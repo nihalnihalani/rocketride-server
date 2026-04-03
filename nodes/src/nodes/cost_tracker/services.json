@@ -13,9 +13,7 @@
 	// Required:
 	//		Class type of the node - what it does
 	//
-	"classType": [
-		"tracker"
-	],
+	"classType": ["tracker"],
 	//
 	// Required:
 	//		Capabilities are flags that change the behavior of the underlying
@@ -49,14 +47,7 @@
 	// Optional:
 	//		Description of this driver
 	//
-	"description": [
-		"A filter component that calculates and tracks per-request LLM costs with ",
-		"budget enforcement. Place it after any LLM node in a pipeline to monitor ",
-		"token usage and spending. Supports all 13 built-in LLM providers, custom ",
-		"pricing overrides, configurable budget limits, and alert thresholds. ",
-		"When the budget is exceeded the node can either warn (log and continue) ",
-		"or block (prevent the answer from propagating downstream)."
-	],
+	"description": ["A filter component that calculates and tracks per-request LLM costs with ", "budget enforcement. Place it after any LLM node in a pipeline to monitor ", "token usage and spending. Supports all 13 built-in LLM providers, custom ", "pricing overrides, configurable budget limits, and alert thresholds. ", "When the budget is exceeded the node can either warn (log and continue) ", "or block (prevent the answer from propagating downstream)."],
 	//
 	// Optional:
 	//		The icon is the icon to display in the UI for this node
@@ -67,18 +58,14 @@
 	//      Rendering hints to the UI which indicate which fields of
 	//      the configuration should be used to display information
 	//
-	"tile": [
-		"Policy: ${parameters.cost_tracker.profile}"
-	],
+	"tile": ["Policy: ${parameters.cost_tracker.profile}"],
 	//
 	//	Optional:
 	//		As a pipe component, define what this pipe component takes
 	//		and what it produces
 	//
 	"lanes": {
-		"answers": [
-			"answers"
-		]
+		"answers": ["answers"]
 	},
 	"input": [
 		{
@@ -109,7 +96,7 @@
 			},
 			"budget": {
 				"title": "Budget",
-				"budget_limit_usd": 10.00,
+				"budget_limit_usd": 10.0,
 				"alert_threshold_pct": 80,
 				"policy": "block",
 				"custom_pricing_json": ""
@@ -158,55 +145,34 @@
 		},
 		"cost_tracker.monitor": {
 			"object": "monitor",
-			"properties": [
-				"alert_threshold_pct",
-				"custom_pricing_json"
-			]
+			"properties": ["alert_threshold_pct", "custom_pricing_json"]
 		},
 		"cost_tracker.budget": {
 			"object": "budget",
-			"properties": [
-				"budget_limit_usd",
-				"alert_threshold_pct",
-				"policy",
-				"custom_pricing_json"
-			]
+			"properties": ["budget_limit_usd", "alert_threshold_pct", "policy", "custom_pricing_json"]
 		},
 		"cost_tracker.custom": {
 			"object": "custom",
-			"properties": [
-				"budget_limit_usd",
-				"alert_threshold_pct",
-				"policy",
-				"custom_pricing_json"
-			]
+			"properties": ["budget_limit_usd", "alert_threshold_pct", "policy", "custom_pricing_json"]
 		},
 		"cost_tracker.profile": {
 			"title": "Mode",
 			"description": "Cost tracking mode",
 			"type": "string",
 			"default": "monitor",
-			"enum": [
-				"*>preconfig.profiles.*.title"
-			],
+			"enum": ["*>preconfig.profiles.*.title"],
 			"conditional": [
 				{
 					"value": "monitor",
-					"properties": [
-						"cost_tracker.monitor"
-					]
+					"properties": ["cost_tracker.monitor"]
 				},
 				{
 					"value": "budget",
-					"properties": [
-						"cost_tracker.budget"
-					]
+					"properties": ["cost_tracker.budget"]
 				},
 				{
 					"value": "custom",
-					"properties": [
-						"cost_tracker.custom"
-					]
+					"properties": ["cost_tracker.custom"]
 				}
 			]
 		}
@@ -220,9 +186,7 @@
 		{
 			"section": "Pipe",
 			"title": "Cost Tracker",
-			"properties": [
-				"cost_tracker.profile"
-			]
+			"properties": ["cost_tracker.profile"]
 		}
 	],
 	"test": {
@@ -232,6 +196,34 @@
 			{
 				"name": "Cost tracker passes answers through",
 				"text": "What is 2+2?",
+				"expect": {
+					"answers": {
+						"contains": "Mock LLM response"
+					}
+				}
+			},
+			{
+				"name": "Budget mode blocks when budget exceeded",
+				"profiles": ["budget"],
+				"text": "What is 2+2?",
+				"config": {
+					"budget_limit_usd": 0.0000001,
+					"policy": "block"
+				},
+				"expect": {
+					"answers": {
+						"empty": true
+					}
+				}
+			},
+			{
+				"name": "Warn mode forwards answer when budget exceeded",
+				"profiles": ["budget"],
+				"text": "What is 2+2?",
+				"config": {
+					"budget_limit_usd": 0.0000001,
+					"policy": "warn"
+				},
 				"expect": {
 					"answers": {
 						"contains": "Mock LLM response"

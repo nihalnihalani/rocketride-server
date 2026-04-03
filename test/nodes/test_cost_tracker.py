@@ -566,3 +566,31 @@ class TestEdgeCases:
         assert math.isclose(status['percent_used'], 100.0, rel_tol=1e-6)
         # At exactly the limit, within_budget should still be True (<=)
         assert status['within_budget'] is True
+
+    def test_invalid_policy_defaults_to_warn(self):
+        """An unrecognised policy value should default to 'warn' with a warning."""
+        import warnings
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter('always')
+            tracker = CostTracker({'policy': 'blcok'})
+        assert tracker.policy == 'warn'
+        assert any('unrecognised policy' in str(w.message) for w in caught)
+
+    def test_entries_bounded_by_max_entries(self):
+        """The _entries list should be bounded by max_entries to prevent unbounded growth."""
+        tracker = CostTracker({'max_entries': 5})
+        for _ in range(10):
+            entry = tracker.calculate_cost('gpt-5', 1000, 500)
+            tracker.track(entry)
+        summary = tracker.get_summary()
+        # All 10 requests should be counted in aggregate stats
+        assert summary['request_count'] == 10
+        # But the raw entries list should be bounded
+        assert len(tracker._entries) <= 5
+
+    def test_custom_pricing_case_insensitive_lookup(self):
+        """Custom pricing keys should be normalized to lowercase for matching."""
+        custom = {'GPT-5': {'input': 99.0, 'output': 99.0}}
+        result = find_model_pricing('gpt-5', custom_pricing=custom)
+        assert result['input'] == 99.0

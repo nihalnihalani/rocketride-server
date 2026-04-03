@@ -48,7 +48,14 @@ class CostTracker:
             self._budget_limit = float(self._budget_limit)
 
         self._alert_threshold_pct: float = float(config.get('alert_threshold_pct', 80))
-        self._policy: str = config.get('policy', 'warn')  # 'warn' | 'block'
+        _VALID_POLICIES = ('warn', 'block')
+        policy = config.get('policy', 'warn')
+        if policy not in _VALID_POLICIES:
+            import warnings
+
+            warnings.warn(f'Cost Tracker: unrecognised policy {policy!r}, defaulting to "warn"', stacklevel=2)
+            policy = 'warn'
+        self._policy: str = policy
 
         # Custom pricing override (JSON string or dict)
         custom_pricing_raw = config.get('custom_pricing_json')
@@ -60,7 +67,9 @@ class CostTracker:
                 self._custom_pricing = custom_pricing_raw
 
         # Accumulation state
+        self._max_entries: int = int(config.get('max_entries', 10_000))
         self._total_cost: float = 0.0
+        self._request_count: int = 0
         self._entries: list[dict[str, Any]] = []
         self._per_model: dict[str, dict[str, Any]] = {}
 
@@ -98,7 +107,10 @@ class CostTracker:
 
         with self._lock:
             self._total_cost += cost
+            self._request_count += 1
             self._entries.append(cost_entry)
+            if self._max_entries > 0 and len(self._entries) > self._max_entries:
+                self._entries = self._entries[-self._max_entries :]
 
             if model not in self._per_model:
                 self._per_model[model] = {
@@ -166,7 +178,7 @@ class CostTracker:
             return {
                 'total_cost': self._total_cost,
                 'per_model': {k: dict(v) for k, v in self._per_model.items()},
-                'request_count': len(self._entries),
+                'request_count': self._request_count,
             }
 
     # ------------------------------------------------------------------
