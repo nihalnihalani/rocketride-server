@@ -26,7 +26,7 @@
 from __future__ import annotations
 
 import re
-from typing import Any, Optional
+from typing import Any
 
 
 class HybridSearchEngine:
@@ -45,7 +45,7 @@ class HybridSearchEngine:
         self.alpha = alpha
 
     @staticmethod
-    def _tokenize(text: Optional[str]) -> list[str]:
+    def _tokenize(text: str | None) -> list[str]:
         """Tokenize text by lowercasing and splitting on non-alphanumeric characters."""
         if not text:
             return []
@@ -106,7 +106,7 @@ class HybridSearchEngine:
         *result_lists: list[dict[str, Any]],
         k: int = 60,
         id_key: str = 'id',
-        weights: Optional[list[float]] = None,
+        weights: list[float] | None = None,
     ) -> list[dict[str, Any]]:
         """
         Merge multiple ranked result lists using Reciprocal Rank Fusion (RRF).
@@ -163,7 +163,7 @@ class HybridSearchEngine:
         self,
         query: str,
         documents: list[dict[str, Any]],
-        vector_scores: Optional[list[float]] = None,
+        vector_scores: list[float] | None = None,
         top_k: int = 10,
         rrf_k: int = 60,
     ) -> list[dict[str, Any]]:

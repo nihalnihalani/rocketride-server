@@ -378,6 +378,7 @@ class TestTokenChunker:
 
         # Mock encoder where each character is a token and decode returns exact chars
         call_counts = {'decode': 0}
+        decoded_lengths: list[int] = []
 
         class TrackingEncoder:
             def encode(self, text):
@@ -385,6 +386,7 @@ class TestTokenChunker:
 
             def decode(self, tokens, **kwargs):
                 call_counts['decode'] += 1
+                decoded_lengths.append(len(tokens))
                 return 'x' * len(tokens)
 
         chunker._encoder = TrackingEncoder()
@@ -392,12 +394,12 @@ class TestTokenChunker:
         chunks = chunker.chunk(text)
         assert len(chunks) == 5
 
-        # With O(n^2) approach, decode would be called 5 (chunks) + 4 (prefixes) = 9 times
-        # With incremental approach, decode is called 5 (chunks) + 4 (steps) = 9 times
-        # but no prefix decode calls scale with chunk index.
-        # Key check: decode should NOT be called with tokens[:N] for large N.
-        # We verify the count is bounded linearly: at most 2*num_chunks calls
+        # Verify decode call count is bounded linearly: at most 2*num_chunks calls
         assert call_counts['decode'] <= 2 * len(chunks), f'decode called {call_counts["decode"]} times for {len(chunks)} chunks; expected at most {2 * len(chunks)} (linear)'
+
+        # Verify decoded token-window lengths are bounded by chunk_size (no O(n) prefix decodes)
+        for length in decoded_lengths:
+            assert length <= chunker.chunk_size, f'decoded window length {length} exceeds chunk_size {chunker.chunk_size}; suggests O(n^2) prefix decode'
 
     def test_start_char_correctness_with_overlap(self):
         """start_char values should be correct even with token overlap."""

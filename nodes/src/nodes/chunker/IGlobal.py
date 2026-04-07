@@ -25,7 +25,7 @@
 # This class controls the data shared between all threads for the task
 # ------------------------------------------------------------------------------
 import os
-from rocketlib import IGlobalBase, OPEN_MODE, warning
+from rocketlib import IGlobalBase, OPEN_MODE
 from ai.common.config import Config
 
 from .chunker_strategies import ChunkingStrategy, RecursiveCharacterChunker, SentenceChunker, TokenChunker
@@ -47,10 +47,10 @@ class IGlobal(IGlobalBase):
             try:
                 from depends import depends
 
-                requirements = os.path.dirname(os.path.realpath(__file__)) + '/requirements.txt'
+                requirements = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'requirements.txt')
                 depends(requirements)
             except Exception as e:  # noqa: BLE001 - intentional broad catch for dependency probing
-                warning(str(e))
+                raise RuntimeError(f'Failed to install tiktoken dependency for token strategy: {e}') from e
 
     def beginGlobal(self):
         """Initialize the configured chunking strategy for runtime execution."""

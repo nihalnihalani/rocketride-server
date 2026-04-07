@@ -43,7 +43,7 @@ class IGlobal(IGlobalBase):
         try:
             from depends import depends
 
-            requirements = os.path.dirname(os.path.realpath(__file__)) + '/requirements.txt'
+            requirements = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'requirements.txt')
             depends(requirements)
         except Exception as e:  # noqa: BLE001 - intentional broad catch for dependency probing
             raise RuntimeError(f'Failed to install hybrid search dependencies: {e}') from e

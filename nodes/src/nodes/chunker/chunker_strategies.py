@@ -26,7 +26,6 @@
 from __future__ import annotations
 
 import re
-from typing import Optional
 
 
 class ChunkingStrategy:
@@ -40,7 +39,7 @@ class ChunkingStrategy:
 class RecursiveCharacterChunker(ChunkingStrategy):
     """Split text recursively by separators with overlap."""
 
-    def __init__(self, chunk_size: int = 1000, chunk_overlap: int = 200, separators: Optional[list[str]] = None):
+    def __init__(self, chunk_size: int = 1000, chunk_overlap: int = 200, separators: list[str] | None = None):
         """Initialize with chunk size, overlap, and optional separators."""
         if chunk_size <= 0:
             raise ValueError('chunk_size must be positive')
@@ -137,9 +136,10 @@ class RecursiveCharacterChunker(ChunkingStrategy):
             start_char = text.find(raw, search_start)
             if start_char == -1:
                 start_char = search_start
-            # Adjust for overlap prefix
+            # Adjust for overlap prefix using actual overlap length (not configured value)
             if i > 0 and self.chunk_overlap > 0:
-                overlap_start = max(0, start_char - self.chunk_overlap)
+                actual_overlap = len(overlap_text)
+                overlap_start = max(0, start_char - actual_overlap)
                 start_char = overlap_start
             end_char = start_char + len(chunk_text)
 
