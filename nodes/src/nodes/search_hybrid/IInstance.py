@@ -25,7 +25,6 @@
 # This class controls the data for each thread of the task
 # ------------------------------------------------------------------------------
 import copy
-from typing import List
 
 from rocketlib import IInstanceBase, debug
 from ai.common.schema import Doc, Question, Answer
@@ -68,8 +67,8 @@ class IInstance(IInstanceBase):
             return
 
         # Build document dicts for the search engine
-        doc_dicts: List[dict] = []
-        vector_scores: List[float] = []
+        doc_dicts: list[dict] = []
+        vector_scores: list[float] = []
         for i, doc in enumerate(docs):
             doc_dict = {
                 'id': str(i),
@@ -90,15 +89,17 @@ class IInstance(IInstanceBase):
         )
 
         # Map results back to Doc objects, preserving original metadata
-        reranked_docs: List[Doc] = []
+        reranked_docs: list[Doc] = []
         for result in results:
             orig_idx = result.get('original_index')
             if orig_idx is not None and 0 <= orig_idx < len(docs):
                 reranked_doc = copy.deepcopy(docs[orig_idx])
-                # Update score with RRF score
-                rrf_score = result.get('rrf_score')
-                if rrf_score is not None:
-                    reranked_doc.score = rrf_score
+                # Update score with whichever ranking signal was used
+                ranking_score = result.get('rrf_score')
+                if ranking_score is None:
+                    ranking_score = result.get('bm25_score', result.get('vector_score'))
+                if ranking_score is not None:
+                    reranked_doc.score = ranking_score
                 reranked_docs.append(reranked_doc)
 
         # Update the question with reranked documents
@@ -113,10 +114,10 @@ class IInstance(IInstanceBase):
         if reranked_docs and self.instance.hasListener('answers'):
             context_parts = []
             for i, doc in enumerate(reranked_docs):
-                score = doc.metadata.get('hybrid_score', 'N/A') if doc.metadata else 'N/A'
+                score = f'{doc.score:.4f}' if doc.score is not None else 'N/A'
                 snippet = (doc.page_content or '')[:500]
                 context_parts.append(f'[Document {i + 1}] (score: {score})\n{snippet}')
             answer_text = f'Hybrid search returned {len(reranked_docs)} results:\n\n' + '\n\n'.join(context_parts)
             ans = Answer()
             ans.setAnswer(answer_text)
-            self.instance.writeAnswers(ans)
+            self.instance.writeAnswers([ans])

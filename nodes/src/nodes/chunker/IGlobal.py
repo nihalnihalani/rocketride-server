@@ -37,14 +37,23 @@ class IGlobal(IGlobalBase):
     def validateConfig(self):
         """Validate that tiktoken dependency is available (only needed for token strategy)."""
         try:
-            from depends import depends
+            config = Config.getNodeConfig(self.glb.logicalType, self.glb.connConfig)
+            strategy_name = config.get('strategy', 'recursive')
+        except Exception:  # noqa: BLE001
+            # If config isn't available yet, install proactively
+            strategy_name = 'token'
 
-            requirements = os.path.dirname(os.path.realpath(__file__)) + '/requirements.txt'
-            depends(requirements)
-        except Exception as e:  # noqa: BLE001 - intentional broad catch for dependency probing
-            warning(str(e))
+        if strategy_name == 'token':
+            try:
+                from depends import depends
+
+                requirements = os.path.dirname(os.path.realpath(__file__)) + '/requirements.txt'
+                depends(requirements)
+            except Exception as e:  # noqa: BLE001 - intentional broad catch for dependency probing
+                warning(str(e))
 
     def beginGlobal(self):
+        """Initialize the configured chunking strategy for runtime execution."""
         # Are we in config mode or some other mode?
         if self.IEndpoint.endpoint.openMode == OPEN_MODE.CONFIG:
             # We are going to get a call to configureService but
@@ -87,5 +96,6 @@ class IGlobal(IGlobalBase):
                 )
 
     def endGlobal(self):
+        """Release the configured chunking strategy."""
         # Release the strategy
         self.strategy = None

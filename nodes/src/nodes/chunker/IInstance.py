@@ -25,7 +25,6 @@
 # This class controls the data for each thread of the task
 # ------------------------------------------------------------------------------
 import copy
-from typing import List
 
 from rocketlib import IInstanceBase, Entry, debug
 from ai.common.schema import Doc, DocMetadata
@@ -44,7 +43,7 @@ class IInstance(IInstanceBase):
         """Reset chunk counter for each new object."""
         self.chunkId = 0
 
-    def writeDocuments(self, documents: List[Doc]):
+    def writeDocuments(self, documents: list[Doc]):
         """
         Chunk each incoming document and emit multiple documents (one per chunk).
 
@@ -74,7 +73,7 @@ class IInstance(IInstanceBase):
                 continue
 
             # Build output documents
-            output_docs: List[Doc] = []
+            output_docs: list[Doc] = []
             for chunk_data in chunks:
                 # Shallow copy of document, explicit copy of metadata only
                 chunk_doc = copy.copy(document)

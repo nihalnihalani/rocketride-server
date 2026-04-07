@@ -25,13 +25,15 @@
 # This class controls the data shared between all threads for the task
 # ------------------------------------------------------------------------------
 import os
-from rocketlib import IGlobalBase, OPEN_MODE, warning
+from rocketlib import IGlobalBase, OPEN_MODE
 from ai.common.config import Config
 
 from .hybrid_search import HybridSearchEngine
 
 
 class IGlobal(IGlobalBase):
+    """Hold shared hybrid-search state across all node threads."""
+
     engine: HybridSearchEngine | None = None
     top_k: int = 10
     rrf_k: int = 60
@@ -43,10 +45,11 @@ class IGlobal(IGlobalBase):
 
             requirements = os.path.dirname(os.path.realpath(__file__)) + '/requirements.txt'
             depends(requirements)
-        except Exception as e:
-            warning(str(e))
+        except Exception as e:  # noqa: BLE001 - intentional broad catch for dependency probing
+            raise RuntimeError(f'Failed to install hybrid search dependencies: {e}') from e
 
     def beginGlobal(self):
+        """Initialize shared search state for the current node lifecycle."""
         # Are we in config mode or some other mode?
         if self.IEndpoint.endpoint.openMode == OPEN_MODE.CONFIG:
             # We are going to get a call to configureService but
@@ -68,5 +71,6 @@ class IGlobal(IGlobalBase):
             self.engine = HybridSearchEngine(alpha=alpha)
 
     def endGlobal(self):
+        """Release shared search state."""
         # Release the engine
         self.engine = None

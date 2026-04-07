@@ -87,6 +87,13 @@ def _restore_modules():
 _install_bm25_stub()
 
 
+@pytest.fixture(autouse=True, scope='module')
+def _cleanup_bm25_stub():
+    """Ensure BM25 stub is restored after all tests in this module complete."""
+    yield
+    _restore_modules()
+
+
 def _load_hybrid_search():
     """Load hybrid_search.py directly."""
     spec = importlib.util.spec_from_file_location(
@@ -644,12 +651,12 @@ class TestIInstanceIntegration:
             self._restore_modules(saved, names)
 
     def test_structured_answer_output(self):
-        """Answer output should be structured with document references, not a raw blob."""
+        """Answer output should be structured with document references and actual scores."""
         saved, names, schema_mod, SubQuestion, IInstance = self._load_iinstance()
         try:
             docs = [
-                schema_mod.Doc(page_content='Machine learning is a subset of AI.', score=0.9, metadata={'hybrid_score': 0.85}),
-                schema_mod.Doc(page_content='Deep learning uses neural networks.', score=0.7, metadata={'hybrid_score': 0.72}),
+                schema_mod.Doc(page_content='Machine learning is a subset of AI.', score=0.9, metadata=None),
+                schema_mod.Doc(page_content='Deep learning uses neural networks.', score=0.7, metadata=None),
             ]
             question = schema_mod.Question(
                 questions=[SubQuestion('machine learning')],
@@ -663,14 +670,17 @@ class TestIInstanceIntegration:
             inst.writeQuestions(question)
 
             assert mock_instance.writeAnswers.called
-            answer = mock_instance.writeAnswers.call_args[0][0]
-            answer_text = answer.getAnswer()
+            # writeAnswers now receives a list of Answer objects
+            answers = mock_instance.writeAnswers.call_args[0][0]
+            answer_text = answers[0].getAnswer()
 
             # Should have structured format, not raw concatenation
             assert 'Hybrid search returned' in answer_text
             assert 'results' in answer_text
             assert '[Document 1]' in answer_text
+            # Score should contain actual numeric values, not 'N/A'
             assert '(score:' in answer_text
+            assert 'N/A' not in answer_text
         finally:
             self._restore_modules(saved, names)
 

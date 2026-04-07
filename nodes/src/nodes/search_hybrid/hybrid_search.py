@@ -26,7 +26,7 @@
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Optional
 
 
 class HybridSearchEngine:
@@ -45,14 +45,14 @@ class HybridSearchEngine:
         self.alpha = alpha
 
     @staticmethod
-    def _tokenize(text: str) -> List[str]:
+    def _tokenize(text: Optional[str]) -> list[str]:
         """Tokenize text by lowercasing and splitting on non-alphanumeric characters."""
         if not text:
             return []
         # Lowercase, then split on non-word characters
         return [token for token in re.split(r'\W+', text.lower()) if token]
 
-    def bm25_search(self, query: str, documents: List[Dict[str, Any]], top_k: int = 10) -> List[Dict[str, Any]]:
+    def bm25_search(self, query: str, documents: list[dict[str, Any]], top_k: int = 10) -> list[dict[str, Any]]:
         """
         BM25 keyword search over document texts.
 
@@ -103,11 +103,11 @@ class HybridSearchEngine:
 
     @staticmethod
     def reciprocal_rank_fusion(
-        *result_lists: List[Dict[str, Any]],
+        *result_lists: list[dict[str, Any]],
         k: int = 60,
         id_key: str = 'id',
-        weights: Optional[List[float]] = None,
-    ) -> List[Dict[str, Any]]:
+        weights: Optional[list[float]] = None,
+    ) -> list[dict[str, Any]]:
         """
         Merge multiple ranked result lists using Reciprocal Rank Fusion (RRF).
 
@@ -126,9 +126,11 @@ class HybridSearchEngine:
         """
         if weights is not None and len(weights) != len(result_lists):
             raise ValueError('weights length must match the number of result lists')
+        if k < 0:
+            raise ValueError('k must be non-negative')
 
-        rrf_scores: Dict[str, float] = {}
-        doc_map: Dict[str, Dict[str, Any]] = {}
+        rrf_scores: dict[str, float] = {}
+        doc_map: dict[str, dict[str, Any]] = {}
 
         for list_idx, result_list in enumerate(result_lists):
             weight = weights[list_idx] if weights is not None else 1.0
@@ -160,11 +162,11 @@ class HybridSearchEngine:
     def search(
         self,
         query: str,
-        documents: List[Dict[str, Any]],
-        vector_scores: Optional[List[float]] = None,
+        documents: list[dict[str, Any]],
+        vector_scores: Optional[list[float]] = None,
         top_k: int = 10,
         rrf_k: int = 60,
-    ) -> List[Dict[str, Any]]:
+    ) -> list[dict[str, Any]]:
         """
         Full hybrid search: vector + BM25 merged via Reciprocal Rank Fusion.
 
@@ -183,8 +185,10 @@ class HybridSearchEngine:
             return []
 
         # Build vector-ranked list if scores are provided
-        vector_results: List[Dict[str, Any]] = []
-        if vector_scores is not None and len(vector_scores) == len(documents):
+        vector_results: list[dict[str, Any]] = []
+        if vector_scores is not None:
+            if len(vector_scores) != len(documents):
+                raise ValueError('vector_scores length must match documents length')
             scored = []
             for i, doc in enumerate(documents):
                 doc_copy = dict(doc)
