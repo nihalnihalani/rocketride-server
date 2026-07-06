@@ -35,10 +35,12 @@
 
 import * as vscode from 'vscode';
 import { ConfigManager, SettingsSnapshot } from '../config';
-import { getConnectionManager } from '../extension';
+import { getConnectionManager, getEngineRegistry } from '../extension';
 import { AgentManager } from '../agents/agent-manager';
 import { DeployManager } from '../connection/deploy-manager';
 import { ConnectionMessageHandler } from './shared/connection-message-handler';
+import { isSubscribed } from '../shared/util/subscriptionGate';
+import { PIPE_BUILDER_APP_ID } from '../shared/types';
 
 export class SettingsProvider {
 	private disposables: vscode.Disposable[] = [];
@@ -58,6 +60,8 @@ export class SettingsProvider {
 		this.connHandler = new ConnectionMessageHandler({
 			extensionFsPath: extensionUri.fsPath,
 			getActiveWebviews: () => this.activeWebviews,
+			getConnectionManager,
+			getEngineRegistry,
 		});
 		this.registerCommands();
 	}
@@ -67,8 +71,8 @@ export class SettingsProvider {
 	 */
 	private registerCommands(): void {
 		const commands = [
-			vscode.commands.registerCommand('rocketride.page.settings.open', async (focus?: string) => {
-				await this.openSettings(focus);
+			vscode.commands.registerCommand('rocketride.page.settings.open', async (focus?: string, authError?: string) => {
+				await this.openSettings(focus, authError);
 			}),
 
 			vscode.commands.registerCommand('rocketride.page.settings.setupCredentials', async () => {
@@ -101,18 +105,25 @@ export class SettingsProvider {
 	 */
 	/** Pending focus section — sent to webview after view:ready. */
 	private pendingFocus?: string;
+	/** Pending auth error — shown as a banner when the page opens due to auth failure. */
+	private pendingAuthError?: string;
 
 	/**
 	 * Opens the settings page, optionally focused on a single section.
 	 * @param focus - If set ('development' or 'deployment'), shows only that section.
+	 * @param authError - If set, displays an auth-failure banner that clears on successful test.
 	 */
-	public async openSettings(focus?: string): Promise<void> {
+	public async openSettings(focus?: string, authError?: string): Promise<void> {
 		this.pendingFocus = focus;
+		this.pendingAuthError = authError;
 		if (this.panel) {
 			this.panel.reveal(vscode.ViewColumn.One);
 			// Panel already open — send focus update directly
 			if (focus) {
 				this.panel.webview.postMessage({ type: 'setFocus', focus });
+			}
+			if (authError) {
+				this.panel.webview.postMessage({ type: 'authError', message: authError });
 			}
 			return;
 		}
@@ -140,6 +151,10 @@ export class SettingsProvider {
 							panel.webview.postMessage({ type: 'setFocus', focus: this.pendingFocus });
 							this.pendingFocus = undefined;
 						}
+						if (this.pendingAuthError) {
+							panel.webview.postMessage({ type: 'authError', message: this.pendingAuthError });
+							this.pendingAuthError = undefined;
+						}
 						await this.connHandler.startStatusPolling();
 						break;
 
@@ -150,6 +165,53 @@ export class SettingsProvider {
 					case 'clearCredentials':
 						await this.clearCredentials(panel.webview);
 						break;
+
+					// -- Checkout flow (embedded Stripe Elements) --------------------
+					case 'checkout:fetchPlans': {
+						try {
+							const billingClient = getConnectionManager()?.getClient();
+							if (!billingClient) throw new Error('Not connected');
+							const plans = await billingClient.billing.getProductPrices(PIPE_BUILDER_APP_ID);
+							panel.webview.postMessage({ type: 'checkout:plansResult', plans, error: null });
+						} catch (err: unknown) {
+							const msg = err instanceof Error ? err.message : String(err);
+							panel.webview.postMessage({ type: 'checkout:plansResult', plans: [], error: msg });
+						}
+						break;
+					}
+
+					case 'checkout:createSession': {
+						try {
+							const billingClient = getConnectionManager()?.getClient();
+							if (!billingClient) throw new Error('Not connected');
+							const orgId = billingClient.getAccountInfo()?.organization?.id;
+							if (!orgId) throw new Error('No organisation found');
+							const result = await billingClient.billing.createCheckoutSession(orgId, PIPE_BUILDER_APP_ID, message.priceId as string);
+							panel.webview.postMessage({ type: 'checkout:sessionResult', ...result, error: null });
+						} catch (err: unknown) {
+							const msg = err instanceof Error ? err.message : String(err);
+							panel.webview.postMessage({ type: 'checkout:sessionResult', clientSecret: '', subscriptionId: '', error: msg });
+						}
+						break;
+					}
+
+					case 'checkout:confirmPending': {
+						try {
+							const billingClient = getConnectionManager()?.getClient();
+							if (!billingClient) throw new Error('Not connected');
+							await (billingClient as any).dapRequest('rrext_account_billing', {
+								subcommand: 'confirm_pending',
+								appId: PIPE_BUILDER_APP_ID,
+								subscriptionId: message.subscriptionId,
+								priceId: message.priceId,
+							});
+							panel.webview.postMessage({ type: 'checkout:confirmResult', error: null });
+						} catch (err: unknown) {
+							const msg = err instanceof Error ? err.message : String(err);
+							panel.webview.postMessage({ type: 'checkout:confirmResult', error: msg });
+						}
+						break;
+					}
 
 					default: {
 						// Delegate connection messages (cloud, docker, service, test, engine versions, sudo)
@@ -252,23 +314,26 @@ export class SettingsProvider {
 			integrationAgentsMd: workspaceConfig.get('integrations.agentsMd', false),
 		};
 
+		// Include subscription status with settings so it's always in sync
+		const cm = getConnectionManager();
+		const client = cm?.getClient();
 		webview.postMessage({
 			type: 'settingsLoaded',
 			settings: allSettings,
+			isSubscribed: isSubscribed(client, PIPE_BUILDER_APP_ID),
 		});
 
 		// Teams are fetched by CloudPanel after it confirms the server is SaaS
 	}
 
 	/**
-	 * Saves all settings atomically, then drives each connection manager
-	 * into its new desired state in sequence.
+	 * Saves all settings atomically, then reconciles engines.
 	 *
 	 * Flow:
-	 *   1. ConfigManager.applyAllSettings() — writes everything, suppresses
-	 *      intermediate change events, refreshes cache once.
-	 *   2. Dev connection — settingsApplied() → disconnect old → initialize new.
-	 *   3. Deploy connection — settingsApplied() → transition shared/independent.
+	 *   1. ConfigManager.applyAllSettings() — writes everything atomically.
+	 *   2. Cancel debounced config-change handlers on CMs (prevents race).
+	 *   3. Reconcile engines — checksums detect config changes, restarts
+	 *      affected engines, CMs reconnect with fresh credentials.
 	 *   4. Reload webview with the authoritative cached config.
 	 */
 	private async saveAllSettings(settings: Record<string, unknown>, webview: vscode.Webview): Promise<void> {
@@ -287,26 +352,31 @@ export class SettingsProvider {
 				return;
 			}
 
-			// 1. Write everything atomically — no listeners fire during this
+			// Step 1: Write everything atomically — ConfigManager suppresses all
+			// intermediate config-change listeners during the batch so no CM reacts
+			// to half-written state (e.g., new API key without new host URL).
 			await this.configManager.applyAllSettings(snapshot);
 
 			// Mark welcome as dismissed — user has configured settings
 			await vscode.workspace.getConfiguration('rocketride').update('welcomeDismissed', true, vscode.ConfigurationTarget.Global);
 
-			// 2. Dev connection: disconnect old mode, connect with new config
-			const connectionManager = getConnectionManager();
-			if (connectionManager) {
-				await connectionManager.settingsApplied();
-			}
-
-			// 3. Deploy connection: transition shared↔independent as needed
-			const deployManager = DeployManager.getDeployInstance();
-			await deployManager.settingsApplied();
-
-			// 4. Reload webview from authoritative cache
-			this.showMessage(webview, 'success', 'Settings saved successfully!');
+			// Step 2: Confirm save to the user immediately — don't wait for engine ops
+			this.showMessage(webview, 'success', 'Settings saved successfully!', 'save');
 			for (const w of this.activeWebviews) {
 				await this.loadAllSettings(w);
+			}
+
+			// Step 3: Cancel any pending debounced config-change handlers so they
+			// don't race with the reconcile triggered by the explicit save.
+			const cm = getConnectionManager();
+			cm?.cancelPendingConfigChange();
+
+			// Reconcile engines — compares config checksums to detect changes
+			// (API key, host URL, connection mode, etc.) and restarts affected engines.
+			// Runs after the UI has updated so downloads don't block the "Saved" feedback.
+			const registry = getEngineRegistry();
+			if (registry) {
+				await registry.reconcile();
 			}
 
 			// Install agent stubs for any newly checked integrations
@@ -334,9 +404,7 @@ export class SettingsProvider {
 
 			// Verify it was actually cleared
 			const hasApiKey = this.configManager.hasApiKey();
-			if (!hasApiKey) {
-				this.showMessage(webview, 'success', 'API Key cleared successfully and removed from secure storage');
-			} else {
+			if (hasApiKey) {
 				this.showMessage(webview, 'error', 'API Key may not have been fully cleared - please try again');
 			}
 
@@ -352,7 +420,7 @@ export class SettingsProvider {
 	 * Sends a message to the webview.
 	 * @param context When 'development', the message is shown inside that section's box; otherwise shown in the global message area.
 	 */
-	private showMessage(webview: vscode.Webview, level: string, message: string, context?: 'development'): void {
+	private showMessage(webview: vscode.Webview, level: string, message: string, context?: 'development' | 'save'): void {
 		webview.postMessage({
 			type: 'showMessage',
 			level: level,

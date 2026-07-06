@@ -24,6 +24,7 @@
 /* global process */
 import { defineConfig } from '@rsbuild/core';
 import { pluginReact } from '@rsbuild/plugin-react';
+import { pluginRocketrideIcons } from 'shared/scripts/rsbuild-plugin-icons.mjs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { createRequire } from 'module';
@@ -36,14 +37,16 @@ const env = getenv();
 requireKeys(env, ['RR_STRIPE_PUBLISHABLE_KEY'], 'vscode:build-webview');
 
 export default defineConfig({
-	plugins: [pluginReact()],
+	plugins: [pluginReact(), pluginRocketrideIcons()],
 
 	source: {
 		// Inject public build-time config values into webview bundles.
 		// SECURITY: never add server-side secrets here — only publishable keys.
 		define: {
 			'process.env.RR_STRIPE_PUBLISHABLE_KEY': JSON.stringify(env.RR_STRIPE_PUBLISHABLE_KEY || ''),
-			'process.env.ROCKETRIDE_URI': JSON.stringify(env.ROCKETRIDE_URI || ''),
+			'process.env.ROCKETRIDE_URI': JSON.stringify(env.ROCKETRIDE_URI || 'https://api.rocketride.ai'),
+			// OAuth broker base URL for the social-login buttons (shared-ui OAUTH_ROOT_URL).
+			'process.env.REACT_APP_OAUTH_ROOT_URL': JSON.stringify(env.REACT_APP_OAUTH_ROOT_URL || ''),
 		},
 		include: ['./src/**/*'],
 		exclude: ['./dist/**', './node_modules/**', './**/*.test.*', './**/*.spec.*'],
@@ -51,11 +54,10 @@ export default defineConfig({
 			'page-sidebar': './src/providers/views/Sidebar/index.tsx',
 			'page-settings': './src/providers/views/Settings/index.tsx',
 			'page-project': './src/providers/views/Project/index.tsx',
-			'page-deploy': './src/providers/views/Deploy/index.tsx',
 			'page-welcome': './src/providers/views/Welcome/index.tsx',
 			'page-monitor': './src/providers/views/Monitor/index.tsx',
 			'page-account': './src/providers/views/Account/index.tsx',
-			'page-auth': './src/providers/views/Auth/index.tsx',
+			'page-environment': './src/providers/views/Environment/index.tsx',
 		},
 	},
 

@@ -115,33 +115,32 @@ class Account(AccountBase):
             defaultTeam='local',
             # Single synthetic organisation with org.admin so that
             # resolve_team_permissions expands to the full permission set.
-            organizations=[
-                {
-                    'id': 'local',
-                    'name': 'Local',
-                    'permissions': ['org.admin'],
-                    'teams': [
-                        {
-                            'id': 'local',
-                            'name': 'Development',
-                            'permissions': [
-                                'team.admin',
-                                'read',
-                                'write',
-                                'execute',
-                                'task.control',
-                                'task.data',
-                                'task.monitor',
-                                'task.debug',
-                                'task.store',
-                            ],
-                        }
-                    ],
-                }
-            ],
-            # OSS: all apps are on the desktop and free
+            organization={
+                'id': 'local',
+                'name': 'Local',
+                'permissions': ['org.admin'],
+                'teams': [
+                    {
+                        'id': 'local',
+                        'name': 'Development',
+                        'permissions': [
+                            'team.admin',
+                            'read',
+                            'write',
+                            'execute',
+                            'task.control',
+                            'task.data',
+                            'task.monitor',
+                            'task.debug',
+                            'task.store',
+                        ],
+                    }
+                ],
+            },
+            # OSS: all apps are on the desktop and free — return full manifest
+            # entries so the shell can register MF remotes after auth
             apps=[
-                {'id': a.get('id', ''), 'appStatus': 'free', 'onDesktop': True}
+                {**a, 'appStatus': 'free', 'onDesktop': True}
                 for a in self._read_apps_json(public_only=False)
                 if a.get('id')
             ],
@@ -322,10 +321,22 @@ class Account(AccountBase):
                 # Only accept ROCKETRIDE_* keys — reject anything else
                 raw = args.get('env', {})
                 env = {k: v for k, v in raw.items() if k.startswith('ROCKETRIDE_')}
-                # Persist to .env file
+
+                # Step 1: Remove existing ROCKETRIDE_* keys from os.environ
+                # so that deleted keys don't linger in memory.
+                for k in [k for k in os.environ if k.startswith('ROCKETRIDE_')]:
+                    del os.environ[k]
+
+                # Step 2: Set the new values in os.environ so get_env
+                # reflects the change immediately without a restart.
+                os.environ.update(env)
+
+                # Step 3: Persist to .env file on disk.
+                # Use sys.executable (engine.exe path) — must match the
+                # load_dotenv path in server.py, which also uses sys.executable.
                 import sys
 
-                exec_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+                exec_dir = os.path.dirname(sys.executable)
                 self._write_env_file(os.path.join(exec_dir, '.env'), env)
                 return conn.build_response(request, body={'updated': True})
 

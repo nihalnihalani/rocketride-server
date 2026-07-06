@@ -19,7 +19,7 @@ import React, { useState, useCallback, useRef, useEffect } from 'react';
 import { applyTheme } from 'shared/themes';
 import type { ThemeTokens } from 'shared/themes/tokens';
 import { ProjectView, parseServerEvent, CheckoutModal } from 'shared';
-import type { TaskStatus, TraceEvent, ViewState, CheckoutPlan } from 'shared';
+import type { TaskStatus, TraceEvent, ViewState, CheckoutPlan, PlanAction } from 'shared';
 import { useMessaging } from '../hooks/useMessaging';
 import type { ProjectHostToWebview, ProjectWebviewToHost } from '../types';
 
@@ -39,11 +39,14 @@ const ProjectWebview: React.FC = () => {
 	const [viewState, setViewState] = useState<ViewState | undefined>(undefined);
 	const [prefs, setPrefs] = useState<Record<string, unknown> | undefined>(undefined);
 	const [serverHost, setServerHost] = useState<string>('');
+	const [oauthReturnUrl, setOauthReturnUrl] = useState<string | undefined>(undefined);
+	const [pendingOAuthTokens, setPendingOAuthTokens] = useState<{ tokens: string; state: string } | undefined>(undefined);
 	const [isDirty, setIsDirty] = useState(false);
 	const [isNew, setIsNew] = useState(false);
 	const [subscribed, setSubscribed] = useState(true);
 	const [isReadonly, setIsReadonly] = useState(false);
 	const [showCheckout, setShowCheckout] = useState(false);
+	const [envKeys, setEnvKeys] = useState<string[]>([]);
 
 	// Checkout flow state — populated by host responses to checkout:* messages
 	const [checkoutPlans, setCheckoutPlans] = useState<CheckoutPlan[]>([]);
@@ -88,12 +91,21 @@ const ProjectWebview: React.FC = () => {
 					mode: vs?.mode ?? 'design',
 					flowViewMode: vs?.flowViewMode ?? 'pipeline',
 					viewport: vs?.viewport,
+					pipelineTraceLevel: vs?.pipelineTraceLevel,
 				});
 				setPrefs(msg.prefs ?? {});
 				setTraceEvents([]);
 				if (msg.serverHost) setServerHost(msg.serverHost);
+				// Unconditional: a load without a return URL must clear any stale
+				// one, and a reload must not keep tokens from a previous session.
+				setOauthReturnUrl(msg.oauthReturnUrl);
+				setPendingOAuthTokens(undefined);
+				setEnvKeys(msg.envKeys ?? []);
 				break;
 			}
+			case 'project:oauthTokens':
+				setPendingOAuthTokens({ tokens: msg.tokens, state: msg.state });
+				break;
 			case 'shell:init':
 				if (msg.theme) applyTheme(msg.theme as ThemeTokens);
 				setIsConnected(msg.isConnected);
@@ -128,6 +140,9 @@ const ProjectWebview: React.FC = () => {
 				}
 				break;
 			}
+			case 'project:envKeysUpdate':
+				setEnvKeys(msg.envKeys);
+				break;
 			case 'shell:connectionChange':
 				if (msg.isConnected) {
 					setStatusMap({});
@@ -135,6 +150,7 @@ const ProjectWebview: React.FC = () => {
 				}
 				setIsConnected(msg.isConnected);
 				if ((msg as any).isSubscribed !== undefined) setSubscribed((msg as any).isSubscribed);
+				if (msg.serverHost) setServerHost(msg.serverHost);
 				break;
 			case 'checkout:required':
 				// Host says subscription is required — show inline prompt (handled by ProjectView's Subscribe button)
@@ -180,6 +196,7 @@ const ProjectWebview: React.FC = () => {
 					mode: msg.state?.mode ?? 'design',
 					flowViewMode: msg.state?.flowViewMode ?? 'pipeline',
 					viewport: msg.state?.viewport,
+					pipelineTraceLevel: msg.state?.pipelineTraceLevel,
 				});
 				break;
 			case 'project:initialPrefs':
@@ -232,13 +249,22 @@ const ProjectWebview: React.FC = () => {
 
 	const handlePipelineAction = useCallback(
 		(action: 'run' | 'stop' | 'restart', source?: string) => {
-			sendMessage({ type: 'status:pipelineAction', action, source });
+			sendMessage({ type: 'status:pipelineAction', action, source, pipelineTraceLevel: viewState?.pipelineTraceLevel ?? 'summary' });
+		},
+		[sendMessage, viewState]
+	);
+
+	const handleMissingEnvVars = useCallback(
+		(keys: string[]) => {
+			sendMessage({ type: 'status:missingEnvVars', keys });
 		},
 		[sendMessage]
 	);
 
 	const handleViewStateChange = useCallback(
 		(vs: ViewState) => {
+			// Keep local state current so the next run message carries the latest trace level
+			setViewState(vs);
 			// Persist to VS Code webview state (survives tab switches)
 			const current = getState() ?? ({} as ViewState);
 			setState({ ...current, ...vs });
@@ -260,6 +286,17 @@ const ProjectWebview: React.FC = () => {
 		},
 		[sendMessage]
 	);
+
+	const handleOpenExternal = useCallback(
+		(url: string) => {
+			sendMessage({ type: 'project:openExternal', url });
+		},
+		[sendMessage]
+	);
+
+	const clearPendingOAuthTokens = useCallback(() => {
+		setPendingOAuthTokens(undefined);
+	}, []);
 
 	const handleSave = useCallback(() => {
 		sendMessage({ type: 'project:requestSave' });
@@ -314,8 +351,8 @@ const ProjectWebview: React.FC = () => {
 
 	return (
 		<>
-			<ProjectView project={project} servicesJson={servicesJson} isConnected={isConnected} isSubscribed={subscribed} statusMap={statusMap} serverHost={serverHost} isDirty={isDirty} isNew={isNew} initialViewState={viewState} initialPrefs={prefs} traceEvents={traceEvents} onContentChanged={handleContentChanged} onValidate={handleValidate} onPipelineAction={handlePipelineAction} onViewStateChange={handleViewStateChange} onPrefsChange={handlePrefsChange} onOpenLink={handleOpenLink} onSave={handleSave} onTraceClear={handleTraceClear} isReadonly={isReadonly} />
-			{showCheckout && stripeKey && <CheckoutModal appName="RocketRide" appDescription="Visual AI pipeline editor — run and deploy pipelines on RocketRide Cloud." stripePublishableKey={stripeKey} onFetchPlans={handleFetchPlans} onCreateCheckout={handleCreateCheckout} onConfirmPending={handleConfirmPending} onSuccess={handleCheckoutSuccess} onClose={() => setShowCheckout(false)} />}
+			<ProjectView project={project} servicesJson={servicesJson} isConnected={isConnected} isSubscribed={subscribed} statusMap={statusMap} serverHost={serverHost} isDirty={isDirty} isNew={isNew} initialViewState={viewState} initialPrefs={prefs} traceEvents={traceEvents} onContentChanged={handleContentChanged} onValidate={handleValidate} onPipelineAction={handlePipelineAction} onViewStateChange={handleViewStateChange} onPrefsChange={handlePrefsChange} onOpenLink={handleOpenLink} oauthReturnUrl={oauthReturnUrl} onOpenExternal={handleOpenExternal} pendingOAuthTokens={pendingOAuthTokens} clearPendingOAuthTokens={clearPendingOAuthTokens} onSave={handleSave} onTraceClear={handleTraceClear} isReadonly={isReadonly} envKeys={envKeys} onMissingEnvVars={handleMissingEnvVars} />
+			{showCheckout && stripeKey && <CheckoutModal appName="RocketRide" appDescription="Visual AI pipeline editor — run and deploy pipelines on RocketRide Cloud." stripePublishableKey={stripeKey} onFetchPlans={handleFetchPlans} onCreateCheckout={handleCreateCheckout} onConfirmPending={handleConfirmPending} onSuccess={handleCheckoutSuccess} onClose={() => setShowCheckout(false)} onActionClick={(_plan: CheckoutPlan, action: PlanAction) => sendMessageRef.current({ type: 'project:openLink', url: action.type === 'mailto' ? `mailto:${action.url}${action.subject ? `?subject=${encodeURIComponent(action.subject)}` : ''}` : action.url, browser: true })} />}
 		</>
 	);
 };

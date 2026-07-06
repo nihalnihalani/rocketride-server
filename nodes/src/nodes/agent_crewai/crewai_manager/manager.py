@@ -46,6 +46,8 @@ from ai.common.agent._internal.host import AgentHostServices
 from ai.common.agent.types import AgentRunResult
 from ai.common.schema import Question
 
+from ai.common.utils import safe_str
+
 from ..crewai_base import CrewBase
 
 
@@ -153,7 +155,7 @@ class CrewManager(CrewBase):
         from rocketlib.types import IInvokeCrew
 
         pSelf = context.invoker
-        prompt = self._safe_str(question.getPrompt())
+        prompt = safe_str(question.getPrompt())
         debug('agent_crewai_manager _run start run_id={} prompt_len={}'.format(context.run_id, len(prompt)))
 
         # 1. Discover all connected sub-agents via per-node invoke (mirrors the tool
@@ -243,12 +245,11 @@ class CrewManager(CrewBase):
                 allow_delegation=False,
             )
 
-            task_text = d.task_description or ''
-            if not task_text:
-                task_text = prompt or 'Complete the user request.'
-            elif prompt:
-                task_text = f'{task_text}\n\nUser request: {prompt}'
-            task_desc = self._escape_braces(task_text)
+            # Mirror native CrewAI template substitution: leave braces unescaped so
+            # _interpolate_inputs() can fill {user_request} (and any other vars the
+            # user placed in their task_description).  Fall back to bare {user_request}
+            # when no task_description is configured, which resolves to the raw prompt.
+            task_desc = d.task_description or '{user_request}'
 
             # No implicit inter-task context wiring.  In hierarchical mode the
             # manager agent decides what to pass to each delegate via its
@@ -315,7 +316,7 @@ class CrewManager(CrewBase):
         tasks_out = getattr(result, 'tasks_output', None) or []
         final_text = ''
         for task_out in reversed(tasks_out):
-            candidate = self._safe_str(getattr(task_out, 'raw', None))
+            candidate = safe_str(getattr(task_out, 'raw', None))
             if not candidate:
                 continue
             stripped = _strip_react_preamble(candidate)
@@ -326,9 +327,9 @@ class CrewManager(CrewBase):
         if not final_text:
             # Fall back to result.raw with the same ReAct stripping.
             raw = (
-                self._safe_str(getattr(result, 'raw', None))
-                or self._safe_str(getattr(getattr(result, 'result', None), 'raw', None))
-                or self._safe_str(result)
+                safe_str(getattr(result, 'raw', None))
+                or safe_str(getattr(getattr(result, 'result', None), 'raw', None))
+                or safe_str(result)
             )
             final_text = _strip_react_preamble(raw)
 
