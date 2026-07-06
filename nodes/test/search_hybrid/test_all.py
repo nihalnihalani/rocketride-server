@@ -32,11 +32,19 @@ no skip fallback: outside the build interpreter the ``rocketlib`` import fails
 and collection errors out, by design.
 
 ``rank_bm25`` is a third-party PyPI compute library (resolved at runtime by
-``depends()`` on the build interpreter), not a framework module. Like the
-openai / elasticsearch mocks, we install the project's faithful mock from
-``nodes/test/mocks/rank_bm25/`` when the real package is absent so the engine
-can be unit-tested in isolation. It is the only stub installed here --
-``rocketlib`` / ``ai.*`` / ``depends`` are provided and NOT stubbed.
+``depends()`` on the build interpreter), not a framework module. When the real
+package is importable it is used as-is; only when it is absent does this file
+install a local, test-scoped stand-in so the engine can be unit-tested in
+isolation. The stub deliberately does NOT live in ``nodes/test/mocks/``: that
+directory is injected engine-wide via ``ROCKETRIDE_MOCK``
+(``packages/ai/src/ai/node.py`` prepends it to ``sys.path`` in the node
+subprocess), so a ``rank_bm25`` package there would shadow the real library and
+make the dynamic services.json test exercise fake BM25 scoring. ``mocks/`` is
+reserved for network/API-client SDKs (openai, pinecone, ...) whose remote calls
+must be faked; compute libraries are installed for real by ``depends()``. This
+mirrors the chunker suite, which keeps its tiktoken stand-in local for the same
+reason. It is the only stub installed here -- ``rocketlib`` / ``ai.*`` /
+``depends`` are provided by the build interpreter and NOT stubbed.
 
 Usage:
     python -m pytest nodes/test/search_hybrid/ -v
@@ -67,24 +75,51 @@ if str(_NODES_SRC) not in sys.path:
 
 # ---------------------------------------------------------------------------
 # rank_bm25 is a PyPI dependency resolved at runtime by `depends()` on the
-# build interpreter. For unit-testing the engine in isolation we load the
-# project's third-party mock from nodes/test/mocks/rank_bm25/ (the same
-# directory the integration runner puts on sys.path via ROCKETRIDE_MOCK) and
-# install it as `rank_bm25`. This is the only stub the test installs --
-# rocketlib / ai.* / depends are provided by the build interpreter and are
-# NOT stubbed here.
+# build interpreter. If the real package is importable we use it. Only when it
+# is absent do we install the minimal stand-in below -- scoped to this test
+# module via sys.modules, NOT placed in nodes/test/mocks/, because that
+# directory is prepended to sys.path in the engine's node subprocess
+# (ROCKETRIDE_MOCK, see packages/ai/src/ai/node.py) and would shadow the real
+# library during the dynamic services.json test. This is the only stub the
+# test installs -- rocketlib / ai.* / depends are provided by the build
+# interpreter and are NOT stubbed here.
 # ---------------------------------------------------------------------------
 
-_MOCKS_DIR = _HERE.parent / 'mocks'
 
+class _StubBM25Okapi:
+    """Minimal stand-in for ``rank_bm25.BM25Okapi``, used only when the real
+    package is not installed.
 
-def _load_rank_bm25_mock():
-    """Load the rank_bm25 mock module from nodes/test/mocks/rank_bm25/."""
-    spec = importlib.util.spec_from_file_location('rank_bm25', str(_MOCKS_DIR / 'rank_bm25' / '__init__.py'))
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    Implements the interface ``HybridSearchEngine`` uses (``__init__(corpus)``
+    and ``get_scores(query_tokens)``) with a TF-IDF-ish score order good
+    enough for ranking assertions. Mirrors the chunker suite's local
+    ``_CharTokenEncoder``: a compute-library stand-in defined at the point of
+    use, never installed engine-wide.
+    """
+
+    def __init__(self, corpus):
+        self.corpus = corpus
+        self.doc_count = len(corpus)
+        self.doc_freqs = {}
+        for doc_tokens in corpus:
+            for token in set(doc_tokens):
+                self.doc_freqs[token] = self.doc_freqs.get(token, 0) + 1
+
+    def get_scores(self, query_tokens):
+        scores = []
+        for doc_tokens in self.corpus:
+            token_counts = {}
+            for t in doc_tokens:
+                token_counts[t] = token_counts.get(t, 0) + 1
+            score = 0.0
+            for qt in query_tokens:
+                if qt in token_counts:
+                    tf = token_counts[qt]
+                    df = self.doc_freqs.get(qt, 1)
+                    idf = max(0.1, (self.doc_count - df + 0.5) / (df + 0.5))
+                    score += tf * idf
+            scores.append(score)
+        return scores
 
 
 # Track our stub so the module-scoped teardown below can distinguish a
@@ -92,17 +127,30 @@ def _load_rank_bm25_mock():
 _RANK_BM25_STUB_TOKEN = object()
 
 
-def _install_bm25_stub_for_session():
-    """Install the rank_bm25 mock only when the real package is missing.
+def _build_rank_bm25_stub_module():
+    """Build an in-memory ``rank_bm25`` module exposing the stub BM25Okapi."""
+    import types
 
-    Returns ``True`` if this call installed the mock (and therefore owns
-    its removal), ``False`` if the real package was already importable.
+    module = types.ModuleType('rank_bm25')
+    module.BM25Okapi = _StubBM25Okapi
+    module.__rank_bm25_test_stub__ = _RANK_BM25_STUB_TOKEN
+    return module
+
+
+def _install_bm25_stub_for_session():
+    """Install the rank_bm25 stub only when the real package is missing.
+
+    Returns ``True`` if this call installed the stub (and therefore owns
+    its removal), ``False`` if the real package is importable (already in
+    ``sys.modules`` or resolvable on ``sys.path``).
     """
     if 'rank_bm25' in sys.modules:
         return False
-    stub = _load_rank_bm25_mock()
-    stub.__rank_bm25_test_stub__ = _RANK_BM25_STUB_TOKEN
-    sys.modules['rank_bm25'] = stub
+    if importlib.util.find_spec('rank_bm25') is not None:
+        # Real package installed (e.g. by depends() on the build interpreter):
+        # let the engine import it -- never shadow a real library.
+        return False
+    sys.modules['rank_bm25'] = _build_rank_bm25_stub_module()
     return True
 
 
