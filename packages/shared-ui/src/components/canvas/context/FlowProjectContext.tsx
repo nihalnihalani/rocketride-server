@@ -119,6 +119,28 @@ export interface IFlowProjectContext {
 	/** OAuth2 root URL for authentication flows. */
 	oauth2RootUrl: string;
 
+	/**
+	 * Where the OAuth broker should redirect after authentication. Hosts that
+	 * cannot receive a web redirect (e.g. the VS Code webview) set this to a
+	 * deep link they can intercept; web hosts leave it undefined and the social
+	 * buttons fall back to `window.location.href`.
+	 */
+	oauthReturnUrl?: string;
+
+	/**
+	 * Opens an external URL in the host's system browser to start an OAuth
+	 * login. When provided (VS Code), the host is responsible for delivering
+	 * the resulting tokens back via `pendingOAuthTokens`. When undefined (web),
+	 * the social buttons do a full-page redirect instead.
+	 */
+	onOpenExternal?: (url: string) => void;
+
+	/** OAuth tokens delivered out-of-band by the host (e.g. VS Code deep-link callback). */
+	pendingOAuthTokens?: { tokens: string; state: string };
+
+	/** Clears `pendingOAuthTokens` once a config panel has consumed them. */
+	clearPendingOAuthTokens?: () => void;
+
 	/** Opens an external URL in the host's default browser. */
 	onOpenLink?: (url: string, displayName?: string) => void;
 
@@ -159,6 +181,10 @@ export interface IFlowProjectContext {
 
 	/** Called when the user requests a save from within the canvas. */
 	onSave?: () => void;
+	onExport?: () => void;
+
+	/** Available ROCKETRIDE_* environment variable key names for autocomplete in config fields. */
+	envKeys?: string[];
 }
 
 const FlowProjectContext = createContext<IFlowProjectContext | null>(null);
@@ -196,6 +222,10 @@ export interface IFlowProjectProviderProps {
 	onUndo?: () => void;
 	onRedo?: () => void;
 	oauth2RootUrl: string;
+	oauthReturnUrl?: string;
+	onOpenExternal?: (url: string) => void;
+	pendingOAuthTokens?: { tokens: string; state: string };
+	clearPendingOAuthTokens?: () => void;
 	onOpenLink?: (url: string, displayName?: string) => void;
 	googlePickerDeveloperKey?: string;
 	googlePickerClientId?: string;
@@ -214,6 +244,10 @@ export interface IFlowProjectProviderProps {
 	isNew?: boolean;
 	/** Called when the user triggers save from the canvas toolbar. */
 	onSave?: () => void;
+	onExport?: () => void;
+
+	/** Available ROCKETRIDE_* environment variable key names for autocomplete in config fields. */
+	envKeys?: string[];
 }
 
 // =============================================================================
@@ -227,7 +261,7 @@ export interface IFlowProjectProviderProps {
  * The host application passes props that are tunneled through this context
  * so deeply nested components can access them without prop drilling.
  */
-export function FlowProjectProvider({ children, project: currentProject, isReadonly = false, taskStatuses, componentPipeCounts, totalPipes, servicesJson: rawServicesJson, servicesJsonError, inventory, inventoryConnectorTitleMap, handleValidatePipeline, onContentChanged, onViewportChange, onUndo, onRedo, oauth2RootUrl, onOpenLink, googlePickerDeveloperKey, googlePickerClientId, onRunPipeline, onStopPipeline, onOpenStatus, serverHost, isConnected, isSubscribed, initialViewport, isDirty, isNew, onSave }: IFlowProjectProviderProps): ReactElement {
+export function FlowProjectProvider({ children, project: currentProject, isReadonly = false, taskStatuses, componentPipeCounts, totalPipes, servicesJson: rawServicesJson, servicesJsonError, inventory, inventoryConnectorTitleMap, handleValidatePipeline, onContentChanged, onViewportChange, onUndo, onRedo, oauth2RootUrl, oauthReturnUrl, onOpenExternal, pendingOAuthTokens, clearPendingOAuthTokens, onOpenLink, googlePickerDeveloperKey, googlePickerClientId, onRunPipeline, onStopPipeline, onOpenStatus, serverHost, isConnected, isSubscribed, initialViewport, isDirty, isNew, onSave, onExport, envKeys }: IFlowProjectProviderProps): ReactElement {
 	// --- Toolchain state ---------------------------------------------------
 
 	const [toolchainState, setToolchainState] = useState<IToolchainState>(DEFAULT_TOOLCHAIN_STATE);
@@ -248,9 +282,9 @@ export function FlowProjectProvider({ children, project: currentProject, isReado
 	// Type-narrow the raw servicesJson into our IServiceCatalog
 	const servicesJson = useMemo(() => (rawServicesJson ?? {}) as IServiceCatalog, [rawServicesJson]);
 
-	// --- Context value -----------------------------------------------------
+	// --- Context value (memoized to prevent consumer re-renders on unchanged props) ---
 
-	const value: IFlowProjectContext = {
+	const value: IFlowProjectContext = useMemo(() => ({
 		currentProject,
 		toolchainState,
 		patchToolchainState,
@@ -270,6 +304,10 @@ export function FlowProjectProvider({ children, project: currentProject, isReado
 		onUndo,
 		onRedo,
 		oauth2RootUrl,
+		oauthReturnUrl,
+		onOpenExternal,
+		pendingOAuthTokens,
+		clearPendingOAuthTokens,
 		onOpenLink,
 		googlePickerDeveloperKey,
 		googlePickerClientId,
@@ -283,7 +321,18 @@ export function FlowProjectProvider({ children, project: currentProject, isReado
 		isDirty,
 		isNew,
 		onSave,
-	};
+		onExport,
+		envKeys,
+	}), [
+		currentProject, toolchainState, patchToolchainState, toggleDevMode,
+		isPipelineRunning, isReadonly, taskStatuses, componentPipeCounts, totalPipes,
+		servicesJson, servicesJsonError, inventory, inventoryConnectorTitleMap,
+		handleValidatePipeline, onContentChanged, onViewportChange, onUndo, onRedo,
+		oauth2RootUrl, oauthReturnUrl, onOpenExternal, pendingOAuthTokens, clearPendingOAuthTokens,
+		onOpenLink, googlePickerDeveloperKey, googlePickerClientId,
+		onRunPipeline, onStopPipeline, onOpenStatus, serverHost, isConnected,
+		isSubscribed, initialViewport, isDirty, isNew, onSave, onExport, envKeys,
+	]);
 
 	return <FlowProjectContext.Provider value={value}>{children}</FlowProjectContext.Provider>;
 }

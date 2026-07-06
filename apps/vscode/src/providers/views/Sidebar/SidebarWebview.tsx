@@ -27,7 +27,7 @@ import React, { useState, useCallback, useMemo, useRef, useEffect } from 'react'
 import 'shared/themes/rocketride-default.css';
 import 'shared/themes/rocketride-vscode.css';
 
-import { SidebarView, BxUser, BxCog, BxExport } from 'shared';
+import { SidebarView, BxUser, BxCog, BxExport, BxLock, BxRocket } from 'shared';
 import { SidebarFooter } from 'shared/components/sidebar-footer/SidebarFooter';
 import type { SidebarFooterMenuItem } from 'shared/components/sidebar-footer/SidebarFooter';
 import type { ProjectEntry, ActiveTaskState, UnknownTask, ConnectionInfo } from 'shared';
@@ -78,11 +78,13 @@ type IncomingMessage =
 				connectionMode: string;
 				developmentTeamId?: string;
 				devProgressMessage?: string;
+				devProgressLogLine?: string;
 				// Deploy connection
 				deployConnectionState?: string;
 				deployConnectionMode?: string | null;
 				deployTargetTeamId?: string;
 				deployProgressMessage?: string;
+				deployProgressLogLine?: string;
 				// Teams (from respective servers)
 				teams?: TeamDTO[];
 				deployTeams?: TeamDTO[];
@@ -126,6 +128,11 @@ const SidebarViewWebview: React.FC = () => {
 	const [entries, setEntries] = useState<ProjectEntry[]>([]);
 	const [activeTasks, setActiveTasks] = useState<Map<string, ActiveTaskState>>(new Map());
 	const [unknownTasks, setUnknownTasks] = useState<UnknownTask[]>([]);
+
+	// ── Engine progress log (last N lines for popup display) ───────────────
+	const MAX_PROGRESS_LINES = 15;
+	const [devProgressLog, setDevProgressLog] = useState<string[]>([]);
+	const [deployProgressLog, setDeployProgressLog] = useState<string[]>([]);
 
 	// ── Shared auth + identity ──────────────────────────────────────────────
 	const [userName, setUserName] = useState<string | undefined>();
@@ -249,12 +256,26 @@ const SidebarViewWebview: React.FC = () => {
 					if (msg.data.developmentTeamId !== undefined) setDevelopmentTeamId(msg.data.developmentTeamId);
 					setDevProgressMessage(msg.data.devProgressMessage);
 
+					// Accumulate dev engine log lines; clear on connect
+					if (msg.data.connectionState === 'connected') {
+						setDevProgressLog([]);
+					} else if (msg.data.devProgressLogLine && msg.data.devProgressLogLine !== devProgressLog[devProgressLog.length - 1]) {
+						setDevProgressLog((prev) => prev[prev.length - 1] === msg.data.devProgressLogLine ? prev : [...prev.slice(-(MAX_PROGRESS_LINES - 1)), msg.data.devProgressLogLine!]);
+					}
+
 					// Deploy connection state
 					if (msg.data.deployConnectionState) setDeployConnectionState(msg.data.deployConnectionState);
 					if (msg.data.deployTeams) setDeployTeams(msg.data.deployTeams);
 					if (msg.data.deployConnectionMode !== undefined) setDeployTargetMode(msg.data.deployConnectionMode ?? null);
 					if (msg.data.deployTargetTeamId !== undefined) setDeployTargetTeamId(msg.data.deployTargetTeamId);
 					setDeployProgressMessage(msg.data.deployProgressMessage);
+
+					// Accumulate deploy engine log lines; clear on connect
+					if (msg.data.deployConnectionState === 'connected') {
+						setDeployProgressLog([]);
+					} else if (msg.data.deployProgressLogLine) {
+						setDeployProgressLog((prev) => prev[prev.length - 1] === msg.data.deployProgressLogLine ? prev : [...prev.slice(-(MAX_PROGRESS_LINES - 1)), msg.data.deployProgressLogLine!]);
+					}
 					// Subscription status
 					if ((msg.data as any).isSubscribed !== undefined) setSubscribed((msg.data as any).isSubscribed);
 					break;
@@ -306,8 +327,6 @@ const SidebarViewWebview: React.FC = () => {
 			const commands: Record<string, string> = {
 				new: 'rocketride.sidebar.files.createFile',
 				monitor: 'rocketride.page.monitor.open',
-				deploy: 'rocketride.page.deploy.open',
-				templates: 'rocketride.page.templates.open',
 			};
 			const cmd = commands[target];
 			if (cmd) sendMessage({ type: 'command', command: cmd });
@@ -393,62 +412,77 @@ const SidebarViewWebview: React.FC = () => {
 		}
 	};
 
+	// ── Footer menu items ───────────────────────────────────────────────────
+	const anyConnected = connection.state === 'connected' || deployConnectionState === 'connected';
+
 	const footerMenuItems: SidebarFooterMenuItem[] = useMemo(() => {
 		const items: SidebarFooterMenuItem[] = [];
 
 		// ── Development section ─────────────────────────────────────────────
-		// "Development" header with live status text (e.g. "Connected (Local)").
-		// Clicking the status line opens Settings focused on the dev section.
-		// If cloud mode, a "Team: {name} >" item opens a team submenu.
 		const devStatus = connectionStatusText(connection.state, developmentMode, devProgressMessage);
 		const devTeamLine = developmentMode === 'cloud' && devTeamName ? `Team: ${devTeamName}` : undefined;
+		const devLines = [devStatus, ...(devTeamLine ? [devTeamLine] : []), ...devProgressLog];
 		items.push({
 			id: 'dev-header',
 			label: 'Development',
 			header: true,
-			statusText: devTeamLine ? `${devStatus}\n${devTeamLine}` : devStatus,
+			statusText: devLines.join('\n'),
 			statusState: connection.state === 'connected' ? 'connected' : connection.state === 'connecting' ? 'connecting' : 'disconnected',
 			onClick: () => sendMessage({ type: 'command', command: 'rocketride.page.settings.open', args: ['development'] }),
 			submenu: developmentMode === 'cloud' && teams.length > 0 ? [...teams].sort((a, b) => a.name.localeCompare(b.name)).map((t: TeamDTO) => ({ id: `dev-${t.id}`, label: t.name, checked: developmentTeamId === t.id, onClick: () => sendMessage({ type: 'setDevelopmentTeam', teamId: t.id }) })) : undefined,
 		});
 
 		// ── Deployment section ──────────────────────────────────────────────
-		// Same pattern as Development. Only shown when deploy target is configured.
 		if (deployTargetMode) {
 			const deployStatus = connectionStatusText(deployConnectionState, deployTargetMode, deployProgressMessage);
 			const deployTeamLine = deployTargetMode === 'cloud' && deployTeamName ? `Team: ${deployTeamName}` : undefined;
+			const deployLines = [deployStatus, ...(deployTeamLine ? [deployTeamLine] : []), ...deployProgressLog];
 			items.push({
 				id: 'deploy-header',
 				label: 'Deployment',
 				header: true,
-				statusText: deployTeamLine ? `${deployStatus}\n${deployTeamLine}` : deployStatus,
+				statusText: deployLines.join('\n'),
 				statusState: deployConnectionState === 'connected' ? 'connected' : deployConnectionState === 'connecting' ? 'connecting' : 'disconnected',
 				onClick: () => sendMessage({ type: 'command', command: 'rocketride.page.settings.open', args: ['deployment'] }),
 				submenu: deployTargetMode === 'cloud' && deployTeams.length > 0 ? [...deployTeams].sort((a, b) => a.name.localeCompare(b.name)).map((t: TeamDTO) => ({ id: `deploy-${t.id}`, label: t.name, checked: deployTargetTeamId === t.id, onClick: () => sendMessage({ type: 'setDeployTargetTeam', teamId: t.id }) })) : undefined,
 			});
 		}
 
-		// ── Account / Settings / Log out ─────────────────────────────────────
-		// cloudConnected is computed by the extension host via isCloudConnected()
-		// Billing is a tab inside Account — no separate menu item needed.
+		// ── Account / Subscribe / Environment / Settings / Log out ──────────
 		if (cloudConnected) {
 			items.push({ id: 'account', label: 'Account', icon: BxUser, dividerBefore: true, onClick: () => sendMessage({ type: 'command', command: 'rocketride.page.account.open' }) });
 		}
 
-		items.push({ id: 'settings', label: 'Settings', icon: BxCog, dividerBefore: !cloudConnected, onClick: () => sendMessage({ type: 'command', command: 'rocketride.page.settings.open' }) });
+		// Subscribe CTA — only when cloud-signed-in but not subscribed
+		if (cloudConnected && !subscribed) {
+			items.push({ id: 'subscribe', label: 'Subscribe', icon: BxRocket, onClick: () => sendMessage({ type: 'command', command: 'rocketride.page.account.open', args: ['billing'] }) });
+		}
+
+		// Environment is visible whenever at least one connection is active,
+		// regardless of whether the server is OSS or SaaS.
+		if (anyConnected) {
+			items.push({ id: 'environment', label: 'Variables', icon: BxLock, dividerBefore: !cloudConnected, onClick: () => sendMessage({ type: 'command', command: 'rocketride.page.environment.open' }) });
+		}
+
+		// Settings is always shown. Divider only when neither Account nor
+		// Environment was shown above (i.e. not connected and not cloud).
+		items.push({ id: 'settings', label: 'Settings', icon: BxCog, dividerBefore: !cloudConnected && !anyConnected, onClick: () => sendMessage({ type: 'command', command: 'rocketride.page.settings.open' }) });
 
 		if (cloudConnected) {
 			items.push({ id: 'logout', label: 'Log out', icon: BxExport, dividerBefore: true, onClick: () => sendMessage({ type: 'command', command: 'rocketride.cloud.logout' }) });
 		}
 
 		return items;
-	}, [sendMessage, cloudConnected, connection.state, teams, deployTeams, developmentMode, developmentTeamId, devTeamName, devProgressMessage, deployConnectionState, deployTargetMode, deployTargetTeamId, deployTeamName, deployProgressMessage]);
+	}, [sendMessage, cloudConnected, connection.state, teams, deployTeams, developmentMode, developmentTeamId, devTeamName, devProgressMessage, devProgressLog, deployConnectionState, deployTargetMode, deployTargetTeamId, deployTeamName, deployProgressMessage, deployProgressLog, subscribed, anyConnected]);
 
 	// ── Footer slot ─────────────────────────────────────────────────────────
 	const footerSlot = <SidebarFooter collapsed={false} userName={userName} userEmail={userEmail} onOpenDocs={onOpenDocs} menuItems={footerMenuItems} />;
 
 	// ── Render ───────────────────────────────────────────────────────────────
 
+	// No headerSlot: the VS Code host has no home-app destination, so it injects no
+	// host-specific top nav. The "Home" button is a SaaS-shell concept owned by the
+	// web host (rocket-ui), intentionally absent from shared-ui / this extension.
 	return <SidebarView connection={connection} isSubscribed={subscribed} entries={entries} activeTasks={activeTasks} unknownTasks={unknownTasks} onNavigate={onNavigate} onOpenFile={onOpenFile} onSourceAction={onSourceAction} onRefresh={onRefresh} footerSlot={footerSlot} onOpenUnknownTask={onOpenUnknownTask} />;
 };
 

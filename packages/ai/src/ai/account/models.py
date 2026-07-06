@@ -26,16 +26,18 @@
 # Placed here to avoid circular imports between account/auth and modules/task.
 # =============================================================================
 
-from pydantic import BaseModel
-from typing import TypedDict
+import time
+from typing import Literal, Optional, TypedDict
+
+from pydantic import BaseModel, Field
 
 from rocketride.types.client import AppManifestEntry
 
 
 # =============================================================================
 # NESTED SHAPES
-# Lightweight TypedDicts documenting the element shape of AccountInfo's
-# ``organizations`` and ``apps`` lists. Mirrors the public
+# Lightweight TypedDicts documenting the shape of AccountInfo's
+# ``organization`` and ``apps`` fields. Mirrors the public
 # ``OrgInfo`` / ``TeamInfo`` defined in ``rocketride.types.client`` but kept
 # local to avoid a server→client cross-package import.
 # =============================================================================
@@ -50,7 +52,7 @@ class TeamInfo(TypedDict):
 
 
 class OrgInfo(TypedDict):
-    """Shape of an entry inside ``AccountInfo.organizations``."""
+    """Shape of the ``AccountInfo.organization`` field (single org per user)."""
 
     id: str
     name: str
@@ -89,8 +91,9 @@ class AccountInfo(BaseModel):
     # Default team ID for this session (pre-resolved server-side)
     defaultTeam: str = ''
 
-    # Full org/team/permissions structure — all permission checks resolve through this
-    organizations: list[OrgInfo] = []
+    # Single org/team/permissions structure — all permission checks resolve through this.
+    # None when the user has no org membership (e.g. freshly invited, not yet provisioned).
+    organization: Optional[OrgInfo] = None
 
     # Apps on the user's desktop — full manifest entries with appStatus + onDesktop.
     # OSS: all apps with appStatus="free", onDesktop=True.
@@ -99,6 +102,18 @@ class AccountInfo(BaseModel):
 
     # Server capability tags — 'oss' or 'saas' depending on the account provider
     capabilities: list[str] = []
+
+    # Platform-level permission strings (e.g. ['sys.admin', 'sys.view']).
+    # Set manually in the database, never via API.
+    sysPermissions: list[str] = []
+
+    # Credit wallet balance snapshot — dict of resource→balance pairs.
+    # Populated from the credit_wallets table for the user's primary org.
+    credits: dict = {}
+
+    # True when the user is authenticated but not yet granted app access
+    # (email did not match any allowed pattern in the user_grants table)
+    waitlisted: bool = False
 
     def to_connect_result(self) -> dict:
         """
@@ -114,6 +129,31 @@ class AccountInfo(BaseModel):
         # Use pydantic's model_dump with an explicit exclusion set so that the
         # raw authentication credential is never returned to the client.
         return self.model_dump(exclude={'auth'})
+
+
+# =============================================================================
+# DEPLOYMENT RECORD
+# =============================================================================
+
+
+class DeploymentRecord(BaseModel):
+    """Persistent deployment control record — single source of truth on disk."""
+
+    pipeline: dict
+
+    # Cron expression (e.g. "*/15 * * * *") or "manual" for on-demand only.
+    schedule: str = 'manual'
+
+    state: Literal['active', 'paused', 'errored'] = 'active'
+
+    userId: str
+    userToken: str
+
+    createdAt: float = Field(default_factory=time.time)
+    updatedAt: float = Field(default_factory=time.time)
+
+    def to_client_record(self) -> dict:
+        return self.model_dump(exclude={'userToken'})
 
 
 # =============================================================================
@@ -141,12 +181,12 @@ def resolve_task_permissions(account_info: AccountInfo, task_team_id: str) -> li
     has no relationship to the team — it returns an empty list instead,
     signalling "no access".
 
-    Resolution order (first match wins):
-      1. Walk ``account_info.organizations``.
-      2. For each org, walk its teams looking for *task_team_id*.
+    Resolution order:
+      1. Check ``account_info.organization``.
+      2. Walk its teams looking for *task_team_id*.
       3. If found and org has ``org.admin`` → full permissions.
       4. If found → that team's stored permissions.
-      5. Not found in any org → ``[]`` (no access).
+      5. Not found → ``[]`` (no access).
 
     Args:
         account_info: The authenticated caller's session.
@@ -156,12 +196,14 @@ def resolve_task_permissions(account_info: AccountInfo, task_team_id: str) -> li
         Effective permission list, or empty list if the caller has no
         membership in the task's team.
     """
-    for org in account_info.organizations:
-        for team in org.get('teams', []):
-            if team['id'] == task_team_id:
-                if 'org.admin' in org.get('permissions', []):
-                    return list(_FULL_TEAM_PERMISSIONS)
-                return list(team.get('permissions', []))
+    org = account_info.organization
+    if not org:
+        return []
+    for team in org.get('teams', []):
+        if team['id'] == task_team_id:
+            if 'org.admin' in org.get('permissions', []):
+                return list(_FULL_TEAM_PERMISSIONS)
+            return list(team.get('permissions', []))
     return []
 
 
@@ -174,7 +216,7 @@ def resolve_team_permissions(account_info: AccountInfo, team_id: str) -> list[st
 
     Args:
         account_info (AccountInfo): The authenticated session whose
-            ``organizations`` list is inspected.
+            ``organization`` field is inspected.
         team_id (str): The team whose permission list should be resolved.
 
     Returns:
@@ -185,12 +227,10 @@ def resolve_team_permissions(account_info: AccountInfo, team_id: str) -> list[st
             per-team record.
 
     Raises:
-        PermissionError: If ``team_id`` is not found in any organisation
-            the caller belongs to.
+        PermissionError: If ``team_id`` is not found in the user's org.
     """
-    # Walk every organisation the user is a member of.
-    for org in account_info.organizations:
-        # Walk every team within this organisation.
+    org = account_info.organization
+    if org:
         for team in org.get('teams', []):
             if team['id'] == team_id:
                 # Org admins get the full permission set regardless of what is
@@ -199,5 +239,4 @@ def resolve_team_permissions(account_info: AccountInfo, team_id: str) -> list[st
                     return list(_FULL_TEAM_PERMISSIONS)
                 # Otherwise return the permissions explicitly stored on the team.
                 return list(team.get('permissions', []))
-    # The team was not found in any of the user's organisations.
     raise PermissionError(f'No membership in team {team_id!r}')

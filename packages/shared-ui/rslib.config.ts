@@ -31,6 +31,7 @@
 import { defineConfig } from '@rslib/core';
 import { pluginSass } from '@rsbuild/plugin-sass';
 import { pluginReact } from '@rsbuild/plugin-react';
+import { pluginRocketrideIcons } from './scripts/rsbuild-plugin-icons.mjs';
 
 /**
  * Builds the `source.define` map that inlines environment variables at compile time.
@@ -48,6 +49,7 @@ function buildDefine() {
 		'process.env.REACT_APP_GOOGLE_PICKER_DEVELOPER_KEY': JSON.stringify(
 			process.env.REACT_APP_GOOGLE_PICKER_DEVELOPER_KEY || ''
 		),
+		'process.env.REACT_APP_OAUTH_ROOT_URL': JSON.stringify(process.env.REACT_APP_OAUTH_ROOT_URL || ''),
 	};
 }
 
@@ -94,5 +96,5 @@ export default defineConfig({
 	},
 
 	// Plugins
-	plugins: [pluginSass(), pluginReact()],
+	plugins: [pluginSass(), pluginReact(), pluginRocketrideIcons()],
 });

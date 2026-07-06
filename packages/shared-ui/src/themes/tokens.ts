@@ -38,6 +38,7 @@ export type ThemeTokens = {
 	'--rr-color-success': string;
 	'--rr-border': string;
 	'--rr-border-hover': string;
+	'--rr-sash-hover': string;
 	'--rr-border-focus': string;
 	'--rr-border-input': string;
 	'--rr-border-paper': string;
@@ -60,7 +61,7 @@ export type ThemeTokens = {
 	'--rr-grey-200': string;
 	'--rr-grey-400': string;
 	'--rr-grey-500': string;
-	'--rr-icon-filter': string;
+	'--rr-icon-color': string;
 	'--rr-font-family': string;
 	'--rr-font-size': string;
 	'--rr-font-size-sm': string;

@@ -25,25 +25,13 @@ import { useFlowGraph } from '../../../context/FlowGraphContext';
 import { useFlowProject } from '../../../context/FlowProjectContext';
 import { useFlowPreferences } from '../../../context/FlowPreferencesContext';
 import { IService, IServiceCapabilities } from '../../../types';
+import { Icon } from '../../../util/Icon';
 import { commonStyles } from '../../../../../themes/styles';
+import { CATEGORY_TITLES } from './categoryTitles';
 
 // =============================================================================
 // Constants
 // =============================================================================
-
-const CATEGORY_TITLES: Record<string, string> = {
-	source: 'Source',
-	embedding: 'Embedding',
-	llm: 'LLM',
-	database: 'Database',
-	filter: 'Filter',
-	image: 'Image',
-	preprocessor: 'Preprocessor',
-	store: 'Store',
-	agent: 'Agent',
-	tool: 'Tool',
-	other: 'Other',
-};
 
 const MIN_WIDTH = 200;
 const MAX_WIDTH = 600;
@@ -80,9 +68,9 @@ const styles = {
 		position: 'absolute' as const,
 		left: 0,
 		top: 0,
-		width: 2,
+		width: 4,
 		height: '100%',
-		background: 'var(--rr-brand)',
+		background: 'var(--rr-sash-hover)',
 	},
 	panel: {
 		position: 'relative' as const,
@@ -241,7 +229,7 @@ interface ICreateNodePanelProps {
 
 export default function CreateNodePanel({ onClose }: ICreateNodePanelProps): ReactElement {
 	const { inventory } = useFlowProject();
-	const { addNode, setTempNode } = useFlowGraph();
+	const { addNode, setTempNode, onDrop, onDragOver } = useFlowGraph();
 	const { getPreference, setPreference } = useFlowPreferences();
 
 	const [search, setSearch] = useState('');
@@ -251,6 +239,7 @@ export default function CreateNodePanel({ onClose }: ICreateNodePanelProps): Rea
 	const [handleHover, setHandleHover] = useState(false);
 	// Track which groups are expanded. Only "source" is open by default.
 	const [expandedGroups, setExpandedGroups] = useState<Set<string>>(() => new Set(['source']));
+	const savedExpandedGroups = useRef<Set<string> | null>(null);
 	const resizeStart = useRef({ mouseX: 0, width: 0 });
 
 	// --- Resize handlers ---
@@ -349,6 +338,20 @@ export default function CreateNodePanel({ onClose }: ICreateNodePanelProps): Rea
 		return sorted;
 	}, [inventory, search]);
 
+	// Auto-expand all matching categories while searching; restore on clear
+	useEffect(() => {
+		if (search) {
+			if (!savedExpandedGroups.current) {
+				savedExpandedGroups.current = new Set(expandedGroups);
+			}
+			setExpandedGroups(new Set(Object.keys(groupedInventory)));
+		} else if (savedExpandedGroups.current) {
+			setExpandedGroups(savedExpandedGroups.current);
+			savedExpandedGroups.current = null;
+		}
+		// eslint-disable-next-line react-hooks/exhaustive-deps
+	}, [search, groupedInventory]);
+
 	// --- Click to add ---
 
 	const onClickItem = (providerKey: string) => {
@@ -378,7 +381,7 @@ export default function CreateNodePanel({ onClose }: ICreateNodePanelProps): Rea
 
 	return (
 		<>
-			<div style={styles.backdrop} onClick={onClose} />
+			<div style={styles.backdrop} onClick={onClose} onDragOver={onDragOver} onDrop={onDrop} />
 			<div className="nopan nodrag" style={{ ...styles.container, width: `${width}px`, userSelect: isResizing ? 'none' : 'auto' }}>
 				{/* Resize handle */}
 				<div style={styles.resizeHitArea} onMouseDown={onResizeMouseDown} onMouseEnter={() => setHandleHover(true)} onMouseLeave={() => setHandleHover(false)}>
@@ -447,7 +450,7 @@ export default function CreateNodePanel({ onClose }: ICreateNodePanelProps): Rea
 													(e.currentTarget as HTMLElement).style.backgroundColor = '';
 												}}
 											>
-												{service.icon && <img src={service.icon} alt="" style={{ ...styles.itemIcon, filter: service.icon?.includes('#td') ? 'var(--icon-filter)' : undefined }} />}
+												{service.icon && <Icon name={service.icon} style={styles.itemIcon} />}
 												<span style={styles.itemTitle}>{service.title ?? key}</span>
 												{Array.isArray(service.classType) && service.classType.includes('tool') && <span style={styles.badge}>Tool</span>}
 												{!!(service.capabilities && IServiceCapabilities.Experimental & service.capabilities) && <span style={styles.experimentalBadge}>Experimental</span>}
