@@ -29,6 +29,7 @@ import { CloudAuthProvider } from '../auth/CloudAuthProvider';
 import { PipelineFileParser, ParsedPipelineFile, ServiceClassInfo } from '../shared/util/pipelineParser';
 import { GenericEvent, PIPE_BUILDER_APP_ID } from '../shared/types';
 import { isSubscribed } from '../shared/util/subscriptionGate';
+import { checkMissingEnvVars } from '../shared/util/envVarCheck';
 import { getProjectProvider } from '../extension';
 
 // =============================================================================
@@ -127,6 +128,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
 						break;
 					case 'setDevelopmentMode':
 						await this.configManager.updateConnectionMode('development', message.mode);
+						this.sendFullUpdate();
 						break;
 					case 'setDevelopmentTeam':
 						this.configManager.setTeamId('development', message.teamId);
@@ -137,6 +139,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
 						// Reconnect the DEPLOY manager (not dev) when deploy mode changes
 						await this.deployManager.disconnect();
 						await this.deployManager.initialize();
+						this.sendFullUpdate();
 						break;
 					case 'setDeployTargetTeam':
 						this.configManager.setTeamId('deployment', message.teamId);
@@ -364,8 +367,8 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
 	 */
 	private getTeamsFromClient(client: import('rocketride').RocketRideClient | undefined): Array<{ id: string; name: string }> {
 		const info = client?.getAccountInfo();
-		if (!info?.organizations?.length) return [];
-		return info.organizations[0].teams ?? [];
+		if (!info?.organization) return [];
+		return info.organization.teams ?? [];
 	}
 
 	/** Sends connection state + entries + user identity + teams to the webview. */
@@ -397,11 +400,13 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
 				connectionMode: config.development.connectionMode,
 				developmentTeamId: config.development.teamId,
 				devProgressMessage: status.progressMessage,
+				devProgressLogLine: status.progressLogLine,
 				// Deploy connection
 				deployConnectionState: deployStatus.state,
 				deployConnectionMode: config.deployment.connectionMode,
 				deployTargetTeamId: config.deployment.teamId,
 				deployProgressMessage: deployStatus.progressMessage,
+				deployProgressLogLine: deployStatus.progressLogLine,
 				// Teams (from respective servers)
 				teams: this.getTeamsFromClient(this.connectionManager.getClient()),
 				deployTeams: this.getTeamsFromClient(this.deployManager.getClient()),
@@ -517,6 +522,10 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
 
 			const client = this.connectionManager.getClient();
 			if (!client) throw new Error('Not connected to server');
+
+			// Gate: check for missing ROCKETRIDE_* env vars
+			const missing = await checkMissingEnvVars(client, pipelineJson);
+			if (missing.length > 0) return;
 
 			const pipeName = path.basename(fsPath).replace(/\.pipe(?:\.json)?$/, '');
 			await client.use({

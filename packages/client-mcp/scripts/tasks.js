@@ -32,7 +32,7 @@
  */
 const path = require('path');
 const {
-    execCommand, syncDir, formatSyncStats,
+    execCommand, runPytest, syncDir, formatSyncStats,
     removeDirs, removeMatching, removeDirAndParents, PROJECT_ROOT, BUILD_ROOT, DIST_ROOT,
     mkdir, copyFile, exists,
     hasSourceChanged, saveSourceHash, setState,
@@ -122,26 +122,31 @@ function makeRunPytestAction(options = {}) {
             require('dotenv').config({ path: path.join(PROJECT_ROOT, '.env') });
 
             const bracket = ctx.brackets?.['mcp-test-server'];
-            const port = bracket?.port || ctx.port;
-            const serverUri = bracket?.serverUri || `http://localhost:${port}`;
+            if (!bracket?.port) throw new Error('mcp-test-server bracket missing — server did not start');
+            const serverUri = bracket.serverUri || `http://localhost:${bracket.port}`;
 
             // MCP and python-dotenv are installed by server:setup-pip
 
             // Run pytest
             const buildSrcDir = path.join(BUILD_DIR, 'src');
             const testsDir = path.join(PACKAGE_DIR, 'tests');
-            const pytestArgs = ['-m', 'pytest', testsDir, '-v', '--rootdir', PACKAGE_DIR];
+            const extraArgs = ['-v', '--rootdir', PACKAGE_DIR];
             if (options.pytest) {
-                pytestArgs.push(...options.pytest);
+                extraArgs.push(...options.pytest);
             }
-            await execCommand(ENGINE, pytestArgs, {
-                task,
-                cwd:  SERVER_DIR,
-                env: {
-                    ...process.env,
-                    ROCKETRIDE_URI: serverUri,
-                    PYTHONPATH: buildSrcDir
-                }
+            await runPytest({
+                engine: ENGINE,
+                testsDir,
+                extraArgs,
+                execOpts: {
+                    task,
+                    cwd: SERVER_DIR,
+                    env: {
+                        ...process.env,
+                        ROCKETRIDE_URI: serverUri,
+                        PYTHONPATH: buildSrcDir,
+                    },
+                },
             });
         }
     };
@@ -210,6 +215,9 @@ function makeStopTestServerAction() {
 module.exports = {
     name: 'client-mcp',
     description: 'MCP Client (Model Context Protocol)',
+
+    // Co-located docs gathered by docs:gather.
+    docs: [{ source: 'docs', mount: 'protocols/mcp' }],
 
     actions: [
         // Internal actions

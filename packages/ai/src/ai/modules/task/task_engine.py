@@ -38,7 +38,6 @@ import socket
 import hashlib
 import shlex
 import shutil
-import re
 from typing import TYPE_CHECKING, Dict, Any, List, Optional
 from tenacity import retry, stop_after_attempt, wait_fixed
 
@@ -54,9 +53,11 @@ from ai.constants import (
 )
 from ai import CONST_AI_NODE_SCRIPT
 from ai.common.dap import DAPBase, DAPClient, TransportWebSocket
+from ai.modules.task.pipeflow import apply_pipeflow_event
 from rocketride import TASK_STATUS, TASK_STATUS_FLOW, TASK_STATE, EVENT_TYPE
 from .dbg_debugpy import DbgDebugpy
 from .dbg_stdio import DbgStdio
+from .pipeline import resolve_pipeline_env
 from .types import LAUNCH_TYPE
 from .task_conn import TaskConn
 from .task_metrics import TaskMetrics
@@ -308,45 +309,12 @@ class Task(DAPBase):
         # Initialize DAP base
         super().__init__(f'TASK-{self.id}', **kwargs)
 
-    # Only environment variables with this prefix are permitted to resolve in pipelines.
-    # All other env vars are blocked to prevent exfiltration of secrets via ${VAR} expansion.
-    ALLOWED_ENV_PREFIX = 'ROCKETRIDE_'
-
     def _resolve_pipeline(self, pipeline: Dict[str, Any]) -> Dict[str, Any]:
+        """Replace ``${KEY}`` placeholders using the merged environment dict.
+
+        Delegates to :func:`pipeline.resolve_pipeline_env`.
         """
-        Replace ${KEY} placeholders in a pipeline dictionary with environment values.
-
-        Uses the merged environment dict (self._env) which was built by the
-        command handler from: .env → org secrets → team secrets → user secrets
-        → caller-supplied env overrides.
-
-        Only variables whose names start with ALLOWED_ENV_PREFIX are resolved.
-        All other references are replaced with a redacted placeholder to prevent
-        secret exfiltration.
-
-        Args:
-            pipeline: Dictionary containing the pipeline configuration.
-
-        Returns:
-            New dictionary with resolved environment variables.
-        """
-        # Convert dict to JSON string
-        pipeline_str = json.dumps(pipeline)
-
-        # Replace ${VAR_NAME} with value from the merged env dict
-        def replacer(match):
-            env_var = match.group(1)
-            if env_var.startswith(self.ALLOWED_ENV_PREFIX):
-                value = self._env.get(env_var, match.group(0))
-                if value == match.group(0):
-                    return value  # placeholder not found
-                return json.dumps(value)[1:-1]  # escape but strip outer quotes
-            return '<REDACTED>'
-
-        resolved_str = re.sub(r'\$\{([^}]+)\}', replacer, pipeline_str)
-
-        # Parse back to dict and return
-        return json.loads(resolved_str)
+        return resolve_pipeline_env(pipeline, self._env)
 
     def _check_pipeline(self, pipeline: Dict[str, Any]) -> None:
         """
@@ -584,6 +552,12 @@ class Task(DAPBase):
             arguments=args,
             token=args.get('token'),
         )
+
+        # Propagate subprocess failures so callers don't silently
+        # receive success for a failed operation.
+        if self._data_client.did_fail(response):
+            raise RuntimeError(response.get('message', 'Data request failed'))
+
         return response
 
     async def _terminated(self) -> None:
@@ -685,27 +659,6 @@ class Task(DAPBase):
                     self._task_metrics = None
         except Exception as e:
             self.debug_message(f'Error cleaning up metrics: {e}')
-
-        # Reset metrics and tokens to zero after task termination
-        try:
-            # Reset current metrics
-            self._status.metrics.cpu_percent = 0.0
-            self._status.metrics.cpu_memory_mb = 0.0
-            self._status.metrics.gpu_memory_mb = 0.0
-
-            # Reset peak metrics
-            self._status.metrics.peak_cpu_percent = 0.0
-            self._status.metrics.peak_cpu_memory_mb = 0.0
-            self._status.metrics.peak_gpu_memory_mb = 0.0
-
-            # Reset average metrics
-            self._status.metrics.avg_cpu_percent = 0.0
-            self._status.metrics.avg_cpu_memory_mb = 0.0
-            self._status.metrics.avg_gpu_memory_mb = 0.0
-
-            self.debug_message('Metrics and tokens reset to zero')
-        except Exception as e:
-            self.debug_message(f'Error resetting metrics and tokens: {e}')
 
         try:
             # Clean up temporary files
@@ -1072,6 +1025,11 @@ class Task(DAPBase):
             service_up = body.get('service', False)
             self._status.serviceUp = service_up
 
+            # Gate billing accumulation on pipeline readiness so users
+            # are not charged for startup time (model loading, deps, etc.)
+            if self._task_metrics:
+                self._task_metrics.set_service_up(service_up)
+
             if service_up:
                 self._status.state = TASK_STATE.RUNNING.value
                 self._status.notes = self._service_up_notes
@@ -1113,25 +1071,21 @@ class Task(DAPBase):
 
             self._status.pipeflow.totalPipes = total_pipes
 
-            if pipe_index not in self._status.pipeflow.byPipe:
-                self._status.pipeflow.byPipe[pipe_index] = []
+            # Update the per-pipe execution stack and get a stable snapshot chain.
+            # See pipeflow.apply_pipeflow_event for why leave pops by identity and the
+            # snapshot is copied (reentrant sub-invocations share one pipe_index and
+            # interleave across threads).
+            pipes = apply_pipeflow_event(self._status.pipeflow.byPipe, pipe_index, operation, component_name)
 
-            # Update execution stack
-            if operation == 'begin':
-                self._status.pipeflow.byPipe[pipe_index] = [component_name]
-            elif operation == 'enter':
-                self._status.pipeflow.byPipe[pipe_index].append(component_name)
-            elif operation == 'leave':
-                if self._status.pipeflow.byPipe[pipe_index]:
-                    self._status.pipeflow.byPipe[pipe_index].pop()
-            elif operation == 'end':
-                self._status.pipeflow.byPipe[pipe_index] = []
-
-            # Build the flow event
+            # Build the flow event. `component` names the component this op refers to
+            # (for 'leave', the leaving one) so consumers can pair enter/leave by identity
+            # rather than assuming strict LIFO order — reentrant agent sub-invocations
+            # interleave under one pipe_index. `pipes` remains the current component stack.
             body = {
                 'id': pipe_index,
                 'op': operation,
-                'pipes': self._status.pipeflow.byPipe[pipe_index],
+                'pipes': pipes,
+                'component': component_name,
                 'trace': trace or {},
                 'project_id': self.project_id,
                 'source': self.source,
@@ -1586,6 +1540,14 @@ class Task(DAPBase):
                         child_args.append(arg)
                         break
 
+            # Inherit parent engine's --node_path so workspace-local nodes load
+            # in the task subprocess too (Opt reads argv only, not the env).
+            if not any(a.startswith('--node_path=') for a in child_args):
+                for arg in startup_args():
+                    if arg.startswith('--node_path='):
+                        child_args.append(arg)
+                        break
+
             await self._send_status_update()
 
             # Launch subprocess - pass environment with account context for store access
@@ -1633,6 +1595,8 @@ class Task(DAPBase):
                     user_id=getattr(_control, 'userId', '') if _control else '',
                     team_id=getattr(_control, 'teamId', '') if _control else '',
                     org_id=getattr(_control, 'orgId', '') if _control else '',
+                    pipeline_name=self._task_name or '',
+                    source_name=self._status.name or self.source or '',
                     on_update_callback=self._on_metrics_updated,
                 )
                 self._task_metrics.start_monitoring()
