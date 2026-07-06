@@ -40,6 +40,116 @@ from rocketlib import ToolDescriptor
 
 from ai.common.agent import AgentBase, AgentContext
 
+from ai.common.utils import safe_str
+
+
+# ────────────────────────────────────────────────────────────────────────────────
+# CREWAI ASYNC COMPATIBILITY PATCHES (applied once at import time)
+#
+# Two related issues in CrewAI 1.14.x when running inside a shared asyncio loop:
+#
+# 1. PLANNING — Crew._handle_crew_planning() calls planner_task.execute_sync()
+#    → agent.execute_task() (sync) which raises RuntimeError when it detects a
+#    running event loop. Fix: offload planning to a ThreadPoolExecutor worker
+#    thread that has no running loop (_patch_crewai_planning).
+#
+# 2. DELEGATION — DelegateWorkTool / BaseAgentTool have no _arun / _aexecute,
+#    so hierarchical crews fall back to the sync execute_task() path from inside
+#    the async loop → RuntimeError. Fix: patch both classes with async variants
+#    that use aexecute_task() instead (_patch_crewai_delegation).
+# ────────────────────────────────────────────────────────────────────────────────
+
+
+def _patch_crewai_planning() -> None:
+    """
+    Patch Crew._handle_crew_planning() to be safe when called from inside a
+    running event loop (e.g. via akickoff() on the CrewRunner daemon thread).
+
+    CrewAI's planning step calls planner_task.execute_sync() -> agent.execute_task(),
+    which raises RuntimeError when it detects a running event loop. We fix this by
+    offloading the entire planning call to a ThreadPoolExecutor worker thread, which
+    has no running loop. Planning mutates self.tasks in-place, so the crew sees the
+    updated task descriptions when the worker returns.
+    """
+    try:
+        import concurrent.futures
+
+        from crewai.crew import Crew
+
+        if getattr(Crew, '_rr_planning_patched', False):
+            return
+
+        _orig_planning = Crew._handle_crew_planning
+
+        def _safe_handle_crew_planning(self) -> None:
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                _orig_planning(self)
+                return
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+                ex.submit(_orig_planning, self).result()
+
+        Crew._handle_crew_planning = _safe_handle_crew_planning  # type: ignore[method-assign]
+        Crew._rr_planning_patched = True  # type: ignore[attr-defined]
+    except Exception:
+        pass
+
+
+def _patch_crewai_delegation() -> None:
+    try:
+        from crewai.task import Task
+        from crewai.tools.agent_tools.ask_question_tool import AskQuestionTool
+        from crewai.tools.agent_tools.base_agent_tools import BaseAgentTool
+        from crewai.tools.agent_tools.delegate_work_tool import DelegateWorkTool
+        from crewai.utilities.i18n import I18N_DEFAULT
+
+        if hasattr(BaseAgentTool, '_aexecute'):
+            return  # already patched
+
+        async def _aexecute(self, agent_name, task, context=None):  # type: ignore[override]
+            try:
+                if agent_name is None:
+                    agent_name = ''
+                sanitized = self.sanitize_agent_name(agent_name)
+                agent = [a for a in self.agents if self.sanitize_agent_name(a.role) == sanitized]
+            except (AttributeError, ValueError) as e:
+                return I18N_DEFAULT.errors('agent_tool_unexisting_coworker').format(
+                    coworkers='\n'.join([f'- {self.sanitize_agent_name(a.role)}' for a in self.agents]),
+                    error=str(e),
+                )
+            if not agent:
+                return I18N_DEFAULT.errors('agent_tool_unexisting_coworker').format(
+                    coworkers='\n'.join([f'- {self.sanitize_agent_name(a.role)}' for a in self.agents]),
+                    error=f"No agent found with role '{sanitized}'",
+                )
+            selected = agent[0]
+            try:
+                t = Task(description=task, agent=selected, expected_output=I18N_DEFAULT.slice('manager_request'))
+                return await selected.aexecute_task(t, context)
+            except Exception as e:
+                return I18N_DEFAULT.errors('agent_tool_execution_error').format(
+                    agent_role=self.sanitize_agent_name(selected.role), error=str(e)
+                )
+
+        async def _delegate_arun(self, task, context, coworker=None, **kwargs):  # type: ignore[override]
+            coworker = self._get_coworker(coworker, **kwargs)
+            return await self._aexecute(coworker, task, context)
+
+        async def _ask_arun(self, question, context, coworker=None, **kwargs):  # type: ignore[override]
+            coworker = self._get_coworker(coworker, **kwargs)
+            return await self._aexecute(coworker, question, context)
+
+        BaseAgentTool._aexecute = _aexecute  # type: ignore[attr-defined]
+        DelegateWorkTool._arun = _delegate_arun  # type: ignore[attr-defined]
+        AskQuestionTool._arun = _ask_arun  # type: ignore[attr-defined]
+    except Exception:
+        pass  # if crewai isn't installed yet, skip silently
+
+
+_patch_crewai_planning()
+_patch_crewai_delegation()
+
 
 # ────────────────────────────────────────────────────────────────────────────────
 # CREWBASE
@@ -57,9 +167,11 @@ class CrewBase(AgentBase):
           * `_build_crew_llm(context, role)`
           * `_build_crew_tools(context, tool_descriptors)`
 
-      - Shared CrewAI utility helpers (`_safe_str`, `_escape_braces`,
-        `_merge_instructions`) as `@staticmethod` so subclasses can call
-        them via `self._safe_str(...)` etc. without import noise.
+      - Shared CrewAI utility helpers (`_escape_braces`, `_merge_instructions`)
+        as `@staticmethod` so subclasses can call them via `self._escape_braces(...)`
+        without import noise. Note: `safe_str` is imported from
+        `ai.common.utils` (the shared helper used by every agent
+        driver including agent_rocketride).
 
       - Default field values (`_DEFAULT_GOAL`, `_DEFAULT_BACKSTORY`,
         `_DEFAULT_EXPECTED_OUTPUT`) as class attributes used as fallbacks
@@ -88,13 +200,6 @@ class CrewBase(AgentBase):
     # ─────────────────────────────────────────────────────────────────────
     # SHARED UTILITIES
     # ─────────────────────────────────────────────────────────────────────
-
-    @staticmethod
-    def _safe_str(v: Any) -> str:
-        try:
-            return '' if v is None else str(v)
-        except Exception:
-            return ''
 
     @staticmethod
     def _escape_braces(text: str) -> str:
@@ -152,7 +257,13 @@ class CrewBase(AgentBase):
                 available_functions: Optional[Dict[str, Any]] = None,
                 **kwargs: Any,
             ) -> Union[str, Any]:
-                stop_words = getattr(self, 'stop', None)
+                # CrewAI injects the ReAct stop list ("\nObservation:") per-call via a
+                # contextvar override that is ONLY visible through the `stop_sequences`
+                # property (crewai/llms/base_llm.py) — NOT the raw `self.stop` field.
+                # Reading `self.stop` returned an empty list, so call_llm's post-hoc truncation no-oped
+                # and the model's fabricated Observation/Final Answer survived, skipping the
+                # real tool call. Read the property so truncation trims at "\nObservation:".
+                stop_words = self.stop_sequences
                 return outer_self.call_llm(
                     outer_context,
                     messages,
@@ -244,6 +355,16 @@ class CrewBase(AgentBase):
             description: str
             args_schema: type[BaseModel] = _ToolInput
 
+            def __repr__(self) -> str:
+                # Strip JSON schema suffix and CrewAI-reformatted header so planning
+                # prompts see a clean one-liner — same as native CrewAI tool reprs.
+                desc = self.description.split('\n\nTool input schema (JSON):')[0]
+                if '\nTool Description: ' in desc:
+                    desc = desc.split('\nTool Description: ', 1)[1].split('\n')[0]
+                return f'Tool(name={self.name!r}, description={desc!r})'
+
+            __str__ = __repr__
+
             def _run(self, **framework_args: Any) -> str:
                 try:
                     out = outer_self.call_tool(outer_context, self.name, framework_args)
@@ -251,9 +372,9 @@ class CrewBase(AgentBase):
                     out = {'error': str(e), 'type': type(e).__name__}
 
                 try:
-                    return json.dumps(out, default=str) if isinstance(out, (dict, list)) else CrewBase._safe_str(out)
+                    return json.dumps(out, default=str) if isinstance(out, (dict, list)) else safe_str(out)
                 except Exception:
-                    return CrewBase._safe_str(out)
+                    return safe_str(out)
 
             async def _arun(self, **framework_args: Any) -> str:
                 # The ReAct tool path goes tool.ainvoke -> _arun, so this is what

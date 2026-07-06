@@ -40,6 +40,7 @@ const {
     startServer,
     stopServer,
     execCommand,
+    runPytest,
     parallel,
     bracket,
     parseServerAddress
@@ -140,8 +141,8 @@ function makeRunPytestAction(options = {}) {
             require('dotenv').config({ path: path.join(PROJECT_ROOT, '.env') });
 
             const bracket = ctx.brackets?.['node-test-server'];
-            const port = bracket?.port || ctx.port;
-            const serverUri = bracket?.serverUri || `http://localhost:${port}`;
+            if (!bracket?.port) throw new Error('node-test-server bracket missing — server did not start');
+            const serverUri = bracket.serverUri || `http://localhost:${bracket.port}`;
 
             const testEnv = {
                 ...process.env,
@@ -150,10 +151,10 @@ function makeRunPytestAction(options = {}) {
             };
 
             // Use absolute paths since cwd is dist/server
-            const pytestArgs = ['-m', 'pytest', TEST_DIR, '-v', '--rootdir', PACKAGE_DIR];
+            const extraArgs = ['-v', '--rootdir', PACKAGE_DIR];
 
             if (!options.test_full) {
-                pytestArgs.push(
+                extraArgs.push(
                     '--ignore-glob', '**/test_*_full.py',
                     '--ignore-glob', '**/test_*_full/**');
             }
@@ -170,7 +171,7 @@ function makeRunPytestAction(options = {}) {
                 return tokens.some(t => t === '-m' || (t.startsWith('-m') && !t.startsWith('--')));
             })();
             if (!hasExplicitMarkers) {
-                pytestArgs.push('-m', 'not skip_node');
+                extraArgs.push('-m', 'not skip_node');
             }
 
             // Add any additional pytest options (from CLI or direct options)
@@ -179,10 +180,10 @@ function makeRunPytestAction(options = {}) {
                 // Handle both string and array formats
                 // CLI passes array like ["-v -s"], so split each element by spaces
                 if (typeof pytestOpts === 'string') {
-                    pytestArgs.push(...pytestOpts.split(/\s+/).filter(x => x));
+                    extraArgs.push(...pytestOpts.split(/\s+/).filter(x => x));
                 } else if (Array.isArray(pytestOpts)) {
                     for (const opt of pytestOpts) {
-                        pytestArgs.push(...opt.split(/\s+/).filter(x => x));
+                        extraArgs.push(...opt.split(/\s+/).filter(x => x));
                     }
                 }
             }
@@ -191,10 +192,10 @@ function makeRunPytestAction(options = {}) {
             const markers = options.markers;
             const pattern = options.pytestPattern;
             if (markers) {
-                pytestArgs.push('-m', markers);
+                extraArgs.push('-m', markers);
             }
             if (pattern) {
-                pytestArgs.push('-k', pattern);
+                extraArgs.push('-k', pattern);
             }
 
             // Parallel execution via pytest-xdist. Defaults to min(cpus, 8) when the
@@ -204,14 +205,32 @@ function makeRunPytestAction(options = {}) {
             const parallelRaw = options.pytestParallel ?? String(Math.min(os.cpus().length, 8));
             const parallelVal = String(parallelRaw).trim().toLowerCase();
             if (parallelVal && parallelVal !== 'off' && parallelVal !== '0') {
-                pytestArgs.push('-n', parallelVal);
+                extraArgs.push('-n', parallelVal);
+                // Honor @pytest.mark.xdist_group (set in conftest._build_parametrize_list):
+                // same-group tests run on one worker, so heavy GPU/model node tests serialize
+                // and don't OOM-crash workers. The marker is ignored under the default
+                // --dist load. Skip if the caller already chose a distribution mode via
+                // --pytest, in either `--dist <mode>` or `--dist=<mode>` form.
+                const hasDistOverride = extraArgs.some((a) => a === '--dist' || a.startsWith('--dist='));
+                if (!hasDistOverride) {
+                    extraArgs.push('--dist', 'loadgroup');
+                }
             }
 
-            await execCommand(ENGINE, pytestArgs, {
-                task,
-                cwd: PACKAGE_DIR,
-                env: testEnv,
+            await runPytest({
+                engine: ENGINE,
+                testsDir: TEST_DIR,
+                extraArgs,
+                execOpts: { task, cwd: PACKAGE_DIR, env: testEnv },
             });
+        }
+    };
+}
+
+function makeDocsGenerateAction() {
+    return {
+        run: async (ctx, task) => {
+            await execCommand('node', [path.join(__dirname, 'gen-node-tables.mjs')], { task, cwd: PACKAGE_DIR });
         }
     };
 }
@@ -219,16 +238,11 @@ function makeRunPytestAction(options = {}) {
 function makeRunContractTestsAction() {
     return {
         run: async (ctx, task) => {
-            const pytestArgs = [
-                '-m', 'pytest',
-                path.join(TEST_DIR, 'test_contracts.py'),
-                '-v',
-                '--rootdir', PACKAGE_DIR
-            ];
-
-            await execCommand(ENGINE, pytestArgs, {
-                task,
-                cwd: PACKAGE_DIR
+            await runPytest({
+                engine: ENGINE,
+                testsDir: path.join(TEST_DIR, 'test_contracts.py'),
+                extraArgs: ['-v', '--rootdir', PACKAGE_DIR],
+                execOpts: { task, cwd: PACKAGE_DIR },
             });
         }
     };
@@ -275,11 +289,12 @@ module.exports = {
         { name: 'nodes:start-server', action: makeStartTestServerAction },
         { name: 'nodes:stop-server', action: makeStopTestServerAction },
         { name: 'nodes:run-contracts', action: makeRunContractTestsAction },
+        { name: 'nodes:docs-generate', action: makeDocsGenerateAction },
 
         // Public actions (have descriptions)
         { name: 'nodes:build', action: () => ({
             description: 'Build nodes',
-            steps: ['server:build', 'nodes:sync']
+            steps: ['server:build', 'nodes:sync', 'nodes:docs-generate']
         })},
         { name: 'nodes:test', action: (options) => makeTestAction({ ...options, test_full: false }) },
         { name: 'nodes:test-full', action: (options) => makeTestAction({ ...options, test_full: true }) },

@@ -195,15 +195,9 @@ export class ConfigManager {
 		let hostUrl = gc.get<string>('hostUrl', '');
 		let apiKey = await this.getApiKeyFromStorage(group);
 
-		// Docker/Service: fixed URL and default API key
-		if (connectionMode === 'docker' || connectionMode === 'service') {
-			hostUrl = 'http://localhost:5565';
-			apiKey = apiKey || 'MYAPIKEY';
-		}
-
-		// Cloud: fall back to the build-time cloud endpoint
-		if (connectionMode === 'cloud' && !hostUrl) {
-			hostUrl = process.env.ROCKETRIDE_URI || 'http://localhost:5565';
+		// Cloud: build-time URI — ignore any stale hostUrl from other modes
+		if (connectionMode === 'cloud') {
+			hostUrl = process.env.ROCKETRIDE_URI || 'https://api.rocketride.ai';
 		}
 
 		return {
@@ -219,10 +213,12 @@ export class ConfigManager {
 		};
 	}
 
-	/**
-	 * Refreshes the cached configuration from all sources.
+/**
+	 * Refreshes the cached configuration from all sources (VS Code settings
+	 * and secure storage). Public so that callers like applyAllSettings() and
+	 * EngineRegistry can force a cache refresh after external writes.
 	 */
-	private async refreshConfig(): Promise<void> {
+	public async refreshConfig(): Promise<void> {
 		const config = vscode.workspace.getConfiguration(this.configSection);
 
 		this.config = {
@@ -263,6 +259,29 @@ export class ConfigManager {
 			defaultPipelinePath: this.config.defaultPipelinePath,
 			pipelineRestartBehavior: this.config.pipelineRestartBehavior,
 		};
+	}
+
+	/**
+	 * Returns a numeric checksum (DJB2 hash) of a group's config.
+	 * Used by the EngineRegistry reconciler to detect config changes
+	 * (API key, host URL, connection mode, etc.) without carrying
+	 * around sensitive values. When the checksum changes between
+	 * reconcile cycles, the registry restarts the affected engine.
+	 *
+	 * @param group - Which connection group to checksum.
+	 * @returns A 32-bit integer hash of the serialized group config.
+	 */
+	public getGroupChecksum(group: ConnectionGroup): number {
+		const gc = this.config[group];
+		// Serialize the full group config to a stable string for hashing.
+		// JSON.stringify order is deterministic for objects created by us.
+		const str = JSON.stringify(gc);
+		// DJB2 hash — fast, good distribution for short strings
+		let hash = 0;
+		for (let i = 0; i < str.length; i++) {
+			hash = ((hash << 5) - hash + str.charCodeAt(i)) | 0;
+		}
+		return hash;
 	}
 
 	/**
@@ -321,7 +340,7 @@ export class ConfigManager {
 				try {
 					new URL(RocketRideClient.normalizeUri(gc.hostUrl));
 				} catch {
-					errors.push(`${label}: Cloud URL must be a valid URL (e.g., https://cloud.rocketride.ai)`);
+					errors.push(`${label}: Cloud URL must be a valid URL (e.g., https://api.rocketride.ai)`);
 				}
 			}
 		} else if (gc.connectionMode === 'onprem') {
