@@ -132,7 +132,7 @@ def _build_rank_bm25_stub_module():
     import types
 
     module = types.ModuleType('rank_bm25')
-    module.BM25Okapi = _StubBM25Okapi
+    module.BM25Okapi = _StubBM25Okapi  # gitleaks:allow -- attribute assignment, not a secret
     module.__rank_bm25_test_stub__ = _RANK_BM25_STUB_TOKEN
     return module
 
