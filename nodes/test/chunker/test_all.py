@@ -21,9 +21,16 @@ from unittest.mock import MagicMock
 
 import pytest
 
-_NODES_SRC = Path(__file__).resolve().parent.parent.parent / 'src' / 'nodes'
-if str(_NODES_SRC) not in sys.path:
-    sys.path.insert(0, str(_NODES_SRC))
+_NODES_SRC = str(Path(__file__).resolve().parent.parent.parent / 'src' / 'nodes')
+# Force the node source to the FRONT of sys.path: this test directory is itself
+# importable as ``chunker`` (it has an ``__init__.py``), so unless the real node
+# package is searched first the test dir shadows it and breaks
+# ``from chunker.chunker_strategies import ...``. A plain "if not in sys.path"
+# guard is insufficient -- another node suite may already have added the path
+# *behind* this test dir, letting the test dir win.
+while _NODES_SRC in sys.path:
+    sys.path.remove(_NODES_SRC)
+sys.path.insert(0, _NODES_SRC)
 
 from chunker.chunker_strategies import (  # noqa: E402
     RecursiveCharacterChunker,
