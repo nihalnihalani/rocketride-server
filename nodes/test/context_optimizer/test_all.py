@@ -31,7 +31,7 @@ import importlib.util
 import sys
 import types
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -63,8 +63,17 @@ def _make_tiktoken_stub() -> types.ModuleType:
     def get_encoding(name: str = 'cl100k_base') -> Encoding:
         return Encoding(name)
 
+    def encoding_for_model(model_name: str) -> Encoding:
+        # Mirror tiktoken's model->encoding mapping closely enough for the
+        # optimizer's resolution path: gpt-4o / gpt-5 -> o200k_base, everything
+        # else -> cl100k_base. The stub tokenizes by whitespace regardless, so
+        # the chosen name only exercises the resolution/caching branches.
+        name = 'o200k_base' if model_name.startswith(('gpt-4o', 'gpt-5')) else 'cl100k_base'
+        return Encoding(name)
+
     module.Encoding = Encoding
     module.get_encoding = get_encoding
+    module.encoding_for_model = encoding_for_model
     return module
 
 
@@ -131,7 +140,7 @@ from context_optimizer.optimizer import ContextOptimizer  # noqa: E402
 
 
 @pytest.fixture
-def default_config() -> Dict[str, Any]:
+def default_config() -> dict[str, Any]:
     """Default optimizer configuration."""
     return {
         'model_name': 'gpt-5',
@@ -150,7 +159,7 @@ def optimizer(default_config) -> ContextOptimizer:
 
 
 @pytest.fixture
-def small_budget_config() -> Dict[str, Any]:
+def small_budget_config() -> dict[str, Any]:
     """Config with a very small context window for easy testing."""
     return {
         'model_name': 'custom',
@@ -803,10 +812,13 @@ class TestIInstanceLifecycle:
         with patch('context_optimizer.IInstance.debug') as mock_debug:
             inst.writeQuestions(q)
 
-        # The debug log about discarding should have been called
-        mock_debug.assert_any_call(
-            'context_optimizer: optimized question text produced but question.questions is empty, discarding: optimized question text'
-        )
+        # A debug log about discarding the orphaned question text should have
+        # fired. Assert on the salient signal -- the word "discarding" plus the
+        # forwarded text -- rather than the exact sentence, so harmless wording
+        # tweaks in IInstance.debug do not break this test.
+        logged = ' '.join(str(call.args[0]) for call in mock_debug.call_args_list if call.args)
+        assert 'discarding' in logged
+        assert 'optimized question text' in logged
         # Question should still be forwarded
         inst.instance.writeQuestions.assert_called_once()
 

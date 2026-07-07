@@ -290,7 +290,16 @@
 			"description": "Context optimization mode",
 			"type": "string",
 			"default": "auto",
-			"enum": ["*>preconfig.profiles.*.title"],
+			// Only "auto" and "manual" are user-facing modes. The "ci_tiny"
+			// preconfig profile exists solely for the automated test suite
+			// (it forces an 80-token budget), so it is intentionally excluded
+			// here rather than surfaced via the "*>preconfig.profiles.*.title"
+			// wildcard -- every enum option below has a matching conditional
+			// field group.
+			"enum": [
+				["auto", "Auto - Use default model limits"],
+				["manual", "Manual - Specify token limits"]
+			],
 			"conditional": [
 				{
 					"value": "auto",

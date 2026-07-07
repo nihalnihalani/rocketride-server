@@ -65,6 +65,18 @@ class ContextOptimizer:
         'gemini-1.5-pro': 1000000,
     }
 
+    # tiktoken encoding overrides for model families tiktoken may not map yet.
+    # The gpt-5 / gpt-4o families use ``o200k_base``; matched by prefix so the
+    # ``-mini`` / ``-nano`` / ``-turbo`` variants resolve too. Anything not
+    # matched here is resolved via ``tiktoken.encoding_for_model()`` at runtime,
+    # with ``_DEFAULT_ENCODING`` as the fallback for ids tiktoken does not know
+    # (non-OpenAI models like Claude / Gemini, or a bare ``custom``).
+    _MODEL_ENCODING_OVERRIDES: ClassVar[Dict[str, str]] = {
+        'gpt-5': 'o200k_base',
+        'gpt-4o': 'o200k_base',
+    }
+    _DEFAULT_ENCODING: ClassVar[str] = 'cl100k_base'
+
     # Sentence boundary pattern: split after . ! ? followed by whitespace or end
     _SENTENCE_RE = re.compile(r'(?<=[.!?])\s+')
 
@@ -121,8 +133,12 @@ class ContextOptimizer:
                 )
             self._total_limit = self.MODEL_LIMITS.get(self.model_name, 128000)
 
-        # Cache the tiktoken encoding (lazily imported)
+        # Cache the tiktoken encoding (lazily imported) and its resolved name.
+        # The name is derived from ``model_name`` on first use (see
+        # ``_resolve_encoding_name``) so gpt-5 / gpt-4o count against o200k_base
+        # rather than the old hardcoded cl100k_base.
         self._encoding = None
+        self._encoding_name: Optional[str] = None
 
         # Track which model names we've already warned about (avoids repeating
         # the same MODEL_LIMITS fallback warning on every optimize() call).
@@ -151,26 +167,59 @@ class ContextOptimizer:
     # Token counting
     # ------------------------------------------------------------------
 
-    def _get_encoding(self, encoding_name: str = 'cl100k_base'):
+    def _resolve_encoding_name(self) -> str:
+        """Resolve (and cache) the tiktoken encoding name for the configured model.
+
+        gpt-5 / gpt-4o map to ``o200k_base`` via ``_MODEL_ENCODING_OVERRIDES``;
+        older GPT ids are resolved through ``tiktoken.encoding_for_model()``.
+        Non-OpenAI models (Claude, Gemini) and unknown ids fall back to
+        ``_DEFAULT_ENCODING`` -- tiktoken is only an approximation for those, but
+        it keeps token counts stable and non-crashing.
+        """
+        if self._encoding_name is not None:
+            return self._encoding_name
+
+        model = self.model_name or ''
+        for prefix, enc_name in self._MODEL_ENCODING_OVERRIDES.items():
+            if model.startswith(prefix):
+                self._encoding_name = enc_name
+                return enc_name
+
+        import tiktoken
+
+        try:
+            self._encoding_name = tiktoken.encoding_for_model(model).name
+        except KeyError:
+            self._encoding_name = self._DEFAULT_ENCODING
+        return self._encoding_name
+
+    def _get_encoding(self, encoding_name: Optional[str] = None):
         """Return a cached tiktoken encoding instance.
 
-        tiktoken is imported lazily so that module-level import does not fail
-        before ``depends()`` has installed the package at runtime.
+        When *encoding_name* is ``None`` the encoding is resolved from the
+        configured model (see :meth:`_resolve_encoding_name`). tiktoken is
+        imported lazily so that module-level import does not fail before
+        ``depends()`` has installed the package at runtime. The cache key is the
+        encoding name, so switching models/encodings rebuilds it correctly.
         """
         import tiktoken
+
+        if encoding_name is None:
+            encoding_name = self._resolve_encoding_name()
 
         if self._encoding is None or self._encoding.name != encoding_name:
             self._encoding = tiktoken.get_encoding(encoding_name)
         return self._encoding
 
-    def count_tokens(self, text: Optional[str], encoding: str = 'cl100k_base') -> int:
-        """Count tokens in *text* using the specified tiktoken encoding.
+    def count_tokens(self, text: Optional[str], encoding: Optional[str] = None) -> int:
+        """Count tokens in *text* using the model's tiktoken encoding.
 
         Handles unicode, emoji, None, and empty strings gracefully.
 
         Args:
             text: The text to tokenize (None is treated as empty).
-            encoding: tiktoken encoding name (default ``cl100k_base``).
+            encoding: tiktoken encoding name. ``None`` (default) resolves the
+                encoding from the configured model.
 
         Returns:
             Number of tokens.
@@ -180,7 +229,7 @@ class ContextOptimizer:
         enc = self._get_encoding(encoding)
         return len(enc.encode(text))
 
-    def _message_tokens(self, msg: Dict[str, str], encoding: str = 'cl100k_base') -> int:
+    def _message_tokens(self, msg: Dict[str, str], encoding: Optional[str] = None) -> int:
         """Return the token cost of a single chat message including role overhead."""
         role_overhead = self.count_tokens(msg.get('role', ''), encoding) + 4
         return role_overhead + self.count_tokens(msg.get('content', ''), encoding)
@@ -227,23 +276,29 @@ class ContextOptimizer:
             scale = 100.0 / total_pct
             pcts = {k: v * scale for k, v in pcts.items()}
 
-        # Allocate in priority order: system_prompt, query, documents, history
+        # Allocate the first three components from their percentages (each
+        # capped at what remains), then hand history everything left over.
+        # This honors the documented priority order -- history is the lowest
+        # priority and absorbs the remainder -- and, because integer flooring
+        # of the first three leaves a few tokens unassigned, prevents that
+        # slack from being silently discarded.
         allocated: Dict[str, int] = {}
         remaining = total_tokens
 
-        for component in ('system_prompt', 'query', 'documents', 'history'):
+        for component in ('system_prompt', 'query', 'documents'):
             alloc = int(total_tokens * pcts[component] / 100.0)
             alloc = min(alloc, remaining)
             allocated[component] = alloc
             remaining -= alloc
 
+        allocated['history'] = remaining
         return allocated
 
     # ------------------------------------------------------------------
     # Truncation
     # ------------------------------------------------------------------
 
-    def truncate_to_budget(self, text: str, max_tokens: int, encoding: str = 'cl100k_base') -> str:
+    def truncate_to_budget(self, text: str, max_tokens: int, encoding: Optional[str] = None) -> str:
         """Truncate *text* to fit within *max_tokens*, preserving sentence boundaries.
 
         If the full text fits, it is returned unchanged. Otherwise the text is
@@ -296,7 +351,7 @@ class ContextOptimizer:
     # ------------------------------------------------------------------
 
     def summarize_history(
-        self, messages: List[Dict[str, str]], max_tokens: int, encoding: str = 'cl100k_base'
+        self, messages: List[Dict[str, str]], max_tokens: int, encoding: Optional[str] = None
     ) -> List[Dict[str, str]]:
         """Compress conversation history to fit within *max_tokens*.
 
@@ -338,9 +393,15 @@ class ContextOptimizer:
 
         budget_for_recent = max_tokens - first_cost - summary_cost
         if budget_for_recent <= 0:
-            # Can only fit the first message (truncated)
-            content = self.truncate_to_budget(first_msg.get('content', ''), max_tokens - 4, encoding)
-            return [{'role': first_msg.get('role', 'user'), 'content': content}]
+            # Can only fit the first message (truncated). Reserve exactly this
+            # message's role overhead -- count_tokens(role) + 4, the same
+            # accounting _message_tokens uses -- so the single returned message's
+            # total cost cannot exceed max_tokens. The previous fixed ``- 4``
+            # ignored the role token(s) and could overshoot the budget.
+            first_role = first_msg.get('role', 'user')
+            content_budget = max_tokens - (self.count_tokens(first_role, encoding) + 4)
+            content = self.truncate_to_budget(first_msg.get('content', ''), content_budget, encoding)
+            return [{'role': first_role, 'content': content}]
 
         # Greedily add recent messages from the end
         recent: List[Dict[str, str]] = []
@@ -369,7 +430,7 @@ class ContextOptimizer:
     # ------------------------------------------------------------------
 
     def rank_documents(
-        self, documents: List[Dict[str, Any]], query: str, max_tokens: int, encoding: str = 'cl100k_base'
+        self, documents: List[Dict[str, Any]], query: str, max_tokens: int, encoding: Optional[str] = None
     ) -> List[Dict[str, Any]]:
         """Select documents that fit within *max_tokens*, best-scoring first.
 
