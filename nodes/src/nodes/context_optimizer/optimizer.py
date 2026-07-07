@@ -371,13 +371,17 @@ class ContextOptimizer:
     def rank_documents(
         self, documents: List[Dict[str, Any]], query: str, max_tokens: int, encoding: str = 'cl100k_base'
     ) -> List[Dict[str, Any]]:
-        """Select documents that fit within *max_tokens*, preserving original order.
+        """Select documents that fit within *max_tokens*, best-scoring first.
 
-        Documents arriving from a vector DB are already ranked by embedding
-        similarity.  This method preserves that ordering and uses greedy
-        budget selection.  When documents carry a ``score`` field it is used
-        as the primary sort key; keyword overlap with *query* is used only as
-        a secondary tiebreaker for documents that lack a score.
+        Documents arriving from a vector DB are ranked by embedding
+        similarity.  When any document carries a ``score`` field this method
+        sorts explicitly by score descending (rather than assuming the vector
+        DB pre-sorted them) and then greedily selects to fit the budget.
+        Documents without a score sink below every scored doc while keeping
+        their incoming relative order (stable sort, missing score = -inf).
+        When no document carries a score, keyword overlap with *query* is used
+        as a lightweight relevance signal, with the original index as a
+        tiebreaker.
 
         Args:
             documents: List of dicts with at least a ``content`` key.
@@ -398,9 +402,21 @@ class ContextOptimizer:
         has_scores = any(doc.get('score') is not None for doc in documents)
 
         if not query or has_scores:
-            # Either no query to rank against, or documents already carry
-            # embedding similarity scores -- preserve original order (which
-            # is score-descending from the vector DB) and greedily select.
+            if has_scores:
+                # Documents already carry embedding similarity scores.  Sort
+                # explicitly by score descending rather than trusting the
+                # vector DB to pre-sort them (the ordering is an implicit
+                # upstream contract that this makes explicit).  The sort is
+                # stable, so a missing score is treated as -inf: unscored docs
+                # sink below every scored doc while keeping their incoming
+                # relative order.
+                documents = sorted(
+                    documents,
+                    key=lambda d: d['score'] if d.get('score') is not None else float('-inf'),
+                    reverse=True,
+                )
+            # No query to rank against (or scores handled above) -- greedily
+            # select in the resulting order to fit the token budget.
             selected: List[Dict[str, Any]] = []
             used = 0
             for doc in documents:

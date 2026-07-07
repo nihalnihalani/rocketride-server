@@ -448,6 +448,47 @@ class TestDocumentRanking:
         result = optimizer.rank_documents(docs, 'document', 10000)
         assert len(result) == 1
 
+    def test_scored_docs_sorted_descending(self, optimizer):
+        """Scored docs are reordered by score descending, not left as-is."""
+        docs = [
+            {'content': 'low relevance', 'score': 0.1},
+            {'content': 'high relevance', 'score': 0.9},
+            {'content': 'mid relevance', 'score': 0.5},
+        ]
+        result = optimizer.rank_documents(docs, 'relevance', 10000)
+        assert [d['content'] for d in result] == [
+            'high relevance',
+            'mid relevance',
+            'low relevance',
+        ]
+
+    def test_scored_budget_picks_top_scoring_subset(self, optimizer):
+        """When the budget only fits some docs, the highest-scoring win even if
+        they arrive last in the unsorted input.
+        """
+        # Equal-cost docs (~11 tokens each) so selection is driven purely by
+        # score.  A ~25-token budget fits exactly two of the three.  The two
+        # highest scorers (mid, high) must be kept; the lowest (low) dropped --
+        # even though 'high' arrives last in the unsorted input.
+        docs = [
+            {'id': 'low', 'content': 'alpha ' * 10, 'score': 0.2},
+            {'id': 'mid', 'content': 'alpha ' * 10, 'score': 0.5},
+            {'id': 'high', 'content': 'alpha ' * 10, 'score': 0.9},
+        ]
+        result = optimizer.rank_documents(docs, 'query', 25)
+        kept = {d['id'] for d in result}
+        assert kept == {'high', 'mid'}
+
+    def test_missing_score_sinks_below_scored(self, optimizer):
+        """A doc without a score ranks below every scored doc (missing = -inf)."""
+        docs = [
+            {'content': 'no score here'},
+            {'content': 'scored doc', 'score': 0.3},
+        ]
+        result = optimizer.rank_documents(docs, 'query', 10000)
+        assert result[0]['content'] == 'scored doc'
+        assert result[1]['content'] == 'no score here'
+
 
 # ===========================================================================
 # Full optimization pipeline tests
