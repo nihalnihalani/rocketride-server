@@ -10,9 +10,16 @@ import tempfile
 from pathlib import Path
 from unittest.mock import Mock
 
-NODES_SRC = Path(__file__).parent.parent.parent / 'src' / 'nodes'
-if str(NODES_SRC) not in sys.path:
-    sys.path.insert(0, str(NODES_SRC))
+NODES_SRC = str(Path(__file__).resolve().parent.parent.parent / 'src' / 'nodes')
+# Force the node source to the FRONT of sys.path: this test directory is itself
+# importable as ``local_text_output`` (it has an ``__init__.py``), so unless the
+# real node package is searched first the test dir shadows it and breaks
+# ``from local_text_output.IInstance import IInstance``. A plain "if not in
+# sys.path" guard is insufficient -- another node suite may already have added
+# the path *behind* this test dir, letting the test dir win.
+while NODES_SRC in sys.path:
+    sys.path.remove(NODES_SRC)
+sys.path.insert(0, NODES_SRC)
 
 from local_text_output.IInstance import IInstance  # noqa: E402
 
