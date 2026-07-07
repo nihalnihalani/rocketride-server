@@ -31,7 +31,7 @@
  *   clean - Remove build artifacts
  */
 const path = require('path');
-const { execCommand, syncDir, formatSyncStats, removeDirs, removeMatching, removeDirAndParents, PROJECT_ROOT, BUILD_ROOT, DIST_ROOT, mkdir, copyFile, exists, startServer, stopServer, bracket, parallel, hasSourceChanged, saveSourceHash, setState, parseServerAddress } = require('../../../scripts/lib');
+const { execCommand, runPytest, syncDir, formatSyncStats, removeDirs, removeMatching, removeDirAndParents, PROJECT_ROOT, BUILD_ROOT, DIST_ROOT, mkdir, copyFile, exists, startServer, stopServer, bracket, parallel, hasSourceChanged, saveSourceHash, setState, parseServerAddress } = require('../../../scripts/lib');
 
 const PACKAGE_DIR = path.join(__dirname, '..');
 const SRC_DIR = path.join(PACKAGE_DIR, 'src', 'rocketride');
@@ -193,9 +193,9 @@ function makeRunPytestAction(options = {}) {
 			require('dotenv').config({ path: path.join(PROJECT_ROOT, '.env') });
 
 			const bracket = ctx.brackets?.['py-test-server'];
-			const port = bracket?.port || ctx.port;
+			if (!bracket?.port) throw new Error('py-test-server bracket missing — server did not start');
 			// Use existing server URI when set (e.g. ROCKETRIDE_URI=http://localhost:5678 for debugging)
-			const serverUri = bracket?.serverUri || `http://localhost:${port}`;
+			const serverUri = bracket.serverUri || `http://localhost:${bracket.port}`;
 
 			const testEnv = {
 				...process.env,
@@ -208,16 +208,17 @@ function makeRunPytestAction(options = {}) {
 
 			// Use absolute paths since cwd is dist/server
 			const testsDir = path.join(PACKAGE_DIR, 'tests');
-			const pytestArgs = ['-m', 'pytest', testsDir, '-v', '--rootdir', PACKAGE_DIR];
+			const extraArgs = ['-v', '--rootdir', PACKAGE_DIR];
 			if (options.pytest) {
-				pytestArgs.push(...options.pytest);
+				extraArgs.push(...options.pytest);
 			}
 
 			// engine.exe uses an isolated environment - cwd must be dist/server
-			await execCommand(ENGINE, pytestArgs, {
-				task,
-				cwd: SERVER_DIR,
-				env: testEnv,
+			await runPytest({
+				engine: ENGINE,
+				testsDir,
+				extraArgs,
+				execOpts: { task, cwd: SERVER_DIR, env: testEnv },
 			});
 		},
 	};
@@ -230,6 +231,9 @@ function makeRunPytestAction(options = {}) {
 module.exports = {
 	name: 'client-python',
 	description: 'Python Client SDK',
+
+	// Co-located docs gathered by docs:gather.
+	docs: [{ source: 'docs', mount: 'develop/python' }],
 
 	actions: [
 		// Internal actions

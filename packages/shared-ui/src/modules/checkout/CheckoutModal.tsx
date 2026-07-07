@@ -4,82 +4,43 @@
 // =============================================================================
 
 /**
- * CheckoutModal — host-agnostic plan picker + Stripe Elements checkout.
+ * CheckoutModal — host-agnostic Stripe Elements checkout.
  *
- * Flow:
- *   1. Mount     → fetch plans via onFetchPlans callback
- *   2. Select    → user picks a plan (monthly / annual / etc.)
- *   3. Continue  → onCreateCheckout returns { clientSecret, subscriptionId }
- *   4. Payment   → Stripe Elements <PaymentElement> collects card details
- *   5. Submit    → stripe.confirmPayment() (redirect: 'if_required')
- *   6. Confirm   → onConfirmPending notifies server
- *   7. Success   → onSuccess — host closes modal, server pushes updated ConnectResult.apps
+ * Two-step modal:
+ *   1. **Plan picker** — delegates to the shared ``PlanPicker`` component.
+ *   2. **Payment form** — Stripe Elements collects and confirms payment.
  *
  * All server communication flows through callback props — no SDK imports.
  */
 
-import React, { useEffect, useState, useCallback, useMemo, type CSSProperties } from 'react';
+import React, { useEffect, useState, useCallback, useMemo, useRef, type CSSProperties } from 'react';
 import { loadStripe } from '@stripe/stripe-js';
 import { Elements, PaymentElement, useStripe, useElements } from '@stripe/react-stripe-js';
 import { commonStyles } from '../../themes/styles';
-import type { CheckoutModalProps, CheckoutPlan } from './types';
-
-// =============================================================================
-// HELPERS
-// =============================================================================
-
-/**
- * Formats a credit grant line using the label template from Stripe metadata.
- * Replaces ``{amount}`` with the localized number. Falls back to raw key.
- */
-function formatGrant(resource: string, amount: number, labels: Record<string, string> | null | undefined): string {
-	const template = labels?.[resource];
-	if (template) return template.replace('{amount}', amount.toLocaleString());
-	return `${amount.toLocaleString()} ${resource}`;
-}
+import { PlanPicker, planAmount } from './PlanPicker';
+import type { CheckoutModalProps, CheckoutPlan, PromoValidation } from './types';
 
 // =============================================================================
 // STYLES
 // =============================================================================
 
 const S = {
-	// Outer modal shell — two-column flex row; overflow:hidden clips the left
-	// column's background to the modal's border-radius.
+	// ── Modal shell ──────────────────────────────────────────────────────
 	modal: {
 		backgroundColor: 'var(--rr-bg-paper)',
 		border: '1px solid var(--rr-border)',
 		borderRadius: 16,
 		width: '100%',
-		maxWidth: 800,
-		display: 'flex',
+		maxWidth: 960,
 		overflow: 'hidden',
 		boxShadow: '0 24px 64px var(--rr-shadow-widget)',
 		position: 'relative' as const,
 	} as CSSProperties,
 
-	// Left summary column — app name, description, and selected plan recap.
-	leftCol: {
-		width: 260,
-		flexShrink: 0,
-		padding: '40px 28px 36px',
-		background: 'var(--rr-bg-titleBar-inactive)',
-		borderRight: '1px solid var(--rr-border)',
-		display: 'flex',
-		flexDirection: 'column' as const,
-		gap: 12,
-	} as CSSProperties,
-
-	// Right form column — plan picker (step 1) or Stripe PaymentElement (step 2).
-	rightCol: {
-		flex: 1,
-		minWidth: 0,
-		padding: '40px 32px 36px',
-	} as CSSProperties,
-
 	closeBtn: {
 		position: 'absolute' as const,
-		top: 16,
-		right: 16,
+		top: 14,
+		right: 14,
 		background: 'none',
 		border: 'none',
 		fontSize: 22,
@@ -87,86 +48,36 @@ const S = {
 		color: 'var(--rr-text-secondary)',
 		lineHeight: 1,
 		padding: '2px 6px',
+		zIndex: 1,
 	} as CSSProperties,
 
-	heading: {
+	// ── Header banner ────────────────────────────────────────────────────
+	header: {
+		padding: '28px 32px 20px',
+		borderBottom: '1px solid var(--rr-border)',
+		background: 'var(--rr-bg-titleBar-inactive)',
+	} as CSSProperties,
+
+	appName: {
 		fontSize: 20,
 		fontWeight: 700,
 		color: 'var(--rr-text-primary)',
 		margin: 0,
 	} as CSSProperties,
 
-	subtitle: {
+	appDesc: {
 		fontSize: 13,
 		color: 'var(--rr-text-secondary)',
-		margin: 0,
+		margin: '4px 0 0',
 		lineHeight: 1.5,
 	} as CSSProperties,
 
-	// Compact plan recap shown in the left column on step 2.
-	planRecap: {
-		marginTop: 'auto',
-		padding: '12px 14px',
-		borderRadius: 10,
-		border: '1px solid var(--rr-border)',
-		background: 'var(--rr-bg-paper)',
+	// ── Body ─────────────────────────────────────────────────────────────
+	body: {
+		padding: '24px 32px 32px',
 	} as CSSProperties,
 
-	planRecapLabel: {
-		...commonStyles.labelUppercase,
-		marginBottom: 6,
-	} as CSSProperties,
-
-	planRecapName: {
-		fontSize: 14,
-		fontWeight: 600,
-		color: 'var(--rr-text-primary)',
-	} as CSSProperties,
-
-	planRecapAmount: {
-		fontSize: 13,
-		color: 'var(--rr-text-secondary)',
-		marginTop: 2,
-	} as CSSProperties,
-
-	// Step 1: plan option rows.
-	stepHeading: {
-		fontSize: 15,
-		fontWeight: 600,
-		color: 'var(--rr-text-primary)',
-		margin: '0 0 14px',
-	} as CSSProperties,
-
-	planList: {
-		display: 'flex',
-		flexDirection: 'column' as const,
-		gap: 10,
-		marginBottom: 24,
-	} as CSSProperties,
-
-	planOption: (selected: boolean): CSSProperties => ({
-		display: 'flex',
-		alignItems: 'center',
-		justifyContent: 'space-between',
-		padding: '14px 16px',
-		borderRadius: 10,
-		border: `2px solid ${selected ? 'var(--rr-brand)' : 'var(--rr-border)'}`,
-		background: selected ? 'var(--rr-bg-list-active)' : 'transparent',
-		cursor: 'pointer',
-		transition: 'border-color 0.15s, background 0.15s',
-	}),
-
-	planLabel: {
-		fontSize: 15,
-		fontWeight: 600,
-		color: 'var(--rr-text-primary)',
-	} as CSSProperties,
-
-	planAmount: {
-		fontSize: 14,
-		color: 'var(--rr-text-secondary)',
-	} as CSSProperties,
-
+	// ── Buttons ──────────────────────────────────────────────────────────
 	continueBtn: (disabled: boolean): CSSProperties => ({
 		width: '100%',
 		padding: '13px 0',
@@ -216,15 +127,216 @@ const S = {
 		fontSize: 14,
 		padding: '32px 0',
 	} as CSSProperties,
+
+	// ── Plan recap shown above the payment form ──────────────────────────
+	planRecap: {
+		padding: '12px 14px',
+		borderRadius: 10,
+		border: '1px solid var(--rr-border)',
+		background: 'var(--rr-bg-titleBar-inactive)',
+		marginBottom: 16,
+		display: 'flex',
+		justifyContent: 'space-between',
+		alignItems: 'center',
+	} as CSSProperties,
+
+	planRecapName: {
+		fontSize: 14,
+		fontWeight: 600,
+		color: 'var(--rr-text-primary)',
+	} as CSSProperties,
+
+	planRecapAmount: {
+		fontSize: 14,
+		color: 'var(--rr-text-secondary)',
+	} as CSSProperties,
+
+	planRecapStrike: {
+		textDecoration: 'line-through',
+		marginRight: 8,
+	} as CSSProperties,
+
+	planRecapNow: {
+		color: 'var(--rr-text-primary)',
+		fontWeight: 700,
+	} as CSSProperties,
+
+	renewNote: {
+		fontSize: 12,
+		color: 'var(--rr-text-secondary)',
+		textAlign: 'center' as const,
+		marginTop: 10,
+	} as CSSProperties,
+
+	// ── Promo code box (step 1, under the plan cards) ────────────────────
+	promoRow: {
+		display: 'flex',
+		alignItems: 'center',
+		gap: 10,
+		margin: '2px 0 14px',
+	} as CSSProperties,
+
+	promoLabel: {
+		fontSize: 13,
+		fontWeight: 600,
+		color: 'var(--rr-text-primary)',
+		whiteSpace: 'nowrap' as const,
+	} as CSSProperties,
+
+	promoInput: {
+		flex: 1,
+		border: '1px solid var(--rr-border)',
+		borderRadius: 8,
+		padding: '9px 12px',
+		fontSize: 13,
+		color: 'var(--rr-text-primary)',
+		background: 'var(--rr-bg-paper)',
+		outline: 'none',
+	} as CSSProperties,
+
+	promoApplyBtn: (disabled: boolean): CSSProperties => ({
+		padding: '9px 18px',
+		border: '1px solid var(--rr-border)',
+		borderRadius: 8,
+		fontSize: 13,
+		fontWeight: 600,
+		background: 'var(--rr-bg-titleBar-inactive)',
+		color: 'var(--rr-text-primary)',
+		cursor: disabled ? 'not-allowed' : 'pointer',
+		opacity: disabled ? 0.6 : 1,
+	}),
+
+	promoApplied: {
+		display: 'flex',
+		alignItems: 'center',
+		gap: 8,
+		margin: '2px 0 14px',
+		padding: '9px 12px',
+		border: '1px solid var(--rr-color-success)',
+		background: 'color-mix(in srgb, var(--rr-color-success) 8%, var(--rr-bg-paper))',
+		borderRadius: 8,
+		fontSize: 13,
+	} as CSSProperties,
+
+	promoAppliedCode: {
+		fontWeight: 700,
+		letterSpacing: 0.5,
+		color: 'var(--rr-text-primary)',
+	} as CSSProperties,
+
+	promoAppliedDesc: {
+		color: 'var(--rr-text-secondary)',
+	} as CSSProperties,
+
+	promoRemoveBtn: {
+		marginLeft: 'auto',
+		background: 'none',
+		border: 'none',
+		cursor: 'pointer',
+		color: 'var(--rr-text-secondary)',
+		fontSize: 12,
+		textDecoration: 'underline',
+		padding: 0,
+	} as CSSProperties,
+
+	promoError: {
+		fontSize: 12.5,
+		color: 'var(--rr-color-error)',
+		margin: '-8px 0 14px',
+	} as CSSProperties,
+
+	// ── Grant-code success block (no payment path) ───────────────────────
+	successBlock: {
+		textAlign: 'center' as const,
+		padding: '34px 20px 10px',
+	} as CSSProperties,
+
+	successMark: {
+		width: 44,
+		height: 44,
+		borderRadius: '50%',
+		background: 'color-mix(in srgb, var(--rr-color-success) 8%, var(--rr-bg-paper))',
+		border: '2px solid var(--rr-color-success)',
+		color: 'var(--rr-color-success)',
+		fontSize: 22,
+		fontWeight: 700,
+		display: 'inline-flex',
+		alignItems: 'center',
+		justifyContent: 'center',
+		marginBottom: 14,
+	} as CSSProperties,
+
+	successTitle: {
+		fontSize: 17,
+		fontWeight: 700,
+		color: 'var(--rr-text-primary)',
+		margin: 0,
+	} as CSSProperties,
+
+	successText: {
+		fontSize: 13.5,
+		color: 'var(--rr-text-secondary)',
+		marginTop: 8,
+		lineHeight: 1.6,
+	} as CSSProperties,
+
+	successCredits: {
+		fontWeight: 700,
+		color: 'var(--rr-text-primary)',
+	} as CSSProperties,
 };
+
+// =============================================================================
+// PROMO HELPERS
+// =============================================================================
+
+/**
+ * First-invoice cents for a plan after applying a validated discount code.
+ *
+ * Prefers the server-computed `discountedAmountCents` (returned when the code
+ * was validated against this plan's price) so the displayed amount always
+ * matches the backend; local math is the fallback when the code was validated
+ * without a plan selected.
+ */
+function discountedCents(plan: CheckoutPlan, promo: PromoValidation): number {
+	if (typeof promo.discountedAmountCents === 'number') {
+		return Math.max(0, promo.discountedAmountCents);
+	}
+	const cents = plan.amountCents || 0;
+	if (promo.percentOff) return Math.max(0, Math.round(cents * (1 - promo.percentOff / 100)));
+	if (promo.amountOffCents) return Math.max(0, cents - promo.amountOffCents);
+	return cents;
+}
+
+/** Format cents as a display price string (e.g. 2175 → "$21.75"). */
+function formatCents(cents: number, currency?: string | null): string {
+	const symbol = currency?.toUpperCase() === 'EUR' ? '€' : '$';
+	const amount = cents / 100;
+	return amount === Math.floor(amount) ? `${symbol}${amount}` : `${symbol}${amount.toFixed(2)}`;
+}
+
+/** Short interval suffix for a plan ("/mo", "/yr", or ""). */
+function intervalSuffix(plan: CheckoutPlan): string {
+	return plan.interval === 'month' ? '/mo' : plan.interval === 'year' ? '/yr' : '';
+}
+
+/** Format a credits grant for display (e.g. {tokens: 10000} → "10,000 tokens"). */
+function formatCredits(credits: Record<string, number>): string {
+	return Object.entries(credits)
+		.map(([resource, amount]) => `${amount.toLocaleString()} ${resource}`)
+		.join(', ');
+}
 
 // =============================================================================
 // PAYMENT FORM (inner — needs Stripe context from <Elements>)
 // =============================================================================
 
+/** @internal */
 interface PaymentFormProps {
 	plan: CheckoutPlan;
 	subscriptionId: string;
+	/** Validated discount code applied to this checkout, if any. */
+	promo?: PromoValidation | null;
 	onConfirmPending: (subscriptionId: string, priceId: string) => Promise<void>;
 	onSuccess: () => void;
 	onError: (msg: string) => void;
@@ -233,25 +345,14 @@ interface PaymentFormProps {
 
 /**
  * Stripe Elements payment form shown after the user has selected a plan.
- * Must be rendered inside an `<Elements>` provider with a valid `clientSecret`.
- *
- * @param plan          - The selected plan (used for the submit button label).
- * @param subscriptionId - Server-side subscription ID for confirm_pending.
- * @param onConfirmPending - Callback to notify server that payment was confirmed.
- * @param onSuccess     - Called after successful payment.
- * @param onError       - Called with an error message string on failure.
- * @param onBack        - Called when the user clicks "Change plan".
+ * Must be rendered inside an ``<Elements>`` provider with a valid ``clientSecret``.
  */
-const PaymentForm: React.FC<PaymentFormProps> = ({ plan, subscriptionId, onConfirmPending, onSuccess, onError, onBack }) => {
+const PaymentForm: React.FC<PaymentFormProps> = ({ plan, subscriptionId, promo, onConfirmPending, onSuccess, onError, onBack }) => {
 	const stripe = useStripe();
 	const elements = useElements();
 	const [submitting, setSubmitting] = useState(false);
 
-	/**
-	 * Confirms the Stripe payment, then notifies the server.
-	 * The server push (from confirm_pending and the webhook) will update
-	 * ConnectResult.apps automatically.
-	 */
+	/** Confirms the Stripe payment, then notifies the server. */
 	const handleSubmit = useCallback(
 		async (e: React.FormEvent) => {
 			e.preventDefault();
@@ -259,9 +360,7 @@ const PaymentForm: React.FC<PaymentFormProps> = ({ plan, subscriptionId, onConfi
 
 			setSubmitting(true);
 			try {
-				// Step 1: Confirm the Stripe payment.
-				// redirect:'if_required' avoids a full-page redirect for most card types;
-				// 3D Secure may still redirect and return to return_url.
+				// Step 1: Confirm the Stripe payment
 				const { error } = await stripe.confirmPayment({
 					elements,
 					confirmParams: { return_url: window.location.origin },
@@ -273,16 +372,14 @@ const PaymentForm: React.FC<PaymentFormProps> = ({ plan, subscriptionId, onConfi
 					return;
 				}
 
-				// Step 2: Tell the server payment was confirmed — writes 'incomplete'
-				// to the DB so the app shows as "Pending" immediately. The webhook
-				// will flip it to 'active' once Stripe settles the charge.
+				// Step 2: Notify server — writes 'incomplete', webhook flips to 'active'
 				try {
-					await onConfirmPending(subscriptionId, plan.priceId);
+					await onConfirmPending(subscriptionId, plan.stripePriceId);
 				} catch {
 					// Non-fatal — the webhook will still update the DB
 				}
 
-				// Step 3: Close the modal. The server push will update ConnectResult.apps.
+				// Step 3: Close the modal
 				onSuccess();
 			} catch (err: any) {
 				onError(err.message ?? 'An unexpected error occurred.');
@@ -293,21 +390,43 @@ const PaymentForm: React.FC<PaymentFormProps> = ({ plan, subscriptionId, onConfi
 		[stripe, elements, subscriptionId, plan, onConfirmPending, onSuccess, onError]
 	);
 
+	// Discounted first-payment display when a discount code is applied
+	const discounted = promo ? discountedCents(plan, promo) : null;
+	const payLabel = discounted !== null ? formatCents(discounted, plan.currency) : planAmount(plan);
+
 	return (
 		<>
-			{/* Back link to plan picker */}
-			<button style={S.backBtn} onClick={onBack}>
-				&#8592; Change plan
-			</button>
+			<button style={S.backBtn} onClick={onBack}>&#8592; Change plan</button>
+
+			{/* Plan recap bar (struck-through list price when discounted) */}
+			<div style={S.planRecap}>
+				<span style={S.planRecapName}>
+					{plan.nickname}
+					{promo?.code && <span style={{ fontWeight: 400, color: 'var(--rr-text-secondary)' }}> &middot; {promo.code} applied</span>}
+				</span>
+				<span style={S.planRecapAmount}>
+					{discounted !== null ? (
+						<>
+							<span style={S.planRecapStrike}>{planAmount(plan)}</span>
+							<span style={S.planRecapNow}>{payLabel}{intervalSuffix(plan)}</span>
+						</>
+					) : (
+						planAmount(plan)
+					)}
+				</span>
+			</div>
 
 			<form onSubmit={handleSubmit}>
-				{/* Stripe renders card fields; Link opt-in suppressed via wallets option. */}
 				<PaymentElement options={{ wallets: { link: 'never' } }} />
-
 				<button type="submit" disabled={!stripe || submitting} style={S.submitBtn(!stripe || submitting)}>
-					{submitting ? 'Processing\u2026' : `Subscribe \u2014 ${plan.amount}`}
+					{submitting ? 'Processing\u2026' : `Subscribe \u2014 ${payLabel}`}
 				</button>
 			</form>
+
+			{/* One-off discounts revert to the list price on renewal */}
+			{promo?.duration === 'once' && (
+				<p style={S.renewNote}>Renews at {planAmount(plan)}{intervalSuffix(plan)}.</p>
+			)}
 		</>
 	);
 };
@@ -317,57 +436,93 @@ const PaymentForm: React.FC<PaymentFormProps> = ({ plan, subscriptionId, onConfi
 // =============================================================================
 
 /**
- * Two-step checkout modal: plan picker then Stripe Elements payment form.
- *
- * Step 1 (plan picker): the user selects from available plans fetched on mount.
- * Step 2 (payment):     the chosen plan's priceId is sent to the server to
- *                       create a Stripe subscription; Stripe Elements then
- *                       collects and confirms the payment.
+ * Two-step checkout modal: PlanPicker (step 1) then Stripe Elements (step 2).
  *
  * All server communication is via callback props — no SDK imports.
  */
-export const CheckoutModal: React.FC<CheckoutModalProps> = ({ appName, appDescription, stripePublishableKey, onFetchPlans, onCreateCheckout, onConfirmPending, onSuccess, onClose }) => {
-	// Initialise Stripe lazily — loadStripe must not be called inside render
+export const CheckoutModal: React.FC<CheckoutModalProps> = ({
+	appName,
+	appDescription,
+	stripePublishableKey,
+	preselectedPlan,
+	onFetchPlans,
+	onCreateCheckout,
+	onConfirmPending,
+	onValidatePromoCode,
+	onRedeemPromoCode,
+	onSuccess,
+	onClose,
+	onActionClick,
+}) => {
+	// Initialise Stripe lazily
 	const [stripePromise] = useState(() => loadStripe(stripePublishableKey));
 
-	// ── Step 1: plan selection ─────────────────────────────────────────────────
-	// Plans are fetched from the server on mount.
+	// ── State ────────────────────────────────────────────────────────────
 	const [plans, setPlans] = useState<CheckoutPlan[]>([]);
 	const [plansLoading, setPlansLoading] = useState(true);
-	const [selectedPlan, setSelectedPlan] = useState<CheckoutPlan | null>(null);
+	// Seed the selection from a preselected plan so the payment step can render
+	// its recap immediately (and the picker is skipped — see the auto-advance
+	// effect below).
+	const [selectedPlan, setSelectedPlan] = useState<CheckoutPlan | null>(preselectedPlan ?? null);
 
-	// ── Step 2: payment ────────────────────────────────────────────────────────
-	// clientSecret is null until the user clicks "Continue" and the server responds.
 	const [clientSecret, setClientSecret] = useState<string | null>(null);
 	const [subscriptionId, setSubscriptionId] = useState<string>('');
-	// Loading flag while the checkout request is in flight
 	const [loadingSecret, setLoadingSecret] = useState(false);
-	// Error message to display in the modal
 	const [error, setError] = useState<string | null>(null);
 
-	// Fetch available plans on mount
+	// ── Promo code state ─────────────────────────────────────────────────
+	const promoEnabled = Boolean(onValidatePromoCode);
+	const [promoInput, setPromoInput] = useState('');
+	const [appliedPromo, setAppliedPromo] = useState<PromoValidation | null>(null);
+	const [promoBusy, setPromoBusy] = useState(false);
+	const [promoError, setPromoError] = useState<string | null>(null);
+	// Set after a grant/hackathon code redeems — renders the success block
+	const [grantResult, setGrantResult] = useState<{
+		code: string;
+		credits: Record<string, number>;
+		mode: 'subscribed' | 'credits_only';
+	} | null>(null);
+
+	// ── Fetch plans on mount ─────────────────────────────────────────────
 	useEffect(() => {
 		onFetchPlans()
 			.then((fetched) => {
-				setPlans(fetched);
-				// Pre-select the first plan (monthly comes first, sorted by server)
-				if (fetched.length > 0) setSelectedPlan(fetched[0]!);
+				// Filter out top-up packs (handled by the TopUpModal) and hidden
+				// promo-base plans (only reachable via promo-code redemption)
+				const subscriptionPlans = fetched.filter(
+					(p) => p.metadata?.kind !== 'topup' && p.metadata?.kind !== 'promo_base' && p.isActive !== false,
+				);
+				setPlans(subscriptionPlans);
+				// Default selection (lowest-order billable plan at the visible
+				// interval -- i.e. Starter) is driven by PlanPicker via
+				// ``autoSelectDefault`` so the selection always matches the
+				// interval that is actually shown.
 			})
 			.catch((err) => setError(err.message ?? 'Failed to load subscription plans.'))
 			.finally(() => setPlansLoading(false));
 	}, [onFetchPlans]);
 
-	/**
-	 * Called when the user confirms their selected plan.
-	 * Creates a Stripe subscription on the server and advances to the payment step.
-	 */
+	/** Creates a Stripe subscription and advances to payment. */
 	const handleContinue = useCallback(async () => {
-		if (!selectedPlan) return;
+		// promoBusy guard: never start checkout while a just-entered code is
+		// still validating/redeeming — it would silently drop the promo.
+		if (!selectedPlan || selectedPlan.metadata?.action || promoBusy) return;
 
 		setLoadingSecret(true);
 		setError(null);
 		try {
-			const res = await onCreateCheckout(selectedPlan.priceId);
+			const res = await onCreateCheckout(selectedPlan.stripePriceId, appliedPromo?.code);
+			if (res.clientSecret === null) {
+				// $0 first invoice (100%-off code) — the subscription is already
+				// active; never mount Elements. Best-effort pending write, then done.
+				try {
+					await onConfirmPending(res.subscriptionId, selectedPlan.stripePriceId);
+				} catch {
+					// Non-fatal — the webhook will still update the DB
+				}
+				onSuccess();
+				return;
+			}
 			setClientSecret(res.clientSecret);
 			setSubscriptionId(res.subscriptionId);
 		} catch (err: any) {
@@ -375,19 +530,91 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({ appName, appDescri
 		} finally {
 			setLoadingSecret(false);
 		}
-	}, [selectedPlan, onCreateCheckout]);
+	}, [selectedPlan, appliedPromo, promoBusy, onCreateCheckout, onConfirmPending, onSuccess]);
 
-	/** Resets back to the plan picker without closing the modal. */
+	/** Resets back to the plan picker. */
 	const handleBack = useCallback(() => {
 		setClientSecret(null);
 		setError(null);
 	}, []);
 
-	// Stripe Elements appearance — matches the shell's design tokens.
-	// Stripe rejects CSS variables, so resolve them to computed values.
+	/**
+	 * Validates the entered promo code. Grant/hackathon codes redeem
+	 * immediately (no plan or payment involved); discount codes stay
+	 * applied and flow into checkout via handleContinue.
+	 */
+	const handleApplyPromo = useCallback(async () => {
+		if (!onValidatePromoCode) return;
+		const code = promoInput.trim();
+		if (!code) return;
+
+		setPromoBusy(true);
+		setPromoError(null);
+		try {
+			const validation = await onValidatePromoCode(code, selectedPlan?.stripePriceId);
+			if (!validation.valid) {
+				setPromoError(validation.reason ?? 'This code is not valid or has expired.');
+				return;
+			}
+			if (validation.appId && onRedeemPromoCode) {
+				// Grant/hackathon code (identified by its target app) — redeem
+				// right away, skip plan + payment. Credits are optional: a
+				// 0-token code just activates the plan.
+				const redemption = await onRedeemPromoCode(code);
+				setGrantResult({
+					code: validation.code ?? code.toUpperCase(),
+					credits: redemption.credits ?? {},
+					mode: redemption.mode,
+				});
+				return;
+			}
+			// Preserve the entered code if validation omits the canonical one —
+			// handleContinue sends appliedPromo.code to the server.
+			setAppliedPromo({ ...validation, code: validation.code ?? code.toUpperCase() });
+		} catch (err: any) {
+			setPromoError(err?.message ?? 'Could not apply this code. Please try again.');
+		} finally {
+			setPromoBusy(false);
+		}
+	}, [promoInput, selectedPlan, onValidatePromoCode, onRedeemPromoCode]);
+
+	/** Clears the applied discount code. */
+	const handleRemovePromo = useCallback(() => {
+		setAppliedPromo(null);
+		setPromoInput('');
+		setPromoError(null);
+	}, []);
+
+	/**
+	 * Plan selection wrapper: an applied discount was validated against the
+	 * previously selected plan's price, so switching plans clears it — the
+	 * user re-applies the code and gets amounts for the new plan.
+	 */
+	const handleSelectPlan = useCallback((plan: CheckoutPlan | null) => {
+		setSelectedPlan(plan);
+		if (appliedPromo) {
+			setAppliedPromo(null);
+			setPromoError(null);
+		}
+	}, [appliedPromo]);
+
+	// When a plan is preselected (web pricing page), skip the picker entirely:
+	// create the subscription immediately so the user lands on the payment step.
+	// At mount ``plans`` is still empty, so the PlanPicker cannot re-select a
+	// default over our seeded selection before this fires. Runs once.
+	const autoStartedRef = useRef(false);
+	useEffect(() => {
+		if (!preselectedPlan || autoStartedRef.current) return;
+		if (!clientSecret && !loadingSecret) {
+			autoStartedRef.current = true;
+			void handleContinue();
+		}
+	}, [preselectedPlan, clientSecret, loadingSecret, handleContinue]);
+
+	// Stripe Elements appearance
 	const appearance = useMemo(() => {
 		const root = getComputedStyle(document.documentElement);
-		const resolve = (varName: string, fallback: string) => root.getPropertyValue(varName).trim() || fallback;
+		const resolve = (v: string, fb: string) => root.getPropertyValue(v).trim() || fb;
 		return {
 			theme: 'stripe' as const,
 			variables: {
@@ -401,103 +628,125 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({ appName, appDescri
 		};
 	}, []);
 
+	// ── Render ───────────────────────────────────────────────────────────
 	return (
-		<div style={{ ...commonStyles.modalOverlay, fontFamily: 'var(--rr-font-family)' }} onClick={(e) => e.target === e.currentTarget && onClose()}>
+		<div
+			style={{ ...commonStyles.modalOverlay, fontFamily: 'var(--rr-font-family)' }}
+			onClick={(e) => e.target === e.currentTarget && onClose()}
+		>
 			<div style={S.modal}>
-				{/* Close button — absolute, floats over the right column */}
-				<button style={S.closeBtn} onClick={onClose} aria-label="Close">
-					&times;
-				</button>
+				<button style={S.closeBtn} onClick={onClose} aria-label="Close">&times;</button>
 
-				{/* ── Left column: app summary ──────────────────────────────────── */}
-				<div style={S.leftCol}>
-					<h2 style={S.heading}>{appName}</h2>
-					<p style={S.subtitle}>{appDescription ?? 'Choose a plan to get started.'}</p>
-
-					{/* On step 2 show the selected plan as a recap card */}
-					{clientSecret && selectedPlan && (
-						<div style={S.planRecap}>
-							<div style={S.planRecapLabel}>Selected plan</div>
-							<div style={S.planRecapName}>{selectedPlan.label}</div>
-							<div style={S.planRecapAmount}>{selectedPlan.amount}</div>
-						</div>
-					)}
+				{/* Header banner */}
+				<div style={S.header}>
+					<h2 style={S.appName}>{appName}</h2>
+					{appDescription && <p style={S.appDesc}>{appDescription}</p>}
 				</div>
 
-				{/* ── Right column: plan picker (step 1) or payment form (step 2) ── */}
-				<div style={S.rightCol}>
+				{/* Body */}
+				<div style={S.body}>
 					{error && <p style={S.error}>{error}</p>}
 
-					{plansLoading ? (
-						<p style={S.status}>Loading plans&hellip;</p>
+					{grantResult ? (
+						/* Grant/hackathon code redeemed — no plan, no payment */
+						<div style={S.successBlock}>
+							<div style={S.successMark}>{'✓'}</div>
+							<h3 style={S.successTitle}>
+								{grantResult.mode === 'subscribed'
+									? 'No payment required — your plan is active.'
+									: 'Code redeemed.'}
+							</h3>
+							<p style={S.successText}>
+								{Object.keys(grantResult.credits).length > 0 && (
+									<>
+										<span style={S.successCredits}>{formatCredits(grantResult.credits)}</span> added to your organization.
+										<br />
+									</>
+								)}
+								Code <b>{grantResult.code}</b>
+							</p>
+							<button style={S.submitBtn(false)} onClick={onSuccess}>Start building</button>
+						</div>
+
 					) : clientSecret && selectedPlan ? (
+						/* Step 2: payment form */
 						<Elements stripe={stripePromise} options={{ clientSecret, appearance }}>
-							<PaymentForm plan={selectedPlan} subscriptionId={subscriptionId} onConfirmPending={onConfirmPending} onSuccess={onSuccess} onError={setError} onBack={handleBack} />
+							<PaymentForm
+								plan={selectedPlan}
+								subscriptionId={subscriptionId}
+								promo={appliedPromo}
+								onConfirmPending={onConfirmPending}
+								onSuccess={onSuccess}
+								onError={setError}
+								onBack={handleBack}
+							/>
 						</Elements>
+
 					) : loadingSecret ? (
 						<p style={S.status}>Preparing checkout&hellip;</p>
+
 					) : (
-						/* ── Step 1: plan picker ──────────────────────────────── */
-						<>
-							<p style={S.stepHeading}>Choose a plan</p>
-							<div style={S.planList} role="radiogroup" aria-label="Subscription plans">
-								{plans.map((plan) => (
-									<div
-										key={plan.priceId}
-										style={S.planOption(selectedPlan?.priceId === plan.priceId)}
-										onClick={() => setSelectedPlan(plan)}
-										onKeyDown={(e) => {
-											if (e.key === 'Enter' || e.key === ' ') {
-												e.preventDefault();
-												setSelectedPlan(plan);
-											}
-										}}
-										role="radio"
-										tabIndex={0}
-										aria-checked={selectedPlan?.priceId === plan.priceId}
+						/* Step 1: plan picker (+ promo code box when the host wires it) */
+						<PlanPicker
+							plans={plans}
+							loading={plansLoading}
+							selectedPlan={selectedPlan}
+							onSelectPlan={handleSelectPlan}
+							onActionClick={onActionClick}
+							autoSelectDefault
+							footer={
+								<>
+									{promoEnabled && (appliedPromo ? (
+										<div style={S.promoApplied}>
+											<span style={S.promoAppliedCode}>{appliedPromo.code}</span>
+											<span style={S.promoAppliedDesc}>
+												{appliedPromo.description}
+												{selectedPlan && (
+													<>
+														{' — '}
+														<b style={{ color: 'var(--rr-text-primary)' }}>
+															{formatCents(discountedCents(selectedPlan, appliedPromo), selectedPlan.currency)}{intervalSuffix(selectedPlan)}
+														</b>
+														{appliedPromo.duration !== 'forever' && `, then ${planAmount(selectedPlan)}${intervalSuffix(selectedPlan)}`}
+													</>
+												)}
+											</span>
+											<button style={S.promoRemoveBtn} onClick={handleRemovePromo}>Remove</button>
+										</div>
+									) : (
+										<>
+											<div style={S.promoRow}>
+												<span style={S.promoLabel}>Promo Code</span>
+												<input
+													style={S.promoInput}
+													value={promoInput}
+													placeholder="Enter code"
+													onChange={(e) => { setPromoInput(e.target.value); setPromoError(null); }}
+													onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); void handleApplyPromo(); } }}
+													disabled={promoBusy}
+													aria-label="Promo code"
+												/>
+												<button
+													style={S.promoApplyBtn(promoBusy || !promoInput.trim())}
+													disabled={promoBusy || !promoInput.trim()}
+													onClick={() => void handleApplyPromo()}
+												>
+													{promoBusy ? 'Applying…' : 'Apply'}
+												</button>
+											</div>
+											{promoError && <p style={S.promoError}>{promoError}</p>}
+										</>
+									))}
+									<button
+										style={S.continueBtn(!selectedPlan || !!selectedPlan.metadata?.action || promoBusy)}
+										disabled={!selectedPlan || !!selectedPlan.metadata?.action || promoBusy}
+										onClick={handleContinue}
 									>
-										<span style={S.planLabel}>{plan.label}</span>
-										<span style={S.planAmount}>{plan.amount}</span>
-									</div>
-								))}
-							</div>
-
-							{/* Credit grant details for the selected plan */}
-							{selectedPlan?.credits && (() => {
-								const { initial, recurring } = selectedPlan.credits!;
-								const labels = selectedPlan.creditLabels;
-								// Welcome bonus = initial - recurring (only show if > 0)
-								const bonuses = initial && recurring
-									? Object.entries(initial)
-										.map(([res, amt]) => ({ res, diff: amt - (recurring[res] ?? 0) }))
-										.filter(({ diff }) => diff > 0)
-									: [];
-								return (
-									<div style={{ marginBottom: 16, fontSize: 12, color: 'var(--rr-text-secondary)', lineHeight: 1.7 }}>
-										{bonuses.length > 0 && (
-											<>
-												<div style={{ fontWeight: 600, color: 'var(--rr-text-primary)' }}>As a Welcome gift</div>
-												{bonuses.map(({ res, diff }) => (
-													<div key={`b-${res}`} style={{ paddingLeft: 12 }}>{formatGrant(res, diff, labels)} bonus</div>
-												))}
-											</>
-										)}
-										{recurring && (
-											<>
-												<div style={{ fontWeight: 600, color: 'var(--rr-text-primary)', marginTop: bonuses.length > 0 ? 6 : 0 }}>Monthly</div>
-												{Object.entries(recurring).map(([res, amt]) => (
-													<div key={`r-${res}`} style={{ paddingLeft: 12 }}>{formatGrant(res, amt, labels)}</div>
-												))}
-											</>
-										)}
-									</div>
-								);
-							})()}
-
-							<button style={S.continueBtn(!selectedPlan)} disabled={!selectedPlan} onClick={handleContinue}>
-								Continue
-							</button>
-						</>
+										Continue
+									</button>
+								</>
+							}
+						/>
 					)}
 				</div>
 			</div>

@@ -40,7 +40,7 @@
 import { ReactElement, useRef, useState, useEffect, useMemo, useCallback } from 'react';
 import { RJSFValidationError } from '@rjsf/utils';
 import Form from '@rjsf/core';
-import validator from '../../../util/csp-safe-validator';
+import validator from '@rjsf/validator-ajv8';
 
 import { TextField } from '@mui/material';
 import { IFormData } from '../../../types';
@@ -131,19 +131,8 @@ const styles = {
 		minHeight: 0,
 		paddingTop: '8px',
 	},
-	footer: { flexShrink: 0, paddingTop: '8px', display: 'flex', flexDirection: 'column' as const, alignItems: 'flex-end' },
-	saveButton: {
-		padding: '6px 20px',
-		fontSize: '13px',
-		fontFamily: 'var(--rr-font-family-widget)',
-		fontWeight: 500,
-		color: 'var(--rr-fg-button)',
-		backgroundColor: 'var(--rr-bg-button)',
-		border: 'none',
-		borderRadius: '3px',
-		cursor: 'pointer',
-	},
-	saveButtonDisabled: { opacity: 0.5, cursor: 'not-allowed' },
+	footer: { flexShrink: 0, paddingTop: '8px', display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: '10px' },
+	footerHint: { fontSize: '11px', color: 'var(--rr-text-disabled)', marginRight: 'auto' },
 	errorBox: {
 		width: '100%',
 		padding: '10px 14px',
@@ -170,9 +159,9 @@ const styles = {
 		position: 'absolute' as const,
 		left: 0,
 		top: 0,
-		width: 2,
+		width: 4,
 		height: '100%',
-		background: 'var(--rr-brand)',
+		background: 'var(--rr-sash-hover)',
 	},
 };
 
@@ -199,7 +188,7 @@ export default function NodeConfigPanel({ node, onClose }: INodeConfigPanelProps
 
 	// --- Context ------------------------------------------------------------
 	const { updateNode, onContentUpdated } = useFlowGraph();
-	const { servicesJson, handleValidatePipeline, currentProject: _currentProject, googlePickerDeveloperKey, googlePickerClientId } = useFlowProject();
+	const { servicesJson, handleValidatePipeline, currentProject: _currentProject, googlePickerDeveloperKey, googlePickerClientId, pendingOAuthTokens, clearPendingOAuthTokens, envKeys = [] } = useFlowProject();
 	const { getPreference, setPreference, isLocked } = useFlowPreferences();
 
 	// --- Annotation detection -----------------------------------------------
@@ -209,7 +198,7 @@ export default function NodeConfigPanel({ node, onClose }: INodeConfigPanelProps
 	const service: IService | undefined = (servicesJson as IServiceCatalog)?.[node.data.provider];
 
 	// --- OAuth callback helpers (context-free) ------------------------------
-	const { applyOAuthCallbacks, clearSecureParamsFromUrl } = useOAuthCallbacks();
+	const { applyOAuthCallbacks, applyGoogleTokens, clearSecureParamsFromUrl } = useOAuthCallbacks();
 
 	// --- Schema from the service catalog ------------------------------------
 	const schema = useMemo((): IServiceSchema | undefined => {
@@ -278,6 +267,34 @@ export default function NodeConfigPanel({ node, onClose }: INodeConfigPanelProps
 		// eslint-disable-next-line react-hooks/exhaustive-deps
 	}, [node.id]);
 
+	// --- Apply OAuth tokens delivered out-of-band by the host (VS Code) ------
+	// Web hosts return tokens in the page URL (handled above); VS Code can't
+	// receive a web redirect, so the host intercepts the broker's deep link and
+	// pushes the tokens down via `pendingOAuthTokens`. Apply them to the node
+	// that started the login, then clear so they aren't re-applied.
+	useEffect(() => {
+		if (!pendingOAuthTokens) return;
+		const { tokens, state } = pendingOAuthTokens;
+
+		// Brokers echo the originating node_id in `state`; ignore tokens meant
+		// for another node. Malformed state falls through to the open panel.
+		let targetNodeId: string | undefined;
+		try {
+			targetNodeId = (JSON.parse(state || '{}') as { node_id?: string }).node_id;
+		} catch {
+			/* malformed state */
+		}
+		if (targetNodeId && targetNodeId !== node.id) return;
+
+		const enrichedConfig = applyGoogleTokens(node.data.config ?? {}, tokens, state);
+		persistTokensFromFormData(enrichedConfig, persistedAuthTokens);
+		setFormValues(enrichedConfig);
+		persistOAuthTokensAndSave(node.id, enrichedConfig, updateNode, onContentUpdated).catch((err) => console.error('Error persisting OAuth tokens:', err));
+
+		clearPendingOAuthTokens?.();
+		// eslint-disable-next-line react-hooks/exhaustive-deps
+	}, [pendingOAuthTokens, node.id]);
+
 	// --- RJSF change handler ------------------------------------------------
 	const onChange = useCallback(
 		({ formData }: Partial<{ formData: IFormData }>) => {
@@ -298,15 +315,31 @@ export default function NodeConfigPanel({ node, onClose }: INodeConfigPanelProps
 		[node.id, updateNode]
 	);
 
-	// --- Friendly auth error messages ---------------------------------------
-	const transformErrors = useCallback((errors: RJSFValidationError[]) => {
-		return errors.map((error) => {
-			if (['accessToken', 'refreshToken', 'userToken'].includes(error.params?.missingProperty ?? '')) {
-				error.stack = 'Authentication required';
-			}
-			return error;
-		});
-	}, []);
+	// --- Friendly auth error messages + env var bypass -----------------------
+	const transformErrors = useCallback(
+		(errors: RJSFValidationError[]) => {
+			return errors
+				.filter((error) => {
+					// Suppress validation errors for fields whose value is an env var reference
+					if (error.property) {
+						const fieldPath = error.property.replace(/^\./, '').split('.');
+						// eslint-disable-next-line @typescript-eslint/no-explicit-any
+						const fieldValue = fieldPath.reduce((obj: any, key) => obj?.[key], formValues);
+						if (typeof fieldValue === 'string' && /^\$\{ROCKETRIDE_\w+\}$/.test(fieldValue)) {
+							return false;
+						}
+					}
+					return true;
+				})
+				.map((error) => {
+					if (['accessToken', 'refreshToken', 'userToken'].includes(error.params?.missingProperty ?? '')) {
+						error.stack = 'Authentication required';
+					}
+					return error;
+				});
+		},
+		[formValues],
+	);
 
 	// --- Save: details only (no schema) ------------------------------------
 	const handleSaveDetailsOnly = useCallback(() => {
@@ -549,6 +582,7 @@ export default function NodeConfigPanel({ node, onClose }: INodeConfigPanelProps
 										googlePickerClientId,
 										nodeId: node.id,
 										formDataErrors: node.data.formDataErrors,
+										envKeys,
 									}}
 									disabled={false}
 									validator={validator}
@@ -564,8 +598,9 @@ export default function NodeConfigPanel({ node, onClose }: INodeConfigPanelProps
 						{/* Footer */}
 						<div style={styles.footer}>
 							{validationError && <div style={styles.errorBox}>{validationError}</div>}
+							{envKeys.length > 0 && <span style={styles.footerHint}>Type $&#123; in a field to pick from your variables</span>}
 							<button
-								style={{ ...styles.saveButton, ...(disableSave ? styles.saveButtonDisabled : {}) }}
+								style={{ ...commonStyles.buttonPrimary, ...(disableSave ? commonStyles.buttonDisabled : {}) }}
 								disabled={disableSave}
 								onClick={() => {
 									if (schema) {
@@ -575,7 +610,7 @@ export default function NodeConfigPanel({ node, onClose }: INodeConfigPanelProps
 									}
 								}}
 							>
-								{isSubmitting ? 'Validating...' : 'Save Changes'}
+								{isSubmitting ? 'Validating...' : 'Save'}
 							</button>
 						</div>
 					</div>
