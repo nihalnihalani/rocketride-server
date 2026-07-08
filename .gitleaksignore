@@ -7,9 +7,10 @@
 # force-push at end of April resurfaced the finding on this dot release PR.
 fd6b61d56b0671f7a3d24d0314d060a3d0d61b8c:nodes/src/nodes/tool_exa_search/services.json:pipe-file-api-key:138
 
-# False positive: rank_bm25 test stand-in in the search_hybrid suite. The line
-# "module.BM25Okapi = _StubBM25Okapi" (a class assignment on a stub module built
-# only when rank_bm25 is absent) pattern-matches generic-api-key. No secret —
-# see the inline gitleaks:allow on the current tree; this pins the historical
-# commit that predates the annotation.
+# False positive: rank_bm25 test stand-in in the search_hybrid suite. A class
+# assignment on a locally built stub module pattern-matches generic-api-key
+# (no secret involved; see the inline allow annotation on the current tree).
+# First fingerprint pins the pre-annotation historical commit; second pins the
+# earlier revision of this file whose comment quoted the flagged line verbatim.
 ecda922f33ab3c7cfc951319763d319818e0b149:nodes/test/search_hybrid/test_all.py:generic-api-key:135
+180737973253a8d96baab83e193a0ed838288826:.gitleaksignore:generic-api-key:11
