@@ -254,8 +254,10 @@ class MiscCommands(DAPConn):
             if source:
                 inner['source'] = source
 
-            # Validate it
-            data = validatePipeline(inner)
+            # validatePipeline expects the config under a top-level 'pipeline'
+            # key — same envelope pipe_Validate (modules/pipe) builds; without
+            # it every config fails with "'pipeline' is missing or invalid"
+            data = validatePipeline({'pipeline': inner})
 
             # Return the results
             return self.build_response(request, body=data)
