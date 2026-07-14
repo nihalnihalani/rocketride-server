@@ -6,13 +6,7 @@
 		"types": [
 			"jest",
 			"node"
-		],
-		"baseUrl": ".",
-		"paths": {
-			"rocketride": [
-				"../client-typescript/src/client/index.ts"
-			]
-		}
+		]
 	},
 	"include": [
 		"./src/**/*",

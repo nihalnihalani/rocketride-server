@@ -482,6 +482,12 @@ export function initFromScript(
 	if (script.dataset[MOUNTED_FLAG] === 'true') {
 		return null;
 	}
+	// Page-level guard: two separate <script> includes load two independent
+	// module scopes, so the per-script flag alone cannot deduplicate them.
+	const doc = script.ownerDocument ?? document;
+	if (doc.querySelector('[data-rocketride-chat-bubble]')) {
+		return null;
+	}
 	script.dataset[MOUNTED_FLAG] = 'true';
-	return mountChatBubble(config, script.ownerDocument ?? document);
+	return mountChatBubble(config, doc);
 }

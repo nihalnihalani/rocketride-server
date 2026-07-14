@@ -10,12 +10,8 @@
 		"forceConsistentCasingInFileNames": true,
 		"allowSyntheticDefaultImports": true,
 		"resolveJsonModule": true,
-		"noImplicitAny": true,
 		"noImplicitReturns": true,
-		"noImplicitThis": true,
 		"noUnusedLocals": true,
-		"strictNullChecks": true,
-		"strictPropertyInitialization": true,
 		"baseUrl": ".",
 		"paths": {
 			"rocketride": ["../client-typescript/src/client/index.ts"]

@@ -347,6 +347,23 @@ describe('initFromScript', () => {
 		first?.destroy();
 	});
 
+	it('mounts only one bubble when two separate script tags are included', () => {
+		// Two independent <script> includes load two module scopes, so the
+		// per-script flag alone cannot deduplicate — the page-level guard must.
+		const first = makeScript({ 'engine-url': 'http://engine.test:5565' });
+		const second = makeScript({ 'engine-url': 'http://engine.test:5565' });
+		document.body.appendChild(first);
+		document.body.appendChild(second);
+
+		const firstHandle = initFromScript(first);
+		const secondHandle = initFromScript(second);
+
+		expect(firstHandle).not.toBeNull();
+		expect(secondHandle).toBeNull();
+		expect(document.querySelectorAll('[data-rocketride-chat-bubble]')).toHaveLength(1);
+		firstHandle?.destroy();
+	});
+
 	it('returns null for a script tag without data-engine-url', () => {
 		const script = makeScript({ title: 'No engine' });
 		document.body.appendChild(script);

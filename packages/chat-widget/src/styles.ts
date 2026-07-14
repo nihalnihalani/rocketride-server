@@ -368,7 +368,8 @@ export const WIDGET_STYLES = `
 }
 
 .rr-root[data-theme='dark'] .rr-input:focus-visible,
-.rr-root[data-theme='dark'] .rr-send:focus-visible {
+.rr-root[data-theme='dark'] .rr-send:focus-visible,
+.rr-root[data-theme='dark'] .rr-retry:focus-visible {
 	outline-color: var(--_accent-text);
 }
 
