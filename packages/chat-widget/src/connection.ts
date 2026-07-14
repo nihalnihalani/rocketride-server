@@ -1,0 +1,245 @@
+/**
+ * MIT License
+ *
+ * Copyright (c) 2026 Aparavi Software AG
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
+
+/**
+ * Protocol layer for the chat widget — a UI-free wrapper around the workspace
+ * 'rocketride' TypeScript SDK.
+ *
+ * AUTH MODEL (security-critical): the widget authenticates with the pipeline's
+ * PUBLIC auth key only — the same `{host}/chat?auth={public_auth}` credential
+ * the chat source node publishes for end users. NEVER configure the widget
+ * with an engine API key or any private token: the auth value is embedded in
+ * the host page and is visible to every visitor. The public key both
+ * authenticates the WebSocket connection and addresses the pipeline
+ * (`client.chat({ token })`), mirroring apps/chat-ui.
+ *
+ * Reconnection is owned by the SDK (`persist: true`): after a drop it retries
+ * with linear backoff and never gives up; this class only translates the SDK
+ * callbacks into UI-friendly state changes.
+ *
+ * @module connection
+ */
+
+import { ConnectionException, PIPELINE_RESULT, Question, QuestionType, RocketRideClient, RocketRideClientConfig } from 'rocketride';
+import { ChatClientFactory, ChatClientLike, ChatHistoryItem, ConnectionState } from './types';
+
+/** Maximum number of prior messages replayed to the pipeline for context (mirrors apps/chat-ui). */
+export const HISTORY_LIMIT = 6;
+
+/** Options for {@link WidgetConnection}. */
+export interface WidgetConnectionOptions {
+	/** Engine URL, e.g. `http://localhost:5565` (normalised by the SDK). */
+	engineUrl: string;
+	/**
+	 * The pipeline's PUBLIC auth key — the `?auth=` value from the chat source
+	 * node's published link. Never an engine API key or private token.
+	 */
+	auth: string;
+	/** Notified whenever the connection state changes. `detail` carries the error/disconnect reason. */
+	onStateChange?: (state: ConnectionState, detail?: string) => void;
+	/** Notified with live pipeline status ('thinking') lines while a question is processed. */
+	onStatus?: (text: string) => void;
+	/** Client factory override for headless unit tests. Defaults to the real SDK client. */
+	createClient?: ChatClientFactory;
+}
+
+/**
+ * Extracts displayable answer texts from a pipeline result.
+ *
+ * `result_types` maps dynamic field names to data types; fields typed 'text'
+ * or 'answers' hold displayable strings (either directly, as arrays, or as
+ * `{ answer: string }` objects). Mirrors apps/chat-ui/src/utils/pipelineUtils.
+ *
+ * @param result - Pipeline result returned by `client.chat()` (narrowed defensively)
+ * @returns Answer strings in result order (empty when the pipeline returned none)
+ */
+export function extractAnswerTexts(result: PIPELINE_RESULT | unknown): string[] {
+	const texts: string[] = [];
+	if (!result || typeof result !== 'object') {
+		return texts;
+	}
+	const pipelineResult = result as PIPELINE_RESULT;
+	if (!pipelineResult.result_types || typeof pipelineResult.result_types !== 'object') {
+		return texts;
+	}
+
+	for (const [fieldName, fieldType] of Object.entries(pipelineResult.result_types)) {
+		if (fieldType !== 'text' && fieldType !== 'answers') {
+			continue;
+		}
+		const fieldData: unknown = pipelineResult[fieldName];
+		if (Array.isArray(fieldData)) {
+			for (const item of fieldData) {
+				if (typeof item === 'string' && item.trim()) {
+					texts.push(item);
+				}
+			}
+		} else if (typeof fieldData === 'string' && fieldData.trim()) {
+			texts.push(fieldData);
+		} else if (typeof fieldData === 'object' && fieldData !== null && typeof (fieldData as Record<string, unknown>).answer === 'string') {
+			// Answer objects arrive as { answer: string, expectJson: bool }.
+			const answer = ((fieldData as Record<string, unknown>).answer as string).trim();
+			if (answer) {
+				texts.push(answer);
+			}
+		}
+	}
+
+	return texts;
+}
+
+/**
+ * Manages one persistent widget connection to a RocketRide engine.
+ *
+ * UI-free by design: all UI concerns are delivered through the callbacks in
+ * {@link WidgetConnectionOptions}, so this class is unit-testable headlessly
+ * with an injected {@link ChatClientFactory}.
+ */
+export class WidgetConnection {
+	private readonly _options: WidgetConnectionOptions;
+	private _client: ChatClientLike | null = null;
+	private _state: ConnectionState = 'idle';
+	private _manualDisconnect = false;
+
+	constructor(options: WidgetConnectionOptions) {
+		this._options = options;
+	}
+
+	/** Current connection state. */
+	get state(): ConnectionState {
+		return this._state;
+	}
+
+	/** True once the transport is connected and authenticated. */
+	isConnected(): boolean {
+		return this._state === 'connected' && this._client !== null && this._client.isConnected();
+	}
+
+	/**
+	 * Opens the persistent connection. Resolves once the first attempt
+	 * completes; with `persist` the SDK keeps retrying on failure/drop, so a
+	 * resolved promise does not imply the state is 'connected' — observe
+	 * `onStateChange`. Idempotent while a client exists.
+	 *
+	 * @throws Error when engineUrl or auth is missing
+	 */
+	async connect(): Promise<void> {
+		if (this._client) {
+			return;
+		}
+		if (!this._options.engineUrl || !this._options.auth) {
+			throw new Error("WidgetConnection requires both engineUrl and auth (the pipeline's public auth key).");
+		}
+
+		this._setState('connecting');
+		this._manualDisconnect = false;
+
+		const config: RocketRideClientConfig = {
+			// PUBLIC auth key only — see the module doc comment.
+			auth: this._options.auth,
+			uri: this._options.engineUrl,
+			// The SDK owns reconnection: linear backoff, retries forever.
+			persist: true,
+			// Never fall back to ambient env credentials (e.g. ROCKETRIDE_APIKEY).
+			env: {},
+			module: 'chat-widget',
+			clientName: 'RocketRide Chat Widget',
+			onConnected: async () => {
+				this._setState('connected');
+			},
+			onDisconnected: async (reason?: string, hasError?: boolean) => {
+				if (this._manualDisconnect) {
+					return;
+				}
+				// The SDK immediately schedules a reconnect; reflect an error state
+				// for server-side rejections, otherwise show 'connecting'.
+				this._setState(hasError ? 'error' : 'connecting', reason || 'Connection lost');
+			},
+			onConnectError: (error: ConnectionException) => {
+				this._setState('error', error.message);
+			},
+		};
+
+		const factory: ChatClientFactory = this._options.createClient ?? ((clientConfig) => new RocketRideClient(clientConfig));
+		this._client = factory(config);
+		await this._client.connect();
+	}
+
+	/** Closes the connection and disables automatic reconnection. */
+	async disconnect(): Promise<void> {
+		this._manualDisconnect = true;
+		const client = this._client;
+		this._client = null;
+		if (client) {
+			await client.disconnect();
+		}
+		this._setState('idle');
+	}
+
+	/** Force-retries the connection immediately (error-state Retry button). */
+	async retry(): Promise<void> {
+		await this.disconnect();
+		await this.connect();
+	}
+
+	/**
+	 * Sends one question through the pipeline and resolves with the answers.
+	 *
+	 * @param text - The user's question
+	 * @param history - Prior conversation turns for context; only the last
+	 *   {@link HISTORY_LIMIT} are sent (UI-only entries must be pre-filtered)
+	 * @returns Answer texts extracted from the pipeline result
+	 * @throws Error when the connection has not been opened or the pipeline fails
+	 */
+	async ask(text: string, history: ChatHistoryItem[] = []): Promise<string[]> {
+		if (!this._client) {
+			throw new Error('Not connected to RocketRide — call connect() first.');
+		}
+
+		const question = new Question({ type: QuestionType.PROMPT, expectJson: false });
+		question.addQuestion(text);
+		for (const item of history.slice(-HISTORY_LIMIT)) {
+			question.addHistory({ role: item.role, content: item.content });
+		}
+
+		const result = await this._client.chat({
+			// The pipeline is addressed with the same public auth key.
+			token: this._options.auth,
+			question,
+			onSSE: async (_type: string, data: Record<string, unknown>) => {
+				const message = data.message;
+				if (typeof message === 'string' && message) {
+					this._options.onStatus?.(message);
+				}
+			},
+		});
+
+		return extractAnswerTexts(result);
+	}
+
+	private _setState(state: ConnectionState, detail?: string): void {
+		this._state = state;
+		this._options.onStateChange?.(state, detail);
+	}
+}

@@ -1,0 +1,25 @@
+{
+	"extends": "./tsconfig.json",
+	"compilerOptions": {
+		"module": "commonjs",
+		"noUnusedLocals": false,
+		"types": [
+			"jest",
+			"node"
+		],
+		"baseUrl": ".",
+		"paths": {
+			"rocketride": [
+				"../client-typescript/src/client/index.ts"
+			]
+		}
+	},
+	"include": [
+		"./src/**/*",
+		"./tests/**/*"
+	],
+	"exclude": [
+		"node_modules",
+		"dist"
+	]
+}
