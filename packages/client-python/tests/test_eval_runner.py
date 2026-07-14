@@ -239,6 +239,21 @@ class TestRunSpecOrchestration:
         assert 'evaluator bug' in case.error
         assert fake.terminated_tokens() == ['task-1']
 
+    async def test_teardown_when_judge_factory_raises(self, monkeypatch):
+        """A raising judge_factory must not orphan the already-started pipeline."""
+        monkeypatch.setattr(runner_module, 'evaluate_assertion', passing_evaluate)
+        fake = FakeClient(chat_results=['x'])
+
+        def exploding_factory(run_pipeline, default_path):
+            raise RuntimeError('factory bug')
+
+        with pytest.raises(RuntimeError, match='factory bug'):
+            await runner_module.run_spec(
+                fake, make_spec([make_case()]), case_filter=None, fail_fast=False, judge_factory=exploding_factory
+            )
+
+        assert fake.terminated_tokens() == ['task-1']
+
     async def test_teardown_failure_is_swallowed(self, monkeypatch):
         monkeypatch.setattr(runner_module, 'evaluate_assertion', passing_evaluate)
         fake = FakeClient(chat_results=['x'])

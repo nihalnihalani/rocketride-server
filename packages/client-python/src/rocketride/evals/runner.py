@@ -304,12 +304,15 @@ async def run_spec(
         future = asyncio.run_coroutine_threadsafe(_judge_chat(pipeline_path, prompt), loop)
         return future.result()
 
-    judge: Callable[..., Any] | None = None
-    if judge_factory is not None:
-        judge = judge_factory(run_pipeline, spec.judge_pipeline or default_judge_pipeline_path())
-
     case_results: list[CaseResult] = []
     try:
+        # Judge setup happens inside the teardown scope: the pipeline under
+        # test is already running, so a raising judge_factory must not skip
+        # the finally block below.
+        judge: Callable[..., Any] | None = None
+        if judge_factory is not None:
+            judge = judge_factory(run_pipeline, spec.judge_pipeline or default_judge_pipeline_path())
+
         for case in selected:
             case_result = await _run_case(client, token, case, judge)
             case_results.append(case_result)
