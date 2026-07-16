@@ -34,8 +34,10 @@ Span hierarchy (documented contract):
       task-level root span per run. Runs are keyed primarily by the wire
       correlation id ``body['__id']`` (``'<token8hex>.<source>'``), falling
       back to ``(project_id, source)``. A run first observed through
-      fallback-keyed events is PROMOTED to its canonical id when that id
-      later arrives (never tracked twice); runs already tracked under a
+      fallback-keyed events is reconciled when its canonical id becomes
+      known: PROMOTED to the canonical key, or ABSORBED into an
+      already-tracked canonical state (duplicate segments closed as
+      unclosed) — never tracked twice. Runs already tracked under a
       different canonical id are distinct runs and are never merged.
     - ``apaevt_flow`` ``op='begin'`` opens a pipe root span for that
       ``(run, pipe id)`` segment, parented to the run's task span when one is
@@ -315,22 +317,31 @@ class FlowSpanMapper:
     def _get_run(self, run_id: str, project_id: str, source: str) -> _RunState:
         key = self._resolve_key(run_id, project_id, source)
         run = self._runs.pop(key, None)
-        if run is None and run_id and (project_id or source):
-            # Promote, never duplicate: a run first observed through events
+        if run_id and (project_id or source):
+            # Reconcile, never duplicate: a run first observed through events
             # without a correlation id lives under the '<project>|<source>'
-            # fallback key. When its canonical id arrives (task begin or the
-            # seeded running snapshot), migrate that state to the canonical
-            # key instead of opening a parallel second run — otherwise its
-            # open spans are stranded (kept alive by every snapshot that
-            # announces the same project/source pair) and later flow events
-            # spawn duplicate implicit roots. Only the fallback-format key is
-            # migrated; a run tracked under a DIFFERENT canonical id is a
-            # distinct run and is never merged.
-            run = self._runs.pop(f'{project_id}|{source}', None)
-            if run is not None:
-                logger.debug('promoting fallback-keyed run %s to canonical id %s', run.key, key)
-                run.key = key
-                self._restamp_run_id(run, key)
+            # fallback key. That state can exist NEXT TO a canonical one when
+            # no alias was registered yet — e.g. the canonical state was
+            # seeded by an SSE __id, which carries no project/source. When
+            # the canonical id and the project/source identity finally meet
+            # on one event, a fallback-keyed state for the pair is PROMOTED
+            # to the canonical key (no canonical state yet) or ABSORBED into
+            # the existing canonical state — otherwise its open spans are
+            # stranded (kept alive by every snapshot that announces the same
+            # project/source pair) and later flow events spawn duplicate
+            # implicit roots. Only the fallback-format key is touched; a run
+            # tracked under a DIFFERENT canonical id is a distinct run and
+            # is never merged.
+            stray = self._runs.pop(f'{project_id}|{source}', None)
+            if stray is not None:
+                if run is None:
+                    logger.debug('promoting fallback-keyed run %s to canonical id %s', stray.key, key)
+                    run = stray
+                    run.key = key
+                    self._restamp_run_id(run, key)
+                else:
+                    logger.debug('absorbing fallback-keyed run %s into canonical run %s', stray.key, key)
+                    self._absorb_fallback_run(run, stray)
         if run is None:
             # Evict before inserting so the new run itself is never a victim.
             self._evict_runs_above(MAX_TRACKED_RUNS - 1)
@@ -353,6 +364,38 @@ class FlowSpanMapper:
             pipe.root.set_attribute(ATTR_RUN_ID, key)
             for entry in pipe.stack:
                 entry.span.set_attribute(ATTR_RUN_ID, key)
+
+    def _absorb_fallback_run(self, run: _RunState, stray: _RunState) -> None:
+        """
+        Merge a stranded fallback-keyed state into the already-tracked canonical run.
+
+        The canonical state is authoritative: stray pipes it does not track
+        migrate over (their open spans re-stamped with the canonical run id);
+        a stray pipe whose id the canonical state already tracks is a
+        duplicate segment and is closed as unclosed, like any other state the
+        wire abandoned. A stray task span is adopted only when the canonical
+        run has none; otherwise it too is closed as unclosed.
+        """
+        for pipe_id in list(stray.pipes):
+            if pipe_id in run.pipes:
+                self._close_pipe(stray, pipe_id, unclosed=True)
+            else:
+                state = stray.pipes.pop(pipe_id)
+                run.pipes[pipe_id] = state
+                state.root.set_attribute(ATTR_RUN_ID, run.key)
+                for entry in state.stack:
+                    entry.span.set_attribute(ATTR_RUN_ID, run.key)
+        if stray.task_span is not None:
+            if run.task_span is None:
+                run.task_span = stray.task_span
+                run.task_span.set_attribute(ATTR_RUN_ID, run.key)
+            else:
+                stray.task_span.set_attribute(ATTR_SPAN_UNCLOSED, True)
+                stray.task_span.end()
+            stray.task_span = None
+        run.name = run.name or stray.name
+        run.project_id = run.project_id or stray.project_id
+        run.source = run.source or stray.source
 
     def _evict_runs_above(self, max_size: int) -> None:
         """Close and drop least-recently-eventful runs until at most max_size remain."""

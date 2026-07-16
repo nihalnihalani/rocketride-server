@@ -519,6 +519,56 @@ def test_promotion_never_merges_distinct_canonical_runs():
     assert len(spans_by_name(exporter, 'task second')) == 1
 
 
+def test_fallback_state_absorbed_when_canonical_state_already_exists():
+    """SSE-first ordering: an SSE __id seeds the canonical state WITHOUT
+    project/source (SSE bodies carry neither), so no alias exists and id-less
+    flow events open a parallel fallback-keyed state. When the canonical id
+    and the project/source identity finally meet on one event, the fallback
+    state must be absorbed — not left stranded next to the canonical one.
+    """
+    mapper, exporter = make_mapper()
+    # 1. SSE with __id creates the canonical run (implicit root for pipe 5).
+    mapper.handle_event('apaevt_sse', {'pipe_id': 5, 'type': 'thinking', '__id': RUN_ID})
+    # 2. Id-less flow events for the same run: no alias -> fallback state.
+    mapper.handle_event('apaevt_flow', flow('begin', 'probe.txt', pipes=['probe.txt'], run_id=''))
+    mapper.handle_event('apaevt_flow', flow('enter', 'response_1', run_id=''))
+    # 3. Canonical id + project/source meet on the task begin event.
+    mapper.handle_event('apaevt_task', task('begin', name='demo'))
+    # 4. Later canonical-id flow events must hit the one surviving state.
+    mapper.handle_event('apaevt_flow', flow('leave', 'response_1', trace={'result': 'continue'}))
+    mapper.handle_event('apaevt_flow', flow('end', 'probe.txt'))
+    mapper.handle_event('apaevt_task', task('end'))
+
+    assert mapper.open_span_count() == 0  # nothing stranded under the fallback key
+    assert len(spans_by_name(exporter, 'task demo')) == 1
+    assert len(spans_by_name(exporter, 'probe.txt')) == 1
+    assert not spans_by_name(exporter, 'pipe 0')  # no duplicate root for pipe 0
+    leave_span = spans_by_name(exporter, 'response_1')[0]
+    assert ATTR_SPAN_UNCLOSED not in (leave_span.attributes or {})
+    # Migrated spans are re-stamped with the canonical id.
+    assert leave_span.attributes['rocketride.run_id'] == RUN_ID
+    assert spans_by_name(exporter, 'probe.txt')[0].attributes['rocketride.run_id'] == RUN_ID
+
+
+def test_fallback_absorption_closes_colliding_pipes_as_unclosed():
+    """When both states opened the same pipe id, the canonical segment wins
+    and the fallback duplicate is closed as unclosed rather than merged.
+    """
+    mapper, exporter = make_mapper()
+    mapper.handle_event('apaevt_sse', {'pipe_id': 0, 'type': 'thinking', '__id': RUN_ID})
+    mapper.handle_event('apaevt_flow', flow('begin', 'probe.txt', pipes=['probe.txt'], run_id=''))
+    mapper.handle_event('apaevt_task', task('begin', name='demo'))  # reconciles: pipe 0 collides
+    mapper.handle_event('apaevt_task', task('end'))
+
+    assert mapper.open_span_count() == 0
+    # The fallback duplicate for pipe 0 was closed as unclosed at absorption.
+    stray_root = spans_by_name(exporter, 'probe.txt')[0]
+    assert stray_root.attributes[ATTR_SPAN_UNCLOSED] is True
+    # The canonical implicit root (carrying the SSE event) survived until task end.
+    implicit = spans_by_name(exporter, 'pipe 0')[0]
+    assert [event for event in implicit.events if event.name == 'thinking']
+
+
 def test_task_restart_closes_and_reopens():
     mapper, exporter = make_mapper()
     mapper.handle_event('apaevt_task', task('begin', name='demo.My webhook'))
