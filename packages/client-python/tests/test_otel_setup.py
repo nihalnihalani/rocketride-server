@@ -41,6 +41,10 @@ import pytest
 
 pytest.importorskip('opentelemetry')
 pytest.importorskip('opentelemetry.sdk')
+# CI environments can carry opentelemetry-api/sdk as another package's
+# transitive dependency WITHOUT the OTLP exporter; these tests exercise the
+# exporter, so skip on the most specific module they need.
+pytest.importorskip('opentelemetry.exporter.otlp.proto.http')
 
 from rocketride.otelbridge.setup import (
     OtelNotInstalledError,
@@ -101,6 +105,18 @@ def test_resolve_endpoint_supports_vendor_base_paths():
         _resolve_endpoint('https://api.smith.langchain.com/otel', 'v1/traces')
         == 'https://api.smith.langchain.com/otel/v1/traces'
     )
+
+
+def test_partial_install_missing_http_exporter_raises_friendly_hint(monkeypatch):
+    """api/sdk present but exporter absent must raise OtelNotInstalledError, not ModuleNotFoundError."""
+    # A None entry in sys.modules makes 'import x' raise ImportError — the
+    # standard way to simulate the partial install CI exhibits (api/sdk pulled
+    # in transitively, exporter package absent).
+    monkeypatch.setitem(sys.modules, 'opentelemetry.exporter.otlp.proto.http.trace_exporter', None)
+    monkeypatch.setitem(sys.modules, 'opentelemetry.exporter.otlp.proto.http', None)
+
+    with pytest.raises(OtelNotInstalledError, match=r'rocketride\[otel\]'):
+        _build_span_exporter(BridgeConfigStub(endpoint='http://collector:4318'))
 
 
 def test_span_exporter_uses_config_endpoint_and_headers():

@@ -111,7 +111,13 @@ def _build_span_exporter(config: Any) -> Any:
             return OTLPSpanExporter(endpoint=config.endpoint, headers=headers)
         return OTLPSpanExporter(headers=headers)
 
-    from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+    try:
+        from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+    except ImportError as exc:
+        # A partial install (opentelemetry-api/sdk present as someone else's
+        # transitive dependency, exporter absent) must give the same friendly
+        # hint as a missing extra, not a raw ModuleNotFoundError.
+        raise OtelNotInstalledError(_INSTALL_HINT) from exc
 
     if config.endpoint:
         return OTLPSpanExporter(endpoint=_resolve_endpoint(config.endpoint, 'v1/traces'), headers=headers)
@@ -133,7 +139,10 @@ def _build_metric_exporter(config: Any) -> Any:
             return OTLPMetricExporter(endpoint=config.endpoint, headers=headers)
         return OTLPMetricExporter(headers=headers)
 
-    from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
+    try:
+        from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
+    except ImportError as exc:
+        raise OtelNotInstalledError(_INSTALL_HINT) from exc
 
     if config.endpoint:
         return OTLPMetricExporter(endpoint=_resolve_endpoint(config.endpoint, 'v1/metrics'), headers=headers)
