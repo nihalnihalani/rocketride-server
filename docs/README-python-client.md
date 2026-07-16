@@ -570,7 +570,7 @@ rocketride status --token <token>            # Monitor task progress
 rocketride stop --token <token>              # Terminate a running task
 rocketride list                              # List all active tasks
 rocketride events ALL --token <token>        # Stream task events
-rocketride rrext_store get_all_projects      # List stored projects
+rocketride store dir /                       # List the root of the file store
 ```
 
 All commands accept `--uri` and `--apikey` flags, or read from environment variables.
