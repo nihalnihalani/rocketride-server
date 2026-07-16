@@ -33,9 +33,15 @@ Environment variables honored when the matching CLI argument is absent:
     - OTEL_EXPORTER_OTLP_ENDPOINT: OTLP base URL (signal paths such as
       ``/v1/traces`` are appended by the exporter setup, matching the
       OpenTelemetry SDK's base-endpoint semantics)
-    - OTEL_EXPORTER_OTLP_HEADERS: comma-separated ``key=value`` pairs sent
-      with every OTLP export request (e.g. ``Authorization=Basic <b64>`` for
-      Langfuse or ``x-api-key=<key>,Langsmith-Project=<proj>`` for LangSmith)
+    - OTEL_EXPORTER_OTLP_HEADERS (and the signal-specific
+      OTEL_EXPORTER_OTLP_TRACES_HEADERS / OTEL_EXPORTER_OTLP_METRICS_HEADERS):
+      comma-separated ``key=value`` pairs sent with every OTLP export request
+      (e.g. ``Authorization=Basic <b64>`` for Langfuse or
+      ``x-api-key=<key>,Langsmith-Project=<proj>`` for LangSmith). These are
+      deliberately NOT parsed here: without ``--headers`` the exporters are
+      constructed with no explicit header set and the OTel SDK resolves the
+      environment itself (signal-specific variables first, then the generic
+      one). An explicit ``--headers`` overrides all of them.
     - OTEL_SERVICE_NAME: the ``service.name`` resource attribute
 
 When neither ``--endpoint`` nor ``OTEL_EXPORTER_OTLP_ENDPOINT`` is set, the
@@ -68,6 +74,8 @@ DEFAULT_SERVICE_NAME = 'rocketride-engine'
 
 # Standard OpenTelemetry environment variable names
 ENV_OTLP_ENDPOINT = 'OTEL_EXPORTER_OTLP_ENDPOINT'
+# Header env vars are resolved by the SDK exporters (see from_args_env), never
+# parsed here; the name is kept for documentation and tests.
 ENV_OTLP_HEADERS = 'OTEL_EXPORTER_OTLP_HEADERS'
 ENV_SERVICE_NAME = 'OTEL_SERVICE_NAME'
 
@@ -127,7 +135,10 @@ class OtelConfig:
             content reaches any span.
         no_metrics: When True, only traces are exported; apaevt_status_update
             snapshots are not mapped to OTel metrics.
-        headers: Extra headers sent with every OTLP export request.
+        headers: Explicit extra headers sent with every OTLP export request
+            (from ``--headers``). When empty, the exporters receive no
+            explicit headers and the OTel SDK resolves the standard
+            ``OTEL_EXPORTER_OTLP_*HEADERS`` environment variables itself.
     """
 
     endpoint: Optional[str] = None
@@ -145,7 +156,9 @@ class OtelConfig:
         Resolution precedence for each field: CLI argument (when present and
         non-empty) > standard ``OTEL_*`` environment variable > default.
         Missing attributes on ``args`` are treated as absent, so partial
-        namespaces (e.g. in tests) work.
+        namespaces (e.g. in tests) work. Headers are resolved from
+        ``--headers`` only; the header environment variables are left to the
+        OTel SDK exporters so their signal-specific precedence applies.
 
         Args:
             args: Parsed argparse namespace (or any object with optional
@@ -165,8 +178,15 @@ class OtelConfig:
         protocol = getattr(args, 'protocol', None) or DEFAULT_PROTOCOL
         service_name = getattr(args, 'service_name', None) or environ.get(ENV_SERVICE_NAME) or DEFAULT_SERVICE_NAME
 
-        headers_arg = getattr(args, 'headers', None)
-        headers = parse_headers(headers_arg if headers_arg else environ.get(ENV_OTLP_HEADERS))
+        # Only explicit --headers become constructor headers. When the flag is
+        # absent, headers stays empty and the exporters are built with NO
+        # explicit header set, so the OTel SDK resolves the environment itself
+        # with its documented precedence: signal-specific
+        # OTEL_EXPORTER_OTLP_TRACES_HEADERS / OTEL_EXPORTER_OTLP_METRICS_HEADERS
+        # first, then the generic OTEL_EXPORTER_OTLP_HEADERS. Pre-parsing the
+        # generic variable here would turn it into an explicit header set that
+        # silently overrides the signal-specific variables.
+        headers = parse_headers(getattr(args, 'headers', None))
 
         return cls(
             endpoint=endpoint,

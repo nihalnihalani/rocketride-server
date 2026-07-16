@@ -94,7 +94,7 @@ rocketride otel [--endpoint URL] [--protocol http|grpc] [--service-name NAME]
 | `--endpoint <url>`  | `OTEL_EXPORTER_OTLP_ENDPOINT`, else the exporter default (`http://localhost:4318` for http, `localhost:4317` for grpc) | OTLP **base** URL. The signal paths `/v1/traces` / `/v1/metrics` are appended automatically unless already present, so pasting Langfuse's or LangSmith's ingest URL just works. With neither the flag nor `OTEL_EXPORTER_OTLP_ENDPOINT` set, the signal-specific `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` / `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` variables are honored too. |
 | `--protocol <p>`    | `http`                                        | OTLP transport: `http` (http/protobuf) or `grpc`. The gRPC exporter is **not** part of the `otel` extra — see [Troubleshooting](#troubleshooting). |
 | `--service-name <n>`| `OTEL_SERVICE_NAME` or `rocketride-engine`    | The `service.name` resource attribute your backend groups by.                                                                          |
-| `--headers <pairs>` | `OTEL_EXPORTER_OTLP_HEADERS`                  | Comma-separated `key=value` pairs sent with every OTLP request (collector auth). Values are split on the *first* `=` only, so base64 padding survives. |
+| `--headers <pairs>` | `OTEL_EXPORTER_OTLP_HEADERS`                  | Comma-separated `key=value` pairs sent with every OTLP request. Values are split on the *first* `=` only, so base64 padding survives. **Prefer the env var for secrets** — command-line arguments are visible in shell history and `ps` output; keep `--headers` for non-secret headers. Without the flag, the OTel SDK resolves `OTEL_EXPORTER_OTLP_HEADERS` and the signal-specific `OTEL_EXPORTER_OTLP_TRACES_HEADERS` / `OTEL_EXPORTER_OTLP_METRICS_HEADERS` itself. |
 | `--include-content` | off                                           | Include pipeline payload content in spans, truncated to 8 KB per attribute. **By default no payload text reaches any span.**            |
 | `--no-metrics`      | off                                           | Export traces only; task status snapshots are not mapped to metrics.                                                                   |
 | `--trace-level <l>` | —                                             | **Informational only.** The bridge cannot change the trace level of runs it did not start; this flag just prints a reminder of how to start traced runs. |
@@ -105,7 +105,11 @@ bridge subscribes to every task your API key owns.
 
 **Configuration precedence:** explicit CLI flags > standard `OTEL_*` environment
 variables (`OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_HEADERS`,
-`OTEL_SERVICE_NAME`) > built-in defaults.
+`OTEL_SERVICE_NAME`) > built-in defaults. Header environment variables are
+resolved by the OTel SDK exporters themselves (never pre-parsed by the bridge),
+so the signal-specific `OTEL_EXPORTER_OTLP_TRACES_HEADERS` /
+`OTEL_EXPORTER_OTLP_METRICS_HEADERS` keep their spec-defined precedence over the
+generic variable whenever `--headers` is not given.
 
 **Exit codes:** `0` graceful shutdown (Ctrl+C / SIGTERM), `1` unexpected runtime error,
 `2` missing dependency (the `otel` extra, or the gRPC exporter with `--protocol grpc`)
@@ -136,12 +140,15 @@ Langfuse ingests OTLP **traces over HTTP only** (no gRPC, no metrics) at
 ```bash
 # Build the Basic auth value from your Langfuse project keys (pk-lf-... : sk-lf-...)
 export LANGFUSE_AUTH=$(echo -n 'pk-lf-your-public-key:sk-lf-your-secret-key' | base64)
+export OTEL_EXPORTER_OTLP_HEADERS="Authorization=Basic ${LANGFUSE_AUTH}"
 
 rocketride otel \
   --endpoint https://cloud.langfuse.com/api/public/otel \
-  --headers "Authorization=Basic ${LANGFUSE_AUTH}" \
   --no-metrics
 ```
+
+The auth header travels via `OTEL_EXPORTER_OTLP_HEADERS` rather than a `--headers`
+argument so the secret never lands in your shell history or shows up in `ps` output.
 
 Use `https://us.cloud.langfuse.com/api/public/otel` for the US region, or
 `https://<your-host>/api/public/otel` for self-hosted (Langfuse v3.22.0+). Pass
@@ -154,9 +161,11 @@ LangSmith ingests OTLP traces over HTTP at `/otel`, authenticated with an `x-api
 header (optional `Langsmith-Project` header to pick the project):
 
 ```bash
+# Env var, not --headers: keeps the API key out of shell history / ps output
+export OTEL_EXPORTER_OTLP_HEADERS='x-api-key=your-langsmith-api-key,Langsmith-Project=your-project-name'
+
 rocketride otel \
   --endpoint https://api.smith.langchain.com/otel \
-  --headers 'x-api-key=your-langsmith-api-key,Langsmith-Project=your-project-name' \
   --no-metrics
 ```
 
@@ -202,8 +211,9 @@ task <task name>                     task root span (INTERNAL), one per run
 ```
 
 Runs are correlated primarily on the wire correlation id (`__id`,
-`<token-prefix>.<source>`), falling back to `(project_id, source)`. Details worth
-knowing:
+`<token-prefix>.<source>`), falling back to `(project_id, source)`. A run first
+observed through events lacking `__id` is promoted to its canonical id when that id
+later arrives — never tracked twice. Details worth knowing:
 
 - **enter/leave pairing is by component identity**, never stack position (the monitor
   protocol documents why). Expect one short component span per lane write — including
@@ -213,9 +223,11 @@ knowing:
   an error.
 - **Attaching mid-run:** events for pipes the bridge never saw begin get an implicit
   root span marked `rocketride.span.implicit=true`.
-- **Errors:** a `trace.error` on any flow event sets span status `ERROR`, records an
-  `exception` span event, and sets `error.type` (`_OTHER` — the wire error is a
-  free-form string).
+- **Errors:** a `trace.error` on a component `leave` event sets span status `ERROR`,
+  records an `exception` span event, and sets `error.type` (`_OTHER` — the wire error
+  is a free-form string). The error *text* is treated as payload: by default the
+  status description is a generic `component error` and the exception event carries
+  no message; with `--include-content` the wire error text is exported (8 KB cap).
 - **Task restarts** close the current spans and open a fresh task span with
   `rocketride.task.restarted=true`.
 - **GenAI conventions:** component ids map to GenAI semantic conventions where the id
@@ -257,12 +269,16 @@ never emitted.
 ## Privacy: content is excluded by default
 
 By default **no pipeline payload content reaches any span** — not lane data
-(`trace.data`), not run-segment results, not SSE message bodies. Only structural
-metadata (names, ids, lanes, counts, timings) is exported, so the bridge is safe to
-point at a shared collector out of the box.
+(`trace.data`), not run-segment results, not SSE message bodies, and not the
+free-form error text of failed components (node errors routinely quote their input;
+the error *signal* — `ERROR` status, `error.type`, the `exception` span event — still
+exports, with the generic description `component error`). Only structural metadata
+(names, ids, lanes, counts, timings) is exported, so the bridge is safe to point at a
+shared collector out of the box.
 
 Opting in with `--include-content` copies payload content into the
-`rocketride.trace.data`, `rocketride.result`, and `rocketride.sse.data` attributes,
+`rocketride.trace.data`, `rocketride.result`, and `rocketride.sse.data` attributes and
+exports the verbatim wire error text in span statuses and `exception` events —
 JSON-serialized and truncated to **8192 characters** per attribute. Treat the flag as
 what it is: pipeline inputs and outputs flowing into your telemetry backend.
 

@@ -54,8 +54,12 @@ Key Features:
 Usage:
     rocketride otel --apikey <key>
     rocketride otel --endpoint http://localhost:4318 --service-name my-engine
-    rocketride otel --headers 'Authorization=Basic <b64>' --no-metrics
+    rocketride otel --headers 'Langsmith-Project=my-project' --no-metrics
     rocketride otel --include-content --apikey <key>
+
+Secrets (collector auth values) are best passed via OTEL_EXPORTER_OTLP_HEADERS
+rather than --headers: command-line arguments land in shell history and are
+visible in process listings.
 
 Requires the optional OpenTelemetry dependencies:
     pip install 'rocketride[otel]'
@@ -175,7 +179,16 @@ class OtelCommand(BaseCommand):
         # --trace-level is documentation-surface only: the monitor protocol
         # has no way to change the trace level of runs the bridge didn't start
         trace_level = getattr(self.args, 'trace_level', None)
-        if trace_level:
+        if trace_level == 'none':
+            # 'none' disables flow tracing, so "emit FLOW events at that
+            # level" would be nonsense for it.
+            print(
+                "Note: --trace-level=none is informational only. 'none' means flow tracing stays "
+                'disabled: runs started without a pipelineTraceLevel (or with '
+                "pipelineTraceLevel='none') emit no FLOW events, so only task lifecycle spans "
+                'and metrics are exported.'
+            )
+        elif trace_level:
             print(
                 f'Note: --trace-level={trace_level} is informational only. The bridge cannot change the '
                 f'trace level of runs it did not start; start runs with '

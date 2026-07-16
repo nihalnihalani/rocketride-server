@@ -285,9 +285,10 @@ pip install 'rocketride[otel]'
 # Export to a local collector (default endpoint http://localhost:4318)
 rocketride otel
 
-# Export to a specific backend with auth headers
-rocketride otel --endpoint https://cloud.langfuse.com/api/public/otel \
-  --headers "Authorization=Basic ${AUTH_VALUE}" --no-metrics
+# Export to a specific backend — pass auth via the env var so the secret
+# stays out of shell history and process listings
+export OTEL_EXPORTER_OTLP_HEADERS="Authorization=Basic ${AUTH_VALUE}"
+rocketride otel --endpoint https://cloud.langfuse.com/api/public/otel --no-metrics
 
 # Include pipeline payload content in spans (excluded by default, 8 KB cap)
 rocketride otel --include-content
@@ -300,7 +301,7 @@ Key flags:
 | `--endpoint <url>` | OTLP base URL; `/v1/traces` and `/v1/metrics` are appended automatically. Defaults to `OTEL_EXPORTER_OTLP_ENDPOINT`, honoring the signal-specific `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` / `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` variables when neither is set, else the exporter default (`http://localhost:4318` for http, `localhost:4317` for grpc). |
 | `--protocol <http\|grpc>` | OTLP transport. Default `http` (http/protobuf); `grpc` needs the separate gRPC exporter package. |
 | `--service-name <name>` | `service.name` resource attribute. Defaults to `OTEL_SERVICE_NAME` or `rocketride-engine`. |
-| `--headers <k=v,k=v>` | Headers sent with every OTLP request (collector auth). Defaults to `OTEL_EXPORTER_OTLP_HEADERS`. |
+| `--headers <k=v,k=v>` | Headers sent with every OTLP request. Prefer `OTEL_EXPORTER_OTLP_HEADERS` for secrets — command-line arguments are visible in shell history and `ps` output. |
 | `--include-content` | Include pipeline payload content in spans, size-capped. By default no payload content is exported. |
 | `--no-metrics` | Export traces only. |
 

@@ -265,6 +265,23 @@ class TestOtelExecute:
         out = capsys.readouterr().out
         assert 'informational only' in out
         assert 'pipelineTraceLevel' in out
+        assert "pipelineTraceLevel='summary'" in out
+
+    async def test_trace_level_none_says_tracing_stays_disabled(self, monkeypatch, capsys):
+        # 'none' must not be described as a level that emits FLOW events.
+        monkeypatch.setattr(otel_module, '_otel_available', lambda: True)
+
+        async def fake_run_bridge(client, config):
+            return 0
+
+        monkeypatch.setattr(otel_module, 'run_bridge', fake_run_bridge)
+
+        await OtelCommand(FakeCli(), make_args(trace_level='none')).execute(FakeClient())
+
+        out = capsys.readouterr().out
+        assert 'informational only' in out
+        assert 'flow tracing stays disabled' in out
+        assert 'to emit FLOW events at that level' not in out
 
     @pytest.mark.parametrize('exc_type', [OtelNotInstalledError, ImportError])
     async def test_missing_dependency_from_bridge_exits_2(self, monkeypatch, capsys, exc_type):

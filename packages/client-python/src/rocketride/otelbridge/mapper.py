@@ -33,7 +33,10 @@ Span hierarchy (documented contract):
     - ``apaevt_task`` ``begin`` (or a seeded ``running`` snapshot) opens one
       task-level root span per run. Runs are keyed primarily by the wire
       correlation id ``body['__id']`` (``'<token8hex>.<source>'``), falling
-      back to ``(project_id, source)``.
+      back to ``(project_id, source)``. A run first observed through
+      fallback-keyed events is PROMOTED to its canonical id when that id
+      later arrives (never tracked twice); runs already tracked under a
+      different canonical id are distinct runs and are never merged.
     - ``apaevt_flow`` ``op='begin'`` opens a pipe root span for that
       ``(run, pipe id)`` segment, parented to the run's task span when one is
       open (else it is a standalone root).
@@ -68,9 +71,13 @@ use event ARRIVAL time (the OpenTelemetry SDK's clock at ``start``/``end``).
 Durations are therefore bridge-observed, not engine-measured.
 
 Privacy: payload content (``trace.data``, lane payloads, the run-segment
-result delivered in ``end.trace``, and SSE ``data``) never reaches span
-attributes or events unless the mapper is built with ``include_content=True``,
-and is then truncated to ``MAX_CONTENT_LENGTH`` characters.
+result delivered in ``end.trace``, SSE ``data``, and the free-form
+``trace.error`` text, which can itself embed payload) never reaches span
+attributes, events, or status descriptions unless the mapper is built with
+``include_content=True``, and is then truncated to ``MAX_CONTENT_LENGTH``
+characters. The error SIGNAL (span status ERROR, ``error.type``, and the
+``exception`` span event) is structural and always exports; by default the
+status description is the generic ``GENERIC_ERROR_DESCRIPTION``.
 
 GenAI semantic conventions: component spans for ``llm_*`` / ``embedding_*`` /
 ``agent_*`` / ``tool_*`` nodes carry ``gen_ai.operation.name`` (and
@@ -145,6 +152,10 @@ GEN_AI_TOOL_NAME = 'gen_ai.tool.name'
 # error.type is low-cardinality by spec; the wire only gives a free-form error
 # string, so the semconv fallback value '_OTHER' is used.
 ERROR_TYPE_FALLBACK = '_OTHER'
+
+# Span status description used in place of the wire's free-form error text
+# when include_content is False (error text can embed payload/credentials).
+GENERIC_ERROR_DESCRIPTION = 'component error'
 
 # Well-known gen_ai.provider.name values, keyed by RocketRide node provider
 # (the component id minus its trailing '_<n>' instance suffix). Only values
@@ -304,6 +315,22 @@ class FlowSpanMapper:
     def _get_run(self, run_id: str, project_id: str, source: str) -> _RunState:
         key = self._resolve_key(run_id, project_id, source)
         run = self._runs.pop(key, None)
+        if run is None and run_id and (project_id or source):
+            # Promote, never duplicate: a run first observed through events
+            # without a correlation id lives under the '<project>|<source>'
+            # fallback key. When its canonical id arrives (task begin or the
+            # seeded running snapshot), migrate that state to the canonical
+            # key instead of opening a parallel second run — otherwise its
+            # open spans are stranded (kept alive by every snapshot that
+            # announces the same project/source pair) and later flow events
+            # spawn duplicate implicit roots. Only the fallback-format key is
+            # migrated; a run tracked under a DIFFERENT canonical id is a
+            # distinct run and is never merged.
+            run = self._runs.pop(f'{project_id}|{source}', None)
+            if run is not None:
+                logger.debug('promoting fallback-keyed run %s to canonical id %s', run.key, key)
+                run.key = key
+                self._restamp_run_id(run, key)
         if run is None:
             # Evict before inserting so the new run itself is never a victim.
             self._evict_runs_above(MAX_TRACKED_RUNS - 1)
@@ -316,6 +343,16 @@ class FlowSpanMapper:
             run.source = run.source or source
             self._aliases[(run.project_id, run.source)] = key
         return run
+
+    @staticmethod
+    def _restamp_run_id(run: _RunState, key: str) -> None:
+        """Update ATTR_RUN_ID on a promoted run's still-open spans to the canonical id."""
+        if run.task_span is not None:
+            run.task_span.set_attribute(ATTR_RUN_ID, key)
+        for pipe in run.pipes.values():
+            pipe.root.set_attribute(ATTR_RUN_ID, key)
+            for entry in pipe.stack:
+                entry.span.set_attribute(ATTR_RUN_ID, key)
 
     def _evict_runs_above(self, max_size: int) -> None:
         """Close and drop least-recently-eventful runs until at most max_size remain."""
@@ -532,12 +569,21 @@ class FlowSpanMapper:
             span.set_attribute(ATTR_TRACE_DATA, _serialize_content(trace['data']))
         error = trace.get('error')
         if error:
-            error_text = error if isinstance(error, str) else _serialize_content(error)
             span.set_attribute(ATTR_ERROR_TYPE, ERROR_TYPE_FALLBACK)
             # exception.type is omitted: the wire carries no exception class
             # name, and the '_OTHER' fallback is defined only for error.type.
-            span.add_event('exception', {'exception.message': error_text})
-            span.set_status(self._status(self._status_code.ERROR, error_text))
+            if self._include_content:
+                error_text = _serialize_content(error)
+                span.add_event('exception', {'exception.message': error_text})
+                span.set_status(self._status(self._status_code.ERROR, error_text))
+            else:
+                # The wire error is a free-form string that can embed payload
+                # (prompts, document text, credentialed URLs), so its text is
+                # content-gated like every other payload surface. The error
+                # SIGNAL — ERROR status, error.type, and the exception span
+                # event — always exports; only the message text is withheld.
+                span.add_event('exception')
+                span.set_status(self._status(self._status_code.ERROR, GENERIC_ERROR_DESCRIPTION))
         span.end()
 
     def _flow_end(self, run: _RunState, pipe_id: int, trace: dict) -> None:

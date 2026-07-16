@@ -29,7 +29,8 @@ without the 'rocketride[otel]' extra installed and without a live server
 
 Covered here:
     - OtelConfig precedence: CLI args > OTEL_* env vars > defaults
-    - OTEL_EXPORTER_OTLP_HEADERS parsing (first-'=' split, whitespace, padding)
+    - --headers parsing (first-'=' split, whitespace, padding); the header
+      env vars are deferred to the SDK exporters, never parsed into config
     - run_bridge event routing (task/flow/sse -> mapper, status -> metrics)
     - Wildcard monitor subscription (token '*', TASK/SUMMARY/FLOW/SSE)
     - Startup connection / subscription failure -> exit code 2
@@ -180,12 +181,23 @@ class TestOtelConfig:
 
     def test_env_used_when_args_absent(self, monkeypatch):
         monkeypatch.setenv(ENV_OTLP_ENDPOINT, 'https://collector.example:4318')
-        monkeypatch.setenv(ENV_OTLP_HEADERS, 'Authorization=Basic cGs6c2s=')
         monkeypatch.setenv(ENV_SERVICE_NAME, 'env-service')
         config = OtelConfig.from_args_env(SimpleNamespace())
         assert config.endpoint == 'https://collector.example:4318'
-        assert config.headers == {'Authorization': 'Basic cGs6c2s='}
         assert config.service_name == 'env-service'
+
+    def test_header_env_vars_left_to_the_sdk_exporters(self):
+        # OTEL_EXPORTER_OTLP_HEADERS must NOT be pre-parsed into explicit
+        # exporter headers: an explicit header set would silently override the
+        # signal-specific OTEL_EXPORTER_OTLP_TRACES/METRICS_HEADERS variables,
+        # whose precedence the SDK exporters resolve themselves (see
+        # test_otel_setup.py for the exporter-level proof).
+        env = {
+            ENV_OTLP_HEADERS: 'x-api-key=generic',
+            'OTEL_EXPORTER_OTLP_TRACES_HEADERS': 'x-api-key=traces-specific',
+        }
+        config = OtelConfig.from_args_env(SimpleNamespace(), env=env)
+        assert config.headers == {}
 
     def test_args_override_env(self):
         env = {

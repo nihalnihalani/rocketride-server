@@ -189,8 +189,14 @@ def build_providers(config: Any) -> Tuple[Any, Any, Callable[[], None]]:
     meter = meter_provider.get_meter(SCOPE_NAME)
 
     def shutdown() -> None:
-        """Flush pending telemetry and shut down both providers."""
-        tracer_provider.shutdown()
-        meter_provider.shutdown()
+        """Flush pending telemetry and shut down both providers.
+
+        try/finally: a tracer-provider shutdown failure (e.g. an exporter
+        raising during the final flush) must not lose the metrics flush.
+        """
+        try:
+            tracer_provider.shutdown()
+        finally:
+            meter_provider.shutdown()
 
     return tracer, meter, shutdown

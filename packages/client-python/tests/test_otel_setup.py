@@ -149,9 +149,65 @@ def test_signal_specific_env_endpoint_honored_when_config_endpoint_absent(monkey
 
 
 def test_env_headers_honored_when_config_headers_absent(monkeypatch):
+    monkeypatch.delenv('OTEL_EXPORTER_OTLP_TRACES_HEADERS', raising=False)
     monkeypatch.setenv('OTEL_EXPORTER_OTLP_HEADERS', 'x-api-key=abc123')
     exporter = _build_span_exporter(BridgeConfigStub(endpoint='http://collector:4318'))
     assert dict(exporter._headers).get('x-api-key') == 'abc123'
+
+
+# ---------------------------------------------------------------------------
+# Header precedence matrix: --headers > signal-specific env > generic env.
+# Only explicit --headers may become constructor headers; env-var resolution
+# is the SDK exporters' job, so the signal-specific variables keep their
+# spec-defined precedence over the generic one.
+# ---------------------------------------------------------------------------
+
+
+def _config_from_cli(headers_arg):
+    """Resolve an OtelConfig exactly as the CLI does (no env pre-parsing)."""
+    from types import SimpleNamespace
+
+    from rocketride.otelbridge.config import OtelConfig
+
+    return OtelConfig.from_args_env(
+        SimpleNamespace(endpoint='http://collector:4318', headers=headers_arg),
+        env=os.environ,
+    )
+
+
+def test_generic_env_headers_reach_exporter_via_sdk_not_config(monkeypatch):
+    """Generic env only: config carries no headers; the SDK resolves the env var."""
+    monkeypatch.delenv('OTEL_EXPORTER_OTLP_TRACES_HEADERS', raising=False)
+    monkeypatch.setenv('OTEL_EXPORTER_OTLP_HEADERS', 'x-api-key=generic')
+    config = _config_from_cli(None)
+    assert config.headers == {}
+    exporter = _build_span_exporter(config)
+    assert dict(exporter._headers).get('x-api-key') == 'generic'
+
+
+def test_signal_specific_env_headers_beat_generic_env(monkeypatch):
+    """Signal env present: the SDK's per-signal precedence must win (it would
+    be defeated if the generic env var were passed as explicit headers).
+    """
+    monkeypatch.setenv('OTEL_EXPORTER_OTLP_HEADERS', 'x-api-key=generic')
+    monkeypatch.setenv('OTEL_EXPORTER_OTLP_TRACES_HEADERS', 'x-api-key=traces-specific')
+    exporter = _build_span_exporter(_config_from_cli(None))
+    assert dict(exporter._headers).get('x-api-key') == 'traces-specific'
+
+
+def test_signal_specific_metrics_env_headers_beat_generic_env(monkeypatch):
+    monkeypatch.setenv('OTEL_EXPORTER_OTLP_HEADERS', 'x-api-key=generic')
+    monkeypatch.setenv('OTEL_EXPORTER_OTLP_METRICS_HEADERS', 'x-api-key=metrics-specific')
+    exporter = _build_metric_exporter(_config_from_cli(None))
+    assert dict(exporter._headers).get('x-api-key') == 'metrics-specific'
+
+
+def test_cli_headers_flag_beats_all_header_env_vars(monkeypatch):
+    """Explicit --headers is the one case that becomes constructor headers."""
+    monkeypatch.setenv('OTEL_EXPORTER_OTLP_HEADERS', 'x-api-key=generic')
+    monkeypatch.setenv('OTEL_EXPORTER_OTLP_TRACES_HEADERS', 'x-api-key=traces-specific')
+    exporter = _build_span_exporter(_config_from_cli('x-api-key=explicit'))
+    assert dict(exporter._headers).get('x-api-key') == 'explicit'
 
 
 # =========================================================================
@@ -177,6 +233,39 @@ def test_build_providers_sets_service_name_resource():
     resource = tracer.resource  # SDK tracer exposes its provider resource
     assert resource.attributes['service.name'] == 'my-bridge'
     shutdown()
+
+
+def test_shutdown_shuts_down_meter_provider_even_when_tracer_shutdown_raises(monkeypatch):
+    """A tracer flush failure must not lose the metrics flush (try/finally)."""
+    import opentelemetry.sdk.metrics as metrics_sdk
+    import opentelemetry.sdk.trace as trace_sdk
+
+    calls = []
+
+    class RaisingTracerProvider(trace_sdk.TracerProvider):
+        def __init__(self, *args, **kwargs):
+            # Keep the raising shutdown out of the SDK's atexit hook.
+            kwargs.setdefault('shutdown_on_exit', False)
+            super().__init__(*args, **kwargs)
+
+        def shutdown(self):
+            calls.append('tracer')
+            raise RuntimeError('tracer shutdown boom')
+
+    class RecordingMeterProvider(metrics_sdk.MeterProvider):
+        def shutdown(self, timeout_millis=30_000):
+            calls.append('meter')
+            super().shutdown(timeout_millis=timeout_millis)
+
+    # build_providers imports these names lazily at call time, so patching the
+    # SDK modules' attributes injects the stubs without faking the SDK itself.
+    monkeypatch.setattr(trace_sdk, 'TracerProvider', RaisingTracerProvider)
+    monkeypatch.setattr(metrics_sdk, 'MeterProvider', RecordingMeterProvider)
+
+    _tracer, _meter, shutdown = build_providers(BridgeConfigStub(endpoint='http://localhost:4318', no_metrics=True))
+    with pytest.raises(RuntimeError, match='tracer shutdown boom'):
+        shutdown()
+    assert calls == ['tracer', 'meter']
 
 
 def test_build_providers_with_metrics_wires_a_periodic_reader(monkeypatch):

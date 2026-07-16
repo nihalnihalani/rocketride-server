@@ -57,6 +57,7 @@ from rocketride.otelbridge.mapper import (
     ATTR_SPAN_UNCLOSED,
     ATTR_TASK_RESTARTED,
     ATTR_UNMATCHED_LEAVES,
+    GENERIC_ERROR_DESCRIPTION,
     MAX_CONTENT_LENGTH,
     FlowSpanMapper,
     MetricsMapper,
@@ -299,9 +300,7 @@ def test_begin_for_already_open_pipe_recycles_root():
     assert len(spans_by_name(exporter, 'second.txt')) == 1
 
 
-def test_error_leave_sets_error_status_and_exception_event():
-    mapper, exporter = make_mapper()
-    error_text = 'OpenAI API error: 401 Unauthorized'
+def _feed_error_leave(mapper, error_text):
     mapper.handle_event('apaevt_flow', flow('begin', 'probe.txt', pipes=['probe.txt']))
     mapper.handle_event('apaevt_flow', flow('enter', 'llm_openai_1', trace={'lane': 'questions'}))
     mapper.handle_event(
@@ -309,12 +308,44 @@ def test_error_leave_sets_error_status_and_exception_event():
     )
     mapper.handle_event('apaevt_flow', flow('end', 'probe.txt'))
 
+
+def test_error_leave_with_content_exports_error_text():
+    mapper, exporter = make_mapper(include_content=True)
+    error_text = 'OpenAI API error: 401 Unauthorized'
+    _feed_error_leave(mapper, error_text)
+
     span = spans_by_name(exporter, 'chat')[0]
     assert span.status.status_code == StatusCode.ERROR
     assert error_text in span.status.description
     assert span.attributes['error.type'] == '_OTHER'
     exception_events = [event for event in span.events if event.name == 'exception']
     assert exception_events and exception_events[0].attributes['exception.message'] == error_text
+
+
+def test_error_leave_by_default_exports_signal_but_not_error_text():
+    """Wire error strings can embed payload; without include_content only the
+    structural error signal (status, error.type, exception event) exports.
+    """
+    mapper, exporter = make_mapper()
+    _feed_error_leave(mapper, f'prompt rejected: {SENTINEL}')
+
+    span = spans_by_name(exporter, 'chat')[0]
+    assert span.status.status_code == StatusCode.ERROR
+    assert span.status.description == GENERIC_ERROR_DESCRIPTION
+    assert span.attributes['error.type'] == '_OTHER'
+    exception_events = [event for event in span.events if event.name == 'exception']
+    assert exception_events and not (exception_events[0].attributes or {})
+    assert not any_span_contains(exporter, SENTINEL)
+
+
+def test_error_leave_with_content_truncates_string_errors_to_cap():
+    mapper, exporter = make_mapper(include_content=True)
+    _feed_error_leave(mapper, 'e' * (MAX_CONTENT_LENGTH * 2))
+
+    span = spans_by_name(exporter, 'chat')[0]
+    exception_events = [event for event in span.events if event.name == 'exception']
+    assert len(exception_events[0].attributes['exception.message']) <= MAX_CONTENT_LENGTH
+    assert len(span.status.description) <= MAX_CONTENT_LENGTH
 
 
 # =========================================================================
@@ -371,6 +402,11 @@ def _feed_content_events(mapper):
     mapper.handle_event(
         'apaevt_flow',
         flow('leave', 'llm_openai_1', trace={'lane': 'text', 'data': {'text': SENTINEL}, 'result': 'continue'}),
+    )
+    # Error text is a payload surface too: node errors can quote the input.
+    mapper.handle_event('apaevt_flow', flow('enter', 'llm_openai_2', trace={'lane': 'text'}))
+    mapper.handle_event(
+        'apaevt_flow', flow('leave', 'llm_openai_2', trace={'lane': 'text', 'error': f'bad prompt: {SENTINEL}'})
     )
     mapper.handle_event('apaevt_flow', flow('end', 'probe.txt', trace={'name': 'probe.txt', 'text': [SENTINEL]}))
 
@@ -435,6 +471,52 @@ def test_running_snapshot_is_idempotent():
     mapper.close_all()
 
     assert len(spans_by_name(exporter, 'task demo.My webhook')) == 1
+
+
+def test_late_canonical_id_promotes_fallback_keyed_run():
+    """A run first seen through no-__id events must be promoted, not duplicated,
+    when its canonical id arrives (regression: second _RunState + implicit
+    duplicate roots + fallback state kept alive forever by snapshots).
+    """
+    mapper, exporter = make_mapper()
+    # Flow events before any task announcement, without __id -> fallback key.
+    mapper.handle_event('apaevt_flow', flow('begin', 'probe.txt', pipes=['probe.txt'], run_id=''))
+    mapper.handle_event('apaevt_flow', flow('enter', 'response_1', run_id=''))
+    # The canonical run id arrives via the seeded running snapshot.
+    mapper.handle_event(
+        'apaevt_task',
+        {
+            'action': 'running',
+            'tasks': [{'id': RUN_ID, 'name': 'demo', 'projectId': PROJECT_ID, 'source': SOURCE}],
+            '__id': '',
+        },
+    )
+    # Subsequent flow events carry the canonical id and must hit the SAME run.
+    mapper.handle_event('apaevt_flow', flow('leave', 'response_1', trace={'result': 'continue'}))
+    mapper.handle_event('apaevt_flow', flow('end', 'probe.txt'))
+    mapper.handle_event('apaevt_task', task('end'))
+
+    assert mapper.open_span_count() == 0  # nothing stranded under the fallback key
+    assert len(spans_by_name(exporter, 'task demo')) == 1
+    assert len(spans_by_name(exporter, 'probe.txt')) == 1
+    assert not spans_by_name(exporter, 'pipe 0')  # no implicit duplicate root
+    leave_span = spans_by_name(exporter, 'response_1')[0]
+    assert ATTR_SPAN_UNCLOSED not in (leave_span.attributes or {})
+    # Open spans of the promoted run are re-stamped with the canonical id.
+    assert leave_span.attributes['rocketride.run_id'] == RUN_ID
+    root = spans_by_name(exporter, 'probe.txt')[0]
+    assert root.attributes['rocketride.run_id'] == RUN_ID
+
+
+def test_promotion_never_merges_distinct_canonical_runs():
+    """Two runs with different canonical ids for the same project/source stay separate."""
+    mapper, exporter = make_mapper()
+    mapper.handle_event('apaevt_task', task('begin', run_id='aaaa1111.webhook_1', name='first'))
+    mapper.handle_event('apaevt_task', task('begin', run_id='bbbb2222.webhook_1', name='second'))
+    mapper.close_all()
+
+    assert len(spans_by_name(exporter, 'task first')) == 1
+    assert len(spans_by_name(exporter, 'task second')) == 1
 
 
 def test_task_restart_closes_and_reopens():
@@ -696,9 +778,11 @@ def test_full_fixture_replay_produces_coherent_span_forest():
     assert chat.status.status_code == StatusCode.ERROR
     assert chat.parent.span_id == implicit.context.span_id
 
-    # Privacy default: real result payload and SSE text never exported.
+    # Privacy default: real result payload, SSE text, and the wire error text
+    # (free-form, can embed payload) never exported.
     assert not any_span_contains(exporter, 'hello otel bridge')
     assert not any_span_contains(exporter, 'Analyzing your request')
+    assert not any_span_contains(exporter, '401 Unauthorized')
 
     # No deprecated GenAI attribute anywhere.
     for span in spans:
