@@ -728,6 +728,8 @@ rocketride events ALL --token <token>        # Stream task events
 rocketride store dir /                       # List the root of the file store
 ```
 
+The `store` command's sub-commands are `dir`, `type`, `write`, `rm`, `mkdir`, and `stat` — run `rocketride store --help` for details.
+
 All commands accept `--uri` and `--apikey` flags, or read from environment variables.
 
 ## Configuration
