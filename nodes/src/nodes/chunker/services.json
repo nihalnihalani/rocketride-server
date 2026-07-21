@@ -1,7 +1,7 @@
 {
 	"title": "Text Chunker",
 	"protocol": "chunker://",
-	"classType": ["transform"],
+	"classType": ["preprocessor"],
 	"capabilities": ["experimental"],
 	"register": "filter",
 	"node": "python",

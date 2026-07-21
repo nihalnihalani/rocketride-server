@@ -67,7 +67,7 @@ class TestRecursiveCharacterChunker:
             assert first_tail in chunks[1]['text']
 
     def test_overlap_never_exceeds_chunk_size(self):
-        """Cap applied so prepended overlap cannot push chunk past chunk_size."""
+        """Reserved overlap headroom keeps every emitted chunk within chunk_size."""
         chunker = RecursiveCharacterChunker(chunk_size=50, chunk_overlap=20)
         text = 'ab' * 200  # well over chunk_size
         chunks = chunker.chunk(text)
@@ -75,6 +75,71 @@ class TestRecursiveCharacterChunker:
             assert len(chunk['text']) <= chunker.chunk_size, (
                 f'len {len(chunk["text"])} > chunk_size {chunker.chunk_size}'
             )
+
+    def test_overlap_stays_within_chunk_size_with_real_separators(self):
+        """Overlap must not push a chunk past chunk_size when a raw chunk carries
+        a trailing separator.
+
+        Regression: capping overlap by ``min(chunk_overlap, raw_start)`` alone
+        ignores ``len(raw)``. A raw chunk is emitted as ``current + separator``,
+        so with a multi-char separator (e.g. the default ``'. '`` / ``'\\n\\n'``)
+        len(raw) can reach ``_split_size + len(separator)`` and ``overlap + raw``
+        exceeds chunk_size. The char-split tests never hit this because ``['']``
+        appends no separator. Pack sentences to the split budget so the sentence
+        separator is appended to a full raw chunk.
+        """
+        chunk_size = 40
+        overlap = 5
+        chunker = RecursiveCharacterChunker(chunk_size=chunk_size, chunk_overlap=overlap, separators=['. ', ' ', ''])
+        # A concrete input (found by fuzzing) where sentences pack to the split
+        # budget and the '. ' separator is appended to a full raw chunk. Under
+        # the len(raw)-unaware cap this emits a 41-char chunk; the fix keeps it
+        # within chunk_size.
+        text = (
+            'cebaeb. bca. bcce. bcdebccac. aae. bedbdad. dedecbbc. bdca. '
+            'baacdbaad. ecebcadbb. daccc. cbacbcb. cda. cebbea'
+        )
+        chunks = chunker.chunk(text)
+        assert len(chunks) >= 2
+        for c in chunks:
+            assert len(c['text']) <= chunk_size, (
+                f'chunk len {len(c["text"])} exceeds chunk_size {chunk_size}: {c["text"]!r}'
+            )
+
+    def test_overlap_honored_on_full_size_chunks(self):
+        """Overlap must be applied even when chunks fill chunk_size.
+
+        Regression: the previous budget cap ``max(0, chunk_size - len(raw))``
+        collapsed the overlap to zero whenever a raw chunk filled chunk_size --
+        the common case for prose with no matching separator and *always* on the
+        hard-split path -- so the configured overlap was silently dropped. With
+        no separators every split is a full-size hard-split, so a zero-overlap
+        implementation yields chunks that share no prefix at all.
+        """
+        chunk_size = 50
+        overlap = 15
+        chunker = RecursiveCharacterChunker(chunk_size=chunk_size, chunk_overlap=overlap, separators=[''])
+        text = 'abcdefghij' * 20  # 200 chars, no separators -> hard-split path
+        chunks = chunker.chunk(text)
+        assert len(chunks) >= 3
+
+        # At least one chunk actually reaches chunk_size (proves overlap is
+        # honored on *full* chunks, not merely on short tail chunks).
+        assert any(len(c['text']) == chunk_size for c in chunks), (
+            f'expected a full-size chunk, got sizes {[len(c["text"]) for c in chunks]}'
+        )
+
+        for i in range(1, len(chunks)):
+            # Every chunk stays within the size cap...
+            assert len(chunks[i]['text']) <= chunk_size
+            # ...and begins with the previous chunk's trailing `overlap` chars.
+            prev_tail = chunks[i - 1]['text'][-overlap:]
+            assert chunks[i]['text'][:overlap] == prev_tail, (
+                f'chunk {i} does not carry the previous {overlap}-char overlap'
+            )
+            # start_char/end_char stay truthful against the source text.
+            meta = chunks[i]['metadata']
+            assert chunks[i]['text'] == text[meta['start_char'] : meta['end_char']]
 
     def test_custom_separators(self):
         """Custom separators should be respected."""

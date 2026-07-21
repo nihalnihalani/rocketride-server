@@ -50,6 +50,12 @@ class RecursiveCharacterChunker(ChunkingStrategy):
             raise ValueError('chunk_overlap must be less than chunk_size')
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
+        # Reserve headroom for the overlap so that ``overlap + raw`` never
+        # exceeds ``chunk_size``. Raw pieces are split to at most this size;
+        # each emitted chunk then prepends up to ``chunk_overlap`` characters
+        # of preceding text, landing back at ``chunk_size``. With no overlap
+        # this equals ``chunk_size`` and splitting is unchanged.
+        self._split_size = chunk_size - chunk_overlap
         self.separators = separators if separators is not None else ['\n\n', '\n', '. ', ' ', '']
 
     def _split_text(self, text: str, separators: list[str]) -> list[str]:
@@ -57,16 +63,18 @@ class RecursiveCharacterChunker(ChunkingStrategy):
         if not text:
             return []
 
-        # If text fits within chunk_size, return as-is
-        if len(text) <= self.chunk_size:
+        # If text fits within the split size, return as-is. Splitting targets
+        # ``_split_size`` (chunk_size minus overlap) so the overlap prepended in
+        # ``chunk`` keeps every emitted chunk within ``chunk_size``.
+        if len(text) <= self._split_size:
             return [text]
 
-        # If no separators left, hard-split by chunk_size
+        # If no separators left, hard-split by the split size
         if not separators:
             chunks = []
             start = 0
             while start < len(text):
-                end = min(start + self.chunk_size, len(text))
+                end = min(start + self._split_size, len(text))
                 chunks.append(text[start:end])
                 start = end
             return chunks
@@ -81,7 +89,7 @@ class RecursiveCharacterChunker(ChunkingStrategy):
         else:
             parts = text.split(separator)
 
-        # Merge parts into chunks that respect chunk_size
+        # Merge parts into chunks that respect the split size
         chunks = []
         current = ''
         for part in parts:
@@ -91,7 +99,7 @@ class RecursiveCharacterChunker(ChunkingStrategy):
             else:
                 candidate = part
 
-            if len(candidate) <= self.chunk_size:
+            if len(candidate) <= self._split_size:
                 current = candidate
             else:
                 # Current chunk is ready (if non-empty). Preserve the separator
@@ -103,8 +111,8 @@ class RecursiveCharacterChunker(ChunkingStrategy):
                         chunks.append(current + separator)
                     else:
                         chunks.append(current)
-                # If this single part exceeds chunk_size, recurse with next separators
-                if len(part) > self.chunk_size:
+                # If this single part exceeds the split size, recurse with next separators
+                if len(part) > self._split_size:
                     sub_chunks = self._split_text(part, remaining_separators)
                     chunks.extend(sub_chunks)
                     current = ''
@@ -126,51 +134,50 @@ class RecursiveCharacterChunker(ChunkingStrategy):
         if not raw_chunks:
             return []
 
-        # Apply overlap between consecutive chunks
+        # Apply overlap between consecutive chunks by reading it straight from
+        # the original text immediately preceding each raw chunk. Every raw
+        # chunk is a contiguous substring of ``text`` (parts are re-joined with
+        # their separator and any trailing separator is preserved on emit), so
+        # its offset is exact and the overlap slice is contiguous with it. This
+        # honors the configured overlap even when a raw chunk fills the split
+        # budget -- the common prose and hard-split case -- and keeps
+        # start_char/end_char truthful regardless of separators between chunks.
         result = []
-        chunk_index = 0
         search_start = 0
         for i, raw in enumerate(raw_chunks):
-            # Compute overlap prefix from the previous chunk, capped so the
-            # final chunk never exceeds chunk_size. Without the cap, the
-            # prepended overlap can push len(chunk_text) past the configured
-            # limit (e.g. raw=chunk_size + overlap=N -> chunk_size + N).
+            raw_start = text.find(raw, search_start)
+            if raw_start == -1:
+                raw_start = search_start
+
+            # Overlap is bounded by the configured amount, the text available
+            # before this chunk, and the headroom left within chunk_size after
+            # this raw chunk. ``_split_size`` reserves overlap headroom, but a
+            # raw chunk can carry a trailing separator (emitted as
+            # ``current + separator``), pushing len(raw) past ``_split_size``;
+            # the ``chunk_size - len(raw)`` term trims overlap in that case so
+            # no emitted chunk exceeds chunk_size. On a true full-size chunk
+            # (no appended separator) it equals chunk_overlap, so full overlap
+            # is still honored -- the point of the fix is preserved.
             applied_overlap = 0
             if i > 0 and self.chunk_overlap > 0:
-                budget = max(0, self.chunk_size - len(raw))
-                applied_overlap = min(self.chunk_overlap, budget)
+                applied_overlap = max(0, min(self.chunk_overlap, raw_start, self.chunk_size - len(raw)))
 
-            if applied_overlap > 0:
-                prev = raw_chunks[i - 1]
-                overlap_text = prev[-applied_overlap:]
-                chunk_text = overlap_text + raw
-            else:
-                chunk_text = raw
-
-            # Find start_char position in original text
-            start_char = text.find(raw, search_start)
-            if start_char == -1:
-                start_char = search_start
-            # Adjust for the *actually applied* overlap so offsets stay truthful.
-            if applied_overlap > 0:
-                start_char = max(0, start_char - applied_overlap)
-            end_char = start_char + len(chunk_text)
+            start_char = raw_start - applied_overlap
+            end_char = raw_start + len(raw)
+            chunk_text = text[start_char:end_char]
 
             result.append(
                 {
                     'text': chunk_text,
                     'metadata': {
-                        'chunk_index': chunk_index,
+                        'chunk_index': i,
                         'start_char': start_char,
                         'end_char': end_char,
                     },
                 }
             )
-            chunk_index += 1
-            # Advance search to after this raw chunk for the next find
-            raw_start = text.find(raw, search_start)
-            if raw_start >= 0:
-                search_start = raw_start + len(raw)
+            # Advance search to after this raw chunk for the next find.
+            search_start = raw_start + len(raw)
 
         return result
 
@@ -232,7 +239,11 @@ class SentenceChunker(ChunkingStrategy):
             else:
                 candidate_len = len(sentence)
 
-            # If adding this sentence exceeds chunk_size and we have content, finalize current
+            # If adding this sentence exceeds chunk_size and we have content,
+            # finalize current. The ``current_sentences`` guard means a single
+            # sentence longer than chunk_size is never split mid-sentence: it is
+            # emitted whole as its own chunk (sentence boundaries take priority
+            # over the size limit for this strategy).
             if current_sentences and candidate_len > self.chunk_size:
                 start_char = sentence_positions[0]
                 end_char = sentence_positions[-1] + len(current_sentences[-1])
