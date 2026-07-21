@@ -218,7 +218,7 @@ _MISSING = object()
 
 def _snapshot_modules():
     """Snapshot sys.modules entries before mock installation."""
-    _original_modules.update({name: sys.modules.get(name) for name in _MOCK_MODULE_NAMES})
+    _original_modules.update({name: sys.modules.get(name, _MISSING) for name in _MOCK_MODULE_NAMES})
     _original_path[:] = sys.path[:]
 
 
@@ -226,7 +226,7 @@ def _restore_modules_impl():
     """Restore sys.modules to pre-mock state after importing node modules."""
     sys.path[:] = _original_path
     for name, orig in _original_modules.items():
-        if orig is None:
+        if orig is _MISSING:
             sys.modules.pop(name, None)
         else:
             sys.modules[name] = orig
@@ -435,6 +435,82 @@ class TestLoadFromInlineItems:
         loader = _make_loader(source_type='inline', items=None)
         with pytest.raises(ValueError, match='non-empty list'):
             loader.load_from_items(None)
+
+
+class TestLoaderWithoutCobalt:
+    """Regression: the loader must stay functional when basalt-ai-cobalt is absent.
+
+    Before the pure-Python fallback, ``from cobalt import Dataset`` inside the
+    file/inline loaders raised ImportError, which beginGlobal swallowed into an
+    empty dataset (0 questions, warning only) — a silent no-op. These tests
+    fail without the fallback because loading raises instead of returning items.
+    """
+
+    @staticmethod
+    def _no_cobalt():
+        # A ``None`` entry in sys.modules makes ``from cobalt import Dataset``
+        # raise ImportError, simulating the package not being installed. The
+        # autouse fixture installs the cobalt mock; this overrides it.
+        return patch.dict(sys.modules, {'cobalt': None})
+
+    def test_load_json_array_fallback_returns_items(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        f = tmp_path / 'data.json'
+        f.write_text('[{"input": "q1", "expected": "a1"}, {"input": "q2", "expected": "a2"}]')
+        loader = _make_loader(file_path=str(f))
+        with self._no_cobalt():
+            items = loader.load_from_file(str(f))
+        assert items == [{'input': 'q1', 'expected': 'a1'}, {'input': 'q2', 'expected': 'a2'}]
+
+    def test_load_json_object_envelope_fallback(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        f = tmp_path / 'data.json'
+        f.write_text('{"items": [{"input": "q1"}, {"input": "q2"}]}')
+        loader = _make_loader(file_path=str(f))
+        with self._no_cobalt():
+            items = loader.load_from_file(str(f))
+        assert items == [{'input': 'q1'}, {'input': 'q2'}]
+
+    def test_load_jsonl_fallback_skips_blank_lines(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        f = tmp_path / 'data.jsonl'
+        f.write_text('{"input": "q1", "expected": "a1"}\n\n{"input": "q2", "expected": "a2"}\n')
+        loader = _make_loader(file_path=str(f))
+        with self._no_cobalt():
+            items = loader.load_from_file(str(f))
+        assert items == [{'input': 'q1', 'expected': 'a1'}, {'input': 'q2', 'expected': 'a2'}]
+
+    def test_load_csv_fallback_returns_items(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        f = tmp_path / 'data.csv'
+        f.write_text('input,expected\nq1,a1\nq2,a2\n')
+        loader = _make_loader(file_path=str(f))
+        with self._no_cobalt():
+            items = loader.load_from_file(str(f))
+        assert items == [{'input': 'q1', 'expected': 'a1'}, {'input': 'q2', 'expected': 'a2'}]
+
+    def test_load_inline_fallback_returns_items(self):
+        inline = [{'input': 'q1', 'expected': 'a1'}, {'input': 'q2', 'expected': 'a2'}]
+        loader = _make_loader(source_type='inline', items=inline)
+        with self._no_cobalt():
+            items = loader.load_from_items(inline)
+        assert items == inline
+
+    def test_full_load_without_cobalt_yields_questions(self, tmp_path, monkeypatch):
+        # End-to-end guard against the silent-empty-dataset regression: without
+        # cobalt, load() -> apply_transforms() -> to_questions() must still
+        # produce the questions rather than an empty list with only a warning.
+        monkeypatch.chdir(tmp_path)
+        f = tmp_path / 'data.jsonl'
+        f.write_text('{"input": "q1", "expected": "a1"}\n{"input": "q2", "expected": "a2"}\n')
+        loader = _make_loader(file_path=str(f))
+        with self._no_cobalt():
+            raw = loader.load()
+            transformed = loader.apply_transforms(raw, {})
+            questions = loader.to_questions(transformed)
+        assert len(questions) == 2
+        assert questions[0]['text'] == 'q1'
+        assert questions[0]['metadata']['expected'] == 'a1'
 
 
 class TestSampleTransform:

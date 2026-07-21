@@ -76,6 +76,9 @@ class IInstance(IInstanceBase):
             json_data = answer.getJson()
             # Strip reserved reference fields before scoring to prevent
             # the evaluator from grading text that contains the reference.
+            # This is a shallow, top-level strip and only applies to dict-shaped
+            # JSON answers: reference fields nested inside sub-objects, or a
+            # reference carried in a plain-text answer, are not removed here.
             eval_payload = json_data
             if isinstance(json_data, dict):
                 eval_payload = {k: v for k, v in json_data.items() if k not in {'expected', 'context', 'reference'}}
@@ -128,7 +131,13 @@ class IInstance(IInstanceBase):
             f'Cobalt evaluation: score={result["score"]:.3f} passed={result["passed"]} evaluator={result["evaluator"]}'
         )
 
-        # Forward the original answer unchanged
+        # This node emits TWO answers per input on the `answers` lane: the
+        # original answer (forwarded unchanged) followed by a synthetic JSON
+        # score answer. Downstream consumers therefore see double the answer
+        # count. This is intentional — the score travels as a sibling answer so
+        # the original payload stays untouched for other consumers — but nodes
+        # that assume a 1:1 answer count, or single-answer output sinks, must
+        # account for it.
         self.instance.writeAnswers(answer)
 
         # Emit evaluation result as a separate JSON answer

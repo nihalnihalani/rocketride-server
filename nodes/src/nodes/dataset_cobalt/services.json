@@ -118,7 +118,7 @@
 		"dataset.file_path": {
 			"type": "string",
 			"title": "File Path",
-			"description": "Absolute path to the dataset file (JSON, CSV, or JSONL format)."
+			"description": "Path to the dataset file (JSON, CSV, or JSONL). Must resolve to a location inside the pipeline working directory; paths outside it, or containing '..', are rejected."
 		},
 		"dataset.items": {
 			"type": "string",

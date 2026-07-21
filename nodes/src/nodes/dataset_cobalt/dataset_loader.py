@@ -92,7 +92,9 @@ class DatasetLoader:
         """Load a dataset from a JSON, CSV, or JSONL file.
 
         Args:
-            path: Absolute or relative file path. Must not contain path traversal sequences.
+            path: File path that must resolve to a location inside the current
+                working directory. Paths outside it, or containing traversal
+                sequences ('..'), are rejected by ``_validate_path``.
 
         Returns:
             List of dataset item dicts.
@@ -107,25 +109,82 @@ class DatasetLoader:
         if not os.path.isfile(normalized):
             raise FileNotFoundError(f'Dataset file not found: {normalized}')
 
-        from cobalt import Dataset
-
         ext = os.path.splitext(normalized)[1].lower()
-        debug(f'Cobalt DatasetLoader: Loading file {normalized} with extension {ext}')
-
-        if ext == '.jsonl':
-            dataset = Dataset.from_jsonl(normalized)
-        elif ext in ('.json', '.csv'):
-            dataset = Dataset.from_file(normalized)
-        else:
+        if ext not in ('.json', '.csv', '.jsonl'):
             raise ValueError(f'Unsupported file format: {ext}. Supported: .json, .csv, .jsonl')
 
-        items = list(dataset)
+        debug(f'Cobalt DatasetLoader: Loading file {normalized} with extension {ext}')
+
+        # cobalt is optional: when basalt-ai-cobalt is not installed, parse the
+        # file with a pure-Python fallback so the node stays functional instead
+        # of silently yielding an empty dataset.
+        try:
+            from cobalt import Dataset
+        except ImportError:
+            debug('Cobalt DatasetLoader: basalt-ai-cobalt not installed, using Python fallback for file load')
+            items = self._load_from_file_fallback(normalized, ext)
+        else:
+            if ext == '.jsonl':
+                dataset = Dataset.from_jsonl(normalized)
+            else:
+                dataset = Dataset.from_file(normalized)
+            items = list(dataset)
+
         debug(f'Cobalt DatasetLoader: Loaded {len(items)} items from file')
 
         if not items:
             warning('Cobalt DatasetLoader: File loaded but dataset is empty')
 
         return items
+
+    @staticmethod
+    def _load_from_file_fallback(path: str, ext: str) -> List[Dict[str, Any]]:
+        """Parse a dataset file without the cobalt dependency.
+
+        Mirrors cobalt.Dataset's file loaders for the supported formats so the
+        node remains usable when basalt-ai-cobalt is not installed:
+          - .jsonl: one JSON object per non-empty line
+          - .json:  a JSON array, a ``{"items"|"data"|"rows": [...]}`` envelope,
+                    or a single object wrapped into a one-item list
+          - .csv:   csv.DictReader rows
+
+        Args:
+            path: Validated, existing file path.
+            ext: Lowercased file extension (one of .json, .csv, .jsonl).
+
+        Returns:
+            List of dataset item dicts.
+
+        Raises:
+            ValueError: If the JSON structure is neither an array nor an object.
+        """
+        import json
+
+        if ext == '.jsonl':
+            items: List[Dict[str, Any]] = []
+            with open(path, encoding='utf-8') as fh:
+                for line in fh:
+                    stripped = line.strip()
+                    if stripped:
+                        items.append(json.loads(stripped))
+            return items
+
+        if ext == '.json':
+            with open(path, encoding='utf-8') as fh:
+                data = json.load(fh)
+            if isinstance(data, list):
+                return data
+            if isinstance(data, dict):
+                for key in ('items', 'data', 'rows'):
+                    if isinstance(data.get(key), list):
+                        return data[key]
+                return [data]
+            raise ValueError(f'Unsupported JSON structure in {path}: expected an array or object')
+
+        import csv
+
+        with open(path, newline='', encoding='utf-8') as fh:
+            return [dict(row) for row in csv.DictReader(fh)]
 
     def load_from_items(self, items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Load a dataset from an inline list of item dicts.
@@ -152,9 +211,16 @@ class DatasetLoader:
         if not items or not isinstance(items, list):
             raise ValueError('Inline items must be a non-empty list of dicts')
 
-        from cobalt import Dataset
-
         debug(f'Cobalt DatasetLoader: Loading {len(items)} inline items')
+
+        # cobalt is optional: inline items are already Python dicts, so fall
+        # back to returning them directly when the dependency is absent.
+        try:
+            from cobalt import Dataset
+        except ImportError:
+            debug('Cobalt DatasetLoader: basalt-ai-cobalt not installed, using inline items directly')
+            return list(items)
+
         dataset = Dataset.from_items(items)
         return list(dataset)
 
