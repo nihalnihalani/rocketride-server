@@ -15,28 +15,49 @@ interpreter the ``rocketlib`` import fails and collection errors out, by design.
 
 from __future__ import annotations
 
+import importlib.util
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
 
 _NODES_SRC = str(Path(__file__).resolve().parent.parent.parent / 'src' / 'nodes')
-# Force the node source to the FRONT of sys.path: this test directory is itself
-# importable as ``chunker`` (it has an ``__init__.py``), so unless the real node
-# package is searched first the test dir shadows it and breaks
-# ``from chunker.chunker_strategies import ...``. A plain "if not in sys.path"
-# guard is insufficient -- another node suite may already have added the path
-# *behind* this test dir, letting the test dir win.
-while _NODES_SRC in sys.path:
-    sys.path.remove(_NODES_SRC)
-sys.path.insert(0, _NODES_SRC)
 
-from chunker.chunker_strategies import (  # noqa: E402
-    RecursiveCharacterChunker,
-    SentenceChunker,
-    TokenChunker,
-)
+# The chunking strategies are pure-stdlib, so load ``chunker_strategies.py``
+# straight from its file. This deliberately avoids importing the ``chunker``
+# package (which pulls the engine-only ``rocketlib``) and, crucially, avoids
+# mutating the global ``sys.path`` at import time: this test dir is itself
+# importable as ``chunker`` and permanently prepending ``src/nodes`` used to
+# perturb how *other* node suites collected (a same-named test-vs-source
+# package could resolve to the wrong one). Direct file loading has no such
+# global side effect.
+_STRATEGIES_PATH = Path(_NODES_SRC) / 'chunker' / 'chunker_strategies.py'
+_spec = importlib.util.spec_from_file_location('chunker_strategies_under_test', _STRATEGIES_PATH)
+_strategies = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_strategies)
+RecursiveCharacterChunker = _strategies.RecursiveCharacterChunker
+SentenceChunker = _strategies.SentenceChunker
+TokenChunker = _strategies.TokenChunker
+
+
+@contextmanager
+def _node_src_on_path():
+    """Temporarily put ``src/nodes`` at the front of sys.path, restoring it after.
+
+    Used only by the IGlobal/IInstance lifecycle tests, which need the real
+    ``chunker`` package (and the engine-provided ``rocketlib``). Scoped so
+    collection of sibling node suites is never affected.
+    """
+    original = list(sys.path)
+    while _NODES_SRC in sys.path:
+        sys.path.remove(_NODES_SRC)
+    sys.path.insert(0, _NODES_SRC)
+    try:
+        yield
+    finally:
+        sys.path[:] = original
 
 
 # ===========================================================================
@@ -104,6 +125,29 @@ class TestRecursiveCharacterChunker:
         for c in chunks:
             assert len(c['text']) <= chunk_size, (
                 f'chunk len {len(c["text"])} exceeds chunk_size {chunk_size}: {c["text"]!r}'
+            )
+
+    @pytest.mark.parametrize('overlap', [0, 1])
+    def test_chunk_never_exceeds_chunk_size_when_overlap_below_separator(self, overlap):
+        """The size cap must hold even when chunk_overlap is smaller than a
+        trailing separator.
+
+        Regression: a raw chunk is emitted as ``current + separator`` where
+        ``current`` fits ``_split_size`` but the appended default ``'\\n\\n'``
+        separator (2 chars) can push len(raw) to chunk_size + 1. Trimming only
+        the overlap cannot shrink the raw chunk, so with chunk_overlap 0 or 1
+        (both allowed -- schema minimum is 0) the emitted chunk overflowed. The
+        body is now capped at chunk_size, dropping only excess trailing
+        separator characters.
+        """
+        chunk_size = 10
+        chunker = RecursiveCharacterChunker(chunk_size=chunk_size, chunk_overlap=overlap)
+        text = 'aaaaaaaaa\n\nbbbbbbbbb\n\nccc'  # default separators include '\n\n'
+        chunks = chunker.chunk(text)
+        assert len(chunks) >= 2
+        for c in chunks:
+            assert len(c['text']) <= chunk_size, (
+                f'overlap={overlap}: chunk len {len(c["text"])} exceeds {chunk_size}: {c["text"]!r}'
             )
 
     def test_overlap_honored_on_full_size_chunks(self):
@@ -451,8 +495,9 @@ class TestTokenChunker:
 
 def _import_node_classes():
     """Import the IInstance/IGlobal classes (provided by the build interpreter)."""
-    from chunker.IGlobal import IGlobal
-    from chunker.IInstance import IInstance
+    with _node_src_on_path():
+        from chunker.IGlobal import IGlobal
+        from chunker.IInstance import IInstance
 
     return IGlobal, IInstance
 

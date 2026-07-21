@@ -149,21 +149,26 @@ class RecursiveCharacterChunker(ChunkingStrategy):
             if raw_start == -1:
                 raw_start = search_start
 
+            # A raw chunk is ``current + separator`` and ``current`` never
+            # exceeds ``_split_size`` (== chunk_size - chunk_overlap), so the
+            # only way len(raw) can pass chunk_size is a trailing separator
+            # longer than the reserved overlap headroom. Cap the emitted body at
+            # chunk_size (dropping only those excess trailing separator chars,
+            # not content) so no emitted chunk ever exceeds chunk_size for any
+            # separator/overlap, including chunk_overlap of 0 or 1.
+            emit_len = min(len(raw), self.chunk_size)
+
             # Overlap is bounded by the configured amount, the text available
-            # before this chunk, and the headroom left within chunk_size after
-            # this raw chunk. ``_split_size`` reserves overlap headroom, but a
-            # raw chunk can carry a trailing separator (emitted as
-            # ``current + separator``), pushing len(raw) past ``_split_size``;
-            # the ``chunk_size - len(raw)`` term trims overlap in that case so
-            # no emitted chunk exceeds chunk_size. On a true full-size chunk
-            # (no appended separator) it equals chunk_overlap, so full overlap
-            # is still honored -- the point of the fix is preserved.
+            # before this chunk, and the headroom left after the emitted body.
+            # On a true full-size chunk (emit_len == _split_size) this equals
+            # chunk_overlap, so full overlap is still honored -- the point of
+            # the original review fix is preserved.
             applied_overlap = 0
             if i > 0 and self.chunk_overlap > 0:
-                applied_overlap = max(0, min(self.chunk_overlap, raw_start, self.chunk_size - len(raw)))
+                applied_overlap = max(0, min(self.chunk_overlap, raw_start, self.chunk_size - emit_len))
 
             start_char = raw_start - applied_overlap
-            end_char = raw_start + len(raw)
+            end_char = raw_start + emit_len
             chunk_text = text[start_char:end_char]
 
             result.append(
