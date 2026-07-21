@@ -156,34 +156,56 @@ class DatasetLoader:
             List of dataset item dicts.
 
         Raises:
-            ValueError: If the JSON structure is neither an array nor an object.
+            ValueError: If the file is malformed or an item is not an object.
         """
         import json
 
-        if ext == '.jsonl':
-            items: List[Dict[str, Any]] = []
-            with open(path, encoding='utf-8') as fh:
-                for line in fh:
-                    stripped = line.strip()
-                    if stripped:
-                        items.append(json.loads(stripped))
+        def _check_items(items: List[Any]) -> List[Dict[str, Any]]:
+            # to_questions/apply_transforms call .get() on each item, so a
+            # non-dict (scalar JSON array element, scalar JSONL line) would
+            # raise deep in the pipeline; fail fast with a clear message here.
+            for idx, item in enumerate(items):
+                if not isinstance(item, dict):
+                    raise ValueError(
+                        f'Dataset item at index {idx} in {path} is not an object '
+                        f'(got {type(item).__name__}); each item must be a mapping.'
+                    )
             return items
 
+        # utf-8-sig transparently strips a UTF-8 BOM (common in Excel CSV and
+        # Windows-authored JSON) and is correct for BOM-less files too; plain
+        # utf-8 would fail on a BOM and be swallowed into an empty dataset.
+        if ext == '.jsonl':
+            items: List[Dict[str, Any]] = []
+            with open(path, encoding='utf-8-sig') as fh:
+                for lineno, line in enumerate(fh, start=1):
+                    stripped = line.strip()
+                    if not stripped:
+                        continue
+                    try:
+                        items.append(json.loads(stripped))
+                    except json.JSONDecodeError as e:
+                        raise ValueError(f'Invalid JSON in {path} line {lineno}: {e}') from e
+            return _check_items(items)
+
         if ext == '.json':
-            with open(path, encoding='utf-8') as fh:
-                data = json.load(fh)
+            with open(path, encoding='utf-8-sig') as fh:
+                try:
+                    data = json.load(fh)
+                except json.JSONDecodeError as e:
+                    raise ValueError(f'Invalid JSON in {path}: {e}') from e
             if isinstance(data, list):
-                return data
+                return _check_items(data)
             if isinstance(data, dict):
                 for key in ('items', 'data', 'rows'):
                     if isinstance(data.get(key), list):
-                        return data[key]
+                        return _check_items(data[key])
                 return [data]
             raise ValueError(f'Unsupported JSON structure in {path}: expected an array or object')
 
         import csv
 
-        with open(path, newline='', encoding='utf-8') as fh:
+        with open(path, newline='', encoding='utf-8-sig') as fh:
             return [dict(row) for row in csv.DictReader(fh)]
 
     def load_from_items(self, items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:

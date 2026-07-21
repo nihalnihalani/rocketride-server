@@ -496,6 +496,33 @@ class TestLoaderWithoutCobalt:
             items = loader.load_from_items(inline)
         assert items == inline
 
+    def test_fallback_strips_utf8_bom(self, tmp_path, monkeypatch):
+        """A BOM-prefixed file (Excel/Windows export) must parse, not error into empty."""
+        monkeypatch.chdir(tmp_path)
+        f = tmp_path / 'bom.json'
+        f.write_text('[{"input": "q1"}]', encoding='utf-8-sig')
+        loader = _make_loader(file_path=str(f))
+        with self._no_cobalt():
+            assert loader.load_from_file(str(f)) == [{'input': 'q1'}]
+
+    def test_fallback_rejects_non_dict_items(self, tmp_path, monkeypatch):
+        """Scalar array elements must fail fast with a clear message, not deep in to_questions."""
+        monkeypatch.chdir(tmp_path)
+        f = tmp_path / 'scalars.json'
+        f.write_text('[1, 2, 3]')
+        loader = _make_loader(file_path=str(f))
+        with self._no_cobalt(), pytest.raises(ValueError, match='is not an object'):
+            loader.load_from_file(str(f))
+
+    def test_fallback_reports_malformed_jsonl_line(self, tmp_path, monkeypatch):
+        """A malformed JSONL line reports the file and real line number."""
+        monkeypatch.chdir(tmp_path)
+        f = tmp_path / 'bad.jsonl'
+        f.write_text('{"input": "q1"}\nnot-json\n')
+        loader = _make_loader(file_path=str(f))
+        with self._no_cobalt(), pytest.raises(ValueError, match='line 2'):
+            loader.load_from_file(str(f))
+
     def test_full_load_without_cobalt_yields_questions(self, tmp_path, monkeypatch):
         # End-to-end guard against the silent-empty-dataset regression: without
         # cobalt, load() -> apply_transforms() -> to_questions() must still

@@ -20,7 +20,7 @@ Key behavior to know:
 - The answer is **deep-copied** before evaluation, so shared answer objects in fan-out pipelines are never mutated.
 - **This node emits two answers per input** on the `answers` lane: the original answer unchanged, followed by a synthetic JSON score answer. Downstream consumers that assume a 1:1 answer count, or single-answer output sinks, must account for the doubling. See [Output](#output).
 - Before scoring a JSON answer, reserved reference keys (`expected`, `context`, `reference`) are stripped from the payload so the evaluator never grades text that already contains the reference. The strip is **shallow (top-level keys only) and applies to dict-shaped JSON answers**; references nested in sub-objects or carried in plain text are not removed.
-- The pass threshold is **clamped to [0.0, 1.0]** at construction and again on every result, so an out-of-range config value can never produce a nonsensical verdict.
+- The configured pass threshold is **clamped to [0.0, 1.0]** at construction, and every computed score is clamped to the same range per result, so an out-of-range config value can never produce a nonsensical verdict.
 - For grounding mode, the `expected` argument is treated as the source context. Candidate context is resolved from metadata/answer context first, then falls back to the reference/expected answer as a last resort.
 - Evaluator failures are contained: any evaluator exception is caught and turned into a zero-score result with a reason, never an aborted pipeline.
 
