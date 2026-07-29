@@ -50,11 +50,7 @@ You build your `.pipe` - and you run it against the fastest AI runtime available
 - **Connection manager** - Connect to a local engine (one click, no setup) or your own on-premises server.
 - **SDKs for TypeScript, Python & MCP** - Embed pipelines in your apps or expose them as tools for AI assistants.
 
-Need inspiration? Check out our [example pipelines](https://docs.rocketride.org/):
-
-- [Advanced RAG](https://docs.rocketride.org/examples/advanced-rag-pipeline/)
-- [Video Frame Grabber](https://docs.rocketride.org/examples/video-key-frame-grabber/)
-- [Audio Transcription](https://docs.rocketride.org/examples/audio-transcription-simple/)
+Need inspiration? Check out [awesome-rocketride](https://github.com/rocketride-org/awesome-rocketride#demos--examples), a collection of example projects built on RocketRide.
 
 ## Extension Settings
 
@@ -64,7 +60,8 @@ Need inspiration? Check out our [example pipelines](https://docs.rocketride.org/
 | `rocketride.hostUrl`                 | `string`   | `"http://localhost:5565"`        | Host URL for RocketRide service. Host and port will be parsed from this URL.                                                              |
 | `rocketride.defaultPipelinePath`     | `string`   | `"${workspaceFolder}/pipelines"` | Default directory path for creating new pipeline files                                                                                    |
 | `rocketride.local.engineVersion`     | `string`   | `"latest"`                       | Engine version to download. `"latest"` for newest stable, `"prerelease"` for newest prerelease, or a specific tag like `"server-v3.1.1"`. |
-| `rocketride.engineArgs`              | `string[]` | `[]`                             | Additional arguments passed to the engine subprocess                                                                                      |
+| `rocketride.taskArguments`           | `string`   | `""`                             | Additional command-line arguments passed to each pipeline task                                                                            |
+| `rocketride.pipelineDebugOutput`     | `boolean`  | `false`                          | Enable full debug output for pipeline tasks (`--trace=debugOut`)                                                                          |
 | `rocketride.pipelineRestartBehavior` | `string`   | `"prompt"`                       | Behavior when a `.pipe` file changes while the pipeline is running: `"auto"`, `"manual"`, or `"prompt"`                                   |
 | `rocketride.integrations.copilot`    | `boolean`  | `false`                          | Enable RocketRide integration with GitHub Copilot                                                                                         |
 | `rocketride.integrations.claudeCode` | `boolean`  | `false`                          | Enable RocketRide integration with Claude Code                                                                                            |

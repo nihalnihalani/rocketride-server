@@ -42,6 +42,9 @@ export interface BillingDetail {
 	/** App identifier matching AppManifestEntry.id (e.g. "brandi"). */
 	appId: string;
 
+	/** Resolved app display name (e.g. "Pipe Builder"). */
+	appName?: string;
+
 	/** Stripe sub_* subscription identifier. */
 	stripeSubscriptionId: string;
 
@@ -73,7 +76,7 @@ export interface BillingDetail {
 	credits: { initial?: Record<string, number>; recurring?: Record<string, number> } | null;
 
 	/** Display templates for credit resource types (e.g. ``{amount} minutes of Audio``), or null. */
-	creditLabels: Record<string, string> | null;
+	labels: Record<string, string> | null;
 }
 
 /**
@@ -189,8 +192,14 @@ export interface LedgerTransaction {
 	/** User who triggered the transaction, or null for system events. */
 	userId: string | null;
 
+	/** Resolved display name of the triggering user, or null. */
+	userName?: string | null;
+
 	/** Team context, or null. */
 	teamId: string | null;
+
+	/** Resolved display name of the team context, or null. */
+	teamName?: string | null;
 
 	/** Human-readable context (pipeline name, source, pack_id, etc.). */
 	context: Record<string, any> | null;
@@ -226,7 +235,81 @@ export interface UsageRollup {
 	/** User or team ID (or '__none__' for unattributed). */
 	id: string;
 
+	/** Resolved display name of the user or team, or null when unresolvable. */
+	name?: string | null;
+
 	/** Consumption per resource type (absolute values — always positive). */
+	credits: Record<string, number>;
+}
+
+/**
+ * Result of resolving a promo code via `promo_validate`.
+ *
+ * `valid: false` carries a human-readable `reason`. A grant/hackathon code
+ * is recognisable by `appId` + `creditsGranted`; a discount-only code has
+ * neither and applies to whichever plan is selected at checkout.
+ */
+export interface PromoValidation {
+	/** Whether the code resolved to an active Stripe promotion code. */
+	valid: boolean;
+
+	/** Human-readable failure reason when `valid` is false. */
+	reason?: string;
+
+	/** Canonical code string as stored in Stripe. */
+	code?: string;
+
+	/** Stripe promo_* identifier (informational — never sent back). */
+	promotionCodeId?: string;
+
+	/** Human-readable description, e.g. "25% off for 3 months". */
+	description?: string;
+
+	/** Percentage discount (e.g. 25 or 100), if percent-based. */
+	percentOff?: number | null;
+
+	/** Fixed discount in cents, if amount-based. */
+	amountOffCents?: number | null;
+
+	/** ISO currency for `amountOffCents`. */
+	currency?: string | null;
+
+	/** Coupon duration: 'once' | 'repeating' | 'forever'. */
+	duration?: string | null;
+
+	/** Months the discount repeats for (duration === 'repeating'). */
+	durationInMonths?: number | null;
+
+	/** Credits granted on redemption ({resource: amount}) — grant codes only. */
+	creditsGranted?: Record<string, number> | null;
+
+	/** Target app for a grant code (e.g. "rocketride.pipeBuilder"). */
+	appId?: string | null;
+
+	/** List price in cents of the plan passed as priceId (if any). */
+	amountCents?: number;
+
+	/** First-invoice price in cents after the discount (if priceId given). */
+	discountedAmountCents?: number;
+}
+
+/**
+ * Result of redeeming a credit-grant code via `promo_redeem`.
+ */
+export interface PromoRedemption {
+	/** True when the redemption succeeded. */
+	redeemed: boolean;
+
+	/** 'subscribed' = new $0 subscription created; 'credits_only' = org was already subscribed. */
+	mode: 'subscribed' | 'credits_only';
+
+	/** App the code targets. */
+	appId: string;
+
+	/** Subscription status after redemption (e.g. 'active'). */
+	status?: string;
+
+	/** Credits granted ({resource: amount}). */
 	credits: Record<string, number>;
 }
 

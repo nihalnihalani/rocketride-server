@@ -32,6 +32,8 @@ Types Defined:
     StripePlan: Stripe plan/price row for a given product.
     CreditBalance: Current credit balance for an org's compute wallet.
     CreditPack: Per-pack pricing row for the credit top-up modal.
+    PromoValidation: Result of resolving a promo code.
+    PromoRedemption: Result of redeeming a credit-grant code.
 """
 
 from typing import Literal, NotRequired, TypedDict
@@ -49,6 +51,8 @@ class BillingDetail(TypedDict):
 
     Attributes:
         appId: App identifier matching AppManifestEntry.appId (e.g. "rocketride.brandy").
+        appName: Human-readable app name resolved server-side (falls back to appId
+            when the app registry has no row).
         stripeSubscriptionId: Stripe sub_* subscription identifier.
         stripePriceId: Stripe price_* for the subscribed plan.
         status: One of: active, trialing, past_due, canceled.
@@ -59,10 +63,13 @@ class BillingDetail(TypedDict):
         currentPeriodEnd: ISO 8601 datetime when the current billing period ends, or None.
         cancelAtPeriodEnd: True when the user has requested cancellation at period end.
         credits: Credit grants config from Stripe price metadata, or None.
-        creditLabels: Display templates for credit resource types, or None.
+        labels: Display templates for credit resource types, or None. (This is the
+            actual wire key; the type previously declared ``creditLabels``, which
+            never matched what the server sends.)
     """
 
     appId: str
+    appName: str
     stripeSubscriptionId: str
     stripePriceId: str
     status: str
@@ -73,7 +80,7 @@ class BillingDetail(TypedDict):
     currentPeriodEnd: str | None
     cancelAtPeriodEnd: bool
     credits: dict[str, dict[str, int]] | None
-    creditLabels: dict[str, str] | None
+    labels: dict[str, str] | None
 
 
 class PlanAction(TypedDict):
@@ -176,6 +183,72 @@ class CreditPack(TypedDict):
 
 
 # =============================================================================
+# PROMO CODE TYPES
+# =============================================================================
+
+
+class PromoValidation(TypedDict):
+    """
+    Result of resolving a promo code via the ``promo_validate`` subcommand.
+
+    ``valid: False`` carries a human-readable ``reason``. A grant/hackathon
+    code is recognisable by ``appId`` + ``creditsGranted``; a discount-only
+    code has neither and applies to whichever plan is selected at checkout.
+
+    Attributes:
+        valid: Whether the code resolved to an active Stripe promotion code.
+        reason: Human-readable failure reason when ``valid`` is False.
+        code: Canonical code string as stored in Stripe.
+        promotionCodeId: Stripe promo_* identifier (informational).
+        description: Human-readable description, e.g. "25% off for 3 months".
+        percentOff: Percentage discount (e.g. 25 or 100), if percent-based.
+        amountOffCents: Fixed discount in cents, if amount-based.
+        currency: ISO currency for ``amountOffCents``.
+        duration: Coupon duration: 'once' | 'repeating' | 'forever'.
+        durationInMonths: Months the discount repeats for.
+        creditsGranted: Credits granted on redemption ({resource: amount}).
+        appId: Target app for a grant code.
+        amountCents: List price in cents of the plan passed as priceId.
+        discountedAmountCents: First-invoice price in cents after the discount.
+    """
+
+    valid: bool
+    reason: NotRequired[str]
+    code: NotRequired[str]
+    promotionCodeId: NotRequired[str]
+    description: NotRequired[str]
+    percentOff: NotRequired[float | None]
+    amountOffCents: NotRequired[int | None]
+    currency: NotRequired[str | None]
+    duration: NotRequired[str | None]
+    durationInMonths: NotRequired[int | None]
+    creditsGranted: NotRequired[dict[str, float] | None]
+    appId: NotRequired[str | None]
+    amountCents: NotRequired[int]
+    discountedAmountCents: NotRequired[int]
+
+
+class PromoRedemption(TypedDict):
+    """
+    Result of redeeming a credit-grant code via the ``promo_redeem`` subcommand.
+
+    Attributes:
+        redeemed: True when the redemption succeeded.
+        mode: 'subscribed' = new $0 subscription created;
+            'credits_only' = org was already subscribed.
+        appId: App the code targets.
+        status: Subscription status after redemption (e.g. 'active').
+        credits: Credits granted ({resource: amount}).
+    """
+
+    redeemed: bool
+    mode: Literal['subscribed', 'credits_only']
+    appId: str
+    status: NotRequired[str]
+    credits: dict[str, float]
+
+
+# =============================================================================
 # TRANSACTION TYPES
 # =============================================================================
 
@@ -191,7 +264,10 @@ class LedgerTransaction(TypedDict):
         amount: Signed amount (positive for credits, negative for debits).
         idempotencyKey: Namespaced dedup key.
         userId: User who triggered the transaction, or None.
+        userName: Display name of that user resolved server-side
+            (coalesce of display name and email), or None when unattributed.
         teamId: Team context, or None.
+        teamName: Name of that team resolved server-side, or None.
         context: Human-readable audit context, or None.
         createdAt: ISO 8601 creation timestamp, or None.
     """
@@ -202,7 +278,9 @@ class LedgerTransaction(TypedDict):
     amount: float
     idempotencyKey: str
     userId: str | None
+    userName: str | None
     teamId: str | None
+    teamName: str | None
     context: dict | None
     createdAt: str | None
 
@@ -232,8 +310,11 @@ class UsageRollup(TypedDict):
 
     Attributes:
         id: User or team ID (or '__none__' for unattributed).
+        name: Display name resolved server-side (user display name / email
+            coalesce, or team name), or None when unresolved.
         credits: Consumption per resource type (absolute values).
     """
 
     id: str
+    name: str | None
     credits: dict[str, float]

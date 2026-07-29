@@ -1,0 +1,114 @@
+name: OS Matrix — compile + test
+
+# Verifies the engine compiles and its unit tests pass across the Linux distros
+# we support. This is deliberately NOT a per-PR check — it builds vcpkg deps
+# from source per distro, so it is slow. It runs on-demand (Actions ▸ Run
+# workflow) and on a monthly schedule. `fail-fast: false` so every distro
+# reports its own pass/fail even when one breaks — the whole point is to see
+# *which* OS regressed.
+#
+# Toolchain install is delegated to scripts/compiler-unix.sh (the project's
+# single cross-distro apt|dnf source of truth), so this matrix inherits new
+# build deps automatically.
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 6 1 * *' # 06:00 UTC on the 1st of each month
+
+permissions:
+  contents: read
+
+env:
+  GH_TOKEN: ${{ github.token }}
+  # Non-interactive apt so tzdata/debconf never block the install in a container
+  # with no tty (harmless on the dnf distros).
+  DEBIAN_FRONTEND: noninteractive
+  # Build every vcpkg dependency from source on each distro (no binary cache) —
+  # that is the actual cross-OS compile test. A read-only nuget cache can be
+  # layered in later to speed up the triplet-matching legs.
+  VCPKG_BINARY_SOURCES: clear
+
+jobs:
+  os-matrix:
+    name: ${{ matrix.image }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    container:
+      image: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - ubuntu:22.04
+          - ubuntu:24.04
+          - ubuntu:26.04
+          - fedora:latest
+          - almalinux:9 # RHEL-compatible; may need EPEL / RHEL-column tuning in compiler-unix.sh — a break here is informative
+    steps:
+      # Minimal base images ship without git, Python, or the Python build
+      # backends. actions/checkout needs git; compiler-unix.sh installs the
+      # C/C++ toolchain but requires — and does not install — python3 plus the
+      # `build`/`wheel` modules (it prints "Missing Python build tools" and
+      # exits). Provide all of it here so the matrix tests the engine, not the
+      # bare base image.
+      - name: Bootstrap base build prerequisites
+        shell: bash
+        run: |
+          set -eux
+          if command -v apt-get >/dev/null 2>&1; then
+            apt-get update
+            apt-get install -y --no-install-recommends \
+              git ca-certificates curl \
+              python3 python3-pip python3-venv
+          elif command -v dnf >/dev/null 2>&1; then
+            # --allowerasing: minimal EL/Fedora images ship curl-minimal, which
+            # conflicts with the full curl package and aborts the whole install.
+            dnf install -y --allowerasing \
+              git ca-certificates curl \
+              python3 python3-pip
+          fi
+          # Pre-provide the Python build backends compiler-unix.sh refuses to
+          # auto-install. No --upgrade: on 24.04+ `wheel` is distro-managed and
+          # pip can't uninstall it (no RECORD) — upgrading aborts the whole
+          # bootstrap; a plain install just skips the already-satisfied wheel.
+          # --break-system-packages for PEP-668 (24.04+/Fedora mark the env
+          # externally-managed); the fallback covers 22.04's older pip that
+          # lacks that flag (and isn't externally-managed anyway).
+          python3 -m pip install --break-system-packages build wheel \
+            || python3 -m pip install build wheel
+
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          submodules: recursive
+          persist-credentials: false
+      # The container runs as root but the checked-out tree is owned by the
+      # runner UID (host bind-mount), so git aborts ./builder's calls with
+      # "detected dubious ownership". Trust the workspace.
+      - name: Trust the workspace
+        shell: bash
+        run: git config --global --add safe.directory '*'
+
+      - name: Install build prerequisites (cross-distro)
+        shell: bash
+        run: bash scripts/compiler-unix.sh --autoinstall
+
+      - name: Set up Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 20
+
+      - name: Enable pnpm
+        shell: bash
+        run: corepack enable
+
+      - name: Build engine (vcpkg from source)
+        shell: bash
+        run: |
+          chmod +x ./builder || true
+          ./builder build --verbose --autoinstall
+
+      - name: Unit tests
+        shell: bash
+        run: ./builder test --verbose --sequential

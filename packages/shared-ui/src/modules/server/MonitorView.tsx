@@ -10,16 +10,25 @@
  * dashboard data and events as props (data-in, callbacks-out) so that the
  * host controls all data fetching and DAP communication.
  *
+ * The Connections and Tasks tabs render the shared server grids. Hosts with
+ * a client pass the paged `listConnections` / `listTasks` fetchers — the
+ * grids then page, sort, filter, and search server-side, and the host polls
+ * the combined `onRefetchReady` trigger. Hosts without fetchers (the VSCode
+ * webview) get LOCAL grids over the pushed snapshot.
+ *
  * Usage:
  *   import MonitorView from 'shared/modules/server';
  *   <MonitorView data={snapshot} events={activityLog} isConnected={true} />
  */
 
-import React, { useState, useMemo, CSSProperties } from 'react';
-import type { DashboardResponse, ActivityEvent } from './types';
-import { OverviewTab, ConnectionsTab, TasksTab, ActivityTab } from './components';
-import { TabPanel } from '../../components/tab-panel/TabPanel';
-import type { ITabPanelTab, ITabPanelPanel } from '../../components/tab-panel/TabPanel';
+import React, { useState, useMemo, useRef, useCallback, useEffect, CSSProperties } from 'react';
+import type { ListPageRequest, ListPageResponse } from 'rocketride';
+import type { DashboardResponse, DashboardConnection, DashboardTask, ActivityEvent } from './types';
+import { OverviewTab, ConnectionsGrid, TasksGrid, ActivityGrid } from './components';
+import { TabPanelContent } from '../../components/tab-panel/TabPanelContent';
+import { PageViewControl } from '../../components/page-view-control/PageViewControl';
+import type { ITabPanelPanel } from '../../components/tab-panel/TabPanelContent';
+import type { ViewMenu } from '../../types/viewMenu';
 import { commonStyles } from '../../themes/styles';
 
 // =============================================================================
@@ -71,6 +80,15 @@ const styles = {
 		cursor: 'default',
 		letterSpacing: '0.05em',
 	} as CSSProperties,
+	// Fills the space below the top PageViewControl strip; TabPanelContent's
+	// 100%-height wrapper resolves against this definite flex box.
+	pageBody: {
+		display: 'flex',
+		flexDirection: 'column',
+		flex: 1,
+		minWidth: 0,
+		minHeight: 0,
+	} as CSSProperties,
 };
 
 // =============================================================================
@@ -86,6 +104,22 @@ export interface IMonitorViewProps {
 	isConnected: boolean;
 	/** Callback to request a manual data refresh from the host. */
 	onRefresh?: () => void;
+	/**
+	 * Optional server-paginated connections fetcher — presence switches the
+	 * Connections grid to REMOTE mode (host binds it to `listConnections`).
+	 */
+	listConnections?: (req: ListPageRequest) => Promise<ListPageResponse<DashboardConnection>>;
+	/**
+	 * Optional server-paginated tasks fetcher — presence switches the Tasks
+	 * grid to REMOTE mode (host binds it to `listTasks`).
+	 */
+	listTasks?: (req: ListPageRequest) => Promise<ListPageResponse<DashboardTask>>;
+	/**
+	 * Receives ONE combined refetch that silently re-requests the current
+	 * page of every remote grid — the host polls it (usePolling, 3s) the way
+	 * the admin views poll their own grids.
+	 */
+	onRefetchReady?: (refetch: () => void) => void;
 }
 
 type TabId = 'overview' | 'connections' | 'tasks' | 'activity';
@@ -94,16 +128,41 @@ type TabId = 'overview' | 'connections' | 'tasks' | 'activity';
 // COMPONENT
 // =============================================================================
 
-const MonitorView: React.FC<IMonitorViewProps> = ({ data, events, isConnected, onRefresh }) => {
+const MonitorView: React.FC<IMonitorViewProps> = ({ data, events, isConnected, onRefresh, listConnections, listTasks, onRefetchReady }) => {
 	const [activeTab, setActiveTab] = useState<TabId>('overview');
 
-	const tabs: ITabPanelTab[] = useMemo(
-		() => [
-			{ id: 'overview', label: 'Overview' },
-			{ id: 'connections', label: 'Connections', badge: data ? String(data.overview.totalConnections) : undefined },
-			{ id: 'tasks', label: 'Tasks', badge: data ? String(data.overview.activeTasks) : undefined },
-			{ id: 'activity', label: 'Activity', badge: events.length > 0 ? String(events.length) : undefined },
-		],
+	// ── Combined remote-grid refetch ─────────────────────────────────────
+	// Each remote grid registers its silent current-page refetch here; the
+	// host receives ONE trigger covering both (every panel stays mounted, so
+	// both grids are live regardless of the active tab).
+	const connectionsRefetchRef = useRef<(() => void) | null>(null);
+	const tasksRefetchRef = useRef<(() => void) | null>(null);
+	/** Registration callback handed to the Connections grid. */
+	const handleConnectionsRefetchReady = useCallback((refetch: () => void) => {
+		connectionsRefetchRef.current = refetch;
+	}, []);
+	/** Registration callback handed to the Tasks grid. */
+	const handleTasksRefetchReady = useCallback((refetch: () => void) => {
+		tasksRefetchRef.current = refetch;
+	}, []);
+	// Hand the host one stable combined trigger (no-op until grids mount).
+	useEffect(() => {
+		onRefetchReady?.(() => {
+			connectionsRefetchRef.current?.();
+			tasksRefetchRef.current?.();
+		});
+	}, [onRefetchReady]);
+
+	// ViewMenu declaration — rendered by this view's own PageViewControl strip.
+	const viewMenu = useMemo<ViewMenu>(
+		() => ({
+			entries: [
+				{ id: 'overview', label: 'Overview' },
+				{ id: 'connections', label: 'Connections', ...(data ? { count: data.overview.totalConnections } : {}) },
+				{ id: 'tasks', label: 'Tasks', ...(data ? { count: data.overview.activeTasks } : {}) },
+				{ id: 'activity', label: 'Activity', ...(events.length > 0 ? { count: events.length } : {}) },
+			],
+		}),
 		[data, events.length]
 	);
 
@@ -131,30 +190,46 @@ const MonitorView: React.FC<IMonitorViewProps> = ({ data, events, isConnected, o
 			connections: {
 				content: (
 					<div style={commonStyles.tabContent}>
-						<ConnectionsTab connections={data.connections} />
+						{/* Snapshot rows back the LOCAL grid; a host fetcher switches
+						    it REMOTE (conditional spread keeps the prop truly absent
+						    for hosts without one). */}
+						<ConnectionsGrid
+							connections={data.connections}
+							{...(listConnections ? { listConnections } : {})}
+							onRefetchReady={handleConnectionsRefetchReady}
+						/>
 					</div>
 				),
 			},
 			tasks: {
 				content: (
 					<div style={commonStyles.tabContent}>
-						<TasksTab tasks={data.tasks} />
+						<TasksGrid
+							tasks={data.tasks}
+							{...(listTasks ? { listTasks } : {})}
+							onRefetchReady={handleTasksRefetchReady}
+						/>
 					</div>
 				),
 			},
 			activity: {
 				content: (
 					<div style={commonStyles.tabContent}>
-						<ActivityTab events={events} />
+						<ActivityGrid events={events} />
 					</div>
 				),
 			},
 		};
-	}, [data, events]);
+	}, [data, events, onRefresh, listConnections, listTasks, handleConnectionsRefetchReady, handleTasksRefetchReady]);
 
 	return (
 		<div style={styles.root}>
-			<TabPanel tabs={tabs} activeTab={activeTab} onTabChange={(id) => setActiveTab(id as TabId)} panels={panels} />
+			{/* Page strip — the view renders its own tabs at the very top. */}
+			<PageViewControl menu={viewMenu} activeId={activeTab} onSelect={(id) => setActiveTab(id as TabId)} />
+			{/* Page bodies fill the space below the strip. */}
+			<div style={styles.pageBody}>
+				<TabPanelContent panels={panels} activeId={activeTab} />
+			</div>
 			{!isConnected && (
 				<div style={styles.disconnectOverlay}>
 					<button type="button" style={styles.disconnectButton} disabled>

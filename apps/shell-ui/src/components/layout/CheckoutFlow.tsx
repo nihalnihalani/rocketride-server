@@ -26,7 +26,7 @@
 
 import React, { useEffect, useRef, useState } from 'react';
 import { CheckoutModal } from 'shared';
-import type { CheckoutPlan } from 'shared';
+import type { CheckoutPlan, PromoValidation } from 'shared';
 import { ConnectionManager } from '../../connection/connection';
 import type { AppManifestEntry } from '../../workspace/types';
 
@@ -57,6 +57,10 @@ export const CheckoutFlow: React.FC<CheckoutFlowProps> = ({ stripeKey, orgId }) 
 	/** Optional plan preselected by the caller (e.g. the web pricing page) to
 	 *  skip the picker and go straight to payment; null = show the picker. */
 	const [presetPlan, setPresetPlan] = useState<CheckoutPlan | null>(null);
+	/** Optional validated discount code passed alongside the preselected plan
+	 *  (e.g. from the web pricing page) so it rides into the auto-advanced
+	 *  checkout; null = no promo. Cleared whenever presetPlan is cleared. */
+	const [presetPromo, setPresetPromo] = useState<PromoValidation | null>(null);
 	/** Pending timer that clears the post-purchase welcome status message. */
 	const statusClearTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -70,9 +74,10 @@ export const CheckoutFlow: React.FC<CheckoutFlowProps> = ({ stripeKey, orgId }) 
 	useEffect(() => {
 		return ConnectionManager.getInstance().on(
 			'shell:subscribe',
-			({ app, plan }: { app: unknown; plan?: CheckoutPlan }) => {
+			({ app, plan, promo }: { app: unknown; plan?: CheckoutPlan; promo?: PromoValidation | null }) => {
 				setCheckoutApp(app as AppManifestEntry);
 				setPresetPlan(plan ?? null);
+				setPresetPromo(promo ?? null);
 			},
 		);
 	}, []);
@@ -101,15 +106,26 @@ export const CheckoutFlow: React.FC<CheckoutFlowProps> = ({ stripeKey, orgId }) 
 			appDescription={checkoutApp.description}
 			stripePublishableKey={stripeKey}
 			preselectedPlan={presetPlan ?? undefined}
+			preselectedPromo={presetPromo ?? undefined}
 			onFetchPlans={async () => {
 				const c = cm.getClient();
 				if (!c) throw new Error('Not connected');
 				return c.billing.getProductPrices(checkoutApp.id);
 			}}
-			onCreateCheckout={async (priceId: string) => {
+			onCreateCheckout={async (priceId: string, promotionCode?: string) => {
 				const c = cm.getClient();
 				if (!c) throw new Error('Not connected');
-				return c.billing.createCheckoutSession(orgId, checkoutApp.id, priceId);
+				return c.billing.createCheckoutSession(orgId, checkoutApp.id, priceId, promotionCode);
+			}}
+			onValidatePromoCode={async (code: string, priceId?: string) => {
+				const c = cm.getClient();
+				if (!c) throw new Error('Not connected');
+				return c.billing.validatePromoCode(orgId, code, priceId);
+			}}
+			onRedeemPromoCode={async (code: string) => {
+				const c = cm.getClient();
+				if (!c) throw new Error('Not connected');
+				return c.billing.redeemPromoCode(orgId, code);
 			}}
 			onConfirmPending={async (subscriptionId: string, priceId: string) => {
 				const c = cm.getClient();
@@ -129,6 +145,7 @@ export const CheckoutFlow: React.FC<CheckoutFlowProps> = ({ stripeKey, orgId }) 
 				const appName = checkoutApp.name;
 				setCheckoutApp(null);
 				setPresetPlan(null);
+				setPresetPromo(null);
 				cm.emit('shell:switchApp', { appId });
 				cm.emit('shell:statusMessage', { message: `Welcome to ${appName} — your plan is now active.` });
 				// Auto-clear so the confirmation doesn't linger in the status bar.
@@ -136,7 +153,7 @@ export const CheckoutFlow: React.FC<CheckoutFlowProps> = ({ stripeKey, orgId }) 
 				if (statusClearTimer.current) clearTimeout(statusClearTimer.current);
 				statusClearTimer.current = setTimeout(() => cm.emit('shell:statusMessage', { message: null }), 5000);
 			}}
-			onClose={() => { setCheckoutApp(null); setPresetPlan(null); }}
+			onClose={() => { setCheckoutApp(null); setPresetPlan(null); setPresetPromo(null); }}
 		/>
 	);
 };
