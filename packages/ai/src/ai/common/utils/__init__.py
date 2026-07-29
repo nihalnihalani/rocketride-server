@@ -10,6 +10,8 @@ Public surface:
   configuration values.
 - ``normalize_bound_tools``, ``langchain_messages_to_transcript`` —
   helpers for LangChain-based agent drivers.
+- ``merge_metadata`` — merge non-prompt pipeline metadata onto a
+  ``Question``/``Answer``.
 - ``decode_data_url`` — decode an uploaded ``data-url`` value to (bytes, mime).
 - ``guess_filename`` — derive a typed ``upload.<ext>`` filename from a buffer
   via the optional ``filetype`` package (lazy; node-provided dependency).
@@ -22,8 +24,9 @@ Public surface:
 
 Implementations live in submodules (``string_utils``, ``tool_args``,
 ``config_utils``, ``agent_tools``, ``file_utils``, ``cuda_utils``,
-``http_retry``, ``image_utils``, ``url_utils``); this package re-exports them so
-the canonical import path is ``from ai.common.utils import <name>``.
+``http_retry``, ``image_utils``, ``metadata_utils``, ``url_utils``); this
+package re-exports them so the canonical import path is
+``from ai.common.utils import <name>``.
 """
 
 from .agent_tools import langchain_messages_to_transcript, normalize_bound_tools
@@ -32,6 +35,7 @@ from .file_utils import decode_data_url, guess_filename
 from .cuda_utils import pick_torch_device, pick_torch_dtype, resolve_pipeline_device
 from .http_retry import post_with_retry
 from .image_utils import colorize_depth, decode_ndarray, encode_ndarray, image_to_bytes
+from .metadata_utils import merge_metadata
 from .string_utils import safe_str
 from .tool_args import (
     normalize_tool_input,
@@ -55,6 +59,7 @@ __all__ = [
     'encode_ndarray',
     'image_to_bytes',
     'langchain_messages_to_transcript',
+    'merge_metadata',
     'normalize_bound_tools',
     'normalize_tool_input',
     'post_with_retry',

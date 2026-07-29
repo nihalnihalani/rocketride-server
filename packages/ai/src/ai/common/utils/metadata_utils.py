@@ -1,5 +1,6 @@
 # =============================================================================
 # MIT License
+#
 # Copyright (c) 2026 Aparavi Software AG
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -21,33 +22,42 @@
 # SOFTWARE.
 # =============================================================================
 
-from typing import Any, Dict
+"""
+Pipeline metadata helpers.
 
-from ai.common.schema import Question
-from ai.common.utils import merge_metadata
+This is the single home of ``merge_metadata``. Dataset/evaluator nodes and the
+LLM drivers all carry non-prompt state on ``Question.metadata`` /
+``Answer.metadata``; they merge it through here rather than each repeating the
+update-or-assign dance.
+"""
+
+from typing import Any, Dict, Optional
+
+__all__ = ['merge_metadata']
 
 
-def question_from_item(item: Dict[str, Any]) -> Question:
-    """Build a Question from a dataset item.
+def merge_metadata(target: Any, metadata: Optional[Dict[str, Any]]) -> None:
+    """Merge pipeline metadata into ``target.metadata``.
+
+    Updates the target's existing dict in place when it has one, so keys set by
+    an earlier node survive; otherwise assigns a shallow copy. The copy matters
+    for fan-out — sharing the source dict would let one branch's writes appear
+    in another's.
 
     Args:
-        item: Dataset item with an optional 'text' key holding the prompt and
-            an optional 'metadata' dict carrying the reference answer. The
-            metadata is attached to the Question but never rendered into the
-            prompt, so a downstream LLM never sees the expected answer.
+        target: Object carrying a ``metadata`` attribute, typically a
+            ``Question`` or an ``Answer``.
+        metadata: Mapping to merge in. A ``None``, empty, or non-dict value is
+            ignored.
 
     Returns:
-        A Question carrying the item's text and metadata.
+        None. ``target`` is modified in place.
     """
-    question = Question()
+    if not isinstance(metadata, dict) or not metadata:
+        return
 
-    if 'text' in item:
-        text = item['text']
+    existing = getattr(target, 'metadata', None)
+    if isinstance(existing, dict):
+        existing.update(metadata)
     else:
-        text = ''
-    if text is not None and text != '':
-        question.addQuestion(str(text))
-
-    merge_metadata(question, item.get('metadata', {}))
-
-    return question
+        target.metadata = dict(metadata)

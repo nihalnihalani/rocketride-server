@@ -222,13 +222,13 @@ Run the pipeline via the standard RocketRide loader (set
 
 ## Running real-library integration tests
 
-The fast unit tests in `test/nodes/test_eval_cobalt.py` mock the `cobalt`
+The fast unit tests in `nodes/test/cobalt/test_eval_cobalt.py` mock the `cobalt`
 library to keep CI deterministic. A companion file exercises the real
 basalt-ai-cobalt library for each of the three primary evaluation modes
 (`similarity`, `llm_judge`, `custom`):
 
 ```bash
-pytest -m integration test/nodes/test_eval_cobalt_integration.py
+pytest -m integration nodes/test/cobalt/test_eval_cobalt_integration.py
 ```
 
 The whole module is skipped cleanly when `basalt-ai-cobalt` is not

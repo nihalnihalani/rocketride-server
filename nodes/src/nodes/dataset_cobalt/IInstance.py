@@ -25,6 +25,7 @@ import contextlib
 import copy
 
 from rocketlib import Entry, IInstanceBase, debug
+from ai.common.utils import merge_metadata
 
 from .common import question_from_item
 from .IGlobal import IGlobal
@@ -76,13 +77,7 @@ class IInstance(IInstanceBase):
 
             # Attach metadata to the question without injecting expected
             # answers into the prompt context (which the LLM would see).
-            metadata = item.get('metadata', {})
-            if metadata:
-                existing = getattr(q, 'metadata', None)
-                if isinstance(existing, dict):
-                    existing.update(metadata)
-                else:
-                    q.metadata = dict(metadata)
+            merge_metadata(q, item.get('metadata', {}))
 
             self.instance.writeQuestions(q)
 

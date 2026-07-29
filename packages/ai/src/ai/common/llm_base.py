@@ -6,6 +6,7 @@ from typing import Callable, List, Optional
 from rocketlib import IInstanceBase, invoke_function, warning
 from ai.common.schema import Question, Answer
 from ai.common.llm_native_stream import STOP_SEQUENCES_VAR
+from ai.common.utils import merge_metadata
 
 
 class LLMBase(IInstanceBase):
@@ -45,23 +46,6 @@ class LLMBase(IInstanceBase):
             )
         finally:
             STOP_SEQUENCES_VAR.reset(token)
-
-    @staticmethod
-    def _copy_question_metadata(question: Question, answer: Answer) -> None:
-        """Copy non-prompt question metadata onto the answer object.
-
-        Mirrors ChatBase._copy_question_metadata; kept here as well so answers
-        produced outside ChatBase.chat() (e.g. the error fallback below, or
-        provider drivers that override chat()) still carry pipeline metadata
-        such as the evaluator's expected values.
-        """
-        metadata = getattr(question, 'metadata', None)
-        if isinstance(metadata, dict):
-            existing = getattr(answer, 'metadata', None)
-            if isinstance(existing, dict):
-                existing.update(metadata)
-            else:
-                answer.metadata = dict(metadata)
 
     def writeQuestions(self, question: Question):
         # Stream the model's reasoning live, one line at a time, on the chat-ui
@@ -109,12 +93,14 @@ class LLMBase(IInstanceBase):
             warning(f'writeQuestions: LLM call failed: {type(e).__name__}: {e}')
             answer = Answer()
             answer.setAnswer(err_msg)
-            self._copy_question_metadata(question, answer)
+            # A failed call still reaches an evaluator downstream; keep the
+            # question pairing so it scores against its expected value.
+            merge_metadata(answer, getattr(question, 'metadata', None))
             self.instance.writeAnswers(answer)
             return
 
         _flush_reasoning(force=True)  # emit any trailing partial line
-        self._copy_question_metadata(question, answer)
+        merge_metadata(answer, getattr(question, 'metadata', None))
         self.instance.writeAnswers(answer)
 
     @invoke_function

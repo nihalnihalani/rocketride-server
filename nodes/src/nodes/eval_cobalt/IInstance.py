@@ -28,6 +28,7 @@ and enriches the answer with evaluation scores before forwarding it downstream.
 """
 
 import copy
+import json
 
 from rocketlib import IInstanceBase, debug
 from ai.common.schema import Answer
@@ -71,8 +72,6 @@ class IInstance(IInstanceBase):
         output_text = ''
         json_data = None
         if answer.isJson():
-            import json
-
             json_data = answer.getJson()
             # Strip reserved reference fields before scoring to prevent
             # the evaluator from grading text that contains the reference.

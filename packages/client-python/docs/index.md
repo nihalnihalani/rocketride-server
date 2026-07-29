@@ -375,6 +375,22 @@ Question(
 
 `QuestionType`: `QUESTION`, `SEMANTIC`, `KEYWORD`, `GET`, `PROMPT`. Default type is `QUESTION`. Default filter and `expectJson=False`, `role=''` if omitted.
 
+### Fields
+
+| Field      | Type                       | Description                                                 |
+| ---------- | -------------------------- | ----------------------------------------------------------- |
+| `metadata` | `Optional[Dict[str, Any]]` | Pipeline state carried with the question. Defaults to `{}`. |
+
+`metadata` is **never rendered into the prompt** — `getPrompt()` does not
+include it, so the model never sees it. Nodes use it to carry a value a later
+node needs, such as the reference answer an evaluator scores against.
+
+**Caution:** `metadata` survives only as far as the next node that forwards the
+same question object. A node that builds a new `Question` from the incoming one
+— the `prompt` node does this, copying only the question text — starts from an
+empty `metadata`. Do not assume a value set at the head of a pipeline reaches
+the tail.
+
 ### Methods
 
 | Method           | Signature                                                           | Description                                                                |
@@ -392,6 +408,17 @@ Question(
 ## Answer
 
 From `rocketride.schema`. Used to parse chat response content. The client does not attach an `Answer` instance to the pipeline result; you read the response body and, if needed, use these helpers to extract JSON or code from AI text (which often includes markdown or code fences).
+
+### Answer fields
+
+| Field      | Type                       | Description                                                      |
+| ---------- | -------------------------- | ---------------------------------------------------------------- |
+| `metadata` | `Optional[Dict[str, Any]]` | Pipeline state carried over from the question. Defaults to `{}`. |
+
+The LLM drivers copy `Question.metadata` onto the answer on both the success
+and error paths. It is not part of the response body sent to the client.
+
+### Answer methods
 
 | Method        | Signature                              | Description                                                      |
 | ------------- | -------------------------------------- | ---------------------------------------------------------------- |

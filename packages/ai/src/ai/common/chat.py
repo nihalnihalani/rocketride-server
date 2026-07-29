@@ -18,6 +18,7 @@ from rocketlib import debug, warning
 from ai.common.schema import Answer, Question
 from ai.common.config import Config
 from ai.common.util import parseJson
+from ai.common.utils import merge_metadata
 from ai.common.validation import validate_model_name, validate_max_tokens, validate_prompt
 from ai.common.llm_native_stream import STOP_SEQUENCES_VAR, dispatch_native_chat_stream
 
@@ -715,7 +716,7 @@ class ChatBase:
                     # Create the json answer and return it
                     answer = Answer(expectJson=True)
                     answer.setAnswer(parsed_response)
-                    self._copy_question_metadata(question, answer)
+                    merge_metadata(answer, getattr(question, 'metadata', None))
                     return answer
 
                 except (json.JSONDecodeError, ValueError):
@@ -736,21 +737,10 @@ class ChatBase:
             # Create the answer and assign the text
             answer = Answer(expectJson=False)
             answer.setAnswer(response)
-            self._copy_question_metadata(question, answer)
+            merge_metadata(answer, getattr(question, 'metadata', None))
 
             # And return it
             return answer
-
-    @staticmethod
-    def _copy_question_metadata(question: Question, answer: Answer) -> None:
-        """Copy non-prompt question metadata onto the answer object."""
-        metadata = getattr(question, 'metadata', None)
-        if isinstance(metadata, dict):
-            existing = getattr(answer, 'metadata', None)
-            if isinstance(existing, dict):
-                existing.update(metadata)
-            else:
-                answer.metadata = dict(metadata)
 
 
 def getChat(provider: str, connConfig: Dict[str, Any], bag: Dict[str, Any]) -> ChatBase:

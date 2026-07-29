@@ -27,6 +27,7 @@ All tests use mocks to avoid real file I/O and external dependencies.
 """
 
 import importlib.machinery
+import importlib.util
 import os
 import pathlib
 import sys
@@ -71,6 +72,7 @@ _MOCK_MODULE_NAMES = [
     'ai.common',
     'ai.common.config',
     'ai.common.schema',
+    'ai.common.utils',
     'rocketride',
     'json5',
     'cobalt',
@@ -189,10 +191,23 @@ def _install_mocks():
     mock_ai_common_schema.DocMetadata = MagicMock
     mock_ai_common_schema.DocGroup = MagicMock
 
+    # ai.common.utils pulls torch/cv2 through its package __init__, which this
+    # environment does not have. Load the dependency-free metadata helper
+    # straight from its file so the tests exercise the shipped merge logic
+    # instead of a stub that could drift from it.
+    mock_ai_common_utils = ModuleType('ai.common.utils')
+    _metadata_path = _REPO_ROOT / 'packages' / 'ai' / 'src' / 'ai' / 'common' / 'utils' / 'metadata_utils.py'
+    _metadata_spec = importlib.util.spec_from_file_location('ai.common.utils.metadata_utils', _metadata_path)
+    _metadata_module = importlib.util.module_from_spec(_metadata_spec)
+    _metadata_spec.loader.exec_module(_metadata_module)
+    mock_ai_common_utils.merge_metadata = _metadata_module.merge_metadata
+    mock_ai_common.utils = mock_ai_common_utils
+
     sys.modules['ai'] = mock_ai
     sys.modules['ai.common'] = mock_ai_common
     sys.modules['ai.common.config'] = mock_ai_common_config
     sys.modules['ai.common.schema'] = mock_ai_common_schema
+    sys.modules['ai.common.utils'] = mock_ai_common_utils
 
     # Mock rocketride (used by ai.common.schema re-exports)
     mock_rocketride = ModuleType('rocketride')
