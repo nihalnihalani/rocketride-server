@@ -93,6 +93,7 @@ DATASET = [
     {'input': '...', 'expected': '...'},
 ]
 
+
 @pytest.mark.cobalt
 class TestEmbeddingQuality:
     def test_embedding_similarity(self, mock_rocketride_client):
