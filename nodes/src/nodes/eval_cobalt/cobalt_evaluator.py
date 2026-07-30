@@ -27,6 +27,7 @@ Supports semantic similarity, LLM-as-judge, and custom function evaluators
 through the cobalt-ai testing framework.
 """
 
+import math
 from typing import Any, Callable, Dict, Optional
 
 from rocketlib import debug
@@ -118,12 +119,12 @@ class CobaltEvaluator:
         Args:
             output: The LLM-generated output text.
             expected: The expected/reference text to compare against.
-            threshold: Override the default threshold for this call.
+            threshold: Override the default threshold for this call. Clamped to [0.0, 1.0].
 
         Returns:
             Evaluation result dict with score, passed, reasoning, and evaluator keys.
         """
-        threshold = threshold if threshold is not None else self._threshold
+        threshold = self._resolve_threshold(threshold)
 
         if not output and not expected:
             return self._make_result(1.0, threshold, 'Both output and expected are empty', 'semantic')
@@ -230,12 +231,12 @@ class CobaltEvaluator:
         Args:
             output: The LLM-generated output text.
             expected: The expected/reference text to compare against.
-            threshold: Override the default threshold for this call.
+            threshold: Override the default threshold for this call. Clamped to [0.0, 1.0].
 
         Returns:
             Evaluation result dict with score, passed, reasoning, and evaluator keys.
         """
-        threshold = threshold if threshold is not None else self._threshold
+        threshold = self._resolve_threshold(threshold)
         try:
             from .evaluators.relevance import evaluate_relevance as _relevance_fn
 
@@ -259,12 +260,12 @@ class CobaltEvaluator:
         Args:
             output: The LLM-generated output text.
             context: The source context (reference passages) the output should be grounded in.
-            threshold: Override the default threshold for this call.
+            threshold: Override the default threshold for this call. Clamped to [0.0, 1.0].
 
         Returns:
             Evaluation result dict with score, passed, reasoning, and evaluator keys.
         """
-        threshold = threshold if threshold is not None else self._threshold
+        threshold = self._resolve_threshold(threshold)
         try:
             from .evaluators.grounding import evaluate_grounding as _grounding_fn
 
@@ -285,12 +286,12 @@ class CobaltEvaluator:
             output: The LLM-generated output text.
             expected_format: The expected format type (prose, list, code, json).
                 If None, uses the configured expected_format.
-            threshold: Override the default threshold for this call.
+            threshold: Override the default threshold for this call. Clamped to [0.0, 1.0].
 
         Returns:
             Evaluation result dict with score, passed, reasoning, and evaluator keys.
         """
-        threshold = threshold if threshold is not None else self._threshold
+        threshold = self._resolve_threshold(threshold)
         expected_format = expected_format or self._expected_format
         try:
             from .evaluators.format_check import evaluate_format as _format_fn
@@ -341,6 +342,32 @@ class CobaltEvaluator:
         except (TypeError, ValueError):
             return default
 
+    def _resolve_threshold(self, threshold: Optional[float]) -> float:
+        """Resolve a per-call threshold override into a usable threshold.
+
+        The configured threshold is clamped in ``__init__``, but a per-call
+        override bypasses that clamp, so it is validated here: unusable values
+        (non-numeric or NaN) fall back to the configured threshold and the rest
+        are clamped to [0.0, 1.0].
+
+        Args:
+            threshold: The per-call override, or None to use the configured one.
+
+        Returns:
+            A threshold in [0.0, 1.0].
+        """
+        if threshold is None:
+            return self._threshold
+        try:
+            value = float(threshold)
+        except (TypeError, ValueError):
+            debug('Invalid threshold override; using the configured threshold')
+            return self._threshold
+        if math.isnan(value):
+            debug('NaN threshold override; using the configured threshold')
+            return self._threshold
+        return max(0.0, min(1.0, value))
+
     @staticmethod
     def _make_result(score: float, threshold: float, reasoning: str, evaluator: str) -> Dict[str, Any]:
         """Build a standardized evaluation result dictionary.
@@ -354,10 +381,22 @@ class CobaltEvaluator:
         Returns:
             Standardized result dict.
         """
-        score = max(0.0, min(1.0, score))
+        # A non-finite score must never clamp into a pass: max(0.0, min(1.0, nan))
+        # is 1.0 in CPython, which would silently report a perfect result.
+        if not isinstance(score, (int, float)) or not math.isfinite(score):
+            score = 0.0
+        score = max(0.0, min(1.0, float(score)))
+
+        # A NaN threshold cannot be satisfied, so it always fails; anything else
+        # is clamped so an out-of-range override cannot invert the verdict.
+        if not isinstance(threshold, (int, float)) or math.isnan(threshold):
+            passed = False
+        else:
+            passed = score >= max(0.0, min(1.0, float(threshold)))
+
         return {
             'score': score,
-            'passed': score >= threshold,
+            'passed': passed,
             'reasoning': reasoning,
             'evaluator': evaluator,
         }

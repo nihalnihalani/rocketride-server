@@ -23,6 +23,11 @@
 
 """Shared constants and function exports for Cobalt evaluators."""
 
+import math
+
+# Negation words ('not', 'nor', 'neither') are deliberately absent: the
+# relevance and grounding evaluators score by content-word overlap, so
+# discarding them would make "X is not Y" and "X is Y" score identically.
 STOP_WORDS: set[str] = {
     'a',
     'an',
@@ -66,13 +71,10 @@ STOP_WORDS: set[str] = {
     'and',
     'but',
     'or',
-    'nor',
-    'not',
     'so',
     'yet',
     'both',
     'either',
-    'neither',
     'it',
     'its',
     'that',
@@ -89,12 +91,41 @@ STOP_WORDS: set[str] = {
     'whose',
 }
 
+_DEFAULT_THRESHOLD = 0.5
+
+
+def clamp_threshold(threshold: float, default: float = _DEFAULT_THRESHOLD) -> float:
+    """Coerce a caller-supplied threshold into the closed interval [0.0, 1.0].
+
+    The ``evaluate_*`` functions are public entry points, so a caller can pass
+    a threshold that makes the verdict meaningless (``-1`` passes everything,
+    ``2`` fails everything). Infinities clamp to the nearest bound; values that
+    are not numbers at all, including NaN, fall back to ``default`` because no
+    comparison against them is meaningful.
+
+    Args:
+        threshold: The caller-supplied threshold.
+        default: Value substituted for a non-numeric or NaN threshold.
+
+    Returns:
+        A float in [0.0, 1.0].
+    """
+    try:
+        value = float(threshold)
+    except (TypeError, ValueError):
+        return default
+    if math.isnan(value):
+        return default
+    return max(0.0, min(1.0, value))
+
+
 from .relevance import evaluate_relevance  # noqa: E402
 from .grounding import evaluate_grounding  # noqa: E402
 from .format_check import evaluate_format  # noqa: E402
 
 __all__ = [
     'STOP_WORDS',
+    'clamp_threshold',
     'evaluate_relevance',
     'evaluate_grounding',
     'evaluate_format',

@@ -171,6 +171,13 @@ if _NODES_DIR not in sys.path:
 
 from eval_cobalt.cobalt_evaluator import CobaltEvaluator
 
+# The framework-level evaluator functions are also exercised directly: they are
+# public entry points that experiment tests call without going through the node.
+from eval_cobalt.evaluators import STOP_WORDS, clamp_threshold
+from eval_cobalt.evaluators.format_check import evaluate_format as evaluate_format_fn
+from eval_cobalt.evaluators.grounding import evaluate_grounding as evaluate_grounding_fn
+from eval_cobalt.evaluators.relevance import evaluate_relevance as evaluate_relevance_fn
+
 importlib.import_module('eval_cobalt.IGlobal')
 importlib.import_module('eval_cobalt.IInstance')
 
@@ -503,6 +510,81 @@ class TestThresholdEnforcement:
 
         result = CobaltEvaluator._make_result(-0.5, 0.7, 'test', 'test')
         assert result['score'] == 0.0
+
+
+class TestNonFiniteScoresCannotPass:
+    """A non-finite score must fail, not clamp into a perfect result.
+
+    ``max(0.0, min(1.0, float('nan')))`` evaluates to 1.0 in CPython, so before
+    the guard a NaN score — reachable from a custom evaluator or an upstream
+    cobalt result — was reported as a passing 1.0.
+    """
+
+    def test_nan_score_scores_zero_and_fails(self):
+        result = CobaltEvaluator._make_result(float('nan'), 0.7, 'test', 'test')
+        assert result['score'] == 0.0
+        assert result['passed'] is False
+
+    def test_positive_infinity_score_fails(self):
+        result = CobaltEvaluator._make_result(float('inf'), 0.7, 'test', 'test')
+        assert result['score'] == 0.0
+        assert result['passed'] is False
+
+    def test_negative_infinity_score_fails(self):
+        result = CobaltEvaluator._make_result(float('-inf'), 0.7, 'test', 'test')
+        assert result['score'] == 0.0
+        assert result['passed'] is False
+
+    def test_non_numeric_score_fails(self):
+        result = CobaltEvaluator._make_result('high', 0.7, 'test', 'test')
+        assert result['score'] == 0.0
+        assert result['passed'] is False
+
+    def test_nan_threshold_never_passes(self):
+        result = CobaltEvaluator._make_result(1.0, float('nan'), 'test', 'test')
+        assert result['passed'] is False
+
+    def test_custom_evaluator_returning_nan_fails(self):
+        """The end-to-end path, not just the static helper."""
+        evaluator = CobaltEvaluator({'eval_type': 'custom', 'threshold': 0.7}, {})
+        result = evaluator.evaluate_custom('out', 'exp', eval_fn=lambda o, e: float('nan'))
+        assert result['score'] == 0.0
+        assert result['passed'] is False
+
+
+class TestPerCallThresholdOverrideIsClamped:
+    """A per-call threshold override bypasses the __init__ clamp, so it is re-clamped.
+
+    Uses a partial match so the score sits strictly between 0 and 1 — a score of
+    1.0 would satisfy any clamped threshold and prove nothing.
+    """
+
+    OUTPUT = 'the cat sat on the mat'
+    EXPECTED = 'a dog stood on the mat'
+
+    def _evaluator(self):
+        return CobaltEvaluator({'eval_type': 'similarity', 'threshold': 0.7}, {})
+
+    def test_partial_match_is_between_zero_and_one(self):
+        result = self._evaluator().evaluate_semantic(self.OUTPUT, self.EXPECTED)
+        assert 0.0 < result['score'] < 1.0
+        assert result['passed'] is False
+
+    def test_negative_override_clamps_to_zero_and_passes(self):
+        result = self._evaluator().evaluate_semantic(self.OUTPUT, self.EXPECTED, threshold=-1)
+        assert result['passed'] is True
+
+    def test_over_one_override_clamps_to_one_and_fails(self):
+        result = self._evaluator().evaluate_semantic(self.OUTPUT, self.EXPECTED, threshold=2)
+        assert result['passed'] is False
+
+    def test_infinite_override_clamps_to_one_and_fails(self):
+        result = self._evaluator().evaluate_semantic(self.OUTPUT, self.EXPECTED, threshold=float('inf'))
+        assert result['passed'] is False
+
+    def test_nan_override_falls_back_to_configured_threshold(self):
+        result = self._evaluator().evaluate_semantic(self.OUTPUT, self.EXPECTED, threshold=float('nan'))
+        assert result['passed'] is False
 
 
 class TestEvaluateDispatch:
@@ -1032,3 +1114,108 @@ class TestEvalConfigExtraction:
         assert config['model'] == 'gpt-test'
         assert config['criteria'] == 'Judge correctness.'
         assert config['apikey'] == 'test-key'
+
+
+class TestClampThresholdHelper:
+    """The shared threshold guard used by every framework evaluator."""
+
+    def test_in_range_values_pass_through(self):
+        assert clamp_threshold(0.0) == 0.0
+        assert clamp_threshold(0.5) == 0.5
+        assert clamp_threshold(1.0) == 1.0
+
+    def test_out_of_range_clamps_to_nearest_bound(self):
+        assert clamp_threshold(-1) == 0.0
+        assert clamp_threshold(2) == 1.0
+
+    def test_infinities_clamp_to_bounds(self):
+        assert clamp_threshold(float('inf')) == 1.0
+        assert clamp_threshold(float('-inf')) == 0.0
+
+    def test_nan_and_non_numeric_fall_back_to_default(self):
+        assert clamp_threshold(float('nan')) == 0.5
+        assert clamp_threshold('abc') == 0.5
+        assert clamp_threshold(None) == 0.5
+        assert clamp_threshold(float('nan'), default=0.7) == 0.7
+
+
+class TestFrameworkEvaluatorsClampThreshold:
+    """The exported evaluate_* entry points clamp their threshold argument.
+
+    These are public, so a caller can otherwise pass a threshold that makes the
+    verdict meaningless. A partially-scoring input is used so the clamp is
+    observable in the verdict.
+    """
+
+    MALFORMED_JSON = '{"a": 1'
+
+    def test_malformed_json_scores_below_one(self):
+        result = evaluate_format_fn(self.MALFORMED_JSON, 'json')
+        assert result['score'] < 1.0
+
+    def test_negative_threshold_clamps_to_zero_and_passes(self):
+        assert evaluate_format_fn(self.MALFORMED_JSON, 'json', threshold=-1)['passed'] is True
+
+    def test_over_one_threshold_clamps_to_one_and_fails(self):
+        assert evaluate_format_fn(self.MALFORMED_JSON, 'json', threshold=2)['passed'] is False
+
+    def test_relevance_clamps_threshold(self):
+        assert evaluate_relevance_fn('the cat sat', 'a dog stood', threshold=-1)['passed'] is True
+        assert evaluate_relevance_fn('the cat sat', 'the cat sat', threshold=2)['passed'] is True
+
+    def test_grounding_clamps_threshold(self):
+        assert evaluate_grounding_fn('the cat sat', 'a dog stood', threshold=-1)['passed'] is True
+
+
+class TestNegationIsNoLongerDiscarded:
+    """Negation words are not stop words, so a contradiction scores lower.
+
+    This deliberately asserts DIRECTION only. Removing 'not'/'nor'/'neither'
+    from STOP_WORDS stops a flat contradiction scoring *identically* to the
+    correct answer, but overlap scoring still rates the negated sentence highly
+    (relevance 0.825, grounding 0.75 for the case below), so it does not flip
+    the verdict at any sane threshold. Catching negation properly needs
+    polarity-aware comparison, not bag-of-words overlap.
+    """
+
+    EXPECTED = 'Paris is the capital of France'
+    NEGATED = 'Paris is not the capital of France'
+
+    def test_negation_words_are_not_stop_words(self):
+        assert 'not' not in STOP_WORDS
+        assert 'nor' not in STOP_WORDS
+        assert 'neither' not in STOP_WORDS
+
+    def test_negated_answer_scores_lower_than_affirmative_relevance(self):
+        affirmative = evaluate_relevance_fn(self.EXPECTED, self.EXPECTED)['score']
+        negated = evaluate_relevance_fn(self.NEGATED, self.EXPECTED)['score']
+        assert negated < affirmative
+
+    def test_negated_answer_scores_lower_than_affirmative_grounding(self):
+        affirmative = evaluate_grounding_fn(self.EXPECTED, self.EXPECTED)['score']
+        negated = evaluate_grounding_fn(self.NEGATED, self.EXPECTED)['score']
+        assert negated < affirmative
+
+
+class TestGroundingVerdictMatchesReportedScore:
+    """`passed` is derived from the same rounded score that is reported.
+
+    Comparing an unrounded average against the threshold while returning a
+    rounded score lets a result claim `score` below threshold with
+    `passed: True` at the boundary. relevance.py already rounded first; this
+    pins grounding to the same rule.
+    """
+
+    def test_reported_score_and_verdict_agree(self):
+        for output, context in (
+            ('the cat sat on the mat', 'the cat sat on the mat'),
+            ('the cat sat on the mat', 'a dog stood on the rug'),
+            ('alpha beta gamma delta', 'alpha beta epsilon zeta'),
+        ):
+            for threshold in (0.0, 0.25, 0.5, 0.75, 1.0):
+                result = evaluate_grounding_fn(output, context, threshold=threshold)
+                if result['score'] is None:
+                    continue
+                assert result['passed'] is (result['score'] >= threshold), (
+                    f'score={result["score"]} threshold={threshold} passed={result["passed"]}'
+                )

@@ -33,7 +33,7 @@ external API calls.
 
 import re
 
-from . import STOP_WORDS
+from . import STOP_WORDS, clamp_threshold
 
 
 def _split_sentences(text: str) -> list[str]:
@@ -97,12 +97,14 @@ def evaluate_grounding(output: str, context: str, threshold: float = 0.5) -> dic
     Args:
         output: The LLM-generated output to evaluate.
         context: The source context (can be multiple documents concatenated).
-        threshold: Minimum score to pass (default 0.5).
+        threshold: Minimum score to pass (default 0.5). Clamped to [0.0, 1.0].
 
     Returns:
         A dict with keys: score (float 0-1), passed (bool), reasoning (str),
         and details (list of per-sentence scores).
     """
+    threshold = clamp_threshold(threshold)
+
     if not output and not context:
         return {'score': 1.0, 'passed': True, 'reasoning': 'Both output and context are empty.', 'details': []}
 
@@ -141,7 +143,9 @@ def evaluate_grounding(output: str, context: str, threshold: float = 0.5) -> dic
             'details': sentence_scores,
         }
 
-    avg_score = sum(scored_only) / len(scored_only)
+    # Round before comparing so the reported score and the verdict cannot
+    # disagree at the threshold boundary (matches relevance.py).
+    avg_score = round(sum(scored_only) / len(scored_only), 4)
     passed = avg_score >= threshold
 
     ungrounded = [s for s in sentence_scores if s.get('score') is not None and s['score'] < threshold]
@@ -153,7 +157,7 @@ def evaluate_grounding(output: str, context: str, threshold: float = 0.5) -> dic
     reasoning = f'Average grounding: {avg_score:.2f}; {ungrounded_summary}; Threshold: {threshold}; Result: {"PASS" if passed else "FAIL"}'
 
     return {
-        'score': round(avg_score, 4),
+        'score': avg_score,
         'passed': passed,
         'reasoning': reasoning,
         'details': sentence_scores,

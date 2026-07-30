@@ -31,6 +31,8 @@ and does not require any external API calls.
 import json
 import re
 
+from . import clamp_threshold
+
 
 def _check_prose_format(output: str) -> dict:
     """Check if output follows prose format (continuous sentences).
@@ -175,7 +177,7 @@ def evaluate_format(output: str, expected_format: str = 'prose', threshold: floa
     Args:
         output: The LLM-generated output to evaluate.
         expected_format: The expected format type. One of: prose, list, code, json.
-        threshold: Minimum score to pass (default 0.5).
+        threshold: Minimum score to pass (default 0.5). Clamped to [0.0, 1.0].
 
     Returns:
         A dict with keys: score (float 0-1), passed (bool), reasoning (str).
@@ -183,6 +185,8 @@ def evaluate_format(output: str, expected_format: str = 'prose', threshold: floa
     Raises:
         ValueError: If expected_format is not one of the supported types.
     """
+    threshold = clamp_threshold(threshold)
+
     if expected_format not in _FORMAT_CHECKERS:
         raise ValueError(f'Unsupported format type: {expected_format!r}. Supported: {list(_FORMAT_CHECKERS.keys())}')
 

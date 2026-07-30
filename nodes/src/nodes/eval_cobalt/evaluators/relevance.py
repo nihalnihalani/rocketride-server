@@ -30,7 +30,7 @@ any external API calls.
 
 import re
 
-from . import STOP_WORDS
+from . import STOP_WORDS, clamp_threshold
 
 
 def _tokenize(text: str) -> set[str]:
@@ -117,11 +117,13 @@ def evaluate_relevance(
         expected: The expected reference text.
         keyword_weight: Weight for the keyword overlap score (default 0.7).
         length_weight: Weight for the length ratio score (default 0.3).
-        threshold: Minimum score to pass (default 0.5).
+        threshold: Minimum score to pass (default 0.5). Clamped to [0.0, 1.0].
 
     Returns:
         A dict with keys: score (float 0-1), passed (bool), reasoning (str).
     """
+    threshold = clamp_threshold(threshold)
+
     output = output.strip()
     expected = expected.strip()
 
