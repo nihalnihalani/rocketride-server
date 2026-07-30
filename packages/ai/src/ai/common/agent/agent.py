@@ -22,7 +22,7 @@ from rocketlib import debug, error
 from ai.common.schema import Answer, Question
 from ai.common.config import Config
 
-from ai.common.utils import safe_str
+from ai.common.utils import merge_metadata, safe_str
 
 from ._internal.host import AgentContext, AgentHostServices
 from ._internal.utils import (
@@ -232,6 +232,7 @@ class AgentBase(ABC):
             )
             answer = Answer(expectJson=False)
             answer.setAnswer(answer_payload.get('content', ''))
+            merge_metadata(answer, getattr(question, 'metadata', None))
             iInstance.instance.writeAnswers(answer)
 
         return answer_payload
