@@ -22,6 +22,7 @@ Key behavior to know:
 - Before scoring a JSON answer, reserved reference keys (`expected`, `context`, `reference`) are stripped from the payload so the evaluator never grades text that already contains the reference. The strip is **shallow (top-level keys only) and applies to dict-shaped JSON answers**; references nested in sub-objects or carried in plain text are not removed.
 - The configured pass threshold is **clamped to [0.0, 1.0]** at construction, and every computed score is clamped to the same range per result, so an out-of-range config value can never produce a nonsensical verdict.
 - For grounding mode, the `expected` argument is treated as the source context. Candidate context is resolved from metadata/answer context first, then falls back to the reference/expected answer as a last resort.
+- **The reference is read from the answer's `metadata`**, so every node between the dataset and this one must carry metadata forward. When nothing resolves, `similarity`, `relevance`, and `grounding` score 0.0 with a debug log rather than an error — a pipeline scoring uniformly 0.0 usually means the reference never arrived, not that the answers were wrong.
 - Evaluator failures are contained: any evaluator exception is caught and turned into a zero-score result with a reason, never an aborted pipeline.
 
 ---

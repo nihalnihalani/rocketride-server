@@ -19,10 +19,12 @@ RocketRide's pipeline nodes handle LLM calls, vector database queries, embedding
 
 ```text
 nodes/test/cobalt/
-  cobalt.toml                     # Cobalt configuration (thresholds, concurrency)
+  cobalt.toml                     # Config for the external Cobalt runner (not read by pytest)
   conftest.py                     # Shared pytest fixtures (mock client, datasets)
   requirements.txt                # Python dependencies for Cobalt tests
-  evaluators/
+  test_eval_cobalt.py             # eval_cobalt node unit tests (cobalt library mocked)
+  test_eval_cobalt_integration.py # eval_cobalt tests against the real cobalt library
+  evaluators/                     # Shims re-exporting nodes/src/nodes/eval_cobalt/evaluators/
     __init__.py
     relevance.py                  # Keyword overlap + length ratio evaluator
     grounding.py                  # Context grounding evaluator (hallucination detection)
@@ -112,7 +114,9 @@ Import evaluators from `nodes/test/cobalt/evaluators/`:
 
 ### 3. Create Custom Evaluators
 
-Add new evaluators in `nodes/test/cobalt/evaluators/`. Every evaluator must:
+Add new evaluators in `nodes/src/nodes/eval_cobalt/evaluators/` (their canonical
+home), then re-export each one from `nodes/test/cobalt/evaluators/` so experiment
+files can keep importing it by short name. Every evaluator must:
 
 - Be deterministic (no randomness)
 - Work offline (no API calls)
@@ -141,15 +145,20 @@ Add a step to your CI workflow that runs Cobalt experiments:
 
 ### Quality Gates
 
-The `cobalt.toml` configuration defines quality thresholds:
+`nodes/test/cobalt/cobalt.toml` declares the thresholds used by the external
+`basalt-ai-cobalt` experiment runner:
 
 ```toml
 [thresholds]
-avg = 0.7    # Average score across all experiments must be >= 0.7
-p95 = 0.5    # 95th percentile worst-case must be >= 0.5
+avg = 0.7    # Average score across all test items must be >= 0.7
+p95 = 0.5    # 95th-percentile (top-tail) score must be >= 0.5
 ```
 
-Tests that fall below these thresholds will fail, blocking the CI pipeline.
+Nothing in this repository reads that file. The offline pytest gates under
+`nodes/test/cobalt/experiments/` hard-code the thresholds they assert on, so
+editing `cobalt.toml` does not change what `pytest` enforces -- the two must be
+kept in sync by hand. A pytest assertion that falls below its own threshold
+fails the CI step above.
 
 ## Evaluator Reference
 
@@ -166,7 +175,7 @@ Parameters:
 - `expected` (str): The reference answer
 - `keyword_weight` (float): Weight for keyword overlap (default 0.7)
 - `length_weight` (float): Weight for length ratio (default 0.3)
-- `threshold` (float): Minimum score to pass (default 0.5)
+- `threshold` (float): Minimum score in `[0.0, 1.0]` to pass (default 0.5)
 
 ### grounding.evaluate_grounding(output, context, ...)
 
@@ -179,8 +188,8 @@ Measures whether output claims are supported by the provided context:
 Parameters:
 
 - `output` (str): The LLM-generated answer
-- `context` (str | list[str]): Source documents. A list of strings is concatenated before word extraction; pass the raw list when documents are already split.
-- `threshold` (float): Minimum score to pass (default 0.5)
+- `context` (str): The source documents as a single string -- callers join multiple documents themselves (e.g. `' '.join(retrieved_docs)`)
+- `threshold` (float): Minimum score in `[0.0, 1.0]` to pass (default 0.5)
 
 ### format_check.evaluate_format(output, expected_format, ...)
 
@@ -194,15 +203,17 @@ Checks structural formatting of the output. Supported formats:
 Parameters:
 
 - `output` (str): The text to check
-- `expected_format` (str): One of 'prose', 'list', 'code', 'json'
-- `threshold` (float): Minimum score to pass (default 0.5)
+- `expected_format` (str): One of 'prose', 'list', 'code', 'json' (default 'prose')
+- `threshold` (float): Minimum score in `[0.0, 1.0]` to pass (default 0.5)
+
+Raises `ValueError` if `expected_format` is not one of the four supported values.
 
 ## End-to-end pipeline example
 
 A working example pipeline is provided in `examples/cobalt-evaluation.pipe`.
 It wires the full evaluation flow:
 
-```
+```text
 dataset_cobalt → prompt → llm_openai → eval_cobalt → response_answers
 ```
 

@@ -192,13 +192,18 @@ class TestRAGAnswerQuality:
 
             evaluation = evaluate_grounding(answer, context)
 
-            # Check per-sentence grounding to find hallucinated claims
-            if evaluation.get('details'):
-                low_grounding_sentences = [s for s in evaluation['details'] if s['score'] < 0.3]
-                hallucination_ratio = len(low_grounding_sentences) / len(evaluation['details'])
+            # Check per-sentence grounding to find hallucinated claims.
+            # evaluate_grounding reports score=None for a sentence with no
+            # content words (stop words only); those carry no signal, so they
+            # are excluded from both the numerator and the denominator rather
+            # than counted as grounded.
+            scored_sentences = [s for s in evaluation.get('details', []) if s.get('score') is not None]
+            if scored_sentences:
+                low_grounding_sentences = [s for s in scored_sentences if s['score'] < 0.3]
+                hallucination_ratio = len(low_grounding_sentences) / len(scored_sentences)
 
                 assert hallucination_ratio < 0.5, (
-                    f'Answer for "{item["query"]}" has {len(low_grounding_sentences)}/{len(evaluation["details"])} potentially hallucinated sentences (ratio: {hallucination_ratio:.2f})'
+                    f'Answer for "{item["query"]}" has {len(low_grounding_sentences)}/{len(scored_sentences)} potentially hallucinated sentences (ratio: {hallucination_ratio:.2f})'
                 )
 
     def test_answer_relevance_to_query(self, mock_rocketride_client, sample_rag_dataset):

@@ -32,7 +32,7 @@ integrates with the upstream API.
 
 Run with:
 
-    pytest -m integration test/nodes/test_eval_cobalt_integration.py
+    pytest -m integration nodes/test/cobalt/test_eval_cobalt_integration.py
 """
 
 import importlib.util
