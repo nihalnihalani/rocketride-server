@@ -34,6 +34,12 @@ __all__ = [
 try:
     from .IGlobal import IGlobal
     from .IInstance import IInstance
-except ImportError:
+except ImportError as exc:
+    # Tolerate only the engine runtime being absent. Catching every ImportError
+    # would turn a real defect — a typo in a submodule import, or a genuinely
+    # missing declared dependency — into `IGlobal = None`, which surfaces much
+    # later as a confusing AttributeError on NoneType instead of at import.
+    if exc.name is not None and exc.name.split('.')[0] != 'rocketlib':
+        raise
     IGlobal = None  # type: ignore[assignment]
     IInstance = None  # type: ignore[assignment]

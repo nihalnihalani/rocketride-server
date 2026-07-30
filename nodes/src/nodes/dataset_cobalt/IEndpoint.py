@@ -80,7 +80,8 @@ class IEndpoint(IEndpointBase):
         except ImportError as exc:
             warning(f'Cobalt Dataset Endpoint: Failed to import cobalt library: {exc!s}')
             warning('Cobalt Dataset Endpoint: Ensure basalt-ai-cobalt is installed. pip install basalt-ai-cobalt')
-        except Exception as exc:  # noqa: BLE001 - source endpoint should report and complete empty
+        # Broad by intent: a source endpoint reports the failure and completes empty.
+        except Exception as exc:
             warning(f'Cobalt Dataset Endpoint: Failed to prepare dataset: {exc!s}')
 
         return []

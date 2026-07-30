@@ -1217,3 +1217,39 @@ class TestExtractConfigMergesDefault:
         assert result['source_type'] == 'inline'
         assert result['items'] == '[{"input": "q", "expected": "a"}]'
         assert result['sample_size'] == 0
+
+
+class TestInlineItemsMustBeMappings:
+    """Inline items are validated at the loader, not deep in to_questions.
+
+    A scalar element used to survive ``load_from_items`` and then raise
+    ``AttributeError: 'str' object has no attribute 'get'`` inside
+    ``to_questions``, which the node boundary swallows into a bare warning and
+    an empty dataset — so a user pasting `["a", "b"]` got a silent no-op run.
+    """
+
+    def test_scalar_item_raises_with_index_and_type(self):
+        loader = _make_loader(source_type='inline')
+        with pytest.raises(ValueError, match=r'index 0 in inline items is not an object'):
+            loader.load_from_items(['bad', 'worse'])
+
+    def test_error_names_the_offending_index(self):
+        loader = _make_loader(source_type='inline')
+        with pytest.raises(ValueError, match=r'index 1 in inline items'):
+            loader.load_from_items([{'input': 'ok'}, 'bad'])
+
+    def test_error_reports_the_actual_type(self):
+        loader = _make_loader(source_type='inline')
+        with pytest.raises(ValueError, match=r'got int'):
+            loader.load_from_items([42])
+
+    def test_json_string_of_scalars_is_rejected(self):
+        """The textarea path is validated after parsing, not only the list path."""
+        loader = _make_loader(source_type='inline')
+        with pytest.raises(ValueError, match='is not an object'):
+            loader.load_from_items('["a", "b"]')
+
+    def test_valid_mappings_still_load(self):
+        loader = _make_loader(source_type='inline')
+        items = loader.load_from_items([{'input': 'q', 'expected': 'a'}])
+        assert items == [{'input': 'q', 'expected': 'a'}]

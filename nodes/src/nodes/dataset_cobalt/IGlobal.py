@@ -78,7 +78,8 @@ class IGlobal(IGlobalBase):
                 warning(f'Cobalt Dataset Global: sample_size must be >= 0, got {sample_size}')
                 return
 
-        except Exception as e:  # noqa: BLE001 - validation warns instead of aborting config save
+        # Broad by intent: validation warns instead of aborting a config save.
+        except Exception as e:
             warning(f'Cobalt Dataset Global: Configuration validation error: {e!s}')
             return
 
@@ -132,7 +133,8 @@ class IGlobal(IGlobalBase):
             warning('Cobalt Dataset Global: Ensure basalt-ai-cobalt is installed. pip install basalt-ai-cobalt')
             self._dataset = []
             self._questions = []
-        except Exception as e:  # noqa: BLE001 - dataset preparation should not abort pipeline init
+        # Broad by intent: dataset preparation should not abort pipeline init.
+        except Exception as e:
             warning(f'Cobalt Dataset Global: Failed to prepare dataset: {e!s}')
             self._dataset = []
             self._questions = []

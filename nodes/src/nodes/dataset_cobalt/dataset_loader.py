@@ -51,6 +51,34 @@ def _validate_path(path: str) -> str:
     return real_path
 
 
+def _require_item_mappings(items: List[Any], source: str) -> List[Dict[str, Any]]:
+    """Return ``items`` unchanged, or raise if any element is not a mapping.
+
+    ``to_questions`` and ``apply_transforms`` call ``.get()`` on every item, so
+    a scalar element raises an opaque ``AttributeError`` deep in the pipeline,
+    which the node's boundaries turn into a bare warning and an empty dataset.
+    Failing here names the offending index and the source instead.
+
+    Args:
+        items: Parsed dataset items to check.
+        source: Human-readable origin (a file path, or 'inline items') used in
+            the error message.
+
+    Returns:
+        The same list, when every element is a dict.
+
+    Raises:
+        ValueError: If any element is not a dict.
+    """
+    for idx, item in enumerate(items):
+        if not isinstance(item, dict):
+            raise ValueError(
+                f'Dataset item at index {idx} in {source} is not an object '
+                f'(got {type(item).__name__}); each item must be a mapping.'
+            )
+    return items
+
+
 class DatasetLoader:
     """Loads and transforms evaluation datasets using Cobalt AI's Dataset class.
 
@@ -161,16 +189,7 @@ class DatasetLoader:
         import json
 
         def _check_items(items: List[Any]) -> List[Dict[str, Any]]:
-            # to_questions/apply_transforms call .get() on each item, so a
-            # non-dict (scalar JSON array element, scalar JSONL line) would
-            # raise deep in the pipeline; fail fast with a clear message here.
-            for idx, item in enumerate(items):
-                if not isinstance(item, dict):
-                    raise ValueError(
-                        f'Dataset item at index {idx} in {path} is not an object '
-                        f'(got {type(item).__name__}); each item must be a mapping.'
-                    )
-            return items
+            return _require_item_mappings(items, path)
 
         # utf-8-sig transparently strips a UTF-8 BOM (common in Excel CSV and
         # Windows-authored JSON) and is correct for BOM-less files too; plain
@@ -232,6 +251,11 @@ class DatasetLoader:
 
         if not items or not isinstance(items, list):
             raise ValueError('Inline items must be a non-empty list of dicts')
+
+        # Same guard the file paths apply: a scalar element would otherwise
+        # surface as an opaque AttributeError from to_questions, which the node
+        # boundary swallows into a bare warning and an empty dataset.
+        items = _require_item_mappings(items, 'inline items')
 
         debug(f'Cobalt DatasetLoader: Loading {len(items)} inline items')
 

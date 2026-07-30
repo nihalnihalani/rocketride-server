@@ -69,7 +69,8 @@ class IGlobal(IGlobalBase):
                 warning('Threshold must be a valid number between 0.0 and 1.0')
                 return
 
-        except Exception as e:  # noqa: BLE001 - validation surfaces dependency/config failures as warnings
+        # Broad by intent: validation surfaces dependency/config failures as warnings.
+        except Exception as e:
             warning(str(e))
 
     def beginGlobal(self):
@@ -79,18 +80,18 @@ class IGlobal(IGlobalBase):
         creates a CobaltEvaluator instance from the node configuration.
         """
         if self.IEndpoint.endpoint.openMode == OPEN_MODE.CONFIG:
-            pass
-        else:
-            from depends import depends
+            return
 
-            requirements = os.path.dirname(os.path.realpath(__file__)) + '/requirements.txt'
-            depends(requirements)
+        from depends import depends
 
-            from .cobalt_evaluator import CobaltEvaluator
+        requirements = os.path.dirname(os.path.realpath(__file__)) + '/requirements.txt'
+        depends(requirements)
 
-            config = self._extractConfig()
-            bag = self.IEndpoint.endpoint.bag
-            self._evaluator = CobaltEvaluator(config, bag)
+        from .cobalt_evaluator import CobaltEvaluator
+
+        config = self._extractConfig()
+        bag = self.IEndpoint.endpoint.bag
+        self._evaluator = CobaltEvaluator(config, bag)
 
     def endGlobal(self):
         """Release the evaluator instance."""
