@@ -398,11 +398,12 @@ Question(
 include it, so the model never sees it. Nodes use it to carry a value a later
 node needs, such as the reference answer an evaluator scores against.
 
-**Caution:** `metadata` survives only as far as the next node that forwards the
-same question object. A node that builds a new `Question` from the incoming one
-— the `prompt` node does this, copying only the question text — starts from an
-empty `metadata`. Do not assume a value set at the head of a pipeline reaches
-the tail.
+**Caution:** `metadata` travels only as far as the nodes that carry it forward.
+A node that forwards the same question object preserves it; a node that builds a
+new `Question` has to copy it across explicitly — the `prompt` node does. One
+that does not, or one that creates a question from text or a tool result rather
+than from an upstream question, starts from an empty `metadata`. Do not assume a
+value set at the head of a pipeline reaches the tail.
 
 ### Methods
 
