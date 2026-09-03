@@ -642,7 +642,7 @@ Plus the shared connection flags: `--uri`, `--apikey`, `--token` (env fallbacks 
 
 **LLM-as-judge:** the judge is itself a `.pipe` pipeline run on the same engine — no extra model-provider dependencies. A default judge ships inside the wheel (`rocketride/evals/templates/judge-default.pipe`, an OpenAI GPT-4o chain that reads `${ROCKETRIDE_OPENAI_KEY}` from your environment). Override it with `judge_pipeline` at the spec level, or per case for individual overrides. The judge receives the criteria, the case input, and the output in clearly delimited sections, is instructed to ignore any instructions embedded in the evaluated output, and must reply with a strict JSON verdict `{"score": 0..1, "reasoning": "..."}`. An unparseable verdict fails that assertion (with the raw reply in the detail) — it never crashes the run.
 
-**CI:** `rocketride validate` (structural checks, no execution) and `rocketride eval` (behavioral checks) together gate `.pipe` pull requests. Both use the same 0/1/2 exit-code contract, so they slot straight into GitHub Actions:
+**CI:** `rocketride eval` gates the behavior of `.pipe` pull requests, and its 0/1/2 exit-code contract slots straight into GitHub Actions. Pair it with a structural check — the SDK's [`client.validate()`](#services-validation-and-ping) call, which verifies a pipeline configuration without executing it — if you also want to catch malformed pipelines before any case runs:
 
 ```yaml
 name: pipeline-evals
@@ -657,7 +657,6 @@ jobs:
         with:
           python-version: '3.12'
       - run: pip install rocketride
-      - run: rocketride validate pipelines/*.pipe
       - run: rocketride eval pipelines/*.eval.json --junit reports/evals.xml
         env:
           ROCKETRIDE_URI: ${{ secrets.ROCKETRIDE_URI }}

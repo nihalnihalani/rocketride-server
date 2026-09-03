@@ -356,9 +356,10 @@ a strict JSON verdict `{"score": 0..1, "reasoning": "..."}`. An unparseable
 verdict fails that assertion — with the raw reply in the assertion detail — it
 never crashes the run.
 
-**Gating pull requests:** pair `validate` (structural checks, no execution)
-with `eval` (behavioral checks) in CI. Both use the same 0/1/2 exit-code
-contract:
+**Gating pull requests:** `eval` is a behavioral gate, and its 0/1/2 exit-code
+contract drops straight into CI. Pair it with a structural check — the SDK's
+`client.validate()` call verifies a pipeline configuration without executing
+it — if you also want malformed pipelines caught before any case runs:
 
 ```yaml
 name: pipeline-evals
@@ -373,7 +374,6 @@ jobs:
         with:
           python-version: '3.12'
       - run: pip install rocketride
-      - run: rocketride validate pipelines/*.pipe
       - run: rocketride eval pipelines/*.eval.json --junit reports/evals.xml
         env:
           ROCKETRIDE_URI: ${{ secrets.ROCKETRIDE_URI }}
