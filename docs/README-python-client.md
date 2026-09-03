@@ -591,7 +591,7 @@ rocketride otel --endpoint http://localhost:4318
 Payload content is excluded from spans by default (`--include-content` opts in,
 size-capped). Per-component spans appear for runs started with
 `client.use(..., pipelineTraceLevel='summary')`. Full guide:
-[README-otel-bridge.md](https://github.com/rocketride-org/rocketride-server/blob/develop/docs/README-otel-bridge.md).
+[OpenTelemetry bridge](https://github.com/rocketride-org/rocketride-server/blob/develop/packages/client-python/docs/otel-bridge.md).
 
 ## Configuration
 

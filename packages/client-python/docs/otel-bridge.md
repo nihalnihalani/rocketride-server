@@ -1,3 +1,7 @@
+---
+title: "OpenTelemetry Bridge"
+---
+
 # OpenTelemetry Bridge (`rocketride otel`)
 
 The OpenTelemetry bridge exports **live pipeline traces and metrics** from a running
@@ -5,7 +9,7 @@ RocketRide engine to any OpenTelemetry collector over OTLP — Jaeger, Grafana, 
 Langfuse, LangSmith, or anything else that ingests OTLP. It ships with the Python client
 as the `rocketride otel` CLI command and requires **zero engine or server changes**: the
 bridge is a pure consumer of the engine's documented
-[WebSocket monitor protocol](../packages/server/docs/observability.md), subscribing to the
+[WebSocket monitor protocol](/protocols/websocket/observability), subscribing to the
 `TASK`, `SUMMARY`, `FLOW`, and `SSE` event streams with the wildcard token scope (the
 documented scope for an ingestion service) and translating them into OTel spans and
 metrics on the fly. Point it at your engine and your collector, and every pipeline run
@@ -66,6 +70,7 @@ Now start a pipeline run **with a trace level** so it emits `FLOW` events (see
 import asyncio
 from rocketride import RocketRideClient
 
+
 async def main():
     # Uses ROCKETRIDE_URI / ROCKETRIDE_APIKEY from the environment
     async with RocketRideClient() as client:
@@ -73,6 +78,7 @@ async def main():
         token = result['token']
         await client.send(token, 'hello traces', objinfo={'name': 'input.txt'}, mimetype='text/plain')
         await client.terminate(token)
+
 
 asyncio.run(main())
 ```
@@ -336,9 +342,16 @@ tokens**, and is deliberately not exported as `gen_ai.usage.*`.
 
 Honest edges of a protocol-level bridge:
 
-- **Timestamps are arrival time.** The monitor wire protocol carries no event
-  timestamps, so span start/end use the bridge's clock at event arrival. Durations are
-  bridge-observed (WebSocket latency included), not engine-measured.
+- **Span timestamps come from the engine; metric points do not.** Every forwarded
+  event body carries `eventTime` (epoch seconds, stamped at ingress by the engine's
+  run-log continuum), and spans and span events are stamped with it — so span
+  durations are engine-measured and exclude WebSocket latency. Two edges remain: a
+  span closed by a non-event path (bridge shutdown, snapshot reconciliation, or the
+  tracked-run cap) and any event from an engine too old to stamp `eventTime` fall back
+  to the bridge's own clock at that moment; and OpenTelemetry metric instruments take
+  no explicit timestamp, so metric points are always recorded at arrival. A close is
+  never stamped before its own span's start, so mixing the two sources cannot produce
+  a negative duration.
 - **LLM token usage and model names appear only when nodes surface them in events.**
   Flow events at `summary` level carry neither, so `gen_ai.request.model` and
   `gen_ai.usage.*` are honestly omitted rather than guessed, and LLM span names degrade
@@ -363,7 +376,7 @@ Honest edges of a protocol-level bridge:
 
 ## See also
 
-- [Monitor protocol reference](../packages/server/docs/observability.md) — the event
+- [Monitor protocol reference](/protocols/websocket/observability) — the event
   stream the bridge consumes
-- [Python client](README-python-client.md) — SDK and the rest of the CLI
-- [Client libraries overview](README-clients.md)
+- [Python client](/develop/python) — SDK and the rest of the CLI
+- [Client libraries overview](https://github.com/rocketride-org/rocketride-server/blob/develop/docs/README-clients.md)

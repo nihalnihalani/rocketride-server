@@ -26,7 +26,7 @@ URIs: clients accept `http`/`https` or `ws`/`wss` and convert to WebSocket (`htt
 
 Each document lists every constructor option, method, type, and usage example for that client.
 
-The Python client also ships the OpenTelemetry bridge (`rocketride otel`), which exports live pipeline traces and metrics over OTLP — see [README-otel-bridge.md](README-otel-bridge.md).
+The Python client also ships the OpenTelemetry bridge (`rocketride otel`), which exports live pipeline traces and metrics over OTLP — see [the OpenTelemetry bridge guide](../packages/client-python/docs/otel-bridge.md).
 
 ---
 
