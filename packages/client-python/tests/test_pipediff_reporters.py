@@ -23,77 +23,25 @@
 """
 Tests for rocketride.pipediff.reporters.
 
-The reporters are read-only over the diff model and are duck-typed, so these
-tests build fixtures from lightweight dataclasses that mirror the pinned shapes
-of ``rocketride.pipediff.model`` (owner: Implementer A). The real model
-dataclasses are structurally identical; exercising the reporters against these
-mirrors runs the true render code without depending on the engine being present.
+Fixtures are built from the production ``rocketride.pipediff`` model classes, so
+a change to the model (a new field, a renamed attribute) surfaces here instead of
+being masked by a local mirror that drifts out of sync.
 
 Coverage:
     - empty diff, layout-only diff, and a mixed diff for each renderer
     - human color on/off (ANSI escape presence)
+    - control-character escaping in the human renderer
     - JSON document shape and summary contents
-    - Markdown table escaping of ``|`` and backticks
+    - Markdown table escaping of ``|`` and backticks, and of the title/version
+    - viewport enumeration under include_layout
     - deterministic ordering independent of engine emission order
 """
 
 import json
 import unittest
-from dataclasses import dataclass, field
-from typing import Any, List, Optional, Tuple
 
+from rocketride.pipediff import EdgeChange, FieldChange, NodeChange, PipeDiff
 from rocketride.pipediff.reporters import render_human, render_json, render_markdown
-
-
-# =========================================================================
-# Fixtures mirroring the pinned rocketride.pipediff.model dataclass shapes.
-# =========================================================================
-
-
-@dataclass
-class FieldChange:
-    """Mirror of model.FieldChange."""
-
-    path: str
-    kind: str  # 'added' | 'removed' | 'changed'
-    old: Any = None
-    new: Any = None
-
-
-@dataclass
-class NodeChange:
-    """Mirror of model.NodeChange."""
-
-    id: str
-    kind: str  # 'added' | 'removed' | 'provider' | 'config'
-    provider_old: Optional[str] = None
-    provider_new: Optional[str] = None
-    field_changes: List[FieldChange] = field(default_factory=list)
-
-
-@dataclass
-class EdgeChange:
-    """Mirror of model.EdgeChange."""
-
-    from_id: str
-    lane: str
-    to_id: str
-    kind: str  # 'added' | 'removed'
-
-
-@dataclass
-class PipeDiff:
-    """Mirror of model.PipeDiff, including has_semantic_changes."""
-
-    node_changes: List[NodeChange] = field(default_factory=list)
-    edge_changes: List[EdgeChange] = field(default_factory=list)
-    version_change: Optional[Tuple[Any, Any]] = None
-    layout_changed: bool = False
-
-    @property
-    def has_semantic_changes(self) -> bool:
-        """Layout is non-semantic; version/nodes/edges are."""
-        return bool(self.node_changes or self.edge_changes or self.version_change)
 
 
 def _mixed_diff() -> PipeDiff:
@@ -157,18 +105,61 @@ class TestRenderHuman(unittest.TestCase):
         out = render_human(_mixed_diff(), use_color=False)
         self.assertFalse(out.endswith('\n'))
 
+    def test_control_characters_in_values_are_escaped(self) -> None:
+        # A .pipe file under review is untrusted input: a config value carrying
+        # ANSI escapes could recolor or rewrite the report the reviewer reads.
+        diff = PipeDiff(
+            node_changes=[
+                NodeChange(
+                    id='n1\r\nfake line',
+                    kind='config',
+                    field_changes=[
+                        FieldChange(path='config.msg', kind='changed', old='a', new='\x1b[31mred\x1b[0m'),
+                    ],
+                )
+            ]
+        )
+        out = render_human(diff, use_color=False)
+        self.assertNotIn('\x1b', out)
+        self.assertNotIn('\r', out)
+        self.assertIn('\\x1b', out)
+        self.assertIn('\\x0d\\x0afake line', out)
+
+    def test_control_characters_escaped_in_ids_lanes_and_version(self) -> None:
+        diff = PipeDiff(
+            node_changes=[NodeChange(id='a\x1b[2J', kind='added', provider_new='p\x1b[2J')],
+            edge_changes=[EdgeChange(from_id='f\x1b[2J', lane='l\x1b[2J', to_id='t', kind='added')],
+            version_change=('1', '2\x1b[2J'),
+        )
+        out = render_human(diff, use_color=False)
+        self.assertNotIn('\x1b', out)
+        self.assertIn('\\x1b[2J', out)
+
+    def test_viewport_changes_render_as_layout_block(self) -> None:
+        diff = PipeDiff(
+            layout_changed=True,
+            viewport_changes=[FieldChange(path='viewport.x', kind='changed', old=0, new=120)],
+        )
+        out = render_human(diff, use_color=False)
+        self.assertIn('Layout', out)
+        self.assertIn('viewport', out)
+        self.assertIn('~ viewport.x: 0 -> 120', out)
+        self.assertIn('1 viewport field changed', out)
+
 
 class TestRenderJson(unittest.TestCase):
     def test_empty_diff_shape(self) -> None:
         doc = render_json(PipeDiff())
-        self.assertEqual(set(doc.keys()), {'nodes', 'edges', 'summary'})
+        self.assertEqual(set(doc.keys()), {'nodes', 'edges', 'viewport', 'summary'})
         self.assertEqual(set(doc['nodes'].keys()), {'added', 'removed', 'changed'})
         self.assertEqual(set(doc['edges'].keys()), {'added', 'removed'})
         self.assertEqual(doc['nodes']['added'], [])
         self.assertEqual(doc['edges']['removed'], [])
+        self.assertEqual(doc['viewport'], [])
         self.assertFalse(doc['summary']['has_semantic_changes'])
         self.assertIsNone(doc['summary']['version_change'])
         self.assertFalse(doc['summary']['layout_changed'])
+        self.assertEqual(doc['summary']['viewport_changes'], 0)
 
     def test_layout_only_summary(self) -> None:
         doc = render_json(PipeDiff(layout_changed=True))
@@ -232,6 +223,19 @@ class TestRenderJson(unittest.TestCase):
         self.assertEqual(entry['provider_change'], {'old': 'a', 'new': 'b'})
         self.assertEqual(len(entry['config_changes']), 1)
 
+    def test_viewport_changes_are_enumerated_and_counted(self) -> None:
+        diff = PipeDiff(
+            layout_changed=True,
+            viewport_changes=[
+                FieldChange(path='viewport.zoom', kind='changed', old=1, new=2),
+                FieldChange(path='viewport.x', kind='changed', old=0, new=120),
+            ],
+        )
+        doc = render_json(diff)
+        self.assertEqual([fc['path'] for fc in doc['viewport']], ['viewport.x', 'viewport.zoom'])
+        self.assertEqual(doc['summary']['viewport_changes'], 2)
+        self.assertTrue(doc['summary']['has_semantic_changes'])
+
     def test_json_serializable(self) -> None:
         # The document must round-trip through the json module unchanged.
         doc = render_json(_mixed_diff())
@@ -247,7 +251,35 @@ class TestRenderMarkdown(unittest.TestCase):
 
     def test_title_heading(self) -> None:
         out = render_markdown(PipeDiff(), title='pipeline.pipe')
-        self.assertTrue(out.startswith('## pipeline.pipe'))
+        self.assertTrue(out.startswith('## `pipeline.pipe`'))
+
+    def test_title_with_newline_cannot_inject_markdown(self) -> None:
+        # The action passes a repository file path as the title; a path is
+        # attacker-controlled content in a fork PR.
+        out = render_markdown(PipeDiff(), title='a.pipe\n\n## INJECTED\n\n@everyone')
+        for line in out.splitlines():
+            self.assertFalse(line.lstrip().startswith('## INJECTED'), line)
+            self.assertFalse(line.lstrip().startswith('@everyone'), line)
+
+    def test_version_in_summary_line_is_code_spanned(self) -> None:
+        # The summary line interpolates the two `version` values; in Markdown they
+        # must be code-spanned or a crafted version breaks out of the comment.
+        out = render_markdown(PipeDiff(version_change=('1', '2`\n\n# pwned')))
+        summary_line = out.splitlines()[0]
+        self.assertIn('**Pipeline diff:**', summary_line)
+        self.assertNotIn('\n\n#', out)
+        for line in out.splitlines():
+            self.assertFalse(line.lstrip().startswith('# pwned'), line)
+
+    def test_viewport_changes_render_as_layout_table(self) -> None:
+        diff = PipeDiff(
+            layout_changed=True,
+            viewport_changes=[FieldChange(path='viewport.x', kind='changed', old=0, new=120)],
+        )
+        out = render_markdown(diff)
+        self.assertIn('**Layout**', out)
+        self.assertIn('| Field | Change |', out)
+        self.assertIn('`viewport.x`', out)
 
     def test_mixed_sections(self) -> None:
         out = render_markdown(_mixed_diff())

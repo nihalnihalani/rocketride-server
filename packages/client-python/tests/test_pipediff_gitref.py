@@ -135,6 +135,30 @@ def test_resolve_raises_on_timeout(monkeypatch):
         resolve_git_ref('HEAD', '/repo/pipeline.pipe')
 
 
+def test_resolve_raises_on_undecodable_git_output(monkeypatch):
+    # subprocess.run(text=True, encoding='utf-8') raises UnicodeDecodeError when a
+    # blob is not UTF-8 text; that is a ValueError, so without a handler it left
+    # the pipediff API as a raw traceback instead of a PipeDiffError.
+    _install_fake_git(
+        monkeypatch,
+        {'rev-parse': UnicodeDecodeError('utf-8', b'\xff', 0, 1, 'invalid start byte')},
+    )
+    with pytest.raises(PipeDiffError, match='not valid UTF-8'):
+        resolve_git_ref('HEAD', '/repo/pipeline.pipe')
+
+
+def test_resolve_raises_on_undecodable_show_output(monkeypatch):
+    _install_fake_git(
+        monkeypatch,
+        {
+            'rev-parse': _completed(0, stdout='/repo\n'),
+            'show': UnicodeDecodeError('utf-8', b'\xff', 0, 1, 'invalid start byte'),
+        },
+    )
+    with pytest.raises(PipeDiffError, match='not valid UTF-8'):
+        resolve_git_ref('HEAD', '/repo/pipeline.pipe')
+
+
 def test_resolve_raises_on_invalid_json_content(monkeypatch):
     _install_fake_git(
         monkeypatch,

@@ -41,9 +41,11 @@ Usage:
     rocketride diff --git <ref> <file.pipe>
 
 Flags:
-    --include-layout  Include layout churn (component ``ui`` blocks and the
-                      top-level ``viewport``) that is ignored by default. Version
-                      changes are always reported regardless of this flag.
+    --include-layout  Enumerate the layout churn (component ``ui`` blocks and the
+                      top-level ``viewport``) that is ignored by default, as
+                      ``ui.*`` and ``viewport.*`` field changes; with the flag a
+                      layout-only edit therefore exits 1. Version changes are
+                      always reported regardless of this flag.
     --json            Emit a single JSON document to stdout.
     --markdown        Emit compact, PR-comment-friendly Markdown to stdout.
     --exit-zero       Force exit code 0 on success, even when changes are present

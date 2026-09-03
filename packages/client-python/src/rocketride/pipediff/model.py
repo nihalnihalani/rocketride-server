@@ -38,7 +38,9 @@ The model deliberately mirrors the three semantic axes of a pipeline:
 Canvas layout (each component's ``ui`` block and the top-level ``viewport``) is
 *not* enumerated field-by-field by default; it is summarised by
 ``PipeDiff.layout_changed`` so that coordinate churn never drowns out real
-changes.
+changes. When the caller opts layout in, per-node ``ui.*`` changes join that
+node's ``field_changes`` and the top-level viewport delta lands in
+``PipeDiff.viewport_changes``.
 
 Classes:
     FieldChange: A single dotted-path change within a component's config/ui.
@@ -158,25 +160,32 @@ class PipeDiff:
             of layout options, since a version bump is semantically meaningful.
         layout_changed: ``True`` when the top-level ``viewport`` or any retained
             component's ``ui`` block differs. This is a coarse hint only; layout
-            details are enumerated as ``ui.*`` field changes only when the caller
-            opts layout in.
+            details are enumerated as ``ui.*`` field changes (per node) and
+            ``viewport_changes`` only when the caller opts layout in.
+        viewport_changes: The top-level ``viewport`` differences as ``viewport.*``
+            dotted paths. Populated only when the caller passes
+            ``include_layout``; empty otherwise. When non-empty it counts as a
+            change, so ``--include-layout`` on a viewport-only edit exits ``1``.
     """
 
     node_changes: list[NodeChange] = field(default_factory=list)
     edge_changes: list[EdgeChange] = field(default_factory=list)
     version_change: Optional[tuple[Any, Any]] = None
     layout_changed: bool = False
+    viewport_changes: list[FieldChange] = field(default_factory=list)
 
     @property
     def has_semantic_changes(self) -> bool:
         """
         Whether this diff contains any change that should gate a non-zero exit.
 
-        Returns ``True`` when there are node changes, edge changes, or a version
-        change. Pure layout churn (``layout_changed`` with no other change) does
-        **not** count as semantic, so a canvas-only move exits ``0``.
+        Returns ``True`` when there are node changes, edge changes, a version
+        change, or enumerated ``viewport_changes``. Pure layout churn
+        (``layout_changed`` with nothing enumerated) does **not** count, so a
+        canvas-only move exits ``0`` unless the caller opted layout in with
+        ``include_layout``.
 
         Returns:
-            ``True`` if any semantic (non-layout) change is present.
+            ``True`` if any change that should gate the exit code is present.
         """
-        return bool(self.node_changes or self.edge_changes or self.version_change is not None)
+        return bool(self.node_changes or self.edge_changes or self.version_change is not None or self.viewport_changes)

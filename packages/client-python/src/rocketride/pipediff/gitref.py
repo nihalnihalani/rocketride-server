@@ -143,7 +143,9 @@ def _run_git(args: list[str], context: str) -> subprocess.CompletedProcess:
         ``stderr``).
 
     Raises:
-        PipeDiffError: If ``git`` is not found on ``PATH`` or the call times out.
+        PipeDiffError: If ``git`` is not found on ``PATH``, the call times out, or
+            git's output is not decodable as UTF-8 (a blob that is not a text
+            pipe file, for instance).
     """
     try:
         return subprocess.run(
@@ -157,3 +159,5 @@ def _run_git(args: list[str], context: str) -> subprocess.CompletedProcess:
         raise PipeDiffError('git executable not found; --git requires git on PATH') from exc
     except subprocess.TimeoutExpired as exc:
         raise PipeDiffError(f'git timed out while {context}') from exc
+    except UnicodeDecodeError as exc:
+        raise PipeDiffError(f'git output is not valid UTF-8 while {context}: {exc}') from exc

@@ -141,6 +141,13 @@ def _layout_only_new_pipe():
     return pipe
 
 
+def _viewport_only_new_pipe():
+    """``_old_pipe`` with *only* a top-level viewport pan/zoom, no node touched."""
+    pipe = _old_pipe()
+    pipe['viewport'] = {'x': 120, 'y': 40, 'zoom': 2}
+    return pipe
+
+
 async def _run(args):
     """Instantiate and execute a DiffCommand, returning its integer exit code."""
     command = DiffCommand(_StubCLI(), args)
@@ -327,8 +334,11 @@ async def test_json_output_is_pure_and_parseable(tmp_path, capsys):
     assert code == 1
     # stdout must be exactly one JSON document, nothing else.
     doc = json.loads(captured.out)
-    assert set(doc.keys()) == {'nodes', 'edges', 'summary'}
+    assert set(doc.keys()) == {'nodes', 'edges', 'viewport', 'summary'}
     assert doc['summary']['has_semantic_changes'] is True
+    # Without --include-layout the viewport is never enumerated.
+    assert doc['viewport'] == []
+    assert doc['summary']['viewport_changes'] == 0
     assert captured.err == ''
 
 
@@ -376,6 +386,36 @@ async def test_include_layout_surfaces_ui_fields_exit_1(tmp_path, capsys):
     # Opting layout in enumerates ui.* field changes and makes them count.
     assert code == 1
     assert 'ui.position' in out
+
+
+@pytest.mark.asyncio
+async def test_viewport_only_hidden_by_default_exit_0(tmp_path, capsys):
+    old = _write_pipe(tmp_path, 'old.pipe', _old_pipe())
+    new = _write_pipe(tmp_path, 'new.pipe', _viewport_only_new_pipe())
+
+    code = await _run(_diff_args([old, new]))
+
+    out = capsys.readouterr().out
+    assert code == 0
+    assert 'Layout' in out
+    assert 'viewport.' not in out
+
+
+@pytest.mark.asyncio
+async def test_include_layout_surfaces_viewport_fields_exit_1(tmp_path, capsys):
+    # --help and the docs claim --include-layout enumerates the top-level
+    # viewport; before this it silently reported nothing and exited 0.
+    old = _write_pipe(tmp_path, 'old.pipe', _old_pipe())
+    new = _write_pipe(tmp_path, 'new.pipe', _viewport_only_new_pipe())
+
+    code = await _run(_diff_args([old, new], include_layout=True, json=True))
+
+    doc = json.loads(capsys.readouterr().out)
+    assert code == 1
+    paths = [fc['path'] for fc in doc['viewport']]
+    assert paths == ['viewport.x', 'viewport.y', 'viewport.zoom']
+    assert doc['summary']['viewport_changes'] == 3
+    assert doc['summary']['has_semantic_changes'] is True
 
 
 # =========================================================================

@@ -41,7 +41,8 @@ Semantic model (see :mod:`rocketride.pipediff.model` for the shapes):
     - **Layout** — each component's ``ui`` block and the top-level ``viewport``
       are ignored by default and summarised by ``layout_changed``. When
       ``include_layout`` is set, ``ui`` differences are additionally enumerated
-      as ``ui.*`` field changes on the affected node.
+      as ``ui.*`` field changes on the affected node and the ``viewport``
+      difference as ``viewport.*`` changes on the diff itself.
 
 Functions:
     load_pipe: Read and validate a pipe from a path or an already-parsed dict.
@@ -90,9 +91,11 @@ def load_pipe(path_or_obj: str | os.PathLike[str] | dict) -> dict:
         passed in; a freshly parsed object when a path is passed in).
 
     Raises:
-        PipeDiffError: If the file cannot be read, the JSON cannot be parsed, the
-            top level is not an object, ``components`` is missing or not a list,
-            or any component is not an object with a non-empty string ``id``.
+        PipeDiffError: If the file cannot be read, is not valid UTF-8, the JSON
+            cannot be parsed, the top level is not an object, ``components`` is
+            missing or not a list, any component is not an object with a
+            non-empty string ``id``, or any component's ``input``/``control``
+            wiring is not a list of well-formed wire objects.
     """
     if isinstance(path_or_obj, dict):
         return _validate_pipe(path_or_obj, '<dict>')
@@ -104,6 +107,8 @@ def load_pipe(path_or_obj: str | os.PathLike[str] | dict) -> dict:
                 text = handle.read()
         except FileNotFoundError as exc:
             raise PipeDiffError(f'Pipe file not found: {source}') from exc
+        except UnicodeDecodeError as exc:
+            raise PipeDiffError(f'{source} is not valid UTF-8: {exc}') from exc
         except OSError as exc:
             raise PipeDiffError(f'Could not read pipe file {source}: {exc}') from exc
         try:
@@ -128,7 +133,8 @@ def _validate_pipe(obj: Any, source: str) -> dict:
 
     Raises:
         PipeDiffError: If ``obj`` is not an object, lacks a ``components`` list,
-            or contains a component that is not an id-bearing object.
+            contains a component that is not an id-bearing object, or contains a
+            component whose ``input``/``control`` wiring is malformed.
     """
     if not isinstance(obj, dict):
         raise PipeDiffError(f'{source}: pipe must be a JSON object, got {type(obj).__name__}')
@@ -141,7 +147,52 @@ def _validate_pipe(obj: Any, source: str) -> dict:
         component_id = component.get('id')
         if not isinstance(component_id, str) or not component_id:
             raise PipeDiffError(f"{source}: component at index {index} is missing a string 'id'")
+        _validate_wires(component, component_id, source)
     return obj
+
+
+# The wire collections a component may declare, mapped to the key that labels the
+# lane on each wire: ``input`` wires carry a data ``lane``, ``control`` wires carry
+# the orchestration ``classType`` (llm/tool/memory/...).
+_WIRE_COLLECTIONS = {'input': 'lane', 'control': 'classType'}
+
+
+def _validate_wires(component: dict, component_id: str, source: str) -> None:
+    """
+    Validate a component's ``input``/``control`` wire collections.
+
+    Edge extraction reads ``from`` and ``lane``/``classType`` off every wire and
+    puts the resulting triples into a ``set``. Without this check a non-list
+    collection raises ``TypeError``, an unhashable ``from``/``lane`` (a list or
+    dict) raises ``TypeError`` inside ``set.add``, and a wire missing ``from``
+    silently produces a ``(None, None, id)`` edge — all of which surface as a
+    traceback or a nonsense diff instead of an actionable exit-2 error.
+
+    Args:
+        component: The component object to check.
+        component_id: The component's id, used for error context.
+        source: A label for error messages (a path, or ``"<dict>"``).
+
+    Raises:
+        PipeDiffError: If a wire collection is not a list, a wire is not an
+            object, or a wire's ``from``/lane label is not a non-empty string.
+    """
+    for key, lane_key in _WIRE_COLLECTIONS.items():
+        wires = component.get(key)
+        if wires is None:
+            continue
+        if not isinstance(wires, list):
+            raise PipeDiffError(f"{source}: component '{component_id}' field '{key}' must be a list")
+        for wire_index, wire in enumerate(wires):
+            where = f"component '{component_id}' {key}[{wire_index}]"
+            if not isinstance(wire, dict):
+                raise PipeDiffError(f'{source}: {where} is not an object')
+            from_id = wire.get('from')
+            if not isinstance(from_id, str) or not from_id:
+                raise PipeDiffError(f"{source}: {where} is missing a string 'from'")
+            lane = wire.get(lane_key)
+            if not isinstance(lane, str) or not lane:
+                raise PipeDiffError(f"{source}: {where} is missing a string '{lane_key}'")
 
 
 def deep_diff_config(old: dict | None, new: dict | None) -> list[FieldChange]:
@@ -177,15 +228,18 @@ def diff_pipes(old: dict, new: dict, *, include_layout: bool = False) -> PipeDif
     from every component's ``input[]`` and ``control[]`` wiring. The top-level
     ``version`` change is always reported. Canvas layout (each ``ui`` block and
     the ``viewport``) is summarised by ``layout_changed`` and, when
-    ``include_layout`` is set, enumerated as ``ui.*`` field changes per node.
+    ``include_layout`` is set, enumerated as ``ui.*`` field changes per node plus
+    ``viewport.*`` changes on the diff itself.
 
     Args:
         old: The previous pipeline (already loaded/validated via ``load_pipe``).
         new: The new pipeline (already loaded/validated via ``load_pipe``).
         include_layout: When ``True``, fold each node's ``ui`` differences into
-            its field changes (paths prefixed ``ui``) so canvas churn is opted
-            back into the reported changes. The ``layout_changed`` flag is
-            computed either way.
+            its field changes (paths prefixed ``ui``) and enumerate the top-level
+            ``viewport`` difference into ``PipeDiff.viewport_changes`` (paths
+            prefixed ``viewport``), so canvas churn is opted back into the
+            reported changes and counts as semantic. The ``layout_changed`` flag
+            is computed either way.
 
     Returns:
         A :class:`PipeDiff` describing every node, edge, version, and layout
@@ -254,11 +308,21 @@ def diff_pipes(old: dict, new: dict, *, include_layout: bool = False) -> PipeDif
 
     layout_changed = _layout_changed(old, new, old_components, new_components, old_ids & new_ids)
 
+    # The top-level viewport is layout, so it is enumerated only when the caller
+    # opts layout in. Doing so is what makes `--include-layout` match its
+    # documented contract: a viewport-only edit then reports concrete
+    # `viewport.*` paths and counts as a change (exit 1) instead of exiting 0
+    # with nothing to show.
+    viewport_changes: list[FieldChange] = []
+    if include_layout:
+        viewport_changes = _diff_value(old.get('viewport') or {}, new.get('viewport') or {}, 'viewport')
+
     return PipeDiff(
         node_changes=node_changes,
         edge_changes=edge_changes,
         version_change=version_change,
         layout_changed=layout_changed,
+        viewport_changes=viewport_changes,
     )
 
 

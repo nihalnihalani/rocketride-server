@@ -571,7 +571,9 @@ class RocketRideCLI:
         routes to appropriate command implementation, and handles errors.
 
         Returns:
-            int: Exit code (0 for success, 1 for error)
+            int: Exit code (0 for success, 1 for error). The ``diff`` command has
+                its own contract: 0 when there are no semantic changes, 1 when
+                changes were found, and 2 for a usage / parse / git error.
 
         Execution Flow:
             1. Parse command line arguments and validate

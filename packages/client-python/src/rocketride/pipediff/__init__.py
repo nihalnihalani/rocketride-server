@@ -36,13 +36,14 @@ Public API:
         load_pipe, diff_pipes, deep_diff_config, PipeDiffError
     Git resolution:
         resolve_git_ref
-    Reporters (rendering; provided alongside this module):
+    Reporters (rendering):
         render_human, render_json, render_markdown
 """
 
 from .engine import PipeDiffError, deep_diff_config, diff_pipes, load_pipe
 from .gitref import resolve_git_ref
 from .model import EdgeChange, FieldChange, NodeChange, PipeDiff
+from .reporters import render_human, render_json, render_markdown
 
 __all__ = [
     'NodeChange',
@@ -54,14 +55,7 @@ __all__ = [
     'diff_pipes',
     'deep_diff_config',
     'resolve_git_ref',
+    'render_human',
+    'render_json',
+    'render_markdown',
 ]
-
-# Reporters live in the sibling ``reporters`` module (implemented in parallel).
-# Import them opportunistically so the public surface is complete once they land,
-# without making this package unimportable while they are still in progress.
-try:
-    from .reporters import render_human, render_json, render_markdown  # noqa: F401
-except ImportError:
-    pass
-else:
-    __all__ += ['render_human', 'render_json', 'render_markdown']

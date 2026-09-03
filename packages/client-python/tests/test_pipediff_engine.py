@@ -328,6 +328,37 @@ def test_include_layout_surfaces_ui_field_changes():
     assert diff.has_semantic_changes is True
     # The flag is still set regardless of the include_layout mode.
     assert diff.layout_changed is True
+    # A ui-only edit says nothing about the top-level viewport.
+    assert diff.viewport_changes == []
+
+
+def test_include_layout_enumerates_top_level_viewport():
+    # --help and the docs promise that --include-layout enumerates "each node's ui
+    # block and the top-level viewport"; a viewport-only edit must therefore
+    # produce concrete viewport.* paths and count as a change (exit 1).
+    old = _pipe([_node('a', 'src')], viewport={'x': 0, 'y': 0, 'zoom': 1})
+    new = copy.deepcopy(old)
+    new['viewport'] = {'x': 10, 'y': 0, 'zoom': 2}
+
+    without = diff_pipes(old, new)
+    assert without.viewport_changes == []
+    assert without.has_semantic_changes is False
+
+    with_layout = diff_pipes(old, new, include_layout=True)
+    paths = [fc.path for fc in with_layout.viewport_changes]
+    assert paths == ['viewport.x', 'viewport.zoom']
+    assert all(path.startswith('viewport.') for path in paths)
+    assert with_layout.has_semantic_changes is True
+    assert with_layout.layout_changed is True
+
+
+def test_include_layout_with_unchanged_viewport_reports_nothing():
+    old = _pipe([_node('a', 'src')], viewport={'x': 0, 'y': 0, 'zoom': 1})
+    new = copy.deepcopy(old)
+    diff = diff_pipes(old, new, include_layout=True)
+
+    assert diff.viewport_changes == []
+    assert diff.has_semantic_changes is False
 
 
 # ---------------------------------------------------------------------------
@@ -405,6 +436,70 @@ def test_load_pipe_component_not_object_raises():
 def test_load_pipe_rejects_unsupported_type():
     with pytest.raises(PipeDiffError, match='expects a path or dict'):
         load_pipe(12345)
+
+
+def test_load_pipe_invalid_utf8_raises_pipediff_error(tmp_path):
+    # UnicodeDecodeError is a ValueError, not an OSError, so without an explicit
+    # handler it escaped load_pipe() as a raw traceback for library callers.
+    path = tmp_path / 'bad-utf8.pipe'
+    path.write_bytes(b'\xff\xfe{"components": []}')
+    with pytest.raises(PipeDiffError, match='not valid UTF-8'):
+        load_pipe(str(path))
+
+
+# ---------------------------------------------------------------------------
+# Wire (input/control) validation
+# ---------------------------------------------------------------------------
+
+
+def test_load_pipe_input_not_a_list_raises():
+    with pytest.raises(PipeDiffError, match="field 'input' must be a list"):
+        load_pipe({'components': [{'id': 'a', 'input': {'from': 'b', 'lane': 'text'}}]})
+
+
+def test_load_pipe_control_not_a_list_raises():
+    with pytest.raises(PipeDiffError, match="field 'control' must be a list"):
+        load_pipe({'components': [{'id': 'a', 'control': 'llm_1'}]})
+
+
+def test_load_pipe_wire_not_an_object_raises():
+    with pytest.raises(PipeDiffError, match=r'input\[0\] is not an object'):
+        load_pipe({'components': [{'id': 'a', 'input': ['b']}]})
+
+
+def test_load_pipe_wire_missing_from_raises():
+    with pytest.raises(PipeDiffError, match=r"input\[0\] is missing a string 'from'"):
+        load_pipe({'components': [{'id': 'a', 'input': [{'lane': 'text'}]}]})
+
+
+def test_load_pipe_wire_from_is_a_list_raises():
+    # An unhashable 'from' used to blow up inside set.add during edge extraction.
+    with pytest.raises(PipeDiffError, match=r"input\[0\] is missing a string 'from'"):
+        load_pipe({'components': [{'id': 'a', 'input': [{'from': ['b'], 'lane': 'text'}]}]})
+
+
+def test_load_pipe_wire_missing_lane_raises():
+    with pytest.raises(PipeDiffError, match=r"input\[1\] is missing a string 'lane'"):
+        load_pipe(
+            {
+                'components': [
+                    {
+                        'id': 'a',
+                        'input': [{'from': 'b', 'lane': 'text'}, {'from': 'c'}],
+                    }
+                ]
+            }
+        )
+
+
+def test_load_pipe_control_wire_missing_classtype_raises():
+    with pytest.raises(PipeDiffError, match=r"control\[0\] is missing a string 'classType'"):
+        load_pipe({'components': [{'id': 'a', 'control': [{'from': 'b'}]}]})
+
+
+def test_load_pipe_accepts_absent_wire_collections():
+    pipe = {'components': [{'id': 'a'}, {'id': 'b', 'input': [], 'control': []}]}
+    assert load_pipe(pipe) is pipe
 
 
 # ---------------------------------------------------------------------------

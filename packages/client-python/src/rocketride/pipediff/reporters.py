@@ -160,6 +160,8 @@ def _organize(diff: 'PipeDiff') -> Dict[str, Any]:
             - ``edges_removed``: list of ``(from_id, lane, to_id)`` tuples, sorted
             - ``version_change``: the ``(old, new)`` tuple or ``None``
             - ``layout_changed``: bool
+            - ``viewport_changes``: list of ``FieldChange`` for the top-level
+              ``viewport`` (non-empty only when the caller opted layout in)
             - ``has_semantic_changes``: bool (delegates to the diff's property)
     """
     nodes_added: List[Tuple[str, Optional[str]]] = []
@@ -220,6 +222,10 @@ def _organize(diff: 'PipeDiff') -> Dict[str, Any]:
         'edges_removed': sorted(edges_removed),
         'version_change': diff.version_change,
         'layout_changed': bool(diff.layout_changed),
+        'viewport_changes': sorted(
+            getattr(diff, 'viewport_changes', None) or [],
+            key=lambda fc: (fc.path, fc.kind),
+        ),
         'has_semantic_changes': bool(diff.has_semantic_changes),
     }
 
@@ -234,6 +240,7 @@ def _any_output(org: Dict[str, Any]) -> bool:
         or org['edges_removed']
         or org['version_change']
         or org['layout_changed']
+        or org['viewport_changes']
     )
 
 
@@ -250,6 +257,32 @@ def _fmt_value(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True)
 
 
+# C0 control characters that must never reach a terminal verbatim: CR and LF can
+# rewrite the line the user is reading, ESC starts an ANSI/OSC sequence that can
+# recolor, reposition, or (with OSC 52) touch the clipboard. Tab is harmless and
+# is left alone.
+_TERM_UNSAFE = re.compile(r'[\x00-\x08\x0b-\x1f\x7f]|\r|\n')
+
+
+def _term_safe(text: Any) -> str:
+    """
+    Escape control characters so untrusted values cannot rewrite the terminal.
+
+    Node ids, providers, lanes, config paths, and config values all come from a
+    ``.pipe`` file that the diff itself is meant to review, so they are untrusted
+    input. Printing them verbatim lets a crafted value emit ANSI escapes (recolor
+    the report, hide lines, move the cursor) or a bare CR/LF that fakes extra
+    report lines. Every such byte is rendered as its ``\\xNN`` escape instead;
+    tabs and printable text pass through unchanged.
+    """
+    return _TERM_UNSAFE.sub(lambda m: f'\\x{ord(m.group()):02x}', str(text))
+
+
+def _identity(text: Any) -> str:
+    """Return ``text`` as a plain string, applying no escaping."""
+    return str(text)
+
+
 def _summary_counts(org: Dict[str, Any]) -> Dict[str, int]:
     """Compute the integer counts used by summary lines and the JSON summary."""
     config_changes = sum(len(entry['config_changes']) for entry in org['nodes_changed'])
@@ -262,15 +295,25 @@ def _summary_counts(org: Dict[str, Any]) -> Dict[str, int]:
         'config_changes': config_changes,
         'edges_added': len(org['edges_added']),
         'edges_removed': len(org['edges_removed']),
+        'viewport_changes': len(org['viewport_changes']),
     }
 
 
-def _summary_phrase(org: Dict[str, Any]) -> str:
+def _summary_phrase(org: Dict[str, Any], fmt=_identity) -> str:
     """
     Build a one-line human summary such as ``2 nodes added, 1 edge removed``.
 
-    Only non-zero categories are included. Version and layout changes are appended
-    when present. When nothing changed the phrase is ``no semantic changes``.
+    Only non-zero categories are included. Version, viewport, and layout changes
+    are appended when present. When nothing changed the phrase is
+    ``no semantic changes``.
+
+    Args:
+        org: The normalized diff produced by :func:`_organize`.
+        fmt: Formatter applied to the two version values — the only untrusted
+            text this line interpolates. Markdown passes ``_md_code`` so a
+            crafted ``version`` cannot break out into headings or mentions in an
+            auto-posted PR comment; the human renderer passes ``_term_safe``.
+            Defaults to no escaping for plain callers.
     """
     counts = _summary_counts(org)
     parts: List[str] = []
@@ -289,9 +332,12 @@ def _summary_phrase(org: Dict[str, Any]) -> str:
     if counts['edges_removed']:
         parts.append(f'{_plural(counts["edges_removed"], "edge")} removed')
 
+    if counts['viewport_changes']:
+        parts.append(f'{_plural(counts["viewport_changes"], "viewport field")} changed')
+
     version_change = org['version_change']
     if version_change:
-        parts.append(f'version {_fmt_value(version_change[0])} → {_fmt_value(version_change[1])}')
+        parts.append(f'version {fmt(_fmt_value(version_change[0]))} → {fmt(_fmt_value(version_change[1]))}')
 
     if org['layout_changed']:
         parts.append('layout changed')
@@ -307,18 +353,23 @@ def _summary_phrase(org: Dict[str, Any]) -> str:
 
 
 def _human_field_line(field_change: Any, palette: _Palette) -> str:
-    """Render a single config FieldChange as an indented, marked text line."""
-    path = field_change.path
+    """
+    Render a single config FieldChange as an indented, marked text line.
+
+    The path and both values come from the diffed ``.pipe`` files, so each is run
+    through :func:`_term_safe` before it reaches the terminal.
+    """
+    path = _term_safe(field_change.path)
     kind = field_change.kind
     if kind == 'added':
-        body = f'{_MARK_ADDED} {path} = {_fmt_value(field_change.new)}'
+        body = f'{_MARK_ADDED} {path} = {_term_safe(_fmt_value(field_change.new))}'
         return '    ' + palette.added(body)
     if kind == 'removed':
-        body = f'{_MARK_REMOVED} {path} = {_fmt_value(field_change.old)}'
+        body = f'{_MARK_REMOVED} {path} = {_term_safe(_fmt_value(field_change.old))}'
         return '    ' + palette.removed(body)
     # changed
-    old = _fmt_value(field_change.old)
-    new = _fmt_value(field_change.new)
+    old = _term_safe(_fmt_value(field_change.old))
+    new = _term_safe(_fmt_value(field_change.new))
     return '    ' + palette.changed(f'{_MARK_CHANGED} {path}: ') + f'{old} ' + palette.dim('->') + f' {new}'
 
 
@@ -326,11 +377,15 @@ def render_human(diff: 'PipeDiff', *, use_color: bool) -> str:
     """
     Render a semantic pipe diff as grouped, optionally colored text.
 
-    The report is organized into up to three sections — ``Nodes`` (additions,
-    removals, provider changes), ``Edges`` (added/removed wiring), and ``Config``
-    (per-node field changes) — followed by standalone ``Version`` and ``Layout``
-    lines when applicable. Change markers are ``+`` (added, green), ``-`` (removed,
-    red), and ``~`` (changed, yellow). Empty sections are omitted.
+    The report is organized into up to four sections — ``Nodes`` (additions,
+    removals, provider changes), ``Edges`` (added/removed wiring), ``Config``
+    (per-node field changes), and ``Layout`` (the enumerated ``viewport.*``
+    changes, present only when the diff was computed with ``include_layout``) —
+    followed by standalone ``Version`` and ``Layout: changed`` lines when
+    applicable. Change markers are ``+`` (added, green), ``-`` (removed, red),
+    and ``~`` (changed, yellow). Empty sections are omitted. Every id, provider,
+    lane, path, and value is escaped through :func:`_term_safe`, so a crafted
+    ``.pipe`` cannot emit ANSI escapes or fake report lines.
 
     Args:
         diff: The pipeline diff to render.
@@ -350,21 +405,25 @@ def render_human(diff: 'PipeDiff', *, use_color: bool) -> str:
         return 'No semantic changes.'
 
     lines: List[str] = []
-    lines.append(f'Pipeline diff: {_summary_phrase(org)}')
+    lines.append(f'Pipeline diff: {_summary_phrase(org, _term_safe)}')
 
     # --- Nodes ---
     if org['nodes_added'] or org['nodes_removed'] or any(e['has_provider_change'] for e in org['nodes_changed']):
         lines.append('')
         lines.append('Nodes')
         for node_id, provider in org['nodes_added']:
-            lines.append('  ' + palette.added(f'{_MARK_ADDED} {node_id} ({provider})'))
+            lines.append('  ' + palette.added(f'{_MARK_ADDED} {_term_safe(node_id)} ({_term_safe(provider)})'))
         for node_id, provider in org['nodes_removed']:
-            lines.append('  ' + palette.removed(f'{_MARK_REMOVED} {node_id} ({provider})'))
+            lines.append('  ' + palette.removed(f'{_MARK_REMOVED} {_term_safe(node_id)} ({_term_safe(provider)})'))
         for entry in org['nodes_changed']:
             if entry['has_provider_change']:
-                marker = palette.changed(f'{_MARK_CHANGED} {entry["id"]} provider: ')
+                marker = palette.changed(f'{_MARK_CHANGED} {_term_safe(entry["id"])} provider: ')
                 lines.append(
-                    '  ' + marker + f'{entry["provider_old"]} ' + palette.dim('->') + f' {entry["provider_new"]}'
+                    '  '
+                    + marker
+                    + f'{_term_safe(entry["provider_old"])} '
+                    + palette.dim('->')
+                    + f' {_term_safe(entry["provider_new"])}'
                 )
 
     # --- Edges ---
@@ -372,9 +431,11 @@ def render_human(diff: 'PipeDiff', *, use_color: bool) -> str:
         lines.append('')
         lines.append('Edges')
         for from_id, lane, to_id in org['edges_added']:
-            lines.append('  ' + palette.added(f'{_MARK_ADDED} {from_id} --{lane}--> {to_id}'))
+            body = f'{_MARK_ADDED} {_term_safe(from_id)} --{_term_safe(lane)}--> {_term_safe(to_id)}'
+            lines.append('  ' + palette.added(body))
         for from_id, lane, to_id in org['edges_removed']:
-            lines.append('  ' + palette.removed(f'{_MARK_REMOVED} {from_id} --{lane}--> {to_id}'))
+            body = f'{_MARK_REMOVED} {_term_safe(from_id)} --{_term_safe(lane)}--> {_term_safe(to_id)}'
+            lines.append('  ' + palette.removed(body))
 
     # --- Config ---
     config_nodes = [e for e in org['nodes_changed'] if e['config_changes']]
@@ -382,19 +443,26 @@ def render_human(diff: 'PipeDiff', *, use_color: bool) -> str:
         lines.append('')
         lines.append('Config')
         for entry in config_nodes:
-            lines.append(f'  {entry["id"]}')
+            lines.append(f'  {_term_safe(entry["id"])}')
             for field_change in entry['config_changes']:
                 lines.append(_human_field_line(field_change, palette))
 
     # --- Version / Layout ---
     if org['version_change']:
-        old = _fmt_value(org['version_change'][0])
-        new = _fmt_value(org['version_change'][1])
+        old = _term_safe(_fmt_value(org['version_change'][0]))
+        new = _term_safe(_fmt_value(org['version_change'][1]))
         lines.append('')
         lines.append('Version: ' + f'{old} ' + palette.dim('->') + f' {new}')
 
+    if org['viewport_changes']:
+        lines.append('')
+        lines.append('Layout')
+        lines.append('  viewport')
+        for field_change in org['viewport_changes']:
+            lines.append(_human_field_line(field_change, palette))
+
     if org['layout_changed']:
-        if not org['version_change']:
+        if not org['version_change'] and not org['viewport_changes']:
             lines.append('')
         lines.append(palette.dim('Layout: changed (ui/viewport)'))
 
@@ -425,14 +493,18 @@ def render_json(diff: 'PipeDiff') -> Dict[str, Any]:
         {
             "nodes": {"added": [...], "removed": [...], "changed": [...]},
             "edges": {"added": [...], "removed": [...]},
+            "viewport": [...],
             "summary": {...}
         }
 
     Each added/removed node is ``{"id", "provider"}``. Each changed node is
     ``{"id", "provider_change": {"old", "new"} | null, "config_changes": [...]}``
     where every config change is ``{"path", "kind", "old", "new"}``. Edges are
-    ``{"from", "lane", "to"}``. The ``summary`` block carries counts, the version
-    change (as ``[old, new]`` or ``null``), the layout flag, and the overall
+    ``{"from", "lane", "to"}``. ``viewport`` holds the top-level ``viewport.*``
+    field changes in the same ``{"path", "kind", "old", "new"}`` shape and is
+    empty unless the diff was computed with ``include_layout``. The ``summary``
+    block carries counts (including ``viewport_changes``), the version change (as
+    ``[old, new]`` or ``null``), the layout flag, and the overall
     ``has_semantic_changes`` boolean.
 
     Args:
@@ -475,6 +547,7 @@ def render_json(diff: 'PipeDiff') -> Dict[str, Any]:
     return {
         'nodes': {'added': nodes_added, 'removed': nodes_removed, 'changed': nodes_changed},
         'edges': {'added': edges_added, 'removed': edges_removed},
+        'viewport': [_json_field_change(fc) for fc in org['viewport_changes']],
         'summary': summary,
     }
 
@@ -534,16 +607,19 @@ def render_markdown(diff: 'PipeDiff', *, title: Optional[str] = None) -> str:
     Render a semantic pipe diff as compact, PR-comment-friendly Markdown.
 
     The output leads with a bold one-line summary, then grouped sections: ``Nodes``
-    and ``Edges`` as bullet lists and ``Config`` as a table (``Node | Field |
-    Change``). All node ids, providers, lanes, and values are wrapped in code
-    spans; table cells additionally escape ``|`` and newlines so untrusted config
-    values cannot break the table or the surrounding comment. Ordering is
-    deterministic, so re-running on unchanged input yields byte-identical output.
+    and ``Edges`` as bullet lists, ``Config`` as a table (``Node | Field |
+    Change``), and — only when the diff was computed with ``include_layout`` — a
+    ``Layout`` table of the top-level ``viewport.*`` changes. All node ids,
+    providers, lanes, versions, values, and the title are wrapped in code spans;
+    table cells additionally escape ``|`` and newlines so untrusted config values
+    cannot break the table or the surrounding comment. Ordering is deterministic,
+    so re-running on unchanged input yields byte-identical output.
 
     Args:
         diff: The pipeline diff to render.
         title: Optional heading text. When provided it is emitted as an ``##``
-            heading above the summary; otherwise no heading is emitted.
+            heading (inside a code span) above the summary; otherwise no heading
+            is emitted.
 
     Returns:
         A Markdown string with no trailing newline.
@@ -552,10 +628,14 @@ def render_markdown(diff: 'PipeDiff', *, title: Optional[str] = None) -> str:
 
     lines: List[str] = []
     if title:
-        lines.append(f'## {title}')
+        # The title is caller-supplied (the action passes a file path), so it goes
+        # through the same code-span escape as every other interpolated value: a
+        # newline in it would otherwise end the heading and let the remainder
+        # render as real Markdown in the auto-posted comment.
+        lines.append(f'## {_md_code(title)}')
         lines.append('')
 
-    lines.append(f'**Pipeline diff:** {_summary_phrase(org)}')
+    lines.append(f'**Pipeline diff:** {_summary_phrase(org, _md_code)}')
 
     if not _any_output(org):
         return '\n'.join(lines)
@@ -605,6 +685,18 @@ def render_markdown(diff: 'PipeDiff', *, title: Optional[str] = None) -> str:
         new = _md_code(_fmt_value(org['version_change'][1]))
         lines.append('')
         lines.append(f'**Version:** {old} → {new}')
+
+    # --- Layout (viewport, enumerated only with include_layout) ---
+    if org['viewport_changes']:
+        lines.append('')
+        lines.append('**Layout**')
+        lines.append('')
+        lines.append('| Field | Change |')
+        lines.append('| --- | --- |')
+        for field_change in org['viewport_changes']:
+            field_cell = _md_cell(_md_code(field_change.path))
+            change_cell = _md_cell(_md_field_change(field_change))
+            lines.append(f'| {field_cell} | {change_cell} |')
 
     if org['layout_changed']:
         lines.append('')
