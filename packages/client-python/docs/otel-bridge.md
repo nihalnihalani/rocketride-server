@@ -5,7 +5,7 @@ title: "OpenTelemetry Bridge"
 # OpenTelemetry Bridge (`rocketride otel`)
 
 The OpenTelemetry bridge exports **live pipeline traces and metrics** from a running
-RocketRide engine to any OpenTelemetry collector over OTLP — Jaeger, Grafana, Datadog,
+RocketRide engine to any OpenTelemetry collector over OTLP — Jaeger, Grafana Tempo, Datadog,
 Langfuse, LangSmith, or anything else that ingests OTLP. It ships with the Python client
 as the `rocketride otel` CLI command and requires **zero engine or server changes**: the
 bridge is a pure consumer of the engine's documented
@@ -132,11 +132,14 @@ level: lane writes and final results without per-call noise.
 
 ## Backend recipes
 
-### Jaeger / any OTLP collector
+### Jaeger / Grafana Tempo / any OTLP collector
 
 Covered by the [quickstart](#quickstart-jaeger-end-to-end): OTLP/HTTP on port 4318
-(or `--protocol grpc` against 4317 with the gRPC exporter installed). The same shape works
-for the OpenTelemetry Collector, Grafana stacks, and any other standard OTLP receiver.
+(or `--protocol grpc` against 4317 with the gRPC exporter installed). Grafana Tempo
+listens on the same two ports once its `distributor.receivers.otlp` block is enabled, so
+`--endpoint http://tempo:4318` is the only change; pair it with Grafana Mimir or
+Prometheus for the metric stream. The same shape works for the OpenTelemetry Collector
+and any other standard OTLP receiver.
 
 ### Langfuse
 
