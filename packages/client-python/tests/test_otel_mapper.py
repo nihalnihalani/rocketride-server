@@ -31,6 +31,7 @@ base CI matrix does not install it).
 """
 
 import json
+import time
 from pathlib import Path
 
 import pytest
@@ -843,3 +844,126 @@ def test_full_fixture_replay_produces_coherent_span_forest():
     points = collect_metrics(reader)
     assert metric_value(points, 'rocketride.objects.total') == 1
     assert metric_value(points, 'rocketride.memory.cpu_mb.peak') == pytest.approx(322.24609375)
+
+
+# =========================================================================
+# ENGINE EVENT TIME (body.eventTime -> span timestamps)
+# =========================================================================
+
+# Fixed epoch seconds well in the past, so a fallback to the SDK clock is
+# always distinguishable from an engine stamp.
+T0 = 1_750_000_000.0
+
+
+def at(body, offset_seconds):
+    """Return a copy of an event body stamped with eventTime = T0 + offset."""
+    stamped = dict(body)
+    stamped['eventTime'] = T0 + offset_seconds
+    return stamped
+
+
+def ns(offset_seconds):
+    return int((T0 + offset_seconds) * 1_000_000_000)
+
+
+def test_event_time_ns_rejects_unusable_values():
+    assert mapper_module._event_time_ns({}) is None
+    assert mapper_module._event_time_ns({'eventTime': None}) is None
+    assert mapper_module._event_time_ns({'eventTime': '1750000000'}) is None
+    assert mapper_module._event_time_ns({'eventTime': True}) is None
+    assert mapper_module._event_time_ns({'eventTime': 0}) is None
+    assert mapper_module._event_time_ns({'eventTime': -1.0}) is None
+    assert mapper_module._event_time_ns({'eventTime': float('nan')}) is None
+    assert mapper_module._event_time_ns({'eventTime': float('inf')}) is None
+    assert mapper_module._event_time_ns({'eventTime': T0}) == ns(0)
+
+
+def test_span_timestamps_come_from_event_time():
+    """Engine-measured durations: start/end are the wire's eventTime, not arrival."""
+    mapper, exporter = make_mapper()
+    mapper.handle_event('apaevt_task', at(task('begin', name='demo.My webhook'), 0))
+    mapper.handle_event('apaevt_flow', at(flow('begin', 'probe.txt', pipes=['probe.txt']), 1))
+    mapper.handle_event('apaevt_flow', at(flow('enter', 'llm_openai_1'), 2))
+    mapper.handle_event('apaevt_flow', at(flow('leave', 'llm_openai_1', trace={'result': 'continue'}), 5))
+    mapper.handle_event('apaevt_flow', at(flow('end', 'probe.txt'), 6))
+    mapper.handle_event('apaevt_task', at(task('end'), 7))
+
+    component = spans_by_name(exporter, 'chat')[0]
+    assert (component.start_time, component.end_time) == (ns(2), ns(5))
+    assert component.end_time - component.start_time == 3_000_000_000
+
+    pipe_root = spans_by_name(exporter, 'probe.txt')[0]
+    assert (pipe_root.start_time, pipe_root.end_time) == (ns(1), ns(6))
+
+    task_span = spans_by_name(exporter, 'task demo.My webhook')[0]
+    assert (task_span.start_time, task_span.end_time) == (ns(0), ns(7))
+
+
+def test_sse_span_event_uses_event_time():
+    mapper, exporter = make_mapper()
+    mapper.handle_event('apaevt_flow', at(flow('begin', 'probe.txt', pipes=['probe.txt']), 0))
+    mapper.handle_event('apaevt_flow', at(flow('enter', 'agent_rocketride_1'), 1))
+    mapper.handle_event('apaevt_sse', at({'pipe_id': 0, 'type': 'thinking', '__id': RUN_ID}, 2))
+    mapper.handle_event('apaevt_flow', at(flow('leave', 'agent_rocketride_1'), 3))
+    mapper.handle_event('apaevt_flow', at(flow('end', 'probe.txt'), 4))
+
+    agent_span = spans_by_name(exporter, 'invoke_agent')[0]
+    thinking = [event for event in agent_span.events if event.name == 'thinking'][0]
+    assert thinking.timestamp == ns(2)
+
+
+def test_unstamped_events_still_use_the_sdk_clock():
+    """Pre-continuum engines (no eventTime) keep the original arrival-time behaviour."""
+    before = time.time_ns()
+    mapper, exporter = make_mapper()
+    mapper.handle_event('apaevt_flow', flow('begin', 'probe.txt', pipes=['probe.txt']))
+    mapper.handle_event('apaevt_flow', flow('end', 'probe.txt'))
+    after = time.time_ns()
+
+    root = spans_by_name(exporter, 'probe.txt')[0]
+    assert before <= root.start_time <= root.end_time <= after
+
+
+def test_close_outside_an_event_falls_back_to_the_sdk_clock():
+    """close_all has no event body, so its end stamp is the bridge clock, not T0."""
+    mapper, exporter = make_mapper()
+    mapper.handle_event('apaevt_flow', at(flow('begin', 'probe.txt', pipes=['probe.txt']), 0))
+    mapper.close_all()
+
+    root = spans_by_name(exporter, 'probe.txt')[0]
+    assert root.start_time == ns(0)
+    assert root.end_time > ns(0)
+    assert root.end_time >= time.time_ns() - 60_000_000_000
+    assert root.attributes[ATTR_SPAN_UNCLOSED] is True
+
+
+def test_end_is_never_stamped_before_its_own_span_start():
+    """A run that mixes stamped and unstamped events cannot get a negative duration."""
+    mapper, exporter = make_mapper()
+    # begin has no eventTime -> SDK clock (now); end carries an ancient stamp.
+    mapper.handle_event('apaevt_flow', flow('begin', 'probe.txt', pipes=['probe.txt']))
+    mapper.handle_event('apaevt_flow', at(flow('end', 'probe.txt'), 0))
+
+    root = spans_by_name(exporter, 'probe.txt')[0]
+    assert root.end_time == root.start_time
+    assert root.end_time > ns(0)
+
+
+def test_fixture_replay_with_engine_stamps_yields_engine_durations():
+    """Replay the captured wire capture as a post-continuum engine would emit it."""
+    mapper, exporter = make_mapper()
+    for index, record in enumerate(load_fixture()):
+        if record['event'] == 'apaevt_status_update':
+            continue
+        mapper.handle_event(record['event'], at(record['body'], index))
+    mapper.close_all()
+
+    spans = exporter.get_finished_spans()
+    assert spans
+    for span in spans:
+        assert span.end_time >= span.start_time
+        # Every span opened by a stamped event starts on the engine clock.
+        assert span.start_time >= ns(0)
+        if not span.attributes.get(ATTR_SPAN_UNCLOSED):
+            # Closed by a stamped event too -> the whole span is engine-timed.
+            assert span.end_time <= ns(len(load_fixture()))

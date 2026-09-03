@@ -68,9 +68,17 @@ expired by a clock: it stays announced in every snapshot, so no TTL heuristic
 is used. ``MetricsMapper`` similarly caps its per-run delta bookkeeping at
 ``MAX_TRACKED_METRIC_RUNS`` entries (least-recently-updated evicted first).
 
-Timestamps: the monitor wire protocol carries no event timestamps, so spans
-use event ARRIVAL time (the OpenTelemetry SDK's clock at ``start``/``end``).
-Durations are therefore bridge-observed, not engine-measured.
+Timestamps: every forwarded event body carries ``eventTime`` — the engine's
+emission time in epoch seconds, stamped at ingress by the run-log continuum
+(``TaskEngine.stamp_log_event``). Spans and span events are stamped with it, so
+durations are ENGINE-measured and exclude WebSocket transport latency. Bodies
+without a usable ``eventTime`` (an older engine, or a span closed by a
+non-event path — shutdown, snapshot reconciliation, cap eviction) fall back to
+the bridge's own ``time.time_ns()`` clock — the same source the OpenTelemetry
+SDK would use — at that moment, i.e. arrival time. A close is
+never stamped earlier than its own span's start, so a run that mixes both
+sources cannot produce a negative duration. Metric instruments take no explicit
+timestamp in the OTel API, so metric points remain arrival-timed.
 
 Privacy: payload content (``trace.data``, lane payloads, the run-segment
 result delivered in ``end.trace``, SSE ``data``, and the free-form
@@ -96,8 +104,9 @@ credits, NOT LLM tokens, and are deliberately never mapped to ``gen_ai.usage.*``
 import json
 import logging
 import re
+import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from .setup import OtelNotInstalledError, missing_otel_message
 
@@ -195,12 +204,30 @@ def _serialize_content(value: Any) -> str:
     return text[:MAX_CONTENT_LENGTH]
 
 
+def _event_time_ns(body: dict) -> Optional[int]:
+    """
+    Return the event's engine emission time in nanoseconds, or None.
+
+    ``body.eventTime`` is epoch SECONDS as a float, stamped on every forwarded
+    event by the engine's run-log continuum. None means "no usable stamp" and
+    every caller then falls back to the bridge clock, which is the
+    pre-continuum behaviour (arrival time).
+    """
+    value = body.get('eventTime')
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if value <= 0 or value != value or value in (float('inf'), float('-inf')):
+        return None
+    return int(value * 1_000_000_000)
+
+
 @dataclass
 class _ComponentSpan:
     """One open component span on a pipe's stack."""
 
     component: str
     span: Any
+    start_ns: int = 0
 
 
 @dataclass
@@ -210,6 +237,7 @@ class _PipeState:
     root: Any
     stack: List[_ComponentSpan] = field(default_factory=list)
     unmatched_leaves: int = 0
+    start_ns: int = 0
 
 
 @dataclass
@@ -221,6 +249,7 @@ class _RunState:
     source: str = ''
     name: str = ''
     task_span: Any = None
+    task_start_ns: int = 0
     pipes: Dict[int, _PipeState] = field(default_factory=dict)
 
 
@@ -259,6 +288,10 @@ class FlowSpanMapper:
         self._runs: Dict[str, _RunState] = {}
         # (project_id, source) -> run key, for events that carry no __id.
         self._aliases: Dict[Tuple[str, str], str] = {}
+        # Engine emission time (ns) of the event currently being handled;
+        # None outside handle_event and for bodies with no usable eventTime,
+        # in which case the bridge clock (arrival time) is used instead.
+        self._event_ns: Optional[int] = None
 
     # ------------------------------------------------------------------
     # Public interface
@@ -268,13 +301,34 @@ class FlowSpanMapper:
         """Dispatch one monitor event body by its DAP event name."""
         if not isinstance(body, dict):
             return
-        if event_name == 'apaevt_flow':
-            self._handle_flow(body)
-        elif event_name == 'apaevt_task':
-            self._handle_task(body)
-        elif event_name == 'apaevt_sse':
-            self._handle_sse(body)
-        # Other event types (status updates, output, ...) are not span-shaped.
+        # Stamp this event's spans with the engine's emission time. Reset in
+        # finally so any span closed OUTSIDE an event (shutdown, snapshot
+        # reconciliation, cap eviction) falls back to the bridge clock.
+        self._event_ns = _event_time_ns(body)
+        try:
+            if event_name == 'apaevt_flow':
+                self._handle_flow(body)
+            elif event_name == 'apaevt_task':
+                self._handle_task(body)
+            elif event_name == 'apaevt_sse':
+                self._handle_sse(body)
+            # Other event types (status updates, output, ...) are not span-shaped.
+        finally:
+            self._event_ns = None
+
+    def _now_ns(self) -> int:
+        """Return the current event's engine time, or the bridge clock (arrival)."""
+        return self._event_ns if self._event_ns is not None else time.time_ns()
+
+    def _end_span(self, span: Any, start_ns: int) -> None:
+        """
+        End a span at the current event's engine time, never before its start.
+
+        Clamping matters for a run that mixes stamped and unstamped events: a
+        span opened on the bridge clock (arrival) must not be closed at an
+        engine emission time that precedes it.
+        """
+        span.end(end_time=max(self._now_ns(), start_ns))
 
     def close_all(self) -> None:
         """Close every open span (components, pipe roots, task spans) as unclosed."""
@@ -388,11 +442,13 @@ class FlowSpanMapper:
         if stray.task_span is not None:
             if run.task_span is None:
                 run.task_span = stray.task_span
+                run.task_start_ns = stray.task_start_ns
                 run.task_span.set_attribute(ATTR_RUN_ID, run.key)
             else:
                 stray.task_span.set_attribute(ATTR_SPAN_UNCLOSED, True)
-                stray.task_span.end()
+                self._end_span(stray.task_span, stray.task_start_ns)
             stray.task_span = None
+            stray.task_start_ns = 0
         run.name = run.name or stray.name
         run.project_id = run.project_id or stray.project_id
         run.source = run.source or stray.source
@@ -475,10 +531,12 @@ class FlowSpanMapper:
         }
         if run.name:
             attributes[ATTR_TASK_NAME] = run.name
+        run.task_start_ns = self._now_ns()
         run.task_span = self._tracer.start_span(
             name=f'task {run.name}' if run.name else 'task',
             kind=self._span_kind.INTERNAL,
             attributes=attributes,
+            start_time=run.task_start_ns,
         )
 
     def _close_run_spans(self, run: _RunState, *, unclosed_task: bool) -> None:
@@ -496,8 +554,9 @@ class FlowSpanMapper:
         if run.task_span is not None:
             if unclosed_task:
                 run.task_span.set_attribute(ATTR_SPAN_UNCLOSED, True)
-            run.task_span.end()
+            self._end_span(run.task_span, run.task_start_ns)
             run.task_span = None
+            run.task_start_ns = 0
 
     # ------------------------------------------------------------------
     # apaevt_flow: pipe segments and component spans
@@ -539,13 +598,15 @@ class FlowSpanMapper:
         attributes = self._pipe_attributes(run, pipe_id)
         if implicit:
             attributes[ATTR_SPAN_IMPLICIT] = True
+        start_ns = self._now_ns()
         root = self._tracer.start_span(
             name=name,
             kind=self._span_kind.INTERNAL,
             context=self._context_for(run.task_span),
             attributes=attributes,
+            start_time=start_ns,
         )
-        state = _PipeState(root=root)
+        state = _PipeState(root=root, start_ns=start_ns)
         run.pipes[pipe_id] = state
         return state
 
@@ -581,13 +642,15 @@ class FlowSpanMapper:
             attributes[ATTR_LANE] = lane
         if self._include_content and trace.get('data') is not None:
             attributes[ATTR_TRACE_DATA] = _serialize_content(trace['data'])
+        start_ns = self._now_ns()
         span = self._tracer.start_span(
             name=name,
             kind=kind,
             context=self._context_for(parent),
             attributes=attributes,
+            start_time=start_ns,
         )
-        state.stack.append(_ComponentSpan(component=component, span=span))
+        state.stack.append(_ComponentSpan(component=component, span=span, start_ns=start_ns))
 
     def _flow_leave(self, run: _RunState, pipe_id: int, component: str, trace: dict) -> None:
         state = self._get_pipe(run, pipe_id)
@@ -617,7 +680,7 @@ class FlowSpanMapper:
             # name, and the '_OTHER' fallback is defined only for error.type.
             if self._include_content:
                 error_text = _serialize_content(error)
-                span.add_event('exception', {'exception.message': error_text})
+                span.add_event('exception', {'exception.message': error_text}, timestamp=self._event_ns)
                 span.set_status(self._status(self._status_code.ERROR, error_text))
             else:
                 # The wire error is a free-form string that can embed payload
@@ -625,9 +688,9 @@ class FlowSpanMapper:
                 # content-gated like every other payload surface. The error
                 # SIGNAL — ERROR status, error.type, and the exception span
                 # event — always exports; only the message text is withheld.
-                span.add_event('exception')
+                span.add_event('exception', timestamp=self._event_ns)
                 span.set_status(self._status(self._status_code.ERROR, GENERIC_ERROR_DESCRIPTION))
-        span.end()
+        self._end_span(span, entry.start_ns)
 
     def _flow_end(self, run: _RunState, pipe_id: int, trace: dict) -> None:
         state = run.pipes.get(pipe_id)
@@ -649,12 +712,12 @@ class FlowSpanMapper:
         while state.stack:
             entry = state.stack.pop()
             entry.span.set_attribute(ATTR_SPAN_UNCLOSED, True)
-            entry.span.end()
+            self._end_span(entry.span, entry.start_ns)
         if state.unmatched_leaves:
             state.root.set_attribute(ATTR_UNMATCHED_LEAVES, state.unmatched_leaves)
         if unclosed:
             state.root.set_attribute(ATTR_SPAN_UNCLOSED, True)
-        state.root.end()
+        self._end_span(state.root, state.start_ns)
 
     # ------------------------------------------------------------------
     # apaevt_sse: node-emitted custom messages -> span events
@@ -689,7 +752,7 @@ class FlowSpanMapper:
         else:
             logger.debug('apaevt_sse without pipe_id and no task span for run %s; dropping', run.key)
             return
-        target.add_event(sse_type, attributes)
+        target.add_event(sse_type, attributes, timestamp=self._event_ns)
 
     # ------------------------------------------------------------------
     # GenAI semantic conventions (Development stability, July 2026 snapshot)
