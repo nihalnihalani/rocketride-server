@@ -70,9 +70,17 @@ if (iifeEntry !== iifeEntryPreferred) {
 // tsconfig.types.json) resolves the 'rocketride' package types from
 // client-typescript/dist/types. On a fresh clone the SDK hasn't been built
 // yet, so generate its declarations here (a few seconds, no-op when present).
+// The supported entry point is `./builder chat-widget:build`, which runs
+// `client-typescript:generate-types` first and never reaches this branch; this
+// only covers a direct `pnpm --filter rocketride-chat-widget build`.
+//
+// `shell` is required on Windows: npx resolves to npx.cmd, and Node >= 20.12.2
+// refuses to spawn a .cmd/.bat without a shell (CVE-2024-27980 hardening). The
+// argument list below is fixed and space-free, so shell quoting is not a
+// concern. This mirrors what scripts/lib/exec.js does for the builder itself.
 if (!fs.existsSync(path.join(SDK_DIR, 'dist', 'types', 'index.d.ts'))) {
 	console.log('[chat-widget] generating rocketride SDK type declarations (client-typescript/dist/types)...');
-	execFileSync('npx', ['tsc', '-p', 'tsconfig.types.json'], { cwd: SDK_DIR, stdio: 'inherit' });
+	execFileSync('npx', ['tsc', '-p', 'tsconfig.types.json'], { cwd: SDK_DIR, stdio: 'inherit', shell: process.platform === 'win32' });
 }
 
 /** @type {import('esbuild').BuildOptions} */

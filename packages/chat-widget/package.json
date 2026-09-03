@@ -48,9 +48,6 @@
 		"embed",
 		"chatbot"
 	],
-	"dependencies": {
-		"rocketride": "workspace:*"
-	},
 	"devDependencies": {
 		"@jest/globals": "^30.4.1",
 		"@types/jest": "^30.0.0",
@@ -60,6 +57,7 @@
 		"jest-environment-jsdom": "^29.7.0",
 		"jest-jasmine2": "^30.4.2",
 		"rimraf": "^5.0.5",
+		"rocketride": "workspace:*",
 		"ts-jest": "^29.4.10",
 		"typescript": "^5.0.0"
 	}
