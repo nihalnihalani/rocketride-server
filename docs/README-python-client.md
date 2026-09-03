@@ -597,7 +597,7 @@ rocketride diff --git main rag.pipe
 | --- | --- |
 | `<old.pipe> <new.pipe>` | The two files to compare (positional). Omit one and pass `--git` instead. |
 | `--git <ref>` | Diff the working-tree `FILE` against `<ref>` via `git show <ref>:<FILE>`. If the file is absent in `<ref>`, everything is reported as added. |
-| `--include-layout` | Enumerate the layout churn (each node's `ui` block and the `viewport`) that is hidden by default, as `ui.*` field changes. |
+| `--include-layout` | Enumerate the layout churn hidden by default — each node's `ui` block as `ui.*` changes, the top-level `viewport` as `viewport.*` changes — and count it, so a layout-only edit then exits `1`. |
 | `--json` | Emit a single JSON document to stdout (mutually exclusive with `--markdown`). |
 | `--markdown` | Emit compact, PR-comment-friendly Markdown to stdout (mutually exclusive with `--json`). |
 | `--exit-zero` | Always exit `0` on a successful run, even when changes are found (non-gating). |
@@ -610,7 +610,7 @@ rocketride diff --git main rag.pipe
 | `1` | Semantic changes were found. |
 | `2` | Usage error, or an unreadable / unparseable file or bad git ref. |
 
-Layout (the `ui` blocks and `viewport`) is ignored by default — a pure canvas move exits `0`. Version changes (the top-level `version` field) are always reported and always count as a change.
+Layout (the `ui` blocks and `viewport`) is ignored by default — a pure canvas move exits `0`, and `--include-layout` enumerates it and makes it exit `1`. Version changes (the top-level `version` field) are always reported and always count as a change.
 
 **Three output modes.** The default is grouped, colored text (color auto-disables when piped or when `NO_COLOR` is set), with `+` added, `-` removed, `~` changed:
 
@@ -624,7 +624,7 @@ Config
 Layout: changed (ui/viewport)
 ```
 
-`--json` emits one stable, sorted document with `nodes`, `edges`, and a `summary` block:
+`--json` emits one stable, sorted document with `nodes`, `edges`, `viewport`, and a `summary` block:
 
 ```json
 {
@@ -642,14 +642,17 @@ Layout: changed (ui/viewport)
     ],
     "removed": []
   },
+  "viewport": [],
   "summary": {
     "config_changes": 1, "edges_added": 0, "edges_removed": 0,
     "has_semantic_changes": true, "layout_changed": true,
     "nodes_added": 0, "nodes_changed": 1, "nodes_removed": 0,
-    "provider_changes": 0, "version_change": null
+    "provider_changes": 0, "version_change": null, "viewport_changes": 0
   }
 }
 ```
+
+The top-level `viewport` array holds the `viewport.*` field changes in the same `{"path", "kind", "old", "new"}` shape as a config change; it is populated only under `--include-layout`, and `summary.viewport_changes` is its length.
 
 `--markdown` emits a compact PR-comment-friendly report (`|` and backticks safely escaped) suitable for posting from a GitHub Action:
 
@@ -665,7 +668,14 @@ Layout: changed (ui/viewport)
 _Layout (ui/viewport) changed._
 ```
 
-**Review pipelines like code in CI.** Because `diff` is local and exits non-zero on change, it drops straight into a pull-request check: a GitHub Actions job runs `rocketride diff --git origin/<base> <file> --markdown` and posts the summary as a PR comment. This is the review half of the "pipelines as code" loop — **validate** a `.pipe` to confirm it is well-formed before it runs (via [`client.validate()`](#services-validation-and-ping)), **evaluate** it to measure output quality, and `diff` it to see exactly what changed between revisions. See the [side-by-side example and PR-comment recipe](https://github.com/rocketride-org/rocketride-server/blob/develop/examples/pipe-diff-example.md).
+**Review pipelines like code in CI.** Because `diff` is local and exits non-zero on change, it drops straight into a pull-request check: a GitHub Actions job runs `rocketride diff --git origin/<base> <file> --markdown` and posts the summary as a PR comment. The bundled composite action does all of that for you:
+
+```yaml
+      - uses: actions/checkout@v4
+      - uses: rocketride-org/rocketride-server/.github/actions/pipe-diff@develop
+```
+
+Pin `@develop` to a tag or commit SHA for a reproducible run; the `./.github/actions/pipe-diff` relative form works only inside the `rocketride-server` repository itself. On a fork pull request the default `GITHUB_TOKEN` is read-only, so the action warns instead of commenting and leaves the report in the job summary. Until a release after 1.3.0 ships `rocketride diff`, pass `install-from: ./packages/client-python` so the action installs the CLI from a checkout instead of PyPI. This is the review half of the "pipelines as code" loop — **validate** a `.pipe` to confirm it is well-formed before it runs (via [`client.validate()`](#services-validation-and-ping)), **evaluate** it to measure output quality, and `diff` it to see exactly what changed between revisions. See the [side-by-side example and PR-comment recipe](https://github.com/rocketride-org/rocketride-server/blob/develop/examples/pipe-diff-example.md).
 
 ## Configuration
 

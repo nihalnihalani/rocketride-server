@@ -162,8 +162,6 @@ coordinates enumerated.)
 the CI job below posts on the pull request:
 
 ```markdown
-## Pipeline changes in rag.pipe
-
 **Pipeline diff:** 1 node added, 2 nodes changed, 2 edges added, 1 edge removed, layout changed
 
 **Nodes**
@@ -187,6 +185,10 @@ the CI job below posts on the pull request:
 _Layout (ui/viewport) changed._
 ```
 
+That is exactly what `--markdown` prints — there is no title. The pipe-diff action
+adds the per-file `### <file>` heading and the `## RocketRide pipeline diff`
+heading around it when it assembles the comment.
+
 There's also `--json`, a single stable, sorted document (`nodes`, `edges`, and a
 `summary` block) for feeding other tooling. See the
 [CLI reference](../docs/README-python-client.md#semantic-pipeline-diff-rocketride-diff)
@@ -194,8 +196,8 @@ for every flag and exit code.
 
 ## Use it in CI (the pipe-diff GitHub Action)
 
-Because `diff` is local, network-free, and exits non-zero on change, it drops
-straight into a pull-request check. The supported integration is the bundled
+Because the comparison is local, needs no engine, and exits non-zero on change,
+`diff` drops straight into a pull-request check. The supported integration is the bundled
 [`pipe-diff` composite action](../.github/actions/pipe-diff/), which finds **every**
 changed `.pipe`, diffs each against the PR base, and posts one **sticky PR comment**
 so reviewers see the semantic change instead of the coordinate noise:
@@ -212,13 +214,29 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4 # default fetch-depth: 1 is fine; the action fetches the base itself
-      - uses: ./.github/actions/pipe-diff
+      - uses: rocketride-org/rocketride-server/.github/actions/pipe-diff@develop
 ```
+
+Pin `@develop` to a tag or commit SHA for a reproducible run. Inside this
+repository the local form `uses: ./.github/actions/pipe-diff` works too, but it
+resolves only here — another repository has no such directory on disk.
 
 The action installs the CLI, resolves the PR base commit (fetching it under the
 default shallow checkout), and updates a single comment in place on re-runs. Its
 [README](../.github/actions/pipe-diff/README.md) documents the `files`,
-`cli-version`, `comment`, and `include-layout` inputs.
+`cli-version`, `install-from`, `comment`, and `include-layout` inputs.
+
+Two things worth knowing before you wire it up:
+
+- **Fork pull requests.** On a `pull_request` event from a fork the default
+  `GITHUB_TOKEN` is read-only whatever `permissions:` says, so the comment API
+  returns `403`. The action warns instead of failing and every run also writes the
+  report to the job summary, so the diff is still there. Use `comment: false`, or
+  `pull_request_target` (never checking out the PR head's code from it), if you
+  need something else.
+- **Before the CLI release.** `rocketride diff` ships in a release after 1.3.0;
+  until then pass `install-from: ./packages/client-python` so the action installs
+  the CLI from a checkout rather than PyPI.
 
 If you would rather not vendor the composite action, the same result can be
 assembled inline for a single file — check out with `fetch-depth: 0` so the base

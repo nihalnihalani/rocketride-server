@@ -352,7 +352,7 @@ Key flags:
 | --- | --- |
 | `<old.pipe> <new.pipe>` | The two files to compare (positional). Omit one and pass `--git` instead. |
 | `--git <ref>` | Diff the single working-tree `FILE` against `<ref>` via `git show <ref>:<FILE>`. If the file does not exist in `<ref>`, everything is reported as added. |
-| `--include-layout` | Enumerate the layout churn (each node's `ui` block and the top-level `viewport`) that is hidden by default, as `ui.*` field changes. |
+| `--include-layout` | Enumerate the layout churn that is hidden by default — each node's `ui` block as `ui.*` changes on that node, and the top-level `viewport` as `viewport.*` changes — and count it, so a layout-only edit then exits `1`. |
 | `--json` | Emit a single JSON document to stdout (mutually exclusive with `--markdown`). |
 | `--markdown` | Emit compact, PR-comment-friendly Markdown to stdout (mutually exclusive with `--json`). |
 | `--exit-zero` | Always exit `0` on a successful run, even when changes are found. Use for informational, non-gating runs. |
@@ -380,8 +380,9 @@ Key flags:
   always count as a change — they are never hidden.
 - **Layout** — each node's `ui` block and the `viewport` — is ignored by default
   and summarized as a single `Layout: changed` line. A pure canvas move is **not**
-  a semantic change, so `diff` exits `0` on it. Pass `--include-layout` to see the
-  individual `ui.*` coordinates.
+  a semantic change, so `diff` exits `0` on it. Pass `--include-layout` to
+  enumerate the individual `ui.*` coordinates and `viewport.*` fields; with the
+  flag they count as changes, so a canvas-only edit exits `1`.
 
 #### Output modes
 
@@ -398,9 +399,9 @@ Config
 Layout: changed (ui/viewport)
 ```
 
-`--json` emits one stable, sorted document — `nodes`, `edges`, and a `summary`
-block with counts and the overall `has_semantic_changes` flag — ideal for feeding
-another tool:
+`--json` emits one stable, sorted document — `nodes`, `edges`, `viewport`, and a
+`summary` block with counts and the overall `has_semantic_changes` flag — ideal
+for feeding another tool:
 
 ```json
 {
@@ -418,6 +419,7 @@ another tool:
     ],
     "removed": []
   },
+  "viewport": [],
   "summary": {
     "config_changes": 1,
     "edges_added": 0,
@@ -428,10 +430,15 @@ another tool:
     "nodes_changed": 1,
     "nodes_removed": 0,
     "provider_changes": 0,
-    "version_change": null
+    "version_change": null,
+    "viewport_changes": 0
   }
 }
 ```
+
+The top-level `viewport` array carries the same
+`{"path", "kind", "old", "new"}` shape as a config change and is populated only
+under `--include-layout`; `summary.viewport_changes` is its length.
 
 `--markdown` emits a compact, PR-comment-friendly report — a one-line summary,
 bullet lists for nodes and edges, and a table for config changes (with `|` and
@@ -470,13 +477,30 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4 # default fetch-depth: 1 is fine; the action fetches the base itself
-      - uses: ./.github/actions/pipe-diff
+      - uses: rocketride-org/rocketride-server/.github/actions/pipe-diff@develop
 ```
+
+Pin `@develop` to a tag or commit SHA for a reproducible run. The `./`-relative
+form (`uses: ./.github/actions/pipe-diff`) works only inside the
+`rocketride-server` repository itself, where the action lives on disk.
 
 The action installs the CLI, resolves the PR base commit, and maintains a single
 sticky comment for you. See its
 [README](https://github.com/rocketride-org/rocketride-server/blob/develop/.github/actions/pipe-diff/README.md)
-for the `files`, `cli-version`, `comment`, and `include-layout` inputs.
+for the `files`, `cli-version`, `install-from`, `comment`, and `include-layout`
+inputs.
+
+> **Fork pull requests:** on a `pull_request` event from a fork, GitHub hands the
+> job a read-only `GITHUB_TOKEN` no matter what `permissions:` says, so the
+> comment API returns `403`. The action warns rather than failing, and every run
+> also writes the full report to the job summary — so the diff stays visible. Set
+> `comment: false` to skip the API call entirely, or use `pull_request_target`
+> for a writable token (and then never check out or run the PR head's code from
+> that workflow).
+
+> **Before the CLI release:** `rocketride diff` ships in a release after 1.3.0.
+> Until then, pass `install-from: ./packages/client-python` (or any pip source
+> that provides the subcommand) instead of installing from PyPI.
 
 If you would rather not vendor the composite action, the same result can be
 assembled inline — check out with `fetch-depth: 0` so the base branch is present
