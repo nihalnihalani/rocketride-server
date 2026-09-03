@@ -291,6 +291,33 @@ async def test_on_rrext_validate_wraps_config_in_pipeline_envelope(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_on_rrext_validate_does_not_double_wrap_enveloped_config(monkeypatch):
+    """An already-enveloped config is wrapped exactly once.
+
+    The MCP ``validate_pipeline`` tool (modules/mcp/tools/introspection.py, #2082)
+    pre-wraps the config client-side as a workaround for the missing envelope.
+    Double-wrapping it would make every MCP validation fail with
+    "'pipeline.components' must be an array".
+    """
+    captured = {}
+    monkeypatch.setattr(cmd_misc, 'resolve_implied_source', lambda p: None)
+    monkeypatch.setattr(
+        cmd_misc,
+        'validatePipeline',
+        lambda payload: captured.update(payload) or {'ok': True},
+    )
+
+    conn = _make_conn()
+    enveloped = {'pipeline': {'components': [{'id': 'webhook_1'}], 'version': 1}}
+    await MiscCommands.on_rrext_validate(conn, {'arguments': {'pipeline': enveloped}})
+
+    assert set(captured.keys()) == {'pipeline'}
+    assert 'pipeline' not in captured['pipeline']
+    assert captured['pipeline']['components'] == [{'id': 'webhook_1'}]
+    assert captured['pipeline']['version'] == 1
+
+
+@pytest.mark.asyncio
 async def test_on_rrext_validate_propagates_validate_pipeline_errors(monkeypatch):
     """A raise from validatePipeline is logged and re-raised."""
     monkeypatch.setattr(cmd_misc, 'resolve_implied_source', lambda p: 'src')
