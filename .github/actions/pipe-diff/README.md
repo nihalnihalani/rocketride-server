@@ -9,10 +9,13 @@ actually matter. This action wraps the local [`rocketride diff`](../../../packag
 CLI subcommand to surface only what changed: nodes added/removed, provider
 changes, config field changes, and edge (wiring) additions/removals.
 
-The action runs **entirely on the runner**. Like the `rocketride diff` command it
-wraps, it never contacts the RocketRide engine or the network — it only reads
-files and git objects and compares parsed JSON. It therefore needs no
-`--uri`/`--apikey`/`--token` credentials of any kind.
+**The comparison itself runs locally.** Like the `rocketride diff` command it
+wraps, it never contacts the RocketRide engine and needs no
+`--uri`/`--apikey`/`--token` credentials of any kind — it only reads files and
+git objects and compares parsed JSON on the runner. The action *around* that
+comparison does use the network: it installs the CLI (from PyPI, or from
+`install-from`), fetches the PR base commit, and calls the GitHub comments API
+when `comment: true`.
 
 ## Usage
 
@@ -51,6 +54,18 @@ fetches the PR base commit itself before diffing.
           include-layout: 'false'         # set 'true' to also report ui/viewport churn
 ```
 
+### Running against an unreleased CLI
+
+`rocketride diff` ships in a release **after** 1.3.0. Until that release is on
+PyPI, point `install-from` at a checkout of the client package — this is how this
+repository dogfoods the action:
+
+```yaml
+      - uses: ./.github/actions/pipe-diff
+        with:
+          install-from: ./packages/client-python
+```
+
 ## Inputs
 
 | Input            | Default       | Description |
@@ -58,8 +73,9 @@ fetches the PR base commit itself before diffing.
 | `files`          | `**/*.pipe`   | Git pathspec glob selecting the `.pipe` files to consider. Git's `:(glob)` magic is applied automatically, so `**` matches across directories. Only files that actually changed versus the PR base are diffed. |
 | `python-version` | `3.12`        | Python version passed to `actions/setup-python`. RocketRide requires Python >= 3.10. |
 | `cli-version`    | `` (empty)    | pip version specifier appended to the `rocketride` requirement, e.g. `==1.4.0` or `>=1.4,<2`. Empty installs the latest published release. The run **fails fast** with a clear message if the installed CLI lacks the `diff` subcommand. |
-| `comment`        | `true`        | When `true`, post or update one sticky PR comment. Set to `false` to compute the diff (job log + outputs) without commenting; that mode needs no `pull-requests: write` permission. |
-| `include-layout` | `false`       | When `true`, treat canvas layout churn (per-node `ui` blocks and the top-level `viewport`) as meaningful and enumerate it. When `false` (default) a pure-layout change is reported as `no semantic changes (layout only)`. |
+| `install-from`   | `` (empty)    | Install the CLI from this local path or pip source (e.g. `./packages/client-python`) instead of PyPI. Takes precedence over `cli-version`. Use it to run the action before a release ships `rocketride diff`. |
+| `comment`        | `true`        | When `true`, post or update one sticky PR comment. Set to `false` to compute the diff without commenting; that mode needs no `pull-requests: write` permission. The report is written to the **job summary** either way. |
+| `include-layout` | `false`       | When `true`, treat canvas layout churn (per-node `ui` blocks and the top-level `viewport`) as meaningful and enumerate it as `ui.*` / `viewport.*` field changes. When `false` (default) a pure-layout change is reported as `No semantic changes.`. |
 
 ## Outputs
 
@@ -78,21 +94,45 @@ repository. If you set `comment: false`, only `contents: read` is needed.
 The action authenticates the GitHub REST calls with the workflow's built-in
 `GITHUB_TOKEN`; it never prints the token.
 
+### Fork pull requests
+
+On a `pull_request` event **from a fork**, GitHub hands the job a read-only
+`GITHUB_TOKEN` regardless of the workflow's `permissions:` block, so the comment
+API returns `403`. The action does not fail on that: it emits a `warning`
+annotation and leaves the full report in the **job summary**, which every run
+writes. Your options, in order of preference:
+
+1. Do nothing — read the diff in the job summary (works for every PR, no extra
+   permissions).
+2. Set `comment: false` to skip the API call entirely and drop the
+   `pull-requests: write` permission.
+3. Use `pull_request_target`, which runs with a writable token. Note its
+   trade-off: the workflow runs in the base repository's context, so you must
+   **not** check out or execute the PR head's code from it. This action only
+   reads `.pipe` data files, but the rest of your job must respect that rule.
+
 ## Behavior
 
-- **Sticky comment.** The action maintains exactly one comment per PR, found and
-  updated via a hidden HTML marker (`<!-- rocketride-pipe-diff -->`). Re-runs
-  update that comment in place instead of stacking new ones.
+- **Sticky comment.** The action maintains exactly one comment per PR, found via
+  a hidden HTML marker (`<!-- rocketride-pipe-diff -->`) **and** an author check
+  for `github-actions[bot]`, so a human comment quoting the marker is never
+  overwritten. Re-runs update that comment in place instead of stacking new ones.
+- **Job summary.** Every run appends the same report to `$GITHUB_STEP_SUMMARY`,
+  so the diff is visible even when commenting is disabled or refused.
 - **Layout noise is hidden by default.** A change that only moves nodes on the
   canvas produces exit code 0 from the CLI and is summarized as
-  `No semantic changes (layout only).`. Pass `include-layout: true` to enumerate
-  the `ui`/`viewport` deltas instead.
+  `No semantic changes.`. Pass `include-layout: true` to enumerate the
+  `ui.*`/`viewport.*` deltas instead (which then counts as a change).
 - **Version changes are always reported** (they are semantic-ish), regardless of
   `include-layout`.
 - **New files.** A `.pipe` file added in the PR (absent in the base) is diffed
   against an empty pipeline, so every node and edge shows up as added.
-- **Deleted files.** Removed `.pipe` files are noted in the comment (there is no
-  working-tree file to diff).
+- **Deleted files.** Removed `.pipe` files are noted in the comment and count as
+  a semantic change (`has-semantic-changes: true`); there is no working-tree file
+  to diff.
+- **Untrusted content.** File paths and CLI error text come from the pull
+  request, so they are rendered inside code spans / a fenced block and stripped
+  of newlines before they reach a workflow-command annotation.
 - **Failure semantics.** The action does **not** fail merely because semantic
   changes exist — it is informational. It **does** fail (and emits an `error`
   annotation) when a changed `.pipe` file cannot be parsed or diffed, so a broken

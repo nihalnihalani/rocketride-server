@@ -22,16 +22,20 @@
 
 # Composite action that posts a semantic diff of changed .pipe pipeline files as
 # a sticky pull-request comment. It wraps the local `rocketride diff` subcommand
-# (Python SDK/CLI), which compares parsed .pipe JSON entirely on the runner and
-# never contacts the RocketRide engine or the network. Raw JSON diffs of .pipe
-# files are dominated by canvas coordinate churn (the per-node "ui" block and the
-# top-level "viewport"); this surfaces what actually changed — nodes, edges, and
-# config — so reviewers see signal instead of layout noise.
+# (Python SDK/CLI): the comparison itself runs on the runner against parsed .pipe
+# JSON and needs no RocketRide engine and no credentials. The action around it
+# does use the network — it installs the CLI (from PyPI, or from `install-from`),
+# fetches the PR base commit, and calls the GitHub comments API when
+# comment=true. Raw JSON diffs of .pipe files are dominated by canvas coordinate
+# churn (the per-node "ui" block and the top-level "viewport"); this surfaces
+# what actually changed — nodes, edges, and config — so reviewers see signal
+# instead of layout noise.
 name: RocketRide Pipe Diff
 description: >-
   Comment a semantic diff of changed .pipe pipeline files on a pull request,
-  hiding canvas-layout noise. Runs entirely on the runner; never contacts the
-  RocketRide engine or the network.
+  hiding canvas-layout noise. The comparison runs locally with no RocketRide
+  engine and no credentials; the action itself installs the CLI, fetches the PR
+  base, and uses the GitHub comments API when comment=true.
 author: RocketRide, Inc.
 
 # Branding for the GitHub Marketplace / action listing.
@@ -55,22 +59,34 @@ inputs:
     description: >-
       pip version specifier appended to the "rocketride" requirement, e.g.
       "==1.4.0" or ">=1.4,<2". Leave empty to install the latest published
-      release. The run fails fast with a clear message if the installed CLI does
-      not provide the "diff" subcommand.
+      release. Ignored when "install-from" is set. The run fails fast with a
+      clear message if the installed CLI does not provide the "diff" subcommand.
+    required: false
+    default: ''
+  install-from:
+    description: >-
+      Install the CLI from this local path or pip source instead of PyPI, e.g.
+      "./packages/client-python". Use it to exercise the action against an
+      in-repo checkout before a release that ships "rocketride diff" is
+      published. Takes precedence over "cli-version".
     required: false
     default: ''
   comment:
     description: >-
       When "true" (default), post or update ONE sticky PR comment with the diff.
-      Set to "false" to compute the diff and write a job summary without
-      commenting (requires no pull-requests:write permission).
+      Set to "false" to compute the diff and write only a job summary, without
+      commenting (requires no pull-requests:write permission). The diff is
+      written to the job summary either way, so a fork pull request — where the
+      default GITHUB_TOKEN is read-only and commenting is refused with 403 —
+      still surfaces the report.
     required: false
     default: 'true'
   include-layout:
     description: >-
       When "true", treat canvas layout churn (per-node "ui" blocks and the
-      top-level "viewport") as meaningful and enumerate it. Default "false" hides
-      it and reports a pure-layout change as "no semantic changes (layout only)".
+      top-level "viewport") as meaningful and enumerate it as "ui.*" and
+      "viewport.*" field changes. Default "false" hides it and reports a
+      pure-layout change as "no semantic changes".
     required: false
     default: 'false'
 
@@ -97,11 +113,17 @@ runs:
       shell: bash
       env:
         CLI_VERSION: ${{ inputs.cli-version }}
+        INSTALL_FROM: ${{ inputs.install-from }}
       run: |
         set -euo pipefail
-        # Build the pip requirement. CLI_VERSION, when set, is a PEP 508 version
-        # specifier appended to the distribution name (e.g. "==1.4.0", ">=1.4").
-        if [ -n "${CLI_VERSION}" ]; then
+        # INSTALL_FROM wins when set: it is a local path (or any pip source) and
+        # is how this repository dogfoods the action before a release ships
+        # `rocketride diff`. Otherwise build the PyPI requirement; CLI_VERSION,
+        # when set, is a PEP 508 specifier appended to the distribution name
+        # (e.g. "==1.4.0", ">=1.4").
+        if [ -n "${INSTALL_FROM}" ]; then
+          requirement="${INSTALL_FROM}"
+        elif [ -n "${CLI_VERSION}" ]; then
           requirement="rocketride${CLI_VERSION}"
         else
           requirement="rocketride"
@@ -111,6 +133,8 @@ runs:
 
     - name: Verify the CLI provides 'diff'
       shell: bash
+      env:
+        INSTALL_FROM: ${{ inputs.install-from }}
       run: |
         set -euo pipefail
         if ! command -v rocketride >/dev/null 2>&1; then
@@ -121,7 +145,11 @@ runs:
         # argparse exits non-zero ("invalid choice: 'diff'") on older releases.
         if ! rocketride diff --help >/dev/null 2>&1; then
           installed="$(python -c 'import importlib.metadata as m; print(m.version("rocketride"))' 2>/dev/null || echo unknown)"
-          echo "::error::The installed 'rocketride' CLI (version ${installed}) does not provide the 'diff' subcommand. Pin a release that includes it via the action's 'cli-version' input once 'rocketride diff' is published."
+          if [ -n "${INSTALL_FROM}" ]; then
+            echo "::error::The 'rocketride' CLI installed from '${INSTALL_FROM}' (version ${installed}) does not provide the 'diff' subcommand."
+          else
+            echo "::error::The installed 'rocketride' CLI (version ${installed}) does not provide the 'diff' subcommand. Pin a release that includes it via the action's 'cli-version' input once 'rocketride diff' is published, or point 'install-from' at a checkout that has it."
+          fi
           exit 1
         fi
         echo "rocketride diff is available."
@@ -144,8 +172,31 @@ runs:
         body_file="${RUNNER_TEMP:-/tmp}/rocketride-pipe-diff-comment.md"
         : > "${body_file}"
 
+        # File paths and CLI stderr are untrusted PR content: a crafted path or
+        # error message would otherwise be interpolated raw into a Markdown
+        # heading (breaking out into headings/@-mentions in the auto-posted
+        # comment). Render them inside a double-backtick code span with newlines
+        # collapsed. A run of backticks inside the value cannot close a
+        # double-backtick span as long as it is not exactly two, and the padding
+        # spaces are stripped by the Markdown renderer.
+        md_code() {
+          local s="${1//$'\n'/ }"
+          s="${s//$'\r'/ }"
+          printf '`` %s ``' "${s}"
+        }
+
+        # The report is written to the job summary on every path, so `comment:
+        # false` and fork pull requests (read-only GITHUB_TOKEN -> comment 403)
+        # still surface the diff.
+        write_job_summary() {
+          if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+            cat "${body_file}" >> "${GITHUB_STEP_SUMMARY}"
+          fi
+        }
+
         # Emit step outputs in one place so every early return stays consistent.
         emit_outputs() {
+          write_job_summary
           {
             echo "changed-files=${1}"
             echo "has-semantic-changes=${2}"
@@ -223,7 +274,7 @@ runs:
         # loop is a no-op under `set -u` on every bash version (a bare
         # "${arr[@]}" of an empty array errors on bash < 4.4).
         for f in ${changed_files[@]+"${changed_files[@]}"}; do
-          printf '### `%s`\n\n' "${f}" >> "${sections_file}"
+          printf '### %s\n\n' "$(md_code "${f}")" >> "${sections_file}"
 
           # Build the command as an always-non-empty array so "${cmd[@]}" is
           # safe under `set -u` on every bash version (an empty-array expansion
@@ -240,9 +291,10 @@ runs:
 
           case "${rc}" in
             0)
-              # Exit 0 = no semantic changes. Any textual change the git diff
-              # picked up was pure layout/formatting noise.
-              printf 'No semantic changes (layout only).\n\n' >> "${sections_file}"
+              # Exit 0 = the CLI found no change it counts. Whether the textual
+              # change was layout churn or pure formatting is the CLI's own
+              # report to make, so do not assert "layout only" here.
+              printf 'No semantic changes.\n\n' >> "${sections_file}"
               ;;
             1)
               any_semantic=true
@@ -251,17 +303,28 @@ runs:
             *)
               any_error=true
               err_msg="$(cat "${err_file}")"
-              echo "::error file=${f}::rocketride diff failed for ${f}: ${err_msg}"
+              # Workflow-command annotations are line-oriented and "::" starts a
+              # command, so strip both from the untrusted message.
+              annotation_msg="${err_msg//$'\n'/ }"
+              annotation_msg="${annotation_msg//$'\r'/ }"
+              annotation_msg="${annotation_msg//::/ }"
+              echo "::error file=${f}::rocketride diff failed for ${f}: ${annotation_msg}"
               {
                 printf 'Could not diff this file (exit %s):\n\n' "${rc}"
-                printf '```\n%s\n```\n\n' "${err_msg}"
+                # A 4-backtick fence cannot be closed by a ``` run inside the
+                # error text.
+                printf '````text\n%s\n````\n\n' "${err_msg}"
               } >> "${sections_file}"
               ;;
           esac
         done
 
         for f in ${deleted_files[@]+"${deleted_files[@]}"}; do
-          printf '### `%s`\n\n' "${f}" >> "${sections_file}"
+          # Deleting a pipeline is a semantic change by any reading; the old
+          # code left any_semantic false, so a deletion-only PR reported
+          # "no semantic changes" and has-semantic-changes=false.
+          any_semantic=true
+          printf '### %s\n\n' "$(md_code "${f}")" >> "${sections_file}"
           printf 'Pipeline file removed in this pull request.\n\n' >> "${sections_file}"
         done
 
@@ -271,7 +334,7 @@ runs:
         elif [ "${any_semantic}" = "true" ]; then
           summary='Semantic pipeline changes detected. See details below.'
         else
-          summary='No semantic changes (layout only).'
+          summary='No semantic changes in the changed `.pipe` files.'
         fi
 
         {
@@ -305,18 +368,47 @@ runs:
             return;
           }
 
-          // Find our one sticky comment by its hidden marker.
+          // Find our one sticky comment by its hidden marker. The author check
+          // matters: without it, a human comment that merely quotes the marker
+          // (in a review of this very action, say) would be overwritten.
           const comments = await github.paginate(github.rest.issues.listComments, {
             owner, repo, issue_number, per_page: 100,
           });
-          const existing = comments.find((c) => c.body && c.body.includes(marker));
+          const existing = comments.find((c) =>
+            c.body && c.body.includes(marker) &&
+            c.user && c.user.type === 'Bot' && c.user.login === 'github-actions[bot]'
+          );
+
+          // On a pull_request event from a fork the default GITHUB_TOKEN is
+          // read-only no matter what the workflow's permissions block says, so
+          // the write 403s. That is the common case for an OSS repo, and it is
+          // not a reason to fail the check: the same report is already in the
+          // job summary.
+          const writeOrWarn = async (label, fn) => {
+            try {
+              await fn();
+              core.info(label);
+            } catch (error) {
+              if (error && error.status === 403) {
+                core.warning(
+                  'Cannot comment on this pull request: the GITHUB_TOKEN is read-only ' +
+                  '(the usual case for a fork PR on a pull_request event). ' +
+                  'The pipeline diff is in this job\'s summary instead.'
+                );
+                return;
+              }
+              throw error;
+            }
+          };
 
           if (existing) {
-            await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
-            core.info(`Updated sticky pipe-diff comment (${existing.id}).`);
+            await writeOrWarn(`Updated sticky pipe-diff comment (${existing.id}).`, () =>
+              github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body })
+            );
           } else if (pipeFilesChanged) {
-            await github.rest.issues.createComment({ owner, repo, issue_number, body });
-            core.info('Created sticky pipe-diff comment.');
+            await writeOrWarn('Created sticky pipe-diff comment.', () =>
+              github.rest.issues.createComment({ owner, repo, issue_number, body })
+            );
           } else {
             core.info('No .pipe changes and no existing comment; nothing to post.');
           }
