@@ -233,6 +233,11 @@ same on Windows shells. Files must contain a JSON object — either the pipeline
 config itself or the `{ "pipeline": { ... } }` wrapper that `.pipe` files use;
 a file that cannot be read or parsed is reported as invalid.
 
+The engine checks structure and component references only — duplicate ids,
+unknown `input`/`control` lanes, dangling `from` references, a `source` that
+names no component. Provider availability and lane compatibility are runtime
+concerns and are not reported here.
+
 ```bash
 # Validate a single pipeline
 rocketride validate ./rag.pipe
