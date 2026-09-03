@@ -42,10 +42,15 @@ pip install rocketride
 
 # MCP
 pip install rocketride-mcp
-
-# Chat widget (browser embed)
-npm install rocketride-chat-widget
 ```
+
+The chat widget is **not on a public registry yet**; build it from this repository and self-host the bundle:
+
+```bash
+./builder chat-widget:build   # -> packages/chat-widget/dist/rocketride-chat.js
+```
+
+See [README-chat-widget.md](README-chat-widget.md#getting-the-bundle) for the embed snippets and for what changes once `rocketride-chat-widget` is published.
 
 ### From the Engine (self-hosted download)
 

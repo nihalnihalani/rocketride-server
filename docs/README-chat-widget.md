@@ -5,7 +5,6 @@
 </p>
 
 <p align="center">
-  <a href="https://www.npmjs.com/package/rocketride-chat-widget"><img src="https://img.shields.io/npm/v/rocketride-chat-widget?color=222223&label=NPM" alt="npm"></a>
   <a href="https://github.com/rocketride-org/rocketride-server"><img src="https://img.shields.io/github/stars/rocketride-org/rocketride-server?style=flat&color=238636&label=GitHub&logo=github&logoColor=white" alt="GitHub"></a>
   <a href="https://discord.gg/PMXrtenMsY"><img src="https://img.shields.io/badge/Discord-Join-370b7a?logo=discord&logoColor=white" alt="Discord"></a>
   <a href="https://github.com/rocketride-org/rocketride-server/blob/develop/LICENSE"><img src="https://img.shields.io/badge/License-MIT-41b6e6" alt="MIT License"></a>
@@ -27,11 +26,23 @@ You need two values, both produced by your pipeline's **chat source node** when 
 
 > **Never use the engine API key** (`ROCKETRIDE_APIKEY`) or any private token in a web page. See [Security](#security-public-auth-key-only).
 
+### Getting the bundle
+
+`rocketride-chat-widget` is **not published to a package registry yet** — today you build the bundle from this repository and serve it yourself:
+
+```bash
+./builder chat-widget:build          # -> packages/chat-widget/dist/rocketride-chat.js
+```
+
+Copy `dist/rocketride-chat.js` (and its `.map`, if you want source maps in production) next to your site's other static assets. Every snippet below uses `/js/rocketride-chat.js` as that self-hosted path — substitute wherever you put it. See [Local development](#local-development) for the full build.
+
+Once the package is published to npm the same snippets work unchanged against a CDN — swap the `src` for `https://unpkg.com/rocketride-chat-widget@1.3.0/dist/rocketride-chat.js` (or the jsDelivr equivalent) and use `npm install rocketride-chat-widget` for the bundler flow. Whether the repo publishes this package, and under which release workflow, is still an open maintainer decision; treat every registry/CDN reference in this document as "once published".
+
 ### Option 1 — floating chat bubble (one script tag)
 
 ```html
 <script
-	src="https://unpkg.com/rocketride-chat-widget/dist/rocketride-chat.js"
+	src="/js/rocketride-chat.js"
 	data-engine-url="http://localhost:5565"
 	data-auth="pk_YOUR-PUBLIC-AUTH-KEY"
 	data-title="RocketRide Assistant"
@@ -45,14 +56,14 @@ You need two values, both produced by your pipeline's **chat source node** when 
 
 That is the whole integration: a launcher bubble appears in the chosen corner, clicking it opens the chat panel, and <kbd>Escape</kbd> closes it again. The loader reads its configuration from the script tag's own `data-*` attributes.
 
-> Use a **classic** script tag (`defer` is fine). With `type="module"` the browser leaves `document.currentScript` unset, so the loader cannot find its configuration and no bubble is mounted. Pin a version for production, e.g. `https://unpkg.com/rocketride-chat-widget@1.3.0/dist/rocketride-chat.js`.
+> Use a **classic** script tag (`defer` is fine). With `type="module"` the browser leaves `document.currentScript` unset, so the loader cannot find its configuration and no bubble is mounted.
 
 ### Option 2 — inline web component
 
 The same bundle also registers the `<rocketride-chat>` custom element (with a plain script tag, just omit `data-engine-url` if you don't want the bubble too):
 
 ```html
-<script src="https://unpkg.com/rocketride-chat-widget/dist/rocketride-chat.js" defer></script>
+<script src="/js/rocketride-chat.js" defer></script>
 
 <div style="height: 560px; max-width: 480px">
 	<rocketride-chat
@@ -68,10 +79,10 @@ The same bundle also registers the `<rocketride-chat>` custom element (with a pl
 
 The element fills its container (and keeps a 320px minimum height), so give it a sized parent.
 
-With a bundler, install the package and import it once — the import registers the element:
+With a bundler, add the package and import it once — the import registers the element. Until the package is on npm, point your dependency at the built folder (`"rocketride-chat-widget": "file:../path/to/packages/chat-widget"`) or at the `.tgz` produced by `npm pack` in that directory; **once published** the same thing installs by name:
 
 ```bash
-# NPM
+# NPM (once published)
 npm install rocketride-chat-widget
 # Yarn
 yarn add rocketride-chat-widget
@@ -301,7 +312,7 @@ pnpm --filter rocketride-chat-widget typecheck
 | Output                        | Contents                                                                         |
 | ----------------------------- | -------------------------------------------------------------------------------- |
 | `dist/rocketride-chat.mjs`    | ESM bundle (package `main` / `module`; for `import` consumers)                   |
-| `dist/rocketride-chat.js`     | IIFE bundle for `<script src>` (global `RocketRideChat`; unpkg/jsdelivr default) |
+| `dist/rocketride-chat.js`     | IIFE bundle for `<script src>` (global `RocketRideChat`; the file you self-host, and the `unpkg`/`jsdelivr` entry once published) |
 | `dist/types/`                 | TypeScript declarations                                                          |
 
 A demo page showing both modes with live theming controls is included at `packages/chat-widget/demo/index.html` — build the bundle, serve the package folder statically (e.g. `npx serve packages/chat-widget`), and open `/demo/`. All auth values in the demo are placeholders; paste your own pipeline's public key.

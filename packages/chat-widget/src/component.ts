@@ -99,8 +99,7 @@ const TEMPLATE_HTML = `
  * is never constructed there (registration is guarded on `customElements`),
  * so an inert stand-in keeps the import from throwing.
  */
-const BaseElement: typeof HTMLElement =
-	typeof HTMLElement !== 'undefined' ? HTMLElement : (class {} as unknown as typeof HTMLElement);
+const BaseElement: typeof HTMLElement = typeof HTMLElement !== 'undefined' ? HTMLElement : (class {} as unknown as typeof HTMLElement);
 
 /**
  * The <rocketride-chat> custom element.
@@ -143,6 +142,7 @@ export class RocketRideChatElement extends BaseElement {
 	private readonly _inputEl: HTMLTextAreaElement;
 	private readonly _sendEl: HTMLButtonElement;
 
+	/** Builds the shadow-DOM skeleton (styles, header, transcript, composer) and wires its listeners. */
 	constructor() {
 		super();
 		const shadow = this.attachShadow({ mode: 'open' });
@@ -241,6 +241,7 @@ export class RocketRideChatElement extends BaseElement {
 	// CUSTOM-ELEMENT LIFECYCLE
 	// ============================================================================
 
+	/** Applies appearance, starts the theme watcher and connects once the element enters the document. */
 	connectedCallback(): void {
 		this._applyTitle();
 		this._applyAccent();
@@ -252,11 +253,13 @@ export class RocketRideChatElement extends BaseElement {
 		this._maybeConnect();
 	}
 
+	/** Stops the theme watcher and tears the connection down when the element leaves the document. */
 	disconnectedCallback(): void {
 		this._unwatchMedia();
 		this._teardownConnection();
 	}
 
+	/** Reacts to an observed attribute change: reconnects on credentials, re-applies appearance otherwise. */
 	attributeChangedCallback(name: string, oldValue: string | null, newValue: string | null): void {
 		if (oldValue === newValue || !this.isConnected) {
 			return;
@@ -289,6 +292,7 @@ export class RocketRideChatElement extends BaseElement {
 	// CONNECTION
 	// ============================================================================
 
+	/** Opens a connection when the element is in the document and both `engine-url` and `auth` are set. */
 	private _maybeConnect(): void {
 		if (!this.isConnected || this._connection) {
 			return;
@@ -327,6 +331,7 @@ export class RocketRideChatElement extends BaseElement {
 		});
 	}
 
+	/** Drops the current connection (best-effort disconnect) and returns the header to the idle state. */
 	private _teardownConnection(): void {
 		const connection = this._connection;
 		this._connection = null;
@@ -338,6 +343,7 @@ export class RocketRideChatElement extends BaseElement {
 		this._applyConnectionState('idle');
 	}
 
+	/** Reflects a connection state in the header, error banner and composer, emitting `rr-error` on entry to `error`. */
 	private _applyConnectionState(state: ConnectionState, detail?: string): void {
 		const previous = this._lastConnectionState;
 		this._lastConnectionState = state;
@@ -367,10 +373,12 @@ export class RocketRideChatElement extends BaseElement {
 	// SENDING
 	// ============================================================================
 
+	/** Sends whatever is currently in the composer (form submit / Enter handler). */
 	private async _submit(): Promise<void> {
 		await this._send(this._inputEl.value);
 	}
 
+	/** Appends the question, asks the pipeline with prior history, then appends the answers or an error notice. */
 	private async _send(text: string): Promise<void> {
 		const trimmed = text.trim();
 		if (!trimmed || this._busy) {
@@ -411,6 +419,7 @@ export class RocketRideChatElement extends BaseElement {
 		return this._messages.filter((message) => !message.transient && (message.role === 'user' || message.role === 'assistant')).map((message) => ({ role: message.role as 'user' | 'assistant', content: message.text }));
 	}
 
+	/** Toggles the pending-reply state: shows or hides the thinking line and re-syncs the composer. */
 	private _setBusy(busy: boolean): void {
 		this._busy = busy;
 		if (busy) {
@@ -424,6 +433,7 @@ export class RocketRideChatElement extends BaseElement {
 		this._autoscroll();
 	}
 
+	/** Updates the thinking line with the pipeline's live status text (ignored when not busy). */
 	private _setThinkingText(text: string): void {
 		if (this._busy) {
 			this._thinkingTextEl.textContent = text;
@@ -431,6 +441,7 @@ export class RocketRideChatElement extends BaseElement {
 		}
 	}
 
+	/** Enables or disables the input and send button from the busy flag and the connection state. */
 	private _syncComposerState(): void {
 		// Input is disabled while awaiting a reply; send additionally requires a live connection.
 		this._inputEl.disabled = this._busy;
@@ -441,6 +452,7 @@ export class RocketRideChatElement extends BaseElement {
 	// TRANSCRIPT
 	// ============================================================================
 
+	/** Renders one message above the thinking line, scrolls if pinned, and emits `rr-message`. */
 	private _appendMessage(message: ChatMessage): void {
 		this._messages.push(message);
 
@@ -455,6 +467,7 @@ export class RocketRideChatElement extends BaseElement {
 		this._dispatchMessage({ role: message.role, text: message.text });
 	}
 
+	/** Shows the `welcome` attribute as a transient assistant bubble on an empty transcript. */
 	private _showWelcome(): void {
 		const welcome = this.getAttribute('welcome');
 		if (welcome && this._messages.length === 0) {
@@ -470,6 +483,7 @@ export class RocketRideChatElement extends BaseElement {
 		}
 	}
 
+	/** Scrolls the transcript to the bottom while the user has not scrolled away from it. */
 	private _autoscroll(): void {
 		if (this._stickToBottom) {
 			this._messagesEl.scrollTop = this._messagesEl.scrollHeight;
@@ -480,10 +494,12 @@ export class RocketRideChatElement extends BaseElement {
 	// APPEARANCE
 	// ============================================================================
 
+	/** Writes the `title` attribute (or the default) into the header. */
 	private _applyTitle(): void {
 		this._titleEl.textContent = this.getAttribute('title') || DEFAULT_TITLE;
 	}
 
+	/** Sets or clears the `--rr-accent` custom property from the `accent` attribute. */
 	private _applyAccent(): void {
 		const accent = this.getAttribute('accent');
 		if (accent) {
@@ -493,6 +509,7 @@ export class RocketRideChatElement extends BaseElement {
 		}
 	}
 
+	/** Writes the `placeholder` attribute (or the default) into the composer input. */
 	private _applyPlaceholder(): void {
 		this._inputEl.placeholder = this.getAttribute('placeholder') || DEFAULT_PLACEHOLDER;
 	}
@@ -509,10 +526,12 @@ export class RocketRideChatElement extends BaseElement {
 		this._root.setAttribute('data-theme', effective);
 	}
 
+	/** True when the browser reports a dark `prefers-color-scheme` (false where matchMedia is unavailable). */
 	private _prefersDark(): boolean {
 		return typeof window !== 'undefined' && typeof window.matchMedia === 'function' && window.matchMedia('(prefers-color-scheme: dark)').matches;
 	}
 
+	/** Subscribes to `prefers-color-scheme` changes so `theme="auto"` updates live. */
 	private _watchMedia(): void {
 		if (this._mediaQuery || typeof window === 'undefined' || typeof window.matchMedia !== 'function') {
 			return;
@@ -524,6 +543,7 @@ export class RocketRideChatElement extends BaseElement {
 		}
 	}
 
+	/** Unsubscribes from the `prefers-color-scheme` listener installed by `_watchMedia`. */
 	private _unwatchMedia(): void {
 		if (this._mediaQuery && typeof this._mediaQuery.removeEventListener === 'function') {
 			this._mediaQuery.removeEventListener('change', this._onMediaChange);
@@ -531,6 +551,7 @@ export class RocketRideChatElement extends BaseElement {
 		this._mediaQuery = null;
 	}
 
+	/** Grows the textarea with its content up to a 120px cap. */
 	private _autosizeInput(): void {
 		this._inputEl.style.height = 'auto';
 		this._inputEl.style.height = `${Math.min(this._inputEl.scrollHeight, 120)}px`;
@@ -540,19 +561,23 @@ export class RocketRideChatElement extends BaseElement {
 	// ERRORS & EVENTS
 	// ============================================================================
 
+	/** Reveals the error banner with the given message. */
 	private _showError(message: string): void {
 		this._errorTextEl.textContent = message;
 		this._errorEl.hidden = false;
 	}
 
+	/** Hides the error banner. */
 	private _hideError(): void {
 		this._errorEl.hidden = true;
 	}
 
+	/** Emits the composed, bubbling `rr-message` event. */
 	private _dispatchMessage(detail: MessageEventDetail): void {
 		this.dispatchEvent(new CustomEvent<MessageEventDetail>('rr-message', { detail, bubbles: true, composed: true }));
 	}
 
+	/** Emits the composed, bubbling `rr-error` event. */
 	private _dispatchError(detail: ErrorEventDetail): void {
 		this.dispatchEvent(new CustomEvent<ErrorEventDetail>('rr-error', { detail, bubbles: true, composed: true }));
 	}

@@ -122,6 +122,7 @@ export class WidgetConnection {
 	private _state: ConnectionState = 'idle';
 	private _manualDisconnect = false;
 
+	/** Stores the connection options; no client is created until `connect()` is called. */
 	constructor(options: WidgetConnectionOptions) {
 		this._options = options;
 	}
@@ -238,6 +239,7 @@ export class WidgetConnection {
 		return extractAnswerTexts(result);
 	}
 
+	/** Records the new state and notifies the `onStateChange` callback. */
 	private _setState(state: ConnectionState, detail?: string): void {
 		this._state = state;
 		this._options.onStateChange?.(state, detail);
