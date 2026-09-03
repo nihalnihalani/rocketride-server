@@ -7,8 +7,8 @@
 
 The build interpreter provides ``rocketlib``, ``ai.common.schema`` and
 ``depends``. The node source is not on the interpreter's import path by
-default, so -- like every other node suite (local_text_output, milvus,
-pinecone, tool_git, ...) -- we prepend ``nodes/src/nodes`` to import the
+default, so -- like every other node suite (local_text_output, store_milvus,
+store_pinecone, tool_git, ...) -- we prepend ``nodes/src/nodes`` to import the
 ``chunker.*`` package by name. There is no skip fallback: outside the build
 interpreter the ``rocketlib`` import fails and collection errors out, by design.
 """

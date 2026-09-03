@@ -9,6 +9,7 @@
 	"prefix": "Chunker",
 	"description": ["A text chunking component that splits documents into smaller, semantically coherent ", "chunks for downstream processing such as embedding, retrieval, and LLM-based generation. ", "Supports multiple chunking strategies: recursive character splitting with configurable ", "separators, sentence-boundary splitting, and token-based splitting using tiktoken. ", "Each strategy supports configurable chunk size and overlap to balance context preservation ", "with chunk granularity."],
 	"icon": "chunker.svg",
+	"documentation": "https://docs.rocketride.org",
 	"tile": ["Strategy: ${parameters.chunker.${profile}.strategy}", "Size: ${parameters.chunker.${profile}.chunk_size}"],
 	"lanes": {
 		"documents": ["documents"]
