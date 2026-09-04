@@ -325,13 +325,21 @@ class ContextOptimizer:
 
         Order: live catalog, then :attr:`MODEL_LIMITS`, then
         :data:`DEFAULT_MODEL_LIMIT` (with a one-time warning per model id).
+
+        Both lookups try the full id first and then, for a provider-scoped id,
+        its bare name -- so ``openai/gpt-5`` still resolves through
+        :attr:`MODEL_LIMITS` when the sibling ``llm_*`` nodes are not deployed
+        and the catalog is therefore empty.
         """
+        bare = model.rsplit('/', 1)[-1]
+        candidates = (model,) if bare == model else (model, bare)
         catalog = self.model_catalog()
-        for key in (model, model.rsplit('/', 1)[-1] if '/' in model else model):
+        for key in candidates:
             if key in catalog:
                 return catalog[key]
-        if model in self.MODEL_LIMITS:
-            return self.MODEL_LIMITS[model]
+        for key in candidates:
+            if key in self.MODEL_LIMITS:
+                return self.MODEL_LIMITS[key]
         if model not in self._warned_unknown_models:
             warning(
                 f"context_optimizer: model '{model}' is in neither the LLM node catalog nor MODEL_LIMITS, "
@@ -349,6 +357,11 @@ class ContextOptimizer:
         except (ValueError, TypeError):
             warning(f'context_optimizer: {name} is not a valid number, defaulting to 0')
             return 0.0
+        if pct != pct:
+            # NaN satisfies neither range check below, so it would survive
+            # validation and blow up allocate_budget's int() conversion.
+            warning(f'context_optimizer: {name} is NaN, defaulting to 0')
+            return 0.0
         if pct < 0:
             warning(f'context_optimizer: {name} is negative ({pct:.1f}), clamping to 0')
             return 0.0
@@ -361,8 +374,8 @@ class ContextOptimizer:
     # Token counting
     # ------------------------------------------------------------------
 
-    def _resolve_encoding_name(self) -> str:
-        """Resolve (and cache) the tiktoken encoding name for the configured model.
+    def encoding_name_for_model(self, model: Optional[str]) -> str:
+        """Resolve the tiktoken encoding name for an arbitrary model id.
 
         gpt-5 / gpt-4o map to ``o200k_base`` via ``_MODEL_ENCODING_OVERRIDES``;
         older GPT ids are resolved through ``tiktoken.encoding_for_model()``.
@@ -370,21 +383,22 @@ class ContextOptimizer:
         ``_DEFAULT_ENCODING`` -- tiktoken is only an approximation for those, but
         it keeps token counts stable and non-crashing.
         """
-        if self._encoding_name is not None:
-            return self._encoding_name
-
-        model = self.model_name or ''
+        model = model or ''
         for prefix, enc_name in self._MODEL_ENCODING_OVERRIDES.items():
             if model.startswith(prefix):
-                self._encoding_name = enc_name
                 return enc_name
 
         import tiktoken
 
         try:
-            self._encoding_name = tiktoken.encoding_for_model(model).name
+            return tiktoken.encoding_for_model(model).name
         except KeyError:
-            self._encoding_name = self._DEFAULT_ENCODING
+            return self._DEFAULT_ENCODING
+
+    def _resolve_encoding_name(self) -> str:
+        """Resolve (and cache) the tiktoken encoding name for the configured model."""
+        if self._encoding_name is None:
+            self._encoding_name = self.encoding_name_for_model(self.model_name)
         return self._encoding_name
 
     def _get_encoding(self, encoding_name: Optional[str] = None):
@@ -499,8 +513,11 @@ class ContextOptimizer:
         split on sentence boundaries and sentences are kept greedily from the
         start until adding the next sentence would exceed the budget.
 
-        If even the first sentence exceeds the budget, it falls back to a
-        token-level truncation so the result always fits.
+        The greedy loop measures each sentence in isolation, but the returned
+        text is the sentences joined by single spaces and BPE does not always
+        merge a joining space into the following token.  The joined result is
+        therefore re-measured before it is trusted; when it overshoots, the
+        token-level fallback is used instead, so the result always fits.
 
         Args:
             text: Source text.
@@ -532,13 +549,54 @@ class ContextOptimizer:
 
         if result_parts:
             # Intentional: joining normalizes inter-sentence whitespace to single spaces.
-            return ' '.join(result_parts)
+            candidate = ' '.join(result_parts)
+            # The per-sentence counts above exclude the joining spaces, which can
+            # cost an extra token apiece, so re-measure before trusting the budget.
+            if self.count_tokens(candidate, encoding) <= max_tokens:
+                return candidate
 
-        # Fallback: first sentence is too long -- truncate at token level
+        # Fallback: nothing fits cleanly -- truncate at token level
         enc = self._get_encoding(encoding)
         tokens = enc.encode(text)
         truncated_tokens = tokens[:max_tokens]
         return enc.decode(truncated_tokens)
+
+    def truncate_each_to_budget(self, texts: List[str], max_tokens: int, encoding: Optional[str] = None) -> List[str]:
+        """Truncate every text in *texts* so the collection shares one budget.
+
+        Used when a single logical component arrives as several entries that
+        must all survive -- a ``Question`` carrying more than one
+        ``QuestionText``, for instance, where downstream embedding and
+        document-store nodes read every entry.  Each entry receives a share of
+        *max_tokens* proportional to its own token cost (integer remainders go
+        to the largest entries first), so no entry is dropped and the entries
+        together stay inside the budget.
+
+        Args:
+            texts: Source texts, one per entry. Order is preserved.
+            max_tokens: Total token budget shared by every entry.
+            encoding: tiktoken encoding name.
+
+        Returns:
+            One truncated text per input, in the same order.
+        """
+        if not texts:
+            return []
+        if max_tokens <= 0:
+            return ['' for _ in texts]
+
+        costs = [self.count_tokens(text, encoding) for text in texts]
+        total = sum(costs)
+        if total <= max_tokens:
+            return list(texts)
+
+        shares = [int(max_tokens * cost / total) for cost in costs]
+        # Integer flooring leaves fewer than len(texts) tokens unassigned; hand
+        # them to the largest entries so the budget is spent, not discarded.
+        for idx in sorted(range(len(costs)), key=lambda i: (-costs[i], i))[: max_tokens - sum(shares)]:
+            shares[idx] += 1
+
+        return [self.truncate_to_budget(text, share, encoding) for text, share in zip(texts, shares)]
 
     # ------------------------------------------------------------------
     # History summarization
@@ -567,8 +625,13 @@ class ContextOptimizer:
             return []
 
         if len(messages) == 1:
-            content = self.truncate_to_budget(messages[0].get('content', ''), max_tokens, encoding)
-            return [{'role': messages[0].get('role', 'user'), 'content': content}]
+            # Reserve this message's role overhead -- count_tokens(role) + 4, the
+            # same accounting _message_tokens uses -- so the single returned
+            # message's total cost stays inside max_tokens, as the docstring says.
+            only_role = messages[0].get('role', 'user')
+            content_budget = max_tokens - (self.count_tokens(only_role, encoding) + 4)
+            content = self.truncate_to_budget(messages[0].get('content', ''), content_budget, encoding)
+            return [{'role': only_role, 'content': content}]
 
         # Measure total cost
         total = sum(self._message_tokens(m, encoding) for m in messages)
@@ -582,7 +645,14 @@ class ContextOptimizer:
         # Summary placeholder.  LLM providers (Claude, OpenAI) only accept
         # ``role: system`` at position 0, so use ``role: user`` for a synthetic
         # mid-conversation summary marker that providers will route correctly.
-        summary_placeholder = {'role': 'user', 'content': '[Earlier conversation summarized]'}
+        # Reserve against the widest wording the placeholder can end up with:
+        # the omitted count is substituted in only after the budget is fixed
+        # (see below), and it tokenizes to more than the bare marker does.
+        max_omitted = len(messages) - 1
+        summary_placeholder = {
+            'role': 'user',
+            'content': f'[Earlier conversation summarized: {max_omitted} messages omitted]',
+        }
         summary_cost = self._message_tokens(summary_placeholder, encoding)
 
         budget_for_recent = max_tokens - first_cost - summary_cost
@@ -735,6 +805,8 @@ class ContextOptimizer:
         Args:
             question: The user's query text.
             model: Optional model name override (uses instance default if ``None``).
+                The override selects both the context-window limit *and* the
+                tiktoken encoding used for counting, so the two never disagree.
             system_prompt: System prompt text.
             documents: List of document dicts with ``content`` key.
             history: Conversation history (list of role/content dicts).
@@ -745,7 +817,8 @@ class ContextOptimizer:
                 - question: optimized question text
                 - documents: list of selected documents
                 - history: compressed conversation history
-                - metadata: dict with tokens_used, tokens_saved, components_truncated, model, total_limit
+                - metadata: dict with tokens_used, tokens_saved, components_truncated,
+                  model, total_limit, budget and encoding
         """
         documents = documents or []
         history = history or []
@@ -754,11 +827,22 @@ class ContextOptimizer:
         effective_model = model or self.model_name
         total_limit = self.max_context_tokens or self.resolve_model_limit(effective_model)
 
+        # Count with the encoding the *effective* model uses, so a ``model``
+        # override cannot apply one model's limit to another model's token
+        # counts. Without an override this is the cached instance encoding.
+        encoding = (
+            self._resolve_encoding_name()
+            if effective_model == self.model_name
+            else self.encoding_name_for_model(effective_model)
+        )
+
         # Compute original token counts
-        original_system = self.count_tokens(system_prompt)
-        original_question = self.count_tokens(question)
-        original_docs = sum(self.count_tokens(str(d.get('content', d.get('page_content', '')))) for d in documents)
-        original_history = sum(self._message_tokens(m) for m in history)
+        original_system = self.count_tokens(system_prompt, encoding)
+        original_question = self.count_tokens(question, encoding)
+        original_docs = sum(
+            self.count_tokens(str(d.get('content', d.get('page_content', ''))), encoding) for d in documents
+        )
+        original_history = sum(self._message_tokens(m, encoding) for m in history)
         original_total = original_system + original_question + original_docs + original_history
 
         # ------------------------------------------------------------------
@@ -778,6 +862,7 @@ class ContextOptimizer:
                     'model': effective_model,
                     'total_limit': total_limit,
                     'budget': budget,
+                    'encoding': encoding,
                 },
             }
 
@@ -788,28 +873,31 @@ class ContextOptimizer:
 
         components_truncated: List[str] = []
 
-        opt_system = self.truncate_to_budget(system_prompt, budget['system_prompt'])
-        if self.count_tokens(opt_system) < original_system:
+        opt_system = self.truncate_to_budget(system_prompt, budget['system_prompt'], encoding)
+        if self.count_tokens(opt_system, encoding) < original_system:
             components_truncated.append('system_prompt')
 
-        opt_question = self.truncate_to_budget(question, budget['query'])
-        if self.count_tokens(opt_question) < original_question:
+        opt_question = self.truncate_to_budget(question, budget['query'], encoding)
+        if self.count_tokens(opt_question, encoding) < original_question:
             components_truncated.append('question')
 
-        opt_documents = self.rank_documents(documents, question, budget['documents'])
+        opt_documents = self.rank_documents(documents, question, budget['documents'], encoding)
         opt_docs_tokens = sum(
-            self.count_tokens(str(d.get('content', d.get('page_content', '')))) for d in opt_documents
+            self.count_tokens(str(d.get('content', d.get('page_content', ''))), encoding) for d in opt_documents
         )
         if opt_docs_tokens < original_docs:
             components_truncated.append('documents')
 
-        opt_history = self.summarize_history(history, budget['history'])
-        opt_history_tokens = sum(self._message_tokens(m) for m in opt_history)
+        opt_history = self.summarize_history(history, budget['history'], encoding)
+        opt_history_tokens = sum(self._message_tokens(m, encoding) for m in opt_history)
         if opt_history_tokens < original_history:
             components_truncated.append('history')
 
         tokens_used = (
-            self.count_tokens(opt_system) + self.count_tokens(opt_question) + opt_docs_tokens + opt_history_tokens
+            self.count_tokens(opt_system, encoding)
+            + self.count_tokens(opt_question, encoding)
+            + opt_docs_tokens
+            + opt_history_tokens
         )
         tokens_saved = max(0, original_total - tokens_used)
 
@@ -825,5 +913,6 @@ class ContextOptimizer:
                 'model': effective_model,
                 'total_limit': total_limit,
                 'budget': budget,
+                'encoding': encoding,
             },
         }

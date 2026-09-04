@@ -1129,3 +1129,267 @@ class TestScorePreservingRanking:
         ]
         result = optimizer.rank_documents(docs, 'Python programming', 10000)
         assert result[0]['content'] == 'First doc'
+
+
+# ===========================================================================
+# Budget-invariant regression tests (CodeRabbit round 1b)
+# ===========================================================================
+
+
+class TestBudgetInvariants:
+    """Every component helper must keep its result inside the budget it is given.
+
+    ``optimize()`` allocates a per-component budget and then trusts each helper
+    to honour it, so an overshoot here silently blows the model's context
+    window. The sweeps below walk every budget from 0 up to the input's full
+    cost, which is what makes them meaningful under either tokenizer (the real
+    ``tiktoken`` BPE or this suite's whitespace stub).
+    """
+
+    # A text whose sentences cost more together than apart under BPE: joining
+    # on a single space does not always merge into the following token, so the
+    # greedy per-sentence tally in truncate_to_budget can undercount.
+    JOIN_SENSITIVE = (
+        'Alpha beta gamma. 12345 67890. Delta epsilon. Extra sentence here to force truncation of the tail.'
+    )
+
+    def test_truncate_to_budget_never_exceeds_budget(self, optimizer):
+        text = self.JOIN_SENSITIVE
+        full = optimizer.count_tokens(text)
+        assert full > 4, 'sweep needs a multi-token text'
+        for max_tokens in range(full + 2):
+            result = optimizer.truncate_to_budget(text, max_tokens)
+            assert optimizer.count_tokens(result) <= max_tokens, (
+                f'truncate_to_budget returned {optimizer.count_tokens(result)} tokens for a '
+                f'{max_tokens}-token budget: {result!r}'
+            )
+
+    def test_truncate_to_budget_still_prefers_sentence_boundaries(self, optimizer):
+        """The re-measure guard must not turn every call into a token-level cut."""
+        text = 'First sentence. Second sentence. Third sentence.'
+        two = optimizer.count_tokens('First sentence. Second sentence.')
+        result = optimizer.truncate_to_budget(text, two)
+        assert result == 'First sentence. Second sentence.'
+
+    def test_summarize_history_never_exceeds_budget(self, optimizer):
+        """The summary placeholder gains tokens when the omitted count is filled in."""
+        messages = [{'role': 'user', 'content': f'message number {i} with some filler words here'} for i in range(12)]
+        total = sum(optimizer._message_tokens(m) for m in messages)
+        # A message costs its role plus 4 tokens of framing even when empty, so
+        # budgets below that floor cannot be met by any non-empty return value.
+        floor = optimizer.count_tokens('user') + 4
+        for max_tokens in range(floor, total + 2):
+            result = optimizer.summarize_history(messages, max_tokens)
+            used = sum(optimizer._message_tokens(m) for m in result)
+            assert used <= max_tokens, (
+                f'summarize_history returned {used} tokens for a {max_tokens}-token budget: {result!r}'
+            )
+
+    def test_summarize_history_still_summarizes_the_middle(self, optimizer):
+        """The wider reservation must not stop the placeholder being emitted."""
+        messages = [{'role': 'user', 'content': f'message number {i} with some filler words here'} for i in range(12)]
+        total = sum(optimizer._message_tokens(m) for m in messages)
+        result = optimizer.summarize_history(messages, total // 2)
+        assert result[0] == messages[0]
+        assert result[1]['role'] == 'user'
+        assert result[1]['content'].startswith('[Earlier conversation summarized: ')
+        assert result[1]['content'].endswith(' messages omitted]')
+
+    def test_single_message_history_reserves_role_overhead(self, optimizer):
+        """A one-message history is budgeted the same way as a summarized one."""
+        messages = [{'role': 'assistant', 'content': 'alpha beta gamma delta epsilon zeta eta theta'}]
+        total = optimizer._message_tokens(messages[0])
+        floor = optimizer.count_tokens('assistant') + 4
+        for max_tokens in range(floor, total + 2):
+            result = optimizer.summarize_history(messages, max_tokens)
+            assert sum(optimizer._message_tokens(m) for m in result) <= max_tokens
+
+
+class TestSharedQueryBudget:
+    """Tests for truncate_each_to_budget, which keeps one entry per input."""
+
+    def test_empty_input(self, optimizer):
+        assert optimizer.truncate_each_to_budget([], 100) == []
+
+    def test_everything_fits_is_returned_unchanged(self, optimizer):
+        texts = ['alpha beta.', 'gamma delta.', 'epsilon.']
+        assert optimizer.truncate_each_to_budget(texts, 10000) == texts
+
+    def test_zero_budget_empties_every_entry_but_keeps_the_count(self, optimizer):
+        texts = ['alpha beta.', 'gamma delta.']
+        assert optimizer.truncate_each_to_budget(texts, 0) == ['', '']
+
+    def test_entry_count_and_order_are_preserved_under_pressure(self, optimizer):
+        texts = ['alpha ' * 30, 'beta ' * 10, 'gamma ' * 20]
+        result = optimizer.truncate_each_to_budget(texts, 12)
+        assert len(result) == 3
+        assert all(t.startswith(src.split()[0]) or t == '' for t, src in zip(result, texts))
+
+    def test_shared_budget_is_respected(self, optimizer):
+        texts = ['alpha ' * 30, 'beta ' * 10, 'gamma ' * 20]
+        total = sum(optimizer.count_tokens(t) for t in texts)
+        for max_tokens in range(total + 2):
+            result = optimizer.truncate_each_to_budget(texts, max_tokens)
+            assert len(result) == len(texts)
+            used = sum(optimizer.count_tokens(t) for t in result)
+            assert used <= max_tokens, f'{used} tokens spent against a {max_tokens}-token budget'
+
+    def test_larger_entries_receive_larger_shares(self, optimizer):
+        texts = ['alpha ' * 40, 'beta ' * 4]
+        result = optimizer.truncate_each_to_budget(texts, 20)
+        assert optimizer.count_tokens(result[0]) > optimizer.count_tokens(result[1])
+
+
+class TestEffectiveModelEncoding:
+    """A ``model`` override must select the tokenizer as well as the limit."""
+
+    def test_override_selects_the_overridden_model_encoding(self, default_config):
+        config = {**default_config, 'model_name': 'gpt-4'}
+        opt = ContextOptimizer(config)
+        assert opt.optimize(question='Test', model='gpt-5')['metadata']['encoding'] == 'o200k_base'
+
+    def test_no_override_uses_the_configured_model_encoding(self, default_config):
+        opt = ContextOptimizer({**default_config, 'model_name': 'gpt-4'})
+        result = opt.optimize(question='Test')
+        assert result['metadata']['encoding'] == opt._resolve_encoding_name() == 'cl100k_base'
+
+    def test_encoding_name_for_model_does_not_poison_the_instance_cache(self, default_config):
+        opt = ContextOptimizer({**default_config, 'model_name': 'gpt-4'})
+        assert opt.encoding_name_for_model('gpt-5') == 'o200k_base'
+        assert opt._resolve_encoding_name() == 'cl100k_base'
+
+
+class TestScopedIdFallback:
+    """A provider-scoped id must reach the fallback table by its bare name.
+
+    The catalog already tries ``openai/gpt-5`` then ``gpt-5``. When the sibling
+    ``llm_*`` nodes are not deployed the catalog is empty, which is exactly the
+    case MODEL_LIMITS exists for -- so that lookup has to try the bare name too,
+    or the scoped id silently lands on DEFAULT_MODEL_LIMIT.
+    """
+
+    def test_scoped_id_resolves_through_the_fallback_table(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(ContextOptimizer, '_CATALOG_ROOT', tmp_path)  # no llm_* dirs -> empty catalog
+        monkeypatch.setattr(ContextOptimizer, '_catalog_cache', None)
+        try:
+            assert ContextOptimizer.model_catalog() == {}
+            opt = ContextOptimizer({'model_name': 'openai/gpt-5', 'max_context_tokens': 0})
+            assert opt._total_limit == ContextOptimizer.MODEL_LIMITS['gpt-5']
+            assert opt._total_limit != DEFAULT_MODEL_LIMIT
+            assert opt._warned_unknown_models == set(), 'a resolvable id must not warn'
+        finally:
+            ContextOptimizer._catalog_cache = None
+
+    def test_full_id_still_wins_over_the_bare_name(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(ContextOptimizer, '_CATALOG_ROOT', tmp_path)
+        monkeypatch.setattr(ContextOptimizer, '_catalog_cache', None)
+        monkeypatch.setitem(ContextOptimizer.MODEL_LIMITS, 'vendor/gpt-5', 4096)
+        try:
+            opt = ContextOptimizer({'model_name': 'vendor/gpt-5', 'max_context_tokens': 0})
+            assert opt._total_limit == 4096
+        finally:
+            ContextOptimizer._catalog_cache = None
+
+    def test_unknown_scoped_id_still_warns_and_defaults(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(ContextOptimizer, '_CATALOG_ROOT', tmp_path)
+        monkeypatch.setattr(ContextOptimizer, '_catalog_cache', None)
+        try:
+            opt = ContextOptimizer({'model_name': 'vendor/not-a-real-model', 'max_context_tokens': 0})
+            assert opt._total_limit == DEFAULT_MODEL_LIMIT
+            assert 'vendor/not-a-real-model' in opt._warned_unknown_models
+        finally:
+            ContextOptimizer._catalog_cache = None
+
+
+class TestNaNBudgetPercentage:
+    """NaN satisfies neither ``< 0`` nor ``> 100``, so it needs its own guard."""
+
+    @pytest.mark.parametrize('value', [float('nan'), 'nan', 'NaN'])
+    def test_nan_percentage_is_rejected(self, default_config, value):
+        opt = ContextOptimizer({**default_config, 'document_budget_pct': value})
+        assert opt.document_budget_pct == 0.0
+
+    def test_nan_percentage_does_not_break_allocation(self, default_config):
+        """Left unguarded this raises ValueError inside allocate_budget's int()."""
+        opt = ContextOptimizer({**default_config, 'document_budget_pct': float('nan')})
+        budget = opt.allocate_budget(1000)
+        assert budget['documents'] == 0
+        assert sum(budget.values()) <= 1000
+
+    def test_infinity_is_still_clamped(self, default_config):
+        opt = ContextOptimizer({**default_config, 'document_budget_pct': float('inf')})
+        assert opt.document_budget_pct == 100.0
+        opt = ContextOptimizer({**default_config, 'document_budget_pct': float('-inf')})
+        assert opt.document_budget_pct == 0.0
+
+
+class TestMultiEntryQuestions:
+    """Every QuestionText entry must survive the node.
+
+    Downstream embedding nodes embed each entry (see
+    ``embedding_transformer/sentenceTransformer.py``) and the document stores
+    read per-entry embedding metadata, so dropping entries here loses both.
+    """
+
+    @staticmethod
+    def _instance(optimizer):
+        inst = IInstance.__new__(IInstance)
+        iglobal = MagicMock()
+        iglobal.optimizer = optimizer
+        inst.IGlobal = iglobal
+        inst.instance = MagicMock()
+        return inst
+
+    @staticmethod
+    def _question(*texts):
+        q = Question()
+        for text in texts:
+            q.addQuestion(text)
+        for idx, entry in enumerate(q.questions):
+            entry.embedding_model = f'model-{idx}'
+            entry.embedding = [float(idx)]
+        return q
+
+    def test_all_entries_survive_when_nothing_is_truncated(self, optimizer):
+        inst = self._instance(optimizer)
+        inst.writeQuestions(self._question('First question?', 'Second question?', 'Third question?'))
+
+        forwarded = inst.instance.writeQuestions.call_args.args[0]
+        assert [e.text for e in forwarded.questions] == ['First question?', 'Second question?', 'Third question?']
+        assert [e.embedding_model for e in forwarded.questions] == ['model-0', 'model-1', 'model-2']
+        assert [e.embedding for e in forwarded.questions] == [[0.0], [1.0], [2.0]]
+
+    def test_all_entries_survive_when_the_query_is_truncated(self, small_budget_config):
+        opt = ContextOptimizer({**small_budget_config, 'max_context_tokens': 40})
+        inst = self._instance(opt)
+        texts = ('alpha ' * 200, 'beta ' * 200, 'gamma ' * 200)
+        inst.writeQuestions(self._question(*texts))
+
+        forwarded = inst.instance.writeQuestions.call_args.args[0]
+        assert len(forwarded.questions) == 3, 'no entry may be dropped'
+        # Embedding metadata rides along with each surviving entry.
+        assert [e.embedding_model for e in forwarded.questions] == ['model-0', 'model-1', 'model-2']
+        # The entries together stay inside the shared query budget.
+        query_budget = opt.allocate_budget(40)['query']
+        used = sum(opt.count_tokens(e.text) for e in forwarded.questions)
+        assert used <= query_budget, f'{used} tokens spent against a {query_budget}-token query budget'
+        # Something was actually trimmed -- otherwise this asserts nothing.
+        assert used < sum(opt.count_tokens(t) for t in texts)
+
+    def test_single_entry_takes_the_optimized_text_directly(self, small_budget_config):
+        opt = ContextOptimizer({**small_budget_config, 'max_context_tokens': 40})
+        inst = self._instance(opt)
+        text = 'alpha ' * 200
+        inst.writeQuestions(self._question(text))
+
+        forwarded = inst.instance.writeQuestions.call_args.args[0]
+        assert len(forwarded.questions) == 1
+        assert forwarded.questions[0].text.startswith('alpha')
+        assert opt.count_tokens(text) > 40, 'input must exceed the window for this to assert anything'
+        assert opt.count_tokens(forwarded.questions[0].text) <= opt.allocate_budget(40)['query']
+
+    def test_multi_entry_input_is_no_longer_warned_about(self, optimizer):
+        inst = self._instance(optimizer)
+        with patch('context_optimizer.IInstance.warning') as mock_warning:
+            inst.writeQuestions(self._question('One?', 'Two?'))
+        assert mock_warning.call_args_list == []
