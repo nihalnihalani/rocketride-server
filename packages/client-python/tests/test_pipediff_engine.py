@@ -423,6 +423,61 @@ def test_falsy_non_null_node_ui_is_not_an_empty_ui(falsy):
     assert with_layout.has_semantic_changes is True
 
 
+@pytest.mark.parametrize(
+    ('before', 'after'), [(False, 0), (True, 1), (0, False)], ids=['false-to-0', 'true-to-1', '0-to-false']
+)
+def test_viewport_scalar_type_change_is_a_layout_change(before, after):
+    # Python treats False == 0 and True == 1, so a plain `!=` missed a JSON
+    # false -> 0 edit: layout_changed stayed False, no viewport change was
+    # reported, and --include-layout exited 0. Equality must be JSON-typed.
+    old = _pipe([_node('a', 'src')])
+    old['viewport'] = before
+    new = _pipe([_node('a', 'src')])
+    new['viewport'] = after
+
+    diff = diff_pipes(old, new)
+    assert diff.layout_changed is True
+
+    with_layout = diff_pipes(old, new, include_layout=True)
+    assert [(change.path, change.old, change.new) for change in with_layout.viewport_changes] == [
+        ('viewport', before, after)
+    ]
+    assert with_layout.has_semantic_changes is True
+
+
+@pytest.mark.parametrize(('before', 'after'), [(False, 0), (True, 1)], ids=['false-to-0', 'true-to-1'])
+def test_node_ui_scalar_type_change_is_a_layout_change(before, after):
+    old = _pipe([_node('a', 'src', ui={})])
+    new = _pipe([_node('a', 'src', ui={})])
+    old['components'][0]['ui'] = before
+    new['components'][0]['ui'] = after
+
+    diff = diff_pipes(old, new)
+    assert diff.layout_changed is True
+
+    with_layout = diff_pipes(old, new, include_layout=True)
+    config_changes = _changes_by_kind(with_layout, 'config')
+    assert len(config_changes) == 1
+    assert [(change.path, change.old, change.new) for change in config_changes[0].field_changes] == [
+        ('ui', before, after)
+    ]
+
+
+def test_config_scalar_type_change_is_reported():
+    # _diff_value is shared with the config diff, so the same rule applies there:
+    # a config flag flipping from false to 0 is a real change, and equal typed
+    # values (including nested ones) still compare equal.
+    old = _pipe([_node('a', 'src', config={'flag': False, 'nested': {'n': 1, 'items': [True]}})])
+    new = _pipe([_node('a', 'src', config={'flag': 0, 'nested': {'n': 1, 'items': [True]}})])
+
+    config_changes = _changes_by_kind(diff_pipes(old, new), 'config')
+    assert len(config_changes) == 1
+    assert [(change.path, change.old, change.new) for change in config_changes[0].field_changes] == [
+        ('config.flag', False, 0)
+    ]
+    assert diff_pipes(old, old).has_semantic_changes is False
+
+
 @pytest.mark.parametrize('null_ui', [True, False], ids=['null', 'omitted'])
 def test_absent_node_ui_equals_empty_ui(null_ui):
     # Same normalization for a node's ui block: null/omitted vs {}.

@@ -442,6 +442,33 @@ def _layout_block(value: Any) -> Any:
     return {} if value is None else value
 
 
+def _json_equal(old: Any, new: Any) -> bool:
+    """
+    Compare two JSON values the way JSON does, not the way Python does.
+
+    Python treats ``False == 0`` and ``True == 1`` as equal, so a plain ``!=``
+    would miss a ``false`` -> ``0`` edit and report no change. Booleans are
+    compared only against booleans; dicts and lists are compared element-wise
+    with the same rule; everything else falls back to ``==``.
+
+    Args:
+        old: The previous JSON value.
+        new: The new JSON value.
+
+    Returns:
+        ``True`` when the two values are the same JSON value.
+    """
+    if isinstance(old, bool) or isinstance(new, bool):
+        return isinstance(old, bool) and isinstance(new, bool) and old == new
+    if isinstance(old, dict) and isinstance(new, dict):
+        return old.keys() == new.keys() and all(_json_equal(old[k], new[k]) for k in old)
+    if isinstance(old, list) and isinstance(new, list):
+        return len(old) == len(new) and all(_json_equal(a, b) for a, b in zip(old, new))
+    if isinstance(old, (dict, list)) or isinstance(new, (dict, list)):
+        return False
+    return old == new
+
+
 def _layout_changed(
     old: dict,
     new: dict,
@@ -472,11 +499,12 @@ def _layout_changed(
     # Without this, None vs {} set layout_changed while producing no ``ui.*``/
     # ``viewport.*`` change, so ``--include-layout`` reported a layout change with
     # nothing to show and still exited 0.
-    if _layout_block(old.get('viewport')) != _layout_block(new.get('viewport')):
+    if not _json_equal(_layout_block(old.get('viewport')), _layout_block(new.get('viewport'))):
         return True
     for component_id in common_ids:
-        if _layout_block(old_components[component_id].get('ui')) != _layout_block(
-            new_components[component_id].get('ui')
+        if not _json_equal(
+            _layout_block(old_components[component_id].get('ui')),
+            _layout_block(new_components[component_id].get('ui')),
         ):
             return True
     return False
@@ -502,7 +530,7 @@ def _diff_value(old: Any, new: Any, path: str) -> list[FieldChange]:
         return _diff_mapping(old, new, path)
     if isinstance(old, list) and isinstance(new, list):
         return _diff_sequence(old, new, path)
-    if old != new:
+    if not _json_equal(old, new):
         return [FieldChange(path=path, kind='changed', old=old, new=new)]
     return []
 
