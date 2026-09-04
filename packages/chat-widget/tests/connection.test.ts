@@ -207,6 +207,21 @@ describe('WidgetConnection — ask()', () => {
 		expect(statuses).toEqual(['Searching documents…']);
 	});
 
+	it('routes SSE statuses to the per-request callback instead of the connection-level one', async () => {
+		const { connection, statuses, getClient } = makeConnection();
+		await connection.connect();
+		getClient()!.result = { name: '', path: '', objectId: '', result_types: { answers: 'answers' }, answers: ['Answer'] };
+
+		const perRequest: string[] = [];
+		await connection.ask('What is RocketRide?', [], (status) => perRequest.push(status));
+
+		// A caller that asks for its own status owns every line of that request,
+		// so nothing leaks to the connection-level fallback where it could be
+		// mistaken for the status of a different, still-live request.
+		expect(perRequest).toEqual(['Searching documents…']);
+		expect(statuses).toEqual([]);
+	});
+
 	it('fails when the connection was never opened', async () => {
 		const { connection } = makeConnection();
 		await expect(connection.ask('hello')).rejects.toThrow(/connect\(\) first/);

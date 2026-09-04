@@ -71,7 +71,13 @@ export interface WidgetConnectionOptions {
 	auth: string;
 	/** Notified whenever the connection state changes. `detail` carries the error/disconnect reason. */
 	onStateChange?: (state: ConnectionState, detail?: string) => void;
-	/** Notified with live pipeline status ('thinking') lines while a question is processed. */
+	/**
+	 * Notified with live pipeline status ('thinking') lines while a question is
+	 * processed. Used only for {@link WidgetConnection.ask} calls that pass no
+	 * per-request status callback: status belongs to one request, and a caller
+	 * with more than one in flight has to receive it per request to know whose
+	 * it is.
+	 */
 	onStatus?: (text: string) => void;
 	/** Client factory override for headless unit tests. Defaults to the real SDK client. */
 	createClient?: ChatClientFactory;
@@ -296,10 +302,17 @@ export class WidgetConnection {
 	 * @param text - The user's question
 	 * @param history - Prior conversation turns for context; only the last
 	 *   {@link HISTORY_LIMIT} are sent (UI-only entries must be pre-filtered)
+	 * @param onStatus - Receives the live status ('thinking') lines of THIS
+	 *   request. Status is a property of a request, not of the connection: a
+	 *   caller that abandons an `ask()` (through `disconnect()`, or by clearing
+	 *   the transcript it belonged to) can start the next one on the same
+	 *   connection while the old SDK `chat()` is still streaming, and only a
+	 *   per-request callback lets it tell the two apart. Falls back to the
+	 *   connection-level {@link WidgetConnectionOptions.onStatus} when omitted.
 	 * @returns Answer texts extracted from the pipeline result
 	 * @throws Error when the connection has not been opened or the pipeline fails
 	 */
-	async ask(text: string, history: ChatHistoryItem[] = []): Promise<string[]> {
+	async ask(text: string, history: ChatHistoryItem[] = [], onStatus?: (text: string) => void): Promise<string[]> {
 		const client = this._client;
 		if (!client) {
 			throw new Error('Not connected to RocketRide — call connect() first.');
@@ -311,6 +324,10 @@ export class WidgetConnection {
 			question.addHistory({ role: item.role, content: item.content });
 		}
 
+		// Bind this request's status sink once, so every line the SDK streams is
+		// attributable to the ask() that produced it.
+		const forwardStatus = onStatus ?? this._options.onStatus;
+
 		const chat = client.chat({
 			// The pipeline is addressed with the same public auth key.
 			token: this._options.auth,
@@ -318,7 +335,7 @@ export class WidgetConnection {
 			onSSE: async (_type: string, data: Record<string, unknown>) => {
 				const message = data.message;
 				if (typeof message === 'string' && message) {
-					this._options.onStatus?.(message);
+					forwardStatus?.(message);
 				}
 			},
 		});

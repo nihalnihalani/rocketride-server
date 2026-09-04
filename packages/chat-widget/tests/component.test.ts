@@ -100,9 +100,13 @@ class FakeClient {
 		await flush();
 	}
 
-	/** Emits a live status ('thinking') line through the pending chat's onSSE. */
-	async emitStatus(text: string): Promise<void> {
-		const call = this.chatCalls[this.chatCalls.length - 1];
+	/**
+	 * Emits a live status ('thinking') line through the onSSE of the chat call
+	 * at `index` (default: the most recent). An earlier index emulates a request
+	 * that is still streaming after the user moved on from it.
+	 */
+	async emitStatus(text: string, index = this.chatCalls.length - 1): Promise<void> {
+		const call = this.chatCalls[index];
 		await call?.onSSE?.('status', { message: text });
 		await flush(1);
 	}
@@ -521,6 +525,52 @@ describe('conversation invalidation', () => {
 		await next.resolveChat(['fresh answer']);
 		expect(getMessages(mounted.shadow, 'assistant')[0].textContent).toContain('fresh answer');
 		expect(mounted.el.busy).toBe(false);
+	});
+
+	it('ignores a status line emitted by a request the user has already cleared', async () => {
+		const mounted = await createChat();
+		await typeAndSubmit(mounted, 'first question');
+
+		// clear() frees the composer while the first request is still in flight,
+		// so the second question starts on the same connection with the first
+		// still streaming underneath it.
+		mounted.el.clear();
+		await typeAndSubmit(mounted, 'second question');
+		expect(mounted.client.chatCalls).toHaveLength(2);
+
+		const thinking = mounted.shadow.querySelector('.rr-thinking-text') as HTMLElement;
+		const beforeStaleStatus = thinking.textContent;
+
+		// The abandoned request's status belongs to a transcript that no longer
+		// exists; it must not overwrite the indicator of the live question.
+		await mounted.client.emitStatus('Still crunching the cleared question…', 0);
+		expect(thinking.textContent).toBe(beforeStaleStatus);
+		expect(thinking.textContent).not.toContain('cleared question');
+
+		// The live request's own status still gets through.
+		await mounted.client.emitStatus('Searching the index…');
+		expect(thinking.textContent).toBe('Searching the index…');
+	});
+
+	it('ignores a status line from a request whose engine identity was replaced', async () => {
+		const mounted = await createChat();
+		await typeAndSubmit(mounted, 'question for the old engine');
+		const stale = mounted.client;
+
+		const next = new FakeClient();
+		mounted.el.clientFactory = next.factory;
+		mounted.el.setAttribute('auth', 'OTHER-PUBLIC-AUTH-KEY');
+		await flush();
+
+		await typeAndSubmit(mounted, 'question for the new engine');
+		const thinking = mounted.shadow.querySelector('.rr-thinking-text') as HTMLElement;
+		const beforeStaleStatus = thinking.textContent;
+
+		await stale.emitStatus('Status from the old engine…', 0);
+		expect(thinking.textContent).toBe(beforeStaleStatus);
+
+		await next.emitStatus('Status from the new engine…');
+		expect(thinking.textContent).toBe('Status from the new engine…');
 	});
 
 	it('ignores a failure that settles after the conversation was replaced', async () => {

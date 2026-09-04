@@ -341,12 +341,6 @@ export class RocketRideChatElement extends BaseElement {
 				}
 				this._applyConnectionState(state, detail);
 			},
-			onStatus: (text) => {
-				if (this._connection !== connection) {
-					return;
-				}
-				this._setThinkingText(text);
-			},
 		});
 		this._connection = connection;
 
@@ -440,7 +434,15 @@ export class RocketRideChatElement extends BaseElement {
 		this._setBusy(true);
 
 		try {
-			const answers = await connection.ask(trimmed, history);
+			// Status is bound to this request. A cleared or replaced request keeps
+			// streaming on the same connection until the SDK settles it, and a
+			// connection-level status line carries nothing to tell it apart from
+			// the question the user is actually waiting on.
+			const answers = await connection.ask(trimmed, history, (status) => {
+				if (this._isCurrentConversation(generation, connection)) {
+					this._setThinkingText(status);
+				}
+			});
 			if (!this._isCurrentConversation(generation, connection)) {
 				return; // late reply for a cleared transcript or a replaced engine/auth
 			}
