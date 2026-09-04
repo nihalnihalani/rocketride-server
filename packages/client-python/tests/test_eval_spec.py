@@ -164,6 +164,16 @@ class TestLoadSpecFileErrors:
         with pytest.raises(EvalSpecError, match='Invalid JSON'):
             load_spec(str(path))
 
+    def test_non_utf8_file_raises_spec_error(self, tmp_path):
+        """A cp1252-encoded spec must surface as EvalSpecError (CLI exit 2)."""
+        path = tmp_path / 'latin.eval.json'
+        document = minimal_spec()
+        document['cases'][0]['input'] = 'café naïve'
+        path.write_bytes(json.dumps(document, ensure_ascii=False).encode('cp1252'))
+
+        with pytest.raises(EvalSpecError, match='not valid UTF-8'):
+            load_spec(str(path))
+
     def test_top_level_not_object(self, tmp_path):
         path = tmp_path / 'array.eval.json'
         path.write_text('[1, 2, 3]', encoding='utf-8')

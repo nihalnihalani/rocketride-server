@@ -39,6 +39,11 @@ Execution model:
     - Judge pipelines are themselves ``.pipe`` runs on the same engine; their
       task tokens are cached per judge path for the duration of the spec run
       and terminated together with the main pipeline.
+    - Each judge round-trip is bounded by ``judge_timeout`` (default
+      ``DEFAULT_JUDGE_TIMEOUT_S``): the judge blocks a worker thread that
+      cannot be cancelled, so an unbounded wait would hang the run and skip
+      teardown. On expiry the judge call is cancelled and the case is
+      recorded as errored.
 
 Components:
     run_spec: Run one EvalSpec against a connected client, returning an EvalReport
@@ -46,6 +51,7 @@ Components:
 """
 
 import asyncio
+import concurrent.futures
 import json
 import time
 from importlib import resources
@@ -58,6 +64,14 @@ from .spec import EvalCase, EvalSpec
 
 if TYPE_CHECKING:
     from ..client import RocketRideClient
+
+#: Default upper bound (seconds) on a single judge pipeline round-trip.
+#:
+#: A judge run blocks a worker thread inside ``asyncio.to_thread``, which is
+#: not cancellable, so an unbounded wait would hang the whole run and skip
+#: pipeline teardown. Five minutes is well above any realistic LLM-judge
+#: latency while still guaranteeing the run finishes.
+DEFAULT_JUDGE_TIMEOUT_S = 300.0
 
 
 def default_judge_pipeline_path() -> str:
@@ -237,6 +251,7 @@ async def run_spec(
     case_filter: str | None = None,
     fail_fast: bool = False,
     judge_factory: Callable[[Callable[[str, str], str], str], Callable[..., Any]] | None = None,
+    judge_timeout: float | None = DEFAULT_JUDGE_TIMEOUT_S,
 ) -> EvalReport:
     """
     Run all (filtered) cases of an eval spec and return an EvalReport.
@@ -258,6 +273,12 @@ async def run_spec(
             ``judge_factory(run_pipeline, default_judge_pipeline)`` where
             ``run_pipeline(pipeline_path, prompt) -> str`` executes a judge
             pipeline on the same engine; None disables LLM-judge support
+        judge_timeout: Upper bound in seconds on a single judge pipeline
+            round-trip (default ``DEFAULT_JUDGE_TIMEOUT_S``). On expiry the
+            judge call is cancelled and raises ``TimeoutError``, which is
+            recorded against the case so teardown still runs. Pass None to
+            wait indefinitely (not recommended: the judge blocks a
+            non-cancellable worker thread).
 
     Returns:
         EvalReport: Per-case results plus the total wall-clock duration
@@ -300,9 +321,19 @@ async def run_spec(
         Must only be called off the event-loop thread (assertion evaluation
         runs inside ``asyncio.to_thread``); it blocks on a coroutine that is
         scheduled onto the main event loop.
+
+        The wait is bounded by ``judge_timeout``: the worker thread this runs
+        on cannot be cancelled, so an unbounded wait on a stalled judge would
+        hang the run and skip pipeline teardown. On expiry the scheduled judge
+        coroutine is cancelled and a ``TimeoutError`` is raised, which the
+        caller records as an assertion/case error and teardown proceeds.
         """
         future = asyncio.run_coroutine_threadsafe(_judge_chat(pipeline_path, prompt), loop)
-        return future.result()
+        try:
+            return future.result(timeout=judge_timeout)
+        except concurrent.futures.TimeoutError as err:
+            future.cancel()
+            raise TimeoutError(f'judge pipeline {pipeline_path!r} did not answer within {judge_timeout}s') from err
 
     case_results: list[CaseResult] = []
     try:

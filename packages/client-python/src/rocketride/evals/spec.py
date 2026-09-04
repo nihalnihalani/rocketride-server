@@ -455,6 +455,11 @@ def load_spec(path: str) -> EvalSpec:
             data = json.load(handle)
     except json.JSONDecodeError as err:
         raise EvalSpecError(f'Invalid JSON in {path}: {err}') from err
+    except UnicodeDecodeError as err:
+        # A spec saved in a non-UTF-8 encoding must still surface as a spec
+        # error (CLI exit 2), not as an unexpected error (exit 1, which the
+        # documented contract reserves for "at least one case failed").
+        raise EvalSpecError(f'{path} is not valid UTF-8: {err}') from err
     except OSError as err:
         raise EvalSpecError(f'Cannot read {path}: {err}') from err
 

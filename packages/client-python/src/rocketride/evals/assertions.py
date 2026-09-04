@@ -314,7 +314,11 @@ def _evaluate_json_path(spec: 'AssertionSpec', output_text: str) -> AssertionRes
     checks: list[str] = []
     if 'equals' in spec.params:
         expected = spec.params['equals']
-        if node != expected:
+        # Python treats True == 1 and False == 0, so a bare `!=` would let a
+        # JSON boolean satisfy `equals: 1` (and a JSON number satisfy
+        # `equals: true`). Require the bool-ness of both sides to match first,
+        # as the gte/lte branch below already does for its numeric operand.
+        if isinstance(node, bool) != isinstance(expected, bool) or node != expected:
             return AssertionResult(
                 spec=spec,
                 passed=False,

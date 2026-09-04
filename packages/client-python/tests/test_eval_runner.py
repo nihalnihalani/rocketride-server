@@ -30,6 +30,7 @@ when evaluation raises), judge factory wiring, and the per-case judge
 pipeline override.
 """
 
+import asyncio
 from typing import Any
 
 import pytest
@@ -413,3 +414,52 @@ class TestRunSpecJudgeWiring:
         use_paths = [payload['filepath'] for kind, payload in fake.calls if kind == 'use']
         assert use_paths == ['/abs/chat.pipe', '/abs/judge.pipe']
         assert sorted(fake.terminated_tokens()) == ['task-1', 'task-2']
+
+    async def test_stalled_judge_times_out_and_pipelines_are_torn_down(self, monkeypatch):
+        """A judge that never answers must not hang the run or skip teardown."""
+
+        class StallingJudgeClient(FakeClient):
+            """Answers the case chat, then hangs forever on the judge chat."""
+
+            async def chat(self, *, token, question, on_sse=None):
+                self.calls.append(('chat', {'token': token, 'question': question.questions[0].text}))
+                if token == 'task-2':
+                    await asyncio.Event().wait()  # never set: simulates a stalled judge
+                return {'answers': ['main answer']}
+
+        captured = {}
+
+        def fake_factory(run_pipeline, default_judge_pipeline):
+            captured['run_pipeline'] = run_pipeline
+            return lambda **kwargs: None
+
+        def judging_evaluate(assertion, *, output_text, duration_ms, case_input, judge):
+            return AssertionResult(
+                spec=assertion,
+                passed=True,
+                detail=captured['run_pipeline']('/abs/judge.pipe', 'score this output'),
+            )
+
+        monkeypatch.setattr(runner_module, 'evaluate_assertion', judging_evaluate)
+        fake = StallingJudgeClient()
+
+        report = await runner_module.run_spec(
+            fake,
+            make_spec([make_case()]),
+            case_filter=None,
+            fail_fast=False,
+            judge_factory=fake_factory,
+            judge_timeout=0.05,
+        )
+
+        # The stalled judge is recorded as a case error rather than hanging
+        assert report.case_results[0].passed is False
+        assert '/abs/judge.pipe' in report.case_results[0].error
+        assert '0.05s' in report.case_results[0].error
+        # ...and both pipelines were still terminated
+        assert sorted(fake.terminated_tokens()) == ['task-1', 'task-2']
+
+    async def test_default_judge_timeout_is_finite(self):
+        """The default must be a bound, not None: an unbounded wait can hang the run."""
+        assert isinstance(runner_module.DEFAULT_JUDGE_TIMEOUT_S, float)
+        assert runner_module.DEFAULT_JUDGE_TIMEOUT_S > 0
