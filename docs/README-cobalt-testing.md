@@ -4,15 +4,27 @@
 
 [Cobalt](https://github.com/basalt-ai/cobalt-python) (basalt-ai-cobalt) is a unit testing framework for AI agents and LLM-powered systems. It runs experiments by loading datasets, executing each item through your AI system, evaluating outputs against quality criteria, and reporting scores.
 
-RocketRide uses Cobalt to validate the quality of its AI pipeline outputs -- LLM responses, RAG answers, and reranking results -- in an automated, reproducible way.
+This page covers the scoring code Cobalt contributes to RocketRide: the
+`eval_cobalt` node's evaluators, and the offline pytest suites under
+`nodes/test/cobalt/`.
+
+**Scope, up front.** The suites in `nodes/test/cobalt/experiments/` score
+**simulated** pipeline outputs -- the responses come from the
+`mock_rocketride_client` fixture in `conftest.py`, not from a running server or
+a live model. They pin the behaviour of the evaluators and of the thresholds
+the evaluators are asserted against; they do **not** measure the quality of a
+real pipeline run. Scoring real runs, and gating CI on the result, is what the
+`rocketride eval` golden-dataset runner (PR #1581) is for; this PR is the
+in-pipeline counterpart that scores answers as they flow through a live
+pipeline via the `eval_cobalt` node.
 
 ## Why RocketRide Uses Cobalt
 
 RocketRide's pipeline nodes handle LLM calls, vector database queries, embedding generation, reranking, and more. Traditional unit tests verify that code runs without errors, but they cannot assess whether an LLM pipeline produces _good_ outputs. Cobalt fills this gap by providing:
 
 - **Quality scoring** -- Measure relevance, grounding, and formatting of pipeline outputs
-- **Threshold enforcement** -- Fail CI if average quality drops below configured thresholds
-- **Regression detection** -- Track quality over time to catch degradation early
+- **Threshold assertions** -- Each offline suite asserts against a threshold it hard-codes, so a change that degrades an evaluator fails the suite
+- **Regression detection** -- Pin evaluator behaviour so scoring changes surface as test failures
 - **Custom evaluators** -- Domain-specific scoring functions that are deterministic and offline
 
 ## Directory Structure
@@ -132,9 +144,13 @@ The `conftest.py` provides shared fixtures:
 
 ## CI Integration
 
-### Add to CI Pipeline
+No workflow in this repository runs these suites as a quality gate today, and
+this PR does not add one: gating CI on the quality of a real pipeline run needs
+a runner that executes the pipeline, which is PR #1581 (`rocketride eval`). The
+suites here run as ordinary pytest tests alongside the rest of `nodes/test/`,
+and fail like any other test when an evaluator regresses.
 
-Add a step to your CI workflow that runs Cobalt experiments:
+If you do want them as a separate step in your own workflow:
 
 ```yaml
 - name: Run Cobalt experiments
@@ -158,7 +174,7 @@ Nothing in this repository reads that file. The offline pytest gates under
 `nodes/test/cobalt/experiments/` hard-code the thresholds they assert on, so
 editing `cobalt.toml` does not change what `pytest` enforces -- the two must be
 kept in sync by hand. A pytest assertion that falls below its own threshold
-fails the CI step above.
+fails that test -- against a simulated response, not a real pipeline run.
 
 ## Evaluator Reference
 
