@@ -56,9 +56,11 @@ class IInstance(IInstanceBase):
         # ---- Extract components from the Question ----
         system_prompt = question.role or ''
 
-        # Gather all question texts into a single query string
-        query_texts = [q.text for q in (question.questions or []) if q.text]
-        query_str = ' '.join(query_texts)
+        # Gather every question text.  ``entry_texts`` stays index-aligned with
+        # ``question.questions`` so each entry can be rewritten in place below;
+        # ``query_str`` is the merged view the optimizer budgets against.
+        entry_texts = [(q.text or '') for q in (question.questions or [])]
+        query_str = ' '.join(text for text in entry_texts if text)
 
         # Convert documents to optimizer format, preserving all fields (e.g. score)
         docs = []
@@ -88,18 +90,34 @@ class IInstance(IInstanceBase):
         # Update role / system prompt
         question.role = result['system_prompt'] or ''
 
-        # Update questions -- replace text with optimized version
+        # Update questions -- rewrite each entry's text in place.
+        #
+        # Every QuestionText entry is preserved: downstream embedding nodes
+        # embed each entry and the document stores read per-entry embedding
+        # metadata, so collapsing the list here would silently drop both.  A
+        # single entry takes the optimizer's merged result directly; several
+        # entries share the query budget, each keeping a slice proportional to
+        # its own size (see ``ContextOptimizer.truncate_each_to_budget``).
         if question.questions:
-            # Keep the first question's embedding info but update text
-            question.questions[0].text = result['question'] or ''
-            # Remove any extra questions that were merged.  Surface a warning
-            # so pipeline authors notice when multi-question input is being
-            # collapsed into a single forwarded question (the merge happens in
-            # ``query_str`` above; everything after question[0] is discarded).
-            if len(question.questions) > 1:
-                dropped = len(question.questions) - 1
-                warning(f'context_optimizer: dropped {dropped} additional question(s); only the first is forwarded')
-                question.questions = [question.questions[0]]
+            if len(question.questions) == 1:
+                question.questions[0].text = result['question'] or ''
+            elif result['question'] != query_str:
+                # The merged query was truncated, so the entries have to be
+                # trimmed to the same shared allowance.
+                meta = result.get('metadata') or {}
+                budget = (meta.get('budget') or {}).get('query')
+                if not isinstance(budget, int) or isinstance(budget, bool):
+                    # Older/foreign result shapes: fall back to the size the
+                    # optimizer actually produced for the merged query.
+                    budget = optimizer.count_tokens(result['question'] or '', meta.get('encoding'))
+                trimmed = optimizer.truncate_each_to_budget(entry_texts, budget, meta.get('encoding'))
+                debug(
+                    f'context_optimizer: query truncated; {len(question.questions)} question entries '
+                    f'share a {budget}-token budget'
+                )
+                for entry, text in zip(question.questions, trimmed):
+                    entry.text = text
+            # else: nothing was truncated -- every entry keeps its text as-is.
         elif result['question']:
             debug(
                 f'context_optimizer: optimized question text produced but question.questions is empty, discarding: {result["question"][:200]}'
