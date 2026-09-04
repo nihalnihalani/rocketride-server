@@ -53,6 +53,9 @@ import { ChatClientFactory, ChatClientLike, ChatHistoryItem, ConnectionState } f
 /** Maximum number of prior messages replayed to the pipeline for context (mirrors apps/chat-ui). */
 export const HISTORY_LIMIT = 6;
 
+/** Rejection message handed to an {@link WidgetConnection.ask} that {@link WidgetConnection.disconnect} closed the transport under. */
+export const ASK_ABANDONED_MESSAGE = 'The connection was closed before the pipeline answered — please try again.';
+
 /** Options for {@link WidgetConnection}. */
 export interface WidgetConnectionOptions {
 	/**
@@ -189,6 +192,14 @@ export class WidgetConnection {
 	private _client: ChatClientLike | null = null;
 	private _state: ConnectionState = 'idle';
 	private _manualDisconnect = false;
+	/**
+	 * Rejectors for every {@link ask} still awaiting an answer. `disconnect()`
+	 * closes the socket underneath the SDK's `chat()` promise, which may then
+	 * never settle; rejecting through these gives the caller a definite outcome
+	 * instead of stranding it — and, in the widget, a composer that would stay
+	 * disabled behind a request that can no longer arrive.
+	 */
+	private readonly _pendingAsks = new Set<(error: Error) => void>();
 
 	/** Stores the connection options; no client is created until `connect()` is called. */
 	constructor(options: WidgetConnectionOptions) {
@@ -258,9 +269,13 @@ export class WidgetConnection {
 		await this._client.connect();
 	}
 
-	/** Closes the connection and disables automatic reconnection. */
+	/** Closes the connection, abandons anything still in flight on it, and disables automatic reconnection. */
 	async disconnect(): Promise<void> {
 		this._manualDisconnect = true;
+		// Settle in-flight asks first, and synchronously: a caller that tears
+		// this connection down may rely on no request still being pending on it
+		// by the time `disconnect()` returns its promise.
+		this._abandonPendingAsks();
 		const client = this._client;
 		this._client = null;
 		if (client) {
@@ -285,7 +300,8 @@ export class WidgetConnection {
 	 * @throws Error when the connection has not been opened or the pipeline fails
 	 */
 	async ask(text: string, history: ChatHistoryItem[] = []): Promise<string[]> {
-		if (!this._client) {
+		const client = this._client;
+		if (!client) {
 			throw new Error('Not connected to RocketRide — call connect() first.');
 		}
 
@@ -295,7 +311,7 @@ export class WidgetConnection {
 			question.addHistory({ role: item.role, content: item.content });
 		}
 
-		const result = await this._client.chat({
+		const chat = client.chat({
 			// The pipeline is addressed with the same public auth key.
 			token: this._options.auth,
 			question,
@@ -307,7 +323,36 @@ export class WidgetConnection {
 			},
 		});
 
-		return extractAnswerTexts(result);
+		// Race the SDK call against an abandon signal so a `disconnect()` under
+		// it (element removed, engine/auth swap, Retry) always settles this
+		// promise instead of leaving the caller waiting on a dead socket.
+		let abandon!: (error: Error) => void;
+		const abandoned = new Promise<never>((_resolve, reject) => {
+			abandon = reject;
+		});
+		this._pendingAsks.add(abandon);
+
+		try {
+			return extractAnswerTexts(await Promise.race([chat, abandoned]));
+		} finally {
+			this._pendingAsks.delete(abandon);
+		}
+	}
+
+	/**
+	 * Rejects every in-flight {@link ask} with {@link ASK_ABANDONED_MESSAGE}.
+	 * The underlying SDK call is left to settle (or not) on its own; its result
+	 * is discarded by the {@link Promise.race} in `ask()`.
+	 */
+	private _abandonPendingAsks(): void {
+		if (this._pendingAsks.size === 0) {
+			return;
+		}
+		const pending = Array.from(this._pendingAsks);
+		this._pendingAsks.clear();
+		for (const abandon of pending) {
+			abandon(new Error(ASK_ABANDONED_MESSAGE));
+		}
 	}
 
 	/** Records the new state and notifies the `onStateChange` callback. */

@@ -235,7 +235,14 @@ export class RocketRideChatElement extends BaseElement {
 		await this._send(text);
 	}
 
-	/** Clears the transcript back to the welcome message (if configured). */
+	/**
+	 * Clears the transcript back to the welcome message (if configured).
+	 *
+	 * Also ends any pending-reply state: the request in flight now belongs to a
+	 * conversation that no longer exists, so the user must be able to type the
+	 * next question immediately rather than wait for an answer that will be
+	 * discarded on arrival.
+	 */
 	clear(): void {
 		// Invalidate any in-flight ask(): its answer belongs to the transcript
 		// being discarded here, not to the one the user sees next.
@@ -245,6 +252,13 @@ export class RocketRideChatElement extends BaseElement {
 			el.remove();
 		}
 		this._showWelcome();
+		if (this._busy) {
+			// Release the composer now; the abandoned request cannot do it,
+			// because its cleanup no longer owns the visible conversation (and
+			// an SDK chat() that never settles would never run it at all).
+			this._setBusy(false);
+			this._inputEl.focus();
+		}
 	}
 
 	// ============================================================================
@@ -345,7 +359,15 @@ export class RocketRideChatElement extends BaseElement {
 		});
 	}
 
-	/** Drops the current connection (best-effort disconnect) and returns the header to the idle state. */
+	/**
+	 * Drops the current connection (best-effort disconnect) and returns the
+	 * header to the idle state.
+	 *
+	 * `disconnect()` abandons every `ask()` still in flight on that connection,
+	 * so the engine-url/auth swap cannot leave the widget waiting on a socket
+	 * it has already closed; the composer is released here for the same reason
+	 * `clear()` releases it.
+	 */
 	private _teardownConnection(): void {
 		const connection = this._connection;
 		this._connection = null;
@@ -353,6 +375,9 @@ export class RocketRideChatElement extends BaseElement {
 			void connection.disconnect().catch(() => {
 				/* already tearing down */
 			});
+		}
+		if (this._busy) {
+			this._setBusy(false);
 		}
 		this._applyConnectionState('idle');
 	}
@@ -431,10 +456,15 @@ export class RocketRideChatElement extends BaseElement {
 			this._appendMessage({ role: 'system', text: message, transient: true });
 			this._dispatchError({ message, source: 'chat' });
 		} finally {
-			// Runs on every path, including the invalidated ones above, so the
-			// composer is never left disabled behind an abandoned request.
-			this._setBusy(false);
-			this._inputEl.focus();
+			// Only the send that still owns the visible conversation may release
+			// the composer. An invalidated one must not: clear() and
+			// _teardownConnection() already released it, and a newer question may
+			// be in flight by now — clearing busy under it would re-enable the
+			// composer mid-request and drop the thinking indicator.
+			if (this._isCurrentConversation(generation, connection)) {
+				this._setBusy(false);
+				this._inputEl.focus();
+			}
 		}
 	}
 

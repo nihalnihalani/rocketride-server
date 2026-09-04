@@ -32,7 +32,7 @@
  */
 
 import { PIPELINE_RESULT, Question, QuestionType, RocketRideClientConfig } from 'rocketride';
-import { HISTORY_LIMIT, WidgetConnection, assertSecureEngineUrl, extractAnswerTexts } from '../src/connection';
+import { ASK_ABANDONED_MESSAGE, HISTORY_LIMIT, WidgetConnection, assertSecureEngineUrl, extractAnswerTexts } from '../src/connection';
 import { ChatClientLike, ChatHistoryItem, ConnectionState } from '../src/types';
 
 /** Options captured from a chat() call. */
@@ -210,6 +210,37 @@ describe('WidgetConnection — ask()', () => {
 	it('fails when the connection was never opened', async () => {
 		const { connection } = makeConnection();
 		await expect(connection.ask('hello')).rejects.toThrow(/connect\(\) first/);
+	});
+});
+
+describe('WidgetConnection — abandoning in-flight asks', () => {
+	it('rejects a pending ask() when disconnect() closes the transport under it', async () => {
+		// Holder (not a bare `let`): TypeScript does not track an assignment made
+		// inside the executor callback below.
+		const pendingChat: { settle?: (result: PIPELINE_RESULT) => void } = {};
+		const connection = new WidgetConnection({
+			engineUrl: 'http://localhost:5565',
+			auth: 'PUBLIC-AUTH-KEY-PLACEHOLDER',
+			createClient: (config) => {
+				const client = new FakeClient(config);
+				// A chat() that never settles by itself: the real SDK promise is
+				// bound to the socket disconnect() is about to close.
+				client.chat = () =>
+					new Promise<PIPELINE_RESULT>((resolve) => {
+						pendingChat.settle = resolve;
+					});
+				return client;
+			},
+		});
+
+		await connection.connect();
+		const pending = connection.ask('never answered');
+
+		await connection.disconnect();
+		await expect(pending).rejects.toThrow(ASK_ABANDONED_MESSAGE);
+
+		// A late settlement of the underlying SDK call is discarded silently.
+		pendingChat.settle?.({ name: '', path: '', objectId: '' });
 	});
 });
 

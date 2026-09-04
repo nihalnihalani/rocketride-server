@@ -471,6 +471,58 @@ describe('conversation invalidation', () => {
 		expect(getInput(mounted.shadow).disabled).toBe(false);
 	});
 
+	it('frees the composer when clear() lands during a pending request', async () => {
+		const mounted = await createChat();
+		await typeAndSubmit(mounted, 'first question');
+		expect(mounted.el.busy).toBe(true);
+		expect(getInput(mounted.shadow).disabled).toBe(true);
+
+		// The first request is still in flight here. clear() has to release the
+		// composer straight away instead of waiting for an answer it will drop
+		// on arrival — an SDK chat() that never settles would never release it.
+		mounted.el.clear();
+		expect(mounted.el.busy).toBe(false);
+		expect(getInput(mounted.shadow).disabled).toBe(false);
+		expect(getSend(mounted.shadow).disabled).toBe(false);
+		expect(isThinking(mounted.shadow)).toBe(false);
+
+		// The composer accepts a new message before the old request settles.
+		await typeAndSubmit(mounted, 'second question');
+		expect(mounted.client.chatCalls).toHaveLength(2);
+		expect(mounted.el.busy).toBe(true);
+
+		await mounted.client.resolveChat(['second answer']);
+		const assistant = getMessages(mounted.shadow, 'assistant');
+		expect(assistant).toHaveLength(1);
+		expect(assistant[0].textContent).toContain('second answer');
+		expect(mounted.el.busy).toBe(false);
+	});
+
+	it('frees the composer when an identity swap abandons a pending request', async () => {
+		const mounted = await createChat();
+		await typeAndSubmit(mounted, 'question for the old engine');
+		expect(mounted.el.busy).toBe(true);
+
+		// An auth swap runs clear() and then tears the connection down, which
+		// abandons the pending ask(): nothing is left waiting on the closed
+		// socket, so the composer cannot stay stuck behind it.
+		const next = new FakeClient();
+		mounted.el.clientFactory = next.factory;
+		mounted.el.setAttribute('auth', 'OTHER-PUBLIC-AUTH-KEY');
+		await flush();
+
+		expect(mounted.el.busy).toBe(false);
+		expect(getInput(mounted.shadow).disabled).toBe(false);
+		// The abandoned request left neither a bubble nor an error notice.
+		expect(getMessages(mounted.shadow)).toHaveLength(0);
+
+		await typeAndSubmit(mounted, 'question for the new engine');
+		expect(next.chatCalls).toHaveLength(1);
+		await next.resolveChat(['fresh answer']);
+		expect(getMessages(mounted.shadow, 'assistant')[0].textContent).toContain('fresh answer');
+		expect(mounted.el.busy).toBe(false);
+	});
+
 	it('ignores a failure that settles after the conversation was replaced', async () => {
 		const mounted = await createChat();
 		const errors: string[] = [];
