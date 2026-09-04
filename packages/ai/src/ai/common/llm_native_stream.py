@@ -15,6 +15,7 @@ the generic stream.
 from __future__ import annotations
 
 import contextvars
+import re
 from typing import Any, Callable, Dict, List, Optional
 
 from rocketlib import debug, warning
@@ -56,14 +57,78 @@ def gate_model_name(model: str) -> str:
     return m
 
 
+# Models still on the legacy ``{'type': 'enabled', 'budget_tokens': N}`` shape.
+# Claude 4.7+ (including the whole Claude 5 family) rejects that shape with an
+# HTTP 400 ("thinking.type.enabled is not supported for this model") and only
+# accepts ``{'type': 'adaptive'}``. This is an explicit allowlist so unknown and
+# future model names default to the current adaptive shape instead of the
+# removed one — new enum entries must opt IN to legacy, not out of it.
+#
+# Matching is on the WHOLE id after deployment/date suffixes are stripped, never
+# on an open-ended prefix: a prefix rule such as ``claude-sonnet-4-5`` would also
+# swallow a future ``claude-sonnet-4-50`` and hand it the removed shape.
+_ANTHROPIC_LEGACY_THINKING_MODELS = frozenset(
+    {
+        'claude-opus-4',
+        'claude-opus-4-0',
+        'claude-opus-4-1',
+        'claude-opus-4-5',
+        'claude-opus-4-6',
+        'claude-sonnet-4',
+        'claude-sonnet-4-0',
+        'claude-sonnet-4-5',
+        'claude-sonnet-4-6',
+        # Haiku 4.5 does support extended thinking, but only the legacy shape.
+        # ``claude-haiku-latest`` resolves to it, so the alias belongs here too;
+        # move it out only when the newest Haiku accepts adaptive.
+        'claude-haiku-4-5',
+        'claude-haiku-latest',
+        'claude-mythos-preview',
+    }
+)
+
+# ``-YYYYMMDD`` dated ids (claude-opus-4-5-20251101) and ``-fast`` deployment
+# variants are the same model as their base id for thinking purposes.
+_ANTHROPIC_DATED_ID_RE = re.compile(r'-\d{8}$')
+_ANTHROPIC_DEPLOYMENT_SUFFIXES = ('-fast',)
+
+
+def _anthropic_base_model_id(model_gate: str) -> str:
+    """Strip dated (``-YYYYMMDD``) and deployment (``-fast``) suffixes from a model id.
+
+    Strips repeatedly so the two compose in either order: both
+    ``claude-opus-4-6-20251101-fast`` and ``claude-opus-4-6-fast-20251101``
+    reduce to ``claude-opus-4-6``. Each pass strictly shortens the id, so the
+    loop terminates.
+    """
+    base = model_gate
+    while True:
+        stripped = _ANTHROPIC_DATED_ID_RE.sub('', base)
+        for suffix in _ANTHROPIC_DEPLOYMENT_SUFFIXES:
+            if stripped.endswith(suffix):
+                stripped = stripped[: -len(suffix)]
+                break
+        if stripped == base:
+            return base
+        base = stripped
+
+
+def _anthropic_uses_legacy_thinking(model_gate: str) -> bool:
+    """True when the model still takes ``{'type': 'enabled', 'budget_tokens': N}``."""
+    base = _anthropic_base_model_id(model_gate)
+    if base in _ANTHROPIC_LEGACY_THINKING_MODELS:
+        return True
+    # Every Claude 3.x model predates adaptive thinking. The trailing hyphen keeps
+    # this a whole-segment match, so a hypothetical ``claude-30-...`` is excluded.
+    return base.startswith('claude-3-')
+
+
 def build_anthropic_thinking_kwargs(model_gate: str, model_output_tokens: int) -> Dict[str, Any]:
     """Return ``ChatAnthropic`` thinking kwargs by model name, or ``{}`` if unsupported."""
     if model_gate.startswith('claude-3') and 'haiku' in model_gate:
         return {}  # Only legacy Claude 3/3.5 Haiku lack extended thinking; 4.5+ supports it.
     out: Dict[str, Any] = {}
-    if model_gate.startswith('claude-opus-4-7') or model_gate.startswith('claude-opus-4-8'):
-        out['thinking'] = {'type': 'adaptive', 'display': 'summarized'}
-    else:
+    if _anthropic_uses_legacy_thinking(model_gate):
         budget = max(2048, model_output_tokens // 2)
         if budget >= model_output_tokens:
             budget = model_output_tokens - 1024
@@ -71,6 +136,10 @@ def build_anthropic_thinking_kwargs(model_gate: str, model_output_tokens: int) -
             return {}  # output window too small for a valid thinking budget
         out['betas'] = ['interleaved-thinking-2025-05-14']
         out['thinking'] = {'type': 'enabled', 'budget_tokens': budget}
+    else:
+        # Claude 4.7+ and all Claude 5 models (sonnet-5, opus-5, fable-5,
+        # mythos-5): adaptive is the only accepted on-mode.
+        out['thinking'] = {'type': 'adaptive', 'display': 'summarized'}
     return out
 
 
