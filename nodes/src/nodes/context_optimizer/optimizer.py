@@ -619,7 +619,9 @@ class ContextOptimizer:
             encoding: tiktoken encoding name.
 
         Returns:
-            Compressed list of message dicts fitting within budget.
+            Compressed list of message dicts fitting within budget. Empty when
+            *max_tokens* cannot cover even one message's role overhead
+            (``count_tokens(role) + 4``), since any message would overshoot.
         """
         if not messages:
             return []
@@ -630,6 +632,11 @@ class ContextOptimizer:
             # message's total cost stays inside max_tokens, as the docstring says.
             only_role = messages[0].get('role', 'user')
             content_budget = max_tokens - (self.count_tokens(only_role, encoding) + 4)
+            if content_budget < 0:
+                # The role overhead alone already exceeds max_tokens, so even an
+                # empty-content message would overshoot. Returning nothing is the
+                # only way to honour the documented budget.
+                return []
             content = self.truncate_to_budget(messages[0].get('content', ''), content_budget, encoding)
             return [{'role': only_role, 'content': content}]
 
@@ -664,6 +671,10 @@ class ContextOptimizer:
             # ignored the role token(s) and could overshoot the budget.
             first_role = first_msg.get('role', 'user')
             content_budget = max_tokens - (self.count_tokens(first_role, encoding) + 4)
+            if content_budget < 0:
+                # As above: the role overhead alone is already over budget, so no
+                # message can be returned without exceeding max_tokens.
+                return []
             content = self.truncate_to_budget(first_msg.get('content', ''), content_budget, encoding)
             return [{'role': first_role, 'content': content}]
 
