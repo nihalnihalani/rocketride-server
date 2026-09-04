@@ -125,7 +125,8 @@ def _make_json5_stub() -> types.ModuleType:
 # (installed only at engine runtime via depends). Inject a test-local stub when
 # the real lib is missing; this only touches THIS process, so the engine's
 # separate dynamic-test subprocess still uses the real libraries.
-if importlib.util.find_spec('tiktoken') is None:
+_HAS_REAL_TIKTOKEN = importlib.util.find_spec('tiktoken') is not None
+if not _HAS_REAL_TIKTOKEN:
     sys.modules['tiktoken'] = _make_tiktoken_stub()
 
 if importlib.util.find_spec('json5') is None:
@@ -135,7 +136,11 @@ from ai.common.schema import Question  # noqa: E402
 
 from context_optimizer.IGlobal import IGlobal  # noqa: E402
 from context_optimizer.IInstance import IInstance  # noqa: E402
-from context_optimizer.optimizer import DEFAULT_MODEL_LIMIT, ContextOptimizer  # noqa: E402
+from context_optimizer.optimizer import (  # noqa: E402
+    DEFAULT_MODEL_LIMIT,
+    DEFAULT_MODEL_NAME,
+    ContextOptimizer,
+)
 
 
 # ===========================================================================
@@ -1423,3 +1428,135 @@ class TestMultiEntryQuestions:
         with patch('context_optimizer.IInstance.warning') as mock_warning:
             inst.writeQuestions(self._question('One?', 'Two?'))
         assert mock_warning.call_args_list == []
+
+
+class TestScopedIdEncoding:
+    """A provider-scoped id must pick the tokenizer its bare name would pick.
+
+    ``resolve_model_limit`` already falls back to the bare name, so
+    ``openai/gpt-5`` resolves the 400k gpt-5 window. Before this fix
+    ``encoding_name_for_model`` did not strip the provider prefix, so the
+    override table missed, ``tiktoken.encoding_for_model`` raised KeyError and
+    the count silently fell back to cl100k_base -- the gpt-5 window measured
+    with the wrong ruler.
+    """
+
+    @pytest.mark.parametrize(
+        ('scoped', 'bare', 'expected'),
+        [
+            ('openai/gpt-5', 'gpt-5', 'o200k_base'),
+            ('openai/gpt-4o', 'gpt-4o', 'o200k_base'),
+            ('azure/gpt-4o', 'gpt-4o', 'o200k_base'),
+            ('openai/gpt-4-turbo', 'gpt-4-turbo', 'cl100k_base'),
+        ],
+    )
+    def test_scoped_id_matches_its_bare_name(self, default_config, scoped, bare, expected):
+        opt = ContextOptimizer(default_config)
+        assert opt.encoding_name_for_model(scoped) == opt.encoding_name_for_model(bare) == expected
+
+    @pytest.mark.parametrize(
+        ('model', 'expected'),
+        [
+            ('gpt-5', 'o200k_base'),
+            ('gpt-4o', 'o200k_base'),
+            ('gpt-4', 'cl100k_base'),
+            ('gpt-4-turbo', 'cl100k_base'),
+            ('claude-sonnet-4-6', 'cl100k_base'),
+            ('custom', 'cl100k_base'),
+            ('', 'cl100k_base'),
+        ],
+    )
+    def test_unscoped_ids_are_unchanged(self, default_config, model, expected):
+        """The normalization must not move any id that has no provider prefix."""
+        assert ContextOptimizer(default_config).encoding_name_for_model(model) == expected
+
+    def test_unknown_scoped_id_still_falls_back(self, default_config):
+        opt = ContextOptimizer(default_config)
+        assert opt.encoding_name_for_model('vendor/not-a-real-model') == 'cl100k_base'
+
+    def test_scoped_id_limit_and_encoding_agree(self, tmp_path, monkeypatch):
+        """The window and the tokenizer must come from the same model.
+
+        With no llm_* dirs the catalog is empty, so the limit is reached through
+        the MODEL_LIMITS bare-name fallback -- the exact path that used to pair
+        the gpt-5 window with the cl100k_base tokenizer.
+        """
+        monkeypatch.setattr(ContextOptimizer, '_CATALOG_ROOT', tmp_path)
+        monkeypatch.setattr(ContextOptimizer, '_catalog_cache', None)
+        try:
+            scoped = ContextOptimizer({'model_name': 'openai/gpt-5', 'max_context_tokens': 0})
+            bare = ContextOptimizer({'model_name': 'gpt-5', 'max_context_tokens': 0})
+            assert scoped._total_limit == bare._total_limit == ContextOptimizer.MODEL_LIMITS['gpt-5']
+            assert scoped._resolve_encoding_name() == bare._resolve_encoding_name() == 'o200k_base'
+        finally:
+            ContextOptimizer._catalog_cache = None
+
+    @pytest.mark.skipif(
+        not _HAS_REAL_TIKTOKEN,
+        reason='the tiktoken stub splits on whitespace, so no two encodings can disagree',
+    )
+    def test_scoped_id_token_counts_match_the_bare_id(self, default_config):
+        """cl100k_base and o200k_base disagree most on non-ASCII text."""
+        text = (
+            '\u65e5\u672c\u8a9e\u306e\u30c6\u30ad\u30b9\u30c8\u3092\u305f\u304f\u3055\u3093\u66f8\u304d\u307e\u3059\u3002'
+            * 30
+        )
+        scoped = ContextOptimizer({**default_config, 'model_name': 'openai/gpt-5'})
+        bare = ContextOptimizer({**default_config, 'model_name': 'gpt-5'})
+        wrong = ContextOptimizer({**default_config, 'model_name': 'gpt-4'})
+        assert scoped.count_tokens(text) == bare.count_tokens(text)
+        # Guard against a vacuous pass: the two encodings really do differ here.
+        assert wrong.count_tokens(text) != bare.count_tokens(text)
+
+    def test_optimize_override_accepts_a_scoped_id(self, default_config):
+        opt = ContextOptimizer({**default_config, 'model_name': 'gpt-4'})
+        assert opt.optimize(question='Test', model='openai/gpt-5')['metadata']['encoding'] == 'o200k_base'
+
+
+def _model_name_warnings(mock_warning) -> list:
+    """Warnings about model_name validation, ignoring the unknown-model one."""
+    return [c for c in mock_warning.call_args_list if 'model_name is not' in str(c)]
+
+
+class TestModelNameValidation:
+    """``model_name`` is declared a string but nothing coerces one on the way in.
+
+    ``Config.getNodeConfig`` merges the profile defaults into the raw pipeline
+    config without type-checking, so a hand-written ``"model_name": null``
+    reached ``resolve_model_limit`` and raised
+    ``AttributeError: 'NoneType' object has no attribute 'rsplit'`` inside
+    ``beginGlobal``, taking the whole node down.
+    """
+
+    @pytest.mark.parametrize('value', [None, 123, 4.5, True, ['gpt-5'], {'a': 1}, '', '   '])
+    def test_invalid_model_name_falls_back_to_the_default(self, default_config, value):
+        with patch('context_optimizer.optimizer.warning') as mock_warning:
+            opt = ContextOptimizer({**default_config, 'model_name': value})
+        assert opt.model_name == DEFAULT_MODEL_NAME
+        assert opt._total_limit == ContextOptimizer.MODEL_LIMITS[DEFAULT_MODEL_NAME]
+        assert _model_name_warnings(mock_warning)
+
+    @pytest.mark.parametrize('value', [None, 123, ''])
+    def test_invalid_model_name_does_not_raise_without_an_override(self, value):
+        """max_context_tokens=0 is what forces the resolve_model_limit call."""
+        opt = ContextOptimizer({'model_name': value, 'max_context_tokens': 0})
+        assert opt.model_name == DEFAULT_MODEL_NAME
+        assert opt.optimize(question='Test')['metadata']['model'] == DEFAULT_MODEL_NAME
+
+    def test_missing_model_name_uses_the_documented_default(self, default_config):
+        config = {k: v for k, v in default_config.items() if k != 'model_name'}
+        with patch('context_optimizer.optimizer.warning') as mock_warning:
+            opt = ContextOptimizer(config)
+        assert opt.model_name == DEFAULT_MODEL_NAME
+        assert not _model_name_warnings(mock_warning), 'an absent key is not a misconfiguration'
+
+    @pytest.mark.parametrize('value', ['gpt-4', 'openai/gpt-5', 'claude-sonnet-4-6', 'custom'])
+    def test_valid_model_names_pass_through_untouched(self, default_config, value):
+        with patch('context_optimizer.optimizer.warning') as mock_warning:
+            opt = ContextOptimizer({**default_config, 'model_name': value})
+        assert opt.model_name == value
+        # ``custom`` legitimately trips the unrelated unknown-model warning.
+        assert not _model_name_warnings(mock_warning)
+
+    def test_surrounding_whitespace_is_stripped(self, default_config):
+        assert ContextOptimizer({**default_config, 'model_name': '  gpt-5  '}).model_name == 'gpt-5'
