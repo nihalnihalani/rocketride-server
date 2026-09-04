@@ -243,35 +243,12 @@
 			"title": "Cobalt Evaluator",
 			"properties": ["profile"]
 		}
-	],
-	//
-	// Optional:
-	//		Test cases for validating the evaluator
-	//
-	"tests": [
-		{
-			"title": "Semantic similarity - high similarity",
-			"eval_type": "similarity",
-			"threshold": 0.5,
-			"input": "The capital of France is Paris",
-			"expected": "Paris is the capital of France",
-			"expect_pass": true
-		},
-		{
-			"title": "Semantic similarity - low similarity",
-			"eval_type": "similarity",
-			"threshold": 0.9,
-			"input": "The weather is sunny today",
-			"expected": "Python is a programming language",
-			"expect_pass": false
-		},
-		{
-			"title": "Custom evaluator - missing function fails",
-			"eval_type": "custom",
-			"threshold": 0.5,
-			"input": "Any output text",
-			"expected": "Any expected text",
-			"expect_pass": false
-		}
 	]
+	//
+	// No harness "test" block: the dynamic runner wires the node under test
+	// downstream of a webhook (nodes/test/framework/pipeline.py), and this node's
+	// only input lane is "answers" — there is no way to inject a real Answer from
+	// a webhook without a live LLM upstream. The scoring cases live in
+	// nodes/test/cobalt/test_eval_cobalt.py instead.
+	//
 }

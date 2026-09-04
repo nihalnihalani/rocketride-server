@@ -126,7 +126,7 @@ def _check_code_format(output: str) -> dict:
     if has_code_blocks:
         return {'score': 1.0, 'reasoning': 'Output contains code blocks.'}
 
-    indented_lines = sum(1 for line in non_empty_lines if line.startswith('    ') or line.startswith('\t'))
+    indented_lines = sum(1 for line in non_empty_lines if line.startswith(('    ', '\t')))
     indent_ratio = indented_lines / len(non_empty_lines)
 
     code_patterns = [r'[{}\[\]();]', r'def\s+\w+', r'class\s+\w+', r'import\s+', r'return\s+', r'=\s*\w+']

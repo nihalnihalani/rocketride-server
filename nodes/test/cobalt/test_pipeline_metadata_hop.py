@@ -52,6 +52,7 @@ Run with:
     pytest nodes/test/cobalt/test_pipeline_metadata_hop.py
 """
 
+import contextlib
 import contextvars
 import importlib.util
 import pathlib
@@ -180,8 +181,22 @@ def _install_mocks():
     # so a two-line stub avoids ordering surprises without changing behaviour.
     ai_stream.STOP_SEQUENCES_VAR = contextvars.ContextVar('rocketride_llm_stop_sequences', default=None)
 
+    # llm_base wraps its provider call in `with turn_usage() as read_usage:` to
+    # collect per-turn token usage. The real ai.common.llm_adapter imports
+    # ai.common.utils.flatten_content_blocks, which the stub above does not
+    # carry, so stand in a no-op scope: this suite asserts on metadata, and a
+    # None usage read simply leaves `answer.tokens` unset.
+    ai_adapter = ModuleType('ai.common.llm_adapter')
+
+    @contextlib.contextmanager
+    def _turn_usage():
+        yield lambda: None
+
+    ai_adapter.turn_usage = _turn_usage
+
     ai.common = ai_common
     ai_common.config = ai_config
+    ai_common.llm_adapter = ai_adapter
     ai_common.llm_native_stream = ai_stream
     ai_common.schema = ai_schema
     ai_common.utils = ai_utils
@@ -191,6 +206,7 @@ def _install_mocks():
             'ai': ai,
             'ai.common': ai_common,
             'ai.common.config': ai_config,
+            'ai.common.llm_adapter': ai_adapter,
             'ai.common.llm_native_stream': ai_stream,
             'ai.common.schema': ai_schema,
             'ai.common.utils': ai_utils,
