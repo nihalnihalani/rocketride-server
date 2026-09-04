@@ -43,6 +43,7 @@ Covered here:
 
 import asyncio
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -55,8 +56,12 @@ from rocketride.otelbridge.config import (
     ENV_OTLP_ENDPOINT,
     ENV_OTLP_HEADERS,
     ENV_SERVICE_NAME,
+    InsecureTransportError,
     OtelConfig,
+    effective_endpoint,
     parse_headers,
+    redact_endpoint,
+    validate_transport_security,
 )
 
 FIXTURE_PATH = Path(__file__).parent / 'fixtures' / 'otel_bridge_events.json'
@@ -180,11 +185,32 @@ class TestOtelConfig:
         assert config.endpoint is None
 
     def test_env_used_when_args_absent(self, monkeypatch):
-        monkeypatch.setenv(ENV_OTLP_ENDPOINT, 'https://collector.example:4318')
+        # OTEL_SERVICE_NAME is the ONE env var resolved here; the endpoint
+        # variables are left to the SDK exporters (see the test below).
         monkeypatch.setenv(ENV_SERVICE_NAME, 'env-service')
         config = OtelConfig.from_args_env(SimpleNamespace())
-        assert config.endpoint == 'https://collector.example:4318'
         assert config.service_name == 'env-service'
+
+    def test_generic_endpoint_env_left_to_the_sdk_exporters(self, monkeypatch):
+        # OTEL_EXPORTER_OTLP_ENDPOINT must NOT be pre-read into an explicit
+        # exporter endpoint: that would silently override the signal-specific
+        # OTEL_EXPORTER_OTLP_TRACES/METRICS_ENDPOINT, inverting the OTLP spec
+        # order exactly as pre-parsing the header variable once did.
+        monkeypatch.setenv(ENV_OTLP_ENDPOINT, 'https://generic.example:4318')
+        monkeypatch.setenv('OTEL_EXPORTER_OTLP_TRACES_ENDPOINT', 'https://traces.example:4318/v1/traces')
+        config = OtelConfig.from_args_env(SimpleNamespace())
+        assert config.endpoint is None
+        # The SDK's resolution order is mirrored (read-only) for the startup
+        # line and the transport-security check: signal-specific wins.
+        assert effective_endpoint(config, os.environ, 'traces') == 'https://traces.example:4318/v1/traces'
+        assert effective_endpoint(config, os.environ, 'metrics') == 'https://generic.example:4318'
+
+    def test_explicit_endpoint_arg_still_wins(self):
+        config = OtelConfig.from_args_env(
+            SimpleNamespace(endpoint='https://args.example:4318'),
+            env={ENV_OTLP_ENDPOINT: 'https://env.example:4318'},
+        )
+        assert config.endpoint == 'https://args.example:4318'
 
     def test_header_env_vars_left_to_the_sdk_exporters(self):
         # OTEL_EXPORTER_OTLP_HEADERS must NOT be pre-parsed into explicit
@@ -201,7 +227,7 @@ class TestOtelConfig:
 
     def test_args_override_env(self):
         env = {
-            ENV_OTLP_ENDPOINT: 'https://env.example:4318',
+            ENV_OTLP_ENDPOINT: 'https://env.example:4318',  # noqa: RUF100 - ignored by design
             ENV_OTLP_HEADERS: 'a=env',
             ENV_SERVICE_NAME: 'env-service',
         }
@@ -401,3 +427,167 @@ class TestRunBridge:
         assert [name for name, _ in mapper.events] == expected_span_events
         assert len(metrics.statuses) == expected_status_count
         assert len(mapper.events) + len(metrics.statuses) == 24
+
+
+# =========================================================================
+# TRANSPORT SECURITY: cleartext-credential guard and endpoint redaction
+# =========================================================================
+
+
+class TestRedactEndpoint:
+    def test_strips_userinfo_and_query(self):
+        redacted = redact_endpoint('https://user:s3cr3t@collector.example:4318/v1/traces?sig=abc123#frag')
+        assert 's3cr3t' not in redacted
+        assert 'user' not in redacted
+        assert 'abc123' not in redacted
+        assert 'frag' not in redacted
+        assert redacted == 'https://collector.example:4318/v1/traces?<redacted>'
+
+    def test_keeps_scheme_host_port_and_ingest_path(self):
+        assert redact_endpoint('https://cloud.langfuse.com/api/public/otel') == (
+            'https://cloud.langfuse.com/api/public/otel'
+        )
+
+    def test_handles_scheme_less_grpc_endpoint(self):
+        assert redact_endpoint('localhost:4317') == 'localhost:4317'
+
+    def test_empty_endpoint_is_empty_string(self):
+        assert redact_endpoint(None) == ''
+        assert redact_endpoint('') == ''
+
+
+class TestValidateTransportSecurity:
+    def _config(self, **overrides):
+        base = dict(endpoint=None, protocol='http', headers={}, no_metrics=False, allow_insecure=False)
+        base.update(overrides)
+        return SimpleNamespace(**base)
+
+    def test_credential_header_over_remote_http_is_refused(self):
+        config = self._config(endpoint='http://collector.example:4318', headers={'x-api-key': 'k'})
+        with pytest.raises(InsecureTransportError) as excinfo:
+            validate_transport_security(config, env={})
+        message = str(excinfo.value)
+        assert 'x-api-key' in message  # names only...
+        assert 'k' not in message.split('credential headers:')[0]  # ...never values
+
+    def test_loopback_http_is_allowed(self):
+        for host in ('localhost', '127.0.0.1', '[::1]', 'jaeger.localhost'):
+            config = self._config(endpoint=f'http://{host}:4318', headers={'Authorization': 'Basic x'})
+            validate_transport_security(config, env={})
+
+    def test_https_is_allowed(self):
+        config = self._config(endpoint='https://collector.example:4318', headers={'x-api-key': 'k'})
+        validate_transport_security(config, env={})
+
+    def test_non_credential_headers_over_http_are_allowed(self):
+        config = self._config(endpoint='http://collector.example:4318', headers={'Langsmith-Project': 'p'})
+        validate_transport_security(config, env={})
+
+    def test_env_headers_are_checked_too(self):
+        # The bridge does not FORWARD these (the SDK does), but it must still
+        # see them to decide whether the transport is safe.
+        config = self._config(endpoint='http://collector.example:4318')
+        for var in (
+            'OTEL_EXPORTER_OTLP_HEADERS',
+            'OTEL_EXPORTER_OTLP_TRACES_HEADERS',
+            'OTEL_EXPORTER_OTLP_METRICS_HEADERS',
+        ):
+            with pytest.raises(InsecureTransportError):
+                validate_transport_security(config, env={var: 'Authorization=Basic cGs6c2s='})
+
+    def test_signal_specific_env_endpoint_is_checked(self):
+        config = self._config(headers={'x-api-key': 'k'})
+        with pytest.raises(InsecureTransportError) as excinfo:
+            validate_transport_security(
+                config, env={'OTEL_EXPORTER_OTLP_TRACES_ENDPOINT': 'http://remote:4318/v1/traces'}
+            )
+        assert 'traces' in str(excinfo.value)
+
+    def test_metrics_endpoint_ignored_when_metrics_disabled(self):
+        config = self._config(headers={'x-api-key': 'k'}, no_metrics=True)
+        env = {
+            'OTEL_EXPORTER_OTLP_TRACES_ENDPOINT': 'https://secure:4318/v1/traces',
+            'OTEL_EXPORTER_OTLP_METRICS_ENDPOINT': 'http://remote:4318/v1/metrics',
+        }
+        validate_transport_security(config, env=env)
+        with pytest.raises(InsecureTransportError):
+            validate_transport_security(self._config(headers={'x-api-key': 'k'}), env=env)
+
+    def test_default_endpoint_is_loopback_and_allowed(self):
+        config = self._config(headers={'x-api-key': 'k'})
+        validate_transport_security(config, env={})
+
+    def test_scheme_less_grpc_is_tls_unless_insecure_env_says_otherwise(self):
+        config = self._config(endpoint='collector.example:4317', protocol='grpc', headers={'x-api-key': 'k'})
+        validate_transport_security(config, env={})
+        with pytest.raises(InsecureTransportError):
+            validate_transport_security(config, env={'OTEL_EXPORTER_OTLP_INSECURE': 'true'})
+
+    def test_allow_insecure_opt_out(self):
+        config = self._config(endpoint='http://collector.example:4318', headers={'x-api-key': 'k'}, allow_insecure=True)
+        validate_transport_security(config, env={})
+
+    def test_allow_insecure_resolved_from_flag_and_env(self):
+        args = SimpleNamespace(insecure=True)
+        assert OtelConfig.from_args_env(args, env={}).allow_insecure is True
+        assert OtelConfig.from_args_env(SimpleNamespace(), env={'ROCKETRIDE_OTEL_ALLOW_INSECURE': '1'}).allow_insecure
+        assert OtelConfig.from_args_env(SimpleNamespace(), env={}).allow_insecure is False
+
+
+# =========================================================================
+# SIGNAL OWNERSHIP
+# =========================================================================
+
+
+class TestSignalOwnership:
+    async def test_pre_existing_loop_signal_handler_is_not_stolen(self):
+        import signal as signal_module
+
+        loop = asyncio.get_running_loop()
+        loop.add_signal_handler(signal_module.SIGTERM, lambda: None)
+        embedder_handle = loop._signal_handlers[signal_module.SIGTERM]
+        try:
+            stop_event = asyncio.Event()
+            client = FakeClient(connected=True)
+            mapper = FakeMapper()
+            task = asyncio.create_task(
+                run_bridge(
+                    client,
+                    OtelConfig(),
+                    mapper_factory=lambda: mapper,
+                    metrics_factory=lambda: FakeMetrics(),
+                    stop_event=stop_event,
+                    poll_interval=0.01,
+                )
+            )
+            await asyncio.sleep(0.05)
+            stop_event.set()
+            assert await task == 0
+            # The embedder's callback survived the bridge's whole lifecycle:
+            # never replaced during the run, never removed on cleanup.
+            assert loop._signal_handlers.get(signal_module.SIGTERM) is embedder_handle
+        finally:
+            loop.remove_signal_handler(signal_module.SIGTERM)
+
+    async def test_install_signal_handlers_false_registers_nothing(self):
+        import signal as signal_module
+
+        loop = asyncio.get_running_loop()
+        before = dict(getattr(loop, '_signal_handlers', {}))
+        stop_event = asyncio.Event()
+        task = asyncio.create_task(
+            run_bridge(
+                FakeClient(connected=True),
+                OtelConfig(),
+                mapper_factory=lambda: FakeMapper(),
+                metrics_factory=lambda: FakeMetrics(),
+                stop_event=stop_event,
+                install_signal_handlers=False,
+                poll_interval=0.01,
+            )
+        )
+        await asyncio.sleep(0.05)
+        assert signal_module.SIGINT not in getattr(loop, '_signal_handlers', {})
+        stop_event.set()
+        assert await task == 0
+        assert dict(getattr(loop, '_signal_handlers', {})) == before

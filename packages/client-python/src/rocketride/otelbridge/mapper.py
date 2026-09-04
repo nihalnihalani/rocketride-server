@@ -62,6 +62,9 @@ flagged ``rocketride.span.unclosed=true`` — by whichever comes first:
       closed and dropped;
     - the ``MAX_TRACKED_RUNS`` cap, which evicts the least-recently-eventful
       run when a new one would exceed it;
+    - the ``MAX_TRACKED_PIPES_PER_RUN`` cap, the same rule one level down:
+      a run that keeps receiving events is never evicted, so its open pipes
+      need their own bound for runs whose ``end`` events never arrive;
     - :meth:`FlowSpanMapper.close_all` at shutdown.
 A deliberately idle-but-alive run (e.g. a webhook service task) is never
 expired by a clock: it stays announced in every snapshot, so no TTL heuristic
@@ -122,6 +125,17 @@ MAX_CONTENT_LENGTH = 8192
 # some runs' 'end' events still has bounded memory. Generous: the engine does
 # not run thousands of concurrent tasks per API key.
 MAX_TRACKED_RUNS = 1024
+
+# Upper bound on concurrently tracked PIPES within a single run. MAX_TRACKED_RUNS
+# alone does not bound memory: a run that keeps receiving events is re-inserted
+# as most-recently-eventful on every one of them, so it is never evicted, while
+# every apaevt_flow 'begin' (or an event for a never-begun pipe) adds a
+# _PipeState that only a matching 'end' removes. A reconnect resubscribes the
+# monitors but does not replay the 'end' events missed while disconnected, so a
+# long-lived task can strand pipe roots indefinitely. When the cap is reached
+# the least-recently-eventful pipe is closed (spans flagged
+# rocketride.span.unclosed=true) and dropped.
+MAX_TRACKED_PIPES_PER_RUN = 256
 
 # Upper bound on MetricsMapper's per-run last-count entries (delta
 # bookkeeping); the least-recently-updated entry is evicted first. Evicting a
@@ -262,7 +276,8 @@ class FlowSpanMapper:
     any remaining open spans with :meth:`close_all` at shutdown. Tracked-run
     state is bounded (see "Bounded state" in the module docstring): runs whose
     'end' is never observed are closed by seeded-snapshot reconciliation or
-    by the ``MAX_TRACKED_RUNS`` least-recently-eventful eviction.
+    by the ``MAX_TRACKED_RUNS`` least-recently-eventful eviction and, within
+    each run, by the ``MAX_TRACKED_PIPES_PER_RUN`` cap on open pipes.
 
     Args:
         tracer: An ``opentelemetry.trace.Tracer`` (SDK or API no-op).
@@ -436,6 +451,7 @@ class FlowSpanMapper:
             else:
                 state = stray.pipes.pop(pipe_id)
                 run.pipes[pipe_id] = state
+                self._evict_pipes_above(run, MAX_TRACKED_PIPES_PER_RUN)
                 state.root.set_attribute(ATTR_RUN_ID, run.key)
                 for entry in state.stack:
                     entry.span.set_attribute(ATTR_RUN_ID, run.key)
@@ -607,8 +623,29 @@ class FlowSpanMapper:
             start_time=start_ns,
         )
         state = _PipeState(root=root, start_ns=start_ns)
+        # Evict before inserting so the new pipe is never its own victim.
+        self._evict_pipes_above(run, MAX_TRACKED_PIPES_PER_RUN - 1)
         run.pipes[pipe_id] = state
         return state
+
+    def _evict_pipes_above(self, run: _RunState, max_size: int) -> None:
+        """Close and drop this run's least-recently-eventful pipes until at most max_size remain."""
+        while len(run.pipes) > max_size:
+            oldest_id = next(iter(run.pipes))
+            logger.debug('tracked-pipe cap reached for run %s; closing idle pipe %s as unclosed', run.key, oldest_id)
+            self._close_pipe(run, oldest_id, unclosed=True)
+
+    @staticmethod
+    def _touch_pipe(run: _RunState, pipe_id: int) -> None:
+        """Move a pipe to the most-recently-eventful end of run.pipes.
+
+        Insertion order alone is not a recency order: without this, a pipe that
+        keeps emitting enter/leave events would still be evicted before a pipe
+        that has been silent since it began.
+        """
+        state = run.pipes.pop(pipe_id, None)
+        if state is not None:
+            run.pipes[pipe_id] = state
 
     def _get_pipe(self, run: _RunState, pipe_id: int) -> _PipeState:
         """Return the pipe state, opening an implicit root for never-begun pipes."""
@@ -616,6 +653,8 @@ class FlowSpanMapper:
         if state is None:
             logger.debug('flow event for pipe %s of run %s before begin; opening implicit root', pipe_id, run.key)
             state = self._open_root(run, pipe_id, f'pipe {pipe_id}', implicit=True)
+        else:
+            self._touch_pipe(run, pipe_id)
         return state
 
     def _flow_begin(self, run: _RunState, pipe_id: int, component: str, body: dict) -> None:

@@ -97,12 +97,13 @@ rocketride otel [--endpoint URL] [--protocol http|grpc] [--service-name NAME]
 
 | Flag                | Default                                       | Description                                                                                                                            |
 | ------------------- | --------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
-| `--endpoint <url>`  | `OTEL_EXPORTER_OTLP_ENDPOINT`, else the exporter default (`http://localhost:4318` for http, `localhost:4317` for grpc) | OTLP **base** URL. The signal paths `/v1/traces` / `/v1/metrics` are appended automatically unless already present, so pasting Langfuse's or LangSmith's ingest URL just works. With neither the flag nor `OTEL_EXPORTER_OTLP_ENDPOINT` set, the signal-specific `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` / `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` variables are honored too. |
+| `--endpoint <url>`  | `OTEL_EXPORTER_OTLP_ENDPOINT`, else the exporter default (`http://localhost:4318` for http, `localhost:4317` for grpc) | OTLP **base** URL. The signal paths `/v1/traces` / `/v1/metrics` are appended automatically unless already present, so pasting Langfuse's or LangSmith's ingest URL just works. Without the flag the endpoint environment variables are resolved by the OTel SDK exporters themselves (never pre-read by the bridge), so `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` / `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` keep their spec-defined precedence over the generic `OTEL_EXPORTER_OTLP_ENDPOINT` (which the SDK still treats as a base URL). |
 | `--protocol <p>`    | `http`                                        | OTLP transport: `http` (http/protobuf) or `grpc`. The gRPC exporter is **not** part of the `otel` extra — see [Troubleshooting](#troubleshooting). |
 | `--service-name <n>`| `OTEL_SERVICE_NAME` or `rocketride-engine`    | The `service.name` resource attribute your backend groups by.                                                                          |
 | `--headers <pairs>` | `OTEL_EXPORTER_OTLP_HEADERS`                  | Comma-separated `key=value` pairs sent with every OTLP request. Values are split on the *first* `=` only, so base64 padding survives. **Prefer the env var for secrets** — command-line arguments are visible in shell history and `ps` output; keep `--headers` for non-secret headers. Without the flag, the OTel SDK resolves `OTEL_EXPORTER_OTLP_HEADERS` and the signal-specific `OTEL_EXPORTER_OTLP_TRACES_HEADERS` / `OTEL_EXPORTER_OTLP_METRICS_HEADERS` itself. |
 | `--include-content` | off                                           | Include pipeline payload content in spans, truncated to 8 KB per attribute. **By default no payload text reaches any span.**            |
 | `--no-metrics`      | off                                           | Export traces only; task status snapshots are not mapped to metrics.                                                                   |
+| `--insecure`        | off (`ROCKETRIDE_OTEL_ALLOW_INSECURE`)        | Allow credential-bearing OTLP headers over cleartext transport to a **non-loopback** collector. Without it the bridge exits `2` rather than putting an `Authorization` / `x-api-key` value on the wire in the clear — see [Transport security](#transport-security). |
 | `--trace-level <l>` | —                                             | **Informational only.** The bridge cannot change the trace level of runs it did not start; this flag just prints a reminder of how to start traced runs. |
 
 Plus the standard connection arguments shared by all subcommands: `--uri`
@@ -110,16 +111,41 @@ Plus the standard connection arguments shared by all subcommands: `--uri`
 bridge subscribes to every task your API key owns.
 
 **Configuration precedence:** explicit CLI flags > standard `OTEL_*` environment
-variables (`OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_HEADERS`,
-`OTEL_SERVICE_NAME`) > built-in defaults. Header environment variables are
-resolved by the OTel SDK exporters themselves (never pre-parsed by the bridge),
-so the signal-specific `OTEL_EXPORTER_OTLP_TRACES_HEADERS` /
-`OTEL_EXPORTER_OTLP_METRICS_HEADERS` keep their spec-defined precedence over the
-generic variable whenever `--headers` is not given.
+variables > built-in defaults. Only `OTEL_SERVICE_NAME` is read by the bridge; the
+endpoint and header variables are resolved by the OTel SDK exporters themselves
+(never pre-read by the bridge), so the signal-specific
+`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` / `_METRICS_ENDPOINT` /
+`OTEL_EXPORTER_OTLP_TRACES_HEADERS` / `_METRICS_HEADERS` keep their spec-defined
+precedence over the generic variables whenever `--endpoint` / `--headers` is not
+given. Pre-reading a generic variable and handing it to both exporters would turn
+it into an explicit value that silently overrides the signal-specific ones.
+
+### Transport security
+
+OTLP exporters send whatever headers they are configured with to whatever endpoint
+they are given; they impose no TLS requirement of their own. So before any exporter
+is built, the bridge checks the *effective* endpoint of each signal (explicit
+`--endpoint` > signal-specific env var > generic env var > SDK default) against the
+*effective* headers (`--headers` plus all three `OTEL_EXPORTER_OTLP_*HEADERS`
+variables — names only; values are never read, logged or echoed):
+
+- A credential-looking header name (`Authorization`, `x-api-key`, `*-token`,
+  `*-secret`, …) plus a **non-loopback** `http://` endpoint — or a gRPC endpoint with
+  `OTEL_EXPORTER_OTLP_INSECURE` set — aborts startup with exit code `2`.
+- Loopback endpoints (`localhost`, `127.0.0.1`, `::1`) are exempt: that is the local
+  collector / Jaeger case from the quickstart.
+- `--insecure` (or `ROCKETRIDE_OTEL_ALLOW_INSECURE=1`) overrides the check for a
+  trusted network, and prints a warning to stderr.
+
+Two related hardening measures need no configuration: the OTLP/HTTP exporters use a
+session that **does not follow redirects** (`requests` strips `Authorization` only on
+a cross-*host* redirect, so a 3xx would otherwise replay `x-api-key` to the redirect
+target), and the startup line prints the endpoint **redacted** — userinfo and query
+string removed — because a signed collector URL is itself a credential.
 
 **Exit codes:** `0` graceful shutdown (Ctrl+C / SIGTERM), `1` unexpected runtime error,
-`2` missing dependency (the `otel` extra, or the gRPC exporter with `--protocol grpc`)
-or startup connection/subscribe failure.
+`2` missing dependency (the `otel` extra, or the gRPC exporter with `--protocol grpc`),
+a cleartext-credential refusal, or startup connection/subscribe failure.
 
 ### FLOW spans need a trace level
 
@@ -147,17 +173,30 @@ Langfuse ingests OTLP **traces over HTTP only** (no gRPC, no metrics) at
 `/api/public/otel`, with HTTP Basic auth built from your project keys:
 
 ```bash
-# Build the Basic auth value from your Langfuse project keys (pk-lf-... : sk-lf-...)
-export LANGFUSE_AUTH=$(echo -n 'pk-lf-your-public-key:sk-lf-your-secret-key' | base64)
+# Read the Langfuse project keys instead of typing them into the command:
+# a literal key in a command line lands in shell history and in `ps` output,
+# and `echo -n '<secret>' | base64` exposes it in the process list too.
+printf 'Langfuse public key (pk-lf-...): ' >&2; read -r LANGFUSE_PUBLIC_KEY
+printf 'Langfuse secret key (sk-lf-...): ' >&2; read -rs LANGFUSE_SECRET_KEY; echo >&2
+
+# tr -d strips the line breaks GNU base64 inserts every 76 characters: real
+# project keys exceed that, and a wrapped value is an invalid header.
+export LANGFUSE_AUTH="$(printf '%s' "${LANGFUSE_PUBLIC_KEY}:${LANGFUSE_SECRET_KEY}" | base64 | tr -d '\r\n')"
 export OTEL_EXPORTER_OTLP_HEADERS="Authorization=Basic ${LANGFUSE_AUTH}"
+unset LANGFUSE_SECRET_KEY
 
 rocketride otel \
   --endpoint https://cloud.langfuse.com/api/public/otel \
   --no-metrics
 ```
 
+(`printf` + `read -rs` is spelled the same in bash and zsh; bash users can shorten
+the second line to `read -rsp 'Langfuse secret key: ' LANGFUSE_SECRET_KEY`.)
+
 The auth header travels via `OTEL_EXPORTER_OTLP_HEADERS` rather than a `--headers`
 argument so the secret never lands in your shell history or shows up in `ps` output.
+Better still, source it from your secret manager — `export LANGFUSE_SECRET_KEY="$(op read ...)"`
+or the equivalent — and export only the variable reference.
 
 Use `https://us.cloud.langfuse.com/api/public/otel` for the US region, or
 `https://<your-host>/api/public/otel` for self-hosted (Langfuse v3.22.0+). Pass
@@ -170,8 +209,11 @@ LangSmith ingests OTLP traces over HTTP at `/otel`, authenticated with an `x-api
 header (optional `Langsmith-Project` header to pick the project):
 
 ```bash
-# Env var, not --headers: keeps the API key out of shell history / ps output
-export OTEL_EXPORTER_OTLP_HEADERS='x-api-key=your-langsmith-api-key,Langsmith-Project=your-project-name'
+# Prompt for the key (or read it from a secret manager) rather than typing it
+# into the command: the env var keeps it out of `ps`, but a literal value in
+# the export line is still recorded in shell history.
+printf 'LangSmith API key: ' >&2; read -rs LANGSMITH_API_KEY; echo >&2
+export OTEL_EXPORTER_OTLP_HEADERS="x-api-key=${LANGSMITH_API_KEY},Langsmith-Project=your-project-name"
 
 rocketride otel \
   --endpoint https://api.smith.langchain.com/otel \

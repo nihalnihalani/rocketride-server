@@ -100,6 +100,7 @@ def make_args(**overrides):
         headers=None,
         include_content=False,
         no_metrics=False,
+        insecure=False,
         trace_level=None,
     )
     base.update(overrides)
@@ -137,6 +138,7 @@ class TestOtelParser:
         assert args.headers is None
         assert args.include_content is False
         assert args.no_metrics is False
+        assert args.insecure is False
         assert args.trace_level is None
 
     def test_all_flags_parse(self, cli_parser):
@@ -153,6 +155,7 @@ class TestOtelParser:
                 'x-api-key=abc,Langsmith-Project=proj',
                 '--include-content',
                 '--no-metrics',
+                '--insecure',
                 '--trace-level',
                 'summary',
                 '--uri',
@@ -167,6 +170,7 @@ class TestOtelParser:
         assert args.headers == 'x-api-key=abc,Langsmith-Project=proj'
         assert args.include_content is True
         assert args.no_metrics is True
+        assert args.insecure is True
         assert args.trace_level == 'summary'
         assert args.uri == 'http://server:5565'
         assert args.apikey == 'KEY'
@@ -232,7 +236,7 @@ class TestOtelExecute:
         monkeypatch.setattr(otel_module, 'run_bridge', fake_run_bridge)
         client = FakeClient()
         args = make_args(
-            endpoint='http://collector:4318',
+            endpoint='https://collector:4318',
             service_name='my-engine',
             headers='x-api-key=abc',
             include_content=True,
@@ -244,7 +248,7 @@ class TestOtelExecute:
         assert exit_code == 0
         assert recorded['client'] is client
         config = recorded['config']
-        assert config.endpoint == 'http://collector:4318'
+        assert config.endpoint == 'https://collector:4318'
         assert config.service_name == 'my-engine'
         assert config.headers == {'x-api-key': 'abc'}
         assert config.include_content is True
@@ -383,3 +387,91 @@ class TestCliRouting:
 
         assert exit_code == 1
         assert 'Token is required' in capsys.readouterr().out
+
+
+# =========================================================================
+# TRANSPORT SECURITY AND STDOUT REDACTION (CodeRabbit round 2)
+# =========================================================================
+
+
+class TestOtelTransportSecurity:
+    async def test_startup_line_redacts_endpoint_credentials(self, monkeypatch, capsys):
+        """Regression: no userinfo or signed query value may reach stdout."""
+        monkeypatch.setattr(otel_module, '_otel_available', lambda: True)
+
+        async def fake_run_bridge(client, config):
+            return 0
+
+        monkeypatch.setattr(otel_module, 'run_bridge', fake_run_bridge)
+        args = make_args(endpoint='https://svcuser:sup3rs3cret@collector.example:4318/v1/traces?sig=DEADBEEF')
+
+        assert await OtelCommand(FakeCli(), args).execute(FakeClient()) == 0
+
+        captured = capsys.readouterr()
+        combined = captured.out + captured.err
+        assert 'sup3rs3cret' not in combined
+        assert 'svcuser' not in combined
+        assert 'DEADBEEF' not in combined
+        assert 'https://collector.example:4318/v1/traces' in captured.out
+
+    async def test_startup_line_redacts_env_endpoint(self, monkeypatch, capsys):
+        monkeypatch.setattr(otel_module, '_otel_available', lambda: True)
+        monkeypatch.setenv('OTEL_EXPORTER_OTLP_ENDPOINT', 'https://u:p4ssw0rd@collector.example:4318')
+        monkeypatch.delenv('OTEL_EXPORTER_OTLP_TRACES_ENDPOINT', raising=False)
+
+        async def fake_run_bridge(client, config):
+            return 0
+
+        monkeypatch.setattr(otel_module, 'run_bridge', fake_run_bridge)
+
+        assert await OtelCommand(FakeCli(), make_args()).execute(FakeClient()) == 0
+
+        captured = capsys.readouterr()
+        assert 'p4ssw0rd' not in captured.out + captured.err
+        assert 'https://collector.example:4318' in captured.out
+
+    async def test_cleartext_credentials_refused_with_exit_2(self, monkeypatch, capsys):
+        monkeypatch.setattr(otel_module, '_otel_available', lambda: True)
+        monkeypatch.delenv('OTEL_EXPORTER_OTLP_HEADERS', raising=False)
+        called = []
+
+        async def fake_run_bridge(client, config):
+            called.append(config)
+            return 0
+
+        monkeypatch.setattr(otel_module, 'run_bridge', fake_run_bridge)
+        args = make_args(endpoint='http://collector.example:4318', headers='x-api-key=abc')
+
+        assert await OtelCommand(FakeCli(), args).execute(FakeClient()) == 2
+
+        assert called == [], 'the bridge must not connect before the transport is validated'
+        err = capsys.readouterr().err
+        assert 'cleartext' in err
+        assert 'x-api-key' in err
+        assert 'abc' not in err  # the header VALUE never appears
+
+    async def test_insecure_flag_allows_cleartext_and_warns(self, monkeypatch, capsys):
+        monkeypatch.setattr(otel_module, '_otel_available', lambda: True)
+        monkeypatch.delenv('OTEL_EXPORTER_OTLP_HEADERS', raising=False)
+
+        async def fake_run_bridge(client, config):
+            return 0
+
+        monkeypatch.setattr(otel_module, 'run_bridge', fake_run_bridge)
+        args = make_args(endpoint='http://collector.example:4318', headers='x-api-key=abc', insecure=True)
+
+        assert await OtelCommand(FakeCli(), args).execute(FakeClient()) == 0
+
+        assert 'WARNING: --insecure' in capsys.readouterr().err
+
+    async def test_loopback_cleartext_still_works(self, monkeypatch, capsys):
+        monkeypatch.setattr(otel_module, '_otel_available', lambda: True)
+        monkeypatch.delenv('OTEL_EXPORTER_OTLP_HEADERS', raising=False)
+
+        async def fake_run_bridge(client, config):
+            return 0
+
+        monkeypatch.setattr(otel_module, 'run_bridge', fake_run_bridge)
+        args = make_args(endpoint='http://localhost:4318', headers='Authorization=Basic abc')
+
+        assert await OtelCommand(FakeCli(), args).execute(FakeClient()) == 0

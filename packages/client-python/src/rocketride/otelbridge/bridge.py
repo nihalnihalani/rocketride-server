@@ -77,6 +77,24 @@ def _log(message: str) -> None:
     print(f'otel-bridge: {message}', file=sys.stderr)
 
 
+def _loop_owns_signal(loop: Any, sig: int) -> bool:
+    """
+    True when the running loop already has an asyncio callback for ``sig``.
+
+    ``loop.add_signal_handler`` replaces any existing callback and asyncio
+    exposes no way to read one back, so the only way not to steal an
+    embedder's SIGINT/SIGTERM is to look at the loop's own registry. The
+    attribute is private, hence the defensive access: when it is missing
+    (a non-CPython or non-Unix loop) the answer is "unknown", and the caller
+    falls back to the previous behaviour of registering its own handler.
+    """
+    handlers = getattr(loop, '_signal_handlers', None)
+    try:
+        return bool(handlers) and sig in handlers
+    except TypeError:  # pragma: no cover - unexpected registry type
+        return False
+
+
 async def _wait_for_stop(stop_event: asyncio.Event, timeout: float) -> None:
     """Wait until stop_event is set or timeout elapses, whichever is first."""
     try:
@@ -93,6 +111,7 @@ async def run_bridge(
     *,
     shutdown_fn: Optional[Callable[[], None]] = None,
     stop_event: Optional[asyncio.Event] = None,
+    install_signal_handlers: bool = True,
     initial_backoff: float = 1.0,
     max_backoff: float = 30.0,
     poll_interval: float = 0.5,
@@ -125,6 +144,12 @@ async def run_bridge(
             ``build_providers`` when providers are built here.
         stop_event: Optional externally controlled stop signal (used by
             tests); created internally when absent. SIGINT/SIGTERM set it.
+        install_signal_handlers: When True (the CLI's case), SIGINT/SIGTERM
+            are wired to ``stop_event``. Pass False when embedding the bridge
+            in an application that owns process signals; a signal the running
+            loop already has a callback for is left alone either way, because
+            ``loop.add_signal_handler`` REPLACES rather than chains and the
+            previous asyncio callback cannot be restored afterwards.
         initial_backoff: First reconnect delay in seconds.
         max_backoff: Reconnect delay cap in seconds.
         poll_interval: Connection health poll interval in seconds.
@@ -134,7 +159,9 @@ async def run_bridge(
         startup connection or the initial monitor subscription fails.
 
     Shutdown order:
-        1. Signal handlers removed (previous handlers restored)
+        1. Signal handlers this call installed are removed (previous
+           process-level handlers restored; handlers owned by someone else
+           were never touched)
         2. Event dispatcher detached from the client
         3. ``mapper.close_all()`` — open spans are ended
         4. ``shutdown_fn()`` — exporters flush pending telemetry
@@ -201,15 +228,24 @@ async def run_bridge(
     loop = asyncio.get_running_loop()
     registered_signals = []
     previous_signal_handlers: Dict[int, Any] = {}
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        try:
-            previous_signal_handlers[sig] = signal.getsignal(sig)
-            loop.add_signal_handler(sig, stop_event.set)
-            registered_signals.append(sig)
-        except (NotImplementedError, RuntimeError, ValueError, OSError):
-            # Not supported on this platform/thread; Ctrl+C falls back to
-            # KeyboardInterrupt handling in the caller.
-            pass
+    if install_signal_handlers:
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            if _loop_owns_signal(loop, sig):
+                # An embedding application already registered an asyncio
+                # callback for this signal. add_signal_handler would REPLACE
+                # it and there is no API to restore it on exit, so leave the
+                # signal to its owner: the bridge still stops via stop_event
+                # or the caller's KeyboardInterrupt path.
+                _log(f'signal {sig} already handled by the running loop; leaving it to its owner')
+                continue
+            try:
+                previous_signal_handlers[sig] = signal.getsignal(sig)
+                loop.add_signal_handler(sig, stop_event.set)
+                registered_signals.append(sig)
+            except (NotImplementedError, RuntimeError, ValueError, OSError):
+                # Not supported on this platform/thread; Ctrl+C falls back to
+                # KeyboardInterrupt handling in the caller.
+                previous_signal_handlers.pop(sig, None)
 
     try:
         # -----------------------------------------------------------------

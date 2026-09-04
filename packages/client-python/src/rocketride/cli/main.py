@@ -499,6 +499,14 @@ class RocketRideCLI:
             help='Include pipeline payload content in spans, size-capped (default: content excluded)',
         )
 
+        # Transport-security opt-out for the cleartext-credential guard
+        otel_parser.add_argument(
+            '--insecure',
+            action='store_true',
+            help='Allow exporting OTLP credential headers over cleartext transport to a '
+            'non-loopback collector (default: refuse; also ROCKETRIDE_OTEL_ALLOW_INSECURE=1)',
+        )
+
         # Metrics toggle: traces-only export
         otel_parser.add_argument(
             '--no-metrics',

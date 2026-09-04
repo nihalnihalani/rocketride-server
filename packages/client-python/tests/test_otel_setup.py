@@ -46,10 +46,12 @@ pytest.importorskip('opentelemetry.sdk')
 # exporter, so skip on the most specific module they need.
 pytest.importorskip('opentelemetry.exporter.otlp.proto.http')
 
-from rocketride.otelbridge.setup import (
+from rocketride.otelbridge.setup import (  # noqa: E402 - after importorskip by design
+    InsecureTransportError,
     OtelNotInstalledError,
     _build_metric_exporter,
     _build_span_exporter,
+    _no_redirect_session,
     _resolve_endpoint,
     build_providers,
     missing_otel_message,
@@ -75,6 +77,7 @@ class BridgeConfigStub:
     include_content: bool = False
     no_metrics: bool = False
     headers: Dict[str, str] = field(default_factory=dict)
+    allow_insecure: bool = False
 
 
 # =========================================================================
@@ -366,3 +369,88 @@ def test_module_import_is_safe_without_otel_extra():
     )
     assert result.returncode == 0, f'stdout={result.stdout!r} stderr={result.stderr!r}'
     assert 'IMPORT_SAFE_OK' in result.stdout
+
+
+# =========================================================================
+# TRANSPORT SECURITY (CodeRabbit round 2)
+# =========================================================================
+
+
+def test_http_exporters_do_not_follow_redirects(monkeypatch):
+    """A 3xx must not replay custom credential headers to the redirect target."""
+    import requests
+
+    sent = {}
+
+    def recording_send(self, request, **kwargs):
+        sent.update(kwargs)
+        return 'response'
+
+    # Patch the BASE class: _NoRedirectSession.send delegates to it, so this
+    # records exactly what the session asks requests to do.
+    monkeypatch.setattr(requests.Session, 'send', recording_send)
+
+    session = _no_redirect_session()
+    # Whatever the caller (or requests' own default) asks for is overridden.
+    session.send(object(), allow_redirects=True)
+
+    assert sent['allow_redirects'] is False
+
+
+def test_span_exporter_gets_a_non_redirecting_session():
+    exporter = _build_span_exporter(BridgeConfigStub(endpoint='https://collector:4318'))
+    assert type(exporter._session).__name__ == '_NoRedirectSession'
+
+
+def test_metric_exporter_gets_a_non_redirecting_session():
+    exporter = _build_metric_exporter(BridgeConfigStub(endpoint='https://collector:4318'))
+    assert type(exporter._session).__name__ == '_NoRedirectSession'
+
+
+def test_build_providers_refuses_cleartext_credentials(monkeypatch):
+    monkeypatch.delenv('OTEL_EXPORTER_OTLP_HEADERS', raising=False)
+    config = BridgeConfigStub(endpoint='http://collector.example:4318', headers={'x-api-key': 'k'})
+    with pytest.raises(InsecureTransportError) as excinfo:
+        build_providers(config)
+    # The refusal names the header, never its value.
+    assert 'x-api-key' in str(excinfo.value)
+    assert 'k' == config.headers['x-api-key']
+    assert "'k'" not in str(excinfo.value)
+
+
+def test_build_providers_allows_cleartext_credentials_with_opt_in(monkeypatch):
+    monkeypatch.delenv('OTEL_EXPORTER_OTLP_HEADERS', raising=False)
+    config = BridgeConfigStub(
+        endpoint='http://collector.example:4318',
+        headers={'x-api-key': 'k'},
+        allow_insecure=True,
+    )
+    _tracer, _meter, shutdown = build_providers(config)
+    shutdown()
+
+
+def test_build_providers_shuts_down_tracer_when_metric_setup_fails(monkeypatch):
+    """A metric-setup failure must not leak the BatchSpanProcessor worker."""
+    from rocketride.otelbridge import setup as setup_module
+
+    shut_down = []
+
+    def boom(config):
+        raise OtelNotInstalledError('no metric exporter')
+
+    monkeypatch.setattr(setup_module, '_build_metric_exporter', boom)
+
+    from opentelemetry.sdk.trace import TracerProvider
+
+    original_shutdown = TracerProvider.shutdown
+
+    def recording_shutdown(self):
+        shut_down.append(self)
+        return original_shutdown(self)
+
+    monkeypatch.setattr(TracerProvider, 'shutdown', recording_shutdown)
+
+    with pytest.raises(OtelNotInstalledError):
+        build_providers(BridgeConfigStub(endpoint='https://collector:4318'))
+
+    assert len(shut_down) == 1, 'tracer provider was left running after metric setup failed'

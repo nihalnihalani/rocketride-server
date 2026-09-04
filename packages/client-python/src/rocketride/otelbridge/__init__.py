@@ -40,6 +40,8 @@ _EXPORTS = {
     'build_providers': '.setup',
     'OtelNotInstalledError': '.setup',
     'OtelConfig': '.config',
+    'InsecureTransportError': '.config',
+    'validate_transport_security': '.config',
     'run_bridge': '.bridge',
 }
 

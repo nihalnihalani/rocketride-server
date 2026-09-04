@@ -41,9 +41,28 @@ Endpoint semantics (matching the OTLP exporter spec):
     - ``protocol='grpc'``: requires the optional
       ``opentelemetry-exporter-otlp-proto-grpc`` package (not part of the
       'otel' extra); gRPC endpoints are used verbatim (no per-signal path).
+
+Transport security:
+    - ``build_providers`` runs
+      :func:`~rocketride.otelbridge.config.validate_transport_security` first,
+      so credential-bearing OTLP headers are never exported in cleartext to a
+      non-loopback collector without an explicit ``--insecure`` opt-in.
+    - The HTTP exporters are given a session that does NOT follow redirects.
+      ``requests`` drops ``Authorization`` only when the redirect changes
+      host, so a 3xx from a collector would otherwise replay custom
+      credential headers (``x-api-key`` and friends) to the redirect target,
+      including on an https -> http downgrade to the same host.
 """
 
+import logging
 from typing import Any, Callable, Dict, Optional, Tuple
+
+# InsecureTransportError is re-exported here: build_providers raises it, so
+# callers importing this module should not need to reach into .config.
+from .config import InsecureTransportError as InsecureTransportError
+from .config import validate_transport_security
+
+logger = logging.getLogger(__name__)
 
 _INSTALL_HINT = "pip install 'rocketride[otel]'"
 _GRPC_INSTALL_HINT = 'pip install opentelemetry-exporter-otlp-proto-grpc'
@@ -96,6 +115,45 @@ def _exporter_headers(config: Any) -> Optional[Dict[str, str]]:
     return dict(headers) if headers else None
 
 
+def _no_redirect_session() -> Any:
+    """
+    Build a ``requests`` session that never follows redirects.
+
+    OTLP/HTTP exporters post through ``Session.post``, which follows 3xx by
+    default. ``requests`` strips ``Authorization`` on a cross-HOST redirect
+    only: arbitrary credential headers (``x-api-key``, project auth values)
+    are replayed to the redirect target, and an https -> http downgrade to
+    the SAME host keeps even ``Authorization``. A collector has no reason to
+    redirect telemetry, so refusing to follow is both safe and lossless: a
+    3xx now surfaces as an export failure instead of a silent credential
+    leak.
+    """
+    import requests
+
+    class _NoRedirectSession(requests.Session):
+        """Session pinned to the configured endpoint (no 3xx following)."""
+
+        def send(self, request, **kwargs):  # type: ignore[override]
+            kwargs['allow_redirects'] = False
+            return super().send(request, **kwargs)
+
+    return _NoRedirectSession()
+
+
+def _http_exporter_kwargs(exporter_cls: Any) -> Dict[str, Any]:
+    """Extra kwargs for an OTLP/HTTP exporter: a non-redirecting session when supported."""
+    import inspect
+
+    try:
+        supported = 'session' in inspect.signature(exporter_cls.__init__).parameters
+    except (TypeError, ValueError):  # pragma: no cover - C-implemented __init__
+        supported = False
+    if not supported:  # pragma: no cover - exporter older than the 'session' kwarg
+        logger.debug('OTLP HTTP exporter %s takes no session=; redirects stay enabled', exporter_cls.__name__)
+        return {}
+    return {'session': _no_redirect_session()}
+
+
 def _build_span_exporter(config: Any) -> Any:
     """Build the OTLP span exporter for config.protocol ('http' or 'grpc')."""
     protocol = getattr(config, 'protocol', 'http') or 'http'
@@ -119,9 +177,10 @@ def _build_span_exporter(config: Any) -> Any:
         # hint as a missing extra, not a raw ModuleNotFoundError.
         raise OtelNotInstalledError(_INSTALL_HINT) from exc
 
+    extra = _http_exporter_kwargs(OTLPSpanExporter)
     if config.endpoint:
-        return OTLPSpanExporter(endpoint=_resolve_endpoint(config.endpoint, 'v1/traces'), headers=headers)
-    return OTLPSpanExporter(headers=headers)
+        return OTLPSpanExporter(endpoint=_resolve_endpoint(config.endpoint, 'v1/traces'), headers=headers, **extra)
+    return OTLPSpanExporter(headers=headers, **extra)
 
 
 def _build_metric_exporter(config: Any) -> Any:
@@ -144,9 +203,10 @@ def _build_metric_exporter(config: Any) -> Any:
     except ImportError as exc:
         raise OtelNotInstalledError(_INSTALL_HINT) from exc
 
+    extra = _http_exporter_kwargs(OTLPMetricExporter)
     if config.endpoint:
-        return OTLPMetricExporter(endpoint=_resolve_endpoint(config.endpoint, 'v1/metrics'), headers=headers)
-    return OTLPMetricExporter(headers=headers)
+        return OTLPMetricExporter(endpoint=_resolve_endpoint(config.endpoint, 'v1/metrics'), headers=headers, **extra)
+    return OTLPMetricExporter(headers=headers, **extra)
 
 
 def build_providers(config: Any) -> Tuple[Any, Any, Callable[[], None]]:
@@ -166,7 +226,14 @@ def build_providers(config: Any) -> Tuple[Any, Any, Callable[[], None]]:
     Raises:
         OtelNotInstalledError: The 'otel' extra (or the gRPC exporter for
             ``protocol='grpc'``) is not installed.
+        InsecureTransportError: Credential-bearing OTLP headers would be
+            exported in cleartext to a non-loopback collector and
+            ``config.allow_insecure`` is not set.
     """
+    # Fail before anything is constructed: no exporter, no worker thread and
+    # no credential on the wire until the transport is known to be safe.
+    validate_transport_security(config)
+
     try:
         from opentelemetry.sdk.metrics import MeterProvider
         from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
@@ -181,12 +248,24 @@ def build_providers(config: Any) -> Tuple[Any, Any, Callable[[], None]]:
     tracer_provider.add_span_processor(BatchSpanProcessor(_build_span_exporter(config)))
     tracer = tracer_provider.get_tracer(SCOPE_NAME)
 
-    if getattr(config, 'no_metrics', False):
-        meter_provider = MeterProvider(resource=resource, metric_readers=[])
-    else:
-        reader = PeriodicExportingMetricReader(_build_metric_exporter(config))
-        meter_provider = MeterProvider(resource=resource, metric_readers=[reader])
-    meter = meter_provider.get_meter(SCOPE_NAME)
+    # From here on the BatchSpanProcessor worker thread is running, and the
+    # caller has no handle to stop it until this function returns `shutdown`.
+    # Any failure while building the metric half (a missing gRPC exporter, a
+    # rejected endpoint) must therefore take the tracer provider down with it
+    # rather than leak the thread behind a "startup failed" message.
+    try:
+        if getattr(config, 'no_metrics', False):
+            meter_provider = MeterProvider(resource=resource, metric_readers=[])
+        else:
+            reader = PeriodicExportingMetricReader(_build_metric_exporter(config))
+            meter_provider = MeterProvider(resource=resource, metric_readers=[reader])
+        meter = meter_provider.get_meter(SCOPE_NAME)
+    except BaseException:
+        try:
+            tracer_provider.shutdown()
+        except Exception as exc:  # noqa: BLE001 - cleanup must not mask the original error
+            logger.debug('tracer provider shutdown failed while unwinding metric setup: %s', exc)
+        raise
 
     def shutdown() -> None:
         """Flush pending telemetry and shut down both providers.

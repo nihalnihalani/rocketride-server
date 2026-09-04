@@ -665,6 +665,36 @@ def test_tracked_run_cap_evicts_least_recently_eventful_run(monkeypatch):
     assert mapper.open_span_count() == 3  # run1 task + pipe root, run3 task
 
 
+def test_tracked_pipe_cap_evicts_least_recently_eventful_pipe(monkeypatch):
+    """A run that keeps receiving events is never evicted; its pipes still must be."""
+    monkeypatch.setattr(mapper_module, 'MAX_TRACKED_PIPES_PER_RUN', 2)
+    mapper, exporter = make_mapper()
+    mapper.handle_event('apaevt_flow', flow('begin', 'one.txt', pipe=1, pipes=['one.txt']))
+    mapper.handle_event('apaevt_flow', flow('begin', 'two.txt', pipe=2, pipes=['two.txt']))
+    # Touch pipe 1 so pipe 2 becomes the least recently eventful. Insertion
+    # order alone would have made pipe 1 the victim instead.
+    mapper.handle_event('apaevt_flow', flow('enter', 'step', pipe=1, trace={}))
+    # A third pipe must evict pipe 2, closing its root as unclosed.
+    mapper.handle_event('apaevt_flow', flow('begin', 'three.txt', pipe=3, pipes=['three.txt']))
+
+    evicted = spans_by_name(exporter, 'two.txt')
+    assert len(evicted) == 1
+    assert evicted[0].attributes[ATTR_SPAN_UNCLOSED] is True
+    assert not spans_by_name(exporter, 'one.txt')
+    assert not spans_by_name(exporter, 'three.txt')
+    assert set(mapper._runs[RUN_ID].pipes) == {1, 3}
+
+
+def test_tracked_pipe_cap_bounds_a_never_ending_run(monkeypatch):
+    """Pipes that never emit 'end' cannot grow without bound."""
+    monkeypatch.setattr(mapper_module, 'MAX_TRACKED_PIPES_PER_RUN', 4)
+    mapper, _exporter = make_mapper()
+    for pipe_id in range(50):
+        mapper.handle_event('apaevt_flow', flow('begin', f'p{pipe_id}.txt', pipe=pipe_id, pipes=[f'p{pipe_id}.txt']))
+
+    assert len(mapper._runs[RUN_ID].pipes) == 4
+
+
 def test_metrics_last_counts_bounded_lru(monkeypatch):
     monkeypatch.setattr(mapper_module, 'MAX_TRACKED_METRIC_RUNS', 2)
     mapper, reader = make_metrics_mapper()

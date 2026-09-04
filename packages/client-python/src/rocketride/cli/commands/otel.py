@@ -61,6 +61,12 @@ Secrets (collector auth values) are best passed via OTEL_EXPORTER_OTLP_HEADERS
 rather than --headers: command-line arguments land in shell history and are
 visible in process listings.
 
+Transport security: when any credential-bearing OTLP header is configured
+(from --headers or the OTEL_EXPORTER_OTLP_*HEADERS variables) and the
+effective collector endpoint is a NON-loopback cleartext one, the bridge
+refuses to start with exit code 2. Pass --insecure (or set
+ROCKETRIDE_OTEL_ALLOW_INSECURE=1) to override on a trusted network.
+
 Requires the optional OpenTelemetry dependencies:
     pip install 'rocketride[otel]'
 
@@ -69,12 +75,21 @@ Components:
 """
 
 import importlib.util
+import os
 import sys
 from typing import TYPE_CHECKING
 
 from .base import BaseCommand
 from ...otelbridge.bridge import run_bridge
-from ...otelbridge.config import OtelConfig
+from ...otelbridge.config import (
+    DEFAULT_GRPC_ENDPOINT,
+    DEFAULT_HTTP_ENDPOINT,
+    InsecureTransportError,
+    OtelConfig,
+    effective_endpoint,
+    redact_endpoint,
+    validate_transport_security,
+)
 
 # Safe without the 'otel' extra: setup.py keeps all opentelemetry imports lazy.
 from ...otelbridge.setup import OtelNotInstalledError
@@ -140,6 +155,30 @@ class OtelCommand(BaseCommand):
         """
         super().__init__(cli, args)
 
+    @staticmethod
+    def _endpoint_display(config: OtelConfig) -> str:
+        """
+        Render the effective OTLP endpoint for the startup line, redacted.
+
+        Never prints ``config.endpoint`` (or an environment endpoint) as
+        given: userinfo and query strings are stripped by
+        :func:`~rocketride.otelbridge.config.redact_endpoint` so no credential
+        or URL signature reaches stdout.
+
+        Args:
+            config: Resolved bridge configuration.
+
+        Returns:
+            str: Redacted endpoint, annotated with where it came from.
+        """
+        if config.endpoint:
+            return redact_endpoint(config.endpoint)
+        resolved = effective_endpoint(config, os.environ, 'traces')
+        sdk_default = DEFAULT_GRPC_ENDPOINT if config.protocol == 'grpc' else DEFAULT_HTTP_ENDPOINT
+        if resolved == sdk_default:
+            return f'exporter default ({sdk_default})'
+        return f'{redact_endpoint(resolved)} (from OTEL_EXPORTER_OTLP_*ENDPOINT)'
+
     async def execute(self, client: 'RocketRideClient') -> int:
         """
         Execute the OpenTelemetry bridge command.
@@ -196,14 +235,19 @@ class OtelCommand(BaseCommand):
                 f'to emit FLOW events at that level.'
             )
 
+        # Refuse to ship collector credentials in cleartext before the
+        # endpoint is echoed or a single span is exported.
+        try:
+            validate_transport_security(config)
+        except InsecureTransportError as e:
+            print(f'Error: {e}', file=sys.stderr)
+            return 2
+
         # Show the effective configuration before entering the run loop.
-        # With no endpoint configured the OTLP exporters resolve their own:
-        # OTEL_EXPORTER_OTLP_TRACES/METRICS_ENDPOINT, else the SDK default.
-        if config.endpoint:
-            endpoint_display = config.endpoint
-        else:
-            sdk_default = 'localhost:4317' if config.protocol == 'grpc' else 'http://localhost:4318'
-            endpoint_display = f'exporter default (OTEL_EXPORTER_OTLP_*_ENDPOINT or {sdk_default})'
+        # ALWAYS redacted: an endpoint can carry userinfo credentials
+        # (https://user:pass@host) or a signed query string, and this line
+        # goes to stdout, which operators pipe into logs.
+        endpoint_display = self._endpoint_display(config)
         print(f'OpenTelemetry bridge starting (endpoint: {endpoint_display}, protocol: {config.protocol})')
         print(f'  service.name: {config.service_name}')
         print(f'  metrics: {"disabled" if config.no_metrics else "enabled"}')
@@ -211,10 +255,21 @@ class OtelCommand(BaseCommand):
         print(
             "  FLOW spans require runs started with pipelineTraceLevel (e.g. client.use(pipelineTraceLevel='summary'))"
         )
+        if config.allow_insecure:
+            print(
+                '  WARNING: --insecure is set; OTLP credentials may be exported over cleartext transport',
+                file=sys.stderr,
+            )
 
         try:
             # Run the bridge until stopped (returns 0) or startup fails (2)
             return await run_bridge(client, config)
+
+        except InsecureTransportError as e:
+            # Re-checked inside build_providers; the environment could have
+            # been read differently there (e.g. embedded use).
+            print(f'Error: {e}', file=sys.stderr)
+            return 2
 
         except (ImportError, OtelNotInstalledError) as e:
             # Missing optional dependency surfaced after the guard, e.g.
