@@ -220,6 +220,30 @@ runs:
           printf '%s %s %s' "${delim}" "${s}" "${delim}"
         }
 
+        # A workflow command is one line of the form
+        # "::error <prop>=<value>,...::<data>", so a raw newline in an
+        # interpolated value ends the command and lets the rest of the value
+        # start a NEW command -- and a raw ":" or "," in a property value ends
+        # the property list. File paths and CLI stderr are PR-controlled, so
+        # percent-encode them exactly as @actions/core does before they are
+        # interpolated: data escapes "%", CR and LF; a property escapes those
+        # plus ":" and ",". "%" must be substituted first or it would re-encode
+        # the escapes this function itself introduces.
+        wc_escape_data() {
+          local s="${1//%/%25}"
+          s="${s//$'\r'/%0D}"
+          s="${s//$'\n'/%0A}"
+          printf '%s' "${s}"
+        }
+
+        wc_escape_property() {
+          local s
+          s="$(wc_escape_data "$1")"
+          s="${s//:/%3A}"
+          s="${s//,/%2C}"
+          printf '%s' "${s}"
+        }
+
         # The report is written to the job summary on every path, so `comment:
         # false` and fork pull requests (read-only GITHUB_TOKEN -> comment 403)
         # still surface the diff.
@@ -338,12 +362,17 @@ runs:
             *)
               any_error=true
               err_msg="$(cat "${err_file}")"
-              # Workflow-command annotations are line-oriented and "::" starts a
-              # command, so strip both from the untrusted message.
-              annotation_msg="${err_msg//$'\n'/ }"
-              annotation_msg="${annotation_msg//$'\r'/ }"
-              annotation_msg="${annotation_msg//::/ }"
-              echo "::error file=${f}::rocketride diff failed for ${f}: ${annotation_msg}"
+              # Both the path and the stderr are untrusted PR content, and both
+              # land in the same single-line workflow command, so both are
+              # percent-encoded: the path once as the "file" property and once as
+              # message data, the message as data. Encoding rather than stripping
+              # keeps the text intact (GitHub decodes %0A back to a line break in
+              # the rendered annotation) while making a second "::" command
+              # unrepresentable.
+              annotation_file="$(wc_escape_property "${f}")"
+              annotation_path="$(wc_escape_data "${f}")"
+              annotation_msg="$(wc_escape_data "${err_msg}")"
+              echo "::error file=${annotation_file}::rocketride diff failed for ${annotation_path}: ${annotation_msg}"
               # The fence is one backtick longer than the longest run in the
               # message (minimum 4), so no fence line inside the untrusted
               # stderr can close the block early and escape into Markdown.

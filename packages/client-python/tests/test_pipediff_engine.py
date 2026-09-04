@@ -382,6 +382,47 @@ def test_absent_viewport_equals_empty_viewport(null_viewport):
     assert with_layout.has_semantic_changes is False
 
 
+@pytest.mark.parametrize('falsy', [False, 0, ''], ids=['false', 'zero', 'empty-string'])
+def test_falsy_non_null_viewport_is_not_an_empty_viewport(falsy):
+    # Only None normalizes to {}. A blanket `or {}` also folded the non-null
+    # falsy JSON values false/0/"" into {} -- all of which `load_pipe` accepts --
+    # so `viewport: false` vs `viewport: {}` reported no change and exited 0 even
+    # under --include-layout.
+    old = _pipe([_node('a', 'src')], viewport={})
+    new = _pipe([_node('a', 'src')])
+    new['viewport'] = falsy
+
+    diff = diff_pipes(old, new)
+    assert diff.layout_changed is True
+
+    with_layout = diff_pipes(old, new, include_layout=True)
+    assert with_layout.layout_changed is True
+    assert [(change.path, change.old, change.new) for change in with_layout.viewport_changes] == [
+        ('viewport', {}, falsy)
+    ]
+    assert with_layout.has_semantic_changes is True
+
+
+@pytest.mark.parametrize('falsy', [False, 0, ''], ids=['false', 'zero', 'empty-string'])
+def test_falsy_non_null_node_ui_is_not_an_empty_ui(falsy):
+    # Same for a node's ui block: false/0/"" are real values, not "no layout".
+    old = _pipe([_node('a', 'src', ui={})])
+    new = _pipe([_node('a', 'src', ui={})])
+    new['components'][0]['ui'] = falsy
+
+    diff = diff_pipes(old, new)
+    assert diff.layout_changed is True
+    # Layout is still not semantic until the caller opts in.
+    assert diff.node_changes == []
+    assert diff.has_semantic_changes is False
+
+    with_layout = diff_pipes(old, new, include_layout=True)
+    config_changes = _changes_by_kind(with_layout, 'config')
+    assert len(config_changes) == 1
+    assert [(change.path, change.old, change.new) for change in config_changes[0].field_changes] == [('ui', {}, falsy)]
+    assert with_layout.has_semantic_changes is True
+
+
 @pytest.mark.parametrize('null_ui', [True, False], ids=['null', 'omitted'])
 def test_absent_node_ui_equals_empty_ui(null_ui):
     # Same normalization for a node's ui block: null/omitted vs {}.

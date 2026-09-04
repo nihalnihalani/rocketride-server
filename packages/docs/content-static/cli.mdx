@@ -502,9 +502,13 @@ inputs.
 > for a writable token (and then never check out or run the PR head's code from
 > that workflow).
 
-> **Before the CLI release:** `rocketride diff` ships in a release after 1.3.0.
-> Until then, pass `install-from: ./packages/client-python` (or any pip source
-> that provides the subcommand) instead of installing from PyPI.
+> **Before the CLI release:** `rocketride diff` ships in a release after 1.3.0,
+> so PyPI does not serve it yet. Until then, set `install-from` to a pip source
+> that does provide the subcommand. Inside `rocketride-server` that is the
+> checkout itself (`install-from: ./packages/client-python`); from any other
+> repository it is this repository's client package at a pinned commit:
+> `install-from: 'git+https://github.com/rocketride-org/rocketride-server@<full-commit-sha>#subdirectory=packages/client-python'`.
+> pip executes the source's build code, so pin a full SHA rather than a branch.
 
 If you would rather not vendor the composite action, the same result can be
 assembled inline — check out with `fetch-depth: 0` so the base branch is present
@@ -518,12 +522,15 @@ for `--git`, then diff and post the Markdown yourself:
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.12"
-      # `rocketride diff` ships in a release AFTER 1.3.0: until then `pip install
-      # rocketride` installs a CLI without the subcommand and the next step fails
-      # with "invalid choice: 'diff'". Until that release, install the client
-      # package from a checkout (see `install-from` above); afterwards pin it:
-      # pip install "rocketride==<release>".
-      - run: pip install rocketride
+      # `rocketride diff` ships in a release AFTER 1.3.0, so `pip install
+      # rocketride` would install a CLI without the subcommand and the next step
+      # would fail with "invalid choice: 'diff'". Until that release, install the
+      # client package straight from this repository at a pinned commit; pip runs
+      # the source's build code, so pin a full SHA, never a branch. Afterwards
+      # switch to the published release: pip install "rocketride==<release>".
+      - run: >-
+          pip install
+          "rocketride @ git+https://github.com/rocketride-org/rocketride-server@<full-commit-sha>#subdirectory=packages/client-python"
       - name: Semantic diff of the pipeline
         run: |
           rocketride diff --git "origin/${{ github.base_ref }}" rag.pipe \

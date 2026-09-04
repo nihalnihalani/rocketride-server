@@ -257,8 +257,10 @@ branch is present for `--git`, then diff and post the Markdown yourself:
       # `rocketride diff` ships in a release AFTER 1.3.0: until then `pip install
       # rocketride` installs a CLI without the subcommand and the next step fails
       # with "invalid choice: 'diff'". Install the client package from a checkout
-      # of this repository instead, and switch to `pip install
-      # "rocketride==<release>"` once a release provides `diff`.
+      # of this repository instead -- the path below resolves only here, so from
+      # another repository use the pinned remote form instead: pip install
+      # "rocketride @ git+https://github.com/rocketride-org/rocketride-server@<full-commit-sha>#subdirectory=packages/client-python".
+      # Switch to `pip install "rocketride==<release>"` once a release provides `diff`.
       - run: pip install ./packages/client-python
       - name: Semantic diff of the pipeline
         run: |

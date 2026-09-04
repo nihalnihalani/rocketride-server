@@ -300,7 +300,7 @@ def diff_pipes(old: dict, new: dict, *, include_layout: bool = False) -> PipeDif
         field_changes = deep_diff_config(old_component.get('config'), new_component.get('config'))
         if include_layout:
             field_changes = field_changes + _diff_value(
-                old_component.get('ui') or {}, new_component.get('ui') or {}, 'ui'
+                _layout_block(old_component.get('ui')), _layout_block(new_component.get('ui')), 'ui'
             )
         if field_changes:
             node_changes.append(NodeChange(id=component_id, kind='config', field_changes=field_changes))
@@ -328,7 +328,9 @@ def diff_pipes(old: dict, new: dict, *, include_layout: bool = False) -> PipeDif
     # with nothing to show.
     viewport_changes: list[FieldChange] = []
     if include_layout:
-        viewport_changes = _diff_value(old.get('viewport') or {}, new.get('viewport') or {}, 'viewport')
+        viewport_changes = _diff_value(
+            _layout_block(old.get('viewport')), _layout_block(new.get('viewport')), 'viewport'
+        )
 
     return PipeDiff(
         node_changes=node_changes,
@@ -412,6 +414,34 @@ def _edge_sort_key(edge: tuple[Any, Any, Any]) -> tuple[str, str, str]:
     return (str(edge[0]), str(edge[1]), str(edge[2]))
 
 
+def _layout_block(value: Any) -> Any:
+    """
+    Normalize a ``viewport``/``ui`` block for comparison, mapping only ``None``.
+
+    An omitted or explicitly-null layout block is the same canvas as an empty
+    object, so both must compare equal to ``{}``. Every other value is returned
+    untouched: a blanket ``or {}`` also folded the *non-null* falsy JSON values
+    ``false``, ``0`` and ``""`` into ``{}``, and :func:`load_pipe` accepts those,
+    so ``viewport: false`` versus ``viewport: {}`` reported no change and exited
+    ``0`` even under ``--include-layout``.
+
+    Validation deliberately stays out of this: :func:`_validate_pipe` rejects only
+    shapes the diff cannot process (a non-object component, a non-list
+    ``components``/wire collection, an unhashable wire endpoint). A scalar
+    ``viewport``/``ui`` processes fine — :func:`_diff_value` falls back to an
+    equality comparison and reports it as a single ``viewport``/``ui`` change —
+    so rejecting it would be stricter than the rest of the loader without making
+    any diff correct that is not already correct.
+
+    Args:
+        value: The raw ``viewport``/``ui`` value, or ``None`` when absent or null.
+
+    Returns:
+        ``{}`` when ``value`` is ``None``, otherwise ``value`` unchanged.
+    """
+    return {} if value is None else value
+
+
 def _layout_changed(
     old: dict,
     new: dict,
@@ -437,15 +467,17 @@ def _layout_changed(
     Returns:
         ``True`` if the viewport or any retained node's ui block differs.
     """
-    # Normalize exactly as the layout field diffs do (``... or {}``): an omitted
-    # or null ``viewport``/``ui`` is the same canvas as an empty object. Without
-    # this, None vs {} set layout_changed while producing no ``ui.*``/
+    # Normalize exactly as the layout field diffs do (:func:`_layout_block`): an
+    # omitted or null ``viewport``/``ui`` is the same canvas as an empty object.
+    # Without this, None vs {} set layout_changed while producing no ``ui.*``/
     # ``viewport.*`` change, so ``--include-layout`` reported a layout change with
     # nothing to show and still exited 0.
-    if (old.get('viewport') or {}) != (new.get('viewport') or {}):
+    if _layout_block(old.get('viewport')) != _layout_block(new.get('viewport')):
         return True
     for component_id in common_ids:
-        if (old_components[component_id].get('ui') or {}) != (new_components[component_id].get('ui') or {}):
+        if _layout_block(old_components[component_id].get('ui')) != _layout_block(
+            new_components[component_id].get('ui')
+        ):
             return True
     return False
 
