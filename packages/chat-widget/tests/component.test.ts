@@ -119,7 +119,7 @@ async function createChat(attrs: Record<string, string | null> = {}, client = ne
 	el.clientFactory = client.factory;
 
 	const merged: Record<string, string | null> = {
-		'engine-url': 'http://engine.test:5565',
+		'engine-url': 'https://engine.test:5565',
 		auth: 'TEST-PUBLIC-AUTH-KEY',
 		...attrs,
 	};
@@ -203,7 +203,7 @@ describe('connection lifecycle', () => {
 	it('connects on mount using engine-url and the public auth key', async () => {
 		const { el, client } = await createChat();
 		expect(client.connectCalls).toBe(1);
-		expect(client.config?.uri).toBe('http://engine.test:5565');
+		expect(client.config?.uri).toBe('https://engine.test:5565');
 		expect(client.config?.auth).toBe('TEST-PUBLIC-AUTH-KEY');
 		expect(client.config?.persist).toBe(true);
 		expect(el.connectionState).toBe('connected');
@@ -433,6 +433,61 @@ describe('output safety in the DOM', () => {
 	});
 });
 
+describe('conversation invalidation', () => {
+	it('drops the transcript when the engine identity changes, so it never reaches the new engine', async () => {
+		const mounted = await createChat();
+		await typeAndSubmit(mounted, 'first question');
+		await mounted.client.resolveChat(['first answer']);
+		expect(getMessages(mounted.shadow, 'user')).toHaveLength(1);
+
+		// Point the widget at a different engine (an auth swap is the same path).
+		const next = new FakeClient();
+		mounted.el.clientFactory = next.factory;
+		mounted.el.setAttribute('engine-url', 'https://other-engine.test:5565');
+		await flush();
+
+		expect(mounted.el.messages).toHaveLength(0);
+		expect(getMessages(mounted.shadow)).toHaveLength(0);
+
+		await typeAndSubmit(mounted, 'second question');
+		const payload = JSON.stringify(next.chatCalls[0].question);
+		expect(payload).not.toContain('first question');
+		expect(payload).not.toContain('first answer');
+		await next.resolveChat(['ok']);
+	});
+
+	it('ignores a reply that settles after clear() and frees the composer', async () => {
+		const mounted = await createChat();
+		await typeAndSubmit(mounted, 'question');
+		expect(mounted.el.busy).toBe(true);
+
+		mounted.el.clear();
+		await mounted.client.resolveChat(['late answer']);
+
+		expect(getMessages(mounted.shadow, 'assistant')).toHaveLength(0);
+		expect(mounted.el.messages.some((message) => message.text === 'late answer')).toBe(false);
+		// The abandoned request must not leave the composer disabled.
+		expect(mounted.el.busy).toBe(false);
+		expect(getInput(mounted.shadow).disabled).toBe(false);
+	});
+
+	it('ignores a failure that settles after the conversation was replaced', async () => {
+		const mounted = await createChat();
+		const errors: string[] = [];
+		mounted.el.addEventListener('rr-error', (event) => {
+			errors.push((event as CustomEvent<{ message: string }>).detail.message);
+		});
+
+		await typeAndSubmit(mounted, 'question');
+		mounted.el.clear();
+		await mounted.client.rejectChat('engine exploded');
+
+		expect(getMessages(mounted.shadow, 'system')).toHaveLength(0);
+		expect(errors).toHaveLength(0);
+		expect(mounted.el.busy).toBe(false);
+	});
+});
+
 describe('welcome message', () => {
 	it('shows the welcome bubble before the first exchange', async () => {
 		const mounted = await createChat({ welcome: 'Welcome aboard!' });
@@ -483,7 +538,7 @@ describe('autoscroll', () => {
 describe('IIFE entry auto-init', () => {
 	it('registers the element and mounts the bubble from a data-configured script tag', async () => {
 		const script = document.createElement('script');
-		script.setAttribute('data-engine-url', 'http://engine.test:5565');
+		script.setAttribute('data-engine-url', 'https://engine.test:5565');
 		script.setAttribute('data-auth', 'TEST-PUBLIC-AUTH-KEY');
 		script.setAttribute('data-title', 'Entry Test');
 		document.body.appendChild(script);
@@ -501,7 +556,7 @@ describe('IIFE entry auto-init', () => {
 		const host = document.querySelector('[data-rocketride-chat-bubble]');
 		expect(host).not.toBeNull();
 		const chat = host?.shadowRoot?.querySelector(WIDGET_TAG);
-		expect(chat?.getAttribute('engine-url')).toBe('http://engine.test:5565');
+		expect(chat?.getAttribute('engine-url')).toBe('https://engine.test:5565');
 
 		// Detach immediately: the upgraded element would otherwise keep a real
 		// SDK client retrying against the placeholder URL.

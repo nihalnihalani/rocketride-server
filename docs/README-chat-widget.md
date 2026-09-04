@@ -135,7 +135,8 @@ You build your `.pipe` - and the widget puts a chat UI on it, anywhere on the we
 ### Exposing an engine to browsers (CORS and TLS)
 
 - **CORS.** By default the engine's web endpoints accept requests from any `localhost` / `127.0.0.1` origin (any port) — enough for local development. To embed the widget on a real site, set the `RR_CORS_ORIGINS` environment variable on the engine to a comma-separated list of allowed origins (e.g. `RR_CORS_ORIGINS=https://www.example.com`).
-- **TLS / mixed content.** Browsers block insecure connections from `https` pages. If the embedding page is served over `https`, the `engine-url` must be `https` too (the SDK upgrades it to a secure WebSocket automatically) — in practice, put the engine behind a TLS-terminating reverse proxy and use that URL.
+- **TLS is required off-loopback.** The widget refuses to open a connection when `engine-url` is cleartext (`http:` / `ws:`) against a non-loopback host, and reports it as a connection error: the SDK maps a non-TLS URL to a plain `ws:` socket, which would put the auth key and every message on the wire unencrypted. `http://localhost:5565` and other loopback hosts (`127.0.0.0/8`, `::1`, `*.localhost`) stay allowed for local development; everything else needs `https:` / `wss:` — in practice, put the engine behind a TLS-terminating reverse proxy and use that URL.
+- **Mixed content.** Browsers separately block insecure connections from `https` pages, so an `https` embedding page needs an `https` `engine-url` regardless (the SDK upgrades it to a secure WebSocket automatically).
 - **Don't expose more than you need.** The page only needs to reach the engine's chat endpoint; keep engine management interfaces off the public network.
 
 ---
@@ -146,7 +147,7 @@ All attributes are observed — changing them on a live element takes effect imm
 
 | Attribute     | Required | Default                       | Description                                                                                                                                      |
 | ------------- | -------- | ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `engine-url`  | Yes      | -                             | RocketRide engine URL, e.g. `http://localhost:5565`. `http(s)` or `ws(s)` accepted; converted to WebSocket internally.                           |
+| `engine-url`  | Yes      | -                             | RocketRide engine URL, e.g. `https://engine.example.com`. `http(s)` or `ws(s)` accepted; converted to WebSocket internally. Cleartext `http:`/`ws:` is refused unless the host is loopback — see [Security](#security-public-auth-key-only). |
 | `auth`        | Yes      | -                             | The pipeline's **PUBLIC** Authorization Key (`pk_…`). Never an engine API key or private token — see [Security](#security-public-auth-key-only). |
 | `title`       | No       | `RocketRide Assistant`        | Header title. Note: `title` is also a global HTML attribute, so browsers additionally show it as a hover tooltip on the element.                 |
 | `accent`      | No       | `#5f2167` (RocketRide violet) | Brand accent color; any CSS color value. Shorthand for setting `--rr-accent`.                                                                    |

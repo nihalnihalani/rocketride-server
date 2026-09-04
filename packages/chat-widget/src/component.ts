@@ -123,6 +123,13 @@ export class RocketRideChatElement extends BaseElement {
 	private _connection: WidgetConnection | null = null;
 	private _messages: ChatMessage[] = [];
 	private _busy = false;
+	/**
+	 * Conversation identity counter, bumped by {@link clear} (which the
+	 * engine-url/auth swap also runs). A reply from an in-flight `ask()` that
+	 * captured an older generation belongs to a transcript that no longer
+	 * exists, so it is dropped instead of being appended to the new one.
+	 */
+	private _generation = 0;
 	private _stickToBottom = true;
 	private _lastConnectionState: ConnectionState = 'idle';
 	private _mediaQuery: MediaQueryList | null = null;
@@ -230,6 +237,9 @@ export class RocketRideChatElement extends BaseElement {
 
 	/** Clears the transcript back to the welcome message (if configured). */
 	clear(): void {
+		// Invalidate any in-flight ask(): its answer belongs to the transcript
+		// being discarded here, not to the one the user sees next.
+		this._generation++;
 		this._messages = [];
 		for (const el of Array.from(this._messagesEl.querySelectorAll('.rr-msg'))) {
 			el.remove();
@@ -267,6 +277,10 @@ export class RocketRideChatElement extends BaseElement {
 		switch (name) {
 			case 'engine-url':
 			case 'auth':
+				// The transcript belongs to the previous engine/auth context.
+				// Keeping it would replay that conversation into _historyItems()
+				// and hand it to the new engine on the very next question.
+				this.clear();
 				this._teardownConnection();
 				this._maybeConnect();
 				break;
@@ -392,6 +406,8 @@ export class RocketRideChatElement extends BaseElement {
 
 		// Capture history before appending the new question (mirrors chat-ui).
 		const history = this._historyItems();
+		// Capture the conversation identity this request belongs to.
+		const generation = this._generation;
 
 		this._appendMessage({ role: 'user', text: trimmed });
 		this._inputEl.value = '';
@@ -400,18 +416,39 @@ export class RocketRideChatElement extends BaseElement {
 
 		try {
 			const answers = await connection.ask(trimmed, history);
+			if (!this._isCurrentConversation(generation, connection)) {
+				return; // late reply for a cleared transcript or a replaced engine/auth
+			}
 			const texts = answers.length > 0 ? answers : ['No response received from the pipeline.'];
 			for (const answer of texts) {
 				this._appendMessage({ role: 'assistant', text: answer });
 			}
 		} catch (error: unknown) {
+			if (!this._isCurrentConversation(generation, connection)) {
+				return; // the failure belongs to a conversation the user has left
+			}
 			const message = error instanceof Error ? error.message : 'Sorry, something went wrong. Please try again.';
 			this._appendMessage({ role: 'system', text: message, transient: true });
 			this._dispatchError({ message, source: 'chat' });
 		} finally {
+			// Runs on every path, including the invalidated ones above, so the
+			// composer is never left disabled behind an abandoned request.
 			this._setBusy(false);
 			this._inputEl.focus();
 		}
+	}
+
+	/**
+	 * True while the send that captured `generation` and `connection` still owns
+	 * the visible conversation. A reply that loses this race belongs to a
+	 * transcript that was cleared, or to an engine/auth context that has since
+	 * been replaced, and must not be appended.
+	 *
+	 * @param generation - `_generation` as it was when the request was sent
+	 * @param connection - the connection the request was sent on
+	 */
+	private _isCurrentConversation(generation: number, connection: WidgetConnection): boolean {
+		return this._generation === generation && this._connection === connection;
 	}
 
 	/** Conversation history for pipeline context: real user/assistant turns only. */

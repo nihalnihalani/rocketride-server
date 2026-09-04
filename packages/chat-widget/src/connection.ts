@@ -34,6 +34,12 @@
  * authenticates the WebSocket connection and addresses the pipeline
  * (`client.chat({ token })`), mirroring apps/chat-ui.
  *
+ * TRANSPORT SECURITY (security-critical): the SDK maps a non-TLS engine URI to
+ * a plain `ws:` socket (see `RocketRideClient._getWebsocketUri`), which would
+ * put the auth key and the whole conversation on the wire in cleartext. This
+ * module therefore refuses cleartext for anything but loopback development
+ * hosts — see {@link assertSecureEngineUrl}.
+ *
  * Reconnection is owned by the SDK (`persist: true`): after a drop it retries
  * with linear backoff and never gives up; this class only translates the SDK
  * callbacks into UI-friendly state changes.
@@ -49,7 +55,11 @@ export const HISTORY_LIMIT = 6;
 
 /** Options for {@link WidgetConnection}. */
 export interface WidgetConnectionOptions {
-	/** Engine URL, e.g. `http://localhost:5565` (normalised by the SDK). */
+	/**
+	 * Engine URL, e.g. `https://engine.example.com` (normalised by the SDK).
+	 * Must be TLS (`https:`/`wss:`) unless it points at a loopback host — see
+	 * {@link assertSecureEngineUrl}.
+	 */
 	engineUrl: string;
 	/**
 	 * The pipeline's PUBLIC auth key — the `?auth=` value from the chat source
@@ -109,6 +119,64 @@ export function extractAnswerTexts(result: PIPELINE_RESULT | unknown): string[] 
 	return texts;
 }
 
+/** Schemes the widget accepts in `engineUrl`; anything else is a configuration error. */
+const ACCEPTED_SCHEMES = new Set(['https:', 'wss:', 'http:', 'ws:']);
+
+/** Schemes that encrypt the transport; the rest are cleartext. */
+const SECURE_SCHEMES = new Set(['https:', 'wss:']);
+
+/**
+ * True for hostnames that never leave the machine, so cleartext is acceptable
+ * there: `localhost` (and any `*.localhost` subdomain, which RFC 6761 reserves
+ * for loopback), the whole `127.0.0.0/8` range, and the IPv6 loopback.
+ *
+ * @param hostname - `URL.hostname` (IPv6 literals arrive without brackets)
+ */
+function isLoopbackHost(hostname: string): boolean {
+	// URL.hostname keeps the brackets off IPv6 literals, but be defensive.
+	const host = hostname.toLowerCase().replace(/^\[|\]$/g, '');
+	return host === 'localhost' || host.endsWith('.localhost') || host === '::1' || host === '0:0:0:0:0:0:0:1' || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host);
+}
+
+/**
+ * Rejects an engine URL whose transport would carry the auth key and the
+ * conversation in cleartext.
+ *
+ * The SDK downgrades silently: `RocketRideClient.normalizeUri` prefixes a
+ * scheme-less URI with `http://`, and `_getWebsocketUri` turns anything that is
+ * not `https:`/`wss:` into a plain `ws:` socket. A widget is embedded in
+ * arbitrary third-party pages, so that downgrade has to be caught here rather
+ * than left to the operator: `https:`/`wss:` is required for every host except
+ * loopback, where cleartext stays allowed for local development (the demo page
+ * and `http://localhost:5565` keep working unchanged).
+ *
+ * @param engineUrl - The configured engine URL, exactly as the embedder wrote it
+ * @throws Error when the URL is unparseable, uses an unsupported scheme, or is
+ *   cleartext against a non-loopback host
+ */
+export function assertSecureEngineUrl(engineUrl: string): void {
+	const raw = engineUrl.trim();
+	// Mirror the SDK's scheme defaulting so a bare 'engine.example:5565' is
+	// judged as the http:// URL the SDK will actually build from it.
+	const candidate = /^[a-zA-Z][a-zA-Z\d+\-.]*:\/\//.test(raw) ? raw : `http://${raw}`;
+
+	let url: URL;
+	try {
+		url = new URL(candidate);
+	} catch {
+		throw new Error(`WidgetConnection: engineUrl is not a valid URL (${engineUrl}).`);
+	}
+
+	if (!ACCEPTED_SCHEMES.has(url.protocol)) {
+		throw new Error(`WidgetConnection: unsupported engineUrl scheme "${url.protocol}" — use https:// or wss:// (http:// and ws:// are accepted for loopback hosts only).`);
+	}
+	if (SECURE_SCHEMES.has(url.protocol) || isLoopbackHost(url.hostname)) {
+		return;
+	}
+
+	throw new Error(`WidgetConnection: refusing to connect to "${engineUrl}" over cleartext — the auth key and every message would cross the network unencrypted. Use https:// or wss:// (terminate TLS in front of the engine); plain http:// or ws:// is allowed only for loopback hosts (localhost, 127.0.0.1, ::1) during local development.`);
+}
+
 /**
  * Manages one persistent widget connection to a RocketRide engine.
  *
@@ -152,6 +220,9 @@ export class WidgetConnection {
 		if (!this._options.engineUrl || !this._options.auth) {
 			throw new Error("WidgetConnection requires both engineUrl and auth (the pipeline's public auth key).");
 		}
+		// Security gate: never hand a credentialed connection to a cleartext
+		// transport. Throws before any client exists, so nothing is sent.
+		assertSecureEngineUrl(this._options.engineUrl);
 
 		this._setState('connecting');
 		this._manualDisconnect = false;

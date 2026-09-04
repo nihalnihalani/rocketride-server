@@ -32,7 +32,7 @@
  */
 
 import { PIPELINE_RESULT, Question, QuestionType, RocketRideClientConfig } from 'rocketride';
-import { HISTORY_LIMIT, WidgetConnection, extractAnswerTexts } from '../src/connection';
+import { HISTORY_LIMIT, WidgetConnection, assertSecureEngineUrl, extractAnswerTexts } from '../src/connection';
 import { ChatClientLike, ChatHistoryItem, ConnectionState } from '../src/types';
 
 /** Options captured from a chat() call. */
@@ -124,6 +124,56 @@ describe('WidgetConnection — connect/disconnect lifecycle', () => {
 		// Simulate an SDK-reported drop with error (e.g. HTTP 401 on reconnect).
 		await getConfig()!.onDisconnected?.('Authentication error', true);
 		expect(states[states.length - 1]).toEqual({ state: 'error', detail: 'Authentication error' });
+	});
+});
+
+describe('WidgetConnection — transport security', () => {
+	/** Builds a connection for `engineUrl`, tracking whether a client was ever built. */
+	function makeFor(engineUrl: string) {
+		let created = 0;
+		const connection = new WidgetConnection({
+			engineUrl,
+			auth: 'PUBLIC-AUTH-KEY-PLACEHOLDER',
+			createClient: (clientConfig) => {
+				created += 1;
+				return new FakeClient(clientConfig);
+			},
+		});
+		return { connection, clientsCreated: () => created };
+	}
+
+	// TLS, or a host the traffic never leaves the machine to reach.
+	it.each(['https://engine.example.com', 'wss://engine.example.com', 'http://localhost:5565', 'http://127.0.0.1:5565', 'http://127.1.2.3:5565', 'http://[::1]:5565', 'http://engine.localhost:5565', 'ws://localhost:5565'])('accepts %s', (engineUrl: string) => {
+		expect(() => assertSecureEngineUrl(engineUrl)).not.toThrow();
+	});
+
+	// Cleartext to a host that is reached over the network: the auth key and
+	// every message would be readable on the wire.
+	it.each(['http://engine.example.com', 'http://engine.example.com:5565', 'ws://engine.example.com', 'http://10.0.0.5:5565', 'http://192.168.1.10:5565', 'engine.example.com:5565'])('rejects cleartext %s', (engineUrl: string) => {
+		expect(() => assertSecureEngineUrl(engineUrl)).toThrow(/cleartext/);
+	});
+
+	it('rejects an unsupported scheme and an unparseable URL', () => {
+		expect(() => assertSecureEngineUrl('ftp://engine.example.com')).toThrow(/unsupported engineUrl scheme/);
+		expect(() => assertSecureEngineUrl('http://')).toThrow(/not a valid URL/);
+	});
+
+	it('never builds a client for a cleartext engine URL', async () => {
+		const { connection, clientsCreated } = makeFor('http://engine.example.com:5565');
+
+		await expect(connection.connect()).rejects.toThrow(/cleartext/);
+		// Nothing was constructed, so the auth key never reached a transport.
+		expect(clientsCreated()).toBe(0);
+		expect(connection.isConnected()).toBe(false);
+		expect(connection.state).toBe('idle');
+	});
+
+	it('still builds a client for a loopback development URL', async () => {
+		const { connection, clientsCreated } = makeFor('http://localhost:5565');
+
+		await connection.connect();
+		expect(clientsCreated()).toBe(1);
+		expect(connection.isConnected()).toBe(true);
 	});
 });
 
