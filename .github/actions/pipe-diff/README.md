@@ -145,7 +145,10 @@ writes. Your options, in order of preference:
 - **Failure semantics.** The action does **not** fail merely because semantic
   changes exist — it is informational. It **does** fail (and emits an `error`
   annotation) when a changed `.pipe` file cannot be parsed or diffed, so a broken
-  pipeline in a PR is surfaced as a red check.
+  pipeline in a PR is surfaced as a red check, and when the pull-request base
+  commit cannot be fetched (`actions/checkout` did not run first, or ran without
+  credentials). Both failure paths still write the job summary, so the reason is
+  readable without digging through the step log.
 
 ## Local equivalent
 

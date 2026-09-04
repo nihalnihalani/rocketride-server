@@ -244,9 +244,9 @@ runs:
           printf '%s' "${s}"
         }
 
-        # The report is written to the job summary on every path, so `comment:
-        # false` and fork pull requests (read-only GITHUB_TOKEN -> comment 403)
-        # still surface the diff.
+        # The report is written to the job summary on every path -- including
+        # the ones that end in `exit 1` -- so `comment: false` and fork pull
+        # requests (read-only GITHUB_TOKEN -> comment 403) still surface it.
         write_job_summary() {
           if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
             cat "${body_file}" >> "${GITHUB_STEP_SUMMARY}"
@@ -284,6 +284,17 @@ runs:
             || true
         fi
         if ! git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null; then
+          # This path fails the step, but it still has to leave a report behind:
+          # `comment: false` and fork pull requests have no other channel, and
+          # the job summary is documented as written on every path. Build the
+          # body, write the summary, then annotate and fail.
+          {
+            printf '%s\n' "${marker}"
+            printf '## RocketRide pipeline diff\n\n'
+            printf 'Could not fetch the pull-request base commit %s, so no diff was computed.\n\n' "$(md_code "${BASE_SHA}")"
+            printf 'Ensure `actions/checkout` runs before this action and leaves its credentials available (the default).\n'
+          } > "${body_file}"
+          write_job_summary
           echo "::error::Could not fetch the PR base commit ${BASE_SHA}. Ensure actions/checkout ran before this action and left credentials available (the default)."
           exit 1
         fi
