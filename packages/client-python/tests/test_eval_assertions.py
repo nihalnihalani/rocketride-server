@@ -206,6 +206,20 @@ def test_json_path_equals():
     assert not evaluate('json_path', JSON_DOC, path='answer.text', equals='London').passed
 
 
+def test_json_path_equals_does_not_conflate_bool_and_number():
+    """True == 1 in Python; the assertion must still reject the mismatch."""
+    document = json.dumps({'flag': True, 'count': 1, 'off': False, 'zero': 0})
+
+    assert not evaluate('json_path', document, path='flag', equals=1).passed
+    assert not evaluate('json_path', document, path='count', equals=True).passed
+    assert not evaluate('json_path', document, path='off', equals=0).passed
+    assert not evaluate('json_path', document, path='zero', equals=False).passed
+    # Same-type comparisons still pass
+    assert evaluate('json_path', document, path='flag', equals=True).passed
+    assert evaluate('json_path', document, path='count', equals=1).passed
+    assert evaluate('json_path', document, path='off', equals=False).passed
+
+
 def test_json_path_list_index():
     assert evaluate('json_path', JSON_DOC, path='citations.1.title', equals='Atlas').passed
 
