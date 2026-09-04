@@ -47,15 +47,21 @@ def _completed(returncode, stdout='', stderr=''):
 
 
 def _install_fake_git(monkeypatch, responses):
-    """Patch ``subprocess.run`` in gitref to reply per git subcommand.
+    """Patch ``subprocess.run`` in gitref to reply per git invocation.
 
-    ``responses`` maps the subcommand ("rev-parse" or "show") to either a
-    ``CompletedProcess`` or an ``Exception`` instance (which is raised).
+    ``responses`` maps an invocation key to either a ``CompletedProcess`` or an
+    ``Exception`` instance (which is raised). The keys are the git subcommand
+    ("rev-parse", "cat-file", "show"), plus "rev-parse-verify" for the ref
+    verification (``rev-parse --verify``) as distinct from the repository-root
+    lookup (``rev-parse --show-toplevel``). "rev-parse-verify" and "cat-file"
+    default to success, so a test only has to name the step it cares about.
     """
+    defaults = {'rev-parse-verify': _completed(0, stdout='deadbeef\n'), 'cat-file': _completed(0)}
 
     def fake_run(args, **_kwargs):
         subcommand = args[3]  # ['git', '-C', <dir>, <subcommand>, ...]
-        outcome = responses[subcommand]
+        key = 'rev-parse-verify' if subcommand == 'rev-parse' and '--verify' in args else subcommand
+        outcome = responses[key] if key in responses else defaults[key]
         if isinstance(outcome, BaseException):
             raise outcome
         return outcome
@@ -84,14 +90,16 @@ def test_resolve_returns_parsed_pipe_when_found(monkeypatch):
     [
         "fatal: path 'pipeline.pipe' exists on disk, but not in 'HEAD'",
         "fatal: path 'pipeline.pipe' does not exist in 'HEAD'",
+        '',
     ],
 )
 def test_resolve_returns_none_when_path_absent_in_ref(monkeypatch, stderr):
+    # The verdict comes from ``cat-file -e``'s exit code, whatever git prints.
     _install_fake_git(
         monkeypatch,
         {
             'rev-parse': _completed(0, stdout='/repo\n'),
-            'show': _completed(128, stderr=stderr),
+            'cat-file': _completed(1, stderr=stderr),
         },
     )
     assert resolve_git_ref('HEAD', '/repo/pipeline.pipe') is None
@@ -102,11 +110,43 @@ def test_resolve_raises_on_unknown_ref(monkeypatch):
         monkeypatch,
         {
             'rev-parse': _completed(0, stdout='/repo\n'),
-            'show': _completed(128, stderr="fatal: invalid object name 'nope'."),
+            'rev-parse-verify': _completed(128, stderr='fatal: Needed a single revision'),
+        },
+    )
+    with pytest.raises(PipeDiffError, match='Unknown git ref'):
+        resolve_git_ref('nope', '/repo/pipeline.pipe')
+
+
+def test_resolve_raises_when_bad_ref_name_echoes_a_path_absent_phrase(monkeypatch):
+    """A bad ref must stay an error even when git's diagnostic quotes it.
+
+    git echoes the offending revision back, so a ref whose *name* contains
+    "does not exist in" used to be mistaken for "the file is not in this ref" and
+    silently produced an all-added diff instead of exit code 2.
+    """
+    bad_ref = 'nope does not exist in'
+    _install_fake_git(
+        monkeypatch,
+        {
+            'rev-parse': _completed(0, stdout='/repo\n'),
+            'rev-parse-verify': _completed(128, stderr=f"fatal: invalid object name '{bad_ref}'."),
+        },
+    )
+    with pytest.raises(PipeDiffError, match='Unknown git ref'):
+        resolve_git_ref(bad_ref, '/repo/pipeline.pipe')
+
+
+def test_resolve_raises_when_show_fails_for_a_present_object(monkeypatch):
+    """A verified ref plus a present object that still fails to read is an error."""
+    _install_fake_git(
+        monkeypatch,
+        {
+            'rev-parse': _completed(0, stdout='/repo\n'),
+            'show': _completed(128, stderr='fatal: unable to read object'),
         },
     )
     with pytest.raises(PipeDiffError, match='git show'):
-        resolve_git_ref('nope', '/repo/pipeline.pipe')
+        resolve_git_ref('HEAD', '/repo/pipeline.pipe')
 
 
 def test_resolve_raises_when_not_a_git_repo(monkeypatch):

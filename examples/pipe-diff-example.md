@@ -213,11 +213,15 @@ jobs:
   diff:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4 # default fetch-depth: 1 is fine; the action fetches the base itself
+      # default fetch-depth: 1 is fine; the action fetches the base itself
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: rocketride-org/rocketride-server/.github/actions/pipe-diff@develop
 ```
 
-Pin `@develop` to a tag or commit SHA for a reproducible run. Inside this
+Every `uses:` runs with the job's token, so pin each one to a full commit SHA
+(keep the `# v4` comment for readability) instead of a mutable tag or branch: a
+retagged action changes what your job executes. Pin `@develop` to a tag or commit
+SHA the same way once the action is released. Inside this
 repository the local form `uses: ./.github/actions/pipe-diff` works too, but it
 resolves only here — another repository has no such directory on disk.
 
@@ -244,19 +248,24 @@ branch is present for `--git`, then diff and post the Markdown yourself:
 
 ```yaml
 # Alternative: inline equivalent of the composite action, for a single file.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           fetch-depth: 0 # need the base branch for `git show`
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.12"
-      - run: pip install rocketride
+      # `rocketride diff` ships in a release AFTER 1.3.0: until then `pip install
+      # rocketride` installs a CLI without the subcommand and the next step fails
+      # with "invalid choice: 'diff'". Install the client package from a checkout
+      # of this repository instead, and switch to `pip install
+      # "rocketride==<release>"` once a release provides `diff`.
+      - run: pip install ./packages/client-python
       - name: Semantic diff of the pipeline
         run: |
           rocketride diff --git "origin/${{ github.base_ref }}" rag.pipe \
             --markdown --exit-zero | tee pipe-diff.md
       - name: Comment on the PR
-        uses: marocchino/sticky-pull-request-comment@v2
+        uses: marocchino/sticky-pull-request-comment@773744901bac0e8cbb5a0dc842800d45e9b2b405 # v2.9.4
         with:
           path: pipe-diff.md
 ```

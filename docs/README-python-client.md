@@ -671,11 +671,11 @@ _Layout (ui/viewport) changed._
 **Review pipelines like code in CI.** Because `diff` is local and exits non-zero on change, it drops straight into a pull-request check: a GitHub Actions job runs `rocketride diff --git origin/<base> <file> --markdown` and posts the summary as a PR comment. The bundled composite action does all of that for you:
 
 ```yaml
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: rocketride-org/rocketride-server/.github/actions/pipe-diff@develop
 ```
 
-Pin `@develop` to a tag or commit SHA for a reproducible run; the `./.github/actions/pipe-diff` relative form works only inside the `rocketride-server` repository itself. On a fork pull request the default `GITHUB_TOKEN` is read-only, so the action warns instead of commenting and leaves the report in the job summary. Until a release after 1.3.0 ships `rocketride diff`, pass `install-from: ./packages/client-python` so the action installs the CLI from a checkout instead of PyPI. This is the review half of the "pipelines as code" loop — **validate** a `.pipe` to confirm it is well-formed before it runs (via [`client.validate()`](#services-validation-and-ping)), **evaluate** it to measure output quality, and `diff` it to see exactly what changed between revisions. See the [side-by-side example and PR-comment recipe](https://github.com/rocketride-org/rocketride-server/blob/develop/examples/pipe-diff-example.md).
+Every `uses:` in a workflow runs with the job's token, so pin each one to a full commit SHA (the `# v4` comment keeps it readable) rather than a mutable tag or branch — a retagged action would otherwise change what your job executes. Pin `@develop` the same way once the action is released; the `./.github/actions/pipe-diff` relative form works only inside the `rocketride-server` repository itself. On a fork pull request the default `GITHUB_TOKEN` is read-only, so the action warns instead of commenting and leaves the report in the job summary. Until a release after 1.3.0 ships `rocketride diff`, pass `install-from: ./packages/client-python` so the action installs the CLI from a checkout instead of PyPI. This is the review half of the "pipelines as code" loop — **validate** a `.pipe` to confirm it is well-formed before it runs (via [`client.validate()`](#services-validation-and-ping)), **evaluate** it to measure output quality, and `diff` it to see exactly what changed between revisions. See the [side-by-side example and PR-comment recipe](https://github.com/rocketride-org/rocketride-server/blob/develop/examples/pipe-diff-example.md).
 
 ## Configuration
 

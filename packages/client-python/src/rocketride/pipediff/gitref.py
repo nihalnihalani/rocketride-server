@@ -49,22 +49,15 @@ from .engine import PipeDiffError, load_pipe
 # Upper bound so a wedged git process can never hang the CLI indefinitely.
 _GIT_TIMEOUT_SECONDS = 30
 
-# Substrings git uses when a ref is valid but the path is absent from it. These
-# distinguish "file not in this ref" (return None) from a genuine failure such as
-# an unknown revision (raise PipeDiffError).
-_PATH_ABSENT_MARKERS = (
-    'does not exist in',
-    'exists on disk, but not in',
-)
-
 
 def resolve_git_ref(ref: str, file_path: str) -> dict | None:
     """
     Load a pipeline file's contents at a specific git ref.
 
-    Resolves ``file_path`` to its repository-relative location and runs
-    ``git show <ref>:<relative-path>`` to retrieve the file as it existed at
-    ``ref``, then parses and validates the result. Used to diff a working-tree
+    Resolves ``file_path`` to its repository-relative location, verifies that
+    ``ref`` names a commit, and runs ``git show <ref>:<relative-path>`` to
+    retrieve the file as it existed at ``ref``, then parses and validates the
+    result. Used to diff a working-tree
     ``.pipe`` file against an arbitrary commit, branch, or tag.
 
     Args:
@@ -79,8 +72,8 @@ def resolve_git_ref(ref: str, file_path: str) -> dict | None:
 
     Raises:
         PipeDiffError: If the path is not inside a git repository, the ref is
-            unknown, ``git`` is unavailable or times out, or the retrieved
-            contents are not a valid pipeline.
+            unknown (or does not name a commit), ``git`` is unavailable or times
+            out, or the retrieved contents are not a valid pipeline.
     """
     # realpath (not just abspath) so the file resolves to the same physical path
     # that ``git rev-parse --show-toplevel`` reports, keeping relpath consistent
@@ -92,12 +85,31 @@ def resolve_git_ref(ref: str, file_path: str) -> dict | None:
     rel_path = os.path.relpath(abs_path, repo_root).replace(os.sep, '/')
     spec = f'{ref}:{rel_path}'
 
+    # "Ref unknown" and "path absent from a known ref" must not be confused: the
+    # first is a user error (exit 2), the second means "everything is new". Both
+    # are decided on a git exit code, never on the wording of git's diagnostic —
+    # a ref whose *name* contains a phrase like "does not exist in" is echoed
+    # back in that diagnostic, and matching on it would silently downgrade a bad
+    # ref into an all-added diff.
+    verified = _run_git(
+        ['-C', repo_root, 'rev-parse', '--verify', '--quiet', f'{ref}^{{commit}}'],
+        f'verifying ref {ref}',
+    )
+    if verified.returncode != 0:
+        detail = verified.stderr.strip()
+        suffix = f': {detail}' if detail else ''
+        raise PipeDiffError(f'Unknown git ref {ref!r}{suffix}')
+
+    # ``cat-file -e`` is the machine-readable existence check: exit 0 when the
+    # object named by <ref>:<path> exists in that (already verified) ref, non-zero
+    # when it does not.
+    present = _run_git(['-C', repo_root, 'cat-file', '-e', spec], f'checking for {spec}')
+    if present.returncode != 0:
+        return None
+
     result = _run_git(['-C', repo_root, 'show', spec], f'reading {spec}')
     if result.returncode != 0:
-        stderr = result.stderr.strip()
-        if any(marker in stderr for marker in _PATH_ABSENT_MARKERS):
-            return None
-        raise PipeDiffError(f'git show {spec} failed: {stderr}')
+        raise PipeDiffError(f'git show {spec} failed: {result.stderr.strip()}')
 
     try:
         obj = json.loads(result.stdout)

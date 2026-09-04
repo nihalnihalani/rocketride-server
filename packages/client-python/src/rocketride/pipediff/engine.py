@@ -133,20 +133,33 @@ def _validate_pipe(obj: Any, source: str) -> dict:
 
     Raises:
         PipeDiffError: If ``obj`` is not an object, lacks a ``components`` list,
-            contains a component that is not an id-bearing object, or contains a
-            component whose ``input``/``control`` wiring is malformed.
+            contains a component that is not an id-bearing object, reuses a
+            component ``id``, or contains a component whose ``input``/``control``
+            wiring is malformed.
     """
     if not isinstance(obj, dict):
         raise PipeDiffError(f'{source}: pipe must be a JSON object, got {type(obj).__name__}')
     components = obj.get('components')
     if not isinstance(components, list):
         raise PipeDiffError(f"{source}: pipe is missing a 'components' list")
+    # Ids are the diff's matching key, so a duplicate is not a harmless quirk:
+    # indexing by id keeps only the last component with that id, which would
+    # silently hide the earlier node and any change to it. Reject it as an
+    # actionable exit-2 error instead of emitting a diff that is quietly wrong.
+    seen_ids: dict[str, int] = {}
     for index, component in enumerate(components):
         if not isinstance(component, dict):
             raise PipeDiffError(f'{source}: component at index {index} is not an object')
         component_id = component.get('id')
         if not isinstance(component_id, str) or not component_id:
             raise PipeDiffError(f"{source}: component at index {index} is missing a string 'id'")
+        first_index = seen_ids.get(component_id)
+        if first_index is not None:
+            raise PipeDiffError(
+                f"{source}: duplicate component id '{component_id}' at index {index} "
+                f'(already used at index {first_index})'
+            )
+        seen_ids[component_id] = index
         _validate_wires(component, component_id, source)
     return obj
 
@@ -336,8 +349,8 @@ def _components_by_id(pipe: dict) -> dict[str, dict]:
     Index a pipeline's components by their ``id``.
 
     Non-object components and components without an ``id`` are skipped defensively
-    (``load_pipe`` normally rejects those upstream). If duplicate ids appear, the
-    last one wins.
+    (``load_pipe`` normally rejects those upstream, and also rejects duplicate ids
+    so that no component can be shadowed here).
 
     Args:
         pipe: A pipeline dict.
@@ -424,10 +437,15 @@ def _layout_changed(
     Returns:
         ``True`` if the viewport or any retained node's ui block differs.
     """
-    if old.get('viewport') != new.get('viewport'):
+    # Normalize exactly as the layout field diffs do (``... or {}``): an omitted
+    # or null ``viewport``/``ui`` is the same canvas as an empty object. Without
+    # this, None vs {} set layout_changed while producing no ``ui.*``/
+    # ``viewport.*`` change, so ``--include-layout`` reported a layout change with
+    # nothing to show and still exited 0.
+    if (old.get('viewport') or {}) != (new.get('viewport') or {}):
         return True
     for component_id in common_ids:
-        if old_components[component_id].get('ui') != new_components[component_id].get('ui'):
+        if (old_components[component_id].get('ui') or {}) != (new_components[component_id].get('ui') or {}):
             return True
     return False
 

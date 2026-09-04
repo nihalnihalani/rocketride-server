@@ -361,6 +361,46 @@ def test_include_layout_with_unchanged_viewport_reports_nothing():
     assert diff.has_semantic_changes is False
 
 
+@pytest.mark.parametrize('null_viewport', [True, False], ids=['null', 'omitted'])
+def test_absent_viewport_equals_empty_viewport(null_viewport):
+    # `_layout_changed` and the viewport field diff must normalize identically:
+    # an omitted or null viewport is the same canvas as {}. Comparing the raw
+    # values set layout_changed while producing no viewport.* paths, so
+    # --include-layout claimed a layout change yet exited 0 with nothing to show.
+    old = _pipe([_node('a', 'src')], viewport={})
+    new = _pipe([_node('a', 'src')])
+    if null_viewport:
+        new['viewport'] = None
+
+    diff = diff_pipes(old, new)
+    assert diff.layout_changed is False
+    assert diff.has_semantic_changes is False
+
+    with_layout = diff_pipes(old, new, include_layout=True)
+    assert with_layout.viewport_changes == []
+    assert with_layout.layout_changed is False
+    assert with_layout.has_semantic_changes is False
+
+
+@pytest.mark.parametrize('null_ui', [True, False], ids=['null', 'omitted'])
+def test_absent_node_ui_equals_empty_ui(null_ui):
+    # Same normalization for a node's ui block: null/omitted vs {}.
+    old = _pipe([_node('a', 'src', ui={})])
+    new = _pipe([_node('a', 'src', ui={})])
+    if null_ui:
+        new['components'][0]['ui'] = None
+    else:
+        del new['components'][0]['ui']
+
+    diff = diff_pipes(old, new)
+    assert diff.layout_changed is False
+
+    with_layout = diff_pipes(old, new, include_layout=True)
+    assert with_layout.node_changes == []
+    assert with_layout.layout_changed is False
+    assert with_layout.has_semantic_changes is False
+
+
 # ---------------------------------------------------------------------------
 # Determinism
 # ---------------------------------------------------------------------------
@@ -431,6 +471,22 @@ def test_load_pipe_component_missing_id_raises():
 def test_load_pipe_component_not_object_raises():
     with pytest.raises(PipeDiffError, match='index 0 is not an object'):
         load_pipe({'components': ['not-a-dict']})
+
+
+def test_load_pipe_duplicate_component_id_raises():
+    # Components are matched by id, and indexing by id keeps only the last one.
+    # A duplicate would therefore hide the first node and every change to it, so
+    # it has to be an actionable error rather than a quietly wrong diff.
+    with pytest.raises(PipeDiffError, match="duplicate component id 'a' at index 2"):
+        load_pipe(
+            {
+                'components': [
+                    {'id': 'a', 'provider': 'src'},
+                    {'id': 'b', 'provider': 'src'},
+                    {'id': 'a', 'provider': 'other'},
+                ]
+            }
+        )
 
 
 def test_load_pipe_rejects_unsupported_type():

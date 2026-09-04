@@ -66,6 +66,14 @@ repository dogfoods the action:
           install-from: ./packages/client-python
 ```
 
+> **`install-from` is an executable package source.** Its value is passed to
+> `python -m pip install`, which runs the source's build and install code
+> (`setup.py`, PEP 517 backends, install hooks) with the job's privileges and
+> token. Point it only at code you trust. In particular, in a
+> `pull_request_target` workflow — writable token, base-repository secrets — it
+> must **never** resolve to pull-request-controlled code: do not point it at a
+> path inside a checkout of the PR head.
+
 ## Inputs
 
 | Input            | Default       | Description |
@@ -73,7 +81,7 @@ repository dogfoods the action:
 | `files`          | `**/*.pipe`   | Git pathspec glob selecting the `.pipe` files to consider. Git's `:(glob)` magic is applied automatically, so `**` matches across directories. Only files that actually changed versus the PR base are diffed. |
 | `python-version` | `3.12`        | Python version passed to `actions/setup-python`. RocketRide requires Python >= 3.10. |
 | `cli-version`    | `` (empty)    | pip version specifier appended to the `rocketride` requirement, e.g. `==1.4.0` or `>=1.4,<2`. Empty installs the latest published release. The run **fails fast** with a clear message if the installed CLI lacks the `diff` subcommand. |
-| `install-from`   | `` (empty)    | Install the CLI from this local path or pip source (e.g. `./packages/client-python`) instead of PyPI. Takes precedence over `cli-version`. Use it to run the action before a release ships `rocketride diff`. |
+| `install-from`   | `` (empty)    | Install the CLI from this local path or pip source (e.g. `./packages/client-python`) instead of PyPI. Takes precedence over `cli-version`. Use it to run the action before a release ships `rocketride diff`. **Executable source:** pip runs its build/install code with the job's privileges, so point it only at trusted code — never at PR-controlled code in a `pull_request_target` workflow. |
 | `comment`        | `true`        | When `true`, post or update one sticky PR comment. Set to `false` to compute the diff without commenting; that mode needs no `pull-requests: write` permission. The report is written to the **job summary** either way. |
 | `include-layout` | `false`       | When `true`, treat canvas layout churn (per-node `ui` blocks and the top-level `viewport`) as meaningful and enumerate it as `ui.*` / `viewport.*` field changes. When `false` (default) a pure-layout change is reported as `No semantic changes.`. |
 
@@ -109,7 +117,8 @@ writes. Your options, in order of preference:
 3. Use `pull_request_target`, which runs with a writable token. Note its
    trade-off: the workflow runs in the base repository's context, so you must
    **not** check out or execute the PR head's code from it. This action only
-   reads `.pipe` data files, but the rest of your job must respect that rule.
+   reads `.pipe` data files, but the rest of your job must respect that rule —
+   including `install-from`, which pip executes (see the note above).
 
 ## Behavior
 

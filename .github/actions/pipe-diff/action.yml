@@ -68,7 +68,13 @@ inputs:
       Install the CLI from this local path or pip source instead of PyPI, e.g.
       "./packages/client-python". Use it to exercise the action against an
       in-repo checkout before a release that ships "rocketride diff" is
-      published. Takes precedence over "cli-version".
+      published. Takes precedence over "cli-version". SECURITY: this value is
+      handed to "python -m pip install", which executes the source's build and
+      install code (setup.py, PEP 517 backends, install hooks) with the job's
+      privileges. Point it only at code you trust. In a pull_request_target
+      workflow — which runs with a writable token and the base repository's
+      secrets — it must never resolve to pull-request-controlled code, so do not
+      set it to a path inside a checkout of the PR head.
     required: false
     default: ''
   comment:
@@ -172,17 +178,46 @@ runs:
         body_file="${RUNNER_TEMP:-/tmp}/rocketride-pipe-diff-comment.md"
         : > "${body_file}"
 
+        # Longest run of backticks in $1, printed as a delimiter one backtick
+        # longer (at least $2). CommonMark closes a code span or fence only on a
+        # run of *exactly* the opening length (span) or at least it (fence), so a
+        # delimiter longer than anything in the value cannot be closed early by
+        # the value itself. Pure bash: no fork per path.
+        backtick_delim() {
+          local s="$1" min="$2"
+          local longest=0 run=0 index char
+          for (( index = 0; index < ${#s}; index++ )); do
+            char="${s:index:1}"
+            if [ "${char}" = '`' ]; then
+              run=$(( run + 1 ))
+              if [ "${run}" -gt "${longest}" ]; then
+                longest="${run}"
+              fi
+            else
+              run=0
+            fi
+          done
+          local width=$(( longest + 1 ))
+          if [ "${width}" -lt "${min}" ]; then
+            width="${min}"
+          fi
+          local pad
+          printf -v pad '%*s' "${width}" ''
+          printf '%s' "${pad// /\`}"
+        }
+
         # File paths and CLI stderr are untrusted PR content: a crafted path or
         # error message would otherwise be interpolated raw into a Markdown
         # heading (breaking out into headings/@-mentions in the auto-posted
-        # comment). Render them inside a double-backtick code span with newlines
-        # collapsed. A run of backticks inside the value cannot close a
-        # double-backtick span as long as it is not exactly two, and the padding
-        # spaces are stripped by the Markdown renderer.
+        # comment). Render them inside a code span with newlines collapsed and a
+        # collision-safe delimiter, so a path containing backticks cannot close
+        # the span. The padding spaces are stripped by the Markdown renderer.
         md_code() {
           local s="${1//$'\n'/ }"
           s="${s//$'\r'/ }"
-          printf '`` %s ``' "${s}"
+          local delim
+          delim="$(backtick_delim "${s}" 2)"
+          printf '%s %s %s' "${delim}" "${s}" "${delim}"
         }
 
         # The report is written to the job summary on every path, so `comment:
@@ -309,11 +344,13 @@ runs:
               annotation_msg="${annotation_msg//$'\r'/ }"
               annotation_msg="${annotation_msg//::/ }"
               echo "::error file=${f}::rocketride diff failed for ${f}: ${annotation_msg}"
+              # The fence is one backtick longer than the longest run in the
+              # message (minimum 4), so no fence line inside the untrusted
+              # stderr can close the block early and escape into Markdown.
+              err_fence="$(backtick_delim "${err_msg}" 4)"
               {
                 printf 'Could not diff this file (exit %s):\n\n' "${rc}"
-                # A 4-backtick fence cannot be closed by a ``` run inside the
-                # error text.
-                printf '````text\n%s\n````\n\n' "${err_msg}"
+                printf '%stext\n%s\n%s\n\n' "${err_fence}" "${err_msg}" "${err_fence}"
               } >> "${sections_file}"
               ;;
           esac
