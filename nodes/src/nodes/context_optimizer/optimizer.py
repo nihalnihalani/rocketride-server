@@ -44,6 +44,10 @@ from rocketlib import warning
 #: knows the configured model id.
 DEFAULT_MODEL_LIMIT = 128000
 
+#: Model id assumed when ``model_name`` is absent or is not a non-empty string.
+#: Matches the ``model_name`` default declared in ``services.json``.
+DEFAULT_MODEL_NAME = 'gpt-5'
+
 
 class ContextOptimizer:
     """Optimizes LLM context windows by managing token budgets across components.
@@ -156,14 +160,23 @@ class ContextOptimizer:
         Args:
             config: Dictionary with keys:
                 - model_name: str - model identifier for limit lookup (an id published
-                  by one of the ``llm_*`` nodes, e.g. ``gpt-5.4``, ``claude-sonnet-4-6``)
+                  by one of the ``llm_*`` nodes, e.g. ``gpt-5.4``, ``claude-sonnet-4-6``);
+                  anything that is not a non-empty string falls back to
+                  :data:`DEFAULT_MODEL_NAME` with a warning
                 - max_context_tokens: int - override for model limit (0 = use model default)
                 - system_prompt_budget_pct: float - percentage for system prompt (default 10)
                 - query_budget_pct: float - percentage for query (default 15)
                 - document_budget_pct: float - percentage for documents (default 50)
                 - history_budget_pct: float - percentage for history (default 25)
         """
-        self.model_name: str = config.get('model_name', 'gpt-5')
+        # Validate model_name: the schema declares a string, but nothing between
+        # the pipeline JSON and here coerces one, and a null/number would blow up
+        # resolve_model_limit's rsplit() during beginGlobal.
+        model_name = config.get('model_name', DEFAULT_MODEL_NAME)
+        if not isinstance(model_name, str) or not model_name.strip():
+            warning(f'context_optimizer: model_name is not a non-empty string, defaulting to {DEFAULT_MODEL_NAME!r}')
+            model_name = DEFAULT_MODEL_NAME
+        self.model_name: str = model_name.strip()
 
         # Validate max_context_tokens (issue #4: non-numeric values)
         try:
@@ -382,18 +395,29 @@ class ContextOptimizer:
         Non-OpenAI models (Claude, Gemini) and unknown ids fall back to
         ``_DEFAULT_ENCODING`` -- tiktoken is only an approximation for those, but
         it keeps token counts stable and non-crashing.
+
+        Provider-scoped ids are tried full-first and then by their bare name, the
+        same order :meth:`resolve_model_limit` uses. Without that, ``openai/gpt-5``
+        would resolve the gpt-5 *window* by its bare name while silently counting
+        its tokens with ``cl100k_base``.
         """
         model = model or ''
-        for prefix, enc_name in self._MODEL_ENCODING_OVERRIDES.items():
-            if model.startswith(prefix):
-                return enc_name
+        bare = model.rsplit('/', 1)[-1]
+        candidates = (model,) if bare == model else (model, bare)
+
+        for candidate in candidates:
+            for prefix, enc_name in self._MODEL_ENCODING_OVERRIDES.items():
+                if candidate.startswith(prefix):
+                    return enc_name
 
         import tiktoken
 
-        try:
-            return tiktoken.encoding_for_model(model).name
-        except KeyError:
-            return self._DEFAULT_ENCODING
+        for candidate in candidates:
+            try:
+                return tiktoken.encoding_for_model(candidate).name
+            except KeyError:
+                continue
+        return self._DEFAULT_ENCODING
 
     def _resolve_encoding_name(self) -> str:
         """Resolve (and cache) the tiktoken encoding name for the configured model."""
