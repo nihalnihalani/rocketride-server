@@ -389,6 +389,36 @@ class TestHistorySummarization:
         result = optimizer.summarize_history(messages, 100000)
         assert len(result) == 2
 
+    def test_budget_below_role_overhead_returns_empty(self, optimizer):
+        """Below one message's role overhead, nothing can be returned.
+
+        Every returned message costs ``count_tokens(role) + 4`` before a single
+        content token is spent (the accounting ``_message_tokens`` uses). When
+        ``max_tokens`` is smaller than that, even an empty-content message
+        overshoots, so both the single-message branch and the
+        ``budget_for_recent <= 0`` fallback must return ``[]`` rather than a
+        message that breaks the documented budget.
+        """
+        single = [{'role': 'user', 'content': 'hello world from the single message branch'}]
+        many = [
+            {'role': 'user', 'content': 'hello world from the fallback branch'},
+            {'role': 'assistant', 'content': 'a reply that will not fit either'},
+            {'role': 'user', 'content': 'and one more turn on top of that'},
+        ]
+        overhead = optimizer.count_tokens('user') + 4
+
+        for messages in (single, many):
+            # Strictly below the overhead: nothing fits, so nothing is returned.
+            for budget in range(0, overhead):
+                assert optimizer.summarize_history(messages, budget) == []
+
+            # Exactly at the overhead an empty-content message still fits, and
+            # it must cost no more than the budget it was given.
+            result = optimizer.summarize_history(messages, overhead)
+            assert len(result) == 1
+            assert result[0]['content'] == ''
+            assert optimizer._message_tokens(result[0]) <= overhead
+
     def test_preserves_first_and_last_with_summary(self, optimizer):
         """With many messages and tight budget, first + placeholder + last should appear."""
         messages = [
