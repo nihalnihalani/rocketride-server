@@ -16,6 +16,8 @@ Fits an LLM request into a model's context window by budgeting tokens across the
 - **Documents** are ranked by their vector-DB `score` (descending; keyword overlap with the question is used when no scores are present) and selected greedily until the document budget is spent.
 - **Conversation history** keeps the first message and as many recent messages as fit, replacing the middle with a single summarized placeholder.
 
+A question carrying several `QuestionText` entries keeps every entry: the entries are budgeted against the query allowance together, each keeping a share proportional to its own size. Nothing is dropped, so the per-entry embedding metadata that the embedding nodes write and the document stores read survives the node.
+
 Requests that already fit pass through unchanged, and no extra model call is made.
 
 This node is marked **experimental**.
