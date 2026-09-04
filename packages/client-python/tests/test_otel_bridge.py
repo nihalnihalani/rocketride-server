@@ -42,6 +42,7 @@ Covered here:
 """
 
 import asyncio
+import sys
 import json
 import os
 from pathlib import Path
@@ -540,6 +541,10 @@ class TestValidateTransportSecurity:
 
 
 class TestSignalOwnership:
+    @pytest.mark.skipif(
+        sys.platform == 'win32',
+        reason='asyncio loop signal handlers are not supported on Windows (ProactorEventLoop)',
+    )
     async def test_pre_existing_loop_signal_handler_is_not_stolen(self):
         import signal as signal_module
 
