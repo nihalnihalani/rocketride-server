@@ -32,12 +32,18 @@ from unittest.mock import AsyncMock, MagicMock
 # Make the evaluators package importable from experiment test files.
 # Append (with duplicate guard) rather than insert at position 0 so this
 # directory can never shadow packages of the same name if the codebase grows.
+# Only this sub-directory goes on sys.path -- nodes/test itself must stay off it.
 _cobalt_test_dir = os.path.dirname(__file__)
 if _cobalt_test_dir not in sys.path:
     sys.path.append(_cobalt_test_dir)
+
+# nodes/src/nodes, by contrast, must win: move it to the front rather than
+# "insert only if absent", because another test dir already on sys.path can hold
+# a package with the same name as a node (see #1687).
 _nodes_dir = os.path.abspath(os.path.join(_cobalt_test_dir, '..', '..', 'src', 'nodes'))
-if _nodes_dir not in sys.path:
-    sys.path.append(_nodes_dir)
+while _nodes_dir in sys.path:
+    sys.path.remove(_nodes_dir)
+sys.path.insert(0, _nodes_dir)
 
 
 @pytest.fixture
