@@ -33,9 +33,14 @@ RocketRide's pipeline nodes handle LLM calls, vector database queries, embedding
 nodes/test/cobalt/
   cobalt.toml                     # Config for the external Cobalt runner (not read by pytest)
   conftest.py                     # Shared pytest fixtures (mock client, datasets)
-  requirements.txt                # Python dependencies for Cobalt tests
+  requirements.txt                # Test deps; -r includes eval_cobalt's own requirements.txt
+                                  #   so the driver version is declared in one place
+  test_dataset_cobalt.py          # dataset_cobalt node unit tests (cobalt library mocked)
   test_eval_cobalt.py             # eval_cobalt node unit tests (cobalt library mocked)
   test_eval_cobalt_integration.py # eval_cobalt tests against the real cobalt library
+  test_pipeline_metadata_hop.py   # Cross-node tests: the reference must survive
+                                  #   dataset_cobalt -> prompt -> LLM -> eval_cobalt, and
+                                  #   examples/cobalt-evaluation.pipe is driven from the file
   evaluators/                     # Shims re-exporting nodes/src/nodes/eval_cobalt/evaluators/
     __init__.py
     relevance.py                  # Keyword overlap + length ratio evaluator

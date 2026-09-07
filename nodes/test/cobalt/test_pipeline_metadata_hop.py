@@ -55,7 +55,9 @@ Run with:
 import contextlib
 import contextvars
 import importlib.util
+import json
 import pathlib
+import re
 import sys
 from types import ModuleType
 from unittest.mock import MagicMock
@@ -655,3 +657,285 @@ class TestPromptNodePreservesExistingBehaviour:
         merged = prompt.instance.questions[0].metadata
         assert merged['dataset_id'] == 'ds'
         assert merged['item_index'] == 1
+
+
+# ---------------------------------------------------------------------------
+# The shipped example, driven from the file itself
+# ---------------------------------------------------------------------------
+#
+# Everything above wires the same node chain as examples/cobalt-evaluation.pipe
+# but from items written out in this file. That leaves one gap: nothing fails if
+# the example itself is edited into a shape the chain above never sees. The
+# section below closes it by reading the example and driving the graph the file
+# declares -- through the node's own config resolver, the real DatasetLoader,
+# the source endpoint's scan, and renderObject. Those four hops run only in
+# source mode, which is the mode the example configures and the one no other
+# test in this file reaches.
+
+_EXAMPLE_PIPE = _REPO_ROOT / 'examples' / 'cobalt-evaluation.pipe'
+
+
+def _example_pipe():
+    """Parse ``examples/cobalt-evaluation.pipe``."""
+    with _EXAMPLE_PIPE.open(encoding='utf-8') as handle:
+        return json.load(handle)
+
+
+def _component(pipe, component_id):
+    """Return the example component with ``component_id``."""
+    for component in pipe['components']:
+        if component.get('id') == component_id:
+            return component
+    raise AssertionError(f'{_EXAMPLE_PIPE.name} has no component {component_id!r}')
+
+
+def _profile_config(pipe, component_id):
+    """Return the active profile block of a component's config.
+
+    The engine resolves ``config[config['profile']]`` for a node configured
+    with named profiles, and a source node carries that pair one level down
+    under ``parameters`` -- ``IEndpoint._mergeSourceParameters`` lifts it out
+    before the profile is resolved. Both shapes are read here for the same
+    reason the endpoint reads both: so the values these tests assert on stay
+    tied to the file instead of being restated in it.
+    """
+    config = _component(pipe, component_id)['config']
+    if 'profile' not in config:
+        config = config.get('parameters', {})
+    return config[config['profile']]
+
+
+def _registered_providers():
+    """Every provider name the node tree registers.
+
+    A node directory registers one provider per ``services*.json`` through that
+    file's ``protocol``, so a directory listing under-reports: ``response``
+    alone ships nine, ``response_answers`` among them. These files are JSONC
+    (the engine's reader tolerates comments), so the protocol is matched out
+    rather than parsed.
+    """
+    protocol = re.compile(r'"protocol"\s*:\s*"([A-Za-z0-9_]+)://"')
+    providers = set()
+    for services in pathlib.Path(_NODES_DIR).glob('*/services*.json'):
+        providers.update(protocol.findall(services.read_text(encoding='utf-8')))
+    return providers
+
+
+def _dataset_source(pipe):
+    """Build the real dataset_cobalt source endpoint bound to the example.
+
+    The engine hands a source node the whole pipeline on ``taskConfig``, and
+    ``IEndpoint._sourceConfigFromTask`` digs its own component out of it by
+    matching the pipeline's ``source`` id. Feeding the parsed example in here
+    is what makes the run below a test of the shipped file: a typo in the
+    example's ``source`` field, its provider name or its inline items surfaces
+    as an empty scan rather than passing silently.
+    """
+    from dataset_cobalt.IEndpoint import IEndpoint
+
+    endpoint = IEndpoint()
+    endpoint.endpoint = MagicMock()
+    endpoint.endpoint.serviceConfig = {}
+    endpoint.endpoint.parameters = {}
+    endpoint.endpoint.bag = {}
+    endpoint.endpoint.logicalType = 'dataset_cobalt'
+    endpoint.endpoint.taskConfig = {'pipeline': pipe}
+    return endpoint
+
+
+def _scan_entries(pipe):
+    """Collect the scan entries the example's source endpoint emits."""
+    entries = []
+    _dataset_source(pipe).scanObjects('', lambda entry: entries.append(entry) or 0)
+    return entries
+
+
+def _question_from_entry(entry):
+    """Push one scan entry through dataset_cobalt's renderObject hop."""
+    from dataset_cobalt.IInstance import IInstance
+
+    node = IInstance()
+    node.instance = _Lane()
+    scanned = MagicMock()
+    scanned.objectTags = entry['objectTags']
+
+    # renderObject ends in preventDefault(), which the engine implements as a
+    # raise; the stub at the top of this file mirrors that. Suppressing it here
+    # is how the engine treats the signal -- as "handled", not as a failure.
+    with contextlib.suppress(RuntimeError):
+        node.renderObject(scanned)
+
+    assert len(node.instance.questions) == 1
+    return node.instance.questions[0]
+
+
+def _run_example(reply, pipe=None):
+    """Drive the example's own graph and return every lane it filled.
+
+    Args:
+        reply: The LLM's answer text, or a callable taking the staged Question.
+        pipe: Parsed example; read from disk when omitted.
+
+    Returns:
+        Tuple of (parsed pipe, questions rendered from the scan, list of prompt
+        lanes, list of LLM lanes, the evaluator's lane).
+    """
+    pipe = pipe if pipe is not None else _example_pipe()
+
+    eval_profile = _profile_config(pipe, 'eval_cobalt_1')
+    evaluator = _eval_node(eval_type=eval_profile['eval_type'], threshold=eval_profile['threshold'])
+    instructions = _component(pipe, 'prompt_1')['config']['instructions']
+
+    questions = []
+    prompt_lanes = []
+    llm_lanes = []
+
+    # Source mode gives every scanned row its own instance chain, so the prompt
+    # and LLM nodes are rebuilt per row rather than shared.
+    for entry in _scan_entries(pipe):
+        question = _question_from_entry(entry)
+        questions.append(question)
+
+        prompt = _prompt_node(instructions)
+        prompt.writeQuestions(question)
+        prompt.closing()
+        prompt_lanes.append(prompt.instance)
+
+        for staged in prompt.instance.questions:
+            llm = _llm_node(reply)
+            llm.writeQuestions(staged)
+            llm_lanes.append(llm.instance)
+            for answer in llm.instance.answers:
+                evaluator.writeAnswers(answer)
+
+    return pipe, questions, prompt_lanes, llm_lanes, evaluator.instance
+
+
+def _example_replies(pipe):
+    """Map each example question to the reference answer the file pairs with it."""
+    items = json.loads(_profile_config(pipe, 'dataset_cobalt_1')['items'])
+    return {item['input']: item['expected'] for item in items}
+
+
+class TestExamplePipelineIsWiredAsProven:
+    """Structural checks on the example, so the run below cannot drift from it."""
+
+    def test_every_input_edge_resolves(self):
+        """Every `input.from` names a component the example actually declares."""
+        pipe = _example_pipe()
+        declared = {component['id'] for component in pipe['components']}
+
+        for component in pipe['components']:
+            for edge in component.get('input', []):
+                assert edge['from'] in declared, f'{component["id"]} reads from unknown {edge["from"]!r}'
+
+    def test_the_declared_source_is_the_dataset_node(self):
+        """The pipeline's `source` is the dataset node, and it is in Source mode."""
+        pipe = _example_pipe()
+        source = _component(pipe, pipe['source'])
+
+        assert source['provider'] == 'dataset_cobalt'
+        assert source['config']['mode'] == 'Source'
+
+    def test_every_provider_ships_in_this_repo(self):
+        """Each provider is one this node tree registers, so no hop is a typo."""
+        pipe = _example_pipe()
+        registered = _registered_providers()
+
+        for component in pipe['components']:
+            provider = component['provider']
+            assert provider in registered, f'no node registers the provider {provider!r}'
+
+    def test_the_evaluator_reads_the_lane_the_llm_writes(self):
+        """The reference travels the questions lane; the score hangs off answers."""
+        pipe = _example_pipe()
+        lanes = {edge['lane']: edge['from'] for edge in _component(pipe, 'eval_cobalt_1')['input']}
+
+        assert lanes == {'answers': 'llm_openai_1'}
+        assert {edge['lane'] for edge in _component(pipe, 'llm_openai_1')['input']} == {'questions'}
+        assert {edge['lane'] for edge in _component(pipe, 'prompt_1')['input']} == {'questions'}
+
+
+class TestExamplePipelineScores:
+    """The example must not score 0.0 on an answer that matches the reference."""
+
+    def test_the_reference_survives_every_hop_of_the_example(self):
+        """Walk the example's own chain and assert `expected` at each hop.
+
+        Hop by hop: the source endpoint's scan entry, the Question renderObject
+        builds from it, the Question the prompt node emits, and the Answer the
+        LLM hop returns. A break at any one of them fails here with the hop
+        named, rather than as a 0.0 at the far end.
+        """
+        pipe = _example_pipe()
+
+        entries = _scan_entries(pipe)
+        assert entries, 'the example source produced no dataset rows'
+        assert entries[0]['objectTags']['metadata']['expected']
+
+        question = _question_from_entry(entries[0])
+        assert question.metadata['expected'] == entries[0]['objectTags']['metadata']['expected']
+
+        prompt = _prompt_node(_component(pipe, 'prompt_1')['config']['instructions'])
+        prompt.writeQuestions(question)
+        prompt.closing()
+        staged = prompt.instance.questions[0]
+        assert staged.metadata['expected'] == question.metadata['expected']
+
+        llm = _llm_node('anything')
+        llm.writeQuestions(staged)
+        assert llm.instance.answers[0].metadata['expected'] == question.metadata['expected']
+
+    def test_every_example_item_scores_above_its_configured_threshold(self):
+        """Correct answers to the example's own questions pass its own threshold."""
+        pipe = _example_pipe()
+        replies = _example_replies(pipe)
+        threshold = _profile_config(pipe, 'eval_cobalt_1')['threshold']
+
+        def reply(question):
+            for text in question.questions:
+                if text.text in replies:
+                    return replies[text.text]
+            return 'I do not know.'
+
+        _, questions, _, _, eval_lane = _run_example(reply, pipe=pipe)
+
+        assert len(questions) == len(replies)
+
+        scores = _scores(eval_lane)
+        assert len(scores) == len(replies)
+        assert all(score['cobalt_score'] > 0.0 for score in scores), (
+            f'the example still scores 0.0: {[s["cobalt_score"] for s in scores]}'
+        )
+        assert all(score['cobalt_score'] >= threshold for score in scores)
+        assert all(score['cobalt_passed'] is True for score in scores)
+
+    def test_a_wrong_answer_to_the_example_still_fails(self):
+        """The pass above is earned, not an artefact of a permissive evaluator."""
+        pipe = _example_pipe()
+        threshold = _profile_config(pipe, 'eval_cobalt_1')['threshold']
+
+        _, _, _, _, eval_lane = _run_example('Bananas are yellow and grow on trees.', pipe=pipe)
+
+        scores = _scores(eval_lane)
+        assert scores
+        assert all(score['cobalt_score'] < threshold for score in scores)
+        assert all(score['cobalt_passed'] is False for score in scores)
+
+    def test_the_example_never_shows_the_model_its_reference(self):
+        """No reference answer may appear in a prompt the example sends."""
+        pipe = _example_pipe()
+        replies = _example_replies(pipe)
+
+        seen = []
+
+        def reply(question):
+            seen.append(question.getPrompt())
+            return 'ok'
+
+        _run_example(reply, pipe=pipe)
+
+        assert seen
+        for rendered in seen:
+            for expected in replies.values():
+                assert expected not in rendered
