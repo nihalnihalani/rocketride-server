@@ -1,4 +1,4 @@
-# search_hybrid
+# search_hybrid — "Hybrid Rerank"
 
 A RocketRide filter node that re-ranks the documents already attached to a question by fusing their upstream vector score with a BM25 keyword score via Reciprocal Rank Fusion (RRF).
 
@@ -10,12 +10,22 @@ BM25 scoring is delegated to the **rank_bm25** `BM25Okapi` implementation, resol
 
 ### This is a post-retrieval re-ranker, not true hybrid retrieval
 
-The node does **not** perform a vector or embedding lookup of its own. It reuses each document's existing `score` (set by the upstream vector store that already retrieved the candidate set) as the "vector" signal, and BM25 only scores that same already-retrieved candidate set. As a consequence:
+The node is called **Hybrid Rerank** rather than "Hybrid Search" because it does **not** perform a vector or embedding lookup of its own. It reuses each document's existing `score` (set by the upstream vector store that already retrieved the candidate set) as the "vector" signal, and BM25 only scores that same already-retrieved candidate set. As a consequence:
 
 - A keyword-relevant document the vector store did **not** return can never be surfaced here — the node can only re-order what it is given.
-- If upstream documents carry no `score`, the vector signal is `0.0` for those documents, so the vector ranking degenerates to the documents' input order (still fused with the BM25 ranking for `0 < alpha < 1`).
+- Recovering a document the vector search missed is the main reason to add BM25 at all, and this node cannot do that. If you need it, put a dedicated dense+sparse retrieval index upstream.
 
 This is a reasonable, dependency-light design for an `experimental` node, but treat it as a re-ranking stage rather than a replacement for a dedicated dense+sparse retrieval index.
+
+### Documents that arrive without a score
+
+`Doc.score` defaults to `None`, so an upstream node that does not score its output hands this node unscored documents. A missing score is treated as **absence of evidence**, which is deliberately not the same as a score of `0.0` ("the store scored this document, and it scored badly"):
+
+- Documents with no score are left **out of the vector-ranked list** entirely. They are still ranked, via BM25, and still appear in the output.
+- When **no** document carries a score there is no vector signal to fuse, so the node ranks by BM25 alone — the same behaviour as supplying no vector scores at all — and logs a warning naming the missing signal.
+- When only **some** documents carry a score, the scored ones keep their vector ranking and the unscored ones are ranked on their BM25 evidence alone; a warning reports how many were unscored.
+
+Scoring an unscored document `0.0` instead would place it in the vector list in whatever order it arrived — sorting equal keys preserves input order — and RRF would then fuse that arrival order with weight `alpha` as though it were vector relevance, producing a ranking that looks plausible but is partly just the order the documents came in.
 
 ---
 

@@ -1,12 +1,12 @@
 {
-	"title": "Hybrid Search",
+	"title": "Hybrid Rerank",
 	"protocol": "search_hybrid://",
 	"classType": ["rerank"],
 	"capabilities": ["experimental"],
 	"register": "filter",
 	"node": "python",
 	"path": "nodes.search_hybrid",
-	"prefix": "Hybrid Search",
+	"prefix": "Hybrid Rerank",
 	"description": ["A hybrid search component that re-ranks documents already retrieved by an ", "upstream vector store, fusing their vector score with a BM25 keyword score ", "for improved ordering. Uses Reciprocal Rank Fusion (RRF) to merge both ", "signals into a unified ranking that captures both semantic meaning and exact ", "keyword matches. It re-orders the retrieved candidate set rather than issuing ", "a fresh embedding lookup, so it cannot surface documents the vector store did ", "not return. Configurable alpha parameter controls the balance between vector ", "and keyword search. Ideal for RAG pipelines where neither pure semantic nor ", "pure keyword ordering alone is sufficient."],
 	"icon": "search-hybrid.svg",
 	"tile": ["Alpha: ${parameters.search_hybrid.${profile}.alpha}", "Top K: ${parameters.search_hybrid.${profile}.top_k}"],
@@ -134,7 +134,7 @@
 	"shape": [
 		{
 			"section": "Pipe",
-			"title": "Hybrid Search",
+			"title": "Hybrid Rerank",
 			"properties": ["search_hybrid.profile"]
 		}
 	]
