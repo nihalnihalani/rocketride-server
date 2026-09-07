@@ -26,7 +26,7 @@
 # ------------------------------------------------------------------------------
 import copy
 
-from rocketlib import IInstanceBase, debug
+from rocketlib import IInstanceBase, debug, warning
 from ai.common.schema import Doc, Question, Answer
 
 from .IGlobal import IGlobal
@@ -36,6 +36,41 @@ class IInstance(IInstanceBase):
     """Instance that performs hybrid search (vector + BM25) over question documents."""
 
     IGlobal: IGlobal
+
+    # Set once the missing-vector-score warning has been emitted, so a pipeline
+    # pushing thousands of questions through an unscored upstream logs one line
+    # rather than one per question. Class-level default so instances built via
+    # __new__ (the framework does not call __init__) still read False.
+    _warned_missing_vector_scores: bool = False
+
+    def _warn_about_missing_vector_scores(self, vector_scores: list):
+        """Warn once if some or all documents arrived without a vector score.
+
+        A document with no score contributes nothing to the vector half of the
+        fusion, so the ranking silently leans on BM25 alone. That is a defensible
+        result but it is not what the node's configuration implies, so surface it
+        instead of letting it pass unnoticed.
+        """
+        if self._warned_missing_vector_scores:
+            return
+
+        missing = sum(1 for score in vector_scores if score is None)
+        if not missing:
+            return
+
+        total = len(vector_scores)
+        if missing == total:
+            warning(
+                f'search_hybrid: none of the {total} incoming documents carry a score, so there is no '
+                'vector signal to fuse; ranking by BM25 alone. Place this node downstream of a vector '
+                'store search that sets Doc.score to use the hybrid ranking.'
+            )
+        else:
+            warning(
+                f'search_hybrid: {missing} of {total} incoming documents carry no score; those documents '
+                'are ranked by BM25 alone and take no part in the vector half of the fusion.'
+            )
+        self._warned_missing_vector_scores = True
 
     def writeQuestions(self, question: Question):
         """
@@ -68,7 +103,7 @@ class IInstance(IInstanceBase):
 
         # Build document dicts for the search engine
         doc_dicts: list[dict] = []
-        vector_scores: list[float] = []
+        vector_scores: list[float | None] = []
         for i, doc in enumerate(docs):
             doc_dict = {
                 'id': str(i),
@@ -81,7 +116,16 @@ class IInstance(IInstanceBase):
             # retrieved these candidates) is reused as the vector signal. No new
             # embedding/vector lookup happens here, so a keyword-relevant document
             # the vector store did not return cannot be surfaced. See README.md.
-            vector_scores.append(float(doc.score) if doc.score is not None else 0.0)
+            #
+            # `Doc.score` defaults to None, so an upstream node that emits
+            # documents without scoring them yields None here. Pass that through
+            # as None rather than coercing it to 0.0: the engine treats None as
+            # "no vector evidence" and leaves the document out of the vector
+            # ranking, whereas 0.0 would be read as a real score and rank the
+            # document by arrival order. See HybridSearchEngine.search().
+            vector_scores.append(float(doc.score) if doc.score is not None else None)
+
+        self._warn_about_missing_vector_scores(vector_scores)
 
         # Run hybrid search
         results = self.IGlobal.engine.search(

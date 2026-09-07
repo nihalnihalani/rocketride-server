@@ -411,6 +411,137 @@ class TestFullHybridSearch:
 
 
 # ===========================================================================
+# Missing vector scores (regression: arrival order must not become a ranking)
+# ===========================================================================
+#
+# Regression cover for the defect reported on PR #899: `Doc.score` defaults to
+# None, so any upstream node that emits documents without scoring them produced
+# an all-zero vector_scores list. Sorting equal keys is stable, so the "vector"
+# list was really the documents in arrival order, and RRF then fused that order
+# with weight alpha as though it were vector relevance -- a plausible-looking
+# ranking that was partly just input order. None now means "no vector evidence"
+# and keeps the document out of the vector list entirely.
+
+# Distinct BM25 relevance to 'machine learning', so the keyword ranking is
+# strictly ordered and comparisons below are exact rather than tie-dependent.
+UNSCORED_DOCS = [
+    {'id': 'ml', 'text': 'machine learning machine learning powers modern systems'},
+    {'id': 'learn', 'text': 'learning to cook takes practice'},
+    {'id': 'harbour', 'text': 'the harbour was grey and cold'},
+]
+UNSCORED_QUERY = 'machine learning'
+
+
+def _ids(results):
+    return [r['id'] for r in results]
+
+
+class TestMissingVectorScores:
+    """None means 'no vector evidence', which is not the same as a score of 0.0."""
+
+    def test_all_unscored_ranking_is_independent_of_arrival_order(self):
+        """The headline defect: with no scores, input order leaked into the ranking.
+
+        Same documents, same query, nothing that could legitimately change the
+        ranking -- only the order they arrive in. Before the fix the two orders
+        produced different rankings because the all-zero vector list was the
+        arrival order wearing a ranking's clothes.
+        """
+        engine = HybridSearchEngine(alpha=0.5)
+        forward = UNSCORED_DOCS
+        shuffled = [UNSCORED_DOCS[2], UNSCORED_DOCS[0], UNSCORED_DOCS[1]]
+
+        ranked_forward = _ids(engine.search(UNSCORED_QUERY, forward, [None, None, None], top_k=10))
+        ranked_shuffled = _ids(engine.search(UNSCORED_QUERY, shuffled, [None, None, None], top_k=10))
+
+        assert ranked_forward == ranked_shuffled, (
+            f'ranking changed with input order: {ranked_forward} vs {ranked_shuffled}'
+        )
+        # And it is the keyword ranking, not the arrival order.
+        assert ranked_forward[0] == 'ml'
+
+    def test_all_unscored_matches_bm25_only(self):
+        """No vector signal at all degrades to BM25-only, the honest answer."""
+        engine = HybridSearchEngine(alpha=0.5)
+        fused = _ids(engine.search(UNSCORED_QUERY, UNSCORED_DOCS, [None, None, None], top_k=10))
+        bm25_only = _ids(engine.bm25_search(UNSCORED_QUERY, UNSCORED_DOCS, top_k=10))
+        assert fused == bm25_only
+
+    def test_all_unscored_equivalent_to_omitting_scores(self):
+        """An all-None list means the same as passing no vector_scores at all."""
+        engine = HybridSearchEngine(alpha=0.5)
+        explicit_none = _ids(engine.search(UNSCORED_QUERY, UNSCORED_DOCS, [None, None, None], top_k=10))
+        omitted = _ids(engine.search(UNSCORED_QUERY, UNSCORED_DOCS, None, top_k=10))
+        assert explicit_none == omitted
+
+    def test_real_zero_scores_are_still_a_real_signal(self):
+        """A scored-0.0 document is evidence; it must keep its place in the vector list.
+
+        This is the distinction the fix turns on: 0.0 means "the store scored
+        this and it scored badly", None means "the store never scored this".
+        Only the latter is dropped, so genuine 0.0 scores must still produce a
+        vector-ranked list and a fused RRF score.
+        """
+        engine = HybridSearchEngine(alpha=0.5)
+        results = engine.search(UNSCORED_QUERY, UNSCORED_DOCS, [0.0, 0.0, 0.0], top_k=10)
+        assert results, 'real 0.0 scores must not be discarded'
+        # Fused (both legs present) rather than the BM25-only fallback.
+        assert all('rrf_score' in r for r in results)
+
+    def test_real_zeros_and_nones_are_not_interchangeable(self):
+        """Guards against a fix that simply treats every falsy score as missing."""
+        engine = HybridSearchEngine(alpha=0.5)
+        with_zeros = engine.search(UNSCORED_QUERY, UNSCORED_DOCS, [0.0, 0.0, 0.0], top_k=10)
+        with_nones = engine.search(UNSCORED_QUERY, UNSCORED_DOCS, [None, None, None], top_k=10)
+        # The zero-scored run fuses two legs and carries RRF scores; the
+        # all-missing run falls through to the BM25-only list.
+        assert all('rrf_score' in r for r in with_zeros)
+        assert not any('rrf_score' in r for r in with_nones)
+
+    def test_equal_real_scores_tie_deterministically(self):
+        """Equal real scores are a legitimate tie, broken stably by input order.
+
+        Ranking documents that genuinely tie is not the defect -- inventing a
+        ranking for documents that were never scored is. Pin the stable-sort
+        behaviour so the tie stays deterministic.
+        """
+        engine = HybridSearchEngine(alpha=1.0)  # vector-only, so BM25 cannot break the tie
+        first = _ids(engine.search(UNSCORED_QUERY, UNSCORED_DOCS, [0.5, 0.5, 0.5], top_k=10))
+        again = _ids(engine.search(UNSCORED_QUERY, UNSCORED_DOCS, [0.5, 0.5, 0.5], top_k=10))
+        assert first == again == ['ml', 'learn', 'harbour']
+
+    def test_mixed_scores_do_not_fabricate_a_rank_for_unscored_docs(self):
+        """Partially-scored input: unscored docs take no part in the vector leg.
+
+        They are still ranked -- via BM25 -- but they never receive a vector
+        rank they did not earn, so the result no longer depends on where they
+        happened to sit in the input list.
+        """
+        engine = HybridSearchEngine(alpha=0.5)
+        # 'harbour' is unscored; the other two carry real scores.
+        forward = _ids(engine.search(UNSCORED_QUERY, UNSCORED_DOCS, [0.9, 0.8, None], top_k=10))
+        # Same documents and same scores, different arrival order.
+        shuffled_docs = [UNSCORED_DOCS[2], UNSCORED_DOCS[0], UNSCORED_DOCS[1]]
+        shuffled = _ids(engine.search(UNSCORED_QUERY, shuffled_docs, [None, 0.9, 0.8], top_k=10))
+        assert forward == shuffled
+
+    def test_mixed_scores_keep_scored_documents_in_the_vector_leg(self):
+        """The surviving vector evidence is still used, not thrown away wholesale."""
+        engine = HybridSearchEngine(alpha=0.5)
+        results = engine.search(UNSCORED_QUERY, UNSCORED_DOCS, [0.9, 0.8, None], top_k=10)
+        by_id = {r['id']: r for r in results}
+        assert 'vector_score' in by_id['ml']
+        assert 'vector_score' in by_id['learn']
+        # The unscored document is present but carries no vector score.
+        assert 'vector_score' not in by_id['harbour']
+
+    def test_length_mismatch_still_raises_with_none_entries(self):
+        engine = HybridSearchEngine(alpha=0.5)
+        with pytest.raises(ValueError, match='vector_scores length must match'):
+            engine.search(UNSCORED_QUERY, UNSCORED_DOCS, [None, 0.5], top_k=10)
+
+
+# ===========================================================================
 # Deep-copy / mutation prevention
 # ===========================================================================
 
@@ -802,3 +933,193 @@ class TestIInstanceIntegration:
 
         assert not mock_instance.writeDocuments.called
         assert not mock_instance.writeAnswers.called
+
+
+# ===========================================================================
+# IInstance regression: documents that arrive without a score
+# ===========================================================================
+#
+# End-to-end cover for the PR #899 defect, exercised the way it actually
+# reached users: `Doc.score` is declared `score: float = Field(None, ...)`, so
+# any upstream node that does not score its documents hands this node
+# `score=None`. IInstance used to coerce that to 0.0, which made the vector
+# "ranking" nothing more than the order the documents arrived in.
+
+
+class TestIInstanceMissingScores:
+    """Unscored documents must not have their arrival order sold as a ranking."""
+
+    # Distinct keyword relevance to the query, so the expected ordering is exact.
+    _TEXTS = [
+        'machine learning machine learning powers modern systems',
+        'learning to cook takes practice',
+        'the harbour was grey and cold',
+    ]
+
+    @staticmethod
+    def _make_doc(pkg, text, score):
+        """Build a Doc, leaving `score` unset when there is none.
+
+        ``Doc.score`` is declared ``score: float = Field(None, ...)``: the
+        default is None but the annotation is not Optional, so pydantic rejects
+        an explicit ``score=None``. An unscored document is therefore one whose
+        score was never set -- exactly what an upstream node that does not score
+        its output produces.
+        """
+        if score is None:
+            return pkg.Doc(page_content=text, metadata=None)
+        return pkg.Doc(page_content=text, score=score, metadata=None)
+
+    def _emit_order(self, pkg, texts, scores):
+        """Run writeQuestions and return the emitted page_content order."""
+        docs = [self._make_doc(pkg, t, s) for t, s in zip(texts, scores)]
+        question = pkg.Question(
+            questions=[pkg.SubQuestion(text='machine learning')],
+            documents=docs,
+        )
+        engine = HybridSearchEngine(alpha=0.5)
+        inst, mock_instance = pkg.make_instance(engine=engine)
+        mock_instance.hasListener.side_effect = lambda lane: lane == 'documents'
+        inst.writeQuestions(question)
+        emitted = mock_instance.writeDocuments.call_args[0][0]
+        return [d.page_content for d in emitted]
+
+    def test_doc_score_defaults_to_none(self, search_hybrid_pkg):
+        """Pin the premise: an unscored Doc really does carry score=None.
+
+        If this ever becomes 0.0 upstream, the distinction this class defends
+        disappears and these tests should be revisited.
+        """
+        pkg = search_hybrid_pkg
+        assert pkg.Doc(page_content='x').score is None
+
+    def test_unscored_documents_do_not_rank_by_arrival_order(self, search_hybrid_pkg):
+        """THE regression: same documents, different input order, same ranking.
+
+        Before the fix the two calls returned different orderings, because every
+        document scored 0.0, the stable sort left the vector list in arrival
+        order, and RRF fused that order in with weight alpha.
+        """
+        pkg = search_hybrid_pkg
+        forward = self._TEXTS
+        shuffled = [self._TEXTS[2], self._TEXTS[0], self._TEXTS[1]]
+
+        ranked_forward = self._emit_order(pkg, forward, [None, None, None])
+        ranked_shuffled = self._emit_order(pkg, shuffled, [None, None, None])
+
+        assert ranked_forward == ranked_shuffled, (
+            f'ranking depends on input order:\n  {ranked_forward}\n  {ranked_shuffled}'
+        )
+        # The keyword-relevant document leads, in both orders.
+        assert ranked_forward[0] == self._TEXTS[0]
+        assert ranked_shuffled[0] == self._TEXTS[0]
+
+    def test_scored_documents_still_use_the_vector_signal(self, search_hybrid_pkg):
+        """The fix must not disable hybrid ranking for properly scored input."""
+        pkg = search_hybrid_pkg
+        # The keyword-poor document carries by far the strongest vector score,
+        # so a working vector leg pulls it above where BM25 alone would put it.
+        ranked = self._emit_order(pkg, self._TEXTS, [0.1, 0.2, 0.99])
+        bm25_only = self._emit_order(pkg, self._TEXTS, [None, None, None])
+        assert ranked != bm25_only, 'vector scores had no effect on the ranking'
+        assert ranked.index(self._TEXTS[2]) < bm25_only.index(self._TEXTS[2])
+
+    def test_warns_once_when_no_document_carries_a_score(self, search_hybrid_pkg, monkeypatch):
+        """A missing vector signal is surfaced, not swallowed."""
+        import importlib
+
+        pkg = search_hybrid_pkg
+        iinstance_mod = importlib.import_module('search_hybrid.IInstance')
+        seen: list = []
+        monkeypatch.setattr(iinstance_mod, 'warning', lambda msg, *a, **kw: seen.append(msg))
+
+        docs = [self._make_doc(pkg, t, None) for t in self._TEXTS]
+        question = pkg.Question(
+            questions=[pkg.SubQuestion(text='machine learning')],
+            documents=docs,
+        )
+        engine = HybridSearchEngine(alpha=0.5)
+        inst, mock_instance = pkg.make_instance(engine=engine)
+        mock_instance.hasListener.return_value = False
+
+        inst.writeQuestions(question)
+        inst.writeQuestions(question)  # second question, same instance
+
+        assert len(seen) == 1, f'expected exactly one warning, got {seen}'
+        assert 'no vector signal' in seen[0]
+
+    def test_warns_when_only_some_documents_carry_a_score(self, search_hybrid_pkg, monkeypatch):
+        """Partially-scored input is a pipeline smell worth naming."""
+        import importlib
+
+        pkg = search_hybrid_pkg
+        iinstance_mod = importlib.import_module('search_hybrid.IInstance')
+        seen: list = []
+        monkeypatch.setattr(iinstance_mod, 'warning', lambda msg, *a, **kw: seen.append(msg))
+
+        docs = [
+            self._make_doc(pkg, self._TEXTS[0], 0.9),
+            self._make_doc(pkg, self._TEXTS[1], None),
+            self._make_doc(pkg, self._TEXTS[2], 0.4),
+        ]
+        question = pkg.Question(
+            questions=[pkg.SubQuestion(text='machine learning')],
+            documents=docs,
+        )
+        engine = HybridSearchEngine(alpha=0.5)
+        inst, mock_instance = pkg.make_instance(engine=engine)
+        mock_instance.hasListener.return_value = False
+
+        inst.writeQuestions(question)
+
+        assert len(seen) == 1
+        assert '1 of 3' in seen[0]
+
+    def test_no_warning_when_every_document_is_scored(self, search_hybrid_pkg, monkeypatch):
+        """The healthy path stays quiet."""
+        import importlib
+
+        pkg = search_hybrid_pkg
+        iinstance_mod = importlib.import_module('search_hybrid.IInstance')
+        seen: list = []
+        monkeypatch.setattr(iinstance_mod, 'warning', lambda msg, *a, **kw: seen.append(msg))
+
+        docs = [pkg.Doc(page_content=t, score=0.5, metadata=None) for t in self._TEXTS]
+        question = pkg.Question(
+            questions=[pkg.SubQuestion(text='machine learning')],
+            documents=docs,
+        )
+        engine = HybridSearchEngine(alpha=0.5)
+        inst, mock_instance = pkg.make_instance(engine=engine)
+        mock_instance.hasListener.return_value = False
+
+        inst.writeQuestions(question)
+
+        assert seen == []
+
+    def test_none_is_passed_through_to_the_engine_not_coerced(self, search_hybrid_pkg):
+        """Pin the contract at the boundary: IInstance must not send 0.0 for None."""
+        pkg = search_hybrid_pkg
+        captured: dict = {}
+
+        class _SpyEngine:
+            def search(self, query, documents, vector_scores, top_k, rrf_k):
+                captured['vector_scores'] = vector_scores
+                return []
+
+        docs = [
+            self._make_doc(pkg, self._TEXTS[0], 0.9),
+            self._make_doc(pkg, self._TEXTS[1], None),
+            self._make_doc(pkg, self._TEXTS[2], 0.0),
+        ]
+        question = pkg.Question(
+            questions=[pkg.SubQuestion(text='machine learning')],
+            documents=docs,
+        )
+        inst, mock_instance = pkg.make_instance(engine=_SpyEngine())
+        mock_instance.hasListener.return_value = False
+
+        inst.writeQuestions(question)
+
+        # A real 0.0 stays 0.0; a missing score stays None. The two must not collapse.
+        assert captured['vector_scores'] == [0.9, None, 0.0]

@@ -176,7 +176,7 @@ class HybridSearchEngine:
         self,
         query: str,
         documents: list[dict[str, Any]],
-        vector_scores: Optional[list[float]] = None,
+        vector_scores: Optional[list[Optional[float]]] = None,
         top_k: int = 10,
         rrf_k: int = 60,
     ) -> list[dict[str, Any]]:
@@ -187,12 +187,27 @@ class HybridSearchEngine:
             query: The search query string.
             documents: List of dicts with 'text' (and optionally 'id') keys.
             vector_scores: Pre-computed vector similarity scores aligned with documents.
-                          If None, only BM25 is used.
+                          If None, only BM25 is used. Individual entries may also be
+                          None, meaning "this document carries no vector score" — see
+                          the note below on why that is not the same as 0.0.
             top_k: Maximum number of results to return.
             rrf_k: RRF constant for fusion.
 
         Returns:
             List of documents ranked by hybrid RRF score.
+
+        Note on missing vector scores:
+            A ``None`` entry means *absence of evidence*, which is not the same as a
+            real score of 0.0 ("the store scored this document, and it scored badly").
+            Documents with no vector score are left out of the vector-ranked list
+            entirely rather than being ranked as 0.0. Ranking them 0.0 would place
+            them in the vector list in whatever order they arrived — a stable sort
+            over equal keys preserves input order — and RRF would then fuse that
+            arrival order with weight ``alpha`` as though it were vector relevance.
+            RRF is rank-based, so a document simply absent from one list contributes
+            nothing from that list, which is the correct reading of "no signal here".
+            When *no* document carries a score the vector list is empty and the
+            BM25-only path below takes over, matching ``vector_scores=None``.
         """
         if not documents:
             return []
@@ -204,8 +219,15 @@ class HybridSearchEngine:
                 raise ValueError('vector_scores length must match documents length')
             scored = []
             for i, doc in enumerate(documents):
-                doc_copy = dict(doc)
-                doc_copy['vector_score'] = float(vector_scores[i])
+                score = vector_scores[i]
+                if score is None:
+                    # No vector evidence for this document: omit it from the
+                    # vector ranking rather than inventing a 0.0 rank for it.
+                    continue
+                # Deep-copy so nested mutable values (metadata dicts, lists) cannot
+                # leak back into the caller's documents via shared references.
+                doc_copy = copy.deepcopy(doc)
+                doc_copy['vector_score'] = float(score)
                 scored.append(doc_copy)
             scored.sort(key=lambda d: d['vector_score'], reverse=True)
             vector_results = scored
