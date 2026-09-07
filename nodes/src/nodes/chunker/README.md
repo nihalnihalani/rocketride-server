@@ -49,6 +49,12 @@ Each emitted chunk copies the source document (metadata is copied per chunk, nev
 
 Configuring `strategy: recursive` raises at startup with a pointer to the General Text node rather than silently falling back.
 
+### Picking a strategy for your input
+
+The sentence strategy treats a sentence as indivisible, so `chunk_size` is a grouping target rather than a hard cap. Input with no sentence-ending punctuation — log lines, CSV rows, minified text, OCR dumps, prose in scripts that do not use `.`/`!`/`?` — contains no boundaries to group on and is emitted as a single oversized chunk.
+
+For those inputs use the **token** strategy, which caps every chunk at `chunk_size` tokens unconditionally, or the **General Text** node's recursive splitter. The sentence strategy is the right default for ordinary punctuated prose, which is what most document pipelines carry.
+
 ---
 
 <!-- ROCKETRIDE:GENERATED:PARAMS START -->

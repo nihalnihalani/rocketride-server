@@ -69,6 +69,28 @@ class TestSentenceChunker:
         chunks = chunker.chunk('Just one sentence.')
         assert len(chunks) == 1
 
+    def test_unpunctuated_input_is_emitted_whole(self):
+        """Pin the documented cost of making 'sentence' the default strategy.
+
+        A sentence is indivisible here, so chunk_size is a grouping target and
+        not a hard cap. Input with no sentence-ending punctuation (log lines,
+        CSV rows, OCR dumps) has no boundary to group on and comes back as one
+        oversized chunk. The README routes those inputs to the token strategy;
+        this test exists so the trade-off is explicit rather than a surprise.
+        """
+        chunker = SentenceChunker(chunk_size=100, chunk_overlap=0)
+        text = 'word ' * 400  # 2000 chars, no '.', '!' or '?'
+        chunks = chunker.chunk(text)
+        assert len(chunks) == 1
+        assert len(chunks[0]['text']) > chunker.chunk_size
+
+        # The token strategy is the documented escape hatch: it caps hard.
+        token_chunker = TokenChunker(chunk_size=100, chunk_overlap=0)
+        token_chunker._encoder = _CharTokenEncoder()
+        token_chunks = token_chunker.chunk(text)
+        assert len(token_chunks) > 1
+        assert all(len(c['text']) <= 100 for c in token_chunks)
+
     def test_handles_question_marks(self):
         chunker = SentenceChunker(chunk_size=30, chunk_overlap=0)
         chunks = chunker.chunk('Is this a test? Yes it is! Absolutely.')
