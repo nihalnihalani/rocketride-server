@@ -165,7 +165,11 @@ class IInstance(IInstanceBase):
                 score = f'{doc.score:.4f}' if doc.score is not None else 'N/A'
                 snippet = (doc.page_content or '')[:500]
                 context_parts.append(f'[Document {i + 1}] (score: {score})\n{snippet}')
-            answer_text = f'Hybrid search returned {len(reranked_docs)} results:\n\n' + '\n\n'.join(context_parts)
+            # "Hybrid rerank", not "Hybrid search": this string is user-visible
+            # answer text and the node is titled "Hybrid Rerank" precisely
+            # because it re-orders an existing candidate set rather than
+            # searching for one. See services.json and README.md.
+            answer_text = f'Hybrid rerank returned {len(reranked_docs)} results:\n\n' + '\n\n'.join(context_parts)
             ans = Answer()
             ans.setAnswer(answer_text)
             # Repo convention (see index_search, response, guardrails, etc.):

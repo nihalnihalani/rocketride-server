@@ -21,11 +21,13 @@ This is a reasonable, dependency-light design for an `experimental` node, but tr
 
 `Doc.score` defaults to `None`, so an upstream node that does not score its output hands this node unscored documents. A missing score is treated as **absence of evidence**, which is deliberately not the same as a score of `0.0` ("the store scored this document, and it scored badly"):
 
-- Documents with no score are left **out of the vector-ranked list** entirely. They are still ranked, via BM25, and still appear in the output.
+- Documents with no score are left **out of the vector-ranked list** entirely. They are still ranked, via BM25, and still appear in the output — at **every** `alpha`, `1.0` included. Taking no part in one ranking is not the same as being dropped from the result.
 - When **no** document carries a score there is no vector signal to fuse, so the node ranks by BM25 alone — the same behaviour as supplying no vector scores at all — and logs a warning naming the missing signal.
 - When only **some** documents carry a score, the scored ones keep their vector ranking and the unscored ones are ranked on their BM25 evidence alone; a warning reports how many were unscored.
 
 Scoring an unscored document `0.0` instead would place it in the vector list in whatever order it arrived — sorting equal keys preserves input order — and RRF would then fuse that arrival order with weight `alpha` as though it were vector relevance, producing a ranking that looks plausible but is partly just the order the documents came in.
+
+The only document the node does **not** return is one with no evidence in *either* leg: no score **and** no text BM25 can rank (`page_content` empty, or tokenizing to nothing). Nothing is available to order it by. That holds uniformly at every `alpha` — it is a property of having no signal, not of picking a particular ranking mode.
 
 ---
 
@@ -69,22 +71,25 @@ All profiles expose `alpha`, `top_k`, and `rrf_k`.
 
 RRF is rank-based, not score-magnitude based: each document's fused score is `sum(weight_i / (rrf_k + rank_i + 1))` across the vector and BM25 lists, with the vector list weighted by `alpha` and the BM25 list by `1 - alpha`. Documents are deduplicated by id (falling back to text content, then to a unique synthetic id) so the same document appearing in both lists accumulates both contributions.
 
-`alpha` behaves as two pure endpoints plus a blended middle:
+`alpha` is a continuous weight, and its endpoints are the limits of that weight rather than a separate code path:
 
-| `alpha`        | Ranking method                    | Emitted `score` field         |
-|----------------|-----------------------------------|-------------------------------|
-| `0.0`          | BM25 only, sorted by BM25 score   | the BM25 score                |
-| `0.0 < a < 1.0`| Weighted RRF of both lists        | the RRF score                 |
-| `1.0`          | Vector only, sorted by vector score | the vector score            |
+| `alpha`        | Ranking method                                                              | Emitted `score` field |
+|----------------|-----------------------------------------------------------------------------|-----------------------|
+| `0.0`          | RRF weighted `[0.0, 1.0]`: the BM25 ranking, then any document BM25 could not rank | the RRF score   |
+| `0.0 < a < 1.0`| Weighted RRF of both lists                                                    | the RRF score       |
+| `1.0`          | RRF weighted `[1.0, 0.0]`: the vector ranking, then any unscored document      | the RRF score       |
 
-> If either signal produces no ranking (e.g. every document tokenizes to empty for BM25), the node falls back to the other signal's single sorted list even for `0 < alpha < 1`.
+A leg weighted `0.0` contributes `0.0` to each of its documents' fused scores. Those documents therefore sort below everything the weighted leg ranked — but they are **still returned**, in that leg's own order. So `alpha = 1.0` emits the vector ranking followed by the unscored documents in BM25 order, which is exactly what `alpha = 0.99` emits; `alpha = 0.0` mirrors it. Weighting a signal to nothing removes its influence on the ordering, never its documents from the result.
+
+> If either signal produces no ranking at all (`vector_scores=None` or every score missing; or every document tokenizes to empty for BM25, or the query does), there is nothing to fuse and the node returns the other signal's single sorted list, emitting that signal's own score instead of an RRF score. This fallback applies at every `alpha`, endpoints included, and cannot drop a document — the empty list held none.
 
 ---
 
 ## Downstream-consumer notes
 
-- **The endpoints are discontinuous with the blended range.** At `alpha == 0.0` or `alpha == 1.0` the node returns a single pure sorted list; anywhere in between it returns weighted RRF. So `alpha = 0.99` behaves qualitatively unlike `alpha = 1.0` — both the ordering method and the emitted score field change. Configure the endpoints deliberately.
-- **The emitted `score` is overwritten with the ranking signal.** In the blended case that is the RRF score, which is a small rank-derived value (roughly `1 / (rrf_k + rank)`, e.g. ~0.016 at `rrf_k = 60`), not the original vector similarity. Do not treat the post-node `score` as a calibrated similarity; treat it as a relative ordering key.
+- **The endpoints are continuous with the blended range.** `alpha == 0.0` and `alpha == 1.0` are the fusion weights at their limits, not a "return one list and discard the other" mode, so `alpha = 0.99` and `alpha = 1.0` agree on both the ordering and the emitted score field. The endpoints do change *which signal orders the result*, so configure them deliberately — but changing `alpha` never changes which documents come back.
+- **The emitted `score` is overwritten with the ranking signal.** Whenever both signals produced a ranking — at every `alpha`, endpoints included — that is the RRF score, a small rank-derived value (roughly `1 / (rrf_k + rank)`, e.g. ~0.016 at `rrf_k = 60`), not the original vector similarity. A document contributed by a `0.0`-weighted leg scores exactly `0.0`, meaning "ranked last, contributed nothing", not "scored badly". Only the single-signal fallback above emits a raw BM25 or vector score. Do not treat the post-node `score` as a calibrated similarity; treat it as a relative ordering key.
+- **Documents are re-ordered, not filtered.** Every document with evidence in either leg comes back, subject only to `top_k`. A document is never dropped for being weighted to zero by `alpha`; the sole exclusion is a document with no score *and* no BM25-rankable text, which no signal can order (see [Documents that arrive without a score](#documents-that-arrive-without-a-score)).
 - **Empty results are dropped, not passed through.** If the query or document list is empty, or re-ranking yields nothing, the node emits on neither lane — downstream nodes receive no object for that question. If a downstream stage requires an always-present result, place a node that guarantees pass-through after it.
 
 ---

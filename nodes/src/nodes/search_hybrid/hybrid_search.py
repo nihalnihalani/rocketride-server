@@ -208,6 +208,14 @@ class HybridSearchEngine:
             nothing from that list, which is the correct reading of "no signal here".
             When *no* document carries a score the vector list is empty and the
             BM25-only path below takes over, matching ``vector_scores=None``.
+
+            Contributing nothing from a list is not the same as being dropped from
+            the result: ``alpha`` 0.0 and 1.0 are the *limits of the fusion weights*,
+            not a separate "return one leg and discard the other" mode. A document
+            with evidence in either leg is always returned. Only a document with no
+            evidence in *either* leg — no vector score and no BM25 rank, e.g. text
+            that tokenizes to nothing — is left out, and that is true at every
+            ``alpha``, not just at the endpoints.
         """
         if not documents:
             return []
@@ -235,15 +243,32 @@ class HybridSearchEngine:
         # Run BM25 search
         bm25_results = self.bm25_search(query, documents, top_k=len(documents))
 
-        # If alpha is 0 (BM25-only), skip vector results
-        if self.alpha == 0.0 or not vector_results:
+        # Degenerate cases: one leg produced no ranking at all, so there is
+        # nothing to fuse and the other leg *is* the whole ranking. Returning it
+        # unchanged cannot drop a document — the empty leg held none. These are
+        # the only short-circuits: `alpha` never gets one, see below.
+        if not vector_results:
             return bm25_results[:top_k]
-
-        # If alpha is 1 (vector-only), skip BM25 results
-        if self.alpha == 1.0 or not bm25_results:
+        if not bm25_results:
             return vector_results[:top_k]
 
-        # Merge using RRF, weighting vector by alpha and BM25 by (1 - alpha)
+        # Merge using RRF, weighting vector by alpha and BM25 by (1 - alpha).
+        #
+        # The endpoints go through here too. alpha 0.0 and 1.0 used to return one
+        # leg and throw the other away, which silently *dropped* every document
+        # the discarded leg held on its own — at alpha=1.0 that is exactly the
+        # unscored documents this method deliberately keeps out of the vector
+        # ranking. Absent from a list must mean "contributes nothing from that
+        # list", never "absent from the result".
+        #
+        # Weighting a leg 0.0 says that already, and says it continuously: RRF
+        # gives each document of the zero-weighted leg a 0.0 contribution, so it
+        # sorts below every document the weighted leg ranked while still being
+        # returned. At alpha=1.0 that is the pure vector ranking followed by the
+        # unscored documents in BM25 order — identical to what alpha=0.99 emits,
+        # rather than a different result one hundredth of a config value away.
+        # alpha=0.0 mirrors it: the BM25 ranking, then any document that carried
+        # a vector score but no BM25-able text, in vector order.
         merged = self.reciprocal_rank_fusion(
             vector_results,
             bm25_results,

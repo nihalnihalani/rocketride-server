@@ -542,6 +542,177 @@ class TestMissingVectorScores:
 
 
 # ===========================================================================
+# alpha endpoints must not drop documents
+# ===========================================================================
+#
+# Follow-up regression cover. Keeping unscored documents out of the vector leg
+# is right, but `alpha == 0.0` / `alpha == 1.0` used to return one leg and
+# discard the other outright. At alpha=1.0 that discarded leg was the only one
+# the unscored documents were in, so they vanished from the output entirely --
+# mis-ranking traded for silent document loss. alpha=0.0 lost the mirror case:
+# a document carrying a real vector score whose text tokenizes to nothing is
+# absent from the BM25 leg.
+#
+# The endpoints are now the limits of the fusion weights ([1.0, 0.0] and
+# [0.0, 1.0]) rather than a separate code path, so a zero-weighted leg
+# contributes 0.0 to a document's score instead of removing it from the result.
+
+# 'gap' carries no keyword overlap with UNSCORED_QUERY but still earns a BM25
+# rank (rank_bm25 scores every document in the corpus, including at 0.0); only
+# text that tokenizes to nothing is absent from the BM25 leg.
+ENDPOINT_DOCS = [
+    {'id': 'ml', 'text': 'machine learning machine learning powers modern systems'},
+    {'id': 'learn', 'text': 'learning to cook takes practice'},
+    {'id': 'harbour', 'text': 'the harbour was grey and cold'},
+]
+
+# Same documents, but 'blank' tokenizes to nothing, so BM25 cannot rank it --
+# the mirror of an unscored document, for the alpha=0.0 endpoint.
+TEXTLESS_DOCS = [
+    {'id': 'ml', 'text': 'machine learning machine learning powers modern systems'},
+    {'id': 'blank', 'text': '   '},
+    {'id': 'harbour', 'text': 'the harbour was grey and cold'},
+]
+
+
+class TestAlphaEndpointsKeepEveryDocument:
+    """A zero-weighted leg contributes nothing to the score, not nothing to the result."""
+
+    def test_vector_only_keeps_unscored_documents(self):
+        """THE follow-up regression: alpha=1.0 dropped every unscored document.
+
+        Verified counterexample from the audit: two scored documents and one
+        unscored one returned ``['ml', 'harbour']`` -- 'learn' was silently gone
+        from the output, not merely mis-ranked.
+        """
+        engine = HybridSearchEngine(alpha=1.0)
+        results = engine.search(UNSCORED_QUERY, ENDPOINT_DOCS, [0.9, None, 0.4], top_k=10)
+
+        assert set(_ids(results)) == {'ml', 'learn', 'harbour'}, f'alpha=1.0 dropped documents: {_ids(results)}'
+        # The scored documents keep their pure vector ranking (0.9 before 0.4),
+        # and the unscored one sorts below both rather than being interleaved.
+        assert _ids(results) == ['ml', 'harbour', 'learn']
+
+    def test_vector_only_scored_order_is_exactly_the_vector_ranking(self):
+        """Keeping the unscored documents must not perturb the scored ones.
+
+        BM25 ranks 'ml' above 'harbour' too, so use vector scores that invert
+        the keyword order: if BM25 had any say, 'ml' would not come last.
+        """
+        engine = HybridSearchEngine(alpha=1.0)
+        results = engine.search(UNSCORED_QUERY, ENDPOINT_DOCS, [0.1, None, 0.8], top_k=10)
+        scored = [r['id'] for r in results if 'vector_score' in r]
+        assert scored == ['harbour', 'ml'], 'BM25 leaked into the alpha=1.0 ranking'
+
+    def test_vector_only_ranks_every_scored_document_above_every_unscored_one(self):
+        """No unscored document may outrank a document that carries evidence."""
+        engine = HybridSearchEngine(alpha=1.0)
+        results = engine.search(UNSCORED_QUERY, ENDPOINT_DOCS, [None, 0.2, None], top_k=10)
+        assert set(_ids(results)) == {'ml', 'learn', 'harbour'}
+        # 'learn' is the only scored document, so it leads despite ranking last
+        # on keywords.
+        assert _ids(results)[0] == 'learn'
+
+    def test_bm25_only_keeps_documents_bm25_cannot_rank(self):
+        """The alpha=0.0 mirror: a scored document with no BM25-able text.
+
+        'blank' tokenizes to nothing so it never reaches the BM25 leg. Before
+        the fix alpha=0.0 returned the BM25 leg alone and 'blank' disappeared,
+        even though it carried a perfectly real vector score.
+        """
+        engine = HybridSearchEngine(alpha=0.0)
+        results = engine.search(UNSCORED_QUERY, TEXTLESS_DOCS, [0.9, 0.8, 0.4], top_k=10)
+
+        assert set(_ids(results)) == {'ml', 'blank', 'harbour'}, f'alpha=0.0 dropped documents: {_ids(results)}'
+        # BM25 order for the documents BM25 could rank, then the one it could not.
+        assert _ids(results) == ['ml', 'harbour', 'blank']
+
+    def test_bm25_only_order_is_exactly_the_bm25_ranking(self):
+        """Vector scores must not leak into the alpha=0.0 ranking.
+
+        The vector scores below invert the keyword order; if the vector leg had
+        any weight, 'harbour' would outrank 'ml'.
+        """
+        engine = HybridSearchEngine(alpha=0.0)
+        fused = _ids(engine.search(UNSCORED_QUERY, ENDPOINT_DOCS, [0.1, 0.2, 0.9], top_k=10))
+        bm25_only = _ids(engine.bm25_search(UNSCORED_QUERY, ENDPOINT_DOCS, top_k=10))
+        assert fused == bm25_only
+
+    @pytest.mark.parametrize('alpha', [0.0, 1.0])
+    def test_endpoints_are_permutation_invariant(self, alpha):
+        """Shuffling the input must not change the ranking at either endpoint.
+
+        Distinct vector scores and distinct BM25 relevance, so nothing legitimate
+        can reorder the result -- only arrival order could, and it must not.
+        """
+        engine = HybridSearchEngine(alpha=alpha)
+        scores = {'ml': 0.9, 'learn': None, 'harbour': 0.4}
+
+        forward = ENDPOINT_DOCS
+        shuffled = [ENDPOINT_DOCS[2], ENDPOINT_DOCS[0], ENDPOINT_DOCS[1]]
+
+        ranked_forward = _ids(engine.search(UNSCORED_QUERY, forward, [scores[d['id']] for d in forward], top_k=10))
+        ranked_shuffled = _ids(engine.search(UNSCORED_QUERY, shuffled, [scores[d['id']] for d in shuffled], top_k=10))
+
+        assert ranked_forward == ranked_shuffled, (
+            f'alpha={alpha} ranking depends on arrival order: {ranked_forward} vs {ranked_shuffled}'
+        )
+
+    @pytest.mark.parametrize('alpha', [0.0, 1.0])
+    @pytest.mark.parametrize('docs', [ENDPOINT_DOCS, TEXTLESS_DOCS], ids=['all-rankable', 'one-textless'])
+    @pytest.mark.parametrize('scores', [[0.9, None, 0.4], [None, None, 0.4], [0.9, 0.5, 0.4], [0.0, None, 0.0]])
+    def test_endpoints_return_exactly_the_documents_that_carry_evidence(self, alpha, docs, scores):
+        """The invariant behind both fixes, stated once and checked at both ends.
+
+        A document is returned iff it has evidence in at least one leg: a vector
+        score, or text BM25 can rank. Which leg carries it, and which ``alpha``
+        weights that leg to zero, must not decide whether it appears at all.
+        """
+        engine = HybridSearchEngine(alpha=alpha)
+        results = engine.search(UNSCORED_QUERY, docs, list(scores), top_k=10)
+
+        has_vector = {d['id'] for d, s in zip(docs, scores) if s is not None}
+        has_bm25 = set(_ids(engine.bm25_search(UNSCORED_QUERY, docs, top_k=len(docs))))
+
+        assert set(_ids(results)) == has_vector | has_bm25, (
+            f'alpha={alpha} scores={scores} changed the document set: {_ids(results)}'
+        )
+
+    def test_endpoint_matches_its_neighbouring_blend(self):
+        """alpha=1.0 must not differ from alpha=0.99, nor 0.0 from 0.01.
+
+        The endpoints used to be discontinuous with the blended range: one
+        hundredth of a config value away, the result gained a document. Pin that
+        they now agree, since that discontinuity is what the loss was made of.
+        """
+        scores = [0.9, None, 0.4]
+        assert _ids(HybridSearchEngine(alpha=1.0).search(UNSCORED_QUERY, ENDPOINT_DOCS, scores, top_k=10)) == _ids(
+            HybridSearchEngine(alpha=0.99).search(UNSCORED_QUERY, ENDPOINT_DOCS, scores, top_k=10)
+        )
+        textless_scores = [0.9, 0.8, 0.4]
+        assert _ids(HybridSearchEngine(alpha=0.0).search(UNSCORED_QUERY, TEXTLESS_DOCS, textless_scores, top_k=10)) == (
+            _ids(HybridSearchEngine(alpha=0.01).search(UNSCORED_QUERY, TEXTLESS_DOCS, textless_scores, top_k=10))
+        )
+
+    def test_all_unscored_still_falls_through_to_bm25_alone(self):
+        """The degenerate legs keep their short-circuit -- they drop nothing.
+
+        An empty leg holds no document, so returning the other leg unchanged
+        cannot lose anything. Pin that this path still emits the raw BM25 list
+        (no ``rrf_score``) at the endpoints as well as in the blended range.
+        """
+        results = HybridSearchEngine(alpha=1.0).search(UNSCORED_QUERY, ENDPOINT_DOCS, [None, None, None], top_k=10)
+        assert _ids(results) == _ids(HybridSearchEngine(alpha=1.0).bm25_search(UNSCORED_QUERY, ENDPOINT_DOCS, top_k=10))
+        assert not any('rrf_score' in r for r in results)
+
+    def test_endpoints_still_respect_top_k(self):
+        """Keeping every document is not a licence to overrun the caller's top_k."""
+        for alpha in (0.0, 1.0):
+            results = HybridSearchEngine(alpha=alpha).search(UNSCORED_QUERY, ENDPOINT_DOCS, [0.9, None, 0.4], top_k=2)
+            assert len(results) == 2
+
+
+# ===========================================================================
 # Deep-copy / mutation prevention
 # ===========================================================================
 
@@ -832,7 +1003,9 @@ class TestIInstanceIntegration:
         answer_text = ans.answer
 
         # Structured format -- not raw concatenation
-        assert 'Hybrid search returned' in answer_text
+        # "Hybrid rerank", matching the node's display title -- the node
+        # re-ranks an existing candidate set, it does not search for one.
+        assert 'Hybrid rerank returned' in answer_text
         assert 'results' in answer_text
         assert '[Document 1]' in answer_text
         # Score should contain actual numeric values, not 'N/A'
