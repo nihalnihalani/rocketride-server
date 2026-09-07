@@ -28,7 +28,7 @@ import os
 from rocketlib import IGlobalBase, OPEN_MODE, warning
 from ai.common.config import Config
 
-from .chunker_strategies import ChunkingStrategy, RecursiveCharacterChunker, SentenceChunker, TokenChunker
+from .chunker_strategies import ChunkingStrategy, SentenceChunker, TokenChunker
 
 
 class IGlobal(IGlobalBase):
@@ -38,7 +38,7 @@ class IGlobal(IGlobalBase):
         """Validate that tiktoken dependency is available (only needed for token strategy)."""
         try:
             config = Config.getNodeConfig(self.glb.logicalType, self.glb.connConfig)
-            strategy_name = config.get('strategy', 'recursive')
+            strategy_name = config.get('strategy', 'sentence')
         except Exception:  # noqa: BLE001
             # If config isn't available yet, install proactively
             strategy_name = 'token'
@@ -64,7 +64,7 @@ class IGlobal(IGlobalBase):
             config = Config.getNodeConfig(self.glb.logicalType, self.glb.connConfig)
 
             # Read strategy parameters from config
-            strategy_name = config.get('strategy', 'recursive')
+            strategy_name = config.get('strategy', 'sentence')
             chunk_size = int(config.get('chunk_size', 1000))
             chunk_overlap = int(config.get('chunk_overlap', 200))
             encoding_name = config.get('encoding_name', 'cl100k_base')
@@ -88,15 +88,18 @@ class IGlobal(IGlobalBase):
                     chunk_size=chunk_size,
                     chunk_overlap=chunk_overlap,
                 )
-            elif strategy_name == 'recursive':
-                self.strategy = RecursiveCharacterChunker(
-                    chunk_size=chunk_size,
-                    chunk_overlap=chunk_overlap,
-                )
             else:
-                raise ValueError(
-                    f"Unknown chunker strategy '{strategy_name}'. Expected one of: recursive, sentence, token."
-                )
+                # 'recursive' is intentionally absent: use the
+                # preprocessor_langchain node, which already exposes
+                # RecursiveCharacterTextSplitter. Name it explicitly so a stale
+                # config gets a pointer instead of a bare "unknown strategy".
+                if strategy_name == 'recursive':
+                    raise ValueError(
+                        "Chunker strategy 'recursive' was removed: use the preprocessor_langchain "
+                        "node (its 'default' or 'recursive' profile) for recursive character "
+                        'splitting. This node provides: sentence, token.'
+                    )
+                raise ValueError(f"Unknown chunker strategy '{strategy_name}'. Expected one of: sentence, token.")
 
     def endGlobal(self):
         """Release the configured chunking strategy."""

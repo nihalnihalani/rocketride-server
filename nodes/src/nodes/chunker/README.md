@@ -4,11 +4,25 @@ A RocketRide preprocessor node ("Text Chunker") that splits documents into small
 
 ## What it does
 
-Receives documents on the `documents` lane and emits one document per chunk, each carrying metadata that ties it back to the source. Three strategies are available, selected by the `profile` field:
+Receives documents on the `documents` lane and emits one document per chunk, each carrying metadata that ties it back to the source. Two strategies are available, selected by the `profile` field:
 
-- **Recursive character** (default) — splits on a separator hierarchy (`\n\n`, `\n`, `. `, ` `, then character), preserving structure where possible and hard-splitting only as a last resort.
-- **Sentence boundary** — groups whole sentences up to `chunk_size`. Sentence boundaries take priority over the size limit, so a single sentence longer than `chunk_size` is emitted whole rather than cut mid-sentence.
-- **Token-based** — splits by token count using `tiktoken`, sized for model context windows. The encoder is imported lazily and the `tiktoken` dependency is probed only when this strategy is selected; the recursive and sentence strategies are pure Python (stdlib only) and pull in no dependencies.
+- **Sentence boundary** (default) — groups whole sentences up to `chunk_size`. Sentence boundaries take priority over the size limit, so a single sentence longer than `chunk_size` is emitted whole rather than cut mid-sentence. Pure Python (stdlib `re` only): unlike the NLTK and Spacy profiles of the General Text node, it pulls in no third-party package and downloads no language model.
+- **Token-based** — splits by token count using the real `tiktoken` BPE tokenizer, sized for model context windows. The encoder is imported lazily and the `tiktoken` dependency is probed only when this strategy is selected.
+
+### Which node do I want?
+
+For **recursive character splitting**, use the **General Text** (`preprocessor_langchain`) node — it already exposes LangChain's `RecursiveCharacterTextSplitter` through its `default` and `recursive` profiles. This node does not reimplement it.
+
+Reach for Text Chunker when you need something General Text does not provide:
+
+| Need | Text Chunker | General Text (`preprocessor_langchain`) |
+|---|---|---|
+| Recursive character splitting | not provided | yes (`default` / `recursive` profiles) |
+| Token sizing | real `tiktoken` BPE counts | byte-length estimate (`bytes/3`), UI-labelled "Estimated tokens" |
+| Chunk overlap | configurable (`chunk_overlap`) | not available — fixed at `0` |
+| Per-chunk character offsets | `start_char` / `end_char` on every chunk | not emitted; returns text only |
+| Sentence splitting | stdlib regex, no extra deps | NLTK / Spacy profiles (extra deps + model download) |
+| Dependency footprint | `tiktoken` only, and only for the token strategy | `langchain`, `langchain-core`, `langchain-text-splitters`, `transformers`, `accelerate`, `tokenizers`, `huggingface-hub` |
 
 `chunk_overlap` characters (or tokens) are shared between consecutive chunks to preserve context across boundaries. The overlap is reserved inside `chunk_size`, so an emitted chunk never exceeds `chunk_size`, and it is honored even when a chunk fills that budget (including the hard-split path).
 
@@ -26,13 +40,14 @@ Each emitted chunk copies the source document (metadata is copied per chunk, nev
 
 ### Strategies
 
-| Profile                          | Strategy    | Chunk size  | Overlap | Best for                                                    |
-|----------------------------------|-------------|-------------|---------|-------------------------------------------------------------|
-| Recursive Character *(default)*  | `recursive` | 1000 chars  | 200     | General-purpose prose; best balance of structure and size   |
-| Sentence Boundary                | `sentence`  | 1000 chars  | 200     | Coherent chunks that never split mid-sentence               |
-| Token-based                      | `token`     | 512 tokens  | 50      | Fitting LLM/embedding context windows (`cl100k_base` default) |
+| Profile                       | Strategy   | Chunk size  | Overlap | Best for                                                      |
+|-------------------------------|------------|-------------|---------|---------------------------------------------------------------|
+| Sentence Boundary *(default)* | `sentence` | 1000 chars  | 200     | Coherent chunks that never split mid-sentence                 |
+| Token-based                   | `token`    | 512 tokens  | 50      | Fitting LLM/embedding context windows (`cl100k_base` default) |
 
-`chunk_size` is measured in characters for the recursive and sentence strategies and in tokens for the token strategy. `chunk_overlap` must be less than `chunk_size`. `encoding_name` applies only to the token strategy.
+`chunk_size` is measured in characters for the sentence strategy and in tokens for the token strategy. `chunk_overlap` must be less than `chunk_size`. `encoding_name` applies only to the token strategy.
+
+Configuring `strategy: recursive` raises at startup with a pointer to the General Text node rather than silently falling back.
 
 ---
 
@@ -44,9 +59,9 @@ Each emitted chunk copies the source document (metadata is copied per chunk, nev
 | Field | Type | Description | Default |
 |---|---|---|---|
 | `chunker.chunk_overlap` | `integer` | **Chunk overlap**<br/>Number of characters or tokens to overlap between consecutive chunks; must be less than chunk size. | `200` |
-| `chunker.chunk_size` | `integer` | **Chunk size**<br/>Maximum size of each chunk (characters for recursive/sentence, tokens for token strategy) | `1000` |
+| `chunker.chunk_size` | `integer` | **Chunk size**<br/>Maximum size of each chunk (characters for the sentence strategy, tokens for the token strategy) | `1000` |
 | `chunker.encoding_name` | `string` | **Token encoding**<br/>Tiktoken encoding name (only used with token strategy) | `"cl100k_base"` |
-| `chunker.profile` | `string` | **Chunking strategy**<br/>Select the text chunking strategy | `"recursive"` |
+| `chunker.profile` | `string` | **Chunking strategy**<br/>Select the text chunking strategy | `"sentence"` |
 
 ## Dependencies
 

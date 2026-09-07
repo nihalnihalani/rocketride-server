@@ -226,7 +226,7 @@ channel; they have no data lanes and **bind to an agent** (see
 | `preprocessor_langchain` | table, text → documents | LangChain text splitters / chunking          |
 | `preprocessor_llm`       | table, text → documents | LLM-based summarization / key-point chunking |
 | `preprocessor_code`      | text → documents       | Source-code tokenization                     |
-| `chunker`                | documents → documents  | Text chunker: recursive / sentence / token strategies with overlap |
+| `chunker`                | documents → documents  | Text chunker: sentence / tiktoken-token strategies with overlap and offsets |
 
 > Generic parsing and content hashing are also provided by the **`core`** module
 > (see [Core module](#core-module)).

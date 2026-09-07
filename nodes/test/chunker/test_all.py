@@ -33,225 +33,9 @@ while _NODES_SRC in sys.path:
 sys.path.insert(0, _NODES_SRC)
 
 from chunker.chunker_strategies import (  # noqa: E402
-    RecursiveCharacterChunker,
     SentenceChunker,
     TokenChunker,
 )
-
-
-# ===========================================================================
-# RecursiveCharacterChunker
-# ===========================================================================
-
-
-class TestRecursiveCharacterChunker:
-    """Tests for the recursive character chunking strategy."""
-
-    def test_basic_split(self):
-        """Text longer than chunk_size is split into multiple chunks."""
-        chunker = RecursiveCharacterChunker(chunk_size=50, chunk_overlap=0)
-        text = 'A' * 120
-        chunks = chunker.chunk(text)
-        assert len(chunks) >= 2
-        combined = ''.join(c['text'] for c in chunks)
-        assert len(combined) >= len(text)
-
-    def test_overlap(self):
-        """Consecutive chunks should overlap by the configured amount."""
-        chunker = RecursiveCharacterChunker(chunk_size=50, chunk_overlap=10)
-        text = 'word ' * 30  # 150 chars
-        chunks = chunker.chunk(text)
-        assert len(chunks) >= 2
-        if len(chunks) >= 2:
-            first_tail = chunks[0]['text'][-10:]
-            assert first_tail in chunks[1]['text']
-
-    def test_overlap_never_exceeds_chunk_size(self):
-        """Reserved overlap headroom keeps every emitted chunk within chunk_size."""
-        chunker = RecursiveCharacterChunker(chunk_size=50, chunk_overlap=20)
-        text = 'ab' * 200  # well over chunk_size
-        chunks = chunker.chunk(text)
-        for chunk in chunks:
-            assert len(chunk['text']) <= chunker.chunk_size, (
-                f'len {len(chunk["text"])} > chunk_size {chunker.chunk_size}'
-            )
-
-    def test_overlap_stays_within_chunk_size_with_real_separators(self):
-        """Overlap must not push a chunk past chunk_size when a raw chunk carries
-        a trailing separator.
-
-        Regression: capping overlap by ``min(chunk_overlap, raw_start)`` alone
-        ignores ``len(raw)``. A raw chunk is emitted as ``current + separator``,
-        so with a multi-char separator (e.g. the default ``'. '`` / ``'\\n\\n'``)
-        len(raw) can reach ``_split_size + len(separator)`` and ``overlap + raw``
-        exceeds chunk_size. The char-split tests never hit this because ``['']``
-        appends no separator. Pack sentences to the split budget so the sentence
-        separator is appended to a full raw chunk.
-        """
-        chunk_size = 40
-        overlap = 5
-        chunker = RecursiveCharacterChunker(chunk_size=chunk_size, chunk_overlap=overlap, separators=['. ', ' ', ''])
-        # A concrete input (found by fuzzing) where sentences pack to the split
-        # budget and the '. ' separator is appended to a full raw chunk. Under
-        # the len(raw)-unaware cap this emits a 41-char chunk; the fix keeps it
-        # within chunk_size.
-        text = (
-            'cebaeb. bca. bcce. bcdebccac. aae. bedbdad. dedecbbc. bdca. '
-            'baacdbaad. ecebcadbb. daccc. cbacbcb. cda. cebbea'
-        )
-        chunks = chunker.chunk(text)
-        assert len(chunks) >= 2
-        for c in chunks:
-            assert len(c['text']) <= chunk_size, (
-                f'chunk len {len(c["text"])} exceeds chunk_size {chunk_size}: {c["text"]!r}'
-            )
-
-    @pytest.mark.parametrize('overlap', [0, 1])
-    def test_chunk_never_exceeds_chunk_size_when_overlap_below_separator(self, overlap):
-        """The size cap must hold even when chunk_overlap is smaller than a
-        trailing separator.
-
-        Regression: a raw chunk is emitted as ``current + separator`` where
-        ``current`` fits ``_split_size`` but the appended default ``'\\n\\n'``
-        separator (2 chars) can push len(raw) to chunk_size + 1. Trimming only
-        the overlap cannot shrink the raw chunk, so with chunk_overlap 0 or 1
-        (both allowed -- schema minimum is 0) the emitted chunk overflowed. The
-        body is now capped at chunk_size, dropping only excess trailing
-        separator characters.
-        """
-        chunk_size = 10
-        chunker = RecursiveCharacterChunker(chunk_size=chunk_size, chunk_overlap=overlap)
-        text = 'aaaaaaaaa\n\nbbbbbbbbb\n\nccc'  # default separators include '\n\n'
-        chunks = chunker.chunk(text)
-        assert len(chunks) >= 2
-        for c in chunks:
-            assert len(c['text']) <= chunk_size, (
-                f'overlap={overlap}: chunk len {len(c["text"])} exceeds {chunk_size}: {c["text"]!r}'
-            )
-
-    def test_overlap_honored_on_full_size_chunks(self):
-        """Overlap must be applied even when chunks fill chunk_size.
-
-        Regression: the previous budget cap ``max(0, chunk_size - len(raw))``
-        collapsed the overlap to zero whenever a raw chunk filled chunk_size --
-        the common case for prose with no matching separator and *always* on the
-        hard-split path -- so the configured overlap was silently dropped. With
-        no separators every split is a full-size hard-split, so a zero-overlap
-        implementation yields chunks that share no prefix at all.
-        """
-        chunk_size = 50
-        overlap = 15
-        chunker = RecursiveCharacterChunker(chunk_size=chunk_size, chunk_overlap=overlap, separators=[''])
-        text = 'abcdefghij' * 20  # 200 chars, no separators -> hard-split path
-        chunks = chunker.chunk(text)
-        assert len(chunks) >= 3
-
-        # At least one chunk actually reaches chunk_size (proves overlap is
-        # honored on *full* chunks, not merely on short tail chunks).
-        assert any(len(c['text']) == chunk_size for c in chunks), (
-            f'expected a full-size chunk, got sizes {[len(c["text"]) for c in chunks]}'
-        )
-
-        for i in range(1, len(chunks)):
-            # Every chunk stays within the size cap...
-            assert len(chunks[i]['text']) <= chunk_size
-            # ...and begins with the previous chunk's trailing `overlap` chars.
-            prev_tail = chunks[i - 1]['text'][-overlap:]
-            assert chunks[i]['text'][:overlap] == prev_tail, (
-                f'chunk {i} does not carry the previous {overlap}-char overlap'
-            )
-            # start_char/end_char stay truthful against the source text.
-            meta = chunks[i]['metadata']
-            assert chunks[i]['text'] == text[meta['start_char'] : meta['end_char']]
-
-    def test_custom_separators(self):
-        """Custom separators should be respected."""
-        chunker = RecursiveCharacterChunker(chunk_size=50, chunk_overlap=0, separators=['|'])
-        text = 'part one|part two|part three'
-        chunks = chunker.chunk(text)
-        assert len(chunks) >= 1
-
-    def test_separator_preserved_on_overflow_emit(self):
-        """When splitting forces an emit, the joining separator must not be dropped.
-
-        Without preservation, concatenating chunk texts loses the ``|`` between
-        emitted pieces; this regresses the start/end offsets downstream.
-        """
-        # chunk_size chosen so each part fits but pairs don't, forcing emits.
-        chunker = RecursiveCharacterChunker(chunk_size=12, chunk_overlap=0, separators=['|'])
-        text = 'partA|partB|partC|partD'
-        chunks = chunker.chunk(text)
-        assert len(chunks) >= 2
-        # At least one emitted chunk should end with the separator that
-        # previously would have been silently dropped.
-        assert any(c['text'].endswith('|') for c in chunks), (
-            f'expected at least one chunk ending in separator, got {[c["text"] for c in chunks]}'
-        )
-
-    def test_empty_text(self):
-        chunker = RecursiveCharacterChunker(chunk_size=50, chunk_overlap=0)
-        assert chunker.chunk('') == []
-        assert chunker.chunk('   ') == []
-
-    def test_whitespace_only_text(self):
-        chunker = RecursiveCharacterChunker(chunk_size=50, chunk_overlap=0)
-        assert chunker.chunk('\n\n\n') == []
-        assert chunker.chunk('\t  \n  ') == []
-
-    def test_text_smaller_than_chunk_size(self):
-        chunker = RecursiveCharacterChunker(chunk_size=1000, chunk_overlap=0)
-        text = 'Hello world.'
-        chunks = chunker.chunk(text)
-        assert len(chunks) == 1
-        assert chunks[0]['text'] == text
-
-    def test_single_character(self):
-        chunker = RecursiveCharacterChunker(chunk_size=50, chunk_overlap=0)
-        chunks = chunker.chunk('A')
-        assert len(chunks) == 1
-        assert chunks[0]['text'] == 'A'
-
-    def test_chunk_metadata_indices(self):
-        chunker = RecursiveCharacterChunker(chunk_size=20, chunk_overlap=0)
-        text = 'This is a longer text that needs to be split into multiple chunks for testing.'
-        chunks = chunker.chunk(text)
-        assert len(chunks) >= 2
-        for i, chunk in enumerate(chunks):
-            assert chunk['metadata']['chunk_index'] == i
-
-    def test_metadata_has_required_fields(self):
-        chunker = RecursiveCharacterChunker(chunk_size=50, chunk_overlap=0)
-        text = 'Hello world. This is a test.'
-        chunks = chunker.chunk(text)
-        for chunk in chunks:
-            assert 'text' in chunk
-            assert 'metadata' in chunk
-            meta = chunk['metadata']
-            assert isinstance(meta['chunk_index'], int)
-            assert isinstance(meta['start_char'], int)
-            assert isinstance(meta['end_char'], int)
-
-    def test_paragraph_separator(self):
-        chunker = RecursiveCharacterChunker(chunk_size=100, chunk_overlap=0)
-        text = 'First paragraph.\n\nSecond paragraph.\n\nThird paragraph.'
-        chunks = chunker.chunk(text)
-        assert len(chunks) == 1
-
-    def test_invalid_chunk_size(self):
-        with pytest.raises(ValueError, match='chunk_size must be positive'):
-            RecursiveCharacterChunker(chunk_size=0)
-        with pytest.raises(ValueError, match='chunk_size must be positive'):
-            RecursiveCharacterChunker(chunk_size=-1)
-
-    def test_invalid_overlap(self):
-        with pytest.raises(ValueError, match='chunk_overlap must be less than chunk_size'):
-            RecursiveCharacterChunker(chunk_size=50, chunk_overlap=50)
-        with pytest.raises(ValueError, match='chunk_overlap must be less than chunk_size'):
-            RecursiveCharacterChunker(chunk_size=50, chunk_overlap=60)
-
-    def test_negative_overlap(self):
-        with pytest.raises(ValueError, match='chunk_overlap must be non-negative'):
-            RecursiveCharacterChunker(chunk_size=50, chunk_overlap=-1)
 
 
 # ===========================================================================
@@ -527,6 +311,31 @@ class TestIGlobalLifecycle:
         with pytest.raises(ValueError, match='Unknown chunker strategy'):
             iglobal.beginGlobal()
 
+    def test_iglobal_points_removed_recursive_strategy_at_preprocessor(self):
+        """A stale 'recursive' config names the node that owns that algorithm.
+
+        Recursive character splitting lives in preprocessor_langchain; this node
+        no longer reimplements it, so the error has to route the author there
+        rather than read as a plain typo.
+        """
+        IGlobal, _ = _import_node_classes()
+        iglobal = IGlobal.__new__(IGlobal)
+        iglobal.strategy = None
+
+        endpoint = MagicMock()
+        endpoint.openMode = 'run'
+        iglobal.IEndpoint = MagicMock()
+        iglobal.IEndpoint.endpoint = endpoint
+
+        glb = MagicMock()
+        glb.logicalType = 'chunker'
+        glb.connConfig = {'strategy': 'recursive', 'chunk_size': '100', 'chunk_overlap': '0'}
+        iglobal.glb = glb
+
+        with pytest.raises(ValueError, match='preprocessor_langchain'):
+            iglobal.beginGlobal()
+        assert iglobal.strategy is None
+
 
 class TestIInstanceWriteDocuments:
     """IInstance.writeDocuments emits one document per chunk."""
@@ -553,12 +362,12 @@ class TestIInstanceWriteDocuments:
     def test_parent_id_propagated_from_existing_metadata(self):
         _, IInstance = _import_node_classes()
         Doc, DocMetadata = _import_schema()
-        strategy = RecursiveCharacterChunker(chunk_size=20, chunk_overlap=0)
+        strategy = SentenceChunker(chunk_size=20, chunk_overlap=0)
         inst = self._make_instance(IInstance, strategy=strategy)
 
         meta = DocMetadata(objectId='doc-123', chunkId=0)
         doc = Doc(
-            page_content='This is text that will be split into multiple chunks by the strategy.',
+            page_content='First sentence here. Second sentence here. Third sentence here.',
             metadata=meta,
         )
         inst.writeDocuments([doc])
@@ -572,11 +381,11 @@ class TestIInstanceWriteDocuments:
     def test_parent_id_empty_when_no_metadata(self):
         _, IInstance = _import_node_classes()
         Doc, _ = _import_schema()
-        strategy = RecursiveCharacterChunker(chunk_size=20, chunk_overlap=0)
+        strategy = SentenceChunker(chunk_size=20, chunk_overlap=0)
         inst = self._make_instance(IInstance, strategy=strategy)
 
         doc = Doc(
-            page_content='This is text that will be split into multiple chunks by the strategy.',
+            page_content='First sentence here. Second sentence here. Third sentence here.',
             metadata=None,
         )
         inst.writeDocuments([doc])
@@ -589,13 +398,13 @@ class TestIInstanceWriteDocuments:
     def test_accepts_dict_payloads(self):
         _, IInstance = _import_node_classes()
         _import_schema()  # ensure schema is importable
-        strategy = RecursiveCharacterChunker(chunk_size=20, chunk_overlap=0)
+        strategy = SentenceChunker(chunk_size=20, chunk_overlap=0)
         inst = self._make_instance(IInstance, strategy=strategy)
 
         inst.writeDocuments(
             [
                 {
-                    'page_content': 'This dictionary document should be split into chunks.',
+                    'page_content': 'First dict sentence. Second dict sentence. Third dict sentence.',
                     'metadata': {
                         'objectId': 'dict-doc',
                         'chunkId': 0,
@@ -616,7 +425,7 @@ class TestIInstanceWriteDocuments:
         """Empty/whitespace-only inputs must not leak through to downstream."""
         _, IInstance = _import_node_classes()
         Doc, _ = _import_schema()
-        strategy = RecursiveCharacterChunker(chunk_size=20, chunk_overlap=0)
+        strategy = SentenceChunker(chunk_size=20, chunk_overlap=0)
         inst = self._make_instance(IInstance, strategy=strategy)
 
         inst.writeDocuments([Doc(page_content='', metadata=None), Doc(page_content='   ', metadata=None)])
@@ -627,10 +436,10 @@ class TestIInstanceWriteDocuments:
     def test_original_document_not_mutated(self):
         _, IInstance = _import_node_classes()
         Doc, DocMetadata = _import_schema()
-        strategy = RecursiveCharacterChunker(chunk_size=20, chunk_overlap=0)
+        strategy = SentenceChunker(chunk_size=20, chunk_overlap=0)
         inst = self._make_instance(IInstance, strategy=strategy)
 
-        original_content = 'This is text that will be split into multiple chunks by the strategy.'
+        original_content = 'First sentence here. Second sentence here. Third sentence here.'
         meta = DocMetadata(objectId='orig-id', chunkId=99)
         doc = Doc(page_content=original_content, metadata=meta)
 

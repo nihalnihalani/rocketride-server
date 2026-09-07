@@ -7,7 +7,7 @@
 	"node": "python",
 	"path": "nodes.chunker",
 	"prefix": "Chunker",
-	"description": ["A text chunking component that splits documents into smaller, semantically coherent ", "chunks for downstream processing such as embedding, retrieval, and LLM-based generation. ", "Supports multiple chunking strategies: recursive character splitting with configurable ", "separators, sentence-boundary splitting, and token-based splitting using tiktoken. ", "Each strategy supports configurable chunk size and overlap to balance context preservation ", "with chunk granularity."],
+	"description": ["A text chunking component that splits documents into smaller, semantically coherent ", "chunks for downstream processing such as embedding, retrieval, and LLM-based generation. ", "Provides two strategies the engine does not otherwise have: sentence-boundary splitting ", "with no third-party dependencies, and token-based splitting using the real tiktoken BPE ", "tokenizer (not a byte-length estimate). Both support configurable chunk size and overlap, ", "and emit start/end character offsets per chunk. For recursive character splitting use the ", "General Text (preprocessor_langchain) node, which already provides it."],
 	"icon": "chunker.svg",
 	"documentation": "https://docs.rocketride.org",
 	"tile": ["Strategy: ${parameters.chunker.${profile}.strategy}", "Size: ${parameters.chunker.${profile}.chunk_size}"],
@@ -28,14 +28,8 @@
 		}
 	],
 	"preconfig": {
-		"default": "recursive",
+		"default": "sentence",
 		"profiles": {
-			"recursive": {
-				"title": "Recursive Character - General-purpose, best balance of structure and size",
-				"strategy": "recursive",
-				"chunk_size": 1000,
-				"chunk_overlap": 200
-			},
 			"sentence": {
 				"title": "Sentence Boundary - Splits at sentence endings for coherent chunks",
 				"strategy": "sentence",
@@ -55,7 +49,7 @@
 		"chunker.chunk_size": {
 			"type": "integer",
 			"title": "Chunk size",
-			"description": "Maximum size of each chunk (characters for recursive/sentence, tokens for token strategy)",
+			"description": "Maximum size of each chunk (characters for the sentence strategy, tokens for the token strategy)",
 			"default": 1000,
 			"minimum": 1
 		},
@@ -78,10 +72,6 @@
 				["r50k_base", "r50k_base - GPT-3 models"]
 			]
 		},
-		"chunker.recursive": {
-			"object": "recursive",
-			"properties": ["chunker.chunk_size", "chunker.chunk_overlap"]
-		},
 		"chunker.sentence": {
 			"object": "sentence",
 			"properties": ["chunker.chunk_size", "chunker.chunk_overlap"]
@@ -94,13 +84,9 @@
 			"title": "Chunking strategy",
 			"description": "Select the text chunking strategy",
 			"type": "string",
-			"default": "recursive",
+			"default": "sentence",
 			"enum": ["*>preconfig.profiles.*.title"],
 			"conditional": [
-				{
-					"value": "recursive",
-					"properties": ["chunker.recursive"]
-				},
 				{
 					"value": "sentence",
 					"properties": ["chunker.sentence"]
@@ -120,7 +106,7 @@
 		}
 	],
 	"test": {
-		"profiles": ["recursive"],
+		"profiles": ["sentence"],
 		"outputs": ["documents"],
 		"cases": [
 			{
