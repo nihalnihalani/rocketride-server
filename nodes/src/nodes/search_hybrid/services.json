@@ -34,6 +34,25 @@
 						"contains": "Machine learning"
 					}
 				}
+			},
+			{
+				"name": "Unscored documents rank by relevance, not arrival order",
+				"questions": {
+					"questions": [
+						{ "text": "machine learning" }
+					],
+					"documents": [
+						{ "page_content": "The harbour was grey and cold that morning." },
+						{ "page_content": "A recipe for bread needs flour, water and salt." },
+						{ "page_content": "Machine learning is a subset of artificial intelligence." }
+					]
+				},
+				"expect": {
+					"documents": {
+						"notEmpty": true,
+						"property": { "path": "[0].page_content", "contains": "Machine learning" }
+					}
+				}
 			}
 		]
 	},
