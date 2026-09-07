@@ -295,13 +295,18 @@ class DatasetLoader:
         if not items:
             return items
 
+        # Only the import is guarded. Running the cobalt transforms inside the
+        # try as well would let an ImportError raised *by cobalt* (a lazy
+        # third-party import inside Dataset) fall through to the fallback, so a
+        # broken install would silently return differently-transformed items
+        # instead of surfacing. load_from_file guards the same way.
         try:
             from cobalt import Dataset
-
-            return self._apply_transforms_cobalt(items, config, Dataset)
         except ImportError:
             debug('Cobalt DatasetLoader: basalt-ai-cobalt not installed, using Python fallback for transforms')
             return self._apply_transforms_fallback(items, config)
+
+        return self._apply_transforms_cobalt(items, config, Dataset)
 
     def _apply_transforms_cobalt(
         self, items: List[Dict[str, Any]], config: Dict[str, Any], Dataset: Any
