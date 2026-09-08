@@ -226,6 +226,7 @@ channel; they have no data lanes and **bind to an agent** (see
 | `preprocessor_langchain` | table, text → documents | LangChain text splitters / chunking          |
 | `preprocessor_llm`       | table, text → documents | LLM-based summarization / key-point chunking |
 | `preprocessor_code`      | text → documents       | Source-code tokenization                     |
+| `chunker`                | documents → documents  | Text chunker: sentence / tiktoken-token strategies with overlap and offsets |
 
 > Generic parsing and content hashing are also provided by the **`core`** module
 > (see [Core module](#core-module)).
@@ -296,6 +297,7 @@ channel; they have no data lanes and **bind to an agent** (see
 | `guardrails`    | questions, answers, documents → answers, documents, questions | Input/output safety guardrails       |
 | `authoritative_overlay` | answers, text → answers                         | SEC EDGAR period-scoped number cross-check (abstain on mismatch) |
 | `rerank_cohere` | questions → answers, documents                        | Cohere Rerank for retrieval quality          |
+| `search_hybrid` | questions → documents, answers                        | BM25 + vector RRF post-retrieval re-ranker (experimental) |
 | `search_exa`    | questions → answers, text                             | Direct Exa web search (non-tool)             |
 
 ### Evaluation
