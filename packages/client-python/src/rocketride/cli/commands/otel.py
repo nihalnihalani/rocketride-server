@@ -21,14 +21,13 @@
 # SOFTWARE.
 
 """
-RocketRide CLI OpenTelemetry Bridge Command Implementation.
+``otel`` — export live pipeline traces and metrics over OTLP.
 
-This module provides the OtelCommand class for exporting live pipeline traces
-and metrics to any OpenTelemetry collector over OTLP through the RocketRide
-CLI. Use this command to observe pipeline executions in backends such as
-Jaeger, Grafana Tempo, Datadog, Langfuse, or LangSmith without any engine or
-server changes: the bridge is a pure consumer of the engine's documented
-WebSocket monitor protocol.
+Exports live pipeline traces and metrics to any OpenTelemetry collector over
+OTLP through the RocketRide CLI. Use this command to observe pipeline
+executions in backends such as Jaeger, Grafana Tempo, Datadog, Langfuse, or
+LangSmith without any engine or server changes: the bridge is a pure consumer
+of the engine's documented WebSocket monitor protocol.
 
 The command subscribes to the TASK, SUMMARY, FLOW, and SSE monitor event
 types with the wildcard token scope and maps them to OTel spans (pipeline
@@ -41,6 +40,14 @@ started with the ``pipelineTraceLevel`` execute argument, e.g.
 ``client.use(pipelineTraceLevel='summary')``. Without it, the bridge still
 exports task lifecycle spans and status metrics.
 
+This command does not route through the shared ``Output`` channel or
+``run_cli_command``: it is a long-running foreground bridge whose output is a
+startup banner plus operational notes, it emits no JSON result, and its
+documented exit codes (0 graceful stop, 1 unexpected failure, 2 missing extra
+/ insecure transport / startup connection failure) do not match the shared
+runner's catch-all mapping to 1. It also owns its client's lifecycle so that
+the dependency guard can refuse BEFORE anything connects.
+
 Key Features:
     - OTLP export of pipeline flow spans and task status metrics
     - Wildcard monitor subscription covering all tasks for the API key
@@ -49,7 +56,8 @@ Key Features:
       apply, including OTEL_EXPORTER_OTLP_TRACES/METRICS_ENDPOINT)
     - Privacy by default: payload content excluded unless --include-content
     - Automatic reconnection with capped exponential backoff
-    - Graceful shutdown on SIGINT/SIGTERM (spans closed, exporters flushed)
+    - Graceful shutdown on SIGINT/SIGTERM (spans closed, exporters flushed),
+      leaving any signal handler the running loop already owns in place
 
 Usage:
     rocketride otel --apikey <key>
@@ -69,17 +77,12 @@ ROCKETRIDE_OTEL_ALLOW_INSECURE=1) to override on a trusted network.
 
 Requires the optional OpenTelemetry dependencies:
     pip install 'rocketride[otel]'
-
-Components:
-    OtelCommand: Main command implementation for the OpenTelemetry bridge
 """
 
 import importlib.util
 import os
 import sys
-from typing import TYPE_CHECKING
 
-from .base import BaseCommand
 from ...otelbridge.bridge import run_bridge
 from ...otelbridge.config import (
     DEFAULT_GRPC_ENDPOINT,
@@ -93,9 +96,6 @@ from ...otelbridge.config import (
 
 # Safe without the 'otel' extra: setup.py keeps all opentelemetry imports lazy.
 from ...otelbridge.setup import OtelNotInstalledError
-
-if TYPE_CHECKING:
-    from ..main import RocketRideClient
 
 # Exact install hint for the missing-extra error path (contract: exit code 2)
 OTEL_INSTALL_HINT = "pip install 'rocketride[otel]'"
@@ -121,168 +121,169 @@ def _otel_available() -> bool:
         return False
 
 
-class OtelCommand(BaseCommand):
+def _endpoint_display(config: OtelConfig) -> str:
     """
-    Command implementation for the OpenTelemetry bridge.
+    Render the effective OTLP endpoint for the startup line, redacted.
 
-    Exports live pipeline traces and metrics over OTLP by consuming the
-    engine's WebSocket monitor protocol. Runs until interrupted (Ctrl+C or
-    SIGTERM), closing open spans and flushing exporters on shutdown.
+    Never prints ``config.endpoint`` (or an environment endpoint) as
+    given: userinfo and query strings are stripped by
+    :func:`~rocketride.otelbridge.config.redact_endpoint` so no credential
+    or URL signature reaches stdout.
 
-    Example:
-        ```python
-        # Initialize and execute the OTel bridge
-        command = OtelCommand(cli, args)
-        exit_code = await command.execute(client)
-        ```
+    Args:
+        config: Resolved bridge configuration.
 
-    Key Features:
-        - Lazy dependency guard: clear exit code 2 with install hint when
-          the 'rocketride[otel]' extra is missing (checked before connecting)
-        - Configuration precedence: CLI args > OTEL_* env vars > defaults
-        - Traces and metrics over one OTLP endpoint (http/protobuf default)
-        - Content privacy gate via --include-content
+    Returns:
+        str: Redacted endpoint, annotated with where it came from.
     """
+    if config.endpoint:
+        return redact_endpoint(config.endpoint)
+    resolved = effective_endpoint(config, os.environ, 'traces')
+    sdk_default = DEFAULT_GRPC_ENDPOINT if config.protocol == 'grpc' else DEFAULT_HTTP_ENDPOINT
+    if resolved == sdk_default:
+        return f'exporter default ({sdk_default})'
+    return f'{redact_endpoint(resolved)} (from OTEL_EXPORTER_OTLP_*ENDPOINT)'
 
-    def __init__(self, cli, args):
-        """
-        Initialize OtelCommand with CLI context and parsed arguments.
 
-        Args:
-            cli: CLI instance providing cancellation state and event handling
-            args: Parsed command line arguments containing exporter options
-                  and connection configuration
-        """
-        super().__init__(cli, args)
+def _make_client(args):
+    """
+    Build an UNCONNECTED client for the bridge to own.
 
-    @staticmethod
-    def _endpoint_display(config: OtelConfig) -> str:
-        """
-        Render the effective OTLP endpoint for the startup line, redacted.
+    The bridge connects (and reconnects) the client itself, so nothing here
+    may touch the network: the missing-extra guard and the transport-security
+    check must both be able to refuse before a single socket is opened.
 
-        Never prints ``config.endpoint`` (or an environment endpoint) as
-        given: userinfo and query strings are stripped by
-        :func:`~rocketride.otelbridge.config.redact_endpoint` so no credential
-        or URL signature reaches stdout.
+    Args:
+        args: Parsed argparse namespace (uri, apikey).
 
-        Args:
-            config: Resolved bridge configuration.
+    Returns:
+        An unconnected RocketRideClient.
+    """
+    from rocketride import RocketRideClient
 
-        Returns:
-            str: Redacted endpoint, annotated with where it came from.
-        """
-        if config.endpoint:
-            return redact_endpoint(config.endpoint)
-        resolved = effective_endpoint(config, os.environ, 'traces')
-        sdk_default = DEFAULT_GRPC_ENDPOINT if config.protocol == 'grpc' else DEFAULT_HTTP_ENDPOINT
-        if resolved == sdk_default:
-            return f'exporter default ({sdk_default})'
-        return f'{redact_endpoint(resolved)} (from OTEL_EXPORTER_OTLP_*ENDPOINT)'
+    return RocketRideClient(args.uri, auth=getattr(args, 'apikey', '') or '')
 
-    async def execute(self, client: 'RocketRideClient') -> int:
-        """
-        Execute the OpenTelemetry bridge command.
 
-        Verifies the optional OpenTelemetry dependencies are installed,
-        resolves the exporter configuration, and runs the bridge loop until
-        interrupted.
+async def run_otel(args, client=None) -> int:
+    """
+    Execute the OpenTelemetry bridge command.
 
-        Args:
-            client: RocketRideClient instance for server communication
-                (connected by the bridge if not already connected)
+    Verifies the optional OpenTelemetry dependencies are installed,
+    resolves the exporter configuration, and runs the bridge loop until
+    interrupted.
 
-        Returns:
-            Exit code: 0 for graceful shutdown, 1 for unexpected errors,
-            2 when dependencies are missing or the startup connection fails
+    Args:
+        args: Parsed argparse namespace (endpoint, protocol, service_name,
+            headers, include_content, insecure, no_metrics, trace_level,
+            uri, apikey).
+        client: RocketRideClient for server communication, connected by the
+            bridge if not already connected. Built from ``args`` when
+            omitted (the CLI's case); injectable for tests.
 
-        Process Flow:
-            1. Guard: missing 'rocketride[otel]' extra -> exit 2 with hint
-               (before any connection attempt)
-            2. Resolve OtelConfig (CLI args > OTEL_* env vars > defaults)
-            3. Print the effective bridge configuration
-            4. Run the bridge loop (connect, subscribe, dispatch, reconnect)
-            5. Graceful shutdown on SIGINT/SIGTERM: spans closed, exporters
-               flushed, exit 0
-        """
-        # Dependency guard MUST run before any connection attempt
-        if not _otel_available():
-            print(
-                f"Error: 'rocketride otel' requires the OpenTelemetry extra. Install it with: {OTEL_INSTALL_HINT}",
-                file=sys.stderr,
-            )
-            return 2
+    Returns:
+        Exit code: 0 for graceful shutdown, 1 for unexpected errors,
+        2 when dependencies are missing or the startup connection fails
 
-        # Resolve configuration: CLI args > OTEL_* env vars > defaults
-        config = OtelConfig.from_args_env(self.args)
-
-        # --trace-level is documentation-surface only: the monitor protocol
-        # has no way to change the trace level of runs the bridge didn't start
-        trace_level = getattr(self.args, 'trace_level', None)
-        if trace_level == 'none':
-            # 'none' disables flow tracing, so "emit FLOW events at that
-            # level" would be nonsense for it.
-            print(
-                "Note: --trace-level=none is informational only. 'none' means flow tracing stays "
-                'disabled: runs started without a pipelineTraceLevel (or with '
-                "pipelineTraceLevel='none') emit no FLOW events, so only task lifecycle spans "
-                'and metrics are exported.'
-            )
-        elif trace_level:
-            print(
-                f'Note: --trace-level={trace_level} is informational only. The bridge cannot change the '
-                f'trace level of runs it did not start; start runs with '
-                f"pipelineTraceLevel='{trace_level}' (e.g. client.use(pipelineTraceLevel='{trace_level}')) "
-                f'to emit FLOW events at that level.'
-            )
-
-        # Refuse to ship collector credentials in cleartext before the
-        # endpoint is echoed or a single span is exported.
-        try:
-            validate_transport_security(config)
-        except InsecureTransportError as e:
-            print(f'Error: {e}', file=sys.stderr)
-            return 2
-
-        # Show the effective configuration before entering the run loop.
-        # ALWAYS redacted: an endpoint can carry userinfo credentials
-        # (https://user:pass@host) or a signed query string, and this line
-        # goes to stdout, which operators pipe into logs.
-        endpoint_display = self._endpoint_display(config)
-        print(f'OpenTelemetry bridge starting (endpoint: {endpoint_display}, protocol: {config.protocol})')
-        print(f'  service.name: {config.service_name}')
-        print(f'  metrics: {"disabled" if config.no_metrics else "enabled"}')
-        print(f'  payload content: {"included (size-capped)" if config.include_content else "excluded"}')
+    Process Flow:
+        1. Guard: missing 'rocketride[otel]' extra -> exit 2 with hint
+           (before any connection attempt)
+        2. Resolve OtelConfig (CLI args > OTEL_* env vars > defaults)
+        3. Print the effective bridge configuration
+        4. Run the bridge loop (connect, subscribe, dispatch, reconnect)
+        5. Graceful shutdown on SIGINT/SIGTERM: spans closed, exporters
+           flushed, exit 0
+    """
+    # Dependency guard MUST run before any connection attempt
+    if not _otel_available():
         print(
-            "  FLOW spans require runs started with pipelineTraceLevel (e.g. client.use(pipelineTraceLevel='summary'))"
+            f"Error: 'rocketride otel' requires the OpenTelemetry extra. Install it with: {OTEL_INSTALL_HINT}",
+            file=sys.stderr,
         )
-        if config.allow_insecure:
-            print(
-                '  WARNING: --insecure is set; OTLP credentials may be exported over cleartext transport',
-                file=sys.stderr,
-            )
+        return 2
 
-        try:
-            # Run the bridge until stopped (returns 0) or startup fails (2)
-            return await run_bridge(client, config)
+    # Resolve configuration: CLI args > OTEL_* env vars > defaults
+    config = OtelConfig.from_args_env(args)
 
-        except InsecureTransportError as e:
-            # Re-checked inside build_providers; the environment could have
-            # been read differently there (e.g. embedded use).
-            print(f'Error: {e}', file=sys.stderr)
-            return 2
+    # --trace-level is documentation-surface only: the monitor protocol
+    # has no way to change the trace level of runs the bridge didn't start
+    trace_level = getattr(args, 'trace_level', None)
+    if trace_level == 'none':
+        # 'none' disables flow tracing, so "emit FLOW events at that
+        # level" would be nonsense for it.
+        print(
+            "Note: --trace-level=none is informational only. 'none' means flow tracing stays "
+            'disabled: runs started without a pipelineTraceLevel (or with '
+            "pipelineTraceLevel='none') emit no FLOW events, so only task lifecycle spans "
+            'and metrics are exported.'
+        )
+    elif trace_level:
+        print(
+            f'Note: --trace-level={trace_level} is informational only. The bridge cannot change the '
+            f'trace level of runs it did not start; start runs with '
+            f"pipelineTraceLevel='{trace_level}' (e.g. client.use(pipelineTraceLevel='{trace_level}')) "
+            f'to emit FLOW events at that level.'
+        )
 
-        except (ImportError, OtelNotInstalledError) as e:
-            # Missing optional dependency surfaced after the guard, e.g.
-            # --protocol grpc without the OTLP gRPC exporter package
-            # (build_providers raises OtelNotInstalledError for that path).
-            print(f'Error: {e}', file=sys.stderr)
-            return 2
+    # Refuse to ship collector credentials in cleartext before the
+    # endpoint is echoed or a single span is exported.
+    try:
+        validate_transport_security(config)
+    except InsecureTransportError as e:
+        print(f'Error: {e}', file=sys.stderr)
+        return 2
 
-        except KeyboardInterrupt:
-            # Fallback when signal handlers could not be installed
-            print('\nStopping OpenTelemetry bridge...')
-            return 0
+    # Show the effective configuration before entering the run loop.
+    # ALWAYS redacted: an endpoint can carry userinfo credentials
+    # (https://user:pass@host) or a signed query string, and this line
+    # goes to stdout, which operators pipe into logs.
+    endpoint_display = _endpoint_display(config)
+    print(f'OpenTelemetry bridge starting (endpoint: {endpoint_display}, protocol: {config.protocol})')
+    print(f'  service.name: {config.service_name}')
+    print(f'  metrics: {"disabled" if config.no_metrics else "enabled"}')
+    print(f'  payload content: {"included (size-capped)" if config.include_content else "excluded"}')
+    print("  FLOW spans require runs started with pipelineTraceLevel (e.g. client.use(pipelineTraceLevel='summary'))")
+    if config.allow_insecure:
+        print(
+            '  WARNING: --insecure is set; OTLP credentials may be exported over cleartext transport',
+            file=sys.stderr,
+        )
 
-        except Exception as e:
-            print(f'Error: OpenTelemetry bridge failed: {e}', file=sys.stderr)
-            return 1
+    # Built only now: everything that can refuse has already refused, so the
+    # guard and the transport check still run before anything connects.
+    owns_client = client is None
+    if owns_client:
+        client = _make_client(args)
+
+    try:
+        # Run the bridge until stopped (returns 0) or startup fails (2)
+        return await run_bridge(client, config)
+
+    except InsecureTransportError as e:
+        # Re-checked inside build_providers; the environment could have
+        # been read differently there (e.g. embedded use).
+        print(f'Error: {e}', file=sys.stderr)
+        return 2
+
+    except (ImportError, OtelNotInstalledError) as e:
+        # Missing optional dependency surfaced after the guard, e.g.
+        # --protocol grpc without the OTLP gRPC exporter package
+        # (build_providers raises OtelNotInstalledError for that path).
+        print(f'Error: {e}', file=sys.stderr)
+        return 2
+
+    except KeyboardInterrupt:
+        # Fallback when signal handlers could not be installed
+        print('\nStopping OpenTelemetry bridge...')
+        return 0
+
+    except Exception as e:
+        print(f'Error: OpenTelemetry bridge failed: {e}', file=sys.stderr)
+        return 1
+
+    finally:
+        # Only a client this function created is this function's to close.
+        if owns_client:
+            try:
+                await client.disconnect()
+            except Exception:  # noqa: BLE001
+                pass

@@ -30,16 +30,16 @@ run_bridge. The RocketRide client and the bridge loop are faked, so no
 server and no 'rocketride[otel]' extra are required.
 """
 
+import argparse
 import importlib
 import importlib.util
 import signal
-import sys
 from types import SimpleNamespace
 
 import pytest
 
-from rocketride.cli.commands import OtelCommand
 from rocketride.cli.commands import otel as otel_module
+from rocketride.cli.commands.otel import run_otel
 
 # Importable without the 'otel' extra: setup.py keeps all otel imports lazy.
 from rocketride.otelbridge.setup import OtelNotInstalledError
@@ -109,10 +109,10 @@ def make_args(**overrides):
 
 @pytest.fixture
 def cli_parser():
-    """RocketRideCLI parser, restoring the SIGINT handler it replaces."""
+    """The CLI's root parser, restoring any SIGINT handler that is disturbed."""
     previous = signal.getsignal(signal.SIGINT)
     try:
-        yield cli_main.RocketRideCLI().setup_parser()
+        yield cli_main.setup_parser()
     finally:
         signal.signal(signal.SIGINT, previous)
 
@@ -126,8 +126,23 @@ class TestOtelParser:
     def test_command_is_exported(self):
         from rocketride.cli import commands
 
-        assert 'OtelCommand' in commands.__all__
-        assert commands.OtelCommand is OtelCommand
+        assert 'run_otel' in commands.__all__
+        assert commands.run_otel is run_otel
+
+    def test_otel_is_registered_exactly_once_alongside_validate(self, cli_parser):
+        # The command table must carry both the upstream 'validate' verb and
+        # this PR's 'otel' verb, each registered exactly once.
+        subparsers = next(a for a in cli_parser._actions if isinstance(a, argparse._SubParsersAction))
+        names = [choice.dest for choice in subparsers._choices_actions]
+        assert names.count('otel') == 1
+        assert names.count('validate') == 1
+
+    def test_otel_has_no_shared_json_option_but_validate_does(self, cli_parser):
+        # `otel` emits no JSON result, so it must not advertise --json;
+        # `validate` keeps the shared --json [FILE] envelope.
+        with pytest.raises(SystemExit):
+            cli_parser.parse_args(['otel', '--json'])
+        assert cli_parser.parse_args(['validate', 'a.pipe', '--json']).json == '-'
 
     def test_defaults(self, cli_parser):
         args = cli_parser.parse_args(['otel'])
@@ -194,7 +209,7 @@ class TestMissingExtraGuard:
         monkeypatch.setattr(otel_module, '_otel_available', lambda: False)
         client = FakeClient()
 
-        exit_code = await OtelCommand(FakeCli(), make_args()).execute(client)
+        exit_code = await run_otel(make_args(), client)
 
         assert exit_code == 2
         err = capsys.readouterr().err
@@ -243,7 +258,7 @@ class TestOtelExecute:
             no_metrics=True,
         )
 
-        exit_code = await OtelCommand(FakeCli(), args).execute(client)
+        exit_code = await run_otel(args, client)
 
         assert exit_code == 0
         assert recorded['client'] is client
@@ -264,7 +279,7 @@ class TestOtelExecute:
 
         monkeypatch.setattr(otel_module, 'run_bridge', fake_run_bridge)
 
-        await OtelCommand(FakeCli(), make_args(trace_level='summary')).execute(FakeClient())
+        await run_otel(make_args(trace_level='summary'), FakeClient())
 
         out = capsys.readouterr().out
         assert 'informational only' in out
@@ -280,7 +295,7 @@ class TestOtelExecute:
 
         monkeypatch.setattr(otel_module, 'run_bridge', fake_run_bridge)
 
-        await OtelCommand(FakeCli(), make_args(trace_level='none')).execute(FakeClient())
+        await run_otel(make_args(trace_level='none'), FakeClient())
 
         out = capsys.readouterr().out
         assert 'informational only' in out
@@ -299,7 +314,7 @@ class TestOtelExecute:
 
         monkeypatch.setattr(otel_module, 'run_bridge', fake_run_bridge)
 
-        exit_code = await OtelCommand(FakeCli(), make_args(protocol='grpc')).execute(FakeClient())
+        exit_code = await run_otel(make_args(protocol='grpc'), FakeClient())
 
         assert exit_code == 2
         assert 'opentelemetry-exporter-otlp-proto-grpc' in capsys.readouterr().err
@@ -309,7 +324,7 @@ class TestOtelExecute:
     async def test_real_grpc_protocol_without_exporter_exits_2(self, capsys):
         # Nothing faked: the real run_bridge -> build_providers path must
         # surface the missing gRPC exporter as exit code 2 with the hint.
-        exit_code = await OtelCommand(FakeCli(), make_args(protocol='grpc')).execute(FakeClient())
+        exit_code = await run_otel(make_args(protocol='grpc'), FakeClient())
 
         assert exit_code == 2
         assert 'opentelemetry-exporter-otlp-proto-grpc' in capsys.readouterr().err
@@ -322,7 +337,7 @@ class TestOtelExecute:
 
         monkeypatch.setattr(otel_module, 'run_bridge', fake_run_bridge)
 
-        exit_code = await OtelCommand(FakeCli(), make_args()).execute(FakeClient())
+        exit_code = await run_otel(make_args(), FakeClient())
 
         assert exit_code == 1
         assert 'exporter blew up' in capsys.readouterr().err
@@ -335,58 +350,102 @@ class TestOtelExecute:
 
         monkeypatch.setattr(otel_module, 'run_bridge', fake_run_bridge)
 
-        assert await OtelCommand(FakeCli(), make_args()).execute(FakeClient()) == 2
+        assert await run_otel(make_args(), FakeClient()) == 2
 
 
 # =========================================================================
-# END-TO-END CLI ROUTING (parser -> validation -> command_map -> execute)
+# END-TO-END CLI ROUTING (parser -> _dispatch -> run_otel)
 # =========================================================================
 
 
 class TestCliRouting:
-    async def test_run_routes_otel_without_requiring_token(self, monkeypatch):
-        # 'otel' must not trip the token validation applied to status/stop/events
+    async def test_dispatch_routes_bare_otel_without_requiring_a_token(self, monkeypatch):
+        # 'otel' takes no token and no positional argument: bare `rocketride
+        # otel` must parse and route straight through to run_otel.
         monkeypatch.delenv('ROCKETRIDE_TOKEN', raising=False)
-        monkeypatch.setattr(sys, 'argv', ['rocketride', 'otel'])
+        recorded = {}
 
-        created = {}
-
-        class FakeRRClient:
-            def __init__(self, **kwargs):
-                created.update(kwargs)
-
-            async def disconnect(self):
-                pass
-
-        async def fake_execute(self, client):
+        async def fake_run_otel(args, client=None):
+            recorded['args'] = args
+            recorded['client'] = client
             return 7
 
-        monkeypatch.setattr(cli_main, 'RocketRideClient', FakeRRClient)
-        monkeypatch.setattr(cli_main.OtelCommand, 'execute', fake_execute)
+        # _dispatch imports run_otel from the module on each call, so the
+        # patch has to land on the module attribute.
+        monkeypatch.setattr(otel_module, 'run_otel', fake_run_otel)
 
-        previous = signal.getsignal(signal.SIGINT)
-        try:
-            exit_code = await cli_main.RocketRideCLI().run()
-        finally:
-            signal.signal(signal.SIGINT, previous)
+        parser = cli_main.setup_parser()
+        args = parser.parse_args(['otel'])
+        assert not hasattr(args, 'token')
 
-        # The command executed (returning our sentinel), so no token error path
+        exit_code = await cli_main._dispatch(args)
+
+        # The command ran (returning our sentinel), with no client handed in:
+        # run_otel builds its own so the missing-extra guard can refuse first.
         assert exit_code == 7
-        assert created['uri']
+        assert recorded['args'].uri
+        assert recorded['client'] is None
 
-    async def test_events_still_requires_token_but_otel_does_not(self, monkeypatch, capsys):
-        # Guard against the otel command being ensnared by the events check
-        monkeypatch.delenv('ROCKETRIDE_TOKEN', raising=False)
-        monkeypatch.setattr(sys, 'argv', ['rocketride', 'events', 'ALL'])
+    async def test_cli_client_is_built_from_args_and_left_unconnected(self, monkeypatch):
+        # The CLI hands run_otel no client, so run_otel builds one from
+        # --uri/--apikey and passes it to the bridge WITHOUT connecting:
+        # connecting (and reconnecting) is the bridge's job.
+        monkeypatch.setattr(otel_module, '_otel_available', lambda: True)
+        created = {}
+        recorded = {}
 
-        previous = signal.getsignal(signal.SIGINT)
-        try:
-            exit_code = await cli_main.RocketRideCLI().run()
-        finally:
-            signal.signal(signal.SIGINT, previous)
+        class FakeRRClient:
+            def __init__(self, uri, auth=''):
+                created['uri'] = uri
+                created['auth'] = auth
+                self.connect_calls = 0
 
-        assert exit_code == 1
-        assert 'Token is required' in capsys.readouterr().out
+            def is_connected(self):
+                return False
+
+            async def connect(self):
+                self.connect_calls += 1
+
+            async def disconnect(self):
+                created['disconnected'] = True
+
+        async def fake_run_bridge(client, config):
+            recorded['client'] = client
+            return 0
+
+        monkeypatch.setattr('rocketride.RocketRideClient', FakeRRClient)
+        monkeypatch.setattr(otel_module, 'run_bridge', fake_run_bridge)
+
+        parser = cli_main.setup_parser()
+        args = parser.parse_args(['otel', '--uri', 'http://server:5565', '--apikey', 'KEY'])
+
+        assert await cli_main._dispatch(args) == 0
+        assert created['uri'] == 'http://server:5565'
+        assert created['auth'] == 'KEY'
+        assert recorded['client'].connect_calls == 0
+        # A client this command created is a client this command closes
+        assert created['disconnected'] is True
+
+    async def test_injected_client_is_not_disconnected_by_the_command(self, monkeypatch):
+        # A caller-supplied client (embedded use, tests) stays the caller's.
+        monkeypatch.setattr(otel_module, '_otel_available', lambda: True)
+
+        async def fake_run_bridge(client, config):
+            return 0
+
+        monkeypatch.setattr(otel_module, 'run_bridge', fake_run_bridge)
+
+        class TrackingClient(FakeClient):
+            def __init__(self):
+                super().__init__()
+                self.disconnect_calls = 0
+
+            async def disconnect(self):
+                self.disconnect_calls += 1
+
+        client = TrackingClient()
+        assert await run_otel(make_args(), client) == 0
+        assert client.disconnect_calls == 0
 
 
 # =========================================================================
@@ -405,7 +464,7 @@ class TestOtelTransportSecurity:
         monkeypatch.setattr(otel_module, 'run_bridge', fake_run_bridge)
         args = make_args(endpoint='https://svcuser:sup3rs3cret@collector.example:4318/v1/traces?sig=DEADBEEF')
 
-        assert await OtelCommand(FakeCli(), args).execute(FakeClient()) == 0
+        assert await run_otel(args, FakeClient()) == 0
 
         captured = capsys.readouterr()
         combined = captured.out + captured.err
@@ -424,7 +483,7 @@ class TestOtelTransportSecurity:
 
         monkeypatch.setattr(otel_module, 'run_bridge', fake_run_bridge)
 
-        assert await OtelCommand(FakeCli(), make_args()).execute(FakeClient()) == 0
+        assert await run_otel(make_args(), FakeClient()) == 0
 
         captured = capsys.readouterr()
         assert 'p4ssw0rd' not in captured.out + captured.err
@@ -442,7 +501,7 @@ class TestOtelTransportSecurity:
         monkeypatch.setattr(otel_module, 'run_bridge', fake_run_bridge)
         args = make_args(endpoint='http://collector.example:4318', headers='x-api-key=abc')
 
-        assert await OtelCommand(FakeCli(), args).execute(FakeClient()) == 2
+        assert await run_otel(args, FakeClient()) == 2
 
         assert called == [], 'the bridge must not connect before the transport is validated'
         err = capsys.readouterr().err
@@ -460,7 +519,7 @@ class TestOtelTransportSecurity:
         monkeypatch.setattr(otel_module, 'run_bridge', fake_run_bridge)
         args = make_args(endpoint='http://collector.example:4318', headers='x-api-key=abc', insecure=True)
 
-        assert await OtelCommand(FakeCli(), args).execute(FakeClient()) == 0
+        assert await run_otel(args, FakeClient()) == 0
 
         assert 'WARNING: --insecure' in capsys.readouterr().err
 
@@ -474,4 +533,4 @@ class TestOtelTransportSecurity:
         monkeypatch.setattr(otel_module, 'run_bridge', fake_run_bridge)
         args = make_args(endpoint='http://localhost:4318', headers='Authorization=Basic abc')
 
-        assert await OtelCommand(FakeCli(), args).execute(FakeClient()) == 0
+        assert await run_otel(args, FakeClient()) == 0

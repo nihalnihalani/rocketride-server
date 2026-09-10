@@ -424,4 +424,4 @@ Honest edges of a protocol-level bridge:
 - [Monitor protocol reference](/protocols/websocket/observability) — the event
   stream the bridge consumes
 - [Python client](/develop/python) — SDK and the rest of the CLI
-- [Client libraries overview](https://github.com/rocketride-org/rocketride-server/blob/develop/docs/README-clients.md)
+- [Client libraries overview](https://github.com/rocketride-org/rocketride-server/blob/develop/docs/develop/README-clients.md)
