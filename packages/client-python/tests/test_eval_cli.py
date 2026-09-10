@@ -23,19 +23,19 @@
 """
 Unit tests for the `rocketride eval` CLI command.
 
-These tests exercise the EvalCommand through the full CLI entry point
-(RocketRideCLI.run) with a fake client, so no live server or network is
-required. The assertion evaluator is patched to a deterministic substring
-check so the tests pin the CLI contract - glob expansion, spec validation,
-pipeline lifecycle, --case/--fail-fast/--json/--junit behavior, and the
-exit code contract: 0 = all cases passed, 1 = at least one case failed,
-2 = usage/spec/connection error or no case produced a result.
+These tests exercise run_eval through the CLI's parse + dispatch path with
+a fake client, so no live server or network is required. The assertion
+evaluator is patched to a deterministic substring check so the tests pin the
+CLI contract - glob expansion, spec validation, pipeline lifecycle,
+--case/--fail-fast/--json/--junit behavior, and the exit code contract:
+0 = all cases passed, 1 = at least one case failed, 2 = usage/spec/connection
+error or no case produced a result.
 """
 
+import argparse
 import importlib
 import json
 import os
-import sys
 from typing import Any
 
 import pytest
@@ -47,6 +47,10 @@ from rocketride.evals.assertions import AssertionResult
 # package re-exports the `main()` function under the same name, which would
 # shadow the module on attribute-style imports.
 cli_main = importlib.import_module('rocketride.cli.main')
+cli_common = importlib.import_module('rocketride.cli.utils.common')
+# eval binds connect_client into its own namespace at import time, so the
+# patch must land there, not on utils.common.
+cli_eval = importlib.import_module('rocketride.cli.commands.eval')
 
 SPEC_DOC = {
     'pipeline': 'chat.pipe',
@@ -131,11 +135,20 @@ def deterministic_evaluate(monkeypatch):
 
 
 async def run_cli(monkeypatch, fake_client: FakeClient, argv: list[str]) -> int:
-    """Run the CLI end-to-end with a fake client and return its exit code."""
-    monkeypatch.setattr(cli_main, 'RocketRideClient', lambda **kwargs: fake_client)
-    monkeypatch.setattr(sys, 'argv', ['rocketride', 'eval', *argv])
-    cli = cli_main.RocketRideCLI()
-    return await cli.run()
+    """Run the CLI's parse + dispatch path with a fake client, returning its exit code."""
+
+    async def fake_connect_client(uri, apikey='', on_event=None):
+        # Mirror the real connect_client contract: register for the
+        # disconnect_all cleanup, connect (raising any configured error),
+        # hand back the connected client.
+        cli_common._active_clients.append(fake_client)
+        await fake_client.connect()
+        return fake_client
+
+    monkeypatch.setattr(cli_eval, 'connect_client', fake_connect_client)
+    parser = cli_main.setup_parser()
+    args = parser.parse_args(['eval', *argv])
+    return await cli_main._dispatch(args)
 
 
 def write_spec(tmp_path, document, name='sample.eval.json'):
@@ -340,3 +353,31 @@ class TestEvalCli:
         exit_code = await run_cli(monkeypatch, fake, [spec_file, '--junit', str(tmp_path)])
 
         assert exit_code == 2
+
+
+class TestEvalRegistration:
+    def test_eval_is_registered_exactly_once_alongside_validate(self):
+        # The command table must carry both the upstream 'validate' verb and
+        # this PR's 'eval' verb, each registered exactly once.
+        parser = cli_main.setup_parser()
+        subparsers = next(a for a in parser._actions if isinstance(a, argparse._SubParsersAction))
+        names = [choice.dest for choice in subparsers._choices_actions]
+        assert names.count('eval') == 1
+        assert names.count('validate') == 1
+
+    def test_eval_owns_its_own_boolean_json_flag(self):
+        # `eval --json` is a format flag, not the shared --json [FILE]
+        # envelope: bare --json must parse to True, and --json=<file> must be
+        # rejected rather than silently reinterpreted.
+        parser = cli_main.setup_parser()
+        args = parser.parse_args(['eval', 'a.eval.json', '--json'])
+        assert args.json is True
+        assert args.uri is not None
+        with pytest.raises(SystemExit):
+            parser.parse_args(['eval', 'a.eval.json', '--json=out.json'])
+
+    def test_validate_keeps_the_shared_json_file_option(self):
+        # The upstream contract for `validate` must survive this merge.
+        parser = cli_main.setup_parser()
+        assert parser.parse_args(['validate', 'a.pipe', '--json']).json == '-'
+        assert parser.parse_args(['validate', 'a.pipe', '--json=out.json']).json == 'out.json'
