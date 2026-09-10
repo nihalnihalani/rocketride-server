@@ -69,10 +69,10 @@ class IInstance(IInstanceBase):
                 text = item['text']
             else:
                 text = ''
+            if hasattr(q, 'questions'):
+                with contextlib.suppress(ValueError, AttributeError):
+                    q.questions = []
             if text is not None and text != '':
-                if hasattr(q, 'questions'):
-                    with contextlib.suppress(ValueError, AttributeError):
-                        q.questions = []
                 q.addQuestion(str(text))
 
             # Attach metadata to the question without injecting expected

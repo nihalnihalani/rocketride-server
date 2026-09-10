@@ -36,7 +36,7 @@ import sys
 # Ensure the node-package evaluators are importable by adding the nodes/src/nodes
 # directory to sys.path. This mirrors the pattern used by
 # nodes/test/cobalt/test_eval_cobalt.py.
-_NODES_DIR = os.path.normpath(os.path.join(os.path.dirname(__file__), '..', '..', '..', 'nodes', 'src', 'nodes'))
+_NODES_DIR = os.path.normpath(os.path.join(os.path.dirname(__file__), '..', '..', '..', 'src', 'nodes'))
 if _NODES_DIR not in sys.path:
     sys.path.insert(0, _NODES_DIR)
 
