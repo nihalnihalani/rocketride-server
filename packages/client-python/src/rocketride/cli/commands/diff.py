@@ -21,20 +21,21 @@
 # SOFTWARE.
 
 """
-RocketRide CLI Semantic Pipeline Diff Command Implementation.
+``diff`` — semantic diff of two ``.pipe`` pipeline files.
 
-This module provides the DiffCommand class for the ``rocketride diff`` command,
-which produces a *semantic* diff of two ``.pipe`` pipeline files. Raw JSON diffs
-of ``.pipe`` files are dominated by canvas coordinate churn (the per-component
-``ui`` block and the top-level ``viewport``); this command hides that noise and
-surfaces what actually changed: nodes added/removed, provider changes, config
-field changes, and edge (wiring) additions/removals.
+Raw JSON diffs of ``.pipe`` files are dominated by canvas coordinate churn
+(the per-component ``ui`` block and the top-level ``viewport``); this command
+hides that noise and surfaces what actually changed: nodes added/removed,
+provider changes, config field changes, and edge (wiring) additions/removals.
 
-Unlike every other RocketRide subcommand, ``diff`` is a purely local operation.
-It reads files (or a git ref) and compares parsed JSON entirely on the client;
-it never connects to the engine or the network. Consequently it takes none of
-the ``--uri``/``--apikey``/``--token`` connection arguments the other commands
-share -- this is a deliberate and documented difference.
+Unlike every other RocketRide subcommand, ``diff`` is a purely local
+operation. It reads files (or a git ref) and compares parsed JSON entirely on
+the client; it never connects to the engine or the network. Consequently it
+takes none of the ``--uri``/``--apikey`` connection arguments the other
+commands share, and it does not route through the shared ``Output`` channel:
+its ``--json`` is a format flag (a whole JSON document on stdout), not the
+shared ``--json [FILE]`` result envelope. This is a deliberate and documented
+difference.
 
 Usage:
     rocketride diff <old.pipe> <new.pipe>
@@ -55,20 +56,15 @@ Exit codes:
     0  No semantic changes (or --exit-zero on any successful run).
     1  Semantic changes were found.
     2  Usage error, or an unreadable/unparseable file / bad git ref.
-
-Components:
-    DiffCommand: Main command implementation for semantic ``.pipe`` diffing
 """
 
 import json
 import os
 import sys
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
-
-from .base import BaseCommand
+from typing import Any, Dict, List, Optional
 
 # The pipediff engine is the semantic core of this command. These are the pinned
-# public names from the rocketride.pipediff package (Implementer A's modules).
+# public names from the rocketride.pipediff package.
 from ...pipediff import (
     PipeDiffError,
     diff_pipes,
@@ -76,9 +72,6 @@ from ...pipediff import (
     resolve_git_ref,
 )
 from ...pipediff.reporters import render_human, render_json, render_markdown
-
-if TYPE_CHECKING:
-    from ..main import RocketRideClient
 
 
 # An empty pipeline used as the "old" side when --git names a ref in which the
@@ -109,157 +102,129 @@ def _should_use_color(stream: Any = None) -> bool:
     return bool(isatty()) if callable(isatty) else False
 
 
-class DiffCommand(BaseCommand):
+def _fail(message: str) -> int:
     """
-    Command implementation for the local, semantic ``.pipe`` diff.
+    Report a usage/processing error on stderr and return exit code 2.
 
-    Load two pipeline files (or one working-tree file against a git ref), compute
-    a semantic diff that ignores canvas layout noise, and render the result as
-    colored text, JSON, or Markdown. This command performs no network I/O and
-    requires no authentication.
+    Errors are always written to stderr so that ``--json`` and ``--markdown``
+    output on stdout stays pure and machine-parseable.
 
-    Example:
-        ```python
-        command = DiffCommand(cli, args)
-        exit_code = await command.execute()
-        ```
+    Args:
+        message: Human-readable error description.
 
-    Key Features:
-        - Two-file and ``--git <ref>`` comparison modes
-        - Layout-noise suppression with an opt-in ``--include-layout`` override
-        - Human / JSON / Markdown reporters, selected by flag
-        - Standardized exit codes (0 unchanged, 1 changed, 2 error)
-        - Pure stdout for report output; all errors are written to stderr
+    Returns:
+        The integer exit code ``2``.
     """
+    print(f'Error: {message}', file=sys.stderr)
+    return 2
 
-    def __init__(self, cli, args):
-        """
-        Initialize DiffCommand with CLI context and parsed arguments.
 
-        Args:
-            cli: CLI instance (used only for shared plumbing; no connection is
-                established by this command).
-            args: Parsed command line arguments (paths, --git, --include-layout,
-                --json, --markdown, --exit-zero).
-        """
-        super().__init__(cli, args)
+def _resolve_inputs(args) -> tuple:
+    """
+    Validate arguments and load the (old, new) pipeline objects.
 
-    def _fail(self, message: str) -> int:
-        """
-        Report a usage/processing error on stderr and return exit code 2.
+    Args:
+        args: Parsed argparse namespace (paths, git).
 
-        Errors are always written to stderr so that ``--json`` and ``--markdown``
-        output on stdout stays pure and machine-parseable.
+    Returns:
+        An ``(old, new)`` tuple of parsed pipeline dicts.
 
-        Args:
-            message: Human-readable error description.
+    Raises:
+        PipeDiffError: Propagated from load_pipe / resolve_git_ref for
+            unreadable, unparseable, or structurally invalid inputs, or for a
+            bad git ref. The caller converts these into exit code 2.
+        ValueError: For argument-usage problems (wrong number of paths for the
+            selected mode). The caller converts these into exit code 2.
+    """
+    paths: List[str] = list(getattr(args, 'paths', None) or [])
+    git_ref: Optional[str] = getattr(args, 'git', None)
 
-        Returns:
-            The integer exit code ``2``.
-        """
-        print(f'Error: {message}', file=sys.stderr)
-        return 2
-
-    def _resolve_inputs(self) -> Optional[tuple]:
-        """
-        Validate arguments and load the (old, new) pipeline objects.
-
-        Returns:
-            A ``(old, new)`` tuple of parsed pipeline dicts on success, or
-            ``None`` when validation or loading failed (an error has already been
-            printed to stderr by the caller path via raised exceptions).
-
-        Raises:
-            PipeDiffError: Propagated from load_pipe / resolve_git_ref for
-                unreadable, unparseable, or structurally invalid inputs, or for a
-                bad git ref. The caller converts these into exit code 2.
-            ValueError: For argument-usage problems (wrong number of paths for the
-                selected mode). The caller converts these into exit code 2.
-        """
-        paths: List[str] = list(getattr(self.args, 'paths', None) or [])
-        git_ref: Optional[str] = getattr(self.args, 'git', None)
-
-        if git_ref:
-            if len(paths) != 1:
-                raise ValueError('--git requires exactly one FILE to compare against the ref')
-            file_path = paths[0]
-            new_obj = load_pipe(file_path)
-            old_obj = resolve_git_ref(git_ref, file_path)
-            if old_obj is None:
-                # File absent in the ref: treat everything as newly added.
-                old_obj = _EMPTY_PIPE
-            return old_obj, new_obj
-
-        if len(paths) != 2:
-            raise ValueError('exactly two files are required: rocketride diff <old.pipe> <new.pipe>')
-
-        old_obj = load_pipe(paths[0])
-        new_obj = load_pipe(paths[1])
+    if git_ref:
+        if len(paths) != 1:
+            raise ValueError('--git requires exactly one FILE to compare against the ref')
+        file_path = paths[0]
+        new_obj = load_pipe(file_path)
+        old_obj = resolve_git_ref(git_ref, file_path)
+        if old_obj is None:
+            # File absent in the ref: treat everything as newly added.
+            old_obj = _EMPTY_PIPE
         return old_obj, new_obj
 
-    def _render(self, diff: Any) -> str:
-        """
-        Render the diff using the reporter selected by the command flags.
+    if len(paths) != 2:
+        raise ValueError('exactly two files are required: rocketride diff <old.pipe> <new.pipe>')
 
-        ``--json`` takes precedence over ``--markdown`` when both are somehow set;
-        argparse normally makes them mutually exclusive. With no format flag the
-        colored human report is produced (color auto-detected from stdout).
+    old_obj = load_pipe(paths[0])
+    new_obj = load_pipe(paths[1])
+    return old_obj, new_obj
 
-        Args:
-            diff: The PipeDiff produced by the engine.
 
-        Returns:
-            The fully rendered report string for printing to stdout.
-        """
-        if getattr(self.args, 'json', False):
-            return json.dumps(render_json(diff), indent=2, ensure_ascii=False, sort_keys=True)
-        if getattr(self.args, 'markdown', False):
-            return render_markdown(diff)
-        return render_human(diff, use_color=_should_use_color(sys.stdout))
+def _render(args, diff: Any) -> str:
+    """
+    Render the diff using the reporter selected by the command flags.
 
-    async def execute(self, client: 'RocketRideClient' = None) -> int:
-        """
-        Execute the semantic pipe diff and return the appropriate exit code.
+    ``--json`` takes precedence over ``--markdown`` when both are somehow set;
+    argparse normally makes them mutually exclusive. With no format flag the
+    colored human report is produced (color auto-detected from stdout).
 
-        This command is fully local: the ``client`` argument is accepted only to
-        match the common command interface and is never used.
+    Args:
+        args: Parsed argparse namespace (json, markdown).
+        diff: The PipeDiff produced by the engine.
 
-        Args:
-            client: Unused. Present for signature compatibility with other
-                commands dispatched by the CLI.
+    Returns:
+        The fully rendered report string for printing to stdout.
+    """
+    if getattr(args, 'json', False):
+        return json.dumps(render_json(diff), indent=2, ensure_ascii=False, sort_keys=True)
+    if getattr(args, 'markdown', False):
+        return render_markdown(diff)
+    return render_human(diff, use_color=_should_use_color(sys.stdout))
 
-        Returns:
-            Exit code per the command contract:
-                - 0 when there are no semantic changes, or when ``--exit-zero``
-                  was passed and the run otherwise succeeded.
-                - 1 when semantic changes were found.
-                - 2 on a usage error or an unreadable/unparseable input.
 
-        Process Flow:
-            1. Validate arguments and load the old/new pipeline objects.
-            2. Compute the semantic diff (respecting --include-layout).
-            3. Render with the selected reporter and print to stdout.
-            4. Map the diff outcome to an exit code (honoring --exit-zero).
-        """
-        include_layout = bool(getattr(self.args, 'include_layout', False))
+async def run_diff(args) -> int:
+    """
+    Execute the semantic pipe diff and return the appropriate exit code.
 
-        try:
-            resolved = self._resolve_inputs()
-        except ValueError as exc:
-            return self._fail(str(exc))
-        except PipeDiffError as exc:
-            return self._fail(str(exc))
+    This command is fully local: it opens no client, so it deliberately does
+    NOT run through the shared ``run_cli_command`` runner — that runner maps
+    any raised error to exit code 1, while this command's documented contract
+    reserves 1 for "changes found" and reports every error as 2.
 
-        old_obj, new_obj = resolved
+    Args:
+        args: Parsed argparse namespace (paths, git, include_layout, json,
+            markdown, exit_zero).
 
-        try:
-            diff = diff_pipes(old_obj, new_obj, include_layout=include_layout)
-        except PipeDiffError as exc:
-            return self._fail(str(exc))
+    Returns:
+        Exit code per the command contract:
+            - 0 when there are no semantic changes, or when ``--exit-zero``
+              was passed and the run otherwise succeeded.
+            - 1 when semantic changes were found.
+            - 2 on a usage error or an unreadable/unparseable input.
 
-        # Report output goes to stdout only; nothing above this point wrote there.
-        print(self._render(diff))
+    Process Flow:
+        1. Validate arguments and load the old/new pipeline objects.
+        2. Compute the semantic diff (respecting --include-layout).
+        3. Render with the selected reporter and print to stdout.
+        4. Map the diff outcome to an exit code (honoring --exit-zero).
+    """
+    include_layout = bool(getattr(args, 'include_layout', False))
 
-        if getattr(self.args, 'exit_zero', False):
-            return 0
-        return 1 if diff.has_semantic_changes else 0
+    try:
+        resolved = _resolve_inputs(args)
+    except ValueError as exc:
+        return _fail(str(exc))
+    except PipeDiffError as exc:
+        return _fail(str(exc))
+
+    old_obj, new_obj = resolved
+
+    try:
+        diff = diff_pipes(old_obj, new_obj, include_layout=include_layout)
+    except PipeDiffError as exc:
+        return _fail(str(exc))
+
+    # Report output goes to stdout only; nothing above this point wrote there.
+    print(_render(args, diff))
+
+    if getattr(args, 'exit_zero', False):
+        return 0
+    return 1 if diff.has_semantic_changes else 0

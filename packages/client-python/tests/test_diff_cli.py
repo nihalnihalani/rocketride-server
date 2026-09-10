@@ -23,12 +23,14 @@
 """
 Tests for the ``rocketride diff`` CLI subcommand (rocketride.cli.commands.diff).
 
-These exercise ``DiffCommand.execute`` end-to-end against real ``.pipe`` files on
-disk, driving it through the same pinned engine and reporters the CLI uses in
+These exercise ``run_diff`` end-to-end against real ``.pipe`` files on disk,
+driving it through the same pinned engine and reporters the CLI uses in
 production. The command is fully local (no server, no auth), so no client fixture
 or network mock is needed; the only external dependency stubbed here is
 ``resolve_git_ref`` for ``--git`` mode, patched in the command's own module
-namespace the same way the engine test suite stubs subprocess.
+namespace the same way the engine test suite stubs subprocess. (``--git``
+against a real temporary repository is covered by
+``test_pipediff_gitref.py::test_resolve_git_ref_real_repository``.)
 
 Coverage mirrors the product contract:
     - two-file happy path (semantic changes -> exit 1)
@@ -40,32 +42,30 @@ Coverage mirrors the product contract:
     - ``--markdown`` output
     - ``--include-layout`` toggling ui.* field lines and the exit code
     - ``--exit-zero`` forcing 0 on changes but never masking an error
-    - argparse registration: 'diff' exists, takes no connection args, and makes
-      ``--json``/``--markdown`` mutually exclusive
+    - argparse registration + dispatch: 'diff' exists, routes to ``run_diff``,
+      takes no connection args, and makes ``--json``/``--markdown`` mutually
+      exclusive
 """
 
+import argparse
+import importlib
 import json
 from types import SimpleNamespace
 
 import pytest
 
 from rocketride.cli.commands import diff as diff_module
-from rocketride.cli.commands.diff import DiffCommand
-from rocketride.cli.main import RocketRideCLI
+from rocketride.cli.commands.diff import run_diff
+
+# `rocketride.cli.main` must be imported as a module: the `rocketride.cli`
+# package re-exports the `main()` function under the same name, which would
+# shadow the module on attribute-style imports.
+cli_main = importlib.import_module('rocketride.cli.main')
 
 
 # =========================================================================
 # Helpers / fixtures
 # =========================================================================
-
-
-class _StubCLI:
-    """Minimal stand-in for the CLI context.
-
-    ``DiffCommand`` stores the CLI on construction but never touches it during
-    ``execute`` (the command is fully local), so an attribute-free stub is enough
-    to satisfy ``BaseCommand.__init__``.
-    """
 
 
 def _diff_args(
@@ -149,9 +149,8 @@ def _viewport_only_new_pipe():
 
 
 async def _run(args):
-    """Instantiate and execute a DiffCommand, returning its integer exit code."""
-    command = DiffCommand(_StubCLI(), args)
-    return await command.execute()
+    """Execute the diff command body, returning its integer exit code."""
+    return await run_diff(args)
 
 
 # =========================================================================
@@ -456,7 +455,7 @@ async def test_exit_zero_does_not_mask_errors(tmp_path, capsys):
 
 
 def test_parser_registers_diff_subcommand():
-    parser = RocketRideCLI().setup_parser()
+    parser = cli_main.setup_parser()
     ns = parser.parse_args(['diff', 'old.pipe', 'new.pipe'])
     assert ns.command == 'diff'
     assert ns.paths == ['old.pipe', 'new.pipe']
@@ -468,7 +467,7 @@ def test_parser_registers_diff_subcommand():
 
 
 def test_parser_diff_takes_no_connection_args():
-    parser = RocketRideCLI().setup_parser()
+    parser = cli_main.setup_parser()
     ns = parser.parse_args(['diff', 'old.pipe', 'new.pipe'])
     # This command never touches the engine, so the shared connection args that
     # every other subcommand carries must be absent from its namespace.
@@ -478,9 +477,34 @@ def test_parser_diff_takes_no_connection_args():
 
 
 def test_parser_json_and_markdown_are_mutually_exclusive():
-    parser = RocketRideCLI().setup_parser()
+    parser = cli_main.setup_parser()
     with pytest.raises(SystemExit):
         parser.parse_args(['diff', '--json', '--markdown', 'old.pipe', 'new.pipe'])
+
+
+def test_diff_is_registered_exactly_once_alongside_validate():
+    # The command table must carry both the upstream 'validate' verb and this
+    # PR's 'diff' verb, each registered exactly once.
+    parser = cli_main.setup_parser()
+    subparsers = next(a for a in parser._actions if isinstance(a, argparse._SubParsersAction))
+    names = [choice.dest for choice in subparsers._choices_actions]
+    assert names.count('diff') == 1
+    assert names.count('validate') == 1
+
+
+@pytest.mark.asyncio
+async def test_dispatch_routes_diff_to_run_diff(tmp_path, capsys):
+    # End-to-end through the real parser and dispatcher, not just the body.
+    old = _write_pipe(tmp_path, 'old.pipe', _old_pipe())
+    new = _write_pipe(tmp_path, 'new.pipe', _new_pipe())
+
+    parser = cli_main.setup_parser()
+    ns = parser.parse_args(['diff', old, new])
+    code = await cli_main._dispatch(ns)
+
+    out = capsys.readouterr().out
+    assert code == 1
+    assert '+ c (qdrant)' in out
 
 
 if __name__ == '__main__':
