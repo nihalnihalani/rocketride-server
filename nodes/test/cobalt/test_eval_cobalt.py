@@ -676,6 +676,43 @@ class TestIInstanceWriteAnswers:
         assert 'cobalt_evaluator' in json_data
         assert 'cobalt_reasoning' in json_data
 
+    def test_score_answer_carries_incoming_metadata(self):
+        """The synthetic score answer must be joinable to its dataset item by key.
+
+        Regression for the review finding that the score answer carried only
+        the four cobalt_* keys, so a consumer could correlate it with its
+        source item only by answer order, which is not stable across fan-out
+        or parallel workers.
+        """
+        inst = self._make_iinstance()
+
+        answer = MockAnswer()
+        answer.metadata = {'dataset_id': 'item-7', 'expected': 'the reference', 'nested': {'k': [1, 2]}}
+        answer.setAnswer('the reference')
+
+        inst.writeAnswers(answer)
+
+        calls = inst.instance.writeAnswers.call_args_list
+        assert len(calls) == 2
+        score_answer = calls[1][0][0]
+        assert score_answer.getJson()['cobalt_score'] > 0
+        assert score_answer.metadata == answer.metadata
+        # A copy, not a shared reference: mutating one must not affect the other.
+        assert score_answer.metadata is not answer.metadata
+        assert score_answer.metadata['nested'] is not answer.metadata['nested']
+
+    def test_score_answer_without_metadata_has_none(self):
+        """No incoming metadata -> the score answer does not fabricate any."""
+        inst = self._make_iinstance()
+        answer = MockAnswer()
+        answer.metadata = None
+        answer.setAnswer('text')
+        inst.writeAnswers(answer)
+        score_answer = inst.instance.writeAnswers.call_args_list[1][0][0]
+        # The real schema Answer defaults metadata to {} (default_factory=dict); the
+        # mock leaves it None. Either way nothing may be fabricated onto the score answer.
+        assert not getattr(score_answer, 'metadata', None)
+
     def test_writeAnswers_passes_through_when_no_evaluator(self):
         from eval_cobalt.IInstance import IInstance
 

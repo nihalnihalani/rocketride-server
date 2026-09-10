@@ -793,6 +793,29 @@ class TestIInstanceEmitsQuestions:
         assert len(emitted) == 1
         assert emitted[0].questions == ['0']
 
+    @pytest.mark.parametrize('text', ['', None])
+    def test_empty_text_clears_template_prompt(self, text):
+        """An item with no text must not inherit the template's prompt.
+
+        Regression for the review finding that `''` left `q.questions`
+        untouched, so the emitted question carried the incoming template
+        prompt instead of the dataset's (empty) prompt.
+        """
+        questions = [
+            {'text': text, 'metadata': {'expected': 'ref', 'dataset_id': '1', 'cobalt_source': True}},
+        ]
+        inst = self._make_instance(questions)
+        emitted = []
+        inst.instance.writeQuestions.side_effect = lambda q: emitted.append(q)
+
+        template = sys.modules['ai.common.schema'].Question()
+        template.addQuestion('template prompt')
+        inst.writeQuestions(template)
+
+        assert len(emitted) == 1
+        assert emitted[0].questions == []
+        assert emitted[0].metadata['expected'] == 'ref'
+
 
 class TestDeepCopyPreventsMutation:
     """Test deep copy prevents mutation between emitted items."""

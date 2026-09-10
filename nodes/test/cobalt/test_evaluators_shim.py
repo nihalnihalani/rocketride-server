@@ -21,25 +21,39 @@
 # SOFTWARE.
 # =============================================================================
 
-"""Shim package that re-exports the canonical evaluators from the eval_cobalt node.
+"""The experiments' `evaluators` shim must point at the real eval_cobalt package.
 
-The evaluator logic now lives in `nodes/src/nodes/eval_cobalt/evaluators/`
-as a first-class component of the Cobalt evaluator node. This shim keeps
-the experiment test files in `test/cobalt/experiments/` working without
-rewriting their imports: they can continue to do
-`from evaluators.relevance import evaluate_relevance`.
+Regression for the review finding that `_NODES_DIR` resolved to
+`nodes/nodes/src/nodes` (one `nodes` segment too many), which does not exist.
 """
 
 import os
 import sys
 
-# Ensure the node-package evaluators are importable by adding the nodes/src/nodes
-# directory to sys.path. This mirrors the pattern used by
-# nodes/test/cobalt/test_eval_cobalt.py.
-_NODES_DIR = os.path.normpath(os.path.join(os.path.dirname(__file__), '..', '..', '..', 'src', 'nodes'))
-if _NODES_DIR not in sys.path:
-    sys.path.insert(0, _NODES_DIR)
+import pytest
 
-from eval_cobalt.evaluators import STOP_WORDS  # noqa: E402, F401 — re-export for experiments
+_COBALT_TEST_DIR = os.path.dirname(os.path.abspath(__file__))
 
-__all__ = ['STOP_WORDS']
+
+@pytest.fixture
+def shim():
+    """Import the shim fresh so its sys.path side effect is observed here."""
+    if _COBALT_TEST_DIR not in sys.path:
+        sys.path.append(_COBALT_TEST_DIR)
+    sys.modules.pop('evaluators', None)
+    import evaluators  # noqa: PLC0415 -- the import is the behaviour under test
+
+    return evaluators
+
+
+def test_shim_nodes_dir_exists_and_is_the_node_package_root(shim):
+    assert os.path.isdir(shim._NODES_DIR), shim._NODES_DIR
+    assert shim._NODES_DIR.endswith(os.path.join('nodes', 'src', 'nodes'))
+    assert os.path.isdir(os.path.join(shim._NODES_DIR, 'eval_cobalt', 'evaluators'))
+
+
+def test_shim_re_exports_the_node_evaluators(shim):
+    from evaluators.relevance import evaluate_relevance  # same import the experiments use
+
+    assert callable(evaluate_relevance)
+    assert shim.STOP_WORDS

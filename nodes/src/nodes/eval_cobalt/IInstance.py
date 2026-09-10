@@ -139,8 +139,13 @@ class IInstance(IInstanceBase):
         # account for it.
         self.instance.writeAnswers(answer)
 
-        # Emit evaluation result as a separate JSON answer
+        # Emit evaluation result as a separate JSON answer. It carries a copy
+        # of the incoming metadata so a consumer can join the score to its
+        # dataset item by key rather than by answer order, which is not stable
+        # across fan-out or parallel workers.
         eval_answer = Answer(expectJson=True)
+        if isinstance(metadata, dict):
+            eval_answer.metadata = copy.deepcopy(metadata)
         eval_answer.setAnswer(
             {
                 'cobalt_score': result['score'],

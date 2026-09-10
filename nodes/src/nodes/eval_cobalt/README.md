@@ -37,7 +37,7 @@ Key behavior to know:
 
 ### Output
 
-The score answer is a JSON `Answer` with these keys:
+The score answer carries a deep copy of the incoming answer's `metadata` (for example the dataset item's `dataset_id` and `expected`), so a downstream consumer can join each score to its source item by key rather than by answer order, which is not stable across fan-out or parallel workers. Its JSON payload has these keys:
 
 | Key | Type | Description |
 |---|---|---|
