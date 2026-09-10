@@ -33,16 +33,16 @@ encoding is requested and caches it on disk; set ``TIKTOKEN_CACHE_DIR`` to a
 pre-seeded directory to run fully offline.
 """
 
-import json
 import re
-from pathlib import Path
 from typing import Any, ClassVar, Dict, List, Optional
 
 from rocketlib import warning
 
-#: Limit used when neither the live model catalog nor :attr:`MODEL_LIMITS`
-#: knows the configured model id.
-DEFAULT_MODEL_LIMIT = 128000
+#: Absolute floor for the unknown-model budget. Only reached if *both* the live
+#: catalog and :attr:`MODEL_LIMITS` are empty; in practice the fallback is the
+#: smallest window either of them publishes (see
+#: :meth:`ContextOptimizer.conservative_model_limit`).
+CONSERVATIVE_MODEL_LIMIT_FLOOR = 8192
 
 #: Model id assumed when ``model_name`` is absent or is not a non-empty string.
 #: Matches the ``model_name`` default declared in ``services.json``.
@@ -61,12 +61,20 @@ class ContextOptimizer:
     :meth:`resolve_model_limit`):
 
     1. the live model catalog -- the ``modelTotalTokens`` values carried by the
-       ``preconfig.profiles`` of every sibling ``llm_*`` node's
-       ``services*.json``, which the ``sync-models`` workflow keeps in step
-       with the providers;
+       ``preconfig.profiles`` of every LLM node's service definition, read
+       through the engine's own registry (``rocketlib.getServiceDefinitions``
+       / ``getServiceDefinition``) so it works wherever the engine loaded the
+       nodes from: the source tree, an installed node store, or a
+       ``--node_path`` materialisation. The ``sync-models`` workflow keeps
+       those values in step with the providers;
     2. :attr:`MODEL_LIMITS`, a small hand-maintained fallback table (also used
        for the abbreviated aliases such as ``claude-sonnet``);
-    3. :data:`DEFAULT_MODEL_LIMIT`, with a warning.
+    3. the *conservative* fallback -- the smallest window any registered
+       chat-LLM profile or :attr:`MODEL_LIMITS` publishes
+       (:meth:`conservative_model_limit`), with a warning. Erring low costs
+       some unused context; erring high makes the provider reject the
+       request, so an unknown id is never budgeted above any known chat
+       model's window.
 
     Setting ``max_context_tokens`` explicitly bypasses all three.
     """
@@ -130,14 +138,6 @@ class ContextOptimizer:
         'gemini-flash': 1048576,
         'gemini-pro': 1048576,
     }
-
-    # Live model catalog: the directory that holds the sibling node packages
-    # (`nodes/src/nodes` in the source tree, `dist/server/nodes` once
-    # `nodes:sync` has copied them).  Each `llm_*/services*.json` carries
-    # `preconfig.profiles.<key>.model` / `.modelTotalTokens`.
-    _CATALOG_ROOT: ClassVar[Path] = Path(__file__).resolve().parent.parent
-    _CATALOG_GLOB: ClassVar[str] = 'llm_*/services*.json'
-    _catalog_cache: ClassVar[Optional[Dict[str, int]]] = None
 
     # tiktoken encoding overrides for model families tiktoken may not map yet.
     # The gpt-5 / gpt-4o families use ``o200k_base``; matched by prefix so the
@@ -213,8 +213,16 @@ class ContextOptimizer:
         # fallback warning is emitted once rather than on every optimize() call.
         self._warned_unknown_models: set = set()
 
+        # Snapshot the live catalog for this optimizer's lifetime (one per
+        # pipeline start, via IGlobal.beginGlobal). Reading it here rather than
+        # caching it on the class means a reloaded engine registry is picked up
+        # by the next pipeline without a process restart.
+        definitions = self._engine_model_definitions()
+        self._catalog: Dict[str, int] = self._load_model_catalog(definitions)
+        self._llm_class_floor: Optional[int] = self._llm_class_min_window(definitions)
+
         # Resolve the effective token limit.  ``resolve_model_limit`` consults
-        # the live llm_* catalog first, then MODEL_LIMITS, and warns once when
+        # the live catalog first, then MODEL_LIMITS, and warns once when
         # neither knows the id (e.g. a typo, or a model this build predates).
         self._total_limit = self.max_context_tokens or self.resolve_model_limit(self.model_name)
 
@@ -222,59 +230,74 @@ class ContextOptimizer:
     # Model context-window catalog
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _strip_jsonc(text: str) -> str:
-        """Strip ``//`` and ``/* */`` comments and trailing commas from JSONC.
-
-        The engine's ``services*.json`` files are JSONC. This node must not
-        depend on ``json5`` just to read them, so a small string-aware stripper
-        is used instead -- it skips comment markers that appear inside string
-        literals.
-        """
-        out: List[str] = []
-        i = 0
-        n = len(text)
-        in_string = False
-        escaped = False
-        while i < n:
-            char = text[i]
-            if in_string:
-                out.append(char)
-                if escaped:
-                    escaped = False
-                elif char == '\\':
-                    escaped = True
-                elif char == '"':
-                    in_string = False
-                i += 1
-                continue
-            if char == '"':
-                in_string = True
-                out.append(char)
-                i += 1
-                continue
-            if char == '/' and i + 1 < n and text[i + 1] == '/':
-                while i < n and text[i] != '\n':
-                    i += 1
-                continue
-            if char == '/' and i + 1 < n and text[i + 1] == '*':
-                i += 2
-                while i + 1 < n and not (text[i] == '*' and text[i + 1] == '/'):
-                    i += 1
-                i += 2
-                continue
-            out.append(char)
-            i += 1
-        return re.sub(r',(\s*[}\]])', r'\1', ''.join(out))
-
     @classmethod
-    def _load_model_catalog(cls) -> Dict[str, int]:
-        """Read every sibling ``llm_*`` node's model context-window catalog.
+    def _engine_model_definitions(cls) -> Dict[str, Dict[str, Any]]:
+        """Fetch every registered node's raw service definition from the engine.
 
-        Returns a mapping of model id -> ``modelTotalTokens``. Ids are keyed
-        exactly as the profiles declare them; where two services files publish
-        the same id with different windows the smaller is kept, which is the
-        safe budget.
+        ``rocketlib.getServiceDefinitions()`` returns an *envelope*,
+        ``{"services": {<logicalType>: <config schema>, ...}, "version": N}``
+        (engLib ``store/services/services.cpp``, ``getServiceSchemas``); the
+        ``services`` member is the index of every registered, non-INTERNAL
+        service, keyed by logical type. It carries only each node's config
+        schema, so the model windows are read with the second call:
+        ``rocketlib.getServiceDefinition(logicalType)`` returns that node's raw
+        ``services*.json`` -- where ``preconfig.profiles[*].modelTotalTokens``
+        lives. (``--serviceCategory`` rewrites the index *values* and so does
+        not affect this node, which reads only the keys; ``--serviceName``,
+        however, narrows the index to a single entry for every caller
+        including this one -- the catalog is then near-empty and known ids
+        fall back to :meth:`conservative_model_limit`, quietly but never
+        above a real window.)
+        Using the registry instead of globbing next to ``__file__`` means the
+        catalog is found wherever the engine loaded the nodes from.
+
+        Every registered type is fetched: which nodes publish model windows
+        is a property of their definition (the chat ``llm_*`` nodes, the
+        ``image_vision_*`` nodes, embedding and search nodes all do), not of
+        a naming convention, and :meth:`_load_model_catalog` keeps only the
+        definitions that actually carry usable profiles. This runs once per
+        pipeline start (``IGlobal.beginGlobal``) against the engine's
+        in-memory registry (~8 ms measured); the server-side
+        ``services_catalog`` caches the same call per process, this node
+        deliberately does not so a reloaded registry is seen at once.
+
+        Any failure (no engine binding, an engine without the registry, an
+        unexpected envelope, a per-type fetch raising) degrades to fewer or no
+        definitions; the caller then falls through to :attr:`MODEL_LIMITS`.
+        """
+        try:
+            import rocketlib  # the engine binding; resolved at call time so tests can substitute it
+        except ImportError:
+            return {}
+        try:
+            raw = rocketlib.getServiceDefinitions()
+        except Exception:  # noqa: BLE001 -- any registry failure means "no catalog", never a crash
+            return {}
+        if not isinstance(raw, dict):
+            return {}
+        # Unwrap the envelope; a bare index (no ``services`` member) is tolerated.
+        index = raw.get('services') if 'services' in raw else raw
+        if not isinstance(index, dict):
+            return {}
+        definitions: Dict[str, Dict[str, Any]] = {}
+        for logical_type in index:
+            if not isinstance(logical_type, str) or not logical_type:
+                continue
+            try:
+                definition = rocketlib.getServiceDefinition(logical_type)
+            except Exception:  # noqa: BLE001 -- one broken node must not hide the others
+                continue
+            if isinstance(definition, dict):
+                definitions[logical_type] = definition
+        return definitions
+
+    @staticmethod
+    def _load_model_catalog(definitions: Dict[str, Dict[str, Any]]) -> Dict[str, int]:
+        """Build the model id -> ``modelTotalTokens`` mapping from raw definitions.
+
+        Ids are keyed exactly as the profiles declare them; where two
+        definitions publish the same id with different windows the smaller is
+        kept, which is the safe budget.
 
         A provider-scoped id (``models/gemini-3.1-pro-preview``,
         ``openai/gpt-5``) is additionally registered under its bare name, but
@@ -284,25 +307,17 @@ class ContextOptimizer:
         entirely so it falls through to :attr:`MODEL_LIMITS` instead of
         silently picking one.
 
-        Any failure (missing directory, unreadable or malformed file) yields an
-        empty mapping -- :attr:`MODEL_LIMITS` then acts as the fallback.
+        Malformed definitions (no ``preconfig``, non-dict profiles, missing or
+        non-positive windows) are skipped, never raised on.
         """
         published: Dict[str, int] = {}  # ids exactly as the profiles declare them
         alias_values: Dict[str, set] = {}  # bare name -> every window seen for it
-        try:
-            paths = sorted(cls._CATALOG_ROOT.glob(cls._CATALOG_GLOB))
-        except OSError:
-            return {}
 
         def _record(table: Dict[str, int], key: str, limit: int) -> None:
             table[key] = min(table[key], limit) if key in table else limit
 
-        for path in paths:
-            try:
-                service = json.loads(cls._strip_jsonc(path.read_text(encoding='utf-8')))
-            except (OSError, ValueError):
-                continue
-            preconfig = service.get('preconfig') if isinstance(service, dict) else None
+        for definition in (definitions or {}).values():
+            preconfig = definition.get('preconfig') if isinstance(definition, dict) else None
             profiles = preconfig.get('profiles') if isinstance(preconfig, dict) else None
             if not isinstance(profiles, dict):
                 continue
@@ -326,41 +341,86 @@ class ContextOptimizer:
         catalog.update(published)
         return catalog
 
+    @staticmethod
+    def _is_llm_class(logical_type: str, definition: Any) -> bool:
+        """True for the chat-LLM nodes: ``llm_*`` types or ``classType`` ``llm``."""
+        if isinstance(logical_type, str) and logical_type.startswith('llm_'):
+            return True
+        class_types = definition.get('classType') if isinstance(definition, dict) else None
+        return isinstance(class_types, list) and 'llm' in class_types
+
+    @classmethod
+    def _llm_class_min_window(cls, definitions: Dict[str, Dict[str, Any]]) -> Optional[int]:
+        """Smallest window any registered chat-LLM profile publishes, or None.
+
+        Only ``llm_*`` / ``classType: ["llm"]`` definitions count: embedding
+        input limits and vision models are catalogued for lookup but say
+        nothing about the window an unknown *chat* model might have.
+        """
+        windows = [
+            limit
+            for logical_type, definition in (definitions or {}).items()
+            if cls._is_llm_class(logical_type, definition)
+            for limit in cls._load_model_catalog({logical_type: definition}).values()
+        ]
+        return min(windows) if windows else None
+
     @classmethod
     def model_catalog(cls) -> Dict[str, int]:
-        """Return the cached live model context-window catalog (may be empty)."""
-        if cls._catalog_cache is None:
-            cls._catalog_cache = cls._load_model_catalog()
-        return cls._catalog_cache
+        """Return the live model context-window catalog (may be empty).
+
+        Read fresh from the engine registry on every call -- there is no
+        class-level cache, so a refreshed registry is never shadowed by a
+        stale snapshot. Instances take their own snapshot in ``__init__``.
+        """
+        return cls._load_model_catalog(cls._engine_model_definitions())
+
+    def conservative_model_limit(self) -> int:
+        """The budget used for a model id nothing knows.
+
+        It is the smallest context window published by any registered
+        chat-LLM profile (``llm_*`` / ``classType: ["llm"]``) or by
+        :attr:`MODEL_LIMITS` -- by construction never larger than any known
+        chat model's window (8 191 on develop, the gpt-4-class entries) -- and
+        :data:`CONSERVATIVE_MODEL_LIMIT_FLOOR` only if both are empty.
+        Embedding input limits and vision models are catalogued for lookup but
+        deliberately never lower this floor. An unknown id is usually a typo
+        or a model this build predates; ``max_context_tokens`` is the explicit
+        override.
+        """
+        known = [*self.MODEL_LIMITS.values()]
+        if self._llm_class_floor is not None:
+            known.append(self._llm_class_floor)
+        return min(known) if known else CONSERVATIVE_MODEL_LIMIT_FLOOR
 
     def resolve_model_limit(self, model: str) -> int:
         """Resolve the context-window size for *model*.
 
         Order: live catalog, then :attr:`MODEL_LIMITS`, then
-        :data:`DEFAULT_MODEL_LIMIT` (with a one-time warning per model id).
+        :meth:`conservative_model_limit` (with a one-time warning per model id).
 
         Both lookups try the full id first and then, for a provider-scoped id,
         its bare name -- so ``openai/gpt-5`` still resolves through
-        :attr:`MODEL_LIMITS` when the sibling ``llm_*`` nodes are not deployed
-        and the catalog is therefore empty.
+        :attr:`MODEL_LIMITS` when the engine registry has no LLM nodes and the
+        catalog is therefore empty.
         """
         bare = model.rsplit('/', 1)[-1]
         candidates = (model,) if bare == model else (model, bare)
-        catalog = self.model_catalog()
         for key in candidates:
-            if key in catalog:
-                return catalog[key]
+            if key in self._catalog:
+                return self._catalog[key]
         for key in candidates:
             if key in self.MODEL_LIMITS:
                 return self.MODEL_LIMITS[key]
+        fallback = self.conservative_model_limit()
         if model not in self._warned_unknown_models:
             warning(
-                f"context_optimizer: model '{model}' is in neither the LLM node catalog nor MODEL_LIMITS, "
-                f'falling back to {DEFAULT_MODEL_LIMIT} tokens; use a model id published by an llm_* node '
-                f'or set max_context_tokens explicitly'
+                f"context_optimizer: model '{model}' is in neither the LLM node catalog nor MODEL_LIMITS; "
+                f'budgeting the conservative {fallback} tokens (the smallest known context window). '
+                f'Use a model id published by an llm_* node or set max_context_tokens explicitly'
             )
             self._warned_unknown_models.add(model)
-        return DEFAULT_MODEL_LIMIT
+        return fallback
 
     @staticmethod
     def _parse_pct(value: Any, name: str) -> float:
