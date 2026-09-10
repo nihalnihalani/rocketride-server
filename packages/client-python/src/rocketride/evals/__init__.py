@@ -36,8 +36,8 @@ Public API:
     evaluate_assertion / AssertionResult: Assertion evaluation
     make_judge / build_judge_prompt / parse_judge_verdict / JudgeVerdict /
         JudgeParseError: LLM-as-judge support
-    CaseResult / EvalReport / render_human / render_json / render_junit:
-        Result model and reporters
+    CaseResult / EvalReport / SpecError / render_human / render_json /
+        render_junit: Result model and reporters
 """
 
 from .assertions import AssertionResult, evaluate_assertion
@@ -48,7 +48,14 @@ from .judge import (
     make_judge,
     parse_judge_verdict,
 )
-from .reporters import CaseResult, EvalReport, render_human, render_json, render_junit
+from .reporters import (
+    CaseResult,
+    EvalReport,
+    SpecError,
+    render_human,
+    render_json,
+    render_junit,
+)
 from .runner import default_judge_pipeline_path, run_spec
 from .spec import AssertionSpec, EvalCase, EvalSpec, EvalSpecError, load_spec
 
@@ -62,6 +69,7 @@ __all__ = [
     'EvalSpecError',
     'JudgeParseError',
     'JudgeVerdict',
+    'SpecError',
     'build_judge_prompt',
     'default_judge_pipeline_path',
     'evaluate_assertion',

@@ -342,13 +342,20 @@ Key flags:
 | `files` positional | One or more eval spec files or glob patterns. |
 | `--case <substring>` | Only run cases whose name contains the substring. |
 | `--fail-fast` | Stop at the first failing case. |
-| `--json` | Print one JSON document (`{"specs": [...], "summary": {...}}`) instead of human-readable text. |
+| `--json` | Print one JSON document (`{"specs": [...], "spec_errors": [...], "summary": {...}}`) instead of human-readable text. |
 | `--junit <path>` | Write a JUnit XML report to `<path>` in addition to the normal output. |
 
 Exit codes (CI-friendly): `0` all cases passed, `1` at least one case failed or
-errored, `2` usage error, spec parse/validation error, connection failure, or
-no case produced a result (e.g. a `--case` filter that matches nothing). Every
-spec is validated before the CLI connects, so a broken spec means nothing runs.
+errored, or a spec could not run to completion, `2` usage error, spec
+parse/validation error, connection failure, or no case produced a result (e.g.
+a `--case` filter that matches nothing). Every spec is validated before the CLI
+connects, so a broken spec means nothing runs.
+
+A spec that cannot be run at all — for example its pipeline fails to start — is
+reported in every output format, not just on stderr: `--json` lists it under
+`spec_errors` and counts it in `summary.spec_errors`, and `--junit` writes it as
+a one-test suite holding an errored `<testcase>`, so an uploaded report never
+shows a green run for a run that exited non-zero.
 
 **Spec format** — strict JSON; the `pipeline` and `judge_pipeline` paths are
 resolved relative to the spec file:
@@ -438,6 +445,10 @@ Troubleshooting:
   The message names the file, case, and assertion index.
 - Exit `2` after a run — no case produced a result: every spec errored, or the
   `--case` filter matched nothing.
+- `Error: <file>: ...` after the run started, with exit `1` — that spec could
+  not run to completion (for example its pipeline failed to start) while another
+  spec produced results. It is listed under `spec_errors` in `--json` and as an
+  errored one-test suite in the JUnit report.
 - `judge verdict unparseable` on an `llm_judge` assertion — the judge pipeline
   replied with something other than the strict JSON verdict; the raw reply is
   included in the assertion detail. Check the judge pipeline's model or prompt,

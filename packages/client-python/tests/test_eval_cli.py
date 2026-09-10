@@ -28,14 +28,15 @@ a fake client, so no live server or network is required. The assertion
 evaluator is patched to a deterministic substring check so the tests pin the
 CLI contract - glob expansion, spec validation, pipeline lifecycle,
 --case/--fail-fast/--json/--junit behavior, and the exit code contract:
-0 = all cases passed, 1 = at least one case failed, 2 = usage/spec/connection
-error or no case produced a result.
+0 = all cases passed, 1 = at least one case failed or a spec could not run to
+completion, 2 = usage/spec/connection error or no case produced a result.
 """
 
 import argparse
 import importlib
 import json
 import os
+import xml.etree.ElementTree as ET
 from typing import Any
 
 import pytest
@@ -326,11 +327,122 @@ class TestEvalCli:
 
         # stdout must be exactly one machine-readable JSON document
         document = json.loads(out)
-        assert set(document.keys()) == {'specs', 'summary'}
+        assert set(document.keys()) == {'specs', 'spec_errors', 'summary'}
         assert document['summary']['total_cases'] == 2
         assert document['summary']['passed'] == 1
         assert document['summary']['failed'] == 1
         assert len(document['specs']) == 1
+
+    async def test_clean_run_reports_no_spec_errors(self, monkeypatch, capsys, spec_file):
+        # spec_errors is always present, so a consumer can read it without
+        # having to probe for the key first
+        fake = FakeClient()
+
+        exit_code = await run_cli(monkeypatch, fake, [spec_file, '--json'])
+
+        assert exit_code == 0
+        document = json.loads(capsys.readouterr().out)
+        assert document['spec_errors'] == []
+        assert document['summary'] == {'total_cases': 2, 'passed': 2, 'failed': 0, 'spec_errors': 0}
+
+    async def test_json_carries_spec_error_alongside_passing_spec(self, monkeypatch, capsys, tmp_path):
+        # The regression this pins: the run exits 1, so the JSON artifact CI
+        # displays must not read as a clean pass just because the spec that
+        # broke produced no report of its own.
+        document = json.loads(json.dumps(SPEC_DOC))
+        document['pipeline'] = 'broken.pipe'
+        write_spec(tmp_path, document, name='a-broken.eval.json')
+        write_spec(tmp_path, SPEC_DOC, name='b-good.eval.json')
+        fake = FakeClient(use_error_for='broken.pipe')
+
+        exit_code = await run_cli(monkeypatch, fake, [str(tmp_path / '*.eval.json'), '--json'])
+
+        assert exit_code == 1
+        captured = capsys.readouterr()
+        # --json owns stdout: the spec error goes to stderr *and* into the document
+        assert 'cannot start pipeline' in captured.err
+        report = json.loads(captured.out)
+
+        assert len(report['spec_errors']) == 1
+        assert report['spec_errors'][0]['spec'] == str(tmp_path / 'a-broken.eval.json')
+        assert 'cannot start pipeline' in report['spec_errors'][0]['error']
+        assert report['summary']['spec_errors'] == 1
+        # ...and the spec that did run is still reported in full
+        assert len(report['specs']) == 1
+        assert report['summary']['total_cases'] == 2
+        assert report['summary']['failed'] == 0
+
+    async def test_junit_carries_spec_error_alongside_passing_spec(self, monkeypatch, tmp_path):
+        document = json.loads(json.dumps(SPEC_DOC))
+        document['pipeline'] = 'broken.pipe'
+        write_spec(tmp_path, document, name='a-broken.eval.json')
+        write_spec(tmp_path, SPEC_DOC, name='b-good.eval.json')
+        junit_path = tmp_path / 'reports' / 'evals.xml'
+        fake = FakeClient(use_error_for='broken.pipe')
+
+        exit_code = await run_cli(monkeypatch, fake, [str(tmp_path / '*.eval.json'), '--junit', str(junit_path)])
+
+        assert exit_code == 1
+        root = ET.fromstring(junit_path.read_text(encoding='utf-8'))
+        # 2 cases from the spec that ran + 1 synthetic test for the one that did not
+        assert root.get('tests') == '3'
+        assert root.get('errors') == '1'
+        assert root.get('failures') == '0'
+
+        errored = [suite for suite in root.findall('testsuite') if suite.get('errors') == '1']
+        assert len(errored) == 1
+        assert errored[0].get('name') == str(tmp_path / 'a-broken.eval.json')
+        assert errored[0].get('tests') == '1'
+        assert errored[0].get('failures') == '0'
+        error = errored[0].find('testcase/error')
+        assert error is not None
+        assert 'cannot start pipeline' in error.get('message')
+
+    async def test_every_spec_erroring_exits_2_but_reports_still_carry_the_errors(self, monkeypatch, capsys, tmp_path):
+        # "all specs errored" stays exit 2, but the reports written on that
+        # path must still name every spec that could not run
+        document = json.loads(json.dumps(SPEC_DOC))
+        document['pipeline'] = 'broken.pipe'
+        write_spec(tmp_path, document, name='a.eval.json')
+        write_spec(tmp_path, document, name='b.eval.json')
+        junit_path = tmp_path / 'evals.xml'
+        fake = FakeClient(use_error_for='broken.pipe')
+
+        exit_code = await run_cli(
+            monkeypatch,
+            fake,
+            [str(tmp_path / '*.eval.json'), '--json', '--junit', str(junit_path)],
+        )
+
+        assert exit_code == 2
+        report = json.loads(capsys.readouterr().out)
+        assert report['specs'] == []
+        assert [entry['spec'] for entry in report['spec_errors']] == [
+            str(tmp_path / 'a.eval.json'),
+            str(tmp_path / 'b.eval.json'),
+        ]
+        assert report['summary'] == {'total_cases': 0, 'passed': 0, 'failed': 0, 'spec_errors': 2}
+
+        root = ET.fromstring(junit_path.read_text(encoding='utf-8'))
+        assert root.get('tests') == '2'
+        assert root.get('errors') == '2'
+        assert len(root.findall('testsuite/testcase/error')) == 2
+
+    async def test_human_output_lists_spec_errors(self, monkeypatch, capsys, tmp_path):
+        document = json.loads(json.dumps(SPEC_DOC))
+        document['pipeline'] = 'broken.pipe'
+        write_spec(tmp_path, document, name='a-broken.eval.json')
+        write_spec(tmp_path, SPEC_DOC, name='b-good.eval.json')
+        fake = FakeClient(use_error_for='broken.pipe')
+
+        exit_code = await run_cli(monkeypatch, fake, [str(tmp_path / '*.eval.json')])
+
+        assert exit_code == 1
+        captured = capsys.readouterr()
+        # Still on stderr, and now also in the report the human reads
+        assert 'cannot start pipeline' in captured.err
+        assert 'a-broken.eval.json: cannot start pipeline' in captured.out
+        assert captured.out.rstrip().endswith('Summary: 2 case(s), 2 passed, 0 failed, 1 spec error(s)')
 
     async def test_junit_report_written_alongside_human_output(self, monkeypatch, capsys, tmp_path, spec_file):
         junit_path = tmp_path / 'reports' / 'evals.xml'
