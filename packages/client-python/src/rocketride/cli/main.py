@@ -32,6 +32,7 @@ Command surface (kept in exact parity with the TypeScript client's CLI):
     validate <files...>        Validate pipeline files (CI-friendly exit codes)
     diff <old> <new>           Semantic .pipe diff (fully local; no server)
     eval <specs...>            Run golden-dataset evals (CI-friendly exit codes)
+    otel                       OpenTelemetry bridge: traces + metrics over OTLP
     store dir/type/write/...   File store operations
     app create/deploy/verify   App lifecycle
     deploy add/list/publish/.. Deploy lifecycle (deployment target)
@@ -294,6 +295,7 @@ def setup_parser() -> argparse.ArgumentParser:
         '--exit-zero',
         action='store_true',
         help='Always exit 0 on a successful run, even when changes are found (non-gating)',
+    )
 
     # ── eval ─────────────────────────────────────────────────────────────
     # `eval` owns its own --json: it is a plain format flag (a whole JSON
@@ -340,6 +342,86 @@ def setup_parser() -> argparse.ArgumentParser:
     eval_parser.add_argument(
         '--junit',
         help='Write a JUnit XML report to this path (in addition to normal output)',
+    )
+
+    # ── otel ─────────────────────────────────────────────────────────────
+    # A long-running foreground bridge: it streams to an OTLP collector and
+    # emits no JSON result, so it takes the connection args without the
+    # shared --json [FILE] option.
+    otel_parser = subparsers.add_parser(
+        'otel',
+        help='Export pipeline traces and metrics to an OpenTelemetry collector',
+        epilog=(
+            "Requires the OpenTelemetry extra: pip install 'rocketride[otel]'. "
+            'Exit codes: 0 = graceful shutdown; 1 = unexpected failure; 2 = missing extra, '
+            'refused cleartext credential transport, or startup connection failure.'
+        ),
+    )
+    _add_connection_args(otel_parser, json_arg=False)
+
+    # OTLP endpoint base URL (signal paths are appended automatically)
+    otel_parser.add_argument(
+        '--endpoint',
+        default=None,
+        help='OTLP endpoint base URL (default: OTEL_EXPORTER_OTLP_ENDPOINT or http://localhost:4318)',
+    )
+
+    # OTLP transport protocol
+    otel_parser.add_argument(
+        '--protocol',
+        choices=['http', 'grpc'],
+        default='http',
+        help='OTLP transport protocol (default: %(default)s)',
+    )
+
+    # service.name resource attribute
+    otel_parser.add_argument(
+        '--service-name',
+        dest='service_name',
+        default=None,
+        help='service.name resource attribute (default: OTEL_SERVICE_NAME or rocketride-engine)',
+    )
+
+    # OTLP headers for collector authentication (Langfuse, LangSmith, ...)
+    otel_parser.add_argument(
+        '--headers',
+        default=None,
+        help='OTLP headers as comma-separated key=value pairs (default: OTEL_EXPORTER_OTLP_HEADERS)',
+    )
+
+    # Privacy gate: payload content is excluded from spans by default
+    otel_parser.add_argument(
+        '--include-content',
+        dest='include_content',
+        action='store_true',
+        help='Include pipeline payload content in spans, size-capped (default: content excluded)',
+    )
+
+    # Transport-security opt-out for the cleartext-credential guard
+    otel_parser.add_argument(
+        '--insecure',
+        action='store_true',
+        help='Allow exporting OTLP credential headers over cleartext transport to a '
+        'non-loopback collector (default: refuse; also ROCKETRIDE_OTEL_ALLOW_INSECURE=1)',
+    )
+
+    # Metrics toggle: traces-only export
+    otel_parser.add_argument(
+        '--no-metrics',
+        dest='no_metrics',
+        action='store_true',
+        help='Disable metrics export; export traces only',
+    )
+
+    # Informational only: the bridge cannot set the trace level of runs
+    # it did not start (pipelineTraceLevel is an execute-time argument)
+    otel_parser.add_argument(
+        '--trace-level',
+        dest='trace_level',
+        choices=['none', 'metadata', 'summary', 'full'],
+        default=None,
+        help='Informational only: FLOW spans require runs started with pipelineTraceLevel; '
+        'the bridge cannot change the trace level of running tasks',
     )
 
     # ── store ────────────────────────────────────────────────────────────
@@ -533,6 +615,7 @@ async def _dispatch(args) -> int:
     from .commands.deploy import run_deploy
     from .commands.diff import run_diff
     from .commands.eval import run_eval
+    from .commands.otel import run_otel
     from .commands.store import run_store
     from .commands.tasks import run_list, run_start, run_stop, run_upload
     from .commands.validate import run_validate
@@ -555,6 +638,8 @@ async def _dispatch(args) -> int:
         return await run_diff(args)
     if args.command == 'eval':
         return await run_eval(args)
+    if args.command == 'otel':
+        return await run_otel(args)
     if args.command == 'store':
         if not getattr(args, 'store_subcommand', None):
             print('Error: Store subcommand is required (dir, type, write, rm, mkdir, stat)', file=sys.stderr)

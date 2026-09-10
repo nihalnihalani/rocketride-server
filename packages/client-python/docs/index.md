@@ -784,6 +784,7 @@ rocketride events ALL --token <token>        # Stream task events
 rocketride store dir /                       # List the root of the file store
 rocketride diff old.pipe new.pipe            # Semantic diff of two .pipe files (local; no server)
 rocketride eval tests/*.eval.json            # Run golden-dataset evals
+rocketride otel                              # Export pipeline traces + metrics over OpenTelemetry
 ```
 
 The `store` command's sub-commands are `dir`, `type`, `write`, `rm`, `mkdir`, and `stat` — run `rocketride store --help` for details.
@@ -816,6 +817,23 @@ Plus the shared connection flags: `--uri`, `--apikey`, `--token`.
 **Exit codes:** `0` all cases passed, `1` at least one case failed or errored, `2` usage error, spec parse/validation error, connection failure, or no case produced a result. All specs are validated before the CLI connects, so a broken spec means nothing runs.
 
 The full spec-file reference, the assertion table, and the LLM-as-judge notes are on the [CLI Reference](/cli) page.
+
+### OpenTelemetry export (`rocketride otel`)
+
+The `otel` command bridges live pipeline traces and metrics to any OpenTelemetry
+collector over OTLP (Jaeger, Grafana, Datadog, Langfuse, LangSmith, ...). It consumes the
+engine's documented WebSocket monitor protocol — no engine changes — and requires the
+optional extra:
+
+```bash
+pip install 'rocketride[otel]'
+rocketride otel --endpoint http://localhost:4318
+```
+
+Payload content is excluded from spans by default (`--include-content` opts in,
+size-capped). Per-component spans appear for runs started with
+`client.use(..., pipelineTraceLevel='summary')`. Full guide:
+[OpenTelemetry bridge](/develop/python/otel-bridge).
 
 ## Configuration
 
