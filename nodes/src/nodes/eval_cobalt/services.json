@@ -4,6 +4,7 @@
 	//		The displayable name of this node
 	//
 	"title": "Cobalt Evaluator",
+	"icon": "eval-cobalt.svg",
 	//
 	// Required:
 	//		The protocol is the endpoint protocol

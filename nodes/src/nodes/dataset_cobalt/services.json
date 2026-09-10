@@ -4,6 +4,7 @@
 	//		The displayable name of this node
 	//
 	"title": "Cobalt Dataset",
+	"icon": "dataset-cobalt.svg",
 	//
 	// Required:
 	//		The protocol is the endpoint protocol
