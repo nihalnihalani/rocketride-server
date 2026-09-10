@@ -10,7 +10,7 @@
 # independently, so editing the values below does not change what `pytest`
 # requires -- the two must be kept in sync by hand.
 #
-# See docs/README-cobalt-testing.md for usage details.
+# See docs/develop/README-cobalt-testing.md for usage details.
 # =============================================================================
 
 [judge]
