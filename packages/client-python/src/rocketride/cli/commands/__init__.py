@@ -35,12 +35,14 @@ Modules:
     deploy: ``deploy`` subcommands
     validate: ``validate`` (pipeline files, CI-friendly exit codes)
     diff: ``diff`` (semantic ``.pipe`` diff, entirely local — no server)
+    eval: ``eval`` (golden-dataset eval specs, CI-friendly exit codes)
 """
 
 from .app import run_app
 from .auth import run_init, run_login
 from .deploy import run_deploy
 from .diff import run_diff
+from .eval import run_eval
 from .store import run_store
 from .tasks import run_list, run_start, run_stop, run_upload
 from .validate import run_validate
@@ -49,6 +51,7 @@ __all__ = [
     'run_app',
     'run_deploy',
     'run_diff',
+    'run_eval',
     'run_init',
     'run_list',
     'run_login',

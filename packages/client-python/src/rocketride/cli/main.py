@@ -31,6 +31,7 @@ Command surface (kept in exact parity with the TypeScript client's CLI):
     start / stop / upload      Task lifecycle
     validate <files...>        Validate pipeline files (CI-friendly exit codes)
     diff <old> <new>           Semantic .pipe diff (fully local; no server)
+    eval <specs...>            Run golden-dataset evals (CI-friendly exit codes)
     store dir/type/write/...   File store operations
     app create/deploy/verify   App lifecycle
     deploy add/list/publish/.. Deploy lifecycle (deployment target)
@@ -60,13 +61,18 @@ from .utils.env import (
 )
 
 
-def _add_connection_args(parser: argparse.ArgumentParser) -> None:
+def _add_connection_args(parser: argparse.ArgumentParser, *, json_arg: bool = True) -> None:
     """
     Add the development-connection options (``--uri``, ``--apikey``,
     ``--json``) with defaults from the (already loaded) environment.
 
     Args:
         parser: The subcommand parser to extend.
+        json_arg: Whether to add the shared ``--json [FILE]`` option. Pass
+            False for a command that defines its own ``--json`` as a plain
+            format flag rather than the shared result envelope (argparse
+            would otherwise reject the duplicate option string), or for one
+            that produces no JSON result at all.
     """
     from ..core.constants import CONST_DEFAULT_WEB_LOCAL
 
@@ -80,7 +86,8 @@ def _add_connection_args(parser: argparse.ArgumentParser) -> None:
         default=os.getenv(ENV_DEV_APIKEY),
         help=f'API key for server authentication (can use {ENV_DEV_APIKEY} in .env or env var)',
     )
-    _add_json_arg(parser)
+    if json_arg:
+        _add_json_arg(parser)
 
 
 def _add_deploy_connection_args(parser: argparse.ArgumentParser) -> None:
@@ -287,6 +294,52 @@ def setup_parser() -> argparse.ArgumentParser:
         '--exit-zero',
         action='store_true',
         help='Always exit 0 on a successful run, even when changes are found (non-gating)',
+
+    # ── eval ─────────────────────────────────────────────────────────────
+    # `eval` owns its own --json: it is a plain format flag (a whole JSON
+    # report on stdout), not the shared --json [FILE] result envelope, so the
+    # connection args are added without it.
+    eval_parser = subparsers.add_parser(
+        'eval',
+        help='Run golden-dataset evals against pipelines',
+        description='Run golden-dataset eval specs (<name>.eval.json) against their pipelines. '
+        'Exit codes: 0 = all cases passed; 1 = at least one case failed; '
+        '2 = usage error, spec parse/validation error, connection failure, '
+        'or no case produced a result.',
+    )
+    _add_connection_args(eval_parser, json_arg=False)
+
+    # Eval spec files as positional arguments - supports glob patterns
+    eval_parser.add_argument(
+        'files',
+        nargs='+',
+        help='Eval spec files or glob patterns (<name>.eval.json)',
+    )
+
+    # Optional substring filter on case names
+    eval_parser.add_argument(
+        '--case',
+        help='Only run cases whose name contains this substring',
+    )
+
+    # Stop at the first failing case
+    eval_parser.add_argument(
+        '--fail-fast',
+        action='store_true',
+        help='Stop at the first failing case',
+    )
+
+    # Optional JSON output format
+    eval_parser.add_argument(
+        '--json',
+        action='store_true',
+        help='Output results in JSON format',
+    )
+
+    # Optional JUnit XML report path
+    eval_parser.add_argument(
+        '--junit',
+        help='Write a JUnit XML report to this path (in addition to normal output)',
     )
 
     # ── store ────────────────────────────────────────────────────────────
@@ -479,6 +532,7 @@ async def _dispatch(args) -> int:
     from .commands.auth import run_init, run_login
     from .commands.deploy import run_deploy
     from .commands.diff import run_diff
+    from .commands.eval import run_eval
     from .commands.store import run_store
     from .commands.tasks import run_list, run_start, run_stop, run_upload
     from .commands.validate import run_validate
@@ -499,6 +553,8 @@ async def _dispatch(args) -> int:
         return await run_validate(args)
     if args.command == 'diff':
         return await run_diff(args)
+    if args.command == 'eval':
+        return await run_eval(args)
     if args.command == 'store':
         if not getattr(args, 'store_subcommand', None):
             print('Error: Store subcommand is required (dir, type, write, rm, mkdir, stat)', file=sys.stderr)

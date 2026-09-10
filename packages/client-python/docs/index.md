@@ -783,11 +783,39 @@ rocketride list                              # List all active tasks
 rocketride events ALL --token <token>        # Stream task events
 rocketride store dir /                       # List the root of the file store
 rocketride diff old.pipe new.pipe            # Semantic diff of two .pipe files (local; no server)
+rocketride eval tests/*.eval.json            # Run golden-dataset evals
 ```
 
 The `store` command's sub-commands are `dir`, `type`, `write`, `rm`, `mkdir`, and `stat` — run `rocketride store --help` for details.
 
 All commands **except `diff`** accept `--uri` and `--apikey` flags, or read from environment variables. `diff` compares parsed `.pipe` JSON entirely on your machine — it never connects to an engine, so it takes no connection flags. See the [CLI reference](/cli) for its flags and exit codes.
+
+### rocketride eval
+
+Golden-dataset regression tests for pipelines. An eval spec (`<name>.eval.json`) pairs a `.pipe` file with named cases: each case sends an input through the pipeline's chat source and checks the output against a list of assertions (`contains`, `not_contains`, `regex`, `equals`, `min_length`, `max_length`, `json_path`, `latency_max_ms`, and `llm_judge`, which scores the output with a judge pipeline). Use it locally while editing a pipeline, and in CI to gate `.pipe` changes.
+
+```bash
+rocketride eval rag-pipeline.eval.json                       # Run one spec
+rocketride eval evals/*.eval.json                            # Run many (globs expanded in-CLI)
+rocketride eval evals/*.eval.json --case greeting            # Only cases whose name contains "greeting"
+rocketride eval evals/*.eval.json --fail-fast                # Stop at the first failing case
+rocketride eval evals/*.eval.json --json                     # Machine-readable output
+rocketride eval evals/*.eval.json --junit reports/evals.xml  # JUnit XML for CI
+```
+
+| Flag          | Description                                                                    |
+| ------------- | ------------------------------------------------------------------------------ |
+| `files`       | One or more eval spec files or glob patterns (positional, required).           |
+| `--case <s>`  | Only run cases whose name contains the substring `<s>`.                        |
+| `--fail-fast` | Stop at the first failing case.                                                |
+| `--json`      | Print a single JSON document (`{"specs": [...], "summary": {...}}`) to stdout. |
+| `--junit <p>` | Write a JUnit XML report to `<p>` in addition to the normal output.            |
+
+Plus the shared connection flags: `--uri`, `--apikey`, `--token`.
+
+**Exit codes:** `0` all cases passed, `1` at least one case failed or errored, `2` usage error, spec parse/validation error, connection failure, or no case produced a result. All specs are validated before the CLI connects, so a broken spec means nothing runs.
+
+The full spec-file reference, the assertion table, and the LLM-as-judge notes are on the [CLI Reference](/cli) page.
 
 ## Configuration
 
