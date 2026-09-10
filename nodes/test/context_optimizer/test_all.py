@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import re
 import sys
 import types
 from pathlib import Path
@@ -137,10 +138,140 @@ from ai.common.schema import Question  # noqa: E402
 from context_optimizer.IGlobal import IGlobal  # noqa: E402
 from context_optimizer.IInstance import IInstance  # noqa: E402
 from context_optimizer.optimizer import (  # noqa: E402
-    DEFAULT_MODEL_LIMIT,
+    CONSERVATIVE_MODEL_LIMIT_FLOOR,
     DEFAULT_MODEL_NAME,
     ContextOptimizer,
 )
+
+import rocketlib  # noqa: E402  -- the engine binding the catalog is read through
+
+
+# ===========================================================================
+# Engine-registry substitutes
+# ===========================================================================
+#
+# The catalog is read through ``rocketlib.getServiceDefinitions()`` (the
+# engine's index of registered services) and ``rocketlib.getServiceDefinition``
+# (one node's raw services*.json). Outside the engine those are the C++
+# binding's stubs, so the tests below install substitutes on the ``rocketlib``
+# module and exercise the production ``_engine_model_definitions`` path
+# unchanged.
+
+
+def _load_jsonc(path: Path) -> dict:
+    """Tolerant loader for the services*.json files (comments, trailing commas).
+
+    Test-local on purpose: production never parses these files itself any
+    more -- the engine does, and hands the node the parsed definition.
+    """
+    text = path.read_text(encoding='utf-8')
+    out, i, n = [], 0, len(text)
+    in_str = False
+    while i < n:
+        c = text[i]
+        if in_str:
+            out.append(c)
+            if c == '\\' and i + 1 < n:
+                out.append(text[i + 1])
+                i += 2
+                continue
+            if c == '"':
+                in_str = False
+            i += 1
+            continue
+        if c == '"':
+            in_str = True
+            out.append(c)
+            i += 1
+            continue
+        if text.startswith('//', i):
+            i = text.find('\n', i)
+            i = n if i < 0 else i
+            continue
+        if text.startswith('/*', i):
+            j = text.find('*/', i + 2)
+            i = n if j < 0 else j + 2
+            continue
+        out.append(c)
+        i += 1
+    return json.loads(re.sub(r',(\s*[}\]])', r'\1', ''.join(out)))
+
+
+def _source_tree_registry() -> tuple[dict, dict]:
+    """(index, definitions) for every node in the source tree.
+
+    Mirrors what the engine registry returns: the index carries each
+    logical type's ``classType``; the definitions are the raw files. The
+    optimizer decides by content which of them publish a model catalog.
+    """
+    index: dict[str, dict] = {}
+    definitions: dict[str, dict] = {}
+    for path in sorted(_NODES_SRC.glob('*/services*.json')):
+        try:
+            definition = _load_jsonc(path)
+        except ValueError:
+            continue
+        protocol = definition.get('protocol') if isinstance(definition, dict) else None
+        logical_type = protocol[:-3] if isinstance(protocol, str) and protocol.endswith('://') else path.parent.name
+        index[logical_type] = {'classType': definition.get('classType', []), 'title': definition.get('title', '')}
+        definitions[logical_type] = definition
+    return index, definitions
+
+
+def _install_registry(monkeypatch, index, definitions, *, calls=None, envelope=True):
+    """Point ``rocketlib`` at a fake engine registry.
+
+    By default the index is served in the engine's real shape -- the
+    ``{"services": {...}, "version": N}`` envelope that
+    ``IServices::getServiceSchemas`` builds; ``envelope=False`` serves a bare
+    index to exercise the tolerance path.
+    """
+
+    def get_definitions():
+        if calls is not None:
+            calls.append(('index',))
+        return {'services': index, 'version': 'test'} if envelope else index
+
+    def get_definition(logical_type):
+        if calls is not None:
+            calls.append(('definition', logical_type))
+        return definitions[logical_type]
+
+    monkeypatch.setattr(rocketlib, 'getServiceDefinitions', get_definitions)
+    monkeypatch.setattr(rocketlib, 'getServiceDefinition', get_definition)
+
+
+def _definitions(class_types, **nodes):
+    """Build a synthetic (index, definitions) pair: name -> [(model, window), ...]."""
+    index, definitions = {}, {}
+    for name, profiles in nodes.items():
+        index[name] = {'classType': list(class_types)}
+        definitions[name] = {
+            'classType': list(class_types),
+            'preconfig': {
+                'profiles': {f'p{i}': {'model': m, 'modelTotalTokens': w} for i, (m, w) in enumerate(profiles)}
+            },
+        }
+    return index, definitions
+
+
+def _llm_definitions(**nodes):
+    """Chat-LLM definitions (``classType: ["llm"]``)."""
+    return _definitions(['llm'], **nodes)
+
+
+@pytest.fixture
+def engine_registry(monkeypatch):
+    """The real source-tree llm_* catalog, served through the registry seam."""
+    index, definitions = _source_tree_registry()
+    _install_registry(monkeypatch, index, definitions)
+    return index, definitions
+
+
+@pytest.fixture
+def empty_registry(monkeypatch):
+    """An engine with no LLM nodes registered (the catalog is empty)."""
+    _install_registry(monkeypatch, {}, {})
 
 
 # ===========================================================================
@@ -641,7 +772,7 @@ class TestModelLimits:
         """
         assert ContextOptimizer.MODEL_LIMITS[model] == expected
 
-    def test_fallback_table_never_disagrees_with_catalog(self):
+    def test_fallback_table_never_disagrees_with_catalog(self, engine_registry):
         """MODEL_LIMITS must not contradict the live llm_* catalog.
 
         The table is a fallback, so wherever the catalog also publishes an id
@@ -669,10 +800,24 @@ class TestModelLimits:
             f'MODEL_LIMITS is stale against the llm_* catalog (model: table vs catalog): {disagreements}'
         )
 
-    def test_unknown_model_uses_default(self):
+    def test_unknown_model_uses_conservative_floor(self, empty_registry):
+        """An id nothing knows is budgeted at the smallest known window, never above."""
         config = {'model_name': 'unknown-model-xyz', 'max_context_tokens': 0}
         opt = ContextOptimizer(config)
-        assert opt._total_limit == DEFAULT_MODEL_LIMIT
+        assert opt._total_limit == min(ContextOptimizer.MODEL_LIMITS.values())
+        assert 'unknown-model-xyz' in opt._warned_unknown_models
+
+    def test_unknown_model_never_exceeds_a_catalogued_window(self, monkeypatch):
+        """A small catalogued model drags the unknown-model budget down with it."""
+        _install_registry(monkeypatch, *_llm_definitions(llm_tiny=[('tiny-4k', 4096)]))
+        opt = ContextOptimizer({'model_name': 'unknown-model-xyz', 'max_context_tokens': 0})
+        assert opt._total_limit == 4096
+        assert opt.conservative_model_limit() == 4096
+
+    def test_floor_constant_only_when_nothing_is_known(self, empty_registry, monkeypatch):
+        monkeypatch.setattr(ContextOptimizer, 'MODEL_LIMITS', {})
+        opt = ContextOptimizer({'model_name': 'unknown-model-xyz', 'max_context_tokens': 0})
+        assert opt._total_limit == CONSERVATIVE_MODEL_LIMIT_FLOOR
 
     def test_custom_max_context_override(self):
         config = {'model_name': 'gpt-5', 'max_context_tokens': 50000}
@@ -681,19 +826,20 @@ class TestModelLimits:
 
 
 class TestModelCatalog:
-    """Tests for the live llm_* model catalog lookup."""
+    """Tests for the live model catalog read through the engine registry."""
 
     @staticmethod
     def _declared_ids_by_node() -> dict[str, set[str]]:
-        """Model ids each sibling ``llm_*`` node declares, read independently.
+        """Model ids each source-tree ``llm_*`` node declares, read independently.
 
-        Parsed straight from the services files rather than through
-        :meth:`ContextOptimizer._load_model_catalog`, so the assertions below
-        are a real check on the loader and not a restatement of it.
+        Parsed straight from the services files by the test's own loader
+        rather than through :meth:`ContextOptimizer._load_model_catalog`, so
+        the assertions below are a real check on the loader and not a
+        restatement of it.
         """
         declared: dict[str, set[str]] = {}
-        for path in sorted(ContextOptimizer._CATALOG_ROOT.glob(ContextOptimizer._CATALOG_GLOB)):
-            service = json.loads(ContextOptimizer._strip_jsonc(path.read_text(encoding='utf-8')))
+        for path in sorted(_NODES_SRC.glob('llm_*/services*.json')):
+            service = _load_jsonc(path)
             profiles = service.get('preconfig', {}).get('profiles', {})
             ids = {
                 profile['model']
@@ -709,8 +855,8 @@ class TestModelCatalog:
                 declared.setdefault(path.parent.name, set()).update(ids)
         return declared
 
-    def test_catalog_is_discovered(self):
-        """The sibling llm_* nodes' services.json files are readable.
+    def test_catalog_is_discovered(self, engine_registry):
+        """Every source-tree llm_* node's profiles reach the catalog via the registry.
 
         Asserted structurally on purpose: no individual model id is named
         here. The catalog contents are owned by ``tools/sync_models`` and
@@ -733,7 +879,122 @@ class TestModelCatalog:
         for node, ids in declared.items():
             assert ids & set(catalog), f'no model id from {node} reached the catalog'
 
-    def test_catalog_beats_fallback_table(self):
+    def test_catalog_is_read_through_the_engine_registry(self, monkeypatch):
+        """Discovery goes index -> every registered type -> raw definition, by content.
+
+        This is the review's ask: no globbing relative to ``__file__``, so an
+        installed or ``--node_path``-materialised node with no sibling
+        directories still sees the catalog the engine loaded. Which nodes
+        contribute is decided by what their definition publishes, not by a
+        name or class convention (the vision nodes register as
+        ``image_vision_*`` with ``classType: ["image"]`` and still publish
+        ``modelTotalTokens``).
+        """
+        calls: list = []
+        index = {
+            'llm_alpha': {'classType': ['llm']},
+            'image_vision_gamma': {'classType': ['image']},
+            'store_vector': {'classType': ['store']},
+        }
+        definitions = {
+            'llm_alpha': {'preconfig': {'profiles': {'p': {'model': 'alpha-1', 'modelTotalTokens': 32000}}}},
+            'image_vision_gamma': {'preconfig': {'profiles': {'p': {'model': 'gamma-1', 'modelTotalTokens': 2048}}}},
+            'store_vector': {'preconfig': {'profiles': {'p': {'dimensions': 1536}}}},
+        }
+        _install_registry(monkeypatch, index, definitions, calls=calls)
+        catalog = ContextOptimizer.model_catalog()
+        assert catalog == {'alpha-1': 32000, 'gamma-1': 2048}
+        assert calls[0] == ('index',)
+        fetched = {name for kind, *rest in calls if kind == 'definition' for name in rest}
+        assert fetched == set(index), 'every registered type is consulted; content decides'
+        assert not hasattr(ContextOptimizer, '_CATALOG_ROOT'), 'no filesystem-relative discovery may remain'
+
+    def test_no_filesystem_access_during_discovery(self, monkeypatch):
+        """Even with a registry present, discovery never touches the filesystem."""
+        _install_registry(monkeypatch, *_llm_definitions(llm_x=[('x-1', 1000)]))
+
+        def _no_glob(*args, **kwargs):
+            raise AssertionError('catalog discovery must not glob the filesystem')
+
+        monkeypatch.setattr(Path, 'glob', _no_glob)
+        monkeypatch.setattr(Path, 'rglob', _no_glob)
+        assert ContextOptimizer.model_catalog() == {'x-1': 1000}
+
+    @pytest.mark.parametrize(
+        'raw',
+        [
+            None,
+            'not-a-dict',
+            [],
+            42,
+            {'services': 'not-a-dict', 'version': 1},
+            {'services': None, 'version': 1},
+            {'services': [], 'version': 1},
+        ],
+    )
+    def test_unusable_registry_index_yields_empty_catalog(self, monkeypatch, raw):
+        monkeypatch.setattr(rocketlib, 'getServiceDefinitions', lambda: raw)
+        monkeypatch.setattr(rocketlib, 'getServiceDefinition', lambda lt: pytest.fail('must not be called'))
+        assert ContextOptimizer.model_catalog() == {}
+
+    def test_registry_envelope_is_unwrapped(self, monkeypatch):
+        """The binding returns {"services": {...}, "version": N}; only the index is walked."""
+        calls: list = []
+        index, definitions = _llm_definitions(llm_env=[('env-1', 12000)])
+        _install_registry(monkeypatch, index, definitions, calls=calls, envelope=True)
+        assert ContextOptimizer.model_catalog() == {'env-1': 12000}
+        fetched = [rest[0] for kind, *rest in calls if kind == 'definition']
+        assert fetched == ['llm_env'], 'the envelope keys ("services", "version") must never be looked up as types'
+
+    def test_bare_index_is_tolerated(self, monkeypatch):
+        index, definitions = _llm_definitions(llm_flat=[('flat-1', 9000)])
+        _install_registry(monkeypatch, index, definitions, envelope=False)
+        assert ContextOptimizer.model_catalog() == {'flat-1': 9000}
+
+    def test_non_llm_windows_are_catalogued_but_never_lower_the_floor(self, monkeypatch):
+        """An embedding input limit resolves by id, yet an unknown chat model is not budgeted at it."""
+        index, definitions = _definitions(['embedding'], embedding_x=[('text-embed-tiny', 2048)])
+        i2, d2 = _llm_definitions(llm_big=[('chat-big', 200000)])
+        index.update(i2)
+        definitions.update(d2)
+        _install_registry(monkeypatch, index, definitions)
+        assert ContextOptimizer.model_catalog()['text-embed-tiny'] == 2048
+        opt = ContextOptimizer({'model_name': 'unknown-chat', 'max_context_tokens': 0})
+        assert opt.conservative_model_limit() == min(ContextOptimizer.MODEL_LIMITS.values())
+        assert opt.conservative_model_limit() > 2048
+
+    def test_registry_failures_degrade_to_empty_or_partial(self, monkeypatch):
+        """A raising index means no catalog; one raising definition is skipped."""
+
+        def _raise():
+            raise RuntimeError('boom')
+
+        monkeypatch.setattr(rocketlib, 'getServiceDefinitions', _raise)
+        assert ContextOptimizer.model_catalog() == {}
+
+        index = {'llm_ok': {'classType': ['llm']}, 'llm_broken': {'classType': ['llm']}}
+
+        def get_definition(logical_type):
+            if logical_type == 'llm_broken':
+                raise RuntimeError('engine says no')
+            return {'preconfig': {'profiles': {'p': {'model': 'ok-1', 'modelTotalTokens': 5000}}}}
+
+        monkeypatch.setattr(rocketlib, 'getServiceDefinitions', lambda: index)
+        monkeypatch.setattr(rocketlib, 'getServiceDefinition', get_definition)
+        assert ContextOptimizer.model_catalog() == {'ok-1': 5000}
+
+    def test_registry_refresh_is_seen_without_a_restart(self, monkeypatch):
+        """No class-level cache: a changed registry is visible to the next optimizer."""
+        _install_registry(monkeypatch, *_llm_definitions(llm_v1=[('model-r', 16000)]))
+        first = ContextOptimizer({'model_name': 'model-r', 'max_context_tokens': 0})
+        assert first._total_limit == 16000
+
+        _install_registry(monkeypatch, *_llm_definitions(llm_v1=[('model-r', 64000)]))
+        second = ContextOptimizer({'model_name': 'model-r', 'max_context_tokens': 0})
+        assert second._total_limit == 64000
+        assert first._total_limit == 16000, 'an existing optimizer keeps the snapshot it budgeted with'
+
+    def test_catalog_beats_fallback_table(self, engine_registry):
         """A model only the catalog knows still resolves."""
         catalog = ContextOptimizer.model_catalog()
         model = 'grok-4-0709'
@@ -743,78 +1004,54 @@ class TestModelCatalog:
         assert opt._total_limit == catalog[model]
         assert model not in ContextOptimizer.MODEL_LIMITS
 
-    @staticmethod
-    def _write_catalog(root, name, profiles):
-        """Write a minimal llm_* services.json into *root*."""
-        node = root / name
-        node.mkdir()
-        body = ',\n'.join(
-            f'\t\t\t"p{i}": {{ "model": "{m}", "modelTotalTokens": {t} }}' for i, (m, t) in enumerate(profiles)
-        )
-        (node / 'services.json').write_text(
-            '{\n\t// comment\n\t"preconfig": {\n\t\t"profiles": {\n' + body + '\n\t\t},\n\t},\n}\n',
-            encoding='utf-8',
-        )
-
-    def test_bare_alias_does_not_shadow_unscoped_profile(self, tmp_path, monkeypatch):
+    def test_bare_alias_does_not_shadow_unscoped_profile(self, monkeypatch):
         """A gateway's `gw/model-x` must not override the unscoped `model-x`."""
-        self._write_catalog(tmp_path, 'llm_a_gateway', [('gw/model-x', 128000)])
-        self._write_catalog(tmp_path, 'llm_z_native', [('model-x', 400000)])
-        monkeypatch.setattr(ContextOptimizer, '_CATALOG_ROOT', tmp_path)
-        monkeypatch.setattr(ContextOptimizer, '_catalog_cache', None)
+        _install_registry(
+            monkeypatch, *_llm_definitions(llm_a_gateway=[('gw/model-x', 128000)], llm_z_native=[('model-x', 400000)])
+        )
         catalog = ContextOptimizer.model_catalog()
         assert catalog['model-x'] == 400000
         assert catalog['gw/model-x'] == 128000
 
-    def test_ambiguous_bare_alias_is_dropped(self, tmp_path, monkeypatch):
+    def test_ambiguous_bare_alias_is_dropped(self, monkeypatch):
         """Two gateways disagreeing about a bare name means no alias at all."""
-        self._write_catalog(tmp_path, 'llm_a_gateway', [('a/model-z', 128000)])
-        self._write_catalog(tmp_path, 'llm_b_gateway', [('b/model-z', 1048576)])
-        monkeypatch.setattr(ContextOptimizer, '_CATALOG_ROOT', tmp_path)
-        monkeypatch.setattr(ContextOptimizer, '_catalog_cache', None)
+        _install_registry(
+            monkeypatch,
+            *_llm_definitions(llm_a_gateway=[('a/model-z', 128000)], llm_b_gateway=[('b/model-z', 1048576)]),
+        )
         catalog = ContextOptimizer.model_catalog()
         assert 'model-z' not in catalog
         assert catalog['a/model-z'] == 128000
         assert catalog['b/model-z'] == 1048576
 
-    def test_conflicting_limits_keep_the_smaller(self, tmp_path, monkeypatch):
-        """The same id in two services files resolves to the safer window."""
-        self._write_catalog(tmp_path, 'llm_one', [('model-y', 262144)])
-        self._write_catalog(tmp_path, 'llm_two', [('model-y', 128000)])
-        monkeypatch.setattr(ContextOptimizer, '_CATALOG_ROOT', tmp_path)
-        monkeypatch.setattr(ContextOptimizer, '_catalog_cache', None)
+    def test_conflicting_limits_keep_the_smaller(self, monkeypatch):
+        """The same id in two definitions resolves to the safer window."""
+        _install_registry(monkeypatch, *_llm_definitions(llm_one=[('model-y', 262144)], llm_two=[('model-y', 128000)]))
         assert ContextOptimizer.model_catalog()['model-y'] == 128000
 
-    def test_resolve_falls_back_to_table_for_family_alias(self):
+    def test_resolve_falls_back_to_table_for_family_alias(self, engine_registry):
         """Abbreviated aliases are not catalogued, so the table answers."""
         catalog = ContextOptimizer.model_catalog()
         assert 'claude-sonnet' not in catalog
         opt = ContextOptimizer({'model_name': 'claude-sonnet', 'max_context_tokens': 0})
         assert opt._total_limit == ContextOptimizer.MODEL_LIMITS['claude-sonnet']
 
-    def test_malformed_catalog_is_ignored(self, tmp_path, monkeypatch):
-        """A broken or missing catalog degrades to the fallback table."""
-        bad = tmp_path / 'llm_broken'
-        bad.mkdir()
-        (bad / 'services.json').write_text('{ not json at all', encoding='utf-8')
-        monkeypatch.setattr(ContextOptimizer, '_CATALOG_ROOT', tmp_path)
-        monkeypatch.setattr(ContextOptimizer, '_catalog_cache', None)
-        try:
-            assert ContextOptimizer.model_catalog() == {}
-            opt = ContextOptimizer({'model_name': 'gpt-5.4', 'max_context_tokens': 0})
-            assert opt._total_limit == ContextOptimizer.MODEL_LIMITS['gpt-5.4']
-        finally:
-            ContextOptimizer._catalog_cache = None
-
-    def test_strip_jsonc_keeps_comment_markers_inside_strings(self):
-        """The JSONC stripper must not cut inside a string literal."""
-        raw = '{ /* c */ "url": "https://x/y", // trailing\n "n": 1, }'
-        assert json.loads(ContextOptimizer._strip_jsonc(raw)) == {'url': 'https://x/y', 'n': 1}
-
-
-# ===========================================================================
-# Edge cases and graceful degradation
-# ===========================================================================
+    def test_malformed_definitions_are_ignored(self, monkeypatch):
+        """Definitions without usable profiles degrade to the fallback table."""
+        index = {
+            'llm_broken': {'classType': ['llm']},
+            'llm_odd': {'classType': ['llm']},
+            'llm_none': {'classType': ['llm']},
+        }
+        definitions = {
+            'llm_broken': 'not a dict',
+            'llm_odd': {'preconfig': {'profiles': [1, 2]}},
+            'llm_none': {'preconfig': {'profiles': {'p': {'model': 'm', 'modelTotalTokens': True}}}},
+        }
+        _install_registry(monkeypatch, index, definitions)
+        assert ContextOptimizer.model_catalog() == {}
+        opt = ContextOptimizer({'model_name': 'gpt-5.4', 'max_context_tokens': 0})
+        assert opt._total_limit == ContextOptimizer.MODEL_LIMITS['gpt-5.4']
 
 
 class TestEdgeCases:
@@ -1297,43 +1534,29 @@ class TestEffectiveModelEncoding:
 class TestScopedIdFallback:
     """A provider-scoped id must reach the fallback table by its bare name.
 
-    The catalog already tries ``openai/gpt-5`` then ``gpt-5``. When the sibling
-    ``llm_*`` nodes are not deployed the catalog is empty, which is exactly the
+    The catalog already tries ``openai/gpt-5`` then ``gpt-5``. When the engine
+    has no LLM nodes registered the catalog is empty, which is exactly the
     case MODEL_LIMITS exists for -- so that lookup has to try the bare name too,
-    or the scoped id silently lands on DEFAULT_MODEL_LIMIT.
+    or the scoped id silently lands on the conservative fallback.
     """
 
-    def test_scoped_id_resolves_through_the_fallback_table(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(ContextOptimizer, '_CATALOG_ROOT', tmp_path)  # no llm_* dirs -> empty catalog
-        monkeypatch.setattr(ContextOptimizer, '_catalog_cache', None)
-        try:
-            assert ContextOptimizer.model_catalog() == {}
-            opt = ContextOptimizer({'model_name': 'openai/gpt-5', 'max_context_tokens': 0})
-            assert opt._total_limit == ContextOptimizer.MODEL_LIMITS['gpt-5']
-            assert opt._total_limit != DEFAULT_MODEL_LIMIT
-            assert opt._warned_unknown_models == set(), 'a resolvable id must not warn'
-        finally:
-            ContextOptimizer._catalog_cache = None
+    def test_scoped_id_resolves_through_the_fallback_table(self, empty_registry):
+        assert ContextOptimizer.model_catalog() == {}
+        opt = ContextOptimizer({'model_name': 'openai/gpt-5', 'max_context_tokens': 0})
+        assert opt._total_limit == ContextOptimizer.MODEL_LIMITS['gpt-5']
+        assert opt._total_limit != opt.conservative_model_limit()
+        assert opt._warned_unknown_models == set(), 'a resolvable id must not warn'
 
-    def test_full_id_still_wins_over_the_bare_name(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(ContextOptimizer, '_CATALOG_ROOT', tmp_path)
-        monkeypatch.setattr(ContextOptimizer, '_catalog_cache', None)
+    def test_full_id_still_wins_over_the_bare_name(self, empty_registry, monkeypatch):
         monkeypatch.setitem(ContextOptimizer.MODEL_LIMITS, 'vendor/gpt-5', 4096)
-        try:
-            opt = ContextOptimizer({'model_name': 'vendor/gpt-5', 'max_context_tokens': 0})
-            assert opt._total_limit == 4096
-        finally:
-            ContextOptimizer._catalog_cache = None
+        opt = ContextOptimizer({'model_name': 'vendor/gpt-5', 'max_context_tokens': 0})
+        assert opt._total_limit == 4096
 
-    def test_unknown_scoped_id_still_warns_and_defaults(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(ContextOptimizer, '_CATALOG_ROOT', tmp_path)
-        monkeypatch.setattr(ContextOptimizer, '_catalog_cache', None)
-        try:
-            opt = ContextOptimizer({'model_name': 'vendor/not-a-real-model', 'max_context_tokens': 0})
-            assert opt._total_limit == DEFAULT_MODEL_LIMIT
-            assert 'vendor/not-a-real-model' in opt._warned_unknown_models
-        finally:
-            ContextOptimizer._catalog_cache = None
+    def test_unknown_scoped_id_still_warns_and_uses_the_floor(self, empty_registry):
+        opt = ContextOptimizer({'model_name': 'vendor/not-a-real-model', 'max_context_tokens': 0})
+        assert opt._total_limit == opt.conservative_model_limit()
+        assert opt._total_limit == min(ContextOptimizer.MODEL_LIMITS.values())
+        assert 'vendor/not-a-real-model' in opt._warned_unknown_models
 
 
 class TestNaNBudgetPercentage:
@@ -1477,19 +1700,15 @@ class TestScopedIdEncoding:
     def test_scoped_id_limit_and_encoding_agree(self, tmp_path, monkeypatch):
         """The window and the tokenizer must come from the same model.
 
-        With no llm_* dirs the catalog is empty, so the limit is reached through
+        With no LLM nodes registered the catalog is empty, so the limit is reached through
         the MODEL_LIMITS bare-name fallback -- the exact path that used to pair
         the gpt-5 window with the cl100k_base tokenizer.
         """
-        monkeypatch.setattr(ContextOptimizer, '_CATALOG_ROOT', tmp_path)
-        monkeypatch.setattr(ContextOptimizer, '_catalog_cache', None)
-        try:
-            scoped = ContextOptimizer({'model_name': 'openai/gpt-5', 'max_context_tokens': 0})
-            bare = ContextOptimizer({'model_name': 'gpt-5', 'max_context_tokens': 0})
-            assert scoped._total_limit == bare._total_limit == ContextOptimizer.MODEL_LIMITS['gpt-5']
-            assert scoped._resolve_encoding_name() == bare._resolve_encoding_name() == 'o200k_base'
-        finally:
-            ContextOptimizer._catalog_cache = None
+        _install_registry(monkeypatch, {}, {})  # an engine with no LLM nodes -> empty catalog
+        scoped = ContextOptimizer({'model_name': 'openai/gpt-5', 'max_context_tokens': 0})
+        bare = ContextOptimizer({'model_name': 'gpt-5', 'max_context_tokens': 0})
+        assert scoped._total_limit == bare._total_limit == ContextOptimizer.MODEL_LIMITS['gpt-5']
+        assert scoped._resolve_encoding_name() == bare._resolve_encoding_name() == 'o200k_base'
 
     @pytest.mark.skipif(
         not _HAS_REAL_TIKTOKEN,
