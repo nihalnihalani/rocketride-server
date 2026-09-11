@@ -358,6 +358,11 @@ reported in every output format, not just on stderr: `--json` lists it under
 a one-test suite holding an errored `<testcase>`, so an uploaded report never
 shows a green run for a run that exited non-zero. `--json FILE` and
 `--junit <path>` can be used together to upload both reports from one run.
+The two paths that exit `2` before any case runs — a spec that fails to parse
+or validate, and a server the CLI cannot reach — write the shared
+`{"error": {"message", "hint"}}` envelope to the `--json` destination in place
+of the report, so an earlier run's green `report.json` is never left behind to
+be read as this run's result.
 
 **Spec format** — strict JSON; the `pipeline` and `judge_pipeline` paths are
 resolved relative to the spec file:

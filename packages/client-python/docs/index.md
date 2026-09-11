@@ -815,7 +815,7 @@ Plus the shared connection flags: `--uri`, `--apikey`.
 
 **Exit codes:** `0` all cases passed, `1` at least one case failed or errored, or a spec could not run to completion, `2` usage error, spec parse/validation error, connection failure, or no case produced a result. All specs are validated before the CLI connects, so a broken spec means nothing runs.
 
-A spec that cannot be run at all — for example its pipeline fails to start — is reported in every output format, not just on stderr: `--json` lists it under `spec_errors` and counts it in `summary.spec_errors`, and `--junit` writes it as a one-test suite holding an errored `<testcase>`. `--json FILE` and `--junit <p>` can be used together to upload both reports from one run.
+A spec that cannot be run at all — for example its pipeline fails to start — is reported in every output format, not just on stderr: `--json` lists it under `spec_errors` and counts it in `summary.spec_errors`, and `--junit` writes it as a one-test suite holding an errored `<testcase>`. `--json FILE` and `--junit <p>` can be used together to upload both reports from one run. The two paths that exit `2` before any case runs — a spec that fails to parse or validate, and a server the CLI cannot reach — write the shared `{"error": {"message", "hint"}}` envelope to the `--json` destination in place of the report, so an earlier run's green `report.json` is never left behind to be read as this run's result.
 
 The full spec-file reference, the assertion table, and the LLM-as-judge notes are on the [CLI Reference](/cli) page.
 
