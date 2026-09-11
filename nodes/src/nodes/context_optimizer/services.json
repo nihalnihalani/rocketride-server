@@ -106,7 +106,7 @@
 				{
 					"name": "truncates over-budget question",
 					"questions": {
-						"questions": [{ "text": "alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha." }]
+						"questions": [{ "text": "alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha." }]
 					},
 					"expect": {
 						"questions": {
@@ -225,7 +225,10 @@
 			"ci_tiny": {
 				"title": "CI tiny - force budget optimization",
 				"model_name": "custom",
-				"max_context_tokens": 80,
+				// 112 tokens: small enough that every ci_tiny case stays over
+				// budget once the section markup IInstance measures is counted,
+				// and large enough for the history summary placeholder to fit.
+				"max_context_tokens": 112,
 				"system_prompt_budget_pct": 10,
 				"query_budget_pct": 20,
 				"document_budget_pct": 35,
@@ -299,7 +302,7 @@
 			"default": "auto",
 			// Only "auto" and "manual" are user-facing modes. The "ci_tiny"
 			// preconfig profile exists solely for the automated test suite
-			// (it forces an 80-token budget), so it is intentionally excluded
+			// (it forces a 112-token budget), so it is intentionally excluded
 			// here rather than surfaced via the "*>preconfig.profiles.*.title"
 			// wildcard -- every enum option below has a matching conditional
 			// field group.
