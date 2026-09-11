@@ -798,23 +798,24 @@ rocketride eval rag-pipeline.eval.json                       # Run one spec
 rocketride eval evals/*.eval.json                            # Run many (globs expanded in-CLI)
 rocketride eval evals/*.eval.json --case greeting            # Only cases whose name contains "greeting"
 rocketride eval evals/*.eval.json --fail-fast                # Stop at the first failing case
-rocketride eval evals/*.eval.json --json                     # Machine-readable output
+rocketride eval evals/*.eval.json --json                     # Machine-readable output on stdout
+rocketride eval evals/*.eval.json --json reports/evals.json  # ...or written to a file
 rocketride eval evals/*.eval.json --junit reports/evals.xml  # JUnit XML for CI
 ```
 
-| Flag          | Description                                                                    |
-| ------------- | ------------------------------------------------------------------------------ |
-| `files`       | One or more eval spec files or glob patterns (positional, required).           |
-| `--case <s>`  | Only run cases whose name contains the substring `<s>`.                        |
-| `--fail-fast` | Stop at the first failing case.                                                |
-| `--json`      | Print a single JSON document (`{"specs": [...], "spec_errors": [...], "summary": {...}}`) to stdout. |
-| `--junit <p>` | Write a JUnit XML report to `<p>` in addition to the normal output.            |
+| Flag            | Description                                                                  |
+| --------------- | ------------------------------------------------------------------------------ |
+| `files`         | One or more eval spec files or glob patterns (positional, required).         |
+| `--case <s>`    | Only run cases whose name contains the substring `<s>`.                      |
+| `--fail-fast`   | Stop at the first failing case.                                              |
+| `--json [FILE]` | Emit a single JSON document (`{"specs": [...], "spec_errors": [...], "summary": {...}}`). Bare `--json` prints it to stdout instead of the human report; `--json FILE` writes it to `FILE` and keeps the human report on stdout. |
+| `--junit <p>`   | Write a JUnit XML report to `<p>` in addition to the normal output.          |
 
 Plus the shared connection flags: `--uri`, `--apikey`.
 
 **Exit codes:** `0` all cases passed, `1` at least one case failed or errored, or a spec could not run to completion, `2` usage error, spec parse/validation error, connection failure, or no case produced a result. All specs are validated before the CLI connects, so a broken spec means nothing runs.
 
-A spec that cannot be run at all — for example its pipeline fails to start — is reported in every output format, not just on stderr: `--json` lists it under `spec_errors` and counts it in `summary.spec_errors`, and `--junit` writes it as a one-test suite holding an errored `<testcase>`.
+A spec that cannot be run at all — for example its pipeline fails to start — is reported in every output format, not just on stderr: `--json` lists it under `spec_errors` and counts it in `summary.spec_errors`, and `--junit` writes it as a one-test suite holding an errored `<testcase>`. `--json FILE` and `--junit <p>` can be used together to upload both reports from one run.
 
 The full spec-file reference, the assertion table, and the LLM-as-judge notes are on the [CLI Reference](/cli) page.
 

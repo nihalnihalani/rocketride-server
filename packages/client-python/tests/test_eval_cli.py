@@ -333,6 +333,74 @@ class TestEvalCli:
         assert document['summary']['failed'] == 1
         assert len(document['specs']) == 1
 
+    async def test_json_file_writes_the_report_and_keeps_human_output(self, monkeypatch, capsys, tmp_path):
+        # The regression: `--json <file>` used to be a usage error (exit 2,
+        # nothing evaluated). It must now run the specs, write the document to
+        # the file, and leave the human report on stdout - exactly what
+        # `validate --json <file>` does.
+        report_path = tmp_path / 'report.json'
+        fake = FakeClient()
+
+        exit_code = await run_cli(monkeypatch, fake, [write_spec(tmp_path, SPEC_DOC), '--json', str(report_path)])
+
+        assert exit_code == 0
+        document = json.loads(report_path.read_text(encoding='utf-8'))
+        assert set(document.keys()) == {'specs', 'spec_errors', 'summary'}
+        assert document['summary'] == {'total_cases': 2, 'passed': 2, 'failed': 0, 'spec_errors': 0}
+        # ...and the human report still went to stdout
+        out = capsys.readouterr().out
+        assert 'greeting' in out
+        assert 'farewell' in out
+
+    async def test_json_file_exits_1_on_a_failing_case(self, monkeypatch, tmp_path):
+        # The exit code follows the results (0/1), never the old usage-error 2
+        document = json.loads(json.dumps(SPEC_DOC))
+        document['cases'][1]['expect'] = [{'type': 'contains', 'value': 'impossible-substring'}]
+        report_path = tmp_path / 'report.json'
+        fake = FakeClient()
+
+        exit_code = await run_cli(monkeypatch, fake, [write_spec(tmp_path, document), '--json', str(report_path)])
+
+        assert exit_code == 1
+        written = json.loads(report_path.read_text(encoding='utf-8'))
+        assert written['summary']['failed'] == 1
+        assert written['spec_errors'] == []
+
+    async def test_json_file_carries_spec_errors(self, monkeypatch, tmp_path):
+        # A spec that cannot run is in the written document too, so a CI
+        # artifact never shows a green run for a run that exited non-zero
+        document = json.loads(json.dumps(SPEC_DOC))
+        document['pipeline'] = 'broken.pipe'
+        write_spec(tmp_path, document, name='a-broken.eval.json')
+        write_spec(tmp_path, SPEC_DOC, name='b-good.eval.json')
+        report_path = tmp_path / 'report.json'
+        fake = FakeClient(use_error_for='broken.pipe')
+
+        exit_code = await run_cli(monkeypatch, fake, [str(tmp_path / '*.eval.json'), '--json', str(report_path)])
+
+        assert exit_code == 1
+        written = json.loads(report_path.read_text(encoding='utf-8'))
+        assert [entry['spec'] for entry in written['spec_errors']] == [str(tmp_path / 'a-broken.eval.json')]
+        assert written['summary']['spec_errors'] == 1
+
+    async def test_json_file_and_junit_are_written_together(self, monkeypatch, capsys, tmp_path, spec_file):
+        # Both machine reports, plus the human one on stdout; missing parent
+        # directories are created for each
+        report_path = tmp_path / 'reports' / 'evals.json'
+        junit_path = tmp_path / 'reports' / 'evals.xml'
+        fake = FakeClient()
+
+        exit_code = await run_cli(
+            monkeypatch,
+            fake,
+            [spec_file, '--json', str(report_path), '--junit', str(junit_path)],
+        )
+
+        assert exit_code == 0
+        assert json.loads(report_path.read_text(encoding='utf-8'))['summary']['passed'] == 2
+        assert '<testsuite' in junit_path.read_text(encoding='utf-8')
+        assert 'greeting' in capsys.readouterr().out
+
     async def test_clean_run_reports_no_spec_errors(self, monkeypatch, capsys, spec_file):
         # spec_errors is always present, so a consumer can read it without
         # having to probe for the key first
@@ -477,16 +545,30 @@ class TestEvalRegistration:
         assert names.count('eval') == 1
         assert names.count('validate') == 1
 
-    def test_eval_owns_its_own_boolean_json_flag(self):
-        # `eval --json` is a format flag, not the shared --json [FILE]
-        # envelope: bare --json must parse to True, and --json=<file> must be
-        # rejected rather than silently reinterpreted.
+    def test_eval_takes_the_shared_json_file_option(self):
+        # `eval --json` is the shared --json [FILE] option every other
+        # subcommand takes: bare --json means stdout ('-'), and both spellings
+        # of --json <file> name a destination file.
         parser = cli_main.setup_parser()
         args = parser.parse_args(['eval', 'a.eval.json', '--json'])
-        assert args.json is True
+        assert args.json == '-'
         assert args.uri is not None
-        with pytest.raises(SystemExit):
-            parser.parse_args(['eval', 'a.eval.json', '--json=out.json'])
+        assert parser.parse_args(['eval', 'a.eval.json', '--json=out.json']).json == 'out.json'
+
+    def test_json_file_argument_is_not_swallowed_by_the_files_positional(self):
+        # The regression: with a store_true --json, the space-separated
+        # `--json out.json` spelling was a usage error (argparse rejected the
+        # leftover as an unrecognized argument), and with the flag written
+        # first the report path was consumed as an eval spec instead.
+        parser = cli_main.setup_parser()
+
+        args = parser.parse_args(['eval', 'a.eval.json', '--json', 'out.json'])
+        assert args.json == 'out.json'
+        assert args.files == ['a.eval.json']
+
+        flag_first = parser.parse_args(['eval', '--json', 'out.json', 'a.eval.json'])
+        assert flag_first.json == 'out.json'
+        assert flag_first.files == ['a.eval.json']
 
     def test_validate_keeps_the_shared_json_file_option(self):
         # The upstream contract for `validate` must survive this merge.

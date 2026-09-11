@@ -332,6 +332,7 @@ rocketride eval evals/*.eval.json --case greeting --fail-fast
 
 # Machine-readable output / JUnit XML for CI
 rocketride eval evals/*.eval.json --json
+rocketride eval evals/*.eval.json --json reports/evals.json
 rocketride eval evals/*.eval.json --junit reports/evals.xml
 ```
 
@@ -342,7 +343,7 @@ Key flags:
 | `files` positional | One or more eval spec files or glob patterns. |
 | `--case <substring>` | Only run cases whose name contains the substring. |
 | `--fail-fast` | Stop at the first failing case. |
-| `--json` | Print one JSON document (`{"specs": [...], "spec_errors": [...], "summary": {...}}`) instead of human-readable text. |
+| `--json [FILE]` | Emit one JSON document (`{"specs": [...], "spec_errors": [...], "summary": {...}}`). Bare `--json` prints it to stdout instead of human-readable text; `--json FILE` writes it to `FILE` and keeps the human-readable text on stdout. |
 | `--junit <path>` | Write a JUnit XML report to `<path>` in addition to the normal output. |
 
 Exit codes (CI-friendly): `0` all cases passed, `1` at least one case failed or
@@ -355,7 +356,8 @@ A spec that cannot be run at all — for example its pipeline fails to start —
 reported in every output format, not just on stderr: `--json` lists it under
 `spec_errors` and counts it in `summary.spec_errors`, and `--junit` writes it as
 a one-test suite holding an errored `<testcase>`, so an uploaded report never
-shows a green run for a run that exited non-zero.
+shows a green run for a run that exited non-zero. `--json FILE` and
+`--junit <path>` can be used together to upload both reports from one run.
 
 **Spec format** — strict JSON; the `pipeline` and `judge_pipeline` paths are
 resolved relative to the spec file:
