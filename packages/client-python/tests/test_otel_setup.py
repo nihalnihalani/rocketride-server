@@ -27,7 +27,15 @@ Covers OTLP endpoint semantics (base URL + per-signal path appending, env var
 fallbacks), header pass-through, provider construction, the lazy-import
 guarantee (module import never requires the 'otel' extra, verified in a
 subprocess with opentelemetry blocked), and the gRPC-extra error path.
-Skipped gracefully when the optional 'otel' extra is absent.
+
+Both halves of the 'otel' extra — the SDK and the OTLP/HTTP exporter — are
+REQUIRED dependencies of this module and imported unconditionally. They are
+declared for the engine interpreter in packages/server/build-requirements.txt
+and for a source checkout by the 'dev'/'test' extras of
+packages/client-python/pyproject.toml. A missing dependency must fail
+collection here: the previous importorskip guards meant an environment
+carrying opentelemetry-api/sdk without the exporter (or neither) quietly
+dropped this file's coverage while CI stayed green.
 """
 
 import os
@@ -39,14 +47,12 @@ from typing import Dict, Optional
 
 import pytest
 
-pytest.importorskip('opentelemetry')
-pytest.importorskip('opentelemetry.sdk')
-# CI environments can carry opentelemetry-api/sdk as another package's
-# transitive dependency WITHOUT the OTLP exporter; these tests exercise the
-# exporter, so skip on the most specific module they need.
-pytest.importorskip('opentelemetry.exporter.otlp.proto.http')
-
-from rocketride.otelbridge.setup import (  # noqa: E402 - after importorskip by design
+# Imported for its side effect of proving the OTLP/HTTP exporter is installed:
+# the tests below reach it through rocketride.otelbridge.setup's lazy imports,
+# where an absent exporter surfaces as OtelNotInstalledError rather than as a
+# collection error naming the missing package.
+import opentelemetry.exporter.otlp.proto.http  # noqa: F401 - dependency assertion
+from rocketride.otelbridge.setup import (
     InsecureTransportError,
     OtelNotInstalledError,
     _build_metric_exporter,
@@ -269,6 +275,46 @@ def test_shutdown_shuts_down_meter_provider_even_when_tracer_shutdown_raises(mon
     with pytest.raises(RuntimeError, match='tracer shutdown boom'):
         shutdown()
     assert calls == ['tracer', 'meter']
+
+
+def test_build_providers_skips_the_tracer_half_when_not_requested(monkeypatch):
+    """with_tracer=False constructs no TracerProvider (hence no BatchSpanProcessor thread)."""
+    import opentelemetry.sdk.trace as trace_sdk
+
+    def _forbidden(*args, **kwargs):
+        raise AssertionError('TracerProvider must not be constructed when with_tracer=False')
+
+    monkeypatch.setattr(trace_sdk, 'TracerProvider', _forbidden)
+
+    config = BridgeConfigStub(endpoint='http://localhost:4318', no_metrics=True)
+    tracer, meter, shutdown = build_providers(config, with_tracer=False)
+    assert tracer is None
+    assert meter is not None
+    # shutdown must cope with the half that was never built.
+    shutdown()
+
+
+def test_build_providers_skips_the_meter_half_when_not_requested(monkeypatch):
+    """with_meter=False constructs neither a MeterProvider nor a metric exporter."""
+    import opentelemetry.sdk.metrics as metrics_sdk
+
+    import rocketride.otelbridge.setup as setup_module
+
+    def _forbidden_provider(*args, **kwargs):
+        raise AssertionError('MeterProvider must not be constructed when with_meter=False')
+
+    def _forbidden_exporter(config):
+        raise AssertionError('the metric exporter must not be built when with_meter=False')
+
+    monkeypatch.setattr(metrics_sdk, 'MeterProvider', _forbidden_provider)
+    monkeypatch.setattr(setup_module, '_build_metric_exporter', _forbidden_exporter)
+
+    # no_metrics=False, so the metric half would otherwise be fully built.
+    config = BridgeConfigStub(endpoint='http://localhost:4318', no_metrics=False)
+    tracer, meter, shutdown = build_providers(config, with_meter=False)
+    assert meter is None
+    assert hasattr(tracer, 'start_span')
+    shutdown()
 
 
 def test_build_providers_with_metrics_wires_a_periodic_reader(monkeypatch):

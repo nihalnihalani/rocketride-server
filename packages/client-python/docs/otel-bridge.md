@@ -371,6 +371,22 @@ tokens**, and is deliberately not exported as `gen_ai.usage.*`.
 - **Startup failure** (engine unreachable, subscribe rejected) prints a clean message to
   stderr and exits `2` so supervisors can tell "never started" from "was stopped".
 
+### Embedding the bridge
+
+`rocketride.otelbridge.run_bridge()` runs the same loop inside an application that owns
+its own event loop (pass `install_signal_handlers=False` when the application owns
+process signals). Two ownership rules matter there:
+
+- **The bridge builds only the halves you did not supply.** Pass `mapper_factory` and
+  it builds no `TracerProvider`; pass `metrics_factory` and it builds no
+  `MeterProvider`. Each provider carries a background export thread, so a half that is
+  built and never read is a leaked thread, not just wasted setup.
+- **Whatever the bridge builds, the bridge shuts down.** A `shutdown_fn` you supply is
+  *chained in front of* the providers' own shutdown, never substituted for it: yours
+  runs first, theirs runs in a `finally` so it still happens if yours raises (your
+  exception is logged to stderr and the bridge still exits `0`). Supplying
+  `shutdown_fn` therefore never orphans a provider the bridge created.
+
 ## Troubleshooting
 
 | Symptom                                                        | Cause / fix                                                                                                                                     |

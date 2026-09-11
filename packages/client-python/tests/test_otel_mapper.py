@@ -26,8 +26,14 @@ Unit tests for rocketride.otelbridge.mapper (FlowSpanMapper / MetricsMapper).
 Pure in-memory tests: monitor event bodies (from the live-captured fixture
 file and synthetic edge cases) are fed to the mappers and the resulting span
 forest / metric points are asserted via the OpenTelemetry SDK's in-memory
-exporters. Skipped gracefully when the optional 'otel' extra is absent (the
-base CI matrix does not install it).
+exporters.
+
+The OpenTelemetry SDK is a REQUIRED dependency of this module, imported
+unconditionally: it is declared for the engine interpreter in
+packages/server/build-requirements.txt and for a source checkout by the
+'dev'/'test' extras of packages/client-python/pyproject.toml. A missing SDK
+must fail collection here — an importorskip would let a dependency change
+silently drop this file's coverage while CI stayed green.
 """
 
 import json
@@ -35,10 +41,6 @@ import time
 from pathlib import Path
 
 import pytest
-
-pytest.importorskip('opentelemetry')
-pytest.importorskip('opentelemetry.sdk')
-
 from opentelemetry.sdk.metrics import MeterProvider
 from opentelemetry.sdk.metrics.export import InMemoryMetricReader
 from opentelemetry.sdk.trace import TracerProvider

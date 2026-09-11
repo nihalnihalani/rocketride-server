@@ -103,6 +103,27 @@ async def _wait_for_stop(stop_event: asyncio.Event, timeout: float) -> None:
         pass
 
 
+def _chain_shutdown(caller_shutdown: Callable[[], None], provider_shutdown: Callable[[], None]) -> Callable[[], None]:
+    """
+    Compose a caller-supplied shutdown with the bridge's own provider shutdown.
+
+    The caller runs first — it owns the exporters it brought and may want to
+    flush them before anything else stops — and ``provider_shutdown`` runs in
+    a ``finally`` so the providers built inside :func:`run_bridge` (and the
+    BatchSpanProcessor worker thread behind them) are torn down even when the
+    caller's shutdown raises. The caller's exception still propagates; the
+    bridge's exit path logs it.
+    """
+
+    def shutdown() -> None:
+        try:
+            caller_shutdown()
+        finally:
+            provider_shutdown()
+
+    return shutdown
+
+
 async def run_bridge(
     client: Any,
     config: OtelConfig,
@@ -140,8 +161,12 @@ async def run_bridge(
             when ``config.no_metrics`` is set; defaults to MetricsMapper
             on the real OTLP meter.
         shutdown_fn: Optional callable flushing/shutting down exporters at
-            exit. Defaults to the shutdown function returned by
-            ``build_providers`` when providers are built here.
+            exit. When providers are also built here (because a factory was
+            omitted), this callable is CHAINED in front of the providers'
+            own shutdown rather than replacing it — the caller's runs first,
+            the providers' runs in a ``finally`` — so the bridge never
+            orphans a provider it created. Defaults to the shutdown function
+            returned by ``build_providers``.
         stop_event: Optional externally controlled stop signal (used by
             tests); created internally when absent. SIGINT/SIGTERM set it.
         install_signal_handlers: When True (the CLI's case), SIGINT/SIGTERM
@@ -164,7 +189,9 @@ async def run_bridge(
            were never touched)
         2. Event dispatcher detached from the client
         3. ``mapper.close_all()`` — open spans are ended
-        4. ``shutdown_fn()`` — exporters flush pending telemetry
+        4. ``shutdown_fn()`` — exporters flush pending telemetry; when the
+           caller supplied one AND providers were built here, that is the
+           caller's callable followed by the providers' own shutdown
     """
     # ---------------------------------------------------------------------
     # Build mappers (and OTLP providers when no factories are injected)
@@ -182,9 +209,23 @@ async def run_bridge(
         from .mapper import FlowSpanMapper, MetricsMapper
         from .setup import build_providers
 
-        tracer, meter, provider_shutdown = build_providers(config)
+        # Build only the half that is missing. A TracerProvider starts a
+        # BatchSpanProcessor worker thread and a MeterProvider a periodic
+        # export thread, so building the half the caller already supplied
+        # would wire up a provider nothing ever reads and leak its thread.
+        tracer, meter, provider_shutdown = build_providers(
+            config,
+            with_tracer=needs_tracer,
+            with_meter=needs_meter,
+        )
+        # Whatever was built here has to be shut down here, whether or not
+        # the caller brought its own shutdown: adopting provider_shutdown
+        # only when shutdown_fn was None used to orphan these providers (and
+        # their export threads) for every embedder that passed one.
         if shutdown_fn is None:
             shutdown_fn = provider_shutdown
+        else:
+            shutdown_fn = _chain_shutdown(shutdown_fn, provider_shutdown)
         if needs_tracer:
             mapper = FlowSpanMapper(tracer, include_content=config.include_content)
         if needs_meter:

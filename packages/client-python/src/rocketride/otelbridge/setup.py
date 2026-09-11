@@ -209,19 +209,33 @@ def _build_metric_exporter(config: Any) -> Any:
     return OTLPMetricExporter(headers=headers, **extra)
 
 
-def build_providers(config: Any) -> Tuple[Any, Any, Callable[[], None]]:
+def build_providers(
+    config: Any,
+    *,
+    with_tracer: bool = True,
+    with_meter: bool = True,
+) -> Tuple[Any, Any, Callable[[], None]]:
     """
     Build (tracer, meter, shutdown_fn) from an OtelConfig.
 
     The providers are kept local (the global OpenTelemetry tracer/meter
     providers are never touched) so tests and embedders stay isolated.
-    ``shutdown_fn`` flushes and shuts down both providers; call it once on
-    exit (SIGINT/SIGTERM handling lives in the bridge loop).
+    ``shutdown_fn`` flushes and shuts down whichever providers were built;
+    call it once on exit (SIGINT/SIGTERM handling lives in the bridge loop).
 
     Args:
         config: An object with ``endpoint``, ``protocol``, ``service_name``,
             ``include_content``, ``no_metrics`` and ``headers`` attributes
             (see ``rocketride.otelbridge.config.OtelConfig``).
+        with_tracer: Build the trace half. Pass False when the caller already
+            has a span mapper: a TracerProvider is not free — it starts a
+            BatchSpanProcessor worker thread — so building one only to
+            discard it leaks that thread for the life of the process.
+            ``tracer`` is None in the returned tuple.
+        with_meter: Build the metric half (subject to ``config.no_metrics``,
+            which still degrades it to a reader-less MeterProvider). Pass
+            False when the caller already has a metrics mapper; ``meter`` is
+            None in the returned tuple.
 
     Raises:
         OtelNotInstalledError: The 'otel' extra (or the gRPC exporter for
@@ -232,6 +246,10 @@ def build_providers(config: Any) -> Tuple[Any, Any, Callable[[], None]]:
     """
     # Fail before anything is constructed: no exporter, no worker thread and
     # no credential on the wire until the transport is known to be safe.
+    # Checked for both signals regardless of which halves are built here —
+    # the endpoint and headers are the same either way, so a config that is
+    # unsafe to export with must not become acceptable just because the
+    # caller brought its own mapper.
     validate_transport_security(config)
 
     try:
@@ -244,38 +262,47 @@ def build_providers(config: Any) -> Tuple[Any, Any, Callable[[], None]]:
 
     resource = _build_resource(config)
 
-    tracer_provider = TracerProvider(resource=resource)
-    tracer_provider.add_span_processor(BatchSpanProcessor(_build_span_exporter(config)))
-    tracer = tracer_provider.get_tracer(SCOPE_NAME)
+    tracer = None
+    tracer_provider = None
+    if with_tracer:
+        tracer_provider = TracerProvider(resource=resource)
+        tracer_provider.add_span_processor(BatchSpanProcessor(_build_span_exporter(config)))
+        tracer = tracer_provider.get_tracer(SCOPE_NAME)
 
     # From here on the BatchSpanProcessor worker thread is running, and the
     # caller has no handle to stop it until this function returns `shutdown`.
     # Any failure while building the metric half (a missing gRPC exporter, a
     # rejected endpoint) must therefore take the tracer provider down with it
     # rather than leak the thread behind a "startup failed" message.
+    meter = None
+    meter_provider = None
     try:
-        if getattr(config, 'no_metrics', False):
-            meter_provider = MeterProvider(resource=resource, metric_readers=[])
-        else:
-            reader = PeriodicExportingMetricReader(_build_metric_exporter(config))
-            meter_provider = MeterProvider(resource=resource, metric_readers=[reader])
-        meter = meter_provider.get_meter(SCOPE_NAME)
+        if with_meter:
+            if getattr(config, 'no_metrics', False):
+                meter_provider = MeterProvider(resource=resource, metric_readers=[])
+            else:
+                reader = PeriodicExportingMetricReader(_build_metric_exporter(config))
+                meter_provider = MeterProvider(resource=resource, metric_readers=[reader])
+            meter = meter_provider.get_meter(SCOPE_NAME)
     except BaseException:
-        try:
-            tracer_provider.shutdown()
-        except Exception as exc:  # noqa: BLE001 - cleanup must not mask the original error
-            logger.debug('tracer provider shutdown failed while unwinding metric setup: %s', exc)
+        if tracer_provider is not None:
+            try:
+                tracer_provider.shutdown()
+            except Exception as exc:  # noqa: BLE001 - cleanup must not mask the original error
+                logger.debug('tracer provider shutdown failed while unwinding metric setup: %s', exc)
         raise
 
     def shutdown() -> None:
-        """Flush pending telemetry and shut down both providers.
+        """Flush pending telemetry and shut down the providers that were built.
 
         try/finally: a tracer-provider shutdown failure (e.g. an exporter
         raising during the final flush) must not lose the metrics flush.
         """
         try:
-            tracer_provider.shutdown()
+            if tracer_provider is not None:
+                tracer_provider.shutdown()
         finally:
-            meter_provider.shutdown()
+            if meter_provider is not None:
+                meter_provider.shutdown()
 
     return tracer, meter, shutdown

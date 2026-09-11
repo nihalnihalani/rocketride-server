@@ -11,3 +11,15 @@ mcp>=1.2.0
 huggingface_hub[hf_xet]
 pydantic
 cryptography
+# OpenTelemetry SDK + OTLP/HTTP exporter: the client-python otel-bridge tests
+# (tests/test_otel_mapper.py, tests/test_otel_setup.py) import them directly.
+# They were reaching the engine only as a transitive dependency of the crewai
+# node, so dropping or repinning that node would have turned 1400+ lines of
+# bridge coverage into a silent no-op. Declared here because this is the only
+# install step the engine interpreter that runs client-python's pytest goes
+# through — the package's own [otel] extra is never pip-installed by CI.
+# The floors match the package's [otel] extra (packages/client-python/
+# pyproject.toml); the resolved versions come from the constraints, as with
+# everything else in this file.
+opentelemetry-sdk>=1.27.0
+opentelemetry-exporter-otlp-proto-http>=1.27.0

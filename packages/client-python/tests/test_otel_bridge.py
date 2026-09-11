@@ -36,6 +36,8 @@ Covered here:
     - Startup connection / subscription failure -> exit code 2
     - Reconnect loop with capped backoff (no hand-rolled resubscription)
     - Shutdown order: close_all() before exporter shutdown_fn()
+    - Provider ownership: only the missing half is built, and providers built
+      here are shut down even when the caller supplies its own shutdown_fn
     - --no-metrics: metrics factory never invoked, status events dropped
     - Dispatcher isolation: a raising mapper does not kill the bridge
     - Replay of the recorded wire fixture (tests/fixtures/otel_bridge_events.json)
@@ -596,3 +598,161 @@ class TestSignalOwnership:
         stop_event.set()
         assert await task == 0
         assert dict(getattr(loop, '_signal_handlers', {})) == before
+
+
+# =========================================================================
+# PROVIDER OWNERSHIP
+# =========================================================================
+
+
+class _StubTracer:
+    """Stand-in for the SDK tracer build_providers would return."""
+
+
+class _StubMeter:
+    """Stand-in for the SDK meter build_providers would return."""
+
+
+def _stub_provider_build(monkeypatch, build_calls, provider_shutdown):
+    """
+    Stub the provider/mapper construction run_bridge performs internally.
+
+    ``run_bridge`` resolves ``build_providers``, ``FlowSpanMapper`` and
+    ``MetricsMapper`` from their modules at call time (lazy imports), so
+    replacing the module attributes is enough to exercise that branch — this
+    module stays runnable without the 'otel' extra, as its docstring promises.
+    """
+    import rocketride.otelbridge.mapper as mapper_module
+    import rocketride.otelbridge.setup as setup_module
+
+    def fake_build_providers(config, *, with_tracer=True, with_meter=True):
+        build_calls.append({'with_tracer': with_tracer, 'with_meter': with_meter})
+        return (
+            _StubTracer() if with_tracer else None,
+            _StubMeter() if with_meter else None,
+            provider_shutdown,
+        )
+
+    monkeypatch.setattr(setup_module, 'build_providers', fake_build_providers)
+    monkeypatch.setattr(mapper_module, 'FlowSpanMapper', lambda tracer, **kwargs: FakeMapper())
+    monkeypatch.setattr(mapper_module, 'MetricsMapper', lambda meter: FakeMetrics())
+
+
+async def _run_until_subscribed(client, config=None, **kwargs):
+    """Run run_bridge to steady state, then stop it; returns its exit code."""
+    stop_event = asyncio.Event()
+    task = asyncio.ensure_future(
+        run_bridge(
+            client,
+            config or OtelConfig(),
+            stop_event=stop_event,
+            poll_interval=0.01,
+            **kwargs,
+        )
+    )
+    await _wait_until(lambda: client.monitor_calls)
+    stop_event.set()
+    return await task
+
+
+class TestProviderOwnership:
+    """
+    Providers built inside run_bridge must be built only when needed, and
+    always shut down — including when the caller brings its own shutdown_fn.
+    """
+
+    async def test_caller_shutdown_fn_does_not_orphan_the_providers(self, monkeypatch):
+        """The regression: a caller-supplied shutdown_fn used to REPLACE the providers'."""
+        order = []
+        _stub_provider_build(monkeypatch, [], lambda: order.append('provider'))
+
+        code = await _run_until_subscribed(
+            FakeClient(connected=True),
+            # No mapper_factory -> run_bridge builds the trace half itself.
+            metrics_factory=lambda: FakeMetrics(),
+            shutdown_fn=lambda: order.append('caller'),
+        )
+
+        assert code == 0
+        # Caller first (it may want to flush what it owns), providers after.
+        assert order == ['caller', 'provider']
+
+    async def test_provider_shutdown_runs_when_caller_shutdown_raises(self, monkeypatch, capsys):
+        """try/finally: a raising caller must not strand the bridge's own providers."""
+        order = []
+        _stub_provider_build(monkeypatch, [], lambda: order.append('provider'))
+
+        def exploding_shutdown():
+            order.append('caller')
+            raise RuntimeError('caller shutdown boom')
+
+        code = await _run_until_subscribed(
+            FakeClient(connected=True),
+            metrics_factory=lambda: FakeMetrics(),
+            shutdown_fn=exploding_shutdown,
+        )
+
+        assert code == 0
+        assert order == ['caller', 'provider']
+        # The caller's failure is reported, not swallowed silently.
+        assert 'caller shutdown boom' in capsys.readouterr().err
+
+    async def test_provider_shutdown_is_adopted_when_no_caller_shutdown(self, monkeypatch):
+        order = []
+        _stub_provider_build(monkeypatch, [], lambda: order.append('provider'))
+
+        code = await _run_until_subscribed(
+            FakeClient(connected=True),
+            metrics_factory=lambda: FakeMetrics(),
+        )
+
+        assert code == 0
+        assert order == ['provider']
+
+    async def test_only_the_metric_half_is_built_when_a_span_mapper_is_supplied(self, monkeypatch):
+        """A supplied mapper_factory must not cost a TracerProvider + export thread."""
+        build_calls = []
+        _stub_provider_build(monkeypatch, build_calls, lambda: None)
+
+        code = await _run_until_subscribed(
+            FakeClient(connected=True),
+            mapper_factory=lambda: FakeMapper(),
+        )
+
+        assert code == 0
+        assert build_calls == [{'with_tracer': False, 'with_meter': True}]
+
+    async def test_only_the_trace_half_is_built_when_a_metrics_mapper_is_supplied(self, monkeypatch):
+        build_calls = []
+        _stub_provider_build(monkeypatch, build_calls, lambda: None)
+
+        code = await _run_until_subscribed(
+            FakeClient(connected=True),
+            metrics_factory=lambda: FakeMetrics(),
+        )
+
+        assert code == 0
+        assert build_calls == [{'with_tracer': True, 'with_meter': False}]
+
+    async def test_no_metrics_builds_the_trace_half_only(self, monkeypatch):
+        """--no-metrics: nothing needs a meter, so none is requested."""
+        build_calls = []
+        _stub_provider_build(monkeypatch, build_calls, lambda: None)
+
+        code = await _run_until_subscribed(FakeClient(connected=True), config=OtelConfig(no_metrics=True))
+
+        assert code == 0
+        assert build_calls == [{'with_tracer': True, 'with_meter': False}]
+
+    async def test_both_factories_supplied_builds_no_providers(self, monkeypatch):
+        build_calls = []
+        _stub_provider_build(monkeypatch, build_calls, lambda: None)
+
+        code = await _run_until_subscribed(
+            FakeClient(connected=True),
+            mapper_factory=lambda: FakeMapper(),
+            metrics_factory=lambda: FakeMetrics(),
+        )
+
+        assert code == 0
+        assert build_calls == []
