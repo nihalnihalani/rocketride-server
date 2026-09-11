@@ -596,10 +596,25 @@ def _md_cell(text: str) -> str:
     renders it verbatim. A literal newline ends the row, so it is folded to a
     space.
 
-    Backslashes are deliberately **not** doubled. Inside a code span the inline
-    parser performs no backslash unescaping, so doubling them was emitted
-    verbatim: ``C:\\Users\\alice`` rendered as ``C:\\\\Users\\\\alice``. Only the
-    ``\\|`` sequence is special to the table parser, and it is added here.
+    **Exactly one backslash is added per pipe, whatever already precedes it** --
+    a backslash sitting immediately before a pipe is not a special case. In
+    cmark-gfm, the parser GitHub runs, the table-cell scanner accepts either a
+    lone backslash or a backslash-escaped punctuation pair and takes the longest
+    match, so a run of *n* backslashes before a pipe always parses as *n - 1*
+    lone backslashes followed by the escaped pair ``\\|``. For every *n* >= 1 the
+    pipe is escaped and the row does **not** split; unescaping then strips that
+    one backslash and leaves *n - 1* for the code span to print verbatim. So the
+    value ``\\|`` is emitted as ``\\\\|`` and renders back as ``\\|``. Doubling
+    the run as well (emitting ``\\\\\\|``) would still not split the row -- it
+    would render a spurious extra backslash.
+
+    Backslashes not adjacent to a pipe are deliberately **not** touched. Inside a
+    code span the inline parser performs no backslash unescaping, so doubling them
+    was emitted verbatim: ``C:\\Users\\alice`` rendered as ``C:\\\\Users\\\\alice``.
+
+    ``test_pipediff_reporters.py`` pins both halves of this: the exact bytes this
+    function emits, and -- when ``cmarkgfm`` is installed -- that GFM renders each
+    of them back to the original value in a row that keeps its column count.
 
     This function assumes code-span input; plain text with backslashes would need
     a different escape, and no caller passes any.

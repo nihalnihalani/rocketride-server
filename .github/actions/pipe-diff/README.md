@@ -92,6 +92,7 @@ repository dogfoods the action:
 | `changed-files`        | Number of changed `.pipe` files considered (added or modified vs the PR base). |
 | `has-semantic-changes` | `true` when at least one changed `.pipe` file has semantic changes, else `false`. |
 | `comment-body-file`    | Path to the generated Markdown comment body (useful for debugging or reuse). |
+| `head-missing`         | `true` when the run could not see the pull-request head commit — a `pull_request_target` job checks out the base branch — so nothing it computed describes the pull request and the comment step was skipped; `false` otherwise. Treat the other outputs as meaningless while this is `true`. See [Fork pull requests](#fork-pull-requests). |
 
 ## Permissions
 
@@ -118,8 +119,18 @@ writes. Your options, in order of preference:
    runs on `pull_request` **and** `pull_request_target`, and the base commit
    comes from the same `github.event.pull_request.base.sha` under both. But the
    action diffs the checked-out tree, and under `pull_request_target`
-   `actions/checkout` lands on the base branch, so the run reports "no `.pipe`
-   files changed" and warns that the PR head is not in the checkout.
+   `actions/checkout` lands on the base branch — the PR head is not in it, so
+   there is nothing to diff the base against.
+
+   The action detects that and refuses to guess. It sets the
+   [`head-missing`](#outputs) output to `true`, reports in the job summary that
+   the head was not visible, and **skips the comment step entirely**. It never
+   claims "no `.pipe` files changed" on the strength of a checkout that could
+   not have contained them, and — because it stays silent rather than posting —
+   it can never overwrite a sticky comment that an earlier `pull_request` run
+   filled with a real diff. If the base branch has moved past the PR base
+   commit, the summary still carries a diff, but labelled as a diff of the
+   **base branch**, not of the pull request.
 
    Do **not** fix that by checking out the PR head: the job holds a writable
    token and the base repository's secrets, and this action runs `python -m pip`
@@ -136,12 +147,15 @@ writes. Your options, in order of preference:
   carry the `pull_request` payload it needs for the base commit and the PR
   number. On any other event there is no base to diff against, so it emits a
   `warning` and skips. Under `pull_request_target` the checkout is the base
-  branch, so the action finds no changes and warns — see
-  [Fork pull requests](#fork-pull-requests).
+  branch, so the PR head is missing: the action sets `head-missing: true`, says
+  so in the report, and skips commenting rather than reporting a non-result as
+  a result — see [Fork pull requests](#fork-pull-requests).
 - **Sticky comment.** The action maintains exactly one comment per PR, found via
   a hidden HTML marker (`<!-- rocketride-pipe-diff -->`) **and** an author check
   for `github-actions[bot]`, so a human comment quoting the marker is never
   overwritten. Re-runs update that comment in place instead of stacking new ones.
+  A run that could not see the PR head (`head-missing: true`) does not comment
+  at all, so it cannot replace a real diff with a "nothing changed" claim.
 - **Job summary.** Every run appends the same report to `$GITHUB_STEP_SUMMARY`,
   so the diff is visible even when commenting is disabled or refused.
 - **Layout noise is hidden by default.** A change that only moves nodes on the

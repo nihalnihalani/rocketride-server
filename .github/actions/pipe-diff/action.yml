@@ -86,8 +86,9 @@ inputs:
       event — where the default GITHUB_TOKEN is read-only and commenting is
       refused with 403 — still surfaces the report. Commenting is attempted on
       "pull_request" and "pull_request_target" events; "pull_request_target"
-      gets a writable token but must not check out the PR head — see the README,
-      'Fork pull requests'.
+      gets a writable token but must not check out the PR head, so when the head
+      is not in the checkout the comment is skipped and "head-missing" is "true"
+      — see the README, 'Fork pull requests'.
     required: false
     default: 'true'
   include-layout:
@@ -109,6 +110,14 @@ outputs:
   comment-body-file:
     description: Path to the generated Markdown comment body (useful for debugging or reuse).
     value: ${{ steps.diff.outputs.comment-body-file }}
+  head-missing:
+    description: >-
+      Set to "true" when this run could not see the pull-request head commit —
+      a pull_request_target job checks out the base branch — so nothing it
+      computed describes the pull request, and the sticky comment is skipped.
+      Otherwise "false". Do not read the other outputs as facts about the pull
+      request while this is "true". See the README, 'Fork pull requests'.
+    value: ${{ steps.diff.outputs.head-missing }}
 
 runs:
   using: composite
@@ -190,6 +199,13 @@ runs:
         body_file="${RUNNER_TEMP:-/tmp}/rocketride-pipe-diff-comment.md"
         : > "${body_file}"
 
+        # "true" once the head-visibility check below finds that this run cannot
+        # see the PR head (the pull_request_target case). Declared here, above
+        # `emit_outputs` and above the two early returns that precede the check,
+        # so every exit reports the flag and none can trip over an unset
+        # variable under `set -u`.
+        head_missing=false
+
         # Longest run of backticks in $1, printed as a delimiter one backtick
         # longer (at least $2). CommonMark closes a code span or fence only on a
         # run of *exactly* the opening length (span) or at least it (fence), so a
@@ -266,6 +282,8 @@ runs:
         }
 
         # Emit step outputs in one place so every early return stays consistent.
+        # `head-missing` is read from the global rather than passed in, so every
+        # existing call site reports it without having to know about it.
         emit_outputs() {
           write_job_summary
           {
@@ -273,6 +291,7 @@ runs:
             echo "has-semantic-changes=${2}"
             echo "pipe-files-changed=${3}"
             echo "errored=${4}"
+            echo "head-missing=${head_missing}"
             echo "comment-body-file=${body_file}"
           } >> "${GITHUB_OUTPUT}"
         }
@@ -326,10 +345,17 @@ runs:
         # NOTE: a GitHub expression (dollar, brace, brace) must never appear
         # anywhere in this run block, comments included -- Actions substitutes
         # them textually before bash ever runs. Hence the env vars above.
+        # A job-log warning is easy to miss, and it is not the artefact a
+        # reviewer reads. So this also raises `head_missing`, which (a) replaces
+        # the "no .pipe files changed" report with one that says the head was
+        # not visible, and (b) is published as the `head-missing` step output
+        # that gates the comment step off entirely -- a run that cannot see the
+        # head must never rewrite a sticky comment holding a real diff.
         if [ "${EVENT_NAME}" = "pull_request_target" ] && [ -n "${HEAD_SHA}" ]; then
           head_now="$(git rev-parse HEAD 2>/dev/null || true)"
           if [ "${head_now}" != "${HEAD_SHA}" ] \
              && ! git merge-base --is-ancestor "${HEAD_SHA}" HEAD 2>/dev/null; then
+            head_missing=true
             echo "::warning::The PR head commit ${HEAD_SHA} is not in this checkout, so this pull_request_target run compares the base branch with itself and finds no changes. Checking out pull-request code in a pull_request_target job is unsafe; run this action on the pull_request event (the report is in the job summary) or post the comment from a workflow_run job. See the README, 'Fork pull requests'."
           fi
         fi
@@ -350,9 +376,31 @@ runs:
         changed_count="${#changed_files[@]}"
         deleted_count="${#deleted_files[@]}"
 
-        # Nothing to report: emit an empty (marker-only) body. The comment step
-        # will refresh an existing sticky comment but will NOT create a new one.
+        # Nothing to report. Two very different reasons land here, and they must
+        # not share a body: finding no changed files because there are none, and
+        # finding none because the PR head is not in the checkout. The second is
+        # not evidence of anything about the pull request, so it must never be
+        # reported as "No `.pipe` files changed" -- and because the comment step
+        # refreshes an existing sticky comment whatever `pipe-files-changed`
+        # says, that false body would overwrite a real diff. The `head-missing`
+        # output keeps the comment step from running at all in that case; the
+        # body below is what the job summary shows instead.
+        #
+        # In the genuine no-changes case the behaviour is unchanged: the comment
+        # step refreshes an existing sticky comment but will NOT create a new one.
         if [ "${changed_count}" -eq 0 ] && [ "${deleted_count}" -eq 0 ]; then
+          if [ "${head_missing}" = "true" ]; then
+            echo "The PR head is not in this checkout; no conclusion about .pipe files is possible."
+            {
+              printf '%s\n' "${marker}"
+              printf '## RocketRide pipeline diff\n\n'
+              printf '> [!WARNING]\n'
+              printf '> This run could not see the pull-request head commit %s, so **no diff was computed**. This is NOT a report that no `.pipe` files changed -- it is a report that nothing could be compared.\n\n' "$(md_code "${HEAD_SHA}")"
+              printf 'A `pull_request_target` job checks out the base branch, and it must not check out pull-request code. Run this action on the `pull_request` event, or post the comment from a `workflow_run` job -- see the README, "Fork pull requests".\n'
+            } > "${body_file}"
+            emit_outputs 0 false false false
+            exit 0
+          fi
           echo "No changed .pipe files versus the base."
           {
             printf '%s\n' "${marker}"
@@ -452,6 +500,15 @@ runs:
         {
           printf '%s\n' "${marker}"
           printf '## RocketRide pipeline diff\n\n'
+          # Reaching here with head_missing=true means the checked-out base
+          # branch has moved past BASE_SHA, so the sections below describe
+          # commits merged into the base -- not this pull request. Say so, at
+          # the top, before anything a reader would mistake for the PR's diff.
+          # The guard makes this emit nothing at all on every other path.
+          if [ "${head_missing}" = "true" ]; then
+            printf '> [!WARNING]\n'
+            printf '> This run could not see the pull-request head commit %s, so what follows is a diff of the checked-out **base branch**, not of this pull request -- see the README, "Fork pull requests".\n\n' "$(md_code "${HEAD_SHA}")"
+          fi
           printf '%s\n\n' "${summary}"
           cat "${sections_file}"
           printf -- '---\n'
@@ -466,8 +523,17 @@ runs:
       # excluding it here meant that option produced no comment at all. Its
       # payload carries `pull_request`, so `context.issue.number` below resolves
       # the same way it does for `pull_request`.
+      #
+      # `head-missing` gates the whole step off. This run learned nothing about
+      # the pull request, and the step below refreshes an existing sticky
+      # comment unconditionally -- so without this gate a pull_request_target
+      # run would overwrite a real diff posted by an earlier pull_request run.
+      # Staying silent cannot destroy a correct comment; the report (which says
+      # the head was not visible) is still in the job summary and in
+      # `comment-body-file`.
       if: >-
         ${{ inputs.comment == 'true'
+        && steps.diff.outputs.head-missing != 'true'
         && (github.event_name == 'pull_request'
         || github.event_name == 'pull_request_target') }}
       uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7

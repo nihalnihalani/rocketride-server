@@ -37,11 +37,21 @@ Coverage:
     - deterministic ordering independent of engine emission order
 """
 
+import html as html_mod
 import json
+import re
 import unittest
+from typing import Optional, Tuple
 
 from rocketride.pipediff import EdgeChange, FieldChange, NodeChange, PipeDiff
-from rocketride.pipediff.reporters import render_human, render_json, render_markdown
+from rocketride.pipediff.reporters import _md_cell, render_human, render_json, render_markdown
+
+try:  # pragma: no cover - the cross-check is skipped when the renderer is absent
+    import cmarkgfm
+    from cmarkgfm.cmark import Options as CmarkOptions
+except ImportError:  # pragma: no cover
+    cmarkgfm = None
+    CmarkOptions = None
 
 
 def _mixed_diff() -> PipeDiff:
@@ -68,6 +78,23 @@ def _mixed_diff() -> PipeDiff:
         version_change=(3, 4),
         layout_changed=False,
     )
+
+
+def _render_gfm_row(table_markdown: str) -> Tuple[int, Optional[str]]:
+    """
+    Render a one-row GFM table and report ``(cell count, first code-span text)``.
+
+    ``cmarkgfm`` wraps the same cmark-gfm that GitHub renders Markdown with, so
+    this answers "what does a reviewer actually see" rather than reasoning about
+    the parser. GFM discards excess cells, so a split row keeps its column
+    count; what exposes a split is the last cell -- the value's code span is
+    then truncated or gone, so the code-span text no longer equals the value.
+    """
+    html = cmarkgfm.github_flavored_markdown_to_html(table_markdown, options=CmarkOptions.CMARK_OPT_UNSAFE)
+    body = re.search(r'<tbody>(.*?)</tbody>', html, re.S)
+    cells = re.findall(r'<td[^>]*>(.*?)</td>', body.group(1) if body else '', re.S)
+    code = re.search(r'<code>(.*?)</code>', cells[-1], re.S) if cells else None
+    return len(cells), (html_mod.unescape(code.group(1)) if code else None)
 
 
 def _table_body_rows(markdown: str) -> list:
@@ -386,6 +413,12 @@ class TestRenderMarkdown(unittest.TestCase):
         double them and ``C:\\Users\\alice`` rendered as ``C:\\\\Users\\\\alice``.
         Only ``\\|`` is meaningful to GitHub's table parser, and that escape
         stays.
+
+        A backslash sitting immediately before a pipe is **not** a special case:
+        the value ``\\d+\\|x`` is emitted as ``\\d+\\\\|x``, one added backslash
+        and no more. See
+        :meth:`test_md_cell_adds_exactly_one_backslash_per_pipe` for the full
+        matrix and the cmark-gfm round-trip that pins why.
         """
         windows_path = r'C:\Users\alice'
         regex_value = r'\d+\|x'
@@ -415,6 +448,62 @@ class TestRenderMarkdown(unittest.TestCase):
         for row in rows:
             # Pipes from the values are escaped, so only the 4 delimiters remain.
             self.assertEqual(row.replace('\\|', '').count('|'), 4, row)
+
+    def test_md_cell_adds_exactly_one_backslash_per_pipe(self) -> None:
+        """
+        Pin the exact bytes ``_md_cell`` emits, including backslash-before-pipe.
+
+        cmark-gfm's table-cell scanner accepts either a lone backslash or a
+        backslash-escaped punctuation pair and takes the longest match, so a run
+        of *n* backslashes before a pipe parses as *n - 1* lone backslashes plus
+        the escaped pair ``\\|``: the pipe is escaped for every *n* >= 1 and the
+        row never splits. Unescaping strips exactly that one backslash. Adding
+        one is therefore both necessary and sufficient — doubling the run would
+        render a spurious extra backslash rather than protect anything.
+        """
+        cases = [
+            # (value, exact text _md_cell must emit)
+            (r'C:\Users\alice', r'C:\Users\alice'),  # no pipe -> untouched
+            ('a|b', r'a\|b'),
+            (r'a\|b', r'a\\|b'),
+            (r'a\\|b', r'a\\\|b'),
+            (r'\d+\|x', r'\d+\\|x'),
+            ('a||b', r'a\|\|b'),
+            ('trailing-backslash\\', 'trailing-backslash\\'),  # no pipe -> untouched
+            ('a\nb', 'a b'),
+            ('a\nb|c', r'a b\|c'),
+        ]
+        for value, expected in cases:
+            with self.subTest(value=value):
+                self.assertEqual(_md_cell(value), expected)
+
+    @unittest.skipIf(cmarkgfm is None, 'cmarkgfm is not installed')
+    def test_gfm_renders_escaped_cells_back_to_the_original_value(self) -> None:
+        """
+        Render the escaped cells through GFM and check what a reader actually sees.
+
+        This is the test that decides the backslash question rather than arguing
+        it: for each value, the emitted row must keep its three columns and the
+        code span must contain the original value, byte for byte.
+        """
+        values = [
+            r'C:\Users\alice',
+            'a|b',
+            r'a\|b',
+            r'a\\|b',
+            r'\d+\|x',
+            'a||b',
+            'trailing-backslash\\',
+            r'^\d{2}\|(a|b)$',
+        ]
+        for value in values:
+            with self.subTest(value=value):
+                row = f'| n1 | `config.v` | `{_md_cell(value)}` |'
+                table = '| Node | Field | Change |\n| --- | --- | --- |\n' + row + '\n'
+                cells, code = _render_gfm_row(table)
+                self.assertEqual(cells, 3, f'unexpected column count: {row!r}')
+                self.assertIsNotNone(code, f'row split by GFM (code span truncated): {row!r}')
+                self.assertEqual(code, value, f'rendered cell differs from the value: {row!r}')
 
     def test_table_cell_neutralizes_newlines_without_touching_backslashes(self) -> None:
         """A newline in a value must not break the row, and must not cost a backslash."""
