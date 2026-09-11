@@ -30,8 +30,9 @@ subprocess with opentelemetry blocked), and the gRPC-extra error path.
 
 Both halves of the 'otel' extra — the SDK and the OTLP/HTTP exporter — are
 REQUIRED dependencies of this module and imported unconditionally. They are
-declared for the engine interpreter in packages/server/build-requirements.txt
-and for a source checkout by the 'dev'/'test' extras of
+declared in tests/requirements.txt, which the client-python:setup-test-deps
+build step installs into the engine interpreter before this suite runs, and for
+a source checkout by the 'dev'/'test' extras of
 packages/client-python/pyproject.toml. A missing dependency must fail
 collection here: the previous importorskip guards meant an environment
 carrying opentelemetry-api/sdk without the exporter (or neither) quietly

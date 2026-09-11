@@ -29,11 +29,12 @@ forest / metric points are asserted via the OpenTelemetry SDK's in-memory
 exporters.
 
 The OpenTelemetry SDK is a REQUIRED dependency of this module, imported
-unconditionally: it is declared for the engine interpreter in
-packages/server/build-requirements.txt and for a source checkout by the
-'dev'/'test' extras of packages/client-python/pyproject.toml. A missing SDK
-must fail collection here — an importorskip would let a dependency change
-silently drop this file's coverage while CI stayed green.
+unconditionally: it is declared in tests/requirements.txt, which the
+client-python:setup-test-deps build step installs into the engine interpreter
+before this suite runs, and for a source checkout by the 'dev'/'test' extras of
+packages/client-python/pyproject.toml. A missing SDK must fail collection
+here — an importorskip would let a dependency change silently drop this file's
+coverage while CI stayed green.
 """
 
 import json

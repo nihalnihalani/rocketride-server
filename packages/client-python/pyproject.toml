@@ -52,7 +52,8 @@ license = "MIT"
 # tests/test_otel_mapper.py and tests/test_otel_setup.py import opentelemetry
 # unconditionally, so an environment that can run the suite must carry it.
 # (CI installs neither extra — it runs pytest on the engine interpreter, which
-# gets these through packages/server/build-requirements.txt.)
+# gets these from tests/requirements.txt via the client-python:setup-test-deps
+# build step.)
 dev = [
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
