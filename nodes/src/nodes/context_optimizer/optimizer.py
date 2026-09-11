@@ -27,6 +27,14 @@ Manages context window budgets by counting tokens, allocating budgets across
 components (system prompt, query, documents, history), and truncating or
 summarizing content to fit within model limits.
 
+Only those four components are budgeted and trimmed. A rendered prompt carries
+more than that -- the question's instructions, examples, context and goals, and
+the section markup ``Question.getPrompt()`` wraps everything in -- so
+:meth:`ContextOptimizer.optimize` takes that part as an ``overhead_tokens``
+figure, counts it towards the window, and carves the per-component budgets out
+of what is left. The node measures it (see ``IInstance``); a direct caller that
+passes nothing gets the old, four-field-only accounting.
+
 Token counting uses ``tiktoken``. Note that tiktoken downloads its BPE
 vocabulary from ``openaipublic.blob.core.windows.net`` the first time a given
 encoding is requested and caches it on disk; set ``TIKTOKEN_CACHE_DIR`` to a
@@ -36,6 +44,7 @@ pre-seeded directory to run fully offline.
 import re
 from typing import Any, ClassVar, Dict, List, Optional
 
+from ai.common.utils import config_int
 from rocketlib import warning
 
 #: Absolute floor for the unknown-model budget. Only reached if *both* the live
@@ -56,6 +65,10 @@ class ContextOptimizer:
     documents, and conversation history using configurable priority-based
     percentages. Supports truncation at sentence boundaries and conversation
     history summarization.
+
+    Anything else the caller renders into the prompt is accounted for, but not
+    trimmed: :meth:`optimize` accepts it as ``overhead_tokens`` and allocates
+    the four budgets from the window that remains.
 
     Context-window sizes are resolved in three steps (see
     :meth:`resolve_model_limit`):
@@ -178,12 +191,12 @@ class ContextOptimizer:
             model_name = DEFAULT_MODEL_NAME
         self.model_name: str = model_name.strip()
 
-        # Validate max_context_tokens (issue #4: non-numeric values)
-        try:
-            self.max_context_tokens: int = max(0, int(config.get('max_context_tokens', 0)))
-        except (ValueError, TypeError):
-            warning('context_optimizer: max_context_tokens is not a valid integer, defaulting to 0')
-            self.max_context_tokens = 0
+        # max_context_tokens (issue #4: non-numeric values). ``config_int`` is
+        # the repo's shared parser for exactly this shape of human-edited field:
+        # missing / null / non-numeric falls back to the default, and it treats
+        # ``<= 0`` as "unspecified" -- which is what 0 means here (use the
+        # model's own window). Clamped, never raised on.
+        self.max_context_tokens: int = config_int(config, 'max_context_tokens', 0, min_value=0)
 
         # Validate budget percentages (issue #4: non-numeric values, issue #5: negative values)
         self.system_prompt_budget_pct: float = self._parse_pct(
@@ -212,6 +225,11 @@ class ContextOptimizer:
         # Track which model names we've already warned about, so the unknown-model
         # fallback warning is emitted once rather than on every optimize() call.
         self._warned_unknown_models: set = set()
+
+        # Same idea for the "un-budgeted prompt sections alone fill the window"
+        # warning: it is a property of the pipeline's questions, not of one
+        # question, so it is emitted once per optimizer (i.e. per pipeline run).
+        self._warned_overhead_over_limit: bool = False
 
         # Snapshot the live catalog for this optimizer's lifetime (one per
         # pipeline start, via IGlobal.beginGlobal). Reading it here rather than
@@ -884,6 +902,7 @@ class ContextOptimizer:
         system_prompt: str = '',
         documents: Optional[List[Dict[str, Any]]] = None,
         history: Optional[List[Dict[str, str]]] = None,
+        overhead_tokens: int = 0,
     ) -> Dict[str, Any]:
         """Run the full context optimization pipeline.
 
@@ -897,6 +916,22 @@ class ContextOptimizer:
         **Pass 2** -- when the total exceeds the limit, allocate percentage-
         based budgets and truncate/rank/summarize each component to fit.
 
+        Only the four components below are budgeted and trimmed.  Whatever else
+        the caller will render into the prompt -- for a ``Question`` that is
+        ``instructions``, ``examples``, ``context``, ``goals`` and all of
+        ``getPrompt()``'s section markup -- is passed in as *overhead_tokens*:
+        it counts towards the pass-1 "does it fit" verdict, and the
+        per-component budgets are allocated from ``total_limit -
+        overhead_tokens`` rather than from the whole window.  Passing ``0``
+        (the default) reproduces the old four-component-only accounting.
+
+        When the overhead alone reaches the limit there is nothing left to
+        budget: every component's budget is 0, so all four are emptied and a
+        warning is emitted (once per optimizer).  That mirrors
+        :meth:`summarize_history`, which returns no messages rather than
+        overshoot a budget that cannot even cover a message's role overhead --
+        the node never knowingly hands on a prompt it has been told is too big.
+
         Args:
             question: The user's query text.
             model: Optional model name override (uses instance default if ``None``).
@@ -905,6 +940,8 @@ class ContextOptimizer:
             system_prompt: System prompt text.
             documents: List of document dicts with ``content`` key.
             history: Conversation history (list of role/content dicts).
+            overhead_tokens: Tokens the rendered prompt spends outside the four
+                budgeted components. Negative values are treated as 0.
 
         Returns:
             Dict with keys:
@@ -912,11 +949,12 @@ class ContextOptimizer:
                 - question: optimized question text
                 - documents: list of selected documents
                 - history: compressed conversation history
-                - metadata: dict with tokens_used, tokens_saved, components_truncated,
-                  model, total_limit, budget and encoding
+                - metadata: dict with tokens_used, tokens_saved, overhead_tokens,
+                  components_truncated, model, total_limit, budget and encoding
         """
         documents = documents or []
         history = history or []
+        overhead_tokens = max(0, overhead_tokens)
 
         # Resolve model limit
         effective_model = model or self.model_name
@@ -938,13 +976,28 @@ class ContextOptimizer:
             self.count_tokens(str(d.get('content', d.get('page_content', ''))), encoding) for d in documents
         )
         original_history = sum(self._message_tokens(m, encoding) for m in history)
-        original_total = original_system + original_question + original_docs + original_history
+        # The overhead is part of what the provider will receive, so it belongs
+        # in the total the pass-1 verdict is made against. Leaving it out is how
+        # an over-limit prompt used to be waved through untouched.
+        original_total = original_system + original_question + original_docs + original_history + overhead_tokens
+
+        # Budgets are carved out of what the overhead leaves behind, never out
+        # of the whole window.
+        budgeted_limit = total_limit - overhead_tokens
+        if budgeted_limit <= 0 and not self._warned_overhead_over_limit:
+            warning(
+                f'context_optimizer: the prompt sections this node does not budget cost {overhead_tokens} tokens, '
+                f"which already fills the {total_limit}-token window for '{effective_model}'; every budgeted "
+                f'component is emptied. Shorten the question instructions/examples/context/goals, or raise '
+                f'max_context_tokens'
+            )
+            self._warned_overhead_over_limit = True
+        budget = self.allocate_budget(max(0, budgeted_limit))
 
         # ------------------------------------------------------------------
         # Pass 1: everything fits -- no truncation needed
         # ------------------------------------------------------------------
         if original_total <= total_limit:
-            budget = self.allocate_budget(total_limit)
             return {
                 'system_prompt': system_prompt,
                 'question': question,
@@ -953,6 +1006,7 @@ class ContextOptimizer:
                 'metadata': {
                     'tokens_used': original_total,
                     'tokens_saved': 0,
+                    'overhead_tokens': overhead_tokens,
                     'components_truncated': [],
                     'model': effective_model,
                     'total_limit': total_limit,
@@ -964,8 +1018,6 @@ class ContextOptimizer:
         # ------------------------------------------------------------------
         # Pass 2: total exceeds limit -- apply per-component budgets
         # ------------------------------------------------------------------
-        budget = self.allocate_budget(total_limit)
-
         components_truncated: List[str] = []
 
         opt_system = self.truncate_to_budget(system_prompt, budget['system_prompt'], encoding)
@@ -988,11 +1040,14 @@ class ContextOptimizer:
         if opt_history_tokens < original_history:
             components_truncated.append('history')
 
+        # The overhead survives trimming (this node cannot touch those fields),
+        # so it stays in tokens_used -- and therefore out of tokens_saved.
         tokens_used = (
             self.count_tokens(opt_system, encoding)
             + self.count_tokens(opt_question, encoding)
             + opt_docs_tokens
             + opt_history_tokens
+            + overhead_tokens
         )
         tokens_saved = max(0, original_total - tokens_used)
 
@@ -1004,6 +1059,7 @@ class ContextOptimizer:
             'metadata': {
                 'tokens_used': tokens_used,
                 'tokens_saved': tokens_saved,
+                'overhead_tokens': overhead_tokens,
                 'components_truncated': components_truncated,
                 'model': effective_model,
                 'total_limit': total_limit,

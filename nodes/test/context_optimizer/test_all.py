@@ -133,10 +133,14 @@ if not _HAS_REAL_TIKTOKEN:
 if importlib.util.find_spec('json5') is None:
     sys.modules['json5'] = _make_json5_stub()
 
-from ai.common.schema import Question  # noqa: E402
+from ai.common.schema import Doc, Question, QuestionHistory  # noqa: E402
 
 from context_optimizer.IGlobal import IGlobal  # noqa: E402
-from context_optimizer.IInstance import IInstance  # noqa: E402
+from context_optimizer.IInstance import (  # noqa: E402
+    IInstance,
+    blank_budgeted_fields,
+    prompt_overhead_tokens,
+)
 from context_optimizer.optimizer import (  # noqa: E402
     CONSERVATIVE_MODEL_LIMIT_FLOOR,
     DEFAULT_MODEL_NAME,
@@ -1779,3 +1783,265 @@ class TestModelNameValidation:
 
     def test_surrounding_whitespace_is_stripped(self, default_config):
         assert ContextOptimizer({**default_config, 'model_name': '  gpt-5  '}).model_name == 'gpt-5'
+
+
+# ===========================================================================
+# Un-budgeted prompt overhead
+# ===========================================================================
+#
+# ``optimize`` used to total only the four budgeted components, but
+# ``Question.getPrompt()`` also renders ``instructions`` (the ``prompt`` node
+# appends there), ``examples``, ``context`` (retrieval fills it), ``goals``,
+# and a skeleton of ``### ...`` headers / ``Document N) Content:`` prefixes /
+# CRLF joins. A question whose four fields fit could therefore be waved
+# through pass 1 while the rendered prompt was already over the window -- the
+# exact failure this node exists to prevent.
+
+
+def _make_iinstance(optimizer) -> IInstance:
+    """An IInstance wired to *optimizer* with a mocked downstream."""
+    inst = IInstance.__new__(IInstance)
+    iglobal = MagicMock()
+    iglobal.optimizer = optimizer
+    inst.IGlobal = iglobal
+    inst.instance = MagicMock()
+    return inst
+
+
+def _forwarded(inst) -> Question:
+    """The Question the instance handed downstream."""
+    return inst.instance.writeQuestions.call_args.args[0]
+
+
+def _mock_optimize_result() -> dict:
+    return {
+        'system_prompt': 'opt_sys',
+        'question': 'opt_q',
+        'documents': [],
+        'history': [],
+        'metadata': {
+            'tokens_used': 10,
+            'tokens_saved': 0,
+            'overhead_tokens': 0,
+            'components_truncated': [],
+            'model': 'gpt-5',
+            'total_limit': 128000,
+            'budget': {},
+        },
+    }
+
+
+def _overhead_warnings(mock_warning) -> list:
+    """Warnings about the un-budgeted sections filling the window."""
+    return [c for c in mock_warning.call_args_list if 'does not budget' in str(c)]
+
+
+class TestUnbudgetedPromptOverhead:
+    """The overhead is measured from the real rendering and charged to the window."""
+
+    def test_blanked_copy_keeps_the_markup_and_drops_the_budgeted_content(self):
+        q = Question(role='ROLEBODY')
+        q.addQuestion('QUESTIONBODY')
+        q.addInstruction('Focus', 'INSTRUCTIONBODY')
+        q.addExample('EXAMPLEGIVEN', 'EXAMPLERESULT')
+        q.addContext('CONTEXTBODY')
+        q.addGoal('GOALBODY')
+        q.addHistory(QuestionHistory(role='user', content='HISTORYBODY'))
+        q.addDocuments(Doc(page_content='DOCUMENTBODY'))
+
+        skeleton = blank_budgeted_fields(q).getPrompt()
+
+        # The four budgeted fields are gone -- the optimizer counts those itself.
+        for gone in ('ROLEBODY', 'QUESTIONBODY', 'HISTORYBODY', 'DOCUMENTBODY'):
+            assert gone not in skeleton, f'{gone} would be counted twice'
+        # Everything the node cannot trim is still there, markup included.
+        for kept in (
+            'INSTRUCTIONBODY',
+            'EXAMPLEGIVEN',
+            'EXAMPLERESULT',
+            'CONTEXTBODY',
+            'GOALBODY',
+            '### System Instructions:',
+            '### Examples:',
+            '### Conversation History:',
+            '### Context:',
+            '### Documents:',
+            '### Ultimate Goal:',
+            '### Current Task:',
+            'Document 1) Content:',
+            'user:',
+        ):
+            assert kept in skeleton, f'{kept} is part of the rendered prompt and must be counted'
+
+    def test_blanking_leaves_the_source_question_untouched(self):
+        q = Question(role='ROLEBODY')
+        q.addQuestion('QUESTIONBODY')
+        q.addHistory(QuestionHistory(role='user', content='HISTORYBODY'))
+        q.addDocuments(Doc(page_content='DOCUMENTBODY'))
+
+        blank_budgeted_fields(q)
+
+        assert q.role == 'ROLEBODY'
+        assert q.questions[0].text == 'QUESTIONBODY'
+        assert q.history[0].content == 'HISTORYBODY'
+        assert q.documents[0].page_content == 'DOCUMENTBODY'
+
+    def test_bare_question_still_pays_for_its_markup(self, optimizer):
+        q = Question()
+        q.addQuestion('Hi')
+        assert prompt_overhead_tokens(optimizer, q) > 0
+
+    def test_expectjson_boilerplate_is_counted(self, optimizer):
+        plain = Question()
+        plain.addQuestion('Hi')
+        jsonish = Question(expectJson=True)
+        jsonish.addQuestion('Hi')
+        assert prompt_overhead_tokens(optimizer, jsonish) > prompt_overhead_tokens(optimizer, plain)
+
+    def test_question_whose_budgeted_fields_fit_is_no_longer_passed_through(self):
+        """The regression: four small fields, a big instructions/context block."""
+        q = Question(role='ROLEBODY')
+        q.addQuestion('QUESTIONBODY')
+        q.addInstruction('Focus', ' '.join(f'instruction-word-{i}' for i in range(200)))
+        q.addContext(' '.join(f'context-word-{i}' for i in range(200)))
+
+        probe = ContextOptimizer({'model_name': 'custom', 'max_context_tokens': 1000000})
+        budgeted = probe.count_tokens('ROLEBODY') + probe.count_tokens('QUESTIONBODY')
+        overhead = prompt_overhead_tokens(probe, q)
+        # A window the four budgeted fields fit into, but the rendered prompt does not.
+        limit = budgeted + overhead - 1
+        assert budgeted <= limit, 'the budgeted fields must fit, or this test proves nothing'
+
+        opt = ContextOptimizer({'model_name': 'custom', 'max_context_tokens': limit})
+
+        # What the old, four-field-only accounting did with the same window.
+        untracked = opt.optimize(question='QUESTIONBODY', system_prompt='ROLEBODY')
+        assert untracked['metadata']['components_truncated'] == []
+
+        inst = _make_iinstance(opt)
+        inst.writeQuestions(q)
+
+        out = _forwarded(inst)
+        assert out.questions[0].text != 'QUESTIONBODY'
+        assert q.questions[0].text == 'QUESTIONBODY', 'the upstream question must not be mutated'
+
+    def test_iinstance_passes_the_measured_overhead_to_optimize(self):
+        mock_opt = MagicMock()
+        mock_opt.count_tokens.return_value = 77
+        mock_opt.optimize.return_value = _mock_optimize_result()
+        inst = _make_iinstance(mock_opt)
+
+        q = Question(role='You are helpful.')
+        q.addQuestion('What is AI?')
+        inst.writeQuestions(q)
+
+        # 77 measured tokens plus the two-token margin for the role line break
+        assert mock_opt.optimize.call_args.kwargs['overhead_tokens'] == 79
+
+    def test_budgets_are_allocated_from_what_the_overhead_leaves(self, small_optimizer):
+        base = small_optimizer.optimize(question='a b c')['metadata']
+        shrunk = small_optimizer.optimize(question='a b c', overhead_tokens=40)['metadata']
+
+        assert sum(base['budget'].values()) == 100
+        assert sum(shrunk['budget'].values()) == 60
+        assert shrunk['budget']['documents'] < base['budget']['documents']
+        assert base['overhead_tokens'] == 0
+        assert shrunk['overhead_tokens'] == 40
+        # The window itself is unchanged -- only the part left to budget shrinks.
+        assert shrunk['total_limit'] == base['total_limit'] == 100
+
+    def test_overhead_counts_towards_the_pass1_verdict(self, small_optimizer):
+        body = ' '.join(f'word{i}' for i in range(20))
+        assert small_optimizer.count_tokens(body) < 100, 'the body alone must fit the 100-token window'
+
+        fits = small_optimizer.optimize(question=body)
+        assert fits['metadata']['components_truncated'] == []
+        assert fits['question'] == body
+
+        over = small_optimizer.optimize(question=body, overhead_tokens=95)
+        assert over['metadata']['components_truncated'] == ['question']
+        assert over['question'] != body
+
+    def test_overhead_alone_over_the_limit_empties_every_component(self, small_budget_config):
+        opt = ContextOptimizer(small_budget_config)
+        with patch('context_optimizer.optimizer.warning') as mock_warning:
+            result = opt.optimize(
+                question='question text',
+                system_prompt='system text',
+                documents=[{'content': 'doc text'}],
+                history=[{'role': 'user', 'content': 'history text'}],
+                overhead_tokens=120,
+            )
+
+        assert result['metadata']['budget'] == {'system_prompt': 0, 'query': 0, 'documents': 0, 'history': 0}
+        assert result['system_prompt'] == ''
+        assert result['question'] == ''
+        assert result['documents'] == []
+        assert result['history'] == []
+        # Nothing but the overhead is left in the window.
+        assert result['metadata']['tokens_used'] == 120
+        assert _overhead_warnings(mock_warning)
+
+    def test_the_overhead_warning_fires_once_per_optimizer(self, small_budget_config):
+        opt = ContextOptimizer(small_budget_config)
+        with patch('context_optimizer.optimizer.warning') as mock_warning:
+            for _ in range(3):
+                opt.optimize(question='x y z', overhead_tokens=120)
+        assert len(_overhead_warnings(mock_warning)) == 1
+
+    def test_the_overhead_is_never_reported_as_saved(self, small_budget_config):
+        opt = ContextOptimizer(small_budget_config)
+        body = ' '.join(f'word{i}' for i in range(500))
+        result = opt.optimize(question=body, overhead_tokens=20)
+
+        meta = result['metadata']
+        assert meta['overhead_tokens'] == 20
+        assert meta['tokens_saved'] == opt.count_tokens(body) - opt.count_tokens(result['question'])
+
+    def test_default_overhead_is_zero(self, optimizer):
+        assert optimizer.optimize(question='Hello world', system_prompt='Be nice')['metadata']['overhead_tokens'] == 0
+
+    def test_negative_overhead_is_treated_as_zero(self, small_optimizer):
+        meta = small_optimizer.optimize(question='x y z', overhead_tokens=-50)['metadata']
+        assert meta['overhead_tokens'] == 0
+        assert sum(meta['budget'].values()) == 100
+
+
+# ===========================================================================
+# max_context_tokens parsing
+# ===========================================================================
+
+
+class TestMaxContextTokensParsing:
+    """``max_context_tokens`` is read with the shared ``ai.common.utils.config_int``.
+
+    It replaces a node-local try/except that duplicated the same semantics:
+    missing / null / non-numeric falls back to the default, and ``<= 0`` means
+    "unspecified", which is what 0 means for this field (use the model's own
+    window). The local parser additionally warned on a non-numeric value; that
+    warning is deliberately dropped rather than pushed into ``config_int``,
+    which the other adopters (``graph_falkordb``, ``tool_guild``,
+    ``tool_http_request``) rely on being silent.
+    """
+
+    @pytest.mark.parametrize(
+        'raw,expected',
+        [
+            ({}, 0),
+            ({'max_context_tokens': None}, 0),
+            ({'max_context_tokens': 'not_a_number'}, 0),
+            ({'max_context_tokens': ''}, 0),
+            ({'max_context_tokens': -500}, 0),
+            ({'max_context_tokens': 0}, 0),
+            ({'max_context_tokens': 1000}, 1000),
+            ({'max_context_tokens': '1000'}, 1000),
+            ({'max_context_tokens': 1000.9}, 1000),
+        ],
+    )
+    def test_parsing_matches_the_documented_semantics(self, raw, expected):
+        assert ContextOptimizer({'model_name': 'gpt-5', **raw}).max_context_tokens == expected
+
+    def test_an_unparseable_value_falls_back_to_the_model_window(self):
+        opt = ContextOptimizer({'model_name': 'gpt-5', 'max_context_tokens': [1, 2]})
+        assert opt.max_context_tokens == 0
+        assert opt._total_limit == ContextOptimizer.MODEL_LIMITS['gpt-5']
