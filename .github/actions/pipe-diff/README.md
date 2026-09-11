@@ -114,14 +114,30 @@ writes. Your options, in order of preference:
    permissions).
 2. Set `comment: false` to skip the API call entirely and drop the
    `pull-requests: write` permission.
-3. Use `pull_request_target`, which runs with a writable token. Note its
-   trade-off: the workflow runs in the base repository's context, so you must
-   **not** check out or execute the PR head's code from it. This action only
-   reads `.pipe` data files, but the rest of your job must respect that rule —
-   including `install-from`, which pip executes (see the note above).
+3. Use `pull_request_target`, which runs with a writable token. The comment step
+   runs on `pull_request` **and** `pull_request_target`, and the base commit
+   comes from the same `github.event.pull_request.base.sha` under both. But the
+   action diffs the checked-out tree, and under `pull_request_target`
+   `actions/checkout` lands on the base branch, so the run reports "no `.pipe`
+   files changed" and warns that the PR head is not in the checkout.
+
+   Do **not** fix that by checking out the PR head: the job holds a writable
+   token and the base repository's secrets, and this action runs `python -m pip`
+   and `git` inside the checkout, so pull-request-controlled files in it are not
+   inert.
+
+   To comment on fork PRs, run the action on `pull_request` with
+   `comment: false`, upload `comment-body-file` as an artifact, and post it from
+   a `workflow_run` workflow that has `pull-requests: write`.
 
 ## Behavior
 
+- **Events.** The action runs on `pull_request` and `pull_request_target`; both
+  carry the `pull_request` payload it needs for the base commit and the PR
+  number. On any other event there is no base to diff against, so it emits a
+  `warning` and skips. Under `pull_request_target` the checkout is the base
+  branch, so the action finds no changes and warns — see
+  [Fork pull requests](#fork-pull-requests).
 - **Sticky comment.** The action maintains exactly one comment per PR, found via
   a hidden HTML marker (`<!-- rocketride-pipe-diff -->`) **and** an author check
   for `github-actions[bot]`, so a human comment quoting the marker is never

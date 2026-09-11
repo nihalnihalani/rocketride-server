@@ -584,13 +584,27 @@ def _md_code(text: str) -> str:
 
 def _md_cell(text: str) -> str:
     """
-    Escape a string for use inside a Markdown table cell.
+    Escape an already-code-span-formatted string for a Markdown table cell.
 
-    GitHub's table parser splits on ``|`` even inside code spans, and literal
-    newlines break the row, so both are neutralized here after any code-span
-    formatting has been applied.
+    Callers pass output of :func:`_md_code` (directly, or wrapped by
+    :func:`_md_field_change`, whose only extra characters are ``+``/``-``/``→``),
+    so every backslash and pipe reaching this function sits inside a code span.
+
+    Two escapes are needed, and only two. GitHub's table parser splits a row on
+    ``|`` even inside a code span, so a pipe must be written ``\\|``; the parser
+    turns that back into a literal ``|`` before inline parsing, and the code span
+    renders it verbatim. A literal newline ends the row, so it is folded to a
+    space.
+
+    Backslashes are deliberately **not** doubled. Inside a code span the inline
+    parser performs no backslash unescaping, so doubling them was emitted
+    verbatim: ``C:\\Users\\alice`` rendered as ``C:\\\\Users\\\\alice``. Only the
+    ``\\|`` sequence is special to the table parser, and it is added here.
+
+    This function assumes code-span input; plain text with backslashes would need
+    a different escape, and no caller passes any.
     """
-    return str(text).replace('\\', '\\\\').replace('|', '\\|').replace('\n', ' ')
+    return str(text).replace('|', '\\|').replace('\n', ' ')
 
 
 def _md_field_change(field_change: Any) -> str:

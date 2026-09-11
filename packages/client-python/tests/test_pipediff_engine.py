@@ -287,6 +287,50 @@ def test_version_change_is_reported_and_is_semantic():
     assert diff.has_semantic_changes is True
 
 
+def test_version_int_to_bool_is_reported_as_a_change():
+    """
+    ``1`` -> ``true`` is a real JSON change and must not be swallowed.
+
+    Python evaluates ``1 == True``, so the plain ``!=`` this comparison used to
+    do reported no version change at all and the diff exited 0. The comparison
+    goes through ``_json_equal``, which refuses to equate a bool with a number.
+    """
+    old = _sample_pipe()
+    new = copy.deepcopy(old)
+    new['version'] = True
+    diff = diff_pipes(old, new)
+    # `== (1, True)` would also hold for `(1, 1)`, so assert the types too.
+    assert diff.version_change is not None
+    old_version, new_version = diff.version_change
+    assert old_version == 1 and not isinstance(old_version, bool)
+    assert new_version is True
+    assert diff.has_semantic_changes is True
+
+
+def test_version_zero_to_false_is_reported_as_a_change():
+    """The falsy half of the same trap: ``0`` -> ``false``."""
+    old = _pipe(_sample_pipe()['components'], version=0)
+    new = _pipe(copy.deepcopy(old['components']), version=False)
+    diff = diff_pipes(old, new)
+    assert diff.version_change is not None
+    old_version, new_version = diff.version_change
+    assert old_version == 0 and not isinstance(old_version, bool)
+    assert new_version is False
+    assert diff.has_semantic_changes is True
+
+
+def test_equal_int_version_is_still_not_a_change():
+    """The bool-aware comparison must not start flagging genuinely equal ints."""
+    old = _sample_pipe()
+    new = copy.deepcopy(old)
+    new['components'][1]['config']['profile'] = 'fast'
+    diff = diff_pipes(old, new)
+    assert old['version'] == 1 and new['version'] == 1
+    assert diff.version_change is None
+    # The unrelated config edit is still picked up, so the diff is not a no-op.
+    assert _changes_by_kind(diff, 'config')
+
+
 # ---------------------------------------------------------------------------
 # Layout
 # ---------------------------------------------------------------------------

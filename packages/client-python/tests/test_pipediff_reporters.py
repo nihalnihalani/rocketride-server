@@ -70,6 +70,28 @@ def _mixed_diff() -> PipeDiff:
     )
 
 
+def _table_body_rows(markdown: str) -> list:
+    """
+    Return the data rows of every Markdown table in ``markdown``.
+
+    Header rows and the ``| --- |`` separators are dropped, so a row count is a
+    count of rendered changes. A row that a stray newline split in two shows up
+    here as two rows, which is exactly what the escaping tests assert against.
+    """
+    rows = []
+    in_body = False
+    for line in markdown.splitlines():
+        if not line.startswith('|'):
+            in_body = False
+            continue
+        if set(line.replace('|', '').replace(' ', '')) == {'-'}:
+            in_body = True
+            continue
+        if in_body:
+            rows.append(line)
+    return rows
+
+
 class TestRenderHuman(unittest.TestCase):
     def test_empty_diff_reports_no_changes(self) -> None:
         self.assertEqual(render_human(PipeDiff(), use_color=False), 'No semantic changes.')
@@ -354,6 +376,74 @@ class TestRenderMarkdown(unittest.TestCase):
             # Unescaped pipes only appear as the 4 column delimiters.
             unescaped = row.replace('\\|', '')
             self.assertEqual(unescaped.count('|'), 4, row)
+
+    def test_table_does_not_double_backslashes_in_code_spans(self) -> None:
+        """
+        Backslashes inside a table cell must survive verbatim.
+
+        Every value reaching a cell is already wrapped in a code span, and a
+        code span does no backslash unescaping — so the cell escaper used to
+        double them and ``C:\\Users\\alice`` rendered as ``C:\\\\Users\\\\alice``.
+        Only ``\\|`` is meaningful to GitHub's table parser, and that escape
+        stays.
+        """
+        windows_path = r'C:\Users\alice'
+        regex_value = r'\d+\|x'
+        diff = PipeDiff(
+            node_changes=[
+                NodeChange(
+                    id='n1',
+                    kind='config',
+                    field_changes=[
+                        FieldChange(path='config.out_dir', kind='changed', old='/tmp', new=windows_path),
+                        FieldChange(path='config.pattern', kind='added', new=regex_value),
+                    ],
+                )
+            ]
+        )
+        out = render_markdown(diff)
+
+        # Backslashes appear exactly as authored, never doubled.
+        self.assertIn(windows_path, out)
+        self.assertNotIn(r'C:\\Users', out)
+        # The regex keeps its single backslashes; only its pipe gains an escape.
+        self.assertIn(r'`\d+\\|x`', out)
+        self.assertNotIn(r'\\d+', out)
+
+        rows = _table_body_rows(out)
+        self.assertEqual(len(rows), 2, out)
+        for row in rows:
+            # Pipes from the values are escaped, so only the 4 delimiters remain.
+            self.assertEqual(row.replace('\\|', '').count('|'), 4, row)
+
+    def test_table_cell_neutralizes_newlines_without_touching_backslashes(self) -> None:
+        """A newline in a value must not break the row, and must not cost a backslash."""
+        diff = PipeDiff(
+            node_changes=[
+                NodeChange(
+                    id='n1',
+                    kind='config',
+                    field_changes=[
+                        FieldChange(
+                            path='config.script',
+                            kind='changed',
+                            old='a\nb',
+                            new='C:\\tmp\nnext|line',
+                        ),
+                    ],
+                )
+            ]
+        )
+        out = render_markdown(diff)
+
+        rows = _table_body_rows(out)
+        self.assertEqual(len(rows), 1, out)
+        row = rows[0]
+        # One row means the embedded newlines were folded, not passed through.
+        self.assertIn('a b', row)
+        self.assertIn('C:\\tmp next\\|line', row)
+        self.assertNotIn('C:\\\\tmp', row)
+        self.assertEqual(row.replace('\\|', '').count('|'), 4, row)
 
 
 class TestDeterminism(unittest.TestCase):

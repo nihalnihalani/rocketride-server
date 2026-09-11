@@ -236,8 +236,11 @@ Two things worth knowing before you wire it up:
   `GITHUB_TOKEN` is read-only whatever `permissions:` says, so the comment API
   returns `403`. The action warns instead of failing and every run also writes the
   report to the job summary, so the diff is still there. Use `comment: false`, or
-  `pull_request_target` (never checking out the PR head's code from it), if you
-  need something else.
+  `pull_request_target` for a writable token — the action comments on that event
+  too, but never check out or run the PR head's code from that workflow: the
+  action then diffs the base branch against itself, reports no changes and warns.
+  To comment on fork PRs, compute on `pull_request` and post from a
+  `workflow_run` workflow.
 - **Before the CLI release.** `rocketride diff` ships in a release after 1.3.0;
   until then pass `install-from: ./packages/client-python` so the action installs
   the CLI from a checkout rather than PyPI.

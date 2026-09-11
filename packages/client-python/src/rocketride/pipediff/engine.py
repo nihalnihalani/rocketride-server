@@ -316,7 +316,11 @@ def diff_pipes(old: dict, new: dict, *, include_layout: bool = False) -> PipeDif
     version_change: tuple[Any, Any] | None = None
     old_version = old.get('version')
     new_version = new.get('version')
-    if old_version != new_version:
+    # Compared with :func:`_json_equal`, not ``!=``: Python treats ``False == 0``
+    # and ``True == 1``, so a plain ``!=`` missed a ``1`` -> ``true`` (or
+    # ``0`` -> ``false``) edit and reported no version change at all — the diff
+    # then exited 0 on a file whose version really had changed type.
+    if not _json_equal(old_version, new_version):
         version_change = (old_version, new_version)
 
     layout_changed = _layout_changed(old, new, old_components, new_components, old_ids & new_ids)
