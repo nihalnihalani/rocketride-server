@@ -18,9 +18,23 @@ Fits an LLM request into a model's context window by budgeting tokens across the
 
 A question carrying several `QuestionText` entries keeps every entry: the entries are budgeted against the query allowance together, each keeping a share proportional to its own size. Nothing is dropped, so the per-entry embedding metadata that the embedding nodes write and the document stores read survives the node.
 
-Requests that already fit pass through unchanged, and no extra model call is made.
+Requests whose rendered prompt already fits pass through unchanged, and no extra model call is made.
 
 This node is marked **experimental**.
+
+### What is budgeted, and what is only counted
+
+Exactly four fields of the incoming `Question` are budgeted and trimmed: `role` (the system prompt), `questions`, `documents` and `history`. Everything else `Question.getPrompt()` renders is **counted against the window but never trimmed**:
+
+- `instructions`, including the JSON-format boilerplate `expectJson` injects (the `prompt` node appends here);
+- `examples`;
+- `context` (retrieval nodes fill this);
+- `goals`;
+- the section markup itself — the `### System Instructions:` / `### Documents:` / `### Current Task:` headers, the `Document N) Content:` and `role:` line prefixes, and the CRLF joins between them.
+
+That second group is measured, not estimated: the incoming question is rendered through `getPrompt()` with the four budgeted fields emptied, the result is counted with the node's own tokenizer, and the total is subtracted from the context window *before* the per-component percentages are applied. A request is therefore judged against the prompt that will actually be sent — a question whose `role`, `questions`, `documents` and `history` fit but whose instructions and context push the rendering over the window is now trimmed instead of being waved through. The figure errs high: it keeps the markup of every document, history message and question entry even though trimming may later drop some of them, and it adds a two-token margin for the line break `getPrompt()` appends after a non-empty `role`, which the blanked rendering cannot see.
+
+If the un-budgeted fields alone fill the window, nothing is left to allocate: every budget becomes 0, all four budgeted fields are emptied, and the node warns once naming the cost. This node cannot shorten `instructions`, `examples`, `context` or `goals` — shorten them upstream, or raise `max_context_tokens`.
 
 ### Where the context-window size comes from
 
