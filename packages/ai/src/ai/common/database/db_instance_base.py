@@ -419,7 +419,10 @@ class DatabaseInstanceBase(IInstanceBase, ABC):
         ``IGlobal.db_schema`` is the same dict the natural-language path
         describes to the LLM (``_buildSQLQueryOnce`` -> ``describe_schema``),
         so refreshing it also stops ``get_data`` / ``get_sql`` writing queries
-        against a table shape that no longer exists.
+        against a table shape that no longer exists. ``IGlobal.schema`` -- the
+        configured table's column map that the answers lane inserts against --
+        is invalidated at the same time so the node is current on both paths,
+        not just the one this tool returns.
 
         Reflection and publication run under a process-wide lock so concurrent
         callers neither repeat the full table walk nor race on the cache. The
@@ -430,6 +433,28 @@ class DatabaseInstanceBase(IInstanceBase, ABC):
         """
         with _REFLECT_LOCK:
             self.IGlobal.db_schema = self.IGlobal._getDatabaseSchema()
+            # `db_schema` is not the only start-up snapshot: `IGlobal.schema`
+            # holds the configured table's column map, and `_insertData`
+            # iterates it to build every answers-lane INSERT. Leaving it alone
+            # would make "refreshed" true for the LLM path and false for the
+            # insert path -- a column added by the DDL that prompted this call
+            # would still be skipped. Emptying it re-arms the lazy rebuild at
+            # the top of `_insertData`, which reflects the table through the
+            # same `_getTableSchema` call `beginGlobal` uses, so the next
+            # insert sees exactly what a freshly started node would.
+            #
+            # Emptying rather than re-reflecting here keeps this cheap for the
+            # (common) node with no answers lane wired, and makes the write a
+            # single atomic rebind: a concurrent `_insertData` either reads the
+            # old map or finds it falsy and rebuilds, never a half-built dict.
+            #
+            # The rebuilt map is a plain reflection, so it carries the table's
+            # primary key while the map `_createTableFromData` curates for an
+            # auto-created table deliberately does not. `_insertData` drops
+            # unsupplied primary-key columns before binding, so the two maps
+            # produce the same INSERT and this invalidation cannot change
+            # answers-lane behaviour mid-task.
+            self.IGlobal.schema = {}
             refreshed_at = datetime.now(timezone.utc).isoformat()
             tables = {}
             for table_name, table_info in self.IGlobal.db_schema.items():
@@ -852,6 +877,33 @@ class DatabaseInstanceBase(IInstanceBase, ABC):
             )
             raise
 
+        # Columns the database fills in itself must not be bound. The loop
+        # below binds NULL for any schema column the incoming rows do not
+        # provide, which is fatal for a generated primary key: Postgres renders
+        # `Column('id', Integer, primary_key=True, autoincrement=True)` as
+        # `id SERIAL NOT NULL`, so an explicit NULL is a not-null violation
+        # rather than "please generate one".
+        #
+        # `_createTableFromData` curates `IGlobal.schema` down to the data
+        # columns for exactly this reason, but any map built by reflection --
+        # `beginGlobal` for a table that already existed, or the lazy rebuild
+        # above once `refresh_schema` has invalidated the cache -- carries the
+        # PK. Dropping the unsupplied PK columns here makes the insert correct
+        # whichever of the two maps this call is holding, so refreshing the
+        # cache can no longer change what an answers-lane INSERT looks like.
+        #
+        # The decision is made once per batch rather than per row so every
+        # mapping handed to executemany keeps an identical key set.
+        supplied_keys = {key.lower() for item in items if isinstance(item, dict) for key in item}
+        pk_names = {column.name.lower() for column in table.primary_key.columns}
+        omit_columns = {
+            colname for colname in schema if colname.lower() in pk_names and colname.lower() not in supplied_keys
+        }
+        if omit_columns and not set(schema) - omit_columns:
+            # A table that is nothing but its primary key: omitting every
+            # column would build empty row mappings, so bind them as before.
+            omit_columns = set()
+
         def prepare_value(value: Any) -> Any:
             """Convert complex Python types to SQL-compatible values."""
             if value is None:
@@ -875,6 +927,9 @@ class DatabaseInstanceBase(IInstanceBase, ABC):
             values: Dict[str, Any] = {}
             if schema:
                 for colname in schema.keys():
+                    if colname in omit_columns:
+                        # Database-generated primary key; let the engine supply it.
+                        continue
                     # Case-insensitive key lookup so 'UserName' maps to 'username'.
                     item_lower_keys = {k.lower(): k for k in item.keys()}
                     if colname.lower() in item_lower_keys:

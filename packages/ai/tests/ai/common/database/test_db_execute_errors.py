@@ -41,7 +41,7 @@ import re
 import threading
 
 import pytest
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.pool import StaticPool
 
 from ai.common.database.db_global_base import DatabaseGlobalBase
@@ -267,6 +267,64 @@ def test_concurrent_refresh_schema_calls_all_succeed(shared_instance):
     assert all('widgets' in result['tables'] for result in results)
 
 
+def test_refresh_schema_invalidates_the_insert_lane_column_map(instance):
+    """The answers lane must be as current as the tool's own return value.
+
+    ``refresh_schema`` replaces ``IGlobal.db_schema`` (what the LLM path
+    describes) but ``_insertData`` builds every INSERT from ``IGlobal.schema``,
+    a separate start-up snapshot of the configured table. Leaving that behind
+    made the node current on one path and stale on the other: a column added
+    by the very DDL that prompted the refresh would still be dropped.
+    """
+    iglobal = instance.IGlobal
+    iglobal.table = 'widgets'
+
+    instance.execute({'sql': 'CREATE TABLE widgets (label TEXT)'})
+    # Start-up state: beginGlobal reflected the one-column table.
+    iglobal.schema = {name: (col_type, '') for name, col_type in iglobal._getTableSchema('widgets')}
+    assert set(iglobal.schema) == {'label'}
+
+    instance.execute({'sql': 'ALTER TABLE widgets ADD COLUMN size INTEGER'})
+    instance.refresh_schema({})
+
+    # Invalidated, so _insertData re-reflects on its next call.
+    assert iglobal.schema == {}
+
+    instance._insertData([{'label': 'a', 'size': 7}])
+
+    assert instance.execute({'sql': 'SELECT label, size FROM widgets'})['rows'] == [{'label': 'a', 'size': 7}]
+    assert set(iglobal.schema) == {'label', 'size'}
+
+
+def test_insert_lane_drops_a_new_column_without_a_refresh(instance):
+    """Pins why the invalidation above is needed, not just that it happens."""
+    iglobal = instance.IGlobal
+    iglobal.table = 'widgets'
+
+    instance.execute({'sql': 'CREATE TABLE widgets (label TEXT)'})
+    iglobal.schema = {name: (col_type, '') for name, col_type in iglobal._getTableSchema('widgets')}
+
+    instance.execute({'sql': 'ALTER TABLE widgets ADD COLUMN size INTEGER'})
+    # No refresh_schema call: the stale map still has only `label`.
+    instance._insertData([{'label': 'a', 'size': 7}])
+
+    assert instance.execute({'sql': 'SELECT label, size FROM widgets'})['rows'] == [{'label': 'a', 'size': None}]
+
+
+def test_refresh_schema_empties_the_column_map_when_the_table_is_gone(instance):
+    """A dropped configured table leaves a falsy map, matching task start."""
+    iglobal = instance.IGlobal
+    iglobal.table = 'widgets'
+
+    instance.execute({'sql': 'CREATE TABLE widgets (label TEXT)'})
+    iglobal.schema = {name: (col_type, '') for name, col_type in iglobal._getTableSchema('widgets')}
+
+    instance.execute({'sql': 'DROP TABLE widgets'})
+    instance.refresh_schema({})
+
+    assert iglobal.schema == {}
+
+
 # ---------------------------------------------------------------------------
 # execute() must not echo the statement or its bind parameters
 # ---------------------------------------------------------------------------
@@ -292,3 +350,109 @@ def test_execute_error_does_not_leak_the_statement_or_parameters(instance):
     assert '[SQL:' not in message
     assert '[parameters:' not in message
     assert 'sqlalche.me' not in message
+
+
+# ---------------------------------------------------------------------------
+# The answers lane must not bind a database-generated primary key
+# ---------------------------------------------------------------------------
+
+
+def _compiled_insert_columns(instance, items):
+    """Return the column names an _insertData batch would actually bind.
+
+    SQLAlchemy builds the INSERT from the first mapping in the executemany
+    list, so capturing the compiled statement is the only way to assert on the
+    column list rather than on whatever the database happened to tolerate.
+    """
+    captured: list[str] = []
+    engine = instance.IGlobal.engine
+
+    def _before_cursor_execute(conn, cursor, statement, parameters, context, executemany):
+        if statement.lstrip().upper().startswith('INSERT'):
+            captured.append(statement)
+
+    event.listen(engine, 'before_cursor_execute', _before_cursor_execute)
+    try:
+        instance._insertData(items)
+    finally:
+        event.remove(engine, 'before_cursor_execute', _before_cursor_execute)
+
+    assert captured, 'no INSERT reached the driver'
+    statement = captured[0]
+    inside = statement[statement.index('(') + 1 : statement.index(')')]
+    return [name.strip().strip('"').strip('`') for name in inside.split(',')]
+
+
+def test_insert_after_refresh_does_not_bind_the_generated_primary_key(instance):
+    """refresh_schema must not change what an auto-created table inserts.
+
+    ``_createTableFromData`` prepends an auto-increment ``id`` and then caches
+    the DATA columns only, because the database generates the key. Refreshing
+    replaces that curated map with a plain reflection that includes ``id``;
+    without the guard in ``_insertData`` every later row would bind ``id=None``
+    -- harmless on SQLite's rowid alias, a not-null violation against the
+    ``id SERIAL NOT NULL`` Postgres renders for the same column.
+    """
+    iglobal = instance.IGlobal
+    iglobal.table = 'answers'
+
+    # Auto-create through the real path, then confirm the curated map.
+    instance._insertData([{'q': 'why', 'a': 'because'}])
+    assert set(iglobal.schema) == {'q', 'a'}
+
+    instance.refresh_schema({})
+    # The rebuilt map is a full reflection, primary key included ...
+    instance._insertData([{'q': 'how', 'a': 'like this'}])
+    assert set(iglobal.schema) == {'id', 'q', 'a'}
+
+    # ... but the INSERT still carries the data columns only.
+    columns = _compiled_insert_columns(instance, [{'q': 'when', 'a': 'now'}])
+    assert 'id' not in columns
+    assert set(columns) == {'q', 'a'}
+
+    rows = instance.execute({'sql': 'SELECT id, q FROM answers ORDER BY id'})['rows']
+    assert [row['q'] for row in rows] == ['why', 'how', 'when']
+    assert all(row['id'] is not None for row in rows)
+
+
+def test_insert_omits_a_reflected_primary_key_the_rows_do_not_supply(instance):
+    """The same guard covers a table that already existed at task start.
+
+    ``beginGlobal`` reflects the configured table, so its map has always
+    carried the primary key; binding NULL into it was a pre-existing defect
+    that the refresh path would otherwise have widened to auto-created tables.
+    """
+    iglobal = instance.IGlobal
+    iglobal.table = 'widgets'
+
+    instance.execute({'sql': 'CREATE TABLE widgets (id INTEGER PRIMARY KEY, label TEXT)'})
+    iglobal.schema = {name: (col_type, '') for name, col_type in iglobal._getTableSchema('widgets')}
+    assert set(iglobal.schema) == {'id', 'label'}
+
+    columns = _compiled_insert_columns(instance, [{'label': 'a'}])
+    assert columns == ['label']
+
+
+def test_insert_still_binds_a_primary_key_the_rows_do_supply(instance):
+    """An explicit key is the caller's to set; the guard must not swallow it."""
+    iglobal = instance.IGlobal
+    iglobal.table = 'widgets'
+
+    instance.execute({'sql': 'CREATE TABLE widgets (id INTEGER PRIMARY KEY, label TEXT)'})
+    iglobal.schema = {name: (col_type, '') for name, col_type in iglobal._getTableSchema('widgets')}
+
+    columns = _compiled_insert_columns(instance, [{'id': 42, 'label': 'a'}])
+    assert set(columns) == {'id', 'label'}
+    assert instance.execute({'sql': 'SELECT id FROM widgets'})['rows'] == [{'id': 42}]
+
+
+def test_insert_binds_the_primary_key_when_it_is_the_only_column(instance):
+    """Omitting every column would build empty mappings, so fall back."""
+    iglobal = instance.IGlobal
+    iglobal.table = 'ids'
+
+    instance.execute({'sql': 'CREATE TABLE ids (id INTEGER PRIMARY KEY)'})
+    iglobal.schema = {name: (col_type, '') for name, col_type in iglobal._getTableSchema('ids')}
+
+    columns = _compiled_insert_columns(instance, [{'label': 'ignored'}])
+    assert columns == ['id']
