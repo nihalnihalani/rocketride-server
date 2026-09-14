@@ -24,7 +24,7 @@
 // SQL-UI — CONNECTION VIEW (Archetype B workbench document for one connection)
 // =============================================================================
 
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import type { CSSProperties } from 'react';
 import { useShellConnection } from 'shell';
 import { Button, ContentHeader, TabControl, TabPanel } from 'shell';
@@ -34,7 +34,9 @@ import type { ISqlEndpoint } from '../connect';
 import { refreshSchema, useSchema } from '../schema/schemaStore';
 import { diagramUri, getDocs, nextQueryDoc } from '../docs';
 import { HistoryPrefsBridge } from '../history/historyStore';
+import { runSchemaChecks } from '../schema/quality';
 import OverviewPanel from '../panels/OverviewPanel';
+import InsightsPanel from './InsightsPanel';
 
 // =============================================================================
 // TYPES
@@ -89,10 +91,15 @@ export const ConnectionView: React.FC<IConnectionViewProps> = ({ endpoint }) => 
 		}
 	}, [client, isConnected, snapshot.status, endpoint]);
 
+	// Snapshot-only review findings; the count rides the Insights tab so the
+	// page advertises whether it has anything to say before it is opened.
+	const findingCount = useMemo(() => runSchemaChecks(snapshot.schema).length, [snapshot.schema]);
+
 	// The document's pages — grows as later phases land.
 	const menu: ViewMenu = {
 		entries: [
 			{ id: 'overview', label: 'Overview' },
+			{ id: 'insights', label: 'Insights', count: findingCount },
 		],
 	};
 
@@ -152,6 +159,7 @@ export const ConnectionView: React.FC<IConnectionViewProps> = ({ endpoint }) => 
 					activeId={activePage}
 					panels={{
 						overview: { content: <OverviewPanel endpoint={endpoint} snapshot={snapshot} client={client} /> },
+						insights: { content: <InsightsPanel endpoint={endpoint} snapshot={snapshot} /> },
 					}}
 				/>
 			</div>
