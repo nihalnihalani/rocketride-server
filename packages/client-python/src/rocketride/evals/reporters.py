@@ -28,8 +28,8 @@ This module defines the result containers produced by ``rocketride eval``
 formats: human-readable terminal text, a machine-readable JSON document, and
 JUnit XML for CI systems.
 
-The human format is a compact per-item report: a check/cross per item,
-indented per-assertion details, and a final
+The human format mirrors the ``rocketride validate`` output style: a
+check/cross per item, indented per-assertion details, and a final
 ``Summary: N case(s), P passed, F failed`` line. The JSON format is a single
 document with per-spec/per-case detail plus an aggregate summary. The JUnit
 format maps one ``<testsuite>`` per spec and one ``<testcase>`` per case,
@@ -187,10 +187,11 @@ def render_human(
     """
     Render eval reports as human-readable terminal text.
 
-    Emits one check/cross line per case, indented per-assertion detail
-    lines, a cross line per spec that could not be run, and a final summary
-    line of the form ``Summary: N case(s), P passed, F failed`` — extended
-    with ``, E spec error(s)`` when any spec failed to run.
+    Mirrors the ``rocketride validate`` style: one check/cross line per
+    case, indented per-assertion detail lines, a cross line per spec that
+    could not be run, and a final summary line of the form
+    ``Summary: N case(s), P passed, F failed`` — extended with
+    ``, E spec error(s)`` when any spec failed to run.
 
     Args:
         reports: Eval reports in execution order
