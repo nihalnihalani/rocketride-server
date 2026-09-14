@@ -88,6 +88,15 @@ class IGlobal(IGlobalBase):
 
         In CONFIG mode (pipeline save) this is a no-op to avoid loading
         datasets during configuration saves.
+
+        A dataset that legitimately holds no rows leaves ``_questions`` empty
+        and the pipeline runs over zero items. A dataset that could not be
+        *loaded* raises ``DatasetLoadError``: swallowing that produced a
+        pipeline that started cleanly and evaluated nothing, with only a
+        warning in the log to say why.
+
+        Raises:
+            DatasetLoadError: If the configured dataset could not be loaded.
         """
         if self.IEndpoint.endpoint.openMode in (OPEN_MODE.CONFIG, OPEN_MODE.SOURCE):
             return
@@ -101,7 +110,7 @@ class IGlobal(IGlobalBase):
         depends(requirements)
 
         # Import after dependencies are installed
-        from .dataset_loader import DatasetLoader
+        from .dataset_loader import DatasetLoader, DatasetLoadError
 
         # Get endpoint bag and config
         bag = self.IEndpoint.endpoint.bag
@@ -110,6 +119,8 @@ class IGlobal(IGlobalBase):
 
         # Create loader and load dataset
         self._loader = DatasetLoader(config, bag)
+        self._dataset = []
+        self._questions = []
 
         try:
             items = self._loader.load()
@@ -120,24 +131,20 @@ class IGlobal(IGlobalBase):
 
             self._questions = self._loader.to_questions(self._dataset)
             debug(f'Cobalt Dataset Global: {len(self._questions)} questions prepared')
-        except FileNotFoundError as e:
-            warning(f'Cobalt Dataset Global: {e!s}')
-            self._dataset = []
-            self._questions = []
-        except ValueError as e:
-            warning(f'Cobalt Dataset Global: {e!s}')
-            self._dataset = []
-            self._questions = []
         except ImportError as e:
             warning(f'Cobalt Dataset Global: Failed to import cobalt library: {e!s}')
-            warning('Cobalt Dataset Global: Ensure basalt-ai-cobalt is installed. pip install basalt-ai-cobalt')
-            self._dataset = []
-            self._questions = []
-        # Broad by intent: dataset preparation should not abort pipeline init.
+            raise DatasetLoadError(
+                f'Cobalt Dataset Global: failed to import the cobalt library: {e!s}. '
+                'Ensure basalt-ai-cobalt is installed: pip install basalt-ai-cobalt'
+            ) from e
+        except (FileNotFoundError, ValueError) as e:
+            warning(f'Cobalt Dataset Global: {e!s}')
+            raise DatasetLoadError(f'Cobalt Dataset Global: {e!s}') from e
+        # Broad by intent: every load failure leaves as one named type, so the
+        # engine sees an error rather than a pipeline that evaluated nothing.
         except Exception as e:
             warning(f'Cobalt Dataset Global: Failed to prepare dataset: {e!s}')
-            self._dataset = []
-            self._questions = []
+            raise DatasetLoadError(f'Cobalt Dataset Global: failed to prepare dataset: {e!s}') from e
 
     def _extractConfig(self) -> Dict[str, Any]:
         """Extract and validate node configuration.

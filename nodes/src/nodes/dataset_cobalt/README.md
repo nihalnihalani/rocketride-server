@@ -14,7 +14,7 @@ Key behavior to know:
 - **Reference answers are attached as metadata, never as prompt context** — the emitted question carries only the dataset's input text, so the expected answer is not exposed to an LLM downstream.
 - Field mapping is None-aware and first-non-null wins: question text is taken from `input`, then `text`, then `question`; the reference from `expected`, then `output`, then `answer`. Any other keys on the item are preserved under metadata. `id` becomes `dataset_id`, and every emitted item is tagged `cobalt_source: true`.
 - **File paths are sandboxed.** A path is rejected if it contains a `..` traversal segment or resolves (after following symlinks) to a location outside the pipeline working directory. This is a security boundary, so an absolute path pointing elsewhere on disk is rejected at runtime.
-- Loading is defensive: a missing file, unsupported extension, bad JSON, or missing dependency is logged as a warning and yields an empty question set rather than aborting pipeline initialization.
+- **An empty dataset and an unreadable one are different outcomes.** A dataset that is read successfully and holds no rows completes normally with a count of zero. A dataset that cannot be read at all — a missing file, an unsupported extension, bad JSON, a non-object row — raises `DatasetLoadError` so the engine records a failed run. A typo'd **File Path** must not report a successful run that evaluated nothing.
 
 ---
 

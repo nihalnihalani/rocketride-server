@@ -331,7 +331,7 @@ mock_cobalt.Dataset = MockDataset
 # ---------------------------------------------------------------------------
 # Now import the actual node code
 # ---------------------------------------------------------------------------
-from dataset_cobalt.dataset_loader import DatasetLoader
+from dataset_cobalt.dataset_loader import DatasetLoader, DatasetLoadError
 from dataset_cobalt.IEndpoint import IEndpoint
 from dataset_cobalt.IGlobal import IGlobal
 from dataset_cobalt.IInstance import IInstance
@@ -1026,7 +1026,12 @@ class TestIGlobalLifecycle:
     @patch('os.path.realpath', side_effect=lambda p: p)
     @patch('os.getcwd', return_value=_abs_test_path('missing'))
     @patch('os.path.isfile', return_value=False)
-    def test_begin_global_missing_file_graceful(self, mock_isfile, mock_cwd, mock_realpath):
+    def test_begin_global_missing_file_raises(self, mock_isfile, mock_cwd, mock_realpath):
+        """A dataset that cannot be loaded must abort init, not start empty.
+
+        This used to warn and set an empty dataset, so a typo'd file_path
+        produced a pipeline that initialised cleanly and evaluated nothing.
+        """
         config = {
             'source_type': 'file',
             'file_path': os.path.join(_abs_test_path('missing'), 'data.json'),
@@ -1034,10 +1039,8 @@ class TestIGlobalLifecycle:
         }
         g = self._make_global(config)
 
-        # Should not raise; warns internally and sets empty dataset
-        g.beginGlobal()
-        assert g._dataset == []
-        assert g._questions == []
+        with pytest.raises(DatasetLoadError, match='Dataset file not found'):
+            g.beginGlobal()
 
     def test_begin_global_config_mode_skips(self):
         config = {'source_type': 'inline', 'items': [{'input': 'q1', 'expected': 'a1'}], 'sample_size': 0}
@@ -1276,3 +1279,153 @@ class TestInlineItemsMustBeMappings:
         loader = _make_loader(source_type='inline')
         items = loader.load_from_items([{'input': 'q', 'expected': 'a'}])
         assert items == [{'input': 'q', 'expected': 'a'}]
+
+
+class TestLoadFailureIsNotSuccess:
+    """A dataset that cannot be loaded must not report a successful run.
+
+    ``_load_questions`` used to catch FileNotFoundError / ValueError /
+    ImportError / Exception, warn, and return ``[]``. ``scanObjects`` then took
+    the "no questions to emit" branch and called ``monitorCompleted(0)``, so a
+    typo'd ``file_path`` produced an engine-visible SUCCESSFUL run that had
+    evaluated nothing. These tests fail without the fix because scanObjects
+    returns normally instead of raising.
+    """
+
+    def _make_endpoint(self, config):
+        endpoint = IEndpoint()
+        endpoint.endpoint = MagicMock()
+        endpoint.endpoint.logicalType = 'dataset_cobalt'
+        endpoint.endpoint.serviceConfig = config
+        endpoint.endpoint.bag = {}
+        return endpoint
+
+    @staticmethod
+    def _real_reader():
+        """Read the file on disk instead of the canned MockDataset contents."""
+        return patch.dict(sys.modules, {'cobalt': None})
+
+    @patch('os.path.realpath', side_effect=lambda p: p)
+    @patch('os.getcwd', return_value=_abs_test_path('missing'))
+    @patch('os.path.isfile', return_value=False)
+    def test_missing_file_raises_out_of_scan_objects(self, mock_isfile, mock_cwd, mock_realpath):
+        endpoint = self._make_endpoint(
+            {
+                'source_type': 'file',
+                'file_path': os.path.join(_abs_test_path('missing'), 'data.json'),
+                'sample_size': 0,
+            }
+        )
+        entries = []
+
+        with pytest.raises(DatasetLoadError, match='Dataset file not found'):
+            endpoint.scanObjects('', lambda entry: entries.append(entry) or 0)
+
+        assert entries == []
+
+    def test_missing_file_does_not_report_a_clean_completion(self, monkeypatch, tmp_path):
+        """The failing scan must never reach monitorCompleted."""
+        monkeypatch.chdir(tmp_path)
+        completed = []
+        monkeypatch.setattr(
+            sys.modules['dataset_cobalt.IEndpoint'],
+            'monitorCompleted',
+            lambda size: completed.append(size),
+        )
+        endpoint = self._make_endpoint(
+            {'source_type': 'file', 'file_path': str(tmp_path / 'nope.json'), 'sample_size': 0}
+        )
+
+        with pytest.raises(DatasetLoadError):
+            endpoint.scanObjects('', lambda entry: 0)
+
+        assert completed == []
+
+    def test_unsupported_extension_raises(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        f = tmp_path / 'data.txt'
+        f.write_text('not a dataset')
+        endpoint = self._make_endpoint({'source_type': 'file', 'file_path': str(f), 'sample_size': 0})
+
+        with pytest.raises(DatasetLoadError, match='Unsupported file format'):
+            endpoint.scanObjects('', lambda entry: 0)
+
+    def test_scalar_rows_raise_rather_than_emitting_nothing(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        f = tmp_path / 'scalars.json'
+        f.write_text('[1, 2, 3]')
+        endpoint = self._make_endpoint({'source_type': 'file', 'file_path': str(f), 'sample_size': 0})
+
+        with self._real_reader(), pytest.raises(DatasetLoadError, match='is not an object'):
+            endpoint.scanObjects('', lambda entry: 0)
+
+    def test_genuinely_empty_dataset_still_completes_cleanly(self, monkeypatch, tmp_path):
+        """A dataset that IS readable and holds no rows keeps working."""
+        monkeypatch.chdir(tmp_path)
+        f = tmp_path / 'empty.json'
+        f.write_text('[]')
+        completed = []
+        monkeypatch.setattr(
+            sys.modules['dataset_cobalt.IEndpoint'],
+            'monitorCompleted',
+            lambda size: completed.append(size),
+        )
+        endpoint = self._make_endpoint({'source_type': 'file', 'file_path': str(f), 'sample_size': 0})
+        entries = []
+
+        with self._real_reader():
+            endpoint.scanObjects('', lambda entry: entries.append(entry) or 0)
+
+        assert entries == []
+        assert completed == [0]
+
+    def test_filtered_to_zero_rows_still_completes_cleanly(self, monkeypatch, tmp_path):
+        """A filter that matches nothing is an empty result, not a load failure."""
+        monkeypatch.chdir(tmp_path)
+        f = tmp_path / 'data.json'
+        f.write_text('[{"input": "q1", "lang": "en"}]')
+        completed = []
+        monkeypatch.setattr(
+            sys.modules['dataset_cobalt.IEndpoint'],
+            'monitorCompleted',
+            lambda size: completed.append(size),
+        )
+        endpoint = self._make_endpoint(
+            {
+                'source_type': 'file',
+                'file_path': str(f),
+                'sample_size': 0,
+                'filter_field': 'lang',
+                'filter_value': 'fr',
+            }
+        )
+
+        with self._real_reader():
+            endpoint.scanObjects('', lambda entry: 0)
+
+        assert completed == [0]
+
+    @patch('os.path.realpath', side_effect=lambda p: p)
+    @patch('os.getcwd', return_value=_abs_test_path('missing'))
+    @patch('os.path.isfile', return_value=False)
+    def test_begin_global_leaves_no_half_loaded_state(self, mock_isfile, mock_cwd, mock_realpath):
+        """Cleanup must still be safe to call after a failed beginGlobal."""
+        g = IGlobal()
+        g.IEndpoint = MagicMock()
+        g.IEndpoint.endpoint.bag = {}
+        config = {
+            'source_type': 'file',
+            'file_path': os.path.join(_abs_test_path('missing'), 'data.json'),
+            'sample_size': 0,
+        }
+        g.IEndpoint.endpoint.connConfig = config
+        g.glb = MagicMock()
+        g.glb.connConfig = config
+        g.glb.logicalType = 'dataset_cobalt'
+
+        with pytest.raises(DatasetLoadError):
+            g.beginGlobal()
+
+        assert g._questions == []
+        g.endGlobal()
+        assert g._loader is None

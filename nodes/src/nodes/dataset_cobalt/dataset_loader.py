@@ -27,6 +27,24 @@ from typing import Any, Dict, List
 from rocketlib import debug, warning
 
 
+class DatasetLoadError(Exception):
+    """Raised when a configured dataset could not be loaded.
+
+    This is the boundary between the two outcomes the node must keep apart:
+
+    * a dataset that legitimately holds no rows — the loaders return an empty
+      list and the node completes with a count of zero;
+    * a dataset that could not be *read at all* — a typo'd path, an
+      unsupported extension, malformed JSON, a scalar where an object was
+      expected. Those used to be warned about and flattened into the same
+      empty list, so the engine saw a clean, successful run that had
+      evaluated nothing.
+
+    ``IEndpoint`` and ``IGlobal`` wrap every load failure in this type and let
+    it propagate, so the engine records a failed scan instead.
+    """
+
+
 def _validate_path(path: str) -> str:
     """Validate and return the canonical path, raising ValueError if outside cwd.
 

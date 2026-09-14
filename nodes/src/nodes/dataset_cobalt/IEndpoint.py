@@ -35,7 +35,14 @@ class IEndpoint(IEndpointBase):
     target: IEndpointBase | None = None
 
     def scanObjects(self, _path: str, _scanCallback: Callable[[Dict[str, Any]], None]):
-        """Load the configured dataset and emit each row as a Question."""
+        """Load the configured dataset and emit each row as a Question.
+
+        A dataset that legitimately holds no rows completes with a count of
+        zero. A dataset that could not be *loaded* raises ``DatasetLoadError``
+        out of this method, which the engine records as a failed scan: a
+        typo'd ``file_path`` must not report a successful run that evaluated
+        nothing.
+        """
         questions = self._load_questions()
         if not questions:
             monitorStatus('Cobalt Dataset: no questions to emit')
@@ -55,13 +62,22 @@ class IEndpoint(IEndpointBase):
         monitorCompleted(len(questions))
 
     def _load_questions(self) -> List[Dict[str, Any]]:
+        """Return the prepared questions, or raise if the dataset cannot be read.
+
+        Returns:
+            The prepared question dicts. An empty list means the dataset was
+            read successfully and holds no rows.
+
+        Raises:
+            DatasetLoadError: If the dataset could not be loaded at all.
+        """
         from depends import depends
 
         requirements = os.path.dirname(os.path.realpath(__file__)) + '/requirements.txt'
         debug(f'Cobalt Dataset Endpoint: Loading requirements from {requirements}')
         depends(requirements)
 
-        from .dataset_loader import DatasetLoader
+        from .dataset_loader import DatasetLoader, DatasetLoadError
 
         config = self._extractConfig()
         debug(f'Cobalt Dataset Endpoint: Config keys: {list(config.keys())}')
@@ -73,18 +89,20 @@ class IEndpoint(IEndpointBase):
             questions = loader.to_questions(dataset)
             debug(f'Cobalt Dataset Endpoint: Prepared {len(questions)} questions')
             return questions
-        except FileNotFoundError as exc:
-            warning(f'Cobalt Dataset Endpoint: {exc!s}')
-        except ValueError as exc:
-            warning(f'Cobalt Dataset Endpoint: {exc!s}')
         except ImportError as exc:
             warning(f'Cobalt Dataset Endpoint: Failed to import cobalt library: {exc!s}')
-            warning('Cobalt Dataset Endpoint: Ensure basalt-ai-cobalt is installed. pip install basalt-ai-cobalt')
-        # Broad by intent: a source endpoint reports the failure and completes empty.
+            raise DatasetLoadError(
+                f'Cobalt Dataset Endpoint: failed to import the cobalt library: {exc!s}. '
+                'Ensure basalt-ai-cobalt is installed: pip install basalt-ai-cobalt'
+            ) from exc
+        except (FileNotFoundError, ValueError) as exc:
+            warning(f'Cobalt Dataset Endpoint: {exc!s}')
+            raise DatasetLoadError(f'Cobalt Dataset Endpoint: {exc!s}') from exc
+        # Broad by intent: every load failure leaves as one named type, so the
+        # engine sees an error rather than a successful run over zero rows.
         except Exception as exc:
             warning(f'Cobalt Dataset Endpoint: Failed to prepare dataset: {exc!s}')
-
-        return []
+            raise DatasetLoadError(f'Cobalt Dataset Endpoint: failed to prepare dataset: {exc!s}') from exc
 
     def _extractConfig(self) -> Dict[str, Any]:
         """Extract source config from the endpoint and normalize UI prefixes."""
