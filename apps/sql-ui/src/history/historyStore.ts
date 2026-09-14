@@ -42,6 +42,13 @@
 // debounced write is DROPPED, not flushed: up to 300 ms of history can be
 // lost if the user switches apps immediately after a run, and that is the
 // honest trade against writing into another app's preferences.
+//
+// THE RECORDING SWITCH IS EXEMPT from that trade. Losing a run costs a row;
+// losing a switch-OFF costs the user their decision not to have their SQL
+// written down, and they would never know. So `setRecording` writes through
+// immediately instead of riding the debounce, and any switch that could not
+// be written (no bridge mounted) is remembered in `unsavedRecording` until a
+// hydrate can land it.
 // =============================================================================
 
 import React, { useEffect, useMemo, useRef, useSyncExternalStore } from 'react';
@@ -82,6 +89,18 @@ const MAX_PENDING_RUNS = 100;
 let bag: HistoryBag = {};
 let recording: Record<string, boolean> = {};
 let hydrated = false;
+
+/**
+ * Recording switches flipped since the last successful write. These are the
+ * ONLY overrides allowed to outrank the stored flags at hydration.
+ *
+ * Keeping the whole of {@link recording} as an override instead would make
+ * every hydrate prefer a value that may be arbitrarily old: a flag that has
+ * already reached disk is re-read from disk, so a second copy of it in memory
+ * can only ever be stale — and a stale `true` surviving a detach would turn
+ * recording back on for a connection the workspace file says is off.
+ */
+let unsavedRecording: Record<string, boolean> = {};
 
 /**
  * Runs that finished before the recording switch could be read. Holding them
@@ -176,8 +195,11 @@ function hydrate(): void {
 			if (typeof value === 'boolean') flags[key] = value;
 		}
 	}
-	// A switch flipped before the bridge mounted outranks the stored one.
-	recording = { ...flags, ...recording };
+	// A switch flipped before the bridge mounted outranks the stored one —
+	// but only while it is still UNSAVED. Rebuilding from the stored flags
+	// rather than layering onto the previous in-memory map is what keeps a
+	// value from an earlier attach from outliving the file it came from.
+	recording = { ...flags, ...unsavedRecording };
 
 	hydrated = true;
 
@@ -188,8 +210,9 @@ function hydrate(): void {
 	for (const run of queued) recordRun(run.key, run.entry);
 
 	notify();
-	// Anything that was waiting in memory now has somewhere to go.
-	if (pendingKeys.length > 0) schedulePersist();
+	// Anything that was waiting in memory now has somewhere to go — entries
+	// recorded before the bridge mounted, and switches flipped before it did.
+	if (pendingKeys.length > 0 || Object.keys(unsavedRecording).length > 0) schedulePersist();
 }
 
 /** Write both preference keys now, applying the whole-bag budget first. */
@@ -202,6 +225,8 @@ function flush(): void {
 	bag = trimmed;
 	prefs.setPref(PREF_HISTORY, bag);
 	prefs.setPref(PREF_RECORDING, recording);
+	// The switches are on disk now, so nothing in memory outranks them.
+	unsavedRecording = {};
 	if (changed) notify();
 }
 
@@ -215,6 +240,22 @@ function schedulePersist(): void {
 }
 
 /**
+ * Write both preference keys NOW, cancelling any batch already in flight.
+ *
+ * A no-op when no bridge is mounted — {@link flush} refuses to write without
+ * an accessor, which is the rule this whole file is built around. The caller
+ * is responsible for keeping the unwritten intent (see
+ * {@link unsavedRecording}).
+ */
+function persistNow(): void {
+	if (persistTimer !== null) {
+		clearTimeout(persistTimer);
+		persistTimer = null;
+	}
+	flush();
+}
+
+/**
  * Attach the shell's preference accessor and hydrate from it.
  *
  * Attachment is reference-counted so more than one bridge may be mounted
@@ -222,10 +263,15 @@ function schedulePersist(): void {
  * own). The LAST detach drops any pending write and forgets the accessor —
  * see this file's header for why a background write must never happen.
  *
+ * Exported because it is the store's real seam onto the shell:
+ * {@link HistoryPrefsBridge} is a null-rendering wrapper around this call, and
+ * the persistence rules worth testing (what a hydrate trusts, what a detach
+ * drops) live here rather than in React.
+ *
  * @param api - The `{ getPref, setPref }` accessor; must be stable.
  * @returns The detach function.
  */
-function attachPrefs(api: IPrefsApi): () => void {
+export function attachPrefs(api: IPrefsApi): () => void {
 	prefs = api;
 	bridgeCount += 1;
 	if (!hydrated) hydrate();
@@ -353,8 +399,16 @@ export function clearForKey(key: string): void {
 export function setRecording(key: string, on: boolean): void {
 	if ((recording[key] ?? true) === on) return;
 	recording = { ...recording, [key]: on };
+	unsavedRecording = { ...unsavedRecording, [key]: on };
 	notify();
-	schedulePersist();
+	// NOT debounced, unlike every other mutation here. Runs arrive in bursts
+	// and one lost run costs a list row, so they batch. This switch is the
+	// opposite on both counts: a person flips it once, deliberately, and what
+	// a lost write costs is their decision not to have their SQL persisted.
+	// The last detach CANCELS a pending write (see attachPrefs), so a
+	// debounced switch-off dropped there would leave the stored flag saying
+	// `true` and the next page load would quietly resume recording.
+	persistNow();
 }
 
 // =============================================================================
