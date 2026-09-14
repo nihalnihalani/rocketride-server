@@ -35,7 +35,7 @@ import type { CSSProperties } from 'react';
 import { Button, DetailPanel, LabelValue, Section, StatusBadge } from 'shell';
 import type { ISqlSchemaTable, SqlDialect } from '../connect';
 import type { IJoinPath, IRelationGraph } from '../schema/relations';
-import { describeHop, findJoinPaths, generateJoinSql, inboundReferences } from '../schema/relations';
+import { MAX_JOIN_PATHS, describeHop, findJoinPaths, generateJoinSql, inboundReferences } from '../schema/relations';
 import { quoteIdent } from '../sql/paging';
 import { announce } from '../a11y/announce';
 import { TableIcon } from '../icons';
@@ -333,7 +333,13 @@ export const TableRecordPanel: React.FC<ITableRecordPanelProps> = (props) => {
 		return (
 			<>
 				{result.paths.length > 1 && (
-					<div style={styles.summary}>{`${result.paths.length} paths found — choose one`}</div>
+					// At the cap the list is a sample, not the answer. Saying
+					// "25 paths found" would claim there are exactly 25.
+					<div style={styles.summary}>
+						{result.paths.length >= MAX_JOIN_PATHS
+							? `${result.paths.length} paths shown (cap reached — more may exist)`
+							: `${result.paths.length} paths found — choose one`}
+					</div>
 				)}
 
 				{result.paths.length > 1
