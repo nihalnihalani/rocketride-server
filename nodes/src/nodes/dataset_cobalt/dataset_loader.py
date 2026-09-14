@@ -21,6 +21,8 @@
 # SOFTWARE.
 # =============================================================================
 
+import hashlib
+import json
 import os
 from typing import Any, Dict, List
 
@@ -95,6 +97,31 @@ def _require_item_mappings(items: List[Any], source: str) -> List[Dict[str, Any]
                 f'(got {type(item).__name__}); each item must be a mapping.'
             )
     return items
+
+
+# Marks a `dataset_id` the node synthesized because the row carried none, so a
+# consumer can still tell a real dataset id from a derived one.
+_SYNTHETIC_ID_PREFIX = 'sha256-'
+
+
+def row_identity(item: Dict[str, Any]) -> str:
+    """Return a deterministic identity for one dataset row.
+
+    Used when a row carries no usable ``id``. The digest is taken over the
+    whole row, so the same row yields the same identity on every scan of the
+    same dataset, and two rows with different content never collide.
+
+    Args:
+        item: A raw dataset row.
+
+    Returns:
+        ``sha256-<hex digest>``.
+    """
+    # default=str keeps a row holding a non-JSON-serialisable value (a date,
+    # say) hashable instead of raising out of the load; sort_keys makes the
+    # digest independent of dict ordering.
+    payload = json.dumps(item, sort_keys=True, default=str)
+    return _SYNTHETIC_ID_PREFIX + hashlib.sha256(payload.encode('utf-8')).hexdigest()
 
 
 class DatasetLoader:
@@ -417,9 +444,21 @@ class DatasetLoader:
                 (v for v in (item.get('expected'), item.get('output'), item.get('answer')) if v is not None),
                 '',
             )
+            # `item.get('id') or ''` used truthiness, so the ids 0, False and
+            # '' all collapsed into '' — indistinguishable from each other and
+            # from a row that carried no id at all, which broke any attempt to
+            # correlate scores back to inputs by dataset_id.
+            #
+            # 0 and False are addressable ids and are preserved as themselves.
+            # A missing, null or empty id is not addressable, so the row gets a
+            # deterministic synthesized one instead of a shared ''. The same
+            # value becomes the scan entry's URL identity, so the join key and
+            # the entry identity are always the same string.
+            raw_id = item.get('id')
+            dataset_id = raw_id if raw_id is not None and raw_id != '' else row_identity(item)
             metadata = {
                 'expected': expected,
-                'dataset_id': item.get('id') or '',
+                'dataset_id': dataset_id,
                 'cobalt_source': True,
             }
             # Preserve any extra fields from the original item as metadata

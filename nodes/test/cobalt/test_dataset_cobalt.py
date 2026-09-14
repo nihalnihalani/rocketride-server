@@ -30,8 +30,10 @@ import importlib.machinery
 import importlib.util
 import os
 import pathlib
+import re
 import sys
 from types import ModuleType
+from urllib.parse import quote
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -331,7 +333,7 @@ mock_cobalt.Dataset = MockDataset
 # ---------------------------------------------------------------------------
 # Now import the actual node code
 # ---------------------------------------------------------------------------
-from dataset_cobalt.dataset_loader import DatasetLoader, DatasetLoadError
+from dataset_cobalt.dataset_loader import DatasetLoader, DatasetLoadError, row_identity
 from dataset_cobalt.IEndpoint import IEndpoint
 from dataset_cobalt.IGlobal import IGlobal
 from dataset_cobalt.IInstance import IInstance
@@ -1502,3 +1504,141 @@ class TestDependencyInstallFailureFallsBack:
 
         with self._failing_depends(), pytest.raises(DatasetLoadError, match='Dataset file not found'):
             endpoint.scanObjects('', lambda entry: 0)
+
+
+class TestScanEntryIdentityIsStable:
+    """The scan entry URL must be derived from the row, not minted per scan.
+
+    It used to be ``f'dataset_cobalt://{index}/{uuid.uuid4()}'``, so the same
+    logical row got a brand-new identity on every scan and nothing downstream
+    could dedup a re-emitted row or resume a partial dataset.
+    """
+
+    def _scan(self, tmp_path, monkeypatch, payload):
+        monkeypatch.chdir(tmp_path)
+        f = tmp_path / 'data.json'
+        f.write_text(payload)
+        endpoint = IEndpoint()
+        endpoint.endpoint = MagicMock()
+        endpoint.endpoint.logicalType = 'dataset_cobalt'
+        endpoint.endpoint.serviceConfig = {'source_type': 'file', 'file_path': str(f), 'sample_size': 0}
+        endpoint.endpoint.bag = {}
+        entries = []
+        # Read the file on disk rather than MockDataset's canned contents.
+        with patch.dict(sys.modules, {'cobalt': None}):
+            endpoint.scanObjects('', lambda entry: entries.append(entry) or 0)
+        return entries
+
+    def test_repeat_scans_produce_identical_urls(self, tmp_path, monkeypatch):
+        payload = '[{"input": "q1", "expected": "a1"}, {"input": "q2", "expected": "a2"}]'
+        first = self._scan(tmp_path, monkeypatch, payload)
+        second = self._scan(tmp_path, monkeypatch, payload)
+
+        assert [e['url'] for e in first] == [e['url'] for e in second]
+        assert len({e['url'] for e in first}) == 2
+
+    def test_no_uuid_in_the_url(self, tmp_path, monkeypatch):
+        entries = self._scan(tmp_path, monkeypatch, '[{"input": "q1"}]')
+        # A uuid4 renders as 8-4-4-4-12 hex with dashes; the identity must not
+        # look like one, and must be reproducible.
+        assert not re.search(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-', entries[0]['url'])
+
+    def test_explicit_id_becomes_the_identity(self, tmp_path, monkeypatch):
+        entries = self._scan(tmp_path, monkeypatch, '[{"id": "row-7", "input": "q1"}]')
+        assert entries[0]['url'] == 'dataset_cobalt://1/row-7'
+
+    def test_id_is_percent_encoded_for_the_url(self, tmp_path, monkeypatch):
+        entries = self._scan(tmp_path, monkeypatch, '[{"id": "a/b c", "input": "q1"}]')
+        assert entries[0]['url'] == 'dataset_cobalt://1/a%2Fb%20c'
+
+    def test_zero_id_is_a_real_id_not_a_missing_one(self, tmp_path, monkeypatch):
+        entries = self._scan(tmp_path, monkeypatch, '[{"id": 0, "input": "q1"}]')
+        assert entries[0]['url'] == 'dataset_cobalt://1/0'
+
+    def test_different_content_gets_a_different_identity(self, tmp_path, monkeypatch):
+        one = self._scan(tmp_path, monkeypatch, '[{"input": "q1"}]')
+        two = self._scan(tmp_path, monkeypatch, '[{"input": "q2"}]')
+        assert one[0]['url'] != two[0]['url']
+
+    def test_duplicate_rows_stay_distinct_entries(self, tmp_path, monkeypatch):
+        entries = self._scan(tmp_path, monkeypatch, '[{"input": "q"}, {"input": "q"}]')
+        assert entries[0]['url'] != entries[1]['url']
+
+    def test_identity_survives_a_non_serialisable_value(self):
+        import datetime
+
+        item = {'text': 'q', 'metadata': {'when': datetime.date(2026, 9, 14)}}
+        assert IEndpoint._identity_for_item(item)
+
+    def test_url_identity_matches_the_dataset_id_join_key(self, tmp_path, monkeypatch):
+        """The entry URL and the metadata join key must be the same string."""
+        entries = self._scan(tmp_path, monkeypatch, '[{"input": "q1"}, {"id": "row-2", "input": "q2"}]')
+
+        for index, entry in enumerate(entries, start=1):
+            dataset_id = entry['objectTags']['metadata']['dataset_id']
+            assert entry['url'] == f'dataset_cobalt://{index}/{quote(str(dataset_id), safe="")}'
+
+    def test_id_less_row_url_carries_the_synthesized_identity(self, tmp_path, monkeypatch):
+        entries = self._scan(tmp_path, monkeypatch, '[{"input": "q1"}]')
+        assert entries[0]['url'].startswith('dataset_cobalt://1/sha256-')
+
+
+class TestDatasetIdIsAlwaysAddressable:
+    """``item.get('id') or ''`` collapsed 0, False, '' and "no id" into one value.
+
+    An evaluator correlating scores back to inputs by ``dataset_id`` (the join
+    key eval_cobalt's README documents) could not then tell row 0 from a row
+    with no id at all, nor one id-less row from another.
+    """
+
+    def test_zero_id_is_preserved(self):
+        loader = _make_loader()
+        questions = loader.to_questions([{'id': 0, 'input': 'q'}])
+        assert questions[0]['metadata']['dataset_id'] == 0
+
+    def test_false_id_is_preserved(self):
+        loader = _make_loader()
+        questions = loader.to_questions([{'id': False, 'input': 'q'}])
+        assert questions[0]['metadata']['dataset_id'] is False
+
+    def test_string_id_is_preserved(self):
+        loader = _make_loader()
+        questions = loader.to_questions([{'id': 'row-7', 'input': 'q'}])
+        assert questions[0]['metadata']['dataset_id'] == 'row-7'
+
+    def test_missing_id_gets_a_synthesized_identity(self):
+        loader = _make_loader()
+        questions = loader.to_questions([{'input': 'q'}])
+        assert questions[0]['metadata']['dataset_id'].startswith('sha256-')
+
+    def test_none_id_gets_a_synthesized_identity(self):
+        loader = _make_loader()
+        questions = loader.to_questions([{'id': None, 'input': 'q'}])
+        assert questions[0]['metadata']['dataset_id'].startswith('sha256-')
+
+    def test_empty_string_id_gets_a_synthesized_identity(self):
+        """'' is not addressable, so it cannot serve as a join key."""
+        loader = _make_loader()
+        questions = loader.to_questions([{'id': '', 'input': 'q'}])
+        assert questions[0]['metadata']['dataset_id'].startswith('sha256-')
+
+    def test_zero_and_missing_are_distinguishable(self):
+        loader = _make_loader()
+        questions = loader.to_questions([{'id': 0, 'input': 'a'}, {'input': 'b'}])
+        assert questions[0]['metadata']['dataset_id'] != questions[1]['metadata']['dataset_id']
+
+    def test_two_id_less_rows_do_not_collapse(self):
+        loader = _make_loader()
+        questions = loader.to_questions([{'input': 'a'}, {'input': 'b'}])
+        assert questions[0]['metadata']['dataset_id'] != questions[1]['metadata']['dataset_id']
+
+    def test_synthesized_id_is_stable_across_calls(self):
+        loader = _make_loader()
+        first = loader.to_questions([{'input': 'a', 'expected': 'b'}])
+        second = loader.to_questions([{'input': 'a', 'expected': 'b'}])
+        assert first[0]['metadata']['dataset_id'] == second[0]['metadata']['dataset_id']
+
+    def test_row_identity_survives_a_non_serialisable_value(self):
+        import datetime
+
+        assert row_identity({'input': 'q', 'when': datetime.date(2026, 9, 14)}).startswith('sha256-')

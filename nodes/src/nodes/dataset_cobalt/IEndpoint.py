@@ -21,9 +21,11 @@
 # SOFTWARE.
 # =============================================================================
 
+import hashlib
+import json
 import os
-import uuid
 from typing import Any, Callable, Dict, List
+from urllib.parse import quote
 
 from ai.common.config import Config
 from rocketlib import IEndpointBase, debug, monitorCompleted, monitorStatus, warning
@@ -225,7 +227,7 @@ class IEndpoint(IEndpointBase):
         text = str(raw_text) if raw_text is not None and raw_text != '' else f'Cobalt dataset item {index}'
 
         return {
-            'url': f'dataset_cobalt://{index}/{uuid.uuid4()}',
+            'url': f'dataset_cobalt://{index}/{self._identity_for_item(item)}',
             'name': text[:200],
             'isContainer': False,
             'size': len(text.encode('utf-8')),
@@ -234,3 +236,43 @@ class IEndpoint(IEndpointBase):
                 'metadata': item.get('metadata', {}),
             },
         }
+
+    @staticmethod
+    def _identity_for_item(item: Dict[str, Any]) -> str:
+        """Return a stable identity for one dataset row.
+
+        This used to be ``uuid.uuid4()``, which minted a fresh identity for the
+        same logical row on every scan — nothing downstream could dedup a
+        re-emitted row or resume a partially-processed dataset.
+
+        The identity is the row's ``dataset_id``, which
+        ``DatasetLoader.to_questions`` guarantees is present and usable: the
+        row's own id when it has an addressable one (``0`` and ``False``
+        included), and a deterministic ``sha256-`` digest of the row otherwise.
+        Using that same string here keeps the entry identity and the join key
+        downstream consumers correlate on identical.
+
+        The emitted URL keeps its ``{index}/`` prefix: a dataset may legally
+        repeat a row verbatim, and those rows share a content digest, so the
+        ordinal is what keeps their entries distinct for the engine's object
+        identity.
+
+        Args:
+            item: A question dict as produced by ``DatasetLoader.to_questions``.
+
+        Returns:
+            A URL-safe identity string for this row.
+        """
+        metadata = item.get('metadata') or {}
+        dataset_id = metadata.get('dataset_id') if isinstance(metadata, dict) else None
+        if dataset_id is not None and dataset_id != '':
+            return quote(str(dataset_id), safe='')
+
+        # to_questions always supplies a usable dataset_id; this covers an entry
+        # assembled by hand, so identity stays deterministic either way.
+        payload = json.dumps(
+            {'text': item.get('text', ''), 'metadata': metadata},
+            sort_keys=True,
+            default=str,
+        )
+        return hashlib.sha256(payload.encode('utf-8')).hexdigest()
