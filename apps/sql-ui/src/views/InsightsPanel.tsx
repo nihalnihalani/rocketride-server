@@ -37,7 +37,7 @@ import type { GridCellComponent, GridColumnDefinition } from 'shell';
 import type { ISqlEndpoint } from '../connect';
 import type { ISchemaState } from '../schema/schemaStore';
 import { buildRelationGraph, orientation } from '../schema/relations';
-import { runSchemaChecks } from '../schema/quality';
+import { RULE_LABELS, runSchemaChecks } from '../schema/quality';
 import type { IFinding } from '../schema/quality';
 import { requestTableRecord } from '../navigation';
 import { DatabaseIcon } from '../icons';
@@ -58,9 +58,9 @@ export interface IInsightsPanelProps {
 interface IFindingRow extends Record<string, unknown> {
 	/** Row identity. */
 	id: string;
-	/** Severity label (`problem` or `candidate`). */
+	/** Severity label (`warning` or `info`). */
 	severity: string;
-	/** Rule identifier. */
+	/** The rule's name, in words. */
 	rule: string;
 	/** `table` or `table.column`. */
 	target: string;
@@ -137,13 +137,24 @@ const styles = {
 export const InsightsPanel: React.FC<IInsightsPanelProps> = ({ endpoint, snapshot }) => {
 	const graph = useMemo(() => buildRelationGraph(snapshot.schema), [snapshot.schema]);
 	const shape = useMemo(() => orientation(graph), [graph]);
-	const findings = useMemo(() => runSchemaChecks(snapshot.schema), [snapshot.schema]);
+	const findings = useMemo(
+		() => runSchemaChecks(snapshot.schema, snapshot.dialect),
+		[snapshot.schema, snapshot.dialect],
+	);
+
+	// The tab badge counts WARNINGS only. An `info` finding is something to
+	// know, not something to do, and a badge that counts both would show a
+	// number on every healthy ClickHouse schema.
+	const warningCount = useMemo(
+		() => findings.filter((finding) => finding.severity === 'warning').length,
+		[findings],
+	);
 
 	const rows = useMemo<IFindingRow[]>(
 		() => findings.map((finding: IFinding, index) => ({
 			id: `${finding.rule}-${finding.table}-${finding.column ?? ''}-${index}`,
-			severity: finding.severity === 'warning' ? 'problem' : 'candidate',
-			rule: finding.rule,
+			severity: finding.severity,
+			rule: RULE_LABELS[finding.rule],
 			target: finding.column ? `${finding.table}.${finding.column}` : finding.table,
 			table: finding.table,
 			evidence: finding.evidence,
@@ -164,7 +175,7 @@ export const InsightsPanel: React.FC<IInsightsPanelProps> = ({ endpoint, snapsho
 					field: 'severity',
 					rrType: 'string',
 					rrDefault: true,
-					rrDescription: 'problem = definitely wrong in this snapshot; candidate = worth a look.',
+					rrDescription: 'warning = worth fixing; info = worth knowing, not a verdict.',
 					width: 120,
 					headerSort: true,
 				},
@@ -174,7 +185,7 @@ export const InsightsPanel: React.FC<IInsightsPanelProps> = ({ endpoint, snapsho
 					rrType: 'string',
 					rrDefault: true,
 					rrDescription: 'Which rule produced the finding.',
-					width: 80,
+					width: 180,
 					headerSort: true,
 				},
 				{
@@ -226,7 +237,8 @@ export const InsightsPanel: React.FC<IInsightsPanelProps> = ({ endpoint, snapsho
 	 *
 	 * @param label - The row's label.
 	 * @param names - The table names.
-	 * @param badge - Optional per-name badge text (the hub's inbound count).
+	 * @param badge - Optional suffix naming what the number counts. A bare
+	 *                number beside a table name could be anything.
 	 * @returns The strip row.
 	 */
 	const renderGroup = (label: string, names: string[], badge?: (name: string) => string): React.ReactElement => (
@@ -234,8 +246,14 @@ export const InsightsPanel: React.FC<IInsightsPanelProps> = ({ endpoint, snapsho
 			<span style={styles.groupLabel}>{label}</span>
 			{names.length === 0 && <span style={styles.empty}>none</span>}
 			{names.map((name) => (
-				<Button key={name} variant="ghost" small onClick={() => requestTableRecord(endpoint.key, name)}>
-					{badge ? `${name} ${badge(name)}` : name}
+				<Button
+					key={name}
+					variant="ghost"
+					small
+					title={badge ? `${name} — ${badge(name)}` : name}
+					onClick={() => requestTableRecord(endpoint.key, name)}
+				>
+					{badge ? `${name} · ${badge(name)}` : name}
 				</Button>
 			))}
 		</div>
@@ -259,7 +277,10 @@ export const InsightsPanel: React.FC<IInsightsPanelProps> = ({ endpoint, snapsho
 						)
 						: (
 							<>
-								{renderGroup('Hubs (most referenced)', hubNames, (name) => String(inboundByTable.get(name) ?? 0))}
+								{renderGroup('Hubs (most referenced)', hubNames, (name) => {
+									const count = inboundByTable.get(name) ?? 0;
+									return `${count} referencing ${count === 1 ? 'table' : 'tables'}`;
+								})}
 								{renderGroup('Leaves (reference only)', shape.leaves)}
 								{renderGroup('Isolated (no relationships)', shape.isolated)}
 							</>
@@ -272,7 +293,7 @@ export const InsightsPanel: React.FC<IInsightsPanelProps> = ({ endpoint, snapsho
 				<Card noBodyPadding fill>
 					<CardDataGrid<IFindingRow>
 						title="Review"
-						actions={<StatusBadge variant={findings.length ? 'warning' : 'success'}>{`${findings.length} findings`}</StatusBadge>}
+						actions={<StatusBadge variant={warningCount ? 'warning' : 'success'}>{`${warningCount} warnings · ${findings.length} findings`}</StatusBadge>}
 						columns={columns}
 						data={rows}
 						tableId="sql-insights-findings"
@@ -280,7 +301,7 @@ export const InsightsPanel: React.FC<IInsightsPanelProps> = ({ endpoint, snapsho
 						height="100%"
 						onRowClick={(row) => requestTableRecord(endpoint.key, row.table)}
 						emptyTitle="No findings"
-						emptyDescription="Rules R1 to R3 found nothing to report."
+						emptyDescription="Rules found nothing to report."
 					/>
 				</Card>
 			</div>

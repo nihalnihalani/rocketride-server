@@ -29,7 +29,11 @@
 // snapshot does not contain — and nothing here changes anything.
 //
 // Three rules, and the reason each one stops where it does:
-//   R1  A table has no primary key. The snapshot knows this for certain.
+//   R1  A table has no primary key. The snapshot knows this for certain on
+//       engines that reflect one — but ClickHouse reports no primary-key
+//       CONSTRAINT at all (a MergeTree ORDER BY is not one), so there the
+//       rule would fire on every table and mean nothing. It drops to `info`
+//       with wording that names the engine, rather than accusing the schema.
 //   R3  A foreign key names a table or column the snapshot does not have.
 //       Certain within the snapshot; a snapshot read before a migration can
 //       produce this against a database that is perfectly consistent, which
@@ -43,7 +47,7 @@
 // guess in a list of findings reads as a fact.
 // =============================================================================
 
-import type { ISqlSchemaResponse } from '../connect';
+import type { ISqlSchemaResponse, SqlDialect } from '../connect';
 
 // =============================================================================
 // TYPES
@@ -55,11 +59,22 @@ export type Severity = 'info' | 'warning';
 /** The rules this module can report. */
 export type RuleId = 'R1' | 'R2' | 'R3';
 
+/**
+ * What each rule is called on screen. Rule ids are for cross-referencing,
+ * not for reading: a grid column of `R1`/`R2`/`R3` tells a first-time reader
+ * nothing, and there is nowhere on the page to look them up.
+ */
+export const RULE_LABELS: Record<RuleId, string> = {
+	R1: 'No primary key',
+	R2: 'Type strings differ',
+	R3: 'Dangling foreign key',
+};
+
 /** One thing worth saying about the schema snapshot. */
 export interface IFinding {
 	/** Which rule produced it. */
 	rule: RuleId;
-	/** `warning` = a definite problem; `info` = worth a look, not a verdict. */
+	/** `warning` = worth fixing; `info` = worth knowing, not a verdict. */
 	severity: Severity;
 	/** The table the finding is about. */
 	table: string;
@@ -122,25 +137,41 @@ export function normaliseType(type: string): string {
  * Run every rule over one schema snapshot.
  *
  * Findings are ordered warnings first, then by table and column, so the list
- * reads the same on every render and the definite problems come first.
+ * reads the same on every render and the ones worth acting on come first.
  *
  * @param schema - The connection's schema snapshot.
+ * @param dialect - The engine dialect; it decides what a missing primary key
+ *                  means (see R1).
  * @returns Every finding, ordered.
  */
-export function runSchemaChecks(schema: ISqlSchemaResponse | null | undefined): IFinding[] {
+export function runSchemaChecks(
+	schema: ISqlSchemaResponse | null | undefined,
+	dialect: SqlDialect = 'unknown',
+): IFinding[] {
 	const tables = schema?.tables ?? {};
 	const findings: IFinding[] = [];
 
 	for (const [table, def] of Object.entries(tables)) {
 		// ── R1 — no primary key ──────────────────────────────────────────────
+		// On ClickHouse this says nothing about the table: the engine
+		// reflects no primary-key constraint for any of them, so reporting
+		// every table as a problem would be noise dressed as a finding.
 		if (!def?.primary_key?.length) {
-			findings.push({
-				rule: 'R1',
-				severity: 'warning',
-				table,
-				evidence: 'no primary key',
-				message: 'Table has no primary key. Rows cannot be addressed individually, and the data browser cannot page in a guaranteed order.',
-			});
+			findings.push(dialect === 'clickhouse'
+				? {
+					rule: 'R1',
+					severity: 'info',
+					table,
+					evidence: 'none reflected',
+					message: 'ClickHouse reflects no primary-key constraint, so this says nothing about the table.',
+				}
+				: {
+					rule: 'R1',
+					severity: 'warning',
+					table,
+					evidence: 'no primary key',
+					message: 'Table has no primary key. Rows cannot be addressed individually, and the data browser cannot page in a guaranteed order.',
+				});
 		}
 
 		// Column types of this table, for the R2 comparison.

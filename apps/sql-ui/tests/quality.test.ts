@@ -27,7 +27,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import type { ISqlSchemaResponse } from '../src/connect';
-import { normaliseType, runSchemaChecks } from '../src/schema/quality';
+import { RULE_LABELS, normaliseType, runSchemaChecks } from '../src/schema/quality';
 
 // =============================================================================
 // TYPE NORMALISATION
@@ -63,18 +63,41 @@ describe('runSchemaChecks', () => {
 		assert.deepEqual(runSchemaChecks({ error: 'boom' }), []);
 	});
 
-	it('R1 fires for a table with no primary key', () => {
+	it('R1 warns for a table with no primary key', () => {
 		const schema: ISqlSchemaResponse = {
 			tables: {
 				audit_log: { columns: [{ column: 'id', type: 'BIGINT' }] },
 				customers: { columns: [{ column: 'id', type: 'BIGINT' }], primary_key: ['id'] },
 			},
 		};
-		const findings = runSchemaChecks(schema);
+		const findings = runSchemaChecks(schema, 'mysql');
 		assert.equal(findings.length, 1);
 		assert.equal(findings[0]?.rule, 'R1');
 		assert.equal(findings[0]?.table, 'audit_log');
 		assert.equal(findings[0]?.severity, 'warning');
+	});
+
+	it('R1 drops to information on ClickHouse, which reflects no primary key', () => {
+		const schema: ISqlSchemaResponse = {
+			tables: {
+				events: { columns: [{ column: 'ts', type: 'DateTime' }] },
+				hits: { columns: [{ column: 'ts', type: 'DateTime' }] },
+			},
+		};
+		const findings = runSchemaChecks(schema, 'clickhouse');
+		assert.equal(findings.length, 2);
+		assert.equal(findings.every((f) => f.severity === 'info'), true);
+		assert.equal(findings[0]?.message, 'ClickHouse reflects no primary-key constraint, so this says nothing about the table.');
+		// Nothing on a ClickHouse schema should reach the tab badge.
+		assert.equal(findings.filter((f) => f.severity === 'warning').length, 0);
+	});
+
+	it('names every rule in words, so a grid column can be read', () => {
+		assert.deepEqual(RULE_LABELS, {
+			R1: 'No primary key',
+			R2: 'Type strings differ',
+			R3: 'Dangling foreign key',
+		});
 	});
 
 	it('R3 fires for a key pointing at a table missing from the snapshot', () => {
@@ -180,7 +203,7 @@ describe('runSchemaChecks', () => {
 					foreign_keys: [{ columns: ['customer_id'], referred_table: 'customers', referred_columns: ['id'] }],
 				},
 			},
-		});
+		}, 'mysql');
 		assert.deepEqual(findings.map((f) => f.rule), ['R1', 'R2']);
 		assert.equal(findings[0]?.severity, 'warning');
 		assert.equal(findings[1]?.severity, 'info');

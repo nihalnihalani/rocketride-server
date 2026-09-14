@@ -93,13 +93,22 @@ export const ConnectionView: React.FC<IConnectionViewProps> = ({ endpoint }) => 
 
 	// Snapshot-only review findings; the count rides the Insights tab so the
 	// page advertises whether it has anything to say before it is opened.
-	const findingCount = useMemo(() => runSchemaChecks(snapshot.schema).length, [snapshot.schema]);
+	//
+	// WARNINGS only. An `info` finding is something to know, not something to
+	// do, and counting both would put a number on the tab of every healthy
+	// ClickHouse schema (where "no primary key" is how the engine reflects
+	// every table). A badge that is always lit stops being read.
+	const warningCount = useMemo(
+		() => runSchemaChecks(snapshot.schema, snapshot.dialect)
+			.filter((finding) => finding.severity === 'warning').length,
+		[snapshot.schema, snapshot.dialect],
+	);
 
 	// The document's pages — grows as later phases land.
 	const menu: ViewMenu = {
 		entries: [
 			{ id: 'overview', label: 'Overview' },
-			{ id: 'insights', label: 'Insights', count: findingCount },
+			{ id: 'insights', label: 'Insights', count: warningCount },
 		],
 	};
 
