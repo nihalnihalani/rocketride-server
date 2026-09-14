@@ -53,6 +53,12 @@ export interface IHistoryEntry {
 	outcome: HistoryOutcome;
 	/** Rows returned, when the outcome is `rows`. */
 	rows?: number;
+	/**
+	 * The row limit in force for this run, when one was applied. A row count
+	 * without its limit is ambiguous: `1000 rows` could be the whole answer
+	 * or the ceiling cutting it off, and those mean opposite things.
+	 */
+	limit?: number;
 	/** Rows affected, when the outcome is `affected`. */
 	affected?: number;
 	/** Error text, when the outcome is `error` (stored bounded). */

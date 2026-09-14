@@ -270,7 +270,14 @@ function clock(at: number): string {
  */
 function outcomeBadge(entry: IHistoryEntry): { variant: 'success' | 'info' | 'error' | 'muted'; label: string } {
 	switch (entry.outcome) {
-		case 'rows': return { variant: 'success', label: `${entry.rows ?? 0} rows` };
+		case 'rows': return {
+			variant: 'success',
+			// A bare row count cannot say whether it is the whole answer or
+			// the ceiling cutting it off, so it never appears without one.
+			label: entry.limit !== undefined
+				? `${entry.rows ?? 0} rows (limit ${entry.limit})`
+				: `${entry.rows ?? 0} rows returned`,
+		};
 		case 'affected': return { variant: 'info', label: `${entry.affected ?? 0} affected` };
 		case 'error': return { variant: 'error', label: 'error' };
 		default: return { variant: 'muted', label: 'abandoned' };
@@ -475,7 +482,12 @@ export const HistoryPanel: React.FC<IHistoryPanelProps> = (props) => {
 							</label>
 
 							<div style={styles.actions}>
-								<Button variant="secondary" small onClick={() => { onLoadIntoEditor(entry.sql); announce('Statement loaded into the editor'); }}>
+								{/* No announcement here: the query view may raise a
+								    "Replace editor text?" confirm that the user
+								    cancels, and it announces the load that does
+								    happen. Announcing both would be wrong once
+								    and duplicated the rest of the time. */}
+								<Button variant="secondary" small onClick={() => onLoadIntoEditor(entry.sql)}>
 									Load into editor
 								</Button>
 								<Button variant="primary" small onClick={() => requestRerun(entry)}>Rerun</Button>
@@ -544,16 +556,20 @@ export const HistoryPanel: React.FC<IHistoryPanelProps> = (props) => {
 				subtitle={`${endpoint.nodeName} · this connection`}
 				footer={
 					<>
+						{/* The label carries the state in TEXT. `pressed` alone
+						    left on and off separated by colour, which is no
+						    difference at all to a reader who cannot see it. */}
 						<Button
 							variant="ghost"
 							small
 							pressed={isRecording}
+							title="Record the statements you run on this connection"
 							onClick={() => {
 								setRecording(endpoint.key, !isRecording);
 								announce(isRecording ? 'Recording off for this connection' : 'Recording on for this connection');
 							}}
 						>
-							Record history for this connection
+							{isRecording ? 'Recording: on' : 'Recording: off'}
 						</Button>
 						<Button variant="ghost" small disabled={entries.length === 0} onClick={() => setConfirmClear(true)}>
 							Clear...
