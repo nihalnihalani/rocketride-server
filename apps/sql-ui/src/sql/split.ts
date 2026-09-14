@@ -184,7 +184,9 @@ function opensDashComment(sql: string, open: number, traits: IScanTraits): boole
 	if (!traits.dashCommentsNeedSpace) return true;
 	const next = sql[open + 2];
 	// Nothing follows the dashes, so there is no text left to hide either way.
-	return next === undefined || /[\s\u0000-\u001f]/.test(next);
+	if (next === undefined) return true;
+	// Whitespace, or any other control character (which MySQL accepts too).
+	return /\s/.test(next) || next.charCodeAt(0) <= 0x1f;
 }
 
 /**
