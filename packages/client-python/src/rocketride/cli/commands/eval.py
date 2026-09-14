@@ -47,10 +47,13 @@ Key Features:
     - In-CLI glob expansion for cross-platform wildcard support
     - Case filtering via --case and early exit via --fail-fast
     - Machine-readable output via --json, JUnit XML via --junit for CI
+    - A spec that cannot be run at all is reported in every output format,
+      so a CI artifact never shows a green run for a failed one
 
 Exit Codes:
     0: All cases passed
-    1: At least one case failed (or errored)
+    1: At least one case failed (or errored), or a spec could not run to
+       completion
     2: Usage error, spec parse/validation error, connection failure, or no
        case produced a result (e.g. a --case filter that matches nothing)
 
@@ -67,7 +70,7 @@ import os
 import sys
 
 from ...evals.judge import make_judge
-from ...evals.reporters import EvalReport, render_human, render_json, render_junit
+from ...evals.reporters import EvalReport, SpecError, render_human, render_json, render_junit
 from ...evals.runner import run_spec
 from ...evals.spec import EvalSpec, EvalSpecError, load_spec
 from ..utils.common import connect_client, disconnect_all
@@ -162,9 +165,12 @@ async def run_eval(args) -> int:
             return 2
 
         # Run each spec sequentially, isolating spec-level failures (e.g. a
-        # pipeline that fails to start) so remaining specs still run
+        # pipeline that fails to start) so remaining specs still run. A spec
+        # that raises produces no report, so it is recorded separately and
+        # carried into every output format: a machine report that omitted it
+        # would show a green run for a run that failed.
         reports: list[EvalReport] = []
-        had_spec_error = False
+        spec_errors: list[SpecError] = []
         for spec in specs:
             try:
                 report = await run_spec(
@@ -175,8 +181,9 @@ async def run_eval(args) -> int:
                     judge_factory=make_judge,
                 )
             except Exception as err:  # noqa: BLE001
-                had_spec_error = True
-                print(f'Error: {spec.path}: {err}', file=sys.stderr)
+                spec_error = SpecError.from_exception(spec.path, err)
+                spec_errors.append(spec_error)
+                print(f'Error: {spec_error.spec_path}: {spec_error.message}', file=sys.stderr)
                 if args.fail_fast:
                     break
                 continue
@@ -187,9 +194,9 @@ async def run_eval(args) -> int:
 
         # Emit results in the requested format; --json owns stdout entirely
         if args.json:
-            print(json.dumps(render_json(reports), indent=2))
+            print(json.dumps(render_json(reports, spec_errors), indent=2))
         else:
-            print(render_human(reports, use_color=sys.stdout.isatty()))
+            print(render_human(reports, use_color=sys.stdout.isatty(), spec_errors=spec_errors))
 
         # --junit writes the XML report in addition to the output above
         if args.junit:
@@ -198,20 +205,21 @@ async def run_eval(args) -> int:
                 if junit_dir:
                     os.makedirs(junit_dir, exist_ok=True)
                 with open(args.junit, 'w', encoding='utf-8') as handle:
-                    handle.write(render_junit(reports))
+                    handle.write(render_junit(reports, spec_errors))
             except OSError as err:
                 print(f'Error: Cannot write JUnit report to {args.junit}: {err}', file=sys.stderr)
                 return 2
 
         # Exit 2 if no case produced a result at all (every spec errored, or
-        # the --case filter matched nothing)
+        # the --case filter matched nothing). The reports written above still
+        # carry the spec errors that got us here.
         total_results = sum(len(report.case_results) for report in reports)
         if total_results == 0:
             return 2
 
         # Exit 1 if any case failed or any spec could not run to completion
         failed = sum(report.failed_count for report in reports)
-        if failed > 0 or had_spec_error:
+        if failed > 0 or spec_errors:
             return 1
         return 0
     finally:

@@ -36,20 +36,28 @@ format maps one ``<testsuite>`` per spec and one ``<testcase>`` per case,
 with ``<failure>`` elements carrying failed-assertion details and ``<error>``
 elements for cases that crashed before producing assertions.
 
+A spec that could not be run at all (e.g. its pipeline failed to start)
+produces no ``EvalReport``, so every renderer also takes a list of
+``SpecError`` records. Without them the machine-readable reports would show
+a clean run for a run that actually failed, which is exactly what a CI
+consumer reads to decide whether a change is green.
+
 Key Features:
     - CaseResult/EvalReport dataclasses with derived pass/fail counts
+    - SpecError records for specs that never produced a report
     - Human-readable rendering with optional ANSI colors
     - Machine-readable JSON document for scripting
     - JUnit XML via xml.etree with fully escaped, XML-safe text
 
 Usage:
-    print(render_human(reports, use_color=sys.stdout.isatty()))
-    json.dumps(render_json(reports))
-    pathlib.Path('junit.xml').write_text(render_junit(reports))
+    print(render_human(reports, use_color=sys.stdout.isatty(), spec_errors=spec_errors))
+    json.dumps(render_json(reports, spec_errors))
+    pathlib.Path('junit.xml').write_text(render_junit(reports, spec_errors))
 
 Components:
     CaseResult: Result of one eval case
     EvalReport: Result of one eval spec (all its cases)
+    SpecError: A spec that could not be run to completion
     render_human: Terminal-friendly report text
     render_json: Single JSON document for all specs
     render_junit: JUnit XML string for CI ingestion
@@ -70,6 +78,9 @@ _ANSI_RED = '\033[91m'
 _ANSI_GREEN = '\033[92m'
 _CHR_CHECK = '✓'
 _CHR_CROSS = '✗'
+
+# Name of the synthetic JUnit testcase standing in for a spec that never ran
+_SPEC_ERROR_CASE_NAME = 'spec did not run'
 
 
 @dataclass
@@ -128,17 +139,63 @@ class EvalReport:
         return self.failed_count == 0
 
 
-def render_human(reports: list[EvalReport], use_color: bool) -> str:
+@dataclass(frozen=True)
+class SpecError:
+    """
+    A spec that could not be run to completion.
+
+    Produced when running a spec raises before it yields an ``EvalReport``
+    (e.g. its pipeline fails to start), so the failure is still carried into
+    every report format instead of silently vanishing from them.
+
+    Attributes:
+        spec_path: Path of the ``.eval.json`` spec that could not be run
+        message: Human-readable error message (never empty)
+        error_type: Class name of the underlying exception
+    """
+
+    spec_path: str
+    message: str
+    error_type: str
+
+    @classmethod
+    def from_exception(cls, spec_path: str, error: BaseException) -> SpecError:
+        """
+        Build a SpecError from the exception a spec run raised.
+
+        Args:
+            spec_path: Path of the spec that could not be run
+            error: The exception raised while running the spec
+
+        Returns:
+            SpecError: Record carrying the path, message, and exception type;
+            the exception type stands in as the message when the exception
+            carries no message of its own
+        """
+        return cls(
+            spec_path=spec_path,
+            message=str(error) or type(error).__name__,
+            error_type=type(error).__name__,
+        )
+
+
+def render_human(
+    reports: list[EvalReport],
+    use_color: bool,
+    spec_errors: list[SpecError] | None = None,
+) -> str:
     """
     Render eval reports as human-readable terminal text.
 
     Emits one check/cross line per case, indented per-assertion detail
-    lines, and a final summary line of the form
-    ``Summary: N case(s), P passed, F failed``.
+    lines, a cross line per spec that could not be run, and a final summary
+    line of the form ``Summary: N case(s), P passed, F failed`` — extended
+    with ``, E spec error(s)`` when any spec failed to run.
 
     Args:
         reports: Eval reports in execution order
         use_color: True to wrap status symbols in ANSI color codes
+        spec_errors: Specs that could not be run to completion
 
     Returns:
         str: The rendered report (no trailing newline)
@@ -159,24 +216,40 @@ def render_human(reports: list[EvalReport], use_color: bool) -> str:
                 assertion_symbol = check if outcome.passed else cross
                 lines.append(f'      {assertion_symbol} {outcome.spec.type}: {outcome.detail}')
 
+    # Specs that never produced a report get their own block: they have no
+    # cases to list, but the run is not green and the report must say so
+    spec_errors = spec_errors or []
+    if spec_errors:
+        lines.append('')
+        for spec_error in spec_errors:
+            lines.append(f'{cross} {spec_error.spec_path}: {spec_error.message}')
+
     total = sum(len(report.case_results) for report in reports)
     passed = sum(report.passed_count for report in reports)
     lines.append('')
-    lines.append(f'Summary: {total} case(s), {passed} passed, {total - passed} failed')
+    summary = f'Summary: {total} case(s), {passed} passed, {total - passed} failed'
+    if spec_errors:
+        summary += f', {len(spec_errors)} spec error(s)'
+    lines.append(summary)
     return '\n'.join(lines)
 
 
-def render_json(reports: list[EvalReport]) -> dict:
+def render_json(reports: list[EvalReport], spec_errors: list[SpecError] | None = None) -> dict:
     """
     Render eval reports as a single machine-readable JSON document.
 
+    ``spec_errors`` and ``summary.spec_errors`` are always present (empty
+    and ``0`` on a clean run) so a consumer can read them unconditionally.
+
     Args:
         reports: Eval reports in execution order
+        spec_errors: Specs that could not be run to completion
 
     Returns:
-        dict: ``{"specs": [...], "summary": {"total_cases", "passed",
-        "failed"}}`` where each spec entry carries its cases and each case
-        its assertion outcomes
+        dict: ``{"specs": [...], "spec_errors": [...], "summary":
+        {"total_cases", "passed", "failed", "spec_errors"}}`` where each spec
+        entry carries its cases and each case its assertion outcomes, and
+        each spec-error entry is ``{"spec": path, "error": message}``
     """
     specs: list[dict[str, Any]] = []
     for report in reports:
@@ -207,34 +280,46 @@ def render_json(reports: list[EvalReport]) -> dict:
             }
         )
 
+    spec_errors = spec_errors or []
     total = sum(len(report.case_results) for report in reports)
     passed = sum(report.passed_count for report in reports)
     return {
         'specs': specs,
-        'summary': {'total_cases': total, 'passed': passed, 'failed': total - passed},
+        'spec_errors': [{'spec': spec_error.spec_path, 'error': spec_error.message} for spec_error in spec_errors],
+        'summary': {
+            'total_cases': total,
+            'passed': passed,
+            'failed': total - passed,
+            'spec_errors': len(spec_errors),
+        },
     }
 
 
-def render_junit(reports: list[EvalReport]) -> str:
+def render_junit(reports: list[EvalReport], spec_errors: list[SpecError] | None = None) -> str:
     """
     Render eval reports as JUnit XML for CI ingestion.
 
     Structure: one ``<testsuite>`` per spec under a ``<testsuites>`` root,
     one ``<testcase>`` per case. Failed assertions produce a ``<failure>``
     element whose text lists each failed assertion; a case that crashed
-    produces an ``<error>`` element instead. ``time`` attributes are in
-    seconds. All text is XML-escaped and stripped of characters that are
-    invalid in XML 1.0 (e.g. ANSI escapes and NUL bytes).
+    produces an ``<error>`` element instead. A spec that could not be run at
+    all is rendered as a one-test suite holding a single errored
+    ``<testcase>``, so a CI system never reads the run as green. ``time``
+    attributes are in seconds. All text is XML-escaped and stripped of
+    characters that are invalid in XML 1.0 (e.g. ANSI escapes and NUL bytes).
 
     Args:
         reports: Eval reports in execution order
+        spec_errors: Specs that could not be run to completion
 
     Returns:
         str: The JUnit XML document, including the XML declaration
     """
-    total = sum(len(report.case_results) for report in reports)
+    spec_errors = spec_errors or []
+    # Each spec that could not run contributes one synthetic errored test
+    total = sum(len(report.case_results) for report in reports) + len(spec_errors)
     total_failures = 0
-    total_errors = 0
+    total_errors = len(spec_errors)
     for report in reports:
         for case in report.case_results:
             if case.error is not None:
@@ -290,6 +375,36 @@ def render_junit(reports: list[EvalReport]) -> str:
                 failure_element.text = _xml_safe(
                     '\n'.join(f'{outcome.spec.type}: {outcome.detail}' for outcome in failed)
                 )
+
+    # One synthetic suite per spec that never ran, so the failure is visible
+    # in the CI test tree rather than only on stderr
+    for spec_error in spec_errors:
+        suite = ET.SubElement(
+            root,
+            'testsuite',
+            {
+                'name': _xml_safe(spec_error.spec_path),
+                'tests': '1',
+                'failures': '0',
+                'errors': '1',
+                'time': _seconds(0.0),
+            },
+        )
+        testcase = ET.SubElement(
+            suite,
+            'testcase',
+            {
+                'name': _SPEC_ERROR_CASE_NAME,
+                'classname': _xml_safe(spec_error.spec_path),
+                'time': _seconds(0.0),
+            },
+        )
+        error_element = ET.SubElement(
+            testcase,
+            'error',
+            {'message': _xml_safe(spec_error.message), 'type': _xml_safe(spec_error.error_type)},
+        )
+        error_element.text = _xml_safe(f'{spec_error.spec_path}: {spec_error.message}')
 
     ET.indent(root)
     return "<?xml version='1.0' encoding='utf-8'?>\n" + ET.tostring(root, encoding='unicode')
