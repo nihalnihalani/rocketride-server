@@ -60,18 +60,13 @@ from .utils.env import (
 )
 
 
-def _add_connection_args(parser: argparse.ArgumentParser, *, json_arg: bool = True) -> None:
+def _add_connection_args(parser: argparse.ArgumentParser) -> None:
     """
     Add the development-connection options (``--uri``, ``--apikey``,
     ``--json``) with defaults from the (already loaded) environment.
 
     Args:
         parser: The subcommand parser to extend.
-        json_arg: Whether to add the shared ``--json [FILE]`` option. Pass
-            False for a command that defines its own ``--json`` as a plain
-            format flag rather than the shared result envelope (argparse
-            would otherwise reject the duplicate option string), or for one
-            that produces no JSON result at all.
     """
     from ..core.constants import CONST_DEFAULT_WEB_LOCAL
 
@@ -85,8 +80,7 @@ def _add_connection_args(parser: argparse.ArgumentParser, *, json_arg: bool = Tr
         default=os.getenv(ENV_DEV_APIKEY),
         help=f'API key for server authentication (can use {ENV_DEV_APIKEY} in .env or env var)',
     )
-    if json_arg:
-        _add_json_arg(parser)
+    _add_json_arg(parser)
 
 
 def _add_deploy_connection_args(parser: argparse.ArgumentParser) -> None:
@@ -240,9 +234,6 @@ def setup_parser() -> argparse.ArgumentParser:
     validate_parser.add_argument('--source', default=None, help='Override source component ID for validation')
 
     # ── eval ─────────────────────────────────────────────────────────────
-    # `eval` owns its own --json: it is a plain format flag (a whole JSON
-    # report on stdout), not the shared --json [FILE] result envelope, so the
-    # connection args are added without it.
     eval_parser = subparsers.add_parser(
         'eval',
         help='Run golden-dataset evals against pipelines',
@@ -251,7 +242,7 @@ def setup_parser() -> argparse.ArgumentParser:
         'run to completion; 2 = usage error, spec parse/validation error, connection failure, '
         'or no case produced a result.',
     )
-    _add_connection_args(eval_parser, json_arg=False)
+    _add_connection_args(eval_parser)
 
     # Eval spec files as positional arguments - supports glob patterns
     eval_parser.add_argument(
@@ -271,13 +262,6 @@ def setup_parser() -> argparse.ArgumentParser:
         '--fail-fast',
         action='store_true',
         help='Stop at the first failing case',
-    )
-
-    # Optional JSON output format
-    eval_parser.add_argument(
-        '--json',
-        action='store_true',
-        help='Output results in JSON format',
     )
 
     # Optional JUnit XML report path

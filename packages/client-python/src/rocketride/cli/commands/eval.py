@@ -35,18 +35,21 @@ identical on shells that do not expand globs, e.g. Windows), validates every
 spec before connecting, and reports per-case results in human-readable, JSON,
 or JUnit XML format.
 
-Its ``--json`` is a plain format flag (a whole JSON report on stdout), not
-the shared ``--json [FILE]`` result envelope, so this command does not route
-through the shared ``Output`` channel or ``run_cli_command``: that runner
-maps any raised error to exit code 1, while this command's documented
-contract reserves 1 for "a case failed" and reports usage, spec and
-connection errors as 2. Client cleanup is therefore done here explicitly.
+Its ``--json [FILE]`` is the shared result option every other subcommand
+takes, routed through the shared ``Output`` channel: bare ``--json`` owns
+stdout (the human report is suppressed so stdout carries exactly one JSON
+document), and ``--json FILE`` writes that document to FILE while the human
+report keeps flowing on stdout. The command does not route through
+``run_cli_command``, though: that runner maps any raised error to exit code
+1, while this command's documented contract reserves 1 for "a case failed"
+and reports usage, spec and connection errors as 2. Client cleanup and the
+``Output`` flush are therefore done here explicitly.
 
 Key Features:
     - Run one or more eval specs in a single invocation
     - In-CLI glob expansion for cross-platform wildcard support
     - Case filtering via --case and early exit via --fail-fast
-    - Machine-readable output via --json, JUnit XML via --junit for CI
+    - Machine-readable output via --json [FILE], JUnit XML via --junit for CI
     - A spec that cannot be run at all is reported in every output format,
       so a CI artifact never shows a green run for a failed one
 
@@ -61,11 +64,10 @@ Usage:
     rocketride eval my_pipeline.eval.json --apikey <key>
     rocketride eval evals/*.eval.json --case greeting --fail-fast
     rocketride eval evals/*.eval.json --json
+    rocketride eval evals/*.eval.json --json reports/evals.json
     rocketride eval evals/*.eval.json --junit reports/evals.xml
 """
 
-import glob
-import json
 import os
 import sys
 
@@ -74,45 +76,8 @@ from ...evals.reporters import EvalReport, SpecError, render_human, render_json,
 from ...evals.runner import run_spec
 from ...evals.spec import EvalSpec, EvalSpecError, load_spec
 from ..utils.common import connect_client, disconnect_all
-
-
-def _expand_files(patterns: list[str]) -> list[str]:
-    """
-    Expand file arguments into a deduplicated, ordered list of paths.
-
-    Literal paths are kept as-is; anything else is treated as a glob
-    pattern (expanded in-CLI so wildcards work on shells that do not
-    expand them). Patterns that match nothing are kept verbatim so they
-    can be reported as unreadable spec files.
-
-    Args:
-        patterns: File paths and/or glob patterns from the command line
-
-    Returns:
-        list[str]: Expanded file paths, deduplicated, preserving order
-    """
-    expanded: list[str] = []
-    for pattern in patterns:
-        if os.path.isfile(pattern):
-            expanded.append(pattern)
-            continue
-
-        # Not a literal file - try shell-style glob expansion
-        matches = sorted(path for path in glob.glob(pattern, recursive=True) if os.path.isfile(path))
-        if matches:
-            expanded.extend(matches)
-        else:
-            # Keep the unmatched pattern so it is reported as a missing file
-            expanded.append(pattern)
-
-    # Remove duplicates while preserving order
-    seen = set()
-    unique_files = []
-    for file_path in expanded:
-        if file_path not in seen:
-            seen.add(file_path)
-            unique_files.append(file_path)
-    return unique_files
+from ..utils.file_utils import expand_file_patterns
+from ..utils.output import Output
 
 
 async def run_eval(args) -> int:
@@ -125,7 +90,8 @@ async def run_eval(args) -> int:
 
     Args:
         args: Parsed argparse namespace (files, case, fail_fast, json,
-            junit, uri, apikey)
+            junit, uri, apikey), where ``json`` is the shared option's
+            value: None (human), '-' (JSON on stdout), or a file path
 
     Returns:
         Exit code: 0 if all cases passed, 1 if at least one case failed
@@ -139,14 +105,15 @@ async def run_eval(args) -> int:
         3. Connect to the server
         4. Run each spec: start pipeline, chat each case, evaluate
            assertions, always tear the pipeline down
-        5. Report results (human, --json, and/or --junit)
+        5. Report results (human, --json [FILE], and/or --junit)
         6. Compute the exit code from the aggregate results
     """
     # Expand globs and literal paths into the working spec file list
-    files = _expand_files(args.files)
+    files = expand_file_patterns(args.files)
 
     # Load and validate every spec up front: a broken eval definition is
-    # a usage error, so nothing runs (mirroring how a bad flag behaves)
+    # a usage error, so nothing runs (mirroring how a bad flag behaves).
+    # No report exists yet on this path, so there is nothing to flush.
     specs: list[EvalSpec] = []
     for file_path in files:
         try:
@@ -155,6 +122,9 @@ async def run_eval(args) -> int:
             print(f'Error: {err}', file=sys.stderr)
             return 2
 
+    # The shared result channel: None -> human, '-' -> JSON on stdout,
+    # <path> -> JSON written to that file (human report still on stdout)
+    out = Output(args.json)
     try:
         # Connect once for all specs. A connection failure is exit code 2 by
         # contract, so it is handled here rather than by a generic catch-all.
@@ -192,11 +162,12 @@ async def run_eval(args) -> int:
             if args.fail_fast and not report.all_passed:
                 break
 
-        # Emit results in the requested format; --json owns stdout entirely
-        if args.json:
-            print(json.dumps(render_json(reports, spec_errors), indent=2))
-        else:
-            print(render_human(reports, use_color=sys.stdout.isatty(), spec_errors=spec_errors))
+        # Emit results in the requested format. The JSON document is always
+        # recorded; Output decides where it lands (nowhere in human mode,
+        # stdout under bare --json, the file under --json FILE) and
+        # suppresses the human report only when it owns stdout.
+        out.result(render_json(reports, spec_errors))
+        out.line(render_human(reports, use_color=sys.stdout.isatty(), spec_errors=spec_errors))
 
         # --junit writes the XML report in addition to the output above
         if args.junit:
@@ -223,6 +194,7 @@ async def run_eval(args) -> int:
             return 1
         return 0
     finally:
-        # This command owns its client (it does not go through the shared
-        # runner), so the connection is closed here on every path.
+        # This command owns its client and its Output (it does not go through
+        # the shared runner), so both are closed out here on every path.
         await disconnect_all()
+        out.finish()
