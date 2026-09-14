@@ -61,7 +61,7 @@ from .sql_safety import is_sql_safe
 # finished first. Module-level rather than per-node: refreshes are rare and a
 # process-wide lock costs nothing, while a per-instance one would need state
 # that db_global_base owns.
-_SCHEMA_REFRESH_LOCK = threading.Lock()
+_REFLECT_LOCK = threading.Lock()
 
 
 class DatabaseInstanceBase(IInstanceBase, ABC):
@@ -199,66 +199,25 @@ class DatabaseInstanceBase(IInstanceBase, ABC):
         if not args:
             args = {}
 
-        return self._schemaPayload(args.get('table'))
+        table_filter = args.get('table')
 
-    @tool_function(
-        input_schema={'type': 'object', 'properties': {}},
-        output_schema={
-            'type': 'object',
-            'properties': {
-                'database': {'type': 'string'},
-                'tables': {'type': 'object', 'description': 'Map of table name to table definition.'},
-                'refreshed_at': {'type': 'string', 'description': 'UTC ISO-8601 time the reflection completed.'},
-                'error': {'type': 'string'},
-            },
-        },
-        description=lambda self: (
-            f'Re-reads the {self._db_display_name()} schema from the database and returns it, in the same '
-            f'shape as get_schema plus a refreshed_at timestamp. get_schema serves the snapshot reflected '
-            f'when the node started, so tables and columns created or altered since are invisible to it. '
-            f'Call this after running DDL.'
-        ),
-    )
-    def refresh_schema(self, args):
-        """Re-reflect the database schema, replace the cache, and return it.
+        def _format_table(table_info):
+            result = {'columns': [{'column': name, 'type': col_type} for name, col_type in table_info['columns']]}
+            if table_info.get('primary_key'):
+                result['primary_key'] = table_info['primary_key']
+            if table_info.get('foreign_keys'):
+                result['foreign_keys'] = table_info['foreign_keys']
+            return result
 
-        ``IGlobal.db_schema`` is the same dict the natural-language path
-        describes to the LLM (``_buildSQLQueryOnce`` -> ``describe_schema``),
-        so refreshing it also stops ``get_data`` / ``get_sql`` writing queries
-        against a table shape that no longer exists.
-
-        Reflection and publication happen under a process-wide lock so
-        concurrent callers do not duplicate the work or race on the cache.
-        Declares no input; anything passed is ignored.
-        """
-        with _SCHEMA_REFRESH_LOCK:
-            self.IGlobal.db_schema = self.IGlobal._getDatabaseSchema()
-            refreshed_at = datetime.now(timezone.utc).isoformat()
-            payload = self._schemaPayload()
-        payload['refreshed_at'] = refreshed_at
-        return payload
-
-    @staticmethod
-    def _format_table(table_info):
-        """Shape one reflected table into the schema wire format."""
-        result = {'columns': [{'column': name, 'type': col_type} for name, col_type in table_info['columns']]}
-        if table_info.get('primary_key'):
-            result['primary_key'] = table_info['primary_key']
-        if table_info.get('foreign_keys'):
-            result['foreign_keys'] = table_info['foreign_keys']
-        return result
-
-    def _schemaPayload(self, table_filter: str | None = None) -> dict:
-        """Build the get_schema / refresh_schema response from the cached schema."""
         if table_filter:
             table_info = self.IGlobal.db_schema.get(table_filter)
             if table_info is None:
                 return {'error': f'Table "{table_filter}" not found', 'database': self.IGlobal.database}
-            return {'database': self.IGlobal.database, 'tables': {table_filter: self._format_table(table_info)}}
+            return {'database': self.IGlobal.database, 'tables': {table_filter: _format_table(table_info)}}
 
         return {
             'database': self.IGlobal.database,
-            'tables': {name: self._format_table(info) for name, info in self.IGlobal.db_schema.items()},
+            'tables': {name: _format_table(info) for name, info in self.IGlobal.db_schema.items()},
         }
 
     @tool_function(
@@ -436,6 +395,52 @@ class DatabaseInstanceBase(IInstanceBase, ABC):
     def dialect(self, args):
         """Return the database engine dialect."""
         return {'dialect': self._db_dialect()}
+
+    @tool_function(
+        input_schema={'type': 'object', 'properties': {}},
+        output_schema={
+            'type': 'object',
+            'properties': {
+                'database': {'type': 'string'},
+                'tables': {'type': 'object', 'description': 'Map of table name to table definition.'},
+                'refreshed_at': {'type': 'string', 'description': 'UTC ISO-8601 time the reflection completed.'},
+            },
+        },
+        description=lambda self: (
+            f'Re-reads the {self._db_display_name()} schema from the database and returns it, in the same '
+            f'shape as get_schema plus a refreshed_at timestamp. get_schema serves the snapshot reflected '
+            f'when the node started, so tables and columns created or altered since are invisible to it. '
+            f'Call this after running DDL.'
+        ),
+    )
+    def refresh_schema(self, args):
+        """Re-reflect the database schema, replace the cache, and return it.
+
+        ``IGlobal.db_schema`` is the same dict the natural-language path
+        describes to the LLM (``_buildSQLQueryOnce`` -> ``describe_schema``),
+        so refreshing it also stops ``get_data`` / ``get_sql`` writing queries
+        against a table shape that no longer exists.
+
+        Reflection and publication run under a process-wide lock so concurrent
+        callers neither repeat the full table walk nor race on the cache. The
+        table formatting is deliberately spelled out again rather than shared
+        with ``get_schema``: a few duplicated lines are cheaper than touching
+        that method's body while other changes to this file are in flight.
+        Declares no input; anything passed is ignored.
+        """
+        with _REFLECT_LOCK:
+            self.IGlobal.db_schema = self.IGlobal._getDatabaseSchema()
+            refreshed_at = datetime.now(timezone.utc).isoformat()
+            tables = {}
+            for table_name, table_info in self.IGlobal.db_schema.items():
+                entry = {'columns': [{'column': name, 'type': col_type} for name, col_type in table_info['columns']]}
+                if table_info.get('primary_key'):
+                    entry['primary_key'] = table_info['primary_key']
+                if table_info.get('foreign_keys'):
+                    entry['foreign_keys'] = table_info['foreign_keys']
+                tables[table_name] = entry
+
+        return {'database': self.IGlobal.database, 'tables': tables, 'refreshed_at': refreshed_at}
 
     # ------------------------------------------------------------------
     # Sanitization helpers
