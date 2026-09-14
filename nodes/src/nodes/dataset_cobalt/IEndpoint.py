@@ -71,12 +71,11 @@ class IEndpoint(IEndpointBase):
         Raises:
             DatasetLoadError: If the dataset could not be loaded at all.
         """
-        from depends import depends
+        self._installDriver()
 
-        requirements = os.path.dirname(os.path.realpath(__file__)) + '/requirements.txt'
-        debug(f'Cobalt Dataset Endpoint: Loading requirements from {requirements}')
-        depends(requirements)
-
+        # Imported after the driver install so the loader picks up a freshly
+        # installed cobalt; the module itself imports cobalt lazily, so this
+        # still works when the install was skipped or failed.
         from .dataset_loader import DatasetLoader, DatasetLoadError
 
         config = self._extractConfig()
@@ -103,6 +102,29 @@ class IEndpoint(IEndpointBase):
         except Exception as exc:
             warning(f'Cobalt Dataset Endpoint: Failed to prepare dataset: {exc!s}')
             raise DatasetLoadError(f'Cobalt Dataset Endpoint: failed to prepare dataset: {exc!s}') from exc
+
+    def _installDriver(self) -> None:
+        """Install the optional cobalt driver, tolerating an install failure.
+
+        The node ships a pure-Python reader for every supported format (see
+        ``DatasetLoader._load_from_file_fallback``), and the README promises
+        it. Letting ``depends()`` raise here would make that promise
+        unreachable: an unreachable index or a resolution conflict would abort
+        the scan even though the node can do the whole job without the
+        dependency.
+        """
+        from depends import depends
+
+        requirements = os.path.dirname(os.path.realpath(__file__)) + '/requirements.txt'
+        debug(f'Cobalt Dataset Endpoint: Loading requirements from {requirements}')
+        # Broad by intent: any install failure degrades to the pure-Python reader.
+        try:
+            depends(requirements)
+        except Exception as exc:
+            warning(
+                f'Cobalt Dataset Endpoint: could not install {requirements}: {exc!s}. '
+                'Continuing with the pure-Python dataset reader.'
+            )
 
     def _extractConfig(self) -> Dict[str, Any]:
         """Extract source config from the endpoint and normalize UI prefixes."""

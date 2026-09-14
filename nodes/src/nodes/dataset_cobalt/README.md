@@ -6,7 +6,7 @@ A RocketRide source node that loads an evaluation dataset and emits each item as
 
 Reads a dataset from a file (JSON, CSV, or JSONL) or from an inline item list, optionally reshapes it (filter, sample, slice), and emits one question per surviving item. Put it at the head of a pipeline to drive batch evaluation and quality testing: each dataset item becomes a question, and the item's reference answer travels alongside as metadata for a downstream evaluator (see `eval_cobalt`).
 
-When the optional **basalt-ai-cobalt** package (`cobalt`) is installed, its `Dataset` class parses files and runs transforms. When it is not installed, a pure-Python fallback parses JSON/CSV/JSONL and applies the same transforms, so the node stays functional without the dependency rather than silently yielding an empty dataset.
+When the optional **basalt-ai-cobalt** package (`cobalt`) is installed, its `Dataset` class parses files and runs transforms. When it is not — including when installing it fails outright, e.g. on a host with no package index — a pure-Python fallback parses JSON/CSV/JSONL and applies the same transforms, so the node stays functional without the dependency rather than silently yielding an empty dataset. The dependency install is attempted first and a failure is logged as a warning, not raised.
 
 Key behavior to know:
 

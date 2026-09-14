@@ -103,13 +103,11 @@ class IGlobal(IGlobalBase):
 
         debug('Cobalt Dataset Global: Starting global initialization')
 
-        from depends import depends
+        self._installDriver()
 
-        requirements = os.path.dirname(os.path.realpath(__file__)) + '/requirements.txt'
-        debug(f'Cobalt Dataset Global: Loading requirements from {requirements}')
-        depends(requirements)
-
-        # Import after dependencies are installed
+        # Imported after the driver install so the loader picks up a freshly
+        # installed cobalt; the module itself imports cobalt lazily, so this
+        # still works when the install was skipped or failed.
         from .dataset_loader import DatasetLoader, DatasetLoadError
 
         # Get endpoint bag and config
@@ -145,6 +143,29 @@ class IGlobal(IGlobalBase):
         except Exception as e:
             warning(f'Cobalt Dataset Global: Failed to prepare dataset: {e!s}')
             raise DatasetLoadError(f'Cobalt Dataset Global: failed to prepare dataset: {e!s}') from e
+
+    def _installDriver(self) -> None:
+        """Install the optional cobalt driver, tolerating an install failure.
+
+        The node ships a pure-Python reader for every supported format (see
+        ``DatasetLoader._load_from_file_fallback``), and the README promises
+        it. Letting ``depends()`` raise here would make that promise
+        unreachable: an unreachable index or a resolution conflict would abort
+        pipeline init even though the node can do the whole job without the
+        dependency.
+        """
+        from depends import depends
+
+        requirements = os.path.dirname(os.path.realpath(__file__)) + '/requirements.txt'
+        debug(f'Cobalt Dataset Global: Loading requirements from {requirements}')
+        # Broad by intent: any install failure degrades to the pure-Python reader.
+        try:
+            depends(requirements)
+        except Exception as e:
+            warning(
+                f'Cobalt Dataset Global: could not install {requirements}: {e!s}. '
+                'Continuing with the pure-Python dataset reader.'
+            )
 
     def _extractConfig(self) -> Dict[str, Any]:
         """Extract and validate node configuration.

@@ -1429,3 +1429,76 @@ class TestLoadFailureIsNotSuccess:
         assert g._questions == []
         g.endGlobal()
         assert g._loader is None
+
+
+class TestDependencyInstallFailureFallsBack:
+    """README promise: a pure-Python fallback when basalt-ai-cobalt is absent.
+
+    ``depends(requirements)`` used to be called OUTSIDE the try/except in both
+    IGlobal and IEndpoint, so a dependency-INSTALL failure (no package index,
+    resolution conflict) raised straight past the fallback and the documented
+    behaviour was unreachable. These tests fail without the fix because the
+    RuntimeError from depends() escapes.
+    """
+
+    @staticmethod
+    def _failing_depends():
+        mod = ModuleType('depends')
+
+        def _boom(*_args, **_kwargs):
+            raise RuntimeError('Failed to install requirements.txt: no index available')
+
+        mod.depends = _boom
+        # `cobalt: None` makes `from cobalt import Dataset` raise ImportError,
+        # i.e. the install really did not land.
+        return patch.dict(sys.modules, {'depends': mod, 'cobalt': None})
+
+    def test_endpoint_still_emits_via_pure_python_reader(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        f = tmp_path / 'data.jsonl'
+        f.write_text('{"input": "q1", "expected": "a1"}\n{"input": "q2", "expected": "a2"}\n')
+        endpoint = IEndpoint()
+        endpoint.endpoint = MagicMock()
+        endpoint.endpoint.logicalType = 'dataset_cobalt'
+        endpoint.endpoint.serviceConfig = {'source_type': 'file', 'file_path': str(f), 'sample_size': 0}
+        endpoint.endpoint.bag = {}
+        entries = []
+
+        with self._failing_depends():
+            endpoint.scanObjects('', lambda entry: entries.append(entry) or 0)
+
+        assert [e['objectTags']['text'] for e in entries] == ['q1', 'q2']
+
+    def test_begin_global_still_prepares_questions(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        f = tmp_path / 'data.json'
+        f.write_text('[{"input": "q1", "expected": "a1"}]')
+        config = {'source_type': 'file', 'file_path': str(f), 'sample_size': 0}
+        g = IGlobal()
+        g.IEndpoint = MagicMock()
+        g.IEndpoint.endpoint.bag = {}
+        g.IEndpoint.endpoint.connConfig = config
+        g.glb = MagicMock()
+        g.glb.connConfig = config
+        g.glb.logicalType = 'dataset_cobalt'
+
+        with self._failing_depends():
+            g.beginGlobal()
+
+        assert [q['text'] for q in g._questions] == ['q1']
+
+    def test_a_real_load_failure_still_raises_after_a_failed_install(self, monkeypatch, tmp_path):
+        """Tolerating the install failure must not re-swallow load failures."""
+        monkeypatch.chdir(tmp_path)
+        endpoint = IEndpoint()
+        endpoint.endpoint = MagicMock()
+        endpoint.endpoint.logicalType = 'dataset_cobalt'
+        endpoint.endpoint.serviceConfig = {
+            'source_type': 'file',
+            'file_path': str(tmp_path / 'nope.json'),
+            'sample_size': 0,
+        }
+        endpoint.endpoint.bag = {}
+
+        with self._failing_depends(), pytest.raises(DatasetLoadError, match='Dataset file not found'):
+            endpoint.scanObjects('', lambda entry: 0)
