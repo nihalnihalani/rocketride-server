@@ -95,13 +95,18 @@ function collapse(newer: IHistoryEntry, older: IHistoryEntry): IHistoryEntry {
 	};
 
 	// Run facts are replaced wholesale, so a success after a failure does not
-	// keep the stale error (and vice versa).
+	// keep the stale error (and vice versa). The row limit is one of them: a
+	// row count carried over from a run under a different limit would describe
+	// the merged entry wrongly in exactly the way IHistoryEntry.limit exists
+	// to prevent.
 	delete merged.rows;
 	delete merged.affected;
 	delete merged.error;
+	delete merged.limit;
 	if (newer.rows !== undefined) merged.rows = newer.rows;
 	if (newer.affected !== undefined) merged.affected = newer.affected;
 	if (newer.error !== undefined) merged.error = newer.error;
+	if (newer.limit !== undefined) merged.limit = newer.limit;
 
 	if (newer.truncated) merged.truncated = true;
 	// A note on the newer entry only wins when the older one carries none.
@@ -136,10 +141,12 @@ function boundEntry(entry: IHistoryEntry, limits: IHistoryLimits): IHistoryEntry
  * Bring one connection's history inside every bound.
  *
  * Order of work, and why:
- *  1. bound each entry's statement and error text — a single huge statement
+ *  1. collapse consecutive repeats of the same statement, carrying the newer
+ *     run onto the older entry — compared on the FULL text, because two
+ *     different statements that happen to share their first `maxSqlChars`
+ *     characters are not the same statement and must not become one entry;
+ *  2. bound each entry's statement and error text — a single huge statement
  *     must not be able to consume the whole budget;
- *  2. collapse consecutive repeats of the same statement, carrying the newer
- *     run onto the older entry;
  *  3. cap the count at {@link IHistoryLimits.maxEntries}, PINS INCLUDED,
  *     dropping unpinned entries oldest-first and only then pinned ones. A pin
  *     buys priority, not immunity: an unbounded pinned list is the same
@@ -153,12 +160,9 @@ export function trimHistory(
 	entries: IHistoryEntry[],
 	limits: IHistoryLimits = DEFAULT_HISTORY_LIMITS,
 ): IHistoryEntry[] {
-	// ── 1. Per-entry bounds ──────────────────────────────────────────────────
-	const bounded = entries.map((entry) => boundEntry(entry, limits));
-
-	// ── 2. Collapse consecutive repeats ──────────────────────────────────────
+	// ── 1. Collapse consecutive repeats, on the UNTRUNCATED text ─────────────
 	const deduped: IHistoryEntry[] = [];
-	for (const entry of bounded) {
+	for (const entry of entries) {
 		const previous = deduped[deduped.length - 1];
 		if (previous && sameStatement(previous, entry)) {
 			// `previous` is the NEWER of the pair (newest-first ordering).
@@ -168,25 +172,28 @@ export function trimHistory(
 		deduped.push(entry);
 	}
 
+	// ── 2. Per-entry bounds ──────────────────────────────────────────────────
+	const bounded = deduped.map((entry) => boundEntry(entry, limits));
+
 	// ── 3. Count cap: unpinned oldest-first, then pinned oldest-first ────────
-	if (deduped.length <= limits.maxEntries) return deduped;
+	if (bounded.length <= limits.maxEntries) return bounded;
 
 	const doomed = new Set<number>();
-	let excess = deduped.length - limits.maxEntries;
+	let excess = bounded.length - limits.maxEntries;
 
-	for (let i = deduped.length - 1; i >= 0 && excess > 0; i -= 1) {
-		if (!deduped[i]?.pinned) {
+	for (let i = bounded.length - 1; i >= 0 && excess > 0; i -= 1) {
+		if (!bounded[i]?.pinned) {
 			doomed.add(i);
 			excess -= 1;
 		}
 	}
-	for (let i = deduped.length - 1; i >= 0 && excess > 0; i -= 1) {
+	for (let i = bounded.length - 1; i >= 0 && excess > 0; i -= 1) {
 		if (doomed.has(i)) continue;
 		doomed.add(i);
 		excess -= 1;
 	}
 
-	return deduped.filter((_, index) => !doomed.has(index));
+	return bounded.filter((_, index) => !doomed.has(index));
 }
 
 // =============================================================================

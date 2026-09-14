@@ -145,6 +145,42 @@ describe('trimHistory — consecutive repeats', () => {
 		assert.deepEqual(kept.map((e) => e.id), ['c', 'b', 'a']);
 	});
 
+	it('carries the newer run\'s row limit onto the surviving entry', () => {
+		// A row count without ITS limit is ambiguous, so keeping the older
+		// run's limit beside the newer run's count describes neither.
+		const kept = trimHistory([
+			entry({ id: 'new', at: 20, rows: 200, limit: 200 }),
+			entry({ id: 'old', at: 10, rows: 1000, limit: 1000 }),
+		]);
+		assert.equal(kept.length, 1);
+		assert.equal(kept[0]?.rows, 200);
+		assert.equal(kept[0]?.limit, 200);
+	});
+
+	it('drops the older limit when the newer run had none', () => {
+		const kept = trimHistory([
+			entry({ id: 'new', at: 20, rows: 4000 }),
+			entry({ id: 'old', at: 10, rows: 1000, limit: 1000 }),
+		]);
+		assert.equal(kept.length, 1);
+		assert.equal(kept[0]?.limit, undefined);
+	});
+
+	it('does not collapse two statements that only agree up to the bound', () => {
+		// Deduplication used to run on the TRUNCATED text, so two different
+		// statements sharing a long prefix became one entry and one of them
+		// was lost from history entirely.
+		const prefix = 'SELECT '.padEnd(DEFAULT_HISTORY_LIMITS.maxSqlChars, 'a');
+		const kept = trimHistory([
+			entry({ id: 'new', at: 20, sql: `${prefix} FROM invoices` }),
+			entry({ id: 'old', at: 10, sql: `${prefix} FROM orders` }),
+		]);
+		assert.deepEqual(kept.map((e) => e.id), ['new', 'old']);
+		// Both are still bounded for storage.
+		assert.deepEqual(kept.map((e) => e.sql.length), [DEFAULT_HISTORY_LIMITS.maxSqlChars, DEFAULT_HISTORY_LIMITS.maxSqlChars]);
+		assert.deepEqual(kept.map((e) => e.truncated), [true, true]);
+	});
+
 	it('collapses a run of three identical statements into one', () => {
 		const kept = trimHistory([
 			entry({ id: 'c', at: 30 }),

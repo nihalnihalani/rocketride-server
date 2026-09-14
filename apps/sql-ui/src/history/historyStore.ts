@@ -126,6 +126,7 @@ function readEntry(value: unknown): IHistoryEntry | null {
 		outcome: raw.outcome ?? 'rows',
 		kind: raw.kind ?? 'other',
 		...(typeof raw.rows === 'number' ? { rows: raw.rows } : {}),
+		...(typeof raw.limit === 'number' ? { limit: raw.limit } : {}),
 		...(typeof raw.affected === 'number' ? { affected: raw.affected } : {}),
 		...(typeof raw.error === 'string' ? { error: raw.error } : {}),
 		...(raw.pinned ? { pinned: true } : {}),
