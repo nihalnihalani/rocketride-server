@@ -198,7 +198,9 @@ export const ExplainPanel: React.FC<IExplainPanelProps> = ({ endpoint, dialect, 
 		const started = Date.now();
 		try {
 			const session = getSession(client, endpoint);
-			const { rows } = await session.execute(explainSql);
+			// Plain EXPLAIN only plans, so re-running it after a token refresh
+			// cannot change anything on the database.
+			const { rows } = await session.execute(explainSql, { idempotent: true });
 			if (signal.cancelled) return;
 			const at = Date.now();
 			const parsed = parseExplain(dialect, rows);
