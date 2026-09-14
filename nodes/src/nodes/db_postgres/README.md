@@ -4,7 +4,7 @@ A RocketRide database node that answers natural-language questions against a Pos
 
 ## What it does
 
-Plays two roles in a pipeline. As a pipeline node, it receives natural-language questions on the `questions` lane, asks a connected LLM to translate them into SQL, executes the query, and emits the results; it also accepts structured data on the `answers` lane and inserts it into the configured table. As a tool node, agents call it directly through three functions: `get_data`, `get_schema`, and `get_sql`.
+Plays two roles in a pipeline. As a pipeline node, it receives natural-language questions on the `questions` lane, asks a connected LLM to translate them into SQL, executes the query, and emits the results; it also accepts structured data on the `answers` lane and inserts it into the configured table. As a tool node, agents call it directly through four functions: `get_data`, `get_schema`, `refresh_schema`, and `get_sql`.
 
 Uses SQLAlchemy with the psycopg2 driver (`psycopg2-binary`). The connection string is built as `postgresql+psycopg2://user:password@host/database`; user, password, and database are URL-encoded so reserved characters (`@`, `/`, `#`, `:`) are safe, and the host may carry an explicit port (e.g. `localhost:5433`).
 
@@ -68,15 +68,18 @@ Two special question types are handled on the `questions` lane:
 
 ## As a tool
 
-When connected to an agent, the node exposes three functions. The registered tool names are the bare method names below; the services.json `prefix` is a URL/path prefix and never appears in a tool name. An agent catalog namespaces each tool by the pipeline component id (for example `<component-id>.get_data`).
+When connected to an agent, the node exposes four functions. The registered tool names are the bare method names below; the services.json `prefix` is a URL/path prefix and never appears in a tool name. An agent catalog namespaces each tool by the pipeline component id (for example `<component-id>.get_data`).
 
 | Tool         | Description                                                                                                       |
 | ------------ | ----------------------------------------------------------------------------------------------------------------- |
 | `get_data`   | Natural language to SQL, executes it, returns rows plus the generated SQL (default 250 rows, max 25,000 via `limit`) |
 | `get_schema` | Returns tables, columns, types, primary keys, and foreign keys, for the full database or one table                |
+| `refresh_schema` | Re-reads the schema from the database and returns it, plus a `refreshed_at` UTC timestamp                     |
 | `get_sql`    | Natural language to SQL only, no execution                                                                        |
 
 `get_data` and `get_sql` return `valid: false` with an `error` (unsafe SQL) or an `answer` (the question was not a database query) when no executable query is produced.
+
+`get_schema` serves the schema reflected when the node started, so a table created or altered since is invisible to it; `refresh_schema` takes no arguments and re-reflects the database.
 
 ### Transactions
 

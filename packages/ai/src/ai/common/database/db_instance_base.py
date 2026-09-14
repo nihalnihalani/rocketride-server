@@ -37,9 +37,11 @@ using SQLAlchemy abstractions that work across dialects.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from datetime import datetime, timezone
 from typing import Any, Dict, List
 
 import json
+import threading
 
 from rocketlib import IInstanceBase, debug, error, warning, tool_function
 from sqlalchemy import MetaData, Table as SQLTable, insert, text
@@ -52,6 +54,14 @@ from rocketlib.types import IInvokeLLM
 
 from .db_global_base import DEFAULT_MAX_EXECUTE_ROWS, DatabaseGlobalBase
 from .sql_safety import is_sql_safe
+
+# Serialises schema re-reflection. Reflection walks every table, so two
+# concurrent refresh_schema calls would do the same expensive work twice and
+# race to publish `IGlobal.db_schema`; readers would briefly see whichever
+# finished first. Module-level rather than per-node: refreshes are rare and a
+# process-wide lock costs nothing, while a per-instance one would need state
+# that db_global_base owns.
+_SCHEMA_REFRESH_LOCK = threading.Lock()
 
 
 class DatabaseInstanceBase(IInstanceBase, ABC):
@@ -178,31 +188,77 @@ class DatabaseInstanceBase(IInstanceBase, ABC):
         ),
     )
     def get_schema(self, args):
-        """Return the reflected database schema."""
+        """Return the reflected database schema.
+
+        Serves ``IGlobal.db_schema``, reflected once in ``beginGlobal``. DDL
+        run since (through ``execute``) is NOT visible here — use
+        ``refresh_schema`` after changing the schema.
+        """
         if args is not None and not isinstance(args, dict):
             raise ValueError('Tool input must be a JSON object or empty')
         if not args:
             args = {}
 
-        table_filter = args.get('table')
+        return self._schemaPayload(args.get('table'))
 
-        def _format_table(table_info):
-            result = {'columns': [{'column': name, 'type': col_type} for name, col_type in table_info['columns']]}
-            if table_info.get('primary_key'):
-                result['primary_key'] = table_info['primary_key']
-            if table_info.get('foreign_keys'):
-                result['foreign_keys'] = table_info['foreign_keys']
-            return result
+    @tool_function(
+        input_schema={'type': 'object', 'properties': {}},
+        output_schema={
+            'type': 'object',
+            'properties': {
+                'database': {'type': 'string'},
+                'tables': {'type': 'object', 'description': 'Map of table name to table definition.'},
+                'refreshed_at': {'type': 'string', 'description': 'UTC ISO-8601 time the reflection completed.'},
+                'error': {'type': 'string'},
+            },
+        },
+        description=lambda self: (
+            f'Re-reads the {self._db_display_name()} schema from the database and returns it, in the same '
+            f'shape as get_schema plus a refreshed_at timestamp. get_schema serves the snapshot reflected '
+            f'when the node started, so tables and columns created or altered since are invisible to it. '
+            f'Call this after running DDL.'
+        ),
+    )
+    def refresh_schema(self, args):
+        """Re-reflect the database schema, replace the cache, and return it.
 
+        ``IGlobal.db_schema`` is the same dict the natural-language path
+        describes to the LLM (``_buildSQLQueryOnce`` -> ``describe_schema``),
+        so refreshing it also stops ``get_data`` / ``get_sql`` writing queries
+        against a table shape that no longer exists.
+
+        Reflection and publication happen under a process-wide lock so
+        concurrent callers do not duplicate the work or race on the cache.
+        Declares no input; anything passed is ignored.
+        """
+        with _SCHEMA_REFRESH_LOCK:
+            self.IGlobal.db_schema = self.IGlobal._getDatabaseSchema()
+            refreshed_at = datetime.now(timezone.utc).isoformat()
+            payload = self._schemaPayload()
+        payload['refreshed_at'] = refreshed_at
+        return payload
+
+    @staticmethod
+    def _format_table(table_info):
+        """Shape one reflected table into the schema wire format."""
+        result = {'columns': [{'column': name, 'type': col_type} for name, col_type in table_info['columns']]}
+        if table_info.get('primary_key'):
+            result['primary_key'] = table_info['primary_key']
+        if table_info.get('foreign_keys'):
+            result['foreign_keys'] = table_info['foreign_keys']
+        return result
+
+    def _schemaPayload(self, table_filter: str | None = None) -> dict:
+        """Build the get_schema / refresh_schema response from the cached schema."""
         if table_filter:
             table_info = self.IGlobal.db_schema.get(table_filter)
             if table_info is None:
                 return {'error': f'Table "{table_filter}" not found', 'database': self.IGlobal.database}
-            return {'database': self.IGlobal.database, 'tables': {table_filter: _format_table(table_info)}}
+            return {'database': self.IGlobal.database, 'tables': {table_filter: self._format_table(table_info)}}
 
         return {
             'database': self.IGlobal.database,
-            'tables': {name: _format_table(info) for name, info in self.IGlobal.db_schema.items()},
+            'tables': {name: self._format_table(info) for name, info in self.IGlobal.db_schema.items()},
         }
 
     @tool_function(
@@ -305,6 +361,8 @@ class DatabaseInstanceBase(IInstanceBase, ABC):
                 raise
         else:
             result = self._executeRawQuery(sql.strip(), params)
+            # Unreachable since _executeRawQuery started raising with the
+            # driver's message; kept so this branch is one open PR's to remove.
             if result is None:
                 raise RuntimeError('SQL execution failed (check server logs for details)')
 
@@ -577,8 +635,12 @@ class DatabaseInstanceBase(IInstanceBase, ABC):
         """Execute a raw SQL statement (read or write) without LLM or safety gating.
 
         Uses ``engine.begin()`` so writes auto-commit. Returns
-        ``{'rows': [...], 'affected_rows': N}`` on success, or ``None`` on a
-        SQLAlchemy error (logged via ``error()``). A ``max_execute_rows``
+        ``{'rows': [...], 'affected_rows': N}`` on success. A SQLAlchemy error
+        is logged via ``error()`` and re-raised as ``RuntimeError`` carrying
+        the DRIVER's own message: the caller wrote the statement, so the caller
+        is who needs to read "no such column: foo" — collapsing every failure
+        into one opaque string made a typo, a missing table, and a permission
+        error indistinguishable. A ``max_execute_rows``
         overflow raises ``RuntimeError`` from *inside* the transaction so
         ``engine.begin()`` rolls back — otherwise a write (e.g. ``INSERT ...
         RETURNING``) would commit even though ``execute()`` reports failure.
@@ -602,7 +664,9 @@ class DatabaseInstanceBase(IInstanceBase, ABC):
 
         except SQLAlchemyError as e:
             error(f'Error executing raw SQL query: {e}')
-            return None
+            # `from None` keeps the driver traceback out of the tool response;
+            # the formatted message already carries what the caller needs.
+            raise RuntimeError(f'SQL execution failed: {self.IGlobal._format_db_error(e)}') from None
 
     def _formatResultAsMarkdown(self, result: Any) -> str:
         """Convert a query result to a markdown table string."""

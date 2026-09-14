@@ -43,6 +43,7 @@ configurable server-name prefix.
 | --- | --- |
 | `get_data` | Generate a safe `SELECT` from a question and execute it. |
 | `get_schema` | Return the schema reflected when the node started. |
+| `refresh_schema` | Re-read the schema from the database and return it. |
 | `get_sql` | Generate a safe `SELECT` without executing it. |
 | `execute` | Run raw SQL, bypassing LLM translation and the safety check. |
 | `begin` | Open a transaction and return its session ID. |
@@ -53,7 +54,10 @@ configurable server-name prefix.
 `get_data` and `get_sql` require a non-empty `question`; `get_data` accepts an
 optional `limit`, defaulting to 250 and clamped to 1–25,000. `get_schema`
 accepts an optional `table`; an unknown table returns an `error` field, while
-omitting it returns all reflected tables. `get_data` returns `{valid, rows,
+omitting it returns all reflected tables. `refresh_schema` takes no arguments
+and re-reflects the database, so it sees tables created or altered since the
+node started; it returns the `get_schema` shape plus a `refreshed_at` UTC
+timestamp. `get_data` returns `{valid, rows,
 sql, row_limit}` on success; a non-database question returns `{valid: false,
 answer}`, and a query execution failure returns `{valid: false, error, sql,
 rows: []}`.

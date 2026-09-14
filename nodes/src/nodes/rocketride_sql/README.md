@@ -39,6 +39,7 @@ unless a function explicitly permits an empty object.
 | --- | --- |
 | get_data | Converts a required natural-language question into safe SQL, executes it, and returns rows. |
 | get_schema | Returns reflected tables, columns, primary keys, and foreign keys; table is optional. |
+| refresh_schema | Re-reads the schema from the database and returns it with a refreshed_at timestamp. |
 | get_sql | Converts a required question into SQL without executing it. |
 | execute | Runs required raw SQL, with optional positional params and a transaction session_id. |
 | begin | Opens a raw-SQL transaction and returns its session_id. |
@@ -50,7 +51,8 @@ get_data returns {valid, rows, sql, row_limit} for a successful query. A
 generation or execution problem returns valid: false with error, SQL, or an LLM
 answer as applicable. It defaults to 250 rows; a supplied limit is clamped to
 the shared maximum. get_schema reports an unknown requested table as an error
-value rather than throwing.
+value rather than throwing; it serves the schema reflected when the node
+started, so refresh_schema is what sees DDL run since.
 
 get_sql returns {sql, valid: true} only for safe generated SQL; unsafe SQL
 returns {error, sql, valid: false}. execute, begin, commit, and rollback raise
