@@ -119,7 +119,16 @@ function readEntry(value: unknown): IHistoryEntry | null {
 	};
 }
 
-/** Read both preference keys into memory. Unknown keys read as empty. */
+/**
+ * Read both preference keys into memory, MERGING anything already recorded.
+ *
+ * Runs can finish before any bridge is mounted (a query document open while
+ * its connection workbench is closed), and those entries are in memory only.
+ * Replacing the bag wholesale would throw them away at the moment persistence
+ * became possible, which is the one moment they could have been saved — so
+ * the in-memory entry wins on a shared id and the two lists are merged by
+ * age. Unknown connections read as empty.
+ */
 function hydrate(): void {
 	const rawBag = prefs?.getPref(PREF_HISTORY);
 	const next: HistoryBag = {};
@@ -130,6 +139,16 @@ function hydrate(): void {
 			if (entries.length > 0) next[key] = trimHistory(entries);
 		}
 	}
+
+	const pendingKeys = Object.keys(bag);
+	for (const key of pendingKeys) {
+		const pending = bag[key] ?? [];
+		const stored = next[key] ?? [];
+		const known = new Set(pending.map((entry) => entry.id));
+		const merged = [...pending, ...stored.filter((entry) => !known.has(entry.id))]
+			.sort((a, b) => b.at - a.at);
+		next[key] = trimHistory(merged);
+	}
 	bag = next;
 
 	const rawRecording = prefs?.getPref(PREF_RECORDING);
@@ -139,10 +158,13 @@ function hydrate(): void {
 			if (typeof value === 'boolean') flags[key] = value;
 		}
 	}
-	recording = flags;
+	// A switch flipped before the bridge mounted outranks the stored one.
+	recording = { ...flags, ...recording };
 
 	hydrated = true;
 	notify();
+	// Anything that was waiting in memory now has somewhere to go.
+	if (pendingKeys.length > 0) schedulePersist();
 }
 
 /** Write both preference keys now, applying the whole-bag budget first. */
