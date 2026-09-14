@@ -32,6 +32,7 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { describeFailure, maxRowsText } from '../src/sql/failure';
 import { applyRowLimit } from '../src/sql/batch';
+import { stripSqlComments } from '../src/sql/split';
 
 describe('describeFailure', () => {
 	it('puts the first line of the driver text in the headline', () => {
@@ -85,11 +86,11 @@ describe('maxRowsText', () => {
 
 describe('applyRowLimit', () => {
 	it('appends a limit to a SELECT', () => {
-		assert.deepEqual(applyRowLimit('SELECT * FROM orders', '200'), { sql: 'SELECT * FROM orders LIMIT 200', limit: 200, state: 'applied' });
+		assert.deepEqual(applyRowLimit('SELECT * FROM orders', '200'), { sql: 'SELECT * FROM orders\nLIMIT 200', limit: 200, state: 'applied' });
 	});
 
 	it('drops a trailing semicolon before appending', () => {
-		assert.equal(applyRowLimit('SELECT 1;', '200').sql, 'SELECT 1 LIMIT 200');
+		assert.equal(applyRowLimit('SELECT 1;', '200').sql, 'SELECT 1\nLIMIT 200');
 	});
 
 	it('applies no limit for All', () => {
@@ -142,5 +143,35 @@ describe('applyRowLimit', () => {
 
 	it('does not see a LIMIT that only exists in a comment', () => {
 		assert.equal(applyRowLimit('SELECT * FROM orders -- no LIMIT here', '200').limit, 200);
+	});
+
+	it('does not append the clause INTO a trailing line comment', () => {
+		// Joined with a space this read `... -- daily LIMIT 200`: the database
+		// saw an unbounded SELECT while the meta line claimed a limit of 200.
+		const applied = applyRowLimit('SELECT * FROM orders -- daily', '200');
+		assert.equal(applied.sql, 'SELECT * FROM orders -- daily\nLIMIT 200');
+		assert.equal(applied.limit, 200);
+		// The clause must be code, not comment text, in the statement as sent.
+		assert.match(stripSqlComments(applied.sql), /LIMIT 200\s*$/);
+	});
+
+	it('leaves a trailing block comment intact and still bounds the statement', () => {
+		const applied = applyRowLimit('SELECT * FROM orders /* daily */', '200');
+		assert.match(stripSqlComments(applied.sql), /LIMIT 200\s*$/);
+	});
+
+	it('does not mistake a subquery LIMIT for the result bound', () => {
+		// The outer SELECT is unbounded: reporting `in-statement` here would
+		// stream every joined row into the browser under a meta line that says
+		// the statement bounded itself.
+		const applied = applyRowLimit('SELECT * FROM (SELECT id FROM big LIMIT 10) x JOIN other o ON o.id = x.id', '200');
+		assert.equal(applied.state, 'applied');
+		assert.equal(applied.limit, 200);
+	});
+
+	it('does not mistake a LIMIT inside a string literal for the result bound', () => {
+		const applied = applyRowLimit("SELECT * FROM orders WHERE note = 'limit 5'", '200');
+		assert.equal(applied.state, 'applied');
+		assert.equal(applied.limit, 200);
 	});
 });

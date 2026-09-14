@@ -38,7 +38,7 @@
 
 import type { SqlDialect } from '../connect';
 import type { StatementKind } from './classify';
-import { stripSqlComments } from './split';
+import { hasTopLevelKeyword, stripSqlComments } from './split';
 
 // =============================================================================
 // TYPES
@@ -276,9 +276,17 @@ export function applyRowLimit(sql: string, limit: string, dialect: SqlDialect = 
 		|| (/^with\b/i.test(bare) && !/\b(insert|update|delete|merge|replace)\b/i.test(bare));
 	// Checked BEFORE the header selection, so `All` on a statement that limits
 	// itself still reports the statement's limit instead of claiming none.
-	if (returnsRows && /\blimit\b/i.test(bare)) return { sql, limit: null, state: 'in-statement' };
+	// Only a LIMIT that bounds the OUTERMOST query counts: one inside a
+	// subquery bounds that subquery, and reporting it as the result's bound
+	// would let an unbounded outer SELECT stream every row into the browser
+	// under a meta line that says otherwise.
+	if (returnsRows && hasTopLevelKeyword(sql, 'limit', dialect)) return { sql, limit: null, state: 'in-statement' };
 	if (limit === 'All' || !returnsRows) return { sql, limit: null, state: 'none' };
 	const value = Number(limit);
 	if (!Number.isFinite(value) || value <= 0) return { sql, limit: null, state: 'none' };
-	return { sql: `${sql.replace(/;\s*$/, '').trimEnd()} LIMIT ${value}`, limit: value, state: 'applied' };
+	// The clause is joined with a NEWLINE, not a space: the checks above run on
+	// comment-stripped text but the statement is sent RAW, so appending after a
+	// trailing `-- ...` comment would put LIMIT inside that comment and send an
+	// unbounded SELECT while the meta line reported a limit.
+	return { sql: `${sql.replace(/;\s*$/, '').trimEnd()}\nLIMIT ${value}`, limit: value, state: 'applied' };
 }
