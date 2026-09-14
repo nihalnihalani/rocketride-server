@@ -57,10 +57,12 @@ accepts an optional `table`; an unknown table returns an `error` field, while
 omitting it returns all reflected tables. `refresh_schema` takes no arguments
 and re-reflects the database, so it sees tables created or altered since the
 node started; it returns the `get_schema` shape plus a `refreshed_at` UTC
-timestamp. `get_data` returns `{valid, rows,
-sql, row_limit}` on success; a non-database question returns `{valid: false,
-answer}`, and a query execution failure returns `{valid: false, error, sql,
-rows: []}`.
+timestamp. It also clears the configured table's cached column map, so the
+`answers` insert lane picks up added or dropped columns on its next insert
+rather than continuing against the start-up shape. `get_data` returns
+`{valid, rows, sql, row_limit}` on success; a non-database question returns
+`{valid: false, answer}`, and a query execution failure returns
+`{valid: false, error, sql, rows: []}`.
 
 `execute` requires non-empty `sql` and optionally accepts a transaction
 `session_id` plus positional values for `$1`, `$2`, and so on. It returns
@@ -151,7 +153,7 @@ columns and best-effort primary keys but no foreign-key relationships.
 
 | Field | Type | Description | Default |
 |---|---|---|---|
-| `clickhouse.allow_execute` | `boolean` | **Allow direct query execution**<br/>Permit QuestionType.EXECUTE callers to run raw SQL without LLM translation or safety checks. Leave OFF unless a trusted application explicitly needs to issue SQL directly. | `false` |
+| `clickhouse.allow_execute` | `boolean` | **Allow direct query execution**<br/>Permit the execute, begin, commit, and rollback tool functions to run raw SQL without LLM translation or safety checks. Leave OFF unless a trusted application explicitly needs to issue SQL directly. | `false` |
 | `clickhouse.database` | `string` | **Database name**<br/>Name of database | `"default"` |
 | `clickhouse.db_description` | `string` | **Database description**<br/>What is this database used for? Describe its content and purpose, this helps the LLM generate more accurate queries. | `""` |
 | `clickhouse.host` | `string` | **ClickHouse host**<br/>Host name or IP address of the ClickHouse server, optionally including a native-protocol port (e.g. localhost:9440). Defaults to port 9000 when none is given. | `"localhost"` |

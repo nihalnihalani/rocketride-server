@@ -8,7 +8,7 @@ Plays two roles in a pipeline. As a pipeline node, it receives natural-language 
 
 Uses SQLAlchemy with the psycopg2 driver (`psycopg2-binary`). The connection string is built as `postgresql+psycopg2://user:password@host/database`; user, password, and database are URL-encoded so reserved characters (`@`, `/`, `#`, `:`) are safe, and the host may carry an explicit port (e.g. `localhost:5433`).
 
-Safety defaults: only `SELECT` statements are permitted for queries (whitelist check, see Notes), generated SQL is validated with `EXPLAIN` against the live database before execution, and raw SQL execution (`QuestionType.EXECUTE`) is disabled by default via `allow_execute`.
+Safety defaults: only `SELECT` statements are permitted for queries (whitelist check, see Notes), generated SQL is validated with `EXPLAIN` against the live database before execution, and raw SQL execution is disabled by default via `allow_execute`.
 
 The same implementation also ships as a Supabase preset (`services.supabase.json`, protocol `db_supabase://`): Supabase is managed Postgres, so it is a branded configuration, not separate code.
 
@@ -61,10 +61,7 @@ answer questions — with the SELECT-only whitelist keeping it read-safe.
 
 If the LLM decides a question is not a database query, its text response is emitted instead of query results.
 
-Two special question types are handled on the `questions` lane:
-
-- **`QuestionType.DIALECT`**: emits `{"dialect": "postgres"}` on the `answers` lane so SDK callers can branch on the underlying engine.
-- **`QuestionType.EXECUTE`**: runs the question text as raw SQL (read or write, no LLM, no safety check). Gated by `allow_execute`; when disabled the request is logged and dropped. `SELECT` results are capped at 25,000 rows; write statements report `affected_rows`.
+The `questions` lane has one behaviour: every question is translated to SQL and executed. It does not branch on `Question.type` — there is no dialect or raw-SQL path on the lane, so a `QuestionType.DIALECT` or `QuestionType.EXECUTE` question is handled exactly like any other natural-language question. (The graph node `graph_neo4j` *does* dispatch on those two types; this node never has.) Reach the dialect and raw-SQL behaviours through the `dialect` and `execute` tool functions below instead.
 
 ## As a tool
 
@@ -80,11 +77,11 @@ When connected to an agent, the node exposes nine functions: the five below, plu
 
 `get_data` and `get_sql` return `valid: false` with an `error` (unsafe SQL) or an `answer` (the question was not a database query) when no executable query is produced.
 
-`get_schema` serves the schema reflected when the node started, so a table created or altered since is invisible to it; `refresh_schema` takes no arguments and re-reflects the database.
+`get_schema` serves the schema reflected when the node started, so a table created or altered since is invisible to it; `refresh_schema` takes no arguments and re-reflects the database. It refreshes both caches the node keeps: the database-wide schema that the natural-language path describes to the LLM, and the configured table's column map that the `answers` lane builds its INSERTs from — so a column added by DDL is populated on the next insert instead of being dropped as unknown.
 
 ### Raw SQL and transactions
 
-Four more tool functions run raw SQL and explicit transactions. All four require `allow_execute=true` on the node (the same gate as `QuestionType.EXECUTE`), and all four fail the call with an error when the gate is off — unlike the `questions` lane, which logs and drops the request.
+Four more tool functions run raw SQL and explicit transactions. All four are gated on the node's **Allow direct query execution** setting (`allow_execute`); with it off, each call fails with an error rather than running. That gate is the node's only raw-SQL switch: it does not change what the `questions` lane does, because the lane never runs raw SQL in the first place.
 
 | Tool       | Input                     | Returns                    | Description                                                                                                   |
 | ---------- | ------------------------- | -------------------------- | ------------------------------------------------------------------------------------------------------------- |
@@ -125,7 +122,7 @@ database error back to the LLM, so attempts are not blind retries.
 
 ### Allow direct query execution
 
-Gates raw SQL execution (`QuestionType.EXECUTE` and the transaction tools).
+Gates the raw-SQL tool functions (`execute`, `begin`, `commit`, `rollback`).
 Off by default — leave it off unless a trusted application explicitly needs to
 issue SQL directly, because enabled callers bypass both the LLM translation
 and the SELECT-only safety check.
@@ -176,7 +173,7 @@ Rows arriving on the `answers` lane are inserted into the configured `table`:
 
 | Field | Type | Description | Default |
 |---|---|---|---|
-| `postgresdb.allow_execute` | `boolean` | **Allow direct query execution**<br/>Permit QuestionType.EXECUTE callers to run raw SQL without LLM translation or safety checks. Leave OFF unless a trusted application explicitly needs to issue SQL directly. | `false` |
+| `postgresdb.allow_execute` | `boolean` | **Allow direct query execution**<br/>Permit the execute, begin, commit, and rollback tool functions to run raw SQL without LLM translation or safety checks. Leave OFF unless a trusted application explicitly needs to issue SQL directly. | `false` |
 | `postgresdb.database` | `string` | **Database name**<br/>Name of database | `"postgres"` |
 | `postgresdb.db_description` | `string` | **Database description**<br/>What is this database used for? Describe its content and purpose, this helps the LLM generate more accurate queries. | `""` |
 | `postgresdb.host` | `string` | **PostgreSQL host**<br/>Host name or IP address of the PostgreSQL server, optionally including a port (e.g. localhost:5433) | `"localhost"` |
@@ -190,7 +187,7 @@ Rows arriving on the `answers` lane are inserted into the configured `table`:
 
 | Field | Type | Description | Default |
 |---|---|---|---|
-| `postgresdb.allow_execute` | `boolean` | **Allow direct query execution**<br/>Permit QuestionType.EXECUTE callers to run raw SQL without LLM translation or safety checks. Leave OFF unless a trusted application explicitly needs to issue SQL directly. | `false` |
+| `postgresdb.allow_execute` | `boolean` | **Allow direct query execution**<br/>Permit the execute, begin, commit, and rollback tool functions to run raw SQL without LLM translation or safety checks. Leave OFF unless a trusted application explicitly needs to issue SQL directly. | `false` |
 | `postgresdb.database` | `string` | **Database name**<br/>Name of database (Supabase default is 'postgres') | `"postgres"` |
 | `postgresdb.db_description` | `string` | **Database description**<br/>What is this database used for? Describe its content and purpose, this helps the LLM generate more accurate queries. | `""` |
 | `postgresdb.host` | `string` | **Supabase host**<br/>From the Supabase dashboard (Connect button), including the port. Recommended: the Supavisor pooler (works over IPv4) -> aws-0-<region>.pooler.supabase.com:6543 (transaction) or :5432 (session). The Direct connection (db.<project-ref>.supabase.co:5432) is IPv6-only and will fail to resolve on networks without IPv6. |  |

@@ -55,7 +55,9 @@ value rather than throwing; it serves the schema reflected when the node
 started, so refresh_schema is what sees DDL run since. refresh_schema takes no
 arguments and returns the re-reflected schema in the same {database, tables}
 shape get_schema returns, plus a refreshed_at UTC ISO-8601 timestamp recording
-when that reflection completed.
+when that reflection completed. It also clears the configured table's cached
+column map, so the answers insert lane picks up added or dropped columns on its
+next insert rather than continuing against the start-up shape.
 
 get_sql returns {sql, valid: true} only for safe generated SQL; unsafe SQL
 returns {error, sql, valid: false}. execute, begin, commit, and rollback raise
@@ -89,11 +91,12 @@ only the natural-language path, not raw execute calls.
 
 ### Allow direct query execution
 
-This setting is off by default. When enabled, QuestionType.EXECUTE on the
-questions lane and the execute, begin, commit, and rollback tools can run raw
-SQL without LLM translation or SQL safety checks. Enable it only for a trusted
-application that needs write statements or explicit transactions; otherwise
-keep it off so those entry points fail rather than executing input.
+This setting is off by default. When enabled, the execute, begin, commit, and
+rollback tools can run raw SQL without LLM translation or SQL safety checks.
+Enable it only for a trusted application that needs write statements or
+explicit transactions; otherwise keep it off so those tools fail rather than
+executing input. It does not change the questions lane, which only ever runs
+LLM-generated, safety-checked SELECT statements.
 
 ## Limitations
 
@@ -108,10 +111,12 @@ is unavailable until direct execution is explicitly enabled.
 ### Query paths
 
 The node inherits PostgreSQL schema reflection and its structured query surface.
-For QuestionType.DIALECT, the questions lane emits the PostgreSQL dialect on
-answers. For QuestionType.EXECUTE, a disabled direct-execution setting logs and
-drops the request; successful raw SELECT results are bounded by the shared
-execution-row maximum, while writes report affected_rows.
+The questions lane does not dispatch on Question.type: every question takes the
+same translate-then-execute path, so there is no dialect or raw-SQL branch on
+the lane. The dialect and execute tool functions are how those are reached.
+With direct execution disabled, execute fails the call rather than running;
+when enabled, raw SELECT results are bounded by the shared execution-row
+maximum, while writes report affected_rows.
 
 <!-- ROCKETRIDE:GENERATED:PARAMS START -->
 <!-- ROCKETRIDE:GENERATED:PARAMS END -->
