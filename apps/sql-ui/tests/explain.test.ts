@@ -35,7 +35,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import type { IPlanNode } from '../src/sql/explain';
-import { buildExplain, countPlanNodes, parseExplain } from '../src/sql/explain';
+import { buildExplain, countPlanNodes, formatRawPlan, parseExplain, planNotes } from '../src/sql/explain';
 
 // =============================================================================
 // FIXTURES
@@ -343,5 +343,92 @@ describe('parseExplain — unsupported dialects', () => {
 		assert.equal(result.ok, false);
 		if (result.ok) return;
 		assert.match(result.reason, /neo4j/);
+	});
+});
+
+// =============================================================================
+// RAW OUTPUT
+// =============================================================================
+
+describe('formatRawPlan', () => {
+	it('prints a single-column text result one cell per line', () => {
+		assert.equal(formatRawPlan(CLICKHOUSE_ROWS), [
+			'Expression ((Projection + Before ORDER BY))',
+			'  Aggregating',
+			'    Expression (Before GROUP BY)',
+			'      ReadFromMergeTree (default.hits)',
+		].join('\n'));
+	});
+
+	it('keeps a JSON string cell exactly as the database sent it', () => {
+		const raw = '{"query_block": {"select_id": 1}}';
+		assert.equal(formatRawPlan([{ EXPLAIN: raw }]), raw);
+	});
+
+	it('pretty-prints a cell the driver already decoded', () => {
+		const text = formatRawPlan([{ 'QUERY PLAN': POSTGRES_PLAN }]);
+		assert.match(text, /^\[\n/);
+		assert.match(text, /"Node Type": "Nested Loop"/);
+	});
+
+	it('falls back to the whole row set for wider results', () => {
+		const text = formatRawPlan([{ id: 1, select_type: 'SIMPLE', table: 'orders' }]);
+		assert.deepEqual(JSON.parse(text), [{ id: 1, select_type: 'SIMPLE', table: 'orders' }]);
+	});
+
+	it('returns empty text for an empty result', () => {
+		assert.equal(formatRawPlan([]), '');
+	});
+});
+
+// =============================================================================
+// PATTERN NOTES
+// =============================================================================
+
+describe('planNotes', () => {
+	/**
+	 * Build a bare node carrying the given fields.
+	 *
+	 * @param label - The node label.
+	 * @param fields - The fields as key/value text pairs.
+	 * @returns The node.
+	 */
+	function node(label: string, fields: Record<string, string> = {}): IPlanNode {
+		return {
+			label,
+			fields: Object.entries(fields).map(([key, value]) => ({ key, value, numeric: /^-?\d+(\.\d+)?$/.test(value) })),
+			children: [],
+		};
+	}
+
+	it('cites access_type = ALL with the row estimate, suffixed est.', () => {
+		const notes = planNotes(node('table: orders', { access_type: 'ALL', rows_examined_per_scan: '1204' }));
+		assert.deepEqual(notes, [{ evidence: 'access_type = ALL', text: 'full table scan (rows_examined_per_scan 1204 est.)' }]);
+	});
+
+	it('drops the parenthetical when the planner gave no row estimate', () => {
+		const notes = planNotes(node('table: orders', { access_type: 'ALL' }));
+		assert.deepEqual(notes, [{ evidence: 'access_type = ALL', text: 'full table scan' }]);
+	});
+
+	it('reads filesort and temporary from the tabular Extra column', () => {
+		const notes = planNotes(node('table: events', { Extra: 'Using temporary; Using filesort' }));
+		assert.deepEqual(notes.map((n) => n.evidence), ['Extra contains Using filesort', 'Extra contains Using temporary']);
+	});
+
+	it('reads filesort and temporary from the FORMAT=JSON booleans', () => {
+		const notes = planNotes(node('ordering_operation', { using_filesort: 'true', using_temporary_table: 'true' }));
+		assert.deepEqual(notes.map((n) => n.evidence), ['using_filesort = true', 'using_temporary_table = true']);
+	});
+
+	it('detects a PostgreSQL sequential scan from the node label', () => {
+		assert.deepEqual(planNotes(node('Seq Scan on orders')), [{ evidence: 'Node Type = Seq Scan on orders', text: 'sequential scan' }]);
+		assert.deepEqual(planNotes(node('Seq Scan')), [{ evidence: 'Node Type = Seq Scan', text: 'sequential scan' }]);
+	});
+
+	it('says nothing about nodes no rule matches', () => {
+		assert.deepEqual(planNotes(node('Index Scan on customers', { 'Index Name': 'customers_pkey' })), []);
+		assert.deepEqual(planNotes(node('table: orders', { access_type: 'eq_ref' })), []);
+		assert.deepEqual(planNotes(node('Nested Loop')), []);
 	});
 });

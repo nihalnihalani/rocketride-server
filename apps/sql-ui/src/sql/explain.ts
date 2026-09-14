@@ -379,3 +379,107 @@ export function parseExplain(dialect: SqlDialect, rows: Record<string, unknown>[
 export function countPlanNodes(node: IPlanNode): number {
 	return 1 + node.children.reduce((sum, child) => sum + countPlanNodes(child), 0);
 }
+
+// =============================================================================
+// RAW OUTPUT
+// =============================================================================
+
+/**
+ * Render the database's plan output as the text a reader would have seen at a
+ * SQL prompt. This is what the panel shows FIRST and by default: the
+ * interpreted tree is a convenience over it, never a replacement for it.
+ *
+ * A single-column result (all three dialects) prints its cells one per line,
+ * pretty-printing any cell the driver already decoded into an object. Anything
+ * wider falls back to the whole row set as JSON, so nothing is hidden.
+ *
+ * @param rows - The execute result rows, verbatim.
+ * @returns The raw text.
+ */
+export function formatRawPlan(rows: Record<string, unknown>[]): string {
+	if (!Array.isArray(rows) || rows.length === 0) return '';
+	const columns = Object.keys(rows[0] ?? {});
+	if (columns.length !== 1) return JSON.stringify(rows, null, 2);
+	const key = columns[0];
+	return rows
+		.map((row) => {
+			const cell = row[key];
+			if (cell === null || cell === undefined) return '';
+			if (typeof cell === 'string') return cell;
+			return JSON.stringify(cell, null, 2);
+		})
+		.join('\n');
+}
+
+// =============================================================================
+// PATTERN NOTES
+// =============================================================================
+
+/** One rule-detected observation about a plan node. */
+export interface IPlanNote {
+	/** The planner field the rule read, verbatim — the note's whole evidence. */
+	evidence: string;
+	/** What that field conventionally means, in plain words. */
+	text: string;
+}
+
+/**
+ * Read one field's value.
+ *
+ * @param node - The node to read.
+ * @param key - The field key.
+ * @returns The value, or null when the node has no such field.
+ */
+function field(node: IPlanNode, key: string): string | null {
+	return node.fields.find((f) => f.key === key)?.value ?? null;
+}
+
+/**
+ * Rule-based notes for one plan node.
+ *
+ * These are TEXT PATTERNS over planner fields, not a cost model and not a
+ * measurement: the caller labels them `detected by pattern`. Each note cites
+ * the exact field it read so the reader can check it against the raw output.
+ * A node no rule matches gets no notes — silence is not a verdict.
+ *
+ * @param node - The plan node to inspect.
+ * @returns The notes, in rule order (possibly empty).
+ */
+export function planNotes(node: IPlanNode): IPlanNote[] {
+	const notes: IPlanNote[] = [];
+
+	// ── MySQL: access_type = ALL is the documented full-scan marker ──────────
+	if (field(node, 'access_type') === 'ALL') {
+		const rows = field(node, 'rows_examined_per_scan');
+		notes.push({
+			evidence: 'access_type = ALL',
+			text: rows ? `full table scan (rows_examined_per_scan ${rows} est.)` : 'full table scan',
+		});
+	}
+
+	// ── MySQL: filesort / temporary table, in either the tabular Extra
+	//    column or the FORMAT=JSON booleans ──────────────────────────────────
+	const extra = field(node, 'Extra') ?? '';
+	if (extra.includes('Using filesort') || field(node, 'using_filesort') === 'true') {
+		notes.push({
+			evidence: extra.includes('Using filesort') ? 'Extra contains Using filesort' : 'using_filesort = true',
+			text: 'sorted without an index',
+		});
+	}
+	if (extra.includes('Using temporary') || field(node, 'using_temporary_table') === 'true') {
+		notes.push({
+			evidence: extra.includes('Using temporary') ? 'Extra contains Using temporary' : 'using_temporary_table = true',
+			text: 'a temporary table holds the intermediate result',
+		});
+	}
+
+	// ── PostgreSQL: Seq Scan is carried in the label (Node Type + relation) ──
+	if (/^Seq Scan(?: on .+)?$/.test(node.label)) {
+		notes.push({
+			evidence: `Node Type = ${node.label}`,
+			text: 'sequential scan',
+		});
+	}
+
+	return notes;
+}
