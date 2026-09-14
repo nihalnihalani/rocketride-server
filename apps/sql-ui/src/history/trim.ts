@@ -144,7 +144,9 @@ function boundEntry(entry: IHistoryEntry, limits: IHistoryLimits): IHistoryEntry
  *  1. collapse consecutive repeats of the same statement, carrying the newer
  *     run onto the older entry — compared on the FULL text, because two
  *     different statements that happen to share their first `maxSqlChars`
- *     characters are not the same statement and must not become one entry;
+ *     characters are not the same statement and must not become one entry.
+ *     An entry that is ALREADY truncated no longer has its full text, so it
+ *     is never collapsed at all (see the step itself);
  *  2. bound each entry's statement and error text — a single huge statement
  *     must not be able to consume the whole budget;
  *  3. cap the count at {@link IHistoryLimits.maxEntries}, PINS INCLUDED,
@@ -161,10 +163,20 @@ export function trimHistory(
 	limits: IHistoryLimits = DEFAULT_HISTORY_LIMITS,
 ): IHistoryEntry[] {
 	// ── 1. Collapse consecutive repeats, on the UNTRUNCATED text ─────────────
+	//
+	// Only entries whose text is COMPLETE may be collapsed. Truncation happens
+	// in step 2 below, so a run that arrives fresh is still compared on its
+	// full text — but `historyStore.hydrate` feeds ALREADY-BOUNDED entries
+	// back through this function on every reload, and there `sql` is a prefix.
+	// Two different statements sharing their first `maxSqlChars` characters
+	// would compare equal, and the collapse would destroy one real entry each
+	// time the app is opened. A prefix cannot prove sameness, so a truncated
+	// entry is never merged: keeping a duplicate row costs one line, losing a
+	// distinct statement costs the user their history.
 	const deduped: IHistoryEntry[] = [];
 	for (const entry of entries) {
 		const previous = deduped[deduped.length - 1];
-		if (previous && sameStatement(previous, entry)) {
+		if (previous && !previous.truncated && !entry.truncated && sameStatement(previous, entry)) {
 			// `previous` is the NEWER of the pair (newest-first ordering).
 			deduped[deduped.length - 1] = collapse(previous, entry);
 			continue;

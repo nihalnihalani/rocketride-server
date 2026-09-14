@@ -181,6 +181,37 @@ describe('trimHistory — consecutive repeats', () => {
 		assert.deepEqual(kept.map((e) => e.truncated), [true, true]);
 	});
 
+	it('does not collapse entries that arrive ALREADY truncated', () => {
+		// The reload path: `historyStore.hydrate` reads bounded entries back
+		// out of the workspace file and passes them through trimHistory again.
+		// Their `sql` is now a prefix, so comparing text cannot tell two
+		// different statements apart — and collapsing them would delete one
+		// real entry on every open. Feeding the OUTPUT of the previous test
+		// back in is exactly that situation.
+		const prefix = 'SELECT '.padEnd(DEFAULT_HISTORY_LIMITS.maxSqlChars, 'a');
+		const stored = trimHistory([
+			entry({ id: 'new', at: 20, sql: `${prefix} FROM invoices` }),
+			entry({ id: 'old', at: 10, sql: `${prefix} FROM orders` }),
+		]);
+		assert.equal(stored[0]?.sql, stored[1]?.sql, 'the stored prefixes are identical, which is the trap');
+
+		const reloaded = trimHistory(stored);
+		assert.deepEqual(reloaded.map((e) => e.id), ['new', 'old']);
+	});
+
+	it('keeps a fresh repeat of a truncated statement as its own entry', () => {
+		// The conservative direction of the same rule: a prefix cannot prove
+		// two statements are the same, so re-running a huge statement adds a
+		// row instead of merging into one that may not match. One extra row
+		// is the acceptable cost of never destroying a distinct statement.
+		const long = 'x'.repeat(DEFAULT_HISTORY_LIMITS.maxSqlChars + 40);
+		const kept = trimHistory([
+			entry({ id: 'new', at: 20, sql: long }),
+			entry({ id: 'old', at: 10, sql: long, truncated: true }),
+		]);
+		assert.deepEqual(kept.map((e) => e.id), ['new', 'old']);
+	});
+
 	it('collapses a run of three identical statements into one', () => {
 		const kept = trimHistory([
 			entry({ id: 'c', at: 30 }),
