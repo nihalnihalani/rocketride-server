@@ -127,6 +127,7 @@ def _install_mocks():
     rocketlib.IJson = MagicMock()
     rocketlib.debug = lambda *a, **kw: None
     rocketlib.warning = lambda *a, **kw: None
+    rocketlib.error = lambda *a, **kw: None
     rocketlib.monitorStatus = lambda *a, **kw: None
     rocketlib.monitorCompleted = lambda *a, **kw: None
     rocketlib.monitorFailed = lambda *a, **kw: None
