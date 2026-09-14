@@ -27,6 +27,11 @@ These tests use in-process fakes for the client and the mappers, so they run
 without the 'rocketride[otel]' extra installed and without a live server
 (unlike the integration tests that use the shared conftest client fixture).
 
+Because the client here is a fake, this file cannot see a change to the SDK
+internals the bridge depends on — notably the private ``_caller_on_event``
+hook the dispatcher is installed on. tests/test_otel_client_contract.py pins
+that against the REAL RocketRideClient; keep the two in step.
+
 Covered here:
     - OtelConfig precedence: CLI args > OTEL_* env vars > defaults
     - --headers parsing (first-'=' split, whitespace, padding); the header

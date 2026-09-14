@@ -207,8 +207,9 @@ function makeStopTestServerAction() {
 	};
 }
 
-// The otel-bridge tests (tests/test_otel_mapper.py, tests/test_otel_setup.py)
-// import the OpenTelemetry SDK and the OTLP/HTTP exporter at collection time,
+// The otel-bridge tests import the OpenTelemetry SDK at collection time
+// (tests/test_otel_mapper.py, tests/test_otel_client_contract.py) and, in
+// test_otel_setup.py, the OTLP/HTTP exporter as well,
 // and CI never pip-installs this package — pytest runs on the engine
 // interpreter against the source checkout, so the package's own [otel] extra
 // never reaches it. Install them here, scoped to this package's test step,
