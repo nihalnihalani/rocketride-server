@@ -98,8 +98,10 @@ run stored-routine definitions through the MySQL client instead.
 ### Each statement commits on its own
 
 Plain `execute` wraps every call in its own transaction. A batch that fails
-on statement 3 therefore leaves 1 and 2 committed, and the error banner says
-so; the outcome line reads like `1–2 committed · 3 failed · 4–5 not run`.
+on statement 3 therefore leaves 1 and 2 applied, and the error banner says
+so. The outcome line names read statements as `ran` and write or DDL
+statements as `committed`, for example `1 ran · 2 committed · 3 failed · 4–5
+not run`.
 
 For the same reason `BEGIN`, `COMMIT` and `ROLLBACK` are refused before
 anything is sent: `Transaction statements have no effect here: each
@@ -112,8 +114,10 @@ would be worse than a refusal.
 
 The header toggle offers **200**, **1000** and **All**, applied to
 row-returning statements. The results line states what was applied: `1,000
-rows returned (limit 1000)`, or `N rows returned (no limit applied)` for
-**All**. When the returned count equals the limit, a badge reads `Limit
+rows returned (limit 1000)` when SQL Explorer appended the limit, `N rows
+returned (limit in statement)` when the statement carried its own `LIMIT`, or
+`N rows returned (no limit applied)` for **All** with no `LIMIT` in the text.
+When the returned count equals an applied limit, a badge reads `Limit
 reached — more rows may exist`, because a full page is not evidence the
 result ended there.
 
@@ -139,8 +143,8 @@ never invisible.
 
 The banner leads with the database's own first line, prefixed `Database
 reported: `, and a collapsible **Database said** block holds the driver text
-verbatim. It also names the statement, its lines, and how many earlier
-statements already committed.
+verbatim. It also names the statement, its lines, and which earlier
+statements already ran or committed.
 
 Whether the driver text arrives at all depends on the node version. Older
 nodes swallow the database's message and return a generic string; in that
@@ -290,8 +294,8 @@ note. Those notes never say "rollback", because nothing here rolls back:
   leaves earlier statements applied. Nothing here can be rolled back.
 - **PostgreSQL** — each statement runs in its own autocommit transaction. A
   failure mid-plan leaves earlier statements applied.
-- **ClickHouse** — `ALTER` runs as an asynchronous mutation and may finish
-  after the dialog closes.
+- **ClickHouse** — some `ALTER` forms run as asynchronous mutations and may
+  finish after the dialog closes.
 
 A batch that stops part-way reports what committed, which statement failed
 and what was not run, and the plan keeps the remaining statements.
