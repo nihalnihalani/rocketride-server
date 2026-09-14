@@ -32,6 +32,7 @@
 
 import { Documents } from 'shell';
 import { NOOP_VFS } from 'shell';
+import type { ISqlEndpoint } from './connect';
 
 /** The app's Documents instance. Set by SqlApp on mount. */
 let _docs: Documents | null = null;
@@ -63,6 +64,30 @@ export function createDocs(): Documents {
 export function destroyDocs(): void {
 	_docs?.destroy();
 	_docs = null;
+}
+
+// =============================================================================
+// DOCUMENT PAYLOADS
+// =============================================================================
+
+/**
+ * What a query document carries as its static content.
+ *
+ * It lives here, beside the URI builders, because every producer of a query
+ * document already imports this module and none of them should have to
+ * import a VIEW to describe what they are handing it. Typing the payload at
+ * the call site is what stops a generated query from quietly shipping a
+ * misspelled field that the reader would never see.
+ */
+export interface IQueryDocPayload {
+	/** The connection the document is pinned to for life. */
+	endpoint: ISqlEndpoint;
+	/** Tab label ("Query 3"). */
+	label: string;
+	/** Text to seed the editor with. */
+	initialSql?: string;
+	/** `generated` marks SQL the app wrote rather than the user. */
+	origin?: 'generated';
 }
 
 // =============================================================================

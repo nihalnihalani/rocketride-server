@@ -35,6 +35,7 @@ import type { ISchemaState } from '../schema/schemaStore';
 import { refreshSchema } from '../schema/schemaStore';
 import { useTableRecordRequest } from '../navigation';
 import { designUri, getDocs, nextQueryDoc, tableDataUri } from '../docs';
+import type { IQueryDocPayload } from '../docs';
 import TableRecordPanel from '../components/TableRecordPanel';
 import { buildRelationGraph } from '../schema/relations';
 import { DatabaseIcon } from '../icons';
@@ -282,7 +283,8 @@ export const OverviewPanel: React.FC<IOverviewPanelProps> = ({ endpoint, snapsho
 						// Generated SQL always opens a NEW document and never
 						// runs; `origin` lets the query view say so on screen.
 						const { uri } = nextQueryDoc(endpoint.key);
-						getDocs()?.openStaticDocument(uri, label, { endpoint, label, initialSql: sql, origin: 'generated' });
+						const payload: IQueryDocPayload = { endpoint, label, initialSql: sql, origin: 'generated' };
+						getDocs()?.openStaticDocument(uri, label, payload);
 						setStack([]);
 					}}
 					onBrowseData={() => {

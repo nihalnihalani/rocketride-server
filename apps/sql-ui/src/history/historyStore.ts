@@ -57,10 +57,10 @@ import { subscribeRuns } from './runEvents';
 // =============================================================================
 
 /** Preference key holding every connection's entries. */
-export const PREF_HISTORY = 'sql.history';
+const PREF_HISTORY = 'sql.history';
 
 /** Preference key holding the per-connection recording switch. */
-export const PREF_RECORDING = 'sql.historyRecording';
+const PREF_RECORDING = 'sql.historyRecording';
 
 /** Delay before a batch of mutations is written to the workspace file (ms). */
 const PERSIST_DELAY_MS = 300;
@@ -200,7 +200,7 @@ function schedulePersist(): void {
  * @param api - The `{ getPref, setPref }` accessor; must be stable.
  * @returns The detach function.
  */
-export function attachPrefs(api: IPrefsApi): () => void {
+function attachPrefs(api: IPrefsApi): () => void {
 	prefs = api;
 	bridgeCount += 1;
 	if (!hydrated) hydrate();
@@ -248,7 +248,7 @@ function setEntries(key: string, entries: IHistoryEntry[]): void {
  * @param key - The connection's endpoint key.
  * @param entry - The finished statement's record.
  */
-export function recordRun(key: string, entry: IHistoryEntry): void {
+function recordRun(key: string, entry: IHistoryEntry): void {
 	if (recording[key] === false) return;
 	setEntries(key, trimHistory([entry, ...(bag[key] ?? [])]));
 }

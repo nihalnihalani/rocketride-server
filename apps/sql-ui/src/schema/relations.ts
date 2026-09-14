@@ -113,9 +113,11 @@ export interface IOrientation {
  * tell the user more paths exist — the list is never silently reduced to one.
  */
 export const MAX_JOIN_PATHS = 25;
+// Exported because the drawer compares against it: at the cap the list is a
+// sample, and only the caller can say so on screen.
 
 /** Default ceiling on joins in a path (5 tables). */
-export const DEFAULT_MAX_DEPTH = 4;
+const DEFAULT_MAX_DEPTH = 4;
 
 // =============================================================================
 // GRAPH
@@ -349,7 +351,7 @@ export function findJoinPaths(
 // =============================================================================
 
 /** The header comment every generated join carries. */
-export const JOIN_SQL_HEADER = '-- generated from declared foreign keys; review before running';
+const JOIN_SQL_HEADER = '-- generated from declared foreign keys; review before running';
 
 /**
  * Derive a short alias for each table position in a path. Table initials

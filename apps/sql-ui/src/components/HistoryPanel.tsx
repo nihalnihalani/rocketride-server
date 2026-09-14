@@ -62,6 +62,7 @@ import {
 } from '../history/historyStore';
 import { DEFAULT_HISTORY_LIMITS } from '../history/trim';
 import { getDocs, nextQueryDoc } from '../docs';
+import type { IQueryDocPayload } from '../docs';
 import { announce } from '../a11y/announce';
 import { DatabaseIcon } from '../icons';
 
@@ -389,7 +390,8 @@ export const HistoryPanel: React.FC<IHistoryPanelProps> = (props) => {
 		const { uri, label } = nextQueryDoc(endpoint.key);
 		// No `origin: 'generated'` — this statement is the user's own text,
 		// not something this app wrote, and must not claim otherwise.
-		getDocs()?.openStaticDocument(uri, label, { endpoint, label, initialSql: entry.sql });
+		const payload: IQueryDocPayload = { endpoint, label, initialSql: entry.sql };
+		getDocs()?.openStaticDocument(uri, label, payload);
 		announce(`Opened ${label}`);
 	};
 
