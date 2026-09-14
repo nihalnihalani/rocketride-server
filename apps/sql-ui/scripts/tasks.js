@@ -27,11 +27,49 @@
  * reached through pipeline database tool nodes.
  */
 const path = require('path');
+const { existsSync } = require('node:fs');
+const { readdir } = require('node:fs/promises');
 const { createAppModule } = require('../../../scripts/lib/appModule');
+const { execCommand } = require('../../../scripts/lib');
 
-module.exports = createAppModule({
+const APP_ROOT = path.join(__dirname, '..');
+const TESTS_DIR = path.join(APP_ROOT, 'tests');
+
+const mod = createAppModule({
 	name: 'sql-ui',
 	description: 'SQL Explorer Application',
-	appRoot: path.join(__dirname, '..'),
+	appRoot: APP_ROOT,
 	dev: true,
 });
+
+// sql-ui:test — runs node:test (via tsx) over the tests/ directory's
+// *.test.ts(x) files. The tested modules (paging, ddl, introspect, docs,
+// erModel, discovery) are pure logic; all but docs.ts reach the platform
+// through `import type` alone, which tsx erases. docs.ts imports Documents /
+// NOOP_VFS as values, so stub-shell.cjs stands in for the platform modules
+// (see its header). Runs under test targets, never as a build step (a normal
+// build must not stream test output).
+mod.actions.push({
+	name: 'sql-ui:test',
+	action: () => ({
+		description: 'Test sql-ui',
+		run: async (ctx, task) => {
+			if (!existsSync(TESTS_DIR)) {
+				task.output = 'No tests/ directory';
+				return;
+			}
+			const testFiles = (await readdir(TESTS_DIR, { recursive: true }))
+				.filter((f) => f.endsWith('.test.ts') || f.endsWith('.test.tsx'))
+				.map((f) => path.join('tests', f));
+			if (testFiles.length === 0) {
+				task.output = 'No sql-ui test files found';
+				return;
+			}
+			// './' prefix required: a bare relative path in --require resolves as
+			// a package name, not a file.
+			await execCommand('node', ['--require', './scripts/stub-shell.cjs', '--import', 'tsx', '--test', '--test-reporter=spec', ...testFiles], { task, cwd: APP_ROOT });
+		},
+	}),
+});
+
+module.exports = mod;
