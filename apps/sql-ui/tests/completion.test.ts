@@ -107,8 +107,12 @@ describe('buildCompletionModel', () => {
 		]);
 	});
 
-	it('carries a snapshot note naming the read time', () => {
-		assert.match(MODEL.snapshotNote, /schema snapshot \d{2}:\d{2}/);
+	it('dates the snapshot and does not promise Refresh will re-read it', () => {
+		// A node without the refresh_schema tool serves its task-start
+		// reflection however often Refresh is pressed, so the hint must not
+		// say "Refresh schema on the connection page" as if that fixed it.
+		assert.match(MODEL.snapshotNote, /The snapshot dates from \d{2}:\d{2}/);
+		assert.match(MODEL.snapshotNote, /only on nodes with refresh_schema/);
 	});
 
 	it('tolerates a null schema', () => {
@@ -290,7 +294,7 @@ describe('suggestAt', () => {
 
 	it('documents the snapshot on the first item of each group', () => {
 		const out = suggestAt(MODEL, 'SELECT * FROM ', 'mysql');
-		assert.match(out.find((c) => c.kind === 'table')?.documentation ?? '', /schema snapshot/);
+		assert.match(out.find((c) => c.kind === 'table')?.documentation ?? '', /The snapshot dates from/);
 	});
 
 	it('falls back to snippets alone when the snapshot is empty', () => {

@@ -80,7 +80,12 @@ export interface ICompletionModel {
 	columnsByTable: Record<string, ISqlSchemaColumn[]>;
 	/** Declared foreign keys across the whole snapshot. */
 	foreignKeys: IFkEdge[];
-	/** Documentation line naming when the snapshot was read. */
+	/**
+	 * Documentation line naming when the snapshot was read — and saying what
+	 * Refresh can and cannot do about it. A node without the `refresh_schema`
+	 * tool serves the reflection it took at task start no matter how often the
+	 * user presses Refresh, so the hint must not promise otherwise.
+	 */
 	snapshotNote: string;
 }
 
@@ -253,7 +258,7 @@ export function buildCompletionModel(schema: ISqlSchemaResponse | null | undefin
 		tables,
 		columnsByTable,
 		foreignKeys,
-		snapshotNote: `From schema snapshot ${clock(refreshedAt)}. Missing a table? Refresh schema on the connection page.`,
+		snapshotNote: `Missing a table? The snapshot dates from ${clock(refreshedAt)}; Refresh re-reads it only on nodes with refresh_schema.`,
 	};
 }
 
