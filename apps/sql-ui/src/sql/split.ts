@@ -66,6 +66,8 @@ export interface IStatement {
 interface IScanTraits {
 	/** `#` starts a line comment (MySQL only; ClickHouse has `--` and `/* *\/`). */
 	hashComments: boolean;
+	/** `--` only starts a comment when whitespace follows (MySQL only). */
+	dashCommentsNeedSpace: boolean;
 	/** `/* *\/` blocks nest (PostgreSQL only). */
 	nestedBlockComments: boolean;
 	/** `$tag$ ... $tag$` bodies are recognised (PostgreSQL only). */
@@ -95,7 +97,8 @@ interface IRegion {
  * Resolve the lexical traits of a dialect.
  *
  * ClickHouse takes `--` and block comments but NOT `#`, and it treats a
- * backslash inside a string literal as an escape. PostgreSQL is the only
+ * backslash inside a string literal as an escape. MySQL is the only dialect
+ * here that requires whitespace after `--` before it means a comment. PostgreSQL is the only
  * dialect here with nested block comments and dollar-quoted bodies, and the
  * only one where a plain `'...'` literal does NOT honour backslash escapes
  * (`standard_conforming_strings`); its `E'...'` form is detected separately.
@@ -106,6 +109,7 @@ interface IRegion {
 function traitsFor(dialect: SqlDialect): IScanTraits {
 	return {
 		hashComments: dialect === 'mysql',
+		dashCommentsNeedSpace: dialect === 'mysql',
 		nestedBlockComments: dialect === 'postgres',
 		dollarQuotes: dialect === 'postgres',
 		backslashEscapes: dialect === 'mysql' || dialect === 'clickhouse',
@@ -161,6 +165,43 @@ function skipDelimited(sql: string, open: number, delim: string, backslashEscape
 		i += 1;
 	}
 	return n;
+}
+
+/**
+ * Whether the `--` at `open` opens a line comment in this dialect.
+ *
+ * MySQL requires the pair to be followed by whitespace or a control
+ * character: it parses `SELECT 1--2; SELECT 3` as arithmetic, so reading the
+ * `--` as a comment would hide the `;` and send one wrong statement instead
+ * of two right ones. Every other dialect the app speaks takes a bare `--`.
+ *
+ * @param sql - The buffer.
+ * @param open - Offset of the first dash.
+ * @param traits - The dialect's lexical traits.
+ * @returns True when the dashes start a comment.
+ */
+function opensDashComment(sql: string, open: number, traits: IScanTraits): boolean {
+	if (!traits.dashCommentsNeedSpace) return true;
+	const next = sql[open + 2];
+	// Nothing follows the dashes, so there is no text left to hide either way.
+	return next === undefined || /[\s\u0000-\u001f]/.test(next);
+}
+
+/**
+ * Whether the `$` at `open` continues an identifier instead of opening a
+ * dollar-quoted body.
+ *
+ * PostgreSQL allows `$` inside an unquoted identifier, so `SELECT foo$tag$`
+ * is one identifier and opens nothing; treating it as a quote would swallow
+ * the separator that follows it.
+ *
+ * @param sql - The buffer.
+ * @param open - Offset of the `$`.
+ * @returns True when the `$` is part of the identifier before it.
+ */
+function continuesIdentifier(sql: string, open: number): boolean {
+	const prev = sql[open - 1];
+	return prev !== undefined && /[A-Za-z0-9_$]/.test(prev);
 }
 
 /**
@@ -256,7 +297,7 @@ function scanRegions(sql: string, traits: IScanTraits): IRegion[] {
 		} else if (ch === '`') {
 			end = skipDelimited(sql, i, '`', false);
 			kind = 'string';
-		} else if (ch === '-' && sql[i + 1] === '-') {
+		} else if (ch === '-' && sql[i + 1] === '-' && opensDashComment(sql, i, traits)) {
 			end = skipLineComment(sql, i);
 			kind = 'comment';
 		} else if (traits.hashComments && ch === '#') {
@@ -265,7 +306,7 @@ function scanRegions(sql: string, traits: IScanTraits): IRegion[] {
 		} else if (ch === '/' && sql[i + 1] === '*') {
 			end = skipBlockComment(sql, i, traits.nestedBlockComments);
 			kind = 'comment';
-		} else if (traits.dollarQuotes && ch === '$') {
+		} else if (traits.dollarQuotes && ch === '$' && !continuesIdentifier(sql, i)) {
 			const closed = skipDollarQuoted(sql, i);
 			if (closed > i) {
 				end = closed;

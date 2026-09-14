@@ -144,6 +144,34 @@ const CASES: ISplitCase[] = [
 		expect: ['SELECT 1 # ; not a split', 'SELECT 2'],
 	},
 	{
+		// MySQL requires whitespace after `--`; without it the dashes are
+		// arithmetic and the semicolon still separates two statements.
+		name: 'mysql needs whitespace after -- before it is a comment',
+		sql: 'SELECT 1--2; SELECT 3',
+		dialect: 'mysql',
+		expect: ['SELECT 1--2', 'SELECT 3'],
+	},
+	{
+		name: 'mysql honours -- when whitespace follows',
+		sql: 'SELECT 1-- ; not a split\n; SELECT 2',
+		dialect: 'mysql',
+		expect: ['SELECT 1-- ; not a split', 'SELECT 2'],
+	},
+	{
+		name: 'mysql -- at the very end of the buffer stays a comment',
+		sql: 'SELECT 1--',
+		dialect: 'mysql',
+		expect: ['SELECT 1--'],
+	},
+	{
+		// The same text on Postgres IS a comment, which is the whole point of
+		// making the precondition dialect-specific.
+		name: 'postgres takes a bare -- and hides the semicolon',
+		sql: 'SELECT 1--2; SELECT 3',
+		dialect: 'postgres',
+		expect: ['SELECT 1--2; SELECT 3'],
+	},
+	{
 		name: 'clickhouse has NO # comment — the semicolon splits',
 		sql: 'SELECT 1 # ; x\n; SELECT 2',
 		dialect: 'clickhouse',
@@ -184,6 +212,20 @@ const CASES: ISplitCase[] = [
 		sql: 'SELECT $body$ a; b $body$; SELECT 2',
 		dialect: 'postgres',
 		expect: ['SELECT $body$ a; b $body$', 'SELECT 2'],
+	},
+	{
+		// `$` is a legal identifier character in PostgreSQL, so `foo$tag$` is
+		// one identifier — reading it as a dollar quote would swallow the `;`.
+		name: 'postgres dollar quote must not continue an identifier',
+		sql: 'SELECT foo$tag$; SELECT 2',
+		dialect: 'postgres',
+		expect: ['SELECT foo$tag$', 'SELECT 2'],
+	},
+	{
+		name: 'postgres dollar quote still opens after a separator',
+		sql: 'SELECT ($tag$ a; b $tag$); SELECT 2',
+		dialect: 'postgres',
+		expect: ['SELECT ($tag$ a; b $tag$)', 'SELECT 2'],
 	},
 	{
 		name: 'postgres positional parameter is not a dollar quote',
