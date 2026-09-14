@@ -51,7 +51,7 @@ import type { CSSProperties } from 'react';
 import { useShellConnection, usePrefs } from 'shell';
 import type { GridCellComponent, GridColumnDefinition } from 'shell';
 import { Banner, Button, Card, CardDataGrid, ConfirmDialog, ContentHeader, EmptyState, StatusBadge, ToggleGroup, commonStyles, monoEl, mutedEl } from 'shell';
-import type { ISqlEndpoint } from '../connect';
+import type { ISqlEndpoint, SqlDialect } from '../connect';
 import { getSession, useSchema } from '../schema/schemaStore';
 import SqlEditor from '../components/SqlEditor';
 import type { IDecorationRange, IEditorCursorState, ISqlEditorHandle } from '../components/SqlEditor';
@@ -252,6 +252,25 @@ function lineRange(from?: number, to?: number): string {
 function clock(at: number): string {
 	const date = new Date(at);
 	return `${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`;
+}
+
+/**
+ * Why Explain cannot run on a statement, or null when it can.
+ *
+ * Both the button's disabled state and the click/keybinding path go through
+ * this, so they can never offer different answers — and the keybinding, which
+ * has no tooltip to read, announces the same sentence the button would show.
+ *
+ * @param dialect - The engine dialect.
+ * @param sql - The statement exactly as it would be sent.
+ * @param connected - Whether the shell connection is live.
+ * @returns The reason, or null when the statement can be explained.
+ */
+function explainRefusal(dialect: SqlDialect, sql: string, connected: boolean): string | null {
+	if (!connected) return 'Not connected.';
+	if (!sql.trim()) return 'Write a statement to explain.';
+	if (buildExplain(dialect, sql) === null) return `EXPLAIN is not available for this engine (${dialect}).`;
+	return null;
 }
 
 /**
@@ -728,11 +747,19 @@ export const QueryView: React.FC<IQueryViewProps> = ({ endpoint, label, initialS
 	 * unlimited one.
 	 */
 	const openExplain = useCallback((): void => {
+		// The LIVE handle decides what is explained, so a caret move that has
+		// not settled yet cannot send the previous statement. When it turns out
+		// nothing can be explained, say why: Ctrl/Cmd+Shift+E has no tooltip,
+		// and a keybinding that does nothing at all reads as a broken app.
 		const sent = targetSqlAsSent();
-		if (buildExplain(dialect, sent) === null) return;
+		const refusal = explainRefusal(dialect, sent, Boolean(client) && isConnected);
+		if (refusal) {
+			announce(refusal);
+			return;
+		}
 		setExplainSql(sent);
 		setExplainOpen(true);
-	}, [targetSqlAsSent, dialect]);
+	}, [targetSqlAsSent, dialect, client, isConnected]);
 
 	/**
 	 * Whether Explain can run right now, and why not when it cannot. Derived
@@ -740,17 +767,16 @@ export const QueryView: React.FC<IQueryViewProps> = ({ endpoint, label, initialS
 	 * drives a disabled state.
 	 */
 	const explainState = useMemo((): { disabled: boolean; title: string } => {
-		if (!client || !isConnected) return { disabled: true, title: 'Not connected.' };
 		const selected = cursor.selectionText.trim()
 			? splitStatementsIn(sql, cursor.selectionStart, cursor.selectionEnd, dialect)[0]?.sql ?? ''
 			: '';
 		const statement = selected || statementAtOffset(sql, cursor.offset, dialect)?.sql || '';
 		const candidate = statement ? applyRowLimit(statement, limit, dialect).sql : '';
-		if (!candidate.trim()) return { disabled: true, title: 'Write a statement to explain.' };
-		if (buildExplain(dialect, candidate) === null) {
-			return { disabled: true, title: `EXPLAIN is not available for this engine (${dialect}).` };
-		}
-		return { disabled: false, title: "Show the database's plan for the statement Run would send (Ctrl+Shift+E)" };
+		const refusal = explainRefusal(dialect, candidate, Boolean(client) && isConnected);
+		return {
+			disabled: refusal !== null,
+			title: refusal ?? "Show the database's plan for the statement Run would send (Ctrl+Shift+E)",
+		};
 	}, [client, isConnected, cursor, sql, dialect, limit]);
 
 	/**

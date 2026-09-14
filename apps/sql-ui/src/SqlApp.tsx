@@ -38,6 +38,7 @@ import type { Documents } from 'shell';
 import { Button, EmptyState } from 'shell';
 import { commonStyles } from 'shell';
 import { CONNECTIONS_URI, createDocs, destroyDocs, endpointKeyFromAnyUri, endpointKeyFromUri, getDocs, isDesignUri, isDiagramUri, isQueryUri, isTableDataUri } from './docs';
+import type { IQueryDocPayload } from './docs';
 import { setActiveConnection } from './navigation';
 import type { ISqlEndpoint } from './connect';
 import ConnectionsView from './views/ConnectionsView';
@@ -55,24 +56,10 @@ import { DatabaseIcon } from './icons';
 // TYPES
 // =============================================================================
 
-/**
- * Content payload of a `query:` document.
- *
- * `initialSql` and `origin` are how another view hands the runner a statement
- * it wrote: the panels that generate SQL open a NEW query document with
- * `origin: 'generated'`, and the runner then shows it as a preview to review
- * rather than as something already run.
- */
-export interface IQueryDocPayload {
-	/** The connection the document is pinned to for life. */
-	endpoint: ISqlEndpoint;
-	/** Tab label ("Query 3"). */
-	label: string;
-	/** Text to seed the editor with. */
-	initialSql?: string;
-	/** `generated` marks SQL the app wrote rather than the user. */
-	origin?: 'generated';
-}
+// The query-document payload is declared beside the URI builders in docs.ts,
+// where every producer of a query document can reach it without importing a
+// view. Re-exported here for the callers that already import the app module.
+export type { IQueryDocPayload } from './docs';
 
 // =============================================================================
 // STYLES
