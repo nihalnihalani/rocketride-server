@@ -39,6 +39,8 @@ interface IFakeSession {
 	session: ISqlSession;
 	/** Every statement the module executed, in order. */
 	statements: string[];
+	/** The bind values each statement rode with, in the same order. */
+	binds: unknown[][];
 }
 
 /**
@@ -49,17 +51,19 @@ interface IFakeSession {
  */
 function fakeSession(rows: Record<string, unknown>[] = []): IFakeSession {
 	const statements: string[] = [];
+	const binds: unknown[][] = [];
 	const session = {
 		endpoint: { key: 'p:s:n' },
-		execute: async (sql: string): Promise<ISqlExecuteResult> => {
+		execute: async (sql: string, opts?: { params?: unknown[] }): Promise<ISqlExecuteResult> => {
 			statements.push(sql);
+			binds.push(opts?.params ?? []);
 			return { rows, affected_rows: 0 };
 		},
 		getSchema: async () => ({}),
 		refreshSchema: async () => ({}),
 		dialect: async () => 'postgres' as const,
 	} as unknown as ISqlSession;
-	return { session, statements };
+	return { session, statements, binds };
 }
 
 // =============================================================================
@@ -95,20 +99,35 @@ describe('fetchForeignKeyNames dialect coverage', () => {
 });
 
 // =============================================================================
-// TABLE NAMES ARE ALWAYS QUOTED LITERALS
+// THE TABLE NAME IS ALWAYS A BIND, NEVER STATEMENT TEXT
 // =============================================================================
 
-describe('fetchForeignKeyNames literal quoting', () => {
-	it('quotes an all-digit table name instead of comparing it as a number', async () => {
-		const { session, statements } = fakeSession();
+describe('fetchForeignKeyNames table binding', () => {
+	it('binds the table name on MySQL instead of quoting it into the predicate', async () => {
+		const { session, statements, binds } = fakeSession();
 		await fetchForeignKeyNames(session, 'mysql', '2026');
-		assert.match(statements[0]!, /TABLE_NAME = '2026'/);
+		assert.match(statements[0]!, /TABLE_NAME = \$1\b/);
+		assert.deepEqual(binds[0], ['2026']);
 	});
 
-	it('doubles an embedded single quote', async () => {
-		const { session, statements } = fakeSession();
-		await fetchForeignKeyNames(session, 'postgres', "o'brien");
-		assert.match(statements[0]!, /tc\.table_name = 'o''brien'/);
+	it('binds the table name on Postgres', async () => {
+		const { session, statements, binds } = fakeSession();
+		await fetchForeignKeyNames(session, 'postgres', 'orders');
+		assert.match(statements[0]!, /tc\.table_name = \$1\b/);
+		assert.deepEqual(binds[0], ['orders']);
+	});
+
+	it('keeps a name carrying quote and backslash characters out of the statement', async () => {
+		// A doubling quoter cannot neutralise `\\'` on a MySQL connection that
+		// honours backslash escapes: the literal ends early and the rest of the
+		// name becomes predicate syntax. A bound value never reaches the parser.
+		const hostile = "o'brien\\' OR 1=1 -- ";
+		for (const dialect of ['mysql', 'postgres'] as const) {
+			const { session, statements, binds } = fakeSession();
+			await fetchForeignKeyNames(session, dialect, hostile);
+			assert.equal(statements[0]!.includes('brien'), false);
+			assert.deepEqual(binds[0], [hostile]);
+		}
 	});
 });
 
