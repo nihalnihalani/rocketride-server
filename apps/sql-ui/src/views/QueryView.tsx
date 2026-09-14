@@ -77,6 +77,7 @@ import {
 import type { IFailureNotice } from '../sql/failure';
 import { inferColumnTypes } from '../sql/resultTypes';
 import { buildCompletionModel } from '../sql/completion';
+import { buildExplain } from '../sql/explain';
 import { emitRun } from '../history/runEvents';
 import type { IHistoryEntry } from '../history/types';
 import { DatabaseIcon } from '../icons';
@@ -166,6 +167,12 @@ const styles = {
 		fontSize: 11,
 		color: 'var(--rr-text-secondary)',
 		paddingTop: 6,
+	} as CSSProperties,
+
+	// Focus-return wrapper around a shell Button (which forwards no ref).
+	// `display: contents` keeps the button itself as the flex child.
+	buttonHost: {
+		display: 'contents',
 	} as CSSProperties,
 
 	// Result meta line in the grid card's action slot.
@@ -317,7 +324,8 @@ export const QueryView: React.FC<IQueryViewProps> = ({ endpoint, label, initialS
 
 	// ── Drawers + dialogs ────────────────────────────────────────────────────
 	const [historyOpen, setHistoryOpen] = useState(false);
-	const [explain, setExplain] = useState<{ sql: string } | null>(null);
+	const [explainOpen, setExplainOpen] = useState(false);
+	const [explainSql, setExplainSql] = useState('');
 	const [pendingLoad, setPendingLoad] = useState<string | null>(null);
 	const [inspected, setInspected] = useState<{ row: Record<string, unknown>; number: number } | null>(null);
 	const [patternPrompt, setPatternPrompt] = useState<IPatternPrompt | null>(null);
@@ -341,6 +349,10 @@ export const QueryView: React.FC<IQueryViewProps> = ({ endpoint, label, initialS
 	// The buffer text as of the last run or the last load: anything else in the
 	// editor is unsaved work that must not be replaced without asking.
 	const committedTextRef = useRef(initialSql ?? '');
+	// The shell's Button does not forward a ref, so focus is returned through a
+	// `display: contents` wrapper that changes no layout.
+	const historyButtonRef = useRef<HTMLSpanElement>(null);
+	const explainButtonRef = useRef<HTMLSpanElement>(null);
 
 	useEffect(() => () => {
 		mountedRef.current = false;
@@ -350,6 +362,15 @@ export const QueryView: React.FC<IQueryViewProps> = ({ endpoint, label, initialS
 		patternResolverRef.current = null;
 	}, []);
 	useEffect(() => { patternChecksOnRef.current = patternChecksOn; }, [patternChecksOn]);
+
+	/**
+	 * Return focus to the control that opened a drawer.
+	 *
+	 * @param host - Wrapper around the opening button.
+	 */
+	const focusOpener = useCallback((host: React.RefObject<HTMLSpanElement>): void => {
+		host.current?.querySelector('button')?.focus();
+	}, []);
 
 	const dialect = snapshot.dialect;
 	const statements = useMemo(() => splitStatements(sql, dialect), [sql, dialect]);
@@ -527,8 +548,9 @@ export const QueryView: React.FC<IQueryViewProps> = ({ endpoint, label, initialS
 		// Transaction control cannot work through per-call autocommit, so it is
 		// refused before anything is sent rather than run and misunderstood.
 		if (targets.some((target) => classifyStatement(target.sql, dialect) === 'tx')) {
+			// No announce(): the Banner below is already a polite live region
+			// (Banner.tsx:75-76), and mirroring it would read the refusal twice.
 			setTxRefused(true);
-			announce(TRANSACTION_REFUSAL_TEXT);
 			return;
 		}
 
@@ -629,10 +651,14 @@ export const QueryView: React.FC<IQueryViewProps> = ({ endpoint, label, initialS
 		// gate is open again, so a successful run retires the warning.
 		if (resolved) setAllowExecuteOff(false);
 
+		// Only outcomes that have NO live region of their own are announced. A
+		// failure is not one: the error Banner is an assertive alert already
+		// (Banner.tsx:75-76), so announcing it here would read it twice. The
+		// batch summary and the row counts live in the strip and the meta line,
+		// which are ordinary text.
 		if (results.length > 1) announce(`${results.length} statements: ${formatBatchOutcome(results)}`);
-		else if (failedAt >= 0) announce('Statement failed');
-		else if (shown?.outcome === 'rows') announce(`Statement returned ${(shown.rows?.length ?? 0).toLocaleString()} rows`);
-		else if (shown?.outcome === 'affected') announce(`Statement affected ${(shown.affected ?? 0).toLocaleString()} rows`);
+		else if (failedAt < 0 && shown?.outcome === 'rows') announce(`Statement returned ${(shown.rows?.length ?? 0).toLocaleString()} rows`);
+		else if (failedAt < 0 && shown?.outcome === 'affected') announce(`Statement affected ${(shown.affected ?? 0).toLocaleString()} rows`);
 	}, [client, dialect, endpoint, limit, sql, askPatternConfirm, publishRuns, record, setPatternChecks]);
 
 	/** Run the selection, or the statement at the caret. */
@@ -665,7 +691,7 @@ export const QueryView: React.FC<IQueryViewProps> = ({ endpoint, label, initialS
 		setAbandonNotice(
 			`Stopped waiting after ${(ms / 1000).toFixed(1)} s. The statement may still be running on the database; this tool cannot cancel it.`,
 		);
-		announce(`Stopped waiting for statement ${activeIndexRef.current + 1}`);
+		// The warning Banner carries this; it is a live region already.
 		editorRef.current?.focus();
 	}, [publishRuns, record]);
 
@@ -684,12 +710,36 @@ export const QueryView: React.FC<IQueryViewProps> = ({ endpoint, label, initialS
 		return applyRowLimit(target.sql, limit, dialect).sql;
 	}, [currentTarget, limit, dialect]);
 
-	/** Open the plan drawer for whatever Run would send. */
+	/**
+	 * Open the plan drawer for whatever Run would send.
+	 *
+	 * The panel is handed the statement EXACTLY as it would run, applied LIMIT
+	 * included, so the plan describes the real statement and not a different,
+	 * unlimited one.
+	 */
 	const openExplain = useCallback((): void => {
 		const sent = targetSqlAsSent();
-		if (!sent.trim()) return;
-		setExplain({ sql: sent });
-	}, [targetSqlAsSent]);
+		if (buildExplain(dialect, sent) === null) return;
+		setExplainSql(sent);
+		setExplainOpen(true);
+	}, [targetSqlAsSent, dialect]);
+
+	/**
+	 * Whether Explain can run right now, and why not when it cannot. Derived
+	 * from the settled caret rather than the live handle, because it only
+	 * drives a disabled state.
+	 */
+	const explainState = useMemo((): { disabled: boolean; title: string } => {
+		if (!client || !isConnected) return { disabled: true, title: 'Not connected.' };
+		const selected = cursor.selectionText.trim();
+		const statement = selected ? selected : statementAtOffset(sql, cursor.offset, dialect)?.sql ?? '';
+		const candidate = statement ? applyRowLimit(statement, limit, dialect).sql : '';
+		if (!candidate.trim()) return { disabled: true, title: 'Write a statement to explain.' };
+		if (buildExplain(dialect, candidate) === null) {
+			return { disabled: true, title: `EXPLAIN is not available for this engine (${dialect}).` };
+		}
+		return { disabled: false, title: "Show the database's plan for the statement Run would send (Ctrl+Shift+E)" };
+	}, [client, isConnected, cursor, sql, dialect, limit]);
 
 	/**
 	 * Put a statement into the editor, asking first when doing so would throw
@@ -817,23 +867,28 @@ export const QueryView: React.FC<IQueryViewProps> = ({ endpoint, label, initialS
 							value={limit}
 							onChange={setLimit}
 						/>
-						<Button
-							variant="ghost"
-							pressed={historyOpen}
-							ariaExpanded={historyOpen}
-							title="Show the statements run on this connection"
-							onClick={() => setHistoryOpen((open) => !open)}
-						>
-							History
-						</Button>
-						<Button
-							variant="secondary"
-							onClick={openExplain}
-							disabled={!client || !isConnected || !sql.trim()}
-							title="Show the database's plan for the statement Run would send (Ctrl+Shift+E)"
-						>
-							Explain
-						</Button>
+						<span ref={historyButtonRef} style={styles.buttonHost}>
+							<Button
+								variant="ghost"
+								pressed={historyOpen}
+								ariaExpanded={historyOpen}
+								title="Show the statements run on this connection"
+								onClick={() => setHistoryOpen((open) => !open)}
+							>
+								History
+							</Button>
+						</span>
+						<span ref={explainButtonRef} style={styles.buttonHost}>
+							<Button
+								variant="secondary"
+								onClick={openExplain}
+								disabled={explainState.disabled}
+								ariaExpanded={explainOpen}
+								title={explainState.title}
+							>
+								Explain
+							</Button>
+						</span>
 						{running && canStop && (
 							<Button variant="ghost" title="Stop waiting for the answer. This does not cancel the statement." onClick={stopWaiting}>
 								Stop waiting
@@ -989,21 +1044,21 @@ export const QueryView: React.FC<IQueryViewProps> = ({ endpoint, label, initialS
 			<HistoryPanel
 				endpoint={endpoint}
 				open={historyOpen}
-				onClose={() => setHistoryOpen(false)}
+				onClose={() => { setHistoryOpen(false); focusOpener(historyButtonRef); }}
 				onLoadIntoEditor={loadIntoEditor}
 				onRerun={rerunEntry}
 			/>
 
-			{/* The database's plan for the statement Run would send. */}
-			{explain && (
-				<ExplainPanel
-					endpoint={endpoint}
-					dialect={dialect}
-					sql={explain.sql}
-					open
-					onClose={() => setExplain(null)}
-				/>
-			)}
+			{/* The database's plan for the statement Run would send. Mounted
+			    always and driven by `open`: the panel runs its own EXPLAIN when
+			    that turns true, and again whenever the statement changes. */}
+			<ExplainPanel
+				endpoint={endpoint}
+				dialect={dialect}
+				sql={explainSql}
+				open={explainOpen}
+				onClose={() => { setExplainOpen(false); focusOpener(explainButtonRef); }}
+			/>
 
 			{/* Loading a statement would discard unsaved editor text. */}
 			{pendingLoad !== null && (

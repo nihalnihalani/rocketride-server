@@ -48,6 +48,7 @@ import TableDesignView from './views/TableDesignView';
 import DiagramView from './views/DiagramView';
 import SqlSidebar from './SqlSidebar';
 import LiveRegion from './components/LiveRegion';
+import { HistoryPrefsBridge } from './history/historyStore';
 import { DatabaseIcon } from './icons';
 
 // =============================================================================
@@ -181,6 +182,12 @@ const SqlAppReady: React.FC<{ docs: Documents }> = ({ docs }) => {
 		<div style={styles.container}>
 			{/* One polite live region for the whole app; announce() writes to it. */}
 			<LiveRegion />
+
+			{/* The history store only writes while a bridge is mounted. This one
+			    is app-level so a query document whose connection tab was closed
+			    still records; the bridge is reference-counted, so the copies in
+			    ConnectionView and the drawer stay harmless. */}
+			<HistoryPrefsBridge />
 			<DocSplitLayout
 				docs={docs}
 				renderPane={(groupId: string) => {
