@@ -40,6 +40,6 @@ export type {
 	ISqlProbeResult,
 } from './types';
 export { DATABASE_PROVIDERS, discoverSqlEndpoints } from './discovery';
-export { createSqlSession, isUnsupportedToolError, probeSqlEndpoint } from './session';
+export { createSqlSession, probeSqlEndpoint } from './session';
 export { refreshEndpoints, useSqlEndpoints } from './endpointStore';
 export type { EndpointStatus, IEndpointState } from './endpointStore';

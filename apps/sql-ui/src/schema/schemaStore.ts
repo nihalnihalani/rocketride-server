@@ -42,6 +42,14 @@ import { createSqlSession } from '../connect';
 /** Snapshot lifecycle for one connection's schema. */
 export type SchemaStatus = 'idle' | 'loading' | 'ready' | 'error';
 
+/**
+ * What this session has learned about the node's `refresh_schema` tool.
+ * `unknown` until a fresh refresh is attempted; `unavailable` is remembered
+ * for the rest of the session so later refreshes skip the doomed call
+ * instead of paying for it every time.
+ */
+export type RefreshToolState = 'unknown' | 'available' | 'unavailable';
+
 /** One connection's schema snapshot. */
 export interface ISchemaState {
 	/** Snapshot lifecycle state. */
@@ -58,13 +66,23 @@ export interface ISchemaState {
 	 * True when the snapshot came from the node's task-start reflection and
 	 * may not reflect DDL run since — either because the caller asked for an
 	 * ordinary read, or because a `fresh` refresh fell back (the node has no
-	 * `refresh_schema` tool). Views that just applied DDL should say so.
+	 * usable `refresh_schema` tool). Views that just applied DDL should say so.
 	 */
 	stale: boolean;
+	/** What this session knows about the node's `refresh_schema` tool. */
+	refreshTool: RefreshToolState;
 }
 
 /** The idle placeholder returned for connections with no snapshot yet. */
-const IDLE_SCHEMA: ISchemaState = { status: 'idle', schema: null, dialect: 'unknown', error: null, refreshedAt: 0, stale: false };
+const IDLE_SCHEMA: ISchemaState = {
+	status: 'idle',
+	schema: null,
+	dialect: 'unknown',
+	error: null,
+	refreshedAt: 0,
+	stale: false,
+	refreshTool: 'unknown',
+};
 
 // ── Module-level state ───────────────────────────────────────────────────────
 
@@ -135,20 +153,33 @@ export async function refreshSchema(client: RocketRideClient, endpoint: ISqlEndp
 		const session = getSession(client, endpoint);
 		// Dialect first (cheap), then the full reflection.
 		const dialect = await session.dialect();
-		const schema = opts?.fresh ? await session.refreshSchema() : await session.getSchema();
+
+		// A fresh refresh is only attempted while the tool might exist. Once
+		// this session has seen it fall back, every later refresh reads the
+		// snapshot directly — same answer, one round trip instead of two.
+		const attemptFresh = opts?.fresh === true && current.refreshTool !== 'unavailable';
+		const schema = attemptFresh ? await session.refreshSchema() : await session.getSchema();
 		if (schema.error) {
 			setSnapshot(endpoint.key, { ...current, status: 'error', dialect, error: schema.error });
 			return;
 		}
-		// A plain read is stale by construction; a fresh one only when the
-		// node answered through the get_schema fallback.
+
+		// `stale` on the response is the session's own report that it fell
+		// back — the only signal used here. No error text is inspected.
+		const refreshTool: RefreshToolState = attemptFresh
+			? (schema.stale === true ? 'unavailable' : 'available')
+			: current.refreshTool;
+
+		// A plain read serves the task-start snapshot by construction; a fresh
+		// one is current only when the refresh tool actually answered.
 		setSnapshot(endpoint.key, {
 			status: 'ready',
 			schema,
 			dialect,
 			error: null,
 			refreshedAt: Date.now(),
-			stale: opts?.fresh ? schema.stale === true : true,
+			stale: attemptFresh ? schema.stale === true : true,
+			refreshTool,
 		});
 	} catch (err) {
 		setSnapshot(endpoint.key, { ...current, status: 'error', error: err instanceof Error ? err.message : String(err) });

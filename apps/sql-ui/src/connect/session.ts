@@ -59,47 +59,6 @@ function toDialect(value: unknown): SqlDialect {
 }
 
 // =============================================================================
-// TOOL-SUPPORT PROBING
-// =============================================================================
-
-/**
- * Error fragments that mean "this node does not have that tool". The engine
- * walks the tool chain and, when no node owns the name, fails the call — the
- * wording is produced by the compiled engine, so only the Python side is
- * readable here (rocketlib's `tool.invoke: <name> not owned` and
- * `Unknown dynamic tool: <name>`). Matching is therefore best-effort.
- */
-const UNSUPPORTED_TOOL_MARKERS = ['not owned', 'unknown tool', 'unknown dynamic tool', 'no tool methods', 'no node handles'];
-
-/**
- * Error fragments that mean the tool RAN and the database refused the work.
- * These are the failures a capability fallback must NOT swallow.
- */
-const EXECUTED_MARKERS = ['sql execution failed', 'max_execute_rows', 'is disabled for this node', 'transaction session'];
-
-/**
- * Decide whether a failed tool call means the node does not support the tool.
- *
- * The engine's exact wording for an unowned tool lives in the compiled
- * engine and cannot be verified from this repository, so the classifier is
- * deliberately asymmetric: it answers FALSE only for errors that clearly came
- * from a tool that ran, and TRUE for everything else. A caller therefore
- * falls back on transient failures too — which is harmless, because the
- * fallback path fails the same way and surfaces the same error.
- *
- * @param err - The error a tool invocation threw.
- * @returns True when the failure should be treated as "tool unsupported".
- */
-export function isUnsupportedToolError(err: unknown): boolean {
-	const message = (err instanceof Error ? err.message : String(err ?? '')).toLowerCase();
-	if (EXECUTED_MARKERS.some((marker) => message.includes(marker))) return false;
-	if (UNSUPPORTED_TOOL_MARKERS.some((marker) => message.includes(marker))) return true;
-	// Unclassifiable: assume unsupported so a capability probe degrades
-	// instead of turning a new UI affordance into a hard failure.
-	return true;
-}
-
-// =============================================================================
 // SESSION IMPLEMENTATION
 // =============================================================================
 
@@ -147,50 +106,64 @@ class SqlToolSession implements ISqlSession {
 	}
 
 	/**
-	 * Invoke one of the node's tools, retrying exactly once with a fresh token
-	 * when the first attempt fails (covers task restarts between calls).
+	 * Invoke one of the node's tools.
+	 *
+	 * The cached task token goes stale whenever the owning task restarts, and
+	 * a stale token fails exactly like a rejected statement — the transport
+	 * gives no way to tell them apart. Retrying is therefore a per-CALL
+	 * decision, not a transport policy: reflection and dialect reads are safe
+	 * to repeat, a write is not. When `retryOnStaleToken` is false the first
+	 * failure is the answer, and the tool is never invoked a second time.
 	 *
 	 * @param tool - Tool name (execute / get_schema / refresh_schema / dialect).
 	 * @param input - Tool input arguments.
+	 * @param retryOnStaleToken - Whether ONE re-resolved-token retry is safe.
 	 * @returns The tool's result value.
 	 */
-	private async invoke<T>(tool: string, input: Record<string, unknown>): Promise<T> {
+	private async invoke<T>(tool: string, input: Record<string, unknown>, retryOnStaleToken: boolean): Promise<T> {
 		const token = await this.resolveToken();
 		try {
 			return await this.client.tool<T>({ token, tool, nodeId: this.endpoint.nodeId, input });
 		} catch (err) {
-			// One retry with a re-resolved token: the cached token goes stale
-			// whenever the owning task restarts. Any second failure is real.
+			// Drop the cached token either way: it may well be the stale one,
+			// and the next call should resolve a fresh one from scratch.
 			this.token = null;
+			if (!retryOnStaleToken) throw err;
 			const fresh = await this.resolveToken();
+			// Same token back = the task did not restart, so the failure was
+			// real. Only a genuinely different token justifies a second call.
 			if (fresh === token) throw err;
 			return await this.client.tool<T>({ token: fresh, tool, nodeId: this.endpoint.nodeId, input });
 		}
 	}
 
 	/** @inheritdoc */
-	async execute(sql: string, opts?: { params?: unknown[] }): Promise<ISqlExecuteResult> {
+	async execute(sql: string, opts?: { params?: unknown[]; idempotent?: boolean }): Promise<ISqlExecuteResult> {
 		// Omit `params` entirely when there is nothing to bind: the node's
 		// placeholder rewriting is skipped for an empty list, so an unbound
 		// statement keeps travelling exactly as it did before.
 		const params = opts?.params;
 		const input = params && params.length > 0 ? { sql, params } : { sql };
-		return this.invoke<ISqlExecuteResult>('execute', input);
+		// Default NO retry: an unmarked statement may well be a write.
+		return this.invoke<ISqlExecuteResult>('execute', input, opts?.idempotent === true);
 	}
 
 	/** @inheritdoc */
 	async getSchema(table?: string): Promise<ISqlSchemaResponse> {
-		return this.invoke<ISqlSchemaResponse>('get_schema', table ? { table } : {});
+		return this.invoke<ISqlSchemaResponse>('get_schema', table ? { table } : {}, true);
 	}
 
 	/** @inheritdoc */
 	async refreshSchema(): Promise<ISqlSchemaResponse> {
 		try {
-			return await this.invoke<ISqlSchemaResponse>('refresh_schema', {});
-		} catch (err) {
-			if (!isUnsupportedToolError(err)) throw err;
-			// Older nodes have no refresh tool: serve the task-start snapshot
-			// and say so, rather than presenting it as freshly reflected.
+			return await this.invoke<ISqlSchemaResponse>('refresh_schema', {}, true);
+		} catch {
+			// ANY failure falls back. A node without the tool and a node that
+			// simply could not answer are indistinguishable at this layer, and
+			// matching the engine's error wording would rot the first time it
+			// changed. Serve the task-start snapshot and flag it, rather than
+			// present it as freshly reflected; when the fallback ALSO fails,
+			// its error is the one the caller sees.
 			const schema = await this.getSchema();
 			return { ...schema, stale: true };
 		}
@@ -198,7 +171,7 @@ class SqlToolSession implements ISqlSession {
 
 	/** @inheritdoc */
 	async dialect(): Promise<SqlDialect> {
-		const result = await this.invoke<{ dialect?: string }>('dialect', {});
+		const result = await this.invoke<{ dialect?: string }>('dialect', {}, true);
 		return toDialect(result?.dialect);
 	}
 }

@@ -163,9 +163,12 @@ export const TableDataView: React.FC<ITableDataViewProps> = ({ endpoint, table }
 
 			// Page rows + total over the same WHERE (drives the pager). The two
 			// statements are independent, so one round trip instead of two.
+			// Both statements are SELECTs: safe to re-run, so they opt in to the
+			// session's one retry with a re-resolved token (the task may have
+			// restarted since this view last paged).
 			const [pageResult, countResult] = await Promise.all([
-				session.execute(select, { params }),
-				session.execute(count, { params }),
+				session.execute(select, { params, idempotent: true }),
+				session.execute(count, { params, idempotent: true }),
 			]);
 			const total = Number((countResult.rows[0] as { total?: unknown } | undefined)?.total ?? pageResult.rows.length);
 			return { rows: pageResult.rows, total };

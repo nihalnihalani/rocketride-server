@@ -149,12 +149,21 @@ export interface ISqlSession {
 	 * them through the driver, so nothing the user typed is ever parsed as
 	 * SQL. Reference them positionally as `$1..$n`.
 	 *
+	 * A session's cached task token goes stale whenever the owning task
+	 * restarts, and a stale token fails INDISTINGUISHABLY from a statement
+	 * the database refused. Retrying is therefore only safe when re-running
+	 * the statement is harmless: pass `idempotent` for reads, and leave it
+	 * unset for anything that writes. A non-idempotent failure surfaces as-is
+	 * — a silently re-sent INSERT is worse than an error the caller can see.
+	 *
 	 * @param sql - The statement to execute.
 	 * @param opts - Optional execution options.
 	 * @param opts.params - Positional bind values for `$1..$n`.
+	 * @param opts.idempotent - Allow ONE retry with a re-resolved task token.
+	 *                          Only for statements that are safe to re-run.
 	 * @returns Rows and affected-row count.
 	 */
-	execute(sql: string, opts?: { params?: unknown[] }): Promise<ISqlExecuteResult>;
+	execute(sql: string, opts?: { params?: unknown[]; idempotent?: boolean }): Promise<ISqlExecuteResult>;
 	/**
 	 * Reflect the schema of the attached database (or a single table).
 	 *
@@ -169,10 +178,13 @@ export interface ISqlSession {
 	/**
 	 * Re-reflect the attached database and return the fresh schema.
 	 *
-	 * Nodes that predate the `refresh_schema` tool fall back to `getSchema`;
-	 * the response then carries {@link ISqlSchemaResponse.stale} so callers
-	 * can tell the user the schema may be out of date rather than showing a
-	 * post-DDL snapshot as if it were current.
+	 * ANY failure of the refresh tool falls back to `getSchema` — the engine
+	 * gives no reliable way to tell "this node has no such tool" apart from
+	 * any other failure, and matching on error text would break the moment
+	 * the wording changed. The response then carries
+	 * {@link ISqlSchemaResponse.stale} so callers can tell the user the
+	 * schema may be out of date rather than showing a post-DDL snapshot as
+	 * if it were current.
 	 *
 	 * @returns The reflected schema, flagged `stale` when it came from the
 	 *          fallback.
