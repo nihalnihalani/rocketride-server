@@ -39,9 +39,10 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import type { CSSProperties } from 'react';
 import { Banner, DetailPanel, EmptyState, ToggleGroup, useShellConnection } from 'shell';
 import type { ISqlEndpoint, SqlDialect } from '../connect';
+import { announce } from '../a11y/announce';
 import { getSession } from '../schema/schemaStore';
 import type { PlanParseResult } from '../sql/explain';
-import { buildExplain, formatRawPlan, parseExplain } from '../sql/explain';
+import { buildExplain, countPlanNodes, formatRawPlan, parseExplain } from '../sql/explain';
 import { PlanTree } from './PlanTree';
 import { DatabaseIcon } from '../icons';
 
@@ -200,12 +201,16 @@ export const ExplainPanel: React.FC<IExplainPanelProps> = ({ endpoint, dialect, 
 			const { rows } = await session.execute(explainSql);
 			if (signal.cancelled) return;
 			const at = Date.now();
+			const parsed = parseExplain(dialect, rows);
 			setResult({
 				at,
 				seconds: (at - started) / 1000,
 				raw: formatRawPlan(rows),
-				parsed: parseExplain(dialect, rows),
+				parsed,
 			});
+			// The plan itself is a tree and a `pre`, neither of which announces
+			// itself the way a Banner does — so say that it arrived.
+			announce(parsed.ok ? `Plan ready: ${countPlanNodes(parsed.root)} nodes` : 'Plan ready: raw output shown');
 		} catch (err) {
 			if (signal.cancelled) return;
 			setError(err instanceof Error ? err.message : String(err));
@@ -225,11 +230,6 @@ export const ExplainPanel: React.FC<IExplainPanelProps> = ({ endpoint, dialect, 
 		void run(signal);
 		return () => { signal.cancelled = true; };
 	}, [open, explainSql, run]);
-
-	// NOTE: there is no app-local live region in the app yet
-	// (src/a11y/announce.ts belongs to the query-runner work). When it lands,
-	// announce `Plan ready: ${countPlanNodes(root)} nodes` from here; the
-	// visible meta line below already carries the same facts for sighted users.
 
 	const meta = result
 		? `Validated by EXPLAIN ${clockTime(result.at)} · round trip ${result.seconds.toFixed(3)} s · Planner estimates, not measurements.`

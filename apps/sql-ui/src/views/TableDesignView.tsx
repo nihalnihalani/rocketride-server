@@ -33,10 +33,11 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import type { CSSProperties } from 'react';
 import { useShellConnection } from 'shell';
-import { Banner, Button, Card, ConfirmDialog, ContentHeader, EmptyState, InputField, StatusBadge, TabControl, TabPanel } from 'shell';
+import { Banner, Button, Card, ConfirmDialog, ContentHeader, EmptyState, InputField, Section, StatusBadge, TabControl, TabPanel } from 'shell';
 import type { ViewMenu } from 'shell';
 import { commonStyles } from 'shell';
-import type { ISqlEndpoint, ISqlSchemaColumn, SqlDialect } from '../connect';
+import type { ISqlEndpoint, ISqlSchemaColumn, ISqlSchemaResponse, SqlDialect } from '../connect';
+import { buildRelationGraph, inboundReferences } from '../schema/relations';
 import { getSession, refreshSchema, useSchema } from '../schema/schemaStore';
 import type { AlterOp, IColumnSpec } from '../sql/ddl';
 import { FK_ACTIONS, describeOp, generateAlterStatements, generateCreateTable } from '../sql/ddl';
@@ -190,6 +191,24 @@ const styles = {
 		marginBottom: 16,
 	} as CSSProperties,
 
+	// Impact list inside the Apply confirmation.
+	confirmSection: {
+		marginTop: 12,
+	} as CSSProperties,
+
+	impactLine: {
+		fontSize: 12.5,
+		lineHeight: 1.6,
+		marginBottom: 4,
+	} as CSSProperties,
+
+	// Provenance stamp: these facts come from the snapshot, not the database.
+	snapshotStamp: {
+		fontSize: 11.5,
+		color: 'var(--rr-text-secondary)',
+		marginTop: 2,
+	} as CSSProperties,
+
 	// Dialect commit note inside the Apply confirmation.
 	confirmNote: {
 		marginTop: 10,
@@ -246,6 +265,80 @@ function clockTime(ms: number): string {
 function firstLine(message: string): string {
 	const line = message.split('\n').map((l) => l.trim()).find((l) => l.length > 0);
 	return line ?? message.trim();
+}
+
+/**
+ * Resolve every staged drop/rename/retype back to the column name the SCHEMA
+ * SNAPSHOT knows, by replaying the renames the plan performs.
+ *
+ * A plan may rename a column and then retype it under its new name; the
+ * inbound foreign keys in the snapshot still speak of the original name, so
+ * matching on the op's own name alone would miss them.
+ *
+ * @param ops - The staged operations, in plan order.
+ * @returns One entry per affected column: its snapshot name, its name after
+ *          the plan runs, and whether the plan drops it.
+ */
+export function changedColumns(ops: AlterOp[]): { snapshotName: string; finalName: string; dropped: boolean }[] {
+	// current display name -> the name the snapshot knows it by
+	const origin = new Map<string, string>();
+	const seen = new Map<string, { snapshotName: string; finalName: string; dropped: boolean }>();
+
+	/**
+	 * Record one affected column, keyed by its snapshot name.
+	 *
+	 * @param snapshotName - The column's name in the snapshot.
+	 * @param finalName - Its name after the plan runs.
+	 * @param dropped - Whether the plan drops it.
+	 */
+	const mark = (snapshotName: string, finalName: string, dropped: boolean): void => {
+		const prev = seen.get(snapshotName);
+		seen.set(snapshotName, { snapshotName, finalName, dropped: dropped || (prev?.dropped ?? false) });
+	};
+
+	for (const op of ops) {
+		if (op.kind === 'renameColumn') {
+			const from = origin.get(op.name) ?? op.name;
+			origin.delete(op.name);
+			origin.set(op.newName, from);
+			mark(from, op.newName, false);
+		} else if (op.kind === 'changeType') {
+			const from = origin.get(op.name) ?? op.name;
+			mark(from, op.name, false);
+		} else if (op.kind === 'dropColumn') {
+			const from = origin.get(op.name) ?? op.name;
+			mark(from, op.name, true);
+		}
+	}
+	return [...seen.values()];
+}
+
+/**
+ * The inbound foreign keys the staged plan touches, as sentences.
+ *
+ * Declared keys only, read from the schema snapshot — the tool does not ask
+ * the database what it will actually do, so the wording says the database MAY
+ * reject or cascade rather than predicting it.
+ *
+ * @param schema - The schema snapshot (null yields no lines).
+ * @param table - The table being altered.
+ * @param ops - The staged operations.
+ * @returns The impact sentences, in column order.
+ */
+export function inboundImpact(schema: ISqlSchemaResponse | null, table: string, ops: AlterOp[]): string[] {
+	const graph = buildRelationGraph(schema);
+	const inbound = inboundReferences(graph, table);
+	const lines: string[] = [];
+	for (const changed of changedColumns(ops)) {
+		for (const edge of inbound) {
+			edge.refColumns.forEach((refColumn, i) => {
+				if (refColumn !== changed.snapshotName) return;
+				const column = edge.columns[i] ?? refColumn;
+				lines.push(`${table}.${changed.snapshotName} is referenced by ${edge.table}.${column} (declared foreign key). The database may reject this change or cascade it.`);
+			});
+		}
+	}
+	return lines;
 }
 
 /**
@@ -389,6 +482,17 @@ export const TableDesignView: React.FC<ITableDesignViewProps> = ({ endpoint, tab
 	const pendingCount = createMode ? (statements.length > 0 ? 1 : 0) : ops.length;
 	// What this engine does with a plan that stops half-way (verbatim per dialect).
 	const dialectNote = DIALECT_COMMIT_NOTE[snapshot.dialect] ?? null;
+	// Confirmation impact, read from the snapshot's DECLARED foreign keys only.
+	const snapshotTime = snapshot.refreshedAt > 0 ? clockTime(snapshot.refreshedAt) : '--:--';
+	const impact = useMemo<string[]>(
+		() => (createMode || !table ? [] : inboundImpact(snapshot.schema, table, ops)),
+		[createMode, table, snapshot.schema, ops],
+	);
+	// Dropped data is gone as far as this tool is concerned — say so by name.
+	const droppedColumns = useMemo<string[]>(
+		() => (createMode ? [] : changedColumns(ops).filter((c) => c.dropped).map((c) => c.finalName)),
+		[createMode, ops],
+	);
 	const otherTables = Object.keys(snapshot.schema?.tables ?? {}).filter((t) => t !== table);
 
 	// ── Foreign key names (alter mode, lazy on first FK page visit) ──────────
@@ -421,6 +525,18 @@ export const TableDesignView: React.FC<ITableDesignViewProps> = ({ endpoint, tab
 		}
 		setDraft(blankSpec());
 	}, [draft, createMode]);
+
+	/**
+	 * Open the column editor for one row (alter mode, not dropped rows).
+	 *
+	 * @param col - The row the user activated.
+	 */
+	const selectColumn = useCallback((col: IEffectiveColumn): void => {
+		if (createMode || col.pending === 'dropped') return;
+		setSelected(col.name);
+		setEditName(col.name);
+		setEditType(col.type);
+	}, [createMode]);
 
 	/**
 	 * Stage rename/retype for the selected column (alter mode).
@@ -608,13 +724,17 @@ export const TableDesignView: React.FC<ITableDesignViewProps> = ({ endpoint, tab
 												{columns.map((col, rowIndex) => (
 													<tr
 														key={col.id}
+														// The row IS the control that opens the column editor, so it carries
+														// the role, the tab stop and the keyboard verbs a button would.
+														// Dropped rows and create-mode drafts stay inert.
+														{...(createMode || col.pending === 'dropped' ? {} : { role: 'button', tabIndex: 0, 'aria-label': `Edit column ${col.name}` })}
 														style={styles.rowSelectable(selected === col.name)}
-														onClick={() => {
-															// Select for rename/retype (alter mode, not dropped rows).
-															if (createMode || col.pending === 'dropped') return;
-															setSelected(col.name);
-															setEditName(col.name);
-															setEditType(col.type);
+														onClick={() => selectColumn(col)}
+														onKeyDown={(e) => {
+															if (e.key !== 'Enter' && e.key !== ' ') return;
+															// Space would scroll the list out from under the row.
+															e.preventDefault();
+															selectColumn(col);
 														}}
 													>
 														<td style={{ ...styles.td, ...styles.mono, textDecoration: col.pending === 'dropped' ? 'line-through' : 'none' }}>{col.name}</td>
@@ -868,6 +988,25 @@ export const TableDesignView: React.FC<ITableDesignViewProps> = ({ endpoint, tab
 									? `CREATE TABLE ${createName.trim()} will run on ${snapshot.schema?.database ?? endpoint.nodeName}.`
 									: `${statements.length} statement${statements.length === 1 ? '' : 's'} will run in order on ${snapshot.schema?.database ?? endpoint.nodeName}.`}
 							</div>
+							{!createMode && (
+								<div style={styles.confirmSection}>
+									<Section label="Impact">
+										{impact.length > 0 ? (
+											<>
+												{impact.map((line) => <div key={line} style={styles.impactLine}>{line}</div>)}
+												<div style={styles.snapshotStamp}>from schema snapshot {snapshotTime}</div>
+											</>
+										) : (
+											<div style={styles.impactLine}>
+												No inbound foreign keys reference the changed columns (from schema snapshot {snapshotTime}).
+											</div>
+										)}
+										{droppedColumns.map((name) => (
+											<div key={`drop:${name}`} style={styles.impactLine}>Data in {name} is not recoverable by this tool.</div>
+										))}
+									</Section>
+								</div>
+							)}
 							{dialectNote && <div style={styles.confirmNote}>{dialectNote}</div>}
 						</>
 					}
