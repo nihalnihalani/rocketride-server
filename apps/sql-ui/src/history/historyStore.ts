@@ -68,6 +68,13 @@ const PERSIST_DELAY_MS = 300;
 /** Shared empty list, so an unknown connection keeps a stable snapshot. */
 const NO_ENTRIES: IHistoryEntry[] = [];
 
+/**
+ * How many pre-hydration runs are held while the recording switch is unknown.
+ * The queue exists to survive a hydrate, not to accumulate a session's work,
+ * and it holds the user's SQL — so it is bounded like everything else here.
+ */
+const MAX_PENDING_RUNS = 100;
+
 // =============================================================================
 // STATE
 // =============================================================================
@@ -75,6 +82,14 @@ const NO_ENTRIES: IHistoryEntry[] = [];
 let bag: HistoryBag = {};
 let recording: Record<string, boolean> = {};
 let hydrated = false;
+
+/**
+ * Runs that finished before the recording switch could be read. Holding them
+ * here rather than in {@link bag} is what keeps a user who turned recording
+ * OFF from having their SQL persisted: until hydrate, a stored `false` is
+ * indistinguishable from "never set", and the default is on.
+ */
+let pendingRuns: { key: string; entry: IHistoryEntry }[] = [];
 
 let prefs: IPrefsApi | null = null;
 let bridgeCount = 0;
@@ -122,12 +137,14 @@ function readEntry(value: unknown): IHistoryEntry | null {
 /**
  * Read both preference keys into memory, MERGING anything already recorded.
  *
- * Runs can finish before any bridge is mounted (a query document open while
- * its connection workbench is closed), and those entries are in memory only.
- * Replacing the bag wholesale would throw them away at the moment persistence
- * became possible, which is the one moment they could have been saved — so
- * the in-memory entry wins on a shared id and the two lists are merged by
- * age. Unknown connections read as empty.
+ * Entries recorded during an earlier attach are in memory only once the last
+ * bridge detaches. Replacing the bag wholesale would throw them away at the
+ * moment persistence became possible, which is the one moment they could have
+ * been saved — so the in-memory entry wins on a shared id and the two lists
+ * are merged by age. Unknown connections read as empty.
+ *
+ * Runs that finished while the recording switch was unknown are decided at
+ * the END of this function, once the stored flags are in hand.
  */
 function hydrate(): void {
 	const rawBag = prefs?.getPref(PREF_HISTORY);
@@ -162,6 +179,13 @@ function hydrate(): void {
 	recording = { ...flags, ...recording };
 
 	hydrated = true;
+
+	// Runs held back while the switch was unknown are recorded (or dropped)
+	// now, oldest first so the newest still ends up at the top of the list.
+	const queued = pendingRuns;
+	pendingRuns = [];
+	for (const run of queued) recordRun(run.key, run.entry);
+
 	notify();
 	// Anything that was waiting in memory now has somewhere to go.
 	if (pendingKeys.length > 0) schedulePersist();
@@ -245,10 +269,21 @@ function setEntries(key: string, entries: IHistoryEntry[]): void {
 /**
  * Record one finished statement, unless recording is off for that connection.
  *
+ * Before hydration the stored switch is UNREADABLE, and `recording[key]` is
+ * simply absent — which reads as the default, on. Recording the run then
+ * would persist the SQL of a user who turned history off, because hydrate
+ * merges whatever is already in the bag and schedules a write. So a run that
+ * arrives early waits in {@link pendingRuns} until the switch is known.
+ *
  * @param key - The connection's endpoint key.
  * @param entry - The finished statement's record.
  */
 function recordRun(key: string, entry: IHistoryEntry): void {
+	if (!hydrated) {
+		pendingRuns.push({ key, entry });
+		if (pendingRuns.length > MAX_PENDING_RUNS) pendingRuns.shift();
+		return;
+	}
 	if (recording[key] === false) return;
 	setEntries(key, trimHistory([entry, ...(bag[key] ?? [])]));
 }
