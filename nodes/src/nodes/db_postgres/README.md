@@ -4,7 +4,7 @@ A RocketRide database node that answers natural-language questions against a Pos
 
 ## What it does
 
-Plays two roles in a pipeline. As a pipeline node, it receives natural-language questions on the `questions` lane, asks a connected LLM to translate them into SQL, executes the query, and emits the results; it also accepts structured data on the `answers` lane and inserts it into the configured table. As a tool node, agents call it directly through four functions: `get_data`, `get_schema`, `refresh_schema`, and `get_sql`.
+Plays two roles in a pipeline. As a pipeline node, it receives natural-language questions on the `questions` lane, asks a connected LLM to translate them into SQL, executes the query, and emits the results; it also accepts structured data on the `answers` lane and inserts it into the configured table. As a tool node, agents call it directly through nine functions: five that are always available (`get_data`, `get_schema`, `refresh_schema`, `get_sql`, `dialect`) and four raw-SQL ones gated behind `allow_execute` (`execute`, `begin`, `commit`, `rollback`).
 
 Uses SQLAlchemy with the psycopg2 driver (`psycopg2-binary`). The connection string is built as `postgresql+psycopg2://user:password@host/database`; user, password, and database are URL-encoded so reserved characters (`@`, `/`, `#`, `:`) are safe, and the host may carry an explicit port (e.g. `localhost:5433`).
 
@@ -68,7 +68,7 @@ Two special question types are handled on the `questions` lane:
 
 ## As a tool
 
-When connected to an agent, the node exposes four functions. The registered tool names are the bare method names below; the services.json `prefix` is a URL/path prefix and never appears in a tool name. An agent catalog namespaces each tool by the pipeline component id (for example `<component-id>.get_data`).
+When connected to an agent, the node exposes nine functions: the five below, plus the four raw-SQL functions in **Raw SQL and transactions**. The registered tool names are the bare method names below; the services.json `prefix` is a URL/path prefix and never appears in a tool name. An agent catalog namespaces each tool by the pipeline component id (for example `<component-id>.get_data`).
 
 | Tool         | Description                                                                                                       |
 | ------------ | ----------------------------------------------------------------------------------------------------------------- |
@@ -76,17 +76,19 @@ When connected to an agent, the node exposes four functions. The registered tool
 | `get_schema` | Returns tables, columns, types, primary keys, and foreign keys, for the full database or one table                |
 | `refresh_schema` | Re-reads the schema from the database and returns it, plus a `refreshed_at` UTC timestamp                     |
 | `get_sql`    | Natural language to SQL only, no execution                                                                        |
+| `dialect`    | Takes no arguments; returns `{"dialect": "postgres"}` so a caller can branch on the underlying engine              |
 
 `get_data` and `get_sql` return `valid: false` with an `error` (unsafe SQL) or an `answer` (the question was not a database query) when no executable query is produced.
 
 `get_schema` serves the schema reflected when the node started, so a table created or altered since is invisible to it; `refresh_schema` takes no arguments and re-reflects the database.
 
-### Transactions
+### Raw SQL and transactions
 
-Three additional tool functions support explicit database transactions. All three require `allow_execute=true` on the node (the same gate as `QuestionType.EXECUTE`); requests are silently dropped when the gate is off.
+Four more tool functions run raw SQL and explicit transactions. All four require `allow_execute=true` on the node (the same gate as `QuestionType.EXECUTE`), and all four fail the call with an error when the gate is off — unlike the `questions` lane, which logs and drops the request.
 
 | Tool       | Input                     | Returns                    | Description                                                                                                   |
 | ---------- | ------------------------- | -------------------------- | ------------------------------------------------------------------------------------------------------------- |
+| `execute`  | `{"sql": "<statement>"}`, optional `params` (positional `$1..$n`) and `session_id` | `{"rows": [...], "affected_rows": N}` | Runs the statement as written — no LLM translation and no SELECT-only check. Without a `session_id` it runs on a fresh auto-commit connection. A `SELECT` over the row cap (25,000 by default) fails and rolls back rather than returning a truncated result; a failed statement reports the driver's own message. |
 | `begin`    | _(none)_                  | `{"session_id": "<id>"}`   | Opens a new transaction and reserves a dedicated connection for it. Returns a `session_id` that callers must thread through subsequent `execute`, `commit`, and `rollback` calls. |
 | `commit`   | `{"session_id": "<id>"}` | `{"ok": true}`             | Commits all statements made on the given session, releases the held connection back to the pool, and removes the session entry. |
 | `rollback` | `{"session_id": "<id>"}` | `{"ok": true}`             | Discards all statements made on the given session, releases the held connection, and removes the session entry. |

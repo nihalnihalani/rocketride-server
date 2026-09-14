@@ -52,7 +52,10 @@ generation or execution problem returns valid: false with error, SQL, or an LLM
 answer as applicable. It defaults to 250 rows; a supplied limit is clamped to
 the shared maximum. get_schema reports an unknown requested table as an error
 value rather than throwing; it serves the schema reflected when the node
-started, so refresh_schema is what sees DDL run since.
+started, so refresh_schema is what sees DDL run since. refresh_schema takes no
+arguments and returns the re-reflected schema in the same {database, tables}
+shape get_schema returns, plus a refreshed_at UTC ISO-8601 timestamp recording
+when that reflection completed.
 
 get_sql returns {sql, valid: true} only for safe generated SQL; unsafe SQL
 returns {error, sql, valid: false}. execute, begin, commit, and rollback raise
