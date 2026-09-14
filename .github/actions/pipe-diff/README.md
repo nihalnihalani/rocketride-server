@@ -39,8 +39,21 @@ jobs:
       - uses: ./.github/actions/pipe-diff
 ```
 
-`actions/checkout` with its default `fetch-depth: 1` is enough — the action
-fetches the PR base commit itself before diffing.
+The action diffs against the **merge base** of the pull request and its base
+branch — the commit the branch forked from — not the base branch tip. Diffing
+against the tip would report every commit merged into the base since the branch
+forked as a change made by this pull request, and report it backwards.
+
+`actions/checkout` with its default `fetch-depth: 1` works: the action fetches
+the base commit and deepens the checkout itself when the merge base is not
+otherwise computable. Adding `fetch-depth: 0` to the checkout skips that
+deepening and is worth it on a large repository:
+
+```yaml
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+```
 
 ### With inputs
 
@@ -116,7 +129,7 @@ writes. Your options, in order of preference:
 2. Set `comment: false` to skip the API call entirely and drop the
    `pull-requests: write` permission.
 3. Use `pull_request_target`, which runs with a writable token. The comment step
-   runs on `pull_request` **and** `pull_request_target`, and the base commit
+   runs on `pull_request` **and** `pull_request_target`, and the base branch
    comes from the same `github.event.pull_request.base.sha` under both. But the
    action diffs the checked-out tree, and under `pull_request_target`
    `actions/checkout` lands on the base branch — the PR head is not in it, so

@@ -317,7 +317,8 @@ _Layout (ui/viewport) changed._
 Because `diff` is local and exits non-zero on change, it drops straight into a
 pull-request check. The supported way to wire it up is the bundled
 [`pipe-diff` composite action](https://github.com/rocketride-org/rocketride-server/tree/develop/.github/actions/pipe-diff),
-which finds every changed `.pipe`, diffs each against the PR base, and posts one
+which finds every changed `.pipe`, diffs each against the merge base with the
+pull request's base branch, and posts one
 **sticky** comment so reviewers see "OpenAI → Anthropic, chunk size 512 → 1024,
 retrieval rewired through a reranker" instead of a wall of coordinate noise:
 
@@ -344,7 +345,7 @@ SHA the same way once the action is released. The `./`-relative
 form (`uses: ./.github/actions/pipe-diff`) works only inside the
 `rocketride-server` repository itself, where the action lives on disk.
 
-The action installs the CLI, resolves the PR base commit, and maintains a single
+The action installs the CLI, resolves the merge base, and maintains a single
 sticky comment for you. See its
 [README](https://github.com/rocketride-org/rocketride-server/blob/develop/.github/actions/pipe-diff/README.md)
 for the `files`, `cli-version`, `install-from`, `comment`, and `include-layout`

@@ -309,13 +309,13 @@ runs:
         fi
 
         # actions/checkout uses fetch-depth 1 by default, so the base commit is
-        # usually absent. Fetch just that object. GitHub allows fetching an
-        # arbitrary reachable SHA directly.
+        # usually absent. Fetch it; GitHub allows fetching an arbitrary
+        # reachable SHA directly. Deliberately NOT --depth=1: what we diff
+        # against is the MERGE BASE of the base branch and the head (resolved
+        # below), and `git merge-base` has to walk the base commit's ancestry.
         if ! git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null; then
           echo "Fetching PR base commit ${BASE_SHA}"
-          git fetch --no-tags --depth=1 origin "${BASE_SHA}" 2>/dev/null \
-            || git fetch --no-tags origin "${BASE_SHA}" 2>/dev/null \
-            || true
+          git fetch --no-tags origin "${BASE_SHA}" 2>/dev/null || true
         fi
         if ! git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null; then
           # This path fails the step, but it still has to leave a report behind:
@@ -333,8 +333,52 @@ runs:
           exit 1
         fi
 
+        # Diff from the MERGE BASE, not from the base branch tip.
+        # `github.event.pull_request.base.sha` is the tip of the base branch as
+        # of this event, and that tip keeps moving as other pull requests merge.
+        # Diffing HEAD against it reports every commit merged into the base
+        # since this branch forked as a change made by THIS pull request -- and
+        # reports it backwards, because those commits are on the left-hand side:
+        # a node someone else added shows up here as a node this PR deleted.
+        # `git merge-base` gives the commit the branch actually forked from,
+        # which is the comparison GitHub's own "Files changed" tab shows. The
+        # README's manual recipe already uses `git merge-base`; this makes the
+        # action agree with it.
+        #
+        # Both sides need ancestry for that walk, and a default `fetch-depth: 1`
+        # checkout has none for HEAD. Deepen only when the cheap attempt fails,
+        # so a workflow that already checks out with `fetch-depth: 0` pays
+        # nothing. `--unshallow` errors on an already-complete repository, hence
+        # the fallbacks.
+        merge_base="$(git merge-base "${BASE_SHA}" HEAD 2>/dev/null || true)"
+        if [ -z "${merge_base}" ]; then
+          echo "Merge base not computable from the shallow checkout; deepening."
+          git fetch --no-tags --unshallow origin 2>/dev/null \
+            || git fetch --no-tags --deepen=2147483647 origin 2>/dev/null \
+            || true
+          git fetch --no-tags origin "${BASE_SHA}" 2>/dev/null || true
+          merge_base="$(git merge-base "${BASE_SHA}" HEAD 2>/dev/null || true)"
+        fi
+        if [ -z "${merge_base}" ]; then
+          # Same contract as the base-fetch failure above: leave a report behind
+          # on the job summary, then annotate and fail. Failing is the point --
+          # falling back to the base tip is what produced wrong, inverted diffs.
+          {
+            printf '%s\n' "${marker}"
+            printf '## RocketRide pipeline diff\n\n'
+            printf 'Could not compute the merge base of %s and the checked-out head, so no diff was computed.\n\n' "$(md_code "${BASE_SHA}")"
+            printf 'Check out with `fetch-depth: 0` so the branch histories are present.\n'
+          } > "${body_file}"
+          write_job_summary
+          echo "::error::Could not compute the merge base of ${BASE_SHA} and HEAD. Check out with fetch-depth: 0 so the branch histories are present."
+          exit 1
+        fi
+        if [ "${merge_base}" != "${BASE_SHA}" ]; then
+          echo "Base branch tip ${BASE_SHA} has moved; diffing against merge base ${merge_base}."
+        fi
+
         # Under pull_request_target, `actions/checkout` defaults to the BASE
-        # branch, not the PR head -- so `git diff BASE_SHA HEAD` would compare
+        # branch, not the PR head -- so the diff below would compare
         # the base against itself and silently report "no .pipe files changed".
         # Warn instead of failing quietly. The fix is NOT to check out the PR
         # head: this job runs `python -m pip` and `git` with the checkout as its
@@ -365,13 +409,13 @@ runs:
         changed_files=()
         while IFS= read -r -d '' path; do
           changed_files+=("${path}")
-        done < <(git diff -z --name-only --diff-filter=d "${BASE_SHA}" HEAD -- ":(glob)${FILES_GLOB}")
+        done < <(git diff -z --name-only --diff-filter=d "${merge_base}" HEAD -- ":(glob)${FILES_GLOB}")
 
         # Deleted .pipe files: reported as a note (no working-tree file to diff).
         deleted_files=()
         while IFS= read -r -d '' path; do
           deleted_files+=("${path}")
-        done < <(git diff -z --name-only --diff-filter=D "${BASE_SHA}" HEAD -- ":(glob)${FILES_GLOB}")
+        done < <(git diff -z --name-only --diff-filter=D "${merge_base}" HEAD -- ":(glob)${FILES_GLOB}")
 
         changed_count="${#changed_files[@]}"
         deleted_count="${#deleted_files[@]}"
@@ -432,7 +476,7 @@ runs:
           # Build the command as an always-non-empty array so "${cmd[@]}" is
           # safe under `set -u` on every bash version (an empty-array expansion
           # errors on bash < 4.4).
-          cmd=(rocketride diff --git "${BASE_SHA}" "${f}" --markdown)
+          cmd=(rocketride diff --git "${merge_base}" "${f}" --markdown)
           if [ -n "${include_layout_flag}" ]; then
             cmd+=("${include_layout_flag}")
           fi
@@ -501,7 +545,7 @@ runs:
           printf '%s\n' "${marker}"
           printf '## RocketRide pipeline diff\n\n'
           # Reaching here with head_missing=true means the checked-out base
-          # branch has moved past BASE_SHA, so the sections below describe
+          # branch has moved past the merge base, so the sections below describe
           # commits merged into the base -- not this pull request. Say so, at
           # the top, before anything a reader would mistake for the PR's diff.
           # The guard makes this emit nothing at all on every other path.
@@ -512,7 +556,7 @@ runs:
           printf '%s\n\n' "${summary}"
           cat "${sections_file}"
           printf -- '---\n'
-          printf '<sub>Semantic diff of `.pipe` files versus the PR base. Canvas layout (per-node `ui` and the top-level `viewport`) is ignored by default. Generated by the RocketRide pipe-diff action.</sub>\n'
+          printf '<sub>Semantic diff of `.pipe` files versus the merge base with the PR base branch. Canvas layout (per-node `ui` and the top-level `viewport`) is ignored by default. Generated by the RocketRide pipe-diff action.</sub>\n'
         } > "${body_file}"
 
         emit_outputs "${changed_count}" "${any_semantic}" true "${any_error}"
