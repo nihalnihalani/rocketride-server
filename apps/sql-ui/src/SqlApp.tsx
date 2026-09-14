@@ -56,10 +56,8 @@ import { DatabaseIcon } from './icons';
 // TYPES
 // =============================================================================
 
-// The query-document payload is declared beside the URI builders in docs.ts,
-// where every producer of a query document can reach it without importing a
-// view. Re-exported here for the callers that already import the app module.
-export type { IQueryDocPayload } from './docs';
+// The query-document payload type lives beside the URI builders in docs.ts
+// (IQueryDocPayload); producers and this consumer import it from there.
 
 // =============================================================================
 // STYLES
