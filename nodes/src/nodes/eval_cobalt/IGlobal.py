@@ -33,6 +33,11 @@ from typing import Any, Dict
 from rocketlib import IGlobalBase, OPEN_MODE, warning
 from ai.common.config import Config
 
+# This node's own service prefix — services.json declares `"prefix": "eval"`,
+# and the credential catalog is generated from that same value, so config the
+# engine injects for this node arrives flat under `eval.<field>`.
+_SERVICE_PREFIX = 'eval.'
+
 
 class IGlobal(IGlobalBase):
     _evaluator = None
@@ -106,13 +111,36 @@ class IGlobal(IGlobalBase):
 
     @classmethod
     def _normalizeConfigKeys(cls, config: Dict[str, Any]) -> Dict[str, Any]:
-        """Map service field names onto the flat keys consumed by CobaltEvaluator."""
+        """Map service field names onto the flat keys consumed by CobaltEvaluator.
+
+        The engine delivers credential-backed config under the node's own
+        service prefix: ``nodes/scripts/gen-credentials.mjs`` builds every
+        catalog path as ``<services.json "prefix">.<field>``, and this node
+        declares ``"prefix": "eval"``, so the generated credential for the
+        judge API key arrives as the flat key ``eval.apikey`` (see the
+        ``eval_cobalt`` entry in ``packages/ai/src/ai/modules/mcp/credentials.json``).
+        Stripping that prefix is what puts the value where
+        ``config.get('apikey')`` can find it — without it the llm_judge profile
+        ran keyless. The sibling ``dataset_cobalt`` node strips its own
+        ``dataset.`` prefix the same way.
+
+        ``cobalt_eval.`` and ``llm.cloud.apikey`` are kept for config saved by
+        earlier UI shapes.
+
+        Args:
+            config: Raw config mapping, possibly nested one profile deep.
+
+        Returns:
+            The same mapping with prefixed keys flattened onto bare field names.
+        """
         normalized = {}
         prefixed = {}
         for key, value in config.items():
             normalized_key = key
             if isinstance(key, str):
-                if key.startswith('cobalt_eval.'):
+                if key.startswith(_SERVICE_PREFIX):
+                    normalized_key = key.removeprefix(_SERVICE_PREFIX)
+                elif key.startswith('cobalt_eval.'):
                     normalized_key = key.removeprefix('cobalt_eval.')
                 elif key == 'llm.cloud.apikey':
                     normalized_key = 'apikey'

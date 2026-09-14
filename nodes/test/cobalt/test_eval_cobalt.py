@@ -178,7 +178,7 @@ from eval_cobalt.evaluators.format_check import evaluate_format as evaluate_form
 from eval_cobalt.evaluators.grounding import evaluate_grounding as evaluate_grounding_fn
 from eval_cobalt.evaluators.relevance import evaluate_relevance as evaluate_relevance_fn
 
-importlib.import_module('eval_cobalt.IGlobal')
+IGlobalModule = importlib.import_module('eval_cobalt.IGlobal')
 importlib.import_module('eval_cobalt.IInstance')
 
 for _name, _original in _ORIGINAL_MODULES.items():
@@ -1151,6 +1151,78 @@ class TestEvalConfigExtraction:
         assert config['model'] == 'gpt-test'
         assert config['criteria'] == 'Judge correctness.'
         assert config['apikey'] == 'test-key'
+
+    def test_generated_credential_path_reaches_the_evaluator(self):
+        """`eval.apikey` — the path the credential catalog declares — must land on `apikey`.
+
+        `nodes/scripts/gen-credentials.mjs` builds every catalog path as
+        `<services.json "prefix">.<field>`, and eval_cobalt declares
+        `"prefix": "eval"`, so the generated credential arrives as the flat key
+        `eval.apikey` (see the eval_cobalt entry in
+        packages/ai/src/ai/modules/mcp/credentials.json). The normalizer only
+        knew `cobalt_eval.` and the literal `llm.cloud.apikey`, so the injected
+        key stayed under `eval.apikey`, `config.get('apikey', '')` came back
+        empty, and llm_judge ran keyless. Fails without the fix.
+        """
+        iglobal = self._make_global(
+            {
+                'profile': 'llm_judge',
+                'llm_judge': {
+                    'eval.apikey': 'injected-key',
+                    'threshold': 0.8,
+                },
+            }
+        )
+
+        with patch('eval_cobalt.IGlobal.Config.getNodeConfig') as mock_get_config:
+            mock_get_config.return_value = {
+                'eval_type': 'llm_judge',
+                'eval.apikey': 'injected-key',
+                'threshold': 0.8,
+            }
+            config = iglobal._extractConfig()
+
+        normalized_conn_config = mock_get_config.call_args.args[1]
+        assert normalized_conn_config['llm_judge']['apikey'] == 'injected-key'
+        assert 'eval.apikey' not in normalized_conn_config['llm_judge']
+
+        assert config['apikey'] == 'injected-key'
+        assert 'eval.apikey' not in config
+
+    def test_every_eval_prefixed_field_is_normalized(self):
+        """The whole prefix is stripped, not just the credential field."""
+        normalized = IGlobalModule.IGlobal._normalizeConfigKeys(
+            {
+                'eval.eval_type': 'llm_judge',
+                'eval.threshold': 0.9,
+                'eval.model': 'gpt-test',
+                'eval.criteria': 'Judge it.',
+                'eval.apikey': 'k',
+            }
+        )
+
+        assert normalized == {
+            'eval_type': 'llm_judge',
+            'threshold': 0.9,
+            'model': 'gpt-test',
+            'criteria': 'Judge it.',
+            'apikey': 'k',
+        }
+
+    def test_legacy_prefixes_still_normalize(self):
+        """The older shapes keep working alongside the service prefix."""
+        normalized = IGlobalModule.IGlobal._normalizeConfigKeys(
+            {'cobalt_eval.threshold': 0.5, 'llm.cloud.apikey': 'legacy-key'}
+        )
+
+        assert normalized['threshold'] == 0.5
+        assert normalized['apikey'] == 'legacy-key'
+
+    def test_unprefixed_keys_are_left_alone(self):
+        """A key that does not carry the prefix must survive untouched."""
+        normalized = IGlobalModule.IGlobal._normalizeConfigKeys({'evaluation_mode': 'strict', 'threshold': 0.4})
+
+        assert normalized == {'evaluation_mode': 'strict', 'threshold': 0.4}
 
 
 class TestClampThresholdHelper:
