@@ -31,19 +31,21 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import type { IStatementRun, RunOutcome } from '../src/sql/batch';
-import { formatBatchOutcome, formatElapsed, formatRunLabel, leadingVerb } from '../src/sql/batch';
+import type { StatementKind } from '../src/sql/classify';
+import { formatBatchOutcome, formatElapsed, formatPriorStatements, formatRunLabel, leadingVerb } from '../src/sql/batch';
 
 /**
- * Build a batch from a list of outcomes.
+ * Build a batch from a list of outcomes, all of them reads.
  *
  * @param outcomes - One outcome per statement, in order.
+ * @param kinds - Statement kind per position; defaults to read throughout.
  * @returns The statement runs.
  */
-function batch(outcomes: RunOutcome[]): IStatementRun[] {
+function batch(outcomes: RunOutcome[], kinds: StatementKind[] = []): IStatementRun[] {
 	return outcomes.map((outcome, index) => ({
 		index,
 		sql: 'SELECT 1',
-		kind: 'read' as const,
+		kind: kinds[index] ?? ('read' as StatementKind),
 		verb: 'SELECT',
 		startLine: index + 1,
 		endLine: index + 1,
@@ -77,8 +79,21 @@ describe('formatElapsed', () => {
 
 describe('formatBatchOutcome', () => {
 	it('produces the bound wording for a partly failed batch', () => {
-		const runs = batch(['rows', 'affected', 'error', 'skipped', 'skipped']);
-		assert.equal(formatBatchOutcome(runs), '1–2 committed · 3 failed · 4–5 not run');
+		// A read that finished "ran"; a write that finished "committed".
+		const runs = batch(['rows', 'affected', 'error', 'skipped', 'skipped'], ['read', 'write', 'read', 'read', 'read']);
+		assert.equal(formatBatchOutcome(runs), '1 ran · 2 committed · 3 failed · 4–5 not run');
+	});
+
+	it('says ran, never committed, for a batch of reads', () => {
+		assert.equal(formatBatchOutcome(batch(['rows', 'rows'])), '1–2 ran');
+	});
+
+	it('says committed for writes and DDL', () => {
+		assert.equal(formatBatchOutcome(batch(['affected', 'affected'], ['write', 'ddl'])), '1–2 committed');
+	});
+
+	it('calls an unclassifiable statement committed, not ran', () => {
+		assert.equal(formatBatchOutcome(batch(['affected'], ['other'])), '1 committed');
 	});
 
 	it('collapses one statement to a single number', () => {
@@ -86,19 +101,50 @@ describe('formatBatchOutcome', () => {
 	});
 
 	it('reports a fully successful batch', () => {
-		assert.equal(formatBatchOutcome(batch(['rows', 'rows', 'affected'])), '1–3 committed');
+		assert.equal(formatBatchOutcome(batch(['rows', 'rows', 'affected'])), '1–3 ran');
 	});
 
 	it('reports an abandoned statement separately', () => {
-		assert.equal(formatBatchOutcome(batch(['rows', 'abandoned', 'skipped'])), '1 committed · 2 abandoned · 3 not run');
+		assert.equal(formatBatchOutcome(batch(['rows', 'abandoned', 'skipped'])), '1 ran · 2 abandoned · 3 not run');
 	});
 
 	it('leaves a running statement out of the line', () => {
-		assert.equal(formatBatchOutcome(batch(['rows', 'running', 'pending'])), '1 committed · 3 not run');
+		assert.equal(formatBatchOutcome(batch(['rows', 'running', 'pending'])), '1 ran · 3 not run');
 	});
 
 	it('says nothing about an empty batch', () => {
 		assert.equal(formatBatchOutcome([]), '');
+	});
+});
+
+describe('formatPriorStatements', () => {
+	it('says nothing when the first statement failed', () => {
+		assert.equal(formatPriorStatements(batch(['error', 'skipped']), 0), '');
+	});
+
+	it('says only "ran" when every earlier statement was a read', () => {
+		const runs = batch(['rows', 'rows', 'error'], ['read', 'read', 'read']);
+		assert.equal(formatPriorStatements(runs, 2), 'Statements 1\u20132 already ran.');
+	});
+
+	it('says "committed" as soon as one earlier statement changed anything', () => {
+		const runs = batch(['rows', 'affected', 'error'], ['read', 'write', 'read']);
+		assert.equal(
+			formatPriorStatements(runs, 2),
+			'Statements 1\u20132 already committed (each statement runs in its own autocommit transaction).',
+		);
+	});
+
+	it('uses the singular for a single earlier statement', () => {
+		assert.equal(formatPriorStatements(batch(['rows', 'error']), 1), 'Statement 1 already ran.');
+	});
+
+	it('uses the singular for a single earlier write', () => {
+		const runs = batch(['affected', 'error'], ['ddl', 'read']);
+		assert.equal(
+			formatPriorStatements(runs, 1),
+			'Statement 1 already committed (each statement runs in its own autocommit transaction).',
+		);
 	});
 });
 

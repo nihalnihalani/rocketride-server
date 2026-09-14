@@ -85,7 +85,7 @@ describe('maxRowsText', () => {
 
 describe('applyRowLimit', () => {
 	it('appends a limit to a SELECT', () => {
-		assert.deepEqual(applyRowLimit('SELECT * FROM orders', '200'), { sql: 'SELECT * FROM orders LIMIT 200', limit: 200 });
+		assert.deepEqual(applyRowLimit('SELECT * FROM orders', '200'), { sql: 'SELECT * FROM orders LIMIT 200', limit: 200, state: 'applied' });
 	});
 
 	it('drops a trailing semicolon before appending', () => {
@@ -93,15 +93,26 @@ describe('applyRowLimit', () => {
 	});
 
 	it('applies no limit for All', () => {
-		assert.deepEqual(applyRowLimit('SELECT * FROM orders', 'All'), { sql: 'SELECT * FROM orders', limit: null });
+		assert.deepEqual(applyRowLimit('SELECT * FROM orders', 'All'), { sql: 'SELECT * FROM orders', limit: null, state: 'none' });
 	});
 
-	it('leaves a statement that already limits itself alone', () => {
-		assert.deepEqual(applyRowLimit('SELECT * FROM orders LIMIT 5', '200'), { sql: 'SELECT * FROM orders LIMIT 5', limit: null });
+	it('reports a statement that limits itself, rather than claiming none', () => {
+		assert.deepEqual(applyRowLimit('SELECT * FROM orders LIMIT 5', '200'), {
+			sql: 'SELECT * FROM orders LIMIT 5',
+			limit: null,
+			state: 'in-statement',
+		});
+	});
+
+	it('still reports the statement own limit under All', () => {
+		// The generated "Select top 100" reads `... LIMIT 100`; under All this
+		// used to render "100 rows returned (no limit applied)", which invites
+		// the reader to conclude the table holds exactly 100 rows.
+		assert.equal(applyRowLimit('SELECT * FROM orders LIMIT 100', 'All').state, 'in-statement');
 	});
 
 	it('leaves an UPDATE alone', () => {
-		assert.deepEqual(applyRowLimit('UPDATE orders SET a = 1', '200'), { sql: 'UPDATE orders SET a = 1', limit: null });
+		assert.deepEqual(applyRowLimit('UPDATE orders SET a = 1', '200'), { sql: 'UPDATE orders SET a = 1', limit: null, state: 'none' });
 	});
 
 	it('leaves DDL alone', () => {

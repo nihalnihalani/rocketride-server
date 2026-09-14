@@ -71,10 +71,14 @@ export interface IStatementRun {
 	start?: number;
 	/** End offset in the editor buffer, when the statement came from one. */
 	end?: number;
-	/** One-based first line in the editor buffer. */
-	startLine: number;
-	/** One-based last line in the editor buffer. */
-	endLine: number;
+	/**
+	 * One-based first line in the editor buffer. ABSENT for a statement that
+	 * did not come from the editor — a history rerun has no position, and
+	 * inventing line 1 would decorate and name unrelated text.
+	 */
+	startLine?: number;
+	/** One-based last line in the editor buffer; absent with {@link startLine}. */
+	endLine?: number;
 	/** Current outcome. */
 	outcome: RunOutcome;
 	/** Returned rows, when the outcome is `rows`. */
@@ -87,6 +91,8 @@ export interface IStatementRun {
 	error?: string;
 	/** Row limit appended to this statement, or null when none was. */
 	limitApplied?: number | null;
+	/** How the row limit came about — decides which meta wording applies. */
+	limitState?: LimitState;
 }
 
 // =============================================================================
@@ -115,30 +121,32 @@ export function formatElapsed(ms: number): string {
 	return `round trip ${(ms / 1000).toFixed(3)} s`;
 }
 
-/** The four things a batch position can be said to have done. */
-type OutcomeGroup = 'committed' | 'failed' | 'not run' | 'abandoned';
+/** The words a batch position can be described with. */
+type OutcomeGroup = 'ran' | 'committed' | 'failed' | 'not run' | 'abandoned';
 
 /**
- * Which group an outcome belongs to in the batch summary.
+ * Which word describes a finished statement.
  *
- * `committed` is the honest word for a statement that finished: each one ran
- * in its own transaction and is already durable, whether it returned rows or
- * changed them.
+ * A read `ran`; anything else `committed`. The distinction matters because
+ * "committed" is the app's way of saying the change is already durable and
+ * cannot be undone from here — saying it about a SELECT dilutes the one word
+ * that has to carry that weight. Anything not clearly read-only is called
+ * committed, which is the safe direction.
  *
- * @param outcome - The statement's outcome.
+ * @param run - The statement.
  * @returns The group, or null for a statement that has not resolved.
  */
-function groupOf(outcome: RunOutcome): OutcomeGroup | null {
-	if (outcome === 'rows' || outcome === 'affected') return 'committed';
-	if (outcome === 'error') return 'failed';
-	if (outcome === 'abandoned') return 'abandoned';
-	if (outcome === 'skipped' || outcome === 'pending') return 'not run';
+function groupOf(run: IStatementRun): OutcomeGroup | null {
+	if (run.outcome === 'rows' || run.outcome === 'affected') return run.kind === 'read' ? 'ran' : 'committed';
+	if (run.outcome === 'error') return 'failed';
+	if (run.outcome === 'abandoned') return 'abandoned';
+	if (run.outcome === 'skipped' || run.outcome === 'pending') return 'not run';
 	return null;
 }
 
 /**
  * Summarise a finished batch in one line, e.g.
- * `1–2 committed · 3 failed · 4–5 not run`.
+ * `1 ran · 2 committed · 3 failed · 4–5 not run`.
  *
  * Positions are one-based and consecutive positions in the same group collapse
  * into a range. A statement still running contributes nothing, so the line is
@@ -164,7 +172,7 @@ export function formatBatchOutcome(runs: IStatementRun[]): string {
 	};
 
 	for (let i = 0; i < runs.length; i++) {
-		const group = groupOf(runs[i].outcome);
+		const group = groupOf(runs[i]);
 		if (group === groupName) continue;
 		flush(i);
 		groupName = group;
@@ -172,6 +180,26 @@ export function formatBatchOutcome(runs: IStatementRun[]): string {
 	}
 	flush(runs.length);
 	return parts.join(' · ');
+}
+
+/**
+ * What the failure banner says about the statements BEFORE the one that
+ * failed — the sentence that has to stop a reader assuming a failed batch
+ * rolled back.
+ *
+ * @param runs - The batch, in order.
+ * @param failedIndex - Zero-based index of the statement that failed.
+ * @returns The sentence, or '' when nothing ran before the failure.
+ */
+export function formatPriorStatements(runs: IStatementRun[], failedIndex: number): string {
+	const prior = runs.slice(0, Math.max(0, failedIndex));
+	if (prior.length === 0) return '';
+	const span = prior.length === 1 ? 'Statement 1' : `Statements 1\u2013${prior.length}`;
+	// One write or DDL before the failure is enough: something is durable.
+	const changed = prior.some((run) => run.kind !== 'read');
+	return changed
+		? `${span} already committed (each statement runs in its own autocommit transaction).`
+		: `${span} already ran.`;
 }
 
 /**
@@ -217,6 +245,16 @@ export function formatRunLabel(run: IStatementRun): string {
 const RETURNS_ROWS = /^select\b/i;
 
 /**
+ * How a result's row limit came about.
+ *
+ * - `applied` — the app appended the header's limit.
+ * - `in-statement` — the statement carried its own LIMIT, so the app added
+ *   none and the row count is the STATEMENT's bound, not the table's size.
+ * - `none` — no limit is in play at all.
+ */
+export type LimitState = 'applied' | 'in-statement' | 'none';
+
+/**
  * Append the header's row limit to a statement that returns rows.
  *
  * A statement that already carries its own LIMIT is left alone: the user's
@@ -230,16 +268,17 @@ const RETURNS_ROWS = /^select\b/i;
  * @returns The statement to send and the limit that was appended (null when
  *          none was).
  */
-export function applyRowLimit(sql: string, limit: string, dialect: SqlDialect = 'unknown'): { sql: string; limit: number | null } {
-	if (limit === 'All') return { sql, limit: null };
-	const value = Number(limit);
-	if (!Number.isFinite(value) || value <= 0) return { sql, limit: null };
+export function applyRowLimit(sql: string, limit: string, dialect: SqlDialect = 'unknown'): { sql: string; limit: number | null; state: LimitState } {
 	const stripped = stripSqlComments(sql, dialect).replace(/;\s*$/, '').trim();
 	const bare = stripped.replace(/^[\s(]+/, '');
 	const returnsRows = RETURNS_ROWS.test(bare)
 		|| stripped.startsWith('(')
 		|| (/^with\b/i.test(bare) && !/\b(insert|update|delete|merge|replace)\b/i.test(bare));
-	if (!returnsRows) return { sql, limit: null };
-	if (/\blimit\b/i.test(bare)) return { sql, limit: null };
-	return { sql: `${sql.replace(/;\s*$/, '').trimEnd()} LIMIT ${value}`, limit: value };
+	// Checked BEFORE the header selection, so `All` on a statement that limits
+	// itself still reports the statement's limit instead of claiming none.
+	if (returnsRows && /\blimit\b/i.test(bare)) return { sql, limit: null, state: 'in-statement' };
+	if (limit === 'All' || !returnsRows) return { sql, limit: null, state: 'none' };
+	const value = Number(limit);
+	if (!Number.isFinite(value) || value <= 0) return { sql, limit: null, state: 'none' };
+	return { sql: `${sql.replace(/;\s*$/, '').trimEnd()} LIMIT ${value}`, limit: value, state: 'applied' };
 }

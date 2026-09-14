@@ -117,10 +117,14 @@ function badgeFor(run: IStatementRun): { variant: StatusVariant; text: string } 
  * @returns The tooltip text.
  */
 function titleFor(run: IStatementRun): string {
-	const where = run.startLine === run.endLine ? `line ${run.startLine}` : `lines ${run.startLine}–${run.endLine}`;
-	if (run.outcome === 'skipped') return `Not run (${where}): an earlier statement failed.`;
-	if (run.outcome === 'abandoned') return `Abandoned (${where}): this tool stopped waiting; the database may still be running it.`;
-	return `Show the result of statement ${run.index + 1} (${where}).`;
+	// A statement rerun from the history drawer has no place in the buffer, so
+	// it gets no line reference rather than a made-up one.
+	const lines = run.startLine === undefined || run.endLine === undefined
+		? ''
+		: run.startLine === run.endLine ? ` (line ${run.startLine})` : ` (lines ${run.startLine}–${run.endLine})`;
+	if (run.outcome === 'skipped') return `Not run${lines}: an earlier statement failed.`;
+	if (run.outcome === 'abandoned') return `Abandoned${lines}: this tool stopped waiting; the database may still be running it.`;
+	return `Show the result of statement ${run.index + 1}${lines}.`;
 }
 
 // =============================================================================
