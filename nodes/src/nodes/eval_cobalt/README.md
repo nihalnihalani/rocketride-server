@@ -27,13 +27,52 @@ Key behavior to know:
 
 ---
 
+## Lanes
+
+| Lane in   | Lane out  | Description                                                  |
+| --------- | --------- | ------------------------------------------------------------ |
+| `answers` | `answers` | Forwards the original answer, then emits a JSON score answer |
+
+## Profiles
+
+Default: **Semantic Similarity - TF-IDF cosine similarity scorer** (`similarity`). The **Evaluator** dropdown selects the profile, which sets a sensible threshold for that strategy and exposes only the fields it needs.
+
+| Profile                    | Default threshold | Extra fields exposed              |
+| -------------------------- | ----------------- | --------------------------------- |
+| `similarity` **(default)** | 0.7               | —                                 |
+| `llm_judge`                | 0.7               | `model`, `criteria`, `apikey`     |
+| `custom`                   | 0.7               | —                                 |
+| `relevance`                | 0.5               | `keyword_weight`, `length_weight` |
+| `grounding`                | 0.5               | —                                 |
+| `format`                   | 0.5               | `expected_format`                 |
+
+The two thresholds are not arbitrary. The deterministic heuristics (`relevance`, `grounding`, `format`) score lower than a semantic comparison on the same correct answer, so they pass at 0.5 where `similarity` and `llm_judge` pass at 0.7.
+
 ## Configuration
 
-### Lanes
+Pick the profile first — it decides the evaluator and pre-sets a threshold, and the remaining fields either belong to that evaluator or are the threshold itself. A pipeline that only needs a pass/fail gate can stop there.
 
-| Lane in   | Lane out  | Description                                                        |
-|-----------|-----------|--------------------------------------------------------------------|
-| `answers` | `answers` | Forwards the original answer, then emits a JSON score answer      |
+### Evaluator / Evaluator type
+
+`similarity` compares the answer against the reference and is the right default when you have expected answers. `llm_judge` grades against written criteria and is for answers with no single right wording — it is the only mode that costs money and needs network. `relevance`, `grounding`, and `format` are deterministic and offline: use `grounding` to catch a RAG pipeline inventing facts, `format` to gate structure (JSON that must parse, a list that must be a list), and `relevance` as a cheap smoke test. `custom` resolves a Python callable `(output, expected) -> score`/dict from config or the pipeline bag when none of the above fits.
+
+### Pass threshold
+
+The minimum score that counts as a pass, clamped to `[0.0, 1.0]` at construction — an out-of-range config value can never produce a nonsensical verdict. Raise it to make the gate stricter; lower it when a known-good corpus scores below it, rather than after a single failing item. Changing the evaluator resets this to that profile's default, so set it after choosing the profile.
+
+### Judge model, Evaluation criteria, API key
+
+Judge-mode only, and all three are effectively required: without an API key or without the `cobalt` package the judge returns a zero score with a reason rather than failing the run, which is easy to mistake for uniformly bad answers. **Evaluation criteria** is the whole contract with the judge — write what a good answer must do (`Is the output correct, complete, and well-structured?` is the default and is a starting point, not a specification).
+
+### Expected format
+
+`format`-mode only: `prose`, `list`, `code`, or `json`. Set it to what the downstream consumer actually parses, not to what the prompt asks for.
+
+### Keyword weight, Length weight
+
+`relevance`-mode only, and they are read as a pair: the score is the keyword-overlap component weighted by the first plus the length-ratio component weighted by the second. The defaults (0.7 / 0.3) favour content over length. Give length more weight only when answers are failing for being the wrong size rather than the wrong content.
+
+## Notes
 
 ### Output
 
@@ -46,36 +85,7 @@ The score answer carries a deep copy of the incoming answer's `metadata` (for ex
 | `cobalt_evaluator` | string | Which evaluator produced the score (`semantic`, `llm_judge`, `custom`, `relevance`, `grounding`, `format`) |
 | `cobalt_reasoning` | string | Human-readable explanation |
 
-### Fields
-
-| Field | Type | Description |
-|---|---|---|
-| `eval_type` | string | The evaluation strategy to run |
-| `threshold` | number | Default 0.7. Minimum score (0.0–1.0) to pass; clamped to range |
-| `model` | string | LLM model for judge mode (e.g. gpt-4, claude-3) |
-| `criteria` | string | Criteria prompt for the LLM judge |
-| `apikey` | string | LLM provider API key (secure/password field) for judge mode |
-| `expected_format` | string | Default "prose". Structure to validate against: prose, list, code, json |
-| `keyword_weight` | number | Default 0.7. Weight on keyword-overlap in relevance scoring |
-| `length_weight` | number | Default 0.3. Weight on length-ratio in relevance scoring |
-| `profile` | string | Default "similarity". Evaluator profile |
-
-### Profiles
-
-The **Evaluator** dropdown selects a preconfigured profile, each setting a sensible default threshold and exposing only the relevant fields:
-
-| Profile      | Evaluator   | Default threshold | Extra fields exposed                     |
-|--------------|-------------|-------------------|-------------------------------------------|
-| `similarity` | Similarity  | 0.7               | —                                         |
-| `llm_judge`  | LLM Judge   | 0.7               | `model`, `criteria`, `apikey`             |
-| `custom`     | Custom      | 0.7               | —                                         |
-| `relevance`  | Relevance   | 0.5               | `keyword_weight`, `length_weight`         |
-| `grounding`  | Grounding   | 0.5               | —                                         |
-| `format`     | Format      | 0.5               | `expected_format`                         |
-
----
-
-## Dependency
+### Dependency
 
 The `cobalt` (basalt-ai-cobalt) package is **optional**. It is required for LLM-judge mode and preferred for similarity mode. When it is absent, similarity falls back to Jaccard word-overlap and the `relevance`, `grounding`, and `format` evaluators run unchanged (they are pure-Python and need no dependency).
 

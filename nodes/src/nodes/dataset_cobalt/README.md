@@ -18,43 +18,56 @@ Key behavior to know:
 
 ---
 
-## Configuration
+## Lanes
 
-### Lanes
-
-| Lane in   | Lane out    | Description                                          |
-|-----------|-------------|------------------------------------------------------|
+| Lane in   | Lane out    | Description                                         |
+| --------- | ----------- | --------------------------------------------------- |
 | `_source` | `questions` | One question emitted per (transformed) dataset item |
 
 The node is a source: it produces questions from the configured dataset and does not consume an upstream `questions` lane.
 
-### Fields
+## Profiles
 
-| Field | Type | Description |
-|---|---|---|
-| `source_type` | string | Default "file". Where to load from: `file` (JSON/CSV/JSONL) or `inline` items |
-| `file_path` | string | Path to the dataset file. Must resolve to a location inside the working directory |
-| `items` | string | Inline items as a JSON array string, e.g. `[{"input": "...", "expected": "..."}]` |
-| `sample_size` | number | Default 0. Random items to sample after filtering (0 = use all), bounded to dataset size |
-| `filter_field` | string | Optional field name to filter items on |
-| `filter_value` | string | Value the filter field must equal (string comparison) |
-| `slice_start` | number | Default 0. Start index for slicing (0-based) |
-| `slice_end` | number | Default 0. End index for slicing (0 = no slicing) |
+Default: `file`. The **Source Type** dropdown selects the profile, which decides where the items come from and which field the panel then asks for.
 
-Transforms are applied in a fixed order: **filter → sample → slice**. Each is optional and skipped when unset.
+| Profile              | Source                                                 |
+| -------------------- | ------------------------------------------------------ |
+| `file` **(default)** | A JSON, CSV, or JSONL file named by **File Path**       |
+| `inline`             | The JSON array pasted into **Inline Items (JSON)**      |
 
-### Profiles
+## Configuration
 
-The **Source Type** dropdown selects a preconfigured profile:
+Pick the profile first — it is the only choice that changes which other fields matter. Everything else is optional: leave the transform fields at their defaults and every item in the dataset is emitted, in file order.
 
-| Profile  | Title              | Source                                    |
-|----------|--------------------|-------------------------------------------|
-| `file`   | File (default)     | Loads from a JSON, CSV, or JSONL file     |
-| `inline` | Inline Items       | Loads from the inline JSON `items` array  |
+### Source Type
 
----
+`file` reads the dataset off disk and is what a committed golden dataset uses. `inline` carries the items in the pipeline itself, which keeps a small smoke-test dataset next to the pipeline that exercises it and avoids shipping a data file. The panel shows **File Path** or **Inline Items (JSON)** accordingly.
 
-## Dependency
+### File Path
+
+Relative to the pipeline working directory. A path containing a `..` traversal segment, or one that resolves (after following symlinks) outside that directory, is rejected at runtime — this is a security boundary, so an absolute path elsewhere on disk is rejected too. `datasets/qa-golden.jsonl` is the shape to write.
+
+JSON files may be a bare array, or an envelope under `items`, `data`, or `rows`. JSONL is one object per line. CSV is read with `DictReader`, so the header row names the fields.
+
+### Inline Items (JSON)
+
+A JSON array of objects, as a string: `[{"input": "What is 2+2?", "expected": "4"}]`. Parsed at runtime, so a syntax error surfaces as a warning and an empty question set rather than a pipeline abort.
+
+Each item's question text is taken from `input`, then `text`, then `question` — first non-null wins; the reference from `expected`, then `output`, then `answer`. Any other keys are preserved as metadata, `id` becomes `dataset_id`, and every item is tagged `cobalt_source: true`.
+
+### Sample Size, Filter Field, Filter Value, Slice Start, Slice End
+
+The transforms, applied in a fixed order: **filter → sample → slice**. Each is skipped when unset, so they compose without surprising each other.
+
+- **Filter Field** / **Filter Value** keep only the items whose field equals the value (string comparison). Both are needed; one alone does nothing.
+- **Sample Size** takes that many items at random after filtering. `0` (the default) means take all, and a value larger than the dataset is bounded to its size.
+- **Slice Start** / **Slice End** take a 0-based half-open range of what is left. `0` for **Slice End** (the default) means no slicing.
+
+Filtering to one category and then sampling 20 is the usual shape for a quick run against a large dataset; slicing is for reproducibly re-running the same window.
+
+## Notes
+
+### Dependency
 
 The `cobalt` (basalt-ai-cobalt) package is **optional**. Installed, it is used for file parsing and transforms; absent, the node falls back to a pure-Python loader that handles JSON arrays, `{"items"|"data"|"rows": [...]}` envelopes, JSONL (one object per line), and CSV (`DictReader` rows).
 
