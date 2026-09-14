@@ -29,6 +29,7 @@ import pytest
 from sqlalchemy import create_engine, text
 from sqlalchemy.pool import StaticPool
 
+from ai.common.database.db_global_base import DatabaseGlobalBase
 from ai.common.database.db_instance_base import DatabaseInstanceBase
 from ai.common.database.tx_registry import TransactionRegistry
 
@@ -55,12 +56,17 @@ def _make_iglobal(*, allow_execute: bool, engine=None):
     if engine is None:
         engine = _engine_shared()
     registry = TransactionRegistry(engine, max_rows=1000)
-    return types.SimpleNamespace(
+    iglobal = types.SimpleNamespace(
         allow_execute=allow_execute,
         max_execute_rows=1000,
         engine=engine,
         tx_registry=registry,
     )
+    # A failed stateless execute formats the driver error through IGlobal, so
+    # the stub borrows the real implementation. Without it the failure path
+    # dies with AttributeError instead of raising the RuntimeError under test.
+    iglobal._format_db_error = types.MethodType(DatabaseGlobalBase._format_db_error, iglobal)
+    return iglobal
 
 
 def _make_instance(iglobal):
@@ -206,6 +212,16 @@ def test_session_execute_overflow_releases_session(instance_with_sqlite_registry
 # ---------------------------------------------------------------------------
 # (d) execute with unknown session_id raises ValueError
 # ---------------------------------------------------------------------------
+
+
+def test_stateless_execute_surfaces_the_driver_error(instance_with_sqlite_registry):
+    """A bad statement outside a session raises with the database's own message.
+
+    Also pins the fixture: execute()'s failure path calls IGlobal._format_db_error,
+    so an IGlobal stub without it fails with AttributeError instead.
+    """
+    with pytest.raises(RuntimeError, match='SQL execution failed: '):
+        instance_with_sqlite_registry.execute({'sql': 'SELECT * FROM no_such_table'})
 
 
 def test_execute_unknown_session_id_raises_value_error(instance_with_sqlite_registry):
