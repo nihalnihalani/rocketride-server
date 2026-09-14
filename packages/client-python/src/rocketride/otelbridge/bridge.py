@@ -50,6 +50,9 @@ modules) so it is importable without the ``rocketride[otel]`` extra.
 
 Components:
     run_bridge: Async entry point running the bridge until stopped
+    CLIENT_EVENT_HOOK: Name of the private SDK attribute the event dispatcher
+        is installed on — the bridge's single point of coupling to the SDK's
+        internals, pinned by tests/test_otel_client_contract.py
 """
 
 import asyncio
@@ -70,6 +73,25 @@ _SPAN_EVENTS = ('apaevt_task', 'apaevt_flow', 'apaevt_sse')
 
 # Event routed to MetricsMapper.handle_status
 _STATUS_EVENT = 'apaevt_status_update'
+
+# ---------------------------------------------------------------------------
+# The private SDK attribute this bridge hooks to receive monitor events.
+#
+# ``EventMixin.__init__`` stores the client constructor's ``on_event=``
+# callback in this attribute, and ``EventMixin.on_event`` awaits whatever it
+# holds for every DAP event envelope that arrives on the socket. The bridge
+# assigns to it rather than passing ``on_event=`` to the constructor because it
+# is handed an ALREADY-BUILT client (the CLI's, or an embedder's) and has to
+# put the previous handler back when it exits.
+#
+# Nothing in the SDK's public surface pins this name, and a rename would fail
+# SILENTLY here: assigning an unknown attribute to a Python object succeeds, so
+# the bridge would keep running, keep reporting "connected", and simply never
+# see an event again. tests/test_otel_client_contract.py pins the name and the
+# dispatch behaviour against the real RocketRideClient so that an SDK refactor
+# breaks a test instead of the bridge.
+# ---------------------------------------------------------------------------
+CLIENT_EVENT_HOOK = '_caller_on_event'
 
 
 def _log(message: str) -> None:
@@ -237,7 +259,7 @@ async def run_bridge(
     # ---------------------------------------------------------------------
     # Attach the event dispatcher, chaining any pre-existing handler
     # ---------------------------------------------------------------------
-    previous_handler = getattr(client, '_caller_on_event', None)
+    previous_handler = getattr(client, CLIENT_EVENT_HOOK, None)
 
     async def _dispatch(message: Dict[str, Any]) -> None:
         """Route one monitor event to the mappers, logging (not raising) failures."""
@@ -261,7 +283,7 @@ async def run_bridge(
             except Exception as exc:
                 _log(f'error in chained event handler for {event_name}: {exc}')
 
-    client._caller_on_event = _dispatch
+    setattr(client, CLIENT_EVENT_HOOK, _dispatch)
 
     # ---------------------------------------------------------------------
     # Signal handling: SIGINT/SIGTERM trigger a graceful stop
@@ -341,7 +363,7 @@ async def run_bridge(
                 pass
 
         # Detach the dispatcher, restoring any chained handler
-        client._caller_on_event = previous_handler
+        setattr(client, CLIENT_EVENT_HOOK, previous_handler)
 
         # Close open spans first, then flush exporters
         try:
