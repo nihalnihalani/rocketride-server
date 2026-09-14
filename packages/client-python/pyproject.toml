@@ -72,8 +72,18 @@ Repository = "https://github.com/rocketride-ai/rocketride-server.git"
 [project.scripts]
 rocketride = "rocketride.cli.main:main"
 
+# `rocketride_common` is a source library shared with the TypeScript client, not
+# a separate distribution: `rocketride.cli.main` imports it at module scope (via
+# `cli/utils/env.py`), so the CLI cannot start without it. The builder stages it
+# into `src/` before building the released wheel, but the checked-out source tree
+# is the one layout where the two packages sit apart — which is exactly the
+# layout `pip install ./packages/client-python` (and the pipe-diff action's
+# `install-from`) builds from. Listing the sibling source root here makes both
+# find the shared package; the entry is simply skipped when the directory is
+# absent, so the builder's staged layout is unaffected and the released
+# wheel/sdist still carry `rocketride_common` from `src/` exactly as before.
 [tool.setuptools.packages.find]
-where = ["src"]
+where = ["src", "../client-common/python/src"]
 include = ["rocketride*"]
 
 [tool.setuptools.package-data]
