@@ -91,7 +91,10 @@ one entry per statement, and selecting an entry shows that statement's rows.
 
 The splitter understands strings, quoted identifiers, line and block
 comments, and PostgreSQL dollar-quoted bodies, so a semicolon inside any of
-those is not a separator. MySQL's `DELIMITER` directive is **not**
+those is not a separator. Each dialect's own rules apply: MySQL needs
+whitespace after `--` before it is a comment (`SELECT 1--2` is arithmetic),
+and a `$tag$` that continues an identifier opens no PostgreSQL dollar quote.
+MySQL's `DELIMITER` directive is **not**
 supported: a buffer that changes the terminator mid-file splits wrongly, so
 run stored-routine definitions through the MySQL client instead.
 
@@ -115,8 +118,10 @@ would be worse than a refusal.
 The header toggle offers **200**, **1000** and **All**, applied to
 row-returning statements. The results line states what was applied: `1,000
 rows returned (limit 1000)` when SQL Explorer appended the limit, `N rows
-returned (limit in statement)` when the statement carried its own `LIMIT`, or
-`N rows returned (no limit applied)` for **All** with no `LIMIT` in the text.
+returned (limit in statement)` when the statement's OUTERMOST query carries
+its own `LIMIT` — one inside a subquery bounds that subquery, not the result,
+so the app still applies its own — or `N rows returned (no limit applied)`
+for **All** with no `LIMIT` in the text.
 When the returned count equals an applied limit, a badge reads `Limit
 reached — more rows may exist`, because a full page is not evidence the
 result ended there.
