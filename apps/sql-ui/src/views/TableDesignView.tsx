@@ -779,7 +779,16 @@ export const TableDesignView: React.FC<ITableDesignViewProps> = ({ endpoint, tab
 																<StatusBadge variant={col.pending === 'dropped' ? 'error' : 'warning'}>{col.pending}</StatusBadge>
 															)}
 														</td>
-														<td style={styles.td}>
+														{/* The row itself has button semantics, so a click or a keypress
+														    on the Drop button inside it would also reach selectColumn and
+														    stage an edit for the column being dropped. The cell stops both
+														    here: the shell's Button takes no event argument, so they cannot
+														    be stopped at the source. */}
+														<td
+															style={styles.td}
+															onClick={(e) => { e.stopPropagation(); }}
+															onKeyDown={(e) => { e.stopPropagation(); }}
+														>
 															<Button
 																variant="danger"
 																small

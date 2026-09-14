@@ -155,6 +155,10 @@ export const TableDataView: React.FC<ITableDataViewProps> = ({ endpoint, table }
 	const fetchPage = useCallback((req: IDataGridPageRequest): Promise<IDataGridPage<Record<string, unknown>>> => {
 		setGridSorted(req.sort.length > 0);
 		const seq = ++seqRef.current;
+		// The banner describes ONE request. A new search, sort or page is a
+		// different question, so the previous answer's failure stops being
+		// shown the moment this one starts rather than the moment it lands.
+		setLoadError(null);
 
 		const run = (async (): Promise<IDataGridPage<Record<string, unknown>>> => {
 			if (!client || !tableDef) return { rows: [], total: 0 };
