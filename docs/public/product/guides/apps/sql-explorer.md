@@ -120,8 +120,28 @@ row-returning statements. The results line states what was applied: `1,000
 rows returned (limit 1000)` when SQL Explorer appended the limit, `N rows
 returned (limit in statement)` when the statement's OUTERMOST query carries
 its own `LIMIT` — one inside a subquery bounds that subquery, not the result,
-so the app still applies its own — or `N rows returned (no limit applied)`
-for **All** with no `LIMIT` in the text.
+so on **200** or **1000** the app still appends its own — or `N rows returned
+(no limit applied)` when nothing bounds the result.
+
+Read `no limit applied` literally, because **All** together with a `LIMIT`
+that is not on the outermost query produces exactly that line. Only a
+top-level `LIMIT` is recognised, so
+
+```sql
+SELECT o.*
+FROM orders o
+JOIN (SELECT customer_id FROM customers LIMIT 10) c
+  ON c.customer_id = o.customer_id
+```
+
+run with **All** counts as carrying no limit: nothing is appended and the
+line reads `no limit applied`. That is not a mistake in the reading — the
+inner `LIMIT 10` bounds the customer subquery, and the statement can still
+return every order belonging to those ten customers. The line describes the
+RESULT, not the text. Choose **200** or **1000** to have a limit appended to
+the outer query, or move the `LIMIT` to the top level, to bound what comes
+back.
+
 When the returned count equals an applied limit, a badge reads `Limit
 reached — more rows may exist`, because a full page is not evidence the
 result ended there.
