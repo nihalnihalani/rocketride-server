@@ -23,17 +23,62 @@
 // =============================================================================
 // SQL-UI — QUERY VIEW (one SQL editor document: Monaco + results grid)
 // =============================================================================
+//
+// The runner's three load-bearing honesty rules, all of which come from how
+// the node actually executes (packages/ai/.../db_instance_base.py):
+//
+//   1. ONE STATEMENT PER CALL, EACH IN ITS OWN TRANSACTION. A buffer is split
+//      client-side and sent statement by statement; plain `execute` wraps each
+//      call in its own `engine.begin()`. A batch that fails on statement 3
+//      therefore leaves 1 and 2 COMMITTED, and the status strip and the error
+//      banner both say so.
+//
+//   2. THERE IS NO CANCEL. Nothing in the tool protocol stops a running
+//      statement, so "Stop waiting" is exactly that: the run sequence is
+//      bumped so the late answer is ignored, and the banner says the database
+//      may still be running it.
+//
+//   3. TRANSACTION CONTROL DOES NOTHING HERE. `BEGIN` / `COMMIT` / `ROLLBACK`
+//      would each land in a separate autocommit call, so they are refused
+//      before anything is sent rather than run into a false sense of safety.
+//
+// The confirmation dialog is likewise a TEXT CHECK and says so in its own
+// words; it prevents nothing and is not called a safe mode anywhere.
+// =============================================================================
 
-import React, { useCallback, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { CSSProperties } from 'react';
-import { useShellConnection } from 'shell';
-import type { GridCellComponent } from 'shell';
-import { Banner, Button, Card, CardDataGrid, ContentHeader, EmptyState, ToggleGroup, monoEl, mutedEl } from 'shell';
-import type { GridColumnDefinition } from 'shell';
-import { commonStyles } from 'shell';
+import { useShellConnection, usePrefs } from 'shell';
+import type { GridCellComponent, GridColumnDefinition } from 'shell';
+import { Banner, Button, Card, CardDataGrid, ConfirmDialog, ContentHeader, EmptyState, StatusBadge, ToggleGroup, commonStyles, monoEl, mutedEl } from 'shell';
 import type { ISqlEndpoint } from '../connect';
 import { getSession, useSchema } from '../schema/schemaStore';
 import SqlEditor from '../components/SqlEditor';
+import type { IDecorationRange, IEditorCursorState, ISqlEditorHandle } from '../components/SqlEditor';
+import StatementStrip from '../components/StatementStrip';
+import CellInspector from '../components/CellInspector';
+import HistoryPanel from '../components/HistoryPanel';
+import ExplainPanel from '../components/ExplainPanel';
+import { announce } from '../a11y/announce';
+import { splitStatements, statementAtOffset } from '../sql/split';
+import type { IStatement } from '../sql/split';
+import { classifyStatement, patternCheck } from '../sql/classify';
+import type { IPatternFinding } from '../sql/classify';
+import { applyRowLimit, formatBatchOutcome, formatElapsed, leadingVerb } from '../sql/batch';
+import type { IStatementRun, RunOutcome } from '../sql/batch';
+import {
+	ALLOW_EXECUTE_OFF_TEXT,
+	DATABASE_SAID_LABEL,
+	GENERIC_ERROR_TEXT,
+	TRANSACTION_REFUSAL_TEXT,
+	describeFailure,
+	maxRowsText,
+} from '../sql/failure';
+import type { IFailureNotice } from '../sql/failure';
+import { inferColumnTypes } from '../sql/resultTypes';
+import { buildCompletionModel } from '../sql/completion';
+import { emitRun } from '../history/runEvents';
+import type { IHistoryEntry } from '../history/types';
 import { DatabaseIcon } from '../icons';
 
 // =============================================================================
@@ -46,20 +91,38 @@ export interface IQueryViewProps {
 	endpoint: ISqlEndpoint;
 	/** Tab label ("Query 3") for the page header. */
 	label: string;
+	/** Text to seed the editor with (a generated query, a reloaded entry). */
+	initialSql?: string;
+	/** `generated` marks SQL the app wrote, which is previewed before it runs. */
+	origin?: 'generated';
 }
 
-/** One finished execution's result, kept until the next run. */
-interface IQueryResult {
-	/** Result rows (possibly empty). */
-	rows: Record<string, unknown>[];
-	/** Rows affected (non-SELECT statements). */
-	affectedRows: number;
-	/** Execution wall time in milliseconds. */
-	elapsedMs: number;
+/** A pending pattern-check confirmation, and the resolver waiting on it. */
+interface IPatternPrompt {
+	/** The statement the check fired on. */
+	run: IStatementRun;
+	/** What the check saw. */
+	finding: IPatternFinding;
+}
+
+/** A failed statement, and where in the batch it was. */
+interface IFailureState {
+	/** What the failure means and what to show. */
+	notice: IFailureNotice;
+	/** Zero-based index of the statement that failed. */
+	index: number;
+	/** One-based line range of the failing statement. */
+	lines: string;
 }
 
 /** Row-limit options offered by the header toggle. */
 const LIMIT_OPTIONS = ['200', '1000', 'All'] as const;
+
+/** Prefs key holding the per-connection pattern-check switch. */
+const PATTERN_CHECK_PREF = 'sql.patternChecks';
+
+/** How long a run must last before "Stop waiting" is offered. */
+const STOP_WAITING_AFTER_MS = 1000;
 
 // =============================================================================
 // STYLES
@@ -94,10 +157,50 @@ const styles = {
 		flexDirection: 'column',
 	} as CSSProperties,
 
-	// Result meta line in the grid card's action slot.
-	meta: {
+	// The pre-run truth line under the editor.
+	willRun: {
+		display: 'flex',
+		alignItems: 'center',
+		justifyContent: 'space-between',
+		gap: 12,
 		fontSize: 11,
 		color: 'var(--rr-text-secondary)',
+		paddingTop: 6,
+	} as CSSProperties,
+
+	// Result meta line in the grid card's action slot.
+	meta: {
+		display: 'flex',
+		alignItems: 'center',
+		gap: 8,
+		fontSize: 11,
+		color: 'var(--rr-text-secondary)',
+	} as CSSProperties,
+
+	// Verbatim driver text inside the error banner.
+	verbatim: {
+		margin: '6px 0 0',
+		padding: 8,
+		maxHeight: 180,
+		overflow: 'auto',
+		fontFamily: 'var(--rr-font-mono, monospace)',
+		fontSize: 11,
+		whiteSpace: 'pre-wrap',
+		background: 'color-mix(in srgb, var(--rr-text-primary) 6%, transparent)',
+		borderRadius: 4,
+	} as CSSProperties,
+
+	// Statement excerpt inside the confirmation dialog.
+	excerpt: {
+		margin: '8px 0',
+		padding: 8,
+		maxHeight: 120,
+		overflow: 'auto',
+		fontFamily: 'var(--rr-font-mono, monospace)',
+		fontSize: 11,
+		whiteSpace: 'pre-wrap',
+		background: 'color-mix(in srgb, var(--rr-text-primary) 6%, transparent)',
+		borderRadius: 4,
 	} as CSSProperties,
 };
 
@@ -106,26 +209,36 @@ const styles = {
 // =============================================================================
 
 /**
- * Apply the header row limit to a statement: SELECTs without their own LIMIT
- * get one appended; everything else passes through untouched.
+ * One-based line number of an offset in a buffer.
  *
- * @param sql - The statement to run.
- * @param limit - The selected limit option.
- * @returns The statement to send.
+ * @param text - The buffer.
+ * @param offset - The character offset.
+ * @returns The line number.
  */
-function applyLimit(sql: string, limit: string): string {
-	if (limit === 'All') return sql;
-	const trimmed = sql.trim().replace(/;\s*$/, '');
-	// Row-returning statements only: SELECT, parenthesised set expressions,
-	// and read-only WITH chains. Data-modifying CTEs (WITH ... INSERT/UPDATE/
-	// DELETE) must stay untouched — appending LIMIT there is invalid SQL.
-	const returnsRows =
-		/^select\b/i.test(trimmed) ||
-		trimmed.startsWith('(') ||
-		(/^with\b/i.test(trimmed) && !/\b(insert|update|delete)\b/i.test(trimmed));
-	if (!returnsRows) return sql;
-	if (/\blimit\s+\d+/i.test(trimmed)) return sql;
-	return `${trimmed} LIMIT ${limit}`;
+function lineAt(text: string, offset: number): number {
+	return text.slice(0, Math.max(0, offset)).split('\n').length;
+}
+
+/**
+ * Describe a line range the way the pre-run line and the strip do.
+ *
+ * @param from - First line (one-based).
+ * @param to - Last line (one-based).
+ * @returns e.g. `line 4` or `lines 4–6`.
+ */
+function lineRange(from: number, to: number): string {
+	return from === to ? `line ${from}` : `lines ${from}–${to}`;
+}
+
+/**
+ * Clock time for the meta and history lines.
+ *
+ * @param at - Unix ms.
+ * @returns `HH:MM`.
+ */
+function clock(at: number): string {
+	const date = new Date(at);
+	return `${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`;
 }
 
 /**
@@ -140,133 +253,783 @@ function resultCellEl(value: unknown): HTMLElement {
 	return monoEl(String(value));
 }
 
+/**
+ * Turn a finished statement into the history entry the drawer stores.
+ *
+ * @param run - The finished statement.
+ * @returns The entry.
+ */
+function toHistoryEntry(run: IStatementRun): IHistoryEntry {
+	const outcome: IHistoryEntry['outcome'] =
+		run.outcome === 'rows' || run.outcome === 'affected' || run.outcome === 'abandoned' ? run.outcome : 'error';
+	return {
+		id: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
+		sql: run.sql,
+		at: Date.now() - (run.ms ?? 0),
+		ms: run.ms ?? 0,
+		outcome,
+		rows: run.outcome === 'rows' ? run.rows?.length ?? 0 : undefined,
+		affected: run.outcome === 'affected' ? run.affected ?? 0 : undefined,
+		error: run.error,
+		kind: run.kind,
+	};
+}
+
 // =============================================================================
 // COMPONENT
 // =============================================================================
 
 /**
- * One SQL editor document: Monaco on top, the last execution's rows in a
- * LOCAL CardDataGrid below. Run executes through the connection's session
- * (Ctrl/Cmd+Enter or the header button); the row-limit toggle guards SELECTs.
+ * One SQL editor document: Monaco on top, the selected statement's rows in a
+ * LOCAL CardDataGrid below.
+ *
+ * Run sends the selection, or the statement the caret is in; Run all sends
+ * every statement in order and stops at the first error. What a run WOULD send
+ * is named in text under the editor before the key is pressed, because a
+ * decoration alone is not an answer for anyone who cannot see it.
+ *
+ * @param props - {@link IQueryViewProps}.
+ * @returns The query document element.
  */
-export const QueryView: React.FC<IQueryViewProps> = ({ endpoint, label }) => {
+export const QueryView: React.FC<IQueryViewProps> = ({ endpoint, label, initialSql, origin }) => {
 	const { client, isConnected } = useShellConnection();
 	const snapshot = useSchema(endpoint.key);
+	const prefs = usePrefs();
 
-	// Editor text, limit selection, and the last run's outcome.
-	const [sql, setSql] = useState('');
+	// ── Editor + run state ───────────────────────────────────────────────────
+	const [sql, setSql] = useState(initialSql ?? '');
 	const [limit, setLimit] = useState<string>('1000');
 	const [running, setRunning] = useState(false);
-	const [result, setResult] = useState<IQueryResult | null>(null);
-	const [error, setError] = useState<string | null>(null);
+	const [runs, setRuns] = useState<IStatementRun[]>([]);
+	const [selectedRun, setSelectedRun] = useState<number | null>(null);
+	const [activeIndex, setActiveIndex] = useState(0);
+	const [cursor, setCursor] = useState<IEditorCursorState>({ offset: 0, selectionText: '', selectionStart: 0, selectionEnd: 0 });
+	const [lastRun, setLastRun] = useState<{ index: number; at: number; start?: number; end?: number } | null>(null);
+
+	// ── Notices ──────────────────────────────────────────────────────────────
+	const [failure, setFailure] = useState<IFailureState | null>(null);
+	const [showVerbatim, setShowVerbatim] = useState(false);
+	const [abandonNotice, setAbandonNotice] = useState<string | null>(null);
+	const [txRefused, setTxRefused] = useState(false);
+	const [allowExecuteOff, setAllowExecuteOff] = useState(false);
+	const [canStop, setCanStop] = useState(false);
+	const [untouchedGenerated, setUntouchedGenerated] = useState(origin === 'generated');
+
+	// ── Drawers + dialogs ────────────────────────────────────────────────────
+	const [historyOpen, setHistoryOpen] = useState(false);
+	const [explain, setExplain] = useState<{ sql: string } | null>(null);
+	const [pendingLoad, setPendingLoad] = useState<string | null>(null);
+	const [inspected, setInspected] = useState<{ row: Record<string, unknown>; number: number } | null>(null);
+	const [patternPrompt, setPatternPrompt] = useState<IPatternPrompt | null>(null);
+	const [patternChecksOn, setPatternChecksOn] = useState<boolean>(() => {
+		const bag = prefs.getPref(PATTERN_CHECK_PREF) as Record<string, boolean> | undefined;
+		return bag?.[endpoint.key] !== false;
+	});
+
+	// ── Refs ─────────────────────────────────────────────────────────────────
+	const editorRef = useRef<ISqlEditorHandle>(null);
+	// Monotonic run id. Every await re-checks it: a response whose sequence has
+	// moved on belongs to a run the user abandoned and is DROPPED, never landed.
+	const runSeqRef = useRef(0);
+	const runningRef = useRef(false);
+	const runStartedRef = useRef(0);
+	const runsRef = useRef<IStatementRun[]>([]);
+	const activeIndexRef = useRef(0);
+	const mountedRef = useRef(true);
+	const patternResolverRef = useRef<((answer: 'run' | 'always' | 'cancel') => void) | null>(null);
+	const patternChecksOnRef = useRef(patternChecksOn);
+	// The buffer text as of the last run or the last load: anything else in the
+	// editor is unsaved work that must not be replaced without asking.
+	const committedTextRef = useRef(initialSql ?? '');
+
+	useEffect(() => () => { mountedRef.current = false; }, []);
+	useEffect(() => { patternChecksOnRef.current = patternChecksOn; }, [patternChecksOn]);
+
+	const dialect = snapshot.dialect;
+	const statements = useMemo(() => splitStatements(sql, dialect), [sql, dialect]);
+
+	// Suggestions are rebuilt only when the snapshot changes, not per keystroke.
+	const completion = useMemo(
+		() => buildCompletionModel(snapshot.schema, snapshot.refreshedAt || Date.now()),
+		[snapshot.schema, snapshot.refreshedAt],
+	);
+
+	// ── Preferences ──────────────────────────────────────────────────────────
 
 	/**
-	 * Execute the editor's statement through the bound session.
+	 * Turn the pattern check on or off for THIS connection, in the workspace
+	 * prefs (server-side, per user) and in local state.
+	 *
+	 * @param on - Whether the check should run.
 	 */
-	const run = useCallback(async (): Promise<void> => {
-		if (!client || running || !sql.trim()) return;
-		setRunning(true);
-		setError(null);
-		const started = performance.now();
-		try {
-			const session = getSession(client, endpoint);
-			const res = await session.execute(applyLimit(sql, limit));
-			setResult({
-				rows: res.rows ?? [],
-				affectedRows: res.affected_rows ?? 0,
-				elapsedMs: performance.now() - started,
-			});
-		} catch (err) {
-			setResult(null);
-			setError(err instanceof Error ? err.message : String(err));
-		} finally {
-			setRunning(false);
+	const setPatternChecks = useCallback((on: boolean): void => {
+		const bag = (prefs.getPref(PATTERN_CHECK_PREF) as Record<string, boolean> | undefined) ?? {};
+		prefs.setPref(PATTERN_CHECK_PREF, { ...bag, [endpoint.key]: on });
+		setPatternChecksOn(on);
+		announce(on ? 'Pattern checks on for this connection' : 'Pattern checks off for this connection');
+	}, [prefs, endpoint.key]);
+
+	// ── Editor wiring ────────────────────────────────────────────────────────
+
+	/**
+	 * Take the editor's new text; the first edit retires the generated-preview
+	 * banner and the decoration left over from the last run.
+	 *
+	 * @param next - The new buffer text.
+	 */
+	const handleChange = useCallback((next: string): void => {
+		setSql(next);
+		setUntouchedGenerated(false);
+		setLastRun(null);
+	}, []);
+
+	// ── What a run would send ────────────────────────────────────────────────
+
+	/**
+	 * The statements the Run button would send right now: the selection when
+	 * there is one, otherwise the statement holding the caret.
+	 *
+	 * Reads the live editor handle rather than the debounced preview state, so
+	 * a keypress that lands between a caret move and its settle still sends
+	 * what the user is looking at.
+	 *
+	 * @returns The statements to run (possibly empty).
+	 */
+	const currentTarget = useCallback((): IStatement[] => {
+		const selection = editorRef.current?.getSelectionText() ?? '';
+		if (selection.trim()) {
+			const start = cursor.selectionStart;
+			return [{
+				index: 0,
+				sql: selection.trim(),
+				start,
+				end: cursor.selectionEnd,
+				startLine: lineAt(sql, start),
+				endLine: lineAt(sql, cursor.selectionEnd),
+			}];
 		}
-	}, [client, running, sql, limit, endpoint]);
+		const offset = editorRef.current?.getCursorOffset() ?? cursor.offset;
+		const statement = statementAtOffset(sql, offset, dialect);
+		return statement ? [statement] : [];
+	}, [sql, dialect, cursor.selectionStart, cursor.selectionEnd, cursor.offset]);
 
-	// Result grid columns, derived from the first row's keys.
+	// The pre-run line and the editor decoration, always saying the same thing.
+	const preview = useMemo((): { text: string; decorations: IDecorationRange[] } => {
+		if (running) {
+			const run = runs[activeIndex];
+			const decorations: IDecorationRange[] = run?.start !== undefined && run.end !== undefined
+				? [{ start: run.start, end: run.end, className: 'sql-ui-stmt-running' }]
+				: [];
+			return { text: `Running statement ${activeIndex + 1} of ${runs.length}…`, decorations };
+		}
+		if (cursor.selectionText.trim()) {
+			const from = lineAt(sql, cursor.selectionStart);
+			const to = lineAt(sql, cursor.selectionEnd);
+			return {
+				text: `Will run: selection (${lineRange(from, to)})`,
+				decorations: [{ start: cursor.selectionStart, end: cursor.selectionEnd, className: 'sql-ui-stmt-active' }],
+			};
+		}
+		if (statements.length === 0) {
+			return { text: 'Will run: nothing — editor is empty', decorations: [] };
+		}
+		const statement = statementAtOffset(sql, cursor.offset, dialect);
+		if (!statement) return { text: 'Will run: nothing — editor is empty', decorations: [] };
+		const decorations: IDecorationRange[] = [{ start: statement.start, end: statement.end, className: 'sql-ui-stmt-active' }];
+		if (lastRun?.start !== undefined && lastRun.end !== undefined && lastRun.start !== statement.start) {
+			decorations.push({ start: lastRun.start, end: lastRun.end, className: 'sql-ui-stmt-last' });
+		}
+		const of = statements.length > 1 ? ` of ${statements.length}` : '';
+		return {
+			text: `Will run: statement ${statement.index + 1}${of} (${lineRange(statement.startLine, statement.endLine)})`,
+			decorations,
+		};
+	}, [running, runs, activeIndex, cursor, sql, statements, dialect, lastRun]);
+
+	useEffect(() => {
+		editorRef.current?.setDecorations(preview.decorations);
+	}, [preview]);
+
+	// "Stop waiting" only appears once a run has actually been slow.
+	useEffect(() => {
+		if (!running) {
+			setCanStop(false);
+			return undefined;
+		}
+		const timer = setTimeout(() => setCanStop(true), STOP_WAITING_AFTER_MS);
+		return () => clearTimeout(timer);
+	}, [running]);
+
+	// ── Pattern-check confirmation ───────────────────────────────────────────
+
+	/**
+	 * Open the confirmation dialog and wait for the answer.
+	 *
+	 * @param run - The statement being confirmed.
+	 * @param finding - What the pattern check saw.
+	 * @returns The user's choice.
+	 */
+	const askPatternConfirm = useCallback((run: IStatementRun, finding: IPatternFinding): Promise<'run' | 'always' | 'cancel'> => {
+		return new Promise((resolve) => {
+			patternResolverRef.current = resolve;
+			setPatternPrompt({ run, finding });
+		});
+	}, []);
+
+	/**
+	 * Answer the open confirmation dialog.
+	 *
+	 * @param answer - The user's choice.
+	 */
+	const answerPattern = useCallback((answer: 'run' | 'always' | 'cancel'): void => {
+		setPatternPrompt(null);
+		const resolve = patternResolverRef.current;
+		patternResolverRef.current = null;
+		resolve?.(answer);
+	}, []);
+
+	// ── Running ──────────────────────────────────────────────────────────────
+
+	/**
+	 * Publish a finished statement to the history subscribers, but only while
+	 * this document is still mounted — a closed tab must not write.
+	 *
+	 * @param run - The finished statement.
+	 */
+	const record = useCallback((run: IStatementRun): void => {
+		if (!mountedRef.current) return;
+		emitRun(endpoint.key, toHistoryEntry(run));
+	}, [endpoint.key]);
+
+	/**
+	 * Commit a run list to state and to the ref the abandon path reads.
+	 *
+	 * @param next - The new run list.
+	 */
+	const publishRuns = useCallback((next: IStatementRun[]): void => {
+		runsRef.current = next;
+		setRuns(next);
+	}, []);
+
+	/**
+	 * Run a list of statements in order, stopping at the first error.
+	 *
+	 * @param targets - The statements to send, in order.
+	 */
+	const runTargets = useCallback(async (targets: IStatement[]): Promise<void> => {
+		if (!client || runningRef.current || targets.length === 0) return;
+
+		// Transaction control cannot work through per-call autocommit, so it is
+		// refused before anything is sent rather than run and misunderstood.
+		if (targets.some((target) => classifyStatement(target.sql, dialect) === 'tx')) {
+			setTxRefused(true);
+			announce(TRANSACTION_REFUSAL_TEXT);
+			return;
+		}
+
+		const seq = runSeqRef.current + 1;
+		runSeqRef.current = seq;
+		runningRef.current = true;
+		setRunning(true);
+		setTxRefused(false);
+		setFailure(null);
+		setShowVerbatim(false);
+		setAbandonNotice(null);
+		setUntouchedGenerated(false);
+		setSelectedRun(null);
+		setInspected(null);
+
+		const list: IStatementRun[] = targets.map((target, index) => ({
+			index,
+			sql: target.sql,
+			kind: classifyStatement(target.sql, dialect),
+			verb: leadingVerb(target.sql, dialect),
+			start: target.start,
+			end: target.end,
+			startLine: target.startLine,
+			endLine: target.endLine,
+			outcome: 'pending' as RunOutcome,
+		}));
+		publishRuns(list);
+
+		const session = getSession(client, endpoint);
+		const results = [...list];
+		let failedAt = -1;
+
+		for (let i = 0; i < results.length; i++) {
+			if (runSeqRef.current !== seq) return;
+
+			// One confirmation per matching statement, asked before it is sent.
+			if (patternChecksOnRef.current) {
+				const finding = patternCheck(results[i].sql, dialect);
+				if (finding) {
+					const answer = await askPatternConfirm(results[i], finding);
+					if (runSeqRef.current !== seq) return;
+					if (answer === 'cancel') {
+						for (let j = i; j < results.length; j++) results[j] = { ...results[j], outcome: 'skipped' };
+						publishRuns([...results]);
+						break;
+					}
+					if (answer === 'always') setPatternChecks(false);
+				}
+			}
+
+			const prepared = applyRowLimit(results[i].sql, limit, dialect);
+			results[i] = { ...results[i], outcome: 'running', limitApplied: prepared.limit };
+			publishRuns([...results]);
+			setActiveIndex(i);
+			activeIndexRef.current = i;
+			const started = performance.now();
+			runStartedRef.current = started;
+
+			try {
+				// `idempotent` gates the session's one retry with a fresh token:
+				// a read may be sent twice harmlessly, a write may NOT.
+				const response = await session.execute(prepared.sql, { idempotent: results[i].kind === 'read' });
+				if (runSeqRef.current !== seq) return;
+				const rows = response.rows ?? [];
+				const affected = response.affected_rows ?? 0;
+				const outcome: RunOutcome = rows.length > 0 || results[i].kind === 'read' ? 'rows' : 'affected';
+				results[i] = { ...results[i], outcome, rows, affected, ms: performance.now() - started };
+				publishRuns([...results]);
+				record(results[i]);
+			} catch (error) {
+				if (runSeqRef.current !== seq) return;
+				const message = error instanceof Error ? error.message : String(error);
+				const notice = describeFailure(message);
+				results[i] = { ...results[i], outcome: 'error', error: message, ms: performance.now() - started };
+				for (let j = i + 1; j < results.length; j++) results[j] = { ...results[j], outcome: 'skipped' };
+				publishRuns([...results]);
+				failedAt = i;
+				setFailure({ notice, index: i, lines: lineRange(results[i].startLine, results[i].endLine) });
+				if (notice.allowExecuteOff) setAllowExecuteOff(true);
+				record(results[i]);
+				break;
+			}
+		}
+
+		if (runSeqRef.current !== seq) return;
+		runningRef.current = false;
+		setRunning(false);
+
+		// Show the last statement that returned rows; failing that, the last
+		// one that resolved at all.
+		const withRows = [...results].reverse().find((run) => run.outcome === 'rows');
+		const resolved = [...results].reverse().find((run) => run.outcome === 'rows' || run.outcome === 'affected');
+		const shown = withRows ?? resolved ?? null;
+		setSelectedRun(shown ? shown.index : null);
+		if (shown) setLastRun({ index: shown.index, at: Date.now(), start: shown.start, end: shown.end });
+		committedTextRef.current = sql;
+		// A statement that actually ran is the only proof the node's execute
+		// gate is open again, so a successful run retires the warning.
+		if (resolved) setAllowExecuteOff(false);
+
+		if (results.length > 1) announce(`${results.length} statements: ${formatBatchOutcome(results)}`);
+		else if (failedAt >= 0) announce('Statement failed');
+		else if (shown?.outcome === 'rows') announce(`Statement returned ${(shown.rows?.length ?? 0).toLocaleString()} rows`);
+		else if (shown?.outcome === 'affected') announce(`Statement affected ${(shown.affected ?? 0).toLocaleString()} rows`);
+	}, [client, dialect, endpoint, limit, sql, askPatternConfirm, publishRuns, record, setPatternChecks]);
+
+	/** Run the selection, or the statement at the caret. */
+	const runOne = useCallback((): void => { void runTargets(currentTarget()); }, [runTargets, currentTarget]);
+
+	/** Run every statement in the buffer, in order. */
+	const runAll = useCallback((): void => { void runTargets(splitStatements(sql, dialect)); }, [runTargets, sql, dialect]);
+
+	/**
+	 * Stop waiting for the statement in flight.
+	 *
+	 * There is NO server-side cancel: this bumps the run sequence so the late
+	 * answer is discarded, and says plainly that the database may still be
+	 * running the statement.
+	 */
+	const stopWaiting = useCallback((): void => {
+		if (!runningRef.current) return;
+		runSeqRef.current += 1;
+		runningRef.current = false;
+		const ms = performance.now() - runStartedRef.current;
+		setRunning(false);
+		const next = runsRef.current.map((run) => {
+			if (run.outcome === 'running') return { ...run, outcome: 'abandoned' as RunOutcome, ms };
+			if (run.outcome === 'pending') return { ...run, outcome: 'skipped' as RunOutcome };
+			return run;
+		});
+		publishRuns(next);
+		const abandoned = next.find((run) => run.outcome === 'abandoned');
+		if (abandoned) record(abandoned);
+		setAbandonNotice(
+			`Stopped waiting after ${(ms / 1000).toFixed(1)} s. The statement may still be running on the database; this tool cannot cancel it.`,
+		);
+		announce(`Stopped waiting for statement ${activeIndexRef.current + 1}`);
+		editorRef.current?.focus();
+	}, [publishRuns, record]);
+
+	// ── Explain, history, and loading a statement back in ────────────────────
+
+	/**
+	 * The statement a run would send, rendered exactly as it would be sent —
+	 * including the header's LIMIT, so an EXPLAIN describes the real plan and
+	 * not a different, unlimited statement.
+	 *
+	 * @returns The statement text, or '' when there is nothing to run.
+	 */
+	const targetSqlAsSent = useCallback((): string => {
+		const [target] = currentTarget();
+		if (!target) return '';
+		return applyRowLimit(target.sql, limit, dialect).sql;
+	}, [currentTarget, limit, dialect]);
+
+	/** Open the plan drawer for whatever Run would send. */
+	const openExplain = useCallback((): void => {
+		const sent = targetSqlAsSent();
+		if (!sent.trim()) return;
+		setExplain({ sql: sent });
+	}, [targetSqlAsSent]);
+
+	/**
+	 * Put a statement into the editor, asking first when doing so would throw
+	 * away text the user has typed since the last run.
+	 *
+	 * @param next - The statement to load.
+	 */
+	const loadIntoEditor = useCallback((next: string): void => {
+		const dirty = sql.trim().length > 0 && sql !== committedTextRef.current;
+		if (dirty) {
+			setPendingLoad(next);
+			return;
+		}
+		committedTextRef.current = next;
+		setSql(next);
+		setUntouchedGenerated(false);
+		setLastRun(null);
+		announce('Loaded the statement into the editor');
+		editorRef.current?.focus();
+	}, [sql]);
+
+	/** Replace the editor text with the statement the user confirmed. */
+	const confirmLoad = useCallback((): void => {
+		const next = pendingLoad;
+		setPendingLoad(null);
+		if (next === null) return;
+		committedTextRef.current = next;
+		setSql(next);
+		setUntouchedGenerated(false);
+		setLastRun(null);
+		announce('Loaded the statement into the editor');
+		editorRef.current?.focus();
+	}, [pendingLoad]);
+
+	/**
+	 * Run one statement from the history drawer. The drawer has already
+	 * confirmed anything that changed data last time; the pattern check still
+	 * applies, because it is about this statement's text, not its past.
+	 *
+	 * @param entry - The history entry to run again.
+	 */
+	const rerunEntry = useCallback((entry: IHistoryEntry): void => {
+		void runTargets([{
+			index: 0,
+			sql: entry.sql,
+			start: 0,
+			end: entry.sql.length,
+			startLine: 1,
+			endLine: entry.sql.split('\n').length,
+		}]);
+	}, [runTargets]);
+
+	// ── Results ──────────────────────────────────────────────────────────────
+
+	const displayed = selectedRun !== null ? runs[selectedRun] ?? null : null;
+	const rows = displayed?.rows ?? [];
+
+	const columnTypes = useMemo(
+		() => (rows.length > 0 && displayed ? inferColumnTypes(rows, snapshot.schema, displayed.sql, dialect) : {}),
+		[rows, displayed, snapshot.schema, dialect],
+	);
+
 	const columns = useMemo<GridColumnDefinition[]>(() => {
-		const first = result?.rows[0];
+		const first = rows[0];
 		if (!first) return [];
-		return Object.keys(first).map((key) => ({
-			title: key,
-			field: key,
-			rrType: 'string',
-			rrDefault: true,
-			rrDescription: `Result column ${key}.`,
-			headerSort: true,
-			formatter: (cell: GridCellComponent) => resultCellEl(cell.getValue()),
-		} satisfies GridColumnDefinition));
-	}, [result]);
+		return Object.keys(first).map((key) => {
+			const info = columnTypes[key];
+			return {
+				title: key,
+				field: key,
+				rrType: info?.rrType ?? 'string',
+				rrDefault: true,
+				rrDescription: info ? `${key} — ${info.description}` : `Result column ${key}.`,
+				headerSort: true,
+				hozAlign: info?.rrType === 'number' ? 'right' : undefined,
+				formatter: (cell: GridCellComponent) => resultCellEl(cell.getValue()),
+			} satisfies GridColumnDefinition;
+		});
+	}, [rows, columnTypes]);
 
-	// Result meta line: rows/affected + elapsed.
-	const meta = result
-		? result.rows.length > 0
-			? `${result.rows.length.toLocaleString()} rows - ${(result.elapsedMs / 1000).toFixed(3)} s`
-			: `${result.affectedRows.toLocaleString()} affected - ${(result.elapsedMs / 1000).toFixed(3)} s`
-		: '';
+	/** True when at least one shown column is numeric (float-precision note). */
+	const hasNumeric = useMemo(() => Object.values(columnTypes).some((info) => info.rrType === 'number'), [columnTypes]);
+
+	/** The result meta line's parts. */
+	const meta = useMemo((): { text: string; limitReached: boolean } => {
+		if (!displayed) return { text: '', limitReached: false };
+		const applied = displayed.limitApplied ?? null;
+		const elapsed = displayed.ms === undefined ? '' : ` · ${formatElapsed(displayed.ms)}`;
+		const executed = lastRun ? ` · executed ${clock(lastRun.at)}` : '';
+		if (displayed.outcome === 'error') return { text: `Statement ${displayed.index + 1} failed${elapsed}`, limitReached: false };
+		if (displayed.outcome === 'abandoned') return { text: `Statement ${displayed.index + 1} abandoned${elapsed}`, limitReached: false };
+		if (displayed.outcome === 'affected') {
+			return { text: `${(displayed.affected ?? 0).toLocaleString()} affected${executed}${elapsed}`, limitReached: false };
+		}
+		const limitText = applied === null ? 'no limit applied' : `limit ${applied.toLocaleString()}`;
+		return {
+			text: `${rows.length.toLocaleString()} rows returned (${limitText})${executed}${elapsed}`,
+			limitReached: applied !== null && rows.length === applied,
+		};
+	}, [displayed, rows.length, lastRun]);
+
+	/** Title for the results region when there is no grid to show. */
+	const emptyTitle = !displayed
+		? 'No results yet'
+		: displayed.outcome === 'error'
+			? 'Statement failed'
+			: displayed.outcome === 'abandoned'
+				? 'Stopped waiting'
+				: 'Statement executed';
+
+	const batchLine = runs.length > 1 ? formatBatchOutcome(runs) : '';
+	const canRun = Boolean(client) && isConnected && !running && sql.trim().length > 0;
+
+	// ── Render ───────────────────────────────────────────────────────────────
 
 	return (
 		<div style={styles.root}>
 			<ContentHeader
 				title={label}
-				subtitle={`${snapshot.schema?.database ?? endpoint.nodeName} - statements execute on ${endpoint.pipelineName} / ${endpoint.nodeId}`}
+				subtitle={`${snapshot.schema?.database ?? endpoint.nodeName} · statements execute on ${endpoint.pipelineName} / ${endpoint.nodeId}`}
 				actions={
 					<>
 						<ToggleGroup
-							options={LIMIT_OPTIONS.map((o) => ({ id: o, label: o }))}
+							options={LIMIT_OPTIONS.map((option) => ({ id: option, label: option }))}
 							value={limit}
 							onChange={setLimit}
 						/>
 						<Button
-							variant="primary"
-							onClick={() => { void run(); }}
-							disabled={!client || !isConnected || running || !sql.trim()}
+							variant="ghost"
+							pressed={historyOpen}
+							ariaExpanded={historyOpen}
+							title="Show the statements run on this connection"
+							onClick={() => setHistoryOpen((open) => !open)}
 						>
-							{running ? 'Running...' : 'Run'}
+							History
+						</Button>
+						<Button
+							variant="secondary"
+							onClick={openExplain}
+							disabled={!client || !isConnected || !sql.trim()}
+							title="Show the database's plan for the statement Run would send (Ctrl+Shift+E)"
+						>
+							Explain
+						</Button>
+						{running && canStop && (
+							<Button variant="ghost" title="Stop waiting for the answer. This does not cancel the statement." onClick={stopWaiting}>
+								Stop waiting
+							</Button>
+						)}
+						<Button
+							variant="secondary"
+							onClick={runAll}
+							disabled={!canRun}
+							title="Run every statement in order, stop at the first error (Ctrl+Shift+Enter)"
+						>
+							Run all
+						</Button>
+						<Button
+							variant="primary"
+							onClick={runOne}
+							disabled={!canRun}
+							title="Run selection, or the statement at the cursor (Ctrl+Enter)"
+						>
+							{running ? 'Running…' : 'Run'}
 						</Button>
 					</>
 				}
 			/>
 
 			<div style={styles.body}>
+				{/* The node refuses to execute anything — schema browsing still works. */}
+				{allowExecuteOff && <Banner variant="warning">{ALLOW_EXECUTE_OFF_TEXT}</Banner>}
+
+				{/* SQL the app wrote, shown before it runs. */}
+				{untouchedGenerated && <Banner variant="info">Generated preview — review, then Run</Banner>}
+
 				{/* Editor. */}
 				<div style={styles.editorRegion}>
-					<SqlEditor value={sql} onChange={setSql} dialect={snapshot.dialect} onRun={() => { void run(); }} />
+					<SqlEditor
+						ref={editorRef}
+						value={sql}
+						onChange={handleChange}
+						dialect={dialect}
+						onRun={runOne}
+						onRunAll={runAll}
+						onExplain={openExplain}
+						onCursorChange={setCursor}
+						completion={completion}
+					/>
 				</div>
 
+				{/* The pre-run truth line: what Run would send, in words. */}
+				<div style={styles.willRun}>
+					<span>{preview.text}</span>
+					{!patternChecksOn && (
+						<Button
+							variant="ghost"
+							small
+							title="Confirmations for unbounded UPDATE/DELETE, TRUNCATE, DROP and ALTER are off for this connection. Click to turn them on."
+							onClick={() => setPatternChecks(true)}
+						>
+							Pattern checks off
+						</Button>
+					)}
+				</div>
+
+				{/* Transaction control was refused before anything was sent. */}
+				{txRefused && <Banner variant="warning">{TRANSACTION_REFUSAL_TEXT}</Banner>}
+
+				{/* The user stopped waiting; the statement may still be running. */}
+				{abandonNotice && <Banner variant="warning">{abandonNotice}</Banner>}
+
 				{/* Execution failure. */}
-				{error && <Banner variant="error">{error}</Banner>}
+				{failure && (
+					<Banner variant="error">
+						<div>{failure.notice.generic ? GENERIC_ERROR_TEXT : failure.notice.headline}</div>
+						<div>
+							{`Statement ${failure.index + 1} (${failure.lines}).`}
+							{failure.index > 0 && ` Statements 1–${failure.index} already committed (each statement runs in its own transaction).`}
+						</div>
+						{failure.notice.maxExecuteRows !== null && <div>{maxRowsText(failure.notice.maxExecuteRows)}</div>}
+						{!failure.notice.generic && failure.notice.verbatim && (
+							<>
+								<Button
+									variant="ghost"
+									small
+									ariaExpanded={showVerbatim}
+									onClick={() => setShowVerbatim((open) => !open)}
+								>
+									{showVerbatim ? `Hide “${DATABASE_SAID_LABEL}”` : DATABASE_SAID_LABEL}
+								</Button>
+								{showVerbatim && <pre style={styles.verbatim}>{failure.notice.verbatim}</pre>}
+							</>
+						)}
+					</Banner>
+				)}
+
+				{/* Per-statement outcomes of the last batch. */}
+				{runs.length > 1 && (
+					<div>
+						<StatementStrip runs={runs} selected={selectedRun} onSelect={setSelectedRun} />
+						{batchLine && <div style={styles.meta}>{batchLine}</div>}
+					</div>
+				)}
 
 				{/* Results. */}
 				<div style={styles.resultsRegion}>
-					{result && result.rows.length > 0 ? (
+					{displayed && rows.length > 0 ? (
 						<Card noBodyPadding fill>
 							<CardDataGrid<Record<string, unknown>>
 								title="Results"
-								actions={<span style={styles.meta}>{meta}</span>}
+								actions={
+									<span style={styles.meta}>
+										{meta.text}
+										{meta.limitReached && <StatusBadge variant="warning">Limit reached — more rows may exist</StatusBadge>}
+										<span title="The grid's gear menu exports the rows this run returned.">Export: grid menu (gear)</span>
+									</span>
+								}
 								columns={columns}
-								data={result.rows}
+								data={rows}
 								tableId="sql-query-results"
 								paginate={false}
 								height="100%"
 								emptyTitle="No rows"
 								emptyDescription="The statement returned no rows."
+								onRowClick={(row) => setInspected({ row, number: Math.max(1, rows.indexOf(row) + 1) })}
 							/>
 						</Card>
 					) : (
 						<EmptyState
 							icon={<DatabaseIcon />}
-							title={result ? 'Statement executed' : 'No results yet'}
+							title={emptyTitle}
 							description={
-								result
-									? meta
-									: 'Write a statement above and press Run (Ctrl+Enter) to execute it on the database node.'
+								displayed
+									? meta.text
+									: 'Write a statement above and press Run (Ctrl+Enter). Ctrl+Shift+Enter runs every statement.'
 							}
 						/>
 					)}
+					{hasNumeric && rows.length > 0 && (
+						<div style={styles.meta}>Decimal values arrive as floating point; integers above 2^53 lose precision.</div>
+					)}
 				</div>
 			</div>
+
+			{/* One row of the result, in full. */}
+			<CellInspector
+				open={inspected !== null}
+				row={inspected?.row ?? null}
+				rowNumber={inspected?.number ?? 0}
+				rowCount={rows.length}
+				subtitle={displayed ? `statement ${displayed.index + 1}${lastRun ? ` · executed ${clock(lastRun.at)}` : ''}` : ''}
+				onClose={() => setInspected(null)}
+			/>
+
+			{/* Statements run on this connection. */}
+			<HistoryPanel
+				endpoint={endpoint}
+				open={historyOpen}
+				onClose={() => setHistoryOpen(false)}
+				onLoadIntoEditor={loadIntoEditor}
+				onRerun={rerunEntry}
+			/>
+
+			{/* The database's plan for the statement Run would send. */}
+			{explain && (
+				<ExplainPanel
+					endpoint={endpoint}
+					dialect={dialect}
+					sql={explain.sql}
+					open
+					onClose={() => setExplain(null)}
+				/>
+			)}
+
+			{/* Loading a statement would discard unsaved editor text. */}
+			{pendingLoad !== null && (
+				<ConfirmDialog
+					title="Replace editor text?"
+					message="The editor holds text that has not been run. Loading this statement replaces it."
+					confirmLabel="Replace"
+					onConfirm={confirmLoad}
+					onCancel={() => setPendingLoad(null)}
+				/>
+			)}
+
+			{/* Pattern check — a TEXT check, and it says so. */}
+			{patternPrompt && (
+				<ConfirmDialog
+					title="Run this statement?"
+					destructive
+					message={
+						<>
+							<div>{`Pattern check: ${patternPrompt.finding.kind} detected. This is a text check, not a database safeguard.`}</div>
+							<pre style={styles.excerpt}>{patternPrompt.run.sql.split('\n').slice(0, 3).join('\n')}</pre>
+							<div>It runs immediately and commits on its own.</div>
+						</>
+					}
+					confirmLabel="Run statement"
+					secondaryLabel="Run and stop asking on this connection"
+					onConfirm={() => answerPattern('run')}
+					onSecondary={() => answerPattern('always')}
+					onCancel={() => answerPattern('cancel')}
+				/>
+			)}
 		</div>
 	);
 };

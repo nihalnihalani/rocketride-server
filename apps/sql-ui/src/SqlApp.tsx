@@ -47,7 +47,31 @@ import TableDataView from './views/TableDataView';
 import TableDesignView from './views/TableDesignView';
 import DiagramView from './views/DiagramView';
 import SqlSidebar from './SqlSidebar';
+import LiveRegion from './components/LiveRegion';
 import { DatabaseIcon } from './icons';
+
+// =============================================================================
+// TYPES
+// =============================================================================
+
+/**
+ * Content payload of a `query:` document.
+ *
+ * `initialSql` and `origin` are how another view hands the runner a statement
+ * it wrote: the panels that generate SQL open a NEW query document with
+ * `origin: 'generated'`, and the runner then shows it as a preview to review
+ * rather than as something already run.
+ */
+export interface IQueryDocPayload {
+	/** The connection the document is pinned to for life. */
+	endpoint: ISqlEndpoint;
+	/** Tab label ("Query 3"). */
+	label: string;
+	/** Text to seed the editor with. */
+	initialSql?: string;
+	/** `generated` marks SQL the app wrote rather than the user. */
+	origin?: 'generated';
+}
 
 // =============================================================================
 // STYLES
@@ -155,6 +179,8 @@ const SqlAppReady: React.FC<{ docs: Documents }> = ({ docs }) => {
 
 	return (
 		<div style={styles.container}>
+			{/* One polite live region for the whole app; announce() writes to it. */}
+			<LiveRegion />
 			<DocSplitLayout
 				docs={docs}
 				renderPane={(groupId: string) => {
@@ -227,8 +253,18 @@ const DocumentPane: React.FC<{ uri: string; docs: Documents }> = ({ uri, docs })
 	// Query document — payload carries the endpoint and the tab label.
 	if (isQueryUri(uri)) {
 		const doc = docs.getState().documents[uri];
-		const payload = doc?.content as { endpoint: ISqlEndpoint; label: string } | undefined;
-		if (payload) return <QueryView key={uri} endpoint={payload.endpoint} label={payload.label} />;
+		const payload = doc?.content as IQueryDocPayload | undefined;
+		if (payload) {
+			return (
+				<QueryView
+					key={uri}
+					endpoint={payload.endpoint}
+					label={payload.label}
+					initialSql={payload.initialSql}
+					origin={payload.origin}
+				/>
+			);
+		}
 	}
 
 	// Table data-browser document — payload carries the endpoint and table.
