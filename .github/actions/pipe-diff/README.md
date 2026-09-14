@@ -39,6 +39,11 @@ jobs:
       - uses: ./.github/actions/pipe-diff
 ```
 
+This repository runs the action on itself: `.github/workflows/pipe-diff.yml`
+invokes it on pull requests that touch a `.pipe` file, the action, the diff
+engine or the `diff` subcommand — so a change to any of them is exercised as a
+real GitHub Action before it merges.
+
 The action diffs against the **merge base** of the pull request and its base
 branch — the commit the branch forked from — not the base branch tip. Diffing
 against the tip would report every commit merged into the base since the branch
