@@ -36,7 +36,7 @@ import { useShellConnection } from 'shell';
 import { Banner, Button, Card, ConfirmDialog, ContentHeader, EmptyState, InputField, StatusBadge, TabControl, TabPanel } from 'shell';
 import type { ViewMenu } from 'shell';
 import { commonStyles } from 'shell';
-import type { ISqlEndpoint, ISqlSchemaColumn } from '../connect';
+import type { ISqlEndpoint, ISqlSchemaColumn, SqlDialect } from '../connect';
 import { getSession, refreshSchema, useSchema } from '../schema/schemaStore';
 import type { AlterOp, IColumnSpec } from '../sql/ddl';
 import { FK_ACTIONS, describeOp, generateAlterStatements, generateCreateTable } from '../sql/ddl';
@@ -54,6 +54,31 @@ export interface ITableDesignViewProps {
 	endpoint: ISqlEndpoint;
 	/** The table being altered, or null for create-table mode. */
 	table: string | null;
+}
+
+/** The banner shown after an Apply, composed once the snapshot has landed. */
+interface IApplyOutcome {
+	/** Banner severity. */
+	variant: 'info' | 'warning' | 'error';
+	/** The whole message, already assembled. */
+	text: string;
+}
+
+/** An Apply whose outcome is waiting to be described against the snapshot. */
+interface IPendingApply {
+	/** Wall-clock ms the statements finished at. */
+	at: number;
+	/** Failure detail, or null when every statement ran. */
+	failure: {
+		/** How many statements committed before the failure. */
+		committed: number;
+		/** How many statements the batch held. */
+		total: number;
+		/** How many statements the plan still holds (null in create mode). */
+		remaining: number | null;
+		/** The database's message, verbatim. */
+		message: string;
+	} | null;
 }
 
 /** One display row of the columns page (snapshot + staged ops applied). */
@@ -164,7 +189,97 @@ const styles = {
 	cardGap: {
 		marginBottom: 16,
 	} as CSSProperties,
+
+	// Dialect commit note inside the Apply confirmation.
+	confirmNote: {
+		marginTop: 10,
+		fontSize: 12.5,
+		lineHeight: 1.6,
+		color: 'var(--rr-text-secondary)',
+	} as CSSProperties,
 };
+
+// =============================================================================
+// HONESTY TEXT
+// =============================================================================
+//
+// The node reflects its schema ONCE, when the pipeline task starts, and serves
+// that dict from `get_schema`. Nodes new enough to carry the `refresh_schema`
+// tool re-reflect on demand; older ones cannot, and the session says so by
+// flagging the response `stale`. Either way the designer must never repaint a
+// pre-DDL snapshot as if it were the database's current structure.
+// =============================================================================
+
+/** Shown whenever the post-Apply snapshot could not be re-read from the database. */
+const STALE_SNAPSHOT_SENTENCE =
+	'The node reflected its schema at task start; the tree and diagram will not show this change until the pipeline restarts.';
+
+/**
+ * How each engine treats a multi-statement DDL plan. None of them can undo a
+ * committed statement from here, so the note says what actually happens
+ * instead of offering a rollback that does not exist.
+ */
+const DIALECT_COMMIT_NOTE: Partial<Record<SqlDialect, string>> = {
+	mysql: 'MySQL: each DDL statement commits implicitly. A failure mid-plan leaves earlier statements applied. Nothing here can be rolled back.',
+	postgres: 'PostgreSQL: each statement runs in its own autocommit transaction. A failure mid-plan leaves earlier statements applied.',
+	clickhouse: 'ClickHouse: ALTER runs as an asynchronous mutation and may finish after this dialog closes.',
+};
+
+/**
+ * Format a wall-clock time as HH:MM for the "Applied HH:MM" lines.
+ *
+ * @param ms - Unix milliseconds.
+ * @returns The local time, zero-padded.
+ */
+function clockTime(ms: number): string {
+	const d = new Date(ms);
+	return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+}
+
+/**
+ * The first line of a driver message — the banner headline. Multi-line driver
+ * text keeps its remaining lines for the detail block.
+ *
+ * @param message - The message, possibly multi-line.
+ * @returns The first non-empty line, or the whole message when it has none.
+ */
+function firstLine(message: string): string {
+	const line = message.split('\n').map((l) => l.trim()).find((l) => l.length > 0);
+	return line ?? message.trim();
+}
+
+/**
+ * Describe a batch that stopped part-way: what committed, which statement
+ * failed and why, what never ran, and what the plan still holds.
+ *
+ * @param failure - The failure detail recorded by Apply.
+ * @returns The banner text.
+ */
+function describeApplyFailure(failure: NonNullable<IPendingApply['failure']>): string {
+	const { committed, total, remaining, message } = failure;
+	const failedAt = committed + 1;
+	const parts: string[] = [];
+
+	if (committed === 0) {
+		parts.push(`Statement 1 of ${total} failed.`);
+	} else if (committed === 1) {
+		parts.push(`Statement 1 of ${total} ran and is committed; statement ${failedAt} failed.`);
+	} else {
+		parts.push(`Statements 1–${committed} of ${total} ran and are committed; statement ${failedAt} failed.`);
+	}
+
+	parts.push(`Database reported: ${firstLine(message)}`);
+
+	const notRun = total - failedAt;
+	if (notRun === 1) parts.push(`Statement ${total} was not run.`);
+	else if (notRun > 1) parts.push(`Statements ${failedAt + 1}–${total} were not run.`);
+
+	if (remaining !== null && remaining > 0) {
+		parts.push(`The plan now holds the remaining ${remaining} statement${remaining === 1 ? '' : 's'}.`);
+	}
+
+	return parts.join(' ');
+}
 
 // =============================================================================
 // HELPERS
@@ -243,10 +358,13 @@ export const TableDesignView: React.FC<ITableDesignViewProps> = ({ endpoint, tab
 	const [fkError, setFkError] = useState<string | null>(null);
 	const [fkDraft, setFkDraft] = useState({ name: '', column: '', refTable: '', refColumn: '', onUpdate: 'CASCADE', onDelete: 'RESTRICT' });
 
-	// Apply lifecycle.
+	// Apply lifecycle. The outcome banner is composed only AFTER the snapshot
+	// refresh lands, because what it may honestly claim depends on whether the
+	// node re-read the database or served its task-start reflection again.
 	const [confirmOpen, setConfirmOpen] = useState(false);
 	const [applying, setApplying] = useState(false);
-	const [applyError, setApplyError] = useState<string | null>(null);
+	const [pendingApply, setPendingApply] = useState<IPendingApply | null>(null);
+	const [applyOutcome, setApplyOutcome] = useState<IApplyOutcome | null>(null);
 
 	// ── Derived data ─────────────────────────────────────────────────────────
 
@@ -269,6 +387,8 @@ export const TableDesignView: React.FC<ITableDesignViewProps> = ({ endpoint, tab
 	}, [createMode, createName, createColumns, snapshot.dialect, table, ops]);
 
 	const pendingCount = createMode ? (statements.length > 0 ? 1 : 0) : ops.length;
+	// What this engine does with a plan that stops half-way (verbatim per dialect).
+	const dialectNote = DIALECT_COMMIT_NOTE[snapshot.dialect] ?? null;
 	const otherTables = Object.keys(snapshot.schema?.tables ?? {}).filter((t) => t !== table);
 
 	// ── Foreign key names (alter mode, lazy on first FK page visit) ──────────
@@ -323,12 +443,18 @@ export const TableDesignView: React.FC<ITableDesignViewProps> = ({ endpoint, tab
 	}, [selected, editName, editType, columns]);
 
 	/**
-	 * Execute the staged statements in order, then re-reflect the schema.
+	 * Execute the staged statements in order, then ask the node to re-reflect.
+	 *
+	 * The outcome banner is NOT written here: what it may claim depends on the
+	 * snapshot that comes back, which this closure cannot see. Apply records
+	 * what happened in `pendingApply`; the effect below describes it against
+	 * the snapshot the refresh produced.
 	 */
 	const apply = useCallback(async (): Promise<void> => {
 		if (!client || statements.length === 0) return;
+		const total = statements.length;
 		setApplying(true);
-		setApplyError(null);
+		setApplyOutcome(null);
 		// No transaction: MySQL/ClickHouse DDL auto-commits statement by
 		// statement, so a failed batch leaves a committed prefix behind.
 		let done = 0;
@@ -340,25 +466,57 @@ export const TableDesignView: React.FC<ITableDesignViewProps> = ({ endpoint, tab
 				await session.execute(sql);
 				done++;
 			}
-			// Success: clear the plan and re-reflect.
+			// Success: clear the plan, then make the node re-read the database
+			// rather than serve its task-start reflection again.
 			setOps([]);
 			setCreateColumns([]);
 			setFkNames(null);
-			await refreshSchema(client, endpoint);
+			await refreshSchema(client, endpoint, { fresh: true });
+			setPendingApply({ at: Date.now(), failure: null });
 		} catch (err) {
-			setApplyError(err instanceof Error ? err.message : String(err));
+			const message = err instanceof Error ? err.message : String(err);
 			if (done > 0) {
 				// Drop the committed prefix so the remaining plan matches what
 				// is actually left to run, then re-reflect the mutated schema.
 				setOps((prev) => prev.slice(done));
 				setFkNames(null);
-				await refreshSchema(client, endpoint).catch(() => undefined);
+				await refreshSchema(client, endpoint, { fresh: true }).catch(() => undefined);
 			}
+			setPendingApply({
+				at: Date.now(),
+				failure: { committed: done, total, remaining: createMode ? null : total - done, message },
+			});
 		} finally {
 			setApplying(false);
 			setConfirmOpen(false);
 		}
-	}, [client, statements, endpoint]);
+	}, [client, statements, endpoint, createMode]);
+
+	// ── Outcome banner (composed against the post-refresh snapshot) ──────────
+
+	useEffect(() => {
+		if (!pendingApply) return;
+		const time = clockTime(pendingApply.at);
+		// A snapshot is trustworthy only when a fresh reflection actually came
+		// back. A fallback (`stale`) or a failed re-read both mean the tree and
+		// diagram still show the pre-DDL structure — say so, do not imply the
+		// change is invisible for some other reason.
+		const reReadWorked = snapshot.status === 'ready' && !snapshot.stale;
+		if (pendingApply.failure) {
+			const detail = describeApplyFailure(pendingApply.failure);
+			// Nothing committed means nothing to be out of date about.
+			const needsSnapshotNote = pendingApply.failure.committed > 0 && !reReadWorked;
+			setApplyOutcome({
+				variant: 'error',
+				text: needsSnapshotNote ? `${detail} ${STALE_SNAPSHOT_SENTENCE}` : detail,
+			});
+		} else if (reReadWorked) {
+			setApplyOutcome({ variant: 'info', text: `Applied ${time} · schema re-read from the database.` });
+		} else {
+			setApplyOutcome({ variant: 'warning', text: `Applied ${time}. ${STALE_SNAPSHOT_SENTENCE}` });
+		}
+		setPendingApply(null);
+	}, [pendingApply, snapshot.status, snapshot.stale]);
 
 	// ── Page menu ────────────────────────────────────────────────────────────
 
@@ -409,7 +567,7 @@ export const TableDesignView: React.FC<ITableDesignViewProps> = ({ endpoint, tab
 					<>
 						<Button
 							variant="ghost"
-							onClick={() => { setOps([]); setCreateColumns([]); setSelected(null); setApplyError(null); }}
+							onClick={() => { setOps([]); setCreateColumns([]); setSelected(null); setApplyOutcome(null); }}
 							disabled={pendingCount === 0 || applying}
 						>
 							Discard
@@ -426,7 +584,7 @@ export const TableDesignView: React.FC<ITableDesignViewProps> = ({ endpoint, tab
 			/>
 
 			<div style={styles.body}>
-				{applyError && <div style={styles.cardGap}><Banner variant="error">Apply failed: {applyError}</Banner></div>}
+				{applyOutcome && <div style={styles.cardGap}><Banner variant={applyOutcome.variant}>{applyOutcome.text}</Banner></div>}
 
 				<TabPanel
 					activeId={activePage}
@@ -702,9 +860,16 @@ export const TableDesignView: React.FC<ITableDesignViewProps> = ({ endpoint, tab
 				<ConfirmDialog
 					title={createMode ? 'Create table?' : `Apply ${statements.length} statement${statements.length === 1 ? '' : 's'}?`}
 					message={
-						createMode
-							? `CREATE TABLE ${createName.trim()} will run on ${snapshot.schema?.database ?? endpoint.nodeName}.`
-							: `The staged DDL will run against ${snapshot.schema?.database ?? endpoint.nodeName} in order. Review the DDL page first — schema changes cannot be undone from here.`
+						// No "cannot be undone" framing: the dialect note says what
+						// the engine actually does with a half-finished plan.
+						<>
+							<div>
+								{createMode
+									? `CREATE TABLE ${createName.trim()} will run on ${snapshot.schema?.database ?? endpoint.nodeName}.`
+									: `${statements.length} statement${statements.length === 1 ? '' : 's'} will run in order on ${snapshot.schema?.database ?? endpoint.nodeName}.`}
+							</div>
+							{dialectNote && <div style={styles.confirmNote}>{dialectNote}</div>}
+						</>
 					}
 					confirmLabel={applying ? 'Applying...' : 'Apply'}
 					destructive
