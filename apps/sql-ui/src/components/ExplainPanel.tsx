@@ -37,10 +37,11 @@
 
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import type { CSSProperties } from 'react';
-import { Banner, DetailPanel, EmptyState, ToggleGroup, useShellConnection } from 'shell';
+import { Banner, Button, DetailPanel, EmptyState, ToggleGroup, useShellConnection } from 'shell';
 import type { ISqlEndpoint, SqlDialect } from '../connect';
 import { announce } from '../a11y/announce';
 import { getSession } from '../schema/schemaStore';
+import { ALLOW_EXECUTE_OFF_TEXT, DATABASE_SAID_LABEL, GENERIC_ERROR_TEXT, describeFailure, maxRowsText } from '../sql/failure';
 import type { PlanParseResult } from '../sql/explain';
 import { buildExplain, countPlanNodes, formatRawPlan, parseExplain } from '../sql/explain';
 import { PlanTree } from './PlanTree';
@@ -87,10 +88,6 @@ interface IExplainResult {
 // TEXT
 // =============================================================================
 
-/** Shown when the node refuses execute; the EXPLAIN never reached the database. */
-const EXECUTE_DISABLED =
-	'This node does not allow execute (allow_execute is off). Schema browsing works; statements cannot run.';
-
 /** Shown on the Interpreted tab when the plan shape is not one the parser knows. */
 const PARSE_MISS = 'Could not interpret this plan shape; raw output shown';
 
@@ -103,17 +100,6 @@ const PARSE_MISS = 'Could not interpret this plan shape; raw output shown';
 function clockTime(ms: number): string {
 	const d = new Date(ms);
 	return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
-}
-
-/**
- * The first non-empty line of a driver message — the banner headline.
- *
- * @param message - The message, possibly multi-line.
- * @returns The first line, or the whole message when it has none.
- */
-function firstLine(message: string): string {
-	const line = message.split('\n').map((l) => l.trim()).find((l) => l.length > 0);
-	return line ?? message.trim();
 }
 
 // =============================================================================
@@ -143,19 +129,6 @@ const styles = {
 	gap: {
 		marginBottom: 12,
 	} as CSSProperties,
-
-	// Verbatim driver text under the error headline.
-	dbSaid: {
-		marginTop: 10,
-	} as CSSProperties,
-
-	dbSaidLabel: {
-		fontSize: 11,
-		textTransform: 'uppercase' as const,
-		letterSpacing: '0.04em',
-		color: 'var(--rr-text-secondary)',
-		marginBottom: 4,
-	} as CSSProperties,
 };
 
 /** The view options; raw output leads because it is what the database sent. */
@@ -182,6 +155,10 @@ export const ExplainPanel: React.FC<IExplainPanelProps> = ({ endpoint, dialect, 
 	const [running, setRunning] = useState(false);
 	const [result, setResult] = useState<IExplainResult | null>(null);
 	const [error, setError] = useState<string | null>(null);
+	// The verbatim driver text starts collapsed on every run.
+	const [showVerbatim, setShowVerbatim] = useState(false);
+
+	const notice = useMemo(() => (error === null ? null : describeFailure(error)), [error]);
 
 	const explainSql = useMemo(() => buildExplain(dialect, sql), [dialect, sql]);
 
@@ -195,6 +172,7 @@ export const ExplainPanel: React.FC<IExplainPanelProps> = ({ endpoint, dialect, 
 		setRunning(true);
 		setError(null);
 		setResult(null);
+		setShowVerbatim(false);
 		const started = Date.now();
 		try {
 			const session = getSession(client, endpoint);
@@ -234,7 +212,7 @@ export const ExplainPanel: React.FC<IExplainPanelProps> = ({ endpoint, dialect, 
 	}, [open, explainSql, run]);
 
 	const meta = result
-		? `Validated by EXPLAIN ${clockTime(result.at)} · round trip ${result.seconds.toFixed(3)} s · Planner estimates, not measurements.`
+		? `EXPLAIN ran ${clockTime(result.at)} · round trip ${result.seconds.toFixed(3)} s · Planner estimates, not measurements.`
 		: undefined;
 
 	// ── Body ─────────────────────────────────────────────────────────────────
@@ -248,20 +226,29 @@ export const ExplainPanel: React.FC<IExplainPanelProps> = ({ endpoint, dialect, 
 				description={`EXPLAIN is not available for ${dialect} in SQL Explorer`}
 			/>
 		);
-	} else if (error) {
-		// The node refuses execute: the statement never reached the database, so
-		// say that rather than showing the driver text as a query failure.
-		const refused = error.includes('allow_execute');
+	} else if (notice) {
 		body = (
-			<>
-				<Banner variant="error">{refused ? EXECUTE_DISABLED : `Database reported: ${firstLine(error)}`}</Banner>
-				{!refused && (
-					<div style={styles.dbSaid}>
-						<div style={styles.dbSaidLabel}>Database said</div>
-						<pre style={styles.raw} tabIndex={0} aria-label="Database error text">{error}</pre>
-					</div>
+			<Banner variant="error">
+				{/* A node that predates the error-text fix returns its own
+				    placeholder. Say the message is missing rather than quoting
+				    the placeholder as if the database had said it. */}
+				<div>{notice.generic ? GENERIC_ERROR_TEXT : notice.headline}</div>
+				{notice.allowExecuteOff && <div>{ALLOW_EXECUTE_OFF_TEXT}</div>}
+				{notice.maxExecuteRows !== null && <div>{maxRowsText(notice.maxExecuteRows)}</div>}
+				{!notice.generic && notice.verbatim && (
+					<>
+						<Button
+							variant="ghost"
+							small
+							ariaExpanded={showVerbatim}
+							onClick={() => setShowVerbatim((shown) => !shown)}
+						>
+							{showVerbatim ? `Hide “${DATABASE_SAID_LABEL}”` : DATABASE_SAID_LABEL}
+						</Button>
+						{showVerbatim && <pre style={styles.raw} tabIndex={0} aria-label="Database error text">{notice.verbatim}</pre>}
+					</>
 				)}
-			</>
+			</Banner>
 		);
 	} else if (running || !result) {
 		body = <EmptyState icon={<DatabaseIcon />} title="Explaining…" description="Asking the database how it would run this statement." />;

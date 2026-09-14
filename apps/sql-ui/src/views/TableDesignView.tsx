@@ -41,6 +41,7 @@ import { buildRelationGraph, inboundReferences } from '../schema/relations';
 import { getSession, refreshSchema, useSchema } from '../schema/schemaStore';
 import type { AlterOp, IColumnSpec } from '../sql/ddl';
 import { FK_ACTIONS, describeOp, generateAlterStatements, generateCreateTable } from '../sql/ddl';
+import { ALLOW_EXECUTE_OFF_TEXT, DATABASE_SAID_LABEL, GENERIC_ERROR_TEXT, describeFailure } from '../sql/failure';
 import type { INamedForeignKey } from '../sql/introspect';
 import { fetchForeignKeyNames } from '../sql/introspect';
 import { DatabaseIcon } from '../icons';
@@ -63,6 +64,11 @@ interface IApplyOutcome {
 	variant: 'info' | 'warning' | 'error';
 	/** The whole message, already assembled. */
 	text: string;
+	/**
+	 * The driver's verbatim text for the collapsible block, or null when there
+	 * is none worth showing — a success, or a node that swallowed the message.
+	 */
+	verbatim: string | null;
 }
 
 /** An Apply whose outcome is waiting to be described against the snapshot. */
@@ -191,6 +197,18 @@ const styles = {
 		marginBottom: 16,
 	} as CSSProperties,
 
+	// Verbatim driver text inside the outcome banner.
+	verbatim: {
+		fontFamily: 'var(--rr-font-mono, monospace)',
+		fontSize: 11.5,
+		lineHeight: 1.6,
+		whiteSpace: 'pre-wrap' as const,
+		wordBreak: 'break-word' as const,
+		margin: '6px 0 0',
+		maxHeight: 200,
+		overflow: 'auto',
+	} as CSSProperties,
+
 	// Impact list inside the Apply confirmation.
 	confirmSection: {
 		marginTop: 12,
@@ -241,7 +259,7 @@ const STALE_SNAPSHOT_SENTENCE =
 const DIALECT_COMMIT_NOTE: Partial<Record<SqlDialect, string>> = {
 	mysql: 'MySQL: each DDL statement commits implicitly. A failure mid-plan leaves earlier statements applied. Nothing here can be rolled back.',
 	postgres: 'PostgreSQL: each statement runs in its own autocommit transaction. A failure mid-plan leaves earlier statements applied.',
-	clickhouse: 'ClickHouse: ALTER runs as an asynchronous mutation and may finish after this dialog closes.',
+	clickhouse: 'ClickHouse: some ALTER forms run as asynchronous mutations and may finish after this dialog closes.',
 };
 
 /**
@@ -253,18 +271,6 @@ const DIALECT_COMMIT_NOTE: Partial<Record<SqlDialect, string>> = {
 function clockTime(ms: number): string {
 	const d = new Date(ms);
 	return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
-}
-
-/**
- * The first line of a driver message — the banner headline. Multi-line driver
- * text keeps its remaining lines for the detail block.
- *
- * @param message - The message, possibly multi-line.
- * @returns The first non-empty line, or the whole message when it has none.
- */
-function firstLine(message: string): string {
-	const line = message.split('\n').map((l) => l.trim()).find((l) => l.length > 0);
-	return line ?? message.trim();
 }
 
 /**
@@ -348,7 +354,7 @@ export function inboundImpact(schema: ISqlSchemaResponse | null, table: string, 
  * @param failure - The failure detail recorded by Apply.
  * @returns The banner text.
  */
-function describeApplyFailure(failure: NonNullable<IPendingApply['failure']>): string {
+function describeApplyFailure(failure: NonNullable<IPendingApply['failure']>): { text: string; verbatim: string | null } {
 	const { committed, total, remaining, message } = failure;
 	const failedAt = committed + 1;
 	const parts: string[] = [];
@@ -361,7 +367,12 @@ function describeApplyFailure(failure: NonNullable<IPendingApply['failure']>): s
 		parts.push(`Statements 1–${committed} of ${total} ran and are committed; statement ${failedAt} failed.`);
 	}
 
-	parts.push(`Database reported: ${firstLine(message)}`);
+	// A node that predates the error-text fix returns its own placeholder. Say
+	// the message is missing rather than quoting the placeholder as if the
+	// database had said it.
+	const notice = describeFailure(message);
+	parts.push(notice.generic ? GENERIC_ERROR_TEXT : notice.headline);
+	if (notice.allowExecuteOff) parts.push(ALLOW_EXECUTE_OFF_TEXT);
 
 	const notRun = total - failedAt;
 	if (notRun === 1) parts.push(`Statement ${total} was not run.`);
@@ -371,7 +382,7 @@ function describeApplyFailure(failure: NonNullable<IPendingApply['failure']>): s
 		parts.push(`The plan now holds the remaining ${remaining} statement${remaining === 1 ? '' : 's'}.`);
 	}
 
-	return parts.join(' ');
+	return { text: parts.join(' '), verbatim: notice.generic ? null : notice.verbatim || null };
 }
 
 // =============================================================================
@@ -458,6 +469,8 @@ export const TableDesignView: React.FC<ITableDesignViewProps> = ({ endpoint, tab
 	const [applying, setApplying] = useState(false);
 	const [pendingApply, setPendingApply] = useState<IPendingApply | null>(null);
 	const [applyOutcome, setApplyOutcome] = useState<IApplyOutcome | null>(null);
+	// The verbatim driver text starts collapsed on every new outcome.
+	const [showVerbatim, setShowVerbatim] = useState(false);
 
 	// ── Derived data ─────────────────────────────────────────────────────────
 
@@ -571,6 +584,7 @@ export const TableDesignView: React.FC<ITableDesignViewProps> = ({ endpoint, tab
 		const total = statements.length;
 		setApplying(true);
 		setApplyOutcome(null);
+		setShowVerbatim(false);
 		// No transaction: MySQL/ClickHouse DDL auto-commits statement by
 		// statement, so a failed batch leaves a committed prefix behind.
 		let done = 0;
@@ -624,12 +638,13 @@ export const TableDesignView: React.FC<ITableDesignViewProps> = ({ endpoint, tab
 			const needsSnapshotNote = pendingApply.failure.committed > 0 && !reReadWorked;
 			setApplyOutcome({
 				variant: 'error',
-				text: needsSnapshotNote ? `${detail} ${STALE_SNAPSHOT_SENTENCE}` : detail,
+				text: needsSnapshotNote ? `${detail.text} ${STALE_SNAPSHOT_SENTENCE}` : detail.text,
+				verbatim: detail.verbatim,
 			});
 		} else if (reReadWorked) {
-			setApplyOutcome({ variant: 'info', text: `Applied ${time} · schema re-read from the database.` });
+			setApplyOutcome({ variant: 'info', text: `Applied ${time} · schema re-read from the database.`, verbatim: null });
 		} else {
-			setApplyOutcome({ variant: 'warning', text: `Applied ${time}. ${STALE_SNAPSHOT_SENTENCE}` });
+			setApplyOutcome({ variant: 'warning', text: `Applied ${time}. ${STALE_SNAPSHOT_SENTENCE}`, verbatim: null });
 		}
 		setPendingApply(null);
 	}, [pendingApply, snapshot.status, snapshot.stale]);
@@ -700,7 +715,26 @@ export const TableDesignView: React.FC<ITableDesignViewProps> = ({ endpoint, tab
 			/>
 
 			<div style={styles.body}>
-				{applyOutcome && <div style={styles.cardGap}><Banner variant={applyOutcome.variant}>{applyOutcome.text}</Banner></div>}
+				{applyOutcome && (
+					<div style={styles.cardGap}>
+						<Banner variant={applyOutcome.variant}>
+							<div>{applyOutcome.text}</div>
+							{applyOutcome.verbatim && (
+								<>
+									<Button
+										variant="ghost"
+										small
+										ariaExpanded={showVerbatim}
+										onClick={() => setShowVerbatim((shown) => !shown)}
+									>
+										{showVerbatim ? `Hide “${DATABASE_SAID_LABEL}”` : DATABASE_SAID_LABEL}
+									</Button>
+									{showVerbatim && <pre style={styles.verbatim}>{applyOutcome.verbatim}</pre>}
+								</>
+							)}
+						</Banner>
+					</div>
+				)}
 
 				<TabPanel
 					activeId={activePage}
