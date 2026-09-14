@@ -82,6 +82,12 @@ export interface IEditorCursorState {
 export interface ISqlEditorHandle {
 	/** The selected text, or '' when the selection is empty. */
 	getSelectionText(): string;
+	/**
+	 * The live selection with its offsets. Read this on the run path: the
+	 * debounced `onCursorChange` state can be up to one debounce behind a
+	 * drag, which would attribute the run to the wrong lines.
+	 */
+	getSelection(): { text: string; start: number; end: number };
 	/** Character offset of the caret in the buffer. */
 	getCursorOffset(): number;
 	/** Replace the statement decorations (pass [] to clear). */
@@ -390,6 +396,20 @@ export const SqlEditor = forwardRef<ISqlEditorHandle, ISqlEditorProps>(function 
 			const selection = editor?.getSelection();
 			if (!editor || !selection || selection.isEmpty()) return '';
 			return editor.getModel()?.getValueInRange(selection) ?? '';
+		},
+		getSelection: () => {
+			const editor = editorRef.current;
+			const model = editor?.getModel();
+			const selection = editor?.getSelection();
+			if (!editor || !model || !selection || selection.isEmpty()) {
+				const offset = editor && model ? model.getOffsetAt(editor.getPosition() ?? model.getPositionAt(0)) : 0;
+				return { text: '', start: offset, end: offset };
+			}
+			return {
+				text: model.getValueInRange(selection),
+				start: model.getOffsetAt(selection.getStartPosition()),
+				end: model.getOffsetAt(selection.getEndPosition()),
+			};
 		},
 		getCursorOffset: () => {
 			const editor = editorRef.current;

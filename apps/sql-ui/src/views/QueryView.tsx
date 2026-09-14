@@ -342,7 +342,13 @@ export const QueryView: React.FC<IQueryViewProps> = ({ endpoint, label, initialS
 	// editor is unsaved work that must not be replaced without asking.
 	const committedTextRef = useRef(initialSql ?? '');
 
-	useEffect(() => () => { mountedRef.current = false; }, []);
+	useEffect(() => () => {
+		mountedRef.current = false;
+		// A dialog open at unmount would otherwise leave the run loop awaiting
+		// a promise nobody can settle.
+		patternResolverRef.current?.('cancel');
+		patternResolverRef.current = null;
+	}, []);
 	useEffect(() => { patternChecksOnRef.current = patternChecksOn; }, [patternChecksOn]);
 
 	const dialect = snapshot.dialect;
@@ -396,22 +402,21 @@ export const QueryView: React.FC<IQueryViewProps> = ({ endpoint, label, initialS
 	 * @returns The statements to run (possibly empty).
 	 */
 	const currentTarget = useCallback((): IStatement[] => {
-		const selection = editorRef.current?.getSelectionText() ?? '';
-		if (selection.trim()) {
-			const start = cursor.selectionStart;
+		const selection = editorRef.current?.getSelection();
+		if (selection && selection.text.trim()) {
 			return [{
 				index: 0,
-				sql: selection.trim(),
-				start,
-				end: cursor.selectionEnd,
-				startLine: lineAt(sql, start),
-				endLine: lineAt(sql, cursor.selectionEnd),
+				sql: selection.text.trim(),
+				start: selection.start,
+				end: selection.end,
+				startLine: lineAt(sql, selection.start),
+				endLine: lineAt(sql, selection.end),
 			}];
 		}
 		const offset = editorRef.current?.getCursorOffset() ?? cursor.offset;
 		const statement = statementAtOffset(sql, offset, dialect);
 		return statement ? [statement] : [];
-	}, [sql, dialect, cursor.selectionStart, cursor.selectionEnd, cursor.offset]);
+	}, [sql, dialect, cursor.offset]);
 
 	// The pre-run line and the editor decoration, always saying the same thing.
 	const preview = useMemo((): { text: string; decorations: IDecorationRange[] } => {
