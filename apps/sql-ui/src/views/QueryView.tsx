@@ -378,12 +378,19 @@ export const QueryView: React.FC<IQueryViewProps> = ({ endpoint, label, initialS
 	// editor is unsaved work that must not be replaced without asking.
 	const committedTextRef = useRef(initialSql ?? '');
 
-	useEffect(() => () => {
-		mountedRef.current = false;
-		// A dialog open at unmount would otherwise leave the run loop awaiting
-		// a promise nobody can settle.
-		patternResolverRef.current?.('cancel');
-		patternResolverRef.current = null;
+	// Set on EVERY setup, not only by `useRef(true)`: under StrictMode React
+	// runs setup, cleanup and setup again on the same instance, and a flag the
+	// cleanup cleared would otherwise stay false for the life of that
+	// instance — silently dropping every later statement from history.
+	useEffect(() => {
+		mountedRef.current = true;
+		return () => {
+			mountedRef.current = false;
+			// A dialog open at unmount would otherwise leave the run loop
+			// awaiting a promise nobody can settle.
+			patternResolverRef.current?.('cancel');
+			patternResolverRef.current = null;
+		};
 	}, []);
 	useEffect(() => { patternChecksOnRef.current = patternChecksOn; }, [patternChecksOn]);
 
