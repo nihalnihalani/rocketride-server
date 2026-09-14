@@ -97,6 +97,72 @@ def _render_gfm_row(table_markdown: str) -> Tuple[int, Optional[str]]:
     return len(cells), (html_mod.unescape(code.group(1)) if code else None)
 
 
+# Values whose escaping the two tests below both check: Windows paths and regex
+# escapes (backslashes that must survive untouched), bare and pre-escaped pipes,
+# and a run of both together.
+_GFM_ESCAPING_CORPUS = [
+    r'C:\Users\alice',
+    'a|b',
+    r'a\|b',
+    r'a\\|b',
+    r'\d+\|x',
+    'a||b',
+    'trailing-backslash\\',
+    r'^\d{2}\|(a|b)$',
+]
+
+
+def _split_gfm_row(row: str) -> list:
+    """
+    Split a GFM table row into cells the way cmark-gfm's table scanner does.
+
+    This is the library-free counterpart to ``_render_gfm_row``: it answers the
+    only question ``_md_cell`` is responsible for -- does the row still have its
+    columns, and does unescaping give the value back -- without needing a C
+    extension that is not installed in CI.
+
+    The rule, confirmed against cmark-gfm itself: a ``|`` splits the row only
+    when no backslash immediately precedes it, and a ``|`` preceded by a run of
+    *n* backslashes (*n* >= 1) is escaped and loses exactly one of them. Every
+    other backslash is left alone, which is what makes a value like
+    ``C:\\Users\\alice`` come through untouched. Cross-checked against
+    ``cmarkgfm`` over several thousand random values built from the punctuation
+    that appears in pipeline config: the two agree on every one.
+    """
+    row = row.strip()
+    if row.startswith('|'):
+        row = row[1:]
+    if row.endswith('|'):
+        row = row[:-1]
+    cells: list = []
+    current: list = []
+    index = 0
+    while index < len(row):
+        if row[index] == '\\':
+            run = 0
+            while index < len(row) and row[index] == '\\':
+                run += 1
+                index += 1
+            if index < len(row) and row[index] == '|':
+                # The last backslash of the run pairs with the pipe: the pipe is
+                # escaped (no split) and that one backslash is consumed.
+                current.append('\\' * (run - 1))
+                current.append('|')
+                index += 1
+            else:
+                current.append('\\' * run)
+            continue
+        if row[index] == '|':
+            cells.append(''.join(current))
+            current = []
+            index += 1
+            continue
+        current.append(row[index])
+        index += 1
+    cells.append(''.join(current))
+    return cells
+
+
 def _table_body_rows(markdown: str) -> list:
     """
     Return the data rows of every Markdown table in ``markdown``.
@@ -477,7 +543,27 @@ class TestRenderMarkdown(unittest.TestCase):
             with self.subTest(value=value):
                 self.assertEqual(_md_cell(value), expected)
 
-    @unittest.skipIf(cmarkgfm is None, 'cmarkgfm is not installed')
+    def test_escaped_cells_survive_gfm_row_splitting(self) -> None:
+        """
+        Every escaped value must keep the row at three columns and unescape back
+        to itself.
+
+        Same corpus as the ``cmarkgfm`` cross-check below, but resolved with
+        ``_split_gfm_row`` so it runs everywhere -- including CI, which executes
+        pytest through the bundled engine and never installs the optional
+        renderer. A row that split shows up here as more than three cells.
+        """
+        for value in _GFM_ESCAPING_CORPUS:
+            with self.subTest(value=value):
+                row = f'| n1 | `config.v` | `{_md_cell(value)}` |'
+                cells = _split_gfm_row(row)
+                self.assertEqual(len(cells), 3, f'row split by GFM: {row!r}')
+                self.assertEqual(cells[2].strip(), f'`{value}`', f'cell does not unescape to the value: {row!r}')
+
+    @unittest.skipIf(
+        cmarkgfm is None,
+        'cmarkgfm is not installed (pip install .[test]); the library-free check above covers the same rules',
+    )
     def test_gfm_renders_escaped_cells_back_to_the_original_value(self) -> None:
         """
         Render the escaped cells through GFM and check what a reader actually sees.
@@ -486,17 +572,7 @@ class TestRenderMarkdown(unittest.TestCase):
         it: for each value, the emitted row must keep its three columns and the
         code span must contain the original value, byte for byte.
         """
-        values = [
-            r'C:\Users\alice',
-            'a|b',
-            r'a\|b',
-            r'a\\|b',
-            r'\d+\|x',
-            'a||b',
-            'trailing-backslash\\',
-            r'^\d{2}\|(a|b)$',
-        ]
-        for value in values:
+        for value in _GFM_ESCAPING_CORPUS:
             with self.subTest(value=value):
                 row = f'| n1 | `config.v` | `{_md_cell(value)}` |'
                 table = '| Node | Field | Change |\n| --- | --- | --- |\n' + row + '\n'

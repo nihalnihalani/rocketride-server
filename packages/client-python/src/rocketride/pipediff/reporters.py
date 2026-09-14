@@ -613,8 +613,10 @@ def _md_cell(text: str) -> str:
     was emitted verbatim: ``C:\\Users\\alice`` rendered as ``C:\\\\Users\\\\alice``.
 
     ``test_pipediff_reporters.py`` pins both halves of this: the exact bytes this
-    function emits, and -- when ``cmarkgfm`` is installed -- that GFM renders each
-    of them back to the original value in a row that keeps its column count.
+    function emits, and that each of them splits back to the original value in a
+    row that keeps its column count -- resolved with the scanner rule directly so
+    the check runs everywhere, and cross-checked against ``cmarkgfm`` when that
+    optional renderer is installed.
 
     This function assumes code-span input; plain text with backslashes would need
     a different escape, and no caller passes any.

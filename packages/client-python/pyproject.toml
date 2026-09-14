@@ -61,6 +61,11 @@ test = [
     "pytest-asyncio>=0.21.0",
     "pytest-cov>=4.0.0",
     "python-dotenv>=1.0.0",
+    # Optional oracle for the pipediff Markdown-escaping tests: it wraps the
+    # same cmark-gfm that GitHub renders comments with. The escaping rules are
+    # also asserted without it (see tests/test_pipediff_reporters.py), because
+    # CI runs pytest through the bundled engine rather than this extra.
+    "cmarkgfm>=2024.1.14",
 ]
 
 [project.urls]
