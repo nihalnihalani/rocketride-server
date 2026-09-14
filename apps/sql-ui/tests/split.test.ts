@@ -34,7 +34,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import type { SqlDialect } from '../src/connect';
-import { hasTopLevelKeyword, splitStatements, statementAtOffset, stripSqlComments } from '../src/sql/split';
+import { hasTopLevelKeyword, splitStatements, splitStatementsIn, statementAtOffset, stripSqlComments } from '../src/sql/split';
 
 // =============================================================================
 // HELPERS
@@ -378,5 +378,67 @@ describe('hasTopLevelKeyword', () => {
 
 	it('does not match a WHERE inside a longer word', () => {
 		assert.equal(hasTopLevelKeyword('UPDATE t SET wherewithal = 1', 'where', 'unknown'), false);
+	});
+});
+
+// =============================================================================
+// SPLITTING A SELECTION
+// =============================================================================
+
+describe('splitStatementsIn', () => {
+	const buffer = 'SELECT 1;\nUPDATE t SET a = 1;\nDELETE FROM t';
+
+	it('splits a selection that holds two statements', () => {
+		// Selects "UPDATE t SET a = 1;\nDELETE FROM t".
+		const out = splitStatementsIn(buffer, 10, buffer.length, 'unknown');
+		assert.deepEqual(out.map((s) => s.sql), ['UPDATE t SET a = 1', 'DELETE FROM t']);
+	});
+
+	it('reports offsets in the whole buffer, not the slice', () => {
+		const out = splitStatementsIn(buffer, 10, buffer.length, 'unknown');
+		for (const statement of out) {
+			assert.equal(buffer.slice(statement.start, statement.end), statement.sql);
+		}
+	});
+
+	it('reports line numbers of the whole buffer', () => {
+		const out = splitStatementsIn(buffer, 10, buffer.length, 'unknown');
+		assert.deepEqual(out.map((s) => [s.startLine, s.endLine]), [[2, 2], [3, 3]]);
+	});
+
+	it('yields one fragment for a partial-statement selection', () => {
+		// Selects "t SET a = 1" out of the middle of statement 2.
+		const out = splitStatementsIn(buffer, 17, 28, 'unknown');
+		assert.deepEqual(out.map((s) => s.sql), ['t SET a = 1']);
+		assert.equal(out[0].startLine, 2);
+	});
+
+	it('yields nothing for a comment-only selection', () => {
+		const commented = 'SELECT 1;\n-- just a note\n';
+		assert.deepEqual(splitStatementsIn(commented, 10, commented.length, 'unknown'), []);
+	});
+
+	it('yields nothing for an empty selection', () => {
+		assert.deepEqual(splitStatementsIn(buffer, 5, 5, 'unknown'), []);
+	});
+
+	it('clamps a slice that runs past the buffer', () => {
+		const out = splitStatementsIn(buffer, 0, buffer.length + 50, 'unknown');
+		assert.equal(out.length, 3);
+	});
+
+	it('keeps a semicolon inside a literal out of the split', () => {
+		const withLiteral = "SELECT 'a;b'; SELECT 2";
+		const out = splitStatementsIn(withLiteral, 0, withLiteral.length, 'unknown');
+		assert.deepEqual(out.map((s) => s.sql), ["SELECT 'a;b'", 'SELECT 2']);
+	});
+
+	it('exposes a trailing transaction statement the runner must refuse', () => {
+		// The regression DA-1 describes: selecting "UPDATE ...; ROLLBACK;" used
+		// to be sent as ONE statement, classified by its first keyword, so the
+		// ROLLBACK was never seen and never refused.
+		const script = 'UPDATE t SET a = 1;\nROLLBACK;';
+		const out = splitStatementsIn(script, 0, script.length, 'unknown');
+		assert.deepEqual(out.map((s) => s.sql), ['UPDATE t SET a = 1', 'ROLLBACK']);
 	});
 });

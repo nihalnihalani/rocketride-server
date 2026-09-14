@@ -448,6 +448,40 @@ export function splitStatements(sql: string, dialect: SqlDialect = 'unknown'): I
 }
 
 /**
+ * Split a SLICE of a buffer, reporting offsets and lines in the WHOLE buffer.
+ *
+ * This is what a selection needs. A selection is not necessarily one statement
+ * — `SELECT 1; DELETE FROM t` can be dragged in one gesture — and running it as
+ * a single call would misclassify it by its first keyword alone: the pattern
+ * check would never see the DELETE, the transaction refusal would never see a
+ * trailing ROLLBACK, and the whole thing would be marked read-only and so
+ * eligible for the session's retry. Splitting the slice and rebasing the
+ * offsets keeps every per-statement guard working while decorations and line
+ * numbers still point at the real text in the editor.
+ *
+ * A slice that holds only part of a statement yields exactly one statement (the
+ * fragment), which is the behaviour a partial selection wants.
+ *
+ * @param buffer - The whole editor buffer.
+ * @param start - Start offset of the slice (inclusive).
+ * @param end - End offset of the slice (exclusive).
+ * @param dialect - The engine dialect.
+ * @returns The statements, with buffer-absolute offsets and line numbers.
+ */
+export function splitStatementsIn(buffer: string, start: number, end: number, dialect: SqlDialect = 'unknown'): IStatement[] {
+	const from = Math.max(0, Math.min(start, buffer.length));
+	const to = Math.max(from, Math.min(end, buffer.length));
+	const lineStarts = buildLineStarts(buffer);
+	return splitStatements(buffer.slice(from, to), dialect).map((statement) => ({
+		...statement,
+		start: from + statement.start,
+		end: from + statement.end,
+		startLine: lineAt(lineStarts, from + statement.start),
+		endLine: lineAt(lineStarts, from + statement.end - 1),
+	}));
+}
+
+/**
  * The statement the cursor sits in.
  *
  * When the offset falls between statements (in the whitespace or comment after

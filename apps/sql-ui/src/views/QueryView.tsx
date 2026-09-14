@@ -60,11 +60,10 @@ import CellInspector from '../components/CellInspector';
 import HistoryPanel from '../components/HistoryPanel';
 import ExplainPanel from '../components/ExplainPanel';
 import { announce } from '../a11y/announce';
-import { splitStatements, statementAtOffset } from '../sql/split';
-import type { IStatement } from '../sql/split';
+import { splitStatements, splitStatementsIn, statementAtOffset } from '../sql/split';
 import { classifyStatement, patternCheck } from '../sql/classify';
 import type { IPatternFinding } from '../sql/classify';
-import { applyRowLimit, formatBatchOutcome, formatElapsed, leadingVerb } from '../sql/batch';
+import { applyRowLimit, formatBatchOutcome, formatElapsed, formatPriorStatements, leadingVerb } from '../sql/batch';
 import type { IStatementRun, RunOutcome } from '../sql/batch';
 import {
 	ALLOW_EXECUTE_OFF_TEXT,
@@ -98,6 +97,26 @@ export interface IQueryViewProps {
 	origin?: 'generated';
 }
 
+/**
+ * One statement to send.
+ *
+ * The position fields are OPTIONAL because not every run comes from the
+ * editor: a rerun from the history drawer has no place in the buffer, and
+ * inventing line 1 for it would decorate and name unrelated text.
+ */
+interface IRunTarget {
+	/** The statement text. */
+	sql: string;
+	/** Start offset in the editor buffer, when it has one. */
+	start?: number;
+	/** End offset in the editor buffer, when it has one. */
+	end?: number;
+	/** One-based first line, when it has one. */
+	startLine?: number;
+	/** One-based last line, when it has one. */
+	endLine?: number;
+}
+
 /** A pending pattern-check confirmation, and the resolver waiting on it. */
 interface IPatternPrompt {
 	/** The statement the check fired on. */
@@ -112,8 +131,10 @@ interface IFailureState {
 	notice: IFailureNotice;
 	/** Zero-based index of the statement that failed. */
 	index: number;
-	/** One-based line range of the failing statement. */
+	/** Line range of the failing statement; '' when it has no editor position. */
 	lines: string;
+	/** What is true of everything before the failure ('' when it failed first). */
+	prior: string;
 }
 
 /** Row-limit options offered by the header toggle. */
@@ -169,12 +190,6 @@ const styles = {
 		paddingTop: 6,
 	} as CSSProperties,
 
-	// Focus-return wrapper around a shell Button (which forwards no ref).
-	// `display: contents` keeps the button itself as the flex child.
-	buttonHost: {
-		display: 'contents',
-	} as CSSProperties,
-
 	// Result meta line in the grid card's action slot.
 	meta: {
 		display: 'flex',
@@ -216,24 +231,15 @@ const styles = {
 // =============================================================================
 
 /**
- * One-based line number of an offset in a buffer.
- *
- * @param text - The buffer.
- * @param offset - The character offset.
- * @returns The line number.
- */
-function lineAt(text: string, offset: number): number {
-	return text.slice(0, Math.max(0, offset)).split('\n').length;
-}
-
-/**
  * Describe a line range the way the pre-run line and the strip do.
  *
- * @param from - First line (one-based).
+ * @param from - First line (one-based), or undefined for a statement with no
+ *               position in the editor (a rerun from the history drawer).
  * @param to - Last line (one-based).
- * @returns e.g. `line 4` or `lines 4–6`.
+ * @returns e.g. `line 4` or `lines 4–6`; '' when there is no position.
  */
-function lineRange(from: number, to: number): string {
+function lineRange(from?: number, to?: number): string {
+	if (from === undefined || to === undefined) return '';
 	return from === to ? `line ${from}` : `lines ${from}–${to}`;
 }
 
@@ -279,6 +285,9 @@ function toHistoryEntry(run: IStatementRun): IHistoryEntry {
 		affected: run.outcome === 'affected' ? run.affected ?? 0 : undefined,
 		error: run.error,
 		kind: run.kind,
+		// Only a limit the APP appended is reported; a statement's own LIMIT is
+		// already visible in the stored text.
+		limit: run.limitState === 'applied' ? run.limitApplied ?? undefined : undefined,
 	};
 }
 
@@ -349,10 +358,6 @@ export const QueryView: React.FC<IQueryViewProps> = ({ endpoint, label, initialS
 	// The buffer text as of the last run or the last load: anything else in the
 	// editor is unsaved work that must not be replaced without asking.
 	const committedTextRef = useRef(initialSql ?? '');
-	// The shell's Button does not forward a ref, so focus is returned through a
-	// `display: contents` wrapper that changes no layout.
-	const historyButtonRef = useRef<HTMLSpanElement>(null);
-	const explainButtonRef = useRef<HTMLSpanElement>(null);
 
 	useEffect(() => () => {
 		mountedRef.current = false;
@@ -362,15 +367,6 @@ export const QueryView: React.FC<IQueryViewProps> = ({ endpoint, label, initialS
 		patternResolverRef.current = null;
 	}, []);
 	useEffect(() => { patternChecksOnRef.current = patternChecksOn; }, [patternChecksOn]);
-
-	/**
-	 * Return focus to the control that opened a drawer.
-	 *
-	 * @param host - Wrapper around the opening button.
-	 */
-	const focusOpener = useCallback((host: React.RefObject<HTMLSpanElement>): void => {
-		host.current?.querySelector('button')?.focus();
-	}, []);
 
 	const dialect = snapshot.dialect;
 	const statements = useMemo(() => splitStatements(sql, dialect), [sql, dialect]);
@@ -422,17 +418,16 @@ export const QueryView: React.FC<IQueryViewProps> = ({ endpoint, label, initialS
 	 *
 	 * @returns The statements to run (possibly empty).
 	 */
-	const currentTarget = useCallback((): IStatement[] => {
+	const currentTarget = useCallback((): IRunTarget[] => {
 		const selection = editorRef.current?.getSelection();
 		if (selection && selection.text.trim()) {
-			return [{
-				index: 0,
-				sql: selection.text.trim(),
-				start: selection.start,
-				end: selection.end,
-				startLine: lineAt(sql, selection.start),
-				endLine: lineAt(sql, selection.end),
-			}];
+			// A selection is NOT necessarily one statement — `SELECT …; DELETE …`
+			// can be dragged in one gesture. Sending it whole would classify it
+			// by its first keyword alone, so the pattern check would never see
+			// the DELETE, a trailing ROLLBACK would never be refused, and the
+			// whole thing would be marked read-only and become eligible for the
+			// session's retry. Split it exactly like the buffer.
+			return splitStatementsIn(sql, selection.start, selection.end, dialect);
 		}
 		const offset = editorRef.current?.getCursorOffset() ?? cursor.offset;
 		const statement = statementAtOffset(sql, offset, dialect);
@@ -449,18 +444,22 @@ export const QueryView: React.FC<IQueryViewProps> = ({ endpoint, label, initialS
 			return { text: `Running statement ${activeIndex + 1} of ${runs.length}…`, decorations };
 		}
 		if (cursor.selectionText.trim()) {
-			const from = lineAt(sql, cursor.selectionStart);
-			const to = lineAt(sql, cursor.selectionEnd);
+			const selected = splitStatementsIn(sql, cursor.selectionStart, cursor.selectionEnd, dialect);
+			if (selected.length === 0) return { text: 'Will run: nothing — no statement found', decorations: [] };
+			const span = lineRange(selected[0].startLine, selected[selected.length - 1].endLine);
+			// Say how many, so a multi-statement selection is never mistaken for
+			// a single statement before it runs.
+			const count = selected.length > 1 ? `, ${selected.length} statements` : '';
 			return {
-				text: `Will run: selection (${lineRange(from, to)})`,
+				text: `Will run: selection${count} (${span})`,
 				decorations: [{ start: cursor.selectionStart, end: cursor.selectionEnd, className: 'sql-ui-stmt-active' }],
 			};
 		}
-		if (statements.length === 0) {
-			return { text: 'Will run: nothing — editor is empty', decorations: [] };
-		}
-		const statement = statementAtOffset(sql, cursor.offset, dialect);
-		if (!statement) return { text: 'Will run: nothing — editor is empty', decorations: [] };
+		// An empty buffer and a buffer holding only comments are different
+		// things, and the second one is the confusing one.
+		if (!sql.trim()) return { text: 'Will run: nothing — editor is empty', decorations: [] };
+		const statement = statements.length > 0 ? statementAtOffset(sql, cursor.offset, dialect) : null;
+		if (!statement) return { text: 'Will run: nothing — no statement found', decorations: [] };
 		const decorations: IDecorationRange[] = [{ start: statement.start, end: statement.end, className: 'sql-ui-stmt-active' }];
 		if (lastRun?.start !== undefined && lastRun.end !== undefined && lastRun.start !== statement.start) {
 			decorations.push({ start: lastRun.start, end: lastRun.end, className: 'sql-ui-stmt-last' });
@@ -542,7 +541,7 @@ export const QueryView: React.FC<IQueryViewProps> = ({ endpoint, label, initialS
 	 *
 	 * @param targets - The statements to send, in order.
 	 */
-	const runTargets = useCallback(async (targets: IStatement[]): Promise<void> => {
+	const runTargets = useCallback(async (targets: IRunTarget[], opts?: { fromEditor?: boolean }): Promise<void> => {
 		if (!client || runningRef.current || targets.length === 0) return;
 
 		// Transaction control cannot work through per-call autocommit, so it is
@@ -602,7 +601,7 @@ export const QueryView: React.FC<IQueryViewProps> = ({ endpoint, label, initialS
 			}
 
 			const prepared = applyRowLimit(results[i].sql, limit, dialect);
-			results[i] = { ...results[i], outcome: 'running', limitApplied: prepared.limit };
+			results[i] = { ...results[i], outcome: 'running', limitApplied: prepared.limit, limitState: prepared.state };
 			publishRuns([...results]);
 			setActiveIndex(i);
 			activeIndexRef.current = i;
@@ -628,7 +627,15 @@ export const QueryView: React.FC<IQueryViewProps> = ({ endpoint, label, initialS
 				for (let j = i + 1; j < results.length; j++) results[j] = { ...results[j], outcome: 'skipped' };
 				publishRuns([...results]);
 				failedAt = i;
-				setFailure({ notice, index: i, lines: lineRange(results[i].startLine, results[i].endLine) });
+				setFailure({
+					notice,
+					index: i,
+					lines: lineRange(results[i].startLine, results[i].endLine),
+					// Says "ran" or "committed" per the kinds that preceded the
+					// failure — the sentence that stops a reader assuming the
+					// batch rolled back.
+					prior: formatPriorStatements(results, i),
+				});
 				if (notice.allowExecuteOff) setAllowExecuteOff(true);
 				record(results[i]);
 				break;
@@ -646,7 +653,10 @@ export const QueryView: React.FC<IQueryViewProps> = ({ endpoint, label, initialS
 		const shown = withRows ?? resolved ?? null;
 		setSelectedRun(shown ? shown.index : null);
 		if (shown) setLastRun({ index: shown.index, at: Date.now(), start: shown.start, end: shown.end });
-		committedTextRef.current = sql;
+		// Only an editor run makes the buffer "already run". A rerun from the
+		// history drawer must not mark untouched editor text as run, or the
+		// next Load-into-editor would silently discard it.
+		if (opts?.fromEditor) committedTextRef.current = sql;
 		// A statement that actually ran is the only proof the node's execute
 		// gate is open again, so a successful run retires the warning.
 		if (resolved) setAllowExecuteOff(false);
@@ -662,10 +672,10 @@ export const QueryView: React.FC<IQueryViewProps> = ({ endpoint, label, initialS
 	}, [client, dialect, endpoint, limit, sql, askPatternConfirm, publishRuns, record, setPatternChecks]);
 
 	/** Run the selection, or the statement at the caret. */
-	const runOne = useCallback((): void => { void runTargets(currentTarget()); }, [runTargets, currentTarget]);
+	const runOne = useCallback((): void => { void runTargets(currentTarget(), { fromEditor: true }); }, [runTargets, currentTarget]);
 
 	/** Run every statement in the buffer, in order. */
-	const runAll = useCallback((): void => { void runTargets(splitStatements(sql, dialect)); }, [runTargets, sql, dialect]);
+	const runAll = useCallback((): void => { void runTargets(splitStatements(sql, dialect), { fromEditor: true }); }, [runTargets, sql, dialect]);
 
 	/**
 	 * Stop waiting for the statement in flight.
@@ -731,8 +741,10 @@ export const QueryView: React.FC<IQueryViewProps> = ({ endpoint, label, initialS
 	 */
 	const explainState = useMemo((): { disabled: boolean; title: string } => {
 		if (!client || !isConnected) return { disabled: true, title: 'Not connected.' };
-		const selected = cursor.selectionText.trim();
-		const statement = selected ? selected : statementAtOffset(sql, cursor.offset, dialect)?.sql ?? '';
+		const selected = cursor.selectionText.trim()
+			? splitStatementsIn(sql, cursor.selectionStart, cursor.selectionEnd, dialect)[0]?.sql ?? ''
+			: '';
+		const statement = selected || statementAtOffset(sql, cursor.offset, dialect)?.sql || '';
 		const candidate = statement ? applyRowLimit(statement, limit, dialect).sql : '';
 		if (!candidate.trim()) return { disabled: true, title: 'Write a statement to explain.' };
 		if (buildExplain(dialect, candidate) === null) {
@@ -782,14 +794,8 @@ export const QueryView: React.FC<IQueryViewProps> = ({ endpoint, label, initialS
 	 * @param entry - The history entry to run again.
 	 */
 	const rerunEntry = useCallback((entry: IHistoryEntry): void => {
-		void runTargets([{
-			index: 0,
-			sql: entry.sql,
-			start: 0,
-			end: entry.sql.length,
-			startLine: 1,
-			endLine: entry.sql.split('\n').length,
-		}]);
+		// No start/end/line: this statement has no place in the editor buffer.
+		void runTargets([{ sql: entry.sql }]);
 	}, [runTargets]);
 
 	// ── Results ──────────────────────────────────────────────────────────────
@@ -834,10 +840,18 @@ export const QueryView: React.FC<IQueryViewProps> = ({ endpoint, label, initialS
 		if (displayed.outcome === 'affected') {
 			return { text: `${(displayed.affected ?? 0).toLocaleString()} affected${executed}${elapsed}`, limitReached: false };
 		}
-		const limitText = applied === null ? 'no limit applied' : `limit ${applied.toLocaleString()}`;
+		// Three states, because "no limit applied" on a statement that limits
+		// ITSELF invites the reader to conclude the table holds exactly this
+		// many rows.
+		const state = displayed.limitState ?? 'none';
+		const limitText = state === 'applied'
+			? `limit ${(applied ?? 0).toLocaleString()}`
+			: state === 'in-statement'
+				? 'limit in statement'
+				: 'no limit applied';
 		return {
 			text: `${rows.length.toLocaleString()} rows returned (${limitText})${executed}${elapsed}`,
-			limitReached: applied !== null && rows.length === applied,
+			limitReached: state === 'applied' && applied !== null && rows.length === applied,
 		};
 	}, [displayed, rows.length, lastRun]);
 
@@ -867,28 +881,24 @@ export const QueryView: React.FC<IQueryViewProps> = ({ endpoint, label, initialS
 							value={limit}
 							onChange={setLimit}
 						/>
-						<span ref={historyButtonRef} style={styles.buttonHost}>
-							<Button
-								variant="ghost"
-								pressed={historyOpen}
-								ariaExpanded={historyOpen}
-								title="Show the statements run on this connection"
-								onClick={() => setHistoryOpen((open) => !open)}
-							>
-								History
-							</Button>
-						</span>
-						<span ref={explainButtonRef} style={styles.buttonHost}>
-							<Button
-								variant="secondary"
-								onClick={openExplain}
-								disabled={explainState.disabled}
-								ariaExpanded={explainOpen}
-								title={explainState.title}
-							>
-								Explain
-							</Button>
-						</span>
+						<Button
+							variant="ghost"
+							pressed={historyOpen}
+							ariaExpanded={historyOpen}
+							title="Show the statements run on this connection"
+							onClick={() => setHistoryOpen((open) => !open)}
+						>
+							History
+						</Button>
+						<Button
+							variant="secondary"
+							onClick={openExplain}
+							disabled={explainState.disabled}
+							ariaExpanded={explainOpen}
+							title={explainState.title}
+						>
+							Explain
+						</Button>
 						{running && canStop && (
 							<Button variant="ghost" title="Stop waiting for the answer. This does not cancel the statement." onClick={stopWaiting}>
 								Stop waiting
@@ -962,8 +972,8 @@ export const QueryView: React.FC<IQueryViewProps> = ({ endpoint, label, initialS
 					<Banner variant="error">
 						<div>{failure.notice.generic ? GENERIC_ERROR_TEXT : failure.notice.headline}</div>
 						<div>
-							{`Statement ${failure.index + 1} (${failure.lines}).`}
-							{failure.index > 0 && ` Statements 1–${failure.index} already committed (each statement runs in its own transaction).`}
+							{`Statement ${failure.index + 1}${failure.lines ? ` (${failure.lines})` : ''}.`}
+							{failure.prior && ` ${failure.prior}`}
 						</div>
 						{failure.notice.maxExecuteRows !== null && <div>{maxRowsText(failure.notice.maxExecuteRows)}</div>}
 						{!failure.notice.generic && failure.notice.verbatim && (
@@ -1044,7 +1054,7 @@ export const QueryView: React.FC<IQueryViewProps> = ({ endpoint, label, initialS
 			<HistoryPanel
 				endpoint={endpoint}
 				open={historyOpen}
-				onClose={() => { setHistoryOpen(false); focusOpener(historyButtonRef); }}
+				onClose={() => setHistoryOpen(false)}
 				onLoadIntoEditor={loadIntoEditor}
 				onRerun={rerunEntry}
 			/>
@@ -1057,7 +1067,7 @@ export const QueryView: React.FC<IQueryViewProps> = ({ endpoint, label, initialS
 				dialect={dialect}
 				sql={explainSql}
 				open={explainOpen}
-				onClose={() => { setExplainOpen(false); focusOpener(explainButtonRef); }}
+				onClose={() => setExplainOpen(false)}
 			/>
 
 			{/* Loading a statement would discard unsaved editor text. */}
