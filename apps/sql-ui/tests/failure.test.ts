@@ -71,10 +71,16 @@ describe('describeFailure', () => {
 		assert.equal(describeFailure('connection reset').maxExecuteRows, null);
 	});
 
-	it('survives an empty message', () => {
+	it('treats an empty message as the generic case rather than an empty quote', () => {
+		// An Error with no message reaches this path; `generic: false` made
+		// QueryView and ExplainPanel render the headline with nothing after it.
 		const notice = describeFailure('');
-		assert.equal(notice.headline, 'Database reported: ');
-		assert.equal(notice.generic, false);
+		assert.equal(notice.generic, true);
+		assert.equal(notice.verbatim, '');
+	});
+
+	it('treats a whitespace-only message the same way', () => {
+		assert.equal(describeFailure('   \n  ').generic, true);
 	});
 });
 

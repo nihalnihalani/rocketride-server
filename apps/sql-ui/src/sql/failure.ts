@@ -118,7 +118,11 @@ export function describeFailure(message: string): IFailureNotice {
 	return {
 		headline: `Database reported: ${firstLine}`,
 		verbatim,
-		generic: GENERIC_FAILURE.test(verbatim),
+		// No text at all is the same situation as the node's placeholder: there
+		// is nothing real to quote. Calling it generic picks the bound wording
+		// instead of rendering the headline "Database reported:" with nothing
+		// after it.
+		generic: verbatim === '' || GENERIC_FAILURE.test(verbatim),
 		allowExecuteOff: verbatim.includes('allow_execute'),
 		maxExecuteRows: maxRows ? Number(maxRows[1]) : null,
 	};
