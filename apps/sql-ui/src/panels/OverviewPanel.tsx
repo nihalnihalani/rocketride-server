@@ -198,7 +198,7 @@ export const OverviewPanel: React.FC<IOverviewPanelProps> = ({ endpoint, snapsho
 				<div>
 					<Button
 						variant="primary"
-						onClick={() => { if (client) void refreshSchema(client, endpoint); }}
+						onClick={() => { if (client) void refreshSchema(client, endpoint, { fresh: true }); }}
 						disabled={!client}
 					>
 						Retry

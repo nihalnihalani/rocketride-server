@@ -104,9 +104,19 @@ export const ConnectionView: React.FC<IConnectionViewProps> = ({ endpoint }) => 
 	};
 
 	// Header subtitle: dialect + pipeline binding + snapshot freshness.
+	//
+	// The stamp distinguishes the two things a "read" can mean here. A node
+	// with the `refresh_schema` tool actually re-reads the database; a node
+	// without it serves the reflection taken when its task started, however
+	// recently we asked. Saying "schema read HH:MM" for both would let the
+	// second case pass for the first, which is exactly the confusion that
+	// makes a Refresh button look broken after a CREATE TABLE.
 	const dialectLabel = snapshot.dialect !== 'unknown' ? snapshot.dialect : endpoint.provider;
+	const stampTime = snapshot.refreshedAt ? new Date(snapshot.refreshedAt).toLocaleTimeString() : '';
 	const refreshed = snapshot.refreshedAt
-		? ` — schema read ${new Date(snapshot.refreshedAt).toLocaleTimeString()}`
+		? (snapshot.stale
+			? ` — task-start snapshot, read ${stampTime}`
+			: ` — snapshot re-read ${stampTime}`)
 		: '';
 
 	return (
@@ -127,7 +137,7 @@ export const ConnectionView: React.FC<IConnectionViewProps> = ({ endpoint }) => 
 					<>
 						<Button
 							variant="ghost"
-							onClick={() => { if (client) void refreshSchema(client, endpoint); }}
+							onClick={() => { if (client) void refreshSchema(client, endpoint, { fresh: true }); }}
 							disabled={!client || snapshot.status === 'loading'}
 						>
 							{snapshot.status === 'loading' ? 'Reading...' : 'Refresh Schema'}
