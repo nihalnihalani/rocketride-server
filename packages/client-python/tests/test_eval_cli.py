@@ -383,6 +383,94 @@ class TestEvalCli:
         assert [entry['spec'] for entry in written['spec_errors']] == [str(tmp_path / 'a-broken.eval.json')]
         assert written['summary']['spec_errors'] == 1
 
+    async def test_json_file_carries_a_spec_parse_error_envelope(self, monkeypatch, capsys, tmp_path):
+        # Exit 2 before any case runs still leaves a document behind: the
+        # shared {"error": ...} envelope every other subcommand writes.
+        broken = tmp_path / 'broken.eval.json'
+        broken.write_text('{ not valid json', encoding='utf-8')
+        report_path = tmp_path / 'report.json'
+        fake = FakeClient()
+
+        exit_code = await run_cli(monkeypatch, fake, [str(broken), '--json', str(report_path)])
+
+        assert exit_code == 2
+        assert fake.calls == []
+        assert report_path.exists()
+        written = json.loads(report_path.read_text(encoding='utf-8'))
+        assert set(written.keys()) == {'error'}
+        assert 'Invalid JSON' in written['error']['message']
+        assert str(broken) in written['error']['message']
+        # ...and the sentence on stderr is printed exactly once
+        captured = capsys.readouterr()
+        assert captured.err.count('Error:') == 1
+        assert 'Invalid JSON' in captured.err
+
+    async def test_json_file_carries_a_connection_error_envelope(self, monkeypatch, capsys, tmp_path, spec_file):
+        # The other exit-2 path: the specs parsed, the server is down
+        report_path = tmp_path / 'report.json'
+        fake = FakeClient(connect_error=ConnectionError('connection refused'))
+
+        exit_code = await run_cli(monkeypatch, fake, [spec_file, '--json', str(report_path)])
+
+        assert exit_code == 2
+        assert report_path.exists()
+        written = json.loads(report_path.read_text(encoding='utf-8'))
+        assert set(written.keys()) == {'error'}
+        assert 'Unable to connect to server' in written['error']['message']
+        assert 'connection refused' in written['error']['message']
+        # hint_for() turns the refusal into the next step to take
+        assert written['error']['hint'].startswith('is the server at ')
+        assert written['error']['hint'].endswith('running?')
+        # One sentence on stderr, carrying the same message and hint
+        captured = capsys.readouterr()
+        assert captured.err.count('Error:') == 1
+        assert 'Unable to connect to server' in captured.err
+        assert 'running?' in captured.err
+
+    async def test_stale_json_report_is_overwritten_by_the_error_envelope(self, monkeypatch, tmp_path, spec_file):
+        # The failure that costs someone time: run 1 passes and writes the
+        # report, run 2 cannot reach the server. The reporting step must not
+        # read run 1's green summary as run 2's result.
+        report_path = tmp_path / 'report.json'
+        passing = FakeClient()
+        assert await run_cli(monkeypatch, passing, [spec_file, '--json', str(report_path)]) == 0
+        assert json.loads(report_path.read_text(encoding='utf-8'))['summary']['passed'] == 2
+
+        offline = FakeClient(connect_error=ConnectionError('connection refused'))
+        exit_code = await run_cli(monkeypatch, offline, [spec_file, '--json', str(report_path)])
+
+        assert exit_code == 2
+        written = json.loads(report_path.read_text(encoding='utf-8'))
+        assert 'summary' not in written
+        assert 'Unable to connect to server' in written['error']['message']
+
+    async def test_bare_json_carries_only_the_error_envelope(self, monkeypatch, capsys, spec_file):
+        # Bare --json owns stdout: exactly one JSON document there, nothing else
+        fake = FakeClient(connect_error=ConnectionError('connection refused'))
+
+        exit_code = await run_cli(monkeypatch, fake, [spec_file, '--json'])
+
+        assert exit_code == 2
+        captured = capsys.readouterr()
+        document = json.loads(captured.out)
+        assert set(document.keys()) == {'error'}
+        assert 'Unable to connect to server' in document['error']['message']
+        # stdout is the document and nothing but the document
+        assert captured.out.strip() == json.dumps(document, indent=2)
+        assert captured.err.count('Error:') == 1
+
+    async def test_human_mode_reports_the_failure_on_stderr_only(self, monkeypatch, capsys, spec_file):
+        # No --json: no document anywhere, one sentence on stderr, clean stdout
+        fake = FakeClient(connect_error=ConnectionError('connection refused'))
+
+        exit_code = await run_cli(monkeypatch, fake, [spec_file])
+
+        assert exit_code == 2
+        captured = capsys.readouterr()
+        assert captured.out == ''
+        assert captured.err.count('Error:') == 1
+        assert captured.err.strip().startswith('Error: Unable to connect to server')
+
     async def test_json_file_and_junit_are_written_together(self, monkeypatch, capsys, tmp_path, spec_file):
         # Both machine reports, plus the human one on stdout; missing parent
         # directories are created for each

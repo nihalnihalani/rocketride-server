@@ -39,11 +39,15 @@ Its ``--json [FILE]`` is the shared result option every other subcommand
 takes, routed through the shared ``Output`` channel: bare ``--json`` owns
 stdout (the human report is suppressed so stdout carries exactly one JSON
 document), and ``--json FILE`` writes that document to FILE while the human
-report keeps flowing on stdout. The command does not route through
-``run_cli_command``, though: that runner maps any raised error to exit code
-1, while this command's documented contract reserves 1 for "a case failed"
-and reports usage, spec and connection errors as 2. Client cleanup and the
-``Output`` flush are therefore done here explicitly.
+report keeps flowing on stdout. The two paths that exit 2 before any case
+runs — an unparsable spec, and a server the CLI cannot reach — record the
+shared ``{"error": {"message", "hint"}}`` envelope in place of the report,
+so the destination is always rewritten and an earlier run's green summary
+is never left behind to be read as this run's result. The command does not
+route through ``run_cli_command``, though: that runner maps any raised
+error to exit code 1, while this command's documented contract reserves 1
+for "a case failed" and reports usage, spec and connection errors as 2.
+Client cleanup and the ``Output`` flush are therefore done here explicitly.
 
 Key Features:
     - Run one or more eval specs in a single invocation
@@ -75,7 +79,7 @@ from ...evals.judge import make_judge
 from ...evals.reporters import EvalReport, SpecError, render_human, render_json, render_junit
 from ...evals.runner import run_spec
 from ...evals.spec import EvalSpec, EvalSpecError, load_spec
-from ..utils.common import connect_client, disconnect_all
+from ..utils.common import connect_client, disconnect_all, hint_for
 from ..utils.file_utils import expand_file_patterns
 from ..utils.output import Output
 
@@ -108,30 +112,35 @@ async def run_eval(args) -> int:
         5. Report results (human, --json [FILE], and/or --junit)
         6. Compute the exit code from the aggregate results
     """
-    # Expand globs and literal paths into the working spec file list
-    files = expand_file_patterns(args.files)
-
-    # Load and validate every spec up front: a broken eval definition is
-    # a usage error, so nothing runs (mirroring how a bad flag behaves).
-    # No report exists yet on this path, so there is nothing to flush.
-    specs: list[EvalSpec] = []
-    for file_path in files:
-        try:
-            specs.append(load_spec(file_path))
-        except EvalSpecError as err:
-            print(f'Error: {err}', file=sys.stderr)
-            return 2
-
     # The shared result channel: None -> human, '-' -> JSON on stdout,
-    # <path> -> JSON written to that file (human report still on stdout)
+    # <path> -> JSON written to that file (human report still on stdout).
+    # Opened before anything can fail so that EVERY exit path leaves a
+    # document behind — the exit-2 paths below record the shared error
+    # envelope, which is what overwrites a stale report from a previous run.
     out = Output(args.json)
     try:
+        # Expand globs and literal paths into the working spec file list
+        files = expand_file_patterns(args.files)
+
+        # Load and validate every spec up front: a broken eval definition is
+        # a usage error, so nothing runs (mirroring how a bad flag behaves).
+        specs: list[EvalSpec] = []
+        for file_path in files:
+            try:
+                specs.append(load_spec(file_path))
+            except EvalSpecError as err:
+                # No hint: the message already names the file and the field
+                # to fix, and the other commands pass none for a parse or
+                # validation error either.
+                out.fail(str(err))
+                return 2
+
         # Connect once for all specs. A connection failure is exit code 2 by
         # contract, so it is handled here rather than by a generic catch-all.
         try:
             client = await connect_client(args.uri, args.apikey)
         except Exception as err:  # noqa: BLE001
-            print(f'Error: Unable to connect to server: {err}', file=sys.stderr)
+            out.fail(f'Unable to connect to server: {err}', hint_for(err, args.uri))
             return 2
 
         # Run each spec sequentially, isolating spec-level failures (e.g. a
@@ -195,6 +204,7 @@ async def run_eval(args) -> int:
         return 0
     finally:
         # This command owns its client and its Output (it does not go through
-        # the shared runner), so both are closed out here on every path.
+        # the shared runner), so both are closed out here on every path — in
+        # the order run_cli_command uses: disconnect, then flush.
         await disconnect_all()
         out.finish()

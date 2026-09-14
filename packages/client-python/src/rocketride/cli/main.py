@@ -240,7 +240,9 @@ def setup_parser() -> argparse.ArgumentParser:
         description='Run golden-dataset eval specs (<name>.eval.json) against their pipelines. '
         'Exit codes: 0 = all cases passed; 1 = at least one case failed or a spec could not '
         'run to completion; 2 = usage error, spec parse/validation error, connection failure, '
-        'or no case produced a result.',
+        'or no case produced a result. A spec or connection error writes the shared '
+        '{"error": ...} envelope to --json [FILE] in place of the report, so a report file '
+        'from an earlier run is never left behind as the result of this one.',
     )
     _add_connection_args(eval_parser)
 
