@@ -407,6 +407,12 @@ export const QueryView: React.FC<IQueryViewProps> = ({ endpoint, label, initialS
 	const setPatternChecks = useCallback((on: boolean): void => {
 		const bag = (prefs.getPref(PATTERN_CHECK_PREF) as Record<string, boolean> | undefined) ?? {};
 		prefs.setPref(PATTERN_CHECK_PREF, { ...bag, [endpoint.key]: on });
+		// Written HERE, not only by the effect that mirrors the state below:
+		// the run loop resumes from `await askPatternConfirm(...)` in a
+		// microtask and reads this ref for the NEXT statement, which happens
+		// before React runs that passive effect. Leaving it to the effect made
+		// "Run and stop asking" ask again for every further match in the batch.
+		patternChecksOnRef.current = on;
 		setPatternChecksOn(on);
 		announce(on ? 'Pattern checks on for this connection' : 'Pattern checks off for this connection');
 	}, [prefs, endpoint.key]);
