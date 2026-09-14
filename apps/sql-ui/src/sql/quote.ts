@@ -21,25 +21,26 @@
 // SOFTWARE.
 
 // =============================================================================
-// CONNECT — PUBLIC SURFACE
+// SQL — QUOTING (the one place a value becomes SQL text)
 // =============================================================================
 //
-// The rest of the app imports the connection layer ONLY through this barrel.
-// See types.ts for the isolation rationale.
+// Binding a value as a `$n` parameter is ALWAYS preferable: the driver never
+// sees the value as syntax (see sql/paging.ts). quoteLiteral exists for the
+// statements that cannot bind — catalog queries whose predicates the engines
+// only accept as literals — and it is deliberately the only literal quoter in
+// the app, so there is exactly one rule to review.
 // =============================================================================
 
-export type {
-	SqlDialect,
-	ISqlEndpoint,
-	ISqlExecuteResult,
-	ISqlSchemaColumn,
-	ISqlSchemaForeignKey,
-	ISqlSchemaTable,
-	ISqlSchemaResponse,
-	ISqlSession,
-	ISqlProbeResult,
-} from './types';
-export { DATABASE_PROVIDERS, discoverSqlEndpoints } from './discovery';
-export { createSqlSession, isUnsupportedToolError, probeSqlEndpoint } from './session';
-export { refreshEndpoints, useSqlEndpoints } from './endpointStore';
-export type { EndpointStatus, IEndpointState } from './endpointStore';
+/**
+ * Quote a string literal for embedding in a statement: single quotes with
+ * doubled embedded quotes. The value is ALWAYS quoted, including when it
+ * looks like a number — an unquoted all-digit table name would become a
+ * number comparison against a text catalog column, which silently matches
+ * the wrong rows on MySQL and raises a type error on Postgres.
+ *
+ * @param value - The literal value.
+ * @returns The quoted literal.
+ */
+export function quoteLiteral(value: string): string {
+	return "'" + value.replace(/'/g, "''") + "'";
+}

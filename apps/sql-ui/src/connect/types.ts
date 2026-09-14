@@ -113,7 +113,7 @@ export interface ISqlSchemaTable {
 	foreign_keys?: ISqlSchemaForeignKey[];
 }
 
-/** Response of the node's `get_schema` tool. */
+/** Response of the node's `get_schema` / `refresh_schema` tools. */
 export interface ISqlSchemaResponse {
 	/** Database name the node is attached to. */
 	database?: string;
@@ -121,6 +121,14 @@ export interface ISqlSchemaResponse {
 	tables?: Record<string, ISqlSchemaTable>;
 	/** Error message when reflection failed. */
 	error?: string;
+	/**
+	 * True when this response was served from the node's TASK-START snapshot
+	 * and may therefore not reflect DDL run since. Set by
+	 * {@link ISqlSession.refreshSchema} when the node has no `refresh_schema`
+	 * tool and the call fell back to `get_schema`; `get_schema` itself always
+	 * serves that snapshot and never sets the flag.
+	 */
+	stale?: boolean;
 }
 
 // =============================================================================
@@ -137,17 +145,39 @@ export interface ISqlSession {
 	/**
 	 * Execute a raw SQL statement (requires `allow_execute` on the node).
 	 *
+	 * Values belong in `opts.params`, not in the statement: the node binds
+	 * them through the driver, so nothing the user typed is ever parsed as
+	 * SQL. Reference them positionally as `$1..$n`.
+	 *
 	 * @param sql - The statement to execute.
+	 * @param opts - Optional execution options.
+	 * @param opts.params - Positional bind values for `$1..$n`.
 	 * @returns Rows and affected-row count.
 	 */
-	execute(sql: string): Promise<ISqlExecuteResult>;
+	execute(sql: string, opts?: { params?: unknown[] }): Promise<ISqlExecuteResult>;
 	/**
 	 * Reflect the schema of the attached database (or a single table).
+	 *
+	 * The node reflects once at task start and serves that snapshot, so DDL
+	 * run since will NOT appear here — use {@link refreshSchema} after a
+	 * schema change.
 	 *
 	 * @param table - Optional table name to reflect just one table.
 	 * @returns The reflected schema.
 	 */
 	getSchema(table?: string): Promise<ISqlSchemaResponse>;
+	/**
+	 * Re-reflect the attached database and return the fresh schema.
+	 *
+	 * Nodes that predate the `refresh_schema` tool fall back to `getSchema`;
+	 * the response then carries {@link ISqlSchemaResponse.stale} so callers
+	 * can tell the user the schema may be out of date rather than showing a
+	 * post-DDL snapshot as if it were current.
+	 *
+	 * @returns The reflected schema, flagged `stale` when it came from the
+	 *          fallback.
+	 */
+	refreshSchema(): Promise<ISqlSchemaResponse>;
 	/**
 	 * Report the engine dialect of the attached database.
 	 *

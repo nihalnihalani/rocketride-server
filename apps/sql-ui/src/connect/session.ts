@@ -26,8 +26,9 @@
 //
 // Attach-mechanics live here on purpose (see types.ts). Today a session
 // resolves the owning task's token lazily and drives the node's shared SQL
-// tools (execute / get_schema / dialect) via client.tool. When the attach
-// path changes, this file changes — the ISqlSession contract does not.
+// tools (execute / get_schema / refresh_schema / dialect) via client.tool.
+// When the attach path changes, this file changes — the ISqlSession contract
+// does not.
 // =============================================================================
 
 import type { RocketRideClient } from 'shell';
@@ -55,6 +56,47 @@ const KNOWN_DIALECTS: ReadonlySet<string> = new Set(['mysql', 'postgres', 'click
  */
 function toDialect(value: unknown): SqlDialect {
 	return typeof value === 'string' && KNOWN_DIALECTS.has(value) ? (value as SqlDialect) : 'unknown';
+}
+
+// =============================================================================
+// TOOL-SUPPORT PROBING
+// =============================================================================
+
+/**
+ * Error fragments that mean "this node does not have that tool". The engine
+ * walks the tool chain and, when no node owns the name, fails the call — the
+ * wording is produced by the compiled engine, so only the Python side is
+ * readable here (rocketlib's `tool.invoke: <name> not owned` and
+ * `Unknown dynamic tool: <name>`). Matching is therefore best-effort.
+ */
+const UNSUPPORTED_TOOL_MARKERS = ['not owned', 'unknown tool', 'unknown dynamic tool', 'no tool methods', 'no node handles'];
+
+/**
+ * Error fragments that mean the tool RAN and the database refused the work.
+ * These are the failures a capability fallback must NOT swallow.
+ */
+const EXECUTED_MARKERS = ['sql execution failed', 'max_execute_rows', 'is disabled for this node', 'transaction session'];
+
+/**
+ * Decide whether a failed tool call means the node does not support the tool.
+ *
+ * The engine's exact wording for an unowned tool lives in the compiled
+ * engine and cannot be verified from this repository, so the classifier is
+ * deliberately asymmetric: it answers FALSE only for errors that clearly came
+ * from a tool that ran, and TRUE for everything else. A caller therefore
+ * falls back on transient failures too — which is harmless, because the
+ * fallback path fails the same way and surfaces the same error.
+ *
+ * @param err - The error a tool invocation threw.
+ * @returns True when the failure should be treated as "tool unsupported".
+ */
+export function isUnsupportedToolError(err: unknown): boolean {
+	const message = (err instanceof Error ? err.message : String(err ?? '')).toLowerCase();
+	if (EXECUTED_MARKERS.some((marker) => message.includes(marker))) return false;
+	if (UNSUPPORTED_TOOL_MARKERS.some((marker) => message.includes(marker))) return true;
+	// Unclassifiable: assume unsupported so a capability probe degrades
+	// instead of turning a new UI affordance into a hard failure.
+	return true;
 }
 
 // =============================================================================
@@ -108,7 +150,7 @@ class SqlToolSession implements ISqlSession {
 	 * Invoke one of the node's tools, retrying exactly once with a fresh token
 	 * when the first attempt fails (covers task restarts between calls).
 	 *
-	 * @param tool - Tool name (execute / get_schema / dialect).
+	 * @param tool - Tool name (execute / get_schema / refresh_schema / dialect).
 	 * @param input - Tool input arguments.
 	 * @returns The tool's result value.
 	 */
@@ -127,13 +169,31 @@ class SqlToolSession implements ISqlSession {
 	}
 
 	/** @inheritdoc */
-	async execute(sql: string): Promise<ISqlExecuteResult> {
-		return this.invoke<ISqlExecuteResult>('execute', { sql });
+	async execute(sql: string, opts?: { params?: unknown[] }): Promise<ISqlExecuteResult> {
+		// Omit `params` entirely when there is nothing to bind: the node's
+		// placeholder rewriting is skipped for an empty list, so an unbound
+		// statement keeps travelling exactly as it did before.
+		const params = opts?.params;
+		const input = params && params.length > 0 ? { sql, params } : { sql };
+		return this.invoke<ISqlExecuteResult>('execute', input);
 	}
 
 	/** @inheritdoc */
 	async getSchema(table?: string): Promise<ISqlSchemaResponse> {
 		return this.invoke<ISqlSchemaResponse>('get_schema', table ? { table } : {});
+	}
+
+	/** @inheritdoc */
+	async refreshSchema(): Promise<ISqlSchemaResponse> {
+		try {
+			return await this.invoke<ISqlSchemaResponse>('refresh_schema', {});
+		} catch (err) {
+			if (!isUnsupportedToolError(err)) throw err;
+			// Older nodes have no refresh tool: serve the task-start snapshot
+			// and say so, rather than presenting it as freshly reflected.
+			const schema = await this.getSchema();
+			return { ...schema, stale: true };
+		}
 	}
 
 	/** @inheritdoc */

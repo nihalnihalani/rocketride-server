@@ -31,24 +31,12 @@
 // =============================================================================
 
 import type { ISqlSession, SqlDialect } from '../connect';
+import { quoteLiteral } from './quote';
 
-// =============================================================================
-// HELPERS
-// =============================================================================
-
-/**
- * Quote a string literal for embedding in a statement: single quotes with
- * doubled embedded quotes. Table names here are DATA (compared against
- * INFORMATION_SCHEMA columns) and must ALWAYS be quoted — paging's
- * quoteValue passes numeric-looking values through unquoted, which would
- * turn an all-digit table name into a number comparison.
- *
- * @param value - The literal value.
- * @returns The quoted literal.
- */
-function quoteLiteral(value: string): string {
-	return "'" + value.replace(/'/g, "''") + "'";
-}
+// NOTE: the table names below are DATA (compared against INFORMATION_SCHEMA
+// columns), not identifiers. They ride as quoted literals rather than `$n`
+// binds because these catalog predicates are built once per dialect here and
+// the surrounding SQL is fixed; quoteLiteral (sql/quote.ts) always quotes.
 
 // =============================================================================
 // FOREIGN KEY NAMES

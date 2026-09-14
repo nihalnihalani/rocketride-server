@@ -1,5 +1,5 @@
-// =============================================================================
 // MIT License
+//
 // Copyright (c) 2026 Aparavi Software AG
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -21,25 +21,31 @@
 // SOFTWARE.
 
 // =============================================================================
-// CONNECT — PUBLIC SURFACE
-// =============================================================================
-//
-// The rest of the app imports the connection layer ONLY through this barrel.
-// See types.ts for the isolation rationale.
+// SQL QUOTE — unit tests for the app's only literal quoter
 // =============================================================================
 
-export type {
-	SqlDialect,
-	ISqlEndpoint,
-	ISqlExecuteResult,
-	ISqlSchemaColumn,
-	ISqlSchemaForeignKey,
-	ISqlSchemaTable,
-	ISqlSchemaResponse,
-	ISqlSession,
-	ISqlProbeResult,
-} from './types';
-export { DATABASE_PROVIDERS, discoverSqlEndpoints } from './discovery';
-export { createSqlSession, isUnsupportedToolError, probeSqlEndpoint } from './session';
-export { refreshEndpoints, useSqlEndpoints } from './endpointStore';
-export type { EndpointStatus, IEndpointState } from './endpointStore';
+import { describe, it } from 'node:test';
+import assert from 'node:assert/strict';
+import { quoteLiteral } from '../src/sql/quote';
+
+describe('quoteLiteral', () => {
+	it('wraps an ordinary value in single quotes', () => {
+		assert.equal(quoteLiteral('orders'), "'orders'");
+	});
+
+	it('quotes a numeric-looking value instead of passing it through bare', () => {
+		// The regression this module exists for: an unquoted all-digit value
+		// compared against a text catalog column is a number comparison.
+		assert.equal(quoteLiteral('2026'), "'2026'");
+		assert.equal(quoteLiteral('-1.5'), "'-1.5'");
+	});
+
+	it('doubles every embedded single quote', () => {
+		assert.equal(quoteLiteral("o'brien"), "'o''brien'");
+		assert.equal(quoteLiteral("''"), "''''''");
+	});
+
+	it('quotes the empty string', () => {
+		assert.equal(quoteLiteral(''), "''");
+	});
+});

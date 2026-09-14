@@ -54,10 +54,17 @@ export interface ISchemaState {
 	error: string | null;
 	/** Unix ms of the last successful refresh (0 = never). */
 	refreshedAt: number;
+	/**
+	 * True when the snapshot came from the node's task-start reflection and
+	 * may not reflect DDL run since — either because the caller asked for an
+	 * ordinary read, or because a `fresh` refresh fell back (the node has no
+	 * `refresh_schema` tool). Views that just applied DDL should say so.
+	 */
+	stale: boolean;
 }
 
 /** The idle placeholder returned for connections with no snapshot yet. */
-const IDLE_SCHEMA: ISchemaState = { status: 'idle', schema: null, dialect: 'unknown', error: null, refreshedAt: 0 };
+const IDLE_SCHEMA: ISchemaState = { status: 'idle', schema: null, dialect: 'unknown', error: null, refreshedAt: 0, stale: false };
 
 // ── Module-level state ───────────────────────────────────────────────────────
 
@@ -107,10 +114,19 @@ export function getSession(client: RocketRideClient, endpoint: ISqlEndpoint): IS
  * Concurrent refreshes of the same connection are collapsed by the loading
  * gate; failures land in the snapshot's error field.
  *
+ * The node reflects once at task start, so an ordinary refresh re-reads that
+ * same snapshot: it is a cheap way to recover from a transient failure, not a
+ * way to see DDL. Pass `fresh` after applying DDL to make the node re-reflect
+ * — the resulting snapshot carries {@link ISchemaState.stale} when the node
+ * is too old to have the `refresh_schema` tool and the call fell back.
+ *
  * @param client - The shell's RocketRide client.
  * @param endpoint - The connection's endpoint.
+ * @param opts - Optional refresh options.
+ * @param opts.fresh - Re-reflect the database rather than re-reading the
+ *                     task-start snapshot.
  */
-export async function refreshSchema(client: RocketRideClient, endpoint: ISqlEndpoint): Promise<void> {
+export async function refreshSchema(client: RocketRideClient, endpoint: ISqlEndpoint, opts?: { fresh?: boolean }): Promise<void> {
 	const current = snapshots[endpoint.key] ?? IDLE_SCHEMA;
 	if (current.status === 'loading') return;
 	setSnapshot(endpoint.key, { ...current, status: 'loading', error: null });
@@ -119,12 +135,21 @@ export async function refreshSchema(client: RocketRideClient, endpoint: ISqlEndp
 		const session = getSession(client, endpoint);
 		// Dialect first (cheap), then the full reflection.
 		const dialect = await session.dialect();
-		const schema = await session.getSchema();
+		const schema = opts?.fresh ? await session.refreshSchema() : await session.getSchema();
 		if (schema.error) {
 			setSnapshot(endpoint.key, { ...current, status: 'error', dialect, error: schema.error });
 			return;
 		}
-		setSnapshot(endpoint.key, { status: 'ready', schema, dialect, error: null, refreshedAt: Date.now() });
+		// A plain read is stale by construction; a fresh one only when the
+		// node answered through the get_schema fallback.
+		setSnapshot(endpoint.key, {
+			status: 'ready',
+			schema,
+			dialect,
+			error: null,
+			refreshedAt: Date.now(),
+			stale: opts?.fresh ? schema.stale === true : true,
+		});
 	} catch (err) {
 		setSnapshot(endpoint.key, { ...current, status: 'error', error: err instanceof Error ? err.message : String(err) });
 	}
