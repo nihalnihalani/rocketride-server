@@ -32,7 +32,7 @@ rocketride eval rag-pipeline.eval.json
 - Exercises the query flow of the RAG pipeline (`"source": "chat_1"` — the pipe has two sources, so the spec pins the chat one)
 - Deterministic assertions (`contains`, `regex`, `min_length`/`max_length`, `latency_max_ms`) plus one `llm_judge` case that checks the pipeline admits when the retrieved context lacks an answer instead of fabricating one
 - Ingest at least one RocketRide-related document through the webhook flow first, then adapt the case inputs and assertions to your own corpus
-- See the [Python client docs](../docs/README-python-client.md#rocketride-eval) for the full spec format and assertion reference
+- See the [CLI reference](../docs/public/product/connect/cli.mdx#eval) for the full spec format and assertion reference
 
 **Required env vars:** same as `rag-pipeline.pipe` (the packaged default LLM judge also uses `ROCKETRIDE_OPENAI_KEY`)
 
