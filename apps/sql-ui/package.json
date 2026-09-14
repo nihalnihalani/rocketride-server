@@ -22,7 +22,8 @@
 		"build": "rsbuild build",
 		"build:prod": "rsbuild build --env-mode production",
 		"dev": "rsbuild dev",
-		"typecheck": "tsc --noEmit"
+		"typecheck": "tsc --noEmit",
+		"typecheck:tests": "tsc -p tsconfig.test.json --noEmit"
 	},
 	"browserslist": [
 		"chrome >= 81",

@@ -68,6 +68,18 @@ mod.actions.push({
 			if (testFiles.length === 0) {
 				throw new Error('No sql-ui test files found under tests/ — expected at least one *.test.ts(x)');
 			}
+			// tsx erases types rather than checking them, so the tests would
+			// otherwise run under no typechecker at all: the app's tsconfig
+			// covers src/** only. tsconfig.test.json is the second program that
+			// covers tests/ as well (see its header for why it is separate).
+			//
+			// It re-checks src/** too, so this step assumes a built shell: on a
+			// fresh clone .rocketride/shell/shell.tgz is the bootstrap stub until
+			// shell:build replaces it, and typechecking against the stub is what
+			// the "has no exported member" storms are (scripts/lib/appModule.js).
+			// CI is ordered for this — _build.yaml runs `builder build` at :152
+			// before `builder test` at :298 — but locally, build before testing.
+			await execCommand('npx', ['tsc', '-p', 'tsconfig.test.json', '--noEmit'], { task, cwd: APP_ROOT });
 			// './' prefix required: a bare relative path in --require resolves as
 			// a package name, not a file.
 			await execCommand('node', ['--require', './scripts/stub-shell.cjs', '--import', 'tsx', '--test', '--test-reporter=spec', ...testFiles], { task, cwd: APP_ROOT });
