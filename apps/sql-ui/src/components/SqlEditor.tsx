@@ -357,7 +357,9 @@ export const SqlEditor = forwardRef<ISqlEditorHandle, ISqlEditorProps>(function 
 		onRunAllRef.current = onRunAll;
 		onExplainRef.current = onExplain;
 		onCursorRef.current = onCursorChange;
-	}, [onRun, onRunAll, onExplain, onCursorChange]);
+		completionRef.current = completion;
+		dialectRef.current = dialect;
+	}, [onRun, onRunAll, onExplain, onCursorChange, completion, dialect]);
 
 	// Monaco namespace captured at mount + the app-theme version, so a theme
 	// toggle re-derives the token-based editor theme.
@@ -365,6 +367,11 @@ export const SqlEditor = forwardRef<ISqlEditorHandle, ISqlEditorProps>(function 
 	const editorRef = useRef<MonacoNS.editor.IStandaloneCodeEditor | null>(null);
 	const decorationsRef = useRef<MonacoNS.editor.IEditorDecorationsCollection | null>(null);
 	const modelUriRef = useRef<string | null>(null);
+	const [modelUri, setModelUri] = useState<string | null>(null);
+	// Mirrors of the current props, so handleMount can publish immediately
+	// rather than waiting a render for the effect above.
+	const completionRef = useRef(completion);
+	const dialectRef = useRef(dialect);
 	const cursorTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 	const themeVersion = useThemeVersion();
 
@@ -378,12 +385,19 @@ export const SqlEditor = forwardRef<ISqlEditorHandle, ISqlEditorProps>(function 
 
 	// Publish this editor's completion model for the shared provider to find,
 	// and take it back down on unmount so a closed tab stops answering.
+	//
+	// The URI is STATE, not just a ref, and that is the whole point: @monaco-
+	// editor/react mounts asynchronously (loader promise, then editor, then
+	// onMount), so on the first pass this effect has no URI to publish under.
+	// Keyed on a ref alone it would never run again for a document whose
+	// schema snapshot was already loaded before the editor appeared — the
+	// ordinary path, browse a connection first and then open a query — and the
+	// user would get Monaco's bare keyword list with no tables or columns.
 	useEffect(() => {
-		const uri = modelUriRef.current;
-		if (!uri) return;
-		if (completion) completionByModel.set(uri, { model: completion, dialect });
-		else completionByModel.delete(uri);
-	}, [completion, dialect]);
+		if (!modelUri) return;
+		if (completion) completionByModel.set(modelUri, { model: completion, dialect });
+		else completionByModel.delete(modelUri);
+	}, [modelUri, completion, dialect]);
 
 	useEffect(() => () => {
 		if (modelUriRef.current) completionByModel.delete(modelUriRef.current);
@@ -457,6 +471,12 @@ export const SqlEditor = forwardRef<ISqlEditorHandle, ISqlEditorProps>(function 
 		decorationsRef.current = editor.createDecorationsCollection([]);
 		const uri = editor.getModel()?.uri.toString() ?? null;
 		modelUriRef.current = uri;
+		setModelUri(uri);
+		// Publish straight away too: the state update above lands a render
+		// later, and a fast typist can open the suggest widget before then.
+		if (uri && completionRef.current) {
+			completionByModel.set(uri, { model: completionRef.current, dialect: dialectRef.current });
+		}
 
 		editor.addAction({
 			id: 'sql-ui.run',
