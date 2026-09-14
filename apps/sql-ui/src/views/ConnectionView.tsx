@@ -24,7 +24,7 @@
 // SQL-UI — CONNECTION VIEW (Archetype B workbench document for one connection)
 // =============================================================================
 
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import type { CSSProperties } from 'react';
 import { useShellConnection } from 'shell';
 import { Button, ContentHeader, TabControl, TabPanel } from 'shell';
@@ -35,6 +35,7 @@ import { refreshSchema, useSchema } from '../schema/schemaStore';
 import { diagramUri, getDocs, nextQueryDoc } from '../docs';
 import { HistoryPrefsBridge } from '../history/historyStore';
 import { runSchemaChecks } from '../schema/quality';
+import { useTableRecordRequest } from '../navigation';
 import OverviewPanel from '../panels/OverviewPanel';
 import InsightsPanel from './InsightsPanel';
 
@@ -90,6 +91,21 @@ export const ConnectionView: React.FC<IConnectionViewProps> = ({ endpoint }) => 
 			void refreshSchema(client, endpoint);
 		}
 	}, [client, isConnected, snapshot.status, endpoint]);
+
+	// The record drawer belongs to OverviewPanel, and TabPanel hides the
+	// inactive panel with `display: none` — so a table opened from Insights,
+	// or from the sidebar tree while Insights is in front, would raise a
+	// drawer nobody can see. Bring Overview forward with it. Requests made
+	// before this document mounted are not acted on: the ref starts at
+	// whatever sequence was already in the store.
+	const tableRequest = useTableRecordRequest();
+	const seenRequestRef = useRef(tableRequest?.seq ?? 0);
+	useEffect(() => {
+		if (!tableRequest || tableRequest.key !== endpoint.key) return;
+		if (tableRequest.seq === seenRequestRef.current) return;
+		seenRequestRef.current = tableRequest.seq;
+		setActivePage('overview');
+	}, [tableRequest, endpoint.key]);
 
 	// Snapshot-only review findings; the count rides the Insights tab so the
 	// page advertises whether it has anything to say before it is opened.
