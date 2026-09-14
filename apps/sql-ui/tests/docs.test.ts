@@ -45,7 +45,6 @@ import {
 	isTableDataUri,
 	nextQueryDoc,
 	tableDataUri,
-	tableFromTableDataUri,
 } from '../src/docs';
 
 // =============================================================================
@@ -159,19 +158,3 @@ describe('endpointKeyFromAnyUri', () => {
 // TABLE EXTRACTION
 // =============================================================================
 
-describe('tableFromTableDataUri', () => {
-	it('round-trips an ordinary table name', () => {
-		assert.equal(tableFromTableDataUri(tableDataUri(KEY, 'orders')), 'orders');
-	});
-
-	it('round-trips a table name containing a colon, a space, or a percent sign', () => {
-		for (const name of ['odd:name', 'two words', '100%', ':', 'ünïcode']) {
-			assert.equal(tableFromTableDataUri(tableDataUri(KEY, name)), name);
-		}
-	});
-
-	it('returns null for any other scheme', () => {
-		assert.equal(tableFromTableDataUri(designUri(KEY, 'orders')), null);
-		assert.equal(tableFromTableDataUri(CONNECTIONS_URI), null);
-	});
-});

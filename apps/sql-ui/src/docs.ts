@@ -168,7 +168,7 @@ export function isQueryUri(uri: string): boolean {
 /**
  * Build the URI for a table's data-browser document. The table name is
  * percent-encoded so a name containing ':' cannot fake a scheme separator
- * (see {@link endpointKeyFromAnyUri}); {@link tableFromTableDataUri} decodes.
+ * (see {@link endpointKeyFromAnyUri}).
  *
  * @param endpointKey - The endpoint's stable key.
  * @param table - The table name.
@@ -186,22 +186,6 @@ export function tableDataUri(endpointKey: string, table: string): string {
  */
 export function isTableDataUri(uri: string): boolean {
 	return uri.startsWith('table:');
-}
-
-/**
- * Recover the table name from a table data-browser URI.
- *
- * The views read their table from the document's content payload, so nothing
- * needs this today; it exists so the encoding in {@link tableDataUri} always
- * has its documented inverse next to it rather than being re-derived by hand.
- *
- * @param uri - A document URI.
- * @returns The decoded table name, or null for any other scheme.
- */
-export function tableFromTableDataUri(uri: string): string | null {
-	if (!isTableDataUri(uri)) return null;
-	const cut = uri.lastIndexOf(':');
-	return cut > 'table:'.length - 1 ? decodeURIComponent(uri.slice(cut + 1)) : null;
 }
 
 // Monotonic create-table counter — each "+ Create Table" opens a fresh draft.
