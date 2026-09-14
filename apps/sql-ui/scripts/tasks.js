@@ -54,16 +54,19 @@ mod.actions.push({
 	action: () => ({
 		description: 'Test sql-ui',
 		run: async (ctx, task) => {
+			// Fail rather than pass silently. tests/ is tracked source, so an
+			// absent directory or a pattern that stops matching is a broken
+			// checkout, not an app without tests — and `builder test` runs this
+			// action in CI, where returning cleanly would report the whole
+			// suite green while nothing at all had run.
 			if (!existsSync(TESTS_DIR)) {
-				task.output = 'No tests/ directory';
-				return;
+				throw new Error(`No tests/ directory at ${TESTS_DIR} — sql-ui's suite is tracked source and must be present`);
 			}
 			const testFiles = (await readdir(TESTS_DIR, { recursive: true }))
 				.filter((f) => f.endsWith('.test.ts') || f.endsWith('.test.tsx'))
 				.map((f) => path.join('tests', f));
 			if (testFiles.length === 0) {
-				task.output = 'No sql-ui test files found';
-				return;
+				throw new Error('No sql-ui test files found under tests/ — expected at least one *.test.ts(x)');
 			}
 			// './' prefix required: a bare relative path in --require resolves as
 			// a package name, not a file.
