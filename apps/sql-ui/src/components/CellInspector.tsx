@@ -103,15 +103,23 @@ function asText(value: unknown): string {
 /**
  * Copy text to the clipboard and announce it.
  *
- * The Clipboard API rejects without a user gesture or a secure context; a
- * failure announces itself rather than passing silently, because the user has
- * no other signal that nothing was copied.
+ * The Clipboard API rejects without a user gesture, and is absent entirely
+ * outside a secure context; either way the failure announces itself rather
+ * than passing silently, because the user has no other signal that nothing
+ * was copied.
  *
  * @param text - The text to copy.
  * @param what - What was copied, for the announcement.
  */
 function copy(text: string, what: string): void {
-	void navigator.clipboard?.writeText(text).then(
+	// An absent Clipboard API (an insecure context, an old browser) took the
+	// optional chain and skipped BOTH callbacks, so the button did nothing and
+	// said nothing. A missing API is a failure to copy like any other.
+	if (!navigator.clipboard) {
+		announce(`Could not copy ${what}`);
+		return;
+	}
+	void navigator.clipboard.writeText(text).then(
 		() => { announce(`Copied ${what}`); },
 		() => { announce(`Could not copy ${what}`); },
 	);

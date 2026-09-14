@@ -180,6 +180,10 @@ const styles = {
 	} as CSSProperties,
 
 	rowSql: {
+		// Block, because `overflow`, `textOverflow` and vertical margins do
+		// nothing on an inline box: as a span the statement overflowed the
+		// drawer instead of ending in an ellipsis.
+		display: 'block',
 		marginTop: 4,
 		fontFamily: 'var(--rr-font-mono, monospace)',
 		fontSize: 12.5,
@@ -189,6 +193,9 @@ const styles = {
 	} as CSSProperties,
 
 	rowNote: {
+		// Block for the same reason, and so the note sits UNDER the statement
+		// rather than running on beside it.
+		display: 'block',
 		marginTop: 2,
 		fontSize: 12,
 		color: 'var(--rr-text-secondary)',

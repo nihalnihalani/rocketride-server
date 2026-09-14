@@ -250,6 +250,11 @@ export const ExplainPanel: React.FC<IExplainPanelProps> = ({ endpoint, dialect, 
 				)}
 			</Banner>
 		);
+	} else if (!client) {
+		// `run` returns before sending anything when there is no client, so
+		// `running` never becomes true and `result` never arrives: the
+		// "Explaining…" state below would claim work that was never started.
+		body = <EmptyState icon={<DatabaseIcon />} title="Not connected" description="The plan cannot be read while the shell connection is down." />;
 	} else if (running || !result) {
 		body = <EmptyState icon={<DatabaseIcon />} title="Explaining…" description="Asking the database how it would run this statement." />;
 	} else {

@@ -24,9 +24,23 @@
 // SQL-UI — LIVE REGION (one polite announcer for the whole app)
 // =============================================================================
 
-import React, { useSyncExternalStore } from 'react';
+import React, { useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import type { CSSProperties } from 'react';
 import { getAnnouncement, subscribeAnnouncements } from '../a11y/announce';
+
+// =============================================================================
+// TIMING
+// =============================================================================
+
+/**
+ * How long the region stays empty before the new sentence is put back.
+ *
+ * The clear and the restore must land in DIFFERENT tasks: a removal and an
+ * insertion inside one commit can be coalesced into "no change" by the time
+ * assistive technology reads the accessibility tree, which is exactly how a
+ * repeated sentence goes unspoken.
+ */
+const RESTORE_DELAY_MS = 50;
 
 // =============================================================================
 // STYLES
@@ -58,18 +72,40 @@ const hidden: CSSProperties = {
  * The app's single polite live region. Mounted once by `SqlApp`; every
  * `announce()` call anywhere in the app lands here.
  *
- * The text is rendered inside a child KEYED BY REVISION. Announcing the same
- * sentence twice would otherwise leave the DOM text unchanged and the live
- * region silent; keying by revision replaces the node, which is the mutation
- * assistive technology actually watches for.
+ * Every announcement — including a REPEAT of the sentence already showing —
+ * empties the region and puts the text back a task later. Replacing the node
+ * in one commit (by keying it on the revision) is not enough: the removal and
+ * the insertion can be coalesced before the accessibility tree is read, and a
+ * repeated sentence then goes unspoken. A newer announcement cancels a
+ * restore still pending for the previous one, so only the latest is voiced.
  *
  * @returns The live region element.
  */
 export const LiveRegion: React.FC = () => {
 	const announcement = useSyncExternalStore(subscribeAnnouncements, getAnnouncement, getAnnouncement);
+	const [spoken, setSpoken] = useState('');
+	const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+	useEffect(() => {
+		// Empty first, in this commit; the text returns in a later task.
+		setSpoken('');
+		if (announcement.text === '') return undefined;
+		timerRef.current = setTimeout(() => {
+			timerRef.current = null;
+			setSpoken(announcement.text);
+		}, RESTORE_DELAY_MS);
+		// Runs before the next announcement's setup, which is how a pending
+		// restore is cancelled.
+		return () => {
+			if (timerRef.current === null) return;
+			clearTimeout(timerRef.current);
+			timerRef.current = null;
+		};
+	}, [announcement.revision, announcement.text]);
+
 	return (
 		<div style={hidden} aria-live="polite" aria-atomic="true" role="status">
-			<span key={announcement.revision}>{announcement.text}</span>
+			<span>{spoken}</span>
 		</div>
 	);
 };
