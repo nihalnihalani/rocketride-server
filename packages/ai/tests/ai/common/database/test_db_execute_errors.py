@@ -265,3 +265,30 @@ def test_concurrent_refresh_schema_calls_all_succeed(shared_instance):
     assert errors == []
     assert len(results) == 4
     assert all('widgets' in result['tables'] for result in results)
+
+
+# ---------------------------------------------------------------------------
+# execute() must not echo the statement or its bind parameters
+# ---------------------------------------------------------------------------
+
+
+def test_execute_error_does_not_leak_the_statement_or_parameters(instance):
+    """A failed statement reports the driver message, never [SQL:]/[parameters:].
+
+    ``str()`` of a SQLAlchemy StatementError appends the executed statement
+    and the values bound into it. That used to stay in the server log; since
+    ``execute`` re-raises the formatted message to its caller, the whole repr
+    would reach a user-facing Run/Refresh UI. Runs against the real sqlite3
+    driver, so it pins the actual exception shape rather than a fake.
+    """
+    instance.execute({'sql': 'CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT)'})
+
+    with pytest.raises(RuntimeError) as excinfo:
+        instance.execute({'sql': 'SELECT no_such_column FROM users WHERE email = $1', 'params': ['ada@example.com']})
+
+    message = str(excinfo.value)
+    assert message == 'SQL execution failed: no such column: no_such_column'
+    assert 'ada@example.com' not in message
+    assert '[SQL:' not in message
+    assert '[parameters:' not in message
+    assert 'sqlalche.me' not in message

@@ -38,6 +38,8 @@ Everything else — schema reflection, type inference, table auto-creation,
 session lifecycle — is handled here and is dialect-agnostic.
 """
 
+import re
+
 from abc import ABC, abstractmethod
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
@@ -61,6 +63,64 @@ from rocketlib import IGlobalBase, error, warning
 from ai.common.config import Config
 
 DEFAULT_MAX_EXECUTE_ROWS = 25000
+
+# Everything a driver or SQLAlchemy appends to its primary message that can
+# echo the executed statement or the values bound into it back to the caller:
+#
+#   * SQLAlchemy's StatementError repr ends in "[SQL: ...]" / "[parameters: ...]"
+#     / "[cached since ...]" / the sqlalche.me background link.
+#   * psycopg2 quotes the offending line of the statement as "LINE n: ..."
+#     followed by a caret marker, and psycopg2 interpolates bind values
+#     client-side, so that line can contain the parameters verbatim.
+#   * PostgreSQL DETAIL/HINT/CONTEXT/QUERY/STATEMENT blocks routinely restate
+#     the offending key values ("Key (email)=(a@b.com) already exists.").
+#
+# The primary message alone -- "no such column: foo", "duplicate key value
+# violates unique constraint users_email_key" -- is what a caller needs in
+# order to fix their statement, and it carries no user data.
+_DB_ERROR_DETAIL = re.compile(
+    r"""\s*(?:
+          \[SQL:
+        | \[parameters:
+        | \[cached\ since
+        | \[generated\ in
+        | \(Background\ on\ this\ error
+        | LINE\ \d+:
+        | DETAIL:
+        | HINT:
+        | CONTEXT:
+        | QUERY:
+        | STATEMENT:
+    )""",
+    re.VERBOSE,
+)
+
+
+# Returned when a message carries no primary sentence at all, so the caller
+# always gets a non-empty string and never the statement echo.
+_DB_ERROR_FALLBACK = 'Database error'
+
+
+def _strip_statement_detail(message: str) -> str:
+    """Cut a driver/SQLAlchemy message down to its primary sentence.
+
+    Everything from the first ``_DB_ERROR_DETAIL`` marker onwards is dropped,
+    because that tail is where the executed statement and its bind parameters
+    live. Returns the input unchanged when there is no marker.
+
+    When the message is nothing but detail there is no primary sentence to
+    keep, so the fallback is a neutral constant rather than the first line:
+    that line would be the ``[SQL: ...]`` echo this function exists to remove,
+    and handing it back would defeat the whole point on the one input where it
+    matters most.
+
+    Module-level rather than a method so ``_format_db_error`` stays usable
+    when it is bound onto a stub IGlobal (see tests/database/test_execute_session.py).
+    """
+    match = _DB_ERROR_DETAIL.search(message)
+    trimmed = message[: match.start()] if match else message
+    trimmed = trimmed.strip()
+    return trimmed or _DB_ERROR_FALLBACK
 
 
 class DatabaseGlobalBase(IGlobalBase, ABC):
@@ -123,23 +183,58 @@ class DatabaseGlobalBase(IGlobalBase, ABC):
     # ------------------------------------------------------------------
 
     def _format_db_error(self, exc: Exception) -> str:
-        """Return a user-facing error string using DB/driver payload when present.
+        """Return the driver's own message, never the statement or its parameters.
 
-        Prefer numeric code and provider message when available, otherwise
-        fallback to the exception string.
+        This string is user-facing: ``_executeRawQuery`` re-raises it as a
+        ``RuntimeError`` that reaches the ``execute`` tool caller, so it must
+        say what went wrong without echoing back what was run.
+
+        ``str(exc)`` is the wrong answer for a SQLAlchemy ``StatementError``:
+        its repr appends ``[SQL: ...]`` and ``[parameters: ...]``, which is
+        exactly the data that must stay in the server log. So each driver
+        shape is unwrapped explicitly and only the primary message is kept:
+
+        * pymysql / clickhouse-driver put ``(errno, message)`` in ``.orig.args``
+          -> ``Error <code>: <message>``.
+        * psycopg2 exposes the server's primary message on ``.orig.diag``;
+          its ``str()`` also carries the ``LINE n:`` echo of the statement,
+          which psycopg2 has already interpolated the bind values into.
+        * sqlite3 (and anything else) puts the bare message in ``.orig.args[0]``.
+
+        Every branch runs through ``_strip_statement_detail`` as a backstop,
+        so a driver shape not enumerated here still cannot leak the tail.
         """
         try:
             # SQLAlchemy wraps driver exceptions in DBAPIError; the original
-            # driver exception lives in .orig, which carries (code, message)
-            # in its .args tuple.
-            orig = getattr(exc, 'orig', exc)
+            # driver exception lives in .orig.
+            orig = getattr(exc, 'orig', None)
+            if orig is None:
+                orig = exc
+
             args = getattr(orig, 'args', ())
-            if isinstance(args, (list, tuple)) and len(args) >= 2 and isinstance(args[0], int):
-                code, msg = args[0], args[1]
-                return f'Error {code}: {str(msg)}'.strip()
+            is_seq = isinstance(args, (list, tuple))
+
+            if is_seq and len(args) >= 2 and isinstance(args[0], int):
+                return _strip_statement_detail(f'Error {args[0]}: {args[1]}')
+
+            # psycopg2: diag.message_primary is the server message with the
+            # LINE/DETAIL/HINT context already split off.
+            diag = getattr(orig, 'diag', None)
+            primary = getattr(diag, 'message_primary', None) if diag is not None else None
+            if isinstance(primary, str) and primary.strip():
+                code = getattr(orig, 'pgcode', None)
+                formatted = f'Error {code}: {primary}' if isinstance(code, str) and code else primary
+                return _strip_statement_detail(formatted)
+
+            # sqlite3 and the generic DBAPI shape: args[0] is the message.
+            if is_seq and args and isinstance(args[0], str) and args[0].strip():
+                return _strip_statement_detail(args[0])
+
+            if orig is not exc:
+                return _strip_statement_detail(str(orig))
         except Exception:
             pass
-        return str(exc).strip()
+        return _strip_statement_detail(str(exc))
 
     def validateConfig(self):
         """Quick save-time validation: probe the database with SELECT 1.

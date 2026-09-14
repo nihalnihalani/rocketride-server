@@ -7,7 +7,7 @@ The base classes are ABCs with two abstract methods (``_connection_params``,
 subclass that supplies SQLite-compatible stubs, then exercise:
 
 - Pure-logic helpers (no engine needed):
-  - ``_format_db_error`` — extracts (code, message) from DBAPI errors
+  - ``_format_db_error`` — driver message only, never the statement/parameters
   - ``_is_datetime_string`` — strptime two formats
   - ``_inferColumnType`` — Python type → SQLAlchemy type
   - ``_sanitize_value`` / ``_sanitize_row`` (db_instance_base) — JSON-safe coercion
@@ -84,19 +84,108 @@ def test_format_db_error_extracts_numeric_code_and_message(base):
     assert result == "Error 1146: Table 'x' doesn't exist"
 
 
-def test_format_db_error_falls_back_to_str_when_args_not_int_first(base):
-    """If args[0] is not an int, the function returns str(exc) instead."""
-    orig = SimpleNamespace(args=('not-a-code', 'msg'))
+def test_format_db_error_uses_the_driver_message_when_args_not_int_first(base):
+    """A string-args driver (sqlite3, psycopg2) yields its own message.
+
+    It must NOT fall through to ``str(exc)``: on a real SQLAlchemy
+    StatementError that repr carries the statement and its bind parameters.
+    """
+    orig = SimpleNamespace(args=('no such column: foo',))
     exc = RuntimeError('outer message')
     exc.orig = orig
-    result = base._format_db_error(exc)
-    assert result == 'outer message'
+    assert base._format_db_error(exc) == 'no such column: foo'
 
 
 def test_format_db_error_handles_exception_without_orig(base):
     """An exception without .orig falls through to str(exc)."""
     exc = RuntimeError('plain error')
     assert base._format_db_error(exc) == 'plain error'
+
+
+def test_format_db_error_drops_the_sqlalchemy_statement_and_parameters(base):
+    """The ``[SQL: ...]`` / ``[parameters: ...]`` tail must never reach a caller.
+
+    This is the shape ``str(exc)`` produces for any SQLAlchemy
+    ``StatementError``; ``_executeRawQuery`` re-raises the formatted string
+    as a RuntimeError that the ``execute`` tool returns to whoever called it.
+    """
+    exc = RuntimeError(
+        '(sqlite3.OperationalError) no such column: foo\n'
+        '[SQL: SELECT foo FROM users WHERE email = ?]\n'
+        "[parameters: ('ada@example.com',)]\n"
+        '(Background on this error at: https://sqlalche.me/e/20/e3q8)'
+    )
+    result = base._format_db_error(exc)
+    assert result == '(sqlite3.OperationalError) no such column: foo'
+    assert 'SELECT foo' not in result
+    assert 'ada@example.com' not in result
+
+
+def test_format_db_error_sqlite3_shape_keeps_only_the_driver_message(base):
+    """sqlite3 puts the bare message in ``.orig.args[0]``."""
+    orig = SimpleNamespace(args=('no such table: widgets',))
+    exc = RuntimeError(
+        '(sqlite3.OperationalError) no such table: widgets\n'
+        '[SQL: INSERT INTO widgets (secret) VALUES (?)]\n'
+        "[parameters: ('hunter2',)]"
+    )
+    exc.orig = orig
+    result = base._format_db_error(exc)
+    assert result == 'no such table: widgets'
+    assert 'hunter2' not in result
+    assert 'INSERT INTO' not in result
+
+
+def test_format_db_error_psycopg2_shape_uses_diag_and_drops_the_line_echo(base):
+    """psycopg2 interpolates binds client-side, so its ``LINE n:`` echo leaks them."""
+    orig = SimpleNamespace(
+        args=(
+            'column "foo" does not exist\nLINE 1: SELECT foo FROM users WHERE email = \'ada@example.com\'\n        ^\n',
+        ),
+        diag=SimpleNamespace(message_primary='column "foo" does not exist'),
+        pgcode='42703',
+    )
+    exc = RuntimeError('(psycopg2.errors.UndefinedColumn) ... [SQL: ...] [parameters: ...]')
+    exc.orig = orig
+    result = base._format_db_error(exc)
+    assert result == 'Error 42703: column "foo" does not exist'
+    assert 'ada@example.com' not in result
+    assert 'LINE 1' not in result
+
+
+def test_format_db_error_psycopg2_without_diag_still_trims_the_line_echo(base):
+    """Falling back to ``args[0]`` must not carry the interpolated statement."""
+    orig = SimpleNamespace(
+        args=(
+            'duplicate key value violates unique constraint "users_email_key"\n'
+            'DETAIL:  Key (email)=(ada@example.com) already exists.\n',
+        )
+    )
+    exc = RuntimeError('outer')
+    exc.orig = orig
+    result = base._format_db_error(exc)
+    assert result == 'duplicate key value violates unique constraint "users_email_key"'
+    assert 'ada@example.com' not in result
+
+
+def test_format_db_error_pymysql_shape_is_unchanged(base):
+    """The numeric-code branch keeps its existing ``Error <code>: <msg>`` output."""
+    orig = SimpleNamespace(args=(1054, "Unknown column 'foo' in 'field list'"))
+    exc = RuntimeError('outer')
+    exc.orig = orig
+    assert base._format_db_error(exc) == "Error 1054: Unknown column 'foo' in 'field list'"
+
+
+def test_format_db_error_returns_a_neutral_string_when_the_message_is_only_detail(base):
+    """A message that is nothing but detail must not fall back to the statement.
+
+    There is no primary sentence to keep here, and the first line is the
+    ``[SQL: ...]`` echo the stripper exists to remove -- so the fallback is a
+    neutral constant. Narrow (it needs a DBAPI error with an empty message),
+    but it is the one input where leaking the statement would be silent.
+    """
+    exc = RuntimeError('[SQL: SELECT 1]')
+    assert base._format_db_error(exc) == 'Database error'
 
 
 # ---------------------------------------------------------------------------
