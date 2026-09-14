@@ -1,0 +1,382 @@
+// =============================================================================
+// MIT License
+// Copyright (c) 2026 Aparavi Software AG
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+
+// =============================================================================
+// SQL SPLIT — unit tests for the multi-statement scanner
+// =============================================================================
+//
+// The contract under test: a `;` separates statements ONLY in code. Every
+// dialect difference the scanner claims (MySQL `#` comments, PostgreSQL nested
+// block comments and dollar-quoted bodies, ClickHouse having neither) is
+// asserted here rather than assumed, because the node executes exactly one
+// statement per call and a wrong split sends the wrong SQL to a database.
+// =============================================================================
+
+import { describe, it } from 'node:test';
+import assert from 'node:assert/strict';
+import type { SqlDialect } from '../src/connect';
+import { hasTopLevelKeyword, splitStatements, statementAtOffset, stripSqlComments } from '../src/sql/split';
+
+// =============================================================================
+// HELPERS
+// =============================================================================
+
+/**
+ * Split and return just the statement texts.
+ *
+ * @param sql - The buffer.
+ * @param dialect - The engine dialect (default 'unknown').
+ * @returns The statement texts in order.
+ */
+function texts(sql: string, dialect: SqlDialect = 'unknown'): string[] {
+	return splitStatements(sql, dialect).map((s) => s.sql);
+}
+
+// =============================================================================
+// TABLE-DRIVEN SPLIT CASES
+// =============================================================================
+
+/** One splitter case: buffer in, statement texts out. */
+interface ISplitCase {
+	/** What the case pins down. */
+	name: string;
+	/** The buffer to split. */
+	sql: string;
+	/** Dialect to scan with. */
+	dialect: SqlDialect;
+	/** Expected statement texts. */
+	expect: string[];
+}
+
+const CASES: ISplitCase[] = [
+	{ name: 'empty buffer', sql: '', dialect: 'unknown', expect: [] },
+	{ name: 'whitespace only', sql: '   \n\t ', dialect: 'unknown', expect: [] },
+	{ name: 'semicolons only', sql: ';;;', dialect: 'unknown', expect: [] },
+	{ name: 'comment only', sql: '-- just a note', dialect: 'unknown', expect: [] },
+	{ name: 'block comment only', sql: '/* nothing here */', dialect: 'unknown', expect: [] },
+	{ name: 'single statement, no terminator', sql: 'SELECT 1', dialect: 'unknown', expect: ['SELECT 1'] },
+	{ name: 'single statement, terminated', sql: 'SELECT 1;', dialect: 'unknown', expect: ['SELECT 1'] },
+	{ name: 'trailing whitespace after terminator', sql: 'SELECT 1;\n\n', dialect: 'unknown', expect: ['SELECT 1'] },
+	{ name: 'two statements', sql: 'SELECT 1; SELECT 2', dialect: 'unknown', expect: ['SELECT 1', 'SELECT 2'] },
+	{
+		name: 'three statements across lines',
+		sql: 'SELECT 1;\nUPDATE t SET a = 1;\nDELETE FROM t',
+		dialect: 'unknown',
+		expect: ['SELECT 1', 'UPDATE t SET a = 1', 'DELETE FROM t'],
+	},
+	{
+		name: 'semicolon inside a single-quoted literal',
+		sql: "SELECT 'a;b'; SELECT 2",
+		dialect: 'unknown',
+		expect: ["SELECT 'a;b'", 'SELECT 2'],
+	},
+	{
+		name: 'doubled single quote escapes the delimiter',
+		sql: "SELECT 'it''s; fine'; SELECT 2",
+		dialect: 'unknown',
+		expect: ["SELECT 'it''s; fine'", 'SELECT 2'],
+	},
+	{
+		name: 'semicolon inside a double-quoted identifier',
+		sql: 'SELECT "od;d" FROM t; SELECT 2',
+		dialect: 'postgres',
+		expect: ['SELECT "od;d" FROM t', 'SELECT 2'],
+	},
+	{
+		name: 'doubled double quote inside a quoted identifier',
+		sql: 'SELECT "we""ird;" FROM t; SELECT 2',
+		dialect: 'postgres',
+		expect: ['SELECT "we""ird;" FROM t', 'SELECT 2'],
+	},
+	{
+		name: 'semicolon inside a backtick identifier',
+		sql: 'SELECT `we;ird` FROM t; SELECT 2',
+		dialect: 'mysql',
+		expect: ['SELECT `we;ird` FROM t', 'SELECT 2'],
+	},
+	{
+		name: 'doubled backtick inside a backtick identifier',
+		sql: 'SELECT `a``b;c` FROM t; SELECT 2',
+		dialect: 'mysql',
+		expect: ['SELECT `a``b;c` FROM t', 'SELECT 2'],
+	},
+	{
+		name: 'semicolon inside a line comment',
+		sql: 'SELECT 1 -- ; not a split\n; SELECT 2',
+		dialect: 'unknown',
+		expect: ['SELECT 1 -- ; not a split', 'SELECT 2'],
+	},
+	{
+		name: 'semicolon inside a block comment',
+		sql: 'SELECT 1 /* ; not a split */; SELECT 2',
+		dialect: 'unknown',
+		expect: ['SELECT 1 /* ; not a split */', 'SELECT 2'],
+	},
+	{
+		name: 'multi-line block comment between statements attaches to the next one',
+		sql: 'SELECT 1;\n/* a\n b; c */\nSELECT 2',
+		dialect: 'unknown',
+		expect: ['SELECT 1', '/* a\n b; c */\nSELECT 2'],
+	},
+	{
+		name: 'mysql # line comment hides a semicolon',
+		sql: 'SELECT 1 # ; not a split\n; SELECT 2',
+		dialect: 'mysql',
+		expect: ['SELECT 1 # ; not a split', 'SELECT 2'],
+	},
+	{
+		name: 'clickhouse has NO # comment — the semicolon splits',
+		sql: 'SELECT 1 # ; x\n; SELECT 2',
+		dialect: 'clickhouse',
+		expect: ['SELECT 1 #', 'x', 'SELECT 2'],
+	},
+	{
+		name: 'clickhouse honours -- comments',
+		sql: 'SELECT 1 -- ; x\n; SELECT 2',
+		dialect: 'clickhouse',
+		expect: ['SELECT 1 -- ; x', 'SELECT 2'],
+	},
+	{
+		name: 'clickhouse honours block comments',
+		sql: 'SELECT 1 /* ; x */; SELECT 2',
+		dialect: 'clickhouse',
+		expect: ['SELECT 1 /* ; x */', 'SELECT 2'],
+	},
+	{
+		name: 'postgres nested block comment',
+		sql: 'SELECT 1 /* outer /* inner ; */ still ; comment */; SELECT 2',
+		dialect: 'postgres',
+		expect: ['SELECT 1 /* outer /* inner ; */ still ; comment */', 'SELECT 2'],
+	},
+	{
+		name: 'mysql does NOT nest block comments — the inner close ends it',
+		sql: 'SELECT 1 /* outer /* inner */ ; SELECT 2',
+		dialect: 'mysql',
+		expect: ['SELECT 1 /* outer /* inner */', 'SELECT 2'],
+	},
+	{
+		name: 'postgres dollar-quoted body keeps its semicolons',
+		sql: "CREATE FUNCTION f() RETURNS int AS $$ BEGIN RETURN 1; END; $$ LANGUAGE plpgsql; SELECT 2",
+		dialect: 'postgres',
+		expect: ['CREATE FUNCTION f() RETURNS int AS $$ BEGIN RETURN 1; END; $$ LANGUAGE plpgsql', 'SELECT 2'],
+	},
+	{
+		name: 'postgres tagged dollar quote',
+		sql: 'SELECT $body$ a; b $body$; SELECT 2',
+		dialect: 'postgres',
+		expect: ['SELECT $body$ a; b $body$', 'SELECT 2'],
+	},
+	{
+		name: 'postgres positional parameter is not a dollar quote',
+		sql: 'SELECT * FROM t WHERE a = $1; SELECT 2',
+		dialect: 'postgres',
+		expect: ['SELECT * FROM t WHERE a = $1', 'SELECT 2'],
+	},
+	{
+		name: 'dollar quoting is postgres-only — mysql splits inside it',
+		sql: 'SELECT $$ a; b $$; SELECT 2',
+		dialect: 'mysql',
+		expect: ['SELECT $$ a', 'b $$', 'SELECT 2'],
+	},
+	{
+		name: 'mysql backslash escapes a quote inside a literal',
+		sql: "SELECT 'a\\'; b'; SELECT 2",
+		dialect: 'mysql',
+		expect: ["SELECT 'a\\'; b'", 'SELECT 2'],
+	},
+	{
+		name: 'clickhouse backslash escapes a quote inside a literal',
+		sql: "SELECT 'a\\'; b'; SELECT 2",
+		dialect: 'clickhouse',
+		expect: ["SELECT 'a\\'; b'", 'SELECT 2'],
+	},
+	{
+		name: 'postgres plain literal does NOT take a backslash escape',
+		sql: "SELECT 'a\\', ';'; SELECT 2",
+		dialect: 'postgres',
+		expect: ["SELECT 'a\\', ';'", 'SELECT 2'],
+	},
+	{
+		name: 'postgres E-string DOES take a backslash escape',
+		sql: "SELECT E'a\\'; b'; SELECT 2",
+		dialect: 'postgres',
+		expect: ["SELECT E'a\\'; b'", 'SELECT 2'],
+	},
+	{
+		name: 'unterminated string literal consumes the tail',
+		sql: "SELECT 'oops; SELECT 2",
+		dialect: 'unknown',
+		expect: ["SELECT 'oops; SELECT 2"],
+	},
+	{
+		name: 'unterminated block comment consumes the tail',
+		sql: 'SELECT 1 /* oops; SELECT 2',
+		dialect: 'unknown',
+		expect: ['SELECT 1 /* oops; SELECT 2'],
+	},
+	{
+		name: 'blank statement between two terminators is dropped',
+		sql: 'SELECT 1;;SELECT 2',
+		dialect: 'unknown',
+		expect: ['SELECT 1', 'SELECT 2'],
+	},
+	{
+		name: 'trailing comment after the last terminator is dropped',
+		sql: 'SELECT 1; -- done',
+		dialect: 'unknown',
+		expect: ['SELECT 1'],
+	},
+	{
+		name: 'leading comment attaches to the statement that follows',
+		sql: '-- why\nSELECT 1;',
+		dialect: 'unknown',
+		expect: ['-- why\nSELECT 1'],
+	},
+	{
+		name: 'DELIMITER is NOT supported — the body splits (documented gap)',
+		sql: 'DELIMITER $$\nCREATE PROCEDURE p() BEGIN SELECT 1; END$$\nDELIMITER ;',
+		dialect: 'mysql',
+		expect: ['DELIMITER $$\nCREATE PROCEDURE p() BEGIN SELECT 1', 'END$$\nDELIMITER'],
+	},
+];
+
+describe('splitStatements', () => {
+	for (const testCase of CASES) {
+		it(`${testCase.dialect}: ${testCase.name}`, () => {
+			assert.deepEqual(texts(testCase.sql, testCase.dialect), testCase.expect);
+		});
+	}
+
+	it('reports contiguous zero-based indices', () => {
+		const statements = splitStatements('SELECT 1;;SELECT 2;SELECT 3', 'unknown');
+		assert.deepEqual(statements.map((s) => s.index), [0, 1, 2]);
+	});
+
+	it('offsets slice the original buffer back out', () => {
+		const buffer = "  SELECT 'a;b' ;\n   UPDATE t SET x = 1  ";
+		for (const statement of splitStatements(buffer, 'unknown')) {
+			assert.equal(buffer.slice(statement.start, statement.end), statement.sql);
+		}
+	});
+
+	it('reports one-based line ranges', () => {
+		const buffer = 'SELECT 1;\n\nSELECT\n  2\n;\nSELECT 3';
+		const statements = splitStatements(buffer, 'unknown');
+		assert.deepEqual(statements.map((s) => [s.startLine, s.endLine]), [[1, 1], [3, 4], [6, 6]]);
+	});
+});
+
+// =============================================================================
+// STATEMENT AT OFFSET
+// =============================================================================
+
+describe('statementAtOffset', () => {
+	const buffer = 'SELECT 1;\nUPDATE t SET a = 1;\nDELETE FROM t';
+
+	it('returns null for a buffer with no statements', () => {
+		assert.equal(statementAtOffset('   \n-- nothing', 3, 'unknown'), null);
+	});
+
+	it('finds the statement the cursor sits inside', () => {
+		assert.equal(statementAtOffset(buffer, 12, 'unknown')?.sql, 'UPDATE t SET a = 1');
+	});
+
+	it('treats the caret at a statement start as inside it', () => {
+		assert.equal(statementAtOffset(buffer, 10, 'unknown')?.sql, 'UPDATE t SET a = 1');
+	});
+
+	it('treats the caret at a statement end as inside it', () => {
+		assert.equal(statementAtOffset(buffer, 8, 'unknown')?.sql, 'SELECT 1');
+	});
+
+	it('falls back to the preceding statement in the gap after a terminator', () => {
+		assert.equal(statementAtOffset(buffer, 9, 'unknown')?.sql, 'SELECT 1');
+	});
+
+	it('falls back to the first statement before any statement text', () => {
+		assert.equal(statementAtOffset('\n\nSELECT 1', 0, 'unknown')?.sql, 'SELECT 1');
+	});
+
+	it('returns the last statement for a caret past the end', () => {
+		assert.equal(statementAtOffset(buffer, buffer.length, 'unknown')?.sql, 'DELETE FROM t');
+	});
+});
+
+// =============================================================================
+// COMMENT STRIPPING
+// =============================================================================
+
+describe('stripSqlComments', () => {
+	it('blanks a line comment but keeps the code', () => {
+		assert.equal(stripSqlComments('SELECT 1 -- note\nFROM t', 'unknown'), 'SELECT 1  \nFROM t');
+	});
+
+	it('leaves a separator behind so tokens do not fuse', () => {
+		assert.equal(stripSqlComments('SELECT/**/1', 'unknown'), 'SELECT 1');
+	});
+
+	it('keeps comment-looking text inside a literal', () => {
+		assert.equal(stripSqlComments("SELECT '-- not a comment'", 'unknown'), "SELECT '-- not a comment'");
+	});
+
+	it('strips a mysql # comment', () => {
+		assert.equal(stripSqlComments('SELECT 1 # note\nFROM t', 'mysql'), 'SELECT 1  \nFROM t');
+	});
+
+	it('leaves a # alone for clickhouse', () => {
+		assert.equal(stripSqlComments('SELECT 1 # note', 'clickhouse'), 'SELECT 1 # note');
+	});
+
+	it('strips a nested postgres block comment whole', () => {
+		assert.equal(stripSqlComments('SELECT /* a /* b */ c */ 1', 'postgres'), 'SELECT   1');
+	});
+});
+
+// =============================================================================
+// TOP-LEVEL KEYWORD SEARCH
+// =============================================================================
+
+describe('hasTopLevelKeyword', () => {
+	it('finds a top-level WHERE', () => {
+		assert.equal(hasTopLevelKeyword('DELETE FROM t WHERE id = 1', 'where', 'unknown'), true);
+	});
+
+	it('ignores a WHERE inside a string literal', () => {
+		assert.equal(hasTopLevelKeyword("UPDATE t SET note = 'where is it'", 'where', 'unknown'), false);
+	});
+
+	it('ignores a WHERE inside a comment', () => {
+		assert.equal(hasTopLevelKeyword('DELETE FROM t -- WHERE id = 1', 'where', 'unknown'), false);
+	});
+
+	it('ignores a WHERE that only occurs inside parentheses', () => {
+		assert.equal(hasTopLevelKeyword('DELETE FROM t USING (SELECT id FROM u WHERE x) s', 'where', 'unknown'), false);
+	});
+
+	it('finds a top-level WHERE that follows a subquery', () => {
+		assert.equal(hasTopLevelKeyword('DELETE FROM t WHERE id IN (SELECT id FROM u WHERE x)', 'where', 'unknown'), true);
+	});
+
+	it('does not match a WHERE inside a longer word', () => {
+		assert.equal(hasTopLevelKeyword('UPDATE t SET wherewithal = 1', 'where', 'unknown'), false);
+	});
+});
