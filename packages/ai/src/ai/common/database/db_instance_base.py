@@ -64,6 +64,37 @@ from .sql_safety import is_sql_safe
 _REFLECT_LOCK = threading.Lock()
 
 
+def _generated_primary_keys(table: SQLTable) -> set:
+    """Return the lowercased primary-key columns the DATABASE fills in itself.
+
+    Only reflected metadata is trusted, because binding the wrong answer is
+    destructive in both directions: binding NULL into a generated key is a
+    not-null violation on Postgres (``id SERIAL NOT NULL``), while omitting a
+    key the database does NOT generate silently writes a row with no identity
+    or fails deep inside the driver.
+
+    * ``table.autoincrement_column`` is SQLAlchemy's own resolution. It honours
+      an ``autoincrement=True`` reflected from MySQL or PostgreSQL, and applies
+      the ``'auto'`` rule -- a lone Integer primary key that is not a foreign
+      key -- which is how SQLite's rowid alias is recognised.
+    * A primary-key column with a ``server_default``, an ``Identity``, or an
+      explicit ``autoincrement=True`` is generated whatever its type, which
+      covers ``code TEXT PRIMARY KEY DEFAULT ...`` and ``GENERATED AS IDENTITY``.
+
+    Everything else -- a composite key, a TEXT key with no default -- is the
+    caller's to supply. Non-primary-key columns are out of scope: a column with
+    a default that the rows omit keeps today's behaviour of binding NULL.
+    """
+    generated = set()
+    autoincrement_column = table.autoincrement_column
+    if autoincrement_column is not None:
+        generated.add(autoincrement_column.name.lower())
+    for column in table.primary_key.columns:
+        if column.server_default is not None or column.identity is not None or column.autoincrement is True:
+            generated.add(column.name.lower())
+    return generated
+
+
 def _format_table(table_info: dict) -> dict:
     """Render one reflected table into the per-table shape both schema tools return.
 
@@ -933,21 +964,16 @@ class DatabaseInstanceBase(IInstanceBase, ABC):
         # columns for exactly this reason, but any map built by reflection --
         # `beginGlobal` for a table that already existed, or the lazy rebuild
         # above once `refresh_schema` has invalidated the cache -- carries the
-        # PK. Dropping the unsupplied PK columns here makes the insert correct
-        # whichever of the two maps this call is holding, so refreshing the
-        # cache can no longer change what an answers-lane INSERT looks like.
+        # PK. Dropping the unsupplied generated PK columns here makes the insert
+        # correct whichever of the two maps this call is holding, so refreshing
+        # the cache can no longer change what an answers-lane INSERT looks like.
         #
-        # The decision is made once per batch rather than per row so every
-        # mapping handed to executemany keeps an identical key set.
-        supplied_keys = {key.lower() for item in items if isinstance(item, dict) for key in item}
+        # The decision is per ROW. Taking it once for the batch, from the union
+        # of the rows' keys, meant one row carrying `id` put `id` into every
+        # mapping, so the rows that omitted it bound NULL into a key the
+        # database was supposed to generate.
+        generated_pk_columns = _generated_primary_keys(table)
         pk_names = {column.name.lower() for column in table.primary_key.columns}
-        omit_columns = {
-            colname for colname in schema if colname.lower() in pk_names and colname.lower() not in supplied_keys
-        }
-        if omit_columns and not set(schema) - omit_columns:
-            # A table that is nothing but its primary key: omitting every
-            # column would build empty row mappings, so bind them as before.
-            omit_columns = set()
 
         def prepare_value(value: Any) -> Any:
             """Convert complex Python types to SQL-compatible values."""
@@ -963,26 +989,43 @@ class DatabaseInstanceBase(IInstanceBase, ABC):
                 return value
 
         # Build the list of row dicts, mapping incoming keys to schema column
-        # names with case-insensitive matching.
+        # names with case-insensitive matching. Every rejection happens here,
+        # before the transaction opens, so a batch this node refuses leaves
+        # nothing behind.
         insert_values = []
-        for item in items:
+        for position, item in enumerate(items):
             if not isinstance(item, dict):
                 continue
 
             values: Dict[str, Any] = {}
             if schema:
+                # Case-insensitive key lookup so 'UserName' maps to 'username'.
+                item_lower_keys = {k.lower(): k for k in item.keys()}
+                missing_keys = []
                 for colname in schema.keys():
-                    if colname in omit_columns:
+                    lowered = colname.lower()
+                    original_key = item_lower_keys.get(lowered)
+                    if original_key is not None:
+                        # Supplied, including an explicit None: the caller asked
+                        # for NULL and gets NULL, which stays distinguishable
+                        # from having omitted the key entirely.
+                        values[colname] = prepare_value(item[original_key])
+                    elif lowered in generated_pk_columns:
                         # Database-generated primary key; let the engine supply it.
                         continue
-                    # Case-insensitive key lookup so 'UserName' maps to 'username'.
-                    item_lower_keys = {k.lower(): k for k in item.keys()}
-                    if colname.lower() in item_lower_keys:
-                        original_key = item_lower_keys[colname.lower()]
-                        values[colname] = prepare_value(item[original_key])
+                    elif lowered in pk_names:
+                        # A key the database will NOT generate and the row does
+                        # not carry. Binding NULL would write a row with no
+                        # identity (or fail deep in the driver), so say so.
+                        missing_keys.append(colname)
                     else:
                         # Column in schema but not in data — insert NULL.
                         values[colname] = None
+                if missing_keys:
+                    raise ValueError(
+                        f'Row {position} of the batch for table "{self.IGlobal.table}" does not supply '
+                        f'primary-key column(s) {", ".join(missing_keys)}, which the database does not generate'
+                    )
             else:
                 # No schema cached — insert whatever keys the item provides.
                 for key, raw_value in item.items():
@@ -991,10 +1034,36 @@ class DatabaseInstanceBase(IInstanceBase, ABC):
             insert_values.append(values)
 
         if insert_values:
+            # Rows whose mappings differ are not one executemany any more, so
+            # group CONTIGUOUS rows that share a key set. Contiguous rather than
+            # gathered: a generated id follows insertion order, and reordering
+            # the batch would hand the caller ids in an order their rows never
+            # had. Every run shares one engine.begin(), so the batch stays
+            # all-or-nothing exactly as a single executemany was.
+            runs: List[List[Dict[str, Any]]] = []
+            previous_keys = None
+            for values in insert_values:
+                keys = tuple(values)
+                if keys != previous_keys:
+                    runs.append([])
+                    previous_keys = keys
+                runs[-1].append(values)
+
             try:
                 with self.IGlobal.engine.begin() as conn:
-                    conn.execute(insert(table), insert_values)
-                debug(f"Inserted {len(insert_values)} records into '{self.IGlobal.table}'.")
+                    for run in runs:
+                        if run[0]:
+                            conn.execute(insert(table), run)
+                            continue
+                        # Nothing left to bind: every column of these rows is
+                        # database-generated. Handing the statement no values at
+                        # all lets SQLAlchemy render the dialect's own form
+                        # (`DEFAULT VALUES` on PostgreSQL and SQLite,
+                        # `() VALUES ()` on MySQL) instead of binding NULL into
+                        # a key the database was about to generate.
+                        for _ in run:
+                            conn.execute(insert(table))
+                debug(f"Inserted {len(insert_values)} records into '{self.IGlobal.table}' in {len(runs)} run(s).")
             except Exception as e:
                 # The context manager has already rolled back; re-raise so the
                 # caller can decide how to surface the failure.

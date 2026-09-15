@@ -41,7 +41,8 @@ import re
 import threading
 
 import pytest
-from sqlalchemy import create_engine, event
+from sqlalchemy import MetaData, Table as SQLTable, create_engine, event, insert
+from sqlalchemy.dialects import mysql, postgresql, sqlite
 from sqlalchemy.pool import StaticPool
 
 import ai.common.database.db_global_base as db_global_base_module
@@ -629,30 +630,46 @@ def test_execute_error_does_not_leak_the_statement_or_parameters(instance):
 # ---------------------------------------------------------------------------
 
 
-def _compiled_insert_columns(instance, items):
-    """Return the column names an _insertData batch would actually bind.
+def _captured_inserts(instance, items):
+    """Run an _insertData batch and return every INSERT that reached the driver.
 
-    SQLAlchemy builds the INSERT from the first mapping in the executemany
-    list, so capturing the compiled statement is the only way to assert on the
-    column list rather than on whatever the database happened to tolerate.
+    Each entry is ``(statement, parameters)``. A batch is no longer one
+    statement: rows that share a key set go out together as an executemany,
+    and a row with nothing to bind gets its own default-values statement, so a
+    test that looked only at the first statement would miss what the rest did.
     """
-    captured: list[str] = []
+    captured: list[tuple[str, object]] = []
     engine = instance.IGlobal.engine
 
     def _before_cursor_execute(conn, cursor, statement, parameters, context, executemany):
         if statement.lstrip().upper().startswith('INSERT'):
-            captured.append(statement)
+            captured.append((statement, parameters))
 
     event.listen(engine, 'before_cursor_execute', _before_cursor_execute)
     try:
         instance._insertData(items)
     finally:
         event.remove(engine, 'before_cursor_execute', _before_cursor_execute)
+    return captured
 
-    assert captured, 'no INSERT reached the driver'
-    statement = captured[0]
+
+def _statement_columns(statement):
+    """Return the column names a captured INSERT binds (empty for DEFAULT VALUES)."""
+    if '(' not in statement:
+        return []
     inside = statement[statement.index('(') + 1 : statement.index(')')]
-    return [name.strip().strip('"').strip('`') for name in inside.split(',')]
+    return [name.strip().strip('"').strip('`') for name in inside.split(',') if name.strip()]
+
+
+def _compiled_insert_columns(instance, items):
+    """Return the column names an _insertData batch binds in its first statement.
+
+    Capturing the compiled statement is the only way to assert on the column
+    list rather than on whatever the database happened to tolerate.
+    """
+    captured = _captured_inserts(instance, items)
+    assert captured, 'no INSERT reached the driver'
+    return _statement_columns(captured[0][0])
 
 
 def test_insert_after_refresh_does_not_bind_the_generated_primary_key(instance):
@@ -718,16 +735,190 @@ def test_insert_still_binds_a_primary_key_the_rows_do_supply(instance):
     assert instance.execute({'sql': 'SELECT id FROM widgets'})['rows'] == [{'id': 42}]
 
 
-def test_insert_binds_the_primary_key_when_it_is_the_only_column(instance):
-    """Omitting every column would build empty mappings, so fall back."""
+def test_insert_into_a_generated_only_table_uses_default_values(instance):
+    """A table that is nothing but a generated key takes a default-values insert.
+
+    Binding the sole primary key as NULL (the old fallback) is tolerable only
+    because SQLite treats an integer primary key as a rowid alias. Postgres
+    renders the same column as ``id SERIAL NOT NULL`` and rejects the explicit
+    NULL outright, so the batch that works here would fail there.
+    """
     iglobal = instance.IGlobal
     iglobal.table = 'ids'
 
     instance.execute({'sql': 'CREATE TABLE ids (id INTEGER PRIMARY KEY)'})
     iglobal.schema = {name: (col_type, '') for name, col_type in iglobal._getTableSchema('ids')}
 
-    columns = _compiled_insert_columns(instance, [{'label': 'ignored'}])
-    assert columns == ['id']
+    captured = _captured_inserts(instance, [{'label': 'ignored'}])
+    assert len(captured) == 1
+    statement, parameters = captured[0]
+    assert _statement_columns(statement) == []
+    assert 'DEFAULT VALUES' in statement.upper()
+    assert not parameters
+
+    # A batch of three yields three statements and three distinct keys.
+    captured = _captured_inserts(instance, [{}, {}, {}])
+    assert len(captured) == 3
+    assert all(_statement_columns(stmt) == [] for stmt, _ in captured)
+
+    rows = instance.execute({'sql': 'SELECT id FROM ids ORDER BY id'})['rows']
+    ids = [row['id'] for row in rows]
+    assert len(ids) == 4
+    assert len(set(ids)) == 4
+    assert all(value is not None for value in ids)
+
+
+def test_default_values_insert_compiles_for_postgres_mysql_and_sqlite(instance):
+    """Compile-only: the dialect-correct form of a values-less INSERT.
+
+    There is no live PostgreSQL or MySQL in this suite, so the cross-dialect
+    claim is proven by compilation rather than execution. SQLAlchemy renders
+    ``DEFAULT VALUES`` for PostgreSQL and SQLite and ``() VALUES ()`` for
+    MySQL, which is the whole reason this path hands the statement no values
+    instead of binding NULL itself.
+    """
+    instance.execute({'sql': 'CREATE TABLE ids (id INTEGER PRIMARY KEY)'})
+    table = SQLTable('ids', MetaData(), autoload_with=instance.IGlobal.engine)
+    statement = insert(table)
+
+    assert str(statement.compile(dialect=postgresql.dialect(), column_keys=[])) == (
+        'INSERT INTO ids DEFAULT VALUES RETURNING ids.id'
+    )
+    assert str(statement.compile(dialect=mysql.dialect(), column_keys=[])) == 'INSERT INTO ids () VALUES ()'
+    assert str(statement.compile(dialect=sqlite.dialect(), column_keys=[])) == 'INSERT INTO ids DEFAULT VALUES'
+
+
+def test_insert_rejects_a_sole_primary_key_the_database_does_not_generate(instance):
+    """An empty mapping is only safe when the database really does generate the key."""
+    iglobal = instance.IGlobal
+    iglobal.table = 'codes'
+
+    instance.execute({'sql': 'CREATE TABLE codes (code TEXT PRIMARY KEY)'})
+    iglobal.schema = {name: (col_type, '') for name, col_type in iglobal._getTableSchema('codes')}
+
+    with pytest.raises(ValueError, match='code'):
+        instance._insertData([{'label': 'ignored'}])
+
+    assert instance.execute({'sql': 'SELECT code FROM codes'})['rows'] == []
+
+
+# ---------------------------------------------------------------------------
+# Generated-key presence is decided per row, not per batch
+# ---------------------------------------------------------------------------
+
+
+def test_insert_mixes_supplied_and_generated_keys_within_one_batch(instance):
+    """One row supplying the key must not make every other row bind NULL.
+
+    The decision used to be taken once per batch from the union of the rows'
+    keys, so a single row carrying ``id`` put ``id`` into every mapping and the
+    rows that omitted it bound NULL. SQLite happens to accept that for a rowid
+    alias; Postgres rejects the whole batch for a ``SERIAL NOT NULL`` key.
+    """
+    iglobal = instance.IGlobal
+    iglobal.table = 'widgets'
+
+    instance.execute({'sql': 'CREATE TABLE widgets (id INTEGER PRIMARY KEY, label TEXT)'})
+    iglobal.schema = {name: (col_type, '') for name, col_type in iglobal._getTableSchema('widgets')}
+
+    captured = _captured_inserts(instance, [{'label': 'a'}, {'id': 42, 'label': 'b'}, {'label': 'c'}])
+
+    # Three contiguous runs, two distinct column sets, input order preserved.
+    assert [_statement_columns(stmt) for stmt, _ in captured] == [['label'], ['id', 'label'], ['label']]
+
+    rows = instance.execute({'sql': 'SELECT id, label FROM widgets ORDER BY id'})['rows']
+    assert [row['label'] for row in rows] == ['a', 'b', 'c']
+    assert {row['label']: row['id'] for row in rows}['b'] == 42
+    assert all(row['id'] is not None for row in rows)
+
+
+def test_insert_binds_an_explicit_null_primary_key_the_caller_supplied(instance):
+    """Omitted and explicitly NULL stay distinguishable.
+
+    A caller that writes ``{'id': None}`` asked for NULL and gets NULL bound;
+    SQLite turns that into a fresh rowid. (Postgres will reject it for a SERIAL
+    column -- that is the caller's choice, not a silent rewrite by this code.)
+    """
+    iglobal = instance.IGlobal
+    iglobal.table = 'widgets'
+
+    instance.execute({'sql': 'CREATE TABLE widgets (id INTEGER PRIMARY KEY, label TEXT)'})
+    iglobal.schema = {name: (col_type, '') for name, col_type in iglobal._getTableSchema('widgets')}
+
+    captured = _captured_inserts(instance, [{'id': None, 'label': 'a'}])
+    assert len(captured) == 1
+    statement, parameters = captured[0]
+    assert _statement_columns(statement) == ['id', 'label']
+    assert list(parameters) == [None, 'a']
+
+    assert instance.execute({'sql': 'SELECT label FROM widgets'})['rows'] == [{'label': 'a'}]
+
+
+def test_insert_rejects_a_composite_primary_key_column_the_row_omits(instance):
+    """A composite key is not auto-generated, so a missing half is a clear error."""
+    iglobal = instance.IGlobal
+    iglobal.table = 'pairs'
+
+    instance.execute({'sql': 'CREATE TABLE pairs (a INTEGER, b INTEGER, PRIMARY KEY (a, b))'})
+    iglobal.schema = {name: (col_type, '') for name, col_type in iglobal._getTableSchema('pairs')}
+
+    with pytest.raises(ValueError) as excinfo:
+        instance._insertData([{'a': 1, 'b': 2}, {'a': 3}])
+
+    message = str(excinfo.value)
+    assert 'b' in message
+    assert 'pairs' in message
+    assert '1' in message  # the row position
+
+    # Nothing was executed: the rejection happens before the transaction opens.
+    assert instance.execute({'sql': 'SELECT a FROM pairs'})['rows'] == []
+
+
+def test_insert_rejects_a_text_primary_key_without_a_default(instance):
+    """A TEXT primary key with no default is not something the database fills in."""
+    iglobal = instance.IGlobal
+    iglobal.table = 'codes'
+
+    instance.execute({'sql': 'CREATE TABLE codes (code TEXT PRIMARY KEY, label TEXT)'})
+    iglobal.schema = {name: (col_type, '') for name, col_type in iglobal._getTableSchema('codes')}
+
+    with pytest.raises(ValueError, match='code'):
+        instance._insertData([{'label': 'a'}])
+
+
+def test_insert_lets_a_server_default_primary_key_generate_itself(instance):
+    """A reflected server_default counts as generated even on a TEXT key."""
+    iglobal = instance.IGlobal
+    iglobal.table = 'codes'
+
+    instance.execute({'sql': "CREATE TABLE codes (code TEXT PRIMARY KEY DEFAULT 'generated', label TEXT)"})
+    iglobal.schema = {name: (col_type, '') for name, col_type in iglobal._getTableSchema('codes')}
+
+    columns = _compiled_insert_columns(instance, [{'label': 'a'}])
+    assert columns == ['label']
+    assert instance.execute({'sql': 'SELECT code, label FROM codes'})['rows'] == [{'code': 'generated', 'label': 'a'}]
+
+
+def test_a_failing_run_rolls_back_the_rows_of_every_other_run(instance):
+    """Splitting a batch into runs must not split its transaction.
+
+    All the runs share one engine.begin(), so a constraint violation in the
+    second discards the first as well -- the all-or-nothing semantics a single
+    executemany used to give for free.
+    """
+    iglobal = instance.IGlobal
+    iglobal.table = 'widgets'
+
+    instance.execute({'sql': 'CREATE TABLE widgets (id INTEGER PRIMARY KEY, label TEXT UNIQUE)'})
+    instance.execute({'sql': "INSERT INTO widgets (id, label) VALUES (1, 'taken')"})
+    iglobal.schema = {name: (col_type, '') for name, col_type in iglobal._getTableSchema('widgets')}
+
+    with pytest.raises(Exception):  # noqa: B017 - the driver's IntegrityError, whatever it is called
+        instance._insertData([{'label': 'fresh'}, {'id': 9, 'label': 'taken'}])
+
+    # The first run's row must not survive the second run's failure.
+    rows = instance.execute({'sql': 'SELECT label FROM widgets ORDER BY label'})['rows']
+    assert rows == [{'label': 'taken'}]
 
 
 # ---------------------------------------------------------------------------
