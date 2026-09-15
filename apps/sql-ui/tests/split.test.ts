@@ -34,7 +34,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import type { SqlDialect } from '../src/connect';
-import { hasTopLevelKeyword, splitStatements, splitStatementsIn, statementAtOffset, stripSqlComments } from '../src/sql/split';
+import { firstNestedKeyword, hasNestedKeyword, hasTopLevelKeyword, splitStatements, splitStatementsIn, statementAtOffset, stripSqlComments } from '../src/sql/split';
 
 // =============================================================================
 // HELPERS
@@ -420,6 +420,94 @@ describe('hasTopLevelKeyword', () => {
 
 	it('does not match a WHERE inside a longer word', () => {
 		assert.equal(hasTopLevelKeyword('UPDATE t SET wherewithal = 1', 'where', 'unknown'), false);
+	});
+});
+
+// =============================================================================
+// NESTED KEYWORD SEARCH
+// =============================================================================
+//
+// The mirror of the top-level search, and the pattern check's only way to see
+// a data-modifying CTE: `WITH gone AS (DELETE ...)` puts the verb at depth 1,
+// where the top-level search is blind to it by design.
+// =============================================================================
+
+describe('hasNestedKeyword', () => {
+	it('is false for a keyword that only occurs at depth 0', () => {
+		assert.equal(hasNestedKeyword('DELETE FROM t WHERE id = 1', 'delete', 'unknown'), false);
+	});
+
+	it('is true for a keyword inside parentheses', () => {
+		assert.equal(hasNestedKeyword('WITH g AS (DELETE FROM t RETURNING *) SELECT 1', 'delete', 'unknown'), true);
+	});
+
+	it('is true for a keyword nested several levels deep', () => {
+		assert.equal(hasNestedKeyword('SELECT (SELECT (SELECT 1) FROM (SELECT 1 WHERE x) u)', 'where', 'unknown'), true);
+	});
+
+	it('ignores a keyword inside a string literal', () => {
+		assert.equal(hasNestedKeyword("SELECT ('delete me') AS t", 'delete', 'unknown'), false);
+	});
+
+	it('ignores a keyword inside a comment', () => {
+		assert.equal(hasNestedKeyword('SELECT (1 /* delete */) AS t', 'delete', 'unknown'), false);
+	});
+
+	it('ignores a keyword inside a quoted identifier', () => {
+		assert.equal(hasNestedKeyword('SELECT ("delete") FROM t', 'delete', 'postgres'), false);
+	});
+
+	it('does not match a keyword inside a longer word', () => {
+		assert.equal(hasNestedKeyword('SELECT (deleted_at) FROM t', 'delete', 'unknown'), false);
+	});
+
+	it('is true when the keyword occurs at both depths', () => {
+		assert.equal(hasNestedKeyword('DELETE FROM t WHERE id IN (SELECT id FROM u WHERE x)', 'where', 'unknown'), true);
+	});
+
+	it('leaves the top-level search unchanged on the same statements', () => {
+		// Both searches read the same scan; neither answers the other's question.
+		assert.equal(hasTopLevelKeyword('WITH g AS (DELETE FROM t RETURNING *) SELECT 1', 'delete', 'unknown'), false);
+		assert.equal(hasTopLevelKeyword('WITH g AS (SELECT 1) DELETE FROM t', 'delete', 'unknown'), true);
+		assert.equal(hasNestedKeyword('WITH g AS (SELECT 1) DELETE FROM t', 'delete', 'unknown'), false);
+	});
+});
+
+describe('firstNestedKeyword', () => {
+	it('returns null when none of the keywords is nested', () => {
+		assert.equal(firstNestedKeyword('WITH g AS (SELECT 1) DELETE FROM t', ['update', 'delete'], 'unknown'), null);
+	});
+
+	it('returns the only nested keyword', () => {
+		assert.equal(
+			firstNestedKeyword('WITH g AS (DELETE FROM t RETURNING *) SELECT 1', ['update', 'delete'], 'unknown'),
+			'delete',
+		);
+	});
+
+	it('returns the one that occurs first in text order, not in argument order', () => {
+		assert.equal(
+			firstNestedKeyword('WITH u AS (UPDATE a SET x = 1), d AS (DELETE FROM b) SELECT 1', ['delete', 'update'], 'unknown'),
+			'update',
+		);
+		assert.equal(
+			firstNestedKeyword('WITH d AS (DELETE FROM b), u AS (UPDATE a SET x = 1) SELECT 1', ['update', 'delete'], 'unknown'),
+			'delete',
+		);
+	});
+
+	it('does not let an occurrence in a literal decide the order', () => {
+		assert.equal(
+			firstNestedKeyword("WITH n AS (SELECT 'delete' AS t), u AS (UPDATE a SET x = 1) SELECT 1", ['update', 'delete'], 'unknown'),
+			'update',
+		);
+	});
+
+	it('ignores an occurrence at depth 0', () => {
+		assert.equal(
+			firstNestedKeyword('UPDATE a SET x = (SELECT 1 FROM b WHERE y)', ['update'], 'unknown'),
+			null,
+		);
 	});
 });
 

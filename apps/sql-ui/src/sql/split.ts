@@ -405,6 +405,45 @@ export function stripSqlComments(sql: string, dialect: SqlDialect = 'unknown'): 
 	return out;
 }
 
+/** One whole-word keyword occurrence in code. */
+interface IKeywordHit {
+	/** Offset of the occurrence in the masked text. */
+	index: number;
+	/** Parenthesis depth, counted in code only, at that offset. */
+	depth: number;
+}
+
+/**
+ * Every whole-word occurrence of `keyword` in masked code, with its depth.
+ *
+ * The one place that pairs a keyword with a parenthesis depth, so the
+ * top-level and nested searches cannot drift apart. The depth is carried along
+ * a single left-to-right pass rather than recounted per match, and the mask has
+ * already blanked literals, quoted identifiers and comments, so a `(` in quoted
+ * text cannot move it.
+ *
+ * @param masked - Code-only text from {@link maskNonCode}.
+ * @param keyword - The keyword to look for (case-insensitive).
+ * @returns The occurrences, in text order.
+ */
+function keywordHits(masked: string, keyword: string): IKeywordHit[] {
+	const needle = new RegExp(`\\b${keyword}\\b`, 'gi');
+	const hits: IKeywordHit[] = [];
+	let depth = 0;
+	let scanned = 0;
+	let match = needle.exec(masked);
+	while (match) {
+		for (; scanned < match.index; scanned++) {
+			const ch = masked[scanned];
+			if (ch === '(') depth += 1;
+			else if (ch === ')') depth = Math.max(0, depth - 1);
+		}
+		hits.push({ index: match.index, depth });
+		match = needle.exec(masked);
+	}
+	return hits;
+}
+
 /**
  * Whether `keyword` appears as a whole word in CODE at parenthesis depth 0.
  *
@@ -418,21 +457,53 @@ export function stripSqlComments(sql: string, dialect: SqlDialect = 'unknown'): 
  * @returns True when the keyword occurs unquoted, uncommented, outside parens.
  */
 export function hasTopLevelKeyword(sql: string, keyword: string, dialect: SqlDialect = 'unknown'): boolean {
+	return keywordHits(maskNonCode(sql, traitsFor(dialect)), keyword).some((hit) => hit.depth === 0);
+}
+
+/**
+ * Whether `keyword` appears as a whole word in CODE at parenthesis depth >= 1.
+ *
+ * The mirror of {@link hasTopLevelKeyword}, and the pattern check's only way to
+ * see a data-modifying CTE: `WITH gone AS (DELETE FROM t RETURNING *)` puts the
+ * verb inside the clause's parentheses, where the top-level search is blind to
+ * it by design. Neither function answers the other's question — a keyword can
+ * occur at both depths, or at neither.
+ *
+ * @param sql - The statement.
+ * @param keyword - The keyword to look for (case-insensitive).
+ * @param dialect - The engine dialect.
+ * @returns True when the keyword occurs in code inside parentheses.
+ */
+export function hasNestedKeyword(sql: string, keyword: string, dialect: SqlDialect = 'unknown'): boolean {
+	return keywordHits(maskNonCode(sql, traitsFor(dialect)), keyword).some((hit) => hit.depth > 0);
+}
+
+/**
+ * Whichever of `keywords` occurs FIRST in code inside parentheses.
+ *
+ * A caller naming a nested keyword needs the winner by text position, not by
+ * argument order: one statement can hold several data-modifying CTEs, and the
+ * finding has to name the one the reader's eye reaches first. The order is
+ * decided on masked text, so an earlier occurrence inside a literal or a
+ * comment cannot win it.
+ *
+ * @param sql - The statement.
+ * @param keywords - The keywords to look for (case-insensitive).
+ * @param dialect - The engine dialect.
+ * @returns The winning keyword, spelled as it was passed in, or null when none
+ *          of them is nested.
+ */
+export function firstNestedKeyword(sql: string, keywords: string[], dialect: SqlDialect = 'unknown'): string | null {
 	const masked = maskNonCode(sql, traitsFor(dialect));
-	const needle = new RegExp(`\\b${keyword}\\b`, 'gi');
-	let match = needle.exec(masked);
-	while (match) {
-		// Parenthesis depth at the match: everything before it, in code only.
-		let depth = 0;
-		for (let i = 0; i < match.index; i++) {
-			const ch = masked[i];
-			if (ch === '(') depth += 1;
-			else if (ch === ')') depth = Math.max(0, depth - 1);
-		}
-		if (depth === 0) return true;
-		match = needle.exec(masked);
+	let best: IKeywordHit | null = null;
+	let winner: string | null = null;
+	for (const keyword of keywords) {
+		const hit = keywordHits(masked, keyword).find((candidate) => candidate.depth > 0);
+		if (!hit || (best !== null && hit.index >= best.index)) continue;
+		best = hit;
+		winner = keyword;
 	}
-	return false;
+	return winner;
 }
 
 /**

@@ -158,6 +158,15 @@ or `ALTER`, the app asks: `Pattern check: <kind> detected. This is a text
 check, not a database safeguard.` Confirm with **Run statement**, or **Run
 and stop asking on this connection**.
 
+A statement that begins with `WITH` is checked on the verb the chain
+carries: `WITH audit AS (SELECT id FROM orders) DELETE FROM orders` deletes
+every row and is asked about like any other `DELETE` with no `WHERE`. An
+`UPDATE` or `DELETE` inside the `WITH` clause itself is reported as `DELETE
+inside a WITH clause` instead, with no verdict on its `WHERE`, because the
+text check cannot tell what a `WHERE` inside the clause applies to. When
+both apply, the outer statement is the one named. `INSERT` is never flagged,
+inside a clause or out.
+
 Read that sentence literally. The check reads the statement text; it never
 consults the database, does not know what a `WHERE` clause actually matches,
 and prevents nothing. It is not called a safe mode anywhere, and when it is

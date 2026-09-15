@@ -33,17 +33,23 @@
 //   read-only is not a read. `EXPLAIN ANALYZE` really executes its inner
 //   statement, so it is classified by that statement, not as a read.
 //
-//   `patternCheck` — whether the statement matches one of the four shapes the
+//   `patternCheck` — whether the statement matches one of the shapes the
 //   confirmation dialog asks about. This is a TEXT CHECK, not a database
-//   safeguard, and the UI says exactly that. It reads the leading keyword and,
-//   for UPDATE/DELETE, looks for a WHERE in code at parenthesis depth 0. It
+//   safeguard, and the UI says exactly that. It reads the leading keyword —
+//   or, for a `WITH` chain, the verb the chain carries at parenthesis depth 0
+//   — and for UPDATE/DELETE looks for a WHERE at that same depth. It
 //   therefore flags a DELETE whose only WHERE sits inside a subquery (a false
 //   positive that costs one extra confirmation) and cannot see anything the
 //   database would do with triggers, rules, or cascading constraints.
+//
+//   The two judgements must agree about `WITH`: `classifyStatement` calls
+//   `WITH gone AS (DELETE ...)` a write, so the pattern check has to see that
+//   delete too — at depth >= 1, where it is reported as a mutation inside the
+//   clause rather than as an unbounded one.
 // =============================================================================
 
 import type { SqlDialect } from '../connect';
-import { hasTopLevelKeyword, stripSqlComments } from './split';
+import { firstNestedKeyword, hasTopLevelKeyword, stripSqlComments } from './split';
 
 // =============================================================================
 // TYPES
@@ -97,6 +103,13 @@ const EXPLAIN_PREFIX = /^explain\s*(?:\([^)]*\)\s*)?(?:(?:analyz[se]|verbose|ext
 
 /** Data-modifying keywords that can appear inside a CTE chain. */
 const CTE_WRITE = /\b(insert|update|delete|merge|replace)\b/i;
+
+/**
+ * The CTE mutations the pattern check names. INSERT/MERGE/REPLACE are absent
+ * on purpose: a top-level INSERT is not confirmed either, and one inside a
+ * clause is no more destructive than one outside it.
+ */
+const CTE_MUTATIONS = ['update', 'delete'];
 
 // =============================================================================
 // HELPERS
@@ -158,14 +171,29 @@ export function classifyStatement(sql: string, dialect: SqlDialect = 'unknown'):
 // =============================================================================
 
 /**
- * Look for the four statement shapes the confirmation dialog asks about:
- * UPDATE or DELETE with no top-level WHERE, TRUNCATE, DROP, ALTER.
+ * Look for the statement shapes the confirmation dialog asks about: UPDATE or
+ * DELETE with no top-level WHERE, an UPDATE or DELETE inside a WITH clause,
+ * TRUNCATE, DROP, ALTER.
+ *
+ * A `WITH` chain is read at two depths, because PostgreSQL lets either one
+ * carry a write. The statement AFTER the chain sits at parenthesis depth 0 and
+ * is judged exactly like a bare UPDATE/DELETE. A mutation INSIDE a CTE body
+ * sits at depth >= 1 and is reported as `<VERB> inside a WITH clause` — never
+ * as "without WHERE", because a WHERE at that depth cannot be attributed to
+ * that verb by a text check. The outer finding is the more specific one and
+ * wins when both apply. INSERT, MERGE and REPLACE inside a CTE are not
+ * flagged, for parity with a top-level INSERT, which is not flagged either.
  *
  * LIMITS, stated plainly because the dialog does too:
  * - A WHERE inside a string literal or a comment does not count (correct).
  * - A WHERE that exists only inside a subquery or a `USING (...)` clause does
  *   not count either, so such a statement is flagged (extra confirmation).
  * - A WHERE clause that matches every row (`WHERE 1=1`) passes the check.
+ * - In a WITH-led statement any whole-word `update`/`delete` in code at depth 0
+ *   is taken for the verb, so `WITH a AS (...) SELECT ... FOR UPDATE` — a
+ *   locking clause, not a write — is flagged (another extra confirmation).
+ * - When a chain holds several CTE mutations only the first one in text order
+ *   is named; the rest are not listed.
  * - Nothing here knows what the database will do with triggers or cascades.
  *
  * @param sql - One statement.
@@ -180,8 +208,23 @@ export function patternCheck(sql: string, dialect: SqlDialect = 'unknown'): IPat
 	if (/^drop\b/i.test(head)) return { kind: 'DROP' };
 	if (/^alter\b/i.test(head)) return { kind: 'ALTER' };
 
-	const verb = /^update\b/i.test(head) ? 'UPDATE' : /^delete\b/i.test(head) ? 'DELETE' : null;
-	if (!verb) return null;
-	if (hasTopLevelKeyword(head, 'where', dialect)) return null;
-	return { kind: `${verb} without WHERE` };
+	// A `WITH` chain can carry the data-modifying verb itself, and `^` anchors
+	// cannot see past it; `hasTopLevelKeyword` reads it at parenthesis depth 0.
+	const leadsWith = /^with\b/i.test(head);
+	const verb = /^update\b/i.test(head) || (leadsWith && hasTopLevelKeyword(head, 'update', dialect))
+		? 'UPDATE'
+		: /^delete\b/i.test(head) || (leadsWith && hasTopLevelKeyword(head, 'delete', dialect))
+			? 'DELETE'
+			: null;
+	// Every CTE body is parenthesised, so in a WITH-led statement a WHERE in
+	// code at depth 0 belongs to the main statement and to nothing else.
+	if (verb && !hasTopLevelKeyword(head, 'where', dialect)) return { kind: `${verb} without WHERE` };
+
+	// The outer statement is bounded, or there is none. A CTE body can still
+	// empty a table on its own, and the outer WHERE does not reach inside it.
+	if (leadsWith) {
+		const nested = firstNestedKeyword(head, CTE_MUTATIONS, dialect);
+		if (nested) return { kind: `${nested.toUpperCase()} inside a WITH clause` };
+	}
+	return null;
 }
