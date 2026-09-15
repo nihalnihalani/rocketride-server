@@ -35,6 +35,7 @@
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import type { SqlDialect } from '../src/connect';
 import type { StatementKind } from '../src/sql/classify';
 import { classifyStatement, patternCheck } from '../src/sql/classify';
 
@@ -48,6 +49,8 @@ interface IKindCase {
 	sql: string;
 	/** The kind it must be reported as. */
 	kind: StatementKind;
+	/** Dialect to classify with; the default covers most cases. */
+	dialect?: SqlDialect;
 }
 
 const KIND_CASES: IKindCase[] = [
@@ -58,6 +61,13 @@ const KIND_CASES: IKindCase[] = [
 	{ sql: '-- a note\nSELECT 1', kind: 'read' },
 	{ sql: '/* lead */ SELECT 1', kind: 'read' },
 	{ sql: 'WITH recent AS (SELECT * FROM orders) SELECT * FROM recent', kind: 'read' },
+	// A WITH chain is judged on CODE: a verb inside a literal, a dollar-quoted
+	// body or a quoted identifier is not a write. `"delete"` is the one that
+	// turns up in practice, since the word has to be quoted to be a table.
+	{ sql: "WITH d AS (SELECT 'delete me' AS t) SELECT * FROM d", kind: 'read' },
+	{ sql: 'WITH d AS (SELECT 1) SELECT * FROM "delete"', kind: 'read' },
+	{ sql: 'WITH d AS (SELECT $$delete from orders$$ AS t) SELECT 1', kind: 'read', dialect: 'postgres' },
+	{ sql: 'WITH d AS (SELECT 1) SELECT * FROM `delete`', kind: 'read', dialect: 'mysql' },
 	{ sql: 'SHOW TABLES', kind: 'read' },
 	{ sql: 'SHOW CREATE TABLE orders', kind: 'read' },
 	{ sql: 'EXPLAIN SELECT * FROM orders', kind: 'read' },
@@ -80,6 +90,9 @@ const KIND_CASES: IKindCase[] = [
 	{ sql: 'MERGE INTO orders USING staging ON (1=1)', kind: 'write' },
 	{ sql: 'TRUNCATE TABLE orders', kind: 'write' },
 	{ sql: 'WITH gone AS (DELETE FROM orders RETURNING *) SELECT * FROM gone', kind: 'write' },
+	// Conservative on purpose: `update` here is real code at depth 0, even
+	// though FOR UPDATE only locks. Over-classifying costs a retry, not data.
+	{ sql: 'WITH a AS (SELECT 1) SELECT * FROM a FOR UPDATE', kind: 'write' },
 
 	// DDL.
 	{ sql: 'CREATE TABLE t (id INT)', kind: 'ddl' },
@@ -113,7 +126,7 @@ const KIND_CASES: IKindCase[] = [
 describe('classifyStatement', () => {
 	for (const testCase of KIND_CASES) {
 		it(`${JSON.stringify(testCase.sql)} -> ${testCase.kind}`, () => {
-			assert.equal(classifyStatement(testCase.sql), testCase.kind);
+			assert.equal(classifyStatement(testCase.sql, testCase.dialect), testCase.kind);
 		});
 	}
 
@@ -123,6 +136,21 @@ describe('classifyStatement', () => {
 
 	it('does not match a keyword inside a longer word', () => {
 		assert.equal(classifyStatement('SELECT deleted_at FROM orders'), 'read');
+	});
+
+	it('agrees with the pattern check about read-only WITH chains', () => {
+		// The two judgements disagreeing is what this whole review round is
+		// about: one said write while the other said there was nothing to
+		// confirm. On a read-only chain both must be quiet.
+		const chains: [string, SqlDialect][] = [
+			["WITH d AS (SELECT 'delete me' AS t) SELECT * FROM d", 'unknown'],
+			['WITH d AS (SELECT 1) SELECT * FROM "delete"', 'unknown'],
+			['WITH d AS (SELECT $$delete from orders$$ AS t) SELECT 1', 'postgres'],
+		];
+		for (const [sql, dialect] of chains) {
+			assert.equal(classifyStatement(sql, dialect), 'read', sql);
+			assert.equal(patternCheck(sql, dialect), null, sql);
+		}
 	});
 });
 

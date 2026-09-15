@@ -195,6 +195,31 @@ describe('applyRowLimit', () => {
 		assert.equal(applyRowLimit('WITH r AS (SELECT 1) SELECT * FROM r', '200').limit, 200);
 	});
 
+	it('limits a WITH chain whose only verb is quoted or in a literal', () => {
+		// The row-limit rule reads the same masked text the classification
+		// does; if it drifts, a read silently returns every row under a meta
+		// line that says a limit was applied elsewhere.
+		assert.equal(applyRowLimit('WITH d AS (SELECT 1) SELECT * FROM "delete"', '1000', 'postgres').state, 'applied');
+		assert.equal(applyRowLimit("WITH d AS (SELECT 'delete me' AS t) SELECT * FROM d", '1000').state, 'applied');
+		assert.equal(applyRowLimit('WITH d AS (SELECT $$delete from orders$$ AS t) SELECT 1', '1000', 'postgres').state, 'applied');
+	});
+
+	it('still appends nothing to a data-modifying WITH chain', () => {
+		// Appending LIMIT there is invalid SQL, so this stays as it was.
+		assert.deepEqual(applyRowLimit('WITH gone AS (DELETE FROM orders RETURNING *) SELECT * FROM gone', '200'), {
+			sql: 'WITH gone AS (DELETE FROM orders RETURNING *) SELECT * FROM gone',
+			limit: null,
+			state: 'none',
+		});
+	});
+
+	it('does not read a LIMIT inside a literal or a quoted identifier', () => {
+		// These already held — the in-statement test has always read masked
+		// text — and are pinned so the masking cannot be dropped from it.
+		assert.equal(applyRowLimit("SELECT 'limit 5' FROM t", '1000').state, 'applied');
+		assert.equal(applyRowLimit('SELECT * FROM "limit"', '1000', 'postgres').state, 'applied');
+	});
+
 	it('leaves a data-modifying WITH chain alone', () => {
 		assert.equal(applyRowLimit('WITH gone AS (DELETE FROM t RETURNING *) SELECT * FROM gone', '200').limit, null);
 	});

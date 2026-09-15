@@ -38,7 +38,8 @@
 
 import type { SqlDialect } from '../connect';
 import type { StatementKind } from './classify';
-import { hasTopLevelKeyword, stripSqlComments } from './split';
+import { CTE_WRITE_WORDS } from './classify';
+import { hasTopLevelKeyword, keywordSites, stripSqlComments } from './split';
 
 // =============================================================================
 // TYPES
@@ -263,7 +264,9 @@ export function formatRunLabel(run: IStatementRun): string {
 /**
  * Row-returning statements: SELECT, a parenthesised set expression, and
  * read-only WITH chains. A data-modifying CTE (`WITH ... INSERT/UPDATE/DELETE`)
- * is NOT one — appending LIMIT there is invalid SQL.
+ * is NOT one — appending LIMIT there is invalid SQL. Whether a chain modifies
+ * is decided on code, by {@link CTE_WRITE_WORDS}, exactly as the statement's
+ * kind is.
  */
 const RETURNS_ROWS = /^select\b/i;
 
@@ -294,9 +297,13 @@ export type LimitState = 'applied' | 'in-statement' | 'none';
 export function applyRowLimit(sql: string, limit: string, dialect: SqlDialect = 'unknown'): { sql: string; limit: number | null; state: LimitState } {
 	const stripped = stripSqlComments(sql, dialect).replace(/;\s*$/, '').trim();
 	const bare = stripped.replace(/^[\s(]+/, '');
+	// The WITH test reads the same masked text and the same word list as
+	// `classifyStatement`, so the two cannot disagree about whether a chain
+	// writes: a `delete` inside a literal or a quoted identifier is not a
+	// mutation, and such a chain gets the header's limit like any other read.
 	const returnsRows = RETURNS_ROWS.test(bare)
 		|| stripped.startsWith('(')
-		|| (/^with\b/i.test(bare) && !/\b(insert|update|delete|merge|replace)\b/i.test(bare));
+		|| (/^with\b/i.test(bare) && keywordSites(bare, CTE_WRITE_WORDS, dialect).length === 0);
 	// Checked BEFORE the header selection, so `All` on a statement that limits
 	// itself still reports the statement's limit instead of claiming none.
 	// Only a LIMIT that bounds the OUTERMOST query counts: one inside a

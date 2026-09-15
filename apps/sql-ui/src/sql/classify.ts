@@ -103,8 +103,14 @@ const TX_SET = /^set\s+(?:session\s+|global\s+|local\s+)?(?:autocommit|transacti
  */
 const EXPLAIN_PREFIX = /^explain\s*(?:\([^)]*\)\s*)?(?:(?:analyz[se]|verbose|extended|partitions|costs|buffers|settings|summary|timing|wal|format\s*=?\s*\w+)\s+)*/i;
 
-/** Data-modifying keywords that can appear inside a CTE chain. */
-const CTE_WRITE = /\b(insert|update|delete|merge|replace)\b/i;
+/**
+ * Data-modifying keywords that can appear inside a CTE chain.
+ *
+ * Exported because the row-limit rule in `batch.ts` asks the same question
+ * about the same words, and the two drifting apart is how a read ends up
+ * unbounded under a meta line that says otherwise.
+ */
+export const CTE_WRITE_WORDS = ['insert', 'update', 'delete', 'merge', 'replace'];
 
 /**
  * Keywords that can lead a statement, whether it is the one a `WITH` chain
@@ -178,10 +184,19 @@ function namesCte(head: string, site: IKeywordSite): boolean {
  * Classify a single statement by its leading keyword.
  *
  * A `WITH` chain is a read only when no data-modifying keyword appears
- * anywhere in it — a deliberately blunt rule, since `WITH gone AS (DELETE ...)`
- * must never be treated as read-only. The cost is that a CTE containing the
- * bare word `delete` in code (not in a literal, which is not visible here
- * either way) is over-classified as a write, which is the safe direction.
+ * anywhere in its CODE — a deliberately blunt rule, since
+ * `WITH gone AS (DELETE ...)` must never be treated as read-only. The cost is
+ * that the bare word `delete` anywhere in code, at any depth, is enough to
+ * call the chain a write: `... SELECT * FROM a FOR UPDATE` is over-classified,
+ * which is the safe direction.
+ *
+ * Code is the operative word. The decision reads the same masked text the
+ * pattern check reads, so a verb inside a string literal, a dollar-quoted body
+ * or a quoted identifier is not a write — `SELECT * FROM "delete"` is a read,
+ * and the word has to be quoted there because it is reserved. Judging that on
+ * raw text made the failure banner say "already committed" about a SELECT,
+ * labelled it `committed` in the strip, and spent the read's one stale-token
+ * retry.
  *
  * @param sql - One statement (no terminator needed).
  * @param dialect - The engine dialect; decides comment syntax.
@@ -205,7 +220,7 @@ export function classifyStatement(sql: string, dialect: SqlDialect = 'unknown'):
 	if (READ_LEADERS.test(head)) return 'read';
 	if (WRITE_LEADERS.test(head)) return 'write';
 	if (DDL_LEADERS.test(head)) return 'ddl';
-	if (/^with\b/i.test(head)) return CTE_WRITE.test(head) ? 'write' : 'read';
+	if (/^with\b/i.test(head)) return keywordSites(head, CTE_WRITE_WORDS, dialect).length > 0 ? 'write' : 'read';
 	return 'other';
 }
 
