@@ -121,7 +121,25 @@ function traitsFor(dialect: SqlDialect): IScanTraits {
 // =============================================================================
 
 /**
+ * A character that may appear inside an unquoted PostgreSQL identifier.
+ *
+ * Per "Lexical Structure": identifiers "must begin with a letter (a-z, but
+ * also letters with diacritical marks and non-Latin letters) or an underscore
+ * (_)", and may continue with "letters, underscores, digits (0-9), or dollar
+ * signs ($)". Which non-ASCII characters count as letters depends on the
+ * server's encoding and locale, and the backend simply treats any byte >= 0x80
+ * as an identifier character; `-￿` is that rule in UTF-16, with no
+ * `u` flag so an astral character still matches through its surrogates.
+ */
+const IDENTIFIER_CHAR = /[A-Za-z0-9_$-￿]/;
+
+/**
  * Whether the quote at `open` is preceded by PostgreSQL's `E` string prefix.
+ *
+ * The `e` only counts as the prefix when it stands alone: in `Straße'x'` it
+ * is the last letter of an identifier, and reading that literal as an escape
+ * string would let a backslash swallow its closing quote — and with it the
+ * separator behind it.
  *
  * @param sql - The buffer.
  * @param open - Offset of the opening single quote.
@@ -131,7 +149,7 @@ function isEscapeStringPrefix(sql: string, open: number): boolean {
 	const prev = sql[open - 1];
 	if (prev !== 'e' && prev !== 'E') return false;
 	const before = sql[open - 2];
-	return before === undefined || !/[A-Za-z0-9_$]/.test(before);
+	return before === undefined || !IDENTIFIER_CHAR.test(before);
 }
 
 /**
@@ -195,7 +213,8 @@ function opensDashComment(sql: string, open: number, traits: IScanTraits): boole
  *
  * PostgreSQL allows `$` inside an unquoted identifier, so `SELECT foo$tag$`
  * is one identifier and opens nothing; treating it as a quote would swallow
- * the separator that follows it.
+ * the separator that follows it. `café$tag$` is the same identifier shape, so
+ * this reads the same character class the tag rule does.
  *
  * @param sql - The buffer.
  * @param open - Offset of the `$`.
@@ -203,7 +222,7 @@ function opensDashComment(sql: string, open: number, traits: IScanTraits): boole
  */
 function continuesIdentifier(sql: string, open: number): boolean {
 	const prev = sql[open - 1];
-	return prev !== undefined && /[A-Za-z0-9_$]/.test(prev);
+	return prev !== undefined && IDENTIFIER_CHAR.test(prev);
 }
 
 /**
@@ -248,8 +267,17 @@ function skipBlockComment(sql: string, open: number, nested: boolean): number {
 	return n;
 }
 
-/** A dollar-quote opener: `$$` or `$tag$` with an identifier-shaped tag. */
-const DOLLAR_TAG = /^\$([A-Za-z_][A-Za-z0-9_]*)?\$/;
+/**
+ * A dollar-quote opener: `$$` or `$tag$` with an identifier-shaped tag.
+ *
+ * PostgreSQL: the tag "follows the same rules as an unquoted identifier,
+ * except that it cannot contain a dollar sign" — hence {@link IDENTIFIER_CHAR}
+ * minus the `$`, and a first character that is not a digit, which is what
+ * keeps the positional parameter in `$1abc$` from opening a quote. Tags are
+ * case sensitive, so `$Tag$` is not closed by `$tag$`; matching is by exact
+ * text and needs no rule of its own.
+ */
+const DOLLAR_TAG = /^\$([A-Za-z_-￿][A-Za-z0-9_-￿]*)?\$/;
 
 /**
  * Skip a PostgreSQL dollar-quoted body. Returns `open` unchanged when the `$`

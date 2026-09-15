@@ -240,6 +240,75 @@ const CASES: ISplitCase[] = [
 		expect: ['SELECT $$ a', 'b $$', 'SELECT 2'],
 	},
 	{
+		// PostgreSQL: a dollar-quote tag "follows the same rules as an
+		// unquoted identifier", and an identifier may begin with "letters
+		// with diacritical marks and non-Latin letters".
+		name: 'postgres dollar-quote tag with a diacritic',
+		sql: 'DO $caf\u00e9$ BEGIN PERFORM 1; END $caf\u00e9$; SELECT 2',
+		dialect: 'postgres',
+		expect: ['DO $caf\u00e9$ BEGIN PERFORM 1; END $caf\u00e9$', 'SELECT 2'],
+	},
+	{
+		name: 'postgres dollar-quote tag in a non-Latin script',
+		sql: 'DO $\u0442\u0435\u0433$ BEGIN PERFORM 1; END $\u0442\u0435\u0433$; SELECT 2',
+		dialect: 'postgres',
+		expect: ['DO $\u0442\u0435\u0433$ BEGIN PERFORM 1; END $\u0442\u0435\u0433$', 'SELECT 2'],
+	},
+	{
+		name: 'postgres dollar-quote tag in CJK',
+		sql: 'DO $\u6807\u7b7e$ SELECT 1; SELECT 2 $\u6807\u7b7e$; SELECT 3',
+		dialect: 'postgres',
+		expect: ['DO $\u6807\u7b7e$ SELECT 1; SELECT 2 $\u6807\u7b7e$', 'SELECT 3'],
+	},
+	{
+		// Outside the BMP: scanned as a surrogate pair, which the tag class
+		// accepts without the `u` flag.
+		name: 'postgres dollar-quote tag outside the BMP',
+		sql: 'DO $\u{1d6fc}$ SELECT 1; SELECT 2 $\u{1d6fc}$; SELECT 3',
+		dialect: 'postgres',
+		expect: ['DO $\u{1d6fc}$ SELECT 1; SELECT 2 $\u{1d6fc}$', 'SELECT 3'],
+	},
+	{
+		name: 'postgres dollar-quote tag may start with an underscore',
+		sql: 'SELECT $_x1$ a; b $_x1$; SELECT 2',
+		dialect: 'postgres',
+		expect: ['SELECT $_x1$ a; b $_x1$', 'SELECT 2'],
+	},
+	{
+		// An identifier cannot start with a digit, so this is the positional
+		// parameter `$1` followed by ordinary text — nothing is quoted.
+		name: 'postgres digit-first tag is not a dollar quote',
+		sql: 'SELECT $1abc$ a; SELECT 2',
+		dialect: 'postgres',
+		expect: ['SELECT $1abc$ a', 'SELECT 2'],
+	},
+	{
+		// The identifier `caf\u00e9` continues across the `$`, exactly as `foo$tag$`
+		// does above; reading it as a quote would swallow the separator.
+		name: 'postgres dollar quote must not continue a non-ASCII identifier',
+		sql: 'SELECT caf\u00e9$tag$; SELECT 2',
+		dialect: 'postgres',
+		expect: ['SELECT caf\u00e9$tag$', 'SELECT 2'],
+	},
+	{
+		// "Tags are case sensitive, so $tag$String content$tag$ is correct,
+		// but $TAG$String content$tag$ is not."
+		name: 'postgres dollar-quote tags are case sensitive',
+		sql: 'SELECT $Tag$ a; b $tag$ x $Tag$; SELECT 2',
+		dialect: 'postgres',
+		expect: ['SELECT $Tag$ a; b $tag$ x $Tag$', 'SELECT 2'],
+	},
+	{
+		// `Stra\u00dfe` is one identifier, so its trailing `e` is not the `E'...'`
+		// escape prefix: the backslash does not escape the closing quote and
+		// the `;` after it still separates. The identifier class decides this,
+		// which is why it has to match the one the tag rule uses.
+		name: 'postgres E-prefix does not trigger after a non-ASCII identifier',
+		sql: "SELECT Stra\u00dfe'a\\'; SELECT 2",
+		dialect: 'postgres',
+		expect: ["SELECT Stra\u00dfe'a\\'", 'SELECT 2'],
+	},
+	{
 		name: 'mysql backslash escapes a quote inside a literal',
 		sql: "SELECT 'a\\'; b'; SELECT 2",
 		dialect: 'mysql',
