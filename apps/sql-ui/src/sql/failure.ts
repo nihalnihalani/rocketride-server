@@ -37,7 +37,17 @@
 //        (db_instance_base.py:309) — the driver's message was SWALLOWED by
 //        node versions that predate the error-text fix. The app must say so
 //        rather than present this as what the database said.
+//   `SQL execution failed: <driver's primary message>`
+//        (db_instance_base.py `execute` / `_executeRawQuery`, both the
+//        session-bound and the plain path) — a node that DOES return the
+//        driver's text wraps it in that prefix. The prefix is the node
+//        talking, so the headline quotes what follows it; the verbatim block
+//        keeps the whole string.
 //   anything else — the database's own text, shown verbatim.
+//
+// Both node generations are handled at once, on purpose: this app is deployed
+// against whatever node a workspace happens to run, so the older placeholder
+// and the newer prefixed message both have to read correctly.
 //
 // Matching is on a SUBSTRING of the machine-stable part of each message
 // (`allow_execute`, `max_execute_rows`), never on the whole sentence, so a
@@ -88,6 +98,17 @@ export const TRANSACTION_REFUSAL_TEXT = 'Transaction statements have no effect h
 /** The node's placeholder for a swallowed driver message. */
 const GENERIC_FAILURE = /SQL execution failed \(check server logs for details\)/i;
 
+/**
+ * The node's own wrapper around a driver message.
+ *
+ * Only the HEADLINE strips it, because the headline is introduced by
+ * `Database reported:` and the prefix is the NODE speaking. The verbatim block
+ * keeps every character, since that is the text that gets pasted into a bug
+ * report. The placeholder above carries a parenthesis rather than a colon, so
+ * it never matches here and stays generic.
+ */
+const NODE_EXECUTE_PREFIX = /^SQL execution failed:\s*/i;
+
 /** The node's row-cap overflow, carrying the cap. */
 const MAX_ROWS = /max_execute_rows[=:\s]+(\d+)/i;
 
@@ -114,15 +135,18 @@ export function maxRowsText(cap: number): string {
 export function describeFailure(message: string): IFailureNotice {
 	const verbatim = (message ?? '').trim();
 	const firstLine = verbatim.split('\n')[0]?.trim() ?? '';
+	// What the DATABASE said: the node's wrapper is not part of it, and the
+	// headline attributes this sentence to the database by name.
+	const said = firstLine.replace(NODE_EXECUTE_PREFIX, '').trim();
 	const maxRows = MAX_ROWS.exec(verbatim);
 	return {
-		headline: `Database reported: ${firstLine}`,
+		headline: `Database reported: ${said}`,
 		verbatim,
 		// No text at all is the same situation as the node's placeholder: there
 		// is nothing real to quote. Calling it generic picks the bound wording
 		// instead of rendering the headline "Database reported:" with nothing
-		// after it.
-		generic: verbatim === '' || GENERIC_FAILURE.test(verbatim),
+		// after it. A wrapper with nothing behind it is that same situation.
+		generic: said === '' || GENERIC_FAILURE.test(verbatim),
 		allowExecuteOff: verbatim.includes('allow_execute'),
 		maxExecuteRows: maxRows ? Number(maxRows[1]) : null,
 	};

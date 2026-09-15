@@ -84,6 +84,66 @@ describe('describeFailure', () => {
 	});
 });
 
+// =============================================================================
+// THE NODE'S OWN PREFIX
+// =============================================================================
+//
+// A node that returns the driver's text wraps it in `SQL execution failed: `.
+// That prefix is the NODE talking, and the banner says `Database reported:`,
+// so quoting the prefix would attribute the node's words to the database.
+// =============================================================================
+
+describe('describeFailure — the node execute prefix', () => {
+	it('quotes what the database said, not the node wrapper', () => {
+		const notice = describeFailure('SQL execution failed: no such table: orders');
+		assert.equal(notice.headline, 'Database reported: no such table: orders');
+	});
+
+	it('still keeps the whole message verbatim, prefix included', () => {
+		const notice = describeFailure('SQL execution failed: no such table: orders');
+		assert.equal(notice.verbatim, 'SQL execution failed: no such table: orders');
+		assert.equal(notice.generic, false);
+	});
+
+	it('strips the prefix from the first line of a multi-line message', () => {
+		const notice = describeFailure('SQL execution failed: no such table: orders\n(sqlite3.OperationalError)');
+		assert.equal(notice.headline, 'Database reported: no such table: orders');
+		assert.equal(notice.verbatim, 'SQL execution failed: no such table: orders\n(sqlite3.OperationalError)');
+	});
+
+	it('leaves the generic placeholder generic', () => {
+		// It carries a parenthesis, not a colon, so it is not the prefix form
+		// and there is still nothing real to quote.
+		const notice = describeFailure('SQL execution failed (check server logs for details)');
+		assert.equal(notice.generic, true);
+	});
+
+	it('leaves a message without the prefix alone', () => {
+		const notice = describeFailure('syntax error at or near "slect"');
+		assert.equal(notice.headline, 'Database reported: syntax error at or near "slect"');
+		assert.equal(notice.generic, false);
+	});
+
+	it('treats the prefix with nothing behind it as nothing to quote', () => {
+		// Rendering `Database reported:` with an empty quote would be worse
+		// than saying plainly that no message came back.
+		const notice = describeFailure('SQL execution failed:');
+		assert.equal(notice.generic, true);
+		assert.equal(notice.verbatim, 'SQL execution failed:');
+	});
+
+	it('keeps reading the node flags through the prefix', () => {
+		assert.equal(
+			describeFailure('SQL execution failed: execute tool is disabled for this node (set allow_execute=true)').allowExecuteOff,
+			true,
+		);
+		assert.equal(
+			describeFailure('SQL execution failed: EXECUTE query exceeded max_execute_rows=1000').maxExecuteRows,
+			1000,
+		);
+	});
+});
+
 describe('maxRowsText', () => {
 	it('names the cap', () => {
 		assert.equal(maxRowsText(1000), 'The node caps results at 1,000 rows; choose a lower limit or add LIMIT.');

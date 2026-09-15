@@ -187,9 +187,11 @@ never invisible.
 ### When a statement fails
 
 The banner leads with the database's own first line, prefixed `Database
-reported: `, and a collapsible **Database said** block holds the driver text
-verbatim. It also names the statement, its lines, and which earlier
-statements already ran or committed.
+reported: `. Any wrapper the node puts around that line is left out of the
+headline, so what follows `Database reported: ` is the database speaking; a
+collapsible **Database said** block holds the message verbatim, exactly as
+it reached the app. It also names the statement, its lines, and which
+earlier statements already ran or committed.
 
 Whether the driver text arrives at all depends on the node version. Older
 nodes swallow the database's message and return a generic string; in that
