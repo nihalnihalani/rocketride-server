@@ -31,7 +31,8 @@
 //   to decide whether a failed call may be retried with a fresh token
 //   (`idempotent`), so the rule is conservative: anything that is not clearly
 //   read-only is not a read. `EXPLAIN ANALYZE` really executes its inner
-//   statement, so it is classified by that statement, not as a read.
+//   statement, so it is classified by that statement, not as a read — and
+//   `patternCheck` peels the same prefix for the same reason.
 //
 //   `patternCheck` — whether the statement matches one of the shapes the
 //   confirmation dialog asks about. This is a TEXT CHECK, not a database
@@ -217,6 +218,11 @@ export function classifyStatement(sql: string, dialect: SqlDialect = 'unknown'):
  * DELETE with no top-level WHERE, an UPDATE or DELETE inside a WITH clause,
  * TRUNCATE, DROP, ALTER.
  *
+ * `EXPLAIN ANALYZE` is checked as the statement it would run, because it runs
+ * it: the prefix is peeled here the same way {@link classifyStatement} peels
+ * it, which is what keeps the two judgements from disagreeing about a form
+ * that empties a table. A plain `EXPLAIN` runs nothing and is never a finding.
+ *
  * A `WITH` chain is read group by group, because PostgreSQL lets the statement
  * and any CTE body carry a write. Each parenthesised group has a VERB — its
  * first leader that is not a CTE name — and so does the statement itself. The
@@ -258,6 +264,18 @@ export function classifyStatement(sql: string, dialect: SqlDialect = 'unknown'):
 export function patternCheck(sql: string, dialect: SqlDialect = 'unknown'): IPatternFinding | null {
 	const head = normalize(sql, dialect);
 	if (!head) return null;
+
+	// EXPLAIN ANALYZE RUNS the statement it describes, and every call here
+	// commits on its own, so the prefix is peeled exactly as
+	// `classifyStatement` peels it and the check is made on what would really
+	// run. A plain EXPLAIN runs nothing and is never a finding.
+	if (/^explain\b/i.test(head)) {
+		const prefix = EXPLAIN_PREFIX.exec(head)?.[0] ?? 'explain';
+		if (!/\banaly[sz]e\b/i.test(prefix)) return null;
+		const inner = head.slice(prefix.length).trim();
+		if (!inner || /^explain\b/i.test(inner)) return null;
+		return patternCheck(inner, dialect);
+	}
 
 	if (/^truncate\b/i.test(head)) return { kind: 'TRUNCATE' };
 	if (/^drop\b/i.test(head)) return { kind: 'DROP' };

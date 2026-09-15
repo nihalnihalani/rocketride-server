@@ -200,6 +200,63 @@ describe('patternCheck', () => {
 });
 
 // =============================================================================
+// PATTERN CHECK — EXPLAIN
+// =============================================================================
+//
+// `EXPLAIN ANALYZE` RUNS the statement it describes (PostgreSQL: "the
+// statement is actually executed when the ANALYZE option is used"; MySQL
+// 8.0.19+ the same), and this app commits every call on its own, so the
+// dialog has to see through the prefix. A plain EXPLAIN runs nothing.
+// =============================================================================
+
+describe('patternCheck — EXPLAIN', () => {
+	it('flags the DELETE that EXPLAIN ANALYZE would run', () => {
+		assert.deepEqual(
+			patternCheck('EXPLAIN ANALYZE DELETE FROM orders'),
+			{ kind: 'DELETE without WHERE' },
+		);
+	});
+
+	it('flags through a parenthesised option list', () => {
+		assert.deepEqual(
+			patternCheck('EXPLAIN (ANALYZE, BUFFERS) UPDATE orders SET x = 1'),
+			{ kind: 'UPDATE without WHERE' },
+		);
+	});
+
+	it('flags a WITH-led statement behind ANALYZE', () => {
+		assert.deepEqual(
+			patternCheck('EXPLAIN ANALYZE WITH a AS (SELECT 1) DELETE FROM orders'),
+			{ kind: 'DELETE without WHERE' },
+		);
+	});
+
+	it('passes when the statement it would run is bounded', () => {
+		assert.equal(patternCheck('EXPLAIN ANALYZE DELETE FROM orders WHERE id = 1'), null);
+	});
+
+	it('passes a plain EXPLAIN, which runs nothing', () => {
+		assert.equal(patternCheck('EXPLAIN DELETE FROM orders'), null);
+	});
+
+	it('passes an EXPLAIN whose options do not include ANALYZE', () => {
+		assert.equal(patternCheck('EXPLAIN (FORMAT JSON) DELETE FROM orders'), null);
+	});
+
+	it('passes EXPLAIN ANALYZE of a read', () => {
+		assert.equal(patternCheck('EXPLAIN ANALYZE SELECT * FROM orders'), null);
+	});
+
+	it('agrees with the classification, which already calls these writes', () => {
+		// The two judgements disagreeing about EXPLAIN ANALYZE is what let a
+		// full-table delete through: classify says write, the dialog said
+		// nothing.
+		assert.equal(classifyStatement('EXPLAIN ANALYZE DELETE FROM orders'), 'write');
+		assert.notEqual(patternCheck('EXPLAIN ANALYZE DELETE FROM orders'), null);
+	});
+});
+
+// =============================================================================
 // PATTERN CHECK — WITH-LED STATEMENTS
 // =============================================================================
 //

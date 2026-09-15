@@ -172,6 +172,11 @@ clauses: `SELECT ... FOR UPDATE` locks rows, and an upsert's `ON CONFLICT
 ... DO UPDATE` belongs to its `INSERT`, so neither is asked about. `INSERT`
 is never flagged, inside a clause or out.
 
+`EXPLAIN ANALYZE` runs the statement it describes rather than only planning
+it, so it is checked as that statement: `EXPLAIN ANALYZE DELETE FROM orders`
+is asked about like the `DELETE` it would run. A plain `EXPLAIN` runs
+nothing and is never asked about.
+
 Read that sentence literally. The check reads the statement text; it never
 consults the database, does not know what a `WHERE` clause actually matches,
 and prevents nothing. It is not called a safe mode anywhere, and when it is
