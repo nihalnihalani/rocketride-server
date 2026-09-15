@@ -343,9 +343,10 @@ describe('patternCheck — a WITH chain carrying the verb', () => {
 	});
 
 	it('reads past a CTE NAMED after a statement keyword', () => {
-		// `MERGE` is not reserved, so `WITH merge AS (...)` is a legal chain.
-		// Its name must not be mistaken for the statement's verb, or the
-		// DELETE behind it goes unasked.
+		// PostgreSQL lists INSERT, UPDATE, DELETE and MERGE as non-reserved, so
+		// `WITH merge AS (...)` is a legal chain. Such a name must not be
+		// mistaken for the statement's verb, or the DELETE behind it goes
+		// unasked — the very false negative this check exists to close.
 		assert.deepEqual(
 			patternCheck('WITH merge AS (SELECT 1) DELETE FROM orders'),
 			{ kind: 'DELETE without WHERE' },
@@ -354,10 +355,36 @@ describe('patternCheck — a WITH chain carrying the verb', () => {
 			patternCheck('WITH RECURSIVE merge AS (SELECT 1) UPDATE orders SET x = 1'),
 			{ kind: 'UPDATE without WHERE' },
 		);
+		assert.deepEqual(
+			patternCheck('WITH update AS (SELECT 1) DELETE FROM orders'),
+			{ kind: 'DELETE without WHERE' },
+		);
+		assert.deepEqual(
+			patternCheck('WITH merge AS MATERIALIZED (SELECT 1) UPDATE orders SET x = 1'),
+			{ kind: 'UPDATE without WHERE' },
+		);
+	});
+
+	it('reads past such a CTE name when it carries a column list', () => {
+		// `name (a, b) AS (...)`: the `(` follows the name, not `AS`. No real
+		// statement puts `(` straight after INSERT, UPDATE, DELETE or MERGE.
+		assert.deepEqual(
+			patternCheck('WITH merge (x) AS (SELECT 1) DELETE FROM orders'),
+			{ kind: 'DELETE without WHERE' },
+		);
 	});
 
 	it('still passes a read whose CTE is named after a statement keyword', () => {
 		assert.equal(patternCheck('WITH merge AS (SELECT 1) SELECT * FROM merge'), null);
+		assert.equal(patternCheck('WITH delete (x) AS (SELECT 1) SELECT * FROM delete'), null);
+	});
+
+	it('does not read a parenthesised SELECT as a CTE name', () => {
+		// SELECT, VALUES and TABLE are reserved and can never be names, so a
+		// `(` after them is an expression. Treating one as a name would step
+		// past the SELECT and read a trailing FOR UPDATE as the verb.
+		assert.equal(patternCheck('WITH a AS (SELECT 1) SELECT (1 + 2)'), null);
+		assert.equal(patternCheck('WITH a AS (SELECT 1) SELECT (1) FROM a FOR UPDATE'), null);
 	});
 
 	it('passes a WITH-led parenthesised set expression', () => {

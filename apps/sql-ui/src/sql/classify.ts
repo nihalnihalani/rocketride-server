@@ -114,6 +114,12 @@ const CTE_WRITE = /\b(insert|update|delete|merge|replace)\b/i;
 const WITH_LEADERS = ['select', 'insert', 'update', 'delete', 'merge', 'values', 'table'];
 
 /**
+ * The leaders that are NOT reserved words, so a CTE may be named after one.
+ * SELECT, VALUES, TABLE and WITH are reserved and can never be names.
+ */
+const NAMEABLE_LEADERS = ['insert', 'update', 'delete', 'merge'];
+
+/**
  * The CTE mutations the pattern check names. INSERT/MERGE/REPLACE are absent
  * on purpose: a top-level INSERT is not confirmed either, and one inside a
  * clause is no more destructive than one outside it.
@@ -139,18 +145,27 @@ function normalize(sql: string, dialect: SqlDialect): string {
 /**
  * Whether a depth-0 keyword is a CTE's NAME rather than a statement's verb.
  *
- * `MERGE` is not a reserved word, so `WITH merge AS (SELECT 1) DELETE FROM t`
- * is a legal chain whose first depth-0 keyword is the CTE's name. Reading that
- * name as the verb would hide the DELETE behind it, which is the false
- * negative this whole check exists to close. A name is always followed by
- * `AS`; a verb never is.
+ * PostgreSQL lists INSERT, UPDATE, DELETE and MERGE as non-reserved words, so
+ * `WITH merge AS (SELECT 1) DELETE FROM t` is a legal chain whose first
+ * depth-0 keyword is the CTE's name. Reading that name as the verb would hide
+ * the DELETE behind it, which is the false negative this whole check exists to
+ * close.
+ *
+ * A name is followed by `AS`, or by its column list — `merge (x) AS (...)`.
+ * The column-list form is only read as a name for those four words, and it is
+ * unambiguous for them because a real statement never puts `(` straight after
+ * the verb: it is `INSERT INTO`, `UPDATE t`, `DELETE FROM`, `MERGE INTO`. The
+ * reserved words cannot be names at all, so `SELECT (1 + 2)` and `VALUES (1)`
+ * stay statements.
  *
  * @param head - The normalised statement.
  * @param site - A keyword occurrence in it.
- * @returns True when `AS` is the next word after the keyword.
+ * @returns True when the keyword names a CTE.
  */
 function namesCte(head: string, site: IKeywordSite): boolean {
-	return /^\s*as\b/i.test(head.slice(site.index + site.keyword.length));
+	const after = head.slice(site.index + site.keyword.length);
+	if (/^\s*as\b/i.test(after)) return true;
+	return NAMEABLE_LEADERS.includes(site.keyword) && /^\s*\(/.test(after);
 }
 
 // =============================================================================
@@ -215,6 +230,10 @@ export function classifyStatement(sql: string, dialect: SqlDialect = 'unknown'):
  * UPDATE` locks rows and writes nothing; an upsert's `ON CONFLICT ... DO
  * UPDATE` belongs to its INSERT. Neither is an unbounded UPDATE, and saying so
  * would spend the dialog's credibility on statements that change nothing.
+ *
+ * A leader followed by `AS`, or one of the non-reserved four (INSERT, UPDATE,
+ * DELETE, MERGE) followed by a column list, is a CTE's NAME and is read past
+ * to the real verb behind it (see {@link namesCte}).
  *
  * LIMITS, stated plainly because the dialog does too:
  * - A WHERE inside a string literal or a comment does not count (correct).
