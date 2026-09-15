@@ -70,8 +70,8 @@ shape plus a `refreshed_at` UTC timestamp. `get_data` returns
 `{rows, affected_rows}`. A failed statement raises `SQL execution failed:`
 followed by `Error <code>:` and ClickHouse's own primary message,
 identically with and without a `session_id`. The `clickhouse+native://`
-driver does not raise a DBAPI error, so the node unwraps its exception by
-the driver error it carries; the code and message come from the server's
+driver does not raise a DBAPI error, so the node unwraps it to the driver
+error it carries; the code and message come from the server's
 own `ServerException`. What is removed is the tail: SQLAlchemy's
 `[SQL: ...]` / `[parameters: ...]` echo, ClickHouse's server stack trace,
 and its `failed at position` quotation of the statement. The primary

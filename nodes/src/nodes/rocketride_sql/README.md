@@ -96,8 +96,10 @@ statement so PostgreSQL supplies the value rather than receiving an explicit
 NULL. A generated primary key supplied as null counts as not carried, since the
 sender on this lane is an upstream node that may emit every schema key; a null
 on any other column is inserted as NULL as given. A primary key PostgreSQL does
-not generate that a row omits is rejected before anything runs. Database description is empty by default and is included as context
-when the node asks the LLM to write SQL. Change it when the database or table
+not generate that a row omits is rejected before anything runs.
+
+Database description is empty by default and is included as context when the
+node asks the LLM to write SQL. Change it when the database or table
 has domain-specific meanings that a column name alone cannot convey; a concise
 description helps the LLM choose relevant tables and predicates without
 changing the actual schema.

@@ -586,9 +586,11 @@ class DatabaseInstanceBase(IInstanceBase, ABC):
             #
             # The guarantee that does hold is narrower: the database still
             # fills in what it owns either way. `_insertData` leaves out any
-            # primary-key or server-default column the rows do NOT supply, so a
-            # column present only in the reflected map is omitted rather than
-            # bound NULL, whichever of the two maps a given call is holding.
+            # generated primary-key, server-default or identity column the rows
+            # do NOT supply (and rejects an omitted key the database cannot
+            # generate), so a column present only in the reflected map is
+            # either left to the database or bound the NULL it would have
+            # stored anyway, whichever of the two maps a given call is holding.
             #
             # For a column a row DOES supply, the two maps differ and the
             # refresh is what changes the INSERT: on an auto-created table the
