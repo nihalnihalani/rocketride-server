@@ -11,9 +11,10 @@ SQLAlchemy with the PyMySQL driver to connect and reflect MySQL table schemas.
 
 ## What it does
 
-On the `questions` lane, the node gives a connected LLM its startup-reflected
-schema and optional database description, validates generated `SELECT` queries
-with `EXPLAIN`, and emits results as a table, text, or answer. On the `answers`
+On the `questions` lane, the node gives a connected LLM its cached schema
+snapshot (the start-up reflection until `refresh_schema` replaces it) and
+optional database description, validates generated `SELECT` queries with
+`EXPLAIN`, and emits results as a table, text, or answer. On the `answers`
 lane, it inserts structured rows into the configured table, creating that table
 from the first incoming data shape when necessary. It is also an agent tool
 node, making it a better fit than a pipeline-only SQL destination when an agent
@@ -71,10 +72,15 @@ shape. `get_data` returns
 `execute` requires non-empty `sql` and optionally accepts a transaction
 `session_id` plus positional values for `$1`, `$2`, and so on. It returns
 `{rows, affected_rows}`. A failed statement raises `SQL execution failed:`
-followed by the driver's own primary message, identically with and without a
-`session_id`; the statement text and the bound parameter values are never
-part of it and stay in the server log, though that primary message may quote
-a value the caller itself submitted. `begin` takes no arguments and returns
+followed by the database's own primary message, identically with and without
+a `session_id`. What is removed is the tail: SQLAlchemy's `[SQL: ...]` /
+`[parameters: ...]` echo. The primary sentence itself is passed through as
+MySQL wrote it, so a syntax error quotes the fragment it stopped on (the
+driver interpolates bound values client-side, so that fragment can contain
+one) and a constraint error names the value that collided. That is
+deliberate: reaching this tool at all requires **Allow direct query
+execution**, and a caller who has it can read the same data with a `SELECT`.
+The full text stays in the server log. `begin` takes no arguments and returns
 `{session_id}`; `commit` and `rollback` require that ID and return
 `{ok: true}`. These four write-capable operations fail when **Allow direct
 query execution** is off; unknown or expired session IDs also fail. Invalid

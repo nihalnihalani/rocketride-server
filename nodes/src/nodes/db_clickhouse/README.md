@@ -16,9 +16,10 @@ On the `questions` lane, the node gives its reflected database schema and
 optional database description to the connected LLM, asks it for a `SELECT`,
 validates that query with `EXPLAIN`, and sends the result to the requested
 `table`, `text`, or `answers` lane. It is also an agent tool node, so an agent
-can retrieve data, inspect the startup-reflected schema, generate SQL, or—when
-explicitly enabled—run raw SQL. Unlike a write-oriented relational database
-node, its declared lanes contain no data-ingestion input.
+can retrieve data, inspect the cached schema snapshot (refreshable with
+`refresh_schema`), generate SQL, or—when explicitly enabled—run raw SQL.
+Unlike a write-oriented relational database node, its declared lanes contain
+no data-ingestion input.
 
 ## Connections
 
@@ -67,10 +68,15 @@ shape plus a `refreshed_at` UTC timestamp. `get_data` returns
 `execute` requires non-empty `sql` and optionally accepts a transaction
 `session_id` plus positional values for `$1`, `$2`, and so on. It returns
 `{rows, affected_rows}`. A failed statement raises `SQL execution failed:`
-followed by the driver's own primary message, identically with and without a
-`session_id`; the statement text and the bound parameter values are never
-part of it and stay in the server log, though that primary message may quote
-a value the caller itself submitted. `begin` takes no arguments and returns
+followed by the database's own primary message, identically with and without
+a `session_id`. What is removed is the tail: SQLAlchemy's `[SQL: ...]` /
+`[parameters: ...]` echo, and ClickHouse's server stack trace and its
+`failed at position` quotation of the statement. The primary sentence itself
+is passed through as ClickHouse wrote it, so it can name a value or an
+identifier the statement carried or touched. That is deliberate: reaching
+this tool at all requires **Allow direct query execution**, and a caller who
+has it can read the same data with a `SELECT`. The full text stays in the
+server log. `begin` takes no arguments and returns
 `{session_id}`; `commit` and `rollback` require that ID and return
 `{ok: true}`. These four write-capable operations fail when **Allow direct
 query execution** is off; unknown or expired session IDs also fail. Invalid

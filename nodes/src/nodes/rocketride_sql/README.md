@@ -67,10 +67,16 @@ returns {error, sql, valid: false}. execute, begin, commit, and rollback raise
 for invalid input, an unknown or expired transaction, or when direct execution
 is disabled. A successful raw execution returns {rows, affected_rows}; begin
 returns {session_id} and transaction completion returns {ok: true}. A failed
-execute raises "SQL execution failed:" followed by the driver's own primary
-message, identically with and without a session_id; the statement text and the
-bound parameter values are never part of it and stay in the server log, though
-that primary message may quote a value the caller itself submitted.
+execute raises "SQL execution failed:" followed by the database's own primary
+message, identically with and without a session_id. What is removed is the
+tail: SQLAlchemy's [SQL: ...] / [parameters: ...] echo, PostgreSQL's LINE n:
+quotation of the statement, and its DETAIL, HINT and CONTEXT blocks. The
+primary sentence itself is passed through as PostgreSQL wrote it, so it can
+name a value the statement carried or touched — including one an
+INSERT ... SELECT or a CAST read from another table. That is deliberate:
+reaching this tool at all requires direct execution to be enabled, and a
+caller who has it can read the same data with a SELECT. The full text stays
+in the server log.
 
 ## Configuration
 
