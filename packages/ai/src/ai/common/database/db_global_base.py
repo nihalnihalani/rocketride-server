@@ -203,6 +203,18 @@ class DatabaseGlobalBase(IGlobalBase, ABC):
 
         Every branch runs through ``_strip_statement_detail`` as a backstop,
         so a driver shape not enumerated here still cannot leak the tail.
+
+        One residual is accepted deliberately: a driver's primary sentence can
+        quote a value from the statement being reported, e.g. PostgreSQL's
+        ``invalid input syntax for type integer: "abc"`` or MySQL's
+        ``Duplicate entry 'x' for key 'users.email'``. That value was submitted
+        by the caller now reading the message, who also holds ``allow_execute``;
+        values belonging to OTHER rows appear only in the DETAIL / HINT /
+        CONTEXT blocks, which are stripped. Blanking quoted tokens generically
+        is not the answer either, because MySQL quotes identifiers with single
+        quotes too ("Unknown column 'foo' in 'field list'"), so the redaction
+        would delete the one thing the caller needs. The full exception,
+        statement and binds included, stays in the server log.
         """
         try:
             # SQLAlchemy wraps driver exceptions in DBAPIError; the original

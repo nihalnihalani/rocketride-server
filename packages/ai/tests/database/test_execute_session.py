@@ -23,10 +23,12 @@
 
 """Tests for begin/commit/rollback tool functions and session-aware execute."""
 
+import contextlib
 import types
 
 import pytest
 from sqlalchemy import create_engine, text
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.pool import StaticPool
 
 from ai.common.database.db_global_base import DatabaseGlobalBase
@@ -335,3 +337,122 @@ def test_commit_unknown_session_id_raises_value_error(instance_with_sqlite_regis
 def test_rollback_unknown_session_id_raises_value_error(instance_with_sqlite_registry):
     with pytest.raises(ValueError, match='unknown or expired transaction session'):
         instance_with_sqlite_registry.rollback({'session_id': 'no-such-session'})
+
+
+# ---------------------------------------------------------------------------
+# (e) Both halves of execute report a driver failure identically
+#
+# Mock-based by necessity: the drivers whose messages quote literals
+# (PostgreSQL, MySQL) are not available in this suite, so their exception
+# shapes are reproduced and wrapped the way SQLAlchemy wraps a real one.
+# ---------------------------------------------------------------------------
+
+
+class _FakeDriverError(Exception):
+    """Stand-in for a DBAPI driver exception (psycopg2 / pymysql shapes)."""
+
+
+class _FailingConnection:
+    """Connection stand-in whose execute() always raises the given exception."""
+
+    def __init__(self, exc, inner=None):
+        self._exc = exc
+        self._inner = inner
+
+    def execute(self, *args, **kwargs):
+        """Fail the way a driver fails, with the statement already bound."""
+        raise self._exc
+
+    def close(self):
+        """Release the real connection this stands in front of, if any."""
+        if self._inner is not None:
+            self._inner.close()
+
+
+class _FailingEngine:
+    """Engine stand-in whose begin() hands out a connection that always raises."""
+
+    def __init__(self, exc):
+        self._exc = exc
+
+    @contextlib.contextmanager
+    def begin(self):
+        """Yield the failing connection, mirroring engine.begin()'s contract."""
+        yield _FailingConnection(self._exc)
+
+
+def _postgres_duplicate_key():
+    """A psycopg2-shaped unique violation, wrapped as SQLAlchemy would wrap it."""
+    orig = _FakeDriverError(
+        'duplicate key value violates unique constraint "users_email_key"\n'
+        'DETAIL:  Key (email)=(ada@example.com) already exists.\n'
+    )
+    orig.diag = types.SimpleNamespace(
+        message_primary='duplicate key value violates unique constraint "users_email_key"'
+    )
+    orig.pgcode = '23505'
+    return DBAPIError.instance(
+        'INSERT INTO users (email) VALUES (%(email)s)',
+        {'email': 'ada@example.com'},
+        orig,
+        dbapi_base_err=Exception,
+    )
+
+
+def _mysql_duplicate_entry():
+    """A pymysql-shaped duplicate entry, wrapped as SQLAlchemy would wrap it."""
+    orig = _FakeDriverError(1062, "Duplicate entry 'ada@example.com' for key 'users.email'")
+    return DBAPIError.instance(
+        'INSERT INTO users (email) VALUES (%s)',
+        ('ada@example.com',),
+        orig,
+        dbapi_base_err=Exception,
+    )
+
+
+@pytest.mark.parametrize(
+    ('build_error', 'expected'),
+    [
+        (
+            _postgres_duplicate_key,
+            'SQL execution failed: Error 23505: duplicate key value violates unique constraint "users_email_key"',
+        ),
+        (
+            _mysql_duplicate_entry,
+            "SQL execution failed: Error 1062: Duplicate entry 'ada@example.com' for key 'users.email'",
+        ),
+    ],
+    ids=['postgres', 'mysql'],
+)
+def test_both_execute_paths_report_a_driver_failure_identically(instance_with_sqlite_registry, build_error, expected):
+    """One tool, one gate, one error contract -- whether or not a session is used.
+
+    The PostgreSQL case also pins what the policy does and does not hide: the
+    DETAIL block restating the key value is dropped, while MySQL's primary
+    sentence keeps the value the caller itself submitted. In both cases the
+    statement and the bind list stay in the server log.
+    """
+    inst = instance_with_sqlite_registry
+    real_engine = inst.IGlobal.engine
+
+    sid = inst.begin({})['session_id']
+    held = inst.IGlobal.tx_registry._sessions[sid]
+    held.conn = _FailingConnection(build_error(), inner=held.conn)
+    with pytest.raises(RuntimeError) as session_exc:
+        inst.execute({'sql': 'INSERT INTO t (v) VALUES ($1)', 'params': ['ada@example.com'], 'session_id': sid})
+
+    inst.IGlobal.engine = _FailingEngine(build_error())
+    try:
+        with pytest.raises(RuntimeError) as stateless_exc:
+            inst.execute({'sql': 'INSERT INTO t (v) VALUES ($1)', 'params': ['ada@example.com']})
+    finally:
+        inst.IGlobal.engine = real_engine
+
+    session_message = str(session_exc.value)
+    stateless_message = str(stateless_exc.value)
+    assert session_message == stateless_message == expected
+    for message in (session_message, stateless_message):
+        assert '[SQL:' not in message
+        assert '[parameters:' not in message
+        assert 'sqlalche.me' not in message
+        assert 'DETAIL' not in message

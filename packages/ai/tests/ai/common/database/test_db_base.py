@@ -33,6 +33,8 @@ from sqlalchemy import (
     inspect,
 )
 
+from sqlalchemy.exc import DBAPIError
+
 from ai.common.database.db_global_base import DatabaseGlobalBase
 from ai.common.database.db_instance_base import DatabaseInstanceBase
 from ai.common.schema import Question
@@ -173,6 +175,104 @@ def test_format_db_error_pymysql_shape_is_unchanged(base):
     orig = SimpleNamespace(args=(1054, "Unknown column 'foo' in 'field list'"))
     exc = RuntimeError('outer')
     exc.orig = orig
+    assert base._format_db_error(exc) == "Error 1054: Unknown column 'foo' in 'field list'"
+
+
+# ---------------------------------------------------------------------------
+# _format_db_error against real DBAPIError wrappers (PostgreSQL / MySQL)
+#
+# The tests above hand _format_db_error a hand-built exception. These build the
+# real SQLAlchemy wrapper with DBAPIError.instance, so str(exc) genuinely ends
+# in the `[SQL: ...]` / `[parameters: ...]` tail, and pin the caller-facing
+# policy for the two drivers whose messages quote literals. Mock-based by
+# necessity: there is no live PostgreSQL or MySQL in this suite, so the driver
+# exception shapes are reproduced rather than provoked.
+# ---------------------------------------------------------------------------
+
+
+class _FakeDriverError(Exception):
+    """Stand-in for a DBAPI driver exception (psycopg2 / pymysql shapes)."""
+
+
+def _wrapped(orig, statement, params):
+    """Wrap a driver exception the way SQLAlchemy wraps one it catches."""
+    return DBAPIError.instance(statement, params, orig, dbapi_base_err=Exception)
+
+
+def test_format_db_error_postgres_duplicate_key_keeps_only_the_primary_sentence(base):
+    """PostgreSQL restates the offending key in DETAIL; only the primary line survives.
+
+    The DETAIL block is where another row's values would appear
+    ("Key (email)=(ada@example.com) already exists."), so it is dropped along
+    with the statement and its binds.
+    """
+    orig = _FakeDriverError(
+        'duplicate key value violates unique constraint "users_email_key"\n'
+        'DETAIL:  Key (email)=(ada@example.com) already exists.\n'
+    )
+    orig.diag = SimpleNamespace(message_primary='duplicate key value violates unique constraint "users_email_key"')
+    orig.pgcode = '23505'
+    exc = _wrapped(orig, 'INSERT INTO users (email) VALUES (%(email)s)', {'email': 'ada@example.com'})
+
+    # The wrapper really does carry the tail, so the assertions below bite.
+    assert '[SQL:' in str(exc)
+    assert '[parameters:' in str(exc)
+
+    message = base._format_db_error(exc)
+    assert message == 'Error 23505: duplicate key value violates unique constraint "users_email_key"'
+    assert 'ada@example.com' not in message
+    assert 'DETAIL' not in message
+    assert '[SQL:' not in message
+    assert '[parameters:' not in message
+
+
+def test_format_db_error_postgres_without_diag_drops_the_line_echo(base):
+    """Without .diag the fallback is args[0], which psycopg2 fills with the statement.
+
+    psycopg2 interpolates bind values client-side, so its ``LINE n:`` echo
+    reproduces them verbatim -- the reason that marker is stripped too.
+    """
+    orig = _FakeDriverError(
+        'invalid input syntax for type integer: "abc"\n'
+        "LINE 1: SELECT * FROM users WHERE id = 'abc' AND email = 'ada@example.com'\n"
+        '                                       ^\n'
+    )
+    exc = _wrapped(orig, 'SELECT * FROM users WHERE id = %(id)s', {'id': 'abc'})
+
+    message = base._format_db_error(exc)
+    assert message == 'invalid input syntax for type integer: "abc"'
+    assert 'LINE 1' not in message
+    assert 'ada@example.com' not in message
+    assert '[SQL:' not in message
+
+
+def test_format_db_error_mysql_duplicate_entry_keeps_the_value_the_caller_sent(base):
+    """The accepted residual, stated as a test rather than left implicit.
+
+    MySQL's primary sentence quotes the value that collided -- a value this
+    caller submitted in the statement being reported, not another row's. The
+    statement and the full bind list still never leave the server log.
+    """
+    orig = _FakeDriverError(1062, "Duplicate entry 'ada@example.com' for key 'users.email'")
+    exc = _wrapped(orig, 'INSERT INTO users (email) VALUES (%s)', ('ada@example.com',))
+
+    message = base._format_db_error(exc)
+    assert message == "Error 1062: Duplicate entry 'ada@example.com' for key 'users.email'"
+    assert '[SQL:' not in message
+    assert '[parameters:' not in message
+    assert 'sqlalche.me' not in message
+
+
+def test_format_db_error_mysql_keeps_a_quoted_identifier_intact(base):
+    """Why quoted tokens are not redacted wholesale.
+
+    MySQL quotes IDENTIFIERS with single quotes as well as values, so a rule
+    that blanked every quoted token would delete "which column" from the one
+    message a caller most needs it in.
+    """
+    orig = _FakeDriverError(1054, "Unknown column 'foo' in 'field list'")
+    exc = _wrapped(orig, 'SELECT foo FROM users', {})
+
     assert base._format_db_error(exc) == "Error 1054: Unknown column 'foo' in 'field list'"
 
 
