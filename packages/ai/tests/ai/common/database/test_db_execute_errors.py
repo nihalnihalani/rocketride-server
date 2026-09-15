@@ -45,7 +45,7 @@ from sqlalchemy import create_engine, event
 from sqlalchemy.pool import StaticPool
 
 from ai.common.database.db_global_base import DatabaseGlobalBase
-from ai.common.database.db_instance_base import DatabaseInstanceBase
+from ai.common.database.db_instance_base import DatabaseInstanceBase, _format_table
 
 
 # ---------------------------------------------------------------------------
@@ -220,12 +220,57 @@ def test_refresh_schema_reports_a_utc_timestamp(instance):
 
 
 def test_refresh_schema_matches_get_schema_shape(instance):
-    """Apart from refreshed_at, the two tools return the same payload."""
-    instance.execute({'sql': 'CREATE TABLE widgets (id INTEGER PRIMARY KEY)'})
+    """Apart from refreshed_at, the two tools return the same payload.
+
+    The table carries a primary key AND a foreign key so the two optional
+    entries are exercised in both payloads: an equality check over a table
+    that has neither passes even if one side stops emitting them.
+    """
+    instance.execute({'sql': 'CREATE TABLE makers (id INTEGER PRIMARY KEY, name TEXT)'})
+    instance.execute({'sql': 'CREATE TABLE widgets (id INTEGER PRIMARY KEY, maker_id INTEGER REFERENCES makers (id))'})
     refreshed = instance.refresh_schema({})
 
     assert refreshed.pop('refreshed_at')
     assert refreshed == instance.get_schema({})
+
+    widgets = refreshed['tables']['widgets']
+    assert widgets['primary_key'] == ['id']
+    assert widgets['foreign_keys'] == [
+        {'columns': ['maker_id'], 'referred_table': 'makers', 'referred_columns': ['id']}
+    ]
+
+
+def test_format_table_keeps_the_optional_keys_optional():
+    """The one formatter both schema tools use, exercised directly.
+
+    ``get_schema`` and ``refresh_schema`` promise callers the same per-table
+    shape, and an LLM picks between the two tools on the strength of that
+    sentence. Comparing the two tool payloads to each other cannot catch a key
+    added to one side only, so the shape itself is pinned here.
+    """
+    full = _format_table(
+        {
+            'columns': [('id', 'INTEGER'), ('maker_id', 'INTEGER')],
+            'primary_key': ['id'],
+            'foreign_keys': [{'columns': ['maker_id'], 'referred_table': 'makers', 'referred_columns': ['id']}],
+        }
+    )
+    assert full == {
+        'columns': [{'column': 'id', 'type': 'INTEGER'}, {'column': 'maker_id', 'type': 'INTEGER'}],
+        'primary_key': ['id'],
+        'foreign_keys': [{'columns': ['maker_id'], 'referred_table': 'makers', 'referred_columns': ['id']}],
+    }
+
+    # An empty primary key / foreign key list is omitted, not emitted empty.
+    assert _format_table({'columns': [('label', 'TEXT')], 'primary_key': [], 'foreign_keys': []}) == {
+        'columns': [{'column': 'label', 'type': 'TEXT'}]
+    }
+
+    # ... and so is a key the reflection never produced.
+    assert _format_table({'columns': [('label', 'TEXT')]}) == {'columns': [{'column': 'label', 'type': 'TEXT'}]}
+
+    # A table with no columns still yields the required key.
+    assert _format_table({'columns': []}) == {'columns': []}
 
 
 def test_refresh_schema_ignores_its_input(instance):

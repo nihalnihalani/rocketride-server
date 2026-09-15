@@ -64,6 +64,27 @@ from .sql_safety import is_sql_safe
 _REFLECT_LOCK = threading.Lock()
 
 
+def _format_table(table_info: dict) -> dict:
+    """Render one reflected table into the per-table shape both schema tools return.
+
+    ``get_schema`` and ``refresh_schema`` both promise callers "the same shape",
+    and the tool descriptions an LLM chooses between say so, so the rendering
+    lives in one place: a key added for one tool is a key both tools emit.
+
+    Takes an entry of ``IGlobal.db_schema`` (``columns`` as ``(name, type)``
+    pairs, plus ``primary_key`` and ``foreign_keys`` lists) and returns
+    ``{'columns': [{'column': ..., 'type': ...}, ...]}``. ``primary_key`` and
+    ``foreign_keys`` are added only when non-empty, so a table without either
+    does not carry an empty list into the tool response.
+    """
+    result = {'columns': [{'column': name, 'type': col_type} for name, col_type in table_info['columns']]}
+    if table_info.get('primary_key'):
+        result['primary_key'] = table_info['primary_key']
+    if table_info.get('foreign_keys'):
+        result['foreign_keys'] = table_info['foreign_keys']
+    return result
+
+
 class DatabaseInstanceBase(IInstanceBase, ABC):
     """Abstract base for the IInstance layer of any relational database node.
 
@@ -200,14 +221,6 @@ class DatabaseInstanceBase(IInstanceBase, ABC):
             args = {}
 
         table_filter = args.get('table')
-
-        def _format_table(table_info):
-            result = {'columns': [{'column': name, 'type': col_type} for name, col_type in table_info['columns']]}
-            if table_info.get('primary_key'):
-                result['primary_key'] = table_info['primary_key']
-            if table_info.get('foreign_keys'):
-                result['foreign_keys'] = table_info['foreign_keys']
-            return result
 
         if table_filter:
             table_info = self.IGlobal.db_schema.get(table_filter)
@@ -449,10 +462,7 @@ class DatabaseInstanceBase(IInstanceBase, ABC):
         not just the one this tool returns.
 
         Reflection and publication run under a process-wide lock so concurrent
-        callers neither repeat the full table walk nor race on the cache. The
-        table formatting is deliberately spelled out again rather than shared
-        with ``get_schema``: a few duplicated lines are cheaper than touching
-        that method's body while other changes to this file are in flight.
+        callers neither repeat the full table walk nor race on the cache.
         Declares no input; anything passed is ignored.
         """
         with _REFLECT_LOCK:
@@ -480,14 +490,7 @@ class DatabaseInstanceBase(IInstanceBase, ABC):
             # answers-lane behaviour mid-task.
             self.IGlobal.schema = {}
             refreshed_at = datetime.now(timezone.utc).isoformat()
-            tables = {}
-            for table_name, table_info in self.IGlobal.db_schema.items():
-                entry = {'columns': [{'column': name, 'type': col_type} for name, col_type in table_info['columns']]}
-                if table_info.get('primary_key'):
-                    entry['primary_key'] = table_info['primary_key']
-                if table_info.get('foreign_keys'):
-                    entry['foreign_keys'] = table_info['foreign_keys']
-                tables[table_name] = entry
+            tables = {name: _format_table(info) for name, info in self.IGlobal.db_schema.items()}
 
         return {'database': self.IGlobal.database, 'tables': tables, 'refreshed_at': refreshed_at}
 
