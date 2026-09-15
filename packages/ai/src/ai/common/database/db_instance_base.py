@@ -478,9 +478,11 @@ class DatabaseInstanceBase(IInstanceBase, ABC):
             # insert sees exactly what a freshly started node would.
             #
             # Emptying rather than re-reflecting here keeps this cheap for the
-            # (common) node with no answers lane wired, and makes the write a
-            # single atomic rebind: a concurrent `_insertData` either reads the
-            # old map or finds it falsy and rebuilds, never a half-built dict.
+            # (common) node with no answers lane wired. The rebind itself is
+            # atomic, but the rebuild it re-arms is not, so `_insertData` takes
+            # `_REFLECT_LOCK` across its check, its rebuild and the snapshot it
+            # builds the batch from: that, not this assignment, is what stops a
+            # concurrent insert reading a half-built map.
             #
             # The rebuilt map is a plain reflection, so it carries the table's
             # primary key while the map `_createTableFromData` curates for an
@@ -882,16 +884,31 @@ class DatabaseInstanceBase(IInstanceBase, ABC):
             debug(f'Successfully created table "{self.IGlobal.table}" from data structure.')
 
         # Fetch the schema if it wasn't populated at startup (e.g. the table
-        # was just created above, or beginGlobal found no table).
-        if not self.IGlobal.schema:
-            table_schema = self.IGlobal._getTableSchema(self.IGlobal.table)
-            if table_schema:
-                self.IGlobal.schema = {name: (col_type, '') for name, col_type in table_schema}
-            else:
-                error(f'Unable to retrieve schema for table "{self.IGlobal.table}"')
-                raise RuntimeError(f'Table "{self.IGlobal.table}" schema could not be retrieved.')
+        # was just created above, or beginGlobal found no table), then take a
+        # private snapshot to build this batch from.
+        #
+        # The check, the rebuild and the snapshot are one critical section.
+        # `refresh_schema` empties `IGlobal.schema` to re-arm this rebuild, so
+        # at runtime a second insert can arrive while the first is reflecting,
+        # and every intermediate state it might observe is wrong: an empty map
+        # sends it down the "no schema cached" branch, which binds the item's
+        # raw keys and skips the generated-key handling below; a half-built map
+        # silently drops the columns not yet added; and the map it holds must
+        # not change size while the per-row loop iterates it.
+        #
+        # The lock is released before the Table reflection and before the
+        # INSERT. Neither reads `IGlobal.schema`, both are slow, and holding a
+        # process-wide lock across a write would serialise every node's inserts.
+        with _REFLECT_LOCK:
+            if not self.IGlobal.schema:
+                table_schema = self.IGlobal._getTableSchema(self.IGlobal.table)
+                if table_schema:
+                    self.IGlobal.schema = {name: (col_type, '') for name, col_type in table_schema}
+                else:
+                    error(f'Unable to retrieve schema for table "{self.IGlobal.table}"')
+                    raise RuntimeError(f'Table "{self.IGlobal.table}" schema could not be retrieved.')
+            schema = dict(self.IGlobal.schema)
 
-        schema = self.IGlobal.schema
         metadata = MetaData()
         engine = self.IGlobal.engine
 

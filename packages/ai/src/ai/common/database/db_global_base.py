@@ -460,14 +460,23 @@ class DatabaseGlobalBase(IGlobalBase, ABC):
                 return None
 
             columns = inspector.get_columns(table)
-            self.schema = {}
+            schema: Dict[str, Tuple[str, str]] = {}
             for column in columns:
                 col_name = column['name']
                 col_type = column['type']  # renamed to avoid shadowing the 'type' builtin
                 comment = column.get('comment', '')
-                self.schema[col_name] = (str(col_type), comment)
+                schema[col_name] = (str(col_type), comment)
 
-            return [(col_name, str(col_type)) for col_name, (col_type, _comment) in self.schema.items()]
+            # Publish in a single assignment. Building into `self.schema` and
+            # filling it column by column made every intermediate state visible:
+            # `_insertData` reads this map to decide which columns to bind, so a
+            # reader arriving mid-rebuild saw a truthy but incomplete map and
+            # silently dropped the columns not yet added. Assigning at the end
+            # also means a reflection that fails above leaves the previous map
+            # in place instead of a half-built one.
+            self.schema = schema
+
+            return [(col_name, str(col_type)) for col_name, (col_type, _comment) in schema.items()]
 
         except Exception as e:
             warning(f'Unable to retrieve database schema for "{table}": {e}')

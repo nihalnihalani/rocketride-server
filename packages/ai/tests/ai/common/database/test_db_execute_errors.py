@@ -44,8 +44,9 @@ import pytest
 from sqlalchemy import create_engine, event
 from sqlalchemy.pool import StaticPool
 
+import ai.common.database.db_global_base as db_global_base_module
 from ai.common.database.db_global_base import DatabaseGlobalBase
-from ai.common.database.db_instance_base import DatabaseInstanceBase, _format_table
+from ai.common.database.db_instance_base import _REFLECT_LOCK, DatabaseInstanceBase, _format_table
 
 
 # ---------------------------------------------------------------------------
@@ -114,6 +115,21 @@ def instance():
     inst = _make_instance(create_engine('sqlite:///:memory:'))
     yield inst
     inst.IGlobal.engine.dispose()
+
+
+@pytest.fixture
+def file_instance(tmp_path):
+    """Instance on a file-backed SQLite database, one connection per thread.
+
+    The concurrency tests need two threads to write, and StaticPool hands every
+    thread the SAME connection, which would merge their transactions. A file
+    database with the default pool gives each thread its own connection while
+    still letting all of them see one set of tables.
+    """
+    engine = create_engine(f'sqlite:///{tmp_path / "test.db"}', connect_args={'check_same_thread': False})
+    inst = _make_instance(engine)
+    yield inst
+    engine.dispose()
 
 
 @pytest.fixture
@@ -368,6 +384,217 @@ def test_refresh_schema_empties_the_column_map_when_the_table_is_gone(instance):
     instance.refresh_schema({})
 
     assert iglobal.schema == {}
+
+
+# ---------------------------------------------------------------------------
+# The lazy rebuild that refresh_schema re-arms must be safe under concurrency
+# ---------------------------------------------------------------------------
+
+
+class _PausingInspector:
+    """Inspector proxy that suspends one ``get_columns`` walk mid-flight.
+
+    ``_getTableSchema`` iterates the column list it gets back, so returning an
+    iterable that stops partway leaves the rebuild genuinely in progress --
+    which is the state a concurrent reader used to be able to observe. Every
+    other inspector call is delegated untouched.
+    """
+
+    def __init__(self, inner, *, entered, release, armed, fail_after=None):
+        self._inner = inner
+        self._entered = entered
+        self._release = release
+        self._armed = armed
+        self._fail_after = fail_after
+
+    def __getattr__(self, name):
+        """Delegate everything this proxy does not override."""
+        return getattr(self._inner, name)
+
+    def get_columns(self, table, *args, **kwargs):
+        """Return the real column list, pausing (once) partway through it."""
+        columns = self._inner.get_columns(table, *args, **kwargs)
+        if not self._armed.is_set():
+            return columns
+        self._armed.clear()  # one walk only; later reflections run at full speed
+        return self._pause_midway(columns)
+
+    def _pause_midway(self, columns):
+        for index, column in enumerate(columns):
+            if index == 1:
+                self._entered.set()
+                assert self._release.wait(timeout=10), 'the paused rebuild was never released'
+                if self._fail_after:
+                    raise RuntimeError('reflection failed midway')
+            yield column
+
+
+def _install_pausing_inspector(monkeypatch, *, entered, release, armed, fail_after=None):
+    """Patch the inspect() db_global_base calls so one column walk can be paused."""
+    real_inspect = db_global_base_module.inspect
+
+    def _inspect(target):
+        return _PausingInspector(
+            real_inspect(target), entered=entered, release=release, armed=armed, fail_after=fail_after
+        )
+
+    monkeypatch.setattr(db_global_base_module, 'inspect', _inspect)
+
+
+def test_a_concurrent_insert_waits_for_the_schema_rebuild(file_instance, monkeypatch):
+    """A second insert must never build its row from a half-rebuilt column map.
+
+    ``refresh_schema`` empties ``IGlobal.schema``; the next ``_insertData``
+    refills it through ``_getTableSchema``, which used to publish the map and
+    then grow it column by column. A second insert arriving inside that window
+    found a truthy but incomplete map, skipped the rebuild, and silently
+    dropped every column not yet added -- the row landed with NULLs in columns
+    the caller had supplied.
+
+    The rebuild is held open inside the column walk, so the window is real and
+    not simulated. Once the lock covers check + rebuild + snapshot, the second
+    insert provably cannot proceed until the first has published, so the
+    assertions below do not depend on how long the window is held open.
+    """
+    inst = file_instance
+    iglobal = inst.IGlobal
+    iglobal.table = 'widgets'
+    inst.execute({'sql': 'CREATE TABLE widgets (label TEXT, size INTEGER)'})
+    iglobal.schema = {}  # the state refresh_schema leaves behind
+
+    entered, release, armed = threading.Event(), threading.Event(), threading.Event()
+    reached_table_check = threading.Event()
+    armed.set()
+    _install_pausing_inspector(monkeypatch, entered=entered, release=release, armed=armed)
+
+    errors: list[BaseException] = []
+
+    def _insert(row, ready=None):
+        try:
+            if ready is not None:
+                ready.set()
+            inst._insertData([row])
+        except BaseException as exc:  # noqa: BLE001 - the test reports whatever escaped
+            errors.append(exc)
+
+    rebuilder = threading.Thread(target=_insert, args=({'label': 'a', 'size': 1},))
+    rebuilder.start()
+    assert entered.wait(timeout=10), 'the rebuild never started'
+
+    reader = threading.Thread(target=_insert, args=({'label': 'b', 'size': 2}, reached_table_check))
+    reader.start()
+    assert reached_table_check.wait(timeout=10)
+    # Give the reader every chance to race ahead into the schema check; under
+    # the lock it cannot finish, so the timeout is the expected outcome here.
+    reader.join(timeout=0.5)
+    release.set()
+
+    for thread in (rebuilder, reader):
+        thread.join(timeout=10)
+    assert not any(thread.is_alive() for thread in (rebuilder, reader))
+    assert errors == []
+
+    assert set(iglobal.schema) == {'label', 'size'}
+    rows = inst.execute({'sql': 'SELECT label, size FROM widgets ORDER BY label'})['rows']
+    assert rows == [{'label': 'a', 'size': 1}, {'label': 'b', 'size': 2}]
+
+
+def test_refresh_schema_overlapping_a_rebuild_is_safe(file_instance, monkeypatch):
+    """refresh_schema arriving during a rebuild must not raise or lose columns."""
+    inst = file_instance
+    iglobal = inst.IGlobal
+    iglobal.table = 'widgets'
+    inst.execute({'sql': 'CREATE TABLE widgets (label TEXT, size INTEGER)'})
+    iglobal.schema = {}
+
+    entered, release, armed = threading.Event(), threading.Event(), threading.Event()
+    armed.set()
+    _install_pausing_inspector(monkeypatch, entered=entered, release=release, armed=armed)
+
+    errors: list[BaseException] = []
+
+    def _insert():
+        try:
+            inst._insertData([{'label': 'a', 'size': 1}])
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    def _refresh():
+        try:
+            inst.refresh_schema({})
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    rebuilder = threading.Thread(target=_insert)
+    rebuilder.start()
+    assert entered.wait(timeout=10), 'the rebuild never started'
+
+    refresher = threading.Thread(target=_refresh)
+    refresher.start()
+    refresher.join(timeout=0.5)
+    release.set()
+
+    for thread in (rebuilder, refresher):
+        thread.join(timeout=10)
+    assert not any(thread.is_alive() for thread in (rebuilder, refresher))
+    assert errors == []
+
+    # Whichever order the two finished in, the next insert sees every column.
+    inst._insertData([{'label': 'b', 'size': 2}])
+    assert set(iglobal.schema) == {'label', 'size'}
+    rows = inst.execute({'sql': 'SELECT label, size FROM widgets ORDER BY label'})['rows']
+    assert rows == [{'label': 'a', 'size': 1}, {'label': 'b', 'size': 2}]
+
+
+def test_a_failed_rebuild_leaves_no_partial_column_map(file_instance, monkeypatch):
+    """A rebuild that dies midway must leave the cache untouched, not half built.
+
+    ``_getTableSchema`` published ``self.schema = {}`` before reading a single
+    column, so a reflection that failed partway left a map holding whichever
+    columns it had reached. The next insert would have believed it.
+    """
+    inst = file_instance
+    iglobal = inst.IGlobal
+    iglobal.table = 'widgets'
+    inst.execute({'sql': 'CREATE TABLE widgets (label TEXT, size INTEGER, colour TEXT)'})
+    iglobal.schema = {}
+
+    entered, release, armed = threading.Event(), threading.Event(), threading.Event()
+    armed.set()
+    release.set()  # fail immediately rather than pausing
+    _install_pausing_inspector(monkeypatch, entered=entered, release=release, armed=armed, fail_after=True)
+
+    with pytest.raises(RuntimeError, match='schema could not be retrieved'):
+        inst._insertData([{'label': 'a', 'size': 1, 'colour': 'red'}])
+
+    assert iglobal.schema == {}
+
+    # The lock is released on the failure path, not stranded.
+    assert _REFLECT_LOCK.acquire(blocking=False)
+    _REFLECT_LOCK.release()
+
+
+def test_insert_follows_a_column_added_and_then_dropped(instance):
+    """Added and dropped columns both reach the insert lane after a refresh."""
+    iglobal = instance.IGlobal
+    iglobal.table = 'widgets'
+
+    instance.execute({'sql': 'CREATE TABLE widgets (label TEXT)'})
+    iglobal.schema = {name: (col_type, '') for name, col_type in iglobal._getTableSchema('widgets')}
+
+    instance.execute({'sql': 'ALTER TABLE widgets ADD COLUMN size INTEGER'})
+    instance.refresh_schema({})
+    assert _compiled_insert_columns(instance, [{'label': 'a', 'size': 7}]) == ['label', 'size']
+    assert instance.execute({'sql': 'SELECT label, size FROM widgets'})['rows'] == [{'label': 'a', 'size': 7}]
+
+    instance.execute({'sql': 'ALTER TABLE widgets DROP COLUMN size'})
+    instance.refresh_schema({})
+    # The dropped column is gone from the rebuilt map, so it is never bound.
+    assert _compiled_insert_columns(instance, [{'label': 'b', 'size': 7}]) == ['label']
+    assert instance.execute({'sql': 'SELECT label FROM widgets ORDER BY label'})['rows'] == [
+        {'label': 'a'},
+        {'label': 'b'},
+    ]
 
 
 # ---------------------------------------------------------------------------
