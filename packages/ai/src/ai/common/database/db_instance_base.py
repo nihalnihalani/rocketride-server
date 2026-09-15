@@ -381,15 +381,23 @@ class DatabaseInstanceBase(IInstanceBase, ABC):
                 self._releaseFailedSession(session_id)
                 # `from None` keeps the driver traceback out of the tool response.
                 raise RuntimeError(f'SQL execution failed: {self.IGlobal._format_db_error(e)}') from None
-            except Exception:
-                # Everything else that can come back from the registry: the
-                # max_rows RuntimeError above all, which is not a SQLAlchemyError
-                # (so the arm above cannot swallow it) and whose wording callers
-                # and tests depend on. A failed session-bound execute would
-                # otherwise leave the connection pinned until idle-reaping, with
-                # the aborted statement still committable; roll the session back
-                # to release it and discard the statement, then re-raise.
+            except Exception as e:
+                # Everything else that can come back from the registry. A failed
+                # session-bound execute would otherwise leave the connection
+                # pinned until idle-reaping, with the aborted statement still
+                # committable, so the session is released either way.
                 self._releaseFailedSession(session_id)
+                if getattr(e, 'orig', None) is not None:
+                    # A driver error the dialect did not wrap in a SQLAlchemy
+                    # exception (clickhouse-sqlalchemy's `DatabaseException`;
+                    # see `_executeRawQuery`). Same contract as the arm above,
+                    # so the session half cannot report a ClickHouse failure
+                    # differently from the sessionless half.
+                    error(f'Error executing raw SQL in session {session_id}: {e}')
+                    raise RuntimeError(f'SQL execution failed: {self.IGlobal._format_db_error(e)}') from None
+                # The max_rows RuntimeError above all, which is not a
+                # SQLAlchemyError (so the arm above cannot swallow it) and whose
+                # wording callers and tests depend on.
                 raise
         else:
             result = self._executeRawQuery(sql.strip(), params)
@@ -782,6 +790,27 @@ class DatabaseInstanceBase(IInstanceBase, ABC):
             error(f'Error executing raw SQL query: {e}')
             # `from None` keeps the driver traceback out of the tool response;
             # the formatted message already carries what the caller needs.
+            raise RuntimeError(f'SQL execution failed: {self.IGlobal._format_db_error(e)}') from None
+
+        except Exception as e:
+            # Not every dialect raises a SQLAlchemy exception. The known case is
+            # clickhouse-sqlalchemy's native connector -- what
+            # `clickhouse+native://` selects -- which raises its own
+            # `DatabaseException`, a plain `Exception` subclass carrying the
+            # driver's error in `.orig`; SQLAlchemy does not wrap a non-DBAPI
+            # exception, so the arm above never fires for that node and the raw
+            # text (server stack trace and the statement fragment at the error
+            # position included) went straight to the caller.
+            #
+            # Duck-typed on `.orig` rather than imported: this shared base must
+            # not depend on any one node's driver, and `.orig` IS the shape being
+            # handled -- a driver error carrying its original. Anything without
+            # it is not a database failure and is re-raised untouched: the
+            # max_execute_rows `RuntimeError` raised above most of all, whose
+            # wording and rollback callers depend on.
+            if getattr(e, 'orig', None) is None:
+                raise
+            error(f'Error executing raw SQL query: {e}')
             raise RuntimeError(f'SQL execution failed: {self.IGlobal._format_db_error(e)}') from None
 
     def _formatResultAsMarkdown(self, result: Any) -> str:

@@ -478,3 +478,123 @@ def test_session_execute_passes_the_primary_sentence_through_verbatim(instance_w
     assert '[SQL:' not in message
     assert '[parameters:' not in message
     assert 'sqlalche.me' not in message
+
+
+# ---------------------------------------------------------------------------
+# (f) A driver error the dialect does NOT wrap in a SQLAlchemy exception
+#
+# Constructed shape; driver not installed. clickhouse-sqlalchemy's native
+# connector (the one `clickhouse+native://` selects) raises its own
+# `DatabaseException` -- a plain Exception subclass carrying the driver's
+# ServerException in `.orig` -- and SQLAlchemy does not wrap a non-DBAPI
+# exception, so `except SQLAlchemyError` never fires for that node. The classes
+# below are shaped exactly like that pair.
+# ---------------------------------------------------------------------------
+
+
+class _StandInServerException(Exception):
+    """Stand-in for clickhouse_driver.errors.ServerException."""
+
+    def __init__(self, code, message, trailer=''):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self._trailer = trailer
+
+    def __str__(self):
+        """Render the driver's ``Code: N.`` form, stack trace included."""
+        return (
+            f'Code: {self.code}.\n{self.message}{self._trailer}. '
+            'Stack trace:\n\n0. DB::Exception::Exception(...) @ 0x1a2b3c\n'
+        )
+
+
+class _StandInDatabaseException(Exception):
+    """Stand-in for clickhouse_sqlalchemy.exceptions.DatabaseException."""
+
+    def __init__(self, orig):
+        super().__init__(orig)
+        self.orig = orig
+
+    def __str__(self):
+        """Prefix the wrapped driver error, as the real class does."""
+        return f'Orig exception: {self.orig}'
+
+
+def _clickhouse_syntax_error():
+    """A ClickHouse syntax error, wrapped the way its connector wraps one."""
+    return _StandInDatabaseException(
+        _StandInServerException(62, 'Syntax error', trailer=": failed at position 21 ('hunter2') (line 1, col 21)")
+    )
+
+
+@pytest.mark.parametrize('use_session', [False, True], ids=['sessionless', 'session'])
+def test_both_paths_format_a_driver_error_sqlalchemy_did_not_wrap(instance_with_sqlite_registry, use_session):
+    """The contract must not depend on whether the dialect raises a DBAPI error.
+
+    Constructed shape; clickhouse-sqlalchemy is not installed here. Without an
+    arm for it the caller got `Orig exception: Code: 62.` followed by the
+    server stack trace and the statement fragment the parser stopped on.
+    """
+    inst = instance_with_sqlite_registry
+    real_engine = inst.IGlobal.engine
+
+    if use_session:
+        sid = inst.begin({})['session_id']
+        held = inst.IGlobal.tx_registry._sessions[sid]
+        held.conn = _FailingConnection(_clickhouse_syntax_error(), inner=held.conn)
+        args = {'sql': "INSERT INTO t VALUES 'hunter2'", 'session_id': sid}
+    else:
+        inst.IGlobal.engine = _FailingEngine(_clickhouse_syntax_error())
+        args = {'sql': "INSERT INTO t VALUES 'hunter2'"}
+
+    try:
+        with pytest.raises(RuntimeError) as excinfo:
+            inst.execute(args)
+    finally:
+        inst.IGlobal.engine = real_engine
+
+    message = str(excinfo.value)
+    assert message.startswith('SQL execution failed: Error 62: ')
+    assert 'Stack trace' not in message
+    assert 'failed at position' not in message
+    assert "('hunter2')" not in message
+    assert 'Orig exception' not in message
+
+    if use_session:
+        # The session is released on this path too, as it is for a wrapped error.
+        with pytest.raises(ValueError, match='unknown or expired'):
+            inst.commit({'session_id': sid})
+
+
+@pytest.mark.parametrize('use_session', [False, True], ids=['sessionless', 'session'])
+def test_an_exception_without_orig_is_not_treated_as_a_database_error(instance_with_sqlite_registry, use_session):
+    """The new arm keys on ``.orig``, so it must not swallow anything else.
+
+    A programming error inside the driver is not a statement failure and must
+    reach the caller unchanged. The max-rows ``RuntimeError`` is the other
+    member of this class and is covered by
+    ``test_stateless_execute_overflow_rolls_back_write`` and
+    ``test_session_execute_overflow_releases_session``.
+    """
+    inst = instance_with_sqlite_registry
+    real_engine = inst.IGlobal.engine
+    boom = ValueError('driver bug, not a database error')
+
+    if use_session:
+        sid = inst.begin({})['session_id']
+        held = inst.IGlobal.tx_registry._sessions[sid]
+        held.conn = _FailingConnection(boom, inner=held.conn)
+        args = {'sql': 'SELECT 1', 'session_id': sid}
+    else:
+        inst.IGlobal.engine = _FailingEngine(boom)
+        args = {'sql': 'SELECT 1'}
+
+    try:
+        with pytest.raises(ValueError) as excinfo:
+            inst.execute(args)
+    finally:
+        inst.IGlobal.engine = real_engine
+
+    assert str(excinfo.value) == 'driver bug, not a database error'
+    assert 'SQL execution failed' not in str(excinfo.value)

@@ -285,16 +285,19 @@ class _FakeServerException(Exception):
         )
 
 
-def test_format_db_error_clickhouse_shape_is_cut_at_the_stack_trace(base):
-    """clickhouse-driver's ``.orig.args`` is not ``(errno, message)``.
+def test_format_db_error_clickhouse_dbapi_shape_is_cut_at_the_stack_trace(base):
+    """clickhouse-driver's OWN DBAPI shape: ``.orig.args`` is not ``(errno, message)``.
 
-    Driver not installed in this engine; the shape is reproduced from the
-    driver's documented behaviour — its DBAPI layer raises
-    ``OperationalError(ServerException)``, so ``args`` holds one exception
-    object rather than an ``(int, str)`` pair and every earlier branch of
-    ``_format_db_error`` falls through to ``str(orig)``. That string carries a
-    symbolised server stack trace, which is server internals the caller cannot
-    act on, so it is cut like any other tail.
+    Constructed shape; driver not installed. This is the layer
+    ``clickhouse_driver.dbapi`` exposes — ``OperationalError(ServerException)``,
+    so ``args`` holds one exception object rather than an ``(int, str)`` pair
+    and every earlier branch falls through to ``str(orig)``, which carries a
+    symbolised server stack trace the caller cannot act on.
+
+    Note the db_clickhouse node does NOT go through this DBAPI: it connects
+    with ``clickhouse+native://``, i.e. clickhouse-sqlalchemy's own connector,
+    whose exception shape is covered by
+    ``test_format_db_error_clickhouse_native_connector_shape_keeps_the_code``.
     """
     orig = _FakeDriverError(_FakeServerException(60, "Table default.widgets doesn't exist"))
     assert len(orig.args) == 1 and not isinstance(orig.args[0], str)
@@ -311,9 +314,9 @@ def test_format_db_error_clickhouse_shape_is_cut_at_the_stack_trace(base):
 def test_format_db_error_clickhouse_syntax_error_drops_the_position_echo(base):
     """ClickHouse quotes the failing statement fragment after ``failed at position``.
 
-    Same labelling as above: constructed, driver not installed. The fragment is
-    the same class of statement echo as psycopg2's ``LINE n:``, so it is cut at
-    the same kind of marker.
+    Constructed shape; driver not installed. The fragment is the same class of
+    statement echo as psycopg2's ``LINE n:``, so it is cut at the same kind of
+    marker.
     """
     orig = _FakeDriverError(
         _FakeServerException(62, 'Syntax error', trailer=": failed at position 21 ('hunter2') (line 1, col 21)")
@@ -322,6 +325,75 @@ def test_format_db_error_clickhouse_syntax_error_drops_the_position_echo(base):
 
     message = base._format_db_error(exc)
     assert message == 'Code: 62.\nDB::Exception: Syntax error:'
+    assert 'hunter2' not in message
+    assert 'Stack trace' not in message
+
+
+class _StandInClickHouseServerException(Exception):
+    """Stand-in for clickhouse_driver.errors.ServerException.
+
+    Carries the ClickHouse error code on ``.code`` and the text on ``.message``
+    (and in ``args``), which is where the code lives for this driver — not in
+    ``args[0]`` as an int, the way pymysql reports it.
+    """
+
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+    def __str__(self):
+        """Render the driver's ``Code: N.`` form."""
+        return f'Code: {self.code}.\n{self.message}'
+
+
+class _StandInClickHouseDatabaseException(Exception):
+    """Stand-in for clickhouse_sqlalchemy.exceptions.DatabaseException.
+
+    A plain ``Exception`` subclass — not a DBAPI error — carrying the driver's
+    exception on ``.orig``. This is what ``clickhouse+native://`` raises, so it
+    is the shape the db_clickhouse node actually produces.
+    """
+
+    def __init__(self, orig):
+        super().__init__(orig)
+        self.orig = orig
+
+    def __str__(self):
+        """Prefix the wrapped driver error, as the real class does."""
+        return f'Orig exception: {self.orig}'
+
+
+def test_format_db_error_clickhouse_native_connector_shape_keeps_the_code(base):
+    """The shape `clickhouse+native://` really raises, formatted like pymysql's.
+
+    Constructed shape; clickhouse-sqlalchemy is not installed here. Its
+    ``ServerException`` puts the code on ``.code`` rather than in ``args``, so
+    without a branch for it the caller saw the bare message and lost the code
+    that identifies the failure.
+    """
+    orig = _StandInClickHouseServerException(60, "Table default.widgets doesn't exist")
+    exc = _StandInClickHouseDatabaseException(orig)
+
+    assert base._format_db_error(exc) == "Error 60: Table default.widgets doesn't exist"
+
+
+def test_format_db_error_clickhouse_native_connector_trims_the_message_tail(base):
+    """The code branch still runs through the stripper, so tails inside it go.
+
+    ClickHouse builds its ``message`` from the server payload, which carries
+    both the statement fragment at the error position and the server stack
+    trace; the markers cut them here as they do anywhere else.
+    """
+    orig = _StandInClickHouseServerException(
+        62,
+        "Syntax error: failed at position 21 ('hunter2') (line 1, col 21). "
+        'Stack trace:\n\n0. DB::Exception::Exception(...) @ 0x1a2b3c\n',
+    )
+    exc = _StandInClickHouseDatabaseException(orig)
+
+    message = base._format_db_error(exc)
+    assert message == 'Error 62: Syntax error:'
     assert 'hunter2' not in message
     assert 'Stack trace' not in message
 

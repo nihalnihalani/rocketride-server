@@ -201,14 +201,17 @@ class DatabaseGlobalBase(IGlobalBase, ABC):
 
         * pymysql puts ``(errno, message)`` in ``.orig.args``
           -> ``Error <code>: <message>``.
-        * clickhouse-driver does NOT: its DBAPI layer raises
-          ``OperationalError(ServerException)``, so ``.orig.args`` holds one
-          exception object and every branch here falls through to
-          ``str(orig)`` -- ``Code: N.\nDB::Exception: <message>. Stack
-          trace: ...``. That is handled by the stripper rather than a branch:
-          ``Stack trace:`` and ``failed at position`` are markers, so the
-          server stack trace and the quoted statement fragment are cut like
-          any other tail.
+        * clickhouse-driver does NOT: its ``ServerException`` carries the code
+          on ``.code`` and the text on ``.message``, so those attributes are
+          read directly -> ``Error <code>: <message>``. The message itself
+          carries the server stack trace and, for a syntax error, the
+          statement fragment after ``failed at position``; both are cut by the
+          stripper's markers like any other tail. Note the two layers differ:
+          ``clickhouse_driver.dbapi`` raises ``OperationalError(ServerException)``,
+          while ``clickhouse+native://`` -- what the db_clickhouse node uses --
+          is clickhouse-sqlalchemy's connector and raises its own
+          ``DatabaseException``, a plain ``Exception`` carrying the same
+          ``ServerException`` in ``.orig``. Both unwrap to the same place.
         * psycopg2 exposes the server's primary message on ``.orig.diag``;
           its ``str()`` also carries the ``LINE n:`` echo of the statement,
           which psycopg2 has already interpolated the bind values into.
@@ -267,6 +270,15 @@ class DatabaseGlobalBase(IGlobalBase, ABC):
                 code = getattr(orig, 'pgcode', None)
                 formatted = f'Error {code}: {primary}' if isinstance(code, str) and code else primary
                 return _strip_statement_detail(formatted)
+
+            # clickhouse-driver's ServerException carries the code on `.code`
+            # and the text on `.message`, not as an (int, str) pair in args, so
+            # the numeric branch above misses it and args[0] alone would drop
+            # the code that identifies the failure.
+            code = getattr(orig, 'code', None)
+            message = getattr(orig, 'message', None)
+            if isinstance(code, int) and isinstance(message, str) and message.strip():
+                return _strip_statement_detail(f'Error {code}: {message}')
 
             # sqlite3 and the generic DBAPI shape: args[0] is the message.
             if is_seq and args and isinstance(args[0], str) and args[0].strip():
