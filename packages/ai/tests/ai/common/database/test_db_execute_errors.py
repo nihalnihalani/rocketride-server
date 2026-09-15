@@ -41,7 +41,7 @@ import re
 import threading
 
 import pytest
-from sqlalchemy import MetaData, Table as SQLTable, create_engine, event, insert
+from sqlalchemy import MetaData, Table as SQLTable, Text, create_engine, event, insert
 from sqlalchemy.dialects import mysql, postgresql, sqlite
 from sqlalchemy.pool import StaticPool
 
@@ -573,6 +573,94 @@ def test_a_failed_rebuild_leaves_no_partial_column_map(file_instance, monkeypatc
     # The lock is released on the failure path, not stranded.
     assert _REFLECT_LOCK.acquire(blocking=False)
     _REFLECT_LOCK.release()
+
+
+def test_a_concurrent_insert_waits_for_the_auto_created_column_map(file_instance, monkeypatch):
+    """The auto-create path is the second writer of the map, and it publishes too.
+
+    ``_createTableFromData`` created the table and then filled ``self.schema``
+    column by column, outside ``_REFLECT_LOCK`` — the same publish-then-fill
+    shape ``_getTableSchema`` was fixed for. A second first-batch arriving
+    after the CREATE found a truthy one-column map, snapshotted it under the
+    lock, and silently dropped every other column the row carried.
+
+    The fill loop is paused through the type object it stringifies, so the real
+    loop runs; the lock is NOT widened over table creation.
+    """
+    inst = file_instance
+    iglobal = inst.IGlobal
+    iglobal.table = 'widgets'
+
+    entered, release = threading.Event(), threading.Event()
+    calls = {'n': 0}
+
+    class _PausingText(Text):
+        """A Text type whose str() blocks once, partway through the fill loop."""
+
+        def __str__(self):
+            """Stringify as TEXT, pausing on the second column of the first pass."""
+            calls['n'] += 1
+            if calls['n'] == 2 and not entered.is_set():
+                entered.set()
+                assert release.wait(timeout=10), 'the paused fill loop was never released'
+            return 'TEXT'
+
+    monkeypatch.setattr(db_global_base_module.DatabaseGlobalBase, '_inferColumnType', lambda self, value: _PausingText)
+
+    errors: list[BaseException] = []
+
+    def _insert(row):
+        try:
+            inst._insertData([row])
+        except BaseException as exc:  # noqa: BLE001 - the test reports whatever escaped
+            errors.append(exc)
+
+    creator = threading.Thread(target=_insert, args=({'label': 'a', 'size': 'one', 'colour': 'red'},))
+    creator.start()
+    assert entered.wait(timeout=10), 'the auto-create never reached its fill loop'
+    # The table now exists and the map holds exactly one of its three columns.
+    assert set(iglobal.schema) != {'label', 'size', 'colour'}
+
+    reader = threading.Thread(target=_insert, args=({'label': 'b', 'size': 'two', 'colour': 'blue'},))
+    reader.start()
+    # Under the lock the reader cannot finish while the map is unpublished, so
+    # this timeout is the expected outcome; without it the window is wider.
+    reader.join(timeout=0.5)
+    release.set()
+
+    for thread in (creator, reader):
+        thread.join(timeout=10)
+    assert not any(thread.is_alive() for thread in (creator, reader))
+    assert errors == []
+
+    rows = inst.execute({'sql': 'SELECT label, size, colour FROM widgets ORDER BY label'})['rows']
+    assert rows == [
+        {'label': 'a', 'size': 'one', 'colour': 'red'},
+        {'label': 'b', 'size': 'two', 'colour': 'blue'},
+    ]
+
+
+def test_a_failed_reflection_leaves_the_previous_column_map_in_place(file_instance, monkeypatch):
+    """Publishing once means the OLD map survives a failure, not that it is reset.
+
+    The concurrency test above starts from an empty map, so it cannot tell
+    "left untouched" from "reset to {}". This one seeds a stale map and calls
+    ``_getTableSchema`` directly.
+    """
+    inst = file_instance
+    iglobal = inst.IGlobal
+    inst.execute({'sql': 'CREATE TABLE widgets (label TEXT, size INTEGER)'})
+
+    stale = {'stale_column': ('TEXT', 'from an earlier reflection')}
+    iglobal.schema = dict(stale)
+
+    entered, release, armed = threading.Event(), threading.Event(), threading.Event()
+    armed.set()
+    release.set()  # fail immediately rather than pausing
+    _install_pausing_inspector(monkeypatch, entered=entered, release=release, armed=armed, fail_after=True)
+
+    assert iglobal._getTableSchema('widgets') is None
+    assert iglobal.schema == stale
 
 
 def test_insert_follows_a_column_added_and_then_dropped(instance):
