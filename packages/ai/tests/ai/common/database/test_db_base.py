@@ -263,6 +263,69 @@ def test_format_db_error_mysql_duplicate_entry_keeps_the_value_the_caller_sent(b
     assert 'sqlalche.me' not in message
 
 
+class _FakeServerException(Exception):
+    """Stand-in for clickhouse_driver.errors.ServerException.
+
+    Its ``str()`` is what the driver's DBAPI wrapper ends up rendering: a code
+    line, the message, and a symbolised server stack trace.
+    """
+
+    def __init__(self, code, message, trailer=''):
+        super().__init__(code, message)
+        self._code = code
+        self._message = message
+        self._trailer = trailer
+
+    def __str__(self):
+        """Render the driver's documented ``Code: N.\nDB::Exception: …`` form."""
+        return (
+            f'Code: {self._code}.\nDB::Exception: {self._message}{self._trailer}. '
+            'Stack trace:\n\n0. DB::Exception::Exception(...) @ 0x1a2b3c\n'
+            '1. DB::throwAtAssertionFailed(...) @ 0x4d5e6f\n'
+        )
+
+
+def test_format_db_error_clickhouse_shape_is_cut_at_the_stack_trace(base):
+    """clickhouse-driver's ``.orig.args`` is not ``(errno, message)``.
+
+    Driver not installed in this engine; the shape is reproduced from the
+    driver's documented behaviour — its DBAPI layer raises
+    ``OperationalError(ServerException)``, so ``args`` holds one exception
+    object rather than an ``(int, str)`` pair and every earlier branch of
+    ``_format_db_error`` falls through to ``str(orig)``. That string carries a
+    symbolised server stack trace, which is server internals the caller cannot
+    act on, so it is cut like any other tail.
+    """
+    orig = _FakeDriverError(_FakeServerException(60, "Table default.widgets doesn't exist"))
+    assert len(orig.args) == 1 and not isinstance(orig.args[0], str)
+    exc = _wrapped(orig, 'SELECT * FROM widgets', {})
+
+    message = base._format_db_error(exc)
+    assert message == "Code: 60.\nDB::Exception: Table default.widgets doesn't exist."
+    assert 'Stack trace' not in message
+    assert '0x1a2b3c' not in message
+    assert '[SQL:' not in message
+    assert '[parameters:' not in message
+
+
+def test_format_db_error_clickhouse_syntax_error_drops_the_position_echo(base):
+    """ClickHouse quotes the failing statement fragment after ``failed at position``.
+
+    Same labelling as above: constructed, driver not installed. The fragment is
+    the same class of statement echo as psycopg2's ``LINE n:``, so it is cut at
+    the same kind of marker.
+    """
+    orig = _FakeDriverError(
+        _FakeServerException(62, 'Syntax error', trailer=": failed at position 21 ('hunter2') (line 1, col 21)")
+    )
+    exc = _wrapped(orig, "INSERT INTO t VALUES 'hunter2'", {})
+
+    message = base._format_db_error(exc)
+    assert message == 'Code: 62.\nDB::Exception: Syntax error:'
+    assert 'hunter2' not in message
+    assert 'Stack trace' not in message
+
+
 def test_format_db_error_mysql_keeps_a_quoted_identifier_intact(base):
     """Why quoted tokens are not redacted wholesale.
 

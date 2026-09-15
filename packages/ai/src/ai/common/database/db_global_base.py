@@ -74,6 +74,9 @@ DEFAULT_MAX_EXECUTE_ROWS = 25000
 #     client-side, so that line can contain the parameters verbatim.
 #   * PostgreSQL DETAIL/HINT/CONTEXT/QUERY/STATEMENT blocks routinely restate
 #     the offending key values ("Key (email)=(a@b.com) already exists.").
+#   * ClickHouse appends a symbolised server stack trace ("Stack trace:\n\n0.
+#     DB::Exception::Exception(...) @ 0x...") the caller cannot act on, and
+#     quotes the failing statement fragment after "failed at position N".
 #
 # The primary message alone -- "no such column: foo", "duplicate key value
 # violates unique constraint users_email_key" -- is what a caller needs in
@@ -91,6 +94,8 @@ _DB_ERROR_DETAIL = re.compile(
         | CONTEXT:
         | QUERY:
         | STATEMENT:
+        | Stack\ trace:
+        | failed\ at\ position
     )""",
     re.VERBOSE,
 )
@@ -194,8 +199,16 @@ class DatabaseGlobalBase(IGlobalBase, ABC):
         exactly the data that must stay in the server log. So each driver
         shape is unwrapped explicitly and only the primary message is kept:
 
-        * pymysql / clickhouse-driver put ``(errno, message)`` in ``.orig.args``
+        * pymysql puts ``(errno, message)`` in ``.orig.args``
           -> ``Error <code>: <message>``.
+        * clickhouse-driver does NOT: its DBAPI layer raises
+          ``OperationalError(ServerException)``, so ``.orig.args`` holds one
+          exception object and every branch here falls through to
+          ``str(orig)`` -- ``Code: N.\nDB::Exception: <message>. Stack
+          trace: ...``. That is handled by the stripper rather than a branch:
+          ``Stack trace:`` and ``failed at position`` are markers, so the
+          server stack trace and the quoted statement fragment are cut like
+          any other tail.
         * psycopg2 exposes the server's primary message on ``.orig.diag``;
           its ``str()`` also carries the ``LINE n:`` echo of the statement,
           which psycopg2 has already interpolated the bind values into.
