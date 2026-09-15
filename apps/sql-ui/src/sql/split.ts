@@ -128,10 +128,13 @@ function traitsFor(dialect: SqlDialect): IScanTraits {
  * (_)", and may continue with "letters, underscores, digits (0-9), or dollar
  * signs ($)". Which non-ASCII characters count as letters depends on the
  * server's encoding and locale, and the backend simply treats any byte >= 0x80
- * as an identifier character; `-￿` is that rule in UTF-16, with no
- * `u` flag so an astral character still matches through its surrogates.
+ * as an identifier character; U+0080 through U+FFFF is that rule in UTF-16,
+ * with no `u` flag so an astral character still matches through its
+ * surrogates. Both bounds are written as escapes: the raw code points are
+ * a C1 control character and a noncharacter, invisible in an editor and
+ * easy for a copy or a diff tool to mangle.
  */
-const IDENTIFIER_CHAR = /[A-Za-z0-9_$-￿]/;
+const IDENTIFIER_CHAR = /[A-Za-z0-9_$\u0080-\uffff]/;
 
 /**
  * Whether the quote at `open` is preceded by PostgreSQL's `E` string prefix.
@@ -277,7 +280,7 @@ function skipBlockComment(sql: string, open: number, nested: boolean): number {
  * case sensitive, so `$Tag$` is not closed by `$tag$`; matching is by exact
  * text and needs no rule of its own.
  */
-const DOLLAR_TAG = /^\$([A-Za-z_-￿][A-Za-z0-9_-￿]*)?\$/;
+const DOLLAR_TAG = /^\$([A-Za-z_\u0080-\uffff][A-Za-z0-9_\u0080-\uffff]*)?\$/;
 
 /**
  * Skip a PostgreSQL dollar-quoted body. Returns `open` unchanged when the `$`

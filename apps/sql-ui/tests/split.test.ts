@@ -283,7 +283,7 @@ const CASES: ISplitCase[] = [
 		expect: ['SELECT $1abc$ a', 'SELECT 2'],
 	},
 	{
-		// The identifier `caf\u00e9` continues across the `$`, exactly as `foo$tag$`
+		// The identifier `café` continues across the `$`, exactly as `foo$tag$`
 		// does above; reading it as a quote would swallow the separator.
 		name: 'postgres dollar quote must not continue a non-ASCII identifier',
 		sql: 'SELECT caf\u00e9$tag$; SELECT 2',
@@ -299,7 +299,7 @@ const CASES: ISplitCase[] = [
 		expect: ['SELECT $Tag$ a; b $tag$ x $Tag$', 'SELECT 2'],
 	},
 	{
-		// `Stra\u00dfe` is one identifier, so its trailing `e` is not the `E'...'`
+		// `Straße` is one identifier, so its trailing `e` is not the `E'...'`
 		// escape prefix: the backslash does not escape the closing quote and
 		// the `;` after it still separates. The identifier class decides this,
 		// which is why it has to match the one the tag rule uses.
