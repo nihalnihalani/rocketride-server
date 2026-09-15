@@ -490,6 +490,25 @@ describe('hasTopLevelKeyword', () => {
 	it('does not match a WHERE inside a longer word', () => {
 		assert.equal(hasTopLevelKeyword('UPDATE t SET wherewithal = 1', 'where', 'unknown'), false);
 	});
+
+	it('does not match a word that continues with a non-ASCII letter', () => {
+		// The identifier class decides where a word ends, and it reaches past
+		// ASCII; `\b` does not, and would end the word at the `\u00e9`.
+		assert.equal(hasTopLevelKeyword('DELETE FROM t where\u00e9', 'where', 'unknown'), false);
+		assert.equal(hasTopLevelKeyword('DELETE FROM t \u00e9where', 'where', 'unknown'), false);
+		assert.equal(hasTopLevelKeyword('DELETE FROM t caf\u00e9where_x', 'where', 'unknown'), false);
+	});
+
+	it('still matches a keyword between non-identifier characters', () => {
+		assert.equal(hasTopLevelKeyword('DELETE FROM t WHERE id = 1', 'where', 'unknown'), true);
+		assert.equal(hasTopLevelKeyword('DELETE FROM t\nWHERE id = 1', 'where', 'unknown'), true);
+		assert.equal(hasTopLevelKeyword('SELECT 1 LIMIT 5', 'limit', 'unknown'), true);
+	});
+
+	it('finds two occurrences that share one separator', () => {
+		const sites = keywordSites('SELECT a WHERE WHERE', ['where'], 'unknown');
+		assert.equal(sites.length, 2);
+	});
 });
 
 // =============================================================================

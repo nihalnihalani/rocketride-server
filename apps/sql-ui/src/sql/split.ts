@@ -152,8 +152,15 @@ function traitsFor(dialect: SqlDialect): IScanTraits {
  * surrogates. Both bounds are written as escapes: the raw code points are
  * a C1 control character and a noncharacter, invisible in an editor and
  * easy for a copy or a diff tool to mangle.
+ *
+ * The class body is kept as a string because the keyword search builds its own
+ * boundaries from it: where an identifier ends is one rule, and the two places
+ * that care must not drift apart.
  */
-const IDENTIFIER_CHAR = /[A-Za-z0-9_$\u0080-\uffff]/;
+const IDENTIFIER_CLASS = 'A-Za-z0-9_$\\u0080-\\uffff';
+
+/** {@link IDENTIFIER_CLASS} as a test for one character. */
+const IDENTIFIER_CHAR = new RegExp(`[${IDENTIFIER_CLASS}]`);
 
 /**
  * Whether the quote at `open` is preceded by PostgreSQL's `E` string prefix.
@@ -483,18 +490,25 @@ interface IKeywordHit {
  * @returns The occurrences, in text order.
  */
 function keywordHits(masked: string, keyword: string): IKeywordHit[] {
-	const needle = new RegExp(`\\b${keyword}\\b`, 'gi');
+	// The boundary is the IDENTIFIER class, not `\b`: `\b` is ASCII-only, so it
+	// would end the word between `where` and the `é` of the legal alias
+	// `whereé` and read that alias as a WHERE clause. The leading boundary is
+	// CONSUMED rather than looked behind — lookbehind reached Safari only in
+	// 16.4, and this app supports Safari 13 — so the keyword starts after
+	// whatever group 1 matched.
+	const needle = new RegExp(`(^|[^${IDENTIFIER_CLASS}])(${keyword})(?![${IDENTIFIER_CLASS}])`, 'gi');
 	const hits: IKeywordHit[] = [];
 	const open: number[] = [];
 	let scanned = 0;
 	let match = needle.exec(masked);
 	while (match) {
-		for (; scanned < match.index; scanned++) {
+		const at = match.index + match[1].length;
+		for (; scanned < at; scanned++) {
 			const ch = masked[scanned];
 			if (ch === '(') open.push(scanned);
 			else if (ch === ')') open.pop();
 		}
-		hits.push({ index: match.index, depth: open.length, group: open.length > 0 ? open[open.length - 1] : -1 });
+		hits.push({ index: at, depth: open.length, group: open.length > 0 ? open[open.length - 1] : -1 });
 		match = needle.exec(masked);
 	}
 	return hits;

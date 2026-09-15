@@ -197,6 +197,34 @@ describe('patternCheck', () => {
 	it('flags a clickhouse ALTER ... DELETE as ALTER', () => {
 		assert.deepEqual(patternCheck('ALTER TABLE orders DELETE WHERE id = 5'), { kind: 'ALTER' });
 	});
+
+	it('does not read a non-ASCII alias as a WHERE clause', () => {
+		// `where\u00e9` is a legal PostgreSQL identifier. JavaScript's \b sees a
+		// word boundary between `where` and `\u00e9`, so the alias satisfied the
+		// WHERE test and a full-table delete went unasked.
+		assert.deepEqual(
+			patternCheck('DELETE FROM t where\u00e9'),
+			{ kind: 'DELETE without WHERE' },
+		);
+		assert.deepEqual(
+			patternCheck('DELETE FROM t AS where\u00e9'),
+			{ kind: 'DELETE without WHERE' },
+		);
+		assert.deepEqual(
+			patternCheck('UPDATE t where\u00e9 SET x = 1'),
+			{ kind: 'UPDATE without WHERE' },
+		);
+		assert.deepEqual(
+			patternCheck('DELETE FROM t \u00e9where'),
+			{ kind: 'DELETE without WHERE' },
+		);
+	});
+
+	it('still reads an ASCII alias and a real WHERE correctly', () => {
+		assert.deepEqual(patternCheck('DELETE FROM t where_e'), { kind: 'DELETE without WHERE' });
+		assert.deepEqual(patternCheck('DELETE FROM t whereX'), { kind: 'DELETE without WHERE' });
+		assert.equal(patternCheck('DELETE FROM t WHERE id = 1'), null);
+	});
 });
 
 // =============================================================================
