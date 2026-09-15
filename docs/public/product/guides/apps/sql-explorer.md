@@ -153,10 +153,11 @@ or add LIMIT.`
 
 ### Pattern checks
 
-Before running `UPDATE` or `DELETE` with no `WHERE`, or `TRUNCATE`, `DROP`
-or `ALTER`, the app asks: `Pattern check: <kind> detected. This is a text
-check, not a database safeguard.` Confirm with **Run statement**, or **Run
-and stop asking on this connection**.
+Before running `UPDATE` or `DELETE` with no `WHERE`, an `UPDATE` or
+`DELETE` inside a `WITH` clause, or `TRUNCATE`, `DROP` or `ALTER`, the app
+asks: `Pattern check: <kind> detected. This is a text check, not a database
+safeguard.` Confirm with **Run statement**, or **Run and stop asking on this
+connection**.
 
 A statement that begins with `WITH` is checked on the verb the chain
 carries: `WITH audit AS (SELECT id FROM orders) DELETE FROM orders` deletes
@@ -199,11 +200,19 @@ message is in the pipeline node's log either way.
 ### Stop waiting
 
 Nothing in the tool protocol cancels a running statement. A second after a
-statement reaches the database a **Stop waiting** button appears — not while
-a confirmation is still open, since nothing has been sent yet — and it does
-exactly what it says: the app stops listening and discards the late answer. The banner is explicit —
-`Stopped waiting after N.N s. The statement may still be running on the
-database; this tool cannot cancel it.` To stop it, stop it on the database.
+statement reaches the database a **Stop waiting** button appears, and it
+does exactly what it says: the app stops listening and discards the late
+answer.
+
+It is not offered while a confirmation is still open, because nothing has
+been sent yet. In a run of several statements the second is counted from the
+first one dispatched, so the button stays available for the rest of an
+uninterrupted run; a confirmation between statements takes it away until the
+next statement is sent.
+
+The banner is explicit — `Stopped waiting after N.N s. The statement may
+still be running on the database; this tool cannot cancel it.` To stop it,
+stop it on the database.
 
 ### Autocomplete
 

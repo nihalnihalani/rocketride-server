@@ -515,9 +515,17 @@ export const QueryView: React.FC<IQueryViewProps> = ({ endpoint, label, initialS
 	// "Stop waiting" only appears once a statement IN FLIGHT has been slow.
 	// Keying this on `running` offered it while a confirmation was open, and
 	// clicking it then announced that the database might still be running a
-	// statement that had never been sent. The timer restarts per statement,
-	// which is right: between two statements of a batch nothing is at the
-	// database, so nothing is being waited for.
+	// statement that had never been sent.
+	//
+	// The timer measures an uninterrupted STRETCH of statements, not each one:
+	// the publish that resolves statement i and the publish that dispatches
+	// i + 1 happen in the same microtask continuation, and React 18 batches
+	// them into one render (the app mounts with `createRoot`,
+	// packages/shell/src/bootstrap.tsx:94), so `inFlight` never observes false
+	// in between and the effect does not re-run. What does reset it is a
+	// confirmation dialog: nothing is at the database while one is open, so
+	// the next statement starts the second again. Both are correct for what
+	// the button says.
 	useEffect(() => {
 		if (!inFlight) {
 			setCanStop(false);
@@ -1002,7 +1010,7 @@ export const QueryView: React.FC<IQueryViewProps> = ({ endpoint, label, initialS
 						<Button
 							variant="ghost"
 							small
-							title="Confirmations for unbounded UPDATE/DELETE, TRUNCATE, DROP and ALTER are off for this connection. Click to turn them on."
+							title="Confirmations for unbounded UPDATE/DELETE, an UPDATE/DELETE inside a WITH clause, TRUNCATE, DROP and ALTER are off for this connection. Click to turn them on."
 							onClick={() => setPatternChecks(true)}
 						>
 							Pattern checks off

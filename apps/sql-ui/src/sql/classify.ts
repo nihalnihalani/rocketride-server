@@ -255,6 +255,9 @@ export function classifyStatement(sql: string, dialect: SqlDialect = 'unknown'):
  *   is named; the rest are not listed.
  * - A group's verb is read from its first leader, so a statement form whose
  *   leader is not in {@link WITH_LEADERS} is not judged at all.
+ * - A MERGE is never a finding, at either level, although its actions can
+ *   update or delete rows: only the verb that leads a group is read, and a
+ *   top-level MERGE is not confirmed either.
  * - Nothing here knows what the database will do with triggers or cascades.
  *
  * @param sql - One statement.
