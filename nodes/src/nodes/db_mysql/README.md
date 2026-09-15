@@ -42,8 +42,8 @@ configurable server-name prefix.
 | Function | Description |
 | --- | --- |
 | `get_data` | Generate a safe `SELECT` from a question and execute it. |
-| `get_schema` | Return the schema reflected when the node started. |
-| `refresh_schema` | Re-read the schema from the database and return it. |
+| `get_schema` | Return the schema snapshot the node currently holds. |
+| `refresh_schema` | Re-read the schema, replace the cache, and return it. |
 | `get_sql` | Generate a safe `SELECT` without executing it. |
 | `execute` | Run raw SQL, bypassing LLM translation and the safety check. |
 | `begin` | Open a transaction and return its session ID. |
@@ -54,22 +54,31 @@ configurable server-name prefix.
 `get_data` and `get_sql` require a non-empty `question`; `get_data` accepts an
 optional `limit`, defaulting to 250 and clamped to 1–25,000. `get_schema`
 accepts an optional `table`; an unknown table returns an `error` field, while
-omitting it returns all reflected tables. `refresh_schema` takes no arguments
-and re-reflects the database, so it sees tables created or altered since the
-node started; it returns the `get_schema` shape plus a `refreshed_at` UTC
-timestamp. It also clears the configured table's cached column map, so the
-`answers` insert lane picks up added or dropped columns on its next insert
-rather than continuing against the start-up shape. `get_data` returns
+omitting it returns all reflected tables. `get_schema` serves the snapshot the
+node currently holds — the reflection taken at start-up, replaced by each
+`refresh_schema` call — so DDL run since the last reflection is invisible to
+it until the next one. `refresh_schema` takes no arguments, re-reflects the
+database, replaces that database-wide cache, and returns the `get_schema`
+shape plus a `refreshed_at` UTC timestamp. It also invalidates the configured
+table's cached column map rather than rebuilding it there: the map is
+reflected afresh on the next `answers`-lane insert, which is how that insert
+picks up added or dropped columns instead of continuing against the start-up
+shape. `get_data` returns
 `{valid, rows, sql, row_limit}` on success; a non-database question returns
 `{valid: false, answer}`, and a query execution failure returns
 `{valid: false, error, sql, rows: []}`.
 
 `execute` requires non-empty `sql` and optionally accepts a transaction
 `session_id` plus positional values for `$1`, `$2`, and so on. It returns
-`{rows, affected_rows}`. `begin` takes no arguments and returns `{session_id}`;
-`commit` and `rollback` require that ID and return `{ok: true}`. These four
-write-capable operations fail when **Allow direct query execution** is off;
-unknown or expired session IDs also fail. Invalid tool input raises an error.
+`{rows, affected_rows}`. A failed statement raises `SQL execution failed:`
+followed by the driver's own primary message, identically with and without a
+`session_id`; the statement text and the bound parameter values are never
+part of it and stay in the server log, though that primary message may quote
+a value the caller itself submitted. `begin` takes no arguments and returns
+`{session_id}`; `commit` and `rollback` require that ID and return
+`{ok: true}`. These four write-capable operations fail when **Allow direct
+query execution** is off; unknown or expired session IDs also fail. Invalid
+tool input raises an error.
 
 ## Configuration
 

@@ -51,19 +51,26 @@ get_data returns {valid, rows, sql, row_limit} for a successful query. A
 generation or execution problem returns valid: false with error, SQL, or an LLM
 answer as applicable. It defaults to 250 rows; a supplied limit is clamped to
 the shared maximum. get_schema reports an unknown requested table as an error
-value rather than throwing; it serves the schema reflected when the node
-started, so refresh_schema is what sees DDL run since. refresh_schema takes no
-arguments and returns the re-reflected schema in the same {database, tables}
-shape get_schema returns, plus a refreshed_at UTC ISO-8601 timestamp recording
-when that reflection completed. It also clears the configured table's cached
-column map, so the answers insert lane picks up added or dropped columns on its
-next insert rather than continuing against the start-up shape.
+value rather than throwing; it serves the snapshot the node currently holds —
+the reflection taken at start-up, replaced by each refresh_schema call — so
+refresh_schema is what sees DDL run since the last reflection. refresh_schema
+takes no arguments and returns the re-reflected schema in the same {database,
+tables} shape get_schema returns, plus a refreshed_at UTC ISO-8601 timestamp
+recording when that reflection completed. Alongside replacing that
+database-wide cache it invalidates the configured table's cached column map
+rather than rebuilding it there: the map is reflected afresh on the next
+answers-lane insert, which is how that insert picks up added or dropped
+columns instead of continuing against the start-up shape.
 
 get_sql returns {sql, valid: true} only for safe generated SQL; unsafe SQL
 returns {error, sql, valid: false}. execute, begin, commit, and rollback raise
 for invalid input, an unknown or expired transaction, or when direct execution
 is disabled. A successful raw execution returns {rows, affected_rows}; begin
-returns {session_id} and transaction completion returns {ok: true}.
+returns {session_id} and transaction completion returns {ok: true}. A failed
+execute raises "SQL execution failed:" followed by the driver's own primary
+message, identically with and without a session_id; the statement text and the
+bound parameter values are never part of it and stay in the server log, though
+that primary message may quote a value the caller itself submitted.
 
 ## Configuration
 

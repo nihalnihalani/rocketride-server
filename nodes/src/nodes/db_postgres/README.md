@@ -61,7 +61,7 @@ answer questions — with the SELECT-only whitelist keeping it read-safe.
 
 If the LLM decides a question is not a database query, its text response is emitted instead of query results.
 
-The `questions` lane has one behaviour: every question is translated to SQL and executed. It does not branch on `Question.type` — there is no dialect or raw-SQL path on the lane, so a `QuestionType.DIALECT` or `QuestionType.EXECUTE` question is handled exactly like any other natural-language question. (The graph node `graph_neo4j` *does* dispatch on those two types; this node never has.) Reach the dialect and raw-SQL behaviours through the `dialect` and `execute` tool functions below instead.
+The `questions` lane has one behaviour: every question takes the natural-language path above, and only SQL the LLM generates for a question it judges to be a database query is executed — when it reports the question is not one (`isValid: false`), the prose answer is emitted and nothing runs against the database. The lane does not branch on `Question.type` — there is no dialect or raw-SQL path on the lane, so a `QuestionType.DIALECT` or `QuestionType.EXECUTE` question is handled exactly like any other natural-language question. (The graph node `graph_neo4j` *does* dispatch on those two types; this node never has.) Reach the dialect and raw-SQL behaviours through the `dialect` and `execute` tool functions below instead.
 
 ## As a tool
 
@@ -77,7 +77,7 @@ When connected to an agent, the node exposes nine functions: the five below, plu
 
 `get_data` and `get_sql` return `valid: false` with an `error` (unsafe SQL) or an `answer` (the question was not a database query) when no executable query is produced.
 
-`get_schema` serves the schema reflected when the node started, so a table created or altered since is invisible to it; `refresh_schema` takes no arguments and re-reflects the database. It refreshes both caches the node keeps: the database-wide schema that the natural-language path describes to the LLM, and the configured table's column map that the `answers` lane builds its INSERTs from — so a column added by DDL is populated on the next insert instead of being dropped as unknown.
+`get_schema` serves the snapshot the node currently holds — the reflection taken at start-up, replaced by each `refresh_schema` call — so a table created or altered since the last reflection is invisible to it until the next one. `refresh_schema` takes no arguments and re-reflects the database, updating both caches the node keeps, but not in the same way: it *replaces* the database-wide schema that the natural-language path describes to the LLM, and it *invalidates* the configured table's column map that the `answers` lane builds its INSERTs from. That column map is reflected afresh on the next insert, which is when a column added by DDL starts being populated instead of dropped as unknown.
 
 ### Raw SQL and transactions
 
@@ -85,7 +85,7 @@ Four more tool functions run raw SQL and explicit transactions. All four are gat
 
 | Tool       | Input                     | Returns                    | Description                                                                                                   |
 | ---------- | ------------------------- | -------------------------- | ------------------------------------------------------------------------------------------------------------- |
-| `execute`  | `{"sql": "<statement>"}`, optional `params` (positional `$1..$n`) and `session_id` | `{"rows": [...], "affected_rows": N}` | Runs the statement as written — no LLM translation and no SELECT-only check. Without a `session_id` it runs on a fresh auto-commit connection. A `SELECT` over the row cap (25,000 by default) fails and rolls back rather than returning a truncated result; a failed statement reports the driver's own message. |
+| `execute`  | `{"sql": "<statement>"}`, optional `params` (positional `$1..$n`) and `session_id` | `{"rows": [...], "affected_rows": N}` | Runs the statement as written — no LLM translation and no SELECT-only check. Without a `session_id` it runs on a fresh auto-commit connection. A `SELECT` over the row cap (25,000 by default) fails and rolls back rather than returning a truncated result; a failed statement raises `SQL execution failed:` followed by the driver's own primary message, identically with and without a `session_id` — the statement text and the bound parameter values are never included and stay in the server log, though that primary message may quote a value the caller itself submitted. |
 | `begin`    | _(none)_                  | `{"session_id": "<id>"}`   | Opens a new transaction and reserves a dedicated connection for it. Returns a `session_id` that callers must thread through subsequent `execute`, `commit`, and `rollback` calls. |
 | `commit`   | `{"session_id": "<id>"}` | `{"ok": true}`             | Commits all statements made on the given session, releases the held connection back to the pool, and removes the session entry. |
 | `rollback` | `{"session_id": "<id>"}` | `{"ok": true}`             | Discards all statements made on the given session, releases the held connection, and removes the session entry. |
