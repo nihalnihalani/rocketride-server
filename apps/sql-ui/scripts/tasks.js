@@ -53,7 +53,7 @@ mod.actions.push({
 	name: 'sql-ui:test',
 	action: () => ({
 		description: 'Test sql-ui',
-		run: async (ctx, task) => {
+		run: async (_ctx, task) => {
 			// Fail rather than pass silently. tests/ is tracked source, so an
 			// absent directory or a pattern that stops matching is a broken
 			// checkout, not an app without tests — and `builder test` runs this
