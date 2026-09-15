@@ -82,8 +82,13 @@ def _generated_primary_keys(table: SQLTable) -> set:
       covers ``code TEXT PRIMARY KEY DEFAULT ...`` and ``GENERATED AS IDENTITY``.
 
     Everything else -- a composite key, a TEXT key with no default -- is the
-    caller's to supply. Non-primary-key columns are out of scope: a column with
-    a default that the rows omit keeps today's behaviour of binding NULL.
+    caller's to supply. The set this returns also decides how an explicit null
+    reads: on one of these columns ``{'id': None}`` means "no value" and is
+    left to the database, because the insert lane's caller is an upstream node
+    emitting every schema key rather than a person choosing NULL. Anywhere else
+    a supplied null is bound as given. (``_insertData`` separately leaves out
+    any column -- key or not -- that carries a server default or an identity
+    and that the row omits.)
 
     The ``'auto'`` half of that rule is an approximation, and on SQLite it is
     measurably imperfect: ``id INT PRIMARY KEY``, ``id BIGINT PRIMARY KEY`` and
@@ -529,12 +534,18 @@ class DatabaseInstanceBase(IInstanceBase, ABC):
             # builds the batch from: that, not this assignment, is what stops a
             # concurrent insert reading a half-built map.
             #
-            # The rebuilt map is a plain reflection, so it carries the table's
-            # primary key while the map `_createTableFromData` curates for an
-            # auto-created table deliberately does not. `_insertData` drops
-            # unsupplied primary-key columns before binding, so the two maps
-            # produce the same INSERT and this invalidation cannot change
-            # answers-lane behaviour mid-task.
+            # The rebuilt map is a plain reflection, so it carries columns the
+            # map `_createTableFromData` curates for an auto-created table
+            # deliberately does not: the primary key, and anything DDL has
+            # added since. Changing what the INSERT carries is the POINT of the
+            # invalidation -- a column added by the DDL that prompted this call
+            # is exactly what the next insert should start populating.
+            #
+            # What cannot change is that the database still fills in what it
+            # owns: `_insertData` leaves out any primary key or server-default
+            # column the rows do not supply, so the columns that appear only in
+            # the reflected map are omitted rather than bound NULL, whichever
+            # of the two maps a given call is holding.
             self.IGlobal.schema = {}
             refreshed_at = datetime.now(timezone.utc).isoformat()
             tables = {name: _format_table(info) for name, info in self.IGlobal.db_schema.items()}
@@ -935,11 +946,9 @@ class DatabaseInstanceBase(IInstanceBase, ABC):
         # The check, the rebuild and the snapshot are one critical section.
         # `refresh_schema` empties `IGlobal.schema` to re-arm this rebuild, so
         # at runtime a second insert can arrive while the first is reflecting,
-        # and every intermediate state it might observe is wrong: an empty map
-        # sends it down the "no schema cached" branch, which binds the item's
-        # raw keys and skips the generated-key handling below; a half-built map
-        # silently drops the columns not yet added; and the map it holds must
-        # not change size while the per-row loop iterates it.
+        # and the intermediate states it would observe are wrong: a half-built
+        # map silently drops the columns not yet added, and the map it holds
+        # must not change size while the per-row loop iterates it.
         #
         # The lock is released before the Table reflection and before the
         # INSERT. Neither reads `IGlobal.schema`, both are slow, and holding a
@@ -967,26 +976,35 @@ class DatabaseInstanceBase(IInstanceBase, ABC):
             )
             raise
 
-        # Columns the database fills in itself must not be bound. The loop
-        # below binds NULL for any schema column the incoming rows do not
-        # provide, which is fatal for a generated primary key: Postgres renders
+        # Columns the database fills in itself must not be bound. The loop below
+        # binds NULL for any schema column the incoming rows do not provide, and
+        # an explicit NULL is not "please supply the value" to any database --
+        # it overrides a server default and violates NOT NULL. Postgres renders
         # `Column('id', Integer, primary_key=True, autoincrement=True)` as
-        # `id SERIAL NOT NULL`, so an explicit NULL is a not-null violation
-        # rather than "please generate one".
+        # `id SERIAL NOT NULL`; a `created_at timestamptz NOT NULL DEFAULT now()`
+        # behaves the same way.
         #
         # `_createTableFromData` curates `IGlobal.schema` down to the data
         # columns for exactly this reason, but any map built by reflection --
         # `beginGlobal` for a table that already existed, or the lazy rebuild
-        # above once `refresh_schema` has invalidated the cache -- carries the
-        # PK. Dropping the unsupplied generated PK columns here makes the insert
-        # correct whichever of the two maps this call is holding, so refreshing
-        # the cache can no longer change what an answers-lane INSERT looks like.
+        # above once `refresh_schema` has invalidated the cache -- carries every
+        # column the table has. That difference is meant to reach the INSERT: a
+        # column added by DDL is one the next insert should populate. What must
+        # NOT reach it is a NULL bound into a column the database owns, so both
+        # kinds are read off the reflected table and skipped when the row omits
+        # them: generated primary keys, and anything carrying a server default
+        # or an identity.
         #
         # The decision is per ROW. Taking it once for the batch, from the union
         # of the rows' keys, meant one row carrying `id` put `id` into every
         # mapping, so the rows that omitted it bound NULL into a key the
         # database was supposed to generate.
         generated_pk_columns = _generated_primary_keys(table)
+        generated_defaults = {
+            column.name.lower()
+            for column in table.columns
+            if column.server_default is not None or column.identity is not None
+        }
         pk_names = {column.name.lower() for column in table.primary_key.columns}
 
         def prepare_value(value: Any) -> Any:
@@ -1011,39 +1029,49 @@ class DatabaseInstanceBase(IInstanceBase, ABC):
             if not isinstance(item, dict):
                 continue
 
+            # `schema` is never empty here: the locked block above either left
+            # `IGlobal.schema` populated or raised.
             values: Dict[str, Any] = {}
-            if schema:
-                # Case-insensitive key lookup so 'UserName' maps to 'username'.
-                item_lower_keys = {k.lower(): k for k in item.keys()}
-                missing_keys = []
-                for colname in schema.keys():
-                    lowered = colname.lower()
-                    original_key = item_lower_keys.get(lowered)
-                    if original_key is not None:
-                        # Supplied, including an explicit None: the caller asked
-                        # for NULL and gets NULL, which stays distinguishable
-                        # from having omitted the key entirely.
-                        values[colname] = prepare_value(item[original_key])
-                    elif lowered in generated_pk_columns:
-                        # Database-generated primary key; let the engine supply it.
+            # Case-insensitive key lookup so 'UserName' maps to 'username'.
+            item_lower_keys = {k.lower(): k for k in item.keys()}
+            missing_keys = []
+            for colname in schema.keys():
+                lowered = colname.lower()
+                original_key = item_lower_keys.get(lowered)
+                if original_key is not None:
+                    supplied = item[original_key]
+                    if supplied is None and lowered in generated_pk_columns:
+                        # An explicit null on a key the database generates means
+                        # the same thing as omitting it. The caller on this lane
+                        # is an upstream node, not a person: an LLM node or a
+                        # JSON mapper emits every schema key, writing null for
+                        # the ones it has no value for. Binding that NULL is a
+                        # not-null violation on Postgres and a silent one, since
+                        # `writeAnswers` only logs. (The `execute` tool is a
+                        # different contract and is not affected: a person wrote
+                        # that statement and their NULL is theirs.)
                         continue
-                    elif lowered in pk_names:
-                        # A key the database will NOT generate and the row does
-                        # not carry. Binding NULL would write a row with no
-                        # identity (or fail deep in the driver), so say so.
-                        missing_keys.append(colname)
-                    else:
-                        # Column in schema but not in data — insert NULL.
-                        values[colname] = None
-                if missing_keys:
-                    raise ValueError(
-                        f'Row {position} of the batch for table "{self.IGlobal.table}" does not supply '
-                        f'primary-key column(s) {", ".join(missing_keys)}, which the database does not generate'
-                    )
-            else:
-                # No schema cached — insert whatever keys the item provides.
-                for key, raw_value in item.items():
-                    values[key] = prepare_value(raw_value)
+                    # Supplied, including an explicit None on any other column:
+                    # the caller asked for NULL and gets NULL.
+                    values[colname] = prepare_value(supplied)
+                elif lowered in generated_pk_columns or lowered in generated_defaults:
+                    # The database owns this column's value when the row omits
+                    # it -- a generated key, or a server default / identity.
+                    continue
+                elif lowered in pk_names:
+                    # A key the database will NOT generate and the row does not
+                    # carry. Binding NULL would write a row with no identity (or
+                    # fail deep in the driver), so say so.
+                    missing_keys.append(colname)
+                else:
+                    # Column in schema, no value in the row, no default behind
+                    # it — insert NULL.
+                    values[colname] = None
+            if missing_keys:
+                raise ValueError(
+                    f'Row {position} of the batch for table "{self.IGlobal.table}" does not supply '
+                    f'primary-key column(s) {", ".join(missing_keys)}, which the database does not generate'
+                )
 
             insert_values.append(values)
 

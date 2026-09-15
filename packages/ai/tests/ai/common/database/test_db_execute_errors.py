@@ -946,12 +946,16 @@ def test_insert_mixes_supplied_and_generated_keys_within_one_batch(instance):
     assert all(row['id'] is not None for row in rows)
 
 
-def test_insert_binds_an_explicit_null_primary_key_the_caller_supplied(instance):
-    """Omitted and explicitly NULL stay distinguishable.
+def test_insert_leaves_an_explicit_null_generated_key_to_the_database(instance):
+    """On the insert lane, an explicit null on a generated key means "no value".
 
-    A caller that writes ``{'id': None}`` asked for NULL and gets NULL bound;
-    SQLite turns that into a fresh rowid. (Postgres will reject it for a SERIAL
-    column -- that is the caller's choice, not a silent rewrite by this code.)
+    The caller here is an upstream node, not a person: an LLM node, a JSON
+    mapper or a row round-tripped out of another table emits every schema key,
+    so it writes ``{'id': None}`` for a key it has no value for. Binding that
+    NULL is a not-null violation against Postgres' ``id SERIAL NOT NULL``, and
+    a silent one -- ``writeAnswers`` only logs. MySQL and SQLite generate a
+    value instead, which is why the column list, not the stored row, is what
+    this asserts.
     """
     iglobal = instance.IGlobal
     iglobal.table = 'widgets'
@@ -962,10 +966,93 @@ def test_insert_binds_an_explicit_null_primary_key_the_caller_supplied(instance)
     captured = _captured_inserts(instance, [{'id': None, 'label': 'a'}])
     assert len(captured) == 1
     statement, parameters = captured[0]
-    assert _statement_columns(statement) == ['id', 'label']
-    assert list(parameters) == [None, 'a']
+    assert _statement_columns(statement) == ['label']
+    assert list(parameters) == ['a']
 
-    assert instance.execute({'sql': 'SELECT label FROM widgets'})['rows'] == [{'label': 'a'}]
+    rows = instance.execute({'sql': 'SELECT id, label FROM widgets'})['rows']
+    assert rows == [{'id': 1, 'label': 'a'}]
+
+
+def test_insert_still_binds_an_explicit_null_on_a_non_key_column(instance):
+    """The rule is narrow: only a generated PRIMARY KEY reads null as "omitted".
+
+    Everywhere else an explicit null is a value the caller chose, and a column
+    that is simply absent from the row is bound NULL anyway, so there is
+    nothing to distinguish and nothing to second-guess.
+    """
+    iglobal = instance.IGlobal
+    iglobal.table = 'widgets'
+
+    instance.execute({'sql': "CREATE TABLE widgets (id INTEGER PRIMARY KEY, label TEXT, note TEXT DEFAULT 'unset')"})
+    iglobal.schema = {name: (col_type, '') for name, col_type in iglobal._getTableSchema('widgets')}
+
+    columns = _compiled_insert_columns(instance, [{'label': 'a', 'note': None}])
+    assert columns == ['label', 'note']
+    assert instance.execute({'sql': 'SELECT label, note FROM widgets'})['rows'] == [{'label': 'a', 'note': None}]
+
+
+# ---------------------------------------------------------------------------
+# Columns the database fills in are left to the database, key or not
+# ---------------------------------------------------------------------------
+
+
+def test_insert_leaves_a_new_not_null_default_column_to_the_database(instance):
+    """A column added by DDL and picked up by refresh_schema must not bind NULL.
+
+    The sequence the refresh tool invites: the answers table is auto-created as
+    (id, q, a) with the curated map {q, a}; an agent runs ALTER TABLE ... ADD
+    COLUMN created_at ... NOT NULL DEFAULT ...; the tool description tells it
+    to call refresh_schema, so the next batch rebuilds the map by reflection
+    and now holds created_at as well. Binding an explicit NULL there overrides
+    the server default and violates NOT NULL -- and writeAnswers only logs, so
+    the batch that worked before the DDL now vanishes with one log line.
+    """
+    iglobal = instance.IGlobal
+    iglobal.table = 'answers'
+
+    instance._insertData([{'q': 'why', 'a': 'because'}])
+    assert set(iglobal.schema) == {'q', 'a'}
+
+    instance.execute({'sql': "ALTER TABLE answers ADD COLUMN created_at TEXT NOT NULL DEFAULT 'now'"})
+    instance.refresh_schema({})
+
+    columns = _compiled_insert_columns(instance, [{'q': 'how', 'a': 'like this'}])
+    assert columns == ['q', 'a']
+
+    rows = instance.execute({'sql': 'SELECT q, created_at FROM answers ORDER BY q'})['rows']
+    assert rows == [{'q': 'how', 'created_at': 'now'}, {'q': 'why', 'created_at': 'now'}]
+
+
+def test_insert_binds_a_supplied_value_over_a_server_default(instance):
+    """Leaving a defaulted column alone applies only when the row omits it."""
+    iglobal = instance.IGlobal
+    iglobal.table = 'notes'
+
+    instance.execute({'sql': "CREATE TABLE notes (label TEXT, created_at TEXT NOT NULL DEFAULT 'now')"})
+    iglobal.schema = {name: (col_type, '') for name, col_type in iglobal._getTableSchema('notes')}
+
+    columns = _compiled_insert_columns(instance, [{'label': 'a', 'created_at': 'yesterday'}])
+    assert columns == ['label', 'created_at']
+    assert instance.execute({'sql': 'SELECT label, created_at FROM notes'})['rows'] == [
+        {'label': 'a', 'created_at': 'yesterday'}
+    ]
+
+
+def test_insert_still_binds_null_for_an_omitted_column_without_a_default(instance):
+    """Unchanged behaviour: only a DEFAULT makes an omitted column the database's.
+
+    A plain nullable column the rows do not carry is still bound NULL, which is
+    what makes a batch of ragged rows land with a consistent column set.
+    """
+    iglobal = instance.IGlobal
+    iglobal.table = 'widgets'
+
+    instance.execute({'sql': 'CREATE TABLE widgets (label TEXT, note TEXT)'})
+    iglobal.schema = {name: (col_type, '') for name, col_type in iglobal._getTableSchema('widgets')}
+
+    columns = _compiled_insert_columns(instance, [{'label': 'a'}])
+    assert columns == ['label', 'note']
+    assert instance.execute({'sql': 'SELECT label, note FROM widgets'})['rows'] == [{'label': 'a', 'note': None}]
 
 
 def test_insert_rejects_a_composite_primary_key_column_the_row_omits(instance):
