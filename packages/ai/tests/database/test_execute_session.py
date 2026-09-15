@@ -456,3 +456,25 @@ def test_both_execute_paths_report_a_driver_failure_identically(instance_with_sq
         assert '[parameters:' not in message
         assert 'sqlalche.me' not in message
         assert 'DETAIL' not in message
+
+
+def test_session_execute_passes_the_primary_sentence_through_verbatim(instance_with_sqlite_registry):
+    """The session half gives the same real contract as the sessionless one.
+
+    The twin of ``test_execute_error_passes_the_primary_sentence_through_verbatim``
+    in tests/ai/common/database/test_db_execute_errors.py: a real SQLite
+    syntax error, whose primary sentence quotes the statement fragment it
+    failed on, with SQLAlchemy's statement/parameter tail removed.
+    """
+    inst = instance_with_sqlite_registry
+    sid = inst.begin({})['session_id']
+
+    with pytest.raises(RuntimeError) as excinfo:
+        inst.execute({'sql': "INSERT INTO t VALUES 'hunter2'", 'session_id': sid})
+
+    message = str(excinfo.value)
+    assert message == 'SQL execution failed: near "\'hunter2\'": syntax error'
+    assert 'hunter2' in message  # the fragment is documented, not stripped
+    assert '[SQL:' not in message
+    assert '[parameters:' not in message
+    assert 'sqlalche.me' not in message

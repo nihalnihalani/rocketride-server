@@ -84,6 +84,18 @@ def _generated_primary_keys(table: SQLTable) -> set:
     Everything else -- a composite key, a TEXT key with no default -- is the
     caller's to supply. Non-primary-key columns are out of scope: a column with
     a default that the rows omit keeps today's behaviour of binding NULL.
+
+    The ``'auto'`` half of that rule is an approximation, and on SQLite it is
+    measurably imperfect: ``id INT PRIMARY KEY``, ``id BIGINT PRIMARY KEY`` and
+    ``id INTEGER PRIMARY KEY DESC`` all reflect as a lone Integer-affinity key
+    and are treated as generated here, yet SQLite aliases none of them to the
+    rowid, so an omitted key lands as NULL; conversely
+    ``id INTEGER PRIMARY KEY REFERENCES parent(id)`` IS a rowid alias but the
+    foreign key excludes it from ``'auto'``, so a row omitting it is rejected.
+    Both are SQLite-only: PostgreSQL and MySQL reflection set ``autoincrement``
+    explicitly (from ``nextval``/Identity and from ``auto_increment``), so the
+    resolution is exact for the engines the production nodes connect to, and no
+    node in this repo runs on SQLite.
     """
     generated = set()
     autoincrement_column = table.autoincrement_column
@@ -242,9 +254,10 @@ class DatabaseInstanceBase(IInstanceBase, ABC):
     def get_schema(self, args):
         """Return the reflected database schema.
 
-        Serves ``IGlobal.db_schema``, reflected once in ``beginGlobal``. DDL
-        run since (through ``execute``) is NOT visible here — use
-        ``refresh_schema`` after changing the schema.
+        Serves ``IGlobal.db_schema``, reflected in ``beginGlobal`` and replaced
+        by each ``refresh_schema`` call. DDL run since the last reflection
+        (through ``execute``) is NOT visible here — use ``refresh_schema``
+        after changing the schema.
         """
         if args is not None and not isinstance(args, dict):
             raise ValueError('Tool input must be a JSON object or empty')
@@ -476,8 +489,9 @@ class DatabaseInstanceBase(IInstanceBase, ABC):
         },
         description=lambda self: (
             f'Re-reads the {self._db_display_name()} schema from the database and returns it, in the same '
-            f'shape as get_schema plus a refreshed_at timestamp. get_schema serves the snapshot reflected '
-            f'when the node started, so tables and columns created or altered since are invisible to it. '
+            f'shape as get_schema plus a refreshed_at timestamp. get_schema serves the snapshot the node '
+            f'currently holds -- the start-up reflection until a refresh_schema call replaces it -- so '
+            f'tables and columns created or altered since the last reflection are invisible to it. '
             f'Call this after running DDL.'
         ),
     )

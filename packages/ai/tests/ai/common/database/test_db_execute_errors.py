@@ -713,6 +713,32 @@ def test_execute_error_does_not_leak_the_statement_or_parameters(instance):
     assert 'sqlalche.me' not in message
 
 
+def test_execute_error_passes_the_primary_sentence_through_verbatim(instance):
+    """What the contract actually is: tails stripped, primary sentence as written.
+
+    SQLite reports a syntax error as ``near "<fragment>": syntax error``, and
+    that fragment is a piece of the statement the caller sent. The prose used
+    to claim the statement text is never part of the message; it is not, as a
+    whole, but the driver's own sentence can quote the point it failed at.
+    What this promises is narrower and true: SQLAlchemy's ``[SQL: ...]`` and
+    ``[parameters: ...]`` tail never reaches the caller, and the full text
+    stays in the server log.
+    """
+    instance.execute({'sql': 'CREATE TABLE widgets (label TEXT)'})
+
+    with pytest.raises(RuntimeError) as excinfo:
+        instance.execute({'sql': "INSERT INTO widgets VALUES 'hunter2'"})
+
+    message = str(excinfo.value)
+    assert message == 'SQL execution failed: near "\'hunter2\'": syntax error'
+    # Documented, not lamented: the fragment the parser stopped on is present.
+    assert 'hunter2' in message
+    # The tail this contract does remove is absent.
+    assert '[SQL:' not in message
+    assert '[parameters:' not in message
+    assert 'sqlalche.me' not in message
+
+
 # ---------------------------------------------------------------------------
 # The answers lane must not bind a database-generated primary key
 # ---------------------------------------------------------------------------

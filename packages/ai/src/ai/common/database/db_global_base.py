@@ -217,17 +217,34 @@ class DatabaseGlobalBase(IGlobalBase, ABC):
         Every branch runs through ``_strip_statement_detail`` as a backstop,
         so a driver shape not enumerated here still cannot leak the tail.
 
-        One residual is accepted deliberately: a driver's primary sentence can
-        quote a value from the statement being reported, e.g. PostgreSQL's
-        ``invalid input syntax for type integer: "abc"`` or MySQL's
-        ``Duplicate entry 'x' for key 'users.email'``. That value was submitted
-        by the caller now reading the message, who also holds ``allow_execute``;
-        values belonging to OTHER rows appear only in the DETAIL / HINT /
-        CONTEXT blocks, which are stripped. Blanking quoted tokens generically
-        is not the answer either, because MySQL quotes identifiers with single
-        quotes too ("Unknown column 'foo' in 'field list'"), so the redaction
-        would delete the one thing the caller needs. The full exception,
-        statement and binds included, stays in the server log.
+        What this does and does not promise, stated exactly, because the
+        difference matters and is easy to overclaim:
+
+        * REMOVED: SQLAlchemy's ``[SQL: ...]`` / ``[parameters: ...]`` /
+          ``[cached since ...]`` tail, and the drivers' trailing blocks --
+          psycopg2's ``LINE n:`` echo, PostgreSQL's DETAIL / HINT / CONTEXT /
+          QUERY / STATEMENT, ClickHouse's server stack trace and its
+          ``failed at position`` echo.
+        * PASSED THROUGH: the driver's own primary sentence, as the database
+          wrote it. It can quote the fragment of the statement the parser
+          stopped on (sqlite3 ``near "'hunter2'": syntax error``, MySQL 1064
+          ``near '...' at line 1``, psycopg2 ``syntax error at or near ...``),
+          and because pymysql and psycopg2 interpolate bind values
+          client-side, such a fragment can contain a bound value. It can also
+          quote a value the statement merely TOUCHED rather than carried:
+          PostgreSQL's ``invalid input syntax for type integer: "<value>"``
+          names the offending row value for an ``INSERT ... SELECT`` or a
+          ``CAST``, which may come from another table.
+
+        That is accepted, not overlooked. The recipient holds
+        ``allow_execute``, so they can already read anything the database user
+        can read by writing a ``SELECT``; passing the message through does not
+        widen their read access, it only tells them why their own statement
+        failed. Blanking quoted tokens generically is not the answer either,
+        because MySQL quotes identifiers with single quotes too ("Unknown
+        column 'foo' in 'field list'"), so the redaction would delete the one
+        thing the caller needs. The full exception, statement and binds
+        included, stays in the server log.
         """
         try:
             # SQLAlchemy wraps driver exceptions in DBAPIError; the original
