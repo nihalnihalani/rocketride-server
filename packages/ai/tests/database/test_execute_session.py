@@ -218,10 +218,108 @@ def test_stateless_execute_surfaces_the_driver_error(instance_with_sqlite_regist
     """A bad statement outside a session raises with the database's own message.
 
     Also pins the fixture: execute()'s failure path calls IGlobal._format_db_error,
-    so an IGlobal stub without it fails with AttributeError instead.
+    so an IGlobal stub without it fails with AttributeError instead. The tail
+    assertions are the load-bearing half: a test that only matched the
+    'SQL execution failed: ' prefix would also pass against a message that
+    still carried the statement, because the driver text comes first.
     """
+    with pytest.raises(RuntimeError) as excinfo:
+        instance_with_sqlite_registry.execute(
+            {'sql': 'SELECT * FROM no_such_table WHERE v = $1', 'params': ['ada@example.com']}
+        )
+
+    message = str(excinfo.value)
+    assert message.startswith('SQL execution failed: ')
+    assert 'no_such_table' in message
+    assert 'ada@example.com' not in message
+    assert '[SQL:' not in message
+    assert '[parameters:' not in message
+    assert 'sqlalche.me' not in message
+
+
+def test_session_execute_surfaces_the_driver_error(instance_with_sqlite_registry):
+    """The session-bound half of execute owes the caller the same contract.
+
+    ``TransactionRegistry.execute`` has no try/except, so before this fix the
+    raw SQLAlchemy exception reached the caller of the same tool, behind the
+    same allow_execute gate, with the ``[SQL: ...]`` / ``[parameters: ...]``
+    tail the sessionless half strips.
+    """
+    inst = instance_with_sqlite_registry
+    sid = inst.begin({})['session_id']
+
+    with pytest.raises(RuntimeError) as excinfo:
+        inst.execute({'sql': 'SELECT * FROM no_such_table', 'session_id': sid})
+
+    message = str(excinfo.value)
+    assert message.startswith('SQL execution failed: ')
+    assert 'no_such_table' in message
+    assert '[SQL:' not in message
+    assert '[parameters:' not in message
+    assert 'sqlalche.me' not in message
+
+
+def test_session_execute_error_does_not_echo_bound_parameters(instance_with_sqlite_registry):
+    """A value the caller bound must not come back inside the error message."""
+    inst = instance_with_sqlite_registry
+    sid = inst.begin({})['session_id']
+
+    with pytest.raises(RuntimeError) as excinfo:
+        inst.execute(
+            {'sql': 'SELECT * FROM no_such_table WHERE v = $1', 'params': ['ada@example.com'], 'session_id': sid}
+        )
+
+    message = str(excinfo.value)
+    assert message.startswith('SQL execution failed: ')
+    assert 'ada@example.com' not in message
+    assert '[parameters:' not in message
+
+
+def test_session_execute_failure_releases_the_session(instance_with_sqlite_registry):
+    """The failed session is rolled back and released, not left pinned.
+
+    Same guarantee the max-rows path already had: the held connection goes
+    back to the pool and the aborted statement is no longer committable.
+    """
+    inst = instance_with_sqlite_registry
+    sid = inst.begin({})['session_id']
+
     with pytest.raises(RuntimeError, match='SQL execution failed: '):
-        instance_with_sqlite_registry.execute({'sql': 'SELECT * FROM no_such_table'})
+        inst.execute({'sql': 'SELECT * FROM no_such_table', 'session_id': sid})
+
+    with pytest.raises(ValueError, match='unknown or expired'):
+        inst.commit({'session_id': sid})
+
+
+def test_session_execute_cleanup_failure_does_not_mask_the_driver_error(instance_with_sqlite_registry):
+    """A rollback that itself fails must not replace the error being reported.
+
+    The caller asked why their statement failed; a secondary failure while
+    releasing the session is a server-side concern and belongs in the log.
+    """
+    inst = instance_with_sqlite_registry
+    sid = inst.begin({})['session_id']
+
+    def _boom(_session_id):
+        raise RuntimeError('boom')
+
+    inst.IGlobal.tx_registry.rollback = _boom
+
+    with pytest.raises(RuntimeError) as excinfo:
+        inst.execute({'sql': 'SELECT * FROM no_such_table', 'session_id': sid})
+
+    message = str(excinfo.value)
+    assert message.startswith('SQL execution failed: ')
+    assert 'no_such_table' in message
+    assert 'boom' not in message
+
+
+def test_session_execute_returns_rows_on_success(instance_with_sqlite_registry):
+    """The success path through the session is unchanged by the error arm."""
+    inst = instance_with_sqlite_registry
+    sid = inst.begin({})['session_id']
+    assert inst.execute({'sql': 'SELECT 1 AS one', 'session_id': sid}) == {'rows': [{'one': 1}], 'affected_rows': 0}
+    inst.rollback({'session_id': sid})
 
 
 def test_execute_unknown_session_id_raises_value_error(instance_with_sqlite_registry):

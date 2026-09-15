@@ -308,25 +308,49 @@ class DatabaseInstanceBase(IInstanceBase, ABC):
                 result = self.IGlobal.tx_registry.execute(session_id, sql.strip(), params)
             except KeyError:
                 raise ValueError(f'unknown or expired transaction session: {session_id}')
+            except SQLAlchemyError as e:
+                # The statement itself failed. `tx_registry` has no IGlobal and
+                # is shared with other callers, so the formatting the sessionless
+                # branch gets from `_executeRawQuery` has to be applied here:
+                # otherwise the same tool, behind the same allow_execute gate,
+                # returns the raw exception -- `[SQL: ...]` / `[parameters: ...]`
+                # tail included -- purely because a session_id was passed.
+                error(f'Error executing raw SQL in session {session_id}: {e}')
+                self._releaseFailedSession(session_id)
+                # `from None` keeps the driver traceback out of the tool response.
+                raise RuntimeError(f'SQL execution failed: {self.IGlobal._format_db_error(e)}') from None
             except Exception:
-                # A failed session-bound execute (e.g. max_execute_rows overflow)
-                # would otherwise leave the connection pinned until idle-reaping,
-                # with the aborted statement still committable; roll the session
-                # back to release it and discard the statement, then re-raise.
-                try:
-                    self.IGlobal.tx_registry.rollback(session_id)
-                except KeyError:
-                    pass
+                # Everything else that can come back from the registry: the
+                # max_rows RuntimeError above all, which is not a SQLAlchemyError
+                # (so the arm above cannot swallow it) and whose wording callers
+                # and tests depend on. A failed session-bound execute would
+                # otherwise leave the connection pinned until idle-reaping, with
+                # the aborted statement still committable; roll the session back
+                # to release it and discard the statement, then re-raise.
+                self._releaseFailedSession(session_id)
                 raise
         else:
             result = self._executeRawQuery(sql.strip(), params)
-            # Unreachable since _executeRawQuery started raising with the
-            # driver's message; kept so this branch is one open PR's to remove.
-            if result is None:
-                raise RuntimeError('SQL execution failed (check server logs for details)')
 
         rows = [self._sanitize_row(row) for row in result['rows']]
         return {'rows': rows, 'affected_rows': result['affected_rows']}
+
+    def _releaseFailedSession(self, session_id: str) -> None:
+        """Roll back a session whose statement failed, without masking that failure.
+
+        Called from ``execute``'s error arms while another exception is
+        propagating. The rollback is best-effort by design: a session already
+        finalised or idle-reaped raises ``KeyError``, and a connection that has
+        dropped can fail the rollback itself. Either way the caller asked why
+        their statement failed, so a secondary cleanup failure is logged and
+        swallowed rather than allowed to replace the error being reported.
+        """
+        try:
+            self.IGlobal.tx_registry.rollback(session_id)
+        except KeyError:
+            pass  # already finalised or reaped; nothing left to release
+        except Exception as cleanup_error:
+            warning(f'Unable to roll back session {session_id} after a failed execute: {cleanup_error}')
 
     @tool_function(
         input_schema={'type': 'object', 'properties': {}},
@@ -661,11 +685,12 @@ class DatabaseInstanceBase(IInstanceBase, ABC):
             error(f'Error executing SQL query: {e}')
             return None
 
-    def _executeRawQuery(self, query: str, params: list | None = None) -> dict | None:
+    def _executeRawQuery(self, query: str, params: list | None = None) -> dict:
         """Execute a raw SQL statement (read or write) without LLM or safety gating.
 
         Uses ``engine.begin()`` so writes auto-commit. Returns
-        ``{'rows': [...], 'affected_rows': N}`` on success. A SQLAlchemy error
+        ``{'rows': [...], 'affected_rows': N}``; there is no failure return
+        value, every failure raises. A SQLAlchemy error
         is logged via ``error()`` and re-raised as ``RuntimeError`` carrying
         the DRIVER's own message: the caller wrote the statement, so the caller
         is who needs to read "no such column: foo" — collapsing every failure

@@ -456,3 +456,25 @@ def test_insert_binds_the_primary_key_when_it_is_the_only_column(instance):
 
     columns = _compiled_insert_columns(instance, [{'label': 'ignored'}])
     assert columns == ['id']
+
+
+# ---------------------------------------------------------------------------
+# _executeRawQuery always returns a dict or raises
+# ---------------------------------------------------------------------------
+
+
+def test_execute_raw_query_returns_a_dict_for_ddl_and_select(instance):
+    """The only caller (``execute``) never has to test the result for None.
+
+    ``_executeRawQuery`` was annotated ``dict | None`` while its body either
+    returned the shaped dict or raised, so ``execute`` carried a dead None
+    guard whose message ('check server logs for details') was the opaque
+    string this work replaced.
+    """
+    ddl = instance._executeRawQuery('CREATE TABLE widgets (id INTEGER PRIMARY KEY, label TEXT)')
+    assert isinstance(ddl, dict)
+    assert set(ddl) == {'rows', 'affected_rows'}
+
+    select = instance._executeRawQuery('SELECT label FROM widgets')
+    assert isinstance(select, dict)
+    assert select == {'rows': [], 'affected_rows': 0}
