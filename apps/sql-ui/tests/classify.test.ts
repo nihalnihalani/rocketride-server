@@ -310,14 +310,60 @@ describe('patternCheck — a WITH chain carrying the verb', () => {
 		);
 	});
 
-	it('flags a WITH-led SELECT ... FOR UPDATE (documented false positive)', () => {
-		// `FOR UPDATE` is a locking clause, not a write, but it is a whole-word
-		// `update` in code at depth 0 and the check reads text only. It costs
-		// one extra confirmation, which is the safe direction.
+	it('flags a CTE-prefixed DELETE that joins the CTE with USING', () => {
 		assert.deepEqual(
-			patternCheck('WITH a AS (SELECT 1) SELECT * FROM a FOR UPDATE'),
+			patternCheck('WITH a AS (SELECT id FROM stale) DELETE FROM t USING a'),
+			{ kind: 'DELETE without WHERE' },
+		);
+	});
+
+	it('passes a WITH-led SELECT whose FOR UPDATE is a locking clause', () => {
+		// The verb is the FIRST statement leader at depth 0, and that is the
+		// SELECT. `FOR UPDATE` locks rows; calling it an unbounded UPDATE
+		// would be a confirmation for something that writes nothing.
+		assert.equal(patternCheck('WITH a AS (SELECT 1) SELECT * FROM a FOR UPDATE'), null);
+	});
+
+	it('passes a WITH-led SELECT ... FOR UPDATE in mysql too', () => {
+		assert.equal(patternCheck('WITH a AS (SELECT 1) SELECT * FROM a FOR UPDATE', 'mysql'), null);
+	});
+
+	it('passes a WITH-led upsert whose DO UPDATE trails the INSERT', () => {
+		assert.equal(
+			patternCheck('WITH src AS (SELECT 1 AS id) INSERT INTO t SELECT id FROM src ON CONFLICT (id) DO UPDATE SET id = excluded.id'),
+			null,
+		);
+	});
+
+	it('passes a WITH-led MERGE whose UPDATE is one of its actions', () => {
+		assert.equal(
+			patternCheck('WITH a AS (SELECT 1) MERGE INTO t USING a ON (1 = 1) WHEN MATCHED THEN UPDATE SET x = 1'),
+			null,
+		);
+	});
+
+	it('reads past a CTE NAMED after a statement keyword', () => {
+		// `MERGE` is not reserved, so `WITH merge AS (...)` is a legal chain.
+		// Its name must not be mistaken for the statement's verb, or the
+		// DELETE behind it goes unasked.
+		assert.deepEqual(
+			patternCheck('WITH merge AS (SELECT 1) DELETE FROM orders'),
+			{ kind: 'DELETE without WHERE' },
+		);
+		assert.deepEqual(
+			patternCheck('WITH RECURSIVE merge AS (SELECT 1) UPDATE orders SET x = 1'),
 			{ kind: 'UPDATE without WHERE' },
 		);
+	});
+
+	it('still passes a read whose CTE is named after a statement keyword', () => {
+		assert.equal(patternCheck('WITH merge AS (SELECT 1) SELECT * FROM merge'), null);
+	});
+
+	it('passes a WITH-led parenthesised set expression', () => {
+		// No statement leader sits at depth 0 at all: every branch of the
+		// UNION is parenthesised.
+		assert.equal(patternCheck('WITH a AS (SELECT 1) (SELECT * FROM a) UNION (SELECT 2)'), null);
 	});
 });
 
@@ -393,6 +439,40 @@ describe('patternCheck — a mutation inside the WITH clause', () => {
 		assert.deepEqual(
 			patternCheck("WITH n AS (SELECT 'delete me' AS t), u AS (UPDATE a SET x = 1 RETURNING id), d AS (DELETE FROM b RETURNING id) SELECT 1"),
 			{ kind: 'UPDATE inside a WITH clause' },
+		);
+	});
+
+	it('flags a CTE mutation laid out across lines', () => {
+		assert.deepEqual(
+			patternCheck('WITH x AS (\n\tDELETE FROM t\n) SELECT 1'),
+			{ kind: 'DELETE inside a WITH clause' },
+		);
+	});
+
+	it('flags a CTE mutation behind a MATERIALIZED hint', () => {
+		assert.deepEqual(
+			patternCheck('WITH x AS MATERIALIZED (DELETE FROM t RETURNING *) SELECT 1'),
+			{ kind: 'DELETE inside a WITH clause' },
+		);
+	});
+
+	it('flags a CTE mutation behind a comment inside the body', () => {
+		assert.deepEqual(
+			patternCheck('WITH x AS ( /* gone */ DELETE FROM t RETURNING *) SELECT 1'),
+			{ kind: 'DELETE inside a WITH clause' },
+		);
+	});
+
+	it('passes a CTE whose FOR UPDATE only locks rows', () => {
+		// Inside the body but not opening it: the clause belongs to the
+		// SELECT that does open it, and nothing is written.
+		assert.equal(patternCheck('WITH a AS (SELECT * FROM t FOR UPDATE) SELECT 1'), null);
+	});
+
+	it('passes a CTE upsert whose DO UPDATE trails its INSERT', () => {
+		assert.equal(
+			patternCheck('WITH ins AS (INSERT INTO t VALUES (1) ON CONFLICT (id) DO UPDATE SET v = 1) SELECT 1'),
+			null,
 		);
 	});
 });

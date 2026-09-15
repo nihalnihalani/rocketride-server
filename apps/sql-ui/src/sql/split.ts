@@ -62,6 +62,22 @@ export interface IStatement {
 	endLine: number;
 }
 
+/** Where one keyword sits in a statement's code. */
+export interface IKeywordSite {
+	/** The keyword, spelled as the caller passed it in. */
+	keyword: string;
+	/** Character offset of the occurrence in the statement. */
+	index: number;
+	/** Parenthesis depth in code at that offset; 0 is the statement itself. */
+	depth: number;
+	/**
+	 * Whether this keyword is the first token inside its parenthesis — the
+	 * difference between `(DELETE FROM t)`, a body that deletes, and
+	 * `(SELECT * FROM t FOR UPDATE)`, a body that only locks.
+	 */
+	opensBody: boolean;
+}
+
 /** The lexical traits that differ between the dialects the app speaks. */
 interface IScanTraits {
 	/** `#` starts a line comment (MySQL only; ClickHouse has `--` and `/* *\/`). */
@@ -445,6 +461,26 @@ interface IKeywordHit {
 }
 
 /**
+ * Whether the token at `index` is the first thing inside a parenthesis.
+ *
+ * This is what separates a CTE body's own verb from a keyword that merely
+ * occurs inside one: `(DELETE FROM t ...)` opens with the verb, whereas the
+ * `UPDATE` of `(SELECT * FROM t FOR UPDATE)` and of `... DO UPDATE SET` sits
+ * behind other code and belongs to whatever opened the body. Literals and
+ * comments are spaces in masked text, so a comment between the parenthesis and
+ * the keyword is stepped over like whitespace.
+ *
+ * @param masked - Code-only text from {@link maskNonCode}.
+ * @param index - Offset of the keyword in that text.
+ * @returns True when the nearest non-whitespace character before it is `(`.
+ */
+function opensParenthesis(masked: string, index: number): boolean {
+	let i = index - 1;
+	while (i >= 0 && /\s/.test(masked[i])) i -= 1;
+	return i >= 0 && masked[i] === '(';
+}
+
+/**
  * Every whole-word occurrence of `keyword` in masked code, with its depth.
  *
  * The one place that pairs a keyword with a parenthesis depth, so the
@@ -492,49 +528,31 @@ export function hasTopLevelKeyword(sql: string, keyword: string, dialect: SqlDia
 }
 
 /**
- * Whether `keyword` appears as a whole word in CODE at parenthesis depth >= 1.
+ * Every occurrence of any of `keywords` in CODE, in text order.
  *
- * The mirror of {@link hasTopLevelKeyword}, and the pattern check's only way to
- * see a data-modifying CTE: `WITH gone AS (DELETE FROM t RETURNING *)` puts the
- * verb inside the clause's parentheses, where the top-level search is blind to
- * it by design. Neither function answers the other's question — a keyword can
- * occur at both depths, or at neither.
+ * The lexical half of the question "what is this statement doing": WHERE each
+ * keyword sits, not what that means. The caller applies the meaning — the
+ * pattern check reads the first {@link IKeywordSite.depth} 0 site as the verb a
+ * `WITH` chain carries, and only treats a mutation as belonging to a CTE body
+ * when it {@link IKeywordSite.opensBody opens} that body.
  *
- * @param sql - The statement.
- * @param keyword - The keyword to look for (case-insensitive).
- * @param dialect - The engine dialect.
- * @returns True when the keyword occurs in code inside parentheses.
- */
-export function hasNestedKeyword(sql: string, keyword: string, dialect: SqlDialect = 'unknown'): boolean {
-	return keywordHits(maskNonCode(sql, traitsFor(dialect)), keyword).some((hit) => hit.depth > 0);
-}
-
-/**
- * Whichever of `keywords` occurs FIRST in code inside parentheses.
- *
- * A caller naming a nested keyword needs the winner by text position, not by
- * argument order: one statement can hold several data-modifying CTEs, and the
- * finding has to name the one the reader's eye reaches first. The order is
- * decided on masked text, so an earlier occurrence inside a literal or a
- * comment cannot win it.
+ * Text order is decided on masked text, so an occurrence inside a literal, a
+ * comment or a quoted identifier neither appears nor displaces a real one.
  *
  * @param sql - The statement.
  * @param keywords - The keywords to look for (case-insensitive).
  * @param dialect - The engine dialect.
- * @returns The winning keyword, spelled as it was passed in, or null when none
- *          of them is nested.
+ * @returns The sites, sorted by position.
  */
-export function firstNestedKeyword(sql: string, keywords: string[], dialect: SqlDialect = 'unknown'): string | null {
+export function keywordSites(sql: string, keywords: string[], dialect: SqlDialect = 'unknown'): IKeywordSite[] {
 	const masked = maskNonCode(sql, traitsFor(dialect));
-	let best: IKeywordHit | null = null;
-	let winner: string | null = null;
+	const sites: IKeywordSite[] = [];
 	for (const keyword of keywords) {
-		const hit = keywordHits(masked, keyword).find((candidate) => candidate.depth > 0);
-		if (!hit || (best !== null && hit.index >= best.index)) continue;
-		best = hit;
-		winner = keyword;
+		for (const hit of keywordHits(masked, keyword)) {
+			sites.push({ keyword, index: hit.index, depth: hit.depth, opensBody: opensParenthesis(masked, hit.index) });
+		}
 	}
-	return winner;
+	return sites.sort((a, b) => a.index - b.index);
 }
 
 /**
