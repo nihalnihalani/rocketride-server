@@ -106,6 +106,12 @@ so. The outcome line names read statements as `ran` and write or DDL
 statements as `committed`, for example `1 ran · 2 committed · 3 failed · 4–5
 not run`.
 
+If the pipeline task restarts while a statement is in flight, a statement
+the app classifies as a read may be sent once more; a write never is. The
+classification is by text, so a read that changes something - `SELECT …
+INTO`, a `nextval` or another volatile function - counts as a read here and
+can be re-sent.
+
 For the same reason `BEGIN`, `COMMIT` and `ROLLBACK` are refused before
 anything is sent: `Transaction statements have no effect here: each
 statement runs and commits on its own.` The node does have a transaction
@@ -256,7 +262,10 @@ preferences on the server, per user, not into the browser, and the drawer
 says so whenever it is open: `Saved in your RocketRide workspace file on the
 server, not in this browser. Statements are stored as typed, including
 literal values.` A literal typed into a `WHERE` clause is stored as typed.
-It is not a server audit log, and not a place for secrets.
+A failed statement is stored with the database's error text, which can quote
+a value from the statement, and both stay in the preferences file until the
+entry is deleted or the list is cleared. It is not a server audit log, and
+not a place for secrets.
 
 The list is bounded, because the preferences file is read and written on
 every app switch: 100 entries per connection including pinned ones, 8 KB per
