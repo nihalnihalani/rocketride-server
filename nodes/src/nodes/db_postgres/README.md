@@ -151,7 +151,10 @@ Insert operations never go through SQL generation; they use the `answers` lane.
 Rows arriving on the `answers` lane are inserted into the configured `table`:
 
 - The table is auto-created from the shape of the first batch if it does not exist (column types inferred from the data).
-- Incoming keys are matched to columns case-insensitively (`UserName` maps to `username`); schema columns missing from the data are inserted as `NULL`.
+- Incoming keys are matched to columns case-insensitively (`UserName` maps to `username`); a schema column the data does not carry is inserted as `NULL`.
+- Unless the database fills it in itself: a generated primary key (`SERIAL`, `IDENTITY`) or a column with a `DEFAULT` is left out of the statement when the row does not carry it, so PostgreSQL supplies the value instead of receiving an explicit `NULL` — which it would reject for a `NOT NULL` column and would use in place of the default elsewhere.
+- A generated primary key supplied as `null` counts as not carried, because the sender on this lane is an upstream node that may emit every schema key; a `null` on any other column is inserted as `NULL` as given. (The `execute` tool is unaffected: a statement you write binds your `NULL`.)
+- A primary key PostgreSQL does not generate (a composite key, a text key with no default) that a row omits is rejected before anything is executed, naming the table, the column and the row position.
 - Lists and dicts are serialised as JSON strings; booleans are stored as `0`/`1`.
 - Each batch is inserted in a single transaction: on failure it is rolled back and the error re-raised.
 

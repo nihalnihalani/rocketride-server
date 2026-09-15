@@ -148,8 +148,14 @@ answer is emitted instead of executing SQL.
 
 ### Inserting answers
 
-Incoming JSON rows are matched to the target schema case-insensitively; missing
-schema columns become `NULL`, and unknown incoming keys are ignored. Lists and
+Incoming JSON rows are matched to the target schema case-insensitively; unknown
+incoming keys are ignored. A schema column a row does not carry becomes `NULL`,
+unless the database fills it in itself: an `AUTO_INCREMENT` primary key or a
+column with a `DEFAULT` is left out of the statement so the server supplies
+the value rather than receiving an explicit `NULL`, which would override the
+default. A generated primary key supplied as `null` counts as not carried --
+on this lane the sender is an upstream node that may emit every schema key --
+while a `null` on any other column is inserted as `NULL` as given. Lists and
 dictionaries are serialized as JSON strings and booleans as `0` or `1`. For a
 new table, the node adds an auto-increment `id` primary key and infers integer,
 float, datetime, or text columns; short text becomes `VARCHAR(255)` and longer

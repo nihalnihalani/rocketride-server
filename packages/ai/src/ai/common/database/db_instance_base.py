@@ -584,11 +584,21 @@ class DatabaseInstanceBase(IInstanceBase, ABC):
             # invalidation -- a column added by the DDL that prompted this call
             # is exactly what the next insert should start populating.
             #
-            # What cannot change is that the database still fills in what it
-            # owns: `_insertData` leaves out any primary key or server-default
-            # column the rows do not supply, so the columns that appear only in
-            # the reflected map are omitted rather than bound NULL, whichever
-            # of the two maps a given call is holding.
+            # The guarantee that does hold is narrower: the database still
+            # fills in what it owns either way. `_insertData` leaves out any
+            # primary-key or server-default column the rows do NOT supply, so a
+            # column present only in the reflected map is omitted rather than
+            # bound NULL, whichever of the two maps a given call is holding.
+            #
+            # For a column a row DOES supply, the two maps differ and the
+            # refresh is what changes the INSERT: on an auto-created table the
+            # curated map has no `id`, so a row carrying one has it silently
+            # dropped and the database generates a different value; after a
+            # refresh the reflected map binds it and the row's own `id` is kept.
+            # The post-refresh behaviour is the better of the two, but it is a
+            # change, and honouring a supplied key on an auto-created table
+            # before any refresh would mean curating the PK into that map --
+            # a separate decision, not this one.
             self.IGlobal.schema = {}
             refreshed_at = datetime.now(timezone.utc).isoformat()
             tables = {name: _format_table(info) for name, info in self.IGlobal.db_schema.items()}
