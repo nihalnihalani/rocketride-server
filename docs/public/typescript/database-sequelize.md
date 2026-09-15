@@ -5,6 +5,11 @@ sidebar_position: 13
 
 # Sequelize over Pipelines
 
+> **Deprecated.** Prefer the Drizzle driver — see [Drizzle over Pipelines](/clients/typescript/database-drizzle). It has no Node
+> built-in requirements (no bundler polyfills) and ships in its own package export.
+> `database.sequelize()` and `createSequelize` remain available because they are part
+> of the frozen SDK contract; they will only be removed in a coordinated major release.
+
 `client.database.sequelize(options)` builds a [Sequelize v6](https://sequelize.org/)
 ORM instance whose Postgres dialect transports SQL over a RocketRide pipeline
 instead of a TCP socket. No pg connection is opened — every `findAll`, `create`,

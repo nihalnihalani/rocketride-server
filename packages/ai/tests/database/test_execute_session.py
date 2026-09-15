@@ -194,11 +194,13 @@ def test_stateless_execute_overflow_rolls_back_write(instance_with_sqlite_regist
     assert out['rows'] == []
 
 
-def test_session_execute_overflow_releases_session(instance_with_sqlite_registry):
-    """A session-bound execute that overflows rolls back and releases the session.
+def test_session_execute_overflow_keeps_session_alive(instance_with_sqlite_registry):
+    """A session-bound execute that overflows leaves the session open.
 
-    Otherwise the held connection stays pinned until idle-reaping and the aborted
-    statement remains committable.
+    The failed statement does not auto-destroy the session: the client owns
+    recovery via an explicit rollback (or `rollback to savepoint`), so the
+    connection stays pinned until the client releases it or the idle reaper
+    reclaims it.
     """
     inst = instance_with_sqlite_registry
     # 0-row cap so a session RETURNING overflows.
@@ -206,9 +208,18 @@ def test_session_execute_overflow_releases_session(instance_with_sqlite_registry
     sid = inst.begin({})['session_id']
     with pytest.raises(RuntimeError, match='max_rows'):
         inst.execute({'sql': "INSERT INTO t (v) VALUES ('x') RETURNING v", 'session_id': sid})
-    # The session was rolled back and released: reusing it now errors.
-    with pytest.raises(ValueError, match='unknown or expired'):
-        inst.commit({'session_id': sid})
+    # The session survives the failed statement: an explicit rollback succeeds.
+    assert inst.rollback({'session_id': sid}) == {'ok': True}
+
+
+def test_failed_statement_keeps_session_alive(instance_with_sqlite_registry):
+    """A syntactically invalid statement leaves the session open for recovery."""
+    inst = instance_with_sqlite_registry
+    sid = inst.begin({})['session_id']
+    with pytest.raises(Exception):
+        inst.execute({'sql': 'select broken', 'session_id': sid})
+    # Session must still exist: rollback succeeds instead of ValueError.
+    assert inst.rollback({'session_id': sid}) == {'ok': True}
 
 
 # ---------------------------------------------------------------------------
@@ -277,11 +288,13 @@ def test_session_execute_error_does_not_echo_bound_parameters(instance_with_sqli
     assert '[parameters:' not in message
 
 
-def test_session_execute_failure_releases_the_session(instance_with_sqlite_registry):
-    """The failed session is rolled back and released, not left pinned.
+def test_session_execute_failure_leaves_the_session_open(instance_with_sqlite_registry):
+    """The formatted error is raised and the session stays open for the client to recover.
 
-    Same guarantee the max-rows path already had: the held connection goes
-    back to the pool and the aborted statement is no longer committable.
+    The formatting is this PR's; the lifecycle is develop's (#1908): a failed
+    statement no longer releases the session, so the client recovers with an
+    explicit ``rollback`` (or ``rollback to savepoint``) and the registry is
+    what refuses to commit an aborted transaction.
     """
     inst = instance_with_sqlite_registry
     sid = inst.begin({})['session_id']
@@ -289,31 +302,7 @@ def test_session_execute_failure_releases_the_session(instance_with_sqlite_regis
     with pytest.raises(RuntimeError, match='SQL execution failed: '):
         inst.execute({'sql': 'SELECT * FROM no_such_table', 'session_id': sid})
 
-    with pytest.raises(ValueError, match='unknown or expired'):
-        inst.commit({'session_id': sid})
-
-
-def test_session_execute_cleanup_failure_does_not_mask_the_driver_error(instance_with_sqlite_registry):
-    """A rollback that itself fails must not replace the error being reported.
-
-    The caller asked why their statement failed; a secondary failure while
-    releasing the session is a server-side concern and belongs in the log.
-    """
-    inst = instance_with_sqlite_registry
-    sid = inst.begin({})['session_id']
-
-    def _boom(_session_id):
-        raise RuntimeError('boom')
-
-    inst.IGlobal.tx_registry.rollback = _boom
-
-    with pytest.raises(RuntimeError) as excinfo:
-        inst.execute({'sql': 'SELECT * FROM no_such_table', 'session_id': sid})
-
-    message = str(excinfo.value)
-    assert message.startswith('SQL execution failed: ')
-    assert 'no_such_table' in message
-    assert 'boom' not in message
+    assert inst.rollback({'session_id': sid}) == {'ok': True}
 
 
 def test_session_execute_returns_rows_on_success(instance_with_sqlite_registry):
@@ -562,9 +551,8 @@ def test_both_paths_format_a_driver_error_sqlalchemy_did_not_wrap(instance_with_
     assert 'Orig exception' not in message
 
     if use_session:
-        # The session is released on this path too, as it is for a wrapped error.
-        with pytest.raises(ValueError, match='unknown or expired'):
-            inst.commit({'session_id': sid})
+        # The session stays open on this path too, as it does for a wrapped error.
+        assert inst.rollback({'session_id': sid}) == {'ok': True}
 
 
 @pytest.mark.parametrize('use_session', [False, True], ids=['sessionless', 'session'])
@@ -575,7 +563,7 @@ def test_an_exception_without_orig_is_not_treated_as_a_database_error(instance_w
     reach the caller unchanged. The max-rows ``RuntimeError`` is the other
     member of this class and is covered by
     ``test_stateless_execute_overflow_rolls_back_write`` and
-    ``test_session_execute_overflow_releases_session``.
+    ``test_session_execute_overflow_keeps_session_alive``.
     """
     inst = instance_with_sqlite_registry
     real_engine = inst.IGlobal.engine
@@ -641,7 +629,7 @@ def test_params_must_cover_every_placeholder(instance_with_sqlite_registry, use_
 
     message = str(excinfo.value)
     assert '$2' in message  # the placeholder that has no value
-    assert '"params"' in message
+    assert 'out of range' in message
 
     if use_session:
         assert inst.execute({'sql': 'SELECT 1 AS one', 'session_id': args['session_id']})['rows'] == [{'one': 1}]
@@ -655,3 +643,87 @@ def test_params_are_still_bound_when_they_cover_the_placeholders(instance_with_s
     assert inst.execute({'sql': 'SELECT v FROM t WHERE v = $1', 'params': ['kept']})['rows'] == [{'v': 'kept'}]
     # A statement with no placeholders and no params is unaffected.
     assert inst.execute({'sql': 'SELECT 2 AS two'})['rows'] == [{'two': 2}]
+
+
+# ---------------------------------------------------------------------------
+# (h) row_mode='array' — positional rows for ORM clients (Drizzle)
+# ---------------------------------------------------------------------------
+
+
+def test_execute_tool_array_row_mode(instance_with_sqlite_registry):
+    inst = instance_with_sqlite_registry
+    inst.execute({'sql': "INSERT INTO t (id, v) VALUES (1, 'x')"})
+    inst.execute({'sql': "INSERT INTO t (id, v) VALUES (2, 'y')"})
+    result = inst.execute({'sql': 'SELECT id, v FROM t ORDER BY id', 'row_mode': 'array'})
+    assert result['rows'] == [[1, 'x'], [2, 'y']]
+    assert all(isinstance(r, list) for r in result['rows'])
+
+
+def test_execute_tool_session_array_row_mode(instance_with_sqlite_registry):
+    inst = instance_with_sqlite_registry
+    sid = inst.begin({})['session_id']
+    inst.execute({'sql': "INSERT INTO t (id, v) VALUES (1, 'x')", 'session_id': sid})
+    result = inst.execute({'sql': 'SELECT id, v FROM t ORDER BY id', 'session_id': sid, 'row_mode': 'array'})
+    inst.rollback({'session_id': sid})
+    assert result['rows'] == [[1, 'x']]
+
+
+def test_execute_tool_rejects_bad_row_mode(instance_with_sqlite_registry):
+    with pytest.raises(ValueError, match='row_mode'):
+        instance_with_sqlite_registry.execute({'sql': 'SELECT 1', 'row_mode': 'csv'})
+
+
+def test_execute_tool_rejects_falsy_row_mode(instance_with_sqlite_registry):
+    # '' violates the declared enum; only an ABSENT field defaults to 'object'.
+    with pytest.raises(ValueError, match='row_mode'):
+        instance_with_sqlite_registry.execute({'sql': 'SELECT 1', 'row_mode': ''})
+
+
+# ---------------------------------------------------------------------------
+# (i) _sanitize_value JSON-encodes dicts and lists (psycopg2 json/jsonb parse)
+# ---------------------------------------------------------------------------
+
+
+def test_sanitize_value_json_encodes_dicts():
+    """Dict values must be JSON-encoded, not Python repr'd."""
+    result = DatabaseInstanceBase._sanitize_value({'a': 1})
+    assert result == '{"a": 1}'
+
+
+def test_sanitize_value_json_encodes_lists():
+    """List values must be JSON-encoded, not Python repr'd."""
+    result = DatabaseInstanceBase._sanitize_value([1, 'x'])
+    assert result == '[1, "x"]'
+
+
+def test_sanitize_value_json_encodes_nested_with_fallback():
+    """Nested non-JSON types fall back to str via default=str."""
+    import datetime
+
+    result = DatabaseInstanceBase._sanitize_value({'t': datetime.date(2026, 1, 1)})
+    assert '"2026-01-01"' in result
+
+
+def test_sanitize_value_json_encodes_tuples():
+    """Tuple values (psycopg2 composite types) must be JSON-encoded."""
+    result = DatabaseInstanceBase._sanitize_value((1, 'x'))
+    assert result == '[1, "x"]'
+
+
+@pytest.mark.parametrize('use_session', [False, True], ids=['sessionless', 'session'])
+def test_a_dollar_number_inside_a_string_literal_is_not_a_placeholder(instance_with_sqlite_registry, use_session):
+    """The rewriter is quote-aware, so no pre-pass may reject `$5` inside a literal.
+
+    `to_sqlalchemy_text` skips `$n` in string literals, quoted identifiers,
+    dollar-quoted bodies and comments; the placeholder pre-pass this PR used to
+    run before dispatch did not, and rejected this statement on both paths.
+    """
+    inst = instance_with_sqlite_registry
+    args = {'sql': "SELECT '$5' AS v", 'params': ['x']}
+    if use_session:
+        args['session_id'] = inst.begin({})['session_id']
+
+    assert inst.execute(args)['rows'] == [{'v': '$5'}]
+
+    if use_session:
+        inst.rollback({'session_id': args['session_id']})

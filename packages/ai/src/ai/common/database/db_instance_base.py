@@ -338,12 +338,17 @@ class DatabaseInstanceBase(IInstanceBase, ABC):
                 'sql': {'type': 'string', 'description': 'Raw SQL statement to execute.'},
                 'session_id': {'type': 'string', 'description': 'Optional transaction session id from begin.'},
                 'params': {'type': 'array', 'description': 'Optional positional bind values for $1..$n.'},
+                'row_mode': {
+                    'type': 'string',
+                    'enum': ['object', 'array'],
+                    'description': "Row shape: 'object' (default) returns dict rows; 'array' returns positional lists (column order preserved, duplicate names kept).",
+                },
             },
         },
         output_schema={
             'type': 'object',
             'properties': {
-                'rows': {'type': 'array', 'items': {'type': 'object'}},
+                'rows': {'type': 'array', 'items': {'type': ['object', 'array']}},
                 'affected_rows': {'type': 'integer'},
             },
         },
@@ -365,10 +370,13 @@ class DatabaseInstanceBase(IInstanceBase, ABC):
 
         session_id = args.get('session_id')
         params = args.get('params')
-        self._validateExecuteParams(sql, params)
+        self._validateExecuteParams(params)
+        row_mode = args.get('row_mode', 'object')
+        if row_mode not in ('object', 'array'):
+            raise ValueError("\"row_mode\" must be 'object' or 'array'")
         if session_id:
             try:
-                result = self.IGlobal.tx_registry.execute(session_id, sql.strip(), params)
+                result = self.IGlobal.tx_registry.execute(session_id, sql.strip(), params, row_mode)
             except KeyError:
                 raise ValueError(f'unknown or expired transaction session: {session_id}')
             except SQLAlchemyError as e:
@@ -378,16 +386,18 @@ class DatabaseInstanceBase(IInstanceBase, ABC):
                 # otherwise the same tool, behind the same allow_execute gate,
                 # returns the raw exception -- `[SQL: ...]` / `[parameters: ...]`
                 # tail included -- purely because a session_id was passed.
+                #
+                # A failed statement leaves the session OPEN: Postgres marks the
+                # transaction aborted, MySQL leaves it usable. The client owns
+                # recovery — `rollback`, or `rollback to savepoint` for nested
+                # transactions — and the idle reaper is the backstop for abandoned
+                # sessions. Committing an aborted transaction would degrade to a
+                # silent ROLLBACK, so the registry refuses it and raises instead.
                 error(f'Error executing raw SQL in session {session_id}: {e}')
-                self._releaseFailedSession(session_id)
                 # `from None` keeps the driver traceback out of the tool response.
                 raise RuntimeError(f'SQL execution failed: {self.IGlobal._format_db_error(e)}') from None
             except Exception as e:
-                # Everything else that can come back from the registry. A failed
-                # session-bound execute would otherwise leave the connection
-                # pinned until idle-reaping, with the aborted statement still
-                # committable, so the session is released either way.
-                self._releaseFailedSession(session_id)
+                # Everything else that can come back from the registry.
                 if getattr(e, 'orig', None) is not None:
                     # A driver error the dialect did not wrap in a SQLAlchemy
                     # exception (clickhouse-sqlalchemy's `DatabaseException`;
@@ -401,61 +411,35 @@ class DatabaseInstanceBase(IInstanceBase, ABC):
                 # wording callers and tests depend on.
                 raise
         else:
-            result = self._executeRawQuery(sql.strip(), params)
+            result = self._executeRawQuery(sql.strip(), params, row_mode)
 
         rows = [self._sanitize_row(row) for row in result['rows']]
         return {'rows': rows, 'affected_rows': result['affected_rows']}
 
     @staticmethod
-    def _validateExecuteParams(sql: str, params: Any) -> None:
-        """Reject a malformed ``params`` argument before anything is dispatched.
+    def _validateExecuteParams(params: Any) -> None:
+        """Reject a ``params`` argument that is not an array before anything is dispatched.
 
         ``to_sqlalchemy_text`` rewrites ``$n`` into a bind by indexing
-        ``params[n - 1]``, so a JSON object raised ``KeyError: 0`` and a short
-        list an ``IndexError`` from inside the rewriter. Neither told the caller
-        what was wrong, and on the session path the ``KeyError`` was
-        indistinguishable from an unknown session id -- ``execute`` reported
+        ``params[n - 1]``, so a JSON object raised ``KeyError: 0`` from inside
+        the rewriter -- which told the caller nothing, and on the session path
+        was indistinguishable from an unknown session id: ``execute`` reported
         "unknown or expired transaction session" for a session that was still
         open and still usable.
 
-        An empty list is left alone: it means "no binds" to the rewriter today,
-        exactly as ``None`` does, and a statement carrying a literal ``$n`` in a
-        string body relies on that.
+        The placeholder range check is ``to_sqlalchemy_text``'s own and applies
+        when ``params`` is non-empty. It is quote-aware -- a ``$n`` inside a
+        string literal, a quoted identifier, a dollar-quoted body or a comment
+        is not a placeholder -- and an index past ``len(params)`` raises
+        ``ValueError('placeholder $n out of range for k param(s)')``. ``None``
+        and an empty list mean "no binds": the rewrite is skipped entirely, so a
+        literal ``$1`` reaches the driver unchanged and the driver's own
+        complaint is what the caller gets back.
         """
         if params is None:
             return
         if not isinstance(params, list):
             raise ValueError('"params" must be an array of positional bind values')
-        if not params:
-            return
-
-        # Imported here, from the module that owns the placeholder syntax, so
-        # the check cannot drift away from the rewriter it is guarding.
-        from ai.common.database.tx_registry import _PLACEHOLDER
-
-        for match in _PLACEHOLDER.finditer(sql):
-            index = int(match.group(1))
-            if index < 1 or index > len(params):
-                raise ValueError(
-                    f'"params" has {len(params)} value(s), so the ${index} placeholder in the statement has none'
-                )
-
-    def _releaseFailedSession(self, session_id: str) -> None:
-        """Roll back a session whose statement failed, without masking that failure.
-
-        Called from ``execute``'s error arms while another exception is
-        propagating. The rollback is best-effort by design: a session already
-        finalised or idle-reaped raises ``KeyError``, and a connection that has
-        dropped can fail the rollback itself. Either way the caller asked why
-        their statement failed, so a secondary cleanup failure is logged and
-        swallowed rather than allowed to replace the error being reported.
-        """
-        try:
-            self.IGlobal.tx_registry.rollback(session_id)
-        except KeyError:
-            pass  # already finalised or reaped; nothing left to release
-        except Exception as cleanup_error:
-            warning(f'Unable to roll back session {session_id} after a failed execute: {cleanup_error}')
 
     @tool_function(
         input_schema={'type': 'object', 'properties': {}},
@@ -616,6 +600,11 @@ class DatabaseInstanceBase(IInstanceBase, ABC):
         """Convert a single database value to a JSON-serializable type."""
         if val is None or isinstance(val, (str, int, float, bool)):
             return val
+        if isinstance(val, (dict, list, tuple)):
+            # psycopg2 parses json/jsonb into dict/list (and composites into
+            # tuples); repr() is not JSON and silently corrupts ORM clients
+            # that JSON.parse driver values.
+            return json.dumps(val, default=str)
         if hasattr(val, '__float__'):
             return float(val)
         if hasattr(val, 'isoformat'):
@@ -801,7 +790,7 @@ class DatabaseInstanceBase(IInstanceBase, ABC):
             error(f'Error executing SQL query: {e}')
             return None
 
-    def _executeRawQuery(self, query: str, params: list | None = None) -> dict:
+    def _executeRawQuery(self, query: str, params: list | None = None, row_mode: str = 'object') -> dict:
         """Execute a raw SQL statement (read or write) without LLM or safety gating.
 
         Uses ``engine.begin()`` so writes auto-commit. Returns
@@ -825,7 +814,7 @@ class DatabaseInstanceBase(IInstanceBase, ABC):
             with self.IGlobal.engine.begin() as conn:
                 clause, binds = to_sqlalchemy_text(query, params)
                 result = conn.execute(clause, binds)
-                shaped = shape_execute_result(result, self.IGlobal.max_execute_rows)
+                shaped = shape_execute_result(result, self.IGlobal.max_execute_rows, row_mode)
                 if shaped is None:
                     # Raise inside the transaction so it rolls back; returning
                     # None here would let an overflowing write commit anyway.

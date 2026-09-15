@@ -70,21 +70,32 @@ shape. `get_data` returns
 `{valid: false, error, sql, rows: []}`.
 
 `execute` requires non-empty `sql` and optionally accepts a transaction
-`session_id` plus positional values for `$1`, `$2`, and so on. It returns
-`{rows, affected_rows}`. A failed statement raises `SQL execution failed:`
-followed by the database's own primary message, identically with and without
-a `session_id`. What is removed is the tail: SQLAlchemy's `[SQL: ...]` /
-`[parameters: ...]` echo. The primary sentence itself is passed through as
-MySQL wrote it, so a syntax error quotes the fragment it stopped on (the
-driver interpolates bound values client-side, so that fragment can contain
-one) and a constraint error names the value that collided. That is
-deliberate: reaching this tool at all requires **Allow direct query
-execution**, and a caller who has it can read the same data with a `SELECT`.
-The full text stays in the server log. `begin` takes no arguments and returns
-`{session_id}`; `commit` and `rollback` require that ID and return
+`session_id`, positional values for `$1`, `$2`, and so on, and a `row_mode`:
+`object` (default) keys rows by column name, while `array` returns positional
+arrays that preserve column order and keep duplicate column names — the shape
+ORM drivers such as Drizzle require. It returns `{rows, affected_rows}`. A
+failed statement raises `SQL execution failed:` followed by the database's own
+primary message, identically with and without a `session_id`. What is removed
+is the tail: SQLAlchemy's `[SQL: ...]` / `[parameters: ...]` echo. The primary
+sentence itself is passed through as MySQL wrote it, so a syntax error quotes
+the fragment it stopped on (the driver interpolates bound values client-side,
+so that fragment can contain one) and a constraint error names the value that
+collided. That is deliberate: reaching this tool at all requires **Allow
+direct query execution**, and a caller who has it can read the same data with
+a `SELECT`. The full text stays in the server log. `begin` takes no arguments
+and returns `{session_id}`; `commit` and `rollback` require that ID and return
 `{ok: true}`. These four write-capable operations fail when **Allow direct
 query execution** is off; unknown or expired session IDs also fail. Invalid
 tool input raises an error.
+
+A failed statement does **not** roll the session back. The session stays open
+and MySQL leaves its transaction usable, so a later `commit` persists the work
+that preceded the error — recovery is the client's responsibility. Issue
+`rollback` to discard the session, or `rollback to savepoint <name>` to undo
+only the failed portion and continue; the idle reaper is the backstop for
+sessions that are abandoned instead. (Postgres differs: it aborts the whole
+transaction on any failure, so the node refuses the later commit rather than
+letting it degrade to a silent rollback.)
 
 ## Configuration
 
