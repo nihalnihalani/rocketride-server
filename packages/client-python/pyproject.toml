@@ -69,10 +69,13 @@ test = [
     "pytest-cov>=4.0.0",
     "python-dotenv>=1.0.0",
     "rocketride[otel]",
-    # Optional oracle for the pipediff Markdown-escaping tests: it wraps the
-    # same cmark-gfm that GitHub renders comments with. The escaping rules are
-    # also asserted without it (see tests/test_pipediff_reporters.py), because
-    # CI runs pytest through the bundled engine rather than this extra.
+    # The cmark-gfm oracle for the pipediff Markdown-escaping tests: it wraps
+    # the same renderer GitHub uses for comments. CI does not install this
+    # extra — it runs pytest through the bundled engine — so it gets the same
+    # wheel from tests/requirements.txt via the client-python:setup-test-deps
+    # step, and the cross-check runs there rather than skipping. The escaping
+    # rules are also asserted without it (see tests/test_pipediff_reporters.py)
+    # for an interpreter that has neither.
     "cmarkgfm>=2024.1.14",
 ]
 

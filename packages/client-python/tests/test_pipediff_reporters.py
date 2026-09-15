@@ -549,9 +549,10 @@ class TestRenderMarkdown(unittest.TestCase):
         to itself.
 
         Same corpus as the ``cmarkgfm`` cross-check below, but resolved with
-        ``_split_gfm_row`` so it runs everywhere -- including CI, which executes
-        pytest through the bundled engine and never installs the optional
-        renderer. A row that split shows up here as more than three cells.
+        ``_split_gfm_row`` so it runs everywhere -- including on an interpreter
+        that has no ``cmarkgfm`` at all. CI installs the renderer through
+        tests/requirements.txt, so both checks run there. A row that split
+        shows up here as more than three cells.
         """
         for value in _GFM_ESCAPING_CORPUS:
             with self.subTest(value=value):
