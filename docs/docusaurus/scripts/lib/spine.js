@@ -70,7 +70,6 @@ const SPINE = [
 			{
 				label: 'Apps',
 				items: [
-					{ id: 'guides/apps/sql-explorer', label: 'SQL Explorer' },
 					{ id: 'guides/apps/app-builder', label: 'App Builder' },
 					{ id: 'guides/apps', label: 'Shell API' },
 				],

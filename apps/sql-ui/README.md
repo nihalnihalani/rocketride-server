@@ -1,7 +1,3 @@
----
-title: SQL Explorer
----
-
 # SQL Explorer
 
 SQL Explorer is the app for working with a database your pipelines already
@@ -10,7 +6,7 @@ plan, stage a table change. It is not a database client of its own. Every
 statement travels through a database tool node inside one of your running
 pipelines, so it reaches exactly the database that node is configured for,
 with that node's permissions. If apps are new to you, read
-[Apps](/concepts/apps) first. What the app deliberately does not do is under
+[Apps](../../docs/public/product/concepts/apps.md) first. What the app deliberately does not do is under
 [Limits](#limits); most of those gaps come from the tool protocol rather
 than from the app.
 
@@ -18,8 +14,8 @@ than from the app.
 
 - **A running pipeline with a database node.** Connections are discovered
   from running tasks, so a stopped pipeline has none. The supported nodes
-  are [`db_mysql`](/nodes/db_mysql), [`db_postgres`](/nodes/db_postgres) and
-  [`db_clickhouse`](/nodes/db_clickhouse).
+  are [`db_mysql`](../../nodes/src/nodes/db_mysql/README.md), [`db_postgres`](../../nodes/src/nodes/db_postgres/README.md) and
+  [`db_clickhouse`](../../nodes/src/nodes/db_clickhouse/README.md).
 - **Direct execution, if you want to run statements.** Each of those nodes
   has an **Allow direct query execution** setting (`allow_execute`), off by
   default and worth leaving off until a caller truly needs it. With it off,
@@ -391,9 +387,9 @@ statements ran either way; only the app's picture of the schema is behind.
 
 ## Next steps
 
-- [`db_mysql`](/nodes/db_mysql), [`db_postgres`](/nodes/db_postgres) and
-  [`db_clickhouse`](/nodes/db_clickhouse): the nodes behind every
+- [`db_mysql`](../../nodes/src/nodes/db_mysql/README.md), [`db_postgres`](../../nodes/src/nodes/db_postgres/README.md) and
+  [`db_clickhouse`](../../nodes/src/nodes/db_clickhouse/README.md): the nodes behind every
   connection, including the tool surface and the direct-execution setting.
-- [Apps](/concepts/apps): what an app is and how it reaches your engine.
-- [Shell API](/guides/apps): the framework SQL Explorer is built on, when
+- [Apps](../../docs/public/product/concepts/apps.md): what an app is and how it reaches your engine.
+- [Shell API](../../docs/public/product/guides/apps/index.md): the framework SQL Explorer is built on, when
   you want to build one of your own.
