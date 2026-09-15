@@ -96,6 +96,29 @@ export interface IStatementRun {
 }
 
 // =============================================================================
+// WHAT IS AT THE DATABASE
+// =============================================================================
+
+/**
+ * Whether one of these statements is AT THE DATABASE right now.
+ *
+ * NOT the same question as "is the batch running". The batch is running from
+ * the moment Run is pressed, which includes the time a pattern-check dialog
+ * sits open with nothing yet sent; only a run whose outcome is `running` has
+ * been handed to `session.execute` and is waiting on an answer.
+ *
+ * The "Stop waiting" affordance keys on THIS, because what it says when it is
+ * used — that the database may still be running the statement and cannot be
+ * told to stop — is only true of a request that was actually made.
+ *
+ * @param runs - The batch's statements, in order.
+ * @returns True when one of them has been sent and has not answered yet.
+ */
+export function hasStatementInFlight(runs: IStatementRun[]): boolean {
+	return runs.some((run) => run.outcome === 'running');
+}
+
+// =============================================================================
 // WORDING
 // =============================================================================
 

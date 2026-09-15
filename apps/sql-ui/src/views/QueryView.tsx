@@ -63,7 +63,7 @@ import { announce } from '../a11y/announce';
 import { splitStatements, splitStatementsIn, statementAtOffset } from '../sql/split';
 import { classifyStatement, patternCheck } from '../sql/classify';
 import type { IPatternFinding } from '../sql/classify';
-import { applyRowLimit, formatBatchOutcome, formatElapsed, formatPriorStatements, leadingVerb } from '../sql/batch';
+import { applyRowLimit, formatBatchOutcome, formatElapsed, formatPriorStatements, hasStatementInFlight, leadingVerb } from '../sql/batch';
 import type { IStatementRun, RunOutcome } from '../sql/batch';
 import {
 	ALLOW_EXECUTE_OFF_TEXT,
@@ -507,15 +507,25 @@ export const QueryView: React.FC<IQueryViewProps> = ({ endpoint, label, initialS
 		editorRef.current?.setDecorations(preview.decorations);
 	}, [preview]);
 
-	// "Stop waiting" only appears once a run has actually been slow.
+	// Whether a statement is at the database, which is NOT the same as the
+	// batch running: `running` is already true while a pattern-check dialog
+	// waits for an answer and nothing has been sent.
+	const inFlight = useMemo(() => hasStatementInFlight(runs), [runs]);
+
+	// "Stop waiting" only appears once a statement IN FLIGHT has been slow.
+	// Keying this on `running` offered it while a confirmation was open, and
+	// clicking it then announced that the database might still be running a
+	// statement that had never been sent. The timer restarts per statement,
+	// which is right: between two statements of a batch nothing is at the
+	// database, so nothing is being waited for.
 	useEffect(() => {
-		if (!running) {
+		if (!inFlight) {
 			setCanStop(false);
 			return undefined;
 		}
 		const timer = setTimeout(() => setCanStop(true), STOP_WAITING_AFTER_MS);
 		return () => clearTimeout(timer);
-	}, [running]);
+	}, [inFlight]);
 
 	// ── Pattern-check confirmation ───────────────────────────────────────────
 
@@ -938,7 +948,7 @@ export const QueryView: React.FC<IQueryViewProps> = ({ endpoint, label, initialS
 						>
 							Explain
 						</Button>
-						{running && canStop && (
+						{inFlight && canStop && (
 							<Button variant="ghost" title="Stop waiting for the answer. This does not cancel the statement." onClick={stopWaiting}>
 								Stop waiting
 							</Button>

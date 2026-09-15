@@ -32,7 +32,7 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import type { IStatementRun, RunOutcome } from '../src/sql/batch';
 import type { StatementKind } from '../src/sql/classify';
-import { formatBatchOutcome, formatElapsed, formatPriorStatements, formatRunLabel, leadingVerb } from '../src/sql/batch';
+import { formatBatchOutcome, formatElapsed, formatPriorStatements, formatRunLabel, hasStatementInFlight, leadingVerb } from '../src/sql/batch';
 
 /**
  * Build a batch from a list of outcomes, all of them reads.
@@ -174,5 +174,44 @@ describe('formatRunLabel', () => {
 	it('labels an abandoned statement', () => {
 		const [run] = batch(['abandoned']);
 		assert.equal(formatRunLabel({ ...run, ms: 1200 }), '1 SELECT · abandoned · round trip 1.200 s');
+	});
+});
+
+// =============================================================================
+// A STATEMENT AT THE DATABASE
+// =============================================================================
+//
+// The distinction the "Stop waiting" affordance rests on: the batch is running
+// from the moment Run is pressed, which includes the time a pattern-check
+// dialog sits open with nothing sent. Only `running` means a request is out.
+// =============================================================================
+
+describe('hasStatementInFlight', () => {
+	it('is false for an empty batch', () => {
+		assert.equal(hasStatementInFlight([]), false);
+	});
+
+	it('is false while every statement is still queued', () => {
+		assert.equal(hasStatementInFlight(batch(['pending', 'pending'])), false);
+	});
+
+	it('is true while one statement is at the database', () => {
+		assert.equal(hasStatementInFlight(batch(['rows', 'running', 'pending'])), true);
+	});
+
+	it('is false once the batch has finished', () => {
+		assert.equal(hasStatementInFlight(batch(['rows', 'affected', 'error', 'skipped'])), false);
+	});
+
+	for (const outcome of ['rows', 'affected', 'error', 'abandoned', 'skipped'] as RunOutcome[]) {
+		it(`is false for a batch holding only ${outcome}`, () => {
+			assert.equal(hasStatementInFlight(batch([outcome])), false);
+		});
+	}
+
+	it('is false again after an abandoned statement was remapped', () => {
+		// `stopWaiting` maps every `running` to `abandoned`, so a stale
+		// in-flight flag cannot outlive the click that abandoned it.
+		assert.equal(hasStatementInFlight(batch(['abandoned', 'skipped'])), false);
 	});
 });

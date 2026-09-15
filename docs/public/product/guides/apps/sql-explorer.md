@@ -188,9 +188,10 @@ message is in the pipeline node's log either way.
 
 ### Stop waiting
 
-Nothing in the tool protocol cancels a running statement. After a second a
-**Stop waiting** button appears, and it does exactly what it says: the app
-stops listening and discards the late answer. The banner is explicit —
+Nothing in the tool protocol cancels a running statement. A second after a
+statement reaches the database a **Stop waiting** button appears — not while
+a confirmation is still open, since nothing has been sent yet — and it does
+exactly what it says: the app stops listening and discards the late answer. The banner is explicit —
 `Stopped waiting after N.N s. The statement may still be running on the
 database; this tool cannot cancel it.` To stop it, stop it on the database.
 
