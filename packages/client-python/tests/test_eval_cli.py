@@ -614,13 +614,44 @@ class TestEvalCli:
         out = capsys.readouterr().out
         assert 'greeting' in out
 
-    async def test_unwritable_junit_path_exits_2(self, monkeypatch, tmp_path, spec_file):
-        # A directory path cannot be opened as a file for writing
+    async def test_unwritable_junit_path_exits_2(self, monkeypatch, capsys, tmp_path, spec_file):
+        # A directory path cannot be opened as a file for writing. The cases
+        # passed, but the run did not produce the report it was asked for, so
+        # the --json payload has to be the shared error envelope: a scripted
+        # caller reading report.json must never find a green document behind
+        # a non-zero exit.
+        report_path = tmp_path / 'report.json'
         fake = FakeClient()
 
-        exit_code = await run_cli(monkeypatch, fake, [spec_file, '--junit', str(tmp_path)])
+        exit_code = await run_cli(monkeypatch, fake, [spec_file, '--junit', str(tmp_path), '--json', str(report_path)])
 
         assert exit_code == 2
+        written = json.loads(report_path.read_text(encoding='utf-8'))
+        assert set(written.keys()) == {'error'}
+        assert 'Cannot write JUnit report' in written['error']['message']
+        assert str(tmp_path) in written['error']['message']
+        # One sentence on stderr, and no machine-readable document on stdout
+        captured = capsys.readouterr()
+        assert captured.err.count('Error:') == 1
+        assert 'Cannot write JUnit report' in captured.err
+        assert '"summary"' not in captured.out
+
+    async def test_unwritable_junit_path_bare_json_carries_only_the_error_envelope(
+        self, monkeypatch, capsys, tmp_path, spec_file
+    ):
+        # Bare --json owns stdout: the failed JUnit write must replace the
+        # passing report there too, not leave it as the run's only document.
+        fake = FakeClient()
+
+        exit_code = await run_cli(monkeypatch, fake, [spec_file, '--junit', str(tmp_path), '--json'])
+
+        assert exit_code == 2
+        captured = capsys.readouterr()
+        document = json.loads(captured.out)
+        assert set(document.keys()) == {'error'}
+        assert 'Cannot write JUnit report' in document['error']['message']
+        assert captured.out.strip() == json.dumps(document, indent=2)
+        assert captured.err.count('Error:') == 1
 
 
 class TestEvalRegistration:

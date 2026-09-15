@@ -187,7 +187,12 @@ async def run_eval(args) -> int:
                 with open(args.junit, 'w', encoding='utf-8') as handle:
                     handle.write(render_junit(reports, spec_errors))
             except OSError as err:
-                print(f'Error: Cannot write JUnit report to {args.junit}: {err}', file=sys.stderr)
+                # Replace the recorded report with the error envelope: the
+                # cases passed but this run produced no JUnit report, so
+                # out.finish() must not write a green document under a
+                # non-zero exit. out.fail() prints the stderr sentence and
+                # returns 1; the explicit 2 keeps the documented exit code.
+                out.fail(f'Cannot write JUnit report to {args.junit}: {err}')
                 return 2
 
         # Exit 2 if no case produced a result at all (every spec errored, or
