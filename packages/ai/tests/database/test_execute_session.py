@@ -598,3 +598,60 @@ def test_an_exception_without_orig_is_not_treated_as_a_database_error(instance_w
 
     assert str(excinfo.value) == 'driver bug, not a database error'
     assert 'SQL execution failed' not in str(excinfo.value)
+
+
+# ---------------------------------------------------------------------------
+# (g) A malformed `params` argument must be rejected, not misreported
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize('use_session', [False, True], ids=['sessionless', 'session'])
+def test_params_must_be_an_array(instance_with_sqlite_registry, use_session):
+    """A JSON object for `params` used to surface as the wrong error entirely.
+
+    `to_sqlalchemy_text` indexes `params[n - 1]`, so a dict raised `KeyError:
+    0` -- which the session path's `except KeyError` reported as "unknown or
+    expired transaction session" while the session was in fact still open, and
+    which escaped the sessionless path as a bare KeyError.
+    """
+    inst = instance_with_sqlite_registry
+    args = {'sql': 'SELECT * FROM t WHERE v = $1', 'params': {'v': 'x'}}
+    if use_session:
+        args['session_id'] = inst.begin({})['session_id']
+
+    with pytest.raises(ValueError, match='"params" must be an array'):
+        inst.execute(args)
+
+    if use_session:
+        # The session was never touched, so it is still usable.
+        assert inst.execute({'sql': 'SELECT 1 AS one', 'session_id': args['session_id']})['rows'] == [{'one': 1}]
+        inst.rollback({'session_id': args['session_id']})
+
+
+@pytest.mark.parametrize('use_session', [False, True], ids=['sessionless', 'session'])
+def test_params_must_cover_every_placeholder(instance_with_sqlite_registry, use_session):
+    """Too few values used to raise a bare IndexError from inside the rewriter."""
+    inst = instance_with_sqlite_registry
+    args = {'sql': 'SELECT * FROM t WHERE v = $1 OR v = $2', 'params': ['only-one']}
+    if use_session:
+        args['session_id'] = inst.begin({})['session_id']
+
+    with pytest.raises(ValueError) as excinfo:
+        inst.execute(args)
+
+    message = str(excinfo.value)
+    assert '$2' in message  # the placeholder that has no value
+    assert '"params"' in message
+
+    if use_session:
+        assert inst.execute({'sql': 'SELECT 1 AS one', 'session_id': args['session_id']})['rows'] == [{'one': 1}]
+        inst.rollback({'session_id': args['session_id']})
+
+
+def test_params_are_still_bound_when_they_cover_the_placeholders(instance_with_sqlite_registry):
+    """The check must not get in the way of a well-formed call."""
+    inst = instance_with_sqlite_registry
+    inst.execute({'sql': 'INSERT INTO t (v) VALUES ($1)', 'params': ['kept']})
+    assert inst.execute({'sql': 'SELECT v FROM t WHERE v = $1', 'params': ['kept']})['rows'] == [{'v': 'kept'}]
+    # A statement with no placeholders and no params is unaffected.
+    assert inst.execute({'sql': 'SELECT 2 AS two'})['rows'] == [{'two': 2}]

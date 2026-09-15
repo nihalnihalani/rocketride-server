@@ -365,6 +365,7 @@ class DatabaseInstanceBase(IInstanceBase, ABC):
 
         session_id = args.get('session_id')
         params = args.get('params')
+        self._validateExecuteParams(sql, params)
         if session_id:
             try:
                 result = self.IGlobal.tx_registry.execute(session_id, sql.strip(), params)
@@ -404,6 +405,40 @@ class DatabaseInstanceBase(IInstanceBase, ABC):
 
         rows = [self._sanitize_row(row) for row in result['rows']]
         return {'rows': rows, 'affected_rows': result['affected_rows']}
+
+    @staticmethod
+    def _validateExecuteParams(sql: str, params: Any) -> None:
+        """Reject a malformed ``params`` argument before anything is dispatched.
+
+        ``to_sqlalchemy_text`` rewrites ``$n`` into a bind by indexing
+        ``params[n - 1]``, so a JSON object raised ``KeyError: 0`` and a short
+        list an ``IndexError`` from inside the rewriter. Neither told the caller
+        what was wrong, and on the session path the ``KeyError`` was
+        indistinguishable from an unknown session id -- ``execute`` reported
+        "unknown or expired transaction session" for a session that was still
+        open and still usable.
+
+        An empty list is left alone: it means "no binds" to the rewriter today,
+        exactly as ``None`` does, and a statement carrying a literal ``$n`` in a
+        string body relies on that.
+        """
+        if params is None:
+            return
+        if not isinstance(params, list):
+            raise ValueError('"params" must be an array of positional bind values')
+        if not params:
+            return
+
+        # Imported here, from the module that owns the placeholder syntax, so
+        # the check cannot drift away from the rewriter it is guarding.
+        from ai.common.database.tx_registry import _PLACEHOLDER
+
+        for match in _PLACEHOLDER.finditer(sql):
+            index = int(match.group(1))
+            if index < 1 or index > len(params):
+                raise ValueError(
+                    f'"params" has {len(params)} value(s), so the ${index} placeholder in the statement has none'
+                )
 
     def _releaseFailedSession(self, session_id: str) -> None:
         """Roll back a session whose statement failed, without masking that failure.
