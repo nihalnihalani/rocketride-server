@@ -50,7 +50,7 @@
 // =============================================================================
 
 import type { SqlDialect } from '../connect';
-import { hasTopLevelKeyword, keywordSites, stripSqlComments } from './split';
+import { codeOnly, hasTopLevelKeyword, keywordSites, stripSqlComments } from './split';
 import type { IKeywordSite } from './split';
 
 // =============================================================================
@@ -122,10 +122,14 @@ export const CTE_WRITE_WORDS = ['insert', 'update', 'delete', 'merge', 'replace'
 const WITH_LEADERS = ['select', 'insert', 'update', 'delete', 'merge', 'values', 'table'];
 
 /**
- * The leaders that are NOT reserved words, so a CTE may be named after one.
- * SELECT, VALUES, TABLE and WITH are reserved and can never be names.
+ * What follows a CTE's name: an optional column list (walked separately), then
+ * `AS`, an optional materialisation hint, and the `(` that opens the body.
+ *
+ * Requiring the body opener is what separates a name from a verb: MySQL's
+ * multi-table `UPDATE (SELECT ...) AS d JOIN t ...` puts a parenthesis and an
+ * `AS` straight after the verb, but no body behind them.
  */
-const NAMEABLE_LEADERS = ['insert', 'update', 'delete', 'merge'];
+const CTE_BODY = /^\s*as\s*(?:(?:not\s+)?materialized\s*)?\(/i;
 
 /**
  * The CTE mutations the pattern check names. INSERT/MERGE/REPLACE are absent
@@ -151,7 +155,7 @@ function normalize(sql: string, dialect: SqlDialect): string {
 }
 
 /**
- * Whether a depth-0 keyword is a CTE's NAME rather than a statement's verb.
+ * Whether a keyword is a CTE's NAME rather than its group's verb.
  *
  * PostgreSQL lists INSERT, UPDATE, DELETE and MERGE as non-reserved words, so
  * `WITH merge AS (SELECT 1) DELETE FROM t` is a legal chain whose first
@@ -159,21 +163,37 @@ function normalize(sql: string, dialect: SqlDialect): string {
  * the DELETE behind it, which is the false negative this whole check exists to
  * close.
  *
- * A name is followed by `AS`, or by its column list — `merge (x) AS (...)`.
- * The column-list form is only read as a name for those four words, and it is
- * unambiguous for them because a real statement never puts `(` straight after
- * the verb: it is `INSERT INTO`, `UPDATE t`, `DELETE FROM`, `MERGE INTO`. The
- * reserved words cannot be names at all, so `SELECT (1 + 2)` and `VALUES (1)`
- * stay statements.
+ * The test is the CTE GRAMMAR, not a single character: an optional column
+ * list, then `AS`, then the body's `(`. Anything less misreads real SQL —
+ * MySQL's `UPDATE (SELECT 1 AS id) AS d JOIN t ...` opens with a parenthesis
+ * and carries an `AS`, and treating that verb as a name left a multi-table
+ * update unconfirmed. Reserved words cannot be names at all, and the grammar
+ * refuses them anyway: `SELECT (1 + 2)` and `VALUES (1)` have no body behind
+ * an `AS`.
  *
- * @param head - The normalised statement.
+ * Read on MASKED text, so a parenthesis inside a literal can neither open nor
+ * close the column list.
+ *
+ * @param masked - The statement with literals and comments blanked
+ *                 ({@link codeOnly}), offsets matching the sites.
  * @param site - A keyword occurrence in it.
  * @returns True when the keyword names a CTE.
  */
-function namesCte(head: string, site: IKeywordSite): boolean {
-	const after = head.slice(site.index + site.keyword.length);
-	if (/^\s*as\b/i.test(after)) return true;
-	return NAMEABLE_LEADERS.includes(site.keyword) && /^\s*\(/.test(after);
+function namesCte(masked: string, site: IKeywordSite): boolean {
+	let at = site.index + site.keyword.length;
+	while (at < masked.length && /\s/.test(masked[at])) at += 1;
+	// An optional column list: `merge (x, y) AS (...)`. Walked as a balanced
+	// run rather than matched, so a nested parenthesis cannot end it early.
+	if (masked[at] === '(') {
+		let depth = 0;
+		while (at < masked.length) {
+			if (masked[at] === '(') depth += 1;
+			else if (masked[at] === ')') depth -= 1;
+			at += 1;
+			if (depth === 0) break;
+		}
+	}
+	return CTE_BODY.test(masked.slice(at));
 }
 
 // =============================================================================
@@ -257,9 +277,9 @@ export function classifyStatement(sql: string, dialect: SqlDialect = 'unknown'):
  * UPDATE` belongs to its INSERT. Neither is an unbounded UPDATE, and saying so
  * would spend the dialog's credibility on statements that change nothing.
  *
- * A leader followed by `AS`, or one of the non-reserved four (INSERT, UPDATE,
- * DELETE, MERGE) followed by a column list, is a CTE's NAME and is read past
- * to the real verb behind it (see {@link namesCte}).
+ * A leader followed by the CTE grammar — an optional column list, `AS`, and
+ * the body's `(` — is a CTE's NAME and is read past to the real verb behind it
+ * (see {@link namesCte}).
  *
  * LIMITS, stated plainly because the dialog does too:
  * - A WHERE inside a string literal or a comment does not count (correct).
@@ -308,8 +328,9 @@ export function patternCheck(sql: string, dialect: SqlDialect = 'unknown'): IPat
 	const leadsWith = /^with\b/i.test(head);
 	const verbs = new Map<number, IKeywordSite>();
 	if (leadsWith) {
+		const masked = codeOnly(head, dialect);
 		for (const site of keywordSites(head, WITH_LEADERS, dialect)) {
-			if (!namesCte(head, site) && !verbs.has(site.group)) verbs.set(site.group, site);
+			if (!namesCte(masked, site) && !verbs.has(site.group)) verbs.set(site.group, site);
 		}
 	}
 	// Group -1 is the statement the chain carries.

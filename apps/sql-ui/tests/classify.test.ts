@@ -492,6 +492,42 @@ describe('patternCheck — a WITH chain carrying the verb', () => {
 		assert.equal(patternCheck('WITH delete (x) AS (SELECT 1) SELECT * FROM delete'), null);
 	});
 
+	it('reads a mysql multi-table UPDATE whose first table is derived', () => {
+		// MySQL puts `(` straight after the verb here, which the column-list
+		// rule alone mistook for a CTE name. A name is followed by the CTE
+		// grammar: an optional column list, then `AS`, then the body.
+		assert.deepEqual(
+			patternCheck('WITH a AS (SELECT 1) UPDATE (SELECT 1 AS id) AS d JOIN t ON t.id = d.id SET t.x = 1', 'mysql'),
+			{ kind: 'UPDATE without WHERE' },
+		);
+	});
+
+	it('reads the CTE grammar in its other spellings', () => {
+		assert.deepEqual(
+			patternCheck('WITH merge AS NOT MATERIALIZED (SELECT 1) DELETE FROM orders'),
+			{ kind: 'DELETE without WHERE' },
+		);
+		assert.deepEqual(
+			patternCheck('WITH merge AS(SELECT 1) DELETE FROM orders'),
+			{ kind: 'DELETE without WHERE' },
+		);
+	});
+
+	it('is not confused by a parenthesis inside a literal column list', () => {
+		// The column list is walked on masked text, so this `(` is a space
+		// and the list still closes where it really closes.
+		assert.deepEqual(
+			patternCheck("WITH merge ('(') AS (SELECT 1) DELETE FROM orders"),
+			{ kind: 'DELETE without WHERE' },
+		);
+	});
+
+	it('reads that statement the same way with and without the chain', () => {
+		const withChain = patternCheck('WITH a AS (SELECT 1) UPDATE (SELECT 1 AS id) AS d JOIN t ON t.id = d.id SET t.x = 1', 'mysql');
+		const bare = patternCheck('UPDATE (SELECT 1 AS id) AS d JOIN t ON t.id = d.id SET t.x = 1', 'mysql');
+		assert.deepEqual(withChain, bare);
+	});
+
 	it('does not read a parenthesised SELECT as a CTE name', () => {
 		// SELECT, VALUES and TABLE are reserved and can never be names, so a
 		// `(` after them is an expression. Treating one as a name would step

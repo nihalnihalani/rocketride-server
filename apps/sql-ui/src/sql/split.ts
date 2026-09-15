@@ -515,6 +515,24 @@ function keywordHits(masked: string, keyword: string): IKeywordHit[] {
 }
 
 /**
+ * The statement with every string literal, quoted identifier and comment
+ * blanked to spaces, offsets preserved.
+ *
+ * Offsets are preserved deliberately: an index from {@link keywordSites} points
+ * at the same character in this string and in the original, so a caller can
+ * look at what FOLLOWS a keyword without a `(` inside a literal misleading it.
+ * Callers that only need to find keywords should use the searches below; this
+ * is for the ones that need to read the grammar around one.
+ *
+ * @param sql - The statement.
+ * @param dialect - The engine dialect.
+ * @returns A string of the same length holding only the code characters.
+ */
+export function codeOnly(sql: string, dialect: SqlDialect = 'unknown'): string {
+	return maskNonCode(sql, traitsFor(dialect));
+}
+
+/**
  * Whether `keyword` appears as a whole word in CODE at parenthesis depth 0.
  *
  * Used by the pattern check to tell `DELETE FROM t WHERE id = 1` (has a
