@@ -505,12 +505,12 @@ describe('hasTopLevelKeyword', () => {
 describe('keywordSites', () => {
 	it('reports depth 0 for a leading keyword', () => {
 		const sites = keywordSites('DELETE FROM t WHERE id = 1', ['delete'], 'unknown');
-		assert.deepEqual(sites, [{ keyword: 'delete', index: 0, depth: 0, opensBody: false }]);
+		assert.deepEqual(sites, [{ keyword: 'delete', index: 0, depth: 0, group: -1 }]);
 	});
 
 	it('reports the depth of a keyword inside parentheses', () => {
 		const sites = keywordSites('WITH g AS (DELETE FROM t RETURNING *) SELECT 1', ['delete'], 'unknown');
-		assert.deepEqual(sites.map((site) => [site.depth, site.opensBody]), [[1, true]]);
+		assert.deepEqual(sites.map((site) => site.depth), [1]);
 	});
 
 	it('counts depth through nesting', () => {
@@ -543,24 +543,38 @@ describe('keywordSites', () => {
 		assert.deepEqual(sites.map((site) => site.keyword), ['update', 'delete', 'select']);
 	});
 
-	it('marks a keyword that opens a body across a line break', () => {
-		const sites = keywordSites('WITH x AS (\n\tDELETE FROM t\n) SELECT 1', ['delete'], 'unknown');
-		assert.deepEqual(sites.map((site) => site.opensBody), [true]);
-	});
-
-	it('marks a keyword that opens a body behind a comment', () => {
-		const sites = keywordSites('WITH x AS ( /* gone */ DELETE FROM t) SELECT 1', ['delete'], 'unknown');
-		assert.deepEqual(sites.map((site) => site.opensBody), [true]);
-	});
-
-	it('does not mark a keyword that merely sits inside a body', () => {
-		const sites = keywordSites('WITH a AS (SELECT * FROM t FOR UPDATE) SELECT 1', ['update'], 'unknown');
-		assert.deepEqual(sites.map((site) => [site.depth, site.opensBody]), [[1, false]]);
-	});
-
-	it('does not mark a keyword that opens nothing at depth 0', () => {
+	it('reports -1 as the group of a keyword at depth 0', () => {
 		const sites = keywordSites('DELETE FROM t', ['delete'], 'unknown');
-		assert.deepEqual(sites.map((site) => site.opensBody), [false]);
+		assert.deepEqual(sites.map((site) => site.group), [-1]);
+	});
+
+	it('groups a keyword by the parenthesis that encloses it', () => {
+		const sql = 'WITH x AS (\n\tDELETE FROM t\n) SELECT 1';
+		const sites = keywordSites(sql, ['delete'], 'unknown');
+		assert.deepEqual(sites.map((site) => site.group), [sql.indexOf('(')]);
+	});
+
+	it('gives sibling groups different identities at the same depth', () => {
+		// Depth alone would call these one body; they are two CTEs.
+		const sql = 'WITH u AS (UPDATE a SET x = 1), d AS (DELETE FROM b) SELECT 1';
+		const sites = keywordSites(sql, ['update', 'delete'], 'unknown');
+		assert.deepEqual(sites.map((site) => site.group), [sql.indexOf('(UPDATE') , sql.indexOf('(DELETE')]);
+		assert.deepEqual(sites.map((site) => site.depth), [1, 1]);
+	});
+
+	it('groups a keyword by its innermost enclosing parenthesis', () => {
+		const sql = 'WITH a AS (WITH b AS (SELECT 1) DELETE FROM t) SELECT 1';
+		const sites = keywordSites(sql, ['select', 'delete'], 'unknown');
+		assert.deepEqual(
+			sites.map((site) => [site.keyword, site.depth, site.group]),
+			[['select', 2, sql.indexOf('(SELECT')], ['delete', 1, sql.indexOf('(WITH')], ['select', 0, -1]],
+		);
+	});
+
+	it('reopens a group identity after a sibling group closes', () => {
+		const sql = 'SELECT (1) FROM t WHERE x IN (SELECT 1)';
+		const sites = keywordSites(sql, ['where'], 'unknown');
+		assert.deepEqual(sites.map((site) => [site.depth, site.group]), [[0, -1]]);
 	});
 
 	it('reports every occurrence of the same keyword', () => {

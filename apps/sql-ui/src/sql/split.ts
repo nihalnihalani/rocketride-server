@@ -71,11 +71,14 @@ export interface IKeywordSite {
 	/** Parenthesis depth in code at that offset; 0 is the statement itself. */
 	depth: number;
 	/**
-	 * Whether this keyword is the first token inside its parenthesis — the
-	 * difference between `(DELETE FROM t)`, a body that deletes, and
-	 * `(SELECT * FROM t FOR UPDATE)`, a body that only locks.
+	 * Which parenthesised group this keyword belongs to, identified by the
+	 * offset of the `(` that opens it; -1 for the statement itself.
+	 *
+	 * Two CTE bodies sit at the same depth and are different groups, so this
+	 * is what lets a caller ask "what does THIS body do" rather than "what
+	 * words occur somewhere inside a parenthesis".
 	 */
-	opensBody: boolean;
+	group: number;
 }
 
 /** The lexical traits that differ between the dialects the app speaks. */
@@ -458,36 +461,22 @@ interface IKeywordHit {
 	index: number;
 	/** Parenthesis depth, counted in code only, at that offset. */
 	depth: number;
+	/** Offset of the enclosing `(`, or -1 at depth 0. */
+	group: number;
 }
 
 /**
- * Whether the token at `index` is the first thing inside a parenthesis.
+ * Every whole-word occurrence of `keyword` in masked code, with its depth and
+ * the parenthesis that encloses it.
  *
- * This is what separates a CTE body's own verb from a keyword that merely
- * occurs inside one: `(DELETE FROM t ...)` opens with the verb, whereas the
- * `UPDATE` of `(SELECT * FROM t FOR UPDATE)` and of `... DO UPDATE SET` sits
- * behind other code and belongs to whatever opened the body. Literals and
- * comments are spaces in masked text, so a comment between the parenthesis and
- * the keyword is stepped over like whitespace.
- *
- * @param masked - Code-only text from {@link maskNonCode}.
- * @param index - Offset of the keyword in that text.
- * @returns True when the nearest non-whitespace character before it is `(`.
- */
-function opensParenthesis(masked: string, index: number): boolean {
-	let i = index - 1;
-	while (i >= 0 && /\s/.test(masked[i])) i -= 1;
-	return i >= 0 && masked[i] === '(';
-}
-
-/**
- * Every whole-word occurrence of `keyword` in masked code, with its depth.
- *
- * The one place that pairs a keyword with a parenthesis depth, so the
- * top-level and nested searches cannot drift apart. The depth is carried along
- * a single left-to-right pass rather than recounted per match, and the mask has
- * already blanked literals, quoted identifiers and comments, so a `(` in quoted
- * text cannot move it.
+ * The one place that pairs a keyword with its place in the parenthesis
+ * structure, so the searches built on it cannot drift apart. A stack of open
+ * parentheses is carried along a single left-to-right pass rather than
+ * recounted per match, and the offset on top of that stack identifies the
+ * GROUP — which depth alone cannot do, since `WITH a AS (SELECT 1), b AS
+ * (DELETE FROM t)` holds two different bodies at depth 1. The mask has already
+ * blanked literals, quoted identifiers and comments, so a `(` in quoted text
+ * cannot move any of it.
  *
  * @param masked - Code-only text from {@link maskNonCode}.
  * @param keyword - The keyword to look for (case-insensitive).
@@ -496,16 +485,16 @@ function opensParenthesis(masked: string, index: number): boolean {
 function keywordHits(masked: string, keyword: string): IKeywordHit[] {
 	const needle = new RegExp(`\\b${keyword}\\b`, 'gi');
 	const hits: IKeywordHit[] = [];
-	let depth = 0;
+	const open: number[] = [];
 	let scanned = 0;
 	let match = needle.exec(masked);
 	while (match) {
 		for (; scanned < match.index; scanned++) {
 			const ch = masked[scanned];
-			if (ch === '(') depth += 1;
-			else if (ch === ')') depth = Math.max(0, depth - 1);
+			if (ch === '(') open.push(scanned);
+			else if (ch === ')') open.pop();
 		}
-		hits.push({ index: match.index, depth });
+		hits.push({ index: match.index, depth: open.length, group: open.length > 0 ? open[open.length - 1] : -1 });
 		match = needle.exec(masked);
 	}
 	return hits;
@@ -532,9 +521,8 @@ export function hasTopLevelKeyword(sql: string, keyword: string, dialect: SqlDia
  *
  * The lexical half of the question "what is this statement doing": WHERE each
  * keyword sits, not what that means. The caller applies the meaning — the
- * pattern check reads the first {@link IKeywordSite.depth} 0 site as the verb a
- * `WITH` chain carries, and only treats a mutation as belonging to a CTE body
- * when it {@link IKeywordSite.opensBody opens} that body.
+ * pattern check reads the first site of a {@link IKeywordSite.group} as that
+ * group's verb, whether the group is the statement itself or one CTE body.
  *
  * Text order is decided on masked text, so an occurrence inside a literal, a
  * comment or a quoted identifier neither appears nor displaces a real one.
@@ -549,7 +537,7 @@ export function keywordSites(sql: string, keywords: string[], dialect: SqlDialec
 	const sites: IKeywordSite[] = [];
 	for (const keyword of keywords) {
 		for (const hit of keywordHits(masked, keyword)) {
-			sites.push({ keyword, index: hit.index, depth: hit.depth, opensBody: opensParenthesis(masked, hit.index) });
+			sites.push({ keyword, index: hit.index, depth: hit.depth, group: hit.group });
 		}
 	}
 	return sites.sort((a, b) => a.index - b.index);

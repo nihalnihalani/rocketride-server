@@ -160,11 +160,12 @@ and stop asking on this connection**.
 
 A statement that begins with `WITH` is checked on the verb the chain
 carries: `WITH audit AS (SELECT id FROM orders) DELETE FROM orders` deletes
-every row and is asked about like any other `DELETE` with no `WHERE`. An
-`UPDATE` or `DELETE` that opens a `WITH` clause body is reported as `DELETE
-inside a WITH clause` instead, with no verdict on its `WHERE`, because the
-text check cannot tell what a `WHERE` inside the clause applies to. When
-both apply, the outer statement is the one named.
+every row and is asked about like any other `DELETE` with no `WHERE`. A
+`WITH` clause whose body LEADS with `UPDATE` or `DELETE` — even behind a
+read-only `WITH` chain of its own — is reported as `UPDATE inside a WITH
+clause` or `DELETE inside a WITH clause` instead, with no verdict on its
+`WHERE`, because the text check cannot tell what a `WHERE` inside the clause
+applies to. When both apply, the outer statement is the one named.
 
 The verb has to be the statement's own, not a word inside one of its
 clauses: `SELECT ... FOR UPDATE` locks rows, and an upsert's `ON CONFLICT

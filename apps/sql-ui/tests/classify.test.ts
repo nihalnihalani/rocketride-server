@@ -496,6 +496,34 @@ describe('patternCheck — a mutation inside the WITH clause', () => {
 		assert.equal(patternCheck('WITH a AS (SELECT * FROM t FOR UPDATE) SELECT 1'), null);
 	});
 
+	it('flags a CTE body that carries its own WITH chain', () => {
+		// A DELETE may take its own read-only WITH clause, so the verb does not
+		// touch the parenthesis that opens the body. The body's verb is its
+		// first leader, not whatever sits nearest the bracket.
+		assert.deepEqual(
+			patternCheck('WITH a AS (WITH b AS (SELECT 1) DELETE FROM t RETURNING *) SELECT * FROM a'),
+			{ kind: 'DELETE inside a WITH clause' },
+		);
+		assert.deepEqual(
+			patternCheck('WITH a AS (WITH b AS (SELECT 1) UPDATE t SET x = 1 RETURNING *) SELECT * FROM a'),
+			{ kind: 'UPDATE inside a WITH clause' },
+		);
+	});
+
+	it('flags such a body when it is the second CTE', () => {
+		assert.deepEqual(
+			patternCheck('WITH a AS (SELECT 1), b AS (WITH c AS (SELECT 2) DELETE FROM t) SELECT 1'),
+			{ kind: 'DELETE inside a WITH clause' },
+		);
+	});
+
+	it('passes a nested chain whose inner CTE is named after a keyword', () => {
+		assert.equal(
+			patternCheck('WITH a AS (WITH delete AS (SELECT 1) SELECT * FROM delete) SELECT 1'),
+			null,
+		);
+	});
+
 	it('passes a CTE upsert whose DO UPDATE trails its INSERT', () => {
 		assert.equal(
 			patternCheck('WITH ins AS (INSERT INTO t VALUES (1) ON CONFLICT (id) DO UPDATE SET v = 1) SELECT 1'),
