@@ -62,8 +62,10 @@ const KIND_CASES: IKindCase[] = [
 	{ sql: '/* lead */ SELECT 1', kind: 'read' },
 	{ sql: 'WITH recent AS (SELECT * FROM orders) SELECT * FROM recent', kind: 'read' },
 	// A WITH chain is judged on CODE: a verb inside a literal, a dollar-quoted
-	// body or a quoted identifier is not a write. `"delete"` is the one that
-	// turns up in practice, since the word has to be quoted to be a table.
+	// body or a quoted identifier is not a write. The quoted-identifier row is
+	// the one that turns up in practice; MySQL reserves `delete`, so a table
+	// of that name needs the quotes there, while PostgreSQL does not reserve
+	// it and does not need them.
 	{ sql: "WITH d AS (SELECT 'delete me' AS t) SELECT * FROM d", kind: 'read' },
 	{ sql: 'WITH d AS (SELECT 1) SELECT * FROM "delete"', kind: 'read' },
 	{ sql: 'WITH d AS (SELECT $$delete from orders$$ AS t) SELECT 1', kind: 'read', dialect: 'postgres' },

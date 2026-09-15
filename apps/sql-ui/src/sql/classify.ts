@@ -212,11 +212,13 @@ function namesCte(masked: string, site: IKeywordSite): boolean {
  *
  * Code is the operative word. The decision reads the same masked text the
  * pattern check reads, so a verb inside a string literal, a dollar-quoted body
- * or a quoted identifier is not a write — `SELECT * FROM "delete"` is a read,
- * and the word has to be quoted there because it is reserved. Judging that on
- * raw text made the failure banner say "already committed" about a SELECT,
- * labelled it `committed` in the strip, and spent the read's one stale-token
- * retry.
+ * or a quoted identifier is not a write — `SELECT * FROM "delete"` is a read.
+ * The quotes in that example are MySQL's requirement, since it reserves the
+ * word; PostgreSQL does not reserve it and does not need them, which is the
+ * same fact {@link namesCte} depends on. Either way the identifier is quoted
+ * text, not code. Judging that on raw text made the failure banner say
+ * "already committed" about a SELECT, labelled it `committed` in the strip,
+ * and spent the read's one stale-token retry.
  *
  * @param sql - One statement (no terminator needed).
  * @param dialect - The engine dialect; decides comment syntax.
