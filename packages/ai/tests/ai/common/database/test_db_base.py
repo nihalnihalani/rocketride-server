@@ -411,6 +411,97 @@ def test_format_db_error_mysql_keeps_a_quoted_identifier_intact(base):
     assert base._format_db_error(exc) == "Error 1054: Unknown column 'foo' in 'field list'"
 
 
+# ---------------------------------------------------------------------------
+# _format_db_error — the block markers must not fire mid-sentence
+#
+# PostgreSQL writes DETAIL / HINT / CONTEXT / QUERY / STATEMENT as separate
+# LINES of the server message, so a bare substring search also matched those
+# five words inside an application's own error text and truncated it. No live
+# PostgreSQL or MySQL server is available in this suite, so each case below is
+# a constructed exception shape reproducing what the driver hands SQLAlchemy.
+# ---------------------------------------------------------------------------
+
+
+def test_format_db_error_keeps_an_inline_hint_word_in_an_application_message(base):
+    """``RAISE EXCEPTION 'Order rejected. HINT: contact billing'`` survives whole.
+
+    Constructed psycopg2 shape; no live PostgreSQL here. A PL/pgSQL ``RAISE``
+    puts the author's whole sentence in ``diag.message_primary``, where the
+    server has already split its own context blocks off — so nothing in it is
+    a marker, and truncating at the word "HINT:" would delete the half of the
+    message that says what to do about the failure.
+    """
+    orig = _FakeDriverError('Order rejected. HINT: contact billing')
+    orig.diag = SimpleNamespace(message_primary='Order rejected. HINT: contact billing')
+    orig.pgcode = 'P0001'
+    exc = _wrapped(orig, 'SELECT place_order(%(id)s)', {'id': 7})
+
+    message = base._format_db_error(exc)
+    assert message == 'Error P0001: Order rejected. HINT: contact billing'
+    assert '[SQL:' not in message
+    assert '[parameters:' not in message
+
+
+def test_format_db_error_keeps_an_inline_hint_word_without_diag(base):
+    """The same sentence via the ``args[0]`` fallback, where the blocks are real lines.
+
+    Constructed psycopg2 shape. Here the message carries a genuine trailing
+    ``DETAIL:`` block on its own line: that one is still cut, while the word
+    "HINT:" in the middle of the primary sentence is not.
+    """
+    orig = _FakeDriverError('Order rejected. HINT: contact billing\nDETAIL:  Key (id)=(7) is on hold.\n')
+    exc = _wrapped(orig, 'SELECT place_order(%(id)s)', {'id': 7})
+
+    message = base._format_db_error(exc)
+    assert message == 'Order rejected. HINT: contact billing'
+    assert 'Key (id)=(7)' not in message
+
+
+def test_format_db_error_keeps_a_mysql_message_containing_the_word_query(base):
+    """A pymysql 1644 from a ``SIGNAL SQLSTATE`` whose text contains "QUERY:".
+
+    Constructed pymysql shape; no live MySQL here. MySQL has no DETAIL/HINT/
+    CONTEXT block structure at all, so any of those words in a MySQL message
+    is part of the message.
+    """
+    orig = _FakeDriverError(1644, 'Invalid QUERY: missing tenant filter')
+    exc = _wrapped(orig, 'SELECT * FROM orders', {})
+
+    assert base._format_db_error(exc) == 'Error 1644: Invalid QUERY: missing tenant filter'
+
+
+def test_format_db_error_keeps_a_message_that_begins_with_a_block_word(base):
+    """A message whose FIRST token is "HINT:" must not degrade to the fallback.
+
+    Constructed shape. Anchoring the block markers to the start of the STRING
+    as well as to a line start would make the whole message detail, and the
+    caller would get the neutral 'Database error' constant instead of the one
+    sentence that tells them what went wrong.
+    """
+    orig = _FakeDriverError('HINT: use a smaller value for the batch size')
+    exc = _wrapped(orig, 'INSERT INTO t VALUES (%(n)s)', {'n': 10**9})
+
+    assert base._format_db_error(exc) == 'HINT: use a smaller value for the batch size'
+
+
+def test_format_db_error_still_cuts_a_real_postgres_detail_block(base):
+    """The anchoring must not reopen the leak: a real DETAIL line is still cut.
+
+    Constructed psycopg2 shape. This is the ``args[0]`` path (no ``.diag``),
+    where the server's DETAIL block — the one that restates another row's key
+    values — arrives as its own line and must still go.
+    """
+    orig = _FakeDriverError(
+        'duplicate key value violates unique constraint "users_email_key"\n'
+        'DETAIL:  Key (email)=(ada@example.com) already exists.\n'
+    )
+    exc = _wrapped(orig, 'INSERT INTO users (email) VALUES (%(email)s)', {'email': 'ada@example.com'})
+
+    message = base._format_db_error(exc)
+    assert message == 'duplicate key value violates unique constraint "users_email_key"'
+    assert 'ada@example.com' not in message
+
+
 def test_format_db_error_returns_a_neutral_string_when_the_message_is_only_detail(base):
     """A message that is nothing but detail must not fall back to the statement.
 

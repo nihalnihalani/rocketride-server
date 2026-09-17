@@ -81,21 +81,40 @@ DEFAULT_MAX_EXECUTE_ROWS = 25000
 # The primary message alone -- "no such column: foo", "duplicate key value
 # violates unique constraint users_email_key" -- is what a caller needs in
 # order to fix their statement, and it carries no user data.
+#
+# Two alternation groups, because the two kinds of marker cannot be matched
+# the same way:
+#
+#   * The tails a library APPENDS can begin anywhere, mid-line included, so
+#     they stay bare substrings.
+#   * PostgreSQL's five context blocks are separate LINES of the server
+#     message. As bare substrings they also fired inside an application's own
+#     text: a PL/pgSQL `RAISE EXCEPTION 'Order rejected. HINT: contact
+#     billing'` was cut to "Order rejected.", and a MySQL message reading
+#     "Invalid QUERY: missing tenant filter" to "Invalid". So they are
+#     anchored to a preceding newline. The anchor is `\n` and not `(?m)^`
+#     deliberately: `^` also matches at position 0, which would make a message
+#     whose first token is one of the five all-detail and degrade it to the
+#     fallback constant.
 _DB_ERROR_DETAIL = re.compile(
-    r"""\s*(?:
-          \[SQL:
-        | \[parameters:
-        | \[cached\ since
-        | \[generated\ in
-        | \(Background\ on\ this\ error
-        | LINE\ \d+:
-        | DETAIL:
-        | HINT:
-        | CONTEXT:
-        | QUERY:
-        | STATEMENT:
-        | Stack\ trace:
-        | failed\ at\ position
+    r"""(?:
+        \s*(?:
+              \[SQL:
+            | \[parameters:
+            | \[cached\ since
+            | \[generated\ in
+            | \(Background\ on\ this\ error
+            | LINE\ \d+:
+            | Stack\ trace:
+            | failed\ at\ position
+        )
+      | \n[ \t]*(?:
+              DETAIL:
+            | HINT:
+            | CONTEXT:
+            | QUERY:
+            | STATEMENT:
+        )
     )""",
     re.VERBOSE,
 )
@@ -215,6 +234,11 @@ class DatabaseGlobalBase(IGlobalBase, ABC):
         * psycopg2 exposes the server's primary message on ``.orig.diag``;
           its ``str()`` also carries the ``LINE n:`` echo of the statement,
           which psycopg2 has already interpolated the bind values into.
+          ``diag.message_primary`` is returned WITHOUT the stripper, because
+          the server has already split DETAIL / HINT / CONTEXT / QUERY /
+          STATEMENT and the ``LINE n:`` echo onto ``diag`` fields of their
+          own: there is no tail left in it, so a marker firing there could
+          only be truncating the application's own wording.
         * sqlite3 (and anything else) puts the bare message in ``.orig.args[0]``.
 
         Every branch runs through ``_strip_statement_detail`` as a backstop,
@@ -226,8 +250,10 @@ class DatabaseGlobalBase(IGlobalBase, ABC):
         * REMOVED: SQLAlchemy's ``[SQL: ...]`` / ``[parameters: ...]`` /
           ``[cached since ...]`` tail, and the drivers' trailing blocks --
           psycopg2's ``LINE n:`` echo, PostgreSQL's DETAIL / HINT / CONTEXT /
-          QUERY / STATEMENT, ClickHouse's server stack trace and its
-          ``failed at position`` echo.
+          QUERY / STATEMENT *as lines of the message* (the five words are
+          left alone in the middle of a sentence, where they belong to the
+          application, not to the server), ClickHouse's server stack trace
+          and its ``failed at position`` echo.
         * PASSED THROUGH: the driver's own primary sentence, as the database
           wrote it. It can quote the fragment of the statement the parser
           stopped on (sqlite3 ``near "'hunter2'": syntax error``, MySQL 1064
@@ -268,8 +294,15 @@ class DatabaseGlobalBase(IGlobalBase, ABC):
             primary = getattr(diag, 'message_primary', None) if diag is not None else None
             if isinstance(primary, str) and primary.strip():
                 code = getattr(orig, 'pgcode', None)
-                formatted = f'Error {code}: {primary}' if isinstance(code, str) and code else primary
-                return _strip_statement_detail(formatted)
+                primary = primary.strip()
+                # Returned WITHOUT the stripper. `message_primary` is the one
+                # field the server has already separated from its own context
+                # blocks -- psycopg2 puts DETAIL / HINT / CONTEXT / QUERY /
+                # STATEMENT and the `LINE n:` echo on `diag` fields of their
+                # own -- so there is no tail here to cut, and running the
+                # markers over it could only truncate an application's text
+                # (`RAISE EXCEPTION 'Order rejected. HINT: contact billing'`).
+                return f'Error {code}: {primary}' if isinstance(code, str) and code else primary
 
             # clickhouse-driver's ServerException carries the code on `.code`
             # and the text on `.message`, not as an (int, str) pair in args, so
