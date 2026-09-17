@@ -30,7 +30,7 @@ current pipeline execution.
 import os
 from typing import Any, Dict
 
-from rocketlib import IGlobalBase, OPEN_MODE, warning
+from rocketlib import IGlobalBase, OPEN_MODE, debug, warning
 from ai.common.config import Config
 
 # This node's own service prefix — services.json declares `"prefix": "eval"`,
@@ -87,16 +87,37 @@ class IGlobal(IGlobalBase):
         if self.IEndpoint.endpoint.openMode == OPEN_MODE.CONFIG:
             return
 
-        from depends import depends
-
-        requirements = os.path.dirname(os.path.realpath(__file__)) + '/requirements.txt'
-        depends(requirements)
+        self._installDriver()
 
         from .cobalt_evaluator import CobaltEvaluator
 
         config = self._extractConfig()
         bag = self.IEndpoint.endpoint.bag
         self._evaluator = CobaltEvaluator(config, bag)
+
+    def _installDriver(self) -> None:
+        """Install the optional cobalt driver, tolerating an install failure.
+
+        The node ships pure-Python evaluators for every eval_type (Jaccard
+        word overlap for ``similarity``, and ``relevance``/``grounding``/
+        ``format`` need no dependency at all), and README.md promises them
+        when ``basalt-ai-cobalt`` is absent. Letting ``depends()`` raise here
+        would make that promise unreachable: an unreachable index or a
+        resolution conflict would abort pipeline init even though the node can
+        still score. Mirrors ``dataset_cobalt``'s ``IGlobal._installDriver``.
+        """
+        from depends import depends
+
+        requirements = os.path.dirname(os.path.realpath(__file__)) + '/requirements.txt'
+        debug(f'Cobalt Evaluator Global: Loading requirements from {requirements}')
+        # Broad by intent: any install failure degrades to the pure-Python evaluators.
+        try:
+            depends(requirements)
+        except Exception as e:
+            warning(
+                f'Cobalt Evaluator Global: could not install {requirements}: {e!s}. '
+                'Continuing with the pure-Python evaluators.'
+            )
 
     def endGlobal(self):
         """Release the evaluator instance."""

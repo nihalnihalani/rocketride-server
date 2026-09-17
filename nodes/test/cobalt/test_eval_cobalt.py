@@ -937,6 +937,94 @@ class TestIGlobalLifecycle:
         assert iglobal._evaluator is None
 
 
+class TestDependencyInstallFailureFallsBack:
+    """README promise: the pure-Python evaluators run when cobalt is absent.
+
+    ``eval_cobalt/README.md`` states the ``basalt-ai-cobalt`` package is
+    optional — similarity falls back to Jaccard word overlap and relevance,
+    grounding and format need no dependency at all. ``beginGlobal`` used to
+    call ``depends(requirements)`` bare, so an install failure (no package
+    index, resolution conflict) aborted pipeline init before the fallback
+    could ever run. These mirror the three dataset_cobalt cases added in
+    31df61c0f and fail without the fix because the RuntimeError from
+    depends() escapes beginGlobal.
+    """
+
+    @staticmethod
+    def _failing_depends():
+        mod = ModuleType('depends')
+
+        def _boom(*_args, **_kwargs):
+            raise RuntimeError('Failed to install requirements.txt: no index available')
+
+        mod.depends = _boom
+        # `cobalt: None` makes the lazy `from cobalt import Evaluator` raise
+        # ImportError, i.e. the install really did not land.
+        return patch.dict(sys.modules, {'depends': mod, 'cobalt': None})
+
+    @staticmethod
+    def _iglobal(config):
+        from eval_cobalt.IGlobal import IGlobal
+
+        iglobal = IGlobal.__new__(IGlobal)
+        mock_endpoint = MagicMock()
+        mock_endpoint.endpoint.openMode = 'RUN'
+        mock_endpoint.endpoint.bag = {}
+        mock_endpoint.endpoint.connConfig = config
+        iglobal.IEndpoint = mock_endpoint
+        mock_glb = MagicMock()
+        mock_glb.logicalType = 'eval_cobalt'
+        mock_glb.connConfig = config
+        iglobal.glb = mock_glb
+        return iglobal
+
+    def test_begin_global_still_builds_the_evaluator(self):
+        iglobal = self._iglobal({'eval_type': 'similarity', 'threshold': 0.3})
+
+        with self._failing_depends():
+            iglobal.beginGlobal()
+
+        assert iglobal._evaluator is not None
+
+    def test_similarity_still_scores_through_the_pure_python_fallback(self):
+        iglobal = self._iglobal({'eval_type': 'similarity', 'threshold': 0.3})
+
+        with self._failing_depends():
+            iglobal.beginGlobal()
+            result = iglobal._evaluator.evaluate_semantic(
+                'The capital of France is Paris',
+                'Paris is the capital of France',
+            )
+
+        assert result['evaluator'] == 'semantic'
+        assert result['score'] > 0.0
+        assert result['passed'] is True
+
+    def test_the_failed_install_is_reported_as_a_warning(self):
+        iglobal = self._iglobal({'eval_type': 'similarity'})
+
+        with self._failing_depends(), patch('eval_cobalt.IGlobal.warning') as mock_warning:
+            iglobal.beginGlobal()
+
+        logged = ' '.join(str(call) for call in mock_warning.call_args_list)
+        assert 'requirements.txt' in logged
+        assert 'no index available' in logged
+
+    def test_a_real_config_failure_still_raises_after_a_failed_install(self):
+        """Tolerating the install failure must not swallow genuine errors."""
+        iglobal = self._iglobal({'eval_type': 'similarity'})
+
+        def _boom(*_args, **_kwargs):
+            raise ValueError('node config unavailable')
+
+        with (
+            self._failing_depends(),
+            patch.object(IGlobalModule.Config, 'getNodeConfig', staticmethod(_boom)),
+            pytest.raises(ValueError, match='node config unavailable'),
+        ):
+            iglobal.beginGlobal()
+
+
 # ===========================================================================
 # Deterministic evaluators (relevance, grounding, format)
 #
