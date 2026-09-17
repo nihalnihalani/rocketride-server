@@ -144,6 +144,14 @@ RESULT, not the text. Choose **200** or **1000** to have a limit appended to
 the outer query, or move the `LIMIT` to the top level, to bound what comes
 back.
 
+A statement that ENDS in a locking clause — `FOR UPDATE`, `FOR NO KEY
+UPDATE`, `FOR SHARE`, `FOR KEY SHARE` or MySQL's `LOCK IN SHARE MODE` — is
+sent exactly as you typed it, and the line reads `no limit applied` whatever
+the toggle says. That clause has to stay last in both engines, so an appended
+`LIMIT` would land after it and the statement would no longer parse, and the
+app will not reorder your SQL to make room: write your own `LIMIT` before the
+clause when you want the result bounded.
+
 When the returned count equals an applied limit, a badge reads `Limit
 reached — more rows may exist`, because a full page is not evidence the
 result ended there.
@@ -382,6 +390,13 @@ statements ran either way; only the app's picture of the schema is behind.
   ClickHouse declares no foreign keys at all.
 - **The schema is a snapshot** from pipeline start, unless the node can
   re-read it.
+- **No appended limit after a locking clause.** `SELECT … FOR UPDATE`,
+  `FOR SHARE` and MySQL's `LOCK IN SHARE MODE` run unbounded and read `no
+  limit applied`; add a `LIMIT` before the clause yourself.
+- **Duplicate column names collapse.** A projection that returns two columns
+  with the same name shows one: the node hands back each row as an object
+  keyed by column name, and the grid takes its headers from the first row.
+  Alias one of them to see both.
 - **The editor loads Monaco from a CDN.** An air-gapped browser gets the
   rest of the app without a working SQL editor.
 
