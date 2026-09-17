@@ -186,7 +186,9 @@ class CobaltEvaluator:
             reasoning = result.get('reasoning', '') if isinstance(result, dict) else getattr(result, 'reasoning', '')
             return self._make_result(score, self._threshold, reasoning or 'LLM judge evaluation complete', 'llm_judge')
         except Exception as e:
-            debug(f'Cobalt LLM judge evaluation failed: {e}')
+            # Only the class name: a provider SDK exception can echo the request URL
+            # or the Authorization header, and self._apikey is in scope here.
+            debug(f'Cobalt LLM judge evaluation failed: {type(e).__name__}')
             return self._make_result(0.0, self._threshold, f'Evaluation failed: {type(e).__name__}', 'llm_judge')
 
     def evaluate_custom(self, output: str, expected: str, eval_fn: Optional[Callable] = None) -> Dict[str, Any]:

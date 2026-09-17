@@ -439,6 +439,34 @@ class TestLLMJudgeEvaluation:
         assert result['passed'] is False
         assert 'RuntimeError' in result['reasoning']
 
+    def test_llm_judge_failure_log_never_carries_the_exception_text(self):
+        """A provider SDK exception may echo the request URL or the Authorization header.
+
+        Only the exception class name may reach the debug log; the message body
+        (which is where a credential would be echoed) must not.
+        """
+        sentinel = 'sk-live-SENTINEL-DO-NOT-LOG'
+        mock_evaluator_instance = MagicMock()
+        mock_evaluator_instance.evaluate.side_effect = RuntimeError(
+            f'401 Unauthorized for https://api.example.test/v1/chat (Authorization: Bearer {sentinel})'
+        )
+
+        with (
+            patch('eval_cobalt.cobalt_evaluator._cobalt_available', True),
+            patch('eval_cobalt.cobalt_evaluator.Evaluator', return_value=mock_evaluator_instance),
+            patch('eval_cobalt.cobalt_evaluator.debug') as mock_debug,
+        ):
+            evaluator = CobaltEvaluator({'eval_type': 'llm_judge', 'apikey': sentinel, 'threshold': 0.5}, {})
+            result = evaluator.evaluate_llm_judge('some output', 'expected')
+
+        logged = ' '.join(str(call) for call in mock_debug.call_args_list)
+        assert sentinel not in logged
+        assert 'Authorization' not in logged
+        assert 'RuntimeError' in logged
+        # The returned reasoning was already safe; keep it that way.
+        assert sentinel not in result['reasoning']
+        assert 'RuntimeError' in result['reasoning']
+
 
 class TestCustomEvaluation:
     """Test custom function evaluation."""
