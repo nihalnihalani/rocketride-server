@@ -39,7 +39,7 @@
 import type { SqlDialect } from '../connect';
 import type { StatementKind } from './classify';
 import { CTE_WRITE_WORDS } from './classify';
-import { hasTopLevelKeyword, keywordSites, stripSqlComments } from './split';
+import { codeOnly, hasTopLevelKeyword, keywordSites, stripSqlComments } from './split';
 
 // =============================================================================
 // TYPES
@@ -271,6 +271,50 @@ export function formatRunLabel(run: IStatementRun): string {
 const RETURNS_ROWS = /^select\b/i;
 
 /**
+ * The head of a locking clause — the part that identifies it as one.
+ *
+ * PostgreSQL spells it `FOR UPDATE`, `FOR NO KEY UPDATE`, `FOR SHARE` or
+ * `FOR KEY SHARE`; MySQL 8.0 adds the older `LOCK IN SHARE MODE`. Matching
+ * the bare keyword would be wrong in both directions: `LOCK` is NON-RESERVED
+ * in PostgreSQL, so `SELECT * FROM lock` is an ordinary unbounded read that
+ * must still be bounded, and `FOR` alone would also catch a `FOR SYSTEM_TIME`
+ * that sits in the middle of a statement.
+ */
+const LOCKING_CLAUSE_HEAD = /^(?:for\s+(?:no\s+key\s+update|key\s+share|update|share)|lock\s+in\s+share\s+mode)(?![\w$])/i;
+
+/**
+ * What may FOLLOW that head and still leave the clause LAST: its optional
+ * `OF table[, ...]` list, `NOWAIT`, `SKIP LOCKED`, a second locking clause, a
+ * trailing `;`, and the whitespace a masked comment leaves behind. Anything
+ * else — a parenthesis, an operator, a comparison — means the statement goes
+ * on, so the match was not the trailing clause.
+ */
+const LOCKING_CLAUSE_TAIL = /^[\w$.,;\s]*$/;
+
+/**
+ * Whether the statement's LAST clause is a locking clause.
+ *
+ * Read on MASKED text, so a `for update` inside a string literal, a comment or
+ * a quoted identifier is not one, and at parenthesis depth 0 only, so a
+ * locking clause inside a subquery is not the outer statement's last clause.
+ * {@link codeOnly} preserves offsets, so a site's index points at the same
+ * character in the masked text as in the statement itself.
+ *
+ * @param sql - The statement.
+ * @param dialect - The engine dialect.
+ * @returns True when a locking clause closes the statement.
+ */
+function endsWithLockingClause(sql: string, dialect: SqlDialect): boolean {
+	const masked = codeOnly(sql, dialect);
+	return keywordSites(sql, ['for', 'lock'], dialect).some((site) => {
+		if (site.depth !== 0) return false;
+		const rest = masked.slice(site.index);
+		const head = LOCKING_CLAUSE_HEAD.exec(rest);
+		return head !== null && LOCKING_CLAUSE_TAIL.test(rest.slice(head[0].length));
+	});
+}
+
+/**
  * How a result's row limit came about.
  *
  * - `applied` — the app appended the header's limit.
@@ -314,6 +358,13 @@ export function applyRowLimit(sql: string, limit: string, dialect: SqlDialect = 
 	if (limit === 'All' || !returnsRows) return { sql, limit: null, state: 'none' };
 	const value = Number(limit);
 	if (!Number.isFinite(value) || value <= 0) return { sql, limit: null, state: 'none' };
+	// A locking clause is the LAST clause of a SELECT in both PostgreSQL and
+	// MySQL, so an appended LIMIT lands after it and the statement no longer
+	// parses — and the user never typed the clause that the error names.
+	// Bounding one would mean reordering the user's SQL, so this does what the
+	// data-modifying WITH chain above does: send the statement untouched and
+	// report that no limit was applied.
+	if (endsWithLockingClause(sql, dialect)) return { sql, limit: null, state: 'none' };
 	// The clause is joined with a NEWLINE, not a space: the checks above run on
 	// comment-stripped text but the statement is sent RAW, so appending after a
 	// trailing `-- ...` comment would put LIMIT inside that comment and send an
