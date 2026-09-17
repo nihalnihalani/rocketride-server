@@ -28,6 +28,7 @@ All tests use mocks — no real Cobalt AI or external API calls are made.
 
 import copy
 import importlib
+import importlib.util
 import pathlib
 import sys
 from types import ModuleType
@@ -1197,6 +1198,52 @@ class TestFormatEvaluation:
         result = evaluator.evaluate('{"valid": true}', 'ignored')
         assert result['evaluator'] == 'format'
         assert result['passed'] is True
+
+
+class TestValidEvalTypesArePinnedToTheSchema:
+    """_VALID_EVAL_TYPES and services.json preconfig.profiles must not drift.
+
+    ``CobaltEvaluator.__init__`` silently rewrites an unknown eval_type to
+    'similarity' (cobalt_evaluator.py:76), so a seventh profile added to
+    services.json without touching the tuple would make that profile evaluate
+    as similarity with no error anywhere. asclearuc asked for the pin
+    (thread r4014072524).
+    """
+
+    @staticmethod
+    def _profiles():
+        # eval_cobalt/services.json is JSONC (// comments, trailing commas) --
+        # plain json.loads raises. Reuse the repo's own service-contract reader
+        # rather than a second private parser.
+        contracts_path = pathlib.Path(__file__).resolve().parents[1] / 'test_contracts.py'
+        spec = importlib.util.spec_from_file_location('_cobalt_service_contract_reader', contracts_path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        services_path = _REPO_ROOT / 'nodes' / 'src' / 'nodes' / 'eval_cobalt' / 'services.json'
+        schema = module.parse_service_json(services_path)
+        assert schema is not None, f'{services_path} did not parse as JSONC'
+        return schema['preconfig']['profiles']
+
+    def test_profile_names_match_the_valid_eval_types_tuple(self):
+        from eval_cobalt.cobalt_evaluator import _VALID_EVAL_TYPES
+
+        assert set(self._profiles()) == set(_VALID_EVAL_TYPES)
+
+    def test_every_profile_eval_type_value_is_itself_valid(self):
+        from eval_cobalt.cobalt_evaluator import _VALID_EVAL_TYPES
+
+        for name, profile in self._profiles().items():
+            assert profile['eval_type'] in _VALID_EVAL_TYPES, f'profile {name!r} declares an unknown eval_type'
+
+    def test_the_default_profile_exists(self):
+        contracts_path = pathlib.Path(__file__).resolve().parents[1] / 'test_contracts.py'
+        spec = importlib.util.spec_from_file_location('_cobalt_service_contract_reader', contracts_path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        schema = module.parse_service_json(_REPO_ROOT / 'nodes' / 'src' / 'nodes' / 'eval_cobalt' / 'services.json')
+
+        assert schema['preconfig']['default'] in schema['preconfig']['profiles']
 
 
 class TestExtendedEvalTypeWhitelist:
