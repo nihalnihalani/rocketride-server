@@ -59,11 +59,23 @@ answer}`, and a query execution failure returns `{valid: false, error, sql,
 rows: []}`.
 
 `execute` requires non-empty `sql` and optionally accepts a transaction
-`session_id` plus positional values for `$1`, `$2`, and so on. It returns
-`{rows, affected_rows}`. `begin` takes no arguments and returns `{session_id}`;
+`session_id`, positional values for `$1`, `$2`, and so on, and a `row_mode`:
+`object` (default) keys rows by column name, while `array` returns positional
+arrays that preserve column order and keep duplicate column names — the shape
+ORM drivers such as Drizzle require. It returns `{rows, affected_rows}`.
+`begin` takes no arguments and returns `{session_id}`;
 `commit` and `rollback` require that ID and return `{ok: true}`. These four
 write-capable operations fail when **Allow direct query execution** is off;
 unknown or expired session IDs also fail. Invalid tool input raises an error.
+
+A failed statement does **not** roll the session back. The session stays open
+and MySQL leaves its transaction usable, so a later `commit` persists the work
+that preceded the error — recovery is the client's responsibility. Issue
+`rollback` to discard the session, or `rollback to savepoint <name>` to undo
+only the failed portion and continue; the idle reaper is the backstop for
+sessions that are abandoned instead. (Postgres differs: it aborts the whole
+transaction on any failure, so the node refuses the later commit rather than
+letting it degrade to a silent rollback.)
 
 ## Configuration
 
@@ -164,6 +176,11 @@ and rolls all open sessions back when the pipeline closes.
 | `mysql.profile` | `string` |  | `"default"` |
 | `mysql.table` | `string` | **Table name**<br/>Name of table | `"table"` |
 | `mysql.user` | `string` | **User**<br/>User to connect to the MySQL server | `"root"` |
+
+## Dependencies
+
+- `pymysql` `>=1.2.0`
+- `cryptography`
 
 ## Source
 
