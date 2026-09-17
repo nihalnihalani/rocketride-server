@@ -62,6 +62,12 @@ mod.actions.push({
 			if (!existsSync(TESTS_DIR)) {
 				throw new Error(`No tests/ directory at ${TESTS_DIR} — sql-ui's suite is tracked source and must be present`);
 			}
+			// `recursive` is IGNORED on Node 20.0.0 exactly (it landed in 20.1.0)
+			// while the root package.json still declares `node: ">=20.0.0"`, so a
+			// NESTED directory added under tests/ would silently stop running on
+			// that one runtime. tests/ is flat today and CI resolves `node-version:
+			// 20` to a current 20.x, so nothing is missed; the repo-wide engines
+			// floor is tracked in PR #2282, discussion r4008843631.
 			const testFiles = (await readdir(TESTS_DIR, { recursive: true }))
 				.filter((f) => f.endsWith('.test.ts') || f.endsWith('.test.tsx'))
 				.map((f) => path.join('tests', f));
