@@ -459,6 +459,64 @@ class TestRunSpecJudgeWiring:
         # ...and both pipelines were still terminated
         assert sorted(fake.terminated_tokens()) == ['task-1', 'task-2']
 
+    async def test_judge_pipeline_started_during_timeout_is_torn_down(self, monkeypatch):
+        """A judge start still in flight when the timeout fires must not escape teardown."""
+
+        class SlowJudgeStartClient(FakeClient):
+            """Starts the judge pipeline on the engine, then answers slowly."""
+
+            def __init__(self):
+                super().__init__()
+                self.engine_started_tokens: list[str] = []
+
+            async def use(self, *, filepath=None, source=None, **kwargs):
+                if filepath != '/abs/judge.pipe':
+                    token = (await super().use(filepath=filepath, source=source, **kwargs))['token']
+                    self.engine_started_tokens.append(token)
+                    return {'token': token}
+                # The engine creates the judge pipeline first and only then
+                # answers: a cancellation landing on the client's await loses
+                # the token, not the pipeline.
+                self._token_counter += 1
+                token = f'task-{self._token_counter}'
+                self.engine_started_tokens.append(token)
+                await asyncio.sleep(0.2)
+                self.calls.append(('use', {'filepath': filepath, 'source': source, 'token': token}))
+                return {'token': token}
+
+        captured = {}
+
+        def fake_factory(run_pipeline, default_judge_pipeline):
+            captured['run_pipeline'] = run_pipeline
+            return lambda **kwargs: None
+
+        def judging_evaluate(assertion, *, output_text, duration_ms, case_input, judge):
+            return AssertionResult(
+                spec=assertion,
+                passed=True,
+                detail=captured['run_pipeline']('/abs/judge.pipe', 'score this output'),
+            )
+
+        monkeypatch.setattr(runner_module, 'evaluate_assertion', judging_evaluate)
+        fake = SlowJudgeStartClient()
+
+        report = await runner_module.run_spec(
+            fake,
+            make_spec([make_case()]),
+            case_filter=None,
+            fail_fast=False,
+            judge_factory=fake_factory,
+            judge_timeout=0.05,
+        )
+
+        # The timeout fired while the judge pipeline was still being started
+        assert report.case_results[0].passed is False
+        assert '/abs/judge.pipe' in report.case_results[0].error
+        # Every pipeline the engine actually started was terminated - including
+        # the judge pipeline whose token the cancelled await never returned
+        assert fake.engine_started_tokens == ['task-1', 'task-2']
+        assert sorted(fake.terminated_tokens()) == ['task-1', 'task-2']
+
     async def test_default_judge_timeout_is_finite(self):
         """The default must be a bound, not None: an unbounded wait can hang the run."""
         assert isinstance(runner_module.DEFAULT_JUDGE_TIMEOUT_S, float)

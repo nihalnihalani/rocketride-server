@@ -43,7 +43,9 @@ Execution model:
       ``DEFAULT_JUDGE_TIMEOUT_S``): the judge blocks a worker thread that
       cannot be cancelled, so an unbounded wait would hang the run and skip
       teardown. On expiry the judge call is cancelled and the case is
-      recorded as errored.
+      recorded as errored. A judge start that was still in flight when that
+      cancellation landed is reconciled during teardown, so a pipeline the
+      engine created behind the cancelled call is still terminated.
 
 Components:
     run_spec: Run one EvalSpec against a connected client, returning an EvalReport
@@ -72,6 +74,15 @@ if TYPE_CHECKING:
 #: pipeline teardown. Five minutes is well above any realistic LLM-judge
 #: latency while still guaranteeing the run finishes.
 DEFAULT_JUDGE_TIMEOUT_S = 300.0
+
+#: Upper bound (seconds) on how long teardown waits for a judge ``use()`` that
+#: was still in flight when its awaiter was cancelled.
+#:
+#: The start is shielded so the token it returns can still be torn down, but
+#: teardown must not become the unbounded wait ``DEFAULT_JUDGE_TIMEOUT_S``
+#: exists to prevent: a start that has not landed by then is cancelled and its
+#: pipeline (if the engine created one at all) left to the engine's reaper.
+JUDGE_START_RECONCILE_TIMEOUT_S = 5.0
 
 
 def default_judge_pipeline_path() -> str:
@@ -156,6 +167,39 @@ async def _terminate_quietly(client: 'RocketRideClient', token: str) -> None:
         await client.terminate(token)
     except Exception:
         pass
+
+
+async def _orphaned_judge_tokens(pending_starts: set['asyncio.Task[Any]']) -> list[str]:
+    """
+    Collect the tokens of judge pipelines whose start outlived its awaiter.
+
+    A judge ``client.use()`` whose awaiting coroutine was cancelled (the judge
+    timeout firing) may still have created a pipeline on the engine. The start
+    runs as a shielded task, so it survives that cancellation and the token it
+    returns can be terminated like any other. The wait is bounded by
+    ``JUDGE_START_RECONCILE_TIMEOUT_S``: a start that has still not landed is
+    cancelled rather than allowed to hang teardown.
+
+    Args:
+        pending_starts: Judge ``use()`` tasks that never handed back a token
+
+    Returns:
+        list[str]: Task tokens of the judge pipelines the engine did start
+    """
+    if not pending_starts:
+        return []
+    done, still_pending = await asyncio.wait(pending_starts, timeout=JUDGE_START_RECONCILE_TIMEOUT_S)
+    for task in still_pending:
+        task.cancel()
+    tokens: list[str] = []
+    for task in done:
+        # A start that failed or was cancelled created no pipeline to sweep
+        if task.cancelled() or task.exception() is not None:
+            continue
+        orphan_token = task.result().get('token')
+        if orphan_token is not None:
+            tokens.append(orphan_token)
+    return tokens
 
 
 async def _run_case(
@@ -300,13 +344,26 @@ async def run_spec(
 
     # Judge pipelines are started lazily and cached per path for this run
     judge_tokens: dict[str, str] = {}
+    # Judge starts that never handed back a token because their awaiter was
+    # cancelled; reconciled by the teardown sweep below.
+    pending_judge_starts: set[asyncio.Task[Any]] = set()
     loop = asyncio.get_running_loop()
 
     async def _judge_chat(pipeline_path: str, prompt: str) -> str:
         """Run one judge prompt through a (cached) judge pipeline."""
         judge_token = judge_tokens.get(pipeline_path)
         if judge_token is None:
-            judge_started = await client.use(filepath=pipeline_path)
+            # The start runs as its own task, shielded from cancellation: the
+            # judge timeout can fire while this await is pending, and the
+            # engine may have created the pipeline anyway. Shielding keeps the
+            # task (and the token it returns) alive for the teardown sweep
+            # instead of losing it with this coroutine.
+            use_task = asyncio.ensure_future(client.use(filepath=pipeline_path))
+            pending_judge_starts.add(use_task)
+            judge_started = await asyncio.shield(use_task)
+            # Reached only when the token is in hand: on cancellation the task
+            # stays registered above and teardown reconciles it.
+            pending_judge_starts.discard(use_task)
             judge_token = judge_started['token']
             judge_tokens[pipeline_path] = judge_token
         judge_question = Question()
@@ -351,9 +408,12 @@ async def run_spec(
                 break
     finally:
         # Teardown is unconditional: the pipeline under test first, then any
-        # judge pipelines that were started on its behalf.
+        # judge pipelines that were started on its behalf - including one whose
+        # start was still in flight when the judge timeout cancelled the
+        # coroutine awaiting it.
         await _terminate_quietly(client, token)
-        for judge_token in judge_tokens.values():
+        orphan_tokens = await _orphaned_judge_tokens(pending_judge_starts)
+        for judge_token in (*judge_tokens.values(), *orphan_tokens):
             await _terminate_quietly(client, judge_token)
 
     duration_ms = (time.perf_counter() - run_started) * 1000.0
