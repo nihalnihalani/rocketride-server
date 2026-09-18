@@ -57,10 +57,11 @@ refresh_schema is what sees DDL run since the last reflection. refresh_schema
 takes no arguments and returns the re-reflected schema in the same {database,
 tables} shape get_schema returns, plus a refreshed_at UTC ISO-8601 timestamp
 recording when that reflection completed. Alongside replacing that
-database-wide cache it invalidates the configured table's cached column map
-rather than rebuilding it there: the map is reflected afresh on the next
-answers-lane insert, which is how that insert picks up added or dropped
-columns instead of continuing against the start-up shape. If the database
+database-wide cache it rebuilds the configured table's cached column map from
+the same walk, which is how the next answers-lane insert picks up added or
+dropped columns instead of continuing against the start-up shape; no second
+reflection is needed. A configured table the walk did not find leaves that map
+empty, and the next insert reflects the table itself if it has come back. If the database
 refuses the reflection — a revoked grant, a lock timeout, a table dropped
 mid-walk — the call fails with Schema refresh failed: followed by the
 database's own message (for a table that disappeared mid-walk, the name of

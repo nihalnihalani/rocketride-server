@@ -60,11 +60,12 @@ node currently holds — the reflection taken at start-up, replaced by each
 `refresh_schema` call — so DDL run since the last reflection is invisible to
 it until the next one. `refresh_schema` takes no arguments, re-reflects the
 database, replaces that database-wide cache, and returns the `get_schema`
-shape plus a `refreshed_at` UTC timestamp. It also invalidates the configured
-table's cached column map rather than rebuilding it there: the map is
-reflected afresh on the next `answers`-lane insert, which is how that insert
-picks up added or dropped columns instead of continuing against the start-up
-shape. If the database refuses the reflection — a revoked grant, a lock
+shape plus a `refreshed_at` UTC timestamp. It also rebuilds the configured
+table's cached column map from the same walk, which is how the next
+`answers`-lane insert picks up added or dropped columns instead of continuing
+against the start-up shape; no second reflection is needed. A configured table
+the walk did not find leaves that map empty, and the next insert reflects the
+table itself if it has come back. If the database refuses the reflection — a revoked grant, a lock
 timeout, a table dropped mid-walk — the call fails with `Schema refresh
 failed:` followed by the database's own message (for a table that disappeared
 mid-walk, the name of that table) and leaves both cached schemas exactly as

@@ -501,7 +501,7 @@ def test_a_global_that_never_ran_begin_global_names_the_missing_lock(instance):
         assert str(excinfo.value) == 'reflect_lock is created in beginGlobal; this global never ran it'
 
 
-def test_refresh_schema_invalidates_the_insert_lane_column_map(instance):
+def test_refresh_schema_rebuilds_the_insert_lane_column_map(instance):
     """The answers lane must be as current as the tool's own return value.
 
     ``refresh_schema`` replaces ``IGlobal.db_schema`` (what the LLM path
@@ -509,6 +509,11 @@ def test_refresh_schema_invalidates_the_insert_lane_column_map(instance):
     a separate start-up snapshot of the configured table. Leaving that behind
     made the node current on one path and stale on the other: a column added
     by the very DDL that prompted the refresh would still be dropped.
+
+    It used to be emptied, which re-armed the lazy rebuild and cost the next
+    insert a second reflection of a table the walk had just read
+    (dylan-savage, review 5215826786 nit 4). It is rebuilt from the walk's own
+    result instead, in the shape ``_getTableSchema`` publishes.
     """
     iglobal = instance.IGlobal
     iglobal.table = 'widgets'
@@ -521,8 +526,9 @@ def test_refresh_schema_invalidates_the_insert_lane_column_map(instance):
     instance.execute({'sql': 'ALTER TABLE widgets ADD COLUMN size INTEGER'})
     instance.refresh_schema({})
 
-    # Invalidated, so _insertData re-reflects on its next call.
-    assert iglobal.schema == {}
+    # Rebuilt, not emptied -- and in the shape _getTableSchema publishes.
+    assert iglobal.schema == {name: (col_type, '') for name, col_type in iglobal._getTableSchema('widgets')}
+    assert set(iglobal.schema) == {'label', 'size'}
 
     instance._insertData([{'label': 'a', 'size': 7}])
 
@@ -530,8 +536,36 @@ def test_refresh_schema_invalidates_the_insert_lane_column_map(instance):
     assert set(iglobal.schema) == {'label', 'size'}
 
 
+def test_an_insert_after_a_refresh_does_not_reflect_the_table_again(instance, monkeypatch):
+    """The point of rebuilding instead of emptying: no second round trip.
+
+    ``refresh_schema``'s walk has already read the configured table's columns.
+    Emptying ``IGlobal.schema`` made the next ``_insertData`` call
+    ``_getTableSchema`` to read them a second time.
+    """
+    iglobal = instance.IGlobal
+    iglobal.table = 'widgets'
+
+    instance.execute({'sql': 'CREATE TABLE widgets (id INTEGER PRIMARY KEY, label TEXT)'})
+    instance.refresh_schema({})
+
+    calls: list[str] = []
+    real_get_table_schema = type(iglobal)._getTableSchema
+
+    def _spy(self, table):
+        calls.append(table)
+        return real_get_table_schema(self, table)
+
+    monkeypatch.setattr(type(iglobal), '_getTableSchema', _spy)
+
+    instance._insertData([{'label': 'a'}])
+
+    assert calls == []
+    assert instance.execute({'sql': 'SELECT label FROM widgets'})['rows'] == [{'label': 'a'}]
+
+
 def test_insert_lane_drops_a_new_column_without_a_refresh(instance):
-    """Pins why the invalidation above is needed, not just that it happens."""
+    """Pins why the rebuild above is needed, not just that it happens."""
     iglobal = instance.IGlobal
     iglobal.table = 'widgets'
 
@@ -617,8 +651,9 @@ def _install_pausing_inspector(monkeypatch, *, entered, release, armed, fail_aft
 def test_a_concurrent_insert_waits_for_the_schema_rebuild(file_instance, monkeypatch):
     """A second insert must never build its row from a half-rebuilt column map.
 
-    ``refresh_schema`` empties ``IGlobal.schema``; the next ``_insertData``
-    refills it through ``_getTableSchema``, which used to publish the map and
+    An empty ``IGlobal.schema`` -- task start, or a ``refresh_schema`` whose
+    walk did not find the configured table -- makes the next ``_insertData``
+    refill it through ``_getTableSchema``, which used to publish the map and
     then grow it column by column. A second insert arriving inside that window
     found a truthy but incomplete map, skipped the rebuild, and silently
     dropped every column not yet added -- the row landed with NULLs in columns

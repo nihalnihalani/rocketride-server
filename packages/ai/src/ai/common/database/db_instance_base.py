@@ -605,8 +605,9 @@ class DatabaseInstanceBase(IInstanceBase, ABC):
         so refreshing it also stops ``get_data`` / ``get_sql`` writing queries
         against a table shape that no longer exists. ``IGlobal.schema`` -- the
         configured table's column map that the answers lane inserts against --
-        is invalidated at the same time so the node is current on both paths,
-        not just the one this tool returns.
+        is rebuilt from the same walk at the same time, so the node is current
+        on both paths, not just the one this tool returns, and the next insert
+        does not reflect the configured table a second time.
 
         Reflection and publication run under this node's ``reflect_lock`` so
         concurrent callers neither repeat the full table walk nor race on the
@@ -625,9 +626,10 @@ class DatabaseInstanceBase(IInstanceBase, ABC):
         ``Schema refresh failed: <name>``. Neither cache is touched in either
         case: the node keeps serving the schema it had and says the refresh
         failed, rather than publishing a half-walked database or, worse,
-        emptying ``IGlobal.schema`` (which would re-arm the insert lane's lazy
-        rebuild against a database that just refused to be reflected) while
-        ``db_schema`` still held the old value. Skipping the offending table and
+        rewriting ``IGlobal.schema`` from a half-walked result (or emptying it,
+        which re-arms the insert lane's lazy rebuild against a database that
+        just refused to be reflected) while ``db_schema`` still held the old
+        value. Skipping the offending table and
         continuing, the way ``_getTableSchema`` warns and returns None for a
         single table, was the other option; it is rejected here because the LLM
         path cannot tell a table that vanished from one that could not be read,
@@ -667,17 +669,25 @@ class DatabaseInstanceBase(IInstanceBase, ABC):
             # iterates it to build every answers-lane INSERT. Leaving it alone
             # would make "refreshed" true for the LLM path and false for the
             # insert path -- a column added by the DDL that prompted this call
-            # would still be skipped. Emptying it re-arms the lazy rebuild at
-            # the top of `_insertData`, which reflects the table through the
-            # same `_getTableSchema` call `beginGlobal` uses, so the next
-            # insert sees exactly what a freshly started node would.
+            # would still be skipped.
             #
-            # Emptying rather than re-reflecting here keeps this cheap for the
-            # (common) node with no answers lane wired. The rebind itself is
-            # atomic, but the rebuild it re-arms is not, so `_insertData` takes
-            # the same `reflect_lock` across its check, its rebuild and the
-            # snapshot it builds the batch from: that, not this assignment, is
-            # what stops a concurrent insert reading a half-built map.
+            # It is REBUILT here rather than emptied. The walk above has already
+            # read the configured table's columns, and emptying re-armed the
+            # lazy rebuild at the top of `_insertData`, which reflected the same
+            # table a second time on the next batch (dylan-savage, review
+            # 5215826786 nit 4). The value shape is exactly what
+            # `_getTableSchema` publishes and `_insertData` consumes --
+            # `{name: (type, comment)}` -- with the comment slot empty, because
+            # `_getDatabaseSchema` does not collect comments and `_insertData`
+            # only ever reads this map by key. A configured table the refresh
+            # did not find (dropped, renamed, or never set) still publishes an
+            # empty map, which is both what task start leaves behind and what
+            # re-arms the lazy rebuild for a table that comes back.
+            #
+            # The rebind is atomic and happens under the same `reflect_lock`
+            # `_insertData` takes across its check, its rebuild and the snapshot
+            # it builds the batch from, so a concurrent insert reads either the
+            # old map or this one, never a half-built one.
             #
             # The rebuilt map is a plain reflection, so it carries columns the
             # map `_createTableFromData` curates for an auto-created table
@@ -703,7 +713,10 @@ class DatabaseInstanceBase(IInstanceBase, ABC):
             # change, and honouring a supplied key on an auto-created table
             # before any refresh would mean curating the PK into that map --
             # a separate decision, not this one.
-            self.IGlobal.schema = {}
+            table_info = refreshed.get(self.IGlobal.table)
+            self.IGlobal.schema = (
+                {name: (col_type, '') for name, col_type in table_info['columns']} if table_info else {}
+            )
             refreshed_at = datetime.now(timezone.utc).isoformat()
 
         # Rendering is pure formatting over `refreshed`, so it runs after the
@@ -1122,10 +1135,11 @@ class DatabaseInstanceBase(IInstanceBase, ABC):
         # private snapshot to build this batch from.
         #
         # The check, the rebuild and the snapshot are one critical section.
-        # `refresh_schema` empties `IGlobal.schema` to re-arm this rebuild, so
-        # at runtime a second insert can arrive while the first is reflecting,
-        # and the state it would observe is wrong: a map still being built
-        # silently drops the columns not yet added.
+        # The map is empty at task start, after `beginGlobal` found no table,
+        # and after a `refresh_schema` whose walk did not find the configured
+        # table, so at runtime a second insert can arrive while the first is
+        # reflecting, and the state it would observe is wrong: a map still
+        # being built silently drops the columns not yet added.
         #
         # What the snapshot buys is one map for the whole batch. Both parts of
         # that matter and they are different: binding it to a local is what
@@ -1189,9 +1203,9 @@ class DatabaseInstanceBase(IInstanceBase, ABC):
         #
         # `_createTableFromData` curates `IGlobal.schema` down to the data
         # columns for exactly this reason, but any map built by reflection --
-        # `beginGlobal` for a table that already existed, or the lazy rebuild
-        # above once `refresh_schema` has invalidated the cache -- carries every
-        # column the table has. That difference is meant to reach the INSERT: a
+        # `beginGlobal` for a table that already existed, `refresh_schema`'s
+        # own rebuild, or the lazy rebuild above -- carries every column the
+        # table has. That difference is meant to reach the INSERT: a
         # column added by DDL is one the next insert should populate. What must
         # NOT reach it is a NULL bound into a column the database owns, so both
         # kinds are read off the reflected table and skipped -- omitted or
