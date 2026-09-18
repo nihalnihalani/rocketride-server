@@ -155,14 +155,27 @@ on both, and the read stays bounded rather than streaming the whole table.
 Your clause is otherwise untouched: its `OF` list, `NOWAIT` and `SKIP LOCKED`
 are sent exactly as you typed them. A statement that already ends in its own
 `OFFSET` keeps the appended form, because a `LIMIT` in front of the clause
-would leave the `OFFSET` stranded behind it.
+would leave the `OFFSET` stranded behind it. `FETCH FIRST … ROWS ONLY` is not
+recognised as a limit the statement carries — a gap older than this rule — so
+a locking clause trailed by that form still gets a `LIMIT` appended after it,
+which PostgreSQL rejects as a second limit clause.
 
-One exception, older than this rule: a `WITH` chain that ends in `FOR
-UPDATE` or `FOR NO KEY UPDATE` is read as a data-modifying chain — the
-`UPDATE` of the clause is taken for the chain's own verb — so it is treated
-as a write, gets no limit and reads `no limit applied`. The same chain
-ending in `FOR SHARE` or `FOR KEY SHARE` is bounded normally. That is a gap
-in how a `WITH` chain is classified, not in the limit rule.
+A locking clause that sits behind a `#` on the same line is left alone: the
+statement goes out exactly as typed and the line reads `no limit applied`.
+`#` starts a comment in MySQL only, so on any other connection — including one
+whose dialect could not be probed — the app cannot tell a commented-out `# for
+update` from a real clause, and moving the limit in front of it would lift the
+clause out of the comment. On a PostgreSQL connection this also costs the
+limit on a statement that uses `#` as an operator on that line; write the
+statement on two lines to have it bounded.
+
+One exception, older than this rule: a `WITH` chain that contains `FOR
+UPDATE` or `FOR NO KEY UPDATE` anywhere — in a CTE body as much as in the
+chain's own last clause — is read as a data-modifying chain, because the
+`UPDATE` of the clause is taken for the chain's verb. Such a chain is treated
+as a write, gets no limit and reads `no limit applied`. A chain whose only
+locking clause is `FOR SHARE` or `FOR KEY SHARE` is bounded normally. That is
+a gap in how a `WITH` chain is classified, not in the limit rule.
 
 When the returned count equals an applied limit, a badge reads `Limit
 reached — more rows may exist`, because a full page is not evidence the
@@ -406,7 +419,11 @@ statements ran either way; only the app's picture of the schema is behind.
   locking clause after `LIMIT`; PostgreSQL accepts either order; the app
   inserts its `LIMIT` before a trailing locking clause so the read stays
   bounded and valid on both. `SELECT … FOR UPDATE` is therefore sent as
-  `SELECT …` / `LIMIT 200` / `FOR UPDATE`.
+  `SELECT …` / `LIMIT 200` / `FOR UPDATE`. Three shapes keep no limit or the
+  old placement: a clause behind a `#` on the same line (sent untouched), one
+  trailed by `FETCH FIRST … ROWS ONLY` (still appended, which PostgreSQL
+  rejects) and a `WITH` chain containing `FOR UPDATE` or `FOR NO KEY UPDATE`
+  (classified as a write).
 - **Duplicate column names collapse.** A projection that returns two columns
   with the same name shows one: the node hands back each row as an object
   keyed by column name, and the grid takes its headers from the first row.
