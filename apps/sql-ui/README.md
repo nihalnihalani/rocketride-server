@@ -155,10 +155,28 @@ on both, and the read stays bounded rather than streaming the whole table.
 Your clause is otherwise untouched: its `OF` list, `NOWAIT` and `SKIP LOCKED`
 are sent exactly as you typed them. A statement that already ends in its own
 `OFFSET` keeps the appended form, because a `LIMIT` in front of the clause
-would leave the `OFFSET` stranded behind it. `FETCH FIRST … ROWS ONLY` is not
-recognised as a limit the statement carries — a gap older than this rule — so
-a locking clause trailed by that form still gets a `LIMIT` appended after it,
-which PostgreSQL rejects as a second limit clause.
+would leave the `OFFSET` stranded behind it. A statement bounded by
+`FETCH { FIRST | NEXT } … { ROW | ROWS } ONLY` is recognised the same way a
+`LIMIT` is: SQL Explorer treats it as the statement's own limit and sends it
+unchanged, locking clause and all — `SELECT … FETCH FIRST 10 ROWS ONLY FOR
+UPDATE` goes out exactly as typed, and the line reads `limit in statement`
+rather than `limit 200`.
+
+That in-statement treatment holds whichever header option is selected —
+**200**, **1000** and **All** all read `limit in statement` for a
+self-bounded statement — and it covers `FETCH … WITH TIES` too, even though
+`WITH TIES` can hand back more rows than the stated count: the line never
+claims that number is a hard maximum, only that the statement carries its
+own bound. As with `LIMIT`, only a `FETCH` on the outermost query counts —
+one inside a subquery or a CTE body bounds that inner result, not what SQL
+Explorer returns, so the outer query still gets the header's `LIMIT`
+appended. A bare `OFFSET` is never a limit on its own, FETCH terms or
+otherwise, so it doesn't change any of this. `FETCH` is also how PostgreSQL
+spells advancing a cursor — `FETCH NEXT FROM mycursor` — which isn't a
+`SELECT` and so never reaches this rewrite at all. MySQL has no `FETCH
+FIRST` clause (MariaDB 10.6+ does); a statement using it is invalid MySQL
+independent of anything SQL Explorer does, so it is left alone for the
+server to report.
 
 A locking clause that sits behind a `#` on the same line is left alone: the
 statement goes out exactly as typed and the line reads `no limit applied`.
@@ -419,11 +437,12 @@ statements ran either way; only the app's picture of the schema is behind.
   locking clause after `LIMIT`; PostgreSQL accepts either order; the app
   inserts its `LIMIT` before a trailing locking clause so the read stays
   bounded and valid on both. `SELECT … FOR UPDATE` is therefore sent as
-  `SELECT …` / `LIMIT 200` / `FOR UPDATE`. Three shapes keep no limit or the
-  old placement: a clause behind a `#` on the same line (sent untouched), one
-  trailed by `FETCH FIRST … ROWS ONLY` (still appended, which PostgreSQL
-  rejects) and a `WITH` chain containing `FOR UPDATE` or `FOR NO KEY UPDATE`
-  (classified as a write).
+  `SELECT …` / `LIMIT 200` / `FOR UPDATE`. Two shapes keep no limit at
+  all — a clause behind a `#` on the same line (sent untouched) and a
+  `WITH` chain containing `FOR UPDATE` or `FOR NO KEY UPDATE` (classified
+  as a write) — and a third keeps the old appended placement: a locking
+  clause trailed by the statement's own `OFFSET`, where the `LIMIT` is
+  appended after `OFFSET` rather than inserted before the clause.
 - **Duplicate column names collapse.** A projection that returns two columns
   with the same name shows one: the node hands back each row as an object
   keyed by column name, and the grid takes its headers from the first row.
