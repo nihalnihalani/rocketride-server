@@ -213,32 +213,36 @@ describe('applyRowLimit', () => {
 		});
 	});
 
-	it('sends a statement ending in a locking clause unchanged', () => {
-		// The locking clause is the LAST clause of a SELECT in both dialects,
-		// so an appended LIMIT lands after it and the statement stops parsing
-		// (PostgreSQL answers `syntax error at or near "LIMIT"`, MySQL 1064).
-		// The user never typed LIMIT and the editor never showed it, so the
-		// error named a clause that was nowhere on their screen. Bounding one
-		// of these would mean reordering the user's clauses, so the app sends
-		// it untouched and says no limit was applied.
-		for (const [statement, dialect] of [
-			['SELECT * FROM orders FOR UPDATE', 'postgres'],
-			['SELECT * FROM orders FOR NO KEY UPDATE', 'postgres'],
-			['SELECT * FROM orders FOR SHARE', 'postgres'],
-			['SELECT * FROM orders FOR KEY SHARE', 'postgres'],
-			['SELECT * FROM orders FOR UPDATE OF orders NOWAIT', 'postgres'],
-			['SELECT * FROM orders FOR UPDATE OF "my orders" NOWAIT', 'postgres'],
-			['SELECT * FROM orders FOR UPDATE SKIP LOCKED', 'postgres'],
-			['SELECT * FROM orders ORDER BY id FOR UPDATE', 'postgres'],
-			['SELECT * FROM orders FOR UPDATE', 'mysql'],
-			['SELECT * FROM orders FOR SHARE NOWAIT', 'mysql'],
-			['SELECT * FROM orders LOCK IN SHARE MODE', 'mysql'],
-			['SELECT * FROM orders FOR UPDATE', 'unknown'],
-			['SELECT * FROM orders LOCK IN SHARE MODE', 'unknown'],
+	it('inserts the limit before a trailing locking clause', () => {
+		// MySQL documents the order `[LIMIT ...] [FOR UPDATE | LOCK IN SHARE
+		// MODE]` and rejects a LIMIT that follows the clause; PostgreSQL
+		// accepts either order. Appending would therefore send MySQL a
+		// statement that does not parse, and skipping the limit would stream
+		// every row of a read the app used to bound. The limit is INSERTED
+		// before the clause instead: valid on both engines, and the user's own
+		// clauses keep the order they were typed in.
+		for (const [statement, dialect, expected] of [
+			['SELECT * FROM orders FOR UPDATE', 'postgres', 'SELECT * FROM orders\nLIMIT 200\nFOR UPDATE'],
+			['SELECT * FROM orders FOR NO KEY UPDATE', 'postgres', 'SELECT * FROM orders\nLIMIT 200\nFOR NO KEY UPDATE'],
+			['SELECT * FROM orders FOR SHARE', 'postgres', 'SELECT * FROM orders\nLIMIT 200\nFOR SHARE'],
+			['SELECT * FROM orders FOR KEY SHARE', 'postgres', 'SELECT * FROM orders\nLIMIT 200\nFOR KEY SHARE'],
+			['SELECT * FROM orders FOR UPDATE OF orders NOWAIT', 'postgres', 'SELECT * FROM orders\nLIMIT 200\nFOR UPDATE OF orders NOWAIT'],
+			['SELECT * FROM orders FOR UPDATE OF t1, t2 NOWAIT', 'postgres', 'SELECT * FROM orders\nLIMIT 200\nFOR UPDATE OF t1, t2 NOWAIT'],
+			['SELECT * FROM orders FOR UPDATE OF "my orders" NOWAIT', 'postgres', 'SELECT * FROM orders\nLIMIT 200\nFOR UPDATE OF "my orders" NOWAIT'],
+			['SELECT * FROM orders FOR UPDATE SKIP LOCKED', 'postgres', 'SELECT * FROM orders\nLIMIT 200\nFOR UPDATE SKIP LOCKED'],
+			['SELECT * FROM orders ORDER BY id FOR UPDATE', 'postgres', 'SELECT * FROM orders ORDER BY id\nLIMIT 200\nFOR UPDATE'],
+			['SELECT * FROM orders FOR UPDATE OF a FOR SHARE OF b', 'postgres', 'SELECT * FROM orders\nLIMIT 200\nFOR UPDATE OF a FOR SHARE OF b'],
+			['select * from orders for update', 'postgres', 'select * from orders\nLIMIT 200\nfor update'],
+			['SELECT * FROM orders FOR UPDATE', 'mysql', 'SELECT * FROM orders\nLIMIT 200\nFOR UPDATE'],
+			['SELECT * FROM orders FOR SHARE NOWAIT', 'mysql', 'SELECT * FROM orders\nLIMIT 200\nFOR SHARE NOWAIT'],
+			['SELECT * FROM orders LOCK IN SHARE MODE', 'mysql', 'SELECT * FROM orders\nLIMIT 200\nLOCK IN SHARE MODE'],
+			['SELECT * FROM orders lock in share mode', 'mysql', 'SELECT * FROM orders\nLIMIT 200\nlock in share mode'],
+			['SELECT * FROM orders FOR UPDATE', 'unknown', 'SELECT * FROM orders\nLIMIT 200\nFOR UPDATE'],
+			['SELECT * FROM orders LOCK IN SHARE MODE', 'unknown', 'SELECT * FROM orders\nLIMIT 200\nLOCK IN SHARE MODE'],
 		] as const) {
 			assert.deepEqual(
 				applyRowLimit(statement, '200', dialect),
-				{ sql: statement, limit: null, state: 'none' },
+				{ sql: expected, limit: 200, state: 'applied' },
 				`${statement} (${dialect})`,
 			);
 		}
@@ -246,32 +250,56 @@ describe('applyRowLimit', () => {
 
 	it('reads the locking clause through a trailing comment and a trailing semicolon', () => {
 		// The clause is still the statement's last clause when a comment or a
-		// `;` follows it, and the statement is returned exactly as typed.
+		// `;` follows it, and the inserted LIMIT goes in front of the clause
+		// rather than inside the comment or after the terminator.
 		assert.deepEqual(applyRowLimit('SELECT * FROM orders FOR UPDATE -- nightly', '200', 'postgres'), {
-			sql: 'SELECT * FROM orders FOR UPDATE -- nightly',
-			limit: null,
-			state: 'none',
+			sql: 'SELECT * FROM orders\nLIMIT 200\nFOR UPDATE -- nightly',
+			limit: 200,
+			state: 'applied',
 		});
-		assert.equal(applyRowLimit('SELECT * FROM orders FOR UPDATE;', '200', 'postgres').state, 'none');
-		assert.equal(applyRowLimit('SELECT * FROM orders /* nightly */ FOR UPDATE /* now */', '200', 'postgres').state, 'none');
+		assert.equal(applyRowLimit('SELECT * FROM orders FOR UPDATE;', '200', 'postgres').sql, 'SELECT * FROM orders\nLIMIT 200\nFOR UPDATE;');
+		assert.equal(
+			applyRowLimit('SELECT * FROM orders /* nightly */ FOR UPDATE /* now */', '200', 'postgres').sql,
+			'SELECT * FROM orders /* nightly */\nLIMIT 200\nFOR UPDATE /* now */',
+		);
 	});
 
-	it('still bounds a statement that only MENTIONS a locking clause', () => {
-		// `lock` is NON-RESERVED in PostgreSQL, so `SELECT * FROM lock` is a
-		// valid unbounded read: matching a bare `lock` keyword would silently
-		// turn it from limited into unlimited. A clause inside a literal, a
-		// comment or a subquery is not the statement's trailing clause either,
-		// and a statement whose own LIMIT precedes the clause keeps reporting
-		// the bound it carries.
-		assert.equal(applyRowLimit('SELECT * FROM lock', '200', 'postgres').state, 'applied');
-		assert.equal(applyRowLimit("SELECT 'for update' FROM t", '200', 'postgres').state, 'applied');
-		assert.equal(applyRowLimit('SELECT * FROM t -- for update', '200', 'postgres').state, 'applied');
-		assert.equal(applyRowLimit('SELECT * FROM (SELECT 1 FROM t FOR UPDATE) x', '200', 'postgres').state, 'applied');
+	it('still appends at the END for a statement that only MENTIONS a locking clause', () => {
+		// `lock` is NON-RESERVED in PostgreSQL, so `SELECT * FROM lock` is an
+		// ordinary read of a table called `lock`: matching a bare `lock`
+		// keyword would move its limit in front of the table name. A clause
+		// inside a literal, a comment or a subquery is not the statement's
+		// trailing clause either, and a statement whose own LIMIT precedes the
+		// clause keeps reporting the bound it carries.
+		assert.deepEqual(applyRowLimit('SELECT * FROM lock', '200', 'postgres'), {
+			sql: 'SELECT * FROM lock\nLIMIT 200',
+			limit: 200,
+			state: 'applied',
+		});
+		assert.equal(applyRowLimit("SELECT 'for update' FROM t", '200', 'postgres').sql, "SELECT 'for update' FROM t\nLIMIT 200");
+		assert.equal(applyRowLimit('SELECT * FROM t -- for update', '200', 'postgres').sql, 'SELECT * FROM t -- for update\nLIMIT 200');
+		assert.equal(applyRowLimit('SELECT * FROM (SELECT 1 FROM t FOR UPDATE) x', '200', 'postgres').sql, 'SELECT * FROM (SELECT 1 FROM t FOR UPDATE) x\nLIMIT 200');
 		assert.equal(applyRowLimit('SELECT * FROM orders LIMIT 5 FOR UPDATE', '200', 'postgres').state, 'in-statement');
 		// MariaDB's `FOR SYSTEM_TIME` is a system-versioning clause, not a lock,
 		// and it is followed by more of the statement: a guard that matched a
-		// bare `for` would stop bounding every versioned read.
-		assert.equal(applyRowLimit('SELECT * FROM t FOR SYSTEM_TIME AS OF NOW() WHERE id = 1', '200', 'mysql').state, 'applied');
+		// bare `for` would cut the statement in half.
+		assert.equal(
+			applyRowLimit('SELECT * FROM t FOR SYSTEM_TIME AS OF NOW() WHERE id = 1', '200', 'mysql').sql,
+			'SELECT * FROM t FOR SYSTEM_TIME AS OF NOW() WHERE id = 1\nLIMIT 200',
+		);
+	});
+
+	it('appends at the END when a limit clause already follows the locking clause', () => {
+		// PostgreSQL also accepts `... FOR UPDATE OFFSET 5`, where the
+		// statement's own limit clause is the last thing in it. Inserting
+		// before the locking clause would produce `LIMIT 200 FOR UPDATE OFFSET
+		// 5`, which does not parse, so such a statement keeps the appended
+		// form it had before the guard existed.
+		assert.deepEqual(applyRowLimit('SELECT * FROM orders FOR UPDATE OFFSET 5', '200', 'postgres'), {
+			sql: 'SELECT * FROM orders FOR UPDATE OFFSET 5\nLIMIT 200',
+			limit: 200,
+			state: 'applied',
+		});
 	});
 
 	it('does not read a LIMIT inside a literal or a quoted identifier', () => {

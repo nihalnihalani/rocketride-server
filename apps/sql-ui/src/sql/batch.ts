@@ -292,26 +292,44 @@ const LOCKING_CLAUSE_HEAD = /^(?:for\s+(?:no\s+key\s+update|key\s+share|update|s
 const LOCKING_CLAUSE_TAIL = /^[\w$.,;\s]*$/;
 
 /**
- * Whether the statement's LAST clause is a locking clause.
+ * A limit clause of the user's own in that tail. PostgreSQL also accepts
+ * `... FOR UPDATE OFFSET 5`, where the statement ENDS in its own limit clause
+ * rather than in the lock; inserting a `LIMIT` before the locking clause there
+ * would produce `LIMIT 200 FOR UPDATE OFFSET 5`, which does not parse. Such a
+ * statement keeps the plain append at the end, which is where that grammar
+ * accepts it — and which is what the app did before the clause was recognised
+ * at all.
+ */
+const LOCKING_CLAUSE_LIMIT_TAIL = /\b(?:offset|fetch)\b/i;
+
+/**
+ * Where the statement's trailing locking clause begins, or -1 when it has none.
  *
  * Read on MASKED text, so a `for update` inside a string literal, a comment or
  * a quoted identifier is not one, and at parenthesis depth 0 only, so a
  * locking clause inside a subquery is not the outer statement's last clause.
- * {@link codeOnly} preserves offsets, so a site's index points at the same
- * character in the masked text as in the statement itself.
+ * {@link codeOnly} preserves offsets, so the returned index points at the same
+ * character in the statement itself. Sites come back in statement order, so
+ * two stacked clauses (`FOR UPDATE OF a FOR SHARE OF b`) report the first —
+ * the point the whole locking block starts at.
  *
  * @param sql - The statement.
  * @param dialect - The engine dialect.
- * @returns True when a locking clause closes the statement.
+ * @returns The index the clause starts at, or -1 when none closes the
+ *          statement.
  */
-function endsWithLockingClause(sql: string, dialect: SqlDialect): boolean {
+function trailingLockingClauseAt(sql: string, dialect: SqlDialect): number {
 	const masked = codeOnly(sql, dialect);
-	return keywordSites(sql, ['for', 'lock'], dialect).some((site) => {
-		if (site.depth !== 0) return false;
+	for (const site of keywordSites(sql, ['for', 'lock'], dialect)) {
+		if (site.depth !== 0) continue;
 		const rest = masked.slice(site.index);
 		const head = LOCKING_CLAUSE_HEAD.exec(rest);
-		return head !== null && LOCKING_CLAUSE_TAIL.test(rest.slice(head[0].length));
-	});
+		if (head === null) continue;
+		const tail = rest.slice(head[0].length);
+		if (!LOCKING_CLAUSE_TAIL.test(tail) || LOCKING_CLAUSE_LIMIT_TAIL.test(tail)) continue;
+		return site.index;
+	}
+	return -1;
 }
 
 /**
@@ -358,13 +376,17 @@ export function applyRowLimit(sql: string, limit: string, dialect: SqlDialect = 
 	if (limit === 'All' || !returnsRows) return { sql, limit: null, state: 'none' };
 	const value = Number(limit);
 	if (!Number.isFinite(value) || value <= 0) return { sql, limit: null, state: 'none' };
-	// A locking clause is the LAST clause of a SELECT in both PostgreSQL and
-	// MySQL, so an appended LIMIT lands after it and the statement no longer
-	// parses — and the user never typed the clause that the error names.
-	// Bounding one would mean reordering the user's SQL, so this does what the
-	// data-modifying WITH chain above does: send the statement untouched and
-	// report that no limit was applied.
-	if (endsWithLockingClause(sql, dialect)) return { sql, limit: null, state: 'none' };
+	// A statement that ENDS in a locking clause takes the limit INSERTED before
+	// that clause rather than appended after it. MySQL documents the order
+	// `[LIMIT ...] [FOR UPDATE | LOCK IN SHARE MODE]` and rejects a LIMIT that
+	// follows the lock, so appending would send it SQL that does not parse —
+	// naming a clause the user never typed. PostgreSQL accepts either order, so
+	// inserting is valid there too, and the read stays bounded on both engines
+	// instead of streaming every row under a meta line that says so.
+	const lockingAt = trailingLockingClauseAt(sql, dialect);
+	if (lockingAt >= 0) {
+		return { sql: `${sql.slice(0, lockingAt).trimEnd()}\nLIMIT ${value}\n${sql.slice(lockingAt)}`, limit: value, state: 'applied' };
+	}
 	// The clause is joined with a NEWLINE, not a space: the checks above run on
 	// comment-stripped text but the statement is sent RAW, so appending after a
 	// trailing `-- ...` comment would put LIMIT inside that comment and send an
