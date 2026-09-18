@@ -363,6 +363,56 @@ function hashCommentPrecedesClause(sql: string, lockingAt: number, dialect: SqlD
 }
 
 /**
+ * The head of the SQL standard's own spelling of a row limit: `FETCH FIRST n
+ * { ROW | ROWS } ONLY` or `FETCH NEXT n { ROW | ROWS } ONLY`, `ROW`/`ROWS`
+ * interchangeable, `WITH TIES` allowed in place of `ONLY`, and `n` itself
+ * optional (it defaults to 1). Only `first`/`next` need matching here — the
+ * rest of the clause does not change whether one is present — anchored the
+ * same way {@link LOCKING_CLAUSE_HEAD} is, against the text starting at a
+ * `fetch` site rather than the bare keyword, so this is a test of what
+ * FOLLOWS `fetch`, not of the keyword alone.
+ */
+const FETCH_LIMIT_HEAD = /^fetch\s+(?:first|next)(?![\w$])/i;
+
+/**
+ * Whether the statement carries its own `FETCH { FIRST | NEXT } ... ONLY`
+ * limit clause at the outermost level — the SQL-standard production that
+ * shares `LIMIT`'s grammar slot, so a statement bounded by one must never
+ * also receive the header's `LIMIT`: PostgreSQL's `select_limit` admits at
+ * most one limit clause, however it is spelled, and MySQL does not accept
+ * this spelling at all.
+ *
+ * Read the same way {@link trailingLockingClauseAt} reads a locking clause:
+ * {@link keywordSites} finds every `fetch` in CODE (masked, so a comment, a
+ * string literal or a quoted identifier cannot forge one) and reports each
+ * one's parenthesis depth; only depth 0 counts, so a `FETCH FIRST 1 ROW ONLY`
+ * inside a subquery, a CTE body or a parenthesised set-query member bounds
+ * that member, not the outer statement, and must not be read as the result's
+ * bound. {@link FETCH_LIMIT_HEAD} then runs on {@link codeOnly} text sliced at
+ * the site's index — offsets are preserved, so that slice reads the same
+ * characters the original statement has there — which is what keeps an
+ * ordinary identifier like `fetch_count` or `prefetch` from matching: the
+ * identifier-boundary check already lives inside {@link keywordSites}, so
+ * this function does not repeat it.
+ *
+ * This does NOT, on its own, tell a limit clause from a cursor's `FETCH NEXT
+ * FROM <cursor>` statement — that also matches `fetch\s+(?:first|next)`
+ * literally. It is the caller's `returnsRows` gate that keeps this function
+ * from ever being asked about one: a bare cursor `FETCH` statement does not
+ * start with `SELECT`, a `(`, or a read-only `WITH`, so {@link RETURNS_ROWS}
+ * (and the checks beside it) already excludes it before this runs.
+ *
+ * @param sql - The statement.
+ * @param dialect - The engine dialect.
+ * @returns True when a top-level `FETCH FIRST`/`FETCH NEXT ... ONLY` (or
+ *          `... WITH TIES`) clause is present.
+ */
+function hasFetchLimit(sql: string, dialect: SqlDialect): boolean {
+	const masked = codeOnly(sql, dialect);
+	return keywordSites(sql, ['fetch'], dialect).some((site) => site.depth === 0 && FETCH_LIMIT_HEAD.test(masked.slice(site.index)));
+}
+
+/**
  * How a result's row limit came about.
  *
  * - `applied` — the app added the header's limit: appended at the end, or
@@ -402,12 +452,31 @@ export function applyRowLimit(sql: string, limit: string, dialect: SqlDialect = 
 		|| stripped.startsWith('(')
 		|| (/^with\b/i.test(bare) && keywordSites(bare, CTE_WRITE_WORDS, dialect).length === 0);
 	// Checked BEFORE the header selection, so `All` on a statement that limits
-	// itself still reports the statement's limit instead of claiming none.
-	// Only a LIMIT that bounds the OUTERMOST query counts: one inside a
-	// subquery bounds that subquery, and reporting it as the result's bound
-	// would let an unbounded outer SELECT stream every row into the browser
-	// under a meta line that says otherwise.
-	if (returnsRows && hasTopLevelKeyword(sql, 'limit', dialect)) return { sql, limit: null, state: 'in-statement' };
+	// itself still reports the statement's limit instead of claiming none. Two
+	// spellings count: `LIMIT n` and the SQL standard's `FETCH { FIRST | NEXT }
+	// n { ROW | ROWS } { ONLY | WITH TIES }` — the same limit_clause production,
+	// and PostgreSQL rejects a statement that carries both. Either way, only a
+	// clause that bounds the OUTERMOST query counts: one inside a subquery, a
+	// CTE body or a parenthesised set member bounds that member, and reporting
+	// it as the result's bound would let an unbounded outer SELECT stream every
+	// row into the browser under a meta line that says otherwise (`hasFetchLimit`
+	// reads depth off `keywordSites` for exactly this reason). A statement
+	// bounded either way is always left untouched, never treated as an app cap:
+	// `WITH TIES` can return MORE rows than the number named, which the header's
+	// numeric limit could never express, so the honest report is `in-statement`
+	// ("limit in statement"), not a row count the app claims to have enforced.
+	// This is also why `FETCH ... ONLY` needs its own check rather than reusing
+	// `hasTopLevelKeyword` unchanged: `LIMIT` is the only keyword that spells a
+	// row limit on its own, but a bare `fetch` is not — it must be followed by
+	// `FIRST`/`NEXT` to be one, which is what `FETCH_LIMIT_HEAD` tests for.
+	// Neither this function nor `hasFetchLimit` needs to rule out a cursor's
+	// `FETCH NEXT FROM <cursor>`: that statement does not reach here at all,
+	// because it fails `returnsRows` above (it is not a SELECT, a parenthesised
+	// set expression, or a read-only WITH chain) — the same reason it never
+	// reached the old LIMIT-only check either.
+	if (returnsRows && (hasTopLevelKeyword(sql, 'limit', dialect) || hasFetchLimit(sql, dialect))) {
+		return { sql, limit: null, state: 'in-statement' };
+	}
 	if (limit === 'All' || !returnsRows) return { sql, limit: null, state: 'none' };
 	const value = Number(limit);
 	if (!Number.isFinite(value) || value <= 0) return { sql, limit: null, state: 'none' };

@@ -405,4 +405,369 @@ describe('applyRowLimit', () => {
 		assert.equal(applied.state, 'applied');
 		assert.equal(applied.limit, 200);
 	});
+
+	describe('applyRowLimit — the SQL-standard FETCH FIRST/NEXT limit clause', () => {
+
+		it('leaves a FETCH FIRST ... ROWS ONLY statement alone and reports the limit in statement', () => {
+			// asclearuc's first reported shape (2282-A1): FETCH FIRST n ROWS ONLY and
+			// LIMIT n are two productions of the same limit_clause, so the statement
+			// already carries its bound and the app must add none.
+			assert.deepEqual(applyRowLimit('SELECT * FROM orders ORDER BY id FETCH FIRST 10 ROWS ONLY', '200', 'postgres'), {
+					sql: 'SELECT * FROM orders ORDER BY id FETCH FIRST 10 ROWS ONLY',
+					limit: null,
+					state: 'in-statement',
+			});
+		});
+
+		it('accepts FETCH NEXT as the other spelling of FETCH FIRST', () => {
+			assert.deepEqual(applyRowLimit('SELECT * FROM orders FETCH NEXT 10 ROWS ONLY', '200', 'postgres'), {
+					sql: 'SELECT * FROM orders FETCH NEXT 10 ROWS ONLY',
+					limit: null,
+					state: 'in-statement',
+			});
+		});
+
+		it('accepts FETCH FIRST ROW ONLY with the count omitted', () => {
+			// The count defaults to 1 row; detection must not require a number.
+			assert.deepEqual(applyRowLimit('SELECT * FROM orders FETCH FIRST ROW ONLY', '200', 'postgres'), {
+					sql: 'SELECT * FROM orders FETCH FIRST ROW ONLY',
+					limit: null,
+					state: 'in-statement',
+			});
+		});
+
+		it('accepts the singular ROW after an explicit count', () => {
+			assert.deepEqual(applyRowLimit('SELECT * FROM orders FETCH FIRST 1 ROW ONLY', '200', 'postgres'), {
+					sql: 'SELECT * FROM orders FETCH FIRST 1 ROW ONLY',
+					limit: null,
+					state: 'in-statement',
+			});
+		});
+
+		it('treats FETCH FIRST 0 ROWS ONLY as a real bound of zero, not as no limit at all', () => {
+			assert.deepEqual(applyRowLimit('SELECT * FROM orders FETCH FIRST 0 ROWS ONLY', '200', 'postgres'), {
+					sql: 'SELECT * FROM orders FETCH FIRST 0 ROWS ONLY',
+					limit: null,
+					state: 'in-statement',
+			});
+		});
+
+		it('accepts a bind parameter as the fetch count', () => {
+			// select_fetch_first_value accepts a parameter; the bound is not a
+			// literal, so no number-shaped test may gate the detection.
+			assert.deepEqual(applyRowLimit('SELECT * FROM orders FETCH FIRST $1 ROWS ONLY', '200', 'postgres'), {
+					sql: 'SELECT * FROM orders FETCH FIRST $1 ROWS ONLY',
+					limit: null,
+					state: 'in-statement',
+			});
+		});
+
+		it('accepts a parenthesised expression as the fetch count', () => {
+			// The open paren sits AFTER the FETCH keyword, so the depth-0 site is
+			// still the FETCH itself.
+			assert.deepEqual(applyRowLimit('SELECT * FROM orders FETCH FIRST (2 + 3) ROWS ONLY', '200', 'postgres'), {
+					sql: 'SELECT * FROM orders FETCH FIRST (2 + 3) ROWS ONLY',
+					limit: null,
+					state: 'in-statement',
+			});
+		});
+
+		it('is case-insensitive', () => {
+			assert.deepEqual(applyRowLimit('select * from orders fetch first 10 rows only', '200', 'postgres'), {
+					sql: 'select * from orders fetch first 10 rows only',
+					limit: null,
+					state: 'in-statement',
+			});
+		});
+
+		it('accepts a comment between FETCH and FIRST', () => {
+			assert.deepEqual(applyRowLimit('SELECT * FROM orders FETCH /* count */ FIRST 10 ROWS ONLY', '200', 'postgres'), {
+					sql: 'SELECT * FROM orders FETCH /* count */ FIRST 10 ROWS ONLY',
+					limit: null,
+					state: 'in-statement',
+			});
+		});
+
+		it('returns the statement verbatim, trailing semicolon included', () => {
+			// The in-statement branch never strips `;` — only applied/appended do.
+			assert.deepEqual(applyRowLimit('SELECT * FROM orders ORDER BY id FETCH FIRST 10 ROWS ONLY;', '200', 'postgres'), {
+					sql: 'SELECT * FROM orders ORDER BY id FETCH FIRST 10 ROWS ONLY;',
+					limit: null,
+					state: 'in-statement',
+			});
+		});
+
+		it('returns the statement verbatim through a trailing line comment', () => {
+			assert.deepEqual(applyRowLimit('SELECT * FROM orders FETCH FIRST 10 ROWS ONLY -- nightly', '200', 'postgres'), {
+					sql: 'SELECT * FROM orders FETCH FIRST 10 ROWS ONLY -- nightly',
+					limit: null,
+					state: 'in-statement',
+			});
+		});
+
+		it("reports 'limit in statement' under All, not 'no limit applied'", () => {
+			// The in-statement check runs BEFORE the All short-circuit, exactly as
+			// it already does for a bare LIMIT under All.
+			assert.deepEqual(applyRowLimit('SELECT * FROM orders FETCH FIRST 10 ROWS ONLY', 'All', 'postgres'), {
+					sql: 'SELECT * FROM orders FETCH FIRST 10 ROWS ONLY',
+					limit: null,
+					state: 'in-statement',
+			});
+		});
+
+		it('does not describe FETCH ... WITH TIES as a hard cap', () => {
+			// WITH TIES may return MORE than the fetch count, so this must read as
+			// in-statement (limit unknown), never as applied (a hard cap of 200).
+			assert.deepEqual(applyRowLimit('SELECT * FROM orders ORDER BY id FETCH FIRST 10 ROWS WITH TIES', '200', 'postgres'), {
+					sql: 'SELECT * FROM orders ORDER BY id FETCH FIRST 10 ROWS WITH TIES',
+					limit: null,
+					state: 'in-statement',
+			});
+		});
+
+	});
+
+	describe('applyRowLimit — FETCH combined with OFFSET', () => {
+
+		it('treats OFFSET ... FETCH NEXT ... ROWS ONLY as self-bounded', () => {
+			// OFFSET alone is not a row cap, but the FETCH beside it is.
+			assert.deepEqual(applyRowLimit('SELECT * FROM orders OFFSET 5 ROWS FETCH NEXT 10 ROWS ONLY', '200', 'postgres'), {
+					sql: 'SELECT * FROM orders OFFSET 5 ROWS FETCH NEXT 10 ROWS ONLY',
+					limit: null,
+					state: 'in-statement',
+			});
+		});
+
+		it('treats an OFFSET 0 ROWS + FETCH NEXT pairing as self-bounded', () => {
+			// The shape a paging UI generates on page one; the zero offset must
+			// not make the FETCH look absent.
+			assert.deepEqual(applyRowLimit('SELECT * FROM orders ORDER BY id OFFSET 0 ROWS FETCH NEXT 10 ROWS ONLY', '200', 'postgres'), {
+					sql: 'SELECT * FROM orders ORDER BY id OFFSET 0 ROWS FETCH NEXT 10 ROWS ONLY',
+					limit: null,
+					state: 'in-statement',
+			});
+		});
+
+		it('accepts FETCH FIRST ... ROWS ONLY followed by OFFSET', () => {
+			// PostgreSQL accepts either order of the two clauses.
+			assert.deepEqual(applyRowLimit('SELECT * FROM orders FETCH FIRST 10 ROWS ONLY OFFSET 5', '200', 'postgres'), {
+					sql: 'SELECT * FROM orders FETCH FIRST 10 ROWS ONLY OFFSET 5',
+					limit: null,
+					state: 'in-statement',
+			});
+		});
+
+	});
+
+	describe('applyRowLimit — FETCH FIRST combined with a locking clause', () => {
+
+		it('leaves a FETCH-bounded statement untouched even when a locking clause follows or precedes it', () => {
+			// asclearuc's second reported shape (2282-A2): with the in-statement
+			// guard fixed, none of these ever reaches trailingLockingClauseAt, so
+			// no limit clause is ever spliced next to the lock, on either side.
+			for (const [statement, dialect] of [
+				['SELECT * FROM orders FETCH FIRST 10 ROWS ONLY FOR UPDATE', 'postgres'],
+				['SELECT * FROM orders FETCH FIRST 10 ROWS ONLY FOR SHARE OF orders NOWAIT', 'postgres'],
+				['SELECT * FROM orders FETCH FIRST 10 ROWS ONLY FOR UPDATE SKIP LOCKED', 'postgres'],
+				['SELECT * FROM orders FETCH FIRST 10 ROWS ONLY FOR UPDATE OF a FOR SHARE OF b', 'postgres'],
+				['SELECT * FROM orders ORDER BY id OFFSET 5 ROWS FETCH NEXT 10 ROWS ONLY FOR UPDATE', 'postgres'],
+				['SELECT * FROM orders FOR UPDATE FETCH FIRST 10 ROWS ONLY', 'postgres'],
+			] as const) {
+				assert.deepEqual(applyRowLimit(statement, '200', dialect), { sql: statement, limit: null, state: 'in-statement' }, `${statement} (${dialect})`);
+			}
+		});
+
+	});
+
+	describe("applyRowLimit — statements that only mention 'fetch', not a limit clause", () => {
+
+		it('does not mistake the word fetch for a limit clause when it is masked out', () => {
+			// A comment, a string/dollar-quoted literal, a quoted or backtick-quoted
+			// identifier named fetch, an identifier merely containing fetch, and a
+			// MySQL # comment (masked for that dialect) must not be read as a FETCH
+			// limit clause — the unbounded read still takes the appended limit.
+			for (const [statement, dialect] of [
+				['SELECT * FROM orders -- fetch first 10 rows only', 'postgres'],
+				['SELECT * FROM orders /* fetch first 10 rows only */', 'postgres'],
+				['SELECT \'fetch first 10 rows only\' AS note FROM orders', 'postgres'],
+				['SELECT $$fetch first 10 rows only$$ AS note', 'postgres'],
+				['SELECT * FROM "fetch"', 'postgres'],
+				['SELECT fetch_count FROM t', 'postgres'],
+				['SELECT prefetch FROM t', 'postgres'],
+				['SELECT * FROM `fetch`', 'mysql'],
+				['SELECT * FROM t # fetch first 10 rows only', 'mysql'],
+			] as const) {
+				assert.deepEqual(
+					applyRowLimit(statement, '200', dialect),
+					{ sql: `${statement}\nLIMIT 200`, limit: 200, state: 'applied' },
+					`${statement} (${dialect})`,
+				);
+			}
+		});
+
+		it('matches the existing # parity ruling for LIMIT: unmasked on unknown, so fetch reads as a real clause there', () => {
+			// applyRowLimit('SELECT * FROM t # limit 5', '200', 'unknown') already
+			// returns in-statement today; the FETCH spelling must agree with it
+			// instead of inventing a third behaviour. Nothing is rewritten and no
+			// invalid SQL is sent — only the meta line is optimistic, as it already
+			// is for LIMIT.
+			assert.deepEqual(applyRowLimit('SELECT * FROM t # fetch first 10 rows only', '200', 'unknown'), {
+					sql: 'SELECT * FROM t # fetch first 10 rows only',
+					limit: null,
+					state: 'in-statement',
+			});
+		});
+
+	});
+
+	describe('applyRowLimit — FETCH at a nested query depth', () => {
+
+		it('does not mistake a subquery FETCH for the result bound', () => {
+			// The FETCH bounds the subquery (depth 1), not the outer join; parity
+			// with the existing subquery-LIMIT case.
+			assert.deepEqual(applyRowLimit('SELECT * FROM (SELECT id FROM big FETCH FIRST 10 ROWS ONLY) x JOIN other o ON o.id = x.id', '200', 'postgres'), {
+					sql: 'SELECT * FROM (SELECT id FROM big FETCH FIRST 10 ROWS ONLY) x JOIN other o ON o.id = x.id\nLIMIT 200',
+					limit: 200,
+					state: 'applied',
+			});
+		});
+
+		it('does not mistake a FETCH inside a WITH body for the result bound', () => {
+			assert.deepEqual(applyRowLimit('WITH r AS (SELECT id FROM big FETCH FIRST 10 ROWS ONLY) SELECT * FROM r', '200', 'postgres'), {
+					sql: 'WITH r AS (SELECT id FROM big FETCH FIRST 10 ROWS ONLY) SELECT * FROM r\nLIMIT 200',
+					limit: 200,
+					state: 'applied',
+			});
+		});
+
+		it('does not mistake a FETCH inside a parenthesised set-query member for the result bound', () => {
+			assert.deepEqual(applyRowLimit('(SELECT 1 FETCH FIRST 1 ROW ONLY) UNION (SELECT 2)', '200', 'postgres'), {
+					sql: '(SELECT 1 FETCH FIRST 1 ROW ONLY) UNION (SELECT 2)\nLIMIT 200',
+					limit: 200,
+					state: 'applied',
+			});
+		});
+
+		it('reads a FETCH on the outer query of a read-only WITH chain as the result bound', () => {
+			assert.deepEqual(applyRowLimit('WITH r AS (SELECT 1) SELECT * FROM r FETCH FIRST 10 ROWS ONLY', '200', 'postgres'), {
+					sql: 'WITH r AS (SELECT 1) SELECT * FROM r FETCH FIRST 10 ROWS ONLY',
+					limit: null,
+					state: 'in-statement',
+			});
+		});
+
+	});
+
+	describe('applyRowLimit — statements FETCH must not be mistaken for', () => {
+
+		it('leaves a cursor FETCH NEXT statement alone', () => {
+			// Not a SELECT, so returnsRows is false and the rewrite path is never
+			// entered — the detection must stay inside the returnsRows gate rather
+			// than being hoisted above it.
+			assert.deepEqual(applyRowLimit('FETCH NEXT FROM mycursor', '200', 'postgres'), {
+					sql: 'FETCH NEXT FROM mycursor',
+					limit: null,
+					state: 'none',
+			});
+		});
+
+		it('leaves a cursor FETCH ALL statement alone', () => {
+			assert.deepEqual(applyRowLimit('FETCH ALL FROM mycursor', '200', 'postgres'), {
+					sql: 'FETCH ALL FROM mycursor',
+					limit: null,
+					state: 'none',
+			});
+		});
+
+		it('leaves an INSERT ... SELECT ... FETCH FIRST statement alone', () => {
+			// Non-row-returning: RETURNS_ROWS matches ^select only.
+			assert.deepEqual(applyRowLimit('INSERT INTO archive SELECT * FROM orders FETCH FIRST 10 ROWS ONLY', '200', 'postgres'), {
+					sql: 'INSERT INTO archive SELECT * FROM orders FETCH FIRST 10 ROWS ONLY',
+					limit: null,
+					state: 'none',
+			});
+		});
+
+		it('leaves a user-typed EXPLAIN of a FETCH-bounded statement alone', () => {
+			assert.deepEqual(applyRowLimit('EXPLAIN SELECT * FROM orders FETCH FIRST 10 ROWS ONLY', '200', 'postgres'), {
+					sql: 'EXPLAIN SELECT * FROM orders FETCH FIRST 10 ROWS ONLY',
+					limit: null,
+					state: 'none',
+			});
+		});
+
+		it('reports the FETCH bound for the SQL fed to the EXPLAIN drawer, not just the Run path', () => {
+			// QueryView's explain drawer calls applyRowLimit and wraps the result's
+			// .sql in `EXPLAIN (FORMAT JSON) <body>`; a FETCH statement that is
+			// misread as unbounded would send the drawer an invalid plan request,
+			// not just an invalid Run.
+			assert.deepEqual(applyRowLimit('SELECT * FROM orders ORDER BY id FETCH FIRST 10 ROWS ONLY', '200', 'postgres'), {
+					sql: 'SELECT * FROM orders ORDER BY id FETCH FIRST 10 ROWS ONLY',
+					limit: null,
+					state: 'in-statement',
+			});
+		});
+
+	});
+
+	describe('applyRowLimit — protections that must survive adding FETCH detection', () => {
+
+		it('still reports a bare LIMIT statement as in-statement on every dialect', () => {
+			assert.deepEqual(applyRowLimit('SELECT * FROM orders LIMIT 5', '200', 'postgres'), {
+					sql: 'SELECT * FROM orders LIMIT 5',
+					limit: null,
+					state: 'in-statement',
+			});
+		});
+
+		it('still treats a nested-only LIMIT as unbounded at the result and applies the limit', () => {
+			assert.deepEqual(applyRowLimit('SELECT * FROM (SELECT id FROM big LIMIT 10) x JOIN other o ON o.id = x.id', '200', 'postgres'), {
+					sql: 'SELECT * FROM (SELECT id FROM big LIMIT 10) x JOIN other o ON o.id = x.id\nLIMIT 200',
+					limit: 200,
+					state: 'applied',
+			});
+		});
+
+		it('still joins the appended clause with a newline so it cannot land inside a trailing comment', () => {
+			assert.deepEqual(applyRowLimit('SELECT * FROM orders -- daily', '200', 'postgres'), {
+					sql: 'SELECT * FROM orders -- daily\nLIMIT 200',
+					limit: 200,
+					state: 'applied',
+			});
+		});
+
+		it('still leaves a data-modifying WITH chain at none, not in-statement, regardless of dialect', () => {
+			assert.deepEqual(applyRowLimit('WITH gone AS (DELETE FROM orders RETURNING *) SELECT * FROM gone', '200', 'postgres'), {
+					sql: 'WITH gone AS (DELETE FROM orders RETURNING *) SELECT * FROM gone',
+					limit: null,
+					state: 'none',
+			});
+		});
+
+		it('still treats a bare OFFSET, with no FETCH, as unbounded and applies the limit', () => {
+			// The FETCH detection must not be widened to `offset`: a skip is not a cap.
+			assert.deepEqual(applyRowLimit('SELECT * FROM orders ORDER BY id OFFSET 5 ROWS', '200', 'postgres'), {
+					sql: 'SELECT * FROM orders ORDER BY id OFFSET 5 ROWS\nLIMIT 200',
+					limit: 200,
+					state: 'applied',
+			});
+		});
+
+	});
+
+	describe('applyRowLimit — the FETCH detection is dialect-independent', () => {
+
+		it('reports the FETCH bound on mysql, unknown and clickhouse, not just postgres', () => {
+			// MySQL has no FETCH FIRST clause at all, and this text is already
+			// invalid MySQL — but the app must not ALSO add a clause the user
+			// never typed. `unknown` is where a failed dialect probe lands, and
+			// `clickhouse`'s documented synopsis includes FETCH like PostgreSQL's.
+			// A dialect-gated detection would leave both broken.
+			for (const dialect of ['mysql', 'unknown', 'clickhouse'] as const) {
+				const statement = 'SELECT * FROM orders FETCH FIRST 10 ROWS ONLY';
+				assert.deepEqual(applyRowLimit(statement, '200', dialect), { sql: statement, limit: null, state: 'in-statement' }, dialect);
+			}
+		});
+
+	});
 });
