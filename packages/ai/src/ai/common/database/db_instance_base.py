@@ -1041,7 +1041,8 @@ class DatabaseInstanceBase(IInstanceBase, ABC):
             )
             raise
 
-        # Columns the database fills in itself must not be bound. The loop below
+        # Columns the database fills in itself must not be bound, whether the
+        # row omits them or carries an explicit null for them. The loop below
         # binds NULL for any schema column the incoming rows do not provide, and
         # an explicit NULL is not "please supply the value" to any database --
         # it overrides a server default and violates NOT NULL. Postgres renders
@@ -1056,9 +1057,9 @@ class DatabaseInstanceBase(IInstanceBase, ABC):
         # column the table has. That difference is meant to reach the INSERT: a
         # column added by DDL is one the next insert should populate. What must
         # NOT reach it is a NULL bound into a column the database owns, so both
-        # kinds are read off the reflected table and skipped when the row omits
-        # them: generated primary keys, and anything carrying a server default
-        # or an identity.
+        # kinds are read off the reflected table and skipped -- omitted or
+        # explicitly null, it makes no difference: generated primary keys, and
+        # anything carrying a server default or an identity.
         #
         # The decision is per ROW. Taking it once for the batch, from the union
         # of the rows' keys, meant one row carrying `id` put `id` into every
@@ -1105,8 +1106,8 @@ class DatabaseInstanceBase(IInstanceBase, ABC):
                 original_key = item_lower_keys.get(lowered)
                 if original_key is not None:
                     supplied = item[original_key]
-                    if supplied is None and lowered in generated_pk_columns:
-                        # An explicit null on a key the database generates means
+                    if supplied is None and (lowered in generated_pk_columns or lowered in generated_defaults):
+                        # An explicit null on a column the DATABASE owns means
                         # the same thing as omitting it. The caller on this lane
                         # is an upstream node, not a person: an LLM node or a
                         # JSON mapper emits every schema key, writing null for
@@ -1115,9 +1116,15 @@ class DatabaseInstanceBase(IInstanceBase, ABC):
                         # `writeAnswers` only logs. (The `execute` tool is a
                         # different contract and is not affected: a person wrote
                         # that statement and their NULL is theirs.)
+                        #
+                        # The same column set as the omitted-column branch below,
+                        # deliberately: generated keys AND server defaults /
+                        # identities. Splitting the rule by nullability, or by
+                        # key-ness, would make one emitted row land differently
+                        # depending on a column attribute its sender cannot see.
                         continue
-                    # Supplied, including an explicit None on any other column:
-                    # the caller asked for NULL and gets NULL.
+                    # Supplied, including an explicit None on a column with
+                    # nothing behind it: the caller asked for NULL and gets NULL.
                     values[colname] = prepare_value(supplied)
                 elif lowered in generated_pk_columns or lowered in generated_defaults:
                     # The database owns this column's value when the row omits

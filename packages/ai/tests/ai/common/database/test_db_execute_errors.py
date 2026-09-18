@@ -973,12 +973,42 @@ def test_insert_leaves_an_explicit_null_generated_key_to_the_database(instance):
     assert rows == [{'id': 1, 'label': 'a'}]
 
 
-def test_insert_still_binds_an_explicit_null_on_a_non_key_column(instance):
-    """The rule is narrow: only a generated PRIMARY KEY reads null as "omitted".
+# ---------------------------------------------------------------------------
+# Columns the database fills in are left to the database, key or not
+# ---------------------------------------------------------------------------
 
-    Everywhere else an explicit null is a value the caller chose, and a column
-    that is simply absent from the row is bound NULL anyway, so there is
-    nothing to distinguish and nothing to second-guess.
+
+def test_insert_reads_an_explicit_null_on_a_not_null_default_as_omitted(instance):
+    """The case the narrow rule dropped: an explicit null on `NOT NULL DEFAULT`.
+
+    Same sender, same reason as the generated-key rule above -- an upstream
+    LLM or JSON-mapper node emits every schema key and writes null for the
+    ones it has no value for. Binding that NULL is a not-null violation, and
+    on the answers lane ``writeAnswers`` only logs, so the batch disappears
+    with one line. SQLite accepts the DEFAULT for an omitted column, which is
+    why the compiled column list, not just the stored row, is asserted.
+    """
+    iglobal = instance.IGlobal
+    iglobal.table = 'notes'
+
+    instance.execute({'sql': "CREATE TABLE notes (label TEXT, created_at TEXT NOT NULL DEFAULT 'now')"})
+    iglobal.schema = {name: (col_type, '') for name, col_type in iglobal._getTableSchema('notes')}
+
+    columns = _compiled_insert_columns(instance, [{'label': 'a', 'created_at': None}])
+    assert columns == ['label']
+    assert instance.execute({'sql': 'SELECT label, created_at FROM notes'})['rows'] == [
+        {'label': 'a', 'created_at': 'now'}
+    ]
+
+
+def test_insert_reads_an_explicit_null_on_a_nullable_default_as_omitted(instance):
+    """One policy for every database-owned column, NOT NULL or not.
+
+    A nullable column with a DEFAULT could in principle take the caller's
+    NULL, but splitting the rule by nullability would mean the same emitted
+    row lands differently depending on a column attribute the sender cannot
+    see. The rule the READMEs state is the simple one: on the answers lane, a
+    null on a column the database fills in means "you fill it in".
     """
     iglobal = instance.IGlobal
     iglobal.table = 'widgets'
@@ -987,13 +1017,49 @@ def test_insert_still_binds_an_explicit_null_on_a_non_key_column(instance):
     iglobal.schema = {name: (col_type, '') for name, col_type in iglobal._getTableSchema('widgets')}
 
     columns = _compiled_insert_columns(instance, [{'label': 'a', 'note': None}])
+    assert columns == ['label']
+    assert instance.execute({'sql': 'SELECT label, note FROM widgets'})['rows'] == [{'label': 'a', 'note': 'unset'}]
+
+
+def test_insert_still_binds_an_explicit_null_on_a_column_the_database_does_not_own(instance):
+    """The rule stays narrow: no default, no identity, no generated key -> NULL.
+
+    This is what keeps the change from meaning "explicit nulls are ignored".
+    A plain nullable column with nothing behind it takes the null the caller
+    chose, exactly as an omitted column does.
+    """
+    iglobal = instance.IGlobal
+    iglobal.table = 'widgets'
+
+    instance.execute({'sql': 'CREATE TABLE widgets (id INTEGER PRIMARY KEY, label TEXT, note TEXT)'})
+    iglobal.schema = {name: (col_type, '') for name, col_type in iglobal._getTableSchema('widgets')}
+
+    columns = _compiled_insert_columns(instance, [{'label': 'a', 'note': None}])
     assert columns == ['label', 'note']
     assert instance.execute({'sql': 'SELECT label, note FROM widgets'})['rows'] == [{'label': 'a', 'note': None}]
 
 
-# ---------------------------------------------------------------------------
-# Columns the database fills in are left to the database, key or not
-# ---------------------------------------------------------------------------
+def test_insert_groups_an_explicit_null_and_an_omission_into_one_run(instance):
+    """The two spellings of "the database decides" now compile to one statement.
+
+    Runs are split on a CHANGE of key set, so before this rule a batch that
+    alternated `{'created_at': None}` and omitted rows produced a separate
+    executemany per row. It does not remove the splitting -- a row that
+    genuinely supplies the column still differs -- it removes the split that
+    was an artefact of how the sender spelled "no value".
+    """
+    iglobal = instance.IGlobal
+    iglobal.table = 'notes'
+
+    instance.execute({'sql': "CREATE TABLE notes (label TEXT, created_at TEXT NOT NULL DEFAULT 'now')"})
+    iglobal.schema = {name: (col_type, '') for name, col_type in iglobal._getTableSchema('notes')}
+
+    captured = _captured_inserts(
+        instance,
+        [{'label': 'a', 'created_at': None}, {'label': 'b'}, {'label': 'c', 'created_at': None}],
+    )
+    assert len(captured) == 1
+    assert _statement_columns(captured[0][0]) == ['label']
 
 
 def test_insert_leaves_a_new_not_null_default_column_to_the_database(instance):

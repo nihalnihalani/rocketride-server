@@ -93,9 +93,11 @@ inserts. Incoming keys are matched to columns case-insensitively, and a column
 the row does not carry is inserted as NULL unless the database fills it in
 itself: a generated primary key or a column with a DEFAULT is left out of the
 statement so PostgreSQL supplies the value rather than receiving an explicit
-NULL. A generated primary key supplied as null counts as not carried, since the
-sender on this lane is an upstream node that may emit every schema key; a null
-on any other column is inserted as NULL as given. A primary key PostgreSQL does
+NULL. A null supplied for any column the database fills in itself -- a
+generated primary key, a DEFAULT -- counts as not carried, since the sender on
+this lane is an upstream node that may emit every schema key with null for the
+ones it has no value for; a null on a column with nothing behind it is inserted
+as NULL as given. A primary key PostgreSQL does
 not generate that a row omits is rejected before anything runs.
 
 Database description is empty by default and is included as context when the

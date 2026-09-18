@@ -164,9 +164,11 @@ incoming keys are ignored. A schema column a row does not carry becomes `NULL`,
 unless the database fills it in itself: an `AUTO_INCREMENT` primary key or a
 column with a `DEFAULT` is left out of the statement so the server supplies
 the value rather than receiving an explicit `NULL`, which would override the
-default. A generated primary key supplied as `null` counts as not carried --
-on this lane the sender is an upstream node that may emit every schema key --
-while a `null` on any other column is inserted as `NULL` as given. Lists and
+default. A `null` supplied for any column the database fills in itself -- a
+generated primary key, a `DEFAULT` -- counts as not carried, because on this
+lane the sender is an upstream node that may emit every schema key with `null`
+for the ones it has no value for, while a `null` on a column with nothing
+behind it is inserted as `NULL` as given. Lists and
 dictionaries are serialized as JSON strings and booleans as `0` or `1`. For a
 new table, the node adds an auto-increment `id` primary key and infers integer,
 float, datetime, or text columns; short text becomes `VARCHAR(255)` and longer
