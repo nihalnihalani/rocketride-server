@@ -37,9 +37,13 @@ found exactly there and neither was reachable from a unit test.
 
 This module pins both from the outside, over the SDK, with the shipped example.
 
-SKIPPED BY DEFAULT. It runs only when ``ROCKETRIDE_URI`` names a reachable
-engine; the ``client`` fixture in ``nodes/test/conftest.py`` skips the session
-when that engine does not answer. To run it the way it was run for this change::
+WHERE IT RUNS. It needs ``ROCKETRIDE_URI`` to name a reachable engine, and the
+``client`` fixture in ``nodes/test/conftest.py`` skips the session when that
+engine does not answer. CI's ``nodes:test`` starts an engine with the same
+provider mocks and sets ``ROCKETRIDE_URI`` for the pytest session, so this
+module RUNS in CI; locally it skips unless you start one. That session is also
+parallel, hence the ``xdist_group`` mark below. To run it the way it was run
+for this change::
 
     cd <repo>/dist/server
     ROCKETRIDE_MOCK=<repo>/nodes/test/mocks ./engine --autoterm ai/eaas.py \\
@@ -81,9 +85,18 @@ _EXAMPLE_PIPE = _REPO_ROOT / 'examples' / 'cobalt-evaluation.pipe'
 _SCAN_SETTLE_SECONDS = 5.0
 _SCAN_TIMEOUT_SECONDS = float(os.getenv('ROCKETRIDE_COBALT_LIVE_TIMEOUT', '180'))
 
+# ONE WORKER FOR THE WHOLE MODULE. ``nodes:test`` sets ROCKETRIDE_URI itself
+# (nodes/scripts/tasks.js), so this module is NOT skipped in CI, and that
+# session runs pytest with ``-n <cpus> --dist loadgroup``. Every test here
+# starts the same pipe, and the engine keys a running task on
+# user+project_id+source, so a second worker's ``client.use()`` is refused with
+# "Pipeline is already running." ``xdist_group`` puts all of them on one
+# worker, the way ``nodes/test/conftest.py`` already groups the heavy dynamic
+# node tests.
 pytestmark = [
     pytest.mark.cobalt,
     pytest.mark.requires_server,
+    pytest.mark.xdist_group('cobalt_live'),
     pytest.mark.skipif(
         not os.getenv('ROCKETRIDE_URI'),
         reason='live engine run: set ROCKETRIDE_URI to the engine to exercise the real pipeline',
