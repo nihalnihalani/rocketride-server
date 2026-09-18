@@ -41,6 +41,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List
 
 import json
+import threading
 
 from rocketlib import IInstanceBase, debug, error, warning, tool_function
 from sqlalchemy import MetaData, Table as SQLTable, insert, text
@@ -162,6 +163,29 @@ class DatabaseInstanceBase(IInstanceBase, ABC):
         Surfaced to SDK callers via the ``dialect`` tool function so applications
         can branch on the underlying engine (dialect-specific SQL, type coercion, etc.).
         """
+
+    # ------------------------------------------------------------------
+    # Reflection lock
+    # ------------------------------------------------------------------
+
+    def _reflectLock(self) -> threading.Lock:
+        """Return this node's reflection lock, or name the step that never ran.
+
+        ``DatabaseGlobalBase.reflect_lock`` is ``None`` on the class and a real
+        lock is created in ``beginGlobal``, so a global built without that
+        lifecycle call -- a fixture using ``__new__``, or a subclass that
+        overrides ``beginGlobal`` and forgets to chain up -- cannot silently
+        share one lock across every node in the process. ``with None:`` already
+        fails, but with "'NoneType' object does not support the context manager
+        protocol", which names neither the attribute nor the call that creates
+        it; on the answers lane ``writeAnswers`` reduces any exception to a
+        single log line, which is precisely the quiet failure this PR is
+        removing elsewhere.
+        """
+        lock = self.IGlobal.reflect_lock
+        if lock is None:
+            raise RuntimeError('reflect_lock is created in beginGlobal; this global never ran it')
+        return lock
 
     # ------------------------------------------------------------------
     # Tool methods — dispatched by IInstanceBase.invoke() via @tool_function
@@ -569,7 +593,7 @@ class DatabaseInstanceBase(IInstanceBase, ABC):
         table that vanished from one that could not be read, and would write
         queries as if it were gone.
         """
-        with self.IGlobal.reflect_lock:
+        with self._reflectLock():
             try:
                 refreshed = self.IGlobal._getDatabaseSchema()
             except NoSuchTableError as e:
@@ -1099,7 +1123,7 @@ class DatabaseInstanceBase(IInstanceBase, ABC):
         #
         # The lock is released before the Table reflection and before the
         # INSERT. Neither reads `IGlobal.schema` and both are slow.
-        with self.IGlobal.reflect_lock:
+        with self._reflectLock():
             if not self.IGlobal.schema:
                 # `_getTableSchema` publishes the map it builds, in one
                 # assignment once the walk is complete, and returns the same

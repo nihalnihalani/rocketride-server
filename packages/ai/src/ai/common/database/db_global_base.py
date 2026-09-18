@@ -200,7 +200,9 @@ class DatabaseGlobalBase(IGlobalBase, ABC):
     # statement timeout on the engine) stalled the answers lane of every DB
     # node in the engine process, which the pre-refresh_schema code never did.
     # `None` here rather than a real lock so that a global which never ran
-    # `beginGlobal` fails loudly instead of silently sharing class state.
+    # `beginGlobal` fails loudly instead of silently sharing class state:
+    # `DatabaseInstanceBase._reflectLock` turns that into a named RuntimeError
+    # before either caller enters its `with`.
     reflect_lock: Optional[threading.Lock] = None
 
     # ------------------------------------------------------------------

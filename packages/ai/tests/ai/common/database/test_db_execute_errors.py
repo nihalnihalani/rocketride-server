@@ -476,6 +476,31 @@ def test_refresh_schema_releases_the_lock_when_the_reflection_fails(instance, mo
     assert 'widgets' in instance.refresh_schema({})['tables']
 
 
+def test_a_global_that_never_ran_begin_global_names_the_missing_lock(instance):
+    """The ``reflect_lock = None`` default must fail with a sentence, not a TypeError.
+
+    The class attribute is ``None`` on purpose, so a global built without
+    ``beginGlobal`` cannot silently share one lock across every node in the
+    process. ``with None:`` on its own raises "'NoneType' object does not
+    support the context manager protocol", which names neither the attribute
+    nor the call that creates it — and on the answers lane ``writeAnswers``
+    reduces any exception to one log line, so that is all an operator would
+    ever see.
+    """
+    iglobal = instance.IGlobal
+    iglobal.table = 'widgets'
+    instance.execute({'sql': 'CREATE TABLE widgets (label TEXT, size INTEGER)'})
+    iglobal.reflect_lock = None
+
+    with pytest.raises(RuntimeError) as insert_error:
+        instance._insertData([{'label': 'a', 'size': 7}])
+    with pytest.raises(RuntimeError) as refresh_error:
+        instance.refresh_schema({})
+
+    for excinfo in (insert_error, refresh_error):
+        assert str(excinfo.value) == 'reflect_lock is created in beginGlobal; this global never ran it'
+
+
 def test_refresh_schema_invalidates_the_insert_lane_column_map(instance):
     """The answers lane must be as current as the tool's own return value.
 
