@@ -88,13 +88,15 @@ def _generated_primary_keys(table: SQLTable) -> set:
     is honoured; the node READMEs carry it. Letting the database refuse the row
     instead, and routing its error through ``_format_db_error``, is the other
     option: it costs the pre-flight guarantee that a refused batch leaves
-    nothing behind, so it is a maintainer call rather than a silent change. The set this returns also decides how an explicit null
-    reads: on one of these columns ``{'id': None}`` means "no value" and is
-    left to the database, because the insert lane's caller is an upstream node
-    emitting every schema key rather than a person choosing NULL. Anywhere else
-    a supplied null is bound as given. (``_insertData`` separately leaves out
-    any column -- key or not -- that carries a server default or an identity
-    and that the row omits.)
+    nothing behind, so it is a maintainer call rather than a silent change.
+
+    The set this returns, together with the server-default / identity columns
+    ``_insertData`` reads off the reflected table, also decides how an explicit
+    null reads: on any of those columns ``{'id': None}`` means "no value" and
+    is left to the database, because the insert lane's caller is an upstream
+    node emitting every schema key rather than a person choosing NULL. On a
+    column with nothing behind it a supplied null is bound as given. The same
+    set decides which columns a row may leave out entirely.
 
     The ``'auto'`` half of that rule is an approximation, and on SQLite it is
     measurably imperfect: ``id INT PRIMARY KEY``, ``id BIGINT PRIMARY KEY`` and
