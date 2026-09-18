@@ -90,7 +90,7 @@ rocketride diff --git <ref> <file.pipe> [--include-layout] [--json | --markdown]
 | Flag | Description |
 | --- | --- |
 | `<old.pipe> <new.pipe>` | The two files to compare (positional, old first). Pass exactly one file with `--git` instead. |
-| `--git <ref>` | Diff the working-tree `FILE` against `<ref>` via `git show <ref>:<FILE>`. `<ref>` is any revision git accepts — a commit SHA, branch, tag, `HEAD`, `HEAD~1`, `origin/main`. If the file does not exist in `<ref>`, everything is reported as added. |
+| `--git <ref>` | Diff the working-tree `FILE` against `<ref>` via `git show <ref>:<FILE>`. `<ref>` is any revision git accepts — a commit SHA, branch, tag, `HEAD`, `HEAD~1`, `origin/main`. If the file does not exist in `<ref>`, everything is reported as added, plus a version change from `null`. |
 | `--include-layout` | Enumerate the layout churn that is hidden by default — each node's `ui` block as `ui.*` changes on that node, and the top-level `viewport` as `viewport.*` changes — and count it, so a layout-only edit then exits `1`. |
 | `--json` | Emit a single JSON document to stdout (mutually exclusive with `--markdown`). |
 | `--markdown` | Emit compact, PR-comment-friendly Markdown to stdout (mutually exclusive with `--json`). |
@@ -228,6 +228,9 @@ jobs:
       - uses: rocketride-org/rocketride-server/.github/actions/pipe-diff@develop
 ```
 
+Pin `@develop` to a commit SHA once the action is released, exactly as
+`actions/checkout` is pinned above.
+
 The [CLI reference](/connect/cli#diff) covers the action's inputs, the fork
 pull-request caveat (a fork's `GITHUB_TOKEN` is read-only, so the action warns
 and falls back to the job summary), and the inline equivalent for teams that
@@ -257,7 +260,7 @@ if diff.has_semantic_changes:
 | `load_pipe(path_or_obj)` | Load and validate a pipeline from a filesystem path or an already-parsed `dict`. Raises `PipeDiffError` for an unreadable file, invalid UTF-8, invalid JSON, a non-object top level, a missing or non-list `components`, a component without a non-empty string `id`, a duplicate component `id`, or malformed `input[]` / `control[]` wiring. |
 | `diff_pipes(old, new, *, include_layout=False)` | Compare two loaded pipelines and return a `PipeDiff`. `include_layout` folds each node's `ui` differences into its field changes and enumerates the top-level `viewport` into `PipeDiff.viewport_changes`. |
 | `deep_diff_config(old, new)` | Deep-diff two config dicts into a list of `FieldChange` with dotted paths (`None` is treated as an empty dict). The building block `diff_pipes` uses per node. |
-| `resolve_git_ref(ref, file_path)` | Return the parsed pipeline at a git ref via `git show <ref>:<path>`, or `None` when the file does not exist in that ref. Raises `PipeDiffError` when the path is outside a repository, the ref is unknown, or `git` is unavailable or times out. Arguments are passed as an argv list (never a shell string). |
+| `resolve_git_ref(ref, file_path)` | Return the parsed pipeline at a git ref via `git show <ref>:<path>`, or `None` when the file does not exist in that ref. Raises `PipeDiffError` when the path is outside a repository, the ref is unknown, `git` is unavailable or times out, or the retrieved contents are not a valid pipeline. Arguments are passed as an argv list (never a shell string). |
 | `PipeDiffError` | The single exception type the package raises. The CLI maps it to exit code `2`. |
 
 ### Data model
