@@ -171,10 +171,13 @@ if _NODES_DIR in sys.path:
 def test_similarity_real_library_path():
     """Drive similarity evaluation through the real `cobalt.Evaluator`.
 
-    Verifies the configured CobaltEvaluator can call into the live library
-    and produces a well-formed result dict. The only assertion on the score
-    itself is that it is a valid probability: the actual value depends on
-    the installed library version.
+    The score itself is only asserted to be a valid probability, since the
+    value depends on the installed library version — but the reasoning is
+    asserted exactly, because that is the only thing that distinguishes the
+    real path from the fallback. Without it this test passed for months while
+    every evaluation actually fell back to Jaccard: cobalt's `evaluate` is a
+    coroutine taking an `EvalContext`, the node called it with `output=` /
+    `expected=` keywords, and the resulting TypeError was swallowed.
     """
     evaluator = CobaltEvaluator({'eval_type': 'similarity', 'threshold': 0.5}, {})
     result = evaluator.evaluate_semantic(
@@ -186,7 +189,32 @@ def test_similarity_real_library_path():
     assert result['evaluator'] == 'semantic'
     assert 0.0 <= result['score'] <= 1.0
     assert isinstance(result['passed'], bool)
-    assert 'reasoning' in result
+    # cobalt's similarity handler returns 'Similarity: <cosine> (threshold: <t>)'
+    # (cobalt/evaluators/similarity.py:54-57); every fallback reason starts with
+    # 'Fallback'.
+    assert 'Fallback' not in result['reasoning']
+    assert result['reasoning'].startswith('Similarity:')
+
+
+@_requires_cobalt
+def test_similarity_real_library_disagrees_with_the_fallback():
+    """The cobalt lane must not silently reproduce the Jaccard fallback.
+
+    TF-IDF cosine weights terms; Jaccard counts set overlap. On a partially
+    overlapping pair the two disagree, so an equal score here means the real
+    evaluator never ran. (A reordered sentence is no good as a probe: both
+    metrics score it 1.0, which is why the reasoning assertion above carries
+    the identical-wording case.)
+    """
+    evaluator = CobaltEvaluator({'eval_type': 'similarity', 'threshold': 0.5}, {})
+    output, expected = 'the quick brown fox', 'a fast brown fox jumps over it'
+
+    live = evaluator.evaluate_semantic(output, expected)
+    fallback = CobaltEvaluator._fallback_semantic(output, expected, 0.5)
+
+    assert live['reasoning'].startswith('Similarity:')
+    assert fallback['reasoning'].startswith('Fallback')
+    assert live['score'] != fallback['score']
 
 
 @_requires_cobalt
@@ -217,6 +245,9 @@ def test_llm_judge_real_library_path():
     assert result['evaluator'] == 'llm_judge'
     assert 0.0 <= result['score'] <= 1.0
     assert isinstance(result['passed'], bool)
+    # A ValueError from the registry or a TypeError from the call shape would
+    # otherwise read as a pass.
+    assert not result['reasoning'].startswith('Evaluation failed:')
 
 
 def test_custom_real_library_path():

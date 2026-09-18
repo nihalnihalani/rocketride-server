@@ -31,7 +31,7 @@ import importlib
 import importlib.util
 import pathlib
 import sys
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 _MISSING = object()
@@ -156,9 +156,14 @@ _ai_common.schema = _ai_common_schema
 _depends_mod = ModuleType('depends')
 _depends_mod.depends = MagicMock()
 
-# cobalt — intentionally NOT registered so that the top-level
-# `from cobalt import Evaluator` in cobalt_evaluator.py fails and
-# _cobalt_available stays False.  Tests that need cobalt patch it directly.
+# cobalt — intentionally NOT registered here. The premise of this module is
+# that the cobalt-backed branches are never taken unless a test asks for them.
+# Leaving the name unregistered is not enough on its own: basalt-ai-cobalt is a
+# real, installed package in the engine's interpreter (CI's check-externals
+# installs 0.2.3), so `from cobalt import Evaluator` succeeds and
+# _cobalt_available is True. The _no_real_cobalt fixture below forces it False
+# for every test; the ones that want the cobalt branch patch it True together
+# with a stub Evaluator.
 
 _rocketride_pkg = ModuleType('rocketride')
 _rocketride_pkg.Answer = MockAnswer
@@ -211,10 +216,60 @@ if _NODES_DIR in sys.path:
 import pytest
 
 
+class _StubEvalContext:
+    """Stand-in for ``cobalt.types.EvalContext`` (cobalt/types.py:20-24).
+
+    The node builds a real ``EvalContext``; these tests patch the symbol so the
+    call shape is asserted without depending on whether basalt-ai-cobalt happens
+    to be importable in the environment running the suite.
+    """
+
+    def __init__(self, item, output, metadata=None):
+        self.item = item
+        self.output = output
+        self.metadata = metadata or {}
+
+
+def _async_evaluate(result=None, raises=None):
+    """Build an ``evaluate`` stub that behaves like cobalt's coroutine method.
+
+    ``Evaluator.evaluate`` is ``async def`` (cobalt/evaluator.py:71), and the
+    node awaits it through ``_run_sync``/``asyncio.run``, which needs a real
+    coroutine. A plain ``MagicMock`` return value would not be awaitable, so
+    these tests would pass against a call shape the library rejects.
+    """
+
+    async def _evaluate(*args, **kwargs):
+        if raises is not None:
+            raise raises
+        return result
+
+    return MagicMock(side_effect=_evaluate)
+
+
 @pytest.fixture(autouse=True)
 def _runtime_mock_modules():
     """Install runtime-only mocks for lazy imports without leaking at collection."""
     with patch.dict(sys.modules, {'depends': _depends_mod}):
+        yield
+
+
+@pytest.fixture(autouse=True)
+def _no_real_cobalt():
+    """Hold ``_cobalt_available`` False, which is this module's stated premise.
+
+    basalt-ai-cobalt is installed in the engine's interpreter, so the module's
+    top-level import succeeds and the flag is True by default — the docstring's
+    "no real Cobalt AI calls" only held while the call shape was broken and
+    every attempt fell into the fallback. It matters beyond truthfulness:
+    cobalt's similarity handler imports scikit-learn, and importing numpy inside
+    the ``patch.dict(sys.modules, ...)`` above makes its teardown drop the
+    freshly imported modules, after which the engine's interpreter refuses the
+    next import with "cannot load module more than once per process".
+
+    Tests that want the cobalt branch patch this True with a stub Evaluator.
+    """
+    with patch('eval_cobalt.cobalt_evaluator._cobalt_available', False):
         yield
 
 
@@ -367,35 +422,53 @@ class TestSemanticEvaluation:
         assert result['passed'] is True
 
     def test_semantic_with_mocked_cobalt(self):
-        """Test that semantic evaluation uses Evaluator(type='similarity') and calls evaluate()."""
+        """The similarity call must match cobalt 0.2.3's API.
+
+        Three things are load-bearing and each of them silently routed every
+        evaluation into the Jaccard fallback when it was wrong: the constructor
+        needs ``field=`` (cobalt/evaluators/similarity.py:32 does an unguarded
+        ``config['field']``), ``evaluate`` takes one positional ``EvalContext``
+        rather than ``output=``/``expected=`` keywords, and it is a coroutine.
+        """
         mock_evaluator_instance = MagicMock()
-        mock_evaluator_instance.evaluate.return_value = {
-            'score': 0.92,
-            'reasoning': 'High semantic similarity',
-        }
+        mock_evaluator_instance.evaluate = _async_evaluate(
+            result=SimpleNamespace(score=0.92, reason='High semantic similarity')
+        )
 
         with (
             patch('eval_cobalt.cobalt_evaluator._cobalt_available', True),
+            patch('eval_cobalt.cobalt_evaluator.EvalContext', _StubEvalContext),
             patch('eval_cobalt.cobalt_evaluator.Evaluator', return_value=mock_evaluator_instance) as mock_cls,
         ):
             evaluator = CobaltEvaluator({'threshold': 0.5}, {})
             result = evaluator.evaluate_semantic('Paris is capital of France', 'The capital of France is Paris')
 
-        mock_cls.assert_called_once_with(name='semantic-similarity', type='similarity', threshold=0.5)
-        mock_evaluator_instance.evaluate.assert_called_once_with(
-            output='Paris is capital of France', expected='The capital of France is Paris'
-        )
+        mock_cls.assert_called_once_with(name='semantic-similarity', type='similarity', field='expected', threshold=0.5)
+        assert mock_evaluator_instance.evaluate.call_count == 1
+        args, kwargs = mock_evaluator_instance.evaluate.call_args
+        assert kwargs == {}
+        (context,) = args
+        assert context.item == {'expected': 'The capital of France is Paris'}
+        assert context.output == 'Paris is capital of France'
+        # EvalResult carries `reason`, not `reasoning` (cobalt/types.py:27-31).
+        assert result['reasoning'] == 'High semantic similarity'
         assert result['score'] == 0.92
         assert result['passed'] is True
         assert result['evaluator'] == 'semantic'
 
     def test_semantic_cobalt_exception_falls_back(self):
-        """Test that cobalt failure falls back to Jaccard similarity."""
+        """A failed cobalt call falls back, and says so as a failure.
+
+        The reasoning must not claim the package is absent: that wording sent
+        an acceptance run's readers hunting for a missing dependency that was
+        installed all along.
+        """
         mock_evaluator_instance = MagicMock()
-        mock_evaluator_instance.evaluate.side_effect = RuntimeError('Connection failed')
+        mock_evaluator_instance.evaluate = _async_evaluate(raises=RuntimeError('Connection failed'))
 
         with (
             patch('eval_cobalt.cobalt_evaluator._cobalt_available', True),
+            patch('eval_cobalt.cobalt_evaluator.EvalContext', _StubEvalContext),
             patch('eval_cobalt.cobalt_evaluator.Evaluator', return_value=mock_evaluator_instance),
         ):
             evaluator = CobaltEvaluator({'threshold': 0.3}, {})
@@ -403,7 +476,15 @@ class TestSemanticEvaluation:
 
         assert result['score'] == 1.0
         assert result['passed'] is True
-        assert 'Fallback' in result['reasoning']
+        assert result['reasoning'] == 'Fallback Jaccard similarity (cobalt call failed: RuntimeError)'
+
+    def test_semantic_fallback_when_cobalt_absent_says_not_installed(self):
+        """The other cause keeps its own wording, so the two stay distinguishable."""
+        with patch('eval_cobalt.cobalt_evaluator._cobalt_available', False):
+            evaluator = CobaltEvaluator({'threshold': 0.3}, {})
+            result = evaluator.evaluate_semantic('hello world test', 'hello world test')
+
+        assert result['reasoning'] == 'Fallback Jaccard similarity (cobalt-ai not installed)'
 
 
 class TestLLMJudgeEvaluation:
@@ -423,20 +504,43 @@ class TestLLMJudgeEvaluation:
         assert result['passed'] is False
 
     def test_llm_judge_with_mocked_cobalt(self):
-        """Test that the evaluator calls cobalt correctly when available."""
+        """The judge call must match cobalt 0.2.3's API.
+
+        The registry key is the hyphenated ``llm-judge``
+        (cobalt/evaluators/llm_judge.py:114) — ``llm_judge`` raises ValueError —
+        and the handler renders ``config['prompt']``; there is no ``criteria``
+        key. The API key is keyword-only on ``evaluate``, not a config field.
+        """
         mock_evaluator_instance = MagicMock()
-        mock_evaluator_instance.evaluate.return_value = {
-            'score': 0.85,
-            'reasoning': 'Output is accurate and well-structured',
-        }
+        mock_evaluator_instance.evaluate = _async_evaluate(
+            result=SimpleNamespace(score=0.85, reason='Output is accurate and well-structured')
+        )
 
         with (
             patch('eval_cobalt.cobalt_evaluator._cobalt_available', True),
-            patch('eval_cobalt.cobalt_evaluator.Evaluator', return_value=mock_evaluator_instance),
+            patch('eval_cobalt.cobalt_evaluator.EvalContext', _StubEvalContext),
+            patch('eval_cobalt.cobalt_evaluator.Evaluator', return_value=mock_evaluator_instance) as mock_cls,
         ):
-            evaluator = CobaltEvaluator({'eval_type': 'llm_judge', 'apikey': 'test-key', 'threshold': 0.7}, {})
+            evaluator = CobaltEvaluator(
+                {'eval_type': 'llm_judge', 'apikey': 'test-key', 'threshold': 0.7, 'criteria': 'Is it right?'}, {}
+            )
             result = evaluator.evaluate_llm_judge('The answer is 42', 'expected 42')
 
+        ctor_kwargs = mock_cls.call_args.kwargs
+        assert ctor_kwargs['type'] == 'llm-judge'
+        assert 'criteria' not in ctor_kwargs
+        assert 'api_key' not in ctor_kwargs
+        assert 'Is it right?' in ctor_kwargs['prompt']
+        assert '{{expected}}' in ctor_kwargs['prompt']
+        assert '{{output}}' in ctor_kwargs['prompt']
+
+        args, kwargs = mock_evaluator_instance.evaluate.call_args
+        (context,) = args
+        assert context.item == {'expected': 'expected 42'}
+        assert context.output == 'The answer is 42'
+        assert kwargs['api_key'] == 'test-key'
+
+        assert result['reasoning'] == 'Output is accurate and well-structured'
         assert result['score'] == 0.85
         assert result['passed'] is True
         assert result['evaluator'] == 'llm_judge'
@@ -444,10 +548,11 @@ class TestLLMJudgeEvaluation:
     def test_llm_judge_cobalt_exception(self):
         """Test graceful handling when cobalt raises an exception."""
         mock_evaluator_instance = MagicMock()
-        mock_evaluator_instance.evaluate.side_effect = RuntimeError('API timeout')
+        mock_evaluator_instance.evaluate = _async_evaluate(raises=RuntimeError('API timeout'))
 
         with (
             patch('eval_cobalt.cobalt_evaluator._cobalt_available', True),
+            patch('eval_cobalt.cobalt_evaluator.EvalContext', _StubEvalContext),
             patch('eval_cobalt.cobalt_evaluator.Evaluator', return_value=mock_evaluator_instance),
         ):
             evaluator = CobaltEvaluator({'eval_type': 'llm_judge', 'apikey': 'test-key', 'threshold': 0.5}, {})
@@ -465,12 +570,15 @@ class TestLLMJudgeEvaluation:
         """
         sentinel = 'sk-live-SENTINEL-DO-NOT-LOG'
         mock_evaluator_instance = MagicMock()
-        mock_evaluator_instance.evaluate.side_effect = RuntimeError(
-            f'401 Unauthorized for https://api.example.test/v1/chat (Authorization: Bearer {sentinel})'
+        mock_evaluator_instance.evaluate = _async_evaluate(
+            raises=RuntimeError(
+                f'401 Unauthorized for https://api.example.test/v1/chat (Authorization: Bearer {sentinel})'
+            )
         )
 
         with (
             patch('eval_cobalt.cobalt_evaluator._cobalt_available', True),
+            patch('eval_cobalt.cobalt_evaluator.EvalContext', _StubEvalContext),
             patch('eval_cobalt.cobalt_evaluator.Evaluator', return_value=mock_evaluator_instance),
             patch('eval_cobalt.cobalt_evaluator.debug') as mock_debug,
         ):

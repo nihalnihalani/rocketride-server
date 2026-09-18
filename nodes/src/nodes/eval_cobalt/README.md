@@ -92,6 +92,8 @@ The score answer carries a deep copy of the incoming answer's `metadata` (for ex
 
 The `cobalt` (basalt-ai-cobalt) package is **optional**. It is required for LLM-judge mode and preferred for similarity mode. When it is absent, similarity falls back to Jaccard word-overlap and the `relevance`, `grounding`, and `format` evaluators run unchanged (they are pure-Python and need no dependency).
 
+Similarity also falls back if the package is installed but the call into it fails. `cobalt_reasoning` says which: `Fallback Jaccard similarity (cobalt-ai not installed)` for an absent package, `Fallback Jaccard similarity (cobalt call failed: <ExceptionName>)` for a call that raised. The two were indistinguishable until the second wording was added, and an acceptance run spent its evidence chasing a dependency that was in fact installed.
+
 ---
 
 <!-- ROCKETRIDE:GENERATED:PARAMS START -->

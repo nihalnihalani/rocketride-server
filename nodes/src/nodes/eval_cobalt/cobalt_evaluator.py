@@ -27,8 +27,10 @@ Supports semantic similarity, LLM-as-judge, and custom function evaluators
 through the cobalt-ai testing framework.
 """
 
+import asyncio
+import concurrent.futures
 import math
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional, Tuple
 
 from rocketlib import debug
 
@@ -36,20 +38,67 @@ from rocketlib import debug
 _cobalt_available = False
 try:
     from cobalt import Evaluator
+    from cobalt.types import EvalContext
 
     _cobalt_available = True
 except ImportError:
     Evaluator = None  # type: ignore
+    EvalContext = None  # type: ignore
 
 
 _VALID_EVAL_TYPES = ('similarity', 'llm_judge', 'custom', 'relevance', 'grounding', 'format')
+
+# cobalt's evaluator registry keys (cobalt/evaluators/*.py call registry.register()).
+# The judge is registered as 'llm-judge' with a hyphen; this node's own eval_type
+# spelling is 'llm_judge', so the two must not be conflated.
+_COBALT_SIMILARITY_TYPE = 'similarity'
+_COBALT_LLM_JUDGE_TYPE = 'llm-judge'
+
+# The key under which the reference text is placed in EvalContext.item. cobalt's
+# similarity handler reads config['field'] out of context.item
+# (cobalt/evaluators/similarity.py:32,36), and its judge prompt template renders
+# **context.item, so the same key is what {{expected}} resolves to.
+_EXPECTED_FIELD = 'expected'
+
+
+def _run_sync(coro: Any) -> Any:
+    """Run a coroutine from synchronous node code.
+
+    cobalt's ``Evaluator.evaluate`` is a coroutine (cobalt/evaluator.py:71).
+    The engine dispatches node lane handlers synchronously, so ``asyncio.run``
+    is the common case; this class is also reachable from a thread that already
+    drives a loop, where ``asyncio.run`` raises, so fall back to a fresh loop on
+    a worker thread. Both shapes follow the repo precedent in
+    ``tool_filesystem/IInstance.py`` (``_run_async``) and
+    ``agent_crewai/crewai_runner.py``.
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(asyncio.run, coro).result()
+
+
+def _cobalt_score_and_reason(result: Any) -> Tuple[float, str]:
+    """Read the score and the reason off whatever cobalt handed back.
+
+    ``cobalt.types.EvalResult`` exposes ``score``/``reason``/``chain_of_thought``
+    — there is no ``reasoning`` attribute. Mappings and the older ``reasoning``
+    spelling are still accepted so a stubbed evaluator keeps working.
+    """
+    if isinstance(result, dict):
+        return float(result.get('score', 0.0)), result.get('reason') or result.get('reasoning') or ''
+    reason = getattr(result, 'reason', None) or getattr(result, 'reasoning', None) or ''
+    return float(getattr(result, 'score', 0.0)), reason
 
 
 class CobaltEvaluator:
     """Evaluate LLM outputs using Cobalt AI's testing framework.
 
     Provides three evaluation strategies:
-      - semantic similarity (Jaccard similarity fallback when cobalt-ai not installed)
+      - semantic similarity (Jaccard similarity fallback when cobalt-ai is not
+        installed or its call fails; the reasoning names which)
       - LLM-as-judge (GPT-4 / Claude scoring with criteria)
       - custom function (arbitrary Python callable returning a score)
     """
@@ -133,19 +182,27 @@ class CobaltEvaluator:
 
         if not _cobalt_available:
             debug('cobalt-ai not installed; falling back to basic similarity')
-            return self._fallback_semantic(output, expected, threshold)
+            return self._fallback_semantic(output, expected, threshold, 'cobalt-ai not installed')
 
         try:
-            evaluator = Evaluator(name='semantic-similarity', type='similarity', threshold=threshold)
-            result = evaluator.evaluate(output=output, expected=expected)
-            score = (
-                float(result.get('score', 0.0)) if isinstance(result, dict) else float(getattr(result, 'score', 0.0))
+            # cobalt's similarity handler requires config['field'] and reads the
+            # reference from context.item[field] (cobalt/evaluators/similarity.py:32-36);
+            # omitting it raises KeyError('field').
+            evaluator = Evaluator(
+                name='semantic-similarity',
+                type=_COBALT_SIMILARITY_TYPE,
+                field=_EXPECTED_FIELD,
+                threshold=threshold,
             )
-            reasoning = result.get('reasoning', '') if isinstance(result, dict) else getattr(result, 'reasoning', '')
+            context = EvalContext(item={_EXPECTED_FIELD: expected}, output=output)
+            result = _run_sync(evaluator.evaluate(context))
+            score, reasoning = _cobalt_score_and_reason(result)
             return self._make_result(score, threshold, reasoning or 'Semantic similarity evaluated', 'semantic')
         except Exception as e:
-            debug(f'Cobalt semantic evaluation failed: {e}')
-            return self._fallback_semantic(output, expected, threshold)
+            # Class name only: the same reasoning applies here as in the judge
+            # branch below — a provider or dependency exception can echo a URL.
+            debug(f'Cobalt semantic evaluation failed: {type(e).__name__}')
+            return self._fallback_semantic(output, expected, threshold, f'cobalt call failed: {type(e).__name__}')
 
     def evaluate_llm_judge(
         self, output: str, expected: str, criteria: Optional[str] = None, model: Optional[str] = None
@@ -176,14 +233,25 @@ class CobaltEvaluator:
             return self._make_result(0.0, self._threshold, 'cobalt-ai not installed', 'llm_judge')
 
         try:
+            # cobalt's judge handler renders config['prompt'] against
+            # {'output': …, 'metadata': …, **context.item} — it has no 'criteria'
+            # key (cobalt/evaluators/llm_judge.py:17-24), and it is registered
+            # under the hyphenated 'llm-judge'.
             evaluator = Evaluator(
-                name='llm-judge', type='llm_judge', model=model, criteria=criteria, api_key=self._apikey
+                name='llm-judge',
+                type=_COBALT_LLM_JUDGE_TYPE,
+                model=model,
+                scoring='scale',
+                prompt=(
+                    f'{criteria}\n\nExpected: {{{{{_EXPECTED_FIELD}}}}}\n'
+                    'Actual: {{output}}\n\nRespond with a score between 0.0 and 1.0.'
+                ),
             )
-            result = evaluator.evaluate(output=output, expected=expected)
-            score = (
-                float(result.get('score', 0.0)) if isinstance(result, dict) else float(getattr(result, 'score', 0.0))
-            )
-            reasoning = result.get('reasoning', '') if isinstance(result, dict) else getattr(result, 'reasoning', '')
+            context = EvalContext(item={_EXPECTED_FIELD: expected}, output=output)
+            # api_key and model are keyword-only on evaluate (cobalt/evaluator.py:71-77);
+            # the config dict never carries the key.
+            result = _run_sync(evaluator.evaluate(context, api_key=self._apikey, model=model))
+            score, reasoning = _cobalt_score_and_reason(result)
             return self._make_result(score, self._threshold, reasoning or 'LLM judge evaluation complete', 'llm_judge')
         except Exception as e:
             # Only the class name: a provider SDK exception can echo the request URL
@@ -404,8 +472,10 @@ class CobaltEvaluator:
         }
 
     @staticmethod
-    def _fallback_semantic(output: str, expected: str, threshold: float) -> Dict[str, Any]:
-        """Compute a basic Jaccard similarity fallback when cobalt-ai is not available.
+    def _fallback_semantic(
+        output: str, expected: str, threshold: float, cause: str = 'cobalt-ai not installed'
+    ) -> Dict[str, Any]:
+        """Compute a basic Jaccard similarity fallback when cobalt cannot score.
 
         Tokenizes both strings into word sets and computes the Jaccard index
         (intersection over union) for a lightweight comparison.
@@ -414,6 +484,11 @@ class CobaltEvaluator:
             output: The LLM-generated output text.
             expected: The expected/reference text.
             threshold: The pass/fail threshold.
+            cause: Why the fallback ran, quoted verbatim in the reasoning. The
+                package being absent and a cobalt call that failed are different
+                situations and must not read alike: a mislabelled reason sent an
+                acceptance run's readers looking for a missing dependency that
+                was in fact installed.
 
         Returns:
             Evaluation result dict.
@@ -432,8 +507,6 @@ class CobaltEvaluator:
                 union = output_tokens | expected_tokens
                 score = len(intersection) / len(union) if union else 0.0
 
-            return CobaltEvaluator._make_result(
-                score, threshold, 'Fallback Jaccard similarity (cobalt-ai not installed)', 'semantic'
-            )
+            return CobaltEvaluator._make_result(score, threshold, f'Fallback Jaccard similarity ({cause})', 'semantic')
         except Exception:
             return CobaltEvaluator._make_result(0.0, threshold, 'Fallback similarity computation failed', 'semantic')
