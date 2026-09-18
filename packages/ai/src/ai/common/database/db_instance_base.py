@@ -137,7 +137,9 @@ def _generated_primary_keys(table: SQLTable) -> set:
     and are treated as generated here, yet SQLite aliases none of them to the
     rowid, so an omitted key lands as NULL; conversely
     ``id INTEGER PRIMARY KEY REFERENCES parent(id)`` IS a rowid alias but the
-    foreign key excludes it from ``'auto'``, so a row omitting it is rejected.
+    foreign key excludes it from ``'auto'``. That second case costs nothing now
+    that an unreflected key is simply left out of the INSERT: SQLite still
+    generates the rowid, and all it buys is SQLAlchemy's SAWarning.
     Both are SQLite-only: PostgreSQL and MySQL reflection set ``autoincrement``
     explicitly (from ``nextval``/Identity and from ``auto_increment``), so the
     resolution is exact for the engines the production nodes connect to, and no
@@ -1173,7 +1175,10 @@ class DatabaseInstanceBase(IInstanceBase, ABC):
                 # columns as pairs. Rebuilding `IGlobal.schema` from those
                 # pairs here produced the identical key set with the reflected
                 # column comment blanked to '' -- a second publisher for no
-                # gain, since this map is only ever read by key. One publisher.
+                # gain, since this map is only ever read by key. `refresh_schema`
+                # does publish exactly that comment-less shape, out of its own
+                # walk, which is fine for a map read by key; what this block
+                # avoids is a THIRD publisher, running on every batch.
                 if not self.IGlobal._getTableSchema(self.IGlobal.table):
                     error(f'Unable to retrieve schema for table "{self.IGlobal.table}"')
                     raise RuntimeError(f'Table "{self.IGlobal.table}" schema could not be retrieved.')
@@ -1291,18 +1296,26 @@ class DatabaseInstanceBase(IInstanceBase, ABC):
                     # idiom is a CHAR(36) key filled by a BEFORE INSERT trigger,
                     # which reflects exactly like a key nobody supplies, and
                     # refusing the row meant the trigger never ran. Leaving the
-                    # column out lets it run. Binding NULL is still not an
-                    # option: an explicit NULL suppresses both a trigger's
-                    # NEW-value default and a server default, so the choice is
-                    # between omitting the column and refusing the row, and
-                    # refusing it is the database's call, not this node's.
+                    # column out lets it run. Binding NULL is still not the
+                    # alternative -- but not because a bound NULL defeats the
+                    # trigger: a BEFORE ROW trigger fires before the NOT NULL
+                    # check on PostgreSQL and on MySQL 5.7+, sees the NULL and
+                    # fills it. What an explicit NULL does override is a column
+                    # DEFAULT, and where no trigger exists it is a NOT NULL
+                    # violation. Omitting the column is the one shape that works
+                    # for a default, a trigger and a generated key alike, so the
+                    # choice is between omitting the column and refusing the row,
+                    # and refusing it is the database's call, not this node's.
                     #
                     # SQLAlchemy emits a SAWarning for exactly this shape ("is
                     # marked as a member of the primary key ... and no explicit
                     # value is passed"). It is correct to warn and wrong to
                     # silence: the statement really does leave a key to the
-                    # database, which is the point. It lands in the server log,
-                    # not in the tool response.
+                    # database, which is the point. It goes out through Python's
+                    # `warnings` module -- stderr under the default filter, once
+                    # per distinct message per process, so once per table/column
+                    # per engine process -- and never reaches the tool response;
+                    # rocketlib does not route warnings through its logger.
                     continue
                 else:
                     # Column in schema, no value in the row, no default behind

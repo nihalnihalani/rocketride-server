@@ -120,13 +120,18 @@ The reason: whether the database generates a key is read from reflected
 metadata, which does not describe triggers. A uuid or CHAR(36) primary key
 populated by a BEFORE INSERT trigger reflects as a key with no default, so
 refusing the row meant the trigger never ran; omitting the column is what lets
-it run, and binding NULL is not an alternative because an explicit NULL
-suppresses a trigger value and a column default alike. Where nothing fills the
-key in, PostgreSQL refuses the row and every row of the batch is rolled back;
-the failure is raised as Insert into "<table>" failed: followed by the
-database's own primary message, with the statement echo stripped. On the
-answers lane that error is logged rather than returned to the caller, so check
-the server log when a batch does not land.
+it run, and binding NULL is not the alternative: a BEFORE INSERT trigger fires
+before the not-null check and would fill a bound NULL, but an explicit NULL
+overrides a column default, and where no trigger exists it is a not-null
+violation -- omitting the column is the one shape that works for a default, a
+trigger and a generated key alike. Where nothing fills the key in, PostgreSQL
+refuses the row and every row of the batch is rolled back; the failure is
+raised as Insert into "<table>" failed: followed by the database's own primary
+message, with the statement echo stripped. On the answers lane that error is
+logged rather than returned to the caller, so check the server log when a batch
+does not land. SQLAlchemy emits a Python SAWarning (once per column per process
+under the default filter) for a statement that leaves a primary key unbound;
+that is expected here.
 
 Database description is empty by default and is included as context when the
 node asks the LLM to write SQL. Change it when the database or table

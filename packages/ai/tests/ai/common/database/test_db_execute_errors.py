@@ -1227,8 +1227,8 @@ def test_insert_leaves_a_sole_primary_key_the_database_does_not_generate_to_the_
     longer decides: reflection describes columns and not triggers, so "no
     default" is not the same as "nobody fills it in". The statement carries no
     columns and the database answers -- SQLite stores NULL for a non-INTEGER
-    primary key, PostgreSQL and MySQL reject the row and the whole batch rolls
-    back.
+    primary key, PostgreSQL and MySQL (in strict mode) reject the row and the
+    whole batch rolls back.
     """
     iglobal = instance.IGlobal
     iglobal.table = 'codes'

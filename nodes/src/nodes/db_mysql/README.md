@@ -186,12 +186,19 @@ is read from reflected metadata, which does not describe triggers. A `CHAR(36)`
 primary key filled by a `BEFORE INSERT` trigger -- the usual UUID idiom before
 MySQL 8.0.13 -- looks exactly like a text key with no default, so refusing the
 row meant the trigger never ran. Leaving the column out of the statement is
-what lets it run. Binding `NULL` is not an alternative: an explicit `NULL`
-suppresses a trigger's value and a column default alike. Where nothing fills
-the key in, MySQL refuses the row itself (`Field '<name>' doesn't have a
-default value`, or a not-null error) and every row of the batch is rolled back.
-SQLAlchemy logs a warning for a statement that leaves a primary key unbound;
-that is expected here.
+what lets it run. Binding `NULL` is not the alternative: a `BEFORE INSERT`
+trigger fires before the not-null check and would fill a bound `NULL`, but an
+explicit `NULL` overrides a column default, and where no trigger exists it is a
+not-null violation -- omitting the column is the one shape that works for a
+default, a trigger and a generated key alike. Where nothing fills the key in,
+MySQL refuses the row itself (`Field '<name>' doesn't have a default value`, or
+a not-null error) in strict mode -- `STRICT_TRANS_TABLES`, the default since
+MySQL 5.7 -- and every row of the batch is rolled back. Under a non-strict
+`sql_mode` MySQL stores the implicit default instead, so an omitted `CHAR` key
+lands as an empty string and the next such row collides with a duplicate-key
+error. SQLAlchemy emits a Python `SAWarning` (once per column per process under
+the default filter) for a statement that leaves a primary key unbound; that is
+expected here.
 
 A failed insert raises `Insert into "<table>" failed:` followed by MySQL's own
 primary message, with SQLAlchemy's statement and parameter echo stripped the
