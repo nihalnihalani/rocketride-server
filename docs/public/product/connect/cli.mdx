@@ -208,6 +208,10 @@ Key flags:
 | `--json [FILE]` | Emit one JSON document (`specs` + `spec_errors` + `summary`). Bare `--json` prints it to stdout instead of human-readable text; `--json FILE` writes it to `FILE` and keeps the human-readable text on stdout. |
 | `--junit <path>` | Write a JUnit XML report to `<path>` in addition to the normal output. |
 
+Of the connection options above, `eval` takes only `--uri` and `--apikey`: it
+registers neither `--token` nor `--pipeline`, because the pipeline under test
+comes from the spec and the task token is created and torn down per run.
+
 Exit codes: `0` — all cases passed; `1` — at least one case failed or errored,
 or a spec could not run to completion; `2` — usage error, spec parse/validation
 error, connection failure, a `--json` or `--junit` destination that cannot be
