@@ -60,7 +60,11 @@ node currently holds — the reflection taken at start-up, replaced by each
 `refresh_schema` call — so DDL run since the last reflection is invisible to
 it until the next one. `refresh_schema` takes no arguments, re-reflects the
 database, replaces that database-wide cache, and returns the `get_schema`
-shape plus a `refreshed_at` UTC timestamp. `get_data` returns
+shape plus a `refreshed_at` UTC timestamp. If the database refuses the
+reflection — a revoked grant, a lock timeout, a table dropped mid-walk — the
+call fails with `Schema refresh failed:` followed by the database's own
+message (for a table that disappeared mid-walk, the name of that table) and
+leaves the cached schema exactly as it was. `get_data` returns
 `{valid, rows, sql, row_limit}` on success; a non-database question returns
 `{valid: false, answer}`, and a query execution failure returns
 `{valid: false, error, sql, rows: []}`.

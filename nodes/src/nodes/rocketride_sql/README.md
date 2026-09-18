@@ -60,7 +60,11 @@ recording when that reflection completed. Alongside replacing that
 database-wide cache it invalidates the configured table's cached column map
 rather than rebuilding it there: the map is reflected afresh on the next
 answers-lane insert, which is how that insert picks up added or dropped
-columns instead of continuing against the start-up shape.
+columns instead of continuing against the start-up shape. If the database
+refuses the reflection — a revoked grant, a lock timeout, a table dropped
+mid-walk — the call fails with Schema refresh failed: followed by the
+database's own message (for a table that disappeared mid-walk, the name of
+that table) and leaves both cached schemas exactly as they were.
 
 get_sql returns {sql, valid: true} only for safe generated SQL; unsafe SQL
 returns {error, sql, valid: false}. execute, begin, commit, and rollback raise

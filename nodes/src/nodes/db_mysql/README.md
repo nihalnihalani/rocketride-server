@@ -64,7 +64,11 @@ shape plus a `refreshed_at` UTC timestamp. It also invalidates the configured
 table's cached column map rather than rebuilding it there: the map is
 reflected afresh on the next `answers`-lane insert, which is how that insert
 picks up added or dropped columns instead of continuing against the start-up
-shape. `get_data` returns
+shape. If the database refuses the reflection — a revoked grant, a lock
+timeout, a table dropped mid-walk — the call fails with `Schema refresh
+failed:` followed by the database's own message (for a table that disappeared
+mid-walk, the name of that table) and leaves both cached schemas exactly as
+they were. `get_data` returns
 `{valid, rows, sql, row_limit}` on success; a non-database question returns
 `{valid: false, answer}`, and a query execution failure returns
 `{valid: false, error, sql, rows: []}`.
