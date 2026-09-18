@@ -992,6 +992,48 @@ def test_insert_after_refresh_does_not_bind_the_generated_primary_key(instance):
     assert all(row['id'] is not None for row in rows)
 
 
+def test_a_supplied_id_is_dropped_before_a_refresh_and_bound_after(instance):
+    """Pin the one INSERT that refresh_schema does change, on an auto-created table.
+
+    ``_createTableFromData`` prepends an ``id`` primary key and then curates it
+    OUT of ``IGlobal.schema``, so a row that carries its own ``id`` has it
+    silently dropped and the database generates a different one.
+    ``refresh_schema`` replaces that curated map with a plain reflection, which
+    has ``id`` in it, so the same row now binds the caller's value. Every other
+    column behaves identically across the refresh; this is the flip, and the
+    comment in ``refresh_schema`` that concedes it had nothing holding it.
+
+    The consequence is invisible in this file and real in production. SQLite
+    picks the next rowid from the current maximum, so a row that jumps the
+    counter simply moves it. PostgreSQL renders the same column as ``id
+    SERIAL``, whose sequence is advanced only by rows that take the DEFAULT: a
+    bound ``id`` of 501 leaves the sequence at 3, and the next row that omits
+    ``id`` collides on the primary key. ``writeAnswers`` logs that failure and
+    drops the batch. Curating ``id`` into the auto-create map, so both maps
+    agree, is the fix for that and is a product decision, not this PR's; the
+    test exists so the deferral is visible rather than only commented.
+    """
+    iglobal = instance.IGlobal
+    iglobal.table = 'answers'
+
+    instance._insertData([{'q': 'why', 'a': 'because'}])
+    assert set(iglobal.schema) == {'q', 'a'}
+
+    # Before the refresh: the curated map has no `id`, so the supplied one is
+    # dropped and the database generates its own.
+    columns_before = _compiled_insert_columns(instance, [{'id': 500, 'q': 'how', 'a': 'like this'}])
+    assert set(columns_before) == {'q', 'a'}
+
+    instance.refresh_schema({})
+
+    # After it: the reflected map has `id`, and the row's own value is bound.
+    columns_after = _compiled_insert_columns(instance, [{'id': 501, 'q': 'when', 'a': 'now'}])
+    assert set(columns_after) == {'id', 'q', 'a'}
+
+    rows = instance.execute({'sql': 'SELECT id, q FROM answers ORDER BY id'})['rows']
+    assert [(row['id'], row['q']) for row in rows] == [(1, 'why'), (2, 'how'), (501, 'when')]
+
+
 def test_insert_omits_a_reflected_primary_key_the_rows_do_not_supply(instance):
     """The same guard covers a table that already existed at task start.
 
