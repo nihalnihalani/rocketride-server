@@ -184,8 +184,10 @@ statement goes out exactly as typed and the line reads `no limit applied`.
 whose dialect could not be probed — the app cannot tell a commented-out `# for
 update` from a real clause, and moving the limit in front of it would lift the
 clause out of the comment. On a PostgreSQL connection this also costs the
-limit on a statement that uses `#` as an operator on that line; write the
-statement on two lines to have it bounded.
+limit on a statement that uses `#` as an operator on that line — and, on a
+statement that carries its own `LIMIT` or `FETCH` clause, it costs the `limit
+in statement` reading too, even though the statement is genuinely bounded;
+write the statement on two lines to have it bounded.
 
 The same ambiguity applies to the statement's OWN limit clause. A `LIMIT` or
 `FETCH { FIRST | NEXT } … ONLY` that sits behind an unmasked `#` on the same

@@ -627,6 +627,21 @@ describe('applyRowLimit', () => {
 			}
 		});
 
+		it('pins the documented cost on PostgreSQL: # as the bitwise-XOR operator ambiguates a genuinely bounded statement', () => {
+			// On PostgreSQL, `#` is the bitwise-XOR operator, not a comment marker —
+			// `SELECT a # b FROM t LIMIT 5` is valid SQL with a real, top-level
+			// LIMIT, and the read really is bounded. But the same-line `#` guard
+			// cannot tell this apart from a MySQL comment shadowing the clause
+			// without masking `#` for PostgreSQL too, so it still reports `none`
+			// here — the same cost the locking-clause guard already pays on this
+			// dialect. Nothing is rewritten: the statement goes out byte-identical.
+			assert.deepEqual(applyRowLimit('SELECT a # b FROM t LIMIT 5', '200', 'postgres'), {
+				sql: 'SELECT a # b FROM t LIMIT 5',
+				limit: null,
+				state: 'none',
+			});
+		});
+
 		it('still appends the limit on mysql, where # is a real comment and masked out', () => {
 			// mysql masks `#`, so `hashCommentPrecedesClause` short-circuits and the
 			// guard never fires — unchanged by this fix.
