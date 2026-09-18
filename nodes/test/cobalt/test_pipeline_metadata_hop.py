@@ -423,6 +423,15 @@ def _run_pipeline(items, reply, instructions=None, with_prompt=True, threshold=0
     dataset rows produced three ``open``/``closing``/``close`` pairs on the
     prompt node and three questions out of it, not one.
 
+    WHAT THIS HARNESS DOES NOT MODEL. The engine also forwards the prompt
+    node's incoming question after ``writeQuestions`` returns, because the
+    prompt node does not prevent the default forward (base-branch behaviour,
+    tracked as a develop follow-up). Live, the LLM therefore receives TWO
+    questions per row - the merged one this node wrote and the untouched
+    original - and the sink sees two scores per row. This harness models only
+    the merged question the node writes, so its counts are one LLM question and
+    one score per row.
+
     The LLM node is still built per staged question. ``LLMBase`` answers inside
     ``writeQuestions`` and holds no cross-object accumulator, so sharing it
     would change nothing but the lane bookkeeping these tests read.

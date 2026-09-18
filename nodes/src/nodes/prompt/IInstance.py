@@ -81,6 +81,13 @@ class IInstance(IInstanceBase):
         emits, and it fires per object, with this reset in between. A live run
         of `examples/cobalt-evaluation.pipe` over three dataset rows put three
         open/closing/close rounds and three emitted questions on this node.
+
+        Those three are what this node writes. The engine also forwards each
+        incoming question after `writeQuestions` returns - this node does not
+        call `preventDefault()` - so the same run delivered six questions to
+        the LLM downstream: three merged and three untouched originals. That is
+        base-branch behaviour, recorded here rather than changed, and tracked
+        as a develop follow-up.
         """
         # The turn starts here, so the question does too.
         self.has_output = False
