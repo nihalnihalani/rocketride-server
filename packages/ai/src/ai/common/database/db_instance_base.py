@@ -1052,9 +1052,18 @@ class DatabaseInstanceBase(IInstanceBase, ABC):
         # The check, the rebuild and the snapshot are one critical section.
         # `refresh_schema` empties `IGlobal.schema` to re-arm this rebuild, so
         # at runtime a second insert can arrive while the first is reflecting,
-        # and the intermediate states it would observe are wrong: a half-built
-        # map silently drops the columns not yet added, and the map it holds
-        # must not change size while the per-row loop iterates it.
+        # and the state it would observe is wrong: a map still being built
+        # silently drops the columns not yet added.
+        #
+        # What the snapshot buys is one map for the whole batch. Both parts of
+        # that matter and they are different: binding it to a local is what
+        # stops a `refresh_schema` arriving mid-batch from swapping the map the
+        # per-row loop below is walking (every publisher REBINDS
+        # `IGlobal.schema` -- `_getTableSchema` and `_createTableFromData` both
+        # assign a map they finished building, so nothing mutates the live one
+        # in place today), and copying it is what keeps that true if a future
+        # publisher ever fills a map in place again, which is exactly the bug
+        # both publishers were fixed for. The copy is a handful of tuples.
         #
         # Every batch takes the lock, even the common case where the map is
         # already built and the body is one falsy test. The trade-off is
@@ -1073,10 +1082,13 @@ class DatabaseInstanceBase(IInstanceBase, ABC):
         # INSERT. Neither reads `IGlobal.schema` and both are slow.
         with self.IGlobal.reflect_lock:
             if not self.IGlobal.schema:
-                table_schema = self.IGlobal._getTableSchema(self.IGlobal.table)
-                if table_schema:
-                    self.IGlobal.schema = {name: (col_type, '') for name, col_type in table_schema}
-                else:
+                # `_getTableSchema` publishes the map it builds, in one
+                # assignment once the walk is complete, and returns the same
+                # columns as pairs. Rebuilding `IGlobal.schema` from those
+                # pairs here produced the identical key set with the reflected
+                # column comment blanked to '' -- a second publisher for no
+                # gain, since this map is only ever read by key. One publisher.
+                if not self.IGlobal._getTableSchema(self.IGlobal.table):
                     error(f'Unable to retrieve schema for table "{self.IGlobal.table}"')
                     raise RuntimeError(f'Table "{self.IGlobal.table}" schema could not be retrieved.')
             schema = dict(self.IGlobal.schema)

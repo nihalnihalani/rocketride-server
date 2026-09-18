@@ -779,15 +779,17 @@ class DatabaseGlobalBase(IGlobalBase, ABC):
 
         # Reflect the target table schema; it may not exist yet if this
         # pipeline is configured to write to a brand-new table.
-        table_schema = self._getTableSchema(self.table)
-        if table_schema is None:
+        #
+        # `_getTableSchema` publishes `self.schema` itself when the reflection
+        # succeeds, so there is nothing to assign on that branch: rebuilding
+        # the same map from the pairs it returns only blanked the reflected
+        # column comment, and `_insertData`, the sole reader, indexes this map
+        # by key. The missing-table branch is the one case it leaves untouched.
+        if self._getTableSchema(self.table) is None:
             warning(
                 f'Table "{self.table}" does not exist in database "{self.database}". It will be created automatically when data is received. If you prefer to create it manually, please do so before running the pipeline.'
             )
             self.schema = {}
-        else:
-            # Store as {col_name: (type_str, comment)} to match the schema cache format.
-            self.schema = {name: (col_type, '') for name, col_type in table_schema}
 
     def endGlobal(self) -> None:
         if self.tx_registry:
