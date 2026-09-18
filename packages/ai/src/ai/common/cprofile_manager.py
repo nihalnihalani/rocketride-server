@@ -24,8 +24,10 @@
 CProfileManager: Process-Level yappi Profiler Singleton.
 
 Provides a single, thread-safe profiling session per Python process using
-yappi, which profiles all threads (unlike cProfile which only profiles
-the calling thread).
+yappi.  Unlike cProfile, yappi profiles more than the calling thread — but
+only threads that exist when the session starts or that start through
+``threading.Thread``.  A thread that first enters Python mid-session (e.g.
+an engine worker thread) must call ``register_current_thread()``.
 
 Any DAP connection handler can import the module-level ``profiler``
 instance and call start/stop/status/report.
@@ -43,7 +45,7 @@ Usage:
     report = profiler.report()
 """
 
-import io
+import functools
 import os
 import sys
 import threading
@@ -71,6 +73,10 @@ _SOURCE_MARKERS = [
 ]
 
 
+# Cached: stop() calls this for every entry and callee of every capture, under
+# _lock, over a few hundred distinct paths. The answer depends only on the path,
+# and a cached one is also a single string object shared by all those entries
+@functools.lru_cache(maxsize=4096)
 def _relativize_path(path: str) -> str:
     """
     Strip absolute prefixes from a module path, returning a relative './...' path.
@@ -122,6 +128,79 @@ def _is_project_code(path: str) -> bool:
     return path.startswith(_PROJECT_PREFIXES)
 
 
+def _thread_name() -> Optional[str]:
+    """
+    Name the current thread for yappi's per-thread stats.
+
+    yappi's default names a context after its thread's class, so every worker
+    reads 'Thread' (or '_DummyThread' for an engine worker).  Reads
+    threading._active directly, as that default does: current_thread() would
+    deadlock when the profiled call is _active_limbo_lock.acquire() (yappi
+    issue #48).
+
+    Returns None while the thread is not registered yet, and yappi asks again.
+    Once it has a name it keeps it, so a thread renamed later keeps its old one.
+    """
+    try:
+        return threading._active[threading.get_ident()].name
+    except KeyError:
+        return None
+
+
+def _no_tree(message: str) -> Dict[str, Any]:
+    """Build the report_tree() result that carries no tree, only an error."""
+    return {'tree': None, 'total_time': 0, 'total_calls': 0, 'error': message}
+
+
+# Text report column layout.  Numeric widths and the two-space gap are yappi's
+# print_all() defaults (yappi.py:1015-1025); the name column is deliberately
+# wider than its 36, which truncated almost every row to an unidentifiable tail
+# ("..' of '_queue.SimpleQueue' objects>").  Safe to widen: profiler-ui renders
+# the report in a <pre> with pre-wrap, so longer lines wrap (ReportText.tsx:59).
+_COLUMNS = (('name', 72), ('ncall', 5), ('tsub', 8), ('ttot', 8), ('tavg', 8))
+_COLUMN_GAP = '  '
+
+# Unpacked once so rows and the header cannot drift apart
+_NAME_W, _NCALL_W, _TSUB_W, _TTOT_W, _TAVG_W = (width for _, width in _COLUMNS)
+
+
+def _ltrim(text: Any, size: int) -> str:
+    """Drop the head behind '..' when too long, else pad to size (yappi.py:393)."""
+    text = str(text)
+    if len(text) > size:
+        return '..' + text[-size:][2:]
+    return text.ljust(size)
+
+
+def _rtrim(text: Any, size: int) -> str:
+    """Drop the tail after '..' when too long, else pad to size (yappi.py:393).
+
+    Padding is right-hand in both directions — yappi's StatString pads short
+    values identically whichever trim was asked for, so columns read as left
+    aligned.  Kept as-is: the report is user-visible and this is not the commit
+    to restyle it.
+    """
+    text = str(text)
+    if len(text) > size:
+        return text[:size][:-2] + '..'
+    return text.ljust(size)
+
+
+def _fmt_time(value: float) -> str:
+    """Format a duration to fit a column, dropping precision as needed."""
+    for precision in range(6, 0, -1):
+        formatted = f'{value:0.{precision}f}'
+        if len(formatted) <= 8:
+            return formatted
+    return formatted
+
+
+# Column header line for the text report sections
+_COLUMN_HEADER = _COLUMN_GAP.join(
+    _ltrim(name, size) if name == 'name' else _rtrim(name, size) for name, size in _COLUMNS
+)
+
+
 # =============================================================================
 # CPROFILE MANAGER
 # =============================================================================
@@ -131,7 +210,7 @@ class CProfileManager:
     """
     Process-level singleton managing a single yappi profiling session.
 
-    Thread-safe via a threading.Lock — safe to call from asyncio handlers
+    Thread-safe via a threading.RLock — safe to call from asyncio handlers
     and from worker threads in the model server.
 
     yappi is process-global (start/stop are module-level), so this manager
@@ -142,8 +221,14 @@ class CProfileManager:
         _owner_id: Identifier of the connection that started the session.
         _session_name: Human-readable name for the session.
         _start_time: Unix timestamp when profiling started.
-        _last_report: Text of the most recently completed report.
+        _last_report: Cached report text, built on demand by report().
         _last_stats_data: Structured stats from the last session for report_tree().
+        _last_thread_data: The same stats split by thread, for threads().
+        _last_session_name: Session name of the last completed session.
+        _last_owner_id: Owner of the last completed session.
+        _last_runtime: Duration of the last completed session.
+        _last_clock_type: yappi clock the last session's timings came from.
+        _session_seq: Counter bumped by every stop(), used to detect stale builds.
         _lock: Guards all mutable state.
     """
 
@@ -161,8 +246,19 @@ class CProfileManager:
         # When profiling started (unix timestamp)
         self._start_time: Optional[float] = None
 
-        # Most recent completed report text
+        # Most recent completed report text. Built lazily by report() — stop()
+        # only captures the data, so it never formats while holding the lock
         self._last_report: Optional[str] = None
+
+        # Header fields of the last completed session, kept for the lazy report
+        self._last_session_name: Optional[str] = None
+        self._last_owner_id: Optional[str] = None
+        self._last_runtime: Optional[float] = None
+        self._last_clock_type: Optional[str] = None
+
+        # Bumped by every stop(); lets report() detect that the data it built
+        # from has since been replaced, and skip caching a stale result
+        self._session_seq: int = 0
 
         # Structured stats from the last completed session for report_tree().
         # Stored as a list of dicts, each with:
@@ -170,11 +266,23 @@ class CProfileManager:
         #   ncall: int
         #   ttot: float (cumulative time)
         #   tsub: float (self time)
+        #   builtin: bool (affects how the text report names it)
         #   children: list of (child_key, ncall, ttot, tsub)
         self._last_stats_data: Optional[List[Dict]] = None
 
-        # Thread lock protecting all mutable state
-        self._lock = threading.Lock()
+        # Per-thread stats from the last completed session, captured next to
+        # _last_stats_data. A list of dicts, one per thread, each with:
+        #   id: int (yappi context id — what report_tree(thread=...) takes)
+        #   name: str or None
+        #   tid: int (threading.get_ident() — tells apart threads sharing a name)
+        #   ttot: float (time yappi attributed to the thread)
+        #   sched_count: int
+        #   stats: list shaped like _last_stats_data, for this thread only
+        self._last_thread_data: Optional[List[Dict]] = None
+
+        # Guards all mutable state. Reentrant because register_current_thread()
+        # is reachable from the engine's GIL-attach path on every thread.
+        self._lock = threading.RLock()
 
     def start(
         self,
@@ -225,6 +333,9 @@ class CProfileManager:
                 }
             yappi.set_clock_type(clock_type)
 
+            # Name threads by Thread.name, not by class, so workers differ
+            yappi.set_context_name_callback(_thread_name)
+
             # Start profiling all threads (including builtins)
             yappi.start(builtins=True)
             self._active = True
@@ -274,22 +385,31 @@ class CProfileManager:
             # Capture function stats before clearing
             func_stats = yappi.get_func_stats()
 
-            # Generate text report
-            self._last_report = self._build_text_report(
-                func_stats,
-                self._session_name,
-                self._owner_id,
-                runtime,
-            )
-
             # Build structured stats data for report_tree()
             self._last_stats_data = self._capture_stats_data(func_stats)
+
+            # Same again per thread, while yappi still holds the data
+            self._last_thread_data = self._capture_thread_data()
 
             # Clear yappi's internal data to free memory
             yappi.clear_stats()
 
+            # Ours is process-global; hand yappi its own default back
+            yappi.set_context_name_callback(None)
+
             # Capture session info before clearing ownership
             session_name = self._session_name
+
+            # Keep what the report header needs; the text itself is formatted on
+            # demand in report(), so no cold worker thread blocks on _lock here
+            # waiting for a full sort-and-format of every profiled function
+            self._last_session_name = session_name
+            self._last_owner_id = self._owner_id
+            self._last_runtime = runtime
+            # yappi printed this per section; keep it, the default is not 'wall'
+            self._last_clock_type = yappi.get_clock_type()
+            self._last_report = None
+            self._session_seq += 1
 
             # Reset state
             self._active = False
@@ -330,7 +450,8 @@ class CProfileManager:
                     'owner': None,
                     'session': None,
                     'runtime': None,
-                    'has_report': self._last_report is not None,
+                    # Captured data counts as a report — the text is built on demand
+                    'has_report': self._last_report is not None or self._last_stats_data is not None,
                 }
 
     def report(self) -> Dict[str, Any]:
@@ -339,20 +460,49 @@ class CProfileManager:
 
         Anyone can call this — no ownership check.
 
+        The text is formatted here rather than in stop(), so stop() never holds
+        _lock across a full sort-and-format — every engine worker thread's first
+        Python entry would otherwise block on it.  Follows the same "copy under
+        lock, process outside" shape as report_tree().
+
         Returns:
             Dict with 'report' key containing the full report text,
             or a placeholder message if no report is available.
         """
         with self._lock:
-            return {
-                'report': self._last_report or 'No profiling data available. Run a session first.',
-            }
+            # No session has ever completed
+            if self._last_stats_data is None:
+                return {'report': 'No profiling data available. Run a session first.'}
+
+            # Already formatted for this session
+            if self._last_report is not None:
+                return {'report': self._last_report}
+
+            stats_data = list(self._last_stats_data)
+            session_name = self._last_session_name
+            owner_id = self._last_owner_id
+            runtime = self._last_runtime
+            clock_type = self._last_clock_type
+            built_from = self._session_seq
+
+        # Format outside the lock (read-only on the copied data)
+        text = self._build_text_report_from_data(stats_data, session_name, owner_id, runtime, clock_type)
+
+        with self._lock:
+            # Cache only if this is still the current session. A newer stop()
+            # owns the cache slot; this text is still the right answer for the
+            # session that was current when the call arrived, so return it
+            if self._session_seq == built_from:
+                self._last_report = text
+
+        return {'report': text}
 
     def report_tree(
         self,
         max_depth: int = 50,
         min_pct: float = 0.1,
         include_system: bool = True,
+        thread: Optional[int] = None,
     ) -> Dict[str, Any]:
         """
         Build a hierarchical call-tree from the last completed profiling session.
@@ -368,11 +518,26 @@ class CProfileManager:
                             only return project code (./ai/, ./nodes/, etc.).
                             System nodes are collapsed — their project-code
                             children are promoted to the nearest project ancestor.
+            thread: Thread id from threads() to build the tree of that thread
+                    alone, or None (default) for all threads merged.
 
         Returns:
-            Dict with 'tree' (root node), 'total_time', and 'total_calls',
-            or an error message if no stats data is available.
+            Dict with 'tree' (root node), 'total_time' (how long the selected
+            thread ran, or all threads summed), and 'total_calls', or an error
+            message if no stats data is available or the thread is unknown.
         """
+        # Validate thread — unlike the knobs below, a bad one must not fall
+        # back silently: the caller would get all threads, labelled as one
+        if thread is not None:
+            try:
+                # bool is an int, and True must not quietly select thread 1;
+                # nor may int() truncate 1.9 into thread 1.  A JSON 2.0 is fine
+                if isinstance(thread, bool) or (isinstance(thread, float) and not thread.is_integer()):
+                    raise TypeError
+                thread = int(thread)
+            except (TypeError, ValueError):
+                return _no_tree(f'Invalid thread id: {thread!r}')
+
         # Validate and clamp max_depth
         try:
             max_depth = int(max_depth)
@@ -389,24 +554,66 @@ class CProfileManager:
 
         with self._lock:
             if self._last_stats_data is None:
-                return {
-                    'tree': None,
-                    'total_time': 0,
-                    'total_calls': 0,
-                    'error': 'No profiling data available. Run a session first.',
-                }
+                return _no_tree('No profiling data available. Run a session first.')
 
-            # Copy data under lock, process outside
-            stats_data = list(self._last_stats_data)
+            # Copy data under lock, process outside.  The total is the time
+            # the threads ran: yappi measures it per thread, and the function
+            # stats cannot give it without counting nested calls again
+            if thread is None:
+                stats_data = list(self._last_stats_data)
+                total_time = sum(t['ttot'] for t in self._last_thread_data or ())
+            else:
+                found = next((t for t in self._last_thread_data or () if t['id'] == thread), None)
+                if found is None:
+                    return _no_tree(f'Thread {thread} not found in the last session')
+                stats_data = list(found['stats'])
+                total_time = found['ttot']
 
-        # Build the tree outside the lock (read-only on stats_data)
-        result = self._build_tree(stats_data, max_depth, min_pct)
+        # Build the tree outside the lock (read-only on stats_data); a zero
+        # total means no thread data, so fall back to the self times
+        result = self._build_tree(stats_data, max_depth, min_pct, total_time or None)
 
         # Filter out system calls if requested
         if not include_system and result.get('tree'):
             result['tree'] = self._filter_system_calls(result['tree'])
 
         return result
+
+    def threads(self) -> Dict[str, Any]:
+        """
+        List the threads profiled in the last completed session.
+
+        Anyone can call this — no ownership check.
+
+        Returns:
+            Dict with 'threads', busiest first.  Each has id (pass it to
+            report_tree() as thread), name, tid, ttot, sched_count, and the
+            number of functions and calls recorded on it.  When no session has
+            completed, the list is empty and 'error' says so.
+        """
+        with self._lock:
+            if self._last_thread_data is None:
+                return {'threads': [], 'error': 'No profiling data available. Run a session first.'}
+
+            # Copy data under lock, process outside
+            thread_data = list(self._last_thread_data)
+
+        threads = [
+            {
+                'id': thread['id'],
+                'name': thread['name'],
+                'tid': thread['tid'],
+                'ttot': round(thread['ttot'], 6),
+                'sched_count': thread['sched_count'],
+                'functions': len(thread['stats']),
+                'calls': sum(entry['ncall'] for entry in thread['stats']),
+            }
+            for thread in thread_data
+        ]
+        # Id breaks ties so idle threads keep a stable order
+        threads.sort(key=lambda t: (-t['ttot'], t['id']))
+
+        return {'threads': threads}
 
     @staticmethod
     def _filter_system_calls(node: Dict[str, Any]) -> Dict[str, Any]:
@@ -457,65 +664,110 @@ class CProfileManager:
                 # Stop yappi and clear without generating a report
                 yappi.stop()
                 yappi.clear_stats()
+                yappi.set_context_name_callback(None)
                 self._active = False
                 self._owner_id = None
                 self._session_name = None
                 self._start_time = None
+
+    def register_current_thread(self) -> bool:
+        """
+        Hook the calling thread into the active profiling session.
+
+        yappi only hooks threads that exist at start() or that start through
+        threading.Thread.  Engine worker threads get their PyThreadState lazily
+        on first Python entry, so one entering mid-session stays invisible
+        unless it registers itself here (the engine calls this once per thread).
+
+        The check and the install must stay under _lock: stop() and release()
+        call yappi.clear_stats(), and installing the bootstrap after that sends
+        the next profile event into freed memory and crashes the process.
+
+        Returns:
+            True if the thread was hooked into an active session, False if no
+            session is running.
+        """
+        with self._lock:
+            # Installing the hook with no session active breaks yappi globally
+            if not self._active:
+                return False
+
+            # yappi's per-thread bootstrap; its first event registers the context
+            sys.setprofile(yappi._profile_thread_callback)
+            return True
 
     # =========================================================================
     # PRIVATE HELPERS
     # =========================================================================
 
     @staticmethod
-    def _build_text_report(
-        func_stats: yappi.YFuncStats,
-        session_name: str,
-        owner_id: str,
-        runtime: float,
+    def _build_text_report_from_data(
+        stats_data: List[Dict],
+        session_name: Optional[str],
+        owner_id: Optional[str],
+        runtime: Optional[float],
+        clock_type: Optional[str] = None,
     ) -> str:
         """
-        Generate a pstats-style text report from yappi function stats.
+        Generate a pstats-style text report from captured stats data.
+
+        Works from the plain dicts captured by _capture_stats_data() rather than
+        a live yappi stats object, so it can run outside the lock and long after
+        yappi.clear_stats() freed the C-level data.  Reproduces yappi's
+        print_all() layout: entries are in whatever order yappi yielded them, so
+        each section sorts explicitly.
 
         Args:
-            func_stats: yappi's function statistics object.
+            stats_data: Captured entries, each with key/ncall/ttot/tsub.
             session_name: Human-readable session name.
             owner_id: Connection that owned the session.
             runtime: Total profiling duration in seconds.
+            clock_type: yappi clock the timings came from ('wall' or 'cpu').
 
         Returns:
             Formatted report string.
         """
-        report_buf = io.StringIO()
+        lines = [
+            f'Session: {session_name}',
+            f'Owner: {owner_id}',
+            f'Duration: {runtime or 0.0:.2f}s',
+            f'Clock: {clock_type or "unknown"}',
+            '=' * 80,
+            '',
+        ]
 
-        # Header
-        report_buf.write(f'Session: {session_name}\n')
-        report_buf.write(f'Owner: {owner_id}\n')
-        report_buf.write(f'Duration: {runtime:.2f}s\n')
-        report_buf.write('=' * 80 + '\n\n')
+        def section(title: str, entries: List[Dict]) -> None:
+            """Append one sorted, formatted stats section."""
+            lines.append(f'{title}:')
+            lines.append('-' * 50)
+            lines.append(_COLUMN_HEADER)
+            for entry in entries:
+                module, lineno, func = entry['key']
+                # Match yappi's full_name: dotted for builtins, located otherwise
+                full_name = f'{module}.{func}' if entry.get('builtin') else f'{module}:{lineno} {func}'
+                ncall = entry['ncall']
+                # yappi derives tavg; guard the division it never has to
+                tavg = entry['ttot'] / ncall if ncall else 0.0
+                lines.append(
+                    _COLUMN_GAP.join(
+                        (
+                            _ltrim(full_name, _NAME_W),
+                            _rtrim(ncall, _NCALL_W),
+                            _rtrim(_fmt_time(entry['tsub']), _TSUB_W),
+                            _rtrim(_fmt_time(entry['ttot']), _TTOT_W),
+                            _rtrim(_fmt_time(tavg), _TAVG_W),
+                        )
+                    )
+                )
+            lines.append('')
 
-        # Cumulative time sort — full stats
-        report_buf.write('FUNCTIONS BY CUMULATIVE TIME:\n')
-        report_buf.write('-' * 50 + '\n')
-        stat_buf = io.StringIO()
-        func_stats.sort('ttot', 'desc')
-        func_stats.print_all(out=stat_buf)
-        report_buf.write(stat_buf.getvalue())
-        report_buf.write('\n')
+        by_ttot = sorted(stats_data, key=lambda e: e['ttot'], reverse=True)
+        section('FUNCTIONS BY CUMULATIVE TIME', by_ttot)
 
-        # Total (self) time sort — top 30
-        report_buf.write('TOP 30 BY TOTAL TIME:\n')
-        report_buf.write('-' * 50 + '\n')
-        stat_buf = io.StringIO()
-        func_stats.sort('tsub', 'desc')
-        func_stats.print_all(out=stat_buf, limit=30)
-        report_buf.write(stat_buf.getvalue())
+        by_tsub = sorted(stats_data, key=lambda e: e['tsub'], reverse=True)
+        section('TOP 30 BY TOTAL TIME', by_tsub[:30])
 
-        # Strip absolute paths from the report text — both dist and source tree
-        report_text = report_buf.getvalue()
-        # Dist root (both slash styles)
-        report_text = report_text.replace(_SERVER_ROOT.replace('/', '\\'), './')
-        report_text = report_text.replace(_SERVER_ROOT, './')
-        return report_text
+        return '\n'.join(lines)
 
     @staticmethod
     def _capture_stats_data(func_stats: yappi.YFuncStats) -> List[Dict]:
@@ -557,17 +809,52 @@ class CProfileManager:
                     'ncall': stat.ncall,
                     'ttot': stat.ttot,
                     'tsub': stat.tsub,
+                    # Builtins are named 'module.name', not 'module:lineno name'
+                    # (yappi.py:167). Only the text report needs this, so it is
+                    # not carried on children, which only the tree consumes.
+                    'builtin': bool(stat.builtin),
                     'children': children,
                 }
             )
 
         return stats_list
 
+    @classmethod
+    def _capture_thread_data(cls) -> List[Dict]:
+        """
+        Capture every profiled thread together with its own function stats.
+
+        Like _capture_stats_data(), must run before yappi.clear_stats().
+
+        Returns:
+            List of dicts, each with id, name, tid, ttot, sched_count, and
+            stats — this thread's entries, shaped as _capture_stats_data()
+            returns them.
+        """
+        threads = []
+        for thread in yappi.get_thread_stats():
+            # A filter dict, not get_func_stats(ctx_id=...): that drops a falsy
+            # id, so thread 0 would get every thread's functions
+            func_stats = yappi.get_func_stats(filter={'ctx_id': thread.id})
+            threads.append(
+                {
+                    'id': thread.id,
+                    'name': thread.name,
+                    'tid': thread.tid,
+                    'ttot': thread.ttot,
+                    'sched_count': thread.sched_count,
+                    'stats': cls._capture_stats_data(func_stats),
+                }
+            )
+
+        return threads
+
     @staticmethod
     def _build_tree(
         stats_data: List[Dict],
         max_depth: int,
         min_pct: float,
+        total_time: Optional[float] = None,
     ) -> Dict[str, Any]:
         """
         Transform captured yappi stats into a JSON-serializable call tree.
@@ -579,6 +866,8 @@ class CProfileManager:
             stats_data: List of stat dicts from _capture_stats_data().
             max_depth: Maximum recursion depth for tree building.
             min_pct: Minimum cumtime percentage threshold for inclusion.
+            total_time: Time the profiled threads ran — the base for min_pct
+                        and the root's cumtime.  None sums the self times.
 
         Returns:
             Dict with 'tree', 'total_time', and 'total_calls'.
@@ -588,16 +877,33 @@ class CProfileManager:
         for entry in stats_data:
             lookup[entry['key']] = entry
 
-        # Step 2: Compute totals for threshold calculation
-        # (sum, not max — max would skew to one hotspot)
-        total_time = 0.0
-        total_calls = 0
-        for entry in stats_data:
-            total_time += entry['ttot']
-            total_calls += entry['ncall']
+        # Step 2: Compute totals for threshold calculation.  Not a sum of
+        # ttot: that counts every nested call again (a 5 s session summed to
+        # 412 s), which inflates the threshold until real work is pruned
+        if total_time is None:
+            total_time = sum(entry['tsub'] for entry in stats_data)
+        total_calls = sum(entry['ncall'] for entry in stats_data)
 
         # Minimum absolute time threshold
         min_time = total_time * (min_pct / 100.0) if total_time > 0 else 0
+
+        # Heaviest callee time reachable below each function.  A node's own
+        # time says little about its subtree: yappi books time on return, so
+        # frames still running at stop() (thread entry points, worker loops)
+        # read ~0, and a coroutine is booked its whole lifetime while the loop
+        # step resuming it is not.  Pruning on this keeps a light node that
+        # leads to real work.  Iterated to a fixpoint — the graph has cycles
+        reach: Dict[Tuple[str, int, str], float] = {
+            key: max((child['ttot'] for child in entry['children']), default=0.0) for key, entry in lookup.items()
+        }
+        changed = True
+        while changed:
+            changed = False
+            for key, entry in lookup.items():
+                best = max((reach.get(child['key'], 0.0) for child in entry['children']), default=0.0)
+                if best > reach[key]:
+                    reach[key] = best
+                    changed = True
 
         # Step 3: Identify root nodes — functions not appearing as anyone's child
         all_child_keys: set = set()
@@ -649,8 +955,8 @@ class CProfileManager:
             Returns:
                 A dict representing the node, or None if pruned.
             """
-            # Prune below minimum time threshold
-            if ttot < min_time and depth > 1:
+            # Prune below minimum time threshold — unless real work hangs below
+            if depth > 1 and max(ttot, reach.get(func_key, 0.0)) < min_time:
                 return None
 
             module, lineno, name = func_key

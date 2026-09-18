@@ -69,7 +69,7 @@ SHARED_PAGES = [
     'analytics',
 ]
 # Declared single-language extras (surface that exists in one SDK only).
-TS_ONLY_PAGES = {'database-sequelize'}
+TS_ONLY_PAGES = {'database-sequelize', 'database-drizzle'}
 PY_ONLY_PAGES = {'otel-bridge', 'pipe-diff'}
 
 
