@@ -65,6 +65,8 @@ The minimum score that counts as a pass, clamped to `[0.0, 1.0]` at construction
 
 Judge-mode only, and all three are effectively required: without an API key or without the `cobalt` package the judge returns a zero score with a reason rather than failing the run, which is easy to mistake for uniformly bad answers. **Evaluation criteria** is the whole contract with the judge — write what a good answer must do (`Is the output correct, complete, and well-structured?` is the default and is a starting point, not a specification).
 
+What the judge actually receives is the criteria verbatim, then the reference answer (`Expected:`) and the answer under test (`Actual:`), then a request for a score between 0.0 and 1.0 — so the reference is shown to the judge, and criteria written as if it were not will not hold. The reply is scanned for the first number that falls in 0.0–1.0 and that number is the score, so ask for a decimal rather than a fraction: a judge that answers `7/10` scores 0.0. `cobalt_reasoning` carries the reply verbatim, `{{…}}` in the criteria is interpreted as a template variable (`{{output}}`, `{{expected}}` and `{{metadata}}` resolve, anything else is left as written), and chain-of-thought is off — the judge is asked for the score, not for its working.
+
 ### Expected format
 
 `format`-mode only: `prose`, `list`, `code`, or `json`. Set it to what the downstream consumer actually parses, not to what the prompt asks for.
