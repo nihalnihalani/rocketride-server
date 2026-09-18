@@ -73,7 +73,21 @@ def _generated_primary_keys(table: SQLTable) -> set:
       covers ``code TEXT PRIMARY KEY DEFAULT ...`` and ``GENERATED AS IDENTITY``.
 
     Everything else -- a composite key, a TEXT key with no default -- is the
-    caller's to supply. The set this returns also decides how an explicit null
+    caller's to supply, and ``_insertData`` rejects a row that omits one.
+
+    That rejection has a known false positive, because reflection describes
+    columns and not triggers: a ``CHAR(36)`` / ``uuid`` primary key populated
+    by a ``BEFORE INSERT`` trigger (the standard MySQL UUID idiom before
+    8.0.13, and the same shape on PostgreSQL) is indistinguishable here from a
+    text key nobody fills in. A row that omits such a key is refused before the
+    transaction opens, so the trigger never runs, and on the answers lane
+    ``writeAnswers`` only logs the ``ValueError`` -- the batch disappears with
+    one log line. The documented workaround is a real column default
+    (``DEFAULT (uuid())``, ``DEFAULT gen_random_uuid()``), which reflects and
+    is honoured; the node READMEs carry it. Letting the database refuse the row
+    instead, and routing its error through ``_format_db_error``, is the other
+    option: it costs the pre-flight guarantee that a refused batch leaves
+    nothing behind, so it is a maintainer call rather than a silent change. The set this returns also decides how an explicit null
     reads: on one of these columns ``{'id': None}`` means "no value" and is
     left to the database, because the insert lane's caller is an upstream node
     emitting every schema key rather than a person choosing NULL. Anywhere else

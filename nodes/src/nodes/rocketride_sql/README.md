@@ -100,6 +100,14 @@ ones it has no value for; a null on a column with nothing behind it is inserted
 as NULL as given. A primary key PostgreSQL does
 not generate that a row omits is rejected before anything runs.
 
+Known limitation: whether the database generates a key is read from reflected
+metadata, which does not describe triggers. A uuid or CHAR(36) primary key
+populated by a BEFORE INSERT trigger reflects as a key with no default, so a
+row that omits it is rejected by that rule and the trigger never runs; on the
+answers lane the rejected batch is logged and dropped rather than reported to
+the caller. Give the column a real DEFAULT such as gen_random_uuid(), or have
+the upstream node supply the key.
+
 Database description is empty by default and is included as context when the
 node asks the LLM to write SQL. Change it when the database or table
 has domain-specific meanings that a column name alone cannot convey; a concise

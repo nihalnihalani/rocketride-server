@@ -168,11 +168,23 @@ default. A `null` supplied for any column the database fills in itself -- a
 generated primary key, a `DEFAULT` -- counts as not carried, because on this
 lane the sender is an upstream node that may emit every schema key with `null`
 for the ones it has no value for, while a `null` on a column with nothing
-behind it is inserted as `NULL` as given. Lists and
+behind it is inserted as `NULL` as given. A primary key MySQL does not
+generate (a composite key, a text key with no default) that a row omits is
+rejected before anything is executed, naming the table, the column and the row
+position. Lists and
 dictionaries are serialized as JSON strings and booleans as `0` or `1`. For a
 new table, the node adds an auto-increment `id` primary key and infers integer,
 float, datetime, or text columns; short text becomes `VARCHAR(255)` and longer
 text becomes `TEXT`.
+
+Known limitation: whether the database generates a key is read from reflected
+metadata, which does not describe triggers. A `CHAR(36)` primary key filled by
+a `BEFORE INSERT` trigger -- the usual UUID idiom before MySQL 8.0.13 -- looks
+exactly like a text key with no default, so a row that omits it is rejected by
+the rule above and the trigger never runs. On the `answers` lane a rejected
+batch is logged and dropped, so the rows are lost with a single log line rather
+than surfaced to the caller. Give the column a real `DEFAULT (uuid())` (MySQL
+8.0.13 and later) or have the upstream node supply the key.
 
 ### Connection checks and transactions
 
