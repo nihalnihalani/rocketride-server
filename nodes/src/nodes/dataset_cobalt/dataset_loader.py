@@ -58,10 +58,12 @@ def _seed_from_config(config: Dict[str, Any]) -> Optional[int]:
 
     A blank or absent seed returns None, and ``random.Random(None)`` seeds
     itself from the OS, so an unset field reproduces the previous behaviour
-    exactly. A seed that is present but not a number raises ``ValueError``,
-    which the node boundary reports as a named ``DatasetLoadError``: running
-    unseeded after the user asked for a pinned subset would silently hand back
-    a different dataset than the one they pinned.
+    exactly. 0 is a seed like any other, not a blank. A seed that is present
+    but not a whole number raises ``ValueError``, which the node boundary
+    reports as a named ``DatasetLoadError``: running unseeded - or on a
+    silently truncated seed, which is what ``int(7.5)`` would give - after the
+    user asked for a pinned subset would hand back a different dataset than the
+    one they pinned.
 
     Args:
         config: Node config; the optional 'seed' key holds the sampling seed.
@@ -70,11 +72,13 @@ def _seed_from_config(config: Dict[str, Any]) -> Optional[int]:
         The seed as an int, or None when no seed is configured.
 
     Raises:
-        ValueError: If a non-blank seed is not an integer.
+        ValueError: If a non-blank seed is not a whole number.
     """
     seed = config.get('seed')
     if seed is None or seed == '':
         return None
+    if isinstance(seed, float) and not seed.is_integer():
+        raise ValueError(f'sampling seed must be a whole number, got {seed!r}')
     return int(seed)
 
 
@@ -421,8 +425,12 @@ class DatasetLoader:
                     # the node draws the subset itself and hands the result
                     # back to cobalt, keeping the two lanes identical for the
                     # same seed; unseeded, cobalt's own sample is used
-                    # unchanged.
-                    dataset = Dataset.from_items(random.Random(seed).sample(current_items, bounded_size))
+                    # unchanged. A sample that covers the whole dataset is not
+                    # drawn at all, matching the fallback lane's guard below:
+                    # otherwise the two lanes would return the same rows in a
+                    # different order for the same seed.
+                    if bounded_size < len(current_items):
+                        dataset = Dataset.from_items(random.Random(seed).sample(current_items, bounded_size))
 
         # Apply slice if configured
         slice_start = int(config.get('slice_start', 0))

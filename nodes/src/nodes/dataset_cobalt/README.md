@@ -64,7 +64,7 @@ The transforms, applied in a fixed order: **filter → sample → slice**. Each 
 
 - **Filter Field** / **Filter Value** keep only the items whose field equals the value (string comparison). Both are needed; one alone does nothing.
 - **Sample Size** takes that many items at random after filtering. `0` (the default) means take all, and a value larger than the dataset is bounded to its size.
-- **Sample Seed** pins *which* items that draw returns. Set it and the same dataset with the same **Sample Size** yields the same subset on every run, so a score is reproducible and two runs are comparable. Leave it blank (the default) and each run draws a fresh subset, exactly as before the field existed. A seed that is not a number fails the run rather than quietly reverting to an unpinned draw.
+- **Sample Seed** pins *which* items that draw returns. Set it and the same dataset with the same **Sample Size** yields the same subset on every run, so a score is reproducible and two runs are comparable. Leave it blank (the default) and each run draws a fresh subset, exactly as before the field existed. `0` is a seed like any other, not a blank. A seed that is not a whole number fails the run — naming the value — rather than quietly truncating it or reverting to an unpinned draw.
 - **Slice Start** / **Slice End** take a 0-based half-open range of what is left. `0` for **Slice End** (the default) means no slicing.
 
 Filtering to one category and then sampling 20 is the usual shape for a quick run against a large dataset; slicing is for reproducibly re-running the same window.
@@ -75,7 +75,7 @@ The draw always comes from a generator local to this node, never the process-glo
 
 ### Sampling with and without cobalt
 
-`cobalt.Dataset.sample(n)` takes no seed — it calls the module-global `random.sample` internally, in every release `requirements.txt` allows (basalt-ai-cobalt 0.1.0 through 0.2.3). Seeding it would mean seeding the process-global RNG, which is what **Sample Seed** exists to avoid. So when a seed is set the node draws the subset itself, from its own generator, and hands the result back to cobalt; with no seed, cobalt's own `sample` is used unchanged. The two lanes therefore return the same subset for the same seed, whether or not cobalt is installed.
+`cobalt.Dataset.sample(n)` takes no seed — it calls the module-global `random.sample` internally, in every release `requirements.txt` allows (basalt-ai-cobalt 0.1.0 through 0.2.3). Seeding it would mean seeding the process-global RNG, which is what **Sample Seed** exists to avoid. So when a seed is set the node draws the subset itself, from its own generator, and hands the result back to cobalt; with no seed, cobalt's own `sample` is used unchanged. A **Sample Size** that covers the whole dataset is not drawn at all in either lane, so the rows keep their original order rather than being shuffled on one lane only. The two lanes therefore return the same subset, in the same order, for the same seed, whether or not cobalt is installed.
 
 ### One question per row, and nothing else
 

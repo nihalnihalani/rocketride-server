@@ -1881,6 +1881,41 @@ class TestSampleSeedIsReproducible:
         with self._no_cobalt(), pytest.raises(ValueError):
             loader.apply_transforms(self._items(), {'sample_size': 5, 'seed': 'not-a-number'})
 
+    @pytest.mark.parametrize('seed', [7.5, -0.5])
+    def test_a_fractional_seed_is_rejected_rather_than_truncated(self, seed):
+        """`int(7.5)` is 7, which pins a subset the user never asked for."""
+        loader = _make_loader()
+        with self._no_cobalt(), pytest.raises(ValueError, match='whole number'):
+            loader.apply_transforms(self._items(), {'sample_size': 5, 'seed': seed})
+
+    def test_a_whole_float_seed_is_accepted(self):
+        """7.0 is 7; only a fractional value is ambiguous."""
+        loader = _make_loader()
+        with self._no_cobalt():
+            from_float = loader.apply_transforms(self._items(), {'sample_size': 5, 'seed': 7.0})
+            from_int = loader.apply_transforms(self._items(), {'sample_size': 5, 'seed': 7})
+        assert [i['input'] for i in from_float] == [i['input'] for i in from_int]
+
+    def test_a_full_size_sample_keeps_the_original_order_in_both_lanes(self):
+        """Seeded, a sample that covers the dataset must not shuffle one lane only.
+
+        The fallback lane skips the draw when the sample covers everything, so
+        the cobalt lane must skip it too: otherwise the same seed returns the
+        same rows in a different order depending on whether cobalt is
+        installed.
+        """
+        loader = _make_loader()
+        items = self._items(5)
+        config = {'sample_size': 5, 'seed': 1}
+
+        with_cobalt = loader.apply_transforms(items, config)
+        with self._no_cobalt():
+            without_cobalt = loader.apply_transforms(items, config)
+
+        expected = ['q0', 'q1', 'q2', 'q3', 'q4']
+        assert [i['input'] for i in without_cobalt] == expected
+        assert [i['input'] for i in with_cobalt] == expected
+
     def test_seed_is_declared_in_the_schema(self):
         """The user cannot pin the seed unless the panel offers the field."""
         import re
