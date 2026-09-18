@@ -145,12 +145,17 @@ the outer query, or move the `LIMIT` to the top level, to bound what comes
 back.
 
 A statement that ENDS in a locking clause — `FOR UPDATE`, `FOR NO KEY
-UPDATE`, `FOR SHARE`, `FOR KEY SHARE` or MySQL's `LOCK IN SHARE MODE` — is
-sent exactly as you typed it, and the line reads `no limit applied` whatever
-the toggle says. That clause has to stay last in both engines, so an appended
-`LIMIT` would land after it and the statement would no longer parse, and the
-app will not reorder your SQL to make room: write your own `LIMIT` before the
-clause when you want the result bounded.
+UPDATE`, `FOR SHARE`, `FOR KEY SHARE` or MySQL's `LOCK IN SHARE MODE` — gets
+the limit INSERTED in front of that clause instead of appended after it, and
+the line reads `limit 200` like any other bounded read. The two engines
+differ on the order: MySQL documents `[LIMIT …] [FOR UPDATE | LOCK IN SHARE
+MODE]` and rejects a `LIMIT` that follows the clause, while PostgreSQL
+accepts either order — so putting the limit first is the one placement valid
+on both, and the read stays bounded rather than streaming the whole table.
+Your clause is otherwise untouched: its `OF` list, `NOWAIT` and `SKIP LOCKED`
+are sent exactly as you typed them. A statement that already ends in its own
+`OFFSET` keeps the appended form, because a `LIMIT` in front of the clause
+would leave the `OFFSET` stranded behind it.
 
 When the returned count equals an applied limit, a badge reads `Limit
 reached — more rows may exist`, because a full page is not evidence the
@@ -390,9 +395,11 @@ statements ran either way; only the app's picture of the schema is behind.
   ClickHouse declares no foreign keys at all.
 - **The schema is a snapshot** from pipeline start, unless the node can
   re-read it.
-- **No appended limit after a locking clause.** `SELECT … FOR UPDATE`,
-  `FOR SHARE` and MySQL's `LOCK IN SHARE MODE` run unbounded and read `no
-  limit applied`; add a `LIMIT` before the clause yourself.
+- **The limit moves in front of a locking clause.** MySQL requires the
+  locking clause after `LIMIT`; PostgreSQL accepts either order; the app
+  inserts its `LIMIT` before a trailing locking clause so the read stays
+  bounded and valid on both. `SELECT … FOR UPDATE` is therefore sent as
+  `SELECT …` / `LIMIT 200` / `FOR UPDATE`.
 - **Duplicate column names collapse.** A projection that returns two columns
   with the same name shows one: the node hands back each row as an object
   keyed by column name, and the grid takes its headers from the first row.
