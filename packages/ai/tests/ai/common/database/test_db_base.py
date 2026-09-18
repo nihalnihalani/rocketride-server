@@ -490,6 +490,30 @@ def test_format_db_error_clickhouse_cuts_a_parenthesised_subquery_scope(base):
     assert 'in scope' not in message
 
 
+def test_format_db_error_clickhouse_cuts_a_sentence_initial_in_scope_echo(base):
+    """The analyzer's other echo form: a new sentence starting ``In scope <sql>``.
+
+    Constructed shape; clickhouse-sqlalchemy is not installed and no live
+    ClickHouse server is available in this suite. The message text is the
+    released ``There are no table sources. In scope {}`` format string with a
+    query substituted for ``{}``. This capitalised form is the analyzer's
+    common one — it appears in dozens of messages per release, against the two
+    or three that splice a lowercase ``in scope`` into the middle of a
+    sentence — and it carries the same client-inlined bind value, so the
+    marker matches either case.
+    """
+    orig = _StandInClickHouseServerException(
+        47,
+        "There are no table sources. In scope SELECT token FROM users WHERE token = 'hunter2'",
+    )
+    exc = _StandInClickHouseDatabaseException(orig)
+
+    message = base._format_db_error(exc)
+    assert message == 'Error 47: There are no table sources.'
+    assert 'hunter2' not in message
+    assert 'In scope' not in message
+
+
 def test_format_db_error_clickhouse_cuts_a_lone_required_columns_tail(base):
     """``, required columns:`` is a marker in its own right, not only a suffix.
 

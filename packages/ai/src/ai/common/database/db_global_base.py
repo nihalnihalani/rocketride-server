@@ -106,15 +106,26 @@ DEFAULT_MAX_EXECUTE_ROWS = 25000
 #     whose first token is one of the five all-detail and degrade it to the
 #     fallback constant.
 #
-# `in scope ` carries a lookahead for the same reason: ClickHouse formats the
-# echoed query back out of its AST, so the phrase is followed by an uppercase
-# statement keyword there, while in prose ("not in scope for this trigger") it
-# is not. The optional `\(` in front of the keyword is not cosmetic: a scope
-# that is itself a subquery or a CTE body is formatted through `ASTSubquery`,
-# which parenthesises it, so the analyzer prints `in scope (SELECT ...)` --
-# the same echo, one character further along, and it carries the caller's
-# inlined bind values just as the bare form does. The other two ClickHouse
-# phrases are distinctive enough on their own.
+# `[Ii]n scope ` carries a lookahead for the same reason: ClickHouse formats
+# the echoed query back out of its AST, so the phrase is followed by an
+# uppercase statement keyword there, while in prose ("not in scope for this
+# trigger") it is not. The optional `\(` in front of the keyword is not
+# cosmetic: a scope that is itself a subquery or a CTE body is formatted
+# through `ASTSubquery`, which parenthesises it, so the analyzer prints
+# `in scope (SELECT ...)` -- the same echo, one character further along, and it
+# carries the caller's inlined bind values just as the bare form does.
+#
+# The capital `I` is not cosmetic either, and is in fact the common case. The
+# analyzer has two ways of appending the scope: a few messages splice a
+# lowercase ` in scope {}` into the middle of a sentence ("Unknown expression
+# identifier '{}' in scope {}"), but dozens per release end the sentence first
+# and start a new one -- "There are no table sources. In scope {}", "Compound
+# identifier '{}' cannot be resolved as {}. In scope {}", "Multiple expressions
+# with the same alias {}. In scope {}". Both substitute the same
+# `formatASTForErrorMessage` output, so both carry the caller's inlined binds;
+# matching only the lowercase form left the majority of the analyzer's
+# messages echoing the statement. The other two ClickHouse phrases are
+# distinctive enough on their own.
 _DB_ERROR_DETAIL = re.compile(
     r"""(?:
         \s*(?:
@@ -128,7 +139,7 @@ _DB_ERROR_DETAIL = re.compile(
             | failed\ at\ position
             | while\ processing\ query:
             | ,\ required\ columns:
-            | in\ scope\ (?=\(?(?:SELECT|INSERT|WITH|CREATE|ALTER|DROP|DELETE|UPDATE|EXPLAIN)\b)
+            | [Ii]n\ scope\ (?=\(?(?:SELECT|INSERT|WITH|CREATE|ALTER|DROP|DELETE|UPDATE|EXPLAIN)\b)
         )
       | \n[ \t]*(?:
               DETAIL:

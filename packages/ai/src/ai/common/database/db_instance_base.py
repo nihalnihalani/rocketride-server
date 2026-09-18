@@ -580,20 +580,19 @@ class DatabaseInstanceBase(IInstanceBase, ABC):
         Publication is all-or-nothing. ``_getDatabaseSchema`` walks every table
         with no per-table guard, so one ``get_columns`` the database refuses --
         a revoked grant, a lock timeout, a table dropped mid-walk -- ends the
-        whole walk. The dropped-table case is reported in its own words
-        because SQLAlchemy raises ``NoSuchTableError`` for it, whose only
-        argument is the table name: formatted like any other driver error it
-        would read ``Schema refresh failed: <name>``. Neither cache is touched
-        in either case: the node keeps
-        serving the schema it had and says the refresh failed, rather than
-        publishing a half-walked database or, worse, emptying ``IGlobal.schema``
-        (which would re-arm the insert lane's lazy rebuild against a database
-        that just refused to be reflected) while ``db_schema`` still held the
-        old value. Skipping the offending table and continuing, the way
-        ``_getTableSchema`` warns and returns None for a single table, was the
-        other option; it is rejected here because the LLM path cannot tell a
-        table that vanished from one that could not be read, and would write
-        queries as if it were gone.
+        whole walk. The dropped-table case is reported in its own words because
+        SQLAlchemy raises ``NoSuchTableError`` for it, whose only argument is
+        the table name: formatted like any other driver error it would read
+        ``Schema refresh failed: <name>``. Neither cache is touched in either
+        case: the node keeps serving the schema it had and says the refresh
+        failed, rather than publishing a half-walked database or, worse,
+        emptying ``IGlobal.schema`` (which would re-arm the insert lane's lazy
+        rebuild against a database that just refused to be reflected) while
+        ``db_schema`` still held the old value. Skipping the offending table and
+        continuing, the way ``_getTableSchema`` warns and returns None for a
+        single table, was the other option; it is rejected here because the LLM
+        path cannot tell a table that vanished from one that could not be read,
+        and would write queries as if it were gone.
         """
         with self._reflectLock():
             try:
