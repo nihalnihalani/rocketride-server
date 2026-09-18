@@ -77,6 +77,14 @@ DEFAULT_MAX_EXECUTE_ROWS = 25000
 #   * ClickHouse appends a symbolised server stack trace ("Stack trace:\n\n0.
 #     DB::Exception::Exception(...) @ 0x...") the caller cannot act on, and
 #     quotes the failing statement fragment after "failed at position N".
+#   * ClickHouse also splices the WHOLE statement into the middle of a
+#     sentence rather than after it. Code 47 (UNKNOWN_IDENTIFIER) reads
+#     "Missing columns: 'x' while processing query: '<sql>', required columns:
+#     'x'" on the old parser and "Unknown expression identifier 'x' in scope
+#     <sql>" on the analyzer. This is the dialect where that echo matters
+#     most: clickhouse-driver sends no server-side parameters by default, so
+#     it interpolates binds client-side and the repeated statement carries the
+#     caller's literal, not a placeholder.
 #
 # The primary message alone -- "no such column: foo", "duplicate key value
 # violates unique constraint users_email_key" -- is what a caller needs in
@@ -96,6 +104,11 @@ DEFAULT_MAX_EXECUTE_ROWS = 25000
 #     deliberately: `^` also matches at position 0, which would make a message
 #     whose first token is one of the five all-detail and degrade it to the
 #     fallback constant.
+#
+# `in scope ` carries a lookahead for the same reason: ClickHouse formats the
+# echoed query back out of its AST, so the phrase is followed by an uppercase
+# statement keyword there, while in prose ("not in scope for this trigger") it
+# is not. The other two ClickHouse phrases are distinctive enough on their own.
 _DB_ERROR_DETAIL = re.compile(
     r"""(?:
         \s*(?:
@@ -107,6 +120,9 @@ _DB_ERROR_DETAIL = re.compile(
             | LINE\ \d+:
             | Stack\ trace:
             | failed\ at\ position
+            | while\ processing\ query:
+            | ,\ required\ columns:
+            | in\ scope\ (?=(?:SELECT|INSERT|WITH|CREATE|ALTER|DROP|DELETE|UPDATE|EXPLAIN)\b)
         )
       | \n[ \t]*(?:
               DETAIL:
@@ -207,11 +223,18 @@ class DatabaseGlobalBase(IGlobalBase, ABC):
     # ------------------------------------------------------------------
 
     def _format_db_error(self, exc: Exception) -> str:
-        """Return the driver's own message, never the statement or its parameters.
+        """Return the driver's own message, cut at the first statement echo.
 
         This string is user-facing: ``_executeRawQuery`` re-raises it as a
         ``RuntimeError`` that reaches the ``execute`` tool caller, so it must
         say what went wrong without echoing back what was run.
+
+        Read "never the statement or its parameters" as "never the statement
+        the caller sent, nor a value they bound, as a repeated block" -- the
+        exact promise is spelled out under REMOVED / PASSED THROUGH below,
+        because a driver's own primary sentence can still quote the token it
+        stopped on, and overclaiming here is how the ClickHouse leak dylan
+        found in review 5215826786 stayed invisible.
 
         ``str(exc)`` is the wrong answer for a SQLAlchemy ``StatementError``:
         its repr appends ``[SQL: ...]`` and ``[parameters: ...]``, which is
@@ -224,8 +247,13 @@ class DatabaseGlobalBase(IGlobalBase, ABC):
           on ``.code`` and the text on ``.message``, so those attributes are
           read directly -> ``Error <code>: <message>``. The message itself
           carries the server stack trace and, for a syntax error, the
-          statement fragment after ``failed at position``; both are cut by the
-          stripper's markers like any other tail. Note the two layers differ:
+          statement fragment after ``failed at position``; for an unknown
+          identifier it repeats the whole statement mid-sentence, after
+          ``while processing query:`` or ``in scope``. All of those are cut by
+          the stripper's markers. That last pair is not cosmetic: the driver
+          sends no server-side parameters by default, so the statement it
+          echoes back has the caller's bind values already interpolated into
+          it. Note the two layers differ:
           ``clickhouse_driver.dbapi`` raises ``OperationalError(ServerException)``,
           while ``clickhouse+native://`` -- what the db_clickhouse node uses --
           is clickhouse-sqlalchemy's connector and raises its own
@@ -242,7 +270,10 @@ class DatabaseGlobalBase(IGlobalBase, ABC):
         * sqlite3 (and anything else) puts the bare message in ``.orig.args[0]``.
 
         Every branch runs through ``_strip_statement_detail`` as a backstop,
-        so a driver shape not enumerated here still cannot leak the tail.
+        so a driver shape not enumerated here still cannot leak the tail --
+        every branch except the ``diag.message_primary`` one above, which the
+        server has already separated from its context blocks and which
+        therefore has no tail for the stripper to find.
 
         What this does and does not promise, stated exactly, because the
         difference matters and is easy to overclaim:
@@ -252,8 +283,10 @@ class DatabaseGlobalBase(IGlobalBase, ABC):
           psycopg2's ``LINE n:`` echo, PostgreSQL's DETAIL / HINT / CONTEXT /
           QUERY / STATEMENT *as lines of the message* (the five words are
           left alone in the middle of a sentence, where they belong to the
-          application, not to the server), ClickHouse's server stack trace
-          and its ``failed at position`` echo.
+          application, not to the server), ClickHouse's server stack trace,
+          its ``failed at position`` echo, and the statement it repeats after
+          ``while processing query:`` / ``in scope`` together with the
+          ``, required columns:`` list that follows.
         * PASSED THROUGH: the driver's own primary sentence, as the database
           wrote it. It can quote the fragment of the statement the parser
           stopped on (sqlite3 ``near "'hunter2'": syntax error``, MySQL 1064

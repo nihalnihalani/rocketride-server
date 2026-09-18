@@ -398,6 +398,106 @@ def test_format_db_error_clickhouse_native_connector_trims_the_message_tail(base
     assert 'Stack trace' not in message
 
 
+# ---------------------------------------------------------------------------
+# _format_db_error — ClickHouse echoes the statement INSIDE its message
+#
+# The other drivers append their statement echo after the primary sentence;
+# ClickHouse splices it into the middle of one. Code 47 (UNKNOWN_IDENTIFIER)
+# reads "Missing columns: 'x' while processing query: '<sql>', required
+# columns: 'x'" on the old parser and "Unknown expression identifier 'x' in
+# scope <sql>" on the analyzer, so without markers for those three phrases the
+# whole statement survived the strip.
+#
+# No live ClickHouse server is available in this suite — neither
+# clickhouse-driver nor clickhouse-sqlalchemy is installed — so both connector
+# shapes below are constructed from the message forms the server documents,
+# the same way the PostgreSQL and MySQL cases above are. This is the dialect
+# where the echo matters most: clickhouse-driver interpolates bind values
+# client-side (it sends no server-side parameters by default), so the echoed
+# statement carries the literal a caller bound rather than a placeholder.
+# ---------------------------------------------------------------------------
+
+
+def test_format_db_error_clickhouse_dbapi_cuts_the_while_processing_query_echo(base):
+    """Code 47 through ``clickhouse_driver.dbapi``: the inlined literal must not survive.
+
+    Constructed shape; driver not installed. ``str(orig)`` is the only thing
+    this layer offers (``args`` holds an exception object, not an
+    ``(int, str)`` pair), and the query ClickHouse repeats has ``hunter2``
+    already interpolated into it by the client, so the marker has to fire
+    mid-sentence — the identifier list before it is the part the caller needs.
+    """
+    orig = _FakeDriverError(
+        _FakeServerException(
+            47,
+            "Missing columns: 'secret'",
+            trailer=(
+                " while processing query: 'SELECT secret FROM users "
+                "WHERE token = ''hunter2''', required columns: 'secret'"
+            ),
+        )
+    )
+    exc = _wrapped(orig, 'SELECT secret FROM users WHERE token = %(token)s', {'token': 'hunter2'})
+
+    message = base._format_db_error(exc)
+    assert message == "Code: 47.\nDB::Exception: Missing columns: 'secret'"
+    assert 'hunter2' not in message
+    assert 'while processing query' not in message
+    assert 'required columns' not in message
+    assert 'Stack trace' not in message
+
+
+def test_format_db_error_clickhouse_native_connector_cuts_the_in_scope_echo(base):
+    """The analyzer's ``in scope <sql>`` form, on the connector db_clickhouse uses.
+
+    Constructed shape; clickhouse-sqlalchemy is not installed. ClickHouse's
+    analyzer prints the resolved query back after "in scope" instead of after
+    "while processing query:", and formats it from the AST — which is why the
+    marker below requires an uppercase statement keyword after the phrase.
+    """
+    orig = _StandInClickHouseServerException(
+        47,
+        "Unknown expression identifier 'secret' in scope SELECT secret FROM users WHERE token = 'hunter2'",
+    )
+    exc = _StandInClickHouseDatabaseException(orig)
+
+    message = base._format_db_error(exc)
+    assert message == "Error 47: Unknown expression identifier 'secret'"
+    assert 'hunter2' not in message
+    assert 'in scope' not in message
+
+
+def test_format_db_error_clickhouse_cuts_a_lone_required_columns_tail(base):
+    """``, required columns:`` is a marker in its own right, not only a suffix.
+
+    Constructed shape. In the code-47 message the two echoes travel together,
+    so cutting at "while processing query:" already removes this tail; the
+    marker is carried separately so a shape that lists the required columns
+    without repeating the query does not leak the list either.
+    """
+    orig = _StandInClickHouseServerException(
+        47,
+        "Not found column secret in block, required columns: 'secret', 'token'",
+    )
+    exc = _StandInClickHouseDatabaseException(orig)
+
+    assert base._format_db_error(exc) == 'Error 47: Not found column secret in block'
+
+
+def test_format_db_error_keeps_the_words_in_scope_inside_an_application_message(base):
+    """The prose "in scope" is not a ClickHouse echo and must not truncate.
+
+    Constructed psycopg2 shape; no live PostgreSQL here. The phrase only marks
+    a statement echo when ClickHouse's AST formatter follows it with an
+    uppercase statement keyword, so the marker is written to require one — the
+    same lesson the DETAIL/HINT anchoring above came from.
+    """
+    orig = _FakeDriverError('temp table is not in scope for this trigger')
+    exc = _wrapped(orig, 'CALL audit()', {})
+
+    assert base._format_db_error(exc) == 'temp table is not in scope for this trigger'
+
+
 def test_format_db_error_mysql_keeps_a_quoted_identifier_intact(base):
     """Why quoted tokens are not redacted wholesale.
 
