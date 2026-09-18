@@ -244,6 +244,12 @@ def diff_pipes(old: dict, new: dict, *, include_layout: bool = False) -> PipeDif
     ``include_layout`` is set, enumerated as ``ui.*`` field changes per node plus
     ``viewport.*`` changes on the diff itself.
 
+    Exactly three top-level keys are read -- ``components``, ``version``, and
+    ``viewport``. Every other top-level key a ``.pipe`` carries (``project_id``,
+    ``isLocked``, and anything a later schema adds) is ignored, because it is
+    editor/session metadata rather than pipeline behaviour; pinned by
+    ``test_unknown_top_level_keys_are_ignored``.
+
     Args:
         old: The previous pipeline (already loaded/validated via ``load_pipe``).
         new: The new pipeline (already loaded/validated via ``load_pipe``).

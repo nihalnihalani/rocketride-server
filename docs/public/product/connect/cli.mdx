@@ -246,6 +246,10 @@ is set); `1` — semantic changes were found; `2` — usage error, or an unreada
   a semantic change, so `diff` exits `0` on it. Pass `--include-layout` to
   enumerate the individual `ui.*` coordinates and `viewport.*` fields; with the
   flag they count as changes, so a canvas-only edit exits `1`.
+- **Everything else at the top level is ignored.** `diff` reads exactly
+  `components`, `version` and `viewport`; `project_id`, `isLocked`, and any key a
+  later schema adds are editor/session metadata, so editing one never reports a
+  change.
 
 #### Output modes
 

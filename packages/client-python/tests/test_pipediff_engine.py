@@ -332,6 +332,55 @@ def test_equal_int_version_is_still_not_a_change():
 
 
 # ---------------------------------------------------------------------------
+# Top-level key contract
+# ---------------------------------------------------------------------------
+
+
+def test_unknown_top_level_keys_are_ignored():
+    # `diff_pipes` reads exactly three top-level keys: `components`, `version`,
+    # and `viewport`. Everything else a .pipe carries -- `project_id`,
+    # `isLocked`, and any key a future schema adds -- is deliberately ignored,
+    # because none of it changes what the pipeline does. Pinned here so the set
+    # cannot drift silently: widening it would make editor/session metadata gate
+    # a CI run, narrowing it would drop a real change.
+    old = _pipe([_node('a', 'src')], viewport={'x': 0, 'y': 0, 'zoom': 1})
+    new = copy.deepcopy(old)
+    new['project_id'] = 'a-different-project'
+    new['isLocked'] = not old.get('isLocked', False)
+    new['name'] = 'renamed in the editor'
+    new['someFutureKey'] = {'nested': [1, 2, 3]}
+
+    for include_layout in (False, True):
+        diff = diff_pipes(old, new, include_layout=include_layout)
+        assert diff.node_changes == []
+        assert diff.edge_changes == []
+        assert diff.version_change is None
+        assert diff.viewport_changes == []
+        assert diff.layout_changed is False
+        assert diff.has_semantic_changes is False
+
+
+def test_version_is_compared_but_viewport_only_under_include_layout():
+    # The other half of the same contract: of the three keys that are read,
+    # `version` always counts, while `viewport` is enumerated and counted only
+    # when the caller opts layout in.
+    old = _pipe([_node('a', 'src')], version=1, viewport={'x': 0, 'y': 0, 'zoom': 1})
+
+    version_edit = copy.deepcopy(old)
+    version_edit['version'] = 2
+    assert diff_pipes(old, version_edit).version_change == (1, 2)
+    assert diff_pipes(old, version_edit).has_semantic_changes is True
+
+    viewport_edit = copy.deepcopy(old)
+    viewport_edit['viewport'] = {'x': 99, 'y': 0, 'zoom': 1}
+    assert diff_pipes(old, viewport_edit).has_semantic_changes is False
+    assert diff_pipes(old, viewport_edit).viewport_changes == []
+    with_layout = diff_pipes(old, viewport_edit, include_layout=True)
+    assert [fc.path for fc in with_layout.viewport_changes] == ['viewport.x']
+    assert with_layout.has_semantic_changes is True
+
+
+# ---------------------------------------------------------------------------
 # Layout
 # ---------------------------------------------------------------------------
 

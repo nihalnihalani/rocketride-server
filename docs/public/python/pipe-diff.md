@@ -125,6 +125,10 @@ difference is deliberate: `diff` produces a report, not a command result.
   default and summarized as a single `Layout: changed` line, so a pure canvas move
   exits `0`. `--include-layout` enumerates the individual `ui.*` and `viewport.*`
   fields and makes them count, so a canvas-only edit then exits `1`.
+- **Everything else at the top level is ignored.** `diff` reads exactly
+  `components`, `version` and `viewport`; `project_id`, `isLocked`, and any key a
+  later schema adds are editor/session metadata rather than pipeline behavior, so
+  editing one never reports a change (even under `--include-layout`).
 
 ## Output modes
 
