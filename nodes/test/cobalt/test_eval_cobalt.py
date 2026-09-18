@@ -429,6 +429,9 @@ class TestSemanticEvaluation:
         needs ``field=`` (cobalt/evaluators/similarity.py:32 does an unguarded
         ``config['field']``), ``evaluate`` takes one positional ``EvalContext``
         rather than ``output=``/``expected=`` keywords, and it is a coroutine.
+
+        A fourth is load-bearing for the verdict rather than for the call: the
+        constructor is given threshold 1.0 so cobalt hands back the raw cosine.
         """
         mock_evaluator_instance = MagicMock()
         mock_evaluator_instance.evaluate = _async_evaluate(
@@ -443,7 +446,11 @@ class TestSemanticEvaluation:
             evaluator = CobaltEvaluator({'threshold': 0.5}, {})
             result = evaluator.evaluate_semantic('Paris is capital of France', 'The capital of France is Paris')
 
-        mock_cls.assert_called_once_with(name='semantic-similarity', type='similarity', field='expected', threshold=0.5)
+        # threshold=1.0, not the node's 0.5: cobalt divides its score by whatever
+        # threshold it is handed (cobalt/evaluators/similarity.py:53), so 1.0 is
+        # what makes the returned score the raw cosine. The node's own threshold
+        # decides pass/fail once, in _make_result.
+        mock_cls.assert_called_once_with(name='semantic-similarity', type='similarity', field='expected', threshold=1.0)
         assert mock_evaluator_instance.evaluate.call_count == 1
         args, kwargs = mock_evaluator_instance.evaluate.call_args
         assert kwargs == {}

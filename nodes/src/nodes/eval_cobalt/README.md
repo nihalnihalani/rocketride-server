@@ -83,10 +83,12 @@ The score answer carries a deep copy of the incoming answer's `metadata` (for ex
 
 | Key | Type | Description |
 |---|---|---|
-| `cobalt_score` | number | Evaluation score, 0.0–1.0 |
-| `cobalt_passed` | boolean | `true` when `score >= threshold` |
+| `cobalt_score` | number | Evaluation score, 0.0–1.0. For `similarity` with cobalt installed it is the raw TF-IDF cosine |
+| `cobalt_passed` | boolean | `true` when `score >= threshold` — the node's **Pass threshold**, applied once |
 | `cobalt_evaluator` | string | Which evaluator produced the score (`semantic`, `llm_judge`, `custom`, `relevance`, `grounding`, `format`) |
 | `cobalt_reasoning` | string | Human-readable explanation |
+
+For `similarity`, cobalt's scorer divides its own result by whatever threshold it is handed, so the node hands it `1.0` and gets the cosine back — which is why the reason it writes reads `Similarity: <cosine> (threshold: 1.0)`. The `1.0` there is cobalt's internal divisor, not the gate; the gate is the node's **Pass threshold** and it is applied once, to that cosine. Passing the node's threshold on both sides applied it twice and reported every cosine in `[threshold², threshold)` as a pass — a cosine of 0.2606 passed at a threshold of 0.5.
 
 ### Dependency
 

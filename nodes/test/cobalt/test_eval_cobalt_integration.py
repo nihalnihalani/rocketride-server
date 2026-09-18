@@ -218,6 +218,27 @@ def test_similarity_real_library_disagrees_with_the_fallback():
 
 
 @_requires_cobalt
+def test_similarity_below_the_threshold_fails_on_the_raw_cosine():
+    """A cosine under the threshold must fail, and the score must be that cosine.
+
+    cobalt's similarity handler returns ``1.0 if sim >= t else sim / t``
+    (cobalt/evaluators/similarity.py:53) — a threshold-normalised value, not the
+    cosine. Handing it this node's threshold and then comparing what came back
+    with the same threshold again applied it twice, so every cosine in
+    ``[t**2, t)`` was reported as a pass: this pair's cosine is 0.2606 and it
+    passed at a threshold of 0.5 with a score of 0.5211. The node now asks cobalt
+    for the raw cosine (threshold 1.0) and applies its own threshold once.
+    """
+    evaluator = CobaltEvaluator({'eval_type': 'similarity', 'threshold': 0.5}, {})
+    result = evaluator.evaluate_semantic('the quick brown fox', 'a fast brown fox jumps over it')
+
+    # The cosine is in cobalt's own reason either way; the score is what moved.
+    assert result['reasoning'].startswith('Similarity: 0.2606')
+    assert abs(result['score'] - 0.2606) < 1e-4
+    assert result['passed'] is False
+
+
+@_requires_cobalt
 @pytest.mark.skipif(not os.getenv('OPENAI_API_KEY'), reason='requires OPENAI_API_KEY for llm_judge integration')
 def test_llm_judge_real_library_path():
     """Drive llm_judge evaluation through the real library + real API.

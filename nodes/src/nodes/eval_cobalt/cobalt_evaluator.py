@@ -60,6 +60,13 @@ _COBALT_LLM_JUDGE_TYPE = 'llm-judge'
 # **context.item, so the same key is what {{expected}} resolves to.
 _EXPECTED_FIELD = 'expected'
 
+# The threshold handed to cobalt's similarity handler, which returns
+# ``1.0 if sim >= threshold else sim / threshold`` (cobalt/evaluators/similarity.py:53)
+# — a threshold-normalised value, not the cosine. At 1.0 the second branch is
+# ``sim / 1.0``, so the score that comes back is the raw TF-IDF cosine and this
+# node applies its own threshold exactly once, in ``_make_result``.
+_COBALT_RAW_COSINE_THRESHOLD = 1.0
+
 
 def _run_sync(coro: Any) -> Any:
     """Run a coroutine from synchronous node code.
@@ -188,11 +195,19 @@ class CobaltEvaluator:
             # cobalt's similarity handler requires config['field'] and reads the
             # reference from context.item[field] (cobalt/evaluators/similarity.py:32-36);
             # omitting it raises KeyError('field').
+            #
+            # The threshold is deliberately NOT this node's: cobalt normalises its
+            # score by whatever threshold it is given, so passing the node's
+            # threshold here and comparing the result with the same threshold in
+            # _make_result applied it twice and passed every cosine in
+            # [threshold**2, threshold) — a cosine of 0.2606 passed at 0.5.
+            # _COBALT_RAW_COSINE_THRESHOLD keeps cobalt's score equal to the
+            # cosine; the verdict is the node's, taken once, below.
             evaluator = Evaluator(
                 name='semantic-similarity',
                 type=_COBALT_SIMILARITY_TYPE,
                 field=_EXPECTED_FIELD,
-                threshold=threshold,
+                threshold=_COBALT_RAW_COSINE_THRESHOLD,
             )
             context = EvalContext(item={_EXPECTED_FIELD: expected}, output=output)
             result = _run_sync(evaluator.evaluate(context))
