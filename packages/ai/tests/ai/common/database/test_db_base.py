@@ -467,6 +467,29 @@ def test_format_db_error_clickhouse_native_connector_cuts_the_in_scope_echo(base
     assert 'in scope' not in message
 
 
+def test_format_db_error_clickhouse_cuts_a_parenthesised_subquery_scope(base):
+    """A scope that is itself a subquery is echoed in parentheses; it must still be cut.
+
+    Constructed shape; clickhouse-sqlalchemy is not installed and no live
+    ClickHouse server is available in this suite. ClickHouse's analyzer
+    formats a scope that is a subquery or a CTE body through ``ASTSubquery``,
+    which parenthesises it, so the echo reads ``in scope (SELECT ...)``
+    instead of ``in scope SELECT ...``. The client has already inlined the
+    caller's bind value into it either way, which is what the lookahead's
+    optional ``(`` is there to catch.
+    """
+    orig = _StandInClickHouseServerException(
+        47,
+        "Unknown expression identifier 'token' in scope (SELECT token FROM users WHERE token = 'hunter2') AS filtered",
+    )
+    exc = _StandInClickHouseDatabaseException(orig)
+
+    message = base._format_db_error(exc)
+    assert message == "Error 47: Unknown expression identifier 'token'"
+    assert 'hunter2' not in message
+    assert 'in scope' not in message
+
+
 def test_format_db_error_clickhouse_cuts_a_lone_required_columns_tail(base):
     """``, required columns:`` is a marker in its own right, not only a suffix.
 

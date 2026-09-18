@@ -109,7 +109,12 @@ DEFAULT_MAX_EXECUTE_ROWS = 25000
 # `in scope ` carries a lookahead for the same reason: ClickHouse formats the
 # echoed query back out of its AST, so the phrase is followed by an uppercase
 # statement keyword there, while in prose ("not in scope for this trigger") it
-# is not. The other two ClickHouse phrases are distinctive enough on their own.
+# is not. The optional `\(` in front of the keyword is not cosmetic: a scope
+# that is itself a subquery or a CTE body is formatted through `ASTSubquery`,
+# which parenthesises it, so the analyzer prints `in scope (SELECT ...)` --
+# the same echo, one character further along, and it carries the caller's
+# inlined bind values just as the bare form does. The other two ClickHouse
+# phrases are distinctive enough on their own.
 _DB_ERROR_DETAIL = re.compile(
     r"""(?:
         \s*(?:
@@ -123,7 +128,7 @@ _DB_ERROR_DETAIL = re.compile(
             | failed\ at\ position
             | while\ processing\ query:
             | ,\ required\ columns:
-            | in\ scope\ (?=(?:SELECT|INSERT|WITH|CREATE|ALTER|DROP|DELETE|UPDATE|EXPLAIN)\b)
+            | in\ scope\ (?=\(?(?:SELECT|INSERT|WITH|CREATE|ALTER|DROP|DELETE|UPDATE|EXPLAIN)\b)
         )
       | \n[ \t]*(?:
               DETAIL:
@@ -270,7 +275,8 @@ class DatabaseGlobalBase(IGlobalBase, ABC):
           carries the server stack trace and, for a syntax error, the
           statement fragment after ``failed at position``; for an unknown
           identifier it repeats the whole statement mid-sentence, after
-          ``while processing query:`` or ``in scope``. All of those are cut by
+          ``while processing query:`` or ``in scope`` (bare, or parenthesised
+          when the scope is a subquery or a CTE body). All of those are cut by
           the stripper's markers. That last pair is not cosmetic: the driver
           sends no server-side parameters by default, so the statement it
           echoes back has the caller's bind values already interpolated into
