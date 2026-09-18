@@ -54,8 +54,9 @@ class IInstance(IInstanceBase):
     prevented it (``__checkCallParent``, ``engLib/python/call.hpp``), so
     without the suppression the original answer arrived downstream a second
     time and the node emitted THREE answers per input, not two. A live run of
-    ``examples/cobalt-evaluation.pipe`` with three dataset rows put 18 answers
-    into the sink instead of 6 for exactly that reason.
+    ``examples/cobalt-evaluation.pipe`` put 18 answers into the sink for the
+    six answers that reached this node, where the two-per-input contract allows
+    12; with the suppression in place the same run delivers 12.
     """
 
     IGlobal: IGlobal
