@@ -796,12 +796,15 @@ class TestIInstanceEmitsQuestions:
         assert emitted[0].questions == ['0']
 
     @pytest.mark.parametrize('text', ['', None])
-    def test_empty_text_clears_template_prompt(self, text):
+    def test_empty_text_never_inherits_the_template_prompt(self, text):
         """An item with no text must not inherit the template's prompt.
 
         Regression for the review finding that `''` left `q.questions`
         untouched, so the emitted question carried the incoming template
-        prompt instead of the dataset's (empty) prompt.
+        prompt instead of the dataset's (empty) prompt. The row is now
+        skipped outright (see TestTextLessRowsAreSkipped), which satisfies
+        that invariant more strongly: nothing carrying the template prompt
+        is emitted at all.
         """
         questions = [
             {'text': text, 'metadata': {'expected': 'ref', 'dataset_id': '1', 'cobalt_source': True}},
@@ -812,11 +815,10 @@ class TestIInstanceEmitsQuestions:
 
         template = sys.modules['ai.common.schema'].Question()
         template.addQuestion('template prompt')
-        inst.writeQuestions(template)
+        with patch('dataset_cobalt.IInstance.warning'):
+            inst.writeQuestions(template)
 
-        assert len(emitted) == 1
-        assert emitted[0].questions == []
-        assert emitted[0].metadata['expected'] == 'ref'
+        assert emitted == []
 
 
 class TestDeepCopyPreventsMutation:
@@ -1642,3 +1644,137 @@ class TestDatasetIdIsAlwaysAddressable:
         import datetime
 
         assert row_identity({'input': 'q', 'when': datetime.date(2026, 9, 14)}).startswith('sha256-')
+
+
+class TestTextLessRowsAreSkipped:
+    """A row carrying no prompt must not become a scored evaluation result.
+
+    ``to_questions`` falls back to ``''`` when a row has none of
+    ``input``/``text``/``question`` (a typo'd key, a renamed CSV column), so
+    ``{'expected': 'Paris'}`` used to be emitted as a question with no prompt
+    at all. Downstream the LLM answered an empty prompt and eval_cobalt scored
+    the reply against the reference, recording a low score indistinguishable
+    from a weak model. Both lanes - filter mode (``IInstance.writeQuestions``)
+    and source mode (``IEndpoint.scanObjects`` /
+    ``IInstance.renderObject``) - now skip such a row and say so once.
+    """
+
+    @staticmethod
+    def _instance(questions):
+        inst = IInstance()
+        inst.IGlobal = MagicMock()
+        inst.IGlobal._questions = questions
+        inst.instance = MagicMock()
+        return inst
+
+    @staticmethod
+    def _endpoint(config):
+        endpoint = IEndpoint()
+        endpoint.endpoint = MagicMock()
+        endpoint.endpoint.logicalType = 'dataset_cobalt'
+        endpoint.endpoint.serviceConfig = config
+        endpoint.endpoint.bag = {}
+        return endpoint
+
+    def test_the_reported_row_yields_no_question_dict_text(self):
+        """The reviewer's row reaches both lanes as text ''."""
+        loader = _make_loader()
+        questions = loader.to_questions([{'expected': 'Paris'}])
+        assert questions[0]['text'] == ''
+        assert questions[0]['metadata']['expected'] == 'Paris'
+
+    def test_filter_mode_skips_the_text_less_row(self):
+        loader = _make_loader()
+        questions = loader.to_questions([{'expected': 'Paris'}, {'input': 'q2', 'expected': 'a2'}])
+        inst = self._instance(questions)
+        emitted = []
+        inst.instance.writeQuestions.side_effect = lambda q: emitted.append(q)
+
+        template = sys.modules['ai.common.schema'].Question()
+        with patch('dataset_cobalt.IInstance.warning') as mock_warning:
+            inst.writeQuestions(template)
+
+        assert [q.questions for q in emitted] == [['q2']]
+        assert mock_warning.call_count == 1
+        assert 'skipped 1 row(s) with no input text' in str(mock_warning.call_args)
+
+    def test_filter_mode_keeps_a_falsey_but_present_text(self):
+        """'0' is a legitimate prompt; only an absent/empty one is skipped."""
+        questions = [
+            {'text': 0, 'metadata': {'expected': 'zero'}},
+            {'text': '0', 'metadata': {'expected': 'zero'}},
+        ]
+        inst = self._instance(questions)
+        emitted = []
+        inst.instance.writeQuestions.side_effect = lambda q: emitted.append(q)
+
+        template = sys.modules['ai.common.schema'].Question()
+        with patch('dataset_cobalt.IInstance.warning') as mock_warning:
+            inst.writeQuestions(template)
+
+        assert [q.questions for q in emitted] == [['0'], ['0']]
+        assert mock_warning.call_count == 0
+
+    def test_filter_mode_warns_once_for_many_skipped_rows(self):
+        questions = [{'text': '', 'metadata': {'expected': str(i)}} for i in range(3)]
+        inst = self._instance(questions)
+
+        template = sys.modules['ai.common.schema'].Question()
+        with patch('dataset_cobalt.IInstance.warning') as mock_warning:
+            inst.writeQuestions(template)
+
+        assert inst.instance.writeQuestions.call_count == 0
+        assert mock_warning.call_count == 1
+        assert 'skipped 3 row(s) with no input text' in str(mock_warning.call_args)
+
+    def test_source_mode_scan_skips_the_text_less_row(self):
+        endpoint = self._endpoint(
+            {
+                'source_type': 'inline',
+                'items': [{'expected': 'Paris'}, {'input': 'q2', 'expected': 'a2'}],
+                'sample_size': 0,
+            }
+        )
+        entries = []
+
+        with patch('dataset_cobalt.IEndpoint.warning') as mock_warning:
+            endpoint.scanObjects('', lambda entry: entries.append(entry) or 0)
+
+        assert [e['objectTags']['text'] for e in entries] == ['q2']
+        assert mock_warning.call_count == 1
+        assert 'skipped 1 row(s) with no input text' in str(mock_warning.call_args)
+
+    def test_source_mode_keeps_a_falsey_but_present_text(self):
+        endpoint = self._endpoint(
+            {
+                'source_type': 'inline',
+                'items': [{'input': 0, 'expected': 'zero'}],
+                'sample_size': 0,
+            }
+        )
+        entries = []
+
+        with patch('dataset_cobalt.IEndpoint.warning') as mock_warning:
+            endpoint.scanObjects('', lambda entry: entries.append(entry) or 0)
+
+        assert [e['objectTags']['text'] for e in entries] == ['0']
+        assert mock_warning.call_count == 0
+
+    def test_render_object_does_not_send_a_text_less_entry(self):
+        inst = IInstance()
+        inst.instance = MagicMock()
+        entry = MagicMock()
+        entry.objectTags = {'text': '', 'metadata': {'expected': 'Paris'}}
+
+        with patch('dataset_cobalt.IInstance.warning'), pytest.raises(Exception, match='No default to prevent'):
+            inst.renderObject(entry)
+
+        assert inst.instance.sendQuestions.call_count == 0
+
+    def test_question_from_item_returns_none_for_a_text_less_row(self):
+        from dataset_cobalt.common import question_from_item
+
+        assert question_from_item({'metadata': {'expected': 'Paris'}}) is None
+        assert question_from_item({'text': '', 'metadata': {}}) is None
+        assert question_from_item({'text': None, 'metadata': {}}) is None
+        assert question_from_item({'text': 0, 'metadata': {}}).questions == ['0']

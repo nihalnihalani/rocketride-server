@@ -30,6 +30,8 @@ from urllib.parse import quote
 from ai.common.config import Config
 from rocketlib import IEndpointBase, debug, monitorCompleted, monitorStatus, warning
 
+from .common import question_text, skipped_rows_warning
+
 
 class IEndpoint(IEndpointBase):
     """Source endpoint for emitting Cobalt dataset rows into a pipeline."""
@@ -66,6 +68,13 @@ class IEndpoint(IEndpointBase):
     def _load_questions(self) -> List[Dict[str, Any]]:
         """Return the prepared questions, or raise if the dataset cannot be read.
 
+        Rows carrying no prompt text are dropped here rather than emitted as
+        scan entries: filter mode applies the same rule in
+        ``IInstance.writeQuestions``, and a promptless question downstream
+        becomes a real-looking - but meaningless - evaluation score. Dropping
+        them here also keeps the monitor count and the emitted entry count in
+        step.
+
         Returns:
             The prepared question dicts. An empty list means the dataset was
             read successfully and holds no rows.
@@ -88,8 +97,12 @@ class IEndpoint(IEndpointBase):
             items = loader.load()
             dataset = loader.apply_transforms(items, config)
             questions = loader.to_questions(dataset)
-            debug(f'Cobalt Dataset Endpoint: Prepared {len(questions)} questions')
-            return questions
+            emittable = [item for item in questions if question_text(item) is not None]
+            skipped = len(questions) - len(emittable)
+            if skipped:
+                warning(f'Cobalt Dataset Endpoint: {skipped_rows_warning(skipped)}')
+            debug(f'Cobalt Dataset Endpoint: Prepared {len(emittable)} questions')
+            return emittable
         except ImportError as exc:
             warning(f'Cobalt Dataset Endpoint: Failed to import cobalt library: {exc!s}')
             raise DatasetLoadError(

@@ -24,10 +24,10 @@
 import contextlib
 import copy
 
-from rocketlib import Entry, IInstanceBase, debug
+from rocketlib import Entry, IInstanceBase, debug, warning
 from ai.common.utils import merge_metadata
 
-from .common import question_from_item
+from .common import question_from_item, question_text, skipped_rows_warning
 from .IGlobal import IGlobal
 
 
@@ -48,6 +48,13 @@ class IInstance(IInstanceBase):
         input text, and metadata is enriched with expected output, dataset ID,
         and cobalt source flag. Each question is then written downstream.
 
+        A row carrying no prompt text is skipped rather than emitted. Emitting
+        it produced a question with no prompt at all but a populated
+        ``metadata['expected']``, so downstream the LLM answered an empty
+        prompt and eval_cobalt scored that reply against the reference - a low
+        score indistinguishable from a weak model. The skipped rows are
+        reported once, after the loop.
+
         Args:
             question: Incoming Question object used as a template.
         """
@@ -58,22 +65,23 @@ class IInstance(IInstanceBase):
 
         debug(f'Cobalt Dataset Instance: Emitting {len(questions)} questions from dataset')
 
+        skipped = 0
         for item in questions:
-            # Deep copy prevents mutation between emitted questions
-            q = copy.deepcopy(question)
-
             # Set the question text from the dataset item, replacing any
             # prompt carried by the incoming template so emitted items
             # contain only the dataset's prompt.
-            if 'text' in item:
-                text = item['text']
-            else:
-                text = ''
+            text = question_text(item)
+            if text is None:
+                skipped += 1
+                continue
+
+            # Deep copy prevents mutation between emitted questions
+            q = copy.deepcopy(question)
+
             if hasattr(q, 'questions'):
                 with contextlib.suppress(ValueError, AttributeError):
                     q.questions = []
-            if text is not None and text != '':
-                q.addQuestion(str(text))
+            q.addQuestion(text)
 
             # Attach metadata to the question without injecting expected
             # answers into the prompt context (which the LLM would see).
@@ -81,7 +89,10 @@ class IInstance(IInstanceBase):
 
             self.instance.writeQuestions(q)
 
-        debug(f'Cobalt Dataset Instance: Finished emitting {len(questions)} questions')
+        if skipped:
+            warning(f'Cobalt Dataset Instance: {skipped_rows_warning(skipped)}')
+
+        debug(f'Cobalt Dataset Instance: Finished emitting {len(questions) - skipped} questions')
 
     def renderObject(self, object: Entry):
         """Render a dataset scan entry as a Question from source mode."""
@@ -94,5 +105,13 @@ class IInstance(IInstanceBase):
             'text': tags.get('text', ''),
             'metadata': tags.get('metadata', {}) or {},
         }
-        self.instance.sendQuestions(question_from_item(item))
+        # Same rule as filter mode: a row with no prompt is dropped, not sent
+        # on as a promptless question. scanObjects already filters these out,
+        # so this covers an entry that reached the instance by another route.
+        emitted = question_from_item(item)
+        if emitted is None:
+            warning(f'Cobalt Dataset Instance: {skipped_rows_warning(1)}')
+            return self.preventDefault()
+
+        self.instance.sendQuestions(emitted)
         return self.preventDefault()
