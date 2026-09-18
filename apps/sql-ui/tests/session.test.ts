@@ -211,9 +211,25 @@ describe('refreshSchema fallback', () => {
 			const schema = await createSqlSession(fake.client, ENDPOINT).refreshSchema();
 			assert.equal(schema.stale, true);
 			assert.equal(schema.database, 'shop');
-			// refresh_schema is tried twice (the token retry), then get_schema.
-			assert.deepEqual(fake.calls.map((c) => c.tool).at(-1), 'get_schema');
+			// The token came back unchanged, so refresh_schema is NOT retried:
+			// one attempt, then the fallback. Asserting the whole sequence
+			// rather than its last entry is what makes that visible.
+			assert.deepEqual(fake.calls.map((c) => c.tool), ['refresh_schema', 'get_schema']);
 		}
+	});
+
+	it('spends the token retry on refresh_schema before falling back', async () => {
+		// The other half of the sequence: a stale token makes refresh_schema
+		// worth repeating, and only the second failure reaches get_schema — so
+		// a fallback is never taken on a failure the retry would have fixed.
+		const fake = fakeClient(['stale', 'fresh'], (call) => {
+			if (call.tool === 'refresh_schema') throw new Error('tool call failed');
+			return { database: 'shop', tables: {} };
+		});
+		const schema = await createSqlSession(fake.client, ENDPOINT).refreshSchema();
+		assert.equal(schema.stale, true);
+		assert.deepEqual(fake.calls.map((c) => c.tool), ['refresh_schema', 'refresh_schema', 'get_schema']);
+		assert.deepEqual(fake.calls.map((c) => c.token), ['stale', 'fresh', 'fresh']);
 	});
 
 	it('surfaces the fallback failure when get_schema fails too', async () => {
