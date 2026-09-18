@@ -303,7 +303,10 @@ class MockDataset:
         return cls([{'input': 'jsonl-q1', 'expected': 'jsonl-a1'}, {'input': 'jsonl-q2', 'expected': 'jsonl-a2'}])
 
     def filter(self, fn):
-        return MockDataset([item for item in self._items if fn(item)])
+        # cobalt.Dataset.filter calls predicate(item, index) (cobalt/dataset.py:188-189).
+        # A one-argument mock here made a one-argument production lambda look
+        # correct while it dropped every row against the real library.
+        return MockDataset([item for i, item in enumerate(self._items) if fn(item, i)])
 
     def sample(self, n):
         # Deterministic 'sample' for testing: take first n items
@@ -313,7 +316,8 @@ class MockDataset:
         return MockDataset(self._items[start:end])
 
     def map(self, fn):
-        return MockDataset([fn(item) for item in self._items])
+        # cobalt.Dataset.map likewise calls fn(item, index) (cobalt/dataset.py:185-186).
+        return MockDataset([fn(item, i) for i, item in enumerate(self._items)])
 
     def __iter__(self):
         """Iterate over dataset items."""
@@ -605,6 +609,33 @@ class TestFilterTransform:
         loader = _make_loader()
         result = loader.apply_transforms(items, {'filter_field': '', 'filter_value': 'x'})
         assert len(result) == 2
+
+    def test_both_lanes_keep_the_same_rows(self):
+        """The cobalt lane must filter, not empty the dataset.
+
+        cobalt's ``Dataset.filter`` calls ``predicate(item, index)``
+        (cobalt/dataset.py:188-189). The loader passed a one-argument lambda,
+        so the index landed in the slot the field name was bound to, every row
+        compared ``item.get(<int>, '')`` against the value, and the cobalt lane
+        returned nothing while the pure-Python lane returned the matching rows
+        — no exception, no warning. The suite could not see it because
+        ``MockDataset.filter`` also took one argument; it now mirrors the real
+        two-argument contract.
+        """
+        items = [
+            {'input': 'q1', 'category': 'math'},
+            {'input': 'q2', 'category': 'science'},
+            {'input': 'q3', 'category': 'math'},
+        ]
+        config = {'filter_field': 'category', 'filter_value': 'math'}
+        loader = _make_loader()
+
+        with_cobalt = loader.apply_transforms(items, config)
+        with TestLoaderWithoutCobalt._no_cobalt():
+            without_cobalt = loader.apply_transforms(items, config)
+
+        assert [i['input'] for i in with_cobalt] == ['q1', 'q3']
+        assert with_cobalt == without_cobalt
 
 
 class TestSliceTransform:

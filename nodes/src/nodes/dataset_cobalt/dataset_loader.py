@@ -401,7 +401,15 @@ class DatasetLoader:
         filter_value = config.get('filter_value', '')
         if filter_field and filter_value:
             debug(f'Cobalt DatasetLoader: Filtering on {filter_field}={filter_value}')
-            dataset = dataset.filter(lambda x, ff=filter_field, fv=filter_value: str(x.get(ff, '')) == str(fv))
+            # cobalt calls predicate(item, index) (cobalt/dataset.py:188-189).
+            # A one-argument lambda takes the index into its next positional
+            # slot instead of the default-bound field name, so every row is
+            # compared against x.get(<int>, '') and silently dropped, with no
+            # exception and no warning, while the pure-Python lane returns the
+            # matching rows.
+            dataset = dataset.filter(
+                lambda item, _index, ff=filter_field, fv=filter_value: str(item.get(ff, '')) == str(fv)
+            )
 
         # Apply sample if configured, bounded to dataset size
         sample_size = int(config.get('sample_size', 0))
