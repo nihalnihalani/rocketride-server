@@ -1778,3 +1778,112 @@ class TestTextLessRowsAreSkipped:
         assert question_from_item({'text': '', 'metadata': {}}) is None
         assert question_from_item({'text': None, 'metadata': {}}) is None
         assert question_from_item({'text': 0, 'metadata': {}}).questions == ['0']
+
+
+class TestSampleSeedIsReproducible:
+    """`dataset.seed` pins which rows Sample Size picks.
+
+    The fallback lane used the process-global `random.sample`, so the same
+    dataset and the same sample size produced a different subset on every run
+    and disturbed global RNG state other nodes may rely on. A local
+    `random.Random(seed)` fixes both. `random.Random(None)` still seeds from
+    the OS, so a blank seed reproduces the previous behaviour exactly.
+    """
+
+    @staticmethod
+    def _items(n=50):
+        return [{'input': f'q{i}', 'expected': f'a{i}'} for i in range(n)]
+
+    @staticmethod
+    def _no_cobalt():
+        return patch.dict(sys.modules, {'cobalt': None})
+
+    def test_same_seed_gives_the_same_subset(self):
+        loader = _make_loader()
+        config = {'sample_size': 5, 'seed': 1234}
+        with self._no_cobalt():
+            first = loader.apply_transforms(self._items(), config)
+            second = loader.apply_transforms(self._items(), config)
+        assert [i['input'] for i in first] == [i['input'] for i in second]
+        assert len(first) == 5
+
+    def test_a_different_seed_gives_a_different_subset(self):
+        loader = _make_loader()
+        with self._no_cobalt():
+            first = loader.apply_transforms(self._items(), {'sample_size': 5, 'seed': 1})
+            second = loader.apply_transforms(self._items(), {'sample_size': 5, 'seed': 2})
+        assert [i['input'] for i in first] != [i['input'] for i in second]
+
+    @pytest.mark.parametrize(
+        'config', [{'sample_size': 5}, {'sample_size': 5, 'seed': ''}, {'sample_size': 5, 'seed': None}]
+    )
+    def test_a_blank_seed_keeps_todays_behaviour(self, config):
+        loader = _make_loader()
+        with self._no_cobalt():
+            result = loader.apply_transforms(self._items(), config)
+        assert len(result) == 5
+        assert all(item in self._items() for item in result)
+
+    def test_the_global_rng_is_left_alone(self):
+        """A local generator must not consume the process-global stream."""
+        import random as _random
+
+        loader = _make_loader()
+        _random.seed(0)
+        control = [_random.random() for _ in range(3)]
+
+        _random.seed(0)
+        with self._no_cobalt():
+            loader.apply_transforms(self._items(), {'sample_size': 5, 'seed': 99})
+        assert [_random.random() for _ in range(3)] == control
+
+    def test_the_cobalt_lane_honours_the_same_seed(self):
+        """Cobalt's Dataset.sample(n) takes no seed, so the node samples itself."""
+        loader = _make_loader()
+        config = {'sample_size': 5, 'seed': 4321}
+        first = loader.apply_transforms(self._items(), config)
+        second = loader.apply_transforms(self._items(), config)
+        assert [i['input'] for i in first] == [i['input'] for i in second]
+        assert len(first) == 5
+        # MockDataset.sample(n) returns the first n items, so a result that is
+        # not the head of the list proves the node did its own seeded draw
+        # instead of delegating to the (seedless) cobalt Dataset.sample.
+        assert [i['input'] for i in first] != ['q0', 'q1', 'q2', 'q3', 'q4']
+
+    def test_the_two_lanes_agree_on_the_same_seed(self):
+        """Seeded, the cobalt and pure-Python lanes must not diverge."""
+        loader = _make_loader()
+        config = {'sample_size': 5, 'seed': 777}
+        with_cobalt = loader.apply_transforms(self._items(), config)
+        with self._no_cobalt():
+            without_cobalt = loader.apply_transforms(self._items(), config)
+        assert [i['input'] for i in with_cobalt] == [i['input'] for i in without_cobalt]
+
+    def test_an_unparseable_seed_is_reported(self):
+        loader = _make_loader()
+        with self._no_cobalt(), pytest.raises(ValueError):
+            loader.apply_transforms(self._items(), {'sample_size': 5, 'seed': 'not-a-number'})
+
+    def test_seed_is_declared_in_the_schema(self):
+        """The user cannot pin the seed unless the panel offers the field."""
+        import re
+
+        schema_path = _REPO_ROOT / 'nodes' / 'src' / 'nodes' / 'dataset_cobalt' / 'services.json'
+        raw = schema_path.read_text(encoding='utf-8')
+        assert '"dataset.seed"' in raw
+        default_block = re.search(r'"dataset\.default":\s*\{.*?\}', raw, re.S).group(0)
+        assert 'dataset.seed' in default_block
+
+    def test_the_seed_survives_config_extraction(self):
+        """`dataset.seed` from the panel reaches the loader as `seed`."""
+        endpoint = IEndpoint()
+        endpoint.endpoint = MagicMock()
+        endpoint.endpoint.logicalType = 'dataset_cobalt'
+        endpoint.endpoint.serviceConfig = {
+            'dataset.source_type': 'inline',
+            'dataset.items': '[{"input": "q", "expected": "a"}]',
+            'dataset.seed': 7,
+        }
+        endpoint.endpoint.bag = {}
+
+        assert endpoint._extractConfig()['seed'] == 7

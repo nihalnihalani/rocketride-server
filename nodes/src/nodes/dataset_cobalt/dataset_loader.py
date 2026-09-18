@@ -24,7 +24,8 @@
 import hashlib
 import json
 import os
-from typing import Any, Dict, List
+import random
+from typing import Any, Dict, List, Optional
 
 from rocketlib import debug, warning
 
@@ -45,6 +46,36 @@ class DatasetLoadError(Exception):
     ``IEndpoint`` and ``IGlobal`` wrap every load failure in this type and let
     it propagate, so the engine records a failed scan instead.
     """
+
+
+def _seed_from_config(config: Dict[str, Any]) -> Optional[int]:
+    """Return the configured sampling seed, or None to sample unseeded.
+
+    Sampling used the process-global ``random``, so the same dataset and the
+    same **Sample Size** drew a different subset on every run - a scored
+    evaluation could not be reproduced - and consumed the global stream other
+    nodes may depend on. Both lanes now draw from a local ``random.Random``.
+
+    A blank or absent seed returns None, and ``random.Random(None)`` seeds
+    itself from the OS, so an unset field reproduces the previous behaviour
+    exactly. A seed that is present but not a number raises ``ValueError``,
+    which the node boundary reports as a named ``DatasetLoadError``: running
+    unseeded after the user asked for a pinned subset would silently hand back
+    a different dataset than the one they pinned.
+
+    Args:
+        config: Node config; the optional 'seed' key holds the sampling seed.
+
+    Returns:
+        The seed as an int, or None when no seed is configured.
+
+    Raises:
+        ValueError: If a non-blank seed is not an integer.
+    """
+    seed = config.get('seed')
+    if seed is None or seed == '':
+        return None
+    return int(seed)
 
 
 def _validate_path(path: str) -> str:
@@ -331,6 +362,8 @@ class DatasetLoader:
                 - filter_field: Field name to filter on.
                 - filter_value: Value that filter_field must match.
                 - sample_size: Number of random items to sample (0 = skip).
+                - seed: Optional sampling seed; blank = unseeded (today's
+                  behaviour), any integer pins which rows are drawn.
                 - slice_start: Start index for slicing.
                 - slice_end: End index for slicing.
 
@@ -369,13 +402,27 @@ class DatasetLoader:
         # Apply sample if configured, bounded to dataset size
         sample_size = int(config.get('sample_size', 0))
         if sample_size > 0:
+            seed = _seed_from_config(config)
             current_items = list(dataset)
             bounded_size = min(sample_size, len(current_items))
             debug(
                 f'Cobalt DatasetLoader: Sampling {bounded_size} items (requested {sample_size}, available {len(current_items)})'
             )
             if bounded_size > 0:
-                dataset = dataset.sample(bounded_size)
+                if seed is None:
+                    dataset = dataset.sample(bounded_size)
+                else:
+                    # cobalt's Dataset.sample(n) takes no seed - it calls the
+                    # module-global random.sample internally (checked against
+                    # basalt-ai-cobalt 0.1.0 through 0.2.3, the whole range
+                    # requirements.txt allows). Seeding it would mean seeding
+                    # the process-global RNG, which is exactly what the local
+                    # generator is here to avoid. So when a seed is configured
+                    # the node draws the subset itself and hands the result
+                    # back to cobalt, keeping the two lanes identical for the
+                    # same seed; unseeded, cobalt's own sample is used
+                    # unchanged.
+                    dataset = Dataset.from_items(random.Random(seed).sample(current_items, bounded_size))
 
         # Apply slice if configured
         slice_start = int(config.get('slice_start', 0))
@@ -390,8 +437,6 @@ class DatasetLoader:
 
     def _apply_transforms_fallback(self, items: List[Dict[str, Any]], config: Dict[str, Any]) -> List[Dict[str, Any]]:
         """Apply transforms using pure Python (no cobalt dependency required)."""
-        import random
-
         result = list(items)
 
         # Apply filter if configured
@@ -404,10 +449,15 @@ class DatasetLoader:
         # Apply sample if configured, bounded to dataset size
         sample_size = int(config.get('sample_size', 0))
         if sample_size > 0:
+            seed = _seed_from_config(config)
             bounded_size = min(sample_size, len(result))
             debug(f'Cobalt DatasetLoader: Sampling {bounded_size} items (fallback)')
             if bounded_size > 0 and bounded_size < len(result):
-                result = random.sample(result, bounded_size)
+                # A local generator, not random.sample: the module-level one
+                # draws from - and advances - the process-global stream, so
+                # the draw was unreproducible and it perturbed every other
+                # node that relies on that stream.
+                result = random.Random(seed).sample(result, bounded_size)
 
         # Apply slice if configured
         slice_start = int(config.get('slice_start', 0))

@@ -135,6 +135,11 @@
 			"description": "Number of random items to sample from the dataset. 0 means use all items.",
 			"default": 0
 		},
+		"dataset.seed": {
+			"type": "number",
+			"title": "Sample Seed",
+			"description": "Optional seed for the random sample, so the same dataset and sample size draw the same rows on every run. Leave blank to draw a different subset each run."
+		},
 		"dataset.filter_field": {
 			"type": "string",
 			"title": "Filter Field",
@@ -159,7 +164,7 @@
 		},
 		"dataset.default": {
 			"object": "default",
-			"properties": ["dataset.source_type", "dataset.sample_size", "dataset.filter_field", "dataset.filter_value", "dataset.slice_start", "dataset.slice_end"]
+			"properties": ["dataset.source_type", "dataset.sample_size", "dataset.seed", "dataset.filter_field", "dataset.filter_value", "dataset.slice_start", "dataset.slice_end"]
 		}
 	},
 	//

@@ -58,17 +58,24 @@ A JSON array of objects, as a string: `[{"input": "What is 2+2?", "expected": "4
 
 Each item's question text is taken from `input`, then `text`, then `question` — first non-null wins; the reference from `expected`, then `output`, then `answer`. Any other keys are preserved as metadata, `id` becomes `dataset_id`, and every item is tagged `cobalt_source: true`.
 
-### Sample Size, Filter Field, Filter Value, Slice Start, Slice End
+### Sample Size, Sample Seed, Filter Field, Filter Value, Slice Start, Slice End
 
 The transforms, applied in a fixed order: **filter → sample → slice**. Each is skipped when unset, so they compose without surprising each other.
 
 - **Filter Field** / **Filter Value** keep only the items whose field equals the value (string comparison). Both are needed; one alone does nothing.
 - **Sample Size** takes that many items at random after filtering. `0` (the default) means take all, and a value larger than the dataset is bounded to its size.
+- **Sample Seed** pins *which* items that draw returns. Set it and the same dataset with the same **Sample Size** yields the same subset on every run, so a score is reproducible and two runs are comparable. Leave it blank (the default) and each run draws a fresh subset, exactly as before the field existed. A seed that is not a number fails the run rather than quietly reverting to an unpinned draw.
 - **Slice Start** / **Slice End** take a 0-based half-open range of what is left. `0` for **Slice End** (the default) means no slicing.
 
 Filtering to one category and then sampling 20 is the usual shape for a quick run against a large dataset; slicing is for reproducibly re-running the same window.
 
+The draw always comes from a generator local to this node, never the process-global `random`, so sampling here cannot shift the random stream any other node in the pipeline draws from.
+
 ## Notes
+
+### Sampling with and without cobalt
+
+`cobalt.Dataset.sample(n)` takes no seed — it calls the module-global `random.sample` internally, in every release `requirements.txt` allows (basalt-ai-cobalt 0.1.0 through 0.2.3). Seeding it would mean seeding the process-global RNG, which is what **Sample Seed** exists to avoid. So when a seed is set the node draws the subset itself, from its own generator, and hands the result back to cobalt; with no seed, cobalt's own `sample` is used unchanged. The two lanes therefore return the same subset for the same seed, whether or not cobalt is installed.
 
 ### Dependency
 
@@ -88,6 +95,7 @@ The `cobalt` (basalt-ai-cobalt) package is **optional**. Installed, it is used f
 | `dataset.filter_value` | `string` | **Filter Value**<br/>Value that the filter field must match. |  |
 | `dataset.items` | `string` | **Inline Items (JSON)**<br/>JSON array of dataset items as a string, e.g. [{"input": "...", "expected": "..."}]. Parsed as JSON at runtime. | `"[{\"input\": \"What is 2+2?\", \"expected\": \"4\"}]"` |
 | `dataset.sample_size` | `number` | **Sample Size**<br/>Number of random items to sample from the dataset. 0 means use all items. | `0` |
+| `dataset.seed` | `number` | **Sample Seed**<br/>Optional seed for the random sample, so the same dataset and sample size draw the same rows on every run. Leave blank to draw a different subset each run. |  |
 | `dataset.slice_end` | `number` | **Slice End**<br/>End index for slicing the dataset. 0 means no slicing. | `0` |
 | `dataset.slice_start` | `number` | **Slice Start**<br/>Start index for slicing the dataset (0-based). | `0` |
 | `dataset.source_type` | `string` | **Source Type**<br/>Where to load the dataset from: file (JSON/CSV/JSONL) or inline items. | `"file"` |
