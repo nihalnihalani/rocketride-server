@@ -602,6 +602,61 @@ def test_format_db_error_still_cuts_a_real_postgres_detail_block(base):
     assert 'ada@example.com' not in message
 
 
+# ---------------------------------------------------------------------------
+# _format_db_error — the generic (sqlstate, message) DBAPI shape
+#
+# No node in this repo uses a driver of this family today (there is no pyodbc
+# dialect under nodes/src/nodes), so these are constructed from the shape the
+# DBAPI specifies rather than provoked from a live server.
+# ---------------------------------------------------------------------------
+
+
+def test_format_db_error_keeps_the_sqlstate_with_its_message(base):
+    """``('42S02', '…not found')`` must not degrade to just ``42S02``.
+
+    pyodbc and other ODBC-backed drivers put a five-character SQLSTATE where
+    pymysql puts an integer errno, so the numeric branch misses them and the
+    generic ``args[0]`` branch returned the code ALONE -- the one part of the
+    pair a caller cannot act on.
+    """
+    orig = _FakeDriverError('42S02', "[42S02] [ODBC Driver] Base table or view not found: 'widgets'")
+    exc = _wrapped(orig, 'SELECT * FROM widgets', {})
+
+    message = base._format_db_error(exc)
+    assert message == "Error 42S02: [42S02] [ODBC Driver] Base table or view not found: 'widgets'"
+    assert '[SQL:' not in message
+
+
+def test_format_db_error_sqlstate_branch_still_strips_the_tail(base):
+    """The new branch is not an escape hatch around the stripper."""
+    orig = _FakeDriverError('42000', 'Syntax error\nSTATEMENT:  SELECT secret FROM users')
+    exc = _wrapped(orig, 'SELECT secret FROM users', {})
+
+    message = base._format_db_error(exc)
+    assert message == 'Error 42000: Syntax error'
+    assert 'secret' not in message
+
+
+def test_format_db_error_does_not_read_any_first_string_as_a_sqlstate(base):
+    """Only a real SQLSTATE shape (five chars, digits and capitals) qualifies.
+
+    A driver that happens to put two strings in ``args`` keeps the old
+    behaviour: the first one is the message, not a code to prefix.
+    """
+    orig = _FakeDriverError('syntax error at or near "FROM"', 'position 14')
+    exc = _wrapped(orig, 'SELECT FROM users', {})
+
+    assert base._format_db_error(exc) == 'syntax error at or near "FROM"'
+
+
+def test_format_db_error_keeps_a_single_argument_message_unprefixed(base):
+    """The sqlite3 shape -- one string in ``args`` -- is untouched by the branch."""
+    orig = _FakeDriverError('no such table: widgets')
+    exc = _wrapped(orig, 'SELECT * FROM widgets', {})
+
+    assert base._format_db_error(exc) == 'no such table: widgets'
+
+
 def test_format_db_error_returns_a_neutral_string_when_the_message_is_only_detail(base):
     """A message that is nothing but detail must not fall back to the statement.
 

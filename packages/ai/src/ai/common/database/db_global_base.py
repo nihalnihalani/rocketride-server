@@ -140,6 +140,13 @@ _DB_ERROR_DETAIL = re.compile(
 # always gets a non-empty string and never the statement echo.
 _DB_ERROR_FALLBACK = 'Database error'
 
+# A SQLSTATE as the standard defines it: five characters, digits and capitals.
+# ODBC-backed drivers (pyodbc and friends) report `(sqlstate, message)` where
+# pymysql reports `(errno, message)`, so the integer branch in
+# `_format_db_error` misses them. Matched strictly so that a driver which
+# merely happens to put two strings in `args` keeps the old behaviour.
+_SQLSTATE = re.compile(r'\A[0-9A-Z]{5}\Z')
+
 
 def _strip_statement_detail(message: str) -> str:
     """Cut a driver/SQLAlchemy message down to its primary sentence.
@@ -267,6 +274,12 @@ class DatabaseGlobalBase(IGlobalBase, ABC):
           STATEMENT and the ``LINE n:`` echo onto ``diag`` fields of their
           own: there is no tail left in it, so a marker firing there could
           only be truncating the application's own wording.
+        * ODBC-backed drivers (pyodbc and friends) report
+          ``(sqlstate, message)`` where pymysql reports ``(errno, message)``,
+          so a five-character SQLSTATE in ``args[0]`` is prefixed the same way
+          an integer errno is -> ``Error <sqlstate>: <message>``. No node in
+          this repo uses such a driver today; the branch is here so the
+          generic one below cannot return the bare code.
         * sqlite3 (and anything else) puts the bare message in ``.orig.args[0]``.
 
         Every branch runs through ``_strip_statement_detail`` as a backstop,
@@ -345,6 +358,19 @@ class DatabaseGlobalBase(IGlobalBase, ABC):
             message = getattr(orig, 'message', None)
             if isinstance(code, int) and isinstance(message, str) and message.strip():
                 return _strip_statement_detail(f'Error {code}: {message}')
+
+            # ODBC-backed drivers report `(sqlstate, message)`. Without this
+            # branch the generic one below returned the five-character code
+            # alone -- the half of the pair a caller cannot act on.
+            if (
+                is_seq
+                and len(args) >= 2
+                and isinstance(args[0], str)
+                and _SQLSTATE.match(args[0])
+                and isinstance(args[1], str)
+                and args[1].strip()
+            ):
+                return _strip_statement_detail(f'Error {args[0]}: {args[1]}')
 
             # sqlite3 and the generic DBAPI shape: args[0] is the message.
             if is_seq and args and isinstance(args[0], str) and args[0].strip():
