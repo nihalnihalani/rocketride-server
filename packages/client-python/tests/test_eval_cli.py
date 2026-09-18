@@ -653,6 +653,53 @@ class TestEvalCli:
         assert captured.out.strip() == json.dumps(document, indent=2)
         assert captured.err.count('Error:') == 1
 
+    @pytest.mark.skipif(
+        hasattr(os, 'geteuid') and os.geteuid() == 0,
+        reason='a read-only file is still writable by root',
+    )
+    async def test_unwritable_json_report_path_exits_2(self, monkeypatch, capsys, tmp_path, spec_file):
+        # The destination already carries a green document from an earlier
+        # run and is now read-only. Every case passes, but this run's report
+        # cannot be written, so the run must not exit 0 and leave the stale
+        # document behind to be read as its result.
+        report_path = tmp_path / 'report.json'
+        report_path.write_text('{"summary": {"failed": 0}, "from": "a previous run"}\n', encoding='utf-8')
+        report_path.chmod(0o444)
+        fake = FakeClient()
+
+        try:
+            exit_code = await run_cli(monkeypatch, fake, [spec_file, '--json', str(report_path)])
+        finally:
+            report_path.chmod(0o644)
+
+        assert exit_code == 2
+        captured = capsys.readouterr()
+        # One sentence on stderr naming the destination, printed once
+        assert captured.err.count('Error:') == 1
+        assert 'Cannot write JSON report' in captured.err
+        assert str(report_path) in captured.err
+        # The earlier run's document is untouched on disk: the non-zero exit
+        # is what stops a caller from reading it as this run's result.
+        assert json.loads(report_path.read_text(encoding='utf-8'))['from'] == 'a previous run'
+
+    async def test_json_report_path_under_a_regular_file_exits_2(self, monkeypatch, capsys, tmp_path, spec_file):
+        # The report's parent directory is a regular file, so neither the
+        # makedirs nor the open can succeed. Same contract as above: exit 2,
+        # one sentence on stderr, nothing invented on disk.
+        blocker = tmp_path / 'not-a-directory'
+        blocker.write_text('occupied\n', encoding='utf-8')
+        fake = FakeClient()
+
+        exit_code = await run_cli(monkeypatch, fake, [spec_file, '--json', str(blocker / 'report.json')])
+
+        assert exit_code == 2
+        captured = capsys.readouterr()
+        assert captured.err.count('Error:') == 1
+        assert 'Cannot write JSON report' in captured.err
+        assert blocker.read_text(encoding='utf-8') == 'occupied\n'
+        # The human report still went to stdout - only the machine report failed
+        assert 'greeting' in captured.out
+
 
 class TestEvalRegistration:
     def test_eval_is_registered_exactly_once_alongside_validate(self):

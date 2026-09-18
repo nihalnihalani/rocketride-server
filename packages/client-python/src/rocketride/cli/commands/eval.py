@@ -43,7 +43,10 @@ report keeps flowing on stdout. The two paths that exit 2 before any case
 runs — an unparsable spec, and a server the CLI cannot reach — record the
 shared ``{"error": {"message", "hint"}}`` envelope in place of the report,
 so the destination is always rewritten and an earlier run's green summary
-is never left behind to be read as this run's result. The command does not
+is never left behind to be read as this run's result. When the destination
+itself cannot be written, the command exits 2 for that reason alone: the
+report is flushed before the exit code is decided, not by the ``finally``
+that runs after it. The command does not
 route through ``run_cli_command``, though: that runner maps any raised
 error to exit code 1, while this command's documented contract reserves 1
 for "a case failed" and reports usage, spec and connection errors as 2.
@@ -61,8 +64,9 @@ Exit Codes:
     0: All cases passed
     1: At least one case failed (or errored), or a spec could not run to
        completion
-    2: Usage error, spec parse/validation error, connection failure, or no
-       case produced a result (e.g. a --case filter that matches nothing)
+    2: Usage error, spec parse/validation error, connection failure, a
+       --json or --junit destination that cannot be written, or no case
+       produced a result (e.g. a --case filter that matches nothing)
 
 Usage:
     rocketride eval my_pipeline.eval.json --apikey <key>
@@ -100,8 +104,8 @@ async def run_eval(args) -> int:
     Returns:
         Exit code: 0 if all cases passed, 1 if at least one case failed
         or a pipeline could not be started, 2 on usage error, spec
-        parse/validation error, connection failure, or when no case
-        produced a result at all
+        parse/validation error, connection failure, a report destination
+        that cannot be written, or when no case produced a result at all
 
     Process Flow:
         1. Expand glob patterns and literal paths into a spec file list
@@ -193,6 +197,20 @@ async def run_eval(args) -> int:
                 # non-zero exit. out.fail() prints the stderr sentence and
                 # returns 1; the explicit 2 keeps the documented exit code.
                 out.fail(f'Cannot write JUnit report to {args.junit}: {err}')
+                return 2
+
+        # --json FILE is flushed HERE, not by the out.finish() in the finally
+        # below: that one runs after the exit code has been decided, so a
+        # destination it cannot write can only be warned about, leaving the
+        # command to exit 0 with an earlier run's green report still in place.
+        # A run whose machine report never landed is a failed run, so it is
+        # reported like the --junit branch above. finish() flushes at most
+        # once, so the finally does not repeat the attempt or the message.
+        if out.json_requested and args.json != '-':
+            try:
+                out.flush()
+            except OSError as err:
+                out.fail(f'Cannot write JSON report to {args.json}: {err}')
                 return 2
 
         # Exit 2 if no case produced a result at all (every spec errored, or
