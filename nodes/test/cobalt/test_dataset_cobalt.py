@@ -1904,3 +1904,70 @@ class TestSampleSeedIsReproducible:
         endpoint.endpoint.bag = {}
 
         assert endpoint._extractConfig()['seed'] == 7
+
+
+class TestSourceModeMetadataSurvivesTheEngineHandle:
+    """`objectTags` is an engine IJson handle, not a dict, and the reference rode on it.
+
+    A live run of ``examples/cobalt-evaluation.pipe`` against a real engine
+    reached ``eval_cobalt`` with ``metadata == {}`` and scored all three rows
+    0.0 with "One of output or expected is empty", while every unit test here
+    passed: the tests hand ``renderObject`` a plain dict, and the engine hands
+    it an ``IJson``. ``tags.get('metadata')`` then returns another ``IJson``,
+    ``merge_metadata`` ignores every non-dict, and the reference answer was
+    dropped on that one hop. ``common.plain_metadata`` converts the handle.
+    """
+
+    class _FakeIJson:
+        """Minimal stand-in for the engine's IJson: dict-ish access plus toDict()."""
+
+        def __init__(self, payload):
+            """Wrap a payload the way the engine wraps an entry's objectTags."""
+            self._payload = payload
+
+        def get(self, key, default=None):
+            """Return the member, itself wrapped when it is a mapping."""
+            value = self._payload.get(key, default)
+            return TestSourceModeMetadataSurvivesTheEngineHandle._FakeIJson(value) if isinstance(value, dict) else value
+
+        def toDict(self):
+            """Convert the handle to a plain dict, as the real binding does."""
+            return dict(self._payload)
+
+        def __bool__(self):
+            """Report emptiness like the engine's handle does."""
+            return bool(self._payload)
+
+    def test_render_object_reads_metadata_through_the_engine_handle(self):
+        inst = IInstance()
+        inst.instance = MagicMock()
+        entry = MagicMock()
+        entry.objectTags = self._FakeIJson({'text': 'q', 'metadata': {'expected': 'a', 'dataset_id': 'row-1'}})
+
+        _dispatch(lambda: inst.renderObject(entry))
+
+        emitted = inst.instance.sendQuestions.call_args.args[0]
+        assert emitted.questions == ['q']
+        assert emitted.metadata['expected'] == 'a', (
+            'the reference did not survive the source-mode hop: objectTags is an IJson handle, '
+            'so its metadata member is not the dict merge_metadata requires'
+        )
+        assert emitted.metadata['dataset_id'] == 'row-1'
+
+    def test_plain_metadata_converts_only_what_it_can(self):
+        from dataset_cobalt.common import plain_metadata
+
+        assert plain_metadata({'expected': 'a'}) == {'expected': 'a'}
+        assert plain_metadata(self._FakeIJson({'expected': 'a'})) == {'expected': 'a'}
+        assert plain_metadata(None) == {}
+        assert plain_metadata('') == {}
+        assert plain_metadata("{'expected': 'a'}") == {}
+
+    def test_plain_metadata_copies_rather_than_aliases(self):
+        from dataset_cobalt.common import plain_metadata
+
+        source = {'expected': 'a'}
+        converted = plain_metadata(source)
+        converted['expected'] = 'b'
+
+        assert source['expected'] == 'a'

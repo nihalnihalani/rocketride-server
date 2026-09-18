@@ -27,7 +27,7 @@ import copy
 from rocketlib import Entry, IInstanceBase, debug, warning
 from ai.common.utils import merge_metadata
 
-from .common import question_from_item, question_text, skipped_rows_warning
+from .common import plain_metadata, question_from_item, question_text, skipped_rows_warning
 from .IGlobal import IGlobal
 
 
@@ -124,7 +124,10 @@ class IInstance(IInstanceBase):
 
         item = {
             'text': tags.get('text', ''),
-            'metadata': tags.get('metadata', {}) or {},
+            # objectTags is an engine IJson handle, so its 'metadata' member is
+            # another IJson rather than the dict scanObjects stored; see
+            # common.plain_metadata for what that cost before it was converted.
+            'metadata': plain_metadata(tags.get('metadata', {})),
         }
         # Same rule as filter mode: a row with no prompt is dropped, not sent
         # on as a promptless question. scanObjects already filters these out,

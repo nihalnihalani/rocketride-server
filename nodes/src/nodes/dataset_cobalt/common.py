@@ -27,6 +27,40 @@ from ai.common.schema import Question
 from ai.common.utils import merge_metadata
 
 
+def plain_metadata(value: Any) -> Dict[str, Any]:
+    """Return engine-side row metadata as a plain Python dict.
+
+    ``Entry.objectTags`` is an engine ``IJson`` handle, not a dict, so
+    ``tags.get('metadata')`` in source mode hands back another ``IJson`` rather
+    than the dict ``IEndpoint.scanObjects`` put on the entry. ``merge_metadata``
+    ignores anything that is not a ``dict``, so the reference answer was
+    silently dropped on that hop: a live run of
+    ``examples/cobalt-evaluation.pipe`` reached ``eval_cobalt`` with
+    ``metadata == {}`` and scored every row 0.0 with "One of output or expected
+    is empty" - a whole-run failure indistinguishable from a weak model.
+
+    ``IJson.toDict()`` converts the handle; a value that is already a dict is
+    copied through, and anything else (a string, ``None``) becomes ``{}``
+    rather than reaching ``merge_metadata`` as a non-mapping.
+
+    Args:
+        value: The ``metadata`` member of an entry's ``objectTags``.
+
+    Returns:
+        A plain dict, empty when the value carries no usable mapping.
+    """
+    if isinstance(value, dict):
+        return dict(value)
+
+    to_dict = getattr(value, 'toDict', None)
+    if callable(to_dict):
+        converted = to_dict()
+        if isinstance(converted, dict):
+            return converted
+
+    return {}
+
+
 def question_text(item: Dict[str, Any]) -> Optional[str]:
     """Return a dataset item's prompt, or None when the row carries none.
 

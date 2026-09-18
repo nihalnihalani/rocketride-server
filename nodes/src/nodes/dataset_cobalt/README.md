@@ -81,6 +81,8 @@ The draw always comes from a generator local to this node, never the process-glo
 
 For N emittable rows the node puts exactly N questions on the lane, in both modes. In filter mode the incoming question is a trigger, not content: it carries no dataset row, so the handler suppresses the engine's default forward rather than letting the bare template travel on beside the N real questions. When no dataset loaded there is nothing to ask at all, and that exit stays silent too — a promptless question downstream is answered by the LLM and scored by `eval_cobalt` against a reference, producing a low score indistinguishable from a weak model.
 
+Source mode reads the row off the scan entry's `objectTags`, which the engine hands over as its own JSON handle rather than as a `dict`; the node converts it before merging, so the reference answer survives the hop. Without the conversion every row reached the evaluator with empty metadata and scored 0.0.
+
 ### Dependency
 
 The `cobalt` (basalt-ai-cobalt) package is **optional**. Installed, it is used for file parsing and transforms; absent, the node falls back to a pure-Python loader that handles JSON arrays, `{"items"|"data"|"rows": [...]}` envelopes, JSONL (one object per line), and CSV (`DictReader` rows).
