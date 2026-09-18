@@ -48,7 +48,7 @@ from sqlalchemy.pool import StaticPool
 
 import ai.common.database.db_global_base as db_global_base_module
 from ai.common.database.db_global_base import DatabaseGlobalBase
-from ai.common.database.db_instance_base import DatabaseInstanceBase, _format_table
+from ai.common.database.db_instance_base import DatabaseInstanceBase, _format_table, _isDbFailure
 
 
 # ---------------------------------------------------------------------------
@@ -1638,3 +1638,39 @@ def test_get_data_rejection_carries_no_statement_echo(instance, monkeypatch):
     assert result['valid'] is False
     assert '[SQL:' not in result['error']
     assert 'hunter2' not in result['error']
+
+
+# ---------------------------------------------------------------------------
+# The database-failure predicate the three except sites share
+# ---------------------------------------------------------------------------
+
+
+def test_is_db_failure_answers_for_every_shape_the_except_arms_used_to_test():
+    """One predicate replaces the copy-pasted SQLAlchemyError / `.orig` duck-test.
+
+    dylan-savage, review 5215826786 nit 2. The three sites (`execute`'s session
+    block, `_executeRawQuery`, `_insertData`) now each have ONE
+    `except Exception` arm that asks this. The cases below are exactly what the
+    old arms distinguished, and the RuntimeError one is the load-bearing half:
+    the `max_execute_rows` overflow must stay a re-raise, because its wording
+    and its rollback are pinned by other tests.
+    """
+    # A SQLAlchemy error, with or without a driver original behind it.
+    assert _isDbFailure(NoSuchTableError('widgets')) is True
+    dbapi_error = DBAPIError.instance(
+        'INSERT INTO t (v) VALUES (%(b1)s)', {'b1': 'x'}, Exception('boom'), dbapi_base_err=Exception
+    )
+    assert _isDbFailure(dbapi_error) is True
+
+    # clickhouse-sqlalchemy's shape: a plain Exception carrying `.orig`.
+    class _DatabaseException(Exception):
+        pass
+
+    unwrapped = _DatabaseException('Code: 47.')
+    unwrapped.orig = Exception('Code: 47.')
+    assert _isDbFailure(unwrapped) is True
+
+    # Everything else, the max_execute_rows overflow above all.
+    assert _isDbFailure(RuntimeError('EXECUTE query exceeded max_execute_rows=1000')) is False
+    assert _isDbFailure(KeyError('session')) is False
+    assert _isDbFailure(ValueError('bad params')) is False
