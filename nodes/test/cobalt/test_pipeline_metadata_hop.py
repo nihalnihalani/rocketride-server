@@ -293,6 +293,46 @@ class _Lane:
         self.sse.append((channel, kwargs))
 
 
+def _dispatch(handler):
+    """Run a lane handler the way the engine runs one.
+
+    After a lane handler returns, the engine forwards the argument it was given
+    unless the handler raised ``Ec.PreventDefault`` (``__checkCallParent``,
+    ``engLib/python/call.hpp``). ``dataset_cobalt.writeQuestions``,
+    ``dataset_cobalt.renderObject`` and ``eval_cobalt.writeAnswers`` all end in
+    ``preventDefault()`` so that the questions and answers they wrote are the
+    only ones that continue downstream; the stub at the top of this file
+    mirrors the real implementation by raising. Wrapping the call treats that
+    signal the way the engine does - as "handled" - and fails the test if the
+    handler stopped suppressing.
+
+    Args:
+        handler: Zero-argument callable that invokes the lane handler.
+    """
+    with pytest.raises(Exception, match='No default to prevent'):
+        handler()
+
+
+def _drive_object(node, question):
+    """Drive one object through a filter node the way the engine's pipe does.
+
+    ``pipe.instance.cpp`` opens, writes, then runs ``closing()`` followed by
+    ``close()`` for EACH object, on the same instance chain. Nodes that
+    accumulate - the prompt node among them - emit from ``closing()``, so this
+    ordering is what decides whether N objects produce N results or one.
+
+    Args:
+        node: The filter node instance.
+        question: The Question to write on the questions lane.
+    """
+    node.open(object())
+    node.writeQuestions(question)
+    node.closing()
+    close = getattr(node, 'close', None)
+    if callable(close):
+        close(object())
+
+
 def _dataset_node(items):
     """Build a dataset_cobalt instance preloaded with ``items``."""
     from dataset_cobalt.IInstance import IInstance
@@ -358,10 +398,34 @@ def _scores(lane):
 def _run_pipeline(items, reply, instructions=None, with_prompt=True, threshold=0.6):
     """Run dataset -> [prompt] -> LLM -> eval and return the collected lanes.
 
-    Mirrors ``examples/cobalt-evaluation.pipe``. In source mode the engine gives
-    each dataset row its own instance chain, so the prompt and LLM nodes are
-    rebuilt per question rather than shared — which is also what keeps the
-    prompt node's ``closing()`` merge from collapsing N items into one.
+    Mirrors ``examples/cobalt-evaluation.pipe``, including the engine's
+    instance lifecycle, because the PR's headline claim - one evaluation result
+    per dataset item - depends on it.
+
+    THE PROMPT NODE IS ONE INSTANCE, SHARED BY EVERY ROW. The engine builds the
+    instance stack once per pipe and worker (``endpoint.pipes.cpp:336-371``)
+    and constructs one Python ``IInstance`` per filter in it
+    (``python-instance.cpp:32-131``). What repeats per object is the lifecycle,
+    not the instance: ``pipe.instance.cpp:40-47`` opens each object, and
+    ``pipe.instance.cpp:82-101`` runs the whole chain's ``closing()`` (:96) and
+    then ``close()`` (:101) for EVERY object, upstream-first. An earlier
+    revision of this harness rebuilt the prompt node per row and said the
+    engine did the same; it does not, and building a fresh node per row made
+    every test here pass by construction.
+
+    What actually keeps ``closing()`` from collapsing N rows into one merged
+    question is that ``closing()`` fires once per object rather than once per
+    instance, and ``prompt.IInstance.open()`` resets the accumulator
+    (``prompt/IInstance.py:61-74``) before the next row is written into it. So
+    this harness shares the instance and drives ``open() -> writeQuestions() ->
+    closing() -> close()`` per row, which is the sequence that would expose a
+    collapse. A live engine run of the example confirmed the counts: three
+    dataset rows produced three ``open``/``closing``/``close`` pairs on the
+    prompt node and three questions out of it, not one.
+
+    The LLM node is still built per staged question. ``LLMBase`` answers inside
+    ``writeQuestions`` and holds no cross-object accumulator, so sharing it
+    would change nothing but the lane bookkeeping these tests read.
 
     Args:
         items: Dataset items as ``dataset_cobalt`` would have loaded them.
@@ -373,24 +437,23 @@ def _run_pipeline(items, reply, instructions=None, with_prompt=True, threshold=0
 
     Returns:
         Tuple of (dataset lane, list of prompt lanes, list of LLM lanes,
-        eval lane).
+        eval lane). With the prompt hop on, the prompt list holds the single
+        shared instance's lane.
     """
     from ai.common.schema import Question
 
     dataset = _dataset_node(items)
-    dataset.writeQuestions(Question())
+    _dispatch(lambda: dataset.writeQuestions(Question()))
 
     evaluator = _eval_node(threshold=threshold)
-    prompt_lanes = []
+    prompt = _prompt_node(instructions or ['Answer the question concisely in one sentence.']) if with_prompt else None
     llm_lanes = []
 
     for question in dataset.instance.questions:
-        if with_prompt:
-            prompt = _prompt_node(instructions or ['Answer the question concisely in one sentence.'])
-            prompt.writeQuestions(question)
-            prompt.closing()
-            prompt_lanes.append(prompt.instance)
-            downstream = prompt.instance.questions
+        if prompt is not None:
+            emitted_before = len(prompt.instance.questions)
+            _drive_object(prompt, question)
+            downstream = prompt.instance.questions[emitted_before:]
         else:
             downstream = [question]
 
@@ -399,8 +462,9 @@ def _run_pipeline(items, reply, instructions=None, with_prompt=True, threshold=0
             llm.writeQuestions(staged)
             llm_lanes.append(llm.instance)
             for answer in llm.instance.answers:
-                evaluator.writeAnswers(answer)
+                _dispatch(lambda captured=answer: evaluator.writeAnswers(captured))
 
+    prompt_lanes = [prompt.instance] if prompt is not None else []
     return dataset.instance, prompt_lanes, llm_lanes, evaluator.instance
 
 
@@ -423,7 +487,7 @@ class TestReferenceSurvivesEveryHop:
         from ai.common.schema import Question
 
         dataset = _dataset_node([_PARIS])
-        dataset.writeQuestions(Question())
+        _dispatch(lambda: dataset.writeQuestions(Question()))
 
         emitted = dataset.instance.questions
         assert len(emitted) == 1
@@ -438,7 +502,7 @@ class TestReferenceSurvivesEveryHop:
         from ai.common.schema import Question
 
         dataset = _dataset_node([_PARIS])
-        dataset.writeQuestions(Question())
+        _dispatch(lambda: dataset.writeQuestions(Question()))
 
         prompt = _prompt_node(['Answer concisely.'])
         prompt.writeQuestions(dataset.instance.questions[0])
@@ -504,7 +568,11 @@ class TestFullPipelineScores:
         dataset_lane, prompt_lanes, llm_lanes, eval_lane = _run_pipeline(items, reply)
 
         assert len(dataset_lane.questions) == 3
-        assert len(prompt_lanes) == 3
+        # ONE shared prompt instance, three questions out of it. This is the
+        # assertion the "closing() collapses N items into one" hypothesis
+        # fails: a single merged question would leave one entry on this lane.
+        assert len(prompt_lanes) == 1
+        assert len(prompt_lanes[0].questions) == 3
         assert len(llm_lanes) == 3
 
         scores = _scores(eval_lane)
@@ -558,12 +626,92 @@ class TestReferenceNeverReachesTheModel:
         from ai.common.schema import Question
 
         dataset = _dataset_node([_PARIS])
-        dataset.writeQuestions(Question())
+        _dispatch(lambda: dataset.writeQuestions(Question()))
         question = dataset.instance.questions[0]
 
         assert question.metadata['expected'] == 'The capital of France is Paris.'
         assert not any('Paris' in repr(entry) for entry in question.context)
         assert not any('Paris' in repr(entry) for entry in question.questions)
+
+
+class TestOnePromptInstanceServesEveryObject:
+    """The lifecycle claim the one-to-one promise rests on, tested directly.
+
+    The engine does NOT give each dataset row its own instance chain. It builds
+    one Python ``IInstance`` per filter per pipe/worker
+    (``python-instance.cpp:32-131``, ``endpoint.pipes.cpp:336-371``) and runs
+    ``open()`` per object (``pipe.instance.cpp:40-47``) and then ``closing()``
+    followed by ``close()`` per object, upstream-first
+    (``pipe.instance.cpp:82-101``). Since ``closing()`` is the only place the
+    prompt node emits, "one instance for many objects" would collapse N rows
+    into a single merged question if ``closing()`` ran once per instance.
+
+    It runs once per object, and ``open()`` resets the accumulator in between,
+    which is what makes N rows produce N questions. These tests drive ONE
+    instance through that exact sequence so a regression on either half - a
+    dropped reset, or emission moved to a once-per-instance hook - fails here
+    rather than at the far end of a pipeline.
+    """
+
+    def test_one_instance_emits_one_question_per_object(self):
+        """Three objects through one shared instance produce three questions."""
+        from ai.common.schema import Question
+
+        node = _prompt_node(['Answer the question concisely in one sentence.'])
+
+        for item in (_PARIS, _MATH, _OCEAN):
+            question = Question()
+            question.addQuestion(item['text'])
+            question.metadata = dict(item['metadata'])
+            _drive_object(node, question)
+
+        emitted = node.instance.questions
+        assert len(emitted) == 3, (
+            f'one prompt instance emitted {len(emitted)} questions for 3 objects. One means '
+            f'closing() merged the objects into a single question, and only the last dataset '
+            f'row would ever be scored'
+        )
+
+    def test_each_emitted_question_keeps_its_own_row(self):
+        """Question n carries row n's prompt and row n's reference, not a merge of all three."""
+        from ai.common.schema import Question
+
+        node = _prompt_node(['Answer the question concisely in one sentence.'])
+        items = [_PARIS, _MATH, _OCEAN]
+
+        for item in items:
+            question = Question()
+            question.addQuestion(item['text'])
+            question.metadata = dict(item['metadata'])
+            _drive_object(node, question)
+
+        emitted = node.instance.questions
+        assert [[t.text for t in q.questions] for q in emitted] == [[item['text']] for item in items]
+        assert [q.metadata['expected'] for q in emitted] == [item['metadata']['expected'] for item in items]
+
+        # A merged question would carry every row's text, and one copy of the
+        # instructions per object on top of it.
+        for question in emitted:
+            assert len(question.questions) == 1
+            assert len(question.instructions) == 1
+
+    def test_a_shared_instance_scores_every_row_one_to_one(self):
+        """The whole chain, on one prompt instance: three rows, three scores."""
+        items = [_PARIS, _MATH, _OCEAN]
+        expected_by_question = {item['text']: item['metadata']['expected'] for item in items}
+
+        def reply(question):
+            for text in question.questions:
+                if text.text in expected_by_question:
+                    return expected_by_question[text.text]
+            return 'I do not know.'
+
+        _, prompt_lanes, _, eval_lane = _run_pipeline(items, reply)
+
+        assert len(prompt_lanes) == 1, 'the harness must share one prompt instance across the rows'
+        scores = _scores(eval_lane)
+        assert len(scores) == 3
+        assert all(score['cobalt_passed'] is True for score in scores)
 
 
 class TestPromptNodePreservesExistingBehaviour:
@@ -760,11 +908,7 @@ def _question_from_entry(entry):
     scanned = MagicMock()
     scanned.objectTags = entry['objectTags']
 
-    # renderObject ends in preventDefault(), which the engine implements as a
-    # raise; the stub at the top of this file mirrors that. Suppressing it here
-    # is how the engine treats the signal -- as "handled", not as a failure.
-    with contextlib.suppress(RuntimeError):
-        node.renderObject(scanned)
+    _dispatch(lambda: node.renderObject(scanned))
 
     assert len(node.instance.questions) == 1
     return node.instance.questions[0]
@@ -791,23 +935,25 @@ def _run_example(reply, pipe=None):
     prompt_lanes = []
     llm_lanes = []
 
-    # Source mode gives every scanned row its own instance chain, so the prompt
-    # and LLM nodes are rebuilt per row rather than shared.
+    # One prompt instance for the whole scan, driven through the per-object
+    # open/closing/close the engine runs on it - see _run_pipeline's docstring
+    # for why the instance is shared and only the lifecycle repeats.
+    prompt = _prompt_node(instructions)
+    prompt_lanes.append(prompt.instance)
+
     for entry in _scan_entries(pipe):
         question = _question_from_entry(entry)
         questions.append(question)
 
-        prompt = _prompt_node(instructions)
-        prompt.writeQuestions(question)
-        prompt.closing()
-        prompt_lanes.append(prompt.instance)
+        emitted_before = len(prompt.instance.questions)
+        _drive_object(prompt, question)
 
-        for staged in prompt.instance.questions:
+        for staged in prompt.instance.questions[emitted_before:]:
             llm = _llm_node(reply)
             llm.writeQuestions(staged)
             llm_lanes.append(llm.instance)
             for answer in llm.instance.answers:
-                evaluator.writeAnswers(answer)
+                _dispatch(lambda captured=answer: evaluator.writeAnswers(captured))
 
     return pipe, questions, prompt_lanes, llm_lanes, evaluator.instance
 

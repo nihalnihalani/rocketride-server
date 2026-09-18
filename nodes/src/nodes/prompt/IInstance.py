@@ -61,13 +61,26 @@ class IInstance(IInstanceBase):
     def open(self, entry: Entry):
         """Start each object from a clean question.
 
-        The engine builds one IInstance per filter instance and calls open()
-        once per object, so the accumulator this node merges into has to be
-        reset here rather than only in __init__. Without the reset a second
-        object inherits the first object's collected text, a duplicate copy of
-        the configured instructions, and its metadata — which downstream turns
-        a missing reference into a wrong one. Every other accumulating node
-        (tool_guild, tool_n8n, guardrails, answer_documents) resets the same way.
+        ONE INSTANCE, MANY OBJECTS. The engine builds the pipe's instance stack
+        once per pipe and worker (`endpoint.pipes.cpp:336-371`) and constructs
+        one Python IInstance per filter in it (`python-instance.cpp:32-131`).
+        What repeats per object is the lifecycle, not the instance:
+        `pipe.instance.cpp:40-47` opens each object, and
+        `pipe.instance.cpp:82-101` runs the whole chain's `closing()` (:96) and
+        then `close()` (:101) for EVERY object, upstream-first.
+
+        So the accumulator this node merges into has to be reset here rather
+        than only in __init__. Without the reset a second object inherits the
+        first object's collected text, a duplicate copy of the configured
+        instructions, and its metadata — which downstream turns a missing
+        reference into a wrong one. Every other accumulating node (tool_guild,
+        tool_n8n, guardrails, answer_documents) resets the same way.
+
+        This reset is also what keeps a run of N objects producing N questions
+        rather than one merged question: `closing()` is the only place this node
+        emits, and it fires per object, with this reset in between. A live run
+        of `examples/cobalt-evaluation.pipe` over three dataset rows put three
+        open/closing/close rounds and three emitted questions on this node.
         """
         # The turn starts here, so the question does too.
         self.has_output = False
