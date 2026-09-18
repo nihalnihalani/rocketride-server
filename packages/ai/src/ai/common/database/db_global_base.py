@@ -654,6 +654,15 @@ class DatabaseGlobalBase(IGlobalBase, ABC):
         ``EXPLAIN`` is standard SQL supported by MySQL and PostgreSQL; both
         engines raise an exception for syntactically or semantically invalid
         queries, which is exactly the signal we need.
+
+        The failure message goes through ``_format_db_error`` rather than
+        ``str(e)``. This error does not stop at the retry loop: it is carried
+        out through ``_buildSQLQuery`` into ``get_sql``'s ``error`` field and
+        from there into ``get_data``'s, and NEITHER of those tools is gated on
+        ``allow_execute`` the way ``execute`` is. ``str()`` of a SQLAlchemy
+        ``StatementError`` appends ``[SQL: ...]`` / ``[parameters: ...]``, so
+        the raw string handed the full ``EXPLAIN`` statement to a caller who
+        was never granted raw SQL. The full exception still goes to the log.
         """
         if not self.engine:
             return False, 'Database engine not initialized'
@@ -662,7 +671,8 @@ class DatabaseGlobalBase(IGlobalBase, ABC):
                 conn.execute(text(f'EXPLAIN {query}'))
             return True, ''
         except Exception as e:
-            return False, str(e)
+            warning(f'EXPLAIN validation failed for the generated query: {e}')
+            return False, self._format_db_error(e)
 
     # ------------------------------------------------------------------
     # Lifecycle

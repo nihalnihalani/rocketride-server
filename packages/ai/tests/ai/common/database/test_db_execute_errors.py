@@ -1142,3 +1142,87 @@ def test_execute_raw_query_returns_a_dict_for_ddl_and_select(instance):
     select = instance._executeRawQuery('SELECT label FROM widgets')
     assert isinstance(select, dict)
     assert select == {'rows': [], 'affected_rows': 0}
+
+
+# ---------------------------------------------------------------------------
+# _validateQuery's error text on the get_sql / get_data lanes
+#
+# execute() is gated on IGlobal.allow_execute, but get_sql and get_data are
+# not, and both carry the EXPLAIN failure back to the caller verbatim. So the
+# EXPLAIN error has to be formatted the same way execute()'s is, or the
+# statement echo reaches a caller who was never granted raw SQL.
+# ---------------------------------------------------------------------------
+
+
+def _always_generates(query):
+    """Stub _buildSQLQueryOnce with an LLM that keeps proposing one query."""
+
+    def _once(self, question_text, *, limit=250, previous_sql=None, error=None):
+        return {'isValid': True, 'query': query}
+
+    return _once
+
+
+def test_validate_query_reports_the_driver_message_without_the_statement_echo(instance):
+    """EXPLAIN's failure is formatted, not ``str(e)``.
+
+    ``str()`` of a SQLAlchemy StatementError appends ``[SQL: …]`` and
+    ``[parameters: …]``, so the raw string carried the whole EXPLAIN statement
+    -- bind values included -- out of a helper whose callers have no
+    allow_execute gate in front of them.
+    """
+    ok, message = instance.IGlobal._validateQuery("SELECT secret FROM no_such_table WHERE token = 'hunter2'")
+
+    assert ok is False
+    assert 'no such table' in message.lower()
+    assert '[SQL:' not in message
+    assert '[parameters:' not in message
+    assert 'sqlalche.me' not in message
+    assert 'hunter2' not in message
+
+
+def test_validate_query_accepts_a_statement_the_database_can_plan(instance):
+    """The success half of the contract is unchanged: ``(True, '')``."""
+    instance.execute({'sql': 'CREATE TABLE widgets (id INTEGER PRIMARY KEY)'})
+
+    assert instance.IGlobal._validateQuery('SELECT id FROM widgets') == (True, '')
+
+
+def test_get_sql_rejection_carries_no_statement_echo(instance, monkeypatch):
+    """The ungated lane: get_sql answers a rejected query without echoing it.
+
+    allow_execute is switched OFF here on purpose — get_sql never consults it,
+    which is exactly why this text had to stop being the SQLAlchemy repr.
+    """
+    instance.IGlobal.allow_execute = False
+    instance.IGlobal.max_validation_attempts = 1
+    monkeypatch.setattr(
+        _TestableInstance,
+        '_buildSQLQueryOnce',
+        _always_generates("SELECT secret FROM no_such_table WHERE token = 'hunter2'"),
+    )
+
+    result = instance.get_sql({'question': 'show me the secrets'})
+
+    assert result['valid'] is False
+    assert 'no such table' in result['error'].lower()
+    assert '[SQL:' not in result['error']
+    assert '[parameters:' not in result['error']
+    assert 'hunter2' not in result['error']
+
+
+def test_get_data_rejection_carries_no_statement_echo(instance, monkeypatch):
+    """get_data returns get_sql's dict untouched, so it leaked the same text."""
+    instance.IGlobal.allow_execute = False
+    instance.IGlobal.max_validation_attempts = 1
+    monkeypatch.setattr(
+        _TestableInstance,
+        '_buildSQLQueryOnce',
+        _always_generates("SELECT secret FROM no_such_table WHERE token = 'hunter2'"),
+    )
+
+    result = instance.get_data({'question': 'show me the secrets'})
+
+    assert result['valid'] is False
+    assert '[SQL:' not in result['error']
+    assert 'hunter2' not in result['error']
