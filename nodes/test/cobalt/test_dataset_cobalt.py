@@ -1601,6 +1601,23 @@ class TestScanEntryIdentityIsStable:
         entries = self._scan(tmp_path, monkeypatch, '[{"input": "q1"}]')
         assert entries[0]['url'].startswith('dataset_cobalt://1/sha256-')
 
+    def test_the_ordinal_counts_emitted_rows_not_raw_ones(self, tmp_path, monkeypatch):
+        """Text-less rows are dropped before the scan, so they take no ordinal.
+
+        This is a contract change against the revision that emitted a question
+        for every row: the same file's second and fourth rows used to scan as
+        ``://2/a`` and ``://4/b``. The identity half is unaffected, which is
+        what a consumer joins on; the ordinal is a position in the scan.
+        """
+        entries = self._scan(
+            tmp_path,
+            monkeypatch,
+            '[{"expected": "only-a-reference"}, {"id": "a", "input": "q-a"}, '
+            '{"text": ""}, {"id": "b", "input": "q-b"}]',
+        )
+
+        assert [e['url'] for e in entries] == ['dataset_cobalt://1/a', 'dataset_cobalt://2/b']
+
 
 class TestDatasetIdIsAlwaysAddressable:
     """``item.get('id') or ''`` collapsed 0, False, '' and "no id" into one value.
