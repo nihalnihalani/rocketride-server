@@ -39,7 +39,7 @@
 import type { SqlDialect } from '../connect';
 import type { StatementKind } from './classify';
 import { CTE_WRITE_WORDS } from './classify';
-import { codeOnly, hasTopLevelKeyword, keywordSites, stripSqlComments } from './split';
+import { codeOnly, keywordSites, stripSqlComments } from './split';
 
 // =============================================================================
 // TYPES
@@ -375,41 +375,58 @@ function hashCommentPrecedesClause(sql: string, lockingAt: number, dialect: SqlD
 const FETCH_LIMIT_HEAD = /^fetch\s+(?:first|next)(?![\w$])/i;
 
 /**
- * Whether the statement carries its own `FETCH { FIRST | NEXT } ... ONLY`
- * limit clause at the outermost level — the SQL-standard production that
- * shares `LIMIT`'s grammar slot, so a statement bounded by one must never
- * also receive the header's `LIMIT`: PostgreSQL's `select_limit` admits at
- * most one limit clause, however it is spelled, and MySQL does not accept
- * this spelling at all.
+ * Where the statement's own outermost row-limit clause starts — `LIMIT` or
+ * the SQL standard's `FETCH { FIRST | NEXT } ... ONLY` — or -1 when it has
+ * none. Either spelling shares `LIMIT`'s grammar slot, so a statement bounded
+ * by one must never also receive the header's `LIMIT`: PostgreSQL's
+ * `select_limit` admits at most one limit clause, however it is spelled, and
+ * MySQL does not accept the `FETCH` spelling at all.
  *
- * Read the same way {@link trailingLockingClauseAt} reads a locking clause:
- * {@link keywordSites} finds every `fetch` in CODE (masked, so a comment, a
- * string literal or a quoted identifier cannot forge one) and reports each
- * one's parenthesis depth; only depth 0 counts, so a `FETCH FIRST 1 ROW ONLY`
+ * {@link keywordSites} finds every `limit`/`fetch` in CODE (masked, so a
+ * comment, a string literal or a quoted identifier cannot forge one) and
+ * reports each one's parenthesis depth; only depth 0 counts, so a clause
  * inside a subquery, a CTE body or a parenthesised set-query member bounds
  * that member, not the outer statement, and must not be read as the result's
- * bound. {@link FETCH_LIMIT_HEAD} then runs on {@link codeOnly} text sliced at
- * the site's index — offsets are preserved, so that slice reads the same
+ * bound. A `limit` site is a clause on sight; a `fetch` site still needs
+ * {@link FETCH_LIMIT_HEAD} to run on {@link codeOnly} text sliced at the
+ * site's index — offsets are preserved, so that slice reads the same
  * characters the original statement has there — which is what keeps an
  * ordinary identifier like `fetch_count` or `prefetch` from matching: the
  * identifier-boundary check already lives inside {@link keywordSites}, so
  * this function does not repeat it.
  *
- * This does NOT, on its own, tell a limit clause from a cursor's `FETCH NEXT
- * FROM <cursor>` statement — that also matches `fetch\s+(?:first|next)`
- * literally. It is the caller's `returnsRows` gate that keeps this function
- * from ever being asked about one: a bare cursor `FETCH` statement does not
- * start with `SELECT`, a `(`, or a read-only `WITH`, so {@link RETURNS_ROWS}
- * (and the checks beside it) already excludes it before this runs.
+ * The index is what lets the caller run {@link hashCommentPrecedesClause} on
+ * it: CodeRabbit review 5253101335 (thread r4051099532) noted that on
+ * `dialect: 'unknown'` — where the app lands when the dialect probe fails,
+ * and a MySQL server is a live possibility behind that failure — an unmasked
+ * `#` on the same line as the clause makes it ambiguous exactly the way it
+ * already makes a trailing locking clause ambiguous: on MySQL that text is a
+ * comment and the SELECT runs unbounded, so reporting `in-statement` would
+ * claim a bound that does not exist. The two clause spellings get the same
+ * ruling here for the same reason `hashCommentPrecedesClause` already gives
+ * it to the locking-clause case, and the guard returns before the append
+ * path, so the SQL sent is never changed by it — only the meta line is, from
+ * `in-statement` to `none`.
+ *
+ * This does NOT, on its own, tell a `FETCH` limit clause from a cursor's
+ * `FETCH NEXT FROM <cursor>` statement — that also matches
+ * `fetch\s+(?:first|next)` literally. It is the caller's `returnsRows` gate
+ * that keeps this function from ever being asked about one: a bare cursor
+ * `FETCH` statement does not start with `SELECT`, a `(`, or a read-only
+ * `WITH`, so {@link RETURNS_ROWS} (and the checks beside it) already excludes
+ * it before this runs.
  *
  * @param sql - The statement.
  * @param dialect - The engine dialect.
- * @returns True when a top-level `FETCH FIRST`/`FETCH NEXT ... ONLY` (or
- *          `... WITH TIES`) clause is present.
+ * @returns The clause's start index, or -1 when none is present.
  */
-function hasFetchLimit(sql: string, dialect: SqlDialect): boolean {
+function inStatementLimitAt(sql: string, dialect: SqlDialect): number {
 	const masked = codeOnly(sql, dialect);
-	return keywordSites(sql, ['fetch'], dialect).some((site) => site.depth === 0 && FETCH_LIMIT_HEAD.test(masked.slice(site.index)));
+	for (const site of keywordSites(sql, ['limit', 'fetch'], dialect)) {
+		if (site.depth !== 0) continue;
+		if (site.keyword === 'limit' || FETCH_LIMIT_HEAD.test(masked.slice(site.index))) return site.index;
+	}
+	return -1;
 }
 
 /**
@@ -459,22 +476,33 @@ export function applyRowLimit(sql: string, limit: string, dialect: SqlDialect = 
 	// clause that bounds the OUTERMOST query counts: one inside a subquery, a
 	// CTE body or a parenthesised set member bounds that member, and reporting
 	// it as the result's bound would let an unbounded outer SELECT stream every
-	// row into the browser under a meta line that says otherwise (`hasFetchLimit`
+	// row into the browser under a meta line that says otherwise (`inStatementLimitAt`
 	// reads depth off `keywordSites` for exactly this reason). A statement
 	// bounded either way is always left untouched, never treated as an app cap:
 	// `WITH TIES` can return MORE rows than the number named, which the header's
 	// numeric limit could never express, so the honest report is `in-statement`
 	// ("limit in statement"), not a row count the app claims to have enforced.
-	// This is also why `FETCH ... ONLY` needs its own check rather than reusing
-	// `hasTopLevelKeyword` unchanged: `LIMIT` is the only keyword that spells a
-	// row limit on its own, but a bare `fetch` is not — it must be followed by
-	// `FIRST`/`NEXT` to be one, which is what `FETCH_LIMIT_HEAD` tests for.
-	// Neither this function nor `hasFetchLimit` needs to rule out a cursor's
-	// `FETCH NEXT FROM <cursor>`: that statement does not reach here at all,
-	// because it fails `returnsRows` above (it is not a SELECT, a parenthesised
-	// set expression, or a read-only WITH chain) — the same reason it never
-	// reached the old LIMIT-only check either.
-	if (returnsRows && (hasTopLevelKeyword(sql, 'limit', dialect) || hasFetchLimit(sql, dialect))) {
+	// This is also why `FETCH ... ONLY` cannot be read with a plain top-level
+	// keyword search: `LIMIT` is the only keyword that spells a row limit on
+	// its own, but a bare `fetch` is not — it must be followed by `FIRST`/
+	// `NEXT` to be one, which is what `FETCH_LIMIT_HEAD` tests for, and
+	// `inStatementLimitAt` runs it. Neither that function nor this one needs to
+	// rule out a cursor's `FETCH NEXT FROM <cursor>`: that statement does not
+	// reach here at all, because it fails `returnsRows` above (it is not a
+	// SELECT, a parenthesised set expression, or a read-only WITH chain) — the
+	// same reason it never reached the old LIMIT-only check either.
+	const ownLimitAt = returnsRows ? inStatementLimitAt(sql, dialect) : -1;
+	if (ownLimitAt >= 0) {
+		// Unless the clause sits behind an unmasked `#` on ITS OWN line, where —
+		// same ruling as the locking-clause guard just below — the text may be a
+		// comment on a dialect that does not mask `#`, and `unknown` is where the
+		// app lands when the dialect probe fails, so a MySQL server reading that
+		// text as a comment is a live possibility. Nothing is rewritten either
+		// way: this guard returns before the append path runs, so the SQL sent
+		// is byte-identical to the input; only the meta line changes, from
+		// `limit in statement` to `no limit applied`, which is the honest read
+		// when the clause might not exist on the server that actually runs it.
+		if (hashCommentPrecedesClause(sql, ownLimitAt, dialect)) return { sql, limit: null, state: 'none' };
 		return { sql, limit: null, state: 'in-statement' };
 	}
 	if (limit === 'All' || !returnsRows) return { sql, limit: null, state: 'none' };

@@ -605,17 +605,54 @@ describe('applyRowLimit', () => {
 			}
 		});
 
-		it('matches the existing # parity ruling for LIMIT: unmasked on unknown, so fetch reads as a real clause there', () => {
-			// applyRowLimit('SELECT * FROM t # limit 5', '200', 'unknown') already
-			// returns in-statement today; the FETCH spelling must agree with it
-			// instead of inventing a third behaviour. Nothing is rewritten and no
-			// invalid SQL is sent — only the meta line is optimistic, as it already
-			// is for LIMIT.
-			assert.deepEqual(applyRowLimit('SELECT * FROM t # fetch first 10 rows only', '200', 'unknown'), {
-					sql: 'SELECT * FROM t # fetch first 10 rows only',
-					limit: null,
-					state: 'in-statement',
-			});
+		it('defers to the same-line # ambiguity guard for its OWN limit clause, on both spellings, everywhere but mysql', () => {
+			// CodeRabbit 5253101335 (thread r4051099532): on `unknown` — where the
+			// app lands when the dialect probe fails, and a MySQL server is a live
+			// possibility behind that failure — an unmasked `#` on the same line as
+			// the statement's own LIMIT/FETCH clause makes the clause ambiguous:
+			// on MySQL, that text is a comment and the SELECT runs unbounded, so
+			// reporting `limit in statement` would claim a bound that does not
+			// exist. Both spellings now defer to the existing
+			// `hashCommentPrecedesClause` guard and report `none` instead — the
+			// same ruling the locking-clause case already uses. Nothing is
+			// rewritten either way: the guard returns before the append path, so
+			// the SQL sent is byte-identical to the input in every case here.
+			for (const [statement, dialect] of [
+				['SELECT * FROM t # fetch first 10 rows only', 'unknown'],
+				['SELECT * FROM t # limit 5', 'unknown'],
+				['SELECT * FROM t # fetch first 10 rows only', 'postgres'],
+				['SELECT * FROM t # limit 5', 'postgres'],
+			] as const) {
+				assert.deepEqual(applyRowLimit(statement, '200', dialect), { sql: statement, limit: null, state: 'none' }, `${statement} (${dialect})`);
+			}
+		});
+
+		it('still appends the limit on mysql, where # is a real comment and masked out', () => {
+			// mysql masks `#`, so `hashCommentPrecedesClause` short-circuits and the
+			// guard never fires — unchanged by this fix.
+			for (const [statement, expectedSql] of [
+				['SELECT * FROM t # fetch first 10 rows only', 'SELECT * FROM t # fetch first 10 rows only\nLIMIT 200'],
+				['SELECT * FROM t # limit 5', 'SELECT * FROM t # limit 5\nLIMIT 200'],
+			] as const) {
+				assert.deepEqual(applyRowLimit(statement, '200', 'mysql'), { sql: expectedSql, limit: 200, state: 'applied' }, statement);
+			}
+		});
+
+		it('does not extend the # guard past the same line, on either spelling', () => {
+			// A `#` on an EARLIER line comments out nothing the clause depends on,
+			// so the clause on the next line still reads as a real in-statement
+			// limit — exactly like the locking-clause case.
+			for (const statement of ['SELECT * FROM t # note\nfetch first 10 rows only', 'SELECT * FROM t # note\nlimit 5']) {
+				assert.deepEqual(applyRowLimit(statement, '200', 'unknown'), { sql: statement, limit: null, state: 'in-statement' }, statement);
+			}
+		});
+
+		it('does not let a # inside a string literal fire the guard, on either spelling', () => {
+			// The `#` is masked out of `codeOnly` because it sits inside a string
+			// literal, so the guard cannot see it — unchanged by this fix.
+			for (const statement of ["SELECT '#' AS a FROM t limit 5", "SELECT '#' AS a FROM t fetch first 10 rows only"]) {
+				assert.deepEqual(applyRowLimit(statement, '200', 'unknown'), { sql: statement, limit: null, state: 'in-statement' }, statement);
+			}
 		});
 
 	});

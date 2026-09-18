@@ -187,6 +187,16 @@ clause out of the comment. On a PostgreSQL connection this also costs the
 limit on a statement that uses `#` as an operator on that line; write the
 statement on two lines to have it bounded.
 
+The same ambiguity applies to the statement's OWN limit clause. A `LIMIT` or
+`FETCH { FIRST | NEXT } … ONLY` that sits behind an unmasked `#` on the same
+line reads as `no limit applied`, not `limit in statement`, on any connection
+but MySQL — including one whose dialect could not be probed, where a MySQL
+server is a live possibility. On MySQL that text is an ordinary comment and
+the statement runs with no bound at all, so claiming `limit in statement`
+would report a bound that does not exist on the server that actually runs it.
+Nothing is rewritten: the statement goes out exactly as typed either way,
+only the reported line changes.
+
 One exception, older than this rule: a `WITH` chain that contains `FOR
 UPDATE` or `FOR NO KEY UPDATE` anywhere — in a CTE body as much as in the
 chain's own last clause — is read as a data-modifying chain, because the
@@ -438,11 +448,12 @@ statements ran either way; only the app's picture of the schema is behind.
   inserts its `LIMIT` before a trailing locking clause so the read stays
   bounded and valid on both. `SELECT … FOR UPDATE` is therefore sent as
   `SELECT …` / `LIMIT 200` / `FOR UPDATE`. Two shapes keep no limit at
-  all — a clause behind a `#` on the same line (sent untouched) and a
-  `WITH` chain containing `FOR UPDATE` or `FOR NO KEY UPDATE` (classified
-  as a write) — and a third keeps the old appended placement: a locking
-  clause trailed by the statement's own `OFFSET`, where the `LIMIT` is
-  appended after `OFFSET` rather than inserted before the clause.
+  all — a locking clause OR the statement's own limit clause behind a `#`
+  on the same line (sent untouched) and a `WITH` chain containing `FOR
+  UPDATE` or `FOR NO KEY UPDATE` (classified as a write) — and a third
+  keeps the old appended placement: a locking clause trailed by the
+  statement's own `OFFSET`, where the `LIMIT` is appended after `OFFSET`
+  rather than inserted before the clause.
 - **Duplicate column names collapse.** A projection that returns two columns
   with the same name shows one: the node hands back each row as an object
   keyed by column name, and the grid takes its headers from the first row.
