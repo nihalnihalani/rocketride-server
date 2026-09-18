@@ -43,6 +43,7 @@ import threading
 import pytest
 from sqlalchemy import MetaData, Table as SQLTable, Text, create_engine, event, insert
 from sqlalchemy.dialects import mysql, postgresql, sqlite
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.pool import StaticPool
 
 import ai.common.database.db_global_base as db_global_base_module
@@ -327,6 +328,106 @@ def test_concurrent_refresh_schema_calls_all_succeed(shared_instance):
     assert errors == []
     assert len(results) == 4
     assert all('widgets' in result['tables'] for result in results)
+
+
+class _FakeReflectionError(Exception):
+    """Stand-in for the DBAPI error a driver raises while reflecting a table."""
+
+
+def _reflection_that_fails_on(monkeypatch, table_name):
+    """Make ``inspect().get_columns(table_name)`` raise a wrapped driver error.
+
+    Patches the ``inspect`` symbol ``_getDatabaseSchema`` resolves, so the walk
+    fails exactly where a real permission or lock error would: part-way through,
+    after ``get_table_names`` has already succeeded. No PostgreSQL is available
+    here to revoke a grant on, so the failure is injected rather than provoked.
+    """
+    real_inspect = db_global_base_module.inspect
+
+    class _FailingInspector:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+        def get_columns(self, name, *args, **kwargs):
+            if name == table_name:
+                orig = _FakeReflectionError(f'permission denied for table {name}')
+                raise DBAPIError.instance(f'PRAGMA table_info("{name}")', {}, orig, dbapi_base_err=Exception)
+            return self._inner.get_columns(name, *args, **kwargs)
+
+    monkeypatch.setattr(db_global_base_module, 'inspect', lambda engine: _FailingInspector(real_inspect(engine)))
+
+
+def test_refresh_schema_reports_a_failed_reflection_with_the_driver_message(instance, monkeypatch):
+    """A reflection failure must not reach the agent as the SQLAlchemy repr.
+
+    ``_getDatabaseSchema`` has no per-table guard, so one failing
+    ``get_columns`` propagates out of the whole walk. Unguarded, that exception
+    left refresh_schema as the one tool in this file whose error text still
+    carried ``[SQL: …]`` — and reached a caller with no allow_execute gate in
+    front of them.
+    """
+    instance.execute({'sql': 'CREATE TABLE widgets (id INTEGER PRIMARY KEY, label TEXT)'})
+    _reflection_that_fails_on(monkeypatch, 'widgets')
+
+    with pytest.raises(RuntimeError) as excinfo:
+        instance.refresh_schema({})
+
+    message = str(excinfo.value)
+    assert message.startswith('Schema refresh failed: ')
+    assert 'permission denied for table widgets' in message
+    assert '[SQL:' not in message
+    assert 'PRAGMA' not in message
+
+
+def test_a_failed_refresh_leaves_both_caches_exactly_as_they_were(instance, monkeypatch):
+    """Publish all or nothing: a half-walked database must not become the cache.
+
+    The two caches move together or not at all. Clearing ``IGlobal.schema``
+    while ``db_schema`` kept its old value would leave the node claiming a
+    refresh it did not perform, and re-arming the insert lane's lazy rebuild
+    against a database that just refused to be reflected.
+    """
+    iglobal = instance.IGlobal
+    iglobal.table = 'widgets'
+
+    instance.execute({'sql': 'CREATE TABLE widgets (id INTEGER PRIMARY KEY, label TEXT)'})
+    instance.refresh_schema({})
+    iglobal.schema = {name: (col_type, '') for name, col_type in iglobal._getTableSchema('widgets')}
+    db_schema_before = dict(iglobal.db_schema)
+    schema_before = dict(iglobal.schema)
+
+    instance.execute({'sql': 'CREATE TABLE gadgets (id INTEGER PRIMARY KEY)'})
+    _reflection_that_fails_on(monkeypatch, 'widgets')
+
+    with pytest.raises(RuntimeError):
+        instance.refresh_schema({})
+
+    assert iglobal.db_schema == db_schema_before
+    assert 'gadgets' not in iglobal.db_schema
+    assert iglobal.schema == schema_before
+
+
+def test_refresh_schema_releases_the_lock_when_the_reflection_fails(instance, monkeypatch):
+    """A failure inside the locked block must not strand later callers.
+
+    The ``with`` statement already guarantees this; the test is here because a
+    refresh that raises is new behaviour and ``_REFLECT_LOCK`` is process-wide,
+    so a leak would wedge every node in the engine, not just this one.
+    """
+    instance.execute({'sql': 'CREATE TABLE widgets (id INTEGER PRIMARY KEY)'})
+    _reflection_that_fails_on(monkeypatch, 'widgets')
+
+    with pytest.raises(RuntimeError):
+        instance.refresh_schema({})
+
+    assert _REFLECT_LOCK.acquire(timeout=5)
+    _REFLECT_LOCK.release()
+
+    monkeypatch.undo()
+    assert 'widgets' in instance.refresh_schema({})['tables']
 
 
 def test_refresh_schema_invalidates_the_insert_lane_column_map(instance):

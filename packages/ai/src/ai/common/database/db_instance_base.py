@@ -541,9 +541,35 @@ class DatabaseInstanceBase(IInstanceBase, ABC):
         Reflection and publication run under a process-wide lock so concurrent
         callers neither repeat the full table walk nor race on the cache.
         Declares no input; anything passed is ignored.
+
+        Publication is all-or-nothing. ``_getDatabaseSchema`` walks every table
+        with no per-table guard, so one ``get_columns`` the database refuses --
+        a revoked grant, a lock timeout, a table dropped mid-walk -- ends the
+        whole walk. Neither cache is touched in that case: the node keeps
+        serving the schema it had and says the refresh failed, rather than
+        publishing a half-walked database or, worse, emptying ``IGlobal.schema``
+        (which would re-arm the insert lane's lazy rebuild against a database
+        that just refused to be reflected) while ``db_schema`` still held the
+        old value. Skipping the offending table and continuing, the way
+        ``_getTableSchema`` warns and returns None for a single table, was the
+        other option; it is rejected here because the LLM path cannot tell a
+        table that vanished from one that could not be read, and would write
+        queries as if it were gone.
         """
         with _REFLECT_LOCK:
-            self.IGlobal.db_schema = self.IGlobal._getDatabaseSchema()
+            try:
+                refreshed = self.IGlobal._getDatabaseSchema()
+            except Exception as e:
+                # The full exception -- statement echo and all -- goes to the
+                # server log; the caller gets the driver's own sentence. This
+                # tool is not behind the `allow_execute` gate, so `str(e)` here
+                # would hand the reflection statement to a caller who was never
+                # granted raw SQL.
+                error(f'Failed to refresh the schema of database "{self.IGlobal.database}": {e}')
+                # `from None` keeps the driver traceback out of the tool response.
+                raise RuntimeError(f'Schema refresh failed: {self.IGlobal._format_db_error(e)}') from None
+
+            self.IGlobal.db_schema = refreshed
             # `db_schema` is not the only start-up snapshot: `IGlobal.schema`
             # holds the configured table's column map, and `_insertData`
             # iterates it to build every answers-lane INSERT. Leaving it alone
