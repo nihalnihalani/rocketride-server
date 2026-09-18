@@ -43,7 +43,7 @@ import threading
 import pytest
 from sqlalchemy import MetaData, Table as SQLTable, Text, create_engine, event, insert
 from sqlalchemy.dialects import mysql, postgresql, sqlite
-from sqlalchemy.exc import DBAPIError
+from sqlalchemy.exc import DBAPIError, NoSuchTableError
 from sqlalchemy.pool import StaticPool
 
 import ai.common.database.db_global_base as db_global_base_module
@@ -383,6 +383,48 @@ def test_refresh_schema_reports_a_failed_reflection_with_the_driver_message(inst
     assert 'permission denied for table widgets' in message
     assert '[SQL:' not in message
     assert 'PRAGMA' not in message
+
+
+def test_refresh_schema_names_a_table_dropped_mid_walk(instance, monkeypatch):
+    """The one reflection failure with no driver sentence must still read as one.
+
+    A table dropped between ``get_table_names`` and its ``get_columns`` makes
+    SQLAlchemy raise ``NoSuchTableError``, which carries the table name and
+    nothing else — no ``.orig``, no server text — so the generic formatter
+    would answer "Schema refresh failed: ghost". Constructed here (the drop is
+    injected rather than raced against a live server), but the exception is the
+    one SQLite, PostgreSQL and MySQL all raise from ``Inspector.get_columns``
+    for a table that is not there.
+    """
+    instance.execute({'sql': 'CREATE TABLE widgets (id INTEGER PRIMARY KEY, label TEXT)'})
+    instance.refresh_schema({})
+    db_schema_before = dict(instance.IGlobal.db_schema)
+
+    real_inspect = db_global_base_module.inspect
+
+    class _GhostInspector:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+        def get_table_names(self, *args, **kwargs):
+            return [*self._inner.get_table_names(*args, **kwargs), 'ghost']
+
+        def get_columns(self, name, *args, **kwargs):
+            if name == 'ghost':
+                raise NoSuchTableError('ghost')
+            return self._inner.get_columns(name, *args, **kwargs)
+
+    monkeypatch.setattr(db_global_base_module, 'inspect', lambda engine: _GhostInspector(real_inspect(engine)))
+
+    with pytest.raises(RuntimeError) as excinfo:
+        instance.refresh_schema({})
+
+    message = str(excinfo.value)
+    assert message == 'Schema refresh failed: table "ghost" disappeared while it was being reflected'
+    assert instance.IGlobal.db_schema == db_schema_before
 
 
 def test_a_failed_refresh_leaves_both_caches_exactly_as_they_were(instance, monkeypatch):

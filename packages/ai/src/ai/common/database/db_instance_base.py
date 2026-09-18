@@ -554,7 +554,11 @@ class DatabaseInstanceBase(IInstanceBase, ABC):
         Publication is all-or-nothing. ``_getDatabaseSchema`` walks every table
         with no per-table guard, so one ``get_columns`` the database refuses --
         a revoked grant, a lock timeout, a table dropped mid-walk -- ends the
-        whole walk. Neither cache is touched in that case: the node keeps
+        whole walk. The dropped-table case is reported in its own words
+        because SQLAlchemy raises ``NoSuchTableError`` for it, whose only
+        argument is the table name: formatted like any other driver error it
+        would read ``Schema refresh failed: <name>``. Neither cache is touched
+        in either case: the node keeps
         serving the schema it had and says the refresh failed, rather than
         publishing a half-walked database or, worse, emptying ``IGlobal.schema``
         (which would re-arm the insert lane's lazy rebuild against a database
@@ -568,6 +572,21 @@ class DatabaseInstanceBase(IInstanceBase, ABC):
         with self.IGlobal.reflect_lock:
             try:
                 refreshed = self.IGlobal._getDatabaseSchema()
+            except NoSuchTableError as e:
+                # The "dropped mid-walk" case above raises this, and it is the
+                # one reflection failure with no driver sentence behind it:
+                # SQLAlchemy builds it from the table name alone, so `args[0]`
+                # IS the name and the generic formatter would answer
+                # "Schema refresh failed: ghost" -- a bare noun the caller
+                # cannot tell from a database message. Name what happened.
+                missing = e.args[0] if e.args else str(e)
+                error(
+                    f'Failed to refresh the schema of database "{self.IGlobal.database}": '
+                    f'table "{missing}" disappeared between the table list and its reflection'
+                )
+                raise RuntimeError(
+                    f'Schema refresh failed: table "{missing}" disappeared while it was being reflected'
+                ) from None
             except Exception as e:
                 # The full exception -- statement echo and all -- goes to the
                 # server log; the caller gets the driver's own sentence. This
