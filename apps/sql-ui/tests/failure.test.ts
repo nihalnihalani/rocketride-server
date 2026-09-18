@@ -289,6 +289,21 @@ describe('applyRowLimit', () => {
 		);
 	});
 
+	it('bounds a WITH chain that ends in a locking clause, except the two the classifier reads as writes', () => {
+		// `FOR SHARE` and `FOR KEY SHARE` carry no word the CTE classification
+		// treats as a write, so the chain is a read and takes the inserted
+		// limit. `FOR UPDATE` and `FOR NO KEY UPDATE` do carry one — the
+		// classifier takes the clause's `UPDATE` for the chain's verb — so the
+		// chain is classified as a write and gets no limit at all. That is a
+		// gap in the WITH-chain classification rather than in this rule, and it
+		// predates it; pinned here so it cannot change unnoticed.
+		assert.equal(
+			applyRowLimit('WITH x AS (SELECT 1) SELECT * FROM x FOR SHARE', '200', 'postgres').sql,
+			'WITH x AS (SELECT 1) SELECT * FROM x\nLIMIT 200\nFOR SHARE',
+		);
+		assert.equal(applyRowLimit('WITH x AS (SELECT 1) SELECT * FROM x FOR UPDATE', '200', 'postgres').state, 'none');
+	});
+
 	it('appends at the END when a limit clause already follows the locking clause', () => {
 		// PostgreSQL also accepts `... FOR UPDATE OFFSET 5`, where the
 		// statement's own limit clause is the last thing in it. Inserting
