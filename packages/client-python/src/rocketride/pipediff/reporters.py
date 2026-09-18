@@ -614,9 +614,14 @@ def _md_cell(text: str) -> str:
 
     ``test_pipediff_reporters.py`` pins both halves of this: the exact bytes this
     function emits, and that each of them splits back to the original value in a
-    row that keeps its column count -- resolved with the scanner rule directly so
-    the check runs everywhere, and cross-checked against ``cmarkgfm`` when that
-    optional renderer is installed.
+    row that keeps its column count. That second half is checked twice over the
+    same corpus -- once by applying the scanner rule directly, so it runs on any
+    interpreter, and once by rendering the row through ``cmarkgfm`` (the same
+    cmark-gfm GitHub renders comments with), which decides the question rather
+    than restating our model of it. CI runs both: ``cmarkgfm`` is installed into
+    the engine interpreter from ``packages/client-python/tests/requirements.txt``
+    by the ``client-python:setup-test-deps`` step, so the renderer cross-check is
+    only skipped on a local interpreter that lacks it.
 
     This function assumes code-span input; plain text with backslashes would need
     a different escape, and no caller passes any.

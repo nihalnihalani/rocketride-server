@@ -46,7 +46,11 @@ from typing import Optional, Tuple
 from rocketride.pipediff import EdgeChange, FieldChange, NodeChange, PipeDiff
 from rocketride.pipediff.reporters import _md_cell, render_human, render_json, render_markdown
 
-try:  # pragma: no cover - the cross-check is skipped when the renderer is absent
+# CI installs cmarkgfm into the engine interpreter from tests/requirements.txt
+# (the client-python:setup-test-deps step), so the renderer cross-check below
+# runs there. The import stays guarded only so the rest of the module still
+# collects on a local interpreter without it.
+try:  # pragma: no cover - guarded for interpreters without the renderer
     import cmarkgfm
     from cmarkgfm.cmark import Options as CmarkOptions
 except ImportError:  # pragma: no cover
@@ -550,9 +554,10 @@ class TestRenderMarkdown(unittest.TestCase):
 
         Same corpus as the ``cmarkgfm`` cross-check below, but resolved with
         ``_split_gfm_row`` so it runs everywhere -- including on an interpreter
-        that has no ``cmarkgfm`` at all. CI installs the renderer through
-        tests/requirements.txt, so both checks run there. A row that split
-        shows up here as more than three cells.
+        that has no ``cmarkgfm`` at all. CI installs the renderer into the engine
+        interpreter from tests/requirements.txt, so both checks run there; this
+        one is the fallback for a local interpreter, not the one that settles the
+        rule. A row that split shows up here as more than three cells.
         """
         for value in _GFM_ESCAPING_CORPUS:
             with self.subTest(value=value):
@@ -563,7 +568,9 @@ class TestRenderMarkdown(unittest.TestCase):
 
     @unittest.skipIf(
         cmarkgfm is None,
-        'cmarkgfm is not installed (pip install .[test]); the library-free check above covers the same rules',
+        'cmarkgfm is not installed; CI installs it from tests/requirements.txt so this runs there, '
+        'and a local interpreter can get it with `pip install .[test]` -- the library-free check above '
+        'covers the same corpus meanwhile',
     )
     def test_gfm_renders_escaped_cells_back_to_the_original_value(self) -> None:
         """
@@ -571,7 +578,9 @@ class TestRenderMarkdown(unittest.TestCase):
 
         This is the test that decides the backslash question rather than arguing
         it: for each value, the emitted row must keep its three columns and the
-        code span must contain the original value, byte for byte.
+        code span must contain the original value, byte for byte. It is not
+        optional in CI -- tests/requirements.txt installs ``cmarkgfm`` into the
+        engine interpreter the suite runs on, so this executes rather than skips.
         """
         for value in _GFM_ESCAPING_CORPUS:
             with self.subTest(value=value):
