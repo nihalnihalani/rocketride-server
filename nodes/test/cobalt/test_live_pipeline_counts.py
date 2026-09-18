@@ -82,8 +82,10 @@ _EXAMPLE_PIPE = _REPO_ROOT / 'examples' / 'cobalt-evaluation.pipe'
 
 # The example's inline dataset holds three rows; read from the file so a row
 # added there is a changed expectation here rather than a silent pass.
-_SCAN_SETTLE_SECONDS = 5.0
+_SCAN_POLL_SECONDS = 2.0
 _SCAN_TIMEOUT_SECONDS = float(os.getenv('ROCKETRIDE_COBALT_LIVE_TIMEOUT', '180'))
+# The server clamps a log read to this many events per page.
+_LOG_PAGE_EVENTS = 2000
 
 # ONE WORKER FOR THE WHOLE MODULE. ``nodes:test`` sets ROCKETRIDE_URI itself
 # (nodes/scripts/tasks.js), so this module is NOT skipped in CI, and that
@@ -163,8 +165,56 @@ def _is_score(data):
     return isinstance(answer, dict) and 'cobalt_score' in answer
 
 
+def _is_run_end(event):
+    """Whether this event is the run's terminal record.
+
+    The engine closes a run with ``apaevt_task`` ``end`` followed by
+    ``apaevt_log_lifecycle`` ``run-end``; both are written after the last flow
+    record of the run, so either one means the trace this module reads is
+    complete.
+    """
+    body = event.get('body') or {}
+    if event.get('event') == 'apaevt_log_lifecycle':
+        return body.get('action') == 'run-end'
+    if event.get('event') == 'apaevt_task':
+        return body.get('action') == 'end'
+    return False
+
+
+async def _read_since(client, pipe, started_at):
+    """Return every event this run has written so far.
+
+    ``client.log.read`` answers with ONE page and the continuum keeps every
+    earlier run of the same project and source, so on a machine that has run
+    this pipe before, the first page can lie entirely in the past. Follow the
+    ``nextSeq`` cursor to the end of the stream before deciding what the run
+    has emitted.
+
+    Args:
+        client: A connected RocketRideClient.
+        pipe: The parsed pipeline, for its project id and source.
+        started_at: Epoch seconds; events older than this belong to a previous
+            run and are dropped.
+
+    Returns:
+        This run's events, oldest first.
+    """
+    events = []
+    cursor = None
+    while True:
+        options = {'from_time': started_at, 'max_events': _LOG_PAGE_EVENTS}
+        if cursor is not None:
+            options['cursor'] = cursor
+        page = await client.log.read(pipe['project_id'], pipe['source'], **options)
+        batch = page.get('events') or []
+        events.extend(event for event in batch if (event.get('body') or {}).get('eventTime', 0) >= started_at)
+        cursor = page.get('nextSeq')
+        if not batch or cursor is None:
+            return events
+
+
 async def _run_once(client):
-    """Start the example, wait for the scan to drain, and return its trace events.
+    """Start the example, wait for the run to finish, and return its trace events.
 
     Args:
         client: A connected RocketRideClient.
@@ -182,26 +232,23 @@ async def _run_once(client):
     token = started['token']
 
     try:
-        events = []
-        settled_since = None
+        # WAIT FOR THE RUN'S TERMINAL RECORD, NOT FOR QUIET. An earlier revision
+        # treated "no new events for 5 s" as completion, which is a guess about
+        # how fast the engine is: on a loaded machine - CI runs several pytest
+        # workers and may be installing a node's dependencies at the same time -
+        # a run that has only emitted its banner goes quiet for longer than that
+        # and the assertions then run against a partial trace. Observed exactly
+        # once while trialling this module under parallel load: a trace with one
+        # question at prompt_1 instead of three. The run-end record cannot be
+        # early, so the timeout below is the only failure bound.
         deadline = time.time() + _SCAN_TIMEOUT_SECONDS
         while time.time() < deadline:
-            await asyncio.sleep(2.0)
-            page = await client.log.read(pipe['project_id'], pipe['source'], max_events=5000)
-            fresh = [
-                event
-                for event in (page.get('events') or [])
-                if (event.get('body') or {}).get('eventTime', 0) >= started_at
-            ]
-            if fresh and len(fresh) == len(events):
-                settled_since = settled_since or time.time()
-                if time.time() - settled_since >= _SCAN_SETTLE_SECONDS:
-                    return pipe, fresh
-            else:
-                settled_since = None
-            events = fresh
+            await asyncio.sleep(_SCAN_POLL_SECONDS)
+            events = await _read_since(client, pipe, started_at)
+            if any(_is_run_end(event) for event in events):
+                return pipe, events
 
-        pytest.fail(f'the example pipeline did not settle within {_SCAN_TIMEOUT_SECONDS}s')
+        pytest.fail(f'the example pipeline did not reach its run-end record within {_SCAN_TIMEOUT_SECONDS}s')
     finally:
         await client.terminate(token)
 
