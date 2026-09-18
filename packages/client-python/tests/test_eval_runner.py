@@ -31,6 +31,7 @@ pipeline override.
 """
 
 import asyncio
+import time
 from typing import Any
 
 import pytest
@@ -449,13 +450,13 @@ class TestRunSpecJudgeWiring:
             case_filter=None,
             fail_fast=False,
             judge_factory=fake_factory,
-            judge_timeout=0.05,
+            judge_timeout=0.2,
         )
 
         # The stalled judge is recorded as a case error rather than hanging
         assert report.case_results[0].passed is False
         assert '/abs/judge.pipe' in report.case_results[0].error
-        assert '0.05s' in report.case_results[0].error
+        assert '0.2s' in report.case_results[0].error
         # ...and both pipelines were still terminated
         assert sorted(fake.terminated_tokens()) == ['task-1', 'task-2']
 
@@ -480,7 +481,7 @@ class TestRunSpecJudgeWiring:
                 self._token_counter += 1
                 token = f'task-{self._token_counter}'
                 self.engine_started_tokens.append(token)
-                await asyncio.sleep(0.2)
+                await asyncio.sleep(0.5)
                 self.calls.append(('use', {'filepath': filepath, 'source': source, 'token': token}))
                 return {'token': token}
 
@@ -506,7 +507,7 @@ class TestRunSpecJudgeWiring:
             case_filter=None,
             fail_fast=False,
             judge_factory=fake_factory,
-            judge_timeout=0.05,
+            judge_timeout=0.2,
         )
 
         # The timeout fired while the judge pipeline was still being started
@@ -516,6 +517,68 @@ class TestRunSpecJudgeWiring:
         # the judge pipeline whose token the cancelled await never returned
         assert fake.engine_started_tokens == ['task-1', 'task-2']
         assert sorted(fake.terminated_tokens()) == ['task-1', 'task-2']
+
+    async def test_judge_start_outliving_the_reconcile_bound_is_cancelled(self, monkeypatch):
+        """A judge start that never lands is cancelled, so teardown stays bounded."""
+
+        class NeverLandingJudgeStartClient(FakeClient):
+            """Starts the judge pipeline and then never hands back its token."""
+
+            def __init__(self):
+                super().__init__()
+                self.judge_start_cancelled = False
+
+            async def use(self, *, filepath=None, source=None, **kwargs):
+                if filepath != '/abs/judge.pipe':
+                    return await super().use(filepath=filepath, source=source, **kwargs)
+                try:
+                    await asyncio.sleep(30)
+                except asyncio.CancelledError:
+                    self.judge_start_cancelled = True
+                    raise
+                raise AssertionError('the judge start should have been cancelled')  # pragma: no cover
+
+        captured = {}
+
+        def fake_factory(run_pipeline, default_judge_pipeline):
+            captured['run_pipeline'] = run_pipeline
+            return lambda **kwargs: None
+
+        def judging_evaluate(assertion, *, output_text, duration_ms, case_input, judge):
+            return AssertionResult(
+                spec=assertion,
+                passed=True,
+                detail=captured['run_pipeline']('/abs/judge.pipe', 'score this output'),
+            )
+
+        monkeypatch.setattr(runner_module, 'evaluate_assertion', judging_evaluate)
+        # Shrink the reconcile bound so the expiry branch is reached in test time
+        monkeypatch.setattr(runner_module, 'JUDGE_START_RECONCILE_TIMEOUT_S', 0.05)
+        fake = NeverLandingJudgeStartClient()
+
+        started = time.perf_counter()
+        report = await runner_module.run_spec(
+            fake,
+            make_spec([make_case()]),
+            case_filter=None,
+            fail_fast=False,
+            judge_factory=fake_factory,
+            judge_timeout=0.2,
+        )
+        elapsed = time.perf_counter() - started
+
+        # Teardown waited out the reconcile bound instead of the 30s start
+        assert elapsed < 5.0
+        assert report.case_results[0].passed is False
+        assert '/abs/judge.pipe' in report.case_results[0].error
+        # Only the pipeline under test produced a token to terminate
+        assert fake.terminated_tokens() == ['task-1']
+        # ...and the start that never landed was cancelled, not left running
+        for _ in range(100):
+            if fake.judge_start_cancelled:
+                break
+            await asyncio.sleep(0.01)
+        assert fake.judge_start_cancelled is True
 
     async def test_default_judge_timeout_is_finite(self):
         """The default must be a bound, not None: an unbounded wait can hang the run."""
