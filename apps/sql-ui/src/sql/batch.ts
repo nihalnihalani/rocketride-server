@@ -333,9 +333,40 @@ function trailingLockingClauseAt(sql: string, dialect: SqlDialect): number {
 }
 
 /**
+ * Whether inserting the limit at `lockingAt` would split a `#` line comment.
+ *
+ * `#` introduces a line comment in MySQL only, so {@link codeOnly} masks it
+ * for that dialect alone. On every other dialect — `unknown` included, which
+ * is where the app lands when the dialect probe fails — `SELECT * FROM t # for
+ * update` reads as a statement whose last clause is a lock, and splicing the
+ * limit in front of that clause would move `for update` onto a line of its
+ * own, OUT of the comment the user wrote it in. Sent to the MySQL server that
+ * `#` implies, the statement would then take row locks the user had commented
+ * out — the one way this rewrite can change what a statement DOES.
+ *
+ * The test is deliberately blunt: any unmasked `#` between the start of the
+ * clause's line and the clause itself sends the statement untouched with
+ * `none`, the same path a statement the app cannot bound already takes. The
+ * cost is that a PostgreSQL statement using `#` as an operator on the clause's
+ * line (`SELECT a # b FROM t FOR UPDATE`) loses its limit and reports `no
+ * limit applied` — an honest unbounded read rather than a rewritten statement.
+ *
+ * @param sql - The statement.
+ * @param lockingAt - Index the trailing locking clause starts at.
+ * @param dialect - The engine dialect.
+ * @returns True when the limit must not be inserted there.
+ */
+function hashCommentPrecedesClause(sql: string, lockingAt: number, dialect: SqlDialect): boolean {
+	if (dialect === 'mysql') return false;
+	const masked = codeOnly(sql, dialect);
+	return masked.slice(masked.lastIndexOf('\n', lockingAt) + 1, lockingAt).includes('#');
+}
+
+/**
  * How a result's row limit came about.
  *
- * - `applied` — the app appended the header's limit.
+ * - `applied` — the app added the header's limit: appended at the end, or
+ *   inserted before a trailing locking clause.
  * - `in-statement` — the statement carried its own LIMIT, so the app added
  *   none and the row count is the STATEMENT's bound, not the table's size.
  * - `none` — no limit is in play at all.
@@ -343,18 +374,22 @@ function trailingLockingClauseAt(sql: string, dialect: SqlDialect): number {
 export type LimitState = 'applied' | 'in-statement' | 'none';
 
 /**
- * Append the header's row limit to a statement that returns rows.
+ * Add the header's row limit to a statement that returns rows.
+ *
+ * The limit is APPENDED at the end, except on a statement whose last clause is
+ * a lock, where it is INSERTED before that clause — the one placement both
+ * MySQL and PostgreSQL accept.
  *
  * A statement that already carries its own LIMIT is left alone: the user's
  * limit governs, and the meta line reports that none was applied by the app.
- * Nothing is appended to writes, DDL, SHOW, EXPLAIN or DESCRIBE, where the
- * clause is either invalid or silently changes what the statement does.
+ * Nothing is added to writes, DDL, SHOW, EXPLAIN or DESCRIBE, where the clause
+ * is either invalid or silently changes what the statement does.
  *
  * @param sql - The statement.
  * @param limit - The header selection ('200', '1000' or 'All').
  * @param dialect - The engine dialect (comment syntax).
- * @returns The statement to send and the limit that was appended (null when
- *          none was).
+ * @returns The statement to send and the limit that was added (null when none
+ *          was).
  */
 export function applyRowLimit(sql: string, limit: string, dialect: SqlDialect = 'unknown'): { sql: string; limit: number | null; state: LimitState } {
 	const stripped = stripSqlComments(sql, dialect).replace(/;\s*$/, '').trim();
@@ -385,6 +420,10 @@ export function applyRowLimit(sql: string, limit: string, dialect: SqlDialect = 
 	// instead of streaming every row under a meta line that says so.
 	const lockingAt = trailingLockingClauseAt(sql, dialect);
 	if (lockingAt >= 0) {
+		// Unless the clause sits behind an unmasked `#`, where it may be text
+		// the user commented out on a dialect that does not mask `#`: breaking
+		// the line would revive it. Such a statement goes out untouched.
+		if (hashCommentPrecedesClause(sql, lockingAt, dialect)) return { sql, limit: null, state: 'none' };
 		return { sql: `${sql.slice(0, lockingAt).trimEnd()}\nLIMIT ${value}\n${sql.slice(lockingAt)}`, limit: value, state: 'applied' };
 	}
 	// The clause is joined with a NEWLINE, not a space: the checks above run on

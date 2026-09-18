@@ -317,6 +317,42 @@ describe('applyRowLimit', () => {
 		});
 	});
 
+	it('never splits a line whose locking clause sits behind an unmasked #', () => {
+		// `#` starts a line comment in MySQL only, so it is masked for that
+		// dialect alone. On `unknown` — where the app lands when the dialect
+		// probe fails — a commented-out `# for update` still reads as the
+		// statement's trailing clause, and inserting the limit in front of it
+		// would move the clause onto its own line and OUT of the comment: sent
+		// to the MySQL server that `#` implies, the statement would take row
+		// locks the user had commented out. Such a statement goes out
+		// untouched and reports no limit instead.
+		assert.deepEqual(applyRowLimit('SELECT * FROM t # for update', '200', 'unknown'), {
+			sql: 'SELECT * FROM t # for update',
+			limit: null,
+			state: 'none',
+		});
+		assert.deepEqual(applyRowLimit('SELECT * FROM t # lock in share mode', '200', 'unknown'), {
+			sql: 'SELECT * FROM t # lock in share mode',
+			limit: null,
+			state: 'none',
+		});
+		// On `mysql` the comment IS masked, so the same text is an ordinary
+		// unbounded read and takes the limit appended at the end — on a line of
+		// its own, which is what keeps it out of the comment.
+		assert.deepEqual(applyRowLimit('SELECT * FROM t # for update', '200', 'mysql'), {
+			sql: 'SELECT * FROM t # for update\nLIMIT 200',
+			limit: 200,
+			state: 'applied',
+		});
+		// A `#` on an EARLIER line comments out nothing the insertion touches,
+		// so the clause on the next line still takes the inserted limit.
+		assert.deepEqual(applyRowLimit('SELECT * FROM t # note\nFOR UPDATE', '200', 'unknown'), {
+			sql: 'SELECT * FROM t # note\nLIMIT 200\nFOR UPDATE',
+			limit: 200,
+			state: 'applied',
+		});
+	});
+
 	it('does not read a LIMIT inside a literal or a quoted identifier', () => {
 		// These already held — the in-statement test has always read masked
 		// text — and are pinned so the masking cannot be dropped from it.
