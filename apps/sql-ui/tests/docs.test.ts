@@ -153,8 +153,3 @@ describe('endpointKeyFromAnyUri', () => {
 		assert.equal(endpointKeyFromAnyUri('table:orders'), null);
 	});
 });
-
-// =============================================================================
-// TABLE EXTRACTION
-// =============================================================================
-
