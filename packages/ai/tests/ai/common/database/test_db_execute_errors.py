@@ -48,7 +48,7 @@ from sqlalchemy.pool import StaticPool
 
 import ai.common.database.db_global_base as db_global_base_module
 from ai.common.database.db_global_base import DatabaseGlobalBase
-from ai.common.database.db_instance_base import _REFLECT_LOCK, DatabaseInstanceBase, _format_table
+from ai.common.database.db_instance_base import DatabaseInstanceBase, _format_table
 
 
 # ---------------------------------------------------------------------------
@@ -101,6 +101,9 @@ def _make_instance(engine):
     iglobal.database = 'main'
     iglobal.allow_execute = True
     iglobal.max_execute_rows = 1000
+    # `beginGlobal` gives every node its own reflection lock; the concurrency
+    # tests below depend on two globals NOT sharing one, so build it the same way.
+    iglobal.reflect_lock = threading.Lock()
 
     inst = _TestableInstance.__new__(_TestableInstance)
     inst.IGlobal = iglobal
@@ -414,8 +417,9 @@ def test_refresh_schema_releases_the_lock_when_the_reflection_fails(instance, mo
     """A failure inside the locked block must not strand later callers.
 
     The ``with`` statement already guarantees this; the test is here because a
-    refresh that raises is new behaviour and ``_REFLECT_LOCK`` is process-wide,
-    so a leak would wedge every node in the engine, not just this one.
+    refresh that raises is new behaviour and a stranded ``reflect_lock`` would
+    wedge this node's answers lane and every later refresh for the life of the
+    task, with no error to say why.
     """
     instance.execute({'sql': 'CREATE TABLE widgets (id INTEGER PRIMARY KEY)'})
     _reflection_that_fails_on(monkeypatch, 'widgets')
@@ -423,8 +427,8 @@ def test_refresh_schema_releases_the_lock_when_the_reflection_fails(instance, mo
     with pytest.raises(RuntimeError):
         instance.refresh_schema({})
 
-    assert _REFLECT_LOCK.acquire(timeout=5)
-    _REFLECT_LOCK.release()
+    assert instance.IGlobal.reflect_lock.acquire(timeout=5)
+    instance.IGlobal.reflect_lock.release()
 
     monkeypatch.undo()
     assert 'widgets' in instance.refresh_schema({})['tables']
@@ -648,6 +652,75 @@ def test_refresh_schema_overlapping_a_rebuild_is_safe(file_instance, monkeypatch
     assert rows == [{'label': 'a', 'size': 1}, {'label': 'b', 'size': 2}]
 
 
+def test_a_refresh_does_not_block_another_nodes_insert(tmp_path, monkeypatch):
+    """One node's reflection must not stall a DIFFERENT node's answers lane.
+
+    The lock that serialises reflection used to be module-level, so a
+    ``refresh_schema`` walking a wide database held it across every
+    ``get_columns`` round trip while every other DB node in the same engine
+    process queued behind it on the unconditional acquire at the top of
+    ``_insertData``. That is cross-node blocking the pre-PR code never had: the
+    two nodes share no cache, so there is nothing for them to race on.
+
+    Two globals, two engines, two databases -- the only thing they shared was
+    the lock. The refresh is paused inside the column walk, so the second
+    node's insert is asserted to finish while the first is provably still
+    holding whatever lock it took.
+    """
+    engine_a = create_engine(f'sqlite:///{tmp_path / "a.db"}', connect_args={'check_same_thread': False})
+    engine_b = create_engine(f'sqlite:///{tmp_path / "b.db"}', connect_args={'check_same_thread': False})
+    inst_a = _make_instance(engine_a)
+    inst_b = _make_instance(engine_b)
+    try:
+        inst_a.IGlobal.table = 'widgets'
+        inst_b.IGlobal.table = 'widgets'
+        inst_a.execute({'sql': 'CREATE TABLE widgets (label TEXT, size INTEGER)'})
+        inst_b.execute({'sql': 'CREATE TABLE widgets (label TEXT, size INTEGER)'})
+        inst_b.IGlobal.schema = {}  # force the locked rebuild, the contended path
+
+        entered, release, armed = threading.Event(), threading.Event(), threading.Event()
+        armed.set()
+        _install_pausing_inspector(monkeypatch, entered=entered, release=release, armed=armed)
+
+        errors: list[BaseException] = []
+
+        def _refresh():
+            try:
+                inst_a.refresh_schema({})
+            except BaseException as exc:  # noqa: BLE001 - the test reports whatever escaped
+                errors.append(exc)
+
+        def _insert():
+            try:
+                inst_b._insertData([{'label': 'b', 'size': 2}])
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        refresher = threading.Thread(target=_refresh)
+        refresher.start()
+        assert entered.wait(timeout=10), 'the refresh never reached the column walk'
+
+        inserter = threading.Thread(target=_insert)
+        inserter.start()
+        # Well inside the paused walk's own 10s release timeout, so the refresh
+        # is still holding its lock when this returns either way.
+        inserter.join(timeout=5)
+        insert_finished = not inserter.is_alive()
+
+        release.set()
+        for thread in (refresher, inserter):
+            thread.join(timeout=10)
+        assert not any(thread.is_alive() for thread in (refresher, inserter))
+        assert insert_finished, "the second node's insert waited for the first node's refresh"
+        assert errors == []
+
+        assert set(inst_b.IGlobal.schema) == {'label', 'size'}
+        assert inst_b.execute({'sql': 'SELECT label, size FROM widgets'})['rows'] == [{'label': 'b', 'size': 2}]
+    finally:
+        engine_a.dispose()
+        engine_b.dispose()
+
+
 def test_a_failed_rebuild_leaves_no_partial_column_map(file_instance, monkeypatch):
     """A rebuild that dies midway must leave the cache untouched, not half built.
 
@@ -672,15 +745,15 @@ def test_a_failed_rebuild_leaves_no_partial_column_map(file_instance, monkeypatc
     assert iglobal.schema == {}
 
     # The lock is released on the failure path, not stranded.
-    assert _REFLECT_LOCK.acquire(blocking=False)
-    _REFLECT_LOCK.release()
+    assert iglobal.reflect_lock.acquire(blocking=False)
+    iglobal.reflect_lock.release()
 
 
 def test_a_concurrent_insert_waits_for_the_auto_created_column_map(file_instance, monkeypatch):
     """The auto-create path is the second writer of the map, and it publishes too.
 
     ``_createTableFromData`` created the table and then filled ``self.schema``
-    column by column, outside ``_REFLECT_LOCK`` — the same publish-then-fill
+    column by column, outside ``reflect_lock`` — the same publish-then-fill
     shape ``_getTableSchema`` was fixed for. A second first-batch arriving
     after the CREATE found a truthy one-column map, snapshotted it under the
     lock, and silently dropped every other column the row carried.

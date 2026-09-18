@@ -41,7 +41,6 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List
 
 import json
-import threading
 
 from rocketlib import IInstanceBase, debug, error, warning, tool_function
 from sqlalchemy import MetaData, Table as SQLTable, insert, text
@@ -54,14 +53,6 @@ from rocketlib.types import IInvokeLLM
 
 from .db_global_base import DEFAULT_MAX_EXECUTE_ROWS, DatabaseGlobalBase
 from .sql_safety import is_sql_safe
-
-# Serialises schema re-reflection. Reflection walks every table, so two
-# concurrent refresh_schema calls would do the same expensive work twice and
-# race to publish `IGlobal.db_schema`; readers would briefly see whichever
-# finished first. Module-level rather than per-node: refreshes are rare and a
-# process-wide lock costs nothing, while a per-instance one would need state
-# that db_global_base owns.
-_REFLECT_LOCK = threading.Lock()
 
 
 def _generated_primary_keys(table: SQLTable) -> set:
@@ -538,9 +529,13 @@ class DatabaseInstanceBase(IInstanceBase, ABC):
         is invalidated at the same time so the node is current on both paths,
         not just the one this tool returns.
 
-        Reflection and publication run under a process-wide lock so concurrent
-        callers neither repeat the full table walk nor race on the cache.
-        Declares no input; anything passed is ignored.
+        Reflection and publication run under this node's ``reflect_lock`` so
+        concurrent callers neither repeat the full table walk nor race on the
+        cache. The lock is per-IGlobal, not process-wide: the walk is
+        unbounded network I/O (the engine sets no statement timeout), and the
+        only state it guards is this node's own two caches, so a second DB node
+        in the same pipeline process has nothing to wait for. Declares no
+        input; anything passed is ignored.
 
         Publication is all-or-nothing. ``_getDatabaseSchema`` walks every table
         with no per-table guard, so one ``get_columns`` the database refuses --
@@ -556,7 +551,7 @@ class DatabaseInstanceBase(IInstanceBase, ABC):
         table that vanished from one that could not be read, and would write
         queries as if it were gone.
         """
-        with _REFLECT_LOCK:
+        with self.IGlobal.reflect_lock:
             try:
                 refreshed = self.IGlobal._getDatabaseSchema()
             except Exception as e:
@@ -583,9 +578,9 @@ class DatabaseInstanceBase(IInstanceBase, ABC):
             # Emptying rather than re-reflecting here keeps this cheap for the
             # (common) node with no answers lane wired. The rebind itself is
             # atomic, but the rebuild it re-arms is not, so `_insertData` takes
-            # `_REFLECT_LOCK` across its check, its rebuild and the snapshot it
-            # builds the batch from: that, not this assignment, is what stops a
-            # concurrent insert reading a half-built map.
+            # the same `reflect_lock` across its check, its rebuild and the
+            # snapshot it builds the batch from: that, not this assignment, is
+            # what stops a concurrent insert reading a half-built map.
             #
             # The rebuilt map is a plain reflection, so it carries columns the
             # map `_createTableFromData` curates for an auto-created table
@@ -613,8 +608,14 @@ class DatabaseInstanceBase(IInstanceBase, ABC):
             # a separate decision, not this one.
             self.IGlobal.schema = {}
             refreshed_at = datetime.now(timezone.utc).isoformat()
-            tables = {name: _format_table(info) for name, info in self.IGlobal.db_schema.items()}
 
+        # Rendering is pure formatting over `refreshed`, so it runs after the
+        # lock is dropped; holding a lock across it only widened the window in
+        # which this node's own inserts wait. `refreshed` rather than
+        # `IGlobal.db_schema` deliberately: a refresh that overtook this one
+        # between the release and here has already published its own map, and
+        # this call still owes its caller the schema IT reflected.
+        tables = {name: _format_table(info) for name, info in refreshed.items()}
         return {'database': self.IGlobal.database, 'tables': tables, 'refreshed_at': refreshed_at}
 
     # ------------------------------------------------------------------
@@ -1041,10 +1042,22 @@ class DatabaseInstanceBase(IInstanceBase, ABC):
         # map silently drops the columns not yet added, and the map it holds
         # must not change size while the per-row loop iterates it.
         #
+        # Every batch takes the lock, even the common case where the map is
+        # already built and the body is one falsy test. The trade-off is
+        # deliberate: an uncontended acquire is a few hundred nanoseconds
+        # against an insert that is about to do network I/O, and the two
+        # cheaper shapes both cost correctness. A check-then-lock fast path has
+        # to read `IGlobal.schema` once into a local and snapshot THAT -- read
+        # it twice and a `refresh_schema` landing between the two hands this
+        # batch an empty map -- which is a second code path pinned by no test.
+        # What made the unconditional acquire expensive was that the lock was
+        # process-wide: the waiting was on OTHER nodes' reflections. `reflect_lock`
+        # is per-IGlobal, so the only thing this batch can queue behind is this
+        # node's own refresh or rebuild, which it genuinely must not read past.
+        #
         # The lock is released before the Table reflection and before the
-        # INSERT. Neither reads `IGlobal.schema`, both are slow, and holding a
-        # process-wide lock across a write would serialise every node's inserts.
-        with _REFLECT_LOCK:
+        # INSERT. Neither reads `IGlobal.schema` and both are slow.
+        with self.IGlobal.reflect_lock:
             if not self.IGlobal.schema:
                 table_schema = self.IGlobal._getTableSchema(self.IGlobal.table)
                 if table_schema:

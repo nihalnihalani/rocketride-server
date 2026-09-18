@@ -39,6 +39,7 @@ session lifecycle — is handled here and is dialect-agnostic.
 """
 
 import re
+import threading
 
 from abc import ABC, abstractmethod
 from datetime import datetime
@@ -183,6 +184,19 @@ class DatabaseGlobalBase(IGlobalBase, ABC):
     max_validation_attempts: int = 5
     allow_execute: bool = False
     max_execute_rows: int = DEFAULT_MAX_EXECUTE_ROWS
+
+    # Serialises this node's schema re-reflection: `refresh_schema`'s full
+    # table walk against `_insertData`'s lazy rebuild of `schema`, and either
+    # of those against another copy of itself. Both writers rebind `schema` and
+    # `db_schema` wholesale, and neither is read by any other IGlobal, so the
+    # state this protects is exactly one node's -- hence one lock per IGlobal,
+    # created in `beginGlobal`. A module-level lock covered the same races but
+    # also made them cross-node: a refresh walking a wide database (no
+    # statement timeout on the engine) stalled the answers lane of every DB
+    # node in the engine process, which the pre-refresh_schema code never did.
+    # `None` here rather than a real lock so that a global which never ran
+    # `beginGlobal` fails loudly instead of silently sharing class state.
+    reflect_lock: Optional[threading.Lock] = None
 
     # ------------------------------------------------------------------
     # Abstract interface — derived classes MUST implement these two methods
@@ -584,7 +598,7 @@ class DatabaseGlobalBase(IGlobalBase, ABC):
             # value mappings.
             #
             # Built locally and published in a single assignment, for the same
-            # reason `_getTableSchema` is: this runs outside `_REFLECT_LOCK`,
+            # reason `_getTableSchema` is: this runs outside `reflect_lock`,
             # and the table already exists by the time the loop starts, so a
             # second first-batch can be in `_insertData` right now. Filling
             # `self.schema` key by key let it snapshot a truthy but incomplete
@@ -705,6 +719,10 @@ class DatabaseGlobalBase(IGlobalBase, ABC):
     # ------------------------------------------------------------------
 
     def beginGlobal(self) -> None:
+        # One reflection lock per node. Created before anything can reflect, so
+        # `refresh_schema` and `_insertData` always find a real lock here.
+        self.reflect_lock = threading.Lock()
+
         # Resolve connection parameters via the subclass-provided mapping.
         raw = Config.getNodeConfig(self.glb.logicalType, self.glb.connConfig)
         params = self._connection_params(raw)
