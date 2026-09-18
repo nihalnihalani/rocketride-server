@@ -59,11 +59,10 @@ from .sql_safety import is_sql_safe
 def _generated_primary_keys(table: SQLTable) -> set:
     """Return the lowercased primary-key columns the DATABASE fills in itself.
 
-    Only reflected metadata is trusted, because binding the wrong answer is
-    destructive in both directions: binding NULL into a generated key is a
-    not-null violation on Postgres (``id SERIAL NOT NULL``), while omitting a
-    key the database does NOT generate silently writes a row with no identity
-    or fails deep inside the driver.
+    Only reflected metadata is trusted. Binding NULL into a generated key is a
+    not-null violation on Postgres (``id SERIAL NOT NULL``) and overrides a
+    server default elsewhere, so a column this set names is never bound when
+    the row does not carry a value for it.
 
     * ``table.autoincrement_column`` is SQLAlchemy's own resolution. It honours
       an ``autoincrement=True`` reflected from MySQL or PostgreSQL, and applies
@@ -74,21 +73,27 @@ def _generated_primary_keys(table: SQLTable) -> set:
       covers ``code TEXT PRIMARY KEY DEFAULT ...`` and ``GENERATED AS IDENTITY``.
 
     Everything else -- a composite key, a TEXT key with no default -- is the
-    caller's to supply, and ``_insertData`` rejects a row that omits one.
+    caller's to supply. A row that does not is NOT refused here: the column is
+    left out of the INSERT and the database answers for it.
 
-    That rejection has a known false positive, because reflection describes
-    columns and not triggers: a ``CHAR(36)`` / ``uuid`` primary key populated
-    by a ``BEFORE INSERT`` trigger (the standard MySQL UUID idiom before
-    8.0.13, and the same shape on PostgreSQL) is indistinguishable here from a
-    text key nobody fills in. A row that omits such a key is refused before the
-    transaction opens, so the trigger never runs, and on the answers lane
-    ``writeAnswers`` only logs the ``ValueError`` -- the batch disappears with
-    one log line. The documented workaround is a real column default
-    (``DEFAULT (uuid())``, ``DEFAULT gen_random_uuid()``), which reflects and
-    is honoured; the node READMEs carry it. Letting the database refuse the row
-    instead, and routing its error through ``_format_db_error``, is the other
-    option: it costs the pre-flight guarantee that a refused batch leaves
-    nothing behind, so it is a maintainer call rather than a silent change.
+    That is deliberate, and it is the narrow reading of this function's own
+    name. Reflection describes columns and not triggers, so "no default" is
+    not the same as "nobody fills it in": a ``CHAR(36)`` / ``uuid`` primary key
+    populated by a ``BEFORE INSERT`` trigger (the standard MySQL UUID idiom
+    before 8.0.13, and the same shape on PostgreSQL) is indistinguishable here
+    from a text key nobody supplies. Refusing the row before the transaction
+    opened meant the trigger never ran, and on the answers lane -- where
+    ``writeAnswers`` reduces any exception to one log line -- the whole batch
+    disappeared silently (dylan-savage, review 5215826786 item 6). Omitting the
+    column instead lets the trigger, or a default the reflection could not see,
+    supply the value; where nothing does, the database refuses the row, its own
+    message comes back through ``_format_db_error``, and the single transaction
+    wrapping the batch rolls every run back, so nothing is half written.
+
+    What this set still decides is what the node must NOT bind: a column in it
+    is left out whether the row omits it or carries an explicit null, because
+    binding NULL into a generated key is a not-null violation on Postgres
+    (``id SERIAL NOT NULL``) and overrides a server default everywhere.
 
     The set this returns, together with the server-default / identity columns
     ``_insertData`` reads off the reflected table, also decides how an explicit
@@ -662,8 +667,8 @@ class DatabaseInstanceBase(IInstanceBase, ABC):
             # The guarantee that does hold is narrower: the database still
             # fills in what it owns either way. `_insertData` leaves out any
             # generated primary-key, server-default or identity column the rows
-            # do NOT supply (and rejects an omitted key the database cannot
-            # generate), so a column present only in the reflected map is
+            # do NOT supply (and any other primary key they do not carry), so a
+            # column present only in the reflected map is
             # either left to the database or bound the NULL it would have
             # stored anyway, whichever of the two maps a given call is holding.
             #
@@ -1208,11 +1213,13 @@ class DatabaseInstanceBase(IInstanceBase, ABC):
                 return value
 
         # Build the list of row dicts, mapping incoming keys to schema column
-        # names with case-insensitive matching. Every rejection happens here,
-        # before the transaction opens, so a batch this node refuses leaves
-        # nothing behind.
+        # names with case-insensitive matching. Nothing here refuses a row: the
+        # node decides only what it must not BIND, and the database decides
+        # what it will accept. Every run of the batch shares one
+        # `engine.begin()` below, so a row the database refuses rolls the whole
+        # batch back and leaves no row of it behind.
         insert_values = []
-        for position, item in enumerate(items):
+        for item in items:
             if not isinstance(item, dict):
                 continue
 
@@ -1221,7 +1228,6 @@ class DatabaseInstanceBase(IInstanceBase, ABC):
             values: Dict[str, Any] = {}
             # Case-insensitive key lookup so 'UserName' maps to 'username'.
             item_lower_keys = {k.lower(): k for k in item.keys()}
-            missing_keys = []
             for colname in schema.keys():
                 lowered = colname.lower()
                 original_key = item_lower_keys.get(lowered)
@@ -1252,20 +1258,31 @@ class DatabaseInstanceBase(IInstanceBase, ABC):
                     # it -- a generated key, or a server default / identity.
                     continue
                 elif lowered in pk_names:
-                    # A key the database will NOT generate and the row does not
-                    # carry. Binding NULL would write a row with no identity (or
-                    # fail deep in the driver), so say so.
-                    missing_keys.append(colname)
+                    # A primary key reflection does not show as generated, that
+                    # the row does not carry. This used to be a pre-flight
+                    # ValueError; it is an omission now. Reflection describes
+                    # columns, not triggers, so "no default" does not mean
+                    # "nobody fills it in" -- the standard pre-8.0.13 MySQL UUID
+                    # idiom is a CHAR(36) key filled by a BEFORE INSERT trigger,
+                    # which reflects exactly like a key nobody supplies, and
+                    # refusing the row meant the trigger never ran. Leaving the
+                    # column out lets it run. Binding NULL is still not an
+                    # option: an explicit NULL suppresses both a trigger's
+                    # NEW-value default and a server default, so the choice is
+                    # between omitting the column and refusing the row, and
+                    # refusing it is the database's call, not this node's.
+                    #
+                    # SQLAlchemy emits a SAWarning for exactly this shape ("is
+                    # marked as a member of the primary key ... and no explicit
+                    # value is passed"). It is correct to warn and wrong to
+                    # silence: the statement really does leave a key to the
+                    # database, which is the point. It lands in the server log,
+                    # not in the tool response.
+                    continue
                 else:
                     # Column in schema, no value in the row, no default behind
                     # it — insert NULL.
                     values[colname] = None
-            if missing_keys:
-                raise ValueError(
-                    f'Row {position} of the batch for table "{self.IGlobal.table}" does not supply '
-                    f'primary-key column(s) {", ".join(missing_keys)}, which the database does not generate'
-                )
-
             insert_values.append(values)
 
         if insert_values:
@@ -1291,18 +1308,32 @@ class DatabaseInstanceBase(IInstanceBase, ABC):
                             conn.execute(insert(table), run)
                             continue
                         # Nothing left to bind: every column of these rows is
-                        # database-generated. Handing the statement no values at
-                        # all lets SQLAlchemy render the dialect's own form
-                        # (`DEFAULT VALUES` on PostgreSQL and SQLite,
-                        # `() VALUES ()` on MySQL) instead of binding NULL into
-                        # a key the database was about to generate.
+                        # the database's to fill -- generated, defaulted, or a
+                        # key this node declines to guess at. Handing the
+                        # statement no values at all lets SQLAlchemy render the
+                        # dialect's own form (`DEFAULT VALUES` on PostgreSQL and
+                        # SQLite, `() VALUES ()` on MySQL) instead of binding
+                        # NULL into a column the database was about to fill.
                         for _ in run:
                             conn.execute(insert(table))
                 debug(f"Inserted {len(insert_values)} records into '{self.IGlobal.table}' in {len(runs)} run(s).")
             except Exception as e:
-                # The context manager has already rolled back; re-raise so the
-                # caller can decide how to surface the failure.
+                # The context manager has already rolled back every run of the
+                # batch; nothing of it is written. The full exception --
+                # statement echo and bound values included -- goes to the server
+                # log, and the caller gets the driver's own sentence through the
+                # same formatter the `execute` tool uses. That matters more now
+                # that the node no longer refuses a row itself: a key nothing
+                # fills in fails HERE, and "NOT NULL constraint failed:
+                # codes.code" is what says so. A failure that is not a database
+                # failure (no `.orig`, not a SQLAlchemy error) is re-raised
+                # untouched -- same duck-test as `_executeRawQuery`.
                 error(f'Error inserting data into "{self.IGlobal.table}": {e}')
-                raise
+                if not isinstance(e, SQLAlchemyError) and getattr(e, 'orig', None) is None:
+                    raise
+                # `from None` keeps the driver traceback out of the message.
+                raise RuntimeError(
+                    f'Insert into "{self.IGlobal.table}" failed: {self.IGlobal._format_db_error(e)}'
+                ) from None
         else:
             debug('No records to insert.')

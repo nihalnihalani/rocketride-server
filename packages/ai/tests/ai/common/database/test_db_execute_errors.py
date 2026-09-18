@@ -1185,18 +1185,27 @@ def test_default_values_insert_compiles_for_postgres_mysql_and_sqlite(instance):
     assert str(statement.compile(dialect=sqlite.dialect(), column_keys=[])) == 'INSERT INTO ids DEFAULT VALUES'
 
 
-def test_insert_rejects_a_sole_primary_key_the_database_does_not_generate(instance):
-    """An empty mapping is only safe when the database really does generate the key."""
+def test_insert_leaves_a_sole_primary_key_the_database_does_not_generate_to_the_database(instance):
+    """A table that is nothing but an ungenerated key still sends a values-less INSERT.
+
+    The node used to refuse this batch before the transaction opened. It no
+    longer decides: reflection describes columns and not triggers, so "no
+    default" is not the same as "nobody fills it in". The statement carries no
+    columns and the database answers -- SQLite stores NULL for a non-INTEGER
+    primary key, PostgreSQL and MySQL reject the row and the whole batch rolls
+    back.
+    """
     iglobal = instance.IGlobal
     iglobal.table = 'codes'
 
     instance.execute({'sql': 'CREATE TABLE codes (code TEXT PRIMARY KEY)'})
     iglobal.schema = {name: (col_type, '') for name, col_type in iglobal._getTableSchema('codes')}
 
-    with pytest.raises(ValueError, match='code'):
-        instance._insertData([{'label': 'ignored'}])
+    captured = _captured_inserts(instance, [{'label': 'ignored'}])
+    assert len(captured) == 1
+    assert _statement_columns(captured[0][0]) == []
 
-    assert instance.execute({'sql': 'SELECT code FROM codes'})['rows'] == []
+    assert instance.execute({'sql': 'SELECT code FROM codes'})['rows'] == [{'code': None}]
 
 
 # ---------------------------------------------------------------------------
@@ -1404,36 +1413,90 @@ def test_insert_still_binds_null_for_an_omitted_column_without_a_default(instanc
     assert instance.execute({'sql': 'SELECT label, note FROM widgets'})['rows'] == [{'label': 'a', 'note': None}]
 
 
-def test_insert_rejects_a_composite_primary_key_column_the_row_omits(instance):
-    """A composite key is not auto-generated, so a missing half is a clear error."""
+def test_insert_omits_a_composite_primary_key_column_the_row_does_not_carry(instance):
+    """A half-supplied composite key is the database's call too, not the node's.
+
+    The omitted half is left out of that row's INSERT rather than bound NULL
+    or refused up front, so the two rows go out as two runs inside one
+    transaction. SQLite tolerates a NULL in a composite primary key; a database
+    that does not refuses the row and takes the whole batch down with it.
+    """
     iglobal = instance.IGlobal
     iglobal.table = 'pairs'
 
     instance.execute({'sql': 'CREATE TABLE pairs (a INTEGER, b INTEGER, PRIMARY KEY (a, b))'})
     iglobal.schema = {name: (col_type, '') for name, col_type in iglobal._getTableSchema('pairs')}
 
-    with pytest.raises(ValueError) as excinfo:
-        instance._insertData([{'a': 1, 'b': 2}, {'a': 3}])
+    captured = _captured_inserts(instance, [{'a': 1, 'b': 2}, {'a': 3}])
+    assert [_statement_columns(statement) for statement, _ in captured] == [['a', 'b'], ['a']]
 
-    message = str(excinfo.value)
-    assert 'b' in message
-    assert 'pairs' in message
-    assert '1' in message  # the row position
-
-    # Nothing was executed: the rejection happens before the transaction opens.
-    assert instance.execute({'sql': 'SELECT a FROM pairs'})['rows'] == []
+    rows = instance.execute({'sql': 'SELECT a, b FROM pairs ORDER BY a'})['rows']
+    assert rows == [{'a': 1, 'b': 2}, {'a': 3, 'b': None}]
 
 
-def test_insert_rejects_a_text_primary_key_without_a_default(instance):
-    """A TEXT primary key with no default is not something the database fills in."""
+def test_insert_omits_a_text_primary_key_a_trigger_might_fill(instance):
+    """The trigger idiom dylan-savage raised in review item 6, as far as SQLite can model it.
+
+    A ``CHAR(36)``/``uuid`` primary key populated by a ``BEFORE INSERT`` trigger
+    reflects exactly like a text key nobody fills in, because reflection reads
+    columns and not triggers. The node used to refuse such a row before the
+    transaction opened, so the trigger never ran and -- on the answers lane,
+    where ``writeAnswers`` only logs -- the whole batch vanished with one line.
+    Now the column is simply left out of the statement, which is what lets the
+    trigger (or a default the reflection missed) supply it. SQLite cannot set a
+    column from a trigger, so what it demonstrates here is the omission itself:
+    the INSERT carries ``label`` only and the key is left to the database.
+    """
     iglobal = instance.IGlobal
     iglobal.table = 'codes'
 
     instance.execute({'sql': 'CREATE TABLE codes (code TEXT PRIMARY KEY, label TEXT)'})
     iglobal.schema = {name: (col_type, '') for name, col_type in iglobal._getTableSchema('codes')}
 
-    with pytest.raises(ValueError, match='code'):
-        instance._insertData([{'label': 'a'}])
+    assert _compiled_insert_columns(instance, [{'label': 'a'}]) == ['label']
+    assert instance.execute({'sql': 'SELECT code, label FROM codes'})['rows'] == [{'code': None, 'label': 'a'}]
+
+
+def test_insert_surfaces_the_drivers_refusal_of_an_ungenerated_primary_key(instance):
+    """When the database does refuse the row, its own message is what comes back.
+
+    This is the other half of removing the pre-flight rejection: the node no
+    longer guesses, so a key nothing fills in has to fail at the database. The
+    failure is formatted like every other insert failure -- the driver's own
+    sentence, with SQLAlchemy's ``[SQL: ...]`` / ``[parameters: ...]`` echo cut
+    -- and the transaction that wraps every run of the batch rolls back, so no
+    row of the batch survives.
+    """
+    iglobal = instance.IGlobal
+    iglobal.table = 'codes'
+
+    instance.execute({'sql': 'CREATE TABLE codes (code TEXT NOT NULL PRIMARY KEY, label TEXT)'})
+    iglobal.schema = {name: (col_type, '') for name, col_type in iglobal._getTableSchema('codes')}
+
+    with pytest.raises(RuntimeError) as excinfo:
+        instance._insertData([{'code': 'kept', 'label': 'first'}, {'label': 'second'}])
+
+    message = str(excinfo.value)
+    assert 'NOT NULL constraint failed: codes.code' in message
+    assert '[SQL:' not in message
+    assert '[parameters:' not in message
+
+    # One transaction wraps every run, so the row that WAS accepted is gone too.
+    assert instance.execute({'sql': 'SELECT code FROM codes'})['rows'] == []
+
+
+def test_insert_still_lets_an_integer_primary_key_generate_itself(instance):
+    """The autoincrement case is untouched by the removal of the rejection."""
+    iglobal = instance.IGlobal
+    iglobal.table = 'widgets'
+
+    instance.execute({'sql': 'CREATE TABLE widgets (id INTEGER PRIMARY KEY, label TEXT)'})
+    iglobal.schema = {name: (col_type, '') for name, col_type in iglobal._getTableSchema('widgets')}
+
+    assert _compiled_insert_columns(instance, [{'label': 'a'}]) == ['label']
+
+    rows = instance.execute({'sql': 'SELECT id, label FROM widgets'})['rows']
+    assert rows == [{'id': 1, 'label': 'a'}]
 
 
 def test_insert_lets_a_server_default_primary_key_generate_itself(instance):

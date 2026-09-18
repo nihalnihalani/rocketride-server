@@ -111,16 +111,21 @@ NULL. A null supplied for any column the database fills in itself -- a
 generated primary key, a DEFAULT -- counts as not carried, since the sender on
 this lane is an upstream node that may emit every schema key with null for the
 ones it has no value for; a null on a column with nothing behind it is inserted
-as NULL as given. A primary key PostgreSQL does
-not generate that a row omits is rejected before anything runs.
+as NULL as given. A primary key PostgreSQL is
+not known to generate, and that a row omits, is left out of the statement too
+rather than refused, and PostgreSQL decides.
 
-Known limitation: whether the database generates a key is read from reflected
+The reason: whether the database generates a key is read from reflected
 metadata, which does not describe triggers. A uuid or CHAR(36) primary key
-populated by a BEFORE INSERT trigger reflects as a key with no default, so a
-row that omits it is rejected by that rule and the trigger never runs; on the
-answers lane the rejected batch is logged and dropped rather than reported to
-the caller. Give the column a real DEFAULT such as gen_random_uuid(), or have
-the upstream node supply the key.
+populated by a BEFORE INSERT trigger reflects as a key with no default, so
+refusing the row meant the trigger never ran; omitting the column is what lets
+it run, and binding NULL is not an alternative because an explicit NULL
+suppresses a trigger value and a column default alike. Where nothing fills the
+key in, PostgreSQL refuses the row and every row of the batch is rolled back;
+the failure is raised as Insert into "<table>" failed: followed by the
+database's own primary message, with the statement echo stripped. On the
+answers lane that error is logged rather than returned to the caller, so check
+the server log when a batch does not land.
 
 Database description is empty by default and is included as context when the
 node asks the LLM to write SQL. Change it when the database or table
