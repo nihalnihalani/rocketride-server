@@ -46,6 +46,16 @@ class IInstance(IInstanceBase):
     The original answer is deep-copied to prevent mutation in fan-out
     pipelines. Evaluation results are emitted as a separate JSON answer
     on the answers lane.
+
+    Exactly TWO answers leave this node per incoming answer, and the count is
+    now enforced rather than merely documented. ``writeAnswers`` ends with
+    ``preventDefault()`` on both of its exits: the engine forwards a lane
+    handler's incoming argument after the handler returns unless the handler
+    prevented it (``__checkCallParent``, ``engLib/python/call.hpp``), so
+    without the suppression the original answer arrived downstream a second
+    time and the node emitted THREE answers per input, not two. A live run of
+    ``examples/cobalt-evaluation.pipe`` with three dataset rows put 18 answers
+    into the sink instead of 6 for exactly that reason.
     """
 
     IGlobal: IGlobal
@@ -57,16 +67,25 @@ class IInstance(IInstanceBase):
         runs the configured evaluator, and emits both the original answer
         and a separate evaluation result answer downstream.
 
+        Every exit suppresses the engine's default forward, so the answers
+        this node wrote are the only ones that continue downstream.
+
         Args:
             answer: The Answer object flowing through the pipeline.
+
+        Returns:
+            The ``preventDefault()`` result, suppressing the engine's
+            post-handler forward of the incoming answer.
         """
         answer = copy.deepcopy(answer)
         evaluator = self.IGlobal._evaluator
 
         if evaluator is None:
             debug('Cobalt evaluator not initialized; passing answer through')
+            # The copy is forwarded once, in place of the original: preventing
+            # the default keeps the untouched original from arriving as well.
             self.instance.writeAnswers(answer)
-            return
+            return self.preventDefault()
 
         # Extract text from the answer
         output_text = ''
@@ -136,7 +155,9 @@ class IInstance(IInstanceBase):
         # count. This is intentional — the score travels as a sibling answer so
         # the original payload stays untouched for other consumers — but nodes
         # that assume a 1:1 answer count, or single-answer output sinks, must
-        # account for it.
+        # account for it. TWO, not three: the explicit forward below is paired
+        # with the preventDefault() at the end of this method, which stops the
+        # engine delivering the incoming answer a second time on its own.
         self.instance.writeAnswers(answer)
 
         # Emit evaluation result as a separate JSON answer. It carries a copy
@@ -155,3 +176,6 @@ class IInstance(IInstanceBase):
             }
         )
         self.instance.writeAnswers(eval_answer)
+
+        # Both writes above are explicit, so the engine must not add its own.
+        return self.preventDefault()

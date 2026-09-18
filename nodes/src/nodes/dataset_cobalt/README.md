@@ -25,7 +25,7 @@ Key behavior to know:
 
 | Lane in   | Lane out    | Description                                         |
 | --------- | ----------- | --------------------------------------------------- |
-| `_source` | `questions` | One question emitted per (transformed) dataset item |
+| `_source` | `questions` | One question emitted per (transformed) dataset item — exactly N out for N rows |
 
 The node is a source: it produces questions from the configured dataset and does not consume an upstream `questions` lane.
 
@@ -76,6 +76,10 @@ The draw always comes from a generator local to this node, never the process-glo
 ### Sampling with and without cobalt
 
 `cobalt.Dataset.sample(n)` takes no seed — it calls the module-global `random.sample` internally, in every release `requirements.txt` allows (basalt-ai-cobalt 0.1.0 through 0.2.3). Seeding it would mean seeding the process-global RNG, which is what **Sample Seed** exists to avoid. So when a seed is set the node draws the subset itself, from its own generator, and hands the result back to cobalt; with no seed, cobalt's own `sample` is used unchanged. The two lanes therefore return the same subset for the same seed, whether or not cobalt is installed.
+
+### One question per row, and nothing else
+
+For N emittable rows the node puts exactly N questions on the lane, in both modes. In filter mode the incoming question is a trigger, not content: it carries no dataset row, so the handler suppresses the engine's default forward rather than letting the bare template travel on beside the N real questions. When no dataset loaded there is nothing to ask at all, and that exit stays silent too — a promptless question downstream is answered by the LLM and scored by `eval_cobalt` against a reference, producing a low score indistinguishable from a weak model.
 
 ### Dependency
 

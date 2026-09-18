@@ -52,7 +52,24 @@ _NODES_DIR = str(_REPO_ROOT / 'nodes' / 'src' / 'nodes')
 # to import/runtime windows.
 _rocketlib = ModuleType('rocketlib')
 _rocketlib.IGlobalBase = type('IGlobalBase', (), {})
-_rocketlib.IInstanceBase = type('IInstanceBase', (), {})
+
+
+class _IInstanceBase:
+    """Stand-in for the engine's instance base.
+
+    ``preventDefault()`` raises here, as ``rocketlib.filters`` does: the engine
+    signals "do not run the default forward" by raising ``Ec.PreventDefault``,
+    and ``eval_cobalt.writeAnswers`` ends in it on every exit. Pinning the stub
+    rather than letting the real ``rocketlib`` be picked up keeps these tests
+    independent of which sibling module imported first.
+    """
+
+    def preventDefault(self):
+        """Raise, as the real implementation does."""
+        raise Exception('No default to prevent')
+
+
+_rocketlib.IInstanceBase = _IInstanceBase
 _rocketlib.OPEN_MODE = type('OPEN_MODE', (), {'CONFIG': 'CONFIG'})()
 _rocketlib.warning = MagicMock()
 _rocketlib.debug = MagicMock()
@@ -654,6 +671,24 @@ class TestDeepCopyPrevention:
         assert copied.getText() == 'mutated text'
 
 
+def _dispatch(handler):
+    """Run a lane handler the way the engine runs one, asserting it suppressed the default.
+
+    The engine forwards a handler's incoming argument after the handler returns
+    unless the handler raised ``Ec.PreventDefault`` (``__checkCallParent``,
+    ``engLib/python/call.hpp``). ``dataset_cobalt.writeQuestions`` and
+    ``eval_cobalt.writeAnswers`` both end in ``preventDefault()``, so calling
+    them directly now raises; wrapping the call keeps these tests asserting on
+    what the node emitted while pinning the suppression that keeps the emitted
+    count exact.
+
+    Args:
+        handler: Zero-argument callable that invokes the lane handler.
+    """
+    with pytest.raises(Exception, match='No default to prevent'):
+        handler()
+
+
 class TestIInstanceWriteAnswers:
     """Test the IInstance.writeAnswers method with mocked infrastructure."""
 
@@ -680,7 +715,7 @@ class TestIInstanceWriteAnswers:
         answer = MockAnswer()
         answer.setAnswer('test answer text')
 
-        inst.writeAnswers(answer)
+        _dispatch(lambda: inst.writeAnswers(answer))
 
         # Should be called twice: once with the original, once with eval result
         assert inst.instance.writeAnswers.call_count == 2
@@ -691,7 +726,7 @@ class TestIInstanceWriteAnswers:
         answer = MockAnswer()
         answer.setAnswer('test answer text')
 
-        inst.writeAnswers(answer)
+        _dispatch(lambda: inst.writeAnswers(answer))
 
         # The second call should be the evaluation result (JSON answer)
         calls = inst.instance.writeAnswers.call_args_list
@@ -719,7 +754,7 @@ class TestIInstanceWriteAnswers:
         answer.metadata = {'dataset_id': 'item-7', 'expected': 'the reference', 'nested': {'k': [1, 2]}}
         answer.setAnswer('the reference')
 
-        inst.writeAnswers(answer)
+        _dispatch(lambda: inst.writeAnswers(answer))
 
         calls = inst.instance.writeAnswers.call_args_list
         assert len(calls) == 2
@@ -736,7 +771,7 @@ class TestIInstanceWriteAnswers:
         answer = MockAnswer()
         answer.metadata = None
         answer.setAnswer('text')
-        inst.writeAnswers(answer)
+        _dispatch(lambda: inst.writeAnswers(answer))
         score_answer = inst.instance.writeAnswers.call_args_list[1][0][0]
         # The real schema Answer defaults metadata to {} (default_factory=dict); the
         # mock leaves it None. Either way nothing may be fabricated onto the score answer.
@@ -754,7 +789,7 @@ class TestIInstanceWriteAnswers:
         answer = MockAnswer()
         answer.setAnswer('test')
 
-        inst.writeAnswers(answer)
+        _dispatch(lambda: inst.writeAnswers(answer))
 
         # Should forward once without evaluation
         assert inst.instance.writeAnswers.call_count == 1
@@ -765,7 +800,7 @@ class TestIInstanceWriteAnswers:
         answer = MockAnswer()
         answer.setAnswer('original')
 
-        inst.writeAnswers(answer)
+        _dispatch(lambda: inst.writeAnswers(answer))
 
         # Original should not be mutated
         assert answer.getText() == 'original'
@@ -787,7 +822,7 @@ class TestIInstanceWriteAnswers:
             {'output': 'Paris', 'expected': 'SECRET_REF', 'context': 'SECRET_CTX', 'reference': 'SECRET_REFERENCE'}
         )
 
-        inst.writeAnswers(answer)
+        _dispatch(lambda: inst.writeAnswers(answer))
 
         inst.IGlobal._evaluator.evaluate.assert_called_once()
         output_text, expected = inst.IGlobal._evaluator.evaluate.call_args.args
@@ -810,7 +845,7 @@ class TestIInstanceWriteAnswers:
         answer = MockAnswer(expectJson=True)
         answer.setAnswer({'output': 'test', 'expected': 'EXPECTED_REF'})
 
-        inst.writeAnswers(answer)
+        _dispatch(lambda: inst.writeAnswers(answer))
 
         inst.IGlobal._evaluator.evaluate.assert_called_once()
         output_text, expected = inst.IGlobal._evaluator.evaluate.call_args.args
@@ -834,7 +869,7 @@ class TestIInstanceWriteAnswers:
         answer.metadata = {'expected': 'metadata reference'}
         answer.setAnswer('metadata reference')
 
-        inst.writeAnswers(answer)
+        _dispatch(lambda: inst.writeAnswers(answer))
 
         inst.IGlobal._evaluator.evaluate.assert_called_once_with('metadata reference', 'metadata reference')
 
@@ -854,7 +889,7 @@ class TestIInstanceWriteAnswers:
         answer.expected = 0
         answer.setAnswer('0')
 
-        inst.writeAnswers(answer)
+        _dispatch(lambda: inst.writeAnswers(answer))
 
         inst.IGlobal._evaluator.evaluate.assert_called_once_with('0', '0')
 
@@ -878,7 +913,7 @@ class TestIInstanceWriteAnswers:
         }
         answer.setAnswer('grounded response')
 
-        inst.writeAnswers(answer)
+        _dispatch(lambda: inst.writeAnswers(answer))
 
         inst.IGlobal._evaluator.evaluate.assert_called_once_with('grounded response', 'source evidence context')
 

@@ -18,7 +18,8 @@ Six evaluator types are available:
 Key behavior to know:
 
 - The answer is **deep-copied** before evaluation, so shared answer objects in fan-out pipelines are never mutated.
-- **This node emits two answers per input** on the `answers` lane: the original answer unchanged, followed by a synthetic JSON score answer. Downstream consumers that assume a 1:1 answer count, or single-answer output sinks, must account for the doubling. See [Output](#output).
+- **This node emits exactly two answers per input** on the `answers` lane: the original answer unchanged, followed by a synthetic JSON score answer. Downstream consumers that assume a 1:1 answer count, or single-answer output sinks, must account for the doubling. See [Output](#output).
+- Two, not three: the handler ends by preventing the engine's default forward. The engine passes a lane handler's incoming argument downstream after the handler returns unless the handler stops it, so before this was suppressed the untouched original arrived a third time — a live run of `examples/cobalt-evaluation.pipe` over three dataset rows put 18 answers into the sink where the contract above allows 12.
 - Before scoring a JSON answer, reserved reference keys (`expected`, `context`, `reference`) are stripped from the payload so the evaluator never grades text that already contains the reference. The strip is **shallow (top-level keys only) and applies to dict-shaped JSON answers**; references nested in sub-objects or carried in plain text are not removed.
 - The configured pass threshold is **clamped to [0.0, 1.0]** at construction, and every computed score is clamped to the same range per result, so an out-of-range config value can never produce a nonsensical verdict.
 - For grounding mode, the `expected` argument is treated as the source context. Candidate context is resolved from metadata/answer context first, then falls back to the reference/expected answer as a last resort.
@@ -31,7 +32,7 @@ Key behavior to know:
 
 | Lane in   | Lane out  | Description                                                  |
 | --------- | --------- | ------------------------------------------------------------ |
-| `answers` | `answers` | Forwards the original answer, then emits a JSON score answer |
+| `answers` | `answers` | Forwards the original answer, then emits a JSON score answer — exactly two out per one in |
 
 ## Profiles
 
@@ -75,6 +76,8 @@ Judge-mode only, and all three are effectively required: without an API key or w
 ## Notes
 
 ### Output
+
+Exactly two answers leave the node per incoming answer: the deep copy of the original, then the score. Nothing else is added — the handler suppresses the engine's post-handler forward, so the incoming answer object itself does not travel on alongside them.
 
 The score answer carries a deep copy of the incoming answer's `metadata` (for example the dataset item's `dataset_id` and `expected`), so a downstream consumer can join each score to its source item by key rather than by answer order, which is not stable across fan-out or parallel workers. Its JSON payload has these keys:
 

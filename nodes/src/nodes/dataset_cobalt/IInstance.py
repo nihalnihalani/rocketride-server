@@ -36,6 +36,13 @@ class IInstance(IInstanceBase):
 
     Emits each dataset item as an individual Question into the pipeline,
     using deep copy to prevent mutation between emitted questions.
+
+    Both emission lanes end in ``preventDefault()``. The engine forwards a lane
+    handler's incoming argument after the handler returns unless the handler
+    prevented it (``__checkCallParent``, ``engLib/python/call.hpp``), and the
+    question this node receives in filter mode is only a trigger: it carries no
+    dataset row, so letting the engine pass it on put one extra, promptless
+    question downstream next to the N real ones.
     """
 
     IGlobal: IGlobal
@@ -55,13 +62,25 @@ class IInstance(IInstanceBase):
         score indistinguishable from a weak model. The skipped rows are
         reported once, after the loop.
 
+        Exactly ``N`` questions leave this node for ``N`` emittable rows. Every
+        exit - including the no-dataset one - suppresses the engine's default
+        forward: the incoming question is a template, not content, and passing
+        it on unchanged would add a promptless question to the lane. When no
+        dataset loaded there is nothing to ask at all, so that exit stays
+        silent rather than forwarding the bare trigger, which is the same rule
+        ``renderObject`` applies in source mode.
+
         Args:
             question: Incoming Question object used as a template.
+
+        Returns:
+            The ``preventDefault()`` result, suppressing the engine's
+            post-handler forward of the template question.
         """
         questions = getattr(self.IGlobal, '_questions', None)
         if not questions:
             debug('Cobalt Dataset Instance: No dataset questions available, skipping')
-            return
+            return self.preventDefault()
 
         debug(f'Cobalt Dataset Instance: Emitting {len(questions)} questions from dataset')
 
@@ -93,6 +112,8 @@ class IInstance(IInstanceBase):
             warning(f'Cobalt Dataset Instance: {skipped_rows_warning(skipped)}')
 
         debug(f'Cobalt Dataset Instance: Finished emitting {len(questions) - skipped} questions')
+
+        return self.preventDefault()
 
     def renderObject(self, object: Entry):
         """Render a dataset scan entry as a Question from source mode."""

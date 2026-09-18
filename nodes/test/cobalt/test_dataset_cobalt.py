@@ -743,6 +743,23 @@ class TestPathValidation:
 # ===========================================================================
 
 
+def _dispatch(handler):
+    """Run a lane handler the way the engine runs one, asserting it suppressed the default.
+
+    The engine forwards a handler's incoming argument after the handler returns
+    unless the handler raised ``Ec.PreventDefault`` (``__checkCallParent``,
+    ``engLib/python/call.hpp``). ``IInstance.writeQuestions`` ends in
+    ``preventDefault()`` on every exit, so calling it directly now raises;
+    wrapping the call keeps these tests asserting on what the node emitted
+    while pinning the suppression that keeps the emitted count exact.
+
+    Args:
+        handler: Zero-argument callable that invokes the lane handler.
+    """
+    with pytest.raises(Exception, match='No default to prevent'):
+        handler()
+
+
 class TestIInstanceEmitsQuestions:
     """Test IInstance emits correct number of questions."""
 
@@ -764,20 +781,20 @@ class TestIInstanceEmitsQuestions:
 
         # Create a mock Question template
         template = sys.modules['ai.common.schema'].Question()
-        inst.writeQuestions(template)
+        _dispatch(lambda: inst.writeQuestions(template))
 
         assert inst.instance.writeQuestions.call_count == 3
 
     def test_empty_questions_skips(self):
         inst = self._make_instance([])
         template = sys.modules['ai.common.schema'].Question()
-        inst.writeQuestions(template)
+        _dispatch(lambda: inst.writeQuestions(template))
         assert inst.instance.writeQuestions.call_count == 0
 
     def test_none_questions_skips(self):
         inst = self._make_instance(None)
         template = sys.modules['ai.common.schema'].Question()
-        inst.writeQuestions(template)
+        _dispatch(lambda: inst.writeQuestions(template))
         assert inst.instance.writeQuestions.call_count == 0
 
     def test_explicit_falsy_text_replaces_template_prompt(self):
@@ -790,7 +807,7 @@ class TestIInstanceEmitsQuestions:
 
         template = sys.modules['ai.common.schema'].Question()
         template.addQuestion('template prompt')
-        inst.writeQuestions(template)
+        _dispatch(lambda: inst.writeQuestions(template))
 
         assert len(emitted) == 1
         assert emitted[0].questions == ['0']
@@ -816,7 +833,7 @@ class TestIInstanceEmitsQuestions:
         template = sys.modules['ai.common.schema'].Question()
         template.addQuestion('template prompt')
         with patch('dataset_cobalt.IInstance.warning'):
-            inst.writeQuestions(template)
+            _dispatch(lambda: inst.writeQuestions(template))
 
         assert emitted == []
 
@@ -842,7 +859,7 @@ class TestDeepCopyPreventsMutation:
         inst.instance.writeQuestions.side_effect = capture_question
 
         template = sys.modules['ai.common.schema'].Question()
-        inst.writeQuestions(template)
+        _dispatch(lambda: inst.writeQuestions(template))
 
         # Each emitted question should be a distinct object
         assert len(emitted) == 2
@@ -1147,7 +1164,7 @@ class TestGoldAnswerNotInContext:
         inst.instance.writeQuestions.side_effect = lambda q: emitted.append(q)
 
         template = sys.modules['ai.common.schema'].Question()
-        inst.writeQuestions(template)
+        _dispatch(lambda: inst.writeQuestions(template))
 
         assert len(emitted) == 1
         # The context list must NOT contain the expected answer in any form
@@ -1692,7 +1709,7 @@ class TestTextLessRowsAreSkipped:
 
         template = sys.modules['ai.common.schema'].Question()
         with patch('dataset_cobalt.IInstance.warning') as mock_warning:
-            inst.writeQuestions(template)
+            _dispatch(lambda: inst.writeQuestions(template))
 
         assert [q.questions for q in emitted] == [['q2']]
         assert mock_warning.call_count == 1
@@ -1710,7 +1727,7 @@ class TestTextLessRowsAreSkipped:
 
         template = sys.modules['ai.common.schema'].Question()
         with patch('dataset_cobalt.IInstance.warning') as mock_warning:
-            inst.writeQuestions(template)
+            _dispatch(lambda: inst.writeQuestions(template))
 
         assert [q.questions for q in emitted] == [['0'], ['0']]
         assert mock_warning.call_count == 0
@@ -1721,7 +1738,7 @@ class TestTextLessRowsAreSkipped:
 
         template = sys.modules['ai.common.schema'].Question()
         with patch('dataset_cobalt.IInstance.warning') as mock_warning:
-            inst.writeQuestions(template)
+            _dispatch(lambda: inst.writeQuestions(template))
 
         assert inst.instance.writeQuestions.call_count == 0
         assert mock_warning.call_count == 1
