@@ -82,6 +82,16 @@ reaching this tool at all requires direct execution to be enabled, and a
 caller who has it can read the same data with a SELECT. The full text stays
 in the server log.
 
+A failed statement rolls nothing back and leaves the session open; the error
+text is the same on both paths and carries no recovery advice, so the policy
+is stated in the execute tool description instead. Recovery is the client's:
+issue rollback to discard the transaction, or rollback to savepoint <name> to
+undo only the failed portion and continue. PostgreSQL aborts the whole
+transaction on any failure, so every later statement on that session fails
+until one of those runs, and a commit is refused rather than allowed to
+degrade into a silent rollback. The idle reaper is the backstop for a session
+abandoned instead.
+
 ## Configuration
 
 There is one built-in profile and no connection panel. RocketRide provisions a

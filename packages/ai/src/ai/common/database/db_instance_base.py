@@ -385,7 +385,10 @@ class DatabaseInstanceBase(IInstanceBase, ABC):
         },
         description=lambda self: (
             f'Execute a raw SQL statement against this {self._db_display_name()} database. '
-            f'Bypasses LLM translation and SQL safety checks.'
+            f'Bypasses LLM translation and SQL safety checks. '
+            f'A failed statement inside a session_id rolls nothing back and leaves the session open: '
+            f'recover with rollback, or rollback to savepoint <name>, before sending more work on that '
+            f'session. On PostgreSQL the transaction stays aborted until you do, and commit is refused.'
         ),
     )
     def execute(self, args):
@@ -424,6 +427,15 @@ class DatabaseInstanceBase(IInstanceBase, ABC):
                 # transactions — and the idle reaper is the backstop for abandoned
                 # sessions. Committing an aborted transaction would degrade to a
                 # silent ROLLBACK, so the registry refuses it and raises instead.
+                #
+                # That policy is NOT appended to this message. The two execute
+                # paths report a driver failure with the same bytes -- the
+                # contract `test_both_execute_paths_report_a_driver_failure_identically`
+                # pins -- and a session-only suffix would break it. It is stated
+                # in the `execute` tool description above instead, which every
+                # agent reads before calling, and in the node READMEs;
+                # `test_the_execute_tool_description_states_the_session_recovery_policy`
+                # is what stops that sentence drifting from this code.
                 error(f'Error executing raw SQL in session {session_id}: {e}')
                 # `from None` keeps the driver traceback out of the tool response.
                 raise RuntimeError(f'SQL execution failed: {self.IGlobal._format_db_error(e)}') from None

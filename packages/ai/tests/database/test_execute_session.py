@@ -727,3 +727,27 @@ def test_a_dollar_number_inside_a_string_literal_is_not_a_placeholder(instance_w
 
     if use_session:
         inst.rollback({'session_id': args['session_id']})
+
+
+# ---------------------------------------------------------------------------
+# The session-after-error recovery policy is stated where callers read it
+# ---------------------------------------------------------------------------
+
+
+def test_the_execute_tool_description_states_the_session_recovery_policy(instance_with_sqlite_registry):
+    """The policy the error text deliberately does NOT carry must live in the tool description.
+
+    ``test_both_execute_paths_report_a_driver_failure_identically`` pins the
+    error string as byte-identical with and without a ``session_id``, so the
+    recovery policy cannot be suffixed onto the session half without breaking
+    that contract. It is stated in the ``execute`` tool description instead --
+    the text every agent reads before it calls the tool -- and this test is
+    what stops that sentence drifting away from the code in
+    ``tx_registry.execute`` / ``_drop`` that implements it.
+    """
+    inst = instance_with_sqlite_registry
+    description = DatabaseInstanceBase.execute.__tool_meta__['description'](inst)
+
+    assert 'rolls nothing back and leaves the session open' in description
+    assert 'rollback to savepoint' in description
+    assert 'commit is refused' in description
