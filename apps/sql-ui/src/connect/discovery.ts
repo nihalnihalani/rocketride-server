@@ -34,9 +34,22 @@
  * Pipeline component providers that expose the shared SQL tool surface
  * (execute / get_schema / dialect, inherited from DatabaseInstanceBase).
  * Extend this set when new relational nodes ship.
+ *
+ * Two entries are not separate engines:
+ * - `db_supabase` is the Supabase preset of the `db_postgres` node
+ *   (`services.supabase.json`: same code, same tools, the `postgres` dialect;
+ *   its provider id comes from its protocol).
+ * - `rocketride_sql` is the tenant SQL node of RocketRide cloud deployments:
+ *   it inherits the same tools and answers `postgres` to `dialect`. It only
+ *   yields a connection where the deployment provides the tenant database.
+ *
+ * Nothing else in the app depends on the provider id: the engine comes from
+ * the node's `dialect` tool and no connection fields are read.
  */
 export const DATABASE_PROVIDERS: ReadonlySet<string> = new Set([
 	'db_mysql',
 	'db_postgres',
 	'db_clickhouse',
+	'db_supabase',
+	'rocketride_sql',
 ]);

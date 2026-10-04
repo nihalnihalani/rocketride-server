@@ -14,8 +14,15 @@ than from the app.
 
 - **A running pipeline with a database node.** Connections are discovered
   from running tasks, so a stopped pipeline has none. The supported nodes
-  are [`db_mysql`](../../nodes/src/nodes/db_mysql/README.md), [`db_postgres`](../../nodes/src/nodes/db_postgres/README.md) and
-  [`db_clickhouse`](../../nodes/src/nodes/db_clickhouse/README.md).
+  are [`db_mysql`](../../nodes/src/nodes/db_mysql/README.md), [`db_postgres`](../../nodes/src/nodes/db_postgres/README.md),
+  [`db_clickhouse`](../../nodes/src/nodes/db_clickhouse/README.md), and two
+  that share the PostgreSQL implementation and report the `postgres` dialect:
+  `db_supabase`, the Supabase preset of the `db_postgres` node (see its
+  [Supabase section](../../nodes/src/nodes/db_postgres/README.md#supabase-preset)), and
+  [`rocketride_sql`](../../nodes/src/nodes/rocketride_sql/README.md), the tenant
+  database node of RocketRide cloud deployments. `rocketride_sql` only produces
+  a connection where the deployment provides the tenant database; this app
+  makes no claim about which environments do.
 - **Direct execution, if you want to run statements.** Each of those nodes
   has an **Allow direct query execution** setting (`allow_execute`), off by
   default and worth leaving off until a caller truly needs it. With it off,
@@ -462,6 +469,10 @@ statements ran either way; only the app's picture of the schema is behind.
 ## Limits
 
 - **No cancel.** **Stop waiting** stops the app waiting, not the database.
+- **No client timeout on a statement.** SQL nodes set no statement deadline,
+  so the app does not impose one either: a long query is allowed to run until
+  you stop waiting. Schema reflection is bounded (five minutes) and the
+  engine check at connection time waits 15 seconds.
 - **No transactions.** Every statement commits on its own, and transaction
   control is refused.
 - **No `EXPLAIN ANALYZE`.** Plan numbers are estimates, never measurements.
@@ -490,8 +501,10 @@ statements ran either way; only the app's picture of the schema is behind.
 
 ## Next steps
 
-- [`db_mysql`](../../nodes/src/nodes/db_mysql/README.md), [`db_postgres`](../../nodes/src/nodes/db_postgres/README.md) and
-  [`db_clickhouse`](../../nodes/src/nodes/db_clickhouse/README.md): the nodes behind every
+- [`db_mysql`](../../nodes/src/nodes/db_mysql/README.md), [`db_postgres`](../../nodes/src/nodes/db_postgres/README.md)
+  (including its [Supabase preset](../../nodes/src/nodes/db_postgres/README.md#supabase-preset), provider `db_supabase`),
+  [`db_clickhouse`](../../nodes/src/nodes/db_clickhouse/README.md) and
+  [`rocketride_sql`](../../nodes/src/nodes/rocketride_sql/README.md): the nodes behind every
   connection, including the tool surface and the direct-execution setting.
 - [Apps](../../docs/public/product/concepts/apps.md): what an app is and how it reaches your engine.
 - [Shell API](../../docs/public/product/guides/apps/index.md): the framework SQL Explorer is built on, when
