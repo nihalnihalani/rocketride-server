@@ -49,6 +49,7 @@ The functions are registered under the `neo4j` service prefix: for example,
 | `neo4j.get_data` | Turn a natural-language request into a read-only Cypher query, run it, and return rows. |
 | `neo4j.get_schema` | Return the reflected labels, properties, and relationship types. |
 | `neo4j.get_query` | Return generated read-only Cypher without executing it. |
+| `neo4j.read_query` | Run Cypher you wrote, read-only, and return positional rows in the shared graph result shape. |
 | `neo4j.execute` | Run raw Cypher only when direct execution is enabled. |
 | `neo4j.dialect` | Return `{"dialect": "neo4j"}`. |
 | `neo4j.get_cypher` | Deprecated compatibility alias for `get_query`; it also includes the statement under `cypher`. |
@@ -63,7 +64,31 @@ instead of rows.
 `get_schema` accepts an optional `label`; an unknown label returns an `error`,
 otherwise the response includes `{database, labels, nodes, relationships}`.
 `execute` requires a non-empty raw `query` and returns `{rows, affected_rows}`;
-it raises an error while direct execution is disabled. `dialect` accepts no
+it raises an error while direct execution is disabled. With `shape: "graph"`
+it returns the `read_query` result shape plus `affected_rows` instead.
+
+`read_query` takes `{cypher, params?, limit?}`: one statement, values bound as
+`$name` parameters (ids as strings: `WHERE elementId(n) = $id`), and a row
+limit that defaults to 1,000 and is capped by the node (at most 25,000). It
+returns `{columns, rows, row_limit, truncated, truncated_by, element_limit,
+elements, value_limit, values}`. Rows are positional. Nodes, relationships and
+paths carry their `elementId` as `id` (a live handle, not a durable key), sorted
+labels, stored relationship direction and traversal-ordered paths. Temporal
+values keep nanoseconds and named zones, points keep their SRID, integers
+beyond 2^53 and NaN/Infinity are tagged as text, and byte arrays are reported
+as base64 (size only above 64 KiB). A response stops at 10,000 graph elements
+or 500,000 values (`truncated_by` says which limit applied). It is read-only
+whatever `allow_execute` says: write, administration and `USE` clauses and any
+`CALL` outside `db.labels`, `db.relationshipTypes`, `db.propertyKeys`,
+`db.schema.nodeTypeProperties`, `db.schema.relTypeProperties` and
+`db.schema.visualization` are refused before the query is sent; it then runs
+in a READ-mode transaction with a 30-second server-side deadline. Failures
+raise an error whose first line is a short headline (`Refused: …`,
+`Query timed out after 30000 ms`, `Invalid read_query input: …` or
+`Query failed`) and whose remaining lines are the database's own message.
+
+The same procedure and clause checks now also apply to the Cypher that
+`get_data` generates. `dialect` accepts no
 meaningful arguments. Generation failures return an error rather than an
 executable query, and `get_cypher` preserves those outcomes while adding
 `cypher` when a query is available.
@@ -125,12 +150,19 @@ be verified.
 ## Limitations
 
 The `noremote` capability pins this node to the local worker because it holds a
-database client and credentials. The ordinary graph-query flow uses a
-client-side best-effort blacklist for selected write and administrative clauses
-and Neo4j READ access mode. Neither is a guaranteed read-only boundary: READ
-access controls routing, and the blacklist cannot cover every mutating procedure.
-Enabling direct execution grants trusted callers an explicit write-capable escape
-hatch.
+database client and credentials. The read paths (`read_query` and the
+natural-language tools) refuse write, administration and `USE` clauses and any
+`CALL` outside a short list of read-only schema procedures, then run in a
+READ access-mode transaction. Neither is a guaranteed read-only boundary: READ
+access controls routing, not permissions, and a statement check cannot know
+every mutating function a server may have installed. **The boundary is the
+database user**: for browsing, connect with an identity whose Neo4j role can
+only read (for example the built-in `reader` role, Neo4j Enterprise or Aura;
+Community Edition has no roles). Enabling direct execution grants trusted
+callers an explicit write-capable escape hatch, and it cannot write through a
+read-only identity: to offer both browsing and writing, configure two nodes,
+one with a read-only identity and one with a write identity and **Allow direct
+query execution** on.
 
 ## Notes
 
@@ -145,17 +177,23 @@ LLM has less structure to ground its Cypher generation.
 
 The LLM is instructed to generate queries only from the reflected schema;
 generated output is checked for unsafe clauses after comments are removed and
-validated with `EXPLAIN`. The safety
-gate rejects `CREATE`, `MERGE`, `DELETE`, `SET`, `DROP`, and other write or
-admin clauses including mutating `apoc` procedures. The actual read query has a
+validated with `EXPLAIN`. Before it runs, the same statement check as
+`read_query` refuses write and administration clauses and every `CALL` outside
+the read-only procedure list (procedure names are compared without
+back-quotes and case). The actual read query has a
 30-second timeout and the implementation returns one row beyond the requested
 limit to report `truncated` correctly.
 
 ### Result serialization
 
-Returned graph values are made JSON-safe: nodes include `_labels`,
-relationships include `_type`, paths become `{nodes, relationships}`, and
-temporal values use their ISO representation. For raw execution, `affected_rows`
+`get_data` and the default `execute` keep their established format: nodes
+include `_labels`, relationships include `_type`, paths become
+`{nodes, relationships}`, and temporal values use their ISO representation.
+`read_query` and `execute` with `shape: "graph"` use the shared graph result
+shape described under **As a tool**, which keeps ids, endpoints, direction,
+points, durations and large integers that the established format loses.
+Tested with the `neo4j` Python driver 6.3.1 against Neo4j 5.26 Community;
+Neo4j 5 is the minimum (`elementId`). For raw execution, `affected_rows`
 counts created or deleted nodes and relationships, changed properties, and
 label changes reported by the Neo4j result summary.
 

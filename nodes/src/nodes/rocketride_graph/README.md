@@ -36,6 +36,7 @@ node defines no configurable server-name prefix. Inputs are JSON objects.
 | get_data | Converts required natural-language question to a safe read-only Cypher query and returns rows; limit is optional. |
 | get_schema | Returns the discovered labels, sampled node properties, and relationships. |
 | get_query | Converts required natural-language question to read-only Cypher without executing it; limit is optional. |
+| read_query | Runs required `cypher` you wrote, read-only, with optional `params` and `limit`, and returns positional rows in the shared graph result shape. |
 | execute | Runs required raw Cypher query when direct execution is enabled. |
 | dialect | Returns {"dialect": "age"}. |
 
@@ -49,6 +50,27 @@ get_query returns {query, valid: true} only after its safe-query checks.
 execute bypasses the read-only gate but still passes Cypher through the AGE
 translation and resource limits; it raises if direct execution is disabled or
 the input is invalid, and otherwise returns {rows, affected_rows}.
+With shape "graph" it returns the read_query shape plus affected_rows (the
+number of result rows, as AGE reports no write counters).
+
+read_query takes {cypher, params?, limit?}. The limit defaults to 1,000 and is
+capped by Max read rows (at most 25,000); it is applied as an outer SQL LIMIT
+so the database stops early. It always uses the safe translation path and a
+READ ONLY transaction with the query timeout, whatever allow_execute says.
+It returns {columns, rows, row_limit, truncated, truncated_by, element_limit,
+elements, value_limit, values}. Rows are positional, so a result that names
+the same column twice keeps both. Graph ids are AGE's 64-bit graphids as
+decimal strings (they pass 2^53 from about the 32nd label); look nodes up with
+WHERE id(n) = toInteger($id). Paths keep traversal order and relationships
+their stored direction; integers beyond 2^53, NaN, Infinity and exact
+numerics are tagged as text. A response stops at 10,000 graph elements or
+500,000 values. Failures raise an error whose first line is a headline:
+"Refused: …" for a write or a firewall rule, "Not supported on Apache AGE
+1.5.0: <construct>" followed by what to write instead (for example for
+date(), duration(), elementId(), list or pattern comprehensions,
+allShortestPaths and EXISTS subqueries, which AGE 1.5.0 cannot run), "Query
+timed out after N ms", "Invalid read_query input: …" or "Query failed"; the
+remaining lines are the detail.
 
 ## Configuration
 

@@ -97,6 +97,10 @@ class CypherFacts:
     # ORDER BY references a bare projection alias rather than an expression
     # (capability: order_by_alias — AGE 1.5.0: 'could not find rte for <name>').
     has_order_by_alias: bool = False
+    # [x IN list WHERE ... | ...] and [(a)-->(b) | ...] (capabilities:
+    # list_comprehension / pattern_comprehension — AGE 1.5.0 syntax errors).
+    has_list_comprehension: bool = False
+    has_pattern_comprehension: bool = False
 
     @property
     def is_write(self) -> bool:
@@ -210,6 +214,13 @@ def analyze(query: str) -> CypherFacts:
             'Cypher expression is nested too deeply to parse (reduce parenthesis/expression nesting)'
         ) from None
     if listener.errors:
+        # Constructs a Neo4j user types early that this grammar cannot parse
+        # get a precise "not supported" hint instead of a bare syntax error.
+        from .capabilities import syntax_hint
+
+        hint = syntax_hint(query)
+        if hint is not None:
+            raise hint
         raise AgeTranslationError('Cypher syntax error: ' + '; '.join(listener.errors[:5]))
 
     facts = CypherFacts(query=query)
@@ -248,6 +259,10 @@ def analyze(query: str) -> CypherFacts:
             facts.procedure_names.append(_name_segments(node))
         if isinstance(node, CypherParser.OC_MergeActionContext):
             facts.has_merge_action = True
+        if isinstance(node, CypherParser.OC_ListComprehensionContext):
+            facts.has_list_comprehension = True
+        if isinstance(node, CypherParser.OC_PatternComprehensionContext):
+            facts.has_pattern_comprehension = True
         if isinstance(node, CypherParser.OC_NodeLabelsContext):
             if len(node.oC_NodeLabel()) > 1:
                 facts.has_multi_label = True

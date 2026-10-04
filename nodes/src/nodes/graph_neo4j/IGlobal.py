@@ -32,6 +32,7 @@ and LLM query loop from the base class.
 
 from __future__ import annotations
 
+from itertools import islice
 from typing import Any, Dict, List, Optional, Tuple
 
 import neo4j
@@ -40,6 +41,8 @@ from neo4j.exceptions import Neo4jError, ServiceUnavailable
 from rocketlib import error, warning
 
 from ai.common.graph import GraphGlobalBase, is_cypher_safe
+from ai.common.graph.adapters import neo4j_adapter
+from ai.common.graph.cypher_safety import NEO4J_READ_PROCEDURES, check_read_only_cypher
 
 DEFAULT_URI = 'neo4j://localhost:7687'
 DEFAULT_DATABASE = 'neo4j'
@@ -112,9 +115,11 @@ class IGlobal(GraphGlobalBase):
         """Execute a read-only Cypher query and return rows as plain dicts.
 
         Unlike FalkorDB's GRAPH.RO_QUERY, Bolt has no server-side read-only
-        execution mode for a standalone instance: READ access only guarantees
-        routing to a replica in a cluster. The is_cypher_safe gate is therefore
-        the primary defence here, not just defence-in-depth.
+        execution mode the driver guarantees: READ access is routing, not
+        access control. The database role is the real boundary; here the
+        token-level check (writes, administration, USE, CALL outside the
+        read-only procedure allowlist) and the legacy keyword gate both run
+        before the READ-mode session, on this natural-language path too.
 
         With ``limit`` set the caller wants truncation detection, so return one
         row past it (still bounded by ``read_row_cap``); with no limit (the lane
@@ -122,6 +127,7 @@ class IGlobal(GraphGlobalBase):
         """
         if not is_cypher_safe(query):
             raise ValueError('Refusing to execute unsafe (write/admin) Cypher statement')
+        check_read_only_cypher(query, allowed_procedures=NEO4J_READ_PROCEDURES)
 
         cap = self.read_row_cap if limit is None else min(int(limit), self.read_row_cap) + 1
         with self.driver.session(
@@ -154,6 +160,73 @@ class IGlobal(GraphGlobalBase):
                 + counters.labels_removed
             )
             return {'rows': rows, 'affected_rows': affected}
+
+    # ------------------------------------------------------------------
+    # read_query / execute(shape='graph')
+    # ------------------------------------------------------------------
+
+    @property
+    def statement_timeout_ms(self) -> int:
+        return int(self.QUERY_TIMEOUT * 1000)
+
+    def _graph_adapter(self):
+        return neo4j_adapter()
+
+    def _read_query_rows(self, cypher, params, fetch_limit, consume):
+        """Read-only Cypher for read_query.
+
+        Layers, outermost first: a token-level check that refuses writes,
+        administration, USE and any CALL outside the read-only procedure
+        allowlist; a READ-mode managed transaction; a server-side transaction
+        deadline. None of these is the security boundary on Neo4j: that is a
+        read-only database role (see the node README). READ mode is routing,
+        not access control, by the driver's own documentation, even though a
+        single instance does refuse writes in it.
+        """
+        check_read_only_cypher(cypher, allowed_procedures=NEO4J_READ_PROCEDURES)
+
+        def work(tx):
+            result = tx.run(cypher, params or {})
+            columns = list(result.keys())
+            # Stream: stop pulling records once the caller has enough.
+            return consume(columns, (record.values() for record in islice(result, fetch_limit)))
+
+        with self.driver.session(
+            database=self.database,
+            default_access_mode=neo4j.READ_ACCESS,
+            fetch_size=max(1, min(fetch_limit, 1000)),
+        ) as session:
+            return session.execute_read(neo4j.unit_of_work(timeout=self.QUERY_TIMEOUT)(work))
+
+    def _raw_query_rows(self, cypher, fetch_limit, consume):
+        """execute(shape='graph'): run as written in one write transaction (never retried)."""
+        with self.driver.session(database=self.database) as session:
+            result = session.run(neo4j.Query(cypher, timeout=self.QUERY_TIMEOUT))
+            envelope = consume(list(result.keys()), (record.values() for record in islice(result, fetch_limit)))
+            counters = result.consume().counters
+            affected = (
+                counters.nodes_created
+                + counters.nodes_deleted
+                + counters.relationships_created
+                + counters.relationships_deleted
+                + counters.properties_set
+                + counters.labels_added
+                + counters.labels_removed
+            )
+            return envelope, affected
+
+    def _describe_error(self, exc):
+        if not isinstance(exc, Neo4jError):
+            return None
+        code = str(getattr(exc, 'code', '') or '')
+        detail = str(getattr(exc, 'message', None) or exc).strip()
+        if 'TransactionTimedOut' in code:
+            return f'Query timed out after {self.statement_timeout_ms} ms', detail
+        if code.endswith('Statement.AccessMode'):
+            return 'Refused: the database refused a write on the read-only path', detail
+        if code.startswith('Neo.ClientError.Security.'):
+            return 'Refused: the database user may not run this statement', detail
+        return 'Query failed', detail
 
     def _validate_query(self, query: str) -> Tuple[bool, str]:
         """Run EXPLAIN to check syntax without executing the query."""
