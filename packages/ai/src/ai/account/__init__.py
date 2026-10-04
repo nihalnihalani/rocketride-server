@@ -60,6 +60,12 @@ else:
 
 # Instantiate the single shared Account object used by the entire process.
 # All command handlers import this singleton rather than creating their own.
+# Refuse to start while the DB broker is configured under its legacy,
+# placeholder-substitutable ROCKETRIDE_* names (see check_db_broker_environment).
+from .base import check_db_broker_environment
+
+check_db_broker_environment()
+
 account: Account = Account()
 
 # Re-export supporting subsystems so callers only need one import.

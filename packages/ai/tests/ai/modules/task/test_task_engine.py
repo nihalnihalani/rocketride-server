@@ -803,15 +803,21 @@ async def test_subprocess_env_scrubs_broker_credentials(monkeypatch):
     """The broker credential can mint ANY tenant's DSN — it must never reach
     node subprocesses, and neither may a parent-level DSN or stale error.
     """
-    monkeypatch.setenv('ROCKETRIDE_DB_BROKER_URL', 'https://broker.example')
-    monkeypatch.setenv('ROCKETRIDE_DB_BROKER_TOKEN', 'super-secret')
+    monkeypatch.setenv('RR_DB_BROKER_URL', 'https://broker.example')
+    monkeypatch.setenv('RR_DB_BROKER_TOKEN', 'super-secret')
+    # The legacy names are refused at startup; the scrub drops them regardless.
+    monkeypatch.setenv('ROCKETRIDE_DB_BROKER_URL', 'https://legacy-broker.example')
+    monkeypatch.setenv('ROCKETRIDE_DB_BROKER_TOKEN', 'legacy-secret')
     monkeypatch.setenv('ROCKETRIDE_DB_DSN', 'postgresql://stale@parent/db')
     monkeypatch.setenv('ROCKETRIDE_DB_RESOLVE_ERROR', 'stale reason')
 
     env = await Task._build_subprocess_env(_env_task())  # no DB nodes
 
+    assert 'RR_DB_BROKER_URL' not in env
+    assert 'RR_DB_BROKER_TOKEN' not in env
     assert 'ROCKETRIDE_DB_BROKER_URL' not in env
     assert 'ROCKETRIDE_DB_BROKER_TOKEN' not in env
+    assert 'super-secret' not in env.values()
     assert 'ROCKETRIDE_DB_DSN' not in env
     assert 'ROCKETRIDE_DB_RESOLVE_ERROR' not in env
     # Identity rides the task file (#1686), never the environment.

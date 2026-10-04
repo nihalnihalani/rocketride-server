@@ -36,7 +36,13 @@ def _make_conn(*, account_info=None, server=None, connection_id=1):
     conn.build_response = MagicMock(side_effect=lambda req, body=None: {'type': 'response', 'body': body})
     conn.debug_message = MagicMock()
     conn.verify_permission = MagicMock()  # no-op (granted) by default
+    conn.verify_team_permission = MagicMock()  # no-op (granted) by default
     return conn
+
+
+def _resolver_conn():
+    """A caller with a dev team, as rrext_resolve_config requires."""
+    return _make_conn(account_info=SimpleNamespace(devTeam='team-dev', userId='user-1', organization=None))
 
 
 # ---------------------------------------------------------------------------
@@ -981,7 +987,7 @@ async def test_on_rrext_resolve_config_returns_what_the_node_receives(monkeypatc
     """Resolution runs through the engine's own getNodeConfig, not a reimplementation."""
     monkeypatch.setattr(cmd_misc.Config, 'getNodeConfig', staticmethod(lambda p, c: {'model': 'gpt-4o', 'temp': 0}))
 
-    conn = _make_conn()
+    conn = _resolver_conn()
     request = {'arguments': {'provider': 'llm_openai', 'config': {'model': 'gpt-4o'}}}
     result = await MiscCommands.on_rrext_resolve_config(conn, request)
 
@@ -1002,7 +1008,7 @@ async def test_on_rrext_resolve_config_reports_keys_a_profile_discards(monkeypat
     """
     monkeypatch.setattr(cmd_misc.Config, 'getNodeConfig', staticmethod(lambda p, c: {'host': 'localhost'}))
 
-    conn = _make_conn()
+    conn = _resolver_conn()
     request = {
         'arguments': {
             'provider': 'store_chroma',
@@ -1026,7 +1032,7 @@ async def test_on_rrext_resolve_config_reports_a_key_the_profile_overwrote(monke
     """
     monkeypatch.setattr(cmd_misc.Config, 'getNodeConfig', staticmethod(lambda p, c: {'apikey': '', 'model': 'gpt-5'}))
 
-    conn = _make_conn()
+    conn = _resolver_conn()
     request = {
         'arguments': {
             'provider': 'llm_openai',
@@ -1049,7 +1055,7 @@ async def test_on_rrext_resolve_config_reports_a_sibling_that_matches_the_profil
     """
     monkeypatch.setattr(cmd_misc.Config, 'getNodeConfig', staticmethod(lambda p, c: {'model': 'gpt-5.4'}))
 
-    conn = _make_conn()
+    conn = _resolver_conn()
     request = {
         'arguments': {
             'provider': 'llm_openai',
@@ -1066,7 +1072,7 @@ async def test_on_rrext_resolve_config_reports_nothing_without_a_profile(monkeyp
     """Without a profile the user layer is read from the top level, so nothing is lost."""
     monkeypatch.setattr(cmd_misc.Config, 'getNodeConfig', staticmethod(lambda p, c: {'model': 'gpt-5.4'}))
 
-    conn = _make_conn()
+    conn = _resolver_conn()
     request = {'arguments': {'provider': 'llm_openai', 'config': {'model': 'gpt-5.4'}}}
     result = await MiscCommands.on_rrext_resolve_config(conn, request)
 
@@ -1089,7 +1095,7 @@ async def test_on_rrext_resolve_config_ignores_structural_and_unselected_profile
         lambda provider: frozenset({'claude-sonnet-4-6', 'claude-opus-4-1'}),
     )
 
-    conn = _make_conn()
+    conn = _resolver_conn()
     request = {
         'arguments': {
             'provider': 'llm_anthropic',
@@ -1110,7 +1116,7 @@ async def test_on_rrext_resolve_config_ignores_structural_and_unselected_profile
 
 @pytest.mark.asyncio
 async def test_on_rrext_resolve_config_requires_a_provider():
-    conn = _make_conn()
+    conn = _resolver_conn()
 
     with pytest.raises(ValueError):
         await MiscCommands.on_rrext_resolve_config(conn, {'arguments': {}})
@@ -1118,7 +1124,7 @@ async def test_on_rrext_resolve_config_requires_a_provider():
 
 @pytest.mark.asyncio
 async def test_on_rrext_resolve_config_rejects_a_non_object_config():
-    conn = _make_conn()
+    conn = _resolver_conn()
 
     with pytest.raises(ValueError):
         await MiscCommands.on_rrext_resolve_config(conn, {'arguments': {'provider': 'ocr', 'config': []}})
@@ -1133,6 +1139,106 @@ async def test_on_rrext_resolve_config_propagates_an_unknown_service(monkeypatch
 
     monkeypatch.setattr(cmd_misc.Config, 'getNodeConfig', staticmethod(_raise))
 
-    conn = _make_conn()
+    conn = _resolver_conn()
     with pytest.raises(Exception, match='was not found'):
         await MiscCommands.on_rrext_resolve_config(conn, {'arguments': {'provider': 'nope'}})
+
+
+# ---------------------------------------------------------------------------
+# rrext_resolve_config permission, and broker settings never resolving
+# ---------------------------------------------------------------------------
+
+BROKER_SENTINEL = 'sentinel-broker-token-7f3a'
+
+
+@pytest.mark.asyncio
+async def test_on_rrext_resolve_config_checks_task_control_on_the_dev_team(monkeypatch):
+    """Resolving takes what running takes: task.control on the caller's dev team."""
+    monkeypatch.setattr(cmd_misc.Config, 'getNodeConfig', staticmethod(lambda p, c: {}))
+    conn = _resolver_conn()
+
+    await MiscCommands.on_rrext_resolve_config(conn, {'arguments': {'provider': 'llm_openai', 'config': {}}})
+
+    conn.verify_team_permission.assert_called_once_with('team-dev', 'task.control')
+
+
+@pytest.mark.asyncio
+async def test_on_rrext_resolve_config_denied_resolves_nothing(monkeypatch):
+    """A caller without task.control is refused before the resolver runs."""
+    resolver = MagicMock(return_value={})
+    monkeypatch.setattr(cmd_misc.Config, 'getNodeConfig', staticmethod(resolver))
+    conn = _resolver_conn()
+    conn.verify_team_permission = MagicMock(side_effect=PermissionError("Permission 'task.control' denied"))
+
+    with pytest.raises(PermissionError):
+        await MiscCommands.on_rrext_resolve_config(conn, {'arguments': {'provider': 'llm_openai', 'config': {}}})
+
+    resolver.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'account_info',
+    [None, SimpleNamespace(devTeam='', userId='user-1', organization=None)],
+    ids=['no-account', 'no-dev-team'],
+)
+async def test_on_rrext_resolve_config_requires_a_dev_team(monkeypatch, account_info):
+    resolver = MagicMock(return_value={})
+    monkeypatch.setattr(cmd_misc.Config, 'getNodeConfig', staticmethod(resolver))
+    conn = _make_conn(account_info=account_info)
+
+    with pytest.raises(PermissionError, match='No development team'):
+        await MiscCommands.on_rrext_resolve_config(conn, {'arguments': {'provider': 'llm_openai', 'config': {}}})
+
+    resolver.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_on_rrext_validate_never_resolves_the_broker_token(monkeypatch):
+    """Validation resolves placeholders from the merged env; the broker token is not in it.
+
+    The fake validator echoes the payload it was given, the way the engine's
+    validator returns the resolved component, so anything substituted would
+    come back in the response.
+    """
+    monkeypatch.setenv('RR_DB_BROKER_URL', 'https://broker.example/provision')
+    monkeypatch.setenv('RR_DB_BROKER_TOKEN', BROKER_SENTINEL)
+    monkeypatch.setenv('ROCKETRIDE_SAFE_SETTING', 'user-visible')
+    monkeypatch.setattr(cmd_misc, 'validatePipeline', lambda payload: {'echo': payload})
+
+    conn = _make_conn(account_info=SimpleNamespace(devTeam='team-dev', userId='user-1', organization={'id': 'org-1'}))
+    pipeline = {
+        'components': [
+            {
+                'id': 'tools_1',
+                'provider': 'tools',
+                'name': '${RR_DB_BROKER_TOKEN} ${ROCKETRIDE_DB_BROKER_TOKEN}',
+                'config': {
+                    'mode': 'Source',
+                    'a': '${RR_DB_BROKER_TOKEN}',
+                    'b': '${RR_DB_BROKER_URL}',
+                    'c': '${ROCKETRIDE_SAFE_SETTING}',
+                },
+            }
+        ]
+    }
+    result = await MiscCommands.on_rrext_validate(conn, {'arguments': {'pipeline': pipeline}})
+
+    text = repr(result)
+    assert BROKER_SENTINEL not in text
+    assert 'broker.example' not in text
+    # The substitution itself still works for user-facing ROCKETRIDE_* names.
+    assert 'user-visible' in text
+
+
+@pytest.mark.asyncio
+async def test_merged_env_never_carries_rr_settings(monkeypatch):
+    """The placeholder map (OSS get_merged_env) holds ROCKETRIDE_* names only."""
+    from ai.account import account
+
+    monkeypatch.setenv('RR_DB_BROKER_TOKEN', BROKER_SENTINEL)
+    monkeypatch.setenv('RR_DB_BROKER_URL', 'https://broker.example/provision')
+    merged = await account.get_merged_env(user_id='user-1', org_id='org-1', team_id='team-dev')
+
+    assert not [k for k in merged if not k.startswith('ROCKETRIDE_')]
+    assert BROKER_SENTINEL not in merged.values()
