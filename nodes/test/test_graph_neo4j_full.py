@@ -459,3 +459,103 @@ class TestExecuteGraphShape:
             assert _count(neo_db) == before
         finally:
             glb.endGlobal()
+
+
+class TestSchemaAndDialect:
+    def test_refresh_reflects_raw_labels_types_endpoints_and_counts(self, neo_env, neo_db):
+        with neo_db.session(database='neo4j') as s:
+            s.run("CREATE (:`Gx Odd``Label` {v: 'x'}), (:GxPerson {name: 'Carol', age: 'unknown'})").consume()
+        glb, inst = _start(neo_env)
+        try:
+            out = inst.refresh_schema({})
+            block = out['schema']
+            labels = {label['name']: label for label in block['labels']}
+            assert 'Gx Odd`Label' in labels  # raw name, not a back-quoted display string
+            person = labels['GxPerson']
+            assert person['count'] == 3 and person['count_estimated'] is False
+            types = {p['name']: p['types'] for p in person['properties']}
+            assert types['age'] == ['string', 'integer']  # every observed type kept
+            assert types['born'] == ['temporal'] and types['home'] == ['point']
+            rels = {r['type']: r for r in block['relationship_types']}
+            knows = rels['GX_KNOWS']
+            assert knows['count'] == 3 and {'name': 'since', 'types': ['integer']} in knows['properties']
+            pairs = {(e['start'], e['end']) for e in knows['endpoints']}
+            assert ('GxPerson', 'GxPerson') in pairs and ('GxEmployee', 'GxPerson') in pairs
+            assert all(e['observed'] for e in knows['endpoints'])
+            assert block['sampled'] is True and block['stale'] is False and block['error'] is None
+        finally:
+            glb.endGlobal()
+
+    def test_label_filter_matches_raw_label_names(self, neo_env, neo_db):
+        # Regression: labels used to be stored back-quoted (":`GxPerson`"), so
+        # get_schema(label='GxPerson') answered "not found".
+        glb, inst = _start(neo_env)
+        try:
+            out = inst.get_schema({'label': 'GxPerson'})
+            assert out['labels'] == ['GxPerson'] and 'error' not in out
+            assert any(r['type'] == 'GX_KNOWS' for r in out['relationships'])
+        finally:
+            glb.endGlobal()
+
+    def test_refresh_shows_a_change_made_by_execute(self, neo_env, neo_db):
+        glb, inst = _start(neo_env, allow_execute=True)
+        try:
+            assert 'GxLater' not in inst.get_schema({})['labels']
+            inst.execute({'query': "CREATE (:GxLater {k: 1})-[:GX_LATER_REL]->(:GxPerson {name: 'z'})"})
+            assert 'GxLater' not in inst.get_schema({})['labels']  # snapshot until refreshed
+            out = inst.refresh_schema({})
+            assert 'GxLater' in out['labels']
+            assert any(r['type'] == 'GX_LATER_REL' for r in out['schema']['relationship_types'])
+        finally:
+            glb.endGlobal()
+
+    def test_failed_refresh_keeps_the_last_good_schema(self, neo_env, neo_db, monkeypatch):
+        glb, inst = _start(neo_env)
+        try:
+            good = inst.get_schema({})['schema']
+            monkeypatch.setattr(
+                glb, '_reflect_schema_v2', lambda builder, deadline: (_ for _ in ()).throw(TimeoutError('slow'))
+            )
+            stale = inst.refresh_schema({})['schema']
+            assert stale['stale'] is True and 'slow' in stale['error']
+            assert stale['labels'] == good['labels'] and stale['refreshed_at'] == good['refreshed_at']
+        finally:
+            glb.endGlobal()
+
+    def test_dialect_identity_without_credentials(self, neo_env, neo_db):
+        glb, inst = _start(neo_env, allow_execute=True)
+        try:
+            out = inst.dialect({})
+            assert out['dialect'] == 'neo4j' and out['database'] == 'neo4j' and out['allow_execute'] is True
+            assert out['engine']['name'] == 'Neo4j' and out['engine']['version'].startswith('5.')
+            assert out['engine']['edition'] == 'community'
+            assert out['read_boundary'] == 'read_session' and out['read_boundary_verified'] is False
+            assert out['limits']['statement_timeout_ms'] == 30000 and out['capabilities']['read_query'] is True
+            text = str(out)
+            assert PASSWORD not in text and '57687' not in text and 'bolt' not in text
+        finally:
+            glb.endGlobal()
+
+    def test_prompt_names_the_engine_and_its_rules(self, neo_env, neo_db):
+        glb, _inst = _start(neo_env)
+        try:
+            rules = ' '.join(glb._prompt_rules())
+            assert 'Neo4j 5.' in rules and 'elementId' in rules and 'db.labels()' in rules
+        finally:
+            glb.endGlobal()
+
+
+def test_role_check_requires_only_read_privileges(neo_env):
+    role_is_read_only = neo_env.iglobal_module.role_is_read_only
+    reader = [
+        {'access': 'GRANTED', 'action': 'access'},
+        {'access': 'GRANTED', 'action': 'traverse'},
+        {'access': 'GRANTED', 'action': 'read'},
+        {'access': 'GRANTED', 'action': 'execute'},
+        {'access': 'DENIED', 'action': 'write'},
+    ]
+    assert role_is_read_only(reader) is True
+    assert role_is_read_only(reader + [{'access': 'GRANTED', 'action': 'write'}]) is False
+    assert role_is_read_only(reader + [{'access': 'GRANTED', 'action': 'execute_boosted'}]) is False
+    assert role_is_read_only(reader + [{'access': 'GRANTED', 'action': 'some_future_privilege'}]) is False
+    assert role_is_read_only([]) is False

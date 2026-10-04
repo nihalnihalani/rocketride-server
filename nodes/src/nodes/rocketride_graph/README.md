@@ -34,11 +34,12 @@ node defines no configurable server-name prefix. Inputs are JSON objects.
 | Function | Description |
 | --- | --- |
 | get_data | Converts required natural-language question to a safe read-only Cypher query and returns rows; limit is optional. |
-| get_schema | Returns the discovered labels, sampled node properties, and relationships. |
+| get_schema | Returns the discovered labels, sampled node properties, and relationships, plus the version 2 schema block. |
+| refresh_schema | Re-reads the schema now and returns it like get_schema. |
 | get_query | Converts required natural-language question to read-only Cypher without executing it; limit is optional. |
 | read_query | Runs required `cypher` you wrote, read-only, with optional `params` and `limit`, and returns positional rows in the shared graph result shape. |
 | execute | Runs required raw Cypher query when direct execution is enabled. |
-| dialect | Returns {"dialect": "age"}. |
+| dialect | Returns {"dialect": "age"} plus the AGE version, database and graph names, capabilities, limits and read boundary. |
 
 get_data defaults to the shared read limit, then clamps the requested limit to
 the configured Max read rows ceiling. A successful result contains
@@ -71,6 +72,32 @@ date(), duration(), elementId(), list or pattern comprehensions,
 allShortestPaths and EXISTS subqueries, which AGE 1.5.0 cannot run), "Query
 timed out after N ms", "Invalid read_query input: …" or "Query failed"; the
 remaining lines are the detail.
+
+get_schema and refresh_schema return the legacy {labels, nodes,
+relationships} keys plus a schema block (version 2): labels and
+relationship types with every observed property type (string, integer, float,
+boolean, list, map, temporal, point), relationship endpoint label pairs seen on
+sampled data, counts, and sampled, truncated, refreshed_at, source,
+stale, error and capable. The schema is read at start and again on
+refresh_schema, bounded to 200 labels, 100 relationship types and 100
+sampled rows each, within a 60-second budget. A refresh is all-or-nothing:
+if it fails or times out, the previous schema stays in place, marked stale
+with the error; a schema that never loaded has refreshed_at: null and an
+error, never an empty graph. Property types in the legacy keys now use the
+same vocabulary (string, integer, ...) instead of engine type names.
+
+dialect returns dialect plus engine (name, version, edition), database,
+graph, allow_execute, capabilities, limits (default and maximum rows,
+element and value budgets, statement timeout, server result cap) and
+read_boundary/read_boundary_verified. It never includes hosts, users or
+credentials.
+On AGE the schema is read in one REPEATABLE READ, READ ONLY transaction bounded
+by the refresh budget: labels from the AGE catalog, counts estimated from the
+PostgreSQL planner statistics (count_estimated: true, absent before the table
+was ever analyzed), sampled properties, and relationship endpoints taken from
+the label id inside each graph id. read_boundary is read_only_tx. The
+natural-language tools tell the model it is writing for Apache AGE 1.5.0 and
+list the constructs it cannot use.
 
 ## Configuration
 
@@ -135,9 +162,10 @@ safe path runs in a server-side read-only transaction with a semantic firewall
 anything reaches the database), the base Cypher safety check, and a
 transaction-local statement timeout. Use the built-in Cypher functions;
 unqualified names resolve only to Apache AGE's own functions.
-Schema reflection is best effort: it lists AGE labels, samples node properties,
-and samples relationship endpoints; an individual reflection failure warns and
-returns partial rather than blocking all schema output.
+Schema reflection lists AGE labels, samples node and relationship properties,
+and records every observed endpoint label pair. A failure is recorded in the
+schema block (the last good schema is kept, marked stale) rather than
+blocking the node.
 
 ### Connections and concurrency
 

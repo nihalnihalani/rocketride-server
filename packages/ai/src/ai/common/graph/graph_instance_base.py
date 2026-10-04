@@ -53,6 +53,7 @@ from .cypher_safety import is_cypher_safe
 from .graph_errors import GraphToolError, driver_detail
 from .graph_global_base import DEFAULT_MAX_EXECUTE_ROWS, DEFAULT_READ_QUERY_LIMIT, GraphGlobalBase
 from .normalize import DEFAULT_ELEMENT_LIMIT, DEFAULT_VALUE_LIMIT, GraphBudgetExceeded, GraphNormalizer
+from .schema import empty_block
 
 DEFAULT_ROW_LIMIT = 250
 
@@ -206,14 +207,51 @@ class GraphInstanceBase(IInstanceBase, ABC):
         ),
     )
     def get_schema(self, args):
-        """Return the reflected graph schema."""
+        """Return the reflected graph schema (legacy keys plus the v2 ``schema`` block)."""
         schema = self.IGlobal.graph_schema or {}
         nodes = schema.get('nodes', {})
         return {
             'labels': list(nodes.keys()),
             'nodes': {label: [{'property': p, 'type': t} for p, t in props] for label, props in nodes.items()},
             'relationships': schema.get('relationships', []),
+            'schema': self._schema_block(),
         }
+
+    def _schema_block(self) -> Dict[str, Any]:
+        block = self.IGlobal.schema_snapshot
+        if block is None:
+            block = empty_block(source='startup', error='The schema has not been reflected yet')
+        return block
+
+    @tool_function(
+        input_schema={'type': 'object', 'properties': {}},
+        output_schema={
+            'type': 'object',
+            'properties': {
+                'labels': {'type': 'array', 'items': {'type': 'string'}},
+                'nodes': {'type': 'object'},
+                'relationships': {'type': 'array', 'items': {'type': 'object'}},
+                'schema': {
+                    'type': 'object',
+                    'description': 'Schema v2: labels and relationship types with all observed property types, '
+                    'endpoints, counts, sampled/truncated flags, refreshed_at, and stale/error after a failed refresh.',
+                },
+            },
+        },
+        description=lambda self: (
+            f'Re-read the {self._db_display_name()} graph schema now (bounded and sampled) and return it like '
+            f'get_schema. If the refresh fails, the previous schema is kept and marked stale with the error.'
+        ),
+    )
+    def refresh_schema(self, args):
+        """Reflect the schema again, publish it all-or-nothing, and return it."""
+        args = normalize_tool_input(args, tool_name='refresh_schema')
+        if args:
+            raise GraphToolError(
+                f'Invalid refresh_schema input: unexpected field(s) {", ".join(map(repr, sorted(args)))}'
+            )
+        self.IGlobal.refresh_schema_snapshot(source='refresh')
+        return self.get_schema({})
 
     @tool_function(
         input_schema={
@@ -506,13 +544,48 @@ class GraphInstanceBase(IInstanceBase, ABC):
         input_schema={'type': 'object', 'properties': {}},
         output_schema={
             'type': 'object',
-            'properties': {'dialect': {'type': 'string', 'description': 'Graph engine identifier.'}},
+            'properties': {
+                'dialect': {'type': 'string', 'description': 'Graph engine identifier.'},
+                'engine': {'type': 'object', 'description': '{name, version, edition}'},
+                'database': {'type': ['string', 'null']},
+                'graph': {'type': ['string', 'null']},
+                'allow_execute': {'type': 'boolean'},
+                'capabilities': {'type': 'object'},
+                'limits': {'type': 'object'},
+                'read_boundary': {'type': 'string'},
+                'read_boundary_verified': {'type': 'boolean'},
+            },
         },
-        description='Return the graph engine dialect (e.g. neo4j, falkordb).',
+        description='Return the graph engine dialect, version, database/graph, capabilities and limits.',
     )
     def dialect(self, args):
-        """Return the graph engine dialect."""
-        return {'dialect': self._db_dialect()}
+        """Return the engine identity, capabilities and limits (no credentials or hosts)."""
+        identity = self.IGlobal._engine_identity()
+        glb = self.IGlobal
+        return {
+            'dialect': self._db_dialect(),
+            'engine': identity.get('engine') or {'name': self._db_display_name(), 'version': None, 'edition': None},
+            'database': identity.get('database'),
+            'graph': identity.get('graph'),
+            'allow_execute': bool(getattr(glb, 'allow_execute', False)),
+            'capabilities': {
+                'read_query': True,
+                'refresh_schema': True,
+                'execute_shape_graph': True,
+                'params': True,
+                'shortest_path': bool(identity.get('shortest_path', True)),
+            },
+            'limits': {
+                'default_rows': DEFAULT_READ_QUERY_LIMIT,
+                'max_rows': glb.read_query_cap,
+                'max_elements': DEFAULT_ELEMENT_LIMIT,
+                'max_values': DEFAULT_VALUE_LIMIT,
+                'statement_timeout_ms': glb.statement_timeout_ms,
+                'server_result_cap': identity.get('server_result_cap'),
+            },
+            'read_boundary': identity.get('read_boundary', 'read_only_tx'),
+            'read_boundary_verified': bool(identity.get('read_boundary_verified', False)),
+        }
 
     # ------------------------------------------------------------------
     # Sanitization helpers
@@ -621,6 +694,10 @@ class GraphInstanceBase(IInstanceBase, ABC):
 
         question.addContext(self._describe_schema(self.IGlobal.graph_schema))
         question.expectJson = True
+
+        engine_rules = self.IGlobal._prompt_rules()
+        if engine_rules:
+            question.addInstruction('Target engine', '\n'.join(engine_rules))
 
         question.addInstruction(
             f'{language} Query Generation Guidelines',

@@ -248,3 +248,68 @@ class TestExecuteGraphShape:
             assert out['rows'][0][0]['labels'] == ['New'] and out['affected_rows'] >= 2
         finally:
             glb.endGlobal()
+
+
+class TestSchemaAndDialect:
+    def test_refresh_contents(self, falkor_env, falkor_graph):
+        falkor_graph.query("CREATE (:Person {name: 'Carol', age: 'unknown'})")
+        glb, inst = _start(falkor_env)
+        try:
+            block = inst.refresh_schema({})['schema']
+            labels = {label['name']: label for label in block['labels']}
+            assert set(labels) == {'Company', 'Employee', 'Person'}
+            person = labels['Person']
+            assert person['count'] == 3 and person['count_estimated'] is False
+            types = {p['name']: p['types'] for p in person['properties']}
+            assert (
+                types['age'] == ['string', 'integer'] and types['home'] == ['point'] and types['born'] == ['temporal']
+            )
+            knows = {r['type']: r for r in block['relationship_types']}['KNOWS']
+            assert knows['count'] == 3
+            # Alice is Person:Employee and KNOWS runs both ways, so every pairing is observed.
+            assert {(e['start'], e['end']) for e in knows['endpoints']} == {
+                ('Person', 'Person'),
+                ('Employee', 'Person'),
+                ('Person', 'Employee'),
+            }
+            assert {'name': 'since', 'types': ['integer']} in knows['properties']
+        finally:
+            glb.endGlobal()
+
+    def test_refresh_shows_a_change_made_by_execute(self, falkor_env, falkor_graph):
+        glb, inst = _start(falkor_env, allow_execute=True)
+        try:
+            inst.execute({'query': "CREATE (:Later {k: 1})-[:LATER_REL]->(:Person {name: 'z'})"})
+            assert 'Later' not in inst.get_schema({})['labels']
+            out = inst.refresh_schema({})
+            assert 'Later' in out['labels']
+            assert any(r['type'] == 'LATER_REL' for r in out['schema']['relationship_types'])
+        finally:
+            glb.endGlobal()
+
+    def test_timeout_never_becomes_an_empty_schema(self, falkor_env, falkor_graph, monkeypatch):
+        glb, inst = _start(falkor_env)
+        try:
+            good = inst.get_schema({})['schema']
+            assert good['relationship_types']
+            monkeypatch.setattr(sys.modules['ai.common.graph.graph_global_base'], 'SCHEMA_REFRESH_BUDGET_MS', 0)
+            out = inst.refresh_schema({})
+            assert out['schema']['stale'] is True and out['schema']['error']
+            assert out['schema']['relationship_types'] == good['relationship_types']
+            assert out['relationships']  # legacy keys keep the last good schema too
+        finally:
+            glb.endGlobal()
+
+    def test_dialect_identity(self, falkor_env, falkor_graph):
+        glb, inst = _start(falkor_env)
+        try:
+            out = inst.dialect({})
+            assert out['dialect'] == 'falkordb' and out['graph'] == GRAPH and out['database'] is None
+            assert out['engine']['name'] == 'FalkorDB' and out['engine']['version'].count('.') == 2
+            assert out['read_boundary'] == 'ro_command'
+            assert out['limits']['server_result_cap'] == glb.server_result_cap
+            assert out['limits']['max_rows'] == glb.read_query_cap
+            assert '56379' not in str(out) and 'redis' not in str(out)
+            assert 'GRAPH.RO_QUERY' in ' '.join(glb._prompt_rules())
+        finally:
+            glb.endGlobal()

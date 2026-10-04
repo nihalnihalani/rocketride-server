@@ -31,11 +31,12 @@ The registered tool names are the bare method names below (an agent catalog name
 | Function | Description |
 |---|---|
 | `get_data` | Requires a non-empty `question`; optional `limit` is clamped to the graph row cap. Returns sanitized rows, generated query, applied limit, and truncation state; generation/execution failure returns `error`, `valid: false`, and no rows. |
-| `get_schema` | Takes no meaningful arguments and returns reflected `labels`, node properties, and relationships. |
+| `get_schema` | Takes no meaningful arguments and returns reflected `labels`, node properties, and relationships, plus the version 2 `schema` block. |
+| `refresh_schema` | Takes no arguments; re-reads the schema of the configured graph now and returns it like `get_schema`. |
 | `get_query` | Requires a non-empty `question`, with optional `limit`; returns validated read-only Cypher and `valid: true`, or an `error`/off-topic `answer` with `valid: false`. |
 | `read_query` | Requires non-empty `cypher`; accepts object `params` and integer `limit` (default 1,000, capped by `max_rows`, the server's `RESULTSET_SIZE` and 25,000). Always runs `GRAPH.RO_QUERY` on the configured graph, whatever `allow_writes` or `allow_execute` say, with the query timeout clamped to the server's `TIMEOUT_MAX`. Returns `{columns, rows, row_limit, truncated, truncated_by, element_limit, elements, value_limit, values}` in the shared graph result shape; failures raise an error whose first line is a headline (`Refused: …`, `Query timed out after N ms`, `Invalid read_query input: …`, `Query failed`) and whose remaining lines are the server's message. |
 | `execute` | Requires raw `query` and runs it without LLM translation; it raises an error unless `allow_execute` is enabled, and fails when the result exceeds the execute row cap. With `shape: "graph"` it returns the `read_query` shape plus `affected_rows`. |
-| `dialect` | Takes no meaningful arguments and returns `{dialect: "falkordb"}`. |
+| `dialect` | Takes no meaningful arguments and returns `{dialect: "falkordb"}` plus the engine version, graph, capabilities, limits and read boundary. |
 | `query` | Requires non-empty `cypher`; accepts optional object `params` and optional `graph`. Returns columns, serialized rows, count, and truncation state; Redis failures return `error` with empty rows. |
 | `list_graphs` | Takes no arguments and returns graph names, or `error` with an empty graph list on a Redis failure. |
 
@@ -48,6 +49,34 @@ duration is its exact stored length, written as days and time). Datetimes are
 reported in UTC. Points come back as plain `{latitude, longitude}` maps because
 the client library does not keep the point type, and vectors as number lists.
 A response stops at 10,000 graph elements or 500,000 values.
+
+FalkorDB refuses a result that names the same column twice, so `read_query`
+columns are always distinct here.
+
+`get_schema` and `refresh_schema` return the legacy `{labels, nodes,
+relationships}` keys plus a `schema` block (version 2): labels and
+relationship types with every observed property type (string, integer, float,
+boolean, list, map, temporal, point), relationship endpoint label pairs seen on
+sampled data, counts, and `sampled`, `truncated`, `refreshed_at`, `source`,
+`stale`, `error` and `capable`. The schema is read at start and again on
+`refresh_schema`, bounded to 200 labels, 100 relationship types and 100
+sampled rows each, within a 60-second budget. A refresh is all-or-nothing:
+if it fails or times out, the previous schema stays in place, marked `stale`
+with the `error`; a schema that never loaded has `refreshed_at: null` and an
+`error`, never an empty graph. Property types in the legacy keys now use the
+same vocabulary (`string`, `integer`, ...) instead of engine type names.
+
+`dialect` returns `dialect` plus `engine` (name, version, edition), `database`,
+`graph`, `allow_execute`, `capabilities`, `limits` (default and maximum rows,
+element and value budgets, statement timeout, server result cap) and
+`read_boundary`/`read_boundary_verified`. It never includes hosts, users or
+credentials.
+On FalkorDB the schema comes from `db.labels()` and `db.relationshipTypes()`,
+exact counts, and sampled properties and endpoints, every query a
+`GRAPH.RO_QUERY` bounded by the statement timeout and what is left of the
+refresh budget; a timeout fails the refresh instead of producing an empty
+relationship list. `read_boundary` is `ro_command`. The natural-language tools
+tell the model it is writing FalkorDB OpenCypher run as `GRAPH.RO_QUERY`.
 
 `RESULTSET_SIZE` truncates a reply silently on the server, so the node reads it
 (and `TIMEOUT_MAX`) with `GRAPH.CONFIG GET` at start and keeps its read cap one
