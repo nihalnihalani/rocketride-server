@@ -270,11 +270,14 @@ class TestSessionHygiene:
 
     def test_timeout_mid_execute_also_cleans_up(self, rr_env, age_graph, monkeypatch):
         _set_pool_size(rr_env, monkeypatch, 1)
-        glb = _begin(rr_env, {'query_timeout_ms': 200})
+        # A generous deadline, so the follow-up query below cannot hit it on a
+        # slow (e.g. emulated) server; the first query needs minutes regardless.
+        glb = _begin(rr_env, {'query_timeout_ms': 1500})
         try:
             with pytest.raises(Exception, match='statement timeout'):
                 glb._run_query(
-                    'MATCH (a)-[*1..10]-(b)-[*1..10]-(c) WHERE a.name = $n RETURN count(*) AS c', params={'n': 'alice'}
+                    'UNWIND range(1, $n) AS a UNWIND range(1, $n) AS b WITH a, b WHERE (a * b) % 7 = 3 RETURN count(*) AS c',
+                    params={'n': 100_000},
                 )
             assert _on_pooled_session(glb, 'SELECT count(*) FROM pg_prepared_statements') == (0,)
             assert glb._run_query('MATCH (p:Person) WHERE p.name = $n RETURN p.age AS age', params={'n': 'carol'}) == [
@@ -560,12 +563,12 @@ class TestReadQuery:
 
     def test_server_deadline(self, rr_env, age_graph):
         _cypher_admin('UNWIND range(1, 2000) AS i CREATE (:Bulk {i: i})')
-        glb = _begin(rr_env, {'query_timeout_ms': 200})
+        glb = _begin(rr_env, {'query_timeout_ms': 800})
         inst = _instance(rr_env, glb)
         try:
             with pytest.raises(_graph_tool_error()) as err:
                 inst.read_query({'cypher': 'MATCH (a:Bulk), (b:Bulk), (c:Bulk) RETURN count(*)'})
-            assert str(err.value).startswith('Query timed out after 200 ms')
+            assert str(err.value).startswith('Query timed out after 800 ms')
         finally:
             glb.endGlobal()
 

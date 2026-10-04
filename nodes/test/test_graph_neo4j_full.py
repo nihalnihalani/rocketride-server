@@ -15,9 +15,11 @@ Configuration (defaults are the local disposable container):
     RR_TEST_NEO4J_USER      neo4j
     RR_TEST_NEO4J_PASSWORD  gxlocal-test-pass
     RR_TEST_NEO4J_READONLY_URI / _USER / _PASSWORD
-                            optional: an identity whose DATABASE ROLE is read-only
-                            (Neo4j Enterprise or Aura). Without it the role test
-                            is reported as skipped (NOT RUN), never as passed.
+                            optional: a user on the SAME server whose database
+                            role is read-only (e.g. the built-in `reader` role;
+                            Neo4j Enterprise or Aura). The role-boundary tests
+                            prove the database refuses writes for it. Without it
+                            they are reported as skipped (NOT RUN), never as passed.
 
 Concurrency: Community Edition has one user database, so every label and
 relationship type these tests create carries a per-run namespace
@@ -286,6 +288,87 @@ def _labels(driver):
     return sorted(x for x in labels + types_ if x.startswith((NS_LABEL, NS_REL)))
 
 
+# ~10^10 rows: far beyond any test deadline on every edition and runtime.
+SLOW_QUERY = 'UNWIND range(1, 100000) AS a UNWIND range(1, 100000) AS b WITH a, b WHERE (a * b) % 7 = 3 RETURN count(*)'
+
+
+def _server_identity(driver):
+    """(version, edition) as the server reports them."""
+    with driver.session(database='neo4j') as s:
+        rec = s.run('CALL dbms.components() YIELD versions, edition RETURN versions, edition').single()
+    return rec['versions'][0], rec['edition'].lower()
+
+
+def _port(uri):
+    return uri.rsplit(':', 1)[-1]
+
+
+READONLY_URI = os.environ.get('RR_TEST_NEO4J_READONLY_URI')
+READONLY_USER = os.environ.get('RR_TEST_NEO4J_READONLY_USER', '')
+READONLY_PASSWORD = os.environ.get('RR_TEST_NEO4J_READONLY_PASSWORD', '')
+_NEEDS_ROLE = pytest.mark.skipif(
+    not READONLY_URI,
+    reason='NOT RUN: needs RR_TEST_NEO4J_READONLY_URI/_USER/_PASSWORD for a read-only database role '
+    '(Neo4j Enterprise or Aura); Community has no roles',
+)
+
+
+def _start_reader(neo_env, **config):
+    """The node connected as the read-only database user (namespaced tools)."""
+    glb, inst = start_node(
+        neo_env,
+        'graph_neo4j',
+        {
+            'uri': READONLY_URI,
+            'user': READONLY_USER,
+            'password': READONLY_PASSWORD,
+            'database': 'neo4j',
+            **config,
+        },
+    )
+    return glb, _NamespacedTools(inst)
+
+
+def _state(driver):
+    """Everything a refused write could change in this run's namespace, read as the admin user."""
+    with driver.session(database='neo4j') as s:
+        props = s.run(
+            ns("MATCH (n) WHERE any(l IN labels(n) WHERE l STARTS WITH 'Gx') RETURN properties(n) AS p ORDER BY n.name")
+        ).data()
+        rels = s.run(ns("MATCH ()-[r]->() WHERE type(r) STARTS WITH 'GX_' RETURN count(r) AS c")).single()['c']
+    return _count(driver), rels, _labels(driver), [r['p'] for r in props]
+
+
+class _WriteModeDriver:
+    """Driver wrapper whose READ transactions are opened as WRITE transactions.
+
+    Lets a test remove the READ-mode layer, so a refusal can only come from
+    the database role.
+    """
+
+    def __init__(self, driver):
+        self._driver = driver
+
+    def __getattr__(self, name):
+        return getattr(self._driver, name)
+
+    def session(self, **kwargs):
+        kwargs.pop('default_access_mode', None)
+        session = self._driver.session(default_access_mode=neo4j.WRITE_ACCESS, **kwargs)
+        session.execute_read = session.execute_write
+        return session
+
+
+def _security_code(exc):
+    """The Neo4j error code behind a raised error (directly or as its cause)."""
+    while exc is not None:
+        code = getattr(exc, 'code', None)
+        if code:
+            return code
+        exc = exc.__cause__
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -432,31 +515,96 @@ class TestReadOnlyInvariant:
         finally:
             glb.endGlobal()
 
-    def test_database_role_boundary(self, neo_env, neo_db):
-        uri = os.environ.get('RR_TEST_NEO4J_READONLY_URI')
-        if not uri:
-            pytest.skip(
-                'NOT RUN: needs RR_TEST_NEO4J_READONLY_URI/_USER/_PASSWORD for a read-only database role '
-                '(Neo4j Enterprise or Aura); Community has no roles'
-            )
-        glb, inst = start_node(
-            neo_env,
-            'graph_neo4j',
-            {
-                'uri': uri,
-                'user': os.environ.get('RR_TEST_NEO4J_READONLY_USER', ''),
-                'password': os.environ.get('RR_TEST_NEO4J_READONLY_PASSWORD', ''),
-                'database': 'neo4j',
-                'allow_execute': True,
-            },
-        )
+
+@_NEEDS_ROLE
+class TestDatabaseRoleBoundary:
+    """With a read-only DATABASE ROLE, the database itself refuses every write.
+
+    These prove the boundary the README names; the node's own checks and the
+    READ-mode session are removed one at a time to show the role holds alone.
+    """
+
+    WRITES = [
+        "CREATE (:GxRoleEvil {name: 'x'})",
+        "MERGE (:GxPerson {name: 'Mallory'})",
+        "MATCH (a:GxPerson {name: 'Alice'}) SET a.age = 99",
+        "MATCH (a:GxPerson {name: 'Bob'}) DETACH DELETE a",
+        "MATCH (a:GxPerson {name: 'Alice'}) REMOVE a.age",
+        "MATCH (a:GxPerson {name: 'Alice'}), (b:GxPerson {name: 'Bob'}) CREATE (a)-[:GX_KNOWS]->(b)",
+    ]
+
+    def test_reads_work_for_the_read_only_user(self, neo_env, neo_db):
+        glb, inst = _start_reader(neo_env)
         try:
-            before = _count(neo_db)
-            with pytest.raises(Exception):
-                inst.execute({'query': "CREATE (:GxEvil {name: 'role'})"})
-            assert _count(neo_db) == before
+            out = inst.read_query({'cypher': "MATCH (a:GxPerson {name: 'Alice'})-[r]->(m) RETURN a, r, m"})
+            assert len(out['rows']) == 4 and out['rows'][0][0]['labels'] == ['GxEmployee', 'GxPerson']
+            assert 'GxPerson' in inst.refresh_schema({})['labels']
         finally:
             glb.endGlobal()
+
+    @pytest.mark.parametrize('shape', ['legacy', 'graph'])
+    @pytest.mark.parametrize('statement', WRITES)
+    def test_execute_writes_are_refused_by_the_database(self, neo_env, neo_db, shape, statement):
+        # execute has no token check and uses a WRITE session: only the role stops it.
+        glb, inst = _start_reader(neo_env, allow_execute=True)
+        try:
+            before = _state(neo_db)
+            with pytest.raises(Exception) as err:
+                inst.execute({'query': statement, 'shape': shape})
+            assert _security_code(err.value) == 'Neo.ClientError.Security.Forbidden'
+            assert 'is not allowed for user' in str(err.value)
+            if shape == 'graph':
+                assert str(err.value).startswith('Refused: the database user may not run this statement')
+            assert _state(neo_db) == before
+        finally:
+            glb.endGlobal()
+
+    def test_procedure_write_is_refused_by_the_role(self, neo_env, neo_db):
+        glb, inst = _start_reader(neo_env, allow_execute=True)
+        try:
+            before = _state(neo_db)
+            with pytest.raises(Exception) as err:
+                inst.execute({'query': "CALL db.createLabel('GxRoleEvil')"})
+            assert _security_code(err.value) == 'Neo.ClientError.Security.Forbidden'
+            assert _state(neo_db) == before
+            assert ns('GxRoleEvil') not in _labels(neo_db)
+        finally:
+            glb.endGlobal()
+
+    @pytest.mark.parametrize('statement', WRITES + ["CALL db.createLabel('GxRoleEvil')"])
+    def test_read_query_with_the_node_checks_removed_is_still_refused(self, neo_env, neo_db, monkeypatch, statement):
+        monkeypatch.setattr(neo_env.iglobal_module, 'check_read_only_cypher', lambda *a, **kw: None)
+        glb, inst = _start_reader(neo_env)
+        try:
+            # Layer removed: the token check. The READ session and the role remain.
+            before = _state(neo_db)
+            with pytest.raises(neo_env.GraphToolError) as err:
+                inst.read_query({'cypher': statement})
+            assert str(err.value).startswith('Refused: ')
+            assert _state(neo_db) == before
+            # Layer removed: READ mode too. Only the database role remains.
+            glb.driver = _WriteModeDriver(glb.driver)
+            with pytest.raises(neo_env.GraphToolError) as err:
+                inst.read_query({'cypher': statement})
+            assert _security_code(err.value) == 'Neo.ClientError.Security.Forbidden'
+            assert str(err.value).startswith('Refused: the database user may not run this statement')
+            assert _state(neo_db) == before
+        finally:
+            glb.endGlobal()
+
+    def test_dialect_reports_a_verified_role_boundary_only_for_the_reader(self, neo_env, neo_db):
+        reader_glb, reader = _start_reader(neo_env)
+        admin_glb, admin = _start(neo_env)
+        try:
+            out = reader.dialect({})
+            assert out['engine']['edition'] == 'enterprise'
+            assert out['read_boundary'] == 'database_role' and out['read_boundary_verified'] is True
+            assert READONLY_PASSWORD not in str(out)
+            admin_out = admin.dialect({})
+            assert admin_out['read_boundary'] == 'read_session' and admin_out['read_boundary_verified'] is False
+        finally:
+            reader_glb.endGlobal()
+            admin_glb.endGlobal()
 
 
 class TestLimitsAndBudgets:
@@ -491,9 +639,7 @@ class TestLimitsAndBudgets:
         glb, inst = _start(neo_env)
         try:
             with pytest.raises(neo_env.GraphToolError) as err:
-                inst.read_query(
-                    {'cypher': 'UNWIND range(1, 200000000) AS x WITH x WHERE x % 7 = 0 RETURN count(x)', 'limit': 1}
-                )
+                inst.read_query({'cypher': SLOW_QUERY, 'limit': 1})
             assert str(err.value).startswith('Query timed out after 500 ms')
         finally:
             glb.endGlobal()
@@ -587,12 +733,16 @@ class TestSchemaAndDialect:
         try:
             out = inst.dialect({})
             assert out['dialect'] == 'neo4j' and out['database'] == 'neo4j' and out['allow_execute'] is True
-            assert out['engine']['name'] == 'Neo4j' and out['engine']['version'].startswith('5.')
-            assert out['engine']['edition'] == 'community'
+            version, edition = _server_identity(neo_db)
+            assert out['engine'] == {'name': 'Neo4j', 'version': version, 'edition': edition}
+            assert version.startswith('5.') and edition in ('community', 'enterprise')
+            # The suite's main identity can write (it seeds the fixtures), so it is
+            # never a verified read-only boundary, on either edition.
             assert out['read_boundary'] == 'read_session' and out['read_boundary_verified'] is False
             assert out['limits']['statement_timeout_ms'] == 30000 and out['capabilities']['read_query'] is True
             text = str(out)
-            assert PASSWORD not in text and '57687' not in text and 'bolt' not in text
+            assert PASSWORD not in text
+            assert _port(URI) not in text and 'bolt' not in text and 'neo4j://' not in text
         finally:
             glb.endGlobal()
 
@@ -615,6 +765,8 @@ def test_role_check_requires_only_read_privileges(neo_env):
         {'access': 'DENIED', 'action': 'write'},
     ]
     assert role_is_read_only(reader) is True
+    # PUBLIC grants LOAD by default; LOAD CSV reads external files but never writes the graph.
+    assert role_is_read_only(reader + [{'access': 'GRANTED', 'action': 'load'}]) is True
     assert role_is_read_only(reader + [{'access': 'GRANTED', 'action': 'write'}]) is False
     assert role_is_read_only(reader + [{'access': 'GRANTED', 'action': 'execute_boosted'}]) is False
     assert role_is_read_only(reader + [{'access': 'GRANTED', 'action': 'some_future_privilege'}]) is False

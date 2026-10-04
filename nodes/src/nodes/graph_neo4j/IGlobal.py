@@ -50,9 +50,12 @@ from ai.common.graph.schema import SCHEMA_LABEL_LIMIT, SCHEMA_REL_TYPE_LIMIT, SC
 # Privileges a browsing identity may hold and still be read-only. Anything
 # else GRANTED (writes, schema/name management, administration, boosted
 # execution, or a privilege this list does not know) means the role is not a
-# verified read-only boundary.
+# verified read-only boundary. Procedures and functions run with the caller's
+# own privileges unless boosted, so 'execute' cannot write for a reader. 'load'
+# (granted to PUBLIC by default) lets LOAD CSV read external files; it never
+# writes the graph, and read_query refuses LOAD CSV regardless.
 READ_ONLY_PRIVILEGES = frozenset(
-    {'access', 'traverse', 'read', 'match', 'show_index', 'show_constraint', 'execute', 'execute_function'}
+    {'access', 'traverse', 'read', 'match', 'show_index', 'show_constraint', 'execute', 'execute_function', 'load'}
 )
 
 DEFAULT_URI = 'neo4j://localhost:7687'
