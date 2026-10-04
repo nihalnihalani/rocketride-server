@@ -49,7 +49,6 @@ from ai.common.schema import Answer, Question, QuestionType
 from ai.common.table import Table
 from ai.common.utils import normalize_tool_input, parse_bool, require_str
 
-from .cypher_safety import is_cypher_safe
 from .graph_errors import GraphToolError, driver_detail
 from .graph_global_base import DEFAULT_MAX_EXECUTE_ROWS, DEFAULT_READ_QUERY_LIMIT, GraphGlobalBase
 from .normalize import DEFAULT_ELEMENT_LIMIT, DEFAULT_VALUE_LIMIT, GraphBudgetExceeded, GraphNormalizer
@@ -293,8 +292,9 @@ class GraphInstanceBase(IInstanceBase, ABC):
                 return {'error': result['error'], 'query': query, 'valid': False}
             # Otherwise the LLM decided this wasn't a graph question — pass its prose through.
             return {'answer': query, 'valid': False}
-        if not is_cypher_safe(query):
-            return {'error': 'Generated query contains write or admin clauses', 'query': query, 'valid': False}
+        refusal = self.IGlobal._read_only_refusal(query)
+        if refusal:
+            return {'error': refusal, 'query': query, 'valid': False}
         return {'query': query, 'valid': True}
 
     @tool_function(
@@ -652,7 +652,7 @@ class GraphInstanceBase(IInstanceBase, ABC):
             query = result.get('query', '')
 
             # Not a graph question, or the safety gate rejects it — no point in EXPLAIN.
-            if not parse_bool(result.get('isValid', False)) or not query or not is_cypher_safe(query):
+            if not parse_bool(result.get('isValid', False)) or not query or self.IGlobal._read_only_refusal(query):
                 return result
 
             ok, explain_error = self.IGlobal._validate_query(query)
@@ -834,8 +834,9 @@ class GraphInstanceBase(IInstanceBase, ABC):
                 return
             # The LLM claimed a valid query but it carries a write/admin clause: same
             # rule — surface the rejection, never emit the unsafe query as prose.
-            if is_valid and query and not is_cypher_safe(query):
-                self._emitError('Generated query contains write or admin clauses', lanes)
+            refusal = self.IGlobal._read_only_refusal(query) if is_valid and query else None
+            if refusal:
+                self._emitError(refusal, lanes)
                 return
 
             executed = is_valid and bool(query)

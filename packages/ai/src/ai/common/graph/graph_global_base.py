@@ -49,6 +49,7 @@ from rocketlib import IGlobalBase, debug, warning
 from ai.common.config import Config
 from ai.common.utils import config_int, parse_bool
 
+from .cypher_safety import is_cypher_safe
 from .graph_errors import GraphToolError, driver_detail
 from .schema import SCHEMA_REFRESH_BUDGET_MS, SchemaBuilder, empty_block, legacy_from_block
 
@@ -200,6 +201,16 @@ class GraphGlobalBase(IGlobalBase, ABC):
         if headline == 'Query failed':
             headline = 'Schema refresh failed'
         return headline + (f'\n{detail}' if detail else '')
+
+    def _read_only_refusal(self, query: str) -> Optional[str]:
+        """Why generated Cypher may not run on a read path, or None if it may.
+
+        Used by the natural-language tools before a query is shown or run.
+        Drivers with a stricter check (Neo4j's procedure allowlist) extend it.
+        """
+        if not is_cypher_safe(query):
+            return 'Generated query contains write or admin clauses'
+        return None
 
     def _prompt_rules(self) -> List[str]:
         """Engine/version-specific rules for the natural-language query prompt."""

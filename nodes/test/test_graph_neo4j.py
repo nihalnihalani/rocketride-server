@@ -555,3 +555,12 @@ def test_role_privilege_check():
     assert _glb_mod.role_is_read_only(read_only)
     assert not _glb_mod.role_is_read_only(read_only + [{'access': 'GRANTED', 'action': 'write'}])
     assert not _glb_mod.role_is_read_only([])
+
+
+def test_get_query_refuses_generated_procedure_writes():
+    # The legacy keyword gate let this through; the procedure allowlist does not.
+    glb = _FakeGlobal(_FakeDriver())
+    inst = _instance(glb)
+    inst._buildQuery = lambda question, limit=0: {'isValid': 'true', 'query': "CALL db.createLabel('X')"}
+    out = inst.get_query({'question': 'make a label'})
+    assert out['valid'] is False and out['error'].startswith('Refused: CALL db.createLabel')

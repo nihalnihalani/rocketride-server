@@ -44,7 +44,7 @@ from rocketlib import error, warning
 
 from ai.common.graph import GraphGlobalBase, is_cypher_safe
 from ai.common.graph.adapters import neo4j_adapter
-from ai.common.graph.cypher_safety import NEO4J_READ_PROCEDURES, check_read_only_cypher
+from ai.common.graph.cypher_safety import NEO4J_READ_PROCEDURES, CypherRefused, check_read_only_cypher
 from ai.common.graph.schema import SCHEMA_LABEL_LIMIT, SCHEMA_REL_TYPE_LIMIT, SCHEMA_SAMPLE_SIZE
 
 # Privileges a browsing identity may hold and still be read-only. Anything
@@ -302,6 +302,16 @@ class IGlobal(GraphGlobalBase):
 
         with self.driver.session(database=self.database, default_access_mode=neo4j.READ_ACCESS) as session:
             session.execute_read(neo4j.unit_of_work(timeout=remaining)(work))
+
+    def _read_only_refusal(self, query):
+        refusal = super()._read_only_refusal(query)
+        if refusal:
+            return refusal
+        try:
+            check_read_only_cypher(query, allowed_procedures=NEO4J_READ_PROCEDURES)
+        except CypherRefused as e:
+            return e.headline
+        return None
 
     def _engine_identity(self):
         verified = bool(self.role_verified_read_only)
