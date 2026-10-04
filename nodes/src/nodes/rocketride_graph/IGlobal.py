@@ -44,7 +44,7 @@ is left on the session afterwards (no session SETs, prepared statements are
 deallocated even when the query fails).
 """
 
-import re
+import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import psycopg2
@@ -62,12 +62,12 @@ from ai.common.graph.age import (
     FirewallConfig,
     TranslateMode,
     TranslatedQuery,
-    decode_agtype,
     decode_row,
     parse_agtype,
     translate,
 )
 from ai.common.graph.connection_pool import ConnectionPool, PoolClosed, PoolTimeout
+from ai.common.graph.schema import SCHEMA_LABEL_LIMIT, SCHEMA_REL_TYPE_LIMIT, SCHEMA_SAMPLE_SIZE
 from ai.common.rocketride_db import resolve_rocketride_dsn
 
 DEFAULT_GRAPH_NAME = 'rocketride'
@@ -85,14 +85,6 @@ CONNECT_TIMEOUT_S = 3
 # Savepoint that brackets a prepared EXECUTE, so a failed EXECUTE can be
 # rolled back to a point where DEALLOCATE still runs in the same transaction.
 _EXEC_SAVEPOINT = 'rr_exec'
-
-# Reflection fan-out bounds (mirrors graph_falkordb's sampling posture).
-SCHEMA_LABEL_LIMIT = 200
-SCHEMA_REL_LIMIT = 100
-
-# Same identifier rule the translation layer applies to graph names — labels
-# interpolated into Cypher text must conform (see _sample_edge_endpoints).
-VALID_LABEL = re.compile(r'^[A-Za-z_][A-Za-z0-9_]{0,62}$')
 
 
 class _ConnectionLost(Exception):
@@ -144,6 +136,7 @@ class IGlobal(GraphGlobalBase):
     max_rows: int = DEFAULT_MAX_ROWS
     query_timeout_ms: int = DEFAULT_QUERY_TIMEOUT_MS
     age_version: str = ''
+    database_name: Optional[str] = None
 
     # ------------------------------------------------------------------
     # Driver lifecycle
@@ -178,6 +171,9 @@ class IGlobal(GraphGlobalBase):
             graph_exists = bool(
                 self._sql_read('SELECT 1 FROM ag_catalog.ag_graph WHERE name = %s', (self.graph_name,), pool=pool)
             )
+            # The database's own name is safe identity for the connection card
+            # (unlike the DSN, which carries host and credentials).
+            self.database_name = self._sql_read('SELECT current_database()', pool=pool)[0][0]
         except BaseException:
             pool.close()
             raise
@@ -490,79 +486,107 @@ class IGlobal(GraphGlobalBase):
             return False, str(e)
 
     # ------------------------------------------------------------------
-    # Schema reflection — AGE catalog + bounded sampling
+    # Schema reflection — AGE catalog + bounded sampling (schema v2)
     # ------------------------------------------------------------------
 
-    def _reflect_schema(self) -> Dict[str, Any]:
-        """Labels from ``ag_catalog.ag_label``; property types by sampling.
+    def _reflect_schema_v2(self, builder, deadline):
+        """Labels from the AGE catalog in id order, estimated counts, sampled properties and endpoints.
 
-        Best-effort by contract: any failure warns and degrades to a partial
-        (or empty) schema rather than blocking startup.
+        One pooled connection, one REPEATABLE READ, READ ONLY transaction whose
+        SET LOCAL statement_timeout is the remaining refresh budget: every
+        sample sees the same database state and the whole refresh is bounded
+        by the server. Counts come from pg_class.reltuples (planner
+        estimates, never a scan). Edge endpoints come from the label id that
+        AGE encodes in the top 16 bits of every graphid, so no join or
+        Cypher text is assembled from label names.
         """
-        schema: Dict[str, Any] = {'nodes': {}, 'relationships': []}
-        if self.pool is None:
-            return schema
+        remaining_ms = int((deadline - time.monotonic()) * 1000)
+        if remaining_ms <= 0:
+            raise TimeoutError('schema refresh budget exhausted')
+        pool = self._require_pool()
+        with pool.connection() as conn:
+            try:
+                with conn.cursor() as cur:
+                    cur.execute('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY')
+                    cur.execute(f"SET LOCAL statement_timeout = '{max(1, remaining_ms)}ms'")
+                    cur.execute(
+                        'SELECT l.id, l.name, l.kind, c.reltuples FROM ag_catalog.ag_label l '
+                        'JOIN ag_catalog.ag_graph g ON l.graph = g.graphid '
+                        'JOIN pg_catalog.pg_class c ON c.oid = l.relation '
+                        'WHERE g.name = %s ORDER BY l.id',
+                        (self.graph_name,),
+                    )
+                    catalog = cur.fetchall()
+                    # Label id -> name, the default (unlabelled) labels as ''.
+                    names = {int(lid): ('' if name.startswith('_ag_label_') else name) for lid, name, _k, _r in catalog}
+                    vertices = [
+                        (name, tuples)
+                        for _id, name, kind, tuples in catalog
+                        if kind == 'v' and not name.startswith('_ag_')
+                    ]
+                    edges = [
+                        (name, tuples)
+                        for _id, name, kind, tuples in catalog
+                        if kind == 'e' and not name.startswith('_ag_')
+                    ]
+                    if len(vertices) > SCHEMA_LABEL_LIMIT or len(edges) > SCHEMA_REL_TYPE_LIMIT:
+                        builder.truncated = True
+                    for name, tuples in vertices[:SCHEMA_LABEL_LIMIT]:
+                        builder.label(name, **_estimate(tuples))
+                        cur.execute(
+                            sql.SQL('SELECT properties FROM ONLY {} LIMIT %s').format(
+                                sql.Identifier(self.graph_name, name)
+                            ),
+                            (SCHEMA_SAMPLE_SIZE,),
+                        )
+                        for (props,) in cur.fetchall():
+                            builder.sample_label_properties(name, parse_agtype(props))
+                    for name, tuples in edges[:SCHEMA_REL_TYPE_LIMIT]:
+                        builder.rel_type(name, **_estimate(tuples))
+                        cur.execute(
+                            sql.SQL('SELECT start_id::text, end_id::text, properties FROM ONLY {} LIMIT %s').format(
+                                sql.Identifier(self.graph_name, name)
+                            ),
+                            (SCHEMA_SAMPLE_SIZE,),
+                        )
+                        for start_id, end_id, props in cur.fetchall():
+                            builder.endpoint(
+                                name,
+                                names.get(int(start_id) >> 48, ''),
+                                names.get(int(end_id) >> 48, ''),
+                                observed=True,
+                            )
+                            builder.sample_rel_properties(name, parse_agtype(props))
+                conn.rollback()
+            except Exception:
+                if conn.closed:
+                    pool.discard(conn)
+                raise
 
-        try:
-            labels = self._sql_read(
-                'SELECT l.name, l.kind FROM ag_catalog.ag_label l '
-                'JOIN ag_catalog.ag_graph g ON l.graph = g.graphid '
-                "WHERE g.name = %s AND l.name NOT LIKE '\\_ag\\_%%'",
-                (self.graph_name,),
-            )
-        except Exception as e:
-            warning(f'rocketride_graph: unable to list graph labels: {e}')
-            return schema
+    def _engine_identity(self):
+        return {
+            'engine': {'name': 'Apache AGE', 'version': self.age_version or None, 'edition': None},
+            'database': self.database_name,
+            'graph': self.graph_name,
+            'read_boundary': 'read_only_tx',
+            'read_boundary_verified': False,
+            'shortest_path': False,
+            'server_result_cap': None,
+        }
 
-        vertex_labels = [name for name, kind in labels if kind == 'v'][:SCHEMA_LABEL_LIMIT]
-        edge_labels = [name for name, kind in labels if kind == 'e'][:SCHEMA_REL_LIMIT]
-
-        for label in vertex_labels:
-            schema['nodes'][label] = self._sample_properties(label)
-
-        for etype in edge_labels:
-            start, end = self._sample_edge_endpoints(etype)
-            schema['relationships'].append({'type': etype, 'start': start, 'end': end})
-
-        return schema
-
-    def _sample_properties(self, label: str) -> List[Tuple[str, str]]:
-        """One-row property sample from the label's backing table."""
-        try:
-            rows = self._sql_read(
-                sql.SQL('SELECT properties FROM {} LIMIT 1').format(sql.Identifier(self.graph_name, label))
-            )
-        except Exception as e:
-            warning(f'rocketride_graph: unable to sample label {label!r}: {e}')
-            return []
-        if not rows:
-            return []
-        properties = decode_agtype(rows[0][0]) or {}
-        return [(key, type(value).__name__) for key, value in properties.items()]
-
-    def _sample_edge_endpoints(self, etype: str) -> Tuple[str, str]:
-        """Start/end labels for one sampled edge of the given type."""
-        # The one Cypher string the node assembles itself, so hold the label
-        # to the same identifier rule the layer applies to graph names: AGE
-        # allows backtick-quoted labels with arbitrary characters, and those
-        # must not be spliced into query text.
-        if not VALID_LABEL.fullmatch(etype or ''):
-            warning(f'rocketride_graph: skipping relationship sample for non-identifier label {etype!r}')
-            return '', ''
-        try:
-            plan = self._translate(
-                f'MATCH (a)-[r:{etype}]->(b) RETURN label(a) AS s, label(b) AS e',
-                limit=1,
-                mode=TranslateMode.SAFE,
-            )
-            raw = self._execute_plan(plan, fetch_cap=1)
-        except Exception as e:
-            warning(f'rocketride_graph: unable to sample relationship {etype!r}: {e}')
-            return '', ''
-        if not raw:
-            return '', ''
-        row = decode_row(plan, raw[0])
-        return str(row.get('s') or ''), str(row.get('e') or '')
+    def _prompt_rules(self):
+        version = self.age_version or '1.5.0'
+        return [
+            f'The database is PostgreSQL with Apache AGE {version}, which runs a SUBSET of Cypher.',
+            'Read only: MATCH, OPTIONAL MATCH, WITH, UNWIND, RETURN, ORDER BY, SKIP, LIMIT. Never CALL.',
+            'List every result column explicitly (no RETURN *); ORDER BY an expression, not a RETURN alias.',
+            'One label per node, inside the pattern: (n:Label). No WHERE n:Label and no (n:A:B).',
+            'Not available: datetime(), date(), time(), localtime(), localdatetime(), duration(), elementId(), '
+            'list or pattern comprehensions, EXISTS { } subqueries, exists(), =~, shortestPath(), allShortestPaths().',
+            'Variable-length relationships need an upper bound of at most 10, e.g. -[*1..3]->.',
+            'Refer to nodes by id(n); compare with toInteger($id) when the id is a string.',
+            'Never qualify a function with a schema name.',
+        ]
 
     # ------------------------------------------------------------------
     # Helpers
@@ -595,3 +619,14 @@ def _firewall_headline(exc: AgeFirewallRejected) -> str:
 def _pg_detail(exc: BaseException) -> str:
     text = (getattr(exc, 'pgerror', None) or str(exc)).strip()
     return '\n'.join(text.splitlines()[:6])
+
+
+def _estimate(reltuples: Any) -> Dict[str, Any]:
+    """pg_class.reltuples as a schema count: an estimate, or nothing if never analyzed."""
+    try:
+        value = float(reltuples)
+    except (TypeError, ValueError):
+        return {}
+    if value < 0:
+        return {}
+    return {'count': int(value), 'estimated': True}

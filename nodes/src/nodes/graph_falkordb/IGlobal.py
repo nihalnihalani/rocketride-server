@@ -33,6 +33,8 @@ from the base class.
 
 from __future__ import annotations
 
+import time
+
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
@@ -43,6 +45,7 @@ from rocketlib import OPEN_MODE, warning
 from ai.common.graph import GraphGlobalBase
 from ai.common.graph.adapters import falkordb_adapter
 from ai.common.graph.graph_global_base import READ_QUERY_HARD_CAP
+from ai.common.graph.schema import SCHEMA_LABEL_LIMIT, SCHEMA_REL_TYPE_LIMIT, SCHEMA_SAMPLE_SIZE
 from ai.common.utils import config_int, parse_bool
 
 from falkordb import FalkorDB
@@ -53,14 +56,6 @@ DEFAULT_GRAPH = 'agent'
 URL_SCHEMES = ('falkor://', 'falkors://', 'redis://', 'rediss://', 'unix://')
 DEFAULT_TIMEOUT_MS = 30000
 DEFAULT_ROW_CAP = 250
-
-# FalkorDB has no db.schema.nodeTypeProperties(), so property names are read
-# off one live node per label.
-SCHEMA_SAMPLE_SIZE = 1
-# Cap on distinct relationship patterns pulled during reflection.
-SCHEMA_REL_LIMIT = 100
-# Cap on labels sampled during reflection — one query per label, so bound the fan-out.
-SCHEMA_LABEL_LIMIT = 200
 
 
 class IGlobal(GraphGlobalBase):
@@ -77,6 +72,7 @@ class IGlobal(GraphGlobalBase):
     # per-query timeouts.
     server_result_cap: Optional[int] = None
     server_timeout_max_ms: Optional[int] = None
+    server_version: Optional[str] = None
 
     def beginGlobal(self) -> None:
         # Config-mode opens the node for editing only; no server round-trip.
@@ -214,9 +210,19 @@ class IGlobal(GraphGlobalBase):
     # ------------------------------------------------------------------
 
     def _read_server_limits(self) -> None:
-        """Best effort: learn RESULTSET_SIZE and TIMEOUT_MAX so limits stay honest."""
+        """Best effort: learn RESULTSET_SIZE and TIMEOUT_MAX so limits stay honest, and the module version."""
         self.server_result_cap = self._config_value('RESULTSET_SIZE')
         self.server_timeout_max_ms = self._config_value('TIMEOUT_MAX')
+        self.server_version = None
+        try:
+            for module in self.client.connection.execute_command('MODULE', 'LIST') or []:
+                fields = dict(zip(module[0::2], module[1::2]))
+                name = fields.get('name', fields.get(b'name'))
+                if name in ('graph', b'graph'):
+                    ver = int(fields.get('ver', fields.get(b'ver')))
+                    self.server_version = f'{ver // 10000}.{ver // 100 % 100}.{ver % 100}'
+        except Exception:  # descriptive only; MODULE LIST may be disabled on managed services
+            self.server_version = None
 
     def _config_value(self, name: str) -> Optional[int]:
         try:
@@ -286,33 +292,71 @@ class IGlobal(GraphGlobalBase):
         except Exception as e:
             return False, str(e)
 
-    def _reflect_schema(self) -> Dict[str, Any]:
-        """Reflect labels with their properties, plus the relationship patterns in use."""
-        schema: Dict[str, Any] = {'nodes': {}, 'relationships': []}
+    def _reflect_schema_v2(self, builder, deadline):
+        """Labels and relationship types, exact counts, sampled properties and endpoints.
 
-        try:
-            graph = self.select_graph()
+        Every query is a GRAPH.RO_QUERY whose timeout is the smaller of the
+        statement timeout and what is left of the refresh budget; a timeout or
+        any error fails the whole refresh (never a silently empty list).
+        """
+        graph = self.select_graph()
 
-            # One sampling query per label, so bound the fan-out on a wide schema.
-            for label in self._column(graph, 'CALL db.labels()')[:SCHEMA_LABEL_LIMIT]:
-                schema['nodes'][label] = self._sample_properties(graph, label)
+        def run(cypher: str):
+            remaining_ms = int((deadline - time.monotonic()) * 1000)
+            if remaining_ms <= 0:
+                raise TimeoutError('schema refresh budget exhausted')
+            return graph.ro_query(cypher, timeout=max(1, min(self.statement_timeout_ms, remaining_ms))).result_set or []
 
-            result = graph.ro_query(
-                'MATCH (a)-[r]->(b) '
-                'RETURN DISTINCT labels(a)[0] AS start, type(r) AS type, labels(b)[0] AS end '
-                f'LIMIT {SCHEMA_REL_LIMIT}',
-                timeout=self.query_timeout_ms,
-            )
-            schema['relationships'] = [
-                {'type': str(row[1] or ''), 'start': str(row[0] or ''), 'end': str(row[2] or '')}
-                for row in (result.result_set or [])
-                if row and len(row) >= 3 and row[1]
-            ]
+        labels = sorted(str(row[0]) for row in run('CALL db.labels()') if row)
+        if len(labels) > SCHEMA_LABEL_LIMIT:
+            builder.truncated = True
+            labels = labels[:SCHEMA_LABEL_LIMIT]
+        for label in labels:
+            if '`' in label:
+                # FalkorDB cannot quote a back-quote inside an identifier.
+                builder.label(label)
+                builder.truncated = True
+                continue
+            builder.label(label, count=run(f'MATCH (n:`{label}`) RETURN count(n)')[0][0])
+            for row in run(f'MATCH (n:`{label}`) WITH n LIMIT {SCHEMA_SAMPLE_SIZE} RETURN properties(n)'):
+                builder.sample_label_properties(label, row[0])
 
-        except Exception as e:
-            warning(f'FalkorDB schema reflection failed: {e}')
+        rels = sorted(str(row[0]) for row in run('CALL db.relationshipTypes()') if row)
+        if len(rels) > SCHEMA_REL_TYPE_LIMIT:
+            builder.truncated = True
+            rels = rels[:SCHEMA_REL_TYPE_LIMIT]
+        for rel in rels:
+            if '`' in rel:
+                builder.rel_type(rel)
+                builder.truncated = True
+                continue
+            builder.rel_type(rel, count=run(f'MATCH ()-[r:`{rel}`]->() RETURN count(r)')[0][0])
+            for start_labels, end_labels, props in run(
+                f'MATCH (a)-[r:`{rel}`]->(b) WITH a, r, b LIMIT {SCHEMA_SAMPLE_SIZE} '
+                'RETURN labels(a), labels(b), properties(r)'
+            ):
+                for start in start_labels or ['']:
+                    for end in end_labels or ['']:
+                        builder.endpoint(rel, start, end, observed=True)
+                builder.sample_rel_properties(rel, props)
 
-        return schema
+    def _engine_identity(self):
+        return {
+            'engine': {'name': 'FalkorDB', 'version': self.server_version, 'edition': None},
+            'database': None,
+            'graph': self.graph_name,
+            'read_boundary': 'ro_command',
+            'read_boundary_verified': False,
+            'shortest_path': True,
+            'server_result_cap': self.server_result_cap,
+        }
+
+    def _prompt_rules(self):
+        return [
+            f'The database is FalkorDB{" " + self.server_version if self.server_version else ""}; write OpenCypher.',
+            'Queries run as GRAPH.RO_QUERY: only read clauses (MATCH, OPTIONAL MATCH, WITH, UNWIND, RETURN).',
+            'Refer to nodes by id(n); compare with toInteger($id) when the id is a string.',
+        ]
 
     # ------------------------------------------------------------------
     # FalkorDB helpers
@@ -330,28 +374,6 @@ class IGlobal(GraphGlobalBase):
     def list_graphs(self) -> List[str]:
         """List the graph names that exist on this server."""
         return [str(g) for g in (self.client.list_graphs() or [])]
-
-    def _sample_properties(self, graph, label: str) -> List[Tuple[str, str]]:
-        """Read property names off one node of ``label``; FalkorDB has no schema catalog."""
-        try:
-            # The label is interpolated because Cypher has no parameter slot for
-            # labels — it comes from db.labels(), never from user input.
-            result = graph.ro_query(
-                f'MATCH (n:`{label}`) RETURN properties(n) LIMIT {SCHEMA_SAMPLE_SIZE}',
-                timeout=self.query_timeout_ms,
-            )
-            rows = result.result_set or []
-            if not rows or not rows[0]:
-                return []
-            props = rows[0][0] or {}
-            return [(str(key), _type_name(value)) for key, value in props.items()]
-        except (RedisError, ValueError, TypeError):
-            return []
-
-    def _column(self, graph, cypher: str) -> List[str]:
-        """Run a single-column procedure call and return its values as strings."""
-        result = graph.ro_query(cypher, timeout=self.query_timeout_ms)
-        return [str(row[0]) for row in (result.result_set or []) if row]
 
     @classmethod
     def _connect(cls, config: Dict[str, Any]) -> FalkorDB:
@@ -481,21 +503,6 @@ def _redact(target: str) -> str:
             query = urlencode([(k, '***' if k == 'password' else v) for k, v in params], safe='*')
 
     return f'{scheme}://{authority}{question}{query}'
-
-
-def _type_name(value: Any) -> str:
-    """Map a sampled property value to a schema type name for the LLM prompt."""
-    if isinstance(value, bool):
-        return 'BOOLEAN'
-    if isinstance(value, int):
-        return 'INTEGER'
-    if isinstance(value, float):
-        return 'FLOAT'
-    if isinstance(value, str):
-        return 'STRING'
-    if isinstance(value, (list, tuple)):
-        return 'LIST'
-    return 'ANY'
 
 
 def _header_names(header) -> List[str]:
