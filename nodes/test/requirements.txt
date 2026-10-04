@@ -13,10 +13,10 @@ pytest-xdist
 img2table                   # ocr: test_model_server_ocr.py
 psycopg2-binary             # rocketride_*, db/store_postgres: test_rocketride_db_full.py, test_rocketride_graph_full.py
 pgvector                    # rocketride_vector, store_postgres: test_rocketride_db_full.py
-antlr4-python3-runtime>=4.13.2,<4.14  # rocketride_graph (AGE translator): test_rocketride_graph_full.py
-neo4j                       # graph_neo4j: live graph suites
-falkordb>=1.6,<2            # graph_falkordb: live graph suites
-redis>=7.1,<8               # graph_falkordb (falkordb-py re-raises redis-py errors)
+antlr4-python3-runtime      # rocketride_graph (AGE translator): live database suites
+neo4j                       # graph_neo4j: live database suites
+falkordb                    # graph_falkordb: live database suites
+redis                       # graph_falkordb (falkordb-py re-raises redis-py errors)
 python-docx                 # tool_microsoft_365: test_word.py
 smbprotocol                 # text_output: test_validate_config.py
 pygit2                      # tool_git: test_tools.py

@@ -395,6 +395,26 @@ class TestEmit:
                 graph_name='g',
             )
 
+    def test_dollar_tag_never_closes_early_when_body_ends_like_the_tag(self):
+        # A query ending in `$rr_cypher` plus the closing `$rr_cypher$` would
+        # contain the tag one character early and end the string there.
+        plan = age.translate('MATCH (n) RETURN n.name = $rr_cypher', params={'rr_cypher': 'x'}, graph_name='g')
+        prepare = plan.statements[plan.result_index - 1]
+        body_start = prepare.index("'g', ") + len("'g', ")
+        tag = prepare[body_start : prepare.index('$', body_start + 1) + 1]
+        quoted = prepare[body_start:]
+        assert tag != '$rr_cypher$'
+        # The closing tag's first occurrence after the opening one ends exactly the body.
+        assert quoted.index(tag, len(tag)) == len(tag) + len('MATCH (n) RETURN n.name = $rr_cypher')
+
+    def test_prepared_name_recorded_for_param_plans(self):
+        plan = age.translate('MATCH (n) WHERE n.a = $x RETURN n', params={'x': 1}, graph_name='g')
+        assert plan.prepared_name and plan.statements[plan.result_index - 1].startswith(
+            f'PREPARE {plan.prepared_name}('
+        )
+        assert plan.statements[-1] == f'DEALLOCATE {plan.prepared_name}'
+        assert age.translate('MATCH (n) RETURN n', graph_name='g').prepared_name is None
+
     def test_dollar_tag_rotates_on_collision(self):
         plan = age.translate("MATCH (n) WHERE n.note = '$rr_cypher$x' RETURN n.note", graph_name='g')
         assert '$rr_cypher1$' in plan.statements[plan.result_index]

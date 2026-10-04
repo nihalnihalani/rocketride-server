@@ -533,6 +533,31 @@ Integration tests execute the test cases defined in `services*.json` through a l
 ./builder nodes:test-full --pytest-pattern="llm"
 ```
 
+### Live database tests
+
+Some suites drive a node's real driver against a real database server:
+`test_rocketride_graph_full.py` and `test_graph_age_full.py` (Apache AGE),
+`test_rocketride_db_full.py` (PostgreSQL with pgvector), and the graph node
+suites for Neo4j and FalkorDB. They stub the engine surface themselves, so they
+need no test server, but they cannot run in the mocked pass: `nodes/test/mocks`
+replaces `psycopg2` and `falkordb` for the whole engine. They are listed in
+`DB_LIVE_SUITES` in `nodes/scripts/tasks.js`, which `nodes:test` ignores in its
+mocked pass and then runs in a separate pass without mocks:
+
+```bash
+./builder nodes:test-db                      # only the live database pass
+RR_REQUIRE_DB_TESTS=1 ./builder nodes:test   # as CI runs it
+```
+
+Each suite skips when its server is unreachable. With `RR_REQUIRE_DB_TESTS` set,
+which the Linux CI leg does once its database containers are healthy, an
+unreachable server fails the suite, and so does a suite in which no test
+passed. The servers and their environment variables (`RR_TEST_AGE_DSN`,
+`RR_TEST_PG_DSN`, `RR_TEST_NEO4J_URI`, `RR_TEST_FALKORDB_URL`, ...) are the
+ones `.github/workflows/_build.yaml` starts; run the same images locally to
+reproduce a CI failure. A new live suite goes into `DB_LIVE_SUITES` and is named
+`test_*_full.py`, so the mocked pass never collects it.
+
 ### Test dependencies
 
 A node installs its `requirements.txt` only when a pipeline first loads it. A test
