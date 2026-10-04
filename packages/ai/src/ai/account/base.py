@@ -32,6 +32,48 @@
 
 import os
 from abc import ABC, abstractmethod
+from typing import Mapping
+
+
+# The data-core DB broker's address and bearer token. Operator-only settings in
+# the RR_* tier: pipeline placeholder resolution only substitutes ROCKETRIDE_*
+# names, the OSS get_env/set_env account commands only read and write
+# ROCKETRIDE_* names, and task subprocesses do not inherit them. The token can
+# resolve any tenant's connection string, so it must never be reachable from a
+# ${...} placeholder.
+DB_BROKER_URL_ENV = 'RR_DB_BROKER_URL'
+DB_BROKER_TOKEN_ENV = 'RR_DB_BROKER_TOKEN'
+
+# The names these settings had before. They sat in the user-substitutable
+# ROCKETRIDE_* namespace, so any value under them is a hard error, never a
+# fallback: a fallback would keep the secret substitutable for as long as the
+# deployment still set it.
+LEGACY_DB_BROKER_ENV = {
+    'ROCKETRIDE_DB_BROKER_URL': DB_BROKER_URL_ENV,
+    'ROCKETRIDE_DB_BROKER_TOKEN': DB_BROKER_TOKEN_ENV,
+}
+
+
+def check_db_broker_environment(environ: Mapping[str, str] = os.environ) -> None:
+    """Refuse to run while a legacy DB broker variable is set.
+
+    Called when the account layer loads, so a server whose deployment still
+    sets ``ROCKETRIDE_DB_BROKER_URL`` or ``ROCKETRIDE_DB_BROKER_TOKEN`` fails at
+    startup instead of serving with the token substitutable into pipelines.
+    Applies whether or not the new ``RR_*`` names are also set, and whether or
+    not their values agree.
+
+    Raises:
+        EnvironmentError: a legacy name has a non-empty value.
+    """
+    legacy = [name for name in LEGACY_DB_BROKER_ENV if environ.get(name, '').strip()]
+    if legacy:
+        renames = ', '.join(f'{name} -> {LEGACY_DB_BROKER_ENV[name]}' for name in legacy)
+        raise EnvironmentError(
+            f'The DB broker settings have been renamed ({renames}). '
+            'Set the RR_* names and remove the old ones from the deployment configuration: '
+            'ROCKETRIDE_* variables can be substituted into pipelines.'
+        )
 
 
 class AccountBase(ABC):
@@ -344,11 +386,13 @@ class AccountBase(ABC):
         ``client_id`` (``userId``).  One database per tenant backs all three.
 
         Default implementation (both editions): call the data-core provisioner
-        configured via server-side environment —
+        configured via operator-only server environment —
 
-            ROCKETRIDE_DB_BROKER_URL    the /provision endpoint URL
-            ROCKETRIDE_DB_BROKER_TOKEN  its Bearer token (from ASM/k8s; never
-                                        hardcoded)
+            RR_DB_BROKER_URL    the /provision endpoint URL
+            RR_DB_BROKER_TOKEN  its Bearer token (from ASM/k8s; never hardcoded)
+
+        The legacy ``ROCKETRIDE_DB_BROKER_*`` names are refused (see
+        :func:`check_db_broker_environment`).
 
         ``POST {url} {"tenant_id": client_id}`` -> ``{"database", "role",
         "dsn", "created"}`` (only ``dsn`` is read here).
@@ -371,10 +415,12 @@ class AccountBase(ABC):
 
         Raises:
             NotImplementedError: broker environment not configured.
+            EnvironmentError: a legacy ``ROCKETRIDE_DB_BROKER_*`` name is set.
             RuntimeError: the broker rejected the request or returned no DSN.
         """
-        broker_url = os.environ.get('ROCKETRIDE_DB_BROKER_URL', '').strip()
-        broker_token = os.environ.get('ROCKETRIDE_DB_BROKER_TOKEN', '').strip()
+        check_db_broker_environment()
+        broker_url = os.environ.get(DB_BROKER_URL_ENV, '').strip()
+        broker_token = os.environ.get(DB_BROKER_TOKEN_ENV, '').strip()
         if not broker_url or not broker_token:
             raise NotImplementedError('RocketRide cloud DB nodes require signing into RocketRide cloud')
         if not client_id or not client_id.strip():
@@ -406,7 +452,7 @@ class AccountBase(ABC):
         if scheme == 'http' and host in ('localhost', '127.0.0.1', '::1'):
             return
         raise RuntimeError(
-            f'ROCKETRIDE_DB_BROKER_URL must use https (got {scheme or "no"} scheme): '
+            f'{DB_BROKER_URL_ENV} must use https (got {scheme or "no"} scheme): '
             'the broker token must never travel unencrypted; plain http is allowed only for localhost'
         )
 

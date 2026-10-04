@@ -192,6 +192,105 @@ class TestFirewall:
         assert plan.has_return is True
 
 
+class TestQualifiedCalls:
+    """Schema-qualified function calls leave AGE's own function namespace, so the
+    safe path rejects every one of them, wherever it sits in the statement.
+    Detection comes from the parse tree, not from a list of names.
+    """
+
+    QUALIFIED = [
+        'RETURN myschema.fn(1)',
+        'RETURN pg_catalog.sqrt(25)',
+        'RETURN PG_CATALOG.SQRT(25)',
+        'RETURN `myschema`.`fn`(1)',
+        'RETURN `my schema`.fn(1)',
+        'RETURN a.b.c(1)',
+        'RETURN `myschema.fn`(1)',
+        'MATCH (n) WHERE myschema.fn(n.x) RETURN n',
+        'MATCH (n) RETURN toUpper(myschema.fn(n.name))',
+        'MATCH (n) RETURN [x IN [1, 2] | myschema.fn(x)]',
+        'MATCH (n) RETURN [(n)-->(m) | myschema.fn(m)]',
+        'MATCH (n) RETURN CASE WHEN n.x > 1 THEN myschema.fn(n) ELSE 0 END',
+        'MATCH (n) WITH myschema.fn(n) AS v RETURN v',
+        'MATCH (n) RETURN n ORDER BY myschema.fn(n.x)',
+        'UNWIND [1] AS x RETURN x UNION UNWIND [2] AS x RETURN myschema.fn(x)',
+        'MATCH (n) RETURN n.x AS v UNION MATCH (n) RETURN myschema.fn(n.y) AS v',
+        'MATCH (n) WHERE n.x = $p AND myschema.fn($p) RETURN n',
+        'MATCH (n) RETURN count(DISTINCT myschema.fn(n))',
+        'MATCH p = (a)-[*1..2]->(b) RETURN size([r IN relationships(p) WHERE myschema.fn(r)])',
+    ]
+
+    @pytest.mark.parametrize('query', QUALIFIED)
+    def test_rejected_on_safe_path(self, query):
+        params = {'p': 1} if '$p' in query else None
+        with pytest.raises(age.AgeFirewallRejected, match='qualified_function'):
+            age.translate(query, params=params, mode=SAFE, graph_name='g')
+
+    @pytest.mark.parametrize('query', QUALIFIED)
+    def test_rejected_on_raw_path_without_allowlist(self, query):
+        params = {'p': 1} if '$p' in query else None
+        with pytest.raises(age.AgeFirewallRejected, match='qualified_function'):
+            age.translate(query, params=params, mode=RAW, graph_name='g')
+
+    @pytest.mark.parametrize(
+        'query',
+        [
+            'RETURN pg_catalog .sqrt(25)',
+            'RETURN pg_catalog/* c */.sqrt(25)',
+            'RETURN pg_catalog. sqrt(25)',
+        ],
+    )
+    def test_spacing_variants_never_translate(self, query):
+        # Whitespace or comments around the dot are not a namespace in openCypher;
+        # whatever the parser makes of them, the statement must not translate.
+        for mode in (SAFE, RAW):
+            with pytest.raises(age.AgeTranslationError):
+                age.translate(query, mode=mode, graph_name='g')
+
+    def test_unqualified_functions_still_translate(self):
+        plan = age.translate(
+            'MATCH (n) WHERE id(n) = toInteger($id) RETURN toUpper(n.name), size(keys(n)), labels(n)',
+            params={'id': '1'},
+            mode=SAFE,
+            graph_name='g',
+        )
+        assert plan.read_only is True
+
+    def test_property_lookups_are_not_calls(self):
+        plan = age.translate('MATCH (n) RETURN n.myschema, n.fn, n.a.b', mode=SAFE, graph_name='g')
+        assert plan.columns == ['n.myschema', 'n.fn', 'n.a.b']
+
+    def test_raw_allowlist_admits_exact_name_only(self):
+        config = age.FirewallConfig(allowed_qualified_functions=frozenset({'myschema.fn'}))
+        plan = age.translate('RETURN myschema.fn(1)', mode=RAW, graph_name='g', firewall=config)
+        assert plan.read_only is False
+        assert age.translate('RETURN `myschema`.`fn`(1)', mode=RAW, graph_name='g', firewall=config)
+        for other in (
+            'RETURN myschema.other(1)',
+            'RETURN MYSCHEMA.FN(1)',
+            'RETURN `myschema.fn`(1)',
+            'RETURN x.myschema.fn(1)',
+        ):
+            with pytest.raises(age.AgeFirewallRejected, match='qualified_function'):
+                age.translate(other, mode=RAW, graph_name='g', firewall=config)
+
+    def test_allowlist_never_opens_the_safe_path(self):
+        config = age.FirewallConfig(allowed_qualified_functions=frozenset({'myschema.fn'}))
+        with pytest.raises(age.AgeFirewallRejected, match='qualified_function'):
+            age.translate('RETURN myschema.fn(1)', mode=SAFE, graph_name='g', firewall=config)
+
+    def test_raw_procedure_calls_need_the_allowlist(self):
+        for query in ('CALL myschema.proc()', 'CALL proc()', 'MATCH (n) CALL myschema.proc(n) YIELD x RETURN x'):
+            with pytest.raises(age.AgeFirewallRejected, match='qualified_function|procedure_call'):
+                age.translate(query, mode=RAW, graph_name='g')
+        config = age.FirewallConfig(allowed_qualified_functions=frozenset({'myschema.proc'}))
+        assert age.translate('CALL myschema.proc()', mode=RAW, graph_name='g', firewall=config)
+
+    def test_facts_record_qualified_names_as_segments(self):
+        facts = age.analyze('RETURN `my``schema`.fn(1), toUpper("x"), a.b.c(2)')
+        assert facts.qualified_functions == [('my`schema', 'fn'), ('a', 'b', 'c')]
+
+
 # ---------------------------------------------------------------------------
 # capabilities
 # ---------------------------------------------------------------------------
@@ -295,6 +394,26 @@ class TestEmit:
                 params={'x': 1},
                 graph_name='g',
             )
+
+    def test_dollar_tag_never_closes_early_when_body_ends_like_the_tag(self):
+        # A query ending in `$rr_cypher` plus the closing `$rr_cypher$` would
+        # contain the tag one character early and end the string there.
+        plan = age.translate('MATCH (n) RETURN n.name = $rr_cypher', params={'rr_cypher': 'x'}, graph_name='g')
+        prepare = plan.statements[plan.result_index - 1]
+        body_start = prepare.index("'g', ") + len("'g', ")
+        tag = prepare[body_start : prepare.index('$', body_start + 1) + 1]
+        quoted = prepare[body_start:]
+        assert tag != '$rr_cypher$'
+        # The closing tag's first occurrence after the opening one ends exactly the body.
+        assert quoted.index(tag, len(tag)) == len(tag) + len('MATCH (n) RETURN n.name = $rr_cypher')
+
+    def test_prepared_name_recorded_for_param_plans(self):
+        plan = age.translate('MATCH (n) WHERE n.a = $x RETURN n', params={'x': 1}, graph_name='g')
+        assert plan.prepared_name and plan.statements[plan.result_index - 1].startswith(
+            f'PREPARE {plan.prepared_name}('
+        )
+        assert plan.statements[-1] == f'DEALLOCATE {plan.prepared_name}'
+        assert age.translate('MATCH (n) RETURN n', graph_name='g').prepared_name is None
 
     def test_dollar_tag_rotates_on_collision(self):
         plan = age.translate("MATCH (n) WHERE n.note = '$rr_cypher$x' RETURN n.note", graph_name='g')

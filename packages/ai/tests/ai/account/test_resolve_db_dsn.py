@@ -24,7 +24,7 @@
 """Tests for ``AccountBase.resolve_db_dsn`` — the env-gated DB broker call.
 
 The broker contract (locked 2026-07-23, shipped as saas #381):
-``POST {ROCKETRIDE_DB_BROKER_URL} {"tenant_id": ...}`` with a Bearer token ->
+``POST {RR_DB_BROKER_URL} {"tenant_id": ...}`` with a Bearer token ->
 ``{"database", "role", "dsn", "created"}`` (only ``dsn`` is read), idempotent.
 A real localhost HTTP server plays the broker so the actual urllib code path
 is exercised.
@@ -99,8 +99,8 @@ def broker(monkeypatch):
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     url = f'http://127.0.0.1:{server.server_port}/provision'
-    monkeypatch.setenv('ROCKETRIDE_DB_BROKER_URL', url)
-    monkeypatch.setenv('ROCKETRIDE_DB_BROKER_TOKEN', TEST_TOKEN)
+    monkeypatch.setenv('RR_DB_BROKER_URL', url)
+    monkeypatch.setenv('RR_DB_BROKER_TOKEN', TEST_TOKEN)
     yield _FakeBroker
     server.shutdown()
     server.server_close()
@@ -111,14 +111,14 @@ def _resolve(client_id: str) -> str:
 
 
 def test_unconfigured_env_raises_signin_error(monkeypatch):
-    monkeypatch.delenv('ROCKETRIDE_DB_BROKER_URL', raising=False)
-    monkeypatch.delenv('ROCKETRIDE_DB_BROKER_TOKEN', raising=False)
+    monkeypatch.delenv('RR_DB_BROKER_URL', raising=False)
+    monkeypatch.delenv('RR_DB_BROKER_TOKEN', raising=False)
     with pytest.raises(NotImplementedError, match='require signing into RocketRide cloud'):
         _resolve('tenant-1')
 
 
 def test_partial_env_still_raises(monkeypatch, broker):
-    monkeypatch.delenv('ROCKETRIDE_DB_BROKER_TOKEN', raising=False)
+    monkeypatch.delenv('RR_DB_BROKER_TOKEN', raising=False)
     with pytest.raises(NotImplementedError):
         _resolve('tenant-1')
 
@@ -143,7 +143,7 @@ def test_broker_4xx_raises_runtime_error(broker):
 
 
 def test_bad_token_raises_runtime_error(broker, monkeypatch):
-    monkeypatch.setenv('ROCKETRIDE_DB_BROKER_TOKEN', 'wrong')
+    monkeypatch.setenv('RR_DB_BROKER_TOKEN', 'wrong')
     with pytest.raises(RuntimeError, match='rejected provision.*401'):
         _resolve('tenant-1')
 
@@ -175,8 +175,8 @@ def test_missing_dsn_in_response_raises(broker):
 
 
 def test_unreachable_broker_raises(monkeypatch):
-    monkeypatch.setenv('ROCKETRIDE_DB_BROKER_URL', 'http://127.0.0.1:9/provision')
-    monkeypatch.setenv('ROCKETRIDE_DB_BROKER_TOKEN', TEST_TOKEN)
+    monkeypatch.setenv('RR_DB_BROKER_URL', 'http://127.0.0.1:9/provision')
+    monkeypatch.setenv('RR_DB_BROKER_TOKEN', TEST_TOKEN)
     with pytest.raises(RuntimeError, match='unreachable'):
         _resolve('tenant-1')
 
@@ -195,8 +195,8 @@ def test_http_broker_url_rejected_for_non_localhost(monkeypatch):
     """The broker token can resolve any tenant's DSN — never send it over
     plain http to a remote host (a deployment typo must fail loudly).
     """
-    monkeypatch.setenv('ROCKETRIDE_DB_BROKER_URL', 'http://broker.internal/provision')
-    monkeypatch.setenv('ROCKETRIDE_DB_BROKER_TOKEN', TEST_TOKEN)
+    monkeypatch.setenv('RR_DB_BROKER_URL', 'http://broker.internal/provision')
+    monkeypatch.setenv('RR_DB_BROKER_TOKEN', TEST_TOKEN)
     with pytest.raises(RuntimeError, match='must use https'):
         _resolve('tenant-1')
 
@@ -227,3 +227,107 @@ def test_dsn_with_existing_sslmode_passes_through_unchanged(broker):
 def test_non_postgres_dsn_rejected(broker):
     with pytest.raises(RuntimeError, match='non-PostgreSQL DSN'):
         _resolve('bad-scheme-tenant')
+
+
+# ---------------------------------------------------------------------------
+# Legacy names: the broker settings left the substitutable ROCKETRIDE_*
+# namespace. Any value under an old name is a hard error, never a fallback.
+# ---------------------------------------------------------------------------
+
+LEGACY_SENTINEL = 'sentinel-legacy-broker-token'
+
+
+@pytest.fixture()
+def no_broker_env(monkeypatch):
+    for name in ('RR_DB_BROKER_URL', 'RR_DB_BROKER_TOKEN', 'ROCKETRIDE_DB_BROKER_URL', 'ROCKETRIDE_DB_BROKER_TOKEN'):
+        monkeypatch.delenv(name, raising=False)
+
+
+def test_check_passes_with_neither_set(no_broker_env):
+    from ai.account.base import check_db_broker_environment
+
+    check_db_broker_environment()
+
+
+def test_check_passes_with_only_the_new_names(no_broker_env, monkeypatch):
+    from ai.account.base import check_db_broker_environment
+
+    monkeypatch.setenv('RR_DB_BROKER_URL', 'https://broker.example/provision')
+    monkeypatch.setenv('RR_DB_BROKER_TOKEN', TEST_TOKEN)
+    check_db_broker_environment()
+
+
+@pytest.mark.parametrize('legacy', ['ROCKETRIDE_DB_BROKER_URL', 'ROCKETRIDE_DB_BROKER_TOKEN'])
+def test_check_refuses_a_legacy_name_alone(no_broker_env, monkeypatch, legacy):
+    from ai.account.base import check_db_broker_environment
+
+    monkeypatch.setenv(legacy, LEGACY_SENTINEL)
+    with pytest.raises(EnvironmentError, match=f'{legacy} -> RR_DB_BROKER_'):
+        check_db_broker_environment()
+
+
+@pytest.mark.parametrize('legacy_value', [TEST_TOKEN, 'a-different-token'], ids=['same-value', 'conflicting-value'])
+def test_check_refuses_legacy_even_beside_the_new_name(no_broker_env, monkeypatch, legacy_value):
+    """With both set, the old name still exposes the token to placeholders."""
+    from ai.account.base import check_db_broker_environment
+
+    monkeypatch.setenv('RR_DB_BROKER_URL', 'https://broker.example/provision')
+    monkeypatch.setenv('RR_DB_BROKER_TOKEN', TEST_TOKEN)
+    monkeypatch.setenv('ROCKETRIDE_DB_BROKER_TOKEN', legacy_value)
+    with pytest.raises(EnvironmentError, match='renamed'):
+        check_db_broker_environment()
+
+
+def test_check_ignores_an_empty_legacy_name(no_broker_env, monkeypatch):
+    from ai.account.base import check_db_broker_environment
+
+    monkeypatch.setenv('ROCKETRIDE_DB_BROKER_TOKEN', '  ')
+    check_db_broker_environment()
+
+
+def test_error_never_echoes_the_legacy_value(no_broker_env, monkeypatch):
+    from ai.account.base import check_db_broker_environment
+
+    monkeypatch.setenv('ROCKETRIDE_DB_BROKER_TOKEN', LEGACY_SENTINEL)
+    with pytest.raises(EnvironmentError) as caught:
+        check_db_broker_environment()
+    assert LEGACY_SENTINEL not in str(caught.value)
+
+
+def test_resolve_refuses_legacy_names_without_calling_the_broker(no_broker_env, monkeypatch, broker):
+    """resolve_db_dsn re-checks, so a legacy name cannot be used even past startup."""
+    monkeypatch.setenv('ROCKETRIDE_DB_BROKER_URL', 'http://127.0.0.1:9/provision')
+    with pytest.raises(EnvironmentError):
+        _resolve('tenant-1')
+    assert broker.requests == []
+
+
+def test_legacy_names_alone_do_not_configure_the_broker(no_broker_env, monkeypatch):
+    """No fallback: the old names never become the broker configuration."""
+    from ai.account.base import check_db_broker_environment
+
+    monkeypatch.setenv('ROCKETRIDE_DB_BROKER_URL', 'http://127.0.0.1:9/provision')
+    monkeypatch.setenv('ROCKETRIDE_DB_BROKER_TOKEN', LEGACY_SENTINEL)
+    with pytest.raises(EnvironmentError):
+        check_db_broker_environment()
+    with pytest.raises(EnvironmentError):
+        _resolve('tenant-1')
+
+
+def test_account_package_refuses_to_load_with_a_legacy_name(tmp_path):
+    """The server fails at startup: importing ai.account runs the check."""
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    src = Path(__file__).resolve().parents[3] / 'src'
+    code = f'import sys\nsys.path.insert(0, {str(src)!r})\nimport ai.account\n'
+    env = {k: v for k, v in os.environ.items() if not k.startswith(('RR_DB_BROKER_', 'ROCKETRIDE_DB_BROKER_'))}
+    env['ROCKETRIDE_DB_BROKER_TOKEN'] = LEGACY_SENTINEL
+    proc = subprocess.run(
+        [sys.executable, '-c', code], env=env, capture_output=True, text=True, timeout=120, cwd=tmp_path
+    )
+    assert proc.returncode != 0
+    assert 'ROCKETRIDE_DB_BROKER_TOKEN -> RR_DB_BROKER_TOKEN' in proc.stderr
+    assert LEGACY_SENTINEL not in proc.stderr + proc.stdout

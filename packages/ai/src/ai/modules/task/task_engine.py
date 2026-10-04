@@ -713,8 +713,9 @@ class Task(DAPBase):
         RR_SIGNING_KEY and AWS_*: the child opens the object store and mints
         fetch URLs itself, so pipeline code can read those values.
 
-        Credential hygiene for the RocketRide cloud DB path (these live in the
-        ROCKETRIDE_* namespace, so the allowlist alone does not cover them):
+        Credential hygiene for the RocketRide cloud DB path (the DSN names live
+        in the ROCKETRIDE_* namespace, so the allowlist alone does not cover
+        them):
 
         - The broker credential can resolve ANY tenant's DSN — it must never
           reach node subprocesses, which run user pipeline code.
@@ -729,8 +730,16 @@ class Task(DAPBase):
         """
         subprocess_env = filter_subprocess_env(os.environ)
 
-        subprocess_env.pop('ROCKETRIDE_DB_BROKER_URL', None)
-        subprocess_env.pop('ROCKETRIDE_DB_BROKER_TOKEN', None)
+        # The broker settings are RR_* names the allowlist never passes; drop
+        # them explicitly anyway, and the legacy ROCKETRIDE_* names with them,
+        # so no change to the allowlist can hand a child the broker token.
+        for name in (
+            'RR_DB_BROKER_URL',
+            'RR_DB_BROKER_TOKEN',
+            'ROCKETRIDE_DB_BROKER_URL',
+            'ROCKETRIDE_DB_BROKER_TOKEN',
+        ):
+            subprocess_env.pop(name, None)
         subprocess_env.pop('ROCKETRIDE_DB_DSN', None)
         subprocess_env.pop('ROCKETRIDE_DB_RESOLVE_ERROR', None)
 

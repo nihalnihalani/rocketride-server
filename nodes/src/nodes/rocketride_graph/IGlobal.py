@@ -38,13 +38,18 @@ query runs inside one transaction whose settings are ``SET LOCAL`` only (the
 translated plan carries them). The safe path additionally makes its
 transaction ``READ ONLY`` — server-side write protection, with the base's
 ``is_cypher_safe`` regex and the layer's semantic firewall as defence-in-depth.
+Each call owns its connection for that transaction (a bounded pool hands
+connections out exclusively), so parallel tool calls never share one; nothing
+is left on the session afterwards (no session SETs, prepared statements are
+deallocated even when the query fails).
 """
 
 import re
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import psycopg2
 from psycopg2 import sql
+from psycopg2.extensions import TRANSACTION_STATUS_IDLE
 
 from rocketlib import warning
 from ai.common.graph import GraphGlobalBase
@@ -57,11 +62,24 @@ from ai.common.graph.age import (
     decode_row,
     translate,
 )
+from ai.common.graph.connection_pool import ConnectionPool
 from ai.common.rocketride_db import resolve_rocketride_dsn
 
 DEFAULT_GRAPH_NAME = 'rocketride'
 DEFAULT_MAX_ROWS = 1000
 DEFAULT_QUERY_TIMEOUT_MS = 30000
+
+# Connections held open per node. Tool calls run on up to 64 worker threads
+# per task; past this many concurrent calls, callers queue for a free
+# connection (bounded by the statement timeout plus a grace period) instead of
+# opening an unbounded number of sessions against the tenant database.
+DEFAULT_POOL_SIZE = 8
+POOL_ACQUIRE_GRACE_S = 5.0
+CONNECT_TIMEOUT_S = 3
+
+# Savepoint that brackets a prepared EXECUTE, so a failed EXECUTE can be
+# rolled back to a point where DEALLOCATE still runs in the same transaction.
+_EXEC_SAVEPOINT = 'rr_exec'
 
 # Reflection fan-out bounds (mirrors graph_falkordb's sampling posture).
 SCHEMA_LABEL_LIMIT = 200
@@ -72,10 +90,51 @@ SCHEMA_REL_LIMIT = 100
 VALID_LABEL = re.compile(r'^[A-Za-z_][A-Za-z0-9_]{0,62}$')
 
 
-class IGlobal(GraphGlobalBase):
-    """Postgres + Apache AGE global for the RocketRide cloud graph node."""
+class _ConnectionLost(Exception):
+    """The session died mid-call. ``before_main`` = nothing user-visible ran yet."""
 
-    client = None
+    def __init__(self, original: BaseException, *, before_main: bool) -> None:
+        super().__init__(str(original))
+        self.original = original
+        self.before_main = before_main
+
+
+def _open_connection(dsn: str):
+    # Bounded connect so an unreachable pooler fails fast (matches the
+    # probe's 3s timeout) instead of waiting out the OS TCP timeout.
+    conn = psycopg2.connect(dsn, connect_timeout=CONNECT_TIMEOUT_S)
+    # READ ONLY and SET LOCAL statement_timeout only apply inside a
+    # transaction; psycopg2 opens one implicitly on the first execute only
+    # while autocommit is off. Make the precondition explicit.
+    conn.autocommit = False
+    return conn
+
+
+def _reset_connection(conn) -> None:
+    """Return a connection to idle-with-no-transaction, or raise."""
+    conn.rollback()
+    if conn.get_transaction_status() != TRANSACTION_STATUS_IDLE:
+        raise RuntimeError('connection did not return to idle after rollback')
+
+
+def _connection_usable(conn) -> bool:
+    return conn.closed == 0 and not conn.autocommit
+
+
+def _close_connection(conn) -> None:
+    conn.close()
+
+
+class IGlobal(GraphGlobalBase):
+    """Postgres + Apache AGE global for the RocketRide cloud graph node.
+
+    Every database call checks a connection out of :attr:`pool` exclusively and
+    runs in its own transaction, so concurrent tool calls never share a
+    transaction (and so never share, or lose, each other's READ ONLY and
+    statement-timeout settings).
+    """
+
+    pool: Optional[ConnectionPool] = None
     graph_name: str = DEFAULT_GRAPH_NAME
     max_rows: int = DEFAULT_MAX_ROWS
     query_timeout_ms: int = DEFAULT_QUERY_TIMEOUT_MS
@@ -86,29 +145,40 @@ class IGlobal(GraphGlobalBase):
     # ------------------------------------------------------------------
 
     def _open_driver(self, config: Dict[str, Any]) -> None:
-        """Resolve the tenant DSN, connect, and fail fast on a missing graph."""
+        """Resolve the tenant DSN, open the pool, and fail fast on a missing graph."""
         self.graph_name = str(config.get('graph') or DEFAULT_GRAPH_NAME).strip()
         self.max_rows = self._config_int(config, 'max_rows', DEFAULT_MAX_ROWS)
         self.query_timeout_ms = self._config_int(config, 'query_timeout_ms', DEFAULT_QUERY_TIMEOUT_MS)
 
         # The one RocketRide difference: DSN from the account seam, no config.
         dsn = resolve_rocketride_dsn()
-        # Bounded connect so an unreachable pooler fails fast (matches the
-        # probe's 3s timeout) instead of waiting out the OS TCP timeout.
-        self.client = psycopg2.connect(dsn, connect_timeout=3)
+        pool = ConnectionPool(
+            lambda: _open_connection(dsn),
+            max_size=DEFAULT_POOL_SIZE,
+            acquire_timeout_s=self.query_timeout_ms / 1000.0 + POOL_ACQUIRE_GRACE_S,
+            reset=_reset_connection,
+            is_usable=_connection_usable,
+            close=_close_connection,
+        )
 
-        # Fail-fast round-trip: AGE present + the tenant graph exists.
-        with self.client.cursor() as cur:
-            cur.execute("SELECT extversion FROM pg_extension WHERE extname = 'age'")
-            row = cur.fetchone()
-            if row is None:
+        try:
+            # Fail-fast round-trip: AGE present + the tenant graph exists.
+            rows = self._sql_read(
+                "SELECT extversion FROM pg_extension WHERE extname = 'age'",
+                pool=pool,
+            )
+            if not rows:
                 raise RuntimeError('The tenant database does not have the Apache AGE extension installed')
-            self.age_version = row[0]
-            cur.execute('SELECT 1 FROM ag_catalog.ag_graph WHERE name = %s', (self.graph_name,))
-            graph_exists = cur.fetchone() is not None
-        self.client.commit()
+            self.age_version = rows[0][0]
+            graph_exists = bool(
+                self._sql_read('SELECT 1 FROM ag_catalog.ag_graph WHERE name = %s', (self.graph_name,), pool=pool)
+            )
+        except BaseException:
+            pool.close()
+            raise
 
         if not graph_exists:
+            pool.close()
             # OPEN QUESTION (create_graph ownership, see the node README and
             # the design's open-questions): whether the node or the cloud
             # provisioner creates the per-tenant graph is undecided. Until it
@@ -119,18 +189,19 @@ class IGlobal(GraphGlobalBase):
                 'Graph provisioning ownership is pending; create the graph '
                 f"(SELECT create_graph('{self.graph_name}')) or configure an existing one."
             )
+        self.pool = pool
 
     def _close_driver(self) -> None:
-        if self.client is not None:
-            self.client.close()
-            self.client = None
+        pool, self.pool = self.pool, None
+        if pool is not None:
+            pool.close()
 
     def _probe_connection(self, config: Dict[str, Any]) -> None:
         """Save-time probe: warn-only (the user is still editing the node)."""
         conn = None
         try:
             dsn = resolve_rocketride_dsn()
-            conn = psycopg2.connect(dsn, connect_timeout=3)
+            conn = psycopg2.connect(dsn, connect_timeout=CONNECT_TIMEOUT_S)
             with conn.cursor() as cur:
                 cur.execute('SELECT 1')
                 cur.execute("SELECT 1 FROM pg_extension WHERE extname = 'age'")
@@ -182,47 +253,145 @@ class IGlobal(GraphGlobalBase):
             firewall=self._firewall_config(),
         )
 
-    def _require_transactional_client(self) -> None:
-        """Shared precondition for every transaction-opening path.
-
-        Both server-side controls (``SET TRANSACTION READ ONLY`` and the
-        plan's ``SET LOCAL statement_timeout``) are silent no-ops outside a
-        transaction. They hold because psycopg2 opens one implicitly on the
-        first execute — which requires autocommit off. Assert the
-        precondition so a future change fails loudly instead of quietly
-        dropping the write protection and the timeout cap.
-        """
-        if self.client is None:
+    def _require_pool(self) -> ConnectionPool:
+        if self.pool is None:
             raise RuntimeError('Database connection is not initialized')
-        if self.client.autocommit:
+        return self.pool
+
+    def _execute_plan(
+        self,
+        plan: TranslatedQuery,
+        fetch_cap: Optional[int] = None,
+        *,
+        explain: bool = False,
+    ) -> List[Tuple]:
+        """Run one translated plan in its own transaction on its own connection.
+
+        A connection that turns out to be dead before the plan's main
+        statement was sent (e.g. dropped while idle in the pool) is discarded
+        and the plan is retried once on a fresh connection: nothing ran, so the
+        retry is safe even for a write. A failure at or after the main
+        statement is never retried — whether it ran is unknown.
+        """
+        pool = self._require_pool()
+        for attempt in (1, 2):
+            with pool.connection() as conn:
+                try:
+                    return self._run_plan(conn, plan, fetch_cap, explain=explain)
+                except _ConnectionLost as lost:
+                    pool.discard(conn)
+                    if lost.before_main and attempt == 1:
+                        continue
+                    raise lost.original from None
+        raise AssertionError('unreachable')  # pragma: no cover
+
+    def _run_plan(self, conn, plan: TranslatedQuery, fetch_cap: Optional[int], *, explain: bool) -> List[Tuple]:
+        """Execute ``plan`` on an exclusively owned connection; commit or roll back.
+
+        Transaction shape (psycopg2 opens it on the first execute)::
+
+            SET TRANSACTION READ ONLY            -- safe path; must come first
+            SET LOCAL search_path / statement_timeout
+            [PREPARE p ...; SAVEPOINT rr_exec]   -- params path
+            <main statement>                     -- or EXPLAIN <main statement>
+            [RELEASE SAVEPOINT rr_exec; DEALLOCATE p]
+            COMMIT                               -- ROLLBACK when explaining
+
+        PostgreSQL keeps a prepared statement after ROLLBACK, so if the main
+        statement fails after PREPARE the transaction is rolled back to the
+        savepoint and the statement is deallocated before the final ROLLBACK —
+        all inside one transaction, which stays on one server session even
+        behind a transaction-mode pooler.
+        """
+        if conn.autocommit:
             raise RuntimeError(
                 'rocketride_graph requires autocommit=False: READ ONLY and SET LOCAL '
                 'statement_timeout only apply inside a transaction'
             )
-
-    def _execute_plan(self, plan: TranslatedQuery, fetch_cap: Optional[int] = None) -> List[Tuple]:
-        """Run one translated plan in its own transaction; return raw rows.
-
-        The plan's READ ONLY flag is applied with ``SET TRANSACTION READ
-        ONLY`` as the first in-transaction statement (psycopg2 has already
-        opened the transaction), giving server-side write protection on the
-        safe path.
-        """
-        self._require_transactional_client()
+        prepare_index = plan.result_index - 1 if plan.prepared_name else None
         rows: List[Tuple] = []
+        main_sent = False
+        prepared = False
+        savepoint = False
         try:
-            with self.client.cursor() as cur:
+            with conn.cursor() as cur:
                 if plan.read_only:
                     cur.execute('SET TRANSACTION READ ONLY')
                 for i, (stmt, binds) in enumerate(zip(plan.statements, plan.binds)):
+                    if i == plan.result_index:
+                        if prepared:
+                            cur.execute(f'SAVEPOINT {_EXEC_SAVEPOINT}')
+                            savepoint = True
+                        main_sent = True
+                        cur.execute(('EXPLAIN ' + stmt) if explain else stmt, binds or None)
+                        if not explain and cur.description is not None:
+                            rows = cur.fetchmany(fetch_cap) if fetch_cap else cur.fetchall()
+                        if savepoint:
+                            cur.execute(f'RELEASE SAVEPOINT {_EXEC_SAVEPOINT}')
+                            savepoint = False
+                        continue
                     cur.execute(stmt, binds or None)
-                    if i == plan.result_index and cur.description is not None:
-                        rows = cur.fetchmany(fetch_cap) if fetch_cap else cur.fetchall()
-            self.client.commit()
-        except Exception:
-            self.client.rollback()
+                    if i == prepare_index:
+                        prepared = True
+                    elif prepared and i > plan.result_index:
+                        # The plan's own DEALLOCATE ran.
+                        prepared = False
+            if explain or plan.read_only:
+                # Nothing to keep; ending a read with ROLLBACK is equivalent and
+                # also covers EXPLAIN, which must never commit anything.
+                conn.rollback()
+            else:
+                conn.commit()
+            return rows
+        except Exception as exc:
+            if conn.closed:
+                raise _ConnectionLost(exc, before_main=not main_sent) from exc
+            self._abort_transaction(conn, plan, prepared=prepared, savepoint=savepoint)
             raise
-        return rows
+
+    def _abort_transaction(self, conn, plan: TranslatedQuery, *, prepared: bool, savepoint: bool) -> None:
+        """Roll back after a failure, deallocating a leftover prepared statement first."""
+        if prepared and plan.prepared_name:
+            try:
+                with conn.cursor() as cur:
+                    if savepoint:
+                        cur.execute(f'ROLLBACK TO SAVEPOINT {_EXEC_SAVEPOINT}')
+                        cur.execute(f'DEALLOCATE {plan.prepared_name}')
+                    else:
+                        # Failed between PREPARE and the savepoint, or after the
+                        # savepoint was released: the transaction is aborted and
+                        # cannot DEALLOCATE. Closing the session is the only
+                        # sure cleanup, so let the pool drop this connection.
+                        raise RuntimeError('cannot deallocate inside an aborted transaction')
+            except Exception:
+                self._require_pool().discard(conn)
+        try:
+            conn.rollback()
+        except Exception:
+            self._require_pool().discard(conn)
+
+    def _sql_read(
+        self,
+        statement: str,
+        params: Sequence[Any] = (),
+        *,
+        pool: Optional[ConnectionPool] = None,
+    ) -> List[Tuple]:
+        """Run one plain SQL read in its own READ ONLY, time-bounded transaction."""
+        pool = pool or self._require_pool()
+        with pool.connection() as conn:
+            try:
+                with conn.cursor() as cur:
+                    cur.execute('SET TRANSACTION READ ONLY')
+                    cur.execute(f"SET LOCAL statement_timeout = '{max(1, int(self.query_timeout_ms))}ms'")
+                    cur.execute(statement, tuple(params) or None)
+                    rows = cur.fetchall() if cur.description is not None else []
+                conn.rollback()
+                return rows
+            except Exception:
+                if conn.closed:
+                    pool.discard(conn)
+                raise
 
     def _run_query(self, query: str, params: Optional[Dict] = None, limit: Optional[int] = None) -> List[Dict]:
         """Read-only path: translate (safe mode) and run in a READ ONLY txn."""
@@ -255,25 +424,10 @@ class IGlobal(GraphGlobalBase):
             plan = self._translate(query, mode=TranslateMode.SAFE)
         except AgeTranslationError as e:
             return False, str(e)
-        # Same precondition as _execute_plan (this method opens an identical
-        # READ ONLY + SET LOCAL transaction), folded into this method's
-        # return-a-message contract.
         try:
-            self._require_transactional_client()
-        except RuntimeError as e:
-            return False, str(e)
-        try:
-            with self.client.cursor() as cur:
-                cur.execute('SET TRANSACTION READ ONLY')
-                for i, (stmt, binds) in enumerate(zip(plan.statements, plan.binds)):
-                    if i == plan.result_index:
-                        cur.execute('EXPLAIN ' + stmt, binds or None)
-                        break
-                    cur.execute(stmt, binds or None)
-            self.client.rollback()
+            self._execute_plan(plan, explain=True)
             return True, ''
         except Exception as e:
-            self.client.rollback()
             return False, str(e)
 
     # ------------------------------------------------------------------
@@ -287,21 +441,17 @@ class IGlobal(GraphGlobalBase):
         (or empty) schema rather than blocking startup.
         """
         schema: Dict[str, Any] = {'nodes': {}, 'relationships': []}
-        if self.client is None:
+        if self.pool is None:
             return schema
 
         try:
-            with self.client.cursor() as cur:
-                cur.execute(
-                    'SELECT l.name, l.kind FROM ag_catalog.ag_label l '
-                    'JOIN ag_catalog.ag_graph g ON l.graph = g.graphid '
-                    "WHERE g.name = %s AND l.name NOT LIKE '\\_ag\\_%%'",
-                    (self.graph_name,),
-                )
-                labels = cur.fetchall()
-            self.client.commit()
+            labels = self._sql_read(
+                'SELECT l.name, l.kind FROM ag_catalog.ag_label l '
+                'JOIN ag_catalog.ag_graph g ON l.graph = g.graphid '
+                "WHERE g.name = %s AND l.name NOT LIKE '\\_ag\\_%%'",
+                (self.graph_name,),
+            )
         except Exception as e:
-            self.client.rollback()
             warning(f'rocketride_graph: unable to list graph labels: {e}')
             return schema
 
@@ -320,17 +470,15 @@ class IGlobal(GraphGlobalBase):
     def _sample_properties(self, label: str) -> List[Tuple[str, str]]:
         """One-row property sample from the label's backing table."""
         try:
-            with self.client.cursor() as cur:
-                cur.execute(sql.SQL('SELECT properties FROM {} LIMIT 1').format(sql.Identifier(self.graph_name, label)))
-                row = cur.fetchone()
-            self.client.commit()
+            rows = self._sql_read(
+                sql.SQL('SELECT properties FROM {} LIMIT 1').format(sql.Identifier(self.graph_name, label))
+            )
         except Exception as e:
-            self.client.rollback()
             warning(f'rocketride_graph: unable to sample label {label!r}: {e}')
             return []
-        if row is None:
+        if not rows:
             return []
-        properties = decode_agtype(row[0]) or {}
+        properties = decode_agtype(rows[0][0]) or {}
         return [(key, type(value).__name__) for key, value in properties.items()]
 
     def _sample_edge_endpoints(self, etype: str) -> Tuple[str, str]:

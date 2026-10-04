@@ -326,10 +326,23 @@ class MiscCommands(DAPConn):
                 - dropped (List[str]): Top-level config keys the resolver discarded.
 
         Raises:
+            PermissionError: If the caller has no development team, or lacks
+                ``task.control`` on it.
             ValueError: If provider is missing or config is not an object.
             Exception: If the service is unknown or has no preconfig section.
         """
         try:
+            # The answer is the config a node would receive when this caller
+            # runs it, so asking takes what running takes: task.control on the
+            # caller's dev team (execute's rule), checked before anything is
+            # resolved.
+            team_id = getattr(self._account_info, 'devTeam', '') if self._account_info else ''
+            if not team_id:
+                raise PermissionError(
+                    'No development team is set — pick one in your profile before resolving a node configuration'
+                )
+            self.verify_team_permission(team_id, 'task.control')
+
             args = request.get('arguments', {})
             provider = args.get('provider')
             if not provider:
