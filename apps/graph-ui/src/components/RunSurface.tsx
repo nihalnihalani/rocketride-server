@@ -138,7 +138,12 @@ export const RunSurface: React.FC<IRunSurfaceProps> = ({ endpoint, mode, loadReq
 	const announce = useCallback((text: string) => announcer.announce(text), []);
 
 	// ── The session on this endpoint (the token never leaves the store) ──────
-	const session = useMemo(() => (client ? graphStoreSession(client, endpoint) : null), [client, endpoint]);
+	// Keyed on the endpoint's KEY, not its object: background discovery hands back a new object for the same
+	// connection, and a new session here would rebuild the graph session below and drop what the user is looking at.
+	const endpointRef = useRef(endpoint);
+	endpointRef.current = endpoint;
+	// eslint-disable-next-line react-hooks/exhaustive-deps
+	const session = useMemo(() => (client ? graphStoreSession(client, endpointRef.current) : null), [client, endpoint.key]);
 	// Recipes (expand, connect, inspect) get their own ticket, so they never expire a statement in flight.
 	const recipeGeneration = useRef(createGeneration());
 	useEffect(() => {
@@ -242,24 +247,34 @@ export const RunSurface: React.FC<IRunSurfaceProps> = ({ endpoint, mode, loadReq
 		setTab(chooseTab(summary));
 	}, [result, summary]);
 
-	// The graph session is one per surface; a new result replaces what it draws.
+	// The graph session lives as long as the connection: a new result replaces what it draws (load), but nothing that
+	// merely re-probes the node, refreshes discovery or re-renders this component may rebuild it, because that would
+	// silently drop the selection, the inspector, every expansion and the stale marks. What changes over time is read
+	// through refs.
+	const latest = useRef({ dialect, writable, session, announce });
+	latest.current = { dialect, writable, session, announce };
+	// `endpoint.key` is the whole dependency on purpose: one graph session per connection.
 	const graphSession = useMemo<IGraphSession>(() => createGraphSession({
-		engine: () => (dialect ? { dialect: dialect.dialect, version: dialect.engineVersion } : null),
+		engine: () => (latest.current.dialect ? { dialect: latest.current.dialect.dialect, version: latest.current.dialect.engineVersion } : null),
 		invoke: (recipe) => {
-			if (!session) throw new ExplorerToolError({ kind: 'unavailable', tool: TOOL.readQuery, message: 'This connection is not available.' });
-			return session.invoke<ReadQueryResult>(TOOL.readQuery, { cypher: recipe.cypher, params: recipe.params, limit: recipe.limit }, { generation: recipeGeneration.current.next() });
+			const current = latest.current.session;
+			if (!current) throw new ExplorerToolError({ kind: 'unavailable', tool: TOOL.readQuery, message: 'This connection is not available.' });
+			return current.invoke<ReadQueryResult>(TOOL.readQuery, { cypher: recipe.cypher, params: recipe.params, limit: recipe.limit }, { generation: recipeGeneration.current.next() });
 		},
-		describe: (error) => describeFailureOf(error instanceof Error ? error.message : String(error), error, writable),
-		announce,
+		describe: (error) => describeFailureOf(error instanceof Error ? error.message : String(error), error, latest.current.writable),
+		announce: (text) => latest.current.announce(text),
 		captionChoice: (label) => captionsRef.current.get(label),
-	}), [session, dialect, writable, announce]);
+		// eslint-disable-next-line react-hooks/exhaustive-deps
+	}), [endpoint.key]);
+	// Dispose once, when the session is replaced or the surface goes away: NOT on every new result. `dispose` ends
+	// everything in flight; a result change only needs `load`.
+	useEffect(() => () => graphSession.dispose(), [graphSession]);
 	// The version of this connection's data when the graph was drawn: a later write marks the drawing out of date.
 	const version = useSyncExternalStore(dataVersions.subscribe, () => dataVersions.get(endpoint.key), () => dataVersions.get(endpoint.key));
 	const drawnAt = useRef(version);
 	useEffect(() => {
 		drawnAt.current = dataVersions.get(endpoint.key);
 		graphSession.load(result);
-		return () => graphSession.dispose();
 	}, [graphSession, result, endpoint.key]);
 	useEffect(() => {
 		if (version !== drawnAt.current) graphSession.markStale();
