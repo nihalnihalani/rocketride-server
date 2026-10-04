@@ -43,6 +43,7 @@ import type { CSSProperties } from 'react';
 import Editor, { loader } from '@monaco-editor/react';
 import type * as MonacoNS from 'monaco-editor';
 import type { IEditorSnapshot, ISelection } from '../cypher/targets';
+import { cypherTokenRules, readableOnEditor } from './editorTheme';
 
 // =============================================================================
 // TYPES
@@ -147,14 +148,18 @@ function cssVar(name: string, fallback: string): string {
  */
 function defineTheme(monaco: typeof MonacoNS): void {
 	const dark = cssVar('--rr-palette-mode', 'light').replace(/['"]/g, '') === 'dark';
+	const background = cssVar('--rr-bg-paper', dark ? '#252526' : '#ffffff');
+	// Line numbers are small text too: the shell's secondary colour is used as it is where it reads, and moved to 4.5:1 only where it falls short.
+	const lineNumber = readableOnEditor(cssVar('--rr-text-secondary', '#666666'), background);
 	monaco.editor.defineTheme(THEME_NAME, {
 		base: dark ? 'vs-dark' : 'vs',
 		inherit: true,
-		rules: [],
+		// Monaco's own token colours, except where one would not read on THIS background (see editorTheme.ts).
+		rules: cypherTokenRules(dark, background),
 		colors: {
-			'editor.background': cssVar('--rr-bg-paper', dark ? '#252526' : '#ffffff'),
+			'editor.background': background,
 			'editor.foreground': cssVar('--rr-text-primary', dark ? '#cccccc' : '#1a1a1a'),
-			'editorLineNumber.foreground': cssVar('--rr-text-secondary', '#666666'),
+			'editorLineNumber.foreground': lineNumber,
 			'editorLineNumber.activeForeground': cssVar('--rr-text-primary', '#1a1a1a'),
 		},
 	});
