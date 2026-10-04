@@ -122,6 +122,8 @@ against every shipped theme, is in [docs/contrast.md](docs/contrast.md).
 | Find path | Between two selected nodes, tried at increasing depth up to 10. A node that cannot answer says so; "no path found" names the depth it searched. |
 | Show more nodes | Adds nodes the first draw left out. |
 
+**Relationship labels.** The type of a relationship is drawn along it when the canvas is at normal size or larger, or (at 60% zoom and above) when no more than 200 relationships are drawn. In a crowded, zoomed-out graph the labels would be unreadable and are the most expensive thing to repaint, so they are not drawn; every relationship still shows its type as a tooltip and in its accessible name ("KNOWS from Ada to Charles"), the inspector shows it, the Table lists it, and zooming in brings the labels back. All relationships are drawn into one SVG behind the nodes, so panning and zooming cost the page nothing beyond moving it.
+
 **Ids are live handles, not identities.** Every action that asks the database about a
 drawn element (Expand, Refresh in the inspector, Connect, Find path) sends the element's
 id. A database may hand an id out again after a delete: FalkorDB does, and Apache AGE ids
@@ -233,6 +235,7 @@ editor and an **Execute** button, and it always says what it is:
   node says so with its own text and the app shows it.
 - FalkorDB and Neo4j refuse two columns with the same name; AGE keeps them, and
   the Table shows both.
+- Dragging nodes is smooth for graphs of a few hundred nodes and relationships on a laptop and slows as the graph grows toward the canvas maximum (1,000 nodes, 2,000 relationships); the first draw is capped at 300 nodes for that reason, and **Show more nodes** adds the rest. It has been measured at 300 nodes and 600 relationships, not beyond.
 - Only Chromium has been exercised. The build targets Chrome 81, Edge 83,
   Firefox 76 and Safari 13 and later, but behaviour in Firefox and Safari has not
   been checked, and the layout worker's cross-origin handling differs by browser.

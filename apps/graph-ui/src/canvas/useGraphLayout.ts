@@ -146,9 +146,16 @@ export function useGraphLayout(model: IGraphModel, seedKey: string, hint: IExpan
 		// The layout depends on WHICH nodes and relationships are drawn, not on their contents.
 	}, [model.nodes, model.relationships, seedKey, hint]);
 
+	// A drop must NOT publish a new positions map: that would rebuild every node and edge of the canvas
+	// (hundreds of elements, measured at about 100 ms for 300 nodes) to record one node's new place. The
+	// dragged node already shows where it was dropped; what matters is that the NEXT time the canvas builds
+	// its lists (a selection, a caption, a new layout) it reads that place. So the published map is updated
+	// in place, and only a real layout result replaces it.
+	const published = useRef(positions);
+	published.current = positions;
 	const pin = useCallback((id: GraphId, at: Point) => {
 		known.current.set(id, at);
-		setPositions(new Map(known.current));
+		(published.current as Map<GraphId, Point>).set(id, at);
 	}, []);
 
 	return useMemo(() => ({ positions, status, version, pin }), [positions, status, version, pin]);
