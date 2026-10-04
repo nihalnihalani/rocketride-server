@@ -90,18 +90,19 @@ test('the editor path that gives an imported template its own id still exists (a
 	assert.match(created, /crypto\.randomUUID\(\)/);
 });
 
-test('the Neo4j note recommends a read-only database role and says reads are a routing hint, not access control', () => {
-	const note = read('neo4j').components.find((c) => c.provider === 'annotation')!;
-	const text = String(note.config.content);
-	assert.match(text, /read-only database role/i);
+test('the Neo4j template names a placeholder reader, not the admin default, and its note recommends a read-only role without claiming a guarantee', () => {
+	const doc = read('neo4j');
+	const graph = doc.components.find((c) => c.provider === 'graph_neo4j')!;
+	assert.notEqual((graph.config.default as Record<string, unknown>).user, 'neo4j', 'the admin account is not the template default');
+	const text = String(doc.components.find((c) => c.provider === 'annotation')!.config.content);
+	assert.match(text, /use a read-only role/i);
+	assert.match(text, /a check in the node, not a database guarantee/i);
 	assert.match(text, /routing hint/i);
 	assert.match(text, /not access control/i);
+	assert.doesNotMatch(text, /Nothing here can write/, 'no unconditional claim that nothing can write');
 });
 
-test('every note says the template cannot write, and how to get Ask', () => {
-	for (const key of FILES) {
-		const text = String(read(key).components.find((c) => c.provider === 'annotation')!.config.content);
-		assert.match(text, /Nothing here can write/, key);
-		assert.match(text, /add an LLM node/i, key);
-	}
+test('the AGE and FalkorDB notes say the template cannot write, and every note says how to get Ask', () => {
+	for (const key of ['age', 'falkordb']) assert.match(String(read(key).components.find((c) => c.provider === 'annotation')!.config.content), /Nothing here can write/, key);
+	for (const key of FILES) assert.match(String(read(key).components.find((c) => c.provider === 'annotation')!.config.content), /add an LLM node/i, key);
 });

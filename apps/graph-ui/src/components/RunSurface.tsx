@@ -217,7 +217,7 @@ export const RunSurface: React.FC<IRunSurfaceProps> = ({ endpoint, mode, loadReq
 			// A write that ran (or may still run) makes every graph drawn from this connection out of date, in every document.
 			if (mayHaveChangedData(mode, run.outcome)) dataVersions.bump(endpoint.key);
 			const outcome = run.outcome === 'rows' || run.outcome === 'abandoned' ? run.outcome : 'error';
-			graphHistory.runs.emitRun(endpoint.key, toHistoryEntry({ cypher: run.cypher, at: Date.now() - (run.ms ?? 0), ms: run.ms ?? 0, outcome, ...(run.outcome === 'rows' ? { rows: run.result?.rows.length ?? 0 } : {}), ...(run.limitApplied != null ? { limit: run.limitApplied } : {}), ...(run.error !== undefined ? { error: run.error } : {}), kind: run.verb }, entryId()));
+			graphHistory.runs.emitRun(endpoint.key, toHistoryEntry({ cypher: run.cypher, at: Math.round(Date.now() - (run.ms ?? 0)), ms: Math.round(run.ms ?? 0), outcome, ...(run.outcome === 'rows' ? { rows: run.result?.rows.length ?? 0 } : {}), ...(run.limitApplied != null ? { limit: run.limitApplied } : {}), ...(run.error !== undefined ? { error: run.error } : {}), kind: run.verb }, entryId()));
 		},
 		summarize: ({ shown, runs }) => {
 			if (shown?.result) {

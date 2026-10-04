@@ -25,9 +25,11 @@ Cypher and are not listed.
   a VS Code workspace: the editor gives a new `.pipe` file its own `project_id` when
   it has none, so two people importing the same template never share an identity.
   Type the connection details into the node's form (they are stored encrypted).
-  Posting the raw file through an SDK `use()` also works, but the engine then does
-  not report a project id for the task, and two such runs of the same node cannot be
-  told apart in the Connections list.
+  Posting the raw file through an SDK `use()` also works, but the engine then
+  reports no project id for the task. Two raw copies started by the same user with
+  the same node id then share one connection identity and appear as ONE card in the
+  Connections list. Save each copy as its own `.pipe` file in a VS Code workspace (or
+  give each its own `project_id`) before running two of them.
 - **A node that is up to date.** The app reads through the node's `read_query`
   tool and reads its identity, limits and capabilities from `dialect`. A node
   that does not advertise `read_query` is shown as **Needs upgrade** and cannot
@@ -119,6 +121,20 @@ against every shipped theme, is in [docs/contrast.md](docs/contrast.md).
 | Connect nodes | Draws the relationships among the nodes already on the canvas. |
 | Find path | Between two selected nodes, tried at increasing depth up to 10. A node that cannot answer says so; "no path found" names the depth it searched. |
 | Show more nodes | Adds nodes the first draw left out. |
+
+**Ids are live handles, not identities.** Every action that asks the database about a
+drawn element (Expand, Refresh in the inspector, Connect, Find path) sends the element's
+id. A database may hand an id out again after a delete: FalkorDB does, and Apache AGE ids
+are per-label sequences. So an answer is merged only when every element it shares an id
+with has the same labels (a relationship: the same type, start and end); otherwise
+nothing from the answer is added, the drawn copy is dashed and marked out of date, and
+you are told. A statement run in the write console marks the whole drawing out of date,
+whatever it was: Expand, Connect and Find path stop sending until the query is run
+again. **This cannot catch everything:** if an element is deleted and another with the
+same labels (or the same type and ends) is created, the app cannot tell them apart and
+the old drawing may show the new element's properties after a Refresh. Refresh re-reads
+the database, but it only shows what is there under that id now. Run the query again to
+be sure.
 
 The canvas holds at most 1,000 nodes and 2,000 relationships; a result opens with
 the first 300 nodes and says how many it left out. Every query the app writes
