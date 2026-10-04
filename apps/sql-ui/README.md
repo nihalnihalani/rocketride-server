@@ -469,6 +469,10 @@ statements ran either way; only the app's picture of the schema is behind.
 ## Limits
 
 - **No cancel.** **Stop waiting** stops the app waiting, not the database.
+- **No client timeout on a statement.** SQL nodes set no statement deadline,
+  so the app does not impose one either: a long query is allowed to run until
+  you stop waiting. Schema reflection is bounded (five minutes) and the
+  engine check at connection time waits 15 seconds.
 - **No transactions.** Every statement commits on its own, and transaction
   control is refused.
 - **No `EXPLAIN ANALYZE`.** Plan numbers are estimates, never measurements.
