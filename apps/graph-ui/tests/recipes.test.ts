@@ -21,7 +21,7 @@ const ENGINES: IEngine[] = [
 	{ dialect: 'falkordb', version: '4.2.0' },
 	{ dialect: 'age', version: '1.5.0' },
 ];
-const HOSTILE_IDS = ["x'; MATCH (n) DETACH DELETE n //", '`; DROP', '4:6f1dbe8c-0000-4000-8000-00000000c0de:17', '11821949021847553', 'x$y', '}{', 'LIMIT 1'];
+const HOSTILE_IDS = ["x'; MATCH (n) DETACH DELETE n //", '`; DROP', '4:6f1dbe8c-0000-4000-8000-00000000c0de:17', '11821949021847553', 'x$y', '}{', 'LIMIT 1; --'];
 
 function recipe(result: RecipeResult): IRecipe {
 	assert.ok(!isRefusal(result), isRefusal(result) ? result.refusal : '');
