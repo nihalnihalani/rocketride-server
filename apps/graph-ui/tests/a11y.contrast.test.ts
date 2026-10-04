@@ -24,7 +24,7 @@ import path from 'node:path';
 import { test } from 'node:test';
 import { ACCENT_TOKEN, CANVAS_SURFACES, CANVAS_TEXT_TOKEN, CHIP_TEXT_TOKEN, EDGE_TOKEN, MIN_GRAPHIC_CONTRAST, MIN_TEXT_CONTRAST } from '../src/canvas/tokens';
 import { CANVAS_RULES } from '../src/canvas/environment';
-import { CYPHER_TOKEN_BASES, cypherTokenRules, ensureContrast, opaqueOver, readableOnEditor, toRuleHex } from '../src/components/editorTheme';
+import { CYPHER_TOKEN_BASES, cypherTokenRules, editorColors, ensureContrast, opaqueOver, readableOnEditor, toHexColor, toRuleHex } from '../src/components/editorTheme';
 import { contrastRatio, parseColor } from '../src/graph/colors';
 import type { Rgb } from '../src/graph/colors';
 
@@ -182,22 +182,73 @@ test('ensureContrast leaves a passing colour untouched, moves a failing one alon
 	assert.equal(toRuleHex({ r: 0, g: 128, b: 255 }), '0080FF');
 });
 
-test('line numbers: the theme\'s secondary colour is kept where it reads on the editor, and moved to 4.5:1 only where it does not (RocketRide Dark)', () => {
+const HEX = /^#[0-9a-f]{6}$/i;
+
+/** The editor theme colours for a shipped theme, built the way the editor builds them. */
+function colorsOf(theme: { tokens: Record<string, string> }): Record<string, string> {
+	return editorColors({ dark: theme.tokens['--rr-palette-mode'] === 'dark', background: theme.tokens['--rr-bg-paper'], foreground: theme.tokens['--rr-text-primary'], secondary: theme.tokens['--rr-text-secondary'] });
+}
+
+test('F9: every value of the editor theme is #RRGGBB in every shipped theme (Monaco reads rgba() as red), and the text colours are at least 4.5:1 on the editor background', () => {
+	for (const theme of themes) {
+		const colors = colorsOf(theme);
+		const paper = parseColor(colors['editor.background']) as Rgb;
+		for (const [key, value] of Object.entries(colors)) assert.match(value, HEX, `${theme.name}: ${key} is "${value}", not #RRGGBB`);
+		for (const key of ['editor.foreground', 'editorLineNumber.foreground', 'editorLineNumber.activeForeground']) {
+			const r = contrastRatio(parseColor(colors[key]) as Rgb, paper);
+			assert.ok(r >= MIN_TEXT_CONTRAST, `${theme.name}: ${key} is ${r.toFixed(2)}:1 on the editor`);
+		}
+		// The editor background is the theme's paper itself.
+		assert.equal(colors['editor.background'].toLowerCase(), `#${toRuleHex(paper)}`.toLowerCase());
+		assert.equal(paper.r, (parseColor(theme.tokens['--rr-bg-paper']) as Rgb).r);
+	}
+});
+
+test('F9: RocketRide Light\'s secondary text is rgba(10,10,10,0.62): the line numbers get the colour it LOOKS like over the paper, as hex, not the rgba string', () => {
+	const light = themes.find((t) => t.name === 'rocketride-light')!;
+	assert.match(light.tokens['--rr-text-secondary'], /^rgba\(/, 'the premise: this theme\'s token is an rgba()');
+	const out = readableOnEditor(light.tokens['--rr-text-secondary'], light.tokens['--rr-bg-paper']);
+	assert.match(out, HEX);
+	const paper = parseColor(light.tokens['--rr-bg-paper']) as Rgb;
+	assert.equal(out.toLowerCase(), `#${toRuleHex(opaqueOver(light.tokens['--rr-text-secondary'], paper) as Rgb)}`.toLowerCase(), 'already readable: the blended colour, unadjusted');
+});
+
+test('line numbers: a theme colour that already reads is kept as it LOOKS (blended, as hex), and one that does not is moved to 4.5:1 only (RocketRide Dark)', () => {
 	for (const theme of themes) {
 		const bg = theme.tokens['--rr-bg-paper'];
 		const out = readableOnEditor(theme.tokens['--rr-text-secondary'], bg);
+		assert.match(out, HEX, `${theme.name}: ${out}`);
 		const paper = parseColor(bg) as Rgb;
-		const seen = opaqueOver(out, paper) as Rgb;
-		assert.ok(contrastRatio(seen, paper) >= MIN_TEXT_CONTRAST, `${theme.name}: line numbers are ${contrastRatio(seen, paper).toFixed(2)}:1`);
+		assert.ok(contrastRatio(parseColor(out) as Rgb, paper) >= MIN_TEXT_CONTRAST, `${theme.name}: line numbers are ${contrastRatio(parseColor(out) as Rgb, paper).toFixed(2)}:1`);
 		const original = opaqueOver(theme.tokens['--rr-text-secondary'], paper) as Rgb;
-		if (contrastRatio(original, paper) >= MIN_TEXT_CONTRAST) assert.equal(out, theme.tokens['--rr-text-secondary'], `${theme.name}: an already-readable colour is returned as it is`);
+		if (contrastRatio(original, paper) >= MIN_TEXT_CONTRAST) assert.equal(out.toLowerCase(), `#${toRuleHex(original)}`.toLowerCase(), `${theme.name}: an already-readable colour is kept (as hex)`);
 	}
+	// RocketRide Dark (rgba white at 40%) is the one that has to move.
+	const dark = themes.find((t) => t.name === 'rocketride')!;
+	const original = opaqueOver(dark.tokens['--rr-text-secondary'], parseColor(dark.tokens['--rr-bg-paper']) as Rgb) as Rgb;
+	assert.ok(contrastRatio(original, parseColor(dark.tokens['--rr-bg-paper']) as Rgb) < MIN_TEXT_CONTRAST);
+	assert.notEqual(readableOnEditor(dark.tokens['--rr-text-secondary'], dark.tokens['--rr-bg-paper']).toLowerCase(), `#${toRuleHex(original)}`.toLowerCase());
+});
+
+test('a missing or unreadable token falls back to the existing defaults, still as hex', () => {
+	for (const dark of [false, true]) {
+		const colors = editorColors({ dark, background: '', foreground: '', secondary: '' });
+		for (const value of Object.values(colors)) assert.match(value, HEX);
+		assert.equal(colors['editor.background'].toLowerCase(), dark ? '#252526' : '#ffffff');
+		assert.equal(colors['editor.foreground'].toLowerCase(), dark ? '#cccccc' : '#1a1a1a');
+		assert.ok(contrastRatio(parseColor(colors['editorLineNumber.foreground']) as Rgb, parseColor(colors['editor.background']) as Rgb) >= MIN_TEXT_CONTRAST);
+	}
+	assert.equal(toHexColor('var(--x)', { r: 0, g: 0, b: 0 }, '#123456'), '#123456');
+	assert.equal(toHexColor('rgba(255,255,255,0.5)', { r: 0, g: 0, b: 0 }, '#123456'), '#808080');
+	assert.equal(readableOnEditor('nonsense', '#ffffff').toLowerCase(), '#666666');
+	assert.equal(readableOnEditor('#000000', 'nonsense', '#abcdef'), '#abcdef');
 });
 
 test('wiring: the editor theme is built from the rules and the line-number colour, and defines no colour per theme', () => {
 	const editor = fs.readFileSync(path.resolve(__dirname, '..', 'src', 'components', 'QueryEditor.tsx'), 'utf8');
-	assert.match(editor, /rules: cypherTokenRules\(dark, background\)/);
-	assert.match(editor, /'editorLineNumber\.foreground': lineNumber/);
+	assert.match(editor, /rules: cypherTokenRules\(dark, colors\['editor\.background'\]\)/);
+	assert.match(editor, /const colors = editorColors\(\{ dark, background: cssVar\('--rr-bg-paper', ''\)/);
+	assert.doesNotMatch(editor.slice(editor.indexOf('function defineTheme'), editor.indexOf('A counter that changes when the app theme does')), /'editor(LineNumber)?\.[a-zA-Z]+': cssVar/, 'no raw token string goes into the theme colours');
 	const body = editor.slice(editor.indexOf('function defineTheme'), editor.indexOf('A counter that changes when the app theme does'));
 	assert.doesNotMatch(body, /rocketride|#[0-9a-fA-F]{6}\b(?!.*fallback)/i.source.length ? /rocketride-light|data-theme/ : /x^/, 'no theme is named');
 });
