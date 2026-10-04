@@ -87,7 +87,7 @@ export function useThemeMode(): 'dark' | 'light' {
 const STYLE_ID = 'graph-ui-canvas-style';
 
 /** Rules the inline styles cannot express: focus rings, selection, label halo, motion. */
-const RULES = [
+export const CANVAS_RULES = [
 	'.graph-ui-canvas .react-flow__node { cursor: pointer; }',
 	'.graph-ui-canvas .react-flow__node:focus { outline: none; }',
 	'.graph-ui-canvas .react-flow__node:focus-visible .graph-ui-circle { outline: 3px solid var(--rr-border-focus, var(--rr-brand)); outline-offset: 3px; }',
@@ -106,6 +106,6 @@ export function ensureCanvasStyle(): void {
 	if (typeof document === 'undefined' || document.getElementById(STYLE_ID)) return;
 	const el = document.createElement('style');
 	el.id = STYLE_ID;
-	el.textContent = RULES;
+	el.textContent = CANVAS_RULES;
 	document.head.appendChild(el);
 }

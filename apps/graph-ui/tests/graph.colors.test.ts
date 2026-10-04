@@ -14,6 +14,7 @@ import { test } from 'node:test';
 import { CHART_COLOR_VARS, assignLabelColors, colorFor, composite, contrastRatio, hashColor, parseColor, readableOn, stableHash } from '../src/graph/colors';
 import type { Rgb } from '../src/graph/colors';
 import { CAPTION_ID, CAPTION_LABEL, CAPTION_MAX_CHARS, captionChoices, captionOf, defaultCaptionKey } from '../src/graph/captions';
+import { CANVAS_RULES } from '../src/canvas/environment';
 import { node } from './support/builders';
 
 test('the first six labels (sorted) take the chart colours in order; the rest hash', () => {
@@ -180,4 +181,15 @@ test('caption choices list property names most common first, then the two specia
 	const choices = captionChoices([node('1', ['P'], { name: 'a', age: 1 }), node('2', ['P'], { name: 'b' }), node('3', ['P'], { zip: 'z', name: 'c' })]);
 	assert.deepEqual(choices.map((c) => c.value), ['name', 'age', 'zip', CAPTION_LABEL, CAPTION_ID]);
 	assert.deepEqual(captionChoices([]).map((c) => c.value), [CAPTION_LABEL, CAPTION_ID]);
+});
+
+test('the node outline is unconditional: one plain rule, not nested in a media or supports block, and focus is always visible', () => {
+	const rules = CANVAS_RULES.split('\n');
+	const outline = rules.find((r) => r.includes('.graph-ui-circle') && r.includes('border: 1px solid var(--rr-text-primary)'));
+	assert.ok(outline, 'the circle has a 1px --rr-text-primary border');
+	assert.ok(!outline.trimStart().startsWith('@'), 'and it is not behind an at-rule');
+	assert.ok(rules.some((r) => r.includes(':focus-visible') && r.includes('outline: 3px solid')), 'a thick focus ring on the focused node');
+	// Motion is opt-in: the only transition lives under prefers-reduced-motion: no-preference.
+	const transitions = rules.filter((r) => r.includes('transition'));
+	assert.ok(transitions.length > 0 && transitions.every((r) => r.startsWith('@media (prefers-reduced-motion: no-preference)')));
 });
