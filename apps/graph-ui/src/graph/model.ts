@@ -41,7 +41,7 @@
 
 import { INITIAL_NODES, MAX_NEW_NEIGHBORS, MAX_NODES, MAX_RELATIONSHIPS } from './budgets';
 import type { IEntities } from './results';
-import type { GraphId, GraphNode, GraphRelationship } from './types';
+import type { GraphId, GraphNode, GraphPath, GraphRelationship } from './types';
 
 // =============================================================================
 // TYPES
@@ -291,6 +291,43 @@ export function connectNodes(model: IGraphModel, entities: IEntities): { model: 
 		added.push(id);
 	}
 	return { model: { ...model, relationships }, addedRelationships: added, budget };
+}
+
+/**
+ * Draw a found path: its nodes and relationships join the canvas (deduplicated,
+ * within the budgets), in the path's own order. Nodes the path adds are NOT roots:
+ * they came from a search, not from the result, so collapsing and dismissing treat
+ * them like any other addition.
+ *
+ * @param model - The current model.
+ * @param path - The path as the node serialised it (stored directions kept).
+ * @returns The model, the ids newly drawn, and the budget hit if any.
+ */
+export function mergePath(model: IGraphModel, path: GraphPath): { model: IGraphModel; addedNodes: GraphId[]; addedRelationships: GraphId[]; budget: BudgetHit } {
+	const nodes = new Map(model.nodes);
+	const relationships = new Map(model.relationships);
+	const addedNodes: GraphId[] = [];
+	const addedRelationships: GraphId[] = [];
+	let budget: BudgetHit = null;
+	for (const node of path.nodes) {
+		if (nodes.has(node.id)) continue;
+		if (nodes.size >= MAX_NODES) {
+			budget = 'nodes';
+			continue;
+		}
+		nodes.set(node.id, node);
+		addedNodes.push(node.id);
+	}
+	for (const rel of path.relationships) {
+		if (relationships.has(rel.id) || !nodes.has(rel.start) || !nodes.has(rel.end)) continue;
+		if (relationships.size >= MAX_RELATIONSHIPS) {
+			budget = budget ?? 'relationships';
+			continue;
+		}
+		relationships.set(rel.id, rel);
+		addedRelationships.push(rel.id);
+	}
+	return { model: { ...model, nodes, relationships }, addedNodes, addedRelationships, budget };
 }
 
 // =============================================================================
