@@ -1,0 +1,250 @@
+# =============================================================================
+# MIT License
+# Copyright (c) 2026 Aparavi Software AG
+# =============================================================================
+
+"""Live tests for graph_falkordb's read_query / execute(shape='graph') against a real FalkorDB.
+
+read_query must always use GRAPH.RO_QUERY, whatever ``allow_writes`` and
+``allow_execute`` say; refused writes are proven by graph state before and
+after. Also covers the server's RESULTSET_SIZE (silent truncation) and
+TIMEOUT settings.
+
+Configuration: RR_TEST_FALKORDB_URL (default redis://127.0.0.1:56379).
+Skips when the server is unreachable unless RR_REQUIRE_DB_TESTS is set.
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+
+import pytest
+
+_REQUIRED = bool(os.environ.get('RR_REQUIRE_DB_TESTS'))
+for _name in [n for n in sys.modules if n.split('.')[0] in ('falkordb', 'redis')]:
+    if not getattr(sys.modules[_name], '__file__', None):
+        del sys.modules[_name]
+if _REQUIRED:
+    import falkordb
+else:
+    falkordb = pytest.importorskip('falkordb')
+
+from .test_graph_neo4j_full import load_graph_node, start_node  # noqa: E402
+
+URL = os.environ.get('RR_TEST_FALKORDB_URL', 'redis://127.0.0.1:56379')
+GRAPH = 'gx_live'
+
+
+def _client():
+    return falkordb.FalkorDB.from_url(URL)
+
+
+def _reachable() -> bool:
+    try:
+        client = _client()
+        client.list_graphs()
+        client.close()
+        return True
+    except Exception:
+        return False
+
+
+_REACHABLE = _reachable()
+if _REQUIRED and not _REACHABLE:
+    pytest.fail(f'RR_REQUIRE_DB_TESTS is set but FalkorDB is not reachable at {URL}', pytrace=False)
+pytestmark = pytest.mark.skipif(not _REACHABLE, reason=f'FalkorDB test server not reachable at {URL}')
+
+SEED = (
+    "CREATE (a:Person:Employee {name: 'Alice', age: 37, big: 9007199254740993, born: date('1989-02-28'), "
+    "seen: localdatetime('2026-10-04T12:30:15'), tenure: duration({days: 40, hours: 2}), "
+    'home: point({latitude: 52.52, longitude: 13.405})}), '
+    "(b:Person {name: 'Bob', age: 41}), (c:Company {name: 'Acme'}), "
+    '(a)-[:KNOWS {since: 2019}]->(b), (a)-[:KNOWS {since: 2021}]->(b), (b)-[:KNOWS {since: 2020}]->(a), '
+    "(a)-[:LIKES]->(a), (a)-[:WORKS_AT {role: 'eng'}]->(c)"
+)
+
+
+@pytest.fixture()
+def falkor_graph():
+    client = _client()
+    graph = client.select_graph(GRAPH)
+    try:
+        graph.delete()
+    except Exception:
+        pass
+    graph.query(SEED)
+    yield graph
+    try:
+        graph.delete()
+    except Exception:
+        pass
+    client.close()
+
+
+@pytest.fixture()
+def falkor_env(monkeypatch):
+    return load_graph_node(monkeypatch, 'graph_falkordb')
+
+
+def _start(env, **config):
+    return start_node(env, 'graph_falkordb', {'mode': 'url', 'url': URL, 'graph': GRAPH, **config})
+
+
+def _state(graph):
+    nodes = graph.ro_query('MATCH (n) RETURN count(n)').result_set[0][0]
+    rels = graph.ro_query('MATCH ()-[r]->() RETURN count(r)').result_set[0][0]
+    labels = sorted(r[0] for r in graph.ro_query('CALL db.labels()').result_set)
+    return nodes, rels, labels
+
+
+class TestReadQueryShape:
+    def test_entities_and_direction(self, falkor_env, falkor_graph):
+        glb, inst = _start(falkor_env)
+        try:
+            out = inst.read_query(
+                {'cypher': "MATCH (a:Person {name: 'Alice'})-[r]->(m) RETURN a, r, m ORDER BY type(r), r.since"}
+            )
+            alice = out['rows'][0][0]
+            assert alice['labels'] == ['Employee', 'Person']
+            props = alice['properties']
+            assert props['big'] == {'@kind': 'number', 'value': '9007199254740993'}
+            assert props['born'] == {'@kind': 'temporal', 'type': 'date', 'value': '1989-02-28'}
+            assert props['seen'] == {'@kind': 'temporal', 'type': 'datetime', 'value': '2026-10-04T12:30:15+00:00'}
+            assert props['tenure'] == {'@kind': 'temporal', 'type': 'duration', 'value': 'P40DT2H'}
+            # Documented policy: a plain map (the client erases the point type).
+            # FalkorDB stores point coordinates as 32-bit floats.
+            assert props['home'] == {
+                'latitude': pytest.approx(52.52, rel=1e-6),
+                'longitude': pytest.approx(13.405, rel=1e-6),
+            }
+            rels = [row[1] for row in out['rows']]
+            assert [r['type'] for r in rels] == ['KNOWS', 'KNOWS', 'LIKES', 'WORKS_AT']
+            assert rels[0]['id'] != rels[1]['id']
+            assert rels[2]['start'] == rels[2]['end'] == alice['id']
+        finally:
+            glb.endGlobal()
+
+    def test_path_direction_and_id_round_trip(self, falkor_env, falkor_graph):
+        glb, inst = _start(falkor_env)
+        try:
+            path = inst.read_query(
+                {'cypher': "MATCH p = (b:Person {name: 'Bob'})<-[:KNOWS {since: 2019}]-(a) RETURN p"}
+            )['rows'][0][0]
+            assert [n['properties']['name'] for n in path['nodes']] == ['Bob', 'Alice']
+            rel = path['relationships'][0]
+            assert (rel['start'], rel['end']) == (path['nodes'][1]['id'], path['nodes'][0]['id'])
+            out = inst.read_query(
+                {
+                    'cypher': 'MATCH (n) WHERE id(n) = toInteger($id) RETURN n.name',
+                    'params': {'id': path['nodes'][1]['id']},
+                }
+            )
+            assert out['rows'] == [['Alice']]
+        finally:
+            glb.endGlobal()
+
+    def test_parameters_round_trip(self, falkor_env, falkor_graph):
+        glb, inst = _start(falkor_env)
+        try:
+            tricky = 'x" RETURN 1 // \\ \' end'
+            params = {'s': tricky, 'b': True, 'n': None, 'f': 1.5, 'l': [1, 'two'], 'm': {'k': 'v'}}
+            out = inst.read_query({'cypher': 'RETURN $s, $b, $n, $f, $l, $m', 'params': params})
+            assert out['rows'] == [[tricky, True, None, 1.5, [1, 'two'], {'k': 'v'}]]
+        finally:
+            glb.endGlobal()
+
+
+WRITES = [
+    "CREATE (:Evil {name: 'x'})",
+    "MERGE (:Evil {name: 'x'})",
+    "MATCH (a:Person {name: 'Alice'}) SET a.evil = true",
+    "MATCH (a:Person {name: 'Bob'}) DETACH DELETE a",
+    'MATCH (a:Person) REMOVE a.age',
+]
+
+
+class TestReadOnlyInvariant:
+    @pytest.mark.parametrize('allow_writes', [False, True])
+    @pytest.mark.parametrize('allow_execute', [False, True])
+    @pytest.mark.parametrize('statement', WRITES)
+    def test_writes_refused_under_every_flag_combination(
+        self, falkor_env, falkor_graph, allow_writes, allow_execute, statement
+    ):
+        glb, inst = _start(falkor_env, allow_writes=allow_writes, allow_execute=allow_execute)
+        try:
+            before = _state(falkor_graph)
+            with pytest.raises(falkor_env.GraphToolError) as err:
+                inst.read_query({'cypher': statement})
+            assert str(err.value).startswith('Refused: read_query is read-only')
+            assert 'read-only queries' in str(err.value)  # the server's own refusal
+            assert _state(falkor_graph) == before
+            props = falkor_graph.ro_query("MATCH (a:Person {name: 'Alice'}) RETURN properties(a)").result_set[0][0]
+            assert 'evil' not in props and props['age'] == 37
+        finally:
+            glb.endGlobal()
+
+    def test_legacy_query_tool_is_unchanged(self, falkor_env, falkor_graph):
+        # The pre-existing `query` tool still writes when allow_writes is on;
+        # Graph Explorer never uses it for reads.
+        glb, inst = _start(falkor_env, allow_writes=True)
+        try:
+            inst.query({'cypher': "CREATE (:Legacy {name: 'kept'})"})
+            assert falkor_graph.ro_query('MATCH (n:Legacy) RETURN count(n)').result_set[0][0] == 1
+        finally:
+            glb.endGlobal()
+
+
+class TestServerLimits:
+    def test_resultset_size_is_read_and_respected(self, falkor_env, falkor_graph):
+        glb, inst = _start(falkor_env, max_rows=25000)
+        try:
+            cap = glb.server_result_cap
+            if cap is None:
+                pytest.skip('server does not allow GRAPH.CONFIG GET RESULTSET_SIZE')
+            assert glb.read_query_cap == min(25000, cap - 1)
+            over = inst.read_query({'cypher': f'UNWIND range(1, {cap + 5000}) AS i RETURN i', 'limit': 25000})
+            assert over['row_limit'] == cap - 1 and len(over['rows']) == cap - 1
+            assert over['truncated'] is True and over['truncated_by'] == 'rows'
+            exact = inst.read_query({'cypher': f'UNWIND range(1, {cap - 1}) AS i RETURN i', 'limit': 25000})
+            assert len(exact['rows']) == cap - 1 and exact['truncated'] is False
+        finally:
+            glb.endGlobal()
+
+    def test_exact_limit_and_truncation(self, falkor_env, falkor_graph):
+        glb, inst = _start(falkor_env)
+        try:
+            q = 'MATCH (p:Person) RETURN p.name ORDER BY p.name'
+            assert inst.read_query({'cypher': q, 'limit': 2})['truncated'] is False
+            cut = inst.read_query({'cypher': q, 'limit': 1})
+            assert cut['rows'] == [['Alice']] and cut['truncated_by'] == 'rows'
+        finally:
+            glb.endGlobal()
+
+    def test_timeout(self, falkor_env, falkor_graph):
+        glb, inst = _start(falkor_env, query_timeout_ms=100)
+        try:
+            with pytest.raises(falkor_env.GraphToolError) as err:
+                inst.read_query({'cypher': 'UNWIND range(1, 300000000) AS i WITH i WHERE i % 7 = 3 RETURN count(i)'})
+            assert str(err.value).startswith(f'Query timed out after {glb.statement_timeout_ms} ms')
+        finally:
+            glb.endGlobal()
+
+    def test_collect_is_bounded_by_the_element_budget(self, falkor_env, falkor_graph):
+        falkor_graph.query('UNWIND range(1, 10050) AS i CREATE (:Bulk {i: i})')
+        glb, inst = _start(falkor_env)
+        try:
+            with pytest.raises(falkor_env.GraphToolError, match='first row holds more than 10,000 graph elements'):
+                inst.read_query({'cypher': 'MATCH (n:Bulk) RETURN collect(n)'})
+        finally:
+            glb.endGlobal()
+
+
+class TestExecuteGraphShape:
+    def test_graph_shape(self, falkor_env, falkor_graph):
+        glb, inst = _start(falkor_env, allow_execute=True)
+        try:
+            out = inst.execute({'query': "CREATE (n:New {name: 'n1'}) RETURN n", 'shape': 'graph'})
+            assert out['rows'][0][0]['labels'] == ['New'] and out['affected_rows'] >= 2
+        finally:
+            glb.endGlobal()

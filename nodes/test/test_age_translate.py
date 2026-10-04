@@ -346,6 +346,54 @@ class TestCapabilities:
         with pytest.raises(age.AgeUnsupportedFeature):
             age.translate('MATCH (n) RETURN datetime()', graph_name='g', age_version='9.9.9')
 
+    @pytest.mark.parametrize(
+        'query,feature,construct',
+        [
+            ("RETURN date('2024-01-01')", 'temporal_functions', 'date()'),
+            ('RETURN localdatetime(), localtime()', 'temporal_functions', 'localdatetime(), localtime()'),
+            ('RETURN time()', 'temporal_functions', 'time()'),
+            ("RETURN duration('P1D')", 'temporal_functions', 'duration()'),
+            ('MATCH (n) RETURN elementId(n)', 'element_id', 'elementId()'),
+            ('RETURN [x IN [1, 2] | x * 2]', 'list_comprehension', 'list comprehension'),
+            ('RETURN [x IN [1, 2] WHERE x > 1]', 'list_comprehension', 'list comprehension'),
+            ('MATCH (n) RETURN [(n)-->(m) | m.x]', 'pattern_comprehension', 'pattern comprehension'),
+            ('MATCH (a), (b) RETURN allShortestPaths((a)-[*..3]-(b))', 'all_shortest_paths', 'allShortestPaths()'),
+        ],
+    )
+    def test_accepted_but_failing_constructs_get_hints(self, query, feature, construct):
+        # Each of these parses, but AGE 1.5.0 fails at run time with a raw error
+        # (verified live: 'function ag_catalog.age_<name> does not exist' or a
+        # syntax error); the translator now refuses them with guidance first.
+        with pytest.raises(age.AgeUnsupportedFeature) as err:
+            age.translate(query, graph_name='g')
+        assert err.value.feature == feature
+        assert err.value.construct == construct
+        assert err.value.detail
+
+    @pytest.mark.parametrize(
+        'query,feature',
+        [
+            ('MATCH (n) WHERE EXISTS { MATCH (n)-->() } RETURN n', 'exists_subquery'),
+            ('MATCH p = shortestPath((a)-[*..3]-(b)) RETURN p', 'shortest_path'),
+            ("MATCH (n) WHERE n.name =~ 'A.*' RETURN n", 'regex_match'),
+            ('MATCH (n) WHERE exists(n.x) RETURN n', 'exists_function'),
+        ],
+    )
+    def test_unparseable_constructs_get_hints_instead_of_syntax_errors(self, query, feature):
+        with pytest.raises(age.AgeUnsupportedFeature) as err:
+            age.translate(query, graph_name='g')
+        assert err.value.feature == feature
+
+    def test_hints_ignore_words_inside_literals(self):
+        with pytest.raises(age.AgeTranslationError) as err:
+            age.translate("MATCH (n WHERE n.note = 'EXISTS { x }' RETURN n", graph_name='g')
+        assert not isinstance(err.value, age.AgeUnsupportedFeature)
+        assert 'syntax error' in str(err.value)
+
+    def test_supported_functions_still_translate(self):
+        for query in ('RETURN timestamp()', 'RETURN toString(1)', 'MATCH (n) RETURN coalesce(n.x, 1), keys(n)'):
+            age.translate(query, graph_name='g')
+
 
 # ---------------------------------------------------------------------------
 # emit

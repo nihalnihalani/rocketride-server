@@ -33,10 +33,27 @@ The registered tool names are the bare method names below (an agent catalog name
 | `get_data` | Requires a non-empty `question`; optional `limit` is clamped to the graph row cap. Returns sanitized rows, generated query, applied limit, and truncation state; generation/execution failure returns `error`, `valid: false`, and no rows. |
 | `get_schema` | Takes no meaningful arguments and returns reflected `labels`, node properties, and relationships. |
 | `get_query` | Requires a non-empty `question`, with optional `limit`; returns validated read-only Cypher and `valid: true`, or an `error`/off-topic `answer` with `valid: false`. |
-| `execute` | Requires raw `query` and runs it without LLM translation; it raises an error unless `allow_execute` is enabled, and fails when the result exceeds the execute row cap. |
+| `read_query` | Requires non-empty `cypher`; accepts object `params` and integer `limit` (default 1,000, capped by `max_rows`, the server's `RESULTSET_SIZE` and 25,000). Always runs `GRAPH.RO_QUERY` on the configured graph, whatever `allow_writes` or `allow_execute` say, with the query timeout clamped to the server's `TIMEOUT_MAX`. Returns `{columns, rows, row_limit, truncated, truncated_by, element_limit, elements, value_limit, values}` in the shared graph result shape; failures raise an error whose first line is a headline (`Refused: …`, `Query timed out after N ms`, `Invalid read_query input: …`, `Query failed`) and whose remaining lines are the server's message. |
+| `execute` | Requires raw `query` and runs it without LLM translation; it raises an error unless `allow_execute` is enabled, and fails when the result exceeds the execute row cap. With `shape: "graph"` it returns the `read_query` shape plus `affected_rows`. |
 | `dialect` | Takes no meaningful arguments and returns `{dialect: "falkordb"}`. |
 | `query` | Requires non-empty `cypher`; accepts optional object `params` and optional `graph`. Returns columns, serialized rows, count, and truncation state; Redis failures return `error` with empty rows. |
 | `list_graphs` | Takes no arguments and returns graph names, or `error` with an empty graph list on a Redis failure. |
+
+In the `read_query` shape, node and relationship ids are FalkorDB's integer ids
+as decimal strings (`WHERE id(n) = toInteger($id)`); they are live handles, not
+durable keys, and node and relationship ids are separate counters. Labels are
+sorted, relationship `start`/`end` keep the stored direction and paths keep
+traversal order. Dates, local times and durations are tagged temporals (a
+duration is its exact stored length, written as days and time). Datetimes are
+reported in UTC. Points come back as plain `{latitude, longitude}` maps because
+the client library does not keep the point type, and vectors as number lists.
+A response stops at 10,000 graph elements or 500,000 values.
+
+`RESULTSET_SIZE` truncates a reply silently on the server, so the node reads it
+(and `TIMEOUT_MAX`) with `GRAPH.CONFIG GET` at start and keeps its read cap one
+row below it; where `GRAPH.CONFIG` is not permitted it assumes no server limit
+and says so in a warning. The client buffers each whole reply, so the server's
+`RESULTSET_SIZE` and the timeout are what bound server work and memory.
 
 ## Profiles
 

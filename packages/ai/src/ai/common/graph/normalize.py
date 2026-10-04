@@ -42,6 +42,7 @@ Shape (only this module creates tags)::
      'value': ISO-8601 text[, 'zone': name]}
     {'@kind': 'point', 'srid': int, 'coordinates': [number, ...]}
     {'@kind': 'number', 'value': text}
+    {'@kind': 'bytes', 'size': int, 'base64': text | None}   (CONTRACT v1.1)
 
 Rules:
 
@@ -61,12 +62,17 @@ Rules:
   members included) and values (every scalar, container and tag) are counted
   per response; exceeding a budget raises :class:`GraphBudgetExceeded`, and
   nesting deeper than ``max_depth`` raises ``ValueError``.
+- **Bytes** (e.g. a Neo4j ``byte[]`` property) become a ``bytes`` tag with the
+  full content in base64 up to 64 KiB, and only the size above that, so one
+  binary property never fails a whole browse query. A bytes value counts as
+  one value toward the value budget.
 - Anything not recognised raises ``ValueError`` naming the type — never a
   ``repr`` passed off as data.
 """
 
 from __future__ import annotations
 
+import base64
 import datetime as _dt
 import math
 
@@ -78,6 +84,8 @@ MAX_SAFE_INTEGER = 2**53 - 1
 DEFAULT_ELEMENT_LIMIT = 10_000
 DEFAULT_VALUE_LIMIT = 500_000
 DEFAULT_MAX_DEPTH = 64
+# Binary values above this size are reported by size only.
+BYTES_INLINE_LIMIT = 65_536
 
 TAG = '@kind'
 
@@ -167,6 +175,12 @@ def _finite_or_tag(value: float) -> Any:
     if math.isinf(value):
         return number_tag('Infinity' if value > 0 else '-Infinity')
     return value
+
+
+def bytes_tag(value: Any) -> Dict[str, Any]:
+    data = bytes(value)
+    encoded = base64.b64encode(data).decode('ascii') if len(data) <= BYTES_INLINE_LIMIT else None
+    return {TAG: 'bytes', 'size': len(data), 'base64': encoded}
 
 
 def normalize_int(value: int) -> Any:
@@ -328,6 +342,8 @@ class GraphNormalizer:
             return _finite_or_tag(value)
         if isinstance(value, Decimal):
             return normalize_decimal(value)
+        if isinstance(value, (bytes, bytearray, memoryview)):
+            return bytes_tag(value)
         if isinstance(value, dict):
             return self._user_map(value, depth)
         if isinstance(value, (list, tuple)):
@@ -421,7 +437,7 @@ def decode_graph_value(value: Any) -> Any:
             'nodes': [decode_graph_value(n) for n in value['nodes']],
             'relationships': [decode_graph_value(r) for r in value['relationships']],
         }
-    if kind in ('temporal', 'point', 'number'):
+    if kind in ('temporal', 'point', 'number', 'bytes'):
         return dict(value)
     return _decode_map(value)
 
