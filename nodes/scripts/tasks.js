@@ -82,6 +82,8 @@ const DB_LIVE_SUITES = [
     'test_rocketride_graph_full.py',
     'test_graph_age_full.py',
     'test_graph_drivers_full.py',
+    'test_graph_neo4j_full.py',
+    'test_graph_falkordb_full.py',
 ];
 
 // ============================================================================
