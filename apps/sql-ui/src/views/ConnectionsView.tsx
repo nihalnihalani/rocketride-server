@@ -26,11 +26,11 @@
 
 import React, { useEffect, useState } from 'react';
 import { useShellConnection } from 'shell';
-// App-private connection tiles (owned by this app, not the platform surface).
-import { ConnectionCard, ConnectionCardAdd } from '../components/ConnectionCard';
 import {
 	Banner,
 	Button,
+	ConnectionCard,
+	ConnectionCardAdd,
 	ContentHeader,
 	EmptyState,
 } from 'shell';
@@ -40,6 +40,31 @@ import { connectionUri, getDocs } from '../docs';
 import ConnectionDetailPanel from '../components/ConnectionDetailPanel';
 import { DatabaseIcon } from '../icons';
 import { styles } from '../styles';
+
+// =============================================================================
+// WORDING
+// =============================================================================
+
+/** The badge each endpoint state wears (the label is the whole message, never colour alone). */
+const STATE_BADGE: Record<ISqlEndpoint['state'], { variant: 'success' | 'muted' | 'error'; label: string }> = {
+	probing: { variant: 'muted', label: 'Checking' },
+	ready: { variant: 'success', label: 'Running' },
+	stopped: { variant: 'muted', label: 'Stopped' },
+	unreachable: { variant: 'error', label: 'Unreachable' },
+	inaccessible: { variant: 'error', label: 'No access' },
+};
+
+/**
+ * The card's second line. A deployment is named as one, because a developer's
+ * run and a deployment of the same pipeline are different connections.
+ *
+ * @param endpoint - The endpoint.
+ * @returns e.g. `db_postgres - Orders` or `db_postgres - Orders (deployment)`.
+ */
+function cardAddress(endpoint: ISqlEndpoint): string {
+	const run = endpoint.runKind === 'deploy' ? ' (deployment)' : '';
+	return `${endpoint.provider} - ${endpoint.pipelineName}${run}`;
+}
 
 // =============================================================================
 // COMPONENT
@@ -143,10 +168,10 @@ export const ConnectionsView: React.FC = () => {
 								key={endpoint.key}
 								icon={<DatabaseIcon />}
 								name={endpoint.nodeName}
-								address={`${endpoint.provider} - ${endpoint.pipelineName}`}
-								status={endpoint.running ? 'success' : 'muted'}
-								statusLabel={endpoint.running ? 'Running' : 'Stopped'}
-								connected={endpoint.running}
+								address={cardAddress(endpoint)}
+								status={STATE_BADGE[endpoint.state].variant}
+								statusLabel={STATE_BADGE[endpoint.state].label}
+								connected={endpoint.state === 'ready'}
 								onClick={() => openConnection(endpoint)}
 								onEdit={() => openDrawer(endpoint)}
 							/>
