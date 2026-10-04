@@ -268,5 +268,10 @@ export function pathAtDepth(engine: IEngine, fromId: string, toId: string, depth
  */
 function printable(name: string): string {
 	const text = name.length > 60 ? `${name.slice(0, 59)}…` : name;
-	return text.replace(/[\u0000-\u001f\u007f]/g, (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, '0')}`);
+	let out = '';
+	for (const ch of text) {
+		const code = ch.charCodeAt(0);
+		out += code < 0x20 || code === 0x7f ? `\\u${code.toString(16).padStart(4, '0')}` : ch;
+	}
+	return out;
 }
