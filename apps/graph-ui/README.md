@@ -238,8 +238,8 @@ editor and an **Execute** button, and it always says what it is:
 - Performance was measured with results of 100, 300 and 1,000 nodes (the first
   draw is capped at 300 nodes; **Show more nodes** adds the rest, up to the
   canvas maximum). On an Apple-silicon laptop there were no long tasks while
-  panning or dragging. A slower device pays more per frame, most when a node is
-  dragged in a large graph.
+  panning or dragging. A slower device pays more per frame, most when panning a
+  large graph.
 - Browsers: the production checks ran in Chrome 154, Firefox 141 and WebKit 26
   (Playwright). WebKit is the engine Safari uses, but it is not Safari, and
   Safari itself has not been tried. The build declares Safari 13 as its floor,
