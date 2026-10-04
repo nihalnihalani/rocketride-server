@@ -295,7 +295,28 @@ describe('invoke — explicit timeouts above the node deadline', () => {
 		await rig.invoke('dialect', {});
 		await rig.invoke('refresh_schema', {});
 		await rig.invoke('get_query', { question: 'q' });
-		assert.deepEqual(rig.world.calls.map((c) => c.timeout), [16_000, 61_000, 121_000]);
+		// dialect 15 s, refresh_schema 135 s, get_query 120 s; the SDK waits 1 s longer than each.
+		assert.deepEqual(rig.world.calls.map((c) => c.timeout), [16_000, 136_000, 121_000]);
+	});
+
+	it('waits for refresh_schema longer than the node can take: a queued refresh plus its own budget', async () => {
+		// Node: SCHEMA_REFRESH_BUDGET_MS = 60 s (packages/ai/src/ai/common/graph/schema.py);
+		// refresh_schema_snapshot waits up to budget + 5 s for the per-node lock and
+		// then reflects for up to its budget, so the node's honest stale/error answer
+		// can arrive after 2 x 60 s + 5 s. A client wait at or below that says
+		// "stopped waiting" just before the node answers.
+		const nodeBudgetMs = 60_000;
+		const worstNodeAnswerMs = 2 * nodeBudgetMs + 5_000;
+		assert.ok(DEFAULT_TOOL_TIMEOUTS.refresh_schema! > 2 * nodeBudgetMs, 'above two budgets');
+		assert.ok(DEFAULT_TOOL_TIMEOUTS.refresh_schema! > worstNodeAnswerMs, 'above the worst honest node answer');
+		assert.equal(DEFAULT_TOOL_TIMEOUTS.refresh_schema, 135_000);
+		// get_schema serves a snapshot the node already holds: it keeps its own, shorter wait.
+		assert.equal(DEFAULT_TOOL_TIMEOUTS.get_schema, 60_000);
+
+		// And the session really uses it for refresh_schema (the SDK is told 1 s more).
+		const rig = makeSession(() => ({ nodes: [], relationships: [] }));
+		await rig.invoke('refresh_schema', {});
+		assert.equal(rig.world.calls[0]!.timeout, DEFAULT_TOOL_TIMEOUTS.refresh_schema! + 1_000);
 	});
 
 	it('lets a call override the budget, and `null` means no client timeout at all', async () => {

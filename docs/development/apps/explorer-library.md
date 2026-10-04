@@ -146,8 +146,17 @@ Failure depends on the **tool**, so each tool gets a `ResultCheck`
 **Timeouts** come from the session's own timer, never from SDK message text.
 The default wait is the node's published `dialect.limits.statement_timeout_ms`
 plus 10 s, or 40 s when it is not published. `DEFAULT_TOOL_TIMEOUTS`:
-`dialect` 15 s, `get_schema` and `refresh_schema` 60 s, `get_data` and
-`get_query` 120 s. A tool spec's `timeoutMs: null` means no client timeout. The
+
+| Tool | Client wait | Why |
+|---|---|---|
+| `dialect` | 15 s | a name and a few limits |
+| `get_schema` | 60 s | serves the snapshot the node already holds |
+| `refresh_schema` | 135 s | the node can queue behind another refresh (budget + 5 s) and then reflect for its own budget (`SCHEMA_REFRESH_BUDGET_MS` = 60 s, `packages/ai/src/ai/common/graph/schema.py`): 2 × 60 s + 5 s, plus the 10 s pad |
+| `get_data`, `get_query` | 120 s | a model writes the query first |
+
+A client wait must sit above the node's own deadline, otherwise the app says
+"stopped waiting" just before the node returns its honest stale or error answer.
+A tool spec's `timeoutMs: null` means no client timeout. The
 SDK is asked to wait 1 s longer than the session so the session's typed
 `timeout` wins. A client timeout does **not** cancel the server's work.
 
