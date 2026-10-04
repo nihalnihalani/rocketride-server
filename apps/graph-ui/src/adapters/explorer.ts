@@ -71,6 +71,8 @@ import {
 } from 'shared/explorer';
 import type { IEndpointStore, IEndpointStoreOptions, IHistoryStore, IToolSpec } from 'shared/explorer';
 import type { GraphDialect } from '../cypher/quote';
+import { createSchemaStore } from '../graph/schemaStore';
+import type { ISchemaStore } from '../graph/schemaStore';
 
 // =============================================================================
 // PROVIDERS, TOOLS
@@ -141,6 +143,9 @@ export const CAPTIONS_PREF_KEY = 'graph.captions';
 
 /** Per-connection editor drafts. Text only, never a token or a result. */
 export const DRAFTS_PREF_KEY = 'graph.drafts';
+
+/** The app's schema snapshots, one per connection. */
+export const schemas: ISchemaStore = createSchemaStore();
 
 /** The one announcement channel and its live region. */
 export const announcer = createAnnouncer();
