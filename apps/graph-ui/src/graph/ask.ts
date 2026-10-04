@@ -79,3 +79,50 @@ export function explainAskFailure(error: { kind: string; headline: string; detai
 	const unavailable = error.kind === 'raised' && NO_MODEL.test(`${error.headline}\n${detail}`);
 	return { headline: error.headline, detail, unavailable };
 }
+
+// =============================================================================
+// ASKING
+// =============================================================================
+
+/** The longest question that is sent. */
+export const ASK_MAX_CHARS = 2000;
+
+/** What asking came to. */
+export type AskOutcome =
+	| { kind: 'cypher'; cypher: string }
+	| { kind: 'prose'; text: string }
+	/** The pipeline has no language model (or it is not wired): say so, no error banner. */
+	| { kind: 'unavailable'; text: string }
+	| { kind: 'failed'; headline: string; detail: string }
+	/** The question was too long or empty: nothing was sent. */
+	| { kind: 'refused'; text: string }
+	/** The answer belongs to a request that was superseded: show nothing. */
+	| { kind: 'ignored' };
+
+/**
+ * Ask the node's model a question and sort the answer.
+ *
+ * The Cypher it returns is a PREVIEW: the caller puts it in the editor and the
+ * user presses Run. Nothing here runs it.
+ *
+ * @param question - The user's question.
+ * @param call - Sends `get_query` with the (trimmed) question and resolves with its value; may throw the session's error.
+ * @param unavailableText - What to say when there is no model.
+ * @returns The outcome; never throws.
+ */
+export async function askQuestion(question: string, call: (question: string) => Promise<unknown>, unavailableText: string): Promise<AskOutcome> {
+	const trimmed = question.trim();
+	if (trimmed === '') return { kind: 'refused', text: 'Type a question first.' };
+	if (trimmed.length > ASK_MAX_CHARS) return { kind: 'refused', text: `That question is longer than ${ASK_MAX_CHARS.toLocaleString('en-US')} characters. Shorten it.` };
+	try {
+		const answer = readAskAnswer(await call(trimmed));
+		return answer ?? { kind: 'failed', headline: 'The node answered with neither a query nor text.', detail: '' };
+	} catch (error) {
+		const e = (error ?? {}) as { kind?: unknown; headline?: unknown; detail?: unknown; message?: unknown };
+		const kind = typeof e.kind === 'string' ? e.kind : 'raised';
+		if (kind === 'stale') return { kind: 'ignored' };
+		const message = typeof e.message === 'string' ? e.message : String(error);
+		const failure = explainAskFailure({ kind, headline: typeof e.headline === 'string' ? e.headline : message.split('\n')[0], ...(typeof e.detail === 'string' ? { detail: e.detail } : {}) });
+		return failure.unavailable ? { kind: 'unavailable', text: unavailableText } : { kind: 'failed', headline: failure.headline, detail: failure.detail };
+	}
+}

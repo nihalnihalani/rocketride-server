@@ -148,5 +148,36 @@ export const GRID_NOTICE = 'The layout worker could not run, so nodes are placed
 /** The upgrade message for a node without `read_query`: never a fallback to another tool. */
 export const UPGRADE_READ_QUERY = 'This node does not support read_query yet. Upgrade the node to browse with Graph Explorer; the app never falls back to execute for reads.';
 
+/** The upgrade message for a node that cannot refresh its schema. The stored snapshot stays on screen. */
+export const UPGRADE_REFRESH_SCHEMA = 'This node cannot refresh its schema yet, so the snapshot taken when its pipeline started is shown. Upgrade the node for a schema you can refresh.';
+
+/** The upgrade message for a node that does not answer Ask (get_query). */
+export const UPGRADE_GET_QUERY = 'This node cannot turn a question into Cypher yet. Upgrade the node to use Ask; writing Cypher by hand works without it.';
+
+/** The upgrade message for a node that cannot run the write console (execute with the graph shape). */
+export const UPGRADE_EXECUTE = 'This node does not support execute with the graph result shape yet. Upgrade the node to use the write console.';
+
+/**
+ * The upgrade message for a tool a node does not have.
+ *
+ * @param tool - The tool name ('' when unknown).
+ * @returns The wording; read_query's never suggests a fallback.
+ */
+export function upgradeText(tool: string): string {
+	switch (tool) {
+		case 'refresh_schema':
+			return UPGRADE_REFRESH_SCHEMA;
+		case 'get_query':
+			return UPGRADE_GET_QUERY;
+		case 'execute':
+			return UPGRADE_EXECUTE;
+		case 'read_query':
+		case '':
+			return UPGRADE_READ_QUERY;
+		default:
+			return `This node does not support ${tool} yet. Upgrade the node to use this part of Graph Explorer.`;
+	}
+}
+
 /** The unavailable state for Ask when the pipeline has no LLM. */
 export const ASK_UNAVAILABLE = 'Asking questions needs a language model in the pipeline, and this one has none. Browsing with Cypher works without it.';

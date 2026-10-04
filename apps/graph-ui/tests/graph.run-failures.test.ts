@@ -61,6 +61,19 @@ test('an upgrade (and the engine\'s unknown-tool text) is a warning with the upg
 	}
 });
 
+test('the upgrade message names the tool the node lacks: refresh, Ask and execute each say their own thing, and only read_query\'s mentions the no-fallback rule', () => {
+	const refresh = describeFailure(failure('upgrade', 'This node cannot run refresh_schema: it does not advertise it.', 'refresh_schema'), false);
+	assert.match(refresh.headline, /cannot refresh its schema/);
+	assert.doesNotMatch(refresh.headline, /read_query/);
+	assert.match(describeFailure(failure('raised', 'No handler found for tool get_query', 'get_query'), false).headline, /cannot turn a question into Cypher/);
+	assert.match(describeFailure(failure('upgrade', 'x', 'execute'), true).headline, /execute with the graph result shape/);
+	assert.match(describeFailure(failure('upgrade', 'x', 'something_else'), true).headline, /does not support something_else yet/);
+	// The tool is also read from the fixed wording when the thrown value is not available (the runner passes only the message).
+	assert.match(describeFailureMessage('This node cannot run refresh_schema: it does not advertise it.', false).headline, /cannot refresh its schema/);
+	assert.match(describeFailureMessage('No handler found for tool get_query', false).headline, /cannot turn a question/);
+	assert.match(describeFailureMessage('No handler found for tool read_query', false).headline, /never falls back to execute/);
+});
+
 test('the legacy execute-disabled text is recognised', () => {
 	const n = describeFailure(failure('raised', errors.execute_disabled_legacy, 'execute'), false);
 	assert.equal(n.headline, 'This node does not allow execute (allow_execute is off).');

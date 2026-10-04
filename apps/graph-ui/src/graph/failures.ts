@@ -45,7 +45,7 @@
 // =============================================================================
 
 import type { IFailureNotice as ISharedFailureNotice } from 'shared/explorer';
-import { GRID_NOTICE, STOP_WAITING_NOTE, UPGRADE_READ_QUERY } from './wording';
+import { GRID_NOTICE, STOP_WAITING_NOTE, upgradeText } from './wording';
 
 /** What the shared tool session threw, reduced to what this module reads. */
 export interface IFailureInput {
@@ -82,8 +82,21 @@ export const DATABASE_SAID_LABEL = 'Database said';
 /** The legacy refusal text of a node that has `execute` off (a plain error, no code). */
 const LEGACY_EXECUTE_OFF = /execute tool is disabled for this node/i;
 
-/** The engine's text when it does not know a tool. */
-const UNKNOWN_TOOL = /no handler found for tool/i;
+/** The engine's text when it does not know a tool; the tool name follows. */
+const UNKNOWN_TOOL = /no handler found for tool\s+['"]?([A-Za-z0-9_.]+)/i;
+
+/** The session's own text when a node does not advertise a tool; the tool name follows. */
+const NOT_ADVERTISED = /This node cannot run ([A-Za-z0-9_.]+): it does not advertise/;
+
+/**
+ * The tool a failure is about: the thrown error's own field, else the name in the fixed wording.
+ *
+ * @param error - The failure.
+ * @returns The tool name, or '' when it cannot be told.
+ */
+function toolOf(error: IFailureInput): string {
+	return error.tool || UNKNOWN_TOOL.exec(error.message)?.[1] || NOT_ADVERTISED.exec(error.message)?.[1] || '';
+}
 
 /**
  * Describe a failed call for the banner.
@@ -108,7 +121,7 @@ function describeKind(error: IFailureInput, canWrite: boolean): Omit<IFailureNot
 	if (error.kind === 'stale') return { variant: 'info', headline: '', detail: '', hint: null, ignore: true };
 	const base = { detail: error.detail ?? '', ignore: false };
 
-	if (error.kind === 'upgrade' || UNKNOWN_TOOL.test(error.message)) return { variant: 'warning', headline: UPGRADE_READ_QUERY, detail: '', hint: null, ignore: false };
+	if (error.kind === 'upgrade' || UNKNOWN_TOOL.test(error.message)) return { variant: 'warning', headline: upgradeText(toolOf(error)), detail: '', hint: null, ignore: false };
 	if (LEGACY_EXECUTE_OFF.test(error.message)) {
 		return { ...base, variant: 'error', headline: 'This node does not allow execute (allow_execute is off).', detail: '', hint: 'Browsing with Cypher works. Statements that change data need a node with direct execution turned on.' };
 	}
