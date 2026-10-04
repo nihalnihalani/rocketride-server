@@ -1,0 +1,74 @@
+// =============================================================================
+// MIT License
+// Copyright (c) 2026 Aparavi Software AG
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+
+// =============================================================================
+// EXPLORER — REACT / SHELL BINDINGS (the components that need the platform)
+// =============================================================================
+//
+// The only place besides shellBinding.ts where the library imports a VALUE from
+// 'shell'. Everything it binds (the history store, the announcer) is pure and
+// tested without the platform; these wrappers are the thin seams onto it.
+// =============================================================================
+
+import React, { useEffect, useMemo, useRef } from 'react';
+import { usePrefs } from 'shell';
+import type { IPrefsAccessor } from './history/types';
+
+/** The part of a history store the bridge needs. */
+export interface IPrefsAttachable {
+	/** Attach the preference accessor; returns the detach function. */
+	attachPrefs(api: IPrefsAccessor): () => void;
+}
+
+/**
+ * Create the component that mounts a history store's access to workspace
+ * preferences.
+ *
+ * It renders nothing. Mount it wherever the app is on screen and history
+ * should be kept — the app root does, and a History drawer may mount its own so
+ * the drawer works even from a query document whose connection tab was closed.
+ * Multiple mounts are safe: attachment is reference-counted.
+ *
+ * @param store - The app's history store.
+ * @returns A null-rendering component.
+ */
+export function createHistoryPrefsBridge(store: IPrefsAttachable): React.FC {
+	const HistoryPrefsBridge: React.FC = () => {
+		const api = usePrefs();
+
+		// The shell hands out a NEW accessor object whenever any preference
+		// changes; the store needs one stable identity for the mount's lifetime,
+		// so calls are forwarded through a ref instead.
+		const latest = useRef(api);
+		latest.current = api;
+
+		const stable = useMemo<IPrefsAccessor>(() => ({
+			getPref: (key: string) => latest.current.getPref(key),
+			setPref: (key: string, value: unknown) => latest.current.setPref(key, value),
+		}), []);
+
+		useEffect(() => store.attachPrefs(stable), [stable]);
+
+		return null;
+	};
+	return HistoryPrefsBridge;
+}
