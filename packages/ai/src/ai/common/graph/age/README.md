@@ -14,10 +14,17 @@ the version gaps. This package is that translation, as a **pure transform**
 
 1. **Parse** ([analysis.py](analysis.py)) — openCypher ANTLR grammar (M23),
    not regex. Extracts RETURN projection, write clauses, `$params`,
-   variable-length depth bounds, invoked functions.
+   variable-length depth bounds, invoked functions, and schema-qualified
+   function/procedure names (as unescaped name segments).
 2. **Firewall** ([firewall.py](firewall.py)) — resource caps on **both**
    paths (query length, variable-length depth, statement timeout); semantic
-   read-only rules (no writes, no CALL) on the **safe** path only.
+   read-only rules (no writes, no CALL) on the **safe** path only. Qualified
+   calls on **both** paths: AGE resolves an unqualified function only among
+   its own `ag_catalog.age_*` functions, so the safe path rejects every
+   schema-qualified function call (`ns.fn(…)`, back-quoted or nested), and the
+   raw path accepts a qualified function, or any `CALL`, only when its exact
+   `schema.name` is on `FirewallConfig.allowed_qualified_functions` — empty by
+   default; AGE's own catalog schema is not assumed safe.
 3. **Dialect** ([capabilities.py](capabilities.py)) — capability table keyed
    by AGE version: `SUPPORTED` / `EMULATE` (rewrite hook; framework only in
    v1) / `REJECT` (fail loud pre-flight) / `TBD` (unverified: passes through,
@@ -38,7 +45,8 @@ decodes rows with `decode_row`. Everything is `SET LOCAL` because the cloud
 endpoint is a transaction-mode pooler: plain `SET` would bleed across tenants.
 
 Errors: `AgeTranslationError` (parse/emit), `AgeUnsupportedFeature`
-(capability REJECT), `AgeFirewallRejected` (caps/semantics) — all fail loud.
+(capability REJECT), `AgeFirewallRejected` (caps/semantics/qualified calls) —
+all fail loud.
 
 ## Verified AGE 1.5.0 mechanics
 

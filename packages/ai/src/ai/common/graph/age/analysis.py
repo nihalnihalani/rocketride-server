@@ -30,7 +30,9 @@ facts every later stage needs:
 - the RETURN projection (column display names, or ``RETURN *`` / no RETURN),
 - which write clauses appear (typed contexts, not regex),
 - variable-length relationship ranges (for the firewall's depth cap),
-- ``$param`` names, and invoked function names (for the capability table).
+- ``$param`` names, and invoked function names (for the capability table),
+- schema-qualified function and procedure names, as unescaped name segments
+  (for the firewall: a qualified name leaves AGE's own function namespace).
 
 Parsing failures raise :class:`~.errors.AgeTranslationError` with the
 collected syntax messages — the same text the LLM repair loop feeds back.
@@ -78,6 +80,13 @@ class CypherFacts:
     var_length_ranges: List[Tuple[Optional[int], Optional[int]]] = field(default_factory=list)
     param_names: Set[str] = field(default_factory=set)
     function_names: Set[str] = field(default_factory=set)
+    # Function invocations whose name carries a namespace (``ns.fn(...)``), or
+    # whose single back-quoted name contains a dot, as unescaped segments in
+    # source order. AGE resolves unqualified names only among its own
+    # ``ag_catalog.age_*`` functions, so the firewall gates qualified ones.
+    qualified_functions: List[Tuple[str, ...]] = field(default_factory=list)
+    # Every CALLed procedure name (qualified or not), as unescaped segments.
+    procedure_names: List[Tuple[str, ...]] = field(default_factory=list)
     # MERGE ... ON CREATE/ON MATCH actions (capability: merge_on_set).
     has_merge_action: bool = False
     # A label check used as an expression (e.g. WHERE (n:Label)) rather than in
@@ -108,6 +117,21 @@ def _strip_backticks(name: str) -> str:
     if len(name) >= 2 and name.startswith('`') and name.endswith('`'):
         return name[1:-1].replace('``', '`')
     return name
+
+
+def _name_segments(name_ctx) -> Tuple[str, ...]:
+    """Unescaped segments of an ``oC_FunctionName`` / ``oC_ProcedureName``.
+
+    Grammar: ``oC_Namespace oC_SymbolicName`` with ``oC_Namespace : ( oC_SymbolicName '.' )*``.
+    Back-quoted segments are unescaped (a doubled back-quote inside one becomes a
+    single one), so a back-quoted ``ns`` and ``fn`` compare equal to bare ones.
+    """
+    segments: List[str] = []
+    namespace = name_ctx.oC_Namespace()
+    if namespace is not None:
+        segments.extend(_strip_backticks(seg.getText()) for seg in namespace.oC_SymbolicName())
+    segments.append(_strip_backticks(name_ctx.oC_SymbolicName().getText()))
+    return tuple(segments)
 
 
 def _source_text(ctx: ParserRuleContext) -> str:
@@ -214,6 +238,14 @@ def analyze(query: str) -> CypherFacts:
             name_ctx = node.oC_FunctionName()
             if name_ctx is not None:
                 facts.function_names.add(name_ctx.getText().lower())
+                segments = _name_segments(name_ctx)
+                # A dot inside one back-quoted name is not a namespace to AGE,
+                # but it is never a legitimate Cypher function either; treat it
+                # as qualified so the firewall's rule stays simple and strict.
+                if len(segments) > 1 or '.' in segments[0]:
+                    facts.qualified_functions.append(segments)
+        if isinstance(node, CypherParser.OC_ProcedureNameContext):
+            facts.procedure_names.append(_name_segments(node))
         if isinstance(node, CypherParser.OC_MergeActionContext):
             facts.has_merge_action = True
         if isinstance(node, CypherParser.OC_NodeLabelsContext):

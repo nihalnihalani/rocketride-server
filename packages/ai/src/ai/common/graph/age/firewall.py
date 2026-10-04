@@ -33,6 +33,12 @@ Two rule families, applied per the design:
   rejected here before translation; the true guard is the read-only
   transaction the node runs safe queries in (server-side, like FalkorDB's
   RO_QUERY), with this check giving precise, pre-flight errors.
+- **Qualified calls** — both paths. AGE resolves an unqualified function only
+  among its own ``ag_catalog.age_*`` functions, but a schema-qualified name
+  (``ns.fn(...)``) goes to ordinary PostgreSQL function resolution, outside
+  the Cypher function set this layer reasons about. The safe path rejects every
+  qualified function call; the raw path admits only names on an explicit
+  allowlist (empty by default) and gates every CALLed procedure the same way.
 
 Caps are constructor arguments; the node currently wires only
 ``statement_timeout_ms`` through its config (``query_timeout_ms`` in
@@ -42,7 +48,8 @@ sanity-checked against the pinned AGE 1.5.0 container.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import FrozenSet, Tuple
 
 from .analysis import CypherFacts
 from .errors import AgeFirewallRejected
@@ -67,6 +74,11 @@ class FirewallConfig:
     # Applied by the emitter as SET LOCAL statement_timeout in the query's
     # transaction — the database-side resource backstop for both paths.
     statement_timeout_ms: int = DEFAULT_STATEMENT_TIMEOUT_MS
+    # Raw (execute) path only: exact ``schema.function`` names that may be
+    # called qualified, or CALLed as procedures. Compared segment by segment,
+    # case-sensitively, after back-quote unescaping. Never consulted on the safe
+    # path, and deliberately empty: AGE's own catalog schema is not assumed safe.
+    allowed_qualified_functions: FrozenSet[str] = field(default_factory=frozenset)
 
 
 def check_pre_parse(cypher: str, config: FirewallConfig) -> None:
@@ -133,3 +145,39 @@ def check_semantics_readonly(facts: CypherFacts) -> None:
         )
     if facts.has_call:
         raise AgeFirewallRejected('procedure_call', 'CALL is not allowed on the read-only path')
+
+
+def _display(segments: Tuple[str, ...]) -> str:
+    return '.'.join(segments)
+
+
+def _allowed(segments: Tuple[str, ...], config: FirewallConfig) -> bool:
+    return any(tuple(entry.split('.')) == segments for entry in config.allowed_qualified_functions)
+
+
+def check_qualified_calls(facts: CypherFacts, config: FirewallConfig, *, safe: bool) -> None:
+    """Gate schema-qualified function calls (both paths) and raw-path procedures.
+
+    Safe path: every qualified function call is rejected, wherever it sits in
+    the statement (the facts come from a full parse-tree walk). Procedure CALLs
+    are left to :func:`check_semantics_readonly`, which rejects them all.
+
+    Raw path: a qualified function call, or any CALLed procedure, must match an
+    entry of ``config.allowed_qualified_functions`` exactly.
+    """
+    for segments in facts.qualified_functions:
+        if safe or not _allowed(segments, config):
+            where = 'the read-only path' if safe else 'the execute path (not on its allowlist)'
+            raise AgeFirewallRejected(
+                'qualified_function',
+                f'schema-qualified function call {_display(segments)}() is not allowed on {where}; '
+                'use the built-in Cypher functions',
+            )
+    if safe:
+        return
+    for segments in facts.procedure_names:
+        if not _allowed(segments, config):
+            raise AgeFirewallRejected(
+                'procedure_call',
+                f'CALL {_display(segments)} is not allowed on the execute path (not on its allowlist)',
+            )

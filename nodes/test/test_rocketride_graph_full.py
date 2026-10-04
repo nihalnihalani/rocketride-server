@@ -160,6 +160,14 @@ def rr_env(monkeypatch):
     rrdb_mod = _load_from_path('ai.common.rocketride_db', _RRDB_PATH)
     monkeypatch.setitem(sys.modules, 'ai.common.rocketride_db', rrdb_mod)
 
+    # Another test module may have left its own copies of the graph package's
+    # submodules in sys.modules, bound to that module's stubs (e.g. a different
+    # Config). Evict them so the package below re-imports against these stubs;
+    # monkeypatch puts them back afterwards.
+    for name in list(sys.modules):
+        if name == 'ai.common.graph' or name.startswith(('ai.common.graph.', 'nodes.rocketride_graph')):
+            monkeypatch.delitem(sys.modules, name)
+
     # Real graph base package (brings ai.common.graph.age with it).
     graph_pkg = _load_from_path('ai.common.graph', _GRAPH_PKG / '__init__.py', is_package=True)
     monkeypatch.setitem(sys.modules, 'ai.common.graph', graph_pkg)
@@ -302,6 +310,24 @@ class TestSafePath:
         try:
             with pytest.raises(Exception, match='write_clause'):
                 glb._run_query("CREATE (n:Person {name: 'evil'})")
+        finally:
+            glb.endGlobal()
+
+    def test_qualified_function_rejected_before_reaching_db(self, rr_env, age_graph, monkeypatch):
+        """The safe path refuses a schema-qualified call in the translator, so no
+        SQL is ever sent for it (the database is not the control here).
+        """
+        glb = _begin(rr_env)
+        sent = []
+        real_execute_plan = glb._execute_plan
+        monkeypatch.setattr(glb, '_execute_plan', lambda *a, **kw: sent.append(a) or real_execute_plan(*a, **kw))
+        try:
+            for query in ('RETURN pg_catalog.sqrt(25)', 'MATCH (p:Person) RETURN [x IN [1] | `pg_catalog`.`sqrt`(x)]'):
+                with pytest.raises(Exception, match='qualified_function'):
+                    glb._run_query(query)
+                ok, err = glb._validate_query(query)
+                assert not ok and 'qualified_function' in err
+            assert sent == []
         finally:
             glb.endGlobal()
 
