@@ -87,13 +87,15 @@ export function useThemeMode(): 'dark' | 'light' {
 const STYLE_ID = 'graph-ui-canvas-style';
 
 /** Rules the inline styles cannot express: focus rings, selection, label halo, motion. */
-const RULES = [
+export const CANVAS_RULES = [
 	'.graph-ui-canvas .react-flow__node { cursor: pointer; }',
 	'.graph-ui-canvas .react-flow__node:focus { outline: none; }',
 	'.graph-ui-canvas .react-flow__node:focus-visible .graph-ui-circle { outline: 3px solid var(--rr-border-focus, var(--rr-brand)); outline-offset: 3px; }',
 	'.graph-ui-canvas .graph-ui-circle { border: 1px solid var(--rr-text-primary); }',
 	'.graph-ui-canvas .graph-ui-node[data-selected="true"] .graph-ui-circle { box-shadow: 0 0 0 3px var(--rr-brand); }',
 	'.graph-ui-canvas .graph-ui-node[data-expanded="true"] .graph-ui-circle { border-width: 2px; }',
+	// An element the database no longer answers for: dashed and faded, so it is not mistaken for a live one.
+	'.graph-ui-canvas .graph-ui-node[data-stale="true"] .graph-ui-circle { border: 2px dashed var(--rr-text-primary); opacity: 0.55; }',
 	'.graph-ui-canvas .graph-ui-caption { position: absolute; top: 100%; left: 50%; transform: translateX(-50%); margin-top: 5px; max-width: 150px; font-size: 11.5px; line-height: 1.2; text-align: center; color: var(--rr-text-primary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; pointer-events: none; text-shadow: 0 0 3px var(--rr-bg-paper), 0 0 3px var(--rr-bg-paper); }',
 	'.graph-ui-canvas .graph-ui-edge-label { font-size: 10px; fill: var(--rr-text-secondary); paint-order: stroke; stroke: var(--rr-bg-paper); stroke-width: 3px; stroke-linejoin: round; user-select: none; }',
 	'.graph-ui-canvas .react-flow__attribution { display: none; }',
@@ -106,6 +108,6 @@ export function ensureCanvasStyle(): void {
 	if (typeof document === 'undefined' || document.getElementById(STYLE_ID)) return;
 	const el = document.createElement('style');
 	el.id = STYLE_ID;
-	el.textContent = RULES;
+	el.textContent = CANVAS_RULES;
 	document.head.appendChild(el);
 }

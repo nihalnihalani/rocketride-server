@@ -15,7 +15,7 @@
 
 import { collectEntities } from '../../src/graph/results';
 import type { IEntities } from '../../src/graph/results';
-import type { GraphNode, GraphRelationship, GraphValue, ReadQueryResult } from '../../src/graph/types';
+import type { GraphNode, GraphRelationship, GraphValue } from '../../src/graph/types';
 
 /** Build a wire-shaped node. */
 export function node(id: string, labels: string[] = ['Person'], properties: Record<string, GraphValue> = {}): GraphNode {

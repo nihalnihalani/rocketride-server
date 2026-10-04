@@ -14,7 +14,10 @@ import { test } from 'node:test';
 import { CHART_COLOR_VARS, assignLabelColors, colorFor, composite, contrastRatio, hashColor, parseColor, readableOn, stableHash } from '../src/graph/colors';
 import type { Rgb } from '../src/graph/colors';
 import { CAPTION_ID, CAPTION_LABEL, CAPTION_MAX_CHARS, captionChoices, captionOf, defaultCaptionKey } from '../src/graph/captions';
-import { node } from './support/builders';
+import { CANVAS_RULES } from '../src/canvas/environment';
+import { legendOf } from '../src/graph/legend';
+import { modelFromResult } from '../src/graph/model';
+import { entitiesOf, node } from './support/builders';
 
 test('the first six labels (sorted) take the chart colours in order; the rest hash', () => {
 	const labels = ['Zebra', 'Apple', 'Mango', 'Cherry', 'Banana', 'Fig', 'Grape', 'Date'];
@@ -180,4 +183,25 @@ test('caption choices list property names most common first, then the two specia
 	const choices = captionChoices([node('1', ['P'], { name: 'a', age: 1 }), node('2', ['P'], { name: 'b' }), node('3', ['P'], { zip: 'z', name: 'c' })]);
 	assert.deepEqual(choices.map((c) => c.value), ['name', 'age', 'zip', CAPTION_LABEL, CAPTION_ID]);
 	assert.deepEqual(captionChoices([]).map((c) => c.value), [CAPTION_LABEL, CAPTION_ID]);
+});
+
+test('the node outline is unconditional: one plain rule, not nested in a media or supports block, and focus is always visible', () => {
+	const rules = CANVAS_RULES.split('\n');
+	const outline = rules.find((r) => r.includes('.graph-ui-circle') && r.includes('border: 1px solid var(--rr-text-primary)'));
+	assert.ok(outline, 'the circle has a 1px --rr-text-primary border');
+	assert.ok(!outline.trimStart().startsWith('@'), 'and it is not behind an at-rule');
+	assert.ok(rules.some((r) => r.includes(':focus-visible') && r.includes('outline: 3px solid')), 'a thick focus ring on the focused node');
+	// Motion is opt-in: the only transition lives under prefers-reduced-motion: no-preference.
+	const transitions = rules.filter((r) => r.includes('transition'));
+	assert.ok(transitions.length > 0 && transitions.every((r) => r.startsWith('@media (prefers-reduced-motion: no-preference)')));
+});
+
+test('the legend names every label on the canvas with its colour and a count of the DRAWN nodes', () => {
+	const model = modelFromResult(entitiesOf([node('1', ['Person']), node('2', ['Person', 'Employee']), node('3', ['Company']), node('4', []), node('5', ['Person'])], []));
+	const colors = assignLabelColors(['Company', 'Person', 'Employee']);
+	const legend = legendOf(model, colors);
+	assert.deepEqual(legend.map((e) => [e.name, e.count]), [['Person', 3], ['(no label)', 1], ['Company', 1]], 'Employee is a second label: it does not set the colour, so it is not a legend line');
+	assert.equal(legend[0].fill, 'var(--rr-chart-red)', 'sorted labels Company, Employee, Person take blue, green, red');
+	assert.equal(legend.find((e) => e.name === '(no label)')?.fill, 'var(--rr-grey-400)');
+	assert.deepEqual(legendOf(modelFromResult(entitiesOf([], [])), colors), []);
 });

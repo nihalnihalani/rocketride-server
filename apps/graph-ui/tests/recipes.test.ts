@@ -9,7 +9,7 @@
 
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { AGE_CONNECT_MAX_NODES, connectNodes, expandNeighbors, idPredicate, inspectNode, isRefusal, labelPreview, majorVersion, pathAtDepth } from '../src/cypher/recipes';
+import { AGE_CONNECT_MAX_NODES, connectNodes, expandNeighbors, idPredicate, inspectNode, isRefusal, labelPreview, majorVersion, pathAtDepth, typePreview } from '../src/cypher/recipes';
 import type { IEngine, IRecipe, RecipeResult } from '../src/cypher/recipes';
 import { createPathSearch, noPathText } from '../src/cypher/pathSearch';
 import type { ReadQueryResult } from '../src/graph/types';
@@ -67,6 +67,7 @@ test('every generated query is a read by the app classifier', () => {
 	for (const engine of ENGINES) {
 		const all = [
 			recipe(labelPreview(engine, 'Person')),
+			recipe(typePreview(engine, 'KNOWS')),
 			recipe(inspectNode(engine, '1')),
 			recipe(expandNeighbors(engine, '1', 100, 5)),
 			recipe(connectNodes(engine, ['1', '2', '3'], 2000)),
@@ -280,4 +281,11 @@ test('refusals: the same node twice, an unsupported Neo4j, and an unusable id', 
 	assert.equal((await createPathSearch({ engine: ENGINES[0], run }).start('a', 'a')).status, 'refused');
 	assert.equal((await createPathSearch({ engine: { dialect: 'neo4j', version: '4.4' }, run }).start('a', 'b')).status, 'refused');
 	assert.equal((await createPathSearch({ engine: ENGINES[0], run }).start('', 'b')).status, 'refused');
+});
+
+test('a relationship type preview quotes the type for the dialect and returns both ends', () => {
+	assert.equal(recipe(typePreview(ENGINES[0], 'KNOWS')).cypher, 'MATCH (a)-[r:`KNOWS`]->(b) RETURN a, r, b LIMIT 25');
+	assert.equal(recipe(typePreview(ENGINES[2], 'WORKS_AT')).cypher, 'MATCH (a)-[r:WORKS_AT]->(b) RETURN a, r, b LIMIT 25');
+	assert.ok(isRefusal(typePreview(ENGINES[2], 'works at')));
+	assert.ok(isRefusal(typePreview(ENGINES[1], 'bad\nname')));
 });

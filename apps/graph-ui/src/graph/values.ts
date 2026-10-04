@@ -303,6 +303,22 @@ function describeProps(map: { [key: string]: GraphValue }, depth: number): strin
 }
 
 /**
+ * Full (unclipped) text for a value, for the inspector: strings as they are,
+ * scalars and tags by their text, containers as compact JSON (precision-safe,
+ * because tagged numbers are text already).
+ *
+ * @param value - A property or cell value.
+ * @returns Text.
+ */
+export function valueText(value: unknown): string {
+	if (typeof value === 'string') return value;
+	if (value === null || value === undefined) return 'null';
+	if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+	if (isGraphNumber(value) || isGraphTemporal(value) || isGraphPoint(value) || isGraphBytes(value)) return describeValue(value);
+	return toJsonText(value, 0);
+}
+
+/**
  * Whether a cell value is a graph entity (node, relationship or path).
  *
  * @param value - A cell value.

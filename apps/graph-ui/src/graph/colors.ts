@@ -43,8 +43,14 @@
 // TYPES AND TOKENS
 // =============================================================================
 
-/** The shell's chart colour tokens, in assignment order. */
-export const CHART_COLOR_VARS = ['--rr-chart-blue', '--rr-chart-green', '--rr-chart-yellow', '--rr-chart-purple', '--rr-chart-orange', '--rr-chart-red'] as const;
+/**
+ * The shell's chart colour tokens, in assignment order. The order keeps the colours
+ * that look alike apart: in the light themes yellow and orange are nearly the same
+ * colour (measured in a real shell: #e67700 and #e67a2e) and blue and purple are close,
+ * so yellow comes last and purple fifth: a connection with up to four labels never
+ * shows a confusable pair, and one with more still has the label initial and the legend.
+ */
+export const CHART_COLOR_VARS = ['--rr-chart-blue', '--rr-chart-green', '--rr-chart-red', '--rr-chart-orange', '--rr-chart-purple', '--rr-chart-yellow'] as const;
 
 /** One label's colour. */
 export interface ILabelColor {

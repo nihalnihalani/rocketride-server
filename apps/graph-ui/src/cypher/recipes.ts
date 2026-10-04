@@ -169,6 +169,22 @@ export function labelPreview(engine: IEngine, label: string, limit: number = PRE
 }
 
 /**
+ * The first relationships of a type, with both end nodes (the schema sidebar's
+ * click on a relationship type).
+ *
+ * @param engine - The engine.
+ * @param type - A relationship type exactly as the schema reports it.
+ * @param limit - Relationships to fetch (default 25).
+ * @returns The recipe, or why there is none.
+ */
+export function typePreview(engine: IEngine, type: string, limit: number = PREVIEW_LIMIT): RecipeResult {
+	const quoted = quoteIdentifier(type, engine.dialect);
+	if (quoted === null) return { refusal: `The relationship type "${printable(type)}" cannot be put in a generated query on this engine. Write the query by hand if it must be browsed.` };
+	const n = clampInt(limit, 1, 1000);
+	return { cypher: `MATCH (a)-[r:${quoted}]->(b) RETURN a, r, b LIMIT ${n}`, params: {}, limit: n };
+}
+
+/**
  * One node by id (the inspector's refresh, and the stale-handle check).
  *
  * @param engine - The engine.
