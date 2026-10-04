@@ -78,8 +78,13 @@ export interface IBatchHooks<TRun extends IStatementRunBase, TSend, TResult, TNo
 	execute(run: TRun, send: TSend, ticket: IGenerationTicket): Promise<TResult>;
 	/** Turn the answer into the settled fields (outcome, row count, rows…). */
 	settle(run: TRun, result: TResult, ms: number): Partial<TRun>;
-	/** Read a failed statement's message. */
-	describeFailure(message: string): TNotice;
+	/**
+	 * Read a failed statement. Receives the message AND the original thrown
+	 * value, so an app can tell an ExplorerToolError's `kind` (upgrade, timeout,
+	 * malformed, unavailable…) and its headline/detail apart instead of
+	 * re-parsing text.
+	 */
+	describeFailure(message: string, error: unknown): TNotice;
 	/** The sentence about the statements BEFORE a failure ('' when none). */
 	formatPrior?(runs: TRun[], failedIndex: number): string;
 	/** Called once for every finished statement (rows, affected, error, abandoned). */
@@ -186,7 +191,7 @@ export async function runStatementBatch<TRun extends IStatementRunBase, TSend, T
 			// session-level stale marker is exactly that: drop, never show.
 			if (!ticket.isCurrent() || isStaleError(error)) return 'dropped';
 			const message = error instanceof Error ? error.message : String(error);
-			const notice = hooks.describeFailure(message);
+			const notice = hooks.describeFailure(message, error);
 			results[i] = { ...(results[i] as TRun), outcome: 'error', error: message, ms: now() - started };
 			for (let j = i + 1; j < results.length; j++) results[j] = { ...(results[j] as TRun), outcome: 'skipped' };
 			view.runs([...results]);
