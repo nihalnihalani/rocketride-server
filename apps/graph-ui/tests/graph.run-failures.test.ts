@@ -9,9 +9,11 @@
 
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { describeFailure } from '../src/graph/failures';
+import { formatBatchOutcome, formatPriorStatements } from 'shared/explorer';
+import type { IStatementRunBase } from 'shared/explorer';
+import { describeFailure, describeFailureMessage } from '../src/graph/failures';
 import type { IFailureInput } from '../src/graph/failures';
-import { prepareStatement, refuseNonReads, toHistoryEntry } from '../src/graph/runConfig';
+import { GRAPH_BATCH_WORDS, prepareStatement, refuseNonReads, toHistoryEntry } from '../src/graph/runConfig';
 import { parseDialect } from '../src/graph/dialect';
 import { fixture } from './support/builders';
 
@@ -128,4 +130,30 @@ test('a history entry holds the statement and the run, and nothing else', () => 
 	assert.equal(failed.error, 'boom');
 	assert.ok(!('rows' in failed));
 	assert.ok(!JSON.stringify(entry).includes('token'));
+});
+
+test('the shared runner hands over the message only: the kinds the session writes are recognised by their fixed wording', () => {
+	assert.equal(describeFailureMessage('Stopped waiting for read_query after 40 s. The node may still be running it; there is no way to cancel it from here.', false).variant, 'warning');
+	assert.match(describeFailureMessage('This node cannot run read_query: it does not advertise "read_query". Update the pipeline\'s node to a version that supports it.', true).headline, /does not support read_query yet/);
+	assert.match(describeFailureMessage("No running task for pipeline 'P'. Start the pipeline and retry.", false).hint ?? '', /Start the pipeline/);
+	assert.match(describeFailureMessage('read_query returned a malformed result: columns is not an array', false).hint ?? '', /may need an upgrade/);
+	const refused = describeFailureMessage(errors.refused_write, false);
+	assert.equal(refused.headline, 'Refused: read_query is read-only; this statement writes (CREATE)');
+	assert.equal(refused.verbatim, 'Use the write console (execute) on a node with allow_execute enabled.', 'the node\'s remaining lines are the verbatim "Database said" text');
+	assert.equal(refused.generic, false);
+	const plain = describeFailureMessage('Something odd', false);
+	assert.equal(plain.headline, 'Something odd');
+	assert.equal(plain.verbatim, '');
+	// A node message that merely mentions these words is not mistaken for a session message.
+	assert.equal(describeFailureMessage('Query failed\nDatabase said: Stopped waiting for lock after 3 s.', false).variant, 'error');
+});
+
+test('Graph\'s batch words never claim a rollback and name nothing as committed', () => {
+	const run = (index: number, kind: string, outcome: IStatementRunBase['outcome']): IStatementRunBase => ({ index, kind, verb: kind.toUpperCase(), outcome });
+	const reads = [run(0, 'read', 'rows'), run(1, 'read', 'rows'), run(2, 'read', 'error')];
+	assert.equal(formatPriorStatements(reads, 2, GRAPH_BATCH_WORDS), 'Statements 1\u20132 already ran.');
+	const writes = [run(0, 'write', 'rows'), run(1, 'read', 'error')];
+	assert.equal(formatPriorStatements(writes, 1, GRAPH_BATCH_WORDS), 'Statement 1 already executed on the database: each statement is a separate request, so nothing is rolled back.');
+	assert.equal(formatBatchOutcome([run(0, 'read', 'rows'), run(1, 'write', 'rows'), run(2, 'write', 'error'), run(3, 'write', 'skipped')], GRAPH_BATCH_WORDS), '1 ran \u00b7 2 executed \u00b7 3 failed \u00b7 4 not run');
+	for (const text of [GRAPH_BATCH_WORDS.changed, GRAPH_BATCH_WORDS.priorChanged('x'), GRAPH_BATCH_WORDS.priorRead('x')]) assert.ok(!/committed|atomic|transaction/i.test(text.replace('nothing is rolled back', '')), text);
 });

@@ -44,6 +44,7 @@
 //                                user never sees it.
 // =============================================================================
 
+import type { IFailureNotice as ISharedFailureNotice } from 'shared/explorer';
 import { GRID_NOTICE, STOP_WAITING_NOTE, UPGRADE_READ_QUERY } from './wording';
 
 /** What the shared tool session threw, reduced to what this module reads. */
@@ -59,12 +60,15 @@ export interface IFailureInput {
 	code?: string;
 }
 
-/** A failure as the banner shows it. */
-export interface IFailureNotice {
-	/** `error` for a failure, `info` for a notice that is not the user's fault. */
+/**
+ * A failure as the banner shows it. It extends the shared notice (`headline`, the
+ * verbatim "Database said" text, and whether the node withheld its text) with
+ * what only Graph Explorer knows: a variant, one hint, and whether to drop it.
+ */
+export interface IFailureNotice extends ISharedFailureNotice {
+	/** `error` for a failure, `warning` for one that is not a bug, `info` for a notice. */
 	variant: 'error' | 'warning' | 'info';
-	headline: string;
-	/** The node's text under "Database said". */
+	/** The node's text under "Database said"; the same text as `verbatim`. */
 	detail: string;
 	/** One sentence on what to do next, or null. */
 	hint: string | null;
@@ -89,6 +93,18 @@ const UNKNOWN_TOOL = /no handler found for tool/i;
  * @returns The notice.
  */
 export function describeFailure(error: IFailureInput, canWrite: boolean): IFailureNotice {
+	const notice = describeKind(error, canWrite);
+	return { ...notice, verbatim: notice.detail, generic: false };
+}
+
+/**
+ * The notice before the shared fields are filled in.
+ *
+ * @param error - The failure.
+ * @param canWrite - Whether this endpoint shows a write console.
+ * @returns The notice without `verbatim` and `generic`.
+ */
+function describeKind(error: IFailureInput, canWrite: boolean): Omit<IFailureNotice, 'verbatim' | 'generic'> {
 	if (error.kind === 'stale') return { variant: 'info', headline: '', detail: '', hint: null, ignore: true };
 	const base = { detail: error.detail ?? '', ignore: false };
 
@@ -108,6 +124,30 @@ export function describeFailure(error: IFailureInput, canWrite: boolean): IFailu
 	if (/^Query timed out/i.test(error.headline)) return { ...base, variant: 'warning', headline: error.headline, hint: 'The node stopped the query. Narrow it, or lower the row limit.' };
 	if (/^Invalid read_query input/i.test(error.headline)) return { ...base, variant: 'error', headline: error.headline, hint: null };
 	return { ...base, variant: 'error', headline: error.headline || error.message, hint: null };
+}
+
+/** Messages the shared session writes itself, by the kind they stand for. */
+const SESSION_MESSAGES: ReadonlyArray<readonly [string, RegExp]> = [
+	['timeout', /^Stopped waiting for \S+ after \d+ s\./],
+	['upgrade', /^This node cannot run \S+: it does not advertise/],
+	['unavailable', /^No running task for pipeline /],
+	['malformed', /returned a malformed result|needs an object for its input/],
+];
+
+/**
+ * Describe a failure from its verbatim message alone. The shared statement runner
+ * hands `describeFailure` the message, not the error, so the kinds the session
+ * writes itself are recognised by their fixed wording; anything else is the
+ * node's own text (a refusal, an AGE hint, a database error) and is read as such.
+ *
+ * @param message - The error message.
+ * @param canWrite - Whether this endpoint shows a write console.
+ * @returns The notice.
+ */
+export function describeFailureMessage(message: string, canWrite: boolean): IFailureNotice {
+	const at = message.indexOf('\n');
+	const kind = SESSION_MESSAGES.find(([, pattern]) => pattern.test(message))?.[0] ?? 'raised';
+	return describeFailure({ kind, tool: '', message, headline: (at === -1 ? message : message.slice(0, at)).trim(), ...(at === -1 ? {} : { detail: message.slice(at + 1).trim() }) }, canWrite);
 }
 
 /** Re-exported so the canvas notice and the failure strip share one place for their wording. */

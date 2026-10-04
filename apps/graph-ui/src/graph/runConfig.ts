@@ -42,6 +42,7 @@ import { classifyStatement, patternCheck } from '../cypher/classify';
 import { splitStatements } from '../cypher/split';
 import type { IPatternFinding, StatementKind } from '../cypher/classify';
 import type { IHistoryEntry } from 'shared/explorer';
+import type { IBatchWords } from 'shared/explorer/runner/format';
 import { rowLimitFor } from './dialect';
 import type { IGraphDialect } from './dialect';
 
@@ -118,3 +119,13 @@ export function toHistoryEntry(run: IRunSummary, id: string): IHistoryEntry<'cyp
 	if (run.error !== undefined) entry.error = run.error;
 	return entry;
 }
+
+/**
+ * The words the shared batch summary and the failure banner use for Graph: every
+ * statement is its own request, so a failed batch never claims a rollback.
+ */
+export const GRAPH_BATCH_WORDS: Pick<IBatchWords, 'changed' | 'priorChanged' | 'priorRead'> = {
+	changed: 'executed',
+	priorChanged: (span) => `${span} already executed on the database: each statement is a separate request, so nothing is rolled back.`,
+	priorRead: (span) => `${span} already ran.`,
+};

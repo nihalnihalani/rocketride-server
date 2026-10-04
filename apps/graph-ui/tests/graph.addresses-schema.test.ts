@@ -15,7 +15,7 @@ import type { IFailureNotice } from '../src/graph/failures';
 import { fixture } from './support/builders';
 
 const KEY = 'k1|dev|user|u1|t1|p1|tools=tools_1|graph_1';
-const notice = (headline: string): IFailureNotice => ({ variant: 'error', headline, detail: '', hint: null, ignore: false });
+const notice = (headline: string): IFailureNotice => ({ variant: 'error', headline, detail: '', verbatim: '', generic: false, hint: null, ignore: false });
 
 test('every document address round-trips to its connection key, and the landing has none', () => {
 	assert.equal(endpointKeyFromUri(workbenchUri(KEY)), KEY);
