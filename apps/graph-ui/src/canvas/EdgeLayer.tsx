@@ -48,6 +48,7 @@ import { edgeShape } from '../graph/geometry';
 import type { IEdgeSlot, Point } from '../graph/geometry';
 import type { GraphId } from '../graph/types';
 import { NODE_DIAMETER } from './GraphNodeView';
+import { ACCENT_TOKEN, EDGE_TOKEN } from './tokens';
 
 /** One relationship as the layer draws it. */
 export interface IEdgeDraw {
@@ -82,7 +83,7 @@ interface IEdgeProps {
  */
 function EdgeShapeImpl({ ax, ay, bx, by, slot, type, ariaLabel, highlighted }: IEdgeProps): React.ReactElement {
 	const shape = edgeShape({ x: ax, y: ay }, { x: bx, y: by }, slot, NODE_DIAMETER / 2, NODE_DIAMETER / 2);
-	const stroke = highlighted ? 'var(--rr-brand)' : 'var(--rr-text-secondary)';
+	const stroke = highlighted ? `var(${ACCENT_TOKEN})` : `var(${EDGE_TOKEN})`;
 	return (
 		<g className="graph-ui-edge" role="img" aria-label={ariaLabel}>
 			<title>{type}</title>

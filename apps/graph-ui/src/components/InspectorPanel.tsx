@@ -32,7 +32,8 @@
 // =============================================================================
 
 import React, { useMemo } from 'react';
-import { Banner, Button, Chip, DetailPanel, LabelValue, Section } from 'shell';
+import { Banner, Button, DetailPanel, LabelValue, Section } from 'shell';
+import { CHIP_TEXT_TOKEN } from '../canvas/tokens';
 import { captionOf } from '../graph/captions';
 import type { IGraphSession, IGraphState, IInspectTarget } from '../graph/graphSession';
 import { STALE_ELEMENT_TEXT } from '../graph/identity';
@@ -47,6 +48,19 @@ export interface IInspectorPanelProps {
 	session: IGraphSession;
 	captions: ReadonlyMap<string, string>;
 	announce(text: string): void;
+}
+
+/** A label or type, as a small pill. Its text is the primary text colour: the shell's chip draws its text in the info colour, which is 3.5:1 on this panel in RocketRide Light. */
+const chipStyle: React.CSSProperties = { display: 'inline-block', margin: '0 6px 4px 0', padding: '1px 9px', borderRadius: 11, fontSize: 12, lineHeight: '18px', color: `var(${CHIP_TEXT_TOKEN})`, background: 'var(--rr-bg-paper)', border: '1px solid var(--rr-border)' };
+
+/**
+ * One label or type pill.
+ *
+ * @param props.label - The text.
+ * @returns The pill.
+ */
+function LabelChip({ label }: { label: string }): React.ReactElement {
+	return <span style={chipStyle}>{label}</span>;
 }
 
 /**
@@ -106,7 +120,7 @@ export const InspectorPanel: React.FC<IInspectorPanelProps> = ({ state, session,
 			)}
 			{state.notice && state.busy === null && target.kind === 'node' && <Banner variant={state.notice.variant}>{state.notice.text}</Banner>}
 			<Section label={m.kind === 'node' ? 'Labels' : 'Type'}>
-				{m.tags.length === 0 ? <span style={{ color: 'var(--rr-text-secondary)' }}>none</span> : m.tags.map((tag) => <Chip key={tag} label={tag} />)}
+				{m.tags.length === 0 ? <span style={{ color: 'var(--rr-text-secondary)' }}>none</span> : m.tags.map((tag) => <LabelChip key={tag} label={tag} />)}
 			</Section>
 			<Section label="Identity">
 				<LabelValue label="id" mono>{m.id}</LabelValue>

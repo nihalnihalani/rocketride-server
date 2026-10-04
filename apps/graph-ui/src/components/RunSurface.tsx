@@ -49,7 +49,7 @@ import { useGraphEndpoints, useSchema } from '../adapters/react';
 import { describeSnapshot, targetsFromEditor } from '../cypher/targets';
 import type { IEditorSnapshot } from '../cypher/targets';
 import { DEFAULT_ROW_LIMIT, ROW_LIMIT_CHOICES } from '../graph/budgets';
-import { canWrite as dialectCanWrite, parseDialect, rowLimitFor } from '../graph/dialect';
+import { canWrite as dialectCanWrite, parseDialect, rowLimitChip } from '../graph/dialect';
 import { describeFailureOf } from '../graph/failures';
 import type { IFailureNotice } from '../graph/failures';
 import { mayHaveChangedData } from '../graph/dataVersion';
@@ -380,7 +380,10 @@ export const RunSurface: React.FC<IRunSurfaceProps> = ({ endpoint, mode, loadReq
 					)}
 					{runner.canStop && <Button variant="ghost" title={STOP_WAITING_NOTE} onClick={() => runner.stopWaiting()}>Stop waiting</Button>}
 					{onOpenHistory && <Button variant="ghost" onClick={onOpenHistory}>History</Button>}
-					{mode === 'read' && dialect && <StatusBadge variant="muted">{`limit ${rowLimitFor(limitChoice, dialect).toLocaleString('en-US')}`}</StatusBadge>}
+					{mode === 'read' && dialect && (() => {
+						const chip = rowLimitChip(limitChoice, dialect);
+						return <span title={chip.title ?? undefined}><StatusBadge variant="muted">{chip.text}</StatusBadge></span>;
+					})()}
 					<span style={styles.willRun}>{runner.running ? 'Running…' : willRun}</span>
 				</div>
 			</div>

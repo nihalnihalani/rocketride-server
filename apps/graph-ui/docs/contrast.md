@@ -74,3 +74,24 @@ Best text colour on each chart-colour fill (black or white, whichever is higher)
 Meeting a contrast ratio is not the same as meeting WCAG for the whole canvas.
 Focus visibility, keyboard operation, reduced motion and screen-reader behaviour
 are checked separately (README, "Accessibility").
+
+## Accent, labels, pills and editor tokens
+
+Measured by `tests/a11y.contrast.test.ts` against all six shipped themes, on both backgrounds the
+canvas and its panels sit on (`--rr-bg-default` and `--rr-bg-paper`). The pairs are the constants in
+`src/canvas/tokens.ts`, so changing a colour in the code changes what is measured.
+
+- **Accent** (a highlighted relationship, the selection ring, the focus ring): `--rr-border-focus`,
+  at least 3:1 everywhere (lowest: RocketRide Light 3.22:1 on paper). It replaced `--rr-brand`, which is
+  1.9:1 against the page in RocketRide Light, so a highlighted path was fainter than an ordinary one. A
+  highlighted relationship is also a thicker line (2 against 1.4), so colour is not the only difference.
+- **Relationship type labels** (10 px): `--rr-text-primary`, at least 7.4:1. They were drawn in
+  `--rr-text-secondary`, which is 3.8:1 in RocketRide Dark.
+- **Inspector label pills**: `--rr-text-primary` on paper. The shell's chip draws its text in the info colour,
+  3.46:1 on the panel in RocketRide Light.
+- **Editor tokens**: Monaco's own `vs` / `vs-dark` colours are kept where they reach 4.5:1 on the editor
+  background and otherwise moved along their own lightness until they do (`src/components/editorTheme.ts`).
+  They failed in three themes (for example the label token `:Person`, 3.85:1 in RocketRide Light, and the
+  comment colour, 2.42:1 in Gray); nothing is written per theme.
+- Small secondary text elsewhere in the app uses the shell's `--rr-text-secondary`, which is a platform
+  decision and is not restyled here.
