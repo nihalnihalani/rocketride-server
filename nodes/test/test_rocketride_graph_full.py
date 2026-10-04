@@ -244,8 +244,9 @@ class TestLifecycle:
             assert glb.graph_name == GRAPH
             assert set(glb.graph_schema['nodes']) == {'Person', 'Company'}
             props = dict(glb.graph_schema['nodes']['Person'])
-            assert props.get('name') == 'str'
-            assert props.get('age') == 'int'
+            # One type vocabulary across engines (schema v2); was Python names.
+            assert props.get('name') == 'string'
+            assert props.get('age') == 'integer'
             rel_types = {r['type'] for r in glb.graph_schema['relationships']}
             assert rel_types == {'KNOWS', 'WORKS_AT'}
             knows = next(r for r in glb.graph_schema['relationships'] if r['type'] == 'KNOWS')
@@ -427,8 +428,15 @@ class TestInstanceTools:
         inst = rr_env.iinstance_cls()
         inst.IGlobal = glb
         try:
-            assert inst.dialect({}) == {'dialect': 'age'}
+            dialect = inst.dialect({})
+            assert dialect['dialect'] == 'age'
+            assert dialect['engine'] == {'name': 'Apache AGE', 'version': '1.5.0', 'edition': None}
+            assert dialect['graph'] == GRAPH and dialect['database'] == 'rrtenant'
+            assert dialect['capabilities']['read_query'] is True and dialect['capabilities']['shortest_path'] is False
+            assert dialect['read_boundary'] == 'read_only_tx' and dialect['allow_execute'] is False
+            assert 'rrpass' not in str(dialect) and '5543' not in str(dialect)  # no credentials or hosts
             schema = inst.get_schema({})
             assert 'Person' in schema['labels']
+            assert schema['schema']['version'] == 2 and schema['schema']['error'] is None
         finally:
             glb.endGlobal()

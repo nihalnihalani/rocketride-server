@@ -11,6 +11,16 @@ in both setups and is documented once, publicly, at
 (source: `docs/public/product/guides/apps/index.md`). Only the project setup differs,
 and that difference is what this page covers.
 
+## Related contributor pages
+
+- [Explorer library](explorer-library.md): the shared code under
+  `apps/shared/src/explorer/` that SQL Explorer and Graph Explorer compile in
+  (discovery, tool sessions, history, the statement runner).
+- [App Builder](appdev.md): the VS Code surface for developing, previewing and
+  deploying apps.
+- [Webview protocol](webview-protocol.md): the messages the VS Code extension's
+  webviews exchange.
+
 ## Standalone vs monorepo
 
 | | Standalone | Monorepo |
@@ -125,6 +135,23 @@ packages:
 pnpm install
 ./builder my-app:build
 ```
+
+### Trying a production build on a local engine
+
+`./builder my-app:build` registers the app in `apps.json` and copies the bundle
+into `dist/server/static/apps/`. A local engine does not serve that copy
+directly: at startup it seeds `apps.json` into its app registry and serves
+`/apps/<app id>/v<N>/...` from the registry, with `cache-control: private,
+max-age=3600`. It seeds a new version only when the manifest's `version`
+changes, so a rebuild at the same version keeps serving the first seeded
+bundle. To try a rebuild:
+
+- start the engine with a fresh store, e.g.
+  `RR_STORE_URL=filesystem:///tmp/my-app-store ./engine ai/eaas.py`, which also
+  keeps test runs out of your default `~/.rocketlib/store`;
+- load the shell in a fresh browser profile or from another origin
+  (`localhost` instead of `127.0.0.1`): a hard reload does not refetch a
+  Module Federation remote that the browser has cached.
 
 ### Builder tasks (`scripts/tasks.js`)
 

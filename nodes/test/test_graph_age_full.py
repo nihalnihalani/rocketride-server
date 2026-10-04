@@ -612,3 +612,110 @@ class TestCapabilityProbes:
     @pytest.mark.parametrize('statement', ['RETURN timestamp()', 'RETURN toString(1)', 'MATCH (n) RETURN keys(n)'])
     def test_supported_construct_runs_on_live_age(self, rr_env, age_graph, statement):
         _cypher_admin(statement)
+
+
+class TestSchemaAndDialect:
+    def test_refresh_contents_and_estimated_counts(self, rr_env, age_graph):
+        from .test_rocketride_graph_full import GRAPH
+
+        _cypher_admin(
+            "MATCH (a:Person {name: 'carol'}) CREATE (a)-[:WORKS_AT {since: 2024}]->(:Company {name: 'Beta'})"
+        )
+        conn = _admin()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(f'ANALYZE "{GRAPH}"."Person"')
+                cur.execute(f'ANALYZE "{GRAPH}"."KNOWS"')
+        finally:
+            conn.close()
+        glb = _begin(rr_env)
+        inst = _instance(rr_env, glb)
+        try:
+            block = inst.refresh_schema({})['schema']
+            labels = {label['name']: label for label in block['labels']}
+            assert set(labels) == {'Person', 'Company'}
+            assert labels['Person']['count'] == 3 and labels['Person']['count_estimated'] is True
+            assert {p['name']: p['types'] for p in labels['Person']['properties']} == {
+                'age': ['integer'],
+                'name': ['string'],
+            }
+            rels = {r['type']: r for r in block['relationship_types']}
+            assert rels['KNOWS']['endpoints'] == [{'start': 'Person', 'end': 'Person', 'observed': True}]
+            assert rels['KNOWS']['properties'] == [{'name': 'since', 'types': ['integer']}]
+            assert rels['KNOWS']['count'] == 2 and rels['KNOWS']['count_estimated'] is True
+            works = rels['WORKS_AT']
+            assert works['endpoints'] == [{'start': 'Person', 'end': 'Company', 'observed': True}]
+            assert works['properties'] == [{'name': 'since', 'types': ['integer']}]
+            assert block['error'] is None and block['stale'] is False
+        finally:
+            glb.endGlobal()
+
+    def test_refresh_shows_a_change_made_by_execute(self, rr_env, age_graph):
+        glb = _begin(rr_env, {'allow_execute': True})
+        inst = _instance(rr_env, glb)
+        try:
+            inst.execute({'query': "CREATE (:Later {k: 1})-[:LATER_REL {w: 1.5}]->(:Person {name: 'z'})"})
+            assert 'Later' not in inst.get_schema({})['labels']
+            out = inst.refresh_schema({})
+            assert 'Later' in out['labels']
+            later = {r['type']: r for r in out['schema']['relationship_types']}['LATER_REL']
+            assert later['endpoints'] == [{'start': 'Later', 'end': 'Person', 'observed': True}]
+            assert later['properties'] == [{'name': 'w', 'types': ['float']}]
+        finally:
+            glb.endGlobal()
+
+    def test_refresh_beside_reads_and_an_uncommitted_write(self, rr_env, age_graph):
+        glb = _begin(rr_env, {'allow_execute': True})
+        inst = _instance(rr_env, glb)
+        age = _age()
+        write = glb._translate('CREATE (:Uncommitted {k: 1})', mode=age.TranslateMode.RAW)
+        write.statements.append('SELECT pg_sleep(1.0)')
+        write.binds.append(())
+        write.result_index = len(write.statements) - 1
+        started = threading.Event()
+
+        def run_write():
+            started.set()
+            return glb._execute_plan(write, fetch_cap=1)
+
+        def run_refresh():
+            started.wait(5)
+            time.sleep(0.4)  # inside the writer's transaction, before its COMMIT
+            return inst.refresh_schema({})['schema']
+
+        def run_read():
+            started.wait(5)
+            time.sleep(0.4)
+            return inst.read_query({'cypher': 'MATCH (p:Person) RETURN count(p)'})['rows']
+
+        try:
+            results, errors = _run_threads({'write': run_write, 'refresh': run_refresh, 'read': run_read})
+            assert not errors, errors
+            assert 'Uncommitted' not in {label['name'] for label in results['refresh']['labels']}
+            assert results['read'] == [[3]]
+            assert 'Uncommitted' in inst.refresh_schema({})['labels']  # visible once committed
+        finally:
+            glb.endGlobal()
+
+    def test_failed_refresh_keeps_the_last_good_schema(self, rr_env, age_graph, monkeypatch):
+        glb = _begin(rr_env)
+        inst = _instance(rr_env, glb)
+        try:
+            good = inst.get_schema({})['schema']
+            monkeypatch.setattr(sys.modules['ai.common.graph.graph_global_base'], 'SCHEMA_REFRESH_BUDGET_MS', 0)
+            stale = inst.refresh_schema({})['schema']
+            assert stale['stale'] is True and stale['error'] and stale['labels'] == good['labels']
+        finally:
+            glb.endGlobal()
+
+    def test_dialect_and_prompt(self, rr_env, age_graph):
+        glb = _begin(rr_env)
+        inst = _instance(rr_env, glb)
+        try:
+            out = inst.dialect({})
+            assert out['engine']['version'] == '1.5.0' and out['capabilities']['shortest_path'] is False
+            assert out['read_boundary'] == 'read_only_tx' and out['limits']['statement_timeout_ms'] == 30000
+            rules = ' '.join(glb._prompt_rules())
+            assert 'Apache AGE 1.5.0' in rules and 'elementId()' in rules and 'at most 10' in rules
+        finally:
+            glb.endGlobal()

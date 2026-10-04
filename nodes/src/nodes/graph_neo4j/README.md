@@ -48,6 +48,7 @@ The functions are registered under the `neo4j` service prefix: for example,
 | --- | --- |
 | `neo4j.get_data` | Turn a natural-language request into a read-only Cypher query, run it, and return rows. |
 | `neo4j.get_schema` | Return the reflected labels, properties, and relationship types. |
+| `neo4j.refresh_schema` | Re-read the schema now and return it like `get_schema`. |
 | `neo4j.get_query` | Return generated read-only Cypher without executing it. |
 | `neo4j.read_query` | Run Cypher you wrote, read-only, and return positional rows in the shared graph result shape. |
 | `neo4j.execute` | Run raw Cypher only when direct execution is enabled. |
@@ -88,7 +89,38 @@ raise an error whose first line is a short headline (`Refused: …`,
 `Query failed`) and whose remaining lines are the database's own message.
 
 The same procedure and clause checks now also apply to the Cypher that
-`get_data` generates. `dialect` accepts no
+`get_data` generates.
+
+Neo4j refuses a result that names the same column twice, so `read_query`
+columns are always distinct here (rows stay positional all the same).
+
+`get_schema` and `refresh_schema` return the legacy `{labels, nodes,
+relationships}` keys plus a `schema` block (version 2): labels and
+relationship types with every observed property type (string, integer, float,
+boolean, list, map, temporal, point), relationship endpoint label pairs seen on
+sampled data, counts, and `sampled`, `truncated`, `refreshed_at`, `source`,
+`stale`, `error` and `capable`. The schema is read at start and again on
+`refresh_schema`, bounded to 200 labels, 100 relationship types and 100
+sampled rows each, within a 60-second budget. A refresh is all-or-nothing:
+if it fails or times out, the previous schema stays in place, marked `stale`
+with the `error`; a schema that never loaded has `refreshed_at: null` and an
+`error`, never an empty graph. Property types in the legacy keys now use the
+same vocabulary (`string`, `integer`, ...) instead of engine type names.
+
+`dialect` returns `dialect` plus `engine` (name, version, edition), `database`,
+`graph`, `allow_execute`, `capabilities`, `limits` (default and maximum rows,
+element and value budgets, statement timeout, server result cap) and
+`read_boundary`/`read_boundary_verified`. It never includes hosts, users or
+credentials.
+On Neo4j the schema comes from `db.labels()` and `db.relationshipTypes()` (raw
+names, so `get_schema` with `label` matches the label as stored), exact counts
+from the count store, and properties and endpoints sampled in one read
+transaction whose server-side timeout is the refresh budget. `read_boundary` is
+`database_role` with `read_boundary_verified: true` only when the server is
+Enterprise and the node's own privileges (`SHOW USER PRIVILEGES`) grant
+nothing beyond reading; otherwise it is `read_session`. The natural-language
+tools tell the model it is writing Neo4j Cypher for the server's version and
+which procedures it may call. `dialect` accepts no
 meaningful arguments. Generation failures return an error rather than an
 executable query, and `get_cypher` preserves those outcomes while adding
 `cypher` when a query is available.
@@ -168,12 +200,11 @@ query execution** on.
 
 ### Schema reflection and query generation
 
-At startup, the node reflects node labels and property types through
-`db.schema.nodeTypeProperties()` and relationship information through
-`db.schema.visualization()`. On servers where those procedures fail, it falls
-back to `db.labels()` and `db.relationshipTypes()`. Reflection failure only
-warns and leaves an empty schema cache, so the connection can continue but the
-LLM has less structure to ground its Cypher generation.
+At startup, and on `refresh_schema`, the node reads labels and relationship
+types with `db.labels()` and `db.relationshipTypes()` and samples properties
+and endpoints (see **As a tool**). Reflection failure only warns and records the
+error in the schema block, so the connection can continue but the LLM has less
+structure to ground its Cypher generation.
 
 The LLM is instructed to generate queries only from the reflected schema;
 generated output is checked for unsafe clauses after comments are removed and
