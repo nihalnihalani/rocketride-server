@@ -232,7 +232,7 @@ export const RunSurface: React.FC<IRunSurfaceProps> = ({ endpoint, mode, loadReq
 		if (!summary) return;
 		resultKey.current += 1;
 		setTab(chooseTab(summary));
-	}, [result]);
+	}, [result, summary]);
 
 	// The graph session is one per surface; a new result replaces what it draws.
 	const graphSession = useMemo<IGraphSession>(() => createGraphSession({
@@ -244,7 +244,7 @@ export const RunSurface: React.FC<IRunSurfaceProps> = ({ endpoint, mode, loadReq
 		describe: (error) => describeFailureOf(error instanceof Error ? error.message : String(error), error, writable),
 		announce,
 		captionChoice: (label) => captionsRef.current.get(label),
-	}), [session, dialect, writable, announce]); // eslint-disable-line react-hooks/exhaustive-deps
+	}), [session, dialect, writable, announce]);
 	useEffect(() => {
 		graphSession.load(result);
 		return () => graphSession.dispose();

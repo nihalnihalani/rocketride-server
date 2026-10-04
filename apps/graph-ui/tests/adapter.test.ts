@@ -16,7 +16,7 @@ import { describe, it } from 'node:test';
 import { ExplorerToolError, probeInfo } from 'shared/explorer';
 import { codedError, fakeWorld, manualClock, row } from 'shared/explorer/connect/testing';
 import type { IFakeRow, IToolCall } from 'shared/explorer/connect/testing';
-import { GRAPH_PROVIDERS, GRAPH_TOOLS, TOOL, makeGraphEndpointStore, makeGraphHistory, makeGraphTools, patternChecks } from '../src/adapters/explorer';
+import { GRAPH_PROVIDERS, TOOL, makeGraphEndpointStore, makeGraphHistory, makeGraphTools, patternChecks } from '../src/adapters/explorer';
 import { parseDialect, supportsReadQuery } from '../src/graph/dialect';
 import { fixture, readQueryFixture } from './support/builders';
 

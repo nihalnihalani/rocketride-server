@@ -13,7 +13,7 @@ import { canWrite, engineText, parseDialect, readBoundaryText, rowLimitFor, supp
 import { fixture } from './support/builders';
 
 const load = (name: string) => parseDialect(fixture<Record<string, unknown>>(`dialect_${name}`));
-/** The rules as they apply once nodes publish capabilities (backend task G10). */
+/** The capability rules: a node advertises what it can do, and anything it does not say is unsupported. */
 
 test('a current node reports engine, version, edition, target, capabilities and limits', () => {
 	const neo = load('neo4j');

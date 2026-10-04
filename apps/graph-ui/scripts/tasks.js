@@ -38,7 +38,7 @@ const TESTS_DIR = path.join(APP_ROOT, 'tests');
 // Suites that must exist for the gate to mean anything. A missing file here is
 // a broken checkout or a deleted suite, not an app "without tests", so the
 // gate fails instead of running whatever happens to be left.
-const REQUIRED_TESTS = ['scaffold.test.ts', 'lexer.test.ts', 'split.test.ts', 'classify.test.ts', 'quote.test.ts', 'graph.values.test.ts', 'graph.model.test.ts', 'graph.geometry.test.ts', 'layout.core.test.ts', 'layout.client.test.ts', 'recipes.test.ts', 'flowProps.test.ts', 'graph.colors.test.ts', 'graph.keynav-schema.test.ts', 'graph.fixtures.test.ts', 'graph.wording.test.ts', 'graph.dialect.test.ts', 'adapter.test.ts', 'graph.connections.test.ts', 'graph.inspector-ask.test.ts', 'graph.run-failures.test.ts', 'graph.addresses-schema.test.ts', 'cypher.targets.test.ts', 'graph.session.test.ts', 'graph.writeconfirm.test.ts', 'adapter.actions.test.ts'];
+const REQUIRED_TESTS = ['scaffold.test.ts', 'lexer.test.ts', 'split.test.ts', 'classify.test.ts', 'quote.test.ts', 'graph.values.test.ts', 'graph.model.test.ts', 'graph.geometry.test.ts', 'layout.core.test.ts', 'layout.client.test.ts', 'recipes.test.ts', 'flowProps.test.ts', 'graph.colors.test.ts', 'graph.keynav-schema.test.ts', 'graph.fixtures.test.ts', 'graph.wording.test.ts', 'graph.dialect.test.ts', 'adapter.test.ts', 'graph.connections.test.ts', 'graph.inspector-ask.test.ts', 'graph.run-failures.test.ts', 'graph.addresses-schema.test.ts', 'cypher.targets.test.ts', 'graph.session.test.ts', 'graph.writeconfirm.test.ts', 'adapter.actions.test.ts', 'graph.schematree.test.ts', 'graph.live-fixtures.test.ts'];
 
 const mod = createAppModule({
 	name: 'graph-ui',

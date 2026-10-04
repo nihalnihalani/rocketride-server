@@ -167,14 +167,16 @@ export const LiveRegion = createLiveRegion(announcer);
 /** Which connection document is active (the sidebar follows it). */
 export const activeConnection = createActiveKeyStore();
 
-/** A sidebar click that asks the workbench to run something (label preview, Refresh). */
+/** A sidebar click that asks a connection's workbench to show a preview. */
 export interface IWorkbenchRequest {
 	/** The connection the request is for. */
 	endpointKey: string;
-	/** What to do. */
-	action: 'label-preview' | 'refresh-schema';
-	/** The label, for a preview. */
-	label?: string;
+	/** What to do: the 25-node preview of a label, or of a relationship type. */
+	action: 'label-preview' | 'type-preview';
+	/** The label or relationship type, exactly as the schema holds it. */
+	name: string;
+	/** When the click happened (ms since the epoch): a workbench that mounts later ignores a request older than a few seconds. */
+	at: number;
 }
 
 /** The sidebar-to-workbench request channel. */
