@@ -1,0 +1,612 @@
+// =============================================================================
+// MIT License
+// Copyright (c) 2026 Aparavi Software AG
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+
+// =============================================================================
+// EXPLORER ENDPOINT STORE — probing, refresh discipline, identity, isolation
+// =============================================================================
+
+import { describe, it } from 'node:test';
+import assert from 'node:assert/strict';
+import { createEndpointStore } from './store';
+import type { EndpointWatch, IEndpointStore, IWatchHandlers } from './store';
+import { codedError, fakeWorld, manualClock, row } from './testing';
+import type { IFakeWorld, IManualClock, IToolCall } from './testing';
+import { SINGLE_TOOLS_ROLE, VECTOR_ROLES } from '../types';
+import type { IExplorerIdentity } from '../types';
+import { identityFingerprint, identityFromConnectResult } from './identity';
+import { ExplorerToolError } from '../errors';
+import { checkRowEnvelope } from '../checks';
+
+const DB = new Set(['db_postgres']);
+const NEO4J_INFO = { dialect: 'neo4j', engine: { name: 'Neo4j', version: '5.26.31' }, capabilities: { read_query: true }, limits: { statement_timeout_ms: 30000 } };
+
+/** A watch that records its handlers so a test can fire task events, focus and identity changes by hand. */
+interface IWatchProbe {
+	watch: EndpointWatch;
+	handlers: IWatchHandlers | null;
+	subscribed: number;
+	unsubscribed: number;
+}
+
+/**
+ * Create a watch probe.
+ *
+ * @returns The probe.
+ */
+function watchProbe(): IWatchProbe {
+	const probe: IWatchProbe = {
+		handlers: null,
+		subscribed: 0,
+		unsubscribed: 0,
+		watch: (handlers) => {
+			probe.handlers = handlers;
+			probe.subscribed += 1;
+			return () => { probe.unsubscribed += 1; probe.handlers = null; };
+		},
+	};
+	return probe;
+}
+
+/** What `make` returns. */
+interface IRig {
+	store: IEndpointStore;
+	world: IFakeWorld;
+	clock: IManualClock;
+}
+
+/**
+ * Build a store over a fake world and a manual clock.
+ *
+ * @param rows - Initial rows.
+ * @param behave - Tool behaviour (default: `dialect` answers a neo4j node).
+ * @param over - Store option overrides.
+ * @returns The rig.
+ */
+function make(rows = [row()], behave?: IFakeWorld['behave'], over: Partial<Parameters<typeof createEndpointStore>[0]> = {}): IRig {
+	const clock = manualClock();
+	const world = fakeWorld(rows, behave ?? ((call) => (call.tool === 'dialect' ? NEO4J_INFO : { columns: [], rows: [], row_limit: 1000, truncated: false })));
+	const store = createEndpointStore({
+		providers: DB,
+		roles: SINGLE_TOOLS_ROLE,
+		tools: { read_query: { idempotent: true, check: checkRowEnvelope, capability: 'read_query' } },
+		clock,
+		...over,
+	});
+	return { store, world, clock };
+}
+
+/**
+ * Count the dialect probes a world received.
+ *
+ * @param world - The world.
+ * @returns How many `dialect` calls it saw.
+ */
+function probes(world: IFakeWorld): number {
+	return world.calls.filter((c) => c.tool === 'dialect').length;
+}
+
+// =============================================================================
+// REFRESH + PROBE
+// =============================================================================
+
+describe('refresh — discover once, probe each endpoint once', () => {
+	it('discovers, probes dialect, and publishes ready endpoints with the node\'s answer', async () => {
+		const { store, world } = make();
+		await store.refresh(world.client);
+		const state = store.getState();
+		assert.equal(state.status, 'ready');
+		assert.equal(state.endpoints.length, 1);
+		assert.equal(state.endpoints[0]!.state, 'ready');
+		assert.equal(state.endpoints[0]!.running, true);
+		const probe = state.probes[state.endpoints[0]!.key]!;
+		assert.equal(probe.ok, true);
+		assert.equal(probe.dialect, 'neo4j');
+		assert.deepEqual(probe.info, NEO4J_INFO);
+		assert.ok(state.refreshedAt > 0);
+	});
+
+	it('does NOT probe an endpoint again on later refreshes while it stays ready', async () => {
+		const { store, world } = make();
+		await store.refresh(world.client);
+		await store.refresh(world.client);
+		await store.refresh(world.client);
+		assert.equal(probes(world), 1);
+		assert.equal(world.getTasksCalls, 3);
+	});
+
+	it('re-probes everything on request (a restart) and probes a NEW endpoint without touching the old one', async () => {
+		const { store, world } = make();
+		await store.refresh(world.client);
+		await store.refresh(world.client, { reprobe: true });
+		assert.equal(probes(world), 2);
+		world.rows.push(row({ source: 'tools_2', pipeline: { project_id: 'p2', components: [{ id: 'db_2', provider: 'db_postgres' }] } }));
+		await store.refresh(world.client);
+		assert.equal(probes(world), 3);
+		assert.deepEqual(store.getState().endpoints.map((e) => e.state), ['ready', 'ready']);
+	});
+
+	it('retries a FAILED probe on the next refresh (only successes are cached)', async () => {
+		let fail = true;
+		const { store, world } = make([row()], (call) => {
+			if (call.tool !== 'dialect') return {};
+			if (fail) throw new Error('node not wired');
+			return NEO4J_INFO;
+		});
+		await store.refresh(world.client);
+		assert.equal(store.getState().endpoints[0]!.state, 'unreachable');
+		assert.match(store.getState().endpoints[0]!.stateDetail ?? '', /node not wired/);
+		fail = false;
+		await store.refresh(world.client);
+		assert.equal(store.getState().endpoints[0]!.state, 'ready');
+		assert.equal(probes(world), 2);
+	});
+
+	it('bounds probe concurrency and isolates a failing probe from the rest', async () => {
+		const rows = Array.from({ length: 10 }, (_, i) => row({ source: `s${i}`, pipeline: { project_id: `p${i}`, components: [{ id: 'db_1', provider: 'db_postgres' }] } }));
+		const { store, world } = make(rows, async (call) => {
+			if (call.tool !== 'dialect') return {};
+			await new Promise((resolve) => setImmediate(resolve));
+			if (call.token === rows[3]!.token) throw new Error('only this one is broken');
+			return NEO4J_INFO;
+		}, { concurrency: 3 });
+		await store.refresh(world.client);
+		assert.ok(world.inFlight.peak <= 3, `peak ${world.inFlight.peak}`);
+		const states = store.getState().endpoints.map((e) => e.state);
+		assert.equal(states.filter((s) => s === 'ready').length, 9);
+		assert.equal(states.filter((s) => s === 'unreachable').length, 1);
+	});
+
+	it('shows `inaccessible` when the probe fails and the identity says the caller cannot call that team', async () => {
+		const identity: IExplorerIdentity = { userId: 'u1', orgId: 'o', devTeam: 't', teamPermissions: { 'team-1': ['task.monitor'] } };
+		const deploy = row({ runKind: 'deploy', ownerKind: 'team', ownerId: 'team-1' });
+		const { store, world } = make([deploy], (call) => { if (call.tool === 'dialect') throw new Error("Permission 'task.data' denied for this task"); return {}; });
+		const detach = store.attach(world.client, identity);
+		await store.refresh(world.client);
+		assert.equal(store.getState().endpoints[0]!.state, 'inaccessible');
+		detach();
+	});
+
+	it('shows `unreachable` (not inaccessible) for the same failure when the identity cannot tell', async () => {
+		const deploy = row({ runKind: 'deploy', ownerKind: 'team', ownerId: 'team-9' });
+		const { store, world } = make([deploy], (call) => { if (call.tool === 'dialect') throw new Error('denied or broken'); return {}; });
+		await store.refresh(world.client);
+		assert.equal(store.getState().endpoints[0]!.state, 'unreachable');
+	});
+
+	it('reads a TASK_* code from the SDK as `stopped`, not `unreachable`', async () => {
+		const { store, world } = make([row()], (call) => { if (call.tool === 'dialect') throw codedError('Task was stopped', 'TASK_STOPPED'); return {}; });
+		await store.refresh(world.client);
+		assert.equal(store.getState().endpoints[0]!.state, 'stopped');
+	});
+
+	it('surfaces a getTasks failure as status `error` and keeps what was already discovered', async () => {
+		const { store, world } = make();
+		await store.refresh(world.client);
+		world.getTasksImpl = async () => { throw new Error('connection lost'); };
+		await store.refresh(world.client);
+		const state = store.getState();
+		assert.equal(state.status, 'error');
+		assert.equal(state.error, 'connection lost');
+		assert.equal(state.endpoints.length, 1);
+		assert.equal(state.endpoints[0]!.state, 'ready');
+	});
+
+	it('uses the dialect probe once per endpoint even for a custom probe function', async () => {
+		let calls = 0;
+		const { store, world } = make([row()], undefined, { probe: async () => { calls += 1; return { ok: true, info: { dialect: 'custom' }, dialect: 'custom' }; } });
+		await store.refresh(world.client);
+		await store.refresh(world.client);
+		assert.equal(calls, 1);
+		assert.equal(store.getState().probes[store.getState().endpoints[0]!.key]!.dialect, 'custom');
+	});
+});
+
+// =============================================================================
+// STOPPED / RESTARTED ENDPOINTS
+// =============================================================================
+
+describe('refresh — a vanished endpoint is stopped, a returning one is probed again', () => {
+	it('keeps a vanished endpoint as `stopped`, drops its token, and refuses calls on it', async () => {
+		const { store, world } = make();
+		await store.refresh(world.client);
+		const endpoint = store.getState().endpoints[0]!;
+		world.rows.length = 0;
+		await store.refresh(world.client);
+		const after = store.getState().endpoints[0]!;
+		assert.equal(after.key, endpoint.key);
+		assert.equal(after.state, 'stopped');
+		assert.equal(after.running, false);
+		assert.match(after.stateDetail ?? '', /no longer running/);
+		assert.equal(store.getState().probes[endpoint.key], undefined);
+		const error = await store.session(world.client, after).invoke('dialect', {}).catch((e: unknown) => e);
+		assert.ok(error instanceof ExplorerToolError);
+		assert.equal(error.kind, 'unavailable');
+	});
+
+	it('probes it again when it reappears (the Stopped badge goes away)', async () => {
+		const { store, world } = make();
+		await store.refresh(world.client);
+		const saved = world.rows.slice();
+		world.rows.length = 0;
+		await store.refresh(world.client);
+		world.rows.push(...saved);
+		await store.refresh(world.client);
+		assert.equal(store.getState().endpoints[0]!.state, 'ready');
+		assert.equal(probes(world), 2);
+	});
+
+	it('marks a stopped endpoint only once and keeps it across further refreshes', async () => {
+		const { store, world } = make();
+		await store.refresh(world.client);
+		world.rows.length = 0;
+		await store.refresh(world.client);
+		await store.refresh(world.client);
+		assert.equal(store.getState().endpoints.length, 1);
+		assert.equal(store.getState().endpoints[0]!.state, 'stopped');
+	});
+
+	it('a vector connection missing its tools source is listed stopped with no probe', async () => {
+		const vec = (source: string) => row({ source, pipeline: { project_id: 'vp', components: [{ id: 'v_1', provider: 'rocketride_vector' }] } });
+		const { store, world } = make([vec('ingest_1'), vec('chat_1')], undefined, { providers: new Set(['rocketride_vector']), roles: VECTOR_ROLES });
+		await store.refresh(world.client);
+		assert.equal(store.getState().endpoints[0]!.state, 'stopped');
+		assert.equal(probes(world), 0);
+	});
+});
+
+// =============================================================================
+// REFRESH DISCIPLINE
+// =============================================================================
+
+describe('refresh discipline — coalescing, debounce, focus, cleanup', () => {
+	it('coalesces any number of concurrent refreshes into the one running plus exactly ONE follow-up', async () => {
+		let release: (() => void) | undefined;
+		const { store, world } = make();
+		let first = true;
+		world.getTasksImpl = async () => {
+			if (first) {
+				first = false;
+				await new Promise<void>((resolve) => { release = resolve; });
+			}
+			return world.rows.map((r) => ({ ...r })) as unknown as Array<Record<string, unknown>>;
+		};
+		const calls = (): number => world.getTasksCalls;
+		const a = store.refresh(world.client);
+		const b = store.refresh(world.client);
+		const c = store.refresh(world.client, { reprobe: true });
+		const d = store.refresh(world.client);
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(calls(), 1);
+		release?.();
+		await Promise.all([a, b, c, d]);
+		await new Promise((resolve) => setImmediate(resolve));
+		// One discovery that was blocked, then exactly one follow-up (carrying the re-probe) — not four.
+		assert.equal(calls(), 2);
+		assert.equal(probes(world), 2);
+	});
+
+	it('never lets an older refresh overwrite a newer one: the final snapshot reflects the latest rows', async () => {
+		const { store, world } = make();
+		await store.refresh(world.client);
+		world.rows.push(row({ source: 'tools_2', pipeline: { project_id: 'p2', components: [{ id: 'db_2', provider: 'db_postgres' }] } }));
+		const refreshing = store.refresh(world.client);
+		world.rows.length = 0;
+		await refreshing;
+		await store.refresh(world.client);
+		assert.deepEqual(store.getState().endpoints.map((e) => e.state), ['stopped', 'stopped']);
+	});
+
+	it('coalesces a burst of task events into ONE refresh after the quiet period', async () => {
+		const { store, world, clock } = make();
+		const watch = watchProbe();
+		const detach = store.attach(world.client, null, watch.watch);
+		for (let i = 0; i < 5; i += 1) watch.handlers!.onTaskEvent({ reprobe: false });
+		assert.equal(world.getTasksCalls, 0);
+		await clock.advance(299);
+		assert.equal(world.getTasksCalls, 0);
+		await clock.advance(1);
+		assert.equal(world.getTasksCalls, 1);
+		detach();
+	});
+
+	it('asks for a re-probe when any event in the burst was a restart', async () => {
+		const { store, world, clock } = make();
+		const watch = watchProbe();
+		const detach = store.attach(world.client, null, watch.watch);
+		await store.refresh(world.client);
+		assert.equal(probes(world), 1);
+		watch.handlers!.onTaskEvent({ reprobe: false });
+		watch.handlers!.onTaskEvent({ reprobe: true });
+		await clock.advance(300);
+		assert.equal(probes(world), 2);
+		detach();
+	});
+
+	it('rate-limits focus refreshes and skips one that follows a refresh closely', async () => {
+		const { store, world, clock } = make();
+		const watch = watchProbe();
+		const detach = store.attach(world.client, null, watch.watch);
+		await store.refresh(world.client);
+		assert.equal(world.getTasksCalls, 1);
+		watch.handlers!.onFocus();
+		await clock.advance(1_000);
+		assert.equal(world.getTasksCalls, 1);
+		await clock.advance(5_000);
+		watch.handlers!.onFocus();
+		await clock.advance(300);
+		assert.equal(world.getTasksCalls, 2);
+		detach();
+	});
+
+	it('refreshes after a reconnect (events were missed), with a re-probe', async () => {
+		const { store, world, clock } = make();
+		const watch = watchProbe();
+		const detach = store.attach(world.client, null, watch.watch);
+		await store.refresh(world.client);
+		watch.handlers!.onReconnect();
+		await clock.advance(300);
+		assert.equal(world.getTasksCalls, 2);
+		assert.equal(probes(world), 2);
+		detach();
+	});
+
+	it('cleans up: detaching unsubscribes, cancels the pending refresh, and later events do nothing', async () => {
+		const { store, world, clock } = make();
+		const watch = watchProbe();
+		const detach = store.attach(world.client, null, watch.watch);
+		const handlers = watch.handlers!;
+		handlers.onTaskEvent({ reprobe: false });
+		assert.equal(clock.pending(), 1);
+		detach();
+		assert.equal(watch.unsubscribed, 1);
+		assert.equal(clock.pending(), 0);
+		handlers.onTaskEvent({ reprobe: false });
+		await clock.advance(1_000);
+		// The stale handler may re-arm a timer, but the detached store's client is gone from the watch.
+		assert.equal(watch.subscribed, 1);
+	});
+});
+
+// =============================================================================
+// IDENTITY + TOKENS
+// =============================================================================
+
+describe('identity changes and sign-out reset everything', () => {
+	const alice: IExplorerIdentity = { userId: 'u1', orgId: 'org-A', devTeam: 'dev-A' };
+
+	it('clears endpoints, probes, tokens and sessions when the ORGANIZATION changes', async () => {
+		const { store, world } = make();
+		const watch = watchProbe();
+		store.attach(world.client, alice, watch.watch);
+		await store.refresh(world.client);
+		const endpoint = store.getState().endpoints[0]!;
+		const session = store.session(world.client, endpoint);
+		assert.equal(store.getState().endpoints.length, 1);
+
+		watch.handlers!.onIdentity({ ...alice, orgId: 'org-B' });
+		const state = store.getState();
+		assert.equal(state.status, 'idle');
+		assert.deepEqual(state.endpoints, []);
+		assert.deepEqual(state.probes, {});
+		// The old session can no longer call: its token is gone.
+		const error = await session.invoke('dialect', {}).catch((e: unknown) => e);
+		assert.equal((error as ExplorerToolError).kind, 'unavailable');
+	});
+
+	it('resets on sign-out and on a different user or team, but NOT on a permissions-only change or the same identity', async () => {
+		const { store, world } = make();
+		const watch = watchProbe();
+		store.attach(world.client, alice, watch.watch);
+		await store.refresh(world.client);
+
+		watch.handlers!.onIdentity({ ...alice, teamPermissions: { x: ['task.data'] } });
+		assert.equal(store.getState().endpoints.length, 1);
+		watch.handlers!.onIdentity({ ...alice });
+		assert.equal(store.getState().endpoints.length, 1);
+
+		watch.handlers!.onIdentity({ ...alice, devTeam: 'dev-B' });
+		assert.equal(store.getState().endpoints.length, 0);
+
+		await store.refresh(world.client);
+		assert.equal(store.getState().endpoints.length, 1);
+		watch.handlers!.onIdentity({ ...alice, devTeam: 'dev-B', userId: 'u2' });
+		assert.equal(store.getState().endpoints.length, 0);
+
+		await store.refresh(world.client);
+		watch.handlers!.onIdentity(null);
+		assert.equal(store.getState().endpoints.length, 0);
+		assert.equal(store.getState().status, 'idle');
+	});
+
+	it('resets when re-attached under another identity', async () => {
+		const { store, world } = make();
+		const detach = store.attach(world.client, alice);
+		await store.refresh(world.client);
+		detach();
+		store.attach(world.client, { ...alice, orgId: 'org-B' });
+		assert.equal(store.getState().endpoints.length, 0);
+	});
+
+	it('drops a probe that was in flight when the store was reset: it must not describe the next session, even with an identical token', async () => {
+		let releaseOld: (() => void) | undefined;
+		let dialectCalls = 0;
+		const { store, world } = make([row()], (call) => {
+			if (call.tool !== 'dialect') return {};
+			dialectCalls += 1;
+			// The FIRST probe (the old session's) blocks; later ones answer at once with a different engine.
+			if (dialectCalls === 1) return new Promise((resolve) => { releaseOld = () => resolve({ dialect: 'old-session' }); });
+			return { dialect: 'new-session' };
+		});
+		const watch = watchProbe();
+		store.attach(world.client, alice, watch.watch);
+		const oldRefresh = store.refresh(world.client);
+		for (let i = 0; i < 4; i += 1) await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(dialectCalls, 1);
+
+		// A new organization, then the SAME task discovered again (same token, same key).
+		watch.handlers!.onIdentity({ ...alice, orgId: 'org-B' });
+		assert.deepEqual(store.getState().endpoints, []);
+		await store.refresh(world.client);
+		const key = store.getState().endpoints[0]!.key;
+		assert.equal(store.getState().probes[key]?.dialect, 'new-session');
+
+		releaseOld?.();
+		await oldRefresh;
+		for (let i = 0; i < 4; i += 1) await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(store.getState().probes[key]?.dialect, 'new-session');
+	});
+
+	it('NEVER lets a token reach the snapshot, its keys, probes or a serialised copy', async () => {
+		const { store, world } = make([row(), row({ runKind: 'deploy', ownerKind: 'team', ownerId: 'team-1' })]);
+		await store.refresh(world.client);
+		const text = JSON.stringify(store.getState());
+		for (const r of world.rows) assert.equal(text.includes(r.token), false);
+		assert.equal(text.includes('tk_sentinel'), false);
+		const session = store.session(world.client, store.getState().endpoints[0]!);
+		assert.equal(JSON.stringify(session).includes('tk_sentinel'), false);
+		assert.equal(JSON.stringify(session.endpoint).includes('tk_sentinel'), false);
+	});
+
+	it('reads identity out of a ConnectResult without the token and with the fingerprint fields', () => {
+		const connect = { userToken: 'rr_SECRET', userId: 'u1', devTeam: 'dev-A', organization: { id: 'org-A', permissions: ['x'], teams: [{ id: 't1', permissions: ['task.data'] }, { id: 7 }] } };
+		const identity = identityFromConnectResult(connect);
+		assert.deepEqual(identity, { userId: 'u1', orgId: 'org-A', devTeam: 'dev-A', orgPermissions: ['x'], teamPermissions: { t1: ['task.data'] } });
+		assert.equal(JSON.stringify(identity).includes('rr_SECRET'), false);
+		assert.equal(identityFingerprint(identity), 'u1|org-A|dev-A');
+		assert.equal(identityFromConnectResult(null), null);
+		assert.equal(identityFromConnectResult({ userId: '' }), null);
+		assert.equal(identityFingerprint(null), null);
+	});
+});
+
+// =============================================================================
+// SESSIONS + REBIND (end to end through the store)
+// =============================================================================
+
+describe('sessions through the store', () => {
+	it('retries an idempotent read once when the task restarts (TASK_STOPPED) and comes back with the SAME token', async () => {
+		let attempts = 0;
+		const { store, world, clock } = make([row()], (call: IToolCall) => {
+			if (call.tool === 'dialect') return NEO4J_INFO;
+			attempts += 1;
+			if (attempts === 1) throw codedError('Task was stopped', 'TASK_STOPPED');
+			return { columns: ['n'], rows: [[1]], row_limit: 1000, truncated: false };
+		});
+		await store.refresh(world.client);
+		const session = store.session(world.client, store.getState().endpoints[0]!);
+		const result = session.invoke('read_query', { cypher: 'RETURN 1' });
+		await clock.advance(0);
+		assert.deepEqual(await result, { columns: ['n'], rows: [[1]], row_limit: 1000, truncated: false });
+		assert.equal(attempts, 2);
+		const tokens = world.calls.filter((c) => c.tool === 'read_query').map((c) => c.token);
+		assert.equal(tokens[0], tokens[1]);
+		// The endpoint's ownership is unchanged by the rebind.
+		assert.equal(store.getState().endpoints[0]!.ownerId, 'u1');
+	});
+
+	it('gives up after the bounded window when the endpoint never comes back, surfacing the original error', async () => {
+		const { store, world, clock } = make([row()], (call: IToolCall) => {
+			if (call.tool === 'dialect') return NEO4J_INFO;
+			throw codedError('Task was stopped', 'TASK_STOPPED');
+		});
+		await store.refresh(world.client);
+		const endpoint = store.getState().endpoints[0]!;
+		const session = store.session(world.client, endpoint);
+		world.rows.length = 0;
+		let outcome: unknown;
+		const pending = session.invoke('read_query', { cypher: 'RETURN 1' }).then(() => 'ok', (error: unknown) => { outcome = error; return 'failed'; });
+		await clock.advance(16_000);
+		assert.equal(await pending, 'failed');
+		assert.equal((outcome as ExplorerToolError).code, 'TASK_STOPPED');
+		assert.equal(world.calls.filter((c) => c.tool === 'read_query').length, 1);
+	});
+
+	it('reuses one session per endpoint and client, and builds a new one for a new client', async () => {
+		const { store, world } = make();
+		await store.refresh(world.client);
+		const endpoint = store.getState().endpoints[0]!;
+		assert.equal(store.session(world.client, endpoint), store.session(world.client, endpoint));
+		const other = fakeWorld([row()]);
+		assert.notEqual(store.session(other.client, endpoint), store.session(world.client, endpoint));
+	});
+
+	it('refuses read_query locally on a node whose probe lacks the capability', async () => {
+		const { store, world } = make([row()], (call) => (call.tool === 'dialect' ? { dialect: 'neo4j' } : {}));
+		await store.refresh(world.client);
+		const session = store.session(world.client, store.getState().endpoints[0]!);
+		const error = await session.invoke('read_query', { cypher: 'RETURN 1' }).catch((e: unknown) => e);
+		assert.equal((error as ExplorerToolError).kind, 'upgrade');
+		assert.equal(world.calls.filter((c) => c.tool === 'read_query').length, 0);
+	});
+
+	it('probe() re-checks one endpoint on demand and returns null for an unknown one', async () => {
+		const { store, world } = make();
+		await store.refresh(world.client);
+		const key = store.getState().endpoints[0]!.key;
+		const result = await store.probe(world.client, key);
+		assert.equal(result?.ok, true);
+		assert.equal(probes(world), 2);
+		assert.equal(await store.probe(world.client, 'nope'), null);
+	});
+});
+
+// =============================================================================
+// FACTORY ISOLATION
+// =============================================================================
+
+describe('factory isolation — SQL, Graph and a mocked Vector store side by side', () => {
+	it('keeps each store\'s endpoints, probes, vault and reset separate', async () => {
+		const clock = manualClock();
+		const world = fakeWorld([
+			row(),
+			row({ source: 'tools_1', pipeline: { project_id: 'g', components: [{ id: 'g_1', provider: 'graph_neo4j' }] }, name: 'Graph' }),
+			row({ source: 'tools_1', pipeline: { project_id: 'v', components: [{ id: 'v_1', provider: 'rocketride_vector' }] }, name: 'Vector' }),
+		], (call) => (call.tool === 'dialect' ? NEO4J_INFO : {}));
+		const sql = createEndpointStore({ providers: DB, roles: SINGLE_TOOLS_ROLE, tools: {}, clock });
+		const graph = createEndpointStore({ providers: new Set(['graph_neo4j']), roles: SINGLE_TOOLS_ROLE, tools: {}, clock });
+		const vector = createEndpointStore({ providers: new Set(['rocketride_vector']), roles: VECTOR_ROLES, tools: {}, clock });
+		await Promise.all([sql.refresh(world.client), graph.refresh(world.client), vector.refresh(world.client)]);
+		assert.deepEqual(sql.getState().endpoints.map((e) => e.provider), ['db_postgres']);
+		assert.deepEqual(graph.getState().endpoints.map((e) => e.provider), ['graph_neo4j']);
+		assert.deepEqual(vector.getState().endpoints.map((e) => e.provider), ['rocketride_vector']);
+
+		graph.reset();
+		assert.equal(graph.getState().endpoints.length, 0);
+		assert.equal(sql.getState().endpoints.length, 1);
+		assert.equal(vector.getState().endpoints.length, 1);
+		// The SQL store's session still holds a working token; the reset Graph store's would not.
+		const sqlSession = sql.session(world.client, sql.getState().endpoints[0]!);
+		await sqlSession.invoke('dialect', {});
+	});
+
+	it('notifies only its own subscribers', async () => {
+		const a = make();
+		const b = make();
+		let aHits = 0;
+		let bHits = 0;
+		a.store.subscribe(() => { aHits += 1; });
+		b.store.subscribe(() => { bHits += 1; });
+		await a.store.refresh(a.world.client);
+		assert.ok(aHits > 0);
+		assert.equal(bHits, 0);
+	});
+});

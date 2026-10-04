@@ -135,6 +135,15 @@ export interface IExplorerIdentity {
 	orgId: string;
 	/** The user's development team id ('' when none). */
 	devTeam: string;
+	/**
+	 * Permissions the user holds per team (team id -> permission strings), when
+	 * known. A HINT only, used to label a failed probe as `inaccessible`: it
+	 * never decides whether a call is attempted, and a change in it does not
+	 * reset the store (only the three fields above do).
+	 */
+	teamPermissions?: Readonly<Record<string, readonly string[]>>;
+	/** Organization-level permissions, when known (same hint-only status). */
+	orgPermissions?: readonly string[];
 }
 
 // =============================================================================

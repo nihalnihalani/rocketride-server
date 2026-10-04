@@ -53,6 +53,27 @@
 // immediately instead of riding the debounce, and any switch that could not be
 // written (no accessor attached) is remembered in `unsavedRecording` until a
 // hydrate can land it.
+//
+// LEGACY KEYS — reading history saved under an older connection key
+//
+// SQL Explorer's first key was `projectId:source:nodeId`; the owner-aware key
+// replaces it, and renaming a key silently orphans every user's saved history.
+// So when `legacyKeyOf` maps a connection to its old key, history is read as a
+// MERGED VIEW of the two lists, and the stored format never changes:
+//
+//   - reads: entries under the new key AND under the old key, de-duplicated by
+//     id, newest first, bounded like any list;
+//   - new runs are written under the NEW key only — except a run that repeats
+//     an older entry's statement, which collapses onto that entry wherever it
+//     lives (the trim keeps the older entry, its pin and its note);
+//   - pin, note and remove change an entry IN PLACE, in whichever list holds it;
+//   - clear empties both lists;
+//   - nothing is ever migrated or deleted behind the user's back, so an older
+//     build still sees its own list and a cleared list never comes back.
+//
+// The mapping is the caller's to make safe: the caller maps ONLY connections
+// the old key could have meant (see keys.ts legacyKeyFromKey), so history is
+// never read across owners or across dev and deploy.
 // =============================================================================
 
 import { useSyncExternalStore } from 'react';
@@ -80,6 +101,12 @@ export interface IHistoryStoreOptions<F extends string> {
 	runs?: IRunEvents<F>;
 	/** Debounce before a batch of mutations is written, in ms (default 300). */
 	persistDelayMs?: number;
+	/**
+	 * Maps a connection key to the key its history was saved under before the
+	 * key format changed, or null when it has none. When set, every connection's
+	 * history is the MERGED view of both lists (see "LEGACY KEYS" below).
+	 */
+	legacyKeyOf?: (key: string) => string | null;
 }
 
 /** One app's history store. */
@@ -142,6 +169,18 @@ export function createHistoryStore<F extends string>(options: IHistoryStoreOptio
 
 	/** Shared empty list, so an unknown connection keeps a stable snapshot. */
 	const NO_ENTRIES: IHistoryEntry<F>[] = [];
+	const legacyKeyOf = options.legacyKeyOf;
+
+	/**
+	 * The older key a connection's history may also live under.
+	 *
+	 * @param key - The connection's current key.
+	 * @returns The old key, or null when there is none to read.
+	 */
+	function legacyOf(key: string): string | null {
+		const legacy = legacyKeyOf?.(key) ?? null;
+		return legacy !== null && legacy !== '' && legacy !== key ? legacy : null;
+	}
 
 	// ── State ─────────────────────────────────────────────────────────────────
 
@@ -189,6 +228,62 @@ export function createHistoryStore<F extends string>(options: IHistoryStoreOptio
 	 */
 	function trim(entries: IHistoryEntry<F>[]): IHistoryEntry<F>[] {
 		return trimHistory(entries, textField, limits);
+	}
+
+	// ── The merged view (legacy keys) ─────────────────────────────────────────
+
+	/** Merged views by connection key, valid while both underlying lists are the same objects. */
+	const viewCache = new Map<string, { own: IHistoryEntry<F>[]; old: IHistoryEntry<F>[]; view: IHistoryEntry<F>[] }>();
+
+	/**
+	 * One connection's history as the UI reads it: its own list, plus the list
+	 * under its legacy key when there is one. Referentially stable until either
+	 * list changes, because it is a useSyncExternalStore snapshot.
+	 *
+	 * @param key - The connection's key.
+	 * @returns The entries, newest first.
+	 */
+	function viewOf(key: string): IHistoryEntry<F>[] {
+		const own = bag[key];
+		const legacy = legacyOf(key);
+		const old = legacy === null ? undefined : bag[legacy];
+		if (old === undefined) return own ?? NO_ENTRIES;
+		if (own === undefined) return old;
+		const cached = viewCache.get(key);
+		if (cached !== undefined && cached.own === own && cached.old === old) return cached.view;
+		const known = new Set(own.map((entry) => entry.id));
+		const combined = [...own, ...old.filter((entry) => !known.has(entry.id))].sort((a, b) => b.at - a.at);
+		const view = trim(combined);
+		viewCache.set(key, { own, old, view });
+		return view;
+	}
+
+	/**
+	 * Whether runs on a connection are recorded: its own switch, else its legacy
+	 * key's (so a switch-OFF chosen before the key changed still holds), else on.
+	 *
+	 * @param key - The connection's key.
+	 * @returns True when runs are recorded.
+	 */
+	function recordingOf(key: string): boolean {
+		const legacy = legacyOf(key);
+		return recording[key] ?? (legacy === null ? undefined : recording[legacy]) ?? true;
+	}
+
+	/**
+	 * Which list holds an entry: the connection's own, else its legacy list.
+	 *
+	 * @param key - The connection's key.
+	 * @param id - The entry id.
+	 * @returns The key of the list that holds it, or null.
+	 */
+	function holderOf(key: string, id: string): string | null {
+		if (bag[key]?.some((entry) => entry.id === id)) return key;
+		const legacy = legacyOf(key);
+		if (legacy !== null && bag[legacy]?.some((entry) => entry.id === id)) return legacy;
+		// Not found anywhere: act on the connection's own list when it has one,
+		// exactly as a store without legacy keys always has.
+		return bag[key] !== undefined ? key : null;
 	}
 
 	// ── Hydration and persistence ─────────────────────────────────────────────
@@ -353,14 +448,30 @@ export function createHistoryStore<F extends string>(options: IHistoryStoreOptio
 	 * @param entries - The connection's new entries, newest first.
 	 */
 	function setEntries(key: string, entries: IHistoryEntry<F>[]): void {
-		if (entries.length === 0) {
-			if (!(key in bag)) return;
-			const next = { ...bag };
-			delete next[key];
-			bag = next;
-		} else {
-			bag = { ...bag, [key]: entries };
+		applyLists([[key, entries]]);
+	}
+
+	/**
+	 * Replace several connections' lists as ONE change: one notification, one write.
+	 *
+	 * @param updates - Key and new entries pairs, newest first; an empty list removes the key.
+	 */
+	function applyLists(updates: [string, IHistoryEntry<F>[]][]): void {
+		let next = bag;
+		let changed = false;
+		for (const [key, entries] of updates) {
+			if (entries.length === 0) {
+				if (!(key in next)) continue;
+				if (next === bag) next = { ...bag };
+				delete next[key];
+			} else {
+				if (next === bag) next = { ...bag };
+				next[key] = entries;
+			}
+			changed = true;
 		}
+		if (!changed) return;
+		bag = next;
 		notify();
 		schedulePersist();
 	}
@@ -383,28 +494,41 @@ export function createHistoryStore<F extends string>(options: IHistoryStoreOptio
 			if (pendingRuns.length > MAX_PENDING_RUNS) pendingRuns.shift();
 			return;
 		}
-		if (recording[key] === false) return;
-		setEntries(key, trim([entry, ...(bag[key] ?? [])]));
+		if (!recordingOf(key)) return;
+		const legacy = legacyOf(key);
+		if (legacy === null || bag[legacy] === undefined) {
+			setEntries(key, trim([entry, ...(bag[key] ?? [])]));
+			return;
+		}
+		// The connection has history under its old key too: trim the MERGED view,
+		// then give each surviving entry back to the list it came from. A run that
+		// repeats an old entry collapses onto it and stays in the old list.
+		const merged = trim([entry, ...viewOf(key)]);
+		const fromLegacy = new Set((bag[legacy] ?? []).map((existing) => existing.id));
+		applyLists([
+			[key, merged.filter((kept) => !fromLegacy.has(kept.id))],
+			[legacy, merged.filter((kept) => fromLegacy.has(kept.id))],
+		]);
 	}
 
 	function removeEntry(key: string, id: string): void {
-		const current = bag[key];
-		if (!current) return;
-		setEntries(key, current.filter((entry) => entry.id !== id));
+		const holder = holderOf(key, id);
+		if (holder === null) return;
+		setEntries(holder, (bag[holder] as IHistoryEntry<F>[]).filter((entry) => entry.id !== id));
 	}
 
 	function togglePin(key: string, id: string): void {
-		const current = bag[key];
-		if (!current) return;
-		setEntries(key, current.map((entry) => (
+		const holder = holderOf(key, id);
+		if (holder === null) return;
+		setEntries(holder, (bag[holder] as IHistoryEntry<F>[]).map((entry) => (
 			entry.id === id ? { ...entry, pinned: !entry.pinned } : entry
 		)));
 	}
 
 	function setNote(key: string, id: string, note: string): void {
-		const current = bag[key];
-		if (!current) return;
-		setEntries(key, current.map((entry) => {
+		const holder = holderOf(key, id);
+		if (holder === null) return;
+		setEntries(holder, (bag[holder] as IHistoryEntry<F>[]).map((entry) => {
 			if (entry.id !== id) return entry;
 			const next = { ...entry };
 			if (note) next.note = note;
@@ -414,11 +538,12 @@ export function createHistoryStore<F extends string>(options: IHistoryStoreOptio
 	}
 
 	function clearForKey(key: string): void {
-		setEntries(key, []);
+		const legacy = legacyOf(key);
+		applyLists(legacy === null ? [[key, []]] : [[key, []], [legacy, []]]);
 	}
 
 	function setRecording(key: string, on: boolean): void {
-		if ((recording[key] ?? true) === on) return;
+		if (recordingOf(key) === on) return;
 		recording = { ...recording, [key]: on };
 		unsavedRecording = { ...unsavedRecording, [key]: on };
 		notify();
@@ -447,12 +572,12 @@ export function createHistoryStore<F extends string>(options: IHistoryStoreOptio
 	}
 
 	function useHistory(key: string): IHistoryEntry<F>[] {
-		const snapshot = (): IHistoryEntry<F>[] => bag[key] ?? NO_ENTRIES;
+		const snapshot = (): IHistoryEntry<F>[] => viewOf(key);
 		return useSyncExternalStore(subscribe, snapshot, snapshot);
 	}
 
 	function useRecording(key: string): boolean {
-		const snapshot = (): boolean => recording[key] ?? true;
+		const snapshot = (): boolean => recordingOf(key);
 		return useSyncExternalStore(subscribe, snapshot, snapshot);
 	}
 

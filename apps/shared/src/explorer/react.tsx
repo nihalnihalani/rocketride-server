@@ -29,9 +29,13 @@
 // tested without the platform; these wrappers are the thin seams onto it.
 // =============================================================================
 
-import React, { useEffect, useMemo, useRef } from 'react';
+import React, { useEffect, useMemo, useRef, useSyncExternalStore } from 'react';
 import { usePrefs } from 'shell';
+import { identityFingerprint, identityFromConnectResult } from './connect/identity';
+import type { IEndpointState, IEndpointStore } from './connect/store';
 import type { IPrefsAccessor } from './history/types';
+import { createShellWatch } from './shellBinding';
+import type { IExplorerClient } from './types';
 
 /** The part of a history store the bridge needs. */
 export interface IPrefsAttachable {
@@ -71,4 +75,42 @@ export function createHistoryPrefsBridge(store: IPrefsAttachable): React.FC {
 		return null;
 	};
 	return HistoryPrefsBridge;
+}
+
+/**
+ * Subscribe to an endpoint store's snapshot.
+ *
+ * @param store - The app's endpoint store.
+ * @returns The current snapshot (stable until the store changes).
+ */
+export function useEndpointState(store: IEndpointStore): IEndpointState {
+	return useSyncExternalStore(store.subscribe, store.getState, store.getState);
+}
+
+/**
+ * Keep an endpoint store wired to the platform for as long as the calling
+ * component is mounted: task events, window focus, reconnects and — the part
+ * that keeps one organization's connections out of the next session — identity
+ * changes and sign-out.
+ *
+ * Mount it once at the app root with the shell's own props. The store is
+ * re-attached only when the CLIENT or the identity FINGERPRINT changes (user,
+ * organization, development team — never a token, never a permission list).
+ *
+ * @param store - The app's endpoint store.
+ * @param client - The shell's client (null while disconnected).
+ * @param identity - The shell's `identity` prop (a ConnectResult, or null when signed out).
+ */
+export function useEndpointStoreLifecycle(store: IEndpointStore, client: IExplorerClient | null, identity: unknown): void {
+	const latest = identityFromConnectResult(identity);
+	const fingerprint = identityFingerprint(latest);
+	const latestRef = useRef(latest);
+	latestRef.current = latest;
+
+	useEffect(() => {
+		if (client === null) return undefined;
+		return store.attach(client, latestRef.current, createShellWatch(client));
+		// `fingerprint` stands in for the identity: a new object with the same
+		// user, organization and team must not re-attach.
+	}, [store, client, fingerprint]);
 }
