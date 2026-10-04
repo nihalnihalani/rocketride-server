@@ -43,7 +43,7 @@
 
 import React, { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { CSSProperties } from 'react';
-import { Controls, ReactFlow, ReactFlowProvider, applyNodeChanges, useReactFlow, useStore } from '@xyflow/react';
+import { ControlButton, Controls, ReactFlow, ReactFlowProvider, applyNodeChanges, getViewportForBounds, useReactFlow, useStore } from '@xyflow/react';
 import type { NodeChange } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
 import { captionOf } from '../graph/captions';
@@ -60,6 +60,7 @@ import { labelsVisibleAt, sameShallow, stabilise, zoomLevel } from './stable';
 import { ensureCanvasStyle, useReducedMotion, useThemeMode } from './environment';
 import { FLOW_INTERACTION_PROPS } from './flowProps';
 import { EdgeLayer } from './EdgeLayer';
+import { contentBounds } from './fitBounds';
 import type { IEdgeDraw } from './EdgeLayer';
 import { GraphNodeView, NODE_DIAMETER } from './GraphNodeView';
 import type { GraphFlowNode } from './GraphNodeView';
@@ -127,6 +128,10 @@ function textOn(fill: string, resolved: Map<string, string>): string {
 /** Off-screen but available to assistive technology. */
 const VISUALLY_HIDDEN: CSSProperties = { position: 'absolute', width: 1, height: 1, margin: -1, padding: 0, overflow: 'hidden', clip: 'rect(0 0 0 0)', whiteSpace: 'nowrap', border: 0 };
 
+/** The room left around what is fitted, as a share of the canvas. */
+const FIT_PADDING = 0.2;
+/** The smallest zoom the canvas allows (the same value the flow is given). */
+const FLOW_MIN_ZOOM = FLOW_INTERACTION_PROPS.minZoom;
 /** Fit never magnifies: a graph of two nodes is shown at normal size, not as two huge circles. */
 const FIT_MAX_ZOOM = 1;
 const NO_IDS: ReadonlySet<GraphId> = new Set();
@@ -177,6 +182,8 @@ function CanvasInner(props: IGraphCanvasProps): React.ReactElement {
 	// is fitted when the tab is shown, because a ResizeObserver retries the pending fit.
 	const wanted = useRef(0);
 	const pendingFit = useRef(false);
+	// The relationships as drawn (set each render below), so a fit can include loops, curves and labels.
+	const edgesRef = useRef<readonly IEdgeDraw[]>([]);
 	// True once the user pans or zooms: a resize then keeps their view instead of refitting.
 	const userMoved = useRef(false);
 	const flowRef = useRef(flow);
@@ -191,10 +198,22 @@ function CanvasInner(props: IGraphCanvasProps): React.ReactElement {
 		if (!el || el.clientWidth === 0 || el.clientHeight === 0) return;
 		if (flowRef.current.getNodes().length < wanted.current) return;
 		// No point animating a tab nobody is looking at.
-		void flowRef.current.fitView({ padding: 0.2, maxZoom: FIT_MAX_ZOOM, duration: reducedRef.current || document.hidden ? 0 : 300 }).then((done) => {
+		const duration = reducedRef.current || document.hidden ? 0 : 300;
+		// Fit everything that is DRAWN, not just the node circles: a loop on the topmost node, a bowed parallel
+		// relationship and the type labels all reach beyond the circles (see fitBounds.ts).
+		const bounds = contentBounds(layoutPositions.current, edgesRef.current);
+		if (!bounds) return;
+		const viewport = getViewportForBounds(bounds, el.clientWidth, el.clientHeight, FLOW_MIN_ZOOM, FIT_MAX_ZOOM, FIT_PADDING);
+		void flowRef.current.setViewport(viewport, { duration }).then((done) => {
 			if (done) pendingFit.current = false;
 		});
 	}, []);
+	/** The fit button: fit again now, and take the view back from the user's pan or zoom. */
+	const refit = useCallback(() => {
+		userMoved.current = false;
+		pendingFit.current = true;
+		tryFit();
+	}, [tryFit]);
 	useEffect(() => {
 		if (layout.version === 0) return undefined;
 		pendingFit.current = true;
@@ -298,6 +317,8 @@ function CanvasInner(props: IGraphCanvasProps): React.ReactElement {
 		// Unchanged relationships keep their object (see stable.ts).
 		return stabilise(edgeCache.current, list, (x, y) => x.source === y.source && x.target === y.target && x.ariaLabel === y.ariaLabel && x.type === y.type && x.highlighted === y.highlighted && sameShallow(x.slot as unknown as Record<string, unknown>, y.slot as unknown as Record<string, unknown>));
 	}, [model, layout.positions, captions, selected, highlighted]);
+
+	edgesRef.current = edges;
 
 	// Where every node is on screen right now (a drag included): the edge layer draws from these.
 	const centers = useMemo(() => {
@@ -420,7 +441,14 @@ function CanvasInner(props: IGraphCanvasProps): React.ReactElement {
 				{...FLOW_INTERACTION_PROPS}
 			>
 				<EdgeLayer edges={edges} centers={centers} />
-				<Controls showInteractive={false} position="bottom-left" />
+				{/* The stock fit button fits node boxes only; this one fits everything drawn, like the automatic fit. */}
+				<Controls showInteractive={false} showFitView={false} position="bottom-left">
+					<ControlButton className="react-flow__controls-fitview" title="fit view" aria-label="fit view" onClick={refit}>
+						<svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+							<path d="M2 6V2h4M10 2h4v4M14 10v4h-4M6 14H2v-4" />
+						</svg>
+					</ControlButton>
+				</Controls>
 			</ReactFlow>
 		</div>
 	);
