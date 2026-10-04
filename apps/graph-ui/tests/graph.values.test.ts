@@ -9,7 +9,7 @@
 
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { chooseTab, collectEntities, columnKeys, summarizeResult, toGridRows } from '../src/graph/results';
+import { RAW_VIEW_LIMIT, chooseTab, collectEntities, columnGridTypes, columnKeys, rawView, summarizeResult, toGridRows } from '../src/graph/results';
 import { countUnsafeNumbers, decodeUserKey, describeValue, encodeUserKey, hasKindKey, isGraphNode, isGraphPath, isGraphRelationship, isTagged, toJsonText, userEntries } from '../src/graph/values';
 import type { GraphNode, GraphValue } from '../src/graph/types';
 import { node, readQueryFixture, rel } from './support/builders';
@@ -174,4 +174,22 @@ test('describeValue gives bounded one-line text for every value kind', () => {
 	let deep: unknown = 1;
 	for (let i = 0; i < 100; i++) deep = [deep];
 	assert.ok(describeValue(deep).length < 100, 'deep nesting terminates');
+});
+
+test('a column is numeric only when every non-null cell is a JSON number; number tags and entities stay text', () => {
+	const types = columnGridTypes({ columns: ['n', 'mixed', 'text', 'tag', 'allnull', 'node'], rows: [[1, 1, 'a', { '@kind': 'number', value: '9007199254740993' }, null, node('1')], [2.5, 'x', 'b', { '@kind': 'number', value: '5' }, null, node('2')], [null, 3, 'c', { '@kind': 'number', value: '6' }, null, node('3')]] });
+	assert.deepEqual(types, ['number', 'string', 'string', 'string', 'string', 'string']);
+	assert.deepEqual(columnGridTypes({ columns: [], rows: [] }), []);
+});
+
+test('the Raw view shows the exact envelope, and a huge one is cut for display with its true length reported', () => {
+	const small = readQueryFixture('neo4j');
+	const view = rawView(small);
+	assert.equal(view.cut, false);
+	assert.deepEqual(JSON.parse(view.text), small);
+	const big = { columns: ['s'], rows: [['x'.repeat(RAW_VIEW_LIMIT + 10)]] };
+	const cut = rawView(big);
+	assert.equal(cut.cut, true);
+	assert.equal(cut.text.length, RAW_VIEW_LIMIT);
+	assert.ok(cut.length > RAW_VIEW_LIMIT, 'the full length is known so the UI can offer the whole text');
 });

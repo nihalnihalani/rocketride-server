@@ -15,7 +15,9 @@ import { CHART_COLOR_VARS, assignLabelColors, colorFor, composite, contrastRatio
 import type { Rgb } from '../src/graph/colors';
 import { CAPTION_ID, CAPTION_LABEL, CAPTION_MAX_CHARS, captionChoices, captionOf, defaultCaptionKey } from '../src/graph/captions';
 import { CANVAS_RULES } from '../src/canvas/environment';
-import { node } from './support/builders';
+import { legendOf } from '../src/graph/legend';
+import { modelFromResult } from '../src/graph/model';
+import { entitiesOf, node } from './support/builders';
 
 test('the first six labels (sorted) take the chart colours in order; the rest hash', () => {
 	const labels = ['Zebra', 'Apple', 'Mango', 'Cherry', 'Banana', 'Fig', 'Grape', 'Date'];
@@ -192,4 +194,14 @@ test('the node outline is unconditional: one plain rule, not nested in a media o
 	// Motion is opt-in: the only transition lives under prefers-reduced-motion: no-preference.
 	const transitions = rules.filter((r) => r.includes('transition'));
 	assert.ok(transitions.length > 0 && transitions.every((r) => r.startsWith('@media (prefers-reduced-motion: no-preference)')));
+});
+
+test('the legend names every label on the canvas with its colour and a count of the DRAWN nodes', () => {
+	const model = modelFromResult(entitiesOf([node('1', ['Person']), node('2', ['Person', 'Employee']), node('3', ['Company']), node('4', []), node('5', ['Person'])], []));
+	const colors = assignLabelColors(['Company', 'Person', 'Employee']);
+	const legend = legendOf(model, colors);
+	assert.deepEqual(legend.map((e) => [e.name, e.count]), [['Person', 3], ['(no label)', 1], ['Company', 1]], 'Employee is a second label: it does not set the colour, so it is not a legend line');
+	assert.equal(legend[0].fill, 'var(--rr-chart-yellow)', 'sorted labels Company, Employee, Person take blue, green, yellow');
+	assert.equal(legend.find((e) => e.name === '(no label)')?.fill, 'var(--rr-grey-400)');
+	assert.deepEqual(legendOf(modelFromResult(entitiesOf([], [])), colors), []);
 });

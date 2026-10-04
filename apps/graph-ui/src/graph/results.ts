@@ -30,7 +30,7 @@
 // Nothing here ever derives a key from a column name.
 // =============================================================================
 
-import { MAX_DEPTH, MAX_VISITS, countUnsafeNumbers, hasKindKey, isGraphNode, isGraphPath, isGraphRelationship, isPlainObject, isTagged } from './values';
+import { MAX_DEPTH, MAX_VISITS, countUnsafeNumbers, hasKindKey, isGraphNode, isGraphPath, isGraphRelationship, isPlainObject, isTagged, toJsonText } from './values';
 import type { GraphId, GraphNode, GraphRelationship, ReadQueryResult } from './types';
 
 // =============================================================================
@@ -190,4 +190,47 @@ export function toGridRows(result: Pick<ReadQueryResult, 'columns' | 'rows'>): A
 		for (let i = 0; i < keys.length; i++) record[keys[i]] = row[i];
 		return record;
 	});
+}
+
+// =============================================================================
+// TABLE COLUMN TYPES AND THE RAW VIEW
+// =============================================================================
+
+/** The grid types a result column may take. */
+export type ColumnGridType = 'string' | 'number';
+
+/**
+ * The grid type of each column: `number` only when every non-null cell is a JSON
+ * number (so numeric sort and filters apply), `string` for everything else
+ * (entities, tags, text, lists, maps). A number TAG is text on purpose: it never
+ * gets numeric treatment that could round it.
+ *
+ * @param result - A result's columns and rows.
+ * @returns One type per column position.
+ */
+export function columnGridTypes(result: Pick<ReadQueryResult, 'columns' | 'rows'>): ColumnGridType[] {
+	return result.columns.map((_, i) => {
+		let seen = false;
+		for (const row of result.rows) {
+			const cell = row[i];
+			if (cell === null || cell === undefined) continue;
+			if (typeof cell !== 'number') return 'string';
+			seen = true;
+		}
+		return seen ? 'number' : 'string';
+	});
+}
+
+/** How much of the Raw view is rendered; the whole text can still be copied. */
+export const RAW_VIEW_LIMIT = 400_000;
+
+/**
+ * The Raw view's text: the whole envelope as pretty JSON, bounded for display.
+ *
+ * @param result - A `read_query` envelope.
+ * @returns The text to show, whether it was cut, and the full text's length.
+ */
+export function rawView(result: unknown): { text: string; cut: boolean; length: number } {
+	const full = toJsonText(result, 2);
+	return full.length <= RAW_VIEW_LIMIT ? { text: full, cut: false, length: full.length } : { text: full.slice(0, RAW_VIEW_LIMIT), cut: true, length: full.length };
 }
