@@ -87,8 +87,15 @@ export interface GraphNumber {
 	value: string;
 }
 
+/** Binary data (contract v1.1): its size, and its bytes as base64 unless it exceeds 64 KiB (then `base64` is null). */
+export interface GraphBytes {
+	'@kind': 'bytes';
+	size: number;
+	base64: string | null;
+}
+
 /** Any value that can sit in a result cell. */
-export type GraphValue = null | boolean | number | string | GraphValue[] | { [key: string]: GraphValue } | GraphNode | GraphRelationship | GraphPath | GraphTemporal | GraphPoint | GraphNumber;
+export type GraphValue = null | boolean | number | string | GraphValue[] | { [key: string]: GraphValue } | GraphNode | GraphRelationship | GraphPath | GraphTemporal | GraphPoint | GraphNumber | GraphBytes;
 
 /** The `read_query` envelope (contract v1 section 1.1). Rows are positional arrays. */
 export interface ReadQueryResult {

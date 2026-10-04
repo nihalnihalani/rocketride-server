@@ -36,7 +36,7 @@
 // such, never silently treated as a plain map and never as a graph entity.
 // =============================================================================
 
-import type { GraphNode, GraphNumber, GraphPath, GraphPoint, GraphRelationship, GraphTemporal, GraphValue, TemporalType } from './types';
+import type { GraphBytes, GraphNode, GraphNumber, GraphPath, GraphPoint, GraphRelationship, GraphTemporal, GraphValue, TemporalType } from './types';
 
 // =============================================================================
 // SHAPE GUARDS
@@ -134,6 +134,16 @@ export function isGraphNumber(value: unknown): value is GraphNumber {
 }
 
 /**
+ * Whether a value is a binary tag.
+ *
+ * @param value - Any value.
+ * @returns True for a well-formed bytes value (`base64` is a string or null).
+ */
+export function isGraphBytes(value: unknown): value is GraphBytes {
+	return isPlainObject(value) && value['@kind'] === 'bytes' && typeof value.size === 'number' && Number.isFinite(value.size) && value.size >= 0 && (value.base64 === null || typeof value.base64 === 'string');
+}
+
+/**
  * Whether an object carries a `@kind` key at all (so it is a tag, well-formed or not).
  *
  * @param value - Any value.
@@ -147,10 +157,10 @@ export function hasKindKey(value: unknown): boolean {
  * Whether a value is a tagged graph value in a recognised, well-formed shape.
  *
  * @param value - Any value.
- * @returns True for a node, relationship, path, temporal, point or number tag.
+ * @returns True for a node, relationship, path, temporal, point, number or bytes tag.
  */
-export function isTagged(value: unknown): value is GraphNode | GraphRelationship | GraphPath | GraphTemporal | GraphPoint | GraphNumber {
-	return isGraphNode(value) || isGraphRelationship(value) || isGraphPath(value) || isGraphTemporal(value) || isGraphPoint(value) || isGraphNumber(value);
+export function isTagged(value: unknown): value is GraphNode | GraphRelationship | GraphPath | GraphTemporal | GraphPoint | GraphNumber | GraphBytes {
+	return isGraphNode(value) || isGraphRelationship(value) || isGraphPath(value) || isGraphTemporal(value) || isGraphPoint(value) || isGraphNumber(value) || isGraphBytes(value);
 }
 
 // =============================================================================
@@ -274,6 +284,7 @@ export function describeValue(value: unknown, depth = 0): string {
 	if (isGraphTemporal(value)) return value.zone ? `${value.value} [${value.zone}]` : value.value;
 	if (isGraphPoint(value)) return `point(srid ${value.srid}: ${value.coordinates.join(', ')})`;
 	if (isGraphNumber(value)) return value.value;
+	if (isGraphBytes(value)) return `binary, ${value.size.toLocaleString('en-US')} ${value.size === 1 ? 'byte' : 'bytes'}`;
 	if (isPlainObject(value)) return clip(`{${describeProps(value as { [key: string]: GraphValue }, depth)}}`);
 	return String(value);
 }

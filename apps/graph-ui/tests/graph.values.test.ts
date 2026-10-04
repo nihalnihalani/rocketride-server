@@ -15,6 +15,7 @@ import type { GraphNode, GraphValue } from '../src/graph/types';
 import { node, readQueryFixture, rel } from './support/builders';
 
 const ENGINES = ['neo4j', 'falkordb', 'age'] as const;
+const SETS = ['provisional', 'v1'] as const;
 
 test('the same logical graph summarises identically on every engine', () => {
 	const summaries = ENGINES.map((engine) => {
