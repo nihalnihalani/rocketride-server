@@ -275,6 +275,44 @@ jobs:
             echo "RR_REQUIRE_DB_TESTS=1"
           } >> "$GITHUB_ENV"
 
+      # Neo4j and FalkorDB for the graph node live suites (Linux only), run by
+      # the unmocked live-database pass of nodes:test. Pinned by digest: the
+      # graph tools' read-only and result-shape guarantees are proved against
+      # these exact servers (Neo4j 5.26.31 Community, FalkorDB module 6.0.1).
+      # Community has no custom roles, so the read-only ROLE boundary is not
+      # exercised here; the suites prove the node's own read path instead.
+      # Vars are exported only once both servers answer, and
+      # RR_REQUIRE_DB_TESTS (above) makes an unreachable server a failure.
+      - name: Start graph databases (Neo4j + FalkorDB) for tests / Linux
+        if: matrix.platform == 'ubuntu' && inputs.codeql == false
+        run: |
+          set -euo pipefail
+          docker run -d --name rr-neo4j -p 57687:7687 \
+            -e NEO4J_AUTH=neo4j/rr-ci-graph-pass \
+            -e NEO4J_server_memory_heap_max__size=512m \
+            neo4j:5.26-community@sha256:d9cfe82983d27f5a75b3aaae8f316d04f9a698a3b7f6103a508f7caf8362f255
+          docker run -d --name rr-falkordb -p 56379:6379 \
+            falkordb/falkordb@sha256:e2765e207e5ba4ee90e47ed31eb7491ad6dd3d42241c326e429375c02ad9882f
+          ready=
+          for i in $(seq 1 60); do
+            if docker exec rr-neo4j cypher-shell -u neo4j -p rr-ci-graph-pass 'RETURN 1' >/dev/null 2>&1; then ready=1; break; fi
+            sleep 2
+          done
+          [ "${ready:-}" = "1" ] || { echo "rr-neo4j did not become ready"; docker logs rr-neo4j || true; exit 1; }
+          ready=
+          for i in $(seq 1 30); do
+            if docker exec rr-falkordb redis-cli GRAPH.QUERY ci_smoke 'RETURN 1' >/dev/null 2>&1; then ready=1; break; fi
+            sleep 1
+          done
+          [ "${ready:-}" = "1" ] || { echo "rr-falkordb did not become ready"; docker logs rr-falkordb || true; exit 1; }
+          docker exec rr-falkordb redis-cli GRAPH.DELETE ci_smoke >/dev/null 2>&1 || true
+          {
+            echo "RR_TEST_NEO4J_URI=bolt://localhost:57687"
+            echo "RR_TEST_NEO4J_USER=neo4j"
+            echo "RR_TEST_NEO4J_PASSWORD=rr-ci-graph-pass" # gitleaks:allow — throwaway CI container password
+            echo "RR_TEST_FALKORDB_URL=redis://localhost:56379"
+          } >> "$GITHUB_ENV"
+
       - name: Test
         if: inputs.codeql == false && inputs.test
         # Integration tests boot a local server on :5565 and connect a test
