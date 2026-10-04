@@ -201,6 +201,15 @@ read-only identity: to offer both browsing and writing, configure two nodes,
 one with a read-only identity and one with a write identity and **Allow direct
 query execution** on.
 
+Neo4j's default `PUBLIC` role grants the `LOAD` privilege, so a read-only
+identity used with **Allow direct query execution** on can still run
+`LOAD CSV` through `execute`. That reads server-side or remote files; it never
+writes the graph. `read_query` refuses `LOAD CSV` regardless. Operators who
+want the identity to have no file or URL access should run
+`REVOKE LOAD ON ALL DATA FROM PUBLIC`. The privilege self-check behind
+`read_boundary_verified` treats `LOAD` as non-writing, so it does not stop a
+reader identity from counting as verified.
+
 ## Notes
 
 ### Schema reflection and query generation
