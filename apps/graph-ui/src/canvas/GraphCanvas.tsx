@@ -43,7 +43,7 @@
 
 import React, { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { CSSProperties } from 'react';
-import { Controls, ReactFlow, ReactFlowProvider, applyNodeChanges, useReactFlow } from '@xyflow/react';
+import { Controls, ReactFlow, ReactFlowProvider, applyNodeChanges, useReactFlow, useStore } from '@xyflow/react';
 import type { NodeChange } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
 import { captionOf } from '../graph/captions';
@@ -56,10 +56,11 @@ import { relationshipsOf } from '../graph/model';
 import type { IGraphModel } from '../graph/model';
 import type { GraphId } from '../graph/types';
 import { STATIC_LAYOUT_ABOVE } from '../graph/budgets';
+import { labelsVisibleAt, sameShallow, stabilise, zoomLevel } from './stable';
 import { ensureCanvasStyle, useReducedMotion, useThemeMode } from './environment';
 import { FLOW_INTERACTION_PROPS } from './flowProps';
-import { GraphEdgeView } from './GraphEdgeView';
-import type { GraphFlowEdge } from './GraphEdgeView';
+import { EdgeLayer } from './EdgeLayer';
+import type { IEdgeDraw } from './EdgeLayer';
 import { GraphNodeView, NODE_DIAMETER } from './GraphNodeView';
 import type { GraphFlowNode } from './GraphNodeView';
 import { useGraphLayout } from './useGraphLayout';
@@ -130,7 +131,8 @@ const VISUALLY_HIDDEN: CSSProperties = { position: 'absolute', width: 1, height:
 const FIT_MAX_ZOOM = 1;
 const NO_IDS: ReadonlySet<GraphId> = new Set();
 const NODE_TYPES = { graphNode: GraphNodeView };
-const EDGE_TYPES = { graphEdge: GraphEdgeView };
+/** React Flow draws no edges of its own: the layer does (see EdgeLayer.tsx). */
+const NO_EDGES: never[] = [];
 
 /**
  * The canvas proper.
@@ -235,6 +237,8 @@ function CanvasInner(props: IGraphCanvasProps): React.ReactElement {
 		return out;
 	}, [model]);
 
+	const nodeCache = useRef(new Map<string, GraphFlowNode>());
+	const edgeCache = useRef(new Map<string, IEdgeDraw>());
 	const nodes = useMemo((): GraphFlowNode[] => {
 		const list: GraphFlowNode[] = [];
 		// Exactly one node is in the tab order: the one that has focus (or the first when none does).
@@ -258,7 +262,8 @@ function CanvasInner(props: IGraphCanvasProps): React.ReactElement {
 				data: { caption, fill, textColor: textOn(fill, textColors.current), initial: (label[0] ?? '•').toUpperCase(), selected: selected.has(id), expanded: model.expansions.has(id), stale: allStale || staleIds.has(id) },
 			});
 		}
-		return list;
+		// Unchanged nodes keep their object, so a click or a focus move redoes the nodes that changed, not all of them.
+		return stabilise(nodeCache.current, list, (a, b) => a.position.x === b.position.x && a.position.y === b.position.y && a.focusable === b.focusable && a.ariaLabel === b.ariaLabel && sameShallow(a.data, b.data));
 		// textColors is a ref reset on theme change, which re-derives the nodes through `mode` below.
 		// eslint-disable-next-line react-hooks/exhaustive-deps
 	}, [model, layout.positions, colors, captions, selected, focusedId, counts, mode, staleIds, allStale]);
@@ -271,10 +276,10 @@ function CanvasInner(props: IGraphCanvasProps): React.ReactElement {
 		setFlowNodes(nodes);
 	}, [nodes]);
 
-	const edges = useMemo((): GraphFlowEdge[] => {
+	const edges = useMemo((): IEdgeDraw[] => {
 		const specs = [...model.relationships.values()].map((r) => ({ id: r.id, source: r.start, target: r.end }));
 		const slots = edgeSlots(specs);
-		const list: GraphFlowEdge[] = [];
+		const list: IEdgeDraw[] = [];
 		for (const r of model.relationships.values()) {
 			const slot = slots.get(r.id);
 			const a = model.nodes.get(r.start);
@@ -282,15 +287,30 @@ function CanvasInner(props: IGraphCanvasProps): React.ReactElement {
 			if (!slot || !a || !b || !layout.positions.has(r.start) || !layout.positions.has(r.end)) continue;
 			list.push({
 				id: r.id,
-				type: 'graphEdge',
 				source: r.start,
 				target: r.end,
 				ariaLabel: `${r.type} from ${captionOf(a, captions.get(a.labels[0] ?? ''))} to ${captionOf(b, captions.get(b.labels[0] ?? ''))}`,
-				data: { slot, type: r.type, highlighted: selected.has(r.start) || selected.has(r.end) || highlighted.has(r.id) },
+				slot,
+				type: r.type,
+				highlighted: selected.has(r.start) || selected.has(r.end) || highlighted.has(r.id),
 			});
 		}
-		return list;
+		// Unchanged relationships keep their object (see stable.ts).
+		return stabilise(edgeCache.current, list, (x, y) => x.source === y.source && x.target === y.target && x.ariaLabel === y.ariaLabel && x.type === y.type && x.highlighted === y.highlighted && sameShallow(x.slot as unknown as Record<string, unknown>, y.slot as unknown as Record<string, unknown>));
 	}, [model, layout.positions, captions, selected, highlighted]);
+
+	// Where every node is on screen right now (a drag included): the edge layer draws from these.
+	const centers = useMemo(() => {
+		const map = new Map<GraphId, Point>();
+		for (const n of flowNodes) map.set(n.id, { x: n.position.x + NODE_DIAMETER / 2, y: n.position.y + NODE_DIAMETER / 2 });
+		return map;
+	}, [flowNodes]);
+
+	// Relationship type labels: hundreds of rotated text labels are unreadable zoomed out and are the most expensive
+	// thing to repaint, so they are drawn only when they can be read (see stable.ts). The zoom is read as a LEVEL: this
+	// component re-renders when the level changes, not on every pan or zoom step.
+	const level = useStore((state) => zoomLevel(state.transform[2]));
+	const edgeLabels = labelsVisibleAt(level, edges.length);
 
 	// Focus follows the model when the change came from the keyboard. Node ids are NOT unique
 	// across nodes and relationships (FalkorDB counts them separately), so the lookup is
@@ -379,15 +399,14 @@ function CanvasInner(props: IGraphCanvasProps): React.ReactElement {
 	const onNodeDoubleClick = useCallback((_event: React.MouseEvent, node: GraphFlowNode) => latest.current.onExpand(node.id), []);
 
 	return (
-		<div ref={container} className="graph-ui-canvas" style={{ width: '100%', height: '100%', minHeight: 0 }} onKeyDown={onKeyDown} onFocus={onFocusCapture} role="group" aria-roledescription="graph" aria-label="Graph" aria-describedby={helpId}>
+		<div ref={container} className="graph-ui-canvas" data-edge-labels={edgeLabels ? 'on' : 'off'} style={{ width: '100%', height: '100%', minHeight: 0 }} onKeyDown={onKeyDown} onFocus={onFocusCapture} role="group" aria-roledescription="graph" aria-label="Graph" aria-describedby={helpId}>
 			<div id={helpId} style={VISUALLY_HIDDEN}>
 				Arrow keys move between connected nodes. Enter opens the inspector, Space selects, E expands, C collapses, Delete dismisses, P finds a path between two selected nodes, question mark lists every key. The Table tab lists the same results.
 			</div>
 			<ReactFlow
 				nodes={flowNodes}
-				edges={edges}
+				edges={NO_EDGES}
 				nodeTypes={NODE_TYPES}
-				edgeTypes={EDGE_TYPES}
 				colorMode={mode}
 				onNodesChange={onNodesChange}
 				onNodeClick={onNodeClick}
@@ -400,6 +419,7 @@ function CanvasInner(props: IGraphCanvasProps): React.ReactElement {
 				proOptions={{ hideAttribution: true }}
 				{...FLOW_INTERACTION_PROPS}
 			>
+				<EdgeLayer edges={edges} centers={centers} />
 				<Controls showInteractive={false} position="bottom-left" />
 			</ReactFlow>
 		</div>

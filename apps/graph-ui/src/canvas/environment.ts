@@ -98,6 +98,12 @@ export const CANVAS_RULES = [
 	'.graph-ui-canvas .graph-ui-node[data-stale="true"] .graph-ui-circle { border: 2px dashed var(--rr-text-primary); opacity: 0.55; }',
 	'.graph-ui-canvas .graph-ui-caption { position: absolute; top: 100%; left: 50%; transform: translateX(-50%); margin-top: 5px; max-width: 150px; font-size: 11.5px; line-height: 1.2; text-align: center; color: var(--rr-text-primary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; pointer-events: none; text-shadow: 0 0 3px var(--rr-bg-paper), 0 0 3px var(--rr-bg-paper); }',
 	'.graph-ui-canvas .graph-ui-edge-label { font-size: 10px; fill: var(--rr-text-secondary); paint-order: stroke; stroke: var(--rr-bg-paper); stroke-width: 3px; stroke-linejoin: round; user-select: none; }',
+	// Zoomed out or crowded: the label text is not drawn (the edge keeps its tooltip, accessible name, the inspector and the Table).
+	'.graph-ui-canvas[data-edge-labels="off"] .graph-ui-edge-label { display: none; }',
+	// Edges have no pointer behaviour (no click, no hover, not focusable): taking them out of hit-testing saves the browser a test against every one of them on each mouse move.
+	'.graph-ui-canvas .graph-ui-edge-layer, .graph-ui-canvas .graph-ui-edge-layer * { pointer-events: none; }',
+	// The edge layer sits behind the nodes: the viewport is a stacking context, so a negative index is behind its nodes and still in front of the page.
+	'.graph-ui-canvas .react-flow__viewport-portal { z-index: -1; }',
 	'.graph-ui-canvas .react-flow__attribution { display: none; }',
 	// Layout results glide into place, but only while the container says so (never while dragging) and never under reduced motion.
 	'@media (prefers-reduced-motion: no-preference) { .graph-ui-canvas.graph-ui-animating .react-flow__node { transition: transform 300ms ease; } }',
