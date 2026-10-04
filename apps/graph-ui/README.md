@@ -235,10 +235,18 @@ editor and an **Execute** button, and it always says what it is:
   node says so with its own text and the app shows it.
 - FalkorDB and Neo4j refuse two columns with the same name; AGE keeps them, and
   the Table shows both.
-- Dragging nodes is smooth for graphs of a few hundred nodes and relationships on a laptop and slows as the graph grows toward the canvas maximum (1,000 nodes, 2,000 relationships); the first draw is capped at 300 nodes for that reason, and **Show more nodes** adds the rest. It has been measured at 300 nodes and 600 relationships, not beyond.
-- Only Chromium has been exercised. The build targets Chrome 81, Edge 83,
-  Firefox 76 and Safari 13 and later, but behaviour in Firefox and Safari has not
-  been checked, and the layout worker's cross-origin handling differs by browser.
+- Performance was measured with results of 100, 300 and 1,000 nodes (the first
+  draw is capped at 300 nodes; **Show more nodes** adds the rest, up to the
+  canvas maximum). On an Apple-silicon laptop there were no long tasks while
+  panning or dragging. A slower device pays more per frame, most when a node is
+  dragged in a large graph.
+- Browsers: the production checks ran in Chrome 154, Firefox 141 and WebKit 26
+  (Playwright). WebKit is the engine Safari uses, but it is not Safari, and
+  Safari itself has not been tried. The build declares Safari 13 as its floor,
+  but the canvas (React Flow 12.3.6) uses logical assignment (`??=`), which
+  starts in Safari 14, so Safari 14 is the lowest version the canvas can run in.
+  The declared floor has not been changed. The layout worker's cross-origin
+  handling differs by browser.
 - The code editor needs `cdn.jsdelivr.net`; without it the plain text box is
   used.
 
