@@ -26,10 +26,27 @@ than from the app.
 
 ## Connections
 
-The Connections page lists every database tool node in every pipeline task
-you can see. Each card shows the pipeline, the dialect and a summary of the
-schema; selecting one opens a drawer where you can probe the endpoint before
-binding to it. An empty list means no running task has a database node.
+The Connections page lists every database tool node in every running
+pipeline task you can see, in one call, however many there are. Your own
+development run and a team's deployment of the same pipeline are separate
+connections (a deployment's card says so), and two owners' runs never merge.
+Each card shows the pipeline, the engine and a state, and selecting one opens
+a drawer where you can probe the endpoint before binding to it. An empty list
+means no running task has a database node.
+
+A connection is **Checking** while the app asks the node which engine it is,
+**Running** once it answered, **Stopped** when its pipeline is no longer
+running (the card stays so an open workbench can say so), **Unreachable**
+when the node could not be reached (for example it is not wired to a tools
+source), and **No access** when you can see a team deployment but your role
+cannot call it (calling a tool needs `task.data`, seeing it only
+`task.monitor`). The list refreshes on its own when a pipeline starts, stops
+or restarts, and when you return to the window; **Refresh** does it on
+demand. Signing out, or switching organization or team, clears the list, so
+one session's connections never appear in the next.
+
+The app never holds a connection string or a task token in anything it saves
+or shows. Task tokens are kept in memory only, per session.
 
 Opening a connection gives it a workbench document and fills the sidebar
 with that database's tables. Everything else hangs off a connection: query
@@ -332,6 +349,14 @@ The list is bounded, because the preferences file is read and written on
 every app switch: 100 entries per connection including pinned ones, 8 KB per
 statement, 256 KB across all connections. Recording can be turned off per
 connection, and **Clear** empties one connection's list, pins included.
+
+History is kept per connection. Connections are identified by their run kind,
+owner, team, project, source and node, so a deployment never shows your
+development history. History you saved before that identity existed is still
+read for your own development run of the same pipeline: it is never moved or
+deleted, a new run is saved under the new identity, pinning or annotating an
+older entry changes it where it lives, and **Clear** empties both. The
+recording switch and the pattern-check switch you chose then still apply.
 
 Re-running an entry that changed data asks first and quotes what it did last
 time; the rerun is a fresh run with its own entry.
