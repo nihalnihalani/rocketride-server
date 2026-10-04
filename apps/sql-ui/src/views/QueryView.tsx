@@ -67,6 +67,7 @@ import { announce } from '../a11y/announce';
 import { createConnectionFlags } from 'shared/explorer/history/flags';
 import { legacyKeyFromKey } from 'shared/explorer/keys';
 import { splitStatements, splitStatementsIn, statementAtOffset } from '../sql/split';
+import { liveBufferText, selectRunTargets } from '../sql/targets';
 import { classifyStatement, patternCheck } from '../sql/classify';
 import type { IFailureNotice } from '../sql/failure';
 import { applyRowLimit, formatBatchOutcome, formatElapsed, formatPriorStatements, leadingVerb } from '../sql/batch';
@@ -431,26 +432,22 @@ export const QueryView: React.FC<IQueryViewProps> = ({ endpoint, label, initialS
 	 * The statements the Run button would send right now: the selection when
 	 * there is one, otherwise the statement holding the caret.
 	 *
-	 * Reads the live editor handle rather than the debounced preview state, so
-	 * a keypress that lands between a caret move and its settle still sends
-	 * what the user is looking at.
+	 * Reads the live editor handle for the TEXT as well as the caret and the
+	 * selection. The `sql` state can lag the editor by a render when the run
+	 * action fires right after the last keystrokes; pairing that stale copy with
+	 * the live caret selected a truncated statement. The state copy is only the
+	 * fallback when there is no editor to ask.
 	 *
 	 * @returns The statements to run (possibly empty).
 	 */
 	const currentTarget = useCallback((): IRunTarget[] => {
-		const selection = editorRef.current?.getSelection();
-		if (selection && selection.text.trim()) {
-			// A selection is NOT necessarily one statement — `SELECT …; DELETE …`
-			// can be dragged in one gesture. Sending it whole would classify it
-			// by its first keyword alone, so the pattern check would never see
-			// the DELETE, a trailing ROLLBACK would never be refused, and the
-			// whole thing would be marked read-only and become eligible for the
-			// session's retry. Split it exactly like the buffer.
-			return splitStatementsIn(sql, selection.start, selection.end, dialect);
-		}
-		const offset = editorRef.current?.getCursorOffset() ?? cursor.offset;
-		const statement = statementAtOffset(sql, offset, dialect);
-		return statement ? [statement] : [];
+		const editor = editorRef.current;
+		return selectRunTargets(
+			liveBufferText(editor, sql),
+			editor?.getSelection() ?? null,
+			editor?.getCursorOffset() ?? cursor.offset,
+			dialect,
+		);
 	}, [sql, dialect, cursor.offset]);
 
 	// The pre-run line and the editor decoration, always saying the same thing.
@@ -509,7 +506,7 @@ export const QueryView: React.FC<IQueryViewProps> = ({ endpoint, label, initialS
 	const runOne = useCallback((): void => { void runTargets(currentTarget(), { fromEditor: true }); }, [runTargets, currentTarget]);
 
 	/** Run every statement in the buffer, in order. */
-	const runAll = useCallback((): void => { void runTargets(splitStatements(sql, dialect), { fromEditor: true }); }, [runTargets, sql, dialect]);
+	const runAll = useCallback((): void => { void runTargets(splitStatements(liveBufferText(editorRef.current, sql), dialect), { fromEditor: true }); }, [runTargets, sql, dialect]);
 
 	// ── Explain, history, and loading a statement back in ────────────────────
 
