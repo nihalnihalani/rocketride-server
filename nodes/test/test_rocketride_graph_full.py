@@ -38,6 +38,8 @@ Configuration via environment variables:
     RR_TEST_AGE_DSN — libpq URL the NODE connects through (may be a
                       transaction-mode pooler in front of the database)
                       (default: postgresql://rruser:rrpass@localhost:55433/rrtenant)
+    RR_TEST_AGE_GRAPH — scratch graph name (default rr_graph_e2e_<random>); it
+                      is dropped and recreated by every test
     RR_TEST_AGE_ADMIN_DSN — direct libpq URL for fixture setup/teardown and
                       server-side inspection (default: RR_TEST_AGE_DSN). Set it
                       when RR_TEST_AGE_DSN points at a pooler, so session-level
@@ -52,6 +54,7 @@ import importlib.util
 import os
 import sys
 import types
+import uuid
 
 from pathlib import Path
 
@@ -67,7 +70,9 @@ _NODE_DIR = _REPO / 'nodes' / 'src' / 'nodes' / 'rocketride_graph'
 TEST_DSN = os.environ.get('RR_TEST_AGE_DSN', 'postgresql://rruser:rrpass@localhost:55433/rrtenant')
 ADMIN_DSN = os.environ.get('RR_TEST_AGE_ADMIN_DSN') or TEST_DSN
 TEST_CLIENT_ID = 'tenant-graph-test'
-GRAPH = 'rr_graph_e2e'
+# Per-run scratch graph, so two runs against one shared database cannot drop
+# each other's graph (RR_TEST_AGE_GRAPH fixes the name).
+GRAPH = os.environ.get('RR_TEST_AGE_GRAPH') or f'rr_graph_e2e_{uuid.uuid4().hex[:8]}'
 
 # RR_REQUIRE_DB_TESTS (set by CI once its DB containers are healthy) turns
 # every skip in this module into a hard failure: a broken container or missing

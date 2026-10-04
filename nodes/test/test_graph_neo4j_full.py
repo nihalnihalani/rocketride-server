@@ -19,6 +19,14 @@ Configuration (defaults are the local disposable container):
                             (Neo4j Enterprise or Aura). Without it the role test
                             is reported as skipped (NOT RUN), never as passed.
 
+Concurrency: Community Edition has one user database, so every label and
+relationship type these tests create carries a per-run namespace
+(``Gx<run id>`` / ``GX<run id>_``; set RR_TEST_RUN_ID to fix it). The tests
+are written with plain ``Gx``/``GX_`` names; the node's tools are wrapped to
+namespace their input and un-namespace their output, and every before/after
+state check counts only this run's labels and types, so two runs against one
+server cannot see or disturb each other.
+
 Skips when the server is unreachable unless RR_REQUIRE_DB_TESTS is set.
 """
 
@@ -28,6 +36,7 @@ import importlib.util
 import os
 import sys
 import types
+import uuid
 
 from pathlib import Path
 
@@ -46,6 +55,47 @@ _REPO = Path(__file__).resolve().parents[2]
 _AI_SRC = _REPO / 'packages' / 'ai' / 'src'
 _GRAPH_PKG = _AI_SRC / 'ai' / 'common' / 'graph'
 _UTILS_DIR = _AI_SRC / 'ai' / 'common' / 'utils'
+
+RUN_ID = os.environ.get('RR_TEST_RUN_ID') or uuid.uuid4().hex[:8]
+NS_LABEL, NS_REL = f'Gx{RUN_ID}', f'GX{RUN_ID}_'
+
+
+def ns(value):
+    """Plain test names (Gx..., GX_...) -> this run's namespace, recursively."""
+    if isinstance(value, str):
+        return value.replace('GX_', NS_REL).replace('Gx', NS_LABEL)
+    if isinstance(value, dict):
+        return {k: ns(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [ns(v) for v in value]
+    return value
+
+
+def un_ns(value):
+    """This run's namespace -> plain test names, recursively (other runs' names untouched)."""
+    if isinstance(value, str):
+        return value.replace(NS_REL, 'GX_').replace(NS_LABEL, 'Gx')
+    if isinstance(value, dict):
+        return {un_ns(k): un_ns(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [un_ns(v) for v in value]
+    return value
+
+
+class _NamespacedTools:
+    """The node instance, with tool input namespaced and output un-namespaced."""
+
+    TOOLS = ('read_query', 'execute', 'get_schema', 'refresh_schema', 'dialect')
+
+    def __init__(self, inst):
+        self._inst = inst
+
+    def __getattr__(self, name):
+        attr = getattr(self._inst, name)
+        if name not in self.TOOLS:
+            return attr
+        return lambda args: un_ns(attr(ns(args)))
+
 
 URI = os.environ.get('RR_TEST_NEO4J_URI', 'bolt://127.0.0.1:57687')
 USER = os.environ.get('RR_TEST_NEO4J_USER', 'neo4j')
@@ -185,19 +235,25 @@ CREATE (a:GxPerson {name: 'Alice', age: 37, big: 9007199254740993, born: date('1
        (a)-[:GX_WORKS_AT {role: 'eng'}]->(c)
 SET a:GxEmployee
 """
-CLEANUP = "MATCH (n) WHERE any(l IN labels(n) WHERE l STARTS WITH 'Gx') DETACH DELETE n"
+CLEANUP = "MATCH (n) WHERE any(l IN labels(n) WHERE l STARTS WITH 'Gx') DETACH DELETE n"  # namespaced by ns()
+
+
+def run_admin(driver, cypher, **params):
+    """Fixture-side Cypher (namespaced) on a write session."""
+    with driver.session(database='neo4j') as s:
+        return s.run(ns(cypher), **params).data()
 
 
 @pytest.fixture()
 def neo_db():
     driver = neo4j.GraphDatabase.driver(URI, auth=(USER, PASSWORD))
     with driver.session(database='neo4j') as s:
-        s.run(CLEANUP).consume()
-        s.run(SEED).consume()
-        s.run('CREATE (:GxBlob {b: $b})', b=bytearray(b'\x00\xffraw')).consume()
+        s.run(ns(CLEANUP)).consume()
+        s.run(ns(SEED)).consume()
+        s.run(ns('CREATE (:GxBlob {b: $b})'), b=bytearray(b'\x00\xffraw')).consume()
     yield driver
     with driver.session(database='neo4j') as s:
-        s.run(CLEANUP).consume()
+        s.run(ns(CLEANUP)).consume()
     driver.close()
 
 
@@ -207,21 +263,27 @@ def neo_env(monkeypatch):
 
 
 def _start(neo_env, **config):
-    return start_node(
+    glb, inst = start_node(
         neo_env,
         'graph_neo4j',
         {'uri': URI, 'user': USER, 'password': PASSWORD, 'database': 'neo4j', **config},
     )
+    return glb, _NamespacedTools(inst)
 
 
-def _count(driver, cypher='MATCH (n) RETURN count(n) AS c'):
-    with driver.session(database='neo4j') as s:
-        return s.run(cypher).single()['c']
+def _count(driver, cypher=None):
+    """This run's node count (or a namespaced custom count query)."""
+    if cypher is None:
+        cypher = "MATCH (n) WHERE any(l IN labels(n) WHERE l STARTS WITH 'Gx') RETURN count(n) AS c"
+    return run_admin(driver, cypher)[0]['c']
 
 
 def _labels(driver):
+    """This run's labels and relationship types in the database catalog."""
     with driver.session(database='neo4j') as s:
-        return sorted(r['label'] for r in s.run('CALL db.labels() YIELD label RETURN label'))
+        labels = [r['label'] for r in s.run('CALL db.labels() YIELD label RETURN label')]
+        types_ = [r['t'] for r in s.run('CALL db.relationshipTypes() YIELD relationshipType AS t RETURN t')]
+    return sorted(x for x in labels + types_ if x.startswith((NS_LABEL, NS_REL)))
 
 
 # ---------------------------------------------------------------------------
@@ -352,7 +414,7 @@ class TestReadOnlyInvariant:
         try:
             before = (_count(neo_db), _labels(neo_db))
             with pytest.raises(ValueError, match='Refused: CALL db.createLabel'):
-                glb._run_query("CALL db.createLabel('GxEvilLabel')")
+                glb._run_query(ns("CALL db.createLabel('GxEvilLabel')"))
             assert (_count(neo_db), _labels(neo_db)) == before
         finally:
             glb.endGlobal()
@@ -410,8 +472,7 @@ class TestLimitsAndBudgets:
             glb.endGlobal()
 
     def test_collect_is_bounded_by_the_element_budget(self, neo_env, neo_db):
-        with neo_db.session(database='neo4j') as s:
-            s.run('UNWIND range(1, 10050) AS i CREATE (:GxBulk {i: i})').consume()
+        run_admin(neo_db, 'UNWIND range(1, 10050) AS i CREATE (:GxBulk {i: i})')
         glb, inst = _start(neo_env)
         try:
             with pytest.raises(neo_env.GraphToolError, match='first row holds more than 10,000 graph elements'):
@@ -463,8 +524,7 @@ class TestExecuteGraphShape:
 
 class TestSchemaAndDialect:
     def test_refresh_reflects_raw_labels_types_endpoints_and_counts(self, neo_env, neo_db):
-        with neo_db.session(database='neo4j') as s:
-            s.run("CREATE (:`Gx Odd``Label` {v: 'x'}), (:GxPerson {name: 'Carol', age: 'unknown'})").consume()
+        run_admin(neo_db, "CREATE (:`Gx Odd``Label` {v: 'x'}), (:GxPerson {name: 'Carol', age: 'unknown'})")
         glb, inst = _start(neo_env)
         try:
             out = inst.refresh_schema({})

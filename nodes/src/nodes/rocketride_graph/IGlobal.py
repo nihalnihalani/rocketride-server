@@ -613,11 +613,20 @@ _FIREWALL_HEADLINES = {
 
 
 def _firewall_headline(exc: AgeFirewallRejected) -> str:
-    return _FIREWALL_HEADLINES.get(getattr(exc, 'rule', ''), 'the statement is not allowed on the read-only path')
+    rule = getattr(exc, 'rule', '')
+    headline = _FIREWALL_HEADLINES.get(rule, 'the statement is not allowed on the read-only path')
+    if rule == 'write_clause':
+        # 'Query rejected by firewall (write_clause): CREATE, SET not allowed ...'
+        clauses = str(exc).partition('): ')[2].partition(' not allowed')[0]
+        if clauses:
+            headline += f' ({clauses})'
+    return headline
 
 
 def _pg_detail(exc: BaseException) -> str:
     text = (getattr(exc, 'pgerror', None) or str(exc)).strip()
+    if text.startswith('ERROR:'):
+        text = text[len('ERROR:') :].strip()
     return '\n'.join(text.splitlines()[:6])
 
 
