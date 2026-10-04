@@ -33,8 +33,10 @@ Facts verified against the live AGE 1.5.0 pin (see the layer README):
 - The cypher() params argument MUST be a real prepared-statement parameter —
   an inline ``'...'::agtype`` literal is rejected by AGE. With params we emit
   ``PREPARE <name>(agtype) AS ...`` / ``EXECUTE <name>(%s::agtype)`` /
-  ``DEALLOCATE <name>`` for one transaction (transaction-pooler safe;
-  a rolled-back transaction discards its prepared statements).
+  ``DEALLOCATE <name>`` inside one transaction (transaction-pooler safe:
+  one transaction stays on one server session). A prepared statement is
+  session state that a ROLLBACK does NOT discard, so the executor must
+  DEALLOCATE inside the same transaction when EXECUTE fails.
 - The Cypher body is embedded via dollar-quoting; the tag is chosen to not
   collide with the body so user text can never escape the envelope.
 
@@ -75,16 +77,29 @@ class TranslatedQuery:
     has_return: bool = True
     # The caller must open the transaction READ ONLY (safe path).
     read_only: bool = False
+    # Name of the session-level prepared statement the plan creates (params
+    # path only). PostgreSQL does not roll prepared statements back with the
+    # transaction, so a caller whose EXECUTE fails must DEALLOCATE it inside
+    # the same transaction (see the node's savepoint handling).
+    prepared_name: Optional[str] = None
 
 
 def _dollar_quote(body: str) -> str:
-    """Wrap ``body`` in a dollar-quote tag guaranteed absent from it."""
-    tag = '$rr_cypher$'
+    """Wrap ``body`` in a dollar-quote tag that cannot end the string early.
+
+    A dollar-quoted string ends at the FIRST occurrence of its tag after the
+    opening one. So the tag must not occur inside the body, and it must not be
+    completed across the body's end either: a body ending in ``$rr_cypher``
+    followed by the closing ``$rr_cypher$`` contains ``$rr_cypher$`` one
+    character early. Requiring the first match in ``body + tag`` to be the
+    closing tag itself rules out both.
+    """
     counter = 0
-    while tag in body:
+    while True:
+        tag = '$rr_cypher$' if counter == 0 else f'$rr_cypher{counter}$'
+        if (body + tag).find(tag) == len(body):
+            return f'{tag}{body}{tag}'
         counter += 1
-        tag = f'$rr_cypher{counter}$'
-    return f'{tag}{body}{tag}'
 
 
 def _params_to_agtype_json(params: Dict[str, Any]) -> str:
@@ -158,6 +173,7 @@ def emit(
         tq.result_index = len(tq.statements) - 1
         tq.statements.append(f'DEALLOCATE {stmt_name}')
         tq.binds.append(())
+        tq.prepared_name = stmt_name
     else:
         select = f"SELECT * FROM cypher('{graph_name}', {body}) AS ({as_list}){outer_limit}"
         tq.statements.append(select)

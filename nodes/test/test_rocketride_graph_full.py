@@ -294,7 +294,8 @@ class TestSafePath:
         age = sys.modules['ai.common.graph.age']
         glb = _begin(rr_env)
         try:
-            assert glb.client.autocommit is False
+            with glb.pool.connection() as conn:
+                assert conn.autocommit is False
             plan = age.TranslatedQuery(columns=['ro'], has_return=True)
             plan.statements.append('SHOW transaction_read_only')
             plan.binds.append(())
