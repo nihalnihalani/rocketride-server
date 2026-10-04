@@ -26,7 +26,7 @@ const FILES = ['age', 'neo4j', 'falkordb'];
 const PROVIDER_OF: Record<string, string> = { age: 'rocketride_graph', neo4j: 'graph_neo4j', falkordb: 'graph_falkordb' };
 
 /** Read a template. */
-function read(key: string): { components: IComponent[]; project_id: string } {
+function read(key: string): { components: IComponent[] } {
 	return JSON.parse(fs.readFileSync(path.join(DIR, `${key}.pipe`), 'utf8'));
 }
 
@@ -71,10 +71,23 @@ test('no template holds a password, token, key or a URL with credentials in it',
 	}
 });
 
-test('project ids are distinct UUIDs, so two templates never share an endpoint identity', () => {
-	const ids = FILES.map((key) => read(key).project_id);
-	assert.equal(new Set(ids).size, FILES.length);
-	for (const id of ids) assert.match(id, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+test('no template ships a project_id: nothing is shared between everyone who imports one', () => {
+	// An id baked into a shared file would be the same for every user, and a task's identity is derived from
+	// (owner, project, source). The editor mints a fresh id when a .pipe is created without one
+	// (apps/vscode/src/providers/SidebarProvider.ts handleFileCreated), so the templates carry none.
+	for (const key of FILES) {
+		const doc = read(key) as Record<string, unknown>;
+		assert.equal('project_id' in doc, false, `${key} has a project_id`);
+		assert.doesNotMatch(fs.readFileSync(path.join(DIR, `${key}.pipe`), 'utf8'), /project_?id/i, `${key} mentions a project id`);
+	}
+});
+
+test('the editor path that gives an imported template its own id still exists (a guard that the premise above holds)', () => {
+	const provider = path.resolve(__dirname, '..', '..', 'vscode', 'src', 'providers', 'SidebarProvider.ts');
+	const source = fs.readFileSync(provider, 'utf8');
+	const created = source.slice(source.indexOf('private async handleFileCreated'), source.indexOf('private async handleFileDeleted'));
+	assert.match(created, /if \(!projectId \|\| isDuplicate\)/);
+	assert.match(created, /crypto\.randomUUID\(\)/);
 });
 
 test('the Neo4j note recommends a read-only database role and says reads are a routing hint, not access control', () => {
