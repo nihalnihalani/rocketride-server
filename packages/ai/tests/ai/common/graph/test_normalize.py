@@ -297,5 +297,26 @@ class TestBudgets:
 
         with pytest.raises(ValueError, match='Opaque'):
             GraphNormalizer().value(Opaque())
-        with pytest.raises(ValueError, match='bytes'):
-            GraphNormalizer().value(b'\x00')
+
+
+class TestBytes:
+    def test_small_bytes_are_inlined_as_base64(self):
+        out = GraphNormalizer().value(bytearray(b'\x00\x01binary'))
+        assert out == {'@kind': 'bytes', 'size': 8, 'base64': 'AAFiaW5hcnk='}
+
+    def test_large_bytes_report_size_only(self):
+        normalizer = GraphNormalizer()
+        out = normalizer.value(b'x' * 70_000)
+        assert out == {'@kind': 'bytes', 'size': 70_000, 'base64': None}
+        assert normalizer.values == 1
+
+    def test_inline_limit_boundary(self):
+        assert GraphNormalizer().value(b'y' * 65_536)['base64'] is not None
+        assert GraphNormalizer().value(b'y' * 65_537)['base64'] is None
+
+    def test_bytes_inside_properties_do_not_fail_the_row(self):
+        text = '{"id": 1, "label": "N", "properties": {"name": "n"}}::vertex'
+        node = GraphNormalizer(age_adapter()).value(parse_agtype(text))
+        node_with_blob = GraphNormalizer().value({'blob': memoryview(b'ab'), 'n': node['id']})
+        assert node_with_blob == {'blob': {'@kind': 'bytes', 'size': 2, 'base64': 'YWI='}, 'n': '1'}
+        assert decode_graph_value(strict_json(node_with_blob))['blob']['@kind'] == 'bytes'

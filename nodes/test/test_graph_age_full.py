@@ -402,3 +402,213 @@ class TestRecovery:
                 admin.close()
         with pytest.raises(Exception):
             glb._run_query('MATCH (p:Person) RETURN count(p) AS c')
+
+
+# ---------------------------------------------------------------------------
+# read_query / execute(shape='graph') through the node's tools
+# ---------------------------------------------------------------------------
+
+
+def _instance(rr_env, glb):
+    inst = rr_env.iinstance_cls()
+    inst.IGlobal = glb
+    return inst
+
+
+def _graph_tool_error():
+    return sys.modules['ai.common.graph.graph_errors'].GraphToolError
+
+
+def _age_state():
+    """Vertex/edge counts and the label catalog of the test graph, read directly."""
+    from .test_rocketride_graph_full import GRAPH
+
+    conn = _admin()
+    try:
+        with conn.cursor() as cur:
+            cur.execute('SET search_path = ag_catalog, "$user", public')
+            cur.execute(f"SELECT count(*) FROM cypher('{GRAPH}', $$ MATCH (n) RETURN n $$) AS (n agtype)")
+            vertices = cur.fetchone()[0]
+            cur.execute(f"SELECT count(*) FROM cypher('{GRAPH}', $$ MATCH ()-[r]->() RETURN r $$) AS (r agtype)")
+            edges = cur.fetchone()[0]
+            cur.execute(
+                'SELECT l.name FROM ag_label l JOIN ag_graph g ON l.graph = g.graphid WHERE g.name = %s ORDER BY 1',
+                (GRAPH,),
+            )
+            labels = [r[0] for r in cur.fetchall()]
+            cur.execute('SELECT count(*) FROM ag_graph')
+            graphs = cur.fetchone()[0]
+        return vertices, edges, labels, graphs
+    finally:
+        conn.close()
+
+
+def _cypher_admin(statement):
+    from .test_rocketride_graph_full import GRAPH
+
+    conn = _admin()
+    try:
+        with conn.cursor() as cur:
+            cur.execute('SET search_path = ag_catalog, "$user", public')
+            cur.execute(f"SELECT * FROM cypher('{GRAPH}', $$ {statement} $$) AS (v agtype)")
+            return cur.fetchall()
+    finally:
+        conn.close()
+
+
+AGE_WRITES = [
+    "CREATE (:Evil {name: 'x'})",
+    "MERGE (:Evil {name: 'x'})",
+    "MATCH (p:Person {name: 'alice'}) SET p.evil = true",
+    "MATCH (p:Person {name: 'bob'}) DETACH DELETE p",
+    'MATCH (p:Person) REMOVE p.age',
+    'RETURN pg_catalog.sqrt(25)',
+    'CALL db.labels()',
+]
+
+
+class TestReadQuery:
+    def test_shape_duplicate_columns_and_direction(self, rr_env, age_graph):
+        glb = _begin(rr_env)
+        inst = _instance(rr_env, glb)
+        try:
+            out = inst.read_query(
+                {'cypher': "MATCH (a:Person {name: 'alice'})-[r:KNOWS]->(b) RETURN a, r, b, a.name, a.name"}
+            )
+            assert out['columns'] == ['a', 'r', 'b', 'a.name', 'a.name']
+            a, r, b, n1, n2 = out['rows'][0]
+            assert (n1, n2) == ('alice', 'alice')
+            assert a['labels'] == ['Person'] and r['type'] == 'KNOWS'
+            assert (r['start'], r['end']) == (a['id'], b['id'])
+            assert int(a['id']) > 0 and isinstance(a['id'], str)
+            path = inst.read_query({'cypher': "MATCH p = (b:Person {name: 'bob'})<-[:KNOWS]-(a) RETURN p"})['rows'][0][
+                0
+            ]
+            assert [n['properties']['name'] for n in path['nodes']] == ['bob', 'alice']
+            rel = path['relationships'][0]
+            assert (rel['start'], rel['end']) == (path['nodes'][1]['id'], path['nodes'][0]['id'])
+        finally:
+            glb.endGlobal()
+
+    def test_ids_beyond_2_53_round_trip_as_string_parameters(self, rr_env, age_graph):
+        for i in range(36):
+            _cypher_admin(f'CREATE (:L{i} {{k: {i}}})')
+        glb = _begin(rr_env)
+        inst = _instance(rr_env, glb)
+        try:
+            node = inst.read_query({'cypher': 'MATCH (n:L35) RETURN n'})['rows'][0][0]
+            assert int(node['id']) > 2**53
+            out = inst.read_query(
+                {'cypher': 'MATCH (n) WHERE id(n) = toInteger($id) RETURN n.k', 'params': {'id': node['id']}}
+            )
+            assert out['rows'] == [[35]]
+        finally:
+            glb.endGlobal()
+
+    @pytest.mark.parametrize('allow_execute', [False, True])
+    @pytest.mark.parametrize('statement', AGE_WRITES)
+    def test_writes_refused_with_state_unchanged(self, rr_env, age_graph, allow_execute, statement):
+        glb = _begin(rr_env, {'allow_execute': allow_execute})
+        inst = _instance(rr_env, glb)
+        try:
+            before = _age_state()
+            with pytest.raises(_graph_tool_error()) as err:
+                inst.read_query({'cypher': statement})
+            assert str(err.value).startswith('Refused: ')
+            assert _age_state() == before
+        finally:
+            glb.endGlobal()
+
+    def test_hints_are_raised_before_the_database(self, rr_env, age_graph, monkeypatch):
+        glb = _begin(rr_env)
+        inst = _instance(rr_env, glb)
+        sent = []
+        monkeypatch.setattr(glb, '_execute_plan', lambda *a, **kw: sent.append(a))
+        try:
+            with pytest.raises(_graph_tool_error()) as err:
+                inst.read_query({'cypher': "RETURN date('2024-01-01')"})
+            headline, _, detail = str(err.value).partition('\n')
+            assert headline == 'Not supported on Apache AGE 1.5.0: date()'
+            assert 'ISO-8601' in detail
+            assert sent == []
+        finally:
+            glb.endGlobal()
+
+    def test_exact_limit_and_truncation(self, rr_env, age_graph):
+        glb = _begin(rr_env)
+        inst = _instance(rr_env, glb)
+        try:
+            q = 'MATCH (p:Person) RETURN p.name ORDER BY p.name'
+            exact = inst.read_query({'cypher': q, 'limit': 3})
+            assert [r[0] for r in exact['rows']] == ['alice', 'bob', 'carol'] and exact['truncated'] is False
+            cut = inst.read_query({'cypher': q, 'limit': 2})
+            assert len(cut['rows']) == 2 and cut['truncated'] is True and cut['truncated_by'] == 'rows'
+        finally:
+            glb.endGlobal()
+
+    def test_collect_is_bounded_by_the_element_budget(self, rr_env, age_graph):
+        _cypher_admin('UNWIND range(1, 10050) AS i CREATE (:Bulk {i: i})')
+        glb = _begin(rr_env)
+        inst = _instance(rr_env, glb)
+        try:
+            with pytest.raises(_graph_tool_error(), match='first row holds more than 10,000 graph elements'):
+                inst.read_query({'cypher': 'MATCH (n:Bulk) RETURN collect(n)'})
+        finally:
+            glb.endGlobal()
+
+    def test_server_deadline(self, rr_env, age_graph):
+        _cypher_admin('UNWIND range(1, 2000) AS i CREATE (:Bulk {i: i})')
+        glb = _begin(rr_env, {'query_timeout_ms': 200})
+        inst = _instance(rr_env, glb)
+        try:
+            with pytest.raises(_graph_tool_error()) as err:
+                inst.read_query({'cypher': 'MATCH (a:Bulk), (b:Bulk), (c:Bulk) RETURN count(*)'})
+            assert str(err.value).startswith('Query timed out after 200 ms')
+        finally:
+            glb.endGlobal()
+
+    def test_execute_graph_shape(self, rr_env, age_graph):
+        glb = _begin(rr_env, {'allow_execute': True})
+        inst = _instance(rr_env, glb)
+        try:
+            out = inst.execute({'query': "CREATE (n:Person {name: 'dora'}) RETURN n", 'shape': 'graph'})
+            assert out['rows'][0][0]['labels'] == ['Person'] and out['affected_rows'] == 1
+            assert inst.read_query({'cypher': "MATCH (p:Person {name: 'dora'}) RETURN count(p)"})['rows'] == [[1]]
+        finally:
+            glb.endGlobal()
+
+
+class TestCapabilityProbes:
+    """The capability table's REJECT cells hold on the live AGE version.
+
+    Each construct is sent straight to AGE (bypassing the translator) and must
+    fail there. If an AGE upgrade starts accepting one, this fails and the
+    table needs a reviewed update.
+    """
+
+    @pytest.mark.parametrize(
+        'statement',
+        [
+            "RETURN date('2024-01-01')",
+            'RETURN time()',
+            'RETURN localtime()',
+            "RETURN localdatetime('2024-01-01T00:00:00')",
+            "RETURN duration('P1D')",
+            "RETURN datetime('2024-01-01T00:00:00Z')",
+            'MATCH (n) RETURN elementId(n)',
+            'RETURN [x IN [1, 2] | x * 2]',
+            'RETURN [x IN [1, 2] WHERE x > 1]',
+            'MATCH (n) RETURN [(n)-->(m) | m]',
+            'MATCH (a:Person), (b:Person) RETURN allShortestPaths((a)-[*..3]-(b))',
+            'MATCH (n) WHERE EXISTS { MATCH (n)-->() } RETURN n',
+            'MATCH p = shortestPath((a:Person)-[*..3]-(b:Person)) RETURN p',
+            'MATCH (n:Person:Company) RETURN n',
+        ],
+    )
+    def test_rejected_construct_fails_on_live_age(self, rr_env, age_graph, statement):
+        with pytest.raises(psycopg2.Error):
+            _cypher_admin(statement)
+
+    @pytest.mark.parametrize('statement', ['RETURN timestamp()', 'RETURN toString(1)', 'MATCH (n) RETURN keys(n)'])
+    def test_supported_construct_runs_on_live_age(self, rr_env, age_graph, statement):
+        _cypher_admin(statement)

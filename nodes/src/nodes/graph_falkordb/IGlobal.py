@@ -41,6 +41,8 @@ from redis.exceptions import RedisError
 from rocketlib import OPEN_MODE, warning
 
 from ai.common.graph import GraphGlobalBase
+from ai.common.graph.adapters import falkordb_adapter
+from ai.common.graph.graph_global_base import READ_QUERY_HARD_CAP
 from ai.common.utils import config_int, parse_bool
 
 from falkordb import FalkorDB
@@ -70,6 +72,11 @@ class IGlobal(GraphGlobalBase):
     allow_writes: bool = False
     max_rows: int = 250
     query_timeout_ms: int = DEFAULT_TIMEOUT_MS
+    # Server limits read at start (None = unknown, e.g. GRAPH.CONFIG not permitted).
+    # RESULTSET_SIZE truncates replies silently; TIMEOUT_MAX rejects larger
+    # per-query timeouts.
+    server_result_cap: Optional[int] = None
+    server_timeout_max_ms: Optional[int] = None
 
     def beginGlobal(self) -> None:
         # Config-mode opens the node for editing only; no server round-trip.
@@ -91,6 +98,7 @@ class IGlobal(GraphGlobalBase):
         )
 
         self.client = self._connect(config)
+        self._read_server_limits()
         # Round-trip now so a wrong host or password fails at pipeline start
         # rather than on the first tool call. FalkorDB has no per-database
         # session open to piggyback a "does this graph exist" check on (unlike
@@ -200,6 +208,73 @@ class IGlobal(GraphGlobalBase):
         # returns rows (CREATE (n) RETURN n), so `rows` being non-empty does not
         # mean nothing was written. _affected_rows is 0 for a pure read anyway.
         return {'rows': rows, 'affected_rows': _affected_rows(result)}
+
+    # ------------------------------------------------------------------
+    # read_query / execute(shape='graph')
+    # ------------------------------------------------------------------
+
+    def _read_server_limits(self) -> None:
+        """Best effort: learn RESULTSET_SIZE and TIMEOUT_MAX so limits stay honest."""
+        self.server_result_cap = self._config_value('RESULTSET_SIZE')
+        self.server_timeout_max_ms = self._config_value('TIMEOUT_MAX')
+
+    def _config_value(self, name: str) -> Optional[int]:
+        try:
+            reply = self.client.connection.execute_command('GRAPH.CONFIG', 'GET', name)
+        except Exception as e:  # managed services may refuse GRAPH.CONFIG
+            warning(f'FalkorDB: could not read {name} ({e}); assuming no server limit')
+            return None
+        try:
+            value = int(reply[1])
+        except (TypeError, ValueError, IndexError):
+            return None
+        # FalkorDB uses 0 (TIMEOUT_MAX) or a negative number (RESULTSET_SIZE) for "unlimited".
+        return value if value > 0 else None
+
+    @property
+    def statement_timeout_ms(self) -> int:
+        """Per-query timeout actually sent: the node's, clamped to the server's TIMEOUT_MAX."""
+        if self.server_timeout_max_ms:
+            return max(1, min(self.query_timeout_ms, self.server_timeout_max_ms))
+        return self.query_timeout_ms
+
+    @property
+    def read_query_cap(self) -> int:
+        """Node cap, kept below the server's RESULTSET_SIZE so the +1 sentinel row can arrive."""
+        cap = min(self.max_rows, READ_QUERY_HARD_CAP)
+        if self.server_result_cap:
+            cap = min(cap, self.server_result_cap - 1)
+        return max(1, cap)
+
+    def _graph_adapter(self):
+        return falkordb_adapter()
+
+    def _read_query_rows(self, cypher, params, fetch_limit, consume):
+        """Always GRAPH.RO_QUERY, whatever allow_writes says; the server refuses writes.
+
+        The client buffers the whole reply before returning, so the row bound
+        that limits server work and memory is the server's RESULTSET_SIZE and
+        the timeout; slicing below only limits what is serialized.
+        """
+        result = self.select_graph().ro_query(cypher, params=params or None, timeout=self.statement_timeout_ms)
+        columns = _header_names(getattr(result, 'header', None))
+        return consume(columns, iter((result.result_set or [])[:fetch_limit]))
+
+    def _raw_query_rows(self, cypher, fetch_limit, consume):
+        result = self.select_graph().query(cypher, timeout=self.statement_timeout_ms)
+        columns = _header_names(getattr(result, 'header', None))
+        return consume(columns, iter((result.result_set or [])[:fetch_limit])), _affected_rows(result)
+
+    def _describe_error(self, exc):
+        if not isinstance(exc, RedisError):
+            return None
+        detail = str(exc).strip()
+        lowered = detail.lower()
+        if 'timed out' in lowered:
+            return f'Query timed out after {self.statement_timeout_ms} ms', detail
+        if 'read-only queries' in lowered or 'ro_query' in lowered:
+            return 'Refused: read_query is read-only; this statement writes', detail
+        return 'Query failed', detail
 
     def _validate_query(self, query: str) -> Tuple[bool, str]:
         """Check syntax with EXPLAIN without running the query."""

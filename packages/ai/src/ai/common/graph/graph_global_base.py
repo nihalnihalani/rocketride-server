@@ -38,7 +38,7 @@ A concrete node implements the abstract hooks below and nothing else. See
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from rocketlib import IGlobalBase, debug, warning
 
@@ -47,6 +47,14 @@ from ai.common.utils import config_int, parse_bool
 
 DEFAULT_MAX_EXECUTE_ROWS = 25000
 DEFAULT_MAX_VALIDATION_ATTEMPTS = 5
+# read_query: default page and the absolute ceiling ("All" in the app means the
+# node's own cap, never unlimited).
+DEFAULT_READ_QUERY_LIMIT = 1000
+READ_QUERY_HARD_CAP = 25000
+DEFAULT_STATEMENT_TIMEOUT_MS = 30000
+
+# consume(columns, rows) -> envelope; rows yields positional driver rows.
+RowConsumer = Callable[[List[str], Iterable[Sequence[Any]]], Dict[str, Any]]
 
 
 class GraphGlobalBase(IGlobalBase, ABC):
@@ -144,6 +152,51 @@ class GraphGlobalBase(IGlobalBase, ABC):
     def _graph_description(self, config: Dict[str, Any]) -> str:
         """User-written description of what this graph holds, for the LLM prompt."""
         return str(config.get('db_description') or '')
+
+    @property
+    def read_query_cap(self) -> int:
+        """Largest row limit ``read_query`` honours on this node (owner cap, hard ceiling 25,000)."""
+        return max(1, min(int(self.read_row_cap), READ_QUERY_HARD_CAP))
+
+    @property
+    def statement_timeout_ms(self) -> int:
+        """Server-side deadline applied to every read_query / execute statement."""
+        return DEFAULT_STATEMENT_TIMEOUT_MS
+
+    # ------------------------------------------------------------------
+    # read_query / execute(shape='graph') hooks — the three Cypher drivers
+    # implement these; an engine without them reports that read_query is
+    # not available rather than falling back to a writable path.
+    # ------------------------------------------------------------------
+
+    def _read_query_rows(
+        self,
+        cypher: str,
+        params: Optional[Dict[str, Any]],
+        fetch_limit: int,
+        consume: RowConsumer,
+    ) -> Dict[str, Any]:
+        """Run ``cypher`` READ-ONLY and hand at most ``fetch_limit`` positional rows to ``consume``.
+
+        Must be read-only whatever ``allow_execute`` (or a driver's own write
+        flag) says, enforced by the engine where it can be (a read-only command,
+        a read-only transaction or role), with lexical checks only as defence in
+        depth. Must apply the server-side statement deadline. ``consume`` may be
+        called more than once if the driver retries a read transaction.
+        """
+        raise NotImplementedError(f'{type(self).__name__} does not support read_query')
+
+    def _raw_query_rows(self, cypher: str, fetch_limit: int, consume: RowConsumer) -> Tuple[Dict[str, Any], int]:
+        """execute(shape='graph'): run ``cypher`` as written; return ``(consume(...), affected_rows)``."""
+        raise NotImplementedError(f'{type(self).__name__} does not support execute with shape "graph"')
+
+    def _graph_adapter(self):
+        """The :mod:`ai.common.graph.adapters` adapter for this driver's values."""
+        return None
+
+    def _describe_error(self, exc: BaseException) -> Optional[Tuple[str, str]]:
+        """Map a driver exception to ``(headline, detail)``; None = generic 'Query failed'."""
+        return None
 
     @property
     def read_row_cap(self) -> int:

@@ -462,6 +462,15 @@ class TestNeo4jValues:
         out = strict_json(normalize.GraphNormalizer(adapters.neo4j_adapter()).row([2**62, float('nan'), -0.0]))
         assert out == [{'@kind': 'number', 'value': str(2**62)}, {'@kind': 'number', 'value': 'NaN'}, -0.0]
 
+    def test_byte_array_properties_never_fail_the_query(self):
+        small, large = bytearray(b'\x00\xffraw'), bytearray(b'z' * 100_000)
+        (node,) = self.hydrate(Structure(b'N', 9, ['Doc'], {'small': small, 'large': large}, '4:gx:9'))
+        out = strict_json(normalize.GraphNormalizer(adapters.neo4j_adapter()).value(node))
+        assert out['properties'] == {
+            'small': {'@kind': 'bytes', 'size': 5, 'base64': 'AP9yYXc='},
+            'large': {'@kind': 'bytes', 'size': 100_000, 'base64': None},
+        }
+
     def test_vector_is_a_plain_list(self):
         from neo4j.vector import Vector, VectorDType
 

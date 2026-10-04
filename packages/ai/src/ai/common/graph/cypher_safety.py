@@ -39,6 +39,8 @@ from __future__ import annotations
 
 import re
 
+from .graph_errors import GraphToolError
+
 # The leading ``(?<![\w.])`` refuses a match when the keyword is preceded by a
 # word character or a dot, so a property or map read like ``n.delete`` or
 # ``n.create`` is not mistaken for the DELETE / CREATE clause. Bare reserved
@@ -88,3 +90,238 @@ def is_cypher_safe(cypher: str) -> bool:
     # nor smuggle a live write past it.
     stripped = _STRIP_LITERALS.sub('', cypher)
     return not bool(_UNSAFE_CYPHER.search(stripped))
+
+
+# ---------------------------------------------------------------------------
+# Read-path statement check (read_query on drivers without a server-side
+# read-only command, i.e. Neo4j)
+# ---------------------------------------------------------------------------
+#
+# This is defence in depth, not the boundary: on Neo4j the boundary is a
+# read-only database role (and, on a single instance, the READ-mode session).
+# It works on tokens, not on a regex over raw text: comments and string
+# literals never produce keywords, a back-quoted name is an identifier (its
+# text unescaped), and a word used as a label, relationship type, property,
+# map key or parameter is not a clause.
+
+
+class CypherRefused(GraphToolError, ValueError):
+    """A statement the read path will not run (``str()`` is "<headline>\\n<detail>")."""
+
+
+# Read-only Neo4j procedures read_query may CALL (CONTRACT v1 §1 item 8). Names
+# are compared case-insensitively after back-quote unescaping; there is no
+# wildcard, so a future db.schema.* procedure needs a reviewed addition here.
+NEO4J_READ_PROCEDURES = frozenset(
+    {
+        'db.labels',
+        'db.relationshiptypes',
+        'db.propertykeys',
+        'db.schema.nodetypeproperties',
+        'db.schema.reltypeproperties',
+        'db.schema.visualization',
+    }
+)
+
+# Clauses that write data or schema wherever they appear in code.
+_WRITE_WORDS = frozenset({'CREATE', 'MERGE', 'DELETE', 'DETACH', 'SET', 'REMOVE', 'DROP', 'FOREACH', 'INSERT'})
+# Administration verbs that are never legitimate on a read path.
+_ADMIN_WORDS = frozenset({'GRANT', 'DENY', 'REVOKE'})
+# Verbs that are only administration when followed by one of these objects;
+# alone they are ordinary names (``MATCH (start)``) and must not be refused.
+_ADMIN_PAIRS = {
+    'START': {'DATABASE', 'DATABASES', 'SERVER'},
+    'STOP': {'DATABASE', 'DATABASES', 'SERVER'},
+    'ALTER': {'USER', 'CURRENT', 'DATABASE', 'SERVER', 'ALIAS', 'ROLE'},
+    'RENAME': {'USER', 'ROLE', 'DATABASE', 'SERVER', 'ALIAS'},
+    'TERMINATE': {'TRANSACTION', 'TRANSACTIONS'},
+    'ENABLE': {'SERVER'},
+    'DEALLOCATE': {'DATABASE', 'DATABASES'},
+    'REALLOCATE': {'DATABASE', 'DATABASES'},
+    'LOAD': {'CSV'},
+}
+# SHOW is allowed only for these database-scoped listings.
+_SHOW_ALLOWED = frozenset(
+    {'INDEX', 'INDEXES', 'CONSTRAINT', 'CONSTRAINTS', 'FUNCTION', 'FUNCTIONS', 'PROCEDURE', 'PROCEDURES'}
+)
+_SHOW_MODIFIERS = frozenset(
+    {
+        'ALL',
+        'BUILT',
+        'IN',
+        'USER',
+        'DEFINED',
+        'RANGE',
+        'TEXT',
+        'POINT',
+        'LOOKUP',
+        'FULLTEXT',
+        'VECTOR',
+        'UNIQUE',
+        'EXIST',
+        'EXISTENCE',
+        'NODE',
+        'RELATIONSHIP',
+        'KEY',
+        'PROPERTY',
+        'TYPE',
+        'BTREE',
+    }
+)
+
+
+class _Tok:
+    __slots__ = ('kind', 'text', 'upper')
+
+    def __init__(self, kind: str, text: str) -> None:
+        self.kind = kind  # 'word' | 'ident' (back-quoted) | 'param' | 'punct' | 'num'
+        self.text = text
+        self.upper = text.upper()
+
+
+def _tokenize(cypher: str) -> list:
+    """Code tokens of a Cypher statement; comments and string literals dropped.
+
+    Raises CypherRefused for an unterminated string, comment or back-quoted
+    name: what the database would make of the rest is unknowable, so refuse.
+    """
+    toks: list = []
+    i, n = 0, len(cypher)
+    while i < n:
+        c = cypher[i]
+        if c.isspace():
+            i += 1
+        elif cypher.startswith('//', i):
+            j = i + 2
+            while j < n and cypher[j] not in '\r\n':
+                j += 1
+            i = j
+        elif cypher.startswith('/*', i):
+            j = cypher.find('*/', i + 2)
+            if j < 0:
+                raise CypherRefused('Refused: unterminated comment')
+            i = j + 2
+        elif c in '\'"':
+            j = i + 1
+            while j < n and cypher[j] != c:
+                j += 2 if cypher[j] == '\\' else 1
+            if j >= n:
+                raise CypherRefused('Refused: unterminated string literal')
+            i = j + 1
+        elif c == '`':
+            parts = []
+            j = i
+            # ``a``b`` is one name containing a back-quote.
+            while j < n and cypher[j] == '`':
+                k = cypher.find('`', j + 1)
+                if k < 0:
+                    raise CypherRefused('Refused: unterminated back-quoted name')
+                parts.append(cypher[j + 1 : k])
+                j = k + 1
+            toks.append(_Tok('ident', '`'.join(parts)))
+            i = j
+        elif c == '$':
+            j = i + 1
+            while j < n and (cypher[j].isalnum() or cypher[j] == '_'):
+                j += 1
+            toks.append(_Tok('param', cypher[i:j]))
+            i = j
+        elif c.isalpha() or c == '_':
+            j = i + 1
+            while j < n and (cypher[j].isalnum() or cypher[j] == '_'):
+                j += 1
+            toks.append(_Tok('word', cypher[i:j]))
+            i = j
+        elif c.isdigit():
+            j = i + 1
+            while j < n and (cypher[j].isalnum() or cypher[j] in '._'):
+                j += 1
+            toks.append(_Tok('num', cypher[i:j]))
+            i = j
+        else:
+            toks.append(_Tok('punct', c))
+            i += 1
+    return toks
+
+
+def _is_clause_word(toks: list, i: int) -> bool:
+    """True when the bare word at ``i`` is used as a keyword, not as a name."""
+    tok = toks[i]
+    if tok.kind != 'word':
+        return False
+    prev = toks[i - 1] if i > 0 else None
+    nxt = toks[i + 1] if i + 1 < len(toks) else None
+    # n.create / :Delete label or type / {set: 1} map key
+    if prev is not None and prev.kind == 'punct' and prev.text in '.:':
+        return False
+    if nxt is not None and nxt.kind == 'punct' and nxt.text == ':':
+        return False
+    return True
+
+
+def check_read_only_cypher(cypher: str, *, allowed_procedures=NEO4J_READ_PROCEDURES) -> None:
+    """Refuse a statement that writes, administers, switches database or CALLs an unlisted procedure.
+
+    Raises:
+        CypherRefused: with a "Refused: ..." headline naming the construct.
+    """
+    toks = _tokenize(cypher)
+    for i, tok in enumerate(toks):
+        if not _is_clause_word(toks, i):
+            continue
+        word = tok.upper
+        nxt = toks[i + 1] if i + 1 < len(toks) else None
+        if word in _WRITE_WORDS:
+            raise CypherRefused(
+                f'Refused: read_query is read-only; this statement writes ({word})',
+                'Use the write console (execute) on a node with allow_execute enabled.',
+            )
+        if word in _ADMIN_WORDS or (word in _ADMIN_PAIRS and nxt is not None and nxt.upper in _ADMIN_PAIRS[word]):
+            command = word + (f' {nxt.upper}' if word not in _ADMIN_WORDS and nxt is not None else '')
+            raise CypherRefused(f'Refused: {command} is not allowed on the read-only path')
+        if word == 'USE':
+            raise CypherRefused("Refused: USE is not allowed; read_query runs against the node's configured database")
+        if word == 'SHOW':
+            j = i + 1
+            while j < len(toks) and toks[j].upper in _SHOW_MODIFIERS:
+                j += 1
+            target = toks[j].upper if j < len(toks) else ''
+            if target not in _SHOW_ALLOWED:
+                raise CypherRefused(
+                    f'Refused: SHOW {target or ""} is not allowed on the read-only path'.replace('  ', ' '),
+                    'Only SHOW INDEXES, CONSTRAINTS, FUNCTIONS and PROCEDURES are allowed.',
+                )
+        if word == 'CALL':
+            if nxt is None:
+                raise CypherRefused('Refused: incomplete CALL')
+            # CALL { ... } and CALL (vars) { ... } are subqueries: their bodies
+            # are part of this token stream and checked like everything else.
+            if nxt.kind == 'punct' and nxt.text in '{(':
+                continue
+            name, j = [], i + 1
+            while j < len(toks) and toks[j].kind in ('word', 'ident'):
+                name.append(toks[j].text)
+                if j + 1 < len(toks) and toks[j + 1].kind == 'punct' and toks[j + 1].text == '.':
+                    j += 2
+                    continue
+                break
+            procedure = '.'.join(name)
+            if procedure.lower() not in allowed_procedures:
+                raise CypherRefused(
+                    f'Refused: CALL {procedure or "(unknown)"} is not on the read-only procedure allowlist',
+                    'Allowed: ' + ', '.join(sorted(_display_procedure(p) for p in allowed_procedures)),
+                )
+
+
+_PROCEDURE_DISPLAY = {
+    'db.labels': 'db.labels',
+    'db.relationshiptypes': 'db.relationshipTypes',
+    'db.propertykeys': 'db.propertyKeys',
+    'db.schema.nodetypeproperties': 'db.schema.nodeTypeProperties',
+    'db.schema.reltypeproperties': 'db.schema.relTypeProperties',
+    'db.schema.visualization': 'db.schema.visualization',
+}
+
+
+def _display_procedure(name: str) -> str:
+    return _PROCEDURE_DISPLAY.get(name, name)

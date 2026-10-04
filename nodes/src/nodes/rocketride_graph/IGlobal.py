@@ -48,21 +48,26 @@ import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import psycopg2
+from psycopg2 import errors as pg_errors
 from psycopg2 import sql
 from psycopg2.extensions import TRANSACTION_STATUS_IDLE
 
 from rocketlib import warning
 from ai.common.graph import GraphGlobalBase
+from ai.common.graph.adapters import age_adapter
 from ai.common.graph.age import (
+    AgeFirewallRejected,
     AgeTranslationError,
+    AgeUnsupportedFeature,
     FirewallConfig,
     TranslateMode,
     TranslatedQuery,
     decode_agtype,
     decode_row,
+    parse_agtype,
     translate,
 )
-from ai.common.graph.connection_pool import ConnectionPool
+from ai.common.graph.connection_pool import ConnectionPool, PoolClosed, PoolTimeout
 from ai.common.rocketride_db import resolve_rocketride_dsn
 
 DEFAULT_GRAPH_NAME = 'rocketride'
@@ -414,6 +419,60 @@ class IGlobal(GraphGlobalBase):
         # the result-row count — 0 for writes without a RETURN clause.
         return {'rows': rows, 'affected_rows': len(rows)}
 
+    # ------------------------------------------------------------------
+    # read_query / execute(shape='graph')
+    # ------------------------------------------------------------------
+
+    @property
+    def statement_timeout_ms(self) -> int:
+        return int(self.query_timeout_ms)
+
+    def _graph_adapter(self):
+        return age_adapter()
+
+    def _read_query_rows(self, cypher, params, fetch_limit, consume):
+        """Safe-mode translation (firewall) in a READ ONLY transaction with SET LOCAL statement_timeout.
+
+        The translator wraps the statement in an outer SQL LIMIT of
+        ``fetch_limit`` (the caller's limit + 1), so the database stops early.
+        Rows stay positional, so duplicate column names survive.
+        """
+        plan = self._translate(cypher, params=params, limit=fetch_limit, mode=TranslateMode.SAFE)
+        raw_rows = self._execute_plan(plan, fetch_cap=fetch_limit)
+        return consume(self._plan_columns(plan), ([parse_agtype(v) for v in row] for row in raw_rows))
+
+    def _raw_query_rows(self, cypher, fetch_limit, consume):
+        plan = self._translate(cypher, mode=TranslateMode.RAW)
+        raw_rows = self._execute_plan(plan, fetch_cap=fetch_limit)
+        rows = [[parse_agtype(v) for v in row] for row in raw_rows]
+        # AGE exposes no write counters; like the legacy path, report result rows.
+        return consume(self._plan_columns(plan), iter(rows)), len(rows)
+
+    @staticmethod
+    def _plan_columns(plan: TranslatedQuery) -> List[str]:
+        # A statement without RETURN yields no rows; its synthesized column is ours, not the user's.
+        return list(plan.columns) if plan.has_return else []
+
+    def _describe_error(self, exc):
+        version = self.age_version or '1.5.0'
+        if isinstance(exc, AgeUnsupportedFeature):
+            return f'Not supported on Apache AGE {version}: {exc.construct}', exc.detail
+        if isinstance(exc, AgeFirewallRejected):
+            return f'Refused: {_firewall_headline(exc)}', str(exc)
+        if isinstance(exc, AgeTranslationError):
+            return 'Invalid Cypher for Apache AGE', str(exc)
+        if isinstance(exc, PoolTimeout):
+            return 'Database busy: no connection became free in time', str(exc)
+        if isinstance(exc, PoolClosed):
+            return 'The graph node is shutting down', str(exc)
+        if isinstance(exc, pg_errors.QueryCanceled):
+            return f'Query timed out after {self.statement_timeout_ms} ms', _pg_detail(exc)
+        if isinstance(exc, pg_errors.ReadOnlySqlTransaction):
+            return 'Refused: the database refused a write on the read-only path', _pg_detail(exc)
+        if isinstance(exc, psycopg2.Error):
+            return 'Query failed', _pg_detail(exc)
+        return None
+
     def _validate_query(self, query: str) -> Tuple[bool, str]:
         """EXPLAIN the translated statement without executing it.
 
@@ -515,3 +574,24 @@ class IGlobal(GraphGlobalBase):
             return max(1, int(config.get(key, default)))
         except (TypeError, ValueError):
             return default
+
+
+_FIREWALL_HEADLINES = {
+    'write_clause': 'read_query is read-only; this statement writes',
+    'procedure_call': 'CALL is not allowed on the read-only path',
+    'qualified_function': 'schema-qualified function calls are not allowed',
+    'unbounded_var_length': 'variable-length patterns need an upper bound',
+    'max_var_length_depth': 'variable-length pattern is too deep',
+    'invalid_var_length_range': 'invalid variable-length range',
+    'max_query_length': 'query is too long',
+    'max_nesting_depth': 'expression is nested too deeply',
+}
+
+
+def _firewall_headline(exc: AgeFirewallRejected) -> str:
+    return _FIREWALL_HEADLINES.get(getattr(exc, 'rule', ''), 'the statement is not allowed on the read-only path')
+
+
+def _pg_detail(exc: BaseException) -> str:
+    text = (getattr(exc, 'pgerror', None) or str(exc)).strip()
+    return '\n'.join(text.splitlines()[:6])
