@@ -10,7 +10,9 @@ read_query must always use GRAPH.RO_QUERY, whatever ``allow_writes`` and
 after. Also covers the server's RESULTSET_SIZE (silent truncation) and
 TIMEOUT settings.
 
-Configuration: RR_TEST_FALKORDB_URL (default redis://127.0.0.1:56379).
+Configuration: RR_TEST_FALKORDB_URL (default redis://127.0.0.1:56379) and
+RR_TEST_FALKORDB_GRAPH (scratch graph, default gx_live_<random>, dropped
+after each test).
 Skips when the server is unreachable unless RR_REQUIRE_DB_TESTS is set.
 """
 
@@ -18,6 +20,7 @@ from __future__ import annotations
 
 import os
 import sys
+import uuid
 
 import pytest
 
@@ -33,7 +36,8 @@ else:
 from .test_graph_neo4j_full import load_graph_node, start_node  # noqa: E402
 
 URL = os.environ.get('RR_TEST_FALKORDB_URL', 'redis://127.0.0.1:56379')
-GRAPH = 'gx_live'
+# Per-run scratch graph, so concurrent runs on one server never share it.
+GRAPH = os.environ.get('RR_TEST_FALKORDB_GRAPH') or f'gx_live_{uuid.uuid4().hex[:8]}'
 
 
 def _client():

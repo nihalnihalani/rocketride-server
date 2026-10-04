@@ -420,7 +420,11 @@ def _graph_tool_error():
 
 
 def _age_state():
-    """Vertex/edge counts and the label catalog of the test graph, read directly."""
+    """Vertex/edge counts and the label catalog of THIS run's graph, read directly.
+
+    Scoped to the test's own graph (other runs may create graphs concurrently);
+    the graph must still exist, so a dropped graph also shows up as a change.
+    """
     from .test_rocketride_graph_full import GRAPH
 
     conn = _admin()
@@ -436,9 +440,7 @@ def _age_state():
                 (GRAPH,),
             )
             labels = [r[0] for r in cur.fetchall()]
-            cur.execute('SELECT count(*) FROM ag_graph')
-            graphs = cur.fetchone()[0]
-        return vertices, edges, labels, graphs
+        return vertices, edges, labels
     finally:
         conn.close()
 
