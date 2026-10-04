@@ -235,11 +235,12 @@ editor and an **Execute** button, and it always says what it is:
   node says so with its own text and the app shows it.
 - FalkorDB and Neo4j refuse two columns with the same name; AGE keeps them, and
   the Table shows both.
-- Performance was measured with results of 100, 300 and 1,000 nodes (the first
-  draw is capped at 300 nodes; **Show more nodes** adds the rest, up to the
-  canvas maximum). On an Apple-silicon laptop there were no long tasks while
-  panning or dragging. A slower device pays more per frame, most when panning a
-  large graph.
+- Performance was checked with results of 100, 300 and 1,000 nodes, but a result
+  of 1,000 nodes draws only its first 300 (**Show more nodes** adds the rest, up
+  to the canvas maximum of 1,000). So the production checks covered at most 300
+  nodes drawn; performance with more than 300 drawn was not covered by them. On an
+  Apple-silicon laptop there were no long tasks while panning or dragging up to
+  that size. A slower device pays more per frame, most when panning a large graph.
 - Browsers: the production checks ran in Chrome 154, Firefox 141 and WebKit 26
   (Playwright). WebKit is the engine Safari uses, but it is not Safari, and
   Safari itself has not been tried. The build declares Safari 13 as its floor,
