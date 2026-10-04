@@ -77,6 +77,8 @@ export interface IGraphCanvasProps {
 	/** The caption chosen per label (property name, or the id/label specials). */
 	captions: ReadonlyMap<string, string>;
 	selected: ReadonlySet<GraphId>;
+	/** Relationships to draw highlighted (a found path). */
+	highlighted?: ReadonlySet<GraphId>;
 	focusedId: GraphId | null;
 	/** Seed text for the layout (same text, same graph, same layout). */
 	seedKey: string;
@@ -120,6 +122,7 @@ function textOn(fill: string, resolved: Map<string, string>): string {
 /** Off-screen but available to assistive technology. */
 const VISUALLY_HIDDEN: CSSProperties = { position: 'absolute', width: 1, height: 1, margin: -1, padding: 0, overflow: 'hidden', clip: 'rect(0 0 0 0)', whiteSpace: 'nowrap', border: 0 };
 
+const NO_IDS: ReadonlySet<GraphId> = new Set();
 const NODE_TYPES = { graphNode: GraphNodeView };
 const EDGE_TYPES = { graphEdge: GraphEdgeView };
 
@@ -131,6 +134,7 @@ const EDGE_TYPES = { graphEdge: GraphEdgeView };
  */
 function CanvasInner(props: IGraphCanvasProps): React.ReactElement {
 	const { model, colors, captions, selected, focusedId, onLayoutStatus } = props;
+	const highlighted = props.highlighted ?? NO_IDS;
 	const flow = useReactFlow();
 	const helpId = useId();
 	const reduced = useReducedMotion();
@@ -266,11 +270,11 @@ function CanvasInner(props: IGraphCanvasProps): React.ReactElement {
 				source: r.start,
 				target: r.end,
 				ariaLabel: `${r.type} from ${captionOf(a, captions.get(a.labels[0] ?? ''))} to ${captionOf(b, captions.get(b.labels[0] ?? ''))}`,
-				data: { slot, type: r.type, highlighted: selected.has(r.start) || selected.has(r.end) },
+				data: { slot, type: r.type, highlighted: selected.has(r.start) || selected.has(r.end) || highlighted.has(r.id) },
 			});
 		}
 		return list;
-	}, [model, layout.positions, captions, selected]);
+	}, [model, layout.positions, captions, selected, highlighted]);
 
 	// Focus follows the model when the change came from the keyboard. Node ids are NOT unique
 	// across nodes and relationships (FalkorDB counts them separately), so the lookup is
