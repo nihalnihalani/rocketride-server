@@ -13,6 +13,11 @@ the overlapping windows are real, not scheduler luck.
 
 Skips cleanly when the database is unreachable unless ``RR_REQUIRE_DB_TESTS``
 is set, in which case the import of the shared module fails the run.
+
+Behind a transaction-mode pooler set ``RR_TEST_AGE_DSN`` to the pooler and
+``RR_TEST_AGE_ADMIN_DSN`` to the database itself. Server sessions then belong
+to the pooler, so the tests that terminate or count server backends check the
+node's own client connections instead.
 """
 
 from __future__ import annotations
@@ -23,11 +28,14 @@ import time
 
 import pytest
 
-from .test_rocketride_graph_full import TEST_DSN, _begin, _db_reachable, age_graph, psycopg2, rr_env
+from .test_rocketride_graph_full import ADMIN_DSN, TEST_DSN, _begin, _db_reachable, age_graph, psycopg2, rr_env
 
 # The shared fixtures are requested by name in the tests below; binding them
 # here is what registers them with pytest for this module.
 _SHARED_FIXTURES = (rr_env, age_graph)
+
+# A pooler sits between the node and the database when the two DSNs differ.
+BEHIND_POOLER = ADMIN_DSN != TEST_DSN
 
 pytestmark = pytest.mark.skipif(not _db_reachable(), reason=f'RocketRide AGE test database not reachable at {TEST_DSN}')
 
@@ -74,7 +82,9 @@ def _on_pooled_session(glb, statement):
 
 
 def _admin():
-    conn = psycopg2.connect(TEST_DSN, connect_timeout=5)
+    # Direct to the database (never through a pooler under test): it runs
+    # server-side inspection and pg_terminate_backend.
+    conn = psycopg2.connect(ADMIN_DSN, connect_timeout=5)
     conn.autocommit = True
     return conn
 
@@ -313,15 +323,23 @@ class TestRecovery:
         glb = _begin(rr_env)
         admin = _admin()
         try:
-            (pid,) = _on_pooled_session(glb, 'SELECT pg_backend_pid()')
-            with admin.cursor() as cur:
-                cur.execute('SELECT pg_terminate_backend(%s)', (pid,))
-            time.sleep(0.2)
+            if BEHIND_POOLER:
+                # The pooler owns server sessions; drop the node's own client
+                # connection instead (same failure as from the node's side).
+                with glb.pool.connection() as conn:
+                    victim = conn
+                victim.close()
+            else:
+                (pid,) = _on_pooled_session(glb, 'SELECT pg_backend_pid()')
+                with admin.cursor() as cur:
+                    cur.execute('SELECT pg_terminate_backend(%s)', (pid,))
+                time.sleep(0.2)
             assert glb._run_query('MATCH (p:Person) WHERE p.name = $n RETURN p.age AS age', params={'n': 'alice'}) == [
                 {'age': 30}
             ]
-            (new_pid,) = _on_pooled_session(glb, 'SELECT pg_backend_pid()')
-            assert new_pid != pid
+            if not BEHIND_POOLER:
+                (new_pid,) = _on_pooled_session(glb, 'SELECT pg_backend_pid()')
+                assert new_pid != pid
             assert glb.pool.size == 1
         finally:
             admin.close()
@@ -352,7 +370,11 @@ class TestRecovery:
             admin.close()
             glb.endGlobal()
 
-    def test_end_global_closes_every_session(self, rr_env, age_graph):
+    def test_end_global_closes_every_session(self, rr_env, age_graph, monkeypatch):
+        module = sys.modules[rr_env.iglobal_cls.__module__]
+        opened = []
+        real_open = module._open_connection
+        monkeypatch.setattr(module, '_open_connection', lambda dsn: opened.append(real_open(dsn)) or opened[-1])
         glb = _begin(rr_env)
         barrier = threading.Barrier(3)
 
@@ -364,17 +386,19 @@ class TestRecovery:
         assert not errors, errors
         pids = sorted(set(results.values()))
         glb.endGlobal()
-        admin = _admin()
-        try:
-            deadline = time.monotonic() + 5
-            alive = pids
-            while alive and time.monotonic() < deadline:
-                with admin.cursor() as cur:
-                    cur.execute('SELECT pid FROM pg_stat_activity WHERE pid = ANY(%s)', (pids,))
-                    alive = [r[0] for r in cur.fetchall()]
-                time.sleep(0.1)
-            assert alive == []
-        finally:
-            admin.close()
+        assert opened and all(conn.closed for conn in opened)
+        if not BEHIND_POOLER:
+            admin = _admin()
+            try:
+                deadline = time.monotonic() + 5
+                alive = pids
+                while alive and time.monotonic() < deadline:
+                    with admin.cursor() as cur:
+                        cur.execute('SELECT pid FROM pg_stat_activity WHERE pid = ANY(%s)', (pids,))
+                        alive = [r[0] for r in cur.fetchall()]
+                    time.sleep(0.1)
+                assert alive == []
+            finally:
+                admin.close()
         with pytest.raises(Exception):
             glb._run_query('MATCH (p:Person) RETURN count(p) AS c')

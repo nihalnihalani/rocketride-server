@@ -146,29 +146,35 @@ class ConnectionPool:
 
     def _acquire(self) -> Any:
         deadline = time.monotonic() + self.acquire_timeout_s
-        with self._cond:
-            while True:
-                if self._closed:
-                    raise PoolClosed('the database connection pool is closed (the node is shutting down)')
-                while self._idle:
-                    candidate = self._idle.pop()
-                    if self._is_usable(candidate):
+        dead: List[Any] = []
+        try:
+            with self._cond:
+                while True:
+                    if self._closed:
+                        raise PoolClosed('the database connection pool is closed (the node is shutting down)')
+                    while self._idle:
+                        candidate = self._idle.pop()
+                        if self._is_usable(candidate):
+                            self._checked_out += 1
+                            return candidate
+                        # Died while idle (server restart, idle timeout): drop
+                        # it (closed outside the lock) and keep looking; a
+                        # fresh one is opened below if needed.
+                        dead.append(candidate)
+                    if self._checked_out < self.max_size:
+                        # Reserve the slot before the (slow) connect, outside the lock.
                         self._checked_out += 1
-                        return candidate
-                    # Died while idle (server restart, idle timeout): drop it
-                    # and keep looking; a fresh one is opened below if needed.
-                    self._close_quietly(candidate)
-                if self._checked_out < self.max_size:
-                    # Reserve the slot before the (slow) connect, outside the lock.
-                    self._checked_out += 1
-                    break
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise PoolTimeout(
-                        f'Timed out after {self.acquire_timeout_s:g} s waiting for a database connection '
-                        f'({self.max_size} in use)'
-                    )
-                self._cond.wait(remaining)
+                        break
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise PoolTimeout(
+                            f'Timed out after {self.acquire_timeout_s:g} s waiting for a database connection '
+                            f'({self.max_size} in use)'
+                        )
+                    self._cond.wait(remaining)
+        finally:
+            for conn in dead:
+                self._close_quietly(conn)
         try:
             return self._connect()
         except BaseException:
@@ -188,15 +194,15 @@ class ConnectionPool:
                 keep = False
         if keep and not self._is_usable(conn):
             keep = False
-        if not keep:
-            self._close_quietly(conn)
         with self._cond:
             self._checked_out -= 1
-            if keep and not self._closed:
+            pooled = keep and not self._closed
+            if pooled:
                 self._idle.append(conn)
-            elif keep:
-                self._close_quietly(conn)
             self._cond.notify()
+        if not pooled:
+            # Broken, unusable, or returned after close(): never reused.
+            self._close_quietly(conn)
 
     # ------------------------------------------------------------------
     # Shutdown

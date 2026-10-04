@@ -35,8 +35,13 @@ seam (env ``ROCKETRIDE_CLIENT_ID`` + a fake, injectable
     # image: apache/age:release_PG16_1.5.0 + pgvector v0.8.0 (see the layer README)
 
 Configuration via environment variables:
-    RR_TEST_AGE_DSN — libpq URL of the AGE test database
+    RR_TEST_AGE_DSN — libpq URL the NODE connects through (may be a
+                      transaction-mode pooler in front of the database)
                       (default: postgresql://rruser:rrpass@localhost:55433/rrtenant)
+    RR_TEST_AGE_ADMIN_DSN — direct libpq URL for fixture setup/teardown and
+                      server-side inspection (default: RR_TEST_AGE_DSN). Set it
+                      when RR_TEST_AGE_DSN points at a pooler, so session-level
+                      fixture SETs never land on pooled server sessions.
 
 Skips cleanly when the database is unreachable.
 """
@@ -60,6 +65,7 @@ _RRDB_PATH = _AI_SRC / 'ai' / 'common' / 'rocketride_db.py'
 _NODE_DIR = _REPO / 'nodes' / 'src' / 'nodes' / 'rocketride_graph'
 
 TEST_DSN = os.environ.get('RR_TEST_AGE_DSN', 'postgresql://rruser:rrpass@localhost:55433/rrtenant')
+ADMIN_DSN = os.environ.get('RR_TEST_AGE_ADMIN_DSN') or TEST_DSN
 TEST_CLIENT_ID = 'tenant-graph-test'
 GRAPH = 'rr_graph_e2e'
 
@@ -200,7 +206,7 @@ def age_graph(rr_env):
     """Provision + seed the test graph out-of-band (provisioning is not the
     node's job while create_graph ownership is open).
     """
-    conn = psycopg2.connect(TEST_DSN)
+    conn = psycopg2.connect(ADMIN_DSN)
     conn.autocommit = True
     with conn.cursor() as cur:
         cur.execute('SET search_path = ag_catalog, "$user", public')
