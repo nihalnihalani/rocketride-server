@@ -190,7 +190,12 @@ access controls routing, not permissions, and a statement check cannot know
 every mutating function a server may have installed. **The boundary is the
 database user**: for browsing, connect with an identity whose Neo4j role can
 only read (for example the built-in `reader` role, Neo4j Enterprise or Aura;
-Community Edition has no roles). Enabling direct execution grants trusted
+Community Edition has no roles). This was tested against Neo4j 5.26
+Enterprise with the built-in `reader` role: the database refused `CREATE`,
+`MERGE`, `SET`, `REMOVE`, `DELETE` and `CALL db.createLabel(...)` even with the
+node's own checks and READ mode removed, and `dialect` reported
+`read_boundary: "database_role"` with `read_boundary_verified: true` only for
+that user. Enabling direct execution grants trusted
 callers an explicit write-capable escape hatch, and it cannot write through a
 read-only identity: to offer both browsing and writing, configure two nodes,
 one with a read-only identity and one with a write identity and **Allow direct
