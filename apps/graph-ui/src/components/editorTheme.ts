@@ -153,16 +153,69 @@ export function opaqueOver(color: string, background: Rgb): Rgb | null {
 }
 
 /**
- * A text colour for the editor: the theme's own when it already reads on the background, else the nearest that does.
+ * A CSS colour as `#RRGGBB`, blended over a background when it has transparency.
+ *
+ * Monaco's theme colours must be hex: it reads `rgba(...)` as red, which once drew the line numbers
+ * of RocketRide Light (whose secondary text colour is `rgba(10,10,10,0.62)`) in pure red.
+ *
+ * @param color - Any colour the app's own parser reads (`#abc`, `#aabbcc`, `rgb()`, `rgba()`, `hsl()`).
+ * @param over - What it is drawn on; used for the blend.
+ * @param fallback - Returned (as it is) when the colour cannot be read. Must itself be `#RRGGBB`.
+ * @returns `#RRGGBB`, or the fallback.
+ */
+export function toHexColor(color: string, over: Rgb, fallback: string): string {
+	const seen = opaqueOver(color, over);
+	return seen ? `#${toRuleHex(seen)}` : fallback;
+}
+
+/**
+ * A text colour for the editor, as `#RRGGBB`: the theme's own colour (blended over the background when it is
+ * transparent) when that already reads, else the nearest colour of the same hue that does.
  *
  * @param color - The theme's CSS colour.
  * @param background - The editor's background, as a CSS colour.
- * @returns The CSS colour to use.
+ * @param fallback - Used when the colour cannot be read (held to the same contrast); returned as it is when the background cannot be read. Must itself be `#RRGGBB`.
+ * @returns `#RRGGBB`.
  */
-export function readableOnEditor(color: string, background: string): string {
+export function readableOnEditor(color: string, background: string, fallback: string = '#666666'): string {
 	const bg = parseColor(background);
-	if (!bg) return color;
-	const seen = opaqueOver(color, bg);
-	if (!seen || contrastRatio(seen, bg) >= TOKEN_MIN_CONTRAST) return color;
-	return `#${toRuleHex(ensureContrast(seen, bg))}`;
+	if (!bg) return fallback;
+	// An unreadable colour is replaced by the fallback, which is held to the same contrast.
+	const seen = opaqueOver(color, bg) ?? parseColor(fallback);
+	if (!seen) return fallback;
+	return `#${toRuleHex(contrastRatio(seen, bg) >= TOKEN_MIN_CONTRAST ? seen : ensureContrast(seen, bg))}`;
+}
+
+/** What the editor theme is built from: the shell's tokens, as CSS strings (empty when unset). */
+export interface IEditorColorInputs {
+	/** Whether the palette is dark (picks the fallbacks). */
+	dark: boolean;
+	/** `--rr-bg-paper`. */
+	background: string;
+	/** `--rr-text-primary`. */
+	foreground: string;
+	/** `--rr-text-secondary`. */
+	secondary: string;
+}
+
+/**
+ * The `colors` of the editor theme: every value `#RRGGBB` (Monaco cannot read `rgba()`), the text colours at
+ * least 4.5:1 on the editor background, and the existing defaults wherever a token is missing or unreadable.
+ *
+ * @param inputs - The shell's tokens.
+ * @returns Monaco theme colours.
+ */
+export function editorColors({ dark, background, foreground, secondary }: IEditorColorInputs): Record<string, string> {
+	const backgroundFallback = dark ? '#252526' : '#ffffff';
+	const foregroundFallback = dark ? '#cccccc' : '#1a1a1a';
+	const page = parseColor(background) ?? (parseColor(backgroundFallback) as Rgb);
+	const bg = toHexColor(background, page, backgroundFallback);
+	const text = readableOnEditor(foreground, bg, foregroundFallback);
+	return {
+		'editor.background': bg,
+		'editor.foreground': text,
+		// Line numbers are small text too: the shell's secondary colour, as it looks over the editor, moved to 4.5:1 only where it falls short.
+		'editorLineNumber.foreground': readableOnEditor(secondary, bg, '#666666'),
+		'editorLineNumber.activeForeground': text,
+	};
 }
