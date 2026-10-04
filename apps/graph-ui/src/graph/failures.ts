@@ -150,5 +150,23 @@ export function describeFailureMessage(message: string, canWrite: boolean): IFai
 	return describeFailure({ kind, tool: '', message, headline: (at === -1 ? message : message.slice(0, at)).trim(), ...(at === -1 ? {} : { detail: message.slice(at + 1).trim() }) }, canWrite);
 }
 
+/**
+ * Describe a failure from whatever the shared runner hands over: the message and,
+ * when the session threw one, the original error (an ExplorerToolError carries its
+ * `kind`, `headline` and `detail`, so nothing has to be guessed from wording).
+ *
+ * @param message - The error message.
+ * @param error - The thrown value, when known.
+ * @param canWrite - Whether this endpoint shows a write console.
+ * @returns The notice.
+ */
+export function describeFailureOf(message: string, error: unknown, canWrite: boolean): IFailureNotice {
+	if (error !== null && typeof error === 'object' && typeof (error as { kind?: unknown }).kind === 'string' && typeof (error as { headline?: unknown }).headline === 'string') {
+		const e = error as { kind: string; tool?: string; message?: string; headline: string; detail?: string; code?: string };
+		return describeFailure({ kind: e.kind, tool: e.tool ?? '', message: e.message ?? message, headline: e.headline, ...(e.detail !== undefined ? { detail: e.detail } : {}), ...(e.code !== undefined ? { code: e.code } : {}) }, canWrite);
+	}
+	return describeFailureMessage(message, canWrite);
+}
+
 /** Re-exported so the canvas notice and the failure strip share one place for their wording. */
 export { GRID_NOTICE };

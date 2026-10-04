@@ -71,6 +71,8 @@ import {
 } from 'shared/explorer';
 import type { IEndpointStore, IEndpointStoreOptions, IHistoryStore, IToolSpec } from 'shared/explorer';
 import type { GraphDialect } from '../cypher/quote';
+import { CAPABILITY_POLICY } from '../graph/dialect';
+import type { ICapabilityPolicy } from '../graph/dialect';
 import { createSchemaStore } from '../graph/schemaStore';
 import type { ISchemaStore } from '../graph/schemaStore';
 
@@ -91,18 +93,35 @@ export const TOOL = {
 	getQuery: 'get_query',
 } as const;
 
-/** Per-tool specs: idempotency, result check, budget and capability. */
-export const GRAPH_TOOLS: Readonly<Record<string, IToolSpec>> = {
-	[TOOL.dialect]: { idempotent: true, check: checkObject, timeoutMs: DEFAULT_TOOL_TIMEOUTS.dialect },
-	[TOOL.getSchema]: { idempotent: true, check: checkObject, timeoutMs: DEFAULT_TOOL_TIMEOUTS.get_schema },
-	[TOOL.refreshSchema]: { idempotent: true, check: checkObject, timeoutMs: DEFAULT_TOOL_TIMEOUTS.refresh_schema, capability: 'refresh_schema' },
-	// The wait derives from the node's published statement deadline (+ pad), so the node's own error arrives first.
-	[TOOL.readQuery]: { idempotent: true, check: checkRowEnvelope, capability: 'read_query' },
-	// Writes: never idempotent, never replayed. Always called with shape 'graph', hence the same envelope.
-	[TOOL.execute]: { idempotent: false, check: checkRowEnvelope, capability: 'execute_shape_graph' },
-	// A question to the node's model: {query, valid:true} | {answer, valid:false} (prose) | {error, valid:false}.
-	[TOOL.getQuery]: { idempotent: true, check: checkGetQuery, timeoutMs: DEFAULT_TOOL_TIMEOUTS.get_query },
-};
+/**
+ * Per-tool specs: idempotency, result check, budget and capability.
+ *
+ * The capability pre-check (a node that does not advertise the tool is refused
+ * locally as `upgrade`, nothing sent) only applies once nodes publish capabilities
+ * (see ICapabilityPolicy). Until then the call is made, and a node without the tool
+ * answers "No handler found for tool ...", which the app words as the same upgrade
+ * message. Either way there is no fallback to another tool.
+ *
+ * @param policy - Whether nodes publish capabilities.
+ * @returns The table.
+ */
+export function makeGraphTools(policy: ICapabilityPolicy = CAPABILITY_POLICY): Readonly<Record<string, IToolSpec>> {
+	const gate = (capability: string): { capability?: string } => (policy.advertised ? { capability } : {});
+	return {
+		[TOOL.dialect]: { idempotent: true, check: checkObject, timeoutMs: DEFAULT_TOOL_TIMEOUTS.dialect },
+		[TOOL.getSchema]: { idempotent: true, check: checkObject, timeoutMs: DEFAULT_TOOL_TIMEOUTS.get_schema },
+		[TOOL.refreshSchema]: { idempotent: true, check: checkObject, timeoutMs: DEFAULT_TOOL_TIMEOUTS.refresh_schema, ...gate('refresh_schema') },
+		// The wait derives from the node's published statement deadline (+ pad), so the node's own error arrives first.
+		[TOOL.readQuery]: { idempotent: true, check: checkRowEnvelope, ...gate('read_query') },
+		// Writes: never idempotent, never replayed. Always called with shape 'graph', hence the same envelope.
+		[TOOL.execute]: { idempotent: false, check: checkRowEnvelope, ...gate('execute_shape_graph') },
+		// A question to the node's model: {query, valid:true} | {answer, valid:false} (prose) | {error, valid:false}.
+		[TOOL.getQuery]: { idempotent: true, check: checkGetQuery, timeoutMs: DEFAULT_TOOL_TIMEOUTS.get_query },
+	};
+}
+
+/** The tool table the app uses. */
+export const GRAPH_TOOLS: Readonly<Record<string, IToolSpec>> = makeGraphTools();
 
 // =============================================================================
 // STORES (one per app, module level)
@@ -117,6 +136,17 @@ export const GRAPH_TOOLS: Readonly<Record<string, IToolSpec>> = {
  */
 export function makeGraphEndpointStore(overrides: Partial<IEndpointStoreOptions> = {}): IEndpointStore {
 	return createEndpointStore({ providers: GRAPH_PROVIDERS, roles: SINGLE_TOOLS_ROLE, tools: GRAPH_TOOLS, ...overrides });
+}
+
+/**
+ * Make an endpoint store with an explicit capability policy (tests exercise both).
+ *
+ * @param policy - Whether nodes publish capabilities.
+ * @param overrides - Other options.
+ * @returns The store.
+ */
+export function makeGraphEndpointStoreWith(policy: ICapabilityPolicy, overrides: Partial<IEndpointStoreOptions> = {}): IEndpointStore {
+	return makeGraphEndpointStore({ tools: makeGraphTools(policy), ...overrides });
 }
 
 /** Graph Explorer's endpoint store: one `tools` role, the three Cypher providers. */

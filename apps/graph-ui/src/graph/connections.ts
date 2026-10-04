@@ -47,7 +47,8 @@
 // =============================================================================
 
 import type { IExplorerEndpoint, IProbeResult } from 'shared/explorer';
-import { canWrite, engineText, parseDialect, readBoundaryText, supportsReadQuery, targetText } from './dialect';
+import { CAPABILITY_POLICY, canWrite, engineText, parseDialect, readBoundaryText, supportsReadQuery, targetText } from './dialect';
+import type { ICapabilityPolicy } from './dialect';
 
 // =============================================================================
 // TYPES
@@ -124,9 +125,10 @@ export function ownerText(endpoint: IExplorerEndpoint): string {
  *
  * @param endpoint - The endpoint (token-free).
  * @param probe - Its probe result, when one exists.
+ * @param policy - Whether nodes publish capabilities (default: the app's policy).
  * @returns The view.
  */
-export function connectionView(endpoint: IExplorerEndpoint, probe: IProbeResult | undefined): IConnectionView {
+export function connectionView(endpoint: IExplorerEndpoint, probe: IProbeResult | undefined, policy: ICapabilityPolicy = CAPABILITY_POLICY): IConnectionView {
 	const dialect = probe?.ok ? parseDialect(probe.info) : null;
 	const details: IDetailRow[] = [
 		{ label: 'Pipeline', value: endpoint.pipelineName || '(unnamed)' },
@@ -144,9 +146,9 @@ export function connectionView(endpoint: IExplorerEndpoint, probe: IProbeResult 
 		details.push({ label: 'Engine', value: engineText(dialect) });
 		const target = targetText(dialect);
 		if (target) details.push({ label: 'Target', value: target });
-		details.push({ label: 'Writes', value: canWrite(dialect) ? 'Allowed (execute is on for this node)' : 'Off (browsing only)' });
+		details.push({ label: 'Writes', value: canWrite(dialect, policy) ? 'Allowed (execute is on for this node)' : 'Off (browsing only)' });
 		notes.push(readBoundaryText(dialect));
-		if (!supportsReadQuery(dialect)) {
+		if (!supportsReadQuery(dialect, policy)) {
 			notes.push('This node does not support read_query yet. Upgrade the node to browse it with Graph Explorer.');
 			blocked = blocked ?? 'This node needs an upgrade before it can be browsed.';
 		}
@@ -154,7 +156,7 @@ export function connectionView(endpoint: IExplorerEndpoint, probe: IProbeResult 
 		blocked = blocked ?? probe.error?.message.split('\n')[0] ?? 'The node did not answer its identity probe.';
 	}
 
-	const badge = endpoint.state === 'ready' && dialect && !supportsReadQuery(dialect) ? { variant: 'warning' as const, label: 'Needs upgrade' } : STATE_BADGE[endpoint.state];
+	const badge = endpoint.state === 'ready' && dialect && !supportsReadQuery(dialect, policy) ? { variant: 'warning' as const, label: 'Needs upgrade' } : STATE_BADGE[endpoint.state];
 	return {
 		title: endpoint.nodeName || endpoint.nodeId,
 		address: `${endpoint.provider} · ${endpoint.pipelineName}${endpoint.runKind === 'deploy' ? ' (deployment)' : ''}`,

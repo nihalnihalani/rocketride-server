@@ -11,7 +11,8 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { formatBatchOutcome, formatPriorStatements } from 'shared/explorer';
 import type { IStatementRunBase } from 'shared/explorer';
-import { describeFailure, describeFailureMessage } from '../src/graph/failures';
+import { ExplorerToolError } from 'shared/explorer';
+import { describeFailure, describeFailureMessage, describeFailureOf } from '../src/graph/failures';
 import type { IFailureInput } from '../src/graph/failures';
 import { GRAPH_BATCH_WORDS, prepareStatement, refuseNonReads, toHistoryEntry } from '../src/graph/runConfig';
 import { parseDialect } from '../src/graph/dialect';
@@ -156,4 +157,18 @@ test('Graph\'s batch words never claim a rollback and name nothing as committed'
 	assert.equal(formatPriorStatements(writes, 1, GRAPH_BATCH_WORDS), 'Statement 1 already executed on the database: each statement is a separate request, so nothing is rolled back.');
 	assert.equal(formatBatchOutcome([run(0, 'read', 'rows'), run(1, 'write', 'rows'), run(2, 'write', 'error'), run(3, 'write', 'skipped')], GRAPH_BATCH_WORDS), '1 ran \u00b7 2 executed \u00b7 3 failed \u00b7 4 not run');
 	for (const text of [GRAPH_BATCH_WORDS.changed, GRAPH_BATCH_WORDS.priorChanged('x'), GRAPH_BATCH_WORDS.priorRead('x')]) assert.ok(!/committed|atomic|transaction/i.test(text.replace('nothing is rolled back', '')), text);
+});
+
+test('when the shared runner passes the thrown ExplorerToolError, its kind decides, not the wording', () => {
+	const timeout = new ExplorerToolError({ kind: 'timeout', tool: 'read_query', message: 'Anything at all, worded differently' });
+	assert.equal(describeFailureOf(timeout.message, timeout, false).variant, 'warning');
+	const upgrade = new ExplorerToolError({ kind: 'upgrade', tool: 'read_query', message: 'Totally different words' });
+	assert.match(describeFailureOf(upgrade.message, upgrade, true).headline, /does not support read_query yet/);
+	const refused = new ExplorerToolError({ kind: 'raised', tool: 'read_query', message: errors.refused_call });
+	const notice = describeFailureOf(refused.message, refused, false);
+	assert.match(notice.headline, /^Refused: CALL apoc\.periodic\.iterate/);
+	assert.match(notice.verbatim, /^Allowed: db\.labels/);
+	// A plain Error (or nothing) falls back to reading the message.
+	assert.equal(describeFailureOf('boom', new Error('boom'), false).headline, 'boom');
+	assert.equal(describeFailureOf('boom', undefined, false).headline, 'boom');
 });
