@@ -123,6 +123,9 @@ def _install_stubs() -> None:
 
     falkordb = types.ModuleType('falkordb')
     falkordb.FalkorDB = object
+    falkordb.Node = type('Node', (), {})
+    falkordb.Edge = type('Edge', (), {})
+    falkordb.Path = type('Path', (), {})
 
     redis_exceptions = types.ModuleType('redis.exceptions')
     redis_exceptions.RedisError = _StubRedisError
@@ -929,3 +932,94 @@ def test_reflect_schema_failure_does_not_break_begin(monkeypatch):
     graph_base.GraphGlobalBase.beginGlobal(glb)
 
     assert glb.graph_schema == {'nodes': {}, 'relationships': []}
+
+
+# ---------------------------------------------------------------------------
+# read_query / refresh_schema (stubbed client; live suite: test_graph_falkordb_full.py)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize('allow_writes', [False, True])
+@pytest.mark.parametrize('allow_execute', [False, True])
+def test_read_query_always_uses_ro_query(allow_writes, allow_execute):
+    graph = _FakeGraph(_FakeResult(result_set=[[1, 'a'], [2, 'b']], header=[[1, 'n'], [1, 's']]))
+    glb = _FakeGlobal(graph, allow_writes=allow_writes)
+    glb.allow_execute = allow_execute
+    out = _instance(glb).read_query({'cypher': 'MATCH (n) RETURN n.n AS n, n.s AS s', 'params': {'x': 1}})
+    assert [c[0] for c in graph.calls] == ['ro_query']
+    assert graph.calls[0][2] == {'x': 1} and graph.calls[0][3] == glb.statement_timeout_ms
+    assert out['columns'] == ['n', 's'] and out['rows'] == [[1, 'a'], [2, 'b']]
+
+
+def test_read_query_respects_server_limits():
+    graph = _FakeGraph(_FakeResult(result_set=[[i] for i in range(10)], header=[[1, 'i']]))
+    glb = _FakeGlobal(graph, max_rows=25000)
+    glb.server_result_cap, glb.server_timeout_max_ms, glb.query_timeout_ms = 5, 1000, 30000
+    assert glb.read_query_cap == 4 and glb.statement_timeout_ms == 1000
+    out = _instance(glb).read_query({'cypher': 'UNWIND range(1, 10) AS i RETURN i', 'limit': 25000})
+    assert out['row_limit'] == 4 and out['truncated'] is True and len(out['rows']) == 4
+    assert graph.calls[0][3] == 1000
+
+
+def test_read_query_error_headlines():
+    graph = _FakeGraph(raise_error=_StubRedisError('graph.RO_QUERY is to be executed only on read-only queries'))
+    with pytest.raises(Exception, match='^Refused: read_query is read-only'):
+        _instance(_FakeGlobal(graph)).read_query({'cypher': 'CREATE (n)'})
+    graph = _FakeGraph(raise_error=_StubRedisError('Query timed out'))
+    with pytest.raises(Exception, match='^Query timed out after 30000 ms'):
+        _instance(_FakeGlobal(graph)).read_query({'cypher': 'MATCH (n) RETURN n'})
+
+
+class _ScriptedGraph(_FakeGraph):
+    """Answers reflection queries by their text."""
+
+    def __init__(self, answers, fail_on=None):
+        super().__init__()
+        self.answers = answers
+        self.fail_on = fail_on
+
+    def ro_query(self, q, params=None, timeout=None):
+        self.calls.append(('ro_query', q, params, timeout))
+        if self.fail_on and self.fail_on in q:
+            raise _StubRedisError('Query timed out')
+        for prefix, rows in self.answers.items():
+            if q.startswith(prefix):
+                return _FakeResult(result_set=rows)
+        return _FakeResult(result_set=[])
+
+
+_ANSWERS = {
+    'CALL db.labels()': [['Person']],
+    'CALL db.relationshipTypes()': [['KNOWS']],
+    'MATCH (n:`Person`) RETURN count(n)': [[2]],
+    'MATCH (n:`Person`) WITH n': [[{'name': 'a', 'age': 1}], [{'name': 'b', 'age': 'x'}]],
+    'MATCH ()-[r:`KNOWS`]->() RETURN count(r)': [[1]],
+    'MATCH (a)-[r:`KNOWS`]->(b)': [[['Person'], ['Person'], {'since': 2019}]],
+}
+
+
+def test_refresh_schema_publishes_a_complete_snapshot():
+    glb = _FakeGlobal(_ScriptedGraph(_ANSWERS))
+    out = _instance(glb).refresh_schema({})
+    block = out['schema']
+    assert block['labels'] == [
+        {
+            'name': 'Person',
+            'properties': [{'name': 'age', 'types': ['string', 'integer']}, {'name': 'name', 'types': ['string']}],
+            'count': 2,
+            'count_estimated': False,
+        }
+    ]
+    assert block['relationship_types'][0]['endpoints'] == [{'start': 'Person', 'end': 'Person', 'observed': True}]
+    assert out['relationships'] == [{'type': 'KNOWS', 'start': 'Person', 'end': 'Person'}]
+
+
+def test_refresh_timeout_keeps_the_last_good_schema():
+    graph = _ScriptedGraph(_ANSWERS)
+    glb = _FakeGlobal(graph)
+    inst = _instance(glb)
+    inst.refresh_schema({})
+    graph.fail_on = 'MATCH (a)-[r'
+    out = inst.refresh_schema({})
+    assert out['schema']['stale'] is True and 'Query timed out' in out['schema']['error']
+    assert out['relationships'] == [{'type': 'KNOWS', 'start': 'Person', 'end': 'Person'}]
