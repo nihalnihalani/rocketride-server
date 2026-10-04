@@ -33,9 +33,14 @@
 //   - the preference keys `sql.history` and `sql.historyRecording`
 //   - the `sql` field of a persisted entry
 //   - the bounds (100 entries, 8 KiB of statement, 1 KiB of error)
+//
+// and it bridges the connection key: history saved under the pre-owner-aware
+// key `projectId:source:nodeId` is still read for the caller's own dev run
+// (see shared/explorer/history/store, "LEGACY KEYS").
 // =============================================================================
 
 import { createHistoryStore } from 'shared/explorer/history/store';
+import { legacyKeyFromKey } from 'shared/explorer/keys';
 import { createHistoryPrefsBridge } from 'shared/explorer/react';
 import type { IHistoryEntry } from './types';
 import { DEFAULT_HISTORY_LIMITS } from './trim';
@@ -65,6 +70,10 @@ const store = createHistoryStore<'sql'>({
 		maxErrorChars: DEFAULT_HISTORY_LIMITS.maxErrorChars,
 	},
 	runs: sqlRunEvents,
+	// Saved history is keyed by connection. The owner-aware key replaces
+	// `projectId:source:nodeId`; the caller's own dev run keeps reading what was
+	// saved under the old key (deploys and other owners never do).
+	legacyKeyOf: legacyKeyFromKey,
 });
 
 /**
