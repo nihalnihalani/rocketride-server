@@ -131,7 +131,25 @@ def _install_stubs() -> None:
     neo4j.Query = lambda q, timeout=None: q
     neo4j.bearer_auth = lambda token: ('bearer', token)
     neo4j.GraphDatabase = types.SimpleNamespace(driver=lambda *a, **kw: None)
-    neo4j.graph = types.SimpleNamespace(Node=object, Relationship=object)
+    neo4j.graph = types.SimpleNamespace(
+        Node=type('Node', (), {}), Relationship=type('Relationship', (), {}), Path=type('Path', (), {})
+    )
+    neo4j.spatial = types.SimpleNamespace(Point=type('Point', (tuple,), {}))
+    neo4j.time = types.SimpleNamespace(
+        Duration=type('Duration', (tuple,), {}),
+        DateTime=type('DateTime', (), {}),
+        Date=type('Date', (), {}),
+        Time=type('Time', (), {}),
+    )
+
+    def unit_of_work(timeout=None, metadata=None):
+        def wrap(fn):
+            fn.uow_timeout = timeout
+            return fn
+
+        return wrap
+
+    neo4j.unit_of_work = unit_of_work
     neo4j_exceptions = types.ModuleType('neo4j.exceptions')
     neo4j_exceptions.Neo4jError = _StubNeo4jError
     neo4j_exceptions.ServiceUnavailable = _StubServiceUnavailable
@@ -226,6 +244,9 @@ class _FakeRecord:
     def keys(self):
         return list(self._data.keys())
 
+    def values(self):
+        return list(self._data.values())
+
     def __getitem__(self, key):
         return self._data[key]
 
@@ -240,6 +261,11 @@ class _FakeResult:
         if self._raise:
             raise self._raise
         return iter(self._records)
+
+    def keys(self):
+        if self._raise:
+            raise self._raise
+        return self._records[0].keys() if self._records else []
 
     def consume(self):
         if self._raise:
@@ -263,6 +289,10 @@ class _FakeSession:
             raise self._driver.raise_error
         return self._driver.result
 
+    def execute_read(self, work):
+        self._driver.read_tx_timeouts.append(getattr(work, 'uow_timeout', None))
+        return work(self)
+
 
 class _FakeDriver:
     def __init__(self, result=None, raise_error=None):
@@ -270,6 +300,7 @@ class _FakeDriver:
         self.raise_error = raise_error
         self.calls = []
         self.session_kwargs = []
+        self.read_tx_timeouts = []
 
     def session(self, **kwargs):
         self.session_kwargs.append(kwargs)
@@ -459,3 +490,68 @@ def test_get_data_enforces_limit_and_flags_truncation():
     assert out['valid'] is True
     assert len(out['rows']) == 3
     assert out['truncated'] is True
+
+
+# ---------------------------------------------------------------------------
+# read_query (stubbed driver; the live suite is test_graph_neo4j_full.py)
+# ---------------------------------------------------------------------------
+
+_WRITES = [
+    'CREATE (n)',
+    'MATCH (n) SET n.x = 1',
+    "CALL db.createLabel('X')",
+    "CALL `apoc`.`cypher`.`runWrite`('CREATE (n)', {})",
+    'MATCH (n) CALL { WITH n DELETE n } RETURN 1',
+    'GRANT ROLE reader TO bob',
+    'USE system SHOW USERS',
+]
+
+
+@pytest.mark.parametrize('allow_execute', [False, True])
+@pytest.mark.parametrize('cypher', _WRITES)
+def test_read_query_refuses_before_opening_a_session(allow_execute, cypher):
+    glb = _FakeGlobal(_FakeDriver())
+    glb.allow_execute = allow_execute
+    with pytest.raises(Exception, match='^Refused: '):
+        _instance(glb).read_query({'cypher': cypher})
+    assert glb.driver.calls == [] and glb.driver.session_kwargs == []
+
+
+def test_read_query_uses_a_read_transaction_with_a_server_deadline():
+    driver = _FakeDriver(_FakeResult(records=[{'a': 1, 'b': 'x'}, {'a': 2, 'b': 'y'}]))
+    glb = _FakeGlobal(driver)
+    out = _instance(glb).read_query({'cypher': 'MATCH (n) RETURN n.a AS a, n.b AS b', 'params': {'p': 1}, 'limit': 1})
+    assert driver.session_kwargs[0]['default_access_mode'] == 'READ'
+    assert driver.read_tx_timeouts == [glb.QUERY_TIMEOUT]
+    assert driver.calls == [('MATCH (n) RETURN n.a AS a, n.b AS b', {'p': 1})]
+    assert out['columns'] == ['a', 'b'] and out['rows'] == [[1, 'x']]
+    assert out['truncated'] is True and out['truncated_by'] == 'rows'
+
+
+def test_read_query_maps_driver_errors_to_headlines():
+    timeout = _StubNeo4jError('The transaction has been terminated.')
+    timeout.code = 'Neo.ClientError.Transaction.TransactionTimedOutClientConfiguration'
+    glb = _FakeGlobal(_FakeDriver(raise_error=timeout))
+    with pytest.raises(Exception) as err:
+        _instance(glb).read_query({'cypher': 'MATCH (n) RETURN n'})
+    assert str(err.value) == 'Query timed out after 30000 ms\nThe transaction has been terminated.'
+
+    denied = _StubNeo4jError('Writing in read access mode not allowed.')
+    denied.code = 'Neo.ClientError.Statement.AccessMode'
+    glb = _FakeGlobal(_FakeDriver(raise_error=denied))
+    with pytest.raises(Exception, match='^Refused: the database refused a write'):
+        _instance(glb).read_query({'cypher': 'MATCH (n) RETURN n'})
+
+
+def test_natural_language_read_path_refuses_unlisted_procedures():
+    glb = _FakeGlobal(_FakeDriver())
+    with pytest.raises(ValueError, match='Refused: CALL db.createLabel'):
+        glb._run_query("CALL db.createLabel('X')")
+    assert glb.driver.calls == []
+
+
+def test_role_privilege_check():
+    read_only = [{'access': 'GRANTED', 'action': a} for a in ('access', 'traverse', 'read', 'execute')]
+    assert _glb_mod.role_is_read_only(read_only)
+    assert not _glb_mod.role_is_read_only(read_only + [{'access': 'GRANTED', 'action': 'write'}])
+    assert not _glb_mod.role_is_read_only([])

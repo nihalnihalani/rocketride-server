@@ -182,7 +182,8 @@ class GraphGlobalBase(IGlobalBase, ABC):
                 else:
                     block = empty_block(source=source, error=message)
                 self._schema_state = (block, self._schema_state[1])
-                warning(f'{self.glb.logicalType}: schema refresh failed: {message.splitlines()[0]}')
+                node = getattr(getattr(self, 'glb', None), 'logicalType', 'graph node')
+                warning(f'{node}: schema refresh failed: {message.splitlines()[0]}')
             return copy.deepcopy(block)
         finally:
             self._schema_lock.release()
