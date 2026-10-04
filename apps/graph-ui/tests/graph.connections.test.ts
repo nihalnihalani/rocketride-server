@@ -39,7 +39,7 @@ test('writes are shown as allowed only when the node says execute is on', () => 
 });
 
 test('an OLD node is badged Needs upgrade and cannot be opened; it is not shown as healthy', () => {
-	const view = connectionView(endpoint(), probeOf('old_node'), { advertised: true });
+	const view = connectionView(endpoint(), probeOf('old_node'));
 	assert.equal(view.badge.label, 'Needs upgrade');
 	assert.equal(view.badge.variant, 'warning');
 	assert.equal(view.openable, false);
@@ -93,9 +93,9 @@ test('failed discovery keeps already discovered endpoints visible instead of an 
 	assert.equal(emptyState('error', [endpoint()], {}, 'refresh failed'), null);
 });
 
-test('TEMPORARY (until G10): a node without a capabilities block is not badged as needing an upgrade', () => {
-	const view = connectionView(endpoint(), probeOf('old_node'), { advertised: false });
-	assert.equal(view.badge.label, 'Running');
-	assert.equal(view.openable, true);
-	assert.equal(connectionView(endpoint(), { ok: true, info: { dialect: 'neo4j', capabilities: { read_query: false } }, dialect: 'neo4j' }, { advertised: false }).badge.label, 'Needs upgrade');
+test('a node that advertises read_query is not badged as needing an upgrade, and one that says false is', () => {
+	const current = connectionView(endpoint(), probeOf('neo4j'));
+	assert.equal(current.badge.label, 'Running');
+	assert.equal(current.openable, true);
+	assert.equal(connectionView(endpoint(), { ok: true, info: { dialect: 'neo4j', capabilities: { read_query: false } }, dialect: 'neo4j' }).badge.label, 'Needs upgrade');
 });

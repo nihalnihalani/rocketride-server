@@ -9,13 +9,11 @@
 
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { CAPABILITY_POLICY, canWrite, engineText, parseDialect, readBoundaryText, rowLimitFor, supportsReadQuery, supportsRefresh, targetText } from '../src/graph/dialect';
+import { canWrite, engineText, parseDialect, readBoundaryText, rowLimitFor, supportsReadQuery, supportsRefresh, targetText } from '../src/graph/dialect';
 import { fixture } from './support/builders';
 
 const load = (name: string) => parseDialect(fixture<Record<string, unknown>>(`dialect_${name}`));
 /** The rules as they apply once nodes publish capabilities (backend task G10). */
-const FINAL = { advertised: true };
-const TODAY = { advertised: false };
 
 test('a current node reports engine, version, edition, target, capabilities and limits', () => {
 	const neo = load('neo4j');
@@ -24,8 +22,8 @@ test('a current node reports engine, version, edition, target, capabilities and 
 	assert.equal(engineText(neo), 'Neo4j 5.26.31 Community');
 	assert.equal(targetText(neo), 'database neo4j');
 	assert.equal(neo.allowExecute, false);
-	assert.equal(supportsReadQuery(neo, FINAL), true);
-	assert.equal(supportsRefresh(neo, FINAL), true);
+	assert.equal(supportsReadQuery(neo), true);
+	assert.equal(supportsRefresh(neo), true);
 	assert.equal(neo.limits.maxRows, 25000);
 	assert.equal(neo.limits.statementTimeoutMs, 30000);
 	assert.equal(neo.readBoundary, 'read_session');
@@ -42,14 +40,13 @@ test('an old node answers {dialect} only: nothing can be assumed, so read_query 
 	const old = load('old_node');
 	assert.ok(old);
 	assert.equal(old.dialect, 'neo4j');
-	assert.equal(supportsReadQuery(old, FINAL), false, 'the app shows an upgrade message and never falls back to execute');
-	assert.equal(supportsRefresh(old, FINAL), false);
-	assert.equal(canWrite(old, FINAL), false);
+	assert.equal(supportsReadQuery(old), false, 'the app shows an upgrade message and never falls back to execute');
+	assert.equal(supportsRefresh(old), false);
+	assert.equal(canWrite(old), false);
 	assert.equal(old.allowExecute, false);
 	assert.equal(old.readBoundary, 'unknown');
 	assert.equal(old.limits.maxRows, 1000, 'fallback limits, never unlimited');
-	assert.equal(supportsReadQuery(null, FINAL), false);
-	assert.equal(supportsReadQuery(null, TODAY), false);
+	assert.equal(supportsReadQuery(null), false);
 });
 
 test('an unsupported or malformed answer is not a graph dialect', () => {
@@ -58,11 +55,11 @@ test('an unsupported or malformed answer is not a graph dialect', () => {
 
 test('the write console needs allow_execute AND the graph execute shape, and nothing else grants it', () => {
 	const on = parseDialect({ dialect: 'neo4j', allow_execute: true, capabilities: { execute_shape_graph: true, read_query: true } });
-	assert.equal(canWrite(on, FINAL), true);
-	assert.equal(canWrite(parseDialect({ dialect: 'neo4j', allow_execute: true, capabilities: { read_query: true } }), FINAL), false, 'no graph shape for execute');
-	assert.equal(canWrite(parseDialect({ dialect: 'neo4j', allow_execute: false, capabilities: { execute_shape_graph: true } }), FINAL), false);
-	assert.equal(canWrite(parseDialect({ dialect: 'neo4j', allow_execute: 'true', capabilities: { execute_shape_graph: true } }), FINAL), false, 'only the boolean true counts');
-	assert.equal(canWrite(parseDialect({ dialect: 'neo4j', allow_writes: true, capabilities: { execute_shape_graph: true } }), FINAL), false, 'allow_writes is not allow_execute');
+	assert.equal(canWrite(on), true);
+	assert.equal(canWrite(parseDialect({ dialect: 'neo4j', allow_execute: true, capabilities: { read_query: true } })), false, 'no graph shape for execute');
+	assert.equal(canWrite(parseDialect({ dialect: 'neo4j', allow_execute: false, capabilities: { execute_shape_graph: true } })), false);
+	assert.equal(canWrite(parseDialect({ dialect: 'neo4j', allow_execute: 'true', capabilities: { execute_shape_graph: true } })), false, 'only the boolean true counts');
+	assert.equal(canWrite(parseDialect({ dialect: 'neo4j', allow_writes: true, capabilities: { execute_shape_graph: true } })), false, 'allow_writes is not allow_execute');
 });
 
 test('row limits: All is the node cap, nothing exceeds it, and a clamp never goes below 1', () => {
@@ -106,15 +103,14 @@ test('engine and target text fall back to the dialect name when the node does no
 	assert.equal(targetText(parseDialect({ dialect: 'neo4j', database: 'neo4j', graph: 'g' }) as never), 'graph g');
 });
 
-test('TEMPORARY policy (until G10): a node that does not publish capabilities is UNKNOWN, not old; only an explicit false blocks', () => {
-	assert.equal(CAPABILITY_POLICY.advertised, false, 'flip this to true when backend task G10 lands, and delete the TODAY branches');
+test('a node that publishes no capabilities block advertises nothing: only an explicit true counts', () => {
 	const unpublished = load('old_node');
-	assert.equal(supportsReadQuery(unpublished, TODAY), true, 'the workbench opens and the call is made');
-	assert.equal(supportsRefresh(unpublished, TODAY), true);
-	assert.equal(supportsReadQuery(parseDialect({ dialect: 'neo4j', capabilities: { read_query: false } }), TODAY), false, 'an explicit false still blocks');
-	assert.equal(supportsReadQuery(parseDialect({ dialect: 'neo4j', capabilities: { read_query: true } }), TODAY), true);
-	// Writing is never assumed: it needs the node to say allow_execute, whatever the policy.
-	assert.equal(canWrite(unpublished, TODAY), false);
-	assert.equal(canWrite(parseDialect({ dialect: 'neo4j', allow_execute: true }), TODAY), true, 'allow_execute true and no capability block: the graph shape cannot be ruled out');
-	assert.equal(canWrite(parseDialect({ dialect: 'neo4j', allow_execute: true, capabilities: { execute_shape_graph: false } }), TODAY), false);
+	assert.equal(supportsReadQuery(unpublished), false);
+	assert.equal(supportsRefresh(unpublished), false);
+	assert.equal(supportsReadQuery(parseDialect({ dialect: 'neo4j', capabilities: { read_query: false } })), false);
+	assert.equal(supportsReadQuery(parseDialect({ dialect: 'neo4j', capabilities: { read_query: 'true' } })), false, 'only the boolean true counts');
+	assert.equal(supportsReadQuery(parseDialect({ dialect: 'neo4j', capabilities: { read_query: true } })), true);
+	// Writing is never assumed: it needs allow_execute AND the graph shape.
+	assert.equal(canWrite(parseDialect({ dialect: 'neo4j', allow_execute: true })), false, 'allow_execute with no capability block: the graph shape is not advertised');
+	assert.equal(canWrite(parseDialect({ dialect: 'neo4j', allow_execute: true, capabilities: { execute_shape_graph: false } })), false);
 });

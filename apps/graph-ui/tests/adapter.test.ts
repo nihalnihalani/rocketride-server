@@ -16,7 +16,7 @@ import { describe, it } from 'node:test';
 import { ExplorerToolError, probeInfo } from 'shared/explorer';
 import { codedError, fakeWorld, manualClock, row } from 'shared/explorer/connect/testing';
 import type { IFakeRow, IToolCall } from 'shared/explorer/connect/testing';
-import { GRAPH_PROVIDERS, GRAPH_TOOLS, TOOL, makeGraphEndpointStore, makeGraphEndpointStoreWith, makeGraphHistory, makeGraphTools, patternChecks } from '../src/adapters/explorer';
+import { GRAPH_PROVIDERS, GRAPH_TOOLS, TOOL, makeGraphEndpointStore, makeGraphHistory, makeGraphTools, patternChecks } from '../src/adapters/explorer';
 import { parseDialect, supportsReadQuery } from '../src/graph/dialect';
 import { fixture, readQueryFixture } from './support/builders';
 
@@ -48,10 +48,10 @@ const CURRENT = fixture<Record<string, unknown>>('dialect_neo4j');
 const OLD = fixture<Record<string, unknown>>('dialect_old_node');
 
 /** A store over a fake world, already discovered and probed. */
-async function rig(dialect: Record<string, unknown>, extra: Record<string, (call: IToolCall) => unknown> = {}, rows: IFakeRow[] = [graphRow()], advertised = true) {
+async function rig(dialect: Record<string, unknown>, extra: Record<string, (call: IToolCall) => unknown> = {}, rows: IFakeRow[] = [graphRow()]) {
 	const world = fakeWorld(rows, behaviour(dialect, extra));
 	const clock = manualClock();
-	const store = makeGraphEndpointStoreWith({ advertised }, { clock });
+	const store = makeGraphEndpointStore({ clock });
 	await store.refresh(world.client);
 	await clock.settle();
 	const endpoint = store.getState().endpoints[0];
@@ -75,23 +75,11 @@ describe('providers', () => {
 
 describe('tools: per-tool judgement', () => {
 	it('declares idempotency and capabilities per tool: reads and reflection are idempotent, execute never is', () => {
-		const GRAPH_TOOLS = makeGraphTools({ advertised: true });
+		const GRAPH_TOOLS = makeGraphTools();
 		assert.deepEqual(Object.entries(GRAPH_TOOLS).map(([name, spec]) => [name, spec.idempotent === true]).sort(), [['dialect', true], ['execute', false], ['get_query', true], ['get_schema', true], ['read_query', true], ['refresh_schema', true]]);
 		assert.equal(GRAPH_TOOLS[TOOL.readQuery].capability, 'read_query');
 		assert.equal(GRAPH_TOOLS[TOOL.refreshSchema].capability, 'refresh_schema');
 		assert.equal(GRAPH_TOOLS[TOOL.execute].capability, 'execute_shape_graph');
-	});
-
-	it('TEMPORARY (until G10): with capabilities not yet published no tool is gated, so nothing is refused locally', () => {
-		const today = makeGraphTools({ advertised: false });
-		for (const [name, spec] of Object.entries(today)) assert.equal(spec.capability, undefined, name);
-		assert.equal(GRAPH_TOOLS[TOOL.readQuery].capability, undefined, 'the app runs with the temporary policy');
-	});
-
-	it('TEMPORARY (until G10): a node without a capabilities block is sent read_query, and a node that lacks the tool answers with the unknown-tool text, shown as the upgrade message, never replaced by execute', async () => {
-		const { world, session } = await rig(OLD, { [TOOL.readQuery]: () => { throw codedError('No handler found for tool read_query'); } }, [graphRow()], false);
-		await assert.rejects(session().invoke(TOOL.readQuery, { cypher: 'RETURN 1' }), /No handler found for tool read_query/);
-		assert.deepEqual(world.calls.map((c) => c.tool), ['dialect', 'read_query'], 'the call was made, and nothing else was tried');
 	});
 
 	it('a probed current node answers read_query with a validated envelope, on the node, with a timeout above its statement deadline', async () => {

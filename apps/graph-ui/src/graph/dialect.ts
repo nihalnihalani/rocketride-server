@@ -76,27 +76,6 @@ export interface IGraphDialect {
 	readBoundaryVerified: boolean;
 }
 
-/**
- * Whether nodes publish a `capabilities` block in their `dialect` answer.
- *
- * TEMPORARY (until backend task G10 lands): the nodes that have `read_query` do
- * not yet answer `dialect` with capabilities, so an answer without a block cannot
- * tell a current node from an old one. While `advertised` is false, a missing
- * capability is read as UNKNOWN (the workbench opens, the call is made, and a node
- * that really lacks the tool answers "No handler found for tool ...", which the
- * app turns into the upgrade message); only an explicit `false` blocks. There is
- * never a fallback to `execute` or FalkorDB's writable `query` either way.
- *
- * When G10 lands: set `advertised` to true, delete the `advertised: false`
- * branches below, and the old-node rule (no `capabilities` => upgrade) applies.
- */
-export interface ICapabilityPolicy {
-	advertised: boolean;
-}
-
-/** The policy the app runs with. Flip to `{ advertised: true }` when G10 lands. */
-export const CAPABILITY_POLICY: ICapabilityPolicy = { advertised: false };
-
 /** Fallbacks when a node does not report its limits. */
 export const FALLBACK_LIMITS: IGraphLimits = { defaultRows: DEFAULT_ROW_LIMIT, maxRows: 1000, maxElements: 10000, maxValues: 500000, statementTimeoutMs: 30000, serverResultCap: null };
 
@@ -168,16 +147,18 @@ export function parseDialect(info: Record<string, unknown> | null): IGraphDialec
 // =============================================================================
 
 /**
- * Whether a node has a capability under a policy.
+ * Whether a node advertises a capability.
+ *
+ * A node that publishes no `capabilities` block (an old node) advertises nothing:
+ * the app then shows the upgrade message and sends nothing. It never substitutes
+ * `execute`, or FalkorDB's writable `query`, for a read.
  *
  * @param dialect - The parsed dialect, or null.
  * @param key - The capability key.
- * @param policy - Whether nodes publish capabilities at all.
- * @returns True when the node says so; while capabilities are not published, true unless the node says false.
+ * @returns True only when the node says `true`.
  */
-function capable(dialect: IGraphDialect | null, key: string, policy: ICapabilityPolicy): boolean {
-	if (dialect === null) return false;
-	return policy.advertised ? dialect.capabilities[key] === true : dialect.capabilities[key] !== false;
+function capable(dialect: IGraphDialect | null, key: string): boolean {
+	return dialect !== null && dialect.capabilities[key] === true;
 }
 
 /**
@@ -186,8 +167,8 @@ function capable(dialect: IGraphDialect | null, key: string, policy: ICapability
  * @param dialect - The parsed dialect, or null for an unprobed or unsupported node.
  * @returns True only when the node says so; an old node (no capabilities) is false.
  */
-export function supportsReadQuery(dialect: IGraphDialect | null, policy: ICapabilityPolicy = CAPABILITY_POLICY): boolean {
-	return capable(dialect, 'read_query', policy);
+export function supportsReadQuery(dialect: IGraphDialect | null): boolean {
+	return capable(dialect, 'read_query');
 }
 
 /**
@@ -196,8 +177,8 @@ export function supportsReadQuery(dialect: IGraphDialect | null, policy: ICapabi
  * @param dialect - The parsed dialect.
  * @returns True only when the node says so.
  */
-export function supportsRefresh(dialect: IGraphDialect | null, policy: ICapabilityPolicy = CAPABILITY_POLICY): boolean {
-	return capable(dialect, 'refresh_schema', policy);
+export function supportsRefresh(dialect: IGraphDialect | null): boolean {
+	return capable(dialect, 'refresh_schema');
 }
 
 /**
@@ -207,8 +188,8 @@ export function supportsRefresh(dialect: IGraphDialect | null, policy: ICapabili
  * @param dialect - The parsed dialect.
  * @returns True when writes are possible through this endpoint.
  */
-export function canWrite(dialect: IGraphDialect | null, policy: ICapabilityPolicy = CAPABILITY_POLICY): boolean {
-	return dialect !== null && dialect.allowExecute && capable(dialect, 'execute_shape_graph', policy);
+export function canWrite(dialect: IGraphDialect | null): boolean {
+	return dialect !== null && dialect.allowExecute && capable(dialect, 'execute_shape_graph');
 }
 
 /**

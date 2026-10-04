@@ -11,7 +11,7 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import { codedError, fakeWorld, manualClock, row } from 'shared/explorer/connect/testing';
 import type { IFakeRow, IToolCall } from 'shared/explorer/connect/testing';
-import { TOOL, makeGraphEndpointStoreWith } from '../src/adapters/explorer';
+import { TOOL, makeGraphEndpointStore } from '../src/adapters/explorer';
 import { askConnection, loadConnectionSchema } from '../src/adapters/actions';
 import { createSchemaStore } from '../src/graph/schemaStore';
 import { ASK_UNAVAILABLE } from '../src/graph/wording';
@@ -25,7 +25,7 @@ function graphRow(over: Partial<IFakeRow> = {}): IFakeRow {
 }
 
 /** A store over a fake world, discovered and probed, and the stores the actions take. */
-async function rig(dialect: Record<string, unknown>, extra: Record<string, (call: IToolCall) => unknown> = {}, advertised = true) {
+async function rig(dialect: Record<string, unknown>, extra: Record<string, (call: IToolCall) => unknown> = {}) {
 	const world = fakeWorld([graphRow()], (call) => {
 		if (extra[call.tool]) return extra[call.tool](call);
 		if (call.tool === TOOL.dialect) return dialect;
@@ -33,7 +33,7 @@ async function rig(dialect: Record<string, unknown>, extra: Record<string, (call
 		return {};
 	});
 	const clock = manualClock();
-	const endpoints = makeGraphEndpointStoreWith({ advertised }, { clock });
+	const endpoints = makeGraphEndpointStore({ clock });
 	await endpoints.refresh(world.client);
 	await clock.settle();
 	const stores = { endpoints, schemas: createSchemaStore() };
@@ -63,16 +63,15 @@ describe('schema actions', () => {
 		assert.equal(noRefresh.stores.schemas.get(noRefresh.endpoint.key).status, 'ready');
 	});
 
-	it('TEMPORARY (until G10): with capabilities unpublished Refresh is sent, and a node lacking it keeps the snapshot and says so for refresh_schema (not read_query)', async () => {
-		const { world, stores, endpoint } = await rig(OLD, { [TOOL.refreshSchema]: () => { throw codedError('No handler found for tool refresh_schema'); } }, false);
+	it('a node that cannot refresh keeps its snapshot, and a failed refresh says so for refresh_schema (not read_query)', async () => {
+		const { world, stores, endpoint } = await rig({ ...CURRENT, capabilities: { ...(CURRENT.capabilities as object), refresh_schema: true } }, { [TOOL.refreshSchema]: () => { throw codedError('Schema refresh failed\nconnection reset'); } });
 		await loadConnectionSchema(world.client, endpoint, {}, stores);
 		const before = stores.schemas.get(endpoint.key).view;
 		await loadConnectionSchema(world.client, endpoint, { fresh: true }, stores);
 		const entry = stores.schemas.get(endpoint.key);
 		assert.equal(entry.status, 'error');
 		assert.deepEqual(entry.view, before, 'the last good snapshot stays');
-		assert.match(entry.failure?.headline ?? '', /cannot refresh its schema/);
-		assert.doesNotMatch(entry.failure?.headline ?? '', /read_query/);
+		assert.equal(entry.failure?.headline, 'Schema refresh failed');
 	});
 
 	it('a failed first load is an error entry that shows nothing, not an empty graph', async () => {
