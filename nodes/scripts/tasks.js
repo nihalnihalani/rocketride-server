@@ -80,6 +80,7 @@ const BUILD_NODES_DIR = path.join(BUILD_ROOT, 'nodes');
 const DB_LIVE_SUITES = [
     'test_rocketride_db_full.py',
     'test_rocketride_graph_full.py',
+    'test_graph_age_full.py',
 ];
 
 // ============================================================================
