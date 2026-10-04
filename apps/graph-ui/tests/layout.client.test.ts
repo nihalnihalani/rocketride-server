@@ -15,6 +15,7 @@ import { test } from 'node:test';
 import { createLayoutClient } from '../src/layout/workerClient';
 import type { ILayoutTimers, ILayoutWorkerLike } from '../src/layout/workerClient';
 import { LayoutUnavailableError, chooseWorkerStrategy, devShimSource } from '../src/layout/workerStrategy';
+import { layoutDeadlineMs } from '../src/layout/protocol';
 import type { ILayoutRequest } from '../src/layout/protocol';
 
 /** A worker the test drives by hand. */
@@ -286,4 +287,12 @@ test('the dev wrapper shadows self.location with the real script URL before load
 	const importedEvil: string[] = [];
 	vm.runInNewContext(devShimSource(evil), { self: {}, importScripts: (u: string) => importedEvil.push(u), postMessage: () => { throw new Error('executed injected code'); }, Object });
 	assert.deepEqual(importedEvil, [evil]);
+});
+
+test('the layout deadline grows with the graph, between 4 and 12 seconds', () => {
+	assert.equal(layoutDeadlineMs(0), 4000);
+	assert.equal(layoutDeadlineMs(100), 4000);
+	assert.equal(layoutDeadlineMs(300), 5000);
+	assert.equal(layoutDeadlineMs(1000), 12000);
+	assert.equal(layoutDeadlineMs(100000), 12000);
 });

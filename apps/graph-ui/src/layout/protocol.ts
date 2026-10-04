@@ -99,3 +99,14 @@ export type LayoutWorkerOut = ILayoutResult | ILayoutError;
 /** Worker defaults. */
 export const DEFAULT_TICKS = 300;
 export const DEFAULT_DEADLINE_MS = 4000;
+
+/**
+ * How long the worker may spend before it answers with the positions it has.
+ * Bigger graphs need longer (and the wait is off the main thread), up to a ceiling.
+ *
+ * @param nodes - Nodes in the layout.
+ * @returns Milliseconds.
+ */
+export function layoutDeadlineMs(nodes: number): number {
+	return Math.min(12_000, Math.max(4000, 2000 + nodes * 10));
+}

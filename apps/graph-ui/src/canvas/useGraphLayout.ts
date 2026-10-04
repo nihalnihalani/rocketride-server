@@ -43,12 +43,13 @@ import type { GraphId } from '../graph/types';
 import { ringAround } from '../layout/gridFallback';
 import { createLayoutClient } from '../layout/workerClient';
 import type { FallbackReason, ILayoutClient } from '../layout/workerClient';
+import { layoutDeadlineMs } from '../layout/protocol';
 import type { ILayoutNode } from '../layout/protocol';
 import { spawnLayoutWorker } from '../layout/spawnWorker';
 import { stableHash } from '../graph/colors';
 
 /** How the last layout went. */
-export type LayoutStatus = { state: 'idle' } | { state: 'working' } | { state: 'ready'; timedOut: boolean } | { state: 'fallback'; reason: FallbackReason; detail: string };
+export type LayoutStatus = { state: 'idle' } | { state: 'working' } | { state: 'ready'; timedOut: boolean; ticks: number; elapsedMs: number } | { state: 'fallback'; reason: FallbackReason; detail: string };
 
 /** Where new nodes should start. */
 export interface IExpandHint {
@@ -131,13 +132,13 @@ export function useGraphLayout(model: IGraphModel, seedKey: string, hint: IExpan
 		let alive = true;
 		setStatus({ state: 'working' });
 		void client.current
-			.layout({ nodes, links, seed: stableHash(seedKey), ticks: known.current.size === 0 ? 300 : 150 })
+			.layout({ nodes, links, seed: stableHash(seedKey), ticks: known.current.size === 0 ? 300 : 150, deadlineMs: layoutDeadlineMs(nodes.length) })
 			.then((outcome) => {
 				if (!alive || outcome.status === 'stale') return;
 				for (const [id, p] of outcome.positions) if (model.nodes.has(id)) known.current.set(id, p);
 				setPositions(new Map(known.current));
 				setVersion((v) => v + 1);
-				setStatus(outcome.status === 'ok' ? { state: 'ready', timedOut: outcome.timedOut } : { state: 'fallback', reason: outcome.reason, detail: outcome.detail });
+				setStatus(outcome.status === 'ok' ? { state: 'ready', timedOut: outcome.timedOut, ticks: outcome.ticks, elapsedMs: outcome.elapsedMs } : { state: 'fallback', reason: outcome.reason, detail: outcome.detail });
 			});
 		return () => {
 			alive = false;
