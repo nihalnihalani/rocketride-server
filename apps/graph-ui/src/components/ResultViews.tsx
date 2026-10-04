@@ -81,6 +81,13 @@ export const ResultTable: React.FC<IResultTableProps> = ({ result, tableKey, onR
 		const types = columnGridTypes(result);
 		return result.columns.map((name, i) => ({
 			title: name === '' ? `(column ${i + 1})` : name,
+			// The grid draws headers in capitals; a Cypher column name is case-sensitive (`n` and `N` differ), so show it as it is.
+			titleFormatter: () => {
+				const span = document.createElement('span');
+				span.textContent = name === '' ? `(column ${i + 1})` : name;
+				span.style.textTransform = 'none';
+				return span;
+			},
 			field: keys[i],
 			rrType: types[i],
 			rrDefault: true,

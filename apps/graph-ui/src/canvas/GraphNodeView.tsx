@@ -54,6 +54,8 @@ export interface IGraphNodeData extends Record<string, unknown> {
 	initial: string;
 	selected: boolean;
 	expanded: boolean;
+	/** The database answered for this id with a different element (or a write ran): the copy is out of date. */
+	stale: boolean;
 }
 
 /** The React Flow node type of a graph node. */
@@ -102,7 +104,7 @@ const styles = {
  */
 function GraphNodeViewImpl({ data }: NodeProps<GraphFlowNode>): React.ReactElement {
 	return (
-		<div className="graph-ui-node" data-selected={data.selected ? 'true' : 'false'} data-expanded={data.expanded ? 'true' : 'false'} style={styles.root}>
+		<div className="graph-ui-node" data-selected={data.selected ? 'true' : 'false'} data-expanded={data.expanded ? 'true' : 'false'} data-stale={data.stale ? 'true' : 'false'} style={styles.root}>
 			<div className="graph-ui-circle" style={styles.circle(data.fill, data.textColor)} aria-hidden="true">
 				{data.initial}
 			</div>

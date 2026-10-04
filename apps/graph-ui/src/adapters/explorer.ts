@@ -71,6 +71,8 @@ import {
 } from 'shared/explorer';
 import type { IEndpointStore, IEndpointStoreOptions, IHistoryStore, IToolSpec } from 'shared/explorer';
 import type { GraphDialect } from '../cypher/quote';
+import { createDataVersions } from '../graph/dataVersion';
+import type { IDataVersions } from '../graph/dataVersion';
 import { createSchemaStore } from '../graph/schemaStore';
 import type { ISchemaStore } from '../graph/schemaStore';
 
@@ -156,6 +158,9 @@ export const CAPTIONS_PREF_KEY = 'graph.captions';
 
 /** Per-connection editor drafts. Text only, never a token or a result. */
 export const DRAFTS_PREF_KEY = 'graph.drafts';
+
+/** Per connection: has something that can change data run there? (drawn graphs go out of date) */
+export const dataVersions: IDataVersions = createDataVersions();
 
 /** The app's schema snapshots, one per connection. */
 export const schemas: ISchemaStore = createSchemaStore();

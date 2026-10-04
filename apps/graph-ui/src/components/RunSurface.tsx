@@ -44,13 +44,15 @@ import type { IExplorerEndpoint, IRunTarget, IStatementRunBase } from 'shared/ex
 import FailureBanner from 'shared/explorer/components/FailureBanner';
 import RowInspector from 'shared/explorer/components/RowInspector';
 import StatementStrip from 'shared/explorer/components/StatementStrip';
-import { CAPTIONS_PREF_KEY, DRAFTS_PREF_KEY, TOOL, announcer, graphEndpoints, graphHistory } from '../adapters/explorer';
+import { CAPTIONS_PREF_KEY, DRAFTS_PREF_KEY, TOOL, announcer, dataVersions, graphEndpoints, graphHistory } from '../adapters/explorer';
 import { useGraphEndpoints, useSchema } from '../adapters/react';
-import { describeRun, targetsToRun } from '../cypher/targets';
+import { describeSnapshot, targetsFromEditor } from '../cypher/targets';
+import type { IEditorSnapshot } from '../cypher/targets';
 import { DEFAULT_ROW_LIMIT, ROW_LIMIT_CHOICES } from '../graph/budgets';
 import { canWrite as dialectCanWrite, parseDialect, rowLimitFor } from '../graph/dialect';
 import { describeFailureOf } from '../graph/failures';
 import type { IFailureNotice } from '../graph/failures';
+import { mayHaveChangedData } from '../graph/dataVersion';
 import { createGraphSession } from '../graph/graphSession';
 import type { IGraphSession } from '../graph/graphSession';
 import { confirmationParagraphs, describeWrites } from '../graph/writeConfirm';
@@ -154,7 +156,7 @@ export const RunSurface: React.FC<IRunSurfaceProps> = ({ endpoint, mode, loadReq
 	const [limitId, setLimitId] = useState<string>(String(DEFAULT_ROW_LIMIT));
 	const limitChoice = limitId === 'all' ? null : Number(limitId);
 	const editor = useRef<IQueryEditorHandle | null>(null);
-	const [cursor, setCursor] = useState({ start: 0, end: 0, caret: 0 });
+	const [view, setView] = useState<IEditorSnapshot | null>(null);
 	const latestText = useRef(text);
 	latestText.current = text;
 
@@ -172,12 +174,16 @@ export const RunSurface: React.FC<IRunSurfaceProps> = ({ endpoint, mode, loadReq
 	}, [prefs, draftKey, onTextChange]);
 	useEffect(() => () => { if (draftTimer.current) clearTimeout(draftTimer.current); }, []);
 
+	// What the "Will run" sentence describes: one live read of the editor, taken when the caret settles or the text changes.
 	const syncCursor = useCallback(() => {
 		const handle = editor.current;
-		if (!handle) return;
-		const sel = handle.getSelection();
-		setCursor({ start: sel.start, end: sel.end, caret: handle.getCaret() });
+		if (handle) setView(handle.snapshot());
 	}, []);
+	// Typing moves the caret, but a text that is replaced from outside (History, a label preview, a draft) may not.
+	useEffect(() => {
+		const timer = setTimeout(syncCursor, 200);
+		return () => clearTimeout(timer);
+	}, [text, syncCursor]);
 
 	// ── The runner (shared) configured for Cypher ────────────────────────────
 	const [confirm, setConfirm] = useState<{ content: IWriteConfirmation; targets: IRunTarget[] } | null>(null);
@@ -208,6 +214,8 @@ export const RunSurface: React.FC<IRunSurfaceProps> = ({ endpoint, mode, loadReq
 		},
 		formatPrior: (runs, index) => formatPriorStatements(runs, index, GRAPH_BATCH_WORDS),
 		record: (run) => {
+			// A write that ran (or may still run) makes every graph drawn from this connection out of date, in every document.
+			if (mayHaveChangedData(mode, run.outcome)) dataVersions.bump(endpoint.key);
 			const outcome = run.outcome === 'rows' || run.outcome === 'abandoned' ? run.outcome : 'error';
 			graphHistory.runs.emitRun(endpoint.key, toHistoryEntry({ cypher: run.cypher, at: Date.now() - (run.ms ?? 0), ms: run.ms ?? 0, outcome, ...(run.outcome === 'rows' ? { rows: run.result?.rows.length ?? 0 } : {}), ...(run.limitApplied != null ? { limit: run.limitApplied } : {}), ...(run.error !== undefined ? { error: run.error } : {}), kind: run.verb }, entryId()));
 		},
@@ -245,10 +253,17 @@ export const RunSurface: React.FC<IRunSurfaceProps> = ({ endpoint, mode, loadReq
 		announce,
 		captionChoice: (label) => captionsRef.current.get(label),
 	}), [session, dialect, writable, announce]);
+	// The version of this connection's data when the graph was drawn: a later write marks the drawing out of date.
+	const version = useSyncExternalStore(dataVersions.subscribe, () => dataVersions.get(endpoint.key), () => dataVersions.get(endpoint.key));
+	const drawnAt = useRef(version);
 	useEffect(() => {
+		drawnAt.current = dataVersions.get(endpoint.key);
 		graphSession.load(result);
 		return () => graphSession.dispose();
-	}, [graphSession, result]);
+	}, [graphSession, result, endpoint.key]);
+	useEffect(() => {
+		if (version !== drawnAt.current) graphSession.markStale();
+	}, [version, graphSession]);
 	const graphState = useSyncExternalStore(graphSession.subscribe, graphSession.getState, graphSession.getState);
 
 	// ── Captions per connection (persisted, view state only) ─────────────────
@@ -287,11 +302,13 @@ export const RunSurface: React.FC<IRunSurfaceProps> = ({ endpoint, mode, loadReq
 		void runner.runTargets(targets, { fromEditor });
 	}, [mode, runner, announce]);
 
+	// Run reads the buffer, the selection and the caret from the LIVE editor in one call. The `text` state is a copy that
+	// lags a render behind fast typing; a caret taken from the editor against that copy points past its end and the run
+	// would send a truncated statement.
 	const run = useCallback((all: boolean) => {
 		const handle = editor.current;
-		const sel = handle ? handle.getSelection() : { start: 0, end: 0 };
-		const caret = handle ? handle.getCaret() : 0;
-		startRun(targetsToRun(latestText.current, { start: sel.start, end: sel.end }, caret, all), true);
+		const targets = handle ? targetsFromEditor(handle, all) : targetsFromEditor({ snapshot: () => ({ text: latestText.current, start: 0, end: 0, caret: latestText.current.length }) }, all);
+		startRun(targets, true);
 	}, [startRun]);
 
 	// A request from the host: put text in the editor, and (for a click on a label) run it.
@@ -299,6 +316,7 @@ export const RunSurface: React.FC<IRunSurfaceProps> = ({ endpoint, mode, loadReq
 	useEffect(() => {
 		if (!loadRequest || loadRequest.seq === handled.current) return;
 		handled.current = loadRequest.seq;
+		editor.current?.setText(loadRequest.text);
 		changeText(loadRequest.text);
 		if (loadRequest.run) startRun([{ text: loadRequest.text }], false);
 	}, [loadRequest]); // eslint-disable-line react-hooks/exhaustive-deps
@@ -311,7 +329,7 @@ export const RunSurface: React.FC<IRunSurfaceProps> = ({ endpoint, mode, loadReq
 	// ── Meta line ────────────────────────────────────────────────────────────
 	const metaText = result ? rowsMeta(result, displayed?.ms) : '';
 	const truncation = result ? truncationText(result) : null;
-	const willRun = describeRun(text, { start: cursor.start, end: cursor.end }, cursor.caret);
+	const willRun = describeSnapshot(view ?? { text, start: 0, end: 0, caret: 0 });
 	const blocked = !isConnected || !client ? 'The shell is not connected to the engine.' : null;
 	const strip = runner.runs.length > 1;
 

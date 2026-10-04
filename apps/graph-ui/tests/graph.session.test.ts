@@ -69,7 +69,7 @@ test('selection toggles and is announced with a count', () => {
 });
 
 test('expand sends one parameterised read_query, draws only NEW neighbours and says what happened', async () => {
-	const { session, log } = rig(NEO, () => envelope([[node('a'), rel('r2', 'T', 'a', 'c'), node('c', ['P'], { name: 'C' })], [node('a'), rel('r1', 'T', 'a', 'b'), node('b')]]));
+	const { session, log } = rig(NEO, () => envelope([[node('a', ['P']), rel('r2', 'T', 'a', 'c'), node('c', ['P'], { name: 'C' })], [node('a', ['P']), rel('r1', 'T', 'a', 'b'), node('b', ['P'])]]));
 	session.load(base());
 	await session.expand('a');
 	assert.equal(log.recipes.length, 1);
@@ -171,7 +171,7 @@ test('expanding without a probed engine sends nothing and says why', async () =>
 });
 
 test('collapse removes what only hung from the node; dismiss removes a node and its relationships; both are local', async () => {
-	const { session, log } = rig(NEO, () => envelope([[node('a'), rel('r2', 'T', 'a', 'c'), node('c')]]));
+	const { session, log } = rig(NEO, () => envelope([[node('a', ['P']), rel('r2', 'T', 'a', 'c'), node('c', ['P'])]]));
 	session.load(base());
 	session.collapse('a');
 	assert.match(session.getState().notice?.text ?? '', /Nothing to collapse/);
@@ -216,7 +216,7 @@ test('connect asks for the relationships among the drawn nodes and adds only tho
 });
 
 test('find path needs exactly two selected nodes, merges the first path found, highlights it and keeps stored direction', async () => {
-	const path = { '@kind': 'path', nodes: [node('a'), node('m'), node('b')], relationships: [rel('p1', 'T', 'a', 'm'), rel('p2', 'T', 'b', 'm')] };
+	const path = { '@kind': 'path', nodes: [node('a', ['P']), node('m', ['P']), node('b', ['P'])], relationships: [rel('p1', 'T', 'a', 'm'), rel('p2', 'T', 'b', 'm')] };
 	const { session, log } = rig(NEO, (recipe) => envelope(/\[\*2\.\.2\]/.test(recipe.cypher) ? [[path as unknown as GraphValue]] : []));
 	session.load(base());
 	await session.findPath();
@@ -308,4 +308,169 @@ test('subscribers hear changes and can unsubscribe', () => {
 	off();
 	session.focus('a');
 	assert.equal(heard, 2);
+});
+
+// -----------------------------------------------------------------------------
+// Reused ids (finding F2): an id is a live handle, not an identity
+// -----------------------------------------------------------------------------
+
+test('refresh: the same id returned with different labels is a different element: not merged, marked out of date, and the next action on it is declined', async () => {
+	let answer: ReadQueryResult = envelope([[node('a', ['Other'], { name: 'unrelated' })]]);
+	const { session, log } = rig(NEO, () => answer);
+	session.load(base());
+	session.inspect({ kind: 'node', id: 'a' });
+	await session.refreshInspected();
+	const s = session.getState();
+	assert.deepEqual(s.model.nodes.get('a')?.labels, ['P'], 'the drawn copy is untouched');
+	assert.deepEqual(s.model.nodes.get('a')?.properties, { name: 'A' });
+	assert.ok(s.staleIds.has('a'));
+	assert.equal(s.notice?.variant, 'warning');
+	assert.match(s.notice?.text ?? '', /different element under an id drawn here.*was label P, and is now label Other.*Dismiss it/);
+	assert.doesNotMatch(s.notice?.text ?? '', /Refreshed/);
+	// The marked element is not asked about again: Expand and Refresh decline without sending.
+	const sent = log.recipes.length;
+	answer = envelope([[node('a', ['P'])]]);
+	await session.expand('a');
+	await session.refreshInspected();
+	assert.equal(log.recipes.length, sent, 'nothing was sent for an out-of-date element');
+	assert.match(session.getState().notice?.text ?? '', /out of date: the database now holds a different element under its id/);
+	// Dismissing it clears the mark.
+	session.dismiss('a');
+	assert.equal(session.getState().staleIds.has('a'), false);
+});
+
+test('refresh: the same id, same labels and different properties IS the same element, and the fresh properties are shown', async () => {
+	const { session } = rig(NEO, () => envelope([[node('a', ['P'], { name: 'Renamed' })]]));
+	session.load(base());
+	session.inspect({ kind: 'node', id: 'a' });
+	await session.refreshInspected();
+	assert.deepEqual(session.getState().model.nodes.get('a')?.properties, { name: 'Renamed' });
+	assert.equal(session.getState().staleIds.size, 0);
+	assert.equal(session.getState().notice?.text, 'Refreshed from the database.');
+});
+
+test('refresh: label order does not make an element different', async () => {
+	const { session } = rig(NEO, () => envelope([[node('a', ['Q', 'P'], { name: 'A2' })]]));
+	session.load(envelope([[node('a', ['P', 'Q'], { name: 'A' })]]));
+	session.inspect({ kind: 'node', id: 'a' });
+	await session.refreshInspected();
+	assert.equal(session.getState().staleIds.size, 0);
+	assert.deepEqual(session.getState().model.nodes.get('a')?.properties, { name: 'A2' });
+});
+
+test('expand: the centre comes back with the same id and other labels: nothing is added, old relationships stay with the old copy, the centre is marked', async () => {
+	const { session, log } = rig(NEO, () => envelope([[node('a', ['Other'], { name: 'unrelated' }), rel('r9', 'T', 'a', 'c'), node('c', ['P'])]]));
+	session.load(base());
+	await session.expand('a');
+	const s = session.getState();
+	assert.deepEqual([...s.model.nodes.keys()], ['a', 'b'], 'no neighbour was added');
+	assert.deepEqual([...s.model.relationships.keys()], ['r1'], 'the answer\'s relationships were not attached');
+	assert.deepEqual(s.model.nodes.get('a')?.labels, ['P']);
+	assert.ok(s.staleIds.has('a'));
+	assert.equal(s.hint, null);
+	assert.match(s.notice?.text ?? '', /nothing from this answer was added/);
+	assert.equal(log.said[log.said.length - 1], s.notice?.text, 'announced as the warning, not as success');
+	assert.doesNotMatch(log.said.join('\n'), /Added/);
+});
+
+test('expand: a NEIGHBOUR that shares an id with a different drawn node rejects the whole answer', async () => {
+	const { session } = rig(NEO, () => envelope([[node('a', ['P']), rel('r9', 'T', 'a', 'b'), node('b', ['Elsewhere'])]]));
+	session.load(base());
+	await session.expand('a');
+	const s = session.getState();
+	assert.deepEqual(s.model.nodes.get('b')?.labels, ['P']);
+	assert.ok(s.staleIds.has('b'));
+	assert.equal(s.model.relationships.has('r9'), false);
+});
+
+test('a relationship that returns with the same id and another type, start or end is a different relationship', async () => {
+	for (const changed of [rel('r1', 'OTHER', 'a', 'b'), rel('r1', 'T', 'b', 'a'), rel('r1', 'T', 'a', 'c')]) {
+		const { session } = rig(NEO, () => envelope([[node('a', ['P']), changed, node('c', ['P'])]]));
+		session.load(base());
+		await session.expand('a');
+		const s = session.getState();
+		assert.equal(s.model.relationships.get('r1')?.type, 'T', 'the drawn relationship is untouched');
+		assert.deepEqual([s.model.relationships.get('r1')?.start, s.model.relationships.get('r1')?.end], ['a', 'b']);
+		assert.equal(s.model.nodes.has('c'), false, 'nothing new was added');
+		assert.ok(s.staleIds.has('r1'), `relationship marked (${changed.type} ${changed.start}>${changed.end})`);
+		assert.match(s.notice?.text ?? '', /the relationship r1 was type T from a to b, and is now type /);
+	}
+});
+
+test('connect: an answer that holds a drawn id as another element is rejected, and Connect is declined while out-of-date nodes remain', async () => {
+	const { session, log } = rig(NEO, () => envelope([[node('a', ['P']), rel('rx', 'T', 'a', 'b'), node('b', ['Gone'])]]));
+	session.load(base());
+	await session.connect();
+	assert.equal(session.getState().model.relationships.has('rx'), false);
+	assert.ok(session.getState().staleIds.has('b'));
+	const sent = log.recipes.length;
+	await session.connect();
+	assert.equal(log.recipes.length, sent);
+	assert.match(session.getState().notice?.text ?? '', /Some drawn nodes are out of date/);
+	session.dismiss('b');
+	assert.equal(session.getState().staleIds.size, 0);
+});
+
+test('find path: a path whose nodes are other elements under drawn ids is not merged or highlighted, and a stale endpoint is not searched', async () => {
+	const path = { '@kind': 'path', nodes: [node('a', ['P']), node('m', ['P']), node('b', ['Reused'])], relationships: [rel('p1', 'T', 'a', 'm'), rel('p2', 'T', 'm', 'b')] };
+	const { session, log } = rig(NEO, (recipe) => envelope(/\[\*2\.\.2\]/.test(recipe.cypher) ? [[path as unknown as GraphValue]] : []));
+	session.load(base());
+	session.toggleSelect('a');
+	session.toggleSelect('b');
+	await session.findPath();
+	const s = session.getState();
+	assert.equal(s.model.nodes.has('m'), false);
+	assert.equal(s.highlight.size, 0);
+	assert.ok(s.staleIds.has('b'));
+	const sent = log.recipes.length;
+	await session.findPath();
+	assert.equal(log.recipes.length, sent, 'an out-of-date endpoint is not searched from');
+});
+
+test('a write that ran on the connection marks the drawing out of date: Expand, Connect, Find path and Refresh send nothing, and the drawing is kept', async () => {
+	const { session, log } = rig(NEO, () => envelope([[node('a', ['P']), rel('r2', 'T', 'a', 'c'), node('c', ['P'])]]));
+	session.load(base());
+	session.toggleSelect('a');
+	session.toggleSelect('b');
+	session.inspect({ kind: 'node', id: 'a' });
+	session.markStale();
+	const s = session.getState();
+	assert.equal(s.stale, true);
+	assert.deepEqual([...s.model.nodes.keys()], ['a', 'b'], 'the answer as it was is still shown');
+	assert.equal(s.notice?.variant, 'warning');
+	assert.match(s.notice?.text ?? '', /ran on this connection after this graph was drawn/);
+	await session.expand('a');
+	await session.connect();
+	await session.findPath();
+	await session.refreshInspected();
+	assert.equal(log.recipes.length, 0, 'no query went to the node');
+	// Collapse and dismiss are local and still work.
+	session.dismiss('b');
+	assert.deepEqual([...session.getState().model.nodes.keys()], ['a']);
+	// Running the query again draws fresh and clears the mark.
+	session.load(base());
+	assert.equal(session.getState().stale, false);
+	await session.expand('a');
+	assert.equal(log.recipes.length, 1);
+});
+
+test('a write while an expansion is in flight drops that answer: its ids were asked about before the write', async () => {
+	let release: (r: ReadQueryResult) => void = () => undefined;
+	const { session } = rig(NEO, () => new Promise<ReadQueryResult>((resolve) => { release = resolve; }));
+	session.load(base());
+	const pending = session.expand('a');
+	await tick();
+	session.markStale();
+	release(envelope([[node('a', ['P']), rel('r2', 'T', 'a', 'c'), node('c', ['P'])]]));
+	await pending;
+	assert.deepEqual([...session.getState().model.nodes.keys()], ['a', 'b'], 'the late answer was not drawn');
+	assert.equal(session.getState().busy, null);
+	assert.equal(session.getState().stale, true);
+});
+
+test('markStale on an empty canvas does nothing', () => {
+	const { session } = rig();
+	session.markStale();
+	assert.equal(session.getState().stale, false);
+	assert.equal(session.getState().notice, null);
 });

@@ -52,6 +52,52 @@ function toTarget(statement: IStatement): IRunTarget {
 }
 
 /**
+ * One read of the editor: the buffer and the selection and caret that are offsets INTO that buffer.
+ *
+ * The three travel together on purpose. A caret offset only means something against the text it was
+ * measured in: the live editor's caret against a copy of the text that is one keystroke behind (a
+ * React state that has not re-rendered yet) points past the end of the old text, and the run sends a
+ * truncated statement. So everything a run uses is read in ONE call from the editor itself.
+ */
+export interface IEditorSnapshot {
+	/** The editor's text at the moment of the read. */
+	text: string;
+	/** Selection start offset (equal to `end` when nothing is selected). */
+	start: number;
+	/** Selection end offset. */
+	end: number;
+	/** The caret offset. */
+	caret: number;
+}
+
+/** What a run reads from: anything that can say what the editor holds right now. */
+export interface ISnapshotSource {
+	snapshot(): IEditorSnapshot;
+}
+
+/**
+ * What a run would send, read from the live editor.
+ *
+ * @param source - The editor (its live buffer, selection and caret, read together).
+ * @param all - True for Run all.
+ * @returns The statements, in order (possibly none).
+ */
+export function targetsFromEditor(source: ISnapshotSource, all: boolean): IRunTarget[] {
+	const { text, start, end, caret } = source.snapshot();
+	return targetsToRun(text, { start, end }, caret, all);
+}
+
+/**
+ * The "Will run" sentence for a snapshot.
+ *
+ * @param snapshot - One read of the editor.
+ * @returns The sentence.
+ */
+export function describeSnapshot(snapshot: IEditorSnapshot): string {
+	return describeRun(snapshot.text, { start: snapshot.start, end: snapshot.end }, snapshot.caret);
+}
+
+/**
  * What a run would send.
  *
  * @param buffer - The editor text.

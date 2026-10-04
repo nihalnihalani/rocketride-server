@@ -201,7 +201,7 @@ test('the legend names every label on the canvas with its colour and a count of 
 	const colors = assignLabelColors(['Company', 'Person', 'Employee']);
 	const legend = legendOf(model, colors);
 	assert.deepEqual(legend.map((e) => [e.name, e.count]), [['Person', 3], ['(no label)', 1], ['Company', 1]], 'Employee is a second label: it does not set the colour, so it is not a legend line');
-	assert.equal(legend[0].fill, 'var(--rr-chart-yellow)', 'sorted labels Company, Employee, Person take blue, green, yellow');
+	assert.equal(legend[0].fill, 'var(--rr-chart-red)', 'sorted labels Company, Employee, Person take blue, green, red');
 	assert.equal(legend.find((e) => e.name === '(no label)')?.fill, 'var(--rr-grey-400)');
 	assert.deepEqual(legendOf(modelFromResult(entitiesOf([], [])), colors), []);
 });

@@ -35,6 +35,7 @@ import React, { useMemo } from 'react';
 import { Banner, Button, Chip, DetailPanel, LabelValue, Section } from 'shell';
 import { captionOf } from '../graph/captions';
 import type { IGraphSession, IGraphState, IInspectTarget } from '../graph/graphSession';
+import { STALE_ELEMENT_TEXT } from '../graph/identity';
 import { inspectNode, inspectRelationship } from '../graph/inspector';
 import { relationshipsOf } from '../graph/model';
 import { copyText } from './ResultViews';
@@ -92,13 +93,17 @@ export const InspectorPanel: React.FC<IInspectorPanelProps> = ({ state, session,
 					<Button variant="ghost" onClick={() => void copy()}>Copy JSON</Button>
 					{view.node && (
 						<>
-							<Button variant="ghost" disabled={state.busy !== null} onClick={() => void session.refreshInspected()}>Refresh</Button>
-							<Button variant="ghost" disabled={state.busy !== null} onClick={() => void session.expand(view.node!.id)}>Expand</Button>
+							<Button variant="ghost" disabled={state.busy !== null || state.stale || state.staleIds.has(view.node.id)} onClick={() => void session.refreshInspected()}>Refresh</Button>
+							<Button variant="ghost" disabled={state.busy !== null || state.stale || state.staleIds.has(view.node.id)} onClick={() => void session.expand(view.node!.id)}>Expand</Button>
+							<Button variant="ghost" onClick={() => session.dismiss(view.node!.id)}>Dismiss</Button>
 						</>
 					)}
 				</>
 			}
 		>
+			{(state.stale || state.staleIds.has(target.id)) && (
+				<Banner variant="warning">{state.stale ? 'This copy may be out of date: a statement that can change data ran on this connection after it was drawn. It is shown as the query returned it.' : STALE_ELEMENT_TEXT}</Banner>
+			)}
 			{state.notice && state.busy === null && target.kind === 'node' && <Banner variant={state.notice.variant}>{state.notice.text}</Banner>}
 			<Section label={m.kind === 'node' ? 'Labels' : 'Type'}>
 				{m.tags.length === 0 ? <span style={{ color: 'var(--rr-text-secondary)' }}>none</span> : m.tags.map((tag) => <Chip key={tag} label={tag} />)}

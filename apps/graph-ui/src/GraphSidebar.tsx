@@ -100,12 +100,18 @@ const GraphSidebar: React.FC = () => {
 							if (client && endpoint) void loadConnectionSchema(client, endpoint, { fresh: true });
 						}}
 					/>
-					<div style={{ padding: '8px 14px', fontSize: 12, lineHeight: 1.45, color: 'var(--rr-text-secondary)' }} role="status">
+					<div style={{ padding: '8px 14px', fontSize: 12, lineHeight: 1.45, color: 'var(--rr-text-secondary)' }}>
 						<div>{status}</div>
 						{entry.failure && entry.failure.headline !== '' && (
 							<div style={{ marginTop: 4, color: 'var(--rr-color-warning)' }}>
 								{entry.failure.headline}
 								{entry.failure.hint ? ` ${entry.failure.hint}` : ''}
+							</div>
+						)}
+						{entry.view.error && entry.view.error.headline !== '' && (
+							<div style={{ marginTop: 4 }}>
+								<div>{entry.view.error.headline}</div>
+								{entry.view.error.detail !== '' && <div style={{ fontFamily: 'var(--rr-font-mono, monospace)', fontSize: 11, whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>{entry.view.error.detail}</div>}
 							</div>
 						)}
 						{entry.view.sampled && entry.view.labels.length > 0 && <div style={{ marginTop: 4 }}>{SAMPLED_NOTE}</div>}

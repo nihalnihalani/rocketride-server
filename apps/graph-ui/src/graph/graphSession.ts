@@ -37,7 +37,13 @@
 //     carries, so a slow expansion cannot paint over the query the user ran next.
 //   - Ids are LIVE HANDLES. An expansion or a refresh that comes back without the
 //     element it asked about says the element is no longer found; the canvas never
-//     substitutes another element, and nothing here persists an id.
+//     substitutes another element, and nothing here persists an id. A database can
+//     hand an id out again after a delete, so an answer is merged only when every
+//     element it shares an id with is the same KIND of element (identity.ts); if not,
+//     nothing from the answer is added and the drawn copies are marked out of date.
+//     A write that ran on the connection after the graph was drawn marks the whole
+//     drawing out of date (`markStale`): its ids can no longer be trusted, so
+//     Expand, Connect and Find path decline until the query is run again.
 //   - Budgets always apply (model.ts): 1,000 nodes, 2,000 relationships, 100 new
 //     neighbours per expansion, and every cut is said out loud.
 //   - Generated queries never run by themselves: each action here is the direct
@@ -55,6 +61,8 @@ import type { IGraphModel } from './model';
 import { collectEntities } from './results';
 import type { IEntities } from './results';
 import type { GraphId, GraphNode, GraphRelationship, ReadQueryResult } from './types';
+import { DATA_CHANGED_TEXT, STALE_CONNECT_TEXT, STALE_ELEMENT_TEXT, conflictText, identityConflicts } from './identity';
+import type { IIdentityConflict } from './identity';
 import { expandText, num } from './wording';
 import { STOP_WAITING_NOTE } from './wording';
 import { createPathSearch, noPathText } from '../cypher/pathSearch';
@@ -102,6 +110,10 @@ export interface IGraphState {
 	highlight: ReadonlySet<GraphId>;
 	/** Progress text while a path search runs. */
 	progress: string | null;
+	/** True once a write ran on the connection after this graph was drawn: every drawn id is suspect. */
+	stale: boolean;
+	/** Drawn elements the database has answered for with a different element under the same id. */
+	staleIds: ReadonlySet<GraphId>;
 }
 
 /** What the session needs from its caller. */
@@ -138,11 +150,13 @@ export interface IGraphSession {
 	stopPath(): void;
 	/** Draw more of the result, up to the canvas maximum. */
 	showMore(): void;
+	/** A statement that can change data ran on this connection: what is drawn may no longer match. */
+	markStale(): void;
 	/** Drop everything in flight (unmount, connection change). */
 	dispose(): void;
 }
 
-const EMPTY: IGraphState = { model: EMPTY_MODEL, entities: null, selected: new Set(), focusedId: null, inspect: null, busy: null, notice: null, hint: null, highlight: new Set(), progress: null };
+const EMPTY: IGraphState = { model: EMPTY_MODEL, entities: null, selected: new Set(), focusedId: null, inspect: null, busy: null, notice: null, hint: null, highlight: new Set(), progress: null, stale: false, staleIds: new Set() };
 
 // =============================================================================
 // FACTORY
@@ -186,6 +200,26 @@ export function createGraphSession(deps: IGraphSessionDeps): IGraphSession {
 		if (!engine) say('This connection has not been checked yet, so the app does not know which engine to write queries for.', 'warning');
 		return engine;
 	};
+
+	/** Whether an action on these drawn elements must not go to the node (and says why). */
+	const outOfDate = (ids: readonly GraphId[]): boolean => {
+		if (state.stale) {
+			say(DATA_CHANGED_TEXT, 'warning');
+			return true;
+		}
+		if (ids.some((id) => state.staleIds.has(id))) {
+			say(STALE_ELEMENT_TEXT, 'warning');
+			return true;
+		}
+		return false;
+	};
+	/** Refuse to merge an answer that is not about the drawn elements: mark them, say so, add nothing. */
+	const reject = (conflicts: readonly IIdentityConflict[]): void => {
+		set({ staleIds: new Set([...state.staleIds, ...conflicts.map((c) => c.id)]), hint: null });
+		say(conflictText(conflicts), 'warning');
+	};
+	/** An element left the canvas: it is no longer worth marking. */
+	const forget = (ids: readonly GraphId[]): ReadonlySet<GraphId> => new Set([...state.staleIds].filter((id) => !ids.includes(id)));
 
 	/**
 	 * Run a recipe for the current epoch.
@@ -257,6 +291,7 @@ export function createGraphSession(deps: IGraphSessionDeps): IGraphSession {
 		async refreshInspected() {
 			const target = state.inspect;
 			if (!target || target.kind !== 'node' || !idle()) return;
+			if (outOfDate([target.id])) return;
 			const engine = engineOrSay();
 			if (!engine) return;
 			const mine = epoch;
@@ -270,6 +305,11 @@ export function createGraphSession(deps: IGraphSessionDeps): IGraphSession {
 				say('This element was not found any more. Element ids are live handles: it may have been deleted, or the id may no longer point at it. The drawn copy is out of date.', 'warning');
 				return;
 			}
+			const conflicts = identityConflicts(state.model, [fresh], []);
+			if (conflicts.length > 0) {
+				reject(conflicts);
+				return;
+			}
 			if (state.model.nodes.has(target.id)) {
 				const nodes = new Map(state.model.nodes);
 				nodes.set(target.id, fresh);
@@ -281,6 +321,7 @@ export function createGraphSession(deps: IGraphSessionDeps): IGraphSession {
 		async expand(id) {
 			const node = state.model.nodes.get(id);
 			if (!node || !idle()) return;
+			if (outOfDate([id])) return;
 			const engine = engineOrSay();
 			if (!engine) return;
 			const mine = epoch;
@@ -293,6 +334,11 @@ export function createGraphSession(deps: IGraphSessionDeps): IGraphSession {
 			const entities = collectEntities(answer.result.rows);
 			if (entities.relationships.size === 0 && !entities.nodes.has(id)) {
 				say(`${captionFor(node)} has no relationships in the database, or it is no longer found: element ids are live handles. Nothing was added.`, 'info');
+				return;
+			}
+			const conflicts = identityConflicts(state.model, entities.nodes.values(), entities.relationships.values());
+			if (conflicts.length > 0) {
+				reject(conflicts);
 				return;
 			}
 			const outcome = expandNode(state.model, id, entities, MAX_NEW_NEIGHBORS);
@@ -308,7 +354,7 @@ export function createGraphSession(deps: IGraphSessionDeps): IGraphSession {
 				return;
 			}
 			const selected = new Set([...state.selected].filter((s) => !result.removed.includes(s)));
-			set({ model: result.model, selected, inspect: state.inspect && result.removed.includes(state.inspect.id) ? null : state.inspect, hint: null });
+			set({ model: result.model, selected, staleIds: forget(result.removed), inspect: state.inspect && result.removed.includes(state.inspect.id) ? null : state.inspect, hint: null });
 			say(`Collapsed. ${num(result.removed.length)} ${result.removed.length === 1 ? 'node' : 'nodes'} removed from the graph.`);
 		},
 
@@ -319,12 +365,17 @@ export function createGraphSession(deps: IGraphSessionDeps): IGraphSession {
 			const selected = new Set(state.selected);
 			selected.delete(id);
 			const first = model.nodes.keys().next().value as GraphId | undefined;
-			set({ model, selected, inspect: state.inspect?.id === id ? null : state.inspect, focusedId: state.focusedId === id ? first ?? null : state.focusedId, hint: null });
+			set({ model, selected, staleIds: forget([id]), inspect: state.inspect?.id === id ? null : state.inspect, focusedId: state.focusedId === id ? first ?? null : state.focusedId, hint: null });
 			say(`${captionFor(node)} dismissed from the graph. It is still in the results table.`);
 		},
 
 		async connect() {
 			if (!idle()) return;
+			if (outOfDate([])) return;
+			if (state.staleIds.size > 0) {
+				say(STALE_CONNECT_TEXT, 'warning');
+				return;
+			}
 			const engine = engineOrSay();
 			if (!engine) return;
 			const mine = epoch;
@@ -333,7 +384,13 @@ export function createGraphSession(deps: IGraphSessionDeps): IGraphSession {
 			if (epoch !== mine) return;
 			set({ busy: null });
 			if (!answer) return;
-			const outcome = connectModel(state.model, collectEntities(answer.result.rows));
+			const incoming = collectEntities(answer.result.rows);
+			const conflicts = identityConflicts(state.model, incoming.nodes.values(), incoming.relationships.values());
+			if (conflicts.length > 0) {
+				reject(conflicts);
+				return;
+			}
+			const outcome = connectModel(state.model, incoming);
 			set({ model: outcome.model });
 			const added = outcome.addedRelationships.length;
 			say(outcome.budget === 'relationships' ? `Added ${num(added)} relationships; the canvas holds its maximum of ${num(MAX_RELATIONSHIPS)}.` : added === 0 ? 'No further relationships among the nodes on the canvas.' : `Added ${num(added)} ${added === 1 ? 'relationship' : 'relationships'} among the nodes on the canvas.`);
@@ -348,6 +405,7 @@ export function createGraphSession(deps: IGraphSessionDeps): IGraphSession {
 			const engine = engineOrSay();
 			if (!engine) return;
 			const [from, to] = [...state.selected];
+			if (outOfDate([from, to])) return;
 			const mine = epoch;
 			const current = createPathSearch({
 				engine,
@@ -364,6 +422,11 @@ export function createGraphSession(deps: IGraphSessionDeps): IGraphSession {
 			set({ busy: null, progress: null });
 			switch (outcome.status) {
 				case 'found': {
+					const conflicts = identityConflicts(state.model, outcome.path.nodes, outcome.path.relationships);
+					if (conflicts.length > 0) {
+						reject(conflicts);
+						break;
+					}
 					const merged = mergePath(state.model, outcome.path);
 					set({ model: merged.model, highlight: new Set(outcome.path.relationships.map((r: GraphRelationship) => r.id)), hint: merged.addedNodes.length > 0 ? { centerId: from, newIds: merged.addedNodes } : null });
 					say(`Found a path of ${outcome.depth} ${outcome.depth === 1 ? 'relationship' : 'relationships'} (the first, so a shortest one). Relationships keep their stored direction.${merged.budget ? ' Part of it could not be drawn: the canvas budget was reached.' : ''}`);
@@ -399,6 +462,16 @@ export function createGraphSession(deps: IGraphSessionDeps): IGraphSession {
 			const added = model.nodes.size - state.model.nodes.size;
 			set({ model });
 			say(added > 0 ? `Showing ${num(added)} more nodes (${num(model.nodes.size)} of ${num(model.resultNodes)}).` : 'The canvas already shows as many nodes as it can hold.');
+		},
+
+		markStale() {
+			if (state.stale || (state.model.nodes.size === 0 && state.entities === null)) return;
+			// Whatever is in flight was asked about ids that may have changed meaning: drop it.
+			epoch += 1;
+			search?.stop();
+			search = null;
+			set({ stale: true, busy: null, progress: null, highlight: new Set() });
+			say(DATA_CHANGED_TEXT, 'warning');
 		},
 
 		dispose() {

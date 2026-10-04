@@ -42,7 +42,7 @@ import React, { forwardRef, useCallback, useEffect, useImperativeHandle, useLayo
 import type { CSSProperties } from 'react';
 import Editor, { loader } from '@monaco-editor/react';
 import type * as MonacoNS from 'monaco-editor';
-import type { ISelection } from '../cypher/targets';
+import type { IEditorSnapshot, ISelection } from '../cypher/targets';
 
 // =============================================================================
 // TYPES
@@ -50,10 +50,17 @@ import type { ISelection } from '../cypher/targets';
 
 /** What the workbench can ask of the editor. */
 export interface IQueryEditorHandle {
+	/** The live buffer, selection and caret, read together from the editor itself (never from React state). */
+	snapshot(): IEditorSnapshot;
 	/** The live selection with its text. */
 	getSelection(): ISelection & { text: string };
 	/** The caret offset. */
 	getCaret(): number;
+	/**
+	 * Replace the text from outside (History, a label preview, Ask). This is the ONLY way text enters a mounted Monaco: the
+	 * editor owns its own buffer while the user types, so a render that is a keystroke behind can never write old text back.
+	 */
+	setText(text: string): void;
 	/** Move focus into the editor. */
 	focus(): void;
 }
@@ -209,6 +216,10 @@ export const QueryEditor = forwardRef<IQueryEditorHandle, IQueryEditorProps>(fun
 	const editorRef = useRef<MonacoNS.editor.IStandaloneCodeEditor | null>(null);
 	const textRef = useRef<HTMLTextAreaElement | null>(null);
 	const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
+	// Monaco is UNCONTROLLED: it starts from the first value and then owns its buffer. A controlled `value` prop is a copy that
+	// lags a render behind fast typing, and the library writes that copy back into the model when it differs.
+	const initial = useRef(value);
+	const pending = useRef<string | null>(null);
 
 	// The latest callbacks, readable from the once-registered Monaco actions.
 	const latest = useRef({ onRun, onRunAll, onCursorChange });
@@ -232,6 +243,19 @@ export const QueryEditor = forwardRef<IQueryEditorHandle, IQueryEditorProps>(fun
 	useImperativeHandle(
 		ref,
 		(): IQueryEditorHandle => ({
+			snapshot: () => {
+				// One read, one source: the textarea's current value, or the Monaco model's. The `value` prop (React state) is never consulted.
+				const area = textRef.current;
+				if (area) return { text: area.value, start: area.selectionStart, end: area.selectionEnd, caret: area.selectionStart };
+				const editor = editorRef.current;
+				const model = editor?.getModel();
+				const selection = editor?.getSelection();
+				const position = editor?.getPosition();
+				if (!editor || !model) return { text: '', start: 0, end: 0, caret: 0 };
+				const start = selection ? model.getOffsetAt(selection.getStartPosition()) : 0;
+				const end = selection ? model.getOffsetAt(selection.getEndPosition()) : 0;
+				return { text: model.getValue(), start, end, caret: position ? model.getOffsetAt(position) : start };
+			},
 			getSelection: () => {
 				const area = textRef.current;
 				if (area) return { start: area.selectionStart, end: area.selectionEnd, text: area.value.slice(area.selectionStart, area.selectionEnd) };
@@ -249,6 +273,20 @@ export const QueryEditor = forwardRef<IQueryEditorHandle, IQueryEditorProps>(fun
 				const editor = editorRef.current;
 				const position = editor?.getPosition();
 				return editor && position ? editor.getModel()?.getOffsetAt(position) ?? 0 : 0;
+			},
+			setText: (text) => {
+				const editor = editorRef.current;
+				const model = editor?.getModel();
+				if (editor && model) {
+					if (model.getValue() === text) return;
+					// An edit, not a reset: Ctrl+Z brings the previous text back.
+					editor.executeEdits('graph-ui', [{ range: model.getFullModelRange(), text, forceMoveMarkers: true }]);
+					editor.pushUndoStop();
+				} else {
+					// Monaco has not mounted yet (or the plain text box is in use, which is controlled by `value`).
+					pending.current = text;
+					initial.current = text;
+				}
 			},
 			focus: () => {
 				if (textRef.current) textRef.current.focus();
@@ -271,6 +309,10 @@ export const QueryEditor = forwardRef<IQueryEditorHandle, IQueryEditorProps>(fun
 	const handleMount = useCallback(
 		(editor: MonacoNS.editor.IStandaloneCodeEditor, monaco: typeof MonacoNS) => {
 			editorRef.current = editor;
+			if (pending.current !== null) {
+				editor.setValue(pending.current);
+				pending.current = null;
+			}
 			editor.addAction({ id: 'graph-ui.run', label: 'Run Selection or Statement at Cursor', keybindings: [monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter], run: () => latest.current.onRun() });
 			editor.addAction({ id: 'graph-ui.runAll', label: 'Run All Statements', keybindings: [monaco.KeyMod.CtrlCmd | monaco.KeyMod.Shift | monaco.KeyCode.Enter], run: () => latest.current.onRunAll() });
 			editor.onDidChangeCursorSelection(settle);
@@ -307,7 +349,7 @@ export const QueryEditor = forwardRef<IQueryEditorHandle, IQueryEditorProps>(fun
 	return (
 		<div style={styles.frame} aria-label={label}>
 			<Editor
-				value={value}
+				defaultValue={initial.current}
 				language="cypher"
 				theme={THEME_NAME}
 				beforeMount={handleBeforeMount}

@@ -80,6 +80,10 @@ export interface IGraphCanvasProps {
 	/** Relationships to draw highlighted (a found path). */
 	highlighted?: ReadonlySet<GraphId>;
 	focusedId: GraphId | null;
+	/** Elements the database answered for with a different element under the same id. */
+	staleIds?: ReadonlySet<GraphId>;
+	/** True when a write ran after the graph was drawn: every element is suspect. */
+	allStale?: boolean;
 	/** Seed text for the layout (same text, same graph, same layout). */
 	seedKey: string;
 	/** Where new nodes from an expansion start. */
@@ -122,6 +126,8 @@ function textOn(fill: string, resolved: Map<string, string>): string {
 /** Off-screen but available to assistive technology. */
 const VISUALLY_HIDDEN: CSSProperties = { position: 'absolute', width: 1, height: 1, margin: -1, padding: 0, overflow: 'hidden', clip: 'rect(0 0 0 0)', whiteSpace: 'nowrap', border: 0 };
 
+/** Fit never magnifies: a graph of two nodes is shown at normal size, not as two huge circles. */
+const FIT_MAX_ZOOM = 1;
 const NO_IDS: ReadonlySet<GraphId> = new Set();
 const NODE_TYPES = { graphNode: GraphNodeView };
 const EDGE_TYPES = { graphEdge: GraphEdgeView };
@@ -135,6 +141,8 @@ const EDGE_TYPES = { graphEdge: GraphEdgeView };
 function CanvasInner(props: IGraphCanvasProps): React.ReactElement {
 	const { model, colors, captions, selected, focusedId, onLayoutStatus } = props;
 	const highlighted = props.highlighted ?? NO_IDS;
+	const staleIds = props.staleIds ?? NO_IDS;
+	const allStale = props.allStale === true;
 	const flow = useReactFlow();
 	const helpId = useId();
 	const reduced = useReducedMotion();
@@ -167,6 +175,8 @@ function CanvasInner(props: IGraphCanvasProps): React.ReactElement {
 	// is fitted when the tab is shown, because a ResizeObserver retries the pending fit.
 	const wanted = useRef(0);
 	const pendingFit = useRef(false);
+	// True once the user pans or zooms: a resize then keeps their view instead of refitting.
+	const userMoved = useRef(false);
 	const flowRef = useRef(flow);
 	const reducedRef = useRef(reduced);
 	useEffect(() => {
@@ -179,7 +189,7 @@ function CanvasInner(props: IGraphCanvasProps): React.ReactElement {
 		if (!el || el.clientWidth === 0 || el.clientHeight === 0) return;
 		if (flowRef.current.getNodes().length < wanted.current) return;
 		// No point animating a tab nobody is looking at.
-		void flowRef.current.fitView({ padding: 0.2, duration: reducedRef.current || document.hidden ? 0 : 300 }).then((done) => {
+		void flowRef.current.fitView({ padding: 0.2, maxZoom: FIT_MAX_ZOOM, duration: reducedRef.current || document.hidden ? 0 : 300 }).then((done) => {
 			if (done) pendingFit.current = false;
 		});
 	}, []);
@@ -192,13 +202,19 @@ function CanvasInner(props: IGraphCanvasProps): React.ReactElement {
 			tryFit();
 			if (pendingFit.current && tries++ < 60) timer = window.setTimeout(poll, 50);
 		};
+		userMoved.current = false;
 		timer = window.setTimeout(poll, 16);
 		return () => window.clearTimeout(timer);
 	}, [layout.version, tryFit]);
 	useEffect(() => {
 		const el = container.current;
 		if (!el || typeof ResizeObserver === 'undefined') return undefined;
-		const observer = new ResizeObserver(() => tryFit());
+		// The canvas can change size after the fit (a notice or the result line appears around it):
+		// until the user takes the view over, the whole graph stays in it.
+		const observer = new ResizeObserver(() => {
+			if (!userMoved.current) pendingFit.current = true;
+			tryFit();
+		});
 		observer.observe(el);
 		return () => observer.disconnect();
 	}, [tryFit]);
@@ -230,7 +246,7 @@ function CanvasInner(props: IGraphCanvasProps): React.ReactElement {
 			const fill = colorFor(colors, label).fill;
 			const caption = captionOf(node, captions.get(label));
 			const shown = counts.get(id) ?? 0;
-			const spoken = `${caption}, ${node.labels.length > 0 ? node.labels.join(' ') : 'no label'}, ${shown} ${shown === 1 ? 'relationship' : 'relationships'} shown${selected.has(id) ? ', selected' : ''}${model.expansions.has(id) ? ', expanded' : ''}`;
+			const spoken = `${caption}, ${node.labels.length > 0 ? node.labels.join(' ') : 'no label'}, ${shown} ${shown === 1 ? 'relationship' : 'relationships'} shown${selected.has(id) ? ', selected' : ''}${model.expansions.has(id) ? ', expanded' : ''}${allStale || staleIds.has(id) ? ', out of date' : ''}`;
 			list.push({
 				id,
 				type: 'graphNode',
@@ -239,13 +255,13 @@ function CanvasInner(props: IGraphCanvasProps): React.ReactElement {
 				height: NODE_DIAMETER,
 				focusable: id === tabbable,
 				ariaLabel: spoken,
-				data: { caption, fill, textColor: textOn(fill, textColors.current), initial: (label[0] ?? '•').toUpperCase(), selected: selected.has(id), expanded: model.expansions.has(id) },
+				data: { caption, fill, textColor: textOn(fill, textColors.current), initial: (label[0] ?? '•').toUpperCase(), selected: selected.has(id), expanded: model.expansions.has(id), stale: allStale || staleIds.has(id) },
 			});
 		}
 		return list;
 		// textColors is a ref reset on theme change, which re-derives the nodes through `mode` below.
 		// eslint-disable-next-line react-hooks/exhaustive-deps
-	}, [model, layout.positions, colors, captions, selected, focusedId, counts, mode]);
+	}, [model, layout.positions, colors, captions, selected, focusedId, counts, mode, staleIds, allStale]);
 
 	// React Flow needs the node list as state it can apply drag changes to. Applying a
 	// change replaces only the node it concerns, so a drag does not re-adopt every node.
@@ -376,6 +392,10 @@ function CanvasInner(props: IGraphCanvasProps): React.ReactElement {
 				onNodesChange={onNodesChange}
 				onNodeClick={onNodeClick}
 				onNodeDoubleClick={onNodeDoubleClick}
+				onMoveStart={(event) => {
+					// A null event is the library moving the view itself (fitView); only the user's own pan or zoom counts.
+					if (event !== null) userMoved.current = true;
+				}}
 				onlyRenderVisibleElements={flowNodes.length > STATIC_LAYOUT_ABOVE * 3}
 				proOptions={{ hideAttribution: true }}
 				{...FLOW_INTERACTION_PROPS}

@@ -7,8 +7,11 @@ the outline rule below is a decision with numbers behind it.
 ## Rules
 
 - The connection's labels, sorted by code point, take `--rr-chart-blue`,
-  `--rr-chart-green`, `--rr-chart-yellow`, `--rr-chart-purple`,
-  `--rr-chart-orange` and `--rr-chart-red` in that order. Every further label
+  `--rr-chart-green`, `--rr-chart-red`, `--rr-chart-orange`, `--rr-chart-purple`
+  and `--rr-chart-yellow` in that order. The order keeps look-alikes apart: in a
+  light theme read from a running shell, yellow (`#e67700`) and orange (`#e67a2e`)
+  are nearly the same colour, and blue and purple are close, so yellow comes last
+  and purple fifth. Every further label
   (and any label the schema snapshot does not know) takes `hsl(hue, 55%, 46%)`
   with the hue from an FNV-1a hash of the name, so a label keeps its colour for
   a given schema.
