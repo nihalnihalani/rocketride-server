@@ -31,6 +31,7 @@
  */
 const path = require('path');
 const os = require('os');
+const fs = require('fs');
 const {
     exists,
     syncDir,
@@ -68,6 +69,18 @@ const ENGINE = path.join(DIST_ROOT, 'server', 'engine');
 
 // Where cmake leaves the c++ node binaries
 const BUILD_NODES_DIR = path.join(BUILD_ROOT, 'nodes');
+
+// Live database suites. Each one drives a real driver against a real server and
+// stubs the engine surface itself, so it needs no test server; but it must run
+// WITHOUT ROCKETRIDE_MOCK, because nodes/test/mocks shadows psycopg2 and
+// falkordb engine-wide. The mocked pass therefore ignores these files and a
+// separate pass runs them. Each suite skips when its server is unreachable,
+// unless RR_REQUIRE_DB_TESTS is set (CI, once its containers are healthy): then
+// an unreachable server fails, and so does a suite in which nothing passed.
+const DB_LIVE_SUITES = [
+    'test_rocketride_db_full.py',
+    'test_rocketride_graph_full.py',
+];
 
 // ============================================================================
 // Action Factories
@@ -227,6 +240,11 @@ function makeRunPytestAction(options = {}) {
                 extraArgs.push(
                     '--ignore-glob', '**/test_*_full.py',
                     '--ignore-glob', '**/test_*_full/**');
+            } else {
+                // The live database suites run in their own unmocked pass.
+                for (const suite of DB_LIVE_SUITES) {
+                    extraArgs.push('--ignore', path.join(TEST_DIR, suite));
+                }
             }
 
             // Exclude skip_node tests by default (same as skip_nodes in pytest_generate_tests for dynamic tests)
@@ -355,6 +373,69 @@ function makeInstallTestDepsAction() {
     };
 }
 
+// Runs DB_LIVE_SUITES in one process (they share database fixtures, so no
+// xdist) without ROCKETRIDE_MOCK. Under RR_REQUIRE_DB_TESTS every suite must
+// exist and must pass at least one test: a suite whose tests all skip proves
+// nothing about the database it was written for.
+function makeRunDbPytestAction(options = {}) {
+    return {
+        run: async (ctx, task) => {
+            require('dotenv').config({ path: path.join(PROJECT_ROOT, '.env') });
+            const required = !!process.env.RR_REQUIRE_DB_TESTS;
+            const testEnv = { ...process.env };
+            delete testEnv.ROCKETRIDE_MOCK;
+
+            const suites = DB_LIVE_SUITES.map((suite) => path.join(TEST_DIR, suite));
+            const reportDir = path.join(BUILD_ROOT, 'nodes-db-tests');
+            await fs.promises.mkdir(reportDir, { recursive: true });
+            const report = path.join(reportDir, 'junit.xml');
+            await fs.promises.rm(report, { force: true });
+
+            const pytestTokens = splitPytestOpts(options.pytest);
+            await runPytest({
+                engine: ENGINE,
+                testsDir: suites[0],
+                extraArgs: [
+                    ...suites.slice(1),
+                    '-v', '-rs', '--rootdir', PACKAGE_DIR,
+                    '-p', 'no:xdist',
+                    `--junitxml=${report}`,
+                    ...withoutXdistArgs(pytestTokens),
+                ],
+                execOpts: { task, cwd: PACKAGE_DIR, env: testEnv },
+            });
+
+            if (!required) return;
+            const xml = await fs.promises.readFile(report, 'utf8');
+            const counts = countJunitResults(xml);
+            const empty = suites
+                .map((suite) => path.basename(suite, '.py'))
+                .filter((name) => !(counts[name]?.passed > 0));
+            if (empty.length > 0) {
+                throw new Error(`RR_REQUIRE_DB_TESTS is set but no test passed in: ${empty.join(', ')}`);
+            }
+        }
+    };
+}
+
+// Per-module passed/skipped counts from a pytest JUnit report. Test cases are
+// attributed by the module name in their classname ("test_x" or "test_x.Class").
+function countJunitResults(xml) {
+    const counts = {};
+    const caseRe = /<testcase\b([^>]*?)(\/>|>([\s\S]*?)<\/testcase>)/g;
+    let match;
+    while ((match = caseRe.exec(xml)) !== null) {
+        const classname = (/classname="([^"]*)"/.exec(match[1]) || [])[1] || '';
+        const module = classname.split('.').find((part) => part.startsWith('test_')) || classname;
+        const body = match[3] || '';
+        const entry = counts[module] || (counts[module] = { passed: 0, skipped: 0, failed: 0 });
+        if (/<skipped\b/.test(body)) entry.skipped += 1;
+        else if (/<(failure|error)\b/.test(body)) entry.failed += 1;
+        else entry.passed += 1;
+    }
+    return counts;
+}
+
 function makeTestAction(options = {}) {
     if (options.warmup && !['plan', 'off'].includes(options.warmup)) {
         throw new Error(`--warmup=${options.warmup}: expected 'plan' or 'off'`);
@@ -393,6 +474,10 @@ function makeTestAction(options = {}) {
         teardown: makeStopTestServerAction(options),
         steps: [{ name: runName, action: makeRunPytestAction(options) }]
     }));
+    // Live database suites need no test server, only their databases.
+    if (!options.taskserver) {
+        steps.push({ name: 'nodes:run-pytest-db', action: makeRunDbPytestAction(options) });
+    }
     return { description: 'Testing nodes', steps };
 }
 
@@ -421,6 +506,15 @@ module.exports = {
         })},
         { name: 'nodes:test', action: (options) => makeTestAction({ ...options, test_full: false }) },
         { name: 'nodes:test-full', action: (options) => makeTestAction({ ...options, test_full: true }) },
+        { name: 'nodes:test-db', action: (options) => ({
+            description: 'Testing nodes (live databases)',
+            steps: [
+                'server:build',
+                parallel(['nodes:build', 'ai:build'], 'Build dependencies'),
+                { name: 'nodes:install-test-deps', action: makeInstallTestDepsAction() },
+                { name: 'nodes:run-pytest-db', action: makeRunDbPytestAction(options) },
+            ]
+        })},
         { name: 'nodes:test-contracts', action: () => ({
             description: 'Testing nodes (contracts)',
             steps: ['server:build', 'nodes:run-contracts']
