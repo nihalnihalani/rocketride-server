@@ -27,6 +27,13 @@ what each app does for its users is documented in that app's own folder.
   the shell. Components and `react.tsx` are not exported from the barrel; import
   them by path.
 - **Task tokens are secrets.** See [Tokens](#tokens-and-identity).
+- **No Node-only globals outside `*.test.ts(x)`.** `shell:freeze` (and so
+  `./builder shell:check`) type-checks `apps/shared/src` with the browser libs
+  and **without Node types**, so a helper such as
+  [`connect/testing.ts`](../../../apps/shared/src/explorer/connect/testing.ts)
+  must not use `setImmediate`, `process`, `Buffer` or `require`. `shared:test`
+  adds Node types for the test files only (`tsconfig.test.json`), so it can pass
+  while `shell:check` fails: run both.
 
 ## Discovery
 
