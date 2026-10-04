@@ -658,15 +658,22 @@ only, no lanes.
 ```text
 chat → graph_falkordb → response_answers
                       → response_table
-	[controlled by graph store: llm (required — writes the Cypher)]
+	[controlled by graph store: llm (writes the Cypher for questions)]
 ```
 
-All three share the shape: `questions` in; `table`, `text`, `answers` out; an `llm` control
-connection is REQUIRED (it crafts Cypher from the question). Config is profile-based —
-`graph_falkordb` profile `default` takes `host`, `port`, `graph`, and a `db_description`
-(describe the schema so the LLM writes good Cypher); `graph_neo4j` defaults
-`database: "neo4j"`; `rocketride_graph` (built-in) needs no external server. Their classType
-also includes `tool`, so an agent can control a graph store as a tool instead.
+All three share the shape: `questions` in; `table`, `text`, `answers` out. The `llm` control
+connection crafts Cypher from a question, so the questions lane and the `get_data` /
+`get_query` tools need it. Config is profile-based — `graph_falkordb` profile `default`
+takes `host`, `port`, `graph`, and a `db_description` (describe the schema so the LLM writes
+good Cypher); `graph_neo4j` defaults `database: "neo4j"`; `rocketride_graph` (built-in) needs
+no external server. Their classType also includes `tool`, so an agent can control a graph
+store as a tool instead.
+
+For direct tool use without questions, wire the graph node to a `tools` source and call its
+tools through `client.tool()`: `read_query` (Cypher you write, read-only on every engine,
+with bound `params` and a row `limit`), `get_schema` / `refresh_schema`, `dialect` (engine,
+capabilities, limits) and `execute` (only when `allow_execute` is on). Such a tools-only
+pipeline starts without an `llm` node; only `get_data` / `get_query` then fail.
 
 ### Pattern 15: Memory options
 
