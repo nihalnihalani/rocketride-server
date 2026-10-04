@@ -209,8 +209,13 @@ export function manualClock(start = 1_000_000): IManualClock {
 	let current = start;
 	let nextId = 1;
 	const timers = new Map<number, { at: number; fn: () => void }>();
+	// A MACROtask turn (not a microtask): every promise continuation already
+	// queued runs before the timer fires, however deep the chain. `setTimeout`
+	// rather than Node's `setImmediate`, because this file is type-checked with
+	// the browser libs only (shell:freeze compiles apps/shared without Node types).
+	const turn = (): Promise<void> => new Promise<void>((resolve) => { setTimeout(resolve, 0); });
 	const settle = async (): Promise<void> => {
-		for (let i = 0; i < 40; i += 1) await new Promise<void>((resolve) => { setImmediate(resolve); });
+		for (let i = 0; i < 10; i += 1) await turn();
 	};
 	return {
 		now: () => current,
