@@ -9,7 +9,7 @@
 
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { canWrite, engineText, parseDialect, readBoundaryText, rowLimitFor, supportsReadQuery, supportsRefresh, targetText } from '../src/graph/dialect';
+import { canWrite, engineText, parseDialect, readBoundaryText, rowLimitChip, rowLimitFor, supportsReadQuery, supportsRefresh, targetText } from '../src/graph/dialect';
 import { fixture } from './support/builders';
 
 const load = (name: string) => parseDialect(fixture<Record<string, unknown>>(`dialect_${name}`));
@@ -113,4 +113,24 @@ test('a node that publishes no capabilities block advertises nothing: only an ex
 	// Writing is never assumed: it needs allow_execute AND the graph shape.
 	assert.equal(canWrite(parseDialect({ dialect: 'neo4j', allow_execute: true })), false, 'allow_execute with no capability block: the graph shape is not advertised');
 	assert.equal(canWrite(parseDialect({ dialect: 'neo4j', allow_execute: true, capabilities: { execute_shape_graph: false } })), false);
+});
+
+test('the row-limit chip says so when the node\'s maximum is below the choice, and is unchanged otherwise', () => {
+	const small = parseDialect({ dialect: 'falkordb', limits: { max_rows: 250 } });
+	const neo = parseDialect({ dialect: 'neo4j', limits: { max_rows: 25000 } });
+	// 1,000 chosen on a node that allows 250: the two controls used to disagree with no explanation.
+	const capped = rowLimitChip(1000, small);
+	assert.equal(capped.text, "limit 250 (this connection's maximum)");
+	assert.match(capped.title ?? '', /at most 250 rows per query \(the node's max_rows\)\. You chose 1,000, so 250 is sent\./);
+	// A choice at or below the cap, and All (which is the cap by definition): the chip is exactly what it was.
+	assert.deepEqual(rowLimitChip(200, small), { text: 'limit 200', title: null });
+	assert.deepEqual(rowLimitChip(250, small), { text: 'limit 250', title: null });
+	assert.deepEqual(rowLimitChip(null, small), { text: 'limit 250', title: null });
+	assert.deepEqual(rowLimitChip(1000, neo), { text: 'limit 1,000', title: null });
+	assert.deepEqual(rowLimitChip(null, neo), { text: 'limit 25,000', title: null });
+	// The chip always agrees with what is sent.
+	for (const choice of [200, 1000, null]) assert.ok(rowLimitChip(choice, small).text.startsWith(`limit ${rowLimitFor(choice, small).toLocaleString('en-US')}`));
+	// No probe yet: the fallback maximum of 1,000 applies and nothing is claimed about a node.
+	assert.deepEqual(rowLimitChip(1000, null), { text: 'limit 1,000', title: null });
+	assert.equal(rowLimitChip(200, null).title, null);
 });

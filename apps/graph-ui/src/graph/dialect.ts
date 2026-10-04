@@ -206,6 +206,34 @@ export function rowLimitFor(choice: number | null, dialect: IGraphDialect | null
 	return Math.max(1, Math.min(cap, Math.floor(wanted)));
 }
 
+/** What the row-limit chip says. */
+export interface IRowLimitChip {
+	/** The chip's text. */
+	text: string;
+	/** A longer explanation for the tooltip; null when there is nothing to explain. */
+	title: string | null;
+}
+
+/**
+ * The row-limit chip: the limit that is sent, and, when it is lower than what the toggle asks for, why.
+ * (The toggle offers 200, 1,000 and All; a node with a lower `max_rows` than the choice silently sends
+ * its own maximum, so the two controls would disagree with no explanation.)
+ *
+ * @param choice - 200, 1000, or null for All.
+ * @param dialect - The parsed dialect (null uses the fallbacks).
+ * @returns Text and tooltip.
+ */
+export function rowLimitChip(choice: number | null, dialect: IGraphDialect | null): IRowLimitChip {
+	const cap = dialect ? dialect.limits.maxRows : FALLBACK_LIMITS.maxRows;
+	const sent = rowLimitFor(choice, dialect);
+	const text = `limit ${sent.toLocaleString('en-US')}`;
+	if (choice === null || choice <= cap) return { text, title: null };
+	return {
+		text: `${text} (this connection's maximum)`,
+		title: `This connection allows at most ${cap.toLocaleString('en-US')} rows per query (the node's max_rows). You chose ${choice.toLocaleString('en-US')}, so ${sent.toLocaleString('en-US')} is sent.`,
+	};
+}
+
 // =============================================================================
 // WORDING
 // =============================================================================
