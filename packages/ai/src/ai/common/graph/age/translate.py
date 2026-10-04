@@ -46,7 +46,13 @@ from .analysis import analyze
 from .capabilities import DEFAULT_AGE_VERSION, apply_capabilities
 from .decode import decode_agtype
 from .emit import TranslatedQuery, emit
-from .firewall import FirewallConfig, check_pre_parse, check_resource_caps, check_semantics_readonly
+from .firewall import (
+    FirewallConfig,
+    check_pre_parse,
+    check_qualified_calls,
+    check_resource_caps,
+    check_semantics_readonly,
+)
 
 
 class TranslateMode(enum.Enum):
@@ -86,6 +92,9 @@ def translate(
 
     # Firewall: resource caps guard BOTH paths; only semantics are mode-gated.
     check_resource_caps(facts, config)
+    # Qualified calls are gated on both paths (the raw path by allowlist), and
+    # before the read-only rules so the more specific rejection wins.
+    check_qualified_calls(facts, config, safe=mode is TranslateMode.SAFE)
     if mode is TranslateMode.SAFE:
         check_semantics_readonly(facts)
 
