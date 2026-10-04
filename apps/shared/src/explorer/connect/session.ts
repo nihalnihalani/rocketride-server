@@ -94,15 +94,35 @@ export const DEFAULT_RETRY_POLL_MS = 1_000;
 const SDK_TIMEOUT_SLACK_MS = 1_000;
 
 /**
+ * The node's own budget for one schema reflection
+ * (`SCHEMA_REFRESH_BUDGET_MS`, packages/ai/src/ai/common/graph/schema.py).
+ */
+const NODE_SCHEMA_REFRESH_BUDGET_MS = 60_000;
+
+/**
+ * How much longer than its own budget a refresh may wait for the per-node lock
+ * (`refresh_schema_snapshot` waits up to budget + 5 s before refusing).
+ */
+const NODE_SCHEMA_LOCK_SLACK_MS = 5_000;
+
+/**
  * Documented per-tool client budgets for the tools every Explorer shares.
  * Apps spread this into their `tools` map and override where they know better.
  * Query tools are NOT listed: their budget derives from the node's published
  * statement deadline (see {@link IToolSessionOptions.timeoutPadMs}).
+ *
+ * A client wait must sit ABOVE the node's deadline, or the app says "stopped
+ * waiting" just before the node returns its honest stale/error answer:
+ *
+ * - `refresh_schema` can queue behind another refresh (up to budget + 5 s) and
+ *   then reflect for up to its own budget, so the worst honest answer arrives
+ *   after 2 x budget + 5 s; plus the usual 10 s pad = 135 s.
+ * - `get_schema` serves the snapshot the node already holds, so 60 s stands.
  */
 export const DEFAULT_TOOL_TIMEOUTS: Readonly<Record<string, number>> = {
 	dialect: 15_000,
 	get_schema: 60_000,
-	refresh_schema: 60_000,
+	refresh_schema: 2 * NODE_SCHEMA_REFRESH_BUDGET_MS + NODE_SCHEMA_LOCK_SLACK_MS + DEFAULT_TIMEOUT_PAD_MS,
 	get_data: 120_000,
 	get_query: 120_000,
 };
