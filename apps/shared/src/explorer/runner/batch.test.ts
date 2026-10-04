@@ -164,6 +164,20 @@ describe('runStatementBatch — sequence and failure', () => {
 		assert.equal(trace.failure?.prior, '');
 	});
 
+	it('hands describeFailure the ORIGINAL error as well as its message, so the app can read an ExplorerToolError\'s kind', async () => {
+		const seen: Array<{ message: string; kind: string | undefined; error: unknown }> = [];
+		const thrown = new ExplorerToolError({ kind: 'upgrade', tool: 'read_query', message: 'This node cannot run read_query' });
+		const { hooks, view } = rig(() => { throw thrown; }, { hooks: { describeFailure: (message, error) => {
+			seen.push({ message, kind: error instanceof ExplorerToolError ? error.kind : undefined, error });
+			return { headline: message, verbatim: message, generic: false };
+		} } });
+		await runStatementBatch(targets('MATCH (a)'), hooks, view, createGeneration().next());
+		assert.equal(seen.length, 1);
+		assert.equal(seen[0]!.message, 'This node cannot run read_query');
+		assert.equal(seen[0]!.kind, 'upgrade');
+		assert.equal(seen[0]!.error, thrown);
+	});
+
 	it('passes the failure to the app (onFailure) and a failing first statement has no prior sentence', async () => {
 		const seen: string[] = [];
 		const { hooks, view, trace } = rig(() => { throw new Error('first one fails'); }, { hooks: { onFailure: (notice, run) => { seen.push(`${run.index}:${notice.headline}`); } } });
