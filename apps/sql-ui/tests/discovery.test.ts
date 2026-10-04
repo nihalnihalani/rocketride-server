@@ -43,8 +43,14 @@ import { taskRow, resetEndpoints } from './support';
 // =============================================================================
 
 describe('DATABASE_PROVIDERS', () => {
-	it('covers exactly the three relational node providers', () => {
-		assert.deepEqual([...DATABASE_PROVIDERS].sort(), ['db_clickhouse', 'db_mysql', 'db_postgres']);
+	it('covers exactly the relational node providers: MySQL, PostgreSQL, ClickHouse, the Supabase preset and RocketRide SQL', () => {
+		assert.deepEqual([...DATABASE_PROVIDERS].sort(), ['db_clickhouse', 'db_mysql', 'db_postgres', 'db_supabase', 'rocketride_sql']);
+	});
+
+	it('does not claim the graph or vector providers', () => {
+		for (const provider of ['graph_neo4j', 'graph_falkordb', 'rocketride_graph', 'rocketride_vector']) {
+			assert.equal(DATABASE_PROVIDERS.has(provider), false, provider);
+		}
 	});
 });
 
@@ -101,6 +107,17 @@ describe('SQL Explorer endpoint store', () => {
 		});
 		// A component without a display name falls back to its id.
 		assert.equal(endpoints.find((e) => e.nodeId === 'ch_1')!.nodeName, 'ch_1');
+	});
+
+	it('finds the Supabase preset and the RocketRide SQL node like any other database node', async () => {
+		const row = taskRow('p1');
+		row.pipeline.components = [
+			{ id: 'sb_1', provider: 'db_supabase', name: 'Supabase' },
+			{ id: 'rr_1', provider: 'rocketride_sql', name: 'Tenant SQL' },
+			{ id: 'rrg_1', provider: 'rocketride_graph' },
+		];
+		await refreshEndpoints(clientFor([row]));
+		assert.deepEqual(sqlEndpoints.getState().endpoints.map((e) => `${e.provider}:${e.nodeId}`), ['rocketride_sql:rr_1', 'db_supabase:sb_1']);
 	});
 
 	it('lists a developer run and the team deployment of one pipeline as two connections', async () => {
