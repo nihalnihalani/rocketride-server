@@ -1,0 +1,70 @@
+// =============================================================================
+// MIT License
+// Copyright (c) 2026 Aparavi Software AG
+// =============================================================================
+
+// =============================================================================
+// WIRING GUARDS: React-side rules that the pure tests cannot see
+// =============================================================================
+//
+// No React harness runs under node:test, so the rules that decide whether the UI stays in
+// step with its state are pinned by reading the source. Each one exists because a real
+// failure was found in a browser:
+//
+//   F7  the inspector did not close on Escape: the graph session was disposed when a new
+//       result arrived, which dropped the surface's subscription, so closing the
+//       inspector changed the state and nothing re-rendered.
+//   --  a refreshed discovery list hands back a NEW endpoint object for the same connection;
+//       rebuilding the graph session from it would silently drop the user's selection,
+//       inspector and expansions.
+// =============================================================================
+
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
+import { test } from 'node:test';
+
+const SRC = path.resolve(__dirname, '..', 'src');
+const read = (...parts: string[]): string => fs.readFileSync(path.join(SRC, ...parts), 'utf8');
+/** Source without comments, so a rule is checked against code only. */
+const code = (text: string): string => text.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '').replace(/\s\/\/.*$/gm, '');
+
+test('the surface disposes its graph session when the session is replaced or the surface unmounts, never from the effect that loads a new result', () => {
+	const surface = code(read('components', 'RunSurface.tsx'));
+	const loadEffect = surface.slice(surface.indexOf('graphSession.load(result)') - 200, surface.indexOf('graphSession.load(result)') + 200);
+	assert.doesNotMatch(loadEffect, /dispose\(\)/, 'dispose() beside load(result) runs on every new result');
+	assert.match(surface, /useEffect\(\(\) => \(\) => graphSession\.dispose\(\), \[graphSession\]\)/);
+});
+
+test('the graph session is built from the connection key and refs, not from objects that change when discovery refreshes', () => {
+	const surface = code(read('components', 'RunSurface.tsx'));
+	const factory = surface.slice(surface.indexOf('const graphSession = useMemo'), surface.indexOf('useEffect(() => () => graphSession.dispose()'));
+	assert.match(factory, /\[endpoint\.key\]\)/, 'its dependency list is the key alone');
+	// Every read of a changing value goes through `latest.current`: strip those, and no bare dialect/session/writable is left.
+	const bare = factory.replace(/latest\.current\.(dialect|session|writable|announce)/g, '');
+	assert.doesNotMatch(bare, /\b(dialect|writable)\b\s*[?.)]|[(,]\s*(session|dialect|writable)\s*[,)]/, 'it closes over a changing object');
+	assert.match(factory, /latest\.current\./, 'what changes over time is read through a ref');
+});
+
+test('every open drawer and dialog goes through the shell: no graph-ui code handles Escape or swallows key events above them', () => {
+	for (const file of ['components/InspectorPanel.tsx', 'components/HistoryPanel.tsx', 'components/RunSurface.tsx', 'views/ConnectionsView.tsx', 'components/ConnectionDrawer.tsx']) {
+		const text = code(read(...file.split('/')));
+		assert.doesNotMatch(text, /stopPropagation/, `${file} stops event propagation`);
+		assert.doesNotMatch(text, /addEventListener\(\s*['"]key/, `${file} registers its own key listener`);
+	}
+});
+
+test('opening a workbench from the connection drawer closes the drawer first, so it cannot sit above the workbench', () => {
+	const view = code(read('views', 'ConnectionsView.tsx'));
+	const onOpen = view.slice(view.indexOf('onOpen={'), view.indexOf('onClose={() => setDrawerKey(null)}'));
+	assert.match(onOpen, /setDrawerKey\(null\)/);
+	assert.ok(onOpen.indexOf('setDrawerKey(null)') < onOpen.indexOf('open(endpoint)'));
+});
+
+test('the inspector closes through the session, and its panel is rendered from the same state the session publishes', () => {
+	const inspector = code(read('components', 'InspectorPanel.tsx'));
+	assert.match(inspector, /onClose=\{\(\) => session\.inspect\(null\)\}/);
+	assert.match(inspector, /const target: IInspectTarget \| null = state\.inspect/);
+	const surface = code(read('components', 'RunSurface.tsx'));
+	assert.match(surface, /useSyncExternalStore\(graphSession\.subscribe, graphSession\.getState, graphSession\.getState\)/);
+});

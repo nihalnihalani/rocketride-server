@@ -152,7 +152,7 @@ export interface IGraphSession {
 	showMore(): void;
 	/** A statement that can change data ran on this connection: what is drawn may no longer match. */
 	markStale(): void;
-	/** Drop everything in flight (unmount, connection change). */
+	/** End everything in flight (unmount, connection change). Subscribers keep their subscriptions. */
 	dispose(): void;
 }
 
@@ -475,10 +475,12 @@ export function createGraphSession(deps: IGraphSessionDeps): IGraphSession {
 		},
 
 		dispose() {
+			// Ends everything in flight. Subscribers are NOT dropped: they own their subscriptions (React unsubscribes on
+			// its own), and clearing them here once left a component that kept using the session deaf to its changes:
+			// the inspector's Escape updated the state, nothing re-rendered, and the dialog stayed open.
 			epoch += 1;
 			search?.stop();
 			search = null;
-			listeners.clear();
 		},
 	};
 }

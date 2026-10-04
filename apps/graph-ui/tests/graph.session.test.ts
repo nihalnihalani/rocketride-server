@@ -474,3 +474,43 @@ test('markStale on an empty canvas does nothing', () => {
 	assert.equal(session.getState().stale, false);
 	assert.equal(session.getState().notice, null);
 });
+
+// -----------------------------------------------------------------------------
+// Finding F7: Escape did not close the inspector. The inspector's state WAS cleared, but
+// `dispose()` (run when a new result replaced the old) had dropped the component's subscription.
+// -----------------------------------------------------------------------------
+
+test('a subscriber keeps hearing after dispose and a later load: closing the inspector re-renders it', () => {
+	const { session } = rig();
+	let heard = 0;
+	session.subscribe(() => { heard += 1; });
+	session.load(base());
+	session.dispose();
+	session.load(base());
+	const before = heard;
+	session.inspect({ kind: 'node', id: 'a' });
+	assert.equal(heard, before + 1, 'opening the inspector is announced to subscribers');
+	session.inspect(null);
+	assert.equal(heard, before + 2, 'closing it is too');
+	assert.equal(session.getState().inspect, null);
+});
+
+test('dispose ends what is in flight but leaves subscriptions alone, and the session is reusable afterwards', async () => {
+	let release: (r: ReadQueryResult) => void = () => undefined;
+	const { session } = rig(NEO, () => new Promise<ReadQueryResult>((resolve) => { release = resolve; }));
+	let heard = 0;
+	const off = session.subscribe(() => { heard += 1; });
+	session.load(base());
+	const pending = session.expand('a');
+	await tick();
+	session.dispose();
+	release(envelope([[node('a', ['P']), rel('r2', 'T', 'a', 'c'), node('c', ['P'])]]));
+	await pending;
+	assert.deepEqual([...session.getState().model.nodes.keys()], ['a', 'b'], 'the answer that was in flight is dropped');
+	const before = heard;
+	session.focus('b');
+	assert.equal(heard, before + 1);
+	off();
+	session.focus('a');
+	assert.equal(heard, before + 1, 'an explicit unsubscribe still works');
+});
