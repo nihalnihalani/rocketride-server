@@ -21,53 +21,77 @@
 // SOFTWARE.
 
 // =============================================================================
-// SQL-UI — CONNECTION DETAIL PANEL (record drawer: inspect + probe an endpoint)
+// EXPLORER — ENDPOINT DRAWER (record drawer: inspect + probe an endpoint)
+// =============================================================================
+//
+// Pick (or inspect) an endpoint and verify it with a live probe. The drawer
+// holds no connection mechanics: the app hands in what to say (`copy`), how to
+// verify (`probe`) and anything extra to show about an endpoint (`details`).
 // =============================================================================
 
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import type { CSSProperties } from 'react';
-import type { RocketRideClient } from 'shell';
-import { Banner, Button, DetailPanel, LabelValue, Section, StatusBadge } from 'shell';
-import { commonStyles } from 'shell';
-import type { ISqlEndpoint, ISqlProbeResult } from '../connect';
-import { probeSqlEndpoint } from '../connect';
-import { DatabaseIcon } from '../icons';
+import type { CSSProperties, ReactNode } from 'react';
+import { Banner, Button, DetailPanel, LabelValue, Section, StatusBadge, commonStyles } from 'shell';
+import type { IExplorerClient, IExplorerEndpoint } from '../types';
+import { ENDPOINT_STATE_BADGE, describeRun } from './endpointState';
 
 // =============================================================================
 // TYPES
 // =============================================================================
 
-/** Props for the {@link ConnectionDetailPanel} component. */
-export interface IConnectionDetailPanelProps {
+/** One line of a probe's result. */
+export interface IDrawerProbeRow {
+	/** The label. */
+	label: string;
+	/** The value. */
+	value: string;
+}
+
+/** What the app reports after verifying an endpoint. */
+export interface IDrawerProbe {
+	/** Whether the endpoint answered. */
+	ok: boolean;
+	/** What the probe learned (engine, database, …). */
+	rows: IDrawerProbeRow[];
+	/** Failure detail when `ok` is false. */
+	error?: string;
+}
+
+/** The words a drawer uses. */
+export interface IEndpointDrawerCopy {
+	/** Title when no endpoint is selected. */
+	newTitle: string;
+	/** Subtitle under the title. */
+	subtitle: string;
+	/** The select's only option when nothing was discovered. */
+	noEndpointsOption: string;
+	/** Hint under the picker. */
+	pickHint: string;
+}
+
+/** Props for the {@link EndpointDrawer} component. */
+export interface IEndpointDrawerProps<E extends IExplorerEndpoint> {
 	/** Whether the drawer is open. */
 	open: boolean;
-	/** The shell's RocketRide client (null while disconnected). */
-	client: RocketRideClient | null;
+	/** The shell's client (null while disconnected). */
+	client: IExplorerClient | null;
 	/** All discovered endpoints (the drawer's pick list). */
-	endpoints: ISqlEndpoint[];
+	endpoints: E[];
 	/** Endpoint preselected by the caller (card click), or null for pick mode. */
-	endpoint: ISqlEndpoint | null;
+	endpoint: E | null;
 	/** Fired when the user dismisses the drawer. */
 	onClose: () => void;
 	/** Fired with the selected endpoint when the user opens its workbench. */
-	onOpen: (endpoint: ISqlEndpoint) => void;
+	onOpen: (endpoint: E) => void;
+	/** The avatar shown in the header. */
+	avatar: ReactNode;
+	/** The drawer's wording. */
+	copy: IEndpointDrawerCopy;
+	/** Verify an endpoint. Must not throw; failures come back as `ok: false`. */
+	probe: (client: IExplorerClient, endpoint: E) => Promise<IDrawerProbe>;
+	/** Extra rows for the Endpoint section (engine, version, graph, owner…). */
+	details?: (endpoint: E) => ReactNode;
 }
-
-/** The badge variant and word for each endpoint state. */
-const STATE_VARIANT: Record<ISqlEndpoint['state'], 'success' | 'muted' | 'error'> = {
-	probing: 'muted',
-	ready: 'success',
-	stopped: 'muted',
-	unreachable: 'error',
-	inaccessible: 'error',
-};
-const STATE_LABEL: Record<ISqlEndpoint['state'], string> = {
-	probing: 'Checking',
-	ready: 'Running',
-	stopped: 'Stopped',
-	unreachable: 'Unreachable',
-	inaccessible: 'No access',
-};
 
 /** Probe lifecycle local to the drawer. */
 type ProbeStatus = 'idle' | 'probing' | 'done';
@@ -77,7 +101,7 @@ type ProbeStatus = 'idle' | 'probing' | 'done';
 // =============================================================================
 
 const styles = {
-	// 42px round avatar slot content for the EntityHeader.
+	// 42px round avatar slot content for the header.
 	avatar: {
 		display: 'flex',
 		alignItems: 'center',
@@ -115,23 +139,25 @@ const styles = {
 // =============================================================================
 
 /**
- * Record drawer for one database endpoint: pick (or inspect) an endpoint and
- * verify it with a live probe (dialect + shallow schema summary). This panel
- * only renders connect/ results — all attach mechanics stay in connect/.
+ * Record drawer for one endpoint: pick (or inspect) it and verify it with a
+ * live probe.
+ *
+ * @param props - {@link IEndpointDrawerProps}.
+ * @returns The drawer element.
  */
-export const ConnectionDetailPanel: React.FC<IConnectionDetailPanelProps> = (props) => {
-	const { open, client, endpoints, endpoint, onClose, onOpen } = props;
+export function EndpointDrawer<E extends IExplorerEndpoint>(props: IEndpointDrawerProps<E>): React.ReactElement {
+	const { open, client, endpoints, endpoint, onClose, onOpen, avatar, copy, probe: runProbeFn, details } = props;
 
 	// The endpoint being inspected: caller preselection wins, else first.
 	const [selectedKey, setSelectedKey] = useState<string | null>(null);
 
 	// Probe lifecycle + result for the selected endpoint.
 	const [probeStatus, setProbeStatus] = useState<ProbeStatus>('idle');
-	const [probe, setProbe] = useState<ISqlProbeResult | null>(null);
+	const [probe, setProbe] = useState<IDrawerProbe | null>(null);
 
-	// Probe sequence (endpointStore refresh-seq pattern): every re-seed or
-	// target switch bumps it, so an in-flight probe result that lands late is
-	// recognised as stale and discarded instead of describing the wrong node.
+	// Probe sequence: every re-seed or target switch bumps it, so an in-flight
+	// probe result that lands late is recognised as stale and discarded instead
+	// of describing the wrong node.
 	const probeSeq = useRef(0);
 
 	// Re-seed the selection every time the drawer opens (or the caller's
@@ -148,9 +174,9 @@ export const ConnectionDetailPanel: React.FC<IConnectionDetailPanelProps> = (pro
 	}, [open, endpoint]);
 
 	// Fill the first-endpoint fallback when the drawer opened from the empty
-	// state and discovery delivers endpoints later. Only a never-made
-	// selection (selectedKey === null) is filled — a live selection, or its
-	// temporary absence from the list during a discovery refresh, stays.
+	// state and discovery delivers endpoints later. Only a never-made selection
+	// (selectedKey === null) is filled — a live selection, or its temporary
+	// absence from the list during a discovery refresh, stays.
 	useEffect(() => {
 		if (!open || selectedKey !== null) return;
 		const first = endpoints[0];
@@ -163,9 +189,7 @@ export const ConnectionDetailPanel: React.FC<IConnectionDetailPanelProps> = (pro
 		[endpoints, selectedKey],
 	);
 
-	/**
-	 * Run the live probe against the selected endpoint.
-	 */
+	/** Run the live probe against the selected endpoint. */
 	const runProbe = async (): Promise<void> => {
 		if (!client || !selected) return;
 		// Capture the sequence: if the drawer re-seeds or the user switches
@@ -173,7 +197,7 @@ export const ConnectionDetailPanel: React.FC<IConnectionDetailPanelProps> = (pro
 		const seq = ++probeSeq.current;
 		setProbeStatus('probing');
 		setProbe(null);
-		const result = await probeSqlEndpoint(client, selected);
+		const result = await runProbeFn(client, selected);
 		if (seq !== probeSeq.current) return;
 		setProbeStatus('done');
 		setProbe(result);
@@ -183,9 +207,9 @@ export const ConnectionDetailPanel: React.FC<IConnectionDetailPanelProps> = (pro
 		<DetailPanel
 			open={open}
 			onClose={onClose}
-			avatar={<span style={styles.avatar}><DatabaseIcon /></span>}
-			title={selected ? selected.nodeName : 'New Connection'}
-			subtitle="Bind SQL Explorer to a database tool node in a running pipeline"
+			avatar={<span style={styles.avatar}>{avatar}</span>}
+			title={selected ? selected.nodeName : copy.newTitle}
+			subtitle={copy.subtitle}
 			footer={
 				<>
 					<Button variant="ghost" onClick={onClose}>Close</Button>
@@ -220,17 +244,14 @@ export const ConnectionDetailPanel: React.FC<IConnectionDetailPanelProps> = (pro
 						setProbe(null);
 					}}
 				>
-					{endpoints.length === 0 && <option value="">No database nodes found</option>}
+					{endpoints.length === 0 && <option value="">{copy.noEndpointsOption}</option>}
 					{endpoints.map((e) => (
 						<option key={e.key} value={e.key}>
 							{e.pipelineName}: {e.nodeName} ({e.provider})
 						</option>
 					))}
 				</select>
-				<div style={styles.hint}>
-					Only database nodes inside running pipelines are listed. The pipeline
-					node owns the database credentials. Nothing is entered here.
-				</div>
+				<div style={styles.hint}>{copy.pickHint}</div>
 			</Section>
 
 			{/* ── Endpoint ───────────────────────────────────────────────────── */}
@@ -239,13 +260,12 @@ export const ConnectionDetailPanel: React.FC<IConnectionDetailPanelProps> = (pro
 					<LabelValue label="Pipeline" mono>{selected.pipelineName}</LabelValue>
 					<LabelValue label="Node" mono>{selected.nodeId}</LabelValue>
 					<LabelValue label="Provider" mono>{selected.provider}</LabelValue>
-					<LabelValue label="Run">
-						{selected.runKind === 'deploy' ? (selected.ownerKind === 'team' ? 'Team deployment' : 'Personal deployment') : 'Your development run'}
-					</LabelValue>
+					<LabelValue label="Run">{describeRun(selected)}</LabelValue>
 					<LabelValue label="State">
-						<StatusBadge variant={STATE_VARIANT[selected.state]}>{STATE_LABEL[selected.state]}</StatusBadge>
+						<StatusBadge variant={ENDPOINT_STATE_BADGE[selected.state].variant}>{ENDPOINT_STATE_BADGE[selected.state].label}</StatusBadge>
 					</LabelValue>
 					{selected.stateDetail && <div style={styles.hint}>{selected.stateDetail}</div>}
+					{details?.(selected)}
 				</Section>
 			)}
 
@@ -256,9 +276,9 @@ export const ConnectionDetailPanel: React.FC<IConnectionDetailPanelProps> = (pro
 						<LabelValue label="Probe">
 							<StatusBadge variant="success">Tool reachable</StatusBadge>
 						</LabelValue>
-						<LabelValue label="Dialect" mono>{probe.dialect}</LabelValue>
-						{probe.database !== undefined && <LabelValue label="Database" mono>{probe.database}</LabelValue>}
-						{probe.tableCount !== undefined && <LabelValue label="Tables" mono>{String(probe.tableCount)}</LabelValue>}
+						{probe.rows.map((row) => (
+							<LabelValue key={row.label} label={row.label} mono>{row.value}</LabelValue>
+						))}
 					</Section>
 				) : (
 					<div style={styles.bannerGap}>
@@ -268,6 +288,6 @@ export const ConnectionDetailPanel: React.FC<IConnectionDetailPanelProps> = (pro
 			)}
 		</DetailPanel>
 	);
-};
+}
 
-export default ConnectionDetailPanel;
+export default EndpointDrawer;
