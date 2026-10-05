@@ -854,11 +854,9 @@ class TestSchemaAndDialect:
 
 # ---------------------------------------------------------------------------
 # The cloud tenant shape: a NOSUPERUSER role on its own database, holding
-# exactly the grants the provisioner gives it, on the default 'rocketride'
-# graph the provisioner creates (rocketride-saas datacore provisioner:
-# _SQL_CLOSE_DATABASE, _SQL_GRANT_DATABASE, _SQL_GRANT_GRAPH_SCHEMA,
-# _SQL_GRANT_TENANT_SCHEMAS). Every other test here runs as the bootstrap
-# superuser, which bypasses all of these grants.
+# the grants the cloud provisioner gives a tenant role, on the default
+# 'rocketride' graph the provisioner creates. Every other test here runs as
+# the bootstrap superuser, which bypasses all of these grants.
 # ---------------------------------------------------------------------------
 
 TENANT_GRAPH = 'rocketride'
@@ -866,14 +864,14 @@ TENANT_GRAPH = 'rocketride'
 
 def _tenant_grant_statements(graph, role):
     return [
-        # _SQL_GRANT_GRAPH_SCHEMA: the tenant owns the graph schema and its bootstrap tables.
+        # Graph schema: the tenant owns the graph schema and its bootstrap tables.
         f'GRANT ALL ON SCHEMA "{graph}" TO "{role}"',
         f'GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA "{graph}" TO "{role}"',
         f'GRANT ALL ON ALL SEQUENCES IN SCHEMA "{graph}" TO "{role}"',
         f'ALTER SCHEMA "{graph}" OWNER TO "{role}"',
         f'ALTER TABLE "{graph}"._ag_label_vertex OWNER TO "{role}"',
         f'ALTER TABLE "{graph}"._ag_label_edge OWNER TO "{role}"',
-        # _SQL_GRANT_TENANT_SCHEMAS
+        # The public schema, and read/execute access to the AGE catalog.
         f'GRANT ALL ON SCHEMA public TO "{role}"',
         f'GRANT USAGE ON SCHEMA ag_catalog TO "{role}"',
         f'GRANT SELECT ON ALL TABLES IN SCHEMA ag_catalog TO "{role}"',
@@ -898,7 +896,7 @@ def tenant_db():
         with admin.cursor() as cur:
             cur.execute(f'CREATE DATABASE "{database}"')
             cur.execute(f'CREATE ROLE "{role}" LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE PASSWORD %s', (password,))
-            # _SQL_CLOSE_DATABASE / _SQL_GRANT_DATABASE
+            # Database access: closed to PUBLIC, all privileges for the tenant role.
             cur.execute(f'REVOKE CONNECT, TEMPORARY ON DATABASE "{database}" FROM PUBLIC')
             cur.execute(f'GRANT ALL PRIVILEGES ON DATABASE "{database}" TO "{role}"')
         setup = psycopg2.connect(urlunsplit(parts._replace(path=f'/{database}')), connect_timeout=5)
