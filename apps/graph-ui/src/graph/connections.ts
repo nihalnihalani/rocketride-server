@@ -167,6 +167,41 @@ export function connectionView(endpoint: IExplorerEndpoint, probe: IProbeResult 
 }
 
 // =============================================================================
+// AN OPEN DOCUMENT WHOSE CONNECTION IS CHECKED AGAIN
+// =============================================================================
+//
+// The store checks a connection again whenever any task restarts (from ANY
+// pipeline), whenever the shell reconnects, and on Test connection. While it does,
+// the endpoint is `probing` and its probe is gone, so the connection is briefly not
+// openable. A document that has already opened its run surface keeps it: unmounting
+// would drop the results, the graph and its expansions, the inspector, the row limit
+// and the batch in flight. The surface stays and running pauses, with the reason.
+
+/** What a connection document shows. */
+export interface ISurfaceGate {
+	/** True when the editor, results and graph are on screen. */
+	mounted: boolean;
+	/** Why running is paused while the surface stays, or null when it can run. */
+	paused: string | null;
+}
+
+/** Said while a connection that was open is being checked again. */
+export const RECHECKING_TEXT = 'Checking this connection again. Running is paused until the node answers; what is on screen stays.';
+
+/**
+ * Whether a connection document shows its run surface, and whether running is paused.
+ *
+ * @param view - The connection's view (or the write console's own `openable`/`blocked`).
+ * @param opened - True once the surface has been on screen in this document.
+ * @returns The gate.
+ */
+export function surfaceGate(view: Pick<IConnectionView, 'openable' | 'blocked'>, opened: boolean): ISurfaceGate {
+	if (view.openable) return { mounted: true, paused: null };
+	if (!opened) return { mounted: false, paused: null };
+	return { mounted: true, paused: view.blocked ?? RECHECKING_TEXT };
+}
+
+// =============================================================================
 // EMPTY STATES
 // =============================================================================
 

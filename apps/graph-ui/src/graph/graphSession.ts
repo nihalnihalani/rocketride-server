@@ -128,6 +128,8 @@ export interface IGraphSessionDeps {
 	announce(text: string): void;
 	/** Caption choice per label (property name, or the id/label specials). */
 	captionChoice(label: string): string | undefined;
+	/** Why nothing may be sent right now (the connection is being checked again, or stopped), or null. */
+	paused?(): string | null;
 }
 
 /** The session. */
@@ -196,6 +198,11 @@ export function createGraphSession(deps: IGraphSessionDeps): IGraphSession {
 		return false;
 	};
 	const engineOrSay = (): IEngine | null => {
+		const why = deps.paused?.() ?? null;
+		if (why !== null) {
+			say(`Nothing was sent. ${why}`, 'warning');
+			return null;
+		}
 		const engine = deps.engine();
 		if (!engine) say('This connection has not been checked yet, so the app does not know which engine to write queries for.', 'warning');
 		return engine;

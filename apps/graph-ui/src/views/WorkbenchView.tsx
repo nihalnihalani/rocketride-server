@@ -37,7 +37,7 @@ import { announcer, graphEndpoints } from '../adapters/explorer';
 import { useGraphEndpoints, useWorkbenchRequest } from '../adapters/react';
 import { typePreview, labelPreview, isRefusal } from '../cypher/recipes';
 import { CONNECTIONS_URI, writeUri } from '../graph/addresses';
-import { connectionView } from '../graph/connections';
+import { connectionView, surfaceGate } from '../graph/connections';
 import { canWrite, engineText, parseDialect, targetText } from '../graph/dialect';
 import { getDocs } from '../docs';
 import { GraphIcon } from '../icons';
@@ -68,6 +68,10 @@ export const WorkbenchView: React.FC<IWorkbenchViewProps> = ({ endpoint }) => {
 	const dialect = useMemo(() => (probe?.ok ? parseDialect(probe.info) : null), [probe]);
 	const view = connectionView(endpoint, probe);
 	const writable = canWrite(dialect);
+	// A surface that has been on screen stays through a re-probe (see surfaceGate): it pauses instead of unmounting.
+	const opened = useRef(false);
+	if (view.openable) opened.current = true;
+	const gate = surfaceGate(view, opened.current);
 
 	const [historyOpen, setHistoryOpen] = useState(false);
 	const [loadRequest, setLoadRequest] = useState<NonNullable<IRunSurfaceProps['loadRequest']>>({ text: '', seq: 0, run: false });
@@ -121,11 +125,12 @@ export const WorkbenchView: React.FC<IWorkbenchViewProps> = ({ endpoint }) => {
 					) : undefined
 				}
 			/>
-			{view.openable ? (
+			{gate.mounted ? (
 				<div style={{ flex: 1, minHeight: 0 }}>
 					<RunSurface
 						endpoint={endpoint}
 						mode="read"
+						paused={gate.paused}
 						loadRequest={loadRequest}
 						topSlot={<AskBar endpoint={endpoint} onPreview={(cypher) => put(cypher, false)} />}
 						onOpenHistory={() => setHistoryOpen(true)}

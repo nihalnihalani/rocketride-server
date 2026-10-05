@@ -81,6 +81,11 @@ result tabs.
   exactly as written.
 - **Stop waiting** stops the app from waiting. The query may still be running on
   the database and cannot be cancelled from here; a late answer is ignored.
+- **When the connection is checked again** (any pipeline restarts, the shell
+  reconnects, or you press **Test connection**), or its pipeline stops, an open
+  workbench keeps its editor, results, graph and inspector on screen. Running and
+  the graph's actions pause, with the reason above the editor, until the node
+  answers again.
 - **The editor** highlights Cypher and keeps a draft per connection (text only).
   It loads the Monaco editor from `cdn.jsdelivr.net`; where that is not
   reachable, a plain text box is used after ten seconds, with the same run keys,

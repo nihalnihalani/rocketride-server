@@ -68,3 +68,19 @@ test('the inspector closes through the session, and its panel is rendered from t
 	const surface = code(read('components', 'RunSurface.tsx'));
 	assert.match(surface, /useSyncExternalStore\(graphSession\.subscribe, graphSession\.getState, graphSession\.getState\)/);
 });
+
+// GX-FE-01: a re-probe (a restart of ANY pipeline, a shell reconnect, Test connection) took the probe away for a
+// moment, the view stopped being openable, and the run surface unmounted: results, graph, expansions, inspector and
+// the row limit were lost. Both connection documents now keep a surface that has opened, and pause it instead.
+test('the workbench and the write console keep an opened run surface through a re-probe, and pass the pause reason down', () => {
+	for (const file of ['WorkbenchView.tsx', 'WriteConsoleView.tsx']) {
+		const view = code(read('views', file));
+		assert.match(view, /surfaceGate\(/, `${file} decides through surfaceGate`);
+		assert.match(view, /gate\.mounted \?/, `${file} mounts the surface on the gate`);
+		assert.doesNotMatch(view, /\{(view\.openable|allowed) \? \(/, `${file} still unmounts the surface whenever the connection is not openable`);
+		const surface = view.slice(view.indexOf('<RunSurface'), view.indexOf('/>', view.indexOf('<RunSurface')));
+		assert.match(surface, /paused=\{gate\.paused\}/, `${file} tells the surface why it is paused`);
+	}
+	const surface = code(read('components', 'RunSurface.tsx'));
+	assert.match(surface, /canRun: \(\) => [^\n]*paused == null/, 'a paused surface sends nothing');
+});

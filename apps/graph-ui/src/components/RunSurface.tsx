@@ -84,6 +84,11 @@ export interface IGraphRun extends IStatementRunBase {
 export interface IRunSurfaceProps {
 	endpoint: IExplorerEndpoint;
 	mode: 'read' | 'write';
+	/**
+	 * Why running is paused while the surface stays on screen (the connection is being checked again, was stopped,
+	 * or no longer allows this mode), or null/absent when it can run. Nothing is sent while it is set.
+	 */
+	paused?: string | null;
 	/** Text the host asks the editor to hold (history load, Ask preview, label preview). */
 	loadRequest: { text: string; seq: number; run: boolean } | null;
 	/** Extra content above the editor (the Ask bar). */
@@ -127,7 +132,7 @@ function entryId(): string {
  * @param props - See {@link IRunSurfaceProps}.
  * @returns The surface.
  */
-export const RunSurface: React.FC<IRunSurfaceProps> = ({ endpoint, mode, loadRequest, topSlot, onTextChange, onOpenHistory }) => {
+export const RunSurface: React.FC<IRunSurfaceProps> = ({ endpoint, mode, paused = null, loadRequest, topSlot, onTextChange, onOpenHistory }) => {
 	const { client, isConnected } = useShellConnection();
 	const prefs = usePrefs();
 	const { probes } = useGraphEndpoints();
@@ -136,6 +141,8 @@ export const RunSurface: React.FC<IRunSurfaceProps> = ({ endpoint, mode, loadReq
 	const dialect = useMemo(() => (probe?.ok ? parseDialect(probe.info) : null), [probe]);
 	const writable = dialectCanWrite(dialect);
 	const announce = useCallback((text: string) => announcer.announce(text), []);
+	// Why nothing may be sent right now (statements and graph actions alike), or null.
+	const blocked = !isConnected || !client ? 'The shell is not connected to the engine.' : paused;
 
 	// ── The session on this endpoint (the token never leaves the store) ──────
 	// Keyed on the endpoint's KEY, not its object: background discovery hands back a new object for the same
@@ -194,7 +201,7 @@ export const RunSurface: React.FC<IRunSurfaceProps> = ({ endpoint, mode, loadReq
 	const [confirm, setConfirm] = useState<{ content: IWriteConfirmation; targets: IRunTarget[] } | null>(null);
 	const failureNotes = useRef<IFailureNotice | null>(null);
 	const runner = useStatementRunner<IGraphRun, { cypher: string; limit: number }, ReadQueryResult, IFailureNotice & { verbatim: string }>({
-		canRun: () => client !== null && isConnected && session !== null,
+		canRun: () => client !== null && isConnected && session !== null && paused == null,
 		initRun: (target, index) => {
 			const prepared = prepareStatement(target.text, limitChoice, dialect);
 			return { index, cypher: target.text, kind: prepared.kind, verb: prepared.verb, outcome: 'pending', ...(target.start !== undefined ? { start: target.start } : {}), ...(target.end !== undefined ? { end: target.end } : {}), ...(target.startLine !== undefined ? { startLine: target.startLine } : {}), ...(target.endLine !== undefined ? { endLine: target.endLine } : {}) };
@@ -251,8 +258,8 @@ export const RunSurface: React.FC<IRunSurfaceProps> = ({ endpoint, mode, loadReq
 	// merely re-probes the node, refreshes discovery or re-renders this component may rebuild it, because that would
 	// silently drop the selection, the inspector, every expansion and the stale marks. What changes over time is read
 	// through refs.
-	const latest = useRef({ dialect, writable, session, announce });
-	latest.current = { dialect, writable, session, announce };
+	const latest = useRef({ dialect, writable, session, announce, blocked });
+	latest.current = { dialect, writable, session, announce, blocked };
 	// `endpoint.key` is the whole dependency on purpose: one graph session per connection.
 	const graphSession = useMemo<IGraphSession>(() => createGraphSession({
 		engine: () => (latest.current.dialect ? { dialect: latest.current.dialect.dialect, version: latest.current.dialect.engineVersion } : null),
@@ -264,6 +271,7 @@ export const RunSurface: React.FC<IRunSurfaceProps> = ({ endpoint, mode, loadReq
 		describe: (error) => describeFailureOf(error instanceof Error ? error.message : String(error), error, latest.current.writable),
 		announce: (text) => latest.current.announce(text),
 		captionChoice: (label) => captionsRef.current.get(label),
+		paused: () => latest.current.blocked,
 		// eslint-disable-next-line react-hooks/exhaustive-deps
 	}), [endpoint.key]);
 	// Dispose once, when the session is replaced or the surface goes away: NOT on every new result. `dispose` ends
@@ -303,6 +311,10 @@ export const RunSurface: React.FC<IRunSurfaceProps> = ({ endpoint, mode, loadReq
 
 	// ── Running ──────────────────────────────────────────────────────────────
 	const startRun = useCallback((targets: IRunTarget[], fromEditor: boolean) => {
+		if (blocked !== null) {
+			announce(`Nothing was sent. ${blocked}`);
+			return;
+		}
 		if (targets.length === 0) {
 			announce('Nothing to run.');
 			return;
@@ -315,7 +327,7 @@ export const RunSurface: React.FC<IRunSurfaceProps> = ({ endpoint, mode, loadReq
 			}
 		}
 		void runner.runTargets(targets, { fromEditor });
-	}, [mode, runner, announce]);
+	}, [mode, runner, announce, blocked]);
 
 	// Run reads the buffer, the selection and the caret from the LIVE editor in one call. The `text` state is a copy that
 	// lags a render behind fast typing; a caret taken from the editor against that copy points past its end and the run
@@ -345,7 +357,6 @@ export const RunSurface: React.FC<IRunSurfaceProps> = ({ endpoint, mode, loadReq
 	const metaText = result ? rowsMeta(result, displayed?.ms) : '';
 	const truncation = result ? truncationText(result) : null;
 	const willRun = describeSnapshot(view ?? { text, start: 0, end: 0, caret: 0 });
-	const blocked = !isConnected || !client ? 'The shell is not connected to the engine.' : null;
 	const strip = runner.runs.length > 1;
 
 	const menu: ViewMenu = useMemo(() => ({
@@ -442,6 +453,10 @@ export const RunSurface: React.FC<IRunSurfaceProps> = ({ endpoint, mode, loadReq
 					onConfirm={() => {
 						const targets = confirm.targets;
 						setConfirm(null);
+						if (blocked !== null) {
+							announce(`Nothing was sent. ${blocked}`);
+							return;
+						}
 						void runner.runTargets(targets, { fromEditor: true });
 					}}
 					onCancel={() => {

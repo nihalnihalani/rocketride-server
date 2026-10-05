@@ -10,7 +10,9 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import type { IExplorerEndpoint, IProbeResult } from 'shared/explorer';
-import { connectionView, emptyState, ownerText } from '../src/graph/connections';
+import { fakeWorld, manualClock, row } from 'shared/explorer/connect/testing';
+import { makeGraphEndpointStore } from '../src/adapters/explorer';
+import { RECHECKING_TEXT, connectionView, emptyState, ownerText, surfaceGate } from '../src/graph/connections';
 import { fixture } from './support/builders';
 
 function endpoint(over: Partial<IExplorerEndpoint> = {}): IExplorerEndpoint {
@@ -98,4 +100,60 @@ test('a node that advertises read_query is not badged as needing an upgrade, and
 	assert.equal(current.badge.label, 'Running');
 	assert.equal(current.openable, true);
 	assert.equal(connectionView(endpoint(), { ok: true, info: { dialect: 'neo4j', capabilities: { read_query: false } }, dialect: 'neo4j' }).badge.label, 'Needs upgrade');
+});
+
+// -----------------------------------------------------------------------------
+// GX-FE-01: a re-probe must not take an open workbench away
+// -----------------------------------------------------------------------------
+
+test('an open workbench stays on screen while its connection is checked again (a restart elsewhere, a reconnect, Test connection), and running pauses until it answers', async () => {
+	const dialect = fixture<Record<string, unknown>>('dialect_neo4j');
+	let hold = false;
+	let release: () => void = () => undefined;
+	const world = fakeWorld([row({ pipeline: { project_id: 'proj-g', name: 'Graph pipeline', components: [{ id: 'graph_1', provider: 'graph_neo4j', name: 'Graph' }] } })], (call) => {
+		if (call.tool === 'dialect') return hold ? new Promise((resolve) => { release = () => resolve(dialect); }) : dialect;
+		return {};
+	});
+	const clock = manualClock();
+	const store = makeGraphEndpointStore({ clock });
+	await store.refresh(world.client);
+	await clock.settle();
+	const gate = (opened: boolean) => {
+		const s = store.getState();
+		const e = s.endpoints[0];
+		return surfaceGate(connectionView(e, s.probes[e.key]), opened);
+	};
+	assert.deepEqual(gate(false), { mounted: true, paused: null }, 'a ready connection opens');
+
+	// Any task restart (from ANY pipeline) and every shell reconnect ask for refresh({ reprobe: true }).
+	hold = true;
+	const reprobe = store.refresh(world.client, { reprobe: true });
+	await clock.settle();
+	assert.equal(store.getState().endpoints[0].state, 'probing', 'the store really is re-checking');
+	const during = gate(true);
+	assert.equal(during.mounted, true, 'the editor, results, graph and inspector stay mounted');
+	assert.equal(during.paused, RECHECKING_TEXT, 'running pauses, and says why');
+	assert.deepEqual(gate(false), { mounted: false, paused: null }, 'a document that never opened keeps its empty state');
+	release();
+	await reprobe;
+	await clock.settle();
+	assert.deepEqual(gate(true), { mounted: true, paused: null }, 'running resumes once the node answers');
+
+	// The drawer's Test connection does the same.
+	const test = store.probe(world.client, store.getState().endpoints[0].key);
+	await clock.settle();
+	assert.equal(gate(true).mounted, true);
+	assert.equal(gate(true).paused, RECHECKING_TEXT);
+	release();
+	await test;
+	assert.deepEqual(gate(true), { mounted: true, paused: null });
+});
+
+test('a stopped or blocked connection keeps an open surface but pauses it with the card\'s reason', () => {
+	const stopped = surfaceGate(connectionView(endpoint({ state: 'stopped', running: false }), undefined), true);
+	assert.equal(stopped.mounted, true);
+	assert.match(stopped.paused ?? '', /stopped/);
+	const upgrade = surfaceGate(connectionView(endpoint(), probeOf('old_node')), true);
+	assert.equal(upgrade.mounted, true);
+	assert.match(upgrade.paused ?? '', /needs an upgrade/);
 });

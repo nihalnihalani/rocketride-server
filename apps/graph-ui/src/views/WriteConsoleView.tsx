@@ -41,7 +41,7 @@ import type { IExplorerEndpoint } from 'shared/explorer';
 import { announcer } from '../adapters/explorer';
 import { useGraphEndpoints } from '../adapters/react';
 import { CONNECTIONS_URI } from '../graph/addresses';
-import { connectionView } from '../graph/connections';
+import { connectionView, surfaceGate } from '../graph/connections';
 import { canWrite, engineText, parseDialect, targetText } from '../graph/dialect';
 import { TEXT_CHECK_SENTENCE } from '../graph/writeConfirm';
 import { getDocs } from '../docs';
@@ -78,6 +78,12 @@ export const WriteConsoleView: React.FC<IWriteConsoleViewProps> = ({ endpoint })
 	const dialect = useMemo(() => (probe?.ok ? parseDialect(probe.info) : null), [probe]);
 	const view = connectionView(endpoint, probe);
 	const allowed = canWrite(dialect) && endpoint.state === 'ready';
+	// A console that has been on screen stays through a re-probe (see surfaceGate): Execute pauses instead of the
+	// console unmounting in the middle of a batch.
+	const opened = useRef(false);
+	if (allowed) opened.current = true;
+	const unavailable = endpoint.state !== 'ready' ? view.blocked : dialect === null ? null : writeUnavailableText(dialect.allowExecute === true, dialect.capabilities.execute_shape_graph === true);
+	const gate = surfaceGate({ openable: allowed, blocked: allowed ? null : unavailable }, opened.current);
 
 	const [historyOpen, setHistoryOpen] = useState(false);
 	const [loadRequest, setLoadRequest] = useState<NonNullable<IRunSurfaceProps['loadRequest']>>({ text: '', seq: 0, run: false });
@@ -92,13 +98,13 @@ export const WriteConsoleView: React.FC<IWriteConsoleViewProps> = ({ endpoint })
 	return (
 		<div style={styles.root}>
 			<ContentHeader title={`${view.title} \u2014 write console`} subtitle={subtitle} />
-			{allowed ? (
+			{gate.mounted ? (
 				<>
 					<div style={{ padding: '8px 24px 0' }}>
 						<Banner variant="warning">{WRITE_CONSOLE_BANNER}</Banner>
 					</div>
 					<div style={{ flex: 1, minHeight: 0 }}>
-						<RunSurface endpoint={endpoint} mode="write" loadRequest={loadRequest} onOpenHistory={() => setHistoryOpen(true)} />
+						<RunSurface endpoint={endpoint} mode="write" paused={gate.paused} loadRequest={loadRequest} onOpenHistory={() => setHistoryOpen(true)} />
 					</div>
 				</>
 			) : (

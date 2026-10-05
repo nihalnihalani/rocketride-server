@@ -514,3 +514,37 @@ test('dispose ends what is in flight but leaves subscriptions alone, and the ses
 	session.focus('a');
 	assert.equal(heard, before + 1, 'an explicit unsubscribe still works');
 });
+
+// -----------------------------------------------------------------------------
+// GX-FE-01: while the connection is checked again, the drawing stays and nothing is sent
+// -----------------------------------------------------------------------------
+
+test('a paused session keeps its drawing and sends nothing for Expand, Connect, Find path or Refresh, and says why', async () => {
+	let why: string | null = 'Checking this connection again.';
+	const log = { recipes: [] as IRecipe[] };
+	const session = createGraphSession({
+		engine: () => NEO,
+		invoke: async (recipe) => {
+			log.recipes.push(recipe);
+			return envelope([[node('a', ['P']), rel('r2', 'T', 'a', 'c'), node('c', ['P'])]]);
+		},
+		describe: (error) => notice(String(error)),
+		announce: () => undefined,
+		captionChoice: () => undefined,
+		paused: () => why,
+	});
+	session.load(base());
+	session.toggleSelect('a');
+	session.toggleSelect('b');
+	session.inspect({ kind: 'node', id: 'a' });
+	await session.expand('a');
+	await session.connect();
+	await session.findPath();
+	await session.refreshInspected();
+	assert.equal(log.recipes.length, 0);
+	assert.deepEqual([...session.getState().model.nodes.keys()], ['a', 'b'], 'the drawing is kept');
+	assert.equal(session.getState().notice?.text, 'Nothing was sent. Checking this connection again.');
+	why = null;
+	await session.expand('a');
+	assert.equal(log.recipes.length, 1, 'it sends again once the connection answers');
+});
