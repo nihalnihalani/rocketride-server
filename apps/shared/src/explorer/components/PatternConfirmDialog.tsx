@@ -29,15 +29,39 @@
 // "This is a text check, not a database safeguard." is part of the dialog and
 // is not configurable. What the dialog says it DOES afterwards is the app's
 // (SQL commits on its own; Graph does not claim atomicity).
+//
+// The SAFE answer is the default one. The dialog opens right after a Run
+// keystroke, and the shell's ConfirmDialog focuses its confirm button, so a
+// second Enter would send the flagged statement. This dialog moves focus to
+// Cancel once it is open (its effect runs after the shell dialog's own).
 // =============================================================================
 
-import React from 'react';
+import React, { useEffect, useRef } from 'react';
 import type { CSSProperties } from 'react';
 import { ConfirmDialog } from 'shell';
 import type { PatternAnswer } from '../runner/types';
 
 /** The sentence every confirmation carries, word for word. */
 export const TEXT_CHECK_SENTENCE = 'This is a text check, not a database safeguard.';
+
+/** The dismiss button's label, which is also how its button is found for focus. */
+export const PATTERN_CANCEL_LABEL = 'Cancel';
+
+/**
+ * Focus the Cancel button of the dialog that contains `anchor`.
+ *
+ * @param anchor - An element inside the dialog (null before it is mounted).
+ * @param label - The Cancel button's label.
+ * @returns True when a Cancel button was found and focused.
+ */
+export function focusCancelIn(anchor: Element | null, label: string = PATTERN_CANCEL_LABEL): boolean {
+	const dialog = anchor?.closest('[role="dialog"]');
+	if (!dialog) return false;
+	const cancel = Array.from(dialog.querySelectorAll('button')).find((button) => button.textContent?.trim() === label);
+	if (!cancel) return false;
+	cancel.focus();
+	return true;
+}
 
 /** Props for the {@link PatternConfirmDialog} component. */
 export interface IPatternConfirmDialogProps {
@@ -79,17 +103,24 @@ const styles = {
  * @returns The dialog element.
  */
 export function PatternConfirmDialog({ kind, excerpt, consequence, title = 'Run this statement?', confirmLabel = 'Run statement', secondaryLabel = 'Run and stop asking on this connection', onAnswer }: IPatternConfirmDialogProps): React.ReactElement {
+	// Anchors the focus move: an element inside the dialog the shell renders.
+	const anchorRef = useRef<HTMLDivElement>(null);
+	useEffect(() => {
+		focusCancelIn(anchorRef.current);
+	}, []);
+
 	return (
 		<ConfirmDialog
 			title={title}
 			destructive
 			message={
-				<>
+				<div ref={anchorRef}>
 					<div>{`Pattern check: ${kind} detected. ${TEXT_CHECK_SENTENCE}`}</div>
 					<pre style={styles.excerpt}>{excerpt}</pre>
 					<div>{consequence}</div>
-				</>
+				</div>
 			}
+			cancelLabel={PATTERN_CANCEL_LABEL}
 			confirmLabel={confirmLabel}
 			secondaryLabel={secondaryLabel}
 			onConfirm={() => onAnswer('run')}
