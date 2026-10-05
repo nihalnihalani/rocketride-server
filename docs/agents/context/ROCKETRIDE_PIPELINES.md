@@ -669,10 +669,11 @@ good Cypher); `graph_neo4j` defaults `database: "neo4j"`; `rocketride_graph` (bu
 no external server. Their classType also includes `tool`, so an agent can control a graph
 store as a tool instead. An agent wired that way sees every graph tool in its catalog:
 `get_data` / `get_query` (natural language; need the `llm`), `read_query` (Cypher the agent
-writes; read-only; up to 1,000 rows by default, capped by the node's row limit: `max_rows`,
-250 by default on `graph_falkordb`; pass a smaller `limit`), `get_schema` (the cached schema
-snapshot) / `refresh_schema` (re-reads the schema from the database on every call; prefer
-`get_schema`), `dialect`, and `execute` (refused unless `allow_execute` is on).
+writes; read-only; up to 1,000 rows by default, capped by the node's row cap: `max_rows` on
+`graph_falkordb` (250 by default) and on `rocketride_graph` (1,000 by default), the execute
+row cap on `graph_neo4j`, never above 25,000; pass a smaller `limit`), `get_schema` (the
+cached schema snapshot) / `refresh_schema` (re-reads the schema from the database on every
+call; prefer `get_schema`), `dialect`, and `execute` (refused unless `allow_execute` is on).
 
 For direct tool use without questions, wire the graph node to a `tools` source and call its
 tools through `client.tool()`: `read_query` (Cypher you write, read-only on every engine,
