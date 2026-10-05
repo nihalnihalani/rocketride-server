@@ -272,12 +272,42 @@ class TestLifecycle:
         )
         assert "SELECT create_graph('rr_graph_missing')" in text
 
+    def test_node_configuration_cannot_choose_the_database(self, rr_env, age_graph):
+        """The DSN comes from the task's tenant only; connection-shaped config keys are ignored."""
+        unreachable = 'postgresql://victim:victim@unreachable.invalid:5432/victim_db?sslmode=disable'
+        glb = _begin(
+            rr_env,
+            {
+                'dsn': unreachable,
+                'url': unreachable,
+                'host': 'unreachable.invalid',
+                'port': 1,
+                'user': 'victim',
+                'password': 'victim',
+                'database': 'victim_db',
+                'tenant_id': 'victim-org',
+                'org_id': 'victim-org',
+                'client_id': 'victim-user',
+            },
+        )
+        try:
+            assert glb.database_name == _dsn_database(TEST_DSN)
+            assert glb._run_query('MATCH (p:Person) RETURN count(p) AS c') == [{'c': 3}]
+        finally:
+            glb.endGlobal()
+
     def test_probe_names_the_organization_database(self, rr_env, age_graph):
         glb = rr_env.iglobal_cls()
         glb._probe_connection({'graph': 'rr_graph_missing'})
         assert rr_env.warnings == [
             "AGE graph 'rr_graph_missing' does not exist in your organization's RocketRide database"
         ]
+
+
+def _dsn_database(dsn: str) -> str:
+    from urllib.parse import urlsplit
+
+    return urlsplit(dsn).path.lstrip('/')
 
 
 def _bad_password_dsn() -> str:
