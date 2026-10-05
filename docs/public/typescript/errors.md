@@ -16,7 +16,7 @@ What the SDK throws, when, and how to catch it.
 | Data-pipe errors (open / write / close) | `PipeException` |
 | A login superseded, logged out, or detached mid-flight | `LoginAttemptCancelledError` |
 | A command the server rejects, through `call()`: `tool()`, `use()`, `getService()`, `getTasks()`, `getTaskToken()`, `getTaskPipeline()` and the other methods that do not re-wrap errors | `DAPException` (an `Error`; `code` set when the server sent one) |
-| Argument errors (such as `getService('')`), and server rejections in methods that re-wrap them: `terminate()`, `restart()`, `getTaskStatus()`, `validate()`, `ping()`, the deprecated `setEvents()`, and `fsRead()` / `fsReadMany()` (which bypass `call()`) | plain `Error` (no `code`) |
+| Argument errors (such as `getService('')`), and server rejections in methods that re-wrap them: `terminate()`, `restart()`, `getTaskStatus()`, `validate()`, `ping()`, the deprecated `setEvents()`, and `fsRead()` / `fsReadMany()` (which bypass `call()`); `use()` when the server returns no task token | plain `Error` (no `code`) |
 | `sendFiles` with a non-positive `maxConcurrent` | `RangeError` |
 | `Answer.getJson()` on non-JSON content | throws |
 

@@ -1176,7 +1176,7 @@ const tree = await client.cprofileReportTree(token);    // call tree
 
 ## 18. Exceptions
 
-The SDK exports a typed exception hierarchy so you can catch errors at the right level of specificity. All extend the base `DAPException`, which carries the raw server response on a `dapResult: Record<string, unknown>` property and the server's machine-readable error code on `code?: string` (unset when the server sent none). All are importable from the package root.
+The SDK exports a typed exception hierarchy so you can catch errors at the right level of specificity. All of them except `LoginAttemptCancelledError` extend the base `DAPException`, which carries the raw server response on a `dapResult: Record<string, unknown>` property and the server's machine-readable error code on `code?: string` (unset when the server sent none). All are importable from the package root.
 
 ```
 DAPException                      // base — wraps any DAP error response (.dapResult, .code); thrown by call()
@@ -1195,10 +1195,10 @@ LoginAttemptCancelledError        // extends Error directly — control flow, no
 - `AuthenticationException`: thrown by `login()` (and therefore `connect()`) on auth failure. In persist mode the client does **not** retry after an auth failure — fix credentials and reconnect.
 - `ConnectionException`: `attach()`/`connect()` transport failures; also delivered to the `onConnectError` constructor callback (whose argument is typed `ConnectionException`).
 - `PipeException`: `DataPipe.open()/write()/close()` (and therefore `send()`, `sendFiles()`, `chat()`) on server-reported pipe failures.
-- `DAPException` (the base class itself, not a `RocketRideException`): `call()` and the methods that pass its failure through — `tool()`, `use()`, `getService()`, `getTasks()`, `getTaskToken()`, `getTaskPipeline()` and the other typed methods not listed below — when the server rejects the command. `message` is the server's message and `code` its code when it sent one. Task failures carry `TASK_NOT_REGISTERED`, `TASK_AMBIGUOUS`, `TASK_COMPLETED` or `TASK_STOPPED` (the task is stopped, or is terminating during a restart, so the request was never sent). **Classify on `err.code`, never on the message text.** These methods re-wrap the failure and throw a plain `Error` with no `code`: `terminate()`, `restart()`, `getTaskStatus()`, `validate()`, `ping()` and the deprecated `setEvents()`. So do `fsRead()` and `fsReadMany()`, which bypass `call()`, a pipe-level `DataPipe.tool()`, and client-side argument checks.
+- `DAPException` (the base class itself, not a `RocketRideException`): `call()` and the methods that pass its failure through — `tool()`, `use()`, `getService()`, `getTasks()`, `getTaskToken()`, `getTaskPipeline()` and the other typed methods not listed below — when the server rejects the command. `message` is the server's message and `code` its code when it sent one. Task failures carry `TASK_NOT_REGISTERED`, `TASK_AMBIGUOUS`, `TASK_COMPLETED` or `TASK_STOPPED` (the task is stopped, or is terminating during a restart, so the request was never sent). **Classify on `err.code`, never on the message text.** These methods re-wrap the failure and throw a plain `Error` with no `code`: `terminate()`, `restart()`, `getTaskStatus()`, `validate()`, `ping()` and the deprecated `setEvents()`. So do `fsRead()` and `fsReadMany()`, which bypass `call()`, a pipe-level `DataPipe.tool()`, client-side argument checks, and `use()` when the server accepts the start but returns no task token.
 - `LoginAttemptCancelledError`: a `login()`/`connect()` superseded by newer intent (`reason`: `'superseded' | 'logout' | 'detached'`) — treat as control flow, not an error condition.
 
-Catch the most specific type first, then fall back to a broader one. Every class above is a `DAPException`, so test the subclasses before the base:
+Catch the most specific type first, then fall back to a broader one. Every class in the tree except `LoginAttemptCancelledError` is a `DAPException`, so test the subclasses before the base:
 
 ```typescript
 try {

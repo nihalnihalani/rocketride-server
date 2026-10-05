@@ -102,6 +102,6 @@ except CommandException as e:
 
 `ConnectionException`, `ExecutionException`, and `ValidationException` exist in
 `rocketride.core.exceptions` but the SDK does not currently raise them: transport
-failures surface as the builtin `ConnectionError`, and pipeline start and
-validation failures as the built-ins in the table above. Don't write handlers
-that rely on them.
+failures surface as the builtin `ConnectionError`, a rejected pipeline start as
+`CommandException`, and `validate()` failures as a plain `RuntimeError` (see the
+table above). Don't write handlers that rely on them.
