@@ -57,13 +57,13 @@ import { createGraphSession } from '../graph/graphSession';
 import type { IGraphSession } from '../graph/graphSession';
 import { confirmationParagraphs, describeWrites } from '../graph/writeConfirm';
 import type { IWriteConfirmation } from '../graph/writeConfirm';
-import { GRAPH_BATCH_WORDS, prepareStatement, refuseNonReads, toHistoryEntry } from '../graph/runConfig';
+import { GRAPH_BATCH_WORDS, historySummaryOf, limitPatch, prepareStatement, refuseNonReads, settleRun, toHistoryEntry } from '../graph/runConfig';
 import { chooseTab, summarizeResult } from '../graph/results';
 import type { ResultTab } from '../graph/results';
 import type { ILoadSlot } from '../graph/loadSlot';
 import { inspectorTextOfRow } from '../graph/rowInspect';
 import type { ReadQueryResult } from '../graph/types';
-import { STOP_WAITING_NOTE, resultAnnouncement, rowsMeta, truncationText } from '../graph/wording';
+import { STOP_WAITING_NOTE, num, resultAnnouncement, resultMeta, truncationText } from '../graph/wording';
 import { GraphView } from './GraphView';
 import InspectorPanel from './InspectorPanel';
 import QueryEditor from './QueryEditor';
@@ -213,7 +213,7 @@ export const RunSurface: React.FC<IRunSurfaceProps> = ({ endpoint, mode, paused 
 		refuse: mode === 'read' ? (runs) => refuseNonReads(runs.map((r) => prepareStatement(r.cypher, limitChoice, dialect)), writable) : undefined,
 		prepare: (run) => {
 			const p = prepareStatement(run.cypher, limitChoice, dialect);
-			return { send: { cypher: p.cypher, limit: p.limit }, patch: { limitApplied: p.limit, limitState: 'node' } };
+			return { send: { cypher: p.cypher, limit: p.limit }, patch: limitPatch(mode, p.limit) };
 		},
 		execute: async (_run, send, ticket) => {
 			if (!session) throw new ExplorerToolError({ kind: 'unavailable', tool: mode === 'read' ? TOOL.readQuery : TOOL.execute, message: 'This connection is not available.' });
@@ -222,7 +222,7 @@ export const RunSurface: React.FC<IRunSurfaceProps> = ({ endpoint, mode, paused 
 				// Counted here, in the call, so a write that lands after this console closed still marks drawn graphs out of date.
 				: countWrite(dataVersions, endpoint.key, () => session.invoke<ReadQueryResult>(TOOL.execute, { query: send.cypher, shape: 'graph' }, { generation: ticket }));
 		},
-		settle: (_run, result) => ({ outcome: 'rows', rowCount: result.rows.length, result }),
+		settle: (_run, result) => settleRun(mode, result),
 		describeFailure: (message, error) => {
 			const notice = mode === 'write' ? describeWriteFailure(message, error) : describeFailureOf(message, error, writable);
 			failureNotes.current = notice;
@@ -233,13 +233,13 @@ export const RunSurface: React.FC<IRunSurfaceProps> = ({ endpoint, mode, paused 
 			// A write is counted where it is sent (countWrite); one the user stopped waiting for may still complete, so it
 			// makes every graph drawn from this connection out of date now, in every document.
 			if (isAbandonedWrite(mode, run.outcome)) dataVersions.bump(endpoint.key);
-			const outcome = run.outcome === 'rows' || run.outcome === 'abandoned' ? run.outcome : 'error';
-			graphHistory.runs.emitRun(endpoint.key, toHistoryEntry({ cypher: run.cypher, at: Math.round(Date.now() - (run.ms ?? 0)), ms: Math.round(run.ms ?? 0), outcome, ...(run.outcome === 'rows' ? { rows: run.result?.rows.length ?? 0 } : {}), ...(run.limitApplied != null ? { limit: run.limitApplied } : {}), ...(run.error !== undefined ? { error: run.error } : {}), kind: run.verb }, entryId()));
+			graphHistory.runs.emitRun(endpoint.key, toHistoryEntry(historySummaryOf(run, Date.now()), entryId()));
 		},
 		summarize: ({ shown, runs }) => {
 			if (shown?.result) {
 				const s = summarizeResult(shown.result);
-				return runs.length > 1 ? `${formatBatchOutcome(runs, GRAPH_BATCH_WORDS)}. ${resultAnnouncement(shown.result.rows.length, s.nodeCount, s.relationshipCount, truncationText(shown.result))}` : resultAnnouncement(shown.result.rows.length, s.nodeCount, s.relationshipCount, truncationText(shown.result));
+				const said = `${shown.outcome === 'affected' ? `${num(shown.affected ?? 0)} affected. ` : ''}${resultAnnouncement(shown.result.rows.length, s.nodeCount, s.relationshipCount, truncationText(shown.result))}`;
+				return runs.length > 1 ? `${formatBatchOutcome(runs, GRAPH_BATCH_WORDS)}. ${said}` : said;
 			}
 			return null;
 		},
@@ -359,7 +359,7 @@ export const RunSurface: React.FC<IRunSurfaceProps> = ({ endpoint, mode, paused 
 	const rowView = result && openRow !== null && result.rows[openRow] ? inspectorTextOfRow(result.columns, result.rows[openRow]) : null;
 
 	// ── Meta line ────────────────────────────────────────────────────────────
-	const metaText = result ? rowsMeta(result, displayed?.ms) : '';
+	const metaText = result ? resultMeta(displayed, result) : '';
 	const truncation = result ? truncationText(result) : null;
 	const willRun = describeSnapshot(view ?? { text, start: 0, end: 0, caret: 0 });
 	const strip = runner.runs.length > 1;

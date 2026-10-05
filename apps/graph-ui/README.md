@@ -207,7 +207,9 @@ editor and an **Execute** button, and it always says what it is:
   they change data, with their text, and says **This is a text check, not a
   database safeguard.** There is no "do not ask again".
 - Statements go through `execute` with the graph result shape, so what a
-  statement returned is drawn like any other result.
+  statement returned is drawn like any other result. The result line, the strip
+  and History show the count the node reports as affected. There is no row-limit
+  choice here: `execute` returns at most the node's own maximum.
 - Each statement is its own request. A batch stops at the first error; statements
   that ran are not undone. The strip says how many ran and how many were not run.
 - A write is never sent again by the app: no automatic retry.

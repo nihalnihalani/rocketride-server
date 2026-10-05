@@ -4,12 +4,17 @@
 // =============================================================================
 
 // =============================================================================
-// RUN SURFACE HELPERS: the editor request mailbox
+// RUN SURFACE HELPERS: the editor request mailbox, and how a run settles in each mode
 // =============================================================================
 
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import { entrySummary } from '../src/components/HistoryPanel';
 import { createLoadSlot } from '../src/graph/loadSlot';
+import { historySummaryOf, limitPatch, settleRun, toHistoryEntry } from '../src/graph/runConfig';
+import type { GraphValue, ReadQueryResult } from '../src/graph/types';
+import { resultMeta } from '../src/graph/wording';
+import { node } from './support/builders';
 
 // GX-FE-03: the request was kept in the host's state and the surface de-duplicated it with a ref that starts at 0 on
 // every mount, so any remount replayed it: the editor text and its saved draft were overwritten, and a preview
@@ -32,4 +37,41 @@ test('a newer request replaces one not yet taken, and every put has a new sequen
 	assert.equal(slot.take(), null);
 	assert.equal(slot.put({ text: 'again', run: false }), 3);
 	assert.deepEqual(slot.take(), { text: 'again', run: false });
+});
+
+// -----------------------------------------------------------------------------
+// GX-FE-06: the write console reports what execute said, and no row limit it never sent
+// -----------------------------------------------------------------------------
+
+const answer = (rows: GraphValue[][], extra: Partial<ReadQueryResult> = {}): ReadQueryResult => ({ columns: rows[0]?.map((_, i) => `c${i}`) ?? [], rows, row_limit: 25000, truncated: false, truncated_by: null, element_limit: 10000, elements: 0, value_limit: 500000, values: 0, ...extra });
+
+test('the write console settles a statement with the affected count execute returned, and keeps its rows for the graph', () => {
+	const created = answer([], { affected_rows: 3 });
+	assert.deepEqual(settleRun('write', created), { outcome: 'affected', rowCount: 0, affected: 3, result: created });
+	const returned = answer([[node('n1', ['X'])]], { affected_rows: 1 });
+	assert.deepEqual(settleRun('write', returned), { outcome: 'affected', rowCount: 1, affected: 1, result: returned });
+	assert.deepEqual(settleRun('read', returned), { outcome: 'rows', rowCount: 1, result: returned }, 'a read is rows');
+	assert.equal(settleRun('write', answer([])).outcome, 'rows', 'an answer without the count is not shown as "0 affected"');
+});
+
+test('the write console records no row limit: execute takes none, so none was sent', () => {
+	assert.deepEqual(limitPatch('write', 1000), { limitApplied: null });
+	assert.deepEqual(limitPatch('read', 1000), { limitApplied: 1000, limitState: 'node' });
+});
+
+test('history keeps a write\'s affected count without a limit, and a read\'s rows with its limit', () => {
+	const write = historySummaryOf({ cypher: 'CREATE (:X)', verb: 'CREATE', outcome: 'affected', affected: 1, ms: 12.4, limitApplied: null }, 1_000);
+	assert.deepEqual(write, { cypher: 'CREATE (:X)', at: 988, ms: 12, outcome: 'affected', affected: 1, kind: 'CREATE' });
+	assert.equal(entrySummary(toHistoryEntry(write, 'w')), '1 affected');
+	const read = historySummaryOf({ cypher: 'MATCH (n) RETURN n', verb: 'MATCH', outcome: 'rows', result: answer([[1], [2]]), ms: 5, limitApplied: 1000 }, 1_000);
+	assert.deepEqual(read, { cypher: 'MATCH (n) RETURN n', at: 995, ms: 5, outcome: 'rows', rows: 2, limit: 1000, kind: 'MATCH' });
+	assert.equal(entrySummary(toHistoryEntry(read, 'r')), '2 rows (limit 1,000)');
+	const failed = historySummaryOf({ cypher: 'X', verb: 'X', outcome: 'error', error: 'boom', ms: 1, limitApplied: null }, 1_000);
+	assert.equal(failed.outcome, 'error');
+	assert.equal(failed.error, 'boom');
+});
+
+test('the result line of a write leads with the affected count', () => {
+	assert.equal(resultMeta({ outcome: 'affected', affected: 3, ms: 400 }, answer([])), '3 affected · 0 rows returned (limit 25,000) · 0.4 s round trip');
+	assert.equal(resultMeta({ outcome: 'rows', ms: 400 }, answer([[1]], { row_limit: 1000 })), '1 row returned (limit 1,000) · 0.4 s round trip');
 });

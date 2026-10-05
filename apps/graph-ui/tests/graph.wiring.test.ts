@@ -112,3 +112,12 @@ test('the write console counts a write where it is sent, not in the record step 
 	assert.ok(!/mayHaveChangedData/.test(surface));
 	assert.ok(/describeWriteFailure\(message, error\)/.test(surface), 'the write console words its failures as possibly applied');
 });
+
+// GX-FE-06: every run settled as 'rows' with the read toggle's limit, in both modes.
+test('the run surface settles, records and describes a run through the mode-aware helpers', () => {
+	const surface = code(read('components', 'RunSurface.tsx'));
+	assert.ok(/settle: \(_run, result\) => settleRun\(mode, result\)/.test(surface), 'settle follows the mode');
+	assert.ok(/patch: limitPatch\(mode, p\.limit\)/.test(surface), 'a limit is recorded only where one is sent');
+	assert.ok(/historySummaryOf\(run, Date\.now\(\)\)/.test(surface), 'history keeps an affected count');
+	assert.ok(/resultMeta\(displayed/.test(surface), 'the result line shows the affected count');
+});
