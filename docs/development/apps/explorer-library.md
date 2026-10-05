@@ -84,7 +84,10 @@ open. Deployments, other owners and projectless pipelines get `null`.
 
 `projectId` is `''` when a pipeline carries no `project_id` (the server mints one
 it never reports). Two such pipelines with the same owner, run kind, source and
-node id collide on their key; real `.pipe` files carry a `project_id`.
+node id collide on their key. A `.pipe` file saved in a VS Code workspace gets a
+`project_id`; the Graph Explorer templates ship without one and get it on
+import, so two copies of one template posted raw through an SDK collide and
+show as one card.
 
 ## Endpoint states
 
@@ -153,7 +156,7 @@ Failure depends on the **tool**, so each tool gets a `ResultCheck`
 
 | Tool shape | Failure arrives as | Check |
 |---|---|---|
-| `execute`, `read_query` | the call rejects; the envelope is validated | `checkRowEnvelope` (positional rows, `row_limit`, `truncated`, additive metadata) |
+| `execute`, `read_query` | the call rejects; the envelope is validated | `checkRowEnvelope` (positional rows, `row_limit`, `truncated`, additive metadata, `truncated_by` null, `rows`, `elements` or `values`); SQL's `execute` answers with object rows and uses `checkObject` |
 | `get_data` | `{valid: false, error}` | `checkValidFlag` |
 | `get_query` | `{valid: false, error}` fails; `{valid: false, answer}` is prose and passes | `checkGetQuery` |
 | store / vector tools | `{success: false, error}` | `checkStoreSuccess` |
@@ -190,8 +193,12 @@ example from `read_query` to `execute`).
 
 A call is retried **at most once**, and only when **all** hold:
 
-1. the tool is idempotent (`idempotent: true` on its spec or the call; `execute`
-   and writes never are);
+1. the call is idempotent: `idempotent: true` on the tool's spec, or on the
+   call itself. A write never is, and `execute` is not by default; a caller may
+   mark one `execute` call idempotent for a statement it classifies as a read
+   (SQL Explorer does, for reads, table pages, row counts and plain `EXPLAIN`).
+   Such a replay is safe only because of rule 2: `TASK_STOPPED` is raised
+   before the request is dispatched, so the first attempt never ran;
 2. the failure is `raised` with `code === 'TASK_STOPPED'`, which the server
    raises from `wait_for_running` **before** the request reaches the node;
 3. bounded re-discovery (at most 15 s, inside the call's own timeout) finds the
@@ -276,7 +283,8 @@ document-URI key rule).
    announcer, an active-key store. Never import another app's instance.
 3. Describe every tool the app calls in the `tools` map: `idempotent`,
    `check`, `timeoutMs`, `capability`. Reads and reflection are idempotent;
-   `execute` is not.
+   `execute` is not (a call may still mark one statement it knows is a read,
+   see "The one retry").
 4. Mount `useEndpointStoreLifecycle(store, client, identity)` once at the app
    root, and call tools only through `store.session`.
 5. Wire the runner's hooks and the shared components; keep the language

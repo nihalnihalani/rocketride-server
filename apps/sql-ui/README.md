@@ -26,10 +26,14 @@ than from the app.
 - **Direct execution, if you want to run statements.** Each of those nodes
   has an **Allow direct query execution** setting (`allow_execute`), off by
   default and worth leaving off until a caller truly needs it. With it off,
-  schema browsing, the diagram and the Insights page still work; statements
-  do not. The first refused statement raises a banner: `This node does not
-  allow execute (allow_execute is off). Schema browsing works; statements
-  cannot run.`
+  what is read from the schema snapshot still works: the Overview, the
+  Insights page, the diagram and the sidebar's table tree. Everything that
+  reads rows does not, because every statement goes through the node's
+  `execute` tool, a plain `SELECT` included: the query editor, the table data
+  browser, **Select top 100** and **Count rows**, **Explain** and the
+  designer's foreign-key lookup. The first refused statement in the editor
+  raises a banner: `This node does not allow execute (allow_execute is off).
+  Schema browsing works; statements cannot run.`
 
 ## Connections
 
@@ -43,13 +47,19 @@ means no running task has a database node.
 
 A connection is **Checking** while the app asks the node which engine it is,
 **Running** once it answered, **Stopped** when its pipeline is no longer
-running (the card stays so an open workbench can say so), **Unreachable**
-when the node could not be reached (for example it is not wired to a tools
-source), and **No access** when you can see a team deployment but your role
-cannot call it (calling a tool needs `task.data`, seeing it only
-`task.monitor`). The list refreshes on its own when a pipeline starts, stops
-or restarts, and when you return to the window; **Refresh** does it on
-demand. Signing out, or switching organization or team, clears the list, so
+running (the card stays in the list), **Unreachable** when the node could not
+be reached (for example it is not wired to a tools source), and **No access**
+when you can see a team deployment but your role cannot call it (calling a
+tool needs `task.data`, seeing it only `task.monitor`). The workbench does
+not show a connection's state. A statement run on a **Stopped** connection is
+still sent: a pipeline that is restarting runs it once it is back, and one
+that is gone answers that it is not running. The list is read again when a
+pipeline starts, stops or restarts, and when you return to the window;
+**Refresh** does it on demand. Only running pipelines are listed, so a
+pipeline that was still starting when the list was read appears the next
+time it is read. An **Unreachable** or **No access** connection is checked
+again on **Refresh** or when its pipeline restarts, not each time the list is
+read. Signing out, or switching organization or team, clears the list, so
 one session's connections never appear in the next.
 
 The app never holds a connection string or a task token in anything it saves
@@ -133,11 +143,15 @@ surface (`begin` / `commit` / `rollback` with a session id), but SQL
 Explorer does not use it, and transaction control that quietly does nothing
 would be worse than a refusal.
 
-One statement can also arrive twice. If the pipeline task restarts while a
-statement is in flight, a statement the app classifies as a read may be
-sent once more; a write never is. The classification is by text, so a read
-that changes something — `SELECT … INTO`, a `nextval` or another
-volatile function — counts as a read here and can be re-sent.
+A statement is sent a second time in one case only. When the pipeline task
+is stopping or restarting, the engine refuses a statement with
+`TASK_STOPPED` before the statement reaches the database, so nothing has run.
+A statement the app classifies as a read is then sent once more, after the
+same connection is running again; a write never is. The classification is by
+text, so a read that changes something (`SELECT … INTO`, a `nextval` or
+another volatile function) counts as a read here; it is still never run
+twice, because the refusal comes before the database sees it. A statement
+that reached the database is never re-sent, whatever happens to its answer.
 
 ### The row limit
 
