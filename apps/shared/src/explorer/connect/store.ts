@@ -142,6 +142,13 @@ export interface IEndpointStoreOptions {
 	debounceMs?: number;
 	/** A focus-triggered refresh is skipped within this long of the last one (default 5 s). */
 	focusMinIntervalMs?: number;
+	/**
+	 * How long one discovery may take before the refresh gives up and reports
+	 * status `error` (default 30 s). Without a bound, a server that never
+	 * answers would keep the refresh, and every refresh coalesced into it,
+	 * waiting forever.
+	 */
+	discoveryTimeoutMs?: number;
 	/** Clock and timers (default: real). */
 	clock?: IStoreClock;
 }
@@ -215,6 +222,7 @@ export function createEndpointStore(options: IEndpointStoreOptions): IEndpointSt
 	const concurrency = options.concurrency ?? 4;
 	const debounceMs = options.debounceMs ?? 300;
 	const focusMinIntervalMs = options.focusMinIntervalMs ?? 5_000;
+	const discoveryTimeoutMs = options.discoveryTimeoutMs ?? 30_000;
 	const clock: IStoreClock = options.clock ?? {
 		now: () => Date.now(),
 		setTimer: (fn, ms) => setTimeout(fn, ms),
@@ -505,6 +513,27 @@ export function createEndpointStore(options: IEndpointStoreOptions): IEndpointSt
 		return toProbe;
 	}
 
+	/**
+	 * Run discovery, bounded by the discovery timeout. A late answer (or late
+	 * failure) after the timeout is dropped.
+	 *
+	 * @param client - The client.
+	 * @returns What discovery found.
+	 */
+	function boundedDiscovery(client: IExplorerClient): Promise<IDiscoveredEndpoint[]> {
+		const discovery = discoverToolEndpoints(client, { providers: options.providers, roles: options.roles, identity: identityNow, concurrency });
+		return new Promise<IDiscoveredEndpoint[]>((resolve, reject) => {
+			const timer = clock.setTimer(() => {
+				discovery.catch(() => undefined);
+				reject(new Error(`The server did not answer within ${Math.round(discoveryTimeoutMs / 1000)} s with the list of running pipelines. Refresh to try again.`));
+			}, discoveryTimeoutMs);
+			discovery.then(
+				(found) => { clock.clearTimer(timer); resolve(found); },
+				(error: unknown) => { clock.clearTimer(timer); reject(error); },
+			);
+		});
+	}
+
 	async function refresh(client: IExplorerClient, opts: { reprobe?: boolean; awaitProbes?: boolean; background?: boolean } = {}): Promise<void> {
 		if (inFlight !== null) {
 			// Coalesce: any number of triggers while one runs cause ONE follow-up,
@@ -521,7 +550,7 @@ export function createEndpointStore(options: IEndpointStoreOptions): IEndpointSt
 
 		const run = (async (): Promise<void> => {
 			try {
-				const found = await discoverToolEndpoints(client, { providers: options.providers, roles: options.roles, identity: identityNow, concurrency });
+				const found = await boundedDiscovery(client);
 				if (epochAfterReset(startedEpoch)) return;
 				const toProbe = merge(found, opts.reprobe === true, opts.background === true);
 				setState({ ...state, status: 'ready', error: null, refreshedAt: clock.now() });

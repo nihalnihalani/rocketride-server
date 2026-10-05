@@ -268,6 +268,40 @@ describe('refresh — discover once, probe each endpoint once', () => {
 		assert.equal(state.endpoints[0]!.state, 'ready');
 	});
 
+	it('gives up on a discovery that never answers, reports it, and lets the next refresh run', async () => {
+		const { store, world, clock } = make();
+		world.getTasksImpl = () => new Promise(() => undefined);
+		let settled = false;
+		void store.refresh(world.client).then(() => { settled = true; });
+		await clock.advance(29_000);
+		assert.equal(settled, false);
+		assert.equal(store.getState().status, 'loading');
+		await clock.advance(1_000);
+		assert.equal(settled, true, 'the refresh ends at the discovery timeout');
+		const state = store.getState();
+		assert.equal(state.status, 'error');
+		assert.match(state.error ?? '', /did not answer within 30 s/);
+
+		// The landing's Refresh works again, and a fresh answer lands.
+		world.getTasksImpl = undefined;
+		await store.refresh(world.client);
+		assert.equal(store.getState().status, 'ready');
+		assert.equal(store.getState().endpoints.length, 1);
+	});
+
+	it('drops a discovery answer that arrives after its timeout', async () => {
+		const { store, world, clock } = make();
+		let answerLate: ((rows: Array<Record<string, unknown>>) => void) | undefined;
+		world.getTasksImpl = () => new Promise((resolve) => { answerLate = resolve; });
+		void store.refresh(world.client);
+		await clock.advance(30_000);
+		assert.equal(store.getState().status, 'error');
+		answerLate?.(world.rows.map((r) => ({ ...r })) as unknown as Array<Record<string, unknown>>);
+		await clock.settle();
+		assert.equal(store.getState().status, 'error');
+		assert.deepEqual(store.getState().endpoints, []);
+	});
+
 	it('uses the dialect probe once per endpoint even for a custom probe function', async () => {
 		let calls = 0;
 		const { store, world } = make([row()], undefined, { probe: async () => { calls += 1; return { ok: true, info: { dialect: 'custom' }, dialect: 'custom' }; } });

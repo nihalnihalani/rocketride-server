@@ -133,7 +133,9 @@ changes; a permissions-only change does not reset. Wire it with
 `useEndpointStoreLifecycle(store, client, identity)` from `react.tsx` (task
 events, focus, reconnect, identity events through `shellBinding.ts`).
 Refresh is debounced (300 ms) for task events, rate-limited (5 s) for focus, and
-concurrent refreshes coalesce into one follow-up.
+concurrent refreshes coalesce into one follow-up. One discovery may take at most
+30 s (`discoveryTimeoutMs`); after that the refresh ends with status `error`, so
+a server that never answers cannot leave the list refreshing forever.
 
 ## Calling a tool
 
