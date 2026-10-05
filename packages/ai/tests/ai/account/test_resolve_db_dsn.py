@@ -138,14 +138,43 @@ def test_idempotent_recall_returns_same_dsn(broker):
 
 
 def test_broker_4xx_raises_runtime_error(broker):
-    with pytest.raises(RuntimeError, match='rejected provision.*404'):
+    with pytest.raises(RuntimeError, match=r'^DB broker rejected provisioning for this organization \(HTTP 404\)$'):
         _resolve('unknown-tenant')
 
 
-def test_bad_token_raises_runtime_error(broker, monkeypatch):
+def test_bad_token_is_reported_as_server_configuration_not_the_account(broker, monkeypatch):
     monkeypatch.setenv('RR_DB_BROKER_TOKEN', 'wrong')
-    with pytest.raises(RuntimeError, match='rejected provision.*401'):
+    with pytest.raises(RuntimeError) as err:
         _resolve('tenant-1')
+    message = str(err.value)
+    assert message.startswith("DB broker refused this server's credentials (HTTP 401)")
+    assert 'operator' in message and 'organization' not in message
+    assert 'wrong' not in message and TEST_TOKEN not in message
+
+
+def _http_error(code):
+    return urllib.error.HTTPError('https://broker.example/provision', code, 'x', hdrs=None, fp=io.BytesIO(b'body'))
+
+
+@pytest.mark.parametrize(
+    'code,expected',
+    [
+        (401, "DB broker refused this server's credentials (HTTP 401)"),
+        (403, "DB broker refused this server's credentials (HTTP 403)"),
+        (400, 'DB broker rejected provisioning for this organization (HTTP 400)'),
+        (404, 'DB broker rejected provisioning for this organization (HTTP 404)'),
+        (500, 'DB broker unavailable (HTTP 500)'),
+        (503, 'DB broker unavailable (HTTP 503)'),
+    ],
+)
+def test_broker_http_errors_are_classified(monkeypatch, code, expected):
+    def raise_http_error(*_args, **_kwargs):
+        raise _http_error(code)
+
+    monkeypatch.setattr(urllib.request, 'urlopen', raise_http_error)
+    with pytest.raises(RuntimeError) as err:
+        AccountBase._call_db_broker('https://broker.example/provision', TEST_TOKEN, 'tenant-1')
+    assert str(err.value).startswith(expected)
 
 
 def test_broker_http_error_response_is_closed(monkeypatch):
@@ -163,7 +192,7 @@ def test_broker_http_error_response_is_closed(monkeypatch):
 
     monkeypatch.setattr(urllib.request, 'urlopen', raise_http_error)
 
-    with pytest.raises(RuntimeError, match='rejected provision.*503'):
+    with pytest.raises(RuntimeError, match='unavailable.*503'):
         AccountBase._call_db_broker('https://broker.example/provision', TEST_TOKEN, 'tenant-1')
 
     assert response_body.closed
@@ -177,8 +206,29 @@ def test_missing_dsn_in_response_raises(broker):
 def test_unreachable_broker_raises(monkeypatch):
     monkeypatch.setenv('RR_DB_BROKER_URL', 'http://127.0.0.1:9/provision')
     monkeypatch.setenv('RR_DB_BROKER_TOKEN', TEST_TOKEN)
-    with pytest.raises(RuntimeError, match='unreachable'):
+    with pytest.raises(RuntimeError) as err:
         _resolve('tenant-1')
+    assert str(err.value) == 'DB broker unreachable (connection refused)'
+
+
+@pytest.mark.parametrize(
+    'raised,expected',
+    [
+        (urllib.error.URLError(ConnectionRefusedError(61, 'Connection refused')), 'connection refused'),
+        (urllib.error.URLError(TimeoutError('timed out')), 'timed out'),
+        (TimeoutError('timed out'), 'timed out'),
+        (urllib.error.URLError(OSError(8, 'nodename nor servname provided')), 'network error'),
+        (ValueError('unknown url type: https://user:secret@broker.example'), 'network error'),
+    ],
+)
+def test_unreachable_broker_never_echoes_the_error_text(monkeypatch, raised, expected):
+    def fail(*_args, **_kwargs):
+        raise raised
+
+    monkeypatch.setattr(urllib.request, 'urlopen', fail)
+    with pytest.raises(RuntimeError) as err:
+        AccountBase._call_db_broker('https://user:secret@broker.example/provision', TEST_TOKEN, 'tenant-1')
+    assert str(err.value) == f'DB broker unreachable ({expected})'
 
 
 def test_empty_client_id_rejected(broker):
@@ -192,8 +242,8 @@ def test_empty_client_id_rejected(broker):
 
 
 def test_http_broker_url_rejected_for_non_localhost(monkeypatch):
-    """The broker token can resolve any tenant's DSN — never send it over
-    plain http to a remote host (a deployment typo must fail loudly).
+    """The broker token is a credential — never send it over plain http to a
+    remote host (a deployment typo must fail loudly).
     """
     monkeypatch.setenv('RR_DB_BROKER_URL', 'http://broker.internal/provision')
     monkeypatch.setenv('RR_DB_BROKER_TOKEN', TEST_TOKEN)
@@ -222,6 +272,32 @@ def test_dsn_without_sslmode_gets_require_pinned(broker):
 
 def test_dsn_with_existing_sslmode_passes_through_unchanged(broker):
     assert _resolve('tenant-1') == TEST_DSN
+
+
+@pytest.mark.parametrize(
+    'dsn',
+    [
+        'postgresql://r:p@pooler.internal:5432/t?sslmode=require',
+        'postgresql://r:p@pooler.internal:5432/t?sslmode=verify-ca&sslrootcert=/etc/rr/ca.crt',
+        'postgresql://r:p@pooler.internal:5432/t?sslmode=verify-full&sslrootcert=/etc/rr/ca.crt',
+    ],
+)
+def test_broker_sslmode_that_requires_tls_passes_through(dsn):
+    """The broker decides how strictly the server is verified; verify-full reaches libpq unchanged."""
+    assert AccountBase._pin_dsn_tls(dsn) == dsn
+
+
+@pytest.mark.parametrize('mode', ['disable', 'allow', 'prefer', 'Prefer'])
+def test_broker_sslmode_without_tls_is_refused_for_a_remote_host(mode):
+    with pytest.raises(RuntimeError, match=f'sslmode={mode}'):
+        AccountBase._pin_dsn_tls(f'postgresql://r:p@pooler.internal:5432/t?sslmode={mode}')
+
+
+@pytest.mark.parametrize('host', ['localhost', '127.0.0.1', '[::1]'])
+def test_broker_sslmode_without_tls_is_allowed_on_the_loopback(host):
+    """The local development rig runs a provisioner and database without TLS."""
+    dsn = f'postgresql://r:p@{host}:55433/t?sslmode=disable'
+    assert AccountBase._pin_dsn_tls(dsn) == dsn
 
 
 def test_non_postgres_dsn_rejected(broker):
@@ -325,6 +401,72 @@ def test_account_package_refuses_to_load_with_a_legacy_name(tmp_path):
     code = f'import sys\nsys.path.insert(0, {str(src)!r})\nimport ai.account\n'
     env = {k: v for k, v in os.environ.items() if not k.startswith(('RR_DB_BROKER_', 'ROCKETRIDE_DB_BROKER_'))}
     env['ROCKETRIDE_DB_BROKER_TOKEN'] = LEGACY_SENTINEL
+    proc = subprocess.run(
+        [sys.executable, '-c', code], env=env, capture_output=True, text=True, timeout=120, cwd=tmp_path
+    )
+    assert proc.returncode != 0
+    assert 'ROCKETRIDE_DB_BROKER_TOKEN -> RR_DB_BROKER_TOKEN' in proc.stderr
+    assert LEGACY_SENTINEL not in proc.stderr + proc.stdout
+
+
+# ---------------------------------------------------------------------------
+# Legacy names in the engine's .env file: refused at startup like the process
+# environment (the web server loads that file only after ai.account imports).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize('legacy', ['ROCKETRIDE_DB_BROKER_URL', 'ROCKETRIDE_DB_BROKER_TOKEN'])
+def test_check_refuses_a_legacy_name_in_the_env_file(no_broker_env, tmp_path, legacy):
+    from ai.account.base import check_db_broker_environment
+
+    env_file = tmp_path / '.env'
+    env_file.write_text(f'ROCKETRIDE_OPENAI_KEY=sk-x\n{legacy}="{LEGACY_SENTINEL}"\n', encoding='utf-8')
+    with pytest.raises(EnvironmentError, match=f'{legacy} -> RR_DB_BROKER_') as caught:
+        check_db_broker_environment(env_file=str(env_file))
+    assert LEGACY_SENTINEL not in str(caught.value)
+
+
+def test_check_accepts_an_env_file_without_legacy_names(no_broker_env, tmp_path):
+    from ai.account.base import check_db_broker_environment
+
+    env_file = tmp_path / '.env'
+    env_file.write_text('RR_DB_BROKER_URL=https://broker.example\nROCKETRIDE_DB_BROKER_TOKEN=\n', encoding='utf-8')
+    check_db_broker_environment(env_file=str(env_file))
+    check_db_broker_environment(env_file=str(tmp_path / 'missing.env'))
+
+
+def test_engine_env_file_is_next_to_the_engine(monkeypatch, tmp_path):
+    import sys
+
+    from ai.account.base import engine_env_file
+
+    monkeypatch.setattr(sys, 'executable', str(tmp_path / 'engine'))
+    assert engine_env_file() == str(tmp_path / '.env')
+
+
+def test_account_package_refuses_to_load_with_a_legacy_name_in_the_engine_env_file(tmp_path):
+    """The startup check reads the engine's .env too (the web server loads it later)."""
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    (tmp_path / '.env').write_text(f'ROCKETRIDE_DB_BROKER_TOKEN={LEGACY_SENTINEL}\n', encoding='utf-8')
+    src = Path(__file__).resolve().parents[3] / 'src'
+    code = (
+        'import sys, types\n'
+        f'sys.path.insert(0, {str(src)!r})\n'
+        # Point the engine directory at tmp_path. Dependency installs (which also
+        # follow sys.executable) are not under test, so they become no-ops.
+        'import depends as real\n'
+        "stub = types.ModuleType('depends')\n"
+        'stub.__dict__.update(real.__dict__)\n'
+        'stub.depends = stub.load_depends = lambda *a, **k: None\n'
+        "sys.modules['depends'] = stub\n"
+        f'sys.executable = {str(tmp_path / "engine")!r}\n'
+        'import ai.account\n'
+    )
+    env = {k: v for k, v in os.environ.items() if not k.startswith(('RR_DB_BROKER_', 'ROCKETRIDE_DB_BROKER_'))}
     proc = subprocess.run(
         [sys.executable, '-c', code], env=env, capture_output=True, text=True, timeout=120, cwd=tmp_path
     )
