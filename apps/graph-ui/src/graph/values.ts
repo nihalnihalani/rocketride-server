@@ -319,6 +319,36 @@ export function valueText(value: unknown): string {
 }
 
 /**
+ * A copy of a value with the keys of every user map in it decoded (one leading `@` removed, at every depth). Tagged
+ * values, well-formed or not, keep their wire shape: a `@kind` key on the wire always means a tag, because a user key
+ * `@kind` arrives as `@@kind`.
+ *
+ * @param value - A parsed value.
+ * @param depth - Recursion guard (internal).
+ * @returns The decoded copy (null-prototype maps, so any key is kept as data).
+ */
+function decodeKeys(value: unknown, depth: number): unknown {
+	if (depth >= MAX_DEPTH) return value;
+	if (Array.isArray(value)) return value.map((item) => decodeKeys(item, depth + 1));
+	if (!isPlainObject(value) || hasKindKey(value)) return value;
+	const out: { [key: string]: unknown } = Object.create(null);
+	for (const key of Object.keys(value)) out[decodeUserKey(key)] = decodeKeys(value[key], depth + 1);
+	return out;
+}
+
+/**
+ * Full text for a value as the user wrote it, for the node inspector: as {@link valueText}, except that a list or
+ * map shows the keys of its user maps decoded, as the Table does. Copy JSON and the row inspector keep the wire form.
+ *
+ * @param value - A property value.
+ * @returns Text.
+ */
+export function decodedText(value: unknown): string {
+	if (Array.isArray(value) || (isPlainObject(value) && !hasKindKey(value))) return toJsonText(decodeKeys(value, 0), 0);
+	return valueText(value);
+}
+
+/**
  * Whether a cell value is a graph entity (node, relationship or path).
  *
  * @param value - A cell value.

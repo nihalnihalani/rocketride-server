@@ -29,9 +29,20 @@ test('the inspector shows labels, exact property values and the user\'s own key 
 	assert.equal(by.big, '9007199254740993', 'a number tag shows its exact text');
 	assert.equal(model.id, alice.id);
 	assert.ok(model.notes.includes(ID_NOTE));
-	// The user's map with @-escaped keys shows the keys as written, as compact JSON of the wire value.
-	assert.match(by.meta, /"@@kind"/);
+	// GX-CT-10: a nested user map shows its keys as the user wrote them (one leading @ removed at every level), not the
+	// escaped wire form; Copy JSON keeps the wire form.
+	assert.equal(by.meta, '{"@kind":"node","@@kind":"already","_labels":["not","metadata"],"_type":"user value","":"empty key"}');
+	assert.match(model.json, /"@@kind": "node"/, 'Copy JSON is the wire form');
 	assert.deepEqual(model.fields.map((f) => f.label).slice(0, 3), ['name', 'age', 'score'], 'wire order');
+});
+
+test('nested maps in a property, at any depth and inside lists, show decoded keys; tagged values inside them keep their shape', () => {
+	const model = inspectNode(node('1', ['P'], { '@@a': { '@@b': 1, list: [{ '@@c': true }], big: { '@kind': 'number', value: '9007199254740993' } } }), 'c');
+	assert.deepEqual(model.fields, [{ label: '@a', value: '{"@b":1,"list":[{"@c":true}],"big":{"@kind":"number","value":"9007199254740993"}}' }]);
+	const relModel = inspectRelationship(rel('r', 'T', 'a', 'b', { m: { '@@x': 'y' } }), (id) => id);
+	assert.deepEqual(relModel.fields, [{ label: 'm', value: '{"@x":"y"}' }]);
+	const odd = inspectNode(node('2', ['P'], { m: JSON.parse('{"__proto__":{"x":1}}') }), 'c');
+	assert.equal(odd.fields[0].value, '{"__proto__":{"x":1}}', 'any key is kept as data');
 });
 
 test('property keys that start with @ are shown with exactly one @ removed', () => {
