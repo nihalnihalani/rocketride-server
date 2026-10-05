@@ -173,7 +173,10 @@ For the active connection the sidebar lists its **node labels** and
 **relationship types**, each with its properties and the types observed for
 them, and a count where the node has one. A count marked *about* is the
 database's estimate. Selecting a label or type shows and runs a preview of 25
-rows in the workbench. **Refresh** asks the node to read the database again.
+rows in the workbench. **Refresh** asks the node to read the database again. A
+Refresh pressed while the schema is first being read is sent once that read
+ends; one pressed while the connection is being checked again sends nothing and
+says so.
 
 The line under the tree says how far the schema can be trusted: how long ago it
 was read, that property keys are **sampled** from a few nodes per label (so a

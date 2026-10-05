@@ -33,7 +33,9 @@
 //     proves: `unknown` evidence, never "an empty graph" (see schema.ts).
 //   - Concurrent loads for one connection COALESCE: a second request while one is
 //     running gets the same promise, so a double click does not send two
-//     `refresh_schema` calls.
+//     `refresh_schema` calls. The one exception is a REFRESH asked for while a
+//     plain load runs: that load cannot answer it (it reads the snapshot taken at
+//     pipeline start), so the refresh runs once, after it.
 //   - `clear` (a connection closed, or the identity changed) drops the snapshot
 //     and expires any load in flight, so a late answer cannot repopulate it.
 //
@@ -67,9 +69,10 @@ export interface ISchemaStore {
 	 * @param key - The connection's key.
 	 * @param fetch - Calls the node and resolves with the tool's value.
 	 * @param describe - Turns a thrown error into a notice.
+	 * @param options - `refresh`: the user asked to re-read the database (see the header).
 	 * @returns A promise that settles when the load does; never rejects.
 	 */
-	load(key: string, fetch: () => Promise<unknown>, describe: (error: unknown) => IFailureNotice): Promise<void>;
+	load(key: string, fetch: () => Promise<unknown>, describe: (error: unknown) => IFailureNotice, options?: { refresh?: boolean }): Promise<void>;
 	/** Forget one connection (or all). A load in flight for it is ignored when it lands. */
 	clear(key?: string): void;
 }
@@ -85,7 +88,9 @@ const IDLE: ISchemaEntry = { status: 'idle', view: NO_SCHEMA, failure: null, loa
  */
 export function createSchemaStore(now: () => number = () => Date.now()): ISchemaStore {
 	const entries = new Map<string, ISchemaEntry>();
-	const inFlight = new Map<string, Promise<void>>();
+	const inFlight = new Map<string, { promise: Promise<void>; refresh: boolean }>();
+	// A refresh waiting for a plain load to end, one per connection.
+	const queued = new Map<string, Promise<void>>();
 	const generations = new Map<string, number>();
 	const listeners = new Set<() => void>();
 
@@ -95,7 +100,7 @@ export function createSchemaStore(now: () => number = () => Date.now()): ISchema
 		notify();
 	};
 
-	return {
+	const store: ISchemaStore = {
 		get: (key) => entries.get(key) ?? IDLE,
 
 		subscribe(listener) {
@@ -105,9 +110,23 @@ export function createSchemaStore(now: () => number = () => Date.now()): ISchema
 			};
 		},
 
-		load(key, fetch, describe) {
+		load(key, fetch, describe, options = {}) {
+			const refresh = options.refresh === true;
 			const running = inFlight.get(key);
-			if (running) return running;
+			if (running) {
+				if (!refresh || running.refresh) return running.promise;
+				const waiting = queued.get(key);
+				if (waiting) return waiting;
+				const startedFor = generations.get(key);
+				const next = running.promise.then(() => {
+					queued.delete(key);
+					// Cleared meanwhile (identity change, connection closed): nothing to refresh any more.
+					if (generations.get(key) !== startedFor) return undefined;
+					return store.load(key, fetch, describe, { refresh: true });
+				});
+				queued.set(key, next);
+				return next;
+			}
 			const generation = (generations.get(key) ?? 0) + 1;
 			generations.set(key, generation);
 			const previous = entries.get(key) ?? IDLE;
@@ -125,7 +144,7 @@ export function createSchemaStore(now: () => number = () => Date.now()): ISchema
 			})().finally(() => {
 				if (generations.get(key) === generation) inFlight.delete(key);
 			});
-			inFlight.set(key, promise);
+			inFlight.set(key, { promise, refresh });
 			return promise;
 		},
 
@@ -134,12 +153,15 @@ export function createSchemaStore(now: () => number = () => Date.now()): ISchema
 				for (const k of generations.keys()) generations.set(k, (generations.get(k) ?? 0) + 1);
 				entries.clear();
 				inFlight.clear();
+				queued.clear();
 			} else {
 				generations.set(key, (generations.get(key) ?? 0) + 1);
 				entries.delete(key);
 				inFlight.delete(key);
+				queued.delete(key);
 			}
 			notify();
 		},
 	};
+	return store;
 }
