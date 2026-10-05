@@ -127,6 +127,10 @@ against every shipped theme, is in [docs/contrast.md](docs/contrast.md).
 | Find path | Between two selected nodes, tried at increasing depth up to 10. A node that cannot answer says so; "no path found" names the depth it searched. |
 | Show more nodes | Adds nodes the first draw left out. |
 
+The graph sends one request at a time. While Expand, Connect, Find path or an
+inspector Refresh is waiting, **Stop waiting** lets go of it: the node may still
+be working on it, and its late answer is ignored.
+
 **Relationship labels.** The type of a relationship is drawn along it when the canvas is at normal size or larger, or (at 60% zoom and above) when no more than 200 relationships are drawn. In a crowded, zoomed-out graph the labels would be unreadable and are the most expensive thing to repaint, so they are not drawn; every relationship still shows its type as a tooltip and in its accessible name ("KNOWS from Ada to Charles"), the inspector shows it, the Table lists it, and zooming in brings the labels back. All relationships are drawn into one SVG behind the nodes, so panning and zooming cost the page nothing beyond moving it.
 
 **Ids are live handles, not identities.** Every action that asks the database about a

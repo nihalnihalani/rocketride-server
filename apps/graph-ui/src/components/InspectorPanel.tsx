@@ -39,6 +39,7 @@ import type { IGraphSession, IGraphState, IInspectTarget } from '../graph/graphS
 import { STALE_ELEMENT_TEXT, STALE_RELATIONSHIP_TEXT } from '../graph/identity';
 import { inspectNode, inspectRelationship } from '../graph/inspector';
 import { relationshipsOf } from '../graph/model';
+import { STOP_WAITING_NOTE } from '../graph/wording';
 import { copyText } from './ResultViews';
 import { GraphIcon } from '../icons';
 
@@ -110,6 +111,7 @@ export const InspectorPanel: React.FC<IInspectorPanelProps> = ({ state, session,
 					{view.node && (
 						<>
 							<Button variant="ghost" disabled={state.busy !== null || state.stale || state.staleIds.has(view.node.id)} onClick={() => void session.refreshInspected()}>Refresh</Button>
+							{state.busy !== null && <Button variant="ghost" title={STOP_WAITING_NOTE} onClick={() => session.stopWaiting()}>Stop waiting</Button>}
 							<Button variant="ghost" disabled={state.busy !== null || state.stale || state.staleIds.has(view.node.id)} onClick={() => void session.expand(view.node!.id)}>Expand</Button>
 							<Button variant="ghost" onClick={() => session.dismiss(view.node!.id)}>Dismiss</Button>
 						</>

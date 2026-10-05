@@ -252,7 +252,7 @@ test('no path within the depth limit is said in budget terms; Stop waiting is ho
 	await tick();
 	assert.equal(s2.getState().busy, 'path');
 	assert.match(s2.getState().progress ?? '', /Looking for a path of 1 relationship/);
-	s2.stopPath();
+	s2.stopWaiting();
 	await running;
 	assert.equal(s2.getState().busy, null);
 	assert.match(s2.getState().notice?.text ?? '', /^Stopped waiting\. Stop waiting stops this app/);
@@ -600,4 +600,44 @@ test('a relationship marked out of date does not mark the node that has the same
 	assert.ok(s.staleRelationshipIds.has('2'), 'dismissing an unrelated node with the same id does not clear it');
 	session.dismiss('1');
 	assert.equal(session.getState().staleRelationshipIds.size, 0, 'the relationship left the canvas with its end');
+});
+
+// -----------------------------------------------------------------------------
+// GX-FE-10: "stop waiting" exists for every request the graph sends
+// -----------------------------------------------------------------------------
+
+test('Stop waiting lets go of Expand, Connect and Refresh as well as a path search: the late answer is dropped and the next action may start', async () => {
+	const starts: Array<[string, (session: ReturnType<typeof rig>['session']) => Promise<void>]> = [
+		['expand', (session) => session.expand('a')],
+		['connect', (session) => session.connect()],
+		['inspect', (session) => { session.inspect({ kind: 'node', id: 'a' }); return session.refreshInspected(); }],
+	];
+	for (const [busy, start] of starts) {
+		let release: (r: ReadQueryResult) => void = () => undefined;
+		const { session, log } = rig(NEO, () => new Promise<ReadQueryResult>((resolve) => { release = resolve; }));
+		session.load(base());
+		const pending = start(session);
+		await tick();
+		assert.equal(session.getState().busy, busy);
+		session.stopWaiting();
+		assert.equal(session.getState().busy, null, `${busy}: no longer busy`);
+		assert.match(session.getState().notice?.text ?? '', /^Stopped waiting\. Stop waiting stops this app from waiting; the query may still be running/, busy);
+		release(envelope([[node('a', ['Q'], { name: 'late' }), rel('r2', 'T', 'a', 'c'), node('c', ['P'])]]));
+		await pending;
+		const s = session.getState();
+		assert.deepEqual([...s.model.nodes.keys()], ['a', 'b'], `${busy}: the late answer was dropped`);
+		assert.equal(s.staleIds.size, 0, `${busy}: and not judged either`);
+		assert.match(s.notice?.text ?? '', /^Stopped waiting\./, `${busy}: the notice is not replaced by the late answer`);
+		const sent = log.recipes.length;
+		void session.expand('b');
+		await tick();
+		assert.equal(log.recipes.length, sent + 1, `${busy}: a new action starts`);
+	}
+});
+
+test('Stop waiting with nothing running does nothing', () => {
+	const { session } = rig();
+	session.load(base());
+	session.stopWaiting();
+	assert.equal(session.getState().notice, null);
 });

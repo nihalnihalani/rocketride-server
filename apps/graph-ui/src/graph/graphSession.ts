@@ -31,7 +31,7 @@
 // RULES IT KEEPS
 //   - One request at a time. A second action while one runs is declined with a
 //     sentence, not queued, so the canvas never shows the answer to a question the
-//     user has already moved past.
+//     user has already moved past. Stop waiting lets go of whatever runs.
 //   - Late answers are dropped. Loading a new result (or `dispose`) starts a new
 //     EPOCH; an answer that belongs to an earlier epoch is ignored, whatever it
 //     carries, so a slow expansion cannot paint over the query the user ran next.
@@ -153,8 +153,11 @@ export interface IGraphSession {
 	dismiss(id: GraphId): void;
 	connect(): Promise<void>;
 	findPath(): Promise<void>;
-	/** Stop waiting for the running path search. */
-	stopPath(): void;
+	/**
+	 * Stop waiting for whatever is running (a path search, an expansion, Connect, a refresh). The node may still be
+	 * working on it; its late answer is dropped.
+	 */
+	stopWaiting(): void;
 	/** Draw more of the result, up to the canvas maximum. */
 	showMore(): void;
 	/** A statement that can change data ran on this connection: what is drawn may no longer match. */
@@ -473,8 +476,17 @@ export function createGraphSession(deps: IGraphSessionDeps): IGraphSession {
 			}
 		},
 
-		stopPath() {
-			search?.stop();
+		stopWaiting() {
+			if (state.busy === null) return;
+			if (state.busy === 'path' && search) {
+				// The search ends at once and says so itself (see findPath, case 'stopped').
+				search.stop();
+				return;
+			}
+			// Expand, Connect and Refresh: a new epoch drops their late answer, whatever it carries.
+			epoch += 1;
+			set({ busy: null, hint: null });
+			say(`Stopped waiting. ${STOP_WAITING_NOTE}`, 'warning');
 		},
 
 		showMore() {

@@ -44,7 +44,7 @@ import type { IGraphSession, IGraphState } from '../graph/graphSession';
 import { DATA_CHANGED_TEXT } from '../graph/identity';
 import { KEY_HELP } from '../graph/keynav';
 import { legendOf } from '../graph/legend';
-import { GRID_NOTICE, canvasBudgetText } from '../graph/wording';
+import { GRID_NOTICE, STOP_WAITING_NOTE, canvasBudgetText } from '../graph/wording';
 import type { LayoutStatus } from '../canvas/useGraphLayout';
 import { GraphIcon } from '../icons';
 
@@ -157,7 +157,7 @@ export const GraphView: React.FC<IGraphViewProps> = ({ session, schemaLabels, ca
 				<Button variant="ghost" small disabled={!focused} title="Open the inspector (Enter)" onClick={() => focused && onInspect(focused.id)}>Inspect</Button>
 				<Button variant="ghost" small disabled={busy || state.stale || state.model.nodes.size < 2} title="Draw the relationships among the nodes on the canvas" onClick={() => void session.connect()}>Connect nodes</Button>
 				<Button variant="ghost" small disabled={busy || state.stale || state.selected.size !== 2} title="Select two nodes with Space, then find a path (P)" onClick={() => void session.findPath()}>Find path</Button>
-				{state.busy === 'path' && <Button variant="ghost" small onClick={() => session.stopPath()}>Stop waiting</Button>}
+				{busy && <Button variant="ghost" small title={STOP_WAITING_NOTE} onClick={() => session.stopWaiting()}>Stop waiting</Button>}
 				{hasMore && <Button variant="ghost" small onClick={() => session.showMore()}>Show more nodes</Button>}
 				<Button variant="ghost" small ariaExpanded={helpOpen} onClick={() => setHelpOpen(true)}>Keys</Button>
 				{state.progress && <span style={{ fontSize: 12, color: 'var(--rr-text-secondary)' }} role="status">{state.progress}</span>}

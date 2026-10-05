@@ -121,3 +121,12 @@ test('the run surface settles, records and describes a run through the mode-awar
 	assert.ok(/historySummaryOf\(run, Date\.now\(\)\)/.test(surface), 'history keeps an affected count');
 	assert.ok(/resultMeta\(displayed/.test(surface), 'the result line shows the affected count');
 });
+
+// GX-FE-10: the busy sentence says "stop waiting for it", but only a path search offered the control.
+test('the graph offers Stop waiting for whatever it is waiting on, in the toolbar and in the inspector', () => {
+	const view = code(read('components', 'GraphView.tsx'));
+	assert.ok(/\{busy && <Button[^>]*onClick=\{\(\) => session\.stopWaiting\(\)\}>Stop waiting<\/Button>\}/.test(view), 'the toolbar offers it whenever a request runs');
+	assert.ok(!/state\.busy === 'path' && <Button/.test(view), 'not only for a path search');
+	const inspector = code(read('components', 'InspectorPanel.tsx'));
+	assert.ok(/state\.busy !== null && <Button[^>]*onClick=\{\(\) => session\.stopWaiting\(\)\}>Stop waiting<\/Button>/.test(inspector), 'the inspector offers it beside Refresh');
+});
