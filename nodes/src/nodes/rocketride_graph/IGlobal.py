@@ -101,7 +101,7 @@ class _ConnectionLost(Exception):
 
 
 class DatabaseUnreachable(RuntimeError):
-    """Connecting to the tenant database failed (the driver's detail is in the server log)."""
+    """Connecting to the tenant database failed (the driver's detail goes to the engine's debug trace)."""
 
 
 UNREACHABLE_TEXT = 'The RocketRide cloud database could not be reached'
@@ -124,8 +124,10 @@ def _connect(dsn: str):
     """psycopg2.connect, bounded, with a connection failure reduced to a fixed message.
 
     libpq's connection errors name the pooler host, its address and port, and
-    the database role. They go to the server's debug log only; callers (users,
-    agents, the browser) get :data:`UNREACHABLE_TEXT`.
+    the database role. They are written with ``debug()`` only, which the engine
+    records when its debug trace level is enabled (``warning()`` and ``error()``
+    would put them in the job log users see); callers (users, agents, the
+    browser) get :data:`UNREACHABLE_TEXT`.
     """
     try:
         # Bounded connect so an unreachable pooler fails fast instead of
@@ -508,7 +510,7 @@ class IGlobal(GraphGlobalBase):
         if isinstance(exc, PoolClosed):
             return 'The graph node is shutting down', str(exc)
         if isinstance(exc, DatabaseUnreachable):
-            return 'Database unreachable', f'{exc}; try again shortly. The server log has the details.'
+            return 'Database unreachable', f"{exc}; try again shortly (the cause is in the engine's debug trace)."
         if isinstance(exc, pg_errors.QueryCanceled):
             return f'Query timed out after {self.statement_timeout_ms} ms', _pg_detail(exc)
         if isinstance(exc, pg_errors.ReadOnlySqlTransaction):

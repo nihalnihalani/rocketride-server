@@ -75,9 +75,10 @@ timed out after N ms", "Invalid read_query input: …", "Query result cannot
 be represented" (the statement was valid, and on execute it ran, but a value
 it returned could not be decoded), "Database unreachable" or "Query failed";
 the remaining lines are the detail. A connection failure
-never shows the database host, port or role: that detail goes to the server's
-debug log only, and callers (including the pipeline start error and the
-save-time check) see "The RocketRide cloud database could not be reached".
+never shows the database host, port or role: that detail is written to the
+engine's debug trace only (recorded when that trace level is enabled), and
+callers (including the pipeline start error and the save-time check) see "The
+RocketRide cloud database could not be reached".
 
 get_schema and refresh_schema return the legacy {labels, nodes,
 relationships} keys plus a schema block (version 2): labels and

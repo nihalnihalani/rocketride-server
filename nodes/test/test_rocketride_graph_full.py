@@ -364,6 +364,9 @@ class TestConnectionFailureText:
             assert text.startswith('Database unreachable\n')
             for detail in _internal_details():
                 assert detail not in text, detail
+            # The detail is written at the engine's debug trace level only; do not promise a log entry.
+            assert 'server log' not in text
+            assert text.endswith("try again shortly (the cause is in the engine's debug trace).")
         finally:
             glb.endGlobal()
 
