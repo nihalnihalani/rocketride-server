@@ -176,8 +176,8 @@ export const ExplainPanel: React.FC<IExplainPanelProps> = ({ endpoint, dialect, 
 		const started = Date.now();
 		try {
 			const session = getSession(client, endpoint);
-			// Plain EXPLAIN only plans, so re-running it after a token refresh
-			// cannot change anything on the database.
+			// Plain EXPLAIN only plans, so it opts in to the session's one retry
+			// (after a TASK_STOPPED refusal raised before the node saw it).
 			const { rows } = await session.execute(explainSql, { idempotent: true });
 			if (signal.cancelled) return;
 			const at = Date.now();

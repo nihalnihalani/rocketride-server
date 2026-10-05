@@ -143,18 +143,20 @@ export interface ISqlSession {
 	 * them through the driver, so nothing the user typed is ever parsed as
 	 * SQL. Reference them positionally as `$1..$n`.
 	 *
-	 * A session's cached task token goes stale whenever the owning task
-	 * restarts, and a stale token fails INDISTINGUISHABLY from a statement
-	 * the database refused. Retrying is therefore only safe when re-running
-	 * the statement is harmless: pass `idempotent` for reads, and leave it
-	 * unset for anything that writes. A non-idempotent failure surfaces as-is
-	 * — a silently re-sent INSERT is worse than an error the caller can see.
+	 * A statement is sent again in one case only: the engine refused it with
+	 * `TASK_STOPPED` (its task is stopping or restarting), which it raises
+	 * BEFORE the statement reaches the node, and re-discovery then finds the
+	 * same endpoint running again within the call's budget. Even so the retry
+	 * is opt-in: pass `idempotent` for reads, and leave it unset for anything
+	 * that writes. Any other failure, and every failure of a non-idempotent
+	 * call, surfaces as-is.
 	 *
 	 * @param sql - The statement to execute.
 	 * @param opts - Optional execution options.
 	 * @param opts.params - Positional bind values for `$1..$n`.
-	 * @param opts.idempotent - Allow ONE retry with a re-resolved task token.
-	 *                          Only for statements that are safe to re-run.
+	 * @param opts.idempotent - Allow the ONE retry after a pre-dispatch
+	 *                          `TASK_STOPPED` refusal. Only for statements the
+	 *                          caller classifies as reads.
 	 * @returns Rows and affected-row count.
 	 */
 	execute(sql: string, opts?: { params?: unknown[]; idempotent?: boolean }): Promise<ISqlExecuteResult>;
