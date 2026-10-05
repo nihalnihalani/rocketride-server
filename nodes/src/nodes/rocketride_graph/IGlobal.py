@@ -106,6 +106,19 @@ class DatabaseUnreachable(RuntimeError):
 UNREACHABLE_TEXT = 'The RocketRide cloud database could not be reached'
 
 
+class ResultDecodeError(ValueError):
+    """A result value the database returned could not be decoded (the statement itself was valid)."""
+
+
+def _decoded(raw_rows, *, ran: bool = False):
+    """Parse each agtype cell, reporting a failure as a result problem, not as invalid Cypher."""
+    for row in raw_rows:
+        try:
+            yield [parse_agtype(v) for v in row]
+        except AgeTranslationError as e:
+            raise ResultDecodeError(f'{e} (the statement itself ran)' if ran else str(e)) from e
+
+
 def _connect(dsn: str):
     """psycopg2.connect, bounded, with a connection failure reduced to a fixed message.
 
@@ -462,12 +475,12 @@ class IGlobal(GraphGlobalBase):
         """
         plan = self._translate(cypher, params=params, limit=fetch_limit, mode=TranslateMode.SAFE)
         raw_rows = self._execute_plan(plan, fetch_cap=fetch_limit)
-        return consume(self._plan_columns(plan), ([parse_agtype(v) for v in row] for row in raw_rows))
+        return consume(self._plan_columns(plan), _decoded(raw_rows))
 
     def _raw_query_rows(self, cypher, fetch_limit, consume):
         plan = self._translate(cypher, mode=TranslateMode.RAW)
         raw_rows = self._execute_plan(plan, fetch_cap=fetch_limit)
-        rows = [[parse_agtype(v) for v in row] for row in raw_rows]
+        rows = list(_decoded(raw_rows, ran=True))
         # AGE exposes no write counters; like the legacy path, report result rows.
         return consume(self._plan_columns(plan), iter(rows)), len(rows)
 
@@ -484,6 +497,8 @@ class IGlobal(GraphGlobalBase):
             return f'Refused: {_firewall_headline(exc)}', str(exc)
         if isinstance(exc, AgeTranslationError):
             return 'Invalid Cypher for Apache AGE', str(exc)
+        if isinstance(exc, ResultDecodeError):
+            return 'Query result cannot be represented', str(exc)
         if isinstance(exc, PoolTimeout):
             return 'Database busy: no connection became free in time', str(exc)
         if isinstance(exc, PoolClosed):

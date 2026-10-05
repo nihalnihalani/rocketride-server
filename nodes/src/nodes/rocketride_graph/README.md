@@ -71,8 +71,10 @@ firewall rule, "Not supported on Apache AGE
 1.5.0: <construct>" followed by what to write instead (for example for
 date(), duration(), elementId(), list or pattern comprehensions,
 allShortestPaths and EXISTS subqueries, which AGE 1.5.0 cannot run), "Query
-timed out after N ms", "Invalid read_query input: …", "Database unreachable"
-or "Query failed"; the remaining lines are the detail. A connection failure
+timed out after N ms", "Invalid read_query input: …", "Query result cannot
+be represented" (the statement was valid, and on execute it ran, but a value
+it returned could not be decoded), "Database unreachable" or "Query failed";
+the remaining lines are the detail. A connection failure
 never shows the database host, port or role: that detail goes to the server's
 debug log only, and callers (including the pipeline start error and the
 save-time check) see "The RocketRide cloud database could not be reached".

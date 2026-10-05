@@ -591,6 +591,30 @@ class TestReadQuery:
         finally:
             glb.endGlobal()
 
+    def test_result_decode_failure_is_not_reported_as_invalid_cypher(self, rr_env, age_graph, monkeypatch):
+        """The statement was valid (and on execute it already ran): only its result could not be decoded."""
+        module = sys.modules[rr_env.iglobal_cls.__module__]
+        glb = _begin(rr_env, {'allow_execute': True})
+        inst = _instance(rr_env, glb)
+
+        def undecodable(value):
+            raise _age().AgeTranslationError('Failed to decode agtype value: unexpected token')
+
+        try:
+            monkeypatch.setattr(module, 'parse_agtype', undecodable)
+            with pytest.raises(_graph_tool_error()) as err:
+                inst.read_query({'cypher': 'MATCH (p:Person) RETURN p'})
+            headline, _, detail = str(err.value).partition('\n')
+            assert headline == 'Query result cannot be represented'
+            assert 'unexpected token' in detail
+            with pytest.raises(_graph_tool_error()) as err:
+                inst.execute({'query': "MATCH (p:Person {name: 'alice'}) SET p.seen = 1 RETURN p", 'shape': 'graph'})
+            headline, _, detail = str(err.value).partition('\n')
+            assert headline == 'Query result cannot be represented'
+            assert 'the statement itself ran' in detail
+        finally:
+            glb.endGlobal()
+
     def test_hints_are_raised_before_the_database(self, rr_env, age_graph, monkeypatch):
         glb = _begin(rr_env)
         inst = _instance(rr_env, glb)
