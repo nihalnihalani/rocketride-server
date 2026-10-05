@@ -111,6 +111,16 @@ storage, a URL, a log, a copied JSON or a document payload. Call tools only
 through `store.session(client, endpoint)`; the session reads the token at call
 time and never keeps it.
 
+Discovery lists running tasks only, so a task that is restarting disappears
+from it just like a stopped one. An endpoint that disappears is shown
+`stopped`, but the store keeps its token, and the node's last good `dialect`
+answer for the session's capability check and budget, until the endpoint is
+discovered again or the store resets. A call made in the meantime is still
+sent: the server holds it until the task is running again, or refuses it at
+once (`TASK_NOT_REGISTERED`) when the task is gone. That is the call's first
+send, not a retry. Only an endpoint for which no token was ever known refuses
+calls locally as `unavailable`.
+
 `store.reset()` forgets endpoints, probes, tokens and sessions, and drops probes
 that were in flight. It runs on sign-out and when the identity fingerprint
 (`userId|orgId|devTeam`, [`connect/identity.ts`](../../../apps/shared/src/explorer/connect/identity.ts))

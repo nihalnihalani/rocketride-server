@@ -38,6 +38,15 @@
 //   - the sessions it opens (`session(client, endpoint)`), which read the
 //     token from the vault at call time and never keep it.
 //
+// A VANISHED ENDPOINT KEEPS ITS TOKEN
+//   Discovery lists RUNNING tasks only, so a task that is restarting vanishes
+//   from it exactly like one that was stopped. The endpoint is shown `stopped`,
+//   but its token (and the node's last `dialect` answer, which the session needs
+//   for its capability check and budget) stay until the endpoint is discovered
+//   again or the store is reset. A call made meanwhile is still SENT: the server
+//   holds it until the task is running again, or refuses it at once when the
+//   task is gone. Nothing is sent twice by this; it is the first send.
+//
 // WHEN IT REFRESHES
 //   explicitly (`refresh`), on task events (debounced), and on window focus
 //   (debounced and rate-limited) — never on a timer. Concurrent refreshes
@@ -218,6 +227,13 @@ export function createEndpointStore(options: IEndpointStoreOptions): IEndpointSt
 	const callHints = new Map<string, boolean | undefined>();
 	/** Sessions already opened, by endpoint key and client. */
 	const sessions = new Map<string, { client: IExplorerClient; session: IToolSession }>();
+	/**
+	 * The last good `dialect` answer of an endpoint that vanished from discovery
+	 * while its token is kept (see "A VANISHED ENDPOINT KEEPS ITS TOKEN"). Read by
+	 * sessions only; never published. Cleared when a probe of that endpoint
+	 * reports again, when it is discovered without a usable token, and on reset.
+	 */
+	const keptInfo = new Map<string, Record<string, unknown>>();
 
 	/** Bumped by reset(): anything in flight that started before it is dropped on arrival. */
 	let resetCount = 0;
@@ -330,6 +346,7 @@ export function createEndpointStore(options: IEndpointStoreOptions): IEndpointSt
 				ok: false, info: null, dialect: null, error: { kind: 'raised', message: error instanceof Error ? error.message : String(error) },
 			}));
 			if (epochAfterReset(startedReset) || vault.get(endpoint.key) !== tokenAtStart) return null;
+			keptInfo.delete(endpoint.key);
 			const outcome = classify(endpoint, result);
 			patchEndpoint(endpoint.key, { state: outcome.state, stateDetail: outcome.detail }, result);
 			return result;
@@ -362,7 +379,7 @@ export function createEndpointStore(options: IEndpointStoreOptions): IEndpointSt
 			token: () => vault.get(endpoint.key),
 			info: () => {
 				const probe = state.probes[endpoint.key];
-				return probe?.ok ? probe.info : null;
+				return probe?.ok ? probe.info : keptInfo.get(endpoint.key) ?? null;
 			},
 			rebind: (deadlineAt: number) => rebind(client, endpoint.key, deadlineAt),
 			now: clock.now,
@@ -404,8 +421,9 @@ export function createEndpointStore(options: IEndpointStoreOptions): IEndpointSt
 	 * Fold a fresh discovery into the store.
 	 *
 	 * Endpoints that disappeared are KEPT, marked `stopped` (the badge a
-	 * workbench needs), and their token is dropped; endpoints that reappeared
-	 * or are new get probed; endpoints already ready keep their probe unless
+	 * workbench needs), with their token and last good `dialect` answer kept
+	 * for calls (a restarting task vanishes too); endpoints that reappeared or
+	 * are new get probed; endpoints already ready keep their probe unless
 	 * `reprobe` is set; endpoints whose last probe failed are probed again.
 	 *
 	 * @param found - What discovery returned.
@@ -425,11 +443,15 @@ export function createEndpointStore(options: IEndpointStoreOptions): IEndpointSt
 			const before = previous.get(endpoint.key);
 			const tokenChanged = vault.get(endpoint.key) !== (token ?? undefined);
 			if (token !== null) vault.set(endpoint.key, token);
-			else vault.delete(endpoint.key);
+			else {
+				vault.delete(endpoint.key);
+				keptInfo.delete(endpoint.key);
+			}
 
 			if (endpoint.state === 'stopped') {
 				// A required role is not running: nothing to probe, nothing to call.
 				vault.delete(endpoint.key);
+				keptInfo.delete(endpoint.key);
 				delete probes[endpoint.key];
 				next.push(endpoint);
 				continue;
@@ -447,10 +469,12 @@ export function createEndpointStore(options: IEndpointStoreOptions): IEndpointSt
 
 		for (const [key, endpoint] of previous) {
 			if (live.has(key)) continue;
-			vault.delete(key);
+			// The token stays in the vault (see "A VANISHED ENDPOINT KEEPS ITS
+			// TOKEN"), with the node's last good answer for the session.
+			const lastProbe = probes[key];
+			if (vault.has(key) && lastProbe?.ok === true && isPlainObject(lastProbe.info)) keptInfo.set(key, lastProbe.info);
 			callHints.delete(key);
 			delete probes[key];
-			sessions.delete(key);
 			next.push(endpoint.state === 'stopped' ? endpoint : { ...endpoint, state: 'stopped', running: false, stateDetail: 'This pipeline is no longer running.' });
 		}
 
@@ -539,6 +563,7 @@ export function createEndpointStore(options: IEndpointStoreOptions): IEndpointSt
 		probing.clear();
 		cancelDebounce();
 		vault.clear();
+		keptInfo.clear();
 		callHints.clear();
 		sessions.clear();
 		inFlight = null;

@@ -225,7 +225,7 @@ describe('refresh — discover once, probe each endpoint once', () => {
 // =============================================================================
 
 describe('refresh — a vanished endpoint is stopped, a returning one is probed again', () => {
-	it('keeps a vanished endpoint as `stopped`, drops its token, and refuses calls on it', async () => {
+	it('keeps a vanished endpoint as `stopped`, with no probe in the snapshot', async () => {
 		const { store, world } = make();
 		await store.refresh(world.client);
 		const endpoint = store.getState().endpoints[0]!;
@@ -237,9 +237,45 @@ describe('refresh — a vanished endpoint is stopped, a returning one is probed 
 		assert.equal(after.running, false);
 		assert.match(after.stateDetail ?? '', /no longer running/);
 		assert.equal(store.getState().probes[endpoint.key], undefined);
-		const error = await store.session(world.client, after).invoke('dialect', {}).catch((e: unknown) => e);
+	});
+
+	it('still sends a call on a vanished endpoint with its last token, so a restarting task answers once it runs', async () => {
+		// Discovery lists RUNNING tasks only, so a task that is restarting
+		// vanishes from it. The server holds a call made meanwhile until the task
+		// runs again; refusing the call locally would fail it instead.
+		let releaseRead: ((value: unknown) => void) | undefined;
+		const { store, world } = make([row()], (call) => {
+			if (call.tool === 'dialect') return NEO4J_INFO;
+			return new Promise((resolve) => { releaseRead = resolve; });
+		});
+		await store.refresh(world.client);
+		const token = world.calls[0]!.token;
+		world.rows.length = 0;
+		await store.refresh(world.client);
+		const vanished = store.getState().endpoints[0]!;
+		assert.equal(vanished.state, 'stopped');
+
+		const pending = store.session(world.client, vanished).invoke('read_query', { cypher: 'RETURN 1' });
+		await new Promise((resolve) => setImmediate(resolve));
+		const sent = world.calls.filter((c) => c.tool === 'read_query');
+		assert.equal(sent.length, 1, 'the call reached the server instead of failing locally');
+		assert.equal(sent[0]!.token, token);
+		releaseRead?.({ columns: ['n'], rows: [[1]], row_limit: 1000, truncated: false });
+		assert.deepEqual(await pending, { columns: ['n'], rows: [[1]], row_limit: 1000, truncated: false });
+	});
+
+	it('surfaces the server\'s answer for a task that is really gone, and never repeats the call', async () => {
+		const { store, world } = make([row()], (call) => {
+			if (call.tool === 'dialect') return NEO4J_INFO;
+			throw codedError('Your pipeline is not running', 'TASK_NOT_REGISTERED');
+		});
+		await store.refresh(world.client);
+		world.rows.length = 0;
+		await store.refresh(world.client);
+		const error = await store.session(world.client, store.getState().endpoints[0]!).invoke('read_query', { cypher: 'RETURN 1' }).catch((e: unknown) => e);
 		assert.ok(error instanceof ExplorerToolError);
-		assert.equal(error.kind, 'unavailable');
+		assert.equal(error.code, 'TASK_NOT_REGISTERED');
+		assert.equal(world.calls.filter((c) => c.tool === 'read_query').length, 1);
 	});
 
 	it('probes it again when it reappears (the Stopped badge goes away)', async () => {
@@ -270,6 +306,10 @@ describe('refresh — a vanished endpoint is stopped, a returning one is probed 
 		await store.refresh(world.client);
 		assert.equal(store.getState().endpoints[0]!.state, 'stopped');
 		assert.equal(probes(world), 0);
+		// No token was ever known for it, so a call is refused locally.
+		const error = await store.session(world.client, store.getState().endpoints[0]!).invoke('dialect', {}).catch((e: unknown) => e);
+		assert.equal((error as ExplorerToolError).kind, 'unavailable');
+		assert.equal(world.calls.length, 0);
 	});
 });
 
