@@ -56,8 +56,9 @@ substituted into a pipeline, never returned or changed by the account
 `get_env` and `set_env` commands, and never passed to a task, whatever
 `RR_SUBPROCESS_ENV` allows. The engine refuses to start while the former names
 `ROCKETRIDE_DB_BROKER_URL` or `ROCKETRIDE_DB_BROKER_TOKEN` are set, in its
-environment or in its `.env` file, even next to the new names: rename them in
-the deployment configuration and secret mapping in the same change. A hosted
+environment or in its `.env` file, even next to the new names, and the
+open-source `set_env` command refuses them: rename them in the deployment
+configuration and secret mapping in the same change. A hosted
 engine without the broker settings logs a warning at startup, and its
 RocketRide database nodes report that the broker is not configured.
 
@@ -67,8 +68,9 @@ engine resolves that connection from the task's own identity; nothing in the
 pipeline, a node's configuration or the environment selects it. The
 connection string the broker returns must require TLS: an explicit `sslmode`
 of `require`, `verify-ca` or `verify-full` is used as issued, a missing one
-becomes `require`, and one that does not require TLS is refused except for a
-database on the loopback interface.
+becomes `require`, and one that does not require TLS is refused unless every
+host it names (including libpq's `host` and `hostaddr` parameters) is on the
+loopback interface.
 
 | Variable            | Effect                                                                                                                                                                                                        |
 | ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |

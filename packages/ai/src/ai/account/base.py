@@ -533,7 +533,7 @@ class AccountBase(ABC):
         )
         try:
             with urllib.request.urlopen(request, timeout=15) as response:
-                body = json.loads(response.read().decode('utf-8'))
+                raw = response.read()
         except urllib.error.HTTPError as e:
             code = e.code
             e.close()
@@ -541,6 +541,13 @@ class AccountBase(ABC):
         except Exception as e:
             # The text of a network error can carry the broker URL; report its kind only.
             raise RuntimeError(f'DB broker unreachable ({AccountBase._network_failure_kind(e)})') from e
+
+        # Decoded outside the network handling: a reply that arrived but is not
+        # JSON (a proxy's error page, a misrouted ingress) is not a network failure.
+        try:
+            body = json.loads(raw.decode('utf-8'))
+        except (UnicodeDecodeError, ValueError):
+            raise RuntimeError('DB broker returned an invalid response (not JSON)') from None
 
         dsn = body.get('dsn') if isinstance(body, dict) else None
         if not dsn or not isinstance(dsn, str):
@@ -580,6 +587,8 @@ class AccountBase(ABC):
 
     # sslmode values that do not require TLS at all.
     _WEAK_SSLMODES = frozenset({'disable', 'allow', 'prefer'})
+    # Hosts a DSN may reach without TLS (the local development rig).
+    _LOOPBACK_HOSTS = frozenset({'localhost', '127.0.0.1', '::1'})
 
     @staticmethod
     def _pin_dsn_tls(dsn: str) -> str:
@@ -590,30 +599,53 @@ class AccountBase(ABC):
         TLS (``require``, ``verify-ca``, ``verify-full``, with any
         ``sslrootcert``): server verification is configured by the broker's
         DSN, never weakened here. One that does not require TLS (``disable``,
-        ``allow``, ``prefer``) is refused, except for a loopback host (the
-        local development rig).
+        ``allow``, ``prefer``) is refused unless every host the DSN names is
+        a loopback host (the local development rig): the hosts in the
+        authority (``host1,host2``) and in the ``host`` and ``hostaddr``
+        parameters, which libpq lets override the authority.
         """
-        from urllib.parse import parse_qs, urlparse
+        from urllib.parse import parse_qs
 
-        parsed = urlparse(dsn)
-        if parsed.scheme.lower() not in ('postgres', 'postgresql'):
-            raise RuntimeError(f'DB broker returned a non-PostgreSQL DSN (scheme {parsed.scheme!r})')
-        modes = parse_qs(parsed.query).get('sslmode')
+        # Split by hand: urlparse rejects libpq's multi-host authorities
+        # (``h1:5432,[::1]:5433``).
+        scheme, separator, rest = dsn.partition('://')
+        if not separator:
+            scheme = ''
+        if scheme.lower() not in ('postgres', 'postgresql'):
+            raise RuntimeError(f'DB broker returned a non-PostgreSQL DSN (scheme {scheme!r})')
+        location, _, query = rest.partition('?')
+        query = query.partition('#')[0]
+        params = parse_qs(query)
+        modes = params.get('sslmode')
         if not modes:
-            separator = '&' if parsed.query else '?'
+            separator = '&' if query else '?'
             return f'{dsn}{separator}sslmode=require'
         weak = [mode for mode in modes if mode.strip().lower() in AccountBase._WEAK_SSLMODES]
-        if weak:
-            try:
-                host = parsed.hostname
-            except ValueError:
-                host = None
-            if host not in ('localhost', '127.0.0.1', '::1'):
-                raise RuntimeError(
-                    f'DB broker returned a DSN with sslmode={weak[0]}, which does not require TLS; '
-                    'only a loopback database may be reached without it'
-                )
+        if weak and not AccountBase._dsn_hosts_are_loopback(location.partition('/')[0], params):
+            raise RuntimeError(
+                f'DB broker returned a DSN with sslmode={weak[0]}, which does not require TLS; '
+                'only a loopback database may be reached without it'
+            )
         return dsn
+
+    @staticmethod
+    def _dsn_hosts_are_loopback(authority: str, params) -> bool:
+        """True when every host a libpq URI names is a loopback host (and it names at least one)."""
+        from urllib.parse import unquote
+
+        hosts = []
+        for item in authority.rpartition('@')[2].split(','):
+            item = item.strip()
+            if item.startswith('['):
+                hosts.append(item[1:].partition(']')[0])
+            else:
+                hosts.append(item.partition(':')[0])
+        for name in ('host', 'hostaddr'):
+            for value in params.get(name, []):
+                hosts.extend(value.split(','))
+        hosts = [unquote(host).strip().lower() for host in hosts]
+        hosts = [host for host in hosts if host]
+        return bool(hosts) and all(host in AccountBase._LOOPBACK_HOSTS for host in hosts)
 
     # =========================================================================
     # DEPLOYMENTS — the teams-as-environments interface.

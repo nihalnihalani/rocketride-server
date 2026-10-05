@@ -231,6 +231,15 @@ def test_unreachable_broker_never_echoes_the_error_text(monkeypatch, raised, exp
     assert str(err.value) == f'DB broker unreachable ({expected})'
 
 
+@pytest.mark.parametrize('body', [b'<html>502 Bad Gateway</html>', b'\xff\xfe not utf-8', b''])
+def test_broker_reply_that_is_not_json_is_an_invalid_response_not_a_network_error(monkeypatch, body):
+    """A proxy or broker answering 200 with a non-JSON body reached us: say so, not "unreachable"."""
+    monkeypatch.setattr(urllib.request, 'urlopen', lambda *_args, **_kwargs: io.BytesIO(body))
+    with pytest.raises(RuntimeError) as err:
+        AccountBase._call_db_broker('https://broker.example/provision', TEST_TOKEN, 'tenant-1')
+    assert str(err.value) == 'DB broker returned an invalid response (not JSON)'
+
+
 def test_empty_client_id_rejected(broker):
     with pytest.raises(ValueError, match='non-empty client_id'):
         _resolve('   ')
@@ -297,6 +306,33 @@ def test_broker_sslmode_without_tls_is_refused_for_a_remote_host(mode):
 def test_broker_sslmode_without_tls_is_allowed_on_the_loopback(host):
     """The local development rig runs a provisioner and database without TLS."""
     dsn = f'postgresql://r:p@{host}:55433/t?sslmode=disable'
+    assert AccountBase._pin_dsn_tls(dsn) == dsn
+
+
+@pytest.mark.parametrize(
+    'dsn',
+    [
+        # libpq's host / hostaddr query parameters override the host in the authority.
+        'postgresql://r:p@localhost:5432/t?host=pooler.internal&sslmode=disable',
+        'postgresql://r:p@127.0.0.1/t?hostaddr=203.0.113.5&sslmode=disable',
+        'postgresql://r:p@localhost/t?sslmode=prefer&host=localhost,pooler.internal',
+        'postgresql://r:p@localhost,pooler.internal/t?sslmode=disable',
+    ],
+)
+def test_broker_sslmode_without_tls_is_refused_unless_every_host_is_loopback(dsn):
+    with pytest.raises(RuntimeError, match='does not require TLS'):
+        AccountBase._pin_dsn_tls(dsn)
+
+
+@pytest.mark.parametrize(
+    'dsn',
+    [
+        'postgresql://r:p@localhost/t?host=127.0.0.1&sslmode=disable',
+        'postgresql://r:p@127.0.0.1/t?hostaddr=127.0.0.1&sslmode=disable',
+        'postgresql://r:p@localhost:5432,[::1]:5433/t?sslmode=disable',
+    ],
+)
+def test_broker_sslmode_without_tls_is_allowed_when_every_host_is_loopback(dsn):
     assert AccountBase._pin_dsn_tls(dsn) == dsn
 
 
@@ -508,3 +544,48 @@ def test_hosted_engine_without_broker_warns_at_startup(account, argv, env, warns
         assert 'RR_DB_BROKER_URL' in text and 'not configured on this server' in text
     else:
         assert text is None
+
+
+# ---------------------------------------------------------------------------
+# OSS set_env: the former broker names cannot be set at runtime either.
+# ---------------------------------------------------------------------------
+
+
+def _set_env_request(env):
+    return {'command': 'rrext_account_me', 'arguments': {'subcommand': 'set_env', 'env': env}}
+
+
+@pytest.mark.parametrize(
+    'name', ['ROCKETRIDE_DB_BROKER_URL', 'ROCKETRIDE_DB_BROKER_TOKEN', 'ROCKETRIDE_db_broker_token']
+)
+def test_oss_set_env_refuses_the_former_broker_names(no_broker_env, monkeypatch, tmp_path, name):
+    import os
+    import sys
+    from unittest.mock import MagicMock
+
+    from ai.account.oss import Account
+
+    monkeypatch.setattr(sys, 'executable', str(tmp_path / 'engine'))
+    monkeypatch.setenv('ROCKETRIDE_GX_KEEP', 'kept')
+    before = dict(os.environ)
+    with pytest.raises(ValueError) as err:
+        asyncio.run(
+            Account().handle_account(MagicMock(), _set_env_request({'ROCKETRIDE_GX_OTHER': 'x', name: LEGACY_SENTINEL}))
+        )
+    assert name in str(err.value) and LEGACY_SENTINEL not in str(err.value)
+    assert dict(os.environ) == before, 'nothing may change when the request is refused'
+    assert not (tmp_path / '.env').exists()
+
+
+def test_oss_set_env_still_saves_other_names(no_broker_env, monkeypatch, tmp_path):
+    import os
+    import sys
+    from unittest.mock import MagicMock
+
+    from ai.account.oss import Account
+
+    monkeypatch.setattr(sys, 'executable', str(tmp_path / 'engine'))
+    monkeypatch.setattr(os, 'environ', dict(os.environ))
+    asyncio.run(Account().handle_account(MagicMock(), _set_env_request({'ROCKETRIDE_GX_OTHER': 'x'})))
+    assert os.environ['ROCKETRIDE_GX_OTHER'] == 'x'
+    assert 'ROCKETRIDE_GX_OTHER=x' in (tmp_path / '.env').read_text()
