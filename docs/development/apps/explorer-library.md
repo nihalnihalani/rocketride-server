@@ -124,10 +124,15 @@ from it just like a stopped one. An endpoint that disappears is shown
 `stopped`, but the store keeps its token, and the node's last good `dialect`
 answer for the session's capability check and budget, until the endpoint is
 discovered again or the store resets. A call made in the meantime is still
-sent: the server holds it until the task is running again, or refuses it at
-once (`TASK_NOT_REGISTERED`) when the task is gone. That is the call's first
-send, not a retry. Only an endpoint for which no token was ever known refuses
-calls locally as `unavailable`.
+sent, and that is its first send, not a retry. The server holds it until a
+restarting task is running again. A pipeline stopped within the last few
+minutes is still registered and answers `TASK_STOPPED`, so an idempotent call
+first gets the one bounded re-discovery (up to the 15 s retry window, see "The
+one retry") and then fails with that code; a task that is no longer registered
+answers `TASK_NOT_REGISTERED` at once. A call is refused locally as
+`unavailable` only for an endpoint whose latest discovery row carried no token
+or reported it `stopped` (a required role not running); its token is dropped
+then.
 
 `store.reset()` forgets endpoints, probes, tokens and sessions, and drops probes
 that were in flight. It runs on sign-out and when the identity fingerprint

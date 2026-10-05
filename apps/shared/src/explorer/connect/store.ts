@@ -43,9 +43,16 @@
 //   from it exactly like one that was stopped. The endpoint is shown `stopped`,
 //   but its token (and the node's last `dialect` answer, which the session needs
 //   for its capability check and budget) stay until the endpoint is discovered
-//   again or the store is reset. A call made meanwhile is still SENT: the server
-//   holds it until the task is running again, or refuses it at once when the
-//   task is gone. Nothing is sent twice by this; it is the first send.
+//   again or the store is reset. A call made meanwhile is still SENT, and that
+//   is its first send, not a retry. The server holds it until a restarting
+//   task is running again. A task stopped within the last few minutes is still
+//   registered and answers TASK_STOPPED, so an idempotent call first gets the
+//   session's one bounded re-discovery (up to its retry window, 15 s by
+//   default) and then fails with that code; a task that is no longer
+//   registered answers TASK_NOT_REGISTERED at once. A call is refused locally
+//   (`unavailable`) only for an endpoint whose latest discovery row carried no
+//   token or reported it `stopped` (a required role not running): its token is
+//   dropped then.
 //
 // WHEN IT REFRESHES
 //   explicitly (`refresh`), on task events (debounced), and on window focus

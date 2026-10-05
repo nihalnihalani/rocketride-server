@@ -370,6 +370,37 @@ describe('refresh — a vanished endpoint is stopped, a returning one is probed 
 		assert.equal(world.calls.filter((c) => c.tool === 'read_query').length, 1);
 	});
 
+	it('lets a read on a vanished endpoint whose task was just stopped wait out the retry window, then surfaces TASK_STOPPED', async () => {
+		// A task the user stopped stays registered for a few minutes and answers
+		// TASK_STOPPED. A read then gets the one bounded re-discovery (about once
+		// a second, up to the retry window) and fails with the server's code; the
+		// call itself is sent once.
+		const { store, world, clock } = make([row()], (call) => {
+			if (call.tool === 'dialect') return NEO4J_INFO;
+			throw codedError('Task was stopped', 'TASK_STOPPED');
+		});
+		await store.refresh(world.client);
+		world.rows.length = 0;
+		await store.refresh(world.client);
+		const vanished = store.getState().endpoints[0]!;
+		assert.equal(vanished.state, 'stopped');
+		const discoveriesBefore = world.getTasksCalls;
+
+		let outcome: unknown;
+		let settled = false;
+		const pending = store.session(world.client, vanished).invoke('read_query', { cypher: 'RETURN 1' })
+			.then(() => 'ok', (error: unknown) => { outcome = error; return 'failed'; })
+			.finally(() => { settled = true; });
+		await clock.advance(5_000);
+		assert.equal(settled, false, 'the read waits while the store looks for the endpoint again');
+		await clock.advance(11_000);
+		assert.equal(await pending, 'failed');
+		assert.equal((outcome as ExplorerToolError).code, 'TASK_STOPPED');
+		assert.equal(world.calls.filter((c) => c.tool === 'read_query').length, 1);
+		const polls = world.getTasksCalls - discoveriesBefore;
+		assert.ok(polls >= 10 && polls <= 16, `re-discovered about once a second within the window, saw ${polls}`);
+	});
+
 	it('probes it again when it reappears (the Stopped badge goes away)', async () => {
 		const { store, world } = make();
 		await store.refresh(world.client);

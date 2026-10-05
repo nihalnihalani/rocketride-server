@@ -52,15 +52,18 @@ be reached (for example it is not wired to a tools source), and **No access**
 when you can see a team deployment but your role cannot call it (calling a
 tool needs `task.data`, seeing it only `task.monitor`). The workbench does
 not show a connection's state. A statement run on a **Stopped** connection is
-still sent: a pipeline that is restarting runs it once it is back, and one
-that is gone answers that it is not running. The list is read again when a
-pipeline starts, stops or restarts, and when you return to the window;
-**Refresh** does it on demand. Only running pipelines are listed, so a
-pipeline that was still starting when the list was read appears the next
-time it is read. An **Unreachable** or **No access** connection is checked
-again on **Refresh** or when its pipeline restarts, not each time the list is
-read. Signing out, or switching organization or team, clears the list, so
-one session's connections never appear in the next.
+still sent: a pipeline that is restarting runs it once it is back. A pipeline
+stopped in the last few minutes answers that it was stopped; a statement the
+app classifies as a read first waits up to 15 seconds for it to come back,
+then shows that answer. One stopped longer ago answers at once that it is not
+running. The list is read again when a pipeline starts, stops or restarts,
+and when you return to the window; **Refresh** does it on demand. Only
+running pipelines are listed, so a pipeline that was still starting when the
+list was read appears the next time it is read. An **Unreachable** or **No
+access** connection is checked again on **Refresh** or when its pipeline
+restarts, not each time the list is read. Signing out, or switching
+organization or team, clears the list, so one session's connections never
+appear in the next.
 
 The app never holds a connection string or a task token in anything it saves
 or shows. Task tokens are kept in memory only, per session.
