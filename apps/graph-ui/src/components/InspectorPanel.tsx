@@ -36,7 +36,7 @@ import { Banner, Button, DetailPanel, LabelValue, Section } from 'shell';
 import { CHIP_TEXT_TOKEN } from '../canvas/tokens';
 import { captionOf } from '../graph/captions';
 import type { IGraphSession, IGraphState, IInspectTarget } from '../graph/graphSession';
-import { STALE_ELEMENT_TEXT } from '../graph/identity';
+import { STALE_ELEMENT_TEXT, STALE_RELATIONSHIP_TEXT } from '../graph/identity';
 import { inspectNode, inspectRelationship } from '../graph/inspector';
 import { relationshipsOf } from '../graph/model';
 import { copyText } from './ResultViews';
@@ -89,6 +89,8 @@ export const InspectorPanel: React.FC<IInspectorPanelProps> = ({ state, session,
 
 	if (!target || !view) return null;
 	const m = view.model;
+	// Node and relationship ids are separate namespaces (FalkorDB numbers both from 0): each kind has its own marks.
+	const targetStale = target.kind === 'node' ? state.staleIds.has(target.id) : state.staleRelationshipIds.has(target.id);
 	const rels = view.node ? relationshipsOf(model, view.node.id) : [];
 
 	const copy = async (): Promise<void> => {
@@ -115,8 +117,8 @@ export const InspectorPanel: React.FC<IInspectorPanelProps> = ({ state, session,
 				</>
 			}
 		>
-			{(state.stale || state.staleIds.has(target.id)) && (
-				<Banner variant="warning">{state.stale ? 'This copy may be out of date: a statement that can change data ran on this connection after it was drawn. It is shown as the query returned it.' : STALE_ELEMENT_TEXT}</Banner>
+			{(state.stale || targetStale) && (
+				<Banner variant="warning">{state.stale ? 'This copy may be out of date: a statement that can change data ran on this connection after it was drawn. It is shown as the query returned it.' : target.kind === 'node' ? STALE_ELEMENT_TEXT : STALE_RELATIONSHIP_TEXT}</Banner>
 			)}
 			{state.notice && state.busy === null && target.kind === 'node' && <Banner variant={state.notice.variant}>{state.notice.text}</Banner>}
 			<Section label={m.kind === 'node' ? 'Labels' : 'Type'}>

@@ -392,7 +392,8 @@ test('a relationship that returns with the same id and another type, start or en
 		assert.equal(s.model.relationships.get('r1')?.type, 'T', 'the drawn relationship is untouched');
 		assert.deepEqual([s.model.relationships.get('r1')?.start, s.model.relationships.get('r1')?.end], ['a', 'b']);
 		assert.equal(s.model.nodes.has('c'), false, 'nothing new was added');
-		assert.ok(s.staleIds.has('r1'), `relationship marked (${changed.type} ${changed.start}>${changed.end})`);
+		assert.ok(s.staleRelationshipIds.has('r1'), `relationship marked (${changed.type} ${changed.start}>${changed.end})`);
+		assert.equal(s.staleIds.has('r1'), false, 'among the relationships, not the nodes');
 		assert.match(s.notice?.text ?? '', /the relationship r1 was type T from a to b, and is now type /);
 	}
 });
@@ -568,4 +569,35 @@ test('connect never says "no further relationships" when the node cut its answer
 	some.load(base());
 	await some.connect();
 	assert.match(some.getState().notice?.text ?? '', /^Added 1 relationship among the nodes on the canvas, but the node stopped at 250 rows/);
+});
+
+// -----------------------------------------------------------------------------
+// GX-CT-07: node and relationship ids are separate namespaces (FalkorDB numbers both from 0)
+// -----------------------------------------------------------------------------
+
+test('a relationship marked out of date does not mark the node that has the same id (FalkorDB numbers both from 0), and Connect says which kind is out of date', async () => {
+	// Nodes 0, 1, 2 and relationship 2 (0 -> 1): the live FalkorDB fixture has exactly this kind of overlap.
+	const drawn = envelope([[node('0', ['P']), rel('2', 'T', '0', '1'), node('1', ['P']), node('2', ['P'])]]);
+	const { session, log } = rig(NEO, (_recipe, call) => (call === 0 ? envelope([[node('0', ['P']), rel('2', 'OTHER', '0', '1'), node('1', ['P'])]]) : envelope([[node('2', ['P']), rel('9', 'T', '2', '1'), node('1', ['P'])]])));
+	session.load(drawn);
+	await session.expand('0');
+	let s = session.getState();
+	assert.equal(s.staleIds.has('2'), false, 'the node with the same number is not marked');
+	assert.ok(s.staleRelationshipIds.has('2'), 'the relationship is');
+	// Node 2 is still asked about.
+	await session.expand('2');
+	assert.equal(log.recipes.length, 2, 'node 2 was expanded');
+	assert.doesNotMatch(session.getState().notice?.text ?? '', /out of date/);
+	// Connect names relationships, not dashed nodes that do not exist.
+	const sent = log.recipes.length;
+	await session.connect();
+	assert.equal(log.recipes.length, sent, 'nothing is sent while a drawn relationship is out of date');
+	assert.match(session.getState().notice?.text ?? '', /Some drawn relationships are out of date/);
+	assert.doesNotMatch(session.getState().notice?.text ?? '', /out-of-date nodes/);
+	// Dismissing node 2 (not an end of relationship 2) keeps the relationship's mark; dismissing an end clears it.
+	session.dismiss('2');
+	s = session.getState();
+	assert.ok(s.staleRelationshipIds.has('2'), 'dismissing an unrelated node with the same id does not clear it');
+	session.dismiss('1');
+	assert.equal(session.getState().staleRelationshipIds.size, 0, 'the relationship left the canvas with its end');
 });

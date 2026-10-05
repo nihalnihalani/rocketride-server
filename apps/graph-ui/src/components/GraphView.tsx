@@ -204,6 +204,7 @@ export const GraphView: React.FC<IGraphViewProps> = ({ session, schemaLabels, ca
 							selected={state.selected}
 							focusedId={state.focusedId}
 							staleIds={state.staleIds}
+							staleRelationshipIds={state.staleRelationshipIds}
 							allStale={state.stale}
 							seedKey={seedKey}
 							expandHint={state.hint}
