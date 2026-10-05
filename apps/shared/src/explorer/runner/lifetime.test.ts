@@ -61,7 +61,6 @@ function rig(flagged: (text: string) => boolean = () => false) {
 	const sent: string[] = [];
 	const recorded: string[] = [];
 	const held: IHeld[] = [];
-	let answer: ((value: PatternAnswer) => void) | null = null;
 	const hooks: IBatchHooks<IRun, string, { rows: number }> = {
 		initRun: (target: IRunTarget, index: number): IRun => ({ index, text: target.text, kind: 'write', verb: 'CREATE', outcome: 'pending', start: target.start, end: target.end, startLine: target.startLine, endLine: target.endLine }),
 		textOf: (run) => run.text,
@@ -82,12 +81,13 @@ function rig(flagged: (text: string) => boolean = () => false) {
 		started: () => undefined,
 		runs: () => undefined,
 		active: () => undefined,
-		confirm: () => new Promise<PatternAnswer>((resolve) => { answer = resolve; lifetimeResolver.current = resolve; }),
+		// What the hook's view does: the open dialog's resolver is the one unmount cancels.
+		confirm: () => new Promise<PatternAnswer>((resolve) => { lifetimeResolver.current = resolve; }),
 		failed: () => undefined,
 		finished: () => undefined,
 	};
 	const lifetimeResolver: IRunnerLifetime['patternResolver'] = { current: null };
-	return { hooks, view, sent, recorded, held, lifetimeResolver, pendingAnswer: () => answer };
+	return { hooks, view, sent, recorded, held, lifetimeResolver };
 }
 
 const targets = (...texts: string[]): IRunTarget[] => texts.map((text, i) => ({ text, start: i * 10, end: i * 10 + text.length, startLine: i + 1, endLine: i + 1 }));
