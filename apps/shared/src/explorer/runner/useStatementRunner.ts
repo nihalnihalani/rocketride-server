@@ -29,8 +29,9 @@
 // into state, owns the generation that makes "Stop waiting" honest, and keeps
 // the refs the original query view kept:
 //
-//   - a GENERATION, not a counter: Stop waiting, and a closed document, expire
-//     the batch's ticket and the late answer is dropped;
+//   - a GENERATION, not a counter: Stop waiting, and the owner unmounting (a
+//     closed document, a switch to another app), expire the batch's ticket:
+//     nothing more is sent and the late answer is dropped;
 //   - the clock reading of the statement in flight, for "stopped waiting after N s";
 //   - the pending confirmation's resolver, cancelled on unmount so the batch
 //     never awaits a dialog nobody can answer;
@@ -46,6 +47,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createGeneration } from '../generation';
+import type { IGeneration } from '../generation';
 import { abandonRuns, runStatementBatch } from './batch';
 import type { IBatchHooks, IBatchView } from './batch';
 import { formatAbandonNotice, formatBatchOutcome, hasStatementInFlight } from './format';
@@ -115,6 +117,42 @@ export interface IStatementRunner<TRun extends IStatementRunBase, TNotice extend
 	stopWaiting(): void;
 }
 
+/** What the runner's owner holds for as long as it is mounted. */
+export interface IRunnerLifetime {
+	/** The runner's generation: expiring it drops the batch in progress. */
+	generation: IGeneration;
+	/** Whether the owner is mounted (gates `record`). */
+	mounted: { current: boolean };
+	/** The pending confirmation's resolver, if a dialog is open. */
+	patternResolver: { current: ((answer: PatternAnswer) => void) | null };
+}
+
+/**
+ * The runner's mount effect. Sets the mounted flag on EVERY setup (React
+ * StrictMode runs setup, cleanup and setup again on one instance) and returns
+ * the cleanup the owner's unmount runs: it expires the batch in progress (the
+ * statement in flight finishes at the node; nothing after it is sent) and
+ * cancels an open confirmation.
+ *
+ * @param lifetime - The runner's refs.
+ * @returns The cleanup.
+ */
+export function attachRunnerLifetime(lifetime: IRunnerLifetime): () => void {
+	lifetime.mounted.current = true;
+	return () => {
+		lifetime.mounted.current = false;
+		// Expire the batch's ticket: a closed tab or a switched-away app must not
+		// keep sending statements nobody is watching. The batch checks its ticket
+		// before every statement, so nothing after the one in flight is sent; that
+		// one finishes at the node (it cannot be cancelled) and its answer is dropped.
+		lifetime.generation.invalidate();
+		// A dialog open at unmount would otherwise leave the batch awaiting a
+		// promise nobody can settle.
+		lifetime.patternResolver.current?.('cancel');
+		lifetime.patternResolver.current = null;
+	};
+}
+
 /**
  * Run batches of statements with the Explorer's honesty rules, as React state.
  *
@@ -144,16 +182,7 @@ export function useStatementRunner<TRun extends IStatementRunBase, TSend, TResul
 	const mountedRef = useRef(true);
 	const patternResolverRef = useRef<((answer: PatternAnswer) => void) | null>(null);
 
-	useEffect(() => {
-		mountedRef.current = true;
-		return () => {
-			mountedRef.current = false;
-			// A dialog open at unmount would otherwise leave the batch awaiting a
-			// promise nobody can settle.
-			patternResolverRef.current?.('cancel');
-			patternResolverRef.current = null;
-		};
-	}, []);
+	useEffect(() => attachRunnerLifetime({ generation: generationRef.current, mounted: mountedRef, patternResolver: patternResolverRef }), []);
 
 	// "Stop waiting" only appears once a statement IN FLIGHT has been slow.
 	// Keying this on `running` offered it while a confirmation was open, and

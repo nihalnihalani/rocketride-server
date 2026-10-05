@@ -239,11 +239,14 @@ failure ends the batch and the rest are `skipped` (no claim of atomicity); a
 `refuse` hook can veto the whole batch before anything is sent; a text pattern
 check asks before a flagged statement is sent (run, run and stop asking, or
 decline, which skips the rest); when the batch's generation ticket expires
-(Stop waiting, the document closing) it stops touching state and the late result
-**and** the late failure are dropped. `abandonRuns` marks the statement in
-flight `abandoned`.
+(Stop waiting, or the component that owns the runner unmounting: a closed
+document, a switch to another app) it sends nothing more, stops touching state,
+and the late result **and** the late failure are dropped. The statement already
+in flight finishes at the node; nothing can cancel it. `abandonRuns` marks the
+statement in flight `abandoned`.
 [`runner/useStatementRunner.ts`](../../../apps/shared/src/explorer/runner/useStatementRunner.ts)
-binds it to React state.
+binds it to React state; its unmount cleanup (`attachRunnerLifetime`) is what
+expires the ticket, so every app using the hook gets this without code of its own.
 
 Shared components under `components/` (import by path): `StatementStrip`,
 `FailureBanner` (headline, where it happened, "Database said" collapsed),
