@@ -28,7 +28,8 @@
 // (sql.history, sql.historyRecording, sql.patternChecks). The key now carries
 // run kind, owner and team. What users saved under the old key must still be
 // read for the connection it meant — the caller's own dev run — and ONLY for
-// that one, and nothing may be rewritten or deleted behind their backs.
+// that one, and the old list is never rewritten or deleted (it is a read-only
+// overlay).
 //
 // The generic rules are tested in shared/explorer/history; this checks that
 // SQL Explorer's own store is wired to them with its own preference keys.
@@ -105,16 +106,17 @@ describe('SQL history under the owner-aware key', () => {
 		}
 	});
 
-	it('updates an old entry in place when it is pinned from the new key', async () => {
+	it('pins an old entry through a copy under the new key and leaves the old list untouched', async () => {
 		const keys = keysFor('legacy-b');
-		const prefs = fakePrefs({ 'sql.history': { [keys.old]: [saved('o1', 'SELECT 1', 10)] } });
+		const oldList = [saved('o1', 'SELECT 1', 10)];
+		const prefs = fakePrefs({ 'sql.history': { [keys.old]: oldList } });
 		const detach = attachPrefs(prefs.api);
 		try {
 			togglePin(keys.dev, 'o1');
 			await settle();
 			const bag = prefs.values['sql.history'] as Record<string, Array<{ id: string; pinned?: boolean }>>;
-			assert.equal(bag[keys.old]?.[0]?.pinned, true);
-			assert.equal(bag[keys.dev], undefined);
+			assert.deepEqual(bag[keys.old], oldList);
+			assert.deepEqual(bag[keys.dev]?.map((e) => [e.id, e.pinned]), [['o1', true]]);
 		} finally {
 			detach();
 		}

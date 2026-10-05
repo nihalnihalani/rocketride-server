@@ -59,17 +59,26 @@
 // SQL Explorer's first key was `projectId:source:nodeId`; the owner-aware key
 // replaces it, and renaming a key silently orphans every user's saved history.
 // So when `legacyKeyOf` maps a connection to its old key, history is read as a
-// MERGED VIEW of the two lists, and the stored format never changes:
+// MERGED VIEW of the two lists. The old list is a READ-ONLY overlay: nothing
+// here writes it. Several new keys can map onto one old key (the same dev run
+// under two development teams), so a write to the old list on behalf of one
+// would change, or empty, what the others read.
 //
 //   - reads: entries under the new key AND under the old key, de-duplicated by
-//     id, newest first, bounded like any list;
-//   - new runs are written under the NEW key only — except a run that repeats
-//     an older entry's statement, which collapses onto that entry wherever it
-//     lives (the trim keeps the older entry, its pin and its note);
-//   - pin, note and remove change an entry IN PLACE, in whichever list holds it;
-//   - clear empties both lists;
-//   - nothing is ever migrated or deleted behind the user's back, so an older
-//     build still sees its own list and a cleared list never comes back.
+//     id (the new key's copy wins), minus the old entries this connection hid,
+//     newest first, bounded like any list. The bound applies to the VIEW: an
+//     old entry it leaves out is still stored and is shown again once there
+//     is room;
+//   - new runs are written under the NEW key only. A run that repeats an old
+//     entry's statement collapses onto a COPY of that entry under the new key
+//     (same id, so the copy stands in for it; its pin and note are kept);
+//   - pin and note on an old entry write a changed copy under the new key;
+//   - remove and clear HIDE old entries for this connection only: their ids
+//     are kept under `legacyHiddenKey`, per connection;
+//   - so an older build still sees its own list, unchanged, and another team
+//     context still reads every old entry. The one bound that can still drop
+//     an old entry is the size budget across every connection's lists
+//     (trimBag), oldest first, as it always has been.
 //
 // The mapping is the caller's to make safe: the caller maps ONLY connections
 // the old key could have meant (see keys.ts legacyKeyFromKey), so history is
@@ -107,6 +116,13 @@ export interface IHistoryStoreOptions<F extends string> {
 	 * history is the MERGED view of both lists (see "LEGACY KEYS" below).
 	 */
 	legacyKeyOf?: (key: string) => string | null;
+	/**
+	 * Preference key holding, per connection, the ids of old-list entries that
+	 * connection removed or cleared from its view (default
+	 * `<historyKey>LegacyHidden`). Written only when `legacyKeyOf` is set and
+	 * something is hidden.
+	 */
+	legacyHiddenKey?: string;
 }
 
 /** One app's history store. */
@@ -170,6 +186,7 @@ export function createHistoryStore<F extends string>(options: IHistoryStoreOptio
 	/** Shared empty list, so an unknown connection keeps a stable snapshot. */
 	const NO_ENTRIES: IHistoryEntry<F>[] = [];
 	const legacyKeyOf = options.legacyKeyOf;
+	const legacyHiddenKey = options.legacyHiddenKey ?? `${historyKey}LegacyHidden`;
 
 	/**
 	 * The older key a connection's history may also live under.
@@ -187,6 +204,14 @@ export function createHistoryStore<F extends string>(options: IHistoryStoreOptio
 	let bag: HistoryBag<F> = {};
 	let recording: Record<string, boolean> = {};
 	let hydrated = false;
+
+	/**
+	 * Per connection, the ids of old-list entries it removed or cleared from its
+	 * view (see "LEGACY KEYS"). The old list itself is never written.
+	 */
+	let hidden: Record<string, string[]> = {};
+	/** Whether `legacyHiddenKey` exists in the file, so emptying it is written too. */
+	let hiddenStored = false;
 
 	/**
 	 * Recording switches flipped since the last successful write. These are the
@@ -232,13 +257,14 @@ export function createHistoryStore<F extends string>(options: IHistoryStoreOptio
 
 	// ── The merged view (legacy keys) ─────────────────────────────────────────
 
-	/** Merged views by connection key, valid while both underlying lists are the same objects. */
-	const viewCache = new Map<string, { own: IHistoryEntry<F>[]; old: IHistoryEntry<F>[]; view: IHistoryEntry<F>[] }>();
+	/** Merged views by connection key, valid while the lists and hidden ids are the same objects. */
+	const viewCache = new Map<string, { own: IHistoryEntry<F>[] | undefined; old: IHistoryEntry<F>[]; hide: string[] | undefined; view: IHistoryEntry<F>[] }>();
 
 	/**
 	 * One connection's history as the UI reads it: its own list, plus the list
-	 * under its legacy key when there is one. Referentially stable until either
-	 * list changes, because it is a useSyncExternalStore snapshot.
+	 * under its legacy key when there is one (less what this connection copied
+	 * or hid). Referentially stable until an input changes, because it is a
+	 * useSyncExternalStore snapshot.
 	 *
 	 * @param key - The connection's key.
 	 * @returns The entries, newest first.
@@ -248,13 +274,13 @@ export function createHistoryStore<F extends string>(options: IHistoryStoreOptio
 		const legacy = legacyOf(key);
 		const old = legacy === null ? undefined : bag[legacy];
 		if (old === undefined) return own ?? NO_ENTRIES;
-		if (own === undefined) return old;
+		const hide = hidden[key];
 		const cached = viewCache.get(key);
-		if (cached !== undefined && cached.own === own && cached.old === old) return cached.view;
-		const known = new Set(own.map((entry) => entry.id));
-		const combined = [...own, ...old.filter((entry) => !known.has(entry.id))].sort((a, b) => b.at - a.at);
+		if (cached !== undefined && cached.own === own && cached.old === old && cached.hide === hide) return cached.view;
+		const shadowed = new Set([...(own ?? []).map((entry) => entry.id), ...(hide ?? [])]);
+		const combined = [...(own ?? []), ...old.filter((entry) => !shadowed.has(entry.id))].sort((a, b) => b.at - a.at);
 		const view = trim(combined);
-		viewCache.set(key, { own, old, view });
+		viewCache.set(key, { own, old, hide, view });
 		return view;
 	}
 
@@ -271,19 +297,52 @@ export function createHistoryStore<F extends string>(options: IHistoryStoreOptio
 	}
 
 	/**
-	 * Which list holds an entry: the connection's own, else its legacy list.
+	 * The old-list entry with this id that the connection can see, if any.
 	 *
 	 * @param key - The connection's key.
 	 * @param id - The entry id.
-	 * @returns The key of the list that holds it, or null.
+	 * @returns The entry in the old list, or undefined.
 	 */
-	function holderOf(key: string, id: string): string | null {
-		if (bag[key]?.some((entry) => entry.id === id)) return key;
+	function legacyEntryOf(key: string, id: string): IHistoryEntry<F> | undefined {
 		const legacy = legacyOf(key);
-		if (legacy !== null && bag[legacy]?.some((entry) => entry.id === id)) return legacy;
-		// Not found anywhere: act on the connection's own list when it has one,
-		// exactly as a store without legacy keys always has.
-		return bag[key] !== undefined ? key : null;
+		if (legacy === null || hidden[key]?.includes(id)) return undefined;
+		return bag[legacy]?.find((entry) => entry.id === id);
+	}
+
+	/**
+	 * Change one entry the connection can see. An entry in its own list changes
+	 * there; an old-list entry is COPIED, changed, into its own list (same id,
+	 * so the copy stands in for it), and the old list is left as it is.
+	 *
+	 * @param key - The connection's key.
+	 * @param id - The entry id.
+	 * @param change - The change.
+	 */
+	function editEntry(key: string, id: string, change: (entry: IHistoryEntry<F>) => IHistoryEntry<F>): void {
+		const own = bag[key];
+		if (own?.some((entry) => entry.id === id)) {
+			setEntries(key, own.map((entry) => (entry.id === id ? change(entry) : entry)));
+			return;
+		}
+		const original = legacyEntryOf(key, id);
+		if (original === undefined) return;
+		setEntries(key, [...(own ?? []), change(original)].sort((a, b) => b.at - a.at));
+	}
+
+	/**
+	 * Hide old-list entries from one connection's view (remove, clear). The old
+	 * list itself is not written.
+	 *
+	 * @param key - The connection's key.
+	 * @param ids - The old-list ids to hide.
+	 * @returns Whether anything new was hidden.
+	 */
+	function hideLegacy(key: string, ids: readonly string[]): boolean {
+		const before = hidden[key] ?? [];
+		const added = ids.filter((id) => !before.includes(id));
+		if (added.length === 0) return false;
+		hidden = { ...hidden, [key]: [...before, ...added] };
+		return true;
 	}
 
 	// ── Hydration and persistence ─────────────────────────────────────────────
@@ -354,6 +413,24 @@ export function createHistoryStore<F extends string>(options: IHistoryStoreOptio
 		}
 		bag = next;
 
+		if (legacyKeyOf !== undefined) {
+			const rawHidden = prefs?.getPref(legacyHiddenKey);
+			hiddenStored = rawHidden !== undefined && rawHidden !== null;
+			const storedHidden: Record<string, string[]> = {};
+			if (rawHidden && typeof rawHidden === 'object' && !Array.isArray(rawHidden)) {
+				for (const [key, value] of Object.entries(rawHidden as Record<string, unknown>)) {
+					if (!Array.isArray(value)) continue;
+					const ids = value.filter((id): id is string => typeof id === 'string');
+					if (ids.length > 0) storedHidden[key] = ids;
+				}
+			}
+			// Ids hidden while no accessor was attached are kept alongside the file's.
+			for (const [key, ids] of Object.entries(hidden)) {
+				storedHidden[key] = [...new Set([...(storedHidden[key] ?? []), ...ids])];
+			}
+			hidden = storedHidden;
+		}
+
 		const rawRecording = prefs?.getPref(recordingKey);
 		const flags: Record<string, boolean> = {};
 		if (rawRecording && typeof rawRecording === 'object') {
@@ -391,6 +468,23 @@ export function createHistoryStore<F extends string>(options: IHistoryStoreOptio
 		bag = trimmed;
 		prefs.setPref(historyKey, bag);
 		prefs.setPref(recordingKey, recording);
+		if (legacyKeyOf !== undefined) {
+			// Keep only ids the connection's old list still holds, so the map
+			// stays as bounded as the lists it refers to.
+			const kept: Record<string, string[]> = {};
+			for (const [key, ids] of Object.entries(hidden)) {
+				const legacy = legacyOf(key);
+				const old = legacy === null ? undefined : bag[legacy];
+				const live = old === undefined ? [] : ids.filter((id) => old.some((entry) => entry.id === id));
+				// The same array when nothing was dropped: a merged view is cached on it.
+				if (live.length > 0) kept[key] = live.length === ids.length ? ids : live;
+			}
+			hidden = kept;
+			if (Object.keys(kept).length > 0 || hiddenStored) {
+				prefs.setPref(legacyHiddenKey, kept);
+				hiddenStored = true;
+			}
+		}
 		// The switches are on disk now, so nothing in memory outranks them.
 		unsavedRecording = {};
 		if (changed) notify();
@@ -500,46 +594,57 @@ export function createHistoryStore<F extends string>(options: IHistoryStoreOptio
 			setEntries(key, trim([entry, ...(bag[key] ?? [])]));
 			return;
 		}
-		// The connection has history under its old key too: trim the MERGED view,
-		// then give each surviving entry back to the list it came from. A run that
-		// repeats an old entry collapses onto it and stays in the old list.
+		// The connection has history under its old key too. Bound the MERGED
+		// view, and keep in the connection's own list every survivor that is not
+		// an untouched old entry. The old list is never written: an old entry the
+		// bound leaves out stays stored, and a run that repeats an old entry
+		// collapses onto a copy of it, which lands in the own list.
 		const merged = trim([entry, ...viewOf(key)]);
-		const fromLegacy = new Set((bag[legacy] ?? []).map((existing) => existing.id));
-		applyLists([
-			[key, merged.filter((kept) => !fromLegacy.has(kept.id))],
-			[legacy, merged.filter((kept) => fromLegacy.has(kept.id))],
-		]);
+		const untouched = new Set<IHistoryEntry<F>>(bag[legacy]);
+		setEntries(key, merged.filter((kept) => !untouched.has(kept)));
 	}
 
 	function removeEntry(key: string, id: string): void {
-		const holder = holderOf(key, id);
-		if (holder === null) return;
-		setEntries(holder, (bag[holder] as IHistoryEntry<F>[]).filter((entry) => entry.id !== id));
+		// An old entry the connection copied (pin, note, a repeat) lives in both
+		// lists: drop the copy AND hide the original, or removing it would bring
+		// the original back.
+		const hid = legacyEntryOf(key, id) !== undefined && hideLegacy(key, [id]);
+		const own = bag[key];
+		if (own?.some((entry) => entry.id === id)) {
+			setEntries(key, own.filter((entry) => entry.id !== id));
+			return;
+		}
+		if (hid) {
+			notify();
+			schedulePersist();
+		}
 	}
 
 	function togglePin(key: string, id: string): void {
-		const holder = holderOf(key, id);
-		if (holder === null) return;
-		setEntries(holder, (bag[holder] as IHistoryEntry<F>[]).map((entry) => (
-			entry.id === id ? { ...entry, pinned: !entry.pinned } : entry
-		)));
+		editEntry(key, id, (entry) => ({ ...entry, pinned: !entry.pinned }));
 	}
 
 	function setNote(key: string, id: string, note: string): void {
-		const holder = holderOf(key, id);
-		if (holder === null) return;
-		setEntries(holder, (bag[holder] as IHistoryEntry<F>[]).map((entry) => {
-			if (entry.id !== id) return entry;
+		editEntry(key, id, (entry) => {
 			const next = { ...entry };
 			if (note) next.note = note;
 			else delete next.note;
 			return next;
-		}));
+		});
 	}
 
 	function clearForKey(key: string): void {
 		const legacy = legacyOf(key);
-		applyLists(legacy === null ? [[key, []]] : [[key, []], [legacy, []]]);
+		const old = legacy === null ? undefined : bag[legacy];
+		const hid = old !== undefined && hideLegacy(key, old.map((entry) => entry.id));
+		if (bag[key] !== undefined) {
+			applyLists([[key, []]]);
+			return;
+		}
+		if (hid) {
+			notify();
+			schedulePersist();
+		}
 	}
 
 	function setRecording(key: string, on: boolean): void {

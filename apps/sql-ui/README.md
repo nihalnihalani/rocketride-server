@@ -360,10 +360,16 @@ connection, and **Clear** empties one connection's list, pins included.
 History is kept per connection. Connections are identified by their run kind,
 owner, team, project, source and node, so a deployment never shows your
 development history. History you saved before that identity existed is still
-read for your own development run of the same pipeline: it is never moved or
-deleted, a new run is saved under the new identity, pinning or annotating an
-older entry changes it where it lives, and **Clear** empties both. The
-recording switch and the pattern-check switch you chose then still apply.
+read for your own development run of the same pipeline, and is only read: it
+is never moved, changed or deleted. A new run is saved under the new identity;
+pinning or annotating an older entry, or re-running its statement, saves a
+copy under the new identity; deleting an older entry or **Clear** hides the
+older entries for this connection only. Your development run under another
+team reads the same older entries and still sees all of them. The 100-entry
+bound applies to the list you see, so an older entry it leaves out is still
+saved; only the 256 KB budget across all connections can drop the oldest
+entries, older ones included. The recording switch and the pattern-check
+switch you chose then still apply.
 
 Re-running an entry that changed data asks first and quotes what it did last
 time; the rerun is a fresh run with its own entry.
