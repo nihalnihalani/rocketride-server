@@ -49,7 +49,7 @@ import { GraphIcon } from '../icons';
 import { styles } from '../styles';
 import HistoryPanel from '../components/HistoryPanel';
 import RunSurface from '../components/RunSurface';
-import type { IRunSurfaceProps } from '../components/RunSurface';
+import { createLoadSlot } from '../graph/loadSlot';
 
 /** What the console says about itself, always visible. */
 export const WRITE_CONSOLE_BANNER = `Statements here run against the live database and can change or delete data. You are asked to confirm before anything is sent. Each statement is its own request: if a batch stops, the statements before it have already run and nothing is rolled back. ${TEXT_CHECK_SENTENCE}`;
@@ -86,13 +86,13 @@ export const WriteConsoleView: React.FC<IWriteConsoleViewProps> = ({ endpoint })
 	const gate = surfaceGate({ openable: allowed, blocked: allowed ? null : unavailable }, opened.current);
 
 	const [historyOpen, setHistoryOpen] = useState(false);
-	const [loadRequest, setLoadRequest] = useState<NonNullable<IRunSurfaceProps['loadRequest']>>({ text: '', seq: 0, run: false });
-	const seq = useRef(0);
+	// One slot for the life of the document: the surface takes each request once (see loadSlot.ts).
+	const [slot] = useState(createLoadSlot);
+	const [loadSeq, setLoadSeq] = useState(0);
 	// From History a statement is only loaded here, never sent: a write is run by pressing Execute and confirming.
 	const put = useCallback((text: string) => {
-		seq.current += 1;
-		setLoadRequest({ text, seq: seq.current, run: false });
-	}, []);
+		setLoadSeq(slot.put({ text, run: false }));
+	}, [slot]);
 	const subtitle = dialect ? [engineText(dialect), targetText(dialect)].filter(Boolean).join(' \u00b7 ') : view.address;
 
 	return (
@@ -104,7 +104,7 @@ export const WriteConsoleView: React.FC<IWriteConsoleViewProps> = ({ endpoint })
 						<Banner variant="warning">{WRITE_CONSOLE_BANNER}</Banner>
 					</div>
 					<div style={{ flex: 1, minHeight: 0 }}>
-						<RunSurface endpoint={endpoint} mode="write" paused={gate.paused} loadRequest={loadRequest} onOpenHistory={() => setHistoryOpen(true)} />
+						<RunSurface endpoint={endpoint} mode="write" paused={gate.paused} loadSlot={slot} loadSeq={loadSeq} onOpenHistory={() => setHistoryOpen(true)} />
 					</div>
 				</>
 			) : (

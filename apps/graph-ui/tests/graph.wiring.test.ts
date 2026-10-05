@@ -84,3 +84,19 @@ test('the workbench and the write console keep an opened run surface through a r
 	const surface = code(read('components', 'RunSurface.tsx'));
 	assert.match(surface, /canRun: \(\) => [^\n]*paused == null/, 'a paused surface sends nothing');
 });
+
+// GX-FE-03: a request is consumed by the surface through the host's slot, never de-duplicated by a ref the surface
+// re-creates on every mount; a request the surface cannot run now is never queued to run later.
+test('the run surface takes its editor request from the host\'s slot, and the hosts never queue a run for a surface that is not on screen', () => {
+	const surface = code(read('components', 'RunSurface.tsx'));
+	assert.ok(/loadSlot\.take\(\)/.test(surface), 'the surface takes the request');
+	assert.ok(!/loadRequest\.seq === handled\.current/.test(surface), 'a per-mount ref decides what was handled');
+	for (const file of ['WorkbenchView.tsx', 'WriteConsoleView.tsx']) {
+		const view = code(read('views', file));
+		assert.ok(/useState\(createLoadSlot\)/.test(view), `${file} keeps one slot for the life of the document`);
+		const surfaceTag = view.slice(view.indexOf('<RunSurface'), view.indexOf('/>', view.indexOf('<RunSurface')));
+		assert.ok(/loadSlot=\{slot\}/.test(surfaceTag), `${file} hands the slot to the surface`);
+	}
+	const workbench = code(read('views', 'WorkbenchView.tsx'));
+	assert.ok(/const runNow = run && now\.mounted && now\.paused === null;/.test(workbench) && /slot\.put\(\{ text, run: runNow \}\)/.test(workbench), 'a run is asked for only while the surface can run it');
+});

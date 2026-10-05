@@ -45,7 +45,7 @@ import { styles } from '../styles';
 import AskBar from '../components/AskBar';
 import HistoryPanel from '../components/HistoryPanel';
 import RunSurface from '../components/RunSurface';
-import type { IRunSurfaceProps } from '../components/RunSurface';
+import { createLoadSlot } from '../graph/loadSlot';
 
 /** A sidebar request older than this when the workbench mounts is not replayed. */
 const REQUEST_FRESH_MS = 3000;
@@ -74,12 +74,18 @@ export const WorkbenchView: React.FC<IWorkbenchViewProps> = ({ endpoint }) => {
 	const gate = surfaceGate(view, opened.current);
 
 	const [historyOpen, setHistoryOpen] = useState(false);
-	const [loadRequest, setLoadRequest] = useState<NonNullable<IRunSurfaceProps['loadRequest']>>({ text: '', seq: 0, run: false });
-	const seq = useRef(0);
+	// One slot for the life of the document: the surface takes each request once (see loadSlot.ts).
+	const [slot] = useState(createLoadSlot);
+	const [loadSeq, setLoadSeq] = useState(0);
+	const gateNow = useRef(gate);
+	gateNow.current = gate;
+	// A run is asked for only while the surface is on screen and can run it: nothing is queued to run by itself later.
 	const put = useCallback((text: string, run: boolean) => {
-		seq.current += 1;
-		setLoadRequest({ text, seq: seq.current, run });
-	}, []);
+		const now = gateNow.current;
+		const runNow = run && now.mounted && now.paused === null;
+		if (run && !runNow) announcer.announce(`The statement was put in the editor but not run. ${now.paused ?? 'This connection cannot be browsed yet.'}`);
+		setLoadSeq(slot.put({ text, run: runNow }));
+	}, [slot]);
 
 	// No probe yet (opened from a stale link or right after a refresh): ask the node who it is.
 	useEffect(() => {
@@ -131,7 +137,8 @@ export const WorkbenchView: React.FC<IWorkbenchViewProps> = ({ endpoint }) => {
 						endpoint={endpoint}
 						mode="read"
 						paused={gate.paused}
-						loadRequest={loadRequest}
+						loadSlot={slot}
+						loadSeq={loadSeq}
 						topSlot={<AskBar endpoint={endpoint} onPreview={(cypher) => put(cypher, false)} />}
 						onOpenHistory={() => setHistoryOpen(true)}
 					/>

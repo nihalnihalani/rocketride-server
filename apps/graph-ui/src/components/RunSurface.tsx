@@ -60,6 +60,7 @@ import type { IWriteConfirmation } from '../graph/writeConfirm';
 import { GRAPH_BATCH_WORDS, prepareStatement, refuseNonReads, toHistoryEntry } from '../graph/runConfig';
 import { chooseTab, summarizeResult } from '../graph/results';
 import type { ResultTab } from '../graph/results';
+import type { ILoadSlot } from '../graph/loadSlot';
 import { inspectorTextOfRow } from '../graph/rowInspect';
 import type { ReadQueryResult } from '../graph/types';
 import { STOP_WAITING_NOTE, resultAnnouncement, rowsMeta, truncationText } from '../graph/wording';
@@ -89,8 +90,10 @@ export interface IRunSurfaceProps {
 	 * or no longer allows this mode), or null/absent when it can run. Nothing is sent while it is set.
 	 */
 	paused?: string | null;
-	/** Text the host asks the editor to hold (history load, Ask preview, label preview). */
-	loadRequest: { text: string; seq: number; run: boolean } | null;
+	/** The host's mailbox for text the editor should hold (history load, Ask preview, label preview); each request is taken once. */
+	loadSlot: ILoadSlot;
+	/** Changes whenever the host puts a request in the slot. */
+	loadSeq: number;
 	/** Extra content above the editor (the Ask bar). */
 	topSlot?: React.ReactNode;
 	/** Told when the editor text changes (so the host can know a preview was edited). */
@@ -132,7 +135,7 @@ function entryId(): string {
  * @param props - See {@link IRunSurfaceProps}.
  * @returns The surface.
  */
-export const RunSurface: React.FC<IRunSurfaceProps> = ({ endpoint, mode, paused = null, loadRequest, topSlot, onTextChange, onOpenHistory }) => {
+export const RunSurface: React.FC<IRunSurfaceProps> = ({ endpoint, mode, paused = null, loadSlot, loadSeq, topSlot, onTextChange, onOpenHistory }) => {
 	const { client, isConnected } = useShellConnection();
 	const prefs = usePrefs();
 	const { probes } = useGraphEndpoints();
@@ -338,15 +341,15 @@ export const RunSurface: React.FC<IRunSurfaceProps> = ({ endpoint, mode, paused 
 		startRun(targets, true);
 	}, [startRun]);
 
-	// A request from the host: put text in the editor, and (for a click on a label) run it.
-	const handled = useRef(0);
+	// A request from the host: put text in the editor, and (for a click on a label) run it. The request is TAKEN from
+	// the host's slot, so a surface that mounts again finds nothing to replay.
 	useEffect(() => {
-		if (!loadRequest || loadRequest.seq === handled.current) return;
-		handled.current = loadRequest.seq;
-		editor.current?.setText(loadRequest.text);
-		changeText(loadRequest.text);
-		if (loadRequest.run) startRun([{ text: loadRequest.text }], false);
-	}, [loadRequest]); // eslint-disable-line react-hooks/exhaustive-deps
+		const request = loadSlot.take();
+		if (!request) return;
+		editor.current?.setText(request.text);
+		changeText(request.text);
+		if (request.run) startRun([{ text: request.text }], false);
+	}, [loadSlot, loadSeq]); // eslint-disable-line react-hooks/exhaustive-deps
 
 	// ── Row inspector (Table) ────────────────────────────────────────────────
 	const [openRow, setOpenRow] = useState<number | null>(null);
