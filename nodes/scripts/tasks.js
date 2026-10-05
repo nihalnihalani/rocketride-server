@@ -86,6 +86,8 @@ const DB_LIVE_SUITES = [
     'test_graph_drivers_full.py',
     'test_graph_neo4j_full.py',
     'test_graph_falkordb_full.py',
+    // Regenerates graph-ui's wire fixtures (apps/graph-ui/tests/fixtures/v1) and compares.
+    'test_graph_wire_fixtures_full.py',
 ];
 
 // Run a second time with RR_TEST_AGE_DSN pointing at a transaction-mode pooler
