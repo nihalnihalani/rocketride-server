@@ -149,9 +149,8 @@ returned data.
 This setting is off by default. Turning it on permits raw Cypher through the
 execute tool and QuestionType.EXECUTE; those calls skip LLM translation and the
 safe read-only gate. They still use the AGE translator and its resource
-controls, and they still refuse schema-qualified function calls and `CALL`
-(no qualified name is allow-listed for this node). Enable it only for trusted
-callers that require writes or raw Cypher.
+controls, and refuse schema-qualified function calls and `CALL`. Enable it
+only for trusted callers that require writes or raw Cypher.
 
 ## Limitations
 
@@ -169,10 +168,9 @@ enabled.
 
 Apache AGE cannot execute bare Cypher. Every query path is translated, and the
 safe path runs in a server-side read-only transaction with a semantic firewall
-(writes, `CALL` and every schema-qualified function call are refused before
+(writes, `CALL` and schema-qualified function calls are refused before
 anything reaches the database), the base Cypher safety check, and a
-transaction-local statement timeout. Use the built-in Cypher functions;
-unqualified names resolve only to Apache AGE's own functions.
+transaction-local statement timeout. Use the built-in Cypher functions.
 Schema reflection lists AGE labels, samples node and relationship properties,
 and records every observed endpoint label pair. A failure is recorded in the
 schema block (the last good schema is kept, marked stale) rather than

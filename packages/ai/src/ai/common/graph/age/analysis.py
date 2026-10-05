@@ -82,8 +82,7 @@ class CypherFacts:
     function_names: Set[str] = field(default_factory=set)
     # Function invocations whose name carries a namespace (``ns.fn(...)``), or
     # whose single back-quoted name contains a dot, as unescaped segments in
-    # source order. AGE resolves unqualified names only among its own
-    # ``ag_catalog.age_*`` functions, so the firewall gates qualified ones.
+    # source order (the firewall gates them: firewall.check_qualified_calls).
     qualified_functions: List[Tuple[str, ...]] = field(default_factory=list)
     # Every CALLed procedure name (qualified or not), as unescaped segments.
     procedure_names: List[Tuple[str, ...]] = field(default_factory=list)

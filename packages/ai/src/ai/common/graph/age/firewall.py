@@ -33,12 +33,11 @@ Two rule families, applied per the design:
   rejected here before translation; the true guard is the read-only
   transaction the node runs safe queries in (server-side, like FalkorDB's
   RO_QUERY), with this check giving precise, pre-flight errors.
-- **Qualified calls** — both paths. AGE resolves an unqualified function only
-  among its own ``ag_catalog.age_*`` functions, but a schema-qualified name
-  (``ns.fn(...)``) goes to ordinary PostgreSQL function resolution, outside
-  the Cypher function set this layer reasons about. The safe path rejects every
-  qualified function call; the raw path admits only names on an explicit
-  allowlist (empty by default) and gates every CALLed procedure the same way.
+- **Qualified calls** — both paths. The safe path rejects every
+  schema-qualified function call (``ns.fn(...)``): it runs the built-in Cypher
+  functions only. The raw path admits a qualified function only when its name
+  is on an explicit allowlist (empty by default) and gates every CALLed
+  procedure the same way.
 
 Caps are constructor arguments; the node currently wires only
 ``statement_timeout_ms`` through its config (``query_timeout_ms`` in
@@ -77,7 +76,7 @@ class FirewallConfig:
     # Raw (execute) path only: exact ``schema.function`` names that may be
     # called qualified, or CALLed as procedures. Compared segment by segment,
     # case-sensitively, after back-quote unescaping. Never consulted on the safe
-    # path, and deliberately empty: AGE's own catalog schema is not assumed safe.
+    # path, and empty by default.
     allowed_qualified_functions: FrozenSet[str] = field(default_factory=frozenset)
 
 

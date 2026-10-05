@@ -36,10 +36,11 @@ inherit the engine's full environment, only an allowlist:
 
 - process basics: `PATH`, `HOME`, locale, TLS and proxy settings
 - interpreter and ML runtime settings (`PYTHON*`, `HF_*`, `CUDA_*`, and similar)
-- every `ROCKETRIDE_` variable except two the engine removes,
-  `ROCKETRIDE_DB_DSN` and `ROCKETRIDE_DB_RESOLVE_ERROR`. A task that uses a
-  RocketRide database node then gets its own resolved `ROCKETRIDE_DB_DSN`.
-  Any other `ROCKETRIDE_DB_*` name passes through like the rest.
+- every `ROCKETRIDE_` variable except `ROCKETRIDE_DB_DSN` and
+  `ROCKETRIDE_DB_RESOLVE_ERROR` (and the former broker names below), which the
+  engine removes in any spelling. A task that uses a RocketRide database node
+  then gets its own resolved `ROCKETRIDE_DB_DSN`. Any other `ROCKETRIDE_DB_*`
+  name passes through like the rest.
 - what nodes and the task itself use directly: `RR_STORE_URL`,
   `RR_STORE_SECRET_KEY`, `RR_SIGNING_KEY`, `RR_BASE_URL`, `RR_CORS_ORIGINS`,
   `RR_OAUTH_BROKER_URL`, `RR_PROC_PRIVATE`, `MEDIA_TOOLKIT_FFMPEG`, `AWS_*`, and
@@ -49,14 +50,25 @@ inherit the engine's full environment, only an allowlist:
 Pipeline code can read everything on that list. Any other engine setting stays
 in the engine.
 
-The RocketRide cloud database broker is configured with `RR_DB_BROKER_URL` and
-`RR_DB_BROKER_TOKEN`. Its token can resolve any tenant's database connection
-string, so it lives in the operator-only `RR_*` tier: it is never substituted
-into a pipeline, never returned or changed by the account `get_env` and
-`set_env` commands, and never passed to a task. These settings were previously
-named `ROCKETRIDE_DB_BROKER_URL` and `ROCKETRIDE_DB_BROKER_TOKEN`. The engine
-refuses to start while either old name is set, even next to the new one: rename
-them in the deployment configuration and secret mapping in the same change.
+The RocketRide cloud database broker is configured with the operator-only
+settings `RR_DB_BROKER_URL` and `RR_DB_BROKER_TOKEN`. They are never
+substituted into a pipeline, never returned or changed by the account
+`get_env` and `set_env` commands, and never passed to a task, whatever
+`RR_SUBPROCESS_ENV` allows. The engine refuses to start while the former names
+`ROCKETRIDE_DB_BROKER_URL` or `ROCKETRIDE_DB_BROKER_TOKEN` are set, in its
+environment or in its `.env` file, even next to the new names: rename them in
+the deployment configuration and secret mapping in the same change. A hosted
+engine without the broker settings logs a warning at startup, and its
+RocketRide database nodes report that the broker is not configured.
+
+Each RocketRide database node connects to the database of the organization
+that runs the pipeline (of the user, where there is no organization). The
+engine resolves that connection from the task's own identity; nothing in the
+pipeline, a node's configuration or the environment selects it. The
+connection string the broker returns must require TLS: an explicit `sslmode`
+of `require`, `verify-ca` or `verify-full` is used as issued, a missing one
+becomes `require`, and one that does not require TLS is refused except for a
+database on the loopback interface.
 
 | Variable            | Effect                                                                                                                                                                                                        |
 | ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |

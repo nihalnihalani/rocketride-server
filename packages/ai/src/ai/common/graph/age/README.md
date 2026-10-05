@@ -19,12 +19,10 @@ the version gaps. This package is that translation, as a **pure transform**
 2. **Firewall** ([firewall.py](firewall.py)) — resource caps on **both**
    paths (query length, variable-length depth, statement timeout); semantic
    read-only rules (no writes, no CALL) on the **safe** path only. Qualified
-   calls on **both** paths: AGE resolves an unqualified function only among
-   its own `ag_catalog.age_*` functions, so the safe path rejects every
-   schema-qualified function call (`ns.fn(…)`, back-quoted or nested), and the
-   raw path accepts a qualified function, or any `CALL`, only when its exact
-   `schema.name` is on `FirewallConfig.allowed_qualified_functions` — empty by
-   default; AGE's own catalog schema is not assumed safe.
+   calls on **both** paths: the safe path rejects schema-qualified function
+   calls (use the built-in Cypher functions), and the raw path accepts a
+   qualified function, or a `CALL`, only when its exact `schema.name` is on
+   `FirewallConfig.allowed_qualified_functions` (empty by default).
 3. **Dialect** ([capabilities.py](capabilities.py)) — capability table keyed
    by AGE version: `SUPPORTED` / `EMULATE` (rewrite hook; framework only in
    v1) / `REJECT` (fail loud pre-flight) / `TBD` (unverified: passes through,

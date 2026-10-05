@@ -306,8 +306,8 @@ def test_non_postgres_dsn_rejected(broker):
 
 
 # ---------------------------------------------------------------------------
-# Legacy names: the broker settings left the substitutable ROCKETRIDE_*
-# namespace. Any value under an old name is a hard error, never a fallback.
+# Legacy names: the broker settings were renamed from ROCKETRIDE_* to RR_*.
+# Any value under an old name is a hard error, never a fallback.
 # ---------------------------------------------------------------------------
 
 LEGACY_SENTINEL = 'sentinel-legacy-broker-token'
@@ -344,7 +344,7 @@ def test_check_refuses_a_legacy_name_alone(no_broker_env, monkeypatch, legacy):
 
 @pytest.mark.parametrize('legacy_value', [TEST_TOKEN, 'a-different-token'], ids=['same-value', 'conflicting-value'])
 def test_check_refuses_legacy_even_beside_the_new_name(no_broker_env, monkeypatch, legacy_value):
-    """With both set, the old name still exposes the token to placeholders."""
+    """With both set, the old name is still refused."""
     from ai.account.base import check_db_broker_environment
 
     monkeypatch.setenv('RR_DB_BROKER_URL', 'https://broker.example/provision')
