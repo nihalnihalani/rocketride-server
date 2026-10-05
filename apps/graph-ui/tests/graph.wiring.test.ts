@@ -130,3 +130,15 @@ test('the graph offers Stop waiting for whatever it is waiting on, in the toolba
 	const inspector = code(read('components', 'InspectorPanel.tsx'));
 	assert.ok(/state\.busy !== null && <Button[^>]*onClick=\{\(\) => session\.stopWaiting\(\)\}>Stop waiting<\/Button>/.test(inspector), 'the inspector offers it beside Refresh');
 });
+
+// GX-FE-09: Run was re-enabled once Stop waiting appeared, and a press then did nothing at all.
+test('Run is disabled for as long as a statement runs, and a run that cannot start says why', () => {
+	const surface = code(read('components', 'RunSurface.tsx'));
+	const buttons = surface.match(/<Button variant="(primary|ghost)" disabled=\{[^}]*\} onClick=\{\(\) => run\((false|true)\)\}/g) ?? [];
+	assert.equal(buttons.length, 2, 'Run and Run all');
+	for (const button of buttons) assert.ok(button.includes('disabled={runner.running || blocked !== null}'), button);
+	const startRun = surface.slice(surface.indexOf('const startRun = useCallback'), surface.indexOf('const run = useCallback'));
+	assert.ok(/runRefusal\(\{ running: runner\.running, blocked \}\)/.test(startRun), 'startRun refuses with a sentence');
+	const confirm = surface.slice(surface.indexOf('onConfirm={'), surface.indexOf('onCancel={'));
+	assert.ok(/runRefusal\(/.test(confirm), 'so does confirming a write');
+});

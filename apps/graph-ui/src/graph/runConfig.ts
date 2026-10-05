@@ -93,6 +93,25 @@ export function refuseNonReads(statements: readonly IPreparedStatement[], canWri
 }
 
 // =============================================================================
+// STARTING A RUN
+// =============================================================================
+
+/** Said when a run is asked for while the last one is still running (one batch at a time). */
+export const STILL_RUNNING_TEXT = 'Nothing was sent: a statement is still running. Wait for it, or stop waiting, then run again.';
+
+/**
+ * Why a run asked for now cannot start, in words, or null when it can.
+ *
+ * @param state - Whether a batch is running, and why the surface sends nothing (or null).
+ * @returns The sentence to announce, or null.
+ */
+export function runRefusal(state: { running: boolean; blocked: string | null }): string | null {
+	if (state.blocked !== null) return `Nothing was sent. ${state.blocked}`;
+	if (state.running) return STILL_RUNNING_TEXT;
+	return null;
+}
+
+// =============================================================================
 // SETTLING A RUN (the browse editor reads rows; the write console reports what execute did)
 // =============================================================================
 

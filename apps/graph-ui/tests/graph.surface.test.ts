@@ -11,7 +11,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { entrySummary } from '../src/components/HistoryPanel';
 import { createLoadSlot } from '../src/graph/loadSlot';
-import { historySummaryOf, limitPatch, settleRun, toHistoryEntry } from '../src/graph/runConfig';
+import { STILL_RUNNING_TEXT, historySummaryOf, limitPatch, runRefusal, settleRun, toHistoryEntry } from '../src/graph/runConfig';
 import type { GraphValue, ReadQueryResult } from '../src/graph/types';
 import { resultMeta } from '../src/graph/wording';
 import { node } from './support/builders';
@@ -74,4 +74,15 @@ test('history keeps a write\'s affected count without a limit, and a read\'s row
 test('the result line of a write leads with the affected count', () => {
 	assert.equal(resultMeta({ outcome: 'affected', affected: 3, ms: 400 }, answer([])), '3 affected · 0 rows returned (limit 25,000) · 0.4 s round trip');
 	assert.equal(resultMeta({ outcome: 'rows', ms: 400 }, answer([[1]], { row_limit: 1000 })), '1 row returned (limit 1,000) · 0.4 s round trip');
+});
+
+// -----------------------------------------------------------------------------
+// GX-FE-09: a run that cannot start says so
+// -----------------------------------------------------------------------------
+
+test('a run asked for while a statement is still running, or while the surface is paused, is refused with a sentence', () => {
+	assert.equal(runRefusal({ running: false, blocked: null }), null);
+	assert.equal(runRefusal({ running: true, blocked: null }), STILL_RUNNING_TEXT);
+	assert.match(STILL_RUNNING_TEXT, /^Nothing was sent: a statement is still running\./);
+	assert.equal(runRefusal({ running: true, blocked: 'Checking this connection again.' }), 'Nothing was sent. Checking this connection again.');
 });

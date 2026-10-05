@@ -57,7 +57,7 @@ import { createGraphSession } from '../graph/graphSession';
 import type { IGraphSession } from '../graph/graphSession';
 import { confirmationParagraphs, describeWrites } from '../graph/writeConfirm';
 import type { IWriteConfirmation } from '../graph/writeConfirm';
-import { GRAPH_BATCH_WORDS, historySummaryOf, limitPatch, prepareStatement, refuseNonReads, settleRun, toHistoryEntry } from '../graph/runConfig';
+import { GRAPH_BATCH_WORDS, historySummaryOf, limitPatch, prepareStatement, refuseNonReads, runRefusal, settleRun, toHistoryEntry } from '../graph/runConfig';
 import { chooseTab, summarizeResult } from '../graph/results';
 import type { ResultTab } from '../graph/results';
 import type { ILoadSlot } from '../graph/loadSlot';
@@ -316,8 +316,10 @@ export const RunSurface: React.FC<IRunSurfaceProps> = ({ endpoint, mode, paused 
 
 	// ── Running ──────────────────────────────────────────────────────────────
 	const startRun = useCallback((targets: IRunTarget[], fromEditor: boolean) => {
-		if (blocked !== null) {
-			announce(`Nothing was sent. ${blocked}`);
+		// A press while a batch runs (keyboard, History) or while the surface is paused is refused out loud, never dropped.
+		const refusal = runRefusal({ running: runner.running, blocked });
+		if (refusal !== null) {
+			announce(refusal);
 			return;
 		}
 		if (targets.length === 0) {
@@ -380,7 +382,7 @@ export const RunSurface: React.FC<IRunSurfaceProps> = ({ endpoint, mode, paused 
 					<QueryEditor ref={editor} value={text} onChange={changeText} onRun={() => run(false)} onRunAll={() => run(true)} onCursorChange={syncCursor} label={mode === 'read' ? 'Cypher query' : 'Cypher statements to execute'} />
 				</div>
 				<div style={styles.runBar}>
-					<Button variant="primary" disabled={!runner.canStop && runner.running || blocked !== null} onClick={() => run(false)} title="Run the selection or the statement at the caret (Ctrl/Cmd+Enter)">
+					<Button variant="primary" disabled={runner.running || blocked !== null} onClick={() => run(false)} title="Run the selection or the statement at the caret (Ctrl/Cmd+Enter)">
 						{mode === 'read' ? 'Run' : 'Execute'}
 					</Button>
 					<Button variant="ghost" disabled={runner.running || blocked !== null} onClick={() => run(true)} title="Run every statement in order (Ctrl/Cmd+Shift+Enter)">
@@ -458,8 +460,9 @@ export const RunSurface: React.FC<IRunSurfaceProps> = ({ endpoint, mode, paused 
 					onConfirm={() => {
 						const targets = confirm.targets;
 						setConfirm(null);
-						if (blocked !== null) {
-							announce(`Nothing was sent. ${blocked}`);
+						const refusal = runRefusal({ running: runner.running, blocked });
+						if (refusal !== null) {
+							announce(refusal);
 							return;
 						}
 						void runner.runTargets(targets, { fromEditor: true });
