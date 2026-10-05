@@ -69,30 +69,37 @@ test('a deployment is named as one and shows the owning team, not the selected o
 	assert.match(connectionView(endpoint({ runKind: 'deploy' }), undefined).address, /\(deployment\)$/);
 });
 
-test('empty states: loading, error, none running (cause unknown), unreachable, and unprovisioned only on positive evidence', () => {
-	assert.equal(emptyState('idle', [], {}, null)?.kind, 'loading');
-	assert.equal(emptyState('loading', [], {}, null)?.kind, 'loading');
-	assert.equal(emptyState('error', [], {}, 'getTasks failed')?.kind, 'error');
-	const none = emptyState('ready', [], {}, null);
+test('empty states: loading, error, none running (cause unknown) and unreachable', () => {
+	assert.equal(emptyState('idle', [], null)?.kind, 'loading');
+	assert.equal(emptyState('loading', [], null)?.kind, 'loading');
+	assert.equal(emptyState('error', [], 'getTasks failed')?.kind, 'error');
+	const none = emptyState('ready', [], null);
 	assert.equal(none?.kind, 'none-running');
 	assert.match(none?.unknown ?? '', /does not appear in this list at all/);
 	assert.ok(!/not provisioned|unprovisioned|does not exist/i.test(`${none?.title} ${none?.description}`), 'an empty list never claims the graph is missing');
-	assert.equal(emptyState('ready', [endpoint({ state: 'unreachable' })], {}, null)?.kind, 'unreachable');
-	assert.equal(emptyState('ready', [endpoint({ state: 'stopped' }), endpoint({ key: 'b', state: 'inaccessible' })], {}, null)?.kind, 'unreachable');
-	assert.equal(emptyState('ready', [endpoint()], {}, null), null, 'something is usable: nothing to say');
-	assert.equal(emptyState('loading', [endpoint()], {}, null), null, 'cached endpoints stay visible while refreshing');
-	const e = endpoint();
-	const positive = emptyState('ready', [e], { [e.key]: failed('Graph "rocketride" does not exist\nCreate it first') }, null);
-	assert.equal(positive?.kind, 'unprovisioned');
-	assert.match(positive?.description ?? '', /Graph "rocketride" does not exist/);
-	// A failure that merely mentions a graph does not count, nor does a healthy node among failures.
-	assert.notEqual(emptyState('ready', [e], { [e.key]: failed('Connection refused while reading graph rocketride') }, null)?.kind, 'unprovisioned');
-	const ok = endpoint({ key: 'ok' });
-	assert.notEqual(emptyState('ready', [e, ok], { [e.key]: failed('graph x does not exist'), ok: probeOf('neo4j') }, null)?.kind, 'unprovisioned');
+	assert.equal(emptyState('ready', [endpoint({ state: 'unreachable' })], null)?.kind, 'unreachable');
+	assert.equal(emptyState('ready', [endpoint({ state: 'stopped' }), endpoint({ key: 'b', state: 'inaccessible' })], null)?.kind, 'unreachable');
+	assert.equal(emptyState('ready', [endpoint()], null), null, 'something is usable: nothing to say');
+	assert.equal(emptyState('loading', [endpoint()], null), null, 'cached endpoints stay visible while refreshing');
+});
+
+// GX-FE-12, AGE-T11, GX-CT-12: the page had a "graph does not exist yet" state keyed on a probe's wording. The probe
+// (`dialect`) never touches the database, and a graph that does not exist stops the node at pipeline start, so the
+// node never appears here at all. Nothing a listed node answers can say a graph is missing, so the page never says it
+// (and no longer reads probe text to decide what to claim).
+test('the page never claims a graph does not exist: a node that cannot be used is unreachable, and a missing graph is named among the start-up failures it cannot see', () => {
+	const e = endpoint({ state: 'unreachable', stateDetail: 'Graph "rocketride" does not exist' });
+	const said = emptyState('ready', [e], null);
+	assert.equal(said?.kind, 'unreachable');
+	assert.doesNotMatch(`${said?.title} ${said?.description}`, /does not exist/);
+	const none = emptyState('ready', [], null);
+	assert.match(none?.unknown ?? '', /does not appear in this list at all/);
+	assert.match(none?.unknown ?? '', /graph that does not exist/, 'a missing graph is one reason a node is not listed');
+	assert.match(none?.unknown ?? '', /pipeline.s log/);
 });
 
 test('failed discovery keeps already discovered endpoints visible instead of an empty state', () => {
-	assert.equal(emptyState('error', [endpoint()], {}, 'refresh failed'), null);
+	assert.equal(emptyState('error', [endpoint()], 'refresh failed'), null);
 });
 
 test('a node that advertises read_query is not badged as needing an upgrade, and one that says false is', () => {

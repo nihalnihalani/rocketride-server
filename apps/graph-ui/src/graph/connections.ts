@@ -33,17 +33,18 @@
 // WHAT AN EMPTY LIST CAN SAY
 // A graph node that fails to START never appears in the task list at all, so an
 // empty list is NOT evidence that a graph was never provisioned, and this app
-// has no authorised status API that could prove it. The three states are kept
-// apart on purpose:
+// has no authorised status API that could prove it. A graph that does not exist
+// is one such start-up failure: the Apache AGE node checks its graph when the
+// pipeline starts and does not create it. And the probe (`dialect`) of a node
+// that did start never reads the database, so nothing a listed node answers can
+// say its graph is missing either. The page therefore never claims it:
 //
 //   none-running   no running supported graph node was found. Cause unknown:
 //                  nothing started, still starting, or a node that failed to
-//                  start. The text gives troubleshooting steps and says what
-//                  is unknown.
+//                  start (for example because its graph does not exist). The
+//                  text gives troubleshooting steps and says what is unknown.
 //   unreachable    nodes were found but none could be reached or used (stopped,
 //                  unreachable, or no permission). They exist; the card says why.
-//   unprovisioned  claimed ONLY when a probe returned text that positively says
-//                  the graph does not exist. Nothing in an empty list produces it.
 // =============================================================================
 
 import type { IExplorerEndpoint, IProbeResult } from 'shared/explorer';
@@ -82,7 +83,7 @@ export interface IConnectionView {
 }
 
 /** The empty states of the connections page. */
-export type EmptyKind = 'loading' | 'none-running' | 'unreachable' | 'unprovisioned' | 'error';
+export type EmptyKind = 'loading' | 'none-running' | 'unreachable' | 'error';
 
 /** The text for an empty state. */
 export interface IEmptyState {
@@ -229,19 +230,15 @@ export function surfaceGate(view: Pick<IConnectionView, 'openable' | 'blocked'>,
 // EMPTY STATES
 // =============================================================================
 
-/** Text in a probe error that positively says the graph does not exist. */
-const UNPROVISIONED_EVIDENCE = /\bgraph\b[^\n]{0,80}\b(does not exist|not found|is missing|has not been created)\b/i;
-
 /**
  * Which empty state applies, and what it may claim.
  *
  * @param status - The discovery lifecycle.
  * @param endpoints - The discovered endpoints.
- * @param probes - Probe results by endpoint key.
  * @param error - The discovery failure text, when it failed.
  * @returns The empty state, or null when there is something to show.
  */
-export function emptyState(status: 'idle' | 'loading' | 'ready' | 'error', endpoints: readonly IExplorerEndpoint[], probes: Readonly<Record<string, IProbeResult>>, error: string | null): IEmptyState | null {
+export function emptyState(status: 'idle' | 'loading' | 'ready' | 'error', endpoints: readonly IExplorerEndpoint[], error: string | null): IEmptyState | null {
 	if (status === 'idle' || (status === 'loading' && endpoints.length === 0)) {
 		return { kind: 'loading', title: 'Discovering graph nodes', description: 'Scanning your running pipelines for Apache AGE, Neo4j and FalkorDB graph nodes...', unknown: null };
 	}
@@ -253,15 +250,8 @@ export function emptyState(status: 'idle' | 'loading' | 'ready' | 'error', endpo
 			kind: 'none-running',
 			title: 'No running graph node found',
 			description: 'Start a pipeline that has a tools source wired to a graph node (rocketride_graph, graph_neo4j or graph_falkordb), then refresh. A pipeline that is still starting does not appear yet.',
-			unknown: 'A graph node that fails to start does not appear in this list at all, so an empty list does not tell whether a graph exists for your organization or why a node is missing. Check the pipeline’s log for a start-up error.',
+			unknown: 'A graph node that fails to start does not appear in this list at all (for example a node pointed at a graph that does not exist), so an empty list does not tell whether a graph exists for your organization or why a node is missing. Check the pipeline’s log for a start-up error.',
 		};
-	}
-	const positive = endpoints.find((e) => {
-		const message = probes[e.key]?.error?.message ?? '';
-		return probes[e.key]?.ok === false && UNPROVISIONED_EVIDENCE.test(message);
-	});
-	if (positive && endpoints.every((e) => probes[e.key]?.ok === false)) {
-		return { kind: 'unprovisioned', title: 'The graph does not exist yet', description: `The node answered that its graph is missing: ${(probes[positive.key]?.error?.message ?? '').split('\n')[0]}`, unknown: null };
 	}
 	if (endpoints.every((e) => e.state !== 'ready')) {
 		return { kind: 'unreachable', title: 'Graph nodes found, but none can be used', description: 'Each card says why: the pipeline is stopped, the node did not answer, or you may not call its tools.', unknown: null };

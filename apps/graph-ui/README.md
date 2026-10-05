@@ -55,8 +55,12 @@ whether writes are allowed, and a sentence on what the node's read path
 guarantees. **Test connection** asks the node again.
 
 An empty list does not say why. If the task list is empty the page says that it
-cannot tell whether nothing is running or something is wrong, and it claims the
-graph does not exist only when a node itself said so.
+cannot tell whether nothing is running or something is wrong. A node that fails
+to start is never listed: for example, `rocketride_graph` checks its Apache AGE
+graph when the pipeline starts and does not create it, so a graph name that does
+not exist stops the pipeline, and the error is in the pipeline's log. On
+RocketRide's managed database the graph `rocketride` is created for your
+organization when the database is provisioned.
 
 The app never holds a connection string or a task token in anything it saves or
 shows. Task tokens are kept in memory only, per session.

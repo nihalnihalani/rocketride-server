@@ -106,3 +106,17 @@ test('the AGE and FalkorDB notes say the template cannot write, and every note s
 	for (const key of ['age', 'falkordb']) assert.match(String(read(key).components.find((c) => c.provider === 'annotation')!.config.content), /Nothing here can write/, key);
 	for (const key of FILES) assert.match(String(read(key).components.find((c) => c.provider === 'annotation')!.config.content), /add an LLM node/i, key);
 });
+
+// GX-FE-12 / AGE-T11: the AGE note said browsing a missing graph shows an error. The node checks the graph when the
+// pipeline starts and does not create it, so a missing graph stops the pipeline instead; on RocketRide's managed
+// database the provisioner creates the graph `rocketride` for the organization.
+test('the AGE note says the managed database already has the graph rocketride, and that a missing graph stops the pipeline from starting', () => {
+	const doc = read('age');
+	const graph = doc.components.find((c) => c.provider === 'rocketride_graph')!;
+	assert.equal((graph.config.default as Record<string, unknown>).graph, 'rocketride');
+	const text = String(doc.components.find((c) => c.provider === 'annotation')!.config.content);
+	assert.match(text, /graph `rocketride` is created for your organization/);
+	assert.match(text, /stops the pipeline from starting/);
+	assert.match(text, /pipeline's log/);
+	assert.doesNotMatch(text, /browsing a name that does not exist shows an error/);
+});

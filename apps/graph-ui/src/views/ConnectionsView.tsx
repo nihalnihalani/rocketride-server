@@ -56,7 +56,7 @@ export const ConnectionsView: React.FC = () => {
 		getDocs()?.openStaticDocument(workbenchUri(endpoint.key), endpoint.nodeName || 'Graph', { endpoint });
 	};
 	const drawerEndpoint = endpoints.find((e) => e.key === drawerKey) ?? null;
-	const empty = emptyState(status, endpoints, probes, error);
+	const empty = emptyState(status, endpoints, error);
 
 	return (
 		<div style={styles.root}>
