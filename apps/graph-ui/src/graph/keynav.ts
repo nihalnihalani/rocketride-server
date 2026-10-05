@@ -33,13 +33,15 @@
 //   Enter         open the inspector         Space               select / deselect
 //   E             expand                     C                   collapse
 //   Delete        dismiss from the canvas    P                   find path (two selected)
+//   (or Backspace: the key a Mac laptop labels "delete")
 //   Escape        clear the selection        ?                   show these keys
 //   Tab           leaves the canvas (focus is never trapped)
 //
 // React Flow's own keyboard handling (arrow keys MOVE the selected node; Space
 // and Backspace are bound too) is turned off for this canvas (see flowProps.ts),
-// so none of these conflicts with it. Keys with Ctrl, Meta or Alt are never
-// handled, so browser and screen-reader shortcuts keep working.
+// so none of these conflicts with it: Backspace here is the canvas's own Dismiss.
+// Keys with Ctrl, Meta or Alt are never handled, so browser and screen-reader
+// shortcuts keep working.
 //
 // Reaching a node that no relationship connects to is what Home/End and
 // PageUp/PageDown are for: the graph's connectivity is not the only way in.
@@ -104,7 +106,7 @@ export const KEY_HELP: ReadonlyArray<{ keys: string; does: string }> = [
 	{ keys: 'Space', does: 'Select or deselect the focused node' },
 	{ keys: 'E', does: 'Expand the focused node (up to 100 new neighbours)' },
 	{ keys: 'C', does: 'Collapse the focused node' },
-	{ keys: 'Delete', does: 'Dismiss the focused node from the canvas' },
+	{ keys: 'Delete or Backspace', does: 'Dismiss the focused node from the canvas' },
 	{ keys: 'P', does: 'Find a path between the two selected nodes' },
 	{ keys: 'Escape', does: 'Clear the selection' },
 	{ keys: '?', does: 'Show these keys' },
@@ -163,6 +165,7 @@ export function keyAction(context: IKeyContext, input: IKeyInput): KeyAction {
 		case 'C':
 			return { type: 'collapse', id: current };
 		case 'Delete':
+		case 'Backspace':
 			return { type: 'dismiss', id: current };
 		default:
 			return { type: 'none' };

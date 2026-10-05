@@ -76,14 +76,23 @@ test('every core action has a key', () => {
 	for (const word of ['Arrow', 'Home', 'Enter', 'Space', 'E', 'C', 'Delete', 'P', 'Escape', '?', 'Tab']) assert.ok(documented.includes(word), `${word} is documented`);
 });
 
+// GX-FE-14: a Mac laptop's "delete" key sends Backspace (Fn+delete sends Delete), so Delete alone left Dismiss without
+// a key for most Mac keyboards. React Flow's own delete binding stays off (flowProps.ts); this is the canvas's action.
+test('Backspace dismisses the focused node as Delete does, and the key list says so', () => {
+	const c = cross();
+	assert.deepEqual(press(c, 'Backspace'), { type: 'dismiss', id: 'c' });
+	assert.equal(handled(press(c, 'Backspace')), true, 'the page does not also act on it');
+	assert.deepEqual(press({ ...c, focusedId: null }, 'Backspace'), { type: 'none' });
+	assert.ok(KEY_HELP.some((k) => k.keys === 'Delete or Backspace' && /Dismiss/.test(k.does)));
+});
+
 test('Tab is never handled (focus is not trapped), nor are keys with Ctrl, Meta or Alt', () => {
 	const c = cross();
 	assert.deepEqual(press(c, 'Tab'), { type: 'none' });
 	assert.deepEqual(press(c, 'Tab', { shiftKey: true }), { type: 'none' });
 	for (const mod of ['ctrlKey', 'metaKey', 'altKey']) {
-		for (const key of ['ArrowRight', 'Enter', ' ', 'e', 'Delete', 'p', '?']) assert.deepEqual(press(c, key, { [mod]: true }), { type: 'none' }, `${mod}+${key}`);
+		for (const key of ['ArrowRight', 'Enter', ' ', 'e', 'Delete', 'Backspace', 'p', '?']) assert.deepEqual(press(c, key, { [mod]: true }), { type: 'none' }, `${mod}+${key}`);
 	}
-	assert.deepEqual(press(c, 'Backspace'), { type: 'none' }, 'React Flow default delete key is not bound');
 	assert.deepEqual(press(c, 'x'), { type: 'none' });
 });
 

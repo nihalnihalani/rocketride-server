@@ -160,10 +160,10 @@ on the main thread.
 
 **Keyboard.** The canvas is a single tab stop with roving focus: arrow keys move
 to the connected node in that direction, Enter inspects, Space selects, `E`
-expands, `C` collapses, Delete dismisses, `P` finds a path between two selected
-nodes, `?` lists every key, Tab leaves the canvas. Each node is spoken with its
-caption, labels and how many relationships are shown, and each action is
-announced through one polite live region. Animations respect the reduced-motion
+expands, `C` collapses, Delete or Backspace (the Mac "delete" key) dismisses,
+`P` finds a path between two selected nodes, `?` lists every key, Tab leaves the
+canvas. Each node is spoken with its caption, labels and how many relationships
+are shown, and each action is announced through one polite live region. Animations respect the reduced-motion
 setting. The Table tab lists the same result for anyone who would rather not use
 the canvas.
 

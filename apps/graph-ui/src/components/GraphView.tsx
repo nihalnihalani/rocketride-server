@@ -153,7 +153,7 @@ export const GraphView: React.FC<IGraphViewProps> = ({ session, schemaLabels, ca
 				<span style={styles.focused} title={focusedCaption ?? ''}>{focusedCaption ? `Focused: ${focusedCaption}` : 'No node focused'}</span>
 				<Button variant="ghost" small disabled={!focused || busy || focusedStale} title="Fetch up to 100 new neighbours (E)" onClick={() => focused && void session.expand(focused.id)}>Expand</Button>
 				<Button variant="ghost" small disabled={!focused} title="Remove what hangs only from this node (C)" onClick={() => focused && session.collapse(focused.id)}>Collapse</Button>
-				<Button variant="ghost" small disabled={!focused} title="Remove this node from the canvas (Delete)" onClick={() => focused && session.dismiss(focused.id)}>Dismiss</Button>
+				<Button variant="ghost" small disabled={!focused} title="Remove this node from the canvas (Delete or Backspace)" onClick={() => focused && session.dismiss(focused.id)}>Dismiss</Button>
 				<Button variant="ghost" small disabled={!focused} title="Open the inspector (Enter)" onClick={() => focused && onInspect(focused.id)}>Inspect</Button>
 				<Button variant="ghost" small disabled={busy || state.stale || state.model.nodes.size < 2} title="Draw the relationships among the nodes on the canvas" onClick={() => void session.connect()}>Connect nodes</Button>
 				<Button variant="ghost" small disabled={busy || state.stale || state.selected.size !== 2} title="Select two nodes with Space, then find a path (P)" onClick={() => void session.findPath()}>Find path</Button>
