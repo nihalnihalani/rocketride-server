@@ -25,6 +25,7 @@ from __future__ import annotations
 import sys
 import threading
 import time
+import types
 
 import pytest
 
@@ -813,5 +814,168 @@ class TestSchemaAndDialect:
             assert out['read_boundary'] == 'read_only_tx' and out['limits']['statement_timeout_ms'] == 30000
             rules = ' '.join(glb._prompt_rules())
             assert 'Apache AGE 1.5.0' in rules and 'elementId()' in rules and 'at most 10' in rules
+        finally:
+            glb.endGlobal()
+
+
+# ---------------------------------------------------------------------------
+# The cloud tenant shape: a NOSUPERUSER role on its own database, holding
+# exactly the grants the provisioner gives it, on the default 'rocketride'
+# graph the provisioner creates (rocketride-saas datacore provisioner:
+# _SQL_CLOSE_DATABASE, _SQL_GRANT_DATABASE, _SQL_GRANT_GRAPH_SCHEMA,
+# _SQL_GRANT_TENANT_SCHEMAS). Every other test here runs as the bootstrap
+# superuser, which bypasses all of these grants.
+# ---------------------------------------------------------------------------
+
+TENANT_GRAPH = 'rocketride'
+
+
+def _tenant_grant_statements(graph, role):
+    return [
+        # _SQL_GRANT_GRAPH_SCHEMA: the tenant owns the graph schema and its bootstrap tables.
+        f'GRANT ALL ON SCHEMA "{graph}" TO "{role}"',
+        f'GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA "{graph}" TO "{role}"',
+        f'GRANT ALL ON ALL SEQUENCES IN SCHEMA "{graph}" TO "{role}"',
+        f'ALTER SCHEMA "{graph}" OWNER TO "{role}"',
+        f'ALTER TABLE "{graph}"._ag_label_vertex OWNER TO "{role}"',
+        f'ALTER TABLE "{graph}"._ag_label_edge OWNER TO "{role}"',
+        # _SQL_GRANT_TENANT_SCHEMAS
+        f'GRANT ALL ON SCHEMA public TO "{role}"',
+        f'GRANT USAGE ON SCHEMA ag_catalog TO "{role}"',
+        f'GRANT SELECT ON ALL TABLES IN SCHEMA ag_catalog TO "{role}"',
+        f'GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA ag_catalog TO "{role}"',
+        f'GRANT ALL ON ALL SEQUENCES IN SCHEMA ag_catalog TO "{role}"',
+    ]
+
+
+@pytest.fixture(scope='class')
+def tenant_db():
+    """A disposable tenant database and role, provisioned like the cloud does; dropped afterwards."""
+    import uuid
+
+    from urllib.parse import urlsplit, urlunsplit
+
+    suffix = uuid.uuid4().hex[:8]
+    database, role, password = f'rr_gx_tenant_{suffix}', f'rr_gx_tenant_{suffix}_rw', f'tenant-{uuid.uuid4().hex}'
+    parts = urlsplit(ADMIN_DSN)
+    host = parts.netloc.rpartition('@')[2]
+    admin = _admin()
+    try:
+        with admin.cursor() as cur:
+            cur.execute(f'CREATE DATABASE "{database}"')
+            cur.execute(f'CREATE ROLE "{role}" LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE PASSWORD %s', (password,))
+            # _SQL_CLOSE_DATABASE / _SQL_GRANT_DATABASE
+            cur.execute(f'REVOKE CONNECT, TEMPORARY ON DATABASE "{database}" FROM PUBLIC')
+            cur.execute(f'GRANT ALL PRIVILEGES ON DATABASE "{database}" TO "{role}"')
+        setup = psycopg2.connect(urlunsplit(parts._replace(path=f'/{database}')), connect_timeout=5)
+        setup.autocommit = True
+        try:
+            with setup.cursor() as cur:
+                cur.execute('CREATE EXTENSION IF NOT EXISTS age')
+                cur.execute('SET search_path = ag_catalog, "$user", public')
+                cur.execute('SELECT create_graph(%s)', (TENANT_GRAPH,))
+                for statement in _tenant_grant_statements(TENANT_GRAPH, role):
+                    cur.execute(statement)
+        finally:
+            setup.close()
+        dsn = urlunsplit(parts._replace(netloc=f'{role}:{password}@{host}', path=f'/{database}'))
+        # The tenant seeds its own graph: the grants must also allow writes.
+        seed = psycopg2.connect(dsn, connect_timeout=5)
+        seed.autocommit = True
+        try:
+            with seed.cursor() as cur:
+                cur.execute('SET search_path = ag_catalog, "$user", public')
+                cur.execute(
+                    f"SELECT * FROM cypher('{TENANT_GRAPH}', $$ "
+                    "CREATE (a:Person {name: 'ada', age: 36})-[:KNOWS {since: 2020}]->(b:Person {name: 'bo', age: 29}), "
+                    "(a)-[:WORKS_AT]->(:Company {name: 'Tenant Co'}) $$) AS (v agtype)"
+                )
+        finally:
+            seed.close()
+        yield types.SimpleNamespace(dsn=dsn, database=database, role=role)
+    finally:
+        with admin.cursor() as cur:
+            cur.execute(f'DROP DATABASE IF EXISTS "{database}" WITH (FORCE)')
+            cur.execute(f'DROP ROLE IF EXISTS "{role}"')
+        admin.close()
+
+
+def _begin_as_tenant(rr_env, tenant_db, monkeypatch, config=None):
+    """The node as a cloud task runs it: the resolved tenant DSN, the default graph name."""
+    monkeypatch.setenv('ROCKETRIDE_DB_DSN', tenant_db.dsn)
+    glb = rr_env.iglobal_cls()
+    glb.glb = types.SimpleNamespace(logicalType='rocketride_graph', connConfig=dict(config or {}))
+    glb.beginGlobal()
+    return glb, _instance(rr_env, glb)
+
+
+class TestTenantRole:
+    def test_the_role_is_not_a_superuser(self, tenant_db):
+        conn = psycopg2.connect(tenant_db.dsn, connect_timeout=5)
+        try:
+            with conn.cursor() as cur:
+                cur.execute('SELECT rolsuper, rolcreaterole, rolcreatedb FROM pg_roles WHERE rolname = current_user')
+                assert cur.fetchone() == (False, False, False)
+        finally:
+            conn.close()
+
+    def test_read_query(self, rr_env, tenant_db, monkeypatch):
+        glb, inst = _begin_as_tenant(rr_env, tenant_db, monkeypatch)
+        try:
+            assert glb.graph_name == TENANT_GRAPH
+            out = inst.read_query(
+                {'cypher': 'MATCH (a:Person)-[r:KNOWS]->(b:Person) RETURN a, r, b.name', 'params': None}
+            )
+            a, r, name = out['rows'][0]
+            assert a['properties']['name'] == 'ada' and r['type'] == 'KNOWS' and name == 'bo'
+            params = inst.read_query(
+                {'cypher': 'MATCH (p:Person) WHERE p.name = $n RETURN p.age', 'params': {'n': 'bo'}, 'limit': 5}
+            )
+            assert params['rows'] == [[29]] and params['truncated'] is False
+        finally:
+            glb.endGlobal()
+
+    def test_get_and_refresh_schema(self, rr_env, tenant_db, monkeypatch):
+        glb, inst = _begin_as_tenant(rr_env, tenant_db, monkeypatch)
+        try:
+            assert set(inst.get_schema({})['labels']) == {'Person', 'Company'}
+            block = inst.refresh_schema({})['schema']
+            assert block['error'] is None and block['stale'] is False
+            assert {label['name'] for label in block['labels']} == {'Person', 'Company'}
+            rels = {r['type']: r for r in block['relationship_types']}
+            assert rels['KNOWS']['endpoints'] == [{'start': 'Person', 'end': 'Person', 'observed': True}]
+            assert rels['WORKS_AT']['endpoints'] == [{'start': 'Person', 'end': 'Company', 'observed': True}]
+        finally:
+            glb.endGlobal()
+
+    def test_dialect(self, rr_env, tenant_db, monkeypatch):
+        glb, inst = _begin_as_tenant(rr_env, tenant_db, monkeypatch)
+        try:
+            out = inst.dialect({})
+            assert out['dialect'] == 'age' and out['graph'] == TENANT_GRAPH
+            assert out['database'] == tenant_db.database
+            assert out['engine']['name'] == 'Apache AGE' and out['engine']['version'] == glb.age_version
+            assert out['read_boundary'] == 'read_only_tx'
+            assert tenant_db.role not in str(out)
+        finally:
+            glb.endGlobal()
+
+    def test_read_path_refuses_writes_and_execute_needs_allow_execute(self, rr_env, tenant_db, monkeypatch):
+        glb, inst = _begin_as_tenant(rr_env, tenant_db, monkeypatch)
+        try:
+            with pytest.raises(_graph_tool_error(), match='^Refused: '):
+                inst.read_query({'cypher': "CREATE (:Evil {name: 'x'})"})
+            with pytest.raises(ValueError, match='execute tool is disabled'):
+                inst.execute({'query': "CREATE (:Evil {name: 'x'})", 'shape': 'graph'})
+            assert inst.read_query({'cypher': 'MATCH (n:Evil) RETURN count(n)'})['rows'] in ([[0]], [])
+        finally:
+            glb.endGlobal()
+
+    def test_execute_writes_a_new_label_as_the_tenant(self, rr_env, tenant_db, monkeypatch):
+        glb, inst = _begin_as_tenant(rr_env, tenant_db, monkeypatch, {'allow_execute': True})
+        try:
+            out = inst.execute({'query': "CREATE (n:TenantNote {text: 'hi'}) RETURN n", 'shape': 'graph'})
+            assert out['rows'][0][0]['labels'] == ['TenantNote']
+            assert 'TenantNote' in inst.refresh_schema({})['labels']
         finally:
             glb.endGlobal()
