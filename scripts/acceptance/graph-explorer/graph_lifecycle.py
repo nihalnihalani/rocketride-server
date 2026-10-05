@@ -129,6 +129,13 @@ async def main():
             'restart: task tokens are deterministic (same token after restart)',
             t_after is not None and t_after['token'] == t1,
         )
+        # Without an observed TASK_STOPPED the next check would pass vacuously: the
+        # calls missed the restart window, so nothing was tested. Rerun when this fails.
+        check(
+            'restart: a call during the window saw TASK_STOPPED (the window was observed)',
+            'TASK_STOPPED' in codes,
+            {'codes': codes, 'calls': len(seen)},
+        )
         check(
             'restart: calls during the window fail only with TASK_STOPPED (never another code)',
             set(codes) <= {'TASK_STOPPED'},

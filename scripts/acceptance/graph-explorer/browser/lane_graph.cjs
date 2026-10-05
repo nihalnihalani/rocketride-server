@@ -32,8 +32,10 @@ function rec(browser, engine, name, ok, detail) {
 
 async function step(ctx, name, fn) {
 	try {
+		// Only an explicit `true` passes: a step that could not check what it names
+		// returns false or throws, and anything else is a FAIL too.
 		const detail = await fn();
-		rec(ctx.browser, ctx.engine, name, detail !== false, detail === false ? 'returned false' : undefined);
+		rec(ctx.browser, ctx.engine, name, detail === true, detail === true ? undefined : `returned ${JSON.stringify(detail)}`);
 	} catch (e) {
 		rec(ctx.browser, ctx.engine, name, false, e.message.split('\n')[0]);
 	}
@@ -144,7 +146,7 @@ async function runEngine(browserName, launcher, opts, engine) {
 		});
 		await step(ctx, 'Ask without an LLM shows an unavailable note, not an error', async () => {
 			const ask = page.getByLabel('Ask a question about this graph');
-			if (!(await ask.isVisible().catch(() => false))) return 'ask bar not visible';
+			if (!(await ask.isVisible().catch(() => false))) throw new Error('ask bar not visible');
 			await ask.fill('who knows Ada?');
 			await ask.press('Enter');
 			await page.waitForTimeout(6000);

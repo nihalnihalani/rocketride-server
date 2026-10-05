@@ -6,8 +6,8 @@
 # Graph Explorer validation: every repository gate the feature touches, with real
 # builder actions only. Run from the repository root. Each step logs to
 # $LOGS/<step>.log and records its exit status; the script never stops early and
-# never hides a failure. It does not run the live SDK or browser lanes (see
-# README.md in this folder).
+# never hides a failure: it exits non-zero when any step failed. It does not run
+# the live SDK or browser lanes (see README.md in this folder).
 #
 # Prerequisites: the database containers from README.md (the nodes:test and
 # nodes:test-db steps require them via RR_REQUIRE_DB_TESTS=1).
@@ -37,7 +37,11 @@ step() {
 	# The builder rewrites this file during builds; never leave it modified.
 	git checkout -- packages/client-typescript/src/client/constants.ts 2>/dev/null
 	printf '%-28s exit=%s\n' "$name" "$rc" | tee -a "$SUMMARY"
+	STEPS=$((STEPS + 1))
+	if [ "$rc" -ne 0 ]; then FAILED=$((FAILED + 1)); fi
 }
+STEPS=0
+FAILED=0
 
 # Frontend unit + type gates
 step shared-test        ./builder shared:test
@@ -61,4 +65,5 @@ step apps-build         ./builder sql-ui:build graph-ui:build
 step full-build         ./builder build
 
 echo "logs: $LOGS" | tee -a "$SUMMARY"
-grep -c 'exit=0' "$SUMMARY" | xargs -I{} echo "{} steps passed" | tee -a "$SUMMARY"
+echo "$((STEPS - FAILED)) of $STEPS steps passed" | tee -a "$SUMMARY"
+if [ "$FAILED" -ne 0 ]; then exit 1; fi

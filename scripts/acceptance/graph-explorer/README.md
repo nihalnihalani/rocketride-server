@@ -22,10 +22,10 @@ secret. Never point them at a database that holds data you care about.
 | --- | --- |
 | `graph_acceptance.py` | Python SDK -> engine -> graph node -> database, per engine (AGE, Neo4j, FalkorDB): task discovery with `get_tasks()`, `dialect`, `get_schema` / `refresh_schema`, `read_query` (positional rows, paths and direction, ids past 2^53, row-limit truncation, invalid input), and that writes and `execute` are refused, proved by database state read over an independent connection. `--pipe-dir apps/graph-ui/templates` runs the shipped templates. |
 | `graph_acceptance.cjs` | The same path through the TypeScript SDK: what a browser-side client receives (number tags for unsafe integers, escaped `@` keys, typed `DAPException` refusals). |
-| `graph_lifecycle.py` | What a tool caller sees for an unwired node, a stopped task, and a task during a restart (only `TASK_STOPPED`, then success on the same token). |
+| `graph_lifecycle.py` | What a tool caller sees for an unwired node, a stopped task, and a task during a restart (only `TASK_STOPPED`, then success on the same token). The restart rows fail when no call landed in the restart window, so rerun it then. |
 | `start_fixtures.py` | Starts the long-lived tools pipelines the browser lanes use (`--stop` terminates them). |
 | `fake_broker.py` | Local stand-in for the DB broker's `/provision` endpoint, so `rocketride_graph` and `rocketride_sql` resolve a local database. |
-| `validate_all.sh` | Runs every repository gate the feature touches (unit, SDK, node, docs, builds) and writes one log per step. |
+| `validate_all.sh` | Runs every repository gate the feature touches (unit, SDK, node, docs, builds), writes one log per step, and exits non-zero when any step failed. |
 | `browser/lane_graph.cjs` | Graph Explorer in Chrome, Firefox and WebKit: connections, drawer, editor run, canvas, Table/Raw tabs, inspector open and Escape, Expand, schema Refresh, History, write refusal, Ask without an LLM. |
 | `browser/lane_sql.cjs` | SQL Explorer in the three browsers: connections listed (no graph nodes), card roles, a query through the shared runner. |
 | `browser/lane_a11y.cjs` | Themes, reduced motion and WCAG contrast (text and relationship strokes) on the landing, canvas, Table view and inspector. |
@@ -33,6 +33,7 @@ secret. Never point them at a database that holds data you care about.
 | `browser/lane_perf.cjs`, `browser/gen_perf.py` | Canvas performance on a seeded FalkorDB graph (first draw, pan and drag frame times, long tasks, Expand round trips), Chrome with CPU throttling. |
 | `demo/seed_demo.sh`, `demo/start_demo.py`, `demo/take_shots.cjs` | A small fictional dataset, demo pipelines and the product screenshots. |
 | `local_env.py`, `env.cjs` | Settings shared by the Python and Node scripts, read from the environment. |
+| `selftest/` | Checks of the harness's own verdicts, with no engine, database or browser (see "Self-tests"). |
 
 ## Prerequisites
 
@@ -174,10 +175,12 @@ node $ACC/browser/lane_perf.cjs "$ENGINE_URL" "$OUT_DIR/perf-300.json" 300 1,4
 $ACC/validate_all.sh
 ```
 
-Every script prints one `PASS` / `FAIL` line per check and exits non-zero when
-any check failed; a check whose prerequisite is missing fails rather than being
-skipped. The browser lanes also write a screenshot per step and a JSON result
-file to the output folder. `lane_perf.cjs` reports measurements, not pass/fail.
+Every lane prints one `PASS` / `FAIL` line per check and exits non-zero when
+any check failed; a check whose prerequisite is missing, or that could not
+observe what it checks, fails rather than being skipped. `validate_all.sh`
+prints one `exit=` line per step and exits non-zero when any step failed. The
+browser lanes also write a screenshot per step and a JSON result file to the
+output folder. `lane_perf.cjs` reports measurements, not pass/fail.
 
 The browser lanes find elements by their visible names (button labels,
 fixture names), so a UI wording change can break a lane without a product
@@ -198,6 +201,19 @@ $ACC/demo/seed_demo.sh                                  # drops and recreates DE
 (cd dist/server && ./engine $ACC/browser/gen_perf.py 300)
 (cd dist/server && ./engine $ACC/demo/start_demo.py)
 node $ACC/demo/take_shots.cjs "$OUT_DIR/shots"
+```
+
+## Self-tests
+
+The harness's own verdict logic has small tests that need no engine, database
+or browser: stand-ins replace the SDK and Playwright. They
+check that `validate_all.sh` reports a failed step in its exit status, and that
+the lifecycle restart rows and the Graph Explorer Ask step cannot pass without
+observing what they name. Run them after changing a script here:
+
+```bash
+python3 -m unittest discover -s scripts/acceptance/graph-explorer/selftest -v
+node --test scripts/acceptance/graph-explorer/selftest/lane_graph.test.cjs
 ```
 
 ## Cleaning up
