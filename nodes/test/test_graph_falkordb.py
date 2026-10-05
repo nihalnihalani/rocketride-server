@@ -992,11 +992,34 @@ def test_read_query_refuses_load_csv_without_touching_the_server(allow_writes):
     assert graph.calls == []
 
 
-def test_query_tool_does_not_apply_the_read_query_rule():
-    """The legacy query tool is unchanged: the statement goes to the server as written."""
+@pytest.mark.parametrize(
+    'cypher',
+    [
+        "LOAD CSV FROM 'https://example.invalid/a.csv' AS r RETURN r",
+        "MATCH (n) WITH 'file:///' + n.name AS f LOAD CSV FROM f AS r RETURN count(r)",
+    ],
+)
+def test_query_tool_refuses_load_csv_while_writes_are_off(cypher):
+    """With allow_writes off the query tool applies read_query's statement rule; the server is not called."""
     graph = _FakeGraph(_FakeResult(result_set=[[1]], header=[[1, 'r']]))
-    _instance(_FakeGlobal(graph)).query({'cypher': "LOAD CSV FROM 'file:///x' AS r RETURN r"})
-    assert [c[0] for c in graph.calls] == ['ro_query']
+    out = _instance(_FakeGlobal(graph, allow_writes=False)).query({'cypher': cypher})
+    assert out['error'].startswith('Refused: LOAD CSV is not allowed on the read-only path\n')
+    assert (out['columns'], out['rows'], out['row_count'], out['truncated']) == ([], [], 0, False)
+    assert graph.calls == []
+
+
+def test_query_tool_reports_unterminated_text_while_writes_are_off():
+    graph = _FakeGraph(_FakeResult(result_set=[[1]], header=[[1, 'r']]))
+    out = _instance(_FakeGlobal(graph, allow_writes=False)).query({'cypher': "MATCH (n) WHERE n.x = 'open RETURN n"})
+    assert out['error'] == 'Invalid query input: unterminated string literal'
+    assert graph.calls == []
+
+
+def test_query_tool_with_writes_allowed_sends_the_statement_as_written():
+    graph = _FakeGraph(_FakeResult(result_set=[[1]], header=[[1, 'r']]))
+    cypher = "LOAD CSV FROM 'file:///x' AS r RETURN r"
+    _instance(_FakeGlobal(graph, allow_writes=True)).query({'cypher': cypher})
+    assert [(c[0], c[1]) for c in graph.calls] == [('query', cypher)]
 
 
 def test_read_query_error_headlines():

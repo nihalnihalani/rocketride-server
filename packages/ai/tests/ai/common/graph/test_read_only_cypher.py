@@ -165,6 +165,33 @@ def test_read_query_statement_passes_everything_else(cypher):
     check_read_query_statement(cypher)
 
 
-def test_read_query_statement_refuses_unterminated_text():
-    with pytest.raises(CypherRefused, match='unterminated'):
-        check_read_query_statement("MATCH (n) WHERE n.x = 'open")
+@pytest.mark.parametrize(
+    'cypher,what',
+    [
+        ("MATCH (n) WHERE n.x = 'open", 'string literal'),
+        ('MATCH (n) /* open', 'comment'),
+        ('MATCH (`open) RETURN 1', 'back-quoted name'),
+    ],
+)
+def test_read_query_statement_reports_unterminated_text_as_invalid_input(cypher, what):
+    """Unterminated text is an input error, not a refusal (a "Refused:" headline reads as a refused write)."""
+    with pytest.raises(GraphToolError) as err:
+        check_read_query_statement(cypher)
+    assert err.value.headline == f'Invalid read_query input: unterminated {what}'
+    assert not isinstance(err.value, CypherRefused)
+    assert isinstance(err.value, ValueError)
+
+
+def test_read_query_statement_names_the_calling_tool():
+    with pytest.raises(GraphToolError) as err:
+        check_read_query_statement("RETURN 'open", tool='query')
+    assert err.value.headline == 'Invalid query input: unterminated string literal'
+    with pytest.raises(CypherRefused) as err:
+        check_read_query_statement("LOAD CSV FROM 'file:///x' AS r RETURN r", tool='query', detail='Some detail.')
+    assert str(err.value) == 'Refused: LOAD CSV is not allowed on the read-only path\nSome detail.'
+
+
+def test_read_query_statement_default_detail_is_unchanged():
+    with pytest.raises(CypherRefused) as err:
+        check_read_query_statement("LOAD CSV FROM 'file:///x' AS r RETURN r")
+    assert err.value.detail == 'read_query reads only the configured graph.'

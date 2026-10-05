@@ -256,6 +256,13 @@ class TestInvariantAndErrors:
         assert str(err.value).startswith('Refused: LOAD CSV is not allowed on the read-only path\n')
         assert inst.IGlobal.read_calls == []
 
+    def test_unterminated_text_is_invalid_input_before_the_driver(self):
+        inst = make()
+        with pytest.raises(GraphToolError) as err:
+            inst.read_query({'cypher': "MATCH (n) WHERE n.name = 'open RETURN n"})
+        assert str(err.value) == 'Invalid read_query input: unterminated string literal'
+        assert inst.IGlobal.read_calls == []
+
     def test_execute_does_not_apply_the_read_query_rule(self):
         inst = make([[vertex(1)]], allow_execute=True)
         inst.execute({'query': "LOAD CSV FROM 'file:///x' AS r RETURN r", 'shape': 'graph'})

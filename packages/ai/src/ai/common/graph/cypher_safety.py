@@ -109,6 +109,18 @@ class CypherRefused(GraphToolError, ValueError):
     """A statement the read path will not run (``str()`` is "<headline>\\n<detail>")."""
 
 
+class CypherInputError(GraphToolError, ValueError):
+    """Statement text that cannot be read as Cypher at all (an unterminated string, comment or name)."""
+
+
+class _Unterminated(CypherRefused):
+    """The tokenizer's unterminated-text error; ``what`` names the construct."""
+
+    def __init__(self, what: str) -> None:
+        self.what = what
+        super().__init__(f'Refused: unterminated {what}')
+
+
 # Read-only Neo4j procedures read_query may CALL (CONTRACT v1 §1 item 8). Names
 # are compared case-insensitively after back-quote unescaping; there is no
 # wildcard, so a future db.schema.* procedure needs a reviewed addition here.
@@ -199,14 +211,14 @@ def _tokenize(cypher: str) -> list:
         elif cypher.startswith('/*', i):
             j = cypher.find('*/', i + 2)
             if j < 0:
-                raise CypherRefused('Refused: unterminated comment')
+                raise _Unterminated('comment')
             i = j + 2
         elif c in '\'"':
             j = i + 1
             while j < n and cypher[j] != c:
                 j += 2 if cypher[j] == '\\' else 1
             if j >= n:
-                raise CypherRefused('Refused: unterminated string literal')
+                raise _Unterminated('string literal')
             i = j + 1
         elif c == '`':
             parts = []
@@ -215,7 +227,7 @@ def _tokenize(cypher: str) -> list:
             while j < n and cypher[j] == '`':
                 k = cypher.find('`', j + 1)
                 if k < 0:
-                    raise CypherRefused('Refused: unterminated back-quoted name')
+                    raise _Unterminated('back-quoted name')
                 parts.append(cypher[j + 1 : k])
                 j = k + 1
             toks.append(_Tok('ident', '`'.join(parts)))
@@ -313,7 +325,12 @@ def check_read_only_cypher(cypher: str, *, allowed_procedures=NEO4J_READ_PROCEDU
                 )
 
 
-def check_read_query_statement(cypher: str) -> None:
+def check_read_query_statement(
+    cypher: str,
+    *,
+    tool: str = 'read_query',
+    detail: str = 'read_query reads only the configured graph.',
+) -> None:
     """The statement rule every driver's ``read_query`` applies before its own read boundary.
 
     ``read_query`` reads the configured graph and nothing else, so ``LOAD CSV``
@@ -321,21 +338,26 @@ def check_read_query_statement(cypher: str) -> None:
     whose read-only command would run it. Writes, administration and
     procedure calls stay with each driver's own read boundary (a read-only
     command, transaction or role, plus Neo4j's :func:`check_read_only_cypher`).
+    Another read-only tool may apply the same rule; ``tool`` names it in the
+    input-error headline and ``detail`` is the refusal's second line.
 
     Raises:
-        CypherRefused: for ``LOAD CSV``, or text whose comments, strings or
-            back-quoted names do not terminate.
+        CypherRefused: for ``LOAD CSV`` ("Refused: ..." headline).
+        CypherInputError: for text whose comments, strings or back-quoted
+            names do not terminate ("Invalid <tool> input: ..." headline): a
+            syntax problem, not a refusal, and what the database would make
+            of the rest cannot be known, so it is not sent.
     """
-    toks = _tokenize(cypher)
+    try:
+        toks = _tokenize(cypher)
+    except _Unterminated as e:
+        raise CypherInputError(f'Invalid {tool} input: unterminated {e.what}') from None
     for i, tok in enumerate(toks):
         if tok.upper != 'LOAD' or not _is_clause_word(toks, i):
             continue
         nxt = toks[i + 1] if i + 1 < len(toks) else None
         if nxt is not None and nxt.kind == 'word' and nxt.upper == 'CSV':
-            raise CypherRefused(
-                'Refused: LOAD CSV is not allowed on the read-only path',
-                'read_query reads only the configured graph.',
-            )
+            raise CypherRefused('Refused: LOAD CSV is not allowed on the read-only path', detail)
 
 
 _PROCEDURE_DISPLAY = {
