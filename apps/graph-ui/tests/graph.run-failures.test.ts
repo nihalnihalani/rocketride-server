@@ -12,7 +12,7 @@ import { test } from 'node:test';
 import { formatBatchOutcome, formatPriorStatements } from 'shared/explorer';
 import type { IStatementRunBase } from 'shared/explorer';
 import { ExplorerToolError } from 'shared/explorer';
-import { describeFailure, describeFailureMessage, describeFailureOf } from '../src/graph/failures';
+import { WRITE_MAY_HAVE_APPLIED, describeFailure, describeFailureMessage, describeFailureOf, describeWriteFailure } from '../src/graph/failures';
 import type { IFailureInput } from '../src/graph/failures';
 import { GRAPH_BATCH_WORDS, prepareStatement, refuseNonReads, toHistoryEntry } from '../src/graph/runConfig';
 import { parseDialect } from '../src/graph/dialect';
@@ -184,4 +184,28 @@ test('when the shared runner passes the thrown ExplorerToolError, its kind decid
 	// A plain Error (or nothing) falls back to reading the message.
 	assert.equal(describeFailureOf('boom', new Error('boom'), false).headline, 'boom');
 	assert.equal(describeFailureOf('boom', undefined, false).headline, 'boom');
+});
+
+// GX-CT-03: execute(shape 'graph') can fail after the statement committed (the node could not build the envelope, or
+// this app rejected the answer). The write console used to say "Refused: ..." with the hint to use the write console
+// the user was already in.
+test('in the write console a failure that can come after the statement ran says the write may have been applied', () => {
+	const message = 'Refused: the first row holds more than 10,000 graph elements';
+	const refused = describeWriteFailure(message, new ExplorerToolError({ kind: 'raised', tool: 'execute', message }));
+	assert.equal(refused.headline, message, 'the node\'s own words lead');
+	assert.equal(refused.hint, WRITE_MAY_HAVE_APPLIED);
+	assert.match(refused.hint ?? '', /^The write may have been applied/);
+	assert.doesNotMatch(refused.hint ?? '', /use the write console/i);
+	const timeout = 'Stopped waiting for execute after 40 s. The node may still be running it; there is no way to cancel it from here.';
+	assert.equal(describeWriteFailure(timeout, new ExplorerToolError({ kind: 'timeout', tool: 'execute', message: timeout })).hint, WRITE_MAY_HAVE_APPLIED);
+	assert.equal(describeWriteFailure('Query result cannot be represented', undefined).hint, WRITE_MAY_HAVE_APPLIED, 'a bare message counts too');
+});
+
+test('in the write console a refusal before anything was sent keeps its own words, and a dropped answer stays silent', () => {
+	const upgrade = 'This node cannot run execute: it does not advertise "execute_shape_graph". Update the pipeline\'s node to a version that supports it.';
+	assert.notEqual(describeWriteFailure(upgrade, new ExplorerToolError({ kind: 'upgrade', tool: 'execute', message: upgrade })).hint, WRITE_MAY_HAVE_APPLIED);
+	const off = 'execute tool is disabled for this node (set allow_execute=true)';
+	assert.match(describeWriteFailure(off, new ExplorerToolError({ kind: 'raised', tool: 'execute', message: off })).headline, /does not allow execute/);
+	assert.notEqual(describeWriteFailure(off, undefined).hint, WRITE_MAY_HAVE_APPLIED);
+	assert.equal(describeWriteFailure('dropped', new ExplorerToolError({ kind: 'stale', tool: 'execute', message: 'dropped' })).ignore, true);
 });

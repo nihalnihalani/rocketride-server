@@ -100,3 +100,15 @@ test('the run surface takes its editor request from the host\'s slot, and the ho
 	const workbench = code(read('views', 'WorkbenchView.tsx'));
 	assert.ok(/const runNow = run && now\.mounted && now\.paused === null;/.test(workbench) && /slot\.put\(\{ text, run: runNow \}\)/.test(workbench), 'a run is asked for only while the surface can run it');
 });
+
+// GX-FE-05 (graph half) and GX-CT-03: the write was counted in `record`, which the shared runner skips once the
+// document is closed, so a write that landed after the console closed never marked other graphs out of date.
+test('the write console counts a write where it is sent, not in the record step a closed document skips', () => {
+	const surface = code(read('components', 'RunSurface.tsx'));
+	const execute = surface.slice(surface.indexOf('execute: async'), surface.indexOf('settle:'));
+	assert.ok(/countWrite\(dataVersions, endpoint\.key, \(\) => session\.invoke<ReadQueryResult>\(TOOL\.execute/.test(execute), 'execute is sent through countWrite');
+	const record = surface.slice(surface.indexOf('record: (run) =>'), surface.indexOf('summarize:'));
+	assert.ok(/isAbandonedWrite\(mode, run\.outcome\)/.test(record), 'record counts only a write the user stopped waiting for');
+	assert.ok(!/mayHaveChangedData/.test(surface));
+	assert.ok(/describeWriteFailure\(message, error\)/.test(surface), 'the write console words its failures as possibly applied');
+});

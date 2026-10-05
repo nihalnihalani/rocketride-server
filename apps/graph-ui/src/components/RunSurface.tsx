@@ -50,9 +50,9 @@ import { describeSnapshot, targetsFromEditor } from '../cypher/targets';
 import type { IEditorSnapshot } from '../cypher/targets';
 import { DEFAULT_ROW_LIMIT, ROW_LIMIT_CHOICES } from '../graph/budgets';
 import { canWrite as dialectCanWrite, parseDialect, rowLimitChip } from '../graph/dialect';
-import { describeFailureOf } from '../graph/failures';
+import { describeFailureOf, describeWriteFailure } from '../graph/failures';
 import type { IFailureNotice } from '../graph/failures';
-import { mayHaveChangedData } from '../graph/dataVersion';
+import { countWrite, isAbandonedWrite } from '../graph/dataVersion';
 import { createGraphSession } from '../graph/graphSession';
 import type { IGraphSession } from '../graph/graphSession';
 import { confirmationParagraphs, describeWrites } from '../graph/writeConfirm';
@@ -219,18 +219,20 @@ export const RunSurface: React.FC<IRunSurfaceProps> = ({ endpoint, mode, paused 
 			if (!session) throw new ExplorerToolError({ kind: 'unavailable', tool: mode === 'read' ? TOOL.readQuery : TOOL.execute, message: 'This connection is not available.' });
 			return mode === 'read'
 				? session.invoke<ReadQueryResult>(TOOL.readQuery, { cypher: send.cypher, params: {}, limit: send.limit }, { generation: ticket })
-				: session.invoke<ReadQueryResult>(TOOL.execute, { query: send.cypher, shape: 'graph' }, { generation: ticket });
+				// Counted here, in the call, so a write that lands after this console closed still marks drawn graphs out of date.
+				: countWrite(dataVersions, endpoint.key, () => session.invoke<ReadQueryResult>(TOOL.execute, { query: send.cypher, shape: 'graph' }, { generation: ticket }));
 		},
 		settle: (_run, result) => ({ outcome: 'rows', rowCount: result.rows.length, result }),
 		describeFailure: (message, error) => {
-			const notice = describeFailureOf(message, error, writable);
+			const notice = mode === 'write' ? describeWriteFailure(message, error) : describeFailureOf(message, error, writable);
 			failureNotes.current = notice;
 			return notice as IFailureNotice & { verbatim: string };
 		},
 		formatPrior: (runs, index) => formatPriorStatements(runs, index, GRAPH_BATCH_WORDS),
 		record: (run) => {
-			// A write that ran (or may still run) makes every graph drawn from this connection out of date, in every document.
-			if (mayHaveChangedData(mode, run.outcome)) dataVersions.bump(endpoint.key);
+			// A write is counted where it is sent (countWrite); one the user stopped waiting for may still complete, so it
+			// makes every graph drawn from this connection out of date now, in every document.
+			if (isAbandonedWrite(mode, run.outcome)) dataVersions.bump(endpoint.key);
 			const outcome = run.outcome === 'rows' || run.outcome === 'abandoned' ? run.outcome : 'error';
 			graphHistory.runs.emitRun(endpoint.key, toHistoryEntry({ cypher: run.cypher, at: Math.round(Date.now() - (run.ms ?? 0)), ms: Math.round(run.ms ?? 0), outcome, ...(run.outcome === 'rows' ? { rows: run.result?.rows.length ?? 0 } : {}), ...(run.limitApplied != null ? { limit: run.limitApplied } : {}), ...(run.error !== undefined ? { error: run.error } : {}), kind: run.verb }, entryId()));
 		},

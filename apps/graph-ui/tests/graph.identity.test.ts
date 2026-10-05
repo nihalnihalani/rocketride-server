@@ -9,7 +9,8 @@
 
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { createDataVersions, mayHaveChangedData } from '../src/graph/dataVersion';
+import { ExplorerToolError } from 'shared/explorer';
+import { countWrite, createDataVersions, isAbandonedWrite } from '../src/graph/dataVersion';
 import { conflictText, identityConflicts } from '../src/graph/identity';
 import { modelFromResult } from '../src/graph/model';
 import { entitiesOf, node, rel } from './support/builders';
@@ -59,11 +60,41 @@ test('data versions count per connection and tell subscribers', () => {
 	assert.equal(heard, 3);
 });
 
-test('only the write console can change data, and only a success or an outcome nobody saw counts; a failed statement does not', () => {
-	assert.equal(mayHaveChangedData('write', 'rows'), true);
-	assert.equal(mayHaveChangedData('write', 'affected'), true);
-	assert.equal(mayHaveChangedData('write', 'abandoned'), true, 'stopped waiting: it may still complete on the database');
-	assert.equal(mayHaveChangedData('write', 'error'), false);
-	assert.equal(mayHaveChangedData('write', 'skipped'), false);
-	for (const outcome of ['rows', 'abandoned', 'error']) assert.equal(mayHaveChangedData('read', outcome), false, 'the read path cannot write');
+// GX-FE-05 (graph half) and GX-CT-03: the write used to be counted in the console's `record`, which the shared runner
+// skips once the console is closed, and a failed statement was assumed rolled back. But the node can fail AFTER the
+// database ran the statement (the answer could not be built or was rejected), and a write can land after its document
+// closed. The count now lives where the write is sent.
+const toolError = (kind: ConstructorParameters<typeof ExplorerToolError>[0]['kind'], message: string): ExplorerToolError => new ExplorerToolError({ kind, tool: 'execute', message });
+
+test('a write is counted where it is sent, whatever happens to its document: a success, and any failure that can come after the database ran it', async () => {
+	const versions = createDataVersions();
+	assert.equal(await countWrite(versions, 'k', async () => 'answer'), 'answer');
+	assert.equal(versions.get('k'), 1, 'a success counts');
+	const after = [
+		toolError('raised', 'Refused: the first row holds more than 10,000 graph elements'),
+		toolError('raised', 'Query result cannot be represented\nunsupported value'),
+		toolError('malformed', 'execute returned a malformed result: rows is not an array'),
+		toolError('timeout', 'Stopped waiting for execute after 40 s. The node may still be running it; there is no way to cancel it from here.'),
+		toolError('stale', 'The result of execute was dropped: a newer request replaced it.'),
+		new Error('connection reset'),
+	];
+	for (const error of after) await assert.rejects(countWrite(versions, 'k', async () => { throw error; }), (thrown) => thrown === error, 'the failure still reaches the runner');
+	assert.equal(versions.get('k'), 1 + after.length, 'each may have been applied');
+});
+
+test('a write refused before anything was sent changes nothing and is not counted', async () => {
+	const versions = createDataVersions();
+	const before = [
+		toolError('upgrade', 'This node cannot run execute: it does not advertise "execute_shape_graph". Update the pipeline\'s node to a version that supports it.'),
+		toolError('unavailable', "No running task for pipeline 'Graph pipeline'. Start the pipeline and retry."),
+		toolError('raised', 'execute tool is disabled for this node (set allow_execute=true)'),
+	];
+	for (const error of before) await assert.rejects(countWrite(versions, 'k', async () => { throw error; }));
+	assert.equal(versions.get('k'), 0);
+});
+
+test('at record time only a write the user stopped waiting for counts (it may still complete); the call itself counts the rest, and the read path never does', () => {
+	assert.equal(isAbandonedWrite('write', 'abandoned'), true);
+	for (const outcome of ['rows', 'affected', 'error', 'skipped']) assert.equal(isAbandonedWrite('write', outcome), false, `${outcome} is counted by countWrite, or was never sent`);
+	for (const outcome of ['rows', 'abandoned', 'error']) assert.equal(isAbandonedWrite('read', outcome), false, 'the read path cannot write');
 });

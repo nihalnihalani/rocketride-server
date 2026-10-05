@@ -211,6 +211,14 @@ editor and an **Execute** button, and it always says what it is:
 - Each statement is its own request. A batch stops at the first error; statements
   that ran are not undone. The strip says how many ran and how many were not run.
 - A write is never sent again by the app: no automatic retry.
+- A failure that can come after the database ran the statement (the node could
+  not return its answer, the answer was not understood, or the app stopped
+  waiting) says **the write may have been applied**. Only a refusal before
+  anything was sent (the node does not support it, the pipeline is not running,
+  or execute is off) means nothing changed.
+- Every write that may have changed data marks the graphs drawn from that
+  connection out of date, in every tab, even when it finishes after the console
+  was closed.
 
 ## Safety
 
