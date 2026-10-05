@@ -28,7 +28,7 @@ secret. Never point them at a database that holds data you care about.
 | `validate_all.sh` | Runs every repository gate the feature touches (unit, SDK, node, docs, builds), writes one log per step, and exits non-zero when any step failed. |
 | `browser/lane_graph.cjs` | Graph Explorer in Chrome, Firefox and WebKit: connections, drawer, editor run, canvas, Table/Raw tabs, inspector open and Escape, Expand, schema Refresh, History, write refusal, Ask without an LLM. |
 | `browser/lane_sql.cjs` | SQL Explorer in the three browsers: connections listed (no graph nodes), card roles, a query through the shared runner. |
-| `browser/lane_a11y.cjs` | Themes, reduced motion and WCAG contrast (text and relationship strokes) on the landing, canvas, Table view and inspector. |
+| `browser/lane_a11y.cjs` | Themes, reduced motion, WCAG text contrast on the landing, canvas, Table view and inspector, and relationship-stroke contrast on the drawn graph. |
 | `browser/probe_linenumbers.cjs` | Editor line-number colour and contrast in both themes, both apps. |
 | `browser/lane_perf.cjs`, `browser/gen_perf.py` | Canvas performance on a seeded FalkorDB graph (first draw, pan and drag frame times, long tasks, Expand round trips), Chrome with CPU throttling. |
 | `demo/seed_demo.sh`, `demo/start_demo.py`, `demo/take_shots.cjs` | A small fictional dataset, demo pipelines and the product screenshots. |
@@ -208,13 +208,16 @@ node $ACC/demo/take_shots.cjs "$OUT_DIR/shots"
 The harness's own verdict logic has small tests that need no engine, database
 or browser: stand-ins replace the SDK, the Neo4j driver and Playwright. They
 check that `validate_all.sh` reports a failed step in its exit status, that the
-lifecycle restart rows and the Graph Explorer Ask step cannot pass without
+lifecycle restart rows, the Graph Explorer Ask and Escape steps, and the
+`lane_a11y.cjs` contrast, stroke and reduced-motion rows cannot pass without
 observing what they name, and that the Neo4j clean-up stays inside `RUN_LABEL`.
+The browser self-tests run the real lane against a stand-in Playwright
+(`selftest/stand_in.cjs`) that models an empty page.
 Run them after changing a script here:
 
 ```bash
 python3 -m unittest discover -s scripts/acceptance/graph-explorer/selftest -v
-node --test scripts/acceptance/graph-explorer/selftest/lane_graph.test.cjs
+node --test scripts/acceptance/graph-explorer/selftest/*.test.cjs
 ```
 
 ## Cleaning up

@@ -109,10 +109,12 @@ async function runEngine(browserName, launcher, opts, engine) {
 			return ok;
 		});
 		await step(ctx, 'Escape closes the inspector (modal dialog)', async () => {
+			const dialog = page.locator('[role="dialog"][aria-modal="true"]').first();
+			// Escape can only be shown to close the inspector if the inspector was open.
+			if (!(await dialog.isVisible().catch(() => false))) throw new Error('inspector dialog not open before Escape');
 			await page.keyboard.press('Escape');
-			await page.waitForTimeout(900);
-			const open = await page.locator('[role="dialog"][aria-modal="true"]').count();
-			if (open > 0) {
+			await dialog.waitFor({ state: 'hidden', timeout: 5000 }).catch(() => {});
+			if (await dialog.isVisible().catch(() => false)) {
 				// Close it with its Close button so the rest of the lane can continue.
 				await page.getByRole('button', { name: 'Close' }).last().click();
 				await page.waitForTimeout(900);

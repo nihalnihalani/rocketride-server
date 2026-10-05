@@ -11,8 +11,11 @@
  * Checks: the theme really applied (--rr-palette-mode); the first fit animates only without
  * reduced motion (viewport transform sampled every frame) and no canvas animation runs under
  * reduce; WCAG 2.x contrast of every visible text element (4.5:1, large text 3:1; disabled
- * controls exempt) and of relationship strokes vs the canvas (1.4.11, 3:1) on the landing,
- * the drawn graph, the Table view and the open inspector. Self-written checker (no axe).
+ * controls exempt) on the landing, the drawn graph, the Table view and the open inspector, and
+ * of relationship strokes vs the canvas (1.4.11, 3:1) on the drawn graph (and wherever else
+ * they are on screen). Self-written checker (no axe). A row that measured nothing (no text
+ * element, a missing scope, no stroke on the drawn graph, no sampled viewport or canvas)
+ * is a FAIL.
  * Usage: node lane_a11y.cjs [base-url] [out-dir] [chrome|firefox|webkit|all]
  * (base-url and out-dir default to ENGINE_URL and OUT_DIR).
  * Browsers: Chrome lanes use the installed Google Chrome (channel "chrome"); Firefox and
@@ -73,9 +76,10 @@ function scanContrast(scopeSelector) {
 		}
 		return true;
 	};
-	const scope = document.querySelector(scopeSelector) || document.body;
+	// No fallback: a missing scope (say, the inspector without its dialog role) measures nothing.
+	const scope = document.querySelector(scopeSelector);
 	const rows = [];
-	for (const el of scope.querySelectorAll('*')) {
+	for (const el of scope ? scope.querySelectorAll('*') : []) {
 		const own = [...el.childNodes].filter((n) => n.nodeType === 3).map((n) => n.textContent.trim()).join(' ').trim();
 		if (!own || !visible(el)) continue;
 		const s = getComputedStyle(el);
@@ -113,7 +117,7 @@ function scanContrast(scopeSelector) {
 			if (eff) strokes.push(+ratio(eff.a < 1 ? over(eff, cbg) : eff, cbg).toFixed(2));
 		}
 	}
-	return { rows, strokes };
+	return { scopeFound: !!scope, rows, strokes };
 }
 
 function summarise(scan) {
@@ -133,7 +137,7 @@ function summarise(scan) {
 		(byToken[t] ||= { n: 0, examples: [] }).n++;
 		if (byToken[t].examples.length < 4) byToken[t].examples.push(`${f.text} ${f.ratio}:1 [${f.region}]`);
 	}
-	return { checked: checked.length, exemptDisabled: scan.rows.length - checked.length, fails, failCount: fails.length, byToken, byRegion, strokeCount: scan.strokes.length, strokeMin };
+	return { scopeFound: scan.scopeFound === true, checked: checked.length, exemptDisabled: scan.rows.length - checked.length, fails, failCount: fails.length, byToken, byRegion, strokeCount: scan.strokes.length, strokeMin };
 }
 
 async function run(bname, launcher, opts, runName, theme, motion) {
@@ -144,12 +148,17 @@ async function run(bname, launcher, opts, runName, theme, motion) {
 	const errors = [];
 	page.on('pageerror', (e) => errors.push(String(e)));
 	const shot = (n) => page.screenshot({ path: path.join(out, `a11y-${bname}-${runName}-${n}.png`) }).catch(() => {});
-	const contrast = async (where, scope) => {
+	// needStrokes: the view draws relationships, so finding no stroke is a FAIL, not a skip.
+	const contrast = async (where, scope, needStrokes = false) => {
 		const s = summarise(await page.evaluate(scanContrast, scope));
 		contrastReport.push({ browser: bname, run: runName, where, ...s });
-		const textOk = s.failCount === 0;
-		rec(bname, runName, `contrast ${where}: ${s.checked} text elements, min ${JSON.stringify(Object.fromEntries(Object.entries(s.byRegion).map(([k, v]) => [k, v.min])))}`, textOk, textOk ? undefined : s.fails);
-		if (s.strokeCount) rec(bname, runName, `relationship strokes vs canvas >= 3:1 (${s.strokeCount}, min ${s.strokeMin})`, s.strokeMin >= 3, s.strokeMin);
+		const measured = s.scopeFound && s.checked > 0;
+		const textOk = measured && s.failCount === 0;
+		const why = !s.scopeFound ? `scope ${scope} not found` : s.checked === 0 ? 'no visible text element measured' : s.fails;
+		rec(bname, runName, `contrast ${where}: ${s.checked} text elements, min ${JSON.stringify(Object.fromEntries(Object.entries(s.byRegion).map(([k, v]) => [k, v.min])))}`, textOk, textOk ? undefined : why);
+		if (needStrokes || s.strokeCount) {
+			rec(bname, runName, `relationship strokes vs canvas >= 3:1 on ${where} (${s.strokeCount}, min ${s.strokeMin})`, s.strokeCount > 0 && s.strokeMin >= 3, s.strokeCount ? s.strokeMin : 'no relationship stroke found');
+		}
 	};
 	try {
 		await E.signIn(page, base);
@@ -202,8 +211,9 @@ async function run(bname, launcher, opts, runName, theme, motion) {
 		if (motion === 'reduce') {
 			// Without animation the fit lands in one step: initial transform + at most one or two jumps
 			// (the fit, and a refit when the result line appears and the canvas changes size).
-			rec(bname, runName, `reduced motion: fit jumps, no animation (${motionData.transformChanges} transform values over ${motionData.frames} frames)`, motionData.transformChanges <= 3, motionData);
-			rec(bname, runName, 'reduced motion: no running canvas animations', motionData.runningCanvasAnimations === 0 || motionData.runningCanvasAnimations === null, motionData.runningCanvasAnimations);
+			// Both rows need something sampled: frames from the viewport, and a canvas to ask for animations.
+			rec(bname, runName, `reduced motion: fit jumps, no animation (${motionData.transformChanges} transform values over ${motionData.frames} frames)`, motionData.frames > 0 && motionData.transformChanges <= 3, motionData);
+			rec(bname, runName, 'reduced motion: no running canvas animations', motionData.runningCanvasAnimations === 0, motionData.runningCanvasAnimations === null ? 'no canvas (or no getAnimations) to check' : motionData.runningCanvasAnimations);
 		} else {
 			rec(bname, runName, `control (no-preference): the fit animates (${motionData.transformChanges} transform values)`, motionData.transformChanges > 3, motionData);
 		}
@@ -211,7 +221,7 @@ async function run(bname, launcher, opts, runName, theme, motion) {
 		const ln = await page.evaluate(() => [...document.querySelectorAll('.monaco-editor .line-numbers')].map((e) => ({ text: e.textContent.trim(), color: getComputedStyle(e).color, active: e.classList.contains('active-line-number') })));
 		const red = ln.filter((x) => /rgb\(255, 0, 0\)/.test(x.color));
 		rec(bname, runName, `editor line numbers are not Monaco's parse-failure red (${ln.length} numbers: ${[...new Set(ln.map((x) => x.color))].join(' / ')})`, ln.length >= 2 && red.length === 0, ln);
-		await contrast('graph result', 'body');
+		await contrast('graph result', 'body', true);
 
 		await page.getByRole('tab', { name: 'Table' }).click();
 		await page.waitForTimeout(500);
