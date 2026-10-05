@@ -69,6 +69,10 @@
 //   nobody asked for (focus, an ordinary task event, a rebind) keeps its last
 //   answer. An endpoint whose probe said its task is not running is cheap to
 //   ask again (the server refuses before the task) and is probed on any refresh.
+//   An endpoint that vanished from discovery is not probed at all: `probe`
+//   sends nothing and answers null, and an answer to a probe that was in
+//   flight when it vanished is not applied (the card stays `stopped`). It is
+//   probed when a discovery lists it again, on any refresh.
 //
 // WHEN IT FORGETS
 //   `reset()` — on sign-out and on a change of user, organization or team —
@@ -176,7 +180,11 @@ export interface IEndpointStore {
 	/**
 	 * Probe one endpoint again now (the drawer's "Test connection").
 	 *
-	 * @returns The result, or null when the endpoint is unknown or has no token.
+	 * @returns The result, or null when nothing was tested: the endpoint is
+	 *   unknown, has no token, is no longer listed by discovery (its pipeline
+	 *   stopped or is restarting; nothing is sent), or a check of it is already
+	 *   running. Also null when the pipeline left the list or the store was
+	 *   reset before the node answered: that answer is not applied.
 	 */
 	probe(client: IExplorerClient, endpointKey: string): Promise<IProbeResult | null>;
 	/**
@@ -257,10 +265,18 @@ export function createEndpointStore(options: IEndpointStoreOptions): IEndpointSt
 	/**
 	 * The last good `dialect` answer of an endpoint that vanished from discovery
 	 * while its token is kept (see "A VANISHED ENDPOINT KEEPS ITS TOKEN"). Read by
-	 * sessions only; never published. Cleared when a probe of that endpoint
-	 * reports again, when it is discovered without a usable token, and on reset.
+	 * sessions only; never published. A good answer to a probe that was in flight
+	 * when the endpoint vanished replaces it. Cleared when a probe of the listed
+	 * endpoint reports again, when it is discovered without a usable token, and
+	 * on reset.
 	 */
 	const keptInfo = new Map<string, Record<string, unknown>>();
+	/**
+	 * Keys listed only because they vanished from the latest discovery. Such an
+	 * endpoint is not probed: `probe` sends nothing for it, and a probe answer
+	 * that arrives after it vanished is not applied (see "WHEN IT PROBES AGAIN").
+	 */
+	const vanished = new Set<string>();
 
 	/** Bumped by reset(): anything in flight that started before it is dropped on arrival. */
 	let resetCount = 0;
@@ -373,6 +389,13 @@ export function createEndpointStore(options: IEndpointStoreOptions): IEndpointSt
 				ok: false, info: null, dialect: null, error: { kind: 'raised', message: error instanceof Error ? error.message : String(error) },
 			}));
 			if (epochAfterReset(startedReset) || vault.get(endpoint.key) !== tokenAtStart) return null;
+			if (vanished.has(endpoint.key)) {
+				// The pipeline left the list while the node answered. The card stays
+				// `stopped` and is probed when discovery lists it again; a good answer
+				// from the same token still serves the session meanwhile.
+				if (result.ok && isPlainObject(result.info)) keptInfo.set(endpoint.key, result.info);
+				return null;
+			}
 			keptInfo.delete(endpoint.key);
 			const outcome = classify(endpoint, result);
 			patchEndpoint(endpoint.key, { state: outcome.state, stateDetail: outcome.detail }, result);
@@ -468,6 +491,7 @@ export function createEndpointStore(options: IEndpointStoreOptions): IEndpointSt
 
 		for (const { endpoint, token, callHint } of found) {
 			live.add(endpoint.key);
+			vanished.delete(endpoint.key);
 			callHints.set(endpoint.key, callHint);
 			const before = previous.get(endpoint.key);
 			const tokenChanged = vault.get(endpoint.key) !== (token ?? undefined);
@@ -507,6 +531,7 @@ export function createEndpointStore(options: IEndpointStoreOptions): IEndpointSt
 
 		for (const [key, endpoint] of previous) {
 			if (live.has(key)) continue;
+			vanished.add(key);
 			// The token stays in the vault (see "A VANISHED ENDPOINT KEEPS ITS
 			// TOKEN"), with the node's last good answer for the session.
 			const lastProbe = probes[key];
@@ -588,7 +613,7 @@ export function createEndpointStore(options: IEndpointStoreOptions): IEndpointSt
 
 	async function probe(client: IExplorerClient, endpointKey: string): Promise<IProbeResult | null> {
 		const endpoint = state.endpoints.find((candidate) => candidate.key === endpointKey);
-		if (endpoint === undefined || !vault.has(endpointKey)) return null;
+		if (endpoint === undefined || vanished.has(endpointKey) || !vault.has(endpointKey)) return null;
 		patchEndpoint(endpointKey, { state: 'probing', stateDetail: undefined }, null);
 		return runProbe(client, endpoint);
 	}
@@ -627,6 +652,7 @@ export function createEndpointStore(options: IEndpointStoreOptions): IEndpointSt
 		cancelDebounce();
 		vault.clear();
 		keptInfo.clear();
+		vanished.clear();
 		callHints.clear();
 		sessions.clear();
 		inFlight = null;

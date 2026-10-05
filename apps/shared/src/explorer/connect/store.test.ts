@@ -413,6 +413,110 @@ describe('refresh — a vanished endpoint is stopped, a returning one is probed 
 		assert.equal(probes(world), 2);
 	});
 
+	it('Test connection on a vanished endpoint sends nothing and answers null; the next listing probes it, even on a focus', async () => {
+		// The drawer reads null as "not tested: the pipeline is not running". A
+		// dialect call sent to a restarting task could time out, and its failure
+		// must not turn the card into a sticky Unreachable that background
+		// refreshes no longer re-probe.
+		let dialectFails = false;
+		const { store, world, clock } = make([row()], (call) => {
+			if (call.tool === 'dialect') {
+				if (dialectFails) throw new Error('dialect timed out after 15 s');
+				return NEO4J_INFO;
+			}
+			return { columns: ['n'], rows: [[1]], row_limit: 1000, truncated: false };
+		});
+		const watch = watchProbe();
+		const detach = store.attach(world.client, null, watch.watch);
+		await store.refresh(world.client);
+		const key = store.getState().endpoints[0]!.key;
+		const saved = world.rows.slice();
+		world.rows.length = 0;
+		await store.refresh(world.client);
+		assert.equal(store.getState().endpoints[0]!.state, 'stopped');
+
+		dialectFails = true;
+		const sentBefore = probes(world);
+		assert.equal(await store.probe(world.client, key), null, 'nothing was tested: the pipeline is not listed');
+		assert.equal(probes(world), sentBefore, 'no dialect call is sent for an endpoint discovery no longer lists');
+		assert.equal(store.getState().endpoints[0]!.state, 'stopped');
+
+		// The restart completes; the next refresh is one nobody asked for.
+		dialectFails = false;
+		world.rows.push(...saved);
+		await clock.advance(6_000);
+		watch.handlers!.onFocus();
+		await clock.advance(400);
+		assert.equal(probes(world), sentBefore + 1, 'the listed-again endpoint is probed on a background refresh');
+		assert.equal(store.getState().endpoints[0]!.state, 'ready');
+		const answer = await store.session(world.client, store.getState().endpoints[0]!).invoke('read_query', { cypher: 'RETURN 1' });
+		assert.deepEqual(answer, { columns: ['n'], rows: [[1]], row_limit: 1000, truncated: false });
+		assert.equal(world.calls.filter((c) => c.tool === 'read_query').length, 1, 'the capability-gated call was sent, not refused as upgrade');
+		detach();
+	});
+
+	it('does not apply a failed probe answer that arrives after its endpoint left the list', async () => {
+		// Test connection started while the card was Ready; the pipeline restarts
+		// before the node answers, and the answer is a failure.
+		let held: { reject: (error: Error) => void } | undefined;
+		let hold = false;
+		const { store, world, clock } = make([row()], (call) => {
+			if (call.tool !== 'dialect') return { columns: [], rows: [], row_limit: 1000, truncated: false };
+			if (!hold) return NEO4J_INFO;
+			return new Promise((_resolve, reject) => { held = { reject }; });
+		});
+		const watch = watchProbe();
+		const detach = store.attach(world.client, null, watch.watch);
+		await store.refresh(world.client);
+		const key = store.getState().endpoints[0]!.key;
+
+		hold = true;
+		const pending = store.probe(world.client, key);
+		const saved = world.rows.slice();
+		world.rows.length = 0;
+		await store.refresh(world.client);
+		assert.equal(store.getState().endpoints[0]!.state, 'stopped');
+		held!.reject(new Error('dialect timed out after 15 s'));
+		assert.equal(await pending, null, 'the answer no longer describes a listed endpoint');
+		assert.equal(store.getState().endpoints[0]!.state, 'stopped', 'never a sticky Unreachable for a pipeline that left the list');
+		assert.equal(store.getState().probes[key], undefined);
+
+		hold = false;
+		world.rows.push(...saved);
+		const sentBefore = probes(world);
+		await clock.advance(6_000);
+		watch.handlers!.onFocus();
+		await clock.advance(400);
+		assert.equal(probes(world), sentBefore + 1);
+		assert.equal(store.getState().endpoints[0]!.state, 'ready');
+		detach();
+	});
+
+	it('does not mark a vanished endpoint ready from a late good answer, but keeps that answer for its calls', async () => {
+		let held: { resolve: (value: unknown) => void } | undefined;
+		let hold = false;
+		const { store, world } = make([row()], (call) => {
+			if (call.tool !== 'dialect') return { columns: ['n'], rows: [[1]], row_limit: 1000, truncated: false };
+			if (!hold) return NEO4J_INFO;
+			return new Promise((resolve) => { held = { resolve }; });
+		});
+		await store.refresh(world.client);
+		const key = store.getState().endpoints[0]!.key;
+
+		hold = true;
+		const pending = store.probe(world.client, key);
+		world.rows.length = 0;
+		await store.refresh(world.client);
+		held!.resolve(NEO4J_INFO);
+		assert.equal(await pending, null);
+		const vanished = store.getState().endpoints[0]!;
+		assert.equal(vanished.state, 'stopped', 'a pipeline discovery does not list is never shown ready');
+		assert.equal(store.getState().probes[key], undefined);
+		// The node's answer still serves the session's capability check while the task restarts.
+		await store.session(world.client, vanished).invoke('read_query', { cypher: 'RETURN 1' });
+		assert.equal(world.calls.filter((c) => c.tool === 'read_query').length, 1);
+	});
+
 	it('marks a stopped endpoint only once and keeps it across further refreshes', async () => {
 		const { store, world } = make();
 		await store.refresh(world.client);

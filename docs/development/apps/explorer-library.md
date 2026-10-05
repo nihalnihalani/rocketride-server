@@ -106,8 +106,11 @@ refresh asks for it, its token changes, or it disappears and returns. An
 `store.refresh()`, a restart or reconnect, `store.probe()` (Test connection) or
 a changed token, never on a focus or an ordinary task event: a probe is a tool
 call, and a tool call that reaches the task counts as activity for its idle
-timeout. An empty `getTasks()` list is not proof that something failed to
-provision.
+timeout. An endpoint that disappeared from discovery is not probed:
+`store.probe()` sends nothing for it and returns null, and the answer to a
+probe that was in flight when it disappeared is not applied, so its card stays
+`stopped`. It is probed when a discovery lists it again, on any refresh. An
+empty `getTasks()` list is not proof that something failed to provision.
 
 ## Tokens and identity
 
