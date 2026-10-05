@@ -225,6 +225,7 @@ directly against PostgreSQL 16 with Apache AGE 1.5.0 and through PgBouncer
 ## Dependencies
 
 - `psycopg2-binary` `==2.9.12`
+- `antlr4-python3-runtime` `==4.13.2`
 
 ## Source
 

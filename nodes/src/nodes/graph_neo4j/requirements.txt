@@ -1,1 +1,2 @@
-neo4j
+# Pinned to the version the live suites validate (nodes/test/requirements.txt pins the same).
+neo4j==6.3.1

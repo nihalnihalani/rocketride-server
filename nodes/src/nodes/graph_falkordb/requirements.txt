@@ -1,4 +1,5 @@
-falkordb>=1.6,<2
+# Pinned to the versions the live suites validate (nodes/test/requirements.txt pins the same).
+falkordb==1.7.0
 # Declared because IInstance imports redis.exceptions directly: falkordb-py
 # has no error hierarchy of its own and re-raises redis-py exceptions verbatim.
-redis>=7.1,<8
+redis==7.4.1

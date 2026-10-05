@@ -267,7 +267,7 @@ label changes reported by the Neo4j result summary.
 
 ## Dependencies
 
-- `neo4j`
+- `neo4j` `==6.3.1`
 
 ## Source
 

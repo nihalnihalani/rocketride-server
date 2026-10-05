@@ -149,8 +149,8 @@ The direct query tool serializes graph nodes, relationships, paths, maps, lists,
 
 ## Dependencies
 
-- `falkordb` `>=1.6,<2`
-- `redis` `>=7.1,<8`
+- `falkordb` `==1.7.0`
+- `redis` `==7.4.1`
 
 ## Source
 
