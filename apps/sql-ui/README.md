@@ -322,6 +322,12 @@ The banner is explicit — `Stopped waiting after N.N s. The statement may
 still be running on the database; this tool cannot cancel it.` To stop it,
 stop it on the database.
 
+Closing the query tab, moving it to another split group or switching to
+another app during a run also ends the run: nothing after the statement
+already sent goes out. That statement still finishes on the database, but its
+result is not shown or added to History, and nothing afterwards says which
+statements were not sent.
+
 ### Autocomplete
 
 Suggestions come from the schema snapshot: columns of the aliased or named
