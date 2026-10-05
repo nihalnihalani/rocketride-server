@@ -42,6 +42,12 @@ import type { IRunTarget } from 'shared/explorer';
 /** The sentence every confirmation carries, word for word. */
 export const TEXT_CHECK_SENTENCE = 'This is a text check, not a database safeguard.';
 
+/**
+ * What the write console says about itself, always visible. Only statements the text check flags are confirmed
+ * (see {@link describeWrites}); the rest are sent when Execute is pressed, so the banner does not claim more.
+ */
+export const WRITE_CONSOLE_BANNER = `Statements here run against the live database and can change or delete data. Statements that look like they change data are listed for you to confirm before anything is sent; anything else is sent when you press Execute. Each statement is its own request: if a batch stops, the statements before it have already run and nothing is rolled back. ${TEXT_CHECK_SENTENCE}`;
+
 /** One statement the confirmation lists. */
 export interface IMutatingStatement {
 	/** One-based position in the batch. */

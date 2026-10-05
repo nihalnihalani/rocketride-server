@@ -125,7 +125,7 @@ export const WorkbenchView: React.FC<IWorkbenchViewProps> = ({ endpoint }) => {
 				subtitle={subtitle}
 				actions={
 					writable ? (
-						<Button variant="ghost" onClick={openWrite} title="Open the console that can change data. It asks before it sends anything.">
+						<Button variant="ghost" onClick={openWrite} title="Open the console that can change data. It asks before it sends a statement that looks like a write.">
 							Write console
 						</Button>
 					) : undefined

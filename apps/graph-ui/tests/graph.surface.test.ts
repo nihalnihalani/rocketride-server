@@ -9,7 +9,7 @@
 
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { entrySummary } from '../src/components/HistoryPanel';
+import { entrySummary, historyEmptyText } from '../src/components/HistoryPanel';
 import { createLoadSlot } from '../src/graph/loadSlot';
 import { STILL_RUNNING_TEXT, historySummaryOf, limitPatch, runRefusal, settleRun, toHistoryEntry } from '../src/graph/runConfig';
 import type { GraphValue, ReadQueryResult } from '../src/graph/types';
@@ -85,4 +85,15 @@ test('a run asked for while a statement is still running, or while the surface i
 	assert.equal(runRefusal({ running: true, blocked: null }), STILL_RUNNING_TEXT);
 	assert.match(STILL_RUNNING_TEXT, /^Nothing was sent: a statement is still running\./);
 	assert.equal(runRefusal({ running: true, blocked: 'Checking this connection again.' }), 'Nothing was sent. Checking this connection again.');
+});
+
+// -----------------------------------------------------------------------------
+// GX-FE-16 (2): an empty History list says why
+// -----------------------------------------------------------------------------
+
+test('History says "No entries match" when a search or Pinned only hides entries, not "No history yet"', () => {
+	assert.equal(historyEmptyText(3, true).title, 'No entries match');
+	assert.match(historyEmptyText(3, false).description, /Clear the search or turn off Pinned only/);
+	assert.deepEqual(historyEmptyText(0, true), { title: 'No history yet', description: 'Statements you run on this connection appear here.' });
+	assert.equal(historyEmptyText(0, false).title, 'Recording is off for this connection');
 });

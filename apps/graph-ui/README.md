@@ -45,9 +45,10 @@ Cypher and are not listed.
 ## Connections
 
 The Connections page lists every graph node in every running pipeline task you
-can see. A card shows the pipeline, the node and a state: **Running** once the
-node answered, **Stopped**, **Unreachable**, **No access** (you can see a team
-deployment but your role cannot call it), or **Needs upgrade**. Your own
+can see. A card shows the pipeline, the node and a state: **Checking** while the
+node is being asked who it is, **Running** once it answered, **Stopped**,
+**Unreachable**, **No access** (you can see a team deployment but your role cannot
+call it), or **Needs upgrade**. Your own
 development run and a team's deployment of the same pipeline are separate
 connections, and two owners' runs never merge. Selecting a card opens a drawer
 with the engine and version the node reports, its target (database or graph),
@@ -205,8 +206,11 @@ file on the server, not in this browser: its text as typed (including any
 literal values), when, how long it took, how many rows, and how it ended. You can
 search, pin, add a note, load a statement into the editor, run it again (an
 explicit action), delete entries, clear all, or turn recording off per
-connection. Up to 100 entries and 8 KiB of text per entry are kept. Tokens and
-connection strings are never recorded.
+connection. Up to 100 entries per connection and 8 KiB of text per entry are
+kept, and about 256 K characters of history across all your Graph Explorer
+connections: past that, the oldest entries anywhere are dropped first, unpinned
+before pinned. When a search or **Pinned only** hides every entry, the panel says
+that nothing matches. Tokens and connection strings are never recorded.
 
 ## The write console
 
@@ -216,7 +220,8 @@ editor and an **Execute** button, and it always says what it is:
 
 - Before anything is sent, a confirmation lists the statements that look like
   they change data, with their text, and says **This is a text check, not a
-  database safeguard.** There is no "do not ask again".
+  database safeguard.** There is no "do not ask again". A batch the check does
+  not flag is sent when you press Execute, without a dialog.
 - Statements go through `execute` with the graph result shape, so what a
   statement returned is drawn like any other result. The result line, the strip
   and History show the count the node reports as affected. There is no row-limit

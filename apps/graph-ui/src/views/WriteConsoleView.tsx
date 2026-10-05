@@ -43,16 +43,13 @@ import { useGraphEndpoints } from '../adapters/react';
 import { CONNECTIONS_URI } from '../graph/addresses';
 import { connectionView, surfaceGate } from '../graph/connections';
 import { canWrite, engineText, parseDialect, targetText } from '../graph/dialect';
-import { TEXT_CHECK_SENTENCE } from '../graph/writeConfirm';
+import { WRITE_CONSOLE_BANNER } from '../graph/writeConfirm';
 import { getDocs } from '../docs';
 import { GraphIcon } from '../icons';
 import { styles } from '../styles';
 import HistoryPanel from '../components/HistoryPanel';
 import RunSurface from '../components/RunSurface';
 import { createLoadSlot } from '../graph/loadSlot';
-
-/** What the console says about itself, always visible. */
-export const WRITE_CONSOLE_BANNER = `Statements here run against the live database and can change or delete data. You are asked to confirm before anything is sent. Each statement is its own request: if a batch stops, the statements before it have already run and nothing is rolled back. ${TEXT_CHECK_SENTENCE}`;
 
 /** Why the console is unavailable for a node, in words. */
 export function writeUnavailableText(allowExecute: boolean, graphShape: boolean): string {
