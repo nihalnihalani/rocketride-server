@@ -41,7 +41,7 @@
 // exist"); "Stop waiting" says exactly what it does.
 // =============================================================================
 
-import { INITIAL_NODES, MAX_NODES } from './budgets';
+import { INITIAL_NODES, MAX_NODES, MAX_RELATIONSHIPS } from './budgets';
 import type { IGraphModel } from './model';
 import type { ReadQueryResult } from './types';
 
@@ -134,6 +134,23 @@ export function expandText(added: number, skipped: number, incomplete: boolean, 
 	if (skipped > 0) return `${head} ${num(skipped)} more were left out (at most 100 new neighbours per expansion); expand again to see more.`;
 	if (incomplete) return `${head} This node has more relationships than were fetched; expand again for more.`;
 	return head;
+}
+
+/**
+ * What Connect did. An answer the node cut (`truncated`, or as many rows as were asked for) never claims that nothing
+ * more exists: asking again returns the same rows, so the remedy is to connect fewer nodes.
+ *
+ * @param added - Relationships newly drawn.
+ * @param budget - The canvas budget that stopped it, if any.
+ * @param cut - True when the node returned only part of what matched.
+ * @param rowLimit - The row limit the node applied.
+ * @returns A sentence.
+ */
+export function connectText(added: number, budget: null | 'nodes' | 'relationships', cut: boolean, rowLimit: number): string {
+	if (budget === 'relationships') return `Added ${num(added)} relationships; the canvas holds its maximum of ${num(MAX_RELATIONSHIPS)}.`;
+	const head = `Added ${num(added)} ${added === 1 ? 'relationship' : 'relationships'} among the nodes on the canvas`;
+	if (cut) return `${added === 0 ? 'No new relationships were drawn' : head}, but the node stopped at ${num(rowLimit)} rows, so more relationships among the nodes on the canvas may exist. Connect asks for the same rows again; dismiss some nodes and connect fewer at a time to see others.`;
+	return added === 0 ? 'No further relationships among the nodes on the canvas.' : `${head}.`;
 }
 
 /**

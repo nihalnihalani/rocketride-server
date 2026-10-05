@@ -548,3 +548,24 @@ test('a paused session keeps its drawing and sends nothing for Expand, Connect, 
 	await session.expand('a');
 	assert.equal(log.recipes.length, 1, 'it sends again once the connection answers');
 });
+
+// -----------------------------------------------------------------------------
+// GX-CT-02: Connect honours `truncated`
+// -----------------------------------------------------------------------------
+
+test('connect never says "no further relationships" when the node cut its answer, and says that more may exist', async () => {
+	// The node clamps the 2,000 rows asked for to its own cap (250 on a default FalkorDB node): every row it sent is
+	// already drawn, but the answer was cut.
+	const { session } = rig(NEO, () => envelope([[node('a', ['P']), rel('r1', 'T', 'a', 'b'), node('b', ['P'])]], { row_limit: 250, truncated: true, truncated_by: 'rows' }));
+	session.load(base());
+	await session.connect();
+	const said = session.getState().notice;
+	assert.doesNotMatch(said?.text ?? '', /No further relationships/);
+	assert.match(said?.text ?? '', /stopped at 250 rows, so more relationships among the nodes on the canvas may exist/);
+	assert.equal(said?.variant, 'warning');
+	// Something added from a cut answer says both.
+	const { session: some } = rig(NEO, () => envelope([[node('a', ['P']), rel('r2', 'T', 'b', 'a'), node('b', ['P'])]], { row_limit: 250, truncated: true, truncated_by: 'rows' }));
+	some.load(base());
+	await some.connect();
+	assert.match(some.getState().notice?.text ?? '', /^Added 1 relationship among the nodes on the canvas, but the node stopped at 250 rows/);
+});

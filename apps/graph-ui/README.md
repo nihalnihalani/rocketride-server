@@ -123,7 +123,7 @@ against every shipped theme, is in [docs/contrast.md](docs/contrast.md).
 | Collapse | Removes what hangs only from this node. |
 | Dismiss | Removes the node from the canvas. |
 | Inspect | Opens the node's labels, id and properties, exact and complete, with Copy JSON. |
-| Connect nodes | Draws the relationships among the nodes already on the canvas. |
+| Connect nodes | Draws the relationships among the nodes already on the canvas. When the node returns only part of them (it stops at its own row limit), it says that more may exist; connect fewer nodes to see the others. |
 | Find path | Between two selected nodes, tried at increasing depth up to 10. A node that cannot answer says so; "no path found" names the depth it searched. |
 | Show more nodes | Adds nodes the first draw left out. |
 

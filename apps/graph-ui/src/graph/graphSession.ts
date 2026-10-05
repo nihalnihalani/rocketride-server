@@ -63,7 +63,7 @@ import type { IEntities } from './results';
 import type { GraphId, GraphNode, GraphRelationship, ReadQueryResult } from './types';
 import { DATA_CHANGED_TEXT, STALE_CONNECT_TEXT, STALE_ELEMENT_TEXT, conflictText, identityConflicts } from './identity';
 import type { IIdentityConflict } from './identity';
-import { expandText, num } from './wording';
+import { connectText, expandText, num } from './wording';
 import { STOP_WAITING_NOTE } from './wording';
 import { createPathSearch, noPathText } from '../cypher/pathSearch';
 import type { IPathSearch } from '../cypher/pathSearch';
@@ -399,8 +399,9 @@ export function createGraphSession(deps: IGraphSessionDeps): IGraphSession {
 			}
 			const outcome = connectModel(state.model, incoming);
 			set({ model: outcome.model });
-			const added = outcome.addedRelationships.length;
-			say(outcome.budget === 'relationships' ? `Added ${num(added)} relationships; the canvas holds its maximum of ${num(MAX_RELATIONSHIPS)}.` : added === 0 ? 'No further relationships among the nodes on the canvas.' : `Added ${num(added)} ${added === 1 ? 'relationship' : 'relationships'} among the nodes on the canvas.`);
+			// The node clamps what was asked for to its own row cap: a cut answer must never read as "nothing more".
+			const cut = answer.result.truncated || answer.result.rows.length >= answer.recipe.limit;
+			say(connectText(outcome.addedRelationships.length, outcome.budget, cut, answer.result.row_limit), cut && outcome.budget === null ? 'warning' : 'info');
 		},
 
 		async findPath() {
