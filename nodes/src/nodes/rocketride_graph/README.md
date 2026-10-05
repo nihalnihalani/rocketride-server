@@ -1,8 +1,8 @@
 # rocketride_graph
 
 A RocketRide graph database node for natural-language Cypher queries against
-the Apache AGE graph in the signed-in tenant's managed database. Pick it over
-rocketride_sql when relationships and traversals are the data model.
+the Apache AGE graph in your organization's managed RocketRide database. Pick it
+over rocketride_sql when relationships and traversals are the data model.
 
 ## What it does
 
@@ -108,16 +108,20 @@ list the constructs it cannot use.
 ## Configuration
 
 The single built-in profile supplies the default graph name. RocketRide
-provisions a per-tenant database for its managed database nodes, and this node
-resolves it from the signed-in RocketRide identity instead of a host, user,
-password, or database name you enter. Start with the defaults, then tune the
+provisions one database per organization for its managed database nodes (per
+user only where there is no organization), and the RocketRide server resolves
+the connection to it from the pipeline's organization instead of a host, user,
+password, or database name you enter; nothing in the node configuration or the
+pipeline can point it at another database. Start with the defaults, then tune the
 graph context and read limits around the size and shape of the graph your LLM
 must query.
 
 ### Graph name and graph description
 
-Graph name defaults to rocketride and must name an existing AGE graph; startup
-fails instead of creating a missing graph. Graph description is empty by
+Graph name defaults to rocketride, the graph RocketRide creates when your
+organization's database is first provisioned, and must name an existing AGE
+graph; startup fails instead of creating a missing graph (the error says how
+to create one with `SELECT create_graph(...)`). Graph description is empty by
 default and becomes LLM context, so describe labels, relationship meaning, and
 domain vocabulary when those are not obvious from reflected schema. Change the
 graph name when the tenant database contains multiple AGE graphs; update the
@@ -152,9 +156,10 @@ callers that require writes or raw Cypher.
 ## Limitations
 
 This node runs on the RocketRide engine host and does not support remote
-execution. The engine host must have access to the signed-in RocketRide
-identity used to resolve the tenant DSN. The tenant database must already have
-Apache AGE installed and contain the configured graph. Read paths are
+execution. The RocketRide server resolves the database connection for the
+pipeline's organization at task start, so it needs the cloud database broker
+configured. The tenant database must already have Apache AGE installed and
+contain the configured graph. Read paths are
 intentionally read-only; raw execution remains disabled until explicitly
 enabled.
 

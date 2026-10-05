@@ -208,8 +208,8 @@ def rr_env(monkeypatch):
 
 @pytest.fixture()
 def age_graph(rr_env):
-    """Provision + seed the test graph out-of-band (provisioning is not the
-    node's job while create_graph ownership is open).
+    """Provision + seed the test graph out-of-band, as the cloud provisioner
+    does for 'rocketride' (the node never creates a graph).
     """
     conn = psycopg2.connect(ADMIN_DSN)
     conn.autocommit = True
@@ -262,8 +262,22 @@ class TestLifecycle:
     def test_missing_graph_fails_fast(self, rr_env, age_graph):
         glb = rr_env.iglobal_cls()
         glb.glb = types.SimpleNamespace(logicalType='rocketride_graph', connConfig={'graph': 'rr_graph_missing'})
-        with pytest.raises(RuntimeError, match='does not exist'):
+        with pytest.raises(RuntimeError, match='does not exist') as err:
             glb.beginGlobal()
+        text = str(err.value)
+        # The provisioner creates 'rocketride'; nothing about graph ownership is open any more.
+        assert 'pending' not in text
+        assert (
+            "RocketRide creates the 'rocketride' graph when your organization's database is first provisioned" in text
+        )
+        assert "SELECT create_graph('rr_graph_missing')" in text
+
+    def test_probe_names_the_organization_database(self, rr_env, age_graph):
+        glb = rr_env.iglobal_cls()
+        glb._probe_connection({'graph': 'rr_graph_missing'})
+        assert rr_env.warnings == [
+            "AGE graph 'rr_graph_missing' does not exist in your organization's RocketRide database"
+        ]
 
 
 def _bad_password_dsn() -> str:

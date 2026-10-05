@@ -25,10 +25,11 @@
 
 Mirrors ``graph_neo4j`` on :class:`GraphGlobalBase`, with two differences:
 
-1. **Connection** — no host/user/password config; the per-tenant DSN comes
-   from the account layer (``ai.common.rocketride_db``), same seam as
-   ``rocketride_sql`` / ``rocketride_vector``. The tenant database is
-   Postgres + Apache AGE.
+1. **Connection** — no host/user/password config; the DSN of the
+   organization's database (the tenant; a user only where there is no
+   organization) comes from the account layer (``ai.common.rocketride_db``),
+   same seam as ``rocketride_sql`` / ``rocketride_vector``. The tenant
+   database is Postgres + Apache AGE.
 2. **Query paths** — Apache AGE cannot run bare Cypher, so ``_run_query``
    (safe), ``_run_query_raw`` (EXECUTE) and ``_validate_query`` all route
    through the Cypher->AGE translation layer (``ai.common.graph.age``).
@@ -218,15 +219,15 @@ class IGlobal(GraphGlobalBase):
 
         if not graph_exists:
             pool.close()
-            # OPEN QUESTION (create_graph ownership, see the node README and
-            # the design's open-questions): whether the node or the cloud
-            # provisioner creates the per-tenant graph is undecided. Until it
-            # is, the node refuses to run against a missing graph rather than
-            # silently creating one.
+            # The cloud provisioner creates the default graph ('rocketride')
+            # when the organization's database is first provisioned. The node
+            # never creates one itself: a mistyped Graph name must fail here,
+            # not silently start an empty graph.
             raise RuntimeError(
-                f'AGE graph {self.graph_name!r} does not exist in the tenant database. '
-                'Graph provisioning ownership is pending; create the graph '
-                f"(SELECT create_graph('{self.graph_name}')) or configure an existing one."
+                f"AGE graph {self.graph_name!r} does not exist in your organization's RocketRide database. "
+                f"RocketRide creates the {DEFAULT_GRAPH_NAME!r} graph when your organization's database is "
+                'first provisioned; set Graph name to an existing graph, or create this one first '
+                f"(SELECT create_graph('{self.graph_name}'))."
             )
         self.pool = pool
 
@@ -250,7 +251,7 @@ class IGlobal(GraphGlobalBase):
                 graph = str(config.get('graph') or DEFAULT_GRAPH_NAME).strip()
                 cur.execute('SELECT 1 FROM ag_catalog.ag_graph WHERE name = %s', (graph,))
                 if cur.fetchone() is None:
-                    warning(f'AGE graph {graph!r} does not exist yet in the tenant database')
+                    warning(f"AGE graph {graph!r} does not exist in your organization's RocketRide database")
         except NotImplementedError as e:
             # The OSS account stub: no cloud sign-in available.
             warning(str(e))
