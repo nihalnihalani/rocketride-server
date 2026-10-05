@@ -105,3 +105,23 @@ test('the remote exposes only the AppDescriptor and keeps the async boundary', (
 test('the .rrapp marker is the contentless trigger file', () => {
 	assert.equal(fs.readFileSync(path.join(APP_ROOT, 'graph.rrapp'), 'utf8').trim(), '{}');
 });
+
+// GX-CMP-02: the app imports the shared Explorer library (`shared/*`, resolved through tsconfig paths). The App Builder
+// and `rocketride app deploy` pack only the app folder plus the manifest's include roots, so without
+// "include": ["apps/shared"] a server build cannot resolve 'shared/explorer'.
+test('an app that imports shared/* declares apps/shared in appManifest.include, as explorer-ui does', () => {
+	const files: string[] = [];
+	const walk = (dir: string): void => {
+		for (const name of fs.readdirSync(dir)) {
+			const full = path.join(dir, name);
+			if (fs.statSync(full).isDirectory()) walk(full);
+			else if (/\.(ts|tsx)$/.test(name)) files.push(full);
+		}
+	};
+	walk(path.join(APP_ROOT, 'src'));
+	const importsShared = files.some((file) => /from '(shared\/[^']+)'/.test(fs.readFileSync(file, 'utf8')));
+	assert.ok(importsShared, 'the premise: src imports shared/*');
+	assert.deepEqual(pkg.appManifest.include, ['apps/shared']);
+	const explorer = JSON.parse(fs.readFileSync(path.join(REPO_ROOT, 'apps', 'explorer-ui', 'package.json'), 'utf8'));
+	assert.deepEqual(explorer.appManifest.include, ['apps/shared'], 'the format other apps use');
+});
