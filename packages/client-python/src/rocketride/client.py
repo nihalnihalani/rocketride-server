@@ -349,8 +349,12 @@ class RocketRideClient(
             The tool's return value (typically a dict).
 
         Raises:
-            RuntimeError: If the server signals failure or no node handles the
-                requested tool.
+            CommandException: If the server signals failure or no node handles
+                the requested tool. It is a ``RuntimeError`` whose message is
+                the server's message (for graph and database tools, a headline
+                line followed by the detail) and whose ``code`` is the
+                server's machine-readable code (for example ``TASK_STOPPED``),
+                when the failure has one.
         """
         result = await self.call(
             'rrext_process',
