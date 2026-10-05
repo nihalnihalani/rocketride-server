@@ -266,6 +266,74 @@ class TestLifecycle:
             glb.beginGlobal()
 
 
+def _bad_password_dsn() -> str:
+    """TEST_DSN with a wrong password: the server answers with libpq's detailed refusal."""
+    from urllib.parse import urlsplit, urlunsplit
+
+    parts = urlsplit(TEST_DSN)
+    host = parts.netloc.rpartition('@')[2]
+    user = parts.username or 'rruser'
+    return urlunsplit((parts.scheme, f'{user}:not-the-password@{host}', parts.path, parts.query, parts.fragment))
+
+
+def _internal_details() -> list:
+    """What a connection failure must not show callers: host, port and database role."""
+    from urllib.parse import urlsplit
+
+    parts = urlsplit(TEST_DSN)
+    return [parts.hostname, str(parts.port), parts.username, '127.0.0.1', 'password authentication']
+
+
+class TestConnectionFailureText:
+    def test_startup_failure_names_no_host_port_or_role(self, rr_env, age_graph, monkeypatch):
+        monkeypatch.setenv('ROCKETRIDE_DB_DSN', _bad_password_dsn())
+        glb = rr_env.iglobal_cls()
+        glb.glb = types.SimpleNamespace(logicalType='rocketride_graph', connConfig={'graph': GRAPH})
+        with pytest.raises(Exception) as err:
+            glb.beginGlobal()
+        text = str(err.value)
+        assert 'could not be reached' in text
+        for detail in _internal_details():
+            assert detail not in text, detail
+
+    def test_tool_call_failure_names_no_host_port_or_role(self, rr_env, age_graph):
+        glb = _begin(rr_env)
+        module = sys.modules[rr_env.iglobal_cls.__module__]
+        try:
+            # The pooler went away (or credentials rotated) after startup: every
+            # new connection now fails the way libpq reports it.
+            bad = _bad_password_dsn()
+            glb.pool.close()
+            glb.pool = module.ConnectionPool(
+                lambda: module._open_connection(bad),
+                max_size=1,
+                acquire_timeout_s=5,
+                reset=module._reset_connection,
+                is_usable=module._connection_usable,
+                close=module._close_connection,
+            )
+            inst = rr_env.iinstance_cls()
+            inst.IGlobal = glb
+            with pytest.raises(Exception) as err:
+                inst.read_query({'cypher': 'MATCH (p:Person) RETURN count(p)'})
+            text = str(err.value)
+            assert text.startswith('Database unreachable\n')
+            for detail in _internal_details():
+                assert detail not in text, detail
+        finally:
+            glb.endGlobal()
+
+    def test_save_time_probe_names_no_host_port_or_role(self, rr_env, age_graph, monkeypatch):
+        monkeypatch.setenv('ROCKETRIDE_DB_DSN', _bad_password_dsn())
+        glb = rr_env.iglobal_cls()
+        glb._probe_connection({'graph': GRAPH})
+        assert rr_env.warnings, 'the probe must still warn'
+        text = ' '.join(rr_env.warnings)
+        assert 'could not be reached' in text
+        for detail in _internal_details():
+            assert detail not in text, detail
+
+
 class TestSafePath:
     def test_read_query_decodes_rows(self, rr_env, age_graph):
         glb = _begin(rr_env)

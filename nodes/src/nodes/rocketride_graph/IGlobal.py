@@ -52,7 +52,7 @@ from psycopg2 import errors as pg_errors
 from psycopg2 import sql
 from psycopg2.extensions import TRANSACTION_STATUS_IDLE
 
-from rocketlib import warning
+from rocketlib import debug, warning
 from ai.common.graph import GraphGlobalBase
 from ai.common.graph.adapters import age_adapter
 from ai.common.graph.age import (
@@ -99,10 +99,31 @@ class _ConnectionLost(Exception):
         self.before_main = before_main
 
 
+class DatabaseUnreachable(RuntimeError):
+    """Connecting to the tenant database failed (the driver's detail is in the server log)."""
+
+
+UNREACHABLE_TEXT = 'The RocketRide cloud database could not be reached'
+
+
+def _connect(dsn: str):
+    """psycopg2.connect, bounded, with a connection failure reduced to a fixed message.
+
+    libpq's connection errors name the pooler host, its address and port, and
+    the database role. They go to the server's debug log only; callers (users,
+    agents, the browser) get :data:`UNREACHABLE_TEXT`.
+    """
+    try:
+        # Bounded connect so an unreachable pooler fails fast instead of
+        # waiting out the OS TCP timeout.
+        return psycopg2.connect(dsn, connect_timeout=CONNECT_TIMEOUT_S)
+    except psycopg2.OperationalError as e:
+        debug(f'rocketride_graph: connecting to the tenant database failed: {_pg_detail(e)}')
+        raise DatabaseUnreachable(UNREACHABLE_TEXT) from None
+
+
 def _open_connection(dsn: str):
-    # Bounded connect so an unreachable pooler fails fast (matches the
-    # probe's 3s timeout) instead of waiting out the OS TCP timeout.
-    conn = psycopg2.connect(dsn, connect_timeout=CONNECT_TIMEOUT_S)
+    conn = _connect(dsn)
     # READ ONLY and SET LOCAL statement_timeout only apply inside a
     # transaction; psycopg2 opens one implicitly on the first execute only
     # while autocommit is off. Make the precondition explicit.
@@ -206,7 +227,7 @@ class IGlobal(GraphGlobalBase):
         conn = None
         try:
             dsn = resolve_rocketride_dsn()
-            conn = psycopg2.connect(dsn, connect_timeout=CONNECT_TIMEOUT_S)
+            conn = _connect(dsn)
             with conn.cursor() as cur:
                 cur.execute('SELECT 1')
                 cur.execute("SELECT 1 FROM pg_extension WHERE extname = 'age'")
@@ -467,6 +488,8 @@ class IGlobal(GraphGlobalBase):
             return 'Database busy: no connection became free in time', str(exc)
         if isinstance(exc, PoolClosed):
             return 'The graph node is shutting down', str(exc)
+        if isinstance(exc, DatabaseUnreachable):
+            return 'Database unreachable', f'{exc}; try again shortly. The server log has the details.'
         if isinstance(exc, pg_errors.QueryCanceled):
             return f'Query timed out after {self.statement_timeout_ms} ms', _pg_detail(exc)
         if isinstance(exc, pg_errors.ReadOnlySqlTransaction):
