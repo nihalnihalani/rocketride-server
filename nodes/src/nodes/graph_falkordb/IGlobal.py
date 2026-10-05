@@ -252,6 +252,18 @@ class IGlobal(GraphGlobalBase):
             cap = min(cap, self.server_result_cap - 1)
         return max(1, cap)
 
+    @property
+    def execute_graph_cap(self) -> int:
+        """max_execute_rows, kept below RESULTSET_SIZE so a reply the server cut reads as truncated.
+
+        GRAPH.QUERY replies are cut at RESULTSET_SIZE just like GRAPH.RO_QUERY
+        ones, without any marker, so the +1 sentinel row must fit under it.
+        """
+        cap = int(self.max_execute_rows)
+        if self.server_result_cap:
+            cap = min(cap, self.server_result_cap - 1)
+        return max(1, cap)
+
     def _graph_adapter(self):
         return falkordb_adapter()
 

@@ -286,6 +286,11 @@ class GraphGlobalBase(IGlobalBase, ABC):
         return max(1, min(int(self.read_row_cap), READ_QUERY_HARD_CAP))
 
     @property
+    def execute_graph_cap(self) -> int:
+        """Row limit ``execute(shape='graph')`` applies (``max_execute_rows`` unless the server cuts sooner)."""
+        return max(1, int(self.max_execute_rows))
+
+    @property
     def statement_timeout_ms(self) -> int:
         """Server-side deadline applied to every read_query / execute statement."""
         return DEFAULT_STATEMENT_TIMEOUT_MS

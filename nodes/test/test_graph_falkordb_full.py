@@ -215,6 +215,21 @@ class TestServerLimits:
         finally:
             glb.endGlobal()
 
+    def test_execute_graph_shape_reports_a_resultset_size_cut(self, falkor_env, falkor_graph):
+        glb, inst = _start(falkor_env, allow_execute=True)
+        try:
+            cap = glb.server_result_cap
+            if cap is None:
+                pytest.skip('server does not allow GRAPH.CONFIG GET RESULTSET_SIZE')
+            assert glb.execute_graph_cap == min(glb.max_execute_rows, cap - 1)
+            over = inst.execute({'query': f'UNWIND range(1, {cap + 5000}) AS i RETURN i', 'shape': 'graph'})
+            assert over['row_limit'] == cap - 1 and len(over['rows']) == cap - 1
+            assert over['truncated'] is True and over['truncated_by'] == 'rows'
+            exact = inst.execute({'query': f'UNWIND range(1, {cap - 1}) AS i RETURN i', 'shape': 'graph'})
+            assert len(exact['rows']) == cap - 1 and exact['truncated'] is False
+        finally:
+            glb.endGlobal()
+
     def test_exact_limit_and_truncation(self, falkor_env, falkor_graph):
         glb, inst = _start(falkor_env)
         try:

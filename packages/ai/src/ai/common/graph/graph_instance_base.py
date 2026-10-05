@@ -340,7 +340,7 @@ class GraphInstanceBase(IInstanceBase, ABC):
 
         if shape == 'graph':
             # Never retried: a write may already have happened.
-            row_limit = self.IGlobal.max_execute_rows
+            row_limit = self.IGlobal.execute_graph_cap
 
             def consume(columns, rows):
                 return self._graph_envelope(columns, rows, row_limit)

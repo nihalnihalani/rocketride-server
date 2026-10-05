@@ -79,8 +79,9 @@ relationship list. `read_boundary` is `ro_command`. The natural-language tools
 tell the model it is writing FalkorDB OpenCypher run as `GRAPH.RO_QUERY`.
 
 `RESULTSET_SIZE` truncates a reply silently on the server, so the node reads it
-(and `TIMEOUT_MAX`) with `GRAPH.CONFIG GET` at start and keeps its read cap one
-row below it; where `GRAPH.CONFIG` is not permitted it assumes no server limit
+(and `TIMEOUT_MAX`) with `GRAPH.CONFIG GET` at start and keeps both the
+`read_query` cap and the `execute` (`shape: "graph"`) row limit one row below
+it, so a reply the server cut is reported as `truncated_by: "rows"`; where `GRAPH.CONFIG` is not permitted it assumes no server limit
 and says so in a warning. The client buffers each whole reply, so the server's
 `RESULTSET_SIZE` and the timeout are what bound server work and memory.
 

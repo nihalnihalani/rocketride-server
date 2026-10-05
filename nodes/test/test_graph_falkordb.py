@@ -961,6 +961,28 @@ def test_read_query_respects_server_limits():
     assert graph.calls[0][3] == 1000
 
 
+def test_execute_graph_shape_respects_server_result_cap():
+    """RESULTSET_SIZE cuts GRAPH.QUERY replies too: a cut write-console result must read as truncated."""
+    # The server silently returns at most RESULTSET_SIZE (5) rows of the 10 the statement produces.
+    graph = _FakeGraph(_FakeResult(result_set=[[i] for i in range(5)], header=[[1, 'i']]))
+    glb = _FakeGlobal(graph)
+    glb.allow_execute = True
+    glb.server_result_cap = 5
+    out = _instance(glb).execute({'query': 'UNWIND range(1, 10) AS i RETURN i', 'shape': 'graph'})
+    assert out['truncated'] is True and out['truncated_by'] == 'rows'
+    assert out['row_limit'] == 4 and len(out['rows']) == 4
+    assert glb.execute_graph_cap == 4
+    assert [c[0] for c in graph.calls] == ['query']
+
+
+def test_execute_graph_shape_without_a_server_cap_uses_max_execute_rows():
+    graph = _FakeGraph(_FakeResult(result_set=[[1]], header=[[1, 'i']]))
+    glb = _FakeGlobal(graph)
+    glb.allow_execute, glb.server_result_cap, glb.max_execute_rows = True, None, 300
+    out = _instance(glb).execute({'query': 'RETURN 1 AS i', 'shape': 'graph'})
+    assert out['row_limit'] == 300 and out['truncated'] is False
+
+
 def test_read_query_error_headlines():
     graph = _FakeGraph(raise_error=_StubRedisError('graph.RO_QUERY is to be executed only on read-only queries'))
     with pytest.raises(Exception, match='^Refused: read_query is read-only'):
