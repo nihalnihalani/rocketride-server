@@ -5,8 +5,9 @@
 # =============================================================================
 # Seed a small fictional demo dataset into the local disposable test containers,
 # for product screenshots only. Graph: DEMO_GRAPH (default gx_demo) on FalkorDB
-# and AGE, which this script DROPS and recreates; Neo4j nodes carry demo:true
-# (only those are deleted). SQL: ${DEMO_SQL_PREFIX}customers / products / orders
+# and AGE, which this script DROPS and recreates; Neo4j nodes carry demo:true, and
+# the script deletes EVERY Neo4j node with demo:true first, whoever created it.
+# SQL: ${DEMO_SQL_PREFIX}customers / products / orders
 # (default prefix demo_), which this script DROPS and recreates.
 # Point it only at disposable containers. The credentials below are throwaway
 # LOCAL-ONLY test values for those containers, not secrets.

@@ -4,19 +4,22 @@
 # =============================================================================
 """Self-tests for the acceptance harness's own verdict logic.
 
-They need no engine, database or browser: the SDK is replaced by a small
-in-memory stand-in written to a temporary directory. They check that a harness
-check cannot pass without testing anything.
+They need no engine, database or browser: the SDK and the Neo4j driver are
+replaced by small in-memory stand-ins written to a temporary directory. They
+check that a harness check cannot pass without testing anything, and that the
+Neo4j clean-up stays inside the run's label.
 
 Run: python3 -m unittest discover -s scripts/acceptance/graph-explorer/selftest -v
 """
 
+import importlib
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
 import textwrap
+import types
 import unittest
 
 from pathlib import Path
@@ -152,6 +155,77 @@ class LifecycleRestartWindow(unittest.TestCase):
     def test_restart_window_observed_passes(self):
         res = self.run_lifecycle('window')
         self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+
+
+class Neo4jCleanupScope(unittest.TestCase):
+    """On the shared Neo4j database the acceptance only deletes and counts nodes with its run label."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.statements = []
+        statements = cls.statements
+
+        class _Driver:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def execute_query(self, cypher):
+                statements.append(cypher)
+                return [], None, None
+
+        neo4j = types.ModuleType('neo4j')
+        neo4j.GraphDatabase = types.SimpleNamespace(driver=_Driver)
+        sdk = types.ModuleType('rocketride')
+        sdk.CommandException = type('CommandException', (RuntimeError,), {})
+        sdk.RocketRideClient = object
+        cls._saved = {name: sys.modules.get(name) for name in ('neo4j', 'rocketride', 'graph_acceptance')}
+        sys.modules['neo4j'] = neo4j
+        sys.modules['rocketride'] = sdk
+        sys.modules.pop('graph_acceptance', None)
+        sys.path.insert(0, str(ACC))
+        cls.ga = importlib.import_module('graph_acceptance')
+
+    @classmethod
+    def tearDownClass(cls):
+        sys.path.remove(str(ACC))
+        for name, module in cls._saved.items():
+            if module is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = module
+
+    def setUp(self):
+        self.statements.clear()
+
+    def assert_scoped(self, statements):
+        label = f':{self.ga.RUN}'
+        for stmt in statements:
+            self.assertIn(label, stmt, f'statement is not limited to the run label {label}: {stmt}')
+
+    def test_reset_deletes_only_run_nodes(self):
+        self.ga.Admin('neo4j').reset_and_seed()
+        deletes = [s for s in self.statements if 'DELETE' in s.upper()]
+        self.assertTrue(deletes)
+        self.assert_scoped(deletes)
+
+    def test_intruder_count_is_run_scoped(self):
+        self.ga.Admin('neo4j').count('Intruder')
+        self.assert_scoped(self.statements)
+
+    def test_write_probes_carry_the_run_label(self):
+        probes = self.ga.write_probes('neo4j') + [self.ga.execute_probe('neo4j')]
+        self.assertEqual(len(probes), 4)
+        self.assert_scoped(probes)
+
+    def test_other_engines_keep_their_own_graph(self):
+        probes = self.ga.write_probes('falkordb') + [self.ga.execute_probe('age')]
+        self.assertNotIn(f':{self.ga.RUN}', ' '.join(probes))
 
 
 if __name__ == '__main__':

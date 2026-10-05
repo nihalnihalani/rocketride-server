@@ -101,15 +101,17 @@ async function runEngine(client, engine) {
 		const m = r.rows && r.rows[0] && r.rows[0][0];
 		check(engine, 'user @-keys are escaped, never a tag', !!m && m['@kind'] === undefined && m['@@kind'] === 'node' && m['@@@x'] === 1 && m.plain === 2, m);
 
+		// On the shared Neo4j database the write probes carry the run label (see graph_acceptance.py).
+		const scope = engine === 'neo4j' ? `:${E.RUN_LABEL}` : '';
 		try {
-			await tool('read_query', { cypher: 'CREATE (:Intruder)', limit: 1 });
+			await tool('read_query', { cypher: `CREATE (:Intruder${scope})`, limit: 1 });
 			check(engine, 'write on read path rejects', false, 'not refused');
 		} catch (e) {
 			check(engine, 'write on read path rejects with a DAPException', e instanceof DAPException && e instanceof Error, { name: e && e.name, msg: String(e && e.message).slice(0, 120) });
 			check(engine, 'refusal headline is first line', /^(Refused|Not supported|Invalid)/.test(String(e.message)), String(e.message).split('\n')[0]);
 		}
 		try {
-			await tool('execute', { query: 'CREATE (:Intruder)' });
+			await tool('execute', { query: `CREATE (:Intruder${scope})` });
 			check(engine, 'execute refused (allow_execute off)', false, 'not refused');
 		} catch (e) {
 			check(engine, 'execute refused (allow_execute off)', e instanceof DAPException && /allow_execute/.test(e.message), e.message);

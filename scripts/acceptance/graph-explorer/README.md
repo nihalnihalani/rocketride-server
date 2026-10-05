@@ -136,9 +136,9 @@ All optional; the defaults match the containers above.
 | `SQL_HOST`, `SQL_USER`, `SQL_PASSWORD`, `SQL_DATABASE` | `gx-pgvector` | SQL fixtures |
 | `SQL_TABLE` | `gx_items` | SQL fixture table; `start_fixtures.py` creates it with 25 rows when missing and never changes an existing one |
 | `ACCEPT_GRAPH` | `gx_accept` | graph the acceptance seeds (dropped and recreated on AGE and FalkorDB) and the fixtures read |
-| `RUN_LABEL` | `GxAcc` | label on every Neo4j node the acceptance seeds (only those are deleted) |
+| `RUN_LABEL` | `GxAcc` | label on every Neo4j node the acceptance seeds or writes as a probe; on Neo4j the acceptance deletes and counts only nodes with this label |
 | `PERF_GRAPH` | `gx_perf` | FalkorDB graph `gen_perf.py` drops and recreates |
-| `DEMO_GRAPH`, `DEMO_SQL_PREFIX` | `gx_demo`, `demo_` | demo graph and tables `seed_demo.sh` drops and recreates |
+| `DEMO_GRAPH`, `DEMO_SQL_PREFIX` | `gx_demo`, `demo_` | demo graph and tables `seed_demo.sh` drops and recreates; on Neo4j it deletes every node with `demo: true`, whoever created it |
 
 Pick your own `ACCEPT_GRAPH` and `RUN_LABEL` when someone else may run the
 lanes against the same containers at the same time.
@@ -197,7 +197,7 @@ a Graph Explorer defect.
 ### Product screenshots
 
 ```bash
-$ACC/demo/seed_demo.sh                                  # drops and recreates DEMO_GRAPH and the demo_* tables
+$ACC/demo/seed_demo.sh    # drops and recreates DEMO_GRAPH and the demo_* tables, deletes all Neo4j nodes with demo: true
 (cd dist/server && ./engine $ACC/browser/gen_perf.py 300)
 (cd dist/server && ./engine $ACC/demo/start_demo.py)
 node $ACC/demo/take_shots.cjs "$OUT_DIR/shots"
@@ -206,10 +206,11 @@ node $ACC/demo/take_shots.cjs "$OUT_DIR/shots"
 ## Self-tests
 
 The harness's own verdict logic has small tests that need no engine, database
-or browser: stand-ins replace the SDK and Playwright. They
-check that `validate_all.sh` reports a failed step in its exit status, and that
-the lifecycle restart rows and the Graph Explorer Ask step cannot pass without
-observing what they name. Run them after changing a script here:
+or browser: stand-ins replace the SDK, the Neo4j driver and Playwright. They
+check that `validate_all.sh` reports a failed step in its exit status, that the
+lifecycle restart rows and the Graph Explorer Ask step cannot pass without
+observing what they name, and that the Neo4j clean-up stays inside `RUN_LABEL`.
+Run them after changing a script here:
 
 ```bash
 python3 -m unittest discover -s scripts/acceptance/graph-explorer/selftest -v

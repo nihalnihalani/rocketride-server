@@ -51,6 +51,31 @@ FALKOR = (E.FALKORDB_HOST, E.FALKORDB_PORT)
 GRAPH = E.ACCEPT_GRAPH  # own graph: never touch other runs' graphs
 RUN = E.RUN_LABEL  # Neo4j has one database: every seeded node carries this label
 
+
+def run_scope(engine: str) -> str:
+    """Label suffix that keeps a Neo4j statement on this run's nodes (AGE and FalkorDB use their own graph)."""
+    return f':{RUN}' if engine == 'neo4j' else ''
+
+
+def write_probes(engine: str) -> List[str]:
+    """Writes the read path must refuse.
+
+    On Neo4j they carry the run label, so a write that got through would be
+    counted, and later deleted, within this run only.
+    """
+    t = run_scope(engine)
+    return [
+        f'CREATE (:Intruder{t} {{x: 1}})',
+        f'MATCH (n:Person{t}) SET n.flag = true',
+        f'MERGE (:Intruder{t} {{x: 2}})',
+    ]
+
+
+def execute_probe(engine: str) -> str:
+    """A write sent to ``execute``, which must be refused while allow_execute is off."""
+    return f'CREATE (:Intruder{run_scope(engine)} {{x: 3}})'
+
+
 NODE_CONFIG = {
     'age': ('rocketride_graph', {'graph': GRAPH, 'allow_execute': False}),
     'neo4j': ('graph_neo4j', {'uri': NEO4J[0], 'user': NEO4J[1], 'password': NEO4J[2], 'allow_execute': False}),
@@ -93,7 +118,7 @@ class Admin:
         return [row[0] for row in res.result_set]
 
     def count(self, label: str = '') -> int:
-        scope = f':{label}' if label else (f':{RUN}' if self.engine == 'neo4j' else '')
+        scope = (f':{label}' if label else '') + run_scope(self.engine)
         rows = self.run(f'MATCH (n{scope}) RETURN count(n)')
         return int(str(rows[0]).split('::')[0]) if rows else 0
 
@@ -115,7 +140,6 @@ class Admin:
                 self.run(f'CREATE (:L{i:02d} {{i: {i}}})')
         elif self.engine == 'neo4j':
             self.run(f'MATCH (n:{RUN}) DETACH DELETE n')
-            self.run('MATCH (n:Intruder) DETACH DELETE n')
         else:
             try:
                 from falkordb import FalkorDB
@@ -123,7 +147,7 @@ class Admin:
                 FalkorDB(host=FALKOR[0], port=FALKOR[1]).select_graph(GRAPH).delete()
             except Exception:  # noqa: BLE001 - graph may not exist yet
                 pass
-        t = f':{RUN}' if self.engine == 'neo4j' else ''
+        t = run_scope(self.engine)
         self.run(
             f"CREATE (a:Person{t} {{name: 'Ada GX', born: 1815}})-[:KNOWS {{since: 1833}}]->(b:Person{t} {{name: 'Charles GX'}}), "
             f"(b)-[:KNOWS {{since: 1840}}]->(c:Person{t} {{name: 'Grace GX'}}), (c)-[:WROTE]->(:Paper{t} {{title: 'Compilers'}})"
@@ -346,7 +370,7 @@ async def run_engine(client: RocketRideClient, engine: str, pipe: Dict[str, Any]
         )
 
         # Id round trip as a bound parameter (unsafe ids on AGE).
-        scope = f':{RUN}' if engine == 'neo4j' else ''
+        scope = run_scope(engine)
         r = await call(client, token, node_id, 'read_query', {'cypher': f'MATCH (n{scope}) RETURN n', 'limit': 100})
         all_nodes = graph_values(r.get('rows'), 'node')
         if engine == 'age':
@@ -383,7 +407,7 @@ async def run_engine(client: RocketRideClient, engine: str, pipe: Dict[str, Any]
         # Writes refused on the read path, proved by state.
         before = admin.count()
         intruders_before = admin.count('Intruder')
-        for stmt in ('CREATE (:Intruder {x: 1})', 'MATCH (n:Person) SET n.flag = true', 'MERGE (:Intruder {x: 2})'):
+        for stmt in write_probes(engine):
             msg = await expect_refusal(client, token, node_id, 'read_query', {'cypher': stmt, 'limit': 5})
             rep.check(f'read_query refuses {stmt.split()[0]}', bool(msg), msg[:120])
         if engine == 'neo4j':
@@ -393,7 +417,7 @@ async def run_engine(client: RocketRideClient, engine: str, pipe: Dict[str, Any]
             rep.check('read_query refuses non-allowlisted CALL', 'Refused' in msg or 'not allowed' in msg, msg[:120])
         after = admin.count()
         intruders_after = admin.count('Intruder')
-        flagged = admin.run("MATCH (n:Person) WHERE n.flag = true AND n.name ENDS WITH ' GX' RETURN count(n)")
+        flagged = admin.run(f"MATCH (n:Person{scope}) WHERE n.flag = true AND n.name ENDS WITH ' GX' RETURN count(n)")
         rep.check(
             'database unchanged after refused writes',
             before == after and intruders_before == intruders_after and str(flagged[0]).split('::')[0] in ('0', 'None'),
@@ -401,7 +425,7 @@ async def run_engine(client: RocketRideClient, engine: str, pipe: Dict[str, Any]
         )
 
         # execute refused with allow_execute off.
-        msg = await expect_refusal(client, token, node_id, 'execute', {'query': 'CREATE (:Intruder {x: 3})'})
+        msg = await expect_refusal(client, token, node_id, 'execute', {'query': execute_probe(engine)})
         rep.check('execute refused with allow_execute off', 'allow_execute' in msg, msg[:120])
         rep.check(
             'database unchanged after refused execute',
@@ -410,7 +434,7 @@ async def run_engine(client: RocketRideClient, engine: str, pipe: Dict[str, Any]
 
         # Schema refresh observes a change made outside the node.
         fresh = f'Fresh{uuid.uuid4().hex[:8]}'  # unique per run: no earlier run can have it
-        admin.run(f'CREATE (:{fresh}{":" + RUN if engine == "neo4j" else ""} {{added: true}})')
+        admin.run(f'CREATE (:{fresh}{scope} {{added: true}})')
         sch_before = {
             lab['name']
             for lab in ((await call(client, token, node_id, 'get_schema', {})).get('schema') or {}).get('labels', [])
