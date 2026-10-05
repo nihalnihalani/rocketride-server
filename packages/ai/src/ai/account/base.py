@@ -103,6 +103,27 @@ def check_db_broker_environment(environ: Mapping[str, str] = os.environ, env_fil
         )
 
 
+def hosted_db_broker_warning(account, argv, environ: Mapping[str, str] = os.environ) -> Optional[str]:
+    """The startup warning for a hosted engine whose cloud DB nodes have no broker, or None.
+
+    A hosted engine (``--saas`` or an account with the ``saas`` capability)
+    that resolves DSNs through the default :meth:`AccountBase.resolve_db_dsn`
+    needs both broker settings; without them every RocketRide cloud database
+    node fails at task start. An overlay with its own ``resolve_db_dsn`` and
+    the open-source default need no warning.
+    """
+    hosted = '--saas' in argv or 'saas' in (getattr(account, 'capabilities', None) or ())
+    if not hosted or type(account).resolve_db_dsn is not AccountBase.resolve_db_dsn:
+        return None
+    if environ.get(DB_BROKER_URL_ENV, '').strip() and environ.get(DB_BROKER_TOKEN_ENV, '').strip():
+        return None
+    return (
+        f'{DB_BROKER_URL_ENV} / {DB_BROKER_TOKEN_ENV} are not set: the RocketRide cloud database nodes '
+        '(rocketride_sql, rocketride_vector, rocketride_graph) will fail at task start with '
+        '"the RocketRide cloud database broker is not configured on this server".'
+    )
+
+
 class AccountBase(ABC):
     """
     Abstract interface for the RocketRide Account facade.

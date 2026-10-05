@@ -473,3 +473,38 @@ def test_account_package_refuses_to_load_with_a_legacy_name_in_the_engine_env_fi
     assert proc.returncode != 0
     assert 'ROCKETRIDE_DB_BROKER_TOKEN -> RR_DB_BROKER_TOKEN' in proc.stderr
     assert LEGACY_SENTINEL not in proc.stderr + proc.stdout
+
+
+# ---------------------------------------------------------------------------
+# A hosted engine without broker settings warns at startup.
+# ---------------------------------------------------------------------------
+
+
+class _Hosted(_Minimal):
+    capabilities = ('saas',)
+
+
+class _OwnResolver(_Hosted):
+    async def resolve_db_dsn(self, client_id):  # pragma: no cover - never called
+        return 'postgresql://overlay'
+
+
+@pytest.mark.parametrize(
+    'account,argv,env,warns',
+    [
+        (_Minimal(), ['engine', '--saas'], {}, True),
+        (_Hosted(), ['engine'], {}, True),
+        (_Hosted(), ['engine'], {'RR_DB_BROKER_URL': 'https://b.example', 'RR_DB_BROKER_TOKEN': 't'}, False),
+        (_Hosted(), ['engine'], {'RR_DB_BROKER_URL': 'https://b.example'}, True),
+        (_Minimal(), ['engine'], {}, False),  # open-source default: nothing to warn about
+        (_OwnResolver(), ['engine', '--saas'], {}, False),  # an overlay resolving DSNs itself needs no broker
+    ],
+)
+def test_hosted_engine_without_broker_warns_at_startup(account, argv, env, warns):
+    from ai.account.base import hosted_db_broker_warning
+
+    text = hosted_db_broker_warning(account, argv, env)
+    if warns:
+        assert 'RR_DB_BROKER_URL' in text and 'not configured on this server' in text
+    else:
+        assert text is None
