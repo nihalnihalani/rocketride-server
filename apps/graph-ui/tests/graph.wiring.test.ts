@@ -142,3 +142,11 @@ test('Run is disabled for as long as a statement runs, and a run that cannot sta
 	const confirm = surface.slice(surface.indexOf('onConfirm={'), surface.indexOf('onCancel={'));
 	assert.ok(/runRefusal\(/.test(confirm), 'so does confirming a write');
 });
+
+// GX-FE-08: one unkeyed drawer instance served every card, so the last Test result showed on the next card opened.
+test('the connection drawer starts fresh for every card, and words its Test result through testResultText', () => {
+	const view = code(read('views', 'ConnectionsView.tsx'));
+	assert.ok(/<ConnectionDrawer\s+key=\{drawerKey \?\? ''\}/.test(view), 'the drawer is keyed on the card it shows');
+	const drawer = code(read('components', 'ConnectionDrawer.tsx'));
+	assert.ok(/setTested\(testResultText\(result\)\)/.test(drawer), 'a missing result is not read as a failed probe');
+});

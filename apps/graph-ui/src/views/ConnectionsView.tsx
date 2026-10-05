@@ -103,6 +103,7 @@ export const ConnectionsView: React.FC = () => {
 				)}
 			</div>
 			<ConnectionDrawer
+				key={drawerKey ?? ''}
 				open={drawerEndpoint !== null}
 				endpoint={drawerEndpoint}
 				probe={drawerEndpoint ? probes[drawerEndpoint.key] : undefined}

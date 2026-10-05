@@ -167,6 +167,30 @@ export function connectionView(endpoint: IExplorerEndpoint, probe: IProbeResult 
 }
 
 // =============================================================================
+// TEST CONNECTION
+// =============================================================================
+
+/** What the drawer says after Test connection. */
+export interface ITestResult {
+	variant: 'info' | 'warning' | 'error';
+	text: string;
+}
+
+/**
+ * The drawer's sentence for a Test connection result. The store answers null when it sent nothing (the pipeline is
+ * not running, so there is no task to ask, or a check of this connection is already running): that is "not tested",
+ * never "the node did not answer".
+ *
+ * @param result - What the probe returned, or null when none was sent.
+ * @returns The sentence and its banner variant.
+ */
+export function testResultText(result: IProbeResult | null): ITestResult {
+	if (result === null) return { variant: 'warning', text: 'Not tested: the pipeline is not running, or a check of this connection is already in progress.' };
+	if (result.ok) return { variant: 'info', text: 'The node answered.' };
+	return { variant: 'error', text: 'The node did not answer its identity probe. The details are on its card.' };
+}
+
+// =============================================================================
 // AN OPEN DOCUMENT WHOSE CONNECTION IS CHECKED AGAIN
 // =============================================================================
 //

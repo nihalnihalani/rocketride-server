@@ -12,7 +12,7 @@ import { test } from 'node:test';
 import type { IExplorerEndpoint, IProbeResult } from 'shared/explorer';
 import { fakeWorld, manualClock, row } from 'shared/explorer/connect/testing';
 import { makeGraphEndpointStore } from '../src/adapters/explorer';
-import { RECHECKING_TEXT, connectionView, emptyState, ownerText, surfaceGate } from '../src/graph/connections';
+import { RECHECKING_TEXT, connectionView, emptyState, ownerText, surfaceGate, testResultText } from '../src/graph/connections';
 import { fixture } from './support/builders';
 
 function endpoint(over: Partial<IExplorerEndpoint> = {}): IExplorerEndpoint {
@@ -156,4 +156,19 @@ test('a stopped or blocked connection keeps an open surface but pauses it with t
 	const upgrade = surfaceGate(connectionView(endpoint(), probeOf('old_node')), true);
 	assert.equal(upgrade.mounted, true);
 	assert.match(upgrade.paused ?? '', /needs an upgrade/);
+});
+
+// -----------------------------------------------------------------------------
+// GX-FE-08: what Test connection says, and for which card
+// -----------------------------------------------------------------------------
+
+test('Test connection says "not tested" when nothing was sent, never that the node did not answer', () => {
+	const skipped = testResultText(null);
+	assert.equal(skipped.variant, 'warning');
+	assert.match(skipped.text, /^Not tested: /);
+	assert.doesNotMatch(skipped.text, /did not answer/);
+	assert.deepEqual(testResultText(probeOf('neo4j')), { variant: 'info', text: 'The node answered.' });
+	const failedProbe = testResultText(failed('connection refused'));
+	assert.equal(failedProbe.variant, 'error');
+	assert.match(failedProbe.text, /did not answer its identity probe/);
 });
