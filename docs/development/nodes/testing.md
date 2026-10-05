@@ -590,9 +590,9 @@ the engine's `depends()`, so versions match what the nodes get at runtime.
 When a test starts importing a package that only a node provides (not a base
 engine package such as `numpy`, `pillow`, `requests` or `SQLAlchemy`), add it to
 `nodes/test/requirements.txt` without a version; the engine constraints pin it.
-The graph database drivers are the exception: their nodes pin the exact
-versions the live suites were validated with, and `nodes/test/requirements.txt`
-repeats those pins, so bump both together.
+This holds for the graph database drivers too: their pins (the versions the
+live suites were validated with) live only in the nodes' own
+`requirements.txt`, and reach the test install through the engine constraints.
 
 `--list-skipped` and `--warmup=plan` do not install anything: they report the
 environment as it is.

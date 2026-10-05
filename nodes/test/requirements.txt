@@ -12,16 +12,16 @@ pytest-xdist
 # Base engine packages (numpy, pillow, requests, SQLAlchemy, antlr4) need no entry.
 img2table                   # ocr: test_model_server_ocr.py
 #
-# The graph database drivers are pinned to the versions the live suites (and
-# the graph-ui wire fixtures generated from them) were validated with. The same
-# pins are in the nodes' own requirements.txt, which feed the engine
-# constraints these installs run under, so bump both together.
-psycopg2-binary==2.9.12     # rocketride_*, db/store_postgres: test_rocketride_db_full.py, test_rocketride_graph_full.py
+# The graph database drivers (and psycopg2, antlr4) are pinned only in their
+# nodes' requirements.txt, to the versions the live suites and the graph-ui wire
+# fixtures were validated with. Those pins reach these installs through the
+# engine constraints, so no version is repeated here.
+psycopg2-binary             # rocketride_*, db/store_postgres: test_rocketride_db_full.py, test_rocketride_graph_full.py
 pgvector                    # rocketride_vector, store_postgres: test_rocketride_db_full.py
-antlr4-python3-runtime==4.13.2  # rocketride_graph (AGE translator, generated with ANTLR 4.13.2): live database suites
-neo4j==6.3.1                # graph_neo4j: live database suites (test_graph_drivers_full.py uses its Bolt hydration)
-falkordb==1.7.0             # graph_falkordb: live database suites
-redis==7.4.1                # graph_falkordb (falkordb-py re-raises redis-py errors)
+antlr4-python3-runtime      # rocketride_graph (AGE translator, generated with ANTLR 4.13.2): live database suites
+neo4j                       # graph_neo4j: live database suites (test_graph_drivers_full.py uses its Bolt hydration)
+falkordb                    # graph_falkordb: live database suites
+redis                       # graph_falkordb (falkordb-py re-raises redis-py errors)
 python-docx                 # tool_microsoft_365: test_word.py
 smbprotocol                 # text_output: test_validate_config.py
 pygit2                      # tool_git: test_tools.py
