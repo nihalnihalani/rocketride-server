@@ -31,7 +31,7 @@ class FakeConn:
         self.resets += 1
 
 
-def make_pool(max_size=2, timeout=1.0, connect=None):
+def make_pool(max_size=2, timeout=1.0, connect=None, **kwargs):
     opened = []
 
     def _connect():
@@ -46,8 +46,18 @@ def make_pool(max_size=2, timeout=1.0, connect=None):
         reset=lambda c: c.reset(),
         is_usable=lambda c: not c.closed,
         close=lambda c: setattr(c, 'closed', True),
+        **kwargs,
     )
     return pool, opened
+
+
+def warm(pool, count):
+    """Check out ``count`` connections at once, then return them all to the idle list."""
+    held = [pool.connection() for _ in range(count)]
+    conns = [cm.__enter__() for cm in held]
+    for cm in held:
+        cm.__exit__(None, None, None)
+    return conns
 
 
 def test_checkout_is_exclusive_and_bounded():
@@ -210,3 +220,79 @@ def test_close_wakes_waiters():
 def test_invalid_size_rejected():
     with pytest.raises(ValueError):
         make_pool(max_size=0)
+
+
+# ---------------------------------------------------------------------------
+# fresh checkout (after a lost connection) and idle reaping
+# ---------------------------------------------------------------------------
+
+
+def test_fresh_checkout_closes_every_idle_connection_and_opens_a_new_one():
+    """After a lost connection the idle ones likely died with it: never hand one out again."""
+    pool, opened = make_pool(max_size=3)
+    stale = warm(pool, 3)
+    assert pool.idle == 3
+    with pool.connection(fresh=True) as conn:
+        assert conn not in stale and conn is opened[-1]
+        assert all(c.closed for c in stale)
+        assert pool.size == 1
+    assert pool.idle == 1 and len(opened) == 4
+
+
+def test_fresh_checkout_stays_within_max_size():
+    pool, opened = make_pool(max_size=2)
+    warm(pool, 2)
+    with pool.connection() as busy:
+        with pool.connection(fresh=True) as conn:
+            assert conn is not busy and pool.size == 2
+    assert pool.size <= 2
+
+
+def test_idle_connections_are_closed_after_the_idle_timeout():
+    """An idle node gives its connections back to the pooler without any further call."""
+    pool, opened = make_pool(max_size=2, idle_timeout_s=0.05)
+    conns = warm(pool, 2)
+    deadline = time.monotonic() + 2
+    while pool.idle and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert pool.idle == 0 and pool.size == 0
+    assert all(c.closed for c in conns)
+    pool.close()
+
+
+def test_expired_idle_connection_is_not_reused_on_checkout():
+    pool, opened = make_pool(max_size=1, idle_timeout_s=0.05)
+    with pool.connection() as first:
+        pass
+    time.sleep(0.1)
+    with pool.connection() as second:
+        assert second is not first
+    assert first.closed
+    pool.close()
+
+
+def test_recently_used_connection_is_kept_within_the_idle_timeout():
+    pool, opened = make_pool(max_size=1, idle_timeout_s=30)
+    with pool.connection() as first:
+        pass
+    with pool.connection() as second:
+        assert second is first
+    pool.close()
+
+
+def test_no_reaping_without_an_idle_timeout():
+    pool, opened = make_pool(max_size=1)
+    with pool.connection() as conn:
+        pass
+    time.sleep(0.05)
+    assert pool.idle == 1 and not conn.closed
+
+
+def test_close_stops_the_reaper():
+    pool, _ = make_pool(max_size=1, idle_timeout_s=0.05)
+    warm(pool, 1)
+    reaper = pool._reaper
+    assert reaper is not None and reaper.is_alive()
+    pool.close()
+    reaper.join(2)
+    assert not reaper.is_alive()

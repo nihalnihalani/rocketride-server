@@ -74,11 +74,14 @@ DEFAULT_GRAPH_NAME = 'rocketride'
 DEFAULT_MAX_ROWS = 1000
 DEFAULT_QUERY_TIMEOUT_MS = 30000
 
-# Connections held open per node. Tool calls run on up to 64 worker threads
-# per task; past this many concurrent calls, callers queue for a free
-# connection (bounded by the statement timeout plus a grace period) instead of
-# opening an unbounded number of sessions against the tenant database.
-DEFAULT_POOL_SIZE = 8
+# Connections a node may hold. Tool calls run on up to 64 worker threads per
+# task; past this many concurrent calls, callers queue for a free connection
+# (bounded by the statement timeout plus a grace period) instead of opening an
+# unbounded number of client connections to the tenant database's pooler,
+# whose client-connection limit every tenant shares. A connection idle for
+# POOL_IDLE_TIMEOUT_S is closed, so an idle pipeline holds none.
+DEFAULT_POOL_SIZE = 4
+POOL_IDLE_TIMEOUT_S = 60.0
 POOL_ACQUIRE_GRACE_S = 5.0
 CONNECT_TIMEOUT_S = 3
 
@@ -157,6 +160,7 @@ class IGlobal(GraphGlobalBase):
             reset=_reset_connection,
             is_usable=_connection_usable,
             close=_close_connection,
+            idle_timeout_s=POOL_IDLE_TIMEOUT_S,
         )
 
         try:
@@ -270,13 +274,15 @@ class IGlobal(GraphGlobalBase):
 
         A connection that turns out to be dead before the plan's main
         statement was sent (e.g. dropped while idle in the pool) is discarded
-        and the plan is retried once on a fresh connection: nothing ran, so the
-        retry is safe even for a write. A failure at or after the main
+        and the plan is retried once on a newly opened connection: nothing
+        ran, so the retry is safe even for a write. The retry never reuses an
+        idle connection, and closes them all: a database or pooler restart
+        drops every idle session at once. A failure at or after the main
         statement is never retried — whether it ran is unknown.
         """
         pool = self._require_pool()
         for attempt in (1, 2):
-            with pool.connection() as conn:
+            with pool.connection(fresh=attempt > 1) as conn:
                 try:
                     return self._run_plan(conn, plan, fetch_cap, explain=explain)
                 except _ConnectionLost as lost:

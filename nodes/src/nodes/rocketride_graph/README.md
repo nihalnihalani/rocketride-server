@@ -171,16 +171,24 @@ blocking the node.
 ### Connections and concurrency
 
 Each tool call checks a database connection out of a small per-node pool
-(up to 8 connections) for its own use and runs in its own transaction, so
+(up to 4 connections) for its own use and runs in its own transaction, so
 parallel calls never share a transaction or each other's read-only and
-statement-timeout settings. When all 8 are busy, further calls wait up to the
+statement-timeout settings. When all 4 are busy, further calls wait up to the
 query timeout plus 5 seconds for one to free up. Every setting is
 transaction-local, and parameterised queries deallocate their prepared
 statement even when the query fails, so nothing is left on the database
 session afterwards. A connection the server dropped while idle is replaced and
-the call retried once, before any of the query has run; a connection lost
-while a query runs is reported, never re-run. The pool closes with the
-pipeline.
+the call retried once, before any of the query has run, on a newly opened
+connection; the retry also closes the node's other idle connections, since a
+database or pooler restart drops them all at once. A connection lost while a
+query runs is reported, never re-run. The pool closes with the pipeline.
+
+Capacity: each running rocketride_graph node holds at most 4 client
+connections to the tenant database's pooler, and closes a connection that has
+been idle for 60 seconds, so an idle pipeline holds none. Plan the pooler's
+client-connection limit for 4 connections per concurrently busy graph node
+(plus those of rocketride_sql and rocketride_vector nodes in the same
+pipelines).
 
 The node works through a transaction-mode connection pooler such as
 PgBouncer: it keeps no state on a database session between transactions and

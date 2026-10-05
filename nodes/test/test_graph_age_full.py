@@ -348,6 +348,63 @@ class TestRecovery:
             admin.close()
             glb.endGlobal()
 
+    def test_restart_with_several_idle_connections_recovers_on_the_first_call(self, rr_env, age_graph, monkeypatch):
+        """A database or pooler restart drops every idle session at once; the retry must not take another."""
+        if BEHIND_POOLER:
+            pytest.skip('NOT RUN: behind a pooler the server cannot drop the node client connections it holds')
+        _set_pool_size(rr_env, monkeypatch, 3)
+        glb = _begin(rr_env)
+        admin = _admin()
+        barrier = threading.Barrier(3)
+
+        def warm():
+            barrier.wait()
+            return glb._execute_plan(_plan(['SELECT pg_sleep(0.3)', 'SELECT pg_backend_pid()'], read_only=True))[0][0]
+
+        try:
+            results, errors = _run_threads({i: warm for i in range(3)})
+            assert not errors, errors
+            pids = sorted(set(results.values()))
+            assert len(pids) == 3 and glb.pool.idle == 3
+            with admin.cursor() as cur:
+                cur.execute('SELECT pg_terminate_backend(pid) FROM unnest(%s::int[]) AS pid', (pids,))
+            time.sleep(0.2)
+            for _ in range(3):
+                assert glb._run_query('MATCH (p:Person) RETURN count(p) AS c') == [{'c': 3}]
+        finally:
+            admin.close()
+            glb.endGlobal()
+
+    def test_idle_sessions_are_closed_after_the_idle_timeout(self, rr_env, age_graph, monkeypatch):
+        module = sys.modules[rr_env.iglobal_cls.__module__]
+        monkeypatch.setattr(module, 'POOL_IDLE_TIMEOUT_S', 0.3)
+        glb = _begin(rr_env)
+        try:
+            assert glb.pool.max_size == module.DEFAULT_POOL_SIZE <= 4
+            assert glb.pool.idle_timeout_s == 0.3
+            pid = None if BEHIND_POOLER else _on_pooled_session(glb, 'SELECT pg_backend_pid()')[0]
+            deadline = time.monotonic() + 5
+            while glb.pool.size and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert glb.pool.size == 0
+            if pid is not None:
+                admin = _admin()
+                try:
+                    deadline = time.monotonic() + 5
+                    alive = True
+                    while alive and time.monotonic() < deadline:
+                        with admin.cursor() as cur:
+                            cur.execute('SELECT 1 FROM pg_stat_activity WHERE pid = %s', (pid,))
+                            alive = cur.fetchone() is not None
+                        time.sleep(0.05)
+                    assert not alive
+                finally:
+                    admin.close()
+            # The next call simply opens a new connection.
+            assert glb._run_query('MATCH (p:Person) RETURN count(p) AS c') == [{'c': 3}]
+        finally:
+            glb.endGlobal()
+
     def test_connection_lost_during_the_main_statement_is_not_retried(self, rr_env, age_graph, monkeypatch):
         _set_pool_size(rr_env, monkeypatch, 1)
         glb = _begin(rr_env)
