@@ -79,7 +79,8 @@ export function prepareStatement(text: string, limitChoice: number | null, diale
 /**
  * Whether the browse editor may send a batch. A statement that is not a read is
  * refused HERE, before anything is sent, with a message; the node's own read
- * path would refuse it too, and the database role is the boundary either way.
+ * path would refuse it too, and that read path (with the database account, where
+ * the node lets you choose one) is the boundary either way.
  *
  * @param statements - The prepared statements.
  * @param canWrite - Whether this endpoint has a write console.

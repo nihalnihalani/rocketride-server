@@ -30,9 +30,11 @@
 // no automatic retry, no "stop asking", and no claim of atomicity: each statement is
 // its own request, so a batch that stops half way leaves the earlier ones done.
 //
-// The text check is not a database safeguard. The database role the node connects
-// with is the real boundary; the node README says to use a read-only role for
-// browsing, and a role that can write only where this console is meant to.
+// The text check is not a database safeguard. For Neo4j and FalkorDB the database
+// account the node connects with is the boundary (a read-only one for browsing, one
+// that can write only where this console is meant to). rocketride_graph has no
+// account to choose: it connects as the role that owns the organization's database,
+// so for it the boundary is whether the node allows execute at all.
 // =============================================================================
 
 import React, { useCallback, useMemo, useRef, useState } from 'react';

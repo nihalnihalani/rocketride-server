@@ -36,7 +36,8 @@
 // until someone reviews it and adds it here.
 //
 // This list is a courtesy for the editor. The node enforces its own allow-list
-// on `read_query`, and the database role is the real boundary.
+// on `read_query`, which (with the database account, where the node lets you
+// choose one) is the real boundary.
 // =============================================================================
 
 /** The reviewed read-only procedures, one entry per name, as lowercase parts. */

@@ -6,30 +6,38 @@ and, only where a node allows it, change data. It is not a database client of
 its own. Every statement travels through a graph tool node inside one of your
 running pipelines, so it reaches exactly the graph that node is configured for,
 with that node's permissions. If apps are new to you, read
-[Apps](../../docs/public/product/concepts/apps.md) first. What the app
-deliberately does not do is under [Limits](#limits).
+[Apps](https://github.com/rocketride-org/rocketride-server/blob/develop/docs/public/product/concepts/apps.md)
+first. What the app deliberately does not do is under [Limits](#limits).
 
-The supported nodes are [`rocketride_graph`](../../nodes/src/nodes/rocketride_graph/README.md)
-(Apache AGE), [`graph_neo4j`](../../nodes/src/nodes/graph_neo4j/README.md) and
-[`graph_falkordb`](../../nodes/src/nodes/graph_falkordb/README.md). Other nodes
-that declare the `graph` class, such as ArangoDB and HydraDB, do not speak
-Cypher and are not listed.
+The supported nodes are
+[`rocketride_graph`](https://github.com/rocketride-org/rocketride-server/blob/develop/nodes/src/nodes/rocketride_graph/README.md)
+(Apache AGE in your organization's managed RocketRide database),
+[`graph_neo4j`](https://github.com/rocketride-org/rocketride-server/blob/develop/nodes/src/nodes/graph_neo4j/README.md)
+and
+[`graph_falkordb`](https://github.com/rocketride-org/rocketride-server/blob/develop/nodes/src/nodes/graph_falkordb/README.md).
+Other nodes that declare the `graph` class, such as ArangoDB and HydraDB, do not
+speak Cypher and are not listed.
 
 ## Before you start
 
 - **A running pipeline with a graph node.** Connections are discovered from
-  running tasks, so a stopped pipeline has none. Three starting pipelines ship
-  with the app in [`templates/`](templates): `age.pipe`, `neo4j.pipe` and
-  `falkordb.pipe`. Each is a tools source plus one graph node and a note, with
-  direct execution off, and holds no password, token or `project_id`. Copy one into
-  a VS Code workspace: the editor gives a new `.pipe` file its own `project_id` when
-  it has none, so two people importing the same template never share an identity.
-  Type the connection details into the node's form (they are stored encrypted).
-  Posting the raw file through an SDK `use()` also works, but the engine then
-  reports no project id for the task. Two raw copies started by the same user with
-  the same node id then share one connection identity and appear as ONE card in the
-  Connections list. Save each copy as its own `.pipe` file in a VS Code workspace (or
-  give each its own `project_id`) before running two of them.
+  running tasks, so a stopped pipeline has none. Three starting pipelines,
+  `age.pipe`, `neo4j.pipe` and `falkordb.pipe`, are kept in the RocketRide
+  repository under
+  [`apps/graph-ui/templates`](https://github.com/rocketride-org/rocketride-server/tree/develop/apps/graph-ui/templates).
+  They are not installed with the app. Each is a tools source plus one graph node
+  and a note, with direct execution off, and holds no password, token or
+  `project_id`. To use one, open it there and save its text as a new `.pipe` file
+  in a VS Code workspace: the editor gives a new `.pipe` file its own `project_id`
+  when it has none, so two people importing the same template never share an
+  identity. For Neo4j and FalkorDB, type the connection details into the node's
+  form (they are stored encrypted). `rocketride_graph` has none to type: it uses
+  your organization's managed RocketRide database. Posting the raw file through
+  an SDK `use()` also works, but the engine then reports no project id for the
+  task. Two raw copies started by the same user with the same node id then share
+  one connection identity and appear as ONE card in the Connections list. Save
+  each copy as its own `.pipe` file in a VS Code workspace (or give each its own
+  `project_id`) before running two of them.
 - **A node that is up to date.** The app reads through the node's `read_query`
   tool and reads its identity, limits and capabilities from `dialect`. A node
   that does not advertise `read_query` is shown as **Needs upgrade** and cannot
@@ -47,13 +55,14 @@ Cypher and are not listed.
 The Connections page lists every graph node in every running pipeline task you
 can see. A card shows the pipeline, the node and a state: **Checking** while the
 node is being asked who it is, **Running** once it answered, **Stopped**,
-**Unreachable**, **No access** (you can see a team deployment but your role cannot
-call it), or **Needs upgrade**. Your own
-development run and a team's deployment of the same pipeline are separate
-connections, and two owners' runs never merge. Selecting a card opens a drawer
-with the engine and version the node reports, its target (database or graph),
-whether writes are allowed, and a sentence on what the node's read path
-guarantees. **Test connection** asks the node again.
+**Unreachable**, **No access** (you can see a team deployment but your role
+cannot call it), or **Needs upgrade**. Your own development run and a team's
+deployment of the same pipeline are separate connections, and two owners' runs
+never merge. Selecting a card opens a drawer with the engine and version the
+node reports, its target (database or graph), whether writes are allowed, and a
+sentence on what the node's read path guarantees. **Test connection** asks the
+node again; when nothing could be sent (the pipeline is not running, or a check
+is already in progress) it says "Not tested".
 
 An empty list does not say why. If the task list is empty the page says that it
 cannot tell whether nothing is running or something is wrong. A node that fails
@@ -99,8 +108,8 @@ result tabs.
   (`CREATE`, `MERGE`, `SET`, `DELETE`, `REMOVE`, `DROP`, `LOAD CSV`, a
   procedure that is not on the allowlist, and similar) is refused before
   anything is sent. **This is a text check, not a database safeguard.** The node
-  refuses writes on its read path as well, but the real boundary is the database
-  role the node connects with; see [Safety](#safety).
+  refuses writes on its read path as well; what keeps a read read-only depends on
+  the node, see [Safety](#safety).
 
 ### Results
 
@@ -120,7 +129,8 @@ budget or its value budget.
 Nodes are coloured by their first label, with the first letter of the label
 inside, and a legend lists every label next to its colour. Colour is never the
 only carrier of meaning. How colours were chosen, and the contrast measured
-against every shipped theme, is in [docs/contrast.md](docs/contrast.md).
+against every shipped theme, is in
+[docs/contrast.md](https://github.com/rocketride-org/rocketride-server/blob/develop/apps/graph-ui/docs/contrast.md).
 
 | Action | What it does |
 |---|---|
@@ -168,9 +178,9 @@ to the connected node in that direction, Enter inspects, Space selects, `E`
 expands, `C` collapses, Delete or Backspace (the Mac "delete" key) dismisses,
 `P` finds a path between two selected nodes, `?` lists every key, Tab leaves the
 canvas. Each node is spoken with its caption, labels and how many relationships
-are shown, and each action is announced through one polite live region. Animations respect the reduced-motion
-setting. The Table tab lists the same result for anyone who would rather not use
-the canvas.
+are shown, and each action is announced through one polite live region.
+Animations respect the reduced-motion setting. The Table tab lists the same
+result for anyone who would rather not use the canvas.
 
 ## The sidebar
 
@@ -245,12 +255,18 @@ editor and an **Execute** button, and it always says what it is:
   elsewhere. A node that cannot do that is not browsable.
 - The text check that refuses writes in the browse editor is a convenience and
   can be wrong in both directions. It is not a boundary.
-- **The boundary is the database role.** Connect the node with a user that can
-  only read, and a statement the app should never send cannot do harm. On Neo4j
-  the node reads in a read session, which is a routing hint, not access control;
-  Apache AGE reads in a read-only transaction; FalkorDB uses `GRAPH.RO_QUERY`.
-  The drawer states which of these a connection has and whether the node verified
-  its own permissions (`read_boundary_verified`).
+- **For Neo4j and FalkorDB, the boundary is the database account you connect
+  the node with.** Use a user that can only read, and a statement the app should
+  never send cannot do harm. On Neo4j the node reads in a read session, which is
+  a routing hint, not access control; FalkorDB uses `GRAPH.RO_QUERY`.
+- **`rocketride_graph` has no account to choose.** It connects to your
+  organization's managed database as the role that owns that database, so a
+  read-only database role cannot be relied on there. Its reads are kept
+  read-only by a read-only transaction and by the node's own check of each
+  statement. Whether it can write at all is its **Allow direct query
+  execution** setting.
+- The drawer states which of these a connection has and whether the node
+  verified its own permissions (`read_boundary_verified`).
 - Nothing the app saves or shows contains a task token, a connection string or a
   password.
 
@@ -269,9 +285,10 @@ editor and an **Execute** button, and it always says what it is:
 - Performance was checked with results of 100, 300 and 1,000 nodes, and with
   1,000 nodes drawn after **Show more nodes** (a 1,000-node result draws its
   first 300 until then). On an Apple-silicon laptop there were no long tasks
-  panning or dragging at any of these. On a much slower device, panning a fully
-  drawn 1,000-node graph stutters, which is one reason the first draw is capped
-  at 300.
+  panning or dragging at any of these. With the CPU slowed 4x in Chrome, as a
+  stand-in for a slower device, panning a fully drawn 1,000-node graph stutters,
+  which is one reason the first draw is capped at 300. No real low-end device
+  was measured.
 - Browsers: the production checks ran in Chrome 154, Firefox 141 and WebKit 26
   (Playwright). WebKit is the engine Safari uses, but it is not Safari, and
   Safari itself has not been tried. The build declares Safari 13 as its floor,
@@ -284,16 +301,7 @@ editor and an **Execute** button, and it always says what it is:
 
 ## For developers
 
-- App id `rocketride.graph`, development port 3102. The code under `src/graph`,
-  `src/cypher` and `src/layout` is plain TypeScript with no browser or shell
-  dependency, so it runs under `node:test`. The shared Explorer library
-  (`apps/shared/src/explorer`) provides discovery, the tool session, history and
-  the statement runner.
-- `./builder graph-ui:test` type-checks `src` and `tests`, then runs every file in
-  `tests/`; a file that is missing from the list in `scripts/tasks.js`, or an empty
-  run, fails the task. `tests/fixtures/v1/live/` holds answers captured from the
-  real node tools on Neo4j, FalkorDB and Apache AGE; `tests/fixtures/provisional/`
-  is hand-modelled and kept for the cases the live set does not cover.
-- `./builder graph-ui:build` bundles the app, registers it and copies it to the
-  served directory. Rebuilding an app at the same version needs the engine's
-  store reset before the server serves it again.
+Notes on the code, its tests and the build are in
+[apps/graph-ui/docs/development.md](https://github.com/rocketride-org/rocketride-server/blob/develop/apps/graph-ui/docs/development.md),
+and how apps work in this repository is in
+[docs/development/apps](https://github.com/rocketride-org/rocketride-server/blob/develop/docs/development/apps/index.md).
