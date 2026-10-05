@@ -329,7 +329,7 @@ Start a RocketRide pipeline for processing data.
 
 **Returns:** Dictionary containing the task `token` and other startup metadata.
 
-**Raises:** `ValueError` (no pipeline/filepath given), `FileNotFoundError` (bad filepath), `RuntimeError` (server refused to start or returned no token).
+**Raises:** `ValueError` (no pipeline/filepath given), `FileNotFoundError` (bad filepath), `CommandException` (the server refused to start it; a `RuntimeError` with `e.code`), `RuntimeError` (the server returned no token).
 
 ```python
 # A document pipeline: webhook source -> parse -> text response
@@ -423,7 +423,7 @@ ocr = await client.get_service('ocr')
 
 ### `async tool(*, token: str, tool: str, node_id: str = '', input: dict = None, timeout: float = None) -> Any`
 
-Invoke a `@tool_function` exposed by a pipeline node, bypassing the chat/question flow. When `node_id` is empty the call broadcasts to all tool-lane nodes and the first node owning the tool handles it. Returns the tool's return value (typically a dict). When the server rejects the call (including when no node handles the tool) it raises `CommandException`, a `RuntimeError` subclass whose `e.code` is the server's machine-readable code when it sent one: `TASK_STOPPED` means the task stopped (or is restarting) before the call reached the node, and no code means the tool itself failed. See [§17](#17-exceptions--error-handling). (The [Database](#13-database) namespace is built on this.)
+Invoke a `@tool_function` exposed by a pipeline node, bypassing the chat/question flow. When `node_id` is empty the call broadcasts to all tool-lane nodes and the first node owning the tool handles it. Returns the tool's return value (typically a dict). When the server rejects the call (including when no node handles the tool) it raises `CommandException`, a `RuntimeError` subclass whose `e.code` is the server's machine-readable code when it sent one: `TASK_STOPPED` means the task stopped (or is restarting) before the call reached the node, and no code means the tool failed or no node handled it. See [§17](#17-exceptions--error-handling). (The [Database](#13-database) namespace is built on this.)
 
 ```python
 from rocketride import CommandException
@@ -1189,10 +1189,10 @@ DAPException                      (base; wraps DAP error responses; .code)
 ### What Actually Raises What
 
 - `connect()` / `login()`: `AuthenticationException` on rejected credentials; transport failures surface as connection errors.
-- `use()`: `ValueError` (neither `pipeline` nor `filepath` given), `FileNotFoundError` (bad `filepath`), `RuntimeError` (server refused to start or returned no token).
+- `use()`: `ValueError` (neither `pipeline` nor `filepath` given), `FileNotFoundError` (bad `filepath`), `CommandException` (the server refused to start it), plain `RuntimeError` (the server returned no token).
 - `send()` / `send_files()` / `chat()` / pipe `open()`/`write()`/`close()`: `PipeException` on transfer failure. `PipeException` also inherits `RuntimeError`, so legacy `except RuntimeError` handlers still catch it.
-- `call()` and the methods that pass its failure through — `tool()`, `get_tasks()`, `get_task_pipeline()` and most other typed methods — raise **`CommandException`** when the server rejects the command. It is a `RuntimeError` subclass, so `except RuntimeError` still catches it; `str(e)` is the server's message and `e.code` its code when it sent one. Task failures carry `TASK_NOT_REGISTERED`, `TASK_AMBIGUOUS`, `TASK_COMPLETED` or `TASK_STOPPED` (the task is stopped, or is terminating during a restart, so the request was never sent). **Classify on `e.code`, never on the message text.**
-- Every other typed API — `terminate()`, `restart()`, `validate()`, `get_services()`, all `fs_*` methods, and the `deploy`, `log`, `account`, `billing`, `database`, dashboard, and app methods — raises **`RuntimeError`** carrying the server's error message when the server signals failure (a `CommandException` when the method passes the `call()` failure through); client-side argument problems raise `ValueError`. Methods that re-raise their own `RuntimeError` (for example `restart()`, `validate()` and pipe `tool()`) carry no `code`.
+- `call()` and every typed method built on it raise **`CommandException`** when the server rejects the command: `tool()`, `use()`, `terminate()`, `get_tasks()`, `get_task_pipeline()`, `get_services()` / `get_service()`, `ping()`, the `fs_*` methods that wrap one call (`fs_open()`, `fs_write()`, `fs_close()`, `fs_delete()`, `fs_list_dir()`, `fs_mkdir()`, `fs_rmdir()`, `fs_stat()`, `fs_rename()`, `fs_get_url()`), and the `deploy`, `log`, `account`, `billing`, `database`, dashboard and app methods. It is a `RuntimeError` subclass, so `except RuntimeError` still catches it; `str(e)` is the server's message and `e.code` its code when it sent one. Task failures carry `TASK_NOT_REGISTERED`, `TASK_AMBIGUOUS`, `TASK_COMPLETED` or `TASK_STOPPED` (the task is stopped, or is terminating during a restart, so the request was never sent). **Classify on `e.code`, never on the message text.**
+- These raise their own plain **`RuntimeError`**, with no `code`: `restart()`, `validate()`, `fs_read()` (so also a failed read inside `fs_read_string()` / `fs_read_json()`), `fs_read_many()`, pipe `tool()`, and `use()` when the server returns no token. Client-side argument problems raise `ValueError`.
 - `ConnectionException`, `ExecutionException`, and `ValidationException` complete the importable hierarchy; current SDK code paths predominantly raise the types listed above.
 
 Put `CommandException` before `RocketRideException` and `RuntimeError`: it is a subclass of both, so it must be caught first to be told apart.
