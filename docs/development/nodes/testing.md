@@ -537,26 +537,46 @@ Integration tests execute the test cases defined in `services*.json` through a l
 
 Some suites drive a node's real driver against a real database server:
 `test_rocketride_graph_full.py` and `test_graph_age_full.py` (Apache AGE),
-`test_rocketride_db_full.py` (PostgreSQL with pgvector), and the graph node
-suites for Neo4j and FalkorDB. They stub the engine surface themselves, so they
-need no test server, but they cannot run in the mocked pass: `nodes/test/mocks`
-replaces `psycopg2` and `falkordb` for the whole engine. They are listed in
-`DB_LIVE_SUITES` in `nodes/scripts/tasks.js`, which `nodes:test` ignores in its
-mocked pass and then runs in a separate pass without mocks:
+`test_rocketride_db_full.py` (PostgreSQL with pgvector),
+`test_graph_neo4j_full.py` (Neo4j) and `test_graph_falkordb_full.py`
+(FalkorDB). Two more need the real driver packages: `test_graph_drivers_full.py`
+(real driver objects, no server) and `test_graph_wire_fixtures_full.py`, which
+regenerates graph-ui's wire fixtures (`apps/graph-ui/tests/fixtures/v1`) from
+the drivers and the live servers and fails when they no longer match. They stub
+the engine surface themselves, so they need no test server, but they cannot run
+in the mocked pass: `nodes/test/mocks` replaces `psycopg2` and `falkordb` for the
+whole engine. They are listed in `DB_LIVE_SUITES` in `nodes/scripts/tasks.js`,
+which `nodes:test` ignores in its mocked pass and then runs in a separate pass
+without mocks:
 
 ```bash
-./builder nodes:test-db                      # only the live database pass
-RR_REQUIRE_DB_TESTS=1 ./builder nodes:test   # as CI runs it
+./builder nodes:test-db                        # only the live database pass; the databases are required
+RR_REQUIRE_DB_TESTS=0 ./builder nodes:test-db  # the same, skipping suites whose server is unreachable
+RR_REQUIRE_DB_TESTS=1 ./builder nodes:test     # as CI runs it
 ```
 
-Each suite skips when its server is unreachable. With `RR_REQUIRE_DB_TESTS` set,
-which the Linux CI leg does once its database containers are healthy, an
-unreachable server fails the suite, and so does a suite in which no test
-passed. The servers and their environment variables (`RR_TEST_AGE_DSN`,
-`RR_TEST_PG_DSN`, `RR_TEST_NEO4J_URI`, `RR_TEST_FALKORDB_URL`, ...) are the
-ones `.github/workflows/_build.yaml` starts; run the same images locally to
-reproduce a CI failure. A new live suite goes into `DB_LIVE_SUITES` and is named
+When the databases are optional (`nodes:test` without `RR_REQUIRE_DB_TESTS`),
+each suite skips when its server is unreachable. When they are required
+(`nodes:test-db` by default, or `RR_REQUIRE_DB_TESTS` set, which the Linux CI
+leg does once its database containers are healthy), an unreachable server fails
+the suite, a suite in which no test passed fails the run, and so does any test
+that skips for a reason that does not start with `NOT RUN:`. That prefix marks a
+deliberate skip for something the CI servers do not offer, such as a Neo4j
+Enterprise role.
+
+With `RR_TEST_AGE_POOLER_DSN` set, the two AGE suites run a second time through
+that transaction-mode pooler (`RR_TEST_AGE_DSN` is pointed at it and
+`RR_TEST_AGE_ADMIN_DSN` at the database itself), the way the cloud reaches
+tenant databases; CI runs PgBouncer in front of its AGE container for this. The
+servers and their environment variables (`RR_TEST_AGE_DSN`, `RR_TEST_PG_DSN`,
+`RR_TEST_NEO4J_URI`, `RR_TEST_FALKORDB_URL`, ...) are the ones
+`.github/workflows/_build.yaml` starts; run the same images locally to reproduce
+a CI failure. A new live suite goes into `DB_LIVE_SUITES` and is named
 `test_*_full.py`, so the mocked pass never collects it.
+
+When a change to a graph node alters its wire output on purpose, regenerate
+graph-ui's fixtures with `nodes/test/graph_wire_fixtures.py` (its docstring has
+the commands) and commit them with the change.
 
 ### Test dependencies
 
@@ -570,6 +590,9 @@ the engine's `depends()`, so versions match what the nodes get at runtime.
 When a test starts importing a package that only a node provides (not a base
 engine package such as `numpy`, `pillow`, `requests` or `SQLAlchemy`), add it to
 `nodes/test/requirements.txt` without a version; the engine constraints pin it.
+The graph database drivers are the exception: their nodes pin the exact
+versions the live suites were validated with, and `nodes/test/requirements.txt`
+repeats those pins, so bump both together.
 
 `--list-skipped` and `--warmup=plan` do not install anything: they report the
 environment as it is.
