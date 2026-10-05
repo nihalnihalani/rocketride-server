@@ -35,10 +35,10 @@
 //   - the bounds (100 entries, 8 KiB of statement, 1 KiB of error)
 //
 // and it bridges the connection key: history saved under the pre-owner-aware
-// key `projectId:source:nodeId` is still read for the caller's own dev run, as
-// a read-only overlay (see shared/explorer/history/store, "LEGACY KEYS"); the
-// old entries a connection removed or cleared are listed under
-// `sql.historyLegacyHidden`.
+// key `projectId:source:nodeId` is still read for the caller's own dev run
+// (see shared/explorer/history/store, "LEGACY KEYS"): runs, pins and notes
+// never write the old list; the user's own Delete and Clear remove entries
+// from it.
 // =============================================================================
 
 import { createHistoryStore } from 'shared/explorer/history/store';
@@ -58,9 +58,6 @@ const PREF_HISTORY = 'sql.history';
 /** Preference key holding the per-connection recording switch. */
 const PREF_RECORDING = 'sql.historyRecording';
 
-/** Preference key holding, per connection, the old-key entries it removed or cleared from its view. */
-const PREF_LEGACY_HIDDEN = 'sql.historyLegacyHidden';
-
 // =============================================================================
 // THE STORE
 // =============================================================================
@@ -79,7 +76,6 @@ const store = createHistoryStore<'sql'>({
 	// `projectId:source:nodeId`; the caller's own dev run keeps reading what was
 	// saved under the old key (deploys and other owners never do).
 	legacyKeyOf: legacyKeyFromKey,
-	legacyHiddenKey: PREF_LEGACY_HIDDEN,
 });
 
 /**

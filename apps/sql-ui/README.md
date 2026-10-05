@@ -374,16 +374,19 @@ connection, and **Clear** empties one connection's list, pins included.
 History is kept per connection. Connections are identified by their run kind,
 owner, team, project, source and node, so a deployment never shows your
 development history. History you saved before that identity existed is still
-read for your own development run of the same pipeline, and is only read: it
-is never moved, changed or deleted. A new run is saved under the new identity;
-pinning or annotating an older entry, or re-running its statement, saves a
-copy under the new identity; deleting an older entry or **Clear** hides the
-older entries for this connection only. Your development run under another
-team reads the same older entries and still sees all of them. The 100-entry
-bound applies to the list you see, so an older entry it leaves out is still
-saved; only the 256 KB budget across all connections can drop the oldest
-entries, older ones included. The recording switch and the pattern-check
-switch you chose then still apply.
+read for your own development run of the same pipeline. Running, pinning and
+annotating never move or change the older entries: a new run is saved under
+the new identity, and pinning or annotating an older entry, or re-running its
+statement, saves a copy under the new identity. The 100-entry bound applies to
+the list you see, so an older entry it leaves out is still saved; only the
+256 KB budget across all connections can drop the oldest entries, older ones
+included. Deleting does remove older entries: deleting an older entry removes
+both its copy and the original, and **Clear** empties the connection's own list
+and the shared older list, so that text leaves the preferences file. Your
+development run of the same pipeline under another team reads the same older
+list, so it no longer sees them either; a copy it saved by pinning or
+annotating is its own and stays until deleted there. The recording switch and
+the pattern-check switch you chose then still apply.
 
 Re-running an entry that changed data asks first and quotes what it did last
 time; the rerun is a fresh run with its own entry.

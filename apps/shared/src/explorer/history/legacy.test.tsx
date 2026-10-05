@@ -27,9 +27,10 @@
 // The owner-aware connection key replaces SQL Explorer's `projectId:source:nodeId`.
 // Everything saved under the old key — history entries, the recording switch,
 // the pattern-check switch — must still be read, without migrating, renaming
-// or deleting anything, and without ever being read across owners or across dev
-// and deploy. The old list is a READ-ONLY overlay: nothing this build does
-// writes it, for any team context that reads it.
+// or deleting anything behind the user's back, and without ever being read
+// across owners or across dev and deploy. No automatic write touches the old
+// list (a run, the bound, a pin or note copy), for any team context that reads
+// it; only the user's own Delete or Clear removes entries from it.
 // =============================================================================
 
 import { describe, it } from 'node:test';
@@ -253,16 +254,20 @@ describe('history under a legacy key', () => {
 		}
 	});
 
-	it('removes an old entry from THIS connection\'s view only, across a reload; the old list is untouched', async () => {
+	it('deletes an old entry from the stored old list too, so its text leaves the preferences file', async () => {
 		const prefs = fakePrefs({ 'sql.history': { [OLD]: OLD_LIST } });
 		const store = sqlStore();
 		let detach = store.attachPrefs(prefs.api);
 		try {
 			store.removeEntry(DEV, 'o2');
 			await settle();
+			assert.deepEqual(stored(prefs, OLD), [OLD_LIST[1]], 'Delete takes exactly the deleted id out of the old list');
+			assert.equal(JSON.stringify(prefs.values).includes('SELECT 2'), false, 'the deleted statement is still in the file');
+			assert.equal(JSON.stringify(prefs.values).includes('keep me'), false, 'the deleted note is still in the file');
+			assert.deepEqual(Object.keys(prefs.values).sort(), ['sql.history', 'sql.historyRecording']);
 			assert.deepEqual(ids(store, DEV), ['o1']);
-			assert.deepEqual(ids(store, DEV_OTHER_TEAM), ['o2', 'o1']);
-			assert.deepEqual(stored(prefs, OLD), OLD_LIST);
+			// The old list is shared: the same dev run under another team no longer sees it either.
+			assert.deepEqual(ids(store, DEV_OTHER_TEAM), ['o1']);
 		} finally {
 			detach();
 		}
@@ -270,6 +275,25 @@ describe('history under a legacy key', () => {
 		detach = reloaded.attachPrefs(prefs.api);
 		try {
 			assert.deepEqual(ids(reloaded, DEV), ['o1']);
+		} finally {
+			detach();
+		}
+	});
+
+	it('deletes both the copy under the new key and the original when an old entry was pinned first', async () => {
+		const prefs = fakePrefs({ 'sql.history': { [OLD]: OLD_LIST } });
+		const store = sqlStore();
+		const detach = store.attachPrefs(prefs.api);
+		try {
+			store.togglePin(DEV, 'o1');
+			await settle();
+			assert.deepEqual(stored(prefs, DEV)?.map((e) => e.id), ['o1']);
+			store.removeEntry(DEV, 'o1');
+			await settle();
+			assert.equal(stored(prefs, DEV), undefined);
+			assert.deepEqual(stored(prefs, OLD), [OLD_LIST[0]]);
+			assert.equal(JSON.stringify(prefs.values).includes('SELECT 1'), false, 'the deleted statement is still in the file');
+			assert.deepEqual(ids(store, DEV), ['o2']);
 		} finally {
 			detach();
 		}
@@ -295,17 +319,23 @@ describe('history under a legacy key', () => {
 		}
 	});
 
-	it('clears this connection\'s view of BOTH lists without deleting the old one, and the clear holds across a reload', async () => {
+	it('clears the connection\'s own list AND every old entry, one beyond the visible bound included', async () => {
 		const store = sqlStore();
-		const prefs = fakePrefs({ 'sql.history': { [OLD]: OLD_LIST, [DEV]: [saved('n0', 'SELECT 0', 5)] } });
+		const full = fullOldList();
+		const prefs = fakePrefs({ 'sql.history': { [OLD]: full, [DEV]: [saved('n0', 'SELECT 0', 5_000)] } });
 		const detach = store.attachPrefs(prefs.api);
 		try {
+			// 101 entries: the view shows 100, so the oldest old entry is stored but not shown.
+			assert.equal(ids(store, DEV).length, 100);
 			store.clearForKey(DEV);
 			await settle();
 			assert.equal(stored(prefs, DEV), undefined);
-			assert.deepEqual(stored(prefs, OLD), OLD_LIST);
+			assert.equal(stored(prefs, OLD), undefined, 'Clear must empty the old list');
+			assert.equal(JSON.stringify(prefs.values).includes('SELECT'), false, 'a cleared statement is still in the file');
+			assert.deepEqual(Object.keys(prefs.values).sort(), ['sql.history', 'sql.historyRecording']);
 			assert.deepEqual(ids(store, DEV), []);
-			assert.deepEqual(ids(store, DEV_OTHER_TEAM), ['o2', 'o1']);
+			// The old list is shared: the same dev run under another team no longer sees it either.
+			assert.deepEqual(ids(store, DEV_OTHER_TEAM), []);
 		} finally {
 			detach();
 		}
@@ -313,7 +343,6 @@ describe('history under a legacy key', () => {
 		const again = reloaded.attachPrefs(prefs.api);
 		try {
 			assert.deepEqual(ids(reloaded, DEV), []);
-			assert.deepEqual(ids(reloaded, DEV_OTHER_TEAM), ['o2', 'o1']);
 		} finally {
 			again();
 		}

@@ -219,31 +219,31 @@ class. With an SDK that drops the code, nothing is retried.
 ## History
 
 `createHistoryStore({ historyKey, recordingKey, textField, limits?, runs?,
-legacyKeyOf?, legacyHiddenKey? })` ([`history/store.ts`](../../../apps/shared/src/explorer/history/store.ts))
+legacyKeyOf? })` ([`history/store.ts`](../../../apps/shared/src/explorer/history/store.ts))
 persists through the shell's workspace preferences, per connection key, and
 writes only while a preferences accessor is attached (see the file header for
 why a background write would be misfiled). SQL Explorer uses `sql.history`,
-`sql.historyRecording`, `sql.historyLegacyHidden`, `sql.patternChecks` and the
-persisted field `sql`; Graph Explorer uses `graph.history`,
-`graph.historyRecording`, `graph.patternChecks` and `cypher`. **These names and the entry shape never change**: renaming one
+`sql.historyRecording`, `sql.patternChecks` and the persisted field `sql`; Graph
+Explorer uses `graph.history`, `graph.historyRecording`, `graph.patternChecks`
+and `cypher`. **These names and the entry shape never change**: renaming one
 silently orphans users' saved history. Mount the accessor with
 `createHistoryPrefsBridge(store)` from `react.tsx`. Per-connection booleans use
 `createConnectionFlags` ([`history/flags.ts`](../../../apps/shared/src/explorer/history/flags.ts)).
 
 **Legacy keys.** When `legacyKeyOf` maps a connection to its pre-v1 key (SQL
-passes `legacyKeyFromKey`), reads are a merged view of both lists and the old
-list is a read-only overlay: nothing writes it, because several new keys can
-read one old key (the same dev run under two development teams). New runs go to
-the new key only, and the per-connection bound applies to the merged view, so
-an old entry it leaves out stays stored. Pin, note and a re-run that repeats an
-old statement write a copy under the new key (same id, so the copy stands in for
-the original). Remove and clear hide old entries for that connection only; the
-hidden ids are kept per connection under `legacyHiddenKey` (default
-`<historyKey>LegacyHidden`; SQL uses `sql.historyLegacyHidden`). A recording or
-pattern-check switch saved under the old key still applies until the new key
+passes `legacyKeyFromKey`), reads are a merged view of both lists. No automatic
+write touches the old list, because several new keys can read one old key (the
+same dev run under two development teams). New runs go to the new key only, and
+the per-connection bound applies to the merged view, so an old entry it leaves
+out stays stored. Pin, note and a re-run that repeats an old statement write a
+copy under the new key (same id, so the copy stands in for the original). Remove
+and clear are the user's own deletes and do reach the old list: remove drops the
+entry from both lists, and clear empties the connection's own list and the old
+list, so every connection reading that old list stops seeing them. A recording
+or pattern-check switch saved under the old key still applies until the new key
 has its own. Nothing is migrated, and a deployment or another owner never reads
-the old list. The only bound that can still drop an old entry is the size budget
-across all connections (`trimBag`, oldest first).
+the old list. Apart from remove and clear, the only thing that can drop an old
+entry is the size budget across all connections (`trimBag`, oldest first).
 
 ## Running statements
 

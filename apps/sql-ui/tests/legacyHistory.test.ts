@@ -28,8 +28,8 @@
 // (sql.history, sql.historyRecording, sql.patternChecks). The key now carries
 // run kind, owner and team. What users saved under the old key must still be
 // read for the connection it meant — the caller's own dev run — and ONLY for
-// that one, and the old list is never rewritten or deleted (it is a read-only
-// overlay).
+// that one. No automatic write (a run, a pin or note) rewrites the old list;
+// the user's own Delete and Clear remove entries from it.
 //
 // The generic rules are tested in shared/explorer/history; this checks that
 // SQL Explorer's own store is wired to them with its own preference keys.
@@ -38,7 +38,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import type { IPrefsApi } from 'shell';
-import { attachPrefs, setRecording, togglePin } from '../src/history/historyStore';
+import { attachPrefs, clearForKey, removeEntry, setRecording, togglePin } from '../src/history/historyStore';
 import { emitRun } from '../src/history/runEvents';
 import type { IHistoryEntry } from '../src/history/types';
 import { buildEndpointKey } from 'shared/explorer/keys';
@@ -117,6 +117,27 @@ describe('SQL history under the owner-aware key', () => {
 			const bag = prefs.values['sql.history'] as Record<string, Array<{ id: string; pinned?: boolean }>>;
 			assert.deepEqual(bag[keys.old], oldList);
 			assert.deepEqual(bag[keys.dev]?.map((e) => [e.id, e.pinned]), [['o1', true]]);
+		} finally {
+			detach();
+		}
+	});
+
+	it('deletes an old entry from the saved old list, and Clear empties it, with no other preference key written', async () => {
+		const keys = keysFor('legacy-e');
+		const oldList = [saved('o2', 'SELECT 2', 20), saved('o1', 'SELECT 1', 10)];
+		const prefs = fakePrefs({ 'sql.history': { [keys.old]: oldList } });
+		const detach = attachPrefs(prefs.api);
+		try {
+			removeEntry(keys.dev, 'o2');
+			await settle();
+			let bag = prefs.values['sql.history'] as Record<string, unknown[]>;
+			assert.deepEqual(bag[keys.old], [oldList[1]]);
+			assert.deepEqual(Object.keys(prefs.values).sort(), ['sql.history', 'sql.historyRecording']);
+			clearForKey(keys.dev);
+			await settle();
+			bag = prefs.values['sql.history'] as Record<string, unknown[]>;
+			assert.equal(bag[keys.old], undefined);
+			assert.deepEqual(Object.keys(prefs.values).sort(), ['sql.history', 'sql.historyRecording']);
 		} finally {
 			detach();
 		}
