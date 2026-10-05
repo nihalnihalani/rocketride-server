@@ -120,6 +120,41 @@ Manual connections can omit credentials or provide the configured username and p
 
 The direct query tool serializes graph nodes, relationships, paths, maps, lists, and temporal values into JSON-safe values. It returns no more than the configured row cap, allowing agents to recognize broad results through the `truncated` flag.
 
+### Agents
+
+An LLM agent wired to this node gets every tool listed under **As a tool** in
+its tool catalog, `read_query` and `refresh_schema` included. With
+`read_query` the agent runs Cypher it writes itself (read-only, 1,000 rows by
+default, within the element and value budgets); `refresh_schema` re-reads the
+schema each time it is called (refreshes of one node run one at a time, with
+no cooldown). Say in the agent's instructions which tools it should prefer,
+for example `get_data` for questions in plain language.
+
+### Result size
+
+The `read_query` budgets count values, not bytes: a string counts as one value
+whatever its length. A result of 1,000 rows whose nodes each carry
+100 KB of text is about 100 MB of JSON, which the engine builds in memory; the
+Python SDK closes its connection above 250 MB. When nodes hold large text,
+return the properties you need (`RETURN n.title` rather than `n`) or cut them
+with `substring()`.
+
+### Write counts
+
+`affected_rows` (from `execute`, both shapes) is the sum of FalkorDB's write
+statistics for the statement: nodes and relationships created and deleted,
+properties set and removed, labels added and indices created. It counts
+changes, not rows, and a read reports 0.
+
+### How long a call can take
+
+Each `read_query` or `execute` is one command bounded by the server's own
+timeout (the node's query timeout, clamped to the server's `TIMEOUT_MAX`) and
+is never retried, so it ends within the `statement_timeout_ms` that `dialect`
+reports plus the network round trip. `refresh_schema` waits up to 65 seconds
+for another refresh of the same node to finish, then runs within its
+60-second budget.
+
 ## Upstream docs
 
 - [FalkorDB documentation](https://docs.falkordb.com/)

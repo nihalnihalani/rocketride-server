@@ -52,7 +52,7 @@ The functions are registered under the `neo4j` service prefix: for example,
 | `neo4j.get_query` | Return generated read-only Cypher without executing it. |
 | `neo4j.read_query` | Run Cypher you wrote, read-only, and return positional rows in the shared graph result shape. |
 | `neo4j.execute` | Run raw Cypher only when direct execution is enabled. |
-| `neo4j.dialect` | Return `{"dialect": "neo4j"}`. |
+| `neo4j.dialect` | Return `{"dialect": "neo4j"}` plus the engine version and edition, database, capabilities, limits and read boundary. |
 | `neo4j.get_cypher` | Deprecated compatibility alias for `get_query`; it also includes the statement under `cypher`. |
 
 `get_data`, `get_query`, and `get_cypher` require a non-empty `question` and
@@ -239,8 +239,45 @@ shape described under **As a tool**, which keeps ids, endpoints, direction,
 points, durations and large integers that the established format loses.
 Tested with the `neo4j` Python driver 6.3.1 against Neo4j 5.26 Community;
 Neo4j 5 is the minimum (`elementId`). For raw execution, `affected_rows`
-counts created or deleted nodes and relationships, changed properties, and
-label changes reported by the Neo4j result summary.
+counts the changes in the Neo4j result summary (see **Write counts**).
+
+### Agents
+
+An LLM agent wired to this node gets every tool listed under **As a tool** in
+its tool catalog, `read_query` and `refresh_schema` included. With
+`read_query` the agent runs Cypher it writes itself (read-only, 1,000 rows by
+default, within the element and value budgets); `refresh_schema` re-reads the
+schema each time it is called (refreshes of one node run one at a time, with
+no cooldown). Say in the agent's instructions which tools it should prefer,
+for example `get_data` for questions in plain language.
+
+### Result size
+
+The `read_query` budgets count values, not bytes: a string counts as one value
+whatever its length (byte arrays above 64 KiB are reported by size only). A result of 1,000 rows whose nodes each carry
+100 KB of text is about 100 MB of JSON, which the engine builds in memory; the
+Python SDK closes its connection above 250 MB. When nodes hold large text,
+return the properties you need (`RETURN n.title` rather than `n`) or cut them
+with `substring()`.
+
+### Write counts
+
+`affected_rows` (from `execute`, both shapes) is the sum of the write counters
+in the Neo4j result summary: nodes and relationships created and deleted,
+properties set, labels added and removed. It counts changes, not rows:
+`CREATE (n:Note {a: 1, b: 2})` reports 4 (one node, two properties, one
+label), and a read reports 0.
+
+### How long a call can take
+
+`read_query` runs in a managed read transaction with a 30-second server-side
+deadline per attempt, and the driver retries transient failures (such as a
+cluster leader change) within its own retry window, 30 seconds by default. A
+call can therefore take longer than the `statement_timeout_ms` that `dialect`
+reports. `refresh_schema` waits up to 65 seconds for another refresh of the
+same node to finish, then runs within its 60-second budget. A client that
+stops waiting earlier only stops waiting: the database ends the transaction
+at its own deadline.
 
 ## Upstream docs
 
