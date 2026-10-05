@@ -432,7 +432,10 @@ class IGlobal(GraphGlobalBase):
                 return rows
             except Exception:
                 if conn.closed:
+                    # No retry here, but a restart dropped the idle sessions
+                    # too: the next calls must not take one of them.
                     pool.discard(conn)
+                    pool.close_idle()
                 raise
 
     def _run_query(self, query: str, params: Optional[Dict] = None, limit: Optional[int] = None) -> List[Dict]:
@@ -606,6 +609,7 @@ class IGlobal(GraphGlobalBase):
             except Exception:
                 if conn.closed:
                     pool.discard(conn)
+                    pool.close_idle()
                 raise
 
     def _engine_identity(self):

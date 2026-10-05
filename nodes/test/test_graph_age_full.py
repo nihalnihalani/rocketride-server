@@ -376,6 +376,40 @@ class TestRecovery:
             admin.close()
             glb.endGlobal()
 
+    @pytest.mark.parametrize('path', ['sql_read', 'reflect_schema'])
+    def test_schema_paths_close_the_other_idle_connections_after_a_restart(self, rr_env, age_graph, monkeypatch, path):
+        """Plain SQL reads and schema reflection do not retry, so after a restart one call may fail; only one."""
+        if BEHIND_POOLER:
+            pytest.skip('NOT RUN: behind a pooler the server cannot drop the node client connections it holds')
+        _set_pool_size(rr_env, monkeypatch, 3)
+        glb = _begin(rr_env)
+        admin = _admin()
+        barrier = threading.Barrier(3)
+
+        def warm():
+            barrier.wait()
+            return glb._execute_plan(_plan(['SELECT pg_sleep(0.3)', 'SELECT pg_backend_pid()'], read_only=True))[0][0]
+
+        def call():
+            return glb._sql_read('SELECT 1') if path == 'sql_read' else glb._reflect_schema()
+
+        try:
+            results, errors = _run_threads({i: warm for i in range(3)})
+            assert not errors, errors
+            pids = sorted(set(results.values()))
+            assert len(pids) == 3 and glb.pool.idle == 3
+            with admin.cursor() as cur:
+                cur.execute('SELECT pg_terminate_backend(pid) FROM unnest(%s::int[]) AS pid', (pids,))
+            time.sleep(0.2)
+            with pytest.raises(psycopg2.Error):
+                call()
+            assert glb.pool.idle == 0, 'the other idle connections died with the restart and must be closed'
+            for _ in range(3):
+                call()
+        finally:
+            admin.close()
+            glb.endGlobal()
+
     def test_idle_sessions_are_closed_after_the_idle_timeout(self, rr_env, age_graph, monkeypatch):
         module = sys.modules[rr_env.iglobal_cls.__module__]
         monkeypatch.setattr(module, 'POOL_IDLE_TIMEOUT_S', 0.3)

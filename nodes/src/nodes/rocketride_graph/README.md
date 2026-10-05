@@ -189,11 +189,15 @@ session afterwards. A connection the server dropped while idle is replaced and
 the call retried once, before any of the query has run, on a newly opened
 connection; the retry also closes the node's other idle connections, since a
 database or pooler restart drops them all at once. A connection lost while a
-query runs is reported, never re-run. The pool closes with the pipeline.
+query runs is reported, never re-run. Schema reads (`refresh_schema` and the
+startup checks) are not retried: the one call that finds its connection
+dropped fails, and it closes the other idle connections so the next call
+opens a new one. The pool closes with the pipeline.
 
 Capacity: each running rocketride_graph node holds at most 4 client
-connections to the tenant database's pooler, and closes a connection that has
-been idle for 60 seconds, so an idle pipeline holds none. Plan the pooler's
+connections to the tenant database's pooler, and closes a connection once it
+has been idle for 60 seconds (within 5 seconds after that), so an idle
+pipeline holds none. Plan the pooler's
 client-connection limit for 4 connections per concurrently busy graph node
 (plus those of rocketride_sql and rocketride_vector nodes in the same
 pipelines).
@@ -234,11 +238,13 @@ reports 1. Do not present it as a count of changes.
 ### How long a call can take
 
 A call first waits for a free pooled connection (up to the query timeout plus
-5 seconds, then it fails with `Database busy`), then runs its statement with
-the query timeout; if the connection turns out to have been dropped while
-idle, it opens a new one once (3-second connect timeout). One `read_query` can
-therefore take up to about twice the query timeout plus 8 seconds, longer than
-the `statement_timeout_ms` that `dialect` reports. `refresh_schema` waits up
+5 seconds, then it fails with `Database busy`), opens one if none is idle
+(3-second connect timeout), then runs its statement with the query timeout. If
+the connection turns out to have been dropped while idle, the call starts over
+once on a new connection, and that second attempt can wait for a free
+connection again. One `read_query` can therefore take up to about three times
+the query timeout plus 16 seconds (106 seconds with the default 30-second
+timeout), longer than the `statement_timeout_ms` that `dialect` reports. `refresh_schema` waits up
 to 65 seconds for another refresh of the same node, then for a connection,
 then runs within its 60-second budget. A client that stops waiting earlier
 only stops waiting: the database ends the statement at its own timeout.

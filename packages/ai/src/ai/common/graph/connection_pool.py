@@ -46,11 +46,13 @@ The pool is driver-agnostic. The caller supplies:
 Waiting is bounded: :meth:`ConnectionPool.connection` raises
 :class:`PoolTimeout` when no connection frees up within ``acquire_timeout_s``.
 With ``idle_timeout_s`` set, a connection left idle that long is closed (by a
-small daemon thread, so an idle node gives its connections back without any
-further call). ``connection(fresh=True)`` closes every idle connection and
-opens a new one: the checkout to use after a connection was lost, since the
-idle ones most likely went down with it. After :meth:`ConnectionPool.close`,
-idle connections are closed at once and in-use ones as they are returned.
+small daemon thread that wakes every ``min(idle_timeout_s / 2, 5 s)``, so an
+idle node gives its connections back without any further call).
+``connection(fresh=True)`` closes every idle connection and opens a new one:
+the checkout to use after a connection was lost, since the idle ones most
+likely went down with it; :meth:`ConnectionPool.close_idle` does the same for
+a caller that does not retry. After :meth:`ConnectionPool.close`, idle
+connections are closed at once and in-use ones as they are returned.
 """
 
 from __future__ import annotations
@@ -68,6 +70,11 @@ class PoolTimeout(TimeoutError):
 
 class PoolClosed(RuntimeError):
     """The pool was closed (node shutdown); no new connections are handed out."""
+
+
+# Longest sleep between two idle-reaper passes, so a connection is closed at
+# most this long after its idle timeout.
+MAX_REAP_INTERVAL_S = 5.0
 
 
 class ConnectionPool:
@@ -150,6 +157,19 @@ class ConnectionPool:
             yield conn
         finally:
             self._release(conn)
+
+    def close_idle(self) -> None:
+        """Close every idle connection now; checked-out ones are untouched.
+
+        For a caller that found its connection dead and does not retry: a
+        server or pooler restart drops every idle session at once, so the
+        next checkouts must open new connections rather than take another
+        dead one.
+        """
+        with self._cond:
+            idle, self._idle = self._idle, []
+        for conn, _returned in idle:
+            self._close_quietly(conn)
 
     def discard(self, conn: Any) -> None:
         """Mark a checked-out connection as broken; it is closed on release.
@@ -250,8 +270,15 @@ class ConnectionPool:
         self._reaper = threading.Thread(target=self._reap_loop, name='db-pool-idle-reaper', daemon=True)
         self._reaper.start()
 
+    @property
+    def reap_interval_s(self) -> Optional[float]:
+        """Seconds between idle-reaper passes (None without an idle timeout)."""
+        if self.idle_timeout_s is None:
+            return None
+        return max(0.01, min(float(self.idle_timeout_s) / 2, MAX_REAP_INTERVAL_S))
+
     def _reap_loop(self) -> None:
-        interval = max(0.01, float(self.idle_timeout_s) / 2)
+        interval = self.reap_interval_s
         while not self._stop.wait(interval):
             with self._cond:
                 expired = self._expired_locked(time.monotonic())

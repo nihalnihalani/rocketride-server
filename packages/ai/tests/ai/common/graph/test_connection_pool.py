@@ -248,6 +248,36 @@ def test_fresh_checkout_stays_within_max_size():
     assert pool.size <= 2
 
 
+def test_close_idle_closes_every_idle_connection_but_not_checked_out_ones():
+    """For a path that does not retry: after one lost connection, do not hand out the others."""
+    pool, opened = make_pool(max_size=3)
+    warm(pool, 3)
+    with pool.connection() as busy:
+        others = [c for c in opened if c is not busy]
+        pool.close_idle()
+        assert pool.idle == 0 and pool.size == 1
+        assert all(c.closed for c in others) and not busy.closed
+    assert pool.idle == 1
+    with pool.connection() as again:
+        assert again is busy
+
+
+def test_close_idle_on_a_closed_pool_is_harmless():
+    pool, opened = make_pool(max_size=2)
+    warm(pool, 2)
+    pool.close()
+    pool.close_idle()
+    assert pool.size == 0 and all(c.closed for c in opened)
+
+
+@pytest.mark.parametrize('idle_timeout_s,interval', [(60.0, 5.0), (8.0, 4.0), (0.05, 0.025)])
+def test_reaper_wakes_often_enough_to_close_soon_after_the_idle_timeout(idle_timeout_s, interval):
+    """A connection idle for idle_timeout_s is closed at most min(idle_timeout_s / 2, 5 s) later."""
+    pool, _ = make_pool(max_size=1, idle_timeout_s=idle_timeout_s)
+    assert pool.reap_interval_s == pytest.approx(interval)
+    pool.close()
+
+
 def test_idle_connections_are_closed_after_the_idle_timeout():
     """An idle node gives its connections back to the pooler without any further call."""
     pool, opened = make_pool(max_size=2, idle_timeout_s=0.05)
