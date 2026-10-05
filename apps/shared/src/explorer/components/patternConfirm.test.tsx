@@ -28,6 +28,13 @@
 // focuses its confirm button, so a second Enter would send the flagged
 // statement; this dialog moves focus to Cancel instead. There is no DOM here, so
 // the focus step is driven against a minimal stand-in for the dialog.
+//
+// NOT COVERED HERE: the effect order the fix relies on. React runs a commit's
+// effects child first, so the shell Modal's focus-in runs, then ConfirmDialog's
+// confirm-button focus, then PatternConfirmDialog's own effect, which calls
+// focusCancelIn last and wins. A shell change that focuses the confirm button
+// later than its mount effect (a timer, a frame) would undo this without
+// failing these tests.
 // =============================================================================
 
 import { describe, it } from 'node:test';
