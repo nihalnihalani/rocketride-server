@@ -53,6 +53,16 @@
 //   coalesce: while one is running, any number of triggers produce exactly ONE
 //   follow-up. A newer refresh's result is never overwritten by an older one.
 //
+// WHEN IT PROBES AGAIN
+//   A probe is a tool call, and a tool call that reaches a task counts as
+//   activity for that task's idle timeout. So an endpoint whose last probe
+//   failed AT THE NODE (`unreachable`, `inaccessible`) is probed again only
+//   when somebody asked: an explicit `refresh`, a restart or reconnect
+//   (`reprobe`), `probe` (Test connection), or a changed token. A refresh
+//   nobody asked for (focus, an ordinary task event, a rebind) keeps its last
+//   answer. An endpoint whose probe said its task is not running is cheap to
+//   ask again (the server refuses before the task) and is probed on any refresh.
+//
 // WHEN IT FORGETS
 //   `reset()` — on sign-out and on a change of user, organization or team —
 //   clears endpoints, probes, tokens and sessions and expires every in-flight
@@ -144,7 +154,9 @@ export interface IEndpointStore {
 	subscribe(listener: () => void): () => void;
 	/**
 	 * Discover (and probe) now. Concurrent calls coalesce: one runs, and a call
-	 * made while it runs causes exactly one follow-up.
+	 * made while it runs causes exactly one follow-up. This is the refresh a
+	 * person asked for, so endpoints whose last probe failed are probed again
+	 * (the store's own background refreshes do not; see "WHEN IT PROBES AGAIN").
 	 */
 	refresh(client: IExplorerClient, opts?: { reprobe?: boolean }): Promise<void>;
 	/**
@@ -243,7 +255,7 @@ export function createEndpointStore(options: IEndpointStoreOptions): IEndpointSt
 	let identityNow: IExplorerIdentity | null = null;
 
 	let inFlight: Promise<void> | null = null;
-	let followUp: { reprobe: boolean } | null = null;
+	let followUp: { reprobe: boolean; background: boolean } | null = null;
 	let debounceTimer: unknown = null;
 	let pendingDebounce: { client: IExplorerClient; reprobe: boolean } | null = null;
 	let lastRefreshStartedAt = 0;
@@ -399,7 +411,7 @@ export function createEndpointStore(options: IEndpointStoreOptions): IEndpointSt
 	async function rebind(client: IExplorerClient, key: string, deadlineAt: number): Promise<boolean> {
 		const pollMs = options.session?.retry?.pollMs ?? 1_000;
 		for (;;) {
-			await refresh(client, { awaitProbes: false });
+			await refresh(client, { awaitProbes: false, background: true });
 			const endpoint = state.endpoints.find((candidate) => candidate.key === key);
 			if (endpoint !== undefined && endpoint.state !== 'stopped' && vault.has(key)) return true;
 			if (clock.now() + pollMs > deadlineAt) return false;
@@ -428,9 +440,11 @@ export function createEndpointStore(options: IEndpointStoreOptions): IEndpointSt
 	 *
 	 * @param found - What discovery returned.
 	 * @param reprobe - Re-check endpoints that were already ready.
+	 * @param background - Nobody asked for this refresh: keep the answer of an
+	 *   endpoint whose probe failed at the node (see "WHEN IT PROBES AGAIN").
 	 * @returns The endpoints that need a probe.
 	 */
-	function merge(found: IDiscoveredEndpoint[], reprobe: boolean): IExplorerEndpoint[] {
+	function merge(found: IDiscoveredEndpoint[], reprobe: boolean, background: boolean): IExplorerEndpoint[] {
 		const previous = new Map(state.endpoints.map((endpoint) => [endpoint.key, endpoint]));
 		const next: IExplorerEndpoint[] = [];
 		const probes: Record<string, IProbeResult> = { ...state.probes };
@@ -462,6 +476,15 @@ export function createEndpointStore(options: IEndpointStoreOptions): IEndpointSt
 				next.push({ ...endpoint, state: 'ready', running: true });
 				continue;
 			}
+			const failedAtNode = before !== undefined && probes[endpoint.key]?.ok === false
+				&& (before.state === 'unreachable' || before.state === 'inaccessible');
+			if (failedAtNode && background && !reprobe && !tokenChanged) {
+				// Nobody asked: keep the last answer rather than call the node again.
+				const kept: IExplorerEndpoint = { ...endpoint, state: before.state, running: false };
+				if (before.stateDetail !== undefined) kept.stateDetail = before.stateDetail;
+				next.push(kept);
+				continue;
+			}
 			delete probes[endpoint.key];
 			next.push(endpoint);
 			toProbe.push(endpoint);
@@ -482,10 +505,14 @@ export function createEndpointStore(options: IEndpointStoreOptions): IEndpointSt
 		return toProbe;
 	}
 
-	async function refresh(client: IExplorerClient, opts: { reprobe?: boolean; awaitProbes?: boolean } = {}): Promise<void> {
+	async function refresh(client: IExplorerClient, opts: { reprobe?: boolean; awaitProbes?: boolean; background?: boolean } = {}): Promise<void> {
 		if (inFlight !== null) {
-			// Coalesce: any number of triggers while one runs cause ONE follow-up.
-			followUp = { reprobe: (followUp?.reprobe ?? false) || opts.reprobe === true };
+			// Coalesce: any number of triggers while one runs cause ONE follow-up,
+			// which counts as asked for when any of them was.
+			followUp = {
+				reprobe: (followUp?.reprobe ?? false) || opts.reprobe === true,
+				background: (followUp?.background ?? true) && opts.background === true,
+			};
 			return inFlight;
 		}
 		const startedEpoch = resetCount;
@@ -496,7 +523,7 @@ export function createEndpointStore(options: IEndpointStoreOptions): IEndpointSt
 			try {
 				const found = await discoverToolEndpoints(client, { providers: options.providers, roles: options.roles, identity: identityNow, concurrency });
 				if (epochAfterReset(startedEpoch)) return;
-				const toProbe = merge(found, opts.reprobe === true);
+				const toProbe = merge(found, opts.reprobe === true, opts.background === true);
 				setState({ ...state, status: 'ready', error: null, refreshedAt: clock.now() });
 				const probes = mapWithConcurrency(toProbe, concurrency, (endpoint) => runProbe(client, endpoint));
 				// A re-discovery done to rebind a restarted endpoint must not wait on
@@ -554,7 +581,7 @@ export function createEndpointStore(options: IEndpointStoreOptions): IEndpointSt
 			debounceTimer = null;
 			const job = pendingDebounce;
 			pendingDebounce = null;
-			if (job !== null) void refresh(job.client, { reprobe: job.reprobe });
+			if (job !== null) void refresh(job.client, { reprobe: job.reprobe, background: true });
 		}, debounceMs);
 	}
 

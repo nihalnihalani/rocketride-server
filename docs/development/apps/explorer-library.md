@@ -98,8 +98,13 @@ node id collide on their key; real `.pipe` files carry a `project_id`.
 
 The probe runs once per endpoint, with bounded concurrency (default 4), and one
 failure never affects another. A `ready` endpoint is not probed again unless a
-refresh asks for it, its token changes, or it disappears and returns. An empty
-`getTasks()` list is not proof that something failed to provision.
+refresh asks for it, its token changes, or it disappears and returns. An
+`unreachable` or `inaccessible` endpoint is probed again only on an explicit
+`store.refresh()`, a restart or reconnect, `store.probe()` (Test connection) or
+a changed token, never on a focus or an ordinary task event: a probe is a tool
+call, and a tool call that reaches the task counts as activity for its idle
+timeout. An empty `getTasks()` list is not proof that something failed to
+provision.
 
 ## Tokens and identity
 

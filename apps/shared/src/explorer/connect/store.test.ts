@@ -160,6 +160,64 @@ describe('refresh — discover once, probe each endpoint once', () => {
 		assert.equal(probes(world), 2);
 	});
 
+	it('does not re-probe an unreachable endpoint on refreshes nobody asked for (focus, task events)', async () => {
+		// Each probe is a tool call, and a tool call that reaches the task counts
+		// as activity for its idle timeout: re-probing on every focus would keep
+		// a pipeline with a broken node alive for as long as the app is open.
+		const { store, world, clock } = make([row()], (call) => {
+			if (call.tool === 'dialect') throw new Error('node not wired');
+			return {};
+		});
+		const watch = watchProbe();
+		const detach = store.attach(world.client, null, watch.watch);
+		await store.refresh(world.client);
+		assert.equal(store.getState().endpoints[0]!.state, 'unreachable');
+		assert.equal(probes(world), 1);
+
+		for (let i = 0; i < 3; i += 1) {
+			await clock.advance(6_000);
+			watch.handlers!.onFocus();
+			await clock.advance(300);
+			watch.handlers!.onTaskEvent({ reprobe: false });
+			await clock.advance(300);
+		}
+		assert.ok(world.getTasksCalls >= 4, `discovery still ran (${world.getTasksCalls})`);
+		assert.equal(probes(world), 1, 'background refreshes must not re-probe');
+		const endpoint = store.getState().endpoints[0]!;
+		assert.equal(endpoint.state, 'unreachable');
+		assert.match(endpoint.stateDetail ?? '', /node not wired/);
+		assert.equal(store.getState().probes[endpoint.key]?.ok, false);
+
+		// An explicit refresh, a restart event and Test connection still re-probe.
+		await store.refresh(world.client);
+		assert.equal(probes(world), 2);
+		watch.handlers!.onTaskEvent({ reprobe: true });
+		await clock.advance(300);
+		assert.equal(probes(world), 3);
+		await store.probe(world.client, endpoint.key);
+		assert.equal(probes(world), 4);
+		detach();
+	});
+
+	it('still re-probes, on any refresh, an endpoint whose probe said its task was not running', async () => {
+		let stopped = true;
+		const { store, world, clock } = make([row()], (call) => {
+			if (call.tool !== 'dialect') return {};
+			if (stopped) throw codedError('Task was stopped', 'TASK_STOPPED');
+			return NEO4J_INFO;
+		});
+		const watch = watchProbe();
+		const detach = store.attach(world.client, null, watch.watch);
+		await store.refresh(world.client);
+		assert.equal(store.getState().endpoints[0]!.state, 'stopped');
+		stopped = false;
+		watch.handlers!.onTaskEvent({ reprobe: false });
+		await clock.advance(300);
+		assert.equal(store.getState().endpoints[0]!.state, 'ready');
+		assert.equal(probes(world), 2);
+		detach();
+	});
+
 	it('bounds probe concurrency and isolates a failing probe from the rest', async () => {
 		const rows = Array.from({ length: 10 }, (_, i) => row({ source: `s${i}`, pipeline: { project_id: `p${i}`, components: [{ id: 'db_1', provider: 'db_postgres' }] } }));
 		const { store, world } = make(rows, async (call) => {
