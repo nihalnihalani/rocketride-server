@@ -216,16 +216,18 @@ function readToken(name: string): string {
  * The tokens are CSS and are NOT all plain hex: RocketRide and RocketRide Light
  * write --rr-text-secondary as rgba(), and Monaco reads theme colours as
  * #RRGGBB only (an rgba() value is drawn red). editorTheme() blends such a token
- * over the paper, writes every colour as #rrggbb, and lifts line numbers to 4.5:1.
+ * over the paper, writes every colour as #rrggbb, lifts line numbers to 4.5:1,
+ * and adds token rules for the syntax colours of Monaco's base palette that do
+ * not reach 4.5:1 on the editor background.
  *
  * @param monaco - The loaded Monaco namespace.
  */
 function defineTheme(monaco: typeof MonacoNS): void {
-	const { dark, colors } = editorTheme(readToken);
+	const { dark, colors, rules } = editorTheme(readToken);
 	monaco.editor.defineTheme(THEME_NAME, {
 		base: dark ? 'vs-dark' : 'vs',
 		inherit: true,
-		rules: [],
+		rules: [...rules],
 		colors: { ...colors },
 	});
 }
