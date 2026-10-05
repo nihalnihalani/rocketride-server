@@ -481,6 +481,19 @@ const rows = await client.tool({
 });
 ```
 
+When the server rejects the call (including when no node handles the tool), `tool()` throws a `DAPException` whose `code` is the server's machine-readable code when it sent one: `TASK_STOPPED` means the task stopped (or is restarting) before the call reached the node, and no code means the tool itself failed. Classify on `err.code`, never on the message text (see section 18):
+
+```typescript
+try {
+	const rows = await client.tool({ token, tool: 'search', input: { q: 'invoices 2026' } });
+} catch (err) {
+	if (err instanceof DAPException && err.code === 'TASK_STOPPED') {
+		// the call never reached the node; retry once the task is running again
+	}
+	throw err;
+}
+```
+
 ### Streaming callback (`onSSE`)
 
 `pipe()`, `send()`, and `chat()` accept a trailing `onSSE` callback that fires for each server-sent event (e.g. token-by-token AI output) while the request is in flight. It is the last positional parameter on `pipe()` and `send()`, and a field on the `chat()` options object; the signature is the same in every case:
@@ -1163,10 +1176,10 @@ const tree = await client.cprofileReportTree(token);    // call tree
 
 ## 18. Exceptions
 
-The SDK exports a typed exception hierarchy so you can catch errors at the right level of specificity. All extend the base `DAPException`, which carries the raw server response on a `dapResult: Record<string, unknown>` property. All are importable from the package root.
+The SDK exports a typed exception hierarchy so you can catch errors at the right level of specificity. All extend the base `DAPException`, which carries the raw server response on a `dapResult: Record<string, unknown>` property and the server's machine-readable error code on `code?: string` (unset when the server sent none). All are importable from the package root.
 
 ```
-DAPException                      // base — wraps any DAP error response (.dapResult)
+DAPException                      // base — wraps any DAP error response (.dapResult, .code); thrown by call()
 └─ RocketRideException            // root of all RocketRide-specific errors
    ├─ ConnectionException         // connect/transport problems, dropped connections
    │  └─ AuthenticationException  // bad API key / credentials
@@ -1182,18 +1195,24 @@ LoginAttemptCancelledError        // extends Error directly — control flow, no
 - `AuthenticationException`: thrown by `login()` (and therefore `connect()`) on auth failure. In persist mode the client does **not** retry after an auth failure — fix credentials and reconnect.
 - `ConnectionException`: `attach()`/`connect()` transport failures; also delivered to the `onConnectError` constructor callback (whose argument is typed `ConnectionException`).
 - `PipeException`: `DataPipe.open()/write()/close()` (and therefore `send()`, `sendFiles()`, `chat()`) on server-reported pipe failures.
+- `DAPException` (the base class itself, not a `RocketRideException`): `call()` and the methods that pass its failure through — `tool()`, `use()`, `getService()`, `getTasks()`, `getTaskToken()`, `getTaskPipeline()` and most other typed methods — when the server rejects the command. `message` is the server's message and `code` its code when it sent one. Task failures carry `TASK_NOT_REGISTERED`, `TASK_AMBIGUOUS`, `TASK_COMPLETED` or `TASK_STOPPED` (the task is stopped, or is terminating during a restart, so the request was never sent). **Classify on `err.code`, never on the message text.** Methods that re-wrap the failure (`restart()`, `getTaskStatus()`) and client-side argument checks throw a plain `Error` with no `code`.
 - `LoginAttemptCancelledError`: a `login()`/`connect()` superseded by newer intent (`reason`: `'superseded' | 'logout' | 'detached'`) — treat as control flow, not an error condition.
 
-Catch the most specific type first, then fall back to a broader one:
+Catch the most specific type first, then fall back to a broader one. Every class above is a `DAPException`, so test the subclasses before the base:
 
 ```typescript
 try {
 	await client.connect('your-api-key');
+	const rows = await client.tool({ token, tool: 'search', input: { q: 'invoices 2026' } });
 } catch (err) {
 	if (err instanceof AuthenticationException) {
 		console.error('Bad credentials:', err.message);
 	} else if (err instanceof RocketRideException) {
 		console.error('RocketRide error:', err.message, err.dapResult);
+	} else if (err instanceof DAPException && err.code === 'TASK_STOPPED') {
+		console.error('Task stopped or restarting; the request was not sent');
+	} else if (err instanceof DAPException) {
+		console.error(`Server rejected the command (${err.code ?? 'no code'}):`, err.message);
 	} else {
 		throw err;
 	}
@@ -1207,7 +1226,7 @@ try {
 1. **Use context managers** (`withConnection` or `await using`) for automatic cleanup.
 2. **Keep the process alive for events.** Events arrive over the WebSocket — in Node.js the open socket keeps the event loop (and your process) alive, and `disconnect()` releases it. Do not exit or disconnect while uploads or monitored tasks are still in flight, and keep `onEvent` handlers fast and non-blocking: a long synchronous handler stalls every other message on the connection.
 3. **Start long-lived pipelines once.** `use()` is expensive; for chat systems start the pipeline globally and reuse the token (`useExisting: true` reattaches) rather than start/ask/stop per question.
-4. **Handle exceptions at the right level of specificity** (section 18), and treat `LoginAttemptCancelledError` as control flow.
+4. **Handle exceptions at the right level of specificity** (section 18): check `err.code` on a `DAPException` from `call()`/`tool()` (e.g. `TASK_STOPPED`), and treat `LoginAttemptCancelledError` as control flow.
 5. **Use `addMonitor`/`removeMonitor`** for event subscriptions — they refcount across consumers and replay automatically on reconnect. Never use the deprecated `setEvents`.
 6. **Enable persist mode** for long-running applications; reconnect backoff is linear-capped and auth failures stop the retry loop (surface them via `onConnectError`).
 7. **Validate before executing**: `validate()` catches structural pipeline errors without burning a task start.
