@@ -20,6 +20,7 @@ and that difference is what this page covers.
   deploying apps.
 - [Webview protocol](webview-protocol.md): the messages the VS Code extension's
   webviews exchange.
+- `scripts/acceptance/graph-explorer/README.md`: manual live-engine and browser acceptance lanes for Graph Explorer and SQL Explorer (not run by CI).
 
 ## Standalone vs monorepo
 
@@ -138,20 +139,17 @@ pnpm install
 
 ### Trying a production build on a local engine
 
-`./builder my-app:build` registers the app in `apps.json` and copies the bundle
-into `dist/server/static/apps/`. A local engine does not serve that copy
-directly: at startup it seeds `apps.json` into its app registry and serves
-`/apps/<app id>/v<N>/...` from the registry, with `cache-control: private,
-max-age=3600`. It seeds a new version only when the manifest's `version`
-changes, so a rebuild at the same version keeps serving the first seeded
-bundle. To try a rebuild:
+A local engine serves the app version it seeded into its store, and seeds
+again only when the app's `version` changes. To try a rebuild at the same
+version:
 
 - start the engine with a fresh store, e.g.
   `RR_STORE_URL=filesystem:///tmp/my-app-store ./engine ai/eaas.py`, which also
   keeps test runs out of your default `~/.rocketlib/store`;
 - load the shell in a fresh browser profile or from another origin
-  (`localhost` instead of `127.0.0.1`): a hard reload does not refetch a
-  Module Federation remote that the browser has cached.
+  (`localhost` instead of `127.0.0.1`): bundles are served with
+  `cache-control: private, max-age=3600`, and a hard reload does not refetch a
+  cached Module Federation remote.
 
 ### Builder tasks (`scripts/tasks.js`)
 
