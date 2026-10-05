@@ -983,6 +983,22 @@ def test_execute_graph_shape_without_a_server_cap_uses_max_execute_rows():
     assert out['row_limit'] == 300 and out['truncated'] is False
 
 
+@pytest.mark.parametrize('allow_writes', [False, True])
+def test_read_query_refuses_load_csv_without_touching_the_server(allow_writes):
+    graph = _FakeGraph(_FakeResult(result_set=[[1]], header=[[1, 'r']]))
+    glb = _FakeGlobal(graph, allow_writes=allow_writes)
+    with pytest.raises(Exception, match='^Refused: LOAD CSV is not allowed on the read-only path'):
+        _instance(glb).read_query({'cypher': "LOAD CSV FROM 'https://example.invalid/a.csv' AS r RETURN r"})
+    assert graph.calls == []
+
+
+def test_query_tool_does_not_apply_the_read_query_rule():
+    """The legacy query tool is unchanged: the statement goes to the server as written."""
+    graph = _FakeGraph(_FakeResult(result_set=[[1]], header=[[1, 'r']]))
+    _instance(_FakeGlobal(graph)).query({'cypher': "LOAD CSV FROM 'file:///x' AS r RETURN r"})
+    assert [c[0] for c in graph.calls] == ['ro_query']
+
+
 def test_read_query_error_headlines():
     graph = _FakeGraph(raise_error=_StubRedisError('graph.RO_QUERY is to be executed only on read-only queries'))
     with pytest.raises(Exception, match='^Refused: read_query is read-only'):

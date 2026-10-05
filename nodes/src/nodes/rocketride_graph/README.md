@@ -66,7 +66,8 @@ WHERE id(n) = toInteger($id). Paths keep traversal order and relationships
 their stored direction; integers beyond 2^53, NaN, Infinity and exact
 numerics are tagged as text. A response stops at 10,000 graph elements or
 500,000 values. Failures raise an error whose first line is a headline:
-"Refused: …" for a write or a firewall rule, "Not supported on Apache AGE
+"Refused: …" for a write, `LOAD CSV` (read_query reads the graph only) or a
+firewall rule, "Not supported on Apache AGE
 1.5.0: <construct>" followed by what to write instead (for example for
 date(), duration(), elementId(), list or pattern comprehensions,
 allShortestPaths and EXISTS subqueries, which AGE 1.5.0 cannot run), "Query

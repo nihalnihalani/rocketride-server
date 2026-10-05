@@ -524,6 +524,16 @@ class TestReadQuery:
         finally:
             glb.endGlobal()
 
+    def test_load_csv_is_refused(self, rr_env, age_graph):
+        glb = _begin(rr_env)
+        inst = _instance(rr_env, glb)
+        try:
+            with pytest.raises(_graph_tool_error()) as err:
+                inst.read_query({'cypher': "LOAD CSV FROM 'https://example.invalid/rr-test.csv' AS r RETURN r"})
+            assert str(err.value).startswith('Refused: LOAD CSV is not allowed on the read-only path')
+        finally:
+            glb.endGlobal()
+
     def test_hints_are_raised_before_the_database(self, rr_env, age_graph, monkeypatch):
         glb = _begin(rr_env)
         inst = _instance(rr_env, glb)

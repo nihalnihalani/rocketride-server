@@ -313,6 +313,31 @@ def check_read_only_cypher(cypher: str, *, allowed_procedures=NEO4J_READ_PROCEDU
                 )
 
 
+def check_read_query_statement(cypher: str) -> None:
+    """The statement rule every driver's ``read_query`` applies before its own read boundary.
+
+    ``read_query`` reads the configured graph and nothing else, so ``LOAD CSV``
+    (which reads a file or URL) is refused on every engine, including those
+    whose read-only command would run it. Writes, administration and
+    procedure calls stay with each driver's own read boundary (a read-only
+    command, transaction or role, plus Neo4j's :func:`check_read_only_cypher`).
+
+    Raises:
+        CypherRefused: for ``LOAD CSV``, or text whose comments, strings or
+            back-quoted names do not terminate.
+    """
+    toks = _tokenize(cypher)
+    for i, tok in enumerate(toks):
+        if tok.upper != 'LOAD' or not _is_clause_word(toks, i):
+            continue
+        nxt = toks[i + 1] if i + 1 < len(toks) else None
+        if nxt is not None and nxt.kind == 'word' and nxt.upper == 'CSV':
+            raise CypherRefused(
+                'Refused: LOAD CSV is not allowed on the read-only path',
+                'read_query reads only the configured graph.',
+            )
+
+
 _PROCEDURE_DISPLAY = {
     'db.labels': 'db.labels',
     'db.relationshiptypes': 'db.relationshipTypes',

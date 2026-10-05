@@ -199,6 +199,24 @@ class TestReadOnlyInvariant:
             glb.endGlobal()
 
 
+class TestReadQueryRefusals:
+    @pytest.mark.parametrize(
+        'cypher',
+        [
+            "LOAD CSV FROM 'https://example.invalid/rr-test.csv' AS r RETURN r",
+            "MATCH (a:Person) WITH 'file://' + a.name AS f LOAD CSV FROM f AS r RETURN count(r)",
+        ],
+    )
+    def test_load_csv_is_refused(self, falkor_env, falkor_graph, cypher):
+        glb, inst = _start(falkor_env, allow_writes=True)
+        try:
+            with pytest.raises(falkor_env.GraphToolError) as err:
+                inst.read_query({'cypher': cypher})
+            assert str(err.value).startswith('Refused: LOAD CSV is not allowed on the read-only path')
+        finally:
+            glb.endGlobal()
+
+
 class TestServerLimits:
     def test_resultset_size_is_read_and_respected(self, falkor_env, falkor_graph):
         glb, inst = _start(falkor_env, max_rows=25000)
