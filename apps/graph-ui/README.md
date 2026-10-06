@@ -210,7 +210,9 @@ The Ask box asks the node's language model (`get_query`) to write Cypher. What
 comes back is a **preview**: it is put in the editor and **not run**; you read it,
 edit it, and press Run. The node has already checked that it reads only, and the
 text check runs on it again. An answer in words is shown as an answer. A pipeline
-with no language model gets a note that says so instead of an error. **Stop
+with no language model gets a note that says so instead of an error; any other
+failure (a model that returned nothing, a lost connection, a node that cannot
+answer Ask yet) is shown as an error with the node's own words. **Stop
 waiting** drops a late answer.
 
 ## History

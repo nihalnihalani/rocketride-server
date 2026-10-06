@@ -100,4 +100,10 @@ test('a failure that looks like a missing model is unavailable; a safety refusal
 	assert.equal(explainAskFailure({ kind: 'invalid', headline: 'Generated query contains write or admin clauses' }).unavailable, false);
 	assert.equal(explainAskFailure({ kind: 'raised', headline: 'Query timed out after 30000 ms', detail: 'Database said: canceling statement' }).unavailable, false);
 	assert.equal(explainAskFailure({ kind: 'invalid', headline: 'no llm' }).unavailable, false, 'only a raised error can mean the pipeline has no model');
+	// GX-T1-04: what the engine raises when the pipeline has no LLM node (filter.callbacks.target.cpp), as captured live.
+	assert.equal(explainAskFailure({ kind: 'raised', headline: 'InvalidParam: No control listeners registered for llm at (filter.callbacks.target.cpp:96)' }).unavailable, true);
+	// ...and texts that only mention a model or a connection: the node's own empty-answer error, the SDK's lost connection.
+	for (const headline of ['LLM failed to return a Cypher query.', 'Server is not connected', 'WebSocket not connected: call connect() first', 'The LLM returned an empty answer']) {
+		assert.equal(explainAskFailure({ kind: 'raised', headline }).unavailable, false, headline);
+	}
 });

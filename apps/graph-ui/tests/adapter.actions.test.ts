@@ -14,7 +14,7 @@ import type { IFakeRow, IToolCall } from 'shared/explorer/connect/testing';
 import { TOOL, makeGraphEndpointStore } from '../src/adapters/explorer';
 import { askConnection, loadConnectionSchema } from '../src/adapters/actions';
 import { createSchemaStore } from '../src/graph/schemaStore';
-import { ASK_UNAVAILABLE } from '../src/graph/wording';
+import { ASK_UNAVAILABLE, UPGRADE_GET_QUERY } from '../src/graph/wording';
 import { fixture } from './support/builders';
 
 const CURRENT = fixture<Record<string, unknown>>('dialect_neo4j');
@@ -157,6 +157,27 @@ describe('Ask over get_query', () => {
 	it('a pipeline without a language model is "unavailable", with the reason, not an error banner', async () => {
 		const { world, stores, endpoint } = await rig(CURRENT, { [TOOL.getQuery]: () => { throw codedError('No LLM connected to this node'); } });
 		assert.deepEqual(await askConnection(world.client, endpoint, 'who?', stores), { kind: 'unavailable', text: ASK_UNAVAILABLE });
+	});
+
+	// GX-T1-04: NO_MODEL matched a bare "llm" or "not connected", so the node's own "LLM failed to return a Cypher query."
+	// (a connected model that answered nothing) and the SDK's "Server is not connected" were reported as "no model".
+	it('the engine\'s no-listener text is "unavailable"; a model that answered nothing and a dropped connection are failures', async () => {
+		const none = await rig(CURRENT, { [TOOL.getQuery]: () => { throw codedError('InvalidParam: No control listeners registered for llm at (filter.callbacks.target.cpp:96)'); } });
+		assert.deepEqual(await askConnection(none.world.client, none.endpoint, 'who?', none.stores), { kind: 'unavailable', text: ASK_UNAVAILABLE });
+		for (const message of ['LLM failed to return a Cypher query.', 'Server is not connected', 'WebSocket not connected: call connect() first']) {
+			const { world, stores, endpoint } = await rig(CURRENT, { [TOOL.getQuery]: () => { throw codedError(message); } });
+			const outcome = await askConnection(world.client, endpoint, 'who?', stores);
+			assert.equal(outcome.kind, 'failed', message);
+			assert.equal(outcome.kind === 'failed' ? outcome.headline : '', message);
+		}
+	});
+
+	it('an engine that does not know get_query gets the upgrade wording, as every other tool does', async () => {
+		const { world, stores, endpoint } = await rig(CURRENT, { [TOOL.getQuery]: () => { throw codedError('No handler found for tool get_query'); } });
+		const outcome = await askConnection(world.client, endpoint, 'who?', stores);
+		assert.equal(outcome.kind, 'failed');
+		assert.equal(outcome.kind === 'failed' ? outcome.headline : '', UPGRADE_GET_QUERY);
+		assert.equal(outcome.kind === 'failed' ? outcome.variant : '', 'warning');
 	});
 
 	it('a node refusal (the model wrote something unsafe) is a failure with the node\'s words', async () => {

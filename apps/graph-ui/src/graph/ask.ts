@@ -35,9 +35,17 @@
 //
 // A pipeline without a language model cannot answer at all. Browsing with Cypher
 // still works, so Ask shows an "unavailable" state instead of an error banner,
-// and says why. Generated Cypher never runs automatically.
+// and says why. That is told from the text of the raised error (ADR O8): the
+// engine's "No control listeners registered for llm" and explicit "no model"
+// wording only, never a bare mention of an LLM or a connection, because the
+// node's "LLM failed to return a Cypher query." (a connected model that answered
+// nothing) and the SDK's "Server is not connected" mean something else. Every
+// other failure is described the way the browse editor describes one
+// (failures.ts), so an engine without get_query gets the upgrade wording.
+// Generated Cypher never runs automatically.
 // =============================================================================
 
+import { describeFailureOf } from './failures';
 import { isPlainObject } from './values';
 
 /** What a `get_query` answer means. */
@@ -64,8 +72,12 @@ export interface IAskFailure {
 	unavailable: boolean;
 }
 
-/** Text in a failure that points at a missing or unconfigured language model. */
-const NO_MODEL = /\bllm\b|language model|no model|model (is )?(not|un)(configured|available|connected)|not connected|no (chat|llm) (node|connection)|invoke\.llm|nothing (is )?connected/i;
+/**
+ * Text in a failure that says the pipeline has no language model: the engine's own words when no LLM node listens
+ * (filter.callbacks.target.cpp: "No control listeners registered for llm"), and explicit "no model" wording. A bare
+ * "LLM" or "not connected" is not enough: "LLM failed to return a Cypher query." comes from a connected model.
+ */
+const NO_MODEL = /no control listeners registered for llm\b|\bno (llm|language model)\b|\binvoke\.llm\b|\b(llm|language model|model) (is )?(not |un)(configured|available|connected|wired)\b|\bno (chat|llm) (node|connection)\b/i;
 
 /**
  * Explain a failed `get_query`.
@@ -93,7 +105,8 @@ export type AskOutcome =
 	| { kind: 'prose'; text: string }
 	/** The pipeline has no language model (or it is not wired): say so, no error banner. */
 	| { kind: 'unavailable'; text: string }
-	| { kind: 'failed'; headline: string; detail: string }
+	/** Described as the browse editor describes a failure: the node's headline (or the upgrade wording), its text, one hint. */
+	| { kind: 'failed'; headline: string; detail: string; hint: string | null; variant: 'error' | 'warning' | 'info' }
 	/** The question was too long or empty: nothing was sent. */
 	| { kind: 'refused'; text: string }
 	/** The answer belongs to a request that was superseded: show nothing. */
@@ -116,13 +129,17 @@ export async function askQuestion(question: string, call: (question: string) => 
 	if (trimmed.length > ASK_MAX_CHARS) return { kind: 'refused', text: `That question is longer than ${ASK_MAX_CHARS.toLocaleString('en-US')} characters. Shorten it.` };
 	try {
 		const answer = readAskAnswer(await call(trimmed));
-		return answer ?? { kind: 'failed', headline: 'The node answered with neither a query nor text.', detail: '' };
+		return answer ?? { kind: 'failed', headline: 'The node answered with neither a query nor text.', detail: '', hint: null, variant: 'error' };
 	} catch (error) {
 		const e = (error ?? {}) as { kind?: unknown; headline?: unknown; detail?: unknown; message?: unknown };
 		const kind = typeof e.kind === 'string' ? e.kind : 'raised';
 		if (kind === 'stale') return { kind: 'ignored' };
 		const message = typeof e.message === 'string' ? e.message : String(error);
 		const failure = explainAskFailure({ kind, headline: typeof e.headline === 'string' ? e.headline : message.split('\n')[0], ...(typeof e.detail === 'string' ? { detail: e.detail } : {}) });
-		return failure.unavailable ? { kind: 'unavailable', text: unavailableText } : { kind: 'failed', headline: failure.headline, detail: failure.detail };
+		if (failure.unavailable) return { kind: 'unavailable', text: unavailableText };
+		// Ask sits on the browse surface, which never sends a write; the write-console hint is not offered here.
+		const notice = describeFailureOf(message, error, false);
+		if (notice.ignore) return { kind: 'ignored' };
+		return { kind: 'failed', headline: notice.headline, detail: notice.detail, hint: notice.hint, variant: notice.variant };
 	}
 }
