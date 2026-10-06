@@ -41,19 +41,20 @@ only when **Allow direct query execution** is enabled.
 
 ## As a tool
 
-The functions are registered under the `neo4j` service prefix: for example,
-`neo4j.get_data`. There is no configurable tool-server-name field.
+The registered tool names are the bare method names below (an agent catalog
+namespaces them by the pipeline component id, not by the services.json
+`prefix`). There is no configurable tool-server-name field.
 
 | Function | Description |
 | --- | --- |
-| `neo4j.get_data` | Turn a natural-language request into a read-only Cypher query, run it, and return rows. |
-| `neo4j.get_schema` | Return the reflected labels, properties, and relationship types. |
-| `neo4j.refresh_schema` | Re-read the schema now and return it like `get_schema`. |
-| `neo4j.get_query` | Return generated read-only Cypher without executing it. |
-| `neo4j.read_query` | Run Cypher you wrote, read-only, and return positional rows in the shared graph result shape. |
-| `neo4j.execute` | Run raw Cypher only when direct execution is enabled. |
-| `neo4j.dialect` | Return `{"dialect": "neo4j"}` plus the engine version and edition, database, capabilities, limits and read boundary. |
-| `neo4j.get_cypher` | Deprecated compatibility alias for `get_query`; it also includes the statement under `cypher`. |
+| `get_data` | Turn a natural-language request into a read-only Cypher query, run it, and return rows. |
+| `get_schema` | Return the reflected labels, properties, and relationship types. |
+| `refresh_schema` | Re-read the schema now and return it like `get_schema`. |
+| `get_query` | Return generated read-only Cypher without executing it. |
+| `read_query` | Run Cypher you wrote, read-only, and return positional rows in the shared graph result shape. |
+| `execute` | Run raw Cypher only when direct execution is enabled. |
+| `dialect` | Return `{"dialect": "neo4j"}` plus the engine version and edition, database, capabilities, limits and read boundary. |
+| `get_cypher` | Deprecated compatibility alias for `get_query`; it also includes the statement under `cypher`. |
 
 `get_data`, `get_query`, and `get_cypher` require a non-empty `question` and
 accept an optional integer `limit`; absent or invalid limits resolve to 250 and
@@ -90,8 +91,10 @@ a `.` (`0LIMIT`, `1.`) or a `/* … */` comment whose text holds a `/` (other
 engines end such a comment at that `/`); it then runs
 in a READ-mode transaction with a 30-second server-side deadline. Failures
 raise an error whose first line is a short headline (`Refused: …`,
-`Query timed out after 30000 ms`, `Invalid read_query input: …` or
-`Query failed`) and whose remaining lines are the database's own message.
+`Query timed out after 30000 ms`, `Invalid read_query input: …`,
+`Query result cannot be represented` (a value the database returned does not
+fit the result shape) or `Query failed`) and whose remaining lines are the
+detail, the database's own message where there is one.
 
 The same procedure and clause checks now also apply to the Cypher that
 `get_data` generates.
@@ -159,8 +162,8 @@ actual schema.
 ### Max validation attempts
 
 **Max validation attempts** controls how many times a rejected generated query
-is repaired after Neo4j rejects it under `EXPLAIN`. The setting defaults to 5;
-the runtime clamps it to 1–10. Increase it only if valid requests routinely
+is repaired after Neo4j rejects it under `EXPLAIN`. The setting defaults to 5
+and accepts 1–10. Increase it only if valid requests routinely
 need additional repair attempts, since each retry calls the LLM and delays the
 answer. When all attempts fail, the node returns the database error rather than
 running the last rejected query.
@@ -172,8 +175,9 @@ agent and lane traffic: generated reads pass the Cypher safety gate and use a
 READ access-mode session. Turn it on only for a trusted caller that must issue
 raw Cypher through `execute` or `QuestionType.EXECUTE`, because that path skips
 both LLM translation and the read-only gate and can write to the database.
-Raw execution is still limited to 25,000 returned rows; exceeding that limit
-raises an error.
+Raw execution is still limited to 25,000 returned rows: in the default shape
+exceeding that limit raises an error, and with `shape: "graph"` the result is
+cut at 25,000 rows and reported as truncated (`truncated_by: "rows"`).
 
 ## Authentication
 

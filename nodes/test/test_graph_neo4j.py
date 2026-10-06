@@ -575,3 +575,44 @@ def test_get_query_refuses_generated_load_csv():
     out = inst.get_query({'question': 'import a file'})
     assert out == {'error': 'Refused: LOAD CSV is not allowed on the read-only path', 'query': cypher, 'valid': False}
     assert glb.driver.calls == []
+
+
+# ---------------------------------------------------------------------------
+# Config form vs runtime: max_attempts
+# ---------------------------------------------------------------------------
+
+_NODES_DIR = _REPO / 'nodes' / 'src' / 'nodes'
+
+
+def _form_maximum(node: str, field: str) -> int:
+    """The "maximum" services.json gives a field (the file is JSONC, so read just that object)."""
+    raw = (_NODES_DIR / node / 'services.json').read_text(encoding='utf-8')
+    start = raw.index(f'"{field}"')
+    body = raw[start : raw.index('}', start)]
+    marker = '"maximum":'
+    return int(body[body.index(marker) + len(marker) :].split(',')[0].strip())
+
+
+@pytest.mark.parametrize(
+    ('node', 'field'),
+    [
+        ('graph_neo4j', 'graph_neo4j.max_attempts'),
+        ('graph_falkordb', 'graph_falkordb.max_attempts'),
+        ('rocketride_graph', 'rocketridegraph.max_attempts'),
+    ],
+)
+def test_max_attempts_form_maximum_is_what_the_runtime_applies(monkeypatch, node, field):
+    """A value the form accepts must not be silently reduced at start (the base clamps to 1..10)."""
+    maximum = _form_maximum(node, field)
+    glb = _FakeGlobal(_FakeDriver())
+    glb.glb = types.SimpleNamespace(logicalType=node, connConfig={})
+    begin = graph_base.GraphGlobalBase.beginGlobal
+    monkeypatch.setitem(
+        begin.__globals__, 'Config', types.SimpleNamespace(getNodeConfig=lambda *a: {'max_attempts': maximum})
+    )
+    monkeypatch.setattr(glb, '_open_driver', lambda config: None)
+    monkeypatch.setattr(glb, 'refresh_schema_snapshot', lambda source='refresh': None)
+
+    begin(glb)
+
+    assert glb.max_validation_attempts == maximum

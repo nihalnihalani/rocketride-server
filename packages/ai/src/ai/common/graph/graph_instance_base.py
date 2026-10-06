@@ -86,6 +86,13 @@ GRAPH_RESULT_SCHEMA = {
     },
 }
 
+# The schema v2 block get_schema and refresh_schema return under 'schema'.
+SCHEMA_V2_PROPERTY = {
+    'type': 'object',
+    'description': 'Schema v2: labels and relationship types with all observed property types, '
+    'endpoints, counts, sampled/truncated flags, refreshed_at, and stale/error after a failed refresh.',
+}
+
 
 class GraphInstanceBase(IInstanceBase, ABC):
     """Abstract base for the IInstance layer of any graph database node."""
@@ -197,7 +204,7 @@ class GraphInstanceBase(IInstanceBase, ABC):
                     'items': {'type': 'object'},
                     'description': 'Relationship types with their start and end labels.',
                 },
-                'error': {'type': 'string'},
+                'schema': SCHEMA_V2_PROPERTY,
             },
         },
         description=lambda self: (
@@ -231,11 +238,7 @@ class GraphInstanceBase(IInstanceBase, ABC):
                 'labels': {'type': 'array', 'items': {'type': 'string'}},
                 'nodes': {'type': 'object'},
                 'relationships': {'type': 'array', 'items': {'type': 'object'}},
-                'schema': {
-                    'type': 'object',
-                    'description': 'Schema v2: labels and relationship types with all observed property types, '
-                    'endpoints, counts, sampled/truncated flags, refreshed_at, and stale/error after a failed refresh.',
-                },
+                'schema': SCHEMA_V2_PROPERTY,
             },
         },
         description=lambda self: (
@@ -315,9 +318,20 @@ class GraphInstanceBase(IInstanceBase, ABC):
         output_schema={
             'type': 'object',
             'properties': {
-                'rows': {'type': 'array'},
-                'affected_rows': {'type': 'integer'},
+                # columns, row_limit, truncated, ... come with shape "graph" only.
                 **GRAPH_RESULT_SCHEMA['properties'],
+                'rows': {
+                    'type': 'array',
+                    'items': {'type': ['object', 'array']},
+                    'description': 'Shape "legacy" (the default): one object per row, keyed by column name. '
+                    'Shape "graph": positional rows as read_query returns them, with the other read_query '
+                    'fields (columns, row_limit, truncated, ...).',
+                },
+                'affected_rows': {
+                    'type': 'integer',
+                    'description': 'Both shapes. The summed write counters on Neo4j and FalkorDB; the number of '
+                    'result rows on Apache AGE, which reports no write counters.',
+                },
             },
         },
         description=lambda self: (
@@ -567,6 +581,7 @@ class GraphInstanceBase(IInstanceBase, ABC):
         """Return the engine identity, capabilities and limits (no credentials or hosts)."""
         identity = self.IGlobal._engine_identity()
         glb = self.IGlobal
+        max_rows = glb.read_query_cap
         return {
             'dialect': self._db_dialect(),
             'engine': identity.get('engine') or {'name': self._db_display_name(), 'version': None, 'edition': None},
@@ -581,8 +596,9 @@ class GraphInstanceBase(IInstanceBase, ABC):
                 'shortest_path': bool(identity.get('shortest_path', True)),
             },
             'limits': {
-                'default_rows': DEFAULT_READ_QUERY_LIMIT,
-                'max_rows': glb.read_query_cap,
+                # What read_query returns when the caller sends no limit.
+                'default_rows': min(DEFAULT_READ_QUERY_LIMIT, max_rows),
+                'max_rows': max_rows,
                 'max_elements': DEFAULT_ELEMENT_LIMIT,
                 'max_values': DEFAULT_VALUE_LIMIT,
                 'statement_timeout_ms': glb.statement_timeout_ms,

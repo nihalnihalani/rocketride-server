@@ -306,7 +306,14 @@ class GraphGlobalBase(IGlobalBase, ABC):
 
     @property
     def statement_timeout_ms(self) -> int:
-        """Server-side deadline applied to every read_query / execute statement."""
+        """Server-side deadline applied to every query the node runs for a caller.
+
+        read_query, execute in either shape, get_data, the questions lane and
+        any driver-specific query tool; ``dialect`` reports it (schema
+        refreshes run within their own budget instead). A driver whose server
+        caps per-query timeouts (FalkorDB's TIMEOUT_MAX) returns the clamped
+        value and must send that on every one of those paths.
+        """
         return DEFAULT_STATEMENT_TIMEOUT_MS
 
     # ------------------------------------------------------------------

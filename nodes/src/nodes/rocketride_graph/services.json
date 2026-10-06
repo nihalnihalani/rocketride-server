@@ -116,7 +116,7 @@
 			"title": "Max validation attempts",
 			"default": 5,
 			"minimum": 1,
-			"maximum": 20,
+			"maximum": 10,
 			"description": "Maximum number of times to re-ask the LLM if validation rejects the generated Cypher"
 		},
 		"rocketridegraph.max_rows": {
@@ -125,7 +125,7 @@
 			"default": 1000,
 			"minimum": 1,
 			"maximum": 25000,
-			"description": "Row ceiling for read queries on the questions lane and get_data tool"
+			"description": "Row ceiling for read queries: the questions lane, get_data and read_query (Graph Explorer's All asks for this cap). Results beyond it are cut; get_data and read_query report them as truncated (the questions lane does not)."
 		},
 		"rocketridegraph.query_timeout_ms": {
 			"type": "integer",

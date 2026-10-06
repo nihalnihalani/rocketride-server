@@ -16,7 +16,7 @@
     "shortest_path": true
   },
   "limits": {
-    "default_rows": 1000,
+    "default_rows": 250,
     "max_rows": 250,
     "max_elements": 10000,
     "max_values": 500000,

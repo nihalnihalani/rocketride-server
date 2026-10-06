@@ -435,3 +435,59 @@ class TestSplitReadings:
         )
         inst.read_query({'cypher': "MATCH (n:`\u00dcn\u00efcode`) WHERE n.name = 'Jos\u00e9' RETURN n"})
         assert len(inst.IGlobal.read_calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# published tool contracts: the outputSchema an agent's catalog carries must
+# describe what the tool returns
+# ---------------------------------------------------------------------------
+
+
+def _published(tool):
+    """The output_schema @tool_function publishes as the tool's outputSchema."""
+    return getattr(GraphInstanceBase, tool).__tool_meta__['output_schema']
+
+
+def _json_type(value):
+    if isinstance(value, dict):
+        return 'object'
+    if isinstance(value, list):
+        return 'array'
+    if isinstance(value, bool):
+        return 'boolean'
+    if isinstance(value, int):
+        return 'integer'
+    if isinstance(value, float):
+        return 'number'
+    if isinstance(value, str):
+        return 'string'
+    return 'null'
+
+
+class TestPublishedContracts:
+    def test_execute_rows_schema_admits_both_shapes(self):
+        rows_schema = _published('execute')['properties']['rows']
+        allowed = rows_schema['items']['type']
+        allowed = [allowed] if isinstance(allowed, str) else list(allowed)
+        inst = make([[vertex(1)]], allow_execute=True)
+        legacy = inst.execute({'query': 'MATCH (n) RETURN n'})
+        graph = inst.execute({'query': 'MATCH (n) RETURN n', 'shape': 'graph'})
+        assert [_json_type(r) for r in legacy['rows']] == ['object']
+        assert [_json_type(r) for r in graph['rows']] == ['array']
+        for out in (legacy, graph):
+            assert all(_json_type(r) in allowed for r in out['rows']), (allowed, out['rows'])
+            assert set(out) <= set(_published('execute')['properties'])
+        assert 'legacy' in rows_schema['description'] and '"graph"' in rows_schema['description']
+
+    @pytest.mark.parametrize('tool', ['get_schema', 'refresh_schema'])
+    def test_schema_tools_declare_what_they_return(self, tool):
+        out = getattr(make(), tool)({})
+        assert set(out) == set(_published(tool)['properties'])
+        assert _published(tool)['properties']['schema']['type'] == 'object'
+
+    @pytest.mark.parametrize('cap,expected', [(250, 250), (1000, 1000), (25000, 1000)])
+    def test_dialect_default_rows_is_what_an_omitted_limit_returns(self, cap, expected):
+        inst = make([[1]] * 3, cap=cap)
+        limits = inst.dialect({})['limits']
+        assert limits['default_rows'] == expected and limits['max_rows'] == min(cap, 25000)
+        assert inst.read_query({'cypher': 'RETURN 1'})['row_limit'] == limits['default_rows']

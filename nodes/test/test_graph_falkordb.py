@@ -1016,6 +1016,99 @@ def test_execute_graph_shape_without_a_server_cap_uses_max_execute_rows():
     assert out['row_limit'] == 300 and out['truncated'] is False
 
 
+# The server limits apply to every command the node sends, not only to
+# read_query and execute(shape='graph'): get_data, the questions lane, execute
+# in its default shape (and the EXECUTE lane) and the query tool too.
+
+
+def test_every_command_sends_the_timeout_clamped_to_timeout_max():
+    """FalkorDB refuses a per-query TIMEOUT above TIMEOUT_MAX, so no path may send the unclamped one."""
+    graph = _FakeGraph(_FakeResult(result_set=[[1]], header=[[1, 'n']]))
+    glb = _FakeGlobal(graph)
+    glb.allow_execute = True
+    glb.server_timeout_max_ms, glb.query_timeout_ms = 1000, 30000
+    inst = _instance(glb)
+    inst.get_query = lambda args: {'query': 'MATCH (n) RETURN n', 'valid': True}
+
+    inst.get_data({'question': 'every node'})
+    glb._run_query('MATCH (n) RETURN n')  # the questions lane
+    inst.execute({'query': 'MATCH (n) RETURN n'})
+    inst.query({'cypher': 'MATCH (n) RETURN n'})
+    glb.allow_writes = True
+    inst.query({'cypher': 'MATCH (n) RETURN n'})
+
+    assert [(c[0], c[3]) for c in graph.calls] == [
+        ('ro_query', 1000),
+        ('ro_query', 1000),
+        ('query', 1000),
+        ('ro_query', 1000),
+        ('query', 1000),
+    ]
+
+
+def _server_cut(produced=10, resultset_size=5):
+    """A server whose RESULTSET_SIZE silently cuts a ``produced``-row reply."""
+    return _FakeGraph(_FakeResult(result_set=[[i] for i in range(min(produced, resultset_size))], header=[[1, 'i']]))
+
+
+def test_get_data_reports_a_resultset_size_cut_as_truncated():
+    glb = _FakeGlobal(_server_cut(), max_rows=25000)
+    glb.server_result_cap = 5
+    inst = _instance(glb)
+    inst.get_query = lambda args: {'query': 'UNWIND range(1, 10) AS i RETURN i', 'valid': True}
+    out = inst.get_data({'question': 'every number', 'limit': 25000})
+    assert out['row_limit'] == 4 and len(out['rows']) == 4 and out['truncated'] is True
+
+
+def test_questions_lane_stays_below_the_server_cut():
+    glb = _FakeGlobal(_server_cut(), max_rows=25000)
+    glb.server_result_cap = 5
+    assert glb.read_row_cap == 4
+    assert len(glb._run_query('UNWIND range(1, 10) AS i RETURN i')) == 4
+
+
+def test_query_tool_reports_a_resultset_size_cut_as_truncated():
+    glb = _FakeGlobal(_server_cut(), max_rows=25000)
+    glb.server_result_cap = 5
+    out = _instance(glb).query({'cypher': 'UNWIND range(1, 10) AS i RETURN i'})
+    assert out['row_count'] == 4 and out['truncated'] is True
+
+
+def test_legacy_execute_fails_when_the_server_may_have_cut_the_reply():
+    glb = _FakeGlobal(_server_cut())
+    glb.allow_execute, glb.server_result_cap = True, 5
+    with pytest.raises(ValueError, match=r'^EXECUTE query exceeded max_execute_rows=4 \(.*RESULTSET_SIZE \(5\)'):
+        _instance(glb).execute({'query': 'UNWIND range(1, 10) AS i RETURN i'})
+
+
+def test_legacy_execute_below_the_server_cap_returns_its_rows():
+    glb = _FakeGlobal(_server_cut(produced=4))
+    glb.allow_execute, glb.server_result_cap = True, 5
+    out = _instance(glb).execute({'query': 'UNWIND range(1, 4) AS i RETURN i'})
+    assert out['rows'] == [{'i': i} for i in range(4)]
+
+
+def test_legacy_execute_without_a_server_cap_keeps_its_message():
+    glb = _FakeGlobal(_server_cut(produced=4, resultset_size=10))
+    glb.allow_execute, glb.max_execute_rows = True, 3
+    with pytest.raises(ValueError) as err:
+        _instance(glb).execute({'query': 'UNWIND range(1, 4) AS i RETURN i'})
+    assert str(err.value).splitlines()[0] == 'EXECUTE query exceeded max_execute_rows=3'
+
+
+@pytest.mark.parametrize('server_cap', [5, None])
+def test_legacy_execute_over_its_cap_says_the_statement_ran_and_its_writes_stand(server_cap):
+    # FalkorDB does not roll a statement back when its reply is too long to
+    # return: the failure must not read as if nothing happened.
+    glb = _FakeGlobal(_server_cut(produced=10, resultset_size=10))
+    glb.allow_execute, glb.server_result_cap, glb.max_execute_rows = True, server_cap, 3
+    with pytest.raises(ValueError) as err:
+        _instance(glb).execute({'query': 'UNWIND range(1, 10) AS i CREATE (:N {i: i}) RETURN i'})
+    detail = str(err.value).splitlines()[1]
+    assert detail.startswith('The statement ran, and any writes it made stand (FalkorDB does not roll them back)')
+    assert 'LIMIT' in detail and 'shape "graph"' in detail
+
+
 @pytest.mark.parametrize('allow_writes', [False, True])
 def test_read_query_refuses_load_csv_without_touching_the_server(allow_writes):
     graph = _FakeGraph(_FakeResult(result_set=[[1]], header=[[1, 'r']]))
