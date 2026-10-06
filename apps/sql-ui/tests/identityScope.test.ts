@@ -30,18 +30,19 @@
 // snapshots, belonged to the previous account and must go with it, so its
 // query results are never shown to the next one.
 //
-// The tabs are checked against the shell's REAL document model (it needs only
-// React), so a closed editor is proven gone from its group and its document
-// released. SqlApp has no DOM harness here, so its wiring is checked against
-// the source, as the QueryView wiring tests do.
+// The tabs are checked against a structural fake of the shell's document
+// model (FakeDocs below) that keeps editor groups and the active group, so a
+// closed editor is proven gone from its group and its document released. App
+// tests do not import the shell's sources. SqlApp has no DOM harness here, so
+// its wiring is checked against the source, as the QueryView wiring tests do.
 // =============================================================================
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import type { RocketRideClient } from 'shell';
-import { Documents } from '../../../packages/shell/src/components/docs/Documents';
+import type { Document, DocumentsState, Editor, RocketRideClient } from 'shell';
+import type { IConnectionDocsHost } from '../src/docs';
 import { CONNECTIONS_URI, closeConnectionDocuments, connectionUri, designUri, diagramUri, nextQueryDoc, tableDataUri } from '../src/docs';
 import { createIdentityScope, forgetConnectionScope, sqlIdentityScope } from '../src/identityScope';
 import { getSession, refreshSchema, schemaSnapshot } from '../src/schema/schemaStore';
@@ -51,6 +52,162 @@ import { registerEndpoint } from './support';
 // HELPERS
 // =============================================================================
 
+/** The part of the shell's document state the fake keeps, in the shell's own types. */
+type FakeDocsState = Pick<DocumentsState, 'documents' | 'editors' | 'groups' | 'activeGroupId'>;
+
+/**
+ * A structural fake of the shell's `Documents`, with the semantics these tests
+ * rely on and nothing more:
+ *
+ * - `openStaticDocument` focuses an editor that already shows the URI, in any
+ *   group; otherwise it adds one to the active group and makes it active.
+ * - `splitGroupWithDocument` adds a group, made active, holding a second editor
+ *   on the split group's active document (that document then has two editors).
+ * - `closeEditor` removes the editor from its group and releases its document
+ *   with the last clean editor. A group it empties is removed unless it is the
+ *   last one, and the last remaining group becomes active if the removed group
+ *   was.
+ * - Every change replaces the state, so a caller still iterating an earlier
+ *   `getState()` is not disturbed.
+ *
+ * It keeps every group and the active group, so a `closeConnectionDocuments`
+ * that closed only the active group's editors would leave tabs open in the
+ * other group and fail.
+ */
+class FakeDocs implements IConnectionDocsHost {
+	private state: FakeDocsState = {
+		documents: {},
+		editors: {},
+		groups: { 'group-1': { id: 'group-1', editorIds: [], activeEditorIndex: -1 } },
+		activeGroupId: 'group-1',
+	};
+
+	private editorSeq = 0;
+
+	private groupSeq = 1;
+
+	/**
+	 * The current state (replaced, never mutated, on every change).
+	 *
+	 * @returns The state.
+	 */
+	getState(): FakeDocsState {
+		return this.state;
+	}
+
+	/**
+	 * Open a static document, or focus the editor that already shows it.
+	 *
+	 * @param uri - The document URI.
+	 * @param label - The tab label.
+	 * @param content - The static payload.
+	 */
+	openStaticDocument(uri: string, label: string, content?: unknown): void {
+		const s = this.state;
+		for (const group of Object.values(s.groups)) {
+			const index = group.editorIds.findIndex((id) => s.editors[id]?.documentUri === uri);
+			if (index !== -1) {
+				this.state = { ...s, groups: { ...s.groups, [group.id]: { ...group, activeEditorIndex: index } }, activeGroupId: group.id };
+				return;
+			}
+		}
+		const group = s.groups[s.activeGroupId];
+		assert.ok(group, 'the active group exists');
+		const editor = this.newEditor(uri, label);
+		const document: Document = { uri, content: content ?? null, dirty: false, version: 1, editorCount: 1, isNew: false, static: true };
+		const editorIds = [...group.editorIds, editor.id];
+		this.state = {
+			...s,
+			documents: { ...s.documents, [uri]: document },
+			editors: { ...s.editors, [editor.id]: editor },
+			groups: { ...s.groups, [group.id]: { ...group, editorIds, activeEditorIndex: editorIds.length - 1 } },
+		};
+	}
+
+	/**
+	 * Split a group: a new active group with an editor on the group's active document.
+	 *
+	 * @param groupId - The group to split.
+	 * @returns The new group's id.
+	 */
+	splitGroupWithDocument(groupId: string): string {
+		const s = this.state;
+		const group = s.groups[groupId];
+		assert.ok(group, `group ${groupId} exists`);
+		const id = `group-${++this.groupSeq}`;
+		const activeId = group.editorIds[group.activeEditorIndex];
+		const active = activeId !== undefined ? s.editors[activeId] : undefined;
+		const shown = active !== undefined ? s.documents[active.documentUri] : undefined;
+		if (active === undefined || shown === undefined) {
+			this.state = { ...s, groups: { ...s.groups, [id]: { id, editorIds: [], activeEditorIndex: -1 } }, activeGroupId: id };
+			return id;
+		}
+		const editor = this.newEditor(active.documentUri, active.label);
+		this.state = {
+			documents: { ...s.documents, [shown.uri]: { ...shown, editorCount: shown.editorCount + 1 } },
+			editors: { ...s.editors, [editor.id]: editor },
+			groups: { ...s.groups, [id]: { id, editorIds: [editor.id], activeEditorIndex: 0 } },
+			activeGroupId: id,
+		};
+		return id;
+	}
+
+	/**
+	 * Close one editor (an unknown id is ignored, as the shell does).
+	 *
+	 * @param editorId - The editor to close.
+	 */
+	closeEditor(editorId: string): void {
+		const s = this.state;
+		const editor = s.editors[editorId];
+		if (editor === undefined) return;
+		const { [editorId]: _closed, ...editors } = s.editors;
+
+		let groups = { ...s.groups };
+		let activeGroupId = s.activeGroupId;
+		const owner = Object.values(groups).find((group) => group.editorIds.includes(editorId));
+		if (owner !== undefined) {
+			const index = owner.editorIds.indexOf(editorId);
+			const editorIds = owner.editorIds.filter((id) => id !== editorId);
+			if (editorIds.length === 0 && Object.keys(groups).length > 1) {
+				const { [owner.id]: _removed, ...rest } = groups;
+				groups = rest;
+				const remaining = Object.keys(groups);
+				if (activeGroupId === owner.id) activeGroupId = remaining[remaining.length - 1] as string;
+			} else {
+				let activeEditorIndex = owner.activeEditorIndex;
+				if (activeEditorIndex >= editorIds.length) activeEditorIndex = Math.max(0, editorIds.length - 1);
+				if (activeEditorIndex > index) activeEditorIndex -= 1;
+				groups[owner.id] = { ...owner, editorIds, activeEditorIndex };
+			}
+		}
+
+		let documents = s.documents;
+		const document = documents[editor.documentUri];
+		if (document !== undefined) {
+			if (document.editorCount <= 1 && !document.dirty) {
+				const { [editor.documentUri]: _released, ...rest } = documents;
+				documents = rest;
+			} else {
+				documents = { ...documents, [editor.documentUri]: { ...document, editorCount: document.editorCount - 1 } };
+			}
+		}
+
+		this.state = { documents, editors, groups, activeGroupId };
+	}
+
+	/**
+	 * Build an editor with the next id.
+	 *
+	 * @param uri - The document it shows.
+	 * @param label - Its tab label.
+	 * @returns The editor.
+	 */
+	private newEditor(uri: string, label: string): Editor {
+		return { id: `editor-${++this.editorSeq}`, documentUri: uri, scrollTop: 0, scrollLeft: 0, cursorLine: 1, cursorColumn: 1, label };
+	}
+}
+
 /**
  * A document model holding the Connections landing plus one tab of every
  * connection-scoped kind for `key`, with the query tab also split into a
@@ -59,8 +216,8 @@ import { registerEndpoint } from './support';
  * @param key - The endpoint key the tabs belong to.
  * @returns The document model.
  */
-function docsWithEveryTab(key: string): Documents {
-	const docs = new Documents();
+function docsWithEveryTab(key: string): FakeDocs {
+	const docs = new FakeDocs();
 	docs.openStaticDocument(CONNECTIONS_URI, 'Connections');
 	docs.openStaticDocument(connectionUri(key), 'Orders DB', { key });
 	docs.openStaticDocument(tableDataUri(key, 'odd:name'), 'odd:name', { key });
@@ -68,7 +225,7 @@ function docsWithEveryTab(key: string): Documents {
 	docs.openStaticDocument(diagramUri(key), 'Diagram', { key });
 	const query = nextQueryDoc(key);
 	docs.openStaticDocument(query.uri, query.label, { key });
-	docs.splitGroupWithDocument(docs.getState().activeGroupId, 'horizontal');
+	docs.splitGroupWithDocument(docs.getState().activeGroupId);
 	return docs;
 }
 
@@ -78,7 +235,7 @@ function docsWithEveryTab(key: string): Documents {
  * @param docs - The document model.
  * @returns The URIs, sorted.
  */
-function openUris(docs: Documents): string[] {
+function openUris(docs: FakeDocs): string[] {
 	return Object.values(docs.getState().editors).map((editor) => editor.documentUri).sort();
 }
 
@@ -142,7 +299,7 @@ describe('closeConnectionDocuments', () => {
 	});
 
 	it('closes nothing when only the landing is open', () => {
-		const docs = new Documents();
+		const docs = new FakeDocs();
 		docs.openStaticDocument(CONNECTIONS_URI, 'Connections');
 		assert.equal(closeConnectionDocuments(docs), 0);
 		assert.deepEqual(openUris(docs), [CONNECTIONS_URI]);
@@ -249,11 +406,20 @@ describe('forgetConnectionScope', () => {
 		forgetConnectionScope(null);
 
 		const after = gatedClient(false, 'next_team_db');
-		// Joining the dropped read would wait on it for ever; give up after a second.
-		const settled = await Promise.race([
-			refreshSchema(after.client, endpoint).then(() => 'answered'),
-			new Promise<string>((resolve) => setTimeout(() => resolve('joined'), 1000)),
-		]);
+		// Joining the dropped read would wait on it for ever; give up after a
+		// second. The timer is cleared either way, so the run does not wait it out.
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		let settled: string;
+		try {
+			settled = await Promise.race([
+				refreshSchema(after.client, endpoint).then(() => 'answered'),
+				new Promise<string>((resolve) => {
+					timer = setTimeout(() => resolve('joined'), 1000);
+				}),
+			]);
+		} finally {
+			clearTimeout(timer);
+		}
 		assert.equal(settled, 'answered', 'the read after the change joined the dropped one');
 		assert.ok(after.tools.length > 0);
 		assert.equal(schemaSnapshot(endpoint.key).schema?.database, 'next_team_db');
