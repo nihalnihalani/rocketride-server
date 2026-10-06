@@ -12,7 +12,9 @@ Neo4j clean-up stays inside the run's label.
 Run: python3 -m unittest discover -s scripts/acceptance/graph-explorer/selftest -v
 """
 
+import contextlib
 import importlib
+import io
 import json
 import os
 import re
@@ -428,12 +430,14 @@ class FixturePipelines(unittest.TestCase):
 
     def test_write_graph_is_created_empty_when_missing(self):
         queries = self._fake_falkordb(graphs=['gx_accept'])
-        self.sf.ensure_write_graph()
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.sf.ensure_write_graph()
         self.assertEqual(queries, [(self.sf.E.WRITE_GRAPH, 'CREATE (n) DELETE n')])
 
     def test_existing_write_graph_is_left_unchanged(self):
         queries = self._fake_falkordb(graphs=['gx_accept', self.sf.E.WRITE_GRAPH])
-        self.sf.ensure_write_graph()
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.sf.ensure_write_graph()
         self.assertEqual(queries, [])
 
 
