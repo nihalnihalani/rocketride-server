@@ -1,7 +1,12 @@
-# PROVISIONAL CONTRACT v1 wire fixtures (graph-backend)
+# PROVISIONAL CONTRACT v1 wire fixtures (hand-modelled)
 
-Hand-modelled from CONTRACT v1, NOT produced by driver objects. Replace with the
-driver-generated goldens in ../v1/ when they land (graph-backend will message you).
+Hand-modelled from CONTRACT v1, NOT produced by driver objects or the node tools, and
+not regenerated or checked by CI. The generated sets are in `../v1/` (driver goldens)
+and `../v1/live/` (captures of the real tool path), both from
+`nodes/test/graph_wire_fixtures.py`; graph-ui's tests keep these for the cases those
+sets do not cover (truncation by elements, an exact-limit result, scalars, pre-upgrade
+nodes, schema states).
+
 Ids are sentinels: Neo4j elementId strings, FalkorDB small decimal strings, AGE
 17-digit graphids incl. 11821949021847553 (> 2^53). Same logical graph on all three:
 Alice(Person[,Employee]) -KNOWS-> Bob twice (parallel), Bob -KNOWS-> Alice (reverse),
