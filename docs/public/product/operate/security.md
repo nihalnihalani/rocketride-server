@@ -64,12 +64,17 @@ the broker settings logs a warning at startup, and its RocketRide database
 nodes report that the broker is not configured, both when their configuration
 is saved and when a task starts.
 
-The open-source `set_env` command puts the names it is given that start with
-`ROCKETRIDE_` (in capitals) in the engine's environment and in its `.env`
-file, one exact assignment per line, and ignores the rest. It refuses the
-whole request, changing nothing, when:
+The open-source `set_env` command replaces the engine's whole set of
+`ROCKETRIDE_` settings, in its environment and in its `.env` file, with the
+names it is given that start with `ROCKETRIDE_` (in capitals), one exact
+assignment per line, and ignores the other names it is given. Every
+`ROCKETRIDE_` name it is not given is removed from the environment, and its
+`NAME=value` lines are removed from the `.env` file (a line written as
+`export NAME=value` stays). A request without `env` is handled as an empty
+object, not refused, so it removes all of them. It refuses the whole request,
+changing nothing, when:
 
-- `env` is not an object of names to values;
+- `env` is not an object of names to values (`null`, for example);
 - a name is one of the broker settings or their former names, in any case or
   with surrounding whitespace (refused, not ignored);
 - a `ROCKETRIDE_` name has nothing after the prefix, or anything other than
