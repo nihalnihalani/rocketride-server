@@ -20,6 +20,7 @@ Focus areas:
 
 from __future__ import annotations
 
+import asyncio
 import errno
 import socket
 import sys
@@ -1226,3 +1227,60 @@ async def test_monitor_ttl_leaves_a_zero_ttl_counter_alone(monkeypatch):
 
     assert task._idle_time == 0
     ts.stop_task.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# start_task — the tenant of a task without an organization
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_start_task_without_an_organization_the_runs_own_user_is_the_tenant(db_tasks):
+    """start_task has no organization guard, on purpose: its contract allows
+    a run without one (org_id defaults to '', and the tenant is then the run's
+    own user, data-core's rule), while the callers that must have one
+    (on_execute, on_launch) already refuse to start without it
+    (resolve_org_for_team). That user is the tenant whatever the engine's
+    environment, the pipeline or the caller's env names, never another.
+    """
+    result = await db_tasks.server.start_task(
+        {'command': 'execute', 'arguments': {**db_tasks.spoof, 'pipeline': db_tasks.pipeline()}},
+        MagicMock(),
+        client_id='user-1',
+        user_id='user-1',
+        team_id='team-1',
+        org_id='',
+        env=dict(db_tasks.spoof_env),
+    )
+
+    task = db_tasks.server._task_control[result['token']].task
+    assert (task.org_id, task.client_id) == ('', 'user-1')
+    assert db_tasks.tenants == ['user-1']
+    assert db_tasks.envs[result['token']]['ROCKETRIDE_DB_DSN'] == 'postgresql://role@pooler/user-1'
+
+
+@pytest.mark.asyncio
+async def test_start_task_with_and_without_an_organization_concurrently(db_tasks):
+    """Each task gets its own organization, or its own user without one; none crosses."""
+    starts = [('org-a', 'user-a'), ('', 'user-b'), ('org-c', 'user-c'), ('', 'user-a')]
+
+    results = await asyncio.gather(
+        *(
+            db_tasks.server.start_task(
+                {
+                    'command': 'execute',
+                    'arguments': {'pipeline': {**db_tasks.pipeline(), 'project_id': f'project-{i}'}},
+                },
+                MagicMock(),
+                client_id=user,
+                user_id=user,
+                team_id='team-1',
+                org_id=org,
+            )
+            for i, (org, user) in enumerate(starts)
+        )
+    )
+
+    for (org, user), result in zip(starts, results):
+        assert db_tasks.envs[result['token']]['ROCKETRIDE_DB_DSN'] == f'postgresql://role@pooler/{org or user}'
+    assert sorted(db_tasks.tenants) == sorted(org or user for org, user in starts)

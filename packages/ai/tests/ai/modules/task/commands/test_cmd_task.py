@@ -15,6 +15,7 @@ table ``_store_subcommand_handlers`` directly.
 
 from __future__ import annotations
 
+import asyncio
 from types import MethodType, SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -285,6 +286,198 @@ async def test_on_execute_skips_plan_check_without_pipeline():
     await TaskCommands.on_execute(conn, {'arguments': {}})
 
     conn.verify_plans.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# on_execute -> TaskServer.start_task -> Task: the tenant a task's RocketRide
+# database nodes get (#2203 spoofing gate, end to end). The real TaskServer
+# builds the real Task; the Task records the environment its process would get
+# (Task._build_subprocess_env, where the DSN is resolved) instead of
+# launching one.
+# ---------------------------------------------------------------------------
+
+
+def _spoofing_execute_request(db_tasks):
+    """An execute request whose arguments name another tenant every way they can."""
+    return {
+        'command': 'execute',
+        'arguments': {
+            **db_tasks.spoof,
+            'pipeline': db_tasks.pipeline(),
+            'teamId': 'victim-team',
+            'env': dict(db_tasks.spoof_env),
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_on_execute_end_to_end_the_tenant_is_the_callers_organization(db_tasks):
+    conn = _make_conn(
+        account_info=_account_info(
+            user_id='user-1', dev_team='team-1', organization={'id': 'org-B', 'teams': [{'id': 'team-1'}]}
+        ),
+        server=db_tasks.server,
+    )
+
+    response = await TaskCommands.on_execute(conn, _spoofing_execute_request(db_tasks))
+
+    token = response['body']['token']
+    task = db_tasks.server._task_control[token].task
+    assert (task.org_id, task.team_id, task.client_id) == ('org-B', 'team-1', 'user-1')
+    assert db_tasks.tenants == ['org-B']
+    assert db_tasks.envs[token]['ROCKETRIDE_DB_DSN'] == 'postgresql://role@pooler/org-B'
+    # Other ROCKETRIDE_* names pass to the task like any other (they are not
+    # identity there); no database setting names another tenant.
+    assert not [k for k, v in db_tasks.envs[token].items() if 'DB_' in k.upper() and 'victim' in v]
+
+
+@pytest.mark.asyncio
+async def test_on_execute_end_to_end_the_tenant_is_the_run_teams_organization(db_tasks, monkeypatch):
+    """A caller allowed on a team outside its own organization (sys.admin)
+    runs in that team's organization, as the account backend records it.
+    """
+    from ai.account import account as account_singleton
+
+    get_team = AsyncMock(return_value={'id': 'team-1', 'orgId': 'org-T'})
+    monkeypatch.setattr(account_singleton, 'get_team', get_team, raising=False)
+    conn = _make_conn(
+        account_info=_account_info(dev_team='team-1', organization={'id': 'org-admin', 'teams': [{'id': 'team-x'}]}),
+        server=db_tasks.server,
+    )
+
+    response = await TaskCommands.on_execute(conn, _spoofing_execute_request(db_tasks))
+
+    get_team.assert_awaited_once_with('team-1')
+    assert db_tasks.tenants == ['org-T']
+    assert db_tasks.envs[response['body']['token']]['ROCKETRIDE_DB_DSN'] == 'postgresql://role@pooler/org-T'
+
+
+@pytest.mark.asyncio
+async def test_on_execute_end_to_end_without_an_organization_starts_nothing(db_tasks, monkeypatch):
+    """on_execute has no user fallback: without an organization for the run
+    team it is denied before any task exists, so no tenant is resolved at all
+    (and in particular not the caller's user or one the request names). The
+    user is the tenant only for a Task started without an organization
+    (TaskServer.start_task; see test_task_server.py).
+    """
+    from ai.account import account as account_singleton
+
+    monkeypatch.setattr(
+        account_singleton, 'get_team', AsyncMock(return_value={'id': 'team-1', 'orgId': ''}), raising=False
+    )
+    # No organization, and none of its teams is the run team.
+    conn = _make_conn(account_info=_account_info(dev_team='team-1', organization={}), server=db_tasks.server)
+
+    with pytest.raises(PermissionError):
+        await TaskCommands.on_execute(conn, _spoofing_execute_request(db_tasks))
+
+    assert db_tasks.tenants == []
+    assert db_tasks.server._task_control == {}
+
+
+@pytest.mark.asyncio
+async def test_on_execute_end_to_end_concurrent_callers_keep_their_own_tenant(db_tasks):
+    """Interleaved starts for two organizations (and two users of one) never cross."""
+    callers = [
+        ('user-a1', 'team-a', 'org-a'),
+        ('user-b1', 'team-b', 'org-b'),
+        ('user-a2', 'team-a', 'org-a'),
+    ]
+    conns = [
+        _make_conn(
+            account_info=_account_info(user_id=user, dev_team=team, organization={'id': org, 'teams': [{'id': team}]}),
+            server=db_tasks.server,
+            connection_id=index + 1,
+        )
+        for index, (user, team, org) in enumerate(callers)
+    ]
+
+    responses = await asyncio.gather(*(TaskCommands.on_execute(c, _spoofing_execute_request(db_tasks)) for c in conns))
+
+    for (user, team, org), response in zip(callers, responses):
+        token = response['body']['token']
+        task = db_tasks.server._task_control[token].task
+        assert (task.org_id, task.client_id) == (org, user)
+        assert db_tasks.envs[token]['ROCKETRIDE_DB_DSN'] == f'postgresql://role@pooler/{org}'
+    assert sorted(db_tasks.tenants) == ['org-a', 'org-a', 'org-b']
+
+
+@pytest.mark.asyncio
+async def test_on_execute_end_to_end_deploy_run_tenant_is_the_organization(db_tasks):
+    """A team-owned deploy run carries no user: the organization is still the tenant."""
+    conn = _make_conn(
+        account_info=_account_info(
+            user_id='', dev_team='team-1', organization={'id': 'org-D', 'teams': [{'id': 'team-1'}]}
+        ),
+        server=db_tasks.server,
+    )
+    conn._trusted_run_kind = 'deploy'
+    conn._trusted_owner_kind = 'team'
+    conn._trusted_trigger = 'schedule'
+
+    response = await TaskCommands.on_execute(conn, _spoofing_execute_request(db_tasks))
+
+    task = db_tasks.server._task_control[response['body']['token']].task
+    assert (task.org_id, task.client_id) == ('org-D', '')
+    assert db_tasks.tenants == ['org-D']
+
+
+def _second_task_request(db_tasks):
+    """A spoofing request for a different project, so it starts a second task."""
+    request = _spoofing_execute_request(db_tasks)
+    request['arguments']['pipeline']['project_id'] = 'project-2'
+    return request
+
+
+@pytest.mark.asyncio
+async def test_on_execute_end_to_end_task_token_keeps_the_stored_organization(db_tasks):
+    """A connection authenticated with a task's tk_ token gets the identity
+    TaskServer builds from the stored task (TASK_CONTROL.orgId); a task it
+    starts runs in that organization, whatever the request names.
+    """
+    owner = _make_conn(
+        account_info=_account_info(
+            user_id='user-1', dev_team='team-1', organization={'id': 'org-S', 'teams': [{'id': 'team-1'}]}
+        ),
+        server=db_tasks.server,
+    )
+    first = await TaskCommands.on_execute(owner, _spoofing_execute_request(db_tasks))
+    identity = await db_tasks.server.authenticate(first['body']['token'])
+    by_token = _make_conn(account_info=identity, server=db_tasks.server, connection_id=2)
+
+    second = await TaskCommands.on_execute(by_token, _second_task_request(db_tasks))
+
+    task = db_tasks.server._task_control[second['body']['token']].task
+    assert task.org_id == 'org-S'
+    assert db_tasks.tenants == ['org-S', 'org-S']
+
+
+@pytest.mark.asyncio
+async def test_on_execute_end_to_end_task_token_of_a_task_without_organization(db_tasks, monkeypatch):
+    """A task started without an organization (its user is its tenant) does
+    not pass that fallback on: a task started with its tk_ token needs the run
+    team's organization, and is refused without one.
+    """
+    from ai.account import account as account_singleton
+
+    monkeypatch.setattr(
+        account_singleton, 'get_team', AsyncMock(return_value={'id': 'team-1', 'orgId': ''}), raising=False
+    )
+    first = await db_tasks.server.start_task(
+        {'command': 'execute', 'arguments': {'pipeline': db_tasks.pipeline()}},
+        MagicMock(),
+        client_id='user-1',
+        user_id='user-1',
+        team_id='team-1',
+        org_id='',
+    )
+    identity = await db_tasks.server.authenticate(first['token'])
+    by_token = _make_conn(account_info=identity, server=db_tasks.server, connection_id=2)
+
+    with pytest.raises(PermissionError):
+        await TaskCommands.on_execute(by_token, _second_task_request(db_tasks))
+
+    assert db_tasks.tenants == ['user-1']
 
 
 # ---------------------------------------------------------------------------
