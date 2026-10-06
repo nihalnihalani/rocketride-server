@@ -143,10 +143,62 @@ test('Run is disabled for as long as a statement runs, and a run that cannot sta
 	assert.ok(/runRefusal\(/.test(confirm), 'so does confirming a write');
 });
 
+// GX-FE-04: the write confirmation is the shell's ConfirmDialog, which focuses its confirm button when it mounts, so an
+// Enter right after Ctrl/Cmd+Enter (or a double Enter) executed the write. WriteConfirmDialog renders that dialog and
+// moves focus to Cancel from its OWN mount effect, which React runs after the dialog's (a parent's effects run after
+// its children's in the same commit).
+// W3-FE04: an effect in RunSurface keyed on the dialog being open was not enough. Under <React.StrictMode> (the shell
+// renders in it) a development build re-runs the mount effects of what was just mounted (the dialog, so Execute takes
+// the focus again) but not RunSurface's update effect, so focus ended on Execute. A mount effect of the component that
+// renders the dialog is re-run with it, after it. No React harness runs here, so the shape is pinned by the source.
+test('the write confirmation opens with focus on Cancel, never on Execute, under StrictMode too', () => {
+	const confirmation = code(read('components', 'WriteConfirmDialog.tsx'));
+	assert.ok(/import \{[^}]*\bfocusCancelIn\b[^}]*\} from 'shared\/explorer\/components\/PatternConfirmDialog';/.test(confirmation), 'the shared focus step is used');
+	assert.ok(/useEffect\(\(\) => \{\s*focusCancelIn\(anchor\.current, WRITE_CANCEL_LABEL\);\s*\}, \[\]\);/.test(confirmation), 'a mount effect of the component that renders the dialog moves focus to Cancel');
+	assert.equal(confirmation.match(/useEffect\(/g)?.length, 1, 'and it is the only effect there');
+	const start = confirmation.indexOf('<ConfirmDialog');
+	assert.ok(start > 0, 'the component renders the shell dialog itself, so it is the dialog\'s parent');
+	const dialog = confirmation.slice(start, confirmation.indexOf('onConfirm={', start));
+	assert.ok(/cancelLabel=\{WRITE_CANCEL_LABEL\}/.test(dialog), 'the Cancel button carries the label the focus step looks for');
+	assert.ok(/message=\{\s*<div ref=\{anchor\}>/.test(dialog), 'the anchor sits inside the dialog');
+
+	const surface = code(read('components', 'RunSurface.tsx'));
+	assert.ok(/import \{ WriteConfirmDialog \} from '\.\/WriteConfirmDialog';/.test(surface));
+	assert.ok(/\{confirm && \(\s*<WriteConfirmDialog\s+content=\{confirm\.content\}/.test(surface), 'the console mounts it while a confirmation is pending');
+	assert.doesNotMatch(surface, /<ConfirmDialog\b/, 'the console renders no write dialog of its own');
+	assert.doesNotMatch(surface, /focusCancelIn|confirmOpen|confirmAnchor/, 'no RunSurface effect moves the focus: StrictMode does not re-run it');
+});
+
+// GX-FE-02: the empty state REPLACED the card grid whenever no endpoint was ready, so a stopped, unreachable or No
+// access node had no card to open, and the reason and Test connection the message points to could not be reached.
+test('the landing renders its cards whenever there are any, under its message, and the empty state alone only when there is no card', () => {
+	const view = code(read('views', 'ConnectionsView.tsx'));
+	assert.ok(/const landing = landingView\(status, endpoints, error\);/.test(view), 'the layout comes from landingView');
+	assert.ok(!/\{empty \? \(/.test(view), 'an empty state still replaces the card grid');
+	assert.ok(/\{landing\.message && !landing\.cards && \(\s*<EmptyState/.test(view), 'the empty state stands alone only without cards');
+	assert.ok(/\{landing\.message && landing\.cards && \(/.test(view), 'with cards, the message sits above them');
+	assert.ok(/\{landing\.cards && \(\s*<div style=\{styles\.cardGrid\}>/.test(view), 'the grid renders whenever there are cards');
+});
+
+// GX-FE-17 (graph half): on a change of user, organization or team (or a sign-out) the shared store forgot every
+// connection, but the open workbench and write-console documents kept the previous identity's results on screen.
+test('a change of identity closes every connection document and clears the per-connection caches', () => {
+	const app = code(read('GraphApp.tsx'));
+	assert.ok(/const fingerprint = identityFingerprint\(identityFromConnectResult\(identity\)\);/.test(app), 'the app tracks the fingerprint the shared store tracks');
+	assert.ok(/useEffect\(\(\) => \{\s*forgetConnections\(getDocs\(\), \{ schemas \}\);\s*\}, \[fingerprint\]\);/.test(app), 'every change of it forgets the connections');
+});
+
 // GX-FE-08: one unkeyed drawer instance served every card, so the last Test result showed on the next card opened.
 test('the connection drawer starts fresh for every card, and words its Test result through testResultText', () => {
 	const view = code(read('views', 'ConnectionsView.tsx'));
 	assert.ok(/<ConnectionDrawer\s+key=\{drawerKey \?\? ''\}/.test(view), 'the drawer is keyed on the card it shows');
 	const drawer = code(read('components', 'ConnectionDrawer.tsx'));
 	assert.ok(/setTested\(testResultText\(result\)\)/.test(drawer), 'a missing result is not read as a failed probe');
+});
+
+// A store reset (sign-out, change of identity) left the drawer open on its key, so it could reopen by itself with the
+// previous identity's Test result once discovery listed the same key again.
+test('the connection drawer closes when the store forgets its card', () => {
+	const view = code(read('views', 'ConnectionsView.tsx'));
+	assert.ok(/useEffect\(\(\) => \{\s*const next = drawerKeyAfter\(drawerKey, endpoints\);\s*if \(next !== drawerKey\) setDrawerKey\(next\);\s*\}, \[drawerKey, endpoints\]\);/.test(view), 'an effect drops a key the store no longer lists');
 });

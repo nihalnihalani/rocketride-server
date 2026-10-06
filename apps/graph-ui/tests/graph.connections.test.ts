@@ -12,7 +12,7 @@ import { test } from 'node:test';
 import type { IExplorerEndpoint, IProbeResult } from 'shared/explorer';
 import { fakeWorld, manualClock, row } from 'shared/explorer/connect/testing';
 import { makeGraphEndpointStore } from '../src/adapters/explorer';
-import { RECHECKING_TEXT, connectionView, emptyState, ownerText, surfaceGate, testResultText } from '../src/graph/connections';
+import { RECHECKING_TEXT, connectionView, drawerKeyAfter, emptyState, landingView, ownerText, surfaceGate, testResultText } from '../src/graph/connections';
 import { fixture } from './support/builders';
 
 function endpoint(over: Partial<IExplorerEndpoint> = {}): IExplorerEndpoint {
@@ -102,6 +102,54 @@ test('failed discovery keeps already discovered endpoints visible instead of an 
 	assert.equal(emptyState('error', [endpoint()], 'refresh failed'), null);
 });
 
+// -----------------------------------------------------------------------------
+// GX-FE-02: the landing hid every card whenever no endpoint was ready
+// -----------------------------------------------------------------------------
+//
+// "Graph nodes found, but none can be used" replaced the card grid whenever no endpoint was 'ready', and 'probing'
+// counted as not ready: every first load and every re-probe said a node was unusable while it was still being
+// checked. And in the genuine stopped / unreachable / No access cases there was no card left to click, so the reason
+// and Test connection that the message points to ("Each card says why") could not be reached.
+
+test('while a node is still being checked, the landing claims nothing about it: its card says Checking', () => {
+	assert.equal(emptyState('ready', [endpoint({ state: 'probing' })], null), null);
+	assert.equal(emptyState('loading', [endpoint({ state: 'probing' })], null), null);
+	assert.equal(emptyState('ready', [endpoint({ state: 'probing' }), endpoint({ key: 'b', state: 'stopped', running: false })], null), null, 'a node still being checked may yet be usable');
+	assert.equal(connectionView(endpoint({ state: 'probing' }), undefined).badge.label, 'Checking');
+});
+
+test('a first discovery whose probe is still in flight shows the card, not "none can be used"', async () => {
+	let release: () => void = () => undefined;
+	const dialect = fixture<Record<string, unknown>>('dialect_neo4j');
+	const world = fakeWorld([row({ pipeline: { project_id: 'proj-g', name: 'Graph pipeline', components: [{ id: 'graph_1', provider: 'graph_neo4j', name: 'Graph' }] } })], (call) => (call.tool === 'dialect' ? new Promise((resolve) => { release = () => resolve(dialect); }) : {}));
+	const clock = manualClock();
+	const store = makeGraphEndpointStore({ clock });
+	const first = store.refresh(world.client);
+	await clock.settle();
+	const during = store.getState();
+	assert.equal(during.endpoints[0]?.state, 'probing', 'the probe really is in flight');
+	assert.equal(emptyState(during.status, during.endpoints, during.error), null, 'no "none can be used" while the probe is in flight');
+	assert.deepEqual(landingView(during.status, during.endpoints, during.error), { message: null, cards: true });
+	release();
+	await first;
+	await clock.settle();
+	const after = store.getState();
+	assert.deepEqual(landingView(after.status, after.endpoints, after.error), { message: null, cards: true });
+});
+
+test('the landing keeps its cards under the message whenever there are cards, and shows the message alone only when there are none', () => {
+	const blocked = landingView('ready', [endpoint({ state: 'stopped', running: false }), endpoint({ key: 'b', state: 'inaccessible' })], null);
+	assert.equal(blocked.message?.kind, 'unreachable');
+	assert.equal(blocked.cards, true, 'each card, its reason and Test connection stay reachable');
+	assert.equal(landingView('loading', [endpoint({ state: 'unreachable' })], null).cards, true, 'a refresh keeps the cards');
+	for (const [status, kind] of [['idle', 'loading'], ['loading', 'loading'], ['error', 'error'], ['ready', 'none-running']] as const) {
+		const alone = landingView(status, [], status === 'error' ? 'getTasks failed' : null);
+		assert.equal(alone.message?.kind, kind, status);
+		assert.equal(alone.cards, false, `${status}: no card to show`);
+	}
+	assert.deepEqual(landingView('ready', [endpoint()], null), { message: null, cards: true });
+});
+
 test('a node that advertises read_query is not badged as needing an upgrade, and one that says false is', () => {
 	const current = connectionView(endpoint(), probeOf('neo4j'));
 	assert.equal(current.badge.label, 'Running');
@@ -178,4 +226,30 @@ test('Test connection says "not tested" when nothing was sent, never that the no
 	const failedProbe = testResultText(failed('connection refused'));
 	assert.equal(failedProbe.variant, 'error');
 	assert.match(failedProbe.text, /did not answer its identity probe/);
+});
+
+// A sign-out or a change of user, organization or team resets the endpoint store. The connection drawer stayed open
+// on its key, so when discovery under the new identity listed the same key it reappeared on its own, still showing
+// the previous identity's Test result.
+test('the connection drawer keeps its card while the store lists it and closes once the store forgets it', async () => {
+	assert.equal(drawerKeyAfter(null, [endpoint()]), null);
+	assert.equal(drawerKeyAfter(endpoint().key, [endpoint()]), endpoint().key);
+	assert.equal(drawerKeyAfter(endpoint().key, [endpoint({ key: 'other' })]), null);
+	assert.equal(drawerKeyAfter(endpoint().key, []), null);
+
+	const world = fakeWorld([row({ pipeline: { project_id: 'proj-g', name: 'Graph pipeline', components: [{ id: 'graph_1', provider: 'graph_neo4j', name: 'Graph' }] } })], (call) => (call.tool === 'dialect' ? fixture<Record<string, unknown>>('dialect_neo4j') : {}));
+	const clock = manualClock();
+	const store = makeGraphEndpointStore({ clock });
+	await store.refresh(world.client);
+	await clock.settle();
+	const key = store.getState().endpoints[0]?.key ?? null;
+	assert.ok(key, 'discovery found the node');
+
+	world.rows = [];
+	await store.refresh(world.client);
+	await clock.settle();
+	assert.equal(drawerKeyAfter(key, store.getState().endpoints), key, 'a node that stopped stays listed, so its drawer stays open');
+
+	store.reset();
+	assert.equal(drawerKeyAfter(key, store.getState().endpoints), null, 'a reset forgets every connection, so the drawer closes');
 });

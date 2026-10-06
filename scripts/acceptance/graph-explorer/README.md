@@ -9,7 +9,10 @@ real databases, and Playwright drives the production shell in real browsers.
 (which stub the engine's tool registration) and the template structure; it
 does not start a graph node in an engine or render the apps in a browser. Run
 these lanes before a release, or when a change touches tool registration or
-dispatch, the shipped templates, the task lifecycle, or the explorer UI.
+dispatch, the shipped templates, the task lifecycle, or the explorer UI. The
+browser lanes can also be run on request as one builder action,
+`./builder graph-ui:e2e-live` (see "Through the builder" below); it is opt-in
+too, and no CI workflow runs it.
 
 Everything here is for **disposable local containers only**. The scripts create
 and drop their own graphs and tables (named below), and every credential they
@@ -193,6 +196,38 @@ below 4.5:1 today, so its contrast rows can fail on text Graph Explorer does
 not colour. `lane_a11y.json` groups each failure by the theme token that drew
 it (`byToken`) and by region, so check those before treating a contrast row as
 a Graph Explorer defect.
+
+### Through the builder
+
+`./builder graph-ui:e2e-live` runs the pass/fail browser lanes (`lane_graph`,
+`lane_sql`, `lane_a11y`, `probe_linenumbers`; not `lane_perf`) against a
+running engine and ends with one summary. It is opt-in: nothing in
+`./builder test`, `graph-ui:test` or CI runs it. It does not set anything up:
+start the engine, the fake broker and the fixtures, and seed the graphs, as
+above. It checks first that `ENGINE_URL` answers, that Playwright loads and
+that every chosen browser starts, and fails with a sentence naming what is
+missing; then it runs each chosen lane once per browser.
+
+```bash
+ENGINE_URL=http://127.0.0.1:5580 ./builder graph-ui:e2e-live
+ENGINE_URL=http://127.0.0.1:5580 GRAPH_UI_E2E_BROWSERS=all GRAPH_UI_E2E_LANES=all ./builder graph-ui:e2e-live
+```
+
+| Variable | Default | Used for |
+| --- | --- | --- |
+| `ENGINE_URL` | none: required | the engine under test (http or https) |
+| `GRAPH_UI_E2E_BROWSERS` | `chrome` | `chrome`, `firefox`, `webkit`, `all`, or a comma list |
+| `GRAPH_UI_E2E_LANES` | `graph,sql,linenumbers` | any of `graph`, `sql`, `a11y`, `linenumbers`, or `all` |
+| `GRAPH_UI_E2E_ENGINES` | `age,neo4j,falkordb` | the graph lane's engines |
+| `OUT_DIR` | `out/e2e` in this folder (git-ignored) | results, in one folder per browser |
+| `PLAYWRIGHT_DIR`, `PLAYWRIGHT_BROWSERS_PATH` | as in "Playwright" above | where Playwright and its browsers are |
+
+`lane_a11y` runs only when named (`GRAPH_UI_E2E_LANES=a11y`, or `all`) until
+the shell's theme tokens pass 4.5:1: its contrast rows fail on the shell text
+described above, so a default run that included it would always fail. When a
+lane run fails, the summary lists up to ten of its failed rows from its JSON
+result in `OUT_DIR/<browser>/`, or its first error line when that run wrote no
+result file.
 
 ### Product screenshots
 

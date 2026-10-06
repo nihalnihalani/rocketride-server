@@ -73,7 +73,9 @@ RocketRide's managed database the graph `rocketride` is created for your
 organization when the database is provisioned.
 
 The app never holds a connection string or a task token in anything it saves or
-shows. Task tokens are kept in memory only, per session.
+shows. Task tokens are kept in memory only, per session. Signing out, or a
+switch to another development team, forgets every connection and closes every
+workbench and write console, so nothing from before stays on screen.
 
 ## The workbench
 
@@ -230,7 +232,8 @@ editor and an **Execute** button, and it always says what it is:
 
 - Before anything is sent, a confirmation lists the statements that look like
   they change data, with their text, and says **This is a text check, not a
-  database safeguard.** There is no "do not ask again". A batch the check does
+  database safeguard.** There is no "do not ask again". **Cancel** has the focus
+  when it opens, so pressing Enter again sends nothing. A batch the check does
   not flag is sent when you press Execute, without a dialog.
 - Statements go through `execute` with the graph result shape, so what a
   statement returned is drawn like any other result. The result line, the strip
@@ -305,3 +308,7 @@ Notes on the code, its tests and the build are in
 [apps/graph-ui/docs/development.md](https://github.com/rocketride-org/rocketride-server/blob/develop/apps/graph-ui/docs/development.md),
 and how apps work in this repository is in
 [docs/development/apps](https://github.com/rocketride-org/rocketride-server/blob/develop/docs/development/apps/index.md).
+The browser lanes run with `ENGINE_URL=<engine> ./builder graph-ui:e2e-live` (opt-in, not part of `builder test` or CI; setup in [scripts/acceptance/graph-explorer/README.md](https://github.com/rocketride-org/rocketride-server/blob/develop/scripts/acceptance/graph-explorer/README.md)).
+By default it runs the graph, SQL and line-number lanes. The contrast lane runs
+only when named (`GRAPH_UI_E2E_LANES=a11y`, or `all`): some of the shell's own
+theme colours are below 4.5:1 today, so it fails on text this app does not colour.
