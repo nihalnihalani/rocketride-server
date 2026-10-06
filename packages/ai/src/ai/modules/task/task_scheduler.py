@@ -144,8 +144,17 @@ class TaskScheduler:
                 self._skip_counts.pop(key, None)
             return
 
+        # A deployment always belongs to an organization (personal @me
+        # deployments too: their record lives in the org, under a user~ slot),
+        # and the entry's org picks whose record and artifact a run reads and
+        # whose identity it gets. Never schedule one without it.
+        schedules = deployment.get('schedules') or {}
+        if schedules and not org_id:
+            error(f'[SCHEDULER] {team_id}/{project_id}: no organization for this deployment; not scheduling it')
+            schedules = {}
+
         scheduled_keys = set()
-        for source_id, sched in (deployment.get('schedules') or {}).items():
+        for source_id, sched in schedules.items():
             cron = (sched or {}).get('cron')
             if not cron or sched.get('paused', False):
                 continue
@@ -380,6 +389,18 @@ class TaskScheduler:
         org_id = entry.org_id
 
         try:
+            # The stored org id picks whose deployment record and artifact are
+            # read and whose identity the run gets (its tenant database
+            # included): without one, read nothing and start nothing, and drop
+            # the entry rather than fail again every tick. sync() never creates
+            # such an entry; this is the last line before a Task is built.
+            if not org_id:
+                error(f'[SCHEDULER] {entry.key}: no organization for this schedule; not dispatching it')
+                current = self._entries.get(entry.key)
+                if current is not None and not current.org_id:
+                    self._entries.pop(entry.key).cancelled = True
+                return
+
             # Re-read the deployment at fire time: a disable/remove/pointer-move
             # or schedule pause between ticks must always win over the in-memory
             # heap.
