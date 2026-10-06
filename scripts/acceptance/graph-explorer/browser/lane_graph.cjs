@@ -22,6 +22,8 @@ const path = require('path');
 
 const [, , base = E.ENGINE_URL, out = E.OUT_DIR, which = 'all', enginesArg = 'neo4j,falkordb,age'] = process.argv;
 const ENGINES = { age: E.FIXTURES.age, neo4j: E.FIXTURES.neo4j, falkordb: E.FIXTURES.falkordb };
+// What the drawer's Engine row must start with for each engine ("Neo4j 5.26.31 Community").
+const ENGINE_ROW = { age: /^Apache AGE \d/, neo4j: /^Neo4j \d/, falkordb: /^FalkorDB \d/ };
 const results = [];
 const MOD = process.platform === 'darwin' ? 'Meta' : 'Control';
 
@@ -40,6 +42,13 @@ async function step(ctx, name, fn) {
 		rec(ctx.browser, ctx.engine, name, false, e.message.split('\n')[0]);
 	}
 	await ctx.page.screenshot({ path: path.join(out, `graph-${ctx.browser}-${ctx.engine}-${name.replace(/[^a-z0-9]+/gi, '_').slice(0, 40)}.png`) }).catch(() => {});
+}
+
+/** The value under the "Engine" label in a drawer's text, or null when the drawer has no Engine row. */
+function engineRowOf(text) {
+	const lines = String(text).split('\n').map((line) => line.trim());
+	const at = lines.findIndex((line) => line.toLowerCase() === 'engine');
+	return at >= 0 && at + 1 < lines.length ? lines[at + 1] : null;
 }
 
 async function typeAndRun(page, text) {
@@ -73,12 +82,16 @@ async function runEngine(browserName, launcher, opts, engine) {
 		});
 		await step(ctx, 'drawer shows engine identity and opens the workbench', async () => {
 			await page.getByText(ENGINES[engine]).first().click();
-			await page.getByRole('button', { name: 'Open workbench' }).waitFor({ timeout: 30000 });
-			const drawer = await page.locator('body').innerText();
-			const ok = /neo4j|falkordb|age|apache/i.test(drawer);
-			await page.getByRole('button', { name: 'Open workbench' }).click();
+			const openWorkbench = page.getByRole('button', { name: 'Open workbench' });
+			await openWorkbench.waitFor({ timeout: 30000 });
+			// Read the drawer's own Engine row (filled from the node's dialect answer). The
+			// landing behind the drawer names every engine, in its subtitle and on the cards.
+			const drawer = page.locator('[role="dialog"]').filter({ has: openWorkbench }).first();
+			await drawer.getByText(ENGINE_ROW[engine]).first().waitFor({ timeout: 30000 }).catch(() => {});
+			const row = engineRowOf(await drawer.innerText());
+			await openWorkbench.click();
 			await page.locator('.monaco-editor .view-lines, textarea').first().waitFor({ timeout: 45000 });
-			return ok;
+			return row !== null && ENGINE_ROW[engine].test(row) ? true : `Engine row: ${JSON.stringify(row)}`;
 		});
 		await step(ctx, 'Cmd/Ctrl+Enter path query draws nodes on the canvas', async () => {
 			await typeAndRun(page, "MATCH p = (a:Person {name: 'Ada GX'})-[:KNOWS*2]->(c) RETURN p");

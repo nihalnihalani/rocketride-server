@@ -15,6 +15,8 @@
  * PLAYWRIGHT_BROWSERS_PATH).
  */
 'use strict';
+// page.evaluate() callbacks run in the browser.
+/* global document */
 const E = require('../env.cjs');
 const { chromium, firefox, webkit } = E.loadPlaywright();
 const fs = require('fs');
@@ -25,7 +27,7 @@ const SQL_TABLE = process.env.SQL_TABLE || 'gx_items';
 const results = [];
 const rec = (browser, name, ok, detail) => {
 	results.push({ browser, name, status: ok ? 'PASS' : 'FAIL', detail });
-	console.log(`  [${ok ? 'PASS' : 'FAIL'}] ${browser}: ${name}${!ok && detail ? ` -- ${String(detail).slice(0, 200)}` : ''}`);
+	console.log(`  [${ok ? 'PASS' : 'FAIL'}] ${browser}: ${name}${!ok && detail ? ` -- ${(typeof detail === 'string' ? detail : JSON.stringify(detail)).slice(0, 200)}` : ''}`);
 };
 
 const signIn = (page) => E.signIn(page, base);
@@ -50,10 +52,21 @@ async function runLane(name, launcher, opts) {
 		rec(name, 'does not list graph nodes', !/graph_neo4j|graph_falkordb|rocketride_graph/.test(body));
 		await page.screenshot({ path: path.join(out, `sql-${name}-connections.png`) });
 
-		// Edit/Delete reachable by accessibility (shell ConnectionCard fix): the card's
-		// button semantics no longer hide its own actions.
-		const snap = await page.locator('body').ariaSnapshot();
-		rec(name, 'connection cards expose button roles', /button/.test(snap));
+		// Edit reachable by accessibility (shell ConnectionCard fix; the SQL cards offer
+		// Edit, not Delete). The landing always has other buttons, so look at the Edit
+		// controls themselves: each must be a button by role and name, with no ancestor
+		// that is a button. A button's descendants are presentational, so an Edit inside
+		// the card's own button is hidden from assistive technology, although
+		// Playwright's role query still finds it; only the DOM shows that.
+		const editControls = await page.evaluate(function editControls() {
+			return [...document.querySelectorAll('[aria-label="Edit"]')].map((e) => ({
+				role: e.getAttribute('role') || e.tagName.toLowerCase(),
+				insideButton: !!(e.parentElement && e.parentElement.closest('[role="button"], button')),
+			}));
+		});
+		const editByRole = await page.getByRole('button', { name: 'Edit', exact: true }).count();
+		const editOk = Array.isArray(editControls) && editControls.length > 0 && editByRole === editControls.length && editControls.every((c) => c.role === 'button' && !c.insideButton);
+		rec(name, 'connection cards expose Edit as a button outside the card button', editOk, { editControls, editByRole });
 
 		// Open the write-enabled connection and run a read through the shared runner.
 		await page.getByText(E.FIXTURES.sqlWrite).first().click();

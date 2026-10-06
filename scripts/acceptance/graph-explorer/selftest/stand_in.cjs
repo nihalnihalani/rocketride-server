@@ -9,6 +9,20 @@
  * page.evaluate() returns what the lane's in-page function would read from a
  * page with nothing on it. A lane check that could not observe what it names
  * must then record FAIL, never PASS. Used by the *.test.cjs files here.
+ *
+ * A test can describe a page instead (runWithStandIn's `page` argument), to
+ * show that a check fails on a page that has everything around what it names
+ * but not the thing itself, and passes on one that has it:
+ *   text      what every innerText() returns (the stand-in has no layout, so
+ *             the body and an element inside it read the same text)
+ *   aria      what every ariaSnapshot() returns
+ *   visible   what every isVisible() returns
+ *   count     what every count() returns
+ *   evaluate  { <name of the in-page function>: what it returns }
+ *   sequence  { <name of the in-page function>: [first call, second call, ...] }
+ *             (the last answer repeats)
+ * The lane is also run with FALKORDB_PORT=9 (nothing listens there), so a step
+ * that checks the database over its own connection observes nothing.
  */
 'use strict';
 
@@ -19,6 +33,9 @@ const { spawnSync } = require('child_process');
 
 const FAKE_PLAYWRIGHT = `
 'use strict';
+// The page the test describes (see stand_in.cjs); empty when it describes none.
+const PAGE = JSON.parse(process.env.STAND_IN_PAGE || '{}');
+const calls = {};
 // What a lane's page.evaluate() callback would return on an empty page.
 function emptyPage(fn, arg) {
 	const src = String(fn);
@@ -27,14 +44,26 @@ function emptyPage(fn, arg) {
 	if (src.includes('line-numbers')) return [];
 	return '';
 }
-// Every other call returns this object; nothing is visible, every text is empty.
+// What it returns on the described page.
+function described(fn, arg) {
+	const name = fn.name;
+	if (PAGE.sequence && Array.isArray(PAGE.sequence[name])) {
+		const answers = PAGE.sequence[name];
+		const n = calls[name] = (calls[name] || 0) + 1;
+		return answers[Math.min(n, answers.length) - 1];
+	}
+	if (PAGE.evaluate && Object.prototype.hasOwnProperty.call(PAGE.evaluate, name)) return PAGE.evaluate[name];
+	return emptyPage(fn, arg);
+}
+// Every other call returns this object; nothing is visible and every text is empty, unless the page says otherwise.
 const handler = {
 	get(_target, prop) {
 		if (prop === 'then') return undefined;
-		if (prop === 'isVisible') return async () => false;
-		if (prop === 'count') return async () => 0;
-		if (prop === 'innerText') return async () => '';
-		if (prop === 'evaluate') return async (fn, arg) => emptyPage(fn, arg);
+		if (prop === 'isVisible') return async () => PAGE.visible === true;
+		if (prop === 'count') return async () => PAGE.count || 0;
+		if (prop === 'innerText') return async () => PAGE.text || '';
+		if (prop === 'ariaSnapshot') return async () => PAGE.aria || '';
+		if (prop === 'evaluate') return async (fn, arg) => described(fn, arg);
 		if (prop === Symbol.toPrimitive) return () => '';
 		return fake;
 	},
@@ -51,8 +80,10 @@ module.exports = { chromium: fake, firefox: fake, webkit: fake };
  * @param {string} lane - File name under browser/, e.g. 'lane_graph.cjs'.
  * @param {string[]} args - Lane arguments after the base URL and output folder.
  * @param {string} resultFile - The JSON file the lane writes into its output folder.
+ * @param {object} [page] - The page to model (see the header); an empty page when omitted.
+ * @param {Record<string, string>} [env] - Extra environment for the lane.
  */
-function runWithStandIn(lane, args, resultFile) {
+function runWithStandIn(lane, args, resultFile, page = {}, env = {}) {
 	const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'gx-selftest-'));
 	try {
 		const pw = path.join(tmp, 'pw', 'node_modules', 'playwright');
@@ -60,7 +91,7 @@ function runWithStandIn(lane, args, resultFile) {
 		fs.writeFileSync(path.join(pw, 'index.js'), FAKE_PLAYWRIGHT);
 		const out = path.join(tmp, 'out');
 		const res = spawnSync(process.execPath, [path.join(__dirname, '..', 'browser', lane), 'http://127.0.0.1:9', out, ...args], {
-			env: { ...process.env, PLAYWRIGHT_DIR: path.join(tmp, 'pw') },
+			env: { ...process.env, FALKORDB_HOST: '127.0.0.1', FALKORDB_PORT: '9', ...env, PLAYWRIGHT_DIR: path.join(tmp, 'pw'), STAND_IN_PAGE: JSON.stringify(page) },
 			encoding: 'utf8',
 			timeout: 60000,
 		});

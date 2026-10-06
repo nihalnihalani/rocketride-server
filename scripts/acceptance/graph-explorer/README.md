@@ -30,7 +30,7 @@ secret. Never point them at a database that holds data you care about.
 | `fake_broker.py` | Local stand-in for the DB broker's `/provision` endpoint, so `rocketride_graph` and `rocketride_sql` resolve a local database. |
 | `validate_all.sh` | Runs every repository gate the feature touches (unit, SDK, node, docs, builds), writes one log per step, and exits non-zero when any step failed. |
 | `browser/lane_graph.cjs` | Graph Explorer in Chrome, Firefox and WebKit: connections, drawer, editor run, canvas, Table/Raw tabs, inspector open and Escape, Expand, schema Refresh, History, write refusal, Ask without an LLM. |
-| `browser/lane_sql.cjs` | SQL Explorer in the three browsers: connections listed (no graph nodes), card roles, a query through the shared runner. |
+| `browser/lane_sql.cjs` | SQL Explorer in the three browsers: connections listed (no graph nodes), each card's Edit reachable as a button (not inside the card's own button), a query through the shared runner. |
 | `browser/lane_a11y.cjs` | Themes, reduced motion, WCAG text contrast on the landing, canvas, Table view and inspector, and relationship-stroke contrast on the drawn graph. |
 | `browser/probe_linenumbers.cjs` | Editor line-number colour and contrast in both themes, both apps. |
 | `browser/lane_perf.cjs`, `browser/gen_perf.py` | Canvas performance on a seeded FalkorDB graph (first draw, pan and drag frame times, long tasks, Expand round trips), Chrome with CPU throttling. |
@@ -247,7 +247,10 @@ lifecycle restart rows, the Graph Explorer Ask and Escape steps, and the
 `lane_a11y.cjs` contrast, stroke and reduced-motion rows cannot pass without
 observing what they name, and that the Neo4j clean-up stays inside `RUN_LABEL`.
 The browser self-tests run the real lane against a stand-in Playwright
-(`selftest/stand_in.cjs`) that models an empty page.
+(`selftest/stand_in.cjs`) that models an empty page, or a page the test
+describes: the SQL Explorer card check fails when a card's Edit sits inside the
+card's own button, and the Graph Explorer drawer check fails when only the
+landing behind the drawer names the engine, or the drawer names another one.
 Run them after changing a script here:
 
 ```bash
