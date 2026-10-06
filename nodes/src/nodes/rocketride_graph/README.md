@@ -248,8 +248,11 @@ once on a new connection, and that second attempt can wait for a free
 connection again. One `read_query` can therefore take up to about three times
 the query timeout plus 16 seconds (106 seconds with the default 30-second
 timeout), longer than the `statement_timeout_ms` that `dialect` reports. `refresh_schema` waits up
-to 65 seconds for another refresh of the same node, then for a connection,
-then runs within its 60-second budget. A client that stops waiting earlier
+to 65 seconds for another refresh of the same node, then gets a connection and
+runs within its 60-second budget; the wait for the connection counts against
+that budget, so the refresh itself takes at most 60 seconds (a refresh whose
+budget runs out fails as a timeout and keeps the previous schema, marked
+stale). A client that stops waiting earlier
 only stops waiting: the database ends the statement at its own timeout.
 
 <!-- ROCKETRIDE:GENERATED:PARAMS START -->

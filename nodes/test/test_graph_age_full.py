@@ -745,6 +745,114 @@ class TestCapabilityProbes:
         _cypher_admin(statement)
 
 
+def _hold_the_only_connection(glb, seconds):
+    """Check out the pool's one connection on another thread for ``seconds``; returns that thread."""
+    held = threading.Event()
+
+    def hold():
+        with glb.pool.connection():
+            held.set()
+            time.sleep(seconds)
+
+    thread = threading.Thread(target=hold)
+    thread.start()
+    assert held.wait(5), 'the holder never got the connection'
+    return thread
+
+
+class _StatementLog:
+    """Wraps a pool so every SQL text run on its connections is recorded (and still run)."""
+
+    def __init__(self, pool):
+        self._pool = pool
+        self.statements = []
+
+    def connection(self, **kw):
+        import contextlib
+
+        log = self.statements
+
+        class Cursor:
+            def __init__(self, cur):
+                self._cur = cur
+
+            def __enter__(self):
+                self._cur.__enter__()
+                return self
+
+            def __exit__(self, *exc):
+                return self._cur.__exit__(*exc)
+
+            def execute(self, query, *args):
+                log.append(query if isinstance(query, str) else repr(query))
+                return self._cur.execute(query, *args)
+
+            def __getattr__(self, name):
+                return getattr(self._cur, name)
+
+        class Conn:
+            def __init__(self, conn):
+                self._conn = conn
+
+            def cursor(self, *a, **k):
+                return Cursor(self._conn.cursor(*a, **k))
+
+            def __getattr__(self, name):
+                return getattr(self._conn, name)
+
+        @contextlib.contextmanager
+        def wrapped():
+            with self._pool.connection(**kw) as conn:
+                yield Conn(conn)
+
+        return wrapped()
+
+    def __getattr__(self, name):
+        return getattr(self._pool, name)
+
+
+class TestSchemaDeadline:
+    """refresh_schema's budget includes the wait for a pooled connection."""
+
+    def test_budget_used_up_while_waiting_for_a_connection_runs_nothing(self, rr_env, age_graph, monkeypatch):
+        from ai.common.graph.schema import SchemaBuilder
+
+        _set_pool_size(rr_env, monkeypatch, 1)
+        glb = _begin(rr_env)
+        holder = _hold_the_only_connection(glb, 0.6)
+        log = _StatementLog(glb.pool)
+        monkeypatch.setattr(glb, 'pool', log)
+        try:
+            with pytest.raises(TimeoutError, match='schema refresh budget exhausted'):
+                glb._reflect_schema_v2(SchemaBuilder(), time.monotonic() + 0.3)
+            assert log.statements == [], 'nothing may run once the budget is spent'
+        finally:
+            holder.join(5)
+            monkeypatch.undo()
+            assert glb.pool.idle == 1, 'the connection goes back to the pool'
+            glb.endGlobal()
+
+    def test_statement_timeout_is_the_budget_left_after_the_wait(self, rr_env, age_graph, monkeypatch):
+        import re
+
+        from ai.common.graph.schema import SchemaBuilder
+
+        _set_pool_size(rr_env, monkeypatch, 1)
+        glb = _begin(rr_env)
+        holder = _hold_the_only_connection(glb, 0.5)
+        log = _StatementLog(glb.pool)
+        monkeypatch.setattr(glb, 'pool', log)
+        try:
+            glb._reflect_schema_v2(SchemaBuilder(), time.monotonic() + 3.0)
+            (timeout,) = [s for s in log.statements if 'statement_timeout' in s]
+            ms = int(re.search(r"'(\d+)ms'", timeout).group(1))
+            assert ms <= 2600, f'statement_timeout {ms} ms ignores the ~500 ms spent waiting for the connection'
+        finally:
+            holder.join(5)
+            monkeypatch.undo()
+            glb.endGlobal()
+
+
 class TestSchemaAndDialect:
     def test_refresh_contents_and_estimated_counts(self, rr_env, age_graph):
         from .test_rocketride_graph_full import GRAPH

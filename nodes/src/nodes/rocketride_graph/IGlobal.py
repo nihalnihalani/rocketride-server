@@ -548,13 +548,17 @@ class IGlobal(GraphGlobalBase):
         by the server. Counts come from pg_class.reltuples (planner
         estimates, never a scan). Edge endpoints come from the label id that
         AGE encodes in the top 16 bits of every graphid, so no join or
-        Cypher text is assembled from label names.
+        Cypher text is assembled from label names. The budget left is
+        measured after the connection is acquired, so time spent waiting for
+        a pool slot counts against it.
         """
-        remaining_ms = int((deadline - time.monotonic()) * 1000)
-        if remaining_ms <= 0:
+        if deadline - time.monotonic() <= 0:
             raise TimeoutError('schema refresh budget exhausted')
         pool = self._require_pool()
         with pool.connection() as conn:
+            remaining_ms = int((deadline - time.monotonic()) * 1000)
+            if remaining_ms <= 0:
+                raise TimeoutError('schema refresh budget exhausted')
             try:
                 with conn.cursor() as cur:
                     cur.execute('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY')
