@@ -88,6 +88,9 @@ const DB_LIVE_SUITES = [
     'test_graph_falkordb_full.py',
     // Regenerates graph-ui's wire fixtures (apps/graph-ui/tests/fixtures/v1) and compares.
     'test_graph_wire_fixtures_full.py',
+    // Starts dist/server's engine itself and calls the shipped Graph Explorer
+    // templates' graph tools through the SDK: the one suite that is not stubbed.
+    'test_graph_toolpath_full.py',
 ];
 
 // Run a second time with RR_TEST_AGE_DSN pointing at a transaction-mode pooler

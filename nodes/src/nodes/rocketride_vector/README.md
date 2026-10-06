@@ -1,8 +1,9 @@
 # rocketride_vector
 
 A RocketRide vector store node that stores embedded document chunks and retrieves
-them by keyword or semantic similarity from the managed tenant database. Pick it
-over the SQL and graph nodes for retrieval-augmented document search.
+them by keyword or semantic similarity from your organization's managed
+RocketRide database. Pick it over the SQL and graph nodes for retrieval-augmented
+document search.
 
 ## What it does
 
@@ -25,11 +26,13 @@ execution surface.
 ## Configuration
 
 The single cloud profile provides a table, cosine similarity, a score threshold,
-and HNSW index defaults. RocketRide provisions a per-tenant database for its
-managed database nodes, and this node resolves it from the signed-in RocketRide
-identity instead of a host, user, password, or database name you enter. Bind an
-embedding module for semantic search; the embedding dimension is taken from the
-first stored document rather than from a configuration field.
+and HNSW index defaults. RocketRide provisions one database per organization for
+its managed database nodes (per user only where there is no organization), and
+the RocketRide server resolves the connection to it from the pipeline's
+organization instead of a host, user, password, or database name you enter;
+nothing in the node configuration or the pipeline can point it at another
+database. Bind an embedding module for semantic search; the embedding dimension
+is taken from the first stored document rather than from a configuration field.
 
 ### Table
 

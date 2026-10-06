@@ -47,7 +47,7 @@
 	// Optional:
 	//		Description to of this driver
 	//
-	"description": ["A RocketRide-managed vector store backed by PostgreSQL + pgvector. Stores ", "and semantically searches high-dimensional embeddings in your own provisioned ", "RocketRide cloud database with zero setup — no host, user, or password to enter; ", "the connection is resolved automatically from your signed-in RocketRide identity. ", "An HNSW index is created on first write so semantic search is fast from the start."],
+	"description": ["A RocketRide-managed vector store backed by PostgreSQL + pgvector. Stores ", "and semantically searches high-dimensional embeddings in your own provisioned ", "RocketRide cloud database with zero setup — no host, user, or password to enter; ", "the server resolves the connection to your organization's database automatically. ", "An HNSW index is created on first write so semantic search is fast from the start."],
 	//
 	// Optional:
 	//	  The icon is the icon to display in the UI for this node

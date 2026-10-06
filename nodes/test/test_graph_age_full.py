@@ -858,6 +858,148 @@ class TestSchemaDeadline:
             glb.endGlobal()
 
 
+def _first_attempt_lost(glb, monkeypatch, seconds):
+    """The call's first attempt takes ``seconds``, then finds its connection lost before the main statement.
+
+    Simulated at the ``_run_plan`` seam, so it behaves the same behind the
+    pooler (TestRecovery shows that a really dropped connection takes this
+    path); the retry runs for real. Returns the start time of each attempt.
+    """
+    module = sys.modules[type(glb).__module__]
+    real_run_plan = glb._run_plan
+    attempts = []
+
+    def run_plan(conn, plan, *args, **kwargs):
+        attempts.append(time.monotonic())
+        if len(attempts) == 1:
+            time.sleep(seconds)
+            lost = psycopg2.OperationalError('server closed the connection unexpectedly')
+            raise module._ConnectionLost(lost, before_main=True)
+        return real_run_plan(conn, plan, *args, **kwargs)
+
+    monkeypatch.setattr(glb, '_run_plan', run_plan)
+    return attempts
+
+
+class _TakenBeforeTheRetry:
+    """Wraps a pool: just before the retry's checkout (``fresh=True``), another caller takes the only connection."""
+
+    def __init__(self, pool):
+        self._pool = pool
+        self._done = threading.Event()
+        self._holder = None
+
+    def connection(self, **kw):
+        if kw.get('fresh') and self._holder is None:
+            held = threading.Event()
+
+            def hold():
+                with self._pool.connection():
+                    held.set()
+                    self._done.wait(30)
+
+            self._holder = threading.Thread(target=hold)
+            self._holder.start()
+            assert held.wait(5), 'the other caller never got the connection'
+        return self._pool.connection(**kw)
+
+    def release(self):
+        self._done.set()
+        if self._holder is not None:
+            self._holder.join(10)
+
+    def __getattr__(self, name):
+        return getattr(self._pool, name)
+
+
+def _setting_ms(text):
+    """PostgreSQL's display of statement_timeout ('580ms', '1s', '2min') in milliseconds."""
+    import re
+
+    number, unit = re.fullmatch(r'(\d+)\s*(ms|s|min)?', text).groups()
+    return int(number) * {'ms': 1, 's': 1000, 'min': 60_000}[unit or 'ms']
+
+
+class TestRetryDeadline:
+    """A call retried after a lost connection gets only what is left of its budget (GX-CT-09).
+
+    The budget is what the first attempt may take: the wait for a connection
+    (the query timeout plus POOL_ACQUIRE_GRACE_S) plus the query timeout. With
+    a 1-second query timeout and a 2-second grace it is 4 seconds.
+    """
+
+    QUERY_TIMEOUT_MS = 1000
+
+    def _begin(self, rr_env, monkeypatch, grace_s=2.0):
+        module = sys.modules[rr_env.iglobal_cls.__module__]
+        monkeypatch.setattr(module, 'POOL_ACQUIRE_GRACE_S', grace_s)
+        _set_pool_size(rr_env, monkeypatch, 1)
+        glb = _begin(rr_env, {'query_timeout_ms': self.QUERY_TIMEOUT_MS})
+        acquire_s = self.QUERY_TIMEOUT_MS / 1000 + grace_s
+        assert glb.pool.acquire_timeout_s == pytest.approx(acquire_s)
+        return glb, acquire_s + self.QUERY_TIMEOUT_MS / 1000
+
+    def test_the_retry_waits_for_a_connection_only_until_the_budget_runs_out(self, rr_env, age_graph, monkeypatch):
+        """3.5 s of a 4 s budget are gone: the retry waits 0.5 s for a connection, not the 3 s acquire timeout."""
+        glb, budget_s = self._begin(rr_env, monkeypatch)
+        _first_attempt_lost(glb, monkeypatch, 3.5)
+        taken = _TakenBeforeTheRetry(glb.pool)
+        monkeypatch.setattr(glb, 'pool', taken)
+        try:
+            started = time.monotonic()
+            with pytest.raises(TimeoutError):
+                glb._run_query('MATCH (p:Person) RETURN count(p) AS c')
+            elapsed = time.monotonic() - started
+            assert elapsed < budget_s + 1.0, f'the call took {elapsed:.2f} s on a {budget_s:g} s budget'
+        finally:
+            taken.release()
+            glb.endGlobal()
+
+    @pytest.mark.parametrize('first_attempt_s, longest_ms', [(0.0, 1000), (3.4, 650)])
+    def test_the_retry_statement_gets_what_is_left_of_the_budget(
+        self, rr_env, age_graph, monkeypatch, first_attempt_s, longest_ms
+    ):
+        """The database itself reports the retry's statement timeout; an early retry keeps the whole query timeout."""
+        glb, _budget_s = self._begin(rr_env, monkeypatch)
+        attempts = _first_attempt_lost(glb, monkeypatch, first_attempt_s)
+        # Shaped like a translated plan: its own SET LOCAL statement_timeout, then the main statement.
+        plan = _plan(
+            [
+                f"SET LOCAL statement_timeout = '{self.QUERY_TIMEOUT_MS}ms'",
+                "SELECT current_setting('statement_timeout')",
+            ],
+            read_only=True,
+            columns=('timeout',),
+        )
+        try:
+            ((setting,),) = glb._execute_plan(plan, fetch_cap=1)
+            assert len(attempts) == 2
+            ms = _setting_ms(setting)
+            if first_attempt_s == 0:
+                assert ms == self.QUERY_TIMEOUT_MS
+            else:
+                assert 100 <= ms <= longest_ms, f'the retry ran with statement_timeout {setting} with ~0.6 s left'
+        finally:
+            glb.endGlobal()
+
+    def test_with_nothing_left_the_retry_runs_nothing(self, rr_env, age_graph, monkeypatch):
+        glb, budget_s = self._begin(rr_env, monkeypatch, grace_s=0.2)
+        attempts = _first_attempt_lost(glb, monkeypatch, budget_s + 0.1)
+        log = _StatementLog(glb.pool)
+        monkeypatch.setattr(glb, 'pool', log)
+        inst = _instance(rr_env, glb)
+        try:
+            with pytest.raises(_graph_tool_error()) as err:
+                inst.read_query({'cypher': 'MATCH (p:Person) RETURN count(p)'})
+            headline, _, detail = str(err.value).partition('\n')
+            assert headline == f'Query timed out after {round(budget_s * 1000)} ms'
+            assert 'no time was left to retry' in detail
+            assert len(attempts) == 1, 'the retry ran with no budget left'
+            assert log.statements == [], 'nothing may run once the budget is spent'
+        finally:
+            glb.endGlobal()
+
+
 class TestSchemaAndDialect:
     def test_refresh_contents_and_estimated_counts(self, rr_env, age_graph):
         from .test_rocketride_graph_full import GRAPH

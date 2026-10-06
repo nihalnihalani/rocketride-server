@@ -111,6 +111,17 @@ class ResultDecodeError(ValueError):
     """A result value the database returned could not be decoded (the statement itself was valid)."""
 
 
+class QueryBudgetExhausted(TimeoutError):
+    """The connection was lost before the statement ran, and the call had no time left to retry it."""
+
+    def __init__(self, budget_ms: int) -> None:
+        super().__init__(
+            'query budget exhausted: the connection was lost before the statement ran, '
+            'and no time was left to retry it on a new connection'
+        )
+        self.budget_ms = budget_ms
+
+
 def _decoded(raw_rows, *, ran: bool = False):
     """Parse each agtype cell, reporting a failure as a result problem, not as invalid Cypher."""
     for row in raw_rows:
@@ -316,12 +327,35 @@ class IGlobal(GraphGlobalBase):
         idle connection, and closes them all: a database or pooler restart
         drops every idle session at once. A failure at or after the main
         statement is never retried — whether it ran is unknown.
+
+        The retry gets only what is left of the call's budget, which is what
+        the first attempt may take: its wait for a connection (the pool's
+        acquire timeout) plus the query timeout. Its wait for a connection
+        stops when the budget runs out (PoolTimeout), its statement timeout is
+        the budget left once it has a connection (never more than the query
+        timeout), and with nothing left it runs nothing and raises
+        :class:`QueryBudgetExhausted`.
         """
         pool = self._require_pool()
+        budget_s = pool.acquire_timeout_s + self.query_timeout_ms / 1000.0
+        deadline = time.monotonic() + budget_s
+        wait_s: Optional[float] = None
         for attempt in (1, 2):
-            with pool.connection(fresh=attempt > 1) as conn:
+            if attempt > 1:
+                wait_s = deadline - time.monotonic()
+                if wait_s <= 0:
+                    raise QueryBudgetExhausted(round(budget_s * 1000))
+            with pool.connection(fresh=attempt > 1, timeout_s=wait_s) as conn:
+                statement_timeout_ms = None
+                if attempt > 1:
+                    left_ms = int((deadline - time.monotonic()) * 1000)
+                    if left_ms <= 0:
+                        raise QueryBudgetExhausted(round(budget_s * 1000))
+                    statement_timeout_ms = min(int(self.query_timeout_ms), left_ms)
                 try:
-                    return self._run_plan(conn, plan, fetch_cap, explain=explain)
+                    return self._run_plan(
+                        conn, plan, fetch_cap, explain=explain, statement_timeout_ms=statement_timeout_ms
+                    )
                 except _ConnectionLost as lost:
                     pool.discard(conn)
                     if lost.before_main and attempt == 1:
@@ -329,7 +363,15 @@ class IGlobal(GraphGlobalBase):
                     raise lost.original from None
         raise AssertionError('unreachable')  # pragma: no cover
 
-    def _run_plan(self, conn, plan: TranslatedQuery, fetch_cap: Optional[int], *, explain: bool) -> List[Tuple]:
+    def _run_plan(
+        self,
+        conn,
+        plan: TranslatedQuery,
+        fetch_cap: Optional[int],
+        *,
+        explain: bool,
+        statement_timeout_ms: Optional[int] = None,
+    ) -> List[Tuple]:
         """Execute ``plan`` on an exclusively owned connection; commit or roll back.
 
         Transaction shape (psycopg2 opens it on the first execute)::
@@ -346,6 +388,10 @@ class IGlobal(GraphGlobalBase):
         savepoint and the statement is deallocated before the final ROLLBACK —
         all inside one transaction, which stays on one server session even
         behind a transaction-mode pooler.
+
+        ``statement_timeout_ms`` (a retry's budget left) is set with one more
+        ``SET LOCAL statement_timeout`` just before the main statement, so it
+        replaces the plan's own.
         """
         if conn.autocommit:
             raise RuntimeError(
@@ -363,6 +409,8 @@ class IGlobal(GraphGlobalBase):
                     cur.execute('SET TRANSACTION READ ONLY')
                 for i, (stmt, binds) in enumerate(zip(plan.statements, plan.binds)):
                     if i == plan.result_index:
+                        if statement_timeout_ms is not None:
+                            cur.execute(f"SET LOCAL statement_timeout = '{max(1, int(statement_timeout_ms))}ms'")
                         if prepared:
                             cur.execute(f'SAVEPOINT {_EXEC_SAVEPOINT}')
                             savepoint = True
@@ -507,6 +555,8 @@ class IGlobal(GraphGlobalBase):
             return 'Query result cannot be represented', str(exc)
         if isinstance(exc, PoolTimeout):
             return 'Database busy: no connection became free in time', str(exc)
+        if isinstance(exc, QueryBudgetExhausted):
+            return f'Query timed out after {exc.budget_ms} ms', f'{exc}; try again.'
         if isinstance(exc, PoolClosed):
             return 'The graph node is shutting down', str(exc)
         if isinstance(exc, DatabaseUnreachable):
