@@ -955,5 +955,44 @@ describe('applyRowLimit — ClickHouse trailing SETTINGS and FORMAT clauses', ()
 	it('leaves PostgreSQL and MySQL statements as before', () => {
 		assert.equal(applyRowLimit('SELECT * FROM events', '200', 'postgres').sql, 'SELECT * FROM events\nLIMIT 200');
 		assert.equal(applyRowLimit('SELECT format FROM t', '200', 'mysql').sql, 'SELECT format FROM t\nLIMIT 200');
+		// Neither clause exists there, so a statement that spells one is appended
+		// to at the end exactly as before this rewrite existed.
+		assert.equal(applyRowLimit('SELECT * FROM t SETTINGS max_threads = 4', '200', 'postgres').sql, 'SELECT * FROM t SETTINGS max_threads = 4\nLIMIT 200');
+		assert.equal(applyRowLimit('SELECT * FROM t FORMAT CSV', '200', 'mysql').sql, 'SELECT * FROM t FORMAT CSV\nLIMIT 200');
+		assert.equal(applyRowLimit('SELECT * FROM t ORDER BY format DESC', '200', 'postgres').sql, 'SELECT * FROM t ORDER BY format DESC\nLIMIT 200');
+	});
+
+	it('inserts it before FORMAT after a LIMIT ... BY, and before SETTINGS when the dialect could not be probed', () => {
+		assert.deepEqual(applyRowLimit('SELECT * FROM events LIMIT 1 BY user_id FORMAT JSONEachRow', '200', 'clickhouse'), {
+			sql: 'SELECT * FROM events LIMIT 1 BY user_id\nLIMIT 200\nFORMAT JSONEachRow',
+			limit: 200,
+			state: 'applied',
+		});
+		assert.equal(applyRowLimit('SELECT * FROM events SETTINGS max_threads = 4', '200', 'unknown').sql, 'SELECT * FROM events\nLIMIT 200\nSETTINGS max_threads = 4');
+	});
+
+	// `ORDER BY format DESC` ends in "format <word>", the shape of a FORMAT
+	// clause; splitting there sends `ORDER BY` with nothing after it, which no
+	// engine parses. A FORMAT clause never follows a word or a sign that still
+	// expects an operand (BY, FROM, JOIN, a comma, a dot).
+	it('does not read an ORDER BY or FROM item named format as the FORMAT clause', () => {
+		const appended = (sql: string, dialect: 'clickhouse' | 'unknown') => assert.equal(applyRowLimit(sql, '200', dialect).sql, `${sql}\nLIMIT 200`);
+		appended('SELECT * FROM t ORDER BY format DESC', 'clickhouse');
+		appended('SELECT * FROM t ORDER BY format DESC', 'unknown');
+		appended('SELECT * FROM t ORDER BY a, format ASC', 'clickhouse');
+		appended('SELECT * FROM t ORDER BY t.format DESC', 'clickhouse');
+		appended('SELECT * FROM format f', 'unknown');
+		appended('SELECT * FROM t JOIN format f USING (id)', 'clickhouse');
+		// The real clause after such an item is still found.
+		assert.equal(applyRowLimit('SELECT * FROM t ORDER BY format DESC FORMAT CSV', '200', 'clickhouse').sql, 'SELECT * FROM t ORDER BY format DESC\nLIMIT 200\nFORMAT CSV');
+	});
+
+	it('does not read a commented-out clause, and keeps a comment that follows the clause on its line', () => {
+		assert.equal(applyRowLimit('SELECT * FROM t -- FORMAT CSV', '200', 'clickhouse').sql, 'SELECT * FROM t -- FORMAT CSV\nLIMIT 200');
+		assert.equal(applyRowLimit('SELECT * FROM t /* SETTINGS max_threads = 4 */', '200', 'clickhouse').sql, 'SELECT * FROM t /* SETTINGS max_threads = 4 */\nLIMIT 200');
+		assert.equal(applyRowLimit('SELECT * FROM t FORMAT CSV -- for the export', '200', 'clickhouse').sql, 'SELECT * FROM t\nLIMIT 200\nFORMAT CSV -- for the export');
+		// ClickHouse also reads `# ` as a line comment; the scanner masks `#` on
+		// MySQL only, so the clause must still be found in front of one.
+		assert.equal(applyRowLimit('SELECT * FROM t FORMAT CSV # for the export', '200', 'clickhouse').sql, 'SELECT * FROM t\nLIMIT 200\nFORMAT CSV # for the export');
 	});
 });

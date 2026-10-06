@@ -246,9 +246,24 @@ function mayLimitByGroup(dialect: SqlDialect): boolean {
  * FORMAT ...`) and rejects a LIMIT that follows either. `FORMAT` must also be
  * the statement's last clause, so a column or alias named `format` or
  * `settings` (`SELECT format FROM t`, `WHERE settings = 1`) never matches.
+ * Only a `;` and comments may follow the format name: `--` and block comments
+ * are masked, but ClickHouse also reads `#` as a line comment, which the
+ * scanner masks on MySQL alone, so an unmasked `# ...` is allowed there too.
  */
 const SETTINGS_CLAUSE_HEAD = /^settings\s+[a-z_][\w]*\s*=/i;
-const FORMAT_CLAUSE = /^format\s+[a-z_][\w]*\s*;?\s*$/i;
+const FORMAT_CLAUSE = /^format\s+[a-z_][\w]*\s*;?\s*(?:#[^\n]*\s*)*$/i;
+
+/**
+ * Masked text before a `settings`/`format` site that still expects an
+ * operand: a comma, an opening parenthesis, a dot, an operator, or a keyword
+ * such as BY, FROM or JOIN. There the word is a column, table or alias name
+ * (`ORDER BY format DESC`, `ORDER BY a, format ASC`, `FROM format f`), never
+ * the trailing clause, which only follows a complete query. `*` is left out
+ * because `SELECT * FORMAT CSV` is a complete ClickHouse query. The word
+ * boundary is the identifier class written out, not `\b`, for the reason
+ * `keywordSites` gives, and without a lookbehind (Safari 13).
+ */
+const EXPECTS_OPERAND = /(?:[,(.=<>+\-/%|&^~!]|(?:^|[^A-Za-z0-9_$\u0080-\uffff])(?:by|from|join|select|distinct|where|prewhere|having|on|using|and|or|not|in|is|like|ilike|between|as|case|when|then|else))\s*$/i;
 
 /**
  * Where a trailing ClickHouse `SETTINGS` or `FORMAT` clause starts (the first
@@ -264,7 +279,7 @@ function trailingClickHouseClauseAt(sql: string, dialect: SqlDialect): number {
 	if (!mayLimitByGroup(dialect)) return -1;
 	const masked = codeOnly(sql, dialect);
 	for (const site of keywordSites(sql, ['settings', 'format'], dialect)) {
-		if (site.depth !== 0) continue;
+		if (site.depth !== 0 || EXPECTS_OPERAND.test(masked.slice(0, site.index))) continue;
 		const rest = masked.slice(site.index);
 		if (site.keyword === 'settings' ? SETTINGS_CLAUSE_HEAD.test(rest) : FORMAT_CLAUSE.test(rest)) return site.index;
 	}
@@ -336,7 +351,8 @@ function inStatementLimitAt(sql: string, dialect: SqlDialect): number {
  * How a result's row limit came about.
  *
  * - `applied` — the app added the header's limit: appended at the end, or
- *   inserted before a trailing locking clause.
+ *   inserted before a trailing locking clause or, on ClickHouse and an
+ *   unprobed dialect, before a trailing `SETTINGS` or `FORMAT` clause.
  * - `in-statement` — the statement carried its own LIMIT, so the app added
  *   none and the row count is the STATEMENT's bound, not the table's size.
  * - `none` — no limit is in play at all.
@@ -348,7 +364,9 @@ export type LimitState = 'applied' | 'in-statement' | 'none';
  *
  * The limit is APPENDED at the end, except on a statement whose last clause is
  * a lock, where it is INSERTED before that clause — the one placement both
- * MySQL and PostgreSQL accept.
+ * MySQL and PostgreSQL accept — and, on ClickHouse or a dialect that could not
+ * be probed, on a statement that ends in `SETTINGS` or `FORMAT`, where it is
+ * inserted before the first of them.
  *
  * A statement that already carries its own LIMIT is left alone: the user's
  * limit governs, and the meta line reports that none was applied by the app.
