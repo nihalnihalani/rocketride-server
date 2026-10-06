@@ -27,16 +27,19 @@
 // The write console only exists on a node that reports `allow_execute`, and it
 // confirms BEFORE sending: one dialog for the whole batch, listing every statement
 // the text check marks as mutating or risky (and how many are plain reads), with the
-// sentence "This is a text check, not a database safeguard." Nothing is sent until
-// the user confirms; there is no "stop asking" option; and no write is ever retried
-// by the app. The text check can miss a write and can flag a read: the node's own
-// permissions are the boundary, and the dialog says so.
+// sentence "This is a text check, not a database safeguard." A batch with any such
+// statement is not sent until the user confirms; a batch the check does not flag is
+// sent when Execute is pressed, with no dialog (the banner and the Run again
+// announcement say so). There is no "stop asking" option, and no write is ever
+// retried by the app. The text check can miss a write and can flag a read: the
+// node's own permissions are the boundary, and the dialog says so.
 //
 // Each statement is sent as its OWN request (`execute` with shape 'graph'), in
 // order, stopping at the first failure; the confirmation says nothing is rolled back.
 // =============================================================================
 
 import { patternCheck } from '../cypher/classify';
+import { targetsToRun } from '../cypher/targets';
 import type { IRunTarget } from 'shared/explorer';
 
 /** The sentence every confirmation carries, word for word. */
@@ -112,4 +115,17 @@ export function confirmationParagraphs(c: IWriteConfirmation): string[] {
 	out.push(TEXT_CHECK_SENTENCE);
 	out.push('Each statement is sent as its own request, in order, and the batch stops at the first error. A statement that has run is not undone if a later one fails.');
 	return out;
+}
+
+/**
+ * What the write console announces when History's "Run again" puts a statement in the editor. Only a statement the
+ * text check flags is confirmed before it is sent, so the sentence says which will happen when Execute is pressed.
+ *
+ * @param text - The statement text loaded into the editor.
+ * @returns The sentence for the live region.
+ */
+export function rerunAnnouncement(text: string): string {
+	return describeWrites(targetsToRun(text, { start: 0, end: 0 }, 0, true)).needed
+		? 'The statement is in the editor. Press Execute to run it; you will be asked to confirm first.'
+		: 'The statement is in the editor. The text check does not take it for a change to data, so Execute sends it without asking first.';
 }
