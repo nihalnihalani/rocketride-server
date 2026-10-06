@@ -44,7 +44,8 @@ The pool is driver-agnostic. The caller supplies:
 - ``close(conn)`` — close quietly.
 
 Waiting is bounded: :meth:`ConnectionPool.connection` raises
-:class:`PoolTimeout` when no connection frees up within ``acquire_timeout_s``.
+:class:`PoolTimeout` when no connection frees up within ``acquire_timeout_s``
+(or the caller's shorter ``timeout_s``, e.g. what is left of a deadline).
 With ``idle_timeout_s`` set, a connection left idle that long is closed (by a
 small daemon thread that wakes every ``min(idle_timeout_s / 2, 5 s)``, so an
 idle node gives its connections back without any further call).
@@ -139,7 +140,7 @@ class ConnectionPool:
     # ------------------------------------------------------------------
 
     @contextmanager
-    def connection(self, *, fresh: bool = False) -> Iterator[Any]:
+    def connection(self, *, fresh: bool = False, timeout_s: Optional[float] = None) -> Iterator[Any]:
         """Check out a connection exclusively for the duration of the block.
 
         The block owns the connection's transaction. On exit — normal or by
@@ -151,8 +152,12 @@ class ConnectionPool:
         after a connection was found dead: a server or pooler restart drops all
         idle sessions at once, and the cheap local usability check cannot see
         that until a statement fails on them.
+
+        ``timeout_s`` shortens the wait for a free connection below
+        ``acquire_timeout_s`` (never lengthens it); with nothing left to wait
+        it still hands out an idle connection or opens one if a slot is free.
         """
-        conn = self._acquire(fresh=fresh)
+        conn = self._acquire(fresh=fresh, timeout_s=timeout_s)
         try:
             yield conn
         finally:
@@ -181,8 +186,9 @@ class ConnectionPool:
         with self._cond:
             self._broken.add(id(conn))
 
-    def _acquire(self, *, fresh: bool = False) -> Any:
-        deadline = time.monotonic() + self.acquire_timeout_s
+    def _acquire(self, *, fresh: bool = False, timeout_s: Optional[float] = None) -> Any:
+        wait_s = self.acquire_timeout_s if timeout_s is None else max(0.0, min(self.acquire_timeout_s, timeout_s))
+        deadline = time.monotonic() + wait_s
         dead: List[Any] = []
         try:
             with self._cond:
@@ -209,7 +215,7 @@ class ConnectionPool:
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         raise PoolTimeout(
-                            f'Timed out after {self.acquire_timeout_s:g} s waiting for a database connection '
+                            f'Timed out after {round(wait_s, 3):g} s waiting for a database connection '
                             f'({self.max_size} in use)'
                         )
                     self._cond.wait(remaining)

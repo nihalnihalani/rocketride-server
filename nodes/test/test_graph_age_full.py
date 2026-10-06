@@ -814,17 +814,22 @@ class _StatementLog:
 class TestSchemaDeadline:
     """refresh_schema's budget includes the wait for a pooled connection."""
 
-    def test_budget_used_up_while_waiting_for_a_connection_runs_nothing(self, rr_env, age_graph, monkeypatch):
+    def test_the_wait_for_a_connection_stops_when_the_budget_runs_out(self, rr_env, age_graph, monkeypatch):
+        """The wait is bounded by the budget left, not by the pool's acquire timeout (query timeout + 5 s)."""
         from ai.common.graph.schema import SchemaBuilder
 
         _set_pool_size(rr_env, monkeypatch, 1)
         glb = _begin(rr_env)
-        holder = _hold_the_only_connection(glb, 0.6)
+        assert glb.pool.acquire_timeout_s > 5
+        holder = _hold_the_only_connection(glb, 2.0)
         log = _StatementLog(glb.pool)
         monkeypatch.setattr(glb, 'pool', log)
         try:
-            with pytest.raises(TimeoutError, match='schema refresh budget exhausted'):
-                glb._reflect_schema_v2(SchemaBuilder(), time.monotonic() + 0.3)
+            started = time.monotonic()
+            with pytest.raises(TimeoutError):
+                glb._reflect_schema_v2(SchemaBuilder(), started + 0.3)
+            waited = time.monotonic() - started
+            assert waited < 1.5, f'waited {waited:.2f} s for a connection on a 0.3 s budget'
             assert log.statements == [], 'nothing may run once the budget is spent'
         finally:
             holder.join(5)

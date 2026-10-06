@@ -326,3 +326,34 @@ def test_close_stops_the_reaper():
     pool.close()
     reaper.join(2)
     assert not reaper.is_alive()
+
+
+def test_a_caller_can_wait_less_than_the_acquire_timeout():
+    """A caller with its own deadline (schema refresh) stops waiting at it (GX-CT-09)."""
+    pool, _ = make_pool(max_size=1, timeout=30.0)
+    with pool.connection():
+        started = time.monotonic()
+        with pytest.raises(pool_mod.PoolTimeout, match=r'^Timed out after 0\.2 s waiting for a database connection'):
+            with pool.connection(timeout_s=0.2):
+                pass
+        assert 0.15 <= time.monotonic() - started < 5
+
+
+def test_a_longer_caller_wait_does_not_extend_the_acquire_timeout():
+    pool, _ = make_pool(max_size=1, timeout=0.1)
+    with pool.connection():
+        started = time.monotonic()
+        with pytest.raises(pool_mod.PoolTimeout, match=r'^Timed out after 0\.1 s'):
+            with pool.connection(timeout_s=60):
+                pass
+        assert time.monotonic() - started < 5
+
+
+@pytest.mark.parametrize('timeout_s', [0, -1])
+def test_no_wait_left_still_hands_out_a_free_connection(timeout_s):
+    pool, opened = make_pool(max_size=1)
+    with pool.connection(timeout_s=timeout_s) as conn:
+        assert conn is opened[0]
+        with pytest.raises(pool_mod.PoolTimeout, match=r'^Timed out after 0 s'):
+            with pool.connection(timeout_s=timeout_s):
+                pass
