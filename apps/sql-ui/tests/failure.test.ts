@@ -995,4 +995,33 @@ describe('applyRowLimit — ClickHouse trailing SETTINGS and FORMAT clauses', ()
 		// MySQL only, so the clause must still be found in front of one.
 		assert.equal(applyRowLimit('SELECT * FROM t FORMAT CSV # for the export', '200', 'clickhouse').sql, 'SELECT * FROM t\nLIMIT 200\nFORMAT CSV # for the export');
 	});
+
+	// The mask blanks string literals and quoted names, so the text before a clause
+	// that follows one used to read as still expecting an operand ('=', FROM, BY).
+	it('finds the clause after a string literal or a quoted name', () => {
+		const inserted = (sql: string, at: string, dialect: 'clickhouse' | 'unknown' = 'clickhouse') => {
+			const i = sql.indexOf(at);
+			assert.equal(applyRowLimit(sql, '200', dialect).sql, `${sql.slice(0, i).trimEnd()}\nLIMIT 200\n${sql.slice(i)}`, sql);
+		};
+		inserted("SELECT * FROM events WHERE kind = 'click' SETTINGS max_threads = 4", 'SETTINGS');
+		inserted("SELECT * FROM events WHERE kind = 'click' FORMAT JSON", 'FORMAT');
+		inserted('SELECT * FROM `events` FORMAT JSON', 'FORMAT');
+		inserted('SELECT * FROM "events" FORMAT JSON', 'FORMAT');
+		inserted('SELECT * FROM db.`events` SETTINGS max_threads = 4', 'SETTINGS');
+		inserted('SELECT * FROM events LIMIT 1 BY `user_id` SETTINGS max_threads = 4', 'SETTINGS');
+		inserted("SELECT 'a' FORMAT JSON", 'FORMAT');
+		inserted("SELECT * FROM t WHERE name LIKE '%x%' FORMAT CSV", 'FORMAT', 'unknown');
+	});
+
+	it('still reads a comment before the clause as no operand at all', () => {
+		assert.equal(applyRowLimit('SELECT * FROM t ORDER BY /* c */ format DESC', '200', 'clickhouse').sql, 'SELECT * FROM t ORDER BY /* c */ format DESC\nLIMIT 200');
+	});
+
+	// ClickHouse also accepts SETTINGS after FORMAT; the limit goes in front of FORMAT.
+	it('inserts it before FORMAT when SETTINGS follows FORMAT', () => {
+		assert.equal(
+			applyRowLimit('SELECT * FROM events FORMAT JSON SETTINGS max_threads = 4', '200', 'clickhouse').sql,
+			'SELECT * FROM events\nLIMIT 200\nFORMAT JSON SETTINGS max_threads = 4',
+		);
+	});
 });
