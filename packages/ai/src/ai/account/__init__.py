@@ -70,10 +70,11 @@ check_db_broker_environment(env_file=engine_env_file())
 account: Account = Account()
 
 # A hosted engine without broker settings starts (other features work), but
-# say so now rather than only when a cloud DB node fails at task start.
+# say so now rather than only when a cloud DB node fails at task start. The
+# engine's .env counts as configured too: the web server loads it later.
 from .base import hosted_db_broker_warning
 
-_broker_warning = hosted_db_broker_warning(account, _sys.argv)
+_broker_warning = hosted_db_broker_warning(account, _sys.argv, env_file=engine_env_file())
 if _broker_warning:
     from rocketlib import warning as _warning
 

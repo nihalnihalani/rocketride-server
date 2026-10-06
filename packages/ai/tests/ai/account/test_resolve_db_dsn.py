@@ -546,6 +546,37 @@ def test_hosted_engine_without_broker_warns_at_startup(account, argv, env, warns
         assert text is None
 
 
+_BROKER = {'RR_DB_BROKER_URL': 'https://b.example', 'RR_DB_BROKER_TOKEN': 't'}
+
+
+@pytest.mark.parametrize(
+    'env,env_file,warns',
+    [
+        ({}, _BROKER, False),  # both settings in the engine's .env only
+        ({'RR_DB_BROKER_URL': 'https://b.example'}, {'RR_DB_BROKER_TOKEN': 't'}, False),  # split across the two
+        ({}, {'RR_DB_BROKER_URL': 'https://b.example'}, True),  # the token is missing everywhere
+        ({}, {'RR_DB_BROKER_URL': 'https://b.example', 'RR_DB_BROKER_TOKEN': ' '}, True),  # blank in .env
+        # A name already in the environment, even empty, is not replaced by .env (load_dotenv without override).
+        ({'RR_DB_BROKER_TOKEN': ''}, _BROKER, True),
+    ],
+)
+def test_hosted_warning_reads_the_engine_env_file(tmp_path, env, env_file, warns):
+    from ai.account.base import hosted_db_broker_warning
+
+    path = tmp_path / '.env'
+    path.write_text(''.join(f'{name}={value}\n' for name, value in env_file.items()), encoding='utf-8')
+    text = hosted_db_broker_warning(_Hosted(), ['engine'], env, env_file=str(path))
+    assert (text is not None) is warns
+
+
+def test_hosted_warning_without_an_env_file_reads_the_environment_only(tmp_path):
+    from ai.account.base import hosted_db_broker_warning
+
+    missing = str(tmp_path / 'absent.env')
+    assert hosted_db_broker_warning(_Hosted(), ['engine'], {}, env_file=missing) is not None
+    assert hosted_db_broker_warning(_Hosted(), ['engine'], dict(_BROKER), env_file=missing) is None
+
+
 # ---------------------------------------------------------------------------
 # OSS set_env: the former broker names cannot be set at runtime either.
 # ---------------------------------------------------------------------------
