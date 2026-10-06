@@ -8,8 +8,10 @@
 // =============================================================================
 
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
 import { test } from 'node:test';
-import { classifyStatement, leadingVerb, patternCheck, statementKind } from '../src/cypher/classify';
+import { SHOW_MODIFIERS, SHOW_TARGETS, WRITE_WORDS, classifyStatement, leadingVerb, patternCheck, statementKind } from '../src/cypher/classify';
 import { codeTokens, tokenize } from '../src/cypher/lexer';
 import { VETTED_PROCEDURES, isVettedProcedure, normalizeProcedure } from '../src/cypher/procedures';
 
@@ -58,9 +60,7 @@ const READS = [
 	'show unique constraints',
 	'SHOW PROCEDURES',
 	'SHOW FUNCTIONS',
-	'SHOW TRANSACTIONS',
-	'SHOW DATABASES',
-	'SHOW SETTINGS',
+	'SHOW NODE PROPERTY TYPE CONSTRAINTS',
 ];
 
 const WRITES: Array<[string, string]> = [
@@ -74,6 +74,10 @@ const WRITES: Array<[string, string]> = [
 	['MATCH (n) WITH n CREATE (m)', 'CREATE'],
 	['UNWIND [1] AS x MERGE (m {id: x}) ON CREATE SET m.a = 1', 'MERGE'],
 	['MATCH (n) FOREACH (x IN [1] | SET n.v = x)', 'FOREACH'],
+	// GQL INSERT, which Neo4j 5 accepts as a synonym of CREATE, mid-statement and first.
+	["MATCH (a:Person {name: 'Ada'}) INSERT (a)-[:KNOWS]->(:Person {name: 'Eve'})", 'INSERT'],
+	['INSERT (:Person {name: $n})', 'INSERT'],
+	['MATCH (n) WITH n DROP INDEX person_name', 'DROP'],
 	["LOAD CSV FROM 'file:///x.csv' AS row RETURN row", 'LOAD CSV'],
 	['DROP INDEX person_name', 'DROP'],
 	['CREATE INDEX FOR (n:Person) ON (n.name)', 'CREATE'],
@@ -109,6 +113,11 @@ const WRITES: Array<[string, string]> = [
 	['USE neo4j MATCH (n) RETURN n', 'unrecognized statement (USE)'],
 	['SHOW USERS', 'unrecognized statement (SHOW)'],
 	['SHOW ROLES', 'unrecognized statement (SHOW)'],
+	// The node's read path refuses every SHOW but schema objects, so these are not reads either.
+	['SHOW TRANSACTIONS', 'unrecognized statement (SHOW)'],
+	['SHOW DATABASES', 'unrecognized statement (SHOW)'],
+	['SHOW DEFAULT DATABASE', 'unrecognized statement (SHOW)'],
+	['SHOW SETTINGS', 'unrecognized statement (SHOW)'],
 	['FOO bar', 'unrecognized statement (FOO)'],
 	['1 + 1', 'unrecognized statement (1)'],
 	['(n)', 'unrecognized statement (()'],
@@ -200,4 +209,55 @@ test('the vetted procedure list is exactly the reviewed six, with no wildcard', 
 	// One part that contains a dot is NOT the two-part name it prints like.
 	assert.equal(isVettedProcedure(['db.labels']), false);
 	assert.deepEqual(normalizeProcedure(['DB', 'Labels']), ['db', 'labels']);
+});
+
+// =============================================================================
+// PARITY WITH THE NODE'S READ PATH (packages/ai/src/ai/common/graph/cypher_safety.py)
+// =============================================================================
+//
+// The text check is the only thing between Execute and a write in the write
+// console, and the browse editor's way of not sending what the node refuses. A
+// word the node's read path counts as a write must make the app ask before it
+// is sent, and the app must not treat as a read a SHOW the node always refuses.
+// These read the node's own sets, so a change on either side fails here.
+
+const CYPHER_SAFETY = path.resolve(__dirname, '..', '..', '..', 'packages', 'ai', 'src', 'ai', 'common', 'graph', 'cypher_safety.py');
+
+/**
+ * The string members of a module-level `NAME = frozenset({...})` in cypher_safety.py.
+ *
+ * @param name - The Python name.
+ * @returns The members, sorted.
+ */
+function nodeSet(name: string): string[] {
+	const source = fs.readFileSync(CYPHER_SAFETY, 'utf8');
+	const match = new RegExp(`^${name} = frozenset\\(\\s*\\{([^}]*)\\}\\s*\\)`, 'm').exec(source);
+	assert.ok(match, `${name} = frozenset({...}) was not found in cypher_safety.py`);
+	const members = [...match[1].matchAll(/'([^']*)'/g)].map((m) => m[1]);
+	assert.ok(members.length > 0, `${name} has no members`);
+	return members.sort();
+}
+
+test("the app's write words, SHOW targets and SHOW modifiers are the node's", () => {
+	assert.deepEqual([...WRITE_WORDS].sort(), nodeSet('_WRITE_WORDS'));
+	assert.deepEqual([...SHOW_TARGETS].sort(), nodeSet('_SHOW_ALLOWED'));
+	assert.deepEqual([...SHOW_MODIFIERS].sort(), nodeSet('_SHOW_MODIFIERS'));
+});
+
+test("every word the node's read path counts as a write is a write here, mid-statement too", () => {
+	for (const word of nodeSet('_WRITE_WORDS')) {
+		for (const text of [`MATCH (n) ${word} (m)`, `MATCH (n) WITH n ${word.toLowerCase()} x`]) {
+			assert.equal(statementKind(text), 'write', text);
+			assert.ok(patternCheck(text)?.kind.includes(word), `${text}: ${patternCheck(text)?.kind}`);
+		}
+	}
+	// Not in clause position, the same words stay names.
+	assert.equal(statementKind('MATCH (n:Insert) RETURN n.insert, {insert: 1}'), 'read');
+});
+
+test("a SHOW is a read exactly when the node's read path allows it", () => {
+	for (const target of nodeSet('_SHOW_ALLOWED')) assert.equal(statementKind(`SHOW ${target}`), 'read', target);
+	for (const target of ['TRANSACTIONS', 'TRANSACTION', 'DATABASES', 'DATABASE', 'SETTINGS', 'SETTING', 'USERS', 'SERVERS', 'ALIASES']) {
+		assert.equal(statementKind(`SHOW ${target}`), 'write', target);
+	}
 });

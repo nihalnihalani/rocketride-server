@@ -32,6 +32,14 @@ test('a batch of reads needs no confirmation', () => {
 	assert.equal(describeWrites([]).needed, false);
 });
 
+// GX-T1-01: a mid-statement GQL INSERT (Neo4j 5's synonym of CREATE) was taken for a read, so the write console sent it
+// with no dialog although the node's own read path counts INSERT as a write.
+test('a mid-statement INSERT is confirmed before it is sent', () => {
+	const c = describeWrites(all("MATCH (a:Person {name: 'Ada'}) INSERT (a)-[:KNOWS]->(:Person {name: 'Eve'})"));
+	assert.equal(c.needed, true);
+	assert.deepEqual(c.mutating.map((m) => m.finding), ['INSERT']);
+});
+
 test('unrecognised or malformed statements are listed as risky, never waved through', () => {
 	const c = describeWrites(all("EXPLAIN MATCH (n) RETURN n; MATCH (n) RETURN 'open"));
 	assert.equal(c.mutating.length, 2);

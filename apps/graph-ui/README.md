@@ -107,9 +107,11 @@ result tabs.
   reachable, a plain text box is used after ten seconds, with the same run keys,
   drafts and history, and a notice says so.
 - **Browsing is read-only.** A statement the text check takes for a write
-  (`CREATE`, `MERGE`, `SET`, `DELETE`, `REMOVE`, `DROP`, `LOAD CSV`, a
-  procedure that is not on the allowlist, and similar) is refused before
-  anything is sent. **This is a text check, not a database safeguard.** The node
+  (`CREATE`, `INSERT`, `MERGE`, `SET`, `DELETE`, `REMOVE`, `DROP`, `LOAD CSV`, a
+  procedure that is not on the allowlist, a `SHOW` of anything but indexes,
+  constraints, functions and procedures, and similar) is refused before
+  anything is sent. The words it looks for are the ones the node's read path
+  refuses. **This is a text check, not a database safeguard.** The node
   refuses writes on its read path as well; what keeps a read read-only depends on
   the node, see [Safety](#safety).
 
