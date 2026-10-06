@@ -117,7 +117,9 @@ mod.actions.push({
 //   ENGINE_URL              required: the engine under test (http or https)
 //   GRAPH_UI_E2E_BROWSERS   chrome (default) | firefox | webkit | all, or a comma list
 //   GRAPH_UI_E2E_LANES      graph,sql,a11y,linenumbers, or all (default: graph,sql,linenumbers)
-//   GRAPH_UI_E2E_ENGINES    graph lane only: age,neo4j,falkordb (default: all three)
+//   GRAPH_UI_E2E_ENGINES    graph lane only: age,neo4j,falkordb (default: all three);
+//                           falkordb also runs the write-console steps, which need the
+//                           write-enabled FalkorDB fixture from start_fixtures.py
 //   OUT_DIR                 results (default: the acceptance folder's git-ignored out/e2e)
 //   PLAYWRIGHT_DIR, PLAYWRIGHT_BROWSERS_PATH   as in the acceptance README
 //

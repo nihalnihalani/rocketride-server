@@ -236,12 +236,14 @@ async function runWriteConsole(browserName, launcher, opts) {
 			await page.keyboard.press(`${MOD}+Enter`);
 			await confirmation.waitFor({ timeout: 15000 });
 			await page.waitForTimeout(300); // the dialog moves the focus to Cancel when it mounts
-			const focus = await page.evaluate(function focusedControl() {
+			// The focused control must be inside the confirmation itself: the drawer
+			// is a dialog too, so a Cancel focused anywhere else must not pass.
+			const focus = await confirmation.evaluate(function focusedControl(dialog) {
 				const el = document.activeElement;
-				return el ? { tag: el.tagName, text: (el.textContent || '').trim(), inDialog: !!el.closest('[role="dialog"]') } : null;
+				return el ? { tag: el.tagName, text: (el.textContent || '').trim(), inConfirmation: dialog.contains(el) } : null;
 			});
 			const listed = (await confirmation.innerText()).includes(run);
-			const ok = !!focus && focus.tag === 'BUTTON' && focus.text === 'Cancel' && focus.inDialog && listed;
+			const ok = !!focus && focus.tag === 'BUTTON' && focus.text === 'Cancel' && focus.inConfirmation && listed;
 			return ok ? true : `focus ${JSON.stringify(focus)}; statement listed ${listed}`;
 		});
 		await step(ctx, 'Cancel sends nothing', async () => {

@@ -1,7 +1,8 @@
 # PROVISIONAL CONTRACT v1 wire fixtures (hand-modelled)
 
 Hand-modelled from CONTRACT v1, NOT produced by driver objects or the node tools, and
-not regenerated or checked by CI. The generated sets are in `../v1/` (driver goldens)
+never regenerated or compared with generator output (graph-ui's tests in CI do read
+them, as below). The generated sets are in `../v1/` (driver goldens)
 and `../v1/live/` (captures of the real tool path), both from
 `nodes/test/graph_wire_fixtures.py`. graph-ui's fixture tests (`graph.fixtures.test.ts`)
 run the per-engine `read_query_*` files here alongside the generated v1 set, through the

@@ -120,7 +120,7 @@ the same way, from the repository root:
 ```bash
 REPO=$PWD
 (cd dist/server && ./engine -c 'import sys; from depends import depends; depends(sys.argv[1])' \
-  $REPO/nodes/test/requirements.txt)
+  "$REPO/nodes/test/requirements.txt")
 ```
 
 Then run the scripts with `./engine <script>` from `dist/server` (shown below).

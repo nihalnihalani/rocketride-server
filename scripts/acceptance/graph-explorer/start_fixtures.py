@@ -130,12 +130,17 @@ def ensure_write_graph() -> None:
     """
     from falkordb import FalkorDB
 
-    db = FalkorDB(host=E.FALKORDB_HOST, port=E.FALKORDB_PORT)
-    if E.WRITE_GRAPH in db.list_graphs():
-        print(f'falkordb graph {E.WRITE_GRAPH} exists (left unchanged)')
-        return
-    db.select_graph(E.WRITE_GRAPH).query('CREATE (n) DELETE n')
-    print(f'falkordb graph {E.WRITE_GRAPH} created (empty)')
+    try:
+        db = FalkorDB(host=E.FALKORDB_HOST, port=E.FALKORDB_PORT)
+        if E.WRITE_GRAPH in db.list_graphs():
+            print(f'falkordb graph {E.WRITE_GRAPH} exists (left unchanged)')
+            return
+        db.select_graph(E.WRITE_GRAPH).query('CREATE (n) DELETE n')
+        print(f'falkordb graph {E.WRITE_GRAPH} created (empty)')
+    except Exception as e:  # noqa: BLE001 - the other fixtures still start
+        # Without FalkorDB only its fixtures fail (each on its own line below);
+        # the SQL, AGE and Neo4j fixtures still start.
+        print(f'FAILED falkordb graph {E.WRITE_GRAPH}: {type(e).__name__}: {str(e)[:200]}')
 
 
 def pipeline(name, project_id, provider, cfg):
