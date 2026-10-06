@@ -60,7 +60,9 @@ accept an optional integer `limit`; absent or invalid limits resolve to 250 and
 the maximum is 25,000. `get_data` returns `{valid, rows, query, row_limit,
 truncated}` on success. Failed validation or execution returns `valid: false`
 with `error`; a non-graph question returns `valid: false` with an `answer`
-instead of rows.
+instead of rows. Generated Cypher follows the `read_query` statement rules
+(no writes, `LOAD CSV`, or procedures outside the read-only allowlist) and is
+returned as an error otherwise.
 
 `get_schema` accepts an optional `label`; an unknown label returns an `error`,
 otherwise the response includes `{database, labels, nodes, relationships}`.

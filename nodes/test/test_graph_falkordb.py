@@ -593,6 +593,39 @@ def test_write_questions_emits_error_for_unsafe_query_not_prose():
     assert any('write or admin' in e for e in emitted)
 
 
+_GENERATED_LOAD_CSV = [
+    "LOAD/**/CSV FROM 'https://example.invalid/a.csv' AS r RETURN r",
+    "MATCH (n) WITH n LOAD/* x */CSV FROM 'file:///a.csv' AS r RETURN r",
+]
+
+
+@pytest.mark.parametrize('cypher', _GENERATED_LOAD_CSV)
+def test_get_data_refuses_generated_load_csv_without_touching_the_server(cypher):
+    """The natural-language paths apply read_query's statement rule; nothing reaches the server."""
+    graph = _FakeGraph(_FakeResult(result_set=[[1]], header=[[1, 'r']]))
+    inst = _instance(_FakeGlobal(graph))
+    inst._buildQueryOnce = lambda *a, **k: {'isValid': True, 'query': cypher}
+
+    out = inst.get_data({'question': 'import a file'})
+
+    assert out == {'error': 'Refused: LOAD CSV is not allowed on the read-only path', 'query': cypher, 'valid': False}
+    assert graph.calls == []
+
+
+@pytest.mark.parametrize('cypher', _GENERATED_LOAD_CSV)
+def test_write_questions_refuses_generated_load_csv_without_touching_the_server(cypher):
+    graph = _FakeGraph(_FakeResult(result_set=[[1]], header=[[1, 'r']]))
+    inst = _instance(_FakeGlobal(graph))
+    inst._buildQueryOnce = lambda *a, **k: {'isValid': True, 'query': cypher}
+    cap = _CapturingInstance({'answers', 'text'})
+    inst.instance = cap
+
+    inst.writeQuestions(_question('import a file'))
+
+    assert cap.text == ['Refused: LOAD CSV is not allowed on the read-only path']
+    assert graph.calls == []
+
+
 def test_get_data_truncated_is_honest_when_limit_exceeds_row_cap():
     """A limit above the node's max_rows must still report truncation, not hide it."""
     # 10 rows exist; the node caps reads at 3, but the caller asks for 1000.

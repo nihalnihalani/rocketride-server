@@ -47,7 +47,9 @@ the configured Max read rows ceiling. A successful result contains
 execution failure returns {valid: false, error, query, rows: []}; a non-graph
 question may instead carry an LLM answer with valid: false.
 
-get_query returns {query, valid: true} only after its safe-query checks.
+get_query returns {query, valid: true} only after its safe-query checks;
+generated Cypher that writes, uses `LOAD CSV` or has unterminated text is
+returned as an error. get_data and the questions lane apply the same checks.
 execute bypasses the read-only gate but still passes Cypher through the AGE
 translation and resource limits; it raises if direct execution is disabled or
 the input is invalid, and otherwise returns {rows, affected_rows}.

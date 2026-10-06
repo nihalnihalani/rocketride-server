@@ -564,3 +564,14 @@ def test_get_query_refuses_generated_procedure_writes():
     inst._buildQuery = lambda question, limit=0: {'isValid': 'true', 'query': "CALL db.createLabel('X')"}
     out = inst.get_query({'question': 'make a label'})
     assert out['valid'] is False and out['error'].startswith('Refused: CALL db.createLabel')
+
+
+def test_get_query_refuses_generated_load_csv():
+    # The shared natural-language gate applies read_query's statement rule.
+    glb = _FakeGlobal(_FakeDriver())
+    inst = _instance(glb)
+    cypher = "LOAD/**/CSV FROM 'https://example.invalid/a.csv' AS r RETURN r"
+    inst._buildQuery = lambda question, limit=0: {'isValid': 'true', 'query': cypher}
+    out = inst.get_query({'question': 'import a file'})
+    assert out == {'error': 'Refused: LOAD CSV is not allowed on the read-only path', 'query': cypher, 'valid': False}
+    assert glb.driver.calls == []

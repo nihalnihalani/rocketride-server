@@ -308,3 +308,53 @@ class TestInvariantAndErrors:
     def test_execute_rejects_unknown_shape(self):
         with pytest.raises(ValueError, match='"shape" must be one of'):
             make(allow_execute=True).execute({'query': 'RETURN 1', 'shape': 'table'})
+
+
+# ---------------------------------------------------------------------------
+# natural-language read paths (get_data, get_query, the questions lane)
+# ---------------------------------------------------------------------------
+
+
+class TestNaturalLanguageGate:
+    """GraphGlobalBase._read_only_refusal applies read_query's statement rule to generated Cypher."""
+
+    @pytest.mark.parametrize(
+        'cypher',
+        [
+            "LOAD/**/CSV FROM 'https://example.invalid/a.csv' AS r RETURN r",
+            "MATCH (n) WITH n LOAD/* x */CSV FROM 'file:///a.csv' AS r RETURN r",
+        ],
+    )
+    def test_load_csv_is_refused_whatever_separates_the_words(self, cypher):
+        assert FakeGlobal()._read_only_refusal(cypher) == 'Refused: LOAD CSV is not allowed on the read-only path'
+
+    def test_unterminated_text_is_refused(self):
+        refusal = FakeGlobal()._read_only_refusal("MATCH (n) WHERE n.x = 'open LOAD/**/CSV FROM 'x' AS r RETURN r")
+        assert refusal == 'Invalid generated query input: unterminated string literal'
+
+    def test_writes_keep_their_message(self):
+        assert (
+            FakeGlobal()._read_only_refusal('MATCH (n) DELETE n') == 'Generated query contains write or admin clauses'
+        )
+
+    @pytest.mark.parametrize(
+        'cypher',
+        [
+            'MATCH (n) RETURN n',
+            "MATCH (n) WHERE n.note = 'LOAD CSV' RETURN n /* LOAD CSV */",
+            'MATCH (n:Load) RETURN n.csv AS csv',
+        ],
+    )
+    def test_reads_pass(self, cypher):
+        assert FakeGlobal()._read_only_refusal(cypher) is None
+
+    def test_get_query_refuses_generated_load_csv(self):
+        inst = make()
+        cypher = "LOAD/**/CSV FROM 'https://example.invalid/a.csv' AS r RETURN r"
+        inst._buildQuery = lambda question, limit=0: {'isValid': True, 'query': cypher}
+        out = inst.get_query({'question': 'import a file'})
+        assert out == {
+            'error': 'Refused: LOAD CSV is not allowed on the read-only path',
+            'query': cypher,
+            'valid': False,
+        }
