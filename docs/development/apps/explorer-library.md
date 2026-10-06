@@ -176,7 +176,7 @@ Failure depends on the **tool**, so each tool gets a `ResultCheck`
 | Tool shape | Failure arrives as | Check |
 |---|---|---|
 | `execute`, `read_query` | the call rejects; the envelope is validated | `checkRowEnvelope` (positional rows, `row_limit`, `truncated`, additive metadata, `truncated_by` null, `rows`, `elements` or `values`); SQL's `execute` answers with object rows and uses `checkObject` |
-| `get_data` | `{valid: false, error}` | `checkValidFlag` |
+| `get_data` | `{valid: false, error}` (`{valid: false, answer}` is a prose answer and passes, as for `get_query`) | `checkValidFlag` |
 | `get_query` | `{valid: false, error}` fails; `{valid: false, answer}` is prose and passes | `checkGetQuery` |
 | store / vector tools | `{success: false, error}` | `checkStoreSuccess` |
 | FalkorDB legacy `query` | `{error, columns: [], rows: []}` | `checkLegacyErrorEnvelope` |
@@ -243,8 +243,8 @@ persists through the shell's workspace preferences, per connection key, and
 writes only while a preferences accessor is attached (see the file header for
 why a background write would be misfiled). SQL Explorer uses `sql.history`,
 `sql.historyRecording`, `sql.patternChecks` and the persisted field `sql`; Graph
-Explorer uses `graph.history`, `graph.historyRecording`, `graph.patternChecks`
-and `cypher`. **These names and the entry shape never change**: renaming one
+Explorer uses `graph.history`, `graph.historyRecording` and `cypher` (it has no
+pattern-check switch: its write confirmation always asks). **These names and the entry shape never change**: renaming one
 silently orphans users' saved history. Mount the accessor with
 `createHistoryPrefsBridge(store)` from `react.tsx`. The store keeps what it read
 after the last bridge detaches and merges it into the next attach, so the bridge

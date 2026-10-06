@@ -41,7 +41,7 @@ import type { IPrefsAccessor } from './types';
 
 /** What distinguishes one flag bag from another. */
 export interface IConnectionFlagsOptions {
-	/** The preference key holding the bag ('sql.patternChecks', 'graph.patternChecks'). */
+	/** The preference key holding the bag (for example 'sql.patternChecks'). */
 	prefKey: string;
 	/** The value of a connection with no stored value. */
 	defaultValue: boolean;

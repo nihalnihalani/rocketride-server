@@ -28,8 +28,7 @@
 //
 //   execute, read_query   a RAISED error (the client rejects) — the check only
 //                         validates the envelope of a call that did not raise
-//   get_data              `{valid: false, error}`
-//   get_query             `{valid: false, error}` is a failure; `{valid: false,
+//   get_data, get_query   `{valid: false, error}` is a failure; `{valid: false,
 //                         answer}` is the model answering in PROSE and is not
 //   store / vector tools  `{success: false, error}` — neither an exception nor
 //                         `{valid: false}`
@@ -123,18 +122,15 @@ export const checkObject: ResultCheck = (value, ctx) => {
 };
 
 /**
- * get_data: `{valid: false, error}` is a failure.
+ * get_data: `{valid: false, error}` is a failure, but `{valid: false, answer}`
+ * passes: the graph and SQL nodes return get_query's prose answer unchanged
+ * when a question is not one their database can answer, a documented result.
  *
  * @param value - The resolved value.
  * @param ctx - The tool being checked.
  * @returns The verdict.
  */
-export const checkValidFlag: ResultCheck = (value, ctx) => {
-	if (!isPlainObject(value)) return malformed(ctx.tool, `expected an object, got ${typeName(value)}`);
-	if (value.valid !== false) return OK;
-	const error = text(value, 'error');
-	return { ok: false, kind: 'invalid', message: error ?? `${ctx.tool} reported valid: false without saying why` };
-};
+export const checkValidFlag: ResultCheck = (value, ctx) => checkGetQuery(value, ctx);
 
 /**
  * get_query: `{valid: false, error}` is a failure, but `{valid: false, answer}`
