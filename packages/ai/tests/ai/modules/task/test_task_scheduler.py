@@ -149,6 +149,31 @@ class TestSync:
         scheduler.sync('org-1', _dep(schedules={'src-1': {'cron': 'not a cron', 'paused': False}}))
         assert not scheduler._entries
 
+    @pytest.mark.parametrize('org_id', ['', None], ids=['empty', 'none'])
+    def test_deployment_without_an_organization_is_not_scheduled(self, scheduler, monkeypatch, org_id):
+        """A deployment always belongs to an organization (personal @me ones
+        included); an entry without one would fire with no tenant.
+        """
+        errors = []
+        monkeypatch.setattr(sched_mod, 'error', errors.append)
+
+        scheduler.sync(org_id, _dep())
+        scheduler.sync(org_id, _dep(team='user~user-1'))
+
+        assert not scheduler._entries
+        assert not [e for e in scheduler._schedule if not e.cancelled]
+        assert errors and all('no organization' in text for text in errors)
+
+    def test_resync_without_an_organization_still_drops_existing_entries(self, scheduler, monkeypatch):
+        monkeypatch.setattr(sched_mod, 'error', lambda text: None)
+        scheduler.sync('org-1', _dep())
+        old = scheduler._entries[('team-1', 'proj-1', 'src-1')]
+
+        scheduler.sync('', _dep())
+
+        assert old.cancelled is True
+        assert not scheduler._entries
+
 
 # ============================================================================
 # _start_run — fire-time behavior
@@ -256,6 +281,54 @@ class TestStartRun:
         await scheduler._start_run(entry)
         dispatch.assert_not_awaited()
         assert not scheduler._entries
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('team', ['team-1', 'user~user-1'], ids=['team-deploy', 'personal-deploy'])
+    async def test_entry_without_an_organization_is_never_dispatched(
+        self, scheduler, account_stub, dispatch, monkeypatch, team
+    ):
+        """The stored org id picks whose deployment record and artifact are
+        read and whose identity the run gets (its tenant database included):
+        an entry without one reads nothing and starts no task, and is dropped
+        so it does not fire again every tick.
+        """
+        errors = []
+        monkeypatch.setattr(sched_mod, 'error', errors.append)
+        key = (team, 'proj-1', 'src-1')
+        entry = sched_mod.ScheduledRun(next_run=time.time(), key=key, org_id='', cron='* * * * *')
+        # As the loop leaves it: the next occurrence requeued, the guard closed.
+        requeued = sched_mod.ScheduledRun(next_run=time.time() + 60, key=key, org_id='', cron='* * * * *')
+        scheduler._entries[key] = requeued
+        scheduler._active_tokens[key] = sched_mod._DISPATCHING
+        account_stub.deployments_get.return_value = _dep(team=team)
+
+        await scheduler._start_run(entry)
+
+        account_stub.deployments_get.assert_not_awaited()
+        account_stub.deployments_artifact.assert_not_awaited()
+        account_stub.deployments_mark_run.assert_not_awaited()
+        dispatch.assert_not_awaited()
+        assert requeued.cancelled is True
+        assert key not in scheduler._entries
+        assert key not in scheduler._active_tokens
+        assert errors and 'no organization' in errors[0]
+
+    @pytest.mark.asyncio
+    async def test_entry_without_an_organization_leaves_a_resynced_entry_alone(
+        self, scheduler, account_stub, dispatch, monkeypatch
+    ):
+        """A sync with the real organization since the tick wins: that entry stays scheduled."""
+        monkeypatch.setattr(sched_mod, 'error', lambda text: None)
+        stale = sched_mod.ScheduledRun(
+            next_run=time.time(), key=('team-1', 'proj-1', 'src-1'), org_id='', cron='@hourly'
+        )
+        live = _entry(scheduler)
+
+        await scheduler._start_run(stale)
+
+        dispatch.assert_not_awaited()
+        assert scheduler._entries[live.key] is live
+        assert live.cancelled is False
 
 
 # ============================================================================
