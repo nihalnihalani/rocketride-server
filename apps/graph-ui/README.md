@@ -289,6 +289,11 @@ editor and an **Execute** button, and it always says what it is:
   node says so with its own text and the app shows it.
 - FalkorDB and Neo4j refuse two columns with the same name; AGE keeps them, and
   the Table shows both.
+- A label or relationship type the app cannot quote for the engine is listed in
+  the sidebar, but its preview says so instead of running: on Apache AGE any
+  name other than letters, digits and `_`, and on FalkorDB a name holding a
+  backtick (FalkorDB cannot parse one inside a quoted name). Write the query by
+  hand to browse it where the engine allows.
 - Performance was checked with results of 100, 300 and 1,000 nodes, and with
   1,000 nodes drawn after **Show more nodes** (a 1,000-node result draws its
   first 300 until then). On an Apple-silicon laptop there were no long tasks

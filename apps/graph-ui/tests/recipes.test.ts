@@ -85,7 +85,13 @@ test('every generated query is a read by the app classifier', () => {
 
 test('label preview quotes the label for the dialect and refuses what cannot be quoted', () => {
 	assert.equal(recipe(labelPreview(ENGINES[0], 'Person')).cypher, 'MATCH (n:`Person`) RETURN n LIMIT 25');
-	assert.equal(recipe(labelPreview(ENGINES[1], 'we`ird')).cypher, 'MATCH (n:`we``ird`) RETURN n LIMIT 25');
+	assert.equal(recipe(labelPreview(ENGINES[0], 'we`ird')).cypher, 'MATCH (n:`we``ird`) RETURN n LIMIT 25');
+	assert.equal(recipe(labelPreview(ENGINES[1], 'we ird')).cypher, 'MATCH (n:`we ird`) RETURN n LIMIT 25');
+	// FalkorDB cannot parse a backtick inside a quoted name: the app says so instead of sending what fails to parse.
+	for (const refusal of [labelPreview(ENGINES[1], 'we`ird'), typePreview(ENGINES[1], 'HAS`TICK')]) {
+		assert.ok(isRefusal(refusal));
+		assert.match(isRefusal(refusal) ? refusal.refusal : '', /cannot be put in a generated query on this engine/);
+	}
 	assert.equal(recipe(labelPreview(ENGINES[2], 'Person')).cypher, 'MATCH (n:Person) RETURN n LIMIT 25');
 	assert.equal(recipe(labelPreview(ENGINES[0], 'Person', 25)).limit, 25);
 	const refused = labelPreview(ENGINES[2], 'has space');
@@ -99,13 +105,13 @@ test('label preview quotes the label for the dialect and refuses what cannot be 
 });
 
 test('an injected label can never break out of its quoting', () => {
-	for (const engine of ENGINES.slice(0, 2)) {
-		const evil = '`) DETACH DELETE n //';
-		const r = recipe(labelPreview(engine, evil));
-		const check = classifyStatement(r.cypher);
-		assert.equal(check.kind, 'read', r.cypher);
-		assert.equal(r.cypher, 'MATCH (n:```) DETACH DELETE n //`) RETURN n LIMIT 25');
-	}
+	const evil = '`) DETACH DELETE n //';
+	const r = recipe(labelPreview(ENGINES[0], evil));
+	const check = classifyStatement(r.cypher);
+	assert.equal(check.kind, 'read', r.cypher);
+	assert.equal(r.cypher, 'MATCH (n:```) DETACH DELETE n //`) RETURN n LIMIT 25');
+	// FalkorDB and AGE have no way to quote a backtick, so the name is refused rather than placed.
+	for (const engine of ENGINES.slice(1)) assert.ok(isRefusal(labelPreview(engine, evil)), engine.dialect);
 });
 
 // GX-T1-02: expand asked for `shown + wanted + 1` rows with nothing left out, so once a node's row cap was below that

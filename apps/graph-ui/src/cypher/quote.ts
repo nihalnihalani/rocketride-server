@@ -34,7 +34,12 @@
 // the user, but a label may contain a backtick, a space or any character, so
 // the rule is "quote exactly as the dialect defines it, or refuse":
 //
-//   - Neo4j, FalkorDB: wrap in backticks, a literal backtick is doubled.
+//   - Neo4j: wrap in backticks, a literal backtick is doubled.
+//   - FalkorDB: wrap in backticks. Its parser has no escape for a backtick
+//     inside a quoted name (a doubled one fails with "Invalid input", FalkorDB
+//     issue #154, checked against a live server), and the FalkorDB node lists
+//     such labels without sampling them for that reason, so a name holding one
+//     is refused.
 //   - Apache AGE: the translator's grammar accepts escaped names, but AGE's own
 //     handling of an escaped LABEL is not proven on a live server, so only a
 //     plain `[A-Za-z_][A-Za-z0-9_]*` name is emitted; anything else is refused
@@ -87,5 +92,6 @@ export function isQuotable(name: string): boolean {
 export function quoteIdentifier(name: string, dialect: GraphDialect): string | null {
 	if (!isQuotable(name)) return null;
 	if (dialect === 'age') return AGE_PLAIN.test(name) ? name : null;
+	if (dialect === 'falkordb') return name.includes('`') ? null : `\`${name}\``;
 	return `\`${name.split('`').join('``')}\``;
 }
