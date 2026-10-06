@@ -143,6 +143,17 @@ test('Run is disabled for as long as a statement runs, and a run that cannot sta
 	assert.ok(/runRefusal\(/.test(confirm), 'so does confirming a write');
 });
 
+// GX-FE-02: the empty state REPLACED the card grid whenever no endpoint was ready, so a stopped, unreachable or No
+// access node had no card to open, and the reason and Test connection the message points to could not be reached.
+test('the landing renders its cards whenever there are any, under its message, and the empty state alone only when there is no card', () => {
+	const view = code(read('views', 'ConnectionsView.tsx'));
+	assert.ok(/const landing = landingView\(status, endpoints, error\);/.test(view), 'the layout comes from landingView');
+	assert.ok(!/\{empty \? \(/.test(view), 'an empty state still replaces the card grid');
+	assert.ok(/\{landing\.message && !landing\.cards && \(\s*<EmptyState/.test(view), 'the empty state stands alone only without cards');
+	assert.ok(/\{landing\.message && landing\.cards && \(/.test(view), 'with cards, the message sits above them');
+	assert.ok(/\{landing\.cards && \(\s*<div style=\{styles\.cardGrid\}>/.test(view), 'the grid renders whenever there are cards');
+});
+
 // GX-FE-08: one unkeyed drawer instance served every card, so the last Test result showed on the next card opened.
 test('the connection drawer starts fresh for every card, and words its Test result through testResultText', () => {
 	const view = code(read('views', 'ConnectionsView.tsx'));

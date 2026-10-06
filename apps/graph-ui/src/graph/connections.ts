@@ -45,6 +45,12 @@
 //                  text gives troubleshooting steps and says what is unknown.
 //   unreachable    nodes were found but none could be reached or used (stopped,
 //                  unreachable, or no permission). They exist; the card says why.
+//
+// A node still being checked (`probing`, on every first load and every re-probe)
+// is not yet unusable, so while any node is being checked the page says nothing
+// about the list: its card says Checking. And a message never takes the cards
+// away: with cards on screen it sits above them (each card's drawer holds the
+// reason and Test connection), and it stands alone only when there is no card.
 // =============================================================================
 
 import type { IExplorerEndpoint, IProbeResult } from 'shared/explorer';
@@ -92,6 +98,14 @@ export interface IEmptyState {
 	description: string;
 	/** What this app cannot tell, stated outright. */
 	unknown: string | null;
+}
+
+/** What the connections page shows: a message, the cards, or the message above the cards. */
+export interface ILandingView {
+	/** The page's message, or null when there is nothing to say. */
+	message: IEmptyState | null;
+	/** True when the card grid is on screen (whenever there is a card). */
+	cards: boolean;
 }
 
 // =============================================================================
@@ -253,8 +267,23 @@ export function emptyState(status: 'idle' | 'loading' | 'ready' | 'error', endpo
 			unknown: 'A graph node that fails to start does not appear in this list at all (for example a node pointed at a graph that does not exist), so an empty list does not tell whether a graph exists for your organization or why a node is missing. Check the pipeline’s log for a start-up error.',
 		};
 	}
+	// A node still being checked may yet be usable: its card says Checking, and the page claims nothing.
+	if (endpoints.some((e) => e.state === 'probing')) return null;
 	if (endpoints.every((e) => e.state !== 'ready')) {
 		return { kind: 'unreachable', title: 'Graph nodes found, but none can be used', description: 'Each card says why: the pipeline is stopped, the node did not answer, or you may not call its tools.', unknown: null };
 	}
 	return null;
+}
+
+/**
+ * What the connections page shows. The cards stay on screen whenever there are any (a message sits above them), so a
+ * card's reason and Test connection are always reachable; the message stands alone only when there is no card.
+ *
+ * @param status - The discovery lifecycle.
+ * @param endpoints - The discovered endpoints.
+ * @param error - The discovery failure text, when it failed.
+ * @returns The message and whether the card grid shows.
+ */
+export function landingView(status: 'idle' | 'loading' | 'ready' | 'error', endpoints: readonly IExplorerEndpoint[], error: string | null): ILandingView {
+	return { message: emptyState(status, endpoints, error), cards: endpoints.length > 0 };
 }

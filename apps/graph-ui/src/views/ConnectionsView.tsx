@@ -31,7 +31,7 @@ import { graphEndpoints } from '../adapters/explorer';
 import { useGraphEndpoints } from '../adapters/react';
 import ConnectionDrawer from '../components/ConnectionDrawer';
 import { getDocs } from '../docs';
-import { connectionView, emptyState } from '../graph/connections';
+import { connectionView, landingView } from '../graph/connections';
 import { workbenchUri } from '../graph/addresses';
 import { GraphIcon } from '../icons';
 import { styles } from '../styles';
@@ -56,7 +56,9 @@ export const ConnectionsView: React.FC = () => {
 		getDocs()?.openStaticDocument(workbenchUri(endpoint.key), endpoint.nodeName || 'Graph', { endpoint });
 	};
 	const drawerEndpoint = endpoints.find((e) => e.key === drawerKey) ?? null;
-	const empty = emptyState(status, endpoints, error);
+	// The cards stay whenever there are any (a message sits above them); the empty state stands alone only without cards.
+	const landing = landingView(status, endpoints, error);
+	const messageText = landing.message ? [landing.message.description, landing.message.unknown].filter(Boolean).join(' ') : '';
 
 	return (
 		<div style={styles.root}>
@@ -75,14 +77,20 @@ export const ConnectionsView: React.FC = () => {
 						<Banner variant="error">Refresh failed: {error}. Showing what was found before.</Banner>
 					</div>
 				)}
-				{empty ? (
+				{landing.message && !landing.cards && (
 					<EmptyState
 						icon={<GraphIcon />}
-						title={empty.title}
-						description={empty.unknown ? `${empty.description} ${empty.unknown}` : empty.description}
-						action={empty.kind === 'loading' ? undefined : <Button variant="primary" onClick={() => { if (client) void graphEndpoints.refresh(client); }} disabled={!client}>Refresh</Button>}
+						title={landing.message.title}
+						description={messageText}
+						action={landing.message.kind === 'loading' ? undefined : <Button variant="primary" onClick={() => { if (client) void graphEndpoints.refresh(client); }} disabled={!client}>Refresh</Button>}
 					/>
-				) : (
+				)}
+				{landing.message && landing.cards && (
+					<div style={{ marginBottom: 16 }}>
+						<Banner variant={landing.message.kind === 'loading' ? 'info' : 'warning'}>{`${landing.message.title}. ${messageText}`}</Banner>
+					</div>
+				)}
+				{landing.cards && (
 					<div style={styles.cardGrid}>
 						{endpoints.map((endpoint) => {
 							const view = connectionView(endpoint, probes[endpoint.key]);
