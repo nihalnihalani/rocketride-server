@@ -30,13 +30,19 @@ const notice = (headline: string): IFailureNotice => ({ variant: 'error', headli
 /** A stand-in for the app's Documents: editors by id, closeEditor removes one, openStaticDocument focuses or opens. */
 function docsWith(uris: string[]): IConnectionDocs & { editors: Record<string, { documentUri: string }>; opened: string[] } {
 	const editors: Record<string, { documentUri: string }> = {};
-	uris.forEach((uri, i) => { editors[`editor-${i + 1}`] = { documentUri: uri }; });
+	uris.forEach((uri, i) => {
+		editors[`editor-${i + 1}`] = { documentUri: uri };
+	});
 	const docs = {
 		editors,
 		opened: [] as string[],
 		getState: () => ({ editors: { ...docs.editors } }),
-		closeEditor: (id: string) => { delete docs.editors[id]; },
-		openStaticDocument: (uri: string) => { docs.opened.push(uri); },
+		closeEditor: (id: string) => {
+			delete docs.editors[id];
+		},
+		openStaticDocument: (uri: string) => {
+			docs.opened.push(uri);
+		},
 	};
 	return docs;
 }
@@ -54,16 +60,30 @@ test('every workbench and write console is closed; the landing stays, and is foc
 	assert.deepEqual(connectionEditorIds(docs.getState().editors), ['editor-2', 'editor-3', 'editor-4']);
 	const schemas = createSchemaStore();
 	assert.equal(forgetConnections(docs, { schemas }), 3);
-	assert.deepEqual(Object.values(docs.editors).map((e) => e.documentUri), [CONNECTIONS_URI]);
+	assert.deepEqual(
+		Object.values(docs.editors).map((e) => e.documentUri),
+		[CONNECTIONS_URI]
+	);
 	assert.deepEqual(docs.opened, [CONNECTIONS_URI]);
 });
 
 test('the per-connection caches are cleared, and a schema load in flight for the previous identity cannot repopulate them', async () => {
 	const schemas = createSchemaStore();
-	await schemas.load(A, async () => fixture('schema_v2'), () => notice('x'));
+	await schemas.load(
+		A,
+		async () => fixture('schema_v2'),
+		() => notice('x')
+	);
 	assert.equal(schemas.get(A).status, 'ready');
 	let land: (value: unknown) => void = () => undefined;
-	const late = schemas.load(B, () => new Promise((resolve) => { land = resolve; }), () => notice('x'));
+	const late = schemas.load(
+		B,
+		() =>
+			new Promise((resolve) => {
+				land = resolve;
+			}),
+		() => notice('x')
+	);
 	forgetConnections(docsWith([workbenchUri(A)]), { schemas });
 	assert.equal(schemas.get(A).status, 'idle');
 	land(fixture('schema_v2'));
