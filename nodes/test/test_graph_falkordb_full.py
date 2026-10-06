@@ -199,6 +199,86 @@ class TestReadOnlyInvariant:
             glb.endGlobal()
 
 
+# Statements FalkorDB reads as LOAD CSV where an earlier tokenizer did not (a
+# number running into a word; a // comment the server ends only at a line
+# feed; a block comment the server ends at the first / after the /*), with the
+# headline each read path returns ({tool}: the tool's name).
+_LOAD_FROM = "LOAD CSV FROM 'https://example.invalid/rr-test.csv' AS r RETURN r"
+_BLOCK_SLASH = "Invalid {tool} input: '/' inside a block comment"
+SPLIT_READINGS = [
+    (f'MATCH (a:Person) WITH a SKIP 0{_LOAD_FROM}', "Invalid {tool} input: the number 0 runs into 'L'"),
+    (f'MATCH (a:Person) WHERE a.age > 0.5{_LOAD_FROM}', "Invalid {tool} input: the number 0.5 runs into 'L'"),
+    (f'MATCH (a:Person) WHERE a.age > 1e3{_LOAD_FROM}', "Invalid {tool} input: the number 1e3 runs into 'L'"),
+    (f"MATCH (a:Person) //\r'\n{_LOAD_FROM} //'", 'Refused: LOAD CSV is not allowed on the read-only path'),
+    (f'MATCH (a:Person) WITH a /*/ {_LOAD_FROM} //*/', _BLOCK_SLASH),
+    (f"MATCH (a:Person) WITH a /*'/{_LOAD_FROM} /*'*/", _BLOCK_SLASH),
+    (f'MATCH (a:Person) WITH a /*`/{_LOAD_FROM} /*`*/', _BLOCK_SLASH),
+    (f'MATCH (a:Person) WITH a /* x / {_LOAD_FROM} //*/', _BLOCK_SLASH),
+]
+
+
+class TestReadQueryRefusals:
+    @pytest.mark.parametrize(
+        'cypher',
+        [
+            "LOAD CSV FROM 'https://example.invalid/rr-test.csv' AS r RETURN r",
+            "MATCH (a:Person) WITH 'file://' + a.name AS f LOAD CSV FROM f AS r RETURN count(r)",
+        ],
+    )
+    def test_load_csv_is_refused(self, falkor_env, falkor_graph, cypher):
+        glb, inst = _start(falkor_env, allow_writes=True)
+        try:
+            with pytest.raises(falkor_env.GraphToolError) as err:
+                inst.read_query({'cypher': cypher})
+            assert str(err.value).startswith('Refused: LOAD CSV is not allowed on the read-only path')
+        finally:
+            glb.endGlobal()
+
+    @pytest.mark.parametrize(
+        'cypher',
+        [
+            "LOAD CSV FROM 'https://example.invalid/rr-test.csv' AS r RETURN r",
+            "MATCH (a:Person) WITH 'file://' + a.name AS f LOAD CSV FROM f AS r RETURN count(r)",
+        ],
+    )
+    def test_query_tool_refuses_load_csv_while_writes_are_off(self, falkor_env, falkor_graph, cypher):
+        glb, inst = _start(falkor_env, allow_writes=False)
+        try:
+            out = inst.query({'cypher': cypher})
+            assert out['error'].startswith('Refused: LOAD CSV is not allowed on the read-only path\n'), out
+            assert out['rows'] == [] and out['row_count'] == 0
+            # Ordinary reads through the same tool are unaffected.
+            ok = inst.query({'cypher': 'MATCH (p:Person) RETURN count(p) AS c'})
+            assert 'error' not in ok and ok['row_count'] == 1
+        finally:
+            glb.endGlobal()
+
+    @pytest.mark.parametrize('cypher,headline', SPLIT_READINGS)
+    def test_the_server_reads_these_statements_as_load_csv(self, falkor_graph, cypher, headline):
+        """EXPLAIN only (nothing runs): the payloads below exercise a real difference in reading."""
+        assert 'Load CSV' in str(falkor_graph.explain(cypher))
+
+    @pytest.mark.parametrize('allow_writes', [False, True])
+    @pytest.mark.parametrize('cypher,headline', SPLIT_READINGS)
+    def test_split_readings_are_refused_on_every_read_path(
+        self, falkor_env, falkor_graph, cypher, headline, allow_writes
+    ):
+        """The URL never resolves: a statement that reached the server would fail as a fetch, not with these headlines."""
+        glb, inst = _start(falkor_env, allow_writes=allow_writes)
+        try:
+            with pytest.raises(falkor_env.GraphToolError) as err:
+                inst.read_query({'cypher': cypher})
+            assert str(err.value).splitlines()[0] == headline.format(tool='read_query')
+            assert glb._read_only_refusal(cypher) == headline.format(tool='generated query')
+            assert glb._validate_query(cypher) == (False, headline.format(tool='generated query'))
+            if not allow_writes:
+                out = inst.query({'cypher': cypher})
+                assert out['error'].splitlines()[0] == headline.format(tool='query'), out
+                assert out['rows'] == [] and out['row_count'] == 0
+        finally:
+            glb.endGlobal()
+
+
 class TestServerLimits:
     def test_resultset_size_is_read_and_respected(self, falkor_env, falkor_graph):
         glb, inst = _start(falkor_env, max_rows=25000)
@@ -211,6 +291,21 @@ class TestServerLimits:
             assert over['row_limit'] == cap - 1 and len(over['rows']) == cap - 1
             assert over['truncated'] is True and over['truncated_by'] == 'rows'
             exact = inst.read_query({'cypher': f'UNWIND range(1, {cap - 1}) AS i RETURN i', 'limit': 25000})
+            assert len(exact['rows']) == cap - 1 and exact['truncated'] is False
+        finally:
+            glb.endGlobal()
+
+    def test_execute_graph_shape_reports_a_resultset_size_cut(self, falkor_env, falkor_graph):
+        glb, inst = _start(falkor_env, allow_execute=True)
+        try:
+            cap = glb.server_result_cap
+            if cap is None:
+                pytest.skip('server does not allow GRAPH.CONFIG GET RESULTSET_SIZE')
+            assert glb.execute_graph_cap == min(glb.max_execute_rows, cap - 1)
+            over = inst.execute({'query': f'UNWIND range(1, {cap + 5000}) AS i RETURN i', 'shape': 'graph'})
+            assert over['row_limit'] == cap - 1 and len(over['rows']) == cap - 1
+            assert over['truncated'] is True and over['truncated_by'] == 'rows'
+            exact = inst.execute({'query': f'UNWIND range(1, {cap - 1}) AS i RETURN i', 'shape': 'graph'})
             assert len(exact['rows']) == cap - 1 and exact['truncated'] is False
         finally:
             glb.endGlobal()

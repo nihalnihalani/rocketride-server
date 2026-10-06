@@ -29,7 +29,8 @@ Inherits the graph tool surface (``get_data``, ``get_schema``, ``get_query``,
 ``execute``, ``dialect``) and the questions lane from ``GraphInstanceBase``.
 
 Adds the two tools specific to FalkorDB, which hosts many graphs on one server:
-``query`` (parameterised read-only Cypher against any graph) and ``list_graphs``.
+``query`` (parameterised Cypher against any graph; read-only, with read_query's
+statement rule, unless ``allow_writes`` is on) and ``list_graphs``.
 """
 
 from __future__ import annotations
@@ -39,6 +40,8 @@ from redis.exceptions import RedisError
 from rocketlib import tool_function
 
 from ai.common.graph import GraphInstanceBase
+from ai.common.graph.cypher_safety import check_read_query_statement
+from ai.common.graph.graph_errors import GraphToolError
 from ai.common.utils import normalize_tool_input
 
 from .IGlobal import IGlobal, _header_names, _serialize_value
@@ -115,6 +118,19 @@ class IInstance(GraphInstanceBase):
         params = args.get('params')
         if params is not None and not isinstance(params, dict):
             raise ValueError('"params" must be an object when provided')
+
+        if not self.IGlobal.allow_writes:
+            # Read-only, so the same statement rule as read_query: no LOAD CSV,
+            # no ambiguous or non-ASCII code.
+            try:
+                check_read_query_statement(
+                    cypher,
+                    tool='query',
+                    detail='With allow_writes off, query reads only graph data.',
+                    ascii_only=self.IGlobal.read_ascii_only,
+                )
+            except GraphToolError as e:
+                return {'error': str(e), 'columns': [], 'rows': [], 'row_count': 0, 'truncated': False}
 
         try:
             graph = self.IGlobal.select_graph(args.get('graph'))

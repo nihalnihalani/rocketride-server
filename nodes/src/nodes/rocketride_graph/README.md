@@ -1,8 +1,8 @@
 # rocketride_graph
 
 A RocketRide graph database node for natural-language Cypher queries against
-the Apache AGE graph in the signed-in tenant's managed database. Pick it over
-rocketride_sql when relationships and traversals are the data model.
+the Apache AGE graph in your organization's managed RocketRide database. Pick it
+over rocketride_sql when relationships and traversals are the data model.
 
 ## What it does
 
@@ -47,7 +47,9 @@ the configured Max read rows ceiling. A successful result contains
 execution failure returns {valid: false, error, query, rows: []}; a non-graph
 question may instead carry an LLM answer with valid: false.
 
-get_query returns {query, valid: true} only after its safe-query checks.
+get_query returns {query, valid: true} only after its safe-query checks;
+generated Cypher that writes, uses `LOAD CSV` or has unterminated text is
+returned as an error. get_data and the questions lane apply the same checks.
 execute bypasses the read-only gate but still passes Cypher through the AGE
 translation and resource limits; it raises if direct execution is disabled or
 the input is invalid, and otherwise returns {rows, affected_rows}.
@@ -58,6 +60,9 @@ read_query takes {cypher, params?, limit?}. The limit defaults to 1,000 and is
 capped by Max read rows (at most 25,000); it is applied as an outer SQL LIMIT
 so the database stops early. It always uses the safe translation path and a
 READ ONLY transaction with the query timeout, whatever allow_execute says.
+A number written straight against a letter, an underscore or a `.` (`0LIMIT`,
+`1.`), or a `/* … */` comment whose text holds a `/` (other engines end such a
+comment at that `/`), is refused as invalid input before translation.
 It returns {columns, rows, row_limit, truncated, truncated_by, element_limit,
 elements, value_limit, values}. Rows are positional, so a result that names
 the same column twice keeps both. Graph ids are AGE's 64-bit graphids as
@@ -66,12 +71,19 @@ WHERE id(n) = toInteger($id). Paths keep traversal order and relationships
 their stored direction; integers beyond 2^53, NaN, Infinity and exact
 numerics are tagged as text. A response stops at 10,000 graph elements or
 500,000 values. Failures raise an error whose first line is a headline:
-"Refused: …" for a write or a firewall rule, "Not supported on Apache AGE
+"Refused: …" for a write, `LOAD CSV` (read_query reads the graph only) or a
+firewall rule, "Not supported on Apache AGE
 1.5.0: <construct>" followed by what to write instead (for example for
 date(), duration(), elementId(), list or pattern comprehensions,
 allShortestPaths and EXISTS subqueries, which AGE 1.5.0 cannot run), "Query
-timed out after N ms", "Invalid read_query input: …" or "Query failed"; the
-remaining lines are the detail.
+timed out after N ms", "Invalid read_query input: …", "Query result cannot
+be represented" (the statement was valid, and on execute it ran, but a value
+it returned could not be decoded), "Database unreachable" or "Query failed";
+the remaining lines are the detail. A connection failure
+never shows the database host, port or role: that detail is written to the
+engine's debug trace only (recorded when that trace level is enabled), and
+callers (including the pipeline start error and the save-time check) see "The
+RocketRide cloud database could not be reached".
 
 get_schema and refresh_schema return the legacy {labels, nodes,
 relationships} keys plus a schema block (version 2): labels and
@@ -102,16 +114,20 @@ list the constructs it cannot use.
 ## Configuration
 
 The single built-in profile supplies the default graph name. RocketRide
-provisions a per-tenant database for its managed database nodes, and this node
-resolves it from the signed-in RocketRide identity instead of a host, user,
-password, or database name you enter. Start with the defaults, then tune the
+provisions one database per organization for its managed database nodes (per
+user only where there is no organization), and the RocketRide server resolves
+the connection to it from the pipeline's organization instead of a host, user,
+password, or database name you enter; nothing in the node configuration or the
+pipeline can point it at another database. Start with the defaults, then tune the
 graph context and read limits around the size and shape of the graph your LLM
 must query.
 
 ### Graph name and graph description
 
-Graph name defaults to rocketride and must name an existing AGE graph; startup
-fails instead of creating a missing graph. Graph description is empty by
+Graph name defaults to rocketride, the graph RocketRide creates when your
+organization's database is first provisioned, and must name an existing AGE
+graph; startup fails instead of creating a missing graph (the error says how
+to create one with `SELECT create_graph(...)`). Graph description is empty by
 default and becomes LLM context, so describe labels, relationship meaning, and
 domain vocabulary when those are not obvious from reflected schema. Change the
 graph name when the tenant database contains multiple AGE graphs; update the
@@ -139,16 +155,16 @@ returned data.
 This setting is off by default. Turning it on permits raw Cypher through the
 execute tool and QuestionType.EXECUTE; those calls skip LLM translation and the
 safe read-only gate. They still use the AGE translator and its resource
-controls, and they still refuse schema-qualified function calls and `CALL`
-(no qualified name is allow-listed for this node). Enable it only for trusted
-callers that require writes or raw Cypher.
+controls, and refuse schema-qualified function calls and `CALL`. Enable it
+only for trusted callers that require writes or raw Cypher.
 
 ## Limitations
 
 This node runs on the RocketRide engine host and does not support remote
-execution. The engine host must have access to the signed-in RocketRide
-identity used to resolve the tenant DSN. The tenant database must already have
-Apache AGE installed and contain the configured graph. Read paths are
+execution. The RocketRide server resolves the database connection for the
+pipeline's organization at task start, so it needs the cloud database broker
+configured. The tenant database must already have Apache AGE installed and
+contain the configured graph. Read paths are
 intentionally read-only; raw execution remains disabled until explicitly
 enabled.
 
@@ -158,10 +174,9 @@ enabled.
 
 Apache AGE cannot execute bare Cypher. Every query path is translated, and the
 safe path runs in a server-side read-only transaction with a semantic firewall
-(writes, `CALL` and every schema-qualified function call are refused before
+(writes, `CALL` and schema-qualified function calls are refused before
 anything reaches the database), the base Cypher safety check, and a
-transaction-local statement timeout. Use the built-in Cypher functions;
-unqualified names resolve only to Apache AGE's own functions.
+transaction-local statement timeout. Use the built-in Cypher functions.
 Schema reflection lists AGE labels, samples node and relationship properties,
 and records every observed endpoint label pair. A failure is recorded in the
 schema block (the last good schema is kept, marked stale) rather than
@@ -170,16 +185,28 @@ blocking the node.
 ### Connections and concurrency
 
 Each tool call checks a database connection out of a small per-node pool
-(up to 8 connections) for its own use and runs in its own transaction, so
+(up to 4 connections) for its own use and runs in its own transaction, so
 parallel calls never share a transaction or each other's read-only and
-statement-timeout settings. When all 8 are busy, further calls wait up to the
+statement-timeout settings. When all 4 are busy, further calls wait up to the
 query timeout plus 5 seconds for one to free up. Every setting is
 transaction-local, and parameterised queries deallocate their prepared
 statement even when the query fails, so nothing is left on the database
 session afterwards. A connection the server dropped while idle is replaced and
-the call retried once, before any of the query has run; a connection lost
-while a query runs is reported, never re-run. The pool closes with the
-pipeline.
+the call retried once, before any of the query has run, on a newly opened
+connection; the retry also closes the node's other idle connections, since a
+database or pooler restart drops them all at once. A connection lost while a
+query runs is reported, never re-run. Schema reads (`refresh_schema` and the
+startup checks) are not retried: the one call that finds its connection
+dropped fails, and it closes the other idle connections so the next call
+opens a new one. The pool closes with the pipeline.
+
+Capacity: each running rocketride_graph node holds at most 4 client
+connections to the tenant database's pooler, and closes a connection once it
+has been idle for 60 seconds (within 5 seconds after that), so an idle
+pipeline holds none. Plan the pooler's
+client-connection limit for 4 connections per concurrently busy graph node
+(plus those of rocketride_sql and rocketride_vector nodes in the same
+pipelines).
 
 The node works through a transaction-mode connection pooler such as
 PgBouncer: it keeps no state on a database session between transactions and
@@ -187,6 +214,55 @@ never runs a session-level `LOAD 'age'`, so the tenant database must preload
 Apache AGE (`shared_preload_libraries`). The node's live test suites pass both
 directly against PostgreSQL 16 with Apache AGE 1.5.0 and through PgBouncer
 1.26 in transaction mode.
+
+### Agents
+
+An LLM agent wired to this node gets every tool listed under **As a tool** in
+its tool catalog, `read_query` and `refresh_schema` included. With
+`read_query` the agent runs Cypher it writes itself (read-only, 1,000 rows by
+default, within the element and value budgets); `refresh_schema` re-reads the
+schema each time it is called (refreshes of one node run one at a time, with
+no cooldown). Say in the agent's instructions which tools it should prefer,
+for example `get_data` for questions in plain language.
+
+### Result size
+
+The `read_query` budgets count values, not bytes: a string counts as one value
+whatever its length. A result of 1,000 rows whose nodes each carry
+100 KB of text is about 100 MB of JSON, which the engine builds in memory; the
+Python SDK closes its connection above 250 MB. When nodes hold large text,
+return the properties you need (`RETURN n.title` rather than `n`) or cut them
+with `substring()`.
+
+### Write counts
+
+Apache AGE reports no write counters, so `affected_rows` (from `execute`,
+both shapes) is the number of result rows the statement returned:
+`CREATE (n:Note)` reports 0 although it wrote, and `CREATE (n:Note) RETURN n`
+reports 1. Do not present it as a count of changes.
+
+### How long a call can take
+
+A call first waits for a free pooled connection (up to the query timeout plus
+5 seconds, then it fails with `Database busy`), opens one if none is idle
+(3-second connect timeout), then runs its statement with the query timeout. If
+the connection turns out to have been dropped while idle, the call starts over
+once on a new connection, within what is left of the time its first attempt
+was allowed (the wait for a connection plus the query timeout): the second
+attempt waits for a free connection only that long (then `Database busy`), its
+statement timeout is the time left, and with no time left it runs nothing and
+fails with `Query timed out after N ms`, where N is that whole allowance. One
+`read_query` therefore takes at most about twice the query timeout plus 5
+seconds (65 seconds with the default 30-second timeout; opening a new
+connection can add a few seconds), longer than the `statement_timeout_ms` that
+`dialect` reports. `refresh_schema` waits up
+to 65 seconds for another refresh of the same node, then gets a connection and
+runs within its 60-second budget; the wait for the connection counts against
+that budget and stops when it runs out, so the refresh itself takes at most
+about 60 seconds (opening a new connection can add a few seconds; a refresh
+whose budget runs out fails as a timeout and keeps the previous schema, marked
+stale). A client that stops waiting earlier
+only stops waiting: the database ends the statement at its own timeout.
 
 <!-- ROCKETRIDE:GENERATED:PARAMS START -->
 <!-- Generated by nodes:docs-generate. Do not edit by hand. -->
@@ -206,6 +282,7 @@ directly against PostgreSQL 16 with Apache AGE 1.5.0 and through PgBouncer
 ## Dependencies
 
 - `psycopg2-binary` `==2.9.12`
+- `antlr4-python3-runtime` `==4.13.2`
 
 ## Source
 

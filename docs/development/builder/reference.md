@@ -41,6 +41,11 @@ This configures the environment, resolves dependencies, and builds all modules. 
 | `<module>:test` | Run tests |
 
 Not all modules support all commands. Run `./builder --help` for the full list.
+`nodes:test-db` runs only the live-database suites and requires their
+databases (an unreachable server fails it; `RR_REQUIRE_DB_TESTS=0` makes them
+optional), while `nodes:test` runs them after the mocked pass and requires
+them only with `RR_REQUIRE_DB_TESTS` set. See
+[Testing nodes](../nodes/testing.md#live-database-tests).
 
 ### Modules reference
 
@@ -70,7 +75,7 @@ Not all modules support all commands. Run `./builder --help` for the full list.
 | `server` | C++ engine (downloads pre-built first, or compile from source) | build, compile, clean, test, build-all, clean-all, configure-cmake, dev, package, run, setup-test-deps |
 | `shared` | RocketRide shared source library | check-gallery-tokens, gen-gallery-tokens, test |
 | `shell` | Shell platform (host + frozen API surface) | build, check, clean, dev, freeze, regen, regen-derived, test |
-| `sql-ui` | SQL Explorer application | build, clean, dev |
+| `sql-ui` | SQL Explorer application | build, clean, dev, test |
 | `test-ui` | Test UI application | build, clean, dev |
 | `tika` | Java document parser | build-jar, build-dbgconn, sync, test-jar, test-dbgconn |
 | `ui` | All UI applications | build, clean, register |

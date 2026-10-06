@@ -49,6 +49,7 @@ from ai.common.schema import Answer, Question, QuestionType
 from ai.common.table import Table
 from ai.common.utils import normalize_tool_input, parse_bool, require_str
 
+from .cypher_safety import check_read_query_statement
 from .graph_errors import GraphToolError, driver_detail
 from .graph_global_base import DEFAULT_MAX_EXECUTE_ROWS, DEFAULT_READ_QUERY_LIMIT, GraphGlobalBase
 from .normalize import DEFAULT_ELEMENT_LIMIT, DEFAULT_VALUE_LIMIT, GraphBudgetExceeded, GraphNormalizer
@@ -340,7 +341,7 @@ class GraphInstanceBase(IInstanceBase, ABC):
 
         if shape == 'graph':
             # Never retried: a write may already have happened.
-            row_limit = self.IGlobal.max_execute_rows
+            row_limit = self.IGlobal.execute_graph_cap
 
             def consume(columns, rows):
                 return self._graph_envelope(columns, rows, row_limit)
@@ -394,6 +395,10 @@ class GraphInstanceBase(IInstanceBase, ABC):
     def read_query(self, args):
         """Run caller-written Cypher read-only and return the graph result envelope."""
         cypher, params, limit = self._read_query_args(args)
+        # One statement rule for every engine (no LOAD CSV, no text engines read
+        # differently; no non-ASCII code where the driver asks), ahead of the
+        # driver's own read boundary.
+        check_read_query_statement(cypher, ascii_only=self.IGlobal.read_ascii_only)
         row_limit = min(limit, self.IGlobal.read_query_cap)
 
         def consume(columns, rows):

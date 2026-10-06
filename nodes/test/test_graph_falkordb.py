@@ -593,6 +593,39 @@ def test_write_questions_emits_error_for_unsafe_query_not_prose():
     assert any('write or admin' in e for e in emitted)
 
 
+_GENERATED_LOAD_CSV = [
+    "LOAD/**/CSV FROM 'https://example.invalid/a.csv' AS r RETURN r",
+    "MATCH (n) WITH n LOAD/* x */CSV FROM 'file:///a.csv' AS r RETURN r",
+]
+
+
+@pytest.mark.parametrize('cypher', _GENERATED_LOAD_CSV)
+def test_get_data_refuses_generated_load_csv_without_touching_the_server(cypher):
+    """The natural-language paths apply read_query's statement rule; nothing reaches the server."""
+    graph = _FakeGraph(_FakeResult(result_set=[[1]], header=[[1, 'r']]))
+    inst = _instance(_FakeGlobal(graph))
+    inst._buildQueryOnce = lambda *a, **k: {'isValid': True, 'query': cypher}
+
+    out = inst.get_data({'question': 'import a file'})
+
+    assert out == {'error': 'Refused: LOAD CSV is not allowed on the read-only path', 'query': cypher, 'valid': False}
+    assert graph.calls == []
+
+
+@pytest.mark.parametrize('cypher', _GENERATED_LOAD_CSV)
+def test_write_questions_refuses_generated_load_csv_without_touching_the_server(cypher):
+    graph = _FakeGraph(_FakeResult(result_set=[[1]], header=[[1, 'r']]))
+    inst = _instance(_FakeGlobal(graph))
+    inst._buildQueryOnce = lambda *a, **k: {'isValid': True, 'query': cypher}
+    cap = _CapturingInstance({'answers', 'text'})
+    inst.instance = cap
+
+    inst.writeQuestions(_question('import a file'))
+
+    assert cap.text == ['Refused: LOAD CSV is not allowed on the read-only path']
+    assert graph.calls == []
+
+
 def test_get_data_truncated_is_honest_when_limit_exceeds_row_cap():
     """A limit above the node's max_rows must still report truncation, not hide it."""
     # 10 rows exist; the node caps reads at 3, but the caller asks for 1000.
@@ -961,6 +994,67 @@ def test_read_query_respects_server_limits():
     assert graph.calls[0][3] == 1000
 
 
+def test_execute_graph_shape_respects_server_result_cap():
+    """RESULTSET_SIZE cuts GRAPH.QUERY replies too: a cut write-console result must read as truncated."""
+    # The server silently returns at most RESULTSET_SIZE (5) rows of the 10 the statement produces.
+    graph = _FakeGraph(_FakeResult(result_set=[[i] for i in range(5)], header=[[1, 'i']]))
+    glb = _FakeGlobal(graph)
+    glb.allow_execute = True
+    glb.server_result_cap = 5
+    out = _instance(glb).execute({'query': 'UNWIND range(1, 10) AS i RETURN i', 'shape': 'graph'})
+    assert out['truncated'] is True and out['truncated_by'] == 'rows'
+    assert out['row_limit'] == 4 and len(out['rows']) == 4
+    assert glb.execute_graph_cap == 4
+    assert [c[0] for c in graph.calls] == ['query']
+
+
+def test_execute_graph_shape_without_a_server_cap_uses_max_execute_rows():
+    graph = _FakeGraph(_FakeResult(result_set=[[1]], header=[[1, 'i']]))
+    glb = _FakeGlobal(graph)
+    glb.allow_execute, glb.server_result_cap, glb.max_execute_rows = True, None, 300
+    out = _instance(glb).execute({'query': 'RETURN 1 AS i', 'shape': 'graph'})
+    assert out['row_limit'] == 300 and out['truncated'] is False
+
+
+@pytest.mark.parametrize('allow_writes', [False, True])
+def test_read_query_refuses_load_csv_without_touching_the_server(allow_writes):
+    graph = _FakeGraph(_FakeResult(result_set=[[1]], header=[[1, 'r']]))
+    glb = _FakeGlobal(graph, allow_writes=allow_writes)
+    with pytest.raises(Exception, match='^Refused: LOAD CSV is not allowed on the read-only path'):
+        _instance(glb).read_query({'cypher': "LOAD CSV FROM 'https://example.invalid/a.csv' AS r RETURN r"})
+    assert graph.calls == []
+
+
+@pytest.mark.parametrize(
+    'cypher',
+    [
+        "LOAD CSV FROM 'https://example.invalid/a.csv' AS r RETURN r",
+        "MATCH (n) WITH 'file:///' + n.name AS f LOAD CSV FROM f AS r RETURN count(r)",
+    ],
+)
+def test_query_tool_refuses_load_csv_while_writes_are_off(cypher):
+    """With allow_writes off the query tool applies read_query's statement rule; the server is not called."""
+    graph = _FakeGraph(_FakeResult(result_set=[[1]], header=[[1, 'r']]))
+    out = _instance(_FakeGlobal(graph, allow_writes=False)).query({'cypher': cypher})
+    assert out['error'].startswith('Refused: LOAD CSV is not allowed on the read-only path\n')
+    assert (out['columns'], out['rows'], out['row_count'], out['truncated']) == ([], [], 0, False)
+    assert graph.calls == []
+
+
+def test_query_tool_reports_unterminated_text_while_writes_are_off():
+    graph = _FakeGraph(_FakeResult(result_set=[[1]], header=[[1, 'r']]))
+    out = _instance(_FakeGlobal(graph, allow_writes=False)).query({'cypher': "MATCH (n) WHERE n.x = 'open RETURN n"})
+    assert out['error'] == 'Invalid query input: unterminated string literal'
+    assert graph.calls == []
+
+
+def test_query_tool_with_writes_allowed_sends_the_statement_as_written():
+    graph = _FakeGraph(_FakeResult(result_set=[[1]], header=[[1, 'r']]))
+    cypher = "LOAD CSV FROM 'file:///x' AS r RETURN r"
+    _instance(_FakeGlobal(graph, allow_writes=True)).query({'cypher': cypher})
+    assert [(c[0], c[1]) for c in graph.calls] == [('query', cypher)]
+
+
 def test_read_query_error_headlines():
     graph = _FakeGraph(raise_error=_StubRedisError('graph.RO_QUERY is to be executed only on read-only queries'))
     with pytest.raises(Exception, match='^Refused: read_query is read-only'):
@@ -1023,3 +1117,150 @@ def test_refresh_timeout_keeps_the_last_good_schema():
     out = inst.refresh_schema({})
     assert out['schema']['stale'] is True and 'Query timed out' in out['schema']['error']
     assert out['relationships'] == [{'type': 'KNOWS', 'start': 'Person', 'end': 'Person'}]
+
+
+# ---------------------------------------------------------------------------
+# Text FalkorDB reads differently from the tokenizer, and non-ASCII code
+# (GX-CMP-01). The server is never called: graph.calls stays empty.
+# ---------------------------------------------------------------------------
+
+_GraphToolError = sys.modules['ai.common.graph.graph_errors'].GraphToolError
+_URL = "'https://example.invalid/x.csv'"
+
+# (statement, headline with {tool} for the calling tool's name)
+_SPLIT_READINGS = [
+    (
+        f'MATCH (n:P) WITH n SKIP 0LOAD CSV FROM {_URL} AS r RETURN r',
+        "Invalid {tool} input: the number 0 runs into 'L'",
+    ),
+    (
+        f'MATCH (n) WHERE n.v > 0.5LOAD CSV FROM {_URL} AS r RETURN r',
+        "Invalid {tool} input: the number 0.5 runs into 'L'",
+    ),
+    (
+        f'MATCH (n) WHERE n.v > 1e3LOAD CSV FROM {_URL} AS r RETURN r',
+        "Invalid {tool} input: the number 1e3 runs into 'L'",
+    ),
+    (
+        f"MATCH (n:P) //\r'\nLOAD CSV FROM {_URL} AS r RETURN r //'",
+        'Refused: LOAD CSV is not allowed on the read-only path',
+    ),
+    (
+        f'MATCH (n:P) WITH n /*/ LOAD CSV FROM {_URL} AS r RETURN r //*/',
+        "Invalid {tool} input: '/' inside a block comment",
+    ),
+    (
+        f"MATCH (n:P) WITH n /*'/LOAD CSV FROM {_URL} AS r RETURN r /*'*/",
+        "Invalid {tool} input: '/' inside a block comment",
+    ),
+    (
+        f'MATCH (n:P) WITH n /* a / LOAD CSV FROM {_URL} AS r RETURN r //*/',
+        "Invalid {tool} input: '/' inside a block comment",
+    ),
+]
+
+# (statement, the character the headline names)
+_NON_ASCII_CODE = [
+    (f'LOAD\u180eCSV FROM {_URL} AS r RETURN r', 'U+180E'),
+    ('MATCH (n)\u200bRETURN n', 'U+200B'),
+    ('MATCH (n) RETURN n\u2028', 'U+2028'),
+    ('MATCH (\u00e9) RETURN \u00e9', 'U+00E9'),
+    ('MATCH (n) // caf\u00e9\nRETURN n', 'U+00E9'),
+]
+
+
+def _non_ascii_headline(tool, code):
+    return f'Invalid {tool} input: character {code} outside a string or back-quoted name'
+
+
+@pytest.mark.parametrize('allow_writes', [False, True])
+@pytest.mark.parametrize('cypher,headline', _SPLIT_READINGS)
+def test_read_query_refuses_split_readings_without_touching_the_server(cypher, headline, allow_writes):
+    graph = _FakeGraph(_FakeResult(result_set=[[1]], header=[[1, 'r']]))
+    with pytest.raises(_GraphToolError) as err:
+        _instance(_FakeGlobal(graph, allow_writes=allow_writes)).read_query({'cypher': cypher})
+    assert err.value.headline == headline.format(tool='read_query')
+    assert graph.calls == []
+
+
+@pytest.mark.parametrize('cypher,headline', _SPLIT_READINGS)
+def test_query_tool_refuses_split_readings_while_writes_are_off(cypher, headline):
+    graph = _FakeGraph(_FakeResult(result_set=[[1]], header=[[1, 'r']]))
+    out = _instance(_FakeGlobal(graph, allow_writes=False)).query({'cypher': cypher})
+    assert out['error'].splitlines()[0] == headline.format(tool='query')
+    assert (out['columns'], out['rows'], out['row_count'], out['truncated']) == ([], [], 0, False)
+    assert graph.calls == []
+
+
+@pytest.mark.parametrize('cypher,headline', _SPLIT_READINGS)
+def test_get_data_refuses_generated_split_readings_without_touching_the_server(cypher, headline):
+    graph = _FakeGraph(_FakeResult(result_set=[[1]], header=[[1, 'r']]))
+    inst = _instance(_FakeGlobal(graph))
+    inst._buildQueryOnce = lambda *a, **k: {'isValid': True, 'query': cypher}
+
+    out = inst.get_data({'question': 'anything'})
+
+    assert out == {'error': headline.format(tool='generated query'), 'query': cypher, 'valid': False}
+    assert graph.calls == []  # not even EXPLAIN
+
+
+@pytest.mark.parametrize('cypher,headline', _SPLIT_READINGS)
+def test_explain_check_refuses_split_readings_without_touching_the_server(cypher, headline):
+    graph = _FakeGraph(_FakeResult(result_set=[[1]], header=[[1, 'r']]))
+    glb = _FakeGlobal(graph)
+    assert glb._validate_query(cypher) == (False, headline.format(tool='generated query'))
+    assert graph.calls == []
+
+
+@pytest.mark.parametrize('allow_writes', [False, True])
+@pytest.mark.parametrize('cypher,code', _NON_ASCII_CODE)
+def test_read_query_refuses_non_ascii_code_without_touching_the_server(cypher, code, allow_writes):
+    graph = _FakeGraph(_FakeResult(result_set=[[1]], header=[[1, 'r']]))
+    with pytest.raises(_GraphToolError) as err:
+        _instance(_FakeGlobal(graph, allow_writes=allow_writes)).read_query({'cypher': cypher})
+    assert err.value.headline == _non_ascii_headline('read_query', code)
+    assert graph.calls == []
+
+
+@pytest.mark.parametrize('cypher,code', _NON_ASCII_CODE)
+def test_query_tool_refuses_non_ascii_code_while_writes_are_off(cypher, code):
+    graph = _FakeGraph(_FakeResult(result_set=[[1]], header=[[1, 'r']]))
+    out = _instance(_FakeGlobal(graph, allow_writes=False)).query({'cypher': cypher})
+    assert out['error'].splitlines()[0] == _non_ascii_headline('query', code)
+    assert graph.calls == []
+
+
+@pytest.mark.parametrize('cypher,code', _NON_ASCII_CODE)
+def test_generated_non_ascii_code_never_reaches_explain(cypher, code):
+    """get_data, get_query and the questions lane refuse it before EXPLAIN, and EXPLAIN itself refuses it."""
+    graph = _FakeGraph(_FakeResult(result_set=[[1]], header=[[1, 'r']]))
+    glb = _FakeGlobal(graph)
+    inst = _instance(glb)
+    inst._buildQueryOnce = lambda *a, **k: {'isValid': True, 'query': cypher}
+
+    out = inst.get_data({'question': 'anything'})
+    assert out == {'error': _non_ascii_headline('generated query', code), 'query': cypher, 'valid': False}
+
+    cap = _CapturingInstance({'answers', 'text'})
+    inst.instance = cap
+    inst.writeQuestions(_question('anything'))
+    assert cap.text == [_non_ascii_headline('generated query', code)]
+
+    assert glb._validate_query(cypher) == (False, _non_ascii_headline('generated query', code))
+    assert graph.calls == []
+
+
+@pytest.mark.parametrize(
+    'cypher',
+    [
+        "MATCH (n:`\u00dcn\u00efcode`) WHERE n.name = 'Jos\u00e9\u200b' RETURN n.`\u00e9` AS `\u00f1`",
+        'RETURN "\u65e5\u672c" AS x',
+    ],
+)
+def test_non_ascii_in_strings_and_back_quoted_names_reaches_the_server(cypher):
+    graph = _FakeGraph(_FakeResult(result_set=[[1]], header=[[1, 'x']]))
+    glb = _FakeGlobal(graph)
+    _instance(glb).read_query({'cypher': cypher})
+    _instance(glb).query({'cypher': cypher})
+    assert glb._validate_query(cypher) == (True, '')
+    assert [(c[0], c[1]) for c in graph.calls] == [('ro_query', cypher), ('ro_query', cypher), ('explain', cypher)]

@@ -60,13 +60,25 @@ else:
 
 # Instantiate the single shared Account object used by the entire process.
 # All command handlers import this singleton rather than creating their own.
-# Refuse to start while the DB broker is configured under its legacy,
-# placeholder-substitutable ROCKETRIDE_* names (see check_db_broker_environment).
-from .base import check_db_broker_environment
+# Refuse to start while the DB broker is configured under its former
+# ROCKETRIDE_* names, in the environment or in the engine's .env file (which
+# the web server loads only later; see check_db_broker_environment).
+from .base import check_db_broker_environment, engine_env_file
 
-check_db_broker_environment()
+check_db_broker_environment(env_file=engine_env_file())
 
 account: Account = Account()
+
+# A hosted engine without broker settings starts (other features work), but
+# say so now rather than only when a cloud DB node fails at task start. The
+# engine's .env counts as configured too: the web server loads it later.
+from .base import hosted_db_broker_warning
+
+_broker_warning = hosted_db_broker_warning(account, _sys.argv, env_file=engine_env_file())
+if _broker_warning:
+    from rocketlib import warning as _warning
+
+    _warning(_broker_warning)
 
 # Re-export supporting subsystems so callers only need one import.
 from .keystore import KeyStore

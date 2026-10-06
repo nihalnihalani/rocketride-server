@@ -34,6 +34,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from ai.constants import CONST_STATUS_HISTORY_LIMIT
+import ai.modules.task.task_engine as task_engine_module
 from ai.modules.task.task_engine import (
     CONST_TRACE_PAYLOAD_CAP,
     CONST_TRACE_PREVIEW_BYTES,
@@ -800,8 +801,8 @@ def _patch_resolve(monkeypatch, fake):
 
 @pytest.mark.asyncio
 async def test_subprocess_env_scrubs_broker_credentials(monkeypatch):
-    """The broker credential can mint ANY tenant's DSN — it must never reach
-    node subprocesses, and neither may a parent-level DSN or stale error.
+    """The broker settings are operator-only — they must never reach node
+    subprocesses, and neither may a parent-level DSN or stale error.
     """
     monkeypatch.setenv('RR_DB_BROKER_URL', 'https://broker.example')
     monkeypatch.setenv('RR_DB_BROKER_TOKEN', 'super-secret')
@@ -822,6 +823,34 @@ async def test_subprocess_env_scrubs_broker_credentials(monkeypatch):
     assert 'ROCKETRIDE_DB_RESOLVE_ERROR' not in env
     # Identity rides the task file (#1686), never the environment.
     assert 'ROCKETRIDE_CLIENT_ID' not in env
+
+
+_SCRUBBED = (
+    'RR_DB_BROKER_URL',
+    'RR_DB_BROKER_TOKEN',
+    'ROCKETRIDE_DB_BROKER_URL',
+    'ROCKETRIDE_DB_BROKER_TOKEN',
+    'ROCKETRIDE_DB_DSN',
+    'ROCKETRIDE_DB_RESOLVE_ERROR',
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('opt_in', ['*', 'RR_DB_*, ROCKETRIDE_*', 'rr_db_broker_token rr_db_broker_url'])
+@pytest.mark.parametrize('spelling', [str.upper, str.lower, str.title], ids=['upper', 'lower', 'title'])
+async def test_subprocess_env_scrub_does_not_depend_on_the_allowlist(monkeypatch, opt_in, spelling):
+    """An operator opt-in (RR_SUBPROCESS_ENV) can pass anything through the
+    allowlist; the explicit scrub must still drop the broker settings and any
+    parent DSN, whatever their spelling.
+    """
+    monkeypatch.setenv('RR_SUBPROCESS_ENV', opt_in)
+    for name in _SCRUBBED:
+        monkeypatch.setenv(spelling(name), f'scrub-me-{name}')
+
+    env = await Task._build_subprocess_env(_env_task())  # no DB nodes
+
+    leaked = sorted(k for k, v in env.items() if v.startswith('scrub-me-'))
+    assert leaked == []
 
 
 @pytest.mark.asyncio
@@ -904,10 +933,129 @@ async def test_subprocess_env_unconfigured_account_is_nonfatal(monkeypatch):
     async def fake_resolve(client_id):
         raise NotImplementedError('sign in')
 
+    monkeypatch.setattr(task_engine_module, '_is_saas_engine', lambda: False)
     _patch_resolve(monkeypatch, fake_resolve)
     env = await Task._build_subprocess_env(_env_task(pipeline=_DB_PIPELINE))
     assert 'ROCKETRIDE_DB_DSN' not in env
     assert 'ROCKETRIDE_DB_RESOLVE_ERROR' not in env
+
+
+@pytest.mark.asyncio
+async def test_subprocess_env_hosted_engine_without_broker_says_so(monkeypatch):
+    """A hosted engine without broker settings is a server configuration
+    error: the node must say that, not ask the user to sign in.
+    """
+
+    async def fake_resolve(client_id):
+        raise NotImplementedError('RocketRide cloud DB nodes require signing into RocketRide cloud')
+
+    monkeypatch.setattr(task_engine_module, '_is_saas_engine', lambda: True)
+    _patch_resolve(monkeypatch, fake_resolve)
+    env = await Task._build_subprocess_env(_env_task(pipeline=_DB_PIPELINE))
+    assert 'ROCKETRIDE_DB_DSN' not in env
+    assert env['ROCKETRIDE_DB_RESOLVE_ERROR'] == 'the RocketRide cloud database broker is not configured on this server'
+
+
+# ---------------------------------------------------------------------------
+# Tenant selection (#2203 spoofing / concurrency gate, as far as the engine
+# goes): the DSN is resolved for the task's own organization (its user only
+# without one), and nothing a caller controls can choose another tenant.
+# ---------------------------------------------------------------------------
+
+
+def _recording_resolver(monkeypatch, delays=None):
+    seen = []
+
+    async def fake_resolve(tenant_id):
+        seen.append(tenant_id)
+        await asyncio.sleep((delays or {}).get(tenant_id, 0))
+        return f'postgresql://role@pooler/{tenant_id}'
+
+    _patch_resolve(monkeypatch, fake_resolve)
+    return seen
+
+
+@pytest.mark.asyncio
+async def test_concurrent_tasks_each_get_their_own_organizations_dsn(monkeypatch):
+    """Interleaved task starts for two organizations never cross DSNs."""
+    seen = _recording_resolver(monkeypatch, delays={'org-a': 0.05, 'org-b': 0.0})
+    tasks = []
+    for org, user in (('org-a', 'user-a'), ('org-b', 'user-b'), ('org-a', 'user-c'), ('org-b', '')):
+        t = _env_task(pipeline=_DB_PIPELINE)
+        t.org_id, t.client_id = org, user
+        tasks.append(t)
+
+    envs = await asyncio.gather(*(Task._build_subprocess_env(t) for t in tasks))
+
+    assert [env['ROCKETRIDE_DB_DSN'] for env in envs] == [f'postgresql://role@pooler/{t.org_id}' for t in tasks]
+    assert sorted(seen) == ['org-a', 'org-a', 'org-b', 'org-b']
+
+
+@pytest.mark.asyncio
+async def test_environment_cannot_choose_the_tenant(monkeypatch):
+    """Identity variables or a DSN in the engine's environment (the
+    caller-influenced ROCKETRIDE_* namespace included) change nothing.
+    """
+    seen = _recording_resolver(monkeypatch)
+    for name, value in {
+        'ROCKETRIDE_CLIENT_ID': 'victim-user',
+        'ROCKETRIDE_ORG_ID': 'victim-org',
+        'ROCKETRIDE_TEAM_ID': 'victim-team',
+        'ROCKETRIDE_TENANT_ID': 'victim-org',
+        'ROCKETRIDE_DB_DSN': 'postgresql://victim@pooler/victim-org',
+        'RR_DB_TENANT': 'victim-org',
+    }.items():
+        monkeypatch.setenv(name, value)
+
+    env = await Task._build_subprocess_env(_env_task(pipeline=_DB_PIPELINE))
+
+    assert seen == ['org-1']
+    assert env['ROCKETRIDE_DB_DSN'] == 'postgresql://role@pooler/org-1'
+    assert not [k for k, v in env.items() if 'DB_' in k.upper() and 'victim' in v]
+
+
+@pytest.mark.asyncio
+async def test_pipeline_configuration_and_caller_env_cannot_choose_the_tenant(monkeypatch):
+    """Node config, pipeline fields and the caller's merged env (pipeline
+    parameters) are not identity: the tenant stays the task's organization.
+    """
+    seen = _recording_resolver(monkeypatch)
+    spoof = {
+        'tenant_id': 'victim-org',
+        'org_id': 'victim-org',
+        'orgId': 'victim-org',
+        'client_id': 'victim-user',
+        'clientId': 'victim-user',
+        'dsn': 'postgresql://victim@pooler/victim-org',
+    }
+    pipeline = {
+        **spoof,
+        'components': [
+            {'id': 'db', 'provider': 'rocketride_graph', 'config': dict(spoof)},
+            {'id': 'sql', 'provider': 'rocketride_sql', 'config': {'db': dict(spoof)}},
+        ],
+    }
+    t = _env_task(pipeline=pipeline)
+    t._env = {
+        'ROCKETRIDE_CLIENT_ID': 'victim-user',
+        'ROCKETRIDE_ORG_ID': 'victim-org',
+        'ROCKETRIDE_DB_DSN': 'postgresql://victim@pooler/victim-org',
+    }
+
+    env = await Task._build_subprocess_env(t)
+
+    assert seen == ['org-1']
+    assert env['ROCKETRIDE_DB_DSN'] == 'postgresql://role@pooler/org-1'
+
+
+@pytest.mark.asyncio
+async def test_user_is_the_tenant_only_without_an_organization(monkeypatch):
+    seen = _recording_resolver(monkeypatch)
+    with_org = _env_task(pipeline=_DB_PIPELINE)
+    without_org = _env_task(pipeline=_DB_PIPELINE)
+    without_org.org_id = ''
+    await asyncio.gather(Task._build_subprocess_env(with_org), Task._build_subprocess_env(without_org))
+    assert sorted(seen) == ['client-env-test', 'org-1']
 
 
 # ---------------------------------------------------------------------------

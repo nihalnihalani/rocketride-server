@@ -25,10 +25,11 @@
 
 Mirrors ``graph_neo4j`` on :class:`GraphGlobalBase`, with two differences:
 
-1. **Connection** — no host/user/password config; the per-tenant DSN comes
-   from the account layer (``ai.common.rocketride_db``), same seam as
-   ``rocketride_sql`` / ``rocketride_vector``. The tenant database is
-   Postgres + Apache AGE.
+1. **Connection** — no host/user/password config; the DSN of the
+   organization's database (the tenant; a user only where there is no
+   organization) comes from the account layer (``ai.common.rocketride_db``),
+   same seam as ``rocketride_sql`` / ``rocketride_vector``. The tenant
+   database is Postgres + Apache AGE.
 2. **Query paths** — Apache AGE cannot run bare Cypher, so ``_run_query``
    (safe), ``_run_query_raw`` (EXECUTE) and ``_validate_query`` all route
    through the Cypher->AGE translation layer (``ai.common.graph.age``).
@@ -52,7 +53,7 @@ from psycopg2 import errors as pg_errors
 from psycopg2 import sql
 from psycopg2.extensions import TRANSACTION_STATUS_IDLE
 
-from rocketlib import warning
+from rocketlib import debug, warning
 from ai.common.graph import GraphGlobalBase
 from ai.common.graph.adapters import age_adapter
 from ai.common.graph.age import (
@@ -74,11 +75,14 @@ DEFAULT_GRAPH_NAME = 'rocketride'
 DEFAULT_MAX_ROWS = 1000
 DEFAULT_QUERY_TIMEOUT_MS = 30000
 
-# Connections held open per node. Tool calls run on up to 64 worker threads
-# per task; past this many concurrent calls, callers queue for a free
-# connection (bounded by the statement timeout plus a grace period) instead of
-# opening an unbounded number of sessions against the tenant database.
-DEFAULT_POOL_SIZE = 8
+# Connections a node may hold. Tool calls run on up to 64 worker threads per
+# task; past this many concurrent calls, callers queue for a free connection
+# (bounded by the statement timeout plus a grace period) instead of opening an
+# unbounded number of client connections to the tenant database's pooler,
+# whose client-connection limit every tenant shares. A connection idle for
+# POOL_IDLE_TIMEOUT_S is closed, so an idle pipeline holds none.
+DEFAULT_POOL_SIZE = 4
+POOL_IDLE_TIMEOUT_S = 60.0
 POOL_ACQUIRE_GRACE_S = 5.0
 CONNECT_TIMEOUT_S = 3
 
@@ -96,10 +100,57 @@ class _ConnectionLost(Exception):
         self.before_main = before_main
 
 
+class DatabaseUnreachable(RuntimeError):
+    """Connecting to the tenant database failed (the driver's detail goes to the engine's debug trace)."""
+
+
+UNREACHABLE_TEXT = 'The RocketRide cloud database could not be reached'
+
+
+class ResultDecodeError(ValueError):
+    """A result value the database returned could not be decoded (the statement itself was valid)."""
+
+
+class QueryBudgetExhausted(TimeoutError):
+    """The connection was lost before the statement ran, and the call had no time left to retry it."""
+
+    def __init__(self, budget_ms: int) -> None:
+        super().__init__(
+            'query budget exhausted: the connection was lost before the statement ran, '
+            'and no time was left to retry it on a new connection'
+        )
+        self.budget_ms = budget_ms
+
+
+def _decoded(raw_rows, *, ran: bool = False):
+    """Parse each agtype cell, reporting a failure as a result problem, not as invalid Cypher."""
+    for row in raw_rows:
+        try:
+            yield [parse_agtype(v) for v in row]
+        except AgeTranslationError as e:
+            raise ResultDecodeError(f'{e} (the statement itself ran)' if ran else str(e)) from e
+
+
+def _connect(dsn: str):
+    """psycopg2.connect, bounded, with a connection failure reduced to a fixed message.
+
+    libpq's connection errors name the pooler host, its address and port, and
+    the database role. They are written with ``debug()`` only, which the engine
+    records when its debug trace level is enabled (``warning()`` and ``error()``
+    would put them in the job log users see); callers (users, agents, the
+    browser) get :data:`UNREACHABLE_TEXT`.
+    """
+    try:
+        # Bounded connect so an unreachable pooler fails fast instead of
+        # waiting out the OS TCP timeout.
+        return psycopg2.connect(dsn, connect_timeout=CONNECT_TIMEOUT_S)
+    except psycopg2.OperationalError as e:
+        debug(f'rocketride_graph: connecting to the tenant database failed: {_pg_detail(e)}')
+        raise DatabaseUnreachable(UNREACHABLE_TEXT) from None
+
+
 def _open_connection(dsn: str):
-    # Bounded connect so an unreachable pooler fails fast (matches the
-    # probe's 3s timeout) instead of waiting out the OS TCP timeout.
-    conn = psycopg2.connect(dsn, connect_timeout=CONNECT_TIMEOUT_S)
+    conn = _connect(dsn)
     # READ ONLY and SET LOCAL statement_timeout only apply inside a
     # transaction; psycopg2 opens one implicitly on the first execute only
     # while autocommit is off. Make the precondition explicit.
@@ -157,6 +208,7 @@ class IGlobal(GraphGlobalBase):
             reset=_reset_connection,
             is_usable=_connection_usable,
             close=_close_connection,
+            idle_timeout_s=POOL_IDLE_TIMEOUT_S,
         )
 
         try:
@@ -180,15 +232,15 @@ class IGlobal(GraphGlobalBase):
 
         if not graph_exists:
             pool.close()
-            # OPEN QUESTION (create_graph ownership, see the node README and
-            # the design's open-questions): whether the node or the cloud
-            # provisioner creates the per-tenant graph is undecided. Until it
-            # is, the node refuses to run against a missing graph rather than
-            # silently creating one.
+            # The cloud provisioner creates the default graph ('rocketride')
+            # when the organization's database is first provisioned. The node
+            # never creates one itself: a mistyped Graph name must fail here,
+            # not silently start an empty graph.
             raise RuntimeError(
-                f'AGE graph {self.graph_name!r} does not exist in the tenant database. '
-                'Graph provisioning ownership is pending; create the graph '
-                f"(SELECT create_graph('{self.graph_name}')) or configure an existing one."
+                f"AGE graph {self.graph_name!r} does not exist in your organization's RocketRide database. "
+                f"RocketRide creates the {DEFAULT_GRAPH_NAME!r} graph when your organization's database is "
+                'first provisioned; set Graph name to an existing graph, or create this one first '
+                f"(SELECT create_graph('{self.graph_name}'))."
             )
         self.pool = pool
 
@@ -202,7 +254,7 @@ class IGlobal(GraphGlobalBase):
         conn = None
         try:
             dsn = resolve_rocketride_dsn()
-            conn = psycopg2.connect(dsn, connect_timeout=CONNECT_TIMEOUT_S)
+            conn = _connect(dsn)
             with conn.cursor() as cur:
                 cur.execute('SELECT 1')
                 cur.execute("SELECT 1 FROM pg_extension WHERE extname = 'age'")
@@ -212,7 +264,7 @@ class IGlobal(GraphGlobalBase):
                 graph = str(config.get('graph') or DEFAULT_GRAPH_NAME).strip()
                 cur.execute('SELECT 1 FROM ag_catalog.ag_graph WHERE name = %s', (graph,))
                 if cur.fetchone() is None:
-                    warning(f'AGE graph {graph!r} does not exist yet in the tenant database')
+                    warning(f"AGE graph {graph!r} does not exist in your organization's RocketRide database")
         except NotImplementedError as e:
             # The OSS account stub: no cloud sign-in available.
             warning(str(e))
@@ -270,15 +322,40 @@ class IGlobal(GraphGlobalBase):
 
         A connection that turns out to be dead before the plan's main
         statement was sent (e.g. dropped while idle in the pool) is discarded
-        and the plan is retried once on a fresh connection: nothing ran, so the
-        retry is safe even for a write. A failure at or after the main
+        and the plan is retried once on a newly opened connection: nothing
+        ran, so the retry is safe even for a write. The retry never reuses an
+        idle connection, and closes them all: a database or pooler restart
+        drops every idle session at once. A failure at or after the main
         statement is never retried — whether it ran is unknown.
+
+        The retry gets only what is left of the call's budget, which is what
+        the first attempt may take: its wait for a connection (the pool's
+        acquire timeout) plus the query timeout. Its wait for a connection
+        stops when the budget runs out (PoolTimeout), its statement timeout is
+        the budget left once it has a connection (never more than the query
+        timeout), and with nothing left it runs nothing and raises
+        :class:`QueryBudgetExhausted`.
         """
         pool = self._require_pool()
+        budget_s = pool.acquire_timeout_s + self.query_timeout_ms / 1000.0
+        deadline = time.monotonic() + budget_s
+        wait_s: Optional[float] = None
         for attempt in (1, 2):
-            with pool.connection() as conn:
+            if attempt > 1:
+                wait_s = deadline - time.monotonic()
+                if wait_s <= 0:
+                    raise QueryBudgetExhausted(round(budget_s * 1000))
+            with pool.connection(fresh=attempt > 1, timeout_s=wait_s) as conn:
+                statement_timeout_ms = None
+                if attempt > 1:
+                    left_ms = int((deadline - time.monotonic()) * 1000)
+                    if left_ms <= 0:
+                        raise QueryBudgetExhausted(round(budget_s * 1000))
+                    statement_timeout_ms = min(int(self.query_timeout_ms), left_ms)
                 try:
-                    return self._run_plan(conn, plan, fetch_cap, explain=explain)
+                    return self._run_plan(
+                        conn, plan, fetch_cap, explain=explain, statement_timeout_ms=statement_timeout_ms
+                    )
                 except _ConnectionLost as lost:
                     pool.discard(conn)
                     if lost.before_main and attempt == 1:
@@ -286,7 +363,15 @@ class IGlobal(GraphGlobalBase):
                     raise lost.original from None
         raise AssertionError('unreachable')  # pragma: no cover
 
-    def _run_plan(self, conn, plan: TranslatedQuery, fetch_cap: Optional[int], *, explain: bool) -> List[Tuple]:
+    def _run_plan(
+        self,
+        conn,
+        plan: TranslatedQuery,
+        fetch_cap: Optional[int],
+        *,
+        explain: bool,
+        statement_timeout_ms: Optional[int] = None,
+    ) -> List[Tuple]:
         """Execute ``plan`` on an exclusively owned connection; commit or roll back.
 
         Transaction shape (psycopg2 opens it on the first execute)::
@@ -303,6 +388,10 @@ class IGlobal(GraphGlobalBase):
         savepoint and the statement is deallocated before the final ROLLBACK —
         all inside one transaction, which stays on one server session even
         behind a transaction-mode pooler.
+
+        ``statement_timeout_ms`` (a retry's budget left) is set with one more
+        ``SET LOCAL statement_timeout`` just before the main statement, so it
+        replaces the plan's own.
         """
         if conn.autocommit:
             raise RuntimeError(
@@ -320,6 +409,8 @@ class IGlobal(GraphGlobalBase):
                     cur.execute('SET TRANSACTION READ ONLY')
                 for i, (stmt, binds) in enumerate(zip(plan.statements, plan.binds)):
                     if i == plan.result_index:
+                        if statement_timeout_ms is not None:
+                            cur.execute(f"SET LOCAL statement_timeout = '{max(1, int(statement_timeout_ms))}ms'")
                         if prepared:
                             cur.execute(f'SAVEPOINT {_EXEC_SAVEPOINT}')
                             savepoint = True
@@ -391,7 +482,10 @@ class IGlobal(GraphGlobalBase):
                 return rows
             except Exception:
                 if conn.closed:
+                    # No retry here, but a restart dropped the idle sessions
+                    # too: the next calls must not take one of them.
                     pool.discard(conn)
+                    pool.close_idle()
                 raise
 
     def _run_query(self, query: str, params: Optional[Dict] = None, limit: Optional[int] = None) -> List[Dict]:
@@ -435,12 +529,12 @@ class IGlobal(GraphGlobalBase):
         """
         plan = self._translate(cypher, params=params, limit=fetch_limit, mode=TranslateMode.SAFE)
         raw_rows = self._execute_plan(plan, fetch_cap=fetch_limit)
-        return consume(self._plan_columns(plan), ([parse_agtype(v) for v in row] for row in raw_rows))
+        return consume(self._plan_columns(plan), _decoded(raw_rows))
 
     def _raw_query_rows(self, cypher, fetch_limit, consume):
         plan = self._translate(cypher, mode=TranslateMode.RAW)
         raw_rows = self._execute_plan(plan, fetch_cap=fetch_limit)
-        rows = [[parse_agtype(v) for v in row] for row in raw_rows]
+        rows = list(_decoded(raw_rows, ran=True))
         # AGE exposes no write counters; like the legacy path, report result rows.
         return consume(self._plan_columns(plan), iter(rows)), len(rows)
 
@@ -457,10 +551,16 @@ class IGlobal(GraphGlobalBase):
             return f'Refused: {_firewall_headline(exc)}', str(exc)
         if isinstance(exc, AgeTranslationError):
             return 'Invalid Cypher for Apache AGE', str(exc)
+        if isinstance(exc, ResultDecodeError):
+            return 'Query result cannot be represented', str(exc)
         if isinstance(exc, PoolTimeout):
             return 'Database busy: no connection became free in time', str(exc)
+        if isinstance(exc, QueryBudgetExhausted):
+            return f'Query timed out after {exc.budget_ms} ms', f'{exc}; try again.'
         if isinstance(exc, PoolClosed):
             return 'The graph node is shutting down', str(exc)
+        if isinstance(exc, DatabaseUnreachable):
+            return 'Database unreachable', f"{exc}; try again shortly (the cause is in the engine's debug trace)."
         if isinstance(exc, pg_errors.QueryCanceled):
             return f'Query timed out after {self.statement_timeout_ms} ms', _pg_detail(exc)
         if isinstance(exc, pg_errors.ReadOnlySqlTransaction):
@@ -498,13 +598,19 @@ class IGlobal(GraphGlobalBase):
         by the server. Counts come from pg_class.reltuples (planner
         estimates, never a scan). Edge endpoints come from the label id that
         AGE encodes in the top 16 bits of every graphid, so no join or
-        Cypher text is assembled from label names.
+        Cypher text is assembled from label names. The wait for a pool slot
+        stops when the budget runs out (PoolTimeout), and the budget left is
+        measured again once the connection is acquired, so that wait counts
+        against it.
         """
-        remaining_ms = int((deadline - time.monotonic()) * 1000)
-        if remaining_ms <= 0:
+        remaining_s = deadline - time.monotonic()
+        if remaining_s <= 0:
             raise TimeoutError('schema refresh budget exhausted')
         pool = self._require_pool()
-        with pool.connection() as conn:
+        with pool.connection(timeout_s=remaining_s) as conn:
+            remaining_ms = int((deadline - time.monotonic()) * 1000)
+            if remaining_ms <= 0:
+                raise TimeoutError('schema refresh budget exhausted')
             try:
                 with conn.cursor() as cur:
                     cur.execute('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY')
@@ -561,6 +667,7 @@ class IGlobal(GraphGlobalBase):
             except Exception:
                 if conn.closed:
                     pool.discard(conn)
+                    pool.close_idle()
                 raise
 
     def _engine_identity(self):

@@ -49,7 +49,7 @@ from rocketlib import IGlobalBase, debug, warning
 from ai.common.config import Config
 from ai.common.utils import config_int, parse_bool
 
-from .cypher_safety import is_cypher_safe
+from .cypher_safety import CypherInputError, CypherRefused, check_read_query_statement, is_cypher_safe
 from .graph_errors import GraphToolError, driver_detail
 from .schema import SCHEMA_REFRESH_BUDGET_MS, SchemaBuilder, empty_block, legacy_from_block
 
@@ -79,6 +79,11 @@ class GraphGlobalBase(IGlobalBase, ABC):
     max_validation_attempts: int = DEFAULT_MAX_VALIDATION_ATTEMPTS
     allow_execute: bool = False
     max_execute_rows: int = DEFAULT_MAX_EXECUTE_ROWS
+
+    # Read paths (read_query, the natural-language tools) refuse non-ASCII
+    # characters outside string literals and back-quoted names before the text
+    # reaches the server. Set by a driver whose server mishandles such text.
+    read_ascii_only: bool = False
 
     # ------------------------------------------------------------------
     # Abstract interface — every graph driver must implement these
@@ -205,9 +210,18 @@ class GraphGlobalBase(IGlobalBase, ABC):
     def _read_only_refusal(self, query: str) -> Optional[str]:
         """Why generated Cypher may not run on a read path, or None if it may.
 
-        Used by the natural-language tools before a query is shown or run.
+        Used by the natural-language tools (get_data, get_query and the
+        questions lane) before a query is shown or run, and before EXPLAIN.
+        Generated Cypher follows read_query's statement rule first
+        (``LOAD CSV`` is refused, and so is text the engines would read
+        differently or that does not terminate, plus non-ASCII code where the
+        driver sets ``read_ascii_only``), then the write/admin keyword gate.
         Drivers with a stricter check (Neo4j's procedure allowlist) extend it.
         """
+        try:
+            check_read_query_statement(query, tool='generated query', ascii_only=self.read_ascii_only)
+        except (CypherRefused, CypherInputError) as e:
+            return e.headline
         if not is_cypher_safe(query):
             return 'Generated query contains write or admin clauses'
         return None
@@ -284,6 +298,11 @@ class GraphGlobalBase(IGlobalBase, ABC):
     def read_query_cap(self) -> int:
         """Largest row limit ``read_query`` honours on this node (owner cap, hard ceiling 25,000)."""
         return max(1, min(int(self.read_row_cap), READ_QUERY_HARD_CAP))
+
+    @property
+    def execute_graph_cap(self) -> int:
+        """Row limit ``execute(shape='graph')`` applies (``max_execute_rows`` unless the server cuts sooner)."""
+        return max(1, int(self.max_execute_rows))
 
     @property
     def statement_timeout_ms(self) -> int:

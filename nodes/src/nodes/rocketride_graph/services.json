@@ -47,7 +47,7 @@
 	// Optional:
 	//		Description of this driver
 	//
-	"description": ["A RocketRide-managed graph database backed by PostgreSQL + Apache AGE. ", "Answers natural-language questions over your own provisioned RocketRide cloud ", "graph with zero setup — no host, user, or password to enter; the connection is ", "resolved automatically from your signed-in RocketRide identity. Cypher queries ", "are translated to AGE with a resource firewall, and safe reads run in read-only ", "transactions server-side."],
+	"description": ["A RocketRide-managed graph database backed by PostgreSQL + Apache AGE. ", "Answers natural-language questions over your own provisioned RocketRide cloud ", "graph with zero setup — no host, user, or password to enter; the server resolves ", "the connection to your organization's database automatically. Cypher queries ", "are translated to AGE with a resource firewall, and safe reads run in read-only ", "transactions server-side."],
 	//
 	// Optional:
 	//	  The icon is the icon to display in the UI for this node

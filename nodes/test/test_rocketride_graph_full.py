@@ -50,6 +50,7 @@ Skips cleanly when the database is unreachable.
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
 import os
 import sys
@@ -112,9 +113,13 @@ def _load_from_path(name: str, path: Path, *, is_package: bool = False):
     return module
 
 
-@pytest.fixture()
-def rr_env(monkeypatch):
-    """Stub the engine surface, load real graph base + age layer + node."""
+def make_rr_env(monkeypatch):
+    """Stub the engine surface, load real graph base + age layer + node.
+
+    The body of the ``rr_env`` fixture, callable without pytest's fixture
+    machinery (``nodes/test/graph_wire_fixtures.py`` uses it with its own
+    ``pytest.MonkeyPatch``).
+    """
     warnings: list[str] = []
 
     depends_mod = types.ModuleType('depends')
@@ -207,9 +212,18 @@ def rr_env(monkeypatch):
 
 
 @pytest.fixture()
-def age_graph(rr_env):
-    """Provision + seed the test graph out-of-band (provisioning is not the
-    node's job while create_graph ownership is open).
+def rr_env(monkeypatch):
+    """Stub the engine surface, load real graph base + age layer + node."""
+    return make_rr_env(monkeypatch)
+
+
+@contextlib.contextmanager
+def seeded_age_graph():
+    """Provision + seed the test graph out-of-band, as the cloud provisioner
+    does for 'rocketride' (the node never creates a graph); drop it on exit.
+
+    The body of the ``age_graph`` fixture, usable without pytest's fixture
+    machinery (``nodes/test/graph_wire_fixtures.py`` uses it directly).
     """
     conn = psycopg2.connect(ADMIN_DSN)
     conn.autocommit = True
@@ -226,11 +240,20 @@ def age_graph(rr_env):
             "(a)-[:WORKS_AT]->(x:Company {name:'RocketRide'}) "
             '$$) AS (v agtype)'
         )
-    yield conn
-    with conn.cursor() as cur:
-        cur.execute('SET search_path = ag_catalog, "$user", public')
-        cur.execute('SELECT drop_graph(%s, true)', (GRAPH,))
-    conn.close()
+    try:
+        yield conn
+    finally:
+        with conn.cursor() as cur:
+            cur.execute('SET search_path = ag_catalog, "$user", public')
+            cur.execute('SELECT drop_graph(%s, true)', (GRAPH,))
+        conn.close()
+
+
+@pytest.fixture()
+def age_graph(rr_env):
+    """The seeded test graph (see :func:`seeded_age_graph`)."""
+    with seeded_age_graph() as conn:
+        yield conn
 
 
 def _begin(rr_env, config=None):
@@ -262,8 +285,123 @@ class TestLifecycle:
     def test_missing_graph_fails_fast(self, rr_env, age_graph):
         glb = rr_env.iglobal_cls()
         glb.glb = types.SimpleNamespace(logicalType='rocketride_graph', connConfig={'graph': 'rr_graph_missing'})
-        with pytest.raises(RuntimeError, match='does not exist'):
+        with pytest.raises(RuntimeError, match='does not exist') as err:
             glb.beginGlobal()
+        text = str(err.value)
+        # The provisioner creates 'rocketride'; nothing about graph ownership is open any more.
+        assert 'pending' not in text
+        assert (
+            "RocketRide creates the 'rocketride' graph when your organization's database is first provisioned" in text
+        )
+        assert "SELECT create_graph('rr_graph_missing')" in text
+
+    def test_node_configuration_cannot_choose_the_database(self, rr_env, age_graph):
+        """The DSN comes from the task's tenant only; connection-shaped config keys are ignored."""
+        unreachable = 'postgresql://victim:victim@unreachable.invalid:5432/victim_db?sslmode=disable'
+        glb = _begin(
+            rr_env,
+            {
+                'dsn': unreachable,
+                'url': unreachable,
+                'host': 'unreachable.invalid',
+                'port': 1,
+                'user': 'victim',
+                'password': 'victim',
+                'database': 'victim_db',
+                'tenant_id': 'victim-org',
+                'org_id': 'victim-org',
+                'client_id': 'victim-user',
+            },
+        )
+        try:
+            assert glb.database_name == _dsn_database(TEST_DSN)
+            assert glb._run_query('MATCH (p:Person) RETURN count(p) AS c') == [{'c': 3}]
+        finally:
+            glb.endGlobal()
+
+    def test_probe_names_the_organization_database(self, rr_env, age_graph):
+        glb = rr_env.iglobal_cls()
+        glb._probe_connection({'graph': 'rr_graph_missing'})
+        assert rr_env.warnings == [
+            "AGE graph 'rr_graph_missing' does not exist in your organization's RocketRide database"
+        ]
+
+
+def _dsn_database(dsn: str) -> str:
+    from urllib.parse import urlsplit
+
+    return urlsplit(dsn).path.lstrip('/')
+
+
+def _bad_password_dsn() -> str:
+    """TEST_DSN with a wrong password: the server answers with libpq's detailed refusal."""
+    from urllib.parse import urlsplit, urlunsplit
+
+    parts = urlsplit(TEST_DSN)
+    host = parts.netloc.rpartition('@')[2]
+    user = parts.username or 'rruser'
+    return urlunsplit((parts.scheme, f'{user}:not-the-password@{host}', parts.path, parts.query, parts.fragment))
+
+
+def _internal_details() -> list:
+    """What a connection failure must not show callers: host, port and database role."""
+    from urllib.parse import urlsplit
+
+    parts = urlsplit(TEST_DSN)
+    return [parts.hostname, str(parts.port), parts.username, '127.0.0.1', 'password authentication']
+
+
+class TestConnectionFailureText:
+    def test_startup_failure_names_no_host_port_or_role(self, rr_env, age_graph, monkeypatch):
+        monkeypatch.setenv('ROCKETRIDE_DB_DSN', _bad_password_dsn())
+        glb = rr_env.iglobal_cls()
+        glb.glb = types.SimpleNamespace(logicalType='rocketride_graph', connConfig={'graph': GRAPH})
+        with pytest.raises(Exception) as err:
+            glb.beginGlobal()
+        text = str(err.value)
+        assert 'could not be reached' in text
+        for detail in _internal_details():
+            assert detail not in text, detail
+
+    def test_tool_call_failure_names_no_host_port_or_role(self, rr_env, age_graph):
+        glb = _begin(rr_env)
+        module = sys.modules[rr_env.iglobal_cls.__module__]
+        try:
+            # The pooler went away (or credentials rotated) after startup: every
+            # new connection now fails the way libpq reports it.
+            bad = _bad_password_dsn()
+            glb.pool.close()
+            glb.pool = module.ConnectionPool(
+                lambda: module._open_connection(bad),
+                max_size=1,
+                acquire_timeout_s=5,
+                reset=module._reset_connection,
+                is_usable=module._connection_usable,
+                close=module._close_connection,
+            )
+            inst = rr_env.iinstance_cls()
+            inst.IGlobal = glb
+            with pytest.raises(Exception) as err:
+                inst.read_query({'cypher': 'MATCH (p:Person) RETURN count(p)'})
+            text = str(err.value)
+            assert text.startswith('Database unreachable\n')
+            for detail in _internal_details():
+                assert detail not in text, detail
+            # The detail is written at the engine's debug trace level only; do not promise a log entry.
+            assert 'server log' not in text
+            assert text.endswith("try again shortly (the cause is in the engine's debug trace).")
+        finally:
+            glb.endGlobal()
+
+    def test_save_time_probe_names_no_host_port_or_role(self, rr_env, age_graph, monkeypatch):
+        monkeypatch.setenv('ROCKETRIDE_DB_DSN', _bad_password_dsn())
+        glb = rr_env.iglobal_cls()
+        glb._probe_connection({'graph': GRAPH})
+        assert rr_env.warnings, 'the probe must still warn'
+        text = ' '.join(rr_env.warnings)
+        assert 'could not be reached' in text
+        for detail in _internal_details():
+            assert detail not in text, detail
 
 
 class TestSafePath:

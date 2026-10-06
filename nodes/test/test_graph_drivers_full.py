@@ -55,8 +55,41 @@ else:
     pytest.importorskip('antlr4')
 
 from falkordb import query_result as falkor_qr  # noqa: E402
-from neo4j._codec.hydration.v2 import HydrationHandler  # noqa: E402
-from neo4j._codec.packstream import Structure  # noqa: E402
+
+# Driver versions this suite (and the graph-ui wire fixtures generated from it)
+# was validated with. The node requirements pin these versions, and nodes/test
+# gets them through the engine constraints.
+VALIDATED_DRIVERS = {'neo4j': '6.3.1', 'falkordb': '1.7.0'}
+
+# The neo4j driver offers no public way to build Node/Relationship/Path
+# objects as a Bolt session hydrates them, so this suite uses the driver's
+# private hydration API, isolated here. Its module path changed between
+# releases (hydration.v2 up to 6.3, hydration.bolt.v2 from 6.4).
+_BOLT_HYDRATION_MODULES = ('neo4j._codec.hydration.v2', 'neo4j._codec.hydration.bolt.v2')
+
+
+def _bolt_hydration():
+    """(HydrationHandler, Structure) from the installed neo4j driver, or a clear failure."""
+    try:
+        structure = importlib.import_module('neo4j._codec.packstream').Structure
+        for name in _BOLT_HYDRATION_MODULES:
+            try:
+                return importlib.import_module(name).HydrationHandler, structure
+            except ImportError:
+                continue
+    except (ImportError, AttributeError):
+        pass
+    message = (
+        f'neo4j {getattr(neo4j, "__version__", "?")} moved its private Bolt hydration API; '
+        f'update _bolt_hydration() in {Path(__file__).name} '
+        f'(validated with neo4j {VALIDATED_DRIVERS["neo4j"]})'
+    )
+    if _REQUIRED:
+        pytest.fail(message, pytrace=False)
+    pytest.skip(message, allow_module_level=True)
+
+
+HydrationHandler, Structure = _bolt_hydration()
 
 _GRAPH_DIR = Path(__file__).resolve().parents[2] / 'packages' / 'ai' / 'src' / 'ai' / 'common' / 'graph'
 

@@ -313,6 +313,24 @@ def filter_subprocess_env(environ: Mapping[str, str]) -> Dict[str, str]:
     return allowed
 
 
+# Never handed to a task subprocess, compared upper-cased: the DB broker
+# settings (operator-only; the former ROCKETRIDE_* names too), and any DSN or
+# resolution error inherited from the engine's own environment (the task
+# engine sets the child's own after resolving it).
+CONST_SUBPROCESS_ENV_SCRUBBED = frozenset(
+    {
+        'RR_DB_BROKER_URL',
+        'RR_DB_BROKER_TOKEN',
+        'ROCKETRIDE_DB_BROKER_URL',
+        'ROCKETRIDE_DB_BROKER_TOKEN',
+        'ROCKETRIDE_DB_DSN',
+        'ROCKETRIDE_DB_RESOLVE_ERROR',
+    }
+)
+
+# What a RocketRide cloud DB node reports when a hosted engine has no broker.
+CONST_DB_BROKER_UNCONFIGURED = 'the RocketRide cloud database broker is not configured on this server'
+
 # Nodes a hosted (SaaS) engine refuses to launch. The canvas already hides
 # `nosaas` services, but a pipeline can reach the engine without the canvas,
 # so the engine enforces the same rule itself. Any service built on the MCP
@@ -717,11 +735,15 @@ class Task(DAPBase):
         in the ROCKETRIDE_* namespace, so the allowlist alone does not cover
         them):
 
-        - The broker credential can resolve ANY tenant's DSN — it must never
-          reach node subprocesses, which run user pipeline code.
+        - The broker settings are operator-only: they never reach node
+          subprocesses, which run user pipeline code, whatever the allowlist
+          or an operator opt-in passes and however the names are spelled.
         - A DSN inherited from the parent environment must not leak into
           pipelines that didn't resolve one (and must not survive a broker
           failure as a stale value pointing at who-knows-which tenant).
+        - The tenant is this task's organization (its user only where there
+          is no organization), taken from the task's own identity: nothing in
+          the environment, the pipeline or a node's configuration selects it.
 
         Children only ever get the single DSN resolved here, for pipelines
         that actually contain one of the DB nodes. Identity is NOT delivered
@@ -730,18 +752,13 @@ class Task(DAPBase):
         """
         subprocess_env = filter_subprocess_env(os.environ)
 
-        # The broker settings are RR_* names the allowlist never passes; drop
-        # them explicitly anyway, and the legacy ROCKETRIDE_* names with them,
-        # so no change to the allowlist can hand a child the broker token.
-        for name in (
-            'RR_DB_BROKER_URL',
-            'RR_DB_BROKER_TOKEN',
-            'ROCKETRIDE_DB_BROKER_URL',
-            'ROCKETRIDE_DB_BROKER_TOKEN',
-        ):
-            subprocess_env.pop(name, None)
-        subprocess_env.pop('ROCKETRIDE_DB_DSN', None)
-        subprocess_env.pop('ROCKETRIDE_DB_RESOLVE_ERROR', None)
+        # The broker settings are RR_* names the default allowlist never
+        # passes; drop them explicitly anyway (with their former ROCKETRIDE_*
+        # names and any parent DSN or resolution error), matching names
+        # case-insensitively like the allowlist does, so neither an operator
+        # opt-in (RR_SUBPROCESS_ENV) nor a spelling variant hands them to a child.
+        for name in [n for n in subprocess_env if n.upper() in CONST_SUBPROCESS_ENV_SCRUBBED]:
+            del subprocess_env[name]
 
         # Resolve the per-tenant DSN server-side (the SaaS account context
         # exists only in this process) and hand it to the node subprocess via
@@ -763,9 +780,12 @@ class Task(DAPBase):
                 dsn = await account.resolve_db_dsn(self.org_id or self.client_id)
                 subprocess_env['ROCKETRIDE_DB_DSN'] = dsn
             except NotImplementedError:
-                # Broker env not configured (open-source default) — the
-                # node raises the sign-in message itself.
-                pass
+                if _is_saas_engine():
+                    # A hosted engine always resolves through the broker, so
+                    # unset broker settings are a server configuration error:
+                    # say so, rather than let the node ask the user to sign in.
+                    subprocess_env['ROCKETRIDE_DB_RESOLVE_ERROR'] = CONST_DB_BROKER_UNCONFIGURED
+                # Open-source default: the node raises the sign-in message itself.
             except Exception as e:
                 self.debug_message(f'RocketRide DB DSN resolution failed: {e}')
                 reason = (str(e).strip().splitlines() or [repr(e)])[0]

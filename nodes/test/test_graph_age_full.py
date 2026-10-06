@@ -25,6 +25,7 @@ from __future__ import annotations
 import sys
 import threading
 import time
+import types
 
 import pytest
 
@@ -348,6 +349,97 @@ class TestRecovery:
             admin.close()
             glb.endGlobal()
 
+    def test_restart_with_several_idle_connections_recovers_on_the_first_call(self, rr_env, age_graph, monkeypatch):
+        """A database or pooler restart drops every idle session at once; the retry must not take another."""
+        if BEHIND_POOLER:
+            pytest.skip('NOT RUN: behind a pooler the server cannot drop the node client connections it holds')
+        _set_pool_size(rr_env, monkeypatch, 3)
+        glb = _begin(rr_env)
+        admin = _admin()
+        barrier = threading.Barrier(3)
+
+        def warm():
+            barrier.wait()
+            return glb._execute_plan(_plan(['SELECT pg_sleep(0.3)', 'SELECT pg_backend_pid()'], read_only=True))[0][0]
+
+        try:
+            results, errors = _run_threads({i: warm for i in range(3)})
+            assert not errors, errors
+            pids = sorted(set(results.values()))
+            assert len(pids) == 3 and glb.pool.idle == 3
+            with admin.cursor() as cur:
+                cur.execute('SELECT pg_terminate_backend(pid) FROM unnest(%s::int[]) AS pid', (pids,))
+            time.sleep(0.2)
+            for _ in range(3):
+                assert glb._run_query('MATCH (p:Person) RETURN count(p) AS c') == [{'c': 3}]
+        finally:
+            admin.close()
+            glb.endGlobal()
+
+    @pytest.mark.parametrize('path', ['sql_read', 'reflect_schema'])
+    def test_schema_paths_close_the_other_idle_connections_after_a_restart(self, rr_env, age_graph, monkeypatch, path):
+        """Plain SQL reads and schema reflection do not retry, so after a restart one call may fail; only one."""
+        if BEHIND_POOLER:
+            pytest.skip('NOT RUN: behind a pooler the server cannot drop the node client connections it holds')
+        _set_pool_size(rr_env, monkeypatch, 3)
+        glb = _begin(rr_env)
+        admin = _admin()
+        barrier = threading.Barrier(3)
+
+        def warm():
+            barrier.wait()
+            return glb._execute_plan(_plan(['SELECT pg_sleep(0.3)', 'SELECT pg_backend_pid()'], read_only=True))[0][0]
+
+        def call():
+            return glb._sql_read('SELECT 1') if path == 'sql_read' else glb._reflect_schema()
+
+        try:
+            results, errors = _run_threads({i: warm for i in range(3)})
+            assert not errors, errors
+            pids = sorted(set(results.values()))
+            assert len(pids) == 3 and glb.pool.idle == 3
+            with admin.cursor() as cur:
+                cur.execute('SELECT pg_terminate_backend(pid) FROM unnest(%s::int[]) AS pid', (pids,))
+            time.sleep(0.2)
+            with pytest.raises(psycopg2.Error):
+                call()
+            assert glb.pool.idle == 0, 'the other idle connections died with the restart and must be closed'
+            for _ in range(3):
+                call()
+        finally:
+            admin.close()
+            glb.endGlobal()
+
+    def test_idle_sessions_are_closed_after_the_idle_timeout(self, rr_env, age_graph, monkeypatch):
+        module = sys.modules[rr_env.iglobal_cls.__module__]
+        monkeypatch.setattr(module, 'POOL_IDLE_TIMEOUT_S', 0.3)
+        glb = _begin(rr_env)
+        try:
+            assert glb.pool.max_size == module.DEFAULT_POOL_SIZE <= 4
+            assert glb.pool.idle_timeout_s == 0.3
+            pid = None if BEHIND_POOLER else _on_pooled_session(glb, 'SELECT pg_backend_pid()')[0]
+            deadline = time.monotonic() + 5
+            while glb.pool.size and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert glb.pool.size == 0
+            if pid is not None:
+                admin = _admin()
+                try:
+                    deadline = time.monotonic() + 5
+                    alive = True
+                    while alive and time.monotonic() < deadline:
+                        with admin.cursor() as cur:
+                            cur.execute('SELECT 1 FROM pg_stat_activity WHERE pid = %s', (pid,))
+                            alive = cur.fetchone() is not None
+                        time.sleep(0.05)
+                    assert not alive
+                finally:
+                    admin.close()
+            # The next call simply opens a new connection.
+            assert glb._run_query('MATCH (p:Person) RETURN count(p) AS c') == [{'c': 3}]
+        finally:
+            glb.endGlobal()
+
     def test_connection_lost_during_the_main_statement_is_not_retried(self, rr_env, age_graph, monkeypatch):
         _set_pool_size(rr_env, monkeypatch, 1)
         glb = _begin(rr_env)
@@ -524,6 +616,40 @@ class TestReadQuery:
         finally:
             glb.endGlobal()
 
+    def test_load_csv_is_refused(self, rr_env, age_graph):
+        glb = _begin(rr_env)
+        inst = _instance(rr_env, glb)
+        try:
+            with pytest.raises(_graph_tool_error()) as err:
+                inst.read_query({'cypher': "LOAD CSV FROM 'https://example.invalid/rr-test.csv' AS r RETURN r"})
+            assert str(err.value).startswith('Refused: LOAD CSV is not allowed on the read-only path')
+        finally:
+            glb.endGlobal()
+
+    def test_result_decode_failure_is_not_reported_as_invalid_cypher(self, rr_env, age_graph, monkeypatch):
+        """The statement was valid (and on execute it already ran): only its result could not be decoded."""
+        module = sys.modules[rr_env.iglobal_cls.__module__]
+        glb = _begin(rr_env, {'allow_execute': True})
+        inst = _instance(rr_env, glb)
+
+        def undecodable(value):
+            raise _age().AgeTranslationError('Failed to decode agtype value: unexpected token')
+
+        try:
+            monkeypatch.setattr(module, 'parse_agtype', undecodable)
+            with pytest.raises(_graph_tool_error()) as err:
+                inst.read_query({'cypher': 'MATCH (p:Person) RETURN p'})
+            headline, _, detail = str(err.value).partition('\n')
+            assert headline == 'Query result cannot be represented'
+            assert 'unexpected token' in detail
+            with pytest.raises(_graph_tool_error()) as err:
+                inst.execute({'query': "MATCH (p:Person {name: 'alice'}) SET p.seen = 1 RETURN p", 'shape': 'graph'})
+            headline, _, detail = str(err.value).partition('\n')
+            assert headline == 'Query result cannot be represented'
+            assert 'the statement itself ran' in detail
+        finally:
+            glb.endGlobal()
+
     def test_hints_are_raised_before_the_database(self, rr_env, age_graph, monkeypatch):
         glb = _begin(rr_env)
         inst = _instance(rr_env, glb)
@@ -617,6 +743,261 @@ class TestCapabilityProbes:
     @pytest.mark.parametrize('statement', ['RETURN timestamp()', 'RETURN toString(1)', 'MATCH (n) RETURN keys(n)'])
     def test_supported_construct_runs_on_live_age(self, rr_env, age_graph, statement):
         _cypher_admin(statement)
+
+
+def _hold_the_only_connection(glb, seconds):
+    """Check out the pool's one connection on another thread for ``seconds``; returns that thread."""
+    held = threading.Event()
+
+    def hold():
+        with glb.pool.connection():
+            held.set()
+            time.sleep(seconds)
+
+    thread = threading.Thread(target=hold)
+    thread.start()
+    assert held.wait(5), 'the holder never got the connection'
+    return thread
+
+
+class _StatementLog:
+    """Wraps a pool so every SQL text run on its connections is recorded (and still run)."""
+
+    def __init__(self, pool):
+        self._pool = pool
+        self.statements = []
+
+    def connection(self, **kw):
+        import contextlib
+
+        log = self.statements
+
+        class Cursor:
+            def __init__(self, cur):
+                self._cur = cur
+
+            def __enter__(self):
+                self._cur.__enter__()
+                return self
+
+            def __exit__(self, *exc):
+                return self._cur.__exit__(*exc)
+
+            def execute(self, query, *args):
+                log.append(query if isinstance(query, str) else repr(query))
+                return self._cur.execute(query, *args)
+
+            def __getattr__(self, name):
+                return getattr(self._cur, name)
+
+        class Conn:
+            def __init__(self, conn):
+                self._conn = conn
+
+            def cursor(self, *a, **k):
+                return Cursor(self._conn.cursor(*a, **k))
+
+            def __getattr__(self, name):
+                return getattr(self._conn, name)
+
+        @contextlib.contextmanager
+        def wrapped():
+            with self._pool.connection(**kw) as conn:
+                yield Conn(conn)
+
+        return wrapped()
+
+    def __getattr__(self, name):
+        return getattr(self._pool, name)
+
+
+class TestSchemaDeadline:
+    """refresh_schema's budget includes the wait for a pooled connection."""
+
+    def test_the_wait_for_a_connection_stops_when_the_budget_runs_out(self, rr_env, age_graph, monkeypatch):
+        """The wait is bounded by the budget left, not by the pool's acquire timeout (query timeout + 5 s)."""
+        from ai.common.graph.schema import SchemaBuilder
+
+        _set_pool_size(rr_env, monkeypatch, 1)
+        glb = _begin(rr_env)
+        assert glb.pool.acquire_timeout_s > 5
+        holder = _hold_the_only_connection(glb, 2.0)
+        log = _StatementLog(glb.pool)
+        monkeypatch.setattr(glb, 'pool', log)
+        try:
+            started = time.monotonic()
+            with pytest.raises(TimeoutError):
+                glb._reflect_schema_v2(SchemaBuilder(), started + 0.3)
+            waited = time.monotonic() - started
+            assert waited < 1.5, f'waited {waited:.2f} s for a connection on a 0.3 s budget'
+            assert log.statements == [], 'nothing may run once the budget is spent'
+        finally:
+            holder.join(5)
+            monkeypatch.undo()
+            assert glb.pool.idle == 1, 'the connection goes back to the pool'
+            glb.endGlobal()
+
+    def test_statement_timeout_is_the_budget_left_after_the_wait(self, rr_env, age_graph, monkeypatch):
+        import re
+
+        from ai.common.graph.schema import SchemaBuilder
+
+        _set_pool_size(rr_env, monkeypatch, 1)
+        glb = _begin(rr_env)
+        holder = _hold_the_only_connection(glb, 0.5)
+        log = _StatementLog(glb.pool)
+        monkeypatch.setattr(glb, 'pool', log)
+        try:
+            glb._reflect_schema_v2(SchemaBuilder(), time.monotonic() + 3.0)
+            (timeout,) = [s for s in log.statements if 'statement_timeout' in s]
+            ms = int(re.search(r"'(\d+)ms'", timeout).group(1))
+            assert ms <= 2600, f'statement_timeout {ms} ms ignores the ~500 ms spent waiting for the connection'
+        finally:
+            holder.join(5)
+            monkeypatch.undo()
+            glb.endGlobal()
+
+
+def _first_attempt_lost(glb, monkeypatch, seconds):
+    """The call's first attempt takes ``seconds``, then finds its connection lost before the main statement.
+
+    Simulated at the ``_run_plan`` seam, so it behaves the same behind the
+    pooler (TestRecovery shows that a really dropped connection takes this
+    path); the retry runs for real. Returns the start time of each attempt.
+    """
+    module = sys.modules[type(glb).__module__]
+    real_run_plan = glb._run_plan
+    attempts = []
+
+    def run_plan(conn, plan, *args, **kwargs):
+        attempts.append(time.monotonic())
+        if len(attempts) == 1:
+            time.sleep(seconds)
+            lost = psycopg2.OperationalError('server closed the connection unexpectedly')
+            raise module._ConnectionLost(lost, before_main=True)
+        return real_run_plan(conn, plan, *args, **kwargs)
+
+    monkeypatch.setattr(glb, '_run_plan', run_plan)
+    return attempts
+
+
+class _TakenBeforeTheRetry:
+    """Wraps a pool: just before the retry's checkout (``fresh=True``), another caller takes the only connection."""
+
+    def __init__(self, pool):
+        self._pool = pool
+        self._done = threading.Event()
+        self._holder = None
+
+    def connection(self, **kw):
+        if kw.get('fresh') and self._holder is None:
+            held = threading.Event()
+
+            def hold():
+                with self._pool.connection():
+                    held.set()
+                    self._done.wait(30)
+
+            self._holder = threading.Thread(target=hold)
+            self._holder.start()
+            assert held.wait(5), 'the other caller never got the connection'
+        return self._pool.connection(**kw)
+
+    def release(self):
+        self._done.set()
+        if self._holder is not None:
+            self._holder.join(10)
+
+    def __getattr__(self, name):
+        return getattr(self._pool, name)
+
+
+def _setting_ms(text):
+    """PostgreSQL's display of statement_timeout ('580ms', '1s', '2min') in milliseconds."""
+    import re
+
+    number, unit = re.fullmatch(r'(\d+)\s*(ms|s|min)?', text).groups()
+    return int(number) * {'ms': 1, 's': 1000, 'min': 60_000}[unit or 'ms']
+
+
+class TestRetryDeadline:
+    """A call retried after a lost connection gets only what is left of its budget (GX-CT-09).
+
+    The budget is what the first attempt may take: the wait for a connection
+    (the query timeout plus POOL_ACQUIRE_GRACE_S) plus the query timeout. With
+    a 1-second query timeout and a 2-second grace it is 4 seconds.
+    """
+
+    QUERY_TIMEOUT_MS = 1000
+
+    def _begin(self, rr_env, monkeypatch, grace_s=2.0):
+        module = sys.modules[rr_env.iglobal_cls.__module__]
+        monkeypatch.setattr(module, 'POOL_ACQUIRE_GRACE_S', grace_s)
+        _set_pool_size(rr_env, monkeypatch, 1)
+        glb = _begin(rr_env, {'query_timeout_ms': self.QUERY_TIMEOUT_MS})
+        acquire_s = self.QUERY_TIMEOUT_MS / 1000 + grace_s
+        assert glb.pool.acquire_timeout_s == pytest.approx(acquire_s)
+        return glb, acquire_s + self.QUERY_TIMEOUT_MS / 1000
+
+    def test_the_retry_waits_for_a_connection_only_until_the_budget_runs_out(self, rr_env, age_graph, monkeypatch):
+        """3.5 s of a 4 s budget are gone: the retry waits 0.5 s for a connection, not the 3 s acquire timeout."""
+        glb, budget_s = self._begin(rr_env, monkeypatch)
+        _first_attempt_lost(glb, monkeypatch, 3.5)
+        taken = _TakenBeforeTheRetry(glb.pool)
+        monkeypatch.setattr(glb, 'pool', taken)
+        try:
+            started = time.monotonic()
+            with pytest.raises(TimeoutError):
+                glb._run_query('MATCH (p:Person) RETURN count(p) AS c')
+            elapsed = time.monotonic() - started
+            assert elapsed < budget_s + 1.0, f'the call took {elapsed:.2f} s on a {budget_s:g} s budget'
+        finally:
+            taken.release()
+            glb.endGlobal()
+
+    @pytest.mark.parametrize('first_attempt_s, longest_ms', [(0.0, 1000), (3.4, 650)])
+    def test_the_retry_statement_gets_what_is_left_of_the_budget(
+        self, rr_env, age_graph, monkeypatch, first_attempt_s, longest_ms
+    ):
+        """The database itself reports the retry's statement timeout; an early retry keeps the whole query timeout."""
+        glb, _budget_s = self._begin(rr_env, monkeypatch)
+        attempts = _first_attempt_lost(glb, monkeypatch, first_attempt_s)
+        # Shaped like a translated plan: its own SET LOCAL statement_timeout, then the main statement.
+        plan = _plan(
+            [
+                f"SET LOCAL statement_timeout = '{self.QUERY_TIMEOUT_MS}ms'",
+                "SELECT current_setting('statement_timeout')",
+            ],
+            read_only=True,
+            columns=('timeout',),
+        )
+        try:
+            ((setting,),) = glb._execute_plan(plan, fetch_cap=1)
+            assert len(attempts) == 2
+            ms = _setting_ms(setting)
+            if first_attempt_s == 0:
+                assert ms == self.QUERY_TIMEOUT_MS
+            else:
+                assert 100 <= ms <= longest_ms, f'the retry ran with statement_timeout {setting} with ~0.6 s left'
+        finally:
+            glb.endGlobal()
+
+    def test_with_nothing_left_the_retry_runs_nothing(self, rr_env, age_graph, monkeypatch):
+        glb, budget_s = self._begin(rr_env, monkeypatch, grace_s=0.2)
+        attempts = _first_attempt_lost(glb, monkeypatch, budget_s + 0.1)
+        log = _StatementLog(glb.pool)
+        monkeypatch.setattr(glb, 'pool', log)
+        inst = _instance(rr_env, glb)
+        try:
+            with pytest.raises(_graph_tool_error()) as err:
+                inst.read_query({'cypher': 'MATCH (p:Person) RETURN count(p)'})
+            headline, _, detail = str(err.value).partition('\n')
+            assert headline == f'Query timed out after {round(budget_s * 1000)} ms'
+            assert 'no time was left to retry' in detail
+            assert len(attempts) == 1, 'the retry ran with no budget left'
+            assert log.statements == [], 'nothing may run once the budget is spent'
+        finally:
+            glb.endGlobal()
 
 
 class TestSchemaAndDialect:
@@ -722,5 +1103,166 @@ class TestSchemaAndDialect:
             assert out['read_boundary'] == 'read_only_tx' and out['limits']['statement_timeout_ms'] == 30000
             rules = ' '.join(glb._prompt_rules())
             assert 'Apache AGE 1.5.0' in rules and 'elementId()' in rules and 'at most 10' in rules
+        finally:
+            glb.endGlobal()
+
+
+# ---------------------------------------------------------------------------
+# The cloud tenant shape: a NOSUPERUSER role on its own database, holding
+# the grants the cloud provisioner gives a tenant role, on the default
+# 'rocketride' graph the provisioner creates. Every other test here runs as
+# the bootstrap superuser, which bypasses all of these grants.
+# ---------------------------------------------------------------------------
+
+TENANT_GRAPH = 'rocketride'
+
+
+def _tenant_grant_statements(graph, role):
+    return [
+        # Graph schema: the tenant owns the graph schema and its bootstrap tables.
+        f'GRANT ALL ON SCHEMA "{graph}" TO "{role}"',
+        f'GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA "{graph}" TO "{role}"',
+        f'GRANT ALL ON ALL SEQUENCES IN SCHEMA "{graph}" TO "{role}"',
+        f'ALTER SCHEMA "{graph}" OWNER TO "{role}"',
+        f'ALTER TABLE "{graph}"._ag_label_vertex OWNER TO "{role}"',
+        f'ALTER TABLE "{graph}"._ag_label_edge OWNER TO "{role}"',
+        # The public schema, and read/execute access to the AGE catalog.
+        f'GRANT ALL ON SCHEMA public TO "{role}"',
+        f'GRANT USAGE ON SCHEMA ag_catalog TO "{role}"',
+        f'GRANT SELECT ON ALL TABLES IN SCHEMA ag_catalog TO "{role}"',
+        f'GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA ag_catalog TO "{role}"',
+        f'GRANT ALL ON ALL SEQUENCES IN SCHEMA ag_catalog TO "{role}"',
+    ]
+
+
+@pytest.fixture(scope='class')
+def tenant_db():
+    """A disposable tenant database and role, provisioned like the cloud does; dropped afterwards."""
+    import uuid
+
+    from urllib.parse import urlsplit, urlunsplit
+
+    suffix = uuid.uuid4().hex[:8]
+    database, role, password = f'rr_gx_tenant_{suffix}', f'rr_gx_tenant_{suffix}_rw', f'tenant-{uuid.uuid4().hex}'
+    parts = urlsplit(ADMIN_DSN)
+    host = parts.netloc.rpartition('@')[2]
+    admin = _admin()
+    try:
+        with admin.cursor() as cur:
+            cur.execute(f'CREATE DATABASE "{database}"')
+            cur.execute(f'CREATE ROLE "{role}" LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE PASSWORD %s', (password,))
+            # Database access: closed to PUBLIC, all privileges for the tenant role.
+            cur.execute(f'REVOKE CONNECT, TEMPORARY ON DATABASE "{database}" FROM PUBLIC')
+            cur.execute(f'GRANT ALL PRIVILEGES ON DATABASE "{database}" TO "{role}"')
+        setup = psycopg2.connect(urlunsplit(parts._replace(path=f'/{database}')), connect_timeout=5)
+        setup.autocommit = True
+        try:
+            with setup.cursor() as cur:
+                cur.execute('CREATE EXTENSION IF NOT EXISTS age')
+                cur.execute('SET search_path = ag_catalog, "$user", public')
+                cur.execute('SELECT create_graph(%s)', (TENANT_GRAPH,))
+                for statement in _tenant_grant_statements(TENANT_GRAPH, role):
+                    cur.execute(statement)
+        finally:
+            setup.close()
+        dsn = urlunsplit(parts._replace(netloc=f'{role}:{password}@{host}', path=f'/{database}'))
+        # The tenant seeds its own graph: the grants must also allow writes.
+        seed = psycopg2.connect(dsn, connect_timeout=5)
+        seed.autocommit = True
+        try:
+            with seed.cursor() as cur:
+                cur.execute('SET search_path = ag_catalog, "$user", public')
+                cur.execute(
+                    f"SELECT * FROM cypher('{TENANT_GRAPH}', $$ "
+                    "CREATE (a:Person {name: 'ada', age: 36})-[:KNOWS {since: 2020}]->(b:Person {name: 'bo', age: 29}), "
+                    "(a)-[:WORKS_AT]->(:Company {name: 'Tenant Co'}) $$) AS (v agtype)"
+                )
+        finally:
+            seed.close()
+        yield types.SimpleNamespace(dsn=dsn, database=database, role=role)
+    finally:
+        with admin.cursor() as cur:
+            cur.execute(f'DROP DATABASE IF EXISTS "{database}" WITH (FORCE)')
+            cur.execute(f'DROP ROLE IF EXISTS "{role}"')
+        admin.close()
+
+
+def _begin_as_tenant(rr_env, tenant_db, monkeypatch, config=None):
+    """The node as a cloud task runs it: the resolved tenant DSN, the default graph name."""
+    monkeypatch.setenv('ROCKETRIDE_DB_DSN', tenant_db.dsn)
+    glb = rr_env.iglobal_cls()
+    glb.glb = types.SimpleNamespace(logicalType='rocketride_graph', connConfig=dict(config or {}))
+    glb.beginGlobal()
+    return glb, _instance(rr_env, glb)
+
+
+class TestTenantRole:
+    def test_the_role_is_not_a_superuser(self, tenant_db):
+        conn = psycopg2.connect(tenant_db.dsn, connect_timeout=5)
+        try:
+            with conn.cursor() as cur:
+                cur.execute('SELECT rolsuper, rolcreaterole, rolcreatedb FROM pg_roles WHERE rolname = current_user')
+                assert cur.fetchone() == (False, False, False)
+        finally:
+            conn.close()
+
+    def test_read_query(self, rr_env, tenant_db, monkeypatch):
+        glb, inst = _begin_as_tenant(rr_env, tenant_db, monkeypatch)
+        try:
+            assert glb.graph_name == TENANT_GRAPH
+            out = inst.read_query(
+                {'cypher': 'MATCH (a:Person)-[r:KNOWS]->(b:Person) RETURN a, r, b.name', 'params': None}
+            )
+            a, r, name = out['rows'][0]
+            assert a['properties']['name'] == 'ada' and r['type'] == 'KNOWS' and name == 'bo'
+            params = inst.read_query(
+                {'cypher': 'MATCH (p:Person) WHERE p.name = $n RETURN p.age', 'params': {'n': 'bo'}, 'limit': 5}
+            )
+            assert params['rows'] == [[29]] and params['truncated'] is False
+        finally:
+            glb.endGlobal()
+
+    def test_get_and_refresh_schema(self, rr_env, tenant_db, monkeypatch):
+        glb, inst = _begin_as_tenant(rr_env, tenant_db, monkeypatch)
+        try:
+            assert set(inst.get_schema({})['labels']) == {'Person', 'Company'}
+            block = inst.refresh_schema({})['schema']
+            assert block['error'] is None and block['stale'] is False
+            assert {label['name'] for label in block['labels']} == {'Person', 'Company'}
+            rels = {r['type']: r for r in block['relationship_types']}
+            assert rels['KNOWS']['endpoints'] == [{'start': 'Person', 'end': 'Person', 'observed': True}]
+            assert rels['WORKS_AT']['endpoints'] == [{'start': 'Person', 'end': 'Company', 'observed': True}]
+        finally:
+            glb.endGlobal()
+
+    def test_dialect(self, rr_env, tenant_db, monkeypatch):
+        glb, inst = _begin_as_tenant(rr_env, tenant_db, monkeypatch)
+        try:
+            out = inst.dialect({})
+            assert out['dialect'] == 'age' and out['graph'] == TENANT_GRAPH
+            assert out['database'] == tenant_db.database
+            assert out['engine']['name'] == 'Apache AGE' and out['engine']['version'] == glb.age_version
+            assert out['read_boundary'] == 'read_only_tx'
+            assert tenant_db.role not in str(out)
+        finally:
+            glb.endGlobal()
+
+    def test_read_path_refuses_writes_and_execute_needs_allow_execute(self, rr_env, tenant_db, monkeypatch):
+        glb, inst = _begin_as_tenant(rr_env, tenant_db, monkeypatch)
+        try:
+            with pytest.raises(_graph_tool_error(), match='^Refused: '):
+                inst.read_query({'cypher': "CREATE (:Evil {name: 'x'})"})
+            with pytest.raises(ValueError, match='execute tool is disabled'):
+                inst.execute({'query': "CREATE (:Evil {name: 'x'})", 'shape': 'graph'})
+            assert inst.read_query({'cypher': 'MATCH (n:Evil) RETURN count(n)'})['rows'] in ([[0]], [])
+        finally:
+            glb.endGlobal()
+
+    def test_execute_writes_a_new_label_as_the_tenant(self, rr_env, tenant_db, monkeypatch):
+        glb, inst = _begin_as_tenant(rr_env, tenant_db, monkeypatch, {'allow_execute': True})
+        try:
+            out = inst.execute({'query': "CREATE (n:TenantNote {text: 'hi'}) RETURN n", 'shape': 'graph'})
+            assert out['rows'][0][0]['labels'] == ['TenantNote']
+            assert 'TenantNote' in inst.refresh_schema({})['labels']
         finally:
             glb.endGlobal()

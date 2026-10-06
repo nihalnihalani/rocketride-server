@@ -52,7 +52,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 from rocketlib import debug
 
-from ..base import AccountBase
+from ..base import LEGACY_DB_BROKER_ENV, AccountBase
 
 
 class Account(AccountBase):
@@ -430,6 +430,15 @@ class Account(AccountBase):
                 # Only accept ROCKETRIDE_* keys — reject anything else
                 raw = args.get('env', {})
                 env = {k: v for k, v in raw.items() if k.startswith('ROCKETRIDE_')}
+
+                # The former DB broker names are refused here as at startup
+                # (any spelling): broker settings are operator-only RR_* values.
+                former = sorted(k for k in env if k.upper() in LEGACY_DB_BROKER_ENV)
+                if former:
+                    raise ValueError(
+                        f'{", ".join(former)}: former DB broker setting name(s), refused. The DB broker '
+                        'settings are RR_DB_BROKER_URL and RR_DB_BROKER_TOKEN, set by the server operator.'
+                    )
 
                 # Step 1: Remove existing ROCKETRIDE_* keys from os.environ
                 # so that deleted keys don't linger in memory.

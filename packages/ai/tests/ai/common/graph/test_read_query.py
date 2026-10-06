@@ -248,6 +248,26 @@ class TestInvariantAndErrors:
         assert inst.IGlobal.raw_calls == []
         assert len(inst.IGlobal.read_calls) == 1
 
+    @pytest.mark.parametrize('allow_execute', [False, True])
+    def test_load_csv_is_refused_before_the_driver(self, allow_execute):
+        inst = make(allow_execute=allow_execute)
+        with pytest.raises(GraphToolError) as err:
+            inst.read_query({'cypher': "LOAD CSV FROM 'https://example.invalid/a.csv' AS r RETURN r"})
+        assert str(err.value).startswith('Refused: LOAD CSV is not allowed on the read-only path\n')
+        assert inst.IGlobal.read_calls == []
+
+    def test_unterminated_text_is_invalid_input_before_the_driver(self):
+        inst = make()
+        with pytest.raises(GraphToolError) as err:
+            inst.read_query({'cypher': "MATCH (n) WHERE n.name = 'open RETURN n"})
+        assert str(err.value) == 'Invalid read_query input: unterminated string literal'
+        assert inst.IGlobal.read_calls == []
+
+    def test_execute_does_not_apply_the_read_query_rule(self):
+        inst = make([[vertex(1)]], allow_execute=True)
+        inst.execute({'query': "LOAD CSV FROM 'file:///x' AS r RETURN r", 'shape': 'graph'})
+        assert [call[0] for call in inst.IGlobal.raw_calls] == ['graph']
+
     def test_driver_errors_use_the_shared_formatter(self):
         inst = make(error=TimeoutError('canceling statement due to statement timeout'))
         with pytest.raises(GraphToolError) as err:
@@ -288,3 +308,130 @@ class TestInvariantAndErrors:
     def test_execute_rejects_unknown_shape(self):
         with pytest.raises(ValueError, match='"shape" must be one of'):
             make(allow_execute=True).execute({'query': 'RETURN 1', 'shape': 'table'})
+
+
+# ---------------------------------------------------------------------------
+# natural-language read paths (get_data, get_query, the questions lane)
+# ---------------------------------------------------------------------------
+
+
+class TestNaturalLanguageGate:
+    """GraphGlobalBase._read_only_refusal applies read_query's statement rule to generated Cypher."""
+
+    @pytest.mark.parametrize(
+        'cypher',
+        [
+            "LOAD/**/CSV FROM 'https://example.invalid/a.csv' AS r RETURN r",
+            "MATCH (n) WITH n LOAD/* x */CSV FROM 'file:///a.csv' AS r RETURN r",
+        ],
+    )
+    def test_load_csv_is_refused_whatever_separates_the_words(self, cypher):
+        assert FakeGlobal()._read_only_refusal(cypher) == 'Refused: LOAD CSV is not allowed on the read-only path'
+
+    def test_unterminated_text_is_refused(self):
+        refusal = FakeGlobal()._read_only_refusal("MATCH (n) WHERE n.x = 'open LOAD/**/CSV FROM 'x' AS r RETURN r")
+        assert refusal == 'Invalid generated query input: unterminated string literal'
+
+    def test_writes_keep_their_message(self):
+        assert (
+            FakeGlobal()._read_only_refusal('MATCH (n) DELETE n') == 'Generated query contains write or admin clauses'
+        )
+
+    @pytest.mark.parametrize(
+        'cypher',
+        [
+            'MATCH (n) RETURN n',
+            "MATCH (n) WHERE n.note = 'LOAD CSV' RETURN n /* LOAD CSV */",
+            'MATCH (n:Load) RETURN n.csv AS csv',
+        ],
+    )
+    def test_reads_pass(self, cypher):
+        assert FakeGlobal()._read_only_refusal(cypher) is None
+
+    def test_get_query_refuses_generated_load_csv(self):
+        inst = make()
+        cypher = "LOAD/**/CSV FROM 'https://example.invalid/a.csv' AS r RETURN r"
+        inst._buildQuery = lambda question, limit=0: {'isValid': True, 'query': cypher}
+        out = inst.get_query({'question': 'import a file'})
+        assert out == {
+            'error': 'Refused: LOAD CSV is not allowed on the read-only path',
+            'query': cypher,
+            'valid': False,
+        }
+
+
+# ---------------------------------------------------------------------------
+# Text that engines read differently (GX-CMP-01): every read path
+# ---------------------------------------------------------------------------
+
+_URL = "'https://example.invalid/x.csv'"
+
+# (statement, headline with {tool} for the calling tool's name)
+SPLIT_READINGS = [
+    (
+        f'MATCH (n:P) WITH n SKIP 0LOAD CSV FROM {_URL} AS r RETURN r',
+        "Invalid {tool} input: the number 0 runs into 'L'",
+    ),
+    (
+        f'MATCH (n) WHERE n.v > 0.5LOAD CSV FROM {_URL} AS r RETURN r',
+        "Invalid {tool} input: the number 0.5 runs into 'L'",
+    ),
+    (
+        f'MATCH (n) WHERE n.v > 1e3LOAD CSV FROM {_URL} AS r RETURN r',
+        "Invalid {tool} input: the number 1e3 runs into 'L'",
+    ),
+    (
+        f"MATCH (n:P) //\r'\nLOAD CSV FROM {_URL} AS r RETURN r //'",
+        'Refused: LOAD CSV is not allowed on the read-only path',
+    ),
+    (
+        f'MATCH (n:P) WITH n /*/ LOAD CSV FROM {_URL} AS r RETURN r //*/',
+        "Invalid {tool} input: '/' inside a block comment",
+    ),
+    (
+        f"MATCH (n:P) WITH n /*'/LOAD CSV FROM {_URL} AS r RETURN r /*'*/",
+        "Invalid {tool} input: '/' inside a block comment",
+    ),
+]
+
+
+class TestSplitReadings:
+    @pytest.mark.parametrize('cypher,headline', SPLIT_READINGS)
+    def test_read_query_refuses_before_the_driver(self, cypher, headline):
+        inst = make()
+        with pytest.raises(GraphToolError) as err:
+            inst.read_query({'cypher': cypher})
+        assert err.value.headline == headline.format(tool='read_query')
+        assert inst.IGlobal.read_calls == []
+
+    @pytest.mark.parametrize('cypher,headline', SPLIT_READINGS)
+    def test_generated_query_is_refused(self, cypher, headline):
+        assert FakeGlobal()._read_only_refusal(cypher) == headline.format(tool='generated query')
+
+    @pytest.mark.parametrize('cypher,headline', SPLIT_READINGS)
+    def test_get_query_returns_the_refusal(self, cypher, headline):
+        inst = make()
+        inst._buildQuery = lambda question, limit=0: {'isValid': True, 'query': cypher}
+        out = inst.get_query({'question': 'anything'})
+        assert out == {'error': headline.format(tool='generated query'), 'query': cypher, 'valid': False}
+
+    def test_non_ascii_names_reach_a_driver_that_accepts_them(self):
+        """Only drivers that set read_ascii_only refuse non-ASCII code (FalkorDB); the others are unchanged."""
+        inst = make()
+        assert FakeGlobal.read_ascii_only is False
+        inst.read_query({'cypher': 'MATCH (\u00e9:\u00dcn\u00efcode) RETURN \u00e9'})
+        assert [call[0] for call in inst.IGlobal.read_calls] == ['MATCH (\u00e9:\u00dcn\u00efcode) RETURN \u00e9']
+        assert FakeGlobal()._read_only_refusal('MATCH (\u00e9:\u00dcn\u00efcode) RETURN \u00e9') is None
+
+    def test_a_driver_that_sets_read_ascii_only_refuses_non_ascii_code(self):
+        inst = make()
+        inst.IGlobal.read_ascii_only = True
+        with pytest.raises(GraphToolError) as err:
+            inst.read_query({'cypher': 'MATCH (n)\u200bRETURN n'})
+        assert err.value.headline == 'Invalid read_query input: character U+200B outside a string or back-quoted name'
+        assert inst.IGlobal.read_calls == []
+        assert inst.IGlobal._read_only_refusal('MATCH (n)\u2028RETURN n') == (
+            'Invalid generated query input: character U+2028 outside a string or back-quoted name'
+        )
+        inst.read_query({'cypher': "MATCH (n:`\u00dcn\u00efcode`) WHERE n.name = 'Jos\u00e9' RETURN n"})
+        assert len(inst.IGlobal.read_calls) == 1
