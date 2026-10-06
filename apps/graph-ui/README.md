@@ -138,7 +138,7 @@ against every shipped theme, is in
 
 | Action | What it does |
 |---|---|
-| Expand | Fetches up to 100 neighbours that are not already drawn. |
+| Expand | Fetches up to 100 neighbours that are not already drawn. The node's relationships already on the canvas are left out of the request, so expanding again fetches the next ones, whatever the node's row limit. On Apache AGE only the first 200 drawn relationships of a node can be left out; past that, the node's row limit can stop an expansion, and it then says that expanding again returns the same rows. |
 | Collapse | Removes what hangs only from this node. |
 | Dismiss | Removes the node from the canvas. |
 | Inspect | Opens the node's labels, id and properties, exact and complete, with Copy JSON. |

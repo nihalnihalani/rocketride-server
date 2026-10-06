@@ -120,13 +120,21 @@ export function canvasBudgetText(model: Pick<IGraphModel, 'nodes' | 'resultNodes
 /**
  * What an expansion did, for the live region and the status line.
  *
+ * An expansion leaves the relationships already drawn out of its request, so "expand again" asks for the next ones.
+ * The one case where it cannot help is an answer the node cut that held nothing new (`stuckAt`): repeating the same
+ * request returns the same rows, so the sentence says that instead.
+ *
  * @param added - New neighbours drawn.
  * @param skipped - New neighbours left out by a cap.
  * @param incomplete - True when the node answered with more rows than were used (more neighbours exist).
  * @param budget - The canvas budget that stopped it, if any.
+ * @param stuckAt - The node's row limit, when its cut answer held nothing new; otherwise null.
  * @returns A sentence.
  */
-export function expandText(added: number, skipped: number, incomplete: boolean, budget: null | 'nodes' | 'relationships'): string {
+export function expandText(added: number, skipped: number, incomplete: boolean, budget: null | 'nodes' | 'relationships', stuckAt: number | null = null): string {
+	if (stuckAt !== null && added === 0 && skipped === 0 && budget === null) {
+		return `No new neighbours: the node stops at ${num(stuckAt)} rows and every row it returned is already drawn, so expanding again returns the same rows. Write a query by hand to see its other relationships.`;
+	}
 	if (added === 0 && skipped === 0 && !incomplete) return 'No new neighbours.';
 	const head = `Added ${num(added)} ${added === 1 ? 'neighbour' : 'neighbours'}.`;
 	if (budget === 'nodes') return `${head} The canvas holds its maximum of ${num(MAX_NODES)} nodes; dismiss some to make room.`;

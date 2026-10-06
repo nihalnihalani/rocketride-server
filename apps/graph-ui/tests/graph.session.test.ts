@@ -73,7 +73,7 @@ test('expand sends one parameterised read_query, draws only NEW neighbours and s
 	session.load(base());
 	await session.expand('a');
 	assert.equal(log.recipes.length, 1);
-	assert.deepEqual(log.recipes[0].params, { id: 'a' });
+	assert.deepEqual(log.recipes[0].params, { id: 'a', drawn: ['r1'] }, 'the relationship already drawn is left out by parameter');
 	assert.ok(!log.recipes[0].cypher.includes("'a'"));
 	const s = session.getState();
 	assert.deepEqual([...s.model.nodes.keys()], ['a', 'b', 'c']);
@@ -97,6 +97,68 @@ test('an expansion that fills its row allowance says more may exist', async () =
 	s2.load(envelope([[node('a')]]));
 	await s2.expand('a');
 	assert.match(s2.getState().notice?.text ?? '', /This node has more relationships than were fetched; expand again for more\./);
+});
+
+/**
+ * A hub `a` with `size` neighbours behind a node that applies its own row cap (`row_limit = min(limit, cap)`, as
+ * graph_instance_base.py does) and honours the ids an expansion leaves out (`$drawn` on Neo4j and FalkorDB, `$d0..`
+ * on AGE). Rows come back in one stable order, as a database without ORDER BY usually returns them.
+ *
+ * @param size - Neighbours of the hub.
+ * @param cap - The node's row cap.
+ * @returns The scripted answer.
+ */
+function cappedHub(size: number, cap: number) {
+	const all = Array.from({ length: size }, (_, i) => [node('a'), rel(`x${i}`, 'T', 'a', `n${i}`), node(`n${i}`)] as GraphValue[]);
+	return (recipe: IRecipe): ReadQueryResult => {
+		const left = new Set<string>();
+		for (const [key, value] of Object.entries(recipe.params)) {
+			if (key === 'drawn' && Array.isArray(value)) value.forEach((id) => left.add(id));
+			else if (/^d\d+$/.test(key) && typeof value === 'string') left.add(value);
+		}
+		const rowLimit = Math.min(recipe.limit, cap);
+		const matched = all.filter((row) => !left.has((row[1] as { id: string }).id));
+		const cut = matched.length > rowLimit;
+		// OPTIONAL MATCH: the node itself answers even when nothing new hangs from it.
+		const rows = matched.length === 0 ? [[node('a'), null, null]] : matched.slice(0, rowLimit);
+		return envelope(rows, { row_limit: rowLimit, truncated: cut, truncated_by: cut ? 'rows' : null });
+	};
+}
+
+// GX-T1-02: the request asked for `shown + wanted + 1` rows with nothing left out. Once that passed the node's row cap
+// (250 on a default FalkorDB node), every repeat got the same first 250 rows, all drawn, and was told "expand again".
+test('repeating Expand on a hub behind a row cap keeps adding the next neighbours until there are none', async () => {
+	const { session, log } = rig(NEO, cappedHub(450, 250));
+	session.load(envelope([[node('a')]]));
+	const texts: string[] = [];
+	for (let i = 0; i < 5; i++) {
+		await session.expand('a');
+		texts.push(session.getState().notice?.text ?? '');
+	}
+	assert.equal(session.getState().model.nodes.size, 451, 'every neighbour is drawn');
+	for (const text of texts.slice(0, 4)) assert.match(text, /^Added 100 neighbours\. .*expand again/);
+	assert.equal(texts[4], 'Added 50 neighbours.');
+	assert.ok(log.recipes.every((r) => r.limit === 101), 'drawn relationships are left out, so wanted + 1 rows are enough');
+	await session.expand('a');
+	assert.equal(session.getState().notice?.text, 'No new neighbours.');
+});
+
+test('on AGE, past the relationships it can leave out, an expansion the row cap stops says a repeat cannot help', async () => {
+	const { session } = rig(AGE, cappedHub(600, 250));
+	session.load(envelope([[node('a')]]));
+	const drawn: number[] = [];
+	const texts: string[] = [];
+	for (let i = 0; i < 6; i++) {
+		await session.expand('a');
+		drawn.push(session.getState().model.nodes.size - 1);
+		texts.push(session.getState().notice?.text ?? '');
+	}
+	assert.deepEqual(drawn, [100, 200, 300, 400, 450, 450], 'each repeat that can make progress does');
+	assert.match(texts[4], /^Added 50 neighbours\. This node has more relationships than were fetched; expand again for more\.$/);
+	assert.match(texts[5], /the node stops at 250 rows/);
+	assert.match(texts[5], /expanding again returns the same rows/);
+	assert.doesNotMatch(texts[5], /expand again for more/);
+	assert.equal(session.getState().notice?.variant, 'warning');
 });
 
 test('only one request at a time: a second action is declined with a sentence and sends nothing', async () => {
@@ -160,6 +222,17 @@ test('an element that is no longer found is said to be, not replaced by another'
 	await session.expand('a');
 	assert.match(session.getState().notice?.text ?? '', /no longer found: element ids are live handles\. Nothing was added\./);
 	assert.equal(session.getState().model.nodes.size, 2);
+});
+
+test('a node that answers with itself alone has no relationships, or none that are not drawn', async () => {
+	const { session } = rig(NEO, () => envelope([[node('a', ['P'], { name: 'A' }), null, null]]));
+	session.load(envelope([[node('a', ['P'], { name: 'A' })]]));
+	await session.expand('a');
+	assert.equal(session.getState().notice?.text, 'A has no relationships in the database. Nothing was added.');
+	const { session: drawn } = rig(NEO, () => envelope([[node('a', ['P'], { name: 'A' }), null, null]]));
+	drawn.load(base());
+	await drawn.expand('a');
+	assert.equal(drawn.getState().notice?.text, 'No new neighbours.');
 });
 
 test('expanding without a probed engine sends nothing and says why', async () => {

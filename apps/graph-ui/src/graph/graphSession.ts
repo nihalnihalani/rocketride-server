@@ -346,13 +346,20 @@ export function createGraphSession(deps: IGraphSessionDeps): IGraphSession {
 			const mine = epoch;
 			set({ busy: 'expand', notice: null });
 			deps.announce(`Expanding ${captionFor(node)}.`);
-			const answer = await ask(expandNeighbors(engine, id, MAX_NEW_NEIGHBORS, relationshipsOf(state.model, id).length), mine);
+			// The relationships already drawn are left out of the request, so a repeat asks for the next ones.
+			const drawn = relationshipsOf(state.model, id).map((rel) => rel.id);
+			const answer = await ask(expandNeighbors(engine, id, MAX_NEW_NEIGHBORS, drawn), mine);
 			if (epoch !== mine) return;
 			set({ busy: null });
 			if (!answer) return;
 			const entities = collectEntities(answer.result.rows);
-			if (entities.relationships.size === 0 && !entities.nodes.has(id)) {
-				say(`${captionFor(node)} has no relationships in the database, or it is no longer found: element ids are live handles. Nothing was added.`, 'info');
+			// The recipe matches the node on its own, so an answer without it means the id no longer finds it.
+			if (!entities.nodes.has(id)) {
+				say(`${captionFor(node)} is no longer found: element ids are live handles. Nothing was added.`, 'warning');
+				return;
+			}
+			if (entities.relationships.size === 0 && drawn.length === 0) {
+				say(`${captionFor(node)} has no relationships in the database. Nothing was added.`);
 				return;
 			}
 			const conflicts = identityConflicts(state.model, entities.nodes.values(), entities.relationships.values());
@@ -362,8 +369,11 @@ export function createGraphSession(deps: IGraphSessionDeps): IGraphSession {
 			}
 			const outcome = expandNode(state.model, id, entities, MAX_NEW_NEIGHBORS);
 			const incomplete = answer.result.truncated || answer.result.rows.length >= answer.recipe.limit;
+			// A cut answer with nothing new in it: the same request returns the same rows (drawn relationships AGE could
+			// not leave out filled the node's row cap), so "expand again" would never help.
+			const stuck = incomplete && outcome.addedNodes.length === 0 && outcome.addedRelationships.length === 0 && outcome.skippedNeighbors === 0 && outcome.budget === null;
 			set({ model: outcome.model, hint: { centerId: id, newIds: outcome.addedNodes } });
-			say(expandText(outcome.addedNodes.length, outcome.skippedNeighbors, incomplete, outcome.budget));
+			say(expandText(outcome.addedNodes.length, outcome.skippedNeighbors, incomplete, outcome.budget, stuck ? answer.result.row_limit : null), stuck ? 'warning' : 'info');
 		},
 
 		collapse(id) {
