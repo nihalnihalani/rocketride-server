@@ -143,7 +143,9 @@ async def main():
                 print(f'running {name} ({pid})')
                 continue
             try:
-                await client.use(pipeline=pipeline(name, pid, provider, cfg), source='tools_1')
+                # ttl=0: run until --stop. The engine stops a task that is idle for its
+                # TTL (15 minutes by default), so a lane run later would find it gone.
+                await client.use(pipeline=pipeline(name, pid, provider, cfg), source='tools_1', ttl=0)
                 print(f'started {name} ({pid})')
             except Exception as e:  # noqa: BLE001
                 print(f'FAILED {name}: {type(e).__name__}: {str(e)[:200]}')
