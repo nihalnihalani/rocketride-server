@@ -9,7 +9,7 @@
 
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { TEXT_CHECK_SENTENCE, confirmationParagraphs, describeWrites } from '../src/graph/writeConfirm';
+import { TEXT_CHECK_SENTENCE, WRITE_CONSOLE_BANNER, confirmationParagraphs, describeWrites } from '../src/graph/writeConfirm';
 import { targetsToRun } from '../src/cypher/targets';
 
 const all = (text: string) => targetsToRun(text, { start: 0, end: 0 }, 0, true);
@@ -52,4 +52,12 @@ test('every confirmation says it is a text check and that nothing is rolled back
 test('long statements are excerpted to three lines in the list', () => {
 	const c = describeWrites(all('CREATE (a)\nSET a.x = 1\nSET a.y = 2\nSET a.z = 3\nSET a.w = 4'));
 	assert.equal(c.mutating[0].excerpt.split('\n').length, 3);
+});
+
+// GX-FE-16 (4): the banner said "You are asked to confirm before anything is sent", but a batch the text check does not
+// flag is sent through execute with no dialog.
+test('the write console banner says which statements are confirmed, not that every one is', () => {
+	assert.doesNotMatch(WRITE_CONSOLE_BANNER, /You are asked to confirm before anything is sent/);
+	assert.match(WRITE_CONSOLE_BANNER, /Statements that look like they change data are listed for you to confirm before anything is sent; anything else is sent when you press Execute\./);
+	assert.ok(WRITE_CONSOLE_BANNER.endsWith(TEXT_CHECK_SENTENCE));
 });

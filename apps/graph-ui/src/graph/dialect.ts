@@ -43,7 +43,7 @@ import type { GraphDialect } from '../cypher/quote';
 // TYPES
 // =============================================================================
 
-/** How the node keeps `read_query` read-only (descriptive; the database's own permissions are the real boundary). */
+/** How the node keeps `read_query` read-only (descriptive: what the database enforces, as the node reports it). */
 export type ReadBoundary = 'database_role' | 'read_session' | 'ro_command' | 'read_only_tx' | 'unknown';
 
 /** Limits the node reports. */

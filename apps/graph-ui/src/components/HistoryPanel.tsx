@@ -74,6 +74,18 @@ export function entrySummary(entry: IHistoryEntry<'cypher'>): string {
 	}
 }
 
+/**
+ * What an empty History list says.
+ *
+ * @param entries - How many entries the connection has before the search and Pinned only are applied.
+ * @param recording - Whether recording is on for the connection.
+ * @returns The title and description.
+ */
+export function historyEmptyText(entries: number, recording: boolean): { title: string; description: string } {
+	if (entries > 0) return { title: 'No entries match', description: 'No statement or note matches the search, or none of them is pinned. Clear the search or turn off Pinned only.' };
+	return recording ? { title: 'No history yet', description: 'Statements you run on this connection appear here.' } : { title: 'Recording is off for this connection', description: 'Turn recording on to keep the statements you run.' };
+}
+
 const styles = {
 	row: { borderBottom: '1px solid var(--rr-border)', padding: '8px 0' } as CSSProperties,
 	text: { fontFamily: 'var(--rr-font-mono, monospace)', fontSize: 12, whiteSpace: 'pre-wrap', wordBreak: 'break-word', margin: '4px 0' } as CSSProperties,
@@ -115,7 +127,7 @@ export const HistoryPanel: React.FC<IHistoryPanelProps> = ({ endpointKey, nodeNa
 				<InputField value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search statements and notes" aria-label="Search statements and notes" />
 				{shown.length === 0 ? (
 					<div style={{ marginTop: 16 }}>
-						<EmptyState icon={<GraphIcon />} title={recording ? 'No history yet' : 'Recording is off for this connection'} description={recording ? 'Statements you run on this connection appear here.' : 'Turn recording on to keep the statements you run.'} />
+						<EmptyState icon={<GraphIcon />} {...historyEmptyText(entries.length, recording)} />
 					</div>
 				) : (
 					<ul style={{ listStyle: 'none', padding: 0, margin: '12px 0 0' }}>

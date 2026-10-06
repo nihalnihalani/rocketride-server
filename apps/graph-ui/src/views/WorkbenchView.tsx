@@ -37,7 +37,7 @@ import { announcer, graphEndpoints } from '../adapters/explorer';
 import { useGraphEndpoints, useWorkbenchRequest } from '../adapters/react';
 import { typePreview, labelPreview, isRefusal } from '../cypher/recipes';
 import { CONNECTIONS_URI, writeUri } from '../graph/addresses';
-import { connectionView } from '../graph/connections';
+import { connectionView, surfaceGate } from '../graph/connections';
 import { canWrite, engineText, parseDialect, targetText } from '../graph/dialect';
 import { getDocs } from '../docs';
 import { GraphIcon } from '../icons';
@@ -45,7 +45,7 @@ import { styles } from '../styles';
 import AskBar from '../components/AskBar';
 import HistoryPanel from '../components/HistoryPanel';
 import RunSurface from '../components/RunSurface';
-import type { IRunSurfaceProps } from '../components/RunSurface';
+import { createLoadSlot } from '../graph/loadSlot';
 
 /** A sidebar request older than this when the workbench mounts is not replayed. */
 const REQUEST_FRESH_MS = 3000;
@@ -68,14 +68,24 @@ export const WorkbenchView: React.FC<IWorkbenchViewProps> = ({ endpoint }) => {
 	const dialect = useMemo(() => (probe?.ok ? parseDialect(probe.info) : null), [probe]);
 	const view = connectionView(endpoint, probe);
 	const writable = canWrite(dialect);
+	// A surface that has been on screen stays through a re-probe (see surfaceGate): it pauses instead of unmounting.
+	const opened = useRef(false);
+	if (view.openable) opened.current = true;
+	const gate = surfaceGate(view, opened.current);
 
 	const [historyOpen, setHistoryOpen] = useState(false);
-	const [loadRequest, setLoadRequest] = useState<NonNullable<IRunSurfaceProps['loadRequest']>>({ text: '', seq: 0, run: false });
-	const seq = useRef(0);
+	// One slot for the life of the document: the surface takes each request once (see loadSlot.ts).
+	const [slot] = useState(createLoadSlot);
+	const [loadSeq, setLoadSeq] = useState(0);
+	const gateNow = useRef(gate);
+	gateNow.current = gate;
+	// A run is asked for only while the surface is on screen and can run it: nothing is queued to run by itself later.
 	const put = useCallback((text: string, run: boolean) => {
-		seq.current += 1;
-		setLoadRequest({ text, seq: seq.current, run });
-	}, []);
+		const now = gateNow.current;
+		const runNow = run && now.mounted && now.paused === null;
+		if (run && !runNow) announcer.announce(`The statement was put in the editor but not run. ${now.paused ?? 'This connection cannot be browsed yet.'}`);
+		setLoadSeq(slot.put({ text, run: runNow }));
+	}, [slot]);
 
 	// No probe yet (opened from a stale link or right after a refresh): ask the node who it is.
 	useEffect(() => {
@@ -115,18 +125,20 @@ export const WorkbenchView: React.FC<IWorkbenchViewProps> = ({ endpoint }) => {
 				subtitle={subtitle}
 				actions={
 					writable ? (
-						<Button variant="ghost" onClick={openWrite} title="Open the console that can change data. It asks before it sends anything.">
+						<Button variant="ghost" onClick={openWrite} title="Open the console that can change data. It asks before it sends a statement that looks like a write.">
 							Write console
 						</Button>
 					) : undefined
 				}
 			/>
-			{view.openable ? (
+			{gate.mounted ? (
 				<div style={{ flex: 1, minHeight: 0 }}>
 					<RunSurface
 						endpoint={endpoint}
 						mode="read"
-						loadRequest={loadRequest}
+						paused={gate.paused}
+						loadSlot={slot}
+						loadSeq={loadSeq}
 						topSlot={<AskBar endpoint={endpoint} onPreview={(cypher) => put(cypher, false)} />}
 						onOpenHistory={() => setHistoryOpen(true)}
 					/>

@@ -24,11 +24,19 @@
 // GRAPH - DATA VERSIONS (has something that can change data run on this connection?)
 // =============================================================================
 //
-// A counter per connection that goes up whenever `execute` ran there (a success, or
-// an outcome nobody saw because the app stopped waiting), from ANY document of the
-// app: the write console is one document and the workbench's graph another, and the
-// graph must find out that what it drew may no longer exist. It holds numbers only.
+// A counter per connection that goes up whenever `execute` may have changed data
+// there, from ANY document of the app: the write console is one document and the
+// workbench's graph another, and the graph must find out that what it drew may no
+// longer exist. It holds numbers only.
+//
+// The count is taken where the write is SENT (countWrite), not when a document
+// records the outcome: a write can land after its console was closed, and the shared
+// runner records nothing for a closed document. And a write that FAILED is counted
+// too, unless it was refused before anything was sent: the node can fail after the
+// database ran the statement (see failures.ts, writeMayHaveApplied).
 // =============================================================================
+
+import { writeMayHaveApplied } from './failures';
 
 /** The counters. */
 export interface IDataVersions {
@@ -64,17 +72,35 @@ export function createDataVersions(): IDataVersions {
 }
 
 /**
- * Whether a finished run means data on the connection may have changed.
+ * Send a write and count it on the connection when it may have changed data: when it succeeds, and when it fails in a
+ * way that can come after the database ran it. Counting here, in the call, does not depend on any document still
+ * being open when the answer arrives.
  *
- * `execute` is the only path that can write, so only the write console counts. A success did
- * whatever the statement says (the app does not trust its own text check to tell a write from a
- * read, so every success counts). A run the app stopped waiting for may still complete on the
- * database, so it counts too. A statement that failed was rolled back by the database and does not.
+ * @param versions - The counters.
+ * @param key - The connection's key.
+ * @param send - Sends the statement through `execute`.
+ * @returns What `send` resolved with; a failure is rethrown unchanged.
+ */
+export async function countWrite<T>(versions: IDataVersions, key: string, send: () => Promise<T>): Promise<T> {
+	let result: T;
+	try {
+		result = await send();
+	} catch (error) {
+		if (writeMayHaveApplied(error)) versions.bump(key);
+		throw error;
+	}
+	versions.bump(key);
+	return result;
+}
+
+/**
+ * Whether a recorded outcome counts on top of {@link countWrite}: a write the user stopped waiting for may still
+ * complete on the database, so drawn graphs go out of date at once rather than when (if ever) its answer lands.
  *
  * @param mode - `read` for the workbench, `write` for the write console.
  * @param outcome - How the run ended.
- * @returns True when drawn ids may no longer mean what they did.
+ * @returns True for a write the app stopped waiting for.
  */
-export function mayHaveChangedData(mode: 'read' | 'write', outcome: string): boolean {
-	return mode === 'write' && (outcome === 'rows' || outcome === 'affected' || outcome === 'abandoned');
+export function isAbandonedWrite(mode: 'read' | 'write', outcome: string): boolean {
+	return mode === 'write' && outcome === 'abandoned';
 }

@@ -127,5 +127,11 @@ export const DATA_CHANGED_TEXT = 'A statement that can change data ran on this c
 /** Said when an action is asked of an element already known to be out of date. */
 export const STALE_ELEMENT_TEXT = 'This element is out of date: the database now holds a different element under its id. Dismiss it, or run the query again.';
 
-/** Said when Connect is asked while some drawn elements are out of date. */
+/** Said for a relationship known to be out of date (relationships are not dismissed on their own). */
+export const STALE_RELATIONSHIP_TEXT = 'This relationship is out of date: the database now holds a different relationship under its id. Dismiss a node at either end of it, or run the query again.';
+
+/** Said when Connect is asked while some drawn relationships (and no nodes) are out of date. */
+export const STALE_CONNECT_RELATIONSHIPS_TEXT = 'Some drawn relationships are out of date (shown dashed), so connecting the nodes could draw relationships of other elements. Dismiss a node at either end of them, or run the query again.';
+
+/** Said when Connect is asked while some drawn nodes are out of date. */
 export const STALE_CONNECT_TEXT = 'Some drawn nodes are out of date, so connecting them could draw relationships of other elements. Dismiss the out-of-date nodes (shown dashed), or run the query again.';

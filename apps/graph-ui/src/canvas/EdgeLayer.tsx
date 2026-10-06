@@ -61,6 +61,8 @@ export interface IEdgeDraw {
 	type: string;
 	/** Draw in the brand colour (an end is selected, or it is on a found path). */
 	highlighted: boolean;
+	/** Draw dashed: the database answered with a different relationship under this id, or a write ran since. */
+	stale: boolean;
 }
 
 /** What one relationship component takes: numbers and flat values, so memoisation is by value. */
@@ -73,6 +75,7 @@ interface IEdgeProps {
 	type: string;
 	ariaLabel: string;
 	highlighted: boolean;
+	stale: boolean;
 }
 
 /**
@@ -81,13 +84,13 @@ interface IEdgeProps {
  * @param props - Its two end centres and what it shows.
  * @returns The `<g>`.
  */
-function EdgeShapeImpl({ ax, ay, bx, by, slot, type, ariaLabel, highlighted }: IEdgeProps): React.ReactElement {
+function EdgeShapeImpl({ ax, ay, bx, by, slot, type, ariaLabel, highlighted, stale }: IEdgeProps): React.ReactElement {
 	const shape = edgeShape({ x: ax, y: ay }, { x: bx, y: by }, slot, NODE_DIAMETER / 2, NODE_DIAMETER / 2);
 	const stroke = highlighted ? `var(${ACCENT_TOKEN})` : `var(${EDGE_TOKEN})`;
 	return (
-		<g className="graph-ui-edge" role="img" aria-label={ariaLabel}>
+		<g className="graph-ui-edge" role="img" aria-label={ariaLabel} opacity={stale ? 0.55 : undefined}>
 			<title>{type}</title>
-			<path d={shape.path} fill="none" stroke={stroke} strokeWidth={highlighted ? 2 : 1.4} />
+			<path d={shape.path} fill="none" stroke={stroke} strokeWidth={highlighted ? 2 : 1.4} strokeDasharray={stale ? '5 4' : undefined} />
 			<polygon points={shape.arrow} fill={stroke} />
 			<text className="graph-ui-edge-label" x={shape.label.x} y={shape.label.y} transform={`rotate(${shape.labelAngle} ${shape.label.x} ${shape.label.y})`} textAnchor="middle" dominantBaseline="central">
 				{type}
@@ -97,7 +100,7 @@ function EdgeShapeImpl({ ax, ay, bx, by, slot, type, ariaLabel, highlighted }: I
 }
 
 /** The memoised relationship. Its slot is compared by value, so a rebuilt list with nothing changed redoes nothing. */
-const EdgeShape = memo(EdgeShapeImpl, (a, b) => a.ax === b.ax && a.ay === b.ay && a.bx === b.bx && a.by === b.by && a.type === b.type && a.ariaLabel === b.ariaLabel && a.highlighted === b.highlighted && a.slot.index === b.slot.index && a.slot.count === b.slot.count && a.slot.reversed === b.slot.reversed && a.slot.loop === b.slot.loop);
+const EdgeShape = memo(EdgeShapeImpl, (a, b) => a.ax === b.ax && a.ay === b.ay && a.bx === b.bx && a.by === b.by && a.type === b.type && a.ariaLabel === b.ariaLabel && a.highlighted === b.highlighted && a.stale === b.stale && a.slot.index === b.slot.index && a.slot.count === b.slot.count && a.slot.reversed === b.slot.reversed && a.slot.loop === b.slot.loop);
 
 /** Props. */
 export interface IEdgeLayerProps {
@@ -120,7 +123,7 @@ export function EdgeLayer({ edges, centers }: IEdgeLayerProps): React.ReactEleme
 					const a = centers.get(edge.source);
 					const b = centers.get(edge.target);
 					if (!a || !b) return null;
-					return <EdgeShape key={edge.id} ax={a.x} ay={a.y} bx={b.x} by={b.y} slot={edge.slot} type={edge.type} ariaLabel={edge.ariaLabel} highlighted={edge.highlighted} />;
+					return <EdgeShape key={edge.id} ax={a.x} ay={a.y} bx={b.x} by={b.y} slot={edge.slot} type={edge.type} ariaLabel={edge.ariaLabel} highlighted={edge.highlighted} stale={edge.stale} />;
 				})}
 			</svg>
 		</ViewportPortal>

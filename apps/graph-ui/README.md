@@ -6,30 +6,38 @@ and, only where a node allows it, change data. It is not a database client of
 its own. Every statement travels through a graph tool node inside one of your
 running pipelines, so it reaches exactly the graph that node is configured for,
 with that node's permissions. If apps are new to you, read
-[Apps](../../docs/public/product/concepts/apps.md) first. What the app
-deliberately does not do is under [Limits](#limits).
+[Apps](https://github.com/rocketride-org/rocketride-server/blob/develop/docs/public/product/concepts/apps.md)
+first. What the app deliberately does not do is under [Limits](#limits).
 
-The supported nodes are [`rocketride_graph`](../../nodes/src/nodes/rocketride_graph/README.md)
-(Apache AGE), [`graph_neo4j`](../../nodes/src/nodes/graph_neo4j/README.md) and
-[`graph_falkordb`](../../nodes/src/nodes/graph_falkordb/README.md). Other nodes
-that declare the `graph` class, such as ArangoDB and HydraDB, do not speak
-Cypher and are not listed.
+The supported nodes are
+[`rocketride_graph`](https://github.com/rocketride-org/rocketride-server/blob/develop/nodes/src/nodes/rocketride_graph/README.md)
+(Apache AGE in your organization's managed RocketRide database),
+[`graph_neo4j`](https://github.com/rocketride-org/rocketride-server/blob/develop/nodes/src/nodes/graph_neo4j/README.md)
+and
+[`graph_falkordb`](https://github.com/rocketride-org/rocketride-server/blob/develop/nodes/src/nodes/graph_falkordb/README.md).
+Other nodes that declare the `graph` class, such as ArangoDB and HydraDB, do not
+speak Cypher and are not listed.
 
 ## Before you start
 
 - **A running pipeline with a graph node.** Connections are discovered from
-  running tasks, so a stopped pipeline has none. Three starting pipelines ship
-  with the app in [`templates/`](templates): `age.pipe`, `neo4j.pipe` and
-  `falkordb.pipe`. Each is a tools source plus one graph node and a note, with
-  direct execution off, and holds no password, token or `project_id`. Copy one into
-  a VS Code workspace: the editor gives a new `.pipe` file its own `project_id` when
-  it has none, so two people importing the same template never share an identity.
-  Type the connection details into the node's form (they are stored encrypted).
-  Posting the raw file through an SDK `use()` also works, but the engine then
-  reports no project id for the task. Two raw copies started by the same user with
-  the same node id then share one connection identity and appear as ONE card in the
-  Connections list. Save each copy as its own `.pipe` file in a VS Code workspace (or
-  give each its own `project_id`) before running two of them.
+  running tasks, so a stopped pipeline has none. Three starting pipelines,
+  `age.pipe`, `neo4j.pipe` and `falkordb.pipe`, are kept in the RocketRide
+  repository under
+  [`apps/graph-ui/templates`](https://github.com/rocketride-org/rocketride-server/tree/develop/apps/graph-ui/templates).
+  They are not installed with the app. Each is a tools source plus one graph node
+  and a note, with direct execution off, and holds no password, token or
+  `project_id`. To use one, open it there and save its text as a new `.pipe` file
+  in a VS Code workspace: the editor gives a new `.pipe` file its own `project_id`
+  when it has none, so two people importing the same template never share an
+  identity. For Neo4j and FalkorDB, type the connection details into the node's
+  form (they are stored encrypted). `rocketride_graph` has none to type: it uses
+  your organization's managed RocketRide database. Posting the raw file through
+  an SDK `use()` also works, but the engine then reports no project id for the
+  task. Two raw copies started by the same user with the same node id then share
+  one connection identity and appear as ONE card in the Connections list. Save
+  each copy as its own `.pipe` file in a VS Code workspace (or give each its own
+  `project_id`) before running two of them.
 - **A node that is up to date.** The app reads through the node's `read_query`
   tool and reads its identity, limits and capabilities from `dialect`. A node
   that does not advertise `read_query` is shown as **Needs upgrade** and cannot
@@ -45,18 +53,24 @@ Cypher and are not listed.
 ## Connections
 
 The Connections page lists every graph node in every running pipeline task you
-can see. A card shows the pipeline, the node and a state: **Running** once the
-node answered, **Stopped**, **Unreachable**, **No access** (you can see a team
-deployment but your role cannot call it), or **Needs upgrade**. Your own
-development run and a team's deployment of the same pipeline are separate
-connections, and two owners' runs never merge. Selecting a card opens a drawer
-with the engine and version the node reports, its target (database or graph),
-whether writes are allowed, and a sentence on what the node's read path
-guarantees. **Test connection** asks the node again.
+can see. A card shows the pipeline, the node and a state: **Checking** while the
+node is being asked who it is, **Running** once it answered, **Stopped**,
+**Unreachable**, **No access** (you can see a team deployment but your role
+cannot call it), or **Needs upgrade**. Your own development run and a team's
+deployment of the same pipeline are separate connections, and two owners' runs
+never merge. Selecting a card opens a drawer with the engine and version the
+node reports, its target (database or graph), whether writes are allowed, and a
+sentence on what the node's read path guarantees. **Test connection** asks the
+node again; when nothing could be sent (the pipeline is not running, or a check
+is already in progress) it says "Not tested".
 
 An empty list does not say why. If the task list is empty the page says that it
-cannot tell whether nothing is running or something is wrong, and it claims the
-graph does not exist only when a node itself said so.
+cannot tell whether nothing is running or something is wrong. A node that fails
+to start is never listed: for example, `rocketride_graph` checks its Apache AGE
+graph when the pipeline starts and does not create it, so a graph name that does
+not exist stops the pipeline, and the error is in the pipeline's log. On
+RocketRide's managed database the graph `rocketride` is created for your
+organization when the database is provisioned.
 
 The app never holds a connection string or a task token in anything it saves or
 shows. Task tokens are kept in memory only, per session.
@@ -81,6 +95,11 @@ result tabs.
   exactly as written.
 - **Stop waiting** stops the app from waiting. The query may still be running on
   the database and cannot be cancelled from here; a late answer is ignored.
+- **When the connection is checked again** (any pipeline restarts, the shell
+  reconnects, or you press **Test connection**), or its pipeline stops, an open
+  workbench keeps its editor, results, graph and inspector on screen. Running and
+  the graph's actions pause, with the reason above the editor, until the node
+  answers again.
 - **The editor** highlights Cypher and keeps a draft per connection (text only).
   It loads the Monaco editor from `cdn.jsdelivr.net`; where that is not
   reachable, a plain text box is used after ten seconds, with the same run keys,
@@ -89,8 +108,8 @@ result tabs.
   (`CREATE`, `MERGE`, `SET`, `DELETE`, `REMOVE`, `DROP`, `LOAD CSV`, a
   procedure that is not on the allowlist, and similar) is refused before
   anything is sent. **This is a text check, not a database safeguard.** The node
-  refuses writes on its read path as well, but the real boundary is the database
-  role the node connects with; see [Safety](#safety).
+  refuses writes on its read path as well; what keeps a read read-only depends on
+  the node, see [Safety](#safety).
 
 ### Results
 
@@ -110,7 +129,8 @@ budget or its value budget.
 Nodes are coloured by their first label, with the first letter of the label
 inside, and a legend lists every label next to its colour. Colour is never the
 only carrier of meaning. How colours were chosen, and the contrast measured
-against every shipped theme, is in [docs/contrast.md](docs/contrast.md).
+against every shipped theme, is in
+[docs/contrast.md](https://github.com/rocketride-org/rocketride-server/blob/develop/apps/graph-ui/docs/contrast.md).
 
 | Action | What it does |
 |---|---|
@@ -118,9 +138,13 @@ against every shipped theme, is in [docs/contrast.md](docs/contrast.md).
 | Collapse | Removes what hangs only from this node. |
 | Dismiss | Removes the node from the canvas. |
 | Inspect | Opens the node's labels, id and properties, exact and complete, with Copy JSON. |
-| Connect nodes | Draws the relationships among the nodes already on the canvas. |
+| Connect nodes | Draws the relationships among the nodes already on the canvas. When the node returns only part of them (it stops at its own row limit), it says that more may exist; connect fewer nodes to see the others. |
 | Find path | Between two selected nodes, tried at increasing depth up to 10. A node that cannot answer says so; "no path found" names the depth it searched. |
 | Show more nodes | Adds nodes the first draw left out. |
+
+The graph sends one request at a time. While Expand, Connect, Find path or an
+inspector Refresh is waiting, **Stop waiting** lets go of it: the node may still
+be working on it, and its late answer is ignored.
 
 **Relationship labels.** The type of a relationship is drawn along it when the canvas is at normal size or larger, or (at 60% zoom and above) when no more than 200 relationships are drawn. In a crowded, zoomed-out graph the labels would be unreadable and are the most expensive thing to repaint, so they are not drawn; every relationship still shows its type as a tooltip and in its accessible name ("KNOWS from Ada to Charles"), the inspector shows it, the Table lists it, and zooming in brings the labels back. All relationships are drawn into one SVG behind the nodes, so panning and zooming cost the page nothing beyond moving it.
 
@@ -151,12 +175,12 @@ on the main thread.
 
 **Keyboard.** The canvas is a single tab stop with roving focus: arrow keys move
 to the connected node in that direction, Enter inspects, Space selects, `E`
-expands, `C` collapses, Delete dismisses, `P` finds a path between two selected
-nodes, `?` lists every key, Tab leaves the canvas. Each node is spoken with its
-caption, labels and how many relationships are shown, and each action is
-announced through one polite live region. Animations respect the reduced-motion
-setting. The Table tab lists the same result for anyone who would rather not use
-the canvas.
+expands, `C` collapses, Delete or Backspace (the Mac "delete" key) dismisses,
+`P` finds a path between two selected nodes, `?` lists every key, Tab leaves the
+canvas. Each node is spoken with its caption, labels and how many relationships
+are shown, and each action is announced through one polite live region.
+Animations respect the reduced-motion setting. The Table tab lists the same
+result for anyone who would rather not use the canvas.
 
 ## The sidebar
 
@@ -164,7 +188,10 @@ For the active connection the sidebar lists its **node labels** and
 **relationship types**, each with its properties and the types observed for
 them, and a count where the node has one. A count marked *about* is the
 database's estimate. Selecting a label or type shows and runs a preview of 25
-rows in the workbench. **Refresh** asks the node to read the database again.
+rows in the workbench. **Refresh** asks the node to read the database again. A
+Refresh pressed while the schema is first being read is sent once that read
+ends; one pressed while the connection is being checked again sends nothing and
+says so.
 
 The line under the tree says how far the schema can be trusted: how long ago it
 was read, that property keys are **sampled** from a few nodes per label (so a
@@ -189,8 +216,11 @@ file on the server, not in this browser: its text as typed (including any
 literal values), when, how long it took, how many rows, and how it ended. You can
 search, pin, add a note, load a statement into the editor, run it again (an
 explicit action), delete entries, clear all, or turn recording off per
-connection. Up to 100 entries and 8 KiB of text per entry are kept. Tokens and
-connection strings are never recorded.
+connection. Up to 100 entries per connection and 8 KiB of text per entry are
+kept, and about 256 K characters of history across all your Graph Explorer
+connections: past that, the oldest entries anywhere are dropped first, unpinned
+before pinned. When a search or **Pinned only** hides every entry, the panel says
+that nothing matches. Tokens and connection strings are never recorded.
 
 ## The write console
 
@@ -200,12 +230,23 @@ editor and an **Execute** button, and it always says what it is:
 
 - Before anything is sent, a confirmation lists the statements that look like
   they change data, with their text, and says **This is a text check, not a
-  database safeguard.** There is no "do not ask again".
+  database safeguard.** There is no "do not ask again". A batch the check does
+  not flag is sent when you press Execute, without a dialog.
 - Statements go through `execute` with the graph result shape, so what a
-  statement returned is drawn like any other result.
+  statement returned is drawn like any other result. The result line, the strip
+  and History show the count the node reports as affected. There is no row-limit
+  choice here: `execute` returns at most the node's own maximum.
 - Each statement is its own request. A batch stops at the first error; statements
   that ran are not undone. The strip says how many ran and how many were not run.
 - A write is never sent again by the app: no automatic retry.
+- A failure that can come after the database ran the statement (the node could
+  not return its answer, the answer was not understood, or the app stopped
+  waiting) says **the write may have been applied**. Only a refusal before
+  anything was sent (the node does not support it, the pipeline is not running,
+  or execute is off) means nothing changed.
+- Every write that may have changed data marks the graphs drawn from that
+  connection out of date, in every tab, even when it finishes after the console
+  was closed.
 
 ## Safety
 
@@ -214,12 +255,18 @@ editor and an **Execute** button, and it always says what it is:
   elsewhere. A node that cannot do that is not browsable.
 - The text check that refuses writes in the browse editor is a convenience and
   can be wrong in both directions. It is not a boundary.
-- **The boundary is the database role.** Connect the node with a user that can
-  only read, and a statement the app should never send cannot do harm. On Neo4j
-  the node reads in a read session, which is a routing hint, not access control;
-  Apache AGE reads in a read-only transaction; FalkorDB uses `GRAPH.RO_QUERY`.
-  The drawer states which of these a connection has and whether the node verified
-  its own permissions (`read_boundary_verified`).
+- **For Neo4j and FalkorDB, the boundary is the database account you connect
+  the node with.** Use a user that can only read, and a statement the app should
+  never send cannot do harm. On Neo4j the node reads in a read session, which is
+  a routing hint, not access control; FalkorDB uses `GRAPH.RO_QUERY`.
+- **`rocketride_graph` has no account to choose.** It connects to your
+  organization's managed database as the role that owns that database, so a
+  read-only database role cannot be relied on there. Its reads are kept
+  read-only by a read-only transaction and by the node's own check of each
+  statement. Whether it can write at all is its **Allow direct query
+  execution** setting.
+- The drawer states which of these a connection has and whether the node
+  verified its own permissions (`read_boundary_verified`).
 - Nothing the app saves or shows contains a task token, a connection string or a
   password.
 
@@ -238,9 +285,10 @@ editor and an **Execute** button, and it always says what it is:
 - Performance was checked with results of 100, 300 and 1,000 nodes, and with
   1,000 nodes drawn after **Show more nodes** (a 1,000-node result draws its
   first 300 until then). On an Apple-silicon laptop there were no long tasks
-  panning or dragging at any of these. On a much slower device, panning a fully
-  drawn 1,000-node graph stutters, which is one reason the first draw is capped
-  at 300.
+  panning or dragging at any of these. With the CPU slowed 4x in Chrome, as a
+  stand-in for a slower device, panning a fully drawn 1,000-node graph stutters,
+  which is one reason the first draw is capped at 300. No real low-end device
+  was measured.
 - Browsers: the production checks ran in Chrome 154, Firefox 141 and WebKit 26
   (Playwright). WebKit is the engine Safari uses, but it is not Safari, and
   Safari itself has not been tried. The build declares Safari 13 as its floor,
@@ -253,16 +301,7 @@ editor and an **Execute** button, and it always says what it is:
 
 ## For developers
 
-- App id `rocketride.graph`, development port 3102. The code under `src/graph`,
-  `src/cypher` and `src/layout` is plain TypeScript with no browser or shell
-  dependency, so it runs under `node:test`. The shared Explorer library
-  (`apps/shared/src/explorer`) provides discovery, the tool session, history and
-  the statement runner.
-- `./builder graph-ui:test` type-checks `src` and `tests`, then runs every file in
-  `tests/`; a file that is missing from the list in `scripts/tasks.js`, or an empty
-  run, fails the task. `tests/fixtures/v1/live/` holds answers captured from the
-  real node tools on Neo4j, FalkorDB and Apache AGE; `tests/fixtures/provisional/`
-  is hand-modelled and kept for the cases the live set does not cover.
-- `./builder graph-ui:build` bundles the app, registers it and copies it to the
-  served directory. Rebuilding an app at the same version needs the engine's
-  store reset before the server serves it again.
+Notes on the code, its tests and the build are in
+[apps/graph-ui/docs/development.md](https://github.com/rocketride-org/rocketride-server/blob/develop/apps/graph-ui/docs/development.md),
+and how apps work in this repository is in
+[docs/development/apps](https://github.com/rocketride-org/rocketride-server/blob/develop/docs/development/apps/index.md).

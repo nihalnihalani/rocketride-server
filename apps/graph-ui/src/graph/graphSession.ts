@@ -31,7 +31,7 @@
 // RULES IT KEEPS
 //   - One request at a time. A second action while one runs is declined with a
 //     sentence, not queued, so the canvas never shows the answer to a question the
-//     user has already moved past.
+//     user has already moved past. Stop waiting lets go of whatever runs.
 //   - Late answers are dropped. Loading a new result (or `dispose`) starts a new
 //     EPOCH; an answer that belongs to an earlier epoch is ignored, whatever it
 //     carries, so a slow expansion cannot paint over the query the user ran next.
@@ -61,9 +61,9 @@ import type { IGraphModel } from './model';
 import { collectEntities } from './results';
 import type { IEntities } from './results';
 import type { GraphId, GraphNode, GraphRelationship, ReadQueryResult } from './types';
-import { DATA_CHANGED_TEXT, STALE_CONNECT_TEXT, STALE_ELEMENT_TEXT, conflictText, identityConflicts } from './identity';
+import { DATA_CHANGED_TEXT, STALE_CONNECT_RELATIONSHIPS_TEXT, STALE_CONNECT_TEXT, STALE_ELEMENT_TEXT, conflictText, identityConflicts } from './identity';
 import type { IIdentityConflict } from './identity';
-import { expandText, num } from './wording';
+import { connectText, expandText, num } from './wording';
 import { STOP_WAITING_NOTE } from './wording';
 import { createPathSearch, noPathText } from '../cypher/pathSearch';
 import type { IPathSearch } from '../cypher/pathSearch';
@@ -112,8 +112,13 @@ export interface IGraphState {
 	progress: string | null;
 	/** True once a write ran on the connection after this graph was drawn: every drawn id is suspect. */
 	stale: boolean;
-	/** Drawn elements the database has answered for with a different element under the same id. */
+	/** Drawn NODES the database has answered for with a different element under the same id. */
 	staleIds: ReadonlySet<GraphId>;
+	/**
+	 * Drawn RELATIONSHIPS the database has answered for with a different relationship under the same id. Kept apart
+	 * from the nodes: node and relationship ids are separate namespaces, and FalkorDB numbers both from 0.
+	 */
+	staleRelationshipIds: ReadonlySet<GraphId>;
 }
 
 /** What the session needs from its caller. */
@@ -128,6 +133,8 @@ export interface IGraphSessionDeps {
 	announce(text: string): void;
 	/** Caption choice per label (property name, or the id/label specials). */
 	captionChoice(label: string): string | undefined;
+	/** Why nothing may be sent right now (the connection is being checked again, or stopped), or null. */
+	paused?(): string | null;
 }
 
 /** The session. */
@@ -146,8 +153,11 @@ export interface IGraphSession {
 	dismiss(id: GraphId): void;
 	connect(): Promise<void>;
 	findPath(): Promise<void>;
-	/** Stop waiting for the running path search. */
-	stopPath(): void;
+	/**
+	 * Stop waiting for whatever is running (a path search, an expansion, Connect, a refresh). The node may still be
+	 * working on it; its late answer is dropped.
+	 */
+	stopWaiting(): void;
 	/** Draw more of the result, up to the canvas maximum. */
 	showMore(): void;
 	/** A statement that can change data ran on this connection: what is drawn may no longer match. */
@@ -156,7 +166,7 @@ export interface IGraphSession {
 	dispose(): void;
 }
 
-const EMPTY: IGraphState = { model: EMPTY_MODEL, entities: null, selected: new Set(), focusedId: null, inspect: null, busy: null, notice: null, hint: null, highlight: new Set(), progress: null, stale: false, staleIds: new Set() };
+const EMPTY: IGraphState = { model: EMPTY_MODEL, entities: null, selected: new Set(), focusedId: null, inspect: null, busy: null, notice: null, hint: null, highlight: new Set(), progress: null, stale: false, staleIds: new Set(), staleRelationshipIds: new Set() };
 
 // =============================================================================
 // FACTORY
@@ -196,6 +206,11 @@ export function createGraphSession(deps: IGraphSessionDeps): IGraphSession {
 		return false;
 	};
 	const engineOrSay = (): IEngine | null => {
+		const why = deps.paused?.() ?? null;
+		if (why !== null) {
+			say(`Nothing was sent. ${why}`, 'warning');
+			return null;
+		}
 		const engine = deps.engine();
 		if (!engine) say('This connection has not been checked yet, so the app does not know which engine to write queries for.', 'warning');
 		return engine;
@@ -213,13 +228,17 @@ export function createGraphSession(deps: IGraphSessionDeps): IGraphSession {
 		}
 		return false;
 	};
-	/** Refuse to merge an answer that is not about the drawn elements: mark them, say so, add nothing. */
+	/** Refuse to merge an answer that is not about the drawn elements: mark them (each kind in its own set), say so, add nothing. */
 	const reject = (conflicts: readonly IIdentityConflict[]): void => {
-		set({ staleIds: new Set([...state.staleIds, ...conflicts.map((c) => c.id)]), hint: null });
+		const nodes = conflicts.filter((c) => c.kind === 'node').map((c) => c.id);
+		const relationships = conflicts.filter((c) => c.kind === 'relationship').map((c) => c.id);
+		set({ staleIds: new Set([...state.staleIds, ...nodes]), staleRelationshipIds: new Set([...state.staleRelationshipIds, ...relationships]), hint: null });
 		say(conflictText(conflicts), 'warning');
 	};
-	/** An element left the canvas: it is no longer worth marking. */
+	/** Nodes left the canvas: they are no longer worth marking. */
 	const forget = (ids: readonly GraphId[]): ReadonlySet<GraphId> => new Set([...state.staleIds].filter((id) => !ids.includes(id)));
+	/** The marked relationships that are still drawn (a relationship leaves the canvas with either of its ends). */
+	const stillDrawn = (model: IGraphModel): ReadonlySet<GraphId> => new Set([...state.staleRelationshipIds].filter((id) => model.relationships.has(id)));
 
 	/**
 	 * Run a recipe for the current epoch.
@@ -354,7 +373,7 @@ export function createGraphSession(deps: IGraphSessionDeps): IGraphSession {
 				return;
 			}
 			const selected = new Set([...state.selected].filter((s) => !result.removed.includes(s)));
-			set({ model: result.model, selected, staleIds: forget(result.removed), inspect: state.inspect && result.removed.includes(state.inspect.id) ? null : state.inspect, hint: null });
+			set({ model: result.model, selected, staleIds: forget(result.removed), staleRelationshipIds: stillDrawn(result.model), inspect: state.inspect && result.removed.includes(state.inspect.id) ? null : state.inspect, hint: null });
 			say(`Collapsed. ${num(result.removed.length)} ${result.removed.length === 1 ? 'node' : 'nodes'} removed from the graph.`);
 		},
 
@@ -365,7 +384,7 @@ export function createGraphSession(deps: IGraphSessionDeps): IGraphSession {
 			const selected = new Set(state.selected);
 			selected.delete(id);
 			const first = model.nodes.keys().next().value as GraphId | undefined;
-			set({ model, selected, staleIds: forget([id]), inspect: state.inspect?.id === id ? null : state.inspect, focusedId: state.focusedId === id ? first ?? null : state.focusedId, hint: null });
+			set({ model, selected, staleIds: forget([id]), staleRelationshipIds: stillDrawn(model), inspect: state.inspect?.id === id ? null : state.inspect, focusedId: state.focusedId === id ? first ?? null : state.focusedId, hint: null });
 			say(`${captionFor(node)} dismissed from the graph. It is still in the results table.`);
 		},
 
@@ -374,6 +393,10 @@ export function createGraphSession(deps: IGraphSessionDeps): IGraphSession {
 			if (outOfDate([])) return;
 			if (state.staleIds.size > 0) {
 				say(STALE_CONNECT_TEXT, 'warning');
+				return;
+			}
+			if (state.staleRelationshipIds.size > 0) {
+				say(STALE_CONNECT_RELATIONSHIPS_TEXT, 'warning');
 				return;
 			}
 			const engine = engineOrSay();
@@ -392,8 +415,9 @@ export function createGraphSession(deps: IGraphSessionDeps): IGraphSession {
 			}
 			const outcome = connectModel(state.model, incoming);
 			set({ model: outcome.model });
-			const added = outcome.addedRelationships.length;
-			say(outcome.budget === 'relationships' ? `Added ${num(added)} relationships; the canvas holds its maximum of ${num(MAX_RELATIONSHIPS)}.` : added === 0 ? 'No further relationships among the nodes on the canvas.' : `Added ${num(added)} ${added === 1 ? 'relationship' : 'relationships'} among the nodes on the canvas.`);
+			// The node clamps what was asked for to its own row cap: a cut answer must never read as "nothing more".
+			const cut = answer.result.truncated || answer.result.rows.length >= answer.recipe.limit;
+			say(connectText(outcome.addedRelationships.length, outcome.budget, cut, answer.result.row_limit), cut && outcome.budget === null ? 'warning' : 'info');
 		},
 
 		async findPath() {
@@ -452,8 +476,17 @@ export function createGraphSession(deps: IGraphSessionDeps): IGraphSession {
 			}
 		},
 
-		stopPath() {
-			search?.stop();
+		stopWaiting() {
+			if (state.busy === null) return;
+			if (state.busy === 'path' && search) {
+				// The search ends at once and says so itself (see findPath, case 'stopped').
+				search.stop();
+				return;
+			}
+			// Expand, Connect and Refresh: a new epoch drops their late answer, whatever it carries.
+			epoch += 1;
+			set({ busy: null, hint: null });
+			say(`Stopped waiting. ${STOP_WAITING_NOTE}`, 'warning');
 		},
 
 		showMore() {

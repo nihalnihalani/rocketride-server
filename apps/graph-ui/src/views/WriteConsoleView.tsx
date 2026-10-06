@@ -30,9 +30,11 @@
 // no automatic retry, no "stop asking", and no claim of atomicity: each statement is
 // its own request, so a batch that stops half way leaves the earlier ones done.
 //
-// The text check is not a database safeguard. The database role the node connects
-// with is the real boundary; the node README says to use a read-only role for
-// browsing, and a role that can write only where this console is meant to.
+// The text check is not a database safeguard. For Neo4j and FalkorDB the database
+// account the node connects with is the boundary (a read-only one for browsing, one
+// that can write only where this console is meant to). rocketride_graph has no
+// account to choose: it connects as the role that owns the organization's database,
+// so for it the boundary is whether the node allows execute at all.
 // =============================================================================
 
 import React, { useCallback, useMemo, useRef, useState } from 'react';
@@ -41,18 +43,15 @@ import type { IExplorerEndpoint } from 'shared/explorer';
 import { announcer } from '../adapters/explorer';
 import { useGraphEndpoints } from '../adapters/react';
 import { CONNECTIONS_URI } from '../graph/addresses';
-import { connectionView } from '../graph/connections';
+import { connectionView, surfaceGate } from '../graph/connections';
 import { canWrite, engineText, parseDialect, targetText } from '../graph/dialect';
-import { TEXT_CHECK_SENTENCE } from '../graph/writeConfirm';
+import { WRITE_CONSOLE_BANNER } from '../graph/writeConfirm';
 import { getDocs } from '../docs';
 import { GraphIcon } from '../icons';
 import { styles } from '../styles';
 import HistoryPanel from '../components/HistoryPanel';
 import RunSurface from '../components/RunSurface';
-import type { IRunSurfaceProps } from '../components/RunSurface';
-
-/** What the console says about itself, always visible. */
-export const WRITE_CONSOLE_BANNER = `Statements here run against the live database and can change or delete data. You are asked to confirm before anything is sent. Each statement is its own request: if a batch stops, the statements before it have already run and nothing is rolled back. ${TEXT_CHECK_SENTENCE}`;
+import { createLoadSlot } from '../graph/loadSlot';
 
 /** Why the console is unavailable for a node, in words. */
 export function writeUnavailableText(allowExecute: boolean, graphShape: boolean): string {
@@ -78,27 +77,33 @@ export const WriteConsoleView: React.FC<IWriteConsoleViewProps> = ({ endpoint })
 	const dialect = useMemo(() => (probe?.ok ? parseDialect(probe.info) : null), [probe]);
 	const view = connectionView(endpoint, probe);
 	const allowed = canWrite(dialect) && endpoint.state === 'ready';
+	// A console that has been on screen stays through a re-probe (see surfaceGate): Execute pauses instead of the
+	// console unmounting in the middle of a batch.
+	const opened = useRef(false);
+	if (allowed) opened.current = true;
+	const unavailable = endpoint.state !== 'ready' ? view.blocked : dialect === null ? null : writeUnavailableText(dialect.allowExecute === true, dialect.capabilities.execute_shape_graph === true);
+	const gate = surfaceGate({ openable: allowed, blocked: allowed ? null : unavailable }, opened.current);
 
 	const [historyOpen, setHistoryOpen] = useState(false);
-	const [loadRequest, setLoadRequest] = useState<NonNullable<IRunSurfaceProps['loadRequest']>>({ text: '', seq: 0, run: false });
-	const seq = useRef(0);
+	// One slot for the life of the document: the surface takes each request once (see loadSlot.ts).
+	const [slot] = useState(createLoadSlot);
+	const [loadSeq, setLoadSeq] = useState(0);
 	// From History a statement is only loaded here, never sent: a write is run by pressing Execute and confirming.
 	const put = useCallback((text: string) => {
-		seq.current += 1;
-		setLoadRequest({ text, seq: seq.current, run: false });
-	}, []);
+		setLoadSeq(slot.put({ text, run: false }));
+	}, [slot]);
 	const subtitle = dialect ? [engineText(dialect), targetText(dialect)].filter(Boolean).join(' \u00b7 ') : view.address;
 
 	return (
 		<div style={styles.root}>
 			<ContentHeader title={`${view.title} \u2014 write console`} subtitle={subtitle} />
-			{allowed ? (
+			{gate.mounted ? (
 				<>
 					<div style={{ padding: '8px 24px 0' }}>
 						<Banner variant="warning">{WRITE_CONSOLE_BANNER}</Banner>
 					</div>
 					<div style={{ flex: 1, minHeight: 0 }}>
-						<RunSurface endpoint={endpoint} mode="write" loadRequest={loadRequest} onOpenHistory={() => setHistoryOpen(true)} />
+						<RunSurface endpoint={endpoint} mode="write" paused={gate.paused} loadSlot={slot} loadSeq={loadSeq} onOpenHistory={() => setHistoryOpen(true)} />
 					</div>
 				</>
 			) : (

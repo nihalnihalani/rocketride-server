@@ -181,5 +181,71 @@ export function describeFailureOf(message: string, error: unknown, canWrite: boo
 	return describeFailureMessage(message, canWrite);
 }
 
+// =============================================================================
+// WRITES (the write console)
+// =============================================================================
+//
+// `execute` runs the statement BEFORE the node builds its answer: Apache AGE commits
+// first, FalkorDB's query returns only after the write ran, and Neo4j streams a
+// short result to completion. So a failure that arrives after the call was sent
+// (the answer could not be built, this app rejected it, it took too long, or the
+// user stopped waiting) does not mean nothing changed. Only a refusal raised
+// before anything reached the database means that.
+
+/** Said under a write-console failure that can have come after the statement ran. */
+export const WRITE_MAY_HAVE_APPLIED = 'The write may have been applied: this error can come after the database ran the statement, and nothing is rolled back. Check the data before running it again. Graphs drawn from this connection are marked out of date.';
+
+/**
+ * The kind of a failure: the thrown error's own `kind`, else the one the session's fixed wording stands for.
+ *
+ * @param error - What was thrown, or the message alone.
+ * @returns The kind ('raised' when nothing else is known).
+ */
+function kindOf(error: unknown): string {
+	if (error !== null && typeof error === 'object' && typeof (error as { kind?: unknown }).kind === 'string') return (error as { kind: string }).kind;
+	const message = messageOf(error);
+	return SESSION_MESSAGES.find(([, pattern]) => pattern.test(message))?.[0] ?? 'raised';
+}
+
+/**
+ * The message of a failure.
+ *
+ * @param error - What was thrown, or the message alone.
+ * @returns The text.
+ */
+function messageOf(error: unknown): string {
+	if (typeof error === 'string') return error;
+	if (error instanceof Error) return error.message;
+	if (error !== null && typeof error === 'object' && typeof (error as { message?: unknown }).message === 'string') return (error as { message: string }).message;
+	return String(error);
+}
+
+/**
+ * Whether a failed `execute` can have changed data: everything except a refusal raised before anything was sent (the
+ * node does not advertise the tool, there is no running task, or the node has execute turned off).
+ *
+ * @param error - What the call threw (or its message).
+ * @returns True when the statement may have run on the database.
+ */
+export function writeMayHaveApplied(error: unknown): boolean {
+	const kind = kindOf(error);
+	if (kind === 'upgrade' || kind === 'unavailable') return false;
+	return !LEGACY_EXECUTE_OFF.test(messageOf(error));
+}
+
+/**
+ * Describe a failure of the write console: as {@link describeFailureOf}, except that a failure that can have come after
+ * the statement ran says so instead of the browse hints (there is no other console to point at).
+ *
+ * @param message - The error message.
+ * @param error - The thrown value, when known.
+ * @returns The notice.
+ */
+export function describeWriteFailure(message: string, error: unknown): IFailureNotice {
+	const notice = describeFailureOf(message, error, true);
+	if (notice.ignore || !writeMayHaveApplied(error ?? message)) return notice;
+	return { ...notice, hint: WRITE_MAY_HAVE_APPLIED };
+}
+
 /** Re-exported so the canvas notice and the failure strip share one place for their wording. */
 export { GRID_NOTICE };

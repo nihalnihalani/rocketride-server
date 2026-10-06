@@ -82,8 +82,10 @@ export interface IGraphCanvasProps {
 	/** Relationships to draw highlighted (a found path). */
 	highlighted?: ReadonlySet<GraphId>;
 	focusedId: GraphId | null;
-	/** Elements the database answered for with a different element under the same id. */
+	/** Nodes the database answered for with a different element under the same id. */
 	staleIds?: ReadonlySet<GraphId>;
+	/** Relationships the database answered for with a different relationship under the same id (a separate id space). */
+	staleRelationshipIds?: ReadonlySet<GraphId>;
 	/** True when a write ran after the graph was drawn: every element is suspect. */
 	allStale?: boolean;
 	/** Seed text for the layout (same text, same graph, same layout). */
@@ -149,6 +151,7 @@ function CanvasInner(props: IGraphCanvasProps): React.ReactElement {
 	const { model, colors, captions, selected, focusedId, onLayoutStatus } = props;
 	const highlighted = props.highlighted ?? NO_IDS;
 	const staleIds = props.staleIds ?? NO_IDS;
+	const staleRelationshipIds = props.staleRelationshipIds ?? NO_IDS;
 	const allStale = props.allStale === true;
 	const flow = useReactFlow();
 	const helpId = useId();
@@ -304,19 +307,21 @@ function CanvasInner(props: IGraphCanvasProps): React.ReactElement {
 			const a = model.nodes.get(r.start);
 			const b = model.nodes.get(r.end);
 			if (!slot || !a || !b || !layout.positions.has(r.start) || !layout.positions.has(r.end)) continue;
+			const stale = allStale || staleRelationshipIds.has(r.id);
 			list.push({
 				id: r.id,
 				source: r.start,
 				target: r.end,
-				ariaLabel: `${r.type} from ${captionOf(a, captions.get(a.labels[0] ?? ''))} to ${captionOf(b, captions.get(b.labels[0] ?? ''))}`,
+				ariaLabel: `${r.type} from ${captionOf(a, captions.get(a.labels[0] ?? ''))} to ${captionOf(b, captions.get(b.labels[0] ?? ''))}${stale ? ', out of date' : ''}`,
 				slot,
 				type: r.type,
 				highlighted: selected.has(r.start) || selected.has(r.end) || highlighted.has(r.id),
+				stale,
 			});
 		}
 		// Unchanged relationships keep their object (see stable.ts).
-		return stabilise(edgeCache.current, list, (x, y) => x.source === y.source && x.target === y.target && x.ariaLabel === y.ariaLabel && x.type === y.type && x.highlighted === y.highlighted && sameShallow(x.slot as unknown as Record<string, unknown>, y.slot as unknown as Record<string, unknown>));
-	}, [model, layout.positions, captions, selected, highlighted]);
+		return stabilise(edgeCache.current, list, (x, y) => x.source === y.source && x.target === y.target && x.ariaLabel === y.ariaLabel && x.type === y.type && x.highlighted === y.highlighted && x.stale === y.stale && sameShallow(x.slot as unknown as Record<string, unknown>, y.slot as unknown as Record<string, unknown>));
+	}, [model, layout.positions, captions, selected, highlighted, staleRelationshipIds, allStale]);
 
 	edgesRef.current = edges;
 

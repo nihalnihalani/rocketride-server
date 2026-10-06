@@ -68,3 +68,85 @@ test('the inspector closes through the session, and its panel is rendered from t
 	const surface = code(read('components', 'RunSurface.tsx'));
 	assert.match(surface, /useSyncExternalStore\(graphSession\.subscribe, graphSession\.getState, graphSession\.getState\)/);
 });
+
+// GX-FE-01: a re-probe (a restart of ANY pipeline, a shell reconnect, Test connection) took the probe away for a
+// moment, the view stopped being openable, and the run surface unmounted: results, graph, expansions, inspector and
+// the row limit were lost. Both connection documents now keep a surface that has opened, and pause it instead.
+test('the workbench and the write console keep an opened run surface through a re-probe, and pass the pause reason down', () => {
+	for (const file of ['WorkbenchView.tsx', 'WriteConsoleView.tsx']) {
+		const view = code(read('views', file));
+		assert.match(view, /surfaceGate\(/, `${file} decides through surfaceGate`);
+		assert.match(view, /gate\.mounted \?/, `${file} mounts the surface on the gate`);
+		assert.doesNotMatch(view, /\{(view\.openable|allowed) \? \(/, `${file} still unmounts the surface whenever the connection is not openable`);
+		const surface = view.slice(view.indexOf('<RunSurface'), view.indexOf('/>', view.indexOf('<RunSurface')));
+		assert.match(surface, /paused=\{gate\.paused\}/, `${file} tells the surface why it is paused`);
+	}
+	const surface = code(read('components', 'RunSurface.tsx'));
+	assert.match(surface, /canRun: \(\) => [^\n]*paused == null/, 'a paused surface sends nothing');
+});
+
+// GX-FE-03: a request is consumed by the surface through the host's slot, never de-duplicated by a ref the surface
+// re-creates on every mount; a request the surface cannot run now is never queued to run later.
+test('the run surface takes its editor request from the host\'s slot, and the hosts never queue a run for a surface that is not on screen', () => {
+	const surface = code(read('components', 'RunSurface.tsx'));
+	assert.ok(/loadSlot\.take\(\)/.test(surface), 'the surface takes the request');
+	assert.ok(!/loadRequest\.seq === handled\.current/.test(surface), 'a per-mount ref decides what was handled');
+	for (const file of ['WorkbenchView.tsx', 'WriteConsoleView.tsx']) {
+		const view = code(read('views', file));
+		assert.ok(/useState\(createLoadSlot\)/.test(view), `${file} keeps one slot for the life of the document`);
+		const surfaceTag = view.slice(view.indexOf('<RunSurface'), view.indexOf('/>', view.indexOf('<RunSurface')));
+		assert.ok(/loadSlot=\{slot\}/.test(surfaceTag), `${file} hands the slot to the surface`);
+	}
+	const workbench = code(read('views', 'WorkbenchView.tsx'));
+	assert.ok(/const runNow = run && now\.mounted && now\.paused === null;/.test(workbench) && /slot\.put\(\{ text, run: runNow \}\)/.test(workbench), 'a run is asked for only while the surface can run it');
+});
+
+// GX-FE-05 (graph half) and GX-CT-03: the write was counted in `record`, which the shared runner skips once the
+// document is closed, so a write that landed after the console closed never marked other graphs out of date.
+test('the write console counts a write where it is sent, not in the record step a closed document skips', () => {
+	const surface = code(read('components', 'RunSurface.tsx'));
+	const execute = surface.slice(surface.indexOf('execute: async'), surface.indexOf('settle:'));
+	assert.ok(/countWrite\(dataVersions, endpoint\.key, \(\) => session\.invoke<ReadQueryResult>\(TOOL\.execute/.test(execute), 'execute is sent through countWrite');
+	const record = surface.slice(surface.indexOf('record: (run) =>'), surface.indexOf('summarize:'));
+	assert.ok(/isAbandonedWrite\(mode, run\.outcome\)/.test(record), 'record counts only a write the user stopped waiting for');
+	assert.ok(!/mayHaveChangedData/.test(surface));
+	assert.ok(/describeWriteFailure\(message, error\)/.test(surface), 'the write console words its failures as possibly applied');
+});
+
+// GX-FE-06: every run settled as 'rows' with the read toggle's limit, in both modes.
+test('the run surface settles, records and describes a run through the mode-aware helpers', () => {
+	const surface = code(read('components', 'RunSurface.tsx'));
+	assert.ok(/settle: \(_run, result\) => settleRun\(mode, result\)/.test(surface), 'settle follows the mode');
+	assert.ok(/patch: limitPatch\(mode, p\.limit\)/.test(surface), 'a limit is recorded only where one is sent');
+	assert.ok(/historySummaryOf\(run, Date\.now\(\)\)/.test(surface), 'history keeps an affected count');
+	assert.ok(/resultMeta\(displayed/.test(surface), 'the result line shows the affected count');
+});
+
+// GX-FE-10: the busy sentence says "stop waiting for it", but only a path search offered the control.
+test('the graph offers Stop waiting for whatever it is waiting on, in the toolbar and in the inspector', () => {
+	const view = code(read('components', 'GraphView.tsx'));
+	assert.ok(/\{busy && <Button[^>]*onClick=\{\(\) => session\.stopWaiting\(\)\}>Stop waiting<\/Button>\}/.test(view), 'the toolbar offers it whenever a request runs');
+	assert.ok(!/state\.busy === 'path' && <Button/.test(view), 'not only for a path search');
+	const inspector = code(read('components', 'InspectorPanel.tsx'));
+	assert.ok(/state\.busy !== null && <Button[^>]*onClick=\{\(\) => session\.stopWaiting\(\)\}>Stop waiting<\/Button>/.test(inspector), 'the inspector offers it beside Refresh');
+});
+
+// GX-FE-09: Run was re-enabled once Stop waiting appeared, and a press then did nothing at all.
+test('Run is disabled for as long as a statement runs, and a run that cannot start says why', () => {
+	const surface = code(read('components', 'RunSurface.tsx'));
+	const buttons = surface.match(/<Button variant="(primary|ghost)" disabled=\{[^}]*\} onClick=\{\(\) => run\((false|true)\)\}/g) ?? [];
+	assert.equal(buttons.length, 2, 'Run and Run all');
+	for (const button of buttons) assert.ok(button.includes('disabled={runner.running || blocked !== null}'), button);
+	const startRun = surface.slice(surface.indexOf('const startRun = useCallback'), surface.indexOf('const run = useCallback'));
+	assert.ok(/runRefusal\(\{ running: runner\.running, blocked \}\)/.test(startRun), 'startRun refuses with a sentence');
+	const confirm = surface.slice(surface.indexOf('onConfirm={'), surface.indexOf('onCancel={'));
+	assert.ok(/runRefusal\(/.test(confirm), 'so does confirming a write');
+});
+
+// GX-FE-08: one unkeyed drawer instance served every card, so the last Test result showed on the next card opened.
+test('the connection drawer starts fresh for every card, and words its Test result through testResultText', () => {
+	const view = code(read('views', 'ConnectionsView.tsx'));
+	assert.ok(/<ConnectionDrawer\s+key=\{drawerKey \?\? ''\}/.test(view), 'the drawer is keyed on the card it shows');
+	const drawer = code(read('components', 'ConnectionDrawer.tsx'));
+	assert.ok(/setTested\(testResultText\(result\)\)/.test(drawer), 'a missing result is not read as a failed probe');
+});

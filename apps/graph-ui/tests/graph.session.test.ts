@@ -252,7 +252,7 @@ test('no path within the depth limit is said in budget terms; Stop waiting is ho
 	await tick();
 	assert.equal(s2.getState().busy, 'path');
 	assert.match(s2.getState().progress ?? '', /Looking for a path of 1 relationship/);
-	s2.stopPath();
+	s2.stopWaiting();
 	await running;
 	assert.equal(s2.getState().busy, null);
 	assert.match(s2.getState().notice?.text ?? '', /^Stopped waiting\. Stop waiting stops this app/);
@@ -392,7 +392,8 @@ test('a relationship that returns with the same id and another type, start or en
 		assert.equal(s.model.relationships.get('r1')?.type, 'T', 'the drawn relationship is untouched');
 		assert.deepEqual([s.model.relationships.get('r1')?.start, s.model.relationships.get('r1')?.end], ['a', 'b']);
 		assert.equal(s.model.nodes.has('c'), false, 'nothing new was added');
-		assert.ok(s.staleIds.has('r1'), `relationship marked (${changed.type} ${changed.start}>${changed.end})`);
+		assert.ok(s.staleRelationshipIds.has('r1'), `relationship marked (${changed.type} ${changed.start}>${changed.end})`);
+		assert.equal(s.staleIds.has('r1'), false, 'among the relationships, not the nodes');
 		assert.match(s.notice?.text ?? '', /the relationship r1 was type T from a to b, and is now type /);
 	}
 });
@@ -513,4 +514,130 @@ test('dispose ends what is in flight but leaves subscriptions alone, and the ses
 	off();
 	session.focus('a');
 	assert.equal(heard, before + 1, 'an explicit unsubscribe still works');
+});
+
+// -----------------------------------------------------------------------------
+// GX-FE-01: while the connection is checked again, the drawing stays and nothing is sent
+// -----------------------------------------------------------------------------
+
+test('a paused session keeps its drawing and sends nothing for Expand, Connect, Find path or Refresh, and says why', async () => {
+	let why: string | null = 'Checking this connection again.';
+	const log = { recipes: [] as IRecipe[] };
+	const session = createGraphSession({
+		engine: () => NEO,
+		invoke: async (recipe) => {
+			log.recipes.push(recipe);
+			return envelope([[node('a', ['P']), rel('r2', 'T', 'a', 'c'), node('c', ['P'])]]);
+		},
+		describe: (error) => notice(String(error)),
+		announce: () => undefined,
+		captionChoice: () => undefined,
+		paused: () => why,
+	});
+	session.load(base());
+	session.toggleSelect('a');
+	session.toggleSelect('b');
+	session.inspect({ kind: 'node', id: 'a' });
+	await session.expand('a');
+	await session.connect();
+	await session.findPath();
+	await session.refreshInspected();
+	assert.equal(log.recipes.length, 0);
+	assert.deepEqual([...session.getState().model.nodes.keys()], ['a', 'b'], 'the drawing is kept');
+	assert.equal(session.getState().notice?.text, 'Nothing was sent. Checking this connection again.');
+	why = null;
+	await session.expand('a');
+	assert.equal(log.recipes.length, 1, 'it sends again once the connection answers');
+});
+
+// -----------------------------------------------------------------------------
+// GX-CT-02: Connect honours `truncated`
+// -----------------------------------------------------------------------------
+
+test('connect never says "no further relationships" when the node cut its answer, and says that more may exist', async () => {
+	// The node clamps the 2,000 rows asked for to its own cap (250 on a default FalkorDB node): every row it sent is
+	// already drawn, but the answer was cut.
+	const { session } = rig(NEO, () => envelope([[node('a', ['P']), rel('r1', 'T', 'a', 'b'), node('b', ['P'])]], { row_limit: 250, truncated: true, truncated_by: 'rows' }));
+	session.load(base());
+	await session.connect();
+	const said = session.getState().notice;
+	assert.doesNotMatch(said?.text ?? '', /No further relationships/);
+	assert.match(said?.text ?? '', /stopped at 250 rows, so more relationships among the nodes on the canvas may exist/);
+	assert.equal(said?.variant, 'warning');
+	// Something added from a cut answer says both.
+	const { session: some } = rig(NEO, () => envelope([[node('a', ['P']), rel('r2', 'T', 'b', 'a'), node('b', ['P'])]], { row_limit: 250, truncated: true, truncated_by: 'rows' }));
+	some.load(base());
+	await some.connect();
+	assert.match(some.getState().notice?.text ?? '', /^Added 1 relationship among the nodes on the canvas, but the node stopped at 250 rows/);
+});
+
+// -----------------------------------------------------------------------------
+// GX-CT-07: node and relationship ids are separate namespaces (FalkorDB numbers both from 0)
+// -----------------------------------------------------------------------------
+
+test('a relationship marked out of date does not mark the node that has the same id (FalkorDB numbers both from 0), and Connect says which kind is out of date', async () => {
+	// Nodes 0, 1, 2 and relationship 2 (0 -> 1): the live FalkorDB fixture has exactly this kind of overlap.
+	const drawn = envelope([[node('0', ['P']), rel('2', 'T', '0', '1'), node('1', ['P']), node('2', ['P'])]]);
+	const { session, log } = rig(NEO, (_recipe, call) => (call === 0 ? envelope([[node('0', ['P']), rel('2', 'OTHER', '0', '1'), node('1', ['P'])]]) : envelope([[node('2', ['P']), rel('9', 'T', '2', '1'), node('1', ['P'])]])));
+	session.load(drawn);
+	await session.expand('0');
+	let s = session.getState();
+	assert.equal(s.staleIds.has('2'), false, 'the node with the same number is not marked');
+	assert.ok(s.staleRelationshipIds.has('2'), 'the relationship is');
+	// Node 2 is still asked about.
+	await session.expand('2');
+	assert.equal(log.recipes.length, 2, 'node 2 was expanded');
+	assert.doesNotMatch(session.getState().notice?.text ?? '', /out of date/);
+	// Connect names relationships, not dashed nodes that do not exist.
+	const sent = log.recipes.length;
+	await session.connect();
+	assert.equal(log.recipes.length, sent, 'nothing is sent while a drawn relationship is out of date');
+	assert.match(session.getState().notice?.text ?? '', /Some drawn relationships are out of date/);
+	assert.doesNotMatch(session.getState().notice?.text ?? '', /out-of-date nodes/);
+	// Dismissing node 2 (not an end of relationship 2) keeps the relationship's mark; dismissing an end clears it.
+	session.dismiss('2');
+	s = session.getState();
+	assert.ok(s.staleRelationshipIds.has('2'), 'dismissing an unrelated node with the same id does not clear it');
+	session.dismiss('1');
+	assert.equal(session.getState().staleRelationshipIds.size, 0, 'the relationship left the canvas with its end');
+});
+
+// -----------------------------------------------------------------------------
+// GX-FE-10: "stop waiting" exists for every request the graph sends
+// -----------------------------------------------------------------------------
+
+test('Stop waiting lets go of Expand, Connect and Refresh as well as a path search: the late answer is dropped and the next action may start', async () => {
+	const starts: Array<[string, (session: ReturnType<typeof rig>['session']) => Promise<void>]> = [
+		['expand', (session) => session.expand('a')],
+		['connect', (session) => session.connect()],
+		['inspect', (session) => { session.inspect({ kind: 'node', id: 'a' }); return session.refreshInspected(); }],
+	];
+	for (const [busy, start] of starts) {
+		let release: (r: ReadQueryResult) => void = () => undefined;
+		const { session, log } = rig(NEO, () => new Promise<ReadQueryResult>((resolve) => { release = resolve; }));
+		session.load(base());
+		const pending = start(session);
+		await tick();
+		assert.equal(session.getState().busy, busy);
+		session.stopWaiting();
+		assert.equal(session.getState().busy, null, `${busy}: no longer busy`);
+		assert.match(session.getState().notice?.text ?? '', /^Stopped waiting\. Stop waiting stops this app from waiting; the query may still be running/, busy);
+		release(envelope([[node('a', ['Q'], { name: 'late' }), rel('r2', 'T', 'a', 'c'), node('c', ['P'])]]));
+		await pending;
+		const s = session.getState();
+		assert.deepEqual([...s.model.nodes.keys()], ['a', 'b'], `${busy}: the late answer was dropped`);
+		assert.equal(s.staleIds.size, 0, `${busy}: and not judged either`);
+		assert.match(s.notice?.text ?? '', /^Stopped waiting\./, `${busy}: the notice is not replaced by the late answer`);
+		const sent = log.recipes.length;
+		void session.expand('b');
+		await tick();
+		assert.equal(log.recipes.length, sent + 1, `${busy}: a new action starts`);
+	}
+});
+
+test('Stop waiting with nothing running does nothing', () => {
+	const { session } = rig();
+	session.load(base());
+	session.stopWaiting();
+	assert.equal(session.getState().notice, null);
 });

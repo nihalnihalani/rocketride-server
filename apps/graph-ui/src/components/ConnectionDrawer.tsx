@@ -33,7 +33,8 @@
 import React, { useState } from 'react';
 import { Banner, Button, DetailPanel, LabelValue, Section, StatusBadge } from 'shell';
 import type { IExplorerEndpoint, IProbeResult } from 'shared/explorer';
-import { connectionView } from '../graph/connections';
+import { connectionView, testResultText } from '../graph/connections';
+import type { ITestResult } from '../graph/connections';
 import { GraphIcon } from '../icons';
 
 /** Props. */
@@ -41,7 +42,7 @@ export interface IConnectionDrawerProps {
 	open: boolean;
 	endpoint: IExplorerEndpoint | null;
 	probe: IProbeResult | undefined;
-	/** Re-probe the endpoint; resolves with the new result (null when the endpoint is gone). */
+	/** Re-probe the endpoint; resolves with the new result (null when nothing was sent: no running task, or a check already running). */
 	onTest(endpoint: IExplorerEndpoint): Promise<IProbeResult | null>;
 	onOpen(endpoint: IExplorerEndpoint): void;
 	onClose(): void;
@@ -55,7 +56,8 @@ export interface IConnectionDrawerProps {
  */
 export const ConnectionDrawer: React.FC<IConnectionDrawerProps> = ({ open, endpoint, probe, onTest, onOpen, onClose }) => {
 	const [testing, setTesting] = useState(false);
-	const [tested, setTested] = useState<'none' | 'ok' | 'failed'>('none');
+	// The host keys this drawer on the card it shows, so a result never carries over to another connection.
+	const [tested, setTested] = useState<ITestResult | null>(null);
 	if (!endpoint) return null;
 	const view = connectionView(endpoint, probe);
 
@@ -63,7 +65,7 @@ export const ConnectionDrawer: React.FC<IConnectionDrawerProps> = ({ open, endpo
 		setTesting(true);
 		try {
 			const result = await onTest(endpoint);
-			setTested(result?.ok ? 'ok' : 'failed');
+			setTested(testResultText(result));
 		} finally {
 			setTesting(false);
 		}
@@ -94,8 +96,7 @@ export const ConnectionDrawer: React.FC<IConnectionDrawerProps> = ({ open, endpo
 						<Banner variant={endpoint.state === 'ready' ? 'warning' : 'info'}>{view.blocked}</Banner>
 					</div>
 				)}
-				{tested === 'ok' && <div style={{ marginTop: 12 }}><Banner variant="info">The node answered.</Banner></div>}
-				{tested === 'failed' && <div style={{ marginTop: 12 }}><Banner variant="error">The node did not answer its identity probe. The details are on its card.</Banner></div>}
+				{tested && <div style={{ marginTop: 12 }}><Banner variant={tested.variant}>{tested.text}</Banner></div>}
 			</Section>
 			<Section label="Connection">
 				{view.details.map((row) => (

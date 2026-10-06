@@ -31,7 +31,10 @@
 //   - Schema: the first load reads `get_schema` (the snapshot the node took when its
 //     pipeline started). Refresh asks `refresh_schema` when the node can. A refresh
 //     that fails (including "this node cannot") keeps the snapshot on screen and
-//     records why; an old node's snapshot is labelled as one it cannot refresh.
+//     records why; an old node's snapshot is labelled as one it cannot refresh. A
+//     Refresh while the connection has not answered its check sends nothing and
+//     records that, rather than quietly re-reading `get_schema`; one asked for
+//     while the first load runs is sent after it.
 //   - Ask: `get_query` returns Cypher the node already vetted (a PREVIEW, never run
 //     here), prose, or a failure. See ask.ts.
 // =============================================================================
@@ -76,15 +79,29 @@ function describe(error: unknown, writable: boolean): IFailureNotice {
  */
 export function loadConnectionSchema(client: IExplorerClient, endpoint: IExplorerEndpoint, options: { fresh?: boolean } = {}, stores: IActionStores = APP_STORES): Promise<void> {
 	const session = stores.endpoints.session(client, endpoint);
-	const dialect = parseDialect(session.info());
-	const refresh = options.fresh === true && supportsRefresh(dialect);
-	const writable = canWrite(dialect);
-	return stores.schemas.load(
-		endpoint.key,
-		() => session.invoke(refresh ? TOOL.refreshSchema : TOOL.getSchema, {}),
-		(error) => describe(error, writable)
-	);
+	const fresh = options.fresh === true;
+	// Decided when the load RUNS (a refresh may wait for the first load to end): what the node can do is read then.
+	const fetch = (): Promise<unknown> => {
+		const dialect = parseDialect(session.info());
+		if (fresh && dialect === null) return Promise.reject(NOT_CHECKED);
+		return session.invoke(fresh && supportsRefresh(dialect) ? TOOL.refreshSchema : TOOL.getSchema, {});
+	};
+	return stores.schemas.load(endpoint.key, fetch, (error) => (error === NOT_CHECKED ? NOT_CHECKED_NOTICE : describe(error, canWrite(parseDialect(session.info())))), { refresh: fresh });
 }
+
+/** Why a Refresh sent nothing: the connection has not answered its check, so what it can do is unknown. */
+const NOT_CHECKED = new Error('not checked');
+
+/** The notice for {@link NOT_CHECKED}. */
+const NOT_CHECKED_NOTICE: IFailureNotice = {
+	variant: 'warning',
+	headline: 'The schema was not refreshed: this connection has not answered its check yet. Try again in a moment.',
+	detail: '',
+	verbatim: '',
+	generic: false,
+	hint: null,
+	ignore: false,
+};
 
 /**
  * Ask a connection's model a question.

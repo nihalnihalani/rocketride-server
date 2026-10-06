@@ -50,19 +50,20 @@ import { describeSnapshot, targetsFromEditor } from '../cypher/targets';
 import type { IEditorSnapshot } from '../cypher/targets';
 import { DEFAULT_ROW_LIMIT, ROW_LIMIT_CHOICES } from '../graph/budgets';
 import { canWrite as dialectCanWrite, parseDialect, rowLimitChip } from '../graph/dialect';
-import { describeFailureOf } from '../graph/failures';
+import { describeFailureOf, describeWriteFailure } from '../graph/failures';
 import type { IFailureNotice } from '../graph/failures';
-import { mayHaveChangedData } from '../graph/dataVersion';
+import { countWrite, isAbandonedWrite } from '../graph/dataVersion';
 import { createGraphSession } from '../graph/graphSession';
 import type { IGraphSession } from '../graph/graphSession';
 import { confirmationParagraphs, describeWrites } from '../graph/writeConfirm';
 import type { IWriteConfirmation } from '../graph/writeConfirm';
-import { GRAPH_BATCH_WORDS, prepareStatement, refuseNonReads, toHistoryEntry } from '../graph/runConfig';
+import { GRAPH_BATCH_WORDS, historySummaryOf, limitPatch, prepareStatement, refuseNonReads, runRefusal, settleRun, toHistoryEntry } from '../graph/runConfig';
 import { chooseTab, summarizeResult } from '../graph/results';
 import type { ResultTab } from '../graph/results';
+import type { ILoadSlot } from '../graph/loadSlot';
 import { inspectorTextOfRow } from '../graph/rowInspect';
 import type { ReadQueryResult } from '../graph/types';
-import { STOP_WAITING_NOTE, resultAnnouncement, rowsMeta, truncationText } from '../graph/wording';
+import { STOP_WAITING_NOTE, num, resultAnnouncement, resultMeta, truncationText } from '../graph/wording';
 import { GraphView } from './GraphView';
 import InspectorPanel from './InspectorPanel';
 import QueryEditor from './QueryEditor';
@@ -84,8 +85,15 @@ export interface IGraphRun extends IStatementRunBase {
 export interface IRunSurfaceProps {
 	endpoint: IExplorerEndpoint;
 	mode: 'read' | 'write';
-	/** Text the host asks the editor to hold (history load, Ask preview, label preview). */
-	loadRequest: { text: string; seq: number; run: boolean } | null;
+	/**
+	 * Why running is paused while the surface stays on screen (the connection is being checked again, was stopped,
+	 * or no longer allows this mode), or null/absent when it can run. Nothing is sent while it is set.
+	 */
+	paused?: string | null;
+	/** The host's mailbox for text the editor should hold (history load, Ask preview, label preview); each request is taken once. */
+	loadSlot: ILoadSlot;
+	/** Changes whenever the host puts a request in the slot. */
+	loadSeq: number;
 	/** Extra content above the editor (the Ask bar). */
 	topSlot?: React.ReactNode;
 	/** Told when the editor text changes (so the host can know a preview was edited). */
@@ -127,7 +135,7 @@ function entryId(): string {
  * @param props - See {@link IRunSurfaceProps}.
  * @returns The surface.
  */
-export const RunSurface: React.FC<IRunSurfaceProps> = ({ endpoint, mode, loadRequest, topSlot, onTextChange, onOpenHistory }) => {
+export const RunSurface: React.FC<IRunSurfaceProps> = ({ endpoint, mode, paused = null, loadSlot, loadSeq, topSlot, onTextChange, onOpenHistory }) => {
 	const { client, isConnected } = useShellConnection();
 	const prefs = usePrefs();
 	const { probes } = useGraphEndpoints();
@@ -136,6 +144,8 @@ export const RunSurface: React.FC<IRunSurfaceProps> = ({ endpoint, mode, loadReq
 	const dialect = useMemo(() => (probe?.ok ? parseDialect(probe.info) : null), [probe]);
 	const writable = dialectCanWrite(dialect);
 	const announce = useCallback((text: string) => announcer.announce(text), []);
+	// Why nothing may be sent right now (statements and graph actions alike), or null.
+	const blocked = !isConnected || !client ? 'The shell is not connected to the engine.' : paused;
 
 	// ── The session on this endpoint (the token never leaves the store) ──────
 	// Keyed on the endpoint's KEY, not its object: background discovery hands back a new object for the same
@@ -194,7 +204,7 @@ export const RunSurface: React.FC<IRunSurfaceProps> = ({ endpoint, mode, loadReq
 	const [confirm, setConfirm] = useState<{ content: IWriteConfirmation; targets: IRunTarget[] } | null>(null);
 	const failureNotes = useRef<IFailureNotice | null>(null);
 	const runner = useStatementRunner<IGraphRun, { cypher: string; limit: number }, ReadQueryResult, IFailureNotice & { verbatim: string }>({
-		canRun: () => client !== null && isConnected && session !== null,
+		canRun: () => client !== null && isConnected && session !== null && paused == null,
 		initRun: (target, index) => {
 			const prepared = prepareStatement(target.text, limitChoice, dialect);
 			return { index, cypher: target.text, kind: prepared.kind, verb: prepared.verb, outcome: 'pending', ...(target.start !== undefined ? { start: target.start } : {}), ...(target.end !== undefined ? { end: target.end } : {}), ...(target.startLine !== undefined ? { startLine: target.startLine } : {}), ...(target.endLine !== undefined ? { endLine: target.endLine } : {}) };
@@ -203,31 +213,33 @@ export const RunSurface: React.FC<IRunSurfaceProps> = ({ endpoint, mode, loadReq
 		refuse: mode === 'read' ? (runs) => refuseNonReads(runs.map((r) => prepareStatement(r.cypher, limitChoice, dialect)), writable) : undefined,
 		prepare: (run) => {
 			const p = prepareStatement(run.cypher, limitChoice, dialect);
-			return { send: { cypher: p.cypher, limit: p.limit }, patch: { limitApplied: p.limit, limitState: 'node' } };
+			return { send: { cypher: p.cypher, limit: p.limit }, patch: limitPatch(mode, p.limit) };
 		},
 		execute: async (_run, send, ticket) => {
 			if (!session) throw new ExplorerToolError({ kind: 'unavailable', tool: mode === 'read' ? TOOL.readQuery : TOOL.execute, message: 'This connection is not available.' });
 			return mode === 'read'
 				? session.invoke<ReadQueryResult>(TOOL.readQuery, { cypher: send.cypher, params: {}, limit: send.limit }, { generation: ticket })
-				: session.invoke<ReadQueryResult>(TOOL.execute, { query: send.cypher, shape: 'graph' }, { generation: ticket });
+				// Counted here, in the call, so a write that lands after this console closed still marks drawn graphs out of date.
+				: countWrite(dataVersions, endpoint.key, () => session.invoke<ReadQueryResult>(TOOL.execute, { query: send.cypher, shape: 'graph' }, { generation: ticket }));
 		},
-		settle: (_run, result) => ({ outcome: 'rows', rowCount: result.rows.length, result }),
+		settle: (_run, result) => settleRun(mode, result),
 		describeFailure: (message, error) => {
-			const notice = describeFailureOf(message, error, writable);
+			const notice = mode === 'write' ? describeWriteFailure(message, error) : describeFailureOf(message, error, writable);
 			failureNotes.current = notice;
 			return notice as IFailureNotice & { verbatim: string };
 		},
 		formatPrior: (runs, index) => formatPriorStatements(runs, index, GRAPH_BATCH_WORDS),
 		record: (run) => {
-			// A write that ran (or may still run) makes every graph drawn from this connection out of date, in every document.
-			if (mayHaveChangedData(mode, run.outcome)) dataVersions.bump(endpoint.key);
-			const outcome = run.outcome === 'rows' || run.outcome === 'abandoned' ? run.outcome : 'error';
-			graphHistory.runs.emitRun(endpoint.key, toHistoryEntry({ cypher: run.cypher, at: Math.round(Date.now() - (run.ms ?? 0)), ms: Math.round(run.ms ?? 0), outcome, ...(run.outcome === 'rows' ? { rows: run.result?.rows.length ?? 0 } : {}), ...(run.limitApplied != null ? { limit: run.limitApplied } : {}), ...(run.error !== undefined ? { error: run.error } : {}), kind: run.verb }, entryId()));
+			// A write is counted where it is sent (countWrite); one the user stopped waiting for may still complete, so it
+			// makes every graph drawn from this connection out of date now, in every document.
+			if (isAbandonedWrite(mode, run.outcome)) dataVersions.bump(endpoint.key);
+			graphHistory.runs.emitRun(endpoint.key, toHistoryEntry(historySummaryOf(run, Date.now()), entryId()));
 		},
 		summarize: ({ shown, runs }) => {
 			if (shown?.result) {
 				const s = summarizeResult(shown.result);
-				return runs.length > 1 ? `${formatBatchOutcome(runs, GRAPH_BATCH_WORDS)}. ${resultAnnouncement(shown.result.rows.length, s.nodeCount, s.relationshipCount, truncationText(shown.result))}` : resultAnnouncement(shown.result.rows.length, s.nodeCount, s.relationshipCount, truncationText(shown.result));
+				const said = `${shown.outcome === 'affected' ? `${num(shown.affected ?? 0)} affected. ` : ''}${resultAnnouncement(shown.result.rows.length, s.nodeCount, s.relationshipCount, truncationText(shown.result))}`;
+				return runs.length > 1 ? `${formatBatchOutcome(runs, GRAPH_BATCH_WORDS)}. ${said}` : said;
 			}
 			return null;
 		},
@@ -251,8 +263,8 @@ export const RunSurface: React.FC<IRunSurfaceProps> = ({ endpoint, mode, loadReq
 	// merely re-probes the node, refreshes discovery or re-renders this component may rebuild it, because that would
 	// silently drop the selection, the inspector, every expansion and the stale marks. What changes over time is read
 	// through refs.
-	const latest = useRef({ dialect, writable, session, announce });
-	latest.current = { dialect, writable, session, announce };
+	const latest = useRef({ dialect, writable, session, announce, blocked });
+	latest.current = { dialect, writable, session, announce, blocked };
 	// `endpoint.key` is the whole dependency on purpose: one graph session per connection.
 	const graphSession = useMemo<IGraphSession>(() => createGraphSession({
 		engine: () => (latest.current.dialect ? { dialect: latest.current.dialect.dialect, version: latest.current.dialect.engineVersion } : null),
@@ -264,6 +276,7 @@ export const RunSurface: React.FC<IRunSurfaceProps> = ({ endpoint, mode, loadReq
 		describe: (error) => describeFailureOf(error instanceof Error ? error.message : String(error), error, latest.current.writable),
 		announce: (text) => latest.current.announce(text),
 		captionChoice: (label) => captionsRef.current.get(label),
+		paused: () => latest.current.blocked,
 		// eslint-disable-next-line react-hooks/exhaustive-deps
 	}), [endpoint.key]);
 	// Dispose once, when the session is replaced or the surface goes away: NOT on every new result. `dispose` ends
@@ -303,6 +316,12 @@ export const RunSurface: React.FC<IRunSurfaceProps> = ({ endpoint, mode, loadReq
 
 	// ── Running ──────────────────────────────────────────────────────────────
 	const startRun = useCallback((targets: IRunTarget[], fromEditor: boolean) => {
+		// A press while a batch runs (keyboard, History) or while the surface is paused is refused out loud, never dropped.
+		const refusal = runRefusal({ running: runner.running, blocked });
+		if (refusal !== null) {
+			announce(refusal);
+			return;
+		}
 		if (targets.length === 0) {
 			announce('Nothing to run.');
 			return;
@@ -315,7 +334,7 @@ export const RunSurface: React.FC<IRunSurfaceProps> = ({ endpoint, mode, loadReq
 			}
 		}
 		void runner.runTargets(targets, { fromEditor });
-	}, [mode, runner, announce]);
+	}, [mode, runner, announce, blocked]);
 
 	// Run reads the buffer, the selection and the caret from the LIVE editor in one call. The `text` state is a copy that
 	// lags a render behind fast typing; a caret taken from the editor against that copy points past its end and the run
@@ -326,15 +345,15 @@ export const RunSurface: React.FC<IRunSurfaceProps> = ({ endpoint, mode, loadReq
 		startRun(targets, true);
 	}, [startRun]);
 
-	// A request from the host: put text in the editor, and (for a click on a label) run it.
-	const handled = useRef(0);
+	// A request from the host: put text in the editor, and (for a click on a label) run it. The request is TAKEN from
+	// the host's slot, so a surface that mounts again finds nothing to replay.
 	useEffect(() => {
-		if (!loadRequest || loadRequest.seq === handled.current) return;
-		handled.current = loadRequest.seq;
-		editor.current?.setText(loadRequest.text);
-		changeText(loadRequest.text);
-		if (loadRequest.run) startRun([{ text: loadRequest.text }], false);
-	}, [loadRequest]); // eslint-disable-line react-hooks/exhaustive-deps
+		const request = loadSlot.take();
+		if (!request) return;
+		editor.current?.setText(request.text);
+		changeText(request.text);
+		if (request.run) startRun([{ text: request.text }], false);
+	}, [loadSlot, loadSeq]); // eslint-disable-line react-hooks/exhaustive-deps
 
 	// ── Row inspector (Table) ────────────────────────────────────────────────
 	const [openRow, setOpenRow] = useState<number | null>(null);
@@ -342,10 +361,9 @@ export const RunSurface: React.FC<IRunSurfaceProps> = ({ endpoint, mode, loadReq
 	const rowView = result && openRow !== null && result.rows[openRow] ? inspectorTextOfRow(result.columns, result.rows[openRow]) : null;
 
 	// ── Meta line ────────────────────────────────────────────────────────────
-	const metaText = result ? rowsMeta(result, displayed?.ms) : '';
+	const metaText = result ? resultMeta(displayed, result) : '';
 	const truncation = result ? truncationText(result) : null;
 	const willRun = describeSnapshot(view ?? { text, start: 0, end: 0, caret: 0 });
-	const blocked = !isConnected || !client ? 'The shell is not connected to the engine.' : null;
 	const strip = runner.runs.length > 1;
 
 	const menu: ViewMenu = useMemo(() => ({
@@ -364,7 +382,7 @@ export const RunSurface: React.FC<IRunSurfaceProps> = ({ endpoint, mode, loadReq
 					<QueryEditor ref={editor} value={text} onChange={changeText} onRun={() => run(false)} onRunAll={() => run(true)} onCursorChange={syncCursor} label={mode === 'read' ? 'Cypher query' : 'Cypher statements to execute'} />
 				</div>
 				<div style={styles.runBar}>
-					<Button variant="primary" disabled={!runner.canStop && runner.running || blocked !== null} onClick={() => run(false)} title="Run the selection or the statement at the caret (Ctrl/Cmd+Enter)">
+					<Button variant="primary" disabled={runner.running || blocked !== null} onClick={() => run(false)} title="Run the selection or the statement at the caret (Ctrl/Cmd+Enter)">
 						{mode === 'read' ? 'Run' : 'Execute'}
 					</Button>
 					<Button variant="ghost" disabled={runner.running || blocked !== null} onClick={() => run(true)} title="Run every statement in order (Ctrl/Cmd+Shift+Enter)">
@@ -442,6 +460,11 @@ export const RunSurface: React.FC<IRunSurfaceProps> = ({ endpoint, mode, loadReq
 					onConfirm={() => {
 						const targets = confirm.targets;
 						setConfirm(null);
+						const refusal = runRefusal({ running: runner.running, blocked });
+						if (refusal !== null) {
+							announce(refusal);
+							return;
+						}
 						void runner.runTargets(targets, { fromEditor: true });
 					}}
 					onCancel={() => {

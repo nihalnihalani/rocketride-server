@@ -26,9 +26,10 @@
 //
 // Pure: turns a wire node or relationship into the fields, JSON and notes the
 // inspector renders. Property keys are shown as the user wrote them (one leading
-// `@` removed); values are shown in full and exactly (a number tag is its text,
-// never a rounded float); Copy-as-JSON is the WIRE form, so what is copied can be
-// pasted back into a test or a bug report without losing a digit.
+// `@` removed), and so are the keys of maps nested in a value, at any depth;
+// values are shown in full and exactly (a number tag is its text, never a rounded
+// float); Copy-as-JSON is the WIRE form, so what is copied can be pasted back into
+// a test or a bug report without losing a digit.
 //
 // An element id is a LIVE HANDLE: Neo4j's elementId in particular is not stable
 // across transactions, and AGE and FalkorDB may reuse an id after a delete. The
@@ -37,7 +38,7 @@
 // =============================================================================
 
 import type { GraphNode, GraphRelationship } from './types';
-import { toJsonText, userEntries, valueText } from './values';
+import { decodedText, toJsonText, userEntries } from './values';
 
 /** One row of the inspector. */
 export interface IInspectorField {
@@ -80,7 +81,7 @@ export function inspectNode(node: GraphNode, caption: string): IInspectorModel {
 		subtitle: node.labels.length > 0 ? node.labels.map((l) => `:${l}`).join('') : 'no label',
 		id: node.id,
 		tags: node.labels,
-		fields: userEntries(node.properties).map(([label, value]) => ({ label, value: valueText(value) })),
+		fields: userEntries(node.properties).map(([label, value]) => ({ label, value: decodedText(value) })),
 		json: toJsonText(node, 2),
 		endpoints: null,
 		notes: [ID_NOTE],
@@ -101,7 +102,7 @@ export function inspectRelationship(rel: GraphRelationship, captionOf: (id: stri
 		subtitle: `${captionOf(rel.start)} → ${captionOf(rel.end)} (as stored)`,
 		id: rel.id,
 		tags: [rel.type],
-		fields: userEntries(rel.properties).map(([label, value]) => ({ label, value: valueText(value) })),
+		fields: userEntries(rel.properties).map(([label, value]) => ({ label, value: decodedText(value) })),
 		json: toJsonText(rel, 2),
 		endpoints: { start: rel.start, end: rel.end },
 		notes: [ID_NOTE],

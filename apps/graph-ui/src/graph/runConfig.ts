@@ -45,6 +45,7 @@ import type { IHistoryEntry } from 'shared/explorer';
 import type { IBatchWords } from 'shared/explorer/runner/format';
 import { rowLimitFor } from './dialect';
 import type { IGraphDialect } from './dialect';
+import type { ReadQueryResult } from './types';
 
 /** A statement ready to send. */
 export interface IPreparedStatement {
@@ -78,7 +79,8 @@ export function prepareStatement(text: string, limitChoice: number | null, diale
 /**
  * Whether the browse editor may send a batch. A statement that is not a read is
  * refused HERE, before anything is sent, with a message; the node's own read
- * path would refuse it too, and the database role is the boundary either way.
+ * path would refuse it too, and that read path (with the database account, where
+ * the node lets you choose one) is the boundary either way.
  *
  * @param statements - The prepared statements.
  * @param canWrite - Whether this endpoint has a write console.
@@ -89,6 +91,99 @@ export function refuseNonReads(statements: readonly IPreparedStatement[], canWri
 	if (!bad) return null;
 	const what = bad.finding ? bad.finding.kind : bad.verb;
 	return `This editor only reads. Statement ${statements.indexOf(bad) + 1} looks like it changes data or runs a command (${what}). ${canWrite ? 'Use the write console for this connection.' : 'This node has direct execution turned off, so there is no write console; use a node that allows it.'} This is a text check, not a database safeguard.`;
+}
+
+// =============================================================================
+// STARTING A RUN
+// =============================================================================
+
+/** Said when a run is asked for while the last one is still running (one batch at a time). */
+export const STILL_RUNNING_TEXT = 'Nothing was sent: a statement is still running. Wait for it, or stop waiting, then run again.';
+
+/**
+ * Why a run asked for now cannot start, in words, or null when it can.
+ *
+ * @param state - Whether a batch is running, and why the surface sends nothing (or null).
+ * @returns The sentence to announce, or null.
+ */
+export function runRefusal(state: { running: boolean; blocked: string | null }): string | null {
+	if (state.blocked !== null) return `Nothing was sent. ${state.blocked}`;
+	if (state.running) return STILL_RUNNING_TEXT;
+	return null;
+}
+
+// =============================================================================
+// SETTLING A RUN (the browse editor reads rows; the write console reports what execute did)
+// =============================================================================
+
+/** The fields a finished statement settles with. */
+export interface ISettledRun {
+	outcome: 'rows' | 'affected';
+	rowCount: number;
+	/** What `execute` reported as affected (write console only). */
+	affected?: number;
+	result: ReadQueryResult;
+}
+
+/**
+ * How a statement that answered settles. In the write console it is the affected count `execute` returned (its rows
+ * still draw); an answer without that count settles as rows rather than claiming "0 affected".
+ *
+ * @param mode - `read` for the workbench, `write` for the write console.
+ * @param result - The node's answer.
+ * @returns The settled fields.
+ */
+export function settleRun(mode: 'read' | 'write', result: ReadQueryResult): ISettledRun {
+	if (mode === 'write' && typeof result.affected_rows === 'number') return { outcome: 'affected', rowCount: result.rows.length, affected: result.affected_rows, result };
+	return { outcome: 'rows', rowCount: result.rows.length, result };
+}
+
+/**
+ * The row-limit fields a run records. `read_query` is sent the limit; `execute` takes none (the node applies its own
+ * maximum), so the write console records none.
+ *
+ * @param mode - `read` for the workbench, `write` for the write console.
+ * @param limit - The limit the browse editor would send.
+ * @returns The fields to merge into the run.
+ */
+export function limitPatch(mode: 'read' | 'write', limit: number): { limitApplied: number | null; limitState?: string } {
+	return mode === 'read' ? { limitApplied: limit, limitState: 'node' } : { limitApplied: null };
+}
+
+/** What history needs of a finished run. */
+export interface IFinishedRun {
+	cypher: string;
+	verb: string;
+	outcome: string;
+	ms?: number;
+	result?: ReadQueryResult;
+	affected?: number;
+	limitApplied?: number | null;
+	error?: string;
+}
+
+/**
+ * The history summary of a finished run: its outcome, its count (rows for a read, affected for a write), and the
+ * row limit only when one was sent.
+ *
+ * @param run - The finished run.
+ * @param now - The clock reading when it finished (ms since the epoch).
+ * @returns The summary for {@link toHistoryEntry}.
+ */
+export function historySummaryOf(run: IFinishedRun, now: number): IRunSummary {
+	const ms = Math.round(run.ms ?? 0);
+	const outcome: IRunSummary['outcome'] = run.outcome === 'rows' || run.outcome === 'affected' || run.outcome === 'abandoned' ? run.outcome : 'error';
+	return {
+		cypher: run.cypher,
+		at: Math.round(now - (run.ms ?? 0)),
+		ms,
+		outcome,
+		...(outcome === 'rows' ? { rows: run.result?.rows.length ?? 0 } : {}),
+		...(outcome === 'affected' ? { affected: run.affected ?? 0 } : {}),
+		...(run.limitApplied != null ? { limit: run.limitApplied } : {}),
+		...(run.error !== undefined ? { error: run.error } : {}),
+		kind: run.verb,
+	};
 }
 
 /** The outcome of one run, as history stores it. */

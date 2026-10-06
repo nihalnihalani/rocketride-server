@@ -85,6 +85,60 @@ describe('schema actions', () => {
 	});
 });
 
+// GX-FE-11: Refresh sent get_schema (and stored it as fresh) whenever the probe was missing, and a Refresh pressed during
+// the first get_schema was answered by that load and never reached refresh_schema.
+describe('schema Refresh when the connection is busy', () => {
+	const CAPABLE = { ...CURRENT, capabilities: { ...(CURRENT.capabilities as object), refresh_schema: true } };
+	const settle = async (): Promise<void> => {
+		for (let i = 0; i < 10; i += 1) await new Promise((resolve) => setTimeout(resolve, 0));
+	};
+
+	it('Refresh while the connection is being checked again sends nothing and records why, instead of quietly re-reading get_schema', async () => {
+		let hold = false;
+		const { world, stores, endpoint } = await rig(CAPABLE, { [TOOL.dialect]: () => (hold ? new Promise(() => undefined) : CAPABLE), [TOOL.refreshSchema]: () => fixture('schema_v2') });
+		await loadConnectionSchema(world.client, endpoint, {}, stores);
+		const before = stores.schemas.get(endpoint.key).view;
+		hold = true;
+		void stores.endpoints.refresh(world.client, { reprobe: true });
+		await settle();
+		assert.equal(stores.endpoints.getState().probes[endpoint.key], undefined, 'the probe is gone while the node is asked again');
+		const sent = world.calls.length;
+		await loadConnectionSchema(world.client, endpoint, { fresh: true }, stores);
+		assert.deepEqual(world.calls.slice(sent).map((c) => c.tool).filter((t) => t !== TOOL.dialect), [], 'neither get_schema nor refresh_schema was sent');
+		const entry = stores.schemas.get(endpoint.key);
+		assert.equal(entry.status, 'error');
+		assert.deepEqual(entry.view, before, 'the snapshot stays');
+		assert.match(entry.failure?.headline ?? '', /not refreshed: this connection has not answered its check yet/);
+	});
+
+	it('Refresh pressed while the first schema load runs is sent once that load ends, and pressing it twice sends one refresh', async () => {
+		let releaseGet: () => void = () => undefined;
+		const { world, stores, endpoint } = await rig(CAPABLE, {
+			[TOOL.getSchema]: () => new Promise((resolve) => { releaseGet = () => resolve(fixture('schema_old_node')); }),
+			[TOOL.refreshSchema]: () => fixture('schema_v2'),
+		});
+		const first = loadConnectionSchema(world.client, endpoint, {}, stores);
+		await settle();
+		const refresh = loadConnectionSchema(world.client, endpoint, { fresh: true }, stores);
+		const again = loadConnectionSchema(world.client, endpoint, { fresh: true }, stores);
+		releaseGet();
+		await Promise.all([first, refresh, again]);
+		assert.deepEqual(world.calls.map((c) => c.tool), [TOOL.dialect, TOOL.getSchema, TOOL.refreshSchema]);
+		assert.equal(stores.schemas.get(endpoint.key).view.source, 'refresh');
+	});
+
+	it('a second Refresh while a refresh runs joins it: one refresh_schema for a double click', async () => {
+		let releaseRefresh: () => void = () => undefined;
+		const { world, stores, endpoint } = await rig(CAPABLE, { [TOOL.refreshSchema]: () => new Promise((resolve) => { releaseRefresh = () => resolve(fixture('schema_v2')); }) });
+		const one = loadConnectionSchema(world.client, endpoint, { fresh: true }, stores);
+		await settle();
+		const two = loadConnectionSchema(world.client, endpoint, { fresh: true }, stores);
+		releaseRefresh();
+		await Promise.all([one, two]);
+		assert.equal(world.calls.filter((c) => c.tool === TOOL.refreshSchema).length, 1);
+	});
+});
+
 describe('Ask over get_query', () => {
 	it('sends the trimmed question and returns Cypher as a preview, never running it', async () => {
 		const { world, stores, endpoint } = await rig(CURRENT, { [TOOL.getQuery]: () => ({ query: 'MATCH (n:Person) RETURN n LIMIT 25', valid: true }) });
