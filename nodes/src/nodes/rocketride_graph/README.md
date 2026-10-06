@@ -246,10 +246,15 @@ A call first waits for a free pooled connection (up to the query timeout plus
 5 seconds, then it fails with `Database busy`), opens one if none is idle
 (3-second connect timeout), then runs its statement with the query timeout. If
 the connection turns out to have been dropped while idle, the call starts over
-once on a new connection, and that second attempt can wait for a free
-connection again. One `read_query` can therefore take up to about three times
-the query timeout plus 16 seconds (106 seconds with the default 30-second
-timeout), longer than the `statement_timeout_ms` that `dialect` reports. `refresh_schema` waits up
+once on a new connection, within what is left of the time its first attempt
+was allowed (the wait for a connection plus the query timeout): the second
+attempt waits for a free connection only that long (then `Database busy`), its
+statement timeout is the time left, and with no time left it runs nothing and
+fails with `Query timed out after N ms`, where N is that whole allowance. One
+`read_query` therefore takes at most about twice the query timeout plus 5
+seconds (65 seconds with the default 30-second timeout; opening a new
+connection can add a few seconds), longer than the `statement_timeout_ms` that
+`dialect` reports. `refresh_schema` waits up
 to 65 seconds for another refresh of the same node, then gets a connection and
 runs within its 60-second budget; the wait for the connection counts against
 that budget and stops when it runs out, so the refresh itself takes at most
