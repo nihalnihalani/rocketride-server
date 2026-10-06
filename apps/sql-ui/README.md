@@ -37,8 +37,12 @@ than from the app.
 
 ## Connections
 
-The Connections page lists every database tool node in every running
-pipeline task you can see, in one call, however many there are. Your own
+The Connections page lists every database tool node in the running pipeline
+tasks you can see in the organization you are signed in to, in one call,
+however many there are. A run whose team is not one of that organization's
+teams is left out, so after you sign in to another organization or team the
+previous one's runs do not appear (a run from an older server that names no
+team is still listed). Your own
 development run and a team's deployment of the same pipeline are separate
 connections (a deployment's card says so), and two owners' runs never merge.
 Each card shows the pipeline, the engine and a state. Selecting a card opens
@@ -163,9 +167,10 @@ is stopping or restarting, the engine refuses a statement with
 `TASK_STOPPED` before the statement reaches the database, so nothing has run.
 A statement the app classifies as a read is then sent once more, after the
 same connection is running again; a write never is. The classification is by
-text, so a read that changes something (`SELECT … INTO`, a `nextval` or
-another volatile function) counts as a read here; it is still never run
-twice, because the refusal comes before the database sees it. A statement
+text: a `SELECT … INTO` counts as a write (see the row limit below), but a
+read that changes something through a function (`nextval` or another
+volatile function) counts as a read here. It is still never run twice,
+because the refusal comes before the database sees it. A statement
 that reached the database is never re-sent, whatever happens to its answer.
 
 ### The row limit
@@ -191,7 +196,9 @@ so it is not read as the statement's own limit (on ClickHouse, and on a
 connection whose dialect could not be probed). On **200** or **1000** the
 header's `LIMIT` is appended after it, which ClickHouse accepts, and the line
 reads `limit 200`; with **All** it reads `no limit applied`. A plain `LIMIT`
-after the `BY` list is the statement's own limit, as anywhere else.
+after the `BY` list is the statement's own limit, as anywhere else. ClickHouse
+puts its `SETTINGS` and `FORMAT` clauses after every `LIMIT`, so when a
+statement ends with them the header's `LIMIT` goes in front of the first one.
 
 Read `no limit applied` literally, because **All** together with a `LIMIT`
 that is not on the outermost query produces exactly that line. Only a
