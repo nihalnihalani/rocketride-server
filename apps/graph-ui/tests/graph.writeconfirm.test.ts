@@ -64,8 +64,8 @@ test('the write console banner says which statements are confirmed, not that eve
 });
 
 // GX-FE-04: the shell's ConfirmDialog focuses its confirm button when it opens, so an Enter right after Ctrl/Cmd+Enter
-// (or a double Enter) executed the write. The console moves focus to the dialog's Cancel button, which the focus step
-// finds by its label. There is no DOM here: the dialog is a stand-in with the shell's footer order.
+// (or a double Enter) executed the write. WriteConfirmDialog moves focus to the dialog's Cancel button, which the focus
+// step finds by its label. There is no DOM here: the dialog is a stand-in with the shell's footer order.
 test('the write confirmation\'s focus step lands on Cancel, never on Execute', () => {
 	assert.equal(WRITE_CANCEL_LABEL, 'Cancel');
 	for (const confirmLabel of ['Execute statement', 'Execute statements']) {

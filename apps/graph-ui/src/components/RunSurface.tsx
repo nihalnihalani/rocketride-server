@@ -37,12 +37,11 @@
 
 import React, { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import type { CSSProperties } from 'react';
-import { Banner, Button, ConfirmDialog, EmptyState, StatusBadge, TabControl, ToggleGroup, usePrefs, useShellConnection } from 'shell';
+import { Banner, Button, EmptyState, StatusBadge, TabControl, ToggleGroup, usePrefs, useShellConnection } from 'shell';
 import type { RocketRideClient, ViewMenu } from 'shell';
 import { ExplorerToolError, clock, createGeneration, formatBatchOutcome, formatPriorStatements, formatRunLabel, useStatementRunner } from 'shared/explorer';
 import type { IExplorerEndpoint, IRunTarget, IStatementRunBase } from 'shared/explorer';
 import FailureBanner from 'shared/explorer/components/FailureBanner';
-import { focusCancelIn } from 'shared/explorer/components/PatternConfirmDialog';
 import RowInspector from 'shared/explorer/components/RowInspector';
 import StatementStrip from 'shared/explorer/components/StatementStrip';
 import { CAPTIONS_PREF_KEY, DRAFTS_PREF_KEY, TOOL, announcer, dataVersions, graphEndpoints, graphHistory } from '../adapters/explorer';
@@ -56,7 +55,7 @@ import type { IFailureNotice } from '../graph/failures';
 import { countWrite, isAbandonedWrite } from '../graph/dataVersion';
 import { createGraphSession } from '../graph/graphSession';
 import type { IGraphSession } from '../graph/graphSession';
-import { WRITE_CANCEL_LABEL, confirmationParagraphs, describeWrites } from '../graph/writeConfirm';
+import { describeWrites } from '../graph/writeConfirm';
 import type { IWriteConfirmation } from '../graph/writeConfirm';
 import { GRAPH_BATCH_WORDS, historySummaryOf, limitPatch, prepareStatement, refuseNonReads, runRefusal, settleRun, toHistoryEntry } from '../graph/runConfig';
 import { chooseTab, summarizeResult } from '../graph/results';
@@ -70,6 +69,7 @@ import InspectorPanel from './InspectorPanel';
 import QueryEditor from './QueryEditor';
 import type { IQueryEditorHandle } from './QueryEditor';
 import { RawView, ResultTable } from './ResultViews';
+import { WriteConfirmDialog } from './WriteConfirmDialog';
 import { GraphIcon } from '../icons';
 
 // =============================================================================
@@ -202,15 +202,9 @@ export const RunSurface: React.FC<IRunSurfaceProps> = ({ endpoint, mode, paused 
 	}, [text, syncCursor]);
 
 	// ── The runner (shared) configured for Cypher ────────────────────────────
+	// The write confirmation waiting for an answer. WriteConfirmDialog is mounted while it is set, and puts the focus on
+	// Cancel from its own mount effect (see its header for why the effect lives there).
 	const [confirm, setConfirm] = useState<{ content: IWriteConfirmation; targets: IRunTarget[] } | null>(null);
-	// The safe answer is the default one: the shell's ConfirmDialog focuses Execute when it opens, so a second Enter
-	// after Ctrl/Cmd+Enter would send the write. This effect moves focus to Cancel; React runs it after the dialog's own
-	// focus effect (an ancestor's effects run after its descendants' in the same commit).
-	const confirmAnchor = useRef<HTMLDivElement>(null);
-	const confirmOpen = confirm !== null;
-	useEffect(() => {
-		if (confirmOpen) focusCancelIn(confirmAnchor.current, WRITE_CANCEL_LABEL);
-	}, [confirmOpen]);
 	const failureNotes = useRef<IFailureNotice | null>(null);
 	const runner = useStatementRunner<IGraphRun, { cypher: string; limit: number }, ReadQueryResult, IFailureNotice & { verbatim: string }>({
 		canRun: () => client !== null && isConnected && session !== null && paused == null,
@@ -447,26 +441,8 @@ export const RunSurface: React.FC<IRunSurfaceProps> = ({ endpoint, mode, paused 
 			{rowView && <RowInspector open title={`Row ${(openRow ?? 0) + 1} of ${result?.rows.length ?? 0}`} subtitle={displayed ? `statement ${displayed.index + 1}${displayed.ms !== undefined ? ` · ${clock(Date.now() - displayed.ms)}` : ''}` : ''} fields={rowView.fields} json={rowView.json} note={rowView.note} nullText="null" announce={announce} onClose={() => setOpenRow(null)} />}
 
 			{confirm && (
-				<ConfirmDialog
-					title={confirm.content.mutating.length === 1 ? 'Run this statement?' : `Run these ${confirm.content.mutating.length} statements?`}
-					destructive
-					cancelLabel={WRITE_CANCEL_LABEL}
-					confirmLabel={confirm.content.total === 1 ? 'Execute statement' : 'Execute statements'}
-					message={
-						<div ref={confirmAnchor}>
-							<ol style={{ margin: '8px 0', paddingLeft: 20 }}>
-								{confirm.content.mutating.map((m) => (
-									<li key={m.position} style={{ marginBottom: 6 }}>
-										<div>{`Statement ${m.position}${m.lines ? ` (${m.lines})` : ''}: ${m.finding}`}</div>
-										<pre style={{ margin: '2px 0', padding: 6, maxHeight: 80, overflow: 'auto', fontFamily: 'var(--rr-font-mono, monospace)', fontSize: 11, whiteSpace: 'pre-wrap', background: 'color-mix(in srgb, var(--rr-text-primary) 6%, transparent)', borderRadius: 4 }}>{m.excerpt}</pre>
-									</li>
-								))}
-							</ol>
-							{confirmationParagraphs(confirm.content).map((p) => (
-								<div key={p} style={{ marginTop: 6 }}>{p}</div>
-							))}
-						</div>
-					}
+				<WriteConfirmDialog
+					content={confirm.content}
 					onConfirm={() => {
 						const targets = confirm.targets;
 						setConfirm(null);

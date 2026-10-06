@@ -143,18 +143,30 @@ test('Run is disabled for as long as a statement runs, and a run that cannot sta
 	assert.ok(/runRefusal\(/.test(confirm), 'so does confirming a write');
 });
 
-// GX-FE-04: the write confirmation is the shell's ConfirmDialog, which focuses its confirm button when it opens, so an
-// Enter right after Ctrl/Cmd+Enter (or a double Enter) executed the write. RunSurface moves focus to Cancel in its own
-// effect, which React runs after the dialog's (a parent's effects run after its children's in the same commit).
-test('the write confirmation opens with focus on Cancel, never on Execute', () => {
-	const surface = code(read('components', 'RunSurface.tsx'));
-	assert.ok(/import \{[^}]*\bfocusCancelIn\b[^}]*\} from 'shared\/explorer\/components\/PatternConfirmDialog';/.test(surface), 'the shared focus step is used');
-	assert.ok(/useEffect\(\(\) => \{\s*if \(confirmOpen\) focusCancelIn\(confirmAnchor\.current, WRITE_CANCEL_LABEL\);\s*\}, \[confirmOpen\]\);/.test(surface), 'an effect moves focus to Cancel when the confirmation opens');
-	assert.ok(/const confirmOpen = confirm !== null;/.test(surface));
-	const start = surface.indexOf('<ConfirmDialog');
-	const dialog = surface.slice(start, surface.indexOf('onConfirm={', start));
+// GX-FE-04: the write confirmation is the shell's ConfirmDialog, which focuses its confirm button when it mounts, so an
+// Enter right after Ctrl/Cmd+Enter (or a double Enter) executed the write. WriteConfirmDialog renders that dialog and
+// moves focus to Cancel from its OWN mount effect, which React runs after the dialog's (a parent's effects run after
+// its children's in the same commit).
+// W3-FE04: an effect in RunSurface keyed on the dialog being open was not enough. Under <React.StrictMode> (the shell
+// renders in it) a development build re-runs the mount effects of what was just mounted (the dialog, so Execute takes
+// the focus again) but not RunSurface's update effect, so focus ended on Execute. A mount effect of the component that
+// renders the dialog is re-run with it, after it. No React harness runs here, so the shape is pinned by the source.
+test('the write confirmation opens with focus on Cancel, never on Execute, under StrictMode too', () => {
+	const confirmation = code(read('components', 'WriteConfirmDialog.tsx'));
+	assert.ok(/import \{[^}]*\bfocusCancelIn\b[^}]*\} from 'shared\/explorer\/components\/PatternConfirmDialog';/.test(confirmation), 'the shared focus step is used');
+	assert.ok(/useEffect\(\(\) => \{\s*focusCancelIn\(anchor\.current, WRITE_CANCEL_LABEL\);\s*\}, \[\]\);/.test(confirmation), 'a mount effect of the component that renders the dialog moves focus to Cancel');
+	assert.equal(confirmation.match(/useEffect\(/g)?.length, 1, 'and it is the only effect there');
+	const start = confirmation.indexOf('<ConfirmDialog');
+	assert.ok(start > 0, 'the component renders the shell dialog itself, so it is the dialog\'s parent');
+	const dialog = confirmation.slice(start, confirmation.indexOf('onConfirm={', start));
 	assert.ok(/cancelLabel=\{WRITE_CANCEL_LABEL\}/.test(dialog), 'the Cancel button carries the label the focus step looks for');
-	assert.ok(/message=\{\s*<div ref=\{confirmAnchor\}>/.test(dialog), 'the anchor sits inside the dialog');
+	assert.ok(/message=\{\s*<div ref=\{anchor\}>/.test(dialog), 'the anchor sits inside the dialog');
+
+	const surface = code(read('components', 'RunSurface.tsx'));
+	assert.ok(/import \{ WriteConfirmDialog \} from '\.\/WriteConfirmDialog';/.test(surface));
+	assert.ok(/\{confirm && \(\s*<WriteConfirmDialog\s+content=\{confirm\.content\}/.test(surface), 'the console mounts it while a confirmation is pending');
+	assert.doesNotMatch(surface, /<ConfirmDialog\b/, 'the console renders no write dialog of its own');
+	assert.doesNotMatch(surface, /focusCancelIn|confirmOpen|confirmAnchor/, 'no RunSurface effect moves the focus: StrictMode does not re-run it');
 });
 
 // GX-FE-02: the empty state REPLACED the card grid whenever no endpoint was ready, so a stopped, unreachable or No
