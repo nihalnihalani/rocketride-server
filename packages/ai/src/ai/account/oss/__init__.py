@@ -48,7 +48,11 @@ from depends import depends as _depends
 # requirements.txt before importing anything else from this module.
 _depends(os.path.dirname(os.path.realpath(__file__)) + '/requirements.txt')
 
+import contextlib
+import errno
 import re
+import stat
+import tempfile
 import unicodedata
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -85,6 +89,13 @@ def _env_file_value(name: str, value: Any) -> str:
     # accepted either.
     if any(unicodedata.category(ch) == 'Cc' or ch in '\u2028\u2029' for ch in value):
         raise ValueError(f'{name}: the value contains a line break or another control character')
+    # A request's JSON can carry a lone surrogate ("\udc80"). UTF-8, the
+    # file's encoding, cannot hold one, while on POSIX the process
+    # environment takes U+DC80 to U+DCFF as raw bytes.
+    if any(unicodedata.category(ch) == 'Cs' for ch in value):
+        raise ValueError(
+            f'{name}: the value contains a surrogate code point (U+D800 to U+DFFF), which UTF-8 cannot hold'
+        )
     # python-dotenv expands ${NAME} from the engine's environment in every
     # value, quoted or not, with no way to escape it: ${RR_DB_BROKER_TOKEN}
     # would read back as the broker token.
@@ -140,6 +151,43 @@ def _replace_rocketride_environ(env: Dict[str, str]) -> None:
     for k in [k for k in os.environ if k.startswith('ROCKETRIDE_')]:
         del os.environ[k]
     os.environ.update(env)
+
+
+def _replace_env_file(path: str, content: str) -> None:
+    """Make ``content`` the .env file at ``path``, in one step.
+
+    The content is written in full to a new file next to the old one, which
+    then takes its place (os.replace), so a write that fails partway (a full
+    disk, say) leaves the old file whole. A symlinked .env stays a link: the
+    file it points to is the one replaced. An existing file keeps its
+    permission bits, and one the engine may not write is refused, as writing
+    it in place would be. A new file has mode 0o600 (on POSIX, readable and
+    writable by the engine's user only). Text is written as
+    ``open(path, 'w', encoding='utf-8')`` would write it.
+
+    Raises:
+        OSError: nothing was replaced.
+    """
+    target = os.path.realpath(path)
+    try:
+        mode: Optional[int] = stat.S_IMODE(os.stat(target).st_mode)
+    except FileNotFoundError:
+        mode = None
+    if mode is not None and not os.access(target, os.W_OK):
+        raise PermissionError(errno.EACCES, 'the .env file is not writable', target)
+    fd, temp = tempfile.mkstemp(prefix='.env.', suffix='.tmp', dir=os.path.dirname(target))
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+        if mode is not None:
+            os.chmod(temp, mode)
+        os.replace(temp, target)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(temp)
+        raise
 
 
 class Account(AccountBase):
@@ -534,13 +582,13 @@ class Account(AccountBase):
 
                 # Step 2: Replace the ROCKETRIDE_* keys in os.environ (deleted
                 # keys must not linger in memory; get_env reflects the change
-                # without a restart), then write the file. If either fails,
-                # os.environ gets its previous ROCKETRIDE_* keys back.
+                # without a restart), then replace the file in one step. If
+                # either fails, the file is as it was and os.environ gets its
+                # previous ROCKETRIDE_* keys back.
                 previous = {k: v for k, v in os.environ.items() if k.startswith('ROCKETRIDE_')}
                 try:
                     _replace_rocketride_environ(env)
-                    with open(path, 'w', encoding='utf-8') as f:
-                        f.write(content)
+                    _replace_env_file(path, content)
                 except BaseException:
                     _replace_rocketride_environ(previous)
                     raise

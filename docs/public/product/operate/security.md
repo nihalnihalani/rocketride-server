@@ -75,15 +75,22 @@ whole request, changing nothing, when:
 - a `ROCKETRIDE_` name has nothing after the prefix, or anything other than
   ASCII letters, digits and underscores;
 - a value given for a `ROCKETRIDE_` name is not a string, has a control
-  character (U+0000 to U+001F or U+007F to U+009F) or a Unicode line or
-  paragraph separator (U+2028, U+2029), or contains `${`, which the `.env`
+  character (U+0000 to U+001F or U+007F to U+009F), a Unicode line or
+  paragraph separator (U+2028, U+2029) or a surrogate code point (U+D800 to
+  U+DFFF, which UTF-8 cannot encode), or contains `${`, which the `.env`
   loader would expand when the engine starts;
 - such a value would need quotes in the file (it starts or ends with
   whitespace, starts with a quote, or has whitespace before a `#`) and ends
   with a backslash.
 
-If the `.env` file cannot be read as UTF-8 or cannot be written, the command
-fails and leaves the engine's environment as it was.
+The command writes the new `.env` file in full next to the one it replaces
+(for a symlinked `.env`, next to the file the link points to), with that
+file's permission bits, and then renames it into place. It therefore needs
+write access to that directory, and it refuses an existing `.env` file it may
+not write. On Linux and macOS, a new `.env` file is readable and writable only
+by the engine's user. If the `.env` file cannot be read as UTF-8 or the new
+one cannot be written in full, the command fails and leaves the engine's
+environment and the `.env` file as they were.
 
 Each RocketRide database node connects to the database of the organization
 that runs the pipeline (of the user, where there is no organization). The
