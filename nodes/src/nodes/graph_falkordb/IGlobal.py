@@ -44,6 +44,8 @@ from rocketlib import OPEN_MODE, warning
 
 from ai.common.graph import GraphGlobalBase
 from ai.common.graph.adapters import falkordb_adapter
+from ai.common.graph.cypher_safety import check_read_query_statement
+from ai.common.graph.graph_errors import GraphToolError
 from ai.common.graph.graph_global_base import READ_QUERY_HARD_CAP
 from ai.common.graph.schema import SCHEMA_LABEL_LIMIT, SCHEMA_REL_TYPE_LIMIT, SCHEMA_SAMPLE_SIZE
 from ai.common.utils import config_int, parse_bool
@@ -73,6 +75,11 @@ class IGlobal(GraphGlobalBase):
     server_result_cap: Optional[int] = None
     server_timeout_max_ms: Optional[int] = None
     server_version: Optional[str] = None
+
+    # The server mishandles parse errors around some non-ASCII characters, so
+    # read paths send non-ASCII text only inside string literals and
+    # back-quoted names.
+    read_ascii_only = True
 
     def beginGlobal(self) -> None:
         # Config-mode opens the node for editing only; no server round-trip.
@@ -295,7 +302,15 @@ class IGlobal(GraphGlobalBase):
         return 'Query failed', detail
 
     def _validate_query(self, query: str) -> Tuple[bool, str]:
-        """Check syntax with EXPLAIN without running the query."""
+        """Check syntax with EXPLAIN without running the query.
+
+        Text the read-path statement rule refuses (non-ASCII code included)
+        is reported as invalid without being sent.
+        """
+        try:
+            check_read_query_statement(query, tool='generated query', ascii_only=self.read_ascii_only)
+        except GraphToolError as e:
+            return False, e.headline
         try:
             self.select_graph().explain(query)
             return True, ''

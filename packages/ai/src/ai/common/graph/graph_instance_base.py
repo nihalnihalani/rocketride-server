@@ -395,8 +395,10 @@ class GraphInstanceBase(IInstanceBase, ABC):
     def read_query(self, args):
         """Run caller-written Cypher read-only and return the graph result envelope."""
         cypher, params, limit = self._read_query_args(args)
-        # One statement rule for every engine (LOAD CSV), ahead of the driver's own read boundary.
-        check_read_query_statement(cypher)
+        # One statement rule for every engine (no LOAD CSV, no text engines read
+        # differently; no non-ASCII code where the driver asks), ahead of the
+        # driver's own read boundary.
+        check_read_query_statement(cypher, ascii_only=self.IGlobal.read_ascii_only)
         row_limit = min(limit, self.IGlobal.read_query_cap)
 
         def consume(columns, rows):

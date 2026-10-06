@@ -61,23 +61,58 @@ _UNSAFE_CYPHER = re.compile(
 # unterminated string or block comment does not match, so its keywords survive
 # and the statement is rejected, which is the safe direction.
 #
-# A line comment ends at a carriage return as well as a line feed. Stopping only
-# at ``\n`` would let ``// ...\rDELETE`` be read as one long comment here while
-# Cypher ends the comment at the ``\r`` and runs the DELETE.
-_STRIP_LITERALS = re.compile(
-    r"""
-      //[^\r\n]*           # line comment
+# Engines disagree on where a line comment ends: Neo4j ends it at a carriage
+# return or a line feed, FalkorDB only at a line feed. A quote after a lone
+# ``\r`` therefore opens a string on one engine and is comment text on the
+# other, and either reading can hide a clause the other runs. Text with a lone
+# carriage return is stripped both ways (``_STRIP_LITERALS_LF`` is the
+# line-feed-only reading) and must be safe under both.
+_LITERALS = r"""
     | /\*.*?\*/            # block comment
     | '(?:\\.|[^'\\])*'    # single-quoted string
     | "(?:\\.|[^"\\])*"    # double-quoted string
     | `[^`]*`              # back-quoted identifier
+"""
+_STRIP_LITERALS = re.compile(r'//[^\r\n]*  # line comment, CR or LF ends it' + _LITERALS, re.DOTALL | re.VERBOSE)
+_STRIP_LITERALS_LF = re.compile(r'//[^\n]*  # line comment, only LF ends it' + _LITERALS, re.DOTALL | re.VERBOSE)
+_LONE_CR = re.compile(r'\r(?!\n)')
+
+# A numeric literal as the engines write it: hexadecimal, octal, or decimal with
+# an optional fraction and exponent (digits may be grouped with single
+# underscores, as Neo4j allows). Matched at an ASCII digit.
+_NUMBER = re.compile(
+    r"""
+      0[xX][0-9A-Fa-f](?:_?[0-9A-Fa-f])*
+    | 0[oO][0-7](?:_?[0-7])*
+    | [0-9](?:_?[0-9])*(?:\.[0-9](?:_?[0-9])*)?(?:[eE][+-]?[0-9]+)?
     """,
-    re.DOTALL | re.VERBOSE,
+    re.VERBOSE,
 )
+# Where a numeric literal may start in stripped text: a digit that does not
+# continue a name or a parameter (``n1``, ``$1``).
+_NUMBER_START = re.compile(r'(?<![\w$])[0-9]')
+
+
+def _runs_on(text: str, end: int) -> bool:
+    """True when the numeric literal ending at ``end`` runs straight into more text.
+
+    Engines split such text differently: FalkorDB reads ``0LOAD`` as ``0``
+    then the keyword ``LOAD`` where Neo4j rejects it, and reads ``1.`` as a
+    number where Neo4j reads a property access. A number must therefore be
+    followed by something that cannot continue it: not a letter, digit or
+    underscore, and no ``.`` other than the range operator ``..``.
+    """
+    ch = text[end : end + 1]
+    return ch.isalnum() or ch == '_' or (ch == '.' and text[end + 1 : end + 2] != '.')
 
 
 def is_cypher_safe(cypher: str) -> bool:
     """Return True when the Cypher statement is read-only (MATCH/RETURN/schema CALLs).
+
+    A number that runs straight into the text after it (``0LOAD``) makes the
+    statement unsafe, since engines split it differently; a lone carriage
+    return in a line comment makes the statement safe only if it is safe
+    whichever way the comment ends.
 
     Args:
         cypher (str): The Cypher statement to inspect.
@@ -87,9 +122,17 @@ def is_cypher_safe(cypher: str) -> bool:
     """
     # Remove comments and literals first so a keyword that is only data (a
     # commented-out DELETE, or ``n.op = "CREATE"``) can neither trip the gate
-    # nor smuggle a live write past it.
-    stripped = _STRIP_LITERALS.sub('', cypher)
-    return not bool(_UNSAFE_CYPHER.search(stripped))
+    # nor smuggle a live write past it. Each becomes a space, as a comment is
+    # to the engine, so ``1/* c */AND`` does not read as ``1AND``.
+    strippers = (_STRIP_LITERALS, _STRIP_LITERALS_LF) if _LONE_CR.search(cypher) else (_STRIP_LITERALS,)
+    for strip in strippers:
+        stripped = strip.sub(' ', cypher)
+        if _UNSAFE_CYPHER.search(stripped):
+            return False
+        for start in _NUMBER_START.finditer(stripped):
+            if _runs_on(stripped, _NUMBER.match(stripped, start.start()).end()):
+                return False
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -110,15 +153,23 @@ class CypherRefused(GraphToolError, ValueError):
 
 
 class CypherInputError(GraphToolError, ValueError):
-    """Statement text that cannot be read as Cypher at all (an unterminated string, comment or name)."""
+    """Statement text the read path will not read as Cypher (unterminated, ambiguous or, where refused, non-ASCII)."""
 
 
-class _Unterminated(CypherRefused):
-    """The tokenizer's unterminated-text error; ``what`` names the construct."""
+class _Unreadable(CypherRefused):
+    """The tokenizer's error for text it will not read; ``problem`` says why."""
+
+    def __init__(self, problem: str) -> None:
+        self.problem = problem
+        super().__init__(f'Refused: {problem}')
+
+
+class _Unterminated(_Unreadable):
+    """An unterminated string, comment or back-quoted name; ``what`` names the construct."""
 
     def __init__(self, what: str) -> None:
         self.what = what
-        super().__init__(f'Refused: unterminated {what}')
+        super().__init__(f'unterminated {what}')
 
 
 # Read-only Neo4j procedures read_query may CALL (CONTRACT v1 §1 item 8). Names
@@ -191,27 +242,41 @@ class _Tok:
         self.upper = text.upper()
 
 
-def _tokenize(cypher: str) -> list:
+def _tokenize(cypher: str, *, cr_ends_comment: bool = True, ascii_only: bool = False) -> list:
     """Code tokens of a Cypher statement; comments and string literals dropped.
 
-    Raises CypherRefused for an unterminated string, comment or back-quoted
-    name: what the database would make of the rest is unknowable, so refuse.
+    ``cr_ends_comment`` picks where a ``//`` comment ends: at a carriage
+    return or a line feed (Neo4j), or only at a line feed (FalkorDB).
+    With ``ascii_only``, a non-ASCII character anywhere but inside a string
+    literal or a back-quoted name (comments included) is refused.
+
+    Raises _Unreadable for an unterminated string, comment or back-quoted
+    name, and for a number that runs into the text after it (see
+    :func:`_runs_on`): what the database would make of the rest is
+    unknowable, so refuse.
     """
     toks: list = []
     i, n = 0, len(cypher)
+    comment_ends = '\r\n' if cr_ends_comment else '\n'
     while i < n:
         c = cypher[i]
+        if ascii_only:
+            _require_ascii(cypher, i, i + 1)
         if c.isspace():
             i += 1
         elif cypher.startswith('//', i):
             j = i + 2
-            while j < n and cypher[j] not in '\r\n':
+            while j < n and cypher[j] not in comment_ends:
                 j += 1
+            if ascii_only:
+                _require_ascii(cypher, i, j)
             i = j
         elif cypher.startswith('/*', i):
             j = cypher.find('*/', i + 2)
             if j < 0:
                 raise _Unterminated('comment')
+            if ascii_only:
+                _require_ascii(cypher, i, j)
             i = j + 2
         elif c in '\'"':
             j = i + 1
@@ -236,24 +301,52 @@ def _tokenize(cypher: str) -> list:
             j = i + 1
             while j < n and (cypher[j].isalnum() or cypher[j] == '_'):
                 j += 1
+            if ascii_only:
+                _require_ascii(cypher, i, j)
             toks.append(_Tok('param', cypher[i:j]))
             i = j
         elif c.isalpha() or c == '_':
             j = i + 1
             while j < n and (cypher[j].isalnum() or cypher[j] == '_'):
                 j += 1
+            if ascii_only:
+                _require_ascii(cypher, i, j)
             toks.append(_Tok('word', cypher[i:j]))
             i = j
-        elif c.isdigit():
-            j = i + 1
-            while j < n and (cypher[j].isalnum() or cypher[j] in '._'):
-                j += 1
+        elif '0' <= c <= '9':
+            j = _NUMBER.match(cypher, i).end()
+            if _runs_on(cypher, j):
+                number = cypher[i:j] if j - i <= 24 else cypher[i : i + 24] + '...'
+                raise _Unreadable(f'the number {number} runs into {cypher[j]!r}')
             toks.append(_Tok('num', cypher[i:j]))
             i = j
         else:
             toks.append(_Tok('punct', c))
             i += 1
     return toks
+
+
+def _require_ascii(cypher: str, start: int, end: int) -> None:
+    """Refuse the first non-ASCII character of ``cypher[start:end]`` (code or a comment)."""
+    span = cypher[start:end]
+    if not span.isascii():
+        c = next(ch for ch in span if not ch.isascii())
+        raise _Unreadable(f'character U+{ord(c):04X} outside a string or back-quoted name')
+
+
+def _readings(cypher: str, *, ascii_only: bool = False) -> list:
+    """Token lists for every way an engine may read the statement.
+
+    One list, unless the text has a carriage return that is not followed by
+    a line feed: Neo4j ends a ``//`` comment there and FalkorDB does not, so
+    a quote, back-quote or ``/*`` after it opens a string, name or comment on
+    one engine only, and both readings are returned. Raises _Unreadable when
+    either reading cannot be read.
+    """
+    readings = [_tokenize(cypher, ascii_only=ascii_only)]
+    if _LONE_CR.search(cypher):
+        readings.append(_tokenize(cypher, cr_ends_comment=False, ascii_only=ascii_only))
+    return readings
 
 
 def _is_clause_word(toks: list, i: int) -> bool:
@@ -330,6 +423,7 @@ def check_read_query_statement(
     *,
     tool: str = 'read_query',
     detail: str = 'read_query reads only the configured graph.',
+    ascii_only: bool = False,
 ) -> None:
     """The statement rule every driver's ``read_query`` applies before its own read boundary.
 
@@ -341,23 +435,33 @@ def check_read_query_statement(
     Another read-only tool may apply the same rule; ``tool`` names it in the
     input-error headline and ``detail`` is the refusal's second line.
 
+    Text the engines read differently is never guessed at: a number that
+    runs into the text after it (``0LOAD``) is invalid input, and a line
+    comment with a lone carriage return is checked both ways it can end.
+    ``ascii_only`` (FalkorDB's read paths) also refuses any non-ASCII
+    character outside string literals and back-quoted names, comments
+    included, before the text reaches the server.
+
     Raises:
         CypherRefused: for ``LOAD CSV`` ("Refused: ..." headline).
         CypherInputError: for text whose comments, strings or back-quoted
-            names do not terminate ("Invalid <tool> input: ..." headline): a
+            names do not terminate, for a number that runs into the text
+            after it, and with ``ascii_only`` for non-ASCII text outside
+            strings and names ("Invalid <tool> input: ..." headline): a
             syntax problem, not a refusal, and what the database would make
-            of the rest cannot be known, so it is not sent.
+            of it cannot be known, so it is not sent.
     """
     try:
-        toks = _tokenize(cypher)
-    except _Unterminated as e:
-        raise CypherInputError(f'Invalid {tool} input: unterminated {e.what}') from None
-    for i, tok in enumerate(toks):
-        if tok.upper != 'LOAD' or not _is_clause_word(toks, i):
-            continue
-        nxt = toks[i + 1] if i + 1 < len(toks) else None
-        if nxt is not None and nxt.kind == 'word' and nxt.upper == 'CSV':
-            raise CypherRefused('Refused: LOAD CSV is not allowed on the read-only path', detail)
+        readings = _readings(cypher, ascii_only=ascii_only)
+    except _Unreadable as e:
+        raise CypherInputError(f'Invalid {tool} input: {e.problem}') from None
+    for toks in readings:
+        for i, tok in enumerate(toks):
+            if tok.upper != 'LOAD' or not _is_clause_word(toks, i):
+                continue
+            nxt = toks[i + 1] if i + 1 < len(toks) else None
+            if nxt is not None and nxt.kind == 'word' and nxt.upper == 'CSV':
+                raise CypherRefused('Refused: LOAD CSV is not allowed on the read-only path', detail)
 
 
 _PROCEDURE_DISPLAY = {

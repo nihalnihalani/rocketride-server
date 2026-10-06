@@ -199,6 +199,18 @@ class TestReadOnlyInvariant:
             glb.endGlobal()
 
 
+# Statements FalkorDB reads as LOAD CSV where an earlier tokenizer did not (a
+# number running into a word; a // comment the server ends only at a line
+# feed), with the headline each read path returns ({tool}: the tool's name).
+_LOAD_FROM = "LOAD CSV FROM 'https://example.invalid/rr-test.csv' AS r RETURN r"
+SPLIT_READINGS = [
+    (f'MATCH (a:Person) WITH a SKIP 0{_LOAD_FROM}', "Invalid {tool} input: the number 0 runs into 'L'"),
+    (f'MATCH (a:Person) WHERE a.age > 0.5{_LOAD_FROM}', "Invalid {tool} input: the number 0.5 runs into 'L'"),
+    (f'MATCH (a:Person) WHERE a.age > 1e3{_LOAD_FROM}', "Invalid {tool} input: the number 1e3 runs into 'L'"),
+    (f"MATCH (a:Person) //\r'\n{_LOAD_FROM} //'", 'Refused: LOAD CSV is not allowed on the read-only path'),
+]
+
+
 class TestReadQueryRefusals:
     @pytest.mark.parametrize(
         'cypher',
@@ -232,6 +244,30 @@ class TestReadQueryRefusals:
             # Ordinary reads through the same tool are unaffected.
             ok = inst.query({'cypher': 'MATCH (p:Person) RETURN count(p) AS c'})
             assert 'error' not in ok and ok['row_count'] == 1
+        finally:
+            glb.endGlobal()
+
+    @pytest.mark.parametrize('cypher,headline', SPLIT_READINGS)
+    def test_the_server_reads_these_statements_as_load_csv(self, falkor_graph, cypher, headline):
+        """EXPLAIN only (nothing runs): the payloads below exercise a real difference in reading."""
+        assert 'Load CSV' in str(falkor_graph.explain(cypher))
+
+    @pytest.mark.parametrize('allow_writes', [False, True])
+    @pytest.mark.parametrize('cypher,headline', SPLIT_READINGS)
+    def test_split_readings_are_refused_on_every_read_path(
+        self, falkor_env, falkor_graph, cypher, headline, allow_writes
+    ):
+        """The URL never resolves: a statement that reached the server would fail as a fetch, not with these headlines."""
+        glb, inst = _start(falkor_env, allow_writes=allow_writes)
+        try:
+            with pytest.raises(falkor_env.GraphToolError) as err:
+                inst.read_query({'cypher': cypher})
+            assert str(err.value).splitlines()[0] == headline.format(tool='read_query')
+            assert glb._read_only_refusal(cypher) == headline.format(tool='generated query')
+            if not allow_writes:
+                out = inst.query({'cypher': cypher})
+                assert out['error'].splitlines()[0] == headline.format(tool='query'), out
+                assert out['rows'] == [] and out['row_count'] == 0
         finally:
             glb.endGlobal()
 

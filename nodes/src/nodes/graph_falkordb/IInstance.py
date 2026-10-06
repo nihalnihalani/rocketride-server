@@ -120,10 +120,14 @@ class IInstance(GraphInstanceBase):
             raise ValueError('"params" must be an object when provided')
 
         if not self.IGlobal.allow_writes:
-            # Read-only, so the same statement rule as read_query: no LOAD CSV.
+            # Read-only, so the same statement rule as read_query: no LOAD CSV,
+            # no ambiguous or non-ASCII code.
             try:
                 check_read_query_statement(
-                    cypher, tool='query', detail='With allow_writes off, query reads only graph data.'
+                    cypher,
+                    tool='query',
+                    detail='With allow_writes off, query reads only graph data.',
+                    ascii_only=self.IGlobal.read_ascii_only,
                 )
             except GraphToolError as e:
                 return {'error': str(e), 'columns': [], 'rows': [], 'row_count': 0, 'truncated': False}

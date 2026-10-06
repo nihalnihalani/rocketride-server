@@ -84,7 +84,9 @@ or 500,000 values (`truncated_by` says which limit applied). It is read-only
 whatever `allow_execute` says: write, administration and `USE` clauses and any
 `CALL` outside `db.labels`, `db.relationshipTypes`, `db.propertyKeys`,
 `db.schema.nodeTypeProperties`, `db.schema.relTypeProperties` and
-`db.schema.visualization` are refused before the query is sent; it then runs
+`db.schema.visualization` are refused before the query is sent, and so, as
+invalid input, is a number written straight against a letter, an underscore or
+a `.` (`0LIMIT`, `1.`); it then runs
 in a READ-mode transaction with a 30-second server-side deadline. Failures
 raise an error whose first line is a short headline (`Refused: …`,
 `Query timed out after 30000 ms`, `Invalid read_query input: …` or

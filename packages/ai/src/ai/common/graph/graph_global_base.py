@@ -80,6 +80,11 @@ class GraphGlobalBase(IGlobalBase, ABC):
     allow_execute: bool = False
     max_execute_rows: int = DEFAULT_MAX_EXECUTE_ROWS
 
+    # Read paths (read_query, the natural-language tools) refuse non-ASCII
+    # characters outside string literals and back-quoted names before the text
+    # reaches the server. Set by a driver whose server mishandles such text.
+    read_ascii_only: bool = False
+
     # ------------------------------------------------------------------
     # Abstract interface — every graph driver must implement these
     # ------------------------------------------------------------------
@@ -206,18 +211,19 @@ class GraphGlobalBase(IGlobalBase, ABC):
         """Why generated Cypher may not run on a read path, or None if it may.
 
         Used by the natural-language tools (get_data, get_query and the
-        questions lane) before a query is shown or run. Generated Cypher
-        follows read_query's statement rule as well: ``LOAD CSV`` is refused,
-        and so is text whose strings, comments or back-quoted names do not
-        terminate. Drivers with a stricter check (Neo4j's procedure
-        allowlist) extend it.
+        questions lane) before a query is shown or run, and before EXPLAIN.
+        Generated Cypher follows read_query's statement rule first
+        (``LOAD CSV`` is refused, and so is text the engines would read
+        differently or that does not terminate, plus non-ASCII code where the
+        driver sets ``read_ascii_only``), then the write/admin keyword gate.
+        Drivers with a stricter check (Neo4j's procedure allowlist) extend it.
         """
-        if not is_cypher_safe(query):
-            return 'Generated query contains write or admin clauses'
         try:
-            check_read_query_statement(query, tool='generated query')
+            check_read_query_statement(query, tool='generated query', ascii_only=self.read_ascii_only)
         except (CypherRefused, CypherInputError) as e:
             return e.headline
+        if not is_cypher_safe(query):
+            return 'Generated query contains write or admin clauses'
         return None
 
     def _prompt_rules(self) -> List[str]:

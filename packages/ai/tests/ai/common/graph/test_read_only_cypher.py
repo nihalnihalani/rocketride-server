@@ -9,7 +9,12 @@ from __future__ import annotations
 
 import pytest
 
-from ai.common.graph.cypher_safety import CypherRefused, check_read_only_cypher, check_read_query_statement
+from ai.common.graph.cypher_safety import (
+    CypherInputError,
+    CypherRefused,
+    check_read_only_cypher,
+    check_read_query_statement,
+)
 from ai.common.graph.graph_errors import GraphToolError
 
 READS = [
@@ -195,3 +200,148 @@ def test_read_query_statement_default_detail_is_unchanged():
     with pytest.raises(CypherRefused) as err:
         check_read_query_statement("LOAD CSV FROM 'file:///x' AS r RETURN r")
     assert err.value.detail == 'read_query reads only the configured graph.'
+
+
+# ---------------------------------------------------------------------------
+# Text that engines read differently is refused or read every way (GX-CMP-01)
+# ---------------------------------------------------------------------------
+
+URL = "'https://example.invalid/x.csv'"
+
+# (statement, the number as written, the character it runs into)
+NUMBER_RUNS_ON = [
+    (f'MATCH (n:P) WITH n SKIP 0LOAD CSV FROM {URL} AS r RETURN r', '0', 'L'),
+    (f'MATCH (n) WHERE n.v > 0.5LOAD CSV FROM {URL} AS r RETURN r', '0.5', 'L'),
+    (f'MATCH (n) WHERE n.v > 1e3LOAD CSV FROM {URL} AS r RETURN r', '1e3', 'L'),
+    (f'MATCH (n) WHERE n.v > 1. LOAD CSV FROM {URL} AS r RETURN r', '1', '.'),
+    (f'MATCH (n) WHERE n.v > 1.LOAD CSV FROM {URL} AS r RETURN r', '1', '.'),
+    (f'MATCH (n) WHERE n.v > .5LOAD CSV FROM {URL} AS r RETURN r', '5', 'L'),
+    (f'MATCH (n) WHERE n.v > 0x1FLOAD CSV FROM {URL} AS r RETURN r', '0x1F', 'L'),
+    (f'MATCH (n) WHERE n.v > 0o7LOAD CSV FROM {URL} AS r RETURN r', '0o7', 'L'),
+    (f'MATCH (n) WHERE n.v > 1_000LOAD CSV FROM {URL} AS r RETURN r', '1_000', 'L'),
+    ('RETURN 1eX AS x', '1', 'e'),
+    ('RETURN 1_ AS x', '1', '_'),
+    ('RETURN 1.5.2 AS x', '1.5', '.'),
+    ('RETURN 1.e3 AS x', '1', '.'),
+    ('RETURN 0o8 AS x', '0', 'o'),
+    ('RETURN 12\u00e9 AS x', '12', '\u00e9'),
+]
+
+NUMBERS = [
+    'RETURN 0, 7, 017, 1_000, 0x1F, 0XfF, 0o17, 1.5, .5, 1e3, 1E-3, 1.5e+3 AS x',
+    'MATCH (n)-[*1..3]->(m) RETURN m',
+    'MATCH (n)-[*..3]->(m) RETURN m',
+    'RETURN [1, 2, 3][0..2] AS x, [1, 2, 3][1..] AS y',
+    'RETURN -1+2*3-4/5%6^7 AS x',
+    'MATCH (n) WHERE n.v1 > 2 AND n.x2y <> $p1 RETURN n LIMIT 10',
+    'RETURN {k1: 1}.k1 AS x',
+]
+
+
+@pytest.mark.parametrize('cypher,number,follower', NUMBER_RUNS_ON)
+def test_a_number_running_into_what_follows_is_invalid_input(cypher, number, follower):
+    """FalkorDB ends a number at the first letter (0LOAD is 0 then LOAD); such text is refused, not guessed at."""
+    with pytest.raises(CypherInputError) as err:
+        check_read_query_statement(cypher)
+    assert err.value.headline == f'Invalid read_query input: the number {number} runs into {follower!r}'
+
+
+@pytest.mark.parametrize('cypher,number,follower', NUMBER_RUNS_ON)
+def test_the_neo4j_check_refuses_a_number_running_into_what_follows(cypher, number, follower):
+    with pytest.raises(CypherRefused) as err:
+        check_read_only_cypher(cypher)
+    assert err.value.headline == f'Refused: the number {number} runs into {follower!r}'
+
+
+@pytest.mark.parametrize('cypher', NUMBERS)
+def test_numbers_written_in_full_pass(cypher):
+    check_read_query_statement(cypher)
+    check_read_query_statement(cypher, ascii_only=True)
+    check_read_only_cypher(cypher)
+
+
+def test_a_long_number_is_shortened_in_the_headline():
+    with pytest.raises(CypherInputError) as err:
+        check_read_query_statement('RETURN ' + '9' * 40 + 'x')
+    assert err.value.headline == f"Invalid read_query input: the number {'9' * 24}... runs into 'x'"
+
+
+# A carriage return without a line feed ends a // comment on Neo4j but not on
+# FalkorDB, so a quote, back-quote or /* after it opens a string, name or
+# comment on one engine only.
+CR_HIDDEN_LOAD_CSV = [
+    f"MATCH (n:P) //\r'\nLOAD CSV FROM {URL} AS r RETURN r //'",
+    f'MATCH (n) //\r"\nLOAD CSV FROM {URL} AS r RETURN r //"',
+    f'MATCH (n) //\r`\nLOAD CSV FROM {URL} AS r RETURN r //`',
+    f'MATCH (n) //\r/*\nLOAD CSV FROM {URL} AS r RETURN r //*/',
+]
+
+
+@pytest.mark.parametrize('cypher', CR_HIDDEN_LOAD_CSV)
+def test_load_csv_after_a_carriage_return_in_a_comment_is_refused(cypher):
+    with pytest.raises(CypherRefused) as err:
+        check_read_query_statement(cypher)
+    assert err.value.headline == 'Refused: LOAD CSV is not allowed on the read-only path'
+
+
+@pytest.mark.parametrize(
+    'cypher',
+    [
+        'MATCH (n) // note\r\nRETURN n',
+        "MATCH (n) // it's\r\nRETURN n",
+        'MATCH (n) //\rRETURN n',
+        "MATCH (n) // a\rRETURN n // it's",
+    ],
+)
+def test_carriage_returns_that_hide_nothing_pass(cypher):
+    check_read_query_statement(cypher)
+
+
+def test_text_one_reading_cannot_read_is_invalid_input():
+    with pytest.raises(CypherInputError) as err:
+        check_read_query_statement("MATCH (n) //\r'\nRETURN n")
+    assert err.value.headline == 'Invalid read_query input: unterminated string literal'
+
+
+# ---------------------------------------------------------------------------
+# ascii_only: no non-ASCII character outside string literals and back-quoted
+# names (FalkorDB's read paths)
+# ---------------------------------------------------------------------------
+
+NON_ASCII_CODE = [
+    (f'LOAD\u180eCSV FROM {URL} AS r RETURN r', 'U+180E'),
+    ('MATCH (n)\u200bRETURN n', 'U+200B'),
+    ('MATCH (n) RETURN n\u2028', 'U+2028'),
+    ('MATCH (n)\u00a0RETURN n', 'U+00A0'),
+    ('MATCH (\u00e9) RETURN \u00e9', 'U+00E9'),
+    ('MATCH (n) // caf\u00e9\nRETURN n', 'U+00E9'),
+    ('MATCH (n) /* \ufeff */ RETURN n', 'U+FEFF'),
+    ('MATCH (a\u00e9) RETURN 1', 'U+00E9'),
+    ('MATCH (n) WHERE n.x = $p\u00e9 RETURN n', 'U+00E9'),
+    # Code only when the // comment ends at the line feed, not at the carriage return.
+    ("RETURN 1 //\r'\n\u200b'", 'U+200B'),
+]
+
+
+@pytest.mark.parametrize('cypher,code', NON_ASCII_CODE)
+def test_ascii_only_refuses_non_ascii_outside_strings_and_names(cypher, code):
+    with pytest.raises(CypherInputError) as err:
+        check_read_query_statement(cypher, ascii_only=True)
+    assert err.value.headline == f'Invalid read_query input: character {code} outside a string or back-quoted name'
+
+
+@pytest.mark.parametrize(
+    'cypher',
+    [
+        "MATCH (n) WHERE n.name = 'Jos\u00e9\u200b' RETURN n",
+        'MATCH (n:`\u00dcn\u00efcode`) RETURN n.`\u00e9` AS `\u00f1`',
+        'RETURN "\u65e5\u672c\u2028" AS x',
+        "RETURN 'a\\'\u00e9' AS x",
+    ],
+)
+def test_ascii_only_keeps_strings_and_back_quoted_names(cypher):
+    check_read_query_statement(cypher, ascii_only=True)
+
+
+def test_non_ascii_code_passes_without_ascii_only():
+    check_read_query_statement('MATCH (\u00e9:\u00dcn\u00efcode) RETURN \u00e9 // caf\u00e9')

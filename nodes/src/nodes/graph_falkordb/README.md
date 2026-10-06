@@ -30,14 +30,14 @@ The registered tool names are the bare method names below (an agent catalog name
 
 | Function | Description |
 |---|---|
-| `get_data` | Requires a non-empty `question`; optional `limit` is clamped to the graph row cap. Returns sanitized rows, generated query, applied limit, and truncation state; generation/execution failure returns `error`, `valid: false`, and no rows. The generated query follows the `read_query` statement rule: `LOAD CSV` (and text with an unterminated string, comment or name) is refused before the server is called. |
+| `get_data` | Requires a non-empty `question`; optional `limit` is clamped to the graph row cap. Returns sanitized rows, generated query, applied limit, and truncation state; generation/execution failure returns `error`, `valid: false`, and no rows. The generated query follows the `read_query` statement rule: `LOAD CSV` (and text with an unterminated string, comment or name, or the code text described below) is refused before the server is called. |
 | `get_schema` | Takes no meaningful arguments and returns reflected `labels`, node properties, and relationships, plus the version 2 `schema` block. |
 | `refresh_schema` | Takes no arguments; re-reads the schema of the configured graph now and returns it like `get_schema`. |
-| `get_query` | Requires a non-empty `question`, with optional `limit`; returns validated read-only Cypher and `valid: true`, or an `error`/off-topic `answer` with `valid: false`. Generated Cypher that contains a write, `LOAD CSV` or unterminated text comes back as `error` with `valid: false`. |
+| `get_query` | Requires a non-empty `question`, with optional `limit`; returns validated read-only Cypher and `valid: true`, or an `error`/off-topic `answer` with `valid: false`. Generated Cypher that contains a write, `LOAD CSV`, unterminated text or the code text described below comes back as `error` with `valid: false`. |
 | `read_query` | Requires non-empty `cypher`; accepts object `params` and integer `limit` (default 1,000, capped by `max_rows`, the server's `RESULTSET_SIZE` and 25,000). Always runs `GRAPH.RO_QUERY` on the configured graph, whatever `allow_writes` or `allow_execute` say, with the query timeout clamped to the server's `TIMEOUT_MAX`, and refuses `LOAD CSV`: it reads the graph only. Returns `{columns, rows, row_limit, truncated, truncated_by, element_limit, elements, value_limit, values}` in the shared graph result shape; failures raise an error whose first line is a headline (`Refused: …`, `Query timed out after N ms`, `Invalid read_query input: …`, `Query failed`) and whose remaining lines are the server's message. |
 | `execute` | Requires raw `query` and runs it without LLM translation or the `read_query` statement rules (so `LOAD CSV` runs here); it raises an error unless `allow_execute` is enabled, and fails when the result exceeds the execute row cap. With `shape: "graph"` it returns the `read_query` shape plus `affected_rows`. |
 | `dialect` | Takes no meaningful arguments and returns `{dialect: "falkordb"}` plus the engine version, graph, capabilities, limits and read boundary. |
-| `query` | Requires non-empty `cypher`; accepts optional object `params` and optional `graph`. Returns columns, serialized rows, count, and truncation state; Redis failures return `error` with empty rows. With `allow_writes` off it runs `GRAPH.RO_QUERY` and applies the `read_query` statement rule: it refuses `LOAD CSV` (and text with an unterminated string, comment or name) and returns that refusal in `error` without calling the server. With `allow_writes` on it runs `GRAPH.QUERY` with the statement as written. |
+| `query` | Requires non-empty `cypher`; accepts optional object `params` and optional `graph`. Returns columns, serialized rows, count, and truncation state; Redis failures return `error` with empty rows. With `allow_writes` off it runs `GRAPH.RO_QUERY` and applies the `read_query` statement rule: it refuses `LOAD CSV` (and text with an unterminated string, comment or name, or the code text described below) and returns that refusal in `error` without calling the server. With `allow_writes` on it runs `GRAPH.QUERY` with the statement as written. |
 | `list_graphs` | Takes no arguments and returns graph names, or `error` with an empty graph list on a Redis failure. |
 
 In the `read_query` shape, node and relationship ids are FalkorDB's integer ids
@@ -52,6 +52,17 @@ A response stops at 10,000 graph elements or 500,000 values.
 
 FalkorDB refuses a result that names the same column twice, so `read_query`
 columns are always distinct here.
+
+The read paths (`read_query`, `query` with `allow_writes` off, and the Cypher
+that `get_data`, `get_query` and the questions lane generate) also refuse, as
+`Invalid … input`, two kinds of code text before the server is called: a
+number that runs straight into a letter, an underscore or a `.` (write
+`SKIP 0 LIMIT 5` and `1.0`, not `0LIMIT` or `1.`; the range `1..3` is fine),
+and a non-ASCII character outside string literals and back-quoted names,
+comments included (non-ASCII text inside strings and back-quoted names is
+sent as written). A `//` comment that holds a carriage return without a line
+feed is read both ways it can end, and `LOAD CSV` in either reading is
+refused.
 
 `get_schema` and `refresh_schema` return the legacy `{labels, nodes,
 relationships}` keys plus a `schema` block (version 2): labels and
