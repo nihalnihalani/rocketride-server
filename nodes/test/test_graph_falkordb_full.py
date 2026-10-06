@@ -474,6 +474,9 @@ class TestSchemaAndDialect:
             assert out['read_boundary'] == 'ro_command'
             assert out['limits']['server_result_cap'] == glb.server_result_cap
             assert out['limits']['max_rows'] == glb.read_query_cap
+            # The default is what read_query returns without a limit: 1,000, capped by max_rows (250 by default).
+            assert out['limits']['default_rows'] == min(1000, glb.read_query_cap) == 250
+            assert inst.read_query({'cypher': 'UNWIND range(1, 300) AS i RETURN i'})['row_limit'] == 250
             assert '56379' not in str(out) and 'redis' not in str(out)
             assert 'GRAPH.RO_QUERY' in ' '.join(glb._prompt_rules())
         finally:

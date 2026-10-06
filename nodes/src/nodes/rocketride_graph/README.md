@@ -219,8 +219,9 @@ directly against PostgreSQL 16 with Apache AGE 1.5.0 and through PgBouncer
 
 An LLM agent wired to this node gets every tool listed under **As a tool** in
 its tool catalog, `read_query` and `refresh_schema` included. With
-`read_query` the agent runs Cypher it writes itself (read-only, 1,000 rows by
-default, within the element and value budgets); `refresh_schema` re-reads the
+`read_query` the agent runs Cypher it writes itself (read-only, up to 1,000
+rows by default, capped by Max read rows, within the element and value
+budgets); `refresh_schema` re-reads the
 schema each time it is called (refreshes of one node run one at a time, with
 no cooldown). Say in the agent's instructions which tools it should prefer,
 for example `get_data` for questions in plain language.

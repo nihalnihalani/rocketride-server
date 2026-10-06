@@ -80,7 +80,8 @@ same vocabulary (`string`, `integer`, ...) instead of engine type names.
 
 `dialect` returns `dialect` plus `engine` (name, version, edition), `database`,
 `graph`, `allow_execute`, `capabilities`, `limits` (default and maximum rows,
-element and value budgets, statement timeout, server result cap) and
+element and value budgets, statement timeout, server result cap; the default
+is what `read_query` returns without a `limit`, 1,000 capped by the maximum) and
 `read_boundary`/`read_boundary_verified`. It never includes hosts, users or
 credentials.
 On FalkorDB the schema comes from `db.labels()` and `db.relationshipTypes()`,
@@ -140,8 +141,9 @@ The direct query tool serializes graph nodes, relationships, paths, maps, lists,
 
 An LLM agent wired to this node gets every tool listed under **As a tool** in
 its tool catalog, `read_query` and `refresh_schema` included. With
-`read_query` the agent runs Cypher it writes itself (read-only, 1,000 rows by
-default, within the element and value budgets); `refresh_schema` re-reads the
+`read_query` the agent runs Cypher it writes itself (read-only, up to 1,000
+rows by default, capped by `max_rows`, which is 250 by default, within the
+element and value budgets); `refresh_schema` re-reads the
 schema each time it is called (refreshes of one node run one at a time, with
 no cooldown). Say in the agent's instructions which tools it should prefer,
 for example `get_data` for questions in plain language.
