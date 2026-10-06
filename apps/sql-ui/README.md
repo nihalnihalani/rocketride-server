@@ -319,7 +319,9 @@ message is in the pipeline node's log either way.
 Nothing in the tool protocol cancels a running statement. A second after a
 statement reaches the database a **Stop waiting** button appears, and it
 does exactly what it says: the app stops listening and discards the late
-answer.
+answer. A read that was waiting for its stopped pipeline to come back (see
+[Connections](#connections)) is not sent again when it does, and the same
+holds for a plan or a table page you navigate away from.
 
 It is not offered while a confirmation is still open, because nothing has
 been sent yet. In a run of several statements the second is counted from the
