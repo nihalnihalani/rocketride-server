@@ -40,7 +40,10 @@
  *
  * - `raised`         — the client rejected: a database error, a safety refusal,
  *                      invalid input, a permission denial, a dead task.
- * - `invalid`        — `{valid: false, error}` (get_data / get_query).
+ * - `invalid`        — get_data / get_query answered `{valid: false}` with an
+ *                      `error`, or with neither an `error` nor an `answer`.
+ *                      `{valid: false, answer}` with no error is a prose
+ *                      answer, not a failure.
  * - `store`          — `{success: false, error}` (store and vector tools).
  * - `error-envelope` — `{error, columns: [], rows: []}` (FalkorDB's legacy `query`).
  * - `malformed`      — the result failed envelope validation.

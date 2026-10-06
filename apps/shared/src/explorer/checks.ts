@@ -28,8 +28,10 @@
 //
 //   execute, read_query   a RAISED error (the client rejects) — the check only
 //                         validates the envelope of a call that did not raise
-//   get_data, get_query   `{valid: false, error}` is a failure; `{valid: false,
-//                         answer}` is the model answering in PROSE and is not
+//   get_data, get_query   `{valid: false}` with an `error` is a failure, even
+//                         beside an `answer`; with an `answer` and no `error`
+//                         it is the model answering in PROSE and is not; with
+//                         neither it is a failure
 //   store / vector tools  `{success: false, error}` — neither an exception nor
 //                         `{valid: false}`
 //   FalkorDB legacy query `{error, columns: [], rows: []}`
@@ -122,9 +124,12 @@ export const checkObject: ResultCheck = (value, ctx) => {
 };
 
 /**
- * get_data: `{valid: false, error}` is a failure, but `{valid: false, answer}`
- * passes: the graph and SQL nodes return get_query's prose answer unchanged
- * when a question is not one their database can answer, a documented result.
+ * get_data: the same rule as {@link checkGetQuery}. The graph and SQL nodes'
+ * get_data passes the result of their query-writing tool (get_query, get_sql)
+ * through unchanged when it is not `valid`, so a question the database cannot
+ * answer comes back as the documented prose `{valid: false, answer}` and
+ * passes, while `{valid: false, error}` (even beside an `answer`) and
+ * `{valid: false}` with neither field fail as `invalid`.
  *
  * @param value - The resolved value.
  * @param ctx - The tool being checked.
@@ -133,8 +138,10 @@ export const checkObject: ResultCheck = (value, ctx) => {
 export const checkValidFlag: ResultCheck = (value, ctx) => checkGetQuery(value, ctx);
 
 /**
- * get_query: `{valid: false, error}` is a failure, but `{valid: false, answer}`
- * is the model answering in prose — a legitimate result, not an error.
+ * get_query: `{valid: false, error}` is a failure, even beside an `answer`,
+ * and so is `{valid: false}` with neither field; `{valid: false, answer}` with
+ * no error is the model answering in prose — a legitimate result, not an
+ * error. A blank string counts as an absent field.
  *
  * @param value - The resolved value.
  * @param ctx - The tool being checked.

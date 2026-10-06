@@ -80,8 +80,9 @@ describe('checkValidFlag (get_data)', () => {
 		if (!outcome.ok) assert.match(outcome.message, /get_data reported valid: false with neither an error nor an answer/);
 	});
 
-	// The graph and SQL nodes' get_data return get_query's {answer, valid: false}
-	// unchanged when the question gets a prose answer: a documented result.
+	// The graph and SQL nodes' get_data pass get_query's / get_sql's
+	// {answer, valid: false} through unchanged when the question gets a prose
+	// answer: a documented result.
 	it('passes valid:false with an answer and no error, the node answering in prose', () => {
 		assert.equal(run(checkValidFlag, { valid: false, answer: 'There are three people in the graph.' }).ok, true);
 		assert.deepEqual(run(checkValidFlag, { valid: false, answer: 'prose', error: 'bad cypher' }), { ok: false, kind: 'invalid', message: 'bad cypher' });

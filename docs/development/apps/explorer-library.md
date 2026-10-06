@@ -176,8 +176,8 @@ Failure depends on the **tool**, so each tool gets a `ResultCheck`
 | Tool shape | Failure arrives as | Check |
 |---|---|---|
 | `execute`, `read_query` | the call rejects; the envelope is validated | `checkRowEnvelope` (positional rows, `row_limit`, `truncated`, additive metadata, `truncated_by` null, `rows`, `elements` or `values`); SQL's `execute` answers with object rows and uses `checkObject` |
-| `get_data` | `{valid: false, error}` (`{valid: false, answer}` is a prose answer and passes, as for `get_query`) | `checkValidFlag` |
-| `get_query` | `{valid: false, error}` fails; `{valid: false, answer}` is prose and passes | `checkGetQuery` |
+| `get_data` | `{valid: false}` with an `error` (even beside an `answer`) or with neither fails; `{valid: false, answer}` with no `error` is a prose answer and passes | `checkValidFlag` (the `get_query` rule) |
+| `get_query` | `{valid: false}` with an `error` (even beside an `answer`) or with neither fails; `{valid: false, answer}` with no `error` is prose and passes | `checkGetQuery` |
 | store / vector tools | `{success: false, error}` | `checkStoreSuccess` |
 | FalkorDB legacy `query` | `{error, columns: [], rows: []}` | `checkLegacyErrorEnvelope` |
 | `get_schema`, `refresh_schema` | never an error by itself | `classifySchemaV2` returns `fresh`, `stale`, `error`, `incapable` or `unknown`; an absent `schema` block is `unknown`, never an empty graph |
