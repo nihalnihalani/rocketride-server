@@ -16,6 +16,7 @@
 
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
 
@@ -37,8 +38,10 @@ interface IPreflightDeps {
 interface IE2e {
 	ACCEPTANCE_BROWSER_DIR: string;
 	LANES: Record<string, string>;
+	DEFAULT_LANES: string[];
 	planE2e(env: Record<string, string | undefined>): IPlan;
 	preflightE2e(plan: IPlan, deps: IPreflightDeps): Promise<void>;
+	runLanes(plan: IPlan, deps: { exec: (args: string[], env: Record<string, string>) => Promise<unknown> }): Promise<void>;
 }
 interface IAction {
 	name: string;
@@ -77,6 +80,7 @@ test('graph-ui:e2e is a public builder action, and nothing that runs by default 
 	const e2e = tasks.actions.find((a) => a.name === 'graph-ui:e2e');
 	assert.ok(e2e, 'the action exists');
 	assert.match(e2e.action().description ?? '', /opt-in/i, 'it is listed, and says it is opt-in');
+	assert.match(e2e.action().description ?? '', /graph, sql, linenumbers; a11y only when named in GRAPH_UI_E2E_LANES/, 'and which lanes it runs');
 	const unit = tasks.actions.find((a) => a.name === 'graph-ui:test')?.action();
 	assert.ok(unit && !JSON.stringify(unit.steps ?? []).includes('e2e'), 'graph-ui:test does not include it');
 	assert.ok(!String(unit.run).includes('e2e'), 'graph-ui:test does not call it');
@@ -106,13 +110,27 @@ test('without an engine URL it fails at once and says which variable to set and 
 	assert.throws(() => tasks.e2e.planE2e({ ENGINE_URL: 'ftp://127.0.0.1:5650' }), /ENGINE_URL must be an http\(s\) URL/);
 });
 
-test('the plan: Chrome and every lane by default, a choice of browsers, lanes and graph engines, and results outside the tree', () => {
+// W3-CI03a: lane_a11y also measures the shell's own text, and some shell theme pairs are below 4.5:1 today (O12), so a
+// default run that included it always exited 1. It runs when named (or with "all") until those tokens are fixed.
+test('the plan: Chrome and every lane but a11y by default, a choice of browsers, lanes and graph engines, and results outside the tree', () => {
 	const plan = tasks.e2e.planE2e(ENV);
 	assert.equal(plan.url, 'http://127.0.0.1:5650', 'no trailing slash: the lanes append paths');
 	assert.deepEqual(plan.browsers, ['chrome']);
 	assert.deepEqual(
 		plan.lanes.map((l) => l.name),
-		['graph', 'sql', 'a11y', 'linenumbers']
+		['graph', 'sql', 'linenumbers'],
+		'lane_a11y is opt-in'
+	);
+	assert.deepEqual(tasks.e2e.DEFAULT_LANES, ['graph', 'sql', 'linenumbers']);
+	assert.deepEqual(
+		tasks.e2e.planE2e({ ...ENV, GRAPH_UI_E2E_LANES: 'a11y' }).lanes.map((l) => l.script),
+		['lane_a11y.cjs'],
+		'named, it runs'
+	);
+	assert.deepEqual(
+		tasks.e2e.planE2e({ ...ENV, GRAPH_UI_E2E_LANES: 'all' }).lanes.map((l) => l.name),
+		['graph', 'sql', 'a11y', 'linenumbers'],
+		'"all" is every lane'
 	);
 	assert.equal(plan.engines, null);
 	assert.equal(path.relative(REPO, plan.outDir), path.join('scripts', 'acceptance', 'graph-explorer', 'out', 'e2e'), "the acceptance folder's git-ignored out/");
@@ -125,7 +143,7 @@ test('the plan: Chrome and every lane by default, a choice of browsers, lanes an
 	assert.equal(tasks.e2e.planE2e({ ...ENV, GRAPH_UI_E2E_ENGINES: 'neo4j,age' }).engines, 'neo4j,age');
 	assert.equal(tasks.e2e.planE2e({ ...ENV, OUT_DIR: '/tmp/somewhere' }).outDir, '/tmp/somewhere');
 	assert.throws(() => tasks.e2e.planE2e({ ...ENV, GRAPH_UI_E2E_BROWSERS: 'chrome,edge' }), /Unknown browser "edge".*chrome, firefox, webkit, all/);
-	assert.throws(() => tasks.e2e.planE2e({ ...ENV, GRAPH_UI_E2E_LANES: 'graph,perf' }), /Unknown lane "perf".*graph, sql, a11y, linenumbers/);
+	assert.throws(() => tasks.e2e.planE2e({ ...ENV, GRAPH_UI_E2E_LANES: 'graph,perf' }), /Unknown lane "perf".*graph, sql, a11y, linenumbers, all/);
 	assert.throws(() => tasks.e2e.planE2e({ ...ENV, GRAPH_UI_E2E_ENGINES: 'neo4j,arango' }), /Unknown graph engine "arango".*age, neo4j, falkordb/);
 });
 
@@ -149,4 +167,78 @@ test('the preflight names what is missing: the engine, Playwright, or a browser'
 		return true;
 	});
 	await assert.rejects(tasks.e2e.preflightE2e(plan, deps({ broken: ['chrome'] })), /chrome could not start.*Google Chrome/s);
+});
+
+/** Rows the way the lanes write them: { browser, engine | run, name, status, detail }. */
+function rows(count: number, extra: Record<string, string>, status = 'FAIL') {
+	return Array.from({ length: count }, (_, i) => ({ browser: 'chrome', ...extra, name: `check ${i + 1}`, status, detail: status === 'FAIL' ? 'returned false' : undefined }));
+}
+
+// W3-CI03a: a failed lane was reported as "lane_graph.cjs (chrome): Command failed (exit 1):", so finding out what
+// failed meant opening the JSON. The summary now names the failed rows from the lane's own result file, and a result
+// file the run did not write (a previous run's, left behind by a lane that died early) is not read.
+test('a failed lane run is summarised by the rows that failed in its own result file, or by its error when it wrote none', async () => {
+	const outDir = fs.mkdtempSync(path.join(os.tmpdir(), 'graph-ui-e2e-'));
+	try {
+		const plan = tasks.e2e.planE2e({ ...ENV, OUT_DIR: outDir, GRAPH_UI_E2E_LANES: 'all', GRAPH_UI_E2E_ENGINES: 'neo4j' });
+		const chrome = path.join(outDir, 'chrome');
+		fs.mkdirSync(chrome, { recursive: true });
+		const stale = path.join(chrome, 'lane_sql.json');
+		fs.writeFileSync(stale, JSON.stringify(rows(1, { name: 'a row from an earlier run' })));
+		const calls: { script: string; args: string[]; env: Record<string, string> }[] = [];
+		const write = (out: string, file: string, data: unknown) => fs.writeFileSync(path.join(out, file), JSON.stringify(data));
+		const exec = async (args: string[], env: Record<string, string>) => {
+			const [script, , out] = args;
+			calls.push({ script: path.basename(script), args, env });
+			switch (path.basename(script)) {
+				case 'lane_graph.cjs':
+					write(out, 'lane_graph.json', [...rows(1, { engine: 'neo4j' }, 'PASS'), ...rows(12, { engine: 'neo4j' })]);
+					throw new Error('Command failed (exit 1):\n== 1 passed, 12 failed');
+				case 'lane_sql.cjs':
+					throw new Error('Command failed (exit 1):\nError: browserType.launch: Target page, context or browser has been closed');
+				case 'lane_a11y.cjs':
+					write(out, 'lane_a11y.json', { results: [...rows(2, { run: 'light-reduce' }), ...rows(3, { run: 'dark-motion' }, 'PASS')], contrast: [] });
+					throw new Error('Command failed (exit 1):\n2/5 PASS');
+				default:
+					write(out, 'probe_linenumbers.json', rows(4, {}, 'PASS'));
+					return undefined;
+			}
+		};
+		await assert.rejects(tasks.e2e.runLanes(plan, { exec }), (error: Error) => {
+			const text = error.message;
+			assert.match(text, /^3 of 4 lane runs failed \(screenshots and JSON results in .+\):$/m);
+			assert.match(text, /^lane_graph\.cjs \(chrome\): 12 failed rows in lane_graph\.json:$/m);
+			for (let i = 1; i <= 10; i += 1) assert.match(text, new RegExp(`^  neo4j: check ${i}$`, 'm'), `row ${i} is named`);
+			assert.doesNotMatch(text, /check 11|check 12/, 'at most ten rows per lane');
+			assert.match(text, /^ {2}\.\.\. and 2 more$/m);
+			assert.match(text, /^lane_sql\.cjs \(chrome\): Command failed \(exit 1\); this run wrote no lane_sql\.json$/m, "the first error line when there is no result file of this run's");
+			assert.doesNotMatch(text, /a row from an earlier run/, 'a result file left by an earlier run is not read');
+			assert.match(text, /^lane_a11y\.cjs \(chrome\): 2 failed rows in lane_a11y\.json:\n {2}light-reduce: check 1\n {2}light-reduce: check 2$/m);
+			assert.doesNotMatch(text, /probe_linenumbers/, 'a lane that passed is not listed');
+			return true;
+		});
+		assert.deepEqual(
+			calls.map((c) => c.script),
+			['lane_graph.cjs', 'lane_sql.cjs', 'lane_a11y.cjs', 'probe_linenumbers.cjs']
+		);
+		for (const call of calls) {
+			assert.deepEqual(call.env, { ENGINE_URL: 'http://127.0.0.1:5650', OUT_DIR: chrome });
+			assert.deepEqual(call.args.slice(1, 4), ['http://127.0.0.1:5650', chrome, 'chrome']);
+		}
+		assert.deepEqual(calls[0].args.slice(4), ['neo4j'], 'the graph engines go to the graph lane');
+		assert.deepEqual(calls[1].args.slice(4), [], 'and to no other');
+	} finally {
+		fs.rmSync(outDir, { recursive: true, force: true });
+	}
+});
+
+test('a lane run that passes everywhere fails nothing', async () => {
+	await tasks.e2e.runLanes(tasks.e2e.planE2e({ ...ENV, OUT_DIR: path.join(os.tmpdir(), 'graph-ui-e2e-unused') }), { exec: async () => undefined });
+});
+
+test('every lane writes the result file the failure summary reads', () => {
+	for (const script of Object.values(tasks.e2e.LANES)) {
+		const source = fs.readFileSync(path.join(tasks.e2e.ACCEPTANCE_BROWSER_DIR, script), 'utf8');
+		assert.ok(source.includes(`path.join(out, '${path.basename(script, '.cjs')}.json')`), `${script} writes ${path.basename(script, '.cjs')}.json to its output folder`);
+	}
 });

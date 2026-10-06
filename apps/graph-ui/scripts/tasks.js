@@ -27,7 +27,7 @@
  * FalkorDB graphs reached through pipeline graph tool nodes.
  */
 const path = require('path');
-const { existsSync } = require('node:fs');
+const { existsSync, readFileSync, statSync } = require('node:fs');
 const { readdir } = require('node:fs/promises');
 const { createAppModule } = require('../../../scripts/lib/appModule');
 const { execCommand } = require('../../../scripts/lib');
@@ -105,21 +105,28 @@ mod.actions.push({
 // the browsers. What it checks first, and fails on with a sentence saying what
 // is missing: the URL, the engine answering it, Playwright, and every chosen
 // browser starting. Then every chosen lane runs once per browser (each into
-// its own results folder) and the action fails if any lane run failed.
+// its own results folder) and the action fails if any lane run failed, naming
+// the failed rows from each failed lane's JSON result.
 //
 //   ENGINE_URL              required: the engine under test (http or https)
 //   GRAPH_UI_E2E_BROWSERS   chrome (default) | firefox | webkit | all, or a comma list
-//   GRAPH_UI_E2E_LANES      graph,sql,a11y,linenumbers (default: all four), or a subset
+//   GRAPH_UI_E2E_LANES      graph,sql,a11y,linenumbers, or all (default: graph,sql,linenumbers)
 //   GRAPH_UI_E2E_ENGINES    graph lane only: age,neo4j,falkordb (default: all three)
 //   OUT_DIR                 results (default: the acceptance folder's git-ignored out/e2e)
 //   PLAYWRIGHT_DIR, PLAYWRIGHT_BROWSERS_PATH   as in the acceptance README
 //
-// lane_a11y measures the shell's own text too, and some shell theme pairs are
-// below 4.5:1 today (see the acceptance README), so its contrast rows can fail
-// on text Graph Explorer does not colour. Read lane_a11y.json before filing one.
+// lane_a11y runs only when named (or with "all"). It measures the shell's own
+// text too, and some shell theme pairs are below 4.5:1 today (see the
+// acceptance README), so its contrast rows fail on text Graph Explorer does not
+// colour and a default run would always fail. Read lane_a11y.json before filing
+// one; make it a default lane again once those shell tokens are fixed.
 
 /** The pass/fail lanes, by the name GRAPH_UI_E2E_LANES uses (lane_perf reports measurements and is not one). */
 const LANES = { graph: 'lane_graph.cjs', sql: 'lane_sql.cjs', a11y: 'lane_a11y.cjs', linenumbers: 'probe_linenumbers.cjs' };
+/** The lanes a run without GRAPH_UI_E2E_LANES runs: every lane but a11y (see above). */
+const DEFAULT_LANES = ['graph', 'sql', 'linenumbers'];
+/** How many failed rows the summary names per lane run; the rest are counted. */
+const MAX_FAILED_ROWS = 10;
 const BROWSERS = ['chrome', 'firefox', 'webkit'];
 const GRAPH_ENGINES = ['age', 'neo4j', 'falkordb'];
 const RECIPE = 'scripts/acceptance/graph-explorer/README.md';
@@ -166,7 +173,8 @@ function planE2e(env) {
 	}
 	const chosen = listOf(env.GRAPH_UI_E2E_BROWSERS || 'chrome', [...BROWSERS, 'all'], 'browser');
 	const browsers = chosen.includes('all') ? [...BROWSERS] : chosen;
-	const lanes = listOf(env.GRAPH_UI_E2E_LANES || Object.keys(LANES).join(','), Object.keys(LANES), 'lane').map((name) => ({ name, script: LANES[name] }));
+	const named = listOf(env.GRAPH_UI_E2E_LANES || DEFAULT_LANES.join(','), [...Object.keys(LANES), 'all'], 'lane');
+	const lanes = (named.includes('all') ? Object.keys(LANES) : named).map((name) => ({ name, script: LANES[name] }));
 	const engines = env.GRAPH_UI_E2E_ENGINES ? listOf(env.GRAPH_UI_E2E_ENGINES, GRAPH_ENGINES, 'graph engine').join(',') : null;
 	return { url: raw.replace(/\/+$/, ''), browsers, lanes, outDir: env.OUT_DIR || path.join(ACCEPTANCE_DIR, 'out', 'e2e'), engines };
 }
@@ -223,32 +231,108 @@ async function preflightE2e(plan, deps) {
 	}
 }
 
+/**
+ * When a file was last written, or null when there is none.
+ *
+ * @param {string} file - The file.
+ * @returns {number | null} Its mtime in milliseconds.
+ */
+function modifiedAt(file) {
+	try {
+		return statSync(file).mtimeMs;
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * The failed rows of a lane's JSON result, as "<engine or run>: <check>" lines.
+ *
+ * The lanes write an array of rows, or (lane_a11y) { results: rows, contrast }; a row is
+ * { browser, engine?, run?, name, status, detail }.
+ *
+ * @param {string} file - The result file.
+ * @returns {string[] | null} The failed rows, or null when the file cannot be read as a lane result.
+ */
+function failedRowsOf(file) {
+	let data;
+	try {
+		data = JSON.parse(readFileSync(file, 'utf8'));
+	} catch {
+		return null;
+	}
+	const rows = Array.isArray(data) ? data : data && Array.isArray(data.results) ? data.results : null;
+	if (!rows) return null;
+	return rows.filter((row) => row && row.status !== 'PASS').map((row) => [row.engine || row.run, String(row.name).slice(0, 160)].filter(Boolean).join(': '));
+}
+
+/**
+ * What a failed lane run reports: the rows its result file lists as failed, else its first error line.
+ *
+ * @param {{ script: string }} lane - The lane.
+ * @param {string} browser - The browser it ran in.
+ * @param {string} out - The folder it wrote to.
+ * @param {unknown} error - What the run threw.
+ * @param {number | null} before - The result file's mtime before the run (null: there was none).
+ * @returns {string} One entry of the failure summary (several lines when rows are listed).
+ */
+function describeLaneFailure(lane, browser, out, error, before) {
+	const name = `${path.basename(lane.script, '.cjs')}.json`;
+	const file = path.join(out, name);
+	const head = `${lane.script} (${browser})`;
+	const firstLine = String(error && error.message ? error.message : error)
+		.split('\n')[0]
+		.replace(/:\s*$/, '');
+	// A result file this run did not write is an earlier run's, left behind by a lane that died before writing its own.
+	const after = modifiedAt(file);
+	if (after === null || after === before) return `${head}: ${firstLine}; this run wrote no ${name}`;
+	const failed = failedRowsOf(file);
+	if (failed === null) return `${head}: ${firstLine}; ${name} is not a lane result`;
+	if (failed.length === 0) return `${head}: ${firstLine}; ${name} lists no failed row`;
+	const listed = failed.slice(0, MAX_FAILED_ROWS).map((row) => `  ${row}`);
+	if (failed.length > MAX_FAILED_ROWS) listed.push(`  ... and ${failed.length - MAX_FAILED_ROWS} more`);
+	return `${head}: ${failed.length} failed ${failed.length === 1 ? 'row' : 'rows'} in ${name}:\n${listed.join('\n')}`;
+}
+
+/**
+ * Run every chosen lane once per browser, then fail with what failed.
+ *
+ * @param {ReturnType<typeof planE2e>} plan - The plan.
+ * @param {{ exec: (args: string[], env: Record<string, string>) => Promise<unknown> }} deps - Runs `node <args>` with
+ *   these variables added to the environment, rejecting when it exits non-zero (tests pass a stand-in).
+ * @returns {Promise<void>} Resolves when every lane run passed.
+ */
+async function runLanes(plan, deps) {
+	const failures = [];
+	for (const lane of plan.lanes) {
+		for (const browser of plan.browsers) {
+			const out = path.join(plan.outDir, browser);
+			const args = [path.join(ACCEPTANCE_BROWSER_DIR, lane.script), plan.url, out, browser];
+			if (lane.name === 'graph' && plan.engines) args.push(plan.engines);
+			const before = modifiedAt(path.join(out, `${path.basename(lane.script, '.cjs')}.json`));
+			try {
+				await deps.exec(args, { ENGINE_URL: plan.url, OUT_DIR: out });
+			} catch (error) {
+				failures.push(describeLaneFailure(lane, browser, out, error, before));
+			}
+		}
+	}
+	if (failures.length > 0) {
+		throw new Error(`${failures.length} of ${plan.lanes.length * plan.browsers.length} lane runs failed (screenshots and JSON results in ${plan.outDir}):\n${failures.join('\n')}`);
+	}
+}
+
 mod.actions.push({
 	name: 'graph-ui:e2e',
 	action: () => ({
-		description: 'Run the Graph Explorer browser lanes against ENGINE_URL (opt-in; not part of test or CI)',
+		description: 'Run the Graph Explorer browser lanes against ENGINE_URL (graph, sql, linenumbers; a11y only when named in GRAPH_UI_E2E_LANES). Opt-in; not part of test or CI',
 		run: async (_ctx, task) => {
 			const plan = planE2e(process.env);
 			await preflightE2e(plan, { fetch: (url, init) => fetch(url, init), loadPlaywright: () => loadAcceptancePlaywright(process.env) });
-			const failures = [];
-			for (const lane of plan.lanes) {
-				for (const browser of plan.browsers) {
-					const out = path.join(plan.outDir, browser);
-					const args = [path.join(ACCEPTANCE_BROWSER_DIR, lane.script), plan.url, out, browser];
-					if (lane.name === 'graph' && plan.engines) args.push(plan.engines);
-					try {
-						await execCommand('node', args, { task, cwd: ACCEPTANCE_BROWSER_DIR, env: { ...process.env, ENGINE_URL: plan.url, OUT_DIR: out } });
-					} catch (error) {
-						failures.push(`${lane.script} (${browser}): ${String(error && error.message).split('\n')[0]}`);
-					}
-				}
-			}
-			if (failures.length > 0) {
-				throw new Error(`${failures.length} of ${plan.lanes.length * plan.browsers.length} lane runs failed (screenshots and JSON results in ${plan.outDir}):\n${failures.join('\n')}`);
-			}
+			await runLanes(plan, { exec: (args, env) => execCommand('node', args, { task, cwd: ACCEPTANCE_BROWSER_DIR, env: { ...process.env, ...env } }) });
 		},
 	}),
 });
 
 module.exports = mod;
-module.exports.e2e = { ACCEPTANCE_BROWSER_DIR, LANES, planE2e, preflightE2e };
+module.exports.e2e = { ACCEPTANCE_BROWSER_DIR, LANES, DEFAULT_LANES, planE2e, preflightE2e, runLanes };
