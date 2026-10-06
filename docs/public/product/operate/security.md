@@ -39,8 +39,9 @@ inherit the engine's full environment, only an allowlist:
 - every `ROCKETRIDE_` variable except `ROCKETRIDE_DB_DSN` and
   `ROCKETRIDE_DB_RESOLVE_ERROR` (and the former broker names below), which the
   engine removes in any spelling. A task that uses a RocketRide database node
-  then gets its own resolved `ROCKETRIDE_DB_DSN`. Any other `ROCKETRIDE_DB_*`
-  name passes through like the rest.
+  then gets its own resolved `ROCKETRIDE_DB_DSN`, however the pipeline spells
+  the node's provider (any case, or a `${ROCKETRIDE_*}` placeholder). Any other
+  `ROCKETRIDE_DB_*` name passes through like the rest.
 - what nodes and the task itself use directly: `RR_STORE_URL`,
   `RR_STORE_SECRET_KEY`, `RR_SIGNING_KEY`, `RR_BASE_URL`, `RR_CORS_ORIGINS`,
   `RR_OAUTH_BROKER_URL`, `RR_PROC_PRIVATE`, `MEDIA_TOOLKIT_FFMPEG`, `AWS_*`, and
@@ -67,9 +68,11 @@ Each RocketRide database node connects to the database of the organization
 that runs the pipeline (of the user, where there is no organization). The
 engine resolves that connection when a task starts, from the task's own
 identity; nothing in the pipeline, a node's configuration or the task's
-environment selects it. On a hosted engine, the connection check that runs
-when a node's configuration is saved resolves no database at all, so the
-engine's own environment cannot select one either. The connection string the
+environment selects it. On a hosted engine a task takes that connection from
+the engine alone: when the engine resolved none for it, its database nodes
+report that and never resolve one themselves. The connection check that runs
+when a node's configuration is saved resolves no database at all on a hosted
+engine, so the engine's own environment cannot select one either. The connection string the
 broker returns must require TLS: an explicit `sslmode`
 of `require`, `verify-ca` or `verify-full` is used as issued, a missing one
 becomes `require`, and one that does not require TLS is refused unless every

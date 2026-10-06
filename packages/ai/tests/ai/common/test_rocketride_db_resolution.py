@@ -212,6 +212,38 @@ def test_hosted_task_process_reports_the_engine_resolve_error(server_env):
         rocketride_db.resolve_rocketride_dsn()
 
 
+@pytest.mark.parametrize('injected', [None, '   '], ids=['no-dsn', 'blank-dsn'])
+@pytest.mark.parametrize(
+    'argv',
+    [['engine', '--hosted'], ['engine', '--hosted', '--saas']],
+    ids=['hosted-task', 'hosted-task-with-added-saas-flag'],
+)
+@pytest.mark.parametrize(
+    'account_cls', [_Account, _HostedAccount, _OverlayAccount], ids=['base', 'hosted', 'overlay-resolver']
+)
+def test_hosted_task_process_without_a_resolved_database_never_resolves_one_itself(
+    server_env, account_cls, argv, injected
+):
+    """Neither a DSN nor a reason from the task engine: say so, and resolve nothing here.
+
+    The account fallback would take the tenant from the task's own environment
+    (ROCKETRIDE_CLIENT_ID) through whichever account class the task loaded, and
+    pipeline code and pipeline-added arguments (``--saas``) reach both.
+    """
+    server_env.delenv(rocketride_db.DB_DSN_ENV)
+    if injected is not None:
+        server_env.setenv(rocketride_db.DB_DSN_ENV, injected)
+    calls = _install(server_env, account_cls, argv)
+
+    with pytest.raises(ValueError) as caught:
+        rocketride_db.resolve_rocketride_dsn()
+
+    assert calls == []
+    message = str(caught.value)
+    assert 'at task start' in message and rocketride_db.NOT_RESOLVED in message
+    assert 'some-tenant' not in message and rocketride_db.CLIENT_ID_ENV not in message
+
+
 def test_open_source_server_uses_its_own_dsn(server_env):
     """Single-tenant local development: ROCKETRIDE_DB_DSN in the engine's environment."""
     calls = _install(server_env, _Account, ['engine'])

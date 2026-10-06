@@ -80,6 +80,7 @@ def _task(*, source='src-id', task_name=None, pipeline=None, status=None):
     t.project_id = 'proj-test'
     t._task_name = task_name
     t._pipeline = pipeline if pipeline is not None else {}
+    t._env = {}
     t._threads = 4
     t._pipelineTraceLevel = None
     t._run_kind = 'dev'
@@ -780,6 +781,50 @@ def test_pipeline_uses_rocketride_db_tolerates_malformed_components():
     assert not Task._pipeline_uses_rocketride_db(t)
 
 
+@pytest.mark.parametrize(
+    'provider,env',
+    [
+        ('RocketRide_Graph', {}),
+        ('ROCKETRIDE_SQL', {}),
+        (' rocketride_vector ', {}),
+        ('${ROCKETRIDE_P}', {'ROCKETRIDE_P': 'rocketride_graph'}),
+        ('${ROCKETRIDE_P}', {'ROCKETRIDE_P': 'RocketRide_Sql'}),
+    ],
+    ids=['mixed-case', 'upper-case', 'padded', 'placeholder', 'placeholder-mixed-case'],
+)
+def test_pipeline_uses_rocketride_db_decides_on_the_provider_the_task_runs(provider, env):
+    """The task process runs the resolved pipeline, and the engine finds a node
+    by its provider case-insensitively: a placeholder or another spelling of a
+    DB provider still loads the node, so it must still get its database.
+    """
+    t = _task(pipeline={'components': [{'id': 'a', 'provider': 'chat'}, {'id': 'b', 'provider': provider}]})
+    t._env = env
+    assert Task._pipeline_uses_rocketride_db(t)
+
+
+@pytest.mark.parametrize(
+    'provider,env',
+    [
+        ('${ROCKETRIDE_P}', {}),
+        ('${ROCKETRIDE_P}', {'ROCKETRIDE_P': 'chat'}),
+        ('${OTHER_P}', {'OTHER_P': 'rocketride_sql'}),
+        ('rocketride_sqlx', {}),
+        (['rocketride_sql'], {}),
+    ],
+    ids=[
+        'unresolved-placeholder',
+        'placeholder-other-node',
+        'non-rocketride-placeholder',
+        'other-name',
+        'not-a-string',
+    ],
+)
+def test_pipeline_uses_rocketride_db_ignores_providers_that_resolve_to_other_nodes(provider, env):
+    t = _task(pipeline={'components': [{'id': 'b', 'provider': provider}]})
+    t._env = env
+    assert not Task._pipeline_uses_rocketride_db(t)
+
+
 # ---------------------------------------------------------------------------
 # _build_subprocess_env — RocketRide DB credential hygiene
 # ---------------------------------------------------------------------------
@@ -1046,6 +1091,24 @@ async def test_pipeline_configuration_and_caller_env_cannot_choose_the_tenant(mo
 
     assert seen == ['org-1']
     assert env['ROCKETRIDE_DB_DSN'] == 'postgresql://role@pooler/org-1'
+
+
+@pytest.mark.asyncio
+async def test_placeholder_or_case_variant_provider_gets_the_task_organizations_dsn(monkeypatch):
+    """A DB node spelled another way, or named by a placeholder, still runs in
+    the task: it gets the task organization's DSN, not nothing (which would
+    leave the task process to look for a database itself).
+    """
+    seen = _recording_resolver(monkeypatch)
+    for provider, caller_env in (('${ROCKETRIDE_P}', {'ROCKETRIDE_P': 'rocketride_graph'}), ('RocketRide_Sql', {})):
+        t = _env_task(pipeline={'components': [{'id': 'db', 'provider': provider}]})
+        t._env = caller_env
+
+        env = await Task._build_subprocess_env(t)
+
+        assert env['ROCKETRIDE_DB_DSN'] == 'postgresql://role@pooler/org-1', provider
+        assert 'ROCKETRIDE_DB_RESOLVE_ERROR' not in env
+    assert seen == ['org-1', 'org-1']
 
 
 @pytest.mark.asyncio
