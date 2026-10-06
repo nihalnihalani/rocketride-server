@@ -48,11 +48,91 @@ from depends import depends as _depends
 # requirements.txt before importing anything else from this module.
 _depends(os.path.dirname(os.path.realpath(__file__)) + '/requirements.txt')
 
+import re
+import unicodedata
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 from rocketlib import debug
 
-from ..base import LEGACY_DB_BROKER_ENV, AccountBase
+from ..base import DB_BROKER_TOKEN_ENV, DB_BROKER_URL_ENV, LEGACY_DB_BROKER_ENV, AccountBase
+
+# A name set_env may write: ROCKETRIDE_ and then letters, digits and
+# underscores, so it is one token of one line in the engine's .env file.
+_SET_ENV_NAME = re.compile(r'ROCKETRIDE_[A-Za-z0-9_]+')
+
+# The DB broker settings (operator-only) and their former names, upper-cased.
+_SET_ENV_RESERVED = frozenset({DB_BROKER_URL_ENV, DB_BROKER_TOKEN_ENV, *LEGACY_DB_BROKER_ENV})
+
+
+def _env_file_value(name: str, value: Any) -> str:
+    """``value`` as written after ``name=`` in the engine's .env file.
+
+    The web server reads that file with python-dotenv at startup, and the
+    value must come back from it exactly, on its own line. A plain value is
+    written as it is. A value python-dotenv would trim or cut (surrounding
+    whitespace, `` #`` starting a comment, an opening quote) is single-quoted,
+    with ``\\`` and ``'`` escaped. What no line can hold is refused.
+
+    Raises:
+        ValueError: naming ``name`` and never quoting ``value`` (it may be a
+            secret).
+    """
+    if not isinstance(value, str):
+        raise ValueError(f'{name}: the value must be a string')
+    # A line break would start a line of the caller's choosing (another name,
+    # or an operator-only setting); str.splitlines also breaks lines at
+    # \x1c-\x1e, \x85, \u2028 and \u2029. No other control character is
+    # accepted either.
+    if any(unicodedata.category(ch) == 'Cc' or ch in '\u2028\u2029' for ch in value):
+        raise ValueError(f'{name}: the value contains a line break or another control character')
+    # python-dotenv expands ${NAME} from the engine's environment in every
+    # value, quoted or not, with no way to escape it: ${RR_DB_BROKER_TOKEN}
+    # would read back as the broker token.
+    if '${' in value:
+        raise ValueError(f'{name}: the value contains "${{", which the .env file loader would expand')
+    if value == value.strip() and not value.startswith(("'", '"')) and not re.search(r'\s#', value):
+        return value
+    # Older python-dotenv releases read a backslash before the closing quote
+    # as an escaped quote and run on into the following lines.
+    if value.endswith('\\'):
+        raise ValueError(
+            f'{name}: a value with surrounding spaces, a leading quote or " #" cannot end with a backslash'
+        )
+    return "'" + value.replace('\\', '\\\\').replace("'", "\\'") + "'"
+
+
+def _checked_set_env(raw: Any) -> Dict[str, str]:
+    """The ROCKETRIDE_* names and values of a set_env request, checked before anything changes.
+
+    Names without the ROCKETRIDE_ prefix are dropped, as before, except the DB
+    broker settings and their former names: those are refused in any
+    spelling (case, surrounding whitespace). A ROCKETRIDE_ name must be one
+    token and every value must fit on its line (see :func:`_env_file_value`).
+
+    Raises:
+        ValueError: the request is refused, and nothing has changed.
+    """
+    if not isinstance(raw, dict):
+        raise ValueError('set_env: env must be an object of names to string values')
+
+    reserved = sorted(repr(k) for k in raw if isinstance(k, str) and k.strip().upper() in _SET_ENV_RESERVED)
+    if reserved:
+        raise ValueError(
+            f'{", ".join(reserved)}: DB broker setting name(s), refused. The DB broker settings are '
+            'RR_DB_BROKER_URL and RR_DB_BROKER_TOKEN, set by the server operator; the former '
+            'ROCKETRIDE_DB_BROKER_* names are refused everywhere.'
+        )
+
+    env = {k: v for k, v in raw.items() if isinstance(k, str) and k.startswith('ROCKETRIDE_')}
+    malformed = sorted(repr(k) for k in env if not _SET_ENV_NAME.fullmatch(k))
+    if malformed:
+        raise ValueError(
+            f'{", ".join(malformed)}: refused. A name is ROCKETRIDE_ followed by letters, digits and underscores.'
+        )
+
+    for name, value in env.items():
+        _env_file_value(name, value)
+    return env
 
 
 class Account(AccountBase):
@@ -427,18 +507,13 @@ class Account(AccountBase):
                 return conn.build_response(request, body={'env': env})
 
             if sub == 'set_env':
-                # Only accept ROCKETRIDE_* keys — reject anything else
-                raw = args.get('env', {})
-                env = {k: v for k, v in raw.items() if k.startswith('ROCKETRIDE_')}
-
-                # The former DB broker names are refused here as at startup
-                # (any spelling): broker settings are operator-only RR_* values.
-                former = sorted(k for k in env if k.upper() in LEGACY_DB_BROKER_ENV)
-                if former:
-                    raise ValueError(
-                        f'{", ".join(former)}: former DB broker setting name(s), refused. The DB broker '
-                        'settings are RR_DB_BROKER_URL and RR_DB_BROKER_TOKEN, set by the server operator.'
-                    )
+                # Only ROCKETRIDE_* names are kept, and the whole request is
+                # checked before anything changes: the DB broker settings and
+                # their former names are refused in any spelling (they are
+                # operator-only RR_* values), and every name and value must be
+                # one exact assignment in the .env file below, so a line break
+                # cannot add one of them anyway.
+                env = _checked_set_env(args.get('env', {}))
 
                 # Step 1: Remove existing ROCKETRIDE_* keys from os.environ
                 # so that deleted keys don't linger in memory.
@@ -470,23 +545,25 @@ class Account(AccountBase):
         Merge ROCKETRIDE_* entries into a .env file.
 
         Preserves non-ROCKETRIDE lines and comments. Replaces existing
-        ROCKETRIDE_* lines and appends new ones.
+        ROCKETRIDE_* lines and appends new ones. Each value is written so the
+        web server's python-dotenv reads it back exactly (see
+        :func:`_env_file_value`), in UTF-8 as python-dotenv reads it.
 
         Args:
             path: Absolute path to the .env file.
-            env:  Key-value dict to write.
+            env:  Key-value dict to write (checked by :func:`_checked_set_env`).
         """
         lines: List[str] = []
         written_keys: set = set()
         try:
-            with open(path, 'r') as f:
+            with open(path, 'r', encoding='utf-8') as f:
                 for line in f:
                     stripped = line.strip()
                     if stripped and not stripped.startswith('#') and '=' in stripped:
                         key = stripped.split('=', 1)[0].strip()
                         if key.startswith('ROCKETRIDE_'):
                             if key in env:
-                                lines.append(f'{key}={env[key]}\n')
+                                lines.append(f'{key}={_env_file_value(key, env[key])}\n')
                                 written_keys.add(key)
                             continue
                     lines.append(line)
@@ -495,9 +572,9 @@ class Account(AccountBase):
 
         for k, v in sorted(env.items()):
             if k not in written_keys:
-                lines.append(f'{k}={v}\n')
+                lines.append(f'{k}={_env_file_value(k, v)}\n')
 
-        with open(path, 'w') as f:
+        with open(path, 'w', encoding='utf-8') as f:
             f.writelines(lines)
 
     # generate_token is inherited from AccountBase.

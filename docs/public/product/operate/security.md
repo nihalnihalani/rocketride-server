@@ -59,7 +59,13 @@ substituted into a pipeline, never returned or changed by the account
 `ROCKETRIDE_DB_BROKER_URL` or `ROCKETRIDE_DB_BROKER_TOKEN` are set, in its
 environment or in its `.env` file, even next to the new names, and the
 open-source `set_env` command refuses them: rename them in the deployment
-configuration and secret mapping in the same change. A hosted
+configuration and secret mapping in the same change. That command saves
+`ROCKETRIDE_` names in the engine's `.env` file, one exact assignment per line,
+and refuses the whole request, changing nothing, when a name is one of the
+broker settings or their former names in any spelling, when a `ROCKETRIDE_`
+name has anything other than letters, digits and underscores after the
+prefix, or when a value has a line break or another control character, or
+contains `${`, which the `.env` loader would expand when the engine starts. A hosted
 engine without the broker settings logs a warning at startup, and its
 RocketRide database nodes report that the broker is not configured, both when
 their configuration is saved and when a task starts.
