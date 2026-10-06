@@ -50,6 +50,8 @@ interface IAction {
 }
 const tasks = require('../scripts/tasks.js') as { actions: IAction[]; e2e: IE2e };
 const REPO = path.resolve(__dirname, '..', '..', '..');
+// apps/shared's global.d.ts types `process` as the browser bundles' env seam only, so Node's own is required by name.
+const { execPath } = require('node:process') as { execPath: string };
 /** The action's name. Its verb (after the colon) is no global builder command: see W3-CI03b below. */
 const E2E_ACTION = 'graph-ui:e2e-live';
 
@@ -116,7 +118,7 @@ function ciBareCommands(): Set<string> {
 
 /** What the real builder expands a command line to, from its dry run (`--list-deps` prints each action it would run and runs none). */
 function builderExpands(commands: string[]): string[] {
-	const run = spawnSync(process.execPath, [path.join(REPO, 'scripts', 'build.js'), ...commands, '--list-deps'], { cwd: REPO, encoding: 'utf8' });
+	const run = spawnSync(execPath, [path.join(REPO, 'scripts', 'build.js'), ...commands, '--list-deps'], { cwd: REPO, encoding: 'utf8' });
 	const lines = run.stdout.split(/\r?\n/);
 	return lines.filter((_, i) => lines[i + 1] === '\u2500'.repeat(40)).map((line) => line.trim());
 }
