@@ -183,6 +183,13 @@ would silently cut the copy short. It goes out exactly as typed and counts as
 a statement that changes data: the app never retries it after a restart,
 History lists it with the writes, and re-running it from History asks first.
 
+ClickHouse's `LIMIT n BY expr` caps the rows of each group, not the result,
+so it is not read as the statement's own limit (on ClickHouse, and on a
+connection whose dialect could not be probed). On **200** or **1000** the
+header's `LIMIT` is appended after it, which ClickHouse accepts, and the line
+reads `limit 200`; with **All** it reads `no limit applied`. A plain `LIMIT`
+after the `BY` list is the statement's own limit, as anywhere else.
+
 Read `no limit applied` literally, because **All** together with a `LIMIT`
 that is not on the outermost query produces exactly that line. Only a
 top-level `LIMIT` is recognised, so

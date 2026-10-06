@@ -869,3 +869,41 @@ describe('applyRowLimit — a SELECT that sends its rows somewhere else (INTO)',
 		assert.equal(applyRowLimit('SELECT into_count FROM t', '200', 'postgres').state, 'applied');
 	});
 });
+
+describe('applyRowLimit — ClickHouse LIMIT n BY caps rows per group, not the result', () => {
+	it('appends the header limit after a LIMIT ... BY, which ClickHouse accepts', () => {
+		assert.deepEqual(applyRowLimit('SELECT * FROM events LIMIT 1 BY user_id', '200', 'clickhouse'), {
+			sql: 'SELECT * FROM events LIMIT 1 BY user_id\nLIMIT 200',
+			limit: 200,
+			state: 'applied',
+		});
+		assert.equal(applyRowLimit('SELECT * FROM events ORDER BY ts DESC LIMIT 2, 1 BY user_id, kind;', '1000', 'clickhouse').sql, 'SELECT * FROM events ORDER BY ts DESC LIMIT 2, 1 BY user_id, kind\nLIMIT 1000');
+		assert.equal(applyRowLimit('SELECT * FROM events LIMIT 1 OFFSET 2 BY user_id', '200', 'clickhouse').state, 'applied');
+		assert.equal(applyRowLimit('SELECT * FROM events limit 1 by (user_id)', '200', 'clickhouse').state, 'applied');
+	});
+
+	it('says no limit applies under All, rather than claiming one in the statement', () => {
+		assert.deepEqual(applyRowLimit('SELECT * FROM events LIMIT 1 BY user_id', 'All', 'clickhouse'), {
+			sql: 'SELECT * FROM events LIMIT 1 BY user_id',
+			limit: null,
+			state: 'none',
+		});
+	});
+
+	it('still reads a LIMIT that follows the LIMIT ... BY as the statement\'s own bound', () => {
+		assert.deepEqual(applyRowLimit('SELECT * FROM events LIMIT 1 BY user_id LIMIT 10', '200', 'clickhouse'), {
+			sql: 'SELECT * FROM events LIMIT 1 BY user_id LIMIT 10',
+			limit: null,
+			state: 'in-statement',
+		});
+		assert.equal(applyRowLimit('SELECT * FROM events LIMIT 10', '200', 'clickhouse').state, 'in-statement');
+		assert.equal(applyRowLimit('SELECT * FROM events LIMIT 10 BYTES', '200', 'clickhouse').state, 'in-statement');
+	});
+
+	it('treats it the same when the dialect could not be probed, and leaves other dialects as they were', () => {
+		assert.equal(applyRowLimit('SELECT * FROM events LIMIT 1 BY user_id', '200', 'unknown').state, 'applied');
+		// Not valid PostgreSQL or MySQL either way; the text is not rewritten there.
+		assert.equal(applyRowLimit('SELECT * FROM events LIMIT 1 BY user_id', '200', 'postgres').state, 'in-statement');
+		assert.equal(applyRowLimit('SELECT * FROM events LIMIT 1 BY user_id', '200', 'mysql').state, 'in-statement');
+	});
+});

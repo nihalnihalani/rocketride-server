@@ -218,6 +218,28 @@ function hashCommentPrecedesClause(sql: string, lockingAt: number, dialect: SqlD
 const FETCH_LIMIT_HEAD = /^fetch\s+(?:first|next)(?![\w$])/i;
 
 /**
+ * ClickHouse's `LIMIT n BY expr`, also spelled `LIMIT m, n BY` and `LIMIT n
+ * OFFSET m BY`: it caps the rows PER GROUP of `expr`, not the result, so it
+ * is not the statement's row limit. ClickHouse accepts an ordinary `LIMIT`
+ * after it, which is where the header's goes. `n` and `m` are constants or
+ * query parameters (`{n:UInt32}`), so each is one token here; matched on
+ * masked text sliced at a `limit` site, like {@link FETCH_LIMIT_HEAD}.
+ */
+const LIMIT_BY_HEAD = /^limit\s+[^\s,()]+(?:\s*,\s*[^\s,()]+)?(?:\s+offset\s+[^\s,()]+)?\s+by(?![\w$])/i;
+
+/**
+ * Whether the dialect may be one that has `LIMIT n BY`: ClickHouse, or a
+ * connection whose dialect could not be probed. On PostgreSQL and MySQL the
+ * clause does not parse at all, and the statement is left as it was.
+ *
+ * @param dialect - The engine dialect.
+ * @returns True when a `LIMIT ... BY` may be a per-group limit.
+ */
+function mayLimitByGroup(dialect: SqlDialect): boolean {
+	return dialect === 'clickhouse' || dialect === 'unknown';
+}
+
+/**
  * Where the statement's own outermost row-limit clause starts — `LIMIT` or
  * the SQL standard's `FETCH { FIRST | NEXT } ... ONLY` — or -1 when it has
  * none. Either spelling shares `LIMIT`'s grammar slot, so a statement bounded
@@ -267,7 +289,13 @@ function inStatementLimitAt(sql: string, dialect: SqlDialect): number {
 	const masked = codeOnly(sql, dialect);
 	for (const site of keywordSites(sql, ['limit', 'fetch'], dialect)) {
 		if (site.depth !== 0) continue;
-		if (site.keyword === 'limit' || FETCH_LIMIT_HEAD.test(masked.slice(site.index))) return site.index;
+		if (site.keyword === 'limit') {
+			// A per-group `LIMIT n BY` bounds each group, not the result: look on
+			// for a real one (ClickHouse allows one after it).
+			if (mayLimitByGroup(dialect) && LIMIT_BY_HEAD.test(masked.slice(site.index))) continue;
+			return site.index;
+		}
+		if (FETCH_LIMIT_HEAD.test(masked.slice(site.index))) return site.index;
 	}
 	return -1;
 }
