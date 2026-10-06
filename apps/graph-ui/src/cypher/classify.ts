@@ -50,7 +50,13 @@
 // _WRITE_WORDS, _SHOW_ALLOWED, _SHOW_MODIFIERS), so a statement the node's read
 // path counts as a write is confirmed here before it is sent, and a SHOW the
 // node always refuses is not offered to it as a read. tests/classify.test.ts
-// reads those sets and fails when the two sides differ.
+// reads those sets and fails when the two sides differ. The rest of the rule
+// is this file's own and is not the node's: an administration word counts
+// only as the first word (a few pairs anywhere), while the Neo4j node refuses
+// GRANT, DENY, REVOKE, USE, a SHOW off its list and more pairs anywhere; and a
+// word right before `:` in a pattern (`(set:Person)`) is a clause here but a
+// name to the node. The FalkorDB and Apache AGE read paths use none of these
+// sets.
 //
 // Words are only keywords in CLAUSE position. A word right after `.` is a
 // property name (`n.set`), right after `:` a label or type (`(n:Delete)`), and a

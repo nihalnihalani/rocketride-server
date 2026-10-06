@@ -255,6 +255,12 @@ test("every word the node's read path counts as a write is a write here, mid-sta
 	assert.equal(statementKind('MATCH (n:Insert) RETURN n.insert, {insert: 1}'), 'read');
 });
 
+test("the vetted procedures are the Neo4j node's read-only procedure allowlist", () => {
+	// The node joins the name parts before it compares; the app compares parts (see procedures.ts), so the lists are
+	// the same while a name quoted as one part (`db.labels`) is refused here and allowed there.
+	assert.deepEqual(VETTED_PROCEDURES.map((entry) => entry.join('.')).sort(), nodeSet('NEO4J_READ_PROCEDURES'));
+});
+
 test("a SHOW is a read exactly when the node's read path allows it", () => {
 	for (const target of nodeSet('_SHOW_ALLOWED')) assert.equal(statementKind(`SHOW ${target}`), 'read', target);
 	for (const target of ['TRANSACTIONS', 'TRANSACTION', 'DATABASES', 'DATABASE', 'SETTINGS', 'SETTING', 'USERS', 'SERVERS', 'ALIASES']) {
