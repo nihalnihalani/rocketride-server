@@ -138,7 +138,7 @@ def live_neo4j() -> Dict[str, Any]:
     """Neo4j live captures (the database of test_graph_neo4j_full.py)."""
     import neo4j
 
-    from _pytest.monkeypatch import MonkeyPatch
+    from pytest import MonkeyPatch
 
     from . import test_graph_neo4j_full as n4
 
@@ -205,7 +205,7 @@ def live_neo4j() -> Dict[str, Any]:
 
 def live_falkordb() -> Dict[str, Any]:
     """FalkorDB live captures (the server of test_graph_falkordb_full.py)."""
-    from _pytest.monkeypatch import MonkeyPatch
+    from pytest import MonkeyPatch
 
     from . import test_graph_falkordb_full as fk
     from .test_graph_neo4j_full import load_graph_node
@@ -248,7 +248,7 @@ def live_falkordb() -> Dict[str, Any]:
 
 def live_age() -> Dict[str, Any]:
     """Apache AGE live captures (the database of test_rocketride_graph_full.py)."""
-    from _pytest.monkeypatch import MonkeyPatch
+    from pytest import MonkeyPatch
 
     from . import test_graph_age_full as ag
     from . import test_rocketride_graph_full as rr
@@ -256,10 +256,8 @@ def live_age() -> Dict[str, Any]:
     out: Dict[str, Any] = {}
     mp = MonkeyPatch()
     try:
-        env = rr.rr_env._get_wrapped_function()(mp)
-        seeded = rr.age_graph._get_wrapped_function()(env)
-        next(seeded)
-        try:
+        env = rr.make_rr_env(mp)
+        with rr.seeded_age_graph():
             for i in range(36):
                 ag._cypher_admin(f'CREATE (:L{i} {{k: {i}}})')
             ag._cypher_admin("MATCH (a:Person {name: 'alice'}) SET a.big = 9007199254740993, a.precise = 1.5::numeric")
@@ -303,8 +301,6 @@ def live_age() -> Dict[str, Any]:
             finally:
                 glb.endGlobal()
             out['age_errors.json'] = errors
-        finally:
-            next(seeded, None)
     finally:
         mp.undo()
     return out

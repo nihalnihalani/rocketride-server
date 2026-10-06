@@ -50,6 +50,7 @@ Skips cleanly when the database is unreachable.
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
 import os
 import sys
@@ -112,9 +113,13 @@ def _load_from_path(name: str, path: Path, *, is_package: bool = False):
     return module
 
 
-@pytest.fixture()
-def rr_env(monkeypatch):
-    """Stub the engine surface, load real graph base + age layer + node."""
+def make_rr_env(monkeypatch):
+    """Stub the engine surface, load real graph base + age layer + node.
+
+    The body of the ``rr_env`` fixture, callable without pytest's fixture
+    machinery (``nodes/test/graph_wire_fixtures.py`` uses it with its own
+    ``pytest.MonkeyPatch``).
+    """
     warnings: list[str] = []
 
     depends_mod = types.ModuleType('depends')
@@ -207,9 +212,18 @@ def rr_env(monkeypatch):
 
 
 @pytest.fixture()
-def age_graph(rr_env):
+def rr_env(monkeypatch):
+    """Stub the engine surface, load real graph base + age layer + node."""
+    return make_rr_env(monkeypatch)
+
+
+@contextlib.contextmanager
+def seeded_age_graph():
     """Provision + seed the test graph out-of-band, as the cloud provisioner
-    does for 'rocketride' (the node never creates a graph).
+    does for 'rocketride' (the node never creates a graph); drop it on exit.
+
+    The body of the ``age_graph`` fixture, usable without pytest's fixture
+    machinery (``nodes/test/graph_wire_fixtures.py`` uses it directly).
     """
     conn = psycopg2.connect(ADMIN_DSN)
     conn.autocommit = True
@@ -226,11 +240,20 @@ def age_graph(rr_env):
             "(a)-[:WORKS_AT]->(x:Company {name:'RocketRide'}) "
             '$$) AS (v agtype)'
         )
-    yield conn
-    with conn.cursor() as cur:
-        cur.execute('SET search_path = ag_catalog, "$user", public')
-        cur.execute('SELECT drop_graph(%s, true)', (GRAPH,))
-    conn.close()
+    try:
+        yield conn
+    finally:
+        with conn.cursor() as cur:
+            cur.execute('SET search_path = ag_catalog, "$user", public')
+            cur.execute('SELECT drop_graph(%s, true)', (GRAPH,))
+        conn.close()
+
+
+@pytest.fixture()
+def age_graph(rr_env):
+    """The seeded test graph (see :func:`seeded_age_graph`)."""
+    with seeded_age_graph() as conn:
+        yield conn
 
 
 def _begin(rr_env, config=None):
