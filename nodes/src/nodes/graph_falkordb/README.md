@@ -30,14 +30,14 @@ The registered tool names are the bare method names below (an agent catalog name
 
 | Function | Description |
 |---|---|
-| `get_data` | Requires a non-empty `question`; optional `limit` is clamped to the graph row cap. Returns sanitized rows, generated query, applied limit, and truncation state; generation/execution failure returns `error`, `valid: false`, and no rows. The generated query follows the `read_query` statement rule: `LOAD CSV` (and text with an unterminated string, comment or name, or the code text described below) is refused before the server is called. |
+| `get_data` | Requires a non-empty `question`; optional `limit` is clamped to the graph row cap (`max_rows`, kept below the server's `RESULTSET_SIZE`). Returns sanitized rows, generated query, applied limit, and truncation state; generation/execution failure returns `error`, `valid: false`, and no rows. The generated query follows the `read_query` statement rule: `LOAD CSV` (and text with an unterminated string, comment or name, or the code text described below) is refused before the server is called. |
 | `get_schema` | Takes no meaningful arguments and returns reflected `labels`, node properties, and relationships, plus the version 2 `schema` block. |
 | `refresh_schema` | Takes no arguments; re-reads the schema of the configured graph now and returns it like `get_schema`. |
 | `get_query` | Requires a non-empty `question`, with optional `limit`; returns validated read-only Cypher and `valid: true`, or an `error`/off-topic `answer` with `valid: false`. Generated Cypher that contains a write, `LOAD CSV`, unterminated text or the code text described below comes back as `error` with `valid: false`. |
 | `read_query` | Requires non-empty `cypher`; accepts object `params` and integer `limit` (default 1,000, capped by `max_rows`, the server's `RESULTSET_SIZE` and 25,000). Always runs `GRAPH.RO_QUERY` on the configured graph, whatever `allow_writes` or `allow_execute` say, with the query timeout clamped to the server's `TIMEOUT_MAX`, and refuses `LOAD CSV`: it reads the graph only. Returns `{columns, rows, row_limit, truncated, truncated_by, element_limit, elements, value_limit, values}` in the shared graph result shape; failures raise an error whose first line is a headline (`Refused: …`, `Query timed out after N ms`, `Invalid read_query input: …`, `Query failed`) and whose remaining lines are the server's message. |
-| `execute` | Requires raw `query` and runs it without LLM translation or the `read_query` statement rules (so `LOAD CSV` runs here); it raises an error unless `allow_execute` is enabled, and fails when the result exceeds the execute row cap. With `shape: "graph"` it returns the `read_query` shape plus `affected_rows`. |
+| `execute` | Requires raw `query` and runs it without LLM translation or the `read_query` statement rules (so `LOAD CSV` runs here); it raises an error unless `allow_execute` is enabled. In the default shape it fails when the result exceeds the execute row cap (`max_execute_rows`, kept below the server's `RESULTSET_SIZE`). With `shape: "graph"` it returns the `read_query` shape plus `affected_rows`, cut at that cap and reported as `truncated_by: "rows"`. |
 | `dialect` | Takes no meaningful arguments and returns `{dialect: "falkordb"}` plus the engine version, graph, capabilities, limits and read boundary. |
-| `query` | Requires non-empty `cypher`; accepts optional object `params` and optional `graph`. Returns columns, serialized rows, count, and truncation state; Redis failures return `error` with empty rows. With `allow_writes` off it runs `GRAPH.RO_QUERY` and applies the `read_query` statement rule: it refuses `LOAD CSV` (and text with an unterminated string, comment or name, or the code text described below) and returns that refusal in `error` without calling the server. With `allow_writes` on it runs `GRAPH.QUERY` with the statement as written. |
+| `query` | Requires non-empty `cypher`; accepts optional object `params` and optional `graph`. Returns columns, serialized rows (at most `max_rows`, kept below the server's `RESULTSET_SIZE`), count, and truncation state; Redis failures return `error` with empty rows. With `allow_writes` off it runs `GRAPH.RO_QUERY` and applies the `read_query` statement rule: it refuses `LOAD CSV` (and text with an unterminated string, comment or name, or the code text described below) and returns that refusal in `error` without calling the server. With `allow_writes` on it runs `GRAPH.QUERY` with the statement as written. |
 | `list_graphs` | Takes no arguments and returns graph names, or `error` with an empty graph list on a Redis failure. |
 
 In the `read_query` shape, node and relationship ids are FalkorDB's integer ids
@@ -91,10 +91,14 @@ relationship list. `read_boundary` is `ro_command`. The natural-language tools
 tell the model it is writing FalkorDB OpenCypher run as `GRAPH.RO_QUERY`.
 
 `RESULTSET_SIZE` truncates a reply silently on the server, so the node reads it
-(and `TIMEOUT_MAX`) with `GRAPH.CONFIG GET` at start and keeps both the
-`read_query` cap and the `execute` (`shape: "graph"`) row limit one row below
-it, so a reply the server cut is reported as `truncated_by: "rows"`; where `GRAPH.CONFIG` is not permitted it assumes no server limit
-and says so in a warning. The client buffers each whole reply, so the server's
+(and `TIMEOUT_MAX`) with `GRAPH.CONFIG GET` at start and keeps every row cap one
+row below it: `read_query`, `get_data`, the questions lane, `query` and
+`execute` with `shape: "graph"` report a reply the server cut as truncated
+(`truncated_by: "rows"` in the `read_query` shape), and `execute` in its default
+shape fails as over its row cap. Every command the node sends carries the
+query timeout clamped to `TIMEOUT_MAX`, since the server refuses a larger one.
+Where `GRAPH.CONFIG` is not permitted the node assumes no server limit and says
+so in a warning. The client buffers each whole reply, so the server's
 `RESULTSET_SIZE` and the timeout are what bound server work and memory.
 
 ## Profiles
@@ -120,7 +124,7 @@ The manual profile passes host, port, optional username/password, and TLS to the
 
 ### Write access, row caps, and timeout
 
-`allow_writes` defaults to false, using `GRAPH.RO_QUERY` so the server rejects write clauses. Enable it only for a trusted workload; direct `query` then uses `GRAPH.QUERY` and can return write statistics. `max_rows` truncates ordinary results and marks them truncated; `max_execute_rows` makes oversized direct-execute results fail. `query_timeout_ms` bounds a single server query.
+`allow_writes` defaults to false, using `GRAPH.RO_QUERY` so the server rejects write clauses. Enable it only for a trusted workload; direct `query` then uses `GRAPH.QUERY` and can return write statistics. `max_rows` caps the results of `get_data`, the questions lane, `query` and `read_query` and marks them truncated. `max_execute_rows` makes an oversized `execute` result fail in the default shape; with `shape: "graph"` the result is cut at the cap and reported as truncated. Both caps stay one row below the server's `RESULTSET_SIZE`. `query_timeout_ms` bounds every server query, clamped to the server's `TIMEOUT_MAX`.
 
 ## Authentication
 
@@ -160,10 +164,13 @@ changes, not rows, and a read reports 0.
 
 ### How long a call can take
 
-Each `read_query` or `execute` is one command bounded by the server's own
-timeout (the node's query timeout, clamped to the server's `TIMEOUT_MAX`) and
-is never retried, so it ends within the `statement_timeout_ms` that `dialect`
-reports plus the network round trip. `refresh_schema` waits up to 65 seconds
+Each `read_query`, `execute` or `query` call is one command bounded by the
+server's own timeout (the node's query timeout, clamped to the server's
+`TIMEOUT_MAX`) and is never retried, so it ends within the
+`statement_timeout_ms` that `dialect` reports plus the network round trip.
+`get_data` and the questions lane run one such command once the LLM has
+written the query and `EXPLAIN` has accepted it; the LLM calls are not
+bounded by this timeout. `refresh_schema` waits up to 65 seconds
 for another refresh of the same node to finish, then runs within its
 60-second budget.
 
@@ -184,12 +191,12 @@ for another refresh of the same node to finish, then runs within its
 | `graph_falkordb.graph` | `string` | **Default Graph**<br/>A FalkorDB server hosts many graphs. This is the one queried when the caller does not name another. | `"agent"` |
 | `graph_falkordb.host` | `string` | **Host**<br/>FalkorDB host, e.g. localhost or your-instance.falkordb.cloud. | `"localhost"` |
 | `graph_falkordb.max_attempts` | `integer` | **Max Validation Attempts**<br/>Maximum number of times to re-ask the LLM if EXPLAIN rejects the generated Cypher query. | `5` |
-| `graph_falkordb.max_execute_rows` | `integer` | **Max Execute Rows**<br/>Upper cap on rows returned by the execute tool. The query fails if exceeded, so one statement cannot exhaust worker memory. | `25000` |
-| `graph_falkordb.max_rows` | `integer` | **Max Rows**<br/>Upper cap on rows returned per query. Results beyond it are cut and flagged as truncated. | `250` |
+| `graph_falkordb.max_execute_rows` | `integer` | **Max Execute Rows**<br/>Upper cap on rows returned by the execute tool, kept one row below the server's RESULTSET_SIZE. In the default shape the call fails if exceeded, so one statement cannot exhaust worker memory; with shape "graph" the result is cut at the cap and reported as truncated. | `25000` |
+| `graph_falkordb.max_rows` | `integer` | **Max Rows**<br/>Upper cap on rows returned by get_data, the questions lane, query and read_query. Results beyond it are cut and flagged as truncated. It is kept one row below the server's RESULTSET_SIZE. | `250` |
 | `graph_falkordb.password` | `string` | **Password**<br/>Password for the FalkorDB instance. Stored encrypted. When set it is the one used, replacing any password embedded in the FalkorDB URL. Leave empty for no auth, or to use the one the URL already carries. | `""` |
 | `graph_falkordb.port` | `integer` | **Port**<br/>FalkorDB port (Redis protocol). FalkorDB Cloud assigns a per-instance port. | `6379` |
 | `graph_falkordb.profile` | `string` | **Connection**<br/>How this node connects to FalkorDB | `"default"` |
-| `graph_falkordb.query_timeout_ms` | `integer` | **Query Timeout (ms)**<br/>Server-side timeout for a single query. | `30000` |
+| `graph_falkordb.query_timeout_ms` | `integer` | **Query Timeout (ms)**<br/>Server-side timeout for every query the node sends, clamped to the server's TIMEOUT_MAX. | `30000` |
 | `graph_falkordb.tls` | `boolean` | **TLS**<br/>Connect with TLS. Required by FalkorDB Cloud TLS endpoints. | `false` |
 | `graph_falkordb.url` | `string` | **FalkorDB URL**<br/>Connection string as shown in the FalkorDB Cloud console, e.g. falkor://falkordb@r-xxxx.instance-yyyy.cloud:53939. Use falkors:// for TLS. The URL may carry credentials, so it is stored encrypted; the password can also be left out of it and typed in the Password field below, which then replaces whatever the URL embeds. | `""` |
 | `graph_falkordb.username` | `string` | **Username**<br/>Username, e.g. "default" for FalkorDB Cloud. Leave empty for no auth. | `""` |

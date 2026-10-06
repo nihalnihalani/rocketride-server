@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 import uuid
 
 import pytest
@@ -307,6 +308,71 @@ class TestServerLimits:
             assert over['truncated'] is True and over['truncated_by'] == 'rows'
             exact = inst.execute({'query': f'UNWIND range(1, {cap - 1}) AS i RETURN i', 'shape': 'graph'})
             assert len(exact['rows']) == cap - 1 and exact['truncated'] is False
+        finally:
+            glb.endGlobal()
+
+    def test_get_data_and_query_report_a_resultset_size_cut(self, falkor_env, falkor_graph):
+        """get_data and the query tool keep their cap below RESULTSET_SIZE, so a cut reply reads as truncated."""
+        glb, inst = _start(falkor_env, max_rows=25000)
+        try:
+            cap = glb.server_result_cap
+            if cap is None:
+                pytest.skip('server does not allow GRAPH.CONFIG GET RESULTSET_SIZE')
+            over = f'UNWIND range(1, {cap + 5000}) AS i RETURN i'
+            out = inst.query({'cypher': over})
+            assert 'error' not in out, out
+            assert out['row_count'] == cap - 1 and out['truncated'] is True
+            # get_data without the LLM: the generated query is the over-long one.
+            inst.get_query = lambda args: {'query': over, 'valid': True}
+            data = inst.get_data({'question': 'every number', 'limit': 25000})
+            assert data['valid'] is True, data
+            assert data['row_limit'] == cap - 1 and len(data['rows']) == cap - 1 and data['truncated'] is True
+            assert len(glb._run_query(over)) == cap - 1  # the questions lane
+        finally:
+            glb.endGlobal()
+
+    def test_legacy_execute_fails_instead_of_returning_a_cut_reply(self, falkor_env, falkor_graph):
+        glb, inst = _start(falkor_env, allow_execute=True)
+        try:
+            cap = glb.server_result_cap
+            if cap is None:
+                pytest.skip('server does not allow GRAPH.CONFIG GET RESULTSET_SIZE')
+            with pytest.raises(ValueError, match=rf'^EXECUTE query exceeded max_execute_rows={cap - 1} \('):
+                inst.execute({'query': f'UNWIND range(1, {cap + 5000}) AS i RETURN i'})
+            exact = inst.execute({'query': f'UNWIND range(1, {cap - 1}) AS i RETURN i'})
+            assert len(exact['rows']) == cap - 1 and exact['rows'][-1] == {'i': cap - 1}
+        finally:
+            glb.endGlobal()
+
+    def test_every_command_sends_the_clamped_timeout(self, falkor_env, falkor_graph):
+        """get_data, the questions lane, legacy execute and query send min(query timeout, TIMEOUT_MAX).
+
+        The shared test server runs with TIMEOUT_MAX off, and changing that
+        server-wide setting would affect other users of the server, so the
+        node is told of a 100 ms TIMEOUT_MAX instead: each path must then end
+        within that, not within the node's own 5-second timeout.
+        """
+        glb, inst = _start(falkor_env, allow_execute=True, query_timeout_ms=5000)
+        slow = 'UNWIND range(1, 300000000) AS i WITH i WHERE i % 7 = 3 RETURN count(i) AS c'
+        try:
+            glb.server_timeout_max_ms = 100
+            assert glb.statement_timeout_ms == 100
+            inst.get_query = lambda args: {'query': slow, 'valid': True}
+            calls = {
+                'get_data': lambda: inst.get_data({'question': 'count'}),
+                'lane': lambda: glb._run_query(slow),
+                'execute': lambda: inst.execute({'query': slow}),
+                'query': lambda: inst.query({'cypher': slow}),
+            }
+            for name, call in calls.items():
+                started = time.monotonic()
+                try:
+                    out = call()
+                except Exception as e:  # noqa: BLE001 - the error text is what is checked
+                    out = {'error': str(e)}
+                elapsed = time.monotonic() - started
+                assert 'timed out' in str(out.get('error', '')).lower(), (name, out)
+                assert elapsed < 2.5, (name, elapsed)
         finally:
             glb.endGlobal()
 

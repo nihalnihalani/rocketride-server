@@ -71,7 +71,8 @@ class IGlobal(GraphGlobalBase):
     query_timeout_ms: int = DEFAULT_TIMEOUT_MS
     # Server limits read at start (None = unknown, e.g. GRAPH.CONFIG not permitted).
     # RESULTSET_SIZE truncates replies silently; TIMEOUT_MAX rejects larger
-    # per-query timeouts.
+    # per-query timeouts. Every command the node sends honours both (see
+    # statement_timeout_ms and _below_server_cap).
     server_result_cap: Optional[int] = None
     server_timeout_max_ms: Optional[int] = None
     server_version: Optional[str] = None
@@ -181,8 +182,8 @@ class IGlobal(GraphGlobalBase):
 
     @property
     def read_row_cap(self) -> int:
-        """Node-owner ceiling on rows a natural-language read query returns."""
-        return self.max_rows
+        """Node-owner ceiling on rows a read returns (get_data, the lane, query), kept below RESULTSET_SIZE."""
+        return self._below_server_cap(self.max_rows)
 
     def _run_query(self, query: str, params: Optional[Dict] = None, limit: Optional[int] = None) -> List[Dict]:
         """Execute a read-only Cypher query through GRAPH.RO_QUERY.
@@ -191,21 +192,32 @@ class IGlobal(GraphGlobalBase):
         write clauses even when a caller skips the client-side check.
 
         With ``limit`` set the caller wants truncation detection, so return one
-        row past it (still bounded by ``max_rows``); with no limit (the lane
-        path) fall back to the node's ``max_rows`` cap.
+        row past it (still bounded by ``read_row_cap``); with no limit (the lane
+        path) fall back to the ``read_row_cap`` ceiling.
         """
-        cap = self.max_rows if limit is None else min(int(limit), self.max_rows) + 1
-        result = self.select_graph().ro_query(query, params=params or None, timeout=self.query_timeout_ms)
+        cap = self.read_row_cap if limit is None else min(int(limit), self.read_row_cap) + 1
+        result = self.select_graph().ro_query(query, params=params or None, timeout=self.statement_timeout_ms)
         return self._rows_as_dicts(result, cap=cap)
 
     def _run_query_raw(self, query: str) -> Dict[str, Any]:
-        """Execute a raw statement with writes allowed (the EXECUTE path)."""
-        max_rows = self.max_execute_rows
-        result = self.select_graph().query(query, timeout=self.query_timeout_ms)
+        """Execute a raw statement with writes allowed (the EXECUTE path).
+
+        Fails rather than return a reply the server may have cut: the row cap
+        is ``execute_graph_cap`` (``max_execute_rows``, kept below the
+        server's RESULTSET_SIZE, which cuts replies without a marker).
+        """
+        max_rows = self.execute_graph_cap
+        result = self.select_graph().query(query, timeout=self.statement_timeout_ms)
 
         rows = self._rows_as_dicts(result, cap=max_rows + 1)
         if len(rows) > max_rows:
-            raise ValueError(f'EXECUTE query exceeded max_execute_rows={max_rows}')
+            message = f'EXECUTE query exceeded max_execute_rows={max_rows}'
+            if max_rows < self.max_execute_rows:
+                message += (
+                    f" (the node's {self.max_execute_rows}, lowered below the server's "
+                    f'RESULTSET_SIZE ({self.server_result_cap}), which cuts longer replies)'
+                )
+            raise ValueError(message)
 
         # Count writes unconditionally: unlike SQL, a Cypher write commonly also
         # returns rows (CREATE (n) RETURN n), so `rows` being non-empty does not
@@ -251,25 +263,26 @@ class IGlobal(GraphGlobalBase):
             return max(1, min(self.query_timeout_ms, self.server_timeout_max_ms))
         return self.query_timeout_ms
 
+    def _below_server_cap(self, cap: int) -> int:
+        """``cap``, kept below the server's RESULTSET_SIZE so the +1 sentinel row can arrive.
+
+        The server cuts every reply (GRAPH.QUERY and GRAPH.RO_QUERY alike) at
+        RESULTSET_SIZE without any marker; one row under it, a reply the
+        server cut reads as truncated (or, for legacy execute, as over the cap).
+        """
+        if self.server_result_cap:
+            cap = min(int(cap), self.server_result_cap - 1)
+        return max(1, int(cap))
+
     @property
     def read_query_cap(self) -> int:
-        """Node cap, kept below the server's RESULTSET_SIZE so the +1 sentinel row can arrive."""
-        cap = min(self.max_rows, READ_QUERY_HARD_CAP)
-        if self.server_result_cap:
-            cap = min(cap, self.server_result_cap - 1)
-        return max(1, cap)
+        """Node cap (at most 25,000), kept below the server's RESULTSET_SIZE."""
+        return self._below_server_cap(min(self.max_rows, READ_QUERY_HARD_CAP))
 
     @property
     def execute_graph_cap(self) -> int:
-        """max_execute_rows, kept below RESULTSET_SIZE so a reply the server cut reads as truncated.
-
-        GRAPH.QUERY replies are cut at RESULTSET_SIZE just like GRAPH.RO_QUERY
-        ones, without any marker, so the +1 sentinel row must fit under it.
-        """
-        cap = int(self.max_execute_rows)
-        if self.server_result_cap:
-            cap = min(cap, self.server_result_cap - 1)
-        return max(1, cap)
+        """max_execute_rows, kept below RESULTSET_SIZE (execute in either shape)."""
+        return self._below_server_cap(self.max_execute_rows)
 
     def _graph_adapter(self):
         return falkordb_adapter()
