@@ -6,8 +6,11 @@
 # Graph Explorer validation: every repository gate the feature touches, with real
 # builder actions only. Run from the repository root. Each step logs to
 # $LOGS/<step>.log and records its exit status; the script never stops early and
-# never hides a failure: it exits non-zero when any step failed. It does not run
-# the live SDK or browser lanes (see README.md in this folder).
+# never hides a failure: it exits non-zero when any step failed. The node steps
+# include test_graph_toolpath_full.py (the engine, the shipped templates and
+# their graph tools through the Python SDK, as CI's Linux leg runs it); the
+# manual SDK acceptance, lifecycle and browser lanes are not run here (see
+# README.md in this folder).
 #
 # Prerequisites: the database containers from README.md (the nodes:test and
 # nodes:test-db steps require them via RR_REQUIRE_DB_TESTS=1), started from the

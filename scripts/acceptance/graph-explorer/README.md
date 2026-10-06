@@ -5,9 +5,17 @@ make: a real engine loads the graph nodes, the SDKs call their tools against
 real databases, and Playwright drives the production shell in real browsers.
 
 **These lanes are manual. They are not wired into CI**, and nothing in
-`./builder test` runs them. CI covers the pure-logic tests, the node suites
-(which stub the engine's tool registration) and the template structure; it
-does not start a graph node in an engine or render the apps in a browser. Run
+`./builder test` runs them. CI does cover the tool path itself: besides the
+pure-logic tests and the graph node suites against live Neo4j, FalkorDB and
+AGE servers (AGE also through PgBouncer), its Linux leg runs
+`nodes/test/test_graph_toolpath_full.py`, which starts the engine from
+`dist/server`, starts the three shipped templates (`apps/graph-ui/templates`)
+and calls their `dialect`, `get_schema`, `refresh_schema`, `read_query` and
+`execute` tools through the Python SDK. What only these lanes check: the
+per-engine acceptance with database state read over independent connections
+(`graph_acceptance.py`), the TypeScript SDK's view of the same tools
+(`graph_acceptance.cjs`), what a tool caller sees across a task's lifecycle
+(`graph_lifecycle.py`), and the explorer apps rendered in real browsers. Run
 these lanes before a release, or when a change touches tool registration or
 dispatch, the shipped templates, the task lifecycle, or the explorer UI. The
 browser lanes can also be run on request as one builder action,
