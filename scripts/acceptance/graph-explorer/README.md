@@ -217,7 +217,8 @@ node $ACC/browser/probe_linenumbers.cjs "$ENGINE_URL" "$OUT_DIR" all
 # Canvas performance (Chrome) on the seeded graph, at CPU throttling 1x and 4x
 node $ACC/browser/lane_perf.cjs "$ENGINE_URL" "$OUT_DIR/perf-300.json" 300 1,4
 
-# Repository gates (no engine needed; containers needed for the node suites)
+# Repository gates (no running engine needed; the containers above, gx-pgbouncer
+# included, for db-versions and the node suites)
 $ACC/validate_all.sh
 ```
 
