@@ -298,8 +298,18 @@ def test_carriage_returns_that_hide_nothing_pass(cypher):
 
 
 def test_text_one_reading_cannot_read_is_invalid_input():
+    """The carriage-return reading leaves the quote open."""
     with pytest.raises(CypherInputError) as err:
         check_read_query_statement("MATCH (n) //\r'\nRETURN n")
+    assert err.value.headline == 'Invalid read_query input: unterminated string literal'
+
+
+def test_text_only_the_line_feed_reading_cannot_read_is_invalid_input():
+    """The carriage-return reading closes the quote; the line-feed reading leaves the second quote open."""
+    cypher = "MATCH (n) //\r'x\n' RETURN n"
+    check_read_only_cypher(cypher)  # the carriage-return reading alone reads cleanly
+    with pytest.raises(CypherInputError) as err:
+        check_read_query_statement(cypher)
     assert err.value.headline == 'Invalid read_query input: unterminated string literal'
 
 
