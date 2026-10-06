@@ -75,11 +75,15 @@ numerics are tagged as text. A response stops at 10,000 graph elements or
 firewall rule, "Not supported on Apache AGE
 1.5.0: <construct>" followed by what to write instead (for example for
 date(), duration(), elementId(), list or pattern comprehensions,
-allShortestPaths and EXISTS subqueries, which AGE 1.5.0 cannot run), "Query
-timed out after N ms", "Invalid read_query input: …", "Query result cannot
-be represented" (the statement was valid, and on execute it ran, but a value
-it returned could not be decoded), "Database unreachable" or "Query failed";
-the remaining lines are the detail. A connection failure
+allShortestPaths and EXISTS subqueries, which AGE 1.5.0 cannot run),
+"Invalid Cypher for Apache AGE" for any other statement the translator
+cannot read (a syntax error, for example), "Query timed out after N ms",
+"Invalid read_query input: …", "Query result cannot be represented" (the
+statement was valid, and on execute it ran, but a value it returned could
+not be decoded), "Database busy: no connection became free in time" (see
+**How long a call can take**), "Database unreachable", "The graph node is
+shutting down" (a call that arrives while the pipeline stops) or "Query
+failed"; the remaining lines are the detail. A connection failure
 never shows the database host, port or role: that detail is written to the
 engine's debug trace only (recorded when that trace level is enabled), and
 callers (including the pipeline start error and the save-time check) see "The
@@ -138,9 +142,10 @@ description with it so generated Cypher targets the right model.
 The node retries failed Cypher validation up to five times by default. Raise
 Max validation attempts (at most 10) for a complex schema where the returned validation error
 is likely to let the LLM repair its query, or lower it to fail faster. Max read
-rows defaults to 1,000 and is an owner-controlled cap for both the questions
-lane and get_data; increase it only when agents truly need larger result sets,
-since results beyond the cap are intentionally truncated.
+rows defaults to 1,000 and is an owner-controlled cap for the questions lane,
+get_data and read_query (and so for Graph Explorer, whose "All" asks for this
+cap); increase it only when agents truly need larger result sets, since
+results beyond the cap are intentionally truncated.
 
 ### Query timeout
 
@@ -276,7 +281,7 @@ only stops waiting: the database ends the statement at its own timeout.
 | `rocketridegraph.db_description` | `string` | **Graph description**<br/>What is this graph used for? Describe its content and purpose, this helps the LLM generate more accurate queries. | `""` |
 | `rocketridegraph.graph` | `string` | **Graph name**<br/>Name of the AGE graph to query in your RocketRide cloud database | `"rocketride"` |
 | `rocketridegraph.max_attempts` | `integer` | **Max validation attempts**<br/>Maximum number of times to re-ask the LLM if validation rejects the generated Cypher | `5` |
-| `rocketridegraph.max_rows` | `integer` | **Max read rows**<br/>Row ceiling for read queries on the questions lane and get_data tool | `1000` |
+| `rocketridegraph.max_rows` | `integer` | **Max read rows**<br/>Row ceiling for read queries: the questions lane, get_data and read_query (Graph Explorer's All asks for this cap). Results beyond it are cut and reported as truncated. | `1000` |
 | `rocketridegraph.profile` | `string` |  | `"default"` |
 | `rocketridegraph.query_timeout_ms` | `integer` | **Query timeout (ms)**<br/>Per-query statement timeout applied inside each query's transaction | `30000` |
 

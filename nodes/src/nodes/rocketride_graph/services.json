@@ -125,7 +125,7 @@
 			"default": 1000,
 			"minimum": 1,
 			"maximum": 25000,
-			"description": "Row ceiling for read queries on the questions lane and get_data tool"
+			"description": "Row ceiling for read queries: the questions lane, get_data and read_query (Graph Explorer's All asks for this cap). Results beyond it are cut and reported as truncated."
 		},
 		"rocketridegraph.query_timeout_ms": {
 			"type": "integer",
