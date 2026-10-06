@@ -9,7 +9,8 @@
 
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { TEXT_CHECK_SENTENCE, WRITE_CONSOLE_BANNER, confirmationParagraphs, describeWrites } from '../src/graph/writeConfirm';
+import { focusCancelIn } from 'shared/explorer/components/PatternConfirmDialog';
+import { TEXT_CHECK_SENTENCE, WRITE_CANCEL_LABEL, WRITE_CONSOLE_BANNER, confirmationParagraphs, describeWrites } from '../src/graph/writeConfirm';
 import { targetsToRun } from '../src/cypher/targets';
 
 const all = (text: string) => targetsToRun(text, { start: 0, end: 0 }, 0, true);
@@ -60,4 +61,19 @@ test('the write console banner says which statements are confirmed, not that eve
 	assert.doesNotMatch(WRITE_CONSOLE_BANNER, /You are asked to confirm before anything is sent/);
 	assert.match(WRITE_CONSOLE_BANNER, /Statements that look like they change data are listed for you to confirm before anything is sent; anything else is sent when you press Execute\./);
 	assert.ok(WRITE_CONSOLE_BANNER.endsWith(TEXT_CHECK_SENTENCE));
+});
+
+// GX-FE-04: the shell's ConfirmDialog focuses its confirm button when it opens, so an Enter right after Ctrl/Cmd+Enter
+// (or a double Enter) executed the write. The console moves focus to the dialog's Cancel button, which the focus step
+// finds by its label. There is no DOM here: the dialog is a stand-in with the shell's footer order.
+test('the write confirmation\'s focus step lands on Cancel, never on Execute', () => {
+	assert.equal(WRITE_CANCEL_LABEL, 'Cancel');
+	for (const confirmLabel of ['Execute statement', 'Execute statements']) {
+		const focused: string[] = [];
+		const footer = [WRITE_CANCEL_LABEL, confirmLabel].map((label) => ({ textContent: label, focus: () => { focused.push(label); } }));
+		const dialog = { querySelectorAll: (selector: string) => (selector === 'button' ? footer : []) };
+		const anchor = { closest: (selector: string) => (selector === '[role="dialog"]' ? dialog : null) } as unknown as Element;
+		assert.equal(focusCancelIn(anchor, WRITE_CANCEL_LABEL), true);
+		assert.deepEqual(focused, ['Cancel'], confirmLabel);
+	}
 });

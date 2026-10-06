@@ -43,6 +43,13 @@ import type { IRunTarget } from 'shared/explorer';
 export const TEXT_CHECK_SENTENCE = 'This is a text check, not a database safeguard.';
 
 /**
+ * The confirmation's dismiss button, which is also how its button is found for focus. The confirmation opens right
+ * after a Run keystroke and the shell's dialog focuses its confirm button, so a second Enter would execute; the
+ * console moves focus to this button instead, so the default answer sends nothing.
+ */
+export const WRITE_CANCEL_LABEL = 'Cancel';
+
+/**
  * What the write console says about itself, always visible. Only statements the text check flags are confirmed
  * (see {@link describeWrites}); the rest are sent when Execute is pressed, so the banner does not claim more.
  */

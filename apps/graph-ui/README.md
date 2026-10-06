@@ -230,7 +230,8 @@ editor and an **Execute** button, and it always says what it is:
 
 - Before anything is sent, a confirmation lists the statements that look like
   they change data, with their text, and says **This is a text check, not a
-  database safeguard.** There is no "do not ask again". A batch the check does
+  database safeguard.** There is no "do not ask again". **Cancel** has the focus
+  when it opens, so pressing Enter again sends nothing. A batch the check does
   not flag is sent when you press Execute, without a dialog.
 - Statements go through `execute` with the graph result shape, so what a
   statement returned is drawn like any other result. The result line, the strip

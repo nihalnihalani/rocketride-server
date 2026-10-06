@@ -42,6 +42,7 @@ import type { RocketRideClient, ViewMenu } from 'shell';
 import { ExplorerToolError, clock, createGeneration, formatBatchOutcome, formatPriorStatements, formatRunLabel, useStatementRunner } from 'shared/explorer';
 import type { IExplorerEndpoint, IRunTarget, IStatementRunBase } from 'shared/explorer';
 import FailureBanner from 'shared/explorer/components/FailureBanner';
+import { focusCancelIn } from 'shared/explorer/components/PatternConfirmDialog';
 import RowInspector from 'shared/explorer/components/RowInspector';
 import StatementStrip from 'shared/explorer/components/StatementStrip';
 import { CAPTIONS_PREF_KEY, DRAFTS_PREF_KEY, TOOL, announcer, dataVersions, graphEndpoints, graphHistory } from '../adapters/explorer';
@@ -55,7 +56,7 @@ import type { IFailureNotice } from '../graph/failures';
 import { countWrite, isAbandonedWrite } from '../graph/dataVersion';
 import { createGraphSession } from '../graph/graphSession';
 import type { IGraphSession } from '../graph/graphSession';
-import { confirmationParagraphs, describeWrites } from '../graph/writeConfirm';
+import { WRITE_CANCEL_LABEL, confirmationParagraphs, describeWrites } from '../graph/writeConfirm';
 import type { IWriteConfirmation } from '../graph/writeConfirm';
 import { GRAPH_BATCH_WORDS, historySummaryOf, limitPatch, prepareStatement, refuseNonReads, runRefusal, settleRun, toHistoryEntry } from '../graph/runConfig';
 import { chooseTab, summarizeResult } from '../graph/results';
@@ -202,6 +203,14 @@ export const RunSurface: React.FC<IRunSurfaceProps> = ({ endpoint, mode, paused 
 
 	// ── The runner (shared) configured for Cypher ────────────────────────────
 	const [confirm, setConfirm] = useState<{ content: IWriteConfirmation; targets: IRunTarget[] } | null>(null);
+	// The safe answer is the default one: the shell's ConfirmDialog focuses Execute when it opens, so a second Enter
+	// after Ctrl/Cmd+Enter would send the write. This effect moves focus to Cancel; React runs it after the dialog's own
+	// focus effect (an ancestor's effects run after its descendants' in the same commit).
+	const confirmAnchor = useRef<HTMLDivElement>(null);
+	const confirmOpen = confirm !== null;
+	useEffect(() => {
+		if (confirmOpen) focusCancelIn(confirmAnchor.current, WRITE_CANCEL_LABEL);
+	}, [confirmOpen]);
 	const failureNotes = useRef<IFailureNotice | null>(null);
 	const runner = useStatementRunner<IGraphRun, { cypher: string; limit: number }, ReadQueryResult, IFailureNotice & { verbatim: string }>({
 		canRun: () => client !== null && isConnected && session !== null && paused == null,
@@ -441,9 +450,10 @@ export const RunSurface: React.FC<IRunSurfaceProps> = ({ endpoint, mode, paused 
 				<ConfirmDialog
 					title={confirm.content.mutating.length === 1 ? 'Run this statement?' : `Run these ${confirm.content.mutating.length} statements?`}
 					destructive
+					cancelLabel={WRITE_CANCEL_LABEL}
 					confirmLabel={confirm.content.total === 1 ? 'Execute statement' : 'Execute statements'}
 					message={
-						<>
+						<div ref={confirmAnchor}>
 							<ol style={{ margin: '8px 0', paddingLeft: 20 }}>
 								{confirm.content.mutating.map((m) => (
 									<li key={m.position} style={{ marginBottom: 6 }}>
@@ -455,7 +465,7 @@ export const RunSurface: React.FC<IRunSurfaceProps> = ({ endpoint, mode, paused 
 							{confirmationParagraphs(confirm.content).map((p) => (
 								<div key={p} style={{ marginTop: 6 }}>{p}</div>
 							))}
-						</>
+						</div>
 					}
 					onConfirm={() => {
 						const targets = confirm.targets;
