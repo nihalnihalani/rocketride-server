@@ -29,9 +29,16 @@
 // node's message (the headline) and shows the rest under "Database said", exactly
 // as SQL Explorer does, and adds ONE hint where the app knows what to do next.
 //
-//   Refused: ...                 the read path refused a write. Writes go through
-//                                the write console, only where the node allows
-//                                execute.
+//   Refused: ...                 a safety rule or the database refused the
+//                                statement (graph_errors.py). Only the WRITE
+//                                refusals ("this statement writes", "the database
+//                                refused a write") point at the write console,
+//                                which exists only where the node allows execute.
+//                                The others (the first-row budget, AGE's resource
+//                                rules, USE, SHOW, LOAD CSV, a procedure off the
+//                                allowlist, a missing privilege) get no hint: the
+//                                node's second line under "Database said" is the
+//                                remedy, and the write console is not.
 //   Not supported on Apache AGE  an AGE limit the node explains; its own text is
 //                                the hint.
 //   timeout                      this app stopped waiting; the database may still
@@ -82,6 +89,9 @@ export const DATABASE_SAID_LABEL = 'Database said';
 /** The legacy refusal text of a node that has `execute` off (a plain error, no code). */
 const LEGACY_EXECUTE_OFF = /execute tool is disabled for this node/i;
 
+/** The node's refusals that mean the statement writes: the only ones the write console is the remedy for. */
+const WRITE_REFUSAL = /^Refused: (read_query is read-only; this statement writes|the database refused a write)\b/i;
+
 /** The engine's text when it does not know a tool; the tool name follows. */
 const UNKNOWN_TOOL = /no handler found for tool\s+['"]?([A-Za-z0-9_.]+)/i;
 
@@ -130,9 +140,10 @@ function describeKind(error: IFailureInput, canWrite: boolean): Omit<IFailureNot
 	if (error.kind === 'malformed') return { ...base, variant: 'error', headline: error.headline, hint: 'The node answered in a shape this app does not understand. It may need an upgrade.' };
 	if (error.kind === 'invalid') return { ...base, variant: 'error', headline: error.headline, hint: null };
 
-	if (/^Refused:/i.test(error.headline)) {
+	if (WRITE_REFUSAL.test(error.headline)) {
 		return { ...base, variant: 'error', headline: error.headline, hint: canWrite ? 'To change data, use the write console for this connection.' : 'Browsing is read-only. To change data, use a node with direct execution turned on.' };
 	}
+	if (/^Refused:/i.test(error.headline)) return { ...base, variant: 'error', headline: error.headline, hint: null };
 	if (/^Not supported on Apache AGE/i.test(error.headline)) return { ...base, variant: 'error', headline: error.headline, hint: 'Apache AGE 1.5.0 does not support this Cypher construct; rewrite the query without it.' };
 	if (/^Query timed out/i.test(error.headline)) return { ...base, variant: 'warning', headline: error.headline, hint: 'The node stopped the query. Narrow it, or lower the row limit.' };
 	if (/^Invalid read_query input/i.test(error.headline)) return { ...base, variant: 'error', headline: error.headline, hint: null };

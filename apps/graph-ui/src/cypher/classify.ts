@@ -39,10 +39,24 @@
 // Anything else is `write`, which routes to the write console and its
 // confirmation, never to the read path. A `write` answer can be wrong in the
 // safe direction (a read the checker does not recognise is simply sent to the
-// write console); a `read` answer that is wrong still cannot change data,
-// because the node's read path and the database role enforce that on their own.
-// That is also why the confirmation dialog says "This is a text check, not a
-// database safeguard."
+// write console). A `read` answer that is wrong cannot change data through the
+// browse editor or the graph actions, because the node's read path and the
+// database role enforce that on their own; in the write console it means the
+// statement is sent WITHOUT the confirmation. That is why the confirmation
+// dialog says "This is a text check, not a database safeguard."
+//
+// The write words, the SHOW targets and the SHOW modifiers are the node's own
+// read-path sets (packages/ai/src/ai/common/graph/cypher_safety.py:
+// _WRITE_WORDS, _SHOW_ALLOWED, _SHOW_MODIFIERS), so a statement the node's read
+// path counts as a write is confirmed here before it is sent, and a SHOW the
+// node always refuses is not offered to it as a read. tests/classify.test.ts
+// reads those sets and fails when the two sides differ. The rest of the rule
+// is this file's own and is not the node's: an administration word counts
+// only as the first word (a few pairs anywhere), while the Neo4j node refuses
+// GRANT, DENY, REVOKE, USE, a SHOW off its list and more pairs anywhere; and a
+// word right before `:` in a pattern (`(set:Person)`) is a clause here but a
+// name to the node. The FalkorDB and Apache AGE read paths use none of these
+// sets.
 //
 // Words are only keywords in CLAUSE position. A word right after `.` is a
 // property name (`n.set`), right after `:` a label or type (`(n:Delete)`), and a
@@ -105,16 +119,20 @@ export interface IPatternFinding {
 /** Clauses that start a read. */
 const READ_STARTS = new Set(['MATCH', 'WITH', 'UNWIND', 'RETURN']);
 
-/** Clauses that change data wherever they appear in clause position. */
-const WRITE_CLAUSES = new Set(['CREATE', 'MERGE', 'SET', 'REMOVE', 'DELETE', 'FOREACH']);
+/**
+ * Words that write data or schema wherever they appear in clause position: the
+ * node's `_WRITE_WORDS`, word for word. `INSERT` is GQL's synonym of `CREATE`
+ * (Neo4j 5). `DETACH` is reported together with the `DELETE` that follows it.
+ */
+export const WRITE_WORDS: ReadonlySet<string> = new Set(['CREATE', 'MERGE', 'SET', 'REMOVE', 'DELETE', 'DETACH', 'DROP', 'FOREACH', 'INSERT']);
 
 /**
- * Administration and schema commands. Each is a standalone command, so it only
- * counts as the FIRST word of a statement; mid-statement the same word is an
- * ordinary variable (`(start)-[:NEXT]->(end)`). The two forms that can follow a
- * SHOW clause (`TERMINATE TRANSACTIONS`) are matched as pairs below.
+ * Administration commands. Each is a standalone command, so it only counts as
+ * the FIRST word of a statement; mid-statement the same word is an ordinary
+ * variable (`(start)-[:NEXT]->(end)`). The two forms that can follow a SHOW
+ * clause (`TERMINATE TRANSACTIONS`) are matched as pairs below.
  */
-const ADMIN_STARTS = new Set(['DROP', 'ALTER', 'GRANT', 'DENY', 'REVOKE', 'START', 'STOP', 'RENAME', 'TERMINATE', 'ENABLE', 'DISABLE', 'ALLOCATE', 'DEALLOCATE', 'REALLOCATE', 'DRYRUN']);
+const ADMIN_STARTS = new Set(['ALTER', 'GRANT', 'DENY', 'REVOKE', 'START', 'STOP', 'RENAME', 'TERMINATE', 'ENABLE', 'DISABLE', 'ALLOCATE', 'DEALLOCATE', 'REALLOCATE', 'DRYRUN']);
 
 /** Word pairs that are administration commands wherever they appear. */
 const ADMIN_PAIRS: ReadonlyArray<readonly [string, ReadonlySet<string>]> = [
@@ -124,11 +142,14 @@ const ADMIN_PAIRS: ReadonlyArray<readonly [string, ReadonlySet<string>]> = [
 	['RENAME', new Set(['ROLE', 'USER', 'DATABASE', 'SERVER'])],
 ];
 
-/** Words allowed between SHOW and its target (`SHOW ALL UNIQUE CONSTRAINTS`). */
-const SHOW_MODIFIERS = new Set(['ALL', 'BTREE', 'RANGE', 'TEXT', 'POINT', 'LOOKUP', 'FULLTEXT', 'VECTOR', 'UNIQUE', 'NODE', 'RELATIONSHIP', 'REL', 'EXISTENCE', 'EXIST', 'KEY', 'PROPERTY', 'BUILT', 'IN', 'USER', 'DEFINED', 'DEFAULT', 'HOME']);
+/** Words allowed between SHOW and its target (`SHOW ALL UNIQUE CONSTRAINTS`): the node's `_SHOW_MODIFIERS`. */
+export const SHOW_MODIFIERS: ReadonlySet<string> = new Set(['ALL', 'BTREE', 'RANGE', 'TEXT', 'POINT', 'LOOKUP', 'FULLTEXT', 'VECTOR', 'UNIQUE', 'NODE', 'RELATIONSHIP', 'EXISTENCE', 'EXIST', 'KEY', 'PROPERTY', 'TYPE', 'BUILT', 'IN', 'USER', 'DEFINED']);
 
-/** What SHOW may list and still count as a read of schema objects. */
-const SHOW_TARGETS = new Set(['INDEX', 'INDEXES', 'CONSTRAINT', 'CONSTRAINTS', 'PROCEDURE', 'PROCEDURES', 'FUNCTION', 'FUNCTIONS', 'SETTING', 'SETTINGS', 'TRANSACTION', 'TRANSACTIONS', 'DATABASE', 'DATABASES']);
+/**
+ * What SHOW may list and still count as a read of schema objects: the node's `_SHOW_ALLOWED`. The node's read path
+ * refuses every other SHOW (`SHOW TRANSACTIONS`, `SHOW DATABASES`, `SHOW SETTINGS`), so those go to the write console.
+ */
+export const SHOW_TARGETS: ReadonlySet<string> = new Set(['INDEX', 'INDEXES', 'CONSTRAINT', 'CONSTRAINTS', 'PROCEDURE', 'PROCEDURES', 'FUNCTION', 'FUNCTIONS']);
 
 // =============================================================================
 // HELPERS
@@ -247,10 +268,10 @@ export function classifyStatement(text: string): IClassification {
 
 		if (word === 'DELETE' && upperWord(tokens[i - 1]) === 'DETACH') {
 			// Already reported together with its DETACH.
-		} else if (WRITE_CLAUSES.has(word)) {
-			findings.push({ reason: 'write-clause', word: token.text, start: token.start, end: token.end });
 		} else if (word === 'DETACH' && upperWord(tokens[i + 1]) === 'DELETE') {
 			findings.push({ reason: 'write-clause', word: `${token.text} ${tokens[i + 1].text}`, start: token.start, end: tokens[i + 1].end });
+		} else if (WRITE_WORDS.has(word)) {
+			findings.push({ reason: 'write-clause', word: token.text, start: token.start, end: token.end });
 		} else if (word === 'LOAD' && upperWord(tokens[i + 1]) === 'CSV') {
 			findings.push({ reason: 'load-csv', word: `${token.text} ${tokens[i + 1].text}`, start: token.start, end: tokens[i + 1].end });
 		} else if (i > 0) {

@@ -8,9 +8,11 @@
 // =============================================================================
 
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
 import { test } from 'node:test';
 import { focusCancelIn } from 'shared/explorer/components/PatternConfirmDialog';
-import { TEXT_CHECK_SENTENCE, WRITE_CANCEL_LABEL, WRITE_CONSOLE_BANNER, confirmationParagraphs, describeWrites } from '../src/graph/writeConfirm';
+import { TEXT_CHECK_SENTENCE, WRITE_CANCEL_LABEL, WRITE_CONSOLE_BANNER, confirmationParagraphs, describeWrites, rerunAnnouncement } from '../src/graph/writeConfirm';
 import { targetsToRun } from '../src/cypher/targets';
 
 const all = (text: string) => targetsToRun(text, { start: 0, end: 0 }, 0, true);
@@ -30,6 +32,14 @@ test('a batch of reads needs no confirmation', () => {
 	assert.equal(c.mutating.length, 0);
 	assert.equal(c.reads, 2);
 	assert.equal(describeWrites([]).needed, false);
+});
+
+// GX-T1-01: a mid-statement GQL INSERT (Neo4j 5's synonym of CREATE) was taken for a read, so the write console sent it
+// with no dialog although the node's own read path counts INSERT as a write.
+test('a mid-statement INSERT is confirmed before it is sent', () => {
+	const c = describeWrites(all("MATCH (a:Person {name: 'Ada'}) INSERT (a)-[:KNOWS]->(:Person {name: 'Eve'})"));
+	assert.equal(c.needed, true);
+	assert.deepEqual(c.mutating.map((m) => m.finding), ['INSERT']);
 });
 
 test('unrecognised or malformed statements are listed as risky, never waved through', () => {
@@ -76,4 +86,26 @@ test('the write confirmation\'s focus step lands on Cancel, never on Execute', (
 		assert.equal(focusCancelIn(anchor, WRITE_CANCEL_LABEL), true);
 		assert.deepEqual(focused, ['Cancel'], confirmLabel);
 	}
+});
+
+// GX-T1-05: History's "Run again" in the write console always announced "you will be asked to confirm", but a statement
+// the text check does not flag is sent by Execute with no dialog. A screen-reader user relying on that promise would run
+// it on the live database at once. The announcement now says which will happen, and the view uses it.
+test('the write console\'s Run again announcement says whether Execute will ask first', () => {
+	const write = rerunAnnouncement("MATCH (a:Person {name: 'Ada'}) SET a.x = 1");
+	assert.equal(write, 'The statement is in the editor. Press Execute to run it; you will be asked to confirm first.');
+	for (const text of ['MATCH (n) RETURN n LIMIT 25', 'RETURN 1; MATCH (n) RETURN n']) {
+		const read = rerunAnnouncement(text);
+		assert.doesNotMatch(read, /you will be asked to confirm/, text);
+		assert.equal(read, 'The statement is in the editor. The text check does not take it for a change to data, so Execute sends it without asking first.');
+	}
+	assert.match(rerunAnnouncement('MATCH (n) RETURN n; CREATE (m)'), /you will be asked to confirm first/, 'a batch with one flagged statement is confirmed');
+	const view = fs.readFileSync(path.resolve(__dirname, '..', 'src', 'views', 'WriteConsoleView.tsx'), 'utf8');
+	assert.doesNotMatch(view, /you will be asked to confirm/, 'the view does not hard-code the promise');
+	assert.match(view, /announcer\.announce\(rerunAnnouncement\(cypher\)\)/);
+});
+
+test('the confirmation module\'s header no longer says nothing is ever sent without confirming', () => {
+	const source = fs.readFileSync(path.resolve(__dirname, '..', 'src', 'graph', 'writeConfirm.ts'), 'utf8');
+	assert.doesNotMatch(source, /Nothing is sent until\s*\n?\s*\/\/\s*the user confirms;/);
 });

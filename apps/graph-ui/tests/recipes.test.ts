@@ -9,7 +9,7 @@
 
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { AGE_CONNECT_MAX_NODES, connectNodes, expandNeighbors, idPredicate, inspectNode, isRefusal, labelPreview, majorVersion, pathAtDepth, typePreview } from '../src/cypher/recipes';
+import { AGE_CONNECT_MAX_NODES, AGE_EXPAND_MAX_EXCLUDED, connectNodes, expandNeighbors, idPredicate, inspectNode, isRefusal, labelPreview, majorVersion, pathAtDepth, typePreview } from '../src/cypher/recipes';
 import type { IEngine, IRecipe, RecipeResult } from '../src/cypher/recipes';
 import { createPathSearch, noPathText } from '../src/cypher/pathSearch';
 import type { ReadQueryResult } from '../src/graph/types';
@@ -51,7 +51,7 @@ test('no id or value ever appears in query text; ids travel only as parameters',
 	for (const engine of ENGINES) {
 		for (const id of HOSTILE_IDS) {
 			const inspect = recipe(inspectNode(engine, id));
-			const expand = recipe(expandNeighbors(engine, id, 100, 3));
+			const expand = recipe(expandNeighbors(engine, id, 100, ['7', '8', '9']));
 			const path = recipe(pathAtDepth(engine, id, 'other-id', 4));
 			for (const r of [inspect, expand, path]) {
 				assert.ok(!r.cypher.includes(id), `${engine.dialect}: id leaked into ${r.cypher}`);
@@ -59,6 +59,10 @@ test('no id or value ever appears in query text; ids travel only as parameters',
 			}
 			const connect = recipe(connectNodes(engine, [id, 'another'], 500));
 			assert.ok(!connect.cypher.includes(id));
+			// A drawn relationship's id is left out of an expansion by parameter too.
+			const again = recipe(expandNeighbors(engine, 'center', 100, [id]));
+			assert.ok(!again.cypher.includes(id), `${engine.dialect}: drawn id leaked into ${again.cypher}`);
+			assert.ok(Object.values(again.params).some((v) => v === id || (Array.isArray(v) && v.includes(id))), 'the drawn id is bound');
 		}
 	}
 });
@@ -69,7 +73,9 @@ test('every generated query is a read by the app classifier', () => {
 			recipe(labelPreview(engine, 'Person')),
 			recipe(typePreview(engine, 'KNOWS')),
 			recipe(inspectNode(engine, '1')),
-			recipe(expandNeighbors(engine, '1', 100, 5)),
+			recipe(expandNeighbors(engine, '1', 100, [])),
+			recipe(expandNeighbors(engine, '1', 100, ['2', '3', '4'])),
+			recipe(expandNeighbors(engine, '1', 100, Array.from({ length: AGE_EXPAND_MAX_EXCLUDED + 5 }, (_, i) => String(i)))),
 			recipe(connectNodes(engine, ['1', '2', '3'], 2000)),
 			recipe(pathAtDepth(engine, '1', '2', 3)),
 		];
@@ -79,7 +85,13 @@ test('every generated query is a read by the app classifier', () => {
 
 test('label preview quotes the label for the dialect and refuses what cannot be quoted', () => {
 	assert.equal(recipe(labelPreview(ENGINES[0], 'Person')).cypher, 'MATCH (n:`Person`) RETURN n LIMIT 25');
-	assert.equal(recipe(labelPreview(ENGINES[1], 'we`ird')).cypher, 'MATCH (n:`we``ird`) RETURN n LIMIT 25');
+	assert.equal(recipe(labelPreview(ENGINES[0], 'we`ird')).cypher, 'MATCH (n:`we``ird`) RETURN n LIMIT 25');
+	assert.equal(recipe(labelPreview(ENGINES[1], 'we ird')).cypher, 'MATCH (n:`we ird`) RETURN n LIMIT 25');
+	// FalkorDB cannot parse a backtick inside a quoted name: the app says so instead of sending what fails to parse.
+	for (const refusal of [labelPreview(ENGINES[1], 'we`ird'), typePreview(ENGINES[1], 'HAS`TICK')]) {
+		assert.ok(isRefusal(refusal));
+		assert.match(isRefusal(refusal) ? refusal.refusal : '', /cannot be put in a generated query on this engine/);
+	}
 	assert.equal(recipe(labelPreview(ENGINES[2], 'Person')).cypher, 'MATCH (n:Person) RETURN n LIMIT 25');
 	assert.equal(recipe(labelPreview(ENGINES[0], 'Person', 25)).limit, 25);
 	const refused = labelPreview(ENGINES[2], 'has space');
@@ -93,25 +105,53 @@ test('label preview quotes the label for the dialect and refuses what cannot be 
 });
 
 test('an injected label can never break out of its quoting', () => {
-	for (const engine of ENGINES.slice(0, 2)) {
-		const evil = '`) DETACH DELETE n //';
-		const r = recipe(labelPreview(engine, evil));
-		const check = classifyStatement(r.cypher);
-		assert.equal(check.kind, 'read', r.cypher);
-		assert.equal(r.cypher, 'MATCH (n:```) DETACH DELETE n //`) RETURN n LIMIT 25');
-	}
+	const evil = '`) DETACH DELETE n //';
+	const r = recipe(labelPreview(ENGINES[0], evil));
+	const check = classifyStatement(r.cypher);
+	assert.equal(check.kind, 'read', r.cypher);
+	assert.equal(r.cypher, 'MATCH (n:```) DETACH DELETE n //`) RETURN n LIMIT 25');
+	// FalkorDB and AGE have no way to quote a backtick, so the name is refused rather than placed.
+	for (const engine of ENGINES.slice(1)) assert.ok(isRefusal(labelPreview(engine, evil)), engine.dialect);
 });
 
-test('expand asks for enough rows to find the wanted NEW neighbours plus one to detect more', () => {
-	const r = recipe(expandNeighbors(ENGINES[0], 'a', 100, 7));
-	assert.equal(r.limit, 108);
-	assert.match(r.cypher, /LIMIT 108$/);
-	assert.equal(recipe(expandNeighbors(ENGINES[0], 'a', 100, 0)).limit, 101);
-	assert.equal(recipe(expandNeighbors(ENGINES[0], 'a', 5000, 5000)).limit, 2000, 'bounded');
-	assert.equal(recipe(expandNeighbors(ENGINES[0], 'a', 0, 0)).limit, 2);
-	assert.ok(isRefusal(expandNeighbors(ENGINES[0], '', 100, 0)));
+// GX-T1-02: expand asked for `shown + wanted + 1` rows with nothing left out, so once a node's row cap was below that
+// (250 on a default FalkorDB node), every repeat returned the same, already drawn, rows. The relationships already drawn
+// are now left out of the request itself, so a repeat asks for the next ones.
+test('expand leaves out the relationships already drawn and asks for the wanted NEW neighbours plus one', () => {
+	const neo = recipe(expandNeighbors(ENGINES[0], 'a', 100, ['r1', 'r2', 'r1']));
+	assert.equal(neo.cypher, 'MATCH (n) WHERE elementId(n) = $id OPTIONAL MATCH (n)-[r]-(m) WHERE NOT (elementId(r) IN $drawn) RETURN n, r, m LIMIT 101');
+	assert.deepEqual(neo.params, { id: 'a', drawn: ['r1', 'r2'] }, 'duplicates removed, order kept');
+	assert.equal(neo.limit, 101);
+	const falkor = recipe(expandNeighbors(ENGINES[1], '5', 100, ['12', '13']));
+	assert.equal(falkor.cypher, 'MATCH (n) WHERE id(n) = toInteger($id) OPTIONAL MATCH (n)-[r]-(m) WHERE NOT (id(r) IN [x IN $drawn | toInteger(x)]) RETURN n, r, m LIMIT 101');
+	assert.deepEqual(falkor.params, { id: '5', drawn: ['12', '13'] });
+	const age = recipe(expandNeighbors(ENGINES[2], '844424930131969', 100, ['1125899906842625', '1125899906842626']));
+	assert.equal(age.cypher, 'MATCH (n) WHERE id(n) = toInteger($id) OPTIONAL MATCH (n)-[r]-(m) WHERE NOT (id(r) = toInteger($d0) OR id(r) = toInteger($d1)) RETURN n, r, m LIMIT 101');
+	assert.deepEqual(age.params, { id: '844424930131969', d0: '1125899906842625', d1: '1125899906842626' }, 'ids above 2^53 stay strings');
+	for (const engine of ENGINES) {
+		const first = recipe(expandNeighbors(engine, 'a', 100, []));
+		assert.ok(!/ NOT /.test(first.cypher), `${engine.dialect}: nothing drawn, nothing left out`);
+		assert.match(first.cypher, /^MATCH \(n\) WHERE .* OPTIONAL MATCH \(n\)-\[r\]-\(m\) RETURN n, r, m LIMIT 101$/, 'the node answers on its own even with no relationships');
+		assert.deepEqual(first.params, { id: 'a' });
+		assert.equal(first.limit, 101);
+	}
+	assert.equal(recipe(expandNeighbors(ENGINES[0], 'a', 5000, [])).limit, 1001, 'the wanted count is bounded');
+	assert.equal(recipe(expandNeighbors(ENGINES[0], 'a', 0, [])).limit, 2);
+	assert.ok(isRefusal(expandNeighbors(ENGINES[0], '', 100, [])));
 	assert.ok(isRefusal(inspectNode(ENGINES[0], 'x'.repeat(513))));
 	assert.ok(isRefusal(inspectNode(ENGINES[0], 42 as unknown as string)));
+});
+
+test('on AGE at most AGE_EXPAND_MAX_EXCLUDED drawn relationships are left out; the rest are fetched again and counted in', () => {
+	const drawn = Array.from({ length: AGE_EXPAND_MAX_EXCLUDED + 30 }, (_, i) => String(1125899906842625 + i));
+	const age = recipe(expandNeighbors(ENGINES[2], '1', 100, drawn));
+	assert.equal(Object.keys(age.params).length, AGE_EXPAND_MAX_EXCLUDED + 1);
+	assert.equal(age.limit, 30 + 100 + 1, 'enough rows for the 30 drawn ones it may see again plus the wanted new ones');
+	assert.ok(!/ IN /.test(age.cypher), 'no list comprehension or IN on AGE');
+	// The rocketride_graph node refuses a statement over 10,000 characters (age/firewall.py DEFAULT_MAX_QUERY_LENGTH).
+	assert.ok(age.cypher.length < 10000, `${age.cypher.length} characters`);
+	// Neo4j and FalkorDB leave every drawn one out, so the limit stays at wanted + 1.
+	for (const engine of ENGINES.slice(0, 2)) assert.equal(recipe(expandNeighbors(engine, '1', 100, drawn)).limit, 101);
 });
 
 test('connect: Neo4j binds the id list, FalkorDB converts it, AGE binds each id and is bounded', () => {

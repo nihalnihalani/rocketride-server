@@ -45,7 +45,7 @@ import { useGraphEndpoints } from '../adapters/react';
 import { CONNECTIONS_URI } from '../graph/addresses';
 import { connectionView, surfaceGate } from '../graph/connections';
 import { canWrite, engineText, parseDialect, targetText } from '../graph/dialect';
-import { WRITE_CONSOLE_BANNER } from '../graph/writeConfirm';
+import { WRITE_CONSOLE_BANNER, rerunAnnouncement } from '../graph/writeConfirm';
 import { getDocs } from '../docs';
 import { GraphIcon } from '../icons';
 import { styles } from '../styles';
@@ -88,7 +88,8 @@ export const WriteConsoleView: React.FC<IWriteConsoleViewProps> = ({ endpoint })
 	// One slot for the life of the document: the surface takes each request once (see loadSlot.ts).
 	const [slot] = useState(createLoadSlot);
 	const [loadSeq, setLoadSeq] = useState(0);
-	// From History a statement is only loaded here, never sent: a write is run by pressing Execute and confirming.
+	// From History a statement is only loaded here, never sent: it runs when Execute is pressed, after the confirmation
+	// when the text check flags it (rerunAnnouncement says which).
 	const put = useCallback((text: string) => {
 		setLoadSeq(slot.put({ text, run: false }));
 	}, [slot]);
@@ -130,7 +131,7 @@ export const WriteConsoleView: React.FC<IWriteConsoleViewProps> = ({ endpoint })
 				onRerun={(cypher) => {
 					put(cypher);
 					setHistoryOpen(false);
-					announcer.announce('The statement is in the editor. Press Execute to run it; you will be asked to confirm.');
+					announcer.announce(rerunAnnouncement(cypher));
 				}}
 				announce={(text) => announcer.announce(text)}
 			/>

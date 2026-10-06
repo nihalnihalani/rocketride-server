@@ -140,9 +140,10 @@ export const AskBar: React.FC<IAskBarProps> = ({ endpoint, onPreview }) => {
 			{outcome?.kind === 'unavailable' && <Banner variant="info">{outcome.text}</Banner>}
 			{outcome?.kind === 'refused' && <Banner variant="warning">{outcome.text}</Banner>}
 			{outcome?.kind === 'failed' && (
-				<Banner variant="error">
+				<Banner variant={outcome.variant}>
 					<strong>{outcome.headline}</strong>
 					{outcome.detail !== '' && <pre style={{ margin: '4px 0 0', whiteSpace: 'pre-wrap', fontFamily: 'var(--rr-font-mono, monospace)', fontSize: 12 }}>{outcome.detail}</pre>}
+					{outcome.hint && <div style={{ marginTop: 4 }}>{outcome.hint}</div>}
 				</Banner>
 			)}
 		</div>

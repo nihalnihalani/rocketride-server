@@ -36,6 +36,59 @@ test('a refusal leads with the node\'s headline, the database text under it, and
 	assert.equal(read.ignore, false);
 });
 
+// GX-T1-03: on the node "Refused:" means a safety rule or the database refused the statement (graph_errors.py), not
+// only "this writes". Every Refused headline got the write-console hint, so a read refused for its size, an AGE resource
+// rule or a missing privilege was shown as a write problem. Only the write refusals point at the write console now.
+const WRITE_REFUSALS = [
+	'Refused: read_query is read-only; this statement writes (CREATE)', // cypher_safety.py, AGE firewall write_clause
+	'Refused: read_query is read-only; this statement writes', // graph_falkordb RO_QUERY
+	'Refused: the database refused a write on the read-only path', // graph_neo4j, rocketride_graph (read-only transaction)
+];
+const OTHER_REFUSALS = [
+	'Refused: the first row holds more than 10,000 graph elements', // graph_instance_base.py first-row budget
+	'Refused: the first row holds more than 500,000 values',
+	"Refused: USE is not allowed; read_query runs against the node's configured database", // cypher_safety.py
+	'Refused: SHOW USERS is not allowed on the read-only path',
+	'Refused: LOAD CSV is not allowed on the read-only path',
+	'Refused: CALL apoc.periodic.iterate is not on the read-only procedure allowlist',
+	'Refused: GRANT is not allowed on the read-only path',
+	'Refused: unterminated string literal',
+	'Refused: variable-length patterns need an upper bound', // rocketride_graph _FIREWALL_HEADLINES
+	'Refused: variable-length pattern is too deep',
+	'Refused: query is too long',
+	'Refused: expression is nested too deeply',
+	'Refused: schema-qualified function calls are not allowed',
+	'Refused: CALL is not allowed on the read-only path',
+	'Refused: the database user may not run this statement', // graph_neo4j Security.* (a reader without TRAVERSE too)
+];
+
+test('only a write refusal points at the write console; other refusals keep the node\'s own remedy and add no hint', () => {
+	for (const headline of WRITE_REFUSALS) {
+		const message = `${headline}\nthe database's own text`;
+		assert.match(describeFailure(failure('raised', message), true).hint ?? '', /use the write console for this connection/, headline);
+		assert.match(describeFailure(failure('raised', message), false).hint ?? '', /Browsing is read-only/, headline);
+		assert.match(describeFailureMessage(message, true).hint ?? '', /write console/, headline);
+	}
+	for (const headline of OTHER_REFUSALS) {
+		for (const canWrite of [true, false]) {
+			const n = describeFailure(failure('raised', `${headline}\nNarrow the query.`), canWrite);
+			assert.equal(n.headline, headline);
+			assert.equal(n.detail, 'Narrow the query.', 'the node\'s second line still carries its remedy');
+			assert.equal(n.hint, null, `${headline} (canWrite ${canWrite})`);
+			assert.equal(n.variant, 'error');
+		}
+	}
+});
+
+test('live non-write refusals (AGE qualified function, Neo4j procedure allowlist) get no write hint', () => {
+	const age = fixture<Record<string, string>>('live/age_errors', 'v1');
+	const neo = fixture<Record<string, string>>('live/neo4j_errors', 'v1');
+	for (const message of [age.refused_qualified, neo.refused_call]) {
+		assert.match(message, /^Refused: /);
+		for (const canWrite of [true, false]) assert.equal(describeFailure(failure('raised', message), canWrite).hint, null, message);
+	}
+});
+
 test('an AGE limitation keeps the node\'s explanation and says what to do', () => {
 	const n = describeFailure(failure('raised', errors.age_hint), false);
 	assert.match(n.headline, /^Not supported on Apache AGE 1\.5\.0: date\(\)/);

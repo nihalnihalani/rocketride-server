@@ -12,15 +12,22 @@ import { test } from 'node:test';
 import { MAX_IDENTIFIER_LENGTH, isQuotable, quoteIdentifier } from '../src/cypher/quote';
 import { tokenize } from '../src/cypher/lexer';
 
-test('Neo4j and FalkorDB wrap every name in backticks and double a literal backtick', () => {
+test('Neo4j and FalkorDB wrap every name in backticks; Neo4j doubles a literal backtick', () => {
 	for (const dialect of ['neo4j', 'falkordb'] as const) {
 		assert.equal(quoteIdentifier('Person', dialect), '`Person`');
 		assert.equal(quoteIdentifier('has space', dialect), '`has space`');
-		assert.equal(quoteIdentifier('a`b', dialect), '`a``b`');
-		assert.equal(quoteIdentifier('``', dialect), '````````'.slice(0, 6));
 		assert.equal(quoteIdentifier('Café 日本語 😀', dialect), '`Café 日本語 😀`');
 		assert.equal(quoteIdentifier("x'; MATCH (n) DETACH DELETE n //", dialect), "`x'; MATCH (n) DETACH DELETE n //`");
 	}
+	assert.equal(quoteIdentifier('a`b', 'neo4j'), '`a``b`');
+	assert.equal(quoteIdentifier('``', 'neo4j'), '````````'.slice(0, 6));
+});
+
+// GX-T1-06: FalkorDB's parser rejects a doubled backtick inside a quoted name (live: `MATCH (n:\`a\`\`b\`)` fails with
+// "Invalid input '`b`': expected ')'"; FalkorDB issue #154), and the FalkorDB node lists such labels without sampling
+// them for that reason. The app doubled it anyway, so clicking the label failed with a parse error.
+test('FalkorDB refuses a name holding a backtick, as the node says the server cannot quote one', () => {
+	for (const name of ['a`b', '``', '`', 'x`;`y', '`) DETACH DELETE n //']) assert.equal(quoteIdentifier(name, 'falkordb'), null, name);
 });
 
 test('a quoted name always lexes back to exactly one backtick token', () => {

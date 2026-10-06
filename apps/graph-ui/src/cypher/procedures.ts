@@ -37,7 +37,10 @@
 //
 // This list is a courtesy for the editor. The node enforces its own allow-list
 // on `read_query`, which (with the database account, where the node lets you
-// choose one) is the real boundary.
+// choose one) is the real boundary. The names are the Neo4j node's
+// NEO4J_READ_PROCEDURES (packages/ai/src/ai/common/graph/cypher_safety.py), and
+// tests/classify.test.ts fails when the two lists differ. The node joins the
+// parts before it compares, so it also allows a name quoted as one part.
 // =============================================================================
 
 /** The reviewed read-only procedures, one entry per name, as lowercase parts. */

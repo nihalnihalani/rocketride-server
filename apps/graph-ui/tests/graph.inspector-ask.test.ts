@@ -9,7 +9,8 @@
 
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { explainAskFailure, readAskAnswer } from '../src/graph/ask';
+import { ExplorerToolError } from 'shared/explorer';
+import { askQuestion, explainAskFailure, readAskAnswer } from '../src/graph/ask';
 import { ID_NOTE, inspectNode, inspectRelationship } from '../src/graph/inspector';
 import { collectEntities } from '../src/graph/results';
 import { classifyStatement } from '../src/cypher/classify';
@@ -100,4 +101,28 @@ test('a failure that looks like a missing model is unavailable; a safety refusal
 	assert.equal(explainAskFailure({ kind: 'invalid', headline: 'Generated query contains write or admin clauses' }).unavailable, false);
 	assert.equal(explainAskFailure({ kind: 'raised', headline: 'Query timed out after 30000 ms', detail: 'Database said: canceling statement' }).unavailable, false);
 	assert.equal(explainAskFailure({ kind: 'invalid', headline: 'no llm' }).unavailable, false, 'only a raised error can mean the pipeline has no model');
+	// GX-T1-04: what the engine raises when the pipeline has no LLM node (filter.callbacks.target.cpp), as captured live.
+	assert.equal(explainAskFailure({ kind: 'raised', headline: 'InvalidParam: No control listeners registered for llm at (filter.callbacks.target.cpp:96)' }).unavailable, true);
+	// ...and texts that only mention a model or a connection: the node's own empty-answer error, the SDK's lost connection.
+	for (const headline of ['LLM failed to return a Cypher query.', 'Server is not connected', 'WebSocket not connected: call connect() first', 'The LLM returned an empty answer']) {
+		assert.equal(explainAskFailure({ kind: 'raised', headline }).unavailable, false, headline);
+	}
+});
+
+// The browse editor's timeout note is about a database query still running. Ask's wait is mostly the node's language
+// model, and the session's own timeout text already says the node may still be working on it and cannot be cancelled.
+test("an Ask the app stopped waiting for is a warning in the session's own words, without the browse editor's query note", async () => {
+	const message = 'Stopped waiting for get_query after 120 s. The node may still be running it; there is no way to cancel it from here.';
+	const outcome = await askQuestion('who?', () => Promise.reject(new ExplorerToolError({ kind: 'timeout', tool: 'get_query', message })), 'no model');
+	assert.deepEqual(outcome, { kind: 'failed', headline: message, detail: '', hint: null, variant: 'warning' });
+});
+
+test("Ask never points at the write console: a raised write refusal gets the read-only hint, the node's verdict on generated Cypher none", async () => {
+	const raised = new ExplorerToolError({ kind: 'raised', tool: 'get_query', message: 'Refused: read_query is read-only; this statement writes (CREATE)\nUse the write console (execute) on a node with allow_execute enabled.' });
+	const fromRaised = await askQuestion('who?', () => Promise.reject(raised), 'no model');
+	assert.equal(fromRaised.kind === 'failed' ? fromRaised.hint : 'not failed', 'Browsing is read-only. To change data, use a node with direct execution turned on.');
+	// get_query reports its refusal of what the model wrote as {valid: false, error}: an `invalid` verdict, with no hint.
+	const verdict = new ExplorerToolError({ kind: 'invalid', tool: 'get_query', message: 'Refused: read_query is read-only; this statement writes (CREATE)' });
+	const fromVerdict = await askQuestion('who?', () => Promise.reject(verdict), 'no model');
+	assert.equal(fromVerdict.kind === 'failed' ? fromVerdict.hint : 'not failed', null);
 });

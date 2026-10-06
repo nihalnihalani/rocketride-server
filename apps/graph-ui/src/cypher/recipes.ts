@@ -85,6 +85,13 @@ export interface IEngine {
 export const AGE_CONNECT_MAX_NODES = 40;
 
 /**
+ * On AGE, the most drawn relationships an expansion leaves out by id. AGE 1.5.0 has no list comprehension, so each id
+ * is its own parameter in an OR chain; 200 keeps the statement near 6,000 characters, inside the rocketride_graph
+ * node's 10,000-character limit. Drawn relationships past this are fetched again and counted into the row limit.
+ */
+export const AGE_EXPAND_MAX_EXCLUDED = 200;
+
+/**
  * Whether a recipe result is a refusal.
  *
  * @param result - A recipe result.
@@ -199,25 +206,46 @@ export function inspectNode(engine: IEngine, id: string): RecipeResult {
 }
 
 /**
- * The relationships around a node and the nodes at their other ends.
+ * The relationships around a node that are not drawn yet, and the nodes at their other ends.
  *
- * `shown` is how many relationships of this node are already drawn: the answer
- * is deduplicated against what is on the canvas, so asking for `shown + wanted
- * + 1` rows makes at least `wanted` NEW neighbours available when they exist,
- * and the extra row tells the caller whether more exist.
+ * `drawn` holds the ids of this node's relationships already on the canvas. They are left out of the request itself
+ * (bound, never spliced), so the answer holds only relationships the canvas does not have and a repeat asks for the
+ * NEXT ones. That matters because the node clamps the row count to its own cap: asking for "everything drawn plus the
+ * wanted ones" stops making progress once that passes the cap, and every repeat then returns the same drawn rows.
+ * `wanted + 1` rows give the wanted new neighbours when they exist, and the extra row tells the caller more exist.
+ * On AGE only the first {@link AGE_EXPAND_MAX_EXCLUDED} can be left out; the rest may come back, so as many more rows
+ * are asked for, and past the node's row cap a repeat can stop making progress (the caller says so).
+ *
+ * The node is matched on its own and its relationships OPTIONALLY: a node that still exists answers with at least one
+ * row holding itself, even when nothing new hangs from it, so an empty answer always means it is no longer found.
  *
  * @param engine - The engine.
  * @param id - The element id of the node to expand.
  * @param wanted - New neighbours wanted (the per-expansion cap).
- * @param shown - Relationships of this node already drawn.
+ * @param drawn - Ids of this node's relationships already drawn.
  * @returns The recipe, or why there is none.
  */
-export function expandNeighbors(engine: IEngine, id: string, wanted: number, shown: number): RecipeResult {
+export function expandNeighbors(engine: IEngine, id: string, wanted: number, drawn: readonly string[]): RecipeResult {
 	if (!validId(id)) return { refusal: 'There is no usable id for this element.' };
 	const predicate = idPredicate(engine, 'n', 'id');
 	if (typeof predicate !== 'string') return predicate;
-	const rows = clampInt(clampInt(wanted, 1, 1000) + clampInt(shown, 0, 2000) + 1, 2, 2000);
-	return { cypher: `MATCH (n)-[r]-(m) WHERE ${predicate} RETURN n, r, m LIMIT ${rows}`, params: { id }, limit: rows };
+	const unique = Array.from(new Set(drawn));
+	const usable = unique.filter(validId);
+	const left = engine.dialect === 'age' ? usable.slice(0, AGE_EXPAND_MAX_EXCLUDED) : usable;
+	const params: Record<string, string | string[]> = { id };
+	let exclude = '';
+	if (left.length > 0 && engine.dialect === 'age') {
+		left.forEach((rid, i) => {
+			params[`d${i}`] = rid;
+		});
+		exclude = ` WHERE NOT (${left.map((_, i) => `id(r) = toInteger($d${i})`).join(' OR ')})`;
+	} else if (left.length > 0) {
+		params.drawn = left;
+		exclude = engine.dialect === 'neo4j' ? ' WHERE NOT (elementId(r) IN $drawn)' : ' WHERE NOT (id(r) IN [x IN $drawn | toInteger(x)])';
+	}
+	// Drawn relationships that could not be left out may come back: ask for that many more rows.
+	const rows = clampInt(clampInt(wanted, 1, 1000) + (unique.length - left.length) + 1, 2, 2000);
+	return { cypher: `MATCH (n) WHERE ${predicate} OPTIONAL MATCH (n)-[r]-(m)${exclude} RETURN n, r, m LIMIT ${rows}`, params, limit: rows };
 }
 
 /**

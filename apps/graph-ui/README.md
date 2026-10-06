@@ -53,8 +53,14 @@ speak Cypher and are not listed.
 ## Connections
 
 The Connections page lists every graph node in every running pipeline task you
-can see. A card shows the pipeline, the node and a state: **Checking** while the
-node is being asked who it is, **Running** once it answered, **Stopped**,
+can see that runs under one of the teams your current organization lists for
+you. Your own pipelines still running in an organization you switched away
+from are not listed (the server still lets you reach them from other clients);
+your own runs under another team of the same organization are. A task whose
+team the server does not report, or a sign-in whose organization data carries
+no team list at all, is not filtered; an organization that lists none of your
+teams shows only tasks that name no team. A card shows the pipeline, the node and a state: **Checking** while
+the node is being asked who it is, **Running** once it answered, **Stopped**,
 **Unreachable**, **No access** (you can see a team deployment but your role
 cannot call it), or **Needs upgrade**. Your own development run and a team's
 deployment of the same pipeline are separate connections, and two owners' runs
@@ -74,8 +80,9 @@ organization when the database is provisioned.
 
 The app never holds a connection string or a task token in anything it saves or
 shows. Task tokens are kept in memory only, per session. Signing out, or a
-switch to another development team, forgets every connection and closes every
-workbench and write console, so nothing from before stays on screen.
+switch to another organization or development team, forgets every connection
+and closes every workbench and write console, so nothing from before stays on
+screen.
 
 ## The workbench
 
@@ -106,12 +113,34 @@ result tabs.
   It loads the Monaco editor from `cdn.jsdelivr.net`; where that is not
   reachable, a plain text box is used after ten seconds, with the same run keys,
   drafts and history, and a notice says so.
-- **Browsing is read-only.** A statement the text check takes for a write
-  (`CREATE`, `MERGE`, `SET`, `DELETE`, `REMOVE`, `DROP`, `LOAD CSV`, a
-  procedure that is not on the allowlist, and similar) is refused before
-  anything is sent. **This is a text check, not a database safeguard.** The node
-  refuses writes on its read path as well; what keeps a read read-only depends on
-  the node, see [Safety](#safety).
+- **Browsing is read-only.** A statement the text check takes for a write is
+  refused before anything is sent: one that uses `CREATE`, `INSERT`, `MERGE`,
+  `SET`, `DELETE`, `DETACH`, `REMOVE`, `DROP`, `FOREACH` or `LOAD CSV` as a
+  clause (not as a property, label or map key), a `CALL` of a procedure that is
+  not on the allowlist, a `SHOW` of anything but indexes, constraints, functions
+  and procedures, an administration command such as `GRANT` or
+  `STOP DATABASE`, or a statement that starts with anything but
+  `MATCH`, `OPTIONAL MATCH`, `WITH`, `UNWIND`, `RETURN`, `CALL` or such a `SHOW`
+  (so `USE`, `EXPLAIN`, `PROFILE` and a `CYPHER` prefix as well). Text whose
+  string, comment or quoted name never closes, and a `CALL` with no procedure
+  name, are refused too. **This is a text check, not a
+  database safeguard.** The node refuses writes on its read path as well; what
+  keeps a read read-only depends on the node, see [Safety](#safety).
+- **Where the text check's words come from.** Three of its lists are the Neo4j
+  node's read-path lists, word for word, and a test fails when they differ: the
+  write words, the `SHOW` targets with the words allowed before them, and the
+  procedure allowlist. The rest is the app's own and is not the node's rule. The
+  app counts an administration word only as the first word of a statement, and
+  a few pairs such as `TERMINATE TRANSACTIONS` anywhere, while the Neo4j node
+  refuses `USE`, `GRANT`, `DENY`, `REVOKE`, a `SHOW` off its list and more
+  administration pairs anywhere in a statement. The app also refuses forms the
+  node lets through, among them a write word used as a variable right before a
+  label, as in `(set:Person)`, a procedure name quoted as one part, as in
+  ``CALL `db.labels`()``, a statement that does not start with a read clause
+  (`EXPLAIN`, `PROFILE`, a `CYPHER` prefix, `LET`, `FINISH`), and one that starts
+  with an administration word the node refuses only in a pair (`DISABLE`,
+  `ALLOCATE`, `DRYRUN`). The FalkorDB and Apache AGE read paths do not use these
+  lists.
 
 ### Results
 
@@ -136,7 +165,7 @@ against every shipped theme, is in
 
 | Action | What it does |
 |---|---|
-| Expand | Fetches up to 100 neighbours that are not already drawn. |
+| Expand | Fetches up to 100 neighbours that are not already drawn. The node's relationships already on the canvas are left out of the request, so expanding again fetches the next ones, whatever the node's row limit. On Apache AGE only the first 200 drawn relationships of a node can be left out; past that, the node's row limit can stop an expansion, and it then says that expanding again returns the same rows. |
 | Collapse | Removes what hangs only from this node. |
 | Dismiss | Removes the node from the canvas. |
 | Inspect | Opens the node's labels, id and properties, exact and complete, with Copy JSON. |
@@ -208,8 +237,15 @@ The Ask box asks the node's language model (`get_query`) to write Cypher. What
 comes back is a **preview**: it is put in the editor and **not run**; you read it,
 edit it, and press Run. The node has already checked that it reads only, and the
 text check runs on it again. An answer in words is shown as an answer. A pipeline
-with no language model gets a note that says so instead of an error. **Stop
-waiting** drops a late answer.
+with no language model gets a note that says so instead of an error. Any other
+failure is shown as an error or a warning. An error leads with the text it came
+with: the node's (a model that returned nothing, or the node's refusal of what
+the model wrote), the SDK's (a lost connection), or the app's own (the pipeline
+is not running, or the answer could not be read). The warnings include a node
+that cannot answer Ask yet, which gets the upgrade notice, and a wait the app
+gave up on, which says that the node may still be working on the question and
+that nothing here can cancel it. An empty question, or one longer than 2,000
+characters, is not sent. **Stop waiting** drops a late answer.
 
 ## History
 
@@ -285,6 +321,11 @@ editor and an **Execute** button, and it always says what it is:
   node says so with its own text and the app shows it.
 - FalkorDB and Neo4j refuse two columns with the same name; AGE keeps them, and
   the Table shows both.
+- A label or relationship type the app cannot quote for the engine is listed in
+  the sidebar, but its preview says so instead of running: on Apache AGE any
+  name other than letters, digits and `_`, and on FalkorDB a name holding a
+  backtick (FalkorDB cannot parse one inside a quoted name). Write the query by
+  hand to browse it where the engine allows.
 - Performance was checked with results of 100, 300 and 1,000 nodes, and with
   1,000 nodes drawn after **Show more nodes** (a 1,000-node result draws its
   first 300 until then). On an Apple-silicon laptop there were no long tasks
