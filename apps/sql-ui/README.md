@@ -63,7 +63,11 @@ list was read appears the next time it is read. An **Unreachable** or **No
 access** connection is checked again on **Refresh** or when its pipeline
 restarts, not each time the list is read. Signing out, or switching
 organization or team, clears the list, so one session's connections never
-appear in the next.
+appear in the next. It also closes every tab that belongs to a connection
+(workbench, query, data browser, designer and diagram) and forgets the schema
+the sidebar showed, so the previous account's results are not left on screen.
+Text typed into those query tabs is not kept; a statement you ran is in the
+connection's history, unless recording is off for that connection.
 
 The app never holds a connection string or a task token in anything it saves
 or shows. Task tokens are kept in memory only, per session.

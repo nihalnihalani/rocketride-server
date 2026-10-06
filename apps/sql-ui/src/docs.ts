@@ -146,6 +146,37 @@ export function endpointKeyFromAnyUri(uri: string): string | null {
 	return keyFromAnyUri(uri, SCHEMES);
 }
 
+/** The part of a Documents instance {@link closeConnectionDocuments} needs. */
+export interface IConnectionDocsHost {
+	/** The current state: every open editor and the document it shows. */
+	getState(): { editors: Readonly<Record<string, { documentUri: string }>> };
+	/** Close one editor (the document is released with its last editor). */
+	closeEditor(editorId: string): void;
+}
+
+/**
+ * Close every connection-scoped tab — workbench, query, table, designer and
+ * diagram, in every editor group — and keep the Connections landing.
+ *
+ * Used when the signed-in account changes: those tabs hold the previous
+ * account's query results and schema, and its connections are gone. Every
+ * SQL Explorer document is static, so none is ever dirty and closing its last
+ * editor releases it.
+ *
+ * @param docs - The app's Documents instance.
+ * @returns How many editors were closed.
+ */
+export function closeConnectionDocuments(docs: IConnectionDocsHost): number {
+	const editors = Object.entries(docs.getState().editors);
+	let closed = 0;
+	for (const [editorId, editor] of editors) {
+		if (endpointKeyFromAnyUri(editor.documentUri) === null) continue;
+		docs.closeEditor(editorId);
+		closed += 1;
+	}
+	return closed;
+}
+
 // Monotonic query-document counter — labels new query tabs Query 1, 2, ...
 const nextQuerySeq = createCounter();
 
