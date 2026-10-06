@@ -4,17 +4,18 @@
 // =============================================================================
 
 // =============================================================================
-// THE OPT-IN BROWSER LANES: graph-ui:e2e (CI-03, partial)
+// THE OPT-IN BROWSER LANES: graph-ui:e2e-live (CI-03, partial)
 // =============================================================================
 //
 // The Playwright lanes in scripts/acceptance/graph-explorer/browser are the only checks that render the app in a real
 // browser (focus restore, Escape and the inspector, the write confirmation, contrast, line numbers). They ran from
-// a recipe in a README only. graph-ui:e2e runs them against an engine named in the environment, and fails with a
+// a recipe in a README only. graph-ui:e2e-live runs them against an engine named in the environment, and fails with a
 // sentence that says what is missing (the engine URL, the engine itself, Playwright, a browser) rather than failing
 // somewhere inside a lane. It is opt-in: not part of graph-ui:test, `builder test` or any CI workflow.
 // =============================================================================
 
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -49,6 +50,8 @@ interface IAction {
 }
 const tasks = require('../scripts/tasks.js') as { actions: IAction[]; e2e: IE2e };
 const REPO = path.resolve(__dirname, '..', '..', '..');
+/** The action's name. Its verb (after the colon) is no global builder command: see W3-CI03b below. */
+const E2E_ACTION = 'graph-ui:e2e-live';
 
 const ENV = { ENGINE_URL: 'http://127.0.0.1:5650/' };
 
@@ -76,8 +79,8 @@ function deps(over: Partial<{ status: number; unreachable: string; noPlaywright:
 	};
 }
 
-test('graph-ui:e2e is a public builder action, and nothing that runs by default runs it', () => {
-	const e2e = tasks.actions.find((a) => a.name === 'graph-ui:e2e');
+test('graph-ui:e2e-live is a public builder action, and nothing that runs by default runs it', () => {
+	const e2e = tasks.actions.find((a) => a.name === E2E_ACTION);
 	assert.ok(e2e, 'the action exists');
 	assert.match(e2e.action().description ?? '', /opt-in/i, 'it is listed, and says it is opt-in');
 	assert.match(e2e.action().description ?? '', /graph, sql, linenumbers; a11y only when named in GRAPH_UI_E2E_LANES/, 'and which lanes it runs');
@@ -91,6 +94,46 @@ test('graph-ui:e2e is a public builder action, and nothing that runs by default 
 		'the CI workflows were read'
 	);
 	for (const file of ci) assert.ok(!fs.readFileSync(file, 'utf8').includes('graph-ui:e2e'), `${path.relative(REPO, file)} runs it in CI`);
+});
+
+/** The bare commands (no module) the CI workflows pass to the builder: `./builder test`, `${{ matrix.builder_cmd }} build`, `node scripts/build.js package`. */
+function ciBareCommands(): Set<string> {
+	const walk = (dir: string): string[] => fs.readdirSync(dir, { withFileTypes: true }).flatMap((entry) => (entry.isDirectory() ? walk(path.join(dir, entry.name)) : [path.join(dir, entry.name)]));
+	const invocation = /(?:\.\/builder(?:\.cmd)?|scripts\/build\.js|\$\{\{\s*matrix\.builder_cmd\s*\}\})((?:[ \t]+[^\s|;&<>]+)*)/g;
+	const verbs = new Set<string>();
+	for (const file of walk(path.join(REPO, '.github')).filter((f) => /\.ya?ml$/.test(f))) {
+		// Continuation lines joined, YAML and shell comments dropped (they quote commands in prose).
+		const text = fs
+			.readFileSync(file, 'utf8')
+			.replace(/\\\r?\n[ \t]*/g, ' ')
+			.replace(/(^|\s)#.*$/gm, '$1');
+		for (const match of text.matchAll(invocation)) {
+			for (const word of match[1].trim().split(/\s+/)) if (/^[a-z][a-z0-9-]*$/.test(word)) verbs.add(word);
+		}
+	}
+	return verbs;
+}
+
+/** What the real builder expands a command line to, from its dry run (`--list-deps` prints each action it would run and runs none). */
+function builderExpands(commands: string[]): string[] {
+	const run = spawnSync(process.execPath, [path.join(REPO, 'scripts', 'build.js'), ...commands, '--list-deps'], { cwd: REPO, encoding: 'utf8' });
+	const lines = run.stdout.split(/\r?\n/);
+	return lines.filter((_, i) => lines[i + 1] === '\u2500'.repeat(40)).map((line) => line.trim());
+}
+
+// W3-CI03b: the builder expands a bare command to every module's public '<module>:<command>' action
+// (scripts/build.js expandGlobalCommands), so a CI step running a bare `builder e2e` would have pulled the browser
+// lanes in, and the check above, which looks for the action's full name, would not have noticed. The action's verb is
+// no command the builder runs globally, and this asks the real builder what those commands expand to.
+test('no bare builder command reaches the opt-in action: not `builder e2e`, and none a CI workflow runs', () => {
+	const optIn = tasks.actions.filter((a) => /opt-in/i.test(a.action().description ?? ''));
+	assert.equal(optIn.length, 1, 'one graph-ui action says it is opt-in');
+	const ci = ciBareCommands();
+	assert.ok(ci.has('build') && ci.has('test'), `the CI builder steps were read (found: ${[...ci].join(', ')})`);
+	const expanded = builderExpands(['e2e', ...ci]);
+	assert.ok(expanded.includes('graph-ui:test') && expanded.includes('graph-ui:build'), `the builder expanded the bare commands (got: ${expanded.join(', ')})`);
+	assert.ok(!expanded.includes(optIn[0].name), `a bare ${['e2e', ...ci].join(' / ')} reaches ${optIn[0].name}`);
+	assert.deepEqual(builderExpands(['e2e']), [], '`builder e2e` reaches no action at all');
 });
 
 test('every lane it runs is a committed pass/fail lane in the acceptance folder', () => {

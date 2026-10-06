@@ -94,8 +94,14 @@ mod.actions.push({
 });
 
 // =============================================================================
-// graph-ui:e2e - the committed Playwright lanes, OPT-IN
+// graph-ui:e2e-live - the committed Playwright lanes, OPT-IN
 // =============================================================================
+//
+// Named e2e-live, not e2e: the builder expands a bare command to every module's
+// public '<module>:<command>' action (expandGlobalCommands in scripts/build.js),
+// so a workflow step running a bare `builder e2e` would have run this too.
+// tests/builder.e2e.test.ts asks the builder what `e2e` and the bare commands
+// the CI workflows run expand to.
 //
 // Runs the pass/fail browser lanes in scripts/acceptance/graph-explorer/browser
 // (see that folder's README for the engine, fixtures and containers they need)
@@ -152,7 +158,7 @@ function listOf(value, allowed, what) {
 }
 
 /**
- * Read graph-ui:e2e's settings from the environment.
+ * Read graph-ui:e2e-live's settings from the environment.
  *
  * @param {Record<string, string | undefined>} env - The environment.
  * @returns {{ url: string, browsers: string[], lanes: { name: string, script: string }[], outDir: string, engines: string | null }} The plan.
@@ -160,7 +166,7 @@ function listOf(value, allowed, what) {
 function planE2e(env) {
 	const raw = (env.ENGINE_URL || '').trim();
 	if (!raw) {
-		throw new Error(`graph-ui:e2e needs ENGINE_URL: the URL of a running engine that serves the built apps, with the fixture pipelines started. The recipe is in ${RECIPE}.`);
+		throw new Error(`graph-ui:e2e-live needs ENGINE_URL: the URL of a running engine that serves the built apps, with the fixture pipelines started. The recipe is in ${RECIPE}.`);
 	}
 	let parsed;
 	try {
@@ -323,7 +329,7 @@ async function runLanes(plan, deps) {
 }
 
 mod.actions.push({
-	name: 'graph-ui:e2e',
+	name: 'graph-ui:e2e-live',
 	action: () => ({
 		description: 'Run the Graph Explorer browser lanes against ENGINE_URL (graph, sql, linenumbers; a11y only when named in GRAPH_UI_E2E_LANES). Opt-in; not part of test or CI',
 		run: async (_ctx, task) => {

@@ -308,7 +308,7 @@ Notes on the code, its tests and the build are in
 [apps/graph-ui/docs/development.md](https://github.com/rocketride-org/rocketride-server/blob/develop/apps/graph-ui/docs/development.md),
 and how apps work in this repository is in
 [docs/development/apps](https://github.com/rocketride-org/rocketride-server/blob/develop/docs/development/apps/index.md).
-The browser lanes run with `ENGINE_URL=<engine> ./builder graph-ui:e2e` (opt-in, not part of `builder test` or CI; setup in [scripts/acceptance/graph-explorer/README.md](https://github.com/rocketride-org/rocketride-server/blob/develop/scripts/acceptance/graph-explorer/README.md)).
+The browser lanes run with `ENGINE_URL=<engine> ./builder graph-ui:e2e-live` (opt-in, not part of `builder test` or CI; setup in [scripts/acceptance/graph-explorer/README.md](https://github.com/rocketride-org/rocketride-server/blob/develop/scripts/acceptance/graph-explorer/README.md)).
 By default it runs the graph, SQL and line-number lanes. The contrast lane runs
 only when named (`GRAPH_UI_E2E_LANES=a11y`, or `all`): some of the shell's own
 theme colours are below 4.5:1 today, so it fails on text this app does not colour.
