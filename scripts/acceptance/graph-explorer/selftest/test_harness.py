@@ -15,6 +15,7 @@ Run: python3 -m unittest discover -s scripts/acceptance/graph-explorer/selftest 
 import importlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -26,6 +27,7 @@ import unittest
 from pathlib import Path
 
 ACC = Path(__file__).resolve().parent.parent
+REPO = ACC.parent.parent.parent
 
 # A stand-in for the rocketride SDK, enough for graph_lifecycle.py. FAKE_RESTART_MODE
 # 'window' makes calls fail with TASK_STOPPED for a moment after restart(); 'none'
@@ -106,16 +108,32 @@ class ValidateAllExitCode(unittest.TestCase):
             "import os, sys\nsys.exit(int(os.environ.get('FAKE_RC', '0')))\n"
         )
         (repo / 'scripts' / 'build.js').write_text("process.exit(Number(process.env.FAKE_RC || '0'));\n")
+        # The engine the database version check runs in: records its arguments.
+        (repo / 'dist' / 'server').mkdir(parents=True)
+        engine = repo / 'dist' / 'server' / 'engine'
+        engine.write_text('#!/bin/sh\necho "engine $*" >> "$FAKE_CALLS"\nexit "${FAKE_ENGINE_RC:-${FAKE_RC:-0}}"\n')
+        engine.chmod(0o755)
+        self.calls = self.tmp / 'calls.txt'
         self.repo = repo
 
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def run_gates(self, rc: str) -> subprocess.CompletedProcess:
-        env = dict(os.environ, FAKE_RC=rc, OUT_DIR=str(self.tmp / 'out'), STORE_DIR=str(self.tmp / 'store'))
+    def run_gates(self, rc: str, **extra: str) -> subprocess.CompletedProcess:
+        env = dict(
+            os.environ,
+            FAKE_RC=rc,
+            FAKE_CALLS=str(self.calls),
+            OUT_DIR=str(self.tmp / 'out'),
+            STORE_DIR=str(self.tmp / 'store'),
+            **extra,
+        )
         return subprocess.run(
             ['bash', str(ACC / 'validate_all.sh')], cwd=self.repo, env=env, capture_output=True, text=True
         )
+
+    def summary_steps(self, res: subprocess.CompletedProcess) -> list:
+        return [line.split()[0] for line in res.stdout.splitlines() if ' exit=' in line]
 
     def test_failed_gate_exits_non_zero(self):
         res = self.run_gates('1')
@@ -124,6 +142,90 @@ class ValidateAllExitCode(unittest.TestCase):
     def test_all_gates_passing_exits_zero(self):
         res = self.run_gates('0')
         self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+
+    def test_database_versions_are_checked_before_the_node_suites(self):
+        res = self.run_gates('0')
+        steps = self.summary_steps(res)
+        self.assertIn('db-versions', steps, res.stdout)
+        self.assertLess(steps.index('db-versions'), steps.index('nodes-test-db'), res.stdout)
+        calls = self.calls.read_text() if self.calls.exists() else ''
+        self.assertRegex(calls, r'engine \S*check_db_versions\.py', 'the version check did not run in the engine')
+
+    def test_a_database_on_another_version_fails_the_run(self):
+        res = self.run_gates('0', FAKE_ENGINE_RC='1')
+        self.assertNotEqual(res.returncode, 0, res.stdout)
+        self.assertRegex(res.stdout, r'db-versions\s+exit=1')
+
+
+class DatabaseImagesMatchCI(unittest.TestCase):
+    """README.md starts the database images CI runs, so the exact wire-fixture comparison means the same locally."""
+
+    IMAGE = re.compile(
+        r'(?<![\w./-])(apache/age|pgvector/pgvector|neo4j|falkordb/falkordb|edoburu/pgbouncer)'
+        r'((?::[\w.-]+)?(?:@sha256:[0-9a-f]{64})?)'
+    )
+
+    def images(self, path: Path) -> dict:
+        found = {}
+        for repo, ref in self.IMAGE.findall(path.read_text()):
+            if ref:  # a bare "neo4j" (a user name, NEO4J_AUTH=neo4j/...) is not an image
+                found.setdefault(repo, set()).add(repo + ref)
+        return found
+
+    def test_readme_starts_the_database_images_ci_runs(self):
+        readme = self.images(ACC / 'README.md')
+        ci = self.images(REPO / '.github' / 'workflows' / '_build.yaml')
+        for repo in ('apache/age', 'pgvector/pgvector', 'neo4j', 'falkordb/falkordb'):
+            self.assertIn(repo, ci, f'_build.yaml no longer starts {repo}')
+            self.assertEqual(readme.get(repo), ci[repo], f'README.md does not start the {repo} image CI runs')
+
+
+class DbVersionCheck(unittest.TestCase):
+    """check_db_versions.py compares the servers with the versions in the committed captures."""
+
+    @classmethod
+    def setUpClass(cls):
+        sys.path.insert(0, str(ACC))
+        sys.modules.pop('check_db_versions', None)
+        cls.cv = importlib.import_module('check_db_versions')
+
+    @classmethod
+    def tearDownClass(cls):
+        sys.path.remove(str(ACC))
+
+    def test_expected_versions_come_from_the_committed_captures(self):
+        expected = self.cv.expected_versions()
+        self.assertEqual(sorted(expected), ['age', 'falkordb', 'neo4j'])
+        captured = json.loads((self.cv.CAPTURES / 'neo4j_dialect.json').read_text())['engine']
+        self.assertEqual(expected['neo4j'], {'version': captured['version'], 'edition': captured['edition']})
+        for engine, want in expected.items():
+            self.assertRegex(want['version'] or '', r'^\d+\.\d+', engine)
+
+    def test_matching_servers_pass(self):
+        expected = {
+            'neo4j': {'version': '5.26.31', 'edition': 'community'},
+            'age': {'version': '1.5.0', 'edition': None},
+        }
+        problems = self.cv.compare(expected, {'neo4j': ('5.26.31', 'community'), 'age': ('1.5.0', None)})
+        self.assertEqual(problems, [])
+
+    def test_another_version_or_edition_fails(self):
+        expected = {
+            'neo4j': {'version': '5.26.31', 'edition': 'community'},
+            'falkordb': {'version': '6.0.1', 'edition': None},
+        }
+        problems = self.cv.compare(expected, {'neo4j': ('5.26.32', 'community'), 'falkordb': ('6.0.1', None)})
+        self.assertEqual(len(problems), 1)
+        self.assertIn('5.26.32', problems[0])
+        self.assertIn('5.26.31', problems[0])
+        problems = self.cv.compare(expected, {'neo4j': ('5.26.31', 'enterprise'), 'falkordb': ('6.0.1', None)})
+        self.assertEqual(len(problems), 1)
+
+    def test_an_unreachable_server_fails(self):
+        expected = {'falkordb': {'version': '6.0.1', 'edition': None}}
+        problems = self.cv.compare(expected, {'falkordb': ConnectionRefusedError('nothing listens')})
+        self.assertEqual(len(problems), 1)
+        self.assertIn('nothing listens', problems[0])
 
 
 class LifecycleRestartWindow(unittest.TestCase):

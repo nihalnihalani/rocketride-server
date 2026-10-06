@@ -10,7 +10,12 @@
 # the live SDK or browser lanes (see README.md in this folder).
 #
 # Prerequisites: the database containers from README.md (the nodes:test and
-# nodes:test-db steps require them via RR_REQUIRE_DB_TESTS=1).
+# nodes:test-db steps require them via RR_REQUIRE_DB_TESTS=1), started from the
+# images CI pins in .github/workflows/_build.yaml, and a built dist/server. The
+# db-versions step checks first that the servers report the versions the
+# committed wire captures were taken on (check_db_versions.py): the wire-fixture
+# suite compares those exactly, so a container from a newer image fails it for
+# a reason that has nothing to do with the code.
 #
 # Environment:
 #   OUT_DIR       where the logs go (default: out/ next to this script, git-ignored)
@@ -19,7 +24,8 @@
 #                 engine writes into ~/.rocketlib/store.
 #   UV_CACHE_DIR, SDKROOT, CI  passed through when set (macOS builds may need SDKROOT).
 set -u
-OUT_DIR=${OUT_DIR:-$(cd "$(dirname "$0")" && pwd)/out}
+HERE=$(cd "$(dirname "$0")" && pwd)
+OUT_DIR=${OUT_DIR:-$HERE/out}
 LOGS=${LOGS:-$OUT_DIR/validate-$(date +%Y%m%d-%H%M%S)}
 STORE_DIR=${STORE_DIR:-$(mktemp -d "${TMPDIR:-/tmp}/rr-validate-store.XXXXXX")}
 mkdir -p "$LOGS"
@@ -53,6 +59,7 @@ step client-ts-test     ./builder client-typescript:test
 step client-py-test     ./builder client-python:test
 # Python: engine-side suites, graph suites, live databases (required, not skippable)
 step ai-test            ./builder ai:test
+step db-versions        sh -c 'cd dist/server && exec ./engine "$1"' sh "$HERE/check_db_versions.py"
 step nodes-test-db      env RR_REQUIRE_DB_TESTS=1 ./builder nodes:test-db
 step nodes-test         env RR_REQUIRE_DB_TESTS=1 ./builder nodes:test
 # Node README + docs gates

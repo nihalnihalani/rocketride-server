@@ -29,6 +29,7 @@ secret. Never point them at a database that holds data you care about.
 | `start_fixtures.py` | Starts the long-lived tools pipelines the browser lanes use, with no idle timeout (the engine otherwise stops a task after 15 idle minutes): the SQL fixtures, one graph fixture per engine with execute off, and one write-enabled FalkorDB fixture on its own graph (`WRITE_GRAPH`, see "The write console fixture"). Only what is not running yet is started; `--stop` terminates them. |
 | `fake_broker.py` | Local stand-in for the DB broker's `/provision` endpoint, so `rocketride_graph` and `rocketride_sql` resolve a local database. |
 | `validate_all.sh` | Runs every repository gate the feature touches (unit, SDK, node, docs, builds), writes one log per step, and exits non-zero when any step failed. |
+| `check_db_versions.py` | `validate_all.sh`'s first database step: the Neo4j, FalkorDB and AGE servers the node suites use must report the versions the committed wire captures (`apps/graph-ui/tests/fixtures/v1/live`) were taken on. |
 | `browser/lane_graph.cjs` | Graph Explorer in Chrome, Firefox and WebKit: connections, the drawer's engine identity, editor run, canvas, Table/Raw tabs, inspector open and Escape, Expand, schema Refresh, History, write refusal in the browse editor, Ask without an LLM. With `falkordb` among its engines it also runs the write console (engine `falkordb-write`): a `CREATE` asks first with the focus on Cancel, Cancel sends nothing, Execute statement writes the node, and the node is deleted again, each checked over the lane's own FalkorDB connection. |
 | `browser/lane_sql.cjs` | SQL Explorer in the three browsers: connections listed (no graph nodes), each card's Edit reachable as a button (not inside the card's own button), a query through the shared runner. |
 | `browser/lane_a11y.cjs` | Themes, reduced motion, WCAG text contrast on the landing, canvas, Table view and inspector, and relationship-stroke contrast on the drawn graph. |
@@ -60,7 +61,14 @@ every run, so no cached bundle masks the served build.
 
 ### 2. Database containers
 
-Local-only throwaway values, published on 127.0.0.1 only:
+The same images CI starts (`.github/workflows/_build.yaml`; Neo4j and FalkorDB
+pinned by digest), with local-only throwaway values, published on 127.0.0.1
+only. Use exactly these: the node suites compare the graph tools' output with
+captures taken on these servers, including the server version and its own
+error text, so a newer image fails them for a reason that is not in the code.
+`validate_all.sh` checks the versions first (its `db-versions` step, which runs
+`check_db_versions.py`), and `selftest/` checks that these images are still the
+ones CI runs.
 
 ```bash
 docker run -d --name gx-age -p 127.0.0.1:55433:5432 \
@@ -71,8 +79,9 @@ docker run -d --name gx-pgvector -p 127.0.0.1:55432:5432 \
   pgvector/pgvector:0.8.0-pg16
 docker run -d --name gx-neo4j -p 127.0.0.1:57687:7687 -p 127.0.0.1:57474:7474 \
   -e NEO4J_AUTH=neo4j/gxlocal-test-pass -e NEO4J_server_memory_heap_max__size=512m \
-  neo4j:5.26-community
-docker run -d --name gx-falkordb -p 127.0.0.1:56379:6379 falkordb/falkordb:latest
+  neo4j:5.26-community@sha256:d9cfe82983d27f5a75b3aaae8f316d04f9a698a3b7f6103a508f7caf8362f255
+docker run -d --name gx-falkordb -p 127.0.0.1:56379:6379 \
+  falkordb/falkordb@sha256:e2765e207e5ba4ee90e47ed31eb7491ad6dd3d42241c326e429375c02ad9882f
 
 # The AGE image creates the extension in rrtenant on first start; this is a no-op then.
 docker exec gx-age psql -U rruser -d rrtenant -c 'CREATE EXTENSION IF NOT EXISTS age'
@@ -258,23 +267,31 @@ node $ACC/demo/take_shots.cjs "$OUT_DIR/shots"
 ## Self-tests
 
 The harness's own verdict logic has small tests that need no engine, database
-or browser: stand-ins replace the SDK, the Neo4j driver and Playwright. They
-check that `validate_all.sh` reports a failed step in its exit status, that the
-lifecycle restart rows, the Graph Explorer Ask and Escape steps, and the
-`lane_a11y.cjs` contrast, stroke and reduced-motion rows cannot pass without
-observing what they name, and that the Neo4j clean-up stays inside `RUN_LABEL`.
-The browser self-tests run the real lane against a stand-in Playwright
-(`selftest/stand_in.cjs`) that models an empty page, or a page the test
-describes: the SQL Explorer card check fails when a card's Edit sits inside the
-card's own button, and the Graph Explorer drawer check fails when only the
-landing behind the drawer names the engine, or the drawer names another one;
-the line-number probe never measures against an editor background that is still
-transparent; and the write console steps fail when they saw no WebSocket traffic
-and could not read the database. `selftest/test_harness.py` also checks that
-`start_fixtures.py` starts every fixture the lanes open and that the write
-console's fixture is the only graph fixture that can write, and
-`selftest/falkordb_resp.test.cjs` runs the lanes' FalkorDB client against a
-stand-in server.
+or browser: stand-ins replace the SDK, the database drivers, the builder and
+Playwright. The browser self-tests run the real lane against a stand-in
+Playwright (`selftest/stand_in.cjs`) that models an empty page, or a page the
+test describes. They check that:
+
+- `validate_all.sh` reports a failed step in its exit status, and checks the
+  database versions (`db-versions`) before the node suites;
+- `check_db_versions.py` takes the expected versions from the committed
+  captures and fails on another version or edition, or an unreachable server;
+- the database images in this README are the ones `_build.yaml` starts;
+- the lifecycle restart rows, the Graph Explorer Ask and Escape steps, and the
+  `lane_a11y.cjs` contrast, stroke and reduced-motion rows cannot pass without
+  observing what they name;
+- the SQL Explorer card check fails when a card's Edit sits inside the card's
+  own button, and the Graph Explorer drawer check fails when only the landing
+  behind the drawer names the engine, or the drawer names another one;
+- the line-number probe never measures against an editor background that is
+  still transparent;
+- the write console steps fail when they saw no WebSocket traffic and could not
+  read the database; `start_fixtures.py` starts every fixture the lanes open,
+  and the write console's fixture is the only graph fixture that can write;
+  the lanes' FalkorDB client (`falkordb_resp.cjs`) reads replies correctly
+  (against a stand-in server);
+- the Neo4j clean-up stays inside `RUN_LABEL`.
+
 Run them after changing a script here:
 
 ```bash
