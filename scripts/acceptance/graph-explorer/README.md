@@ -32,7 +32,7 @@ secret. Never point them at a database that holds data you care about.
 | `browser/lane_graph.cjs` | Graph Explorer in Chrome, Firefox and WebKit: connections, drawer, editor run, canvas, Table/Raw tabs, inspector open and Escape, Expand, schema Refresh, History, write refusal, Ask without an LLM. |
 | `browser/lane_sql.cjs` | SQL Explorer in the three browsers: connections listed (no graph nodes), each card's Edit reachable as a button (not inside the card's own button), a query through the shared runner. |
 | `browser/lane_a11y.cjs` | Themes, reduced motion, WCAG text contrast on the landing, canvas, Table view and inspector, and relationship-stroke contrast on the drawn graph. |
-| `browser/probe_linenumbers.cjs` | Editor line-number colour and contrast in both themes, both apps. |
+| `browser/probe_linenumbers.cjs` | Editor line-number colour and contrast in both themes, both apps, measured once the editor background is painted (a read before that is transparent and fails rather than being measured). |
 | `browser/lane_perf.cjs`, `browser/gen_perf.py` | Canvas performance on a seeded FalkorDB graph (first draw, pan and drag frame times, long tasks, Expand round trips), Chrome with CPU throttling. |
 | `demo/seed_demo.sh`, `demo/start_demo.py`, `demo/take_shots.cjs` | A small fictional dataset, demo pipelines and the product screenshots. |
 | `local_env.py`, `env.cjs` | Settings shared by the Python and Node scripts, read from the environment. |
@@ -250,7 +250,9 @@ The browser self-tests run the real lane against a stand-in Playwright
 (`selftest/stand_in.cjs`) that models an empty page, or a page the test
 describes: the SQL Explorer card check fails when a card's Edit sits inside the
 card's own button, and the Graph Explorer drawer check fails when only the
-landing behind the drawer names the engine, or the drawer names another one.
+landing behind the drawer names the engine, or the drawer names another one;
+the line-number probe never measures against an editor background that is still
+transparent.
 Run them after changing a script here:
 
 ```bash

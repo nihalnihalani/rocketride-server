@@ -18,9 +18,9 @@
  *   aria      what every ariaSnapshot() returns
  *   visible   what every isVisible() returns
  *   count     what every count() returns
- *   evaluate  { <name of the in-page function>: what it returns }
- *   sequence  { <name of the in-page function>: [first call, second call, ...] }
- *             (the last answer repeats)
+ *   evaluate  { <key>: what the in-page function returns }
+ *   sequence  { <key>: [first call, second call, ...] } (the last answer repeats)
+ *             A key is the in-page function's name, or text in its source.
  * The lane is also run with FALKORDB_PORT=9 (nothing listens there), so a step
  * that checks the database over its own connection observes nothing.
  */
@@ -44,15 +44,18 @@ function emptyPage(fn, arg) {
 	if (src.includes('line-numbers')) return [];
 	return '';
 }
-// What it returns on the described page.
+// What it returns on the described page. A key names the in-page function, or is text in its source.
 function described(fn, arg) {
-	const name = fn.name;
-	if (PAGE.sequence && Array.isArray(PAGE.sequence[name])) {
-		const answers = PAGE.sequence[name];
-		const n = calls[name] = (calls[name] || 0) + 1;
+	const src = String(fn);
+	const matches = (key) => key === fn.name || src.includes(key);
+	const seq = Object.keys(PAGE.sequence || {}).find(matches);
+	if (seq !== undefined) {
+		const answers = PAGE.sequence[seq];
+		const n = (calls[seq] = (calls[seq] || 0) + 1);
 		return answers[Math.min(n, answers.length) - 1];
 	}
-	if (PAGE.evaluate && Object.prototype.hasOwnProperty.call(PAGE.evaluate, name)) return PAGE.evaluate[name];
+	const one = Object.keys(PAGE.evaluate || {}).find(matches);
+	if (one !== undefined) return PAGE.evaluate[one];
 	return emptyPage(fn, arg);
 }
 // Every other call returns this object; nothing is visible and every text is empty, unless the page says otherwise.

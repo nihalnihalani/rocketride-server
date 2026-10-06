@@ -32,6 +32,16 @@ const lum = (c) => { const f = (v) => { v /= 255; return v <= 0.03928 ? v / 12.9
 const ratio = (a, b) => { const x = lum(a), y = lum(b); return +((Math.max(x, y) + 0.05) / (Math.min(x, y) + 0.05)).toFixed(2); };
 const nums = (s) => (/rgba?\(([^)]+)\)/.exec(s) || ['', '0,0,0'])[1].split(/[\s,]+/).map(Number);
 
+// An rgb() colour, or an rgba() one with alpha 1. Monaco paints the editor background
+// after its line numbers can already be read; until then the background reads as
+// transparent (rgba(0, 0, 0, 0)), and a ratio against it is no measurement.
+const opaque = (c) => {
+	const m = /^rgba?\(([^)]+)\)$/.exec(String(c || '').trim());
+	if (!m) return false;
+	const parts = m[1].split(/[\s,/]+/).filter(Boolean).map(Number);
+	return parts.length === 3 || (parts.length === 4 && parts[3] === 1);
+};
+
 async function lineNumbers(page) {
 	return page.evaluate(() => {
 		const ed = [...document.querySelectorAll('.monaco-editor')].find((e) => e.getBoundingClientRect().width > 0);
@@ -39,6 +49,18 @@ async function lineNumbers(page) {
 		const bg = getComputedStyle(ed.querySelector('.margin') || ed).backgroundColor;
 		return { bg, numbers: [...ed.querySelectorAll('.line-numbers')].map((e) => ({ text: e.textContent.trim(), color: getComputedStyle(e).color, active: e.classList.contains('active-line-number') })) };
 	});
+}
+
+// Read the line numbers once the editor background is painted (opaque), for up to 10 s;
+// the last read is returned either way, and checkNums fails it when it is not.
+async function paintedLineNumbers(page) {
+	let info = null;
+	for (let attempt = 0; attempt < 40; attempt++) {
+		info = await lineNumbers(page);
+		if (info && opaque(info.bg) && Array.isArray(info.numbers) && info.numbers.length >= 2) return info;
+		await page.waitForTimeout(250);
+	}
+	return info;
 }
 
 async function twoLines(page, a, b) {
@@ -76,7 +98,7 @@ async function run(bname, launcher, opts, theme, app) {
 			await page.getByText(E.FIXTURES.sqlWrite).first().click();
 			await page.getByRole('button', { name: 'New Query' }).click();
 			await twoLines(page, 'select 1', 'from generate_series(1, 2)');
-			const sql = await lineNumbers(page);
+			const sql = await paintedLineNumbers(page);
 			await page.screenshot({ path: path.join(out, `ln-${bname}-${tag}-sql.png`) });
 			checkNums(bname, `SQL Explorer ${tag}`, sql);
 		} else {
@@ -84,7 +106,7 @@ async function run(bname, launcher, opts, theme, app) {
 			await page.getByText(E.FIXTURES.falkordb).first().click();
 			await page.getByRole('button', { name: 'Open workbench' }).click();
 			await twoLines(page, 'MATCH (n)', 'RETURN n LIMIT 5');
-			const graph = await lineNumbers(page);
+			const graph = await paintedLineNumbers(page);
 			await page.screenshot({ path: path.join(out, `ln-${bname}-${tag}-graph.png`) });
 			checkNums(bname, `Graph Explorer ${tag}`, graph);
 		}
@@ -96,7 +118,8 @@ async function run(bname, launcher, opts, theme, app) {
 }
 
 function checkNums(bname, label, info) {
-	if (!info || info.numbers.length < 2) return rec(bname, `${label}: two line numbers drawn`, false, info);
+	if (!info || !Array.isArray(info.numbers) || info.numbers.length < 2) return rec(bname, `${label}: two line numbers drawn`, false, info);
+	if (!opaque(info.bg)) return rec(bname, `${label}: editor background painted (opaque) before measuring`, false, { bg: info.bg });
 	const bg = nums(info.bg);
 	for (const n of info.numbers) {
 		const c = nums(n.color);
