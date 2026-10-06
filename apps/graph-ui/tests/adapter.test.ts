@@ -12,11 +12,14 @@
 // =============================================================================
 
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
 import { describe, it } from 'node:test';
 import { ExplorerToolError, probeInfo } from 'shared/explorer';
 import { codedError, fakeWorld, manualClock, row } from 'shared/explorer/connect/testing';
 import type { IFakeRow, IToolCall } from 'shared/explorer/connect/testing';
-import { GRAPH_PROVIDERS, TOOL, makeGraphEndpointStore, makeGraphHistory, makeGraphTools, patternChecks } from '../src/adapters/explorer';
+import * as explorerAdapter from '../src/adapters/explorer';
+import { GRAPH_PROVIDERS, TOOL, makeGraphEndpointStore, makeGraphHistory, makeGraphTools } from '../src/adapters/explorer';
 import { parseDialect, supportsReadQuery } from '../src/graph/dialect';
 import { fixture, readQueryFixture } from './support/builders';
 
@@ -203,13 +206,15 @@ describe('history and flags', () => {
 		detach();
 	});
 
-	it('the pattern-check flag is per connection under graph.patternChecks and defaults on', () => {
-		const p = prefs();
-		assert.equal(patternChecks.read(p.accessor, 'a'), true);
-		patternChecks.write(p.accessor, 'a', false);
-		assert.deepEqual(p.bag['graph.patternChecks'], { a: false });
-		assert.equal(patternChecks.read(p.accessor, 'a'), false);
-		assert.equal(patternChecks.read(p.accessor, 'b'), true);
-		assert.ok(!('sql.patternChecks' in p.bag));
+	// GX-T1-07: a `graph.patternChecks` flag store was exported, tested and documented, but nothing read or wrote it.
+	// The write console always confirms what the text check flags and the README promises no "do not ask again", so
+	// Graph Explorer keeps no such switch: a later change cannot wire one to turn the confirmation off by accident.
+	it('keeps no pattern-check switch: nothing in the app stores or reads graph.patternChecks', () => {
+		assert.ok(!('patternChecks' in explorerAdapter), 'the adapter exports no pattern-check flag store');
+		const src = path.resolve(__dirname, '..', 'src');
+		const files = (dir: string): string[] => fs.readdirSync(dir, { withFileTypes: true }).flatMap((e) => (e.isDirectory() ? files(path.join(dir, e.name)) : /\.tsx?$/.test(e.name) ? [path.join(dir, e.name)] : []));
+		const all = files(src);
+		assert.ok(all.length > 20, 'the source tree was read');
+		for (const file of all) assert.doesNotMatch(fs.readFileSync(file, 'utf8'), /patternChecks/, path.relative(src, file));
 	});
 });

@@ -46,10 +46,11 @@
 //   - Only `read_query`, `get_schema`, `refresh_schema`, `dialect` and `get_query`
 //     are idempotent (a lost TASK_STOPPED may be retried once for them).
 //     `execute` never is, so it is never replayed.
-//   - History lives under graph.history / graph.historyRecording /
-//     graph.patternChecks, persisted text field `cypher`; SQL's keys and
-//     `sql` field are untouched. Tokens never enter an entry: an entry holds
-//     only the statement text, timings, counts, an outcome and the user's note.
+//   - History lives under graph.history / graph.historyRecording, persisted
+//     text field `cypher`; SQL's keys and `sql` field are untouched. Tokens
+//     never enter an entry: an entry holds only the statement text, timings,
+//     counts, an outcome and the user's note. There is no pattern-check switch:
+//     the write console always confirms what the text check flags.
 //
 // The stores are created once, at module level, and are per-app instances: the
 // shared library holds no state of its own.
@@ -63,7 +64,6 @@ import {
 	checkRowEnvelope,
 	createActiveKeyStore,
 	createAnnouncer,
-	createConnectionFlags,
 	createEndpointStore,
 	createHistoryStore,
 	createLiveRegion,
@@ -149,9 +149,6 @@ export function makeGraphHistory(persistDelayMs?: number): IHistoryStore<'cypher
 
 /** Graph history: `graph.history` / `graph.historyRecording`, entry text field `cypher`. */
 export const graphHistory: IHistoryStore<'cypher'> = makeGraphHistory();
-
-/** The per-connection pattern-check switch (`graph.patternChecks`, on by default). */
-export const patternChecks = createConnectionFlags({ prefKey: 'graph.patternChecks', defaultValue: true });
 
 /** Per-connection caption choices and similar view state live in their own bag. */
 export const CAPTIONS_PREF_KEY = 'graph.captions';
