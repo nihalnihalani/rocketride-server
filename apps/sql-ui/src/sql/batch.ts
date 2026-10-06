@@ -240,6 +240,38 @@ function mayLimitByGroup(dialect: SqlDialect): boolean {
 }
 
 /**
+ * ClickHouse's trailing `SETTINGS name = value, ...` and `FORMAT Name`
+ * clauses, matched on masked text sliced at a depth-0 `settings`/`format`
+ * site. ClickHouse orders them after every LIMIT (`... LIMIT n SETTINGS ...
+ * FORMAT ...`) and rejects a LIMIT that follows either. `FORMAT` must also be
+ * the statement's last clause, so a column or alias named `format` or
+ * `settings` (`SELECT format FROM t`, `WHERE settings = 1`) never matches.
+ */
+const SETTINGS_CLAUSE_HEAD = /^settings\s+[a-z_][\w]*\s*=/i;
+const FORMAT_CLAUSE = /^format\s+[a-z_][\w]*\s*;?\s*$/i;
+
+/**
+ * Where a trailing ClickHouse `SETTINGS` or `FORMAT` clause starts (the first
+ * of them when both are present), or -1. Only on a dialect that may be
+ * ClickHouse (see {@link mayLimitByGroup}); neither clause parses on
+ * PostgreSQL or MySQL.
+ *
+ * @param sql - The statement.
+ * @param dialect - The engine dialect.
+ * @returns The clause's start index, or -1.
+ */
+function trailingClickHouseClauseAt(sql: string, dialect: SqlDialect): number {
+	if (!mayLimitByGroup(dialect)) return -1;
+	const masked = codeOnly(sql, dialect);
+	for (const site of keywordSites(sql, ['settings', 'format'], dialect)) {
+		if (site.depth !== 0) continue;
+		const rest = masked.slice(site.index);
+		if (site.keyword === 'settings' ? SETTINGS_CLAUSE_HEAD.test(rest) : FORMAT_CLAUSE.test(rest)) return site.index;
+	}
+	return -1;
+}
+
+/**
  * Where the statement's own outermost row-limit clause starts — `LIMIT` or
  * the SQL standard's `FETCH { FIRST | NEXT } ... ONLY` — or -1 when it has
  * none. Either spelling shares `LIMIT`'s grammar slot, so a statement bounded
@@ -403,6 +435,14 @@ export function applyRowLimit(sql: string, limit: string, dialect: SqlDialect = 
 		// the line would revive it. Such a statement goes out untouched.
 		if (hashCommentPrecedesClause(sql, lockingAt, dialect)) return { sql, limit: null, state: 'none' };
 		return { sql: `${sql.slice(0, lockingAt).trimEnd()}\nLIMIT ${value}\n${sql.slice(lockingAt)}`, limit: value, state: 'applied' };
+	}
+	// ClickHouse's SETTINGS and FORMAT clauses come after every LIMIT, so the
+	// header's limit goes in front of the first of them, the same way it goes in
+	// front of a locking clause. A LIMIT appended after either does not parse.
+	const trailingAt = trailingClickHouseClauseAt(sql, dialect);
+	if (trailingAt >= 0) {
+		if (hashCommentPrecedesClause(sql, trailingAt, dialect)) return { sql, limit: null, state: 'none' };
+		return { sql: `${sql.slice(0, trailingAt).trimEnd()}\nLIMIT ${value}\n${sql.slice(trailingAt)}`, limit: value, state: 'applied' };
 	}
 	// The clause is joined with a NEWLINE, not a space: the checks above run on
 	// comment-stripped text but the statement is sent RAW, so appending after a

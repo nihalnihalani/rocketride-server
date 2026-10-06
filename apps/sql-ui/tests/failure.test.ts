@@ -907,3 +907,53 @@ describe('applyRowLimit — ClickHouse LIMIT n BY caps rows per group, not the r
 		assert.equal(applyRowLimit('SELECT * FROM events LIMIT 1 BY user_id', '200', 'mysql').state, 'in-statement');
 	});
 });
+
+// ClickHouse ends a SELECT with SETTINGS and then FORMAT, after every LIMIT. A
+// LIMIT appended after either does not parse ("Syntax error ... LIMIT"), so the
+// header's limit goes in front of the first of them.
+describe('applyRowLimit — ClickHouse trailing SETTINGS and FORMAT clauses', () => {
+	it('inserts the header limit before SETTINGS, after a LIMIT ... BY too', () => {
+		assert.deepEqual(applyRowLimit('SELECT * FROM events LIMIT 1 BY user_id SETTINGS max_threads = 4', '200', 'clickhouse'), {
+			sql: 'SELECT * FROM events LIMIT 1 BY user_id\nLIMIT 200\nSETTINGS max_threads = 4',
+			limit: 200,
+			state: 'applied',
+		});
+		assert.equal(
+			applyRowLimit('SELECT * FROM events SETTINGS max_threads = 4, max_block_size = 1000;', '1000', 'clickhouse').sql,
+			'SELECT * FROM events\nLIMIT 1000\nSETTINGS max_threads = 4, max_block_size = 1000;',
+		);
+	});
+
+	it('inserts it before FORMAT, and before SETTINGS when both are present', () => {
+		assert.equal(applyRowLimit('SELECT * FROM events FORMAT JSONEachRow', '200', 'clickhouse').sql, 'SELECT * FROM events\nLIMIT 200\nFORMAT JSONEachRow');
+		assert.equal(
+			applyRowLimit('SELECT * FROM events LIMIT 1 BY user_id SETTINGS max_threads = 4 FORMAT CSV', '200', 'clickhouse').sql,
+			'SELECT * FROM events LIMIT 1 BY user_id\nLIMIT 200\nSETTINGS max_threads = 4 FORMAT CSV',
+		);
+	});
+
+	it('does the same when the dialect could not be probed', () => {
+		assert.equal(applyRowLimit('SELECT * FROM events FORMAT JSON', '200', 'unknown').sql, 'SELECT * FROM events\nLIMIT 200\nFORMAT JSON');
+	});
+
+	it('leaves a statement whose own LIMIT precedes SETTINGS alone', () => {
+		assert.deepEqual(applyRowLimit('SELECT * FROM events LIMIT 10 SETTINGS max_threads = 4', '200', 'clickhouse'), {
+			sql: 'SELECT * FROM events LIMIT 10 SETTINGS max_threads = 4',
+			limit: null,
+			state: 'in-statement',
+		});
+	});
+
+	it('does not mistake a column, a string or a comment named format or settings for the clause', () => {
+		assert.equal(applyRowLimit('SELECT format FROM t', '200', 'clickhouse').sql, 'SELECT format FROM t\nLIMIT 200');
+		assert.equal(applyRowLimit('SELECT a FROM t ORDER BY format', '200', 'clickhouse').sql, 'SELECT a FROM t ORDER BY format\nLIMIT 200');
+		assert.equal(applyRowLimit('SELECT a FROM t WHERE settings = 1', '200', 'clickhouse').sql, 'SELECT a FROM t WHERE settings = 1\nLIMIT 200');
+		assert.equal(applyRowLimit("SELECT 'FORMAT CSV' AS f FROM t", '200', 'clickhouse').sql, "SELECT 'FORMAT CSV' AS f FROM t\nLIMIT 200");
+		assert.equal(applyRowLimit('SELECT (SELECT 1 FORMAT CSV) AS f FROM t', '200', 'clickhouse').sql, 'SELECT (SELECT 1 FORMAT CSV) AS f FROM t\nLIMIT 200');
+	});
+
+	it('leaves PostgreSQL and MySQL statements as before', () => {
+		assert.equal(applyRowLimit('SELECT * FROM events', '200', 'postgres').sql, 'SELECT * FROM events\nLIMIT 200');
+		assert.equal(applyRowLimit('SELECT format FROM t', '200', 'mysql').sql, 'SELECT format FROM t\nLIMIT 200');
+	});
+});
