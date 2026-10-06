@@ -31,7 +31,7 @@ import { graphEndpoints } from '../adapters/explorer';
 import { useGraphEndpoints } from '../adapters/react';
 import ConnectionDrawer from '../components/ConnectionDrawer';
 import { getDocs } from '../docs';
-import { connectionView, landingView } from '../graph/connections';
+import { connectionView, drawerKeyAfter, landingView } from '../graph/connections';
 import { workbenchUri } from '../graph/addresses';
 import { GraphIcon } from '../icons';
 import { styles } from '../styles';
@@ -51,6 +51,12 @@ export const ConnectionsView: React.FC = () => {
 	useEffect(() => {
 		if (client && isConnected && status === 'idle') void graphEndpoints.refresh(client);
 	}, [client, isConnected, status]);
+
+	// A sign-out or a change of identity resets the store: the drawer closes with the connections it forgot.
+	useEffect(() => {
+		const next = drawerKeyAfter(drawerKey, endpoints);
+		if (next !== drawerKey) setDrawerKey(next);
+	}, [drawerKey, endpoints]);
 
 	const open = (endpoint: IExplorerEndpoint): void => {
 		getDocs()?.openStaticDocument(workbenchUri(endpoint.key), endpoint.nodeName || 'Graph', { endpoint });

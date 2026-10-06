@@ -195,3 +195,10 @@ test('the connection drawer starts fresh for every card, and words its Test resu
 	const drawer = code(read('components', 'ConnectionDrawer.tsx'));
 	assert.ok(/setTested\(testResultText\(result\)\)/.test(drawer), 'a missing result is not read as a failed probe');
 });
+
+// A store reset (sign-out, change of identity) left the drawer open on its key, so it could reopen by itself with the
+// previous identity's Test result once discovery listed the same key again.
+test('the connection drawer closes when the store forgets its card', () => {
+	const view = code(read('views', 'ConnectionsView.tsx'));
+	assert.ok(/useEffect\(\(\) => \{\s*const next = drawerKeyAfter\(drawerKey, endpoints\);\s*if \(next !== drawerKey\) setDrawerKey\(next\);\s*\}, \[drawerKey, endpoints\]\);/.test(view), 'an effect drops a key the store no longer lists');
+});

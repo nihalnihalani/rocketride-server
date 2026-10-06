@@ -205,6 +205,20 @@ export function testResultText(result: IProbeResult | null): ITestResult {
 	return { variant: 'error', text: 'The node did not answer its identity probe. The details are on its card.' };
 }
 
+/**
+ * The card the connection drawer shows after the endpoint list changed. The store keeps a node that stopped listed
+ * (as stopped), so a key disappears only when the store was reset: a sign-out or a change of user, organization or
+ * team. The drawer then closes, so the previous identity's Test result cannot reappear when discovery under the new
+ * identity lists the same key.
+ *
+ * @param drawerKey - The key the drawer shows, or null when it is closed.
+ * @param endpoints - Every endpoint the store lists.
+ * @returns The same key while it is listed, otherwise null.
+ */
+export function drawerKeyAfter(drawerKey: string | null, endpoints: readonly IExplorerEndpoint[]): string | null {
+	return drawerKey !== null && endpoints.some((e) => e.key === drawerKey) ? drawerKey : null;
+}
+
 // =============================================================================
 // AN OPEN DOCUMENT WHOSE CONNECTION IS CHECKED AGAIN
 // =============================================================================

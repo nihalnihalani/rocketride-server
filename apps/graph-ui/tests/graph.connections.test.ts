@@ -12,7 +12,7 @@ import { test } from 'node:test';
 import type { IExplorerEndpoint, IProbeResult } from 'shared/explorer';
 import { fakeWorld, manualClock, row } from 'shared/explorer/connect/testing';
 import { makeGraphEndpointStore } from '../src/adapters/explorer';
-import { RECHECKING_TEXT, connectionView, emptyState, landingView, ownerText, surfaceGate, testResultText } from '../src/graph/connections';
+import { RECHECKING_TEXT, connectionView, drawerKeyAfter, emptyState, landingView, ownerText, surfaceGate, testResultText } from '../src/graph/connections';
 import { fixture } from './support/builders';
 
 function endpoint(over: Partial<IExplorerEndpoint> = {}): IExplorerEndpoint {
@@ -226,4 +226,30 @@ test('Test connection says "not tested" when nothing was sent, never that the no
 	const failedProbe = testResultText(failed('connection refused'));
 	assert.equal(failedProbe.variant, 'error');
 	assert.match(failedProbe.text, /did not answer its identity probe/);
+});
+
+// A sign-out or a change of user, organization or team resets the endpoint store. The connection drawer stayed open
+// on its key, so when discovery under the new identity listed the same key it reappeared on its own, still showing
+// the previous identity's Test result.
+test('the connection drawer keeps its card while the store lists it and closes once the store forgets it', async () => {
+	assert.equal(drawerKeyAfter(null, [endpoint()]), null);
+	assert.equal(drawerKeyAfter(endpoint().key, [endpoint()]), endpoint().key);
+	assert.equal(drawerKeyAfter(endpoint().key, [endpoint({ key: 'other' })]), null);
+	assert.equal(drawerKeyAfter(endpoint().key, []), null);
+
+	const world = fakeWorld([row({ pipeline: { project_id: 'proj-g', name: 'Graph pipeline', components: [{ id: 'graph_1', provider: 'graph_neo4j', name: 'Graph' }] } })], (call) => (call.tool === 'dialect' ? fixture<Record<string, unknown>>('dialect_neo4j') : {}));
+	const clock = manualClock();
+	const store = makeGraphEndpointStore({ clock });
+	await store.refresh(world.client);
+	await clock.settle();
+	const key = store.getState().endpoints[0]?.key ?? null;
+	assert.ok(key, 'discovery found the node');
+
+	world.rows = [];
+	await store.refresh(world.client);
+	await clock.settle();
+	assert.equal(drawerKeyAfter(key, store.getState().endpoints), key, 'a node that stopped stays listed, so its drawer stays open');
+
+	store.reset();
+	assert.equal(drawerKeyAfter(key, store.getState().endpoints), null, 'a reset forgets every connection, so the drawer closes');
 });
