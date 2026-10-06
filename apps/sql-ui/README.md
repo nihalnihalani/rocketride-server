@@ -41,9 +41,12 @@ The Connections page lists every database tool node in every running
 pipeline task you can see, in one call, however many there are. Your own
 development run and a team's deployment of the same pipeline are separate
 connections (a deployment's card says so), and two owners' runs never merge.
-Each card shows the pipeline, the engine and a state, and selecting one opens
-a drawer where you can probe the endpoint before binding to it. An empty list
-means no running task has a database node.
+Each card shows the pipeline, the engine and a state. Selecting a card opens
+its workbench straight away. To look before you open, use the card's
+**Edit** action (it appears on hover or keyboard focus) or the **New
+Connection** tile: both open a drawer that shows the endpoint, runs **Test
+Connection** on it, and opens it with **Open**. An empty list means no
+running task has a database node.
 
 A connection is **Checking** while the app asks the node which engine it is,
 **Running** once it answered, **Stopped** when its pipeline is no longer

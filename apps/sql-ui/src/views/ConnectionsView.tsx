@@ -89,8 +89,9 @@ function openConnection(endpoint: ISqlEndpoint): void {
 
 /**
  * Landing view: every database tool node discovered in the caller's running
- * pipelines, as connection cards. Clicking a card (or the add tile) opens the
- * record drawer to inspect and probe the endpoint.
+ * pipelines, as connection cards. Clicking a card opens its workbench; the
+ * card's Edit action and the add tile open the record drawer to inspect and
+ * probe the endpoint first.
  */
 export const ConnectionsView: React.FC = () => (
 	<ConnectionsLanding<ISqlEndpoint>
