@@ -22,6 +22,7 @@ node's own client connections instead.
 
 from __future__ import annotations
 
+import json
 import sys
 import threading
 import time
@@ -705,6 +706,90 @@ class TestReadQuery:
             out = inst.execute({'query': "CREATE (n:Person {name: 'dora'}) RETURN n", 'shape': 'graph'})
             assert out['rows'][0][0]['labels'] == ['Person'] and out['affected_rows'] == 1
             assert inst.read_query({'cypher': "MATCH (p:Person {name: 'dora'}) RETURN count(p)"})['rows'] == [[1]]
+        finally:
+            glb.endGlobal()
+
+
+# The statement Graph Explorer's Connect sends to Apache AGE
+# (apps/graph-ui/src/cypher/recipes.ts connectNodes, AGE_CONNECT_MAX_NODES):
+# no bound list compares with AGE ids exactly, so each id is its own parameter
+# in an OR chain. Through read_query that is one PREPARE whose agtype map holds
+# every id, an EXECUTE and a DEALLOCATE inside one transaction. This module
+# also runs through the transaction-mode pooler (DB_POOLER_SUITES in
+# nodes/scripts/tasks.js), where the three must stay on one server session.
+AGE_CONNECT_MAX_NODES = 40
+
+
+def _connect_recipe(ids, rows=2000):
+    """connectNodes() for AGE, text for text: the OR chain, i0..iN string ids, the LIMIT and the row limit."""
+
+    def either(v):
+        return '(' + ' OR '.join(f'id({v}) = toInteger($i{i})' for i in range(len(ids))) + ')'
+
+    return {
+        'cypher': f'MATCH (a)-[r]->(b) WHERE {either("a")} AND {either("b")} RETURN a, r, b LIMIT {rows}',
+        'params': {f'i{i}': node_id for i, node_id in enumerate(ids)},
+        'limit': rows,
+    }
+
+
+def _connected(inst, ids):
+    """(start, type, end) of every relationship Connect returns among ``ids``, and whether it was cut."""
+    out = inst.read_query(_connect_recipe(ids))
+    return {(row[1]['start'], row[1]['type'], row[1]['end']) for row in out['rows']}, out['truncated']
+
+
+class TestConnectRecipe:
+    def test_or_chain_over_the_most_bound_ids_connect_allows(self, rr_env, age_graph):
+        # 36 more nodes in a chain: with the seeded four, 40 nodes and 38 relationships among them.
+        _cypher_admin('UNWIND range(1, 36) AS i CREATE (:Link {i: i})')
+        _cypher_admin('MATCH (a:Link), (b:Link) WHERE b.i = a.i + 1 CREATE (a)-[:NEXT]->(b)')
+        glb = _begin(rr_env)
+        inst = _instance(rr_env, glb)
+        try:
+            ids = [row[0]['id'] for row in inst.read_query({'cypher': 'MATCH (n) RETURN n', 'limit': 100})['rows']]
+            assert len(ids) == AGE_CONNECT_MAX_NODES
+            expected = {
+                (r['start'], r['type'], r['end'])
+                for (r,) in inst.read_query({'cypher': 'MATCH ()-[r]->() RETURN r', 'limit': 100})['rows']
+            }
+            assert len(expected) == 38
+            recipe = _connect_recipe(ids)
+
+            # The shape that has to survive the pooler: PREPARE ... EXECUTE ... DEALLOCATE, one agtype map.
+            plan = glb._translate(recipe['cypher'], params=recipe['params'], limit=2001, mode=_age().TranslateMode.SAFE)
+            assert plan.prepared_name and plan.read_only
+            assert len(json.loads(plan.binds[plan.result_index][0])) == AGE_CONNECT_MAX_NODES
+
+            def connect():
+                return _connected(inst, ids)
+
+            pool = glb.pool
+            glb.pool = log = _StatementLog(pool)
+            try:
+                assert connect() == (expected, False)
+            finally:
+                glb.pool = pool
+            kinds = [s.split()[0] for s in log.statements]
+            assert kinds == ['SET', 'SET', 'SET', 'PREPARE', 'SAVEPOINT', 'EXECUTE', 'RELEASE', 'DEALLOCATE'], kinds
+
+            # Again, one after the other and side by side: each call prepares, runs and
+            # deallocates its own statement, so pooled server sessions never collect them.
+            for _ in range(3):
+                assert connect() == (expected, False)
+            results, errors = _run_threads({i: connect for i in range(8)})
+            assert not errors, errors
+            assert all(result == (expected, False) for result in results.values())
+            assert _on_pooled_session(glb, 'SELECT count(*) FROM pg_prepared_statements') == (0,)
+
+            # Two of the ids: only the relationship between them.
+            (knows,) = inst.read_query(
+                {'cypher': "MATCH (:Person {name: 'alice'})-[r:KNOWS]->(:Person {name: 'bob'}) RETURN r"}
+            )['rows'][0]
+            assert _connected(inst, [knows['start'], knows['end']]) == (
+                {(knows['start'], 'KNOWS', knows['end'])},
+                False,
+            )
         finally:
             glb.endGlobal()
 
