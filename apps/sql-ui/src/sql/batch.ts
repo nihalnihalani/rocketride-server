@@ -247,7 +247,7 @@ function mayLimitByGroup(dialect: SqlDialect): boolean {
  * the statement's last clause, so a column or alias named `format` or
  * `settings` (`SELECT format FROM t`, `WHERE settings = 1`) never matches.
  * Only a `;` and comments may follow the format name: `--` and block comments
- * are masked, but ClickHouse also reads `#` as a line comment, which the
+ * are masked, but ClickHouse can read `#` as a line comment, which the
  * scanner masks on MySQL alone, so an unmasked `# ...` is allowed there too.
  */
 const SETTINGS_CLAUSE_HEAD = /^settings\s+[a-z_][\w]*\s*=/i;

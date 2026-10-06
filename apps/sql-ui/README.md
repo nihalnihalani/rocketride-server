@@ -39,18 +39,21 @@ than from the app.
 
 The Connections page lists every database tool node in the running pipeline
 tasks you can see in the organization you are signed in to, in one call,
-however many there are. A run whose team is not one of that organization's
-teams is left out, so after you sign in to another organization or team the
-previous one's runs do not appear (a run from an older server that names no
-team is still listed). Your own
+however many there are. A run is listed when its team is any of the teams
+that organization lists for you, so after you sign in to another
+organization the previous one's runs do not appear.
+The filter lets two kinds through: a run that names no team (an older
+server sends none) is always listed, and when your sign-in carries no list
+of the organization's teams, every run is. Your own
 development run and a team's deployment of the same pipeline are separate
 connections (a deployment's card says so), and two owners' runs never merge.
 Each card shows the pipeline, the engine and a state. Selecting a card opens
 its workbench straight away. To look before you open, use the card's
 **Edit** action (it appears on hover or keyboard focus) or the **New
-Connection** tile: both open a drawer that shows the endpoint, runs **Test
-Connection** on it, and opens it with **Open**. An empty list means no
-running task has a database node.
+Connection** tile: both open a drawer that shows the endpoint, with a **Test
+Connection** button that probes it on demand and **Open** to open it. An
+empty list means no running task you can see in that organization has a
+database node.
 
 A connection is **Checking** while the app asks the node which engine it is,
 **Running** once it answered, **Stopped** when its pipeline is no longer
@@ -167,9 +170,10 @@ is stopping or restarting, the engine refuses a statement with
 `TASK_STOPPED` before the statement reaches the database, so nothing has run.
 A statement the app classifies as a read is then sent once more, after the
 same connection is running again; a write never is. The classification is by
-text: a `SELECT … INTO` counts as a write (see the row limit below), but a
-read that changes something through a function (`nextval` or another
-volatile function) counts as a read here. It is still never run twice,
+text: a `SELECT … INTO`, which fills a new table, a file or variables (see
+the row limit below), counts as a write and is never re-sent, but a read
+that changes something through a function (`nextval` or another volatile
+function) counts as a read here. It is still never run twice,
 because the refusal comes before the database sees it. A statement
 that reached the database is never re-sent, whatever happens to its answer.
 
@@ -196,9 +200,17 @@ so it is not read as the statement's own limit (on ClickHouse, and on a
 connection whose dialect could not be probed). On **200** or **1000** the
 header's `LIMIT` is appended after it, which ClickHouse accepts, and the line
 reads `limit 200`; with **All** it reads `no limit applied`. A plain `LIMIT`
-after the `BY` list is the statement's own limit, as anywhere else. ClickHouse
-puts its `SETTINGS` and `FORMAT` clauses after every `LIMIT`, so when a
-statement ends with them the header's `LIMIT` goes in front of the first one.
+after the `BY` list is the statement's own limit, as anywhere else.
+
+ClickHouse puts its `SETTINGS` and `FORMAT` clauses after every `LIMIT` and
+rejects a `LIMIT` that follows either, so on ClickHouse, and on a connection
+whose dialect could not be probed, a statement that ends in one or both gets
+the header's `LIMIT` inserted in front of the first of them, after any `LIMIT
+n BY`. A column, sort key or table named `format` or `settings` (`ORDER BY
+format DESC`, `FROM format f`) is not taken for either clause. As with a
+locking clause (below), one that sits behind a `#` on the same line is left
+alone and the line reads `no limit applied`: ClickHouse can read `#` as the
+start of a comment too.
 
 Read `no limit applied` literally, because **All** together with a `LIMIT`
 that is not on the outermost query produces exactly that line. Only a
@@ -563,6 +575,11 @@ statements ran either way; only the app's picture of the schema is behind.
   keeps the old appended placement: a locking clause trailed by the
   statement's own `OFFSET`, where the `LIMIT` is appended after `OFFSET`
   rather than inserted before the clause.
+- **The limit moves in front of ClickHouse's `SETTINGS` and `FORMAT`.** On
+  ClickHouse, and on a connection whose dialect could not be probed,
+  `SELECT … SETTINGS max_threads = 4` is sent as `SELECT …` / `LIMIT 200` /
+  `SETTINGS max_threads = 4`. Such a clause behind a `#` on the same line
+  keeps no limit (sent untouched).
 - **Duplicate column names collapse.** A projection that returns two columns
   with the same name shows one: the node hands back each row as an object
   keyed by column name, and the grid takes its headers from the first row.
