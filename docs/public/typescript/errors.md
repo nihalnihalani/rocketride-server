@@ -15,8 +15,8 @@ What the SDK throws, when, and how to catch it.
 | Transport loss and connection failures (including during login) | `ConnectionException` |
 | Data-pipe errors (open / write / close) | `PipeException` |
 | A login superseded, logged out, or detached mid-flight | `LoginAttemptCancelledError` |
-| A command the server rejects, through `call()`: `tool()`, `getTasks()`, `getTaskToken()`, `getTaskPipeline()` and the other methods that do not re-wrap errors | `DAPException` (an `Error`; `code` set when the server sent one) |
-| Argument errors, and server rejections in methods that re-wrap them (`use()`, `getService()`, `restart()`, `getTaskStatus()`) | plain `Error` |
+| A command the server rejects, through `call()`: `tool()`, `use()`, `getService()`, `getTasks()`, `getTaskToken()`, `getTaskPipeline()` and the other methods that do not re-wrap errors | `DAPException` (an `Error`; `code` set when the server sent one) |
+| Argument errors (such as `getService('')`), and server rejections in methods that re-wrap them: `terminate()`, `restart()`, `getTaskStatus()`, `validate()`, `ping()`, the deprecated `setEvents()`, and `fsRead()` / `fsReadMany()` (which bypass `call()`); `use()` when the server returns no task token | plain `Error` (no `code`) |
 | `sendFiles` with a non-positive `maxConcurrent` | `RangeError` |
 | `Answer.getJson()` on non-JSON content | throws |
 
@@ -93,7 +93,8 @@ try {
 
 A rejected `call()` keeps the server's message as `message` and its code as
 `code`, so a tool caller can tell a task that stopped before the call reached it
-(`TASK_STOPPED`) from a failure inside the tool (no code):
+(`TASK_STOPPED`) from a failure inside the tool or a call no node handled (no
+code):
 
 ```typescript
 try {

@@ -68,6 +68,9 @@ receives.
   `list_components`; `config` (object, optional) — the component's config
   block, omitted for pure defaults.
 - **Returns:** the resolved config the node would receive, plus `ok: true`.
+- **Requires:** `task.control` on your development team, the same rule as
+  running a pipeline. Without a development team selected in your profile, or
+  without that permission, the call fails.
 - **Notable:** keys the resolver discarded (for example a key written beside
   `profile` instead of inside it) are reported with a `hint` explaining where
   to move them — a silent drop a schema cannot express.

@@ -16,8 +16,8 @@ What the SDK raises, when, and how to catch it.
 | Data-pipe errors (open / write / close) | `PipeException` |
 | `use()` argument problems (neither `filepath` nor `pipeline`; both; bad types) | `ValueError` |
 | `use()` with a missing pipeline file | `FileNotFoundError` |
-| Server rejects a command through `call()`: `tool()`, `get_tasks()`, `get_task_pipeline()` and the other methods built on it | `CommandException` (a `RuntimeError`; `code` set when the server sent one) |
-| Server rejects a pipeline start or a request in a method that re-raises it | `RuntimeError` |
+| Server rejects a command through `call()`: `tool()`, `use()`, `terminate()`, `get_tasks()`, `get_task_pipeline()` and the other methods built on it | `CommandException` (a `RuntimeError`; `code` set when the server sent one) |
+| Server rejects a request in a method that re-raises it (`restart()`, `validate()`, `fs_read()`, `fs_read_many()`, pipe `tool()`), or `use()` gets no task token back | `RuntimeError` (no `code`) |
 | `get_service('')` / unknown service name | `ValueError` / `RuntimeError` |
 | `send_files` without an API key, or a missing file | `RuntimeError` / `ValueError` |
 | `Answer.getJson()` on non-JSON content | `ValueError` |
@@ -86,7 +86,8 @@ except PipeException as e:
 `except RuntimeError` catches pipe and command failures too. A rejected
 `client.call()` keeps the server's message as `str(e)` and its code as `e.code`,
 so a tool caller can tell a task that stopped before the call reached it
-(`TASK_STOPPED`) from a failure inside the tool (no code):
+(`TASK_STOPPED`) from a failure inside the tool or a call no node handled (no
+code):
 
 ```python
 from rocketride import CommandException
@@ -101,6 +102,6 @@ except CommandException as e:
 
 `ConnectionException`, `ExecutionException`, and `ValidationException` exist in
 `rocketride.core.exceptions` but the SDK does not currently raise them: transport
-failures surface as the builtin `ConnectionError`, and pipeline start and
-validation failures as the built-ins in the table above. Don't write handlers
-that rely on them.
+failures surface as the builtin `ConnectionError`, a rejected pipeline start as
+`CommandException`, and `validate()` failures as a plain `RuntimeError` (see the
+table above). Don't write handlers that rely on them.
