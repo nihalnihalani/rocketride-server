@@ -13,6 +13,7 @@ Run: python3 -m unittest discover -s scripts/acceptance/graph-explorer/selftest 
 """
 
 import importlib
+import json
 import os
 import shutil
 import subprocess
@@ -226,6 +227,84 @@ class Neo4jCleanupScope(unittest.TestCase):
     def test_other_engines_keep_their_own_graph(self):
         probes = self.ga.write_probes('falkordb') + [self.ga.execute_probe('age')]
         self.assertNotIn(f':{self.ga.RUN}', ' '.join(probes))
+
+
+class FixturePipelines(unittest.TestCase):
+    """start_fixtures.py starts what the browser lanes open, and only the write console's fixture may write."""
+
+    GRAPH_PROVIDERS = ('rocketride_graph', 'graph_neo4j', 'graph_falkordb')
+
+    @classmethod
+    def setUpClass(cls):
+        sdk = types.ModuleType('rocketride')
+        sdk.RocketRideClient = object
+        cls._saved = {name: sys.modules.get(name) for name in ('rocketride', 'start_fixtures', 'falkordb')}
+        sys.modules['rocketride'] = sdk
+        sys.modules.pop('start_fixtures', None)
+        sys.path.insert(0, str(ACC))
+        cls.sf = importlib.import_module('start_fixtures')
+        # The display names the Node lanes look for (env.cjs FIXTURES).
+        script = 'process.stdout.write(JSON.stringify(require(process.argv[1]).FIXTURES))'
+        out = subprocess.run(['node', '-e', script, str(ACC / 'env.cjs')], capture_output=True, text=True, check=True)
+        cls.lane_names = json.loads(out.stdout)
+
+    @classmethod
+    def tearDownClass(cls):
+        sys.path.remove(str(ACC))
+        for name, module in cls._saved.items():
+            if module is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = module
+
+    def test_every_fixture_a_lane_opens_is_started(self):
+        started = {fixture[0] for fixture in self.sf.FIXTURES}
+        self.assertEqual(sorted(set(self.lane_names.values()) - started), [])
+
+    def test_only_the_write_console_fixture_can_write_to_a_graph(self):
+        graphs = [f for f in self.sf.FIXTURES if f[2] in self.GRAPH_PROVIDERS]
+        writable = [f for f in graphs if f[3].get('allow_execute')]
+        self.assertEqual([f[0] for f in writable], [self.lane_names.get('falkordbWrite')])
+        _, _, provider, cfg = writable[0]
+        self.assertEqual(provider, 'graph_falkordb')
+        self.assertEqual(cfg['graph'], self.sf.E.WRITE_GRAPH)
+        E = self.sf.E
+        self.assertNotIn(cfg['graph'], {E.ACCEPT_GRAPH, E.PERF_GRAPH, E.DEMO_GRAPH})
+
+    def _fake_falkordb(self, graphs):
+        queries = []
+
+        class _Graph:
+            def __init__(self, name):
+                self.name = name
+
+            def query(self, cypher):
+                queries.append((self.name, cypher))
+
+        class _FalkorDB:
+            def __init__(self, host=None, port=None):
+                pass
+
+            def list_graphs(self):
+                return list(graphs)
+
+            def select_graph(self, name):
+                return _Graph(name)
+
+        module = types.ModuleType('falkordb')
+        module.FalkorDB = _FalkorDB
+        sys.modules['falkordb'] = module
+        return queries
+
+    def test_write_graph_is_created_empty_when_missing(self):
+        queries = self._fake_falkordb(graphs=['gx_accept'])
+        self.sf.ensure_write_graph()
+        self.assertEqual(queries, [(self.sf.E.WRITE_GRAPH, 'CREATE (n) DELETE n')])
+
+    def test_existing_write_graph_is_left_unchanged(self):
+        queries = self._fake_falkordb(graphs=['gx_accept', self.sf.E.WRITE_GRAPH])
+        self.sf.ensure_write_graph()
+        self.assertEqual(queries, [])
 
 
 if __name__ == '__main__':

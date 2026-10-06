@@ -24,6 +24,8 @@ const CLIENT_TS_DIR = env.CLIENT_TS_DIR || path.resolve(__dirname, '../../../pac
 const NEO4J = { uri: env.NEO4J_URI || 'bolt://127.0.0.1:57687', user: env.NEO4J_USER || 'neo4j', password: env.NEO4J_PASSWORD || 'gxlocal-test-pass' };
 const FALKORDB = { host: env.FALKORDB_HOST || '127.0.0.1', port: Number(env.FALKORDB_PORT || 56379) };
 const ACCEPT_GRAPH = env.ACCEPT_GRAPH || 'gx_accept';
+// FalkorDB graph of the write-enabled fixture (start_fixtures.py), where lane_graph's write console steps write.
+const WRITE_GRAPH = env.WRITE_GRAPH || 'gx_accept_write';
 const RUN_LABEL = env.RUN_LABEL || 'GxAcc';
 const DEMO_SQL_PREFIX = env.DEMO_SQL_PREFIX || 'demo_';
 
@@ -34,6 +36,7 @@ const FIXTURES = {
 	falkordb: 'gx-local Graph (FalkorDB)',
 	falkordbPerf: 'gx-local Graph perf (FalkorDB)',
 	sqlWrite: 'gx-local SQL write-enabled (pgvector)',
+	falkordbWrite: 'gx-local Graph write-enabled (FalkorDB)',
 };
 
 /**
@@ -61,4 +64,4 @@ async function signIn(page, base = ENGINE_URL) {
 	await page.getByText(/connected/i).first().waitFor({ timeout: 20000 });
 }
 
-module.exports = { ENGINE_URL, API_KEY, OUT_DIR, CLIENT_TS_DIR, NEO4J, FALKORDB, ACCEPT_GRAPH, RUN_LABEL, DEMO_SQL_PREFIX, FIXTURES, loadPlaywright, signIn };
+module.exports = { ENGINE_URL, API_KEY, OUT_DIR, CLIENT_TS_DIR, NEO4J, FALKORDB, ACCEPT_GRAPH, WRITE_GRAPH, RUN_LABEL, DEMO_SQL_PREFIX, FIXTURES, loadPlaywright, signIn };

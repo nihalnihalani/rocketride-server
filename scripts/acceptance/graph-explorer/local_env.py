@@ -41,6 +41,8 @@ SQL_TABLE = os.environ.get('SQL_TABLE', 'gx_items')
 ACCEPT_GRAPH = os.environ.get('ACCEPT_GRAPH', 'gx_accept')
 RUN_LABEL = os.environ.get('RUN_LABEL', 'GxAcc')
 PERF_GRAPH = os.environ.get('PERF_GRAPH', 'gx_perf')
+# FalkorDB graph of the write-enabled fixture, the only fixture that can write (lane_graph's write console steps).
+WRITE_GRAPH = os.environ.get('WRITE_GRAPH', 'gx_accept_write')
 DEMO_GRAPH = os.environ.get('DEMO_GRAPH', 'gx_demo')
 DEMO_SQL_PREFIX = os.environ.get('DEMO_SQL_PREFIX', 'demo_')
 

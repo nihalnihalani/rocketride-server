@@ -64,3 +64,14 @@ test('lane_graph: the drawer step passes when the drawer shows the expected engi
 	const r = drawerRow('falkordb', `${LANDING_TEXT}\n${FALKORDB_DRAWER}`);
 	assert.strictEqual(r.status, 'PASS', JSON.stringify(r));
 });
+
+// The write console steps (falkordb runs): on an empty page nothing is sent over a WebSocket and the database
+// (FALKORDB_PORT=9 here) cannot be read, so none of them may pass.
+test('lane_graph: the write console steps fail when they observed nothing', () => {
+	const names = ['write console opens on the write-enabled connection', 'a CREATE opens the confirmation with focus on Cancel', 'Cancel sends nothing', 'Execute statement writes it to the database', 'clean-up removes the written node'];
+	for (const name of names) {
+		const r = lane().data.find((x) => x.engine === 'falkordb-write' && x.name === name);
+		assert.ok(r, `the write console step "${name}" did not run:\n${lane().stdout}`);
+		assert.strictEqual(r.status, 'FAIL', `passed without observing anything: ${JSON.stringify(r)}`);
+	}
+});

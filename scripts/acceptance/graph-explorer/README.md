@@ -26,15 +26,16 @@ secret. Never point them at a database that holds data you care about.
 | `graph_acceptance.py` | Python SDK -> engine -> graph node -> database, per engine (AGE, Neo4j, FalkorDB): task discovery with `get_tasks()`, `dialect`, `get_schema` / `refresh_schema`, `read_query` (positional rows, paths and direction, ids past 2^53, row-limit truncation, invalid input), and that writes and `execute` are refused, proved by database state read over an independent connection. `--pipe-dir apps/graph-ui/templates` runs the shipped templates. |
 | `graph_acceptance.cjs` | The same path through the TypeScript SDK: what a browser-side client receives (number tags for unsafe integers, escaped `@` keys, typed `DAPException` refusals). |
 | `graph_lifecycle.py` | What a tool caller sees for an unwired node, a stopped task, and a task during a restart (only `TASK_STOPPED`, then success on the same token). The restart rows fail when no call landed in the restart window, so rerun it then. |
-| `start_fixtures.py` | Starts the long-lived tools pipelines the browser lanes use, with no idle timeout (the engine otherwise stops a task after 15 idle minutes); `--stop` terminates them. |
+| `start_fixtures.py` | Starts the long-lived tools pipelines the browser lanes use, with no idle timeout (the engine otherwise stops a task after 15 idle minutes): the SQL fixtures, one graph fixture per engine with execute off, and one write-enabled FalkorDB fixture on its own graph (`WRITE_GRAPH`, see "The write console fixture"). Only what is not running yet is started; `--stop` terminates them. |
 | `fake_broker.py` | Local stand-in for the DB broker's `/provision` endpoint, so `rocketride_graph` and `rocketride_sql` resolve a local database. |
 | `validate_all.sh` | Runs every repository gate the feature touches (unit, SDK, node, docs, builds), writes one log per step, and exits non-zero when any step failed. |
-| `browser/lane_graph.cjs` | Graph Explorer in Chrome, Firefox and WebKit: connections, drawer, editor run, canvas, Table/Raw tabs, inspector open and Escape, Expand, schema Refresh, History, write refusal, Ask without an LLM. |
+| `browser/lane_graph.cjs` | Graph Explorer in Chrome, Firefox and WebKit: connections, the drawer's engine identity, editor run, canvas, Table/Raw tabs, inspector open and Escape, Expand, schema Refresh, History, write refusal in the browse editor, Ask without an LLM. With `falkordb` among its engines it also runs the write console (engine `falkordb-write`): a `CREATE` asks first with the focus on Cancel, Cancel sends nothing, Execute statement writes the node, and the node is deleted again, each checked over the lane's own FalkorDB connection. |
 | `browser/lane_sql.cjs` | SQL Explorer in the three browsers: connections listed (no graph nodes), each card's Edit reachable as a button (not inside the card's own button), a query through the shared runner. |
 | `browser/lane_a11y.cjs` | Themes, reduced motion, WCAG text contrast on the landing, canvas, Table view and inspector, and relationship-stroke contrast on the drawn graph. |
 | `browser/probe_linenumbers.cjs` | Editor line-number colour and contrast in both themes, both apps, measured once the editor background is painted (a read before that is transparent and fails rather than being measured). |
 | `browser/lane_perf.cjs`, `browser/gen_perf.py` | Canvas performance on a seeded FalkorDB graph (first draw, pan and drag frame times, long tasks, Expand round trips), Chrome with CPU throttling. |
 | `demo/seed_demo.sh`, `demo/start_demo.py`, `demo/take_shots.cjs` | A small fictional dataset, demo pipelines and the product screenshots. |
+| `falkordb_resp.cjs` | The browser lanes' own FalkorDB connection (Redis protocol, no engine): counts and deletes the nodes one write console run created. |
 | `local_env.py`, `env.cjs` | Settings shared by the Python and Node scripts, read from the environment. |
 | `selftest/` | Checks of the harness's own verdicts, with no engine, database or browser (see "Self-tests"). |
 
@@ -141,10 +142,25 @@ All optional; the defaults match the containers above.
 | `ACCEPT_GRAPH` | `gx_accept` | graph the acceptance seeds (dropped and recreated on AGE and FalkorDB) and the fixtures read |
 | `RUN_LABEL` | `GxAcc` | label on every Neo4j node the acceptance seeds or writes as a probe; on Neo4j the acceptance deletes and counts only nodes with this label |
 | `PERF_GRAPH` | `gx_perf` | FalkorDB graph `gen_perf.py` drops and recreates |
+| `WRITE_GRAPH` | `gx_accept_write` | FalkorDB graph of the write-enabled fixture; `start_fixtures.py` creates it empty when missing, and the write console steps add and delete only their own nodes there |
 | `DEMO_GRAPH`, `DEMO_SQL_PREFIX` | `gx_demo`, `demo_` | demo graph and tables `seed_demo.sh` drops and recreates; on Neo4j it deletes every node with `demo: true`, whoever created it |
 
 Pick your own `ACCEPT_GRAPH` and `RUN_LABEL` when someone else may run the
 lanes against the same containers at the same time.
+
+### The write console fixture
+
+Every graph fixture has `allow_execute` off except one:
+`gx-local Graph write-enabled (FalkorDB)` (`graph_falkordb` on `WRITE_GRAPH`,
+default `gx_accept_write`, execute on). It exists for the write console steps
+of `lane_graph.cjs`, which run whenever `falkordb` is among the lane's engines
+(so also in the default `./builder graph-ui:e2e-live` run). Each run creates one
+node `(:GxWrite {run: '<run id>'})` through the write console and deletes it
+again over the lane's own FalkorDB connection (`falkordb_resp.cjs`), so
+concurrent runs never touch each other's nodes. The steps find the console by
+its visible names (`Write console`, `Execute`, `Cancel`, `Execute statement`).
+The lane counts the `execute` tool calls the page sends on its WebSocket, by
+count only: the frames carry task tokens, so none is stored or printed.
 
 ## Running the lanes
 
@@ -163,7 +179,8 @@ node $ACC/graph_acceptance.cjs all
 (cd dist/server && ./engine $ACC/graph_lifecycle.py)
 
 # Browser lanes: seed the perf graph (its fixture does not start without it),
-# start the fixtures, then run any lane ([chrome|firefox|webkit|all])
+# start the fixtures (this also creates WRITE_GRAPH when it is missing), then
+# run any lane ([chrome|firefox|webkit|all])
 (cd dist/server && ./engine $ACC/browser/gen_perf.py 300)
 (cd dist/server && ./engine $ACC/start_fixtures.py)
 node $ACC/browser/lane_graph.cjs "$ENGINE_URL" "$OUT_DIR" all
@@ -218,7 +235,7 @@ ENGINE_URL=http://127.0.0.1:5580 GRAPH_UI_E2E_BROWSERS=all GRAPH_UI_E2E_LANES=al
 | `ENGINE_URL` | none: required | the engine under test (http or https) |
 | `GRAPH_UI_E2E_BROWSERS` | `chrome` | `chrome`, `firefox`, `webkit`, `all`, or a comma list |
 | `GRAPH_UI_E2E_LANES` | `graph,sql,linenumbers` | any of `graph`, `sql`, `a11y`, `linenumbers`, or `all` |
-| `GRAPH_UI_E2E_ENGINES` | `age,neo4j,falkordb` | the graph lane's engines |
+| `GRAPH_UI_E2E_ENGINES` | `age,neo4j,falkordb` | the graph lane's engines (`falkordb` also runs the write console steps) |
 | `OUT_DIR` | `out/e2e` in this folder (git-ignored) | results, in one folder per browser |
 | `PLAYWRIGHT_DIR`, `PLAYWRIGHT_BROWSERS_PATH` | as in "Playwright" above | where Playwright and its browsers are |
 
@@ -252,7 +269,12 @@ describes: the SQL Explorer card check fails when a card's Edit sits inside the
 card's own button, and the Graph Explorer drawer check fails when only the
 landing behind the drawer names the engine, or the drawer names another one;
 the line-number probe never measures against an editor background that is still
-transparent.
+transparent; and the write console steps fail when they saw no WebSocket traffic
+and could not read the database. `selftest/test_harness.py` also checks that
+`start_fixtures.py` starts every fixture the lanes open and that the write
+console's fixture is the only graph fixture that can write, and
+`selftest/falkordb_resp.test.cjs` runs the lanes' FalkorDB client against a
+stand-in server.
 Run them after changing a script here:
 
 ```bash
@@ -267,5 +289,5 @@ node --test scripts/acceptance/graph-explorer/selftest/*.test.cjs
 # stop the engine and the fake broker, then delete $STORE_DIR and $OUT_DIR
 ```
 
-The seeded graphs and tables stay in the containers until you drop them or
-remove the containers.
+The seeded graphs and tables, and the empty `WRITE_GRAPH`, stay in the
+containers until you drop them or remove the containers.
