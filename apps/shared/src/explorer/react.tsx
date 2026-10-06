@@ -29,8 +29,8 @@
 // tested without the platform; these wrappers are the thin seams onto it.
 // =============================================================================
 
-import React, { useEffect, useMemo, useRef, useSyncExternalStore } from 'react';
-import { usePrefs } from 'shell';
+import React, { useEffect, useLayoutEffect, useMemo, useRef, useSyncExternalStore } from 'react';
+import { useAuthUser, usePrefs } from 'shell';
 import { identityFingerprint, identityFromConnectResult } from './connect/identity';
 import type { IEndpointState, IEndpointStore } from './connect/store';
 import type { IPrefsAccessor } from './history/types';
@@ -39,8 +39,8 @@ import type { IExplorerClient } from './types';
 
 /** The part of a history store the bridge needs. */
 export interface IPrefsAttachable {
-	/** Attach the preference accessor; returns the detach function. */
-	attachPrefs(api: IPrefsAccessor): () => void;
+	/** Attach the preference accessor under its owner (the identity fingerprint); returns the detach function. */
+	attachPrefs(api: IPrefsAccessor, owner?: string | null): () => void;
 }
 
 /**
@@ -52,12 +52,19 @@ export interface IPrefsAttachable {
  * the drawer works even from a query document whose connection tab was closed.
  * Multiple mounts are safe: attachment is reference-counted.
  *
+ * It attaches under the signed-in identity's fingerprint, and attaches again
+ * when that changes, so the store drops a previous account's history before
+ * the next account sees, merges or saves any of it (history/store.ts, "WHOSE
+ * HISTORY IS IN MEMORY"). A layout effect, so a render that carries the new
+ * identity is never painted with the old history.
+ *
  * @param store - The app's history store.
  * @returns A null-rendering component.
  */
 export function createHistoryPrefsBridge(store: IPrefsAttachable): React.FC {
 	const HistoryPrefsBridge: React.FC = () => {
 		const api = usePrefs();
+		const owner = identityFingerprint(identityFromConnectResult(useAuthUser()));
 
 		// The shell hands out a NEW accessor object whenever any preference
 		// changes; the store needs one stable identity for the mount's lifetime,
@@ -70,7 +77,7 @@ export function createHistoryPrefsBridge(store: IPrefsAttachable): React.FC {
 			setPref: (key: string, value: unknown) => latest.current.setPref(key, value),
 		}), []);
 
-		useEffect(() => store.attachPrefs(stable), [stable]);
+		useLayoutEffect(() => store.attachPrefs(stable, owner), [stable, owner]);
 
 		return null;
 	};

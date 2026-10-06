@@ -235,7 +235,14 @@ why a background write would be misfiled). SQL Explorer uses `sql.history`,
 Explorer uses `graph.history`, `graph.historyRecording`, `graph.patternChecks`
 and `cypher`. **These names and the entry shape never change**: renaming one
 silently orphans users' saved history. Mount the accessor with
-`createHistoryPrefsBridge(store)` from `react.tsx`. Per-connection booleans use
+`createHistoryPrefsBridge(store)` from `react.tsx`. The store keeps what it read
+after the last bridge detaches and merges it into the next attach, so the bridge
+attaches under the signed-in identity's fingerprint (`attachPrefs(api, owner)`,
+the owner read with the shell's `useAuthUser`) and attaches again when it
+changes. An attach under a different owner, a sign-out included, first forgets
+every entry, switch, queued run and pending write held in memory, so one
+account's history is never shown to, merged into or written for the next one
+that signs in on the same page. Per-connection booleans use
 `createConnectionFlags` ([`history/flags.ts`](../../../apps/shared/src/explorer/history/flags.ts)).
 
 **Legacy keys.** When `legacyKeyOf` maps a connection to its pre-v1 key (SQL
@@ -302,7 +309,9 @@ document-URI key rule), and the drawer's selection and probe rules
    and reads in flight, as SQL Explorer (`identityScope.ts`) and Graph
    Explorer (`graph/identityChange.ts`) do. The shared `EndpointDrawer` needs
    nothing extra: when the store resets, it forgets its selection and drops
-   the probe result, including one still in flight.
+   the probe result, including one still in flight. Nor does history: the
+   bridge from `createHistoryPrefsBridge` makes the history store forget the
+   previous identity's entries (see [History](#history)).
 5. Wire the runner's hooks and the shared components; keep the language
    (lexer, classifier, row limits, failure wording) in the app.
 6. Tests: pure logic runs under the app's `*:test` action; for `shared:test`,

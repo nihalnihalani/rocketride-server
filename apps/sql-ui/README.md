@@ -377,7 +377,10 @@ reached the app — the node's own wrapper included, not just the sentence
 the banner quotes — and such a message can carry a value from the
 statement. Both stay in the preferences file until the entry is deleted,
 the list is cleared, or the bounds below trim it. It is not a server audit
-log, and not a place for secrets.
+log, and not a place for secrets. History belongs to the account that ran
+it: when you sign out, or another account signs in on the same page, the app
+forgets the history it was holding before it shows or saves anything for
+the next account, so one account's statements never reach another's file.
 
 The list is bounded, because the preferences file is read and written on
 every app switch: 100 entries per connection including pinned ones, 8 KB per

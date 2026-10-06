@@ -54,6 +54,18 @@
 // written (no accessor attached) is remembered in `unsavedRecording` until a
 // hydrate can land it.
 //
+// WHOSE HISTORY IS IN MEMORY — the store outlives a detach, and the next
+// attach MERGES what is still in memory into what it reads (so a run whose
+// write the detach dropped is saved after all). The shell can sign one account
+// out and another in without reloading the page, so that merge would hand the
+// previous account's entries to the next one and write them into its workspace
+// file. So an attach names the OWNER of the accessor (the identity
+// fingerprint: user, organization, development team). The first one binds; an
+// attach under a different owner (null: signed out) first forgets everything
+// held in memory: entries, switches, runs queued before hydration and any
+// pending write. The previous account loses only what had not reached its
+// file yet, the same trade as an app switch.
+//
 // LEGACY KEYS — reading history saved under an older connection key
 //
 // SQL Explorer's first key was `projectId:source:nodeId`; the owner-aware key
@@ -127,9 +139,13 @@ export interface IHistoryStore<F extends string> {
 	 * write and forgets the accessor.
 	 *
 	 * @param api - The `{ getPref, setPref }` accessor; must be stable.
+	 * @param owner - Whose workspace the accessor reads and writes: the identity
+	 *   fingerprint, or null when nobody is signed in. The first owner given
+	 *   binds; a different one first forgets everything held in memory (see
+	 *   "WHOSE HISTORY IS IN MEMORY"). Omitted: no check.
 	 * @returns The detach function.
 	 */
-	attachPrefs(api: IPrefsAccessor): () => void;
+	attachPrefs(api: IPrefsAccessor, owner?: string | null): () => void;
 	/** Subscribe to one connection's history (newest first; empty for an unknown connection). */
 	useHistory(key: string): IHistoryEntry<F>[];
 	/** Subscribe to one connection's recording switch (default on). */
@@ -222,6 +238,9 @@ export function createHistoryStore<F extends string>(options: IHistoryStoreOptio
 	let prefs: IPrefsAccessor | null = null;
 	let bridgeCount = 0;
 	let persistTimer: ReturnType<typeof setTimeout> | null = null;
+
+	/** Whose history is in memory: set by the first attach that names an owner. */
+	let owner: { id: string | null } | null = null;
 
 	const listeners = new Set<() => void>();
 
@@ -447,7 +466,32 @@ export function createHistoryStore<F extends string>(options: IHistoryStoreOptio
 		flush();
 	}
 
-	function attachPrefs(api: IPrefsAccessor): () => void {
+	/**
+	 * Forget everything held in memory: entries, switches, runs queued before
+	 * hydration and any pending write. The next attach hydrates afresh from its
+	 * own accessor.
+	 */
+	function forgetMemory(): void {
+		if (persistTimer !== null) {
+			clearTimeout(persistTimer);
+			persistTimer = null;
+		}
+		bag = {};
+		recording = {};
+		unsavedRecording = {};
+		pendingRuns = [];
+		viewCache.clear();
+		hydrated = false;
+		notify();
+	}
+
+	function attachPrefs(api: IPrefsAccessor, ownerId?: string | null): () => void {
+		if (ownerId !== undefined) {
+			// The first owner binds. Another one (a sign-out included) means what
+			// is in memory belongs to somebody else's workspace.
+			if (owner !== null && owner.id !== ownerId) forgetMemory();
+			owner = { id: ownerId };
+		}
 		prefs = api;
 		bridgeCount += 1;
 		if (!hydrated) hydrate();
