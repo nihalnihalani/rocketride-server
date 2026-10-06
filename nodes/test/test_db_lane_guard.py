@@ -146,6 +146,7 @@ def test_the_lane_lists_the_graph_suites_and_the_pooler_pass():
         'test_graph_neo4j_full.py',
         'test_graph_falkordb_full.py',
         'test_graph_wire_fixtures_full.py',
+        'test_graph_toolpath_full.py',
     ):
         assert suite in out['suites']
     assert out['poolerSuites'] == ['test_rocketride_graph_full.py', 'test_graph_age_full.py']

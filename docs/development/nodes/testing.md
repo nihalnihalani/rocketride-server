@@ -542,8 +542,12 @@ Some suites drive a node's real driver against a real database server:
 (FalkorDB). Two more need the real driver packages: `test_graph_drivers_full.py`
 (real driver objects, no server) and `test_graph_wire_fixtures_full.py`, which
 regenerates graph-ui's wire fixtures (`apps/graph-ui/tests/fixtures/v1`) from
-the drivers and the live servers and fails when they no longer match. They stub
-the engine surface themselves, so they need no test server, but they cannot run
+the drivers and the live servers and fails when they no longer match. These
+stub the engine surface themselves. `test_graph_toolpath_full.py` does not: it
+starts the engine in `dist/server` (build it first) with a stand-in for the
+cloud database broker, starts each shipped Graph Explorer template
+(`apps/graph-ui/templates`) against the test servers, and calls its graph tools
+through the Python SDK. None of them needs the test server, but they cannot run
 in the mocked pass: `nodes/test/mocks` replaces `psycopg2` and `falkordb` for the
 whole engine. They are listed in `DB_LIVE_SUITES` in `nodes/scripts/tasks.js`,
 which `nodes:test` ignores in its mocked pass and then runs in a separate pass
