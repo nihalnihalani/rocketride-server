@@ -432,6 +432,34 @@ def test_every_value_comes_back_from_the_env_file_exactly(engine_dir):
     assert dict(loaded) == {**values, 'RR_DB_BROKER_URL': BROKER_URL, 'RR_DB_BROKER_TOKEN': BROKER_TOKEN}
 
 
+@pytest.mark.parametrize(
+    'last_line',
+    ['RR_DB_BROKER_URL=https://broker.example', f'RR_DB_BROKER_TOKEN={BROKER_TOKEN}', '# operator note'],
+    ids=['broker-url', 'broker-token', 'comment'],
+)
+def test_a_name_set_env_adds_never_joins_a_last_line_without_a_line_break(engine_dir, last_line):
+    """An operator's .env need not end with a line break. A name set_env adds
+    goes on a line of its own: appended to the operator's last line, the
+    caller's text would become part of the broker URL or token, or vanish
+    into a comment.
+    """
+    env_file = engine_dir / '.env'
+    env_file.write_text(f'ROCKETRIDE_GX_KEEP=kept\n# operator settings\n{last_line}', encoding='utf-8')
+    operator_before = {k: v for k, v in dotenv_values(env_file).items() if not k.startswith('ROCKETRIDE_')}
+
+    _set_env({'ROCKETRIDE_GX_KEEP': 'kept', 'ROCKETRIDE_GX_ADDED': 'x.elsewhere.example/p'})
+
+    assert env_file.read_text(encoding='utf-8').splitlines() == [
+        'ROCKETRIDE_GX_KEEP=kept',
+        '# operator settings',
+        last_line,
+        'ROCKETRIDE_GX_ADDED=x.elsewhere.example/p',
+    ]
+    loaded = dotenv_values(env_file)
+    assert {k: v for k, v in loaded.items() if not k.startswith('ROCKETRIDE_')} == operator_before
+    assert loaded['ROCKETRIDE_GX_ADDED'] == 'x.elsewhere.example/p'
+
+
 def test_a_plain_value_is_written_unquoted(engine_dir):
     """Ordinary values keep the file's existing NAME=value form."""
     _set_env({'ROCKETRIDE_GX_KEEP': 'kept', 'ROCKETRIDE_GX_OTHER': 'https://example.com/a?b=c'})

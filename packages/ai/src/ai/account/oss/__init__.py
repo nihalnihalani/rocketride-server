@@ -637,6 +637,11 @@ class Account(AccountBase):
         except FileNotFoundError:
             pass
 
+        # The file's last line need not end with a line break; a line added
+        # below must not run on from it (into the broker token, say).
+        if lines and not lines[-1].endswith('\n'):
+            lines[-1] += '\n'
+
         for k, v in sorted(env.items()):
             if k not in written_keys:
                 lines.append(f'{k}={_env_file_value(k, v)}\n')
