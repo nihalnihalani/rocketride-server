@@ -70,11 +70,17 @@ names it is given that start with `ROCKETRIDE_` (in capitals), one exact
 assignment per line, and ignores the other names it is given. Every
 `ROCKETRIDE_` name it is not given is removed from the environment, and its
 `NAME=value` lines are removed from the `.env` file (a line written as
-`export NAME=value` stays). A request without `env` is handled as an empty
-object, not refused, so it removes all of them. It refuses the whole request,
-changing nothing, when:
+`export NAME=value` stays). The one exception is the engine's API key,
+`ROCKETRIDE_APIKEY`: a request that does not name it keeps it, in the
+environment and in the `.env` file, wherever it was set, so no request can
+switch off the key check by leaving the key out. A request without `env` is
+handled as an empty object, not refused, so it removes every other
+`ROCKETRIDE_` setting. The key is compared in constant time. It refuses the
+whole request, changing nothing, when:
 
 - `env` is not an object of names to values (`null`, for example);
+- it would set `ROCKETRIDE_APIKEY` to an empty or blank value (a new non-empty
+  key is accepted, which rotates it);
 - a name is one of the broker settings or their former names, in any case or
   with surrounding whitespace (refused, not ignored);
 - a `ROCKETRIDE_` name has nothing after the prefix, or anything other than

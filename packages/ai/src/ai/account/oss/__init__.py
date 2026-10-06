@@ -41,6 +41,7 @@ The single authenticated identity is a local "Developer" user who belongs to
 a synthetic ``local`` organisation and team with full admin permissions.
 """
 
+import hmac
 import os
 from depends import depends as _depends
 
@@ -146,9 +147,16 @@ def _checked_set_env(raw: Any) -> Dict[str, str]:
     return env
 
 
-def _replace_rocketride_environ(env: Dict[str, str]) -> None:
-    """Make ``env`` the process environment's ROCKETRIDE_* entries; other names are untouched."""
-    for k in [k for k in os.environ if k.startswith('ROCKETRIDE_')]:
+# The engine's own credential: a set_env request that does not name it keeps
+# it, wherever it is set (environment or .env file), and none may empty it.
+# Without this, a request that left it out (no env at all, or a team-scoped
+# call meant for the cloud) deleted it, and authenticate accepted anything.
+KEPT_UNLESS_NAMED = ('ROCKETRIDE_APIKEY',)
+
+
+def _replace_rocketride_environ(env: Dict[str, str], keep: frozenset = frozenset()) -> None:
+    """Make ``env`` the process environment's ROCKETRIDE_* entries, except the names in ``keep``; other names are untouched."""
+    for k in [k for k in os.environ if k.startswith('ROCKETRIDE_') and k not in keep]:
         del os.environ[k]
     os.environ.update(env)
 
@@ -235,7 +243,9 @@ class Account(AccountBase):
 
         # OSS is a lot looser on the key -- whatever is specified in ROCKETRIDE_APIKEY
         # on the server env is what we expect. Up to 3rd part and key rotation
-        if oss_key and oss_key != credential:
+        if oss_key and not hmac.compare_digest(
+            oss_key.encode('utf-8', 'surrogatepass'), str(credential or '').encode('utf-8', 'surrogatepass')
+        ):
             # Key is configured but the credential doesn't match — reject.
             return (401, 'Invalid API key')
 
@@ -569,6 +579,13 @@ class Account(AccountBase):
                 # one exact assignment in the .env file below, so a line break
                 # cannot add one of them anyway.
                 env = _checked_set_env(args.get('env', {}))
+                for name in KEPT_UNLESS_NAMED:
+                    if name in env and not env[name].strip():
+                        raise ValueError(
+                            f'{name}: refused. set_env cannot empty the API key; set a new non-empty key, '
+                            'or change it in the engine environment and restart.'
+                        )
+                keep = frozenset(name for name in KEPT_UNLESS_NAMED if name not in env)
 
                 # Step 1: Read the .env file and merge the request into it,
                 # still before anything changes: a file that cannot be read
@@ -578,7 +595,7 @@ class Account(AccountBase):
                 import sys
 
                 path = os.path.join(os.path.dirname(sys.executable), '.env')
-                content = self._merged_env_file(path, env)
+                content = self._merged_env_file(path, env, keep)
 
                 # Step 2: Replace the ROCKETRIDE_* keys in os.environ (deleted
                 # keys must not linger in memory; get_env reflects the change
@@ -587,7 +604,7 @@ class Account(AccountBase):
                 # previous ROCKETRIDE_* keys back.
                 previous = {k: v for k, v in os.environ.items() if k.startswith('ROCKETRIDE_')}
                 try:
-                    _replace_rocketride_environ(env)
+                    _replace_rocketride_environ(env, keep)
                     _replace_env_file(path, content)
                 except BaseException:
                     _replace_rocketride_environ(previous)
@@ -601,7 +618,7 @@ class Account(AccountBase):
         raise NotImplementedError('Account management requires SaaS mode')
 
     @staticmethod
-    def _merged_env_file(path: str, env: Dict[str, str]) -> str:
+    def _merged_env_file(path: str, env: Dict[str, str], keep: frozenset = frozenset()) -> str:
         """
         Return the .env file at ``path`` with ``env`` as its ROCKETRIDE_* entries.
 
@@ -615,6 +632,8 @@ class Account(AccountBase):
         Args:
             path: Absolute path to the .env file.
             env:  Key-value dict to write (checked by :func:`_checked_set_env`).
+            keep: ROCKETRIDE_* names whose existing lines stay as they are
+                  although ``env`` does not name them (KEPT_UNLESS_NAMED).
 
         Raises:
             OSError, UnicodeDecodeError: the file exists but cannot be read
@@ -632,6 +651,8 @@ class Account(AccountBase):
                             if key in env:
                                 lines.append(f'{key}={_env_file_value(key, env[key])}\n')
                                 written_keys.add(key)
+                            elif key in keep:
+                                lines.append(line)
                             continue
                     lines.append(line)
         except FileNotFoundError:

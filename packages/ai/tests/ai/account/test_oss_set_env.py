@@ -472,3 +472,100 @@ def test_a_plain_value_is_written_unquoted(engine_dir):
         f'RR_DB_BROKER_TOKEN={BROKER_TOKEN}',
         'ROCKETRIDE_GX_OTHER=https://example.com/a?b=c',
     ]
+
+
+# ---------------------------------------------------------------------------
+# The API key: set_env never switches authentication off
+# ---------------------------------------------------------------------------
+#
+# ROCKETRIDE_APIKEY is an open-source engine's only credential. set_env replaces
+# the whole ROCKETRIDE_ set, so before this rule a request that left the key out
+# (no env at all, or the team-scoped call meant for the cloud, such as
+# set_env('team', {'ROCKETRIDE_OPENAI_KEY': ...})) deleted it from the
+# environment and the .env file, and authenticate then accepted any credential.
+
+API_KEY = 'gx-test-api-key'
+
+
+@pytest.fixture
+def keyed_engine_dir(engine_dir, monkeypatch):
+    """As ``engine_dir``, with ROCKETRIDE_APIKEY set in the environment and in the .env file.
+
+    A successful authenticate then assembles the user's apps, which imports the
+    engine's modules from its real path; the fixture's engine path is a stand-in,
+    so the app list is stubbed (it is not what these tests check).
+    """
+
+    async def no_apps(self):
+        return []
+
+    monkeypatch.setattr(Account, '_assemble_apps', no_apps)
+    os.environ['ROCKETRIDE_APIKEY'] = API_KEY
+    with open(engine_dir / '.env', 'a', encoding='utf-8') as f:
+        f.write(f'ROCKETRIDE_APIKEY={API_KEY}\n')
+    return engine_dir
+
+
+def _authenticate(credential):
+    return asyncio.run(Account().authenticate(credential))
+
+
+def _set_env_request(request_args):
+    request = {'command': 'rrext_account_me', 'arguments': {'subcommand': 'set_env', **request_args}}
+    return asyncio.run(Account().handle_account(MagicMock(), request))
+
+
+@pytest.mark.parametrize(
+    'request_args',
+    [{}, {'env': {}}, {'env': {'ROCKETRIDE_OPENAI_KEY': 'sk-test'}}],
+    ids=['no-env', 'empty-env', 'other-name'],
+)
+def test_a_set_env_that_leaves_out_the_api_key_keeps_it(keyed_engine_dir, request_args):
+    _set_env_request(request_args)
+    assert os.environ['ROCKETRIDE_APIKEY'] == API_KEY
+    assert dotenv_values(keyed_engine_dir / '.env')['ROCKETRIDE_APIKEY'] == API_KEY
+    assert _authenticate('a-wrong-key') == (401, 'Invalid API key')
+    assert not isinstance(_authenticate(API_KEY), tuple)
+
+
+def test_a_key_only_in_the_environment_is_kept_there_and_not_written_to_the_file(engine_dir):
+    os.environ['ROCKETRIDE_APIKEY'] = API_KEY
+    _set_env({'ROCKETRIDE_OPENAI_KEY': 'sk-test'})
+    assert os.environ['ROCKETRIDE_APIKEY'] == API_KEY
+    assert 'ROCKETRIDE_APIKEY' not in dotenv_values(engine_dir / '.env')
+
+
+@pytest.mark.parametrize('value', ['', '   '], ids=['empty', 'blank'])
+def test_set_env_cannot_empty_the_api_key(keyed_engine_dir, value):
+    message = _assert_refused(keyed_engine_dir, {'ROCKETRIDE_APIKEY': value})
+    assert 'ROCKETRIDE_APIKEY' in message
+    assert _authenticate('a-wrong-key') == (401, 'Invalid API key')
+
+
+def test_set_env_can_still_rotate_the_api_key(keyed_engine_dir):
+    _set_env({'ROCKETRIDE_APIKEY': 'a-new-key'})
+    assert dotenv_values(keyed_engine_dir / '.env')['ROCKETRIDE_APIKEY'] == 'a-new-key'
+    assert _authenticate(API_KEY) == (401, 'Invalid API key')
+    assert not isinstance(_authenticate('a-new-key'), tuple)
+
+
+def test_an_engine_without_a_key_gets_none_from_set_env(engine_dir):
+    _set_env({'ROCKETRIDE_OPENAI_KEY': 'sk-test'})
+    assert 'ROCKETRIDE_APIKEY' not in os.environ
+    assert 'ROCKETRIDE_APIKEY' not in dotenv_values(engine_dir / '.env')
+
+
+def test_authenticate_compares_the_key_in_constant_time(keyed_engine_dir, monkeypatch):
+    import hmac
+
+    seen = []
+    real = hmac.compare_digest
+
+    def spy(a, b):
+        seen.append((type(a), type(b)))
+        return real(a, b)
+
+    monkeypatch.setattr(hmac, 'compare_digest', spy)
+    assert _authenticate('a-wrong-key') == (401, 'Invalid API key')
+    assert not isinstance(_authenticate(API_KEY), tuple)
+    assert seen == [(bytes, bytes), (bytes, bytes)]
