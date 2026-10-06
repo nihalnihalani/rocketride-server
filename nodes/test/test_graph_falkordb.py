@@ -1091,8 +1091,22 @@ def test_legacy_execute_below_the_server_cap_returns_its_rows():
 def test_legacy_execute_without_a_server_cap_keeps_its_message():
     glb = _FakeGlobal(_server_cut(produced=4, resultset_size=10))
     glb.allow_execute, glb.max_execute_rows = True, 3
-    with pytest.raises(ValueError, match=r'^EXECUTE query exceeded max_execute_rows=3$'):
+    with pytest.raises(ValueError) as err:
         _instance(glb).execute({'query': 'UNWIND range(1, 4) AS i RETURN i'})
+    assert str(err.value).splitlines()[0] == 'EXECUTE query exceeded max_execute_rows=3'
+
+
+@pytest.mark.parametrize('server_cap', [5, None])
+def test_legacy_execute_over_its_cap_says_the_statement_ran_and_its_writes_stand(server_cap):
+    # FalkorDB does not roll a statement back when its reply is too long to
+    # return: the failure must not read as if nothing happened.
+    glb = _FakeGlobal(_server_cut(produced=10, resultset_size=10))
+    glb.allow_execute, glb.server_result_cap, glb.max_execute_rows = True, server_cap, 3
+    with pytest.raises(ValueError) as err:
+        _instance(glb).execute({'query': 'UNWIND range(1, 10) AS i CREATE (:N {i: i}) RETURN i'})
+    detail = str(err.value).splitlines()[1]
+    assert detail.startswith('The statement ran, and any writes it made stand (FalkorDB does not roll them back)')
+    assert 'LIMIT' in detail and 'shape "graph"' in detail
 
 
 @pytest.mark.parametrize('allow_writes', [False, True])

@@ -71,8 +71,10 @@ class IGlobal(GraphGlobalBase):
     query_timeout_ms: int = DEFAULT_TIMEOUT_MS
     # Server limits read at start (None = unknown, e.g. GRAPH.CONFIG not permitted).
     # RESULTSET_SIZE truncates replies silently; TIMEOUT_MAX rejects larger
-    # per-query timeouts. Every command the node sends honours both (see
-    # statement_timeout_ms and _below_server_cap).
+    # per-query timeouts. Every query the node runs honours both (see
+    # statement_timeout_ms and _below_server_cap). GRAPH.EXPLAIN (the
+    # generated-query check) and the start-up MODULE LIST / GRAPH.CONFIG GET
+    # calls carry no per-query timeout: they run no query.
     server_result_cap: Optional[int] = None
     server_timeout_max_ms: Optional[int] = None
     server_version: Optional[str] = None
@@ -217,6 +219,13 @@ class IGlobal(GraphGlobalBase):
                     f" (the node's {self.max_execute_rows}, lowered below the server's "
                     f'RESULTSET_SIZE ({self.server_result_cap}), which cuts longer replies)'
                 )
+            # The server has already run the statement: FalkorDB does not roll
+            # it back, so the failure must not read as if nothing happened.
+            message += (
+                '\nThe statement ran, and any writes it made stand (FalkorDB does not roll them back); '
+                'only its reply has more rows than the node returns. Add a LIMIT, or use shape "graph", '
+                'which returns the first rows marked truncated.'
+            )
             raise ValueError(message)
 
         # Count writes unconditionally: unlike SQL, a Cypher write commonly also

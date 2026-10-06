@@ -281,7 +281,7 @@ only stops waiting: the database ends the statement at its own timeout.
 | `rocketridegraph.db_description` | `string` | **Graph description**<br/>What is this graph used for? Describe its content and purpose, this helps the LLM generate more accurate queries. | `""` |
 | `rocketridegraph.graph` | `string` | **Graph name**<br/>Name of the AGE graph to query in your RocketRide cloud database | `"rocketride"` |
 | `rocketridegraph.max_attempts` | `integer` | **Max validation attempts**<br/>Maximum number of times to re-ask the LLM if validation rejects the generated Cypher | `5` |
-| `rocketridegraph.max_rows` | `integer` | **Max read rows**<br/>Row ceiling for read queries: the questions lane, get_data and read_query (Graph Explorer's All asks for this cap). Results beyond it are cut and reported as truncated. | `1000` |
+| `rocketridegraph.max_rows` | `integer` | **Max read rows**<br/>Row ceiling for read queries: the questions lane, get_data and read_query (Graph Explorer's All asks for this cap). Results beyond it are cut; get_data and read_query report them as truncated (the questions lane does not). | `1000` |
 | `rocketridegraph.profile` | `string` |  | `"default"` |
 | `rocketridegraph.query_timeout_ms` | `integer` | **Query timeout (ms)**<br/>Per-query statement timeout applied inside each query's transaction | `30000` |
 
