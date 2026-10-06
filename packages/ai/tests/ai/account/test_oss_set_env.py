@@ -165,6 +165,49 @@ def test_a_non_string_value_or_a_non_object_env_is_refused(engine_dir, env):
     _assert_refused(engine_dir, env)
 
 
+def _not_utf8(env_file) -> bytes:
+    data = b'ROCKETRIDE_GX_KEEP=kept\n# operator note \xff\n'
+    env_file.write_bytes(data)
+    return data
+
+
+def _read_only(env_file) -> bytes:
+    data = env_file.read_bytes()
+    env_file.chmod(0o444)
+    return data
+
+
+def _unreadable(env_file) -> bytes:
+    data = env_file.read_bytes()
+    env_file.chmod(0o000)
+    return data
+
+
+@pytest.mark.skipif(not hasattr(os, 'geteuid') or os.geteuid() == 0, reason='file modes do not bind root')
+@pytest.mark.parametrize(
+    'break_file,error',
+    [(_not_utf8, UnicodeDecodeError), (_read_only, PermissionError), (_unreadable, PermissionError)],
+    ids=['not-utf8', 'read-only', 'unreadable'],
+)
+def test_an_env_file_that_cannot_be_read_or_written_fails_the_request_and_changes_nothing(
+    engine_dir, break_file, error
+):
+    """A request that passed every check can still fail on the file: here it
+    is not UTF-8, cannot be read, or cannot be opened for writing. The request
+    then fails with the process environment as it was, and the file as it was.
+    """
+    env_file = engine_dir / '.env'
+    file_before = break_file(env_file)
+    environ_before = dict(os.environ)
+    try:
+        with pytest.raises(error):
+            _set_env({'ROCKETRIDE_GX_KEEP': 'changed', 'ROCKETRIDE_GX_ADDED': SECRET})
+    finally:
+        env_file.chmod(0o644)
+    assert dict(os.environ) == environ_before, 'a failed request must leave the environment as it was'
+    assert env_file.read_bytes() == file_before
+
+
 def test_every_value_comes_back_from_the_env_file_exactly(engine_dir):
     """Whatever the value, the file holds exactly that value under exactly that
     name, and the operator's lines stay as they were: an opening quote on the

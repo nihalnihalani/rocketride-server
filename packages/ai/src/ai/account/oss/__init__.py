@@ -135,6 +135,13 @@ def _checked_set_env(raw: Any) -> Dict[str, str]:
     return env
 
 
+def _replace_rocketride_environ(env: Dict[str, str]) -> None:
+    """Make ``env`` the process environment's ROCKETRIDE_* entries; other names are untouched."""
+    for k in [k for k in os.environ if k.startswith('ROCKETRIDE_')]:
+        del os.environ[k]
+    os.environ.update(env)
+
+
 class Account(AccountBase):
     """
     Open-source authentication and account management.
@@ -515,22 +522,28 @@ class Account(AccountBase):
                 # cannot add one of them anyway.
                 env = _checked_set_env(args.get('env', {}))
 
-                # Step 1: Remove existing ROCKETRIDE_* keys from os.environ
-                # so that deleted keys don't linger in memory.
-                for k in [k for k in os.environ if k.startswith('ROCKETRIDE_')]:
-                    del os.environ[k]
-
-                # Step 2: Set the new values in os.environ so get_env
-                # reflects the change immediately without a restart.
-                os.environ.update(env)
-
-                # Step 3: Persist to .env file on disk.
+                # Step 1: Read the .env file and merge the request into it,
+                # still before anything changes: a file that cannot be read
+                # (or is not UTF-8) fails the request with nothing changed.
                 # Use sys.executable (engine.exe path) — must match the
                 # load_dotenv path in server.py, which also uses sys.executable.
                 import sys
 
-                exec_dir = os.path.dirname(sys.executable)
-                self._write_env_file(os.path.join(exec_dir, '.env'), env)
+                path = os.path.join(os.path.dirname(sys.executable), '.env')
+                content = self._merged_env_file(path, env)
+
+                # Step 2: Replace the ROCKETRIDE_* keys in os.environ (deleted
+                # keys must not linger in memory; get_env reflects the change
+                # without a restart), then write the file. If either fails,
+                # os.environ gets its previous ROCKETRIDE_* keys back.
+                previous = {k: v for k, v in os.environ.items() if k.startswith('ROCKETRIDE_')}
+                try:
+                    _replace_rocketride_environ(env)
+                    with open(path, 'w', encoding='utf-8') as f:
+                        f.write(content)
+                except BaseException:
+                    _replace_rocketride_environ(previous)
+                    raise
                 return conn.build_response(request, body={'updated': True})
 
             if sub == 'env_keys':
@@ -540,18 +553,24 @@ class Account(AccountBase):
         raise NotImplementedError('Account management requires SaaS mode')
 
     @staticmethod
-    def _write_env_file(path: str, env: Dict[str, str]) -> None:
+    def _merged_env_file(path: str, env: Dict[str, str]) -> str:
         """
-        Merge ROCKETRIDE_* entries into a .env file.
+        Return the .env file at ``path`` with ``env`` as its ROCKETRIDE_* entries.
 
         Preserves non-ROCKETRIDE lines and comments. Replaces existing
-        ROCKETRIDE_* lines and appends new ones. Each value is written so the
-        web server's python-dotenv reads it back exactly (see
-        :func:`_env_file_value`), in UTF-8 as python-dotenv reads it.
+        ROCKETRIDE_* lines, drops the ones ``env`` does not name, and appends
+        new ones. Each value is written so the web server's python-dotenv
+        reads it back exactly (see :func:`_env_file_value`). The file is read
+        as UTF-8, strictly, as python-dotenv reads it; a missing file reads as
+        empty. Nothing is written here.
 
         Args:
             path: Absolute path to the .env file.
             env:  Key-value dict to write (checked by :func:`_checked_set_env`).
+
+        Raises:
+            OSError, UnicodeDecodeError: the file exists but cannot be read
+                as UTF-8 text.
         """
         lines: List[str] = []
         written_keys: set = set()
@@ -574,7 +593,6 @@ class Account(AccountBase):
             if k not in written_keys:
                 lines.append(f'{k}={_env_file_value(k, v)}\n')
 
-        with open(path, 'w', encoding='utf-8') as f:
-            f.writelines(lines)
+        return ''.join(lines)
 
     # generate_token is inherited from AccountBase.

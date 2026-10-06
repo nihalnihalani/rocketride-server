@@ -59,16 +59,31 @@ substituted into a pipeline, never returned or changed by the account
 `ROCKETRIDE_DB_BROKER_URL` or `ROCKETRIDE_DB_BROKER_TOKEN` are set, in its
 environment or in its `.env` file, even next to the new names, and the
 open-source `set_env` command refuses them: rename them in the deployment
-configuration and secret mapping in the same change. That command saves
-`ROCKETRIDE_` names in the engine's `.env` file, one exact assignment per line,
-and refuses the whole request, changing nothing, when a name is one of the
-broker settings or their former names in any spelling, when a `ROCKETRIDE_`
-name has anything other than letters, digits and underscores after the
-prefix, or when a value has a line break or another control character, or
-contains `${`, which the `.env` loader would expand when the engine starts. A hosted
-engine without the broker settings logs a warning at startup, and its
-RocketRide database nodes report that the broker is not configured, both when
-their configuration is saved and when a task starts.
+configuration and secret mapping in the same change. A hosted engine without
+the broker settings logs a warning at startup, and its RocketRide database
+nodes report that the broker is not configured, both when their configuration
+is saved and when a task starts.
+
+The open-source `set_env` command puts the names it is given that start with
+`ROCKETRIDE_` (in capitals) in the engine's environment and in its `.env`
+file, one exact assignment per line, and ignores the rest. It refuses the
+whole request, changing nothing, when:
+
+- `env` is not an object of names to values;
+- a name is one of the broker settings or their former names, in any case or
+  with surrounding whitespace (refused, not ignored);
+- a `ROCKETRIDE_` name has nothing after the prefix, or anything other than
+  ASCII letters, digits and underscores;
+- a value given for a `ROCKETRIDE_` name is not a string, has a control
+  character (U+0000 to U+001F or U+007F to U+009F) or a Unicode line or
+  paragraph separator (U+2028, U+2029), or contains `${`, which the `.env`
+  loader would expand when the engine starts;
+- such a value would need quotes in the file (it starts or ends with
+  whitespace, starts with a quote, or has whitespace before a `#`) and ends
+  with a backslash.
+
+If the `.env` file cannot be read as UTF-8 or cannot be written, the command
+fails and leaves the engine's environment as it was.
 
 Each RocketRide database node connects to the database of the organization
 that runs the pipeline (of the user, where there is no organization). The
