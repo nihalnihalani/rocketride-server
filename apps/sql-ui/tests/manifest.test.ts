@@ -58,4 +58,17 @@ describe('appManifest', () => {
 		const manifest = JSON.parse(readFileSync(path.join(APP_ROOT, 'package.json'), 'utf8')).appManifest as { include?: unknown };
 		assert.deepEqual(manifest.include, ['apps/shared']);
 	});
+
+	it('ships a version that installs seeded before the Explorer rework do not have, so a local engine re-seeds the app', () => {
+		// A local (OSS) engine copies a built-in app's bundle into its store
+		// once, and seeds it again only when the version in apps.json (stamped
+		// from this package.json by registerApp) differs from the version it
+		// seeded (packages/ai/src/ai/account/oss/__init__.py). Every install
+		// before the shared Explorer rework seeded 1.0.0, so at 1.0.0 an upgraded
+		// engine would keep serving the old SQL Explorer.
+		const { version } = JSON.parse(readFileSync(path.join(APP_ROOT, 'package.json'), 'utf8')) as { version?: unknown };
+		assert.equal(typeof version, 'string');
+		assert.match(version as string, /^\d+\.\d+\.\d+$/);
+		assert.notEqual(version, '1.0.0');
+	});
 });

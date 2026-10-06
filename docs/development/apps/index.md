@@ -140,8 +140,11 @@ pnpm install
 ### Trying a production build on a local engine
 
 A local engine serves the app version it seeded into its store, and seeds
-again only when the app's `version` changes. To try a rebuild at the same
-version:
+again only when the app's `version` changes (the `version` in its
+`package.json`, which `registerApp` stamps into `apps.json`). So a change that
+users of a built-in app must get also bumps that `version`: without the bump,
+an engine upgraded over an existing store keeps serving the bundle it seeded
+before. To try a rebuild at the same version:
 
 - start the engine with a fresh store, e.g.
   `RR_STORE_URL=filesystem:///tmp/my-app-store ./engine ai/eaas.py`, which also
