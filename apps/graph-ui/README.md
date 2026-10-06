@@ -73,7 +73,9 @@ RocketRide's managed database the graph `rocketride` is created for your
 organization when the database is provisioned.
 
 The app never holds a connection string or a task token in anything it saves or
-shows. Task tokens are kept in memory only, per session.
+shows. Task tokens are kept in memory only, per session. Signing out, or a
+switch to another development team, forgets every connection and closes every
+workbench and write console, so nothing from before stays on screen.
 
 ## The workbench
 

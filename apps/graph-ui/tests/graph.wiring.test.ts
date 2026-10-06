@@ -168,6 +168,14 @@ test('the landing renders its cards whenever there are any, under its message, a
 	assert.ok(/\{landing\.cards && \(\s*<div style=\{styles\.cardGrid\}>/.test(view), 'the grid renders whenever there are cards');
 });
 
+// GX-FE-17 (graph half): on a change of user, organization or team (or a sign-out) the shared store forgot every
+// connection, but the open workbench and write-console documents kept the previous identity's results on screen.
+test('a change of identity closes every connection document and clears the per-connection caches', () => {
+	const app = code(read('GraphApp.tsx'));
+	assert.ok(/const fingerprint = identityFingerprint\(identityFromConnectResult\(identity\)\);/.test(app), 'the app tracks the fingerprint the shared store tracks');
+	assert.ok(/useEffect\(\(\) => \{\s*forgetConnections\(getDocs\(\), \{ schemas \}\);\s*\}, \[fingerprint\]\);/.test(app), 'every change of it forgets the connections');
+});
+
 // GX-FE-08: one unkeyed drawer instance served every card, so the last Test result showed on the next card opened.
 test('the connection drawer starts fresh for every card, and words its Test result through testResultText', () => {
 	const view = code(read('views', 'ConnectionsView.tsx'));

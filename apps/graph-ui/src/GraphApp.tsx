@@ -30,8 +30,9 @@
 // Every document is static; the endpoint rides as its payload and carries no token.
 //
 // It also keeps the endpoint store wired to the platform (task events, focus, and a
-// sign-out or change of user, organization or team forgetting every connection) and
-// clears the schema snapshots with it, so one session's schema never shows in the next.
+// sign-out or change of user, organization or team forgetting every connection). With
+// it, the app closes every workbench and write console and clears the schema snapshots,
+// so one session's results and schema never show in the next.
 // =============================================================================
 
 import React, { useEffect, useMemo, useState } from 'react';
@@ -44,6 +45,7 @@ import { LiveRegion, activeConnection, graphEndpoints, schemas } from './adapter
 import { GraphHistoryPrefsBridge, useEndpointStoreLifecycle, useGraphEndpoints } from './adapters/react';
 import { CONNECTIONS_URI, endpointKeyFromUri, isWorkbenchUri, isWriteUri } from './graph/addresses';
 import { createDocs, destroyDocs, getDocs } from './docs';
+import { forgetConnections } from './graph/identityChange';
 import type { IConnectionDocPayload } from './docs';
 import GraphSidebar from './GraphSidebar';
 import { GraphIcon } from './icons';
@@ -70,10 +72,12 @@ const GraphApp: React.FC<ShellAppProps> = ({ identity }) => {
 	const { client } = useShellConnection();
 	useEndpointStoreLifecycle(graphEndpoints, client, identity);
 
-	// A different user, organization or team (or a sign-out) must find no schema from before.
+	// A different user, organization or team (or a sign-out) must find nothing from before: no schema, and no
+	// workbench or write console still showing the previous identity's results (the store forgets its endpoints).
+	// On the first run the documents do not exist yet, so only the schema snapshots are cleared.
 	const fingerprint = identityFingerprint(identityFromConnectResult(identity));
 	useEffect(() => {
-		schemas.clear();
+		forgetConnections(getDocs(), { schemas });
 	}, [fingerprint]);
 
 	useEffect(() => {
