@@ -25,8 +25,9 @@
 # This class controls the data shared between all threads for the task.
 #
 # Mirrors vectordb_postgres/IGlobal, differing only in how it connects: there
-# are no host/user/password fields; the per-tenant DSN is resolved from the
-# account layer (keyed by the authenticated client_id).
+# are no host/user/password fields; the DSN of the organization's database
+# (the tenant; a user only where there is no organization) comes from the
+# account layer (ai.common.rocketride_db).
 # ------------------------------------------------------------------------------
 import re
 from rocketlib import OPEN_MODE, warning
