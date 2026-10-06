@@ -67,8 +67,14 @@ _UNSAFE_CYPHER = re.compile(
 # other, and either reading can hide a clause the other runs. Text with a lone
 # carriage return is stripped both ways (``_STRIP_LITERALS_LF`` is the
 # line-feed-only reading) and must be safe under both.
+#
+# They also disagree on where a block comment ends: Neo4j and Apache AGE at the
+# first ``*/``, FalkorDB at the first ``/`` after the ``/*`` (or at the end of
+# the text). Only a block comment whose text holds no ``/`` reads the same
+# everywhere, so only that form is stripped; any other ``/*`` is left in place
+# and makes the statement unsafe.
 _LITERALS = r"""
-    | /\*.*?\*/            # block comment
+    | /\*[^/]*?\*/         # block comment holding no '/'
     | '(?:\\.|[^'\\])*'    # single-quoted string
     | "(?:\\.|[^"\\])*"    # double-quoted string
     | `[^`]*`              # back-quoted identifier
@@ -110,7 +116,8 @@ def is_cypher_safe(cypher: str) -> bool:
     """Return True when the Cypher statement is read-only (MATCH/RETURN/schema CALLs).
 
     A number that runs straight into the text after it (``0LOAD``) makes the
-    statement unsafe, since engines split it differently; a lone carriage
+    statement unsafe, since engines split it differently, and so does a
+    block comment that holds a ``/`` or does not terminate; a lone carriage
     return in a line comment makes the statement safe only if it is safe
     whichever way the comment ends.
 
@@ -127,7 +134,9 @@ def is_cypher_safe(cypher: str) -> bool:
     strippers = (_STRIP_LITERALS, _STRIP_LITERALS_LF) if _LONE_CR.search(cypher) else (_STRIP_LITERALS,)
     for strip in strippers:
         stripped = strip.sub(' ', cypher)
-        if _UNSAFE_CYPHER.search(stripped):
+        # A /* left after stripping opens a comment that engines end in
+        # different places (it holds a '/') or that never ends.
+        if _UNSAFE_CYPHER.search(stripped) or '/*' in stripped:
             return False
         for start in _NUMBER_START.finditer(stripped):
             if _runs_on(stripped, _NUMBER.match(stripped, start.start()).end()):
@@ -251,9 +260,10 @@ def _tokenize(cypher: str, *, cr_ends_comment: bool = True, ascii_only: bool = F
     literal or a back-quoted name (comments included) is refused.
 
     Raises _Unreadable for an unterminated string, comment or back-quoted
-    name, and for a number that runs into the text after it (see
-    :func:`_runs_on`): what the database would make of the rest is
-    unknowable, so refuse.
+    name, for a number that runs into the text after it (see
+    :func:`_runs_on`) and for a block comment whose text holds a ``/``
+    (FalkorDB ends it at that ``/``, Neo4j and Apache AGE at the ``*/``):
+    what the database would make of the rest is unknowable, so refuse.
     """
     toks: list = []
     i, n = 0, len(cypher)
@@ -277,6 +287,11 @@ def _tokenize(cypher: str, *, cr_ends_comment: bool = True, ascii_only: bool = F
                 raise _Unterminated('comment')
             if ascii_only:
                 _require_ascii(cypher, i, j)
+            # FalkorDB ends the comment at the first '/' after the '/*', the
+            # other engines at the first '*/': they agree only when the text
+            # between holds no '/'.
+            if '/' in cypher[i + 2 : j]:
+                raise _Unreadable("'/' inside a block comment")
             i = j + 2
         elif c in '\'"':
             j = i + 1
@@ -436,8 +451,9 @@ def check_read_query_statement(
     input-error headline and ``detail`` is the refusal's second line.
 
     Text the engines read differently is never guessed at: a number that
-    runs into the text after it (``0LOAD``) is invalid input, and a line
-    comment with a lone carriage return is checked both ways it can end.
+    runs into the text after it (``0LOAD``) and a block comment whose text
+    holds a ``/`` are invalid input, and a line comment with a lone carriage
+    return is checked both ways it can end.
     ``ascii_only`` (FalkorDB's read paths) also refuses any non-ASCII
     character outside string literals and back-quoted names, comments
     included, before the text reaches the server.
@@ -446,7 +462,8 @@ def check_read_query_statement(
         CypherRefused: for ``LOAD CSV`` ("Refused: ..." headline).
         CypherInputError: for text whose comments, strings or back-quoted
             names do not terminate, for a number that runs into the text
-            after it, and with ``ascii_only`` for non-ASCII text outside
+            after it, for a ``/`` inside a block comment, and with
+            ``ascii_only`` for non-ASCII text outside
             strings and names ("Invalid <tool> input: ..." headline): a
             syntax problem, not a refusal, and what the database would make
             of it cannot be known, so it is not sent.

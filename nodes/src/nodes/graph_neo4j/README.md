@@ -86,7 +86,8 @@ whatever `allow_execute` says: write, administration and `USE` clauses and any
 `db.schema.nodeTypeProperties`, `db.schema.relTypeProperties` and
 `db.schema.visualization` are refused before the query is sent, and so, as
 invalid input, is a number written straight against a letter, an underscore or
-a `.` (`0LIMIT`, `1.`); it then runs
+a `.` (`0LIMIT`, `1.`) or a `/* … */` comment whose text holds a `/` (other
+engines end such a comment at that `/`); it then runs
 in a READ-mode transaction with a 30-second server-side deadline. Failures
 raise an error whose first line is a short headline (`Refused: …`,
 `Query timed out after 30000 ms`, `Invalid read_query input: …` or

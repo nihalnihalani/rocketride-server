@@ -201,13 +201,19 @@ class TestReadOnlyInvariant:
 
 # Statements FalkorDB reads as LOAD CSV where an earlier tokenizer did not (a
 # number running into a word; a // comment the server ends only at a line
-# feed), with the headline each read path returns ({tool}: the tool's name).
+# feed; a block comment the server ends at the first / after the /*), with the
+# headline each read path returns ({tool}: the tool's name).
 _LOAD_FROM = "LOAD CSV FROM 'https://example.invalid/rr-test.csv' AS r RETURN r"
+_BLOCK_SLASH = "Invalid {tool} input: '/' inside a block comment"
 SPLIT_READINGS = [
     (f'MATCH (a:Person) WITH a SKIP 0{_LOAD_FROM}', "Invalid {tool} input: the number 0 runs into 'L'"),
     (f'MATCH (a:Person) WHERE a.age > 0.5{_LOAD_FROM}', "Invalid {tool} input: the number 0.5 runs into 'L'"),
     (f'MATCH (a:Person) WHERE a.age > 1e3{_LOAD_FROM}', "Invalid {tool} input: the number 1e3 runs into 'L'"),
     (f"MATCH (a:Person) //\r'\n{_LOAD_FROM} //'", 'Refused: LOAD CSV is not allowed on the read-only path'),
+    (f'MATCH (a:Person) WITH a /*/ {_LOAD_FROM} //*/', _BLOCK_SLASH),
+    (f"MATCH (a:Person) WITH a /*'/{_LOAD_FROM} /*'*/", _BLOCK_SLASH),
+    (f'MATCH (a:Person) WITH a /*`/{_LOAD_FROM} /*`*/', _BLOCK_SLASH),
+    (f'MATCH (a:Person) WITH a /* x / {_LOAD_FROM} //*/', _BLOCK_SLASH),
 ]
 
 
@@ -264,6 +270,7 @@ class TestReadQueryRefusals:
                 inst.read_query({'cypher': cypher})
             assert str(err.value).splitlines()[0] == headline.format(tool='read_query')
             assert glb._read_only_refusal(cypher) == headline.format(tool='generated query')
+            assert glb._validate_query(cypher) == (False, headline.format(tool='generated query'))
             if not allow_writes:
                 out = inst.query({'cypher': cypher})
                 assert out['error'].splitlines()[0] == headline.format(tool='query'), out

@@ -1145,6 +1145,18 @@ _SPLIT_READINGS = [
         f"MATCH (n:P) //\r'\nLOAD CSV FROM {_URL} AS r RETURN r //'",
         'Refused: LOAD CSV is not allowed on the read-only path',
     ),
+    (
+        f'MATCH (n:P) WITH n /*/ LOAD CSV FROM {_URL} AS r RETURN r //*/',
+        "Invalid {tool} input: '/' inside a block comment",
+    ),
+    (
+        f"MATCH (n:P) WITH n /*'/LOAD CSV FROM {_URL} AS r RETURN r /*'*/",
+        "Invalid {tool} input: '/' inside a block comment",
+    ),
+    (
+        f'MATCH (n:P) WITH n /* a / LOAD CSV FROM {_URL} AS r RETURN r //*/',
+        "Invalid {tool} input: '/' inside a block comment",
+    ),
 ]
 
 # (statement, the character the headline names)
@@ -1190,6 +1202,14 @@ def test_get_data_refuses_generated_split_readings_without_touching_the_server(c
 
     assert out == {'error': headline.format(tool='generated query'), 'query': cypher, 'valid': False}
     assert graph.calls == []  # not even EXPLAIN
+
+
+@pytest.mark.parametrize('cypher,headline', _SPLIT_READINGS)
+def test_explain_check_refuses_split_readings_without_touching_the_server(cypher, headline):
+    graph = _FakeGraph(_FakeResult(result_set=[[1]], header=[[1, 'r']]))
+    glb = _FakeGlobal(graph)
+    assert glb._validate_query(cypher) == (False, headline.format(tool='generated query'))
+    assert graph.calls == []
 
 
 @pytest.mark.parametrize('allow_writes', [False, True])

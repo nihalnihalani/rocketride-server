@@ -61,7 +61,8 @@ capped by Max read rows (at most 25,000); it is applied as an outer SQL LIMIT
 so the database stops early. It always uses the safe translation path and a
 READ ONLY transaction with the query timeout, whatever allow_execute says.
 A number written straight against a letter, an underscore or a `.` (`0LIMIT`,
-`1.`) is refused as invalid input before translation.
+`1.`), or a `/* … */` comment whose text holds a `/` (other engines end such a
+comment at that `/`), is refused as invalid input before translation.
 It returns {columns, rows, row_limit, truncated, truncated_by, element_limit,
 elements, value_limit, values}. Rows are positional, so a result that names
 the same column twice keeps both. Graph ids are AGE's 64-bit graphids as

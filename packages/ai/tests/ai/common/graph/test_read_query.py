@@ -384,6 +384,14 @@ SPLIT_READINGS = [
         f"MATCH (n:P) //\r'\nLOAD CSV FROM {_URL} AS r RETURN r //'",
         'Refused: LOAD CSV is not allowed on the read-only path',
     ),
+    (
+        f'MATCH (n:P) WITH n /*/ LOAD CSV FROM {_URL} AS r RETURN r //*/',
+        "Invalid {tool} input: '/' inside a block comment",
+    ),
+    (
+        f"MATCH (n:P) WITH n /*'/LOAD CSV FROM {_URL} AS r RETURN r /*'*/",
+        "Invalid {tool} input: '/' inside a block comment",
+    ),
 ]
 
 

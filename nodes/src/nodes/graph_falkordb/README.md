@@ -55,12 +55,13 @@ columns are always distinct here.
 
 The read paths (`read_query`, `query` with `allow_writes` off, and the Cypher
 that `get_data`, `get_query` and the questions lane generate) also refuse, as
-`Invalid … input`, two kinds of code text before the server is called: a
+`Invalid … input`, three kinds of code text before the server is called: a
 number that runs straight into a letter, an underscore or a `.` (write
 `SKIP 0 LIMIT 5` and `1.0`, not `0LIMIT` or `1.`; the range `1..3` is fine),
-and a non-ASCII character outside string literals and back-quoted names,
-comments included (non-ASCII text inside strings and back-quoted names is
-sent as written). A `//` comment that holds a carriage return without a line
+a `/* … */` comment whose text holds a `/` (FalkorDB ends the comment at that
+`/`; use a `//` comment for text such as a URL), and a non-ASCII character
+outside string literals and back-quoted names, comments included (non-ASCII
+text inside strings and back-quoted names is sent as written). A `//` comment that holds a carriage return without a line
 feed is read both ways it can end, and `LOAD CSV` in either reading is
 refused.
 

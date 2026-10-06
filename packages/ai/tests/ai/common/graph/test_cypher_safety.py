@@ -217,3 +217,38 @@ def test_a_comment_between_a_number_and_a_word_separates_them():
     """A stripped comment or string leaves a space behind, as the engine reads it."""
     assert is_cypher_safe('MATCH (n) WHERE n.x = 1/* note */AND n.y = 2 RETURN n') is True
     assert is_cypher_safe("MATCH (n) WHERE n.x = 1'a'CREATE (m)") is False
+
+
+@pytest.mark.parametrize(
+    'cypher',
+    [
+        "MATCH (n:P) WITH n /*/ LOAD CSV FROM 'https://example.invalid/x.csv' AS r RETURN r //*/",
+        "MATCH (n:P) WITH n /*/LOAD CSV FROM 'https://example.invalid/x.csv' AS r RETURN r /* */",
+        "MATCH (n:P) /*'/LOAD CSV FROM 'https://example.invalid/x.csv' AS r RETURN r",
+        "MATCH (n) /*'/CREATE (m) /*'*/",
+        'MATCH (n) /*`/DELETE n /*`*/',
+        'MATCH (n) /* a / DELETE n //*/',
+        'MATCH (n) /* see https://example.invalid */ RETURN n',
+        'MATCH (n) /*/*/ RETURN n',
+        'MATCH (n) /* open RETURN n',
+    ],
+)
+def test_block_comment_holding_a_slash_is_unsafe(cypher):
+    """FalkorDB ends a block comment at the first / after the /*, other engines at the first */."""
+    assert is_cypher_safe(cypher) is False
+
+
+@pytest.mark.parametrize(
+    'cypher',
+    [
+        'MATCH (n) /**/ RETURN n',
+        'MATCH (n) /***/ RETURN n',
+        'MATCH (n) /* note **/ RETURN n',
+        "MATCH (n) /* it's * */ RETURN n",
+        'RETURN 4 / /* c */ 2 AS x',
+        "RETURN '/*/' AS x, `/* a/b */` AS y",
+        'MATCH (n) // a /* b/c\nRETURN n',
+    ],
+)
+def test_block_comments_without_a_slash_stay_safe(cypher):
+    assert is_cypher_safe(cypher) is True

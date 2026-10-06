@@ -273,7 +273,8 @@ CR_HIDDEN_LOAD_CSV = [
     f"MATCH (n:P) //\r'\nLOAD CSV FROM {URL} AS r RETURN r //'",
     f'MATCH (n) //\r"\nLOAD CSV FROM {URL} AS r RETURN r //"',
     f'MATCH (n) //\r`\nLOAD CSV FROM {URL} AS r RETURN r //`',
-    f'MATCH (n) //\r/*\nLOAD CSV FROM {URL} AS r RETURN r //*/',
+    # The block comment holds no '/', so only the comment rule hides the clause.
+    'MATCH (n) //\r/*\nLOAD CSV FROM $url AS r RETURN r */',
 ]
 
 
@@ -311,6 +312,60 @@ def test_text_only_the_line_feed_reading_cannot_read_is_invalid_input():
     with pytest.raises(CypherInputError) as err:
         check_read_query_statement(cypher)
     assert err.value.headline == 'Invalid read_query input: unterminated string literal'
+
+
+# ---------------------------------------------------------------------------
+# A block comment ends at its first */ on Neo4j and Apache AGE, but FalkorDB
+# ends it at the first / after the /*: a / inside one is read differently
+# ---------------------------------------------------------------------------
+
+BLOCK_COMMENT_SLASH = [
+    f'MATCH (n:P) WITH n /*/ LOAD CSV FROM {URL} AS r RETURN r //*/',
+    f'MATCH (n:P) WITH n /*/LOAD CSV FROM {URL} AS r RETURN r /* */',
+    f'MATCH (n) /* a / LOAD CSV FROM {URL} AS r RETURN r //*/',
+    f"MATCH (n) /*'/LOAD CSV FROM {URL} AS r RETURN r /*'*/",
+    f'MATCH (n) /*`/LOAD CSV FROM {URL} AS r RETURN r /*`*/',
+    f'MATCH (n) //\r/*\nLOAD CSV FROM {URL} AS r RETURN r //*/',
+    'MATCH (n) /* see https://example.invalid */ RETURN n',
+    'MATCH (n) /*/*/ RETURN n',
+]
+
+BLOCK_COMMENTS = [
+    'MATCH (n) /**/ RETURN n',
+    'MATCH (n) /***/ RETURN n',
+    'MATCH (n) /* note */ RETURN n',
+    'MATCH (n) /* note **/ RETURN n',
+    "MATCH (n) /* it's * */ RETURN n",
+    'MATCH (n) /* a\r\nb */ RETURN n',
+    'MATCH (n) WHERE n.x = 1/*c*/ RETURN n',
+    'RETURN 4 / /* c */ 2 AS x',
+    "RETURN '/*/' AS x, `/* a/b */` AS y",
+    'MATCH (n) // a /* b/c\nRETURN n',
+]
+
+
+@pytest.mark.parametrize('cypher', BLOCK_COMMENT_SLASH)
+def test_a_slash_inside_a_block_comment_is_invalid_input(cypher):
+    with pytest.raises(CypherInputError) as err:
+        check_read_query_statement(cypher)
+    assert err.value.headline == "Invalid read_query input: '/' inside a block comment"
+    with pytest.raises(CypherInputError) as err:
+        check_read_query_statement(cypher, ascii_only=True)
+    assert err.value.headline == "Invalid read_query input: '/' inside a block comment"
+
+
+@pytest.mark.parametrize('cypher', BLOCK_COMMENT_SLASH)
+def test_the_neo4j_check_refuses_a_slash_inside_a_block_comment(cypher):
+    with pytest.raises(CypherRefused) as err:
+        check_read_only_cypher(cypher)
+    assert err.value.headline == "Refused: '/' inside a block comment"
+
+
+@pytest.mark.parametrize('cypher', BLOCK_COMMENTS)
+def test_block_comments_without_a_slash_pass(cypher):
+    check_read_query_statement(cypher)
+    check_read_query_statement(cypher, ascii_only=True)
+    check_read_only_cypher(cypher)
 
 
 # ---------------------------------------------------------------------------
