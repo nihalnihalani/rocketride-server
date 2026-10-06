@@ -41,11 +41,16 @@
 // node's "LLM failed to return a Cypher query." (a connected model that answered
 // nothing) and the SDK's "Server is not connected" mean something else. Every
 // other failure is described the way the browse editor describes one
-// (failures.ts), so an engine without get_query gets the upgrade wording.
+// (failures.ts), so an engine without get_query gets the upgrade wording, with
+// one difference: a timeout gets no hint. The browse editor's note is about a
+// database query still running, while Ask's wait is mostly the node's language
+// model, and the session's own timeout text already says the node may still be
+// working on it and that nothing here can cancel it.
 // Generated Cypher never runs automatically.
 // =============================================================================
 
 import { describeFailureOf } from './failures';
+import { STOP_WAITING_NOTE } from './wording';
 import { isPlainObject } from './values';
 
 /** What a `get_query` answer means. */
@@ -137,9 +142,14 @@ export async function askQuestion(question: string, call: (question: string) => 
 		const message = typeof e.message === 'string' ? e.message : String(error);
 		const failure = explainAskFailure({ kind, headline: typeof e.headline === 'string' ? e.headline : message.split('\n')[0], ...(typeof e.detail === 'string' ? { detail: e.detail } : {}) });
 		if (failure.unavailable) return { kind: 'unavailable', text: unavailableText };
-		// Ask sits on the browse surface, which never sends a write; the write-console hint is not offered here.
+		// Ask sits on the browse surface, so it is described with canWrite false: a raised write refusal gets the
+		// read-only hint ("Browsing is read-only. ..."), never the pointer to this connection's write console. The
+		// node's refusal of the Cypher its model wrote arrives as a {valid: false, error} verdict (kind `invalid`),
+		// which gets no hint at all.
 		const notice = describeFailureOf(message, error, false);
 		if (notice.ignore) return { kind: 'ignored' };
-		return { kind: 'failed', headline: notice.headline, detail: notice.detail, hint: notice.hint, variant: notice.variant };
+		// The browse editor's timeout note speaks of a database query; the session's own words say what Ask needs.
+		const hint = notice.hint === STOP_WAITING_NOTE ? null : notice.hint;
+		return { kind: 'failed', headline: notice.headline, detail: notice.detail, hint, variant: notice.variant };
 	}
 }
