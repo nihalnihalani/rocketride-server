@@ -36,7 +36,13 @@
 //   - a token that is not a colour at all (var(), a keyword, empty) falls back
 //     to a plain hex;
 //   - line numbers that would still read under 4.5:1 (WCAG 1.4.3, small text)
-//     are moved along their own lightness until they do.
+//     are moved along their own lightness until they do;
+//   - SYNTAX colours too: Monaco colours SQL with its built-in `vs` / `vs-dark`
+//     palettes, which were not chosen for these backgrounds (on RocketRide
+//     Light's #e8e7e1, operators are 2.94:1 and strings 3.23:1). Each token
+//     class keeps Monaco's colour when it already reaches 4.5:1 on the editor
+//     background, and otherwise gets a rule moving it along its own lightness
+//     (same hue, same saturation) until it does. No colour is written per theme.
 //
 // Pure: it takes a token reader rather than touching the DOM or Monaco, so a
 // test can build the colours for every shipped theme and measure them.
@@ -44,8 +50,34 @@
 // each other, so this is a separate, smaller copy of the logic.)
 // =============================================================================
 
-/** Text contrast the line numbers must reach (WCAG 1.4.3). */
+/** Text contrast the line numbers and syntax colours must reach (WCAG 1.4.3). */
 export const LINE_NUMBER_MIN_CONTRAST = 4.5;
+
+/** A Monaco token rule; `foreground` is `RRGGBB` (no `#`), the form Monaco's rules take. */
+export interface ITokenRule {
+	token: string;
+	foreground: string;
+}
+
+/**
+ * The token classes Monaco's sql, mysql and pgsql tokenizers produce that its
+ * own `vs` / `vs-dark` themes colour, with those colours
+ * (monaco-editor/esm/vs/editor/standalone/common/themes.js). Every SQL token
+ * carries the `.sql` postfix, and a rule colours every token it is a prefix of:
+ * `comment` also colours `comment.quote.sql`, and `string` colours MySQL's
+ * `string.double.sql`. Identifiers and whitespace have no entry: they are drawn
+ * in the editor's foreground, which is already held to the same contrast.
+ */
+export const SQL_TOKEN_BASES: ReadonlyArray<{ token: string; light: string; dark: string }> = [
+	{ token: 'keyword', light: '0000FF', dark: '569CD6' },
+	{ token: 'string', light: 'A31515', dark: 'CE9178' },
+	{ token: 'string.sql', light: 'FF0000', dark: 'FF0000' },
+	{ token: 'number', light: '098658', dark: 'B5CEA8' },
+	{ token: 'comment', light: '008000', dark: '608B4E' },
+	{ token: 'operator.sql', light: '778899', dark: '778899' },
+	{ token: 'predefined.sql', light: 'C700C7', dark: 'FF00FF' },
+	{ token: 'delimiter', light: '000000', dark: 'DCDCDC' },
+];
 
 /** An opaque sRGB colour, 0-255 per channel. */
 export interface Rgb {
@@ -70,10 +102,12 @@ export interface IEditorColors {
 	'editorLineNumber.activeForeground': string;
 }
 
-/** The editor theme: Monaco's base palette and its colours. */
+/** The editor theme: Monaco's base palette, its colours and the token rules it adds. */
 export interface IEditorTheme {
 	dark: boolean;
 	colors: IEditorColors;
+	/** Rules only for the token classes whose Monaco colour does not reach 4.5:1 (empty when all do). */
+	rules: ITokenRule[];
 }
 
 const clamp = (value: number, low: number, high: number): number => Math.max(low, Math.min(high, value));
@@ -212,10 +246,29 @@ export function ensureContrast(color: Rgb, background: Rgb, minimum: number = LI
 }
 
 /**
+ * The token rules for a palette and an editor background: a rule only for a
+ * token class whose Monaco colour does not reach 4.5:1, moved along its own
+ * lightness until it does.
+ *
+ * @param dark - Whether the palette is dark (Monaco's `vs-dark` base).
+ * @param background - The editor's background, opaque.
+ * @returns Rules for the failing token classes.
+ */
+export function sqlTokenRules(dark: boolean, background: Rgb): ITokenRule[] {
+	const rules: ITokenRule[] = [];
+	for (const { token, light, dark: darkBase } of SQL_TOKEN_BASES) {
+		const base = parseCssColor(`#${dark ? darkBase : light}`) as Rgba;
+		const adjusted = ensureContrast(base, background);
+		if (adjusted !== base) rules.push({ token, foreground: toHex(adjusted).slice(1).toUpperCase() });
+	}
+	return rules;
+}
+
+/**
  * The editor's Monaco theme from the shell's tokens.
  *
  * @param read - Reads a --rr-* custom property ('' when unset).
- * @returns Whether the palette is dark, and four #rrggbb colours.
+ * @returns Whether the palette is dark, four #rrggbb colours and the token rules.
  */
 export function editorTheme(read: TokenReader): IEditorTheme {
 	const token = (name: string): string => read(name).trim();
@@ -243,5 +296,6 @@ export function editorTheme(read: TokenReader): IEditorTheme {
 			'editorLineNumber.foreground': lineNumber('--rr-text-secondary', '#666666'),
 			'editorLineNumber.activeForeground': lineNumber('--rr-text-primary', '#1a1a1a'),
 		},
+		rules: sqlTokenRules(dark, background),
 	};
 }

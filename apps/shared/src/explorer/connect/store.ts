@@ -38,11 +38,41 @@
 //   - the sessions it opens (`session(client, endpoint)`), which read the
 //     token from the vault at call time and never keep it.
 //
+// A VANISHED ENDPOINT KEEPS ITS TOKEN
+//   Discovery lists RUNNING tasks only, so a task that is restarting vanishes
+//   from it exactly like one that was stopped. The endpoint is shown `stopped`,
+//   but its token (and the node's last `dialect` answer, which the session needs
+//   for its capability check and budget) stay until the endpoint is discovered
+//   again or the store is reset. A call made meanwhile is still SENT, and that
+//   is its first send, not a retry. The server holds it until a restarting
+//   task is running again. A task stopped within the last few minutes is still
+//   registered and answers TASK_STOPPED, so an idempotent call first gets the
+//   session's one bounded re-discovery (up to its retry window, 15 s by
+//   default) and then fails with that code; a task that is no longer
+//   registered answers TASK_NOT_REGISTERED at once. A call is refused locally
+//   (`unavailable`) only for an endpoint whose latest discovery row carried no
+//   token or reported it `stopped` (a required role not running): its token is
+//   dropped then.
+//
 // WHEN IT REFRESHES
 //   explicitly (`refresh`), on task events (debounced), and on window focus
 //   (debounced and rate-limited) — never on a timer. Concurrent refreshes
 //   coalesce: while one is running, any number of triggers produce exactly ONE
 //   follow-up. A newer refresh's result is never overwritten by an older one.
+//
+// WHEN IT PROBES AGAIN
+//   A probe is a tool call, and a tool call that reaches a task counts as
+//   activity for that task's idle timeout. So an endpoint whose last probe
+//   failed AT THE NODE (`unreachable`, `inaccessible`) is probed again only
+//   when somebody asked: an explicit `refresh`, a restart or reconnect
+//   (`reprobe`), `probe` (Test connection), or a changed token. A refresh
+//   nobody asked for (focus, an ordinary task event, a rebind) keeps its last
+//   answer. An endpoint whose probe said its task is not running is cheap to
+//   ask again (the server refuses before the task) and is probed on any refresh.
+//   An endpoint that vanished from discovery is not probed at all: `probe`
+//   sends nothing and answers null, and an answer to a probe that was in
+//   flight when it vanished is not applied (the card stays `stopped`). It is
+//   probed when a discovery lists it again, on any refresh.
 //
 // WHEN IT FORGETS
 //   `reset()` — on sign-out and on a change of user, organization or team —
@@ -123,6 +153,13 @@ export interface IEndpointStoreOptions {
 	debounceMs?: number;
 	/** A focus-triggered refresh is skipped within this long of the last one (default 5 s). */
 	focusMinIntervalMs?: number;
+	/**
+	 * How long one discovery may take before the refresh gives up and reports
+	 * status `error` (default 30 s). Without a bound, a server that never
+	 * answers would keep the refresh, and every refresh coalesced into it,
+	 * waiting forever.
+	 */
+	discoveryTimeoutMs?: number;
 	/** Clock and timers (default: real). */
 	clock?: IStoreClock;
 }
@@ -135,13 +172,19 @@ export interface IEndpointStore {
 	subscribe(listener: () => void): () => void;
 	/**
 	 * Discover (and probe) now. Concurrent calls coalesce: one runs, and a call
-	 * made while it runs causes exactly one follow-up.
+	 * made while it runs causes exactly one follow-up. This is the refresh a
+	 * person asked for, so endpoints whose last probe failed are probed again
+	 * (the store's own background refreshes do not; see "WHEN IT PROBES AGAIN").
 	 */
 	refresh(client: IExplorerClient, opts?: { reprobe?: boolean }): Promise<void>;
 	/**
 	 * Probe one endpoint again now (the drawer's "Test connection").
 	 *
-	 * @returns The result, or null when the endpoint is unknown or has no token.
+	 * @returns The result, or null when nothing was tested: the endpoint is
+	 *   unknown, has no token, is no longer listed by discovery (its pipeline
+	 *   stopped or is restarting; nothing is sent), or a check of it is already
+	 *   running. Also null when the pipeline left the list or the store was
+	 *   reset before the node answered: that answer is not applied.
 	 */
 	probe(client: IExplorerClient, endpointKey: string): Promise<IProbeResult | null>;
 	/**
@@ -194,6 +237,7 @@ export function createEndpointStore(options: IEndpointStoreOptions): IEndpointSt
 	const concurrency = options.concurrency ?? 4;
 	const debounceMs = options.debounceMs ?? 300;
 	const focusMinIntervalMs = options.focusMinIntervalMs ?? 5_000;
+	const discoveryTimeoutMs = options.discoveryTimeoutMs ?? 30_000;
 	const clock: IStoreClock = options.clock ?? {
 		now: () => Date.now(),
 		setTimer: (fn, ms) => setTimeout(fn, ms),
@@ -218,6 +262,21 @@ export function createEndpointStore(options: IEndpointStoreOptions): IEndpointSt
 	const callHints = new Map<string, boolean | undefined>();
 	/** Sessions already opened, by endpoint key and client. */
 	const sessions = new Map<string, { client: IExplorerClient; session: IToolSession }>();
+	/**
+	 * The last good `dialect` answer of an endpoint that vanished from discovery
+	 * while its token is kept (see "A VANISHED ENDPOINT KEEPS ITS TOKEN"). Read by
+	 * sessions only; never published. A good answer to a probe that was in flight
+	 * when the endpoint vanished replaces it. Cleared when a probe of the listed
+	 * endpoint reports again, when it is discovered without a usable token, and
+	 * on reset.
+	 */
+	const keptInfo = new Map<string, Record<string, unknown>>();
+	/**
+	 * Keys listed only because they vanished from the latest discovery. Such an
+	 * endpoint is not probed: `probe` sends nothing for it, and a probe answer
+	 * that arrives after it vanished is not applied (see "WHEN IT PROBES AGAIN").
+	 */
+	const vanished = new Set<string>();
 
 	/** Bumped by reset(): anything in flight that started before it is dropped on arrival. */
 	let resetCount = 0;
@@ -227,7 +286,7 @@ export function createEndpointStore(options: IEndpointStoreOptions): IEndpointSt
 	let identityNow: IExplorerIdentity | null = null;
 
 	let inFlight: Promise<void> | null = null;
-	let followUp: { reprobe: boolean } | null = null;
+	let followUp: { reprobe: boolean; background: boolean } | null = null;
 	let debounceTimer: unknown = null;
 	let pendingDebounce: { client: IExplorerClient; reprobe: boolean } | null = null;
 	let lastRefreshStartedAt = 0;
@@ -330,6 +389,14 @@ export function createEndpointStore(options: IEndpointStoreOptions): IEndpointSt
 				ok: false, info: null, dialect: null, error: { kind: 'raised', message: error instanceof Error ? error.message : String(error) },
 			}));
 			if (epochAfterReset(startedReset) || vault.get(endpoint.key) !== tokenAtStart) return null;
+			if (vanished.has(endpoint.key)) {
+				// The pipeline left the list while the node answered. The card stays
+				// `stopped` and is probed when discovery lists it again; a good answer
+				// from the same token still serves the session meanwhile.
+				if (result.ok && isPlainObject(result.info)) keptInfo.set(endpoint.key, result.info);
+				return null;
+			}
+			keptInfo.delete(endpoint.key);
 			const outcome = classify(endpoint, result);
 			patchEndpoint(endpoint.key, { state: outcome.state, stateDetail: outcome.detail }, result);
 			return result;
@@ -362,7 +429,7 @@ export function createEndpointStore(options: IEndpointStoreOptions): IEndpointSt
 			token: () => vault.get(endpoint.key),
 			info: () => {
 				const probe = state.probes[endpoint.key];
-				return probe?.ok ? probe.info : null;
+				return probe?.ok ? probe.info : keptInfo.get(endpoint.key) ?? null;
 			},
 			rebind: (deadlineAt: number) => rebind(client, endpoint.key, deadlineAt),
 			now: clock.now,
@@ -382,7 +449,7 @@ export function createEndpointStore(options: IEndpointStoreOptions): IEndpointSt
 	async function rebind(client: IExplorerClient, key: string, deadlineAt: number): Promise<boolean> {
 		const pollMs = options.session?.retry?.pollMs ?? 1_000;
 		for (;;) {
-			await refresh(client, { awaitProbes: false });
+			await refresh(client, { awaitProbes: false, background: true });
 			const endpoint = state.endpoints.find((candidate) => candidate.key === key);
 			if (endpoint !== undefined && endpoint.state !== 'stopped' && vault.has(key)) return true;
 			if (clock.now() + pollMs > deadlineAt) return false;
@@ -404,15 +471,18 @@ export function createEndpointStore(options: IEndpointStoreOptions): IEndpointSt
 	 * Fold a fresh discovery into the store.
 	 *
 	 * Endpoints that disappeared are KEPT, marked `stopped` (the badge a
-	 * workbench needs), and their token is dropped; endpoints that reappeared
-	 * or are new get probed; endpoints already ready keep their probe unless
+	 * workbench needs), with their token and last good `dialect` answer kept
+	 * for calls (a restarting task vanishes too); endpoints that reappeared or
+	 * are new get probed; endpoints already ready keep their probe unless
 	 * `reprobe` is set; endpoints whose last probe failed are probed again.
 	 *
 	 * @param found - What discovery returned.
 	 * @param reprobe - Re-check endpoints that were already ready.
+	 * @param background - Nobody asked for this refresh: keep the answer of an
+	 *   endpoint whose probe failed at the node (see "WHEN IT PROBES AGAIN").
 	 * @returns The endpoints that need a probe.
 	 */
-	function merge(found: IDiscoveredEndpoint[], reprobe: boolean): IExplorerEndpoint[] {
+	function merge(found: IDiscoveredEndpoint[], reprobe: boolean, background: boolean): IExplorerEndpoint[] {
 		const previous = new Map(state.endpoints.map((endpoint) => [endpoint.key, endpoint]));
 		const next: IExplorerEndpoint[] = [];
 		const probes: Record<string, IProbeResult> = { ...state.probes };
@@ -421,15 +491,20 @@ export function createEndpointStore(options: IEndpointStoreOptions): IEndpointSt
 
 		for (const { endpoint, token, callHint } of found) {
 			live.add(endpoint.key);
+			vanished.delete(endpoint.key);
 			callHints.set(endpoint.key, callHint);
 			const before = previous.get(endpoint.key);
 			const tokenChanged = vault.get(endpoint.key) !== (token ?? undefined);
 			if (token !== null) vault.set(endpoint.key, token);
-			else vault.delete(endpoint.key);
+			else {
+				vault.delete(endpoint.key);
+				keptInfo.delete(endpoint.key);
+			}
 
 			if (endpoint.state === 'stopped') {
 				// A required role is not running: nothing to probe, nothing to call.
 				vault.delete(endpoint.key);
+				keptInfo.delete(endpoint.key);
 				delete probes[endpoint.key];
 				next.push(endpoint);
 				continue;
@@ -440,6 +515,15 @@ export function createEndpointStore(options: IEndpointStoreOptions): IEndpointSt
 				next.push({ ...endpoint, state: 'ready', running: true });
 				continue;
 			}
+			const failedAtNode = before !== undefined && probes[endpoint.key]?.ok === false
+				&& (before.state === 'unreachable' || before.state === 'inaccessible');
+			if (failedAtNode && background && !reprobe && !tokenChanged) {
+				// Nobody asked: keep the last answer rather than call the node again.
+				const kept: IExplorerEndpoint = { ...endpoint, state: before.state, running: false };
+				if (before.stateDetail !== undefined) kept.stateDetail = before.stateDetail;
+				next.push(kept);
+				continue;
+			}
 			delete probes[endpoint.key];
 			next.push(endpoint);
 			toProbe.push(endpoint);
@@ -447,10 +531,13 @@ export function createEndpointStore(options: IEndpointStoreOptions): IEndpointSt
 
 		for (const [key, endpoint] of previous) {
 			if (live.has(key)) continue;
-			vault.delete(key);
+			vanished.add(key);
+			// The token stays in the vault (see "A VANISHED ENDPOINT KEEPS ITS
+			// TOKEN"), with the node's last good answer for the session.
+			const lastProbe = probes[key];
+			if (vault.has(key) && lastProbe?.ok === true && isPlainObject(lastProbe.info)) keptInfo.set(key, lastProbe.info);
 			callHints.delete(key);
 			delete probes[key];
-			sessions.delete(key);
 			next.push(endpoint.state === 'stopped' ? endpoint : { ...endpoint, state: 'stopped', running: false, stateDetail: 'This pipeline is no longer running.' });
 		}
 
@@ -458,10 +545,35 @@ export function createEndpointStore(options: IEndpointStoreOptions): IEndpointSt
 		return toProbe;
 	}
 
-	async function refresh(client: IExplorerClient, opts: { reprobe?: boolean; awaitProbes?: boolean } = {}): Promise<void> {
+	/**
+	 * Run discovery, bounded by the discovery timeout. A late answer (or late
+	 * failure) after the timeout is dropped.
+	 *
+	 * @param client - The client.
+	 * @returns What discovery found.
+	 */
+	function boundedDiscovery(client: IExplorerClient): Promise<IDiscoveredEndpoint[]> {
+		const discovery = discoverToolEndpoints(client, { providers: options.providers, roles: options.roles, identity: identityNow, concurrency });
+		return new Promise<IDiscoveredEndpoint[]>((resolve, reject) => {
+			const timer = clock.setTimer(() => {
+				discovery.catch(() => undefined);
+				reject(new Error(`The server did not answer within ${Math.round(discoveryTimeoutMs / 1000)} s with the list of running pipelines. Refresh to try again.`));
+			}, discoveryTimeoutMs);
+			discovery.then(
+				(found) => { clock.clearTimer(timer); resolve(found); },
+				(error: unknown) => { clock.clearTimer(timer); reject(error); },
+			);
+		});
+	}
+
+	async function refresh(client: IExplorerClient, opts: { reprobe?: boolean; awaitProbes?: boolean; background?: boolean } = {}): Promise<void> {
 		if (inFlight !== null) {
-			// Coalesce: any number of triggers while one runs cause ONE follow-up.
-			followUp = { reprobe: (followUp?.reprobe ?? false) || opts.reprobe === true };
+			// Coalesce: any number of triggers while one runs cause ONE follow-up,
+			// which counts as asked for when any of them was.
+			followUp = {
+				reprobe: (followUp?.reprobe ?? false) || opts.reprobe === true,
+				background: (followUp?.background ?? true) && opts.background === true,
+			};
 			return inFlight;
 		}
 		const startedEpoch = resetCount;
@@ -470,9 +582,9 @@ export function createEndpointStore(options: IEndpointStoreOptions): IEndpointSt
 
 		const run = (async (): Promise<void> => {
 			try {
-				const found = await discoverToolEndpoints(client, { providers: options.providers, roles: options.roles, identity: identityNow, concurrency });
+				const found = await boundedDiscovery(client);
 				if (epochAfterReset(startedEpoch)) return;
-				const toProbe = merge(found, opts.reprobe === true);
+				const toProbe = merge(found, opts.reprobe === true, opts.background === true);
 				setState({ ...state, status: 'ready', error: null, refreshedAt: clock.now() });
 				const probes = mapWithConcurrency(toProbe, concurrency, (endpoint) => runProbe(client, endpoint));
 				// A re-discovery done to rebind a restarted endpoint must not wait on
@@ -501,7 +613,7 @@ export function createEndpointStore(options: IEndpointStoreOptions): IEndpointSt
 
 	async function probe(client: IExplorerClient, endpointKey: string): Promise<IProbeResult | null> {
 		const endpoint = state.endpoints.find((candidate) => candidate.key === endpointKey);
-		if (endpoint === undefined || !vault.has(endpointKey)) return null;
+		if (endpoint === undefined || vanished.has(endpointKey) || !vault.has(endpointKey)) return null;
 		patchEndpoint(endpointKey, { state: 'probing', stateDetail: undefined }, null);
 		return runProbe(client, endpoint);
 	}
@@ -530,7 +642,7 @@ export function createEndpointStore(options: IEndpointStoreOptions): IEndpointSt
 			debounceTimer = null;
 			const job = pendingDebounce;
 			pendingDebounce = null;
-			if (job !== null) void refresh(job.client, { reprobe: job.reprobe });
+			if (job !== null) void refresh(job.client, { reprobe: job.reprobe, background: true });
 		}, debounceMs);
 	}
 
@@ -539,6 +651,8 @@ export function createEndpointStore(options: IEndpointStoreOptions): IEndpointSt
 		probing.clear();
 		cancelDebounce();
 		vault.clear();
+		keptInfo.clear();
+		vanished.clear();
 		callHints.clear();
 		sessions.clear();
 		inFlight = null;

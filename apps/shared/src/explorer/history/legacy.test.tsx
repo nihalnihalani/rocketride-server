@@ -27,8 +27,10 @@
 // The owner-aware connection key replaces SQL Explorer's `projectId:source:nodeId`.
 // Everything saved under the old key — history entries, the recording switch,
 // the pattern-check switch — must still be read, without migrating, renaming
-// or deleting anything, and without ever being read across owners or across dev
-// and deploy.
+// or deleting anything behind the user's back, and without ever being read
+// across owners or across dev and deploy. No automatic write touches the old
+// list (a run, the bound, a pin or note copy), for any team context that reads
+// it; only the user's own Delete or Clear removes entries from it.
 // =============================================================================
 
 import { describe, it } from 'node:test';
@@ -48,6 +50,8 @@ const BATCH_MS = 10;
 
 /** The user's own dev run: the only connection the old key could have meant. */
 const DEV = buildEndpointKey({ runKind: 'dev', ownerKind: 'user', ownerId: 'u1', teamId: 't', projectId: 'proj-1', roles: { tools: 'tools_1' }, nodeId: 'db_1' });
+/** The user's own dev run of the same pipeline under ANOTHER development team: it reads the same old list. */
+const DEV_OTHER_TEAM = buildEndpointKey({ runKind: 'dev', ownerKind: 'user', ownerId: 'u1', teamId: 't2', projectId: 'proj-1', roles: { tools: 'tools_1' }, nodeId: 'db_1' });
 /** The team's deployment of the SAME project, source and node. */
 const DEPLOY = buildEndpointKey({ runKind: 'deploy', ownerKind: 'team', ownerId: 'team-1', teamId: 'team-1', projectId: 'proj-1', roles: { tools: 'tools_1' }, nodeId: 'db_1' });
 /** What SQL Explorer saved before the key changed. */
@@ -148,6 +152,28 @@ function stored(prefs: IFakePrefs, key: string): Array<Record<string, unknown>> 
 
 const OLD_LIST = [saved('o2', 'SELECT 2', 20, { pinned: true, note: 'keep me' }), saved('o1', 'SELECT 1', 10)];
 
+/**
+ * A full old list: 100 entries, newest first.
+ *
+ * @param count - How many.
+ * @returns The entries.
+ */
+function fullOldList(count = 100): Array<Record<string, unknown>> {
+	return Array.from({ length: count }, (_, i) => saved(`o${count - i}`, `SELECT ${count - i}`, (count - i) * 10));
+}
+
+/**
+ * Record one run under a connection.
+ *
+ * @param store - The store.
+ * @param key - The connection.
+ * @param id - The entry id.
+ * @param at - Its time.
+ */
+function runOn(store: ReturnType<typeof sqlStore>, key: string, id: string, at: number): void {
+	store.runs.emitRun(key, { id, sql: `SELECT '${id}'`, at, ms: 1, outcome: 'rows', rows: 1, kind: 'read' } as IHistoryEntry<'sql'>);
+}
+
 // =============================================================================
 // HISTORY
 // =============================================================================
@@ -209,51 +235,107 @@ describe('history under a legacy key', () => {
 		}
 	});
 
-	it('pins, annotates and removes an old entry IN PLACE, in the old list', async () => {
+	it('pins and annotates an old entry through a COPY under the new key; the old list is untouched', async () => {
 		const store = sqlStore();
 		const prefs = fakePrefs({ 'sql.history': { [OLD]: OLD_LIST } });
 		const detach = store.attachPrefs(prefs.api);
 		try {
 			store.togglePin(DEV, 'o1');
 			store.setNote(DEV, 'o1', 'from the new key');
-			store.removeEntry(DEV, 'o2');
 			await settle();
-			assert.deepEqual(stored(prefs, OLD)?.map((e) => ({ id: e.id, pinned: e.pinned, note: e.note })), [{ id: 'o1', pinned: true, note: 'from the new key' }]);
-			assert.equal(stored(prefs, DEV), undefined);
+			assert.deepEqual(stored(prefs, OLD), OLD_LIST);
+			assert.deepEqual(stored(prefs, DEV)?.map((e) => ({ id: e.id, sql: e.sql, pinned: e.pinned, note: e.note })), [{ id: 'o1', sql: 'SELECT 1', pinned: true, note: 'from the new key' }]);
+			// The copy stands in for the original: one row, pinned and annotated.
+			assert.deepEqual(ids(store, DEV), ['o2', 'o1']);
+			// Another team context still reads the original, unchanged.
+			assert.deepEqual(ids(store, DEV_OTHER_TEAM), ['o2', 'o1']);
 		} finally {
 			detach();
 		}
 	});
 
-	it('collapses a re-run of an old statement onto the old entry, keeping its pin and note', async () => {
+	it('deletes an old entry from the stored old list too, so its text leaves the preferences file', async () => {
+		const prefs = fakePrefs({ 'sql.history': { [OLD]: OLD_LIST } });
+		const store = sqlStore();
+		let detach = store.attachPrefs(prefs.api);
+		try {
+			store.removeEntry(DEV, 'o2');
+			await settle();
+			assert.deepEqual(stored(prefs, OLD), [OLD_LIST[1]], 'Delete takes exactly the deleted id out of the old list');
+			assert.equal(JSON.stringify(prefs.values).includes('SELECT 2'), false, 'the deleted statement is still in the file');
+			assert.equal(JSON.stringify(prefs.values).includes('keep me'), false, 'the deleted note is still in the file');
+			assert.deepEqual(Object.keys(prefs.values).sort(), ['sql.history', 'sql.historyRecording']);
+			assert.deepEqual(ids(store, DEV), ['o1']);
+			// The old list is shared: the same dev run under another team no longer sees it either.
+			assert.deepEqual(ids(store, DEV_OTHER_TEAM), ['o1']);
+		} finally {
+			detach();
+		}
+		const reloaded = sqlStore();
+		detach = reloaded.attachPrefs(prefs.api);
+		try {
+			assert.deepEqual(ids(reloaded, DEV), ['o1']);
+		} finally {
+			detach();
+		}
+	});
+
+	it('deletes both the copy under the new key and the original when an old entry was pinned first', async () => {
+		const prefs = fakePrefs({ 'sql.history': { [OLD]: OLD_LIST } });
+		const store = sqlStore();
+		const detach = store.attachPrefs(prefs.api);
+		try {
+			store.togglePin(DEV, 'o1');
+			await settle();
+			assert.deepEqual(stored(prefs, DEV)?.map((e) => e.id), ['o1']);
+			store.removeEntry(DEV, 'o1');
+			await settle();
+			assert.equal(stored(prefs, DEV), undefined);
+			assert.deepEqual(stored(prefs, OLD), [OLD_LIST[0]]);
+			assert.equal(JSON.stringify(prefs.values).includes('SELECT 1'), false, 'the deleted statement is still in the file');
+			assert.deepEqual(ids(store, DEV), ['o2']);
+		} finally {
+			detach();
+		}
+	});
+
+	it('collapses a re-run of an old statement onto a copy of the old entry, keeping its pin and note', async () => {
 		const store = sqlStore();
 		const prefs = fakePrefs({ 'sql.history': { [OLD]: OLD_LIST } });
 		const detach = store.attachPrefs(prefs.api);
 		try {
 			store.runs.emitRun(DEV, { id: 'again', sql: 'SELECT 2', at: 40, ms: 9, outcome: 'rows', rows: 5, kind: 'read' } as IHistoryEntry<'sql'>);
 			await settle();
-			const old = stored(prefs, OLD)!;
-			assert.deepEqual(old.map((e) => e.id), ['o2', 'o1']);
-			assert.equal(old[0]!.pinned, true);
-			assert.equal(old[0]!.note, 'keep me');
-			assert.equal(old[0]!.at, 40);
-			assert.equal(old[0]!.rows, 5);
-			assert.equal(stored(prefs, DEV), undefined);
+			assert.deepEqual(stored(prefs, OLD), OLD_LIST);
+			const own = stored(prefs, DEV)!;
+			assert.deepEqual(own.map((e) => e.id), ['o2']);
+			assert.equal(own[0]!.pinned, true);
+			assert.equal(own[0]!.note, 'keep me');
+			assert.equal(own[0]!.at, 40);
+			assert.equal(own[0]!.rows, 5);
+			assert.deepEqual(ids(store, DEV), ['o2', 'o1']);
 		} finally {
 			detach();
 		}
 	});
 
-	it('clears BOTH lists, and a cleared old list never comes back', async () => {
+	it('clears the connection\'s own list AND every old entry, one beyond the visible bound included', async () => {
 		const store = sqlStore();
-		const prefs = fakePrefs({ 'sql.history': { [OLD]: OLD_LIST, [DEV]: [saved('n0', 'SELECT 0', 5)] } });
+		const full = fullOldList();
+		const prefs = fakePrefs({ 'sql.history': { [OLD]: full, [DEV]: [saved('n0', 'SELECT 0', 5_000)] } });
 		const detach = store.attachPrefs(prefs.api);
 		try {
+			// 101 entries: the view shows 100, so the oldest old entry is stored but not shown.
+			assert.equal(ids(store, DEV).length, 100);
 			store.clearForKey(DEV);
 			await settle();
 			assert.equal(stored(prefs, DEV), undefined);
-			assert.equal(stored(prefs, OLD), undefined);
+			assert.equal(stored(prefs, OLD), undefined, 'Clear must empty the old list');
+			assert.equal(JSON.stringify(prefs.values).includes('SELECT'), false, 'a cleared statement is still in the file');
+			assert.deepEqual(Object.keys(prefs.values).sort(), ['sql.history', 'sql.historyRecording']);
 			assert.deepEqual(ids(store, DEV), []);
+			// The old list is shared: the same dev run under another team no longer sees it either.
+			assert.deepEqual(ids(store, DEV_OTHER_TEAM), []);
 		} finally {
 			detach();
 		}
@@ -263,6 +345,41 @@ describe('history under a legacy key', () => {
 			assert.deepEqual(ids(reloaded, DEV), []);
 		} finally {
 			again();
+		}
+	});
+
+	it('never prunes a FULL old list: a new run bounds the view, not the stored list', async () => {
+		const store = sqlStore();
+		const full = fullOldList();
+		const prefs = fakePrefs({ 'sql.history': { [OLD]: full } });
+		const detach = store.attachPrefs(prefs.api);
+		try {
+			runOn(store, DEV, 'n1', 5_000);
+			await settle();
+			assert.deepEqual(stored(prefs, OLD), full, 'the old list must be stored exactly as it was');
+			assert.deepEqual(stored(prefs, DEV)?.map((e) => e.id), ['n1']);
+			const view = ids(store, DEV);
+			assert.equal(view.length, 100);
+			assert.equal(view[0], 'n1');
+		} finally {
+			detach();
+		}
+	});
+
+	it('never lets one team context\'s runs wipe the old entries another team context reads', async () => {
+		const store = sqlStore();
+		const legacy = fullOldList(50);
+		const prefs = fakePrefs({ 'sql.history': { [OLD]: legacy } });
+		const detach = store.attachPrefs(prefs.api);
+		try {
+			for (let i = 1; i <= 100; i += 1) runOn(store, DEV, `a${i}`, 10_000 + i);
+			await settle();
+			assert.deepEqual(stored(prefs, OLD), legacy);
+			assert.equal(stored(prefs, DEV)?.length, 100);
+			assert.equal(ids(store, DEV).length, 100);
+			assert.deepEqual(ids(store, DEV_OTHER_TEAM), legacy.map((e) => e.id));
+		} finally {
+			detach();
 		}
 	});
 

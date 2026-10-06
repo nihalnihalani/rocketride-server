@@ -37,8 +37,9 @@
 //     and the user may decline (the rest are skipped), run, or run and stop asking;
 //   - a refusal vetoes the WHOLE batch before anything is sent;
 //   - when the owner invalidates the batch's ticket (Stop waiting, a new run,
-//     the document closing) the batch stops touching state at once: a late
-//     answer, and a late failure, are DROPPED — never shown, never recorded;
+//     the owner unmounting: a closed document or a switch to another app) the
+//     batch stops at once: nothing more is sent, and a late answer, and a late
+//     failure, are DROPPED — never shown, never recorded;
 //   - every finished statement is recorded exactly once, through `record`.
 // =============================================================================
 

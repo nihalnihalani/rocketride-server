@@ -16,7 +16,10 @@
 		],
 		"mode": "free",
 		"authenticated": true,
-		"showStatusBar": true
+		"showStatusBar": true,
+		"include": [
+			"apps/shared"
+		]
 	},
 	"scripts": {
 		"build": "rsbuild build",

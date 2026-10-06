@@ -30,6 +30,11 @@
 // so passing that token straight through painted every inactive line number
 // red (3.23:1 on RocketRide Light's paper). These tests read the real theme
 // files and check the colours the editor would hand to Monaco, in all six.
+//
+// The same holds for SYNTAX colours: Monaco's own `vs` / `vs-dark` token
+// colours were not chosen for these backgrounds. They are read here from the
+// installed Monaco, and every SQL token class must reach 4.5:1 on the editor
+// background in every shipped theme, through the rules the editor adds.
 // =============================================================================
 
 import { describe, it } from 'node:test';
@@ -37,6 +42,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { editorTheme, ensureContrast, monacoHex, parseCssColor } from '../src/components/editorTheme';
+import type { IEditorTheme } from '../src/components/editorTheme';
 
 /** An sRGB colour, 0-255 per channel. */
 interface Rgb {
@@ -135,6 +141,84 @@ describe('shipped theme editor colours', () => {
 		const lineNumber = rgbOf(editorTheme(reader(tokens)).colors['editorLineNumber.foreground']);
 		assert.ok(lineNumber.r > 0x73, 'moved lighter than the blended colour');
 		assert.ok(lineNumber.r === lineNumber.g && lineNumber.g === lineNumber.b, 'same hue and saturation: still grey');
+	});
+});
+
+// =============================================================================
+// SYNTAX COLOURS
+// =============================================================================
+
+/** Monaco's built-in token rules for one base theme, read from the installed package. */
+function monacoBaseRules(base: 'vs' | 'vs-dark'): Map<string, string> {
+	const source = fs.readFileSync(path.resolve(__dirname, '..', 'node_modules', 'monaco-editor', 'esm', 'vs', 'editor', 'standalone', 'common', 'themes.js'), 'utf8');
+	const block = new RegExp(`base: '${base}',[\\s\\S]*?rules: \\[([\\s\\S]*?)\\],\\s*colors`).exec(source);
+	assert.ok(block, `Monaco's ${base} rules`);
+	const rules = new Map<string, string>();
+	for (const match of block[1]!.matchAll(/\{ token: '([^']*)', foreground: '([0-9a-fA-F]{6})'/g)) rules.set(match[1]!, match[2]!);
+	return rules;
+}
+
+/** The token classes the sql, mysql and pgsql tokenizers emit (every one carries the `.sql` postfix). */
+const SQL_TOKENS = [
+	'keyword', 'keyword.try', 'keyword.catch', 'keyword.choice', 'keyword.block',
+	'string', 'string.double', 'number', 'comment', 'comment.quote', 'operator', 'predefined',
+	'delimiter', 'delimiter.parenthesis', 'delimiter.square', 'identifier', 'identifier.quote', 'white',
+].map((token) => `${token}.sql`);
+
+/**
+ * The colour Monaco draws a token in: the most specific rule whose scope is a
+ * prefix of the token (the theme's own rules over the base's), else the
+ * editor foreground.
+ *
+ * @param token - The token class.
+ * @param theme - The editor theme.
+ * @returns `#rrggbb`.
+ */
+function drawnColour(token: string, theme: IEditorTheme): string {
+	const rules = monacoBaseRules(theme.dark ? 'vs-dark' : 'vs');
+	for (const rule of theme.rules) rules.set(rule.token, rule.foreground);
+	const parts = token.split('.');
+	for (let i = parts.length; i > 0; i--) {
+		const hit = rules.get(parts.slice(0, i).join('.'));
+		if (hit !== undefined) return `#${hit.toLowerCase()}`;
+	}
+	return theme.colors['editor.foreground'];
+}
+
+describe('SQL syntax colours', () => {
+	it('every SQL token reaches 4.5:1 on the editor background, in every shipped theme', () => {
+		const failures: string[] = [];
+		for (const { name, tokens } of THEMES) {
+			const theme = editorTheme(reader(tokens));
+			const background = rgbOf(theme.colors['editor.background']);
+			for (const token of SQL_TOKENS) {
+				const colour = drawnColour(token, theme);
+				const seen = ratio(rgbOf(colour), background);
+				if (seen < 4.5) failures.push(`${name}: ${token} ${colour} on ${theme.colors['editor.background']} is ${seen.toFixed(2)}:1`);
+			}
+		}
+		assert.deepEqual(failures, []);
+	});
+
+	it('adds a rule only for a token whose Monaco colour fails, and writes it as Monaco reads it', () => {
+		for (const { name, tokens } of THEMES) {
+			const theme = editorTheme(reader(tokens));
+			const base = monacoBaseRules(theme.dark ? 'vs-dark' : 'vs');
+			const background = rgbOf(theme.colors['editor.background']);
+			for (const rule of theme.rules) {
+				assert.match(rule.foreground, /^[0-9A-F]{6}$/, `${name}: ${rule.token}`);
+				const original = base.get(rule.token);
+				assert.ok(original !== undefined, `${name}: ${rule.token} is not one of Monaco's own rules`);
+				assert.ok(ratio(rgbOf(`#${original}`), background) < 4.5, `${name}: ${rule.token} already read at ${original}`);
+			}
+		}
+	});
+
+	it('RocketRide Light: operators, strings, numbers and comments are the ones moved', () => {
+		const theme = editorTheme(reader(THEMES.find((t) => t.name === 'rocketride-light')!.tokens));
+		const moved = theme.rules.map((rule) => rule.token);
+		for (const token of ['operator.sql', 'string.sql', 'number', 'comment']) assert.ok(moved.includes(token), `${token} not moved (${moved.join(', ')})`);
+		assert.ok(!moved.includes('keyword'), 'a keyword colour that already reads is left as Monaco draws it');
 	});
 });
 
@@ -240,6 +324,11 @@ describe('SqlEditor wiring', () => {
 		assert.match(source, /from '\.\/editorTheme'/);
 		assert.match(source, /editorTheme\(/);
 		assert.ok(!/'editor(Line)?[A-Za-z.]*':\s*cssVar\(/.test(source), 'a Monaco colour is still taken straight from cssVar()');
+	});
+
+	it('hands editorTheme()\'s token rules to Monaco instead of an empty list', () => {
+		assert.ok(!/rules:\s*\[\]/.test(source), 'the theme still registers no token rules');
+		assert.match(source, /rules:\s*\[\.\.\.rules\]|rules,|rules:\s*rules/);
 	});
 
 	it('no longer claims every shipped theme uses plain hex', () => {

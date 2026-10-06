@@ -59,17 +59,27 @@
 // SQL Explorer's first key was `projectId:source:nodeId`; the owner-aware key
 // replaces it, and renaming a key silently orphans every user's saved history.
 // So when `legacyKeyOf` maps a connection to its old key, history is read as a
-// MERGED VIEW of the two lists, and the stored format never changes:
+// MERGED VIEW of the two lists. No AUTOMATIC write touches the old list.
+// Several new keys can map onto one old key (the same dev run under two
+// development teams), so a bound or a copy applied to the old list on behalf
+// of one would change, or empty, what the others read.
 //
 //   - reads: entries under the new key AND under the old key, de-duplicated by
-//     id, newest first, bounded like any list;
-//   - new runs are written under the NEW key only — except a run that repeats
-//     an older entry's statement, which collapses onto that entry wherever it
-//     lives (the trim keeps the older entry, its pin and its note);
-//   - pin, note and remove change an entry IN PLACE, in whichever list holds it;
-//   - clear empties both lists;
-//   - nothing is ever migrated or deleted behind the user's back, so an older
-//     build still sees its own list and a cleared list never comes back.
+//     id (the new key's copy wins), newest first, bounded like any list. The
+//     bound applies to the VIEW: an old entry it leaves out is still stored
+//     and is shown again once there is room;
+//   - new runs are written under the NEW key only. A run that repeats an old
+//     entry's statement collapses onto a COPY of that entry under the new key
+//     (same id, so the copy stands in for it; its pin and note are kept);
+//   - pin and note on an old entry write a changed copy under the new key;
+//   - remove and clear are the user's own deliberate deletes, so they DO reach
+//     the old list: remove drops the entry from both lists (the copy and the
+//     original), and clear empties the connection's own list and the old list.
+//     Every connection that reads that old list stops seeing what was deleted;
+//   - so until the user deletes something, an older build still sees its own
+//     list, unchanged, and another team context still reads every old entry.
+//     The one bound that can still drop an old entry is the size budget across
+//     every connection's lists (trimBag), oldest first, as it always has been.
 //
 // The mapping is the caller's to make safe: the caller maps ONLY connections
 // the old key could have meant (see keys.ts legacyKeyFromKey), so history is
@@ -233,12 +243,13 @@ export function createHistoryStore<F extends string>(options: IHistoryStoreOptio
 	// ── The merged view (legacy keys) ─────────────────────────────────────────
 
 	/** Merged views by connection key, valid while both underlying lists are the same objects. */
-	const viewCache = new Map<string, { own: IHistoryEntry<F>[]; old: IHistoryEntry<F>[]; view: IHistoryEntry<F>[] }>();
+	const viewCache = new Map<string, { own: IHistoryEntry<F>[] | undefined; old: IHistoryEntry<F>[]; view: IHistoryEntry<F>[] }>();
 
 	/**
 	 * One connection's history as the UI reads it: its own list, plus the list
-	 * under its legacy key when there is one. Referentially stable until either
-	 * list changes, because it is a useSyncExternalStore snapshot.
+	 * under its legacy key when there is one (less what this connection copied).
+	 * Referentially stable until either list changes, because it is a
+	 * useSyncExternalStore snapshot.
 	 *
 	 * @param key - The connection's key.
 	 * @returns The entries, newest first.
@@ -248,11 +259,10 @@ export function createHistoryStore<F extends string>(options: IHistoryStoreOptio
 		const legacy = legacyOf(key);
 		const old = legacy === null ? undefined : bag[legacy];
 		if (old === undefined) return own ?? NO_ENTRIES;
-		if (own === undefined) return old;
 		const cached = viewCache.get(key);
 		if (cached !== undefined && cached.own === own && cached.old === old) return cached.view;
-		const known = new Set(own.map((entry) => entry.id));
-		const combined = [...own, ...old.filter((entry) => !known.has(entry.id))].sort((a, b) => b.at - a.at);
+		const copied = new Set((own ?? []).map((entry) => entry.id));
+		const combined = [...(own ?? []), ...old.filter((entry) => !copied.has(entry.id))].sort((a, b) => b.at - a.at);
 		const view = trim(combined);
 		viewCache.set(key, { own, old, view });
 		return view;
@@ -271,19 +281,36 @@ export function createHistoryStore<F extends string>(options: IHistoryStoreOptio
 	}
 
 	/**
-	 * Which list holds an entry: the connection's own, else its legacy list.
+	 * The old-list entry with this id, if the connection has an old list.
 	 *
 	 * @param key - The connection's key.
 	 * @param id - The entry id.
-	 * @returns The key of the list that holds it, or null.
+	 * @returns The entry in the old list, or undefined.
 	 */
-	function holderOf(key: string, id: string): string | null {
-		if (bag[key]?.some((entry) => entry.id === id)) return key;
+	function legacyEntryOf(key: string, id: string): IHistoryEntry<F> | undefined {
 		const legacy = legacyOf(key);
-		if (legacy !== null && bag[legacy]?.some((entry) => entry.id === id)) return legacy;
-		// Not found anywhere: act on the connection's own list when it has one,
-		// exactly as a store without legacy keys always has.
-		return bag[key] !== undefined ? key : null;
+		if (legacy === null) return undefined;
+		return bag[legacy]?.find((entry) => entry.id === id);
+	}
+
+	/**
+	 * Change one entry the connection can see. An entry in its own list changes
+	 * there; an old-list entry is COPIED, changed, into its own list (same id,
+	 * so the copy stands in for it), and the old list is left as it is.
+	 *
+	 * @param key - The connection's key.
+	 * @param id - The entry id.
+	 * @param change - The change.
+	 */
+	function editEntry(key: string, id: string, change: (entry: IHistoryEntry<F>) => IHistoryEntry<F>): void {
+		const own = bag[key];
+		if (own?.some((entry) => entry.id === id)) {
+			setEntries(key, own.map((entry) => (entry.id === id ? change(entry) : entry)));
+			return;
+		}
+		const original = legacyEntryOf(key, id);
+		if (original === undefined) return;
+		setEntries(key, [...(own ?? []), change(original)].sort((a, b) => b.at - a.at));
 	}
 
 	// ── Hydration and persistence ─────────────────────────────────────────────
@@ -500,44 +527,46 @@ export function createHistoryStore<F extends string>(options: IHistoryStoreOptio
 			setEntries(key, trim([entry, ...(bag[key] ?? [])]));
 			return;
 		}
-		// The connection has history under its old key too: trim the MERGED view,
-		// then give each surviving entry back to the list it came from. A run that
-		// repeats an old entry collapses onto it and stays in the old list.
+		// The connection has history under its old key too. Bound the MERGED
+		// view, and keep in the connection's own list every survivor that is not
+		// an untouched old entry. A run never writes the old list: an old entry
+		// the bound leaves out stays stored, and a run that repeats an old entry
+		// collapses onto a copy of it, which lands in the own list.
 		const merged = trim([entry, ...viewOf(key)]);
-		const fromLegacy = new Set((bag[legacy] ?? []).map((existing) => existing.id));
-		applyLists([
-			[key, merged.filter((kept) => !fromLegacy.has(kept.id))],
-			[legacy, merged.filter((kept) => fromLegacy.has(kept.id))],
-		]);
+		const untouched = new Set<IHistoryEntry<F>>(bag[legacy]);
+		setEntries(key, merged.filter((kept) => !untouched.has(kept)));
 	}
 
 	function removeEntry(key: string, id: string): void {
-		const holder = holderOf(key, id);
-		if (holder === null) return;
-		setEntries(holder, (bag[holder] as IHistoryEntry<F>[]).filter((entry) => entry.id !== id));
+		// A delete is the user's own deliberate act, so it reaches the old list
+		// too. An old entry the connection copied (pin, note, a repeat) lives in
+		// both lists: drop the copy AND the original, or the original would come
+		// back and its text would stay in the file.
+		const updates: [string, IHistoryEntry<F>[]][] = [];
+		const own = bag[key];
+		if (own?.some((entry) => entry.id === id)) updates.push([key, own.filter((entry) => entry.id !== id)]);
+		const legacy = legacyOf(key);
+		if (legacy !== null && legacyEntryOf(key, id) !== undefined) {
+			updates.push([legacy, (bag[legacy] as IHistoryEntry<F>[]).filter((entry) => entry.id !== id)]);
+		}
+		applyLists(updates);
 	}
 
 	function togglePin(key: string, id: string): void {
-		const holder = holderOf(key, id);
-		if (holder === null) return;
-		setEntries(holder, (bag[holder] as IHistoryEntry<F>[]).map((entry) => (
-			entry.id === id ? { ...entry, pinned: !entry.pinned } : entry
-		)));
+		editEntry(key, id, (entry) => ({ ...entry, pinned: !entry.pinned }));
 	}
 
 	function setNote(key: string, id: string, note: string): void {
-		const holder = holderOf(key, id);
-		if (holder === null) return;
-		setEntries(holder, (bag[holder] as IHistoryEntry<F>[]).map((entry) => {
-			if (entry.id !== id) return entry;
+		editEntry(key, id, (entry) => {
 			const next = { ...entry };
 			if (note) next.note = note;
 			else delete next.note;
 			return next;
-		}));
+		});
 	}
 
 	function clearForKey(key: string): void {
+		// Like a delete, a clear is deliberate: it empties the old list too.
 		const legacy = legacyOf(key);
 		applyLists(legacy === null ? [[key, []]] : [[key, []], [legacy, []]]);
 	}

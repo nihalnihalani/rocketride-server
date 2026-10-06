@@ -84,7 +84,10 @@ open. Deployments, other owners and projectless pipelines get `null`.
 
 `projectId` is `''` when a pipeline carries no `project_id` (the server mints one
 it never reports). Two such pipelines with the same owner, run kind, source and
-node id collide on their key; real `.pipe` files carry a `project_id`.
+node id collide on their key. A `.pipe` file saved in a VS Code workspace gets a
+`project_id`; the Graph Explorer templates ship without one and get it on
+import, so two copies of one template posted raw through an SDK collide and
+show as one card.
 
 ## Endpoint states
 
@@ -98,8 +101,16 @@ node id collide on their key; real `.pipe` files carry a `project_id`.
 
 The probe runs once per endpoint, with bounded concurrency (default 4), and one
 failure never affects another. A `ready` endpoint is not probed again unless a
-refresh asks for it, its token changes, or it disappears and returns. An empty
-`getTasks()` list is not proof that something failed to provision.
+refresh asks for it, its token changes, or it disappears and returns. An
+`unreachable` or `inaccessible` endpoint is probed again only on an explicit
+`store.refresh()`, a restart or reconnect, `store.probe()` (Test connection) or
+a changed token, never on a focus or an ordinary task event: a probe is a tool
+call, and a tool call that reaches the task counts as activity for its idle
+timeout. An endpoint that disappeared from discovery is not probed:
+`store.probe()` sends nothing for it and returns null, and the answer to a
+probe that was in flight when it disappeared is not applied, so its card stays
+`stopped`. It is probed when a discovery lists it again, on any refresh. An
+empty `getTasks()` list is not proof that something failed to provision.
 
 ## Tokens and identity
 
@@ -111,6 +122,21 @@ storage, a URL, a log, a copied JSON or a document payload. Call tools only
 through `store.session(client, endpoint)`; the session reads the token at call
 time and never keeps it.
 
+Discovery lists running tasks only, so a task that is restarting disappears
+from it just like a stopped one. An endpoint that disappears is shown
+`stopped`, but the store keeps its token, and the node's last good `dialect`
+answer for the session's capability check and budget, until the endpoint is
+discovered again or the store resets. A call made in the meantime is still
+sent, and that is its first send, not a retry. The server holds it until a
+restarting task is running again. A pipeline stopped within the last few
+minutes is still registered and answers `TASK_STOPPED`, so an idempotent call
+first gets the one bounded re-discovery (up to the 15 s retry window, see "The
+one retry") and then fails with that code; a task that is no longer registered
+answers `TASK_NOT_REGISTERED` at once. A call is refused locally as
+`unavailable` only for an endpoint whose latest discovery row carried no token
+or reported it `stopped` (a required role not running); its token is dropped
+then.
+
 `store.reset()` forgets endpoints, probes, tokens and sessions, and drops probes
 that were in flight. It runs on sign-out and when the identity fingerprint
 (`userId|orgId|devTeam`, [`connect/identity.ts`](../../../apps/shared/src/explorer/connect/identity.ts))
@@ -118,7 +144,9 @@ changes; a permissions-only change does not reset. Wire it with
 `useEndpointStoreLifecycle(store, client, identity)` from `react.tsx` (task
 events, focus, reconnect, identity events through `shellBinding.ts`).
 Refresh is debounced (300 ms) for task events, rate-limited (5 s) for focus, and
-concurrent refreshes coalesce into one follow-up.
+concurrent refreshes coalesce into one follow-up. One discovery may take at most
+30 s (`discoveryTimeoutMs`); after that the refresh ends with status `error`, so
+a server that never answers cannot leave the list refreshing forever.
 
 ## Calling a tool
 
@@ -136,7 +164,7 @@ Failure depends on the **tool**, so each tool gets a `ResultCheck`
 
 | Tool shape | Failure arrives as | Check |
 |---|---|---|
-| `execute`, `read_query` | the call rejects; the envelope is validated | `checkRowEnvelope` (positional rows, `row_limit`, `truncated`, additive metadata) |
+| `execute`, `read_query` | the call rejects; the envelope is validated | `checkRowEnvelope` (positional rows, `row_limit`, `truncated`, additive metadata, `truncated_by` null, `rows`, `elements` or `values`); SQL's `execute` answers with object rows and uses `checkObject` |
 | `get_data` | `{valid: false, error}` | `checkValidFlag` |
 | `get_query` | `{valid: false, error}` fails; `{valid: false, answer}` is prose and passes | `checkGetQuery` |
 | store / vector tools | `{success: false, error}` | `checkStoreSuccess` |
@@ -173,8 +201,12 @@ example from `read_query` to `execute`).
 
 A call is retried **at most once**, and only when **all** hold:
 
-1. the tool is idempotent (`idempotent: true` on its spec or the call; `execute`
-   and writes never are);
+1. the call is idempotent: `idempotent: true` on the tool's spec, or on the
+   call itself. A write never is, and `execute` is not by default; a caller may
+   mark one `execute` call idempotent for a statement it classifies as a read
+   (SQL Explorer does, for reads, table pages, row counts and plain `EXPLAIN`).
+   Such a replay is safe only because of rule 2: `TASK_STOPPED` is raised
+   before the request is dispatched, so the first attempt never ran;
 2. the failure is `raised` with `code === 'TASK_STOPPED'`, which the server
    raises from `wait_for_running` **before** the request reaches the node;
 3. bounded re-discovery (at most 15 s, inside the call's own timeout) finds the
@@ -207,11 +239,19 @@ silently orphans users' saved history. Mount the accessor with
 `createConnectionFlags` ([`history/flags.ts`](../../../apps/shared/src/explorer/history/flags.ts)).
 
 **Legacy keys.** When `legacyKeyOf` maps a connection to its pre-v1 key (SQL
-passes `legacyKeyFromKey`), reads are a merged view of both lists; new runs go
-to the new key only; pin, note and remove change an entry where it lives; clear
-empties both; a recording or pattern-check switch saved under the old key still
-applies until the new key has its own. Nothing is migrated or deleted, and a
-deployment or another owner never reads the old list.
+passes `legacyKeyFromKey`), reads are a merged view of both lists. No automatic
+write touches the old list, because several new keys can read one old key (the
+same dev run under two development teams). New runs go to the new key only, and
+the per-connection bound applies to the merged view, so an old entry it leaves
+out stays stored. Pin, note and a re-run that repeats an old statement write a
+copy under the new key (same id, so the copy stands in for the original). Remove
+and clear are the user's own deletes and do reach the old list: remove drops the
+entry from both lists, and clear empties the connection's own list and the old
+list, so every connection reading that old list stops seeing them. A recording
+or pattern-check switch saved under the old key still applies until the new key
+has its own. Nothing is migrated, and a deployment or another owner never reads
+the old list. Apart from remove and clear, the only thing that can drop an old
+entry is the size budget across all connections (`trimBag`, oldest first).
 
 ## Running statements
 
@@ -222,11 +262,14 @@ failure ends the batch and the rest are `skipped` (no claim of atomicity); a
 `refuse` hook can veto the whole batch before anything is sent; a text pattern
 check asks before a flagged statement is sent (run, run and stop asking, or
 decline, which skips the rest); when the batch's generation ticket expires
-(Stop waiting, the document closing) it stops touching state and the late result
-**and** the late failure are dropped. `abandonRuns` marks the statement in
-flight `abandoned`.
+(Stop waiting, or the component that owns the runner unmounting: a closed
+document, a switch to another app) it sends nothing more, stops touching state,
+and the late result **and** the late failure are dropped. The statement already
+in flight finishes at the node; nothing can cancel it. `abandonRuns` marks the
+statement in flight `abandoned`.
 [`runner/useStatementRunner.ts`](../../../apps/shared/src/explorer/runner/useStatementRunner.ts)
-binds it to React state.
+binds it to React state; its unmount cleanup (`attachRunnerLifetime`) is what
+expires the ticket, so every app using the hook gets this without code of its own.
 
 Shared components under `components/` (import by path): `StatementStrip`,
 `FailureBanner` (headline, where it happened, "Database said" collapsed),
@@ -248,7 +291,8 @@ document-URI key rule).
    announcer, an active-key store. Never import another app's instance.
 3. Describe every tool the app calls in the `tools` map: `idempotent`,
    `check`, `timeoutMs`, `capability`. Reads and reflection are idempotent;
-   `execute` is not.
+   `execute` is not (a call may still mark one statement it knows is a read,
+   see "The one retry").
 4. Mount `useEndpointStoreLifecycle(store, client, identity)` once at the app
    root, and call tools only through `store.session`.
 5. Wire the runner's hooks and the shared components; keep the language

@@ -141,6 +141,29 @@ describe('checkRowEnvelope (read_query, execute shape graph)', () => {
 		assert.equal(run(checkRowEnvelope, { ...good, truncated_by: null }).ok, true);
 	});
 
+	it('accepts every truncated_by the contract allows, the value budget included', () => {
+		// The node cuts a result at the value budget with truncated_by "values";
+		// that is an honest partial result, never a malformed one.
+		for (const by of [null, 'rows', 'elements', 'values']) {
+			const outcome = run(checkRowEnvelope, { ...good, truncated: by !== null, truncated_by: by }, 'read_query');
+			assert.deepEqual(outcome, { ok: true }, `truncated_by ${JSON.stringify(by)}`);
+		}
+		const cut = { ...good, truncated: true, truncated_by: 'values', element_limit: 10000, elements: 4, value_limit: 500000, values: 499998 };
+		assert.deepEqual(run(checkRowEnvelope, cut, 'read_query'), { ok: true });
+	});
+
+	it('rejects a mistyped value budget as malformed', () => {
+		for (const bad of [
+			{ ...good, value_limit: '500000' },
+			{ ...good, values: null },
+			{ ...good, values: Number.NaN },
+		]) {
+			const outcome = run(checkRowEnvelope, bad, 'read_query');
+			assert.equal(outcome.ok, false, JSON.stringify(bad));
+			if (!outcome.ok) assert.equal(outcome.kind, 'malformed');
+		}
+	});
+
 	it('rejects a row as wide as neither the columns nor an array', () => {
 		const narrow = run(checkRowEnvelope, { ...good, rows: [[1]] });
 		assert.equal(narrow.ok, false);

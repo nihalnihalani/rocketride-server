@@ -42,7 +42,11 @@
 //     being restarted fails with TASK_STOPPED from `wait_for_running`, BEFORE
 //     the request reaches the node — and a task the user really stopped fails
 //     with the same code. So a retry is allowed only when ALL of these hold:
-//       - the tool is idempotent (never execute, never a write);
+//       - the call is idempotent: its tool spec says so, or the CALLER marks
+//         this call so (`opts.idempotent`). A write never is; `execute` is
+//         not by default, and SQL Explorer marks an `execute` idempotent only
+//         for a statement its classifier calls a read. Such a replay is safe
+//         ONLY because TASK_STOPPED is raised before dispatch: nothing ran;
 //       - the error carries the transient code (read off the SDK error's
 //         `code`, never parsed out of its message);
 //       - re-discovery, within a bounded window, finds the SAME endpoint

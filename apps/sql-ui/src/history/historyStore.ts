@@ -36,7 +36,9 @@
 //
 // and it bridges the connection key: history saved under the pre-owner-aware
 // key `projectId:source:nodeId` is still read for the caller's own dev run
-// (see shared/explorer/history/store, "LEGACY KEYS").
+// (see shared/explorer/history/store, "LEGACY KEYS"): runs, pins and notes
+// never write the old list; the user's own Delete and Clear remove entries
+// from it.
 // =============================================================================
 
 import { createHistoryStore } from 'shared/explorer/history/store';

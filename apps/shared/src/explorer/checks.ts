@@ -180,12 +180,17 @@ export const checkLegacyErrorEnvelope: ResultCheck = (value, ctx) => {
 	return error === undefined ? OK : { ok: false, kind: 'error-envelope', message: error };
 };
 
+/** The budgets a row envelope may name in `truncated_by` (null aside). */
+const TRUNCATED_BY: readonly string[] = ['rows', 'elements', 'values'];
+
 /**
  * The positional row envelope of read_query (and execute with shape "graph"):
  * `{columns: string[], rows: unknown[][], row_limit: number, truncated: boolean}`
  * plus additive metadata (`truncated_by`, `element_limit`, `elements`,
- * `affected_rows`). Rows are ARRAYS in column order, so a result naming the
- * same column twice keeps both; each row must be exactly as wide as `columns`.
+ * `value_limit`, `values`, `affected_rows`). `truncated_by` is null or names
+ * the budget that cut the result: `rows`, `elements` or `values`. Rows are
+ * ARRAYS in column order, so a result naming the same column twice keeps
+ * both; each row must be exactly as wide as `columns`.
  *
  * @param value - The resolved value.
  * @param ctx - The tool being checked.
@@ -210,10 +215,10 @@ export const checkRowEnvelope: ResultCheck = (value, ctx) => {
 	}
 	if (typeof truncated !== 'boolean') return malformed(ctx.tool, 'truncated must be a boolean');
 	const truncatedBy = value.truncated_by;
-	if (truncatedBy !== undefined && truncatedBy !== null && truncatedBy !== 'rows' && truncatedBy !== 'elements') {
-		return malformed(ctx.tool, 'truncated_by must be null, "rows" or "elements"');
+	if (truncatedBy !== undefined && truncatedBy !== null && (typeof truncatedBy !== 'string' || !TRUNCATED_BY.includes(truncatedBy))) {
+		return malformed(ctx.tool, 'truncated_by must be null, "rows", "elements" or "values"');
 	}
-	for (const key of ['element_limit', 'elements', 'affected_rows'] as const) {
+	for (const key of ['element_limit', 'elements', 'value_limit', 'values', 'affected_rows'] as const) {
 		const field = value[key];
 		if (field !== undefined && (typeof field !== 'number' || !Number.isFinite(field))) {
 			return malformed(ctx.tool, `${key} must be a number`);
