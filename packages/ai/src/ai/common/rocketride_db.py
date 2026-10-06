@@ -40,8 +40,9 @@ the task file since #1686 — the task engine does NOT set
 ``ROCKETRIDE_CLIENT_ID``).  A hosted engine's server process, where a node's
 save-time ``validateConfig`` probe runs, resolves no tenant at all: it serves
 every tenant and the probe carries none, so it reports the broker state
-instead.  The env-based ``current_client_id`` accessor remains for the account
-fallback used by the open-source server process and tests.
+instead, and a hosted engine's task process takes its database from the
+task engine alone.  The env-based ``current_client_id`` accessor remains for
+the account fallback used by the open-source engine's processes and tests.
 The account call is async while node lifecycle code (``beginGlobal`` /
 ``Store.__init__``) is synchronous, so it is bridged with ``asyncio.run`` —
 safe only from a thread with no running loop, which is exactly how nodes are
@@ -54,7 +55,7 @@ import sys
 import urllib.parse
 
 # Identity override consumed only by the account fallback (the open-source
-# server process and tests; a hosted engine's server process never reads it).
+# engine's processes and tests; no process of a hosted engine reads it).
 # The task engine does NOT set this in node subprocesses:
 # identity rides the task file (#1686) and the ROCKETRIDE_* env namespace is
 # caller-influenced by design.
@@ -79,6 +80,10 @@ HOSTED_CHILD_FLAG = '--hosted'
 # (task_engine.CONST_DB_BROKER_UNCONFIGURED). The server-process check reports
 # the same words.
 BROKER_UNCONFIGURED = 'the RocketRide cloud database broker is not configured on this server'
+
+# What a hosted engine's task process reports when the task engine passed it
+# neither a DSN nor a reason.
+NOT_RESOLVED = 'the task engine resolved no database for this task'
 
 
 class ResolvedAtTaskStart(ValueError):
@@ -116,9 +121,10 @@ def _run_async(async_fn, *args):
 def current_client_id() -> str:
     """Return the tenant id for the account fallback, from ``ROCKETRIDE_CLIENT_ID``.
 
-    Only the open-source server process and tests reach it: a task process
-    gets its DSN from the task engine, and a hosted engine's server process
-    resolves no tenant (see :func:`resolve_rocketride_dsn`).
+    Only the open-source engine's processes and tests reach it: a hosted
+    engine's task process gets its DSN (or why there is none) from the task
+    engine alone, and its server process resolves no tenant (see
+    :func:`resolve_rocketride_dsn`).
 
     Raises:
         ValueError: if the identity env var is missing — which normally means
@@ -205,9 +211,13 @@ def resolve_rocketride_dsn() -> str:
        server process it is the single tenant's DSN for local development.
     2. ``ROCKETRIDE_DB_RESOLVE_ERROR`` env — why the task engine could not
        resolve one at task start.
-    3. ``Account.resolve_db_dsn(client_id)`` — fallback for the open-source
-       server process (or tests injecting a fake account). On an unconfigured
-       open-source build this raises the cloud-sign-in error.
+    3. A hosted engine's task process (``--hosted``) with neither raises
+       :data:`NOT_RESOLVED`: it takes its database from the task engine
+       alone, never from the account fallback below, whose tenant would come
+       from the task's own environment.
+    4. ``Account.resolve_db_dsn(client_id)`` — fallback for the open-source
+       engine's processes (or tests injecting a fake account). On an
+       unconfigured open-source build this raises the cloud-sign-in error.
 
     Returns the raw DSN (URL form, directly usable by ``psycopg2.connect``).
     Callers that need a SQLAlchemy engine URL should wrap the result in
@@ -227,6 +237,15 @@ def resolve_rocketride_dsn() -> str:
     resolve_error = os.environ.get(DB_RESOLVE_ERROR_ENV, '').strip()
     if resolve_error:
         raise ValueError(f'RocketRide cloud database resolution failed at task start: {resolve_error}')
+
+    # A hosted engine's task process with neither: the task engine resolved
+    # nothing for it. Never fall back to the account here: the tenant would
+    # come from this process's own environment (ROCKETRIDE_CLIENT_ID), and
+    # pipeline code and pipeline-added arguments (``--saas``, which loads the
+    # SaaS account class) reach both. A pipeline can add flags to the command
+    # line, never remove --hosted.
+    if HOSTED_CHILD_FLAG in sys.argv:
+        raise ValueError(f'RocketRide cloud database resolution failed at task start: {NOT_RESOLVED}')
 
     # Lazy import: ai.common is imported very early, and ai.account pulls in the
     # OSS/SaaS overlay — importing at module load risks a cycle.

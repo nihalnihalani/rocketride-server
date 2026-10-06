@@ -711,10 +711,20 @@ class Task(DAPBase):
     _ROCKETRIDE_DB_PROVIDERS = frozenset({'rocketride_sql', 'rocketride_vector', 'rocketride_graph'})
 
     def _pipeline_uses_rocketride_db(self) -> bool:
-        """True when any pipeline component is a RocketRide cloud DB node."""
-        components = self._pipeline.get('components') or []
+        """True when any component of the pipeline the task runs is a RocketRide cloud DB node.
+
+        Decided like the task process loads its nodes: on the pipeline with its
+        ``${ROCKETRIDE_*}`` placeholders resolved (a provider can be one), and
+        with the provider matched case-insensitively, as the engine's service
+        lookup is. Surrounding whitespace is ignored too: resolving a database
+        the task then does not use costs a broker call, while missing one
+        leaves a DB node without its database.
+        """
+        components = self._resolve_pipeline(self._pipeline).get('components') or []
         return any(
-            isinstance(component, dict) and component.get('provider') in self._ROCKETRIDE_DB_PROVIDERS
+            isinstance(component, dict)
+            and isinstance(component.get('provider'), str)
+            and component['provider'].strip().lower() in self._ROCKETRIDE_DB_PROVIDERS
             for component in components
         )
 

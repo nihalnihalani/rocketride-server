@@ -39,8 +39,9 @@ inherit the engine's full environment, only an allowlist:
 - every `ROCKETRIDE_` variable except `ROCKETRIDE_DB_DSN` and
   `ROCKETRIDE_DB_RESOLVE_ERROR` (and the former broker names below), which the
   engine removes in any spelling. A task that uses a RocketRide database node
-  then gets its own resolved `ROCKETRIDE_DB_DSN`. Any other `ROCKETRIDE_DB_*`
-  name passes through like the rest.
+  then gets its own resolved `ROCKETRIDE_DB_DSN`, however the pipeline spells
+  the node's provider (any case, or a `${ROCKETRIDE_*}` placeholder). Any other
+  `ROCKETRIDE_DB_*` name passes through like the rest.
 - what nodes and the task itself use directly: `RR_STORE_URL`,
   `RR_STORE_SECRET_KEY`, `RR_SIGNING_KEY`, `RR_BASE_URL`, `RR_CORS_ORIGINS`,
   `RR_OAUTH_BROKER_URL`, `RR_PROC_PRIVATE`, `MEDIA_TOOLKIT_FFMPEG`, `AWS_*`, and
@@ -58,18 +59,59 @@ substituted into a pipeline, never returned or changed by the account
 `ROCKETRIDE_DB_BROKER_URL` or `ROCKETRIDE_DB_BROKER_TOKEN` are set, in its
 environment or in its `.env` file, even next to the new names, and the
 open-source `set_env` command refuses them: rename them in the deployment
-configuration and secret mapping in the same change. A hosted
-engine without the broker settings logs a warning at startup, and its
-RocketRide database nodes report that the broker is not configured, both when
-their configuration is saved and when a task starts.
+configuration and secret mapping in the same change. A hosted engine without
+the broker settings logs a warning at startup, and its RocketRide database
+nodes report that the broker is not configured, both when their configuration
+is saved and when a task starts.
+
+The open-source `set_env` command replaces the engine's whole set of
+`ROCKETRIDE_` settings, in its environment and in its `.env` file, with the
+names it is given that start with `ROCKETRIDE_` (in capitals), one exact
+assignment per line, and ignores the other names it is given. Every
+`ROCKETRIDE_` name it is not given is removed from the environment, and its
+`NAME=value` lines are removed from the `.env` file (a line written as
+`export NAME=value` stays). The one exception is the engine's API key,
+`ROCKETRIDE_APIKEY`: a request that does not name it keeps it, in the
+environment and in the `.env` file, wherever it was set, so no request can
+switch off the key check by leaving the key out. A request without `env` is
+handled as an empty object, not refused, so it removes every other
+`ROCKETRIDE_` setting. The key is compared in constant time. It refuses the
+whole request, changing nothing, when:
+
+- `env` is not an object of names to values (`null`, for example);
+- it would set `ROCKETRIDE_APIKEY` to an empty or blank value (a new non-empty
+  key is accepted, which rotates it);
+- a name is one of the broker settings or their former names, in any case or
+  with surrounding whitespace (refused, not ignored);
+- a `ROCKETRIDE_` name has nothing after the prefix, or anything other than
+  ASCII letters, digits and underscores;
+- a value given for a `ROCKETRIDE_` name is not a string, has a control
+  character (U+0000 to U+001F or U+007F to U+009F), a Unicode line or
+  paragraph separator (U+2028, U+2029) or a surrogate code point (U+D800 to
+  U+DFFF, which UTF-8 cannot encode), or contains `${`, which the `.env`
+  loader would expand when the engine starts;
+- such a value would need quotes in the file (it starts or ends with
+  whitespace, starts with a quote, or has whitespace before a `#`) and ends
+  with a backslash.
+
+The command writes the new `.env` file in full next to the one it replaces
+(for a symlinked `.env`, next to the file the link points to), with that
+file's permission bits, and then renames it into place. It therefore needs
+write access to that directory, and it refuses an existing `.env` file it may
+not write. On Linux and macOS, a new `.env` file is readable and writable only
+by the engine's user. If the `.env` file cannot be read as UTF-8 or the new
+one cannot be written in full, the command fails and leaves the engine's
+environment and the `.env` file as they were.
 
 Each RocketRide database node connects to the database of the organization
 that runs the pipeline (of the user, where there is no organization). The
 engine resolves that connection when a task starts, from the task's own
 identity; nothing in the pipeline, a node's configuration or the task's
-environment selects it. On a hosted engine, the connection check that runs
-when a node's configuration is saved resolves no database at all, so the
-engine's own environment cannot select one either. The connection string the
+environment selects it. On a hosted engine a task takes that connection from
+the engine alone: when the engine resolved none for it, its database nodes
+report that and never resolve one themselves. The connection check that runs
+when a node's configuration is saved resolves no database at all on a hosted
+engine, so the engine's own environment cannot select one either. The connection string the
 broker returns must require TLS: an explicit `sslmode`
 of `require`, `verify-ca` or `verify-full` is used as issued, a missing one
 becomes `require`, and one that does not require TLS is refused unless every
