@@ -761,6 +761,75 @@ describe('identity changes and sign-out reset everything', () => {
 		assert.equal(store.getState().probes[key]?.dialect, 'new-session');
 	});
 
+	it('a refresh overtaken by a reset leaves the next identity\'s refresh in flight, and its one follow-up, alone', async () => {
+		const { store, world, clock } = make([row()]);
+		const answers: (() => void)[] = [];
+		world.getTasksImpl = () => new Promise((resolve) => { answers.push(() => resolve(world.rows.map((r) => ({ ...r })) as unknown as Record<string, unknown>[])); });
+		const watch = watchProbe();
+		store.attach(world.client, alice, watch.watch);
+
+		const oldRefresh = store.refresh(world.client);
+		await clock.settle();
+		watch.handlers!.onIdentity({ ...alice, orgId: 'org-B' });
+		const newRefresh = store.refresh(world.client);
+		await clock.settle();
+		// A trigger while the new identity's discovery runs: ONE follow-up.
+		void store.refresh(world.client);
+		assert.equal(world.getTasksCalls, 2);
+
+		// The old discovery lands (it was dropped by the reset) ...
+		answers[0]!();
+		await oldRefresh;
+		await clock.settle();
+		// ... and must not have cleared the new refresh: this trigger still coalesces.
+		void store.refresh(world.client);
+		assert.equal(world.getTasksCalls, 2, 'a trigger during the new discovery started a second, concurrent one');
+
+		answers[1]!();
+		await clock.settle();
+		assert.equal(world.getTasksCalls, 3, 'the follow-up queued during the new discovery was lost');
+		answers[2]!();
+		await newRefresh;
+		await clock.settle();
+		assert.equal(world.getTasksCalls, 3);
+		assert.equal(store.getState().status, 'ready');
+		assert.equal(store.getState().endpoints.length, 1);
+	});
+
+	it('a probe overtaken by a reset does not clear the next identity\'s probe of the same endpoint', async () => {
+		const releases: (() => void)[] = [];
+		let dialectCalls = 0;
+		const { store, world, clock } = make([row()], (call) => {
+			if (call.tool !== 'dialect') return {};
+			dialectCalls += 1;
+			return new Promise((resolve) => { releases.push(() => resolve(NEO4J_INFO)); });
+		});
+		const watch = watchProbe();
+		store.attach(world.client, alice, watch.watch);
+		const oldRefresh = store.refresh(world.client);
+		await clock.settle();
+		assert.equal(dialectCalls, 1);
+
+		watch.handlers!.onIdentity({ ...alice, orgId: 'org-B' });
+		const newRefresh = store.refresh(world.client);
+		await clock.settle();
+		assert.equal(dialectCalls, 2);
+
+		// The old probe settles: dropped, and it must leave the new probe's marker in place.
+		releases[0]!();
+		await oldRefresh;
+		await clock.settle();
+		const key = store.getState().endpoints[0]!.key;
+		const duplicate = store.probe(world.client, key);
+		await clock.settle();
+		assert.equal(dialectCalls, 2, 'a second probe of the endpoint was sent while one was running');
+
+		releases.slice(1).forEach((release) => release());
+		assert.equal(await duplicate, null);
+		await newRefresh;
+		assert.equal(store.getState().endpoints[0]!.state, 'ready');
+	});
+
 	it('NEVER lets a token reach the snapshot, its keys, probes or a serialised copy', async () => {
 		const { store, world } = make([row(), row({ runKind: 'deploy', ownerKind: 'team', ownerId: 'team-1' })]);
 		await store.refresh(world.client);

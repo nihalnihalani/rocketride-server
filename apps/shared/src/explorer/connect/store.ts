@@ -401,7 +401,9 @@ export function createEndpointStore(options: IEndpointStoreOptions): IEndpointSt
 			patchEndpoint(endpoint.key, { state: outcome.state, stateDetail: outcome.detail }, result);
 			return result;
 		} finally {
-			probing.delete(endpoint.key);
+			// reset() already cleared the marker; one there now belongs to a probe
+			// the next identity started, which this one must not unmark.
+			if (!epochAfterReset(startedReset)) probing.delete(endpoint.key);
 		}
 	}
 
@@ -600,14 +602,17 @@ export function createEndpointStore(options: IEndpointStoreOptions): IEndpointSt
 		try {
 			await run;
 		} finally {
-			inFlight = null;
+			// After a reset, `inFlight` may already be a refresh the next identity
+			// started; only this run's own marker is cleared.
+			if (inFlight === run) inFlight = null;
 		}
-		if (followUp !== null && !epochAfterReset(startedEpoch)) {
+		// reset() dropped this run's follow-up already. A follow-up queued since
+		// belongs to the next identity's refresh, which runs it: leave it alone.
+		if (epochAfterReset(startedEpoch)) return;
+		if (followUp !== null) {
 			const next = followUp;
 			followUp = null;
 			await refresh(client, next);
-		} else {
-			followUp = null;
 		}
 	}
 
