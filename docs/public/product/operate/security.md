@@ -59,15 +59,18 @@ substituted into a pipeline, never returned or changed by the account
 environment or in its `.env` file, even next to the new names, and the
 open-source `set_env` command refuses them: rename them in the deployment
 configuration and secret mapping in the same change. A hosted
-engine without the broker settings logs a warning at startup, and when a task
-starts, its RocketRide database nodes report that the broker is not
-configured.
+engine without the broker settings logs a warning at startup, and its
+RocketRide database nodes report that the broker is not configured, both when
+their configuration is saved and when a task starts.
 
 Each RocketRide database node connects to the database of the organization
-that runs the pipeline (of the user, where there is no organization). When a
-task starts, the engine resolves that connection from the task's own
+that runs the pipeline (of the user, where there is no organization). The
+engine resolves that connection when a task starts, from the task's own
 identity; nothing in the pipeline, a node's configuration or the task's
-environment selects it. The connection string the broker returns must require TLS: an explicit `sslmode`
+environment selects it. On a hosted engine, the connection check that runs
+when a node's configuration is saved resolves no database at all, so the
+engine's own environment cannot select one either. The connection string the
+broker returns must require TLS: an explicit `sslmode`
 of `require`, `verify-ca` or `verify-full` is used as issued, a missing one
 becomes `require`, and one that does not require TLS is refused unless every
 host it names (including libpq's `host` and `hostaddr` parameters) is on the
