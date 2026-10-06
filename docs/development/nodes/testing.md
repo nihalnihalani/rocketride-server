@@ -571,7 +571,11 @@ Enterprise role.
 With `RR_TEST_AGE_POOLER_DSN` set, the two AGE suites run a second time through
 that transaction-mode pooler (`RR_TEST_AGE_DSN` is pointed at it and
 `RR_TEST_AGE_ADMIN_DSN` at the database itself), the way the cloud reaches
-tenant databases; CI runs PgBouncer in front of its AGE container for this. The
+tenant databases; CI runs PgBouncer in front of its AGE container for this.
+Without the variable a required run still passes but leaves that pass out (it
+says so in the task output). `scripts/acceptance/graph-explorer/validate_all.sh`
+always sets it, to the `gx-pgbouncer` container from that folder's README unless
+you point it elsewhere, so a local gate run includes the pass. The
 servers and their environment variables (`RR_TEST_AGE_DSN`, `RR_TEST_PG_DSN`,
 `RR_TEST_NEO4J_URI`, `RR_TEST_FALKORDB_URL`, ...) are the ones
 `.github/workflows/_build.yaml` starts; run the same images locally to reproduce

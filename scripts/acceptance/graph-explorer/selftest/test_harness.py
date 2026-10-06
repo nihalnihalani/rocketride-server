@@ -102,7 +102,10 @@ class ValidateAllExitCode(unittest.TestCase):
         (repo / 'scripts').mkdir(parents=True)
         subprocess.run(['git', 'init', '-q', str(repo)], check=True)
         builder = repo / 'builder'
-        builder.write_text('#!/bin/sh\nexit "${FAKE_RC:-0}"\n')
+        # Records each action and the pooler DSN it was given.
+        builder.write_text(
+            '#!/bin/sh\necho "builder $* pooler=${RR_TEST_AGE_POOLER_DSN:-}" >> "$FAKE_CALLS"\nexit "${FAKE_RC:-0}"\n'
+        )
         builder.chmod(0o755)
         (repo / 'scripts' / 'validate-node-readme.py').write_text(
             "import os, sys\nsys.exit(int(os.environ.get('FAKE_RC', '0')))\n"
@@ -120,8 +123,9 @@ class ValidateAllExitCode(unittest.TestCase):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def run_gates(self, rc: str, **extra: str) -> subprocess.CompletedProcess:
+        base = {k: v for k, v in os.environ.items() if k != 'RR_TEST_AGE_POOLER_DSN'}
         env = dict(
-            os.environ,
+            base,
             FAKE_RC=rc,
             FAKE_CALLS=str(self.calls),
             OUT_DIR=str(self.tmp / 'out'),
@@ -151,6 +155,30 @@ class ValidateAllExitCode(unittest.TestCase):
         calls = self.calls.read_text() if self.calls.exists() else ''
         self.assertRegex(calls, r'engine \S*check_db_versions\.py', 'the version check did not run in the engine')
 
+    def node_suite_poolers(self) -> dict:
+        calls = self.calls.read_text().splitlines() if self.calls.exists() else []
+        out = {}
+        for line in calls:
+            m = re.match(r'builder (nodes:test(?:-db)?) pooler=(.*)$', line)
+            if m:
+                out[m.group(1)] = m.group(2)
+        return out
+
+    def test_node_suites_run_the_pooler_pass(self):
+        # CI sets RR_TEST_AGE_POOLER_DSN, so nodes:test runs the AGE suites a second time through PgBouncer.
+        res = self.run_gates('0')
+        poolers = self.node_suite_poolers()
+        self.assertEqual(sorted(poolers), ['nodes:test', 'nodes:test-db'], res.stdout)
+        for action, dsn in poolers.items():
+            self.assertRegex(dsn, r'^postgresql://.*@127\.0\.0\.1:56433/', f'{action} ran without the pooler pass')
+        self.assertIn('pooler 127.0.0.1:56433', res.stdout)
+        self.assertNotIn('rrpass', res.stdout, 'the pooler DSN password was printed')
+
+    def test_a_pooler_dsn_from_the_environment_is_used(self):
+        dsn = 'postgresql://someone:secret@127.0.0.1:6543/elsewhere'
+        self.run_gates('0', RR_TEST_AGE_POOLER_DSN=dsn)
+        self.assertEqual(set(self.node_suite_poolers().values()), {dsn})
+
     def test_a_database_on_another_version_fails_the_run(self):
         res = self.run_gates('0', FAKE_ENGINE_RC='1')
         self.assertNotEqual(res.returncode, 0, res.stdout)
@@ -175,7 +203,7 @@ class DatabaseImagesMatchCI(unittest.TestCase):
     def test_readme_starts_the_database_images_ci_runs(self):
         readme = self.images(ACC / 'README.md')
         ci = self.images(REPO / '.github' / 'workflows' / '_build.yaml')
-        for repo in ('apache/age', 'pgvector/pgvector', 'neo4j', 'falkordb/falkordb'):
+        for repo in ('apache/age', 'pgvector/pgvector', 'neo4j', 'falkordb/falkordb', 'edoburu/pgbouncer'):
             self.assertIn(repo, ci, f'_build.yaml no longer starts {repo}')
             self.assertEqual(readme.get(repo), ci[repo], f'README.md does not start the {repo} image CI runs')
 

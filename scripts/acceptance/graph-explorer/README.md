@@ -82,6 +82,11 @@ docker run -d --name gx-neo4j -p 127.0.0.1:57687:7687 -p 127.0.0.1:57474:7474 \
   neo4j:5.26-community@sha256:d9cfe82983d27f5a75b3aaae8f316d04f9a698a3b7f6103a508f7caf8362f255
 docker run -d --name gx-falkordb -p 127.0.0.1:56379:6379 \
   falkordb/falkordb@sha256:e2765e207e5ba4ee90e47ed31eb7491ad6dd3d42241c326e429375c02ad9882f
+# PgBouncer in transaction mode in front of gx-age, as CI runs it (validate_all.sh's pooler pass)
+docker run -d --name gx-pgbouncer --link gx-age:age -p 127.0.0.1:56433:5432 \
+  -e DB_HOST=age -e DB_USER=rruser -e DB_PASSWORD=rrpass -e DB_NAME=rrtenant \
+  -e POOL_MODE=transaction -e AUTH_TYPE=scram-sha-256 -e DEFAULT_POOL_SIZE=4 -e MAX_CLIENT_CONN=200 \
+  edoburu/pgbouncer@sha256:9c78945868a6a142c7fc40ccd843bbe5a606df163c7ffce4de70e0d628d696a2
 
 # The AGE image creates the extension in rrtenant on first start; this is a no-op then.
 docker exec gx-age psql -U rruser -d rrtenant -c 'CREATE EXTENSION IF NOT EXISTS age'
@@ -89,10 +94,13 @@ docker exec gx-age psql -U rruser -d rrtenant -c 'CREATE EXTENSION IF NOT EXISTS
 
 In a cloud tenant the provisioner creates the AGE graph `rocketride` and the
 tenant reaches its database through a PgBouncer pooler in transaction mode.
-Locally the scripts create their own graphs. To exercise the pooled path, run
-a PgBouncer in transaction mode in front of `gx-age` (for example
-`edoburu/pgbouncer` with `POOL_MODE=transaction`) and give the fake broker its
-DSN instead of the direct one.
+Locally the scripts create their own graphs. `gx-pgbouncer` is that pooler:
+`validate_all.sh` always runs the node suites' second AGE pass through it
+(`RR_TEST_AGE_POOLER_DSN`, default
+`postgresql://rruser:rrpass@127.0.0.1:56433/rrtenant`), as CI does, and fails
+when it is not running rather than skipping the pass. To run the SDK and browser
+lanes through the pooled path too, give the fake broker that DSN instead of the
+direct one.
 
 The Python scripts need `rocketride`, `psycopg2`, `neo4j` and `falkordb`; the
 engine in `dist/server` has them, so run them with `./engine <script>` from
@@ -143,6 +151,7 @@ All optional; the defaults match the containers above.
 | `OUT_DIR` | `out/` in this folder (git-ignored) | JSON results, screenshots, logs |
 | `CLIENT_TS_DIR` | `packages/client-typescript` | the built TypeScript SDK for `graph_acceptance.cjs` |
 | `STORE_DIR` | a new temp dir | `validate_all.sh`: the store for the test servers the builder starts |
+| `RR_TEST_AGE_POOLER_DSN` | the `gx-pgbouncer` DSN | `validate_all.sh`: the pooler the node suites' second AGE pass goes through (the pass always runs, as in CI) |
 | `AGE_DSN` | the `gx-age` DSN | seeding and measuring the AGE graphs |
 | `NEO4J_URI`, `NEO4J_USER`, `NEO4J_PASSWORD` | `gx-neo4j` | Neo4j node config and seeding |
 | `FALKORDB_HOST`, `FALKORDB_PORT` | `127.0.0.1`, `56379` | FalkorDB node config and seeding |
@@ -272,11 +281,13 @@ Playwright. The browser self-tests run the real lane against a stand-in
 Playwright (`selftest/stand_in.cjs`) that models an empty page, or a page the
 test describes. They check that:
 
-- `validate_all.sh` reports a failed step in its exit status, and checks the
-  database versions (`db-versions`) before the node suites;
+- `validate_all.sh` reports a failed step in its exit status, checks the
+  database versions (`db-versions`) before the node suites, and gives both node
+  steps a pooler DSN (its own when none is set) without printing its password;
 - `check_db_versions.py` takes the expected versions from the committed
   captures and fails on another version or edition, or an unreachable server;
-- the database images in this README are the ones `_build.yaml` starts;
+- the database and PgBouncer images in this README are the ones `_build.yaml`
+  starts;
 - the lifecycle restart rows, the Graph Explorer Ask and Escape steps, and the
   `lane_a11y.cjs` contrast, stroke and reduced-motion rows cannot pass without
   observing what they name;

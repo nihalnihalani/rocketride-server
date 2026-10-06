@@ -22,6 +22,13 @@
 #   STORE_DIR     disposable engine store for the test servers the builder starts
 #                 (default: a new temporary directory). Without RR_STORE_URL the
 #                 engine writes into ~/.rocketlib/store.
+#   RR_TEST_AGE_POOLER_DSN  the transaction-mode pooler in front of AGE (default:
+#                 the gx-pgbouncer container from README.md,
+#                 postgresql://rruser:rrpass@127.0.0.1:56433/rrtenant). CI always
+#                 sets it, so nodes:test runs the AGE suites a second time through
+#                 PgBouncer; this script does the same and never skips that pass
+#                 (an empty value also gets the default). With the pooler down the
+#                 required pass fails, as it would in CI.
 #   UV_CACHE_DIR, SDKROOT, CI  passed through when set (macOS builds may need SDKROOT).
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -31,10 +38,13 @@ STORE_DIR=${STORE_DIR:-$(mktemp -d "${TMPDIR:-/tmp}/rr-validate-store.XXXXXX")}
 mkdir -p "$LOGS"
 export CI=${CI:-true}
 export RR_STORE_URL=filesystem://$STORE_DIR
+export RR_TEST_AGE_POOLER_DSN=${RR_TEST_AGE_POOLER_DSN:-postgresql://rruser:rrpass@127.0.0.1:56433/rrtenant}
 SUMMARY=$LOGS/SUMMARY.txt
 : > "$SUMMARY"
 echo "revision $(git rev-parse HEAD) dirty=$(git status --porcelain | grep -v constants.ts | wc -l | tr -d ' ')" | tee -a "$SUMMARY"
 echo "store $RR_STORE_URL" | tee -a "$SUMMARY"
+# Where the AGE pooler pass connects (host and port only: the DSN carries a password).
+echo "pooler $(printf '%s' "$RR_TEST_AGE_POOLER_DSN" | sed -E 's#^[a-z]+://([^@/]*@)?##; s#[/?].*$##')" | tee -a "$SUMMARY"
 
 step() {
 	local name=$1; shift
@@ -57,7 +67,8 @@ step shell-check        ./builder shell:check shell:test
 # SDKs (frozen-surface tsc runs inside client-typescript:test)
 step client-ts-test     ./builder client-typescript:test
 step client-py-test     ./builder client-python:test
-# Python: engine-side suites, graph suites, live databases (required, not skippable)
+# Python: engine-side suites, graph suites, live databases (required, not skippable;
+# the node steps also run the AGE suites through the pooler, RR_TEST_AGE_POOLER_DSN)
 step ai-test            ./builder ai:test
 step db-versions        sh -c 'cd dist/server && exec ./engine "$1"' sh "$HERE/check_db_versions.py"
 step nodes-test-db      env RR_REQUIRE_DB_TESTS=1 ./builder nodes:test-db
