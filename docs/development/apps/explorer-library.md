@@ -295,7 +295,14 @@ document-URI key rule), and the drawer's selection and probe rules
    `execute` is not (a call may still mark one statement it knows is a read,
    see "The one retry").
 4. Mount `useEndpointStoreLifecycle(store, client, identity)` once at the app
-   root, and call tools only through `store.session`.
+   root, and call tools only through `store.session`. The store resets when
+   the identity fingerprint changes (sign-out included); the app must then
+   close every connection-scoped document (keep the Connections landing) and
+   clear its per-connection caches, such as schema snapshots, cached sessions
+   and reads in flight, as SQL Explorer (`identityScope.ts`) and Graph
+   Explorer (`graph/identityChange.ts`) do. The shared `EndpointDrawer` needs
+   nothing extra: when the store resets, it forgets its selection and drops
+   the probe result, including one still in flight.
 5. Wire the runner's hooks and the shared components; keep the language
    (lexer, classifier, row limits, failure wording) in the app.
 6. Tests: pure logic runs under the app's `*:test` action; for `shared:test`,
