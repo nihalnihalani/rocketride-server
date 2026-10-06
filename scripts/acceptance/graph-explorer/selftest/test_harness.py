@@ -222,6 +222,34 @@ class ValidateAllExitCode(unittest.TestCase):
         self.run_gates('0', RR_TEST_AGE_POOLER_DSN=dsn)
         self.assertEqual(set(self.node_suite_poolers().values()), {dsn})
 
+    def printed(self, res: subprocess.CompletedProcess) -> str:
+        """Everything the run showed: stdout, stderr and every SUMMARY.txt it wrote."""
+        summaries = ''.join(p.read_text() for p in (self.tmp / 'out').glob('*/SUMMARY.txt'))
+        return res.stdout + res.stderr + summaries
+
+    def test_a_pooler_dsn_password_is_never_printed(self):
+        # libpq also takes key/value DSNs, and a URL password may hold an unencoded '@'
+        # or '/': whatever the form, the password must stay out of stdout and SUMMARY.txt.
+        cases = [
+            # (DSN, its password, what the summary shows)
+            ('host=127.0.0.1 port=6543 dbname=elsewhere user=someone password=kv-pw-1', 'kv-pw-1', 'pooler (set)'),
+            ("host='127.0.0.1' password = 'kv pw 2' port=6543", 'kv pw 2', 'pooler (set)'),
+            ('postgresql://someone:at@pw-3@127.0.0.1:6543/elsewhere', 'pw-3', 'pooler (set)'),
+            ('postgresql://someone:6543/pw-4@127.0.0.1/elsewhere', 'pw-4', 'pooler (set)'),
+            ('postgresql://127.0.0.1:6543/elsewhere?password=at@pw-5', 'pw-5', 'pooler (set)'),
+            ('postgresql+psycopg2://someone:pw-6@127.0.0.1:6543/elsewhere', 'pw-6', 'pooler 127.0.0.1:6543'),
+            ('postgres://someone:pw-7@[::1]:6543', 'pw-7', 'pooler [::1]:6543'),
+        ]
+        for dsn, password, shown in cases:
+            with self.subTest(dsn=dsn):
+                shutil.rmtree(self.tmp / 'out', ignore_errors=True)
+                self.calls.unlink(missing_ok=True)
+                res = self.run_gates('0', RR_TEST_AGE_POOLER_DSN=dsn)
+                out = self.printed(res)
+                self.assertNotIn(password, out, 'the pooler password was printed')
+                self.assertIn(shown + '\n', out)
+                self.assertEqual(set(self.node_suite_poolers().values()), {dsn}, 'the node suites got another DSN')
+
     def test_a_database_on_another_version_fails_the_run(self):
         res = self.run_gates('0', FAKE_ENGINE_RC='1')
         self.assertNotEqual(res.returncode, 0, res.stdout)

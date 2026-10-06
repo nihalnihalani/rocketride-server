@@ -306,7 +306,9 @@ test describes. They check that:
   node test dependencies into the engine and then checks the database versions
   (`db-versions`) before the node suites (its stand-in engine has no drivers
   until that install, as after a fresh build), and gives both node steps a
-  pooler DSN (its own when none is set) without printing its password;
+  pooler DSN (its own when none is set); its summary shows only the pooler's
+  host and port, and only for a plain URL (any other form, such as libpq's
+  key/value one, shows `(set)`), so the password is never printed;
 - `check_db_versions.py` takes the expected versions from the committed
   captures and fails on another version or edition, or an unreachable server;
 - the database and PgBouncer images in this README are the ones `_build.yaml`

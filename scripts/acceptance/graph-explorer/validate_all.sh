@@ -49,8 +49,19 @@ SUMMARY=$LOGS/SUMMARY.txt
 : > "$SUMMARY"
 echo "revision $(git rev-parse HEAD) dirty=$(git status --porcelain | grep -v constants.ts | wc -l | tr -d ' ')" | tee -a "$SUMMARY"
 echo "store $RR_STORE_URL" | tee -a "$SUMMARY"
-# Where the AGE pooler pass connects (host and port only: the DSN carries a password).
-echo "pooler $(printf '%s' "$RR_TEST_AGE_POOLER_DSN" | sed -E 's#^[a-z]+://([^@/]*@)?##; s#[/?].*$##')" | tee -a "$SUMMARY"
+# Where the AGE pooler pass connects. The DSN carries a password, so only a plain URL,
+# scheme://[user[:password]@]host[:port][/path][?query] with no other '@', shows its host
+# and port; any other form (libpq key/value, several hosts, an unencoded '@' or '/' in the
+# password) shows a placeholder.
+pooler_shown() {
+	local url='^[A-Za-z][A-Za-z0-9+.-]*://([^@/?#]*@)?([A-Za-z0-9._-]+|\[[0-9A-Fa-f:.]+\])(:[0-9]+)?([/?#][^@]*)?$'
+	if [[ $1 =~ $url ]]; then
+		printf '%s%s' "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}"
+	else
+		printf '(set)'
+	fi
+}
+echo "pooler $(pooler_shown "$RR_TEST_AGE_POOLER_DSN")" | tee -a "$SUMMARY"
 
 step() {
 	local name=$1; shift
