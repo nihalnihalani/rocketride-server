@@ -4,12 +4,15 @@
 # =============================================================================
 """Start long-lived tools pipelines for the browser lanes (local disposable databases only).
 
-Starts SQL pipelines (db_postgres, db_supabase, rocketride_sql) and one tools-only
-graph pipeline per engine, each with a fixed local-only project id so reruns
-reuse them, then exits and leaves the tasks running. Before starting, it makes
-sure the SQL fixture table (SQL_TABLE, default gx_items) exists with 25 rows;
-it never drops or rewrites an existing table. Prints names and project ids only,
-never tokens. ``--stop`` terminates the fixtures.
+Starts SQL pipelines (db_postgres, db_supabase, rocketride_sql), one tools-only
+graph pipeline per engine (execute off), and one write-enabled FalkorDB pipeline
+on its own graph (WRITE_GRAPH, default gx_accept_write) for the write console
+steps of browser/lane_graph.cjs. Each has a fixed local-only project id so reruns
+reuse them; the script then exits and leaves the tasks running. Before starting,
+it makes sure the SQL fixture table (SQL_TABLE, default gx_items) exists with 25
+rows and that WRITE_GRAPH exists (created empty); it never drops or rewrites an
+existing table or graph. Prints names and project ids only, never tokens.
+``--stop`` terminates the fixtures.
 
 Run graph_acceptance.py first: it seeds the ACCEPT_GRAPH graphs these fixtures
 read. Run browser/gen_perf.py first too: the perf fixture does not start until
@@ -85,6 +88,14 @@ FIXTURES = [
         'graph_falkordb',
         {**FALKOR, 'graph': E.ACCEPT_GRAPH, 'allow_execute': False},
     ),
+    # The only graph fixture that can write: the write console steps run their CREATE
+    # here and delete what they wrote. Its own graph, never ACCEPT_GRAPH.
+    (
+        'gx-local Graph write-enabled (FalkorDB)',
+        '00000000-0000-4000-8000-00000000fa1e',
+        'graph_falkordb',
+        {**FALKOR, 'graph': E.WRITE_GRAPH, 'allow_execute': True},
+    ),
 ]
 
 
@@ -110,6 +121,28 @@ def ensure_sql_table() -> None:
         conn.close()
 
 
+def ensure_write_graph() -> None:
+    """Create WRITE_GRAPH empty when it does not exist yet; never change an existing one.
+
+    FalkorDB refuses a read on a graph nothing has written to yet ("Invalid graph
+    operation on empty key"), so the write-enabled fixture needs the graph to exist
+    before the workbench can read its schema.
+    """
+    from falkordb import FalkorDB
+
+    try:
+        db = FalkorDB(host=E.FALKORDB_HOST, port=E.FALKORDB_PORT)
+        if E.WRITE_GRAPH in db.list_graphs():
+            print(f'falkordb graph {E.WRITE_GRAPH} exists (left unchanged)')
+            return
+        db.select_graph(E.WRITE_GRAPH).query('CREATE (n) DELETE n')
+        print(f'falkordb graph {E.WRITE_GRAPH} created (empty)')
+    except Exception as e:  # noqa: BLE001 - the other fixtures still start
+        # Without FalkorDB only its fixtures fail (each on its own line below);
+        # the SQL, AGE and Neo4j fixtures still start.
+        print(f'FAILED falkordb graph {E.WRITE_GRAPH}: {type(e).__name__}: {str(e)[:200]}')
+
+
 def pipeline(name, project_id, provider, cfg):
     return {
         'name': name,
@@ -131,6 +164,7 @@ async def main():
     stop = '--stop' in sys.argv
     if not stop:
         ensure_sql_table()
+        ensure_write_graph()
     async with RocketRideClient(uri=E.ENGINE_URL, auth=E.API_KEY) as client:
         running = {(t.get('pipeline') or {}).get('project_id'): t for t in await client.get_tasks()}
         for name, pid, provider, cfg in FIXTURES:
@@ -151,4 +185,5 @@ async def main():
                 print(f'FAILED {name}: {type(e).__name__}: {str(e)[:200]}')
 
 
-asyncio.run(main())
+if __name__ == '__main__':
+    asyncio.run(main())

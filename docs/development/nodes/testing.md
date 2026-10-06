@@ -571,16 +571,30 @@ Enterprise role.
 With `RR_TEST_AGE_POOLER_DSN` set, the two AGE suites run a second time through
 that transaction-mode pooler (`RR_TEST_AGE_DSN` is pointed at it and
 `RR_TEST_AGE_ADMIN_DSN` at the database itself), the way the cloud reaches
-tenant databases; CI runs PgBouncer in front of its AGE container for this. The
+tenant databases; CI runs PgBouncer in front of its AGE container for this.
+Without the variable a required run still passes but leaves that pass out (it
+says so in the task output). `scripts/acceptance/graph-explorer/validate_all.sh`
+always sets it, to the `gx-pgbouncer` container from that folder's README unless
+you point it elsewhere, so a local gate run includes the pass. The
 servers and their environment variables (`RR_TEST_AGE_DSN`, `RR_TEST_PG_DSN`,
 `RR_TEST_NEO4J_URI`, `RR_TEST_FALKORDB_URL`, ...) are the ones
 `.github/workflows/_build.yaml` starts; run the same images locally to reproduce
-a CI failure. A new live suite goes into `DB_LIVE_SUITES` and is named
-`test_*_full.py`, so the mocked pass never collects it.
+a CI failure (`scripts/acceptance/graph-explorer/README.md` has the commands,
+with Neo4j and FalkorDB pinned by the same digests). A new live suite goes into
+`DB_LIVE_SUITES` and is named `test_*_full.py`, so the mocked pass never
+collects it.
 
 When a change to a graph node alters its wire output on purpose, regenerate
 graph-ui's fixtures with `nodes/test/graph_wire_fixtures.py` (its docstring has
-the commands) and commit them with the change.
+the commands) and commit them with the change. Regenerate only against the CI
+images: the live captures record each server's version and its own error text,
+so captures taken on another server version fail CI.
+`scripts/acceptance/graph-explorer/check_db_versions.py` says whether your
+servers match the committed captures; when `test_graph_wire_fixtures_full.py`
+fails locally and the code did not change the wire output, run it before
+regenerating anything (with `./engine` from `dist/server`; it imports the
+database drivers, which a plain build does not install, so run it after
+`nodes:test` or `nodes:test-db` has installed `nodes/test/requirements.txt`).
 
 ### Test dependencies
 
