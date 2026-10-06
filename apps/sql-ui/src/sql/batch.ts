@@ -38,7 +38,7 @@
 
 import type { SqlDialect } from '../connect';
 import type { StatementKind } from './classify';
-import { CTE_WRITE_WORDS } from './classify';
+import { CTE_WRITE_WORDS, selectsInto } from './classify';
 import { codeOnly, keywordSites, stripSqlComments } from './split';
 import {
 	formatBatchOutcome,
@@ -293,7 +293,9 @@ export type LimitState = 'applied' | 'in-statement' | 'none';
  * A statement that already carries its own LIMIT is left alone: the user's
  * limit governs, and the meta line reports that none was applied by the app.
  * Nothing is added to writes, DDL, SHOW, EXPLAIN or DESCRIBE, where the clause
- * is either invalid or silently changes what the statement does.
+ * is either invalid or silently changes what the statement does — nor to a
+ * `SELECT ... INTO` on any dialect ({@link selectsInto}), which writes its rows
+ * into a table, a file or variables, so a limit would truncate what it writes.
  *
  * @param sql - The statement.
  * @param limit - The header selection ('200', '1000' or 'All').
@@ -311,6 +313,14 @@ export function applyRowLimit(sql: string, limit: string, dialect: SqlDialect = 
 	const returnsRows = RETURNS_ROWS.test(bare)
 		|| stripped.startsWith('(')
 		|| (/^with\b/i.test(bare) && keywordSites(bare, CTE_WRITE_WORDS, dialect).length === 0);
+	// A SELECT ... INTO returns no rows: it fills a new table (PostgreSQL), a
+	// file or variables (MySQL), or a file (ClickHouse). An appended LIMIT would
+	// silently truncate the copy, or follow MySQL's trailing INTO where it does
+	// not parse. It goes out as typed, its own LIMIT included, and since no
+	// rows come back no limit is reported either. Checked before the statement's
+	// own limit for that reason, with the classification's own test, so the run
+	// is a `write` there too.
+	if (returnsRows && selectsInto(sql, dialect)) return { sql, limit: null, state: 'none' };
 	// Checked BEFORE the header selection, so `All` on a statement that limits
 	// itself still reports the statement's limit instead of claiming none. Two
 	// spellings count: `LIMIT n` and the SQL standard's `FETCH { FIRST | NEXT }

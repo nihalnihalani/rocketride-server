@@ -175,6 +175,14 @@ its own `LIMIT` — one inside a subquery bounds that subquery, not the result,
 so on **200** or **1000** the app still appends its own — or `N rows returned
 (no limit applied)` when nothing bounds the result.
 
+A `SELECT … INTO` returns no rows: PostgreSQL's `SELECT … INTO new_table`
+creates and fills a table, MySQL's `INTO OUTFILE`, `INTO DUMPFILE` and `INTO
+@variable` write a file or variables, and ClickHouse's `INTO OUTFILE` writes a
+file. Nothing is appended to one, whatever the header says, because a limit
+would silently cut the copy short. It goes out exactly as typed and counts as
+a statement that changes data: the app never retries it after a restart,
+History lists it with the writes, and re-running it from History asks first.
+
 Read `no limit applied` literally, because **All** together with a `LIMIT`
 that is not on the outermost query produces exactly that line. Only a
 top-level `LIMIT` is recognised, so

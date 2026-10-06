@@ -823,3 +823,49 @@ describe('applyRowLimit', () => {
 
 	});
 });
+
+describe('applyRowLimit — a SELECT that sends its rows somewhere else (INTO)', () => {
+	// SELECT ... INTO returns no rows: it fills a new table (PostgreSQL), a
+	// file or variables (MySQL), or a file (ClickHouse). An appended LIMIT
+	// would silently truncate what it writes, or be a syntax error naming a
+	// clause the user never typed. Nothing is appended, on any dialect.
+	const untouched = (sql: string, dialect: Parameters<typeof applyRowLimit>[2]) => {
+		for (const limit of ['200', '1000', 'All']) {
+			assert.deepEqual(applyRowLimit(sql, limit, dialect), { sql, limit: null, state: 'none' }, `${dialect}: ${sql} (${limit})`);
+		}
+	};
+
+	it('leaves PostgreSQL SELECT ... INTO a new table alone', () => {
+		untouched('SELECT * INTO orders_backup FROM orders', 'postgres');
+		untouched('SELECT * INTO TEMP orders_tmp FROM orders;', 'postgres');
+		untouched('SELECT id, total INTO UNLOGGED TABLE t FROM orders WHERE total > 0', 'postgres');
+		untouched('WITH r AS (SELECT * FROM orders) SELECT * INTO orders_backup FROM r', 'postgres');
+		untouched('(SELECT * INTO t FROM a)', 'postgres');
+		// Its own LIMIT is the user's: still sent as typed, and still no rows.
+		untouched('SELECT * INTO t FROM orders LIMIT 10', 'postgres');
+	});
+
+	it('leaves MySQL INTO OUTFILE, INTO DUMPFILE and INTO @variable alone', () => {
+		untouched("SELECT * FROM orders INTO OUTFILE '/tmp/orders.csv'", 'mysql');
+		untouched("SELECT * INTO OUTFILE '/tmp/orders.csv' FROM orders", 'mysql');
+		untouched("SELECT doc INTO DUMPFILE '/tmp/doc.bin' FROM docs WHERE id = 1", 'mysql');
+		untouched('SELECT id INTO @last FROM orders ORDER BY id DESC LIMIT 1', 'mysql');
+		untouched('SELECT id FROM orders WHERE id = 1 FOR UPDATE INTO @x', 'mysql');
+	});
+
+	it('leaves ClickHouse INTO OUTFILE alone', () => {
+		untouched("SELECT * FROM events INTO OUTFILE 'events.csv' FORMAT CSV", 'clickhouse');
+	});
+
+	it('leaves it alone when the dialect could not be probed', () => {
+		untouched('SELECT * INTO orders_backup FROM orders', 'unknown');
+	});
+
+	it('still bounds a read that only mentions INTO in a literal, a quoted name, a comment or a longer word', () => {
+		assert.equal(applyRowLimit("SELECT 'into' AS word FROM t", '200', 'postgres').state, 'applied');
+		assert.equal(applyRowLimit('SELECT * FROM "into"', '200', 'postgres').state, 'applied');
+		assert.equal(applyRowLimit('SELECT * FROM `into`', '200', 'mysql').state, 'applied');
+		assert.equal(applyRowLimit('SELECT * FROM t -- copy into backup later', '200', 'postgres').state, 'applied');
+		assert.equal(applyRowLimit('SELECT into_count FROM t', '200', 'postgres').state, 'applied');
+	});
+});
