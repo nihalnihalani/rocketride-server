@@ -27,12 +27,14 @@
 // Pick (or inspect) an endpoint and verify it with a live probe. The drawer
 // holds no connection mechanics: the app hands in what to say (`copy`), how to
 // verify (`probe`) and anything extra to show about an endpoint (`details`).
+// Its selection and probe rules live in drawerModel.ts, where they are tested.
 // =============================================================================
 
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useState, useSyncExternalStore } from 'react';
 import type { CSSProperties, ReactNode } from 'react';
 import { Banner, Button, DetailPanel, LabelValue, Section, StatusBadge, commonStyles } from 'shell';
 import type { IExplorerClient, IExplorerEndpoint } from '../types';
+import { createDrawerModel } from './drawerModel';
 import { ENDPOINT_STATE_BADGE, describeRun } from './endpointState';
 
 // =============================================================================
@@ -93,9 +95,6 @@ export interface IEndpointDrawerProps<E extends IExplorerEndpoint> {
 	details?: (endpoint: E) => ReactNode;
 }
 
-/** Probe lifecycle local to the drawer. */
-type ProbeStatus = 'idle' | 'probing' | 'done';
-
 // =============================================================================
 // STYLES
 // =============================================================================
@@ -148,40 +147,27 @@ const styles = {
 export function EndpointDrawer<E extends IExplorerEndpoint>(props: IEndpointDrawerProps<E>): React.ReactElement {
 	const { open, client, endpoints, endpoint, onClose, onOpen, avatar, copy, probe: runProbeFn, details } = props;
 
-	// The endpoint being inspected: caller preselection wins, else first.
-	const [selectedKey, setSelectedKey] = useState<string | null>(null);
-
-	// Probe lifecycle + result for the selected endpoint.
-	const [probeStatus, setProbeStatus] = useState<ProbeStatus>('idle');
-	const [probe, setProbe] = useState<IDrawerProbe | null>(null);
-
-	// Probe sequence: every re-seed or target switch bumps it, so an in-flight
-	// probe result that lands late is recognised as stale and discarded instead
-	// of describing the wrong node.
-	const probeSeq = useRef(0);
+	// The selection and the probe lifecycle (drawerModel.ts): the endpoint
+	// being inspected (caller preselection wins, else first), where its probe
+	// stands, and the generation that drops a probe answering too late.
+	const [model] = useState(() => createDrawerModel<IDrawerProbe>());
+	const { selectedKey, status: probeStatus, probe } = useSyncExternalStore(model.subscribe, model.get, model.get);
 
 	// Re-seed the selection every time the drawer opens (or the caller's
 	// preselection changes) and drop any stale probe result.
 	useEffect(() => {
 		if (!open) return;
-		probeSeq.current += 1;
-		setSelectedKey(endpoint?.key ?? endpoints[0]?.key ?? null);
-		setProbeStatus('idle');
-		setProbe(null);
+		model.seed(endpoint?.key ?? endpoints[0]?.key ?? null);
 		// `endpoints` is read for the first-entry fallback only; a background
 		// discovery refresh must not reset the user's selection mid-inspection.
 		// eslint-disable-next-line react-hooks/exhaustive-deps
 	}, [open, endpoint]);
 
-	// Fill the first-endpoint fallback when the drawer opened from the empty
-	// state and discovery delivers endpoints later. Only a never-made selection
-	// (selectedKey === null) is filled — a live selection, or its temporary
-	// absence from the list during a discovery refresh, stays.
+	// Follow the endpoint list: fill the first-endpoint fallback when the
+	// drawer opened from the empty state and discovery delivers endpoints later.
 	useEffect(() => {
-		if (!open || selectedKey !== null) return;
-		const first = endpoints[0];
-		if (first) setSelectedKey(first.key);
-	}, [open, selectedKey, endpoints]);
+		model.sync(endpoints, open);
+	}, [model, open, endpoints]);
 
 	// Resolve the selected endpoint object from its key.
 	const selected = useMemo(
@@ -192,15 +178,11 @@ export function EndpointDrawer<E extends IExplorerEndpoint>(props: IEndpointDraw
 	/** Run the live probe against the selected endpoint. */
 	const runProbe = async (): Promise<void> => {
 		if (!client || !selected) return;
-		// Capture the sequence: if the drawer re-seeds or the user switches
-		// endpoints while this probe is in flight, the result is stale.
-		const seq = ++probeSeq.current;
-		setProbeStatus('probing');
-		setProbe(null);
+		// The ticket expires if the drawer re-seeds or the user switches
+		// endpoints while this probe is in flight; its result is then dropped.
+		const ticket = model.startProbe();
 		const result = await runProbeFn(client, selected);
-		if (seq !== probeSeq.current) return;
-		setProbeStatus('done');
-		setProbe(result);
+		model.finishProbe(ticket, result);
 	};
 
 	return (
@@ -238,10 +220,7 @@ export function EndpointDrawer<E extends IExplorerEndpoint>(props: IEndpointDraw
 					onChange={(e) => {
 						// Changing the target invalidates any prior (or in-flight)
 						// probe result.
-						probeSeq.current += 1;
-						setSelectedKey(e.target.value);
-						setProbeStatus('idle');
-						setProbe(null);
+						model.select(e.target.value);
 					}}
 				>
 					{endpoints.length === 0 && <option value="">{copy.noEndpointsOption}</option>}
