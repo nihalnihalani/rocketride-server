@@ -163,8 +163,11 @@ export function EndpointDrawer<E extends IExplorerEndpoint>(props: IEndpointDraw
 		// eslint-disable-next-line react-hooks/exhaustive-deps
 	}, [open, endpoint]);
 
-	// Follow the endpoint list: fill the first-endpoint fallback when the
-	// drawer opened from the empty state and discovery delivers endpoints later.
+	// Follow the endpoint list. When the selection leaves it (the store reset on
+	// sign-out or a change of user, organization or team), forget it with its
+	// probe result and drop a probe still in flight, open or closed. Fill the
+	// first-endpoint fallback when the drawer opened from the empty state (or
+	// after a reset) and discovery delivers endpoints later.
 	useEffect(() => {
 		model.sync(endpoints, open);
 	}, [model, open, endpoints]);

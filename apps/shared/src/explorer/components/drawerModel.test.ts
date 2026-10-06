@@ -141,6 +141,69 @@ describe('createDrawerModel: probe', () => {
 	});
 });
 
+// A selection leaves the list only when the endpoint store resets: on sign-out
+// and on a change of user, organization or team (the store keeps a vanished
+// endpoint listed as `stopped`).
+describe('createDrawerModel: the endpoint store resets', () => {
+	it('forgets the selection and its finished probe when the selected endpoint leaves the list', () => {
+		const model = createDrawerModel<IProbe>();
+		model.seed('a');
+		model.finishProbe(model.startProbe(), { database: 'previous_team_db' });
+		let calls = 0;
+		model.subscribe(() => {
+			calls += 1;
+		});
+
+		model.sync(listed(), true);
+
+		assert.deepEqual(model.get(), { selectedKey: null, status: 'idle', probe: null }, 'the previous account\'s probe rows are still shown');
+		assert.equal(calls, 1);
+	});
+
+	it('drops a probe still in flight, so its late answer is not shown', () => {
+		const model = createDrawerModel<IProbe>();
+		model.seed('a');
+		const ticket = model.startProbe();
+
+		model.sync(listed(), true);
+
+		assert.equal(model.finishProbe(ticket, { database: 'previous_team_db' }), false, 'the late answer was applied');
+		assert.deepEqual(model.get(), { selectedKey: null, status: 'idle', probe: null });
+	});
+
+	it('forgets while the drawer is closed too', () => {
+		const model = createDrawerModel<IProbe>();
+		model.seed('a');
+		const ticket = model.startProbe();
+
+		model.sync(listed(), false);
+
+		assert.equal(model.get().selectedKey, null);
+		assert.equal(model.finishProbe(ticket, { database: 'previous_team_db' }), false);
+	});
+
+	it('falls back to the first endpoint of the fresh list with no result carried over, even when the same key returns', () => {
+		const model = createDrawerModel<IProbe>();
+		model.seed('a');
+		model.finishProbe(model.startProbe(), { database: 'previous_team_db' });
+
+		model.sync(listed(), true);
+		model.sync(listed('a', 'b'), true);
+
+		assert.deepEqual(model.get(), { selectedKey: 'a', status: 'idle', probe: null });
+	});
+
+	it('forgets when the list is replaced without the selection in one step', () => {
+		const model = createDrawerModel<IProbe>();
+		model.seed('a');
+		model.finishProbe(model.startProbe(), { database: 'previous_team_db' });
+
+		model.sync(listed('x', 'y'), true);
+
+		assert.deepEqual(model.get(), { selectedKey: 'x', status: 'idle', probe: null });
+	});
+});
+
 describe('createDrawerModel: subscription', () => {
 	it('replaces the view on every change and stops notifying after unsubscribe', () => {
 		const model = createDrawerModel<IProbe>();

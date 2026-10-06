@@ -279,7 +279,8 @@ names survive), `ConnectionsLanding` and `EndpointDrawer` (the app injects its
 wording, icon, probe, extra rows and empty states; state wording is in
 `endpointState.ts`). Also pure: `a11y/` (`createAnnouncer`,
 `createLiveRegion`), `nav/` (`createActiveKeyStore`, `createRequestChannel`,
-document-URI key rule).
+document-URI key rule), and the drawer's selection and probe rules
+(`components/drawerModel.ts`).
 
 ## Adding an Explorer app
 

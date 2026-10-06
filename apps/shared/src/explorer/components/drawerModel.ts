@@ -30,9 +30,21 @@
 //
 // A PROBE RESULT BELONGS TO ONE SELECTION
 //   Every probe takes a generation ticket. Re-seeding the drawer (it opened,
-//   or the caller's preselection changed) and picking another endpoint move
-//   the generation on, so a probe that answers afterwards is dropped instead
-//   of describing a different node.
+//   or the caller's preselection changed), picking another endpoint and the
+//   selection leaving the list move the generation on, so a probe that
+//   answers afterwards is dropped instead of describing a different node.
+//
+// THE SELECTION LEAVES WITH ITS ENDPOINT
+//   The endpoint store keeps an endpoint that vanished from discovery listed
+//   (as `stopped`), so a key leaves the list only when the store resets: on
+//   sign-out and on a change of user, organization or team. The drawer then
+//   forgets the selection and the probe result with it (the database name and
+//   table count it showed belonged to the previous account), and a probe
+//   still in flight is dropped when it answers. A reset publishes the empty
+//   list, and the next account's list needs a round trip to the server, so
+//   the drawer sees the empty list even when that account lists the same key.
+//   An open drawer then takes the first endpoint of the fresh list, as it
+//   does in pick mode.
 // =============================================================================
 
 import { createGeneration } from '../generation';
@@ -75,9 +87,10 @@ export interface IDrawerModel<P> {
 	 */
 	select(key: string): void;
 	/**
-	 * The endpoint list changed. An open drawer with nothing picked takes the
-	 * first endpoint; a live selection is never replaced by a background
-	 * refresh.
+	 * The endpoint list changed. A selection that is no longer listed (the
+	 * store reset) is forgotten with its probe result, and a probe in flight is
+	 * dropped. An open drawer with nothing picked takes the first endpoint; a
+	 * live selection is never replaced by a background refresh.
 	 *
 	 * @param endpoints - The endpoints listed now.
 	 * @param open - Whether the drawer is open.
@@ -144,9 +157,17 @@ export function createDrawerModel<P>(): IDrawerModel<P> {
 		seed: inspect,
 		select: inspect,
 		sync(endpoints, open): void {
-			if (!open || view.selectedKey !== null) return;
+			let next = view;
+			const selected = next.selectedKey;
+			if (selected !== null && !endpoints.some((endpoint) => endpoint.key === selected)) {
+				// The store reset: the selection and its result belonged to the
+				// previous account, and so does any answer still on its way.
+				generation.invalidate();
+				next = { selectedKey: null, status: 'idle', probe: null };
+			}
 			const first = endpoints[0];
-			if (first !== undefined) publish({ ...view, selectedKey: first.key });
+			if (open && next.selectedKey === null && first !== undefined) next = { ...next, selectedKey: first.key };
+			if (next !== view) publish(next);
 		},
 		startProbe(): IGenerationTicket {
 			const ticket = generation.next();
