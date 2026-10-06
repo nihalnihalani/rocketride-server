@@ -704,6 +704,25 @@ describe('identity changes and sign-out reset everything', () => {
 		assert.equal(store.getState().status, 'idle');
 	});
 
+	it('after a switch to another organization, does not list the caller\'s own runs from the previous one again', async () => {
+		// The server keeps a user's own runs visible across an org switch and
+		// hands back their tokens; the store must not offer them to the new org.
+		const inA = row({ teamId: 'team-a', pipeline: { project_id: 'pa', name: 'In A', components: [{ id: 'db_1', provider: 'db_postgres' }] } });
+		const inB = row({ teamId: 'team-b', source: 'tools_2', pipeline: { project_id: 'pb', name: 'In B', components: [{ id: 'db_1', provider: 'db_postgres' }] } });
+		const { store, world } = make([inA]);
+		const watch = watchProbe();
+		store.attach(world.client, { userId: 'u1', orgId: 'org-A', devTeam: 'team-a', teamPermissions: { 'team-a': ['task.data'] } }, watch.watch);
+		await store.refresh(world.client);
+		assert.equal(store.getState().endpoints.length, 1);
+
+		world.rows.push(inB);
+		watch.handlers!.onIdentity({ userId: 'u1', orgId: 'org-B', devTeam: 'team-b', teamPermissions: { 'team-b': ['task.data'] } });
+		await store.refresh(world.client);
+		assert.deepEqual(store.getState().endpoints.map((endpoint) => endpoint.teamId), ['team-b']);
+		const text = JSON.stringify(store.getState());
+		assert.equal(text.includes('In A'), false);
+	});
+
 	it('resets when re-attached under another identity', async () => {
 		const { store, world } = make();
 		const detach = store.attach(world.client, alice);

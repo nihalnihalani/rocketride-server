@@ -46,6 +46,17 @@ project id is `pipeline.project_id`; the row has no `projectId` field.
 `pipeline.components` is read from the row; `getTaskPipeline(token)` is a
 bounded fallback only when a row carries none.
 
+The server scopes a user-owned run by its owner, so `getTasks()` still returns
+the caller's own runs from an organization they have switched away from, with
+their tokens. Discovery drops a row, before grouping and before its token
+reaches the store, when the identity lists its organization's teams
+(`identity.teamPermissions`) and the row's `teamId` is not one of them
+(`runInIdentityOrganization` in
+[`connect/identity.ts`](../../../apps/shared/src/explorer/connect/identity.ts)).
+A row with no `teamId`, or an identity without a team list, keeps every row.
+This also keeps a platform administrator's Explorer to the organization they
+are signed in to. A run under another team of the same organization stays.
+
 A connection is a **role map**, not a provider set
 ([`types.ts`](../../../apps/shared/src/explorer/types.ts)):
 

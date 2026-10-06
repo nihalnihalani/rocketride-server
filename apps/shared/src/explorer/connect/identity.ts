@@ -33,6 +33,15 @@
 // The fingerprint below is the whole rule. It deliberately contains no token,
 // and deliberately excludes permission lists: a permission change updates
 // hints, it does not invalidate state.
+//
+// Forgetting is not enough on its own. The server keeps a caller's OWN runs
+// visible after an organization switch (owner, not team, decides who sees a
+// user-owned run) and hands back their tokens, so the next discovery would
+// list them again. Discovery therefore keeps a run only when its team is one
+// of the teams the signed-in organization lists for the caller
+// (`runInIdentityOrganization`); every run carries one (a dev run its
+// development team, a personal deploy its billing team, a team deploy its
+// team).
 // =============================================================================
 
 import { isPlainObject } from '../checks';
@@ -81,6 +90,26 @@ export function identityFromConnectResult(value: unknown): IExplorerIdentity | n
 		}
 	}
 	return identity;
+}
+
+/**
+ * Whether a run belongs to the organization the identity is signed in to, as
+ * far as the identity can tell: its team is one of the teams that organization
+ * lists for the caller. This one is a FILTER, not a hint: a run it rejects is
+ * not listed at all, so its token never reaches the store.
+ *
+ * - no identity, or one that carries no team list (no organization data):
+ *   true, nothing can be told;
+ * - a run that names no team (an older server): true;
+ * - otherwise: whether the run's team is in the list.
+ *
+ * @param identity - Who is signed in.
+ * @param teamId - The run's team id ('' when the row names none).
+ * @returns False only when the run's team is known not to be the organization's.
+ */
+export function runInIdentityOrganization(identity: IExplorerIdentity | null, teamId: string): boolean {
+	if (identity === null || identity.teamPermissions === undefined || teamId === '') return true;
+	return Object.prototype.hasOwnProperty.call(identity.teamPermissions, teamId);
 }
 
 /**

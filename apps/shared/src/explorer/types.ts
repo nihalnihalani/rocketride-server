@@ -137,9 +137,11 @@ export interface IExplorerIdentity {
 	devTeam: string;
 	/**
 	 * Permissions the user holds per team (team id -> permission strings), when
-	 * known. A HINT only, used to label a failed probe as `inaccessible`: it
-	 * never decides whether a call is attempted, and a change in it does not
-	 * reset the store (only the three fields above do).
+	 * known. The permissions are a HINT only, used to label a failed probe as
+	 * `inaccessible`: they never decide whether a call is attempted, and a
+	 * change in them does not reset the store (only the three fields above do).
+	 * The KEYS are the signed-in organization's teams, and discovery lists only
+	 * runs of those teams (see connect/identity.ts `runInIdentityOrganization`).
 	 */
 	teamPermissions?: Readonly<Record<string, readonly string[]>>;
 	/** Organization-level permissions, when known (same hint-only status). */

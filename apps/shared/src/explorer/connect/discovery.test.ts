@@ -218,6 +218,33 @@ describe('discoverToolEndpoints — one tools role (SQL, Graph)', () => {
 		assert.equal(found.every((f) => f.endpoint.state === 'probing'), true);
 	});
 
+	it('lists only runs whose team belongs to the signed-in organization: the caller\'s own runs in another organization are left out', async () => {
+		// Signed in to org B, a member of teams b1 and b2. The server still lists
+		// the caller's own runs from org A (owner visibility survives an org switch).
+		const identity: IExplorerIdentity = { userId: 'u1', orgId: 'org-B', devTeam: 'team-b1', teamPermissions: { 'team-b1': ['task.data'], 'team-b2': ['task.monitor'] }, orgPermissions: [] };
+		const { found } = await discover([
+			row({ teamId: 'team-a1', source: 'own_dev_in_A' }),
+			row({ teamId: 'team-a1', runKind: 'deploy', ownerKind: 'user', ownerId: 'u1', source: 'own_personal_deploy_in_A' }),
+			row({ teamId: 'team-b1', source: 'own_dev_in_B' }),
+			// A dev run under the organization's OTHER team is still this organization's.
+			row({ teamId: 'team-b2', source: 'own_dev_in_B_other_team' }),
+			row({ teamId: 'team-b2', runKind: 'deploy', ownerKind: 'team', ownerId: 'team-b2', source: 'team_deploy_in_B' }),
+		], DB, identity);
+		assert.deepEqual(found.map((f) => f.endpoint.source).sort(), ['own_dev_in_B', 'own_dev_in_B_other_team', 'team_deploy_in_B']);
+		// No token of a left-out run is handed back for the vault.
+		const tokens = found.map((f) => f.token);
+		assert.equal(tokens.some((token) => token?.includes('_in_A')), false);
+	});
+
+	it('keeps every run when the identity cannot tell its organization\'s teams, or a row names no team', async () => {
+		const rows = [row({ teamId: 'team-a1', source: 's1' }), row({ teamId: '', source: 's2' })];
+		const noTeams: IExplorerIdentity = { userId: 'u1', orgId: 'org-B', devTeam: 'team-b1' };
+		assert.equal((await discover(rows, DB, noTeams)).found.length, 2);
+		assert.equal((await discover(rows, DB, null)).found.length, 2);
+		const withTeams: IExplorerIdentity = { ...noTeams, teamPermissions: { 'team-b1': [] } };
+		assert.deepEqual((await discover(rows, DB, withTeams)).found.map((f) => f.endpoint.source), ['s2']);
+	});
+
 	it('sorts by pipeline name, then node id, then key', async () => {
 		const z = row({ name: 'Zeta', source: 'tools_1', pipeline: { project_id: 'pz', components: [{ id: 'z1', provider: 'db_mysql' }] } });
 		const a = row({ name: 'Alpha', source: 'tools_2', pipeline: { project_id: 'pa', components: [{ id: 'b', provider: 'db_mysql' }, { id: 'a', provider: 'db_mysql' }] } });

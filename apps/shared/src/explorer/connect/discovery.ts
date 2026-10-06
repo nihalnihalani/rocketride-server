@@ -48,12 +48,19 @@
 // TOKENS: a task token is read here and returned beside the endpoint, never
 // inside it. The caller (the store) puts it in a transient vault; nothing else
 // in the library ever sees it.
+//
+// ANOTHER ORGANIZATION'S RUNS: getTasks also returns the caller's own runs
+// started in an organization they have since switched away from (the server
+// scopes a user-owned run by its owner, not by the current organization).
+// Such a row is dropped here, before grouping, when the identity lists its
+// organization's teams and the row's team is not one of them, so neither its
+// card nor its token reaches the store (see identity.ts).
 // =============================================================================
 
 import { isPlainObject } from '../checks';
 import { buildEndpointKey, legacyKeyFromKey, roleKeySource } from '../keys';
 import type { IExplorerClient, IExplorerComponent, IExplorerEndpoint, IExplorerIdentity, IExplorerPipeline, IExplorerTaskRow, IRoleBinding, IRoleSpec } from '../types';
-import { identityCanCallTools } from './identity';
+import { identityCanCallTools, runInIdentityOrganization } from './identity';
 
 // =============================================================================
 // TYPES
@@ -270,7 +277,10 @@ async function componentsOf(client: IExplorerClient, group: IGroup): Promise<IEx
  */
 export async function discoverToolEndpoints(client: IExplorerClient, options: IDiscoveryOptions): Promise<IDiscoveredEndpoint[]> {
 	const raw = await client.getTasks();
-	const rows = (Array.isArray(raw) ? raw : []).map(readTaskRow).filter((row): row is IExplorerTaskRow => row !== null);
+	const identity = options.identity ?? null;
+	const rows = (Array.isArray(raw) ? raw : [])
+		.map(readTaskRow)
+		.filter((row): row is IExplorerTaskRow => row !== null && runInIdentityOrganization(identity, row.teamId));
 	const groups = groupRows(rows, options.roles);
 	const componentLists = await mapWithConcurrency(groups, options.concurrency ?? 4, (group) => componentsOf(client, group));
 
