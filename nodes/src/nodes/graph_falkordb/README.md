@@ -185,7 +185,7 @@ for another refresh of the same node to finish, then runs within its
 ## Dependencies
 
 - `falkordb` `==1.7.0`
-- `redis` `==7.4.1`
+- `redis` `>=7.1,<8`
 
 ## Source
 

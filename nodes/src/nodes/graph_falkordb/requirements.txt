@@ -1,5 +1,7 @@
-# Pinned to the versions the live suites validate; nodes/test gets them through the engine constraints.
+# Pinned to the version the live suites validate; nodes/test gets it through the engine constraints.
 falkordb==1.7.0
 # Declared because IInstance imports redis.exceptions directly: falkordb-py
 # has no error hierarchy of its own and re-raises redis-py exceptions verbatim.
-redis==7.4.1
+# A range, not a pin: other nodes (memory_persistent) share redis, and the
+# falkordb pin above already bounds the client version it runs with.
+redis>=7.1,<8

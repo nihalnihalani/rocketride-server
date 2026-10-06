@@ -57,8 +57,8 @@ else:
 from falkordb import query_result as falkor_qr  # noqa: E402
 
 # Driver versions this suite (and the graph-ui wire fixtures generated from it)
-# was validated with; nodes/test/requirements.txt and the node requirements pin
-# the same versions.
+# was validated with. The node requirements pin these versions, and nodes/test
+# gets them through the engine constraints.
 VALIDATED_DRIVERS = {'neo4j': '6.3.1', 'falkordb': '1.7.0'}
 
 # The neo4j driver offers no public way to build Node/Relationship/Path
