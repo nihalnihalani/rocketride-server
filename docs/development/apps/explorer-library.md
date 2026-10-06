@@ -232,8 +232,9 @@ persists through the shell's workspace preferences, per connection key, and
 writes only while a preferences accessor is attached (see the file header for
 why a background write would be misfiled). SQL Explorer uses `sql.history`,
 `sql.historyRecording`, `sql.patternChecks` and the persisted field `sql`; Graph
-Explorer uses `graph.history`, `graph.historyRecording`, `graph.patternChecks`
-and `cypher`. **These names and the entry shape never change**: renaming one
+Explorer uses `graph.history`, `graph.historyRecording` and `cypher` (it has no
+pattern-check switch: its write console always confirms what the text check
+flags). **These names and the entry shape never change**: renaming one
 silently orphans users' saved history. Mount the accessor with
 `createHistoryPrefsBridge(store)` from `react.tsx`. Per-connection booleans use
 `createConnectionFlags` ([`history/flags.ts`](../../../apps/shared/src/explorer/history/flags.ts)).
