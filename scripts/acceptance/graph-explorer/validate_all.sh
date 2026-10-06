@@ -18,7 +18,10 @@
 # db-versions step checks first that the servers report the versions the
 # committed wire captures were taken on (check_db_versions.py): the wire-fixture
 # suite compares those exactly, so a container from a newer image fails it for
-# a reason that has nothing to do with the code.
+# a reason that has nothing to do with the code. That check imports the
+# database drivers, which a plain build does not install (nodes:test and
+# nodes:test-db install them first), so the node-test-deps step before it
+# installs nodes/test/requirements.txt into the engine the same way.
 #
 # Environment:
 #   OUT_DIR       where the logs go (default: out/ next to this script, git-ignored)
@@ -73,6 +76,9 @@ step client-py-test     ./builder client-python:test
 # Python: engine-side suites, graph suites, live databases (required, not skippable;
 # the node steps also run the AGE suites through the pooler, RR_TEST_AGE_POOLER_DSN)
 step ai-test            ./builder ai:test
+# The version check needs neo4j, falkordb and psycopg2 in the engine: install the node test
+# dependencies first, as nodes:install-test-deps does (depends(), engine constraints).
+step node-test-deps     sh -c 'cd dist/server && exec ./engine -c "import sys; from depends import depends; depends(sys.argv[1])" "$1"' sh "$PWD/nodes/test/requirements.txt"
 step db-versions        sh -c 'cd dist/server && exec ./engine "$1"' sh "$HERE/check_db_versions.py"
 step nodes-test-db      env RR_REQUIRE_DB_TESTS=1 ./builder nodes:test-db
 step nodes-test         env RR_REQUIRE_DB_TESTS=1 ./builder nodes:test

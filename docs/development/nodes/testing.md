@@ -592,7 +592,9 @@ so captures taken on another server version fail CI.
 `scripts/acceptance/graph-explorer/check_db_versions.py` says whether your
 servers match the committed captures; when `test_graph_wire_fixtures_full.py`
 fails locally and the code did not change the wire output, run it before
-regenerating anything.
+regenerating anything (with `./engine` from `dist/server`; it imports the
+database drivers, which a plain build does not install, so run it after
+`nodes:test` or `nodes:test-db` has installed `nodes/test/requirements.txt`).
 
 ### Test dependencies
 

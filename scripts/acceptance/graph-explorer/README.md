@@ -37,7 +37,7 @@ secret. Never point them at a database that holds data you care about.
 | `start_fixtures.py` | Starts the long-lived tools pipelines the browser lanes use, with no idle timeout (the engine otherwise stops a task after 15 idle minutes): the SQL fixtures, one graph fixture per engine with execute off, and one write-enabled FalkorDB fixture on its own graph (`WRITE_GRAPH`, see "The write console fixture"). Only what is not running yet is started; `--stop` terminates them. |
 | `fake_broker.py` | Local stand-in for the DB broker's `/provision` endpoint, so `rocketride_graph` and `rocketride_sql` resolve a local database. |
 | `validate_all.sh` | Runs every repository gate the feature touches (unit, SDK, node, docs, builds), writes one log per step, and exits non-zero when any step failed. |
-| `check_db_versions.py` | `validate_all.sh`'s first database step: the Neo4j, FalkorDB and AGE servers the node suites use must report the versions the committed wire captures (`apps/graph-ui/tests/fixtures/v1/live`) were taken on. |
+| `check_db_versions.py` | `validate_all.sh`'s first database check, run after its `node-test-deps` step has installed the drivers it imports: the Neo4j, FalkorDB and AGE servers the node suites use must report the versions the committed wire captures (`apps/graph-ui/tests/fixtures/v1/live`) were taken on. |
 | `browser/lane_graph.cjs` | Graph Explorer in Chrome, Firefox and WebKit: connections, the drawer's engine identity, editor run, canvas, Table/Raw tabs, inspector open and Escape, Expand, schema Refresh, History, write refusal in the browse editor, Ask without an LLM. With `falkordb` among its engines it also runs the write console (engine `falkordb-write`): a `CREATE` asks first with the focus on Cancel, Cancel sends nothing, Execute statement writes the node, and the node is deleted again, each checked over the lane's own FalkorDB connection. |
 | `browser/lane_sql.cjs` | SQL Explorer in the three browsers: connections listed (no graph nodes), each card's Edit reachable as a button (not inside the card's own button), a query through the shared runner. |
 | `browser/lane_a11y.cjs` | Themes, reduced motion, WCAG text contrast on the landing, canvas, Table view and inspector, and relationship-stroke contrast on the drawn graph. |
@@ -74,9 +74,9 @@ pinned by digest), with local-only throwaway values, published on 127.0.0.1
 only. Use exactly these: the node suites compare the graph tools' output with
 captures taken on these servers, including the server version and its own
 error text, so a newer image fails them for a reason that is not in the code.
-`validate_all.sh` checks the versions first (its `db-versions` step, which runs
-`check_db_versions.py`), and `selftest/` checks that these images are still the
-ones CI runs.
+`validate_all.sh` checks the versions before the node suites (its `db-versions`
+step, which runs `check_db_versions.py`), and `selftest/` checks that these
+images are still the ones CI runs.
 
 ```bash
 docker run -d --name gx-age -p 127.0.0.1:55433:5432 \
@@ -110,9 +110,21 @@ when it is not running rather than skipping the pass. To run the SDK and browser
 lanes through the pooled path too, give the fake broker that DSN instead of the
 direct one.
 
-The Python scripts need `rocketride`, `psycopg2`, `neo4j` and `falkordb`; the
-engine in `dist/server` has them, so run them with `./engine <script>` from
-`dist/server` (shown below). A virtualenv with those packages works too.
+The Python scripts need `rocketride`, `psycopg2`, `neo4j` and `falkordb`. A
+build gives the engine in `dist/server` `rocketride` but not the three drivers:
+they come from `nodes/test/requirements.txt`, which `./builder nodes:test` and
+`./builder nodes:test-db` install into the engine before their tests (and
+`validate_all.sh` in its `node-test-deps` step). On a fresh build, install them
+the same way, from the repository root:
+
+```bash
+REPO=$PWD
+(cd dist/server && ./engine -c 'import sys; from depends import depends; depends(sys.argv[1])' \
+  $REPO/nodes/test/requirements.txt)
+```
+
+Then run the scripts with `./engine <script>` from `dist/server` (shown below).
+A virtualenv with those packages works too.
 
 ### 3. Fake broker and engine
 
@@ -290,9 +302,11 @@ Playwright. The browser self-tests run the real lane against a stand-in
 Playwright (`selftest/stand_in.cjs`) that models an empty page, or a page the
 test describes. They check that:
 
-- `validate_all.sh` reports a failed step in its exit status, checks the
-  database versions (`db-versions`) before the node suites, and gives both node
-  steps a pooler DSN (its own when none is set) without printing its password;
+- `validate_all.sh` reports a failed step in its exit status, installs the
+  node test dependencies into the engine and then checks the database versions
+  (`db-versions`) before the node suites (its stand-in engine has no drivers
+  until that install, as after a fresh build), and gives both node steps a
+  pooler DSN (its own when none is set) without printing its password;
 - `check_db_versions.py` takes the expected versions from the committed
   captures and fails on another version or edition, or an unreachable server;
 - the database and PgBouncer images in this README are the ones `_build.yaml`

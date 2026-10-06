@@ -113,10 +113,33 @@ class ValidateAllExitCode(unittest.TestCase):
             "import os, sys\nsys.exit(int(os.environ.get('FAKE_RC', '0')))\n"
         )
         (repo / 'scripts' / 'build.js').write_text("process.exit(Number(process.env.FAKE_RC || '0'));\n")
-        # The engine the database version check runs in: records its arguments.
+        # The engine the database version check runs in, as a fresh build leaves it: it
+        # records its arguments, and has no database drivers until something installs
+        # nodes/test/requirements.txt (a plain build does not; nodes:test and nodes:test-db
+        # do, first). Until then the version check fails the way the real one does.
+        # FAKE_ENGINE_RC is the version check's own verdict.
         (repo / 'dist' / 'server').mkdir(parents=True)
         engine = repo / 'dist' / 'server' / 'engine'
-        engine.write_text('#!/bin/sh\necho "engine $*" >> "$FAKE_CALLS"\nexit "${FAKE_ENGINE_RC:-${FAKE_RC:-0}}"\n')
+        engine.write_text(
+            textwrap.dedent(
+                """\
+                #!/bin/sh
+                echo "engine $*" >> "$FAKE_CALLS"
+                case "$*" in
+                *depends*nodes/test/requirements.txt)
+                    [ "${FAKE_RC:-0}" = 0 ] && : > "$FAKE_DRIVERS"
+                    exit "${FAKE_RC:-0}" ;;
+                *check_db_versions.py)
+                    if [ ! -e "$FAKE_DRIVERS" ]; then
+                        echo "neo4j: could not read the server version (ModuleNotFoundError: No module named 'neo4j')"
+                        exit 1
+                    fi
+                    exit "${FAKE_ENGINE_RC:-${FAKE_RC:-0}}" ;;
+                esac
+                exit "${FAKE_RC:-0}"
+                """
+            )
+        )
         engine.chmod(0o755)
         self.calls = self.tmp / 'calls.txt'
         self.repo = repo
@@ -130,6 +153,7 @@ class ValidateAllExitCode(unittest.TestCase):
             base,
             FAKE_RC=rc,
             FAKE_CALLS=str(self.calls),
+            FAKE_DRIVERS=str(self.tmp / 'drivers-installed'),
             OUT_DIR=str(self.tmp / 'out'),
             STORE_DIR=str(self.tmp / 'store'),
             **extra,
@@ -156,6 +180,23 @@ class ValidateAllExitCode(unittest.TestCase):
         self.assertLess(steps.index('db-versions'), steps.index('nodes-test-db'), res.stdout)
         calls = self.calls.read_text() if self.calls.exists() else ''
         self.assertRegex(calls, r'engine \S*check_db_versions\.py', 'the version check did not run in the engine')
+
+    def engine_calls(self) -> list:
+        calls = self.calls.read_text().splitlines() if self.calls.exists() else []
+        return [line for line in calls if line.startswith('engine ')]
+
+    def test_the_version_check_gets_the_database_drivers_first(self):
+        # A fresh build has no neo4j, falkordb or psycopg2 in dist/server: the gate must
+        # install nodes/test/requirements.txt (depends(), as nodes:test does) before the check.
+        res = self.run_gates('0')
+        self.assertRegex(res.stdout, r'db-versions\s+exit=0', 'the version check failed on a fresh build')
+        calls = self.engine_calls()
+        installs = r'depends\(sys\.argv\[1\]\) \S*/nodes/test/requirements\.txt$'
+        install = [i for i, c in enumerate(calls) if re.search(installs, c)]
+        check = [i for i, c in enumerate(calls) if c.endswith('check_db_versions.py')]
+        self.assertTrue(install, f'nodes/test/requirements.txt was never installed into the engine: {calls}')
+        self.assertTrue(check, f'the version check never ran: {calls}')
+        self.assertLess(install[0], check[0], f'the drivers were installed after the check: {calls}')
 
     def node_suite_poolers(self) -> dict:
         calls = self.calls.read_text().splitlines() if self.calls.exists() else []
