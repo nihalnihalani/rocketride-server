@@ -57,8 +57,9 @@ can see that runs under one of the teams your current organization lists for
 you. Your own pipelines still running in an organization you switched away
 from are not listed (the server still lets you reach them from other clients);
 your own runs under another team of the same organization are. A task whose
-team the server does not report, or a sign-in that lists no teams, is not
-filtered. A card shows the pipeline, the node and a state: **Checking** while
+team the server does not report, or a sign-in whose organization data carries
+no team list at all, is not filtered; an organization that lists none of your
+teams shows only tasks that name no team. A card shows the pipeline, the node and a state: **Checking** while
 the node is being asked who it is, **Running** once it answered, **Stopped**,
 **Unreachable**, **No access** (you can see a team deployment but your role
 cannot call it), or **Needs upgrade**. Your own development run and a team's
@@ -120,7 +121,9 @@ result tabs.
   and procedures, an administration command such as `GRANT` or
   `STOP DATABASE`, or a statement that starts with anything but
   `MATCH`, `OPTIONAL MATCH`, `WITH`, `UNWIND`, `RETURN`, `CALL` or such a `SHOW`
-  (so `USE`, `EXPLAIN` and `PROFILE` as well). **This is a text check, not a
+  (so `USE`, `EXPLAIN`, `PROFILE` and a `CYPHER` prefix as well). Text whose
+  string, comment or quoted name never closes, and a `CALL` with no procedure
+  name, are refused too. **This is a text check, not a
   database safeguard.** The node refuses writes on its read path as well; what
   keeps a read read-only depends on the node, see [Safety](#safety).
 - **Where the text check's words come from.** Three of its lists are the Neo4j
@@ -130,11 +133,14 @@ result tabs.
   app counts an administration word only as the first word of a statement, and
   a few pairs such as `TERMINATE TRANSACTIONS` anywhere, while the Neo4j node
   refuses `USE`, `GRANT`, `DENY`, `REVOKE`, a `SHOW` off its list and more
-  administration pairs anywhere in a statement. The app also refuses two forms
-  the node lets through: a write word used as a variable right before a label,
-  as in `(set:Person)`, and a procedure name quoted as one part, as in
-  ``CALL `db.labels`()``. The FalkorDB and Apache AGE read paths do not use
-  these lists.
+  administration pairs anywhere in a statement. The app also refuses forms the
+  node lets through, among them a write word used as a variable right before a
+  label, as in `(set:Person)`, a procedure name quoted as one part, as in
+  ``CALL `db.labels`()``, a statement that does not start with a read clause
+  (`EXPLAIN`, `PROFILE`, a `CYPHER` prefix, `LET`, `FINISH`), and one that starts
+  with an administration word the node refuses only in a pair (`DISABLE`,
+  `ALLOCATE`, `DRYRUN`). The FalkorDB and Apache AGE read paths do not use these
+  lists.
 
 ### Results
 

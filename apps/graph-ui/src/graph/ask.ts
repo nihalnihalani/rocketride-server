@@ -42,7 +42,9 @@
 // nothing) and the SDK's "Server is not connected" mean something else. Every
 // other failure is described the way the browse editor describes one
 // (failures.ts), so an engine without get_query gets the upgrade wording, with
-// one difference: a timeout gets no hint. The browse editor's note is about a
+// two differences: Ask always describes a failure as on a read-only connection
+// (so a write refusal gets the read-only hint, not the write console's; see
+// below), and a timeout gets no hint. The browse editor's timeout note is about a
 // database query still running, while Ask's wait is mostly the node's language
 // model, and the session's own timeout text already says the node may still be
 // working on it and that nothing here can cancel it.
