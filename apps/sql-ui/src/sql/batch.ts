@@ -39,7 +39,7 @@
 import type { SqlDialect } from '../connect';
 import type { StatementKind } from './classify';
 import { CTE_WRITE_WORDS, selectsInto } from './classify';
-import { codeOnly, keywordSites, stripSqlComments } from './split';
+import { codeOnly, codeWithOperands, keywordSites, stripSqlComments } from './split';
 import {
 	formatBatchOutcome,
 	formatElapsed,
@@ -243,15 +243,16 @@ function mayLimitByGroup(dialect: SqlDialect): boolean {
  * ClickHouse's trailing `SETTINGS name = value, ...` and `FORMAT Name`
  * clauses, matched on masked text sliced at a depth-0 `settings`/`format`
  * site. ClickHouse orders them after every LIMIT (`... LIMIT n SETTINGS ...
- * FORMAT ...`) and rejects a LIMIT that follows either. `FORMAT` must also be
- * the statement's last clause, so a column or alias named `format` or
- * `settings` (`SELECT format FROM t`, `WHERE settings = 1`) never matches.
+ * FORMAT ...`, or FORMAT first) and rejects a LIMIT that follows either.
+ * `FORMAT` must also be the statement's last clause apart from a trailing
+ * SETTINGS, so a column or alias named `format` or `settings` (`SELECT format
+ * FROM t`, `WHERE settings = 1`) never matches.
  * Only a `;` and comments may follow the format name: `--` and block comments
  * are masked, but ClickHouse can read `#` as a line comment, which the
  * scanner masks on MySQL alone, so an unmasked `# ...` is allowed there too.
  */
 const SETTINGS_CLAUSE_HEAD = /^settings\s+[a-z_][\w]*\s*=/i;
-const FORMAT_CLAUSE = /^format\s+[a-z_][\w]*\s*;?\s*(?:#[^\n]*\s*)*$/i;
+const FORMAT_CLAUSE = /^format\s+[a-z_][\w]*(?:\s+settings\s+[a-z_][\w]*\s*=[\s\S]*?)?\s*;?\s*(?:#[^\n]*\s*)*$/i;
 
 /**
  * Masked text before a `settings`/`format` site that still expects an
@@ -278,8 +279,11 @@ const EXPECTS_OPERAND = /(?:[,(.=<>+\-/%|&^~!]|(?:^|[^A-Za-z0-9_$\u0080-\uffff])
 function trailingClickHouseClauseAt(sql: string, dialect: SqlDialect): number {
 	if (!mayLimitByGroup(dialect)) return -1;
 	const masked = codeOnly(sql, dialect);
+	// A literal or a quoted name right before the site is a complete operand,
+	// which the plain mask would blank away (`kind = 'click' SETTINGS ...`).
+	const operands = codeWithOperands(sql, dialect);
 	for (const site of keywordSites(sql, ['settings', 'format'], dialect)) {
-		if (site.depth !== 0 || EXPECTS_OPERAND.test(masked.slice(0, site.index))) continue;
+		if (site.depth !== 0 || EXPECTS_OPERAND.test(operands.slice(0, site.index))) continue;
 		const rest = masked.slice(site.index);
 		if (site.keyword === 'settings' ? SETTINGS_CLAUSE_HEAD.test(rest) : FORMAT_CLAUSE.test(rest)) return site.index;
 	}

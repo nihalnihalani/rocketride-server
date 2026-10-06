@@ -204,7 +204,8 @@ after the `BY` list is the statement's own limit, as anywhere else.
 
 ClickHouse puts its `SETTINGS` and `FORMAT` clauses after every `LIMIT` and
 rejects a `LIMIT` that follows either, so on ClickHouse, and on a connection
-whose dialect could not be probed, a statement that ends in one or both gets
+whose dialect could not be probed, a statement that ends in one or both (in
+either order) gets
 the header's `LIMIT` inserted in front of the first of them, after any `LIMIT
 n BY`. A column, sort key or table named `format` or `settings` (`ORDER BY
 format DESC`, `FROM format f`) is not taken for either clause. As with a
