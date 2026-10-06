@@ -117,10 +117,11 @@ function ciBareCommands(): Set<string> {
 }
 
 /** What the real builder expands a command line to, from its dry run (`--list-deps` prints each action it would run and runs none). */
-function builderExpands(commands: string[]): string[] {
+function builderDryRun(commands: string[]): { actions: string[]; status: number | null; output: string } {
 	const run = spawnSync(execPath, [path.join(REPO, 'scripts', 'build.js'), ...commands, '--list-deps'], { cwd: REPO, encoding: 'utf8' });
-	const lines = run.stdout.split(/\r?\n/);
-	return lines.filter((_, i) => lines[i + 1] === '\u2500'.repeat(40)).map((line) => line.trim());
+	const lines = (run.stdout ?? '').split(/\r?\n/);
+	const actions = lines.filter((_, i) => lines[i + 1] === '\u2500'.repeat(40)).map((line) => line.trim());
+	return { actions, status: run.status, output: `${run.stdout ?? ''}${run.stderr ?? ''}` };
 }
 
 // W3-CI03b: the builder expands a bare command to every module's public '<module>:<command>' action
@@ -132,10 +133,13 @@ test('no bare builder command reaches the opt-in action: not `builder e2e`, and 
 	assert.equal(optIn.length, 1, 'one graph-ui action says it is opt-in');
 	const ci = ciBareCommands();
 	assert.ok(ci.has('build') && ci.has('test'), `the CI builder steps were read (found: ${[...ci].join(', ')})`);
-	const expanded = builderExpands(['e2e', ...ci]);
-	assert.ok(expanded.includes('graph-ui:test') && expanded.includes('graph-ui:build'), `the builder expanded the bare commands (got: ${expanded.join(', ')})`);
-	assert.ok(!expanded.includes(optIn[0].name), `a bare ${['e2e', ...ci].join(' / ')} reaches ${optIn[0].name}`);
-	assert.deepEqual(builderExpands(['e2e']), [], '`builder e2e` reaches no action at all');
+	const all = builderDryRun(['e2e', ...ci]);
+	assert.equal(all.status, 0, `the builder's dry run failed:\n${all.output.slice(-800)}`);
+	assert.ok(all.actions.includes('graph-ui:test') && all.actions.includes('graph-ui:build'), `the builder expanded the bare commands (got: ${all.actions.join(', ')})`);
+	assert.ok(!all.actions.includes(optIn[0].name), `a bare ${['e2e', ...ci].join(' / ')} reaches ${optIn[0].name}`);
+	const bare = builderDryRun(['e2e']);
+	assert.deepEqual(bare.actions, [], '`builder e2e` reaches no action at all');
+	assert.match(bare.output, /Usage: builder <action>/, 'the builder ran, found nothing to run and printed its usage');
 });
 
 test('every lane it runs is a committed pass/fail lane in the acceptance folder', () => {
