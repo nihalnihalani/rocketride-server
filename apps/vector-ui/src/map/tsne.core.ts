@@ -42,6 +42,7 @@
 // the n² cost and memory grow too fast for the browser.
 // =============================================================================
 
+import { TSNE_ITERATIONS, TSNE_MAX_POINTS } from './budgets';
 import { seededRandom } from './layout.core';
 import type { IKnnGraph, ILayoutJob } from './layout.core';
 
@@ -49,14 +50,8 @@ import type { IKnnGraph, ILayoutJob } from './layout.core';
 // CONSTANTS
 // =============================================================================
 
-/** The most points t-SNE accepts. */
-export const TSNE_MAX_POINTS = 1000;
-
-/** Wall-clock budget of a t-SNE run. */
-export const TSNE_BUDGET_MS = 20_000;
-
-/** Iterations of a full run. */
-export const TSNE_ITERATIONS = 750;
+/** The budgets live in budgets.ts (no imports) so the main thread can read them. */
+export { TSNE_BUDGET_MS, TSNE_ITERATIONS, TSNE_MAX_POINTS } from './budgets';
 
 /** Iterations with early exaggeration (at most a third of the run). */
 const EXAGGERATION_ITERATIONS = 250;

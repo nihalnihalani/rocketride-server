@@ -305,3 +305,31 @@ test('same origin starts directly; cross-origin is unavailable in production and
 	assert.match(shim, /importScripts\(/);
 	assert.ok(shim.indexOf('defineProperty') < shim.indexOf('importScripts'));
 });
+
+test('nothing the main thread loads reaches the layouts or d3-force, even indirectly (they live in the worker chunk)', () => {
+	const ROOT = path.resolve(__dirname, '..', 'src');
+	const seen = new Set<string>();
+	const resolve = (from: string, spec: string): string | null => {
+		if (!spec.startsWith('.')) return null;
+		const base = path.resolve(path.dirname(from), spec);
+		for (const ext of ['.ts', '.tsx', '/index.ts']) if (fs.existsSync(base + ext)) return base + ext;
+		return null;
+	};
+	const external = new Set<string>();
+	const walk = (file: string): void => {
+		if (seen.has(file)) return;
+		seen.add(file);
+		const source = fs.readFileSync(file, 'utf8');
+		for (const m of source.matchAll(/^import\s+(type\s+)?[^;]*?from\s+'([^']+)'/gm)) {
+			if (m[1]) continue;
+			const target = resolve(file, m[2] as string);
+			if (target) walk(target);
+			else external.add(m[2] as string);
+		}
+	};
+	walk(path.join(ROOT, 'views', 'MapView.tsx'));
+	const names = [...seen].map((f) => path.relative(ROOT, f));
+	for (const banned of ['map/layout.core.ts', 'map/tsne.core.ts', 'map/layout.server.ts', 'map/layout.worker.ts']) assert.ok(!names.includes(banned), `${banned} is reachable from MapView`);
+	assert.ok(!external.has('d3-force'), 'd3-force is reachable from MapView');
+	assert.ok(names.includes('map/workerClient.ts') && names.includes('map/spawnWorker.ts'), 'the walk reached the client');
+});

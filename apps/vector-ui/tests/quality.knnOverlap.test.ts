@@ -99,10 +99,13 @@ test('GATE on sample_demo_1000.json: overlap(neighbour-graph layout) >= overlap(
 	assert.ok(force >= 0.35, `force ${force.toFixed(3)} < 0.35`);
 });
 
-test('light mode (5,000 points, k = 10): the neighbour-graph layout also beats PCA, within the 15 s budget', (t) => {
+test('light mode (5,000 points, k = 10): the neighbour-graph layout also beats PCA by the same margin', (t) => {
+	// Quality only: the run gets no wall-clock budget here (a loaded CI machine must not make it flaky);
+	// the elapsed time is reported, and the browser lane measures the real budgeted run.
 	const sample = loadSample('sample_light_5000.json');
 	const pca = knnOverlap(pcaXY(sample), sample.knn, 10);
-	const run = runJob(createForceJob({ n: sample.n, init: pcaXY(sample), knn: sample.knn, seed: 11 }), 15_000);
+	const run = runJob(createForceJob({ n: sample.n, init: pcaXY(sample), knn: sample.knn, seed: 11 }), 3_600_000);
+	assert.equal(run.ticks, 300);
 	const force = knnOverlap(run.positions, sample.knn, 10);
 	t.diagnostic(`light knn-overlap pca=${pca.toFixed(3)} force=${force.toFixed(3)} ticks=${run.ticks} ms=${Math.round(run.elapsedMs)}`);
 	assert.ok(force >= pca + 0.1, `force ${force.toFixed(3)} vs PCA ${pca.toFixed(3)}`);

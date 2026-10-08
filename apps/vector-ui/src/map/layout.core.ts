@@ -45,16 +45,14 @@
 
 import { forceLink, forceManyBody, forceSimulation, forceX, forceY } from 'd3-force';
 import type { SimulationLinkDatum, SimulationNodeDatum } from 'd3-force';
+import { FORCE_TICKS } from './budgets';
 
 // =============================================================================
 // CONSTANTS
 // =============================================================================
 
-/** Ticks of the static layout (d3's own default). */
-export const FORCE_TICKS = 300;
-
-/** Wall-clock budget of the neighbour-graph layout, after which it stops with what it has. */
-export const FORCE_BUDGET_MS = 15_000;
+/** The budgets live in budgets.ts (no imports) so the main thread can read them. */
+export { FORCE_BUDGET_MS, FORCE_TICKS } from './budgets';
 
 /** Length scale of the layout: the start is scaled to a radius of LAYOUT_UNIT * sqrt(n). */
 export const LAYOUT_UNIT = 10;

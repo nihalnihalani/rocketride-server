@@ -32,8 +32,7 @@
 // =============================================================================
 
 import type { ISampleResult } from '../contract/types';
-import { FORCE_BUDGET_MS } from './layout.core';
-import { TSNE_BUDGET_MS } from './tsne.core';
+import { FORCE_BUDGET_MS, TSNE_BUDGET_MS } from './budgets';
 
 /** The refined layouts the worker computes (PCA needs no worker: it is the node's own answer). */
 export type LayoutAlgorithm = 'force' | 'tsne';
