@@ -20,6 +20,7 @@ import uuid
 import numpy as np
 import pytest
 
+from ai.common.schema import QuestionText
 from ai.common.store import DocumentStoreBase
 from ai.common.store.errors import StoreUnsupported, ToolRefusal
 from ai.common.store.vx_types import ChunkPage, DocPage, StoreInfo
@@ -133,7 +134,11 @@ def test_describe_an_existing_collection_without_reading_every_id():
     assert info.meta_column is None
     assert info.metric == 'cosine'
     assert info.dimension == 6 and info.model == 'unit-model'
-    assert info.index['type'] == 'hnsw' and info.index['params']['space'] == 'cosine'
+    # The explorer's names: m and ef_construction (Chroma calls m 'max_neighbors').
+    assert info.index == {
+        'type': 'hnsw',
+        'params': {'space': 'cosine', 'm': 16, 'ef_construction': 100, 'ef_search': 100},
+    }
     assert 'score_scale_inverted_fixed' in info.caveats
     assert '127.0.0.1' not in repr(info) and '8000' not in repr(info)
     assert [c for c in Collection.calls if c['include'] == []] == []
@@ -168,6 +173,29 @@ def test_score_info():
     assert info['range'] == [0, 1] and info['higher_is_better'] is True
     assert info['floor'] == pytest.approx(0.2) and info['threshold'] == pytest.approx(0.3)
     assert make_store(drv, similarity='l2').scoreInfo()['formula'] == '1 / (1 + euclidean_distance)'
+    ip = make_store(drv, similarity='ip').scoreInfo()
+    assert ip['formula'] == '(2 - ip_distance) / 2'
+    assert 'range' in ip and ip['range'] is None  # unbounded unless the vectors are unit length
+
+
+def test_empty_id_lists_answer_nothing_without_asking_the_server():
+    # Chroma refuses `$in: []`; an empty list selects no row, as it does on Qdrant.
+    store = make_store(drv)
+    _corpus(store, docs=2, chunks=2)
+    for object_ids in (['schema'], []):
+        page = store.listDocuments(cursor=None, limit=5, object_ids=object_ids, deleted='all', sort='path')
+        assert page.items == [] and page.next_cursor is None and page.total == 0
+    query = QuestionText(text='doc')
+    query.embedding = [1.0, 0, 0, 0, 0, 0]
+    query.embedding_model = 'unit-model'
+    for field in ('objectIds', 'tableIds', 'permissions', 'chunkIds'):
+        flt = vx_filter(**{field: []})
+        assert store.countChunks(flt) == 0, field
+        assert store.get(flt) == [], field
+        assert store.searchSemantic(query, flt) == [], field
+        assert store.searchKeyword(query, flt) == [], field
+        assert store.sampleChunks(n=5, seed=1, strategy='first', docFilter=flt, include_keys=[]) == ([], 'first')
+    assert store.countChunks(vx_filter(objectIds=['doc-0'])) == 2
 
 
 # --- counts ---------------------------------------------------------------------------

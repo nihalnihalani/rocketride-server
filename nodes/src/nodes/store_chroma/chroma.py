@@ -266,7 +266,7 @@ class Store(DocumentStoreBase):
             self.client = None
             floor = f'{_MIN_CHROMA_VERSION[0]}.{_MIN_CHROMA_VERSION[1]}'
             raise Exception(
-                f'Failed to connect to Chroma at {self.host}:{self.port}. This may be due to '
+                'Failed to connect to Chroma. This may be due to '
                 f'network/connectivity issues, invalid host/port/credentials, or an '
                 f'incompatible/too-old Chroma server (RocketRide requires Chroma server '
                 f'>= {floor}). Original error: {e}'
@@ -488,6 +488,17 @@ class Store(DocumentStoreBase):
             return None
         return {'isDeleted': {'$ne': True}}
 
+    @staticmethod
+    def _selectsNothing(docFilter: DocFilter) -> bool:
+        """
+        Whether a list filter of ``docFilter`` is empty, so it matches no row.
+
+        Chroma refuses ``$in: []``; the callers answer an empty result instead
+        of asking the server (as Qdrant does for the same filter).
+        """
+        lists = (docFilter.objectIds, docFilter.tableIds, docFilter.permissions, docFilter.chunkIds)
+        return any(value is not None and len(value) == 0 for value in lists)
+
     def _convertFilter(self, docFilter: DocFilter) -> Dict[str, Any]:
         filters = []
         if docFilter.nodeId is not None:
@@ -614,6 +625,10 @@ class Store(DocumentStoreBase):
         # Declare the results list
         docs: List[Doc] = []
 
+        # An empty id list matches nothing (and Chroma refuses it)
+        if self._selectsNothing(docFilter):
+            return []
+
         # Build up the filter
         filters = self._convertFilter(docFilter)
 
@@ -658,6 +673,10 @@ class Store(DocumentStoreBase):
         if docFilter.offset:
             raise ValueError('Non-zero offset is not supported in semantic searching')
 
+        # An empty id list matches nothing (and Chroma refuses it)
+        if self._selectsNothing(docFilter):
+            return []
+
         # Perform the search
         results = self.collectionObj.query(
             query_embeddings=[query.embedding], n_results=self._effectiveLimit(docFilter), where=filters
@@ -676,6 +695,10 @@ class Store(DocumentStoreBase):
         # If the collection does not exists, by definition there are
         # no documents matching the get
         if checkCollection and not self.doesCollectionExist():
+            return []
+
+        # An empty id list matches nothing (and Chroma refuses it)
+        if self._selectsNothing(docFilter):
             return []
 
         # Convert filter to ChromaDB format
@@ -1033,18 +1056,17 @@ class Store(DocumentStoreBase):
         if space == 'l2':
             formula, value_range = '1 / (1 + euclidean_distance)', [0, 1]
         elif space == 'ip':
+            # [0, 1] only for unit-length vectors; an inner product is otherwise unbounded.
             formula, value_range = '(2 - ip_distance) / 2', None
         else:
             formula, value_range = '(2 - cosine_distance) / 2', [0, 1]
-        info = {
+        return {
             'formula': formula,
+            'range': value_range,
             'higher_is_better': True,
             'floor': MIN_RELEVANCE_SCORE,
             'threshold': self.threshold_search,
         }
-        if value_range is not None:
-            info['range'] = value_range
-        return info
 
     def describe(self):
         """Backend, collection, metric, dimension, model, index; never a host, port or key."""
@@ -1075,9 +1097,14 @@ class Store(DocumentStoreBase):
         config = getattr(self.collectionObj, 'configuration_json', None)
         hnsw = (config or {}).get('hnsw') if isinstance(config, dict) else None
         if isinstance(hnsw, dict):
-            for key in ('ef_construction', 'ef_search', 'max_neighbors'):
+            # The explorer's names (m, ef_construction); Chroma calls m 'max_neighbors'.
+            for key, name in (
+                ('max_neighbors', 'm'),
+                ('ef_construction', 'ef_construction'),
+                ('ef_search', 'ef_search'),
+            ):
                 if hnsw.get(key) is not None:
-                    params[key] = hnsw[key]
+                    params[name] = hnsw[key]
         return vx.StoreInfo(
             backend='chroma',
             backend_version=version,
@@ -1100,7 +1127,7 @@ class Store(DocumentStoreBase):
         Chroma has no filtered count: this reads the matching ids (no payload),
         ``READ_PAGE`` at a time. The tools cache it (counts_cached_s).
         """
-        if not self._exists():
+        if not self._exists() or self._selectsNothing(docFilter):
             return 0
         where = _where(self._convertFilter(docFilter), {'objectId': {'$ne': CONTROL_OBJECT_ID}})
         return sum(1 for _ in self._readAll(where, []))
@@ -1197,6 +1224,11 @@ class Store(DocumentStoreBase):
             )
 
         ids = None if object_ids is None else [str(o) for o in object_ids if str(o) != CONTROL_OBJECT_ID]
+        if ids == []:
+            # No document asked for (or only the control record): Chroma refuses `$in: []`.
+            return vx.DocPage(
+                items=[], next_cursor=None, total=0, counts_exact=True, distinct=True, sorted=False, caveats=caveats
+            )
         items = []
         if state['ph'] == 'c':
             offset = state['o']
@@ -1320,7 +1352,7 @@ class Store(DocumentStoreBase):
         if strategy not in ('random', 'first'):
             raise ValueError(f'unknown sampling strategy {strategy!r}')
         n = max(0, int(n))
-        if not n or not self._exists():
+        if not n or self._selectsNothing(docFilter) or not self._exists():
             return [], 'first'
         where = _where(self._convertFilter(docFilter), {'objectId': {'$ne': CONTROL_OBJECT_ID}})
         offset = 0

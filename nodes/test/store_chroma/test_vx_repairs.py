@@ -189,3 +189,15 @@ def test_count_documents_uses_the_collection_count():
     # The only read is the control record (it also loads the model name); no read of every id.
     assert [c for c in Collection.calls if c['include'] == []] == []
     assert all(c['where'] == {'objectId': {'$in': ['schema']}} for c in Collection.calls)
+
+
+def test_a_failed_connect_names_no_host_or_port(monkeypatch):
+    def refuse(*_args, **_kwargs):
+        raise ConnectionError('connection refused')
+
+    monkeypatch.setattr(drv.chromadb, 'HttpClient', refuse)
+    with pytest.raises(Exception) as err:
+        make_store(drv)
+    message = str(err.value)
+    assert 'Failed to connect to Chroma' in message and 'connection refused' in message
+    assert '127.0.0.1' not in message and '8000' not in message
