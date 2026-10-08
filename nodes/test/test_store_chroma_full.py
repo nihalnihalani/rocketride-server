@@ -9,7 +9,9 @@ Runs the shared driver contract (``vector_store_contract.py``) on a new
 collection, on a collection written the way the previous driver wrote it
 (random ids), and read-only on the seeded ``vx_legacy_docs``; then the driver
 repairs: scores that rise with similarity, the floor, soft delete, paths and
-render, and that the store's quick figures never read every id.
+render, empty id lists, and that the store's quick figures never read every
+id. A 1,503-document collection checks the orphan sweep and the counts at
+scale.
 
 Needs a disposable local Chroma, e.g. the ``vx-chroma`` container that
 ``scripts/acceptance/vector-explorer/containers/start.sh`` starts
@@ -186,6 +188,13 @@ def legacy_shape_store():
 
 
 @pytest.fixture(scope='module')
+def scale_store():
+    store = _store(_new_collection('scale'))
+    store.addChunks(contract.scale_docs())
+    return store
+
+
+@pytest.fixture(scope='module')
 def seeded_legacy_store():
     name = contract.SEEDED_LEGACY_COLLECTION
     names = [c if isinstance(c, str) else c.name for c in RAW.list_collections()]
@@ -223,6 +232,7 @@ def test_describe_without_reading_every_id(collection):
     assert info.metric == 'cosine'
     assert info.dimension == expect.dimension and info.model == expect.model
     assert info.index['type'] == 'hnsw' and info.index['params']['space'] == 'cosine'
+    assert info.index['params']['m'] > 0 and info.index['params']['ef_construction'] > 0
     assert 'score_scale_inverted_fixed' in info.caveats
     if spy is not None:
         assert spy.includes, 'the spy saw no read (the control record is read through get)'
@@ -360,6 +370,29 @@ def test_soft_delete_keeps_the_metadata(new_store):
     assert len(got['ids']) == contract.DOCS[contract.SOFT_DELETED]
     for meta in got['metadatas']:
         assert meta['isDeleted'] is True and meta['parent'] == contract.path_of(contract.SOFT_DELETED)
+
+
+def test_empty_id_lists_select_nothing(new_store):
+    # The server refuses `$in: []`; the driver answers an empty result instead.
+    store, _ = new_store
+    for object_ids in (['schema'], []):
+        page = store.listDocuments(cursor=None, limit=5, object_ids=object_ids, deleted='all', sort='path')
+        assert page.items == [] and page.total == 0 and page.next_cursor is None
+    assert store.countChunks(_vx_filter(objectIds=[])) == 0
+    assert store.countChunks(_vx_filter(chunkIds=[])) == 0
+    assert store.get(_vx_filter(objectIds=[], limit=10)) == []
+
+
+# --- past the caps (1,503 documents) --------------------------------------------------------
+
+
+def test_scale_listing_finds_every_low_count_orphan(scale_store):
+    contract.check_scale_listing(scale_store)
+
+
+def test_scale_counts(scale_store):
+    assert scale_store.countChunks(_vx_filter(chunkIds=[0])) == contract.SCALE_DOCS
+    assert scale_store.countChunks(_vx_filter()) == 2 * contract.SCALE_DOCS + len(contract.SCALE_ORPHANS)
 
 
 @pytest.mark.parametrize('shape', ['new', 'legacy'])

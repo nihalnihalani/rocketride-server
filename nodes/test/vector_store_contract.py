@@ -19,6 +19,10 @@ section 2) against three collections per backend:
 Every expectation is computed independently of the driver: from the corpus
 below for the collections the suite writes, and from a raw client scan for
 the seeded one. This module is not a test module (no ``test_`` prefix).
+
+A second, larger corpus (``scale_docs``: 1,500 documents and three documents
+without chunk 0, each with the fewest rows) checks the behaviour that only
+shows past the drivers' internal caps.
 """
 
 from __future__ import annotations
@@ -47,6 +51,12 @@ ORPHAN = 'doc-05'  # chunk 0 is deleted after ingest: a document without its fir
 SOFT_DELETED = 'doc-07'  # marked deleted after ingest
 TABLE_CHUNK = ('doc-02', 1)
 INGESTED_AT = '2026-10-08T18:20:11Z'
+
+# The scale corpus: SCALE_DOCS documents of two chunks, plus documents whose
+# only row is chunk 1 (no first chunk, and the lowest row count of all).
+SCALE_DOCS = 1500
+SCALE_DIM = 64
+SCALE_ORPHANS = ('scale-orphan-a', 'scale-orphan-b', 'scale-orphan-c')
 
 # The collection the acceptance scripts seed with the previous drivers.
 SEEDED_LEGACY_COLLECTION = os.environ.get('RR_TEST_VX_LEGACY_COLLECTION', 'vx_legacy_docs')
@@ -101,6 +111,50 @@ def corpus_docs() -> List[Any]:
         doc.embedding_model = MODEL
         docs.append(doc)
     return docs
+
+
+def scale_object_id(index: int) -> str:
+    return f'scale-{index:05d}'
+
+
+def scale_docs() -> List[Any]:
+    """The scale corpus as the embedding node hands it to a store (unit vectors in eight clusters)."""
+    from ai.common.schema import Doc, DocMetadata
+
+    rng = np.random.default_rng(23)
+    centres = rng.normal(size=(8, SCALE_DIM))
+    rows = [(scale_object_id(d), c) for d in range(SCALE_DOCS) for c in range(2)]
+    rows += [(oid, 1) for oid in SCALE_ORPHANS]
+    docs = []
+    for i, (oid, chunk) in enumerate(rows):
+        v = centres[i % 8] + 0.5 * rng.normal(size=SCALE_DIM)
+        metadata = DocMetadata(
+            objectId=oid,
+            chunkId=chunk,
+            nodeId='chunk_1',
+            parent=f'/srv/vx-scale/{oid}.txt',
+            permissionId=0,
+            isDeleted=False,
+            isTable=False,
+            tableId=0,
+        )
+        doc = Doc(page_content=f'{oid} chunk {chunk}', metadata=metadata)
+        doc.embedding = (v / np.linalg.norm(v)).tolist()
+        doc.embedding_model = MODEL
+        docs.append(doc)
+    return docs
+
+
+def check_scale_listing(store, *, limit: int = 500) -> None:
+    """Every scale document listed once, the low-count documents without chunk 0 included."""
+    items, pages = list_all(store, limit=limit)
+    ids = [i.objectId for i in items]
+    assert len(ids) == len(set(ids)), 'a document was listed twice'
+    assert len(ids) == SCALE_DOCS + len(SCALE_ORPHANS)
+    assert {i.objectId for i in items if not i.has_first_chunk} == set(SCALE_ORPHANS)
+    assert all(i.chunks == 1 for i in items if not i.has_first_chunk)
+    assert {p.total for p in pages if p.total is not None} == {SCALE_DOCS + len(SCALE_ORPHANS)}
+    assert all('document_count_capped' not in p.caveats for p in pages)
 
 
 def control_doc(vector_size: int = DIM) -> Any:
