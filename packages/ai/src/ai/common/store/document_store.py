@@ -1,3 +1,4 @@
+import functools
 import importlib
 import threading
 from abc import abstractmethod, ABC
@@ -50,6 +51,31 @@ _BACKEND_BY_PROVIDER: Dict[str, str] = {
     'mongodb+srv': 'atlas',
     'atlas': 'atlas',
 }
+
+#: Metadata keys ``DocMetadata(pInstance)`` adds for the explorer (contract section 2.3). A driver
+#: that cannot store them (:meth:`DocumentStoreBase.vxStoresExtras`) never sees them in ``addChunks``.
+VX_METADATA_EXTRAS: Tuple[str, ...] = ('size', 'modifyTime', 'ingestedAt')
+
+#: Driver modules that write one table column per metadata key (``model_dump().keys()`` as the
+#: INSERT column list) and therefore fail on an unknown key until they keep extras elsewhere.
+_COLUMN_PER_KEY_MODULES = frozenset({'store_postgres', 'rocketride_vector'})
+
+
+def _without_extras(doc: Doc) -> Doc:
+    """Return ``doc`` without :data:`VX_METADATA_EXTRAS` in its metadata (a copy; ``doc`` is not changed)."""
+    metadata = getattr(doc, 'metadata', None)
+    extra = getattr(metadata, 'model_extra', None)
+    if not extra or not any(name in extra for name in VX_METADATA_EXTRAS):
+        return doc
+    trimmed = metadata.model_copy()
+    object.__setattr__(
+        trimmed,
+        '__pydantic_extra__',
+        {name: value for name, value in extra.items() if name not in VX_METADATA_EXTRAS},
+    )
+    copy = doc.model_copy()
+    copy.metadata = trimmed
+    return copy
 
 
 def _int_or_none(value: Any) -> Optional[int]:
@@ -219,6 +245,53 @@ class DocumentStoreBase(ABC):
     #: ``dialect.support``: 'supported' once the driver's unmocked suites pass on a new and a legacy
     #: collection, else 'experimental'. A driver lane sets it; mocked evidence never does.
     VX_SUPPORT: str = 'experimental'
+
+    #: Whether ``addChunks`` may receive the explorer's metadata extras (:data:`VX_METADATA_EXTRAS`).
+    #: None: derived by :meth:`vxStoresExtras` (False for pgvector, True for payload stores). A driver
+    #: that keeps extras (pgvector in its ``meta`` column) sets True; one that cannot sets False.
+    VX_STORES_EXTRAS: Optional[bool] = None
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        """Route every driver's own ``addChunks`` through :meth:`vxWritableChunks`.
+
+        Covers every path to the driver (``writeDocuments``, nodes that call
+        ``store.addChunks`` directly, ``createCollection``), so a driver that cannot store
+        the explorer's metadata extras keeps ingesting exactly what it wrote before.
+        """
+        super().__init_subclass__(**kwargs)
+        add = cls.__dict__.get('addChunks')
+        if add is None or getattr(add, '__isabstractmethod__', False) or getattr(add, '__vx_extras_guard__', False):
+            return
+
+        @functools.wraps(add)
+        def addChunks(self, chunks, *args, **kw):
+            return add(self, self.vxWritableChunks(chunks), *args, **kw)
+
+        addChunks.__vx_extras_guard__ = True
+        cls.addChunks = addChunks
+
+    def vxStoresExtras(self) -> bool:
+        """Return whether this driver stores the explorer's metadata extras.
+
+        :attr:`VX_STORES_EXTRAS` when the driver sets it; otherwise False for the pgvector
+        backend and the drivers that write one column per metadata key, True for the rest
+        (Qdrant, Chroma, Milvus, Weaviate and Pinecone keep them in the payload).
+        """
+        declared = type(self).VX_STORES_EXTRAS
+        if isinstance(declared, bool):
+            return declared
+        if self.vxBackend() == 'pgvector':
+            return False
+        return not _COLUMN_PER_KEY_MODULES.intersection(type(self).__module__.split('.'))
+
+    def vxWritableChunks(self, chunks: List[Doc]) -> List[Doc]:
+        """Return ``chunks`` as this driver can store them: without the metadata extras when it cannot.
+
+        The caller's documents are never changed; a trimmed document is a copy.
+        """
+        if not chunks or not isinstance(chunks, (list, tuple)) or self.vxStoresExtras():
+            return chunks
+        return [_without_extras(doc) for doc in chunks]
 
     def capabilities(self) -> FrozenSet[str]:
         """

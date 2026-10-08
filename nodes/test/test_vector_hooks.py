@@ -723,3 +723,135 @@ def test_create_collection_on_an_empty_driver_writes_the_control_record():
 
 def test_store_base_keeps_the_provider():
     assert MemoryStore(provider='qdrant').provider == 'qdrant'
+
+
+# ---------------------------------------------------------------------------
+# metadata extras reach only the drivers that store them
+# ---------------------------------------------------------------------------
+
+#: The columns of a legacy pgvector table: the original DDL plus ``signature``.
+LEGACY_COLUMNS = (
+    'content',
+    'objectId',
+    'chunkId',
+    'nodeId',
+    'parent',
+    'permissionId',
+    'isDeleted',
+    'isTable',
+    'tableId',
+    'signature',
+    'embedding',
+    'vectorSize',
+    'modelName',
+)
+
+EXTRAS = {'size': 7419, 'modifyTime': 1727000000, 'ingestedAt': '2026-10-08T18:20:11Z'}
+
+
+class ColumnStore(MemoryStore):
+    """Writes one table column per metadata key, like the pgvector drivers that predate the ``meta`` column."""
+
+    COLUMNS = LEGACY_COLUMNS
+
+    def __init__(self, provider: str = 'postgres', **kw: Any) -> None:
+        super().__init__(provider, **kw)
+        self.inserts: List[List[str]] = []
+
+    def addChunks(self, chunks: List[Doc], checkCollection: bool = True) -> None:
+        for chunk in chunks:
+            data = {'content': chunk.page_content, **chunk.metadata.model_dump(), 'embedding': chunk.embedding}
+            data.setdefault('vectorSize', len(chunk.embedding or []))
+            data.setdefault('modelName', '')
+            unknown = [column for column in data if column not in self.COLUMNS]
+            if unknown:
+                raise Exception(f'column "{unknown[0].lower()}" of relation "vx_test_docs" does not exist')
+            self.inserts.append(list(data))
+        super().addChunks(chunks, checkCollection)
+
+
+def _ingested(store: MemoryStore) -> List[Doc]:
+    docs = [make_doc('a', 0, **EXTRAS), make_doc('a', 1, **EXTRAS), make_doc('b', 0, **EXTRAS)]
+    store.addChunks(docs)
+    return docs
+
+
+def test_a_column_per_key_driver_ingests_metadata_with_extras():
+    store = ColumnStore()
+    _ingested(store)
+    assert {key for key in store.rows if key[0] != 'schema'} == {('a', 0), ('a', 1), ('b', 0)}
+    written = {column for columns in store.inserts for column in columns}
+    assert written <= set(LEGACY_COLUMNS) and not written & set(EXTRAS)
+
+
+@pytest.mark.parametrize('provider', ['postgres', 'rocketride_vector'])
+def test_pgvector_providers_do_not_receive_the_extras(provider):
+    store = ColumnStore(provider)
+    _ingested(store)
+    assert all(not (doc.metadata.model_extra or {}).keys() & EXTRAS.keys() for doc in store.rows.values())
+
+
+@pytest.mark.parametrize('provider', ['qdrant', 'chroma', 'milvus', 'weaviate', 'pinecone', 'memory'])
+def test_payload_drivers_receive_the_extras(provider):
+    store = MemoryStore(provider)
+    _ingested(store)
+    for key in (('a', 0), ('a', 1), ('b', 0)):
+        assert {name: store.rows[key].metadata.model_extra.get(name) for name in EXTRAS} == EXTRAS
+
+
+def test_a_driver_that_stores_extras_receives_them():
+    class MetaColumnStore(ColumnStore):
+        VX_STORES_EXTRAS = True
+        COLUMNS = LEGACY_COLUMNS + tuple(EXTRAS)
+
+    store = MetaColumnStore()
+    _ingested(store)
+    assert set(EXTRAS) <= {column for columns in store.inserts for column in columns}
+
+
+def test_a_driver_may_refuse_extras_on_any_backend():
+    class NoExtrasStore(MemoryStore):
+        VX_STORES_EXTRAS = False
+
+    store = NoExtrasStore('qdrant')
+    _ingested(store)
+    assert not (store.rows[('a', 0)].metadata.model_extra or {}).keys() & EXTRAS.keys()
+
+
+def test_leaving_out_the_extras_does_not_change_the_callers_documents():
+    store = ColumnStore()
+    docs = _ingested(store)
+    for doc in docs:
+        assert {name: doc.metadata.model_extra.get(name) for name in EXTRAS} == EXTRAS
+
+
+def test_other_metadata_extras_still_reach_the_driver():
+    store = MemoryStore('postgres')
+    store.addChunks([make_doc('a', 0, ingestedAt='2026-10-08T18:20:11Z', entities='person')])
+    extra = store.rows[('a', 0)].metadata.model_extra
+    assert extra.get('entities') == 'person' and 'ingestedAt' not in extra
+
+
+def test_the_extras_guard_covers_a_driver_built_without_its_constructor():
+    class LegacyModuleStore(ColumnStore):
+        __module__ = 'store_postgres.postgres'
+
+    store = object.__new__(LegacyModuleStore)
+    MemoryStore.__init__(store, 'memory')
+    del store.provider
+    store.inserts = []
+    _ingested(store)
+    written = {column for columns in store.inserts for column in columns}
+    assert not written & set(EXTRAS)
+
+
+def test_vx_stores_extras_follows_the_backend_unless_the_driver_says():
+    assert MemoryStore('postgres').vxStoresExtras() is False
+    assert MemoryStore('rocketride_vector').vxStoresExtras() is False
+    assert MemoryStore('qdrant').vxStoresExtras() is True
+    assert MemoryStore('memory').vxStoresExtras() is True
+
+    class Declared(MemoryStore):
+        VX_STORES_EXTRAS = True
+
+    assert Declared('postgres').vxStoresExtras() is True

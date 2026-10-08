@@ -120,6 +120,17 @@ def test_extras_survive_to_dict_and_round_trip():
     assert again.model_dump()['ingestedAt'] == meta.model_dump()['ingestedAt']
 
 
+def test_model_dump_carries_the_ingest_extras_as_extra_keys():
+    """size, modifyTime and ingestedAt are the only keys model_dump() adds beyond the declared fields.
+
+    A store driver that turns model_dump() keys into table columns would see them;
+    the store base leaves them out of addChunks for drivers that do not store them.
+    """
+    meta = DocMetadata(_instance(size=5, modifyTime=6, hasSize=True, hasModifyTime=True))
+    assert set(meta.model_dump()) - set(DocMetadata.model_fields) == {'size', 'modifyTime', 'ingestedAt'}
+    assert set(meta.model_extra) == {'size', 'modifyTime', 'ingestedAt'}
+
+
 def test_metadata_without_instance_gains_no_extras():
     meta = DocMetadata(objectId='x', chunkId=0)
     dumped = meta.model_dump()
