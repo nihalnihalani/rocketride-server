@@ -118,7 +118,8 @@ all-or-nothing transaction across the prior objects and the new batch.
 
 The Vector Explorer app supports Weaviate as **experimental**: its explorer functions are tested against an in-memory stand-in for the Weaviate client, not against a live server. What the app sees on Weaviate:
 
-- The document list pages through each document's chunk 0 by offset, in storage order (the app sorts what it has loaded), with chunk counts grouped by object id. A document whose chunk 0 is missing is not listed but is still counted in the statistics. Weaviate does not page past 10,000 results, so a longer list ends there with a note.
+- The document list pages through each document's chunk 0 by offset, in storage order (the app sorts what it has loaded), with chunk counts grouped by object id. A document whose chunk 0 is missing is not listed but is still counted in the statistics, so the list's total (documents with a chunk 0) can be lower than the statistics' document count. Weaviate does not page past 10,000 results, so a longer list ends there with a note.
+- New collections declare the file size, modification time and ingest time of each chunk (`size`, `modifyTime` and `ingestedAt`). On a collection created by an earlier release, Weaviate's auto-schema types them on the first write (the ingest time as a date, the numbers as decimals); the app still shows them as they were written.
 - Chunk and document counts honour the active, deleted and all views; the collection's control record is never counted or listed, and its embedding model and dimension are reported from it.
 - Samples for the embedding map are taken in object-id order, and the neighbour graph is computed on the node, not by Weaviate.
 - Removing a document reports the number of chunks it removed.

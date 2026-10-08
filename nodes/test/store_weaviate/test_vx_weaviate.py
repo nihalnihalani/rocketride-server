@@ -121,3 +121,55 @@ def test_listing_stops_with_a_note_at_the_query_window(adapter, store, monkeypat
     assert len({row.objectId for row in rows}) == 4
     assert pages[-1].next_cursor is None
     assert 'documents_paging_unsupported' in pages[-1].caveats
+
+
+# -----------------------------------------------------------------------------
+# Explorer extras (size, modifyTime, ingestedAt) and Weaviate's auto-schema
+# -----------------------------------------------------------------------------
+
+EXTRAS = ('size', 'modifyTime', 'ingestedAt')
+
+
+def test_new_collections_declare_the_explorer_extras(adapter, store):
+    """New collections declare size/modifyTime as INT and ingestedAt as TEXT, so auto-schema never types them."""
+    h.ingest(store, 'doc-a', '/docs/a.md', [0])
+    declared = {
+        p.name: str(p.data_type.value) for p in adapter.mock.MockCollections._configs[store.collection]['properties']
+    }
+    assert {name: declared.get(name) for name in EXTRAS} == {'size': 'int', 'modifyTime': 'int', 'ingestedAt': 'text'}
+    rows, _ = h.collect_listing(store, limit=10)
+    assert (rows[0].size, rows[0].modifyTime, rows[0].ingestedAt) == (1000, 1700000000, '2026-10-08T18:20:11Z')
+
+
+def test_auto_schemaed_extras_read_back_as_written(adapter, store):
+    """
+    A collection created before the extras were declared gets them from auto-schema on the first write:
+    ingestedAt as a date (the client returns a datetime), size and modifyTime as numbers (floats).
+    The explorer still reports the ISO-8601 string and integers.
+    """
+    adapter.seed_legacy(store)
+    schema = adapter.mock.MockCollections._schemas[store.collection]
+    for name in EXTRAS:
+        schema.pop(name, None)  # as the previous driver created the collection
+    h.ingest(store, 'doc-new', '/docs/new.md', [0, 1])
+
+    stored = next(
+        o['properties']
+        for o in adapter.storage(store).values()
+        if o['properties'].get('objectId') == 'doc-new' and o['properties'].get('chunkId') == 0
+    )
+    assert type(stored['ingestedAt']).__name__ == 'datetime'
+    assert isinstance(stored['size'], float) and isinstance(stored['modifyTime'], float)
+
+    rows, _ = h.collect_listing(store, limit=10)
+    row = next(r for r in rows if r.objectId == 'doc-new')
+    assert row.ingestedAt == '2026-10-08T18:20:11Z'
+    assert row.size == 1000 and isinstance(row.size, int)
+    assert row.modifyTime == 1700000000 and isinstance(row.modifyTime, int)
+
+    docs, _ = h.collect_chunks(store, 'doc-new', limit=10)
+    vectors = store.getVectors([('doc-new', 1)])
+    for doc in docs + vectors:
+        extras = doc.metadata.model_dump()
+        assert extras['ingestedAt'] == '2026-10-08T18:20:11Z'
+        assert isinstance(extras['size'], int) and isinstance(extras['modifyTime'], int)

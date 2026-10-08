@@ -38,6 +38,7 @@ import functools
 import json
 import uuid
 import base64
+from datetime import datetime, timezone
 
 import weaviate
 from weaviate.client import WeaviateClient
@@ -192,6 +193,37 @@ def _all(*filters: Optional[Filter]) -> Optional[Filter]:
 def _any_equal(prop: str, values: Sequence[Any]) -> Filter:
     """``prop`` equals one of ``values``."""
     return Filter.any_of([Filter.by_property(prop).equal(v) for v in values])
+
+
+#: Integer properties a collection may hold as Weaviate numbers (auto-schema types undeclared ints as 'number')
+INT_PROPERTIES = frozenset({'chunkId', 'tableId', 'permissionId', 'vectorSize', 'size', 'modifyTime'})
+
+
+def _iso_utc(value: datetime) -> str:
+    """A datetime as the ISO-8601 UTC string it was written as ('2026-10-08T18:20:11Z')."""
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc).isoformat().replace('+00:00', 'Z')
+
+
+def _plain_properties(properties: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Stored properties as the driver wrote them, nulls dropped.
+
+    A collection created before ``size``, ``modifyTime`` and ``ingestedAt`` were declared had
+    them auto-schemaed on the first write: the timestamp as a date (the client returns a datetime)
+    and the integers as numbers (floats). They come back as the ISO string and integers.
+    """
+    plain: Dict[str, Any] = {}
+    for key, value in (properties or {}).items():
+        if value is None:
+            continue
+        if isinstance(value, datetime):
+            value = _iso_utc(value)
+        elif key in INT_PROPERTIES and isinstance(value, float) and value.is_integer():
+            value = int(value)
+        plain[key] = value
+    return plain
 
 
 def _vector_of(obj: Any) -> List[float]:
@@ -353,6 +385,11 @@ class Store(DocumentStoreBase):
             wc.Property(name='tableId', data_type=wc.DataType.INT),
             wc.Property(name='vectorSize', data_type=wc.DataType.INT),
             wc.Property(name='modelName', data_type=wc.DataType.TEXT),
+            # The explorer's metadata extras, declared so auto-schema never types them
+            # (it would make ingestedAt a date and the integers numbers)
+            wc.Property(name='size', data_type=wc.DataType.INT),
+            wc.Property(name='modifyTime', data_type=wc.DataType.INT),
+            wc.Property(name='ingestedAt', data_type=wc.DataType.TEXT),
         ]
 
         # Shared across both index types; only vector_index_config differs.
@@ -469,9 +506,10 @@ class Store(DocumentStoreBase):
 
     def _toDoc(self, point: Any, *, score: float = 0.0, with_vector: bool = False) -> Doc:
         """A Doc from a returned object; carries ``metadata.pointId`` and, on request, the embedding."""
-        properties = {k: v for k, v in (point.properties or {}).items() if k != 'content' and v is not None}
+        properties = _plain_properties(point.properties)
+        content = properties.pop('content', None)
         properties['pointId'] = str(point.uuid)
-        doc = Doc(score=score, page_content=point.properties.get('content'), metadata=DocMetadata(**properties))
+        doc = Doc(score=score, page_content=content, metadata=DocMetadata(**properties))
         if with_vector:
             doc.embedding = _vector_of(point)
         return doc
@@ -487,8 +525,8 @@ class Store(DocumentStoreBase):
         # Now, add the documents to the results
         for point in points:
             # Get the payload content and metadata
-            metadata = {k: v for k, v in point.properties.items() if k not in {'content'} and v is not None}
-            content = point.properties.get('content')
+            metadata = _plain_properties(point.properties)
+            content = metadata.pop('content', None)
 
             if point.metadata.distance is not None:
                 score = self._score(point.metadata.distance)
@@ -866,7 +904,7 @@ class Store(DocumentStoreBase):
         ).objects
         if len(points) != 1:
             return False, None, None
-        properties = points[0].properties or {}
+        properties = _plain_properties(points[0].properties)
         size = properties.get('vectorSize')
         model = properties.get('modelName')
         if isinstance(size, int) and size > 0:
@@ -1052,7 +1090,7 @@ class Store(DocumentStoreBase):
         items: List[DocumentRow] = []
         seen = set()
         for point in points:
-            properties = point.properties or {}
+            properties = _plain_properties(point.properties)
             object_id = properties.get('objectId')
             if not object_id or object_id in seen:
                 continue

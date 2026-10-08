@@ -36,11 +36,66 @@ Mocked Components:
 Storage:
     - Uses class-level storage to persist data across operations within a test
     - Call MockWeaviateClient.reset() between tests to clear state
+    - Values are typed as the server types them: a property the collection does not
+      declare is auto-schemaed on first write (numbers as ``number``, returned as
+      floats; RFC 3339 strings as ``date``, returned as datetimes)
 """
 
 from typing import Any, Dict, List, Optional
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 import hashlib
+import re
+
+
+# =============================================================================
+# Auto-schema (what the server does with properties a collection does not declare)
+# =============================================================================
+
+#: An RFC 3339 timestamp, which auto-schema types as ``date`` (AUTOSCHEMA_DEFAULT_DATE)
+_RFC3339 = re.compile(r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$')
+
+
+def _data_type_name(data_type: Any) -> str:
+    """'text', 'int', 'number', 'date', ... for a DataType member or its value."""
+    return str(getattr(data_type, 'value', data_type))
+
+
+def _infer_type(value: Any) -> str:
+    """The type auto-schema gives an undeclared property: numbers become 'number', timestamps 'date'."""
+    if isinstance(value, bool):
+        return 'boolean'
+    if isinstance(value, (int, float)):
+        return 'number'
+    if isinstance(value, datetime) or (isinstance(value, str) and _RFC3339.match(value)):
+        return 'date'
+    if isinstance(value, str):
+        return 'text'
+    return 'object'
+
+
+def _as_type(data_type: str, value: Any) -> Any:
+    """A value as the server stores (and the client returns) it for a property of ``data_type``."""
+    if value is None:
+        return None
+    if data_type == 'number' and isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    if data_type == 'int' and isinstance(value, (int, float)) and not isinstance(value, bool):
+        return int(value)
+    if data_type == 'date' and isinstance(value, str):
+        return datetime.fromisoformat(value.replace('Z', '+00:00')).astimezone(timezone.utc)
+    return value
+
+
+def _apply_schema(collection_name: str, properties: Dict[str, Any]) -> Dict[str, Any]:
+    """Type ``properties`` by the collection's schema, adding undeclared ones as auto-schema would."""
+    schema = MockCollections._schemas.setdefault(collection_name, {})
+    typed = {}
+    for key, value in properties.items():
+        if key not in schema and value is not None:
+            schema[key] = _infer_type(value)
+        typed[key] = _as_type(schema.get(key, ''), value)
+    return typed
 
 
 # =============================================================================
@@ -262,9 +317,10 @@ class MockBatchContext:
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        # Commit all objects (an existing uuid is overwritten, as in Weaviate)
+        # Commit all objects (an existing uuid is overwritten, as in Weaviate), typed by the schema
         for obj in self.objects_to_add:
-            self.collection._storage[obj['uuid']] = {'properties': obj['properties'], 'vector': obj['vector']}
+            properties = _apply_schema(self.collection.name, dict(obj['properties']))
+            self.collection._storage[obj['uuid']] = {'properties': properties, 'vector': obj['vector']}
         return False
 
 
@@ -419,7 +475,7 @@ class MockData:
     def update(self, uuid: str, properties: Dict):
         """Update object properties."""
         if uuid in self.collection._storage:
-            self.collection._storage[uuid]['properties'].update(properties)
+            self.collection._storage[uuid]['properties'].update(_apply_schema(self.collection.name, dict(properties)))
 
 
 class MockAggregate:
@@ -511,9 +567,11 @@ class MockCollection:
 class MockCollections:
     """Mock collections manager."""
 
-    # Class-level set of collection names and the arguments they were created with
+    # Class-level set of collection names, the arguments they were created with, and their
+    # schema (property name -> data type), which auto-schema extends on writes
     _collections: set = set()
     _configs: Dict[str, Dict[str, Any]] = {}
+    _schemas: Dict[str, Dict[str, str]] = {}
 
     def exists(self, name: str) -> bool:
         """Check if collection exists."""
@@ -527,6 +585,9 @@ class MockCollections:
         """Create a new collection."""
         MockCollections._collections.add(name)
         MockCollections._configs[name] = dict(kwargs)
+        MockCollections._schemas[name] = {
+            prop.name: _data_type_name(prop.data_type) for prop in kwargs.get('properties') or []
+        }
         return MockCollection(name)
 
 
@@ -555,6 +616,7 @@ class MockWeaviateClient:
         """Reset all mock state for testing."""
         MockCollections._collections.clear()
         MockCollections._configs.clear()
+        MockCollections._schemas.clear()
         MockCollection._all_storage.clear()
 
 
