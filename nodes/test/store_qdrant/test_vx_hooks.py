@@ -446,13 +446,80 @@ def test_knn_graph_falls_back_to_the_node_when_qdrant_cannot_answer(monkeypatch)
     def broken(*_a, **_k):
         raise RuntimeError('matrix API unavailable')
 
+    logged = []
     monkeypatch.setattr(store.client, 'search_matrix_offsets', broken)
+    monkeypatch.setattr(drv, 'debug', logged.append)
     graph = store.knnGraph(keys, X, 'cosine', 3)
     assert graph.source == 'node'
     assert len(graph.offsets_row) == 10
     exact = _exact_knn(X.astype(float), 3)
     for i in range(9):
         assert set(graph.cols[graph.offsets_row[i] : graph.offsets_row[i + 1]].tolist()) == exact[i]
+    assert len(logged) == 1 and 'matrix API unavailable' in logged[0]
+
+
+def test_knn_graph_above_the_native_cap_is_computed_on_the_node(monkeypatch):
+    # search_matrix_offsets with a has_id filter costs the server memory that grows
+    # with the square of the sample; above the cap the node computes the graph.
+    store = make_store(drv)
+    _corpus(store, docs=3, chunks=3)
+    keys = [(f'doc-{d}', c) for d in range(3) for c in range(3)]
+    X = np.asarray([d.embedding for d in store.getVectors(keys)], dtype=np.float32)
+    assert drv.Store.NATIVE_KNN_MAX == 500
+    monkeypatch.setattr(drv.Store, 'NATIVE_KNN_MAX', 8)
+    logged = []
+    monkeypatch.setattr(drv, 'debug', logged.append)
+    Client.calls.clear()
+
+    graph = store.knnGraph(keys, X, 'cosine', 3)
+    assert graph.source == 'node'
+    assert Client.calls.get('search_matrix_offsets', 0) == 0
+    assert logged == []  # expected, not a failure
+    exact = _exact_knn(X.astype(float), 3)
+    for i in range(9):
+        assert set(graph.cols[graph.offsets_row[i] : graph.offsets_row[i + 1]].tolist()) == exact[i]
+
+    graph = store.knnGraph(keys[:8], X[:8], 'cosine', 3)
+    assert graph.source == 'native'
+
+
+def _reference_knn(metric, X, k):
+    X = X.astype(np.float64)
+    if metric == 'l2':
+        S = 1.0 / (1.0 + np.linalg.norm(X[:, None, :] - X[None, :, :], axis=2))
+    elif metric == 'ip':
+        S = X @ X.T
+    else:
+        Xn = X / np.linalg.norm(X, axis=1, keepdims=True)
+        S = Xn @ Xn.T
+    np.fill_diagonal(S, -np.inf)
+    cols = np.argsort(-S, axis=1, kind='stable')[:, :k]
+    return cols, np.take_along_axis(S, cols, axis=1)
+
+
+@pytest.mark.parametrize('metric', ['cosine', 'l2', 'ip'])
+def test_node_knn_is_exact_in_blocks(metric):
+    rng = np.random.default_rng(4)
+    X = rng.normal(size=(37, 5)).astype(np.float32)
+    offsets, cols, sims = drv._exact_knn(metric, X, 4, block=8)
+    ref_cols, ref_sims = _reference_knn(metric, X, 4)
+    assert offsets.tolist() == list(range(0, 37 * 4 + 1, 4))
+    assert cols.reshape(37, 4).tolist() == ref_cols.tolist()
+    assert np.allclose(sims.reshape(37, 4), ref_sims, atol=1e-5)
+
+
+def test_node_knn_memory_stays_bounded():
+    import tracemalloc
+
+    X = np.random.default_rng(5).normal(size=(2000, 16)).astype(np.float32)
+    tracemalloc.start()
+    try:
+        drv._exact_knn('cosine', X, 10)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    # A full 2,000 x 2,000 float64 matrix alone is 32 MB; the blocked graph never holds one.
+    assert peak < 24 * 2**20, peak
 
 
 # --- removeCounted --------------------------------------------------------------------

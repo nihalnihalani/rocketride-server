@@ -40,6 +40,7 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Set,
 from uuid import NAMESPACE_URL, uuid5
 import sys
 import numpy as np
+from rocketlib import debug
 from qdrant_client import QdrantClient
 from qdrant_client.models import (
     PointStruct,
@@ -97,6 +98,10 @@ _DISTANCE_METRICS = ('Euclid', 'Manhattan')
 # Page size of the internal scrolls that walk a filtered set.
 _SCROLL_PAGE = 256
 
+# Rows per block of the node-side exact kNN: the similarity block is
+# _KNN_BLOCK x n floats, never the whole n x n matrix.
+_KNN_BLOCK = 256
+
 
 def point_id_for(objectId: str, chunkId: int) -> str:
     """
@@ -149,26 +154,49 @@ def _similarities(metric: str, X: np.ndarray, rows: np.ndarray, cols: np.ndarray
     return np.divide(dots, norms, out=np.zeros_like(dots), where=norms > 0)
 
 
-def _exact_knn(metric: str, X: np.ndarray, k: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Exact k-nearest neighbours (self excluded) as (offsets_row, cols, sims), rows best-first."""
+def _exact_knn(
+    metric: str, X: np.ndarray, k: int, block: int = _KNN_BLOCK
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Exact k-nearest neighbours (self excluded) as (offsets_row, cols, sims), rows best-first.
+
+    Computed ``block`` rows at a time, so memory grows with ``block * n``,
+    not ``n * n``; ties keep the lower column first.
+    """
     n = len(X)
     k = max(0, min(int(k), n - 1))
-    Xf = X.astype(np.float64)
-    if metric == 'l2':
-        sq = np.sum(Xf * Xf, axis=1)
-        S = 1.0 / (1.0 + np.sqrt(np.maximum(sq[:, None] + sq[None, :] - 2.0 * (Xf @ Xf.T), 0.0)))
-    elif metric == 'ip':
-        S = Xf @ Xf.T
-    else:
+    if not k:
+        return np.zeros(n + 1, dtype=np.int64), np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.float32)
+    Xf = np.asarray(X, dtype=np.float64)
+    if metric == 'cosine':
         norms = np.linalg.norm(Xf, axis=1)
         norms[norms == 0] = 1.0
-        Xn = Xf / norms[:, None]
-        S = Xn @ Xn.T
-    np.fill_diagonal(S, -np.inf)
-    cols = np.argsort(-S, axis=1, kind='stable')[:, :k] if k else np.zeros((n, 0), dtype=np.int64)
-    sims = np.take_along_axis(S, cols, axis=1) if k else np.zeros((n, 0))
-    offsets = np.arange(0, n * k + 1, k, dtype=np.int64) if k else np.zeros(n + 1, dtype=np.int64)
-    return offsets, cols.reshape(-1).astype(np.int64), sims.reshape(-1).astype(np.float32)
+        Xf = Xf / norms[:, None]
+    sq = np.sum(Xf * Xf, axis=1) if metric == 'l2' else None
+    cols = np.empty((n, k), dtype=np.int64)
+    sims = np.empty((n, k), dtype=np.float32)
+    step = max(1, int(block))
+    for start in range(0, n, step):
+        stop = min(n, start + step)
+        S = Xf[start:stop] @ Xf.T
+        if sq is not None:
+            # 1 / (1 + euclidean distance), in place
+            S *= -2.0
+            S += sq[start:stop, None]
+            S += sq[None, :]
+            np.maximum(S, 0.0, out=S)
+            np.sqrt(S, out=S)
+            S += 1.0
+            np.reciprocal(S, out=S)
+        S[np.arange(stop - start), np.arange(start, stop)] = -np.inf
+        top = np.argpartition(S, n - k, axis=1)[:, n - k :]  # the k largest, unordered
+        top_sims = np.take_along_axis(S, top, axis=1)
+        del S
+        order = np.lexsort((top, -top_sims), axis=1)
+        cols[start:stop] = np.take_along_axis(top, order, axis=1)
+        sims[start:stop] = np.take_along_axis(top_sims, order, axis=1)
+    offsets = np.arange(0, n * k + 1, k, dtype=np.int64)
+    return offsets, cols.reshape(-1), sims.reshape(-1)
 
 
 class Store(DocumentStoreBase):
@@ -184,6 +212,15 @@ class Store(DocumentStoreBase):
 
     # Most distinct objectIds countDocuments counts exactly; above it the count is unknown (None).
     COUNT_DOCUMENTS_CAP = 10000
+
+    # Largest sample whose neighbour graph Qdrant computes (search_matrix_offsets
+    # restricted to the sample's point ids). The server's memory for that call
+    # grows with the square of the sample. Measured on qdrant 1.17.1: nothing
+    # measurable up to 500 points; at 1,000 a peak of about +170 MB, of which
+    # about +125 MB stayed allocated after the call (and after the collection
+    # was dropped); about +500 MB at 2,000; killed on a 2 GB host at 5,000.
+    # Larger samples are computed on the node.
+    NATIVE_KNN_MAX = 500
 
     # Most (objectId, chunkId) -> point id entries remembered between getVectors and knnGraph.
     POINT_ID_MEMO_MAX = 20000
@@ -1348,21 +1385,22 @@ class Store(DocumentStoreBase):
 
         ``search_matrix_offsets`` restricted to the sample's point ids finds the
         neighbours (source 'native'); similarities are recomputed from the
-        vectors by ``metric`` so every visual uses one definition. If Qdrant
-        cannot answer for every key, the graph is computed on the node instead.
+        vectors by ``metric`` so every visual uses one definition. Above
+        ``NATIVE_KNN_MAX`` keys, or if Qdrant cannot answer for every key, the
+        graph is computed on the node instead (source 'node').
         """
         vx = _vx()
         X = np.asarray(vectors, dtype=np.float32)
         keys = [(str(o), int(c)) for o, c in keys]
         n = len(keys)
         k = max(0, min(int(k), n - 1))
-        if n >= 2 and k >= 1:
+        if 2 <= n <= self.NATIVE_KNN_MAX and k >= 1:
             try:
                 graph = self._nativeKnn(keys, X, metric, k)
                 if graph is not None:
                     return graph
-            except Exception:
-                pass
+            except Exception as e:
+                debug(f'Qdrant could not compute the neighbour graph ({type(e).__name__}: {e}); computing it here')
         try:
             return super().knnGraph(keys, X, metric, k)
         except _errors().StoreUnsupported:
