@@ -26,7 +26,7 @@ from ai.common.schema import Doc, DocFilter, DocMetadata, QuestionText
 from ai.common.store import DocumentStoreBase
 from ai.common.store import document_store as ds
 from ai.common.store import vx_math
-from ai.common.store.errors import StoreUnsupported
+from ai.common.store.errors import StoreUnsupported, ToolRefusal
 from ai.common.store.vx_types import ChunkPage, DocPage, DocumentRow, KnnGraph, StoreInfo
 
 MODEL = 'test-model'
@@ -262,7 +262,7 @@ class ExactListingStore(VectorMemoryStore):
                 )
             )
         rows.sort(key=lambda r: (r.path, r.objectId))
-        offset = ds.decodeCursor(cursor)['o'] if cursor else 0
+        offset = ds.defaultCursorState(cursor)[0]
         page = rows[offset : offset + limit]
         nxt = ds.encodeCursor({'o': offset + limit}) if offset + limit < len(rows) else None
         return DocPage(page, nxt, len(rows), True, True, True, [])
@@ -418,6 +418,44 @@ def test_cursor_round_trip_is_url_safe_and_unpadded():
 def test_decode_cursor_rejects_garbage(bad):
     with pytest.raises(ValueError):
         ds.decodeCursor(bad)
+
+
+#: Cursors that decode to a JSON object but were never issued by the default listing.
+FORGED_CURSORS = [
+    {'o': 'abc'},
+    {'o': [1]},
+    {'o': 1e300},
+    {'o': 2.0},
+    {'o': -5},
+    {'o': True},
+    {'o': 2**40},
+    {'f': 'a#0'},
+    {'o': 2, 'f': 5},
+]
+
+
+@pytest.mark.parametrize('state', FORGED_CURSORS, ids=[str(s) for s in FORGED_CURSORS])
+def test_default_cursor_state_refuses_a_forged_cursor(state):
+    with pytest.raises(ToolRefusal) as caught:
+        ds.defaultCursorState(ds.encodeCursor(state))
+    assert caught.value.code == 'INVALID_INPUT'
+
+
+@pytest.mark.parametrize('state', FORGED_CURSORS, ids=[str(s) for s in FORGED_CURSORS])
+def test_list_documents_default_refuses_a_forged_cursor(state):
+    store = MemoryStore().seed(corpus({'a': [0], 'b': [0]}))
+    with pytest.raises(ToolRefusal) as caught:
+        store.listDocuments(cursor=ds.encodeCursor(state), limit=2, object_ids=None, deleted='active', sort='path')
+    assert caught.value.code == 'INVALID_INPUT'
+    assert not [call for call in store.calls if call[0] == 'get']
+
+
+def test_default_cursor_state_reads_an_issued_cursor():
+    assert ds.defaultCursorState(None) == (0, None)
+    assert ds.defaultCursorState(ds.encodeCursor({'o': 200, 'f': 'a#0'})) == (200, 'a#0')
+    assert ds.defaultCursorState(ds.encodeCursor({'o': 0})) == (0, None)
+    with pytest.raises(ToolRefusal):
+        ds.defaultCursorState('not a cursor!')
 
 
 # ---------------------------------------------------------------------------

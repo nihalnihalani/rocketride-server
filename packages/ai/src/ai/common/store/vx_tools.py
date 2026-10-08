@@ -150,6 +150,41 @@ def decodeCursor(cursor: str) -> Dict[str, Any]:
     return state
 
 
+#: Largest offset a default listing cursor may carry.
+CURSOR_OFFSET_MAX = 2**31 - 1
+
+#: What a caller sees for a cursor the store did not issue.
+INVALID_CURSOR_TEXT = 'cursor must be the next_cursor of a previous page.'
+
+
+def invalidCursor() -> ToolRefusal:
+    """The refusal (``INVALID_INPUT``) a ``listDocuments`` hook raises for a cursor it did not issue."""
+    return ToolRefusal('INVALID_INPUT', INVALID_CURSOR_TEXT)
+
+
+def defaultCursorState(cursor: Optional[str]) -> Tuple[int, Optional[str]]:
+    """Return ``(offset, first key)`` of a cursor issued by the default ``listDocuments``.
+
+    ``(0, None)`` for no cursor. A cursor that does not decode, lacks the offset
+    ``o``, carries an offset that is not an integer in ``0..CURSOR_OFFSET_MAX``, or a
+    first key ``f`` that is not text raises :func:`invalidCursor`, so a stale or
+    edited cursor answers ``INVALID_INPUT`` instead of reaching the backend.
+    """
+    if cursor is None:
+        return 0, None
+    try:
+        state = decodeCursor(cursor)
+    except ValueError:
+        raise invalidCursor() from None
+    offset = state.get('o')
+    first = state.get('f')
+    if isinstance(offset, bool) or not isinstance(offset, int) or not 0 <= offset <= CURSOR_OFFSET_MAX:
+        raise invalidCursor()
+    if first is not None and not isinstance(first, str):
+        raise invalidCursor()
+    return offset, first
+
+
 def metadataValue(doc: Any, name: str) -> Any:
     """Return metadata field or extra ``name`` of ``doc`` (None when absent)."""
     md = getattr(doc, 'metadata', None)
@@ -986,11 +1021,11 @@ class VectorExplorerTools:
         cursor = args.get('cursor')
         if cursor is not None:
             if not isinstance(cursor, str):
-                raise _invalid('cursor must be the next_cursor of a previous page.')
+                raise invalidCursor()
             try:
                 decodeCursor(cursor)
             except ValueError:
-                raise _invalid('cursor must be the next_cursor of a previous page.') from None
+                raise invalidCursor() from None
         limit = _clamped(
             _int_arg(args, 'limit', DEFAULTS['documents_page']), 1, LIMITS['documents_page'], 'limit', warnings
         )
@@ -1856,14 +1891,18 @@ class VectorExplorerTools:
 
 __all__ = [
     'CONTRACT_VERSION',
+    'CURSOR_OFFSET_MAX',
+    'INVALID_CURSOR_TEXT',
     'MAX_ANSWER_BYTES',
     'VectorExplorerTools',
     'decodeCursor',
+    'defaultCursorState',
     'deletedFilter',
     'docKey',
     'documentRow',
     'encodeCursor',
     'finish_answer',
+    'invalidCursor',
     'jsonable',
     'matchesDeleted',
     'metadataValue',

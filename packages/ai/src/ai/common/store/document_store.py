@@ -10,10 +10,12 @@ from .vx_defaults import VECTOR_TOOL_LIMITS
 from .vx_tools import (  # noqa: F401 - re-exported for the drivers that override the hooks
     VectorExplorerTools,
     decodeCursor,
+    defaultCursorState,
     deletedFilter,
     docKey as _vxDocKey,
     documentRow,
     encodeCursor,
+    invalidCursor,
     matchesDeleted,
     metadataValue,
     normalize_tool_input,
@@ -360,10 +362,11 @@ class DocumentStoreBase(ABC):
         ``{'o': offset, 'f': first key of the previous page}``; when a page's first key
         equals ``cursor['f']`` the backend ignored the offset, so the page ends with
         ``next_cursor=None`` and the caveat ``'documents_paging_unsupported'``.
+
+        A cursor the hook did not issue raises :func:`invalidCursor` (``INVALID_INPUT``)
+        before the backend is asked; a driver with its own cursor does the same.
         """
-        state = decodeCursor(cursor) if cursor else {}
-        offset = max(0, int(state.get('o', 0) or 0))
-        previous_first = state.get('f')
+        offset, previous_first = defaultCursorState(cursor)
         limit = max(1, int(limit))
         flt = deletedFilter(
             deleted,

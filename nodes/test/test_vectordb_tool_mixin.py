@@ -45,6 +45,7 @@ from ai.common.store.errors import StoreUnsupported
 from ai.common.store.vx_defaults import VECTOR_TOOL_LIMITS
 
 from .test_vector_hooks import (
+    FORGED_CURSORS,
     MODEL,
     CountingStore,
     ExactListingStore,
@@ -1018,6 +1019,19 @@ def test_documents_clamps_the_limit_with_a_warning():
 def test_documents_rejects_bad_input(args):
     answer = node(clustered()).documents(args)
     assert (answer['success'], answer['code']) == (False, 'INVALID_INPUT')
+
+
+@pytest.mark.parametrize('state', FORGED_CURSORS, ids=[str(s) for s in FORGED_CURSORS])
+@pytest.mark.parametrize('store_cls', [MemoryStore, ExactListingStore], ids=['default', 'native'])
+def test_documents_refuses_a_forged_cursor_as_invalid_input(state, store_cls):
+    answer = node(store_cls().seed(corpus({'a': [0], 'b': [0]}))).documents(
+        {'cursor': _store_module.encodeCursor(state)}
+    )
+    assert answer == {
+        'success': False,
+        'code': 'INVALID_INPUT',
+        'error': 'cursor must be the next_cursor of a previous page.',
+    }
 
 
 def test_documents_never_lists_the_control_record():
