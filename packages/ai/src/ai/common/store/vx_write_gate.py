@@ -60,12 +60,18 @@ from .errors import ToolRefusal
 from .vx_types import CONTROL_OBJECT_ID
 
 try:  # an engine without the module attaches no context: every write is refused
-    from ai.common.tool_context import current_tool_call as _engine_current_tool_call
+    import ai.common.tool_context as _tool_context
 except ImportError:  # pragma: no cover - exercised by loading a copy without the module
-    _engine_current_tool_call = None
+    _tool_context = None
+
+
+def _engine_current_tool_call() -> Any:
+    """Read the context through the module at call time, so a rebinding of the reader is honoured."""
+    return _tool_context.current_tool_call()
+
 
 #: Reads the engine's context for the running call (None on an engine without it).
-_current_tool_call = _engine_current_tool_call
+_current_tool_call = _engine_current_tool_call if _tool_context is not None else None
 
 #: The tools that write and therefore run the gate.
 WRITE_TOOLS = ('remove_document', 'delete', 'upsert')

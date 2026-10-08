@@ -220,6 +220,12 @@ def test_without_engine_wiring_every_write_is_refused():
     assert refusal.value.code == 'WRITES_UNKNOWN_CALLER'
 
 
+def test_the_gate_reads_the_engine_reader_at_call_time(monkeypatch):
+    monkeypatch.setattr(tool_context, 'current_tool_call', lambda: agent())
+    decision = vx_write_gate.check_write('delete', object_ids=['a'], allow_writes=False, agent_writes=True)
+    assert decision.origin == 'agent'
+
+
 def test_a_reader_that_raises_is_an_unknown_caller(monkeypatch):
     def broken():
         raise RuntimeError('context unavailable')
