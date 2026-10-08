@@ -197,6 +197,38 @@ def _decode_cursor(cursor: Optional[str]) -> Tuple[Optional[str], Optional[str]]
         raise ToolRefusal('INVALID_INPUT', 'cursor is not one this store issued')
 
 
+# Doubling steps the chunk scroll takes to find the next chunk id after a gap
+GAP_SEARCH_STEPS = 64
+
+
+def _first_chunk_after(exists: Callable[[int, int], bool], high: int, span: int) -> Optional[int]:
+    """
+    The smallest chunk id above ``high``, found with existence probes.
+
+    ``exists(low, top)`` says whether a chunk id lies in (low, top]. Windows of doubling width
+    find the first non-empty one, then a binary search finds its smallest id: a few probes of
+    one row each instead of one empty page per ``span`` ids. Reading "any row beyond the window"
+    would not do: Pinecone returns rows in storage order, not chunk order. None when nothing is
+    within reach.
+    """
+    low, width = high, max(1, span)
+    for _ in range(GAP_SEARCH_STEPS):
+        top = low + width
+        if exists(low, top):
+            break
+        low, width = top, width * 2
+    else:
+        return None
+    empty, found = low, top
+    while found - empty > 1:
+        middle = (empty + found) // 2
+        if exists(low, middle):
+            found = middle
+        else:
+            empty = middle
+    return found
+
+
 def _key_batches(keys: Sequence[Tuple[str, int]]) -> Iterator[Tuple[List[str], List[int]]]:
     """Group keys into (objectIds, chunkIds) reads whose cross product stays within VECTOR_BATCH_ROWS."""
     by_object: Dict[str, set] = {}
@@ -966,27 +998,43 @@ class Store(DocumentStoreBase):
 
     @_backend_errors('scrollChunks')
     def scrollChunks(self, objectId: str, *, after_chunk: int, limit: int, deleted: str) -> ChunkPage:
-        """The chunks of one document after ``after_chunk``, in chunk order, without embeddings."""
+        """
+        The chunks of one document after ``after_chunk``, in chunk order, without embeddings.
+
+        Reads the window of chunk ids (after_chunk, after_chunk + limit] and orders it here. When
+        the window is empty but the document goes on, the next chunk id is found with a few one-row
+        probes and the window starts there.
+        """
         after_chunk = int(after_chunk)
         limit = max(1, min(int(limit), MAX_QUERY_MATCHES))
         if objectId == CONTROL_OBJECT_ID or not self._doesCollectionExist():
             return ChunkPage(docs=[], has_more=False, next_after=after_chunk)
 
-        # Read a window of chunk ids and order it here
-        high = after_chunk + limit
-        window = self._convertFilter(
-            DocFilter(objectIds=[objectId], minChunkId=after_chunk + 1, maxChunkId=high), deleted=deleted
-        )
-        rows = self._selectRows(window, 0, min(limit * 4, MAX_QUERY_MATCHES))
-        docs = sorted((self._toDoc(row, score=0.0) for row in rows), key=lambda doc: doc.metadata.chunkId)
+        def window(low: int, high: int, *, probe: bool = False) -> List[Dict[str, Any]]:
+            flt = self._convertFilter(
+                DocFilter(objectIds=[objectId], minChunkId=low + 1, maxChunkId=high), deleted=deleted
+            )
+            return self._selectRows(flt, 0, 1 if probe else min(limit * 4, MAX_QUERY_MATCHES))
 
-        # Is there anything after the window?
-        beyond = self._convertFilter(DocFilter(objectIds=[objectId], minChunkId=high + 1), deleted=deleted)
-        more = self._selectRows(beyond, 0, 1)
-        next_after = docs[-1].metadata.chunkId if docs else after_chunk
+        def beyond(high: int) -> bool:
+            flt = self._convertFilter(DocFilter(objectIds=[objectId], minChunkId=high + 1), deleted=deleted)
+            return bool(self._selectRows(flt, 0, 1))
+
+        low = after_chunk
+        rows = window(low, low + limit)
+        more = beyond(low + limit)
+        if not rows and more:
+            first = _first_chunk_after(lambda lo, hi: bool(window(lo, hi, probe=True)), low + limit, limit)
+            if first is not None:
+                low = first - 1
+                rows = window(low, low + limit)
+                more = beyond(low + limit)
+        docs = sorted((self._toDoc(row, score=0.0) for row in rows), key=lambda doc: doc.metadata.chunkId)
         if more:
-            next_after = max(next_after, high)
-        return ChunkPage(docs=docs, has_more=bool(more), next_after=next_after)
+            next_after = low + limit
+        else:
+            next_after = docs[-1].metadata.chunkId if docs else after_chunk
+        return ChunkPage(docs=docs, has_more=more, next_after=next_after)
 
     @_backend_errors('sampleChunks')
     def sampleChunks(

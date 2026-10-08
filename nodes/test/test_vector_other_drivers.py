@@ -321,6 +321,22 @@ def test_scroll_chunks_walks_over_gaps_in_chunk_ids(adapter, store):
     assert [doc.metadata.chunkId for doc in docs] == [3, 7, 64]
 
 
+def test_scroll_chunks_jumps_gaps_without_empty_pages(adapter, store):
+    """
+    A gap in chunk ids costs no empty pages: each page before the last carries chunks. The chunks
+    are stored out of chunk order, so a jump to "whichever row lies beyond the window" would skip some.
+    """
+    for chunk_id in (64, 7, 3):
+        h.ingest(store, 'doc-a', '/docs/a.md', [chunk_id])
+    h.ingest(store, 'doc-b', '/docs/b.md', [5000])
+    docs, pages = h.collect_chunks(store, 'doc-a', limit=3)
+    assert [doc.metadata.chunkId for doc in docs] == [3, 7, 64]
+    assert all(page.docs for page in pages), [len(page.docs) for page in pages]
+    docs, pages = h.collect_chunks(store, 'doc-b', limit=3)
+    assert [doc.metadata.chunkId for doc in docs] == [5000]
+    assert len(pages) == 1
+
+
 def test_scroll_chunks_never_returns_the_control_record(adapter, store):
     """The control record (objectId 'schema') is not a document."""
     h.ingest(store, 'doc-a', '/docs/a.md', [0])

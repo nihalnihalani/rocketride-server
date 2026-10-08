@@ -186,6 +186,38 @@ def _key_batches(keys: Sequence[Tuple[str, int]]) -> Iterator[Tuple[List[str], L
         yield batch_objects, sorted(batch_chunks)
 
 
+# Doubling steps the chunk scroll takes to find the next chunk id after a gap
+GAP_SEARCH_STEPS = 64
+
+
+def _first_chunk_after(exists: Callable[[int, int], bool], high: int, span: int) -> Optional[int]:
+    """
+    The smallest chunk id above ``high``, found with existence probes.
+
+    ``exists(low, top)`` says whether a chunk id lies in (low, top]. Windows of doubling width
+    find the first non-empty one, then a binary search finds its smallest id: a few probes of
+    one row each instead of one empty page per ``span`` ids. Reading "any row beyond the window"
+    would not do: Milvus returns rows in storage order, not chunk order. None when nothing is
+    within reach.
+    """
+    low, width = high, max(1, span)
+    for _ in range(GAP_SEARCH_STEPS):
+        top = low + width
+        if exists(low, top):
+            break
+        low, width = top, width * 2
+    else:
+        return None
+    empty, found = low, top
+    while found - empty > 1:
+        middle = (empty + found) // 2
+        if exists(low, middle):
+            found = middle
+        else:
+            empty = middle
+    return found
+
+
 def _plain_meta(meta: Any) -> Dict[str, Any]:
     """A stored metadata value as a plain dict (older rows may hold other shapes)."""
     if meta is None:
@@ -1090,34 +1122,53 @@ class Store(DocumentStoreBase):
 
     @_backend_errors('scrollChunks')
     def scrollChunks(self, objectId: str, *, after_chunk: int, limit: int, deleted: str) -> ChunkPage:
-        """The chunks of one document after ``after_chunk``, in chunk order, without embeddings."""
+        """
+        The chunks of one document after ``after_chunk``, in chunk order, without embeddings.
+
+        Reads the window of chunk ids (after_chunk, after_chunk + limit] and orders it here (Milvus
+        queries do not sort). When the window is empty but the document goes on, the next chunk id
+        is found with a few one-row probes and the window starts there.
+        """
         after_chunk = int(after_chunk)
         limit = max(1, int(limit))
         if objectId == CONTROL_OBJECT_ID or not self._doesCollectionExist():
             return ChunkPage(docs=[], has_more=False, next_after=after_chunk)
 
-        # Read a window of chunk ids; Milvus queries do not sort
-        high = after_chunk + limit
-        conditions = self._convertFilter(DocFilter(objectIds=[objectId]), deleted=deleted)
-        rows = self.client.query(
-            collection_name=self.collection,
-            filter=' and '.join(conditions + [f"meta['chunkId'] > {after_chunk}", f"meta['chunkId'] <= {high}"]),
-            output_fields=['meta', 'content'],
-            limit=min(limit * 4, MAX_QUERY_WINDOW),
-        )
-        docs = sorted((self._toDoc(row, with_vector=False) for row in rows), key=lambda doc: doc.metadata.chunkId)
+        document = self._convertFilter(DocFilter(objectIds=[objectId]), deleted=deleted)
 
-        # Is there anything after the window?
-        more = self.client.query(
-            collection_name=self.collection,
-            filter=' and '.join(conditions + [f"meta['chunkId'] > {high}"]),
-            output_fields=['meta'],
-            limit=1,
-        )
-        next_after = docs[-1].metadata.chunkId if docs else after_chunk
+        def window(low: int, high: int, *, probe: bool = False) -> List[Dict[str, Any]]:
+            return self.client.query(
+                collection_name=self.collection,
+                filter=' and '.join(document + [f"meta['chunkId'] > {low}", f"meta['chunkId'] <= {high}"]),
+                output_fields=['meta'] if probe else ['meta', 'content'],
+                limit=1 if probe else min(limit * 4, MAX_QUERY_WINDOW),
+            )
+
+        def beyond(high: int) -> bool:
+            return bool(
+                self.client.query(
+                    collection_name=self.collection,
+                    filter=' and '.join(document + [f"meta['chunkId'] > {high}"]),
+                    output_fields=['meta'],
+                    limit=1,
+                )
+            )
+
+        low = after_chunk
+        rows = window(low, low + limit)
+        more = beyond(low + limit)
+        if not rows and more:
+            first = _first_chunk_after(lambda lo, hi: bool(window(lo, hi, probe=True)), low + limit, limit)
+            if first is not None:
+                low = first - 1
+                rows = window(low, low + limit)
+                more = beyond(low + limit)
+        docs = sorted((self._toDoc(row, with_vector=False) for row in rows), key=lambda doc: doc.metadata.chunkId)
         if more:
-            next_after = max(next_after, high)
-        return ChunkPage(docs=docs, has_more=bool(more), next_after=next_after)
+            next_after = low + limit
+        else:
+            next_after = docs[-1].metadata.chunkId if docs else after_chunk
+        return ChunkPage(docs=docs, has_more=more, next_after=next_after)
 
     @_backend_errors('sampleChunks')
     def sampleChunks(
