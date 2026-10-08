@@ -758,6 +758,44 @@ class TestHooks:
         only = store.listDocuments(cursor=None, limit=10, object_ids=['echo', 'schema'], deleted='all', sort='path')
         assert [r.objectId for r in only.items] == ['echo'] and only.total == 1
 
+    def test_list_documents_counts_once_and_aggregates_only_the_page(self, dsn, table, stores, monkeypatch):
+        """A page aggregates its own documents only, and the total is counted once, on the first page."""
+        rng = np.random.default_rng(49)
+        store = _open(dsn, table, stores)
+        for i in range(7):
+            _ingest(store, rng, f'doc{i}', 3)
+        _ingest(store, rng, 'gone', 2)
+        store.markDeleted(['gone'])
+        counted, aggregated = [], []
+        count_documents, list_documents = store._sql.count_documents, store._sql.list_documents
+
+        def spy_count(where):
+            counted.append(where)
+            return count_documents(where)
+
+        def spy_list(columns, where):
+            aggregated.append(list(where.object_ids or []))
+            return list_documents(columns, where)
+
+        monkeypatch.setattr(store._sql, 'count_documents', spy_count)
+        monkeypatch.setattr(store._sql, 'list_documents', spy_list)
+        pages, cursor = [], None
+        while True:
+            page = store.listDocuments(cursor=cursor, limit=3, object_ids=None, deleted='active', sort='path')
+            pages.append(page)
+            cursor = page.next_cursor
+            if cursor is None:
+                break
+        assert [[r.objectId for r in p.items] for p in pages] == [
+            ['doc0', 'doc1', 'doc2'],
+            ['doc3', 'doc4', 'doc5'],
+            ['doc6'],
+        ]
+        assert [p.total for p in pages] == [7, 7, 7]
+        assert all(r.chunks == 3 for p in pages for r in p.items)
+        assert counted == []
+        assert aggregated == [[r.objectId for r in p.items] for p in pages]
+
     def test_list_documents_rejects_a_bad_cursor(self, dsn, table, stores):
         from ai.common.store.errors import ToolRefusal
 

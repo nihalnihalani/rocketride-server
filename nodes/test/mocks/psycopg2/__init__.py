@@ -565,27 +565,47 @@ class MockCursor:
         )
         self._set(['content', 'chunkid'], [(r.get('content'), r.get('chunkid')) for r in rows[:limit]])
 
-    def _op_list_documents(self, body: str, params: List[Any], tag: str) -> None:
-        table = self._table(body)
-        test, it = self._where(body, params, stop=r' GROUP BY ')
+    @staticmethod
+    def _documents(table: MockTable, test: Callable) -> Dict[str, List[Dict[str, Any]]]:
+        """The rows matching ``test``, grouped by objectId, each group in chunk order."""
         groups: Dict[str, List[Dict[str, Any]]] = {}
         for row in table.rows.values():
             if test(row):
                 groups.setdefault(row.get('objectid'), []).append(row)
+        return {oid: sorted(rows, key=lambda r: r.get('chunkid') or 0) for oid, rows in groups.items()}
+
+    @staticmethod
+    def _path(rows: List[Dict[str, Any]]) -> str:
+        parents = [r.get('parent') for r in rows if r.get('parent') is not None]
+        return min(parents) if parents else ''
+
+    def _op_list_document_keys(self, body: str, params: List[Any], tag: str) -> None:
+        table = self._table(body)
+        test, it = self._where(body, params, stop=r' GROUP BY ')
+        groups = self._documents(table, test)
         after = (next(it), next(it)) if ' HAVING ' in body else None
         limit = next(it)
+        keys = sorted((self._path(rows), oid) for oid, rows in groups.items())
+        with_total = 'count(*) OVER ()' in body
+        out = [
+            (oid, path, len(keys)) if with_total else (oid, path)
+            for path, oid in keys
+            if after is None or (path, oid) > after
+        ]
+        self._set(['objectid', 'path', 'total'] if with_total else ['objectid', 'path'], out[:limit])
+
+    def _op_list_documents(self, body: str, params: List[Any], tag: str) -> None:
+        table = self._table(body)
+        if ' HAVING ' in body or ' LIMIT ' in body:
+            raise NotImplementedError('psycopg2 test double: a documents page is read by its objectIds')
+        test, _ = self._where(body, params, stop=r' GROUP BY ')
         has_meta = '"meta" ORDER BY' in body
         out = []
-        for object_id, rows in groups.items():
-            rows = sorted(rows, key=lambda r: r.get('chunkid') or 0)
-            parents = [r.get('parent') for r in rows if r.get('parent') is not None]
-            path = min(parents) if parents else ''
-            if after is not None and (path, object_id) <= after:
-                continue
+        for object_id, rows in self._documents(table, test).items():
             out.append(
                 (
                     object_id,
-                    path,
+                    self._path(rows),
                     len(rows),
                     any(r.get('chunkid') == 0 for r in rows),
                     any(bool(r.get('isdeleted')) for r in rows),
@@ -597,8 +617,7 @@ class MockCursor:
             )
         out.sort(key=lambda r: (r[1], r[0]))
         self._set(
-            ['objectid', 'path', 'chunks', 'has_first_chunk', 'deleted', 'tables', 'nodeid', 'point_id', 'meta'],
-            out[:limit],
+            ['objectid', 'path', 'chunks', 'has_first_chunk', 'deleted', 'tables', 'nodeid', 'point_id', 'meta'], out
         )
 
     def _op_scroll(self, body: str, params: List[Any], tag: str) -> None:

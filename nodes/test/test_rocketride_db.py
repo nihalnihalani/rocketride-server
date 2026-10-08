@@ -677,6 +677,24 @@ class TestPgVectorTransactions:
         assert [(r.objectId, r.chunks, r.deleted) for r in listed.items] == [('a', 2, False)]
         assert all(d.metadata.isDeleted is False for d in store.get(DocFilter(objectIds=['a'])))
 
+    def test_document_pages_aggregate_only_their_own_documents(self, mock_rv):
+        store = _make_store(mock_rv, {'collection': 'rr_vec', 'similarity': 'cosine'})
+        for i in range(5):
+            store.addChunks([_doc(f'd{i}', c, [1, 0, 0, 0, c]) for c in range(2)])
+        cursor, seen, totals = None, [], []
+        while True:
+            page = store.listDocuments(cursor=cursor, limit=2, object_ids=None, deleted='active', sort='path')
+            seen += [r.objectId for r in page.items]
+            totals.append(page.total)
+            cursor = page.next_cursor
+            if cursor is None:
+                break
+        assert seen == [f'd{i}' for i in range(5)] and totals == [5, 5, 5]
+        assert not _statements(mock_rv, 'count_documents')
+        details = _statements(mock_rv, 'list_documents')
+        assert len(details) == 3 and all('"objectid" = ANY(%s)' in text for text in details)
+        assert all('HAVING' not in text and 'LIMIT' not in text for text in details)
+
     def test_unreachable_server_error_names_no_host(self, mock_rv):
         from ai.common.store.errors import StoreError
 

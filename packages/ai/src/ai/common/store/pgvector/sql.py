@@ -450,16 +450,40 @@ class Statements:
             [object_id, int(after_chunk), int(limit)],
         )
 
-    def list_documents(
-        self, columns: Sequence[str], where: Where, after: Optional[Tuple[str, str]], limit: int
+    def list_document_keys(
+        self, where: Where, after: Optional[Tuple[str, str]], limit: int, *, with_total: bool
     ) -> Tuple[sql.Composed, List[Any]]:
-        """One page of documents (one row per objectId), ordered by ``(path, objectId)`` from ``after``."""
+        """The ``(objectId, path)`` keys of one page of documents, ordered by ``(path, objectId)`` from ``after``.
+
+        Only ``min(parent)`` is aggregated over the table, which a hash
+        aggregate does in one pass; the page's counts and metadata are read
+        by :meth:`list_documents` for its own objectIds only. With
+        ``with_total`` (the first page, which has no ``after``) every row
+        also carries the number of matching documents.
+        """
         pred, params = where.build()
-        meta = sql.SQL('(array_agg("meta" ORDER BY "chunkid"))[1]') if 'meta' in columns else sql.SQL('NULL::jsonb')
         having = sql.SQL('')
         if after is not None:
             having = sql.SQL('HAVING (coalesce(min("parent"), \'\'), "objectid") > (%s, %s) ')
             params = params + [after[0], after[1]]
+        total = sql.SQL(', count(*) OVER () AS "total"') if with_total else sql.SQL('')
+        return (
+            _q(
+                'list_document_keys',
+                'SELECT "objectid", coalesce(min("parent"), \'\') AS "path"{total} FROM {t} WHERE {w} '
+                'GROUP BY "objectid" {having}ORDER BY 2, 1 LIMIT %s',
+                total=total,
+                t=self.t,
+                w=pred,
+                having=having,
+            ),
+            params + [int(limit)],
+        )
+
+    def list_documents(self, columns: Sequence[str], where: Where) -> Tuple[sql.Composed, List[Any]]:
+        """One row per objectId of ``where`` (which names the page's objectIds): counts, flags and metadata."""
+        pred, params = where.build()
+        meta = sql.SQL('(array_agg("meta" ORDER BY "chunkid"))[1]') if 'meta' in columns else sql.SQL('NULL::jsonb')
         return (
             _q(
                 'list_documents',
@@ -470,13 +494,12 @@ class Statements:
                 '(array_agg("nodeid" ORDER BY "chunkid"))[1] AS "nodeid", '
                 '(array_agg("id" ORDER BY "chunkid"))[1] AS "point_id", '
                 '{meta} AS "meta" '
-                'FROM {t} WHERE {w} GROUP BY "objectid" {having}ORDER BY 2, 1 LIMIT %s',
+                'FROM {t} WHERE {w} GROUP BY "objectid" ORDER BY 2, 1',
                 meta=meta,
                 t=self.t,
                 w=pred,
-                having=having,
             ),
-            params + [int(limit)],
+            params,
         )
 
     def scroll(self, columns: Sequence[str], where: Where, limit: int) -> Tuple[sql.Composed, List[Any]]:

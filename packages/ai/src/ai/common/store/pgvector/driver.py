@@ -56,6 +56,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import dataclasses
 import json
 import math
 import threading
@@ -786,27 +787,55 @@ class PgVectorStore(DocumentStoreBase):
         deleted: str,
         sort: str,
     ) -> DocPage:
-        """One page of documents ordered by ``(path, objectId)``, with exact per-document counts."""
-        after = _decode_cursor(cursor) if cursor else None
+        """One page of documents ordered by ``(path, objectId)``, with exact per-document counts.
+
+        A page costs one pass over the table that aggregates only each
+        document's path, plus the counts and metadata of the page's own
+        documents (read through the ``(objectid, chunkid)`` index). The total
+        is counted on the first page and carried by the cursor, so later
+        pages do not count again.
+        """
+        after: Optional[Tuple[str, str]] = None
+        carried: Optional[int] = None
+        if cursor:
+            path, object_id, carried = _decode_cursor(cursor)
+            after = (path, object_id)
         page = max(1, int(limit))
         where = Where(deleted=deleted if deleted in ('active', 'deleted', 'all') else 'active')
         if object_ids is not None:
             where.object_ids = [str(o) for o in object_ids]
         columns = self._columns_now()
-        statement = self._sql.list_documents(columns, where, after, page + 1)
-        total_statement = self._sql.count_documents(where)
+        keys_statement = self._sql.list_document_keys(where, after, page + 1, with_total=after is None)
+        count_statement = self._sql.count_documents(where) if after is not None and carried is None else None
 
         def work(cur):
-            cur.execute(*statement)
-            rows = self._fetch_dicts(cur)
-            cur.execute(*total_statement)
-            return rows, int(cur.fetchone()[0])
+            cur.execute(*keys_statement)
+            keys = self._fetch_dicts(cur)
+            rows: List[Dict[str, Any]] = []
+            if keys:
+                shown = [key['objectid'] for key in keys[:page]]
+                cur.execute(*self._sql.list_documents(columns, dataclasses.replace(where, object_ids=shown)))
+                rows = self._fetch_dicts(cur)
+            counted = None
+            if count_statement is not None:
+                cur.execute(*count_statement)
+                counted = int(cur.fetchone()[0])
+            return keys, rows, counted
 
-        rows, total = self._read(work, ([], 0))
-        more = len(rows) > page
-        rows = rows[:page]
-        items = [_document_row(row) for row in rows]
-        next_cursor = _encode_cursor(rows[-1]['path'], rows[-1]['objectid']) if more and rows else None
+        keys, rows, counted = self._read(work, ([], [], None))
+        if after is None:
+            total = int(keys[0]['total']) if keys else 0
+        else:
+            total = carried if carried is not None else (counted or 0)
+        more = len(keys) > page
+        keys = keys[:page]
+        by_id = {row['objectid']: row for row in rows}
+        items = []
+        for key in keys:
+            row = by_id.get(key['objectid'])
+            if row is not None:  # gone between the two statements
+                items.append(_document_row({**row, 'path': key['path']}))
+        next_cursor = _encode_cursor(keys[-1]['path'], keys[-1]['objectid'], total) if more and keys else None
         return DocPage(
             items=items,
             next_cursor=next_cursor,
@@ -998,17 +1027,25 @@ def _vector_index(indexes: Sequence[Sequence[Any]]) -> Dict[str, Any]:
     return {'type': 'none', 'params': {}}
 
 
-def _encode_cursor(path: str, object_id: str) -> str:
-    raw = json.dumps({'p': path, 'o': object_id}, separators=(',', ':')).encode('utf-8')
+def _encode_cursor(path: str, object_id: str, total: Optional[int] = None) -> str:
+    """The documents cursor: the last ``(path, objectId)`` of a page and the listing's total."""
+    value: Dict[str, Any] = {'p': path, 'o': object_id}
+    if total is not None:
+        value['t'] = int(total)
+    raw = json.dumps(value, separators=(',', ':')).encode('utf-8')
     return base64.urlsafe_b64encode(raw).decode('ascii').rstrip('=')
 
 
-def _decode_cursor(cursor: str) -> Tuple[str, str]:
+def _decode_cursor(cursor: str) -> Tuple[str, str, Optional[int]]:
+    """``(path, objectId, total)`` of a documents cursor; the total is None when the cursor has none."""
     try:
         padded = cursor + '=' * (-len(cursor) % 4)
         value = json.loads(base64.urlsafe_b64decode(padded.encode('ascii')).decode('utf-8'))
         if isinstance(value, dict) and isinstance(value.get('p'), str) and isinstance(value.get('o'), str):
-            return value['p'], value['o']
+            total = value.get('t')
+            if not (isinstance(total, int) and not isinstance(total, bool) and total >= 0):
+                total = None
+            return value['p'], value['o'], total
     except (ValueError, TypeError, UnicodeError, binascii.Error):
         pass
     raise ToolRefusal('INVALID_INPUT', 'The documents cursor is not valid; start again without one')
