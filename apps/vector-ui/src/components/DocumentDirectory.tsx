@@ -179,7 +179,7 @@ export function DocumentDirectory({ pager, selectedId, writes, onSelect, onRemov
 							const top = index * ROW_HEIGHT;
 							if (line.kind === 'group') {
 								return (
-									<div key={line.group.key} style={{ position: 'absolute', top, left: 0, right: 0, height: ROW_HEIGHT }}>
+									<div key={line.group.key} role="listitem" aria-label={`Folder ${line.group.label}`} style={{ position: 'absolute', top, left: 0, right: 0, height: ROW_HEIGHT }}>
 										<button type="button" aria-expanded={!line.collapsed} onClick={() => toggle(line.group.key)} style={{ display: 'flex', alignItems: 'center', gap: 4, width: '100%', height: ROW_HEIGHT, padding: '0 8px', background: 'none', border: 'none', color: 'inherit', font: 'inherit', fontSize: 12, fontWeight: 700, cursor: 'pointer', textAlign: 'left', overflow: 'hidden', whiteSpace: 'nowrap', textOverflow: 'ellipsis' }} onFocus={(event) => (event.currentTarget.style.outline = FOCUS_RING)} onBlur={(event) => (event.currentTarget.style.outline = 'none')}>
 											<span style={{ width: 12, height: 12, flex: 'none', transform: line.collapsed ? 'none' : 'rotate(90deg)' }}>
 												<ChevronIcon />
@@ -191,7 +191,7 @@ export function DocumentDirectory({ pager, selectedId, writes, onSelect, onRemov
 							}
 							const item = line.row.item;
 							return (
-								<div key={item.objectId} style={{ position: 'absolute', top, left: 0, right: 0 }}>
+								<div key={item.objectId} role="none" style={{ position: 'absolute', top, left: 0, right: 0 }}>
 									<DocumentRow row={line.row} selected={item.objectId === selectedId} checked={checked.has(item.objectId)} writes={writes} onSelect={() => onSelect(item)} onToggleCheck={() => toggleCheck(item.objectId)} onRemove={() => onRemove([targetOf(item)])} />
 								</div>
 							);
