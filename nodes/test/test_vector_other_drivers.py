@@ -470,7 +470,9 @@ def test_services_json_cases_replay_on_the_mock(adapter, store):
             failures = h.find_case_expectation_failures(docs, case['expect']['documents'])
         else:
             question = Question.model_validate(case['questions'])
-            found = sorted(store._queryDocuments(question).values(), key=lambda doc: -doc.score)
+            # Rank by score as dispatchSearch does, but break ties against storage order, so a case
+            # that only passes because equal scores keep the mock's insertion order fails here
+            found = sorted(reversed(list(store._queryDocuments(question).values())), key=lambda doc: -doc.score)
             failures = h.find_case_expectation_failures(found, case['expect']['documents'])
         assert failures == [], f'{case.get("name")}: {failures}'
 

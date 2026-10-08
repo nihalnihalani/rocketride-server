@@ -275,6 +275,24 @@ def _field_value(data: Dict[str, Any], container: str, field: str) -> Any:
     return None
 
 
+def _vector_distance(metric: str, query: List[float], stored: Any) -> float:
+    """The distance Milvus reports for a hit under ``metric``.
+
+    COSINE and IP report a similarity (higher is closer); L2 reports the squared
+    euclidean distance (lower is closer). Rows without a comparable vector score 0.85.
+    """
+    stored = list(stored or [])
+    if not query or len(stored) != len(query):
+        return 0.85
+    if metric == 'L2':
+        return float(sum((a - b) ** 2 for a, b in zip(query, stored)))
+    dot = float(sum(a * b for a, b in zip(query, stored)))
+    if metric == 'IP':
+        return dot
+    norm = (sum(a * a for a in query) ** 0.5) * (sum(b * b for b in stored) ** 0.5)
+    return dot / norm if norm else 0.0
+
+
 def _parse_literal(expected: str) -> Any:
     """Parse one literal of a filter expression: quoted string, bool or integer."""
     if len(expected) >= 2 and expected[0] == expected[-1] and expected[0] in ('"', "'"):
@@ -739,9 +757,9 @@ class MilvusClient:
         """
         Perform semantic similarity search.
 
-        In a real Milvus, this computes vector similarity between the query
-        vectors and all stored vectors. Our mock returns all matching points
-        with a simulated distance score.
+        Like a real Milvus, this ranks the matching rows by the collection's metric
+        (COSINE / IP: similarity, higher first; L2: squared distance, lower first)
+        and returns the closest ``limit`` of them.
 
         IMPORTANT: We filter out documents with isDeleted=True because they
         should not appear in search results.
@@ -777,11 +795,20 @@ class MilvusClient:
         if filter:
             filtered_data = [record for record in filtered_data if _parse_filter_expression(filter, record)]
 
-        # Build results for each query vector (usually just one)
+        # The collection's vector metric (COSINE unless an index says otherwise)
+        metric = 'COSINE'
+        params = (MilvusClient._collections.get(collection_name) or {}).get('index_params')
+        for index in getattr(params, 'indexes', []) or []:
+            if index.get('field_name') == 'vector' and index.get('metric_type'):
+                metric = str(index['metric_type']).upper()
+
+        # Build results for each query vector (usually just one), closest first
         all_results = []
         for query_vector in data:
             results = []
-            for record in filtered_data[:limit]:
+            ranked = [(_vector_distance(metric, list(query_vector), r.get('vector')), r) for r in filtered_data]
+            ranked.sort(key=lambda pair: pair[0], reverse=metric != 'L2')
+            for distance, record in ranked[:limit]:
                 entity = {}
                 if output_fields:
                     for field in output_fields:
@@ -793,7 +820,7 @@ class MilvusClient:
                 results.append(
                     {
                         'id': _normalize_id(record.get('id')),
-                        'distance': 0.85,  # Fixed distance for mock (cosine similarity)
+                        'distance': distance,
                         'entity': entity,
                     }
                 )
