@@ -254,6 +254,12 @@ class EmbedLock:
             self._exclusive = False
             self._cond.notify_all()
 
+    @property
+    def exclusive_waiters(self) -> int:
+        """Return how many exclusive acquisitions (embed calls) are waiting right now."""
+        with self._cond:
+            return self._exclusive_waiting
+
 
 _STATE_GUARD = threading.Lock()
 

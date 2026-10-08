@@ -704,6 +704,13 @@ def _in_thread(fn: Callable[[], Any]) -> tuple:
     return thread, box
 
 
+def _until(predicate: Callable[[], bool], what: str, wait_s: float = 10.0) -> None:
+    deadline = time.monotonic() + wait_s
+    while not predicate():
+        assert time.monotonic() < deadline, f'timed out waiting until {what}'
+        time.sleep(0.005)
+
+
 def _flush_documents(node: str, inst: Any) -> None:
     """Make the node embed a batch: a full buffer on the transformer, any write on OpenAI."""
     if node == 'embedding_transformer':
@@ -724,7 +731,8 @@ def test_a_tool_call_during_a_flush_completes_after_the_flush(node):
     assert gate.entered.wait(10), 'the flush never reached the model'
 
     call, call_box = _in_thread(lambda: _invoke(tools, {'texts': ['during the flush']}))
-    call.join(0.3)
+    _until(lambda: _embed_tool().embed_lock_of(glb).exclusive_waiters == 1, 'the tool call waits on the lock')
+    call.join(0.2)
     assert call.is_alive(), 'the tool call must wait while the batch is being embedded'
     assert gate.events == ['chunks:start']
 
@@ -816,8 +824,7 @@ def test_a_waiting_tool_call_goes_before_batches_that_arrive_after_it(node):
     flush, _ = _in_thread(lambda: _flush_documents(node, ingest))
     assert gate.entered.wait(10)
     call, call_box = _in_thread(lambda: _invoke(tools, {'texts': ['waiting']}))
-    call.join(0.2)
-    assert call.is_alive()
+    _until(lambda: _embed_tool().embed_lock_of(glb).exclusive_waiters == 1, 'the tool call waits on the lock')
     question, _ = _in_thread(lambda: later.writeQuestions(_question('arrived later')))
     question.join(0.2)
     assert question.is_alive(), 'a batch arriving while a tool call waits must queue behind it'
@@ -884,6 +891,7 @@ def test_a_timed_out_tool_wait_does_not_hold_up_later_batches():
 
     with lock.shared():
         assert not lock.acquire_exclusive(timeout=0.05)
+        assert lock.exclusive_waiters == 0
 
         def batch() -> None:
             with lock.shared():
