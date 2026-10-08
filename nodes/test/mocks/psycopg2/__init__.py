@@ -33,8 +33,8 @@ dispatches on that tag. An untagged statement other than the save-time probe
 driver change cannot pass here silently.
 
 What it models: tables with their columns, indexes and rows; ``WHERE``
-predicates the driver builds (``=``, ``<>``, ``ANY``, ranges, key pairs,
-``ILIKE``); cosine / L2 / inner-product distances; the seeded id hash samples are
+predicates the driver builds (``=``, ``<>``, ``IS [NOT] TRUE``, ``ANY``, ranges,
+key pairs, ``ILIKE``); cosine / L2 / inner-product distances; the seeded id hash samples are
 ordered by (``hashtextextended``, modelled by a stable keyed hash);
 ``DELETE`` row counts; transactions (a read-only transaction refuses writes, a
 failed statement aborts the transaction until rollback, rollback undoes
@@ -226,6 +226,11 @@ def _predicate(where: str, params: Iterator[Any]) -> Callable[[Dict[str, Any]], 
                 }[op]
 
             tests.append(test)
+            continue
+        match = re.fullmatch(r'"(\w+)" IS (NOT )?TRUE', part)
+        if match:
+            col, negate = match.group(1), bool(match.group(2))
+            tests.append(lambda row, col=col, negate=negate: (row.get(col) is True) != negate)
             continue
         match = re.fullmatch(r'"(\w+)" = ANY\(%s\)', part)
         if match:

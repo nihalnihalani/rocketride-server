@@ -377,7 +377,7 @@ class PgVectorStore(DocumentStoreBase):
             'nodeId': row.get('nodeid') if row.get('nodeid') is not None else '',
             'parent': row.get('parent') if row.get('parent') is not None else '',
             'permissionId': row.get('permissionid') if row.get('permissionid') is not None else 0,
-            'isDeleted': row.get('isdeleted'),
+            'isDeleted': bool(row.get('isdeleted')),
             'isTable': bool(row.get('istable')) if row.get('istable') is not None else False,
             'tableId': row.get('tableid') if row.get('tableid') is not None else 0,
             'modelName': row.get('modelname') if row.get('modelname') is not None else '',

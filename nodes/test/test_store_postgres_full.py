@@ -937,6 +937,43 @@ class TestLegacy:
         assert store.countChunks(_filter(chunkIds=[0])) == 1
         assert store.describe().control_record is True
 
+    def test_rows_with_null_flags_read_as_active(self, dsn, table, stores, admin):
+        """Hand-written or foreign rows with a NULL isDeleted count, list and search as active, never as 'all' only."""
+        rng = np.random.default_rng(54)
+        _legacy_synthetic(admin, table, rng)
+        target = _unit(rng)
+        with admin.cursor() as cur:
+            for cid in range(3):
+                vec = '[' + ','.join(repr(x) for x in (target if cid == 1 else _unit(rng))) + ']'
+                cur.execute(
+                    f'INSERT INTO "{table}" (content, objectId, chunkId, embedding, parent) VALUES (%s, %s, %s, %s::vector, %s)',
+                    (f'nullflags {cid}', 'nullflags', cid, vec, 'C:/legacy/nullflags.md'),
+                )  # isDeleted, permissionId, isTable, tableId and nodeId stay NULL
+        store = _open(dsn, table, stores)
+        s = _schema()
+
+        listed = store.listDocuments(cursor=None, limit=10, object_ids=None, deleted='active', sort='path')
+        rows = {r.objectId: r for r in listed.items}
+        assert set(rows) == {'whole', 'orphan', 'nullflags'} and listed.total == 3
+        assert (rows['nullflags'].chunks, rows['nullflags'].deleted) == (3, False)
+        assert store.listDocuments(cursor=None, limit=10, object_ids=None, deleted='deleted', sort='path').items == []
+        got = store.get(s.DocFilter(objectIds=['nullflags'], limit=10))
+        assert [d.metadata.chunkId for d in got] == [0, 1, 2]
+        assert all(d.metadata.isDeleted is False for d in got)
+        q = s.QuestionText(text='q')
+        q.embedding = target
+        assert store.searchSemantic(q, s.DocFilter(limit=1))[0].page_content == 'nullflags 1'
+        assert 'C:/legacy/nullflags.md' in store.getPaths()
+        active, deleted, every = (store.countChunks(_filter(deleted=m)) for m in ('active', 'deleted', 'all'))
+        assert (active, deleted, every) == (12, 0, 12)
+        assert store.countDocuments(_filter()) == 3
+
+        store.markDeleted(['nullflags'])
+        assert store.countChunks(_filter(deleted='deleted')) == 3
+        assert store.countChunks(_filter()) + store.countChunks(_filter(deleted='deleted')) == store.countChunks(
+            _filter(deleted='all')
+        )
+
     def test_table_left_empty_by_a_failed_first_write_is_reused(self, dsn, table, stores, admin):
         """D3: an old-shape table with no row at all (no control record) is completed, not refused."""
         rng = np.random.default_rng(53)

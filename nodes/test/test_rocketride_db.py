@@ -663,6 +663,20 @@ class TestPgVectorTransactions:
         assert samples and all('hashtextextended("id"::text, %s)' in text for text in samples)
         assert not [text for text in _statements(mock_rv) if 'setseed' in text or 'random()' in text]
 
+    def test_rows_with_a_null_deleted_flag_read_as_active(self, mock_rv):
+        from ai.common.schema import DocFilter
+
+        store = _make_store(mock_rv, {'collection': 'rr_vec', 'similarity': 'cosine'})
+        store.addChunks([_doc('a', 0, [1, 0, 0, 0, 0]), _doc('a', 1, [1, 0, 0, 0, 0])])
+        for row in mock_rv.db.table('rr_vec').rows.values():
+            if row['objectid'] == 'a':
+                row['isdeleted'] = None  # a row written by hand or by another client
+        assert store.countChunks(DocFilter()) == 2
+        assert store.countDocuments(DocFilter()) == 1
+        listed = store.listDocuments(cursor=None, limit=5, object_ids=None, deleted='active', sort='path')
+        assert [(r.objectId, r.chunks, r.deleted) for r in listed.items] == [('a', 2, False)]
+        assert all(d.metadata.isDeleted is False for d in store.get(DocFilter(objectIds=['a'])))
+
     def test_unreachable_server_error_names_no_host(self, mock_rv):
         from ai.common.store.errors import StoreError
 

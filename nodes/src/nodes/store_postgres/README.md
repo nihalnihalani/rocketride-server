@@ -99,7 +99,7 @@ Provide the configured PostgreSQL host, port, user, password, and database. The 
 
 ### Search and document lifecycle
 
-Semantic search requires an embedding. Keyword search is a case-insensitive substring match of the question text on content, with the metadata filters. A batch that carries a document's first chunk replaces every row stored for that document; a later batch of the same document adds its chunks (replacing only the same chunk IDs), so a long document the embedding node sends in several batches is stored whole. The store can mark chunks deleted or active, and its default filters exclude marked-deleted chunks.
+Semantic search requires an embedding. Keyword search is a case-insensitive substring match of the question text on content, with the metadata filters. A batch that carries a document's first chunk replaces every row stored for that document; a later batch of the same document adds its chunks (replacing only the same chunk IDs), so a long document the embedding node sends in several batches is stored whole. The store can mark chunks deleted or active, and its default filters exclude marked-deleted chunks; a row with no deletion flag at all (one written by hand or by another client) counts as not deleted.
 
 Semantic search orders by the chosen pgvector distance operator and honors the
 filter's offset and limit. Filtered searches keep scanning the HNSW index

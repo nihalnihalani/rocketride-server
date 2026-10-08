@@ -140,7 +140,11 @@ def _col(name: str) -> sql.Identifier:
 
 @dataclass
 class Where:
-    """The row filter of one statement. Every field is optional; ``deleted`` is 'active', 'deleted' or 'all'."""
+    """The row filter of one statement. Every field is optional; ``deleted`` is 'active', 'deleted' or 'all'.
+
+    'active' takes the rows whose ``isdeleted`` is false or NULL, so that
+    'active' and 'deleted' together always make 'all'.
+    """
 
     exclude_control: bool = True
     deleted: str = 'active'
@@ -186,10 +190,11 @@ class Where:
             add('"parent" = %s', self.parent)
         if self.permissions is not None:
             add('"permissionid" = ANY(%s)', [int(p) for p in self.permissions])
+        # A NULL flag (a row written by hand or by another client) reads as not deleted.
         if self.deleted == 'active':
-            add('"isdeleted" = %s', False)
+            add('"isdeleted" IS NOT TRUE')
         elif self.deleted == 'deleted':
-            add('"isdeleted" = %s', True)
+            add('"isdeleted" IS TRUE')
         if self.chunk_ids is not None:
             add('"chunkid" = ANY(%s)', [int(c) for c in self.chunk_ids])
         if self.min_chunk_id is not None:

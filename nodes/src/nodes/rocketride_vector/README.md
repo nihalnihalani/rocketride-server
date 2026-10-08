@@ -129,8 +129,9 @@ Keyword search is a case-insensitive substring match on the question text.
 Semantic search needs an embedding bound to the question and raises if none is
 available; filtered searches keep scanning the HNSW index until they have enough
 rows. Missing tables produce empty search results rather than an error. Deleted
-objects are excluded by default, while document rendering reassembles stored
-chunks in chunkId order.
+objects are excluded by default (a row with no deletion flag at all counts as
+not deleted), while document rendering reassembles stored chunks in chunkId
+order.
 
 ### Connections
 
