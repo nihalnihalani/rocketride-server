@@ -929,6 +929,22 @@ def test_stats_quick_returns_cached_figures_with_their_time(monkeypatch):
     assert inst.stats({'mode': 'full'})['documents'] == 3
 
 
+@pytest.mark.parametrize('age_s', [VECTOR_TOOL_LIMITS['counts_cached_s'] + 1, 3600])
+def test_stats_quick_never_recounts_and_reports_the_age_through_counts_as_of(monkeypatch, age_s):
+    # Only mode 'full' (open, after a write, Refresh) recounts; counts_cached_s is the
+    # staleness the console expects between full calls, counts_as_of the actual age.
+    store = clustered(CountingStore, docs=2, chunks=2)
+    clock = [1_760_000_000.0]
+    monkeypatch.setattr(vx_tools, '_wall_clock', lambda: clock[0])
+    inst = node(store)
+    full = inst.stats({'mode': 'full'})
+    clock[0] += age_s
+    counted = len([c for c in store.calls if c[0] in ('countChunks', 'countDocuments')])
+    quick = inst.stats({'mode': 'quick'})
+    assert len([c for c in store.calls if c[0] in ('countChunks', 'countDocuments')]) == counted
+    assert quick['counts_as_of'] == full['computed_at'] and quick['documents'] == full['documents']
+
+
 def test_stats_quick_without_a_cache_computes_once():
     answer = node(clustered(CountingStore, docs=2, chunks=1)).stats({'mode': 'quick'})
     assert answer['documents'] == 2 and answer['counts_as_of'] is not None
