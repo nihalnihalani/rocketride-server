@@ -91,6 +91,9 @@ SAMPLE_LISTING_MAX = 500
 #: Keys read through ``getVectors`` in one call.
 VECTOR_READ_BATCH = 500
 
+#: Fewest sampled points for which ``sample`` reports outliers (1 % of fewer points is noise).
+OUTLIERS_MIN_POINTS = 10
+
 #: Most near-duplicate pairs a sample lists (most similar first); more adds the warning 'duplicates_capped'.
 DUPLICATES_MAX = 1000
 
@@ -1537,7 +1540,9 @@ class VectorExplorerTools:
                 offsets, cols, sims = graph.offsets_row, graph.cols, graph.sims
                 knn_source, graph_k = graph.source if graph.source in ('native', 'node') else 'node', int(graph.k)
             dens = vx_math.density(offsets, sims)
-            outliers = vx_math.outliers(dens, 1.0) if len(keys) else []
+            spread = float(np.ptp(np.asarray(dens, dtype=np.float64))) if len(keys) else 0.0
+            # A handful of points, or points all as dense as each other, have no outlier to show.
+            outliers = vx_math.outliers(dens, 1.0) if len(keys) >= OUTLIERS_MIN_POINTS and spread > 1e-6 else []
             duplicates = vx_math.duplicates(offsets, cols, sims, float(threshold))
             if len(duplicates) > DUPLICATES_MAX:
                 duplicates = duplicates[:DUPLICATES_MAX]

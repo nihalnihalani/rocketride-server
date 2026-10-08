@@ -1283,6 +1283,24 @@ def test_sample_without_chunk_counts_pins_first_chunks_and_fills_the_rest():
     assert all(doc['chunks'] is None for doc in answer['docs'])
 
 
+@pytest.mark.parametrize('points', [1, 2, 9])
+def test_sample_of_fewer_than_ten_points_flags_no_outliers(points):
+    answer = node(clustered(docs=points, chunks=1)).sample({'n': points})
+    assert answer['n'] == points and answer['outliers'] == []
+
+
+def test_sample_where_every_point_is_as_dense_flags_no_outliers():
+    store = VectorMemoryStore().seed([make_doc(f'd{i:02d}', 0, vector=[1.0, 0.0, 0.0, 0.0]) for i in range(12)])
+    answer = node(store).sample({'n': 12})
+    assert answer['n'] == 12 and len(set(answer['density'])) == 1 and answer['outliers'] == []
+
+
+def test_sample_of_ten_spread_points_flags_the_least_dense():
+    answer = node(clustered(docs=10, chunks=1, spread=0.9)).sample({'n': 10})
+    assert len(answer['outliers']) == 1
+    assert answer['density'][answer['outliers'][0]] == min(answer['density'])
+
+
 def test_sample_reports_fewer_points_when_the_collection_is_smaller():
     answer = node(clustered(docs=2, chunks=2)).sample({'n': 50})
     assert (answer['n'], answer['n_requested'], answer['biased']) == (4, 50, False)
