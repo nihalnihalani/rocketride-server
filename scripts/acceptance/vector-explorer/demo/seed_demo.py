@@ -15,7 +15,8 @@
 The fixtures' sources are started when they are not running (``ttl=0``, as
 start_fixtures.py does). Uploading a name again replaces that document, so a
 second run is harmless; ``--if-empty`` skips a fixture whose store already
-holds documents (asked through its Tools source, ``stats``).
+holds documents (asked through its Tools source, ``stats``; a store holding
+only its control record counts as empty).
 
 Usage (from dist/server): ./engine <this folder>/seed_demo.py [--only postgres,qdrant] [--pager] [--if-empty]
 """
@@ -30,7 +31,7 @@ import sys
 import tempfile
 
 from pathlib import Path
-from typing import Iterable, Iterator, List, Optional, Sequence, Tuple
+from typing import Any, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
@@ -94,17 +95,36 @@ def batches(items: Sequence, size: int) -> Iterator[Sequence]:
         yield items[start : start + size]
 
 
-async def _stored_count(client, key: str) -> Optional[int]:
-    """The store's legacy ``stats`` count through the fixture's Tools source (None when not answerable)."""
+def stored_documents(answer: Any) -> Optional[int]:
+    """Documents in a store from its ``stats`` answer; None when it did not answer.
+
+    The explorer's ``stats`` counts ``documents`` without the control record.
+    The legacy answer has only ``count``, every row including the control
+    record, so a collection holding just that record (e.g. after a failed
+    first upload) counts 1: that is no document.
+    """
+    if not isinstance(answer, dict) or answer.get('success') is False:
+        return None
+    if isinstance(answer.get('documents'), int):
+        return answer['documents']
+    return max(0, int(answer.get('count') or 0) - 1)
+
+
+def is_empty(answer: Any) -> bool:
+    """True when --if-empty should seed the store: it holds no document, or could not say."""
+    return not (stored_documents(answer) or 0) > 0
+
+
+async def _stats(client, key: str) -> Any:
+    """The store's ``stats`` answer through the fixture's Tools source (None when not answerable)."""
     fixture = fx.FIXTURES[key]
     if 'tools_1' not in fixture.sources:
         return None
     tokens = await fx.ensure_started(client, fx.build_pipeline(key), ('tools_1',))
     try:
-        answer = await client.tool(token=tokens['tools_1'], tool='stats', node_id='store_1', input={}, timeout=60000)
+        return await client.tool(token=tokens['tools_1'], tool='stats', node_id='store_1', input={}, timeout=60000)
     except Exception:  # noqa: BLE001 - a fixture that cannot answer is seeded
         return None
-    return int(answer.get('count') or 0) if isinstance(answer, dict) else None
 
 
 async def upload(client, key: str, source: str, files: Iterable[Tuple[Path, str]]) -> int:
@@ -126,7 +146,11 @@ async def main() -> int:
     )
     parser.add_argument('--only', default=','.join(TEMPLATE_FIXTURES + ('stock_rag',)))
     parser.add_argument('--pager', action='store_true', help='also fill qdrant_pager with 1,500 documents')
-    parser.add_argument('--if-empty', action='store_true', help='skip a fixture whose store already has documents')
+    parser.add_argument(
+        '--if-empty',
+        action='store_true',
+        help='skip a fixture whose store already has documents (the control record alone is none)',
+    )
     args = parser.parse_args()
     keys = [k.strip() for k in args.only.split(',') if k.strip()]
     if args.pager and 'qdrant_pager' not in keys:
@@ -141,7 +165,7 @@ async def main() -> int:
         async with RocketRideClient(uri=fx.ENGINE_URL, auth=fx.API_KEY, request_timeout=900000) as client:
             for key in keys:
                 name = fx.FIXTURES[key].name
-                if args.if_empty and (await _stored_count(client, key) or 0) > 0:
+                if args.if_empty and not is_empty(await _stats(client, key)):
                     print(f'{name}: already has documents, skipped')
                     continue
                 if key == 'stock_rag':

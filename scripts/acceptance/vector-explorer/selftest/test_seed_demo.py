@@ -48,6 +48,28 @@ class DemoNamesTests(unittest.TestCase):
             self.assertLess(len(files), 40)
 
 
+class IfEmptyTests(unittest.TestCase):
+    """--if-empty must not skip a store that holds only its control record."""
+
+    def test_documents_from_the_stats_answer(self):
+        # The explorer's stats counts documents (control record excluded).
+        self.assertEqual(seed.stored_documents({'success': True, 'documents': 0, 'count': 1}), 0)
+        self.assertEqual(seed.stored_documents({'success': True, 'documents': 40, 'count': 307}), 40)
+        # The legacy stats count is every row, the control record included.
+        self.assertEqual(seed.stored_documents({'count': 1}), 0)
+        self.assertEqual(seed.stored_documents({'count': 0}), 0)
+        self.assertEqual(seed.stored_documents({'count': 82}), 81)
+        self.assertIsNone(seed.stored_documents(None))
+        self.assertIsNone(seed.stored_documents({'success': False, 'code': 'COLLECTION_MISSING'}))
+
+    def test_a_store_with_only_its_control_record_is_seeded(self):
+        self.assertTrue(seed.is_empty({'count': 1}))
+        self.assertTrue(seed.is_empty({'success': True, 'documents': 0, 'count': 1}))
+        self.assertTrue(seed.is_empty(None))
+        self.assertFalse(seed.is_empty({'count': 2}))
+        self.assertFalse(seed.is_empty({'success': True, 'documents': 1, 'count': 2}))
+
+
 class PagerTests(unittest.TestCase):
     def test_1500_unique_one_chunk_documents(self):
         docs = seed.pager_documents()
