@@ -69,7 +69,7 @@ The collection is the destination for stored chunks and is created with no vecto
 
 The runtime accepts `cosine`, `dot`, `l2-squared`, `hamming`, or `manhattan` as the similarity setting, defaulting to `cosine`; another value stops initialization. It passes the selected value to the HNSW index when it creates a collection, so make the choice match the embedding space before the first ingest. Changing the setting does not recreate an existing collection's index.
 
-The retrieval score defaults to `0.5`, while the conversion code also drops results below a hard `0.20` before returning them. Raise the configured threshold if weak documents crowd the context; lower it when expected material is omitted, remembering that nothing below `0.20` can be returned. Cosine scores are converted as `(distance + 1) / 2`; the other supported metrics use a sigmoid conversion, so threshold values are not directly comparable after a metric change.
+The retrieval score defaults to `0.5`, while the conversion code also drops results below a floor of `0.20` before returning them. Raise the configured threshold if weak documents crowd the context; lower it when expected material is omitted, remembering that nothing below `0.20` can be returned. Scores are higher for closer results on every metric: cosine distance is converted as `(2 - distance) / 2` (an identical vector scores `1.0`), `dot` reports the dot product, and `l2-squared`, `hamming` and `manhattan` use `1 / (1 + distance)`. Threshold values are therefore not directly comparable after a metric change. Collections searched by an earlier release scored cosine results as `(distance + 1) / 2`, which ranked the farthest results first; thresholds tuned against those scores need retuning.
 
 ### Connection timeouts
 
@@ -92,7 +92,7 @@ For a cloud profile, provide the API key; the runtime uses it for the cloud conn
 
 ### Search and document lifecycle
 
-Semantic search requires an embedding and does not accept a non-zero offset. Keyword search matches content with the metadata filters. Re-ingesting an object deletes its existing chunks before replacement chunks are added. The store can mark chunks deleted or active, and its default filters exclude marked-deleted chunks.
+Semantic search requires an embedding and does not accept a non-zero offset. Keyword search matches the question text against the stored content with the metadata filters. A write that holds an object's chunk 0 starts a new version of the object and deletes its existing chunks first; later writes of the same object (embedding nodes send long documents in several batches) add to it. Each chunk is stored under an id derived from its object id and chunk number, so writing the same chunk again replaces it. The file size, modification time and ingest time are stored with each chunk when the pipeline provides them. Paged reads honour their offset. The store can mark chunks deleted or active, and its default filters exclude marked-deleted chunks.
 
 Before semantic search, the driver checks that the collection is compatible with
 the query's embedding model. The collection's batch import reports an error if
@@ -108,11 +108,20 @@ scoped at query time without using collection names as routine access filters.
 
 Rendering retrieves an object's chunks in `chunkId` order and sends joined text to the callback in `renderChunkSize` groups. The node's document count is a count of stored vectors (chunks).
 
-When an object is re-ingested, the driver deletes its existing objects before
-adding replacements through Weaviate's dynamic batch API. A batch with failed
-objects raises an error after the batch ends. Keep the original source
-available for a retry, since the replacement behavior is not an all-or-nothing
-transaction across the prior objects and the new batch.
+When an object is re-ingested from its chunk 0, the driver deletes its existing
+objects before adding replacements through Weaviate's dynamic batch API. A batch
+with failed objects raises an error after the batch ends. Keep the original
+source available for a retry, since the replacement behavior is not an
+all-or-nothing transaction across the prior objects and the new batch.
+
+### Vector Explorer
+
+The Vector Explorer app supports Weaviate as **experimental**: its explorer functions are tested against an in-memory stand-in for the Weaviate client, not against a live server. What the app sees on Weaviate:
+
+- The document list pages through each document's chunk 0 by offset, in storage order (the app sorts what it has loaded), with chunk counts grouped by object id. A document whose chunk 0 is missing is not listed but is still counted in the statistics. Weaviate does not page past 10,000 results, so a longer list ends there with a note.
+- Chunk and document counts honour the active, deleted and all views; the collection's control record is never counted or listed, and its embedding model and dimension are reported from it.
+- Samples for the embedding map are taken in object-id order, and the neighbour graph is computed on the node, not by Weaviate.
+- Removing a document reports the number of chunks it removed.
 
 ## Upstream docs
 

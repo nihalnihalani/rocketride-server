@@ -417,3 +417,89 @@ class MilvusAdapter(Adapter):
             return [hits]
 
         store.client.search = search
+
+
+class WeaviateAdapter(Adapter):
+    """Weaviate through ``nodes/test/mocks/weaviate``."""
+
+    name = 'weaviate'
+    backend = 'weaviate'
+    services = 'store_weaviate/services.json'
+    floor = 0.2
+    offset_raises = True
+    extras_stored = True
+
+    def __init__(self) -> None:
+        """Load the driver against the weaviate mock."""
+        self.module, mocks = load_driver('store_weaviate/weaviate.py', '_vx_weaviate_driver', mock_libs=('weaviate',))
+        self.mock = mocks['weaviate']
+
+    def new_store(self) -> Any:
+        """A store on an empty mock server."""
+        self.mock.MockWeaviateClient.reset()
+        return bare_store(
+            self.module.Store,
+            collection='VxTest',
+            host='localhost',
+            port=8080,
+            grpc_port=50051,
+            apikey=None,
+            renderChunkSize=32 * 1024 * 1024,
+            threshold_search=0.5,
+            similarity=self.module.VectorDistances.COSINE,
+            client=self.mock.connect_to_local(),
+            collectionObj=None,
+        )
+
+    def storage(self, store: Any) -> Dict[str, Dict[str, Any]]:
+        """The mock's objects for the collection, keyed by uuid."""
+        return self.mock.MockCollection._all_storage.setdefault(store.collection, {})
+
+    def seed_legacy(self, store: Any) -> None:
+        """Objects as today's driver wrote them: content-hash ids, declared fields only."""
+        store._createCollection(DIM)
+        for object_id, chunk_id, meta, content in legacy_rows():
+            vector = [0.0] * DIM if object_id == 'schema' else vector_for(object_id, chunk_id)
+            self.storage(store)[random_uuid()] = {'properties': {**meta, 'content': content}, 'vector': vector}
+
+    def ignore_offsets(self, store: Any) -> None:
+        """Make fetch_objects answer from offset 0."""
+        store._doesCollectionExist()
+
+        def factory(original: Callable[..., Any]) -> Callable[..., Any]:
+            def fetch_objects(*args: Any, **kwargs: Any) -> Any:
+                kwargs['offset'] = 0
+                return original(*args, **kwargs)
+
+            return fetch_objects
+
+        replace_method(store.collectionObj.query, 'fetch_objects', factory)
+
+    def raw_rows(self, store: Any) -> List[Dict[str, Any]]:
+        """Every stored object."""
+        return [
+            {
+                'objectId': o['properties'].get('objectId'),
+                'chunkId': o['properties'].get('chunkId'),
+                'meta': o['properties'],
+                'id': uid,
+            }
+            for uid, o in self.storage(store).items()
+        ]
+
+    def set_scores(self, store: Any, scores: Sequence[float]) -> None:
+        """Answer the next near_vector with one hit per score (cosine: distance = 2 - 2 * score)."""
+        store._doesCollectionExist()
+        objects = [(uid, o) for uid, o in self.storage(store).items() if o['properties'].get('objectId') != 'schema']
+        mock = self.mock
+
+        def near_vector(*args: Any, **kwargs: Any) -> Any:
+            hits = []
+            for (uid, obj), score in zip(objects, scores):
+                props = {k: v for k, v in obj['properties'].items() if v is not None}
+                hits.append(
+                    mock.QueryObject(uuid=uid, properties=props, metadata=mock.MetadataResult(distance=2 - 2 * score))
+                )
+            return mock.QueryResult(objects=hits)
+
+        store.collectionObj.query.near_vector = near_vector

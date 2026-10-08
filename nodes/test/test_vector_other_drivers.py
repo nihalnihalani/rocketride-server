@@ -30,6 +30,7 @@ from . import vector_other_drivers_harness as h
 
 ADAPTERS = {
     'milvus': h.MilvusAdapter,
+    'weaviate': h.WeaviateAdapter,
 }
 
 
