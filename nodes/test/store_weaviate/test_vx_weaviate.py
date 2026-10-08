@@ -110,3 +110,14 @@ def test_describe_reports_the_index_and_version(store):
     assert info.backend_version == '1.30.0-mock'
     assert 'score_scale_inverted_fixed' in info.caveats
     assert '8080' not in repr(info) and 'localhost' not in repr(info)
+
+
+def test_listing_stops_with_a_note_at_the_query_window(adapter, store, monkeypatch):
+    """Weaviate cannot page past 10,000 results: the listing serves what fits, then says so."""
+    monkeypatch.setattr(adapter.module, 'MAX_QUERY_RESULTS', 4)
+    for i in range(6):
+        h.ingest(store, f'doc-{i}', f'/docs/{i}.md', [0])
+    rows, pages = h.collect_listing(store, limit=2)
+    assert len({row.objectId for row in rows}) == 4
+    assert pages[-1].next_cursor is None
+    assert 'documents_paging_unsupported' in pages[-1].caveats

@@ -926,8 +926,9 @@ class Store(DocumentStoreBase):
                 items=[], next_cursor=None, total=0, counts_exact=True, distinct=False, sorted=False, caveats=caveats
             )
 
-        # Weaviate does not page beyond QUERY_MAXIMUM_RESULTS objects
-        if offset + limit + 1 > MAX_QUERY_RESULTS:
+        # Weaviate answers offset + limit <= QUERY_MAXIMUM_RESULTS only: serve what fits, then stop with a note
+        window_left = MAX_QUERY_RESULTS - offset
+        if window_left <= 0:
             return DocPage(
                 items=[],
                 next_cursor=None,
@@ -944,7 +945,8 @@ class Store(DocumentStoreBase):
             ),
             self._notControl(),
         )
-        points = self.collectionObj.query.fetch_objects(filters=first_chunks, offset=offset, limit=limit + 1).objects
+        fetch = min(limit + 1, window_left)
+        points = self.collectionObj.query.fetch_objects(filters=first_chunks, offset=offset, limit=fetch).objects
 
         # The backend ignored the offset: this page repeats the previous one
         if previous_first is not None and points and (points[0].properties or {}).get('objectId') == previous_first:
@@ -959,6 +961,9 @@ class Store(DocumentStoreBase):
             )
 
         has_more = len(points) > limit
+        if not has_more and fetch <= limit and len(points) == fetch:
+            # The window ended on a full page: more documents may exist beyond it
+            caveats = caveats + ['documents_paging_unsupported']
         points = points[:limit]
         page_ids = []
         for point in points:

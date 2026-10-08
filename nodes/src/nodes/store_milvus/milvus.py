@@ -918,12 +918,25 @@ class Store(DocumentStoreBase):
         )
         conditions.append(f"meta['objectId'] != '{CONTROL_OBJECT_ID}'")
 
+        # Milvus answers offset + limit <= MAX_QUERY_WINDOW only: serve what fits, then stop with a note
+        window_left = MAX_QUERY_WINDOW - offset
+        if window_left <= 0:
+            return DocPage(
+                items=[],
+                next_cursor=None,
+                total=None,
+                counts_exact=True,
+                distinct=False,
+                sorted=False,
+                caveats=caveats + ['documents_paging_unsupported'],
+            )
+        fetch = min(limit + 1, window_left)
         rows = self.client.query(
             collection_name=self.collection,
             filter=' and '.join(conditions),
             output_fields=['meta'],
             offset=offset,
-            limit=min(limit + 1, MAX_QUERY_WINDOW - offset) if offset < MAX_QUERY_WINDOW else 0,
+            limit=fetch,
         )
 
         # The backend ignored the offset: this page repeats the previous one
@@ -939,6 +952,9 @@ class Store(DocumentStoreBase):
             )
 
         has_more = len(rows) > limit
+        if not has_more and fetch <= limit and len(rows) == fetch:
+            # The window ended on a full page: more documents may exist beyond it
+            caveats = caveats + ['documents_paging_unsupported']
         rows = rows[:limit]
 
         items: List[DocumentRow] = []
