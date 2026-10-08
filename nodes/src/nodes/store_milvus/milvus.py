@@ -33,7 +33,7 @@ requirements = os.path.dirname(os.path.realpath(__file__)) + '/requirements.txt'
 depends(requirements)
 
 # Load what we need
-from typing import List, Callable, Dict, Any, Optional, Sequence, Tuple
+from typing import List, Callable, Dict, Any, Iterator, Optional, Sequence, Tuple
 import numpy as np
 from pymilvus import MilvusClient, DataType
 
@@ -64,6 +64,9 @@ CONTROL_OBJECT_ID = 'schema'
 
 # Milvus metric -> the explorer's metric vocabulary (None: no vector-space equivalent)
 METRICS = {'COSINE': 'cosine', 'L2': 'l2', 'IP': 'ip'}
+
+# Most objectId x chunkId combinations one vectors read asks for
+VECTOR_BATCH_ROWS = 4096
 
 
 def _escape_milvus_str(value: object) -> str:
@@ -101,6 +104,24 @@ def _decode_cursor(cursor: Optional[str]) -> Tuple[int, Optional[str]]:
         return offset, first
     except Exception:
         raise ToolRefusal('INVALID_INPUT', 'cursor is not one this store issued')
+
+
+def _key_batches(keys: Sequence[Tuple[str, int]]) -> Iterator[Tuple[List[str], List[int]]]:
+    """Group keys into (objectIds, chunkIds) reads whose cross product stays within VECTOR_BATCH_ROWS."""
+    by_object: Dict[str, set] = {}
+    for object_id, chunk_id in keys:
+        by_object.setdefault(object_id, set()).add(chunk_id)
+    batch_objects: List[str] = []
+    batch_chunks: set = set()
+    for object_id in sorted(by_object):
+        merged = batch_chunks | by_object[object_id]
+        if batch_objects and (len(batch_objects) + 1) * len(merged) > VECTOR_BATCH_ROWS:
+            yield batch_objects, sorted(batch_chunks)
+            batch_objects, merged = [], set(by_object[object_id])
+        batch_objects.append(object_id)
+        batch_chunks = merged
+    if batch_objects:
+        yield batch_objects, sorted(batch_chunks)
 
 
 def _plain_meta(meta: Any) -> Dict[str, Any]:
@@ -1024,18 +1045,17 @@ class Store(DocumentStoreBase):
         wanted = [(str(o), int(c)) for o, c in keys or [] if o != CONTROL_OBJECT_ID]
         if not wanted or not self._doesCollectionExist():
             return []
-        object_ids = sorted({o for o, _ in wanted})
-        chunk_ids = sorted({c for _, c in wanted})
-        rows = self.client.query(
-            collection_name=self.collection,
-            filter=f"meta['objectId'] in [{_str_list(object_ids)}] and meta['chunkId'] in [{_int_list(chunk_ids)}]",
-            output_fields=['meta', 'content', 'vector'],
-            limit=min(len(object_ids) * len(chunk_ids), MAX_QUERY_WINDOW),
-        )
         found: Dict[Tuple[str, int], Doc] = {}
-        for row in rows:
-            doc = self._toDoc(row, with_vector=True)
-            found.setdefault((doc.metadata.objectId, doc.metadata.chunkId), doc)
+        for object_ids, chunk_ids in _key_batches(wanted):
+            rows = self.client.query(
+                collection_name=self.collection,
+                filter=f"meta['objectId'] in [{_str_list(object_ids)}] and meta['chunkId'] in [{_int_list(chunk_ids)}]",
+                output_fields=['meta', 'content', 'vector'],
+                limit=min(len(object_ids) * len(chunk_ids), MAX_QUERY_WINDOW),
+            )
+            for row in rows:
+                doc = self._toDoc(row, with_vector=True)
+                found.setdefault((doc.metadata.objectId, doc.metadata.chunkId), doc)
         return [found[key] for key in wanted if key in found]
 
     def removeCounted(self, objectIds: List[str]) -> Optional[int]:

@@ -33,7 +33,7 @@ requirements = os.path.dirname(os.path.realpath(__file__)) + '/requirements.txt'
 depends(requirements)
 
 # Load what we need
-from typing import List, Callable, Dict, Any, Optional, Sequence, Tuple
+from typing import List, Callable, Dict, Any, Iterator, Optional, Sequence, Tuple
 import sys
 import json
 import uuid
@@ -69,6 +69,10 @@ MATCH_ALL = {'chunkId': {'$gte': 0}}
 
 # Pinecone metric -> the explorer's metric vocabulary
 METRICS = {'cosine': 'cosine', 'euclidean': 'l2', 'dotproduct': 'ip'}
+
+# Most objectId x chunkId combinations one vectors read asks for (within the match cap), and ids per fetch
+VECTOR_BATCH_ROWS = 1000
+FETCH_BATCH_IDS = 200
 
 
 def _keyed_id(objectId: str, chunkId: int) -> str:
@@ -128,6 +132,24 @@ def _decode_cursor(cursor: Optional[str]) -> Tuple[Optional[str], Optional[str]]
         return token, first
     except Exception:
         raise ToolRefusal('INVALID_INPUT', 'cursor is not one this store issued')
+
+
+def _key_batches(keys: Sequence[Tuple[str, int]]) -> Iterator[Tuple[List[str], List[int]]]:
+    """Group keys into (objectIds, chunkIds) reads whose cross product stays within VECTOR_BATCH_ROWS."""
+    by_object: Dict[str, set] = {}
+    for object_id, chunk_id in keys:
+        by_object.setdefault(object_id, set()).add(chunk_id)
+    batch_objects: List[str] = []
+    batch_chunks: set = set()
+    for object_id in sorted(by_object):
+        merged = batch_chunks | by_object[object_id]
+        if batch_objects and (len(batch_objects) + 1) * len(merged) > VECTOR_BATCH_ROWS:
+            yield batch_objects, sorted(batch_chunks)
+            batch_objects, merged = [], set(by_object[object_id])
+        batch_objects.append(object_id)
+        batch_chunks = merged
+    if batch_objects:
+        yield batch_objects, sorted(batch_chunks)
 
 
 class Store(DocumentStoreBase):
@@ -946,21 +968,18 @@ class Store(DocumentStoreBase):
         found: Dict[Tuple[str, int], Doc] = {}
 
         # Fast path: keyed ids
-        response = index.fetch(ids=[_keyed_id(o, c) for o, c in wanted])
-        for vec_id, vector in (_field(response, 'vectors', {}) or {}).items():
-            doc = self._toDoc(self._rowOf(vector, vec_id), with_vector=True, score=0.0)
-            found.setdefault((doc.metadata.objectId, doc.metadata.chunkId), doc)
+        for start in range(0, len(wanted), FETCH_BATCH_IDS):
+            batch = wanted[start : start + FETCH_BATCH_IDS]
+            response = index.fetch(ids=[_keyed_id(o, c) for o, c in batch])
+            for vec_id, vector in (_field(response, 'vectors', {}) or {}).items():
+                doc = self._toDoc(self._rowOf(vector, vec_id), with_vector=True, score=0.0)
+                found.setdefault((doc.metadata.objectId, doc.metadata.chunkId), doc)
 
         # Misses: by objectId and chunkId
         missing = [key for key in wanted if key not in found]
-        if missing:
-            flt = {
-                '$and': [
-                    {'objectId': {'$in': sorted({o for o, _ in missing})}},
-                    {'chunkId': {'$in': sorted({c for _, c in missing})}},
-                ]
-            }
-            limit = min(len({o for o, _ in missing}) * len({c for _, c in missing}), MAX_QUERY_MATCHES)
+        for object_ids, chunk_ids in _key_batches(missing):
+            flt = {'$and': [{'objectId': {'$in': object_ids}}, {'chunkId': {'$in': chunk_ids}}]}
+            limit = min(len(object_ids) * len(chunk_ids), MAX_QUERY_MATCHES)
             for row in self._selectRows(flt, 0, limit, with_values=True):
                 doc = self._toDoc(row, with_vector=True, score=0.0)
                 found.setdefault((doc.metadata.objectId, doc.metadata.chunkId), doc)

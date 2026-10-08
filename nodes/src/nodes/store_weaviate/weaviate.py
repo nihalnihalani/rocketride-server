@@ -32,7 +32,7 @@ from depends import depends
 requirements = os.path.dirname(os.path.realpath(__file__)) + '/requirements.txt'
 depends(requirements)
 
-from typing import List, Callable, Dict, Any, Optional, Sequence, Tuple
+from typing import List, Callable, Dict, Any, Iterator, Optional, Sequence, Tuple
 import re
 import json
 import uuid
@@ -67,6 +67,10 @@ MAX_GROUPS = 10000
 # Weaviate distance -> the explorer's metric vocabulary (None: no vector-space equivalent)
 METRICS = {'cosine': 'cosine', 'dot': 'ip', 'l2-squared': 'l2'}
 
+# Most objectId x chunkId combinations one vectors read asks for, and ids per id lookup
+VECTOR_BATCH_ROWS = 4096
+FETCH_BATCH_IDS = 500
+
 
 def _keyed_uuid(objectId: str, chunkId: int) -> str:
     """The point id of a chunk: uuid5 of '<objectId>#<chunkId>'."""
@@ -93,6 +97,24 @@ def _decode_cursor(cursor: Optional[str]) -> Tuple[int, Optional[str]]:
         return offset, first
     except Exception:
         raise ToolRefusal('INVALID_INPUT', 'cursor is not one this store issued')
+
+
+def _key_batches(keys: Sequence[Tuple[str, int]]) -> Iterator[Tuple[List[str], List[int]]]:
+    """Group keys into (objectIds, chunkIds) reads whose cross product stays within VECTOR_BATCH_ROWS."""
+    by_object: Dict[str, set] = {}
+    for object_id, chunk_id in keys:
+        by_object.setdefault(object_id, set()).add(chunk_id)
+    batch_objects: List[str] = []
+    batch_chunks: set = set()
+    for object_id in sorted(by_object):
+        merged = batch_chunks | by_object[object_id]
+        if batch_objects and (len(batch_objects) + 1) * len(merged) > VECTOR_BATCH_ROWS:
+            yield batch_objects, sorted(batch_chunks)
+            batch_objects, merged = [], set(by_object[object_id])
+        batch_objects.append(object_id)
+        batch_chunks = merged
+    if batch_objects:
+        yield batch_objects, sorted(batch_chunks)
 
 
 def _all(*filters: Optional[Filter]) -> Optional[Filter]:
@@ -1054,20 +1076,20 @@ class Store(DocumentStoreBase):
         found: Dict[Tuple[str, int], Doc] = {}
 
         # Fast path: keyed ids
-        points = self.collectionObj.query.fetch_objects(
-            filters=Filter.by_id().contains_any([_keyed_uuid(o, c) for o, c in wanted]),
-            limit=len(wanted),
-            include_vector=True,
-        ).objects
-        for point in points:
-            doc = self._toDoc(point, with_vector=True)
-            found.setdefault((doc.metadata.objectId, doc.metadata.chunkId), doc)
+        for start in range(0, len(wanted), FETCH_BATCH_IDS):
+            batch = wanted[start : start + FETCH_BATCH_IDS]
+            points = self.collectionObj.query.fetch_objects(
+                filters=Filter.by_id().contains_any([_keyed_uuid(o, c) for o, c in batch]),
+                limit=len(batch),
+                include_vector=True,
+            ).objects
+            for point in points:
+                doc = self._toDoc(point, with_vector=True)
+                found.setdefault((doc.metadata.objectId, doc.metadata.chunkId), doc)
 
         # Misses: by objectId and chunkId
         missing = [key for key in wanted if key not in found]
-        if missing:
-            object_ids = sorted({o for o, _ in missing})
-            chunk_ids = sorted({c for _, c in missing})
+        for object_ids, chunk_ids in _key_batches(missing):
             points = self.collectionObj.query.fetch_objects(
                 filters=_all(_any_equal('objectId', object_ids), _any_equal('chunkId', chunk_ids)),
                 limit=min(len(object_ids) * len(chunk_ids), MAX_QUERY_RESULTS),

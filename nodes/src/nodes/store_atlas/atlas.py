@@ -31,7 +31,7 @@ from depends import depends
 requirements = os.path.dirname(os.path.realpath(__file__)) + '/requirements.txt'
 depends(requirements)
 
-from typing import List, Callable, Dict, Any, Optional, Sequence, Tuple
+from typing import List, Callable, Dict, Any, Iterator, Optional, Sequence, Tuple
 from uuid import uuid4
 import sys
 import json
@@ -81,6 +81,9 @@ VECTOR_SIMILARITY = {'cosine': 'cosine', 'euclidean': 'euclidean', 'dotproduct':
 # Similarity setting -> the explorer's metric vocabulary
 METRICS = {'cosine': 'cosine', 'euclidean': 'l2', 'dotproduct': 'ip', 'dotProduct': 'ip'}
 
+# Most objectId x chunkId combinations one vectors read asks for
+VECTOR_BATCH_ROWS = 4096
+
 
 def _meta_dump(metadata: DocMetadata) -> Dict[str, Any]:
     """The metadata stored with a chunk: declared fields and the control-record extras, never null."""
@@ -107,6 +110,24 @@ def _decode_cursor(cursor: Optional[str]) -> Tuple[int, Optional[str]]:
         return offset, first
     except Exception:
         raise ToolRefusal('INVALID_INPUT', 'cursor is not one this store issued')
+
+
+def _key_batches(keys: Sequence[Tuple[str, int]]) -> Iterator[Tuple[List[str], List[int]]]:
+    """Group keys into (objectIds, chunkIds) reads whose cross product stays within VECTOR_BATCH_ROWS."""
+    by_object: Dict[str, set] = {}
+    for object_id, chunk_id in keys:
+        by_object.setdefault(object_id, set()).add(chunk_id)
+    batch_objects: List[str] = []
+    batch_chunks: set = set()
+    for object_id in sorted(by_object):
+        merged = batch_chunks | by_object[object_id]
+        if batch_objects and (len(batch_objects) + 1) * len(merged) > VECTOR_BATCH_ROWS:
+            yield batch_objects, sorted(batch_chunks)
+            batch_objects, merged = [], set(by_object[object_id])
+        batch_objects.append(object_id)
+        batch_chunks = merged
+    if batch_objects:
+        yield batch_objects, sorted(batch_chunks)
 
 
 """
@@ -981,17 +1002,13 @@ class Store(DocumentStoreBase):
         wanted = [(str(o), int(c)) for o, c in keys or [] if o != CONTROL_OBJECT_ID]
         if not wanted or not self._doesCollectionExist():
             return []
-        documents = self.collection.find(
-            {
-                'meta.objectId': {'$in': sorted({o for o, _ in wanted})},
-                'meta.chunkId': {'$in': sorted({c for _, c in wanted})},
-            }
-        )
         found: Dict[Tuple[str, int], Doc] = {}
-        for document in documents:
-            doc = self._toDoc(document, with_vector=True)
-            if doc is not None:
-                found.setdefault((doc.metadata.objectId, doc.metadata.chunkId), doc)
+        for object_ids, chunk_ids in _key_batches(wanted):
+            documents = self.collection.find({'meta.objectId': {'$in': object_ids}, 'meta.chunkId': {'$in': chunk_ids}})
+            for document in documents:
+                doc = self._toDoc(document, with_vector=True)
+                if doc is not None:
+                    found.setdefault((doc.metadata.objectId, doc.metadata.chunkId), doc)
         return [found[key] for key in wanted if key in found]
 
     def removeCounted(self, objectIds: List[str]) -> Optional[int]:

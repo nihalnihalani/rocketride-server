@@ -256,6 +256,9 @@ class Adapter:
         """Make the next semantic search answer one hit per score (in that order), driver scale."""
         raise NotImplementedError
 
+    def scramble_ids(self, store: Any) -> None:
+        """Give every stored row a random id, as older releases wrote them (no-op where ids are random)."""
+
 
 def ingest(store: Any, object_id: str, path: str, chunk_ids: Sequence[int], **kwargs: Any) -> List[Doc]:
     """Write chunks through the driver's addChunks, as the data lane does."""
@@ -481,6 +484,14 @@ class WeaviateAdapter(Adapter):
             vector = [0.0] * DIM if object_id == 'schema' else vector_for(object_id, chunk_id)
             self.storage(store)[random_uuid()] = {'properties': {**meta, 'content': content}, 'vector': vector}
 
+    def scramble_ids(self, store: Any) -> None:
+        """Re-key every object with a random uuid."""
+        storage = self.storage(store)
+        items = list(storage.items())
+        storage.clear()
+        for _, obj in items:
+            storage[random_uuid()] = obj
+
     def ignore_offsets(self, store: Any) -> None:
         """Make fetch_objects answer from offset 0."""
         store._doesCollectionExist()
@@ -572,6 +583,14 @@ class PineconeAdapter(Adapter):
                 metadata.update({'nodeId': '', 'parent': '', 'permissionId': 0, 'isTable': False, 'tableId': 0})
                 vector = [0.0] * (DIM - 1) + [1.0]
             self.storage(store)[random_uuid()] = {'values': vector, 'metadata': metadata}
+
+    def scramble_ids(self, store: Any) -> None:
+        """Re-key every vector with a random id."""
+        storage = self.storage(store)
+        items = list(storage.items())
+        storage.clear()
+        for _, vector in items:
+            storage[random_uuid()] = vector
 
     def _wrap_index(self, store: Any, method: str, factory: Callable[[Callable[..., Any]], Callable[..., Any]]) -> None:
         original_index = store.client.Index

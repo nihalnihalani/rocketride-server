@@ -351,6 +351,22 @@ def test_get_vectors_on_a_legacy_collection(adapter, store):
     assert all(len(doc.embedding) == h.DIM for doc in docs)
 
 
+@pytest.mark.parametrize('scrambled', [False, True], ids=['keyed', 'random-ids'])
+def test_get_vectors_batches_large_requests(adapter, store, scrambled, monkeypatch):
+    """Many keys over many documents are read in bounded batches and all come back, in order."""
+    for i in range(12):
+        h.ingest(store, f'doc-{i:02d}', f'/docs/{i:02d}.md', list(range(5)))
+    if scrambled:
+        adapter.scramble_ids(store)
+    monkeypatch.setattr(adapter.module, 'VECTOR_BATCH_ROWS', 10)
+    if hasattr(adapter.module, 'FETCH_BATCH_IDS'):
+        monkeypatch.setattr(adapter.module, 'FETCH_BATCH_IDS', 7)
+    keys = [(f'doc-{i:02d}', c) for i in reversed(range(12)) for c in (4, 0, 2)]
+    docs = store.getVectors(keys)
+    assert [(doc.metadata.objectId, doc.metadata.chunkId) for doc in docs] == keys
+    assert all(len(doc.embedding) == h.DIM for doc in docs)
+
+
 def test_sample_chunks_returns_vectors_and_the_strategy_used(adapter, store):
     """A sample carries embeddings, skips the control record and deleted rows."""
     h.ingest(store, 'doc-a', '/docs/a.md', [0, 1, 2])
