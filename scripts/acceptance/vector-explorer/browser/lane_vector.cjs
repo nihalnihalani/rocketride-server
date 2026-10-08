@@ -193,9 +193,15 @@ async function server() {
 	return client;
 }
 
-async function tokenOf(fixture, source) {
+/** The running tasks (the task list the SDKs read, `rrext_get_tasks`). */
+async function runningTasks() {
 	const client = await server();
-	const tasks = await client.getTasks();
+	const body = await client.call('rrext_get_tasks');
+	return (body && body.tasks) || [];
+}
+
+async function tokenOf(fixture, source) {
+	const tasks = await runningTasks();
 	const row = tasks.find((t) => ((t.pipeline || {}).project_id === fixture.projectId) && t.source === source);
 	if (!row) throw new Error(`${fixture.name} / ${source} is not running (start_fixtures.py)`);
 	return row.token;
@@ -418,8 +424,7 @@ async function main() {
 		});
 
 		await step(page, 'sign-out leaves no task token in the page storage', async () => {
-			const client = await server();
-			const tokens = (await client.getTasks()).map((t) => t.token).filter(Boolean);
+			const tokens = (await runningTasks()).map((t) => t.token).filter(Boolean);
 			const menu = page.locator('[aria-haspopup="menu"]').last();
 			await menu.click();
 			await page.getByText(UI.logout).first().click();
