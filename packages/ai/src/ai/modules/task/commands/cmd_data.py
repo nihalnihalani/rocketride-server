@@ -32,6 +32,7 @@ This module works in conjunction with TaskServer to:
 - Handle processing errors and edge cases
 """
 
+import re
 from typing import TYPE_CHECKING, Dict, Any, Optional
 from ai.account import account
 from ai.common.dap import DAPConn, TransportBase
@@ -39,6 +40,11 @@ from ai.common.tool_context import caller_from_auth
 
 # Most object ids one audit record carries (the write tools accept at most 100).
 AUDIT_OBJECT_IDS_MAX = 100
+
+# The audit labels the vector write tools use: `vector.<snake_case name>`. Any
+# node reached by a tool call can return an `audit` block, so only this
+# namespace is recorded (under source 'vector').
+AUDIT_ACTION_PATTERN = re.compile(r'vector\.[a-z][a-z0-9_]{0,63}')
 
 # Only import for type checking to avoid circular import errors
 if TYPE_CHECKING:
@@ -214,7 +220,10 @@ class DataCommands(DAPConn):
     async def _forward_audit(self, subprocess_response: Any, caller: Dict[str, Any], control: Optional[Any]) -> None:
         """Record a tool result's ``audit`` block with ``account.audit``.
 
-        Only a dict result whose ``audit`` block names an ``action`` is recorded.
+        Only a dict result whose ``audit`` block names an ``action`` in the
+        ``vector.<snake_case name>`` namespace (``AUDIT_ACTION_PATTERN``) is
+        recorded; the caller kind, team, org and source component come from the
+        server, never from the block.
         The record carries the node, provider, collection, at most
         ``AUDIT_OBJECT_IDS_MAX`` object ids, the caller kind and team, the source
         component, the rows changed and the outcome; never content or vectors.
@@ -226,7 +235,7 @@ class DataCommands(DAPConn):
         if not isinstance(audit, dict):
             return
         action = audit.get('action')
-        if not isinstance(action, str) or not action:
+        if not isinstance(action, str) or not AUDIT_ACTION_PATTERN.fullmatch(action):
             return
 
         def _text(value: Any) -> Optional[str]:

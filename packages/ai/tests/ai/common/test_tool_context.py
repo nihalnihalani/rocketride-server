@@ -865,6 +865,48 @@ def test_results_without_an_audit_block_are_not_audited(monkeypatch, result):
     audit.assert_not_awaited()
 
 
+@pytest.mark.parametrize(
+    'action',
+    [
+        'delete',
+        'shell.exec',
+        'account.delete',
+        'vector.',
+        'vector.Delete',
+        'vector.delete everything',
+        'vector.delete\nforged line',
+        'vector..delete',
+        'vector.' + 'x' * 80,
+        ' vector.delete',
+    ],
+)
+def test_audit_actions_outside_the_vector_namespace_are_not_recorded(monkeypatch, action):
+    """Only a `vector.<snake_case name>` action is recorded, so another node's result cannot pick audit labels."""
+    from ai.account import account
+
+    audit = AsyncMock()
+    monkeypatch.setattr(account, 'audit', audit)
+    result = {'success': True, 'audit': {'action': action, 'object_ids': ['a'], 'rows': 1}}
+    cmd, _task = _data_commands('local-acceptance-key', result=result)
+    response, _request = _process(cmd, {'subcommand': 'tool', 'tool': 'stats', 'nodeId': 'store_1', 'input': {}})
+    assert response['body']['result'] == result
+    audit.assert_not_awaited()
+
+
+@pytest.mark.parametrize('action', ['vector.upsert', 'vector.delete', 'vector.remove_document', 'vector.v2_write'])
+def test_vector_audit_actions_are_recorded(monkeypatch, action):
+    """The write tools' actions are recorded under their own label."""
+    from ai.account import account
+
+    audit = AsyncMock()
+    monkeypatch.setattr(account, 'audit', audit)
+    result = {'success': True, 'audit': {'action': action, 'object_ids': ['a'], 'rows': 1}}
+    cmd, _task = _data_commands('local-acceptance-key', result=result)
+    _process(cmd, {'subcommand': 'tool', 'tool': 'upsert', 'nodeId': 'store_1', 'input': {}})
+    audit.assert_awaited_once()
+    assert audit.await_args.kwargs['reason'] == action
+
+
 def test_audit_failure_does_not_fail_the_call(monkeypatch):
     """An audit backend error is logged, and the tool answer still reaches the client."""
     from ai.account import account
