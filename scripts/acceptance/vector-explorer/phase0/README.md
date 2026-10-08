@@ -53,6 +53,7 @@ the end (set `VX_PHASE0_KEEP=1` to leave them running).
 | `RR_TEST_APIKEY` | `local-acceptance-key` | sign-in on an OSS engine without `ROCKETRIDE_APIKEY` |
 | `VX_PHASE0_FIXTURES` | `postgres` | which `start_fixtures.py` fixtures G0-1/G0-2 start (comma-separated) |
 | `VX_PHASE0_COLLECTION` | `vx_phase0_docs` | the table / collection those fixtures use |
+| `VX_PHASE0_RR_TABLE` | `vx_phase0_rr` | the table the RocketRide Vector fixture uses |
 | `VX_PHASE0_RAW_COLLECTION` | `vx_phase0_raw` | the (empty) table the G0-1b raw-template chat reads |
 | `VX_PHASE0_KEEP` | unset | `1` leaves the pins' pipelines running |
 | `OUT_DIR` | `../out` | observations land in `out/phase0/*.json` (git-ignored) |

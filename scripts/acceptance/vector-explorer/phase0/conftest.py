@@ -19,6 +19,7 @@ from phase0_lib import (
     API_KEY,
     ENGINE_URL,
     FIXTURE_COLLECTION,
+    FIXTURE_RR_TABLE,
     FIXTURE_PROJECT_IDS,
     FIXTURES,
     PROBE_NODE_PATH,
@@ -86,7 +87,13 @@ def probe(engine: str) -> Iterator[Dict[str, Dict[str, Any]]]:
 
 def _start_fixtures(*extra: str) -> subprocess.CompletedProcess:
     """Run start_fixtures.py with this run's engine, fixtures and collection."""
-    env = {**os.environ, 'ENGINE_URL': ENGINE_URL, 'RR_TEST_APIKEY': API_KEY, 'VX_COLLECTION': FIXTURE_COLLECTION}
+    env = {
+        **os.environ,
+        'ENGINE_URL': ENGINE_URL,
+        'RR_TEST_APIKEY': API_KEY,
+        'VX_COLLECTION': FIXTURE_COLLECTION,
+        'VX_RR_TABLE': FIXTURE_RR_TABLE,
+    }
     command = [sys.executable, str(ACC / 'start_fixtures.py'), '--only', ','.join(FIXTURES), *extra]
     # sys.executable is the engine binary under `./engine -m pytest`; it runs from dist/server.
     return subprocess.run(

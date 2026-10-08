@@ -36,6 +36,7 @@ OUT_DIR = Path(os.environ.get('OUT_DIR', str(ACC / 'out'))) / 'phase0'
 # collection they use (kept apart from the demo collection other runs ingest into).
 FIXTURES = [k.strip() for k in os.environ.get('VX_PHASE0_FIXTURES', 'postgres').split(',') if k.strip()]
 FIXTURE_COLLECTION = os.environ.get('VX_PHASE0_COLLECTION', 'vx_phase0_docs')
+FIXTURE_RR_TABLE = os.environ.get('VX_PHASE0_RR_TABLE', 'vx_phase0_rr')
 
 # The probe nodes (nodes/test/vx_context_probe) load only with --node_path.
 PROBE_NODE_PATH = REPO / 'nodes' / 'test' / 'vx_context_probe'
