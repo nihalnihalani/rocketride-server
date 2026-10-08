@@ -291,7 +291,7 @@ async function mapSteps(page, box, row) {
 		});
 	} else {
 		await step(steps, 'a text query draws its star and rays (when the embedding node answers)', async () => {
-			const box = page.getByRole('searchbox').first();
+			const box = page.getByRole('searchbox', { name: 'Query' }).first();
 			if (await box.isDisabled()) return 'query disabled: the embedding node is not reachable from the Tools source';
 			await box.fill(QUERY);
 			await page.getByRole('button', { name: 'Run' }).click();

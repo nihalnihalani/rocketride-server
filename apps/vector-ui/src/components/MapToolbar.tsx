@@ -91,6 +91,7 @@ export function MapToolbar(props: MapToolbarProps): React.ReactElement {
 			<label style={MAP_STYLES.group}>
 				<span style={MAP_STYLES.label}>Points</span>
 				<select
+					aria-label="Points"
 					style={MAP_STYLES.select}
 					value={current}
 					disabled={busy}
@@ -111,7 +112,7 @@ export function MapToolbar(props: MapToolbarProps): React.ReactElement {
 			</button>
 			<label style={MAP_STYLES.group}>
 				<span style={MAP_STYLES.label}>Layout</span>
-				<select style={MAP_STYLES.select} value={props.layout} disabled={busy || !sample} onChange={(event) => props.onLayout(event.target.value as MapLayout)}>
+				<select aria-label="Layout" style={MAP_STYLES.select} value={props.layout} disabled={busy || !sample} onChange={(event) => props.onLayout(event.target.value as MapLayout)}>
 					{LAYOUTS.map((l) => (
 						<option key={l.id} value={l.id} disabled={l.id === 'tsne' && !!props.tsneReason} title={l.id === 'tsne' ? (props.tsneReason ?? undefined) : undefined}>
 							{l.label}
@@ -126,7 +127,7 @@ export function MapToolbar(props: MapToolbarProps): React.ReactElement {
 			) : null}
 			<label style={MAP_STYLES.group}>
 				<span style={MAP_STYLES.label}>Colour by</span>
-				<select style={MAP_STYLES.select} value={props.colourBy} onChange={(event) => props.onColourBy(event.target.value as ColourBy)}>
+				<select aria-label="Colour by" style={MAP_STYLES.select} value={props.colourBy} onChange={(event) => props.onColourBy(event.target.value as ColourBy)}>
 					{COLOURS.map((c) => (
 						<option key={c.id} value={c.id}>
 							{c.label}
@@ -143,7 +144,7 @@ export function MapToolbar(props: MapToolbarProps): React.ReactElement {
 			>
 				<label style={MAP_STYLES.group}>
 					<span style={MAP_STYLES.label}>Query</span>
-					<input style={MAP_STYLES.input} type="search" value={text} maxLength={8000} placeholder="Place a question on the map" disabled={!props.query.enabled} onChange={(event) => setText(event.target.value)} />
+					<input aria-label="Query" style={MAP_STYLES.input} type="search" value={text} maxLength={8000} placeholder="Place a question on the map" disabled={!props.query.enabled} onChange={(event) => setText(event.target.value)} />
 				</label>
 				<button type="submit" style={MAP_STYLES.button} disabled={!props.query.enabled || busy || text.trim() === ''}>Run</button>
 			</form>

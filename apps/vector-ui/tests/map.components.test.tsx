@@ -120,6 +120,8 @@ test('MapToolbar: sizes capped by the node\'s limits, t-SNE disabled above 1,000
 	assert.match(out, /<option value="tsne" disabled=""/);
 	assert.match(out, /Text queries need the embedding node reachable from the Tools source/);
 	assert.match(out, /<button[^>]*disabled=""[^>]*>Run<\/button>/);
+	// Each control is named explicitly: Chrome names a label-wrapped select by its selected option otherwise.
+	for (const name of ['Points', 'Layout', 'Colour by', 'Query']) assert.match(out, new RegExp(`aria-label="${name}"`), `${name} is named`);
 	assert.match(out, /aria-pressed="true"[^>]*>Lasso/);
 	assert.match(out, /aria-pressed="false"[^>]*>Table/);
 	const busy = html(<MapToolbar {...base} busy="Laying out…" canCancel query={{ enabled: true, reason: null }} />);
