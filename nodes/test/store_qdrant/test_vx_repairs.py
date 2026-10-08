@@ -18,7 +18,9 @@ a real Qdrant):
 - semantic search applies the score floor through ``effectiveFloor``;
 - a non-zero offset on semantic search is a ``ValueError``;
 - soft delete updates ``meta.isDeleted`` without wiping the rest of ``meta``;
-- distance metrics (Euclid, Manhattan) score closer points higher.
+- distance metrics (Euclid, Manhattan) score closer points higher;
+- ``Dot`` scores ``(1 + dot) / 2`` (a perfect unit-vector match is 1.0);
+- ``getPaths(parent=...)`` matches the exact path, never a token of it.
 """
 
 from __future__ import annotations
@@ -194,6 +196,58 @@ def test_distance_metrics_score_closer_points_higher(similarity):
     assert scores['near'] == pytest.approx(1.0)
     assert scores['near'] > scores['far'] > 0
     assert store.scoreInfo()['formula'] == '1 / (1 + distance)'
+
+
+def test_dot_scores_spread_over_the_whole_range():
+    store = make_store(drv, similarity='Dot')
+    _ingest(
+        store,
+        [
+            make_doc('same', 0, [1, 0, 0]),
+            make_doc('orthogonal', 0, [0, 1, 0]),
+            make_doc('opposite', 0, [-1, 0, 0]),
+        ],
+    )
+    query = QuestionText(text='q')
+    query.embedding = [1.0, 0.0, 0.0]
+    query.embedding_model = 'unit-model'
+    docs = store.searchSemantic(query, vx_filter(limit=10, minScore=-math.inf))
+    scores = {d.metadata.objectId: round(d.score, 4) for d in docs}
+    assert scores == {'same': 1.0, 'orthogonal': 0.5, 'opposite': 0.0}
+
+    floored = store.searchSemantic(query, DocFilter(limit=10))
+    assert {d.metadata.objectId for d in floored} == {'same', 'orthogonal'}
+
+    info = store.scoreInfo()
+    assert info['formula'] == '(1 + dot) / 2'
+    assert 'range' in info and info['range'] is None  # unbounded unless the vectors are unit length
+
+
+def test_get_paths_matches_the_exact_parent_and_keeps_legacy_rows():
+    store = make_store(drv)
+    _ingest(
+        store,
+        [
+            make_doc('doc-a', 0, [1, 0, 0], parent='C:/p/harrier_handbook.md'),
+            make_doc('doc-b', 0, [0, 1, 0], parent='C:/p/harrier_handbook.md.bak'),
+        ],
+    )
+    # A row written before isDeleted existed (no flag at all) is an active document.
+    store.client.upsert(
+        store.collection,
+        points=[
+            drv.PointStruct(
+                id=str(uuid.uuid4()),
+                vector=[0.0, 0.0, 1.0],
+                payload={'content': 'old', 'meta': {'objectId': 'old', 'chunkId': 0, 'parent': 'C:/p/old.md'}},
+            )
+        ],
+    )
+
+    assert store.getPaths(parent='C:/p/harrier_handbook.md') == {'C:/p/harrier_handbook.md': 'doc-a'}
+    assert store.getPaths(parent='harrier_handbook') == {}
+    assert store.getPaths(parent='C:/p/old.md') == {'C:/p/old.md': 'old'}
+    assert set(store.getPaths()) == {'C:/p/harrier_handbook.md', 'C:/p/harrier_handbook.md.bak', 'C:/p/old.md'}
 
 
 def test_soft_delete_keeps_the_rest_of_the_metadata():

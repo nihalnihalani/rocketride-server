@@ -131,7 +131,7 @@ def test_describe_an_existing_collection():
     assert info.metric == 'cosine'
     assert info.dimension == 6
     assert info.model == 'unit-model'
-    assert info.index == {'type': 'hnsw', 'params': {'m': 16, 'ef_construct': 100}}
+    assert info.index == {'type': 'hnsw', 'params': {'m': 16, 'ef_construction': 100}}
     assert 'brute_force_search' in info.caveats
     text = repr(info)
     assert '127.0.0.1' not in text and '6333' not in text

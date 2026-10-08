@@ -446,13 +446,12 @@ class Store(DocumentStoreBase):
         return Filter(must=must, must_not=deleted_must_not or None)
 
     def _rawToScore(self, raw: float) -> float:
-        """Map Qdrant's raw score to [0, 1], higher meaning closer."""
-        if self.similarity == 'Cosine':
-            return (raw + 1) / 2
+        """Map Qdrant's raw score to a score where higher means closer ([0, 1] for unit vectors)."""
         if self.similarity in _DISTANCE_METRICS:
             # Euclid/Manhattan answer a distance: smaller is closer.
             return float(1.0 / (1.0 + max(float(raw), 0.0)))
-        return float(1.0 / (1.0 + np.exp(raw / -100)))
+        # Cosine and Dot answer a similarity in [-1, 1] for unit vectors.
+        return (float(raw) + 1.0) / 2.0
 
     def _convertToDocs(self, points: List[ScoredPoint] | List[Record], floor: float = MIN_RELEVANCE_SCORE) -> List[Doc]:
         """
@@ -613,21 +612,15 @@ class Store(DocumentStoreBase):
         if not self.doesCollectionExist():
             return {}
 
-        # Build the base: chunk 0 only, exclude the internal schema document
-        must: List[models.Condition] = [
-            FieldCondition(key='meta.chunkId', match=models.MatchValue(value=0)),
-            FieldCondition(key='meta.isDeleted', match=models.MatchValue(value=False)),
-        ]
-        must_not: List[models.Condition] = [
-            FieldCondition(key='meta.objectId', match=models.MatchValue(value='schema')),
-        ]
+        # Chunk 0 of the active documents (rows without an isDeleted flag count as
+        # active), never the internal schema document
+        conditions: List[models.Condition] = [FieldCondition(key='meta.chunkId', match=models.MatchValue(value=0))]
 
-        # If parent specified, match on it
+        # If parent specified, match the exact path (a text match would also take a token of it)
         if parent is not None:
-            must.append(FieldCondition(key='meta.parent', match=models.MatchText(text=parent)))
+            conditions.append(FieldCondition(key='meta.parent', match=models.MatchValue(value=parent)))
 
-        # Build filter excluding schema docs
-        filter = Filter(must=must, must_not=must_not)
+        filter = self._documentsFilter('active', None, *conditions)
 
         # Build up the path list
         paths: Dict[str, str] = {}
@@ -1032,14 +1025,15 @@ class Store(DocumentStoreBase):
     def scoreInfo(self) -> Dict[str, Any]:
         """How ``Doc.score`` is derived from Qdrant's raw score for this collection's distance."""
         if self.similarity == 'Cosine':
-            formula = '(1 + cosine_similarity) / 2'
+            formula, value_range = '(1 + cosine_similarity) / 2', [0, 1]
         elif self.similarity in _DISTANCE_METRICS:
-            formula = '1 / (1 + distance)'
+            formula, value_range = '1 / (1 + distance)', [0, 1]
         else:
-            formula = '1 / (1 + exp(-dot / 100))'
+            # [0, 1] only for unit-length vectors; a dot product is otherwise unbounded.
+            formula, value_range = '(1 + dot) / 2', None
         return {
             'formula': formula,
-            'range': [0, 1],
+            'range': value_range,
             'higher_is_better': True,
             'floor': MIN_RELEVANCE_SCORE,
             'threshold': self.threshold_search,
@@ -1085,7 +1079,8 @@ class Store(DocumentStoreBase):
         dimension = _int_or_none(getattr(vectors, 'size', None)) or (self.vectorSize or None)
         index = None
         if hnsw is not None:
-            index = {'type': 'hnsw', 'params': {'m': hnsw.m, 'ef_construct': hnsw.ef_construct}}
+            # The explorer's parameter names (Qdrant calls ef_construction 'ef_construct').
+            index = {'type': 'hnsw', 'params': {'m': hnsw.m, 'ef_construction': hnsw.ef_construct}}
         return vx.StoreInfo(
             backend='qdrant',
             backend_version=version,
