@@ -827,6 +827,37 @@ class TestHooks:
         )
         assert used_f == 'first' and [d.metadata.chunkId for d in first] == [0, 1, 2]
 
+    def test_seeded_samples_depend_on_the_seed_and_leave_no_seed_in_the_session(self, dsn, table, stores):
+        """A seed orders the sample without seeding the session: behind a pooler that session serves others next."""
+        rng = np.random.default_rng(48)
+        store = _open(dsn, table, stores)
+        for i in range(8):
+            _ingest(store, rng, f'doc{i}', 6)
+        s = _schema()
+
+        def keys(seed, strategy, n=10):
+            docs, _ = store.sampleChunks(n=n, seed=seed, strategy=strategy, docFilter=s.DocFilter(), include_keys=[])
+            return [(d.metadata.objectId, d.metadata.chunkId) for d in docs]
+
+        def session_random(cur):
+            cur.execute('SELECT random()')
+            return cur.fetchone()[0]
+
+        for strategy in ('random', 'stratified'):
+            assert keys(5, strategy, 20) == keys(5, strategy, 20)
+            assert {tuple(keys(seed, strategy, 20)) for seed in (5, 6, 7)} != {tuple(keys(5, strategy, 20))}
+        # Stratified: every document is picked once before any is picked twice.
+        per_doc = {}
+        for oid, _cid in keys(9, 'stratified', 12):
+            per_doc[oid] = per_doc.get(oid, 0) + 1
+        assert len(per_doc) == 8 and set(per_doc.values()) <= {1, 2}
+
+        after = []
+        for _ in range(3):
+            keys(42, 'random')
+            after.append(store._db.run_read(session_random))
+        assert len(set(after)) == 3, after
+
     def test_remove_counted_reports_rows_and_never_removes_the_control_record(self, dsn, table, stores, admin):
         rng = np.random.default_rng(47)
         store = _open(dsn, table, stores)

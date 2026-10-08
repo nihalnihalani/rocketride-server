@@ -876,11 +876,9 @@ class PgVectorStore(DocumentStoreBase):
         pinned = [(str(o), int(c)) for o, c in include_keys or []]
         if pinned:
             where.not_keys = pinned
-        statement = self._sql.sample(self._columns_now(), strategy, where, count)
-        seed_statement = self._sql.setseed(seed)
+        statement = self._sql.sample(self._columns_now(), strategy, where, count, seed)
 
         def work(cur):
-            cur.execute(*seed_statement)
             cur.execute(*statement)
             return self._fetch_dicts(cur)
 

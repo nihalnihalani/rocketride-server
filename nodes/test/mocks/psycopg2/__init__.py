@@ -34,7 +34,8 @@ driver change cannot pass here silently.
 
 What it models: tables with their columns, indexes and rows; ``WHERE``
 predicates the driver builds (``=``, ``<>``, ``ANY``, ranges, key pairs,
-``ILIKE``); cosine / L2 / inner-product distances; ``setseed`` + ``random()``;
+``ILIKE``); cosine / L2 / inner-product distances; the seeded id hash samples are
+ordered by (``hashtextextended``, modelled by a stable keyed hash);
 ``DELETE`` row counts; transactions (a read-only transaction refuses writes, a
 failed statement aborts the transaction until rollback, rollback undoes
 writes); errors with their SQLSTATE. Tests may make the next statement with a
@@ -48,9 +49,9 @@ suites (``test_store_postgres_full.py``, ``test_rocketride_db_full.py``) are.
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import math
-import random
 import re
 import threading
 
@@ -168,6 +169,12 @@ def _parse_vector(text: Any) -> Optional[List[float]]:
     if isinstance(text, (list, tuple)):
         return [float(v) for v in text]
     return [float(v) for v in json.loads(text)]
+
+
+def _id_hash(row_id: Any, seed: int) -> int:
+    """A stable keyed hash of a row id: what ``hashtextextended("id"::text, seed)`` stands for here."""
+    digest = hashlib.blake2b(f'{seed}:{row_id}'.encode(), digest_size=8).digest()
+    return int.from_bytes(digest, 'big', signed=True)
 
 
 def _like(pattern: str, text: Optional[str]) -> bool:
@@ -601,36 +608,35 @@ class MockCursor:
         rows = self._ordered([r for r in table.rows.values() if test(r)], ('objectid', 'chunkid'))
         self._rows_out(self._read_list(body), rows)
 
-    def _op_setseed(self, body: str, params: List[Any], tag: str) -> None:
-        self.connection._random = random.Random(params[0])
-        self._set(['setseed'], [(None,)])
-
     def _op_sample(self, body: str, params: List[Any], tag: str) -> None:
         table = self._table(body)
         strategy = tag[len('sample_') :]
-        match = re.search(r' FROM "\w+" WHERE (.*?)(?: ORDER BY |\), "pick")', body, re.S)
+        if 'setseed' in body or 'random()' in body:
+            raise NotImplementedError('psycopg2 test double: samples are ordered by a seeded id hash')
         it = iter(params)
+        seeds = [next(it), next(it)] if strategy == 'stratified' else []
+        match = re.search(r' FROM "\w+" WHERE (.*?)(?: ORDER BY |\), "pick")', body, re.S)
         test = _predicate(match.group(1), it)
+        if strategy == 'random':
+            seeds = [next(it)]
         limit = next(it)
-        rng = self.connection._random
         rows = [r for r in self._ordered(list(table.rows.values()), ('id',)) if test(r)]
         if strategy == 'random':
-            keyed = [(rng.random(), r) for r in rows]
-            picked = [r for _k, r in sorted(keyed, key=lambda p: p[0])[:limit]]
+            picked = sorted(rows, key=lambda r: (_id_hash(r.get('id'), seeds[0]), r.get('id')))[:limit]
         elif strategy == 'stratified':
-            by_doc: Dict[str, List[Tuple[float, Dict[str, Any]]]] = {}
+            by_doc: Dict[str, List[Dict[str, Any]]] = {}
             for r in rows:
-                by_doc.setdefault(r.get('objectid'), []).append((rng.random(), r))
+                by_doc.setdefault(r.get('objectid'), []).append(r)
             ranked = []
             for entries in by_doc.values():
-                entries.sort(key=lambda p: (p[1].get('chunkid') != 0, p[0]))
-                for rn, (_k, r) in enumerate(entries, start=1):
-                    ranked.append((rn, rng.random(), r))
-            ranked.sort(key=lambda p: (p[0], p[1]))
-            picked = [r for _rn, _k, r in ranked[:limit]]
+                entries.sort(key=lambda r: (r.get('chunkid') != 0, _id_hash(r.get('id'), seeds[0]), r.get('id')))
+                for rn, r in enumerate(entries, start=1):
+                    ranked.append((rn, _id_hash(r.get('id'), seeds[1]), r.get('id'), r))
+            ranked.sort(key=lambda p: p[:3])
+            picked = [p[3] for p in ranked[:limit]]
         else:
             picked = self._ordered(rows, ('parent', 'objectid', 'chunkid'))[:limit]
-        final = re.search(r'SELECT (.*?) FROM "\w+" JOIN "pick"', body, re.S)
+        final = re.search(r'^.*\bSELECT (.*?) FROM "\w+" JOIN "pick"', body, re.S)  # the outer SELECT
         self._rows_out(_select_names(final.group(1)), self._ordered(picked, ('objectid', 'chunkid')))
 
     # --- writes ----------------------------------------------------------------
@@ -717,7 +723,6 @@ class MockConnection:
         self._read_only = False
         self._snapshots: Dict[str, MockTable] = {}
         self._created: List[str] = []
-        self._random = random.Random(0)
         MockConnection.opened.append(self)
 
     def cursor(self, *args: Any, **kwargs: Any) -> MockCursor:

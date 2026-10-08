@@ -500,31 +500,41 @@ class Statements:
             params,
         )
 
-    @staticmethod
-    def setseed(seed: int) -> Tuple[sql.Composed, List[Any]]:
-        """``setseed`` for the transaction's ``random()``: a seed in [-1, 1) derived from the integer seed."""
-        value = (int(seed) % 2_000_003) / 2_000_003.0 * 2.0 - 1.0
-        return _q('setseed', 'SELECT setseed(%s)'), [value]
-
-    def sample(self, columns: Sequence[str], strategy: str, where: Where, n: int) -> Tuple[sql.Composed, List[Any]]:
+    def sample(
+        self, columns: Sequence[str], strategy: str, where: Where, n: int, seed: int = 0
+    ) -> Tuple[sql.Composed, List[Any]]:
         """Pick ``n`` rows (``random``, ``stratified`` or ``first``) and read them with their vectors.
 
-        ``stratified`` takes one row of every document before a second one of any:
-        each document's rows are ranked by ``random()`` with chunk 0 first, and
-        the ranks are taken in order. The ids are picked first so that only the
-        chosen rows are read with their vectors.
+        The order is a seeded hash of each row's id (``hashtextextended``), so
+        the same seed picks the same rows and nothing is set for the session
+        (``setseed`` would seed the session's ``random()``, which a
+        transaction-mode pooler hands to the next client). ``stratified``
+        takes one row of every document before a second one of any: each
+        document's rows are ranked with chunk 0 first, then by one hash, and
+        the ranks are taken in the order of a second, independent hash. The
+        ids are picked first so that only the chosen rows are read with their
+        vectors.
         """
         pred, params = where.build()
+        first, second = _sample_seeds(seed)
         if strategy == 'stratified':
+            # Placeholders in text order: the two hash seeds, the filter, the limit.
             pick = (
                 'WITH "ranked" AS (SELECT "id", row_number() OVER (PARTITION BY "objectid" '
-                'ORDER BY ("chunkid" = 0) DESC, random()) AS "rn" FROM {t} WHERE {w}), '
-                '"pick" AS (SELECT "id" FROM "ranked" ORDER BY "rn", random() LIMIT %s) '
+                'ORDER BY ("chunkid" = 0) DESC, hashtextextended("id"::text, %s), "id") AS "rn", '
+                'hashtextextended("id"::text, %s) AS "draw" FROM {t} WHERE {w}), '
+                '"pick" AS (SELECT "id" FROM "ranked" ORDER BY "rn", "draw", "id" LIMIT %s) '
             )
+            values = [first, second] + params + [int(n)]
         elif strategy == 'random':
-            pick = 'WITH "pick" AS (SELECT "id" FROM {t} WHERE {w} ORDER BY random() LIMIT %s) '
+            pick = (
+                'WITH "pick" AS (SELECT "id" FROM {t} WHERE {w} '
+                'ORDER BY hashtextextended("id"::text, %s), "id" LIMIT %s) '
+            )
+            values = params + [first, int(n)]
         else:
             pick = 'WITH "pick" AS (SELECT "id" FROM {t} WHERE {w} ORDER BY "parent", "objectid", "chunkid" LIMIT %s) '
+            values = params + [int(n)]
         return (
             _q(
                 'sample_' + strategy,
@@ -533,7 +543,7 @@ class Statements:
                 t=self.t,
                 w=pred,
             ),
-            params + [int(n)],
+            values,
         )
 
     # --- writes -------------------------------------------------------------
@@ -564,6 +574,13 @@ class Statements:
     def set_deleted(self, where: Where, value: bool) -> Tuple[sql.Composed, List[Any]]:
         pred, params = where.build()
         return _q('set_deleted', 'UPDATE {t} SET "isdeleted" = %s WHERE {w}', t=self.t, w=pred), [bool(value)] + params
+
+
+def _sample_seeds(seed: int) -> Tuple[int, int]:
+    """Two independent ``bigint`` hash seeds derived from the sample's integer seed."""
+    first = int(seed or 0) % (1 << 63)
+    second = (first * 6364136223846793005 + 1442695040888963407) % (1 << 63)
+    return first, second
 
 
 def _index_name(table: str, suffix: str) -> str:

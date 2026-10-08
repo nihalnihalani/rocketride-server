@@ -644,6 +644,25 @@ class TestPgVectorTransactions:
         assert gate.acquire(0.01)
         assert not gate.acquire(0.05)  # the only slot is taken: a bounded wait gives up
 
+    def test_seeded_samples_set_nothing_for_the_session(self, mock_rv):
+        from ai.common.schema import DocFilter
+
+        store = _make_store(mock_rv, {'collection': 'rr_vec', 'similarity': 'cosine'})
+        for i in range(6):
+            store.addChunks([_doc(f'd{i}', c, [1, 0, 0, 0, c]) for c in range(4)])
+
+        def keys(seed, strategy):
+            docs, _ = store.sampleChunks(n=9, seed=seed, strategy=strategy, docFilter=DocFilter(), include_keys=[])
+            return [(d.metadata.objectId, d.metadata.chunkId) for d in docs]
+
+        for strategy in ('random', 'stratified'):
+            assert keys(3, strategy) == keys(3, strategy)
+            assert any(keys(seed, strategy) != keys(3, strategy) for seed in (4, 5, 6))
+        assert len({oid for oid, _cid in keys(3, 'stratified')}) == 6
+        samples = _statements(mock_rv, 'sample_random') + _statements(mock_rv, 'sample_stratified')
+        assert samples and all('hashtextextended("id"::text, %s)' in text for text in samples)
+        assert not [text for text in _statements(mock_rv) if 'setseed' in text or 'random()' in text]
+
     def test_unreachable_server_error_names_no_host(self, mock_rv):
         from ai.common.store.errors import StoreError
 
