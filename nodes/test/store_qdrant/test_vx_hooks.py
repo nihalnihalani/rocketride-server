@@ -270,23 +270,112 @@ def test_list_documents_filters_by_deleted_and_object_ids_and_never_lists_schema
     assert sorted(i.objectId for i in some) == ['doc-1', 'doc-3']
 
 
-def test_list_documents_caps_the_orphan_sweep(monkeypatch):
+def test_list_documents_finds_low_count_orphans_in_a_large_collection():
+    # Documents without chunk 0 have the fewest rows, so a count-ordered top-N
+    # facet drops them first; well past 1,000 documents they must still be listed.
     store = make_store(drv)
-    _corpus(store, docs=4, chunks=2)
-    monkeypatch.setattr(drv.Store, 'FACET_CAP', 2)
-    _, pages = _all_pages(store, limit=10)
-    assert 'document_count_capped' in pages[-1].caveats
+    batch = [make_doc(f'd{d:05d}', c, [1.0, d % 7, c]) for d in range(1200) for c in range(2)]
+    batch += [make_doc(f'orphan-{i}', 1, [0.0, 1.0, i]) for i in range(2)]  # chunk 0 never written
+    store.addChunks(batch)
+    items, pages = _all_pages(store, limit=500)
+
+    assert len(items) == 1202 and len({i.objectId for i in items}) == 1202
+    assert sorted(i.objectId for i in items if not i.has_first_chunk) == ['orphan-0', 'orphan-1']
+    assert {p.total for p in pages} == {1202}
+    assert all(p.caveats == ['documents_unsorted'] for p in pages)
+    assert store.countDocuments(vx_filter()) == 1202
 
 
-def test_list_documents_refuses_a_forged_cursor():
+def test_list_documents_flags_a_capped_count_and_lists_no_false_orphan(monkeypatch):
+    store = make_store(drv)
+    _corpus(store, docs=5, chunks=2)
+    _delete_point(store, drv.point_id_for('doc-3', 0))
+    monkeypatch.setattr(drv.Store, 'COUNT_DOCUMENTS_CAP', 3)
+    items, pages = _all_pages(store, limit=2)
+
+    assert all('document_count_capped' in p.caveats for p in pages)
+    assert all(p.total is None for p in pages)
+    orphans = {i.objectId for i in items if not i.has_first_chunk}
+    assert orphans <= {'doc-3'}  # capped may miss an orphan, never invent one
+    assert store.countDocuments(vx_filter()) is None
+
+
+def test_list_documents_computes_the_total_once_per_listing(monkeypatch):
+    store = make_store(drv)
+    _corpus(store, docs=7, chunks=2)
+    limits = []
+    facet = store.client.facet
+
+    def spy(*args, **kwargs):
+        limits.append(kwargs.get('limit'))
+        return facet(*args, **kwargs)
+
+    monkeypatch.setattr(store.client, 'facet', spy)
+    first = store.listDocuments(cursor=None, limit=2, object_ids=None, deleted='active', sort='path')
+    assert first.total == 7
+    assert max(limits) > 7  # the first page counts every document once
+
+    limits.clear()
+    second = store.listDocuments(cursor=first.next_cursor, limit=2, object_ids=None, deleted='active', sort='path')
+    assert second.total == 7
+    assert limits and max(limits) <= 3  # later pages facet over their own objectIds only
+
+
+def test_documents_are_counted_without_an_object_id_index():
+    # A collection created outside this driver may lack the keyword index Qdrant needs to facet.
+    store = make_store(drv)
+    _corpus(store, docs=4, chunks=3)
+    _delete_point(store, drv.point_id_for('doc-2', 0))
+    Client._collections[store.collection]['payload_schema'].pop('meta.objectId')
+
+    assert store.countDocuments(vx_filter()) == 4
+    items, pages = _all_pages(store, limit=3)
+    rows = {i.objectId: i for i in items}
+    assert set(rows) == {'doc-0', 'doc-1', 'doc-2', 'doc-3'}
+    assert rows['doc-2'].has_first_chunk is False and rows['doc-2'].chunks == 2
+    assert rows['doc-1'].chunks == 3
+    assert {p.total for p in pages} == {4}
+
+
+def _cursor(state):
+    return base64.urlsafe_b64encode(json.dumps(state).encode()).decode()
+
+
+@pytest.mark.parametrize(
+    'cursor',
+    [
+        'not-a-cursor',
+        _cursor({'ph': 'x'}),
+        _cursor({'ph': 'c', 'p': 'zzz'}),
+        _cursor({'ph': 'c', 'p': -1}),
+        _cursor({'ph': 'c', 'p': True}),
+        _cursor({'ph': 'c', 'p': '{12345678-1234-1234-1234-123456789abc}'}),
+        _cursor({'ph': 'c', 'p': 5, 't': 'many'}),
+        _cursor({'ph': 'o', 'i': 0, 'x': 'yes'}),
+    ],
+)
+def test_list_documents_refuses_a_cursor_it_did_not_issue(cursor):
     store = make_store(drv)
     _corpus(store)
+    Client.calls.clear()
     with pytest.raises(ToolRefusal) as err:
-        store.listDocuments(cursor='not-a-cursor', limit=5, object_ids=None, deleted='active', sort='path')
+        store.listDocuments(cursor=cursor, limit=5, object_ids=None, deleted='active', sort='path')
     assert err.value.code == 'INVALID_INPUT'
-    forged = base64.urlsafe_b64encode(json.dumps({'ph': 'x'}).encode()).decode()
-    with pytest.raises(ToolRefusal):
-        store.listDocuments(cursor=forged, limit=5, object_ids=None, deleted='active', sort='path')
+    assert Client.calls.get('scroll', 0) == 0  # refused before anything reaches the server
+
+
+def test_list_documents_accepts_a_well_formed_point_id_it_did_not_see():
+    # Qdrant starts a scroll at the first id at or after the offset: a valid id is a position, not an error.
+    store = make_store(drv)
+    _corpus(store, docs=3, chunks=1)
+    page = store.listDocuments(
+        cursor=_cursor({'ph': 'c', 'p': '00000000-0000-0000-0000-000000000000'}),
+        limit=10,
+        object_ids=None,
+        deleted='active',
+        sort='path',
+    )
+    assert sorted(i.objectId for i in page.items) == ['doc-0', 'doc-1', 'doc-2']
 
 
 # --- scrollChunks ---------------------------------------------------------------------

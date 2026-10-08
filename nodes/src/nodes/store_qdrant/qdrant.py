@@ -37,7 +37,7 @@ import base64
 import binascii
 import json
 from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Set, Tuple
-from uuid import NAMESPACE_URL, uuid5
+from uuid import NAMESPACE_URL, UUID, uuid5
 import sys
 import numpy as np
 from rocketlib import debug
@@ -207,11 +207,14 @@ class Store(DocumentStoreBase):
     # (nodes/test/test_store_qdrant_full.py) runs on a new and a legacy collection.
     VX_SUPPORT = 'supported'
 
-    # Most distinct objectIds the orphan sweep of listDocuments reads in one facet.
-    FACET_CAP = 1000
-
-    # Most distinct objectIds countDocuments counts exactly; above it the count is unknown (None).
+    # Most distinct objectIds counted exactly (countDocuments, the listing's total and
+    # its sweep for documents without chunk 0); above it the count is unknown (None)
+    # and the listing carries the caveat 'document_count_capped'.
     COUNT_DOCUMENTS_CAP = 10000
+
+    # Most rows read to count documents by scrolling, on a collection whose
+    # meta.objectId has no keyword index (Qdrant refuses to facet on it).
+    FACET_SCROLL_ROWS_CAP = 200000
 
     # Largest sample whose neighbour graph Qdrant computes (search_matrix_offsets
     # restricted to the sample's point ids). The server's memory for that call
@@ -978,12 +981,45 @@ class Store(DocumentStoreBase):
             must.append(FieldCondition(key='meta.objectId', match=models.MatchAny(any=list(object_ids))))
         return Filter(must=must, must_not=list(must_not) + [self._notControl()])
 
-    def _facetCounts(self, flt: Filter, limit: int) -> List[Tuple[str, int]]:
-        """(objectId, matching rows) per distinct objectId, highest counts first; zero counts dropped."""
-        hits = self.client.facet(
-            collection_name=self.collection, key='meta.objectId', facet_filter=flt, limit=limit, exact=True
-        ).hits
-        return [(str(h.value), int(h.count)) for h in hits if int(h.count) > 0]
+    def _canFacetObjectIds(self) -> bool:
+        """Whether meta.objectId has the keyword index Qdrant needs to facet on it (remembered once true)."""
+        if self.__dict__.get('_vxFacetable') == self.collection:
+            return True
+        schema = getattr(self.client.get_collection(collection_name=self.collection), 'payload_schema', None) or {}
+        entry = schema.get('meta.objectId')
+        kind = getattr(entry, 'data_type', entry)
+        if str(getattr(kind, 'value', kind) or '').lower() != 'keyword':
+            return False
+        self.__dict__['_vxFacetable'] = self.collection
+        return True
+
+    def _documentCounts(self, flt: Filter, limit: int) -> Tuple[List[Tuple[str, int]], bool]:
+        """
+        Rows per distinct objectId matching ``flt``, highest counts first, and whether the list is capped.
+
+        At most ``limit`` objectIds; ``capped`` is True when more exist. An exact
+        facet answers it; a collection without a keyword index on meta.objectId
+        (created outside this driver) is counted by scrolling the matching rows
+        instead, at most ``FACET_SCROLL_ROWS_CAP`` of them.
+        """
+        limit = max(1, int(limit))
+        if self._canFacetObjectIds():
+            hits = self.client.facet(
+                collection_name=self.collection, key='meta.objectId', facet_filter=flt, limit=limit + 1, exact=True
+            ).hits
+            counts = [(str(h.value), int(h.count)) for h in hits if int(h.count) > 0]
+            return counts[:limit], len(counts) > limit
+        tally: Dict[str, int] = {}
+        capped = False
+        for read, record in enumerate(self._scrollAll(flt, with_payload=['meta.objectId'], page=1024)):
+            if read >= self.FACET_SCROLL_ROWS_CAP:
+                capped = True
+                break
+            oid = _meta_of(record).get('objectId')
+            if oid is not None:
+                tally[str(oid)] = tally.get(str(oid), 0) + 1
+        counts = sorted(tally.items(), key=lambda kv: (-kv[1], kv[0]))
+        return counts[:limit], capped or len(counts) > limit
 
     # ------------------------------------------------------------------
     # Explorer hooks (docs/development/nodes/vector-tool-contract.md, section 2)
@@ -1084,25 +1120,60 @@ class Store(DocumentStoreBase):
             return 0
         flt = self._convertFilter(docFilter)
         flt.must_not = list(flt.must_not or []) + [self._notControl()]
-        hits = self._facetCounts(flt, self.COUNT_DOCUMENTS_CAP)
-        return None if len(hits) >= self.COUNT_DOCUMENTS_CAP else len(hits)
+        counts, capped = self._documentCounts(flt, self.COUNT_DOCUMENTS_CAP)
+        return None if capped else len(counts)
 
     @staticmethod
     def _encodeCursor(state: Dict[str, Any]) -> str:
         return base64.urlsafe_b64encode(json.dumps(state, separators=(',', ':')).encode()).decode()
 
     @staticmethod
+    def _isPointId(value: Any) -> bool:
+        """An id Qdrant accepts as a scroll offset: an unsigned integer or a hyphenated UUID."""
+        if isinstance(value, bool):
+            return False
+        if isinstance(value, int):
+            return value >= 0
+        if not isinstance(value, str) or len(value) != 36:
+            return False
+        try:
+            UUID(value)
+        except ValueError:
+            return False
+        return True
+
+    @staticmethod
     def _decodeCursor(cursor: Optional[str]) -> Dict[str, Any]:
-        """The listing state in an opaque cursor; a cursor this driver did not issue is refused."""
+        """
+        The listing state in an opaque cursor; a cursor this driver did not issue is refused.
+
+        {'ph': 'c', 'p': next point id} pages the chunk-0 rows, {'ph': 'o', 'i': n}
+        the documents without chunk 0; 't' (total or None) and 'x' (capped)
+        carry the first page's count so later pages do not recount.
+        """
         if cursor is None:
             return {'ph': 'c', 'p': None}
         try:
             state = json.loads(base64.urlsafe_b64decode(str(cursor).encode()).decode())
         except (binascii.Error, UnicodeDecodeError, ValueError):
             state = None
-        valid = isinstance(state, dict) and (
-            (state.get('ph') == 'c' and isinstance(state.get('p'), (str, int)))
-            or (state.get('ph') == 'o' and isinstance(state.get('i'), int) and state['i'] >= 0)
+
+        def count(value: Any) -> bool:
+            return value is None or (isinstance(value, int) and not isinstance(value, bool) and value >= 0)
+
+        valid = (
+            isinstance(state, dict)
+            and (
+                (state.get('ph') == 'c' and Store._isPointId(state.get('p')))
+                or (
+                    state.get('ph') == 'o'
+                    and isinstance(state.get('i'), int)
+                    and not isinstance(state.get('i'), bool)
+                    and state['i'] >= 0
+                )
+            )
+            and count(state.get('t'))
+            and isinstance(state.get('x', False), bool)
         )
         if not valid:
             raise _errors().ToolRefusal(
@@ -1145,30 +1216,38 @@ class Store(DocumentStoreBase):
             rows = list(self._scrollAll(flt))
             return min(rows, key=lambda r: _int_or_none(_meta_of(r).get('chunkId')) or 0) if rows else None
 
-    def _orphans(self, deleted: str, object_ids: Optional[Sequence[str]]) -> Tuple[List[Tuple[str, int]], bool]:
-        """Documents without a chunk-0 row: ([(objectId, rows)] sorted by id, capped?)."""
-        hits = self._facetCounts(self._documentsFilter(deleted, object_ids), self.FACET_CAP)
-        capped = len(hits) >= self.FACET_CAP
-        counts = dict(hits)
+    def _orphans(
+        self, deleted: str, object_ids: Optional[Sequence[str]], every: Tuple[List[Tuple[str, int]], bool]
+    ) -> Tuple[List[Tuple[str, int]], bool]:
+        """
+        Documents without a chunk-0 row: ([(objectId, rows)] sorted by id, capped?).
+
+        ``every`` is (rows per document, capped) over all the documents; the
+        documents that do have chunk 0 come from a second count over the
+        chunk-0 rows. When ``every`` is capped that count is restricted to the
+        ids it holds, so a capped sweep may miss a document but never lists
+        one that has chunk 0.
+        """
+        counts, capped = every
+        first = FieldCondition(key='meta.chunkId', match=MatchValue(value=0))
+        scope = [oid for oid, _ in counts] if capped else object_ids
         with_first: Set[str] = set()
-        ids = list(counts)
-        for start in range(0, len(ids), _SCROLL_PAGE):
-            batch = ids[start : start + _SCROLL_PAGE]
-            first = FieldCondition(key='meta.chunkId', match=MatchValue(value=0))
-            flt = self._documentsFilter(deleted, batch, first)
-            for record in self._scrollAll(flt, with_payload=['meta']):
-                with_first.add(str(_meta_of(record).get('objectId')))
-        orphans = sorted((oid, n) for oid, n in counts.items() if oid not in with_first)
-        return orphans, capped
+        if counts:
+            found, _ = self._documentCounts(self._documentsFilter(deleted, scope, first), len(counts))
+            with_first = {oid for oid, _ in found}
+        return sorted((oid, n) for oid, n in counts if oid not in with_first), capped
 
     def listDocuments(self, *, cursor, limit, object_ids, deleted, sort):
         """
         One page of documents: chunk-0 rows in storage order, then documents without chunk 0.
 
-        Chunk counts come from an exact facet over the page's objectIds; the
-        documents without a first chunk are found by a facet over every objectId
-        (at most ``FACET_CAP``; beyond that the caveat ``document_count_capped``).
-        Rows are not sorted by path (``sorted=False``); each objectId is listed once.
+        The first page counts every document once (an exact facet, at most
+        ``COUNT_DOCUMENTS_CAP``; beyond that total is None and the caveat
+        ``document_count_capped``) and later pages carry that total in the
+        cursor. Chunk and table counts come from facets over the page's
+        objectIds. Documents without a first chunk are every document minus
+        those with a chunk-0 row. Rows are not sorted by path (``sorted=False``);
+        each objectId is listed once.
         """
         vx = _vx()
         limit = max(1, int(limit))
@@ -1180,11 +1259,34 @@ class Store(DocumentStoreBase):
             )
 
         ids = None if object_ids is None else [str(o) for o in object_ids if str(o) != CONTROL_OBJECT_ID]
-        total_hits = self._facetCounts(self._documentsFilter(deleted, ids), self.COUNT_DOCUMENTS_CAP)
-        total = None if len(total_hits) >= self.COUNT_DOCUMENTS_CAP else len(total_hits)
-        items = []
-        next_cursor: Optional[str] = None
+        memo: Dict[str, Tuple[List[Tuple[str, int]], bool]] = {}
 
+        def every() -> Tuple[List[Tuple[str, int]], bool]:
+            if 'every' not in memo:
+                memo['every'] = self._documentCounts(self._documentsFilter(deleted, ids), self.COUNT_DOCUMENTS_CAP)
+            return memo['every']
+
+        if cursor is None:
+            counted, capped = every()
+            total: Optional[int] = None if capped else len(counted)
+        else:
+            total, capped = state.get('t'), bool(state.get('x', False))
+
+        def page(items: List[Any], next_state: Optional[Dict[str, Any]]):
+            if capped and 'document_count_capped' not in caveats:
+                caveats.append('document_count_capped')
+            next_cursor = None if next_state is None else self._encodeCursor({**next_state, 't': total, 'x': capped})
+            return vx.DocPage(
+                items=items,
+                next_cursor=next_cursor,
+                total=total,
+                counts_exact=True,
+                distinct=True,
+                sorted=False,
+                caveats=caveats,
+            )
+
+        items = []
         if state['ph'] == 'c':
             first = FieldCondition(key='meta.chunkId', match=MatchValue(value=0))
             records, next_point = self.client.scroll(
@@ -1206,46 +1308,28 @@ class Store(DocumentStoreBase):
             counts: Dict[str, int] = {}
             tables: Dict[str, int] = {}
             if page_ids:
-                counts = dict(self._facetCounts(self._documentsFilter(deleted, page_ids), len(page_ids)))
+                counts = dict(self._documentCounts(self._documentsFilter(deleted, page_ids), len(page_ids))[0])
                 is_table = FieldCondition(key='meta.isTable', match=MatchValue(value=True))
-                tables = dict(self._facetCounts(self._documentsFilter(deleted, page_ids, is_table), len(page_ids)))
+                tables = dict(
+                    self._documentCounts(self._documentsFilter(deleted, page_ids, is_table), len(page_ids))[0]
+                )
             for record in unique:
                 oid = str(_meta_of(record).get('objectId'))
                 items.append(self._documentRow(record, counts.get(oid), tables.get(oid, 0), True))
             if next_point is not None:
-                next_cursor = self._encodeCursor({'ph': 'c', 'p': next_point})
-                return vx.DocPage(
-                    items=items,
-                    next_cursor=next_cursor,
-                    total=total,
-                    counts_exact=True,
-                    distinct=True,
-                    sorted=False,
-                    caveats=caveats,
-                )
+                return page(items, {'ph': 'c', 'p': next_point})
             state = {'ph': 'o', 'i': 0}
 
         # The chunk-0 rows are exhausted: fill the page with documents that have no chunk 0.
-        orphans, capped = self._orphans(deleted, ids)
-        if capped:
-            caveats.append('document_count_capped')
+        orphans, swept_capped = self._orphans(deleted, ids, every())
+        capped = capped or swept_capped
         start = state['i']
         room = max(0, limit - len(items))
         for oid, rows in orphans[start : start + room]:
             record = self._firstRow(oid, deleted)
             if record is not None:
                 items.append(self._documentRow(record, rows, None, False))
-        if start + room < len(orphans):
-            next_cursor = self._encodeCursor({'ph': 'o', 'i': start + room})
-        return vx.DocPage(
-            items=items,
-            next_cursor=next_cursor,
-            total=total,
-            counts_exact=True,
-            distinct=True,
-            sorted=False,
-            caveats=caveats,
-        )
+        return page(items, {'ph': 'o', 'i': start + room} if start + room < len(orphans) else None)
 
     def scrollChunks(self, objectId: str, *, after_chunk: int, limit: int, deleted: str):
         """The chunks of one document after ``after_chunk``, in chunk order, without vectors."""
