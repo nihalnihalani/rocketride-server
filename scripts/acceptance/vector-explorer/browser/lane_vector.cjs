@@ -24,6 +24,7 @@
  *   re-uploading a stored path asks before replacing (Cancel focused); Cancel
  *     sends nothing; once on 127.0.0.1 and once on the LAN origin (LAN_URL)
  *   a chat answer carries at least one source; "open" lands on that chunk
+ *   the Map tab draws one point per sampled chunk (the canvas's data-points)
  *   trash: Cancel is focused, Cancel sends nothing, Confirm removes exactly
  *     that document and the stats drop
  *   the 1,500-document store loads to completion with the progress line and
@@ -71,6 +72,11 @@ const UI = {
 	loading: /Loading documents…/,
 	readOnly: /Read-only/,
 	logout: 'Log out',
+	consoleTab: /^Console$/,
+	mapTab: /^Map$/,
+	// The map canvas carries the number of points it drew.
+	mapPoints: '[data-points]',
+	defaultSample: 1000,
 };
 
 fs.mkdirSync(out, { recursive: true });
@@ -250,6 +256,13 @@ async function uploadFolder(page, dir) {
 	await page.locator('input[type="file"][webkitdirectory]').first().setInputFiles(dir);
 }
 
+/** Click a view switch ("Console", "Map"): a tab, or a button where the header uses buttons. */
+async function switchView(page, name) {
+	const tab = page.getByRole('tab', { name }).first();
+	if (await tab.isVisible().catch(() => false)) return tab.click();
+	return page.getByRole('button', { name }).first().click();
+}
+
 async function focusedText(page) {
 	return page.evaluate(() => (document.activeElement ? document.activeElement.textContent || '' : ''));
 }
@@ -381,6 +394,17 @@ async function main() {
 			await opens.first().click();
 			await page.waitForTimeout(1000);
 			return /#\s?\d+|chunk/i.test(await bodyText(page)) ? true : 'no chunk shown after open';
+		});
+
+		await step(page, 'the Map tab draws one point per sampled chunk', async () => {
+			await switchView(page, UI.mapTab);
+			const canvas = page.locator(UI.mapPoints).first();
+			await canvas.waitFor({ timeout: 90000 });
+			const drawn = Number(await canvas.getAttribute('data-points'));
+			const stats = await storeTool('stats', { mode: 'full' });
+			const expected = Math.min(Number(stats.chunks), UI.defaultSample);
+			await switchView(page, UI.consoleTab);
+			return stats.success === true && drawn === expected && drawn > 0 ? true : `drawn ${drawn}, expected ${expected}`;
 		});
 
 		await step(page, 'trash: Cancel focused and sending nothing, Confirm removes exactly that document', async () => {
