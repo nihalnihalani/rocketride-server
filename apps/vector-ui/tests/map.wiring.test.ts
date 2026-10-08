@@ -61,3 +61,11 @@ test('the view samples on first open with the node\'s default size, sends neighb
 	assert.match(view, /data-knn-overlap=/);
 	assert.match(view, /data-pca-overlap=/);
 });
+
+test('the browser lanes can read the map\'s state: tooltip, query, rays, layout, points', () => {
+	const view = read('views/MapView.tsx');
+	assert.match(view, /data-query-state=/);
+	assert.match(view, /data-rays=\{rays\.length\}/);
+	assert.match(view, /data-layout-state=\{layoutState\}/);
+	assert.match(read('components/PointCanvas.tsx'), /data-map-tooltip/);
+});

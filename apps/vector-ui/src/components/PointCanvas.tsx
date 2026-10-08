@@ -515,7 +515,7 @@ export function PointCanvas(props: PointCanvasProps): React.ReactElement {
 			<canvas ref={canvasRef} style={LAYER} aria-hidden="true" />
 			<canvas ref={overlayRef} style={{ ...LAYER, pointerEvents: 'none' }} aria-hidden="true" />
 			{tooltip !== null ? (
-				<div style={{ ...MAP_STYLES.tooltip, left: Math.min(tooltip.x + 14, Math.max(0, sizeRef.current.width - 330)), top: tooltip.y + 14 }} aria-hidden="true">
+				<div data-map-tooltip={tooltip.index} style={{ ...MAP_STYLES.tooltip, left: Math.min(tooltip.x + 14, Math.max(0, sizeRef.current.width - 330)), top: tooltip.y + 14 }} aria-hidden="true">
 					{tooltipText}
 				</div>
 			) : null}

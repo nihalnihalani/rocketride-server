@@ -812,6 +812,8 @@ export function MapView(props: MapViewProps): React.ReactElement {
 			data-knn-overlap={quality ? quality.overlap.toFixed(4) : ''}
 			data-pca-overlap={quality ? quality.pcaOverlap.toFixed(4) : ''}
 			data-renderer={rendererKind}
+			data-query-state={query === null ? 'none' : query.item || query.search ? 'placed' : 'failed'}
+			data-rays={rays.length}
 		>
 			<MapToolbar
 				limits={model.capabilities.sample_light === false ? { ...limits, sample_max_light: limits.sample_max } : limits}
