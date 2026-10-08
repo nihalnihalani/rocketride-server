@@ -33,7 +33,10 @@ requirements = os.path.dirname(os.path.realpath(__file__)) + '/requirements.txt'
 depends(requirements)
 
 # Load what we need
-from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
+import base64
+import binascii
+import json
+from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Set, Tuple
 from uuid import NAMESPACE_URL, uuid5
 import sys
 import numpy as np
@@ -85,6 +88,9 @@ MIN_RELEVANCE_SCORE = 0.20
 # objectId of the collection's control record (model name and vector size).
 CONTROL_OBJECT_ID = 'schema'
 
+# Qdrant distance -> the explorer's metric vocabulary ('cosine' | 'l2' | 'ip').
+_METRICS = {'Cosine': 'cosine', 'Euclid': 'l2', 'Dot': 'ip'}
+
 # Distances where a smaller raw score means a closer point.
 _DISTANCE_METRICS = ('Euclid', 'Manhattan')
 
@@ -102,7 +108,86 @@ def point_id_for(objectId: str, chunkId: int) -> str:
     return str(uuid5(NAMESPACE_URL, f'{objectId}#{int(chunkId)}'))
 
 
+def _vx():
+    """The explorer value types, imported on use (the driver also loads on an older ai package)."""
+    from ai.common.store import vx_types
+
+    return vx_types
+
+
+def _errors():
+    from ai.common.store import errors
+
+    return errors
+
+
+def _meta_of(record: Any) -> Dict[str, Any]:
+    payload = getattr(record, 'payload', None) or {}
+    meta = payload.get('meta') or {}
+    return meta if isinstance(meta, dict) else {}
+
+
+def _int_or_none(value: Any) -> Optional[int]:
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _similarities(metric: str, X: np.ndarray, rows: np.ndarray, cols: np.ndarray) -> np.ndarray:
+    """Similarity of each (row, col) pair under the explorer's definition (higher is closer)."""
+    a = X[rows].astype(np.float64)
+    b = X[cols].astype(np.float64)
+    if metric == 'l2':
+        return 1.0 / (1.0 + np.linalg.norm(a - b, axis=1))
+    dots = np.einsum('ij,ij->i', a, b)
+    if metric == 'ip':
+        return dots
+    norms = np.linalg.norm(a, axis=1) * np.linalg.norm(b, axis=1)
+    return np.divide(dots, norms, out=np.zeros_like(dots), where=norms > 0)
+
+
+def _exact_knn(metric: str, X: np.ndarray, k: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Exact k-nearest neighbours (self excluded) as (offsets_row, cols, sims), rows best-first."""
+    n = len(X)
+    k = max(0, min(int(k), n - 1))
+    Xf = X.astype(np.float64)
+    if metric == 'l2':
+        sq = np.sum(Xf * Xf, axis=1)
+        S = 1.0 / (1.0 + np.sqrt(np.maximum(sq[:, None] + sq[None, :] - 2.0 * (Xf @ Xf.T), 0.0)))
+    elif metric == 'ip':
+        S = Xf @ Xf.T
+    else:
+        norms = np.linalg.norm(Xf, axis=1)
+        norms[norms == 0] = 1.0
+        Xn = Xf / norms[:, None]
+        S = Xn @ Xn.T
+    np.fill_diagonal(S, -np.inf)
+    cols = np.argsort(-S, axis=1, kind='stable')[:, :k] if k else np.zeros((n, 0), dtype=np.int64)
+    sims = np.take_along_axis(S, cols, axis=1) if k else np.zeros((n, 0))
+    offsets = np.arange(0, n * k + 1, k, dtype=np.int64) if k else np.zeros(n + 1, dtype=np.int64)
+    return offsets, cols.reshape(-1).astype(np.int64), sims.reshape(-1).astype(np.float32)
+
+
 class Store(DocumentStoreBase):
+    # Explorer capabilities beyond the hooks this class overrides (vx_types.CAPABILITY_KEYS).
+    VX_DRIVER_CAPABILITIES = frozenset({'documents_distinct', 'knn_native', 'search_keyword'})
+
+    # Support level reported by the explorer's dialect: the unmocked live suite
+    # (nodes/test/test_store_qdrant_full.py) runs on a new and a legacy collection.
+    VX_SUPPORT = 'supported'
+
+    # Most distinct objectIds the orphan sweep of listDocuments reads in one facet.
+    FACET_CAP = 1000
+
+    # Most distinct objectIds countDocuments counts exactly; above it the count is unknown (None).
+    COUNT_DOCUMENTS_CAP = 10000
+
+    # Most (objectId, chunkId) -> point id entries remembered between getVectors and knnGraph.
+    POINT_ID_MEMO_MAX = 20000
+
     apikey: str | None = None
     node: str = 'qdrant'
     collection: str = ''
@@ -820,3 +905,517 @@ class Store(DocumentStoreBase):
             if len(window) >= limit:
                 break
         return window
+
+    def _exists(self) -> bool:
+        """Whether the collection exists (no control-record read)."""
+        return bool(self.collection) and self._doesCollectionExist()
+
+    def _rememberPointIds(self, records: Sequence[Any]) -> None:
+        memo: Dict[Tuple[str, int], Any] = self.__dict__.setdefault('_vxPointIds', {})
+        if len(memo) > self.POINT_ID_MEMO_MAX:
+            memo.clear()
+        for record in records:
+            meta = _meta_of(record)
+            chunk = _int_or_none(meta.get('chunkId'))
+            if meta.get('objectId') is not None and chunk is not None:
+                memo[(str(meta['objectId']), chunk)] = record.id
+
+    def _recordToDoc(self, record: Any, *, with_vector: bool = False) -> Doc:
+        """A Doc from a stored point, with ``metadata.pointId`` (and the vector when asked)."""
+        payload = record.payload or {}
+        meta = {k: v for k, v in _meta_of(record).items() if v is not None}
+        metadata = DocMetadata(**{**meta, 'pointId': str(record.id)})
+        doc = Doc(score=0, page_content=payload.get('content', ''), metadata=metadata)
+        if with_vector and record.vector is not None:
+            vector = record.vector
+            if isinstance(vector, dict):  # named vectors: this driver writes the default (unnamed) one
+                vector = next(iter(vector.values()), None)
+            doc.embedding = [float(v) for v in (vector or [])]
+        return doc
+
+    def _documentsFilter(self, deleted: str, object_ids: Optional[Sequence[str]], *extra: Any) -> Filter:
+        """Rows of real documents (never the control record) in the given deleted state."""
+        must, must_not = self._deletedConditions(deleted)
+        must = list(must) + list(extra)
+        if object_ids is not None:
+            must.append(FieldCondition(key='meta.objectId', match=models.MatchAny(any=list(object_ids))))
+        return Filter(must=must, must_not=list(must_not) + [self._notControl()])
+
+    def _facetCounts(self, flt: Filter, limit: int) -> List[Tuple[str, int]]:
+        """(objectId, matching rows) per distinct objectId, highest counts first; zero counts dropped."""
+        hits = self.client.facet(
+            collection_name=self.collection, key='meta.objectId', facet_filter=flt, limit=limit, exact=True
+        ).hits
+        return [(str(h.value), int(h.count)) for h in hits if int(h.count) > 0]
+
+    # ------------------------------------------------------------------
+    # Explorer hooks (docs/development/nodes/vector-tool-contract.md, section 2)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _metricName(similarity: Any) -> Optional[str]:
+        return _METRICS.get(str(getattr(similarity, 'value', similarity)))
+
+    def scoreInfo(self) -> Dict[str, Any]:
+        """How ``Doc.score`` is derived from Qdrant's raw score for this collection's distance."""
+        if self.similarity == 'Cosine':
+            formula = '(1 + cosine_similarity) / 2'
+        elif self.similarity in _DISTANCE_METRICS:
+            formula = '1 / (1 + distance)'
+        else:
+            formula = '1 / (1 + exp(-dot / 100))'
+        return {
+            'formula': formula,
+            'range': [0, 1],
+            'higher_is_better': True,
+            'floor': MIN_RELEVANCE_SCORE,
+            'threshold': self.threshold_search,
+        }
+
+    def describe(self):
+        """Backend, collection, metric, dimension, model, index; never a host, port or key."""
+        vx = _vx()
+        caveats = ['brute_force_search']
+        try:
+            version = getattr(self.client.info(), 'version', None)
+        except Exception:
+            version = None
+        metric = self._metricName(self.similarity)
+        if not self._exists():
+            return vx.StoreInfo(
+                backend='qdrant',
+                backend_version=version,
+                collection=self.collection or None,
+                collection_exists=False,
+                control_record=None,
+                meta_column=None,
+                metric=metric,
+                dimension=None,
+                model=None,
+                index=None,
+                size_bytes=None,
+                caveats=caveats,
+            )
+
+        info = self.client.get_collection(collection_name=self.collection)
+        config = getattr(info, 'config', None)
+        vectors = getattr(getattr(config, 'params', None), 'vectors', None)
+        if isinstance(vectors, dict):  # named vectors: describe the first
+            vectors = next(iter(vectors.values()), None)
+        hnsw = getattr(config, 'hnsw_config', None)
+        try:
+            control = self.doesCollectionExist()
+        except Exception:
+            control = False
+        if self.similarity in _DISTANCE_METRICS:
+            caveats.append('score_scale_inverted_fixed')
+        dimension = _int_or_none(getattr(vectors, 'size', None)) or (self.vectorSize or None)
+        index = None
+        if hnsw is not None:
+            index = {'type': 'hnsw', 'params': {'m': hnsw.m, 'ef_construct': hnsw.ef_construct}}
+        return vx.StoreInfo(
+            backend='qdrant',
+            backend_version=version,
+            collection=self.collection,
+            collection_exists=True,
+            control_record=bool(control),
+            meta_column=None,
+            metric=self._metricName(getattr(vectors, 'distance', None)) or metric,
+            dimension=dimension,
+            model=(self.modelName or None) if control else None,
+            index=index,
+            size_bytes=None,
+            caveats=caveats,
+        )
+
+    def countChunks(self, docFilter: DocFilter) -> Optional[int]:
+        """Exact count of the chunk rows matching ``docFilter`` (control record excluded)."""
+        if not self._exists():
+            return 0
+        flt = self._convertFilter(docFilter)
+        flt.must_not = list(flt.must_not or []) + [self._notControl()]
+        return int(self.client.count(collection_name=self.collection, count_filter=flt, exact=True).count)
+
+    def countDocuments(self, docFilter: DocFilter) -> Optional[int]:
+        """
+        Distinct objectIds matching ``docFilter``, counted by an exact facet.
+
+        Includes documents whose first chunk is missing. None above
+        ``COUNT_DOCUMENTS_CAP`` distinct ids (the tools then count first chunks).
+        """
+        if not self._exists():
+            return 0
+        flt = self._convertFilter(docFilter)
+        flt.must_not = list(flt.must_not or []) + [self._notControl()]
+        hits = self._facetCounts(flt, self.COUNT_DOCUMENTS_CAP)
+        return None if len(hits) >= self.COUNT_DOCUMENTS_CAP else len(hits)
+
+    @staticmethod
+    def _encodeCursor(state: Dict[str, Any]) -> str:
+        return base64.urlsafe_b64encode(json.dumps(state, separators=(',', ':')).encode()).decode()
+
+    @staticmethod
+    def _decodeCursor(cursor: Optional[str]) -> Dict[str, Any]:
+        """The listing state in an opaque cursor; a cursor this driver did not issue is refused."""
+        if cursor is None:
+            return {'ph': 'c', 'p': None}
+        try:
+            state = json.loads(base64.urlsafe_b64decode(str(cursor).encode()).decode())
+        except (binascii.Error, UnicodeDecodeError, ValueError):
+            state = None
+        valid = isinstance(state, dict) and (
+            (state.get('ph') == 'c' and isinstance(state.get('p'), (str, int)))
+            or (state.get('ph') == 'o' and isinstance(state.get('i'), int) and state['i'] >= 0)
+        )
+        if not valid:
+            raise _errors().ToolRefusal(
+                'INVALID_INPUT', 'The documents cursor is not valid; start from the first page.'
+            )
+        return state
+
+    def _documentRow(self, record: Any, chunks: Optional[int], tables: Optional[int], has_first: bool):
+        meta = _meta_of(record)
+        ingested = meta.get('ingestedAt')
+        return _vx().DocumentRow(
+            objectId=str(meta.get('objectId', '')),
+            path=str(meta.get('parent') or ''),
+            chunks=chunks,
+            has_first_chunk=has_first,
+            deleted=meta.get('isDeleted') is True,
+            tables=tables,
+            nodeId=meta.get('nodeId'),
+            size=_int_or_none(meta.get('size')),
+            modifyTime=_int_or_none(meta.get('modifyTime')),
+            ingestedAt=ingested if isinstance(ingested, str) else None,
+            pointId=str(record.id),
+        )
+
+    def _firstRow(self, objectId: str, deleted: str) -> Optional[Any]:
+        """The lowest-chunk row of a document (its display row when chunk 0 is missing)."""
+        flt = self._documentsFilter(deleted, [objectId])
+        try:
+            records, _ = self.client.scroll(
+                collection_name=self.collection,
+                scroll_filter=flt,
+                order_by=models.OrderBy(key='meta.chunkId'),
+                limit=1,
+                with_payload=True,
+                with_vectors=False,
+            )
+            return records[0] if records else None
+        except Exception:
+            # No range index on meta.chunkId (collection not created by this driver): read them all.
+            rows = list(self._scrollAll(flt))
+            return min(rows, key=lambda r: _int_or_none(_meta_of(r).get('chunkId')) or 0) if rows else None
+
+    def _orphans(self, deleted: str, object_ids: Optional[Sequence[str]]) -> Tuple[List[Tuple[str, int]], bool]:
+        """Documents without a chunk-0 row: ([(objectId, rows)] sorted by id, capped?)."""
+        hits = self._facetCounts(self._documentsFilter(deleted, object_ids), self.FACET_CAP)
+        capped = len(hits) >= self.FACET_CAP
+        counts = dict(hits)
+        with_first: Set[str] = set()
+        ids = list(counts)
+        for start in range(0, len(ids), _SCROLL_PAGE):
+            batch = ids[start : start + _SCROLL_PAGE]
+            first = FieldCondition(key='meta.chunkId', match=MatchValue(value=0))
+            flt = self._documentsFilter(deleted, batch, first)
+            for record in self._scrollAll(flt, with_payload=['meta']):
+                with_first.add(str(_meta_of(record).get('objectId')))
+        orphans = sorted((oid, n) for oid, n in counts.items() if oid not in with_first)
+        return orphans, capped
+
+    def listDocuments(self, *, cursor, limit, object_ids, deleted, sort):
+        """
+        One page of documents: chunk-0 rows in storage order, then documents without chunk 0.
+
+        Chunk counts come from an exact facet over the page's objectIds; the
+        documents without a first chunk are found by a facet over every objectId
+        (at most ``FACET_CAP``; beyond that the caveat ``document_count_capped``).
+        Rows are not sorted by path (``sorted=False``); each objectId is listed once.
+        """
+        vx = _vx()
+        limit = max(1, int(limit))
+        state = self._decodeCursor(cursor)
+        caveats = ['documents_unsorted']
+        if not self._exists():
+            return vx.DocPage(
+                items=[], next_cursor=None, total=0, counts_exact=True, distinct=True, sorted=False, caveats=caveats
+            )
+
+        ids = None if object_ids is None else [str(o) for o in object_ids if str(o) != CONTROL_OBJECT_ID]
+        total_hits = self._facetCounts(self._documentsFilter(deleted, ids), self.COUNT_DOCUMENTS_CAP)
+        total = None if len(total_hits) >= self.COUNT_DOCUMENTS_CAP else len(total_hits)
+        items = []
+        next_cursor: Optional[str] = None
+
+        if state['ph'] == 'c':
+            first = FieldCondition(key='meta.chunkId', match=MatchValue(value=0))
+            records, next_point = self.client.scroll(
+                collection_name=self.collection,
+                scroll_filter=self._documentsFilter(deleted, ids, first),
+                limit=limit,
+                offset=state['p'],
+                with_payload=True,
+                with_vectors=False,
+            )
+            seen: Set[str] = set()
+            unique = []
+            for record in records:
+                oid = str(_meta_of(record).get('objectId', ''))
+                if oid and oid not in seen:
+                    seen.add(oid)
+                    unique.append(record)
+            page_ids = list(seen)
+            counts: Dict[str, int] = {}
+            tables: Dict[str, int] = {}
+            if page_ids:
+                counts = dict(self._facetCounts(self._documentsFilter(deleted, page_ids), len(page_ids)))
+                is_table = FieldCondition(key='meta.isTable', match=MatchValue(value=True))
+                tables = dict(self._facetCounts(self._documentsFilter(deleted, page_ids, is_table), len(page_ids)))
+            for record in unique:
+                oid = str(_meta_of(record).get('objectId'))
+                items.append(self._documentRow(record, counts.get(oid), tables.get(oid, 0), True))
+            if next_point is not None:
+                next_cursor = self._encodeCursor({'ph': 'c', 'p': next_point})
+                return vx.DocPage(
+                    items=items,
+                    next_cursor=next_cursor,
+                    total=total,
+                    counts_exact=True,
+                    distinct=True,
+                    sorted=False,
+                    caveats=caveats,
+                )
+            state = {'ph': 'o', 'i': 0}
+
+        # The chunk-0 rows are exhausted: fill the page with documents that have no chunk 0.
+        orphans, capped = self._orphans(deleted, ids)
+        if capped:
+            caveats.append('document_count_capped')
+        start = state['i']
+        room = max(0, limit - len(items))
+        for oid, rows in orphans[start : start + room]:
+            record = self._firstRow(oid, deleted)
+            if record is not None:
+                items.append(self._documentRow(record, rows, None, False))
+        if start + room < len(orphans):
+            next_cursor = self._encodeCursor({'ph': 'o', 'i': start + room})
+        return vx.DocPage(
+            items=items,
+            next_cursor=next_cursor,
+            total=total,
+            counts_exact=True,
+            distinct=True,
+            sorted=False,
+            caveats=caveats,
+        )
+
+    def scrollChunks(self, objectId: str, *, after_chunk: int, limit: int, deleted: str):
+        """The chunks of one document after ``after_chunk``, in chunk order, without vectors."""
+        vx = _vx()
+        after_chunk = int(after_chunk)
+        limit = max(1, int(limit))
+        if objectId == CONTROL_OBJECT_ID or not self._exists():
+            return vx.ChunkPage(docs=[], has_more=False, next_after=after_chunk)
+        after = FieldCondition(key='meta.chunkId', range=Range(gt=after_chunk))
+        flt = self._documentsFilter(deleted, [objectId], after)
+        try:
+            records, _ = self.client.scroll(
+                collection_name=self.collection,
+                scroll_filter=flt,
+                order_by=models.OrderBy(key='meta.chunkId'),
+                limit=limit + 1,
+                with_payload=True,
+                with_vectors=False,
+            )
+        except Exception:
+            # No range index on meta.chunkId (collection not created by this driver): sort here.
+            records = sorted(self._scrollAll(flt), key=lambda r: _int_or_none(_meta_of(r).get('chunkId')) or 0)
+            records = records[: limit + 1]
+        self._rememberPointIds(records)
+        docs = [self._recordToDoc(r) for r in records[:limit]]
+        next_after = docs[-1].metadata.chunkId if docs else after_chunk
+        return vx.ChunkPage(docs=docs, has_more=len(records) > limit, next_after=next_after)
+
+    def sampleChunks(self, *, n, seed, strategy, docFilter, include_keys):
+        """
+        Up to ``n`` chunks with vectors: 'random' (Qdrant's random sample) or 'first' (storage order).
+
+        Qdrant's random sample takes no seed. 'stratified' is not native here
+        (StoreUnsupported), so the shared sampler builds it from getVectors.
+        """
+        if strategy == 'stratified':
+            raise _errors().StoreUnsupported('sampleChunks(strategy="stratified") is not native on Qdrant')
+        if strategy not in ('random', 'first'):
+            raise ValueError(f'unknown sampling strategy {strategy!r}')
+        n = max(0, int(n))
+        if not n or not self._exists():
+            return [], strategy
+        flt = self._convertFilter(docFilter)
+        flt.must_not = list(flt.must_not or []) + [self._notControl()]
+        if strategy == 'random':
+            records = self.client.query_points(
+                collection_name=self.collection,
+                query=models.SampleQuery(sample=models.Sample.RANDOM),
+                query_filter=flt,
+                limit=n,
+                with_payload=True,
+                with_vectors=True,
+            ).points
+        else:
+            records = []
+            for record in self._scrollAll(flt, with_vectors=True, page=min(n, _SCROLL_PAGE)):
+                records.append(record)
+                if len(records) >= n:
+                    break
+        self._rememberPointIds(records)
+        return [self._recordToDoc(r, with_vector=True) for r in records], strategy
+
+    def getVectors(self, keys):
+        """
+        The chunks for ``keys`` with vectors, in the order asked; missing keys are left out.
+
+        Reads by deterministic id first, then by filter for every miss (rows
+        written before deterministic ids carry random ids). Deleted rows included.
+        """
+        wanted = list(dict.fromkeys((str(o), int(c)) for o, c in keys if str(o) != CONTROL_OBJECT_ID))
+        if not wanted or not self._exists():
+            return []
+        found: Dict[Tuple[str, int], Any] = {}
+        want = set(wanted)
+        ids = [point_id_for(oid, chunk) for oid, chunk in wanted]
+        for start in range(0, len(ids), 1000):
+            for record in self.client.retrieve(
+                collection_name=self.collection, ids=ids[start : start + 1000], with_payload=True, with_vectors=True
+            ):
+                meta = _meta_of(record)
+                key = (str(meta.get('objectId')), _int_or_none(meta.get('chunkId')))
+                if key in want and key not in found:
+                    found[key] = record
+        misses = [k for k in wanted if k not in found]
+        for record in self._readByKeys(misses, with_vectors=True):
+            meta = _meta_of(record)
+            key = (str(meta.get('objectId')), _int_or_none(meta.get('chunkId')))
+            if key in want and key not in found:
+                found[key] = record
+        records = [found[k] for k in wanted if k in found]
+        self._rememberPointIds(records)
+        return [self._recordToDoc(r, with_vector=True) for r in records]
+
+    def _readByKeys(
+        self, keys: Sequence[Tuple[str, int]], *, with_payload: Any = True, with_vectors: bool = False
+    ) -> Iterator[Any]:
+        """
+        Yield the rows of ``keys`` read by filter (objectId IN ... AND chunkId IN ...), deleted rows included.
+
+        Keys are grouped by objectId in batches so each read asks only for the
+        chunk ids of its own documents; the caller pairs rows with keys.
+        """
+        by_object: Dict[str, Set[int]] = {}
+        for oid, chunk in keys:
+            by_object.setdefault(oid, set()).add(chunk)
+        objects = sorted(by_object)
+        for start in range(0, len(objects), 64):
+            batch = objects[start : start + 64]
+            chunks = sorted(set().union(*(by_object[o] for o in batch)))
+            flt = Filter(
+                must=[
+                    FieldCondition(key='meta.objectId', match=models.MatchAny(any=batch)),
+                    FieldCondition(key='meta.chunkId', match=models.MatchAny(any=chunks)),
+                ]
+            )
+            yield from self._scrollAll(flt, with_payload=with_payload, with_vectors=with_vectors)
+
+    def _pointIdsFor(self, keys: Sequence[Tuple[str, int]]) -> Dict[Tuple[str, int], Any]:
+        """Point id per key: remembered from earlier reads, else looked up by filter."""
+        memo: Dict[Tuple[str, int], Any] = self.__dict__.get('_vxPointIds', {})
+        resolved = {k: memo[k] for k in keys if k in memo}
+        misses = [k for k in keys if k not in resolved]
+        if misses:
+            missing = set(misses)
+            records = list(self._readByKeys(misses, with_payload=['meta']))
+            self._rememberPointIds(records)
+            for record in records:
+                meta = _meta_of(record)
+                key = (str(meta.get('objectId')), _int_or_none(meta.get('chunkId')))
+                if key in missing and key not in resolved:
+                    resolved[key] = record.id
+        return resolved
+
+    def knnGraph(self, keys, vectors, metric, k):
+        """
+        The k-nearest-neighbour graph over the sampled keys, computed by Qdrant.
+
+        ``search_matrix_offsets`` restricted to the sample's point ids finds the
+        neighbours (source 'native'); similarities are recomputed from the
+        vectors by ``metric`` so every visual uses one definition. If Qdrant
+        cannot answer for every key, the graph is computed on the node instead.
+        """
+        vx = _vx()
+        X = np.asarray(vectors, dtype=np.float32)
+        keys = [(str(o), int(c)) for o, c in keys]
+        n = len(keys)
+        k = max(0, min(int(k), n - 1))
+        if n >= 2 and k >= 1:
+            try:
+                graph = self._nativeKnn(keys, X, metric, k)
+                if graph is not None:
+                    return graph
+            except Exception:
+                pass
+        try:
+            return super().knnGraph(keys, X, metric, k)
+        except _errors().StoreUnsupported:
+            offsets, cols, sims = _exact_knn(metric, X, k)
+            return vx.KnnGraph(k=k, offsets_row=offsets, cols=cols, sims=sims, source='node')
+
+    def _nativeKnn(self, keys, X, metric, k):
+        pids = self._pointIdsFor(keys)
+        if len(pids) != len(keys) or len(set(pids.values())) != len(keys):
+            return None
+        row_of = {pid: i for i, pid in enumerate(pids[key] for key in keys)}
+        response = self.client.search_matrix_offsets(
+            collection_name=self.collection,
+            query_filter=Filter(must=[models.HasIdCondition(has_id=list(row_of))]),
+            sample=len(keys),
+            limit=k,
+        )
+        ids = list(response.ids)
+        if len(ids) != len(keys) or any(pid not in row_of for pid in ids):
+            return None
+        rows = np.asarray([row_of[ids[r]] for r in response.offsets_row], dtype=np.int64)
+        cols = np.asarray([row_of[ids[c]] for c in response.offsets_col], dtype=np.int64)
+        keep = rows != cols
+        rows, cols = rows[keep], cols[keep]
+        sims = _similarities(metric, X, rows, cols).astype(np.float32)
+        order = np.lexsort((-sims, rows))
+        rows, cols, sims = rows[order], cols[order], sims[order]
+        out_cols: List[np.ndarray] = []
+        out_sims: List[np.ndarray] = []
+        offsets = np.zeros(len(keys) + 1, dtype=np.int64)
+        bounds = np.searchsorted(rows, np.arange(len(keys) + 1))
+        for i in range(len(keys)):
+            lo, hi = bounds[i], min(bounds[i + 1], bounds[i] + k)
+            out_cols.append(cols[lo:hi])
+            out_sims.append(sims[lo:hi])
+            offsets[i + 1] = offsets[i] + (hi - lo)
+        return _vx().KnnGraph(
+            k=k,
+            offsets_row=offsets,
+            cols=np.concatenate(out_cols) if out_cols else np.zeros(0, dtype=np.int64),
+            sims=np.concatenate(out_sims) if out_sims else np.zeros(0, dtype=np.float32),
+            source='native',
+        )
+
+    def removeCounted(self, objectIds: List[str]) -> Optional[int]:
+        """Remove every chunk of ``objectIds`` (deleted rows too); return the rows removed. Never the control record."""
+        ids = [oid for oid in dict.fromkeys(str(o).strip() for o in objectIds) if oid and oid != CONTROL_OBJECT_ID]
+        if not ids or not self._exists():
+            return 0
+        flt = Filter(must=[FieldCondition(key='meta.objectId', match=models.MatchAny(any=ids))])
+        removed = int(self.client.count(collection_name=self.collection, count_filter=flt, exact=True).count)
+        if removed:
+            self.client.delete(
+                collection_name=self.collection, points_selector=models.FilterSelector(filter=flt), wait=True
+            )
+        return removed

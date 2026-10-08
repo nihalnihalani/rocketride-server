@@ -193,6 +193,7 @@ def test_distance_metrics_score_closer_points_higher(similarity):
     scores = {d.metadata.objectId: d.score for d in docs}
     assert scores['near'] == pytest.approx(1.0)
     assert scores['near'] > scores['far'] > 0
+    assert store.scoreInfo()['formula'] == '1 / (1 + distance)'
 
 
 def test_soft_delete_keeps_the_rest_of_the_metadata():
