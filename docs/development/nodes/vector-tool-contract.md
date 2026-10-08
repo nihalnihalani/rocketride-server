@@ -22,6 +22,11 @@ Where it lives in code:
 A change to any signature, JSON shape, code or limit here is a contract change:
 update this page, the files above and the app's contract types in the same change.
 
+How the app, the shared Explorer library and these nodes fit together, and
+which suites test them, is in [Vector Explorer](../apps/vector-explorer.md).
+What users see is in the public guide,
+<https://docs.rocketride.org/guides/apps/vector-explorer>.
+
 Path legend: `ds` = `packages/ai/src/ai/common/store/document_store.py`; `sgb` = `.../store_global_base.py`; `sib` = `.../store_instance_base.py`; `dm` = `packages/client-python/src/rocketride/schema/doc_metadata.py`; `df` = `.../doc_filter.py`; `q` = `.../question.py`; `dc` = `packages/ai/src/ai/modules/data/data_conn.py`; `cmd_data` = `packages/ai/src/ai/modules/task/commands/cmd_data.py`; `host` = `packages/ai/src/ai/common/agent/_internal/host.py`; `flt` = `packages/server/engine-lib/rocketlib-python/lib/rocketlib/filters.py`; `types` = `.../rocketlib/types.py`. Line references (`file:line`) point at the code as it stood before this contract was implemented and drift as the code changes.
 
 ---
@@ -135,6 +140,8 @@ class DocumentStoreBase(ABC):
     def resolveDeleted(docFilter: DocFilter) -> Deleted: ...   # docFilter.deleted if set, else isDeleted None/False -> 'active', True -> 'all'
 ```
 
+`capabilities()` returns the hooks named in the class constant `DocumentStoreBase.VX_HOOKS` that the driver overrides, plus the names in the class constant `DocumentStoreBase.VX_DRIVER_CAPABILITIES`: an empty frozenset in the base, which a driver overrides with what its backend does natively beyond the hooks (such as `sample_stratified_native`, `knn_native`, `documents_distinct`, `documents_sorted` or `search_keyword`; the vocabulary is `vx_types.CAPABILITY_KEYS`).
+
 Base-class changes that ride along: `doesCollectionExist(modelName)` **keeps today's read-path behaviour** (never refuses on model); the comparison is exposed as `describe().caveats` `model_mismatch` and `dialect.health.model_mismatch`, and `search` adds `warnings:['model_mismatch']`. `BaseException` for non-zero offsets (`qdrant.py:404`, `chroma.py:536`, `milvus.py:365`, `weaviate.py:404`, `pinecone.py:278`) becomes `ValueError`. **The control-record path is untouched:** `createCollection` keeps calling `self.addChunks([doc], checkCollection=False)` (`ds:535`); no driver refuses `schema` inside `addChunks`.
 
 ### 2.3 Schema changes (`packages/client-python/src/rocketride/schema/`)
@@ -201,7 +208,7 @@ def vectordb_tool(fn):  # applied under @tool_function on every tool, new and le
     # 3. post-process: numpy -> list, float rounding (5 dp scalars, 4 dp bulk, 2 dp light), size assertion vs LIMITS
 ```
 
-`@tool_function` (`flt:67-94`) gains `audience: Tuple[str, ...] = ('agent', 'dap')` stored in `__tool_meta__`; `_build_tool_descriptors` (`flt:1141-1190`), called from `tool.query` with `audience='agent'`, lists only tools whose audience includes it; `tool.invoke` dispatches every `@tool_function` regardless. The six legacy tools keep the default audience and their descriptors byte-identical. Every new tool and `embed` is `audience=('dap',)`. `packages/ai/test/test_tool_audience.py` asserts: the agent catalog (`host.py:93-123` descriptors) is byte-identical before and after; legacy inputs of `search`/`stats`/`delete`/`get`/`objdir`/`upsert` are accepted; legacy output keys are present with legacy semantics, including `stats` on a missing collection answering `{success:true, count:0, model:'', vector_size:0}`.
+`@tool_function` (`flt:67-94`) gains `audience: Tuple[str, ...] = ('agent', 'dap')` stored in `__tool_meta__`; `_build_tool_descriptors` (`flt:1141-1190`), called from `tool.query` with `audience='agent'`, lists only tools whose audience includes it; `tool.invoke` dispatches every `@tool_function` regardless. The six legacy tools keep the default audience and their descriptors byte-identical. Every new tool and `embed` is `audience=('dap',)`. `test_tool_audience.py` (the `packages/ai` suite, `./builder ai:test`) asserts: the agent catalog (`host.py:93-123` descriptors) is byte-identical before and after; legacy inputs of `search`/`stats`/`delete`/`get`/`objdir`/`upsert` are accepted; legacy output keys are present with legacy semantics, including `stats` on a missing collection answering `{success:true, count:0, model:'', vector_size:0}`.
 
 ### 4.1 Codes, capabilities, caveats, limits
 
@@ -312,6 +319,7 @@ tools_1  (tools)   ─control(tool)→ store_1, embed_1
 ### 6.1 Switches (node config)
 - `vector.allow_writes` — boolean, default `VECTOR_ALLOW_WRITES_DEFAULT` (`vx_defaults.py`, **false in this build**), "Allow document management from tool calls", defined once in `nodes/src/nodes/core/services.common.vector.json`; `rrvector.allow_writes` for rocketride_vector. Read in `StoreGlobalBase.beginGlobal` with `parse_bool`. The templates test and the toolpath expectation table import the same constant, so a reversal is one line.
 - `vector.agent_writes` — boolean, default `VECTOR_AGENT_WRITES_DEFAULT` (true).
+- Where they live: like the other `vector.*` fields, both are profile fields, so in a `.pipe` they sit on the store component at `config[config.profile].allow_writes` (for example `config.local.allow_writes`; `config.cloud.allow_writes` for rocketride_vector) and the node reads them from the merged `Config.getNodeConfig` result. An absent field means the default.
 - Scope: `allow_writes` governs external DAP tool calls only. With the switch **on**, the gate still refuses callers on a public (`pk_`) task key, non-tools sources, broadcasts, caller-supplied embeddings and `schema`; with it **off** (the default), SDK scripts calling `upsert`/`delete` through `client.tool()` get `WRITES_DISABLED` (no in-repo script, doc or test does so today). Data-lane ingest is unchanged except for the reserved id (§6.3).
 
 ### 6.2 Call context (engine; `packages/ai/src/ai/common/tool_context.py`)
