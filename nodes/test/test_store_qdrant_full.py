@@ -1,0 +1,361 @@
+# =============================================================================
+# MIT License
+# Copyright (c) 2026 Aparavi Software AG
+# =============================================================================
+
+"""The Qdrant driver's explorer hooks against a real Qdrant (no mocks).
+
+Runs the shared driver contract (``vector_store_contract.py``) on a new
+collection, on a collection written the way the previous driver wrote it
+(random point ids), and read-only on the seeded ``vx_legacy_docs``; then the
+driver repairs and Qdrant's own neighbour graph (``search_matrix_offsets``,
+``knn_source: 'native'``), which must agree with the exact graph on at least
+95 % of edges.
+
+Needs a disposable local Qdrant, e.g. the ``vx-qdrant`` container that
+``scripts/acceptance/vector-explorer/containers/start.sh`` starts
+(qdrant/qdrant:v1.17.1 on 127.0.0.1:56333). The suite creates and drops its
+own ``vx_contract_*`` collections and never writes to the seeded one.
+
+Configuration:
+    RR_TEST_QDRANT_URL   - REST address (default http://127.0.0.1:56333)
+    RR_REQUIRE_DB_TESTS  - set by the database lane: an unreachable server fails
+                           the run instead of skipping it with "NOT RUN:".
+
+Must run without ``ROCKETRIDE_MOCK`` (``nodes/test/mocks`` shadows qdrant_client).
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import math
+import os
+import sys
+import types
+import urllib.request
+import uuid
+from pathlib import Path
+
+import numpy as np
+import pytest
+
+from . import vector_store_contract as contract
+
+QDRANT_URL = os.environ.get('RR_TEST_QDRANT_URL', 'http://127.0.0.1:56333').rstrip('/')
+_DRIVER = Path(__file__).resolve().parents[1] / 'src' / 'nodes' / 'store_qdrant' / 'qdrant.py'
+_MOCKS = str(Path(__file__).resolve().parent / 'mocks')
+_RUN = uuid.uuid4().hex[:8]
+
+
+def _reachable() -> bool:
+    try:
+        with urllib.request.urlopen(QDRANT_URL + '/', timeout=3) as response:
+            return response.status == 200
+    except Exception:
+        return False
+
+
+if not _reachable():
+    if contract.required():
+        pytest.fail(f'RR_REQUIRE_DB_TESTS is set but Qdrant is not reachable at {QDRANT_URL}', pytrace=False)
+    pytest.skip(f'NOT RUN: Qdrant not reachable at {QDRANT_URL}', allow_module_level=True)
+
+# A unit-test module may have left a stub or the mock client in sys.modules.
+for _name in [n for n in sys.modules if n == 'qdrant_client' or n.startswith('qdrant_client.')]:
+    _file = getattr(sys.modules[_name], '__file__', None) or ''
+    if not _file or _file.startswith(_MOCKS):
+        del sys.modules[_name]
+
+from qdrant_client import QdrantClient, models  # noqa: E402
+
+from ai.common.schema import DocFilter, QuestionText  # noqa: E402
+
+
+def _load_driver():
+    """Execute the driver as the engine does (its requirements are installed: depends() only checks)."""
+    spec = importlib.util.spec_from_file_location('_vx_qdrant_driver_live', _DRIVER)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    # Resolve the node configuration from the dict the suite passes (no services registry here).
+    module.Config = types.SimpleNamespace(getNodeConfig=lambda _provider, conn: dict(conn))
+    return module
+
+
+drv = _load_driver()
+assert drv.QdrantClient is QdrantClient, 'the live suite must use the real qdrant_client'
+
+RAW = QdrantClient(url=QDRANT_URL, prefer_grpc=False, timeout=60)
+_CREATED = []
+
+
+def _store(collection: str):
+    host, port = QDRANT_URL.rsplit(':', 1)
+    conn = {'collection': collection, 'host': host, 'port': int(port), 'similarity': 'Cosine', 'score': 0.3}
+    return drv.Store('qdrant', conn, {})
+
+
+def _vx_filter(**kwargs):
+    fields = getattr(DocFilter, 'model_fields', {})
+    if 'deleted' in fields and 'minScore' in fields:
+        return DocFilter(**kwargs)
+
+    class _VxDocFilter(DocFilter):
+        deleted: str | None = None
+        minScore: float | None = None
+
+    return _VxDocFilter(**kwargs)
+
+
+def _new_collection(kind: str) -> str:
+    name = f'vx_contract_{kind}_{_RUN}'
+    _CREATED.append(name)
+    return name
+
+
+def _plant_orphan_and_soft_delete(store) -> None:
+    RAW.delete(
+        store.collection,
+        points_selector=models.FilterSelector(
+            filter=models.Filter(
+                must=[
+                    models.FieldCondition(key='meta.objectId', match=models.MatchValue(value=contract.ORPHAN)),
+                    models.FieldCondition(key='meta.chunkId', match=models.MatchValue(value=0)),
+                ]
+            )
+        ),
+        wait=True,
+    )
+    store.markDeleted([contract.SOFT_DELETED])
+
+
+def _write_like_the_previous_driver(store, docs) -> None:
+    """Create the collection and write rows as the previous driver did: random ids, same payload."""
+    store._createCollection(contract.DIM)
+    points = [
+        models.PointStruct(
+            id=str(uuid.uuid4()), vector=d.embedding, payload={'content': d.page_content, 'meta': d.metadata}
+        )
+        for d in [contract.control_doc()] + docs
+    ]
+    RAW.upsert(store.collection, points=points, wait=True)
+
+
+def _raw_rows(collection: str):
+    offset = None
+    while True:
+        records, offset = RAW.scroll(collection, limit=256, offset=offset, with_payload=['meta'], with_vectors=True)
+        for record in records:
+            yield record.payload.get('meta') or {}, record.vector
+        if offset is None:
+            return
+
+
+@pytest.fixture(scope='module', autouse=True)
+def _cleanup():
+    yield
+    contract.drop_collections(_CREATED, lambda name: RAW.delete_collection(name))
+
+
+@pytest.fixture(scope='module')
+def new_store():
+    store = _store(_new_collection('new'))
+    store.addChunks(contract.corpus_docs())
+    _plant_orphan_and_soft_delete(store)
+    return store, contract.corpus_expectations()
+
+
+@pytest.fixture(scope='module')
+def legacy_shape_store():
+    store = _store(_new_collection('legacy'))
+    _write_like_the_previous_driver(store, contract.corpus_docs())
+    _plant_orphan_and_soft_delete(store)
+    return store, contract.corpus_expectations()
+
+
+@pytest.fixture(scope='module')
+def seeded_legacy_store():
+    name = contract.SEEDED_LEGACY_COLLECTION
+    if not RAW.collection_exists(name):
+        pytest.skip(f'NOT RUN: the legacy collection {name} is not seeded on this Qdrant')
+    store = _store(name)
+    assert store.doesCollectionExist(), 'the seeded legacy collection has no control record'
+    expect = contract.expectations_from_rows(_raw_rows(name), store.vectorSize, store.modelName)
+    return store, expect
+
+
+@pytest.fixture(params=['new', 'legacy_shape', 'seeded_legacy'])
+def collection(request):
+    return request.getfixturevalue(f'{request.param}_store')
+
+
+# --- the shared contract ----------------------------------------------------------------
+
+
+def test_describe(collection):
+    store, expect = collection
+    info = store.describe()
+    contract.assert_no_connection_details(info)
+    assert info.backend == 'qdrant'
+    assert info.backend_version and info.backend_version[0].isdigit()
+    assert info.collection == store.collection
+    assert info.collection_exists is True and info.control_record is True
+    assert info.metric == 'cosine'
+    assert info.dimension == expect.dimension and info.model == expect.model
+    assert info.index['type'] == 'hnsw' and info.index['params']['m'] > 0
+    assert 'brute_force_search' in info.caveats
+
+
+def test_counts(collection):
+    store, expect = collection
+    assert store.countChunks(_vx_filter()) == expect.chunks
+    assert store.countChunks(_vx_filter(chunkIds=[0])) == len(expect.documents) - len(expect.orphans)
+    assert store.countDocuments(_vx_filter()) == len(expect.documents)
+    assert store.count_documents() >= expect.chunks + 1
+
+
+def test_listing_lists_every_document_once_and_the_orphan_last(collection):
+    store, expect = collection
+    contract.check_listing(store, expect, limit=7)
+
+
+def test_chunks_page_in_chunk_order(collection):
+    store, expect = collection
+    largest = max(expect.documents, key=lambda oid: (expect.documents[oid], oid))
+    contract.check_scroll_chunks(store, expect, largest, page=max(2, expect.documents[largest] // 3))
+    orphan = sorted(expect.orphans)[0]
+    contract.check_scroll_chunks(store, expect, orphan, page=50)
+
+
+def test_vectors_by_key(collection):
+    store, expect = collection
+    keys = sorted(expect.vectors)[:: max(1, len(expect.vectors) // 12)][:12]
+    contract.check_get_vectors(store, expect, keys)
+
+
+def test_random_sample(collection):
+    store, expect = collection
+    n = min(20, expect.chunks)
+    docs, used = store.sampleChunks(n=n, seed=3, strategy='random', docFilter=_vx_filter(), include_keys=[])
+    assert used == 'random' and len(docs) == n
+    for d in docs:
+        key = (d.metadata.objectId, d.metadata.chunkId)
+        assert key in expect.vectors
+        assert np.allclose(d.embedding, expect.vectors[key], atol=1e-5)
+
+
+def test_neighbour_graph_is_computed_by_qdrant(collection):
+    store, expect = collection
+    keys = sorted(expect.vectors)[:200]
+    docs = store.getVectors(keys)
+    assert [(d.metadata.objectId, d.metadata.chunkId) for d in docs] == keys
+    X = np.asarray([d.embedding for d in docs], dtype=np.float32)
+    k = min(10, len(keys) - 1)
+    graph = store.knnGraph(keys, X, 'cosine', k)
+    assert graph.source == 'native'
+    contract.check_knn_rows(graph, X, k)
+    assert contract.knn_agreement(graph, contract.exact_knn_sets(X.astype(np.float64), k), k) >= 0.95
+
+
+@pytest.mark.skip(reason='NEEDS:L1 merged (vx_math) — integration gate G2')
+def test_neighbour_graph_agrees_with_vx_math(collection):
+    from ai.common.store import vx_math
+
+    store, expect = collection
+    keys = sorted(expect.vectors)[:200]
+    X = np.asarray([d.embedding for d in store.getVectors(keys)], dtype=np.float32)
+    k = min(15, len(keys) - 1)
+    graph = store.knnGraph(keys, X, 'cosine', k)
+    offsets, cols, _ = vx_math.knn('cosine', X, k)
+    exact = [set(cols[offsets[i] : offsets[i + 1]].tolist()) for i in range(len(keys))]
+    assert graph.source == 'native'
+    assert contract.knn_agreement(graph, exact, k) >= 0.95
+
+
+@pytest.mark.skip(reason='NEEDS:L1 merged (explorer tools on VectorStoreToolMixin) — integration gate G2')
+def test_documents_tool_lists_the_orphan_unsorted(collection):
+    from ai.common.store import VectorStoreToolMixin
+
+    store, expect = collection
+    node = VectorStoreToolMixin()
+    node.IGlobal = types.SimpleNamespace(store=store)
+    answer = node.documents({'limit': 500, 'deleted': 'active'})
+    assert answer['success'] is True and answer['sorted'] is False
+    orphans = {i['objectId'] for i in answer['items'] if not i['has_first_chunk']}
+    assert orphans == expect.orphans
+
+
+# --- repairs and writes (collections this suite owns) -------------------------------------
+
+
+def test_new_rows_have_deterministic_ids(new_store):
+    store, _ = new_store
+    pid = drv.point_id_for('doc-00', 2)
+    assert pid == str(uuid.uuid5(uuid.NAMESPACE_URL, 'doc-00#2'))
+    record = RAW.retrieve(store.collection, ids=[pid], with_payload=True)[0]
+    assert record.payload['meta']['objectId'] == 'doc-00' and record.payload['meta']['chunkId'] == 2
+
+
+def test_numeric_offset_pages_without_repeating(new_store):
+    store, expect = new_store
+    first = [(d.metadata.objectId, d.metadata.chunkId) for d in store.get(DocFilter(limit=5, offset=0))]
+    second = [(d.metadata.objectId, d.metadata.chunkId) for d in store.get(DocFilter(limit=5, offset=5))]
+    assert len(first) == 5 and len(second) == 5 and not set(first) & set(second)
+
+
+def test_parent_filter_is_the_exact_path(new_store):
+    store, _ = new_store
+    docs = store.get(DocFilter(parent=contract.path_of('doc-01'), limit=50))
+    assert {d.metadata.objectId for d in docs} == {'doc-01'}
+
+
+def test_floor_and_min_score(new_store):
+    store, expect = new_store
+    key = sorted(expect.vectors)[0]
+    query = QuestionText(text='q')
+    query.embedding = [-x for x in expect.vectors[key]]  # the opposite of a stored chunk
+    query.embedding_model = contract.MODEL
+    floored = store.searchSemantic(query, DocFilter(limit=100))
+    everything = store.searchSemantic(query, _vx_filter(limit=100, minScore=-math.inf))
+    assert len(everything) == expect.chunks
+    assert all(d.score >= 0.2 for d in floored) and len(floored) < len(everything)
+    assert min(d.score for d in everything) == pytest.approx(0.0, abs=1e-4)
+
+
+def test_soft_delete_keeps_the_payload(new_store):
+    store, _ = new_store
+    records, _ = RAW.scroll(
+        store.collection,
+        scroll_filter=models.Filter(
+            must=[models.FieldCondition(key='meta.objectId', match=models.MatchValue(value=contract.SOFT_DELETED))]
+        ),
+        limit=50,
+        with_payload=True,
+    )
+    assert len(records) == contract.DOCS[contract.SOFT_DELETED]
+    for record in records:
+        meta = record.payload['meta']
+        assert meta['isDeleted'] is True and meta['parent'] == contract.path_of(contract.SOFT_DELETED)
+
+
+@pytest.mark.parametrize('shape', ['new', 'legacy'])
+def test_remove_counted_reports_rows_and_spares_the_control_record(shape):
+    store = _store(_new_collection(f'remove_{shape}'))
+    if shape == 'new':
+        store.addChunks(contract.corpus_docs())
+    else:
+        _write_like_the_previous_driver(store, contract.corpus_docs())
+    store.markDeleted(['doc-04'])
+    removed = store.removeCounted(['doc-03', 'doc-04', 'schema', 'no-such-document'])
+    assert removed == contract.DOCS['doc-03'] + contract.DOCS['doc-04']
+    assert store.countChunks(_vx_filter(objectIds=['doc-03', 'doc-04'], deleted='all')) == 0
+    assert store.describe().control_record is True
+    assert store.removeCounted(['doc-03']) == 0
+
+
+def test_a_missing_collection_answers_without_raising():
+    store = _store(f'vx_contract_absent_{_RUN}')
+    info = store.describe()
+    assert info.collection_exists is False and info.control_record is None
+    assert store.countChunks(_vx_filter()) == 0
+    assert store.listDocuments(cursor=None, limit=5, object_ids=None, deleted='active', sort='path').items == []
