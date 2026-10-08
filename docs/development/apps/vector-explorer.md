@@ -215,9 +215,13 @@ descriptors byte-for-byte, and `test_tool_audience.py` pins that.
 The live suites are listed in `DB_LIVE_SUITES` in `nodes/scripts/tasks.js` and
 follow the rules in [Live database tests](../nodes/testing.md#live-database-tests):
 a required run fails on an unreachable server, and a deliberate skip says
-`NOT RUN:`. With `RR_TEST_PGVECTOR_POOLER_DSN` set, the two pgvector suites run
-a second time through that transaction-mode pooler. The servers, their pinned
-images and the local ports are in the acceptance
+`NOT RUN:`. The pooler pass is part of the suites themselves: the driver cases
+in `test_store_postgres_full.py` and the `rocketride_vector` cases in
+`test_rocketride_db_full.py` run once against the database and, with
+`RR_TEST_PGVECTOR_POOLER_DSN` set, once more through that transaction-mode
+pooler, and `test_vector_toolpath_full.py` runs `rocketride_vector.pipe` through
+it a second time. Without the variable those cases skip with `NOT RUN:`. The
+servers, their pinned images and the local ports are in the acceptance
 [README](../../../scripts/acceptance/vector-explorer/README.md).
 
 ## Fixtures
