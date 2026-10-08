@@ -24,8 +24,10 @@ RocketRide database), [Qdrant](/nodes/store_qdrant) and
 [Chroma](/nodes/store_chroma). [Milvus](/nodes/store_milvus),
 [Weaviate](/nodes/store_weaviate), [Pinecone](/nodes/store_pinecone),
 [Astra DB](/nodes/store_astra) and [MongoDB Atlas](/nodes/store_atlas) are
-available but marked **Experimental**: they were not run against a live server
-in this build. The level each connection shows is the one its node reports.
+available but marked **Experimental**: a store is marked supported only after
+its tests against a live server pass, and in this build these five were tested
+against mock clients only. The level each connection shows is the one its node
+reports.
 [Elasticsearch and OpenSearch](/nodes/store_elasticsearch) are not supported and
 are never listed.
 
@@ -307,12 +309,16 @@ document's chunks in order on the map.
 
 ## What the notes mean
 
+**Experimental** is the support level the store node reports, not a note with
+a sentence of its own: a store is marked supported only after its tests
+against a live server pass. The other notes are explained by these sentences:
+
 | When | The app says |
 | --- | --- |
 | The store searches exactly, without an index | This store searches by brute force (exact); large collections answer slowly. |
 | The store's scores are not on a 0–1 scale | Scores are the backend's raw values, not 0–1. |
 | The store does not keep the extra file details | This backend does not keep file size or ingest time. |
-| The store is experimental | This backend was not run against a live server in this build. |
+| The store is a cloud service that was not checked against a live server | This backend was not run against a live server in this build. |
 | The store counts documents by their first chunk | Documents are counted by their first chunk on this store. |
 | More than 1,000 documents lack a first chunk | Orphan counts above 1,000 are not exact on this store. |
 | The store lists documents unsorted | This store lists documents in storage order; the directory sorts what is loaded. |
@@ -377,7 +383,7 @@ Vector Explorer, and a line is logged when one is stored.
 - **Elasticsearch and OpenSearch** store nodes are not supported and are not
   listed.
 - **Experimental stores** (Milvus, Weaviate, Pinecone, Astra DB, MongoDB Atlas)
-  were not run against a live server in this build. Pinecone cannot count
+  were tested against mock clients only in this build. Pinecone cannot count
   documents or chunks and has no keyword search.
 - **Size.** The map draws at most 2,000 points in detailed mode and 5,000 in
   light mode, and t-SNE at most 1,000. The directory loads 5,000 documents on
