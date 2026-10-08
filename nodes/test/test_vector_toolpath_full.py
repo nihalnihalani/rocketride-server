@@ -1323,7 +1323,7 @@ def test_the_write_switch_default_is_the_shared_constant(deployment):
         before = deployment.service.counts(deployment.new.collection)
         if vx_defaults.VECTOR_ALLOW_WRITES_DEFAULT:
             pytest.skip(
-                'VECTOR_ALLOW_WRITES_DEFAULT is on: the refusal row does not apply (the allowed path is covered above)'
+                'NOT RUN: VECTOR_ALLOW_WRITES_DEFAULT is on, so the refusal row does not apply (the allowed path is covered above)'
             )
         assert variant.refused('remove_document', {'object_ids': [oid]}) == 'WRITES_DISABLED'
         assert deployment.service.counts(deployment.new.collection) == before

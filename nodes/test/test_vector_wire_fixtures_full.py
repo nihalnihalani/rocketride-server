@@ -103,7 +103,7 @@ def live():
     except RuntimeError as e:
         if _REQUIRED:
             pytest.fail(f'RR_REQUIRE_DB_TESTS is set but the live captures failed: {e}', pytrace=False)
-        pytest.skip(f'live captures not possible here: {e}')
+        pytest.skip(f'NOT RUN: live captures not possible here: {e}')
 
 
 @pytest.mark.skip(reason=NEEDS_LIVE)
