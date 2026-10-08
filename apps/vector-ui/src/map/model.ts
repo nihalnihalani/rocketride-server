@@ -230,3 +230,28 @@ export function applyTransform(place: { x: number; y: number; z?: number }, t: I
 	if (place.z !== undefined) out.z = (place.z - t.cz) * t.s;
 	return out;
 }
+
+/**
+ * Spread coordinates that were rounded to `step` (light samples carry 2-decimal
+ * floats) uniformly within their rounding interval, seeded. Rounding already
+ * moved every point by up to step/2; drawing the rounded values as they are
+ * shows a lattice that is not in the data.
+ *
+ * @param positions - Rounded coordinates.
+ * @param step - The rounding step (0.01 for 2 decimals); 0 returns a copy.
+ * @param seed - The sample's seed (same sample, same picture).
+ * @returns Dithered coordinates (a new array).
+ */
+export function ditherRounded(positions: Float32Array, step: number, seed: number): Float32Array {
+	const out = Float32Array.from(positions);
+	if (!(step > 0)) return out;
+	let state = (seed ^ 0x9e3779b9) | 0;
+	for (let i = 0; i < out.length; i += 1) {
+		state = (state + 0x6d2b79f5) | 0;
+		let t = Math.imul(state ^ (state >>> 15), 1 | state);
+		t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+		const u = ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+		out[i] = (out[i] as number) + (u - 0.5) * step * 0.999;
+	}
+	return out;
+}

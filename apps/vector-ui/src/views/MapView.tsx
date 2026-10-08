@@ -64,7 +64,7 @@ import { forgetCameras } from '../map/cameraMemory';
 import { colourPoints } from '../map/colours';
 import { tweenPositions } from '../map/interaction';
 import type { KeyAction } from '../map/interaction';
-import { applyTransform, chunkPath, documentOf, hiddenMask, keyIndex, keyString, neighboursOf, normaliseLayout, pcaPositions, pointKey } from '../map/model';
+import { applyTransform, chunkPath, ditherRounded, documentOf, hiddenMask, keyIndex, keyString, neighboursOf, normaliseLayout, pcaPositions, pointKey } from '../map/model';
 import { createLatestQueue } from '../map/neighbours';
 import type { IOverlayEnd, IPlace } from '../map/overlay';
 import { centroidStar, placeProjected, querySims, raysFromSearch, resolveKeys, starFromProject, withSampleRetry } from '../map/queryProjection';
@@ -259,8 +259,10 @@ export function MapView(props: MapViewProps): React.ReactElement {
 	const raw = useMemo(() => {
 		if (!sample) return new Float32Array(0);
 		if (layout !== 'pca' && refined !== null && refined.sampleId === sample.sample_id && refined.layout === layout) return refined.positions;
-		return pcaPositions(sample, dims);
-	}, [sample, layout, refined, dims]);
+		const pca = pcaPositions(sample, dims);
+		// Light samples carry 2-decimal coordinates: spread them within their rounding step.
+		return sample.mode === 'light' ? ditherRounded(pca, 0.01, sampleModel?.seed ?? DEFAULT_SEED) : pca;
+	}, [sample, sampleModel, layout, refined, dims]);
 	const frame = useMemo(() => normaliseLayout(raw, dims, hidden), [raw, dims, hidden]);
 
 	// Layout changes tween (never under reduced motion).

@@ -69,3 +69,7 @@ test('the browser lanes can read the map\'s state: tooltip, query, rays, layout,
 	assert.match(view, /data-layout-state=\{layoutState\}/);
 	assert.match(read('components/PointCanvas.tsx'), /data-map-tooltip/);
 });
+
+test('light samples are dithered within their 2-decimal rounding on PCA, so no lattice is drawn', () => {
+	assert.match(read('views/MapView.tsx'), /sample\.mode === 'light' \? ditherRounded\(pca, 0\.01, /);
+});

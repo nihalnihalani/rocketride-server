@@ -9,7 +9,7 @@
 
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { applyTransform, chunkPath, hiddenMask, keyIndex, keyString, neighboursOf, normaliseLayout, pcaPositions, pointKey, visibleCount } from '../src/map/model';
+import { applyTransform, chunkPath, ditherRounded, hiddenMask, keyIndex, keyString, neighboursOf, normaliseLayout, pcaPositions, pointKey, visibleCount } from '../src/map/model';
 import { biasedNote, sampleLabel } from '../src/map/wording';
 import { loadSample, modelOf } from './support/map.samples';
 
@@ -100,4 +100,21 @@ test('every layout is shown in one frame: visible points centred on the origin w
 	const three = normaliseLayout(new Float32Array([0, 0, 1, 0, 0, -1]), 3, null);
 	assert.equal(three.positions.length, 6);
 	assert.ok(applyTransform({ x: 0, y: 0, z: 1 }, three.transform).z !== undefined);
+});
+
+test('light samples (2-decimal coordinates) are dithered within their rounding step, the same way every time', () => {
+	const light = loadSample('sample_light_5000.json');
+	const raw = pcaPositions(light, 2);
+	const a = ditherRounded(raw, 0.01, 11);
+	const b = ditherRounded(raw, 0.01, 11);
+	assert.deepEqual(Array.from(a), Array.from(b), 'deterministic for a seed');
+	let moved = 0;
+	for (let i = 0; i < raw.length; i += 1) {
+		const d = Math.abs((a[i] as number) - (raw[i] as number));
+		assert.ok(d <= 0.005 + 1e-6, `coordinate ${i} moved ${d}`);
+		if (d > 1e-6) moved += 1;
+	}
+	assert.ok(moved > raw.length * 0.9, 'nearly every coordinate leaves the lattice');
+	assert.notDeepEqual(Array.from(ditherRounded(raw, 0.01, 12)), Array.from(a));
+	assert.deepEqual(Array.from(ditherRounded(raw, 0, 11)), Array.from(raw), 'no step, no dither');
 });
