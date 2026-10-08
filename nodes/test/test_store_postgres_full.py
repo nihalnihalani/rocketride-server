@@ -348,32 +348,31 @@ class TestIngest:
         assert _rows(admin, table, 'objectid = %s', ('nul',))[0][2] == 'ab'
 
     def test_concurrent_first_writes_create_one_control_record(self, dsn, table, stores, admin):
-        """Two tasks writing to a new table at once still leave exactly one control record."""
+        """Four tasks writing to a new table at once: every write succeeds and there is one control record."""
         rng = np.random.default_rng(6)
-        a = _open(dsn, table, stores)
-        b = _open(dsn, table, stores)
-        docs_a = [_doc('a', i, _unit(rng)) for i in range(3)]
-        docs_b = [_doc('b', i, _unit(rng)) for i in range(3)]
+        writers = [_open(dsn, table, stores) for _ in range(4)]
+        batches = [[_doc(f'd{w}', i, _unit(rng)) for i in range(3)] for w in range(len(writers))]
+        start = threading.Barrier(len(writers))
         errors = []
 
         def write(store, docs):
+            start.wait(10)
             try:
                 store.addChunks(docs)
-            except Exception as e:  # noqa: BLE001 - reported below
-                errors.append(e)
+            except Exception as e:  # noqa: BLE001 - asserted below
+                errors.append(repr(e))
 
-        threads = [threading.Thread(target=write, args=(a, docs_a)), threading.Thread(target=write, args=(b, docs_b))]
+        threads = [threading.Thread(target=write, args=pair) for pair in zip(writers, batches)]
         for t in threads:
             t.start()
         for t in threads:
             t.join(30)
-        # One of the two may legitimately lose the race on the control record check; neither may corrupt it.
+        assert not any(t.is_alive() for t in threads)
+        assert errors == []
         with admin.cursor() as cur:
             cur.execute(f'SELECT count(*) FROM "{table}" WHERE objectid = %s', ('schema',))
             assert cur.fetchone()[0] == 1
-        for store, docs in ((a, docs_a), (b, docs_b)):
-            store.addChunks(docs)
-        assert len(_rows(admin, table, 'objectid <> %s', ('schema',))) == 6, errors
+        assert len(_rows(admin, table, 'objectid <> %s', ('schema',))) == 12
 
 
 # ---------------------------------------------------------------------------
@@ -482,9 +481,14 @@ class TestConnections:
         assert _idle_in_transaction(admin, table) == 0
 
     def test_idle_connections_are_released(self, dsn, table, stores, admin):
-        """The pool opens connections on demand and closes them after the idle timeout."""
+        """The pool opens connections on demand and closes them after the idle timeout (60 s by default)."""
+        import inspect
+
+        from ai.common.store.pgvector import PgVectorStore
+
+        assert inspect.signature(PgVectorStore).parameters['idle_timeout_s'].default == 60.0
         rng = np.random.default_rng(13)
-        idle_s = 60.0 if dsn == POOLER_DSN else 2.0
+        idle_s = 2.0  # the production 60 s is asserted above; the release itself is what is measured here
         store = _open(dsn, table, stores, idle_timeout_s=idle_s)
         _ingest(store, rng, 'doc', 3)
         s = _schema()
