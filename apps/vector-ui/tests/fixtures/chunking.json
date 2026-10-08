@@ -1,0 +1,16 @@
+{
+	"calibrated": false,
+	"note": "Provisional chunking in every template (chunk_1). The calibration run replaces it with measured values (median chunk 400-1,200 characters) and sets calibrated to true; the templates test reports NOT RUN until then.",
+	"chunk_1": {
+		"provider": "preprocessor_langchain",
+		"config": {
+			"profile": "default",
+			"default": {
+				"mode": "strlen",
+				"splitter": "RecursiveCharacterTextSplitter",
+				"strlen": 512
+			},
+			"parameters": {}
+		}
+	}
+}
