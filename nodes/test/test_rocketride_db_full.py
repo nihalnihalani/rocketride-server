@@ -55,6 +55,7 @@ Skips cleanly when the database is unreachable.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import importlib
 import importlib.util
@@ -570,6 +571,25 @@ def _unit_vec(rng):
     return (v / np.linalg.norm(v)).tolist()
 
 
+@contextlib.contextmanager
+def _called_as(rv, ctx):
+    """Run the body as the tool call ``ctx``, the way the engine's dispatcher runs a tool method.
+
+    Where the engine does not record the call context yet (``tool_call`` is an
+    interface there), the node module's lookup stands in for it, so the node
+    sees exactly ``ctx``; where it does, nothing is replaced.
+    """
+    from ai.common import tool_context
+
+    with tool_context.tool_call(ctx):
+        if tool_context.current_tool_call() is not None:
+            yield
+            return
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(sys.modules[rv.IInstance.__module__], 'current_tool_call', lambda: ctx)
+            yield
+
+
 def _begin_vector_node(rv, config):
     """Run the node's real beginGlobal (open the store, register the transform key)."""
     from rocketlib import OPEN_MODE
@@ -801,6 +821,110 @@ class TestRocketrideVectorNode:
             assert (stats['model'], stats['vector_size'], stats['count']) == ('test-model', DIMS, 2)
         finally:
             reader.endGlobal()
+
+    @staticmethod
+    def _seed(rv, glb, rng):
+        glb.store.addChunks(
+            [
+                rv.Doc(
+                    page_content='kept',
+                    metadata=rv.DocMetadata(objectId='doc', chunkId=0, isDeleted=False),
+                    embedding=_unit_vec(rng),
+                    embedding_model='test-model',
+                )
+            ]
+        )
+
+    @staticmethod
+    def _write(inst, rng, tool, object_id):
+        if tool == 'delete':
+            return inst.delete({'object_ids': [object_id]})
+        document = {
+            'content': 'new',
+            'object_id': object_id,
+            'embedding': _unit_vec(rng),
+            'embedding_model': 'test-model',
+        }
+        return inst.upsert({'documents': [document]})
+
+    @staticmethod
+    def _unchanged(rv, glb):
+        """The seeded document is still there, nothing else was written, and the control record is intact."""
+        assert glb.store.countChunks(rv.DocFilter()) == 1
+        assert glb.store.countChunks(rv.DocFilter(objectIds=['doc'])) == 1
+        assert glb.store.count_documents() == 2
+        assert (glb.store.modelName, glb.store.vectorSize) == ('test-model', DIMS)
+
+    def test_write_tools_stay_listed(self, rv):
+        from ai.common.store import StoreInstanceBase
+
+        for name in ('upsert', 'delete'):
+            assert getattr(rv.IInstance, name).__tool_meta__ == getattr(StoreInstanceBase, name).__tool_meta__
+
+    @pytest.mark.parametrize('allow_writes', [False, True])
+    @pytest.mark.parametrize('tool', ['delete', 'upsert'])
+    def test_tool_writes_without_a_call_context_are_refused(self, rv, table, allow_writes, tool):
+        """A write that carries no call context is refused whatever the switch says; the rows stay."""
+        rng = np.random.default_rng(44)
+        config = {'collection': table, 'similarity': 'cosine', 'allow_writes': allow_writes}
+        glb, inst = _begin_vector_node(rv, config)
+        try:
+            self._seed(rv, glb, rng)
+            for object_id in ('doc', 'other', 'schema'):
+                answer = self._write(inst, rng, tool, object_id)
+                assert answer['success'] is False, answer
+                assert answer['code'] == ('RESERVED_ID' if object_id == 'schema' else 'WRITES_UNKNOWN_CALLER')
+            self._unchanged(rv, glb)
+        finally:
+            glb.endGlobal()
+
+    @pytest.mark.parametrize(
+        ('origin', 'switches', 'object_id', 'code'),
+        [
+            ('dap', {'allow_writes': False}, 'doc', 'WRITES_DISABLED'),
+            ('agent', {'agent_writes': False}, 'doc', 'WRITES_AGENT'),
+            ('agent', {}, 'schema', 'RESERVED_ID'),
+            ('dap', {'allow_writes': True}, 'schema', 'RESERVED_ID'),
+        ],
+    )
+    @pytest.mark.parametrize('tool', ['delete', 'upsert'])
+    def test_tool_writes_refused_by_the_switches_and_the_reserved_id(
+        self, rv, table, origin, switches, object_id, code, tool
+    ):
+        from ai.common.tool_context import ToolCallContext
+
+        rng = np.random.default_rng(45)
+        glb, inst = _begin_vector_node(rv, {'collection': table, 'similarity': 'cosine', **switches})
+        if origin == 'dap':
+            ctx = ToolCallContext(origin='dap', source_type='tools', targeted=True, caller={'auth': 'account'})
+        else:
+            ctx = ToolCallContext(origin='agent', source_type=None, targeted=True, caller={'auth': 'agent'})
+        try:
+            self._seed(rv, glb, rng)
+            with _called_as(rv, ctx):
+                answer = self._write(inst, rng, tool, object_id)
+            assert answer['success'] is False and answer['code'] == code, answer
+            self._unchanged(rv, glb)
+        finally:
+            glb.endGlobal()
+
+    def test_agent_writes_with_a_call_context_reach_the_store(self, rv, table):
+        """With the default switches an agent's upsert and delete go through to the table."""
+        from ai.common.tool_context import ToolCallContext
+
+        rng = np.random.default_rng(46)
+        glb, inst = _begin_vector_node(rv, {'collection': table, 'similarity': 'cosine'})
+        ctx = ToolCallContext(origin='agent', source_type=None, targeted=True, caller={'auth': 'agent'})
+        try:
+            self._seed(rv, glb, rng)
+            with _called_as(rv, ctx):
+                stored = self._write(inst, rng, 'upsert', 'other')
+                removed = self._write(inst, rng, 'delete', 'doc')
+            assert stored['success'] is True and removed['success'] is True, (stored, removed)
+            assert glb.store.countChunks(rv.DocFilter(objectIds=['other'])) == 1
+            assert glb.store.countChunks(rv.DocFilter(objectIds=['doc'])) == 0
+        finally:
+            glb.endGlobal()
 
     @pytest.mark.skip(reason='NEEDS:L1,L0 merged — integration gate G2')
     def test_writes_refused_with_the_switch_off(self, rv, table):

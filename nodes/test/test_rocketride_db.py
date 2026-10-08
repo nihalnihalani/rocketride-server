@@ -675,6 +675,77 @@ class TestPgVectorTransactions:
         assert rows['c']['meta'] == {'size': 7} and 'meta' not in rows['b']
 
 
+class TestRocketrideVectorWriteCheck:
+    """The node's local write check (live twins: test_rocketride_db_full.py TestRocketrideVectorNode)."""
+
+    @staticmethod
+    def _node(env, config):
+        import importlib
+
+        from rocketlib import OPEN_MODE
+
+        IGlobal = importlib.import_module('nodes.rocketride_vector.IGlobal').IGlobal
+        IInstance = importlib.import_module('nodes.rocketride_vector.IInstance').IInstance
+        glb = IGlobal()
+        glb.IEndpoint = types.SimpleNamespace(
+            endpoint=types.SimpleNamespace(openMode=OPEN_MODE.SOURCE, bag={}, parameters={})
+        )
+        glb.glb = types.SimpleNamespace(logicalType='rocketride_vector', connConfig=config)
+        glb.beginGlobal()
+        inst = IInstance()
+        inst.IGlobal = glb
+        glb.store.addChunks([_doc('doc', 0, [1, 0, 0, 0, 0])])
+        return glb, inst
+
+    @staticmethod
+    def _rows(env):
+        return sorted(r['objectid'] for r in env.db.table('rr_vec').rows.values())
+
+    def test_delete_without_a_call_context_is_refused(self, mock_rv):
+        glb, inst = self._node(mock_rv, {'collection': 'rr_vec', 'similarity': 'cosine', 'allow_writes': True})
+        answer = inst.delete({'object_ids': ['doc']})
+        assert answer['success'] is False and answer['code'] == 'WRITES_UNKNOWN_CALLER'
+        assert inst.delete({'object_ids': ['schema']})['code'] == 'RESERVED_ID'
+        assert self._rows(mock_rv) == ['doc', 'schema']
+        glb.endGlobal()
+
+    @pytest.mark.parametrize(
+        ('origin', 'switches', 'code'),
+        [('dap', {'allow_writes': False}, 'WRITES_DISABLED'), ('agent', {'agent_writes': False}, 'WRITES_AGENT')],
+    )
+    def test_switches_refuse_calls_with_a_context(self, mock_rv, monkeypatch, origin, switches, code):
+        import importlib
+
+        from ai.common.tool_context import ToolCallContext
+
+        glb, inst = self._node(mock_rv, {'collection': 'rr_vec', 'similarity': 'cosine', **switches})
+        ctx = ToolCallContext(origin=origin, source_type='tools', targeted=True, caller={'auth': 'account'})
+        monkeypatch.setattr(
+            importlib.import_module('nodes.rocketride_vector.IInstance'), 'current_tool_call', lambda: ctx
+        )
+        upsert = {
+            'documents': [{'content': 'x', 'object_id': 'new', 'embedding': [0, 1, 0, 0, 0], 'embedding_model': 'm'}]
+        }
+        assert inst.delete({'object_ids': ['doc']})['code'] == code
+        assert inst.upsert(upsert)['code'] == code
+        assert self._rows(mock_rv) == ['doc', 'schema']
+        glb.endGlobal()
+
+    def test_agent_call_with_default_switches_reaches_the_store(self, mock_rv, monkeypatch):
+        import importlib
+
+        from ai.common.tool_context import ToolCallContext
+
+        glb, inst = self._node(mock_rv, {'collection': 'rr_vec', 'similarity': 'cosine'})
+        ctx = ToolCallContext(origin='agent', source_type=None, targeted=True, caller={'auth': 'agent'})
+        monkeypatch.setattr(
+            importlib.import_module('nodes.rocketride_vector.IInstance'), 'current_tool_call', lambda: ctx
+        )
+        assert inst.delete({'object_ids': ['doc']})['success'] is True
+        assert self._rows(mock_rv) == ['schema']
+        glb.endGlobal()
+
+
 # ---------------------------------------------------------------------------
 # Tenancy wording (AGE-T6)
 # ---------------------------------------------------------------------------

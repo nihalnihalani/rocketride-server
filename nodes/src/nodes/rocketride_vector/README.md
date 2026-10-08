@@ -45,8 +45,9 @@ The tool-server name is `rocketride_vector`.
 `upsert` and `delete` change the table. When an agent in the pipeline calls
 them, Allow agent writes decides; when a Tools source calls them (an SDK script,
 or the Vector Explorer), Allow document management from tool calls decides, and
-it is off by default. The collection's control record (object ID `schema`) can
-never be removed or overwritten through a tool.
+it is off by default. A call the engine did not identify as coming from an
+agent or a Tools source is always refused. The collection's control record
+(object ID `schema`) can never be removed or overwritten through a tool.
 
 ## Configuration
 
