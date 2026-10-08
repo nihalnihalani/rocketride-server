@@ -23,6 +23,7 @@
 # =============================================================================
 
 from __future__ import annotations  # Enables forward references
+import contextlib
 import functools
 import json
 from typing import TYPE_CHECKING, Dict, Any, List, Optional, Tuple, TypedDict, Callable, Protocol
@@ -98,6 +99,21 @@ def tool_function(
         return fn
 
     return decorator
+
+
+def _tool_context_module() -> Any:
+    """Return ``ai.common.tool_context``, or None when it cannot be imported.
+
+    rocketlib is usable without the ``ai`` package (tests, tooling); then no call
+    context is ever set, which every tool that needs one treats as an unknown
+    caller. A successful import is cached by ``sys.modules``; a failed one is
+    retried on the next call rather than remembered.
+    """
+    try:
+        from ai.common import tool_context
+    except Exception:
+        return None
+    return tool_context
 
 
 class IKeyValueStore:
@@ -1244,17 +1260,25 @@ class IInstanceBase:
                 raise ValueError('tool_name must be a non-empty string')
             tool_name = tool_name.strip()
 
-            # Try static @tool_function methods first
-            if tool_name in methods:
-                output = methods[tool_name](input_obj)
-
-            # Then try dynamic tools (MCP etc.)
-            elif has_dynamic:
-                output = self._tool_invoke_dynamic(tool_name=tool_name, input_obj=input_obj)
-
             # This node doesn't own this tool — let the next node try.
-            else:
+            if tool_name not in methods and not has_dynamic:
                 raise APERR(Ec.PreventDefault, f'tool.invoke: {tool_name} not owned')
+
+            # Run the tool inside the call context the caller stamped on the
+            # param (the DAP path and the agent host do; see
+            # ai.common.tool_context). No stamp means no context, even when
+            # this call is nested in another tool call. The tool input is
+            # never read as context.
+            tool_context = _tool_context_module()
+            scope = tool_context.dispatch_scope(param) if tool_context is not None else contextlib.nullcontext()
+            with scope:
+                # Try static @tool_function methods first
+                if tool_name in methods:
+                    output = methods[tool_name](input_obj)
+
+                # Then try dynamic tools (MCP etc.)
+                else:
+                    output = self._tool_invoke_dynamic(tool_name=tool_name, input_obj=input_obj)
 
             # Write the output back into the param object so the caller
             # can read it from param.output after the invoke returns.
