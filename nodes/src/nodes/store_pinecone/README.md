@@ -128,6 +128,7 @@ The Vector Explorer app supports Pinecone as **experimental**: its explorer func
 - The document list pages through each document's chunk 0 with Pinecone's metadata fetch, in storage order (the app sorts what it has loaded). A pod-based index has no metadata fetch: it lists the first 1,000 documents only.
 - Samples for the embedding map are taken in storage order on serverless indexes; a pod-based index cannot provide them. The neighbour graph is computed on the node.
 - Keyword search is reported as unsupported, and the scores shown are Pinecone's raw values.
+- When Pinecone fails (unreachable, or a request it rejects), the explorer and the store's tools report `Pinecone <operation> failed: <error class> (code N)`. The client's own message, which can name the server, is not passed on.
 
 ## Upstream docs
 

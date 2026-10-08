@@ -30,6 +30,7 @@ depends(requirements)
 from typing import List, Callable, Dict, Any, Iterator, Optional, Sequence, Tuple
 from uuid import uuid4
 import re
+import functools
 import json
 import base64
 
@@ -47,7 +48,7 @@ except ImportError:  # older astrapy: count_documents has no upper bound to exce
 
 from ai.common.schema import Doc, DocFilter, DocMetadata, QuestionText
 from ai.common.store import DocumentStoreBase
-from ai.common.store.errors import StoreUnsupported, ToolRefusal
+from ai.common.store.errors import StoreError, StoreUnsupported, ToolRefusal
 from ai.common.store.vx_types import ChunkPage, DocPage, DocumentRow, StoreInfo
 from ai.common.config import Config
 
@@ -68,6 +69,67 @@ METRICS = {'cosine': 'cosine', 'euclidean': 'l2', 'dot_product': 'ip'}
 
 # Most objectId x chunkId combinations one vectors read asks for
 VECTOR_BATCH_ROWS = 1000
+
+
+#: Exception types the driver and the store base raise with their own text (never a client message)
+_OWN_ERRORS = (Exception, RuntimeError, ValueError)
+
+
+def _error_code(error: BaseException) -> Optional[str]:
+    """The client's error code (a number or an UPPER_CASE name) when the exception carries one."""
+    for name in ('code', 'status_code', 'status', 'error_code'):
+        try:
+            value = getattr(error, name, None)
+        except Exception:
+            continue
+        if isinstance(value, bool) or callable(value):
+            continue
+        if isinstance(value, int):
+            return str(value)
+        if isinstance(value, str) and re.fullmatch(r'[A-Z][A-Z0-9_]{0,63}', value):
+            return value
+    return None
+
+
+def _client_failure(error: BaseException) -> Optional[BaseException]:
+    """The client-library exception in ``error``'s chain, or None when the driver raised it itself."""
+    seen = set()
+    link: Optional[BaseException] = error
+    while link is not None and id(link) not in seen:
+        seen.add(id(link))
+        if isinstance(link, (StoreError, StoreUnsupported, ToolRefusal)):
+            return None
+        if type(link) not in _OWN_ERRORS:
+            return link
+        link = link.__cause__ or link.__context__
+    return None
+
+
+def _backend_errors(operation: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    """
+    Re-raise a client failure inside ``operation`` as a StoreError with a fixed, host-free message.
+
+    Client errors name the server (host, port, endpoint) and the tool wrapper answers a failure
+    with the exception's text, so the text becomes 'Astra DB <operation> failed: <ErrorClass> (code N)'.
+    The driver's own exceptions (refusals, ValueError for offsets, messages it wrote) pass through.
+    """
+
+    def decorate(fn: Callable[..., Any]) -> Callable[..., Any]:
+        @functools.wraps(fn)
+        def call(*args: Any, **kwargs: Any) -> Any:
+            try:
+                return fn(*args, **kwargs)
+            except Exception as error:
+                failure = _client_failure(error)
+                if failure is None:
+                    raise
+                code = _error_code(failure)
+                detail = type(failure).__name__ + (f' (code {code})' if code else '')
+                raise StoreError(f'Astra DB {operation} failed: {detail}') from error
+
+        return call
+
+    return decorate
 
 
 def _meta_dump(metadata: DocMetadata) -> Dict[str, Any]:
@@ -232,7 +294,9 @@ class Store(DocumentStoreBase):
             return True
 
         except Exception as e:
-            warning(f'Collection creation failed: {e}')
+            # The client's text can name the endpoint: report the error class and code only
+            code = _error_code(e)
+            warning(f'Collection creation failed: {type(e).__name__}' + (f' (code {code})' if code else ''))
             return False
 
     def _convertFilter(self, docFilter: DocFilter, deleted: Optional[str] = None) -> Dict:
@@ -338,6 +402,7 @@ class Store(DocumentStoreBase):
         except TooManyDocumentsToCountException:
             return None
 
+    @_backend_errors('count_documents')
     def count_documents(self) -> int:
         """
         Return the number of documents in the document store.
@@ -353,6 +418,7 @@ class Store(DocumentStoreBase):
             count = self.database.get_collection(self.collection_name).estimated_document_count()
         return count
 
+    @_backend_errors('searchKeyword')
     def searchKeyword(self, query: QuestionText, docFilter: DocFilter) -> List[Doc]:
         """
         Keyword search using AstraDB's native lexical search.
@@ -379,6 +445,7 @@ class Store(DocumentStoreBase):
 
         return docs
 
+    @_backend_errors('searchSemantic')
     def searchSemantic(self, query: QuestionText, docFilter: DocFilter) -> List[Doc]:
         """
         Semantic search.
@@ -407,6 +474,7 @@ class Store(DocumentStoreBase):
 
         return docs
 
+    @_backend_errors('get')
     def get(self, docFilter: DocFilter, checkCollection: bool = True) -> List[Doc]:
         """
         Retrieve documents matching the filter.
@@ -436,6 +504,7 @@ class Store(DocumentStoreBase):
         documents = list(cursor)
         return self._convertToDocs(documents)
 
+    @_backend_errors('getPaths')
     def getPaths(self, parent: str | None = None, offset: int = 0, limit: int = 1000) -> Dict[str, str]:
         """
         Return the parent paths of the live documents (never the control record).
@@ -551,6 +620,7 @@ class Store(DocumentStoreBase):
         # Flush any remaining documents
         flush()
 
+    @_backend_errors('remove')
     def remove(self, objectIds: List[str]) -> None:
         """
         Delete all documents with a matching objectIds from the document store.
@@ -686,6 +756,7 @@ class Store(DocumentStoreBase):
             self.modelName = model
         return True, size if isinstance(size, int) else None, model if isinstance(model, str) else None
 
+    @_backend_errors('describe')
     def describe(self) -> StoreInfo:
         """Describe the collection; never raises for a missing one and never names the endpoint."""
         caveats = ['experimental', 'cloud_only_unverified', 'extras_not_stored']
@@ -746,12 +817,14 @@ class Store(DocumentStoreBase):
             'threshold': self.threshold_search,
         }
 
+    @_backend_errors('countChunks')
     def countChunks(self, docFilter: DocFilter) -> Optional[int]:
         """Chunks matching ``docFilter``, control record excluded; None above the count ceiling."""
         if not self._doesCollectionExist():
             return 0
         return self._countWhere(self._notControl(self._convertFilter(docFilter)))
 
+    @_backend_errors('listDocuments')
     def listDocuments(
         self,
         *,
@@ -848,6 +921,7 @@ class Store(DocumentStoreBase):
             caveats=caveats,
         )
 
+    @_backend_errors('scrollChunks')
     def scrollChunks(self, objectId: str, *, after_chunk: int, limit: int, deleted: str) -> ChunkPage:
         """The chunks of one document after ``after_chunk``, sorted by chunkId, without embeddings."""
         after_chunk = int(after_chunk)
@@ -865,6 +939,7 @@ class Store(DocumentStoreBase):
         docs = [self._toDoc(document) for document in documents[:limit]]
         return ChunkPage(docs=docs, has_more=has_more, next_after=docs[-1].metadata.chunkId if docs else after_chunk)
 
+    @_backend_errors('sampleChunks')
     def sampleChunks(
         self,
         *,
@@ -895,6 +970,7 @@ class Store(DocumentStoreBase):
                 break
         return docs, 'first'
 
+    @_backend_errors('getVectors')
     def getVectors(self, keys: Sequence[Tuple[str, int]]) -> List[Doc]:
         """Chunks with embeddings for ``keys`` (by filter: ids are random), in request order."""
         wanted = [(str(o), int(c)) for o, c in keys or [] if o != CONTROL_OBJECT_ID]
@@ -912,6 +988,7 @@ class Store(DocumentStoreBase):
                 found.setdefault((doc.metadata.objectId, doc.metadata.chunkId), doc)
         return [found[key] for key in wanted if key in found]
 
+    @_backend_errors('removeCounted')
     def removeCounted(self, objectIds: List[str]) -> Optional[int]:
         """Remove every chunk of ``objectIds``; return the rows removed."""
         ids = [o for o in objectIds or [] if o != CONTROL_OBJECT_ID]

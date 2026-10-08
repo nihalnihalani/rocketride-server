@@ -110,6 +110,7 @@ The Vector Explorer app supports Astra DB as **experimental**: its explorer func
 - Chunk counts honour the active, deleted and all views; the collection's control record is never counted or listed. Collections written by earlier releases have no embedding model in their control record, so the model is shown as unknown there.
 - Samples for the embedding map are taken in storage order, and the neighbour graph is computed on the node.
 - Removing a document reports the number of chunks it removed.
+- When Astra DB fails (unreachable, or a request it rejects), the explorer and the store's tools report `Astra DB <operation> failed: <error class> (code N)`. The client's own message, which can name the server, is not passed on.
 
 ### Tool embedding dependency
 

@@ -215,6 +215,39 @@ def keyed_uuid(object_id: str, chunk_id: int) -> str:
 # -----------------------------------------------------------------------------
 
 
+class FailingProxy:
+    """Stands in for a client object whose server is unreachable: every call raises ``error``.
+
+    Attribute chains (``client.collections.exists``) resolve to further proxies, so the
+    failure surfaces at the first call. Names in ``allow`` are read from ``real`` instead,
+    which lets an existence check succeed while every data call fails.
+    """
+
+    def __init__(self, error: BaseException, real: Any = None, allow: Sequence[str] = ()) -> None:
+        """Remember the error to raise and what still answers for real."""
+        self._error = error
+        self._real = real
+        self._allow = tuple(allow)
+
+    def __getattr__(self, name: str) -> Any:
+        """A real attribute when allowed, else another failing proxy."""
+        if name in self._allow:
+            return getattr(self._real, name)
+        return FailingProxy(self._error)
+
+    def __getitem__(self, key: Any) -> Any:
+        """Subscripts (``client['db']``) fail the same way."""
+        return FailingProxy(self._error)
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        """Any call raises the client error."""
+        raise self._error
+
+    def __iter__(self) -> Any:
+        """Iterating a cursor raises the client error."""
+        raise self._error
+
+
 class Adapter:
     """What the shared suite needs from one driver."""
 
@@ -258,6 +291,14 @@ class Adapter:
 
     def scramble_ids(self, store: Any) -> None:
         """Give every stored row a random id, as older releases wrote them (no-op where ids are random)."""
+
+    def server_address(self, store: Any) -> str:  # pragma: no cover - interface
+        """The configured server address a client error message would name."""
+        raise NotImplementedError
+
+    def fail_backend(self, store: Any, error: BaseException, *, after_exists: bool) -> None:  # pragma: no cover
+        """Make every client call raise ``error`` (``after_exists``: the existence check still answers)."""
+        raise NotImplementedError
 
 
 def ingest(store: Any, object_id: str, path: str, chunk_ids: Sequence[int], **kwargs: Any) -> List[Doc]:
@@ -394,6 +435,14 @@ class MilvusAdapter(Adapter):
         """The raw records the mock holds for the collection."""
         return self.client_cls._data.get(store.collection, [])
 
+    def server_address(self, store: Any) -> str:
+        """host:port of the Milvus server."""
+        return f'{store.host}:{store.port}'
+
+    def fail_backend(self, store: Any, error: BaseException, *, after_exists: bool) -> None:
+        """Every MilvusClient call raises (has_collection still answers when ``after_exists``)."""
+        store.client = FailingProxy(error, store.client, ('has_collection',) if after_exists else ())
+
     def seed_legacy(self, store: Any) -> None:
         """Rows as today's driver wrote them: random int64 ids, declared fields only."""
         store._createCollection(DIM)
@@ -481,6 +530,20 @@ class WeaviateAdapter(Adapter):
     def storage(self, store: Any) -> Dict[str, Dict[str, Any]]:
         """The mock's objects for the collection, keyed by uuid."""
         return self.mock.MockCollection._all_storage.setdefault(store.collection, {})
+
+    def server_address(self, store: Any) -> str:
+        """host:port of the Weaviate server."""
+        return f'{store.host}:{store.port}'
+
+    def fail_backend(self, store: Any, error: BaseException, *, after_exists: bool) -> None:
+        """Every client and collection call raises (collections.exists still answers when ``after_exists``)."""
+        if after_exists:
+            store._doesCollectionExist()
+            store.collectionObj = FailingProxy(error)
+            return
+        # close() still reaches the mock so the store's destructor stays quiet
+        store.client = FailingProxy(error, store.client, ('close',))
+        store.collectionObj = FailingProxy(error)
 
     def seed_legacy(self, store: Any) -> None:
         """Objects as today's driver wrote them: content-hash ids, declared fields only."""
@@ -577,6 +640,14 @@ class PineconeAdapter(Adapter):
     def storage(self, store: Any) -> Dict[str, Dict[str, Any]]:
         """The mock's vectors for the index, keyed by id."""
         return self.mock.MockIndex._all_storage.setdefault(store.collection, {})
+
+    def server_address(self, store: Any) -> str:
+        """The index host the control plane reports (the data-plane address)."""
+        return f'{store.collection}-mock.svc.example.invalid'
+
+    def fail_backend(self, store: Any, error: BaseException, *, after_exists: bool) -> None:
+        """Every client call raises (has_index still answers when ``after_exists``)."""
+        store.client = FailingProxy(error, store.client, ('has_index',) if after_exists else ())
 
     def seed_legacy(self, store: Any) -> None:
         """Vectors as today's driver wrote them: uuid4 ids, declared fields plus content."""
@@ -721,6 +792,14 @@ class AstraAdapter(Adapter):
         """The mock's documents for the collection."""
         return self.mock.Database._data.setdefault(store.collection_name, [])
 
+    def server_address(self, store: Any) -> str:
+        """The Data API endpoint."""
+        return store.api_endpoint
+
+    def fail_backend(self, store: Any, error: BaseException, *, after_exists: bool) -> None:
+        """Every database call raises (list_collection_names still answers when ``after_exists``)."""
+        store.database = FailingProxy(error, store.database, ('list_collection_names',) if after_exists else ())
+
     def seed_legacy(self, store: Any) -> None:
         """Documents as today's driver wrote them: uuid4 ids, declared fields with explicit nulls."""
         store._createCollection(DIM)
@@ -846,6 +925,15 @@ class AtlasAdapter(Adapter):
             store.collection.docs.append(
                 {'_id': random_uuid(), 'embedding': vector, 'content': content, 'meta': dict(meta)}
             )
+
+    def server_address(self, store: Any) -> str:
+        """The cluster address from the connection string."""
+        return store.host.split('://', 1)[-1]
+
+    def fail_backend(self, store: Any, error: BaseException, *, after_exists: bool) -> None:
+        """Every database and collection call raises (list_collection_names answers when ``after_exists``)."""
+        store.database = FailingProxy(error, store.database, ('list_collection_names',) if after_exists else ())
+        store.collection = FailingProxy(error)
 
     def ignore_offsets(self, store: Any) -> None:
         """Drop $skip stages and cursor skips."""

@@ -34,7 +34,9 @@ depends(requirements)
 from typing import List, Callable, Dict, Any, Iterator, Optional, Sequence, Tuple
 from uuid import uuid4
 import sys
+import functools
 import json
+import re
 import math
 import base64
 import numpy as np
@@ -50,7 +52,7 @@ from pydantic import ValidationError
 
 from ai.common.schema import Doc, DocFilter, DocMetadata, QuestionText
 from ai.common.store import DocumentStoreBase
-from ai.common.store.errors import StoreError, ToolRefusal
+from ai.common.store.errors import StoreError, StoreUnsupported, ToolRefusal
 from ai.common.store.vx_types import ChunkPage, DocPage, DocumentRow, StoreInfo
 from ai.common.config import Config
 
@@ -83,6 +85,66 @@ METRICS = {'cosine': 'cosine', 'euclidean': 'l2', 'dotproduct': 'ip', 'dotProduc
 
 # Most objectId x chunkId combinations one vectors read asks for
 VECTOR_BATCH_ROWS = 4096
+
+#: Exception types the driver and the store base raise with their own text (never a client message)
+_OWN_ERRORS = (Exception, RuntimeError, ValueError)
+
+
+def _error_code(error: BaseException) -> Optional[str]:
+    """The client's error code (a number or an UPPER_CASE name) when the exception carries one."""
+    for name in ('code', 'status_code', 'status', 'error_code'):
+        try:
+            value = getattr(error, name, None)
+        except Exception:
+            continue
+        if isinstance(value, bool) or callable(value):
+            continue
+        if isinstance(value, int):
+            return str(value)
+        if isinstance(value, str) and re.fullmatch(r'[A-Z][A-Z0-9_]{0,63}', value):
+            return value
+    return None
+
+
+def _client_failure(error: BaseException) -> Optional[BaseException]:
+    """The client-library exception in ``error``'s chain, or None when the driver raised it itself."""
+    seen = set()
+    link: Optional[BaseException] = error
+    while link is not None and id(link) not in seen:
+        seen.add(id(link))
+        if isinstance(link, (StoreError, StoreUnsupported, ToolRefusal)):
+            return None
+        if type(link) not in _OWN_ERRORS:
+            return link
+        link = link.__cause__ or link.__context__
+    return None
+
+
+def _backend_errors(operation: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    """
+    Re-raise a client failure inside ``operation`` as a StoreError with a fixed, host-free message.
+
+    Client errors name the server (host, port, endpoint) and the tool wrapper answers a failure
+    with the exception's text, so the text becomes 'Atlas <operation> failed: <ErrorClass> (code N)'.
+    The driver's own exceptions (refusals, ValueError for offsets, messages it wrote) pass through.
+    """
+
+    def decorate(fn: Callable[..., Any]) -> Callable[..., Any]:
+        @functools.wraps(fn)
+        def call(*args: Any, **kwargs: Any) -> Any:
+            try:
+                return fn(*args, **kwargs)
+            except Exception as error:
+                failure = _client_failure(error)
+                if failure is None:
+                    raise
+                code = _error_code(failure)
+                detail = type(failure).__name__ + (f' (code {code})' if code else '')
+                raise StoreError(f'Atlas {operation} failed: {detail}') from error
+
+        return call
+
+    return decorate
 
 
 def _meta_dump(metadata: DocMetadata) -> Dict[str, Any]:
@@ -295,17 +357,23 @@ class Store(DocumentStoreBase):
                 logger.info(f'Vector search index {self.vector_index_name} already exists')
 
         except Exception as e:
-            logger.error(f'Could not create vector search index: {e}')
+            # The client's text can name the cluster: log the error class and code only
+            code = _error_code(e)
+            logger.error(
+                f'Could not create vector search index: {type(e).__name__}' + (f' (code {code})' if code else '')
+            )
             logger.info('You may need to create the vector search index manually in Atlas UI')
 
         return True
 
+    @_backend_errors('count_documents')
     def count_documents(self) -> int:
         """Return the number of documents in the store."""
         if not self.doesCollectionExist():
             return 0
         return self.collection.count_documents({})
 
+    @_backend_errors('searchKeyword')
     def searchKeyword(self, query: QuestionText, docFilter: DocFilter) -> List[Doc]:
         """Perform keyword search using MongoDB text search."""
         if not self.doesCollectionExist():
@@ -327,6 +395,7 @@ class Store(DocumentStoreBase):
         results = list(self.collection.aggregate(pipeline))
         return self._convertToDocs(results, include_score=True, score_kind='text')
 
+    @_backend_errors('searchSemantic')
     def searchSemantic(self, query: QuestionText, docFilter: DocFilter) -> List[Doc]:
         """Perform semantic search using Atlas Vector Search."""
         if not self.doesCollectionExist():
@@ -372,6 +441,7 @@ class Store(DocumentStoreBase):
 
         return self._convertToDocs(results, include_score=True, floor=self.effectiveFloor(docFilter))
 
+    @_backend_errors('get')
     def get(self, docFilter: DocFilter, checkCollection: bool = True) -> List[Doc]:
         """Get documents matching the filter."""
         if checkCollection and not self.doesCollectionExist():
@@ -388,6 +458,7 @@ class Store(DocumentStoreBase):
         documents = list(cursor)
         return self._convertToDocs(documents)
 
+    @_backend_errors('getPaths')
     def getPaths(self, parent: str | None = None, offset: int = 0, limit: int = 1000) -> Dict[str, str]:
         """Get unique parent paths."""
         if not self.doesCollectionExist():
@@ -460,6 +531,7 @@ class Store(DocumentStoreBase):
         if documents:
             self.collection.insert_many(documents)
 
+    @_backend_errors('remove')
     def remove(self, objectIds: List[str]) -> None:
         """Remove documents by object IDs."""
         if not objectIds:
@@ -743,6 +815,7 @@ class Store(DocumentStoreBase):
             )
         return None, None
 
+    @_backend_errors('describe')
     def describe(self) -> StoreInfo:
         """Describe the collection; never raises for a missing one and never names the cluster."""
         caveats = ['experimental', 'cloud_only_unverified', 'extras_not_stored']
@@ -800,6 +873,7 @@ class Store(DocumentStoreBase):
             'threshold': self.threshold_search,
         }
 
+    @_backend_errors('countChunks')
     def countChunks(self, docFilter: DocFilter) -> Optional[int]:
         """Chunks matching ``docFilter``, control record excluded."""
         if not self._doesCollectionExist():
@@ -815,12 +889,14 @@ class Store(DocumentStoreBase):
         )
         return int(rows[0]['n']) if rows else 0
 
+    @_backend_errors('countDocuments')
     def countDocuments(self, docFilter: DocFilter) -> Optional[int]:
         """Distinct objectIds matching ``docFilter`` ($group), control record excluded."""
         if not self._doesCollectionExist():
             return 0
         return self._countGroups(self._notControl(self._convertFilter(docFilter)))
 
+    @_backend_errors('listDocuments')
     def listDocuments(
         self,
         *,
@@ -907,6 +983,7 @@ class Store(DocumentStoreBase):
             caveats=caveats,
         )
 
+    @_backend_errors('scrollChunks')
     def scrollChunks(self, objectId: str, *, after_chunk: int, limit: int, deleted: str) -> ChunkPage:
         """The chunks of one document after ``after_chunk``, sorted by chunkId, without embeddings."""
         after_chunk = int(after_chunk)
@@ -922,6 +999,7 @@ class Store(DocumentStoreBase):
         docs = [doc for doc in (self._toDoc(document) for document in documents[:limit]) if doc is not None]
         return ChunkPage(docs=docs, has_more=has_more, next_after=docs[-1].metadata.chunkId if docs else after_chunk)
 
+    @_backend_errors('sampleChunks')
     def sampleChunks(
         self,
         *,
@@ -997,6 +1075,7 @@ class Store(DocumentStoreBase):
                 break
         return docs, used
 
+    @_backend_errors('getVectors')
     def getVectors(self, keys: Sequence[Tuple[str, int]]) -> List[Doc]:
         """Chunks with embeddings for ``keys`` (by filter: ids are random), in request order."""
         wanted = [(str(o), int(c)) for o, c in keys or [] if o != CONTROL_OBJECT_ID]
@@ -1011,6 +1090,7 @@ class Store(DocumentStoreBase):
                     found.setdefault((doc.metadata.objectId, doc.metadata.chunkId), doc)
         return [found[key] for key in wanted if key in found]
 
+    @_backend_errors('removeCounted')
     def removeCounted(self, objectIds: List[str]) -> Optional[int]:
         """Remove every chunk of ``objectIds``; return the rows Atlas reports deleted."""
         ids = [o for o in objectIds or [] if o != CONTROL_OBJECT_ID]

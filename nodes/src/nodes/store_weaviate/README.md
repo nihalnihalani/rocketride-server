@@ -122,6 +122,7 @@ The Vector Explorer app supports Weaviate as **experimental**: its explorer func
 - Chunk and document counts honour the active, deleted and all views; the collection's control record is never counted or listed, and its embedding model and dimension are reported from it.
 - Samples for the embedding map are taken in object-id order, and the neighbour graph is computed on the node, not by Weaviate.
 - Removing a document reports the number of chunks it removed.
+- When Weaviate fails (unreachable, or a request it rejects), the explorer and the store's tools report `Weaviate <operation> failed: <error class> (code N)`. The client's own message, which can name the server, is not passed on.
 
 ## Upstream docs
 

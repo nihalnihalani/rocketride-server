@@ -477,6 +477,65 @@ def test_services_json_cases_replay_on_the_mock(adapter, store):
         assert failures == [], f'{case.get("name")}: {failures}'
 
 
+# -----------------------------------------------------------------------------
+# Backend failures never carry the server address
+# -----------------------------------------------------------------------------
+
+
+class FakeClientError(Exception):
+    """A client library error: like pymongo's or pymilvus', its message names the server."""
+
+    code = 2
+
+
+#: Every store call a tool can reach: the explorer hooks and the methods behind the legacy tools.
+TOOL_CALLS = {
+    'describe': lambda store: store.describe(),
+    'countChunks': lambda store: store.countChunks(DocFilter()),
+    'countDocuments': lambda store: store.countDocuments(DocFilter()),
+    'listDocuments': lambda store: store.listDocuments(
+        cursor=None, limit=5, object_ids=None, deleted='active', sort='path'
+    ),
+    'scrollChunks': lambda store: store.scrollChunks('doc-a', after_chunk=-1, limit=5, deleted='active'),
+    'sampleChunks': lambda store: store.sampleChunks(
+        n=3, seed=1, strategy='random', docFilter=h.VxFilter(deleted='active'), include_keys=[]
+    ),
+    'getVectors': lambda store: store.getVectors([('doc-a', 0)]),
+    'removeCounted': lambda store: store.removeCounted(['doc-a']),
+    'searchSemantic': lambda store: store.searchSemantic(_question(), DocFilter(limit=5)),
+    'searchKeyword': lambda store: store.searchKeyword(_question('chunk'), DocFilter(limit=5)),
+    'count_documents': lambda store: store.count_documents(),
+    'get': lambda store: store.get(DocFilter(objectIds=['doc-a'])),
+    'getPaths': lambda store: store.getPaths(),
+    'remove': lambda store: store.remove(['doc-a']),
+}
+
+
+@pytest.mark.parametrize('after_exists', [False, True], ids=['unreachable', 'reads-fail'])
+@pytest.mark.parametrize('call', sorted(TOOL_CALLS))
+def test_backend_failures_do_not_name_the_server(adapter, store, call, after_exists):
+    """A client error that names the server surfaces as a host-free error (the tool's STORE_ERROR text)."""
+    if not hasattr(store, call):
+        pytest.skip(f'NOT RUN: {adapter.name} has no {call}')
+    h.ingest(store, 'doc-a', '/docs/a.md', [0, 1])
+    address = adapter.server_address(store)
+    adapter.fail_backend(
+        store, FakeClientError(f'Fail connecting to server on {address}: Connection refused'), after_exists=after_exists
+    )
+    try:
+        TOOL_CALLS[call](store)
+    except StoreUnsupported:
+        return  # refused before any backend call (e.g. keyword search on Pinecone)
+    except Exception as error:  # noqa: BLE001 - every failure must be host-free
+        answer = f'{type(error).__name__}: {error}'  # what the tool wrapper puts in a STORE_ERROR answer
+        assert address not in answer, answer
+        assert 'FakeClientError' in answer, answer
+        assert '(code 2)' in answer, answer
+    else:
+        # Only the base defaults that never touch the backend may answer
+        assert call not in vars(type(store)), f'{call} answered although every backend call fails'
+
+
 @pytest.mark.skip(reason='NEEDS:L1 merged — integration gate G2 (dialect/stats live in vx_tools on L1)')
 def test_dialect_and_stats_through_the_mixin(adapter, store):
     """The dialect and stats tools answer through VectorStoreToolMixin with this driver's hooks."""

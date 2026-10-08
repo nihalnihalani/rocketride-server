@@ -38,6 +38,7 @@ import numpy as np
 from pymilvus import MilvusClient, DataType
 
 import re
+import functools
 import json
 import uuid
 import base64
@@ -46,7 +47,7 @@ import engLib
 
 from ai.common.schema import Doc, DocFilter, DocMetadata, QuestionText
 from ai.common.store import DocumentStoreBase
-from ai.common.store.errors import StoreUnsupported, ToolRefusal
+from ai.common.store.errors import StoreError, StoreUnsupported, ToolRefusal
 from ai.common.store.vx_types import ChunkPage, DocPage, DocumentRow, StoreInfo
 from ai.common.config import Config
 
@@ -67,6 +68,67 @@ METRICS = {'COSINE': 'cosine', 'L2': 'l2', 'IP': 'ip'}
 
 # Most objectId x chunkId combinations one vectors read asks for
 VECTOR_BATCH_ROWS = 4096
+
+
+#: Exception types the driver and the store base raise with their own text (never a client message)
+_OWN_ERRORS = (Exception, RuntimeError, ValueError)
+
+
+def _error_code(error: BaseException) -> Optional[str]:
+    """The client's error code (a number or an UPPER_CASE name) when the exception carries one."""
+    for name in ('code', 'status_code', 'status', 'error_code'):
+        try:
+            value = getattr(error, name, None)
+        except Exception:
+            continue
+        if isinstance(value, bool) or callable(value):
+            continue
+        if isinstance(value, int):
+            return str(value)
+        if isinstance(value, str) and re.fullmatch(r'[A-Z][A-Z0-9_]{0,63}', value):
+            return value
+    return None
+
+
+def _client_failure(error: BaseException) -> Optional[BaseException]:
+    """The client-library exception in ``error``'s chain, or None when the driver raised it itself."""
+    seen = set()
+    link: Optional[BaseException] = error
+    while link is not None and id(link) not in seen:
+        seen.add(id(link))
+        if isinstance(link, (StoreError, StoreUnsupported, ToolRefusal)):
+            return None
+        if type(link) not in _OWN_ERRORS:
+            return link
+        link = link.__cause__ or link.__context__
+    return None
+
+
+def _backend_errors(operation: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    """
+    Re-raise a client failure inside ``operation`` as a StoreError with a fixed, host-free message.
+
+    Client errors name the server (host, port, endpoint) and the tool wrapper answers a failure
+    with the exception's text, so the text becomes 'Milvus <operation> failed: <ErrorClass> (code N)'.
+    The driver's own exceptions (refusals, ValueError for offsets, messages it wrote) pass through.
+    """
+
+    def decorate(fn: Callable[..., Any]) -> Callable[..., Any]:
+        @functools.wraps(fn)
+        def call(*args: Any, **kwargs: Any) -> Any:
+            try:
+                return fn(*args, **kwargs)
+            except Exception as error:
+                failure = _client_failure(error)
+                if failure is None:
+                    raise
+                code = _error_code(failure)
+                detail = type(failure).__name__ + (f' (code {code})' if code else '')
+                raise StoreError(f'Milvus {operation} failed: {detail}') from error
+
+        return call
+
+    return decorate
 
 
 def _escape_milvus_str(value: object) -> str:
@@ -370,6 +432,7 @@ class Store(DocumentStoreBase):
         # Return it
         return docs
 
+    @_backend_errors('count_documents')
     def count_documents(self) -> int:
         """
         Return the number of vectors in the document store, not the number of documents themselves.
@@ -387,6 +450,7 @@ class Store(DocumentStoreBase):
         # Parse query result
         return res[0]['count(*)']
 
+    @_backend_errors('searchKeyword')
     def searchKeyword(self, query: QuestionText, docFilter: DocFilter) -> List[Doc]:
         """
         Keyword search.
@@ -422,6 +486,7 @@ class Store(DocumentStoreBase):
         # Return them
         return docs
 
+    @_backend_errors('searchSemantic')
     def searchSemantic(self, query: QuestionText, docFilter: DocFilter) -> List[Doc]:
         """
         Semantic search.
@@ -469,6 +534,7 @@ class Store(DocumentStoreBase):
         # Return the results
         return docs
 
+    @_backend_errors('get')
     def get(self, docFilter: DocFilter, checkCollection: bool = True) -> List[Doc]:
         """
         Retrieve document groups matching a given filter.
@@ -496,6 +562,7 @@ class Store(DocumentStoreBase):
         # Convert results to Docs
         return self._convertToDocs(results)
 
+    @_backend_errors('getPaths')
     def getPaths(self, parent: str | None = None, offset: int = 0, limit: int = 1000) -> Dict[str, str]:
         """
         Retrieve unique parent paths of the live documents (never the control record).
@@ -604,6 +671,7 @@ class Store(DocumentStoreBase):
         # Flush any remaining chunks
         flush_batch()
 
+    @_backend_errors('remove')
     def remove(self, objectIds: List[str]) -> None:
         """
         Delete all documents with a matching objectIds from the document store.
@@ -797,6 +865,7 @@ class Store(DocumentStoreBase):
             doc.embedding = [float(x) for x in row.get('vector') or []]
         return doc
 
+    @_backend_errors('describe')
     def describe(self) -> StoreInfo:
         """Describe the collection; never raises for a missing one and never names the host."""
         caveats = ['experimental']
@@ -881,6 +950,7 @@ class Store(DocumentStoreBase):
             'threshold': self.threshold_search,
         }
 
+    @_backend_errors('countChunks')
     def countChunks(self, docFilter: DocFilter) -> Optional[int]:
         """Chunk rows matching ``docFilter``, control record excluded."""
         if not self._doesCollectionExist():
@@ -889,6 +959,7 @@ class Store(DocumentStoreBase):
         conditions.append(f"meta['objectId'] != '{CONTROL_OBJECT_ID}'")
         return self._countWhere(conditions)
 
+    @_backend_errors('listDocuments')
     def listDocuments(
         self,
         *,
@@ -993,6 +1064,7 @@ class Store(DocumentStoreBase):
             caveats=caveats,
         )
 
+    @_backend_errors('scrollChunks')
     def scrollChunks(self, objectId: str, *, after_chunk: int, limit: int, deleted: str) -> ChunkPage:
         """The chunks of one document after ``after_chunk``, in chunk order, without embeddings."""
         after_chunk = int(after_chunk)
@@ -1023,6 +1095,7 @@ class Store(DocumentStoreBase):
             next_after = max(next_after, high)
         return ChunkPage(docs=docs, has_more=bool(more), next_after=next_after)
 
+    @_backend_errors('sampleChunks')
     def sampleChunks(
         self,
         *,
@@ -1056,6 +1129,7 @@ class Store(DocumentStoreBase):
                 break
         return docs, 'first'
 
+    @_backend_errors('getVectors')
     def getVectors(self, keys: Sequence[Tuple[str, int]]) -> List[Doc]:
         """Chunks with embeddings for ``keys`` (by filter: Milvus ids are random), in request order."""
         wanted = [(str(o), int(c)) for o, c in keys or [] if o != CONTROL_OBJECT_ID]
@@ -1074,6 +1148,7 @@ class Store(DocumentStoreBase):
                 found.setdefault((doc.metadata.objectId, doc.metadata.chunkId), doc)
         return [found[key] for key in wanted if key in found]
 
+    @_backend_errors('removeCounted')
     def removeCounted(self, objectIds: List[str]) -> Optional[int]:
         """Remove every chunk of ``objectIds``; return the rows removed (counted first)."""
         ids = [o for o in objectIds or [] if o != CONTROL_OBJECT_ID]
