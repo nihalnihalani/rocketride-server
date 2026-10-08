@@ -1541,11 +1541,9 @@ class VectorStoreToolMixin(VectorExplorerTools):
         """Add or update documents in the vector database (gated; see ``vx_write_gate``)."""
         store = self._vectordb_store()
 
+        # The gate runs first (on the documents as sent), then the input is checked.
         raw_docs = args.get('documents', [])
-        if not isinstance(raw_docs, list) or not raw_docs:
-            raise ToolRefusal('INVALID_INPUT', 'upsert requires a non-empty "documents" array')
-
-        candidates = [raw for raw in raw_docs if isinstance(raw, dict)]
+        candidates = [raw for raw in raw_docs if isinstance(raw, dict)] if isinstance(raw_docs, list) else []
         decision = vx_write_gate.check_write(
             'upsert',
             object_ids=[str(raw.get('object_id', '')).strip() for raw in candidates],
@@ -1555,6 +1553,8 @@ class VectorStoreToolMixin(VectorExplorerTools):
                 raw.get('embedding') is not None or raw.get('embedding_model') for raw in candidates
             ),
         )
+        if not isinstance(raw_docs, list) or not raw_docs:
+            raise ToolRefusal('INVALID_INPUT', 'upsert requires a non-empty "documents" array')
 
         embed_model_name = getattr(getattr(self, 'IGlobal', None), 'embed_model_name', None)
 
@@ -1640,20 +1640,19 @@ class VectorStoreToolMixin(VectorExplorerTools):
         """Delete documents from the vector database by object IDs (gated; see ``vx_write_gate``)."""
         store = self._vectordb_store()
 
+        # The gate runs first (on the ids as sent), then the input is checked.
         object_ids = args.get('object_ids', [])
-        if not isinstance(object_ids, list) or not object_ids:
-            raise ToolRefusal('INVALID_INPUT', 'delete requires a non-empty "object_ids" array')
-
-        clean_ids = [str(oid).strip() for oid in object_ids if str(oid).strip()]
-        if not clean_ids:
-            raise ToolRefusal('INVALID_INPUT', 'delete: no valid object IDs provided')
-
+        clean_ids = [str(oid).strip() for oid in object_ids if str(oid).strip()] if isinstance(object_ids, list) else []
         decision = vx_write_gate.check_write(
             'delete',
             object_ids=clean_ids,
             allow_writes=self._vx_allow_writes(),
             agent_writes=self._vx_agent_writes(),
         )
+        if not isinstance(object_ids, list) or not object_ids:
+            raise ToolRefusal('INVALID_INPUT', 'delete requires a non-empty "object_ids" array')
+        if not clean_ids:
+            raise ToolRefusal('INVALID_INPUT', 'delete: no valid object IDs provided')
         if decision.origin != 'agent' and len(clean_ids) > VECTOR_TOOL_LIMITS['write_ids_max']:
             raise ToolRefusal(
                 'INVALID_INPUT', f'object_ids must be a list of 1 to {VECTOR_TOOL_LIMITS["write_ids_max"]} strings.'

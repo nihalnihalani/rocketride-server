@@ -528,6 +528,13 @@ def _strings_arg(value: Any, name: str, max_n: int) -> List[str]:
     return out
 
 
+def _gate_ids(value: Any) -> List[str]:
+    """The ids a write call names, as text, for the gate (which runs before the input is checked)."""
+    if not isinstance(value, (list, tuple)):
+        return []
+    return [item if isinstance(item, str) else str(item) for item in value]
+
+
 def _filter_object_ids(args: Mapping[str, Any]) -> Optional[List[str]]:
     flt = args.get('filter')
     if flt is None:
@@ -1882,13 +1889,14 @@ class VectorExplorerTools:
     def remove_document(self, args):
         """Remove whole documents by objectId (gated)."""
         store = self._vx_store()
-        ids = _strings_arg(args.get('object_ids'), 'object_ids', LIMITS['write_ids_max'])
+        # The gate runs first (on the ids as sent), then the input is checked.
         decision = vx_write_gate.check_write(
             'remove_document',
-            object_ids=ids,
+            object_ids=_gate_ids(args.get('object_ids')),
             allow_writes=self._vx_allow_writes(),
             agent_writes=self._vx_agent_writes(),
         )
+        ids = _strings_arg(args.get('object_ids'), 'object_ids', LIMITS['write_ids_max'])
         removed, not_found, rows = self._vx_remove(store, ids)
         self._vx_log_write('vector.remove_document', ids, rows, decision.origin)
         return {

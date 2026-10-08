@@ -25,8 +25,8 @@
 
 """The write gate of the vector store tools. It fails closed.
 
-``remove_document``, ``delete`` and ``upsert`` call :func:`check_write` before
-they touch the store. The gate reads who is calling only from the context the
+``remove_document``, ``delete`` and ``upsert`` call :func:`check_write` first,
+before they check their input or touch the store. The gate reads who is calling only from the context the
 engine attached to the call (``ai.common.tool_context.current_tool_call()``);
 nothing in the tool input is ever read as context. It checks, in order:
 

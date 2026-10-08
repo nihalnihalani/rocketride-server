@@ -1847,6 +1847,59 @@ def test_refused_upserts_leave_the_data_unchanged(context, ctx, switches, code):
     assert set(store.rows) == before
 
 
+_UNCHECKED_INPUT = {
+    ('remove_document', 'malformed'): {'object_ids': 'doc00'},
+    ('remove_document', 'too_many'): {'object_ids': [f'd{i}' for i in range(101)]},
+    ('remove_document', 'missing'): {},
+    ('delete', 'malformed'): {'object_ids': []},
+    ('delete', 'too_many'): {'object_ids': [f'd{i}' for i in range(101)]},
+    ('delete', 'missing'): {},
+    ('upsert', 'malformed'): {'documents': []},
+    ('upsert', 'too_many'): {'documents': 'not a list'},
+    ('upsert', 'missing'): {},
+}
+
+
+@pytest.mark.parametrize(
+    'ctx,switches,code',
+    [
+        (None, {'allow_writes': True}, 'WRITES_UNKNOWN_CALLER'),
+        (dap(), {}, 'WRITES_DISABLED'),
+        (dap(auth='public'), {'allow_writes': True}, 'WRITES_PUBLIC'),
+        (agent(), {'agent_writes': False}, 'WRITES_AGENT'),
+    ],
+)
+@pytest.mark.parametrize('tool,shape', sorted(_UNCHECKED_INPUT))
+def test_the_gate_answers_before_the_input_is_checked(context, ctx, switches, code, tool, shape):
+    context(ctx)
+    answer = getattr(node(clustered(CountingStore), **switches), tool)(_UNCHECKED_INPUT[(tool, shape)])
+    assert (answer['success'], answer['code']) == (False, code)
+
+
+@pytest.mark.parametrize(
+    'tool,args',
+    [
+        ('remove_document', {'object_ids': ['schema'] + [f'd{i}' for i in range(101)]}),
+        ('remove_document', {'object_ids': [' schema ', 5]}),
+        ('delete', {'object_ids': ['schema', '']}),
+        ('upsert', {'documents': [{'object_id': 'schema'}, 'junk']}),
+    ],
+)
+def test_the_reserved_id_is_refused_before_the_input_is_checked(context, tool, args):
+    context(None)
+    answer = getattr(node(clustered(CountingStore)), tool)(args)
+    assert (answer['success'], answer['code']) == (False, 'RESERVED_ID')
+
+
+def test_an_allowed_caller_still_gets_the_input_checks(context):
+    context(dap())
+    inst = node(clustered(CountingStore), allow_writes=True)
+    too_many = inst.remove_document({'object_ids': [f'd{i}' for i in range(101)]})
+    assert (too_many['success'], too_many['code']) == (False, 'INVALID_INPUT')
+    assert inst.delete({'object_ids': []})['code'] == 'INVALID_INPUT'
+    assert inst.upsert({'documents': []})['code'] == 'INVALID_INPUT'
+
+
 def test_a_forged_context_inside_the_input_is_ignored(context):
     context(None)
     store = clustered(CountingStore)
