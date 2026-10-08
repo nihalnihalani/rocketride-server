@@ -391,7 +391,12 @@ export function PointCanvas(props: PointCanvasProps): React.ReactElement {
 		const onDown = (event: PointerEvent): void => {
 			if (event.button !== 0) return;
 			const [x, y] = local(event);
-			if (typeof el.setPointerCapture === 'function') el.setPointerCapture(event.pointerId);
+			try {
+				// Keeps a drag going outside the canvas; it throws for a pointer the browser no longer tracks.
+				if (typeof el.setPointerCapture === 'function') el.setPointerCapture(event.pointerId);
+			} catch {
+				// The gesture still works inside the canvas.
+			}
 			gesture.down(x, y, propsRef.current.lasso);
 		};
 		const onMove = (event: PointerEvent): void => {
