@@ -870,7 +870,8 @@ class AstraAdapter(Adapter):
             self.rows(store).append({'_id': random_uuid(), '$vector': vector, 'content': content, 'meta': dict(meta)})
 
     def ignore_offsets(self, store: Any) -> None:
-        """Make find ignore skip."""
+        """Make find ignore skip and page states (with pages of 2, so a listing crosses pages)."""
+        self.mock.Database.page_size = 2  # restored by the next new_store (Database.reset)
         original_get = store.database.get_collection
 
         def get_collection(name: str) -> Any:
@@ -879,6 +880,7 @@ class AstraAdapter(Adapter):
             def factory(original: Callable[..., Any]) -> Callable[..., Any]:
                 def find(*args: Any, **kwargs: Any) -> Any:
                     kwargs.pop('skip', None)
+                    kwargs.pop('initial_page_state', None)
                     return original(*args, **kwargs)
 
                 return find

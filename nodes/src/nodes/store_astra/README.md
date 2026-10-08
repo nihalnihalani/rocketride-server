@@ -106,7 +106,8 @@ That ordering detail matters when rendering a document whose chunks were written
 
 The Vector Explorer app supports Astra DB as **experimental**: its explorer functions are tested against an in-memory stand-in for the Data API client, not against Astra. What the app sees on Astra:
 
-- The document list pages through each document's chunk 0, ordered by object id (the app sorts what it has loaded by path). It shows no chunk count per document: the Data API cannot count per document without one request per row. A document whose chunk 0 is missing is not listed. File size and ingest time are not shown because Astra does not keep them.
+- The document list pages through each document's chunk 0 in Astra's own storage order, following the Data API's page state (the app sorts what it has loaded by path). It shows no chunk count per document: the Data API cannot count per document without one request per row. A document whose chunk 0 is missing is not listed.
+- The explorer never asks Astra to sort on a metadata field: the Data API answers such a request with at most 20 documents and sorts at most 10,000 rows in memory. Lists, chunk pages and the `objdir` paths are read unsorted, and a document's chunks are read by ranges of chunk ids and put in order on the node. File size and ingest time are not shown because Astra does not keep them.
 - Chunk counts honour the active, deleted and all views; the collection's control record is never counted or listed. Collections written by earlier releases have no embedding model in their control record, so the model is shown as unknown there.
 - Samples for the embedding map are taken in storage order, and the neighbour graph is computed on the node.
 - Removing a document reports the number of chunks it removed.

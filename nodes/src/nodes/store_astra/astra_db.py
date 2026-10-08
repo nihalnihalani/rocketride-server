@@ -70,6 +70,13 @@ METRICS = {'cosine': 'cosine', 'euclidean': 'l2', 'dot_product': 'ip'}
 # Most objectId x chunkId combinations one vectors read asks for
 VECTOR_BATCH_ROWS = 1000
 
+# Doubling steps the chunk scroll takes to find the next chunk id after a gap
+GAP_SEARCH_STEPS = 64
+
+# Note on sorting: a find sorted on a regular field (not $vector / $lexical) returns at most 20
+# documents and stops there, and sorts at most 10,000 matching rows in memory. Every read below
+# is therefore unsorted (the Data API pages it) and ordered on the node where order matters.
+
 
 #: Exception types the driver and the store base raise with their own text (never a client message)
 _OWN_ERRORS = (Exception, RuntimeError, ValueError)
@@ -149,26 +156,58 @@ def _field(obj: Any, name: str, default: Any = None) -> Any:
     return getattr(obj, name, default)
 
 
-def _encode_cursor(offset: int, first: Optional[str]) -> str:
-    """Opaque listing cursor: the next offset and the first objectId of the page just served."""
-    raw = json.dumps({'o': offset, 'f': first}, separators=(',', ':')).encode('utf-8')
+def _encode_cursor(state: Optional[str], skip: int, first: Optional[str]) -> str:
+    """
+    Opaque listing cursor: the Data API page state to resume from (None: the first page), how many
+    of that page's documents were already served, and the listing's first objectId.
+    """
+    raw = json.dumps({'s': state, 'k': skip, 'f': first}, separators=(',', ':')).encode('utf-8')
     return base64.urlsafe_b64encode(raw).decode('ascii').rstrip('=')
 
 
-def _decode_cursor(cursor: Optional[str]) -> Tuple[int, Optional[str]]:
+def _decode_cursor(cursor: Optional[str]) -> Tuple[Optional[str], int, Optional[str]]:
     """Read a cursor from :func:`_encode_cursor`; anything else is INVALID_INPUT."""
     if not cursor:
-        return 0, None
+        return None, 0, None
     try:
         padded = cursor + '=' * (-len(cursor) % 4)
         data = json.loads(base64.urlsafe_b64decode(padded.encode('ascii')).decode('utf-8'))
-        offset = int(data['o'])
+        state = data['s']
+        skip = int(data['k'])
         first = data.get('f')
-        if offset < 0 or (first is not None and not isinstance(first, str)):
+        if (state is not None and not isinstance(state, str)) or skip < 0:
             raise ValueError('cursor out of range')
-        return offset, first
+        if first is not None and not isinstance(first, str):
+            raise ValueError('cursor out of range')
+        return state, skip, first
     except Exception:
         raise ToolRefusal('INVALID_INPUT', 'cursor is not one this store issued')
+
+
+def _first_chunk_after(exists: Callable[[int, int], bool], high: int, span: int) -> Optional[int]:
+    """
+    The smallest chunk id above ``high``, found with existence probes.
+
+    ``exists(low, top)`` says whether a chunk id lies in (low, top]. Windows of doubling width
+    find the first non-empty one, then a binary search finds its smallest id: a few probes of
+    one row each instead of one empty page per ``span`` ids. None when nothing is within reach.
+    """
+    low, width = high, max(1, span)
+    for _ in range(GAP_SEARCH_STEPS):
+        top = low + width
+        if exists(low, top):
+            break
+        low, width = top, width * 2
+    else:
+        return None
+    empty, found = low, top
+    while found - empty > 1:
+        middle = (empty + found) // 2
+        if exists(low, middle):
+            found = middle
+        else:
+            empty = middle
+    return found
 
 
 def _key_batches(keys: Sequence[Tuple[str, int]]) -> Iterator[Tuple[List[str], List[int]]]:
@@ -479,8 +518,8 @@ class Store(DocumentStoreBase):
         """
         Retrieve documents matching the filter.
 
-        A non-zero offset pages with ``skip``, which the Data API accepts only together
-        with a sort, so those reads are ordered by (objectId, chunkId).
+        The offset is applied here, on an unsorted read: ``skip`` needs a sort, and a sorted find
+        returns at most 20 documents. Unsorted reads come back in the same order for the same data.
         """
         if checkCollection and not self._doesCollectionExist():
             return []
@@ -488,20 +527,11 @@ class Store(DocumentStoreBase):
         collection = self.database.get_collection(self.collection_name)
 
         filter_dict = self._convertFilter(docFilter)
+        offset = max(0, int(docFilter.offset or 0))
+        limit = docFilter.limit or 100
 
-        # Execute query
-        if docFilter.offset:
-            cursor = collection.find(
-                filter=filter_dict,
-                sort={'meta.objectId': 1, 'meta.chunkId': 1},
-                skip=docFilter.offset,
-                limit=docFilter.limit or 100,
-            )
-        else:
-            cursor = collection.find(filter=filter_dict, limit=docFilter.limit or 100)
-
-        # Convert to Doc objects
-        documents = list(cursor)
+        # Execute query: the first offset + limit documents, then drop the offset
+        documents = list(collection.find(filter=filter_dict, limit=offset + limit))[offset:]
         return self._convertToDocs(documents)
 
     @_backend_errors('getPaths')
@@ -509,7 +539,8 @@ class Store(DocumentStoreBase):
         """
         Return the parent paths of the live documents (never the control record).
 
-        Reads chunk 0 of each document ordered by path; the Data API has no aggregation.
+        Reads chunk 0 of each document in storage order (unsorted: a sorted find returns at most
+        20 documents) and applies ``offset`` here; the Data API has no aggregation.
         """
         if not self._doesCollectionExist():
             return {}
@@ -521,17 +552,14 @@ class Store(DocumentStoreBase):
             match_filter['meta.parent'] = parent
 
         collection = self.database.get_collection(self.collection_name)
-        cursor = collection.find(
-            filter=match_filter,
-            sort={'meta.parent': 1},
-            skip=offset or None,
-            limit=limit,
-            projection={'meta': True},
-        )
+        offset = max(0, int(offset or 0))
+        cursor = collection.find(filter=match_filter, limit=offset + limit, projection={'meta': True})
 
         # Build paths dictionary
         paths: Dict[str, str] = {}
-        for document in cursor:
+        for index, document in enumerate(cursor):
+            if index < offset:
+                continue
             meta = document.get('meta') or {}
             parent_path = meta.get('parent')
             object_id = meta.get('objectId')
@@ -835,18 +863,19 @@ class Store(DocumentStoreBase):
         sort: str,
     ) -> DocPage:
         """
-        One page of documents: chunk-0 documents by offset (ordered by objectId so skip is allowed).
+        One page of documents: chunk-0 documents in storage order, paged with the Data API's page state.
 
-        A document whose chunk 0 is missing is not listed. Chunk counts are not reported (one count
-        request per document is too costly); the total is unknown above the count ceiling.
+        The read is unsorted because a sorted find returns at most 20 documents. A document whose
+        chunk 0 is missing is not listed. Chunk counts are not reported (one count request per
+        document is too costly); the total is unknown above the count ceiling.
         """
-        offset, previous_first = _decode_cursor(cursor)
+        state, skip, first_of_listing = _decode_cursor(cursor)
         limit = max(1, int(limit))
         caveats = ['documents_unsorted', 'documents_by_first_chunk', 'extras_not_stored']
 
         if not self._doesCollectionExist():
             return DocPage(
-                items=[], next_cursor=None, total=0, counts_exact=True, distinct=False, sorted=False, caveats=caveats
+                items=[], next_cursor=None, total=0, counts_exact=False, distinct=False, sorted=False, caveats=caveats
             )
 
         first_chunks = self._notControl(
@@ -854,40 +883,44 @@ class Store(DocumentStoreBase):
                 DocFilter(chunkIds=[0], objectIds=list(object_ids) if object_ids else None), deleted=deleted
             )
         )
-        documents = list(
-            self._collection().find(
-                filter=first_chunks,
-                sort={'meta.objectId': 1},
-                skip=offset or None,
-                limit=limit + 1,
-                projection={'meta': True},
-            )
-        )
 
-        # The backend ignored the offset: this page repeats the previous one
-        if (
-            previous_first is not None
-            and documents
-            and (documents[0].get('meta') or {}).get('objectId') == previous_first
-        ):
-            return DocPage(
-                items=[],
-                next_cursor=None,
-                total=None,
-                counts_exact=True,
-                distinct=False,
-                sorted=False,
-                caveats=caveats + ['documents_paging_unsupported'],
-            )
+        def object_of(document: Dict[str, Any]) -> Optional[str]:
+            return (document.get('meta') or {}).get('objectId')
 
-        has_more = len(documents) > limit
-        documents = documents[:limit]
+        served: List[Dict[str, Any]] = []
+        next_cursor: Optional[str] = None
+        for _ in range(limit + 2):
+            options = {'initial_page_state': state} if state else {}
+            page = self._collection().find(filter=first_chunks, projection={'meta': True}, **options).fetch_next_page()
+            results = list(page.results or [])
+
+            # The backend ignored the page state: it answered the listing's first page again
+            if state and results and first_of_listing is not None and object_of(results[0]) == first_of_listing:
+                caveats = caveats + ['documents_paging_unsupported']
+                next_cursor = None
+                break
+            if state is None and skip == 0 and first_of_listing is None and results:
+                first_of_listing = object_of(results[0])
+
+            remaining = results[skip:]
+            room = limit - len(served)
+            served.extend(remaining[:room])
+            if len(remaining) > room:
+                # Stopped inside this page: resume from the same page state, further in
+                next_cursor = _encode_cursor(state, skip + room, first_of_listing)
+                break
+            if not page.next_page_state:
+                break
+            state, skip = page.next_page_state, 0
+            if len(served) >= limit:
+                next_cursor = _encode_cursor(state, 0, first_of_listing)
+                break
 
         # No chunk counts: the Data API has no group-by, and a count per document would cost one
         # request per row (the contract allows chunks=None when counting is not cheap)
         items: List[DocumentRow] = []
         seen = set()
-        for document in documents:
+        for document in served:
             meta = document.get('meta') or {}
             object_id = meta.get('objectId')
             if not object_id or object_id in seen:
@@ -909,10 +942,9 @@ class Store(DocumentStoreBase):
                 )
             )
 
-        first = (documents[0].get('meta') or {}).get('objectId') if documents else None
         return DocPage(
             items=items,
-            next_cursor=_encode_cursor(offset + limit, first) if has_more else None,
+            next_cursor=next_cursor,
             total=self._countWhere(first_chunks),
             counts_exact=False,
             distinct=False,
@@ -920,23 +952,53 @@ class Store(DocumentStoreBase):
             caveats=caveats,
         )
 
+    def _chunkWindow(self, document: Dict[str, Any], low: int, high: int, *, probe: bool = False) -> List[Doc]:
+        """Chunks of one document with low < chunkId <= high (unsorted read; ``probe``: at most one)."""
+        filter_dict = dict(document)
+        filter_dict['meta.chunkId'] = {'$gt': low, '$lte': high}
+        rows = self._collection().find(
+            filter=filter_dict, limit=1 if probe else None, projection={'meta': True, 'content': True}
+        )
+        return [self._toDoc(row) for row in rows]
+
+    def _chunkAfter(self, document: Dict[str, Any], high: int) -> bool:
+        """Whether the document has a chunk with chunkId > high."""
+        filter_dict = dict(document)
+        filter_dict['meta.chunkId'] = {'$gt': high}
+        return bool(list(self._collection().find(filter=filter_dict, limit=1, projection={'meta': True})))
+
     @_backend_errors('scrollChunks')
     def scrollChunks(self, objectId: str, *, after_chunk: int, limit: int, deleted: str) -> ChunkPage:
-        """The chunks of one document after ``after_chunk``, sorted by chunkId, without embeddings."""
+        """
+        The chunks of one document after ``after_chunk``, in chunk order, without embeddings.
+
+        Reads the window of chunk ids (after_chunk, after_chunk + limit] unsorted and orders it here
+        (a sorted find returns at most 20 documents). When the window is empty but the document
+        goes on, the next chunk id is found with a few one-row probes and the window starts there.
+        """
         after_chunk = int(after_chunk)
         limit = max(1, int(limit))
         if objectId == CONTROL_OBJECT_ID or not self._doesCollectionExist():
             return ChunkPage(docs=[], has_more=False, next_after=after_chunk)
-        filter_dict = self._convertFilter(DocFilter(objectIds=[objectId]), deleted=deleted)
-        filter_dict['meta.chunkId'] = {'$gt': after_chunk}
-        documents = list(
-            self._collection().find(
-                filter=filter_dict, sort={'meta.chunkId': 1}, limit=limit + 1, projection={'$vector': False}
+
+        document = self._convertFilter(DocFilter(objectIds=[objectId]), deleted=deleted)
+        low = after_chunk
+        docs = self._chunkWindow(document, low, low + limit)
+        more = self._chunkAfter(document, low + limit)
+        if not docs and more:
+            first = _first_chunk_after(
+                lambda lo, hi: bool(self._chunkWindow(document, lo, hi, probe=True)), low + limit, limit
             )
-        )
-        has_more = len(documents) > limit
-        docs = [self._toDoc(document) for document in documents[:limit]]
-        return ChunkPage(docs=docs, has_more=has_more, next_after=docs[-1].metadata.chunkId if docs else after_chunk)
+            if first is not None:
+                low = first - 1
+                docs = self._chunkWindow(document, low, low + limit)
+                more = self._chunkAfter(document, low + limit)
+        docs.sort(key=lambda doc: doc.metadata.chunkId)
+        if more:
+            next_after = low + limit
+        else:
+            next_after = docs[-1].metadata.chunkId if docs else after_chunk
+        return ChunkPage(docs=docs, has_more=more, next_after=next_after)
 
     @_backend_errors('sampleChunks')
     def sampleChunks(

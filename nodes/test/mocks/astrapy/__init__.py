@@ -73,11 +73,44 @@ import re
 from . import data_types
 from . import exceptions
 from . import info
-from .exceptions import TooManyDocumentsToCountException
+from .exceptions import DataAPIResponseException, TooManyDocumentsToCountException
 
 # Re-export commonly used types
 from .data_types import DataAPIVector
 from .info import CollectionDefinition, CollectionVectorOptions, CollectionLexicalOptions
+
+
+# =============================================================================
+# Data API limits the drivers must live with
+# =============================================================================
+
+#: A find sorted on a regular field returns at most this many documents and stops there
+#: (astrapy ``Collection.find``: "the Data API will return a smaller number of documents, set to 20")
+SORTED_FIND_MAX = 20
+
+#: A find sorted on a regular field sorts the matching documents in memory, at most this many
+IN_MEMORY_SORT_LIMIT = 10000
+
+
+@dataclass
+class FindPage:
+    """One page of a find (``astrapy.data.cursors.pagination.FindPage``)."""
+
+    results: List[Dict[str, Any]]
+    next_page_state: Any = None
+    sort_vector: Any = None
+
+
+def _encode_page_state(offset: int) -> str:
+    """The opaque page state of the page starting at ``offset``."""
+    return f'mock-page-state:{offset}'
+
+
+def _decode_page_state(state: Any) -> int:
+    """Offset of a page state from :func:`_encode_page_state`."""
+    if not isinstance(state, str) or not state.startswith('mock-page-state:'):
+        raise DataAPIResponseException('Invalid page state', error_code='INVALID_PAGE_STATE')
+    return int(state.split(':', 1)[1])
 
 
 # =============================================================================
@@ -295,10 +328,20 @@ class Collection:
         Returns:
             Cursor over matching documents
         """
+        if 'initial_page_state' in kwargs and kwargs['initial_page_state'] is None:
+            raise ValueError('Passing an explicit null for initial_page_state is not allowed.')
+        page_start = 0
+        if kwargs.get('initial_page_state') is not None:
+            page_start = _decode_page_state(kwargs['initial_page_state'])
         data = [doc for doc in self._get_data() if not filter or _evaluate_filter(filter, doc)]
         vector_sort = bool(sort) and '$vector' in sort
+        field_sort = bool(sort) and not vector_sort and '$lexical' not in sort
         if skip and (not sort or vector_sort):
             raise ValueError('skip is only allowed together with a field sort')
+        if field_sort and len(data) > IN_MEMORY_SORT_LIMIT:
+            raise DataAPIResponseException(
+                'Response data set too big to be sorted, add more filters', error_code='DATASET_TOO_BIG'
+            )
 
         if vector_sort:
             metric = self._metric()
@@ -320,9 +363,11 @@ class Collection:
         if skip:
             data = data[skip:]
 
-        # Apply limit
+        # Apply limit; a field sort returns at most SORTED_FIND_MAX documents and does not page
         if limit:
             data = data[:limit]
+        if field_sort:
+            data = data[:SORTED_FIND_MAX]
 
         # Apply projection: $vector only on request; allow-list or deny-list of top-level fields
         projection = projection or {}
@@ -340,7 +385,8 @@ class Collection:
                 out['$vector'] = list(doc['$vector'])
             projected.append(out)
 
-        return Cursor(projected)
+        # Unsorted finds page through everything (Database.page_size per request); sorted ones do not
+        return Cursor(projected, start=page_start, page_size=None if sort else Database.page_size)
 
     def _metric(self) -> str:
         """The collection's vector metric."""
@@ -475,14 +521,30 @@ class Collection:
 class Cursor:
     """
     Mock cursor for iterating over query results.
+
+    Iterating returns every result from the starting page on (astrapy fetches the pages
+    transparently); ``fetch_next_page`` returns one page and the state of the next.
     """
 
-    def __init__(self, data: List[Dict[str, Any]]):
+    def __init__(self, data: List[Dict[str, Any]], start: int = 0, page_size: Any = None):
         self._data = data
-        self._index = 0
+        self._start = start
+        self._page_size = page_size
+        self._index = start
+
+    def fetch_next_page(self) -> FindPage:
+        """One whole page of results and the page state to continue from (None at the end)."""
+        if self._page_size is None:
+            results, more = self._data[self._index :], False
+            self._index = len(self._data)
+        else:
+            stop = self._index + self._page_size
+            results, more = self._data[self._index : stop], stop < len(self._data)
+            self._index = min(stop, len(self._data))
+        return FindPage(results=results, next_page_state=_encode_page_state(self._index) if more else None)
 
     def __iter__(self) -> Iterator[Dict[str, Any]]:
-        return iter(self._data)
+        return iter(self._data[self._start :])
 
     def __next__(self) -> Dict[str, Any]:
         if self._index >= len(self._data):
@@ -510,6 +572,9 @@ class Database:
     # Class-level storage
     _collections: Dict[str, Dict[str, Any]] = {}  # Collection metadata
     _data: Dict[str, List[Dict[str, Any]]] = {}  # Collection name -> documents
+
+    #: Documents per page of an unsorted find (the Data API answers 20)
+    page_size: int = 20
 
     def __init__(self, api_endpoint: str, token: str = None):
         """
@@ -570,6 +635,7 @@ class Database:
         """
         cls._collections = {}
         cls._data = {}
+        cls.page_size = 20
 
 
 # =============================================================================
@@ -626,6 +692,7 @@ __all__ = [
     'Collection',
     'Cursor',
     'CollectionDeleteResult',
+    'FindPage',
     # Submodules
     'data_types',
     'exceptions',
