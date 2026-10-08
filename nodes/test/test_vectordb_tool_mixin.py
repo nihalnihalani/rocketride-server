@@ -1793,6 +1793,56 @@ def test_remove_document_single_document_takes_the_driver_count(context):
     assert answer['removed'] == [{'objectId': 'a', 'chunks_removed': 2}] and answer['removed_chunks'] == 2
 
 
+class _NativeRemovalStore(CountingStore):
+    """Counts the rows it removes itself (like DELETE ... RETURNING)."""
+
+    def removeCounted(self, objectIds):
+        self.calls.append(('removeCounted', list(objectIds)))
+        removed = [key for key in self.rows if key[0] in objectIds]
+        self.remove(list(objectIds))
+        return len(removed)
+
+
+def _backend_calls(store, *names):
+    return [call for call in store.calls if call[0] in names]
+
+
+def test_remove_document_counts_each_document_once(context):
+    context(dap())
+    store = clustered(CountingStore, docs=4, chunks=2)
+    answer = node(store, allow_writes=True).remove_document({'object_ids': ['doc00', 'doc01', 'ghost']})
+    assert answer['removed_chunks'] == 4 and answer['not_found'] == ['ghost']
+    assert len(_backend_calls(store, 'countChunks')) == 3
+    assert _backend_calls(store, 'remove') == [('remove', ['doc00', 'doc01'])]
+
+
+def test_remove_document_of_one_document_asks_a_counting_driver_once(context):
+    context(dap())
+    store = clustered(_NativeRemovalStore, docs=2, chunks=3)
+    answer = node(store, allow_writes=True).remove_document({'object_ids': ['doc01']})
+    assert answer['removed'] == [{'objectId': 'doc01', 'chunks_removed': 3}] and answer['removed_chunks'] == 3
+    assert _backend_calls(store, 'countChunks', 'removeCounted') == [('removeCounted', ['doc01'])]
+
+
+def test_remove_document_of_one_missing_document_on_a_counting_driver(context):
+    context(dap())
+    store = clustered(_NativeRemovalStore, docs=2, chunks=3)
+    answer = node(store, allow_writes=True).remove_document({'object_ids': ['ghost']})
+    assert (answer['removed'], answer['not_found'], answer['removed_chunks']) == ([], ['ghost'], 0)
+
+
+def test_remove_document_of_several_documents_on_a_counting_driver(context):
+    context(dap())
+    store = clustered(_NativeRemovalStore, docs=3, chunks=2)
+    answer = node(store, allow_writes=True).remove_document({'object_ids': ['doc00', 'ghost', 'doc02']})
+    assert answer['removed'] == [
+        {'objectId': 'doc00', 'chunks_removed': 2},
+        {'objectId': 'doc02', 'chunks_removed': 2},
+    ]
+    assert answer['not_found'] == ['ghost'] and answer['removed_chunks'] == 4
+    assert _backend_calls(store, 'removeCounted') == [('removeCounted', ['doc00', 'doc02'])]
+
+
 def test_remove_document_reserved_id(context):
     context(dap())
     store = clustered(CountingStore)

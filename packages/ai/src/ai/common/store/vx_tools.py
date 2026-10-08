@@ -819,22 +819,42 @@ class VectorExplorerTools:
             pass
 
     def _vx_remove(self, store: Any, ids: Sequence[str]) -> Tuple[List[Dict[str, Any]], List[str], Optional[int]]:
-        """Remove documents; return ``(removed, not_found, rows)`` with per-document counts where known."""
-        per: Dict[str, Optional[int]] = {}
-        for oid in ids:
-            per[oid] = self._vx_count(store.countChunks, deletedFilter('all', objectIds=[oid]))
-        not_found = [oid for oid in ids if per[oid] == 0]
-        targets = [oid for oid in ids if per[oid] != 0]
-        rows: Optional[int] = 0
-        if targets:
-            rows = _int_or_none(store.removeCounted(list(targets)))
-            if rows is None and all(per[oid] is not None for oid in targets):
-                rows = sum(per[oid] or 0 for oid in targets)
-        if len(targets) == 1 and per[targets[0]] is None:
-            per[targets[0]] = rows
-        _vx_state(store).forget_counts()
-        removed = [{'objectId': oid, 'chunks_removed': per[oid]} for oid in targets]
-        return removed, not_found, rows
+        """Remove documents; return ``(removed, not_found, rows)`` with per-document counts where known.
+
+        A driver that counts what it removes (``removeCounted`` overridden) is asked once
+        for a single document and counted per document otherwise (for ``not_found``);
+        any other driver is counted per document (free when it cannot count) and then
+        removed once, so no batch is counted twice.
+        """
+        ids = [oid for oid in ids if oid != CONTROL_OBJECT_ID]
+        native = 'removeCounted' in store.capabilities()
+        try:
+            if native and len(ids) == 1:
+                rows = _int_or_none(store.removeCounted(list(ids)))
+                if rows == 0:
+                    return [], list(ids), 0
+                return [{'objectId': ids[0], 'chunks_removed': rows}], [], rows
+            per: Dict[str, Optional[int]] = {
+                oid: self._vx_count(store.countChunks, deletedFilter('all', objectIds=[oid])) for oid in ids
+            }
+            not_found = [oid for oid in ids if per[oid] == 0]
+            targets = [oid for oid in ids if per[oid] != 0]
+            known = all(per[oid] is not None for oid in targets)
+            rows: Optional[int] = 0
+            if targets:
+                if native:
+                    rows = _int_or_none(store.removeCounted(list(targets)))
+                else:
+                    store.remove(list(targets))
+                    rows = None
+                if rows is None and known:
+                    rows = sum(per[oid] or 0 for oid in targets)
+            if len(targets) == 1 and per[targets[0]] is None:
+                per[targets[0]] = rows
+            removed = [{'objectId': oid, 'chunks_removed': per[oid]} for oid in targets]
+            return removed, not_found, rows
+        finally:
+            _vx_state(store).forget_counts()
 
     # ------------------------------------------------------------------
     # dialect
