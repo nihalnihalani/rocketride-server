@@ -37,9 +37,8 @@ are never listed.
   per store (`postgres.pipe`, `rocketride_vector.pipe`, `qdrant.pipe`,
   `chroma.pipe`, `milvus.pipe`, `weaviate.pipe`, `pinecone.pipe`, `astra.pipe`,
   `atlas.pipe`), are kept in the RocketRide repository under
-  [`apps/vector-ui/templates`](https://github.com/rocketride-org/rocketride-server/tree/develop/apps/vector-ui/templates).
-  They are not installed with the app, and none holds a password, a real key
-  or a `project_id`. Each has three sources:
+  `apps/vector-ui/templates`. They are not installed with the app, and none
+  holds a password, a real key or a `project_id`. Each has three sources:
   - **Ingest** ([Drag & Drop](/nodes/webhook/dropper)): files sent here are
     parsed, chunked, embedded and written to the store. The app's drop zone
     uses it.
@@ -111,11 +110,11 @@ are never listed.
   source: documents cannot be added or removed from here".
 - **Trying it without a model.** The repository's acceptance scripts include a
   local stub of an OpenAI-compatible server,
-  [`stub_llm.py`](https://github.com/rocketride-org/rocketride-server/blob/develop/scripts/acceptance/vector-explorer/stub_llm.py).
-  It is a test stand-in, not a model: its answers start with `[STUB-LLM]` and
-  prove only that retrieval reached the LLM node. The test fixtures rename the
-  LLM node to "Local stub LLM" so the chat header says what it is. The stub
-  logs every request, which includes document text, to its own `out/` folder.
+  `scripts/acceptance/vector-explorer/stub_llm.py`. It is a test stand-in, not
+  a model: its answers start with `[STUB-LLM]` and prove only that retrieval
+  reached the LLM node. The test fixtures rename the LLM node to "Local stub
+  LLM" so the chat header says what it is. The stub logs every request, which
+  includes document text, to its own `out/` folder.
 - **Know what leaves the store.** Read [Privacy](#privacy) before adding
   anything sensitive, and [Where document paths come from](#where-document-paths-come-from)
   before trusting a path.
