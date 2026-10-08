@@ -537,15 +537,16 @@ class Store(DocumentStoreBase):
                 return 'l2'  # Chroma's default space
         return self.similarity
 
-    def _distanceToScore(self, distance: float) -> float:
+    @staticmethod
+    def _distanceToScore(distance: float, space: str) -> float:
         """
-        Map a Chroma distance to a score where higher means closer.
+        Map a Chroma distance in ``space`` to a score where higher means closer.
 
         cosine (1 - cos) and ip (1 - dot): (2 - d) / 2, i.e. (1 + similarity) / 2.
         l2 (squared euclidean): 1 / (1 + euclidean distance).
         """
         distance = float(distance)
-        if self._space() == 'l2':
+        if space == 'l2':
             return 1.0 / (1.0 + math.sqrt(max(distance, 0.0)))
         return (2.0 - distance) / 2.0
 
@@ -556,6 +557,9 @@ class Store(DocumentStoreBase):
         Query results (with distances) below ``floor`` are dropped.
         """
         docs: List[Doc] = []
+        # The space the distances were measured in (read once per result set)
+        space = self._space() if results.get('distances', None) is not None else None
+
         # Now we need to unwrap each list of ndarrays returned by Chroma in case of Query
         if results.get('distances', None) is not None:
             results['ids'] = results['ids'][0]
@@ -570,7 +574,7 @@ class Store(DocumentStoreBase):
             content = results['documents'][i]
 
             if results.get('distances', None) is not None:
-                score = self._distanceToScore(results['distances'][i])
+                score = self._distanceToScore(results['distances'][i], space)
 
                 # Ignore it if it doesn't have a high enough score
                 if score < floor:
