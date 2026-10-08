@@ -193,8 +193,10 @@ def caller_from_auth(
 def dap_context(*, source_type: Any, node_id: Any, caller: Any) -> ToolCallContext:
     """Return the context of an external tool call through the DAP.
 
-    :param source_type: The calling task's source provider (the target endpoint's
-        logical type); anything but a non-empty string is recorded as None.
+    :param source_type: The calling task's source provider: the provider of the
+        component ``taskConfig.pipeline.source`` names (``DataConn._source_type``),
+        not the target endpoint's logical type, which is the pipeline's Null
+        endpoint for every task. Anything but a non-empty string is recorded as None.
     :param node_id: The node the call named; empty means a broadcast.
     :param caller: The caller block the server attached to the request.
     """
