@@ -249,8 +249,9 @@ every pipeline in the organization that names it.
 
 After a removal the counts and the directory refresh and the app announces
 "Removed `<path>` (N chunks)", with the number of chunks the store actually
-removed. If the request times out: "The request may still complete on the
-server. Refresh to check." Writes are never retried.
+removed, or just "Removed `<path>`" when the store cannot count the rows it
+removed (Pinecone). If the request times out: "The request may still complete
+on the server. Refresh to check." Writes are never retried.
 
 When the store refuses, the app says why:
 
