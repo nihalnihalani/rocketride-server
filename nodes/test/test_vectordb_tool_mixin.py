@@ -1339,6 +1339,16 @@ def test_sample_uses_a_native_neighbour_graph():
     assert node(clustered(NativeKnn)).dialect({})['capabilities']['knn_native'] is True
 
 
+def test_sample_falls_back_to_the_node_graph_when_the_native_one_fails():
+    class FlakyKnn(ExactListingStore):
+        def knnGraph(self, keys, vectors, metric, k):
+            raise RuntimeError('search_matrix_offsets timed out')
+
+    answer = node(clustered(FlakyKnn)).sample({'n': 10})
+    assert answer['success'] is True and answer['knn_source'] == 'node'
+    assert any('neighbour graph' in w for w in _WARNINGS)
+
+
 def DocumentStoreBaseKnn(store, keys, vectors, metric, k):
     return _store_module.DocumentStoreBase.knnGraph(store, keys, vectors, metric, k)
 

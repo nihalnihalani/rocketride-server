@@ -1402,6 +1402,11 @@ class VectorExplorerTools:
                 graph = store.knnGraph(keys, V, metric, knn_k)
             except StoreUnsupported:
                 graph = None
+            except Exception as exc:  # the node can always compute the graph itself
+                warning(
+                    f'vector store tool: the store could not build the neighbour graph ({safe_error(exc)}); computing it on the node'
+                )
+                graph = None
             if graph is None or len(graph.offsets_row) != len(keys) + 1:
                 offsets, cols, sims = vx_math.knn(metric, V, knn_k)
                 knn_source, graph_k = 'node', max(0, min(knn_k, len(keys) - 1))
