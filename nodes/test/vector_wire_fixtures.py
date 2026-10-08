@@ -12,11 +12,22 @@ answer from a template started in a real engine (the machinery of
 stub), on a new collection and on a legacy-shaped copy of it, written to
 ``<out>/<backend>/<tool>[.<case>].json``.
 
-Answers are stored in a canonical form so a capture is stable across runs and
-machines: floats are rounded to 4 decimal places, and the values of the keys in
-``SCRUB_KEYS`` (times, durations, point ids, caller ids, sizes) are replaced by
-``"<scrubbed>"``; every file lists the keys it scrubbed in ``__scrub__``. The
-upload names are fixed (``C:/demo/<folder>/<file>``), so objectIds are too.
+Answers are stored in a canonical form: floats are rounded to 4 decimal
+places, and the values of the keys in ``SCRUB_KEYS`` (times, durations, point
+ids, caller ids, sizes) are replaced by ``"<scrubbed>"``; every file lists the
+keys it scrubbed in ``__scrub__``. The upload names are fixed
+(``C:/demo/<folder>/<file>``), so objectIds are too. The comparison is exact,
+except that the floats of the embedding-derived answers (``SIMILARITY_TOOLS``:
+PCA coordinates, similarities, scores) may differ by ``FLOAT_TOLERANCE``,
+because their last digits depend on the CPU and BLAS build; their shapes,
+keys, integers and strings are still compared exactly (a near-tie that orders
+two neighbours differently on another machine is reported as a difference).
+
+Every capture is taken for an expected outcome (``EXPECTED``: success, or the
+refusal code), and generation stops with ``CaptureMismatch`` when a tool
+answers otherwise, so a broken gate is never committed as the reference. The
+writes that must be refused run after every read and target an objectId
+nothing was uploaded under (``disposable_id``).
 
 ``test_vector_wire_fixtures_full.py`` regenerates the captures and compares
 them with the committed files. To regenerate, from ``nodes/`` (unmocked, with
@@ -60,6 +71,77 @@ FLOAT_DIGITS = 4
 WIRE_PREFIX = 'C:/demo/'
 WIRE_COLLECTION = 'vx_tp_wire'
 WIRE_LEGACY = 'vx_tp_wire_legacy'
+
+
+# Answers derived from embeddings (similarities, PCA coordinates, scores): their
+# last digits depend on the CPU and BLAS build, so their floats are compared
+# within FLOAT_TOLERANCE; everything else, and every non-float, exactly.
+SIMILARITY_TOOLS = frozenset({'sample', 'project', 'neighbors', 'search', 'embed', 'vectors'})
+FLOAT_TOLERANCE = 1e-3
+
+# The outcome each capture is for: OK, or the refusal code it must carry.
+OK = 'ok'
+EXPECTED: Dict[Tuple[str, Optional[str]], str] = {
+    ('dialect', None): OK,
+    ('stats', None): OK,
+    ('stats', 'quick'): OK,
+    ('documents', None): OK,
+    ('chunks', None): OK,
+    ('chunks', 'not_found'): 'NOT_FOUND',
+    ('vectors', None): OK,
+    ('sample', None): OK,
+    ('sample', 'light'): OK,
+    ('project', None): OK,
+    ('neighbors', None): OK,
+    ('search', None): OK,
+    ('search', 'below_floor'): OK,
+    ('search', 'dimension_mismatch'): 'DIMENSION_MISMATCH',
+    ('remove_document', 'reserved_id'): 'RESERVED_ID',
+    ('remove_document', 'writes_source'): 'WRITES_SOURCE',
+    ('remove_document', 'writes_disabled'): 'WRITES_DISABLED',
+}
+
+
+class CaptureMismatch(AssertionError):
+    """A tool answered a capture with another outcome than the one the capture is for.
+
+    Committing such an answer would pin a bug as the app's reference, so
+    generation stops instead (an AssertionError: the suite fails, never skips).
+    """
+
+
+def outcome_problem(answer: Any, expected: str) -> Optional[str]:
+    """Why ``answer`` is not the ``expected`` outcome (OK or a refusal code); None when it is."""
+    if not isinstance(answer, dict):
+        return f'expected {expected}, got {answer!r:.200}'
+    refused = answer.get('success') is False
+    if expected == OK:
+        return f'expected success, got {answer.get("code")}: {answer.get("error")}' if refused else None
+    if not refused:
+        return f'expected the refusal {expected}, got a success: {json.dumps(answer, default=str)[:200]}'
+    if answer.get('code') != expected:
+        return f'expected the refusal {expected}, got {answer.get("code")}: {answer.get("error")}'
+    return None
+
+
+def disposable_id(tp) -> str:
+    """An objectId nothing was uploaded under: the target of every write that must be refused.
+
+    If the gate wrongly let such a write through, it would remove nothing.
+    """
+    return tp.object_id(WIRE_PREFIX + 'never-uploaded/refusal-probe.md')
+
+
+def live_blocker() -> Optional[str]:
+    """Why the live captures cannot run in this process (None when they can).
+
+    Under ROCKETRIDE_MOCK this process imports nodes/test/mocks' qdrant_client,
+    chromadb and psycopg2 while the engine it starts talks to the real servers;
+    the live suites run in nodes:test-db's unmocked pass instead.
+    """
+    if os.environ.get('ROCKETRIDE_MOCK'):
+        return 'NOT RUN: a live database suite does not run under ROCKETRIDE_MOCK (nodes:test-db runs it unmocked)'
+    return None
 
 
 def canonical(value: Any, scrubbed: Optional[set] = None) -> Any:
@@ -115,12 +197,18 @@ def _write(out_dir: Path, captures: Dict[str, Any]) -> None:
 def _captures_for(
     tp, deployment_side, kind: str, backend: str, multi: str, water: List[float], unrelated: List[float]
 ) -> Dict[str, Any]:
+    """Every capture of one side (``kind`` 'new' or 'legacy'), each checked against EXPECTED."""
     side = deployment_side
     case = (lambda c: c) if kind == 'new' else (lambda c: f'{c}.legacy' if c else 'legacy')
     out: Dict[str, Any] = {}
+    problems: List[str] = []
 
     def put(tool: str, c: Optional[str], answer: Any) -> None:
-        out[file_name(backend, tool, case(c))] = answer
+        name = file_name(backend, tool, case(c))
+        problem = outcome_problem(answer, EXPECTED[(tool, c)])
+        if problem:
+            problems.append(f'{name}: {problem}')
+        out[name] = answer
 
     put('dialect', None, side.tool('dialect'))
     put('stats', None, side.tool('stats', {'mode': 'full'}))
@@ -150,15 +238,23 @@ def _captures_for(
         ),
     )
     put('search', 'dimension_mismatch', side.tool('search', {'vector': water[:10], 'top_k': 3}))
+    # Last, and on an id nothing was uploaded under: writes that must be refused.
+    nobody = disposable_id(tp)
+    put('remove_document', 'writes_source', side.tool('remove_document', {'object_ids': [nobody]}, source='chat_1'))
+    put('remove_document', 'writes_disabled', side.tool('remove_document', {'object_ids': [nobody]}, node='store_2'))
     put('remove_document', 'reserved_id', side.tool('remove_document', {'object_ids': ['schema']}))
-    put('remove_document', 'writes_source', side.tool('remove_document', {'object_ids': [multi]}, source='chat_1'))
-    put('remove_document', 'writes_disabled', side.tool('remove_document', {'object_ids': [multi]}, node='store_2'))
+    if problems:
+        raise CaptureMismatch('; '.join(problems))
     return out
 
 
 def live_fixtures(only: Optional[Sequence[str]] = None) -> Dict[str, Any]:
     """Every live capture, by file name (starts its own engine; requires the services of the toolpath suite)."""
     import tempfile
+
+    blocker = live_blocker()
+    if blocker:
+        raise RuntimeError(blocker)
 
     from . import test_vector_toolpath_full as tp
 
@@ -207,6 +303,9 @@ def live_fixtures(only: Optional[Sequence[str]] = None) -> Dict[str, Any]:
                     (unrelated,) = new.tool(
                         'embed', {'texts': [tp.UNRELATED_QUESTION], 'kind': 'query'}, node='embed_1'
                     )['vectors']
+                    problem = outcome_problem(embed_answer, OK)
+                    if problem:
+                        raise CaptureMismatch(f'{file_name(backend, "embed")}: {problem}')
                     out[file_name(backend, 'embed')] = embed_answer
                     service.make_legacy(WIRE_COLLECTION, WIRE_LEGACY, multi)
                     legacy = tp._Side(
@@ -222,7 +321,11 @@ def live_fixtures(only: Optional[Sequence[str]] = None) -> Dict[str, Any]:
                     second = tp.object_id(WIRE_PREFIX + 'field/kestrel_field_guide.md')
                     out.update(_captures_for(tp, legacy, 'legacy', backend, second, water, unrelated))
                     # Last, because it changes the data: a removal and what it reports.
-                    out[file_name(backend, 'remove_document')] = new.tool('remove_document', {'object_ids': [second]})
+                    removed = new.tool('remove_document', {'object_ids': [second]})
+                    problem = outcome_problem(removed, OK)
+                    if problem:
+                        raise CaptureMismatch(f'{file_name(backend, "remove_document")}: {problem}')
+                    out[file_name(backend, 'remove_document')] = removed
                 finally:
                     for side in sides:
                         side.stop()
@@ -246,13 +349,34 @@ def committed(directory: Path) -> Dict[str, Any]:
     }
 
 
+def _tool_of(name: str) -> str:
+    """``<backend>/<tool>[.<case>].json`` -> tool."""
+    return name.split('/', 1)[-1].split('.', 1)[0]
+
+
+def _close(a: Any, b: Any, tolerance: float) -> bool:
+    """Same shape, keys, integers and strings; floats within tolerance."""
+    if isinstance(a, float) and isinstance(b, float):
+        return abs(a - b) <= tolerance
+    if type(a) is not type(b):
+        return False
+    if isinstance(a, dict):
+        return a.keys() == b.keys() and all(_close(a[k], b[k], tolerance) for k in a)
+    if isinstance(a, list):
+        return len(a) == len(b) and all(_close(x, y, tolerance) for x, y in zip(a, b))
+    return a == b
+
+
 def differences(regenerated: Dict[str, Any], on_disk: Dict[str, Any]) -> List[str]:
     """File names whose canonical form differs, is missing on disk or is not regenerated."""
     out = []
     for name in sorted(set(regenerated) | set(on_disk)):
         if name not in on_disk or name not in regenerated:
             out.append(name)
-        elif stored(regenerated[name]) != on_disk[name]:
+            continue
+        fresh = stored(regenerated[name])
+        tolerance = FLOAT_TOLERANCE if _tool_of(name) in SIMILARITY_TOOLS else 0.0
+        if not _close(fresh, on_disk[name], tolerance):
             out.append(name)
     return out
 
