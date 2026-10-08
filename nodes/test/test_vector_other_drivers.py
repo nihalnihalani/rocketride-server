@@ -1,0 +1,474 @@
+# =============================================================================
+# MIT License
+# Copyright (c) 2026 Aparavi Software AG
+# =============================================================================
+
+"""Explorer-hook contract of the experimental vector stores, against mocked clients.
+
+One suite, parameterised by driver (Milvus, Weaviate, Pinecone, Astra DB,
+MongoDB Atlas): every driver must answer the optional ``DocumentStoreBase``
+hooks the Vector Explorer tools call (docs/development/nodes/vector-tool-contract.md
+sections 2 and 3) on a new collection, on a legacy collection written the way
+today's drivers write it, and on a backend that ignores paging offsets.
+
+The clients are mocks (see ``vector_other_drivers_harness``). Passing here is not
+evidence that a driver works against a live server: these drivers stay
+``support='experimental'`` whatever this suite says.
+"""
+
+import dataclasses
+import json
+import math
+
+import pytest
+
+from ai.common.schema import Doc, DocFilter, Question, QuestionText
+from ai.common.store.errors import StoreUnsupported, ToolRefusal
+from ai.common.store.vx_types import ChunkPage, DocPage, StoreInfo
+
+from . import vector_other_drivers_harness as h
+
+ADAPTERS = {
+    'milvus': h.MilvusAdapter,
+}
+
+
+@pytest.fixture(scope='module', params=sorted(ADAPTERS))
+def adapter(request):
+    """One adapter (driver module + mock client) per driver."""
+    return ADAPTERS[request.param]()
+
+
+@pytest.fixture
+def store(adapter):
+    """A fresh store on an empty mocked backend."""
+    return adapter.new_store()
+
+
+def _object_ids(rows):
+    return [row.objectId for row in rows]
+
+
+def _chunk_ids(rows, object_id):
+    return sorted(row['chunkId'] for row in rows if row['objectId'] == object_id)
+
+
+def _question(text='question'):
+    return QuestionText(text=text, embedding=h.vector_for('question', 0), embedding_model=h.MODEL)
+
+
+# -----------------------------------------------------------------------------
+# Support level and capabilities
+# -----------------------------------------------------------------------------
+
+
+def test_support_stays_experimental(adapter):
+    """Mocked evidence never promotes a driver: the support level is fixed in code."""
+    assert adapter.module.Store.VX_SUPPORT == 'experimental'
+
+
+def test_capabilities_name_the_native_hooks(adapter, store):
+    """The driver overrides the hooks it answers natively and leaves knnGraph to the node."""
+    caps = store.capabilities()
+    for hook in ('describe', 'scoreInfo', 'listDocuments', 'scrollChunks', 'getVectors', 'sampleChunks'):
+        assert hook in caps, hook
+    assert 'knn_native' not in caps
+    assert ('sample_stratified_native' in caps) == adapter.stratified_native
+
+
+# -----------------------------------------------------------------------------
+# describe / scoreInfo
+# -----------------------------------------------------------------------------
+
+
+def test_describe_a_missing_collection_does_not_raise(adapter, store):
+    """No collection: an answer with collection_exists False and no control record."""
+    info = store.describe()
+    assert isinstance(info, StoreInfo)
+    assert info.backend == adapter.backend
+    assert info.collection_exists is False
+    assert info.control_record is None
+    assert info.meta_column is None
+    assert 'experimental' in info.caveats
+
+
+def test_describe_reads_the_control_record(adapter, store):
+    """Model and dimension come from the control record; no host or credential is reported."""
+    h.ingest(store, 'doc-a', '/docs/a.md', [0, 1])
+    info = store.describe()
+    assert info.collection_exists is True
+    assert info.control_record is True
+    assert info.model == h.MODEL
+    assert info.dimension == h.DIM
+    assert info.metric == 'cosine'
+    text = json.dumps(dataclasses.asdict(info), default=str).lower()
+    for secret in ('localhost', 'apikey', 'token', 'mongodb://', 'https://'):
+        assert secret not in text, secret
+
+
+def test_describe_reads_a_legacy_collection(adapter, store):
+    """A collection written by today's driver still describes itself."""
+    adapter.seed_legacy(store)
+    info = store.describe()
+    assert info.collection_exists is True
+    assert info.control_record is True
+    assert info.model == h.MODEL
+    assert info.dimension == h.DIM
+
+
+def test_score_info_reports_floor_and_threshold(adapter, store):
+    """The score info carries the legacy floor; minScore=-inf lifts it."""
+    info = store.scoreInfo()
+    assert {'formula', 'higher_is_better', 'floor', 'threshold'} <= set(info)
+    assert info['floor'] == pytest.approx(adapter.floor)
+    assert store.effectiveFloor(DocFilter()) == pytest.approx(adapter.floor)
+    assert store.effectiveFloor(h.VxFilter(minScore=float('-inf'))) == float('-inf')
+
+
+# -----------------------------------------------------------------------------
+# Writes: re-ingest in several batches
+# -----------------------------------------------------------------------------
+
+
+def test_later_batches_of_a_document_keep_the_earlier_ones(adapter, store):
+    """The embedding nodes send one document in several batches; only the chunk-0 batch replaces."""
+    h.ingest(store, 'doc-a', '/docs/a.md', [0, 1])
+    h.ingest(store, 'doc-a', '/docs/a.md', [2, 3])
+    assert _chunk_ids(adapter.raw_rows(store), 'doc-a') == [0, 1, 2, 3]
+
+
+def test_a_new_chunk0_batch_replaces_the_document(adapter, store):
+    """Re-ingesting from chunk 0 drops the chunks of the previous version."""
+    h.ingest(store, 'doc-a', '/docs/a.md', [0, 1, 2])
+    h.ingest(store, 'doc-a', '/docs/a.md', [0, 1])
+    assert _chunk_ids(adapter.raw_rows(store), 'doc-a') == [0, 1]
+
+
+# -----------------------------------------------------------------------------
+# Counts
+# -----------------------------------------------------------------------------
+
+
+def test_count_chunks_honours_the_deleted_modes(adapter, store):
+    """Counts honour active / deleted / all and the legacy isDeleted flag, never the control record."""
+    if not adapter.counts:
+        assert store.countChunks(DocFilter()) is None
+        return
+    h.ingest(store, 'doc-a', '/docs/a.md', [0, 1, 2])
+    h.ingest(store, 'doc-b', '/docs/b.md', [0, 1])
+    store.markDeleted(['doc-b'])
+    assert store.countChunks(h.VxFilter(deleted='active')) == 3
+    assert store.countChunks(h.VxFilter(deleted='deleted')) == 2
+    assert store.countChunks(h.VxFilter(deleted='all')) == 5
+    assert store.countChunks(DocFilter()) == 3
+    assert store.countChunks(DocFilter(isDeleted=True)) == 5
+    assert store.countChunks(DocFilter(chunkIds=[0])) == 1
+    assert store.countChunks(h.VxFilter(objectIds=['doc-b'], deleted='all')) == 2
+
+
+def test_count_chunks_on_a_missing_collection_is_zero(adapter, store):
+    """Nothing stored yet: zero (or None where the backend cannot count)."""
+    assert store.countChunks(DocFilter()) in (0, None)
+
+
+# -----------------------------------------------------------------------------
+# listDocuments
+# -----------------------------------------------------------------------------
+
+
+def _ingest_five(store):
+    for i in range(5):
+        h.ingest(store, f'doc-{i}', f'/docs/{chr(ord("e") - i)}.md', list(range(i + 1)))
+
+
+def test_listing_pages_cover_every_document_once(adapter, store):
+    """Following next_cursor lists each document once, never the control record."""
+    _ingest_five(store)
+    rows, pages = h.collect_listing(store, limit=2)
+    assert sorted(_object_ids(rows)) == [f'doc-{i}' for i in range(5)]
+    assert all(len(page.items) <= 2 for page in pages)
+    assert pages[-1].next_cursor is None
+    for page in pages:
+        assert isinstance(page, DocPage)
+        assert page.sorted is adapter.listing_sorted
+        if not adapter.listing_sorted:
+            assert 'documents_unsorted' in page.caveats
+    by_id = {row.objectId: row for row in rows}
+    for i in range(5):
+        row = by_id[f'doc-{i}']
+        assert row.path == f'/docs/{chr(ord("e") - i)}.md'
+        assert row.has_first_chunk is True
+        assert row.deleted is False
+        assert row.nodeId == 'chunk_1'
+        assert isinstance(row.pointId, str) and row.pointId
+        assert row.chunks == ((i + 1) if adapter.listing_counts else None)
+        if adapter.extras_stored:
+            assert row.size == 1000
+            assert row.ingestedAt == '2026-10-08T18:20:11Z'
+        else:
+            assert row.size is None and row.ingestedAt is None
+    if adapter.listing_sorted:
+        paths = [row.path for row in rows]
+        assert paths == sorted(paths)
+
+
+def test_listing_filters_by_object_ids(adapter, store):
+    """object_ids restricts the listing."""
+    _ingest_five(store)
+    rows, _ = h.collect_listing(store, limit=10, object_ids=['doc-1', 'doc-3'])
+    assert sorted(_object_ids(rows)) == ['doc-1', 'doc-3']
+
+
+def test_listing_honours_the_deleted_modes(adapter, store):
+    """Soft-deleted documents appear only under 'deleted' and 'all'."""
+    h.ingest(store, 'doc-a', '/docs/a.md', [0, 1])
+    h.ingest(store, 'doc-b', '/docs/b.md', [0])
+    store.markDeleted(['doc-b'])
+    active, _ = h.collect_listing(store, limit=10, deleted='active')
+    deleted, _ = h.collect_listing(store, limit=10, deleted='deleted')
+    every, _ = h.collect_listing(store, limit=10, deleted='all')
+    assert _object_ids(active) == ['doc-a']
+    assert _object_ids(deleted) == ['doc-b']
+    assert deleted[0].deleted is True
+    assert sorted(_object_ids(every)) == ['doc-a', 'doc-b']
+
+
+def test_listing_a_legacy_collection(adapter, store):
+    """Legacy rows list without the new extras; a document without chunk 0 is flagged or noted."""
+    adapter.seed_legacy(store)
+    rows, pages = h.collect_listing(store, limit=10)
+    by_id = {row.objectId: row for row in rows}
+    assert {'legacy-a', 'legacy-b'} <= set(by_id)
+    assert 'schema' not in by_id
+    assert by_id['legacy-a'].size is None
+    assert by_id['legacy-a'].ingestedAt is None
+    if adapter.listing_counts:
+        assert by_id['legacy-a'].chunks == 3
+        assert by_id['legacy-b'].chunks == 2
+    if 'legacy-orphan' in by_id:
+        assert by_id['legacy-orphan'].has_first_chunk is False
+    else:
+        assert 'documents_by_first_chunk' in pages[0].caveats
+
+
+def test_listing_on_a_backend_that_ignores_offsets_ends_with_a_caveat(adapter, store):
+    """A repeated page ends the listing instead of looping (documents_paging_unsupported)."""
+    _ingest_five(store)
+    adapter.ignore_offsets(store)
+    first = store.listDocuments(cursor=None, limit=2, object_ids=None, deleted='active', sort='path')
+    assert len(first.items) == 2
+    assert first.next_cursor is not None
+    second = store.listDocuments(cursor=first.next_cursor, limit=2, object_ids=None, deleted='active', sort='path')
+    assert second.items == []
+    assert second.next_cursor is None
+    assert 'documents_paging_unsupported' in second.caveats
+
+
+def test_listing_refuses_a_cursor_it_did_not_issue(adapter, store):
+    """A malformed cursor is INVALID_INPUT, not a crash."""
+    h.ingest(store, 'doc-a', '/docs/a.md', [0])
+    with pytest.raises(ToolRefusal) as excinfo:
+        store.listDocuments(cursor='%%not-a-cursor%%', limit=2, object_ids=None, deleted='active', sort='path')
+    assert excinfo.value.code == 'INVALID_INPUT'
+
+
+def test_listing_a_missing_collection_is_empty(adapter, store):
+    """No collection: an empty last page."""
+    page = store.listDocuments(cursor=None, limit=5, object_ids=None, deleted='active', sort='path')
+    assert page.items == []
+    assert page.next_cursor is None
+
+
+# -----------------------------------------------------------------------------
+# scrollChunks
+# -----------------------------------------------------------------------------
+
+
+def test_scroll_chunks_pages_in_chunk_order_without_vectors(adapter, store):
+    """Chunks come back in order, paged, and never carry embeddings."""
+    h.ingest(store, 'doc-a', '/docs/a.md', list(range(7)))
+    docs, pages = h.collect_chunks(store, 'doc-a', limit=3)
+    assert [doc.metadata.chunkId for doc in docs] == list(range(7))
+    assert all(isinstance(page, ChunkPage) and len(page.docs) <= 3 for page in pages)
+    assert pages[-1].has_more is False
+    assert all(not doc.embedding for doc in docs)
+    assert all('chunk' in doc.page_content for doc in docs)
+
+
+def test_scroll_chunks_walks_over_gaps_in_chunk_ids(adapter, store):
+    """Non-contiguous chunk ids are all reached."""
+    h.ingest(store, 'doc-a', '/docs/a.md', [3, 7, 64])
+    docs, _ = h.collect_chunks(store, 'doc-a', limit=3)
+    assert [doc.metadata.chunkId for doc in docs] == [3, 7, 64]
+
+
+def test_scroll_chunks_never_returns_the_control_record(adapter, store):
+    """The control record (objectId 'schema') is not a document."""
+    h.ingest(store, 'doc-a', '/docs/a.md', [0])
+    page = store.scrollChunks('schema', after_chunk=-1, limit=10, deleted='all')
+    assert page.docs == []
+    assert page.has_more is False
+
+
+def test_scroll_chunks_of_a_deleted_document(adapter, store):
+    """A soft-deleted document scrolls under 'deleted'/'all' only."""
+    h.ingest(store, 'doc-a', '/docs/a.md', [0, 1])
+    store.markDeleted(['doc-a'])
+    assert store.scrollChunks('doc-a', after_chunk=-1, limit=10, deleted='active').docs == []
+    assert len(store.scrollChunks('doc-a', after_chunk=-1, limit=10, deleted='all').docs) == 2
+
+
+# -----------------------------------------------------------------------------
+# getVectors / sampleChunks
+# -----------------------------------------------------------------------------
+
+
+def test_get_vectors_pairs_the_requested_keys(adapter, store):
+    """Vectors by (objectId, chunkId), in request order; unknown keys and the control record omitted."""
+    h.ingest(store, 'doc-a', '/docs/a.md', [0, 1, 2])
+    h.ingest(store, 'doc-b', '/docs/b.md', [0, 1])
+    docs = store.getVectors([('doc-a', 2), ('doc-b', 0), ('doc-a', 9), ('schema', 0)])
+    assert [(doc.metadata.objectId, doc.metadata.chunkId) for doc in docs] == [('doc-a', 2), ('doc-b', 0)]
+    for doc in docs:
+        expected = h.vector_for(doc.metadata.objectId, doc.metadata.chunkId)
+        assert doc.embedding == pytest.approx(expected, rel=1e-5)
+        assert isinstance(doc.metadata.pointId, str) and doc.metadata.pointId
+
+
+def test_get_vectors_on_a_legacy_collection(adapter, store):
+    """Legacy rows have random ids: the filter path still finds them."""
+    adapter.seed_legacy(store)
+    docs = store.getVectors([('legacy-a', 1), ('legacy-orphan', 2)])
+    assert sorted((doc.metadata.objectId, doc.metadata.chunkId) for doc in docs) == [
+        ('legacy-a', 1),
+        ('legacy-orphan', 2),
+    ]
+    assert all(len(doc.embedding) == h.DIM for doc in docs)
+
+
+def test_sample_chunks_returns_vectors_and_the_strategy_used(adapter, store):
+    """A sample carries embeddings, skips the control record and deleted rows."""
+    h.ingest(store, 'doc-a', '/docs/a.md', [0, 1, 2])
+    h.ingest(store, 'doc-b', '/docs/b.md', [0, 1])
+    h.ingest(store, 'doc-c', '/docs/c.md', [0])
+    store.markDeleted(['doc-c'])
+    docs, used = store.sampleChunks(
+        n=4, seed=7, strategy='random', docFilter=h.VxFilter(deleted='active'), include_keys=[]
+    )
+    assert used == adapter.random_strategy
+    assert 1 <= len(docs) <= 4
+    for doc in docs:
+        assert doc.metadata.objectId in ('doc-a', 'doc-b')
+        assert len(doc.embedding) == h.DIM
+        assert isinstance(doc.metadata.pointId, str)
+
+
+def test_sample_chunks_stratified(adapter, store):
+    """Stratified sampling is native only where cheap; otherwise the shared sampler falls back."""
+    for i in range(4):
+        h.ingest(store, f'doc-{i}', f'/docs/{i}.md', list(range(6)))
+    if not adapter.stratified_native:
+        with pytest.raises(StoreUnsupported):
+            store.sampleChunks(
+                n=8, seed=1, strategy='stratified', docFilter=h.VxFilter(deleted='active'), include_keys=[]
+            )
+        return
+    docs, used = store.sampleChunks(
+        n=8, seed=1, strategy='stratified', docFilter=h.VxFilter(deleted='active'), include_keys=[]
+    )
+    assert used == 'stratified'
+    assert len(docs) == 8
+    assert {doc.metadata.objectId for doc in docs} == {f'doc-{i}' for i in range(4)}
+    assert all(len(doc.embedding) == h.DIM for doc in docs)
+
+
+# -----------------------------------------------------------------------------
+# removeCounted
+# -----------------------------------------------------------------------------
+
+
+def test_remove_counted_reports_the_rows_removed(adapter, store):
+    """Removing a document reports its chunk rows and leaves the rest (and the control record)."""
+    h.ingest(store, 'doc-a', '/docs/a.md', [0, 1, 2])
+    h.ingest(store, 'doc-b', '/docs/b.md', [0, 1])
+    removed = store.removeCounted(['doc-a', 'no-such-doc'])
+    assert removed == (3 if adapter.remove_counts else None)
+    rows = adapter.raw_rows(store)
+    assert _chunk_ids(rows, 'doc-a') == []
+    assert _chunk_ids(rows, 'doc-b') == [0, 1]
+    assert store.describe().control_record is True
+
+
+# -----------------------------------------------------------------------------
+# Search and paths
+# -----------------------------------------------------------------------------
+
+
+def test_semantic_search_applies_the_floor_not_the_threshold(adapter, store):
+    """Rows under the node threshold survive; rows under the floor do not, unless minScore is -inf."""
+    h.ingest(store, 'doc-a', '/docs/a.md', [0, 1, 2])
+    adapter.set_scores(store, [0.9, 0.35, 0.1])
+    kept = [doc.score for doc in store.searchSemantic(_question(), DocFilter(limit=10))]
+    expected = [s for s in (0.9, 0.35, 0.1) if s >= adapter.floor]
+    assert kept == pytest.approx(expected, abs=1e-6)
+    adapter.set_scores(store, [0.9, 0.35, 0.1])
+    every = [doc.score for doc in store.searchSemantic(_question(), h.VxFilter(limit=10, minScore=-math.inf))]
+    assert every == pytest.approx([0.9, 0.35, 0.1], abs=1e-6)
+
+
+def test_semantic_search_refuses_offsets_with_valueerror(adapter, store):
+    """A non-zero offset is a ValueError (it used to be a bare BaseException)."""
+    if not adapter.offset_raises:
+        pytest.skip('NOT RUN: this driver ignores offsets in semantic search')
+    h.ingest(store, 'doc-a', '/docs/a.md', [0])
+    with pytest.raises(ValueError):
+        store.searchSemantic(_question(), DocFilter(offset=5))
+
+
+def test_get_paths_skips_the_control_record_and_deleted_documents(adapter, store):
+    """The objdir paths list live documents only."""
+    h.ingest(store, 'doc-a', '/docs/a.md', [0, 1])
+    h.ingest(store, 'doc-b', '/docs/b.md', [0])
+    h.ingest(store, 'doc-c', '/docs/c.md', [0])
+    store.markDeleted(['doc-c'])
+    assert store.getPaths() == {'/docs/a.md': 'doc-a', '/docs/b.md': 'doc-b'}
+
+
+def test_services_json_cases_replay_on_the_mock(adapter, store):
+    """The node's own services.json cases (data lane) still pass through the repaired driver."""
+    if not adapter.services:
+        pytest.skip('NOT RUN: this node has no services.json test cases')
+    cases = h.services_cases(adapter.services)
+    assert cases, 'expected test cases in services.json'
+    for case in cases:
+        if 'documents' in case:
+            docs = [Doc.model_validate(doc) for doc in case['documents']]
+            store.addChunks(docs)
+            failures = h.find_case_expectation_failures(docs, case['expect']['documents'])
+        else:
+            question = Question.model_validate(case['questions'])
+            found = sorted(store._queryDocuments(question).values(), key=lambda doc: -doc.score)
+            failures = h.find_case_expectation_failures(found, case['expect']['documents'])
+        assert failures == [], f'{case.get("name")}: {failures}'
+
+
+@pytest.mark.skip(reason='NEEDS:L1 merged — integration gate G2 (dialect/stats live in vx_tools on L1)')
+def test_dialect_and_stats_through_the_mixin(adapter, store):
+    """The dialect and stats tools answer through VectorStoreToolMixin with this driver's hooks."""
+    from types import SimpleNamespace
+
+    from ai.common.store import VectorStoreToolMixin
+
+    h.ingest(store, 'doc-a', '/docs/a.md', [0, 1, 2])
+    node = SimpleNamespace(
+        IGlobal=SimpleNamespace(store=store, serverName=adapter.name, glb=SimpleNamespace(logicalType=adapter.name))
+    )
+    dialect = VectorStoreToolMixin.dialect(node, {})
+    assert dialect['success'] is True
+    assert dialect['support'] == 'experimental'
+    assert dialect['backend'] == adapter.backend
+    assert 'experimental' in dialect['caveats']
+    stats = VectorStoreToolMixin.stats(node, {'mode': 'full'})
+    assert stats['success'] is True
+    assert stats['model'] == h.MODEL
+    assert stats['vector_size'] == h.DIM

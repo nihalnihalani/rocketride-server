@@ -263,6 +263,44 @@ def _normalize_id(id_value: Any) -> int:
 # =============================================================================
 
 
+def _field_value(data: Dict[str, Any], container: str, field: str) -> Any:
+    """Read ``container[field]`` from a record whose container is a dict or an object."""
+    container_data = data.get(container, {})
+    if isinstance(container_data, dict):
+        return container_data.get(field)
+    if hasattr(container_data, field):
+        return getattr(container_data, field, None)
+    if hasattr(container_data, '__dict__'):
+        return container_data.__dict__.get(field)
+    return None
+
+
+def _parse_literal(expected: str) -> Any:
+    """Parse one literal of a filter expression: quoted string, bool or integer."""
+    if len(expected) >= 2 and expected[0] == expected[-1] and expected[0] in ('"', "'"):
+        return expected[1:-1].replace("\\'", "'")
+    if expected in ('True', 'true'):
+        return True
+    if expected in ('False', 'false'):
+        return False
+    if expected.lstrip('-').isdigit():
+        return int(expected)
+    return expected
+
+
+def _parse_list(values_str: str) -> List[Any]:
+    """Parse the items of a ``[...]`` list literal."""
+    values = []
+    for m in re.finditer(r"'([^']*)'|\"([^\"]*)\"|([^,\s\[\]]+)", values_str):
+        if m.group(1) is not None:
+            values.append(m.group(1))
+        elif m.group(2) is not None:
+            values.append(m.group(2))
+        else:
+            values.append(_parse_literal(m.group(3)))
+    return values
+
+
 def _parse_filter_expression(filter_expr: str, data: Dict[str, Any]) -> bool:
     """
     Parse and evaluate a Milvus filter expression against a data record.
@@ -299,6 +337,18 @@ def _parse_filter_expression(filter_expr: str, data: Dict[str, Any]) -> bool:
     filter_expr = filter_expr.strip()
     if filter_expr.startswith('(') and filter_expr.endswith(')'):
         filter_expr = filter_expr[1:-1].strip()
+
+    # Pattern: meta['field'] != value
+    match = re.match(r"(\w+)\['(\w+)'\]\s*!=\s*(.+)", filter_expr)
+    if match:
+        container, field, expected = match.groups()
+        return _field_value(data, container, field) != _parse_literal(expected.strip())
+
+    # Pattern: meta['field'] not in [values]
+    match = re.match(r"(\w+)\['(\w+)'\]\s+not\s+in\s+\[(.*)\]", filter_expr)
+    if match:
+        container, field, values_str = match.groups()
+        return _field_value(data, container, field) not in _parse_list(values_str)
 
     # Pattern: meta['field'] == value
     match = re.match(r"(\w+)\['(\w+)'\]\s*==\s*(.+)", filter_expr)
@@ -551,6 +601,57 @@ class MilvusClient:
             'index_params': index_params,
         }
         MilvusClient._data[collection_name] = []
+
+    def describe_collection(self, collection_name: str, **kwargs) -> Dict[str, Any]:
+        """
+        Describe a collection: its fields (with the vector dimension) as the real client reports them.
+
+        Args:
+            collection_name: Name of the collection
+
+        Returns:
+            Dict with ``collection_name`` and ``fields`` (``name``, ``type``, ``params``)
+        """
+        info = MilvusClient._collections.get(collection_name)
+        if info is None:
+            raise Exception(f'collection not found[collection={collection_name}]')
+        schema = info.get('schema')
+        fields = []
+        for f in getattr(schema, 'fields', []) or []:
+            fields.append(
+                {
+                    'name': f.field_name,
+                    'type': f.datatype,
+                    'params': {'dim': f.dim} if f.dim else {},
+                    'is_primary': f.is_primary,
+                }
+            )
+        return {'collection_name': collection_name, 'fields': fields}
+
+    def describe_index(self, collection_name: str, index_name: str, **kwargs) -> Dict[str, Any]:
+        """
+        Describe the index built on a field (the index name defaults to the field name).
+
+        Returns:
+            Dict with ``index_type``, ``metric_type``, ``field_name``, ``index_name`` and the index params
+        """
+        info = MilvusClient._collections.get(collection_name) or {}
+        params = info.get('index_params')
+        for index in getattr(params, 'indexes', []) or []:
+            if index['field_name'] == index_name:
+                described = {
+                    'field_name': index['field_name'],
+                    'index_name': index_name,
+                    'index_type': index['index_type'],
+                    'metric_type': index['metric_type'],
+                }
+                described.update({k: str(v) for k, v in (index.get('params') or {}).items()})
+                return described
+        raise Exception(f'index not found[collection={collection_name}][index={index_name}]')
+
+    def get_server_version(self, **kwargs) -> str:
+        """Return the mock server's version string."""
+        return 'v2.5.0-mock'
 
     # -------------------------------------------------------------------------
     # Data Operations: Query (Filter-Based Retrieval)

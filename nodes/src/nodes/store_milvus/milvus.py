@@ -33,18 +33,21 @@ requirements = os.path.dirname(os.path.realpath(__file__)) + '/requirements.txt'
 depends(requirements)
 
 # Load what we need
-from typing import List, Callable, Dict, Any, cast
+from typing import List, Callable, Dict, Any, Optional, Sequence, Tuple
 import numpy as np
 from pymilvus import MilvusClient, DataType
 
 import re
 import json
 import uuid
+import base64
 import random
 import engLib
 
 from ai.common.schema import Doc, DocFilter, DocMetadata, QuestionText
 from ai.common.store import DocumentStoreBase
+from ai.common.store.errors import StoreUnsupported, ToolRefusal
+from ai.common.store.vx_types import ChunkPage, DocPage, DocumentRow, StoreInfo
 from ai.common.config import Config
 
 # Default batch size for bulk upsert operations
@@ -53,10 +56,60 @@ DEFAULT_BULK_INSERT_BATCH_SIZE = 50
 # Default connection timeout in seconds
 DEFAULT_TIMEOUT = 60
 
+# Largest offset + limit a Milvus query accepts
+MAX_QUERY_WINDOW = 16384
+
+# objectId of the collection's control record
+CONTROL_OBJECT_ID = 'schema'
+
+# Milvus metric -> the explorer's metric vocabulary (None: no vector-space equivalent)
+METRICS = {'COSINE': 'cosine', 'L2': 'l2', 'IP': 'ip'}
+
 
 def _escape_milvus_str(value: object) -> str:
     """Escape a value for safe interpolation into a Milvus filter expression."""
     return str(value).replace('\\', '\\\\').replace("'", "\\'")
+
+
+def _int_list(values: Sequence[Any]) -> str:
+    """Render integers for a Milvus ``in [...]`` list; anything that is not an integer is refused."""
+    return ', '.join(str(int(v)) for v in values)
+
+
+def _str_list(values: Sequence[Any]) -> str:
+    """Render strings for a Milvus ``in [...]`` list."""
+    return ', '.join(f"'{_escape_milvus_str(v)}'" for v in values)
+
+
+def _encode_cursor(offset: int, first: Optional[str]) -> str:
+    """Opaque listing cursor: the next offset and the first objectId of the page just served."""
+    raw = json.dumps({'o': offset, 'f': first}, separators=(',', ':')).encode('utf-8')
+    return base64.urlsafe_b64encode(raw).decode('ascii').rstrip('=')
+
+
+def _decode_cursor(cursor: Optional[str]) -> Tuple[int, Optional[str]]:
+    """Read a cursor from :func:`_encode_cursor`; anything else is INVALID_INPUT."""
+    if not cursor:
+        return 0, None
+    try:
+        padded = cursor + '=' * (-len(cursor) % 4)
+        data = json.loads(base64.urlsafe_b64decode(padded.encode('ascii')).decode('utf-8'))
+        offset = int(data['o'])
+        first = data.get('f')
+        if offset < 0 or (first is not None and not isinstance(first, str)):
+            raise ValueError('cursor out of range')
+        return offset, first
+    except Exception:
+        raise ToolRefusal('INVALID_INPUT', 'cursor is not one this store issued')
+
+
+def _plain_meta(meta: Any) -> Dict[str, Any]:
+    """A stored metadata value as a plain dict (older rows may hold other shapes)."""
+    if meta is None:
+        return {}
+    if hasattr(meta, 'model_dump'):
+        return meta.model_dump(exclude_none=True)
+    return {k: v for k, v in dict(meta).items() if v is not None}
 
 
 class Store(DocumentStoreBase):
@@ -69,6 +122,12 @@ class Store(DocumentStoreBase):
     vectorSizePos: int = 1
     vectorIndexType: str = 'IVF_FLAT'
     scalarIndexType: str = 'STL_SORT'
+
+    #: Vector Explorer support level. Only an unmocked live suite can promote a driver.
+    VX_SUPPORT: str = 'experimental'
+
+    #: Capabilities beyond the hooks this driver overrides.
+    VX_DRIVER_CAPABILITIES = frozenset({'search_keyword'})
 
     def __init__(self, provider: str, connConfig: Dict[str, Any], bag: Dict[str, Any]):
         """
@@ -189,9 +248,12 @@ class Store(DocumentStoreBase):
             self.client.create_collection(collection_name=self.collection, schema=schema, index_params=index_params)
         return True
 
-    def _convertFilter(self, docFilter: DocFilter) -> str:
+    def _convertFilter(self, docFilter: DocFilter, deleted: Optional[str] = None) -> List[str]:
         """
         Build the generic filter expression based on required permissions, node, parent, etc.
+
+        ``deleted`` ('active' | 'deleted' | 'all') overrides what the filter itself asks for
+        (``DocFilter.deleted``, else the legacy ``isDeleted`` flag).
         """
         # Declare the must list to start adding conditions
         must_conditions = []
@@ -200,46 +262,56 @@ class Store(DocumentStoreBase):
             must_conditions.append(f"meta['nodeId'] == '{_escape_milvus_str(docFilter.nodeId)}'")
 
         if docFilter.isTable is not None:
-            (must_conditions.append(f"meta['isTable'] == '{_escape_milvus_str(docFilter.isTable)}'"),)
+            must_conditions.append(f"meta['isTable'] == {bool(docFilter.isTable)}")
 
         if docFilter.tableIds is not None:
-            table_ids = ', '.join(f"'{_escape_milvus_str(t)}'" for t in docFilter.tableIds)
-            must_conditions.append(f"meta['tableId'] in [{table_ids}]")
+            must_conditions.append(f"meta['tableId'] in [{_int_list(docFilter.tableIds)}]")
 
         if docFilter.parent is not None:
             must_conditions.append(f"meta['parent'] == '{_escape_milvus_str(docFilter.parent)}'")
 
         if docFilter.permissions is not None:
-            permission_ids = ', '.join(f"'{_escape_milvus_str(p)}'" for p in docFilter.permissions)
-            must_conditions.append(f"meta['permissionId'] in [{permission_ids}]")
+            must_conditions.append(f"meta['permissionId'] in [{_int_list(docFilter.permissions)}]")
 
         if docFilter.objectIds is not None:
-            object_ids = ', '.join(f"'{_escape_milvus_str(o)}'" for o in docFilter.objectIds)
-            must_conditions.append(f"meta['objectId'] in [{object_ids}]")
+            must_conditions.append(f"meta['objectId'] in [{_str_list(docFilter.objectIds)}]")
 
-        # If we are not going after deleted docs, add a condition
-        if docFilter.isDeleted is None or not docFilter.isDeleted:
+        # Soft-deleted rows: active (default), deleted only, or all
+        mode = deleted or self.resolveDeleted(docFilter)
+        if mode == 'active':
             must_conditions.append("meta['isDeleted'] == False")
+        elif mode == 'deleted':
+            must_conditions.append("meta['isDeleted'] == True")
 
         if docFilter.chunkIds is not None:
-            chunk_ids = ', '.join(map(str, docFilter.chunkIds))
-            must_conditions.append(f"meta['chunkId'] in [{chunk_ids}]")
+            must_conditions.append(f"meta['chunkId'] in [{_int_list(docFilter.chunkIds)}]")
 
-            # If we are min chunk id, add a condition
+        # If we are min chunk id, add a condition
         if docFilter.minChunkId is not None:
-            must_conditions.append(f"meta['chunkId'] >= {docFilter.minChunkId}")
+            must_conditions.append(f"meta['chunkId'] >= {int(docFilter.minChunkId)}")
 
         # If we are min chunk id, add a condition
         if docFilter.maxChunkId is not None:
-            must_conditions.append(f"meta['chunkId'] <= {docFilter.maxChunkId}")
+            must_conditions.append(f"meta['chunkId'] <= {int(docFilter.maxChunkId)}")
 
         return must_conditions
 
-    def _convertToDocs(self, points: List[dict]) -> List[Doc]:
+    def _score(self, distance: float) -> float:
+        """Map a Milvus search distance onto a higher-is-better score."""
+        if self.similarity == 'COSINE':
+            # Milvus COSINE returns the similarity in [-1, 1]; rescale to [0, 1]
+            return (distance + 1) / 2
+        if self.similarity in ('L2', 'JACCARD', 'HAMMING'):
+            # Distances: 0 is identical, larger is farther
+            return 1.0 / (1.0 + max(float(distance), 0.0))
+        # IP and BM25 are already higher-is-better
+        return float(1.0 / (1.0 + np.exp(distance / -100)))  # expit function unwrapped
+
+    def _convertToDocs(self, points: List[dict], floor: Optional[float] = None) -> List[Doc]:
         """
         Convert a list of points or records to a docGroup.
 
-        Groups all document chunks  together
+        Search hits (points with an ``entity``) below ``floor`` are dropped.
         """
         docs: List[Doc] = []
 
@@ -258,24 +330,15 @@ class Store(DocumentStoreBase):
                 entity = point
                 score = 0
             else:
-                # Milvus COSINE distance returns values in the range [0, 2] where 0 is
-                # identical. We rescale to [0, 1] with 1 meaning most similar to stay
-                # consistent with the rest of the codebase score convention.
-                if self.similarity == 'COSINE':
-                    score = (point.get('distance') + 1) / 2
-                else:
-                    score = float(1.0 / (1.0 + np.exp(point.get('distance') / -100)))  # expit function unwrapped
-                # Ignore it if it doesn't have a high enough score
-                if score < self.threshold_search:
+                score = self._score(point.get('distance'))
+
+                # Ignore it if it is under the floor
+                if floor is not None and score < floor:
                     continue
 
-            # Process the entity as needed
-            content = entity.get('content')
-            # Process the entity as needed
-            metadata = entity.get('meta')
-
             # Get the payload content and metadata
-            metadata = cast(DocMetadata, metadata)
+            content = entity.get('content')
+            metadata = DocMetadata(**_plain_meta(entity.get('meta')))
 
             # Create a new document
             doc = Doc(score=score, page_content=content, metadata=metadata)
@@ -318,8 +381,9 @@ class Store(DocumentStoreBase):
         # Build up the conditions
         must_conditions = self._convertFilter(docFilter=docFilter)
 
-        # Append it
-        must_conditions.append(f"content like '%{_escape_milvus_str(query)}%'")
+        # Match on the question text (not on the question's repr)
+        text = getattr(query, 'text', None) or ''
+        must_conditions.append(f"content like '%{_escape_milvus_str(text)}%'")
 
         # Combine all conditions into a single filter expression
         filter_expression = ' and '.join(must_conditions) if must_conditions else None
@@ -340,6 +404,9 @@ class Store(DocumentStoreBase):
     def searchSemantic(self, query: QuestionText, docFilter: DocFilter) -> List[Doc]:
         """
         Semantic search.
+
+        Hits below the score floor (``effectiveFloor``) are dropped; the node's score
+        threshold is applied by the caller, not here.
         """
         # If the collection does not exists, by definition there are
         # no search results to return
@@ -362,7 +429,7 @@ class Store(DocumentStoreBase):
 
         # We cannot support non-zero offsets
         if docFilter.offset:
-            raise BaseException('Non-zero offset is not supported in semantic searching')
+            raise ValueError('Non-zero offset is not supported in semantic searching')
 
         # Combine all conditions into a single filter expression
         filter_expression = ' and '.join(must_conditions) if must_conditions else None
@@ -376,10 +443,7 @@ class Store(DocumentStoreBase):
             output_fields=['meta', 'content'],
         )
 
-        docs = self._convertToDocs(points[0])
-
-        # Filter results based on retrieval_score_threshold (self.threshold_search)
-        docs = [doc for doc in docs if doc.score >= self.threshold_search]
+        docs = self._convertToDocs(points[0], floor=self.effectiveFloor(docFilter))
 
         # Return the results
         return docs
@@ -413,19 +477,21 @@ class Store(DocumentStoreBase):
 
     def getPaths(self, parent: str | None = None, offset: int = 0, limit: int = 1000) -> Dict[str, str]:
         """
-        Retrieve unique parent paths.
+        Retrieve unique parent paths of the live documents (never the control record).
         """
         # If the collection does not exists, by definition there are
         # no paths to return
         if not self.doesCollectionExist():
             return {}
 
-        # Base filter: Only chunk 0
-        filter_expr = "meta['chunkId'] == 0"
+        # Base filter: Only chunk 0 of live documents
+        filter_expr = (
+            f"meta['chunkId'] == 0 and meta['isDeleted'] == False and meta['objectId'] != '{CONTROL_OBJECT_ID}'"
+        )
 
         # If parent specified, add condition
         if parent is not None:
-            filter_expr += f' and meta["parent"] == {json.dumps(parent)}'
+            filter_expr += f" and meta['parent'] == '{_escape_milvus_str(parent)}'"
 
         # Perform the query
         results = self.client.query(
@@ -435,7 +501,7 @@ class Store(DocumentStoreBase):
         # Build paths dictionary
         paths = {}
         for record in results:
-            metadata = record.get('meta', {})
+            metadata = _plain_meta(record.get('meta'))
             parent_id = metadata.get('parent', None)
             object_id = metadata.get('objectId', None)
 
@@ -447,6 +513,10 @@ class Store(DocumentStoreBase):
     def addChunks(self, chunks: List[Doc], checkCollection: bool = True) -> None:
         """
         Add document chunks to the document store using batched bulk upsert.
+
+        A batch holding chunk 0 of an object starts a new version of it, so the
+        object's older chunks are removed first; later batches of the same object
+        (the embedding nodes send long documents in several) are added to it.
         """
         # If no documents present, get out
         if not len(chunks):
@@ -456,18 +526,15 @@ class Store(DocumentStoreBase):
         if checkCollection and not self.createCollection(chunks):
             return
 
-        # Clear the object id list
+        # The objects this batch starts (it holds their chunk 0)
         objectIds: Dict = {}
-
-        # For each document
         for chunk in chunks:
-            # Save this object id
-            objectIds[chunk.metadata.objectId] = True
+            if not chunk.metadata.chunkId:
+                objectIds[chunk.metadata.objectId] = True
 
-        # Erase all documents/chunks associated with that ObjectId in one operation
-        # so we can cleanly insert the new version
+        # Erase the previous version of those objects in one operation
         if len(objectIds.keys()):
-            filter_condition = f"meta['objectId'] in [{', '.join(json.dumps(k) for k in objectIds.keys())}]"
+            filter_condition = f"meta['objectId'] in [{_str_list(objectIds.keys())}]"
             try:
                 # Delete entities
                 self.client.delete(collection_name=self.collection, filter=filter_condition)
@@ -498,12 +565,13 @@ class Store(DocumentStoreBase):
             if embedding is None:
                 raise Exception('No embedding in document')
 
-            # Append the points // create a unique identifier that fits into an int64 id field
+            # Append the points // create a unique identifier that fits into an int64 id field.
+            # The JSON meta field takes a plain dict (pymilvus cannot serialise a pydantic model).
             tmp_struct = {
                 'id': np.int64(((uuid.uuid1().time & 0x1FFFFFFFF) << 27) | random.getrandbits(27)),
                 'vector': embedding,
                 'content': chunk.page_content,
-                'meta': chunk.metadata,
+                'meta': chunk.metadata.model_dump(exclude_none=True),
             }
 
             batch.append(tmp_struct)
@@ -528,8 +596,7 @@ class Store(DocumentStoreBase):
 
         # If a permissionId list was specified
         if objectIds:
-            objectIdsJoint = ', '.join(f"'{_escape_milvus_str(o)}'" for o in objectIds)
-            must_conditions.append(f"meta['objectId'] in [{objectIdsJoint}]")
+            must_conditions.append(f"meta['objectId'] in [{_str_list(objectIds)}]")
 
         filter_expression = ' and '.join(must_conditions) if must_conditions else None
         if filter_expression:
@@ -551,7 +618,7 @@ class Store(DocumentStoreBase):
         batch: List[dict] = []
 
         for result in results:
-            meta = result.get('meta', {})
+            meta = _plain_meta(result.get('meta'))
             meta['isDeleted'] = isDeleted
             result['meta'] = meta
             batch.append(result)
@@ -579,8 +646,7 @@ class Store(DocumentStoreBase):
 
         # If a permissionId list was specified
         if objectIds:
-            objectIdsJoint = ', '.join(f"'{_escape_milvus_str(o)}'" for o in objectIds)
-            must_conditions.append(f"meta['objectId'] in [{objectIdsJoint}]")
+            must_conditions.append(f"meta['objectId'] in [{_str_list(objectIds)}]")
 
         filter_expression = ' and '.join(must_conditions) if must_conditions else None
         if not filter_expression:
@@ -609,8 +675,7 @@ class Store(DocumentStoreBase):
 
         # If a permissionId list was specified
         if objectIds:
-            objectIdsJoint = ', '.join(f"'{_escape_milvus_str(o)}'" for o in objectIds)
-            must_conditions.append(f"meta['objectId'] in [{objectIdsJoint}]")
+            must_conditions.append(f"meta['objectId'] in [{_str_list(objectIds)}]")
 
         filter_expression = ' and '.join(must_conditions) if must_conditions else None
         if not filter_expression:
@@ -628,63 +693,356 @@ class Store(DocumentStoreBase):
         """
         Given an object id, render the complete document.
 
-        Rehydrates all the chunks into the proper order.
+        Rehydrates all the chunks into the proper order, one window of
+        ``renderChunkSize`` chunk ids at a time.
         """
         # By definition, if the collection does not exists, there
         # is nothing to render
         if not self.doesCollectionExist():
             return
 
-        must_condition = []
-
-        # Since chunks are returned in any order, and a single objectId
-        # may contain tens of thousands of chunks, we grave them one
-        # group at a time (renderChunkSize), put them into an array,
-        # join them and call the callback
+        window = max(1, min(int(self.renderChunkSize), MAX_QUERY_WINDOW))
         offset = 0
         while True:
             # Build filter for getting a set of chunks within the offset range
-            must_condition = f"(meta['objectId'] == '{_escape_milvus_str(objectId)}') && ({offset - 1} < meta['chunkId'] < {offset + self.renderChunkSize})"
-
-            results = self.client.query(
-                collection_name=self.collection, filter=must_condition, output_fields=['meta', 'content']
+            must_condition = (
+                f"meta['objectId'] == '{_escape_milvus_str(objectId)}' and "
+                f"meta['chunkId'] >= {offset} and meta['chunkId'] < {offset + window}"
             )
 
-            # Create a renderChunkSize array with empty
-            # entries. This will allow us to join even when
-            # a chunk doesn't come back
-            # Process the results
-            text = [''] * self.renderChunkSize
-            lastIndex = -1
+            results = self.client.query(
+                collection_name=self.collection, filter=must_condition, output_fields=['meta', 'content'], limit=window
+            )
 
+            # Order this window's chunks by chunk id
+            parts: Dict[int, str] = {}
             for point in results:
-                content = point['content']
-                chunk = point['chunkId']
-                index = chunk - offset
-
-                # Should never happen since we gave it an offset
-                if chunk < offset:
-                    continue
-
-                text[index] = content
-                if index > lastIndex:
-                    lastIndex = index
-
-            # Compute the number of items we are going to process
-            numberOfItems = lastIndex + 1
+                chunk = _plain_meta(point.get('meta')).get('chunkId')
+                if isinstance(chunk, int) and offset <= chunk < offset + window:
+                    parts[chunk] = point.get('content') or ''
 
             # If we got no items back, we are done
-            if numberOfItems < 1:
+            if not parts:
                 break
 
-            # Join it together
-            fullText = ''.join(text[0:numberOfItems])
+            # Join it together and call the output function
+            callback(''.join(parts[chunk] for chunk in sorted(parts)))
 
-            # Call the output function
-            callback(fullText)
-
-            # If we got less than we asked for, must be done
-            if numberOfItems < self.renderChunkSize:
+            # If the window was not full, must be done
+            if max(parts) < offset + window - 1:
                 break
 
-            offset += self.renderChunkSize
+            offset += window
+
+    # ------------------------------------------------------------------
+    # Vector Explorer hooks (docs/development/nodes/vector-tool-contract.md)
+    # ------------------------------------------------------------------
+
+    def _metricName(self) -> Optional[str]:
+        """The configured metric in the explorer's vocabulary."""
+        return METRICS.get(str(self.similarity).upper())
+
+    def _countWhere(self, conditions: List[str]) -> int:
+        """``count(*)`` of the rows matching ``conditions``."""
+        filter_expression = ' and '.join(conditions) if conditions else ''
+        res = self.client.query(collection_name=self.collection, filter=filter_expression, output_fields=['count(*)'])
+        return int(res[0]['count(*)']) if res else 0
+
+    def _readControl(self) -> Tuple[Optional[bool], Optional[int], Optional[str]]:
+        """(control record present, vector size, model) read from the control record."""
+        rows = self.client.query(
+            collection_name=self.collection,
+            filter=f"meta['objectId'] == '{CONTROL_OBJECT_ID}'",
+            output_fields=['meta'],
+            limit=2,
+        )
+        if len(rows) != 1:
+            return False, None, None
+        meta = _plain_meta(rows[0].get('meta'))
+        size = meta.get('vectorSize')
+        model = meta.get('modelName')
+        if isinstance(size, int) and size > 0:
+            self.vectorSize = size
+        if isinstance(model, str) and model:
+            self.modelName = model
+        return True, size if isinstance(size, int) else None, model if isinstance(model, str) else None
+
+    def _toDoc(self, row: Dict[str, Any], *, with_vector: bool) -> Doc:
+        """A Doc from a query row; carries ``metadata.pointId`` and, on request, the embedding."""
+        meta = _plain_meta(row.get('meta'))
+        meta['pointId'] = str(row.get('id'))
+        doc = Doc(page_content=row.get('content') or '', metadata=DocMetadata(**meta), score=0)
+        if with_vector:
+            doc.embedding = [float(x) for x in row.get('vector') or []]
+        return doc
+
+    def describe(self) -> StoreInfo:
+        """Describe the collection; never raises for a missing one and never names the host."""
+        caveats = ['experimental']
+        version = None
+        try:
+            version = str(self.client.get_server_version())
+        except Exception:
+            version = None
+
+        if not self._doesCollectionExist():
+            return StoreInfo(
+                backend='milvus',
+                backend_version=version,
+                collection=self.collection or None,
+                collection_exists=False,
+                control_record=None,
+                meta_column=None,
+                metric=self._metricName(),
+                dimension=None,
+                model=None,
+                index=None,
+                size_bytes=None,
+                caveats=caveats,
+            )
+
+        control, dimension, model = self._readControl()
+
+        # The vector field's dimension when the control record does not say
+        if dimension is None:
+            try:
+                for field in self.client.describe_collection(collection_name=self.collection).get('fields', []):
+                    if field.get('name') == 'vector':
+                        dimension = int((field.get('params') or {}).get('dim')) or None
+            except Exception:
+                dimension = None
+
+        # The vector index (IVF_FLAT by default)
+        index = None
+        try:
+            described = self.client.describe_index(collection_name=self.collection, index_name='vector')
+            params = {}
+            for key in ('nlist', 'M', 'efConstruction', 'nprobe'):
+                if key in described:
+                    try:
+                        params[key] = int(described[key])
+                    except (TypeError, ValueError):
+                        params[key] = described[key]
+            index = {'type': described.get('index_type'), 'metric': described.get('metric_type'), 'params': params}
+        except Exception:
+            index = None
+
+        return StoreInfo(
+            backend='milvus',
+            backend_version=version,
+            collection=self.collection,
+            collection_exists=True,
+            control_record=control,
+            meta_column=None,
+            metric=self._metricName(),
+            dimension=dimension,
+            model=model,
+            index=index,
+            size_bytes=None,
+            caveats=caveats,
+        )
+
+    def scoreInfo(self) -> Dict[str, Any]:
+        """How Doc.score is computed on Milvus."""
+        if self.similarity == 'COSINE':
+            formula, score_range = '(1 + cosine similarity) / 2', [0, 1]
+        elif self.similarity == 'L2':
+            formula, score_range = '1 / (1 + squared L2 distance)', [0, 1]
+        elif self.similarity in ('JACCARD', 'HAMMING'):
+            formula, score_range = f'1 / (1 + {self.similarity.lower()} distance)', [0, 1]
+        else:
+            formula, score_range = f'sigmoid({self.similarity.lower()} score / 100)', [0, 1]
+        return {
+            'formula': formula,
+            'range': score_range,
+            'higher_is_better': True,
+            'floor': 0.2,
+            'threshold': self.threshold_search,
+        }
+
+    def countChunks(self, docFilter: DocFilter) -> Optional[int]:
+        """Chunk rows matching ``docFilter``, control record excluded."""
+        if not self._doesCollectionExist():
+            return 0
+        conditions = self._convertFilter(docFilter)
+        conditions.append(f"meta['objectId'] != '{CONTROL_OBJECT_ID}'")
+        return self._countWhere(conditions)
+
+    def listDocuments(
+        self,
+        *,
+        cursor: Optional[str],
+        limit: int,
+        object_ids: Optional[Sequence[str]],
+        deleted: str,
+        sort: str,
+    ) -> DocPage:
+        """
+        One page of documents: chunk-0 rows by offset, with per-document chunk counts.
+
+        Milvus has no group-by on scalar fields, so a document is listed by its chunk 0
+        (a document without one is not listed) and the rows arrive in storage order.
+        """
+        offset, previous_first = _decode_cursor(cursor)
+        limit = max(1, int(limit))
+        caveats = ['documents_unsorted', 'documents_by_first_chunk']
+
+        if not self._doesCollectionExist():
+            return DocPage(
+                items=[], next_cursor=None, total=0, counts_exact=True, distinct=False, sorted=False, caveats=caveats
+            )
+
+        conditions = self._convertFilter(
+            DocFilter(chunkIds=[0], objectIds=list(object_ids) if object_ids else None), deleted=deleted
+        )
+        conditions.append(f"meta['objectId'] != '{CONTROL_OBJECT_ID}'")
+
+        rows = self.client.query(
+            collection_name=self.collection,
+            filter=' and '.join(conditions),
+            output_fields=['meta'],
+            offset=offset,
+            limit=min(limit + 1, MAX_QUERY_WINDOW - offset) if offset < MAX_QUERY_WINDOW else 0,
+        )
+
+        # The backend ignored the offset: this page repeats the previous one
+        if previous_first is not None and rows and _plain_meta(rows[0].get('meta')).get('objectId') == previous_first:
+            return DocPage(
+                items=[],
+                next_cursor=None,
+                total=None,
+                counts_exact=True,
+                distinct=False,
+                sorted=False,
+                caveats=caveats + ['documents_paging_unsupported'],
+            )
+
+        has_more = len(rows) > limit
+        rows = rows[:limit]
+
+        items: List[DocumentRow] = []
+        seen = set()
+        for row in rows:
+            meta = _plain_meta(row.get('meta'))
+            object_id = meta.get('objectId')
+            if not object_id or object_id in seen:
+                continue
+            seen.add(object_id)
+            chunk_conditions = self._convertFilter(DocFilter(objectIds=[object_id]), deleted=deleted)
+            items.append(
+                DocumentRow(
+                    objectId=object_id,
+                    path=meta.get('parent') or '',
+                    chunks=self._countWhere(chunk_conditions),
+                    has_first_chunk=True,
+                    deleted=bool(meta.get('isDeleted')),
+                    tables=None,
+                    nodeId=meta.get('nodeId'),
+                    size=meta.get('size'),
+                    modifyTime=meta.get('modifyTime'),
+                    ingestedAt=meta.get('ingestedAt'),
+                    pointId=str(row.get('id')),
+                )
+            )
+
+        first = _plain_meta(rows[0].get('meta')).get('objectId') if rows else None
+        return DocPage(
+            items=items,
+            next_cursor=_encode_cursor(offset + limit, first) if has_more else None,
+            total=self._countWhere(conditions),
+            counts_exact=True,
+            distinct=False,
+            sorted=False,
+            caveats=caveats,
+        )
+
+    def scrollChunks(self, objectId: str, *, after_chunk: int, limit: int, deleted: str) -> ChunkPage:
+        """The chunks of one document after ``after_chunk``, in chunk order, without embeddings."""
+        after_chunk = int(after_chunk)
+        limit = max(1, int(limit))
+        if objectId == CONTROL_OBJECT_ID or not self._doesCollectionExist():
+            return ChunkPage(docs=[], has_more=False, next_after=after_chunk)
+
+        # Read a window of chunk ids; Milvus queries do not sort
+        high = after_chunk + limit
+        conditions = self._convertFilter(DocFilter(objectIds=[objectId]), deleted=deleted)
+        rows = self.client.query(
+            collection_name=self.collection,
+            filter=' and '.join(conditions + [f"meta['chunkId'] > {after_chunk}", f"meta['chunkId'] <= {high}"]),
+            output_fields=['meta', 'content'],
+            limit=min(limit * 4, MAX_QUERY_WINDOW),
+        )
+        docs = sorted((self._toDoc(row, with_vector=False) for row in rows), key=lambda doc: doc.metadata.chunkId)
+
+        # Is there anything after the window?
+        more = self.client.query(
+            collection_name=self.collection,
+            filter=' and '.join(conditions + [f"meta['chunkId'] > {high}"]),
+            output_fields=['meta'],
+            limit=1,
+        )
+        next_after = docs[-1].metadata.chunkId if docs else after_chunk
+        if more:
+            next_after = max(next_after, high)
+        return ChunkPage(docs=docs, has_more=bool(more), next_after=next_after)
+
+    def sampleChunks(
+        self,
+        *,
+        n: int,
+        seed: int,
+        strategy: str,
+        docFilter: DocFilter,
+        include_keys: Sequence[Tuple[str, int]],
+    ) -> Tuple[List[Doc], str]:
+        """Up to ``n`` chunks with embeddings, in storage order ('first'); stratified is not native."""
+        if strategy == 'stratified':
+            raise StoreUnsupported('sampleChunks(strategy="stratified") is not native on Milvus')
+        if not self._doesCollectionExist():
+            return [], 'first'
+        pinned = {(str(o), int(c)) for o, c in include_keys or []}
+        conditions = self._convertFilter(docFilter)
+        conditions.append(f"meta['objectId'] != '{CONTROL_OBJECT_ID}'")
+        rows = self.client.query(
+            collection_name=self.collection,
+            filter=' and '.join(conditions),
+            output_fields=['meta', 'content', 'vector'],
+            limit=min(max(1, int(n)) + len(pinned), MAX_QUERY_WINDOW),
+        )
+        docs = []
+        for row in rows:
+            doc = self._toDoc(row, with_vector=True)
+            if (doc.metadata.objectId, doc.metadata.chunkId) in pinned:
+                continue
+            docs.append(doc)
+            if len(docs) >= n:
+                break
+        return docs, 'first'
+
+    def getVectors(self, keys: Sequence[Tuple[str, int]]) -> List[Doc]:
+        """Chunks with embeddings for ``keys`` (by filter: Milvus ids are random), in request order."""
+        wanted = [(str(o), int(c)) for o, c in keys or [] if o != CONTROL_OBJECT_ID]
+        if not wanted or not self._doesCollectionExist():
+            return []
+        object_ids = sorted({o for o, _ in wanted})
+        chunk_ids = sorted({c for _, c in wanted})
+        rows = self.client.query(
+            collection_name=self.collection,
+            filter=f"meta['objectId'] in [{_str_list(object_ids)}] and meta['chunkId'] in [{_int_list(chunk_ids)}]",
+            output_fields=['meta', 'content', 'vector'],
+            limit=min(len(object_ids) * len(chunk_ids), MAX_QUERY_WINDOW),
+        )
+        found: Dict[Tuple[str, int], Doc] = {}
+        for row in rows:
+            doc = self._toDoc(row, with_vector=True)
+            found.setdefault((doc.metadata.objectId, doc.metadata.chunkId), doc)
+        return [found[key] for key in wanted if key in found]
+
+    def removeCounted(self, objectIds: List[str]) -> Optional[int]:
+        """Remove every chunk of ``objectIds``; return the rows removed (counted first)."""
+        ids = [o for o in objectIds or [] if o != CONTROL_OBJECT_ID]
+        if not ids or not self._doesCollectionExist():
+            return 0
+        removed = self._countWhere([f"meta['objectId'] in [{_str_list(ids)}]"])
+        self.remove(ids)
+        return removed
