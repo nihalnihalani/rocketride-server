@@ -42,6 +42,7 @@ naming the table ``mydocs``. Column names are lower case for the same reason.
 
 from __future__ import annotations
 
+import hashlib
 import re
 
 from dataclasses import dataclass
@@ -612,8 +613,18 @@ def _sample_seeds(seed: int) -> Tuple[int, int]:
 
 
 def _index_name(table: str, suffix: str) -> str:
-    """``<table>_<suffix>``, the name the legacy driver gave its index (PostgreSQL keeps 63 characters)."""
-    return f'{table}_{suffix}'[:63]
+    """``<table>_<suffix>``, the name the legacy driver gave its index, when it fits in 63 characters.
+
+    A longer name would be cut by PostgreSQL, and two indexes of a 62- or
+    63-character table would then share a name (or take the table's own).
+    Such a table gets ``<prefix>_<digest>_<suffix>`` instead: the digest of
+    the whole table name keeps tables that share a prefix apart.
+    """
+    name = f'{table}_{suffix}'
+    if len(name) <= 63:
+        return name
+    digest = hashlib.sha1(table.encode('utf-8')).hexdigest()[:8]
+    return f'{table[: 63 - len(suffix) - len(digest) - 2]}_{digest}_{suffix}'
 
 
 def vector_literal(values: Sequence[float]) -> str:

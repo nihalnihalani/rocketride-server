@@ -290,6 +290,30 @@ class TestIngest:
         assert "m='16'" in hnsw and "ef_construction='64'" in hnsw
         assert any('(objectid, chunkid)' in ddl for ddl in indexes.values())
 
+    def test_long_table_names_get_two_distinct_indexes(self, dsn, table, stores, admin):
+        """62- and 63-character names (the identifier limit) still get both indexes, named apart from the table."""
+        rng = np.random.default_rng(7)
+        names = [(table + '_' + 'x' * 63)[:63], (table + '_' + 'x' * 63)[:62], (table + '_' + 'y' * 63)[:63]]
+        try:
+            for name in names:
+                store = _open(dsn, name, stores)
+                _ingest(store, rng, 'doc', 2)
+            with admin.cursor() as cur:
+                cur.execute('SELECT tablename, indexname, indexdef FROM pg_indexes WHERE tablename = ANY(%s)', (names,))
+                found = cur.fetchall()
+            by_table = {}
+            for tablename, indexname, indexdef in found:
+                by_table.setdefault(tablename, {})[indexname] = indexdef
+            assert set(by_table) == set(names)
+            for name, indexes in by_table.items():
+                assert name not in indexes and all(len(n) <= 63 for n in indexes)
+                assert any('USING hnsw' in d for d in indexes.values())
+                assert any('(objectid, chunkid)' in d for d in indexes.values())
+            assert len({n for indexes in by_table.values() for n in indexes}) == 3 * 3  # pkey, key, hnsw each
+        finally:
+            for name in names:
+                _drop(admin, name)
+
     def test_two_batch_reingest_keeps_both_batches(self, dsn, table, stores, admin):
         """A document flushed in two batches (chunk 0 in the first) keeps every chunk (AC-19)."""
         rng = np.random.default_rng(3)

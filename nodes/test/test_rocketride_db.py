@@ -547,6 +547,14 @@ class TestRocketrideVectorStore:
         )
         assert store.hnsw_ef_construction == 128
 
+    def test_long_table_names_get_distinct_index_names(self, mock_rv):
+        for length in (61, 62, 63):
+            name = ('t' * 70)[:length]
+            store = _make_store(mock_rv, {'collection': name, 'similarity': 'cosine'})
+            store.addChunks([_doc('a', 0, [1, 0, 0, 0, 0])])
+            indexes = set(mock_rv.db.table(name).indexes)
+            assert len(indexes) == 2 and name not in indexes and all(len(n) <= 63 for n in indexes)
+
     def test_hnsw_skipped_above_dimension_ceiling(self, mock_rv):
         store = _make_store(mock_rv, {'collection': 'rr_vec', 'similarity': 'cosine'})
         store._createCollection(vectorSize=2001)
