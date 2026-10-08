@@ -38,16 +38,27 @@ Requires a container on the live pin (PG16 + pgvector), e.g.::
         pgvector/pgvector:pg16
     docker exec rr-pg-phase1 psql -U rruser -d rrtenant -c 'CREATE EXTENSION IF NOT EXISTS vector;'
 
+The ``rocketride_vector`` cases run the node's real classes over the shared
+pgvector driver, with the DSN injected through ``ROCKETRIDE_DB_DSN`` (the
+production delivery path), once directly and once through a transaction-mode
+pooler.
+
 Configuration via environment variables:
     RR_TEST_PG_DSN — libpq URL of the test database
                      (default: postgresql://rruser:rrpass@localhost:55432/rrtenant)
+    RR_TEST_PGVECTOR_POOLER_DSN — the same database behind PgBouncer in
+                     transaction mode; the pooled rocketride_vector cases are
+                     not run without it
 
 Skips cleanly when the database is unreachable.
 """
 
 from __future__ import annotations
 
+import dataclasses
+import importlib
 import importlib.util
+import json
 import os
 import sys
 import urllib.parse
@@ -434,24 +445,9 @@ class TestRocketrideSqlE2E:
 
 
 # ---------------------------------------------------------------------------
-# rocketride_vector end-to-end (incl. HNSW index verification)
+# rocketride_vector end-to-end (the shared pgvector driver, the HNSW index,
+# the tool surface), directly and through the transaction-mode pooler
 # ---------------------------------------------------------------------------
-
-
-def _load_vector_store(monkeypatch):
-    iglobal = _load_from_path('nodes.rocketride_vector.IGlobal', _VEC_NODE_DIR / 'IGlobal.py', register=False)
-    pkg = types.ModuleType('nodes.rocketride_vector')
-    pkg.__path__ = [str(_VEC_NODE_DIR)]
-    pkg.IGlobal = iglobal
-    monkeypatch.setitem(sys.modules, 'nodes.rocketride_vector', pkg)
-    monkeypatch.setitem(sys.modules, 'nodes.rocketride_vector.IGlobal', iglobal)
-    store = _load_from_path(
-        'nodes.rocketride_vector.rocketride_vector',
-        _VEC_NODE_DIR / 'rocketride_vector.py',
-        register=False,
-    )
-    monkeypatch.setitem(sys.modules, 'nodes.rocketride_vector.rocketride_vector', store)
-    return store.Store
 
 
 _NODE_LOADER_ALIASES = (
@@ -465,14 +461,6 @@ _NODE_LOADER_ALIASES = (
             'nodes.rocketride_sql',
             'nodes.rocketride_sql.IGlobal',
             'nodes.rocketride_sql.IInstance',
-        ),
-    ),
-    (
-        _load_vector_store,
-        (
-            'nodes.rocketride_vector',
-            'nodes.rocketride_vector.IGlobal',
-            'nodes.rocketride_vector.rocketride_vector',
         ),
     ),
 )
@@ -505,8 +493,71 @@ def test_node_loader_restores_existing_module_aliases(rr_env, monkeypatch, loade
     assert all(sys.modules[alias] is existing[alias] for alias in aliases)
 
 
-VEC_TABLE = 'rr_vec_e2e'
+# The rocketride_vector cases run the node's real classes (StoreGlobalBase,
+# StoreInstanceBase, the shared pgvector driver, the schema) rather than the
+# stand-ins above, once directly and once through the pooler when
+# RR_TEST_PGVECTOR_POOLER_DSN is set.
+
+POOLER_DSN = os.environ.get('RR_TEST_PGVECTOR_POOLER_DSN', '').strip()
+VEC_TABLE = 'vx_l2_rr_e2e'
 DIMS = 8
+_VEC_MODULES = (
+    'nodes.rocketride_vector',
+    'nodes.rocketride_vector.IEndpoint',
+    'nodes.rocketride_vector.IGlobal',
+    'nodes.rocketride_vector.IInstance',
+    'nodes.rocketride_vector.rocketride_vector',
+)
+
+
+@pytest.fixture(params=['direct', 'pooler'])
+def vec_dsn(request) -> str:
+    """The DSN the server injects: the database itself, or the transaction-mode pooler in front of it."""
+    if request.param == 'pooler':
+        if not POOLER_DSN:
+            pytest.skip('NOT RUN: RR_TEST_PGVECTOR_POOLER_DSN is not set (the transaction-mode pooler pass)')
+        try:
+            psycopg2.connect(POOLER_DSN, connect_timeout=3).close()
+        except Exception:
+            if _DB_TESTS_REQUIRED:
+                pytest.fail(f'RR_TEST_PGVECTOR_POOLER_DSN is set but not reachable: {POOLER_DSN}')
+            pytest.skip(f'NOT RUN: pooler not reachable at {POOLER_DSN}')
+        return POOLER_DSN
+    return TEST_DSN
+
+
+@pytest.fixture()
+def rv(monkeypatch, vec_dsn):
+    """The real rocketride_vector node, its DSN injected the way the task engine injects it."""
+    import depends as real_depends
+
+    depends_mod = types.ModuleType('depends')
+    depends_mod.__dict__.update(real_depends.__dict__)
+    depends_mod.depends = lambda *a, **kw: None  # the requirements are installed; never resolve them in a test
+    monkeypatch.setitem(sys.modules, 'depends', depends_mod)
+    for name in _VEC_MODULES:  # always the real modules, never a stand-in another suite registered
+        monkeypatch.delitem(sys.modules, name, raising=False)
+    from ai.common.config import Config
+
+    monkeypatch.setattr(Config, 'getNodeConfig', staticmethod(lambda provider, connConfig: dict(connConfig)))
+    monkeypatch.setenv('ROCKETRIDE_DB_DSN', vec_dsn)
+    monkeypatch.delenv('ROCKETRIDE_DB_RESOLVE_ERROR', raising=False)
+    store_mod = importlib.import_module('nodes.rocketride_vector.rocketride_vector')
+    iglobal_mod = importlib.import_module('nodes.rocketride_vector.IGlobal')
+    iinstance_mod = importlib.import_module('nodes.rocketride_vector.IInstance')
+    from ai.common.schema import Doc, DocFilter, DocMetadata, QuestionText
+
+    return types.SimpleNamespace(
+        dsn=vec_dsn,
+        Store=store_mod.Store,
+        IGlobal=iglobal_mod.IGlobal,
+        IInstance=iinstance_mod.IInstance,
+        Doc=Doc,
+        DocFilter=DocFilter,
+        DocMetadata=DocMetadata,
+        QuestionText=QuestionText,
+        monkeypatch=monkeypatch,
+    )
 
 
 def _unit_vec(rng):
@@ -514,75 +565,99 @@ def _unit_vec(rng):
     return (v / np.linalg.norm(v)).tolist()
 
 
+def _begin_vector_node(rv, config):
+    """Run the node's real beginGlobal (open the store, register the transform key)."""
+    from rocketlib import OPEN_MODE
+
+    glb = rv.IGlobal()
+    glb.IEndpoint = types.SimpleNamespace(
+        endpoint=types.SimpleNamespace(openMode=OPEN_MODE.SOURCE, bag={}, parameters={})
+    )
+    glb.glb = types.SimpleNamespace(logicalType='rocketride_vector', connConfig=config)
+    glb.beginGlobal()
+    inst = rv.IInstance()
+    inst.IGlobal = glb
+    return glb, inst
+
+
 class TestRocketrideVectorE2E:
     @pytest.fixture()
-    def vec_store(self, rr_env, monkeypatch, raw_conn):
+    def vec_store(self, rv, raw_conn):
         with raw_conn.cursor() as cur:
             cur.execute(f'DROP TABLE IF EXISTS {VEC_TABLE}')
             raw_conn.commit()
-        store_cls = _load_vector_store(monkeypatch)
-        store = store_cls('rocketride_vector', {'collection': VEC_TABLE, 'similarity': 'cosine'}, {})
+        store = rv.Store('rocketride_vector', {'collection': VEC_TABLE, 'similarity': 'cosine'}, {})
         yield store
-        # Close the driver connection before dropping: the driver's SELECT
-        # paths (mirroring vectordb_postgres) leave the session idle in
-        # transaction, and its AccessShare lock would block the DROP.
-        if store.client is not None:
-            store.client.close()
-            store.client = None
+        store.close()
         with raw_conn.cursor() as cur:
+            cur.execute("SET lock_timeout = '10s'")
             cur.execute(f'DROP TABLE IF EXISTS {VEC_TABLE}')
             raw_conn.commit()
 
-    def _chunks(self, schema, contents_and_embeddings):
-        docs = []
-        for i, (content, embedding) in enumerate(contents_and_embeddings):
-            docs.append(
-                schema.Doc(
-                    page_content=content,
-                    metadata={
-                        'objectId': f'obj-{i}',
-                        'nodeId': 'test-node',
-                        'parent': '/test',
-                        'permissionId': 0,
-                        'isDeleted': False,
-                        'chunkId': 0,
-                        'isTable': False,
-                        'tableId': 0,
-                        'vectorSize': len(embedding),
-                        'modelName': 'test-model',
-                    },
-                    embedding=embedding,
-                    embedding_model='test-model',
-                )
+    def _chunks(self, rv, contents_and_embeddings, chunk_id=0):
+        return [
+            rv.Doc(
+                page_content=content,
+                metadata=rv.DocMetadata(
+                    objectId=f'obj-{i}',
+                    chunkId=chunk_id,
+                    nodeId='test-node',
+                    parent='/test',
+                    permissionId=0,
+                    isDeleted=False,
+                    isTable=False,
+                    tableId=0,
+                    signature='component-signature',
+                    chunk_index=chunk_id,
+                ),
+                embedding=embedding,
+                embedding_model='test-model',
             )
-        return docs
+            for i, (content, embedding) in enumerate(contents_and_embeddings)
+        ]
 
-    def test_first_write_creates_table_and_hnsw_index(self, rr_env, vec_store, raw_conn):
+    def test_connects_via_the_injected_dsn_and_reports_no_connection_details(self, rv, vec_store):
+        assert vec_store.database == TEST_DB_NAME
+        info = vec_store.describe()
+        assert info.collection == VEC_TABLE and info.collection_exists is False
+        assert 'shared_org_table' in info.caveats
+        dumped = json.dumps(dataclasses.asdict(info))
+        fields = urllib.parse.urlparse(rv.dsn)
+        for secret in (fields.hostname, str(fields.port), fields.username, fields.password, TEST_DB_NAME):
+            assert secret not in dumped
+
+    def test_first_write_creates_table_and_hnsw_index(self, rv, vec_store, raw_conn):
         rng = np.random.default_rng(7)
-        vec_store.addChunks(self._chunks(rr_env.schema, [(f'doc {i}', _unit_vec(rng)) for i in range(100)]))
+        vec_store.addChunks(self._chunks(rv, [(f'doc {i}', _unit_vec(rng)) for i in range(100)]))
 
         with raw_conn.cursor() as cur:
             cur.execute('SELECT indexname, indexdef FROM pg_indexes WHERE tablename = %s', (VEC_TABLE,))
             indexes = {name: ddl for name, ddl in cur.fetchall()}
+            cur.execute(
+                f'SELECT count(*), count(signature), count(meta) FROM {VEC_TABLE} WHERE objectid <> %s', ('schema',)
+            )
+            counts = cur.fetchone()
+        raw_conn.rollback()
 
         index_name = f'{VEC_TABLE}_embedding_hnsw'
         assert index_name in indexes
         assert 'USING hnsw (embedding vector_cosine_ops)' in indexes[index_name]
         assert "m='16'" in indexes[index_name]
         assert "ef_construction='64'" in indexes[index_name]
+        # A real Doc (signature and chunker extras included) is stored, not refused.
+        assert counts == (100, 100, 100)
 
-    def test_semantic_search_uses_hnsw_index_not_seq_scan(self, rr_env, vec_store, raw_conn):
+    def test_semantic_search_uses_hnsw_index_not_seq_scan(self, rv, vec_store, raw_conn):
         """The acceptance check: the node's own search SQL must use the index.
 
         The planner rightly prefers a seq scan on tiny tables, so load enough
         rows (and ANALYZE) that index cost wins; then EXPLAIN the exact
-        ``semantic_search`` statement the driver executes.
+        statement the driver executes for a semantic search.
         """
+        from psycopg2 import sql as pgsql
+
         rng = np.random.default_rng(11)
-        # Insert in one bulk statement (the driver's row-at-a-time insert is
-        # too slow for a 2000-row planner fixture); create the table + index
-        # through the driver's first-write path first.
-        vec_store.addChunks(self._chunks(rr_env.schema, [('seed doc', _unit_vec(rng))]))
+        vec_store.addChunks(self._chunks(rv, [('seed doc', _unit_vec(rng))]))
         with raw_conn.cursor() as cur:
             cur.execute(
                 f'INSERT INTO {VEC_TABLE} (content, objectId, chunkId, isDeleted, embedding) '
@@ -594,56 +669,122 @@ class TestRocketrideVectorE2E:
             cur.execute(f'ANALYZE {VEC_TABLE}')
             raw_conn.commit()
 
-        # EXPLAIN the exact statement the driver runs for semantic search.
-        node_module = sys.modules['nodes.rocketride_vector.rocketride_vector']
-        search_sql = node_module.SQL_QUERIES['semantic_search'].format(
-            collection=VEC_TABLE, similarity_operator='<=>', where_clause=''
+        from ai.common.store.pgvector.sql import vector_literal
+
+        statement, params = vec_store._sql.semantic(
+            vec_store._cached_columns(),
+            'cosine',
+            vector_literal(_unit_vec(rng)),
+            vec_store._where(rv.DocFilter()),
+            5,
+            0,
         )
-        probe = _unit_vec(rng)
         with raw_conn.cursor() as cur:
-            cur.execute(f'EXPLAIN {search_sql}', (str(probe), 5))
+            cur.execute(pgsql.SQL('EXPLAIN ') + statement, params)
             plan = '\n'.join(row[0] for row in cur.fetchall())
+        raw_conn.rollback()
 
         assert f'Index Scan using {VEC_TABLE}_embedding_hnsw' in plan, plan
         assert 'Seq Scan' not in plan, plan
 
-    def test_semantic_search_returns_nearest_document(self, rr_env, vec_store):
+    def test_semantic_search_returns_nearest_document(self, rv, vec_store):
         rng = np.random.default_rng(23)
         vectors = [(f'doc {i}', _unit_vec(rng)) for i in range(50)]
-        vec_store.addChunks(self._chunks(rr_env.schema, vectors))
+        vec_store.addChunks(self._chunks(rv, vectors))
 
-        # Query with (nearly) the exact embedding of doc 17 — it must come back first.
-        target = vectors[17][1]
-        query = rr_env.schema.QuestionText('find doc 17')
-        query.embedding = target
-        results = vec_store.searchSemantic(query, rr_env.schema.DocFilter(limit=5))
+        # Query with the exact embedding of doc 17: it must come back first.
+        query = rv.QuestionText(text='find doc 17')
+        query.embedding = vectors[17][1]
+        results = vec_store.searchSemantic(query, rv.DocFilter(limit=5))
         assert results, 'semantic search returned nothing'
         assert results[0].page_content == 'doc 17'
         assert results[0].score > 0.99
 
-    def test_upsert_replaces_same_object_id(self, rr_env, vec_store):
+    def test_upsert_replaces_same_object_id(self, rv, vec_store):
         rng = np.random.default_rng(31)
-        first = self._chunks(rr_env.schema, [('original', _unit_vec(rng))])
-        vec_store.addChunks(first)
-        replacement = self._chunks(rr_env.schema, [('replaced', _unit_vec(rng))])
-        vec_store.addChunks(replacement)
-        assert vec_store.count_documents() == 1
+        vec_store.addChunks(self._chunks(rv, [('original', _unit_vec(rng))]))
+        vec_store.addChunks(self._chunks(rv, [('replaced', _unit_vec(rng))]))
+        assert vec_store.count_documents() == 2  # the chunk and the control record
+        assert vec_store.countChunks(rv.DocFilter()) == 1
 
-    def test_wide_vectors_skip_index_with_warning(self, rr_env, monkeypatch, raw_conn):
-        wide_table = 'rr_vec_wide_e2e'
+    def test_wide_vectors_skip_index_with_warning(self, rv, raw_conn):
+        import ai.common.store.pgvector.driver as driver
+
+        warnings: list = []
+        rv.monkeypatch.setattr(driver, 'warning', warnings.append)
+        wide_table = 'vx_l2_rr_wide_e2e'
         with raw_conn.cursor() as cur:
             cur.execute(f'DROP TABLE IF EXISTS {wide_table}')
             raw_conn.commit()
-        store_cls = _load_vector_store(monkeypatch)
-        store = store_cls('rocketride_vector', {'collection': wide_table, 'similarity': 'cosine'}, {})
+        store = rv.Store('rocketride_vector', {'collection': wide_table, 'similarity': 'cosine'}, {})
         try:
             store._createCollection(vectorSize=2001)
             with raw_conn.cursor() as cur:
                 cur.execute('SELECT indexname FROM pg_indexes WHERE tablename = %s', (wide_table,))
                 index_names = [row[0] for row in cur.fetchall()]
+            raw_conn.rollback()
             assert not any('hnsw' in name for name in index_names)
-            assert any('Skipping index' in w for w in rr_env.warnings)
+            assert any('Skipping index' in w for w in warnings)
         finally:
+            store.close()
             with raw_conn.cursor() as cur:
                 cur.execute(f'DROP TABLE IF EXISTS {wide_table}')
                 raw_conn.commit()
+
+
+class TestRocketrideVectorNode:
+    """The node's lifecycle and tool surface through its real IGlobal/IInstance."""
+
+    @pytest.fixture()
+    def table(self, raw_conn):
+        name = 'vx_l2_rr_node'
+        with raw_conn.cursor() as cur:
+            cur.execute(f'DROP TABLE IF EXISTS {name}')
+            raw_conn.commit()
+        yield name
+        with raw_conn.cursor() as cur:
+            cur.execute("SET lock_timeout = '10s'")
+            cur.execute(f'DROP TABLE IF EXISTS {name}')
+            raw_conn.commit()
+
+    def test_node_uses_the_store_bases(self, rv):
+        from ai.common.store import StoreGlobalBase, StoreInstanceBase, VectorStoreToolMixin
+        from ai.common.store.pgvector import PgVectorStore
+
+        assert issubclass(rv.IGlobal, StoreGlobalBase)
+        assert issubclass(rv.IInstance, StoreInstanceBase) and issubclass(rv.IInstance, VectorStoreToolMixin)
+        assert issubclass(rv.Store, PgVectorStore)
+
+    def test_begin_global_opens_the_store_and_keys_on_the_tenant(self, rv, table):
+        glb, inst = _begin_vector_node(rv, {'collection': table, 'similarity': 'cosine'})
+        try:
+            assert glb.TRANFORM_KEY_TAG_NAME == f'rocketride_vector://{TEST_DB_NAME}/{table}/status'.lower()
+            stats = inst.stats({})
+            assert stats['success'] is True and stats['count'] == 0
+        finally:
+            glb.endGlobal()
+        assert glb.store is None
+
+    def test_stats_after_restart_report_the_stored_model(self, rv, table):
+        """A fresh task (nothing written by it) still reports the collection's model and dimension (D6)."""
+        rng = np.random.default_rng(41)
+        writer, _ = _begin_vector_node(rv, {'collection': table, 'similarity': 'cosine'})
+        try:
+            writer.store.addChunks(
+                [
+                    rv.Doc(
+                        page_content='kestrel',
+                        metadata=rv.DocMetadata(objectId='doc', chunkId=0, isDeleted=False),
+                        embedding=_unit_vec(rng),
+                        embedding_model='test-model',
+                    )
+                ]
+            )
+        finally:
+            writer.endGlobal()
+        reader, inst = _begin_vector_node(rv, {'collection': table, 'similarity': 'cosine'})
+        try:
+            stats = inst.stats({})
+            assert (stats['model'], stats['vector_size'], stats['count']) == ('test-model', DIMS, 2)
+        finally:
+            reader.endGlobal()

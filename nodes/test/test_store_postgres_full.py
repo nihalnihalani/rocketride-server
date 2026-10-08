@@ -48,9 +48,11 @@ Skips when the database is unreachable, unless ``RR_REQUIRE_DB_TESTS`` is set.
 from __future__ import annotations
 
 import dataclasses
+import importlib
 import json
 import math
 import os
+import sys
 import threading
 import time
 import types
@@ -974,3 +976,75 @@ class TestLegacy:
         assert all(r.objectId != 'schema' for r in rows)
         assert store.describe().control_record is True
         assert store.modelName and store.vectorSize
+
+
+# ---------------------------------------------------------------------------
+# The node classes over the shared driver
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def node_env(monkeypatch):
+    """Import the node modules with ``depends`` stubbed and the config read as given."""
+    import depends as real_depends
+
+    depends = types.ModuleType('depends')
+    depends.__dict__.update(real_depends.__dict__)
+    depends.depends = lambda *a, **kw: None  # the requirements are installed; never resolve them in a test
+    monkeypatch.setitem(sys.modules, 'depends', depends)
+    from ai.common.config import Config
+
+    monkeypatch.setattr(Config, 'getNodeConfig', staticmethod(lambda provider, connConfig: dict(connConfig)))
+    return monkeypatch
+
+
+def _dsn_fields(dsn: str) -> dict:
+    from ai.common.rocketride_db import parse_dsn_fields
+
+    return parse_dsn_fields(dsn)
+
+
+class TestNodes:
+    def test_store_postgres_writes_through_the_shared_driver(self, node_env, dsn, table, stores, admin):
+        rng = np.random.default_rng(60)
+        postgres = importlib.import_module('nodes.store_postgres.postgres')
+        f = _dsn_fields(dsn)
+        store = postgres.Store(
+            'postgres',
+            {
+                'host': f['host'],
+                'port': f['port'],
+                'user': f['user'],
+                'password': f['password'],
+                'database': f['database'],
+                'collection': table,
+                'similarity': 'cosine',
+                'score': 0.5,
+            },
+            {},
+        )
+        stores.append(store)
+        from ai.common.store.pgvector import PgVectorStore
+
+        assert isinstance(store, PgVectorStore)
+        assert store.collection == table and store.host == f['host']
+        _ingest(store, rng, 'doc', 2)
+        assert len(_rows(admin, table, 'objectid = %s', ('doc',))) == 2
+        assert store.describe().caveats == []
+
+    def test_rocketride_vector_writes_through_the_shared_driver(self, node_env, dsn, table, stores, admin):
+        rng = np.random.default_rng(61)
+        node_env.setenv('ROCKETRIDE_DB_DSN', dsn)
+        rv = importlib.import_module('nodes.rocketride_vector.rocketride_vector')
+        store = rv.Store(
+            'rocketride_vector', {'collection': table, 'similarity': 'l2', 'hnsw_m': 8, 'hnsw_ef_construction': 32}, {}
+        )
+        stores.append(store)
+        _ingest(store, rng, 'doc', 2)
+        with admin.cursor() as cur:
+            cur.execute('SELECT indexdef FROM pg_indexes WHERE indexname = %s', (f'{table}_embedding_hnsw',))
+            ddl = cur.fetchone()[0]
+        assert 'vector_l2_ops' in ddl and "m='8'" in ddl and "ef_construction='32'" in ddl
+        info = store.describe()
+        assert info.metric == 'l2' and 'shared_org_table' in info.caveats
+        assert store.database == _dsn_fields(dsn)['database']
