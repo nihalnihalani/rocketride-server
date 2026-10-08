@@ -63,6 +63,7 @@ import os
 import sys
 import urllib.parse
 import types
+import uuid
 
 from pathlib import Path
 
@@ -499,7 +500,6 @@ def test_node_loader_restores_existing_module_aliases(rr_env, monkeypatch, loade
 # RR_TEST_PGVECTOR_POOLER_DSN is set.
 
 POOLER_DSN = os.environ.get('RR_TEST_PGVECTOR_POOLER_DSN', '').strip()
-VEC_TABLE = 'vx_l2_rr_e2e'
 DIMS = 8
 _VEC_MODULES = (
     'nodes.rocketride_vector',
@@ -560,6 +560,11 @@ def rv(monkeypatch, vec_dsn):
     )
 
 
+def _unique_table(prefix: str) -> str:
+    """A table name no other test (or parallel worker) uses."""
+    return f'{prefix}_{uuid.uuid4().hex[:8]}'
+
+
 def _unit_vec(rng):
     v = rng.standard_normal(DIMS)
     return (v / np.linalg.norm(v)).tolist()
@@ -583,15 +588,13 @@ def _begin_vector_node(rv, config):
 class TestRocketrideVectorE2E:
     @pytest.fixture()
     def vec_store(self, rv, raw_conn):
-        with raw_conn.cursor() as cur:
-            cur.execute(f'DROP TABLE IF EXISTS {VEC_TABLE}')
-            raw_conn.commit()
-        store = rv.Store('rocketride_vector', {'collection': VEC_TABLE, 'similarity': 'cosine'}, {})
+        table = _unique_table('vx_l2_rr_e2e')
+        store = rv.Store('rocketride_vector', {'collection': table, 'similarity': 'cosine'}, {})
         yield store
         store.close()
         with raw_conn.cursor() as cur:
             cur.execute("SET lock_timeout = '10s'")
-            cur.execute(f'DROP TABLE IF EXISTS {VEC_TABLE}')
+            cur.execute(f'DROP TABLE IF EXISTS {table}')
             raw_conn.commit()
 
     def _chunks(self, rv, contents_and_embeddings, chunk_id=0):
@@ -619,7 +622,7 @@ class TestRocketrideVectorE2E:
     def test_connects_via_the_injected_dsn_and_reports_no_connection_details(self, rv, vec_store):
         assert vec_store.database == TEST_DB_NAME
         info = vec_store.describe()
-        assert info.collection == VEC_TABLE and info.collection_exists is False
+        assert info.collection == vec_store.table and info.collection_exists is False
         assert 'shared_org_table' in info.caveats
         dumped = json.dumps(dataclasses.asdict(info))
         fields = urllib.parse.urlparse(rv.dsn)
@@ -631,15 +634,16 @@ class TestRocketrideVectorE2E:
         vec_store.addChunks(self._chunks(rv, [(f'doc {i}', _unit_vec(rng)) for i in range(100)]))
 
         with raw_conn.cursor() as cur:
-            cur.execute('SELECT indexname, indexdef FROM pg_indexes WHERE tablename = %s', (VEC_TABLE,))
+            cur.execute('SELECT indexname, indexdef FROM pg_indexes WHERE tablename = %s', (vec_store.table,))
             indexes = {name: ddl for name, ddl in cur.fetchall()}
             cur.execute(
-                f'SELECT count(*), count(signature), count(meta) FROM {VEC_TABLE} WHERE objectid <> %s', ('schema',)
+                f'SELECT count(*), count(signature), count(meta) FROM {vec_store.table} WHERE objectid <> %s',
+                ('schema',),
             )
             counts = cur.fetchone()
         raw_conn.rollback()
 
-        index_name = f'{VEC_TABLE}_embedding_hnsw'
+        index_name = f'{vec_store.table}_embedding_hnsw'
         assert index_name in indexes
         assert 'USING hnsw (embedding vector_cosine_ops)' in indexes[index_name]
         assert "m='16'" in indexes[index_name]
@@ -660,13 +664,13 @@ class TestRocketrideVectorE2E:
         vec_store.addChunks(self._chunks(rv, [('seed doc', _unit_vec(rng))]))
         with raw_conn.cursor() as cur:
             cur.execute(
-                f'INSERT INTO {VEC_TABLE} (content, objectId, chunkId, isDeleted, embedding) '
+                f'INSERT INTO {vec_store.table} (content, objectId, chunkId, isDeleted, embedding) '
                 f"SELECT 'doc '||i, 'obj-'||i, 0, false, "
                 f"(SELECT ('['||string_agg((random()*2-1)::text, ',')||']')::vector "
                 f' FROM generate_series(1,{DIMS}) WHERE i=i) '
                 f'FROM generate_series(1, 2000) i'
             )
-            cur.execute(f'ANALYZE {VEC_TABLE}')
+            cur.execute(f'ANALYZE {vec_store.table}')
             raw_conn.commit()
 
         from ai.common.store.pgvector.sql import vector_literal
@@ -684,7 +688,7 @@ class TestRocketrideVectorE2E:
             plan = '\n'.join(row[0] for row in cur.fetchall())
         raw_conn.rollback()
 
-        assert f'Index Scan using {VEC_TABLE}_embedding_hnsw' in plan, plan
+        assert f'Index Scan using {vec_store.table}_embedding_hnsw' in plan, plan
         assert 'Seq Scan' not in plan, plan
 
     def test_semantic_search_returns_nearest_document(self, rv, vec_store):
@@ -712,10 +716,7 @@ class TestRocketrideVectorE2E:
 
         warnings: list = []
         rv.monkeypatch.setattr(driver, 'warning', warnings.append)
-        wide_table = 'vx_l2_rr_wide_e2e'
-        with raw_conn.cursor() as cur:
-            cur.execute(f'DROP TABLE IF EXISTS {wide_table}')
-            raw_conn.commit()
+        wide_table = _unique_table('vx_l2_rr_wide')
         store = rv.Store('rocketride_vector', {'collection': wide_table, 'similarity': 'cosine'}, {})
         try:
             store._createCollection(vectorSize=2001)
@@ -737,10 +738,7 @@ class TestRocketrideVectorNode:
 
     @pytest.fixture()
     def table(self, raw_conn):
-        name = 'vx_l2_rr_node'
-        with raw_conn.cursor() as cur:
-            cur.execute(f'DROP TABLE IF EXISTS {name}')
-            raw_conn.commit()
+        name = _unique_table('vx_l2_rr_node')
         yield name
         with raw_conn.cursor() as cur:
             cur.execute("SET lock_timeout = '10s'")
