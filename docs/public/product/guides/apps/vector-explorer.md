@@ -197,9 +197,11 @@ PPTX, XLSX, ODT, RTF, TXT, MD, CSV, HTML and JSON, up to 20 files per drop,
 50 MB per file and 200 MB per drop. A drop with the same path twice is refused
 before anything is sent.
 
-Before sending, the app checks each path against the store. If a document with
-that path exists, it asks "Replace existing '`<name>`' (N chunks)? The old chunks
-are removed when the new file is stored." with **Cancel** focused. Each file
+Before sending, the app checks each path against the store. If a document
+added through a Drag & Drop source has that path (see
+[Where document paths come from](#where-document-paths-come-from)), it asks
+"Replace existing '`<name>`' (N chunks)? The old chunks are removed when the
+new file is stored." with **Cancel** focused. Each file
 then shows queued, uploading, processing, and "N chunks added". A failed upload
 says "Failed. The engine did not return the reason; the pipeline's run log
 may. The document was not added." Files with the same name in different folders
@@ -343,11 +345,13 @@ by whatever added the document:
   recorded, for example a file-system path or an object-store key.
 
 A path is not a location: the app never opens a file at that path, and the path
-does not prove where the file is now or who added it. The same path does mean
-the same document, though: the document's id is derived from its path, so
-adding a file under a path that is already stored replaces that document, which
-is why the app asks first. Uploads from the app are tagged as coming from
-Vector Explorer, and a line is logged when one is stored.
+does not prove where the file is now or who added it. For a document added
+through a Drag & Drop source (this app or another pipeline's), the document's id
+is derived from its path, so adding a file under a path that is already stored
+replaces that document, which is why the app asks first. A document another
+kind of source recorded under the same path keeps its own id and is listed
+beside the new one. Uploads from the app are tagged as coming from Vector
+Explorer, and a line is logged when one is stored.
 
 ## Privacy
 
