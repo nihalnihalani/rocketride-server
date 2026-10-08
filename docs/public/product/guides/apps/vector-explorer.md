@@ -367,10 +367,12 @@ Explorer, and a line is logged when one is stored.
   chat, map and selection is cleared.
 - **Run log traces.** When a pipeline runs with any trace level other than
   `none` (`metadata`, `summary` or `full`), its run log records each tool
-  call's input and the first 2 KB of its output. The VS Code extension starts
-  runs with `full`, the MCP tools with `summary`, and an SDK `use()` with
-  `none`; a deployment records at `full` unless its schedule sets a lower
-  level. For Vector Explorer that means your map queries, document paths and
+  call's input and the first 2 KB of its output. Unlike lane data, a tool trace
+  carries its input and output even at `metadata`, the level the Observability
+  page lists as component enter/leave and object identities only. The VS Code
+  extension starts runs with `full`, the MCP tools with `summary`, and an SDK
+  `use()` with `none`; a deployment records at `full` unless its schedule sets
+  a lower level. For Vector Explorer that means your map queries, document paths and
   ids, snippets of chunk text, and for a `vectors` answer (the one request that
   returns raw embedding values) the start of the raw vector. The chat's
   questions and the chunks passed to the LLM travel through the pipeline's
