@@ -90,10 +90,10 @@ are never listed.
   OpenAI, which refuses the placeholder key (or, offline, cannot be reached).
   Everything else (counts, the directory, adding and removing documents, the
   map) works without an LLM.
-- **Removing documents needs the write switch.** Each store node has an
-  **Allow document management from tool calls** setting (`allow_writes`). It
-  is off by default on every store node. The Vector Explorer templates turn it
-  on for `store_1` and leave it off for `store_2`. To turn it on in a pipeline
+- **Removing documents needs the write switch.** Every vector store node that
+  Vector Explorer lists has an **Allow document management from tool calls**
+  setting (`allow_writes`), off by default. The Vector Explorer templates turn
+  it on for `store_1` and leave it off for `store_2`. To turn it on in a pipeline
   of your own, switch it on in the store node's settings, or set
   `config.<profile>.allow_writes` to `true` on the store component in the
   `.pipe` (for example `"local": { …, "allow_writes": true }`), then restart the
