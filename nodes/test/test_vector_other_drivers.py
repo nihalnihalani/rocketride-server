@@ -33,6 +33,7 @@ ADAPTERS = {
     'weaviate': h.WeaviateAdapter,
     'pinecone': h.PineconeAdapter,
     'astra_db': h.AstraAdapter,
+    'atlas': h.AtlasAdapter,
 }
 
 
@@ -105,7 +106,7 @@ def test_describe_reads_the_control_record(adapter, store):
     assert info.dimension == h.DIM
     assert info.metric == 'cosine'
     text = json.dumps(dataclasses.asdict(info), default=str).lower()
-    for secret in ('localhost', 'apikey', 'token', 'mongodb://', 'https://'):
+    for secret in ('localhost', 'apikey', 'token', 'mongodb', 'https://', 'example.invalid'):
         assert secret not in text, secret
 
 

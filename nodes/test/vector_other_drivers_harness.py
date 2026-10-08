@@ -66,30 +66,47 @@ def load_driver(
     *,
     mock_libs: Sequence[str] = (),
     preload: Sequence[str] = (),
+    real_libs: Sequence[str] = (),
 ) -> Tuple[ModuleType, Dict[str, ModuleType]]:
     """Load ``nodes/src/nodes/<relpath>`` with ``mock_libs`` resolved from ``nodes/test/mocks``.
 
     The real (or previously leaked) modules of those libraries are set aside while
     the driver imports and restored afterwards, so nothing leaks into the session.
     ``preload`` names extra submodules of the mocks to import (and return).
+    ``real_libs`` are libraries that must be the installed packages while the driver
+    imports (another test may have left a stand-in in ``sys.modules``).
     Returns the driver module and the mock modules by name.
     """
-    saved = {name: module for name, module in sys.modules.items() if _is_lib(name, mock_libs)}
+    # Real libraries are only set aside when a stand-in (a module without a file) took their
+    # place; a real module stays loaded (C extensions cannot be imported twice).
+    stand_ins = [
+        name
+        for name, module in sys.modules.items()
+        if _is_lib(name, real_libs)
+        and getattr(module, '__file__', None) is None
+        and not getattr(module, '__path__', None)
+    ]
+    isolated = tuple(mock_libs)
+    saved = {name: module for name, module in sys.modules.items() if _is_lib(name, isolated) or name in stand_ins}
     for name in saved:
         del sys.modules[name]
     sys.path.insert(0, str(MOCKS))
     try:
         mocks = {lib: importlib.import_module(lib) for lib in list(mock_libs) + list(preload)}
+        sys.path.remove(str(MOCKS))
+        for lib in real_libs:
+            importlib.import_module(lib)
         spec = importlib.util.spec_from_file_location(module_name, NODES / relpath)
         assert spec is not None and spec.loader is not None
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         return module, mocks
     finally:
-        sys.path.remove(str(MOCKS))
-        for name in [name for name in sys.modules if _is_lib(name, mock_libs)]:
+        if str(MOCKS) in sys.path:
+            sys.path.remove(str(MOCKS))
+        for name in [name for name in sys.modules if _is_lib(name, isolated)]:
             del sys.modules[name]
-        sys.modules.update(saved)
+        sys.modules.update({name: module for name, module in saved.items() if name not in stand_ins})
 
 
 def bare_store(store_class: type, **attrs: Any) -> Any:
@@ -742,3 +759,111 @@ class AstraAdapter(Adapter):
             return collection
 
         store.database.get_collection = get_collection
+
+
+class AtlasAdapter(Adapter):
+    """MongoDB Atlas through ``store_atlas/fake_pymongo.py`` (the driver imports the real pymongo)."""
+
+    name = 'atlas'
+    backend = 'atlas'
+    services = None
+    floor = 0.2
+    offset_raises = True
+    extras_stored = False
+    legacy_control_has_model = False
+    listing_sorted = True
+    random_strategy = 'random'
+    stratified_native = True
+
+    def __init__(self) -> None:
+        """Load the driver against the installed pymongo (its exceptions and models)."""
+        from .store_atlas import fake_pymongo
+
+        self.fake = fake_pymongo
+        self.module, _ = load_driver('store_atlas/atlas.py', '_vx_atlas_driver', real_libs=('pymongo',))
+
+    def new_store(self) -> Any:
+        """A store on an empty fake cluster."""
+        client = self.fake.FakeMongoClient()
+        database = client['vxdb']
+        return bare_store(
+            self.module.Store,
+            database_name='vxdb',
+            collection_name='vx_test',
+            host='mongodb+srv://cluster0.example.invalid',
+            vector_index_name='vector_index',
+            text_index_name='text_index',
+            similarity='cosine',
+            threshold_search=0.5,
+            payload_limit=32 * 1024 * 1024,
+            renderChunkSize=32 * 1024 * 1024,
+            client=client,
+            database=database,
+            collection=database['vx_test'],
+        )
+
+    def seed_legacy(self, store: Any) -> None:
+        """A collection as today's driver built it: a knnVector search index, uuid4 ids, nulls in meta."""
+        store.database.create_collection(store.collection_name)
+        store.collection.search_indexes.append(
+            {
+                'name': 'vector_index',
+                'type': 'search',
+                'latestDefinition': {
+                    'mappings': {
+                        'dynamic': True,
+                        'fields': {'embedding': {'type': 'knnVector', 'dimensions': DIM, 'similarity': 'cosine'}},
+                    }
+                },
+            }
+        )
+        for object_id, chunk_id, meta, content in legacy_document_rows():
+            vector = [0.0] * DIM if object_id == 'schema' else vector_for(object_id, chunk_id)
+            store.collection.docs.append(
+                {'_id': random_uuid(), 'embedding': vector, 'content': content, 'meta': dict(meta)}
+            )
+
+    def ignore_offsets(self, store: Any) -> None:
+        """Drop $skip stages and cursor skips."""
+        collection = store.collection
+        original_aggregate = collection.aggregate
+
+        def aggregate(pipeline: List[Dict[str, Any]], **kwargs: Any) -> Any:
+            return original_aggregate([stage for stage in pipeline if '$skip' not in stage], **kwargs)
+
+        collection.aggregate = aggregate
+        original_find = collection.find
+
+        def find(*args: Any, **kwargs: Any) -> Any:
+            cursor = original_find(*args, **kwargs)
+            cursor.skip = lambda count: cursor
+            return cursor
+
+        collection.find = find
+
+    def raw_rows(self, store: Any) -> List[Dict[str, Any]]:
+        """Every stored document."""
+        return [
+            {
+                'objectId': d['meta'].get('objectId'),
+                'chunkId': d['meta'].get('chunkId'),
+                'meta': d['meta'],
+                'id': d['_id'],
+            }
+            for d in store.collection.docs
+        ]
+
+    def set_scores(self, store: Any, scores: Sequence[float]) -> None:
+        """Answer the next $vectorSearch with one hit per vectorSearchScore."""
+        docs = [d for d in store.collection.docs if d['meta'].get('objectId') != 'schema']
+        collection = store.collection
+        original_aggregate = type(collection).aggregate.__get__(collection, type(collection))
+
+        def aggregate(pipeline: List[Dict[str, Any]], **kwargs: Any) -> Any:
+            if pipeline and '$vectorSearch' in pipeline[0]:
+                return iter(
+                    [{**{k: v for k, v in d.items() if k != 'embedding'}, 'score': s} for d, s in zip(docs, scores)]
+                )
+            return original_aggregate(pipeline, **kwargs)
+
+        collection.aggregate = aggregate
