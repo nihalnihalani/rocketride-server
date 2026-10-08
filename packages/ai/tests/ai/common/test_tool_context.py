@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import threading
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
@@ -495,6 +496,60 @@ def test_dispatcher_context_survives_without_the_module(monkeypatch):
     node = _Probe()
     param = _invoke(node, 'whoami', stamp=_dap().__dict__)
     assert param.output == {'context': None}
+
+
+def _failing_tool_context_import(monkeypatch, exc: BaseException) -> None:
+    """Make ``from ai.common import tool_context`` raise ``exc``."""
+    import builtins
+
+    real_import = builtins.__import__
+
+    def _import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == 'ai.common' and fromlist and 'tool_context' in fromlist:
+            raise exc
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, '__import__', _import)
+
+
+def test_a_broken_tool_context_module_is_reported_once(monkeypatch, caplog):
+    """A tool_context that fails for any reason but being absent is logged once; tools run with no context."""
+    import rocketlib.filters as flt
+
+    monkeypatch.setattr(flt, '_tool_context_failure_reported', False)
+    _failing_tool_context_import(monkeypatch, SyntaxError('invalid syntax'))
+    caplog.set_level(logging.WARNING, logger='rocketlib.filters')
+    node = _Probe()
+    first = _invoke(node, 'whoami', stamp=_dap().__dict__)
+    second = _invoke(node, 'whoami', stamp=_dap().__dict__)
+    assert first.output == second.output == {'context': None}
+    reports = [r for r in caplog.records if 'tool_context' in r.getMessage()]
+    assert len(reports) == 1
+    assert reports[0].levelno == logging.WARNING
+    assert 'SyntaxError' in reports[0].getMessage()
+
+
+@pytest.mark.parametrize('missing', ['ai', 'ai.common', 'ai.common.tool_context'])
+def test_an_absent_ai_package_is_not_reported(monkeypatch, caplog, missing):
+    """Running rocketlib without the ai package is supported: no context, and nothing logged."""
+    import rocketlib.filters as flt
+
+    monkeypatch.setattr(flt, '_tool_context_failure_reported', False)
+    _failing_tool_context_import(monkeypatch, ModuleNotFoundError(f'No module named {missing!r}', name=missing))
+    caplog.set_level(logging.WARNING, logger='rocketlib.filters')
+    assert flt._tool_context_module() is None
+    assert not [r for r in caplog.records if 'tool_context' in r.getMessage()]
+
+
+def test_a_missing_dependency_of_tool_context_is_reported(monkeypatch, caplog):
+    """A module tool_context needs that is missing is a broken install, not an absent ai package."""
+    import rocketlib.filters as flt
+
+    monkeypatch.setattr(flt, '_tool_context_failure_reported', False)
+    _failing_tool_context_import(monkeypatch, ModuleNotFoundError("No module named 'gone'", name='gone'))
+    caplog.set_level(logging.WARNING, logger='rocketlib.filters')
+    assert flt._tool_context_module() is None
+    assert len([r for r in caplog.records if 'tool_context' in r.getMessage()]) == 1
 
 
 # ---------------------------------------------------------------------------

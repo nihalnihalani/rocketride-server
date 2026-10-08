@@ -26,6 +26,7 @@ from __future__ import annotations  # Enables forward references
 import contextlib
 import functools
 import json
+import logging
 from typing import TYPE_CHECKING, Dict, Any, List, Optional, Tuple, TypedDict, Callable, Protocol
 from .types import AVI_ACTION, OPEN_MODE, ENDPOINT_MODE, SERVICE_MODE, Entry, IControl, IInvoke, IJson
 from .error import APERR, Ec
@@ -133,19 +134,43 @@ def tool_function(
     return decorator
 
 
+#: Module names whose absence means the ``ai`` package is simply not installed.
+_TOOL_CONTEXT_MODULES = ('ai', 'ai.common', 'ai.common.tool_context')
+
+#: True once a broken ``ai.common.tool_context`` import has been logged.
+_tool_context_failure_reported = False
+
+
 def _tool_context_module() -> Any:
     """Return ``ai.common.tool_context``, or None when it cannot be imported.
 
     rocketlib is usable without the ``ai`` package (tests, tooling); then no call
     context is ever set, which every tool that needs one treats as an unknown
-    caller. A successful import is cached by ``sys.modules``; a failed one is
-    retried on the next call rather than remembered.
+    caller. Any other import failure (a broken module, a missing dependency of
+    it) has the same effect, so it is logged once as a warning: write tools
+    would otherwise refuse every call with no visible cause. A successful
+    import is cached by ``sys.modules``; a failed one is retried on the next
+    call rather than remembered.
     """
+    global _tool_context_failure_reported
     try:
         from ai.common import tool_context
-    except Exception:
-        return None
-    return tool_context
+    except ModuleNotFoundError as e:
+        if e.name in _TOOL_CONTEXT_MODULES:
+            return None
+        failure: Exception = e
+    except Exception as e:
+        failure = e
+    else:
+        return tool_context
+    if not _tool_context_failure_reported:
+        _tool_context_failure_reported = True
+        logging.getLogger(__name__).warning(
+            'ai.common.tool_context failed to import (%s: %s); tool calls run with no call context',
+            type(failure).__name__,
+            failure,
+        )
+    return None
 
 
 class IKeyValueStore:
