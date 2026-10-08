@@ -1325,10 +1325,14 @@ class VectorStoreToolMixin(VectorExplorerTools):
         raw_filter = args.get('filter') or {}
         if not isinstance(raw_filter, dict):
             raw_filter = {}
-        deleted = args.get('deleted', 'active') or 'active'
-        if deleted not in ('active', 'deleted', 'all'):
-            raise ToolRefusal('INVALID_INPUT', "deleted must be 'active', 'deleted' or 'all'.")
-        doc_filter = deletedFilter(deleted)
+        # Without ``deleted`` the filter is the legacy one, so agents' results do not change.
+        if args.get('deleted') is None:
+            doc_filter = DocFilter()
+        else:
+            deleted = args['deleted']
+            if deleted not in ('active', 'deleted', 'all'):
+                raise ToolRefusal('INVALID_INPUT', "deleted must be 'active', 'deleted' or 'all'.")
+            doc_filter = deletedFilter(deleted)
         object_ids: List[str] = []
         object_id = raw_filter.get('objectId')
         if object_id:
@@ -1573,7 +1577,7 @@ class VectorStoreToolMixin(VectorExplorerTools):
             allow_writes=self._vx_allow_writes(),
             agent_writes=self._vx_agent_writes(),
         )
-        if len(clean_ids) > VECTOR_TOOL_LIMITS['write_ids_max']:
+        if decision.origin != 'agent' and len(clean_ids) > VECTOR_TOOL_LIMITS['write_ids_max']:
             raise ToolRefusal(
                 'INVALID_INPUT', f'object_ids must be a list of 1 to {VECTOR_TOOL_LIMITS["write_ids_max"]} strings.'
             )

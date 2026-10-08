@@ -1177,11 +1177,13 @@ class VectorExplorerTools:
             chosen[key] = doc
             return True
 
+        readable = False  # becomes True once the store answers getVectors or sampleChunks
         if pinned:
             try:
                 for doc in store.getVectors(pinned):
                     if docKey(doc) in pinned:
                         add(doc)
+                readable = True
             except StoreUnsupported:
                 pass
 
@@ -1217,6 +1219,7 @@ class VectorExplorerTools:
                 for doc in store.getVectors(list(batch)):
                     add(doc)
                 self._vx_check_deadline(deadline)
+            readable = readable or bool(keys) or 'getVectors' in store.capabilities()
         except StoreUnsupported:
             pass
         strategy_used = 'stratified'
@@ -1228,10 +1231,13 @@ class VectorExplorerTools:
                     added = self._vx_refill(store, strat, chosen, add, n, seed, flt, deadline)
                 except StoreUnsupported:
                     continue
+                readable = True
                 if added:
                     strategy_used = strat
                     biased = True
                 break
+        if not readable and not chosen:
+            raise StoreUnsupported('sample needs getVectors or sampleChunks, which this store does not support')
         return list(chosen.values()), strategy_used, biased, listing
 
     def _vx_refill(self, store, strat, chosen, add, n, seed, flt, deadline) -> int:

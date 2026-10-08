@@ -1300,8 +1300,15 @@ def test_sample_on_a_missing_collection():
     assert (answer['success'], answer['code']) == (False, 'COLLECTION_MISSING')
 
 
-def test_sample_on_a_store_without_vectors_has_nothing_to_draw():
+def test_sample_on_a_store_that_cannot_read_vectors_is_unsupported():
     answer = node(MemoryStore().seed(corpus({'a': [0, 1]}))).sample({'n': 5})
+    assert (answer['success'], answer['code']) == (False, 'UNSUPPORTED')
+
+
+def test_sample_of_an_empty_collection_has_no_points():
+    store = ExactListingStore().seed([make_doc('a', 0, dim=8)])
+    store.remove(['a'])
+    answer = node(store).sample({'n': 5})
     assert answer['success'] is True and answer['n'] == 0 and answer['knn']['offsets_row'] == [0]
 
 
@@ -1657,6 +1664,15 @@ def test_search_extended_filter_reaches_the_store():
     assert (flt.minChunkId, flt.maxChunkId, flt.deleted, flt.isDeleted) == (1, 3, 'all', True)
 
 
+def test_legacy_search_sends_the_same_filter_as_before():
+    store = clustered()
+    inst = node(store, embed_query=lambda text: [0.1] * 8, embed_model_name=MODEL)
+    inst.search({'query': 'kestrel', 'top_k': 4, 'filter': {'objectId': 'doc00', 'parent': '/p', 'nodeId': 'n'}})
+    flt = [call for call in store.calls if call[0] == 'semantic'][-1][2]
+    assert (flt.isDeleted, flt.deleted, flt.minScore, flt.limit) == (None, None, None, 4)
+    assert (flt.objectIds, flt.parent, flt.nodeId) == (['doc00'], '/p', 'n')
+
+
 def test_search_never_returns_the_control_record():
     store = clustered()
     answer = node(store).search({'vector': [0.0] * 8, 'include_below_floor': True, 'deleted': 'all', 'top_k': 100})
@@ -1814,6 +1830,21 @@ def test_delete_extended_answer(context):
     assert answer['success'] is True
     assert (answer['deleted_count'], answer['removed_chunks'], answer['not_found']) == (3, 3, ['ghost'])
     assert answer['audit']['action'] == 'vector.delete' and answer['audit']['object_ids'] == ['doc00', 'ghost']
+
+
+def test_delete_caps_external_callers_at_one_hundred_ids(context):
+    context(dap())
+    store = clustered(CountingStore, docs=1, chunks=1)
+    answer = node(store, allow_writes=True).delete({'object_ids': [f'd{i}' for i in range(101)]})
+    assert (answer['success'], answer['code']) == (False, 'INVALID_INPUT')
+    assert not any(call[0] == 'remove' for call in store.calls)
+
+
+def test_delete_from_an_agent_keeps_no_id_cap(context):
+    context(agent())
+    store = clustered(CountingStore, docs=1, chunks=1)
+    answer = node(store).delete({'object_ids': ['doc00'] + [f'd{i}' for i in range(150)]})
+    assert answer['success'] is True and answer['deleted_count'] == 151 and len(answer['not_found']) == 150
 
 
 def test_delete_refuses_the_control_record(context):
