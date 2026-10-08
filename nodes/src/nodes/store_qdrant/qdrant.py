@@ -33,8 +33,8 @@ requirements = os.path.dirname(os.path.realpath(__file__)) + '/requirements.txt'
 depends(requirements)
 
 # Load what we need
-from typing import List, Callable, Dict, Any
-from uuid import uuid4
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
+from uuid import NAMESPACE_URL, uuid5
 import sys
 import numpy as np
 from qdrant_client import QdrantClient
@@ -79,7 +79,27 @@ enabled by building qdrant from source with
 
 # Minimum rescaled [0, 1] similarity for a result to count as relevant; below
 # this it is dropped as noise regardless of the configured retrieval score.
+# A caller that sets DocFilter.minScore (the explorer tools) overrides it.
 MIN_RELEVANCE_SCORE = 0.20
+
+# objectId of the collection's control record (model name and vector size).
+CONTROL_OBJECT_ID = 'schema'
+
+# Distances where a smaller raw score means a closer point.
+_DISTANCE_METRICS = ('Euclid', 'Manhattan')
+
+# Page size of the internal scrolls that walk a filtered set.
+_SCROLL_PAGE = 256
+
+
+def point_id_for(objectId: str, chunkId: int) -> str:
+    """
+    Return the deterministic point id of a chunk: uuid5(NAMESPACE_URL, 'objectId#chunkId').
+
+    Rows written before this id scheme carry random ids; every read by key
+    falls back to a filter on objectId/chunkId for those.
+    """
+    return str(uuid5(NAMESPACE_URL, f'{objectId}#{int(chunkId)}'))
 
 
 class Store(DocumentStoreBase):
@@ -227,9 +247,32 @@ class Store(DocumentStoreBase):
 
         return True
 
+    @staticmethod
+    def _deletedConditions(deleted: str) -> Tuple[List[Any], List[Any]]:
+        """
+        Return (must, must_not) conditions selecting the 'active', 'deleted' or 'all' rows.
+
+        'active' excludes only rows explicitly marked deleted: a null or absent
+        isDeleted (the client strips None via exclude_none) counts as not deleted.
+        """
+        flag = FieldCondition(key='meta.isDeleted', match=MatchValue(value=True))
+        if deleted == 'deleted':
+            return [flag], []
+        if deleted == 'all':
+            return [], []
+        return [], [flag]
+
+    @staticmethod
+    def _notControl() -> FieldCondition:
+        """Condition matching the control record (used under must_not)."""
+        return FieldCondition(key='meta.objectId', match=MatchValue(value=CONTROL_OBJECT_ID))
+
     def _convertFilter(self, docFilter: DocFilter) -> Filter:
         """
         Build the generic filter based on required permissions, node, parent, etc.
+
+        The deleted rows follow ``resolveDeleted``: ``docFilter.deleted`` when set,
+        otherwise isDeleted None/False selects the active rows and True all rows.
         """
         # Declare the mist list to start addding conditions
         must: List[models.Condition] = []
@@ -244,9 +287,9 @@ class Store(DocumentStoreBase):
         if docFilter.tableIds is not None:
             must.append(models.FieldCondition(key='meta.tableId', match=models.MatchAny(any=docFilter.tableIds)))
 
-        # If a parent was specified
+        # If a parent was specified: the exact path (meta.parent has a keyword index)
         if docFilter.parent is not None:
-            must.append(models.FieldCondition(key='meta.parent', match=models.MatchText(text=docFilter.parent)))
+            must.append(models.FieldCondition(key='meta.parent', match=models.MatchValue(value=docFilter.parent)))
 
         # If a permissionId list was specified
         if docFilter.permissions is not None:
@@ -258,14 +301,9 @@ class Store(DocumentStoreBase):
         if docFilter.objectIds is not None:
             must.append(models.FieldCondition(key='meta.objectId', match=models.MatchAny(any=docFilter.objectIds)))
 
-        # Exclude only docs explicitly marked deleted. A null/absent isDeleted
-        # (the client strips None via exclude_none) must still count as not deleted.
-        if docFilter.isDeleted is None or not docFilter.isDeleted:
-            must.append(
-                models.Filter(
-                    must_not=[models.FieldCondition(key='meta.isDeleted', match=models.MatchValue(value=True))]
-                )
-            )
+        # Which rows by their deleted flag
+        deleted_must, deleted_must_not = self._deletedConditions(self.resolveDeleted(docFilter))
+        must.extend(deleted_must)
 
         # If we are not going after chunks, add a condition
         if docFilter.chunkIds is not None:
@@ -280,13 +318,22 @@ class Store(DocumentStoreBase):
             must.append(models.FieldCondition(key='meta.chunkId', range=models.Range(lte=docFilter.maxChunkId)))
 
         # Determine the basic must conditions
-        return Filter(must=must)
+        return Filter(must=must, must_not=deleted_must_not or None)
 
-    def _convertToDocs(self, points: List[ScoredPoint] | List[Record]) -> List[Doc]:
+    def _rawToScore(self, raw: float) -> float:
+        """Map Qdrant's raw score to [0, 1], higher meaning closer."""
+        if self.similarity == 'Cosine':
+            return (raw + 1) / 2
+        if self.similarity in _DISTANCE_METRICS:
+            # Euclid/Manhattan answer a distance: smaller is closer.
+            return float(1.0 / (1.0 + max(float(raw), 0.0)))
+        return float(1.0 / (1.0 + np.exp(raw / -100)))
+
+    def _convertToDocs(self, points: List[ScoredPoint] | List[Record], floor: float = MIN_RELEVANCE_SCORE) -> List[Doc]:
         """
         Convert a list of points or records to a docGroup.
 
-        Groups all document chunks  together
+        Groups all document chunks  together. Scored points below ``floor`` are dropped.
         """
         docs: List[Doc] = []
 
@@ -303,13 +350,10 @@ class Store(DocumentStoreBase):
             # Determine the score of this document
             if isinstance(point, ScoredPoint):
                 # If we are return scaled scores, build it
-                if self.similarity == 'Cosine':
-                    score = (point.score + 1) / 2
-                else:
-                    score = float(1.0 / (1.0 + np.exp(point.score / -100)))
+                score = self._rawToScore(point.score)
 
                 # Ignore it if it doesn't have a high enough score
-                if score < MIN_RELEVANCE_SCORE:
+                if score < floor:
                     continue
             else:
                 score = 0
@@ -361,14 +405,8 @@ class Store(DocumentStoreBase):
 
         filter.must.append(models.FieldCondition(key='content', match=models.MatchText(text=query.text)))
 
-        # Perform the search
-        records, nextURL = self.client.scroll(
-            collection_name=self.collection,
-            scroll_filter=filter,
-            offset=docFilter.offset,
-            limit=docFilter.limit,
-            with_vectors=False,
-        )
+        # Perform the search (a numeric offset skips rows; Qdrant's own offset is a point id)
+        records = self._scrollWindow(filter, docFilter.offset, docFilter.limit)
 
         # Convert the points into groups
         docs = self._convertToDocs(records)
@@ -401,7 +439,7 @@ class Store(DocumentStoreBase):
 
         # We cannot support non-zero offsets
         if docFilter.offset:
-            raise BaseException('Non-zero offset is not supported in semantic searching')
+            raise ValueError('Non-zero offset is not supported in semantic searching')
 
         # Don't pass score_threshold: Qdrant compares it against the raw similarity
         # score, but threshold_search is in the rescaled [0,1] space. The cut is
@@ -416,8 +454,8 @@ class Store(DocumentStoreBase):
             search_params=SearchParams(exact=True),
         ).points
 
-        # Convert the points into groups
-        docs = self._convertToDocs(points)
+        # Convert the points into groups, applying the score floor (DocFilter.minScore or the legacy floor)
+        docs = self._convertToDocs(points, self.effectiveFloor(docFilter))
 
         # Return them
         return docs
@@ -434,14 +472,8 @@ class Store(DocumentStoreBase):
         # Build up the filter
         filter = self._convertFilter(docFilter=docFilter)
 
-        # Perform the search
-        records, nextPoint = self.client.scroll(
-            collection_name=self.collection,
-            scroll_filter=filter,
-            offset=docFilter.offset,
-            limit=docFilter.limit,
-            with_vectors=False,
-        )
+        # Perform the search (a numeric offset skips rows; Qdrant's own offset is a point id)
+        records = self._scrollWindow(filter, docFilter.offset, docFilter.limit)
 
         # Convert the points into documents
         docs = self._convertToDocs(records)
@@ -475,15 +507,8 @@ class Store(DocumentStoreBase):
         # Build up the path list
         paths: Dict[str, str] = {}
 
-        # Perform the search
-        records, nextPoint = self.client.scroll(
-            collection_name=self.collection,
-            scroll_filter=filter,
-            offset=offset,
-            limit=limit,
-            with_vectors=False,
-            with_payload=True,
-        )
+        # Perform the search (a numeric offset skips rows; Qdrant's own offset is a point id)
+        records = self._scrollWindow(filter, offset, limit)
 
         # Fill it in
         for record in records:
@@ -577,9 +602,11 @@ class Store(DocumentStoreBase):
             if embedding is None:
                 raise Exception('No embedding in document')
 
-            # Append the points
+            # Append the points; the id is derived from (objectId, chunkId) so a key maps to one point
             tmp_struct = PointStruct(
-                id=str(uuid4()), vector=embedding, payload={'content': chunk.page_content, 'meta': chunk.metadata}
+                id=point_id_for(chunk.metadata.objectId, chunk.metadata.chunkId),
+                vector=embedding,
+                payload={'content': chunk.page_content, 'meta': chunk.metadata},
             )
             cur_size = sys.getsizeof(tmp_struct)
             sum_size += cur_size
@@ -623,9 +650,10 @@ class Store(DocumentStoreBase):
         # Build a filter for an object id
         filter_objectId = Filter(must=[FieldCondition(key='meta.objectId', match=models.MatchAny(any=objectIds))])
 
-        # Set all the objects with the given objectId to true
+        # Set meta.isDeleted to true. key='meta' merges into the nested object: a
+        # top-level {'meta': {...}} would replace meta whole and drop the rest of it.
         self.client.set_payload(
-            collection_name=self.collection, payload={'meta': {'isDeleted': True}}, points=filter_objectId
+            collection_name=self.collection, payload={'isDeleted': True}, key='meta', points=filter_objectId
         )
         return
 
@@ -643,9 +671,9 @@ class Store(DocumentStoreBase):
         # Build a filter for an object id
         filter_objectId = Filter(must=[FieldCondition(key='meta.objectId', match=models.MatchAny(any=objectIds))])
 
-        # Set all the objects with the given objectId to false
+        # Set meta.isDeleted to false inside meta (see markDeleted)
         self.client.set_payload(
-            collection_name=self.collection, payload={'meta': {'isDeleted': False}}, points=filter_objectId
+            collection_name=self.collection, payload={'isDeleted': False}, key='meta', points=filter_objectId
         )
         return
 
@@ -734,3 +762,61 @@ class Store(DocumentStoreBase):
                 break
 
             offset += self.renderChunkSize
+
+    # ------------------------------------------------------------------
+    # Scrolling helpers
+    # ------------------------------------------------------------------
+
+    def _scrollAll(
+        self,
+        flt: Optional[Filter],
+        *,
+        with_payload: Any = True,
+        with_vectors: bool = False,
+        page: int = _SCROLL_PAGE,
+    ) -> Iterator[Any]:
+        """Yield every point matching ``flt``, following Qdrant's next-page point id."""
+        offset = None
+        while True:
+            records, offset = self.client.scroll(
+                collection_name=self.collection,
+                scroll_filter=flt,
+                limit=page,
+                offset=offset,
+                with_payload=with_payload,
+                with_vectors=with_vectors,
+            )
+            yield from records
+            if offset is None or not records:
+                return
+
+    def _scrollWindow(self, flt: Optional[Filter], offset: Any, limit: Optional[int]) -> List[Any]:
+        """
+        Return ``limit`` points matching ``flt`` after skipping ``offset`` of them.
+
+        Qdrant's own scroll ``offset`` is a point id, not a position; a numeric
+        offset is honoured here by walking the matching points in id order.
+        """
+        skip = int(offset or 0)
+        if skip < 0:
+            raise ValueError('offset must not be negative')
+        limit = 10 if limit is None else int(limit)
+        if limit <= 0:
+            return []
+        if not skip:
+            records, _ = self.client.scroll(
+                collection_name=self.collection,
+                scroll_filter=flt,
+                limit=limit,
+                with_payload=True,
+                with_vectors=False,
+            )
+            return list(records)
+        window: List[Any] = []
+        for index, record in enumerate(self._scrollAll(flt)):
+            if index < skip:
+                continue
+            window.append(record)
+            if len(window) >= limit:
+                break
+        return window
