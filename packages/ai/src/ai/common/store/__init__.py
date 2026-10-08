@@ -32,6 +32,12 @@ migrate onto these bases one at a time. The store interface itself
 (``VectorStoreToolMixin``) live in ``document_store`` and are re-exported here so
 ``from ai.common.store import ...`` keeps working after the module became a
 package.
+
+The Vector Explorer additions live beside them: the optional hooks' value types
+(``vx_types``), errors (``errors``), the numpy helpers (``vx_math``), the sample
+cache (``vx_sample_cache``), the write gate (``vx_write_gate``) and the explorer
+tools with the wrapper every store tool runs in (``vx_tools``). See
+``docs/development/nodes/vector-tool-contract.md``.
 """
 
 from .document_store import (
@@ -39,13 +45,20 @@ from .document_store import (
     VectorStoreToolMixin,
     getStore,
 )
+from .errors import StoreError, StoreUnsupported, ToolRefusal
 from .store_global_base import StoreGlobalBase
 from .store_instance_base import StoreInstanceBase
+from .vx_tools import VectorExplorerTools, vectordb_tool
 
 __all__ = [
     'DocumentStoreBase',
+    'StoreError',
     'StoreGlobalBase',
     'StoreInstanceBase',
+    'StoreUnsupported',
+    'ToolRefusal',
+    'VectorExplorerTools',
     'VectorStoreToolMixin',
     'getStore',
+    'vectordb_tool',
 ]

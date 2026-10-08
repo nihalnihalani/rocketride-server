@@ -1,0 +1,1813 @@
+# =============================================================================
+# RocketRide Engine
+# =============================================================================
+# MIT License
+# Copyright (c) 2026 Aparavi Software AG
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+# =============================================================================
+
+"""The Vector Explorer tools on every vector store node, and the wrapper all store tools run in.
+
+``VectorExplorerTools`` is mixed into ``VectorStoreToolMixin`` (``document_store``),
+so every store node that exposes the six agent tools (``search``, ``upsert``,
+``delete``, ``objdir``, ``get``, ``stats``) also answers the explorer's tools:
+``dialect``, ``documents``, ``chunks``, ``vectors``, ``sample``, ``project``,
+``neighbors`` and ``remove_document``. The explorer tools are listed for external
+(DAP) callers only (``audience=('dap',)``), so an agent's tool catalog does not
+change.
+
+Every tool, new and legacy, runs inside :func:`vectordb_tool`: the input is
+normalised, a refusal or failure becomes ``{success: false, code, error}``
+(nothing raises past the tool boundary), numpy values become JSON, and an answer
+over :data:`MAX_ANSWER_BYTES` is refused with ``LIMIT_EXCEEDED``.
+
+The module also holds small helpers the store hooks share (filters by deleted
+state, opaque cursors, document rows); ``document_store`` re-exports them.
+
+See ``docs/development/nodes/vector-tool-contract.md`` section 4.
+"""
+
+import base64
+import dataclasses
+import functools
+import json
+import math
+import re
+import threading
+import time
+from collections import Counter
+from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+
+from rocketlib import tool_function, warning
+
+from ..schema import Doc, DocFilter, QuestionText
+from . import vx_write_gate
+from .errors import StoreError, StoreUnsupported, ToolRefusal
+from .vx_defaults import (
+    VECTOR_AGENT_WRITES_DEFAULT,
+    VECTOR_ALLOW_WRITES_DEFAULT,
+    VECTOR_TOOL_DEFAULTS,
+    VECTOR_TOOL_LIMITS,
+)
+from .vx_types import CONTROL_OBJECT_ID, DELETED_VALUES, PROJECTIONS, SAMPLE_STRATEGIES, SUPPORT_LEVELS, DocumentRow
+
+if TYPE_CHECKING:  # pragma: no cover
+    from .document_store import DocumentStoreBase
+
+Key = Tuple[str, int]
+
+#: ``dialect.contract``.
+CONTRACT_VERSION = 'vector/1'
+
+#: Largest answer a store tool returns; a bigger one is refused with LIMIT_EXCEEDED.
+MAX_ANSWER_BYTES = 8 * 1024 * 1024
+
+#: The tools that change data (gated by ``vx_write_gate``).
+WRITE_TOOLS = ('remove_document', 'delete', 'upsert')
+
+#: Most rows ``objdir`` scans through ``listDocuments`` to fill one answer.
+OBJDIR_SCAN_MAX = 10000
+
+#: Documents the sampler lists to build its key space.
+SAMPLE_LISTING_MAX = 500
+
+#: Keys read through ``getVectors`` in one call.
+VECTOR_READ_BATCH = 500
+
+#: Most near-duplicate pairs a sample lists (most similar first); more adds the warning 'duplicates_capped'.
+DUPLICATES_MAX = 1000
+
+LIMITS = VECTOR_TOOL_LIMITS
+DEFAULTS = VECTOR_TOOL_DEFAULTS
+
+
+# =============================================================================
+# Helpers shared with the store hooks (re-exported by document_store)
+# =============================================================================
+
+
+def deletedFilter(deleted: str, **fields: Any) -> DocFilter:
+    """Build a ``DocFilter`` covering ``deleted`` rows (``'active'|'deleted'|'all'``).
+
+    Sets the exact ``deleted`` selector and the legacy ``isDeleted`` flag drivers
+    read today (``'active'`` -> False, otherwise True). A store whose ``isDeleted=True``
+    means "both" returns deleted and active rows for ``'deleted'``; callers that need
+    exactly the deleted ones filter what comes back (see :func:`matchesDeleted`).
+    """
+    flt = DocFilter(**fields)
+    flt.deleted = deleted
+    flt.isDeleted = deleted != 'active'
+    return flt
+
+
+def matchesDeleted(doc: Doc, deleted: str) -> bool:
+    """Whether ``doc`` belongs to the ``deleted`` selection (``'active'|'deleted'|'all'``)."""
+    is_deleted = bool(metadataValue(doc, 'isDeleted'))
+    if deleted == 'active':
+        return not is_deleted
+    if deleted == 'deleted':
+        return is_deleted
+    return True
+
+
+def encodeCursor(state: Dict[str, Any]) -> str:
+    """Encode a listing position as an opaque, URL-safe cursor (base64 of compact JSON, unpadded)."""
+    raw = json.dumps(state, separators=(',', ':'), sort_keys=True).encode('utf-8')
+    return base64.urlsafe_b64encode(raw).decode('ascii').rstrip('=')
+
+
+def decodeCursor(cursor: str) -> Dict[str, Any]:
+    """Decode a cursor made by :func:`encodeCursor`.
+
+    :raises ValueError: When ``cursor`` is not one (not base64, not JSON, or not an object).
+    """
+    if not isinstance(cursor, str) or not cursor:
+        raise ValueError('the cursor is empty')
+    try:
+        raw = base64.urlsafe_b64decode(cursor + '=' * (-len(cursor) % 4))
+        state = json.loads(raw.decode('utf-8'))
+    except Exception as exc:
+        raise ValueError('the cursor is not one this store issued') from exc
+    if not isinstance(state, dict):
+        raise ValueError('the cursor is not one this store issued')
+    return state
+
+
+def metadataValue(doc: Any, name: str) -> Any:
+    """Return metadata field or extra ``name`` of ``doc`` (None when absent)."""
+    md = getattr(doc, 'metadata', None)
+    if md is None:
+        return None
+    if isinstance(md, Mapping):
+        return md.get(name)
+    value = getattr(md, name, None)
+    if value is None:
+        extra = getattr(md, 'model_extra', None) or {}
+        value = extra.get(name)
+    return value
+
+
+def _int_or_none(value: Any) -> Optional[int]:
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def documentRow(doc: Doc, *, chunks: Optional[int] = None, tables: Optional[int] = None) -> DocumentRow:
+    """Build a ``DocumentRow`` from a document's display chunk (chunk 0 where it exists)."""
+    point_id = metadataValue(doc, 'pointId')
+    ingested = metadataValue(doc, 'ingestedAt')
+    return DocumentRow(
+        objectId=str(metadataValue(doc, 'objectId')),
+        path=str(metadataValue(doc, 'parent') or ''),
+        chunks=chunks,
+        has_first_chunk=_int_or_none(metadataValue(doc, 'chunkId')) == 0,
+        deleted=bool(metadataValue(doc, 'isDeleted')),
+        tables=tables,
+        nodeId=metadataValue(doc, 'nodeId'),
+        size=_int_or_none(metadataValue(doc, 'size')),
+        modifyTime=_int_or_none(metadataValue(doc, 'modifyTime')),
+        ingestedAt=ingested if isinstance(ingested, str) else None,
+        pointId=str(point_id) if point_id is not None else None,
+    )
+
+
+def docKey(doc: Any) -> Optional[Key]:
+    """Return ``(objectId, chunkId)`` of ``doc``, or None when either is missing."""
+    oid = metadataValue(doc, 'objectId')
+    chunk = _int_or_none(metadataValue(doc, 'chunkId'))
+    if oid is None or chunk is None:
+        return None
+    return (str(oid), chunk)
+
+
+# =============================================================================
+# Input normalisation, error text and answer post-processing
+# =============================================================================
+
+
+def normalize_tool_input(input_obj: Any) -> Dict[str, Any]:
+    """Normalize a tool-call payload into a plain ``dict``.
+
+    Handles ``None``, plain dicts, pydantic models (``model_dump`` / ``dict``),
+    JSON strings, and nested ``input`` wrappers the host may produce. A
+    nested ``input`` value of any supported shape (dict, JSON string,
+    pydantic model) is re-normalized before merging with any sibling
+    ``extras`` in the outer payload so values like ``{'input': '{"query":
+    "x"}'}`` or ``{'input': SomeModel(...)}`` are handled correctly.
+    """
+    if input_obj is None:
+        return {}
+
+    # Pydantic (v2 prefers model_dump; fall back to v1 dict())
+    if hasattr(input_obj, 'model_dump') and callable(getattr(input_obj, 'model_dump')):
+        input_obj = input_obj.model_dump()
+    elif hasattr(input_obj, 'dict') and callable(getattr(input_obj, 'dict')):
+        try:
+            input_obj = input_obj.dict()
+        except TypeError:
+            # Not a pydantic-style ``dict()`` (e.g. builtin dict) — leave as is.
+            pass
+
+    # JSON string
+    if isinstance(input_obj, str):
+        try:
+            parsed = json.loads(input_obj)
+            if isinstance(parsed, dict):
+                input_obj = parsed
+            else:
+                warning(f'vectordb tool: JSON input did not parse to a dict (got {type(parsed).__name__})')
+                return {}
+        except (json.JSONDecodeError, ValueError) as exc:
+            warning(f'vectordb tool: malformed JSON input, returning empty dict: {exc}')
+            return {}
+
+    if not isinstance(input_obj, dict):
+        warning(f'vectordb tool: unexpected input type {type(input_obj).__name__}')
+        return {}
+
+    # Unwrap nested ``input`` wrappers the host may produce. Re-run the
+    # normalizer on the inner value so string-, model- or dict-wrapped
+    # payloads all get the same treatment.
+    if 'input' in input_obj:
+        inner_raw = input_obj['input']
+        extras = {k: v for k, v in input_obj.items() if k != 'input'}
+        inner = normalize_tool_input(inner_raw)
+        if isinstance(inner, dict):
+            input_obj = {**inner, **extras}
+
+    input_obj.pop('security_context', None)
+    return input_obj
+
+
+_SCRUB = (
+    (re.compile(r'\b[a-zA-Z][a-zA-Z0-9+.\-]*://[^\s\'"<>]+'), '<url>'),
+    (
+        re.compile(
+            r'\b(password|passwd|pwd|user|username|host|hostaddr|port|dbname|database|apikey|api_key|token|secret'
+            r'|sslkey|sslcert|sslrootcert)\s*=\s*[^\s,;)]+',
+            re.IGNORECASE,
+        ),
+        r'\1=<redacted>',
+    ),
+    (re.compile(r'\b(server at|host name|host|on socket|socket)\s+"[^"]*"', re.IGNORECASE), r'\1 <host>'),
+    (re.compile(r'\b\d{1,3}(?:\.\d{1,3}){3}(?::\d+)?\b'), '<host>'),
+    (re.compile(r'\[[0-9a-fA-F:]{2,}\](?::\d+)?'), '<host>'),
+    (re.compile(r'\blocalhost(?::\d+)?\b', re.IGNORECASE), '<host>'),
+    (re.compile(r'\bport\s+\d+\b', re.IGNORECASE), 'port <port>'),
+)
+
+
+def safe_error_text(error: Any, limit: int = 300) -> str:
+    """Return error text fit for a tool answer: no URL, DSN, host, port or credential; at most ``limit`` chars."""
+    text = ' '.join(str(error).split())
+    for pattern, replacement in _SCRUB:
+        text = pattern.sub(replacement, text)
+    if len(text) > limit:
+        text = text[: limit - 1].rstrip() + '…'
+    return text
+
+
+def safe_error(exc: BaseException) -> str:
+    """``'<ExceptionType>: <scrubbed message>'``."""
+    message = safe_error_text(exc)
+    return f'{type(exc).__name__}: {message}' if message else type(exc).__name__
+
+
+def jsonable(value: Any) -> Any:
+    """Turn a tool answer into JSON values: numpy to Python, tuples to lists, NaN/inf to None."""
+    if value is None or isinstance(value, (str, bool)):
+        return value
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, Mapping):
+        return {str(k): jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [jsonable(v) for v in value]
+    if isinstance(value, (set, frozenset)):
+        return [jsonable(v) for v in sorted(value, key=str)]
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        return jsonable(dataclasses.asdict(value))
+    module = type(value).__module__
+    if module == 'numpy' or module.startswith('numpy.'):
+        if hasattr(value, 'tolist'):
+            return jsonable(value.tolist())
+        return jsonable(value.item())
+    if hasattr(value, 'model_dump') and callable(value.model_dump):
+        return jsonable(value.model_dump())
+    if isinstance(value, (bytes, bytearray)):
+        return None
+    return str(value)
+
+
+def finish_answer(result: Any) -> Dict[str, Any]:
+    """Post-process a tool answer: JSON values, ``success`` first, and the size cap."""
+    if not isinstance(result, Mapping):
+        result = {'success': True, 'result': result}
+    out = jsonable(result)
+    out = {'success': out.pop('success', True), **out}
+    size = len(json.dumps(out, separators=(',', ':'), allow_nan=False))
+    if size > MAX_ANSWER_BYTES:
+        return {
+            'success': False,
+            'code': 'LIMIT_EXCEEDED',
+            'error': f'The answer would be {size} bytes; the limit is {MAX_ANSWER_BYTES} bytes. Ask for fewer items.',
+        }
+    return out
+
+
+def vectordb_tool(fn: Callable) -> Callable:
+    """Run a store tool inside the shared envelope.
+
+    1. the input is normalised (:func:`normalize_tool_input`);
+    2. ``StoreUnsupported`` -> ``UNSUPPORTED``; ``ToolRefusal`` -> its code and extra keys;
+       ``KeyboardInterrupt``/``SystemExit`` propagate; anything else (any ``BaseException``)
+       -> ``STORE_ERROR`` with a scrubbed message;
+    3. the answer is post-processed by :func:`finish_answer`.
+
+    Applied under ``@tool_function`` so the tool's descriptor is unchanged.
+    """
+
+    @functools.wraps(fn)
+    def wrapper(self, args: Any = None) -> Dict[str, Any]:
+        try:
+            result = fn(self, normalize_tool_input(args))
+        except StoreUnsupported as exc:
+            result = {'success': False, 'code': 'UNSUPPORTED', 'error': safe_error_text(exc)}
+        except ToolRefusal as exc:
+            result = exc.envelope()
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException as exc:  # noqa: BLE001 - the tool boundary: nothing escapes it
+            result = {'success': False, 'code': 'STORE_ERROR', 'error': safe_error(exc)}
+        return finish_answer(result)
+
+    wrapper.__vectordb_tool__ = True
+    return wrapper
+
+
+# =============================================================================
+# Argument parsing
+# =============================================================================
+
+
+def _invalid(message: str) -> ToolRefusal:
+    return ToolRefusal('INVALID_INPUT', message)
+
+
+def _int_arg(args: Mapping[str, Any], name: str, default: int) -> int:
+    value = args.get(name, default)
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        raise _invalid(f'{name} must be an integer.')
+    try:
+        if isinstance(value, float) and not value.is_integer():
+            raise ValueError
+        return int(value)
+    except (TypeError, ValueError):
+        raise _invalid(f'{name} must be an integer.') from None
+
+
+def _clamped(value: int, low: int, high: int, name: str, warnings: List[str]) -> int:
+    if value > high:
+        warnings.append(f'{name}_clamped')
+        return high
+    if value < low:
+        warnings.append(f'{name}_clamped')
+        return low
+    return value
+
+
+def _bool_arg(args: Mapping[str, Any], name: str, default: bool) -> bool:
+    value = args.get(name, default)
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    raise _invalid(f'{name} must be true or false.')
+
+
+def _deleted_arg(args: Mapping[str, Any]) -> str:
+    deleted = args.get('deleted', 'active')
+    if deleted is None:
+        return 'active'
+    if deleted not in DELETED_VALUES:
+        raise _invalid("deleted must be 'active', 'deleted' or 'all'.")
+    return deleted
+
+
+def _strings_arg(value: Any, name: str, max_n: int) -> List[str]:
+    if not isinstance(value, (list, tuple)) or not 1 <= len(value) <= max_n:
+        raise _invalid(f'{name} must be a list of 1 to {max_n} strings.')
+    out: List[str] = []
+    for item in value:
+        if not isinstance(item, str) or not item.strip():
+            raise _invalid(f'{name} must be a list of 1 to {max_n} strings.')
+        text = item.strip()
+        if text not in out:
+            out.append(text)
+    return out
+
+
+def _filter_object_ids(args: Mapping[str, Any]) -> Optional[List[str]]:
+    flt = args.get('filter')
+    if flt is None:
+        return None
+    if not isinstance(flt, Mapping):
+        raise _invalid('filter must be an object.')
+    ids = flt.get('object_ids')
+    if ids is None:
+        return None
+    return _strings_arg(ids, 'filter.object_ids', LIMITS['scope_keys_max'])
+
+
+def _key_arg(value: Any, name: str) -> Key:
+    if (
+        not isinstance(value, (list, tuple))
+        or len(value) != 2
+        or not isinstance(value[0], str)
+        or not value[0]
+        or isinstance(value[1], bool)
+        or not isinstance(value[1], (int, float))
+        or float(value[1]) != int(value[1])
+    ):
+        raise _invalid(f'{name} must be [objectId, chunkId].')
+    return (value[0], int(value[1]))
+
+
+def _keys_arg(value: Any, name: str, max_n: int, min_n: int = 1) -> List[Key]:
+    if not isinstance(value, (list, tuple)) or not min_n <= len(value) <= max_n:
+        raise _invalid(f'{name} must be a list of {min_n} to {max_n} [objectId, chunkId] keys.')
+    keys: List[Key] = []
+    for item in value:
+        key = _key_arg(item, f'each of {name}')
+        if key not in keys:
+            keys.append(key)
+    return keys
+
+
+def _vector_arg(value: Any, name: str = 'vector') -> List[float]:
+    if not isinstance(value, (list, tuple)) or not value:
+        raise _invalid(f'{name} must be a non-empty list of numbers.')
+    out: List[float] = []
+    for item in value:
+        if isinstance(item, bool) or not isinstance(item, (int, float)) or not math.isfinite(float(item)):
+            raise _invalid(f'{name} must be a non-empty list of finite numbers.')
+        out.append(float(item))
+    return out
+
+
+def _round(value: Any, dp: int) -> Optional[float]:
+    if value is None:
+        return None
+    number = float(value)
+    return round(number, dp) if math.isfinite(number) else None
+
+
+def _round_list(values: Iterable[Any], dp: int) -> List[Optional[float]]:
+    return [_round(v, dp) for v in values]
+
+
+def _iso(ts: Optional[float]) -> Optional[str]:
+    if ts is None:
+        return None
+    return time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(ts))
+
+
+# Clocks, patchable in tests.
+_wall_clock = time.time
+_monotonic = time.monotonic
+
+
+# =============================================================================
+# Per-store explorer state
+# =============================================================================
+
+
+class _VxState:
+    """What the explorer tools keep per store: cached counts, samples, the neighbors gate."""
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.counts: Optional[Dict[str, Any]] = None
+        self.counts_as_of: Optional[float] = None
+        self.neighbors_busy = threading.Lock()
+        self._samples = None
+
+    def samples(self):
+        """Return the store's sample cache (created on first use; it needs numpy)."""
+        with self.lock:
+            if self._samples is None:
+                from .vx_sample_cache import SampleCache
+
+                self._samples = SampleCache()
+            return self._samples
+
+    def forget_counts(self) -> None:
+        with self.lock:
+            self.counts = None
+            self.counts_as_of = None
+
+
+_STATE_LOCK = threading.Lock()
+
+
+def _vx_state(store: Any) -> _VxState:
+    state = getattr(store, '_vx_state', None)
+    if state is None:
+        with _STATE_LOCK:
+            state = getattr(store, '_vx_state', None)
+            if state is None:
+                state = _VxState()
+                store._vx_state = state
+    return state
+
+
+def _batches(items: Sequence[Any], size: int) -> Iterable[Sequence[Any]]:
+    for start in range(0, len(items), size):
+        yield items[start : start + size]
+
+
+# =============================================================================
+# Output schemas (descriptors are listed for DAP callers only)
+# =============================================================================
+
+_ENVELOPE = {
+    'success': {'type': 'boolean'},
+    'code': {'type': 'string'},
+    'error': {'type': 'string'},
+}
+
+_KEY_SCHEMA = {
+    'type': 'array',
+    'description': '[objectId, chunkId]',
+    'prefixItems': [{'type': 'string'}, {'type': 'integer'}],
+    'minItems': 2,
+    'maxItems': 2,
+}
+
+_DELETED_SCHEMA = {
+    'type': 'string',
+    'enum': list(DELETED_VALUES),
+    'description': "Rows to cover: 'active' (default), 'deleted' or 'all'.",
+}
+
+
+# =============================================================================
+# The explorer tools
+# =============================================================================
+
+
+class VectorExplorerTools:
+    """The Vector Explorer's tools; mixed into ``VectorStoreToolMixin``.
+
+    Every method delegates to ``self.IGlobal.store`` (a ``DocumentStoreBase``) and
+    its optional hooks. The write tool runs ``vx_write_gate`` first.
+    """
+
+    # ------------------------------------------------------------------
+    # Plumbing
+    # ------------------------------------------------------------------
+
+    def _vx_store(self) -> 'DocumentStoreBase':
+        store = getattr(getattr(self, 'IGlobal', None), 'store', None)
+        if store is None:
+            raise StoreError('The store is not open on this node; start the pipeline and try again.')
+        return store
+
+    def _vx_switch(self, name: str, default: bool) -> bool:
+        value = getattr(getattr(self, 'IGlobal', None), name, None)
+        return value if isinstance(value, bool) else default
+
+    def _vx_allow_writes(self) -> bool:
+        return self._vx_switch('allow_writes', VECTOR_ALLOW_WRITES_DEFAULT)
+
+    def _vx_agent_writes(self) -> bool:
+        return self._vx_switch('agent_writes', VECTOR_AGENT_WRITES_DEFAULT)
+
+    @staticmethod
+    def _vx_forget_counts(store: Any) -> None:
+        _vx_state(store).forget_counts()
+
+    def _vx_provider(self, store: Any) -> Optional[str]:
+        inner = getattr(getattr(self, 'IGlobal', None), 'glb', None)
+        logical = getattr(inner, 'logicalType', None)
+        if isinstance(logical, str) and logical:
+            return logical
+        provider = getattr(store, 'provider', None)
+        return provider if isinstance(provider, str) and provider else None
+
+    def _vx_node_id(self) -> Optional[str]:
+        try:
+            pipe_type = getattr(getattr(self, 'instance', None), 'pipeType', None)
+            if pipe_type is None:
+                return None
+            node = pipe_type.get('id') if isinstance(pipe_type, Mapping) else getattr(pipe_type, 'id', None)
+            if node is None and hasattr(pipe_type, '__getitem__'):
+                node = pipe_type['id']
+        except Exception:
+            return None
+        return str(node) if node else None
+
+    @staticmethod
+    def _vx_metric(store: Any) -> Optional[str]:
+        from .vx_math import normalize_metric
+
+        return normalize_metric(getattr(store, 'similarity', None))
+
+    @staticmethod
+    def _vx_load_control(store: Any) -> bool:
+        """Load model and dimension from the control record; False when the collection or record is missing."""
+        try:
+            return bool(store.doesCollectionExist())
+        except Exception:
+            return False
+
+    @staticmethod
+    def _vx_count(fn: Callable[[DocFilter], Optional[int]], flt: DocFilter) -> Optional[int]:
+        try:
+            value = fn(flt)
+        except StoreUnsupported:
+            return None
+        except Exception as exc:  # a count the store cannot give is reported as unknown
+            warning(f'vector store tool: a count failed: {safe_error(exc)}')
+            return None
+        return _int_or_none(value)
+
+    def _vx_score(self, store: Any) -> Dict[str, Any]:
+        info = dict(store.scoreInfo() or {})
+        score: Dict[str, Any] = {'formula': str(info.get('formula', 'unknown'))}
+        if info.get('range') is not None:
+            score['range'] = list(info['range'])
+        score['higher_is_better'] = bool(info.get('higher_is_better', True))
+        score['floor'] = _round(info.get('floor', 0.2), 5)
+        threshold = info.get('threshold', getattr(store, 'threshold_search', None))
+        score['threshold'] = _round(threshold, 5) if threshold is not None else None
+        return score
+
+    @staticmethod
+    def _vx_capabilities(caps: Iterable[str]) -> Dict[str, Any]:
+        has = frozenset(caps).__contains__
+        vectors = has('getVectors')
+        sample = vectors or has('sampleChunks')
+        return {
+            'describe': True,
+            'count': True,
+            'count_documents': has('countDocuments'),
+            'documents': True,
+            'documents_distinct': has('documents_distinct'),
+            'documents_sorted': has('documents_sorted'),
+            'chunks': True,
+            'vectors': vectors,
+            'sample': sample,
+            'sample_light': sample,
+            'sample_stratified_native': has('sample_stratified_native'),
+            'knn_native': has('knnGraph') or has('knn_native'),
+            'project': sample,
+            'neighbors': vectors,
+            'search_vector': True,
+            'search_keyword': has('search_keyword'),
+            'remove': True,
+            'remove_count': has('removeCounted') or has('countChunks'),
+            'soft_delete': False,
+            'projection': list(PROJECTIONS),
+        }
+
+    def _vx_audit(self, action: str, store: Any, object_ids: Sequence[str], rows: Optional[int], decision: Any) -> Dict:
+        return {
+            'action': action,
+            'node': self._vx_node_id(),
+            'provider': self._vx_provider(store),
+            'collection': store.vxCollectionName() if hasattr(store, 'vxCollectionName') else None,
+            'object_ids': list(object_ids),
+            'rows': rows,
+            'caller': dict(decision.caller),
+        }
+
+    def _vx_log_write(self, action: str, object_ids: Sequence[str], rows: Optional[int], origin: str) -> None:
+        try:
+            from rocketlib import debug
+
+            debug(f'{action} on {self._vx_node_id() or "store"} ({origin}): {rows} rows for {list(object_ids)}')
+        except Exception:
+            pass
+
+    def _vx_remove(self, store: Any, ids: Sequence[str]) -> Tuple[List[Dict[str, Any]], List[str], Optional[int]]:
+        """Remove documents; return ``(removed, not_found, rows)`` with per-document counts where known."""
+        per: Dict[str, Optional[int]] = {}
+        for oid in ids:
+            per[oid] = self._vx_count(store.countChunks, deletedFilter('all', objectIds=[oid]))
+        not_found = [oid for oid in ids if per[oid] == 0]
+        targets = [oid for oid in ids if per[oid] != 0]
+        rows: Optional[int] = 0
+        if targets:
+            rows = _int_or_none(store.removeCounted(list(targets)))
+            if rows is None and all(per[oid] is not None for oid in targets):
+                rows = sum(per[oid] or 0 for oid in targets)
+        if len(targets) == 1 and per[targets[0]] is None:
+            per[targets[0]] = rows
+        _vx_state(store).forget_counts()
+        removed = [{'objectId': oid, 'chunks_removed': per[oid]} for oid in targets]
+        return removed, not_found, rows
+
+    # ------------------------------------------------------------------
+    # dialect
+    # ------------------------------------------------------------------
+
+    @tool_function(
+        input_schema={'type': 'object', 'properties': {}},
+        output_schema={
+            'type': 'object',
+            'properties': {
+                **_ENVELOPE,
+                'dialect': {'type': 'string'},
+                'contract': {'type': 'string'},
+                'provider': {'type': 'string'},
+                'backend': {'type': 'string'},
+                'collection': {'type': ['string', 'null']},
+                'metric': {'type': ['string', 'null']},
+                'model': {'type': ['string', 'null']},
+                'dimension': {'type': ['integer', 'null']},
+                'capabilities': {'type': 'object'},
+                'limits': {'type': 'object'},
+                'health': {'type': 'object'},
+                'caveats': {'type': 'array', 'items': {'type': 'string'}},
+            },
+        },
+        description=(
+            'Describe this vector store for the Vector Explorer: backend, collection, metric, model, '
+            'dimension, index, score scale, write switches, capabilities, limits, health and caveats.'
+        ),
+        audience=('dap',),
+    )
+    @vectordb_tool
+    def dialect(self, args):
+        """Describe the store (the explorer's probe)."""
+        store = self._vx_store()
+        info = store.describe()
+        support = getattr(store, 'VX_SUPPORT', 'experimental')
+        if support not in SUPPORT_LEVELS:
+            support = 'experimental'
+        caveats = list(info.caveats)
+        if support == 'experimental':
+            caveats.append('experimental')
+        if info.meta_column is False:
+            caveats.append('meta_column_pending')
+        limits = dict(LIMITS)
+        if info.backend != 'pgvector':
+            limits['statement_timeout_ms'] = None
+        mismatch = getattr(store, 'modelMismatch', None) if info.collection_exists else None
+        return {
+            'success': True,
+            'dialect': 'vector',
+            'contract': CONTRACT_VERSION,
+            'provider': self._vx_provider(store),
+            'backend': info.backend,
+            'backend_version': info.backend_version,
+            'collection': info.collection,
+            'metric': info.metric,
+            'model': info.model,
+            'dimension': info.dimension,
+            'index': info.index,
+            'score': self._vx_score(store),
+            'support': support,
+            'allow_writes': self._vx_allow_writes(),
+            'agent_writes': self._vx_agent_writes(),
+            'writes_scope': 'tools_source',
+            'write_tools': list(WRITE_TOOLS),
+            'capabilities': self._vx_capabilities(store.capabilities()),
+            'limits': limits,
+            'health': {
+                'collection_exists': info.collection_exists,
+                'control_record': info.control_record,
+                'model_mismatch': mismatch if isinstance(mismatch, bool) else None,
+                'meta_column': info.meta_column,
+            },
+            'caveats': list(dict.fromkeys(caveats)),
+        }
+
+    # ------------------------------------------------------------------
+    # stats helpers (the legacy ``stats`` tool lives in document_store)
+    # ------------------------------------------------------------------
+
+    def _vx_compute_counts(self, store: Any) -> Dict[str, Any]:
+        """The filtered figures of ``stats`` (control record excluded); None where the store cannot count."""
+        caveats: List[str] = []
+        documents = self._vx_count(store.countDocuments, deletedFilter('active'))
+        first = self._vx_count(store.countChunks, deletedFilter('active', chunkIds=[0]))
+        without_first: Optional[int] = None
+        if documents is None and first is not None:
+            documents = first
+            caveats.append('documents_by_first_chunk')
+        elif documents is not None and first is not None:
+            without_first = max(0, documents - first)
+        chunks = self._vx_count(store.countChunks, deletedFilter('active'))
+        deleted_chunks = self._vx_count(store.countChunks, deletedFilter('deleted'))
+        tables = self._vx_count(store.countChunks, deletedFilter('active', isTable=True))
+        if documents is None and chunks is None and deleted_chunks is None and tables is None:
+            caveats.append('no_filtered_count')
+        return {
+            'documents': documents,
+            'documents_without_first_chunk': without_first,
+            'chunks': chunks,
+            'deleted_chunks': deleted_chunks,
+            'tables': tables,
+            'avg_chunks_per_document': _round(chunks / documents, 5) if chunks is not None and documents else None,
+            'caveats': caveats,
+        }
+
+    def _vx_stats(self, store: Any, mode: str) -> Dict[str, Any]:
+        """The ``stats`` answer: legacy keys plus the explorer's figures (see the contract, ``stats``)."""
+        now = _wall_clock()
+        state = _vx_state(store)
+        if not store._doesCollectionExist():
+            state.forget_counts()
+            return {
+                'success': True,
+                'count': 0,
+                'model': '',
+                'vector_size': 0,
+                'collection_exists': False,
+                'documents': None,
+                'documents_without_first_chunk': None,
+                'chunks': None,
+                'deleted_chunks': None,
+                'raw_count': None,
+                'tables': None,
+                'avg_chunks_per_document': None,
+                'dimension': None,
+                'metric': None,
+                'computed_at': _iso(now),
+                'counts_as_of': None,
+            }
+        self._vx_load_control(store)
+        count = int(store.count_documents())
+        with state.lock:
+            cached, as_of = state.counts, state.counts_as_of
+        if mode == 'quick' and cached is not None:
+            figures = cached
+        else:
+            figures = self._vx_compute_counts(store)
+            as_of = now
+            with state.lock:
+                state.counts, state.counts_as_of = figures, as_of
+        vector_size = int(store.vectorSize or 0)
+        answer = {
+            'success': True,
+            'count': count,
+            'model': store.modelName or '',
+            'vector_size': vector_size,
+            'collection_exists': True,
+            'documents': figures['documents'],
+            'documents_without_first_chunk': figures['documents_without_first_chunk'],
+            'chunks': figures['chunks'],
+            'deleted_chunks': figures['deleted_chunks'],
+            'raw_count': count,
+            'tables': figures['tables'],
+            'avg_chunks_per_document': figures['avg_chunks_per_document'],
+            'dimension': vector_size or None,
+            'metric': self._vx_metric(store),
+            'computed_at': _iso(now),
+            'counts_as_of': _iso(as_of),
+        }
+        if figures['caveats']:
+            answer['caveats'] = list(figures['caveats'])
+        return answer
+
+    # ------------------------------------------------------------------
+    # documents
+    # ------------------------------------------------------------------
+
+    @tool_function(
+        input_schema={
+            'type': 'object',
+            'properties': {
+                'cursor': {'type': ['string', 'null'], 'description': 'next_cursor of the previous page.'},
+                'limit': {'type': 'integer', 'description': 'Documents per page (default 200, at most 500).'},
+                'object_ids': {'type': ['array', 'null'], 'items': {'type': 'string'}},
+                'deleted': _DELETED_SCHEMA,
+                'sort': {'type': 'string', 'enum': ['path']},
+            },
+        },
+        output_schema={
+            'type': 'object',
+            'properties': {
+                **_ENVELOPE,
+                'items': {'type': 'array', 'items': {'type': 'object'}},
+                'next_cursor': {'type': ['string', 'null']},
+                'total': {'type': ['integer', 'null']},
+                'counts_exact': {'type': 'boolean'},
+                'distinct': {'type': 'boolean'},
+                'sorted': {'type': 'boolean'},
+                'caveats': {'type': 'array', 'items': {'type': 'string'}},
+            },
+        },
+        description='List the documents in this vector store, one row per document with its path and chunk count.',
+        audience=('dap',),
+    )
+    @vectordb_tool
+    def documents(self, args):
+        """One page of the document directory."""
+        store = self._vx_store()
+        warnings: List[str] = []
+        cursor = args.get('cursor')
+        if cursor is not None:
+            if not isinstance(cursor, str):
+                raise _invalid('cursor must be the next_cursor of a previous page.')
+            try:
+                decodeCursor(cursor)
+            except ValueError:
+                raise _invalid('cursor must be the next_cursor of a previous page.') from None
+        limit = _clamped(
+            _int_arg(args, 'limit', DEFAULTS['documents_page']), 1, LIMITS['documents_page'], 'limit', warnings
+        )
+        object_ids = args.get('object_ids')
+        if object_ids is not None:
+            object_ids = _strings_arg(object_ids, 'object_ids', LIMITS['documents_page'])
+        deleted = _deleted_arg(args)
+        sort = args.get('sort', 'path') or 'path'
+        if sort != 'path':
+            raise _invalid("sort must be 'path'.")
+        page = store.listDocuments(cursor=cursor, limit=limit, object_ids=object_ids, deleted=deleted, sort=sort)
+        items = [
+            {
+                'objectId': row.objectId,
+                'path': row.path,
+                'chunks': row.chunks,
+                'has_first_chunk': row.has_first_chunk,
+                'tables': row.tables,
+                'deleted': row.deleted,
+                'nodeId': row.nodeId,
+                'size': row.size,
+                'modifyTime': row.modifyTime,
+                'ingestedAt': row.ingestedAt,
+                'pointId': row.pointId,
+            }
+            for row in page.items
+            if row.objectId != CONTROL_OBJECT_ID
+        ]
+        caveats = list(page.caveats)
+        if not page.sorted and 'documents_unsorted' not in caveats:
+            caveats.append('documents_unsorted')
+        answer = {
+            'success': True,
+            'items': items,
+            'next_cursor': page.next_cursor,
+            'total': page.total,
+            'counts_exact': page.counts_exact,
+            'distinct': page.distinct,
+            'sorted': page.sorted,
+            'caveats': caveats,
+        }
+        if warnings:
+            answer['warnings'] = ['limit_clamped']
+        return answer
+
+    # ------------------------------------------------------------------
+    # chunks
+    # ------------------------------------------------------------------
+
+    @tool_function(
+        input_schema={
+            'type': 'object',
+            'required': ['object_id'],
+            'properties': {
+                'object_id': {'type': 'string'},
+                'after_chunk': {'type': 'integer', 'description': 'Return chunks after this chunkId (default -1).'},
+                'limit': {'type': 'integer', 'description': 'Chunks per page (default 100, at most 200).'},
+                'deleted': _DELETED_SCHEMA,
+            },
+        },
+        output_schema={
+            'type': 'object',
+            'properties': {
+                **_ENVELOPE,
+                'items': {'type': 'array', 'items': {'type': 'object'}},
+                'has_more': {'type': 'boolean'},
+                'next_after': {'type': 'integer'},
+                'total': {'type': ['integer', 'null']},
+            },
+        },
+        description="Page through one document's chunks in chunk order (text and metadata; never vectors).",
+        audience=('dap',),
+    )
+    @vectordb_tool
+    def chunks(self, args):
+        """One page of a document's chunks."""
+        store = self._vx_store()
+        object_id = args.get('object_id')
+        if not isinstance(object_id, str) or not object_id.strip():
+            raise _invalid('object_id is required.')
+        object_id = object_id.strip()
+        warnings: List[str] = []
+        after = _int_arg(args, 'after_chunk', -1)
+        if after < -1:
+            raise _invalid('after_chunk must be -1 or more.')
+        limit = _clamped(_int_arg(args, 'limit', DEFAULTS['chunks_page']), 1, LIMITS['chunks_page'], 'limit', warnings)
+        deleted = _deleted_arg(args)
+        not_found = ToolRefusal('NOT_FOUND', f"No document with objectId '{object_id}' is stored in this collection.")
+        if object_id == CONTROL_OBJECT_ID:
+            raise not_found
+        page = store.scrollChunks(object_id, after_chunk=after, limit=limit, deleted=deleted)
+        if not page.docs and not page.has_more and after == -1:
+            raise not_found
+        items = []
+        for doc in page.docs:
+            meta = doc.metadata.model_dump(exclude_none=True) if hasattr(doc.metadata, 'model_dump') else {}
+            for key in ('vectorSize', 'modelName'):
+                meta.pop(key, None)
+            content = doc.page_content or ''
+            items.append(
+                {
+                    'chunkId': _int_or_none(metadataValue(doc, 'chunkId')),
+                    'content': content,
+                    'length': len(content),
+                    'isTable': bool(metadataValue(doc, 'isTable')),
+                    'tableId': _int_or_none(metadataValue(doc, 'tableId')) or 0,
+                    'isDeleted': bool(metadataValue(doc, 'isDeleted')),
+                    'pointId': meta.pop('pointId', None),
+                    'metadata': meta,
+                }
+            )
+        answer = {
+            'success': True,
+            'items': items,
+            'has_more': page.has_more,
+            'next_after': page.next_after,
+            'total': self._vx_count(store.countChunks, deletedFilter(deleted, objectIds=[object_id])),
+        }
+        if warnings:
+            answer['warnings'] = warnings
+        return answer
+
+    # ------------------------------------------------------------------
+    # vectors
+    # ------------------------------------------------------------------
+
+    @tool_function(
+        input_schema={
+            'type': 'object',
+            'required': ['keys'],
+            'properties': {'keys': {'type': 'array', 'items': _KEY_SCHEMA, 'maxItems': 2}},
+        },
+        output_schema={
+            'type': 'object',
+            'properties': {**_ENVELOPE, 'items': {'type': 'array'}, 'model': {'type': ['string', 'null']}},
+        },
+        description='Return the raw vectors of at most two chunks, by [objectId, chunkId].',
+        audience=('dap',),
+    )
+    @vectordb_tool
+    def vectors(self, args):
+        """The raw vectors of one or two chunks: the only tool that returns them."""
+        import numpy as np
+
+        store = self._vx_store()
+        keys = _keys_arg(args.get('keys'), 'keys', LIMITS['vectors_keys_max'])
+        wanted = [key for key in keys if key[0] != CONTROL_OBJECT_ID]
+        found: Dict[Key, Doc] = {}
+        if wanted:
+            for doc in store.getVectors(wanted):
+                key = docKey(doc)
+                if key in wanted and doc.embedding is not None and key not in found:
+                    found[key] = doc
+        if not found:
+            raise ToolRefusal('NOT_FOUND', 'None of those chunks is stored in this collection.')
+        self._vx_load_control(store)
+        items = []
+        for key in wanted:
+            doc = found.get(key)
+            if doc is None:
+                continue
+            values = np.asarray(doc.embedding, dtype=np.float64)
+            items.append(
+                {
+                    'key': [key[0], key[1]],
+                    'pointId': metadataValue(doc, 'pointId'),
+                    'dimension': int(values.size),
+                    'norm': _round(float(np.linalg.norm(values)), 6),
+                    'values': [float(v) for v in values],
+                }
+            )
+        return {'success': True, 'items': items, 'model': store.modelName or None}
+
+    # ------------------------------------------------------------------
+    # sample
+    # ------------------------------------------------------------------
+
+    def _vx_list_rows(
+        self, store: Any, object_ids: Optional[List[str]], deleted: str, limit: int, deadline: float
+    ) -> List[DocumentRow]:
+        """List up to ``limit`` documents (distinct by objectId), following cursors."""
+        rows: Dict[str, DocumentRow] = {}
+        cursor: Optional[str] = None
+        while len(rows) < limit:
+            page = store.listDocuments(
+                cursor=cursor,
+                limit=min(LIMITS['documents_page'], limit),
+                object_ids=object_ids,
+                deleted=deleted,
+                sort='path',
+            )
+            for row in page.items:
+                if row.objectId != CONTROL_OBJECT_ID and row.objectId not in rows and len(rows) < limit:
+                    rows[row.objectId] = row
+            if not page.next_cursor or 'documents_paging_unsupported' in page.caveats:
+                break
+            cursor = page.next_cursor
+            self._vx_check_deadline(deadline)
+        return list(rows.values())
+
+    @staticmethod
+    def _vx_check_deadline(deadline: float) -> None:
+        if _monotonic() > deadline:
+            raise ToolRefusal('TIMEOUT', f'The sample did not finish within {LIMITS["sample_budget_ms"] // 1000} s.')
+
+    def _vx_collect_sample(
+        self,
+        store: Any,
+        *,
+        n: int,
+        seed: int,
+        strategy: str,
+        pinned: List[Key],
+        object_ids: Optional[List[str]],
+        deleted: str,
+        deadline: float,
+    ) -> Tuple[List[Doc], str, bool, Dict[str, DocumentRow]]:
+        """Draw the sample (contract section 2.4): ``(docs with vectors, strategy_used, biased, listing)``."""
+        flt = deletedFilter(deleted, objectIds=object_ids)
+        chosen: Dict[Key, Doc] = {}
+
+        def add(doc: Doc) -> bool:
+            key = docKey(doc)
+            if (
+                len(chosen) >= n
+                or key is None
+                or key[0] == CONTROL_OBJECT_ID
+                or key in chosen
+                or not doc.embedding
+                or (object_ids and key[0] not in object_ids)
+                or not matchesDeleted(doc, deleted)
+            ):
+                return False
+            chosen[key] = doc
+            return True
+
+        if pinned:
+            try:
+                for doc in store.getVectors(pinned):
+                    if docKey(doc) in pinned:
+                        add(doc)
+            except StoreUnsupported:
+                pass
+
+        listing: Dict[str, DocumentRow] = {}
+        strategy_used = strategy
+        biased = False
+
+        # (2) a native sampler answers directly.
+        order = {'stratified': ('stratified',), 'random': ('random', 'first'), 'first': ('first', 'random')}[strategy]
+        for strat in order:
+            try:
+                docs, used = store.sampleChunks(
+                    n=n - len(chosen), seed=seed, strategy=strat, docFilter=flt, include_keys=list(chosen)
+                )
+            except StoreUnsupported:
+                continue
+            for doc in docs:
+                add(doc)
+            return list(chosen.values()), used if used in SAMPLE_STRATEGIES else strat, False, listing
+
+        # (3) / (4) keys from the document listing, read through getVectors.
+        rows = self._vx_list_rows(store, object_ids, deleted, SAMPLE_LISTING_MAX, deadline)
+        listing = {row.objectId: row for row in rows}
+        from .vx_math import stratified_pick
+
+        if rows and all(row.chunks is not None for row in rows):
+            rows_by_doc = {row.objectId: [(row.objectId, c) for c in range(max(0, int(row.chunks)))] for row in rows}
+        else:
+            rows_by_doc = {row.objectId: [(row.objectId, 0)] for row in rows if row.has_first_chunk}
+        keys = [key for key in stratified_pick(rows_by_doc, n, seed, pinned=list(chosen)) if key not in chosen]
+        try:
+            for batch in _batches(keys, VECTOR_READ_BATCH):
+                for doc in store.getVectors(list(batch)):
+                    add(doc)
+                self._vx_check_deadline(deadline)
+        except StoreUnsupported:
+            pass
+        strategy_used = 'stratified'
+
+        # Refill every miss (gaps in chunk ids, documents without chunk 0, no counts).
+        if len(chosen) < n:
+            for strat in ('random', 'first'):
+                try:
+                    added = self._vx_refill(store, strat, chosen, add, n, seed, flt, deadline)
+                except StoreUnsupported:
+                    continue
+                if added:
+                    strategy_used = strat
+                    biased = True
+                break
+        return list(chosen.values()), strategy_used, biased, listing
+
+    def _vx_refill(self, store, strat, chosen, add, n, seed, flt, deadline) -> int:
+        added_total = 0
+        for attempt in range(3):
+            want = n - len(chosen)
+            if want <= 0:
+                break
+            docs, _used = store.sampleChunks(
+                n=want + len(chosen), seed=seed + attempt, strategy=strat, docFilter=flt, include_keys=list(chosen)
+            )
+            added = sum(1 for doc in docs if add(doc))
+            added_total += added
+            if added == 0:
+                break
+            self._vx_check_deadline(deadline)
+        return added_total
+
+    @tool_function(
+        input_schema={
+            'type': 'object',
+            'properties': {
+                'n': {
+                    'type': 'integer',
+                    'description': 'Points wanted (default 1000; at most 2000, 5000 in light mode).',
+                },
+                'seed': {'type': 'integer'},
+                'strategy': {'type': 'string', 'enum': list(SAMPLE_STRATEGIES)},
+                'mode': {'type': 'string', 'enum': ['detailed', 'light']},
+                'include_keys': {'type': 'array', 'items': _KEY_SCHEMA},
+                'filter': {'type': 'object', 'properties': {'object_ids': {'type': ['array', 'null']}}},
+                'deleted': _DELETED_SCHEMA,
+                'knn_k': {'type': 'integer'},
+                'components': {'type': 'integer', 'enum': [2, 3]},
+                'duplicate_threshold': {'type': 'number'},
+                'include_text': {'type': 'boolean'},
+            },
+        },
+        output_schema={
+            'type': 'object',
+            'properties': {
+                **_ENVELOPE,
+                'sample_id': {'type': 'string'},
+                'n': {'type': 'integer'},
+                'points': {'type': 'object'},
+                'knn': {'type': 'object'},
+            },
+        },
+        description=(
+            'Draw a sample of chunks and compute, on the node, a PCA layout, the k-nearest-neighbour graph, '
+            'density, outliers and near-duplicates. Columnar; never returns vectors.'
+        ),
+        audience=('dap',),
+    )
+    @vectordb_tool
+    def sample(self, args):
+        """A map of the collection: sampled points, positions and the neighbour graph."""
+        import numpy as np
+
+        from . import vx_math
+        from .vx_sample_cache import SampleEntry, check_light_budget, make_sample_id
+
+        started = _monotonic()
+        store = self._vx_store()
+        mode = args.get('mode', 'detailed') or 'detailed'
+        if mode not in ('detailed', 'light'):
+            raise _invalid("mode must be 'detailed' or 'light'.")
+        light = mode == 'light'
+        max_n = LIMITS['sample_max_light'] if light else LIMITS['sample_max']
+        n = _int_arg(args, 'n', LIMITS['sample_default'])
+        if n < 1:
+            raise _invalid('n must be 1 or more.')
+        if n > max_n:
+            raise ToolRefusal(
+                'LIMIT_EXCEEDED', f'{"Light" if light else "Detailed"} mode is limited to {max_n} points.'
+            )
+        seed = _int_arg(args, 'seed', 0)
+        strategy = args.get('strategy', 'stratified') or 'stratified'
+        if strategy not in SAMPLE_STRATEGIES:
+            raise _invalid("strategy must be 'stratified', 'random' or 'first'.")
+        pinned: List[Key] = []
+        if args.get('include_keys') is not None:
+            pinned = _keys_arg(args['include_keys'], 'include_keys', LIMITS['project_keys_max'], min_n=0)
+            pinned = [key for key in pinned if key[0] != CONTROL_OBJECT_ID][:n]
+        object_ids = _filter_object_ids(args)
+        deleted = _deleted_arg(args)
+        warnings: List[str] = []
+        k_max = DEFAULTS['knn_k_max_light'] if light else LIMITS['knn_k_max']
+        knn_k = _clamped(
+            _int_arg(args, 'knn_k', DEFAULTS['knn_k_max_light'] if light else DEFAULTS['knn_k']),
+            1,
+            k_max,
+            'knn_k',
+            warnings,
+        )
+        components = _int_arg(args, 'components', 3)
+        if components not in (2, 3):
+            raise _invalid('components must be 2 or 3.')
+        threshold = args.get('duplicate_threshold', DEFAULTS['duplicate_threshold'])
+        if isinstance(threshold, bool) or not isinstance(threshold, (int, float)) or not 0 < float(threshold) <= 1:
+            raise _invalid('duplicate_threshold must be a number above 0 and at most 1.')
+        include_text = False if light else _bool_arg(args, 'include_text', True)
+        dp = 2 if light else 4
+
+        cache = _vx_state(store).samples()
+        with cache.exclusive():
+            if not store._doesCollectionExist():
+                raise ToolRefusal('COLLECTION_MISSING', 'The collection does not exist yet; add a document first.')
+            self._vx_load_control(store)
+            if light and store.vectorSize:
+                check_light_budget(n, int(store.vectorSize))
+            deadline = started + LIMITS['sample_budget_ms'] / 1000.0
+            docs, strategy_used, biased, listing = self._vx_collect_sample(
+                store,
+                n=n,
+                seed=seed,
+                strategy=strategy,
+                pinned=pinned,
+                object_ids=object_ids,
+                deleted=deleted,
+                deadline=deadline,
+            )
+
+            # One dimension: the collection's, else the most common one drawn.
+            lengths = Counter(len(doc.embedding) for doc in docs)
+            dimension = (
+                int(store.vectorSize) if store.vectorSize in lengths else (lengths.most_common(1) or [(0, 0)])[0][0]
+            )
+            docs = [doc for doc in docs if len(doc.embedding) == dimension]
+            if light and dimension:
+                check_light_budget(len(docs), dimension)
+
+            paths: Dict[str, str] = {}
+            for doc in docs:
+                oid = str(metadataValue(doc, 'objectId'))
+                row = listing.get(oid)
+                paths.setdefault(oid, row.path if row is not None else str(metadataValue(doc, 'parent') or ''))
+            doc_order = sorted(paths, key=lambda oid: (paths[oid], oid))
+            doc_index = {oid: i for i, oid in enumerate(doc_order)}
+            docs.sort(key=lambda doc: (doc_index[str(metadataValue(doc, 'objectId'))], docKey(doc)[1]))
+            keys = [docKey(doc) for doc in docs]
+
+            if doc_order and any(oid not in listing for oid in doc_order):
+                try:
+                    page = store.listDocuments(
+                        cursor=None,
+                        limit=min(len(doc_order), LIMITS['documents_page']),
+                        object_ids=doc_order[: LIMITS['documents_page']],
+                        deleted=deleted,
+                        sort='path',
+                    )
+                    for row in page.items:
+                        listing.setdefault(row.objectId, row)
+                except Exception:
+                    pass
+
+            metric = self._vx_metric(store) or 'cosine'
+            V = np.asarray([doc.embedding for doc in docs], dtype=np.float32).reshape(len(docs), dimension)
+            coords, explained, mean, basis = vx_math.pca(V, components)
+            graph = None
+            try:
+                graph = store.knnGraph(keys, V, metric, knn_k)
+            except StoreUnsupported:
+                graph = None
+            if graph is None or len(graph.offsets_row) != len(keys) + 1:
+                offsets, cols, sims = vx_math.knn(metric, V, knn_k)
+                knn_source, graph_k = 'node', max(0, min(knn_k, len(keys) - 1))
+            else:
+                offsets, cols, sims = graph.offsets_row, graph.cols, graph.sims
+                knn_source, graph_k = graph.source if graph.source in ('native', 'node') else 'node', int(graph.k)
+            dens = vx_math.density(offsets, sims)
+            outliers = vx_math.outliers(dens, 1.0) if len(keys) else []
+            duplicates = vx_math.duplicates(offsets, cols, sims, float(threshold))
+            if len(duplicates) > DUPLICATES_MAX:
+                duplicates = duplicates[:DUPLICATES_MAX]
+                warnings.append('duplicates_capped')
+            self._vx_check_deadline(deadline)
+
+            in_sample = Counter(key[0] for key in keys)
+            pinned_set = set(pinned)
+            points: Dict[str, Any] = {
+                'doc': [doc_index[key[0]] for key in keys],
+                'chunk': [key[1] for key in keys],
+                'x': _round_list(coords[:, 0] if components >= 1 and len(keys) else [], dp),
+                'y': _round_list(coords[:, 1] if len(keys) else [], dp),
+            }
+            if components == 3:
+                points['z'] = _round_list(coords[:, 2] if len(keys) else [], dp)
+            points['len'] = [len(doc.page_content or '') for doc in docs]
+            if include_text:
+                points['snip'] = [vx_math.snippet(doc.page_content, LIMITS['snippet_chars']) for doc in docs]
+            points['pinned'] = [1 if key in pinned_set else 0 for key in keys]
+
+            sample_id = make_sample_id(seed, keys)
+            cache.put(
+                SampleEntry(
+                    sample_id=sample_id,
+                    keys=keys,
+                    vectors=V,
+                    mean=mean,
+                    basis=basis,
+                    metric=metric,
+                    dimension=dimension,
+                    mode=mode,
+                    point_ids=[metadataValue(doc, 'pointId') for doc in docs],
+                )
+            )
+
+        of_filter = {'objectIds': object_ids} if object_ids else {}
+        answer = {
+            'success': True,
+            'sample_id': sample_id,
+            'expires_in_s': int(DEFAULTS['sample_cache_ttl_s']),
+            'n': len(keys),
+            'n_requested': n,
+            'mode': mode,
+            'of': {
+                'chunks': self._vx_count(store.countChunks, deletedFilter(deleted, **of_filter)),
+                'documents': self._vx_count(store.countDocuments, deletedFilter(deleted, **of_filter)),
+            },
+            'strategy_used': strategy_used,
+            'biased': biased,
+            'knn_source': knn_source,
+            'metric': metric,
+            'dimension': dimension,
+            'docs': [
+                {
+                    'i': doc_index[oid],
+                    'objectId': oid,
+                    'path': paths[oid],
+                    'chunks': listing[oid].chunks if oid in listing else None,
+                    'in_sample': in_sample[oid],
+                }
+                for oid in doc_order
+            ],
+            'points': points,
+            'knn': {
+                'k': graph_k,
+                'offsets_row': [int(v) for v in offsets],
+                'cols': [int(v) for v in cols],
+                'sims': _round_list(sims, dp),
+            },
+            'density': _round_list(dens, dp),
+            'outliers': outliers,
+            'duplicates': [{'a': a, 'b': b, 'sim': _round(s, 4)} for a, b, s in duplicates],
+            'pca': {'explained': _round_list(explained, 5)},
+            'took_ms': int((_monotonic() - started) * 1000),
+        }
+        if biased:
+            answer['caveats'] = ['biased_sample']
+        if warnings:
+            answer['warnings'] = warnings
+        return answer
+
+    # ------------------------------------------------------------------
+    # project
+    # ------------------------------------------------------------------
+
+    @tool_function(
+        input_schema={
+            'type': 'object',
+            'required': ['sample_id'],
+            'properties': {
+                'sample_id': {'type': 'string'},
+                'vector': {'type': 'array', 'items': {'type': 'number'}},
+                'keys': {'type': 'array', 'items': _KEY_SCHEMA},
+                'm': {'type': 'integer', 'description': 'Nearest sample points per item (default 10).'},
+                'with_similarities': {'type': 'boolean'},
+            },
+        },
+        output_schema={
+            'type': 'object',
+            'properties': {**_ENVELOPE, 'items': {'type': 'array'}, 'dimension': {'type': 'integer'}},
+        },
+        description='Place a query vector or stored chunks on a sample drawn by the sample tool.',
+        audience=('dap',),
+    )
+    @vectordb_tool
+    def project(self, args):
+        """Place a vector, or chunks by key, on a cached sample."""
+        import numpy as np
+
+        from . import vx_math
+
+        store = self._vx_store()
+        sample_id = args.get('sample_id')
+        if not isinstance(sample_id, str) or not sample_id:
+            raise _invalid('sample_id is required.')
+        has_vector = args.get('vector') is not None
+        has_keys = args.get('keys') is not None
+        if has_vector == has_keys:
+            raise _invalid('Give exactly one of vector or keys.')
+        warnings: List[str] = []
+        m = _clamped(_int_arg(args, 'm', 10), 1, LIMITS['neighbors_k_max'], 'm', warnings)
+        with_sims = _bool_arg(args, 'with_similarities', False)
+        cache = _vx_state(store).samples()
+        with cache.exclusive():
+            entry = cache.get(sample_id)
+            if entry is None:
+                raise ToolRefusal(
+                    'SAMPLE_EXPIRED',
+                    'The sample is no longer held by the node (it expires after '
+                    f'{int(DEFAULTS["sample_cache_ttl_s"])} s or when a newer sample replaces it). Draw the sample again.',
+                )
+            not_found: List[List[Any]] = []
+            if has_vector:
+                vector = _vector_arg(args['vector'])
+                if len(vector) != entry.dimension:
+                    raise ToolRefusal(
+                        'DIMENSION_MISMATCH',
+                        f'The vector has {len(vector)} values; this sample holds vectors of {entry.dimension}.',
+                    )
+                rows = [(None, None, np.asarray(vector, dtype=np.float32))]
+            else:
+                keys = _keys_arg(args['keys'], 'keys', LIMITS['project_keys_max'])
+                missing = [key for key in keys if key not in entry.index and key[0] != CONTROL_OBJECT_ID]
+                fetched: Dict[Key, Any] = {}
+                if missing:
+                    try:
+                        for doc in store.getVectors(missing):
+                            key = docKey(doc)
+                            if key in missing and doc.embedding is not None and len(doc.embedding) == entry.dimension:
+                                fetched[key] = np.asarray(doc.embedding, dtype=np.float32)
+                    except StoreUnsupported:
+                        pass
+                rows = []
+                for key in keys:
+                    if key in entry.index:
+                        idx = entry.index[key]
+                        rows.append((key, idx, entry.vectors[idx]))
+                    elif key in fetched:
+                        rows.append((key, None, fetched[key]))
+                    else:
+                        not_found.append([key[0], key[1]])
+                if not rows:
+                    raise ToolRefusal('NOT_FOUND', 'None of those chunks is stored in this collection.')
+            Q = np.vstack([row[2] for row in rows]).astype(np.float32)
+            coords = vx_math.pca_project(Q, entry.mean, entry.basis)
+            S = vx_math.similarity(entry.metric, Q, entry.vectors)
+            items = []
+            for r, (key, idx, _vec) in enumerate(rows):
+                row = S[r].copy()
+                if idx is not None:
+                    row[idx] = -np.inf
+                take = min(m, int(np.isfinite(row).sum()))
+                order = np.lexsort((np.arange(row.size), -row))[:take]
+                items.append(
+                    {
+                        'key': [key[0], key[1]] if key is not None else None,
+                        'in_sample': idx,
+                        'pca': _round_list(coords[r], 4),
+                        'neighbors': [{'i': int(i), 'sim': _round(row[i], 4)} for i in order],
+                    }
+                )
+            answer: Dict[str, Any] = {'success': True, 'items': items}
+            if has_vector and with_sims:
+                answer['similarities'] = _round_list(S[0], 4)
+            answer['dimension'] = entry.dimension
+        if not_found:
+            answer['not_found'] = not_found
+        if warnings:
+            answer['warnings'] = warnings
+        return answer
+
+    # ------------------------------------------------------------------
+    # neighbors
+    # ------------------------------------------------------------------
+
+    def _vx_vectors_for(self, store: Any, keys: Sequence[Key]) -> Dict[Key, Any]:
+        """Vectors for ``keys``: from the latest cached sample where it holds them, else through getVectors."""
+        import numpy as np
+
+        out: Dict[Key, Any] = {}
+        latest = _vx_state(store).samples().latest()
+        if latest is not None:
+            for key in keys:
+                idx = latest.index.get(key)
+                if idx is not None:
+                    out[key] = latest.vectors[idx]
+        missing = [key for key in keys if key not in out and key[0] != CONTROL_OBJECT_ID]
+        if missing:
+            try:
+                for batch in _batches(missing, VECTOR_READ_BATCH):
+                    for doc in store.getVectors(list(batch)):
+                        key = docKey(doc)
+                        if key is not None and doc.embedding is not None and key not in out:
+                            out[key] = np.asarray(doc.embedding, dtype=np.float32)
+            except StoreUnsupported:
+                pass
+        return out
+
+    @tool_function(
+        input_schema={
+            'type': 'object',
+            'properties': {
+                'key': _KEY_SCHEMA,
+                'vector': {'type': 'array', 'items': {'type': 'number'}},
+                'k': {'type': 'integer', 'description': 'Neighbours wanted (default 12, at most 50).'},
+                'exclude_self': {'type': 'boolean'},
+                'filter': {'type': 'object', 'properties': {'object_ids': {'type': ['array', 'null']}}},
+                'scope_keys': {'type': ['array', 'null'], 'items': _KEY_SCHEMA},
+            },
+        },
+        output_schema={
+            'type': 'object',
+            'properties': {**_ENVELOPE, 'items': {'type': 'array'}, 'scores': {'type': 'array'}},
+        },
+        description='Find the stored chunks nearest to a chunk or a vector across the whole collection.',
+        audience=('dap',),
+    )
+    @vectordb_tool
+    def neighbors(self, args):
+        """Nearest chunks of a key or a vector (or its similarities to scope keys)."""
+        import numpy as np
+
+        from . import vx_math
+
+        store = self._vx_store()
+        has_key = args.get('key') is not None
+        has_vector = args.get('vector') is not None
+        if has_key == has_vector:
+            raise _invalid('Give exactly one of key or vector.')
+        warnings: List[str] = []
+        k = _clamped(_int_arg(args, 'k', DEFAULTS['neighbors_k']), 1, LIMITS['neighbors_k_max'], 'k', warnings)
+        exclude_self = _bool_arg(args, 'exclude_self', True)
+        object_ids = _filter_object_ids(args)
+        scope_keys = None
+        if args.get('scope_keys') is not None:
+            scope_keys = _keys_arg(args['scope_keys'], 'scope_keys', LIMITS['scope_keys_max'])
+        state = _vx_state(store)
+        if not state.neighbors_busy.acquire(blocking=False):
+            raise ToolRefusal('BUSY', 'Another neighbour search is running on this store; try again when it ends.')
+        try:
+            if not store._doesCollectionExist():
+                raise ToolRefusal('COLLECTION_MISSING', 'The collection does not exist yet; add a document first.')
+            self._vx_load_control(store)
+            metric = self._vx_metric(store) or 'cosine'
+            self_key: Optional[Key] = None
+            if has_key:
+                self_key = _key_arg(args['key'], 'key')
+                vectors = self._vx_vectors_for(store, [self_key]) if self_key[0] != CONTROL_OBJECT_ID else {}
+                if self_key not in vectors:
+                    raise ToolRefusal('NOT_FOUND', 'That chunk is not stored in this collection.')
+                query = np.asarray(vectors[self_key], dtype=np.float32)
+            else:
+                query = np.asarray(_vector_arg(args['vector']), dtype=np.float32)
+                if store.vectorSize and query.size != int(store.vectorSize):
+                    raise ToolRefusal(
+                        'DIMENSION_MISMATCH',
+                        f'The vector has {query.size} values; this collection stores {int(store.vectorSize)}.',
+                    )
+
+            if scope_keys is not None:
+                found = self._vx_vectors_for(store, scope_keys)
+                present = [key for key in scope_keys if key in found]
+                scores: Dict[Key, float] = {}
+                if present:
+                    S = vx_math.similarity(metric, query, np.vstack([found[key] for key in present]))
+                    scores = {key: float(S[0, i]) for i, key in enumerate(present)}
+                return {'success': True, 'scores': [_round(scores.get(key), 4) for key in scope_keys]}
+
+            flt = deletedFilter('active', objectIds=object_ids, limit=k + (1 if self_key and exclude_self else 0))
+            flt.minScore = float('-inf')
+            question = QuestionText(
+                text='', embedding=[float(v) for v in query], embedding_model=store.modelName or None
+            )
+            hits = [
+                doc for doc in store.searchSemantic(question, flt) if (docKey(doc) or ('', 0))[0] != CONTROL_OBJECT_ID
+            ]
+            if self_key is not None and exclude_self:
+                hits = [doc for doc in hits if docKey(doc) != self_key]
+            hit_keys = [docKey(doc) for doc in hits]
+            hit_vectors = self._vx_vectors_for(store, [key for key in hit_keys if key is not None])
+            floor = float(self._vx_score(store)['floor'] or 0.0)
+            items = []
+            for doc, key in zip(hits, hit_keys):
+                if key is None:
+                    continue
+                score = doc.score if isinstance(doc.score, (int, float)) else None
+                if key in hit_vectors:
+                    sim = float(vx_math.similarity(metric, query, hit_vectors[key])[0, 0])
+                else:
+                    sim = float(score) if score is not None else None
+                items.append(
+                    {
+                        'key': [key[0], key[1]],
+                        'sim': _round(sim, 4),
+                        'score': _round(score, 4),
+                        'below_floor': score is not None and score < floor,
+                        'path': str(metadataValue(doc, 'parent') or ''),
+                        'chunkId': key[1],
+                        'preview': vx_math.snippet(doc.page_content, LIMITS['snippet_chars']),
+                    }
+                )
+            items.sort(key=lambda item: -(item['sim'] if item['sim'] is not None else -math.inf))
+            answer = {
+                'success': True,
+                'items': items[:k],
+                'metric': metric,
+                'scope': 'collection',
+                'k_requested': k,
+            }
+            if warnings:
+                answer['warnings'] = warnings
+            return answer
+        finally:
+            state.neighbors_busy.release()
+
+    # ------------------------------------------------------------------
+    # remove_document
+    # ------------------------------------------------------------------
+
+    @tool_function(
+        input_schema={
+            'type': 'object',
+            'required': ['object_ids'],
+            'properties': {
+                'object_ids': {
+                    'type': 'array',
+                    'items': {'type': 'string'},
+                    'minItems': 1,
+                    'maxItems': 100,
+                    'description': 'Documents to remove, every chunk of each.',
+                }
+            },
+        },
+        output_schema={
+            'type': 'object',
+            'properties': {
+                **_ENVELOPE,
+                'removed': {'type': 'array'},
+                'not_found': {'type': 'array', 'items': {'type': 'string'}},
+                'removed_chunks': {'type': ['integer', 'null']},
+                'audit': {'type': 'object'},
+            },
+        },
+        description='Remove documents (every chunk of each) and report the rows removed. Gated by allow_writes.',
+        audience=('dap',),
+    )
+    @vectordb_tool
+    def remove_document(self, args):
+        """Remove whole documents by objectId (gated)."""
+        store = self._vx_store()
+        ids = _strings_arg(args.get('object_ids'), 'object_ids', LIMITS['write_ids_max'])
+        decision = vx_write_gate.check_write(
+            'remove_document',
+            object_ids=ids,
+            allow_writes=self._vx_allow_writes(),
+            agent_writes=self._vx_agent_writes(),
+        )
+        removed, not_found, rows = self._vx_remove(store, ids)
+        self._vx_log_write('vector.remove_document', ids, rows, decision.origin)
+        return {
+            'success': True,
+            'removed': removed,
+            'not_found': not_found,
+            'removed_chunks': rows,
+            'audit': self._vx_audit('vector.remove_document', store, ids, rows, decision),
+        }
+
+
+__all__ = [
+    'CONTRACT_VERSION',
+    'MAX_ANSWER_BYTES',
+    'VectorExplorerTools',
+    'decodeCursor',
+    'deletedFilter',
+    'docKey',
+    'documentRow',
+    'encodeCursor',
+    'finish_answer',
+    'jsonable',
+    'matchesDeleted',
+    'metadataValue',
+    'normalize_tool_input',
+    'safe_error',
+    'safe_error_text',
+    'vectordb_tool',
+]
