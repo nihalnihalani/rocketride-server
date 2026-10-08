@@ -99,7 +99,7 @@ and disables text queries on the map, with the reason, when nothing reaches it.
 | Folder | What is in it |
 | --- | --- |
 | `adapters/` | The one seam to the shared library and the shell: provider list, tool names, the endpoint store with its roles and node filter, history, the announcer, the per-connection request channel for `neighbors` |
-| `contract/` | Frozen wire types and the selection bridge (lead-owned; see "Changing the contract") |
+| `contract/` | The wire types and the selection bridge, changed only together with the contract (see [Changing the contract](#changing-the-contract)) |
 | `vector/` | Pure modules tested under `node:test`: addresses, connections, stats, the document tree and its background pager, pure-JS SHA-1 and the uuid5 objectId, file types, upload batching, chat results, retrieval, safe markdown, wording, colours, support levels, identity changes, budgets, panel ratios |
 | `map/` | Renderer (WebGL points with a Canvas2D fallback), camera, picking, lasso, the layouts and their worker, the layout-quality metric, query projection |
 | `chat/`, `ingest/` | The chat and upload hooks and the folder-drop traversal |
@@ -226,8 +226,8 @@ images and the local ports are in the acceptance
 | --- | --- | --- |
 | `apps/vector-ui/tests/fixtures/provisional/` | One hand-written answer per tool and case, including the error envelopes | By hand, from the contract |
 | `apps/vector-ui/tests/fixtures/v1/live/<backend>/` | Answers captured from the live drivers, on a new and a legacy collection, scrubbed of volatile values | `nodes/test/vector_wire_fixtures.py`; `test_vector_wire_fixtures_full.py` regenerates and compares |
-| `sample_*.json` among the provisional fixtures | Seeded synthetic `sample` answers for the map's tests | `tests/fixtures/gen_sample.ts` (`--check` verifies them) |
-| `defaults.json` | The write defaults and tool limits | `scripts/gen_defaults.py` (`--check`) |
+| `sample_*.json` among the provisional fixtures | Seeded synthetic `sample` answers for the map's tests | `apps/vector-ui/tests/fixtures/gen_sample.ts` (`--check` verifies them) |
+| `defaults.json` | The write defaults and tool limits | `apps/vector-ui/scripts/gen_defaults.py` (`--check`) |
 | `chunking.json` | The chunker settings every template carries | The chunking calibration run |
 
 Regenerate the live captures only against the pinned container images: they
