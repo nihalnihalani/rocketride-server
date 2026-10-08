@@ -62,6 +62,46 @@ class SummaryTests(unittest.TestCase):
         self.assertFalse(cal.setting_ignored({'1000': dict(same)}))
 
 
+# The keyword filter preprocessor_langchain had when the calibration was made, and one that walks the MRO.
+FILTER_OWN_INIT = """
+class Node:
+    def _filter_kwargs_for(self, cls, kwargs: Dict[str, Any]) -> Dict[str, Any]:
+        params = set(inspect.signature(cls.__init__).parameters.keys())
+        params.discard('self')
+        return {k: v for k, v in kwargs.items() if k in params}
+"""
+FILTER_MRO = """
+class Node:
+    def _filter_kwargs_for(self, cls, kwargs: Dict[str, Any]) -> Dict[str, Any]:
+        params = set()
+        for klass in cls.__mro__:
+            if '__init__' in vars(klass):
+                params |= set(inspect.signature(klass.__init__).parameters)
+        params -= {'self', 'args', 'kwargs'}
+        return {k: v for k, v in kwargs.items() if k in params}
+"""
+
+
+class NodeProbeTests(unittest.TestCase):
+    """node_passes_chunk_size runs the node's own keyword filter against LangChain's splitter."""
+
+    def setUp(self):
+        if cal.node_splitter_kwargs({}) is None:
+            self.skipTest('NOT RUN: langchain_text_splitters is not importable here (run with the engine python)')
+
+    def test_a_filter_on_the_splitters_own_init_drops_the_length(self):
+        kept = cal.node_splitter_kwargs({'chunk_size': 1000, 'chunk_overlap': 200, 'separators': None}, FILTER_OWN_INIT)
+        self.assertEqual(kept, {'separators': None})
+
+    def test_a_filter_over_the_mro_keeps_it(self):
+        kept = cal.node_splitter_kwargs({'chunk_size': 1000, 'chunk_overlap': 200, 'separators': None}, FILTER_MRO)
+        self.assertEqual(kept, {'chunk_size': 1000, 'chunk_overlap': 200, 'separators': None})
+
+    def test_a_node_without_the_filter_is_reported(self):
+        with self.assertRaises(RuntimeError):
+            cal.node_splitter_kwargs({'chunk_size': 1000}, 'class Node:\n    pass\n')
+
+
 class WriterTests(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
@@ -93,12 +133,39 @@ class WriterTests(unittest.TestCase):
             # The template formatting is kept (2-space JSON, trailing newline).
             self.assertEqual(path.read_text(encoding='utf-8'), json.dumps(pipe, indent=2) + '\n')
 
-    def test_write_keeps_a_recorded_known_issue(self):
-        record = json.loads(self.chunking.read_text(encoding='utf-8'))
-        record['known_issue'] = 'kept across rewrites'
-        self.chunking.write_text(json.dumps(record, indent='\t') + '\n', encoding='utf-8')
-        cal.write_choice(1000, {'median_chars': 806}, {}, '40 documents')
-        self.assertEqual(json.loads(self.chunking.read_text(encoding='utf-8'))['known_issue'], 'kept across rewrites')
+    def _write_with_node(self, passes: bool) -> dict:
+        saved = cal.node_passes_chunk_size
+        cal.node_passes_chunk_size = lambda: passes
+        try:
+            cal.write_choice(1000, {'median_chars': 806}, {}, '40 documents')
+        finally:
+            cal.node_passes_chunk_size = saved
+        return json.loads(self.chunking.read_text(encoding='utf-8'))
+
+    def test_write_records_that_the_setting_has_no_effect_while_the_node_drops_it(self):
+        record = self._write_with_node(False)
+        self.assertIs(record['effective'], False)
+        self.assertEqual(record['known_issue'], cal.KNOWN_ISSUE)
+        for path in sorted(self.templates.glob('*.pipe')):
+            self.assertIn(cal.chunk_sentence(record), _annotation(path), path.name)
+            self.assertIn('until it does', cal.chunk_sentence(record))
+
+    def test_write_drops_the_known_issue_once_the_node_passes_the_length(self):
+        record = self._write_with_node(True)
+        self.assertIs(record['effective'], True)
+        self.assertNotIn('known_issue', record)
+        for path in sorted(self.templates.glob('*.pipe')):
+            text = _annotation(path)
+            self.assertIn(cal.chunk_sentence(record), text, path.name)
+            # Exactly one chunk paragraph, whatever was there before.
+            self.assertEqual(sum(1 for p in text.split('\n\n') if p.startswith('`chunk_1`')), 1, path.name)
+
+
+def _annotation(path: Path) -> str:
+    """The text of a template's "Read this first" note."""
+    pipe = json.loads(path.read_text(encoding='utf-8'))
+    (note,) = [c for c in pipe['components'] if c['id'] == 'annotation_1']
+    return note['config']['content']
 
 
 class CommittedTemplatesTests(unittest.TestCase):
@@ -117,6 +184,24 @@ class CommittedTemplatesTests(unittest.TestCase):
             (chunker,) = [c for c in pipe['components'] if c['id'] == 'chunk_1']
             self.assertEqual(chunker['provider'], record['chunk_1']['provider'], path.name)
             self.assertEqual(chunker['config'], record['chunk_1']['config'], path.name)
+
+    def test_effective_says_whether_the_node_passes_the_length_to_its_splitter(self):
+        """chunking.json must not claim an effect the chunker node does not have (and must say so once it does)."""
+        passes = cal.node_passes_chunk_size()
+        if passes is None:
+            self.skipTest('NOT RUN: langchain_text_splitters is not importable here (run with the engine python)')
+        record = json.loads(CHUNKING.read_text(encoding='utf-8'))
+        self.assertIs(
+            record.get('effective'),
+            passes,
+            'chunking.json "effective" disagrees with preprocessor_langchain: run calibrate_chunking.py --sync',
+        )
+        self.assertEqual('known_issue' in record, not passes)
+
+    def test_every_template_says_what_the_chunker_does(self):
+        record = json.loads(CHUNKING.read_text(encoding='utf-8'))
+        for path in sorted(TEMPLATES.glob('*.pipe')):
+            self.assertIn(cal.chunk_sentence(record), _annotation(path), path.name)
 
 
 if __name__ == '__main__':

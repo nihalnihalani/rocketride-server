@@ -18,16 +18,25 @@ Prints one JSON report. With ``--write`` it records the chosen candidate in
 ``apps/vector-ui/tests/fixtures/chunking.json`` (``calibrated: true`` plus the
 measurement) and puts its ``chunk_1`` configuration into all nine templates.
 
+Whether the setting takes effect is a property of the chunker node, not of
+the measurement: ``effective`` in chunking.json is read from the node's own
+keyword filter (``node_passes_chunk_size``), and the templates' note says what
+the chunker does today. ``--sync`` re-reads the node and updates both without
+measuring (no engine needed), e.g. once the node passes the length through.
+
 Usage (from dist/server):
   ./engine <this folder>/calibrate_chunking.py [--strlen 512,800,1000] [--write N]
+  ./engine <this folder>/calibrate_chunking.py --sync
 Settings: ENGINE_URL, RR_TEST_APIKEY (see README.md).
 """
 
 from __future__ import annotations
 
 import argparse
+import ast
 import asyncio
 import importlib.util
+import inspect
 import json
 import os
 import statistics
@@ -36,18 +45,74 @@ import tempfile
 import uuid
 
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[2]
 TEMPLATES = REPO / 'apps' / 'vector-ui' / 'templates'
 CHUNKING = REPO / 'apps' / 'vector-ui' / 'tests' / 'fixtures' / 'chunking.json'
+NODE = REPO / 'nodes' / 'src' / 'nodes' / 'preprocessor_langchain' / 'langchain.py'
 
 ENGINE_URL = os.environ.get('ENGINE_URL', 'http://127.0.0.1:5590')
 API_KEY = os.environ.get('RR_TEST_APIKEY', 'local-acceptance-key')
 
 TARGET = (400, 1200)
 DEFAULT_CANDIDATES = (512, 800, 1000, 1200)
+
+
+KNOWN_ISSUE = (
+    "preprocessor_langchain filters the splitter's keyword arguments by the splitter class's own __init__ "
+    "signature, which drops chunk_size, chunk_overlap and length_function (LangChain's splitters take them "
+    "through **kwargs). Until the node passes them through, every chunk is up to LangChain's 4,000-character "
+    'default whatever strlen says: on the demo corpus 81 chunks, median 3,409 characters, identical at strlen '
+    "200, 512 and 1,000. The measurement in 'measured' and 'candidates' was taken with the node passing "
+    "chunk_size to the splitter; the templates' value takes effect once it does."
+)
+
+
+def node_splitter_kwargs(kwargs: Dict[str, Any], node_source: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """What preprocessor_langchain's own keyword filter keeps of ``kwargs`` for RecursiveCharacterTextSplitter.
+
+    The node's ``_filter_kwargs_for`` is taken from its source (``node_source``,
+    default the node file) and run here against LangChain's splitter, so the
+    answer follows the node as it changes. None when LangChain's splitters are
+    not importable; RuntimeError when the node has no such filter.
+    """
+    try:
+        import langchain_text_splitters
+    except ImportError:
+        return None
+    source = NODE.read_text(encoding='utf-8') if node_source is None else node_source
+    found = [
+        n for n in ast.walk(ast.parse(source)) if isinstance(n, ast.FunctionDef) and n.name == '_filter_kwargs_for'
+    ]
+    if len(found) != 1:
+        raise RuntimeError(f'{NODE.name}: expected one _filter_kwargs_for, found {len(found)}')
+    namespace: Dict[str, Any] = {'inspect': inspect, 'Dict': Dict, 'Any': Any}
+    exec(compile(ast.Module(body=found, type_ignores=[]), str(NODE), 'exec'), namespace)  # noqa: S102 - the repo's own node code
+    return namespace['_filter_kwargs_for'](None, langchain_text_splitters.RecursiveCharacterTextSplitter, dict(kwargs))
+
+
+def node_passes_chunk_size() -> Optional[bool]:
+    """True when the chunker node hands the template's length to its splitter (None without LangChain)."""
+    kept = node_splitter_kwargs({'chunk_size': 1000, 'chunk_overlap': 200, 'length_function': len})
+    return None if kept is None else 'chunk_size' in kept
+
+
+def chunk_sentence(record: Dict[str, Any]) -> str:
+    """The templates' note on chunk_1, true for what the chunker node does with the setting."""
+    strlen = record['chunk_1']['config']['default']['strlen']
+    median = int(round(record['measured']['median_chars'], -2))
+    if record.get('effective'):
+        return (
+            f'`chunk_1` cuts text into chunks of at most {strlen:,} characters (`strlen`); on mixed documents that '
+            f'gives a median chunk of about {median:,} characters, small enough for precise answers and a readable map.'
+        )
+    return (
+        f'`chunk_1` asks for chunks of at most {strlen:,} characters (`strlen`), which on mixed documents gives a '
+        f'median chunk of about {median:,} characters. The chunker node does not pass `strlen` on to its splitter '
+        'yet, so chunks run up to about 4,000 characters until it does.'
+    )
 
 
 def chunk_config(strlen: int) -> Dict[str, Any]:
@@ -144,34 +209,56 @@ async def measure(client, files: List[Path], root: Path, strlen: int) -> Dict[st
         await client.terminate(task['token'])
 
 
-def write_choice(strlen: int, summary: Dict[str, Any], candidates: Dict[str, Any], corpus_note: str) -> None:
-    """Record the chosen candidate in chunking.json and every template's chunk_1.
+def _with_chunk_sentence(content: str, sentence: str) -> str:
+    """A template note with its chunk_1 paragraph replaced by ``sentence`` (appended when there is none)."""
+    paragraphs = [p for p in content.split('\n\n') if not p.startswith('`chunk_1`')]
+    return '\n\n'.join(paragraphs + [sentence])
 
-    A ``known_issue`` already recorded in chunking.json is kept.
+
+def sync(record: Dict[str, Any]) -> Dict[str, Any]:
+    """Record what the chunker node does with the setting, and put record's chunk_1 and note into every template.
+
+    ``effective`` says whether the node hands the length to its splitter (read
+    from the node's code, not from the measurement, which may have been taken
+    with the node patched); ``known_issue`` is kept exactly while it does not.
     """
-    config = chunk_config(strlen)
-    previous = json.loads(CHUNKING.read_text(encoding='utf-8')) if CHUNKING.exists() else {}
-    record = {
-        'calibrated': True,
-        'note': (
-            'Measured by scripts/acceptance/vector-explorer/calibrate_chunking.py on the demo corpus '
-            f'({corpus_note}); the design asks for a median chunk of {TARGET[0]}-{TARGET[1]:,} characters. '
-            'Every template carries this chunk_1 configuration.'
-        ),
-        'target_median_chars': list(TARGET),
-        'measured': summary,
-        'candidates': candidates,
-        'chunk_1': {'provider': 'preprocessor_langchain', 'config': config},
-    }
-    if 'known_issue' in previous:
-        record['known_issue'] = previous['known_issue']
-    CHUNKING.write_text(json.dumps(record, indent='\t') + '\n', encoding='utf-8')
+    passes = node_passes_chunk_size()
+    if passes is None:
+        raise RuntimeError('langchain_text_splitters is not importable: run this with the engine python')
+    out = {k: v for k, v in record.items() if k not in ('effective', 'known_issue')}
+    out['effective'] = passes
+    if not passes:
+        out['known_issue'] = KNOWN_ISSUE
+    CHUNKING.write_text(json.dumps(out, indent='\t') + '\n', encoding='utf-8')
+    sentence = chunk_sentence(out)
     for template in sorted(TEMPLATES.glob('*.pipe')):
         pipe = json.loads(template.read_text(encoding='utf-8'))
         (chunker,) = [c for c in pipe['components'] if c['id'] == 'chunk_1']
-        chunker['provider'] = 'preprocessor_langchain'
-        chunker['config'] = config
+        chunker['provider'] = out['chunk_1']['provider']
+        chunker['config'] = out['chunk_1']['config']
+        for note in (c for c in pipe['components'] if c['id'] == 'annotation_1'):
+            note['config']['content'] = _with_chunk_sentence(note['config']['content'], sentence)
         template.write_text(json.dumps(pipe, indent=2) + '\n', encoding='utf-8')
+    return out
+
+
+def write_choice(strlen: int, summary: Dict[str, Any], candidates: Dict[str, Any], corpus_note: str) -> None:
+    """Record the chosen candidate in chunking.json and every template's chunk_1 and note."""
+    sync(
+        {
+            'calibrated': True,
+            'note': (
+                'Measured by scripts/acceptance/vector-explorer/calibrate_chunking.py on the demo corpus '
+                f'({corpus_note}); the design asks for a median chunk of {TARGET[0]}-{TARGET[1]:,} characters. '
+                'Every template carries this chunk_1 configuration. "effective" says whether the chunker node '
+                'passes it to its splitter (calibrate_chunking.py --sync keeps it current).'
+            ),
+            'target_median_chars': list(TARGET),
+            'measured': summary,
+            'candidates': candidates,
+            'chunk_1': {'provider': 'preprocessor_langchain', 'config': chunk_config(strlen)},
+        }
+    )
 
 
 def _load_corpus_module():
@@ -188,7 +275,16 @@ async def main() -> int:
     parser = argparse.ArgumentParser(description='Measure chunk sizes for the Vector Explorer templates (G0-6).')
     parser.add_argument('--strlen', default=','.join(map(str, DEFAULT_CANDIDATES)))
     parser.add_argument('--write', type=int, default=None, help='record this candidate (must be in target)')
+    parser.add_argument(
+        '--sync',
+        action='store_true',
+        help='no measurement: re-read the chunker node and update "effective", the known issue and the templates',
+    )
     args = parser.parse_args()
+    if args.sync:
+        record = sync(json.loads(CHUNKING.read_text(encoding='utf-8')))
+        print(f'effective: {record["effective"]}; {len(list(TEMPLATES.glob("*.pipe")))} templates updated')
+        return 0
     candidates = [int(x) for x in args.strlen.split(',') if x.strip()]
 
     corpus = _load_corpus_module()
