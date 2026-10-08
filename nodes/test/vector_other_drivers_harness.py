@@ -311,18 +311,23 @@ def find_case_expectation_failures(documents: List[Doc], expect: Dict[str, Any])
     if expect.get('notEmpty') and not rows:
         failures.append('documents empty')
     needle = expect.get('contains')
-    if needle is not None and not any(needle in (row.get('page_content') or '') for row in rows):
-        failures.append(f'no document contains {needle!r}')
+    # As nodes/test/framework/expectations.py: content matchers read the lane's content path, [0].page_content
+    if needle is not None and (not rows or needle not in (rows[0].get('page_content') or '')):
+        failures.append(f'[0].page_content does not contain {needle!r}')
     props = expect.get('property') or []
     if isinstance(props, dict):
         props = [props]
     for prop in props:
         path = prop['path']
         value: Any = rows
-        for part in path.replace('[', '.').replace(']', '').split('.'):
-            if part == '':
-                continue
-            value = value[int(part)] if part.isdigit() else value.get(part)
+        try:
+            for part in path.replace('[', '.').replace(']', '').split('.'):
+                if part == '':
+                    continue
+                value = value[int(part)] if part.isdigit() else value.get(part)
+        except (IndexError, KeyError, AttributeError, TypeError):
+            failures.append(f'{path} is missing')
+            continue
         if 'greaterThan' in prop and not value > prop['greaterThan']:
             failures.append(f'{path}={value} not > {prop["greaterThan"]}')
         if 'greaterThanOrEqual' in prop and not value >= prop['greaterThanOrEqual']:
