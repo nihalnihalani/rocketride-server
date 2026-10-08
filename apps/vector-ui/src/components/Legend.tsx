@@ -21,39 +21,74 @@
 // SOFTWARE.
 
 // =============================================================================
-// VECTOR-UI — Legend (placeholder)
+// VECTOR-UI — Legend (what the map's colours and marks mean, and what it shows)
 // =============================================================================
 //
-// Placeholder until the real component lands: it exports the frozen props
-// (src/contract/types.ts) and renders a framed "Not built yet" notice, so the
-// files that render it compile and run today. Keep the export names and the
-// props type when replacing it.
+// Names every colour (colour is never the only carrier), states the sample line
+// and the point cap of the mode, who computed the neighbour graph ("neighbour
+// graph computed by Qdrant" when the store did it natively) and the caveat that
+// 2D distances are approximate while ranks and scores are exact.
 // =============================================================================
 
 import React from 'react';
-import { EmptyState } from 'shell';
-import type { LegendProps } from '../contract/types';
+import type { LegendProps as ContractLegendProps } from '../contract/types';
+import type { IColouring } from '../map/colours';
+import { MAP_STYLES } from '../map/styles';
+import { DISTANCE_CAVEAT, biasedNote, knnSourceLine, num, pointCapLine, sampleLabel } from '../map/wording';
 
-export type { LegendProps };
-
-/** Dashed frame that marks the placeholder on screen. */
-const FRAME: React.CSSProperties = {
-	border: '1px dashed var(--rr-border-input)',
-	borderRadius: 6,
-	padding: 12,
-};
+/** Legend props: the frozen ones plus what the map computed. */
+export interface LegendProps extends ContractLegendProps {
+	/** The current colouring (legend rows, ramp, note), when there is one. */
+	colouring?: IColouring | null;
+	/** Extra lines (query placement, layout notes). */
+	notes?: readonly string[];
+}
 
 /**
- * Placeholder for the legend of the point map.
+ * The map legend.
  *
- * @param _props - The frozen props (unused until the component is built).
- * @returns A framed "Not built yet" notice.
+ * @param props - Sample, colour mode, point cap, backend, colouring.
+ * @returns The legend.
  */
-export function Legend(_props: LegendProps): React.ReactElement {
+export function Legend(props: LegendProps): React.ReactElement {
+	const sample = props.sample.result;
+	const colouring = props.colouring ?? null;
+	const bias = biasedNote(sample);
+	const rampStyle: React.CSSProperties | null = colouring?.ramp ? { height: 10, borderRadius: 3, background: `linear-gradient(to right, ${colouring.ramp.stops.join(', ')})`, margin: '4px 0' } : null;
 	return (
-		<div style={FRAME} data-placeholder="Legend">
-			<EmptyState title="Not built yet" description="The map legend will appear here." />
-		</div>
+		<section aria-label="Map legend" style={MAP_STYLES.legend} data-knn-source={sample.knn_source} data-colour-by={props.colourBy}>
+			<p style={MAP_STYLES.note}>{sampleLabel(sample)}</p>
+			{bias ? <p style={MAP_STYLES.note}>{bias}</p> : null}
+			{colouring && colouring.legend.length > 0 ? (
+				<ul aria-label="Colours" style={{ ...MAP_STYLES.list, display: 'flex', flexWrap: 'wrap', gap: '2px 14px', margin: '4px 0' }}>
+					{colouring.legend.map((entry) => (
+						<li key={entry.key} style={{ ...MAP_STYLES.small, display: 'inline-flex', alignItems: 'center' }}>
+							<span aria-hidden="true" style={MAP_STYLES.swatch(entry.colour, entry.outlined)} />
+							<span>{entry.label}</span>
+							<span style={{ marginLeft: 4 }}>({num(entry.count)})</span>
+						</li>
+					))}
+				</ul>
+			) : null}
+			{colouring?.ramp && rampStyle ? (
+				<div role="img" aria-label={`Colour ramp from ${colouring.ramp.low} to ${colouring.ramp.high}`} style={{ maxWidth: 320 }}>
+					<div style={rampStyle} />
+					<div style={{ ...MAP_STYLES.small, display: 'flex', justifyContent: 'space-between' }}>
+						<span>{colouring.ramp.low}</span>
+						<span>{colouring.ramp.high}</span>
+					</div>
+				</div>
+			) : null}
+			{colouring?.note ? <p style={MAP_STYLES.note}>{colouring.note}</p> : null}
+			<p style={MAP_STYLES.note}>
+				{pointCapLine(sample.mode, props.pointCap)} · {knnSourceLine(sample, props.backend)} · {DISTANCE_CAVEAT}
+			</p>
+			{(props.notes ?? []).map((line) => (
+				<p key={line} style={MAP_STYLES.note}>
+					{line}
+				</p>
+			))}
+		</section>
 	);
 }
 

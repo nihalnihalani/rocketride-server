@@ -21,39 +21,67 @@
 // SOFTWARE.
 
 // =============================================================================
-// VECTOR-UI — DuplicatesPanel (placeholder)
+// VECTOR-UI — DuplicatesPanel (near-duplicate pairs the node found in the sample)
 // =============================================================================
 //
-// Placeholder until the real component lands: it exports the frozen props
-// (src/contract/types.ts) and renders a framed "Not built yet" notice, so the
-// files that render it compile and run today. Keep the export names and the
-// props type when replacing it.
+// Pairs of sample points whose similarity is at or above the sample's
+// duplicate threshold (0.97 by default), as the node computed them. "Show"
+// highlights the pair on the map; "Remove" asks the console to remove one
+// document (the console confirms; the control is gated like every write).
 // =============================================================================
 
 import React from 'react';
-import { EmptyState } from 'shell';
-import type { DuplicatesPanelProps } from '../contract/types';
+import type { DuplicatesPanelProps as ContractDuplicatesPanelProps } from '../contract/types';
+import { documentOf, pointKey } from '../map/model';
+import { MAP_STYLES } from '../map/styles';
 
-export type { DuplicatesPanelProps };
+/** Props (frozen). */
+export type DuplicatesPanelProps = ContractDuplicatesPanelProps;
 
-/** Dashed frame that marks the placeholder on screen. */
-const FRAME: React.CSSProperties = {
-	border: '1px dashed var(--rr-border-input)',
-	borderRadius: 6,
-	padding: 12,
-};
+/** The last path segment. */
+function base(path: string): string {
+	const cut = Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\'));
+	return cut >= 0 ? path.slice(cut + 1) : path;
+}
 
 /**
- * Placeholder for the near-duplicate chunks of the sample.
+ * The duplicates panel.
  *
- * @param _props - The frozen props (unused until the component is built).
- * @returns A framed "Not built yet" notice.
+ * @param props - Sample, write availability, handlers.
+ * @returns A list of pairs.
  */
-export function DuplicatesPanel(_props: DuplicatesPanelProps): React.ReactElement {
+export function DuplicatesPanel(props: DuplicatesPanelProps): React.ReactElement {
+	const result = props.sample.result;
+	const removed = new Set(props.sample.removed);
+	if (result.duplicates.length === 0) return <p style={MAP_STYLES.note}>No near-duplicate pairs at similarity 0.97 or above in this sample.</p>;
 	return (
-		<div style={FRAME} data-placeholder="DuplicatesPanel">
-			<EmptyState title="Not built yet" description="Near-duplicate chunks in the sample will appear here." />
-		</div>
+		<>
+			<p style={MAP_STYLES.note}>Pairs of chunks that are nearly the same text, by the store&apos;s own similarity. The same file stored under two paths shows up here.</p>
+			<ul aria-label="Near-duplicate pairs" style={MAP_STYLES.list}>
+				{result.duplicates.map((pair) => {
+					const a = documentOf(result, pair.a);
+					const b = documentOf(result, pair.b);
+					const [objectB] = pointKey(result, pair.b);
+					const pathB = b?.path ?? objectB;
+					return (
+						<li key={`${pair.a}-${pair.b}`} style={MAP_STYLES.row}>
+							<div style={MAP_STYLES.small}>
+								{a?.path ?? '?'} #{result.points.chunk[pair.a]} ↔ {pathB} #{result.points.chunk[pair.b]} · similarity {pair.sim.toFixed(4)}
+							</div>
+							<div style={{ display: 'flex', gap: 6, marginTop: 4 }}>
+								<button type="button" style={MAP_STYLES.button} onClick={() => props.onSelect([pair.a, pair.b])}>
+									Show
+								</button>
+								<button type="button" style={MAP_STYLES.button} disabled={!props.writes.enabled || removed.has(objectB)} title={props.writes.enabled ? undefined : (props.writes.reason ?? undefined)} onClick={() => props.onRemoveDocument(objectB)}>
+									Remove {base(pathB)}
+								</button>
+							</div>
+						</li>
+					);
+				})}
+			</ul>
+			{!props.writes.enabled && props.writes.reason ? <p style={MAP_STYLES.note}>{props.writes.reason}</p> : null}
+		</>
 	);
 }
 
