@@ -260,27 +260,70 @@ def normalize_tool_input(input_obj: Any) -> Dict[str, Any]:
     return input_obj
 
 
+#: Last labels of DNS names the scrubber treats as host names (``db.internal``, ``x.pinecone.io``);
+#: a short list, so file and module names (``postgres.py``, ``ai.common.store``) survive.
+_HOST_SUFFIXES = 'com|net|org|io|ai|cloud|internal|localdomain|lan|svc|dev|co|tech|xyz|info|biz'
+
+#: Words that name an identity a backend quotes in its messages (``for user "x"``, ``database "y"``).
+_QUOTED_IDENTITIES = 'user|role|database|relation|schema|tenant|keyspace|namespace'
+
+#: ``key=value`` / ``key: value`` pairs whose value is never shown.
+_SECRET_KEYS = (
+    'password|passwd|pwd|sslpassword|passfile|user|username|role|host|hostaddr|port|dbname|database|tenant'
+    '|apikey|api_key|api-key|x-api-key|access_token|token|secret|authorization|sslkey|sslcert|sslrootcert'
+)
+
 _SCRUB = (
+    # URLs and DSNs: scheme://..., user:password@host[:port][/path], user@host
     (re.compile(r'\b[a-zA-Z][a-zA-Z0-9+.\-]*://[^\s\'"<>]+'), '<url>'),
+    (re.compile(r'\b[\w.%+-]+:[^\s@/]*@[\w.\-\[\]:%]+(?:/[^\s\'"<>)]*)?'), '<dsn>'),
+    (re.compile(r'\b[\w.%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+(?::\d+)?(?:/[^\s\'"<>)]*)?'), '<dsn>'),
+    # credentials
+    (re.compile(r'\b(bearer|basic)\s+[\w.~+/=-]+', re.IGNORECASE), r'\1 <redacted>'),
     (
-        re.compile(
-            r'\b(password|passwd|pwd|user|username|host|hostaddr|port|dbname|database|apikey|api_key|token|secret'
-            r'|sslkey|sslcert|sslrootcert)\s*=\s*[^\s,;)]+',
-            re.IGNORECASE,
-        ),
+        re.compile(rf'\b({_SECRET_KEYS})\s*[=:]\s*(?:"[^"]*"|\'[^\']*\'|[^\s,;)]+)', re.IGNORECASE),
         r'\1=<redacted>',
     ),
-    (re.compile(r'\b(server at|host name|host|on socket|socket)\s+"[^"]*"', re.IGNORECASE), r'\1 <host>'),
+    (
+        re.compile(
+            r'\b(api[ _-]?key|access[ _-]?key|secret[ _-]?key)\s+'
+            r'(?!(?:is|was|not|has|for|missing|invalid|required|expired|rejected|<)\b)[^\s,;)]+',
+            re.IGNORECASE,
+        ),
+        r'\1 <redacted>',
+    ),
+    # hosts and identities quoted by the backend
+    (
+        re.compile(r'\b(server at|host name|host|on socket|socket)\s+(?:"[^"]*"|\'[^\']*\')', re.IGNORECASE),
+        r'\1 <host>',
+    ),
+    (re.compile(rf'\b({_QUOTED_IDENTITIES})\s+(?:"[^"]*"|\'[^\']*\'|`[^`]*`)', re.IGNORECASE), r'\1 <redacted>'),
+    (re.compile(r'\b(to|for) (tenant|database|keyspace) [\w.-]*\w', re.IGNORECASE), r'\1 \2 <redacted>'),
+    # bare addresses, host:port pairs and DNS names
     (re.compile(r'\b\d{1,3}(?:\.\d{1,3}){3}(?::\d+)?\b'), '<host>'),
     (re.compile(r'\[[0-9a-fA-F:]{2,}\](?::\d+)?'), '<host>'),
     (re.compile(r'\blocalhost(?::\d+)?\b', re.IGNORECASE), '<host>'),
+    (re.compile(r'\b[A-Za-z][\w.-]*:\d{2,5}\b'), '<host>'),
+    (
+        re.compile(rf'\b(?:[A-Za-z0-9](?:[\w-]*[A-Za-z0-9])?\.)+(?:{_HOST_SUFFIXES})(?![\w-])', re.IGNORECASE),
+        '<host>',
+    ),
     (re.compile(r'\bport\s+\d+\b', re.IGNORECASE), 'port <port>'),
 )
 
 
 def safe_error_text(error: Any, limit: int = 300) -> str:
-    """Return error text fit for a tool answer: no URL, DSN, host, port or credential; at most ``limit`` chars."""
-    text = ' '.join(str(error).split())
+    """Return error text fit for a tool answer: at most ``limit`` chars and none of the following.
+
+    URLs, DSNs, credentials (``key=value`` pairs, bearer tokens, API keys), host
+    names and addresses, ports, and the user, role, database, schema or tenant
+    names a backend quotes in its messages (libpq: ``for user "x"``,
+    ``database "y" does not exist``).
+    """
+    try:
+        text = ' '.join(str(error).split())
+    except Exception:  # an exception whose message cannot be built
+        return ''
     for pattern, replacement in _SCRUB:
         text = pattern.sub(replacement, text)
     if len(text) > limit:
@@ -289,7 +332,7 @@ def safe_error_text(error: Any, limit: int = 300) -> str:
 
 
 def safe_error(exc: BaseException) -> str:
-    """``'<ExceptionType>: <scrubbed message>'``."""
+    """``'<ExceptionType>: <scrubbed message>'`` (just the type when there is no message)."""
     message = safe_error_text(exc)
     return f'{type(exc).__name__}: {message}' if message else type(exc).__name__
 

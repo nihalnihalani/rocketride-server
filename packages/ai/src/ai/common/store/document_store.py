@@ -1272,7 +1272,7 @@ class VectorStoreToolMixin(VectorExplorerTools):
                 if mode == 'semantic':
                     raise
                 warning(
-                    f'vectordb tool: semantic search failed ({type(exc).__name__}: {exc}); falling back to keyword search. Check that the store is initialized and the embedding model matches the collection.'
+                    f'vectordb tool: semantic search failed ({safe_error(exc)}); falling back to keyword search. Check that the store is initialized and the embedding model matches the collection.'
                 )
                 warnings.extend(['keyword_fallback', f'semantic search failed: {safe_error(exc)}'])
                 docs = store.searchKeyword(question, doc_filter)

@@ -1608,6 +1608,19 @@ def test_search_keyword_fallback_is_reported():
     ]
 
 
+def test_search_keyword_fallback_logs_scrubbed_text():
+    store = clustered()
+    store.raise_semantic = RuntimeError(
+        'connection to server at "10.0.0.5", port 55432 failed: FATAL:  password authentication failed for user "rruser"'
+    )
+    answer = node(store).search({'vector': store.rows[('doc00', 0)].embedding, 'query': 'doc00'})
+    assert answer['mode_used'] == 'keyword'
+    logged = [w for w in _WARNINGS if 'semantic search failed' in w]
+    assert logged, _WARNINGS
+    for text in logged + answer['warnings']:
+        assert '10.0.0.5' not in text and '55432' not in text and 'rruser' not in text
+
+
 def test_search_semantic_mode_does_not_fall_back():
     store = clustered()
     store.raise_semantic = RuntimeError('boom')

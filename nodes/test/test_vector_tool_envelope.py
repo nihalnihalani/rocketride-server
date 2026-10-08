@@ -195,6 +195,39 @@ def test_the_size_cap_is_eight_megabytes():
         ('could not translate host name "vectors.example.com" to address', ['vectors.example.com']),
         ('apikey=abc123 rejected', ['abc123']),
         ('connect to [::1]:19530 refused', ['::1', '19530']),
+        # libpq FATAL lines name the role and the database in double quotes
+        (
+            'connection to server at "127.0.0.1", port 55432 failed: FATAL:  password authentication failed '
+            'for user "rruser"',
+            ['127.0.0.1', '55432', 'rruser'],
+        ),
+        (
+            'connection to server at "127.0.0.1", port 55432 failed: FATAL:  database "rrtenant" does not exist',
+            ['127.0.0.1', '55432', 'rrtenant'],
+        ),
+        ('FATAL:  role "rruser" does not exist', ['rruser']),
+        ('relation "rrtenant.vx_demo_docs" does not exist', ['rrtenant']),
+        ("Access denied for user 'rruser'", ['rruser']),
+        ('schema "tenant_7" does not exist', ['tenant_7']),
+        # client libraries print bare host:port pairs and DNS names
+        ('Could not connect to tenant default_tenant. Are you sure it exists? (vx-chroma:8000)', ['vx-chroma', '8000']),
+        (
+            'Could not connect to database team_db for tenant team_7. Are you sure it exists?',
+            ['team_db', 'team_7'],
+        ),
+        (
+            '<MilvusException: (code=2, message=Fail connecting to server on my-qdrant.example.com:19530)>',
+            ['my-qdrant.example.com', '19530'],
+        ),
+        ('Name or service not known: db.internal', ['db.internal']),
+        ('timed out talking to in01-abc.api.gcp-us-west1.zillizcloud.com', ['zillizcloud.com', 'in01-abc']),
+        ('index host abc-123.svc.us-east1-gcp.pinecone.io unreachable', ['pinecone.io', 'abc-123']),
+        # credentials outside a URL or a key=value pair
+        ('Unauthorized: api key rrpass rejected', ['rrpass']),
+        ('Authorization: Bearer eyJhbGciOi.payload.sig was refused', ['eyJhbGciOi']),
+        ('auth failed for rruser:rrpass@127.0.0.1:55432/rrtenant', ['rruser', 'rrpass', '127.0.0.1', 'rrtenant']),
+        ("password='s3cret value' user=admin", ['s3cret', 'admin']),
+        ('api_key: sk-live-123 is not valid', ['sk-live-123']),
     ],
 )
 def test_error_text_is_scrubbed(message, secrets):
@@ -203,12 +236,58 @@ def test_error_text_is_scrubbed(message, secrets):
         assert secret not in answer['error']
 
 
+#: The local fixture identities a store error must never carry.
+_FIXTURE_SECRETS = ('rruser', 'rrpass', 'rrtenant', '55432', '56434', 'vx-chroma', 'gx-pgvector')
+
+
+@pytest.mark.parametrize(
+    'message',
+    [
+        'connection to server at "gx-pgvector" (172.18.0.4), port 5432 failed: FATAL:  password authentication '
+        'failed for user "rruser"',
+        'connection to server at "127.0.0.1", port 56434 failed: FATAL:  database "rrtenant" does not exist',
+        'could not connect to server: Connection refused\n\tIs the server running on host "vx-chroma" and accepting '
+        'TCP/IP connections on port 8000?',
+        "HTTPConnectionPool(host='vx-chroma', port=8000): Max retries exceeded",
+        'FATAL:  no pg_hba.conf entry for host "172.18.0.1", user "rruser", database "rrtenant", no encryption',
+    ],
+)
+def test_store_errors_never_carry_the_fixture_identities(message):
+    answer = _run(RuntimeError(message))
+    assert answer['code'] == 'STORE_ERROR'
+    assert not [secret for secret in _FIXTURE_SECRETS if secret in answer['error']], answer['error']
+
+
+@pytest.mark.parametrize(
+    'message',
+    [
+        'the vector has 3 values',
+        'statement timed out at 2026-10-08T18:20:11Z after 30000 ms',
+        "No module named 'ai.common.store.pgvector'",
+        'error in postgres.py line 12',
+        'qdrant_client.http.exceptions.UnexpectedResponse: Unexpected Response: 404 (Not Found)',
+        'canceling statement due to statement timeout',
+    ],
+)
+def test_ordinary_error_text_survives_the_scrubber(message):
+    assert vx_tools.safe_error_text(message) == message
+
+
 def test_error_text_is_bounded():
     assert len(vx_tools.safe_error_text('x ' * 1000)) <= 300
 
 
 def test_plain_error_text_is_kept():
     assert vx_tools.safe_error(ValueError('the vector has 3 values')) == 'ValueError: the vector has 3 values'
+
+
+def test_an_exception_whose_text_fails_still_answers():
+    class Unprintable(Exception):
+        def __str__(self) -> str:
+            raise RuntimeError('the message cannot be built')
+
+    assert vx_tools.safe_error(Unprintable()) == 'Unprintable'
+    assert _run(Unprintable()) == {'success': False, 'code': 'STORE_ERROR', 'error': 'Unprintable'}
 
 
 # ---------------------------------------------------------------------------
