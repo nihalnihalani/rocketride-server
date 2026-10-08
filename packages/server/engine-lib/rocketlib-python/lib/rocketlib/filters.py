@@ -65,12 +65,35 @@ def invoke_function(fn: Callable) -> Callable:
     return fn
 
 
+#: The audiences a tool can be listed for: ``'agent'`` (the agent catalog that
+#: ``tool.query`` builds) and ``'dap'`` (external tool calls through the DAP).
+TOOL_AUDIENCES: Tuple[str, ...] = ('agent', 'dap')
+
+
+def _normalize_audience(audience: Any) -> Tuple[str, ...]:
+    """Return ``audience`` as a tuple of known audience names.
+
+    A single name may be given as a string (``audience='dap'``); a bare string is
+    never split into characters.
+
+    Raises:
+        ValueError: When the audience is empty or names an unknown audience.
+    """
+    names = (audience,) if isinstance(audience, str) else tuple(audience or ())
+    if not names:
+        raise ValueError('tool_function: audience must name at least one of ' + ', '.join(TOOL_AUDIENCES))
+    unknown = [name for name in names if name not in TOOL_AUDIENCES]
+    if unknown:
+        raise ValueError(f'tool_function: unknown audience {unknown!r}; expected any of {list(TOOL_AUDIENCES)}')
+    return tuple(dict.fromkeys(names))
+
+
 def tool_function(
     *,
     input_schema: Any = None,
     description: Any = None,
     output_schema: Any = None,
-    audience: Tuple[str, ...] = ('agent', 'dap'),
+    audience: Any = TOOL_AUDIENCES,
 ) -> Callable:
     """Mark a method as a tool entry point.
 
@@ -80,21 +103,30 @@ def tool_function(
     ``audience`` names who the tool is listed for: ``'agent'`` (the agent
     catalog built by ``tool.query``) and/or ``'dap'`` (external tool calls).
     It is recorded in ``__tool_meta__['audience']`` as a tuple; the default
-    lists the tool for both, which is every tool's behaviour today.
+    lists the tool for both, which is every tool's behaviour today. A tool
+    whose audience leaves out ``'agent'`` is not listed in ``tool.query``,
+    but ``tool.invoke`` still dispatches it: the audience decides what a
+    catalog shows, not who may call.
 
     ``@tool_function`` implicitly registers the method as an invoke handler
     for the ``tool.*`` ops — no separate ``@invoke_function`` needed::
 
         @tool_function(input_schema={...}, description='...')
         def get_data(self, args): ...
+
+    A tool for external callers only::
+
+        @tool_function(input_schema={...}, description='...', audience=('dap',))
+        def list_documents(self, args): ...
     """
+    names = _normalize_audience(audience)
 
     def decorator(fn: Callable) -> Callable:
         fn.__tool_meta__ = {
             'input_schema': input_schema,
             'description': description,
             'output_schema': output_schema,
-            'audience': tuple(audience),
+            'audience': names,
         }
         return fn
 
@@ -1161,13 +1193,19 @@ class IInstanceBase:
     # like self.IGlobal.db_description or self._db_display_name().
     # ------------------------------------------------------------------
 
-    def _build_tool_descriptors(self, methods: Dict[str, Callable]) -> List[ToolDescriptor]:
+    def _build_tool_descriptors(
+        self, methods: Dict[str, Callable], audience: Optional[str] = 'agent'
+    ) -> List[ToolDescriptor]:
         """Build ToolDescriptor dicts from @tool_function metadata.
 
         The user-entered tool description (from the node's "tool" config
         field) is auto-prepended to every tool's description so the LLM
         sees context like "Database of world cities" before the fixed
         tool description.
+
+        Only tools whose ``audience`` includes ``audience`` are listed; the
+        default is the agent catalog. ``audience=None`` lists every tool.
+        A method stamped without an audience is listed for every audience.
         """
         # The user-entered description from the node config panel.
         # e.g. "This is a database of world cities and populations"
@@ -1176,6 +1214,12 @@ class IInstanceBase:
 
         for tool_name, method in methods.items():
             meta = method.__tool_meta__
+
+            # --- Audience ---
+            # DAP-only tools (e.g. the vector store explorer tools) stay out of
+            # the agent catalog so an agent sees exactly the tools it saw before.
+            if audience is not None and audience not in meta.get('audience', TOOL_AUDIENCES):
+                continue
 
             # --- Description ---
             # Resolve: static string, callable(self), or fall back to docstring.
@@ -1235,9 +1279,11 @@ class IInstanceBase:
             raise APERR(Ec.PreventDefault, 'no tool methods')
 
         if op == 'tool.query':
-            # Build descriptors from all @tool_function methods on this node,
-            # plus any dynamically discovered tools (e.g. MCP).
-            descriptors = self._build_tool_descriptors(methods)
+            # Build descriptors from the agent-audience @tool_function methods
+            # on this node, plus any dynamically discovered tools (e.g. MCP).
+            # tool.query builds the agent catalog, so DAP-only tools are left
+            # out here; tool.invoke below still dispatches them.
+            descriptors = self._build_tool_descriptors(methods, audience='agent')
             descriptors.extend(self._tool_query_dynamic())
 
             # Add our descriptors to the shared param.tools list.
