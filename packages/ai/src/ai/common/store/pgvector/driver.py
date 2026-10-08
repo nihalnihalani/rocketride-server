@@ -89,6 +89,9 @@ from .sql import (
 #: Read statements run at most this long (also reported as ``dialect.limits.statement_timeout_ms``).
 DEFAULT_STATEMENT_TIMEOUT_MS = 30000
 
+#: The first pgvector version with ``hnsw.iterative_scan`` (filtered HNSW searches that keep scanning until k rows).
+ITERATIVE_SCAN_VERSION = (0, 8, 0)
+
 #: The fixed score floor below which a search drops rows unless ``minScore`` says otherwise.
 MIN_SIMILARITY_SCORE = 0.20
 
@@ -229,7 +232,7 @@ class PgVectorStore(DocumentStoreBase):
 
         version, exists, columns, control = self._db.run_read(probe)
         self._extension_version = version
-        self._db.iterative_scan = _version_at_least(version, (0, 8, 0))
+        self._db.iterative_scan = _version_at_least(version, ITERATIVE_SCAN_VERSION)
         with self._state_lock:
             self._exists = exists
             self._columns = columns
@@ -707,6 +710,9 @@ class PgVectorStore(DocumentStoreBase):
             version, found = self._extension_version, None
 
         caveats: List[str] = list(self.store_caveats)
+        if not _version_at_least(version, ITERATIVE_SCAN_VERSION):
+            # No iterative scan: an HNSW search with a filter may stop before it has k matching rows.
+            caveats.append('filtered_search_may_underfill')
         if found is None:
             self._mark_missing()
             return StoreInfo(

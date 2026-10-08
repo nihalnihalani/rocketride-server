@@ -128,7 +128,9 @@ now (the extra metadata is not stored) and tries again at most once a minute.
 Keyword search is a case-insensitive substring match on the question text.
 Semantic search needs an embedding bound to the question and raises if none is
 available; filtered searches keep scanning the HNSW index until they have enough
-rows. Missing tables produce empty search results rather than an error. Deleted
+rows (pgvector 0.8 and later; with an older pgvector a filtered search can
+return fewer rows than its limit, reported as the caveat
+`filtered_search_may_underfill`). Missing tables produce empty search results rather than an error. Deleted
 objects are excluded by default (a row with no deletion flag at all counts as
 not deleted), while document rendering reassembles stored chunks in chunkId
 order.

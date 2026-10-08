@@ -589,6 +589,15 @@ class TestPgVectorTransactions:
         store = _make_store(mock_rv, {'collection': 'rr_vec', 'similarity': 'cosine'})
         store.countChunks(None)
         assert not any('hnsw.iterative_scan' in b for b in _statements(mock_rv, 'begin_read'))
+        # Without the iterative scan a filtered search may return fewer than k rows: say so.
+        assert 'filtered_search_may_underfill' in store.describe().caveats
+        store.addChunks([_doc('a', 0, [1, 0, 0, 0, 0])])
+        assert 'filtered_search_may_underfill' in store.describe().caveats
+
+    def test_no_underfill_caveat_from_pgvector_0_8(self, mock_rv):
+        store = _make_store(mock_rv, {'collection': 'rr_vec', 'similarity': 'cosine'})
+        store.addChunks([_doc('a', 0, [1, 0, 0, 0, 0])])
+        assert 'filtered_search_may_underfill' not in store.describe().caveats
 
     def test_failed_statement_does_not_poison_the_next_call(self, mock_rv):
         from ai.common.schema import DocFilter

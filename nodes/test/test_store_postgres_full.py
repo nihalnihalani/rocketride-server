@@ -693,6 +693,8 @@ class TestHooks:
         assert (info.metric, info.dimension, info.model) == ('cosine', DIM, MODEL)
         assert info.index == {'type': 'hnsw', 'params': {'m': 16, 'ef_construction': 64}}
         assert info.size_bytes and info.size_bytes > 0
+        # The live server has pgvector >= 0.8 (iterative scan), so filtered searches fill k.
+        assert 'filtered_search_may_underfill' not in info.caveats and info.caveats == []
         dumped = json.dumps(dataclasses.asdict(info))
         for secret in ('rruser', 'rrpass', 'rrtenant', '55432', '56434', 'localhost', '127.0.0.1'):
             assert secret not in dumped
