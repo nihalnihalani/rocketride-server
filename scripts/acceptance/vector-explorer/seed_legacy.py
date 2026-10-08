@@ -33,9 +33,10 @@ The old drivers never lose chunk 0 by themselves on a fresh ingest: the
 chunker hands every text chunk of a document to the embedding node in one
 call, so the store sees a single write per document.
 
-Verification (always run, also after seeding): exactly one control record; no
-``meta`` column on pgvector; exactly one document (the long manual) without
-chunk 0; every corpus document present. Exits 1 when any check fails.
+Verification (always run, also after seeding): exactly one control record;
+exactly one document (the long manual) without chunk 0; every corpus document
+present; no ``meta`` column on a pgvector table seeded in this run (a newer
+driver adds it when it first opens the table). Exits 1 when any check fails.
 
 Usage (from dist/server; the engine must run with RR_DB_BROKER_URL/TOKEN):
   ./engine <this folder>/seed_legacy.py [--only pgvector,qdrant,chroma] [--recreate] [--verify-only]
@@ -416,8 +417,12 @@ async def seed(backends: Sequence[str], recreate: bool) -> Dict[str, Any]:
     return notes
 
 
-def verify(backends: Sequence[str]) -> Tuple[Dict[str, Any], List[str]]:
-    """Facts and problems for every selected backend."""
+def verify(backends: Sequence[str], seeded_now: Sequence[str] = ()) -> Tuple[Dict[str, Any], List[str]]:
+    """Facts and problems for every selected backend.
+
+    A ``meta`` column on pgvector is a problem only right after this run seeded
+    the table: a newer driver adds the column when it first opens the table.
+    """
     corpus = _corpus()
     expected_ids = {fx.object_id(n) for n in corpus_names(corpus)}
     rr_ids = {fx.object_id(n) for n in corpus_names(corpus, RR_PREFIX, RR_FOLDER)}
@@ -446,7 +451,7 @@ def verify(backends: Sequence[str]) -> Tuple[Dict[str, Any], List[str]]:
             documents=f['documents'],
             expected_documents=len(wanted),
             missing=sorted(wanted - present),
-            meta_column=f.get('meta_column'),
+            meta_column=f.get('meta_column') if backend in seeded_now else None,
         )
     return facts, problems
 
@@ -465,7 +470,7 @@ def main() -> int:
     if unknown:
         parser.error(f'unknown backend(s): {", ".join(unknown)}')
     notes = {} if args.verify_only else asyncio.run(seed(backends, args.recreate))
-    facts, problems = verify(backends)
+    facts, problems = verify(backends, seeded_now=list(notes))
     print(json.dumps({'seeded': notes, 'facts': facts, 'problems': problems}, indent=2, default=str))
     return 1 if problems else 0
 
