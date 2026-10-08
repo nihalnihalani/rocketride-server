@@ -27,13 +27,17 @@ from depends import depends
 requirements = os.path.dirname(os.path.realpath(__file__)) + '/requirements.txt'
 depends(requirements)
 
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Set, Tuple
 import chromadb
-from ai.common.schema import Doc, DocFilter, QuestionText
+from ai.common.schema import Doc, DocFilter, DocMetadata, QuestionText
 from ai.common.store import DocumentStoreBase
 from ai.common.config import Config
 from rocketlib import debug
+import base64
+import binascii
+import json
 import math
+import random
 import uuid
 import sys
 import re
@@ -58,6 +62,19 @@ def point_id_for(objectId: str, chunkId: int) -> str:
     return str(uuid.uuid5(uuid.NAMESPACE_URL, f'{objectId}#{int(chunkId)}'))
 
 
+def _vx():
+    """The explorer value types, imported on use (the driver also loads on an older ai package)."""
+    from ai.common.store import vx_types
+
+    return vx_types
+
+
+def _errors():
+    from ai.common.store import errors
+
+    return errors
+
+
 def _where(*clauses: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     """Combine where clauses: None when empty, the clause alone, else $and (Chroma needs two or more)."""
     parts: List[Dict[str, Any]] = []
@@ -71,6 +88,24 @@ def _where(*clauses: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     if not parts:
         return None
     return parts[0] if len(parts) == 1 else {'$and': parts}
+
+
+def _int_or_none(value: Any) -> Optional[int]:
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _as_list(vector: Any) -> List[float]:
+    """An embedding as a plain list of floats (the client returns numpy arrays)."""
+    if vector is None:
+        return []
+    if hasattr(vector, 'tolist'):
+        vector = vector.tolist()
+    return [float(v) for v in vector]
 
 
 # Minimum Chroma *server* version this client supports, as (major, minor). The v2
@@ -98,6 +133,20 @@ def _check_server_version(version: str) -> None:
 
 
 class Store(DocumentStoreBase):
+    # Explorer capabilities beyond the hooks this class overrides (vx_types.CAPABILITY_KEYS).
+    VX_DRIVER_CAPABILITIES = frozenset({'documents_distinct', 'search_keyword'})
+
+    # Support level reported by the explorer's dialect: the unmocked live suite
+    # (nodes/test/test_store_chroma_full.py) runs on a new and a legacy collection.
+    VX_SUPPORT = 'supported'
+
+    # Records read per request when a hook walks a filtered set (counts, sweeps).
+    READ_PAGE = 5000
+
+    # Most rows the sweep for documents without chunk 0 reads; beyond it the
+    # listing ends with the caveat 'document_count_capped'.
+    SWEEP_ROWS_CAP = 200000
+
     apikey: str | None = None
     node: str = 'chroma'
     collection: str = ''
@@ -911,3 +960,424 @@ class Store(DocumentStoreBase):
                 break
 
             offset += self.renderChunkSize
+
+    # ------------------------------------------------------------------
+    # Reading helpers
+    # ------------------------------------------------------------------
+
+    def _exists(self) -> bool:
+        """Whether the collection exists (no control-record read)."""
+        return bool(self.collection) and self._doesCollectionExist()
+
+    def _readAll(
+        self, where: Optional[Dict[str, Any]], include: List[str], cap: Optional[int] = None
+    ) -> Iterator[Tuple[str, Dict[str, Any]]]:
+        """
+        Yield (id, row) for every record matching ``where``, ``READ_PAGE`` at a time.
+
+        ``row`` holds the included fields of one record ('metadata', 'document',
+        'embedding'). Stops after ``cap`` records when given.
+        """
+        offset = 0
+        page = max(1, int(self.READ_PAGE))
+        while True:
+            results = self.collectionObj.get(where=where, include=list(include), limit=page, offset=offset)
+            ids = list(results.get('ids') or [])
+            for index, record_id in enumerate(ids):
+                if cap is not None and offset + index >= cap:
+                    return
+                yield record_id, self._row(results, index)
+            if len(ids) < page:
+                return
+            offset += page
+
+    @staticmethod
+    def _row(results: Dict[str, Any], index: int) -> Dict[str, Any]:
+        row: Dict[str, Any] = {}
+        for field, key in (('metadatas', 'metadata'), ('documents', 'document'), ('embeddings', 'embedding')):
+            values = results.get(field)
+            if values is not None:
+                row[key] = values[index]
+        return row
+
+    def _rowToDoc(self, record_id: str, row: Dict[str, Any], *, with_vector: bool = False) -> Doc:
+        """A Doc from a stored record, with ``metadata.pointId`` (and the vector when asked)."""
+        meta = {k: v for k, v in (row.get('metadata') or {}).items() if v is not None}
+        doc = Doc(
+            score=0, page_content=row.get('document') or '', metadata=DocMetadata(**{**meta, 'pointId': record_id})
+        )
+        if with_vector:
+            doc.embedding = _as_list(row.get('embedding'))
+        return doc
+
+    def _documentsWhere(self, deleted: str, object_ids: Optional[Sequence[str]], *extra: Optional[Dict[str, Any]]):
+        """Records of real documents (never the control record) in the given deleted state."""
+        return _where(
+            self._deletedClause(deleted),
+            {'objectId': {'$ne': CONTROL_OBJECT_ID}},
+            {'objectId': {'$in': list(object_ids)}} if object_ids is not None else None,
+            *extra,
+        )
+
+    # ------------------------------------------------------------------
+    # Explorer hooks (docs/development/nodes/vector-tool-contract.md, section 2)
+    # ------------------------------------------------------------------
+
+    def scoreInfo(self) -> Dict[str, Any]:
+        """How ``Doc.score`` is derived from Chroma's distance for this collection's space."""
+        space = self._space()
+        if space == 'l2':
+            formula, value_range = '1 / (1 + euclidean_distance)', [0, 1]
+        elif space == 'ip':
+            formula, value_range = '(2 - ip_distance) / 2', None
+        else:
+            formula, value_range = '(2 - cosine_distance) / 2', [0, 1]
+        info = {
+            'formula': formula,
+            'higher_is_better': True,
+            'floor': MIN_RELEVANCE_SCORE,
+            'threshold': self.threshold_search,
+        }
+        if value_range is not None:
+            info['range'] = value_range
+        return info
+
+    def describe(self):
+        """Backend, collection, metric, dimension, model, index; never a host, port or key."""
+        vx = _vx()
+        caveats = ['score_scale_inverted_fixed']
+        version = self._getServerVersion()
+        if not self._exists():
+            return vx.StoreInfo(
+                backend='chroma',
+                backend_version=version,
+                collection=self.collection or None,
+                collection_exists=False,
+                control_record=None,
+                meta_column=None,
+                metric=self.similarity if self.similarity in ('cosine', 'l2', 'ip') else None,
+                dimension=None,
+                model=None,
+                index=None,
+                size_bytes=None,
+                caveats=caveats,
+            )
+        try:
+            control = self.doesCollectionExist()
+        except Exception:
+            control = False
+        space = self._space()
+        params: Dict[str, Any] = {'space': space}
+        config = getattr(self.collectionObj, 'configuration_json', None)
+        hnsw = (config or {}).get('hnsw') if isinstance(config, dict) else None
+        if isinstance(hnsw, dict):
+            for key in ('ef_construction', 'ef_search', 'max_neighbors'):
+                if hnsw.get(key) is not None:
+                    params[key] = hnsw[key]
+        return vx.StoreInfo(
+            backend='chroma',
+            backend_version=version,
+            collection=self.collection,
+            collection_exists=True,
+            control_record=bool(control),
+            meta_column=None,
+            metric=space,
+            dimension=(self.vectorSize or None) if control else None,
+            model=(self.modelName or None) if control else None,
+            index={'type': 'hnsw', 'params': params},
+            size_bytes=None,
+            caveats=caveats,
+        )
+
+    def countChunks(self, docFilter: DocFilter) -> Optional[int]:
+        """
+        Count the chunk rows matching ``docFilter`` (control record excluded).
+
+        Chroma has no filtered count: this reads the matching ids (no payload),
+        ``READ_PAGE`` at a time. The tools cache it (counts_cached_s).
+        """
+        if not self._exists():
+            return 0
+        where = _where(self._convertFilter(docFilter), {'objectId': {'$ne': CONTROL_OBJECT_ID}})
+        return sum(1 for _ in self._readAll(where, []))
+
+    @staticmethod
+    def _encodeCursor(state: Dict[str, Any]) -> str:
+        return base64.urlsafe_b64encode(json.dumps(state, separators=(',', ':')).encode()).decode()
+
+    @staticmethod
+    def _decodeCursor(cursor: Optional[str]) -> Dict[str, Any]:
+        """The listing state in an opaque cursor; a cursor this driver did not issue is refused."""
+        if cursor is None:
+            return {'ph': 'c', 'o': 0}
+        try:
+            state = json.loads(base64.urlsafe_b64decode(str(cursor).encode()).decode())
+        except (binascii.Error, UnicodeDecodeError, ValueError):
+            state = None
+        valid = isinstance(state, dict) and (
+            (state.get('ph') == 'c' and isinstance(state.get('o'), int) and state['o'] >= 0)
+            or (state.get('ph') == 'o' and isinstance(state.get('i'), int) and state['i'] >= 0)
+        )
+        if not valid:
+            raise _errors().ToolRefusal(
+                'INVALID_INPUT', 'The documents cursor is not valid; start from the first page.'
+            )
+        return state
+
+    @staticmethod
+    def _documentRow(
+        record_id: str, meta: Dict[str, Any], chunks: Optional[int], tables: Optional[int], has_first: bool
+    ):
+        ingested = meta.get('ingestedAt')
+        return _vx().DocumentRow(
+            objectId=str(meta.get('objectId', '')),
+            path=str(meta.get('parent') or ''),
+            chunks=chunks,
+            has_first_chunk=has_first,
+            deleted=meta.get('isDeleted') is True,
+            tables=tables,
+            nodeId=meta.get('nodeId'),
+            size=_int_or_none(meta.get('size')),
+            modifyTime=_int_or_none(meta.get('modifyTime')),
+            ingestedAt=ingested if isinstance(ingested, str) else None,
+            pointId=record_id,
+        )
+
+    def _sweep(self, deleted: str, object_ids: Optional[Sequence[str]]):
+        """
+        Read every document row's metadata once: (orphans, distinct documents, capped).
+
+        ``orphans`` are the documents without a chunk-0 row, sorted by objectId,
+        each with (lowest-chunk record id, its metadata, rows).
+        """
+        per_object: Dict[str, Dict[str, Any]] = {}
+        cap = max(1, int(self.SWEEP_ROWS_CAP))
+        read = 0
+        for record_id, row in self._readAll(self._documentsWhere(deleted, object_ids), ['metadatas'], cap=cap):
+            read += 1
+            meta = row.get('metadata') or {}
+            oid = str(meta.get('objectId', ''))
+            chunk = _int_or_none(meta.get('chunkId'))
+            entry = per_object.setdefault(oid, {'rows': 0, 'first': False, 'low': None})
+            entry['rows'] += 1
+            if chunk == 0:
+                entry['first'] = True
+            if chunk is not None and (entry['low'] is None or chunk < entry['low'][0]):
+                entry['low'] = (chunk, record_id, meta)
+        capped = read >= cap
+        orphans = [
+            (oid, entry['low'][1], entry['low'][2], entry['rows'])
+            for oid, entry in sorted(per_object.items())
+            if not entry['first'] and entry['low'] is not None
+        ]
+        return orphans, len(per_object), capped
+
+    def listDocuments(self, *, cursor, limit, object_ids, deleted, sort):
+        """
+        One page of documents: chunk-0 records by offset, then documents without chunk 0.
+
+        Chunk and table counts come from one metadata read over the page's
+        objectIds. Documents without a first chunk are found by reading every
+        row's metadata once, after the chunk-0 records are exhausted (at most
+        ``SWEEP_ROWS_CAP`` rows; beyond it the caveat ``document_count_capped``);
+        that read also gives ``total``, so earlier pages answer total=None.
+        Rows are not sorted by path (``sorted=False``).
+        """
+        vx = _vx()
+        limit = max(1, int(limit))
+        state = self._decodeCursor(cursor)
+        caveats = ['documents_unsorted']
+        if not self._exists():
+            return vx.DocPage(
+                items=[], next_cursor=None, total=0, counts_exact=True, distinct=True, sorted=False, caveats=caveats
+            )
+
+        ids = None if object_ids is None else [str(o) for o in object_ids if str(o) != CONTROL_OBJECT_ID]
+        items = []
+        if state['ph'] == 'c':
+            offset = state['o']
+            results = self.collectionObj.get(
+                where=self._documentsWhere(deleted, ids, {'chunkId': {'$eq': 0}}),
+                include=['metadatas'],
+                offset=offset,
+                limit=limit + 1,
+            )
+            page_ids = list(results.get('ids') or [])
+            more = len(page_ids) > limit
+            rows: List[Tuple[str, Dict[str, Any]]] = []
+            seen: Set[str] = set()
+            for index, record_id in enumerate(page_ids[:limit]):
+                meta = (results['metadatas'][index] or {}) if results.get('metadatas') else {}
+                oid = str(meta.get('objectId', ''))
+                if oid and oid not in seen:
+                    seen.add(oid)
+                    rows.append((record_id, meta))
+            counts: Dict[str, int] = {}
+            tables: Dict[str, int] = {}
+            if seen:
+                for _, row in self._readAll(self._documentsWhere(deleted, sorted(seen)), ['metadatas']):
+                    meta = row.get('metadata') or {}
+                    oid = str(meta.get('objectId', ''))
+                    counts[oid] = counts.get(oid, 0) + 1
+                    if meta.get('isTable') is True:
+                        tables[oid] = tables.get(oid, 0) + 1
+            for record_id, meta in rows:
+                oid = str(meta.get('objectId'))
+                items.append(self._documentRow(record_id, meta, counts.get(oid), tables.get(oid, 0), True))
+            if more:
+                return vx.DocPage(
+                    items=items,
+                    next_cursor=self._encodeCursor({'ph': 'c', 'o': offset + limit}),
+                    total=None,
+                    counts_exact=True,
+                    distinct=True,
+                    sorted=False,
+                    caveats=caveats,
+                )
+            state = {'ph': 'o', 'i': 0}
+
+        # The chunk-0 records are exhausted: fill the page with documents that have no chunk 0.
+        orphans, total, capped = self._sweep(deleted, ids)
+        if capped:
+            caveats.append('document_count_capped')
+        start = state['i']
+        room = max(0, limit - len(items))
+        for oid, record_id, meta, rows_count in orphans[start : start + room]:
+            items.append(self._documentRow(record_id, meta, rows_count, None, False))
+        next_cursor = self._encodeCursor({'ph': 'o', 'i': start + room}) if start + room < len(orphans) else None
+        return vx.DocPage(
+            items=items,
+            next_cursor=next_cursor,
+            total=None if capped else total,
+            counts_exact=not capped,
+            distinct=True,
+            sorted=False,
+            caveats=caveats,
+        )
+
+    def scrollChunks(self, objectId: str, *, after_chunk: int, limit: int, deleted: str):
+        """
+        The chunks of one document after ``after_chunk``, in chunk order, without vectors.
+
+        Reads the window (after_chunk, after_chunk + limit] first; when chunk ids
+        have gaps, reads the remaining chunk ids and fetches the next ``limit`` by id.
+        """
+        vx = _vx()
+        after_chunk = int(after_chunk)
+        limit = max(1, int(limit))
+        if objectId == CONTROL_OBJECT_ID or not self._exists():
+            return vx.ChunkPage(docs=[], has_more=False, next_after=after_chunk)
+        window = self.collectionObj.get(
+            where=self._documentsWhere(
+                deleted,
+                [objectId],
+                {'chunkId': {'$gt': after_chunk}},
+                {'chunkId': {'$lte': after_chunk + limit}},
+            ),
+            include=['metadatas', 'documents'],
+        )
+        rows = [(rid, self._row(window, i)) for i, rid in enumerate(window.get('ids') or [])]
+        if len(rows) < limit:
+            # Gaps in the chunk ids: find the next `limit` chunk ids, then read those records.
+            remaining = sorted(
+                (
+                    (_int_or_none((row.get('metadata') or {}).get('chunkId')) or 0, rid)
+                    for rid, row in self._readAll(
+                        self._documentsWhere(deleted, [objectId], {'chunkId': {'$gt': after_chunk}}), ['metadatas']
+                    )
+                ),
+            )
+            wanted = [rid for _, rid in remaining[:limit]]
+            more = len(remaining) > limit
+            fetched = self.collectionObj.get(ids=wanted, include=['metadatas', 'documents']) if wanted else {'ids': []}
+            rows = [(rid, self._row(fetched, i)) for i, rid in enumerate(fetched.get('ids') or [])]
+        else:
+            beyond = self.collectionObj.get(
+                where=self._documentsWhere(deleted, [objectId], {'chunkId': {'$gt': after_chunk + limit}}),
+                include=[],
+                limit=1,
+            )
+            more = bool(beyond.get('ids'))
+        rows.sort(key=lambda item: _int_or_none((item[1].get('metadata') or {}).get('chunkId')) or 0)
+        docs = [self._rowToDoc(rid, row) for rid, row in rows[:limit]]
+        next_after = docs[-1].metadata.chunkId if docs else after_chunk
+        return vx.ChunkPage(docs=docs, has_more=more, next_after=next_after)
+
+    def sampleChunks(self, *, n, seed, strategy, docFilter, include_keys):
+        """
+        Up to ``n`` chunks with vectors, as one contiguous window of the collection.
+
+        Chroma cannot sample at random: 'first' reads from the start and
+        'random' from an offset chosen by ``seed``; both report 'first'.
+        'stratified' is not native (StoreUnsupported).
+        """
+        if strategy == 'stratified':
+            raise _errors().StoreUnsupported('sampleChunks(strategy="stratified") is not native on Chroma')
+        if strategy not in ('random', 'first'):
+            raise ValueError(f'unknown sampling strategy {strategy!r}')
+        n = max(0, int(n))
+        if not n or not self._exists():
+            return [], 'first'
+        where = _where(self._convertFilter(docFilter), {'objectId': {'$ne': CONTROL_OBJECT_ID}})
+        offset = 0
+        if strategy == 'random':
+            total = sum(1 for _ in self._readAll(where, []))
+            offset = random.Random(int(seed)).randint(0, max(0, total - n))
+        results = self.collectionObj.get(
+            where=where, include=['embeddings', 'metadatas', 'documents'], offset=offset, limit=n
+        )
+        docs = [
+            self._rowToDoc(rid, self._row(results, i), with_vector=True)
+            for i, rid in enumerate(results.get('ids') or [])
+        ]
+        return docs, 'first'
+
+    def getVectors(self, keys):
+        """
+        The chunks for ``keys`` with vectors, in the order asked; missing keys are left out.
+
+        Reads by deterministic id first, then by filter for every miss (rows
+        written before deterministic ids carry random ids). Deleted rows included.
+        """
+        wanted = list(dict.fromkeys((str(o), int(c)) for o, c in keys if str(o) != CONTROL_OBJECT_ID))
+        if not wanted or not self._exists():
+            return []
+        want = set(wanted)
+        found: Dict[Tuple[str, int], Tuple[str, Dict[str, Any]]] = {}
+        include = ['embeddings', 'metadatas', 'documents']
+        ids = [point_id_for(oid, chunk) for oid, chunk in wanted]
+        for start in range(0, len(ids), 1000):
+            results = self.collectionObj.get(ids=ids[start : start + 1000], include=include)
+            for index, record_id in enumerate(results.get('ids') or []):
+                row = self._row(results, index)
+                meta = row.get('metadata') or {}
+                key = (str(meta.get('objectId')), _int_or_none(meta.get('chunkId')))
+                if key in want and key not in found:
+                    found[key] = (record_id, row)
+        misses = [k for k in wanted if k not in found]
+        if misses:
+            by_object: Dict[str, Set[int]] = {}
+            for oid, chunk in misses:
+                by_object.setdefault(oid, set()).add(chunk)
+            objects = sorted(by_object)
+            for start in range(0, len(objects), 64):
+                batch = objects[start : start + 64]
+                chunks = sorted(set().union(*(by_object[o] for o in batch)))
+                where = _where({'objectId': {'$in': batch}}, {'chunkId': {'$in': chunks}})
+                for record_id, row in self._readAll(where, include):
+                    meta = row.get('metadata') or {}
+                    key = (str(meta.get('objectId')), _int_or_none(meta.get('chunkId')))
+                    if key in want and key not in found:
+                        found[key] = (record_id, row)
+        return [self._rowToDoc(*found[k], with_vector=True) for k in wanted if k in found]
+
+    def removeCounted(self, objectIds: List[str]) -> Optional[int]:
+        """Remove every chunk of ``objectIds`` (deleted rows too); return the rows removed. Never the control record."""
+        ids = [oid for oid in dict.fromkeys(str(o).strip() for o in objectIds) if oid and oid != CONTROL_OBJECT_ID]
+        if not ids or not self._exists():
+            return 0
+        where = {'objectId': {'$in': ids}}
+        removed = sum(1 for _ in self._readAll(where, []))
+        if removed:
+            self.collectionObj.delete(where=where)
+        return removed
