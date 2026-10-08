@@ -302,6 +302,31 @@ test("queue: another app's events for a file of the same name do not decide the 
 	assert.deepEqual(fake.changed, [[objectIdForPath('x/report.pdf')]]);
 });
 
+test('queue: the chunk count and the change report use the objectId the engine reports for the upload', async () => {
+	const engineId = '00000000-0000-5000-8000-000000000002';
+	const counted: string[] = [];
+	const fake = fakeDeps({
+		async callTool(tool, input): Promise<CallOutcome> {
+			if (tool === 'chunks') return { ok: false, code: 'NOT_FOUND', message: 'not stored', kind: null, error: null };
+			const id = (input.object_ids as string[])[0];
+			counted.push(id);
+			return { ok: true, value: { success: true, items: [{ objectId: id, chunks: 4 }] } };
+		},
+		async sendFiles(files: ISendFile[]) {
+			return files.map((file) => ({ action: 'complete', filepath: file.file.name, bytes_sent: file.file.size, file_size: file.file.size, upload_time: 0.1, result: { objectId: engineId } }));
+		},
+	});
+	const queue = createIngestQueue(fake.deps);
+	await queue.addDrop([candidate('a.md')]);
+	await queue.idle();
+	assert.deepEqual(counted, [engineId]);
+	assert.deepEqual(fake.changed, [[engineId]]);
+	const row = queue.getState().rows[0];
+	assert.equal(uploadLabel(row), '4 chunks added');
+	assert.equal(row.objectId, engineId);
+	assert.match(row.detail ?? '', /the console expected/);
+});
+
 test('queue: dispose while the replace question is open sends nothing', async () => {
 	const fake = fakeDeps({ canProbe: false });
 	const queue = createIngestQueue(fake.deps);

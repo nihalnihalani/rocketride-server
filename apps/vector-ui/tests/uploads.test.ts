@@ -279,6 +279,27 @@ test('applyFinalResult: the result sendFiles returns decides, whatever the event
 	assert.equal(applyFinalResult(foreign, null).status, 'failed');
 });
 
+test('applyFinalResult: a completed upload is counted under the objectId the engine reports', () => {
+	const script = fixture<{ events: IUploadEvent[] }>('upload_events.json');
+	const planned = planDrop([candidate('memo_q3.docx', 22016)]).accepted[0];
+	const row: UploadRow = { ...queuedRow(planned), status: 'processing' };
+	// The fixture's completed upload reports the id the console derived: nothing to say.
+	const complete = script.events.find((event) => event.action === 'complete') as unknown as Record<string, unknown>;
+	const same = applyFinalResult(row, complete);
+	assert.equal(same.objectId, planned.objectId);
+	assert.equal(same.detail, null);
+	// When the engine reports another id, that id is the stored document's, and the row says so.
+	const engineId = '00000000-0000-5000-8000-000000000001';
+	const differs = applyFinalResult(row, { ...complete, result: { objectId: engineId } });
+	assert.equal(differs.status, 'counting');
+	assert.equal(differs.objectId, engineId);
+	assert.equal(differs.detail, `The engine stored this file under objectId ${engineId}; the console expected ${planned.objectId}.`);
+	// Anything that is not an id is ignored.
+	for (const result of [{}, { objectId: '' }, { objectId: 42 }, { objectId: 'a b' }, 'x', null]) {
+		assert.equal(applyFinalResult(row, { ...complete, result }).objectId, planned.objectId, JSON.stringify(result));
+	}
+});
+
 test("applyUploadEvent: an event whose file size is not this file's belongs to another file of the same name", () => {
 	const row: UploadRow = { ...queuedRow(planDrop([candidate('x/report.pdf', 100)]).accepted[0]), status: 'uploading', bytesSent: 40 };
 	assert.equal(applyUploadEvent(row, { action: 'write', filepath: 'report.pdf', bytes_sent: 900, file_size: 999, upload_time: 0 }), row);

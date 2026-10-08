@@ -454,9 +454,24 @@ export function applyUploadEvent(row: UploadRow, event: IUploadEvent): UploadRow
 }
 
 /**
+ * The objectId the engine reports in a completed upload's pipeline result.
+ *
+ * @param result - The file's upload result.
+ * @returns The id, or null when it reports none.
+ */
+function engineObjectId(result: Record<string, unknown>): string | null {
+	const pipeline = result.result;
+	if (pipeline === null || typeof pipeline !== 'object' || Array.isArray(pipeline)) return null;
+	const id = (pipeline as Record<string, unknown>).objectId;
+	return typeof id === 'string' && id !== '' && id.length <= 128 && !/\s/.test(id) ? id : null;
+}
+
+/**
  * Apply the result sendFiles returned for a file. This alone ends a sending
  * row: counting when the upload completed, failed (with the result's own
- * error text) otherwise, whatever the events said before.
+ * error text) otherwise, whatever the events said before. A completed
+ * upload is counted under the objectId the engine reports for it; when that
+ * is not the one the console derived, the row says so.
  *
  * @param row - The row.
  * @param result - The file's upload result.
@@ -466,7 +481,16 @@ export function applyFinalResult(row: UploadRow, result: Record<string, unknown>
 	if (FINISHED.has(row.status)) return row;
 	if (result && result.action === 'complete') {
 		const bytes = typeof result.bytes_sent === 'number' ? result.bytes_sent : row.bytesSent;
-		return { ...row, status: 'counting', bytesSent: Math.max(row.bytesSent, bytes), message: null, detail: null };
+		const reported = engineObjectId(result);
+		const differs = reported !== null && reported !== row.objectId;
+		return {
+			...row,
+			status: 'counting',
+			bytesSent: Math.max(row.bytesSent, bytes),
+			objectId: differs ? reported : row.objectId,
+			message: null,
+			detail: differs ? `The engine stored this file under objectId ${reported}; the console expected ${row.objectId}.` : null,
+		};
 	}
 	const error = result && typeof result.error === 'string' && result.error !== '' ? result.error : null;
 	return { ...row, status: 'failed', message: FAILED_SENTENCE, detail: error };

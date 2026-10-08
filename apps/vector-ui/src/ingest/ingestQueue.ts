@@ -219,6 +219,8 @@ export function createIngestQueue(deps: IngestDeps): IngestQueue {
 		const added: string[] = [];
 		for (const file of files) {
 			if (disposed) return;
+			// The id the engine reported for the upload (applyFinalResult), else the derived one.
+			const objectId = rowOf(file.id)?.objectId ?? file.objectId;
 			let chunks: number | null = null;
 			let message: string | null;
 			if (!deps.canCount) {
@@ -228,14 +230,14 @@ export function createIngestQueue(deps: IngestDeps): IngestQueue {
 				let failure: string | null = null;
 				for (let attempt = 0; attempt < 2 && !listed && failure === null; attempt++) {
 					if (attempt > 0) await sleep(RECOUNT_DELAY_MS);
-					const outcome = await deps.callTool('documents', { object_ids: [file.objectId], limit: 1 });
+					const outcome = await deps.callTool('documents', { object_ids: [objectId], limit: 1 });
 					if (disposed) return;
 					if (!outcome.ok) {
 						failure = outcome.message;
 						break;
 					}
 					const items = Array.isArray(outcome.value.items) ? outcome.value.items : [];
-					const item = items.find((candidate) => isRecord(candidate) && candidate.objectId === file.objectId);
+					const item = items.find((candidate) => isRecord(candidate) && candidate.objectId === objectId);
 					if (isRecord(item)) {
 						listed = true;
 						chunks = typeof item.chunks === 'number' && Number.isFinite(item.chunks) ? item.chunks : null;
@@ -246,7 +248,7 @@ export function createIngestQueue(deps: IngestDeps): IngestQueue {
 				else message = chunkCountMessage(chunks);
 			}
 			updateRow(file.id, { status: 'done', chunks, message });
-			added.push(file.objectId);
+			added.push(objectId);
 			const row = rowOf(file.id);
 			if (row) deps.announce(`${file.path}: ${uploadLabel(row)}`);
 		}
