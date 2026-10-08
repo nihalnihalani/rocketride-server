@@ -32,7 +32,10 @@ a call came from before it acts. The engine, never the client, sets that context
    ``param.__tool_context__`` (:data:`TOOL_CONTEXT_FIELD`): origin ``'dap'``, the
    calling task's source type, whether the call named a node, and the caller as
    the server sees it (the server replaces any caller the client sent). Nothing
-   inside the tool ``input`` is ever read as context.
+   inside the tool ``input`` is ever read as context, and neither is a field of
+   that name that arrived as data: only the plain instance attribute the engine
+   sets counts, never a pydantic extra field (which is what validating a dict
+   that carries the name produces) and never a key of a dict op.
 2. The agent host stamps the params it builds with origin ``'agent'``.
 3. ``IInstanceBase._dispatch_tool`` reads the field and runs the tool method
    inside :func:`tool_call`, so the method can read :func:`current_tool_call`.
@@ -54,8 +57,10 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any, Dict, Iterator, Optional, Tuple
 
-#: Name of the extra field on the ``IInvokeTool`` param that carries the context
-#: (the invoke param model allows extra fields).
+#: Name of the plain instance attribute on the ``IInvokeTool`` param that carries
+#: the context. It is set with ``setattr`` (so it lands in the instance
+#: ``__dict__``), never as a pydantic extra field: anything a client can get into
+#: a param through validation lands in ``__pydantic_extra__`` and is not read.
 TOOL_CONTEXT_FIELD = '__tool_context__'
 
 #: ``ToolCallContext.origin`` values.
@@ -216,20 +221,24 @@ def _as_stamp(ctx: ToolCallContext) -> Dict[str, Any]:
 
 
 def stamp_param(param: Any, ctx: ToolCallContext) -> None:
-    """Attach ``ctx`` to an invoke param (a pydantic op or a dict).
+    """Attach ``ctx`` to an invoke param the engine built (a pydantic op).
 
-    On a pydantic param the field is a plain attribute, so it never appears in
-    ``model_dump()`` (which tracing serializes).
+    The field is a plain instance attribute, so it never appears in
+    ``model_dump()`` (which tracing serializes). A field of the same name that
+    came in as a pydantic extra field (client data) is dropped first.
 
-    :raises TypeError: When ``ctx`` is not a :class:`ToolCallContext`.
+    :raises TypeError: When ``ctx`` is not a :class:`ToolCallContext`, or when
+        ``param`` is a dict (a dict op may be built from client data, so a stamp
+        on one is never read).
     """
     if not isinstance(ctx, ToolCallContext):
         raise TypeError(f'stamp_param expects a ToolCallContext, got {type(ctx).__name__}')
-    value = _as_stamp(ctx)
     if isinstance(param, dict):
-        param[TOOL_CONTEXT_FIELD] = value
-    else:
-        setattr(param, TOOL_CONTEXT_FIELD, value)
+        raise TypeError('stamp_param stamps engine-built invoke ops, not dicts')
+    extra = getattr(param, '__pydantic_extra__', None)
+    if isinstance(extra, dict):
+        extra.pop(TOOL_CONTEXT_FIELD, None)
+    setattr(param, TOOL_CONTEXT_FIELD, _as_stamp(ctx))
 
 
 def context_from_stamp(value: Any) -> Optional[ToolCallContext]:
@@ -260,15 +269,21 @@ def context_from_stamp(value: Any) -> Optional[ToolCallContext]:
 def read_stamp(param: Any) -> Optional[ToolCallContext]:
     """Return the context stamped on an invoke param, or None.
 
-    Only the param's own field is read; the tool ``input`` is never looked at.
+    Only the plain instance attribute :func:`stamp_param` sets is read. The tool
+    ``input`` is never looked at, a dict op never carries a context, and a
+    pydantic extra field of the same name (``getattr`` would serve it from
+    ``__pydantic_extra__``) is ignored, because validating a client dict puts a
+    field there.
     """
-    if param is None:
+    if param is None or isinstance(param, dict):
         return None
-    if isinstance(param, dict):
-        value = param.get(TOOL_CONTEXT_FIELD)
-    else:
-        value = getattr(param, TOOL_CONTEXT_FIELD, None)
-    return context_from_stamp(value)
+    try:
+        own = object.__getattribute__(param, '__dict__')
+    except AttributeError:
+        return None
+    if not isinstance(own, dict):
+        return None
+    return context_from_stamp(own.get(TOOL_CONTEXT_FIELD))
 
 
 @contextmanager

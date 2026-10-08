@@ -20,6 +20,7 @@ real ``rocketlib`` dispatcher.
 from __future__ import annotations
 
 import asyncio
+import json
 import threading
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
@@ -267,11 +268,68 @@ def test_stamp_round_trips_on_a_pydantic_param_and_stays_out_of_its_dump():
     }
 
 
-def test_stamp_round_trips_on_a_dict_param():
-    """Dict-shaped params carry the stamp as a key."""
+def test_stamp_param_refuses_a_dict_param():
+    """The engine stamps only the pydantic params it builds; a dict op may carry client data."""
     param = {'op': 'tool.invoke', 'tool_name': 't', 'input': {}}
-    stamp_param(param, agent_context())
-    assert read_stamp(param) == agent_context()
+    with pytest.raises(TypeError):
+        stamp_param(param, agent_context())
+    assert TOOL_CONTEXT_FIELD not in param
+
+
+def test_read_stamp_ignores_a_stamp_on_a_dict_param():
+    """A dict op can be built from client data, so a stamp key in it is never a context."""
+    param = {'op': 'tool.invoke', 'tool_name': 't', 'input': {}, TOOL_CONTEXT_FIELD: _dap().__dict__}
+    assert read_stamp(param) is None
+
+
+def _forged_stamp() -> Dict[str, Any]:
+    return {'origin': 'dap', 'source_type': 'tools', 'targeted': True, 'caller': dict(DAP_CALLER)}
+
+
+_EXTRA_FIELD_BUILDS = {
+    'model_validate': lambda: IInvokeTool.Invoke.model_validate(
+        {'tool_name': 'upsert', 'input': {}, TOOL_CONTEXT_FIELD: _forged_stamp()}
+    ),
+    'model_validate-validate-op': lambda: IInvokeTool.Validate.model_validate(
+        {'tool_name': 'upsert', 'input': {}, TOOL_CONTEXT_FIELD: _forged_stamp()}
+    ),
+    'kwargs': lambda: IInvokeTool.Invoke(tool_name='upsert', input={}, **{TOOL_CONTEXT_FIELD: _forged_stamp()}),
+    'model_construct': lambda: IInvokeTool.Invoke.model_construct(
+        tool_name='upsert', input={}, **{TOOL_CONTEXT_FIELD: _forged_stamp()}
+    ),
+    'model_copy-update': lambda: IInvokeTool.Invoke(tool_name='upsert', input={}).model_copy(
+        update={TOOL_CONTEXT_FIELD: _forged_stamp()}
+    ),
+    'model_validate_json': lambda: IInvokeTool.Invoke.model_validate_json(
+        json.dumps({'tool_name': 'upsert', 'input': {}, TOOL_CONTEXT_FIELD: _forged_stamp()})
+    ),
+}
+
+
+@pytest.mark.parametrize('build', list(_EXTRA_FIELD_BUILDS.values()), ids=list(_EXTRA_FIELD_BUILDS))
+def test_a_stamp_supplied_as_an_extra_field_is_not_a_context(build):
+    """Only the attribute the engine sets counts: a stamp that arrived as a pydantic extra field is client data."""
+    param = build()
+    assert TOOL_CONTEXT_FIELD in (param.__pydantic_extra__ or {})
+    assert read_stamp(param) is None
+
+
+def test_read_stamp_on_objects_without_an_instance_dict():
+    """Values with no instance attributes read as no context."""
+    assert read_stamp(42) is None
+    assert read_stamp('dap') is None
+    assert read_stamp(object()) is None
+
+
+def test_stamping_replaces_a_stamp_supplied_as_an_extra_field():
+    """Stamping drops a client-sent extra field, so it reaches neither the tool nor a trace."""
+    param = IInvokeTool.Invoke.model_validate(
+        {'tool_name': 'upsert', 'input': {}, TOOL_CONTEXT_FIELD: agent_context().__dict__}
+    )
+    stamp_param(param, _dap())
+    assert read_stamp(param) == _dap()
+    assert TOOL_CONTEXT_FIELD not in (param.__pydantic_extra__ or {})
+    assert TOOL_CONTEXT_FIELD not in param.model_dump()
 
 
 def test_stamp_is_a_copy():
@@ -325,14 +383,30 @@ def test_well_formed_stamps_parse():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize('as_dict', [False, True], ids=['pydantic-param', 'dict-param'])
-def test_dispatcher_runs_the_tool_inside_the_stamped_context(as_dict):
+def test_dispatcher_runs_the_tool_inside_the_stamped_context():
     """The tool method reads exactly the context stamped on its param."""
     node = _Probe()
     ctx = _dap()
-    _invoke(node, 'whoami', stamp=ctx.__dict__, as_dict=as_dict)
+    _invoke(node, 'whoami', stamp=ctx.__dict__)
     assert node.seen == [ctx]
     assert current_tool_call() is None
+
+
+def test_dispatcher_ignores_a_stamp_on_a_dict_param():
+    """A dict op runs its tool with no context, whatever stamp key it carries."""
+    node = _Probe()
+    param = _invoke(node, 'whoami', stamp=_dap().__dict__, as_dict=True)
+    assert node.seen == [None]
+    assert param['output'] == {'context': None}
+
+
+def test_dispatcher_ignores_a_stamp_supplied_as_an_extra_field():
+    """A param validated from a client dict that carries the field runs with no context."""
+    node = _Probe()
+    param = IInvokeTool.Invoke.model_validate({'tool_name': 'whoami', 'input': {}, TOOL_CONTEXT_FIELD: _forged_stamp()})
+    node.invoke(param)
+    assert node.seen == [None]
+    assert param.output == {'context': None}
 
 
 def test_dispatcher_accepts_a_context_object_as_the_stamp():
