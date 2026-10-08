@@ -138,6 +138,18 @@ def _backend_errors(operation: str) -> Callable[[Callable[..., Any]], Callable[.
     return decorate
 
 
+#: Integer metadata fields; Pinecone stores every metadata number as a double and returns floats
+INT_METADATA = frozenset({'chunkId', 'tableId', 'permissionId', 'vectorSize', 'size', 'modifyTime'})
+
+
+def _int_metadata(metadata: Dict[str, Any]) -> Dict[str, Any]:
+    """Metadata with the integral floats of integer fields turned back into ints."""
+    return {
+        key: int(value) if key in INT_METADATA and isinstance(value, float) and value.is_integer() else value
+        for key, value in metadata.items()
+    }
+
+
 def _keyed_id(objectId: str, chunkId: int) -> str:
     """The vector id of a chunk: uuid5 of '<objectId>#<chunkId>'."""
     return str(uuid.uuid5(uuid.NAMESPACE_URL, f'{objectId}#{chunkId}'))
@@ -396,7 +408,7 @@ class Store(DocumentStoreBase):
         return {
             'id': str(_field(item, 'id', vec_id)),
             'score': _field(item, 'score', 0.0),
-            'metadata': dict(_field(item, 'metadata', {}) or {}),
+            'metadata': _int_metadata(dict(_field(item, 'metadata', {}) or {})),
             'values': list(_field(item, 'values', []) or []),
         }
 

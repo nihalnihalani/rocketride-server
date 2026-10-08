@@ -136,3 +136,19 @@ def test_a_pod_index_cannot_sample_or_list(adapter):
     page = store.listDocuments(cursor=None, limit=10, object_ids=None, deleted='active', sort='path')
     assert [row.objectId for row in page.items] == ['doc-a']
     assert page.next_cursor is None
+
+
+def test_metadata_numbers_come_back_as_integers(adapter, store):
+    """Pinecone keeps every metadata number as a float; integer fields are reported as ints again."""
+    h.ingest(store, 'doc-a', '/docs/a.md', [0, 1])
+    fetched = store.client.Index(store.collection).fetch(ids=[h.keyed_uuid('doc-a', 1)])
+    raw = next(iter(fetched['vectors'].values()))['metadata']
+    assert type(raw['chunkId']) is float and type(raw['size']) is float  # the service's shape
+
+    rows, _ = h.collect_listing(store, limit=10)
+    assert (rows[0].size, rows[0].modifyTime) == (1000, 1700000000)
+    assert type(rows[0].size) is int and type(rows[0].modifyTime) is int
+    docs, _ = h.collect_chunks(store, 'doc-a', limit=10)
+    for doc in docs + store.getVectors([('doc-a', 1)]):
+        meta = doc.metadata.model_dump()
+        assert all(type(meta[key]) is int for key in ('chunkId', 'size', 'modifyTime', 'tableId', 'permissionId'))

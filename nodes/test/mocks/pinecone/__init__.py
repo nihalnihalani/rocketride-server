@@ -33,6 +33,7 @@ Mocked Components:
     - Index operations (query, upsert, delete, describe_index_stats, fetch, fetch_by_metadata)
     - The server limits that matter to the driver: ``top_k`` at most 1000 when metadata
       or values are returned, and metadata values that are never null or objects
+    - Metadata numbers come back as floats, as the service stores them
 
 Storage:
     - Uses class-level storage to persist data across operations within a test
@@ -281,12 +282,14 @@ class MockIndex:
         return dot_product / (norm1 * norm2)
 
     def _serialize_metadata(self, metadata: Dict) -> Dict:
-        """Serialize metadata, handling special types and excluding None values."""
+        """Serialize metadata as the service returns it: no None values, every number a float."""
         result = {}
         for key, value in metadata.items():
             if value is None:
                 continue  # Skip None values
-            if hasattr(value, 'model_dump'):
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                result[key] = float(value)  # Pinecone stores metadata numbers as doubles
+            elif hasattr(value, 'model_dump'):
                 result[key] = value.model_dump(exclude_none=True)
             elif isinstance(value, dict):
                 result[key] = {k: v for k, v in value.items() if v is not None}
