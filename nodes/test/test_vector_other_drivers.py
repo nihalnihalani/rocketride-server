@@ -125,6 +125,7 @@ def test_score_info_reports_floor_and_threshold(adapter, store):
     """The score info carries the legacy floor; minScore=-inf lifts it."""
     info = store.scoreInfo()
     assert {'formula', 'higher_is_better', 'floor', 'threshold'} <= set(info)
+    assert info['formula'] != 'unknown'  # the driver describes its own score, not the base default
     assert info['floor'] == pytest.approx(adapter.floor)
     assert store.effectiveFloor(DocFilter()) == pytest.approx(adapter.floor)
     assert store.effectiveFloor(h.VxFilter(minScore=float('-inf'))) == float('-inf')
@@ -172,8 +173,8 @@ def test_count_chunks_honours_the_deleted_modes(adapter, store):
 
 
 def test_count_chunks_on_a_missing_collection_is_zero(adapter, store):
-    """Nothing stored yet: zero (or None where the backend cannot count)."""
-    assert store.countChunks(DocFilter()) in (0, None)
+    """Nothing stored yet: zero where the driver counts, None where the backend cannot."""
+    assert store.countChunks(DocFilter()) == (0 if adapter.counts else None)
 
 
 # -----------------------------------------------------------------------------
@@ -407,7 +408,8 @@ def test_sample_chunks_returns_vectors_and_the_strategy_used(adapter, store):
         n=4, seed=7, strategy='random', docFilter=h.VxFilter(deleted='active'), include_keys=[]
     )
     assert used == adapter.random_strategy
-    assert 1 <= len(docs) <= 4
+    assert len(docs) == 4  # min(n, active rows): five active chunks, four asked for
+    assert len({(doc.metadata.objectId, doc.metadata.chunkId) for doc in docs}) == 4
     for doc in docs:
         assert doc.metadata.objectId in ('doc-a', 'doc-b')
         assert len(doc.embedding) == h.DIM
