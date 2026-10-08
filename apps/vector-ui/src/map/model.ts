@@ -160,3 +160,73 @@ export function neighboursOf(sample: ISampleResult, i: number, limit = Infinity)
 	for (let e = start; e < end && out.length < limit; e += 1) out.push({ i: sample.knn.cols[e] as number, sim: sample.knn.sims[e] as number });
 	return out;
 }
+
+/** The shift and scale that bring a layout into the display frame. */
+export interface ILayoutTransform {
+	cx: number;
+	cy: number;
+	cz: number;
+	/** Multiplier applied after centring. */
+	s: number;
+}
+
+/**
+ * Bring a layout into one display frame: its visible points centred on the
+ * origin with an RMS radius of 1. PCA coordinates and force-layout units differ
+ * by orders of magnitude; in one frame the camera stays put and a layout change
+ * can tween.
+ *
+ * @param raw - Layout coordinates, `dims` per point.
+ * @param dims - 2 or 3.
+ * @param hidden - Points left out of the frame (still transformed).
+ * @returns The transformed coordinates and the transform (for the star and pinned points).
+ */
+export function normaliseLayout(raw: Float32Array, dims: 2 | 3, hidden: ArrayLike<number> | null): { positions: Float32Array; transform: ILayoutTransform } {
+	const n = Math.floor(raw.length / dims);
+	let count = 0;
+	let cx = 0;
+	let cy = 0;
+	let cz = 0;
+	for (let i = 0; i < n; i += 1) {
+		if (hidden && hidden[i]) continue;
+		cx += raw[i * dims] as number;
+		cy += raw[i * dims + 1] as number;
+		if (dims === 3) cz += raw[i * dims + 2] as number;
+		count += 1;
+	}
+	if (count > 0) {
+		cx /= count;
+		cy /= count;
+		cz /= count;
+	}
+	let r2 = 0;
+	for (let i = 0; i < n; i += 1) {
+		if (hidden && hidden[i]) continue;
+		const dx = (raw[i * dims] as number) - cx;
+		const dy = (raw[i * dims + 1] as number) - cy;
+		const dz = dims === 3 ? (raw[i * dims + 2] as number) - cz : 0;
+		r2 += dx * dx + dy * dy + dz * dz;
+	}
+	const rms = count > 0 ? Math.sqrt(r2 / count) : 0;
+	const transform: ILayoutTransform = { cx, cy, cz, s: rms > 0 && Number.isFinite(rms) ? 1 / rms : 1 };
+	const positions = new Float32Array(raw.length);
+	for (let i = 0; i < n; i += 1) {
+		positions[i * dims] = ((raw[i * dims] as number) - cx) * transform.s;
+		positions[i * dims + 1] = ((raw[i * dims + 1] as number) - cy) * transform.s;
+		if (dims === 3) positions[i * dims + 2] = ((raw[i * dims + 2] as number) - cz) * transform.s;
+	}
+	return { positions, transform };
+}
+
+/**
+ * Put a place (in raw layout units) into the display frame.
+ *
+ * @param place - x, y (and z).
+ * @param t - From {@link normaliseLayout}.
+ * @returns The place in the display frame.
+ */
+export function applyTransform(place: { x: number; y: number; z?: number }, t: ILayoutTransform): { x: number; y: number; z?: number } {
+	const out: { x: number; y: number; z?: number } = { x: (place.x - t.cx) * t.s, y: (place.y - t.cy) * t.s };
+	if (place.z !== undefined) out.z = (place.z - t.cz) * t.s;
+	return out;
+}

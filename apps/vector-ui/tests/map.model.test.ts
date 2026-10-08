@@ -9,7 +9,7 @@
 
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { chunkPath, hiddenMask, keyIndex, keyString, neighboursOf, pcaPositions, pointKey, visibleCount } from '../src/map/model';
+import { applyTransform, chunkPath, hiddenMask, keyIndex, keyString, neighboursOf, normaliseLayout, pcaPositions, pointKey, visibleCount } from '../src/map/model';
 import { biasedNote, sampleLabel } from '../src/map/wording';
 import { loadSample, modelOf } from './support/map.samples';
 
@@ -74,4 +74,30 @@ test('the sample label says how many of how many, and whether the sample is unif
 	assert.equal(biasedNote(demo), null);
 	assert.equal(sampleLabel({ ...demo, strategy_used: 'first', biased: false }), 'Showing 1,000 of 1,318 chunks (not a uniform sample)');
 	assert.equal(sampleLabel({ ...demo, of: { chunks: null, documents: null } }), 'Showing 1,000 chunks (random sample; the store did not say how many it holds)');
+});
+
+test('every layout is shown in one frame: visible points centred on the origin with an RMS radius of 1', () => {
+	const raw = new Float32Array([10, 10, 14, 10, 10, 14, 14, 14, 500, 500]);
+	const hidden = new Uint8Array([0, 0, 0, 0, 1]);
+	const { positions, transform } = normaliseLayout(raw, 2, hidden);
+	let sx = 0;
+	let sy = 0;
+	let r2 = 0;
+	for (let i = 0; i < 4; i += 1) {
+		sx += positions[2 * i] as number;
+		sy += positions[2 * i + 1] as number;
+		r2 += (positions[2 * i] as number) ** 2 + (positions[2 * i + 1] as number) ** 2;
+	}
+	assert.ok(Math.abs(sx) < 1e-6 && Math.abs(sy) < 1e-6, 'centred');
+	assert.ok(Math.abs(r2 / 4 - 1) < 1e-6, 'RMS radius 1');
+	// A place in layout units goes through the same transform (the query star, pinned points).
+	const p = applyTransform({ x: 14, y: 14 }, transform);
+	assert.ok(Math.abs(p.x - (positions[6] as number)) < 1e-6 && Math.abs(p.y - (positions[7] as number)) < 1e-6);
+	// The hidden point is transformed too (indices stay put) but did not set the frame.
+	assert.ok(Number.isFinite(positions[8] as number));
+	const flat = normaliseLayout(new Float32Array([3, 3, 3, 3]), 2, null);
+	assert.deepEqual(Array.from(flat.positions), [0, 0, 0, 0]);
+	const three = normaliseLayout(new Float32Array([0, 0, 1, 0, 0, -1]), 3, null);
+	assert.equal(three.positions.length, 6);
+	assert.ok(applyTransform({ x: 0, y: 0, z: 1 }, three.transform).z !== undefined);
 });
