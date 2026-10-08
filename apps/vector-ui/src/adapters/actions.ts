@@ -150,3 +150,16 @@ export function vectorChannels(store: Pick<IEndpointStore, 'channel'>, client: I
 	const bound = (role: string) => (endpoint.roles[role] ? store.channel(client, endpoint, role) : null);
 	return { tools: bound('tools'), chat: bound('chat'), ingest: bound('ingest') };
 }
+
+/**
+ * One document's directory row (`documents` with `object_ids`), or null when it is not stored.
+ *
+ * @param caller - A session or channel.
+ * @param nodeId - The store node.
+ * @param objectId - The objectId.
+ * @returns The row, or null.
+ */
+export async function fetchDocument(caller: IVectorCaller, nodeId: string, objectId: string): Promise<IDocumentsPageView['items'][number] | null> {
+	const page = readDocumentsPage(await callVector(caller, nodeId, TOOL.documents, { cursor: null, limit: 1, object_ids: [objectId], deleted: 'all', sort: 'path' }));
+	return page.items.find((item) => item.objectId === objectId) ?? null;
+}

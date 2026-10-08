@@ -1,0 +1,212 @@
+// =============================================================================
+// MIT License
+// Copyright (c) 2026 Aparavi Software AG
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+
+// =============================================================================
+// VECTOR-UI - DOCUMENT VIEW (one stored document, every chunk in reading order)
+// =============================================================================
+//
+// Header: path, objectId (copy), chunk count, size, type and ingest time
+// where the store keeps them, the "no first chunk" note, the support badge
+// and the trash button (gated; it asks the console, which confirms). Body:
+// the chunks in reading order, a page of 100 at a time, table chunks tagged,
+// each with its length and "map"; "Show chunk path on map"; a toggle that
+// includes deleted chunks. Calls ride on the connection's anchor channel
+// (Tools, or Chat on a read-only connection).
+// =============================================================================
+
+import React, { useCallback, useEffect, useRef, useState } from 'react';
+import { Banner, Button, BxTrash, ContentHeader } from 'shell';
+import type { DocumentViewProps, IChunkItem, IDocumentItem, VectorKey } from '../contract/types';
+import { fetchChunks, fetchDocument } from '../adapters/actions';
+import type { IVectorCaller } from '../adapters/actions';
+import HeatStrip from '../components/HeatStrip';
+import SupportBadge from '../components/SupportBadge';
+import { CHUNKS_PAGE } from '../vector/budgets';
+import { fileTypeOf, formatSize } from '../vector/fileType';
+import { formatCount } from '../vector/stats';
+import { supportOf } from '../vector/support';
+import { failureText } from '../vector/wording';
+import type { IFailureText } from '../vector/wording';
+import { FOCUS_RING, styles } from '../styles';
+
+export type { DocumentViewProps };
+
+/** The chunks of the document, loaded a page at a time. */
+interface IChunkState {
+	items: IChunkItem[];
+	hasMore: boolean;
+	nextAfter: number;
+	total: number | null;
+	loading: boolean;
+	error: IFailureText | null;
+}
+
+const NO_CHUNKS: IChunkState = { items: [], hasMore: false, nextAfter: -1, total: null, loading: false, error: null };
+
+/**
+ * One document's tab.
+ *
+ * @param props - The frozen DocumentViewProps.
+ * @returns The view.
+ */
+export function DocumentView({ model, channels, selection, actions, objectId, path, chunkId }: DocumentViewProps): React.ReactElement {
+	const caller: IVectorCaller | null = channels.tools ?? channels.chat ?? channels.ingest;
+	const store = model.nodes.store;
+	const [info, setInfo] = useState<IDocumentItem | null>(null);
+	const [infoError, setInfoError] = useState<IFailureText | null>(null);
+	const [withDeleted, setWithDeleted] = useState(false);
+	const [chunks, setChunks] = useState<IChunkState>(NO_CHUNKS);
+	const run = useRef(0);
+
+	const load = useCallback(
+		async (afterChunk: number) => {
+			if (caller === null) return;
+			const mine = run.current;
+			setChunks((prev) => ({ ...(afterChunk < 0 ? NO_CHUNKS : prev), loading: true, error: null }));
+			try {
+				const page = await fetchChunks(caller, store, { objectId, afterChunk, limit: Math.min(CHUNKS_PAGE, model.limits.chunks_page), deleted: withDeleted ? 'all' : 'active' });
+				if (mine !== run.current) return;
+				setChunks((prev) => ({ items: afterChunk < 0 ? page.items : [...prev.items, ...page.items], hasMore: page.hasMore, nextAfter: page.nextAfter, total: page.total, loading: false, error: null }));
+			} catch (error) {
+				if (mine !== run.current) return;
+				const text = failureText(error);
+				if (text) setChunks((prev) => ({ ...prev, loading: false, error: text }));
+			}
+		},
+		[caller, store, objectId, withDeleted, model.limits.chunks_page]
+	);
+
+	useEffect(() => {
+		run.current += 1;
+		void load(-1);
+	}, [load]);
+
+	useEffect(() => {
+		if (caller === null) return undefined;
+		let live = true;
+		fetchDocument(caller, store, objectId).then(
+			(row) => {
+				if (live) setInfo(row);
+			},
+			(error) => {
+				if (live) setInfoError(failureText(error));
+			}
+		);
+		return () => {
+			live = false;
+		};
+	}, [caller, store, objectId]);
+
+	// Scroll to the chunk the tab was opened at, once it is listed.
+	const listRef = useRef<HTMLOListElement>(null);
+	useEffect(() => {
+		if (chunkId === undefined) return;
+		const el = listRef.current?.querySelector(`[data-chunk="${chunkId}"]`);
+		if (el && 'scrollIntoView' in el) (el as HTMLElement).scrollIntoView({ block: 'center' });
+	}, [chunkId, chunks.items.length]);
+
+	const shownPath = info?.path ?? path ?? objectId;
+	const focused = selection.getState().chunk;
+	const keys: VectorKey[] = chunks.items.map((c) => [objectId, c.chunkId] as const);
+
+	return (
+		<div style={styles.root} data-document={objectId}>
+			<ContentHeader
+				title={shownPath}
+				subtitle={`${model.collection ?? 'collection'} · ${model.connection.endpoint.pipelineName}`}
+				actions={
+					<>
+						<SupportBadge support={supportOf(model.connection.endpoint.provider, model.connection.dialect)} />
+						<Button variant="ghost" disabled={keys.length === 0} onClick={() => actions.showOnMap(keys, 'document')}>
+							Show chunk path on map
+						</Button>
+						<button type="button" style={{ ...styles.iconButton, opacity: model.writes.enabled ? 1 : 0.55, cursor: model.writes.enabled ? 'pointer' : 'not-allowed' }} aria-label={`Remove ${shownPath} from the database`} title={model.writes.enabled ? `Remove ${shownPath} from the database` : (model.writes.reason ?? undefined)} disabled={!model.writes.enabled} onClick={() => actions.requestRemove([objectId])} onFocus={(event) => (event.currentTarget.style.outline = FOCUS_RING)} onBlur={(event) => (event.currentTarget.style.outline = 'none')}>
+							<BxTrash />
+						</button>
+					</>
+				}
+			/>
+			<div style={styles.content}>
+				{caller === null && <Banner variant="warning">No source of this pipeline is running, so the document cannot be read.</Banner>}
+				{infoError && <Banner variant="error">{infoError.headline}</Banner>}
+				<dl style={{ display: 'grid', gridTemplateColumns: 'max-content 1fr', gap: '4px 16px', margin: '0 0 12px', ...styles.small }}>
+					<dt style={{ fontWeight: 600 }}>objectId</dt>
+					<dd style={{ margin: 0, display: 'flex', gap: 8, alignItems: 'center' }}>
+						<code style={{ overflowWrap: 'anywhere' }}>{objectId}</code>
+						<Button mini variant="ghost" onClick={() => void navigator.clipboard?.writeText(objectId)}>
+							Copy
+						</Button>
+					</dd>
+					<dt style={{ fontWeight: 600 }}>Chunks</dt>
+					<dd style={{ margin: 0 }}>{info?.chunks != null ? formatCount(info.chunks) : chunks.total !== null ? formatCount(chunks.total) : '—'}</dd>
+					<dt style={{ fontWeight: 600 }}>Type</dt>
+					<dd style={{ margin: 0 }}>{fileTypeOf(shownPath)}</dd>
+					{info?.size != null && (
+						<>
+							<dt style={{ fontWeight: 600 }}>Size</dt>
+							<dd style={{ margin: 0 }}>{formatSize(info.size)}</dd>
+						</>
+					)}
+					{info?.ingestedAt && (
+						<>
+							<dt style={{ fontWeight: 600 }}>Ingested</dt>
+							<dd style={{ margin: 0 }}>{info.ingestedAt.replace('T', ' ').replace('Z', ' UTC')}</dd>
+						</>
+					)}
+				</dl>
+				{info && !info.has_first_chunk && <Banner variant="info">This document has no first chunk on this store (it was partly removed or partly ingested); it is listed under "Without first chunk".</Banner>}
+				<div style={{ display: 'flex', gap: 12, alignItems: 'center', margin: '12px 0' }}>
+					<label style={{ display: 'flex', gap: 6, alignItems: 'center', ...styles.small }}>
+						<input type="checkbox" checked={withDeleted} onChange={(event) => setWithDeleted(event.target.checked)} />
+						Include deleted chunks
+					</label>
+				</div>
+				<HeatStrip chunks={chunks.total ?? chunks.items.length} scores={[]} focused={focused !== null && focused[0] === objectId ? focused[1] : null} onSelectChunk={(id) => selection.focusChunk([objectId, id])} label="Similarity of each chunk to the query" />
+				{chunks.error && <Banner variant="error">{chunks.error.headline}</Banner>}
+				<ol ref={listRef} aria-label="Chunks in reading order" style={{ listStyle: 'none', margin: '12px 0 0', padding: 0 }}>
+					{chunks.items.map((chunk) => (
+						<li key={chunk.chunkId} data-chunk={chunk.chunkId} style={{ padding: '10px 0', borderTop: '1px solid var(--rr-border)', borderLeft: chunk.chunkId === chunkId ? '3px solid var(--rr-border-focus)' : '3px solid transparent', paddingLeft: 10 }}>
+							<div style={{ display: 'flex', gap: 8, alignItems: 'center', ...styles.small }}>
+								<strong>{`#${chunk.chunkId}`}</strong>
+								<span>{`${formatCount(chunk.length)} chars`}</span>
+								{chunk.isTable && <span style={styles.chip('var(--rr-border-input)')}>table</span>}
+								{chunk.isDeleted && <span style={styles.chip('var(--rr-border-input)')}>deleted</span>}
+								<Button mini variant="ghost" onClick={() => actions.showOnMap([[objectId, chunk.chunkId]], 'document')}>
+									map
+								</Button>
+							</div>
+							<div style={{ fontSize: 13, lineHeight: 1.55, marginTop: 4, whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }}>{chunk.content}</div>
+						</li>
+					))}
+				</ol>
+				{chunks.loading && <div style={styles.small}>Loading chunks…</div>}
+				{chunks.hasMore && !chunks.loading && (
+					<Button variant="secondary" onClick={() => void load(chunks.nextAfter)}>
+						More chunks
+					</Button>
+				)}
+			</div>
+		</div>
+	);
+}
+
+export default DocumentView;
