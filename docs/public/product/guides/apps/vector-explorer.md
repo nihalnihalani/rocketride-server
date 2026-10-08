@@ -314,14 +314,19 @@ document's chunks in order on the map.
 
 ## What the notes mean
 
-**Experimental** is the support level the store node reports, not a note with
-a sentence of its own: a store is marked supported only after its tests
-against a live server pass. The other notes are explained by these sentences:
+**Experimental** is the support level the store node reports: a store is
+marked supported only after its tests against a live server pass. An
+Experimental store also carries the first note below. Each note has one
+sentence:
 
 | When | The app says |
 | --- | --- |
+| The store is marked Experimental | Experimental: this store was checked against stand-ins only in this build. |
 | The store searches exactly, without an index | This store searches by brute force (exact); large collections answer slowly. |
+| The store cannot count with a filter (Pinecone, for example) | This store cannot count with a filter, so some figures are not shown. |
 | The store's scores are not on a 0–1 scale | Scores are the backend's raw values, not 0–1. |
+| Earlier releases reported this store's scores the wrong way round (Chroma; Qdrant and Weaviate with some metrics) | Scores on this store were inverted before this release; they now rise with similarity. |
+| The map's sample is not uniform | This sample is not uniform: some documents are over-represented. |
 | The store does not keep the extra file details | This backend does not keep file size or ingest time. |
 | The store is a cloud service that was not checked against a live server | This backend was not run against a live server in this build. |
 | The store counts documents by their first chunk | Documents are counted by their first chunk on this store. |
@@ -330,6 +335,9 @@ against a live server pass. The other notes are explained by these sentences:
 | The store cannot page its document list | This store cannot page its document list; only the first page is shown. |
 | The chat's embedding model is not the collection's | The chat embedding model differs from the one this collection was built with; results may be meaningless. |
 | pgvector could not add its metadata column yet | File size and ingest time are not stored yet: another session holds this table; the store will retry. |
+
+On RocketRide Vector the drawer also says that the table is shared; that
+sentence is quoted under [Connections](#connections).
 
 ## Where document paths come from
 
