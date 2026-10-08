@@ -210,6 +210,34 @@ test('chat: Stop waiting frees the composer and drops the late answer', async ()
 	assert.equal(fake.asks.length, 2);
 });
 
+test('chat: a late answer the channel still delivers after "Stop waiting" or a reset is dropped by the session itself', async () => {
+	// A channel that does not drop expired answers: the session's own ticket check must.
+	let pending = deferred<Record<string, unknown>>();
+	const fake = fakeDeps({ ask: () => pending.promise });
+	const session = createChatSession(fake.deps);
+
+	const stopped = session.send('q1', null);
+	await flush();
+	session.stopWaiting();
+	pending.resolve(WITH_DOCUMENTS);
+	await stopped;
+	assert.equal(session.getState().turns[0].status, 'stopped');
+	assert.equal(session.getState().turns[0].answer, null);
+	assert.equal(session.getState().asking, false);
+
+	pending = deferred<Record<string, unknown>>();
+	const reset = session.send('q2', null);
+	await flush();
+	session.clear();
+	pending.resolve(WITH_DOCUMENTS);
+	await reset;
+	assert.deepEqual(session.getState().turns, []);
+	assert.equal(session.getState().asking, false);
+
+	assert.equal(fake.answered.length, 0);
+	assert.ok(!fake.announced.some((message) => message.startsWith('Answer received')), fake.announced.join(' | '));
+});
+
 test('chat: dispose forgets the conversation and ignores a late answer', async () => {
 	const fake = fakeDeps();
 	const session = createChatSession(fake.deps);
