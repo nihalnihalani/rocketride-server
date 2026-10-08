@@ -358,17 +358,19 @@ Vector Explorer, and a line is logged when one is stored.
   memory for the session only, never in history, preferences or anything saved.
   When you sign out, or switch organization or team, every connection, list,
   chat, map and selection is cleared.
-- **Run log traces.** When a pipeline runs with tracing on (the `summary` or
-  `full` trace level; the VS Code extension starts runs with `full`, an SDK
-  `use()` with `none`), its run log records each tool call's input and the
-  first 2 KB of its output. For Vector Explorer that means your map queries,
-  document paths and ids, snippets of chunk text, and for a `vectors` answer
-  (the one request that returns raw embedding values) the start of the raw
-  vector. The chat's questions and the chunks passed to the LLM travel through
-  the pipeline's lanes and are recorded at those levels too. Run logs are kept
-  7 days for development runs and 30 days for deployments; see
-  [Observability](/guides/observability). If that matters, start the pipeline
-  with tracing off.
+- **Run log traces.** When a pipeline runs with any trace level other than
+  `none` (`metadata`, `summary` or `full`), its run log records each tool
+  call's input and the first 2 KB of its output. The VS Code extension starts
+  runs with `full`, the MCP tools with `summary`, and an SDK `use()` with
+  `none`; a deployment records at `full` unless its schedule sets a lower
+  level. For Vector Explorer that means your map queries, document paths and
+  ids, snippets of chunk text, and for a `vectors` answer (the one request that
+  returns raw embedding values) the start of the raw vector. The chat's
+  questions and the chunks passed to the LLM travel through the pipeline's
+  lanes, which `summary` and `full` record too. Run logs are kept 7 days for
+  development runs and 30 days for deployments; see
+  [Observability](/guides/observability). If that matters, start the pipeline,
+  or set the deployment's schedule, with the trace level `none`.
 - **Chat history** keeps the text of your questions only, and is forgotten on
   sign-out.
 
