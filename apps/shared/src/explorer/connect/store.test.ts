@@ -31,12 +31,22 @@ import type { EndpointWatch, IEndpointStore, IWatchHandlers } from './store';
 import { codedError, fakeWorld, manualClock, row } from './testing';
 import type { IFakeWorld, IManualClock, IToolCall } from './testing';
 import { SINGLE_TOOLS_ROLE, VECTOR_ROLES } from '../types';
-import type { IExplorerIdentity } from '../types';
+import type { IExplorerIdentity, IRoleSpec } from '../types';
 import { identityFingerprint, identityFromConnectResult } from './identity';
 import { ExplorerToolError } from '../errors';
 import { checkRowEnvelope } from '../checks';
 
 const DB = new Set(['db_postgres']);
+
+/** A multi-role spec whose tools role is REQUIRED (no providers, no read-only anchors). */
+const TOOLS_REQUIRED: IRoleSpec = {
+	roles: {
+		ingest: { sources: ['ingest_1'], required: false },
+		chat: { sources: ['chat_1'], required: false },
+		tools: { sources: ['tools_1'], required: true },
+	},
+	toolsRole: 'tools',
+};
 const NEO4J_INFO = { dialect: 'neo4j', engine: { name: 'Neo4j', version: '5.26.31' }, capabilities: { read_query: true }, limits: { statement_timeout_ms: 30000 } };
 
 /** A watch that records its handlers so a test can fire task events, focus and identity changes by hand. */
@@ -527,9 +537,9 @@ describe('refresh — a vanished endpoint is stopped, a returning one is probed 
 		assert.equal(store.getState().endpoints[0]!.state, 'stopped');
 	});
 
-	it('a vector connection missing its tools source is listed stopped with no probe', async () => {
+	it('a multi-role connection missing its REQUIRED tools source is listed stopped with no probe', async () => {
 		const vec = (source: string) => row({ source, pipeline: { project_id: 'vp', components: [{ id: 'v_1', provider: 'rocketride_vector' }] } });
-		const { store, world } = make([vec('ingest_1'), vec('chat_1')], undefined, { providers: new Set(['rocketride_vector']), roles: VECTOR_ROLES });
+		const { store, world } = make([vec('ingest_1'), vec('chat_1')], undefined, { providers: new Set(['rocketride_vector']), roles: TOOLS_REQUIRED });
 		await store.refresh(world.client);
 		assert.equal(store.getState().endpoints[0]!.state, 'stopped');
 		assert.equal(probes(world), 0);

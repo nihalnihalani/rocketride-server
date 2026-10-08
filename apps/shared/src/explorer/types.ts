@@ -24,9 +24,9 @@
 // EXPLORER — TYPES (the contract every Explorer app compiles in)
 // =============================================================================
 //
-// Shared by SQL Explorer, Graph Explorer and (tested with mocks only) Vector
-// Explorer. This module is TYPES AND CONSTANTS ONLY and imports nothing from
-// 'shell', so it loads under node:test with or without the platform stub.
+// Shared by SQL Explorer, Graph Explorer and Vector Explorer. This module is
+// TYPES AND CONSTANTS ONLY and imports nothing from 'shell', so it loads under
+// node:test with or without the platform stub.
 //
 // The library is compiled INTO each app (factories, no module-level state, no
 // Module Federation singleton). Contract revision: v1 (explorer-foundation).
@@ -63,8 +63,9 @@ export interface IExplorerClient {
 	/**
 	 * Upload files into a task's data lane (the dropper path). Only the role
 	 * channel of a multi-role connection calls this (Vector Explorer's ingest).
-	 * Resolves with one upload result per file (the SDK's UPLOAD_RESULT, which
-	 * has no index signature, hence `object`).
+	 * Resolves with one upload result per file. Typed `object` because the SDK's
+	 * UPLOAD_RESULT has no index signature: the role channel copies each result
+	 * into a plain record (`IRoleChannel.sendFiles`), so apps never see this type.
 	 */
 	sendFiles?(files: ISendFile[], token: string, maxConcurrent?: number): Promise<object[]>;
 	/** Ask a chat source a question. Only the role channel of a multi-role connection calls this. */
@@ -182,9 +183,12 @@ export interface IRoleDef {
 	/** Source component ids that fill the role; null = ANY source (single-role SQL/Graph). */
 	sources: readonly string[] | null;
 	/**
-	 * Source providers that also fill the role (a row fills it when its own
-	 * source component has one of these providers). Not implemented yet:
-	 * discovery refuses a role spec that uses it.
+	 * Source providers that also fill the role: a row fills it when its own
+	 * source component (the component whose id is the row's `source`, read from
+	 * the row's `pipeline.components`) has one of these providers. A source the
+	 * role names in `sources` is preferred over a provider match. A role with
+	 * providers keys on a fixed `~provider+provider` marker (see keys.ts), so the
+	 * connection's key does not depend on which source fills it.
 	 */
 	providers?: readonly string[];
 	/** A required role that is not running makes the endpoint 'stopped' (it cannot be called). */
@@ -202,9 +206,10 @@ export interface IRoleSpec {
 	/** The role whose task token carries tool calls. */
 	toolsRole: string;
 	/**
-	 * Roles that may anchor a read-only connection when the tools role is not
-	 * running, in order. Not implemented yet: discovery refuses a role spec
-	 * that uses it.
+	 * Roles that may anchor a READ-ONLY connection when the tools role is not
+	 * running, in order: the first bound one carries the connection's calls
+	 * (its token is the endpoint's token) and the endpoint is `readOnly`.
+	 * Without it, a connection whose tools role is not running has no token.
 	 */
 	readOnlyAnchors?: readonly string[];
 }
@@ -216,17 +221,20 @@ export const SINGLE_TOOLS_ROLE: IRoleSpec = {
 };
 
 /**
- * Vector Explorer's three-source connection. No Vector app ships in this
- * release; the role map is exercised by tests with mocks so the API is not
- * expensive to change later.
+ * Vector Explorer's three-source connection: an ingest source (dropper or
+ * webhook), a chat source and a Tools source of ONE project. Every role is
+ * optional and matched by its source's provider too, so a stock RAG pipeline
+ * (webhook + chat, no Tools source) still becomes a connection: a read-only one
+ * anchored on its chat source, or on its ingest source when chat is not running.
  */
 export const VECTOR_ROLES: IRoleSpec = {
 	roles: {
-		ingest: { sources: ['ingest_1'], required: false },
-		chat: { sources: ['chat_1'], required: false },
-		tools: { sources: ['tools_1'], required: true },
+		ingest: { sources: ['ingest_1'], providers: ['dropper', 'webhook'], required: false },
+		chat: { sources: ['chat_1'], providers: ['chat'], required: false },
+		tools: { sources: ['tools_1'], providers: ['tools'], required: false },
 	},
 	toolsRole: 'tools',
+	readOnlyAnchors: ['chat', 'ingest'],
 };
 
 // =============================================================================
@@ -312,14 +320,31 @@ export interface IExplorerEndpoint {
 	running: boolean;
 	/**
 	 * The pipeline's components (id, provider, name and control edges only;
-	 * never config). Not filled yet: absent on every endpoint discovery returns today.
+	 * never config, never input edges). Set on every endpoint discovered over a
+	 * MULTI-role spec; absent on single-role (SQL, Graph) endpoints, whose
+	 * snapshots, payloads and documents stay exactly as they were. Narrow with
+	 * `isMultiRoleEndpoint` (connect/discovery.ts) to read it as required.
 	 */
 	components?: ReadonlyArray<IExplorerComponent>;
-	/** The role whose task token this endpoint's calls use. Not filled yet. */
+	/** The role whose task token this endpoint's calls use (multi-role only; see `components`). */
 	anchorRole?: string;
-	/** True when the endpoint is anchored on a role other than the tools role. Not filled yet. */
+	/** True when the endpoint is anchored on a role other than the tools role (multi-role only; see `components`). */
 	readOnly?: boolean;
 }
+
+/**
+ * An endpoint discovered over a multi-role spec (Vector Explorer): the three
+ * connection fields are always present. Discovery fills them for every
+ * multi-role endpoint and never for a single-role one.
+ */
+export type IMultiRoleEndpoint = IExplorerEndpoint & {
+	/** The pipeline's components (id, provider, name and control edges only). */
+	components: ReadonlyArray<IExplorerComponent>;
+	/** The role whose task token this endpoint's calls use. */
+	anchorRole: string;
+	/** True when the endpoint is anchored on a role other than the tools role. */
+	readOnly: boolean;
+};
 
 /** Result of the one-per-endpoint probe. */
 export interface IProbeResult {
