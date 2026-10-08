@@ -503,3 +503,120 @@ class WeaviateAdapter(Adapter):
             return mock.QueryResult(objects=hits)
 
         store.collectionObj.query.near_vector = near_vector
+
+
+class PineconeAdapter(Adapter):
+    """Pinecone (serverless) through ``nodes/test/mocks/pinecone``."""
+
+    name = 'pinecone'
+    backend = 'pinecone'
+    services = 'store_pinecone/services.json'
+    floor = 0.0
+    offset_raises = True
+    extras_stored = True
+    counts = False
+    listing_counts = False
+    remove_counts = False
+
+    def __init__(self) -> None:
+        """Load the driver against the pinecone mock."""
+        self.module, mocks = load_driver(
+            'store_pinecone/pinecone.py', '_vx_pinecone_driver', mock_libs=('pinecone',), preload=('pinecone.grpc',)
+        )
+        self.mock = mocks['pinecone']
+
+    def new_store(self, profile: str = 'serverless-dense') -> Any:
+        """A store on an empty mock project."""
+        self.mock.MockPinecone.reset()
+        return bare_store(
+            self.module.Store,
+            collection='vx-test',
+            apikey=None,
+            profile=profile,
+            threshold_search=0.5,
+            renderChunkSize=32 * 1024 * 1024,
+            similarity='cosine',
+            client=self.mock.MockPinecone(api_key=None),
+        )
+
+    def storage(self, store: Any) -> Dict[str, Dict[str, Any]]:
+        """The mock's vectors for the index, keyed by id."""
+        return self.mock.MockIndex._all_storage.setdefault(store.collection, {})
+
+    def seed_legacy(self, store: Any) -> None:
+        """Vectors as today's driver wrote them: uuid4 ids, declared fields plus content."""
+        store._createCollection(DIM)
+        for object_id, chunk_id, meta, content in legacy_rows():
+            metadata = {**meta, 'content': content}
+            vector = vector_for(object_id, chunk_id)
+            if object_id == 'schema':
+                metadata.update({'nodeId': '', 'parent': '', 'permissionId': 0, 'isTable': False, 'tableId': 0})
+                vector = [0.0] * (DIM - 1) + [1.0]
+            self.storage(store)[random_uuid()] = {'values': vector, 'metadata': metadata}
+
+    def _wrap_index(self, store: Any, method: str, factory: Callable[[Callable[..., Any]], Callable[..., Any]]) -> None:
+        original_index = store.client.Index
+
+        def index(name: str) -> Any:
+            idx = original_index(name)
+            replace_method(idx, method, factory)
+            return idx
+
+        store.client.Index = index
+
+    def ignore_offsets(self, store: Any) -> None:
+        """Make fetch_by_metadata ignore its pagination token."""
+
+        def factory(original: Callable[..., Any]) -> Callable[..., Any]:
+            def fetch_by_metadata(*args: Any, **kwargs: Any) -> Any:
+                kwargs['pagination_token'] = None
+                return original(*args, **kwargs)
+
+            return fetch_by_metadata
+
+        self._wrap_index(store, 'fetch_by_metadata', factory)
+
+    def raw_rows(self, store: Any) -> List[Dict[str, Any]]:
+        """Every stored vector."""
+        return [
+            {
+                'objectId': v['metadata'].get('objectId'),
+                'chunkId': v['metadata'].get('chunkId'),
+                'meta': v['metadata'],
+                'id': vid,
+            }
+            for vid, v in self.storage(store).items()
+        ]
+
+    def set_scores(self, store: Any, scores: Sequence[float]) -> None:
+        """Answer the next semantic query with one match per score (raw cosine)."""
+        rows = [(vid, v) for vid, v in self.storage(store).items() if v['metadata'].get('objectId') != 'schema']
+
+        def factory(original: Callable[..., Any]) -> Callable[..., Any]:
+            def query(*args: Any, **kwargs: Any) -> Any:
+                # The driver's own reads query with a constant vector of ones; answer those for real
+                if all(x == 1 for x in kwargs.get('vector') or []):
+                    return original(*args, **kwargs)
+                return {
+                    'matches': [
+                        {'id': vid, 'score': score, 'metadata': dict(v['metadata'])}
+                        for (vid, v), score in zip(rows, scores)
+                    ]
+                }
+
+            return query
+
+        original_search = type(store).searchSemantic.__get__(store, type(store))
+
+        def search(query: Any, docFilter: Any) -> Any:
+            saved = store.client.__dict__.get('Index')
+            self._wrap_index(store, 'query', factory)
+            try:
+                return original_search(query, docFilter)
+            finally:
+                if saved is None:
+                    store.client.__dict__.pop('Index', None)
+                else:
+                    store.client.Index = saved
+
+        store.searchSemantic = search
