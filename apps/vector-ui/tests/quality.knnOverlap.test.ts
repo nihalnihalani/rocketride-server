@@ -14,6 +14,7 @@
 
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import { createForceJob, runJob } from '../src/map/layout.core';
 import { knnOverlap } from '../src/map/quality';
 import { knnFromRows, loadSample, pcaXY } from './support/map.samples';
 
@@ -72,7 +73,7 @@ test('a stride of 3 measures distance over the first two coordinates only', () =
 });
 
 test('an empty sample scores 0 and too few coordinates is an error, not a guess', () => {
-	assert.equal(knnOverlap(new Float32Array(0), { k: 0, offsets_row: [0], cols: [], sims: [] }, 15), 0);
+	assert.equal(knnOverlap(new Float32Array(0), knnFromRows([]), 15), 0);
 	assert.throws(() => knnOverlap(new Float32Array(3), knnFromRows([[1], [0]]), 1), RangeError);
 });
 
@@ -80,4 +81,29 @@ test('PCA baseline on sample_demo_1000.json is 0.167, the number the fixture gen
 	const sample = loadSample('sample_demo_1000.json');
 	const value = knnOverlap(pcaXY(sample), sample.knn, 15);
 	assert.ok(Math.abs(value - 0.167) < 0.0005, `PCA overlap ${value}`);
+});
+
+// -----------------------------------------------------------------------------
+// The gate: the neighbour-graph layout must beat PCA by a real margin
+// -----------------------------------------------------------------------------
+
+test('GATE on sample_demo_1000.json: overlap(neighbour-graph layout) >= overlap(PCA) + 0.10 and >= 0.35', (t) => {
+	const sample = loadSample('sample_demo_1000.json');
+	const pca = knnOverlap(pcaXY(sample), sample.knn, 15);
+	const run = runJob(createForceJob({ n: sample.n, init: pcaXY(sample), knn: sample.knn, seed: 7 }), 3_600_000);
+	const force = knnOverlap(run.positions, sample.knn, 15);
+	const record = { fixture: 'sample_demo_1000.json', k: 15, pca: Number(pca.toFixed(4)), force: Number(force.toFixed(4)), margin: Number((force - pca).toFixed(4)), ticks: run.ticks, elapsedMs: Math.round(run.elapsedMs) };
+	t.diagnostic(`knn-overlap ${JSON.stringify(record)}`);
+	console.log(`knn-overlap ${JSON.stringify(record)}`);
+	assert.ok(force >= pca + 0.1, `force ${force.toFixed(3)} is not PCA ${pca.toFixed(3)} + 0.10`);
+	assert.ok(force >= 0.35, `force ${force.toFixed(3)} < 0.35`);
+});
+
+test('light mode (5,000 points, k = 10): the neighbour-graph layout also beats PCA, within the 15 s budget', (t) => {
+	const sample = loadSample('sample_light_5000.json');
+	const pca = knnOverlap(pcaXY(sample), sample.knn, 10);
+	const run = runJob(createForceJob({ n: sample.n, init: pcaXY(sample), knn: sample.knn, seed: 11 }), 15_000);
+	const force = knnOverlap(run.positions, sample.knn, 10);
+	t.diagnostic(`light knn-overlap pca=${pca.toFixed(3)} force=${force.toFixed(3)} ticks=${run.ticks} ms=${Math.round(run.elapsedMs)}`);
+	assert.ok(force >= pca + 0.1, `force ${force.toFixed(3)} vs PCA ${pca.toFixed(3)}`);
 });
