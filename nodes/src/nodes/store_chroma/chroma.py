@@ -792,12 +792,11 @@ class Store(DocumentStoreBase):
                     'index documents. Check the Chroma server connection and version.'
                 )
             if object_ids_to_delete:
-                if len(object_ids_to_delete) > 1:
-                    filter_condition = {'$or': [{'objectId': object_id} for object_id in object_ids_to_delete]}
-                    self.collectionObj.delete(where=filter_condition)
-                else:
-                    filter_condition = {'objectId': list(object_ids_to_delete.keys())[0]}
-                    self.collectionObj.delete(where=filter_condition)
+                # One $in list per thousand documents: an $or with a clause per document
+                # exceeds the server's expression depth (about 1,000) on a large batch.
+                pending = list(object_ids_to_delete)
+                for start in range(0, len(pending), 1000):
+                    self.collectionObj.delete(where={'objectId': {'$in': pending[start : start + 1000]}})
                 object_ids_to_delete.clear()
 
             if ids:

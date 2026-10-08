@@ -201,3 +201,14 @@ def test_a_failed_connect_names_no_host_or_port(monkeypatch):
     message = str(err.value)
     assert 'Failed to connect to Chroma' in message and 'connection refused' in message
     assert '127.0.0.1' not in message and '8000' not in message
+
+
+def test_a_large_batch_replaces_its_documents_with_one_id_list():
+    # The re-ingest delete once OR-ed one clause per document; the server refuses
+    # an $or of about 1,000 clauses, so one call with that many first chunks failed.
+    store = make_store(drv)
+    batch = [make_doc(f'doc-{i:04d}', c, [1.0, i, c]) for i in range(1100) for c in range(2)]
+    store.addChunks(batch)
+    store.addChunks(batch[:4])  # a re-ingest of two documents keeps one record per chunk
+    assert store.countChunks(vx_filter()) == 2200
+    assert store.countChunks(vx_filter(objectIds=['doc-0000', 'doc-0001'])) == 4
