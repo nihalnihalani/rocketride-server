@@ -61,7 +61,8 @@ unmocked:
    runs again with the broker answering the transaction-mode pooler's DSN
    (``RR_TEST_PGVECTOR_POOLER_DSN``) and a search filtered to one document
    still returns ``k`` rows.
-6. No answer carries a host, DSN, credential, database name or token.
+6. No answer (tool or chat) carries a host, DSN, user, credential, database
+   name or token, and none has a non-empty field named like one (``SECRET_KEY``).
 
 Services (the defaults are the local containers of
 ``scripts/acceptance/vector-explorer/README.md``):
@@ -72,7 +73,13 @@ Services (the defaults are the local containers of
     RR_TEST_CHROMA_URL           chroma.pipe
 
 A service that is unreachable skips its template unless ``RR_REQUIRE_DB_TESTS``
-is set, which turns it into a failure. Optional: ``RR_TEST_TOOLPATH_ENGINE_PORT``
+is set, which turns it into a failure. Under ``ROCKETRIDE_MOCK`` the whole
+module is NOT RUN (it belongs to the unmocked live pass). The first start of
+the template's sources installs the embedding node's requirements (torch and
+sentence-transformers, through depends/uv) and loads all-MiniLM-L6-v2: that
+needs the network or a warm uv cache and the model in the Hugging Face cache,
+and takes minutes cold (about 90 s warm); an offline machine without them
+fails a required run rather than skipping it. Optional: ``RR_TEST_TOOLPATH_ENGINE_PORT``
 fixes the engine's port (default: a free one).
 
 Tests marked ``NEEDS:`` exercise code of other Vector Explorer lanes that is
@@ -120,6 +127,14 @@ else:
     _sdk = pytest.importorskip('rocketride')
     CommandException, RocketRideClient = _sdk.CommandException, _sdk.RocketRideClient
     Question = pytest.importorskip('rocketride.schema').Question
+
+if os.environ.get('ROCKETRIDE_MOCK'):
+    # This process would import nodes/test/mocks' database clients while the
+    # engine it starts writes to the real servers; nodes:test-db runs it unmocked.
+    pytest.skip(
+        'NOT RUN: a live database suite does not run under ROCKETRIDE_MOCK (nodes:test-db runs it unmocked)',
+        allow_module_level=True,
+    )
 
 if not _ENGINE.exists():
     if _DB_TESTS_REQUIRED:
@@ -248,7 +263,7 @@ class _PgVector:
         self.where = f'{self.host}:{self.port}'
 
     def secrets(self) -> List[str]:
-        out = ['postgresql://', 'postgres://', self.where, self.database]
+        out = ['postgresql://', 'postgres://', self.where, self.database, self.user]
         if self.password:
             out.append(self.password)
         if self.pooler_dsn:
@@ -843,7 +858,9 @@ class _Side:
     def chat(self, text: str) -> Dict[str, Any]:
         question = Question()
         question.addQuestion(text)
-        return self.engine.run(self.engine.client.chat(token=self.tokens['chat_1'], question=question))
+        answer = self.engine.run(self.engine.client.chat(token=self.tokens['chat_1'], question=question))
+        ANSWERS.append((self.template, self.kind, 'chat', answer))
+        return answer
 
     def stop(self) -> None:
         for token in self.tokens.values():
@@ -1490,6 +1507,57 @@ def test_rocketride_vector_through_the_transaction_pooler(engine, broker, stub, 
         broker.dsn = direct
 
 
+def test_a_write_without_a_call_context_is_refused():
+    """The 'no context' row (WRITES_UNKNOWN_CALLER) of the refusal table."""
+    pytest.skip(
+        'NOT RUN: a context-less call cannot be produced through a real engine (the dispatcher stamps every '
+        'client.tool call); covered by test_vector_write_gate.py and the G0-7 probe'
+    )
+
+
+# ---------------------------------------------------------------------------
+# The secrets scan's own rules (no engine call)
+# ---------------------------------------------------------------------------
+
+
+def test_the_secrets_scan_reads_every_field_but_document_text():
+    banned = ['127.0.0.1:55432', 'rruser']
+    # A banned value anywhere outside the text is a finding.
+    assert _secret_findings({'success': False, 'error': 'cannot reach rruser@127.0.0.1:55432'}, banned)
+    assert _secret_findings({'items': [{'metadata': {'parent': 'rruser/notes.md'}}]}, banned)
+    # Document text may say anything.
+    assert _secret_findings({'items': [{'content': 'rruser on 127.0.0.1:55432'}], 'answers': ['rruser']}, banned) == []
+    # A field named like a connection setting is a finding whatever its value, unless it is empty.
+    for key in ('host', 'Host', 'dsn', 'password', 'user', 'username', 'port', 'url', 'uri', 'apikey', 'api_key'):
+        assert _secret_findings({'backend': {key: 'x'}}, []), key
+    assert _secret_findings({'backend': {'password': ''}, 'url': None}, []) == []
+    # Ids named after users are not connection settings.
+    assert _secret_findings({'audit': {'caller': {'userId': 'u-1', 'teamId': None}}, 'user_count': 3}, []) == []
+
+
+def test_the_pgvector_secrets_include_the_database_user():
+    service = _PgVector('postgres')
+    assert service.user and service.user in service.secrets()
+
+
+def test_a_chat_answer_is_scanned_too():
+    class _Client:
+        def chat(self, token, question):
+            return {'answers': ['[STUB-LLM] ok'], 'documents': [{'metadata': {'objectId': 'x'}}]}
+
+    side = _Side.__new__(_Side)
+    side.engine = SimpleNamespace(client=_Client(), run=lambda value, *a: value)
+    side.template, side.kind, side.tokens = 'qdrant', 'new', {'chat_1': 'token'}
+    before = len(ANSWERS)
+    side.chat('a question')
+    try:
+        assert ANSWERS[before:] == [
+            ('qdrant', 'new', 'chat', {'answers': ['[STUB-LLM] ok'], 'documents': [{'metadata': {'objectId': 'x'}}]})
+        ]
+    finally:
+        del ANSWERS[before:]
+
+
 # ---------------------------------------------------------------------------
 # Last: nothing secret in any answer of the run
 # ---------------------------------------------------------------------------
@@ -1503,11 +1571,39 @@ def _non_content(value: Any) -> Any:
     return value
 
 
+# Field names that hold a connection setting or a credential (whole names, any case): CONTRACT section 1.6.
+SECRET_KEY = re.compile(
+    r'^(host|hostname|dsn|password|passwd|pwd|user|username|port|url|uri|connection_?string|api_?key|secret|token)$',
+    re.IGNORECASE,
+)
+
+
+def _secret_keys(value: Any, at: str = '$') -> List[str]:
+    """Paths of non-empty fields named like a connection setting or credential (document text excluded)."""
+    found: List[str] = []
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if key in CONTENT_KEYS:
+                continue
+            if SECRET_KEY.match(str(key)) and item not in (None, '', [], {}):
+                found.append(f'{at}.{key}')
+            found += _secret_keys(item, f'{at}.{key}')
+    elif isinstance(value, list):
+        for i, item in enumerate(value):
+            found += _secret_keys(item, f'{at}[{i}]')
+    return found
+
+
+def _secret_findings(answer: Any, banned: Sequence[str]) -> List[str]:
+    """What in ``answer`` outside document text is a fixture secret or a field named like one."""
+    blob = json.dumps(_non_content(answer), default=str)
+    return [s for s in banned if s and s in blob] + _secret_keys(answer)
+
+
 def test_no_answer_carries_a_host_credential_or_token(deployment, broker, engine):
     answers = [a for a in ANSWERS if a[0] == deployment.provider]
     assert answers, 'no tool answers were recorded for this template'
     banned = deployment.service.secrets() + [broker.token, engine.apikey, broker.url]
     for template, kind, tool, answer in answers:
-        blob = json.dumps(_non_content(answer), default=str)
-        leaked = [s for s in banned if s and s in blob]
+        leaked = _secret_findings(answer, banned)
         assert leaked == [], f'{template}/{kind} {tool} answer carries {leaked}'
