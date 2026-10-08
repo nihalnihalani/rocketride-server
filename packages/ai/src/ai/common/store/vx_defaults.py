@@ -1,0 +1,87 @@
+# =============================================================================
+# RocketRide Engine
+# =============================================================================
+# MIT License
+# Copyright (c) 2026 Aparavi Software AG
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+# =============================================================================
+
+"""Defaults of the vector store write switches and tool limits: the single source.
+
+The store nodes read the two switches when ``vector.allow_writes`` /
+``vector.agent_writes`` (``rrvector.allow_writes`` on rocketride_vector) are not
+set in the node configuration. The templates test and the live tool-path
+expectation table read the same values (the app reads them from
+``apps/vector-ui/tests/fixtures/defaults.json``, generated from this file by
+``apps/vector-ui/scripts/gen_defaults.py``), so changing a default is one line
+here plus a regeneration.
+
+This module must stay free of imports: the generator loads it by path.
+"""
+
+#: Whether DAP tool calls (``client.tool()`` from a Tools source) may remove or upsert documents.
+#: Off by default; turn it on per store node with ``allow_writes``.
+VECTOR_ALLOW_WRITES_DEFAULT = False
+
+#: Whether tool calls made by an agent inside the pipeline may write (today's behaviour).
+VECTOR_AGENT_WRITES_DEFAULT = True
+
+#: Node-enforced limits, reported verbatim in ``dialect.limits`` (contract section 4.1).
+#: Page sizes and counts are maxima; the ``*_default`` keys are the defaults.
+#: ``statement_timeout_ms`` applies to pgvector; other drivers report None.
+VECTOR_TOOL_LIMITS = {
+    'documents_page': 500,
+    'chunks_page': 200,
+    'vectors_keys_max': 2,
+    'sample_default': 1000,
+    'sample_max': 2000,
+    'sample_max_light': 5000,
+    'snippet_chars': 120,
+    'knn_k_max': 30,
+    'neighbors_k_max': 50,
+    'project_keys_max': 200,
+    'scope_keys_max': 2000,
+    'top_k_max': 100,
+    'write_ids_max': 100,
+    'sample_budget_ms': 60000,
+    'statement_timeout_ms': 30000,
+    'counts_cached_s': 60,
+}
+
+#: Defaults applied when a tool call leaves the value out (contract section 4.1).
+VECTOR_TOOL_DEFAULTS = {
+    'documents_page': 200,
+    'chunks_page': 100,
+    'neighbors_k': 12,
+    'knn_k': 15,
+    'knn_k_max_light': 10,
+    'duplicate_threshold': 0.97,
+    'sample_cache_entries': 2,
+    'sample_cache_ttl_s': 600,
+    'sample_light_max_bytes': 64 * 1024 * 1024,
+}
+
+#: Limits of the ``embed`` tool on the embedding nodes (contract section 4.3).
+EMBED_TOOL_LIMITS = {
+    'embed_texts_max': 8,
+    'embed_text_chars_max': 8000,
+    'embed_per_minute': 30,
+    'embed_burst': 5,
+}

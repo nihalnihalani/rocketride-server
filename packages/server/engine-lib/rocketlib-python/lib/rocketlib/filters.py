@@ -25,7 +25,7 @@
 from __future__ import annotations  # Enables forward references
 import functools
 import json
-from typing import TYPE_CHECKING, Dict, Any, List, Optional, TypedDict, Callable, Protocol
+from typing import TYPE_CHECKING, Dict, Any, List, Optional, Tuple, TypedDict, Callable, Protocol
 from .types import AVI_ACTION, OPEN_MODE, ENDPOINT_MODE, SERVICE_MODE, Entry, IControl, IInvoke, IJson
 from .error import APERR, Ec
 
@@ -69,11 +69,17 @@ def tool_function(
     input_schema: Any = None,
     description: Any = None,
     output_schema: Any = None,
+    audience: Tuple[str, ...] = ('agent', 'dap'),
 ) -> Callable:
     """Mark a method as a tool entry point.
 
     The method name becomes the bare tool ID.  Each parameter accepts either
     a static value or a ``callable(self)`` evaluated at ``tool.query`` time.
+
+    ``audience`` names who the tool is listed for: ``'agent'`` (the agent
+    catalog built by ``tool.query``) and/or ``'dap'`` (external tool calls).
+    It is recorded in ``__tool_meta__['audience']`` as a tuple; the default
+    lists the tool for both, which is every tool's behaviour today.
 
     ``@tool_function`` implicitly registers the method as an invoke handler
     for the ``tool.*`` ops — no separate ``@invoke_function`` needed::
@@ -87,6 +93,7 @@ def tool_function(
             'input_schema': input_schema,
             'description': description,
             'output_schema': output_schema,
+            'audience': tuple(audience),
         }
         return fn
 

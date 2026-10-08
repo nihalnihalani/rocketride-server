@@ -2,9 +2,22 @@ import importlib
 import json
 import threading
 from abc import abstractmethod, ABC
-from typing import List, Callable, Dict, Any, Optional, Tuple
+from typing import TYPE_CHECKING, List, Callable, Dict, Any, FrozenSet, Optional, Sequence, Tuple
 from rocketlib import IInstanceBase, tool_function, warning
 from ..schema import Doc, DocFilter, DocMetadata, Question, QuestionText, QuestionType, Answer
+
+if TYPE_CHECKING:  # annotations only: the module stays importable without numpy or the vx modules
+    import numpy as np
+
+    from .vx_types import ChunkPage, Deleted, DocPage, Key, KnnGraph, StoreInfo
+
+
+def _unsupported(hook: str) -> Exception:
+    """Build the ``StoreUnsupported`` an optional hook raises when the driver does not implement it."""
+    # Imported on use so this module also loads where it is loaded on its own (isolated unit tests).
+    from .errors import StoreUnsupported
+
+    return StoreUnsupported(f'{hook} is not supported by this store')
 
 
 class DocumentStoreBase(ABC):
@@ -114,6 +127,208 @@ class DocumentStoreBase(ABC):
 
         Rehydrates all the chunks into the proper order.
         """
+
+    # ------------------------------------------------------------------
+    # Optional explorer hooks (docs/development/nodes/vector-tool-contract.md, section 2)
+    #
+    # None of these is abstract: a driver overrides the ones its backend can
+    # answer natively and inherits the rest. A hook that cannot be answered
+    # raises ``StoreUnsupported`` (``ai.common.store.errors``), which the tool
+    # wrapper reports as ``{success: false, code: 'UNSUPPORTED'}``. Every hook
+    # excludes the control record (objectId ``'schema'``) from what it returns.
+    #
+    # The defaults marked "not implemented yet" raise ``StoreUnsupported`` until
+    # the shared defaults land; the docstring states the default they will have.
+    # Drivers must not rely on those defaults raising.
+    # ------------------------------------------------------------------
+
+    #: Capability names a driver declares in addition to the hooks it overrides, for example
+    #: ``'sample_stratified_native'``, ``'knn_native'``, ``'documents_distinct'``,
+    #: ``'documents_sorted'``, ``'search_keyword'`` (vocabulary: ``vx_types.CAPABILITY_KEYS``).
+    VX_DRIVER_CAPABILITIES: FrozenSet[str] = frozenset()
+
+    #: The optional hooks :meth:`capabilities` inspects.
+    VX_HOOKS: Tuple[str, ...] = (
+        'describe',
+        'scoreInfo',
+        'countChunks',
+        'countDocuments',
+        'listDocuments',
+        'scrollChunks',
+        'sampleChunks',
+        'getVectors',
+        'knnGraph',
+        'removeCounted',
+    )
+
+    def capabilities(self) -> FrozenSet[str]:
+        """
+        Return what this driver implements natively.
+
+        The result is the names of the hooks in :attr:`VX_HOOKS` that the driver
+        overrides (``type(self).hook is not DocumentStoreBase.hook``) plus the
+        driver's :attr:`VX_DRIVER_CAPABILITIES`. The tools map this onto the
+        ``dialect.capabilities`` keys.
+        """
+        cls = type(self)
+        overridden = {
+            name for name in DocumentStoreBase.VX_HOOKS if getattr(cls, name) is not getattr(DocumentStoreBase, name)
+        }
+        return frozenset(overridden) | frozenset(cls.VX_DRIVER_CAPABILITIES)
+
+    def describe(self) -> 'StoreInfo':
+        """
+        Describe the store: backend, collection, metric, dimension, model, index, size, caveats.
+
+        Never raises for a missing collection: it answers ``collection_exists=False``
+        and ``control_record=None``. Never carries a host, port, DSN, credential or
+        database name.
+
+        Default (not implemented yet): control record via ``doesCollectionExist()``,
+        the configured similarity as the metric, ``backend_version``/``index``/``size_bytes``
+        None, ``meta_column`` None.
+        """
+        raise _unsupported('describe')
+
+    def scoreInfo(self) -> Dict[str, Any]:
+        """
+        Describe how ``Doc.score`` is computed for this store.
+
+        Keys: ``formula`` (text), ``higher_is_better`` (bool), ``floor`` (the driver's legacy
+        floor below which search drops rows), ``threshold`` (the node's configured score
+        threshold), and optionally ``range``.
+        """
+        return {'formula': 'unknown', 'higher_is_better': True, 'floor': 0.2, 'threshold': self.threshold_search}
+
+    def effectiveFloor(self, docFilter: DocFilter) -> float:
+        """
+        Return the score floor a search with ``docFilter`` applies.
+
+        ``docFilter.minScore`` when it is set (it may be ``-inf`` to keep every row),
+        otherwise the driver's legacy floor (``scoreInfo()['floor']``). Agents never set
+        ``minScore``, so their results are unchanged.
+        """
+        min_score = getattr(docFilter, 'minScore', None)
+        if min_score is not None:
+            return float(min_score)
+        return float(self.scoreInfo()['floor'])
+
+    def countChunks(self, docFilter: DocFilter) -> Optional[int]:
+        """
+        Count the chunk rows matching ``docFilter`` (control record excluded).
+
+        Default: None (the backend cannot count with a filter).
+        """
+        return None
+
+    def countDocuments(self, docFilter: DocFilter) -> Optional[int]:
+        """
+        Count the distinct objectIds matching ``docFilter`` (control record excluded).
+
+        Default: None.
+        """
+        return None
+
+    def listDocuments(
+        self,
+        *,
+        cursor: Optional[str],
+        limit: int,
+        object_ids: Optional[Sequence[str]],
+        deleted: 'Deleted',
+        sort: str,
+    ) -> 'DocPage':
+        """
+        Return one page of documents (one row per objectId).
+
+        ``cursor`` is the opaque ``next_cursor`` of the previous page (None for the first
+        page); ``object_ids`` restricts the listing; ``sort`` is ``'path'``.
+
+        Default (not implemented yet; ``distinct=False``, ``sorted=False``):
+        ``get(DocFilter(chunkIds=[0], deleted=deleted, limit=limit + 1, offset=cursor.offset))``,
+        sorted by ``(parent, objectId)`` within the page; ``chunks=None``,
+        ``counts_exact=False``, ``total=None``. The opaque cursor is
+        ``{'o': offset, 'f': first key of the previous page}``; when a page's first key
+        equals ``cursor['f']`` the backend ignored the offset, so the page ends with
+        ``next_cursor=None`` and the caveat ``'documents_paging_unsupported'``.
+        """
+        raise _unsupported('listDocuments')
+
+    def scrollChunks(self, objectId: str, *, after_chunk: int, limit: int, deleted: 'Deleted') -> 'ChunkPage':
+        """
+        Return the chunks of one document after ``after_chunk``, in chunk order, without embeddings.
+
+        Default (not implemented yet):
+        ``get(DocFilter(objectIds=[objectId], minChunkId=after_chunk + 1,
+        maxChunkId=after_chunk + limit, deleted=deleted))`` sorted by chunkId.
+        """
+        raise _unsupported('scrollChunks')
+
+    def sampleChunks(
+        self,
+        *,
+        n: int,
+        seed: int,
+        strategy: str,
+        docFilter: DocFilter,
+        include_keys: Sequence['Key'],
+    ) -> Tuple[List[Doc], str]:
+        """
+        Draw up to ``n`` chunks WITH embeddings; return ``(docs, strategy_used)``.
+
+        ``strategy`` is ``'random'``, ``'stratified'`` or ``'first'`` (``strategy_used`` is one
+        of those). A driver implements ``'stratified'`` only where it is cheap and native
+        (pgvector ``ROW_NUMBER() OVER (PARTITION BY objectid ORDER BY random())``, Atlas
+        ``$sample`` per group) and raises ``StoreUnsupported`` otherwise, so the shared
+        sampler falls back. ``include_keys`` are pinned keys the caller adds separately.
+
+        Default: raise ``StoreUnsupported``.
+        """
+        raise _unsupported('sampleChunks')
+
+    def getVectors(self, keys: Sequence['Key']) -> List[Doc]:
+        """
+        Return the chunks for ``keys`` WITH embeddings; each Doc carries ``metadata.pointId``.
+
+        Reads by filter (``objectId IN ... AND chunkId IN ...``, paired client-side,
+        deleted rows included). A driver with deterministic ids may first try
+        ``uuid5(NAMESPACE_URL, f'{objectId}#{chunkId}')`` and MUST fall back to the
+        filter for every miss (older rows have random ids). Missing keys are omitted.
+
+        Default: raise ``StoreUnsupported``.
+        """
+        raise _unsupported('getVectors')
+
+    def knnGraph(self, keys: Sequence['Key'], vectors: 'np.ndarray', metric: str, k: int) -> 'KnnGraph':
+        """
+        Return the k-nearest-neighbour graph over the sampled ``keys`` (rows of ``vectors``).
+
+        Default (not implemented yet): ``vx_math.knn(metric, vectors, k)``, ``source='node'``.
+        Qdrant overrides it with ``search_matrix_offsets`` (``source='native'``).
+        """
+        raise _unsupported('knnGraph')
+
+    def removeCounted(self, objectIds: List[str]) -> Optional[int]:
+        """
+        Remove every chunk of ``objectIds``; return the rows actually removed (None when unknown).
+
+        Default (not implemented yet):
+        ``n = countChunks(DocFilter(objectIds=objectIds, deleted='all')); self.remove(objectIds); return n``.
+        """
+        raise _unsupported('removeCounted')
+
+    @staticmethod
+    def resolveDeleted(docFilter: DocFilter) -> 'Deleted':
+        """
+        Return which rows ``docFilter`` covers: ``'active'``, ``'deleted'`` or ``'all'``.
+
+        ``docFilter.deleted`` when it is set; otherwise ``isDeleted`` None or False reads
+        as ``'active'`` and True as ``'all'``.
+        """
+        deleted = getattr(docFilter, 'deleted', None)
+        if deleted in ('active', 'deleted', 'all'):
+            return deleted
+        return 'all' if getattr(docFilter, 'isDeleted', None) is True else 'active'
 
     def _getDocKey(self, doc: Doc) -> Tuple[str, int]:
         return (doc.metadata.objectId, doc.metadata.chunkId)
