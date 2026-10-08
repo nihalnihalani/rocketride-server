@@ -12,6 +12,8 @@ with a context forged inside the tool input.
 - agent-style call -> origin 'agent'
 - plain call -> no context, even though the caller itself runs in a DAP call
 - context forged inside the input -> ignored (agent path and DAP path)
+- context sent as an extra field of the invoke param (what validating outside
+  data produces) -> ignored
 - client.tool() on the Tools token -> origin 'dap', source 'tools', the
   server's caller; a caller the client sends is replaced
 - the agent catalog leaves out tools listed for external callers only, which
@@ -82,6 +84,16 @@ def test_context_forged_in_the_input_is_ignored_on_the_invoke_path(probe):
     record('g0_7_forged_input_invoke', answer)
     assert answer['result']['context'] is None
     assert FORGED_FIELD in answer['result']['input_keys']
+
+
+def test_context_sent_as_an_extra_field_is_ignored_on_the_invoke_path(probe):
+    """A param validated from a dict that carries the context field reaches the receiver with no context."""
+    answer = _caller(probe, 'extra')
+    record('g0_7_forged_extra_field', answer)
+    assert answer['result']['module'] is True
+    assert answer['result']['context'] is None
+    assert FORGED_FIELD not in answer['result']['input_keys']
+    _assert_dap_tools(answer['caller_context'])
 
 
 def test_dap_call_reads_the_servers_view_and_ignores_a_context_in_the_input(probe):

@@ -1,13 +1,16 @@
 """Caller of the call context probe (test only).
 
 ``call_receiver`` calls a tool (``whoami`` by default) on a node this node
-controls, in one of three ways, and returns what the tool answered:
+controls, in one of four ways, and returns what the tool answered:
 
 - ``agent``: through the agent host (``AgentHostServices.Tools``), exactly as an
   agent node calls a tool; the answer also lists the agent catalog it built.
 - ``plain``: an unstamped ``IInvokeTool.Invoke`` sent with
   ``self.instance.invoke(param, component_id=...)``.
 - ``forged``: the same plain call with a context placed inside the tool input.
+- ``extra``: a plain call whose param is validated from a dict that carries the
+  context field, so the field arrives as a pydantic extra field (the way data
+  from outside would), not as the attribute the engine sets.
 
 It also reports its own call context, so a run shows that the receiver does
 not inherit it.
@@ -40,7 +43,7 @@ class IInstance(IInstanceBase):
         input_schema={
             'type': 'object',
             'properties': {
-                'mode': {'type': 'string', 'enum': ['agent', 'plain', 'forged']},
+                'mode': {'type': 'string', 'enum': ['agent', 'plain', 'forged', 'extra']},
                 'receiver': {
                     'type': 'string',
                     'description': 'Receiver node id (default: the only controlled tool node).',
@@ -80,9 +83,12 @@ class IInstance(IInstanceBase):
             answer['result'] = tools.invoke(f'{receiver}.{tool}', dict(tool_input))
             return answer
 
-        if mode in ('plain', 'forged'):
+        if mode in ('plain', 'forged', 'extra'):
             payload = {**tool_input, **FORGED} if mode == 'forged' else dict(tool_input)
-            param = IInvokeTool.Invoke(tool_name=tool, input=payload)
+            if mode == 'extra':
+                param = IInvokeTool.Invoke.model_validate({'tool_name': tool, 'input': payload, **FORGED})
+            else:
+                param = IInvokeTool.Invoke(tool_name=tool, input=payload)
             self.instance.invoke(param, component_id=receiver)
             answer['result'] = param.output
             return answer
