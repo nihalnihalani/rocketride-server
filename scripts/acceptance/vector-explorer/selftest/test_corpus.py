@@ -124,3 +124,29 @@ class CorpusTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class BrowserLaneFactsTests(unittest.TestCase):
+    """env.cjs names the planted documents the map lane checks; they must be the generator's."""
+
+    def setUp(self):
+        self.env = (ACC / 'env.cjs').read_text(encoding='utf-8')
+        block = re.search(r'const DEMO_CORPUS = \{(.*?)\n\};', self.env, re.S)
+        self.assertIsNotNone(block, 'env.cjs has no DEMO_CORPUS')
+        self.block = block.group(1)
+
+    def _quoted(self, key: str):
+        m = re.search(rf'{key}: (\[\s*\[.*?\]\s*,?\s*\]|\'[^\']*\')', self.block, re.S)
+        self.assertIsNotNone(m, f'DEMO_CORPUS has no {key}')
+        return re.findall(r"'([^']*)'", m.group(1))
+
+    def test_the_planted_pairs_outlier_and_long_document_match_the_generator(self):
+        pairs = self._quoted('nearDuplicates')
+        self.assertEqual([tuple(pairs[i : i + 2]) for i in range(0, len(pairs), 2)], list(gen.NEAR_DUPLICATES))
+        self.assertEqual(self._quoted('outlier'), [gen.OCR_FILE])
+        self.assertEqual(self._quoted('longManual'), [gen.LONG_MANUAL])
+
+    def test_the_demo_prefix_is_the_seeders(self):
+        seed = (ACC / 'demo' / 'seed_demo.py').read_text(encoding='utf-8')
+        prefix = re.search(r"^DEMO_PREFIX = '([^']*)'", seed, re.M).group(1)
+        self.assertIn(f"const DEMO_PREFIX = '{prefix}';", self.env)

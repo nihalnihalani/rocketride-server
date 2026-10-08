@@ -26,7 +26,10 @@ not a secret. Never point them at a database that holds data you care about.
 | `calibrate_chunking.py` | Measures the templates' chunk sizes on the demo corpus and, with `--write N`, records the choice in `apps/vector-ui/tests/fixtures/chunking.json` and every template's `chunk_1`. |
 | `stub_llm.py` | A local test stub of an OpenAI-compatible chat server, **not a model**: deterministic answers tagged `[STUB-LLM]` that quote the prompt, plain and streamed (SSE); `--tool-call NAME` answers one request with a tool call. Logs request bodies to `out/` (git-ignored). |
 | `fake_broker.py` | Local stand-in for the DB broker's `/provision` endpoint, so `rocketride_vector` resolves a local database: the direct gx-pgvector DSN, or with `--pooler` the vx-pgbouncer one (both with `sslmode=disable`, which the engine accepts for loopback hosts only). |
-| `browser/lane_vector.cjs` | The browser lane (Playwright, Chrome): connections, console, upload, chat, removal, paging, sign-out. Writes one JSON verdict per step to `out/`. |
+| `browser/lane_vector.cjs` | The console lane (gate G3; Playwright, Chrome): connections, console, upload, chat, removal, paging, sign-out, privacy. Writes one JSON verdict per step to `out/lane_vector.json`. |
+| `browser/lane_vector_map.cjs` | The map lane (gate G4): both sample modes, hover, neighbours, lasso, query star and rays, the Table alternative, chunk path, duplicates, outliers, keyboard sectors, the layout-quality rule, the Qdrant legend, t-SNE's limit, Cancel, privacy. Writes `out/lane_vector_map.json` (with what each step measured). |
+| `browser/ui.cjs` | Every selector, sentence and canvas data attribute the two lanes look for, in one table. |
+| `browser/common.cjs` | What the lanes share: the step recorder, the WebSocket frame capture, the store's side through the TypeScript client, the privacy property. |
 | `validate_all.sh` | Every repository gate the feature touches, with real builder actions; never stops early, exits non-zero when a step failed. |
 | `env.cjs` | Settings shared by the Node scripts and the browser lane, read from the environment. |
 | `selftest/` | Self-tests of the harness itself (no engine, database or browser): the corpus, the calibration writer, the legacy seed's verdicts, the fixture builders, the stand-ins, and the browser lane run against an empty stand-in page, where every check must fail. |
@@ -164,21 +167,62 @@ LLM, and drops only `vx_tp_` collections. By default its legacy pass builds a
 legacy-shaped copy of its own collection; `RR_TEST_VECTOR_LEGACY=seeded` uses
 `vx_legacy_docs` and only adds and removes documents of its own there.
 
-## Browser lane
+## Browser lanes
 
 ```bash
 PLAYWRIGHT_DIR=<a folder whose node_modules has playwright> ENGINE_URL=http://127.0.0.1:5590 node $ACC/browser/lane_vector.cjs
+PLAYWRIGHT_DIR=<...> ENGINE_URL=http://127.0.0.1:5590 node $ACC/browser/lane_vector_map.cjs   # the map (qdrant fixture)
 ```
 
-It needs the fixtures running and seeded, and the app built into the engine
-(`./builder vector-ui:build`). Each step records PASS or FAIL with what it saw
-in `out/lane_vector.json`; screenshots go next to it.
+Both need the fixtures running and seeded (`demo/seed_demo.sh`, and
+`--only qdrant_pager --pager` for the steps that need more than 1,000 points),
+and the app built into the engine (`./builder vector-ui:build`). Each step
+records PASS or FAIL with what it saw in `out/lane_vector.json` /
+`out/lane_vector_map.json`; screenshots go next to them. A step passes only
+when it returns `true`: a lane that cannot observe what a step names fails
+it, which the selftest checks on two stand-in pages (one empty, one where
+every element is visible but says nothing).
+
+The lanes look for the app's wording as its design states it;
+`browser/ui.cjs` is the single place to adjust when the app's wording or
+structure differs. The map draws on a canvas, so the map lane also reads
+these data attributes on the element that carries `data-points` (the
+PointCanvas root, which must also be the element that takes the arrow keys):
+
+| Attribute | Value |
+| --- | --- |
+| `data-points` | points drawn |
+| `data-mode` | `detailed` or `light` |
+| `data-layout` | the layout drawn: `pca`, `neighbour-graph` or `tsne` |
+| `data-star` | `1` while a query star is drawn, else `0` |
+| `data-rays` | rays drawn from the star |
+| `data-links` | neighbour links drawn from the selected point |
+| `data-chunk-path` | points on the chunk path drawn |
+| `data-selected`, `data-focused` | index of the inspected / keyboard-focused point, empty for none |
+| `data-selection` | points in the lasso selection |
+| `data-overlap-pca`, `data-overlap-layout` | `quality.knnOverlap` (k = 15) of PCA and of the last refined layout, empty before one ran |
+
+What G4 asks and where it is checked:
+
+| G4 | Checked by |
+| --- | --- |
+| `data-points` = `sample.n` in both modes | map lane: detailed, light |
+| hover, click lists 12 neighbours, lasso count | map lane: hover, click, lasso |
+| Run query draws the star and rays (to the true top-k) | map lane: query (the rays' results equal the store's own `search` for the embedded vector) |
+| chunk path, Duplicates and Outliers from the seeded corpus | map lane: chunk path (the long manual), duplicates (both planted pairs), outliers (the OCR scan first) |
+| keyboard sector path and Table alternative | map lane: keyboard (each move checked against the sample's PCA coordinates), table |
+| t-SNE refuses above 1,000; Cancel stops a layout | map lane on `qdrant_pager` |
+| force layout kept only when kNN overlap >= PCA's | map lane: kNN overlap (both numbers in the lane JSON) |
+| Qdrant legend says "neighbour graph computed by Qdrant" | map lane: legend |
+| privacy property | both lanes, with `dialect.dimension` read from the store |
+| `a11y.contrast` in six themes | the app's unit test `tests/a11y.contrast.map.test.ts` |
+| 2,000 points at 4x throttle, p95 frame <= 33 ms | the performance lane `browser/lane_vector_perf.cjs` (the map lane does not measure frame times) |
 
 ## Selftest
 
 ```bash
 python3 -m unittest discover -s scripts/acceptance/vector-explorer/selftest -v
-node --test 'scripts/acceptance/vector-explorer/selftest/*.test.cjs'
+node --test scripts/acceptance/vector-explorer/selftest/*.test.cjs   # the shell expands the glob
 ```
 
 ## Settings
@@ -214,7 +258,10 @@ These shape the templates and the tests; each was measured on a local engine.
   demo corpus: 81 chunks, median 3,409 characters, identical at `strlen` 200,
   512 and 1,000). With the arguments passed through, `strlen` 1,000 gives a
   median chunk of 806 characters, which the templates carry
-  (`apps/vector-ui/tests/fixtures/chunking.json` records both).
+  (`apps/vector-ui/tests/fixtures/chunking.json` records both, with
+  `effective: false` read from the node itself; the templates' note says the
+  length is asked for, not applied, until the node passes it on, and
+  `calibrate_chunking.py --sync` updates both once it does).
 - **The parser's size cap is not applied to these pipelines.** The parser reads
   `index.maxFileSize` from the task's own configuration, which the engine
   builds from the pipeline without an `index` section, so neither the
@@ -231,10 +278,9 @@ These shape the templates and the tests; each was measured on a local engine.
   The legacy seed creates its table itself for that reason.
 - **Chroma's `objdir` lists nothing as it stands**: it filters on a metadata key
   (`chunk`) the driver never writes.
-- **Which nodes a source's token reaches** (the store tools through
-  `client.tool`): the Tools token reaches `store_1`, `store_2`, `embed_1`,
-  `llm_1` and `response_2` but not `parse_1`/`chunk_1`; the Chat token reaches
-  both stores; the Ingest token reaches every node.
+- **What the Tools token addresses** (the store tools through `client.tool`):
+  `store_1`, `store_2`, `embed_1` and `llm_1`; `parse_1` and `chunk_1` answer
+  "not found in pipeline". The lanes rely on nothing else.
 - **Upload errors arrive garbled**: a failed upload reports a UTF-8 decode error
   instead of the store's message, so a failure can only be shown as a failure.
 

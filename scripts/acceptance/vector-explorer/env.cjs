@@ -61,6 +61,20 @@ const FIXTURES = {
 // The display name start_fixtures.py --llm stub gives the LLM node.
 const STUB_LLM_NODE_NAME = 'Local stub LLM';
 
+// What demo/gen_corpus.py plants in the demo corpus (seeded under DEMO_PREFIX by demo/seed_demo.sh;
+// selftest/test_corpus.py keeps these in sync with the generator).
+const DEMO_PREFIX = 'C:/demo/';
+const DEMO_CORPUS = {
+	nearDuplicates: [
+		['handbooks/falcon_handbook.md', 'handbooks/falcon_handbook_rev2.md'],
+		['field/kestrel_field_guide.md', 'archive/kestrel_field_guide_copy.md'],
+	],
+	// The OCR-junk page: the sparsest neighbourhood of the corpus (its chunks are the sample's first outliers).
+	outlier: 'scans/ocr_scan_0417.txt',
+	longManual: 'manuals/long_manual.md',
+};
+const WATER_QUESTION = 'Where does Falcon Station get its drinking water?';
+
 /**
  * Load Playwright from PLAYWRIGHT_DIR (a folder whose node_modules has it) when
  * set, else from browser/node_modules (`npm install --no-package-lock` there).
@@ -96,6 +110,9 @@ module.exports = {
 	STUB_LLM_URL,
 	STUB_LLM_TAG,
 	STUB_LLM_NODE_NAME,
+	DEMO_PREFIX,
+	DEMO_CORPUS,
+	WATER_QUESTION,
 	PGVECTOR,
 	PGVECTOR_POOLER_PORT,
 	QDRANT,
