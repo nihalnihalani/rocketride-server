@@ -1436,6 +1436,14 @@ def test_sample_payload_detailed_two_thousand_points_fits_one_megabyte():
     assert _payload_bytes(answer) <= 1024 * 1024
 
 
+def test_sample_payload_at_the_largest_neighbour_count_stays_near_one_megabyte():
+    # knn_k_max (30) doubles the graph columns of the default k=15: about 1.03 MB on this corpus.
+    store = clustered(docs=40, chunks=50, dim=384, text_chars=3000)
+    answer = node(store).sample({'n': 2000, 'knn_k': 30})
+    assert answer['n'] == 2000 and answer['knn']['k'] == 30
+    assert _payload_bytes(answer) <= 1.1 * 1024 * 1024
+
+
 def test_sample_payload_light_five_thousand_points_fits_one_megabyte():
     store = clustered(docs=100, chunks=50, dim=384, text_chars=3000)
     answer = node(store).sample({'n': 5000, 'mode': 'light', 'knn_k': 10})
