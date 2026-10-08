@@ -2,11 +2,12 @@
 
 Live checks for Vector Explorer that the unit suites cannot make: a real engine
 runs the shipped templates (`apps/vector-ui/templates`) against real vector
-stores, the SDKs call the store tools, and (as the lanes are added) a browser
-drives the app.
+stores, the SDKs call the store tools, and a browser drives the app.
 
 **These lanes are manual. They are not wired into CI**, and nothing in
-`./builder test` runs them.
+`./builder test` runs them. The two live node suites they feed
+(`nodes/test/test_vector_toolpath_full.py`, `nodes/test/test_vector_wire_fixtures_full.py`)
+run with `./builder nodes:test-db` once they are registered there.
 
 Everything here is for **disposable local containers only**. The fixtures write
 into their own tables and collections (named below), and every credential the
@@ -17,17 +18,25 @@ not a secret. Never point them at a database that holds data you care about.
 
 | File | What it does |
 | --- | --- |
-| `start_fixtures.py` | Starts one fixture pipeline per supported store from the shipped templates: pgvector (`gx-pgvector`), RocketRide Vector (through the fake broker), Qdrant (`vx-qdrant`) and Chroma (`vx-chroma`). Each has a fixed local-only project id and starts its three sources (`tools_1`, `chat_1`, `ingest_1`) with no idle timeout (`ttl=0`; the engine otherwise stops a task after 15 idle minutes). Only what is not running yet is started; `--stop` terminates them. `--llm stub` (default) points the LLM node at `stub_llm.py`; `--llm template` keeps the template's placeholder key. It also warms the tiktoken cache so the first chat does not wait for a download. |
+| `vx_fixtures.py` | Settings and pipeline builders the scripts share: the fixture table (names, fixed local-only project ids, connections), the template loader, the stock-RAG shape, the stub LLM substitution, start/stop helpers and the objectId an upload name gets. |
+| `start_fixtures.py` | Starts the fixture pipelines with `ttl=0` (the engine otherwise stops a task after 15 idle minutes); only what is not running yet. `--only`, `--llm stub\|template`, `--stop`. Warms the tiktoken cache first. |
+| `demo/gen_corpus.py` | The fictional demo corpus: 40 documents in 11 folders (topic clusters, a 160-procedure manual, two near-duplicate pairs, one boilerplate paragraph ending six files, an OCR-junk file, an HTML table). Deterministic; `--check` compares a written copy. |
+| `demo/seed_demo.sh` | Uploads the corpus into the fixtures as `C:/demo/<folder>/<file>` (two folders into `stock_rag` through its webhook); `--pager` fills the 1,500-document Qdrant fixture; `--if-empty` skips stores that already hold documents. |
+| `seed_legacy.sh` | Seeds and verifies the legacy-shaped collections `vx_legacy_docs` (see below). |
+| `calibrate_chunking.py` | Measures the templates' chunk sizes on the demo corpus and, with `--write N`, records the choice in `apps/vector-ui/tests/fixtures/chunking.json` and every template's `chunk_1`. |
 | `stub_llm.py` | A local test stub of an OpenAI-compatible chat server, **not a model**: deterministic answers tagged `[STUB-LLM]` that quote the prompt, plain and streamed (SSE); `--tool-call NAME` answers one request with a tool call. Logs request bodies to `out/` (git-ignored). |
-| `fake_broker.py` | Local stand-in for the DB broker's `/provision` endpoint, so `rocketride_vector` resolves a local database (direct, or through `vx-pgbouncer` with `--dsn`). |
-| `env.cjs` | Settings shared by the Node scripts and browser lanes, read from the environment. |
+| `fake_broker.py` | Local stand-in for the DB broker's `/provision` endpoint, so `rocketride_vector` resolves a local database: the direct gx-pgvector DSN, or with `--pooler` the vx-pgbouncer one (both with `sslmode=disable`, which the engine accepts for loopback hosts only). |
+| `browser/lane_vector.cjs` | The browser lane (Playwright, Chrome): connections, console, upload, chat, removal, paging, sign-out. Writes one JSON verdict per step to `out/`. |
+| `validate_all.sh` | Every repository gate the feature touches, with real builder actions; never stops early, exits non-zero when a step failed. |
+| `env.cjs` | Settings shared by the Node scripts and the browser lane, read from the environment. |
+| `selftest/` | Self-tests of the harness itself (no engine, database or browser): the corpus, the calibration writer, the legacy seed's verdicts, the fixture builders, the stand-ins, and the browser lane run against an empty stand-in page, where every check must fail. |
 
 ## Ports
 
 | Service | Address |
 | --- | --- |
 | Engine under test | `http://127.0.0.1:5590` (`ENGINE_URL`; each worktree runs its own engine on its own port) |
-| Fake broker | `http://127.0.0.1:18788/provision`, token `local-broker-placeholder` |
+| Fake broker | `http://127.0.0.1:18788/provision`, token `local-broker-placeholder` (start a second one on another port for the pooled pass) |
 | Stub LLM | `http://127.0.0.1:18901/v1` |
 | pgvector (`gx-pgvector`) | `127.0.0.1:55432`, database `rrtenant` |
 | PgBouncer, transaction mode, in front of `gx-pgvector` (`vx-pgbouncer`) | `127.0.0.1:56434` |
@@ -67,7 +76,7 @@ docker run -d --name vx-chroma -p 127.0.0.1:58000:8000 \
 
 ```bash
 ACC=$PWD/scripts/acceptance/vector-explorer
-python3 $ACC/fake_broker.py &        # direct DSN; add --dsn postgresql://rruser:rrpass@127.0.0.1:56434/rrtenant for the pooled pass
+python3 $ACC/fake_broker.py &        # direct DSN; --pooler (on another --port) for the pooled pass
 python3 $ACC/stub_llm.py &
 
 STORE_DIR=$(mktemp -d)   # a fresh, disposable store; never your ~/.rocketlib/store
@@ -82,18 +91,86 @@ Leave `ROCKETRIDE_APIKEY` unset: an OSS engine then accepts any non-empty key,
 and the scripts sign in with `RR_TEST_APIKEY` (a local label, default
 `local-acceptance-key`).
 
-### 4. Fixtures
+## Fixtures
+
+| Key | Display name | What it is |
+| --- | --- | --- |
+| `postgres` | vx-local Vector (pgvector) | `postgres.pipe` on gx-pgvector, table `vx_demo_docs` |
+| `rocketride_vector` | vx-local Vector (RocketRide Vector) | `rocketride_vector.pipe` through the fake broker, table `vx_demo_rr` |
+| `qdrant` | vx-local Vector (Qdrant) | `qdrant.pipe` on vx-qdrant, collection `vx_demo_docs` |
+| `chroma` | vx-local Vector (Chroma) | `chroma.pipe` on vx-chroma, collection `vx_demo_docs` |
+| `stock_rag` | vx-local Stock RAG (pgvector) | the shape of `examples/rag-pipeline.pipe`: a webhook ingest, a chat with its own embedding and store node, **no Tools source** (the explorer's read-only case); table `vx_stock_rag`, writes on so a write through the chat source shows the source check |
+| `qdrant_pager` | vx-local 1,500 documents (Qdrant) | `qdrant.pipe` on collection `vx_pager_docs`, filled by `demo/seed_demo.sh --pager` (the directory's background paging); started only when named |
 
 ```bash
-(cd dist/server && ./engine $ACC/start_fixtures.py)                  # all four, stub LLM
-(cd dist/server && ./engine $ACC/start_fixtures.py --only qdrant)    # one
-(cd dist/server && ./engine $ACC/start_fixtures.py --stop)           # terminate them
+(cd dist/server && ./engine $ACC/start_fixtures.py)                        # the first five, stub LLM
+(cd dist/server && ./engine $ACC/start_fixtures.py --only qdrant_pager)    # one
+(cd dist/server && ./engine $ACC/start_fixtures.py --stop)                 # terminate them
+$ACC/demo/seed_demo.sh --if-empty                                          # the demo corpus
+$ACC/demo/seed_demo.sh --only qdrant_pager --pager                         # 1,500 documents (about 25 s warm)
 ```
 
 The first start installs and loads the embedding model (`all-MiniLM-L6-v2`),
-which can take a minute or more; later starts take seconds. The stores create
-their collection on the first ingest; the script itself never creates, drops or
-rewrites a table or collection.
+which can take a minute or more; later starts take seconds. Every source of a
+template fixture loads its own copy of the model. The stores create their
+collection on the first upload; the scripts never create, drop or rewrite a
+table or collection (`seed_legacy.sh --recreate` drops only `vx_legacy_` names).
+
+## Legacy collections
+
+`seed_legacy.sh` writes `vx_legacy_docs` on pgvector, Qdrant and Chroma the way
+the store drivers did before the explorer, so every explorer tool is also
+tested on old data: random point ids, no file size or ingest time, no `meta`
+column on pgvector, and one document without its first chunk. Run it once with
+an engine whose drivers are still the old ones; later runs only verify.
+
+- **pgvector**: the table is created with the old driver's DDL plus the
+  `signature` column its insert writes, and the control row exactly as
+  `createCollection` writes it; `postgres.pipe` uploads the corpus as
+  `/srv/legacy/<folder>/<file>` and `rocketride_vector.pipe` (through the broker)
+  the `kitchen` folder again as `/srv/legacy-rr/...`.
+- **Qdrant, Chroma**: the old drivers create the collection.
+- Then the first chunk of `manuals/long_manual.md` is deleted through each
+  database's own client. A fresh upload never loses chunk 0 by itself: the
+  chunker hands every text chunk of a document to the embedding node in one
+  call, so the store sees one write per document.
+
+Verified after seeding: one control record, exactly the long manual without
+chunk 0, every corpus document present by its objectId, no `meta` column on
+pgvector (until a newer driver opens the table and adds it).
+
+## Live node suites
+
+```bash
+cd dist/server
+./engine -m pytest ../../nodes/test/test_vector_toolpath_full.py -q -rs
+RR_TEST_VECTOR_LEGACY=seeded ./engine -m pytest ../../nodes/test/test_vector_toolpath_full.py -q -rs   # on vx_legacy_docs
+RR_TEST_PGVECTOR_POOLER_DSN=postgresql://rruser:rrpass@127.0.0.1:56434/rrtenant ./engine -m pytest ../../nodes/test/test_vector_toolpath_full.py -q -rs
+./engine -m pytest ../../nodes/test/test_vector_wire_fixtures_full.py -q -rs
+(cd ../../nodes && ../dist/server/engine test/vector_wire_fixtures.py ../apps/vector-ui/tests/fixtures/v1/live)   # regenerate the captures
+```
+
+The tool-path suite starts its own engine (free port), broker stand-in and stub
+LLM, and drops only `vx_tp_` collections. By default its legacy pass builds a
+legacy-shaped copy of its own collection; `RR_TEST_VECTOR_LEGACY=seeded` uses
+`vx_legacy_docs` and only adds and removes documents of its own there.
+
+## Browser lane
+
+```bash
+PLAYWRIGHT_DIR=<a folder whose node_modules has playwright> ENGINE_URL=http://127.0.0.1:5590 node $ACC/browser/lane_vector.cjs
+```
+
+It needs the fixtures running and seeded, and the app built into the engine
+(`./builder vector-ui:build`). Each step records PASS or FAIL with what it saw
+in `out/lane_vector.json`; screenshots go next to it.
+
+## Selftest
+
+```bash
+python3 -m unittest discover -s scripts/acceptance/vector-explorer/selftest -v
+node --test 'scripts/acceptance/vector-explorer/selftest/*.test.cjs'
+```
 
 ## Settings
 
@@ -108,9 +185,49 @@ All optional; the defaults match the containers above.
 | `VX_STUB_LLM_URL` | `http://127.0.0.1:18901/v1` | the stub LLM the fixtures point at |
 | `VX_COLLECTION` | `vx_demo_docs` | table / collection of the pgvector, Qdrant and Chroma fixtures |
 | `VX_RR_TABLE` | `vx_demo_rr` | table of the RocketRide Vector fixture |
-| `VX_PG_HOST`, `VX_PG_PORT`, `VX_PG_USER`, `VX_PG_PASSWORD`, `VX_PG_DATABASE` | `gx-pgvector` | the pgvector fixture's connection |
-| `VX_QDRANT_HOST`, `VX_QDRANT_PORT` | `127.0.0.1`, `56333` | the Qdrant fixture's connection |
-| `VX_CHROMA_HOST`, `VX_CHROMA_PORT` | `127.0.0.1`, `58000` | the Chroma fixture's connection |
+| `VX_STOCK_RAG_TABLE` | `vx_stock_rag` | table of the stock-RAG fixture |
+| `VX_PAGER_COLLECTION` | `vx_pager_docs` | collection of the paging fixture |
+| `VX_PG_HOST`, `VX_PG_PORT`, `VX_PG_USER`, `VX_PG_PASSWORD`, `VX_PG_DATABASE` | `gx-pgvector` | the pgvector fixtures' and seeds' connection |
+| `VX_QDRANT_HOST`, `VX_QDRANT_PORT` | `127.0.0.1`, `56333` | the Qdrant connection |
+| `VX_CHROMA_HOST`, `VX_CHROMA_PORT` | `127.0.0.1`, `58000` | the Chroma connection |
+| `RR_TEST_PGVECTOR_DSN`, `RR_TEST_PGVECTOR_POOLER_DSN`, `RR_TEST_QDRANT_URL`, `RR_TEST_CHROMA_URL` | the containers above (pooler: unset) | the live node suites |
+| `RR_TEST_VECTOR_LEGACY` | `emulated` | the tool-path suite's legacy pass (`seeded`: `vx_legacy_docs`) |
+
+## What these lanes found about the engine as it stands
+
+These shape the templates and the tests; each was measured on a local engine.
+
+- **The chunk size setting has no effect yet.** `preprocessor_langchain` filters
+  the splitter's keyword arguments by the splitter class's own `__init__`
+  signature, and LangChain's splitters take `chunk_size`, `chunk_overlap` and
+  `length_function` through `**kwargs`, so all three are dropped: every chunk
+  is up to LangChain's 4,000-character default whatever `strlen` says (on the
+  demo corpus: 81 chunks, median 3,409 characters, identical at `strlen` 200,
+  512 and 1,000). With the arguments passed through, `strlen` 1,000 gives a
+  median chunk of 806 characters, which the templates carry
+  (`apps/vector-ui/tests/fixtures/chunking.json` records both).
+- **The parser's size cap is not applied to these pipelines.** The parser reads
+  `index.maxFileSize` from the task's own configuration, which the engine
+  builds from the pipeline without an `index` section, so neither the
+  templates' `parse_1.config.index.maxFileSize` nor a pipeline-level `index`
+  is honoured (a 5.3 KB file went through with the cap at 1,000 bytes in both
+  places). The templates keep the value; the app's own upload limits are what
+  holds today.
+- **Upload names**: a name starting with `/` is stored without its leading
+  slash (`/srv/legacy/a.md` becomes the path `srv/legacy/a.md`), while the
+  objectId is derived from the name as sent: `uuid5(NAMESPACE_URL, 'null://Stream/' + name)`.
+- **The pgvector drivers as they stand cannot create a table**: their DDL lacks
+  the `signature` column their insert writes, so the first upload into a new
+  table fails (and leaves an empty table without a control record behind).
+  The legacy seed creates its table itself for that reason.
+- **Chroma's `objdir` lists nothing as it stands**: it filters on a metadata key
+  (`chunk`) the driver never writes.
+- **Which nodes a source's token reaches** (the store tools through
+  `client.tool`): the Tools token reaches `store_1`, `store_2`, `embed_1`,
+  `llm_1` and `response_2` but not `parse_1`/`chunk_1`; the Chat token reaches
+  both stores; the Ingest token reaches every node.
+- **Upload errors arrive garbled**: a failed upload reports a UTF-8 decode error
+  instead of the store's message, so a failure can only be shown as a failure.
 
 ## Notes
 
