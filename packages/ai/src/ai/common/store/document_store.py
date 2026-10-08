@@ -1603,6 +1603,7 @@ class VectorStoreToolMixin(VectorExplorerTools):
         if not docs:
             raise ToolRefusal('INVALID_INPUT', 'upsert: no valid documents provided')
 
+        self._vectordb_check_collection_fit(store, docs)
         store.addChunks(docs)
         object_ids = list(dict.fromkeys(doc.metadata.objectId for doc in docs))
         self._vx_forget_counts(store)
@@ -1613,6 +1614,34 @@ class VectorStoreToolMixin(VectorExplorerTools):
             'skipped': skipped,
             'audit': self._vx_audit('vector.upsert', store, object_ids, len(docs), decision),
         }
+
+    @staticmethod
+    def _vectordb_check_collection_fit(store: 'DocumentStoreBase', docs: List[Doc]) -> None:
+        """Refuse documents embedded with another model or dimension than an existing collection's.
+
+        ``MODEL_MISMATCH`` / ``DIMENSION_MISMATCH`` before anything is written (the store's own
+        check would raise a plain exception after the call reached it). A collection that does
+        not exist yet, or whose control record cannot be read, is left to ``addChunks``.
+        """
+        try:
+            exists = bool(store._doesCollectionExist()) and bool(store.doesCollectionExist())
+        except Exception:  # the store decides in addChunks, as before
+            return
+        if not exists:
+            return
+        for doc in docs:
+            model = doc.embedding_model
+            if store.modelName and isinstance(model, str) and model and model != store.modelName:
+                raise ToolRefusal(
+                    'MODEL_MISMATCH',
+                    f"This collection was embedded with '{store.modelName}' and these documents with "
+                    f"'{model}'; documents embedded with different models cannot be stored together.",
+                )
+            if store.vectorSize and hasVector(doc) and len(doc.embedding) != int(store.vectorSize):
+                raise ToolRefusal(
+                    'DIMENSION_MISMATCH',
+                    f'The vectors have {len(doc.embedding)} values; this collection stores {int(store.vectorSize)}.',
+                )
 
     @tool_function(
         input_schema={

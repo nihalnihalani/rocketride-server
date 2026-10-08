@@ -2074,6 +2074,47 @@ def test_upsert_store_error_is_enveloped(agent_context):
     assert 'model mismatch' in answer['error']
 
 
+def test_upsert_with_another_embedding_model_is_model_mismatch(agent_context):
+    store = clustered(CountingStore, docs=1, chunks=1)
+    before = set(store.rows)
+    inst = node(store, embed_query=lambda text: [0.1] * 8, embed_model_name='other-model')
+    answer = inst.upsert({'documents': [{'content': 'new text', 'object_id': 'fresh'}]})
+    assert (answer['success'], answer['code']) == (False, 'MODEL_MISMATCH')
+    assert MODEL in answer['error'] and 'other-model' in answer['error']
+    assert set(store.rows) == before and not _backend_calls(store, 'addChunks')
+
+
+def test_agent_upsert_with_its_own_vector_of_another_model_is_model_mismatch(agent_context):
+    store = clustered(CountingStore, docs=1, chunks=1)
+    answer = node(store).upsert(
+        {'documents': [{'content': 'x', 'object_id': 'fresh', 'embedding': [0.1] * 8, 'embedding_model': 'm'}]}
+    )
+    assert (answer['success'], answer['code']) == (False, 'MODEL_MISMATCH')
+
+
+def test_upsert_with_a_vector_of_another_dimension_is_dimension_mismatch(agent_context):
+    store = clustered(CountingStore, docs=1, chunks=1)
+    before = set(store.rows)
+    inst = node(store, embed_query=lambda text: [0.1] * 4, embed_model_name=MODEL)
+    answer = inst.upsert({'documents': [{'content': 'new text', 'object_id': 'fresh'}]})
+    assert (answer['success'], answer['code']) == (False, 'DIMENSION_MISMATCH')
+    assert set(store.rows) == before
+
+
+def test_upsert_with_the_collections_model_still_writes(agent_context):
+    store = clustered(CountingStore, docs=1, chunks=1)
+    inst = node(store, embed_query=lambda text: [0.1] * 8, embed_model_name=MODEL)
+    answer = inst.upsert({'documents': [{'content': 'new text', 'object_id': 'fresh'}]})
+    assert answer['success'] is True and ('fresh', 0) in store.rows
+
+
+def test_upsert_into_a_new_collection_creates_it(agent_context):
+    store = CountingStore()
+    inst = node(store, embed_query=lambda text: [0.1] * 8, embed_model_name='any-model')
+    answer = inst.upsert({'documents': [{'content': 'first text', 'object_id': 'first'}]})
+    assert answer['success'] is True and ('first', 0) in store.rows and ('schema', 0) in store.rows
+
+
 def test_upsert_without_an_embedder_is_no_embedder(agent_context):
     answer = node(clustered(CountingStore)).upsert({'documents': [{'content': 'x', 'object_id': 'a'}]})
     assert (answer['success'], answer['code']) == (False, 'NO_EMBEDDER')
