@@ -141,10 +141,12 @@ are never listed. A card shows:
   (pgvector: file size and ingest time are not stored yet, see
   [What the notes mean](#what-the-notes-mean)).
 
-A store node the anchor source cannot reach is shown Stopped with "Not
-reachable from the Chat source" (or Ingest). When nothing is listed, the page
-says "No running pipeline has a vector store. Start one of the Vector Explorer
-templates (`templates/<store>.pipe`) and save it as a project, then refresh."
+On a read-only card, a store node the anchor source cannot reach is shown
+Stopped with "Not reachable from the chat source", or "Not reachable from the
+ingest source" when the card is anchored on the Ingest source. When nothing is
+listed, the page says "No running pipeline has a vector store. Start one of the
+Vector Explorer templates (`templates/<store>.pipe`) and save it as a project,
+then refresh."
 
 Selecting a card opens a drawer with the roles, the backend and its version,
 the collection, metric, embedding model and dimension, the index, the embedding
