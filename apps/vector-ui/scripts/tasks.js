@@ -42,7 +42,7 @@ const ACCEPTANCE_BROWSER_DIR = path.join(ACCEPTANCE_DIR, 'browser');
 // a broken checkout or a deleted suite, not an app "without tests", so the
 // gate fails instead of running whatever happens to be left. Suites not listed
 // here (the map's, the chat's and the uploads') run as well.
-const REQUIRED_TESTS = ['scaffold.test.ts', 'templates.test.ts', 'adapter.test.ts', 'vector.results.test.ts', 'vector.documents.test.ts', 'vector.objectId.grep.test.ts', 'vector.stats.test.ts', 'vector.connections.test.ts', 'vector.confirm.test.ts', 'vector.wording.test.ts', 'vector.identity-change.test.ts', 'vector.wiring.test.ts', 'builder.e2e.test.ts', 'a11y.contrast.test.ts'];
+const REQUIRED_TESTS = ['scaffold.test.ts', 'templates.test.ts', 'adapter.test.ts', 'vector.results.test.ts', 'vector.documents.test.ts', 'vector.objectId.grep.test.ts', 'vector.stats.test.ts', 'vector.connections.test.ts', 'vector.confirm.test.ts', 'vector.console.test.ts', 'vector.wording.test.ts', 'vector.identity-change.test.ts', 'vector.wiring.test.ts', 'builder.e2e.test.ts', 'a11y.contrast.test.ts'];
 
 const mod = createAppModule({
 	name: 'vector-ui',
