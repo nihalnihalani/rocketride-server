@@ -467,10 +467,32 @@ def _data_conn(target: Any) -> Any:
     return conn
 
 
-def _target(logical_type: Any, chain: Any) -> Any:
+class _IJsonLike:
+    """Stand-in for the engine's IJson task config: dict-like, converts with toDict()."""
+
+    def __init__(self, value: Dict[str, Any]) -> None:
+        self._value = value
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return self._value.get(key, default)
+
+    def toDict(self) -> Dict[str, Any]:
+        return self._value
+
+
+def _pipeline(source_provider: Any, *, source: str = 'src_1') -> Dict[str, Any]:
+    """A task pipeline config whose source component has the given provider."""
+    components = [{'id': 'store_1', 'provider': 'postgres'}]
+    if source_provider is not None:
+        components.insert(0, {'id': source, 'provider': source_provider})
+    return {'source': source, 'components': components}
+
+
+def _target(source_provider: Any, chain: Any, *, pipeline: Any = None) -> Any:
+    """The pipeline's target endpoint as DataConn sees it: the Null endpoint, whose own type says nothing."""
     target = MagicMock()
-    target.logicalType = logical_type
-    target.taskConfig = {'threadCount': 2}
+    target.logicalType = 'null'
+    target.taskConfig = {'threadCount': 2, 'pipeline': pipeline if pipeline is not None else _pipeline(source_provider)}
     target.getPipe = MagicMock(return_value=chain)
     target.putPipe = MagicMock()
     return target
@@ -525,15 +547,48 @@ def test_dap_call_ignores_a_context_inside_the_input():
     assert read_stamp(store.params[0]).origin == 'dap'
 
 
-def test_dap_call_with_an_unreadable_source_type_is_unknown():
-    """A target without a usable logicalType records source_type None (refused by write gates)."""
+@pytest.mark.parametrize(
+    'pipeline',
+    [
+        _pipeline(None),
+        {'source': 'src_1'},
+        {'components': [{'id': 'src_1', 'provider': 'tools'}]},
+        {'source': 'src_1', 'components': [{'id': 'src_1', 'provider': ''}]},
+        {'source': 'src_1', 'components': [{'id': 'src_1', 'provider': 7}]},
+        {'source': 'src_1', 'components': 'not-a-list'},
+        'not-a-config',
+    ],
+    ids=[
+        'source-missing',
+        'no-components',
+        'no-source',
+        'blank-provider',
+        'odd-provider',
+        'odd-components',
+        'odd-config',
+    ],
+)
+def test_dap_call_with_an_unreadable_source_type_is_unknown(pipeline):
+    """A task whose source component cannot be read records source_type None (refused by write gates)."""
     store = _RecordingInstance()
-    target = _target(None, _chain(('store_1', store)))
-    conn = _data_conn(target)
+    conn = _data_conn(_target(None, _chain(('store_1', store)), pipeline=pipeline))
     _run_tool(
         conn, {'subcommand': 'tool', 'tool': 'stats', 'nodeId': 'store_1', 'input': {}, 'caller': dict(DAP_CALLER)}
     )
     assert read_stamp(store.params[0]).source_type is None
+
+
+def test_dap_source_type_is_the_source_components_provider_not_the_target_type():
+    """The source type is the provider of the task's source component; the Null target's own type is never used."""
+    store = _RecordingInstance()
+    pipeline = _IJsonLike(_pipeline('dropper', source='ingest_1'))
+    conn = _data_conn(_target(None, _chain(('store_1', store)), pipeline=pipeline))
+    _run_tool(
+        conn, {'subcommand': 'tool', 'tool': 'stats', 'nodeId': 'store_1', 'input': {}, 'caller': dict(DAP_CALLER)}
+    )
+    ctx = read_stamp(store.params[0])
+    assert ctx.source_type == 'dropper'
+    assert ctx.source_type != 'null'
 
 
 # ---------------------------------------------------------------------------

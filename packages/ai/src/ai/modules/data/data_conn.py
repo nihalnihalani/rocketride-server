@@ -923,6 +923,32 @@ class DataConn(DAPConn):
         component = component.replace('*', '')
         monitorOther('DBG', f'{op}*{pipe_id:x}*0*{component}*{payload}')
 
+    def _source_type(self) -> Optional[str]:
+        """Return the provider of this task's source component, or None when it cannot be read.
+
+        This is ``'tools'``, ``'chat'``, ``'dropper'``, ``'webhook'``, ... for the
+        source the task was started from: the provider of the component that
+        ``taskConfig.pipeline.source`` names. The target endpoint's own logical
+        type is not it (that is the pipeline's Null target endpoint).
+        """
+        try:
+            pipeline = self._target.taskConfig.get('pipeline')
+            if hasattr(pipeline, 'toDict'):
+                pipeline = pipeline.toDict()
+            if not isinstance(pipeline, dict):
+                return None
+            source_id = pipeline.get('source')
+            components = pipeline.get('components')
+            if not isinstance(source_id, str) or not source_id or not isinstance(components, list):
+                return None
+            for component in components:
+                if isinstance(component, dict) and component.get('id') == source_id:
+                    provider = component.get('provider')
+                    return provider if isinstance(provider, str) and provider else None
+        except Exception:
+            return None
+        return None
+
     async def _tool(self, request: Dict[str, Any], args: Dict[str, Any]) -> Dict[str, Any]:
         """
         Invoke a @tool_function on a pipeline node.
@@ -947,9 +973,9 @@ class DataConn(DAPConn):
 
         Every invoke param this builds carries the call context
         (``ai.common.tool_context``): origin ``'dap'``, the calling task's
-        source type (the target endpoint's logical type), whether a node was
-        named, and the caller. The tool input is passed through unchanged and
-        is never read as context.
+        source type (see :pymeth:`_source_type`), whether a node was named,
+        and the caller. The tool input is passed through unchanged and is
+        never read as context.
 
         Returns:
             DAP response with ``body.result`` set to the tool's return value.
@@ -997,7 +1023,7 @@ class DataConn(DAPConn):
             # from the server-side view only (the source task's type, the
             # node the request named, the caller the server attached).
             call_context = dap_context(
-                source_type=getattr(self._target, 'logicalType', None),
+                source_type=self._source_type(),
                 node_id=node_id,
                 caller=args.get('caller'),
             )
