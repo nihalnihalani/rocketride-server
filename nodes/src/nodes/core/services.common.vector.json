@@ -79,6 +79,18 @@
 				"ui:widget": "ApiKeyWidget"
 			}
 		},
+		"vector.allow_writes": {
+			"type": "boolean",
+			"title": "Allow document management from tool calls",
+			"description": "Let tool calls from a Tools source (for example the Vector Explorer) remove and add documents in this collection. Calls from other sources, from callers that are not signed in, and calls that do not name this node are refused either way.",
+			"default": false
+		},
+		"vector.agent_writes": {
+			"type": "boolean",
+			"title": "Allow writes from agents",
+			"description": "Let an agent in this pipeline add and remove documents through this node's tools.",
+			"default": true
+		},
 		"vectorizer.embedding": {
 			"title": "Embedding",
 			"combo": "embedding"
