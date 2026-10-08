@@ -1,3 +1,4 @@
+import base64
 import importlib
 import json
 import threading
@@ -5,19 +6,131 @@ from abc import abstractmethod, ABC
 from typing import TYPE_CHECKING, List, Callable, Dict, Any, FrozenSet, Optional, Sequence, Tuple
 from rocketlib import IInstanceBase, tool_function, warning
 from ..schema import Doc, DocFilter, DocMetadata, Question, QuestionText, QuestionType, Answer
+from .errors import StoreUnsupported
+from .vx_types import CONTROL_OBJECT_ID, ChunkPage, DocPage, DocumentRow, KnnGraph, StoreInfo
 
-if TYPE_CHECKING:  # annotations only: the module stays importable without numpy or the vx modules
+if TYPE_CHECKING:  # annotations only: numpy is imported where a hook needs it
     import numpy as np
 
-    from .vx_types import ChunkPage, Deleted, DocPage, Key, KnnGraph, StoreInfo
+    from .vx_types import Deleted, Key
 
 
 def _unsupported(hook: str) -> Exception:
     """Build the ``StoreUnsupported`` an optional hook raises when the driver does not implement it."""
-    # Imported on use so this module also loads where it is loaded on its own (isolated unit tests).
-    from .errors import StoreUnsupported
-
     return StoreUnsupported(f'{hook} is not supported by this store')
+
+
+# ---------------------------------------------------------------------------
+# Helpers shared by the explorer hooks and the drivers that override them
+# ---------------------------------------------------------------------------
+
+#: ``dialect.backend`` for a provider (node logical type) whose driver does not set ``VX_BACKEND``.
+_BACKEND_BY_PROVIDER: Dict[str, str] = {
+    'postgres': 'pgvector',
+    'rocketride_vector': 'pgvector',
+    'qdrant': 'qdrant',
+    'chroma': 'chroma',
+    'milvus': 'milvus',
+    'weaviate': 'weaviate',
+    'pinecone': 'pinecone',
+    'astra_db': 'astra',
+    'astra': 'astra',
+    'mongodb+srv': 'atlas',
+    'atlas': 'atlas',
+}
+
+
+def deletedFilter(deleted: str, **fields: Any) -> DocFilter:
+    """Build a ``DocFilter`` covering ``deleted`` rows (``'active'|'deleted'|'all'``).
+
+    Sets the exact ``deleted`` selector and the legacy ``isDeleted`` flag drivers
+    read today (``'active'`` -> False, otherwise True). A store whose ``isDeleted=True``
+    means "both" returns deleted and active rows for ``'deleted'``; callers that need
+    exactly the deleted ones filter what comes back (see :func:`matchesDeleted`).
+    """
+    flt = DocFilter(**fields)
+    flt.deleted = deleted
+    flt.isDeleted = deleted != 'active'
+    return flt
+
+
+def matchesDeleted(doc: Doc, deleted: str) -> bool:
+    """Whether ``doc`` belongs to the ``deleted`` selection (``'active'|'deleted'|'all'``)."""
+    is_deleted = bool(getattr(getattr(doc, 'metadata', None), 'isDeleted', False))
+    if deleted == 'active':
+        return not is_deleted
+    if deleted == 'deleted':
+        return is_deleted
+    return True
+
+
+def encodeCursor(state: Dict[str, Any]) -> str:
+    """Encode a listing position as an opaque, URL-safe cursor (base64 of compact JSON, unpadded)."""
+    raw = json.dumps(state, separators=(',', ':'), sort_keys=True).encode('utf-8')
+    return base64.urlsafe_b64encode(raw).decode('ascii').rstrip('=')
+
+
+def decodeCursor(cursor: str) -> Dict[str, Any]:
+    """Decode a cursor made by :func:`encodeCursor`.
+
+    :raises ValueError: When ``cursor`` is not one (not base64, not JSON, or not an object).
+    """
+    if not isinstance(cursor, str) or not cursor:
+        raise ValueError('the cursor is empty')
+    try:
+        raw = base64.urlsafe_b64decode(cursor + '=' * (-len(cursor) % 4))
+        state = json.loads(raw.decode('utf-8'))
+    except Exception as exc:
+        raise ValueError('the cursor is not one this store issued') from exc
+    if not isinstance(state, dict):
+        raise ValueError('the cursor is not one this store issued')
+    return state
+
+
+def metadataValue(doc: Doc, name: str) -> Any:
+    """Return metadata field or extra ``name`` of ``doc`` (None when absent)."""
+    md = getattr(doc, 'metadata', None)
+    if md is None:
+        return None
+    if isinstance(md, dict):
+        return md.get(name)
+    value = getattr(md, name, None)
+    if value is None:
+        extra = getattr(md, 'model_extra', None) or {}
+        value = extra.get(name)
+    return value
+
+
+def _int_or_none(value: Any) -> Optional[int]:
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def documentRow(doc: Doc, *, chunks: Optional[int] = None, tables: Optional[int] = None) -> DocumentRow:
+    """Build a ``DocumentRow`` from a document's display chunk (chunk 0 where it exists)."""
+    point_id = metadataValue(doc, 'pointId')
+    ingested = metadataValue(doc, 'ingestedAt')
+    return DocumentRow(
+        objectId=str(metadataValue(doc, 'objectId')),
+        path=str(metadataValue(doc, 'parent') or ''),
+        chunks=chunks,
+        has_first_chunk=_int_or_none(metadataValue(doc, 'chunkId')) == 0,
+        deleted=bool(metadataValue(doc, 'isDeleted')),
+        tables=tables,
+        nodeId=metadataValue(doc, 'nodeId'),
+        size=_int_or_none(metadataValue(doc, 'size')),
+        modifyTime=_int_or_none(metadataValue(doc, 'modifyTime')),
+        ingestedAt=ingested if isinstance(ingested, str) else None,
+        pointId=str(point_id) if point_id is not None else None,
+    )
+
+
+def _docKey(doc: Doc) -> str:
+    return f'{metadataValue(doc, "objectId")}#{metadataValue(doc, "chunkId")}'
 
 
 class DocumentStoreBase(ABC):
@@ -38,6 +151,13 @@ class DocumentStoreBase(ABC):
         self.modelName: str = ''
         self.threshold_search = 0.5
         self.collectionLock = threading.Lock()
+
+        # The node's logical type ('qdrant', 'postgres', ...); reported by the explorer tools.
+        self.provider: str = provider
+
+        # Whether the last query model compared against the control record differed
+        # from it (None until a search names a model). A warning, never a refusal.
+        self.modelMismatch: Optional[bool] = None
 
     @abstractmethod
     def _doesCollectionExist() -> bool:
@@ -137,9 +257,9 @@ class DocumentStoreBase(ABC):
     # wrapper reports as ``{success: false, code: 'UNSUPPORTED'}``. Every hook
     # excludes the control record (objectId ``'schema'``) from what it returns.
     #
-    # The defaults marked "not implemented yet" raise ``StoreUnsupported`` until
-    # the shared defaults land; the docstring states the default they will have.
-    # Drivers must not rely on those defaults raising.
+    # The defaults below work on any driver through the abstract API (``get``,
+    # ``remove``) and the count hooks; ``sampleChunks`` and ``getVectors`` have
+    # no portable default because no driver returns embeddings from ``get``.
     # ------------------------------------------------------------------
 
     #: Capability names a driver declares in addition to the hooks it overrides, for example
@@ -161,6 +281,13 @@ class DocumentStoreBase(ABC):
         'removeCounted',
     )
 
+    #: ``dialect.backend`` of the driver ('pgvector', 'qdrant', ...). None: derived from the provider.
+    VX_BACKEND: Optional[str] = None
+
+    #: ``dialect.support``: 'supported' once the driver's unmocked suites pass on a new and a legacy
+    #: collection, else 'experimental'. A driver lane sets it; mocked evidence never does.
+    VX_SUPPORT: str = 'experimental'
+
     def capabilities(self) -> FrozenSet[str]:
         """
         Return what this driver implements natively.
@@ -176,7 +303,34 @@ class DocumentStoreBase(ABC):
         }
         return frozenset(overridden) | frozenset(cls.VX_DRIVER_CAPABILITIES)
 
-    def describe(self) -> 'StoreInfo':
+    def vxBackend(self) -> str:
+        """Return the backend family reported as ``dialect.backend``."""
+        if self.VX_BACKEND:
+            return self.VX_BACKEND
+        provider = str(getattr(self, 'provider', '') or '')
+        return _BACKEND_BY_PROVIDER.get(provider, provider or 'unknown')
+
+    def vxCollectionName(self) -> Optional[str]:
+        """Return the collection (table, index) name, never a database or host name; None when unknown."""
+        for attr in ('collection_name', 'collection', 'table', 'index_name', 'indexName'):
+            value = getattr(self, attr, None)
+            if isinstance(value, str) and value:
+                return value
+        return None
+
+    def _readControlRecord(self) -> bool:
+        """Read the control record; load ``vectorSize``/``modelName`` and return True when exactly one exists."""
+        flt = DocFilter(objectIds=[CONTROL_OBJECT_ID], isDeleted=True)
+        flt.deleted = 'all'
+        docs = self.get(flt, checkCollection=False)
+        controls = [d for d in docs if metadataValue(d, 'objectId') == CONTROL_OBJECT_ID]
+        if len(controls) != 1:
+            return False
+        self.vectorSize = int(metadataValue(controls[0], 'vectorSize') or 0)
+        self.modelName = str(metadataValue(controls[0], 'modelName') or '')
+        return True
+
+    def describe(self) -> StoreInfo:
         """
         Describe the store: backend, collection, metric, dimension, model, index, size, caveats.
 
@@ -184,11 +338,37 @@ class DocumentStoreBase(ABC):
         and ``control_record=None``. Never carries a host, port, DSN, credential or
         database name.
 
-        Default (not implemented yet): control record via ``doesCollectionExist()``,
-        the configured similarity as the metric, ``backend_version``/``index``/``size_bytes``
-        None, ``meta_column`` None.
+        Default: existence through ``_doesCollectionExist()``, model and dimension from
+        the control record, the configured similarity as the metric;
+        ``backend_version``, ``index``, ``size_bytes`` and ``meta_column`` None. The
+        caveat ``model_mismatch`` is added when the last query model compared by
+        :meth:`doesCollectionExist` differed from the stored one.
         """
-        raise _unsupported('describe')
+        from .vx_math import normalize_metric
+
+        exists = bool(self._doesCollectionExist())
+        control: Optional[bool] = None
+        if exists:
+            with self.collectionLock:
+                control = self._readControlRecord()
+        caveats: List[str] = []
+        if getattr(self, 'modelMismatch', None):
+            caveats.append('model_mismatch')
+        known = exists and bool(control)
+        return StoreInfo(
+            backend=self.vxBackend(),
+            backend_version=None,
+            collection=self.vxCollectionName(),
+            collection_exists=exists,
+            control_record=control,
+            meta_column=None,
+            metric=normalize_metric(getattr(self, 'similarity', None)) if exists else None,
+            dimension=(self.vectorSize or None) if known else None,
+            model=(self.modelName or None) if known else None,
+            index=None,
+            size_bytes=None,
+            caveats=caveats,
+        )
 
     def scoreInfo(self) -> Dict[str, Any]:
         """
@@ -237,14 +417,14 @@ class DocumentStoreBase(ABC):
         object_ids: Optional[Sequence[str]],
         deleted: 'Deleted',
         sort: str,
-    ) -> 'DocPage':
+    ) -> DocPage:
         """
         Return one page of documents (one row per objectId).
 
         ``cursor`` is the opaque ``next_cursor`` of the previous page (None for the first
         page); ``object_ids`` restricts the listing; ``sort`` is ``'path'``.
 
-        Default (not implemented yet; ``distinct=False``, ``sorted=False``):
+        Default (``distinct=False``, ``sorted=False``):
         ``get(DocFilter(chunkIds=[0], deleted=deleted, limit=limit + 1, offset=cursor.offset))``,
         sorted by ``(parent, objectId)`` within the page; ``chunks=None``,
         ``counts_exact=False``, ``total=None``. The opaque cursor is
@@ -252,17 +432,85 @@ class DocumentStoreBase(ABC):
         equals ``cursor['f']`` the backend ignored the offset, so the page ends with
         ``next_cursor=None`` and the caveat ``'documents_paging_unsupported'``.
         """
-        raise _unsupported('listDocuments')
+        state = decodeCursor(cursor) if cursor else {}
+        offset = max(0, int(state.get('o', 0) or 0))
+        previous_first = state.get('f')
+        limit = max(1, int(limit))
+        flt = deletedFilter(
+            deleted,
+            chunkIds=[0],
+            objectIds=list(object_ids) if object_ids else None,
+            limit=limit + 1,
+            offset=offset,
+        )
+        raw = self.get(flt)
+        first_key = _docKey(raw[0]) if raw else None
+        if previous_first is not None and first_key == previous_first:
+            return DocPage(
+                items=[],
+                next_cursor=None,
+                total=None,
+                counts_exact=False,
+                distinct=False,
+                sorted=False,
+                caveats=['documents_paging_unsupported'],
+            )
+        items = [
+            documentRow(doc)
+            for doc in raw[:limit]
+            if metadataValue(doc, 'objectId') != CONTROL_OBJECT_ID
+            and (not object_ids or metadataValue(doc, 'objectId') in object_ids)
+            and matchesDeleted(doc, deleted)
+        ]
+        items.sort(key=lambda row: (row.path, row.objectId))
+        next_cursor = encodeCursor({'o': offset + limit, 'f': first_key}) if len(raw) > limit else None
+        return DocPage(
+            items=items,
+            next_cursor=next_cursor,
+            total=None,
+            counts_exact=False,
+            distinct=False,
+            sorted=False,
+            caveats=[],
+        )
 
-    def scrollChunks(self, objectId: str, *, after_chunk: int, limit: int, deleted: 'Deleted') -> 'ChunkPage':
+    def scrollChunks(self, objectId: str, *, after_chunk: int, limit: int, deleted: 'Deleted') -> ChunkPage:
         """
         Return the chunks of one document after ``after_chunk``, in chunk order, without embeddings.
 
-        Default (not implemented yet):
-        ``get(DocFilter(objectIds=[objectId], minChunkId=after_chunk + 1,
-        maxChunkId=after_chunk + limit, deleted=deleted))`` sorted by chunkId.
+        Default: ``get(DocFilter(objectIds=[objectId], minChunkId=after_chunk + 1,
+        maxChunkId=after_chunk + limit, deleted=deleted))`` sorted by chunkId, plus a
+        one-row probe past the window for ``has_more``. ``next_after`` is the end of
+        the window, so a gap in the chunk ids never stops the scroll early.
         """
-        raise _unsupported('scrollChunks')
+        if objectId == CONTROL_OBJECT_ID:
+            return ChunkPage(docs=[], has_more=False, next_after=int(after_chunk))
+        low = int(after_chunk) + 1
+        high = int(after_chunk) + max(1, int(limit))
+        window = self.get(
+            deletedFilter(
+                deleted, objectIds=[objectId], minChunkId=low, maxChunkId=high, limit=high - low + 1, offset=0
+            )
+        )
+        by_chunk: Dict[int, Doc] = {}
+        for doc in window:
+            chunk = _int_or_none(metadataValue(doc, 'chunkId'))
+            if (
+                metadataValue(doc, 'objectId') == objectId
+                and chunk is not None
+                and low <= chunk <= high
+                and matchesDeleted(doc, deleted)
+            ):
+                doc.embedding = None
+                by_chunk.setdefault(chunk, doc)
+        beyond = self.get(deletedFilter(deleted, objectIds=[objectId], minChunkId=high + 1, limit=1, offset=0))
+        has_more = any(
+            metadataValue(doc, 'objectId') == objectId
+            and (_int_or_none(metadataValue(doc, 'chunkId')) or -1) > high
+            and matchesDeleted(doc, deleted)
+            for doc in beyond
+        )
+        return ChunkPage(docs=[by_chunk[c] for c in sorted(by_chunk)], has_more=has_more, next_after=high)
 
     def sampleChunks(
         self,
@@ -280,7 +528,8 @@ class DocumentStoreBase(ABC):
         of those). A driver implements ``'stratified'`` only where it is cheap and native
         (pgvector ``ROW_NUMBER() OVER (PARTITION BY objectid ORDER BY random())``, Atlas
         ``$sample`` per group) and raises ``StoreUnsupported`` otherwise, so the shared
-        sampler falls back. ``include_keys`` are pinned keys the caller adds separately.
+        sampler falls back. ``include_keys`` are keys the caller already holds; a driver
+        may skip them.
 
         Default: raise ``StoreUnsupported``.
         """
@@ -299,23 +548,32 @@ class DocumentStoreBase(ABC):
         """
         raise _unsupported('getVectors')
 
-    def knnGraph(self, keys: Sequence['Key'], vectors: 'np.ndarray', metric: str, k: int) -> 'KnnGraph':
+    def knnGraph(self, keys: Sequence['Key'], vectors: 'np.ndarray', metric: str, k: int) -> KnnGraph:
         """
         Return the k-nearest-neighbour graph over the sampled ``keys`` (rows of ``vectors``).
 
-        Default (not implemented yet): ``vx_math.knn(metric, vectors, k)``, ``source='node'``.
+        Default: ``vx_math.knn(metric, vectors, k)``, ``source='node'``.
         Qdrant overrides it with ``search_matrix_offsets`` (``source='native'``).
         """
-        raise _unsupported('knnGraph')
+        from .vx_math import knn
+
+        offsets, cols, sims = knn(metric, vectors, k)
+        k_eff = max(0, min(int(k), len(keys) - 1))
+        return KnnGraph(k=k_eff, offsets_row=offsets, cols=cols, sims=sims, source='node')
 
     def removeCounted(self, objectIds: List[str]) -> Optional[int]:
         """
         Remove every chunk of ``objectIds``; return the rows actually removed (None when unknown).
 
-        Default (not implemented yet):
+        Never removes the control record. Default:
         ``n = countChunks(DocFilter(objectIds=objectIds, deleted='all')); self.remove(objectIds); return n``.
         """
-        raise _unsupported('removeCounted')
+        ids = [oid for oid in objectIds if oid != CONTROL_OBJECT_ID]
+        if not ids:
+            return 0
+        count = self.countChunks(deletedFilter('all', objectIds=list(ids)))
+        self.remove(ids)
+        return count
 
     @staticmethod
     def resolveDeleted(docFilter: DocFilter) -> 'Deleted':
@@ -665,14 +923,20 @@ class DocumentStoreBase(ABC):
         """
         Check if the collection exists and verifies its integrity.
 
-        If a `modelName` is provided, it ensures that the existing collection was encoded with the same model.
+        If a `modelName` is provided it is compared with the collection's stored model
+        and the outcome is recorded in ``self.modelMismatch`` (reported by ``describe()``
+        and the explorer tools as ``model_mismatch``). A mismatch never makes this
+        return False: reads keep working as they always have.
 
-        :param modelName: Optional name of the embedding model to validate against the collection.
-        :return: True if the collection exists and matches the model (if specified), otherwise False.
+        :param modelName: Optional name of the embedding model the caller's vectors were made with.
+        :return: True if the collection exists, otherwise False.
         """
         # Acquire the lock to ensure thread-safe checking
         with self.collectionLock:
-            return self._checkCollectionExists()
+            exists = self._checkCollectionExists()
+        if exists and modelName and self.modelName:
+            self.modelMismatch = modelName != self.modelName
+        return exists
 
     def createCollection(self, documents: List[Doc]):
         """

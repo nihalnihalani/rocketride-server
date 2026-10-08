@@ -5,9 +5,9 @@
 
 """Unit tests for the VectorStoreToolMixin (packages/ai/src/ai/common/store/document_store.py).
 
-These tests load ``store.py`` in isolation by stubbing its heavy imports
-(``rocketlib``, ``ai.common.schema``) so the module can be exercised without
-the server runtime. They cover:
+These tests run the mixin on the engine's own modules (``rocketlib``,
+``ai.common.schema``, ``ai.common.store``) with a fake store and a fake IGlobal,
+so no server or database is needed. They cover:
 
 * ``_normalize_vectordb_tool_input`` — dict / JSON / pydantic / nested /
   malformed / security-context stripping.
@@ -22,216 +22,37 @@ the server runtime. They cover:
 
 from __future__ import annotations
 
-import importlib.util
-import sys
-import types
-from collections.abc import Iterator
-from contextlib import contextmanager
-from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
-_ROOT = Path(__file__).resolve().parents[2]
-_STORE_PY = _ROOT / 'packages' / 'ai' / 'src' / 'ai' / 'common' / 'store' / 'document_store.py'
+import pytest
+from rocketlib import IInstanceBase
 
-_STUB_MODULE_NAMES = (
-    'rocketlib',
-    'ai',
-    'ai.common',
-    'ai.common.schema',
-    'ai.common.store',
-    'ai.common.store.document_store',
-)
+from ai.common.schema import Doc, DocMetadata
+from ai.common.store import VectorStoreToolMixin
+from ai.common.store import document_store as _store_module
 
-
-# ---------------------------------------------------------------------------
-# Stub harness
-# ---------------------------------------------------------------------------
-
-
-class _StubDoc:
-    def __init__(
-        self,
-        page_content: str = '',
-        metadata: Optional['_StubDocMetadata'] = None,
-        score: float = 0.0,
-        embedding: Optional[list] = None,
-        embedding_model: Optional[str] = None,
-    ) -> None:
-        self.page_content = page_content
-        self.metadata = metadata
-        self.score = score
-        self.embedding = embedding
-        self.embedding_model = embedding_model
-
-    def toDict(self) -> Dict[str, Any]:
-        return {'content': self.page_content, 'score': self.score}
-
-
-class _StubDocMetadata:
-    def __init__(self, **kwargs: Any) -> None:
-        self.objectId = kwargs.get('objectId', '')
-        self.nodeId = kwargs.get('nodeId', '')
-        self.parent = kwargs.get('parent', '/')
-        self.chunkId = kwargs.get('chunkId', 0)
-        self.tableId = kwargs.get('tableId', 0)
-        self.isTable = kwargs.get('isTable', False)
-        self.isDeleted = kwargs.get('isDeleted', False)
-        self.vectorSize = kwargs.get('vectorSize', 0)
-        self.modelName = kwargs.get('modelName', '')
-
-    def __iter__(self):
-        return iter(self.__dict__.items())
-
-
-class _StubDocFilter:
-    def __init__(self, **kwargs: Any) -> None:
-        self.objectIds = kwargs.get('objectIds')
-        self.nodeId = kwargs.get('nodeId')
-        self.parent = kwargs.get('parent')
-        self.isTable = kwargs.get('isTable')
-        self.permissions = kwargs.get('permissions')
-        self.tableIds = kwargs.get('tableIds')
-        self.chunkIds = kwargs.get('chunkIds')
-        self.minChunkId = kwargs.get('minChunkId')
-        self.maxChunkId = kwargs.get('maxChunkId')
-        self.isDeleted = kwargs.get('isDeleted')
-        self.offset = kwargs.get('offset', 0)
-        self.limit = kwargs.get('limit')
-        self.fullTables = kwargs.get('fullTables', False)
-        self.fullDocuments = kwargs.get('fullDocuments', False)
-
-
-class _StubQuestion:
-    def __init__(self, *a: Any, **kw: Any) -> None:
-        self.type = None
-        self.documents: list = []
-        self.questions: list = []
-        self.filter = _StubDocFilter()
-
-
-class _StubQuestionText:
-    def __init__(self, text: str = '') -> None:
-        self.text = text
-        self.embedding: Optional[list] = None
-        self.embedding_model: Optional[str] = None
-
-
-class _StubQuestionType:
-    PROMPT = 'prompt'
-    SEMANTIC = 'semantic'
-    QUESTION = 'question'
-    KEYWORD = 'keyword'
-    GET = 'get'
-
-
-class _StubAnswer:
-    def setAnswer(self, *_a: Any, **_kw: Any) -> None:
-        pass
-
-
-# rocketlib stubs
-class _StubIInstanceBase:
-    """Minimal stand-in for rocketlib.IInstanceBase used by the mixin tests."""
-
-    IGlobal: Any = None
-
-    def _collect_tool_methods(self) -> Dict[str, Callable]:
-        methods: Dict[str, Callable] = {}
-        for name in dir(type(self)):
-            attr = getattr(type(self), name, None)
-            if attr is not None and hasattr(attr, '__tool_meta__'):
-                methods[name] = getattr(self, name)
-        return methods
-
-
-def _stub_tool_function(
-    *,
-    input_schema: Any = None,
-    description: Any = None,
-    output_schema: Any = None,
-) -> Callable:
-    def decorator(fn: Callable) -> Callable:
-        fn.__tool_meta__ = {
-            'input_schema': input_schema,
-            'description': description,
-            'output_schema': output_schema,
-        }
-        return fn
-
-    return decorator
-
+_normalize_vectordb_tool_input = _store_module._normalize_vectordb_tool_input
 
 _WARNINGS: List[str] = []
 
 
-def _stub_warning(msg: str) -> None:
-    _WARNINGS.append(str(msg))
+@pytest.fixture(autouse=True)
+def _capture_warnings(monkeypatch):
+    """Collect what the store module logs with ``warning()``."""
+    _WARNINGS.clear()
+    monkeypatch.setattr(_store_module, 'warning', lambda msg: _WARNINGS.append(str(msg)))
+    yield
 
 
-def _install_stubs() -> None:
-    """Install lightweight stubs so store.py can be imported in isolation."""
-    rocketlib_mod = types.ModuleType('rocketlib')
-    rocketlib_mod.IInstanceBase = _StubIInstanceBase
-    rocketlib_mod.tool_function = _stub_tool_function
-    rocketlib_mod.warning = _stub_warning
-    sys.modules['rocketlib'] = rocketlib_mod
-
-    ai_pkg = types.ModuleType('ai')
-    ai_pkg.__path__ = []  # mark as package
-    common_pkg = types.ModuleType('ai.common')
-    common_pkg.__path__ = []
-    schema_mod = types.ModuleType('ai.common.schema')
-    schema_mod.Doc = _StubDoc
-    schema_mod.DocFilter = _StubDocFilter
-    schema_mod.DocMetadata = _StubDocMetadata
-    schema_mod.Question = _StubQuestion
-    schema_mod.QuestionText = _StubQuestionText
-    schema_mod.QuestionType = _StubQuestionType
-    schema_mod.Answer = _StubAnswer
-
-    store_pkg = types.ModuleType('ai.common.store')
-    store_pkg.__path__ = []  # mark as package so document_store's ``..schema`` resolves
-
-    sys.modules['ai'] = ai_pkg
-    sys.modules['ai.common'] = common_pkg
-    sys.modules['ai.common.schema'] = schema_mod
-    sys.modules['ai.common.store'] = store_pkg
+def _meta(**kwargs: Any) -> DocMetadata:
+    kwargs.setdefault('chunkId', 0)
+    return DocMetadata(**kwargs)
 
 
-@contextmanager
-def _scoped_stubs() -> Iterator[None]:
-    saved = {name: sys.modules.get(name) for name in _STUB_MODULE_NAMES}
-    _install_stubs()
-    try:
-        yield
-    finally:
-        for name, mod in saved.items():
-            if mod is None:
-                sys.modules.pop(name, None)
-            else:
-                sys.modules[name] = mod
-
-
-def _load_store_module() -> types.ModuleType:
-    with _scoped_stubs():
-        # Load store/document_store.py as a submodule of the stubbed
-        # ``ai.common`` package so its ``from ..schema import ...`` relative
-        # import resolves against the stub already installed in sys.modules.
-        spec = importlib.util.spec_from_file_location('ai.common.store.document_store', _STORE_PY)
-        assert spec is not None and spec.loader is not None
-        module = importlib.util.module_from_spec(spec)
-        sys.modules['ai.common.store.document_store'] = module
-        spec.loader.exec_module(module)
-        return module
-
-
-# Load once at module level. After load, the mixin's closures still reference
-# the stub types from the scoped-stubs window because the module caches them
-# via its own globals (e.g. ``Doc`` / ``QuestionText``).
-_store_module = _load_store_module()
-
-VectorStoreToolMixin = _store_module.VectorStoreToolMixin
-_normalize_vectordb_tool_input = _store_module._normalize_vectordb_tool_input
+def _doc(page_content: str = '', metadata: Optional[DocMetadata] = None, score: float = 0.0) -> Doc:
+    doc = Doc(page_content=page_content, metadata=metadata)
+    doc.score = score
+    return doc
 
 
 # ---------------------------------------------------------------------------
@@ -242,9 +63,7 @@ _normalize_vectordb_tool_input = _store_module._normalize_vectordb_tool_input
 class FakeStore:
     """Captures calls to searchSemantic/searchKeyword/addChunks/remove."""
 
-    def __init__(
-        self, semantic_docs: Optional[List[_StubDoc]] = None, keyword_docs: Optional[List[_StubDoc]] = None
-    ) -> None:
+    def __init__(self, semantic_docs: Optional[List[Doc]] = None, keyword_docs: Optional[List[Doc]] = None) -> None:
         """Seed the fake store with optional pre-canned result lists."""
         self.semantic_docs = semantic_docs if semantic_docs is not None else []
         self.keyword_docs = keyword_docs if keyword_docs is not None else []
@@ -254,13 +73,13 @@ class FakeStore:
         self.removed_ids: List[list] = []
         self.raise_semantic: Optional[Exception] = None
 
-    def searchSemantic(self, question: Any, doc_filter: Any) -> List[_StubDoc]:
+    def searchSemantic(self, question: Any, doc_filter: Any) -> List[Doc]:
         self.semantic_calls.append((question, doc_filter))
         if self.raise_semantic is not None:
             raise self.raise_semantic
         return self.semantic_docs
 
-    def searchKeyword(self, question: Any, doc_filter: Any) -> List[_StubDoc]:
+    def searchKeyword(self, question: Any, doc_filter: Any) -> List[Doc]:
         self.keyword_calls.append((question, doc_filter))
         return self.keyword_docs
 
@@ -297,7 +116,7 @@ class FakeIGlobal:
             self.embed_model_name = embed_model_name
 
 
-class FakeIInstance(VectorStoreToolMixin, _StubIInstanceBase):
+class FakeIInstance(VectorStoreToolMixin, IInstanceBase):
     def __init__(self, iglobal: FakeIGlobal) -> None:
         """Attach the fake IGlobal so the mixin sees the configured store."""
         self.IGlobal = iglobal
@@ -400,10 +219,10 @@ def test_collect_tool_methods_bare_names_regardless_of_provider() -> None:
 
 
 def test_collect_tool_methods_bare_names_when_no_globals() -> None:
-    class Orphan(VectorStoreToolMixin, _StubIInstanceBase):
+    class Orphan(VectorStoreToolMixin, IInstanceBase):
         pass
 
-    orphan = Orphan()
+    orphan = object.__new__(Orphan)
     orphan.IGlobal = None
     methods = orphan._collect_tool_methods()
     assert set(methods.keys()) == _EXPECTED_TOOLS
@@ -453,7 +272,7 @@ def test_upsert_metadata_schema_enumerates_only_honored_keys() -> None:
 def test_search_returns_error_envelope_when_no_embedder() -> None:
     """No embed_query on IGlobal → search must return a failure envelope, not fall back to keyword."""
     _fresh_warnings()
-    store = FakeStore(keyword_docs=[_StubDoc(page_content='cat', score=0.9, metadata=_StubDocMetadata(objectId='d1'))])
+    store = FakeStore(keyword_docs=[_doc(page_content='cat', score=0.9, metadata=_meta(objectId='d1'))])
     instance = FakeIInstance(FakeIGlobal(store=store, server_name='vdb'))
 
     result = instance.search({'query': 'cat'})
@@ -488,7 +307,7 @@ def test_search_uses_semantic_when_embed_query_present() -> None:
         embed_calls.append(text)
         return [0.1, 0.2, 0.3]
 
-    store = FakeStore(semantic_docs=[_StubDoc(page_content='dog', score=0.8, metadata=_StubDocMetadata(objectId='d2'))])
+    store = FakeStore(semantic_docs=[_doc(page_content='dog', score=0.8, metadata=_meta(objectId='d2'))])
     instance = FakeIInstance(
         FakeIGlobal(store=store, server_name='vdb', embed_query=embed_query, embed_model_name='test-model')
     )
@@ -514,9 +333,7 @@ def test_search_uses_iglobal_embed_query_when_bound() -> None:
         embed_calls.append(text)
         return embedded_vector
 
-    store = FakeStore(
-        semantic_docs=[_StubDoc(page_content='result', score=0.9, metadata=_StubDocMetadata(objectId='r1'))]
-    )
+    store = FakeStore(semantic_docs=[_doc(page_content='result', score=0.9, metadata=_meta(objectId='r1'))])
     instance = FakeIInstance(
         FakeIGlobal(store=store, server_name='vdb', embed_query=embed_query, embed_model_name='ada-002')
     )
@@ -542,7 +359,7 @@ def test_search_empty_query_returns_error_envelope() -> None:
 def test_search_falls_back_to_keyword_on_semantic_exception() -> None:
     """When embed_query IS bound but searchSemantic raises, fall back to keyword search."""
     _fresh_warnings()
-    store = FakeStore(keyword_docs=[_StubDoc(page_content='kw', score=0.5, metadata=_StubDocMetadata(objectId='d1'))])
+    store = FakeStore(keyword_docs=[_doc(page_content='kw', score=0.5, metadata=_meta(objectId='d1'))])
     store.raise_semantic = RuntimeError('index missing')
     instance = FakeIInstance(FakeIGlobal(store=store, server_name='vdb', embed_query=lambda _t: [0.0, 0.1]))
 
@@ -782,7 +599,7 @@ def test_dispatch_via_bare_name() -> None:
         embed_calls.append(text)
         return [1.0, 0.0]
 
-    store = FakeStore(semantic_docs=[_StubDoc(page_content='hit', score=1.0, metadata=_StubDocMetadata(objectId='o1'))])
+    store = FakeStore(semantic_docs=[_doc(page_content='hit', score=1.0, metadata=_meta(objectId='o1'))])
     instance = FakeIInstance(
         FakeIGlobal(store=store, server_name='pinecone', embed_query=embed_query, embed_model_name='test')
     )
