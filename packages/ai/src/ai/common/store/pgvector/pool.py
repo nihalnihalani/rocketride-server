@@ -59,6 +59,7 @@ from typing import Any, Callable, Deque, Dict, Iterable, Iterator, Mapping, Opti
 
 import psycopg2
 
+from psycopg2.extensions import TRANSACTION_STATUS_IDLE
 from rocketlib import debug
 
 from ..errors import StoreError, ToolRefusal
@@ -76,9 +77,6 @@ UNREACHABLE_TEXT = 'The pgvector database could not be reached'
 
 #: ``application_name`` of the driver's sessions, so they are easy to find in ``pg_stat_activity``.
 APPLICATION_NAME = 'rocketride-pgvector'
-
-# psycopg2's TRANSACTION_STATUS_IDLE (kept literal: the test double has no extensions module).
-_TRANSACTION_STATUS_IDLE = 0
 
 # SQLSTATEs the driver answers specially.
 _UNDEFINED_TABLE = '42P01'
@@ -140,7 +138,7 @@ class FairGate:
 
 def _reset_connection(conn: Any) -> None:
     conn.rollback()
-    if conn.get_transaction_status() != _TRANSACTION_STATUS_IDLE:
+    if conn.get_transaction_status() != TRANSACTION_STATUS_IDLE:
         raise RuntimeError('connection did not return to idle after rollback')
 
 
