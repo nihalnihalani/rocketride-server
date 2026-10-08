@@ -128,9 +128,9 @@ Rules the tests pin:
 Builder tasks (see the [builder reference](../builder/reference.md)):
 
 ```bash
-./builder vector-ui:build   # bundle, register in apps.json, copy to dist/server/static/apps/rocketride.vector
-./builder vector-ui:dev     # rsbuild dev server on port 3103
-./builder vector-ui:test    # node:test over apps/vector-ui/tests
+./builder vector-ui:build     # bundle into dist/server/static/apps, register in apps.json
+./builder vector-ui:dev       # rsbuild dev server on port 3103
+./builder vector-ui:test      # node:test over apps/vector-ui/tests
 ./builder vector-ui:e2e-live  # browser lanes against ENGINE_URL; opt-in, not part of test or CI
 ```
 
@@ -241,8 +241,8 @@ record each server's version.
    fresh store exactly as the acceptance
    [README](../../../scripts/acceptance/vector-explorer/README.md) says. An
    engine seeds an app version once per store, so use a fresh store after a
-   rebuild (see
-   [Trying a production build on a local engine](index.md#trying-a-production-build-on-a-local-engine)).
+   rebuild (see "Trying a production build on a local engine" in
+   [the apps index](index.md#trying-a-production-build-on-a-local-engine)).
 3. Start the fixture pipelines with `start_fixtures.py` (one per supported
    store, all three sources, no idle timeout, the stub LLM in place of a
    model).
