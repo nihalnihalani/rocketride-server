@@ -51,6 +51,7 @@ from .test_vector_hooks import (
     ExactListingStore,
     MemoryStore,
     NativeStratifiedStore,
+    NumpyVectorStore,
     VectorMemoryStore,
     corpus,
     make_doc,
@@ -1167,6 +1168,29 @@ def test_sample_detailed_answer_shape():
     assert all(doc['chunks'] == 5 for doc in answer['docs'])
     assert 'caveats' not in answer
     assert _no_vectors_anywhere(answer, 8)
+
+
+def test_sample_accepts_numpy_embeddings_from_the_driver():
+    store = clustered(NumpyVectorStore, docs=4, chunks=4)
+    assert isinstance(store.getVectors([('doc00', 0)])[0].embedding, np.ndarray)
+    answer = node(store).sample({'n': 12, 'seed': 2})
+    assert answer['success'] is True and answer['n'] == 12 and answer['dimension'] == 8
+
+
+def test_vectors_project_and_neighbors_accept_numpy_embeddings():
+    inst = node(clustered(NumpyVectorStore, docs=4, chunks=4))
+    assert inst.vectors({'keys': [['doc01', 2]]})['items'][0]['dimension'] == 8
+    sample = inst.sample({'n': 6, 'seed': 1})
+    assert inst.project({'sample_id': sample['sample_id'], 'keys': [['doc03', 3]]})['success'] is True
+    assert inst.neighbors({'key': ['doc01', 2], 'k': 3})['success'] is True
+
+
+def test_search_similarities_accept_numpy_embeddings():
+    store = clustered(NumpyVectorStore)
+    vector = list(store.rows[('doc02', 3)].embedding)
+    hits = [store.rows[('doc02', 3)], store.rows[('doc01', 0)]]
+    sims = node(store)._vectordb_result_sims(store, vector, hits)
+    assert set(sims) == {('doc02', 3), ('doc01', 0)} and sims[('doc02', 3)] == pytest.approx(1.0, abs=1e-4)
 
 
 def test_sample_points_are_ordered_by_document_then_chunk():

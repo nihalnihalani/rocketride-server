@@ -227,6 +227,17 @@ def documentRow(doc: Doc, *, chunks: Optional[int] = None, tables: Optional[int]
     )
 
 
+def hasVector(doc: Any) -> bool:
+    """Whether ``doc`` carries a non-empty embedding (a list or a numpy row; never truth-tests an array)."""
+    embedding = getattr(doc, 'embedding', None)
+    if embedding is None:
+        return False
+    try:
+        return len(embedding) > 0
+    except TypeError:
+        return False
+
+
 def docKey(doc: Any) -> Optional[Key]:
     """Return ``(objectId, chunkId)`` of ``doc``, or None when either is missing."""
     oid = metadataValue(doc, 'objectId')
@@ -1254,7 +1265,7 @@ class VectorExplorerTools:
                 or key is None
                 or key[0] == CONTROL_OBJECT_ID
                 or key in chosen
-                or not doc.embedding
+                or not hasVector(doc)
                 or (object_ids and key[0] not in object_ids)
                 or not matchesDeleted(doc, deleted)
             ):
@@ -1902,6 +1913,7 @@ __all__ = [
     'documentRow',
     'encodeCursor',
     'finish_answer',
+    'hasVector',
     'invalidCursor',
     'jsonable',
     'matchesDeleted',

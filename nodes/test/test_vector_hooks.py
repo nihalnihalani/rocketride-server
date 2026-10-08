@@ -268,6 +268,16 @@ class ExactListingStore(VectorMemoryStore):
         return DocPage(page, nxt, len(rows), True, True, True, [])
 
 
+class NumpyVectorStore(ExactListingStore):
+    """Hands back embeddings as numpy rows assigned after the Doc is built (as a chromadb 1.x driver may)."""
+
+    def getVectors(self, keys: Sequence[Tuple[str, int]]) -> List[Doc]:
+        out = super().getVectors(keys)
+        for doc in out:
+            doc.embedding = np.asarray(doc.embedding, dtype=np.float32)
+        return out
+
+
 class NativeStratifiedStore(ExactListingStore):
     """Adds a native stratified sampler."""
 
