@@ -35,7 +35,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import React from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
-import { LINK_REL, parseMarkdown, plainText, safeHref } from '../src/vector/markdown';
+import { LINK_REL, MARKDOWN_MAX_CHARS, parseMarkdown, plainText, safeHref } from '../src/vector/markdown';
 import type { MdBlock, MdInline } from '../src/vector/markdown';
 import { Markdown } from '../src/chat/Markdown';
 
@@ -274,6 +274,63 @@ test('markdown: deep nesting and huge input are bounded', () => {
 	const blocks = parseMarkdown(big, { maxChars: 1000 });
 	assert.ok(plainText(blocks).length <= 1001 + 1);
 	assert.match(plainText(blocks), /…$/);
+});
+
+/** Longest one answer of the full cap may take to parse (best of up to three runs). */
+const PARSE_LIMIT_MS = 100;
+
+test('markdown: no answer within the cap stalls the page; every hostile shape parses in under 100 ms', () => {
+	const n = MARKDOWN_MAX_CHARS - 100;
+	const fill = (unit: string): string => unit.repeat(Math.floor(n / unit.length));
+	// Shapes that made a search cost (length × length) or (length × span):
+	// whitespace runs inside table delimiters, headings and paragraphs, and
+	// openers that are never closed.
+	const shapes: Array<[string, string]> = [
+		['table delimiter: pipe then spaces', 'a|b\n|' + ' '.repeat(n) + 'x|'],
+		['table delimiter: dash then spaces', 'a|b\n|-' + ' '.repeat(n) + '|x'],
+		['heading: spaces inside', '# a' + ' '.repeat(n) + 'b'],
+		['heading: spaces and tabs inside', '# a' + ' \t'.repeat(n / 2) + 'b'],
+		['paragraph: a run of spaces', 'a' + ' '.repeat(n) + 'b'],
+		['brackets never closed', '['.repeat(n)],
+		['images never closed', fill('![')],
+		['link destinations never closed', fill('[a](')],
+		['emphasis never closed', fill('*a ')],
+		['strong never closed', fill('**a ')],
+		['underscores never closed', fill('_a ')],
+		['strikethrough never closed', fill('~~a ')],
+		['bare URLs ending in parentheses', fill('http://a' + ')'.repeat(1990) + ' ')],
+		['bare URL look-alikes', fill('http:///-')],
+		['email look-alikes', fill('<a@' + 'a.'.repeat(998) + ' ')],
+		['rule look-alike', '- '.repeat(n / 2) + 'x'],
+		['quotes nested deep', '> '.repeat(n / 2) + 'x'],
+	];
+	const slow: string[] = [];
+	for (const [label, text] of shapes) {
+		assert.ok(text.length <= MARKDOWN_MAX_CHARS, `${label}: the cap must not cut the input`);
+		let best = Number.POSITIVE_INFINITY;
+		for (let run = 0; run < 3 && best > PARSE_LIMIT_MS; run++) {
+			const started = performance.now();
+			parseMarkdown(text);
+			best = Math.min(best, performance.now() - started);
+		}
+		if (best > PARSE_LIMIT_MS) slow.push(`${label}: ${Math.round(best)} ms`);
+	}
+	assert.deepEqual(slow, []);
+});
+
+test('markdown: once an answer has spent its search budget the rest is plain text, and the next answer is parsed in full', () => {
+	const unclosed = '*a '.repeat(Math.floor((MARKDOWN_MAX_CHARS - 200) / 3));
+	const hostile = `${unclosed}**late** and [docs](https://docs.example/a)`;
+	const blocks = parseMarkdown(hostile);
+	// Every character is still there to read; nothing past the budget became markup.
+	assert.equal(plainText(blocks), hostile.trim());
+	assert.equal(links(blocks).length, 0);
+	// The budget belongs to one answer.
+	const next = parseMarkdown('**bold** and [docs](https://docs.example/a)');
+	assert.deepEqual(
+		inlines(next).map((node) => node.type),
+		['strong', 'text', 'text', 'link', 'text']
+	);
 });
 
 test('markdown: random metacharacter soup never throws and never yields an unsafe link', () => {

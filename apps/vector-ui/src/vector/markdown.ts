@@ -41,8 +41,14 @@
 // ordered lists (nested by indentation), GFM tables, thematic breaks, emphasis,
 // strong, strikethrough, inline code, links, autolinks, bare http(s) URLs,
 // backslash escapes, character references and hard breaks. Everything else
-// renders as text. Input is capped (MARKDOWN_MAX_CHARS) and every nesting and
-// delimiter search is bounded, so hostile input cannot stall the page.
+// renders as text.
+//
+// Hostile input cannot stall the page: the input is capped
+// (MARKDOWN_MAX_CHARS), nesting is capped, no regular expression here can
+// backtrack over a run of characters more than once (block shapes are read
+// by hand), and the delimiter searches of one answer share a budget
+// proportional to its length; once it is spent, the rest of the answer is
+// plain text. The parse is therefore linear in the answer's length.
 // No regex lookbehind (the app supports Safari 13). No platform imports.
 // =============================================================================
 
@@ -64,6 +70,40 @@ const MAX_SPAN = 2_000;
 /** Table caps. */
 const MAX_TABLE_COLUMNS = 50;
 const MAX_TABLE_ROWS = 500;
+
+/**
+ * Characters the delimiter searches of one answer may visit, per character of
+ * the answer. A search that finds no closer costs up to MAX_SPAN, so an answer
+ * full of openers that are never closed would otherwise cost length × MAX_SPAN.
+ * Ordinary answers use a small fraction of this.
+ */
+const SEARCH_STEPS_PER_CHAR = 16;
+
+/**
+ * Search steps left in the parse in progress. parseMarkdown sets it before
+ * parsing and restores it after (parsing is synchronous); once it is spent,
+ * every further search reports "no closer" and the rest is plain text.
+ */
+let searchBudget = 0;
+
+/**
+ * Pay for a search.
+ *
+ * @param steps - Characters it visited.
+ */
+function spend(steps: number): void {
+	searchBudget -= Math.max(1, steps);
+}
+
+/**
+ * Whether one is a space or a tab.
+ *
+ * @param ch - One character, or undefined.
+ * @returns True for ' ' and '\t'.
+ */
+function isBlank(ch: string | undefined): boolean {
+	return ch === ' ' || ch === '\t';
+}
 
 // =============================================================================
 // Node types
@@ -198,6 +238,7 @@ function isSpace(ch: string | undefined): boolean {
  * @returns The span's content and end, or null when it is not closed.
  */
 function readCodeSpan(text: string, at: number): { content: string; end: number } | null {
+	if (searchBudget <= 0) return null;
 	let run = 0;
 	while (text[at + run] === '`') run++;
 	const fence = '`'.repeat(run);
@@ -205,19 +246,21 @@ function readCodeSpan(text: string, at: number): { content: string; end: number 
 	const limit = Math.min(text.length, at + run + MAX_SPAN);
 	while (search < limit) {
 		const close = text.indexOf(fence, search);
-		if (close < 0 || close >= limit) return null;
+		if (close < 0 || close >= limit) break;
 		// The closing run must be exactly as long.
 		if (text[close + run] === '`') {
 			search = close + run;
 			while (text[search] === '`') search++;
 			continue;
 		}
+		spend(close + run - at);
 		let content = text.slice(at + run, close).replace(/\n/g, ' ');
 		if (content.length > 2 && content[0] === ' ' && content[content.length - 1] === ' ' && content.trim() !== '') {
 			content = content.slice(1, -1);
 		}
 		return { content, end: close + run };
 	}
+	spend(limit - at);
 	return null;
 }
 
@@ -229,9 +272,11 @@ function readCodeSpan(text: string, at: number): { content: string; end: number 
  * @returns The index of the matching ']', or -1.
  */
 function matchBracket(text: string, at: number): number {
+	if (searchBudget <= 0) return -1;
 	let depth = 0;
 	const limit = Math.min(text.length, at + MAX_SPAN);
-	for (let i = at; i < limit; i++) {
+	let i = at;
+	for (; i < limit; i++) {
 		const ch = text[i];
 		if (ch === '\\') {
 			i++;
@@ -249,9 +294,13 @@ function matchBracket(text: string, at: number): number {
 		if (ch === '[') depth++;
 		else if (ch === ']') {
 			depth--;
-			if (depth === 0) return i;
+			if (depth === 0) {
+				spend(i - at);
+				return i;
+			}
 		}
 	}
+	spend(i - at);
 	return -1;
 }
 
@@ -263,21 +312,27 @@ function matchBracket(text: string, at: number): number {
  * @returns The index of the matching ')', or -1.
  */
 function matchParen(text: string, at: number): number {
+	if (searchBudget <= 0) return -1;
 	let depth = 0;
 	const limit = Math.min(text.length, at + MAX_SPAN);
-	for (let i = at; i < limit; i++) {
+	let i = at;
+	for (; i < limit; i++) {
 		const ch = text[i];
 		if (ch === '\\') {
 			i++;
 			continue;
 		}
-		if (ch === '\n' && text[i + 1] === '\n') return -1;
+		if (ch === '\n' && text[i + 1] === '\n') break;
 		if (ch === '(') depth++;
 		else if (ch === ')') {
 			depth--;
-			if (depth === 0) return i;
+			if (depth === 0) {
+				spend(i - at);
+				return i;
+			}
 		}
 	}
+	spend(i - at);
 	return -1;
 }
 
@@ -307,8 +362,10 @@ function linkDestination(inner: string): string {
  * @returns The closer's index, or -1.
  */
 function findCloser(text: string, at: number, delim: string): number {
+	if (searchBudget <= 0) return -1;
 	const limit = Math.min(text.length, at + delim.length + MAX_SPAN);
-	for (let i = at + delim.length + 1; i < limit; i++) {
+	let i = at + delim.length + 1;
+	for (; i < limit; i++) {
 		const ch = text[i];
 		if (ch === '\\') {
 			i++;
@@ -328,8 +385,10 @@ function findCloser(text: string, at: number, delim: string): number {
 			if (text[i + 1] === delim || text[i - 1] === delim) continue;
 		}
 		if (delim[0] === '_' && isAlnum(text[i + delim.length])) continue;
+		spend(i - at);
 		return i;
 	}
+	spend(i - at);
 	return -1;
 }
 
@@ -342,26 +401,75 @@ function findCloser(text: string, at: number, delim: string): number {
  * @returns The end index, or -1 when no URL starts here.
  */
 function bareUrlEnd(text: string, at: number): number {
+	if (searchBudget <= 0) return -1;
 	const match = /^https?:\/\/[^\s<>"`]+/i.exec(text.slice(at, at + MAX_SPAN));
 	if (!match) return -1;
-	let url = match[0];
-	for (;;) {
-		const last = url[url.length - 1];
+	const url = match[0];
+	spend(url.length);
+	let opens = 0;
+	let closes = 0;
+	for (let i = 0; i < url.length; i++) {
+		if (url[i] === '(') opens++;
+		else if (url[i] === ')') closes++;
+	}
+	let end = url.length;
+	while (end > 0) {
+		const last = url[end - 1];
 		if ('.,:;!?\'"*_~'.includes(last)) {
-			url = url.slice(0, -1);
+			end--;
 			continue;
 		}
-		if (last === ')') {
-			const opens = url.split('(').length - 1;
-			const closes = url.split(')').length - 1;
-			if (closes > opens) {
-				url = url.slice(0, -1);
-				continue;
-			}
+		if (last === ')' && closes > opens) {
+			closes--;
+			end--;
+			continue;
 		}
 		break;
 	}
-	return url.length > 'https://'.length - 1 ? at + url.length : -1;
+	return end > 'https://'.length - 1 ? at + end : -1;
+}
+
+/**
+ * The autolink `<scheme:…>` or `<name@host.tld>` at `text[at] === '<'`, read
+ * by hand: the scan stops at the first '>', '<' or whitespace.
+ *
+ * @param text - The text.
+ * @param at - Index of '<'.
+ * @returns The link target, its label and the index after '>', or null.
+ */
+function readAutolink(text: string, at: number): { href: string; label: string; end: number } | null {
+	const limit = Math.min(text.length, at + MAX_SPAN);
+	let close = -1;
+	for (let i = at + 1; i < limit; i++) {
+		const ch = text[i];
+		if (ch === '>') {
+			close = i;
+			break;
+		}
+		if (ch === '<' || isSpace(ch)) return null;
+	}
+	if (close < 0) return null;
+	const inner = text.slice(at + 1, close);
+	let href: string | null;
+	if (/^[A-Za-z][A-Za-z0-9+.-]{1,31}:/.test(inner)) href = safeHref(inner);
+	else href = isEmailAddress(inner) ? safeHref(`mailto:${inner}`) : null;
+	return href === null ? null : { href, label: inner, end: close + 1 };
+}
+
+/**
+ * Whether the inside of `<…>` (no whitespace, '<' or '>') is an email
+ * address: a local part without '@' or ':', one '@', and a host with a dot
+ * that is neither its first nor its last character.
+ *
+ * @param inner - What sits between the angle brackets.
+ * @returns True for an address.
+ */
+function isEmailAddress(inner: string): boolean {
+	const atSign = inner.indexOf('@');
+	if (atSign <= 0 || inner.indexOf('@', atSign + 1) >= 0 || inner.lastIndexOf(':', atSign) >= 0) return false;
+	const host = inner.slice(atSign + 1);
+	const dot = host.indexOf('.', 1);
+	return dot > 0 && dot < host.length - 1;
 }
 
 /**
@@ -493,15 +601,11 @@ function parseInline(text: string, depth = 0): MdInline[] {
 
 		// Autolinks: <https://…> and <name@host>.
 		if (ch === '<') {
-			const tail = text.slice(i, i + MAX_SPAN);
-			const uri = /^<([A-Za-z][A-Za-z0-9+.-]{1,31}:[^<>\s]*)>/.exec(tail);
-			const email = /^<([^\s<>@:]+@[^\s<>@]+\.[^\s<>@]+)>/.exec(tail);
-			const href = uri ? safeHref(uri[1]) : email ? safeHref(`mailto:${email[1]}`) : null;
-			const matched = uri ?? email;
-			if (href !== null && matched !== null) {
+			const autolink = readAutolink(text, i);
+			if (autolink !== null) {
 				flush(i);
-				out.push({ type: 'link', href, rel: LINK_REL, children: [{ type: 'text', text: matched[1] }] });
-				i += matched[0].length;
+				out.push({ type: 'link', href: autolink.href, rel: LINK_REL, children: [{ type: 'text', text: autolink.label }] });
+				i = autolink.end;
 				plainFrom = i;
 				continue;
 			}
@@ -558,12 +662,46 @@ function parseInline(text: string, depth = 0): MdInline[] {
 // Block parsing
 // =============================================================================
 
+// Each of these reads a line left to right with no two quantifiers able to
+// claim the same characters, so a failed match costs one pass. Headings and
+// table delimiter rows are read by hand (readHeading, isDelimiterRow): as
+// regular expressions they need adjacent optional whitespace runs, which
+// backtrack quadratically over a long run of spaces.
 const FENCE = /^( {0,3})(`{3,}|~{3,})(.*)$/;
-const HEADING = /^ {0,3}(#{1,6})(?:[ \t]+(.*?))?(?:[ \t]+#+)?[ \t]*$/;
 const RULE = /^ {0,3}(?:(?:-[ \t]*){3,}|(?:\*[ \t]*){3,}|(?:_[ \t]*){3,})$/;
 const QUOTE = /^ {0,3}>/;
 const LIST_ITEM = /^( {0,3})([-*+]|(\d{1,9})([.)]))(?:([ \t]+)(.*))?$/;
-const TABLE_DELIMITER = /^\s*\|?\s*:?-+:?\s*(?:\|\s*:?-+:?\s*)*\|?\s*$/;
+
+/** One cell of a table delimiter row, trimmed. */
+const DELIMITER_CELL = /^:?-+:?$/;
+
+/**
+ * An ATX heading: up to three spaces, one to six '#', then a space, a tab or
+ * the end of the line; an optional closing run of '#' after a space or tab is
+ * dropped.
+ *
+ * @param line - The line.
+ * @returns The level and the heading's text, or null.
+ */
+function readHeading(line: string): { level: number; text: string } | null {
+	let at = 0;
+	while (at < 3 && line[at] === ' ') at++;
+	let level = 0;
+	while (line[at + level] === '#') level++;
+	if (level < 1 || level > 6) return null;
+	at += level;
+	if (at < line.length && !isBlank(line[at])) return null;
+	while (isBlank(line[at])) at++;
+	let end = line.length;
+	while (end > at && isBlank(line[end - 1])) end--;
+	let hashes = end;
+	while (hashes > at && line[hashes - 1] === '#') hashes--;
+	if (hashes < end && hashes > at && isBlank(line[hashes - 1])) {
+		end = hashes;
+		while (end > at && isBlank(line[end - 1])) end--;
+	}
+	return { level, text: line.slice(at, end) };
+}
 
 /**
  * Leading spaces of a line (a tab counts as four).
@@ -648,8 +786,10 @@ function splitRow(line: string): string[] {
 function tableStarts(lines: readonly string[], at: number): boolean {
 	const header = lines[at];
 	const delimiter = lines[at + 1];
-	if (header === undefined || delimiter === undefined || !header.includes('|') || !delimiter.includes('|') || !TABLE_DELIMITER.test(delimiter)) return false;
-	return splitRow(header).length === splitRow(delimiter).length;
+	if (header === undefined || delimiter === undefined || !header.includes('|') || !delimiter.includes('|')) return false;
+	const cells = splitRow(delimiter);
+	if (!cells.every((cell) => DELIMITER_CELL.test(cell))) return false;
+	return splitRow(header).length === cells.length;
 }
 
 /**
@@ -661,7 +801,7 @@ function tableStarts(lines: readonly string[], at: number): boolean {
  */
 function startsBlock(lines: readonly string[], at: number): boolean {
 	const line = lines[at];
-	return FENCE.test(line) || HEADING.test(line) || RULE.test(line) || QUOTE.test(line) || (LIST_ITEM.test(line) && (LIST_ITEM.exec(line)?.[6] ?? '').trim() !== '') || tableStarts(lines, at);
+	return FENCE.test(line) || readHeading(line) !== null || RULE.test(line) || QUOTE.test(line) || (LIST_ITEM.test(line) && (LIST_ITEM.exec(line)?.[6] ?? '').trim() !== '') || tableStarts(lines, at);
 }
 
 /**
@@ -707,9 +847,9 @@ function parseBlocks(lines: readonly string[], depth: number): MdBlock[] {
 			continue;
 		}
 
-		const heading = HEADING.exec(line);
+		const heading = readHeading(line);
 		if (heading) {
-			blocks.push({ type: 'heading', level: heading[1].length, children: parseInline((heading[2] ?? '').trim()) });
+			blocks.push({ type: 'heading', level: heading.level, children: parseInline(heading.text.trim()) });
 			i++;
 			continue;
 		}
@@ -741,7 +881,7 @@ function parseBlocks(lines: readonly string[], depth: number): MdBlock[] {
 				});
 			i += 2;
 			const rows: MdInline[][][] = [];
-			while (i < lines.length && lines[i].trim() !== '' && lines[i].includes('|') && !(FENCE.test(lines[i]) || HEADING.test(lines[i]) || QUOTE.test(lines[i]))) {
+			while (i < lines.length && lines[i].trim() !== '' && lines[i].includes('|') && !(FENCE.test(lines[i]) || readHeading(lines[i]) !== null || QUOTE.test(lines[i]))) {
 				if (rows.length < MAX_TABLE_ROWS) {
 					const cells = splitRow(lines[i]);
 					rows.push(header.map((_, column) => parseInline(cells[column] ?? '')));
@@ -805,8 +945,10 @@ function parseBlocks(lines: readonly string[], depth: number): MdBlock[] {
 			para.push(lines[i].replace(/^[ \t]+/, ''));
 			i++;
 		}
-		const text = para.join('\n').replace(/[ \t]+$/, '');
-		blocks.push({ type: 'paragraph', children: parseInline(text) });
+		const joined = para.join('\n');
+		let end = joined.length;
+		while (end > 0 && isBlank(joined[end - 1])) end--;
+		blocks.push({ type: 'paragraph', children: parseInline(joined.slice(0, end)) });
 	}
 	return blocks;
 }
@@ -822,7 +964,13 @@ export function parseMarkdown(text: string, options: MarkdownOptions = {}): MdBl
 	const max = options.maxChars ?? MARKDOWN_MAX_CHARS;
 	let source = typeof text === 'string' ? text : String(text ?? '');
 	if (source.length > max) source = `${source.slice(0, max)}…`;
-	return parseBlocks(source.replace(/\r\n?/g, '\n').split(String.fromCharCode(0)).join('\ufffd').split('\n'), 0);
+	const outer = searchBudget;
+	searchBudget = SEARCH_STEPS_PER_CHAR * source.length + 4 * MAX_SPAN;
+	try {
+		return parseBlocks(source.replace(/\r\n?/g, '\n').split(String.fromCharCode(0)).join('\ufffd').split('\n'), 0);
+	} finally {
+		searchBudget = outer;
+	}
 }
 
 // =============================================================================
