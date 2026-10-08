@@ -36,7 +36,11 @@ call, so the store sees a single write per document.
 Verification (always run, also after seeding): exactly one control record;
 exactly one document (the long manual) without chunk 0; every corpus document
 present; no ``meta`` column on a pgvector table seeded in this run (a newer
-driver adds it when it first opens the table). Exits 1 when any check fails.
+driver adds it when it first opens the table); the long manual still has at
+least 64 rows and the median chunk is 400-1,200 characters, the calibrated
+chunking of ``apps/vector-ui/tests/fixtures/chunking.json``. A seed on an
+engine whose chunker ignores ``strlen`` (about 33 chunks of up to 4,000
+characters for the manual) fails here. Exits 1 when any check fails.
 
 Usage (from dist/server; the engine must run with RR_DB_BROKER_URL/TOKEN):
   ./engine <this folder>/seed_legacy.py [--only pgvector,qdrant,chroma] [--recreate] [--verify-only]
@@ -46,8 +50,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import collections
 import importlib.util
 import json
+import statistics
 import sys
 import tempfile
 import uuid
@@ -66,6 +72,10 @@ RR_PREFIX = '/srv/legacy-rr/'
 RR_FOLDER = 'kitchen'
 ORPHAN_REL = 'manuals/long_manual.md'
 BACKENDS = ('pgvector', 'qdrant', 'chroma')
+# The long manual has more than 64 chunks at the calibrated chunking, so at least 64 rows once chunk 0 is gone.
+LONG_MANUAL_MIN_ROWS = 64
+# The calibrated median chunk (apps/vector-ui/tests/fixtures/chunking.json target_median_chars).
+MEDIAN_CHARS = (400, 1200)
 
 # The old pgvector driver's DDL (store_postgres/postgres.py) plus the column its insert also writes.
 LEGACY_DDL = (
@@ -113,6 +123,12 @@ def control_row(model: str = fx.EMBEDDING_MODEL, dim: int = fx.EMBEDDING_DIMENSI
     }
 
 
+def median_length(contents: Sequence[str]) -> Optional[int]:
+    """Median length of the non-empty contents (the control record's content is empty); None when there are none."""
+    lengths = sorted(len(c) for c in contents if c)
+    return int(statistics.median(lengths)) if lengths else None
+
+
 def orphans(rows: Sequence[Tuple[str, int]]) -> List[str]:
     """Return the objectIds (control record excluded) without chunk 0, from (objectId, chunkId) rows."""
     chunks: Dict[str, set] = {}
@@ -133,6 +149,8 @@ def verdict(
     expected_documents: int,
     missing: Sequence[str] = (),
     meta_column: Optional[bool] = None,
+    long_manual_chunks: Optional[int] = None,
+    median_chunk_chars: Optional[int] = None,
 ) -> List[str]:
     """Problems with one seeded collection (empty when it is as promised)."""
     problems = []
@@ -148,6 +166,15 @@ def verdict(
         )
     if documents != expected_documents:
         problems.append(f'{backend}: {documents} documents (expected {expected_documents})')
+    if long_manual_chunks is None or long_manual_chunks < LONG_MANUAL_MIN_ROWS:
+        problems.append(
+            f'{backend}: the long manual has {long_manual_chunks} rows (expected at least {LONG_MANUAL_MIN_ROWS}: '
+            'was it seeded by a chunker that ignores strlen?)'
+        )
+    if median_chunk_chars is None or not MEDIAN_CHARS[0] <= median_chunk_chars <= MEDIAN_CHARS[1]:
+        problems.append(
+            f'{backend}: median chunk of {median_chunk_chars} characters (expected {MEDIAN_CHARS[0]}-{MEDIAN_CHARS[1]:,})'
+        )
     return problems
 
 
@@ -244,6 +271,8 @@ def pg_facts(table: str) -> Dict[str, Any]:
         orphan_ids = [r[0] for r in cur.fetchall()]
         cur.execute(sql.SQL("SELECT objectid, count(*) FROM {} WHERE objectid <> 'schema' GROUP BY objectid").format(t))
         counts = dict(cur.fetchall())
+        cur.execute(sql.SQL("SELECT content FROM {} WHERE objectid <> 'schema'").format(t))
+        contents = [r[0] or '' for r in cur.fetchall()]
     return {
         'control': control,
         'meta_column': meta,
@@ -251,6 +280,8 @@ def pg_facts(table: str) -> Dict[str, Any]:
         'documents': len(counts),
         'chunks': sum(counts.values()),
         'object_ids': set(counts),
+        'counts': counts,
+        'median_chunk_chars': median_length(contents),
     }
 
 
@@ -265,14 +296,15 @@ def _qdrant():
     return QdrantClient(host=fx.QDRANT['host'], port=fx.QDRANT['port'], timeout=30)
 
 
-def _qdrant_points(collection: str) -> List[Dict[str, Any]]:
+def _qdrant_points(collection: str) -> List[Tuple[Dict[str, Any], str]]:
+    """(meta, content) of every point."""
     client = _qdrant()
     out, offset = [], None
     while True:
         points, offset = client.scroll(
             collection_name=collection, limit=1000, offset=offset, with_payload=True, with_vectors=False
         )
-        out.extend((p.payload or {}).get('meta') or {} for p in points)
+        out.extend((((p.payload or {}).get('meta') or {}), (p.payload or {}).get('content') or '') for p in points)
         if offset is None:
             return out
 
@@ -304,17 +336,23 @@ def qdrant_plant_orphan(collection: str, object_id: str) -> None:
     )
 
 
-def qdrant_facts(collection: str) -> Dict[str, Any]:
-    metas = _qdrant_points(collection)
-    rows = [(m.get('objectId'), m.get('chunkId') or 0) for m in metas]
-    docs = {o for o, _ in rows if o != 'schema'}
+def _row_facts(rows: Sequence[Tuple[str, int, str]]) -> Dict[str, Any]:
+    """Facts from (objectId, chunkId, content) rows of a whole collection."""
+    keys = [(o, c) for o, c, _ in rows]
+    counts = collections.Counter(o for o, _ in keys if o != 'schema')
     return {
-        'control': sum(1 for o, _ in rows if o == 'schema'),
-        'orphans': orphans(rows),
-        'documents': len(docs),
-        'chunks': sum(1 for o, _ in rows if o != 'schema'),
-        'object_ids': docs,
+        'control': sum(1 for o, _ in keys if o == 'schema'),
+        'orphans': orphans(keys),
+        'documents': len(counts),
+        'chunks': sum(counts.values()),
+        'object_ids': set(counts),
+        'counts': dict(counts),
+        'median_chunk_chars': median_length([t for o, _, t in rows if o != 'schema']),
     }
+
+
+def qdrant_facts(collection: str) -> Dict[str, Any]:
+    return _row_facts([(m.get('objectId'), m.get('chunkId') or 0, text) for m, text in _qdrant_points(collection)])
 
 
 # ---------------------------------------------------------------------------
@@ -337,8 +375,10 @@ def chroma_drop(collection: str) -> None:
         _chroma().delete_collection(collection)
 
 
-def _chroma_metas(collection: str) -> List[Dict[str, Any]]:
-    return _chroma().get_collection(collection).get(include=['metadatas'])['metadatas'] or []
+def _chroma_rows(collection: str) -> List[Tuple[Dict[str, Any], str]]:
+    """(metadata, document) of every record."""
+    got = _chroma().get_collection(collection).get(include=['metadatas', 'documents'])
+    return list(zip(got['metadatas'] or [], [d or '' for d in (got['documents'] or [])]))
 
 
 def chroma_plant_orphan(collection: str, object_id: str) -> None:
@@ -346,15 +386,7 @@ def chroma_plant_orphan(collection: str, object_id: str) -> None:
 
 
 def chroma_facts(collection: str) -> Dict[str, Any]:
-    rows = [(m.get('objectId'), m.get('chunkId') or 0) for m in _chroma_metas(collection)]
-    docs = {o for o, _ in rows if o != 'schema'}
-    return {
-        'control': sum(1 for o, _ in rows if o == 'schema'),
-        'orphans': orphans(rows),
-        'documents': len(docs),
-        'chunks': sum(1 for o, _ in rows if o != 'schema'),
-        'object_ids': docs,
-    }
+    return _row_facts([(m.get('objectId'), m.get('chunkId') or 0, text) for m, text in _chroma_rows(collection)])
 
 
 # ---------------------------------------------------------------------------
@@ -441,6 +473,7 @@ def verify(backends: Sequence[str], seeded_now: Sequence[str] = ()) -> Tuple[Dic
             continue
         f = facts_of(LEGACY)
         present = f.pop('object_ids')
+        f['long_manual_chunks'] = f.pop('counts').get(orphan_id, 0)
         f['orphan_expected'] = orphan_id
         facts[backend] = f
         problems += verdict(
@@ -452,6 +485,8 @@ def verify(backends: Sequence[str], seeded_now: Sequence[str] = ()) -> Tuple[Dic
             expected_documents=len(wanted),
             missing=sorted(wanted - present),
             meta_column=f.get('meta_column') if backend in seeded_now else None,
+            long_manual_chunks=f['long_manual_chunks'],
+            median_chunk_chars=f['median_chunk_chars'],
         )
     return facts, problems
 

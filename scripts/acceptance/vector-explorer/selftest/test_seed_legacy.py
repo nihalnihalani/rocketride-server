@@ -46,7 +46,14 @@ class OrphanTests(unittest.TestCase):
 class VerdictTests(unittest.TestCase):
     def ok(self, **overrides):
         args = dict(
-            control=1, orphan_ids=['x'], expected_orphan='x', documents=40, expected_documents=40, meta_column=False
+            control=1,
+            orphan_ids=['x'],
+            expected_orphan='x',
+            documents=40,
+            expected_documents=40,
+            meta_column=False,
+            long_manual_chunks=159,
+            median_chunk_chars=806,
         )
         args.update(overrides)
         return seed.verdict('pgvector', **args)
@@ -64,6 +71,20 @@ class VerdictTests(unittest.TestCase):
         self.assertTrue(self.ok(documents=39))
         self.assertTrue(self.ok(meta_column=True))
         self.assertTrue(self.ok(missing=['a-missing-document']))
+
+    def test_a_collection_chunked_without_the_calibrated_length_fails(self):
+        # A seed on an engine whose chunker ignores strlen: about 33 chunks of up to 4,000 characters.
+        self.assertTrue(self.ok(long_manual_chunks=33))
+        self.assertTrue(self.ok(median_chunk_chars=3409))
+        self.assertTrue(self.ok(median_chunk_chars=399))
+        self.assertTrue(self.ok(median_chunk_chars=None))
+        # The long manual keeps more than 64 chunks: at least 64 rows once chunk 0 is gone.
+        self.assertTrue(self.ok(long_manual_chunks=63))
+        self.assertEqual(self.ok(long_manual_chunks=64, median_chunk_chars=1200), [])
+
+    def test_the_median_skips_the_control_record(self):
+        self.assertEqual(seed.median_length(['', 'abcd', 'ab', 'abcdef']), 4)
+        self.assertIsNone(seed.median_length([]))
 
     def test_object_ids_follow_the_engine(self):
         # Observed on the engine: an upload named '/srv/legacy/ops/memo_q2.txt' is stored with
