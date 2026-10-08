@@ -29,7 +29,7 @@
 // and two connections uploading files of the same name at once.
 // =============================================================================
 
-import { test } from 'node:test';
+import { test as nodeTest } from 'node:test';
 import assert from 'node:assert/strict';
 import { ExplorerToolError } from 'shared/explorer';
 import type { ISendFile } from 'shared/explorer';
@@ -40,6 +40,19 @@ import { RECOUNT_DELAY_MS, createIngestQueue } from '../src/ingest/ingestQueue';
 import type { IngestDeps } from '../src/ingest/ingestQueue';
 import { createNameLocks } from '../src/ingest/nameLocks';
 import type { CallOutcome } from '../src/chat/toolCalls';
+
+/** Most a test here may take: they await fakes, so a regression must fail, not hang the run. */
+const TEST_TIMEOUT_MS = 10_000;
+
+/**
+ * Declare a test bounded by {@link TEST_TIMEOUT_MS}.
+ *
+ * @param name - What it checks.
+ * @param fn - The test.
+ */
+function test(name: string, fn: () => void | Promise<void>): void {
+	void nodeTest(name, { timeout: TEST_TIMEOUT_MS }, fn);
+}
 
 /**
  * A drop candidate.

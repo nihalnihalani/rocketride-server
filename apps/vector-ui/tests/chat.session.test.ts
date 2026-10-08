@@ -30,7 +30,7 @@
 // questions only.
 // =============================================================================
 
-import { test } from 'node:test';
+import { test as nodeTest } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
@@ -39,6 +39,19 @@ import type { IGenerationTicket } from 'shared/explorer';
 import { CHAT_TIMEOUT_MS, CHAT_TIMEOUT_SENTENCE } from '../src/vector/chatResult';
 import { HISTORY_MAX, STOPPED_SENTENCE, createChatSession } from '../src/chat/chatSession';
 import type { ChatDeps, ChatTurn } from '../src/chat/chatSession';
+
+/** Most a test here may take: they await fakes, so a regression must fail, not hang the run. */
+const TEST_TIMEOUT_MS = 10_000;
+
+/**
+ * Declare a test bounded by {@link TEST_TIMEOUT_MS}.
+ *
+ * @param name - What it checks.
+ * @param fn - The test.
+ */
+function test(name: string, fn: () => void | Promise<void>): void {
+	void nodeTest(name, { timeout: TEST_TIMEOUT_MS }, fn);
+}
 
 const WITH_DOCUMENTS = JSON.parse(readFileSync(path.join(__dirname, 'fixtures', 'provisional', 'chat_result_with_documents.json'), 'utf8')) as Record<string, unknown>;
 

@@ -30,7 +30,7 @@
 // that render their text, loaded before the panels are.
 // =============================================================================
 
-import { test } from 'node:test';
+import { test as nodeTest } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
@@ -41,6 +41,19 @@ import type { IExplorerEndpoint, IRoleChannel } from 'shared/explorer';
 import type { ConsoleActions, ConsoleModel, IChatSource, IDialectResult, VectorChannels } from '../src/contract/types';
 import { createSelectionStore } from '../src/contract/bridge';
 import type { UploadRow } from '../src/vector/uploads';
+
+/** Most a test here may take: they await fakes, so a regression must fail, not hang the run. */
+const TEST_TIMEOUT_MS = 10_000;
+
+/**
+ * Declare a test bounded by {@link TEST_TIMEOUT_MS}.
+ *
+ * @param name - What it checks.
+ * @param fn - The test.
+ */
+function test(name: string, fn: () => void | Promise<void>): void {
+	void nodeTest(name, { timeout: TEST_TIMEOUT_MS }, fn);
+}
 
 // ── Shell stand-ins (installed before any panel module loads) ────────────────
 
