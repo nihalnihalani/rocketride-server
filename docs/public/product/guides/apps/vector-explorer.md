@@ -374,8 +374,8 @@ Explorer.
   When you sign out, or switch organization or team, every connection, list,
   chat, map and selection is cleared.
 - **Run log traces.** When a pipeline runs with any trace level other than
-  `none` (`metadata`, `summary` or `full`), its run log records each tool
-  call's input and the first 2 KB of its output. Unlike lane data, a tool trace
+  `none` (`metadata`, `summary` or `full`), its run log records the first 2 KB
+  of each tool call's input and of its output. Unlike lane data, a tool trace
   carries its input and output even at `metadata`, the level the Observability
   page lists as component enter/leave and object identities only. The VS Code
   extension starts runs with `full`, the MCP tools with `summary`, and an SDK
