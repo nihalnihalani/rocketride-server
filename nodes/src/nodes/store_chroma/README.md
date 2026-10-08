@@ -100,11 +100,11 @@ When the server reports a version, this node requires Chroma 0.6 or later. An un
 
 ### Ingestion, replacement, and rendering
 
-Every ingested chunk needs an embedding. Inserts are batched and flush at 500 chunks or when the accumulated payload exceeds the configured limit. A chunk with `chunkId` 0 causes older chunks with the same `objectId` to be deleted before the new chunks are upserted, so a re-ingest replaces an object rather than adding a second copy.
+Every ingested chunk needs an embedding. Inserts are batched and flush at 500 chunks or when the accumulated payload exceeds the configured limit. A chunk with `chunkId` 0 causes older chunks with the same `objectId` to be deleted before the new chunks are upserted, so a re-ingest replaces an object rather than adding a second copy. The delete names the documents in one ID list per thousand documents, so a large batch stays within the server's limit on filter size.
 
 Each chunk is stored under a record ID derived from its document and position, `uuid5(NAMESPACE_URL, '<objectId>#<chunkId>')`, so a chunk always maps to one record; if one batch carries the same chunk twice, the later one is kept. Collections written by earlier versions of this node hold random record IDs; every read by document and chunk falls back to a metadata filter for those. Keep `objectId` and `chunkId` consistent across imports to make replacement, filters, and rendering predictable.
 
-Soft deletion sets `isDeleted` in the metadata of every record of the document and hides it from default search; hard deletion removes it. Rendering reconstructs an object in chunk-ID order and reads it in configured windows, tolerating gaps in the sequence. That makes the render path appropriate for a large stored document, not a guarantee that all chunks are contiguous. The path listing returns one entry per document that has a first chunk, matching a `parent` filter exactly, and leaves out deleted documents.
+Soft deletion sets `isDeleted` in the metadata of every record of the document and hides it from default search; hard deletion removes it. Rendering reconstructs an object in chunk-ID order and reads it in configured windows, tolerating gaps in the sequence. That makes the render path appropriate for a large stored document, not a guarantee that all chunks are contiguous. The path listing returns one entry per document that has a first chunk, matching a `parent` filter exactly, and leaves out deleted documents. A filter with an empty ID list (documents, chunks, tables or permissions) matches nothing; the node answers it without querying the server, which would refuse it.
 
 ### Search result interpretation
 
