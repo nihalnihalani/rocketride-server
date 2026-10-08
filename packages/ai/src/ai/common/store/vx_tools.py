@@ -388,7 +388,9 @@ def vectordb_tool(fn: Callable) -> Callable:
     2. ``StoreUnsupported`` -> ``UNSUPPORTED``; ``ToolRefusal`` -> its code and extra keys;
        ``KeyboardInterrupt``/``SystemExit`` propagate; anything else (any ``BaseException``)
        -> ``STORE_ERROR`` with a scrubbed message;
-    3. the answer is post-processed by :func:`finish_answer`.
+    3. the answer is post-processed by :func:`finish_answer`; an answer that cannot be
+       turned into JSON (a value whose text or ``model_dump`` fails, a cycle) is
+       ``STORE_ERROR`` too.
 
     Applied under ``@tool_function`` so the tool's descriptor is unchanged.
     """
@@ -405,7 +407,12 @@ def vectordb_tool(fn: Callable) -> Callable:
             raise
         except BaseException as exc:  # noqa: BLE001 - the tool boundary: nothing escapes it
             result = {'success': False, 'code': 'STORE_ERROR', 'error': safe_error(exc)}
-        return finish_answer(result)
+        try:
+            return finish_answer(result)
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException as exc:  # noqa: BLE001 - the answer itself failed to serialise
+            return {'success': False, 'code': 'STORE_ERROR', 'error': safe_error(exc)}
 
     wrapper.__vectordb_tool__ = True
     return wrapper

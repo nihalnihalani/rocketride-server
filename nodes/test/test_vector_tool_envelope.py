@@ -174,6 +174,51 @@ def test_the_size_cap_is_eight_megabytes():
     assert vx_tools.MAX_ANSWER_BYTES == 8 * 1024 * 1024
 
 
+class _Unprintable:
+    """A value whose text cannot be built (a driver handle whose repr touches a closed socket)."""
+
+    def __str__(self) -> str:
+        raise RuntimeError('the handle is closed')
+
+
+class _BrokenModel:
+    def model_dump(self) -> Dict[str, Any]:
+        raise ValueError('model_dump failed')
+
+
+def _cyclic() -> list:
+    items: list = []
+    items.append(items)
+    return items
+
+
+@pytest.mark.parametrize(
+    'result',
+    [
+        {'success': True, 'handle': _Unprintable()},
+        {'success': True, _Unprintable(): 1},
+        {'success': True, 'doc': _BrokenModel()},
+        {'success': True, 'x': _cyclic()},
+        _Unprintable(),
+    ],
+    ids=['value', 'key', 'model_dump', 'cycle', 'bare'],
+)
+def test_an_answer_that_cannot_be_serialised_is_a_store_error(result):
+    answer = _run(lambda _args: result)
+    assert (answer['success'], answer['code']) == (False, 'STORE_ERROR')
+    json.dumps(answer, allow_nan=False)
+
+
+@pytest.mark.parametrize('exc', [KeyboardInterrupt(), SystemExit(3)])
+def test_interrupts_while_serialising_still_propagate(exc, monkeypatch):
+    def interrupted(_value):
+        raise exc
+
+    monkeypatch.setattr(vx_tools, 'jsonable', interrupted)
+    with pytest.raises(type(exc)):
+        _run({'value': 1})
+
+
 # ---------------------------------------------------------------------------
 # Error text
 # ---------------------------------------------------------------------------
