@@ -86,6 +86,13 @@ export interface IDiscoveredEndpoint {
 	token: string | null;
 	/** Whether the identity can tell the caller may invoke tools (hint; undefined = unknown). */
 	callHint: boolean | undefined;
+	/**
+	 * Role -> that role's task token, for the store's role vault ONLY (multi-role
+	 * connections). Not filled yet: absent on every result today.
+	 */
+	roleTokens?: Readonly<Record<string, string>>;
+	/** The role whose token is `token`. Not filled yet. */
+	anchorRole?: string;
 }
 
 // =============================================================================
@@ -276,6 +283,12 @@ async function componentsOf(client: IExplorerClient, group: IGroup): Promise<IEx
  * @returns Endpoints (state `probing`, or `stopped` when a required role is not running), sorted by pipeline name, node id, key.
  */
 export async function discoverToolEndpoints(client: IExplorerClient, options: IDiscoveryOptions): Promise<IDiscoveredEndpoint[]> {
+	// Provider-matched roles and read-only anchors are declared but not implemented
+	// yet: refuse them loudly rather than group rows by source ids alone.
+	const roleDefs = Object.values(options.roles.roles);
+	if (options.roles.readOnlyAnchors !== undefined || roleDefs.some((def) => def.providers !== undefined)) {
+		throw new Error('discoverToolEndpoints: role providers and readOnlyAnchors are not implemented yet');
+	}
 	const raw = await client.getTasks();
 	const identity = options.identity ?? null;
 	const rows = (Array.isArray(raw) ? raw : [])

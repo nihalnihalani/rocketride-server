@@ -116,6 +116,8 @@ export interface IEndpointKeyParts {
  * @returns The source to put in the key.
  */
 export function roleKeySource(def: IRoleDef, bound: string | null): string {
+	// A provider-matched role keys on a provider marker; declared, not implemented yet.
+	if (def.providers !== undefined) throw new Error('roleKeySource: provider-matched roles are not implemented yet');
 	if (bound !== null) return bound;
 	return def.sources !== null && def.sources.length === 1 ? (def.sources[0] as string) : '';
 }

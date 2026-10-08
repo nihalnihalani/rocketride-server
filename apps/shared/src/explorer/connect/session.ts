@@ -180,6 +180,8 @@ export interface IInvokeOptions {
 	generation?: IGenerationTicket;
 	/** Forbid the retry for this call (probes use it so a restarting task cannot make probing recurse). */
 	retry?: false;
+	/** Call this node instead of the endpoint's own node (role channels). Not implemented yet: invoke refuses it. */
+	nodeId?: string;
 }
 
 /** One endpoint, one way to call it. */
@@ -345,6 +347,8 @@ export function createToolSession(client: IExplorerClient, endpoint: IExplorerEn
 		if (!isPlainObject(input)) {
 			throw new ExplorerToolError({ kind: 'malformed', tool, message: `${tool} needs an object for its input` });
 		}
+		// Declared, not implemented yet: never send a call to a node the caller did not get.
+		if (opts.nodeId !== undefined) throw new Error('IInvokeOptions.nodeId is not implemented yet');
 		const spec: IToolSpec = options.tools[tool] ?? {};
 		const ticket = opts.generation;
 		const dropIfStale = (): void => {

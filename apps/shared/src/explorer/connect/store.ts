@@ -82,12 +82,13 @@
 
 import { ExplorerToolError } from '../errors';
 import { checkObject, isPlainObject } from '../checks';
-import type { IExplorerClient, IExplorerEndpoint, IExplorerIdentity, IProbeResult, IRoleSpec } from '../types';
+import type { IGenerationTicket } from '../generation';
+import type { IExplorerClient, IExplorerComponent, IExplorerEndpoint, IExplorerIdentity, IProbeResult, IRoleSpec, ISendFile } from '../types';
 import { discoverToolEndpoints, mapWithConcurrency } from './discovery';
 import type { IDiscoveredEndpoint } from './discovery';
 import { identityFingerprint } from './identity';
 import { DEFAULT_TOOL_TIMEOUTS, createToolSession } from './session';
-import type { IToolSession, IToolSessionOptions } from './session';
+import type { IInvokeOptions, IToolSession, IToolSessionOptions } from './session';
 
 // =============================================================================
 // TYPES
@@ -162,6 +163,29 @@ export interface IEndpointStoreOptions {
 	discoveryTimeoutMs?: number;
 	/** Clock and timers (default: real). */
 	clock?: IStoreClock;
+	/**
+	 * Which matching components of a group become endpoints (default: all).
+	 * Not implemented yet: createEndpointStore refuses the option.
+	 */
+	nodeFilter?: (component: IExplorerComponent, group: { toolsSource: string | null; anchorRole: string; boundRoles: readonly string[] }) => boolean;
+}
+
+/**
+ * One role of a multi-role connection (Vector Explorer: ingest, chat, tools),
+ * called through that role's own task token, which never leaves the store.
+ * Nothing on a channel is retried.
+ */
+export interface IRoleChannel {
+	/** The role name. */
+	readonly role: string;
+	/** Whether a running source fills the role right now. */
+	readonly bound: boolean;
+	/** Upload files through the role's data lane. */
+	sendFiles(files: ISendFile[], opts?: { maxConcurrent?: number }): Promise<Array<Record<string, unknown>>>;
+	/** Ask the role's chat source a question. */
+	ask(question: unknown, opts?: { onSSE?: (type: string, data: Record<string, unknown>) => Promise<void>; timeoutMs?: number; generation?: IGenerationTicket }): Promise<Record<string, unknown>>;
+	/** Call a node tool through the role's token; `opts.nodeId` is required. */
+	invoke<T = unknown>(tool: string, input?: Record<string, unknown>, opts?: IInvokeOptions): Promise<T>;
 }
 
 /** One app's endpoint store. */
@@ -196,6 +220,12 @@ export interface IEndpointStore {
 	reset(): void;
 	/** Open a session on an endpoint. The token never leaves the store. */
 	session(client: IExplorerClient, endpoint: IExplorerEndpoint): IToolSession;
+	/**
+	 * A channel on one role of an endpoint's connection. Rejects with
+	 * `ExplorerToolError{kind:'unavailable'}` when the role is not bound.
+	 * Not implemented yet: throws.
+	 */
+	channel(client: IExplorerClient, endpoint: IExplorerEndpoint, role: string): IRoleChannel;
 }
 
 // =============================================================================
@@ -234,6 +264,8 @@ const NOT_RUNNING_CODES: ReadonlySet<string> = new Set(['TASK_NOT_REGISTERED', '
  * @returns The store.
  */
 export function createEndpointStore(options: IEndpointStoreOptions): IEndpointStore {
+	// Declared, not implemented yet: refuse rather than list every matching node.
+	if (options.nodeFilter !== undefined) throw new Error('createEndpointStore: nodeFilter is not implemented yet');
 	const concurrency = options.concurrency ?? 4;
 	const debounceMs = options.debounceMs ?? 300;
 	const focusMinIntervalMs = options.focusMinIntervalMs ?? 5_000;
@@ -716,6 +748,9 @@ export function createEndpointStore(options: IEndpointStoreOptions): IEndpointSt
 		attach,
 		reset,
 		session,
+		channel(): IRoleChannel {
+			throw new Error('IEndpointStore.channel is not implemented yet');
+		},
 	};
 }
 

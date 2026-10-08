@@ -60,6 +60,25 @@ export interface IExplorerClient {
 	addMonitor?(key: { token?: string; projectId?: string; source?: string }, types: string[]): Promise<void>;
 	/** Counterpart of addMonitor. */
 	removeMonitor?(key: { token?: string; projectId?: string; source?: string }, types: string[]): Promise<void>;
+	/**
+	 * Upload files into a task's data lane (the dropper path). Only the role
+	 * channel of a multi-role connection calls this (Vector Explorer's ingest).
+	 * Resolves with one upload result per file (the SDK's UPLOAD_RESULT, which
+	 * has no index signature, hence `object`).
+	 */
+	sendFiles?(files: ISendFile[], token: string, maxConcurrent?: number): Promise<object[]>;
+	/** Ask a chat source a question. Only the role channel of a multi-role connection calls this. */
+	chat?(options: { token: string; question: unknown; onSSE?: (type: string, data: Record<string, unknown>) => Promise<void> }): Promise<Record<string, unknown>>;
+}
+
+/** One file for {@link IExplorerClient.sendFiles}. */
+export interface ISendFile {
+	/** The file. */
+	file: File;
+	/** Object info sent with it (for example `{ name, origin }`). */
+	objinfo?: Record<string, unknown>;
+	/** MIME type; the SDK falls back to the file's own type. */
+	mimetype?: string;
 }
 
 // =============================================================================
@@ -74,6 +93,12 @@ export interface IExplorerComponent {
 	provider?: string;
 	/** Optional display name. */
 	name?: string;
+	/**
+	 * Control edges into this component (`{ from: <source id>, classType: 'tool' }`).
+	 * Discovery reads them to tell which nodes a Tools source controls. Never
+	 * the component's config.
+	 */
+	control?: ReadonlyArray<{ from?: string; classType?: string }>;
 }
 
 /**
@@ -156,6 +181,12 @@ export interface IExplorerIdentity {
 export interface IRoleDef {
 	/** Source component ids that fill the role; null = ANY source (single-role SQL/Graph). */
 	sources: readonly string[] | null;
+	/**
+	 * Source providers that also fill the role (a row fills it when its own
+	 * source component has one of these providers). Not implemented yet:
+	 * discovery refuses a role spec that uses it.
+	 */
+	providers?: readonly string[];
 	/** A required role that is not running makes the endpoint 'stopped' (it cannot be called). */
 	required: boolean;
 }
@@ -170,6 +201,12 @@ export interface IRoleSpec {
 	roles: Readonly<Record<string, IRoleDef>>;
 	/** The role whose task token carries tool calls. */
 	toolsRole: string;
+	/**
+	 * Roles that may anchor a read-only connection when the tools role is not
+	 * running, in order. Not implemented yet: discovery refuses a role spec
+	 * that uses it.
+	 */
+	readOnlyAnchors?: readonly string[];
 }
 
 /** SQL Explorer and Graph Explorer: one `tools` role filled by any source. */
@@ -273,6 +310,15 @@ export interface IExplorerEndpoint {
 	stateDetail?: string;
 	/** Legacy flag: true while the state is `probing` or `ready`. */
 	running: boolean;
+	/**
+	 * The pipeline's components (id, provider, name and control edges only;
+	 * never config). Not filled yet: absent on every endpoint discovery returns today.
+	 */
+	components?: ReadonlyArray<IExplorerComponent>;
+	/** The role whose task token this endpoint's calls use. Not filled yet. */
+	anchorRole?: string;
+	/** True when the endpoint is anchored on a role other than the tools role. Not filled yet. */
+	readOnly?: boolean;
 }
 
 /** Result of the one-per-endpoint probe. */

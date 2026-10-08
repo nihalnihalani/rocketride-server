@@ -45,6 +45,7 @@ export type {
 	IRoleBinding,
 	IRoleDef,
 	IRoleSpec,
+	ISendFile,
 } from './types';
 export { SINGLE_TOOLS_ROLE, VECTOR_ROLES } from './types';
 
@@ -100,7 +101,7 @@ export {
 	TRANSIENT_TASK_CODE,
 	createToolSession,
 } from './connect/session';
-export type { EndpointStatus, EndpointWatch, IEndpointState, IEndpointStore, IEndpointStoreOptions, IStoreClock, IWatchHandlers } from './connect/store';
+export type { EndpointStatus, EndpointWatch, IEndpointState, IEndpointStore, IEndpointStoreOptions, IRoleChannel, IStoreClock, IWatchHandlers } from './connect/store';
 export { createEndpointStore, probeInfo } from './connect/store';
 
 export type { IConnectionFlags, IConnectionFlagsOptions } from './history/flags';
