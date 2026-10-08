@@ -27,17 +27,50 @@ from depends import depends
 requirements = os.path.dirname(os.path.realpath(__file__)) + '/requirements.txt'
 depends(requirements)
 
-from typing import List, Dict, Any, Callable, cast
+from typing import Any, Callable, Dict, List, Optional
 import chromadb
-from ai.common.schema import Doc, DocFilter, DocMetadata, QuestionText
+from ai.common.schema import Doc, DocFilter, QuestionText
 from ai.common.store import DocumentStoreBase
 from ai.common.config import Config
 from rocketlib import debug
+import math
 import uuid
-import numpy as np
-import json
 import sys
 import re
+
+
+# Minimum rescaled [0, 1] similarity for a result to count as relevant; below
+# this it is dropped as noise. A caller that sets DocFilter.minScore (the
+# explorer tools) overrides it.
+MIN_RELEVANCE_SCORE = 0.20
+
+# objectId of the collection's control record (model name and vector size).
+CONTROL_OBJECT_ID = 'schema'
+
+
+def point_id_for(objectId: str, chunkId: int) -> str:
+    """
+    Return the deterministic record id of a chunk: uuid5(NAMESPACE_URL, 'objectId#chunkId').
+
+    Rows written before this id scheme carry random ids; every read by key
+    falls back to a filter on objectId/chunkId for those.
+    """
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f'{objectId}#{int(chunkId)}'))
+
+
+def _where(*clauses: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Combine where clauses: None when empty, the clause alone, else $and (Chroma needs two or more)."""
+    parts: List[Dict[str, Any]] = []
+    for clause in clauses:
+        if not clause:
+            continue
+        if set(clause) == {'$and'}:
+            parts.extend(clause['$and'])
+        else:
+            parts.append(clause)
+    if not parts:
+        return None
+    return parts[0] if len(parts) == 1 else {'$and': parts}
 
 
 # Minimum Chroma *server* version this client supports, as (major, minor). The v2
@@ -391,11 +424,26 @@ class Store(DocumentStoreBase):
             # "'NoneType' object has no attribute 'delete'" crash downstream in flush().
             raise Exception(f'Error creating Chroma collection: {e}') from e
 
+    @staticmethod
+    def _deletedClause(deleted: str) -> Optional[Dict[str, Any]]:
+        """
+        Where clause selecting the 'active', 'deleted' or 'all' rows.
+
+        'active' excludes only rows explicitly marked deleted: a null/absent
+        isDeleted (the client strips None via exclude_none) must still count as
+        not deleted, so use $ne True (which matches absent-key records).
+        """
+        if deleted == 'deleted':
+            return {'isDeleted': {'$eq': True}}
+        if deleted == 'all':
+            return None
+        return {'isDeleted': {'$ne': True}}
+
     def _convertFilter(self, docFilter: DocFilter) -> Dict[str, Any]:
         filters = []
         if docFilter.nodeId is not None:
             filters.append({'nodeId': {'$eq': docFilter.nodeId}})
-        if docFilter.isTable:
+        if docFilter.isTable is not None:
             filters.append({'isTable': {'$eq': docFilter.isTable}})
         if docFilter.tableIds is not None:
             filters.append({'tableId': {'$in': docFilter.tableIds}})
@@ -405,14 +453,11 @@ class Store(DocumentStoreBase):
             filters.append({'permissionId': {'$in': docFilter.permissions}})
         if docFilter.objectIds is not None:
             filters.append({'objectId': {'$in': docFilter.objectIds}})
-        if docFilter.isDeleted is None or not docFilter.isDeleted:
-            # Exclude only docs explicitly marked deleted. A null/absent isDeleted
-            # (the client strips None via exclude_none) must still count as not
-            # deleted, so use $ne True (which matches absent-key records) instead of
-            # $eq False (which would drop them).
-            filters.append({'isDeleted': {'$ne': True}})
-        else:
-            filters.append({'isDeleted': {'$eq': True}})
+        # Which rows by their deleted flag: DocFilter.deleted when set, otherwise
+        # isDeleted None/False selects the active rows and True every row.
+        deleted = self._deletedClause(self.resolveDeleted(docFilter))
+        if deleted is not None:
+            filters.append(deleted)
         if docFilter.chunkIds is not None:
             filters.append({'chunkId': {'$in': docFilter.chunkIds}})
         # If we are min chunk id, add a condition
@@ -429,9 +474,37 @@ class Store(DocumentStoreBase):
         else:
             return None
 
-    def _convertToDocs(self, results: Dict) -> List[Doc]:
+    def _space(self) -> str:
+        """The collection's distance space ('cosine', 'l2' or 'ip'); the configured one until it exists."""
+        collection = self.__dict__.get('collectionObj')
+        if collection is not None:
+            config = getattr(collection, 'configuration_json', None)
+            space = ((config or {}).get('hnsw') or {}).get('space') if isinstance(config, dict) else None
+            if not space:
+                space = (getattr(collection, 'metadata', None) or {}).get('hnsw:space')
+            if space in ('cosine', 'l2', 'ip'):
+                return space
+            if space is None and isinstance(getattr(collection, 'metadata', None), dict):
+                return 'l2'  # Chroma's default space
+        return self.similarity
+
+    def _distanceToScore(self, distance: float) -> float:
+        """
+        Map a Chroma distance to a score where higher means closer.
+
+        cosine (1 - cos) and ip (1 - dot): (2 - d) / 2, i.e. (1 + similarity) / 2.
+        l2 (squared euclidean): 1 / (1 + euclidean distance).
+        """
+        distance = float(distance)
+        if self._space() == 'l2':
+            return 1.0 / (1.0 + math.sqrt(max(distance, 0.0)))
+        return (2.0 - distance) / 2.0
+
+    def _convertToDocs(self, results: Dict, floor: float = MIN_RELEVANCE_SCORE) -> List[Doc]:
         """
         Convert ChromaDB results to a list of Docs.
+
+        Query results (with distances) below ``floor`` are dropped.
         """
         docs: List[Doc] = []
         # Now we need to unwrap each list of ndarrays returned by Chroma in case of Query
@@ -444,17 +517,14 @@ class Store(DocumentStoreBase):
         # Now, add the documents to the results
         for i in range(len(results['ids'])):
             # Get the payload content and meadata
-            metadata = cast(DocMetadata, results['metadatas'][i])
+            metadata = results['metadatas'][i]
             content = results['documents'][i]
 
             if results.get('distances', None) is not None:
-                if self.similarity == 'cosine':
-                    score = (results['distances'][i] + 1) / 2
-                else:
-                    score = float(1.0 / (1.0 + np.exp(results['distances'][i] / -100)))
+                score = self._distanceToScore(results['distances'][i])
 
                 # Ignore it if it doesn't have a high enough score
-                if score < 0.20:
+                if score < floor:
                     continue
             else:
                 score = 0.0
@@ -475,9 +545,9 @@ class Store(DocumentStoreBase):
         # no documents in the collection
         if not self.doesCollectionExist():
             return 0
-        # Get all ids in collection
-        result = self.collectionObj.get(include=[])
-        return len(result['ids'])
+        # The collection's record count (control record included, as before);
+        # count() is answered by the server without reading every id.
+        return int(self.collectionObj.count())
 
     def searchKeyword(self, query: QuestionText, docFilter: DocFilter) -> List[Doc]:
         """
@@ -533,15 +603,15 @@ class Store(DocumentStoreBase):
 
         # We cannot support non-zero offsets
         if docFilter.offset:
-            raise BaseException('Non-zero offset is not supported in semantic searching')
+            raise ValueError('Non-zero offset is not supported in semantic searching')
 
         # Perform the search
         results = self.collectionObj.query(
             query_embeddings=[query.embedding], n_results=self._effectiveLimit(docFilter), where=filters
         )
 
-        # Convert the points into groups
-        docs = self._convertToDocs(results)
+        # Convert the points into groups, applying the score floor (DocFilter.minScore or the legacy floor)
+        docs = self._convertToDocs(results, self.effectiveFloor(docFilter))
 
         # Return them
         return docs
@@ -582,15 +652,16 @@ class Store(DocumentStoreBase):
         if not self.doesCollectionExist():
             return {}
 
-        # Base filter: Only chunk 0
-        filter_dict = {'chunk': 0}
-
-        # If parent specified, add condition
-        if parent is not None:
-            filter_dict['parent'] = {'$eq': json.dumps(parent, ensure_ascii=False)}
+        # Base filter: first chunks of active documents, never the control record
+        filter_dict = _where(
+            {'chunkId': {'$eq': 0}},
+            {'objectId': {'$ne': CONTROL_OBJECT_ID}},
+            {'isDeleted': {'$ne': True}},
+            {'parent': {'$eq': parent}} if parent is not None else None,
+        )
 
         # Perform the query
-        results = self.collectionObj.get(where=filter_dict, limit=limit, offset=offset)
+        results = self.collectionObj.get(where=filter_dict, limit=limit, offset=offset, include=['metadatas'])
 
         # Build paths dictionary
         paths = {}
@@ -627,6 +698,15 @@ class Store(DocumentStoreBase):
 
         def flush():
             nonlocal ids, embeddings, metadatas, documents
+            # One record per id: a later chunk with the same key replaces an earlier one
+            # (the server refuses duplicate ids in one upsert).
+            if len(set(ids)) != len(ids):
+                last = {record_id: index for index, record_id in enumerate(ids)}
+                keep = sorted(last.values())
+                ids[:] = [ids[i] for i in keep]
+                embeddings[:] = [embeddings[i] for i in keep]
+                metadatas[:] = [metadatas[i] for i in keep]
+                documents[:] = [documents[i] for i in keep]
             # Defense in depth: never index against a missing collection. Surface a clear,
             # actionable error instead of a cryptic "'NoneType' object has no attribute
             # 'delete'" if the collection was not created (e.g. a failed/incompatible server).
@@ -667,7 +747,8 @@ class Store(DocumentStoreBase):
 
             metadata = {k: v for k, v in chunk.metadata.toDict().items() if v is not None}
 
-            ids.append(str(uuid.uuid4()))
+            # The id is derived from (objectId, chunkId), so a key maps to one record
+            ids.append(point_id_for(chunk.metadata.objectId, chunk.metadata.chunkId))
             embeddings.append(embedding)
             metadatas.append(metadata)
             documents.append(chunk.page_content)
@@ -714,14 +795,7 @@ class Store(DocumentStoreBase):
         if not objectIds:
             return
 
-        # Get all the objects with the given objectIds
-        results = self.collectionObj.get(where={'objectId': {'$in': objectIds}}, include=['metadatas'])
-
-        # Set all isDeleted parameters for the objects with the given objectId to true
-        for res in results:
-            res['metadata']['isDeleted'] = True
-            self.collectionObj.update(where={'objectId': res['metadata']['objectId']}, new_metadata=res['metadata'])
-
+        self._setDeleted(objectIds, True)
         return
 
     def markActive(self, objectIds: List[str]) -> None:
@@ -738,15 +812,18 @@ class Store(DocumentStoreBase):
         if not objectIds:
             return
 
-        # Get all the objects with the given objectIds
-        results = self.collectionObj.get(where={'objectId': {'$in': objectIds}}, include=['metadatas'])
-
-        # Set all isDeleted parameters for the objects with the given objectId to false
-        for res in results:
-            res['metadata']['isDeleted'] = False
-            self.collectionObj.update(where={'objectId': res['metadata']['objectId']}, new_metadata=res['metadata'])
-
+        self._setDeleted(objectIds, False)
         return
+
+    def _setDeleted(self, objectIds: List[str], value: bool) -> None:
+        """Set isDeleted on every record of ``objectIds`` (update takes ids and full metadata)."""
+        results = self.collectionObj.get(where={'objectId': {'$in': list(objectIds)}}, include=['metadatas'])
+        ids = list(results.get('ids') or [])
+        if not ids:
+            return
+        metadatas = [{**(meta or {}), 'isDeleted': value} for meta in results['metadatas']]
+        for start in range(0, len(ids), 1000):
+            self.collectionObj.update(ids=ids[start : start + 1000], metadatas=metadatas[start : start + 1000])
 
     def render(self, objectId: str, callback: Callable[[str], None]) -> None:
         """
@@ -784,7 +861,9 @@ class Store(DocumentStoreBase):
                     },
                 ]
             }
-            results = self.collectionObj.get(where=filter, include=['documents'], limit=self.renderChunkSize)
+            results = self.collectionObj.get(
+                where=filter, include=['documents', 'metadatas'], limit=self.renderChunkSize
+            )
             # Create a renderChunkSize array with empty
             # entries. This will allow us to join even when
             # a chunk doesn't come back
@@ -792,9 +871,9 @@ class Store(DocumentStoreBase):
             lastIndex = -1
             for i in range(len(results['ids'])):
                 # Get the info
-                metadata = results['metadatas'][i]
+                metadata = results['metadatas'][i] or {}
                 content = results['documents'][i]
-                chunk = metadata.chunkId
+                chunk = metadata.get('chunkId', 0)
 
                 # Should never happen since we gave it an offset
                 if chunk < offset:
