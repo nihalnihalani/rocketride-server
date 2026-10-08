@@ -301,19 +301,19 @@ class Store(DocumentStoreBase):
         for field in keyword_keys:
             if field not in existing:
                 self.client.create_payload_index(
-                    collection_name=self.collection, field_name=field, field_type=PayloadSchemaType.KEYWORD
+                    collection_name=self.collection, field_name=field, field_schema=PayloadSchemaType.KEYWORD
                 )
 
         for field in integer_keys:
             if field not in existing:
                 self.client.create_payload_index(
-                    collection_name=self.collection, field_name=field, field_type=PayloadSchemaType.INTEGER
+                    collection_name=self.collection, field_name=field, field_schema=PayloadSchemaType.INTEGER
                 )
 
         for field in bool_keys:
             if field not in existing:
                 self.client.create_payload_index(
-                    collection_name=self.collection, field_name=field, field_type=PayloadSchemaType.BOOL
+                    collection_name=self.collection, field_name=field, field_schema=PayloadSchemaType.BOOL
                 )
 
         # Setup a full text keyword search on our content
