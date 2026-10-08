@@ -362,7 +362,7 @@ is derived from its path, so adding a file under a path that is already stored
 replaces that document, which is why the app asks first. A document another
 kind of source recorded under the same path keeps its own id and is listed
 beside the new one. Uploads from the app are tagged as coming from Vector
-Explorer, and a line is logged when one is stored.
+Explorer.
 
 ## Privacy
 
