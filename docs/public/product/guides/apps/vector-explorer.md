@@ -91,13 +91,14 @@ are never listed.
   Everything else (counts, the directory, adding and removing documents, the
   map) works without an LLM.
 - **Removing documents needs the write switch.** Every vector store node that
-  Vector Explorer lists has an **Allow document management from tool calls**
-  setting (`allow_writes`), off by default. The Vector Explorer templates turn
-  it on for `store_1` and leave it off for `store_2`. To turn it on in a pipeline
-  of your own, switch it on in the store node's settings, or set
+  Vector Explorer lists reads an `allow_writes` setting, off by default. The
+  Vector Explorer templates turn it on for `store_1` and leave it off for
+  `store_2`. To turn it on in a pipeline of your own, set
   `config.<profile>.allow_writes` to `true` on the store component in the
   `.pipe` (for example `"local": { …, "allow_writes": true }`), then restart the
-  pipeline. With it off, the trash buttons are disabled and say why. Adding
+  pipeline. RocketRide Vector's node form also shows it, as **Allow document
+  management from tool calls**; in this build the other store nodes' forms do
+  not show it. With it off, the trash buttons are disabled and say why. Adding
   documents is not governed by this switch: it goes through the Ingest source,
   and anyone with the data permission on the ingest task can add documents.
   Agents that use a store as a tool are unaffected; they have their own switch,
