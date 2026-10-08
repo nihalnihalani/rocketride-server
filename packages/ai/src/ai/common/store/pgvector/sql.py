@@ -1,0 +1,593 @@
+# =============================================================================
+# RocketRide Engine
+# =============================================================================
+# MIT License
+# Copyright (c) 2026 Aparavi Software AG
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+# =============================================================================
+
+"""The SQL of the shared pgvector driver.
+
+Every statement is built with ``psycopg2.sql``: the table is always an
+``Identifier`` and every value is a bound parameter. Column names are constants
+of this module; a document's metadata reaches the table only through the column
+allowlist :data:`METADATA_COLUMNS`, and every other key goes into the ``meta``
+jsonb column (or is dropped when the table has none).
+
+Each statement starts with a ``/* rr-pgvector:<name> */`` comment. It names the
+statement in ``pg_stat_activity`` and in the server log, and the test double of
+``psycopg2`` (``nodes/test/mocks/psycopg2``) dispatches on it.
+
+The table name is folded to lower case before it is quoted: the drivers this one
+replaced wrote unquoted names, which PostgreSQL folds, so ``MyDocs`` must keep
+naming the table ``mydocs``. Column names are lower case for the same reason.
+"""
+
+from __future__ import annotations
+
+import re
+
+from dataclasses import dataclass
+from typing import Any, List, Optional, Sequence, Tuple
+
+from psycopg2 import sql
+
+#: A valid unquoted PostgreSQL identifier: letter or underscore first, then letters, digits or underscores, at most 63.
+VALID_TABLE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]{0,62}$')
+
+#: objectId of the collection's control record.
+CONTROL_OBJECT_ID = 'schema'
+
+#: pgvector cannot build an HNSW index over vectors wider than this.
+HNSW_MAX_DIMS = 2000
+
+#: The configured similarity names and the metric each one is reported as.
+METRICS = {'cosine': 'cosine', 'l2': 'l2', 'inner_product': 'ip'}
+
+#: The distance operator and the HNSW operator class of each metric.
+OPERATORS = {'cosine': '<=>', 'l2': '<->', 'ip': '<#>'}
+OPCLASSES = {'cosine': 'vector_cosine_ops', 'l2': 'vector_l2_ops', 'ip': 'vector_ip_ops'}
+
+#: DocMetadata keys stored in a column of their own, and that column (PostgreSQL folds the legacy unquoted names).
+METADATA_COLUMNS = {
+    'objectId': 'objectid',
+    'nodeId': 'nodeid',
+    'parent': 'parent',
+    'permissionId': 'permissionid',
+    'isDeleted': 'isdeleted',
+    'chunkId': 'chunkid',
+    'isTable': 'istable',
+    'tableId': 'tableid',
+    'vectorSize': 'vectorsize',
+    'modelName': 'modelname',
+    'signature': 'signature',
+}
+
+#: Every column of a table this driver creates, in DDL order.
+TABLE_COLUMNS: Tuple[str, ...] = (
+    'id',
+    'content',
+    'objectid',
+    'nodeid',
+    'parent',
+    'permissionid',
+    'isdeleted',
+    'chunkid',
+    'istable',
+    'tableid',
+    'vectorsize',
+    'modelname',
+    'embedding',
+    'signature',
+    'meta',
+)
+
+#: Columns a row is read with, when the table has them (``embedding`` only as text, on request).
+READ_COLUMNS: Tuple[str, ...] = (
+    'id',
+    'content',
+    'objectid',
+    'nodeid',
+    'parent',
+    'permissionid',
+    'isdeleted',
+    'chunkid',
+    'istable',
+    'tableid',
+    'vectorsize',
+    'modelname',
+    'signature',
+    'meta',
+)
+
+#: Columns a write may fill (``id`` is the table's own; ``embedding`` and ``meta`` are cast).
+WRITE_COLUMNS: Tuple[str, ...] = tuple(c for c in TABLE_COLUMNS if c != 'id')
+
+#: Advisory-lock namespace: every write transaction on a table takes ``pg_advisory_xact_lock(hashtext(...))``.
+LOCK_NAMESPACE = 'rocketride.pgvector.'
+
+
+def _q(tag: str, text: str, /, **parts: sql.Composable) -> sql.Composed:
+    """A statement named ``tag`` (see the module docstring)."""
+    return sql.SQL('/* rr-pgvector:' + tag + ' */ ' + text).format(**parts)
+
+
+def _col(name: str) -> sql.Identifier:
+    return sql.Identifier(name)
+
+
+# -----------------------------------------------------------------------------
+# Filters
+# -----------------------------------------------------------------------------
+
+
+@dataclass
+class Where:
+    """The row filter of one statement. Every field is optional; ``deleted`` is 'active', 'deleted' or 'all'."""
+
+    exclude_control: bool = True
+    deleted: str = 'active'
+    node_id: Optional[str] = None
+    is_table: Optional[bool] = None
+    table_ids: Optional[Sequence[int]] = None
+    parent: Optional[str] = None
+    permissions: Optional[Sequence[int]] = None
+    object_ids: Optional[Sequence[str]] = None
+    object_id: Optional[str] = None
+    chunk_ids: Optional[Sequence[int]] = None
+    min_chunk_id: Optional[int] = None
+    max_chunk_id: Optional[int] = None
+    after_chunk_id: Optional[int] = None
+    keys: Optional[Sequence[Tuple[str, int]]] = None
+    not_keys: Optional[Sequence[Tuple[str, int]]] = None
+    content_like: Optional[str] = None
+
+    def build(self) -> Tuple[sql.Composable, List[Any]]:
+        """Return ``(predicate, params)``; the predicate is ``TRUE`` when nothing filters."""
+        parts: List[sql.Composable] = []
+        params: List[Any] = []
+
+        def add(text: str, *values: Any) -> None:
+            parts.append(sql.SQL(text))
+            params.extend(values)
+
+        if self.content_like is not None:
+            add('"content" ILIKE %s ESCAPE \'\\\'', self.content_like)
+        if self.exclude_control:
+            add('"objectid" <> %s', CONTROL_OBJECT_ID)
+        if self.object_id is not None:
+            add('"objectid" = %s', self.object_id)
+        if self.object_ids is not None:
+            add('"objectid" = ANY(%s)', [str(o) for o in self.object_ids])
+        if self.node_id is not None:
+            add('"nodeid" = %s', self.node_id)
+        if self.is_table is not None:
+            add('"istable" = %s', bool(self.is_table))
+        if self.table_ids is not None:
+            add('"tableid" = ANY(%s)', [int(t) for t in self.table_ids])
+        if self.parent is not None:
+            add('"parent" = %s', self.parent)
+        if self.permissions is not None:
+            add('"permissionid" = ANY(%s)', [int(p) for p in self.permissions])
+        if self.deleted == 'active':
+            add('"isdeleted" = %s', False)
+        elif self.deleted == 'deleted':
+            add('"isdeleted" = %s', True)
+        if self.chunk_ids is not None:
+            add('"chunkid" = ANY(%s)', [int(c) for c in self.chunk_ids])
+        if self.min_chunk_id is not None:
+            add('"chunkid" >= %s', int(self.min_chunk_id))
+        if self.max_chunk_id is not None:
+            add('"chunkid" <= %s', int(self.max_chunk_id))
+        if self.after_chunk_id is not None:
+            add('"chunkid" > %s', int(self.after_chunk_id))
+        for keys, op in ((self.keys, 'IN'), (self.not_keys, 'NOT IN')):
+            if keys is None:
+                continue
+            if not keys:
+                # An empty IN list matches nothing; an empty NOT IN list excludes nothing.
+                if op == 'IN':
+                    parts.append(sql.SQL('FALSE'))
+                continue
+            pairs = sql.SQL(', ').join(sql.SQL('(%s, %s)') for _ in keys)
+            parts.append(sql.SQL('("objectid", "chunkid") ' + op + ' ({})').format(pairs))
+            for object_id, chunk_id in keys:
+                params.extend([str(object_id), int(chunk_id)])
+
+        if not parts:
+            return sql.SQL('TRUE'), params
+        return sql.SQL(' AND ').join(parts), params
+
+
+# -----------------------------------------------------------------------------
+# Statements
+# -----------------------------------------------------------------------------
+
+
+class Statements:
+    """Every statement the driver runs against one table."""
+
+    def __init__(self, table: str) -> None:
+        """Build the statements for ``table`` (already validated and folded to lower case)."""
+        self.table = table
+        self.t = sql.Identifier(table)
+        #: The text ``to_regclass`` resolves the table from.
+        self.regclass = '"' + table + '"'
+        self.lock_key = LOCK_NAMESPACE + table
+
+    # --- transaction bootstrap ----------------------------------------------
+
+    @staticmethod
+    def begin_read(statement_timeout_ms: int, iterative_scan: bool) -> str:
+        """The first statement of every read transaction.
+
+        ``SELECT '[0]'::vector`` loads pgvector's library in the server session,
+        so its settings exist (a non-superuser may not ``LOAD`` it); then the
+        transaction is made read-only and time-bounded. Nothing is set for the
+        session: behind a transaction-mode pooler the next transaction may run
+        on another server session.
+        """
+        text = (
+            "/* rr-pgvector:begin_read */ SELECT '[0]'::vector; SET TRANSACTION READ ONLY; "
+            f"SET LOCAL statement_timeout = '{int(statement_timeout_ms)}ms'"
+        )
+        if iterative_scan:
+            text += '; SET LOCAL hnsw.iterative_scan = relaxed_order'
+        return text
+
+    @staticmethod
+    def begin_write(statement_timeout_ms: int, lock_timeout_ms: Optional[int] = None) -> str:
+        """The first statement of a write (or DDL) transaction."""
+        text = f"/* rr-pgvector:begin_write */ SET LOCAL statement_timeout = '{int(statement_timeout_ms)}ms'"
+        if lock_timeout_ms is not None:
+            text += f"; SET LOCAL lock_timeout = '{int(lock_timeout_ms)}ms'"
+        return text
+
+    def lock(self) -> Tuple[sql.Composed, List[Any]]:
+        """Serialise writes to this table across every process, until the transaction ends."""
+        return _q('lock', 'SELECT pg_advisory_xact_lock(hashtext(%s))'), [self.lock_key]
+
+    # --- catalog --------------------------------------------------------------
+
+    @staticmethod
+    def extension_version() -> Tuple[sql.Composed, List[Any]]:
+        return _q('extension_version', "SELECT extversion FROM pg_extension WHERE extname = 'vector'"), []
+
+    def exists(self) -> Tuple[sql.Composed, List[Any]]:
+        return _q('exists', 'SELECT to_regclass(%s) IS NOT NULL'), [self.regclass]
+
+    def has_rows(self) -> Tuple[sql.Composed, List[Any]]:
+        return _q('has_rows', 'SELECT EXISTS (SELECT 1 FROM {t})', t=self.t), []
+
+    def columns(self) -> Tuple[sql.Composed, List[Any]]:
+        return (
+            _q(
+                'columns',
+                'SELECT attname, format_type(atttypid, atttypmod) FROM pg_attribute '
+                'WHERE attrelid = to_regclass(%s) AND attnum > 0 AND NOT attisdropped ORDER BY attnum',
+            ),
+            [self.regclass],
+        )
+
+    def indexes(self) -> Tuple[sql.Composed, List[Any]]:
+        return (
+            _q(
+                'indexes',
+                'SELECT c.relname, am.amname, pg_get_indexdef(c.oid), c.reloptions FROM pg_index x '
+                'JOIN pg_class c ON c.oid = x.indexrelid JOIN pg_am am ON am.oid = c.relam '
+                'WHERE x.indrelid = to_regclass(%s) ORDER BY c.relname',
+            ),
+            [self.regclass],
+        )
+
+    def size(self) -> Tuple[sql.Composed, List[Any]]:
+        return _q('size', 'SELECT pg_total_relation_size(to_regclass(%s))'), [self.regclass]
+
+    def control(self) -> Tuple[sql.Composed, List[Any]]:
+        return (
+            _q('control', 'SELECT "modelname", "vectorsize" FROM {t} WHERE "objectid" = %s', t=self.t),
+            [CONTROL_OBJECT_ID],
+        )
+
+    # --- DDL ------------------------------------------------------------------
+
+    def create_table(self, dimension: int) -> Tuple[sql.Composed, List[Any]]:
+        return (
+            _q(
+                'create_table',
+                'CREATE TABLE IF NOT EXISTS {t} (id bigserial PRIMARY KEY, content text, objectid text, nodeid text, '
+                'parent text, permissionid int, isdeleted boolean, chunkid int, istable boolean, tableid int, '
+                'vectorsize int, modelname text, embedding vector({dim}), signature text, meta jsonb)',
+                t=self.t,
+                dim=sql.SQL(str(int(dimension))),
+            ),
+            [],
+        )
+
+    def create_key_index(self) -> Tuple[sql.Composed, List[Any]]:
+        return (
+            _q(
+                'create_key_index',
+                'CREATE INDEX IF NOT EXISTS {name} ON {t} ("objectid", "chunkid")',
+                name=sql.Identifier(_index_name(self.table, 'objectid_chunkid')),
+                t=self.t,
+            ),
+            [],
+        )
+
+    def create_hnsw_index(self, metric: str, m: int, ef_construction: int) -> Tuple[sql.Composed, List[Any]]:
+        return (
+            _q(
+                'create_hnsw_index',
+                'CREATE INDEX IF NOT EXISTS {name} ON {t} USING hnsw ("embedding" {opclass}) '
+                'WITH (m = {m}, ef_construction = {ef})',
+                name=sql.Identifier(_index_name(self.table, 'embedding_hnsw')),
+                t=self.t,
+                opclass=sql.SQL(OPCLASSES[metric]),
+                m=sql.SQL(str(int(m))),
+                ef=sql.SQL(str(int(ef_construction))),
+            ),
+            [],
+        )
+
+    def add_meta_column(self) -> Tuple[sql.Composed, List[Any]]:
+        return _q('add_meta_column', 'ALTER TABLE {t} ADD COLUMN IF NOT EXISTS "meta" jsonb', t=self.t), []
+
+    # --- reads ----------------------------------------------------------------
+
+    @staticmethod
+    def _select_list(columns: Sequence[str], *, embedding: bool) -> sql.Composable:
+        """The read columns the table has; a missing ``meta``/``signature`` reads as NULL."""
+        items: List[sql.Composable] = []
+        for name in READ_COLUMNS:
+            if name in columns:
+                items.append(sql.Identifier(name))
+            elif name in ('meta', 'signature'):
+                items.append(sql.SQL('NULL AS {}').format(sql.Identifier(name)))
+        if embedding:
+            items.append(sql.SQL('"embedding"::text AS "embedding_text"'))
+        return sql.SQL(', ').join(items)
+
+    def count_all(self) -> Tuple[sql.Composed, List[Any]]:
+        return _q('count_all', 'SELECT count(*) FROM {t}', t=self.t), []
+
+    def count_chunks(self, where: Where) -> Tuple[sql.Composed, List[Any]]:
+        pred, params = where.build()
+        return _q('count_chunks', 'SELECT count(*) FROM {t} WHERE {w}', t=self.t, w=pred), params
+
+    def count_documents(self, where: Where) -> Tuple[sql.Composed, List[Any]]:
+        pred, params = where.build()
+        return _q('count_documents', 'SELECT count(DISTINCT "objectid") FROM {t} WHERE {w}', t=self.t, w=pred), params
+
+    def get(
+        self, columns: Sequence[str], where: Where, limit: Optional[int], offset: int
+    ) -> Tuple[sql.Composed, List[Any]]:
+        pred, params = where.build()
+        return (
+            _q(
+                'get',
+                'SELECT {cols} FROM {t} WHERE {w} ORDER BY "objectid", "chunkid" LIMIT %s OFFSET %s',
+                cols=self._select_list(columns, embedding=False),
+                t=self.t,
+                w=pred,
+            ),
+            params + [limit, offset],
+        )
+
+    def keyword(
+        self, columns: Sequence[str], where: Where, limit: Optional[int], offset: int
+    ) -> Tuple[sql.Composed, List[Any]]:
+        pred, params = where.build()
+        return (
+            _q(
+                'keyword',
+                'SELECT {cols} FROM {t} WHERE {w} ORDER BY "objectid", "chunkid" LIMIT %s OFFSET %s',
+                cols=self._select_list(columns, embedding=False),
+                t=self.t,
+                w=pred,
+            ),
+            params + [limit, offset],
+        )
+
+    def semantic(
+        self, columns: Sequence[str], metric: str, vector: str, where: Where, limit: Optional[int], offset: int
+    ) -> Tuple[sql.Composed, List[Any]]:
+        pred, params = where.build()
+        return (
+            _q(
+                'semantic',
+                'SELECT {cols}, "embedding" {op} %s::vector AS "distance" FROM {t} WHERE {w} '
+                'ORDER BY "distance" LIMIT %s OFFSET %s',
+                cols=self._select_list(columns, embedding=False),
+                op=sql.SQL(OPERATORS[metric]),
+                t=self.t,
+                w=pred,
+            ),
+            [vector] + params + [limit, offset],
+        )
+
+    def paths(self, where: Where, limit: Optional[int], offset: int) -> Tuple[sql.Composed, List[Any]]:
+        pred, params = where.build()
+        return (
+            _q(
+                'paths',
+                'SELECT "parent", "objectid" FROM {t} WHERE {w} ORDER BY "parent", "objectid" LIMIT %s OFFSET %s',
+                t=self.t,
+                w=pred,
+            ),
+            params + [limit, offset],
+        )
+
+    def render(self, object_id: str, after_chunk: int, limit: int) -> Tuple[sql.Composed, List[Any]]:
+        return (
+            _q(
+                'render',
+                'SELECT "content", "chunkid" FROM {t} WHERE "objectid" = %s AND "chunkid" > %s ORDER BY "chunkid" LIMIT %s',
+                t=self.t,
+            ),
+            [object_id, int(after_chunk), int(limit)],
+        )
+
+    def list_documents(
+        self, columns: Sequence[str], where: Where, after: Optional[Tuple[str, str]], limit: int
+    ) -> Tuple[sql.Composed, List[Any]]:
+        """One page of documents (one row per objectId), ordered by ``(path, objectId)`` from ``after``."""
+        pred, params = where.build()
+        meta = sql.SQL('(array_agg("meta" ORDER BY "chunkid"))[1]') if 'meta' in columns else sql.SQL('NULL::jsonb')
+        having = sql.SQL('')
+        if after is not None:
+            having = sql.SQL('HAVING (coalesce(min("parent"), \'\'), "objectid") > (%s, %s) ')
+            params = params + [after[0], after[1]]
+        return (
+            _q(
+                'list_documents',
+                'SELECT "objectid", coalesce(min("parent"), \'\') AS "path", count(*) AS "chunks", '
+                'coalesce(bool_or("chunkid" = 0), false) AS "has_first_chunk", '
+                'coalesce(bool_or("isdeleted"), false) AS "deleted", '
+                'count(*) FILTER (WHERE "istable") AS "tables", '
+                '(array_agg("nodeid" ORDER BY "chunkid"))[1] AS "nodeid", '
+                '(array_agg("id" ORDER BY "chunkid"))[1] AS "point_id", '
+                '{meta} AS "meta" '
+                'FROM {t} WHERE {w} GROUP BY "objectid" {having}ORDER BY 2, 1 LIMIT %s',
+                meta=meta,
+                t=self.t,
+                w=pred,
+                having=having,
+            ),
+            params + [int(limit)],
+        )
+
+    def scroll(self, columns: Sequence[str], where: Where, limit: int) -> Tuple[sql.Composed, List[Any]]:
+        pred, params = where.build()
+        return (
+            _q(
+                'scroll',
+                'SELECT {cols} FROM {t} WHERE {w} ORDER BY "chunkid" LIMIT %s',
+                cols=self._select_list(columns, embedding=False),
+                t=self.t,
+                w=pred,
+            ),
+            params + [int(limit)],
+        )
+
+    def vectors(self, columns: Sequence[str], where: Where) -> Tuple[sql.Composed, List[Any]]:
+        pred, params = where.build()
+        return (
+            _q(
+                'vectors',
+                'SELECT {cols} FROM {t} WHERE {w} ORDER BY "objectid", "chunkid"',
+                cols=self._select_list(columns, embedding=True),
+                t=self.t,
+                w=pred,
+            ),
+            params,
+        )
+
+    @staticmethod
+    def setseed(seed: int) -> Tuple[sql.Composed, List[Any]]:
+        """``setseed`` for the transaction's ``random()``: a seed in [-1, 1) derived from the integer seed."""
+        value = (int(seed) % 2_000_003) / 2_000_003.0 * 2.0 - 1.0
+        return _q('setseed', 'SELECT setseed(%s)'), [value]
+
+    def sample(self, columns: Sequence[str], strategy: str, where: Where, n: int) -> Tuple[sql.Composed, List[Any]]:
+        """Pick ``n`` rows (``random``, ``stratified`` or ``first``) and read them with their vectors.
+
+        ``stratified`` takes one row of every document before a second one of any:
+        each document's rows are ranked by ``random()`` with chunk 0 first, and
+        the ranks are taken in order. The ids are picked first so that only the
+        chosen rows are read with their vectors.
+        """
+        pred, params = where.build()
+        if strategy == 'stratified':
+            pick = (
+                'WITH "ranked" AS (SELECT "id", row_number() OVER (PARTITION BY "objectid" '
+                'ORDER BY ("chunkid" = 0) DESC, random()) AS "rn" FROM {t} WHERE {w}), '
+                '"pick" AS (SELECT "id" FROM "ranked" ORDER BY "rn", random() LIMIT %s) '
+            )
+        elif strategy == 'random':
+            pick = 'WITH "pick" AS (SELECT "id" FROM {t} WHERE {w} ORDER BY random() LIMIT %s) '
+        else:
+            pick = 'WITH "pick" AS (SELECT "id" FROM {t} WHERE {w} ORDER BY "parent", "objectid", "chunkid" LIMIT %s) '
+        return (
+            _q(
+                'sample_' + strategy,
+                pick + 'SELECT {cols} FROM {t} JOIN "pick" USING ("id") ORDER BY "objectid", "chunkid"',
+                cols=self._select_list(columns, embedding=True),
+                t=self.t,
+                w=pred,
+            ),
+            params + [int(n)],
+        )
+
+    # --- writes -------------------------------------------------------------
+
+    def insert(self, columns: Sequence[str], rows: int) -> sql.Composed:
+        """A multi-row INSERT of ``rows`` rows over ``columns`` (the ``WRITE_COLUMNS`` the table has)."""
+        cells: List[sql.Composable] = []
+        for name in columns:
+            if name == 'embedding':
+                cells.append(sql.SQL('%s::vector'))
+            elif name == 'meta':
+                cells.append(sql.SQL('%s::jsonb'))
+            else:
+                cells.append(sql.SQL('%s'))
+        row = sql.SQL('({})').format(sql.SQL(', ').join(cells))
+        return _q(
+            'insert',
+            'INSERT INTO {t} ({cols}) VALUES {rows}',
+            t=self.t,
+            cols=sql.SQL(', ').join(sql.Identifier(c) for c in columns),
+            rows=sql.SQL(', ').join([row] * rows),
+        )
+
+    def delete(self, where: Where) -> Tuple[sql.Composed, List[Any]]:
+        pred, params = where.build()
+        return _q('delete', 'DELETE FROM {t} WHERE {w}', t=self.t, w=pred), params
+
+    def set_deleted(self, where: Where, value: bool) -> Tuple[sql.Composed, List[Any]]:
+        pred, params = where.build()
+        return _q('set_deleted', 'UPDATE {t} SET "isdeleted" = %s WHERE {w}', t=self.t, w=pred), [bool(value)] + params
+
+
+def _index_name(table: str, suffix: str) -> str:
+    """``<table>_<suffix>``, the name the legacy driver gave its index (PostgreSQL keeps 63 characters)."""
+    return f'{table}_{suffix}'[:63]
+
+
+def vector_literal(values: Sequence[float]) -> str:
+    """Return the text form pgvector reads a vector from, for a ``%s::vector`` parameter."""
+    return '[' + ','.join(repr(float(v)) for v in values) + ']'
+
+
+__all__ = [
+    'CONTROL_OBJECT_ID',
+    'HNSW_MAX_DIMS',
+    'METADATA_COLUMNS',
+    'METRICS',
+    'OPCLASSES',
+    'OPERATORS',
+    'READ_COLUMNS',
+    'Statements',
+    'TABLE_COLUMNS',
+    'VALID_TABLE',
+    'WRITE_COLUMNS',
+    'Where',
+    'vector_literal',
+]
