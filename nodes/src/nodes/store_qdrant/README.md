@@ -121,11 +121,19 @@ Self-hosted Qdrant typically needs no credentials: leave `apikey` empty. For Qdr
 
 ### Scoring and relevance
 
-Raw Qdrant scores are rescaled to `[0, 1]` before filtering. For `Cosine` similarity the rescaling is `(score + 1) / 2`; for other metrics a sigmoid is applied. Results below a hard floor of `0.20` are always dropped as noise, and the configured retrieval `score` threshold is applied on top of that in the rescaled space (applied by the base store, not passed to Qdrant as `score_threshold`).
+Raw Qdrant scores are rescaled to `[0, 1]` before filtering, so that a higher score always means a closer chunk. For `Cosine` similarity the rescaling is `(score + 1) / 2`; for `Euclid` and `Manhattan`, whose raw score is a distance, it is `1 / (1 + distance)`; for `Dot` a sigmoid of the raw score is applied. Results below a floor of `0.20` are dropped as noise unless the caller sets its own minimum score (the Vector Explorer does, to show what the floor hides), and the configured retrieval `score` threshold is applied on top of that in the rescaled space (applied by the base store, not passed to Qdrant as `score_threshold`).
 
-The similarity metric defaults to `Cosine`; `Euclid`, `Dot`, and `Manhattan` are also accepted. Any other value raises a configuration error at startup. Semantic search uses exact search (`SearchParams(exact=True)`) and does not support a non-zero result offset; keyword search and plain filtered gets use Qdrant scroll and do support offsets.
+The similarity metric defaults to `Cosine`; `Euclid`, `Dot`, and `Manhattan` are also accepted. Any other value raises a configuration error at startup. Semantic search uses exact search (`SearchParams(exact=True)`) and does not support a non-zero result offset. Keyword search and plain filtered gets do: a numeric offset skips that many matching chunks (Qdrant's own scroll offset is a point id, so the node walks the matches in id order). A `parent` filter matches the exact path.
 
-Deletion of source files is handled as a soft delete: chunks are marked `meta.isDeleted: true` and excluded from all searches by default. They are only returned when the filter explicitly asks for deleted documents. A document that reappears is marked active again.
+Deletion of source files is handled as a soft delete: `isDeleted` is set to `true` inside each chunk's `meta` payload (the rest of `meta` is kept) and the chunks are excluded from all searches by default. They are only returned when the filter explicitly asks for deleted documents. A document that reappears is marked active again.
+
+### Point ids
+
+Each chunk is stored under a point id derived from its document and position, `uuid5(NAMESPACE_URL, '<objectId>#<chunkId>')`, so a chunk always maps to one point and re-ingesting a document overwrites its points in place. Collections written by earlier versions of this node hold random point ids; every read by document and chunk falls back to a payload filter for those, so old and new collections work alike.
+
+### Vector Explorer
+
+The node answers the Vector Explorer's store calls natively. Documents are listed from their first chunks in storage order (the app sorts what it has loaded), with chunk and table counts from exact facets; documents whose first chunk is missing are found by a facet over every `objectId` and listed after the others (up to 1,000 distinct documents per sweep). Document counts come from the same exact facets. The neighbour graph for the map is computed by Qdrant itself (the distance-matrix API, restricted to the sampled points); similarities are then recomputed from the vectors so every view uses one definition. Random samples come from Qdrant's random sampling, which takes no seed.
 
 ### Save-time validation
 
