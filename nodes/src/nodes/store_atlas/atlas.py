@@ -86,6 +86,9 @@ METRICS = {'cosine': 'cosine', 'euclidean': 'l2', 'dotproduct': 'ip', 'dotProduc
 # Most objectId x chunkId combinations one vectors read asks for
 VECTOR_BATCH_ROWS = 4096
 
+# Chunk ids render reads per query (renderChunkSize, when smaller)
+RENDER_WINDOW = 10000
+
 #: Exception types the driver and the store base raise with their own text (never a client message)
 _OWN_ERRORS = (Exception, RuntimeError, ValueError)
 
@@ -560,54 +563,42 @@ class Store(DocumentStoreBase):
         self.collection.update_many({'meta.objectId': {'$in': objectIds}}, {'$set': {'meta.isDeleted': False}})
 
     def render(self, objectId: str, callback: Callable[[str], None]) -> None:
-        """Render complete document by combining all chunks."""
+        """Render complete document by combining all chunks, one window of chunk ids at a time."""
         if not self.doesCollectionExist():
             return
 
+        window = max(1, min(int(self.renderChunkSize), RENDER_WINDOW))
         offset = 0
         while True:
             filter_conditions = {
                 'meta.objectId': objectId,
-                'meta.chunkId': {'$gte': offset, '$lt': offset + self.renderChunkSize},
+                'meta.chunkId': {'$gte': offset, '$lt': offset + window},
             }
+            documents = list(self.collection.find(filter_conditions, {'embedding': 0}).limit(window))
 
-            cursor = self.collection.find(filter_conditions).limit(self.renderChunkSize)
-            documents = list(cursor)
-
-            text = [''] * self.renderChunkSize
-            lastIndex = -1
-
+            # Order this window's chunks by chunk id
+            parts: Dict[int, str] = {}
             for document in documents:
                 if 'meta' not in document:
                     continue
-
                 metadata = self._validateMetadata(document['meta'])
                 if metadata is None:
                     continue
-
-                content = document['content']
                 chunk = metadata.chunkId
+                if isinstance(chunk, int) and offset <= chunk < offset + window:
+                    parts[chunk] = document.get('content') or ''
 
-                if chunk < offset or chunk >= offset + self.renderChunkSize:
-                    continue
-
-                index = chunk - offset
-                text[index] = content
-
-                if index > lastIndex:
-                    lastIndex = index
-
-            numberOfItems = lastIndex + 1
-            if numberOfItems < 1:
+            # If we got no items back, we are done
+            if not parts:
                 break
 
-            fullText = ''.join(text[0:numberOfItems])
-            callback(fullText)
+            callback(''.join(parts[chunk] for chunk in sorted(parts)))
 
-            if numberOfItems < self.renderChunkSize:
+            # If the window was not full, must be done
+            if max(parts) < offset + window - 1:
                 break
 
-            offset += self.renderChunkSize
+            offset += window
 
     def _convertFilter(self, docFilter: DocFilter, deleted: Optional[str] = None) -> Dict[str, Any]:
         """

@@ -124,3 +124,46 @@ def test_get_paths_skip_the_control_record(store):
     """Objdir lists live documents only."""
     h.ingest(store, 'doc-a', '/docs/a.md', [0])
     assert store.getPaths() == {'/docs/a.md': 'doc-a'}
+
+
+def test_render_emits_every_chunk_in_order(store):
+    """Rendering joins every chunk of the document in chunk order."""
+    h.ingest(store, 'doc-a', '/docs/a.md', list(range(25)))
+    parts = []
+    store.render('doc-a', parts.append)
+    assert ''.join(parts) == ''.join(f'/docs/a.md chunk {c} text' for c in range(25))
+
+
+def test_render_does_not_allocate_the_render_chunk_size(store):
+    """Render reads a bounded window of chunk ids instead of building a renderChunkSize-long list."""
+    import tracemalloc
+
+    h.ingest(store, 'doc-a', '/docs/a.md', [0, 1, 2])
+    store.renderChunkSize = 4_000_000  # a list this long would take about 32 MB
+    parts = []
+    tracemalloc.start()
+    try:
+        store.render('doc-a', parts.append)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert ''.join(parts) == ''.join(f'/docs/a.md chunk {c} text' for c in range(3))
+    assert peak < 8 * 1024 * 1024, peak
+
+
+def test_stratified_sample_takes_every_first_chunk_before_any_second_one(store):
+    """
+    With fewer rows than documents x per-document quota, the round-robin order decides coverage:
+    every document's chunk 0 comes before any document's second chunk.
+    """
+    for i in range(4):
+        h.ingest(store, f'doc-{i}', f'/docs/{i}.md', list(range(6)))
+    pinned = [('doc-2', 3)]
+    docs, used = store.sampleChunks(
+        n=5, seed=1, strategy='stratified', docFilter=h.VxFilter(deleted='active'), include_keys=pinned
+    )
+    keys = [(doc.metadata.objectId, doc.metadata.chunkId) for doc in docs]
+    assert used == 'stratified'
+    assert len(keys) == 5 and ('doc-2', 3) not in keys
+    assert sorted(keys[:4]) == [(f'doc-{i}', 0) for i in range(4)]
+    assert keys[4][1] != 0

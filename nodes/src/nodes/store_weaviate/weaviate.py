@@ -63,6 +63,9 @@ CONTROL_OBJECT_ID = 'schema'
 # Weaviate answers at most this many objects for offset + limit (QUERY_MAXIMUM_RESULTS)
 MAX_QUERY_RESULTS = 10000
 
+# Objects read per page when updating a document's chunks
+UPDATE_PAGE = 1000
+
 # Largest number of documents countDocuments groups before it gives up (None)
 MAX_GROUPS = 10000
 
@@ -759,32 +762,37 @@ class Store(DocumentStoreBase):
         self.collectionObj.data.delete_many(where=Filter.any_of(objectIdsFilter))
         return
 
+    def _setDeleted(self, objectIds: List[str], value: bool) -> None:
+        """
+        Set ``isDeleted`` on every chunk of ``objectIds``.
+
+        Reads the chunks still in the other state a page at a time (a query without a limit
+        returns only the server's default of 10 objects); each update takes a chunk out of
+        the next read, and a page of chunks already updated ends the loop.
+        """
+        # By definition, if the collection does not exists, there
+        # is nothing to mark
+        if not objectIds or not self.doesCollectionExist():
+            return
+
+        pending = _all(_any_equal('objectId', list(objectIds)), Filter.by_property('isDeleted').equal(not value))
+        done = set()
+        while True:
+            points = self.collectionObj.query.fetch_objects(filters=pending, limit=UPDATE_PAGE).objects
+            fresh = [point for point in points if str(point.uuid) not in done]
+            for point in fresh:
+                done.add(str(point.uuid))
+                self.collectionObj.data.update(uuid=point.uuid, properties={'isDeleted': value})
+            if not fresh or len(points) < UPDATE_PAGE:
+                return
+
     def markDeleted(self, objectIds: List[str]) -> None:
         """
         Mark the set of documents with the given objectId as deleted.
 
         They then will not be returned from the search without specifying deleted=True
         """
-        # By definition, if the collection does not exists, there
-        # is nothing to mark
-        if not self.doesCollectionExist():
-            return
-
-        if not objectIds:
-            return
-
-        objectIdsFilter: List[Filter] = []
-        for objectId in objectIds:
-            objectIdsFilter.append(Filter.by_property('objectId').equal(objectId))
-        points = self.collectionObj.query.fetch_objects(filters=Filter.any_of(objectIdsFilter))
-        for point in points.objects:
-            self.collectionObj.data.update(
-                uuid=point.uuid,
-                properties={
-                    'isDeleted': True,
-                },
-            )
-        return
+        self._setDeleted(objectIds, True)
 
     def markActive(self, objectIds: List[str]) -> None:
         """
@@ -792,91 +800,53 @@ class Store(DocumentStoreBase):
 
         This occurs if a document now "comes back" after begin deleted
         """
-        # By definition, if the collection does not exists, there
-        # is nothing to mark
-        if not self.doesCollectionExist():
-            return
-
-        if not objectIds:
-            return
-
-        objectIdsFilter: List[Filter] = []
-        for objectId in objectIds:
-            objectIdsFilter.append(Filter.by_property('objectId').equal(objectId))
-        points = self.collectionObj.query.fetch_objects(filters=Filter.any_of(objectIdsFilter))
-        for point in points.objects:
-            self.collectionObj.data.update(
-                uuid=point.uuid,
-                properties={
-                    'isDeleted': False,
-                },
-            )
-        return
+        self._setDeleted(objectIds, False)
 
     def render(self, objectId: str, callback: Callable[[str], None]) -> None:
         """
         Given an object id, render the complete document.
 
-        Rehydrates all the chunks into the proper order.
+        Rehydrates all the chunks into the proper order, one window of chunk ids at a time
+        (``renderChunkSize``, at most the MAX_QUERY_RESULTS objects one Weaviate query returns).
         """
         # By definition, if the collection does not exists, there
         # is nothing to render
         if not self.doesCollectionExist():
             return
 
-        # Since chunks are returned in any order, and a single objectId
-        # may contain tens of thousands of chunks, we grave them one
-        # group at a time (renderChunkSize), put them into an array,
-        # join them and call the callback
+        window = max(1, min(int(self.renderChunkSize), MAX_QUERY_RESULTS))
         offset = 0
         while True:
-            # Build filter for getting a set of chunks within the offset range
+            # The chunks within this window of chunk ids, in any order
             points = self.collectionObj.query.fetch_objects(
                 filters=(
                     Filter.by_property('objectId').equal(objectId)
                     & Filter.by_property('chunkId').greater_or_equal(offset)
-                    & Filter.by_property('chunkId').less_than(offset + self.renderChunkSize)
-                )
-            )
+                    & Filter.by_property('chunkId').less_than(offset + window)
+                ),
+                limit=window,
+            ).objects
 
-            # Create a renderChunkSize array with empty
-            # entries. This will allow us to join even when
-            # a chunk doesn't come back
-            # Process the results
-            text = [''] * self.renderChunkSize
-            lastIndex = -1
-
-            for point in points.objects:
-                content = point.properties.get('content')
-                chunk = point.properties.get('chunkId')
-                index = chunk - offset
-
-                # Should never happen since we gave it an offset
-                if chunk < offset:
-                    continue
-
-                text[index] = content
-                if index > lastIndex:
-                    lastIndex = index
-
-            # Compute the number of items we are going to process
-            numberOfItems = lastIndex + 1
+            # Order this window's chunks by chunk id
+            parts: Dict[int, str] = {}
+            for point in points:
+                properties = _plain_properties(point.properties)
+                chunk = properties.get('chunkId')
+                if isinstance(chunk, int) and offset <= chunk < offset + window:
+                    parts[chunk] = properties.get('content') or ''
 
             # If we got no items back, we are done
-            if numberOfItems < 1:
+            if not parts:
                 break
 
-            # Join it together
-            fullText = ''.join(text[0:numberOfItems])
+            # Join it together and call the output function
+            callback(''.join(parts[chunk] for chunk in sorted(parts)))
 
-            # Call the output function
-            callback(fullText)
-
-            # If we got less than we asked for, must be done
-            if numberOfItems < self.renderChunkSize:
+            # If the window was not full, must be done
+            if max(parts) < offset + window - 1:
                 break
 
-            offset += self.renderChunkSize
+            offset += window
 
     # ------------------------------------------------------------------
     # Vector Explorer hooks (docs/development/nodes/vector-tool-contract.md)

@@ -52,6 +52,9 @@ import re
 # Auto-schema (what the server does with properties a collection does not declare)
 # =============================================================================
 
+#: Objects a query returns when it sets no limit (the server's QUERY_DEFAULTS_LIMIT)
+QUERY_DEFAULTS_LIMIT = 10
+
 #: An RFC 3339 timestamp, which auto-schema types as ``date`` (AUTOSCHEMA_DEFAULT_DATE)
 _RFC3339 = re.compile(r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$')
 
@@ -422,8 +425,9 @@ class MockQuery:
             ids = [obj.uuid for obj in results]
             results = results[ids.index(str(after)) + 1 :] if str(after) in ids else []
 
+        # Without a limit the server answers QUERY_DEFAULTS_LIMIT (10) objects
         start = offset or 0
-        stop = start + (100 if limit is None else limit)
+        stop = start + (QUERY_DEFAULTS_LIMIT if limit is None else limit)
         return QueryResult(objects=results[start:stop])
 
     def _cosine_distance(self, v1: List[float], v2: List[float]) -> float:

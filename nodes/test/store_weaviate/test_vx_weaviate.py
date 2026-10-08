@@ -173,3 +173,51 @@ def test_auto_schemaed_extras_read_back_as_written(adapter, store):
         extras = doc.metadata.model_dump()
         assert extras['ingestedAt'] == '2026-10-08T18:20:11Z'
         assert isinstance(extras['size'], int) and isinstance(extras['modifyTime'], int)
+
+
+# -----------------------------------------------------------------------------
+# Unbounded reads: Weaviate answers 10 objects when no limit is given
+# -----------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize('method', ['markDeleted', 'markActive'])
+def test_soft_delete_reaches_every_chunk_of_a_long_document(adapter, store, method):
+    """Marking a 25-chunk document touches all 25 chunks, not the server's default page of 10."""
+    h.ingest(store, 'doc-a', '/docs/a.md', list(range(25)), deleted=method == 'markActive')
+    h.ingest(store, 'doc-b', '/docs/b.md', [0], deleted=method == 'markActive')
+    getattr(store, method)(['doc-a'])
+    flags = {
+        o['properties']['chunkId']: o['properties']['isDeleted']
+        for o in adapter.storage(store).values()
+        if o['properties']['objectId'] == 'doc-a'
+    }
+    assert flags == {chunk: method == 'markDeleted' for chunk in range(25)}
+    other = [
+        o['properties']['isDeleted'] for o in adapter.storage(store).values() if o['properties']['objectId'] == 'doc-b'
+    ]
+    assert other == [method == 'markActive']
+
+
+def test_render_emits_every_chunk_in_order(store):
+    """Rendering a 25-chunk document joins all 25 chunks in chunk order."""
+    h.ingest(store, 'doc-a', '/docs/a.md', list(range(25)))
+    parts = []
+    store.render('doc-a', parts.append)
+    assert ''.join(parts) == ''.join(f'/docs/a.md chunk {c} text' for c in range(25))
+
+
+def test_render_does_not_allocate_the_render_chunk_size(store):
+    """The render window is bounded by what Weaviate can return, not a renderChunkSize-long list."""
+    import tracemalloc
+
+    h.ingest(store, 'doc-a', '/docs/a.md', [0, 1, 2])
+    store.renderChunkSize = 4_000_000  # a list this long would take about 32 MB
+    parts = []
+    tracemalloc.start()
+    try:
+        store.render('doc-a', parts.append)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert ''.join(parts) == ''.join(f'/docs/a.md chunk {c} text' for c in range(3))
+    assert peak < 8 * 1024 * 1024, peak
