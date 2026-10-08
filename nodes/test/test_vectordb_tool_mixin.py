@@ -1994,7 +1994,7 @@ def test_get_of_the_control_record_is_empty():
 
 
 def test_objdir_lists_entries_without_collapsing_equal_paths():
-    store = MemoryStore().seed(
+    store = ExactListingStore().seed(
         [make_doc('a', 0, path='/same.md'), make_doc('b', 0, path='/same.md'), make_doc('c', 0, path='/other.md')]
     )
     answer = node(store).objdir({})
@@ -2008,7 +2008,7 @@ def test_objdir_lists_entries_without_collapsing_equal_paths():
 
 
 def test_objdir_excludes_the_control_record_and_deleted_documents():
-    store = MemoryStore().seed(corpus({'a': [0], 'b': [0]}))
+    store = ExactListingStore().seed(corpus({'a': [0], 'b': [0]}))
     store.markDeleted(['b'])
     answer = node(store).objdir({})
     assert [e['objectId'] for e in answer['entries']] == ['a']
@@ -2016,11 +2016,47 @@ def test_objdir_excludes_the_control_record_and_deleted_documents():
 
 
 def test_objdir_filters_by_parent_prefix_and_pages():
-    store = MemoryStore().seed(
+    store = ExactListingStore().seed(
         [make_doc(f'd{i}', 0, path=f'/docs/{i}.md') for i in range(5)] + [make_doc('x', 0, path='/x.md')]
     )
     answer = node(store).objdir({'parent': '/docs/', 'offset': 1, 'limit': 2})
     assert [e['objectId'] for e in answer['entries']] == ['d1', 'd2']
+
+
+def test_objdir_pages_a_native_listing_past_one_page():
+    store = ExactListingStore().seed(corpus({f'd{i:04d}': [0] for i in range(1200)}))
+    answer = node(store).objdir({})
+    assert len(answer['entries']) == 1000 and len({e['objectId'] for e in answer['entries']}) == 1000
+
+
+class _PathsSpy(MemoryStore):
+    """A store without a native document listing that records how getPaths was asked."""
+
+    def getPaths(self, parent=None, offset=0, limit=1000):
+        self.calls.append(('getPaths', parent, offset, limit))
+        return super().getPaths(parent=parent, offset=offset, limit=limit)
+
+
+def test_objdir_without_a_native_listing_keeps_the_drivers_get_paths():
+    store = _PathsSpy().seed(corpus({'a': [0], 'b': [0]}))
+    answer = node(store).objdir({'parent': '/docs/', 'offset': 0, 'limit': 50})
+    assert [call for call in store.calls if call[0] == 'getPaths'] == [('getPaths', '/docs/', 0, 50)]
+    assert not [call for call in store.calls if call[0] == 'get']
+    assert sorted(e['objectId'] for e in answer['entries']) == ['a', 'b']
+    assert 'schema' not in answer['paths'].values()
+
+
+def test_objdir_on_an_offset_ignoring_store_lists_past_the_first_page():
+    store = MemoryStore(ignore_offset=True).seed(corpus({f'd{i:04d}': [0] for i in range(600)}))
+    answer = node(store).objdir({})
+    assert len(answer['entries']) == 600 and len(answer['paths']) == 600
+
+
+def test_objdir_clamps_the_limit_given_to_get_paths():
+    store = _PathsSpy().seed(corpus({f'd{i}': [0] for i in range(3)}))
+    node(store).objdir({'limit': 100_000})
+    node(store).objdir({'limit': 0})
+    assert [call[3] for call in store.calls if call[0] == 'getPaths'] == [1000, 1]
 
 
 def test_objdir_rejects_bad_integers():
@@ -2029,7 +2065,7 @@ def test_objdir_rejects_bad_integers():
 
 
 def test_objdir_clamps_the_limit():
-    store = MemoryStore().seed(corpus({f'd{i}': [0] for i in range(3)}))
+    store = ExactListingStore().seed(corpus({f'd{i}': [0] for i in range(3)}))
     assert len(node(store).objdir({'limit': 0})['entries']) == 1
 
 

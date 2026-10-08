@@ -1703,9 +1703,12 @@ class VectorStoreToolMixin(VectorExplorerTools):
     def objdir(self, args):
         """List unique document paths in this vector store.
 
-        ``paths`` maps each path to an objectId as before; ``entries`` lists every
-        document (path and objectId) so equal paths are not collapsed. The control
-        record and deleted documents are never listed; ``limit`` is clamped to 1..1000.
+        ``paths`` maps each path to an objectId as before; the control record is never
+        listed and ``limit`` is clamped to 1..1000. On a driver with a native document
+        listing (``listDocuments``), ``entries`` lists every document (path and objectId,
+        equal paths not collapsed) and deleted documents are left out. On any other
+        driver the answer is the driver's own ``getPaths`` page, as before: the default
+        listing pages by offset, which several backends ignore or read as a point id.
         """
         store = self._vectordb_store()
 
@@ -1718,34 +1721,13 @@ class VectorStoreToolMixin(VectorExplorerTools):
         offset = max(0, offset)
         limit = max(1, min(limit, _OBJDIR_MAX_LIMIT))
 
-        entries: List[Dict[str, str]] = []
-        try:
-            skipped = 0
-            scanned = 0
-            cursor: Optional[str] = None
-            while len(entries) < limit:
-                page = store.listDocuments(
-                    cursor=cursor,
-                    limit=VECTOR_TOOL_LIMITS['documents_page'],
-                    object_ids=None,
-                    deleted='active',
-                    sort='path',
-                )
-                for row in page.items:
-                    if row.objectId == CONTROL_OBJECT_ID or row.deleted:
-                        continue
-                    if isinstance(parent, str) and parent and not row.path.startswith(parent):
-                        continue
-                    if skipped < offset:
-                        skipped += 1
-                        continue
-                    if len(entries) < limit:
-                        entries.append({'path': row.path, 'objectId': row.objectId})
-                scanned += len(page.items)
-                if not page.next_cursor or scanned >= _OBJDIR_SCAN_MAX:
-                    break
-                cursor = page.next_cursor
-        except StoreUnsupported:
+        entries: Optional[List[Dict[str, str]]] = None
+        if 'listDocuments' in store.capabilities():
+            try:
+                entries = self._vectordb_objdir_listing(store, parent, offset, limit)
+            except StoreUnsupported:
+                entries = None
+        if entries is None:
             legacy = store.getPaths(parent=parent, offset=offset, limit=limit) or {}
             entries = [
                 {'path': str(path), 'objectId': str(oid)}
@@ -1757,6 +1739,39 @@ class VectorStoreToolMixin(VectorExplorerTools):
         for entry in entries:
             paths.setdefault(entry['path'], entry['objectId'])
         return {'success': True, 'paths': paths, 'entries': entries}
+
+    @staticmethod
+    def _vectordb_objdir_listing(
+        store: 'DocumentStoreBase', parent: Any, offset: int, limit: int
+    ) -> List[Dict[str, str]]:
+        """``objdir`` entries from a native ``listDocuments``: active documents under ``parent``, paged."""
+        entries: List[Dict[str, str]] = []
+        skipped = 0
+        scanned = 0
+        cursor: Optional[str] = None
+        while len(entries) < limit:
+            page = store.listDocuments(
+                cursor=cursor,
+                limit=VECTOR_TOOL_LIMITS['documents_page'],
+                object_ids=None,
+                deleted='active',
+                sort='path',
+            )
+            for row in page.items:
+                if row.objectId == CONTROL_OBJECT_ID or row.deleted:
+                    continue
+                if isinstance(parent, str) and parent and not row.path.startswith(parent):
+                    continue
+                if skipped < offset:
+                    skipped += 1
+                    continue
+                if len(entries) < limit:
+                    entries.append({'path': row.path, 'objectId': row.objectId})
+            scanned += len(page.items)
+            if not page.next_cursor or scanned >= _OBJDIR_SCAN_MAX:
+                break
+            cursor = page.next_cursor
+        return entries
 
     @tool_function(
         input_schema={
