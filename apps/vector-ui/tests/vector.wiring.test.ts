@@ -77,6 +77,7 @@ test('every lane file exists (the premise of the checks below)', () => {
 
 test('the console is the first view of a connection: the landing and the sidebar open its console', () => {
 	assert.match(code('views/ConnectionsView.tsx'), /openStaticDocument\(consoleUri\(endpoint\.key\)/);
+	assert.match(code('views/ConnectionsView.tsx'), /Elasticsearch and OpenSearch stores are not listed\./, "the landing's help text says which stores are left out");
 	assert.match(code('VectorSidebar.tsx'), /openConsole\(endpoint\)/);
 	const app = code('VectorApp.tsx');
 	assert.match(app, /if \(isConsoleUri\(uri\)\)[\s\S]*<ConsoleView key=\{uri\} opened=\{payload\.endpoint\} active=\{active\} \/>/);

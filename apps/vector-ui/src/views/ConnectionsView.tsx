@@ -97,7 +97,7 @@ export const ConnectionsView: React.FC = () => {
 		<div style={styles.root}>
 			<ContentHeader
 				title="Connections"
-				subtitle="Vector stores reachable through your running pipelines. A connection is a store node a pipeline's Tools source controls; a pipeline without one is listed read-only."
+				subtitle="Vector stores reachable through your running pipelines. A connection is a store node a pipeline's Tools source controls; a pipeline without one is listed read-only. Elasticsearch and OpenSearch stores are not listed."
 				actions={
 					<Button variant="ghost" onClick={refresh} disabled={!client || status === 'loading'}>
 						{status === 'loading' ? 'Refreshing…' : 'Refresh'}
