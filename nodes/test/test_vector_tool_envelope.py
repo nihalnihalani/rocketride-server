@@ -21,8 +21,9 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Dict
 
 import numpy as np
 import pytest
@@ -354,3 +355,122 @@ def test_tool_function_records_the_audience_it_is_given():
         return {}
 
     assert probe.__tool_meta__['audience'] == ('dap',)
+
+
+# ---------------------------------------------------------------------------
+# Wire shapes agree with the app's fixtures
+# ---------------------------------------------------------------------------
+
+_FIXTURES = Path(__file__).resolve().parents[2] / 'apps' / 'vector-ui' / 'tests' / 'fixtures' / 'provisional'
+
+#: Keys an answer may carry beyond the fixture, or leave out when they do not apply
+#: (``range`` is optional in ``dialect.score``: a driver reports it when it knows it).
+_OPTIONAL = {'caveats', 'warnings', 'similarities', 'not_found', 'range'}
+
+
+def _fixture(name: str) -> Dict[str, Any]:
+    return json.loads((_FIXTURES / f'{name}.json').read_text(encoding='utf-8'))
+
+
+def _same_keys(answer: Dict[str, Any], fixture: Dict[str, Any], where: str) -> None:
+    mine, theirs = set(answer), set(fixture)
+    assert theirs - _OPTIONAL <= mine, f'{where}: missing {sorted(theirs - _OPTIONAL - mine)}'
+    assert mine <= theirs | _OPTIONAL, f'{where}: unexpected {sorted(mine - theirs - _OPTIONAL)}'
+
+
+@pytest.fixture
+def wired(monkeypatch):
+    """A node over a counting, vector-capable store with a sample drawn."""
+    from ai.common.store import vx_write_gate
+
+    from .test_vectordb_tool_mixin import clustered, node
+
+    monkeypatch.setattr(
+        vx_write_gate,
+        '_current_tool_call',
+        lambda: {'origin': 'dap', 'source_type': 'tools', 'targeted': True, 'caller': {'auth': 'account'}},
+    )
+    store = clustered(docs=4, chunks=5)
+    inst = node(store, allow_writes=True)
+    sample = inst.sample({'n': 12, 'seed': 7})
+    return store, inst, sample
+
+
+def test_dialect_matches_the_fixture(wired):
+    _store, inst, _sample = wired
+    answer, fixture = inst.dialect({}), _fixture('dialect_pgvector')
+    _same_keys(answer, fixture, 'dialect')
+    for part in ('score', 'limits', 'health'):
+        _same_keys(answer[part], fixture[part], f'dialect.{part}')
+    assert set(answer['capabilities']) == set(fixture['capabilities'])
+
+
+def test_stats_matches_the_fixture(wired):
+    _store, inst, _sample = wired
+    _same_keys(inst.stats({}), _fixture('stats_pgvector'), 'stats')
+    _same_keys(_node(MemoryStore()).stats({}), _fixture('stats_collection_missing_legacy'), 'stats(missing)')
+
+
+def test_documents_matches_the_fixture(wired):
+    _store, inst, _sample = wired
+    answer, fixture = inst.documents({}), _fixture('documents_page1')
+    _same_keys(answer, fixture, 'documents')
+    _same_keys(answer['items'][0], fixture['items'][0], 'documents.items[]')
+
+
+def test_chunks_matches_the_fixture(wired):
+    _store, inst, _sample = wired
+    answer, fixture = inst.chunks({'object_id': 'doc00', 'limit': 2}), _fixture('chunks_page')
+    _same_keys(answer, fixture, 'chunks')
+    _same_keys(answer['items'][0], fixture['items'][0], 'chunks.items[]')
+
+
+def test_sample_matches_the_fixtures(wired):
+    _store, _inst, sample = wired
+    for name in ('sample_demo_1000', 'sample_biased_refilled', 'sample_native_knn'):
+        fixture = _fixture(name)
+        _same_keys(sample, fixture, name)
+        _same_keys(sample['points'], fixture['points'], f'{name}.points')
+        _same_keys(sample['knn'], fixture['knn'], f'{name}.knn')
+        _same_keys(sample['docs'][0], fixture['docs'][0], f'{name}.docs[]')
+        _same_keys(sample['pca'], fixture['pca'], f'{name}.pca')
+        _same_keys(sample['of'], fixture['of'], f'{name}.of')
+
+
+def test_project_matches_the_fixtures(wired):
+    store, inst, sample = wired
+    by_vector = inst.project(
+        {'sample_id': sample['sample_id'], 'vector': store.rows[('doc00', 0)].embedding, 'with_similarities': True}
+    )
+    by_keys = inst.project({'sample_id': sample['sample_id'], 'keys': [['doc00', 0], ['doc03', 4]]})
+    _same_keys(by_vector, _fixture('project_vector'), 'project(vector)')
+    _same_keys(by_keys, _fixture('project_keys'), 'project(keys)')
+    _same_keys(by_keys['items'][0], _fixture('project_keys')['items'][0], 'project.items[]')
+
+
+def test_neighbors_matches_the_fixtures(wired):
+    _store, inst, _sample = wired
+    answer, fixture = inst.neighbors({'key': ['doc00', 0]}), _fixture('neighbors_key')
+    _same_keys(answer, fixture, 'neighbors')
+    _same_keys(answer['items'][0], fixture['items'][0], 'neighbors.items[]')
+    scoped = inst.neighbors({'key': ['doc00', 0], 'scope_keys': [['doc01', 0]]})
+    _same_keys(scoped, _fixture('neighbors_scope_scores'), 'neighbors(scope)')
+
+
+def test_search_matches_the_fixture(wired):
+    store, inst, _sample = wired
+    answer, fixture = inst.search({'vector': store.rows[('doc00', 0)].embedding}), _fixture('search_vector')
+    _same_keys(answer, fixture, 'search')
+    _same_keys(answer['results'][0], fixture['results'][0], 'search.results[]')
+
+
+def test_remove_document_matches_the_fixture(wired):
+    _store, inst, _sample = wired
+    answer, fixture = inst.remove_document({'object_ids': ['doc01']}), _fixture('remove_document_ok')
+    _same_keys(answer, fixture, 'remove_document')
+    _same_keys(answer['audit'], fixture['audit'], 'remove_document.audit')
+    _same_keys(answer['removed'][0], fixture['removed'][0], 'remove_document.removed[]')
+
+
+def test_every_documented_code_has_an_app_sentence():
+    assert set(_fixture('errors')) == set(TOOL_CODES)
