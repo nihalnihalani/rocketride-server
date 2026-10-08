@@ -755,6 +755,21 @@ class TestRocketrideVectorNode:
         assert issubclass(rv.IInstance, StoreInstanceBase) and issubclass(rv.IInstance, VectorStoreToolMixin)
         assert issubclass(rv.Store, PgVectorStore)
 
+    def test_services_declare_the_tool_and_the_write_switches(self):
+        from ai.common.store.vx_defaults import VECTOR_AGENT_WRITES_DEFAULT, VECTOR_ALLOW_WRITES_DEFAULT
+
+        text = (_VEC_NODE_DIR / 'services.json').read_text(encoding='utf-8')
+        text = '\n'.join(line for line in text.splitlines() if not line.strip().startswith('//'))
+        services = json.loads(text)
+        assert services['classType'] == ['store', 'tool']
+        assert services['capabilities'] == ['invoke']
+        fields = services['fields']
+        assert fields['rrvector.allow_writes']['default'] is VECTOR_ALLOW_WRITES_DEFAULT
+        assert fields['rrvector.agent_writes']['default'] is VECTOR_AGENT_WRITES_DEFAULT
+        assert {'rrvector.allow_writes', 'rrvector.agent_writes'} <= set(fields['rrvector.cloud']['properties'])
+        # The default lives in vx_defaults only: no profile pins it.
+        assert all('allow_writes' not in profile for profile in services['preconfig']['profiles'].values())
+
     def test_begin_global_opens_the_store_and_keys_on_the_tenant(self, rv, table):
         glb, inst = _begin_vector_node(rv, {'collection': table, 'similarity': 'cosine'})
         try:
@@ -788,3 +803,54 @@ class TestRocketrideVectorNode:
             assert (stats['model'], stats['vector_size'], stats['count']) == ('test-model', DIMS, 2)
         finally:
             reader.endGlobal()
+
+    @pytest.mark.skip(reason='NEEDS:L1,L0 merged — integration gate G2')
+    def test_writes_refused_with_the_switch_off(self, rv, table):
+        """A DAP call from a Tools source is refused while rrvector.allow_writes is off; the rows stay."""
+        from ai.common.tool_context import ToolCallContext, tool_call
+
+        rng = np.random.default_rng(42)
+        glb, inst = _begin_vector_node(rv, {'collection': table, 'similarity': 'cosine', 'allow_writes': False})
+        try:
+            glb.store.addChunks(
+                [
+                    rv.Doc(
+                        page_content='kept',
+                        metadata=rv.DocMetadata(objectId='doc', chunkId=0, isDeleted=False),
+                        embedding=_unit_vec(rng),
+                        embedding_model='test-model',
+                    )
+                ]
+            )
+            ctx = ToolCallContext(origin='dap', source_type='tools', targeted=True, caller={'auth': 'account'})
+            with tool_call(ctx):
+                removed = inst.remove_document({'object_ids': ['doc']})
+                deleted = inst.delete({'object_ids': ['doc']})
+            assert removed['success'] is False and removed['code'] == 'WRITES_DISABLED'
+            assert deleted['success'] is False and deleted['code'] == 'WRITES_DISABLED'
+            assert glb.store.countChunks(rv.DocFilter()) == 1
+        finally:
+            glb.endGlobal()
+
+    @pytest.mark.skip(reason='NEEDS:L1,L0 merged — integration gate G2')
+    def test_writes_refused_without_a_call_context(self, rv, table):
+        """With the switch on, a call that carries no call context is refused; the rows stay."""
+        rng = np.random.default_rng(43)
+        glb, inst = _begin_vector_node(rv, {'collection': table, 'similarity': 'cosine', 'allow_writes': True})
+        try:
+            glb.store.addChunks(
+                [
+                    rv.Doc(
+                        page_content='kept',
+                        metadata=rv.DocMetadata(objectId='doc', chunkId=0, isDeleted=False),
+                        embedding=_unit_vec(rng),
+                        embedding_model='test-model',
+                    )
+                ]
+            )
+            for tool in (inst.remove_document, inst.delete):
+                answer = tool({'object_ids': ['doc']})
+                assert answer['success'] is False and answer['code'] == 'WRITES_UNKNOWN_CALLER'
+            assert glb.store.countChunks(rv.DocFilter()) == 1
+        finally:
+            glb.endGlobal()

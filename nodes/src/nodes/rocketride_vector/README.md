@@ -7,12 +7,18 @@ document search.
 
 ## What it does
 
-The node writes documents from the documents lane into a pgvector-backed table,
-replacing existing chunks for the same object IDs. Questions can produce
-matching documents, answers, or enriched questions through the three configured
-question outputs. Use it when retrieval should flow through a pipeline; unlike
-the tool-capable sibling stores, this node registers no agent tools or raw-SQL
-execution surface.
+The node writes documents from the documents lane into a pgvector-backed table.
+A batch that carries a document's first chunk replaces every chunk stored for
+that document; a later batch of the same document adds its chunks, so a long
+document that the embedding node sends in several batches is stored whole.
+Questions can produce matching documents, answers, or enriched questions through
+the three configured question outputs. The node is also a tool: an agent can
+search the table and manage its documents, and the Vector Explorer app browses,
+maps and edits it through a Tools source.
+
+It stores through the same pgvector driver as the PostgreSQL store
+(`store_postgres`); the two differ only in how they reach the database and in
+their configuration.
 
 ## Lanes
 
@@ -22,6 +28,25 @@ execution surface.
 | questions | documents | Returns matching documents. |
 | questions | answers | Returns matching documents as answers. |
 | questions | questions | Enriches a question with matching documents. |
+
+## As a tool
+
+The tool-server name is `rocketride_vector`.
+
+| Function | Description |
+| --- | --- |
+| `search` | Searches the table for a non-empty `query`; accepts an optional `top_k` and a metadata `filter`, and returns matching content, metadata and scores. Needs an embedding provider bound to the node. |
+| `upsert` | Adds or replaces documents from a non-empty `documents` array; each needs `content` and an `object_id`. |
+| `delete` | Removes every chunk of the documents in a non-empty `object_ids` array. |
+| `objdir` | Lists the stored document paths, optionally under a `parent` path, with `offset` and `limit`. |
+| `get` | Returns the chunks of one `object_id` in chunk order, with `offset` and `limit`. |
+| `stats` | Reports the number of stored rows, the embedding model and the vector size. |
+
+`upsert` and `delete` change the table. When an agent in the pipeline calls
+them, Allow agent writes decides; when a Tools source calls them (an SDK script,
+or the Vector Explorer), Allow document management from tool calls decides, and
+it is off by default. The collection's control record (object ID `schema`) can
+never be removed or overwritten through a tool.
 
 ## Configuration
 
@@ -41,7 +66,12 @@ and embeddings. Choose a distinct table when separate corpora need separate
 retrieval indexes or retention behavior. The node accepts only an unquoted
 PostgreSQL identifier: it must start with a letter or underscore, use only
 letters, digits, and underscores, and be at most 63 characters. Invalid names
-are rejected during configuration validation and at startup.
+are rejected during configuration validation and at startup. The name is used
+in lower case, as PostgreSQL itself would read it (`MyDocs` is the table
+`mydocs`).
+
+The table is shared by every pipeline of the organization that names it: they
+all read and write the same rows.
 
 ### Score threshold and similarity metric
 
@@ -67,21 +97,49 @@ supported ranges (m 2–100 and ef_construction 4–1,000), and ef_construction 
 raised to at least twice m. These values do not rebuild an index that already
 exists.
 
+### Write switches
+
+Allow document management from tool calls (`allow_writes`) is off by default.
+Turn it on in the pipeline whose Tools source should be able to remove documents
+from the table, for example the pipeline the Vector Explorer manages. Even when
+it is on, a removal is accepted only from a Tools source of the pipeline,
+addressed to this node; calls from the pipeline's chat or ingest sources are
+refused. Because the table is shared by the organization's pipelines, removing a
+document removes it for all of them.
+
+Allow agent writes (`agent_writes`) is on by default and keeps an agent's
+`upsert` and `delete` calls working as before. Turn it off when the agents of
+this pipeline should only search.
+
 ## Notes
 
 ### Storage and retrieval behavior
 
-The node creates the table on the first write and creates a metric-compatible
-HNSW index then. pgvector cannot create that index for embeddings wider than
-2,000 dimensions, so the node warns and searches without the index in that
-case. Keyword search uses a content LIKE match; semantic search needs an
-embedding bound to the question and raises if none is available. Missing tables
-produce empty search results rather than an error.
+The node creates the table on the first write, with an index on object ID and
+chunk ID and, up to 2,000 dimensions, a metric-compatible HNSW index. pgvector
+cannot create the HNSW index for wider embeddings, so the node warns and
+searches without it in that case. Metadata the table has no column for, such as
+a file's size or ingest time, is kept in a `meta` JSON column. A table written by
+an earlier version of the node gets that column when the node starts; if
+another session holds the table at that moment, the node writes without it for
+now (the extra metadata is not stored) and tries again at most once a minute.
 
-Deleted objects are excluded by default, while document rendering reassembles
-stored chunks by chunkId. The store removes all existing chunks for incoming
-object IDs before inserting the replacement chunks, preventing duplicate data
-for a re-ingested object.
+Keyword search is a case-insensitive substring match on the question text.
+Semantic search needs an embedding bound to the question and raises if none is
+available; filtered searches keep scanning the HNSW index until they have enough
+rows. Missing tables produce empty search results rather than an error. Deleted
+objects are excluded by default, while document rendering reassembles stored
+chunks in chunkId order.
+
+### Connections
+
+The node opens at most four connections to the database, only when it needs
+them, and closes a connection that stayed idle for a minute. Every call runs in
+one short transaction that always ends: reads are read-only and limited to 30
+seconds per statement, and a batch of writes is applied together or not at all,
+one batch at a time across every pipeline writing the table. Nothing is set for
+the database session, so the node works through a transaction-mode connection
+pooler. Errors never name the database server, user or database.
 
 <!-- ROCKETRIDE:GENERATED:PARAMS START -->
 <!-- Generated by nodes:docs-generate. Do not edit by hand. -->
