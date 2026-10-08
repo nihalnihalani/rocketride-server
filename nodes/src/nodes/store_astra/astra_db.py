@@ -835,10 +835,10 @@ class Store(DocumentStoreBase):
         sort: str,
     ) -> DocPage:
         """
-        One page of documents: chunk-0 documents by offset (ordered by objectId so skip is allowed),
-        with per-document chunk counts.
+        One page of documents: chunk-0 documents by offset (ordered by objectId so skip is allowed).
 
-        A document whose chunk 0 is missing is not listed. Counts above the count ceiling are unknown.
+        A document whose chunk 0 is missing is not listed. Chunk counts are not reported (one count
+        request per document is too costly); the total is unknown above the count ceiling.
         """
         offset, previous_first = _decode_cursor(cursor)
         limit = max(1, int(limit))
@@ -883,8 +883,9 @@ class Store(DocumentStoreBase):
         has_more = len(documents) > limit
         documents = documents[:limit]
 
+        # No chunk counts: the Data API has no group-by, and a count per document would cost one
+        # request per row (the contract allows chunks=None when counting is not cheap)
         items: List[DocumentRow] = []
-        exact = True
         seen = set()
         for document in documents:
             meta = document.get('meta') or {}
@@ -892,13 +893,11 @@ class Store(DocumentStoreBase):
             if not object_id or object_id in seen:
                 continue
             seen.add(object_id)
-            chunks = self._countWhere(self._convertFilter(DocFilter(objectIds=[object_id]), deleted=deleted))
-            exact = exact and chunks is not None
             items.append(
                 DocumentRow(
                     objectId=object_id,
                     path=meta.get('parent') or '',
-                    chunks=chunks,
+                    chunks=None,
                     has_first_chunk=True,
                     deleted=bool(meta.get('isDeleted')),
                     tables=None,
@@ -915,7 +914,7 @@ class Store(DocumentStoreBase):
             items=items,
             next_cursor=_encode_cursor(offset + limit, first) if has_more else None,
             total=self._countWhere(first_chunks),
-            counts_exact=exact,
+            counts_exact=False,
             distinct=False,
             sorted=False,
             caveats=caveats,

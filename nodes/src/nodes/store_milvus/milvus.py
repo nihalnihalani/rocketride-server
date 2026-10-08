@@ -970,7 +970,8 @@ class Store(DocumentStoreBase):
         sort: str,
     ) -> DocPage:
         """
-        One page of documents: chunk-0 rows by offset, with per-document chunk counts.
+        One page of documents: chunk-0 rows by offset, with per-document chunk counts tallied
+        from one query over the page's chunks.
 
         Milvus has no group-by on scalar fields, so a document is listed by its chunk 0
         (a document without one is not listed) and the rows arrive in storage order.
@@ -1027,6 +1028,30 @@ class Store(DocumentStoreBase):
             # The window ended on a full page: more documents may exist beyond it
             caveats = caveats + ['documents_paging_unsupported']
         rows = rows[:limit]
+        page_ids: List[str] = []
+        for row in rows:
+            object_id = _plain_meta(row.get('meta')).get('objectId')
+            if object_id and object_id not in page_ids:
+                page_ids.append(object_id)
+
+        # Chunk counts for the whole page from one query (Milvus has no group-by on JSON fields):
+        # the page's chunk rows, tallied here. A page with more chunks than one query returns has
+        # no counts rather than one count query per document.
+        counts: Dict[str, int] = {}
+        counts_exact = True
+        if page_ids:
+            chunk_rows = self.client.query(
+                collection_name=self.collection,
+                filter=' and '.join(self._convertFilter(DocFilter(objectIds=page_ids), deleted=deleted)),
+                output_fields=['meta'],
+                limit=MAX_QUERY_WINDOW,
+            )
+            if len(chunk_rows) >= MAX_QUERY_WINDOW:
+                counts_exact = False
+            else:
+                for chunk_row in chunk_rows:
+                    object_id = _plain_meta(chunk_row.get('meta')).get('objectId')
+                    counts[object_id] = counts.get(object_id, 0) + 1
 
         items: List[DocumentRow] = []
         seen = set()
@@ -1036,12 +1061,11 @@ class Store(DocumentStoreBase):
             if not object_id or object_id in seen:
                 continue
             seen.add(object_id)
-            chunk_conditions = self._convertFilter(DocFilter(objectIds=[object_id]), deleted=deleted)
             items.append(
                 DocumentRow(
                     objectId=object_id,
                     path=meta.get('parent') or '',
-                    chunks=self._countWhere(chunk_conditions),
+                    chunks=counts.get(object_id) if counts_exact else None,
                     has_first_chunk=True,
                     deleted=bool(meta.get('isDeleted')),
                     tables=None,
@@ -1058,7 +1082,7 @@ class Store(DocumentStoreBase):
             items=items,
             next_cursor=_encode_cursor(offset + limit, first) if has_more else None,
             total=self._countWhere(conditions),
-            counts_exact=True,
+            counts_exact=counts_exact,
             distinct=False,
             sorted=False,
             caveats=caveats,

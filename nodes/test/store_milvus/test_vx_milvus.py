@@ -114,3 +114,16 @@ def test_listing_stops_with_a_note_at_the_query_window(adapter, store, monkeypat
     assert len({row.objectId for row in rows}) == 4
     assert pages[-1].next_cursor is None
     assert 'documents_paging_unsupported' in pages[-1].caveats
+
+
+def test_listing_counts_are_unknown_when_a_page_has_more_chunks_than_one_query(adapter, store, monkeypatch):
+    """The page's chunks are tallied from one query; past Milvus' result window the counts are None, not wrong."""
+    monkeypatch.setattr(adapter.module, 'MAX_QUERY_WINDOW', 5)
+    for i in range(3):
+        h.ingest(store, f'doc-{i}', f'/docs/{i}.md', [0, 1, 2])
+    page = store.listDocuments(cursor=None, limit=2, object_ids=None, deleted='active', sort='path')
+    assert len(page.items) == 2
+    assert page.counts_exact is False
+    assert [row.chunks for row in page.items] == [None, None]
+    small = store.listDocuments(cursor=None, limit=1, object_ids=None, deleted='active', sort='path')
+    assert small.counts_exact is True and small.items[0].chunks == 3

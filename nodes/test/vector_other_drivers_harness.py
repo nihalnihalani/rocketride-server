@@ -248,6 +248,37 @@ class FailingProxy:
         raise self._error
 
 
+class CountingProxy:
+    """Wraps a client object and counts the calls made through it.
+
+    Attribute chains (``collection.query.fetch_objects``) are counted too. The results of
+    the calls named in ``wrap_results`` (``Index``, ``get_collection``) are wrapped as well,
+    so calls on the object they return are counted.
+    """
+
+    def __init__(self, target: Any, counter: Dict[str, int], wrap_results: Sequence[str] = ()) -> None:
+        """Remember the target, the shared counter and which call results to wrap."""
+        self._target = target
+        self._counter = counter
+        self._wrap_results = tuple(wrap_results)
+
+    def __getattr__(self, name: str) -> Any:
+        """A counting wrapper for methods and sub-objects; plain values as they are."""
+        value = getattr(self._target, name)
+        if callable(value) and not isinstance(value, type):
+            wrap = name in self._wrap_results
+
+            def call(*args: Any, **kwargs: Any) -> Any:
+                self._counter['calls'] += 1
+                result = value(*args, **kwargs)
+                return CountingProxy(result, self._counter, self._wrap_results) if wrap else result
+
+            return call
+        if value is None or isinstance(value, (str, bytes, int, float, bool, dict, list, tuple, set)):
+            return value
+        return CountingProxy(value, self._counter, self._wrap_results)
+
+
 class Adapter:
     """What the shared suite needs from one driver."""
 
@@ -298,6 +329,10 @@ class Adapter:
 
     def fail_backend(self, store: Any, error: BaseException, *, after_exists: bool) -> None:  # pragma: no cover
         """Make every client call raise ``error`` (``after_exists``: the existence check still answers)."""
+        raise NotImplementedError
+
+    def count_calls(self, store: Any) -> Dict[str, int]:  # pragma: no cover - interface
+        """Count every backend call the store makes from now on; returns the live counter."""
         raise NotImplementedError
 
 
@@ -443,6 +478,12 @@ class MilvusAdapter(Adapter):
         """Every MilvusClient call raises (has_collection still answers when ``after_exists``)."""
         store.client = FailingProxy(error, store.client, ('has_collection',) if after_exists else ())
 
+    def count_calls(self, store: Any) -> Dict[str, int]:
+        """Count MilvusClient calls."""
+        counter = {'calls': 0}
+        store.client = CountingProxy(store.client, counter)
+        return counter
+
     def seed_legacy(self, store: Any) -> None:
         """Rows as today's driver wrote them: random int64 ids, declared fields only."""
         store._createCollection(DIM)
@@ -544,6 +585,14 @@ class WeaviateAdapter(Adapter):
         # close() still reaches the mock so the store's destructor stays quiet
         store.client = FailingProxy(error, store.client, ('close',))
         store.collectionObj = FailingProxy(error)
+
+    def count_calls(self, store: Any) -> Dict[str, int]:
+        """Count client and collection calls."""
+        store._doesCollectionExist()
+        counter = {'calls': 0}
+        store.client = CountingProxy(store.client, counter)
+        store.collectionObj = CountingProxy(store.collectionObj, counter)
+        return counter
 
     def seed_legacy(self, store: Any) -> None:
         """Objects as today's driver wrote them: content-hash ids, declared fields only."""
@@ -648,6 +697,12 @@ class PineconeAdapter(Adapter):
     def fail_backend(self, store: Any, error: BaseException, *, after_exists: bool) -> None:
         """Every client call raises (has_index still answers when ``after_exists``)."""
         store.client = FailingProxy(error, store.client, ('has_index',) if after_exists else ())
+
+    def count_calls(self, store: Any) -> Dict[str, int]:
+        """Count control-plane calls and calls on the index objects the client hands out."""
+        counter = {'calls': 0}
+        store.client = CountingProxy(store.client, counter, ('Index',))
+        return counter
 
     def seed_legacy(self, store: Any) -> None:
         """Vectors as today's driver wrote them: uuid4 ids, declared fields plus content."""
@@ -765,6 +820,7 @@ class AstraAdapter(Adapter):
     offset_raises = False
     extras_stored = False
     legacy_control_has_model = False
+    listing_counts = False
 
     def __init__(self) -> None:
         """Load the driver against the astrapy mock."""
@@ -799,6 +855,12 @@ class AstraAdapter(Adapter):
     def fail_backend(self, store: Any, error: BaseException, *, after_exists: bool) -> None:
         """Every database call raises (list_collection_names still answers when ``after_exists``)."""
         store.database = FailingProxy(error, store.database, ('list_collection_names',) if after_exists else ())
+
+    def count_calls(self, store: Any) -> Dict[str, int]:
+        """Count database calls and calls on the collections it hands out."""
+        counter = {'calls': 0}
+        store.database = CountingProxy(store.database, counter, ('get_collection',))
+        return counter
 
     def seed_legacy(self, store: Any) -> None:
         """Documents as today's driver wrote them: uuid4 ids, declared fields with explicit nulls."""
@@ -934,6 +996,13 @@ class AtlasAdapter(Adapter):
         """Every database and collection call raises (list_collection_names answers when ``after_exists``)."""
         store.database = FailingProxy(error, store.database, ('list_collection_names',) if after_exists else ())
         store.collection = FailingProxy(error)
+
+    def count_calls(self, store: Any) -> Dict[str, int]:
+        """Count database and collection calls."""
+        counter = {'calls': 0}
+        store.database = CountingProxy(store.database, counter)
+        store.collection = CountingProxy(store.collection, counter)
+        return counter
 
     def ignore_offsets(self, store: Any) -> None:
         """Drop $skip stages and cursor skips."""

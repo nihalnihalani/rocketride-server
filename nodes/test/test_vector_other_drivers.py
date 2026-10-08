@@ -217,6 +217,20 @@ def test_listing_pages_cover_every_document_once(adapter, store):
         assert paths == sorted(paths)
 
 
+def test_listing_costs_the_same_backend_calls_whatever_the_page_size(adapter, store):
+    """A page of 12 documents costs no more backend calls than a page of 3 (no count per document)."""
+    for i in range(12):
+        h.ingest(store, f'doc-{i:02d}', f'/docs/{i:02d}.md', [0, 1, 2])
+    store.listDocuments(cursor=None, limit=1, object_ids=None, deleted='active', sort='path')  # fills driver caches
+    counter = adapter.count_calls(store)
+    small = store.listDocuments(cursor=None, limit=3, object_ids=None, deleted='active', sort='path')
+    small_calls, counter['calls'] = counter['calls'], 0
+    large = store.listDocuments(cursor=None, limit=12, object_ids=None, deleted='active', sort='path')
+    assert len(small.items) == 3 and len(large.items) == 12
+    assert counter['calls'] == small_calls, (small_calls, counter['calls'])
+    assert small_calls <= 5, small_calls
+
+
 def test_listing_filters_by_object_ids(adapter, store):
     """object_ids restricts the listing."""
     _ingest_five(store)
