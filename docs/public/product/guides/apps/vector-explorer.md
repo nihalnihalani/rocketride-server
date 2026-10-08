@@ -76,10 +76,11 @@ are never listed.
   ```
 
   `result['reused']` is `True` when the source was already running.
-- **Your store's connection details.** Type them into the store nodes' forms
-  (they are stored encrypted); the app never shows them.
-  `rocketride_vector` has none to type: it uses your organization's managed
-  RocketRide database.
+- **Your store's connection details.** Type them into the store nodes' forms.
+  The app never shows them, and store nodes never return them. A `.pipe` file
+  is plain JSON and keeps what you type as written, so treat it like any file
+  that holds a password. `rocketride_vector` has none to type: it uses your
+  organization's managed RocketRide database.
 - **A key for the chat's LLM.** The templates ship with the placeholder key
   `replace-with-your-key` and an empty `base_url` on the LLM node
   ([OpenAI-Compatible API](/nodes/llm_openai_api)). Replace the key, and set
