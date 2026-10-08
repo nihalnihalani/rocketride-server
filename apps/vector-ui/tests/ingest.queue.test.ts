@@ -275,6 +275,33 @@ test('queue: dispose in the middle of an upload forgets everything and ignores t
 	assert.deepEqual(queue.getState().rows, []);
 });
 
+test("queue: another app's events for a file of the same name do not decide the row; the result sendFiles returns does", async () => {
+	const started = deferred<void>();
+	const gate = deferred<void>();
+	const fake = fakeDeps({
+		async sendFiles(files: ISendFile[]) {
+			started.resolve();
+			await gate.promise;
+			return files.map((file) => ({ action: 'complete', filepath: file.file.name, bytes_sent: file.file.size, file_size: file.file.size, upload_time: 0.1 }));
+		},
+	});
+	const queue = createIngestQueue(fake.deps);
+	await queue.addDrop([candidate('x/report.pdf', 100)]);
+	await started.promise;
+	// The shell's event stream is shared by every app, and names a file by its base name only.
+	queue.handleEvent({ action: 'write', filepath: 'report.pdf', bytes_sent: 900, file_size: 999, upload_time: 0 });
+	assert.equal(queue.getState().rows[0].bytesSent, 0, 'a file of another size is another file');
+	queue.handleEvent({ action: 'error', filepath: 'report.pdf', bytes_sent: 3, file_size: 100, upload_time: 0, error: 'another app: pipe error' });
+	assert.notEqual(queue.getState().rows[0].status, 'failed');
+	gate.resolve();
+	await queue.idle();
+	const row = queue.getState().rows[0];
+	assert.equal(row.status, 'done');
+	assert.equal(uploadLabel(row), '2 chunks added');
+	assert.equal(row.detail, null);
+	assert.deepEqual(fake.changed, [[objectIdForPath('x/report.pdf')]]);
+});
+
 test('queue: dispose while the replace question is open sends nothing', async () => {
 	const fake = fakeDeps({ canProbe: false });
 	const queue = createIngestQueue(fake.deps);

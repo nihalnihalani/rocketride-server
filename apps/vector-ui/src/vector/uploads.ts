@@ -44,6 +44,9 @@
 //           file of that name in flight.
 //   ROWS    queued → uploading → processing → counting → "N chunks added",
 //           or failed with a sentence that does not pretend to know why.
+//           Events (which other apps' files of the same name can produce)
+//           only move a row through the sending states; the result sendFiles
+//           returns for the file ends it.
 // =============================================================================
 
 import type { ISendFile } from 'shared/explorer';
@@ -418,12 +421,20 @@ const PROGRESS: Partial<Record<UploadStatus, number>> = { queued: 0, uploading: 
 /**
  * Apply one upload event to the row of the file in flight.
  *
+ * Every app in the shell receives every upload event, and an event names its
+ * file by base name only, so an event may belong to another app's file of the
+ * same name. Events therefore only move a row through the sending states: an
+ * event whose file size is not this file's is ignored, and an 'error' event
+ * keeps the engine's words in `detail` without finishing the row. The result
+ * sendFiles returns for the file decides how it ends ({@link applyFinalResult}).
+ *
  * @param row - The row.
  * @param event - An `apaevt_status_upload` body.
  * @returns The new row (the same row when the event changes nothing).
  */
 export function applyUploadEvent(row: UploadRow, event: IUploadEvent): UploadRow {
 	if (FINISHED.has(row.status)) return row;
+	if (typeof event.file_size === 'number' && event.file_size > 0 && row.size > 0 && event.file_size !== row.size) return row;
 	const rank = PROGRESS[row.status] ?? 0;
 	const fileSize = typeof event.file_size === 'number' && event.file_size > 0 ? event.file_size : row.fileSize;
 	const bytesSent = typeof event.bytes_sent === 'number' ? Math.max(row.bytesSent, event.bytes_sent) : row.bytesSent;
@@ -436,26 +447,29 @@ export function applyUploadEvent(row: UploadRow, event: IUploadEvent): UploadRow
 		case 'complete':
 			return { ...row, status: 'counting', bytesSent, fileSize };
 		case 'error':
-			return { ...row, status: 'failed', bytesSent, fileSize, message: FAILED_SENTENCE, detail: typeof event.error === 'string' && event.error !== '' ? event.error : null };
+			// Provisional: it may be another app's file of the same name.
+			return { ...row, bytesSent, fileSize, detail: typeof event.error === 'string' && event.error !== '' ? event.error : row.detail };
 	}
 	return row;
 }
 
 /**
- * Apply the final result sendFiles returned for a file (authoritative).
+ * Apply the result sendFiles returned for a file. This alone ends a sending
+ * row: counting when the upload completed, failed (with the result's own
+ * error text) otherwise, whatever the events said before.
  *
  * @param row - The row.
  * @param result - The file's upload result.
- * @returns The new row: counting when the upload completed, failed otherwise.
+ * @returns The new row.
  */
 export function applyFinalResult(row: UploadRow, result: Record<string, unknown> | null | undefined): UploadRow {
 	if (FINISHED.has(row.status)) return row;
 	if (result && result.action === 'complete') {
 		const bytes = typeof result.bytes_sent === 'number' ? result.bytes_sent : row.bytesSent;
-		return { ...row, status: 'counting', bytesSent: Math.max(row.bytesSent, bytes) };
+		return { ...row, status: 'counting', bytesSent: Math.max(row.bytesSent, bytes), message: null, detail: null };
 	}
 	const error = result && typeof result.error === 'string' && result.error !== '' ? result.error : null;
-	return { ...row, status: 'failed', message: FAILED_SENTENCE, detail: error ?? row.detail };
+	return { ...row, status: 'failed', message: FAILED_SENTENCE, detail: error };
 }
 
 /**

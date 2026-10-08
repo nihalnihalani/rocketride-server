@@ -40,7 +40,7 @@ import { ExplorerToolError } from 'shared/explorer';
 import type { IUploadEvent } from '../src/contract/types';
 import type { ISendFile } from 'shared/explorer';
 import { objectIdForPath } from '../src/vector/objectId';
-import { ALLOWED_EXTENSIONS, CANCELLED_SENTENCE, FAILED_SENTENCE, UPLOAD_LIMITS, UPLOAD_ORIGIN, applyUploadEvent, batchForSend, classifyProbe, mimeTypeFor, normaliseFolderPrefix, normaliseRelPath, planDrop, replaceQuestion, sendFilesPayload, uploadLabel } from '../src/vector/uploads';
+import { ALLOWED_EXTENSIONS, CANCELLED_SENTENCE, FAILED_SENTENCE, FINISHED, UPLOAD_LIMITS, UPLOAD_ORIGIN, applyFinalResult, applyUploadEvent, batchForSend, classifyProbe, mimeTypeFor, normaliseFolderPrefix, normaliseRelPath, planDrop, replaceQuestion, sendFilesPayload, uploadLabel } from '../src/vector/uploads';
 import type { DropCandidate, PlannedUpload, UploadRow } from '../src/vector/uploads';
 import { createIngestQueue } from '../src/ingest/ingestQueue';
 import type { IngestDeps } from '../src/ingest/ingestQueue';
@@ -228,7 +228,7 @@ function queuedRow(file: PlannedUpload): UploadRow {
 	return { id: file.id, path: file.path, name: file.name, objectId: file.objectId, size: file.size, status: 'queued', bytesSent: 0, fileSize: file.size, chunks: null, existingChunks: null, message: null, detail: null };
 }
 
-test('applyUploadEvent: open, write, close and complete move a row forward; an error fails it honestly', () => {
+test('applyUploadEvent: open, write, close and complete move a row forward; an error event is only provisional', () => {
 	const events = fixture<{ events: IUploadEvent[] }>('upload_events.json').events;
 	const plan = planDrop([candidate('memo_q3.docx', 22016), candidate('scan_unreadable.pdf', 4096)]);
 	let memo = queuedRow(plan.accepted[0]);
@@ -243,13 +243,47 @@ test('applyUploadEvent: open, write, close and complete move a row forward; an e
 	assert.deepEqual(labels, ['Uploading… 0%', 'Uploading… 33%', 'Uploading… 67%', 'Uploading… 100%', 'Processing…', 'Counting chunks…']);
 	assert.equal(memo.status, 'counting');
 	assert.equal(memo.bytesSent, 22016);
-	assert.equal(scan.status, 'failed');
-	assert.equal(scan.message, FAILED_SENTENCE);
+	// Every app in the shell sees upload events, keyed by base name only, so an
+	// error event cannot finish a row: the engine's text is kept, the row waits.
+	assert.equal(scan.status, 'processing');
+	assert.equal(scan.message, null);
 	assert.equal(scan.detail, 'Pipe closed with an error');
+	// The result sendFiles returns for the file decides.
+	const failed = applyFinalResult(scan, events[events.length - 1] as unknown as Record<string, unknown>);
+	assert.equal(failed.status, 'failed');
+	assert.equal(failed.message, FAILED_SENTENCE);
+	assert.equal(failed.detail, 'Pipe closed with an error');
 	assert.equal(FAILED_SENTENCE, "Failed. The engine did not return the reason; the pipeline's run log may. The document was not added.");
 	// A row never moves backwards, and a finished row ignores late events.
 	assert.equal(applyUploadEvent({ ...memo, status: 'processing' }, events[1]).status, 'processing');
-	assert.equal(applyUploadEvent(scan, events[0]).status, 'failed');
+	assert.equal(applyUploadEvent(failed, events[0]).status, 'failed');
+});
+
+test('applyFinalResult: the result sendFiles returns decides, whatever the events said', () => {
+	const row: UploadRow = { ...queuedRow(planDrop([candidate('x/report.pdf', 100)]).accepted[0]), status: 'uploading' };
+	// Another app in the shell failed its own report.pdf of the same size.
+	const foreign = applyUploadEvent(row, { action: 'error', filepath: 'report.pdf', bytes_sent: 3, file_size: 100, upload_time: 0, error: 'another app: pipe error' });
+	assert.equal(FINISHED.has(foreign.status), false);
+	const done = applyFinalResult(foreign, { action: 'complete', filepath: 'report.pdf', bytes_sent: 100, file_size: 100, upload_time: 1 });
+	assert.equal(done.status, 'counting');
+	assert.equal(done.message, null);
+	assert.equal(done.detail, null, "the other app's text is not this file's");
+	const failed = applyFinalResult(foreign, { action: 'error', filepath: 'report.pdf', bytes_sent: 3, file_size: 100, upload_time: 1, error: 'Pipe closed with an error' });
+	assert.equal(failed.status, 'failed');
+	assert.equal(failed.detail, 'Pipe closed with an error');
+	// A failed result without a reason does not borrow an event's.
+	const silent = applyFinalResult(foreign, { action: 'error', filepath: 'report.pdf', bytes_sent: 3, file_size: 100, upload_time: 1 });
+	assert.equal(silent.status, 'failed');
+	assert.equal(silent.detail, null);
+	// No result at all is a failure.
+	assert.equal(applyFinalResult(foreign, null).status, 'failed');
+});
+
+test("applyUploadEvent: an event whose file size is not this file's belongs to another file of the same name", () => {
+	const row: UploadRow = { ...queuedRow(planDrop([candidate('x/report.pdf', 100)]).accepted[0]), status: 'uploading', bytesSent: 40 };
+	assert.equal(applyUploadEvent(row, { action: 'write', filepath: 'report.pdf', bytes_sent: 900, file_size: 999, upload_time: 0 }), row);
+	assert.equal(applyUploadEvent(row, { action: 'error', filepath: 'report.pdf', bytes_sent: 900, file_size: 999, upload_time: 0, error: 'x' }), row);
+	assert.equal(applyUploadEvent(row, { action: 'write', filepath: 'report.pdf', bytes_sent: 60, file_size: 100, upload_time: 0 }).bytesSent, 60);
 });
 
 test('uploadLabel: the finished states', () => {
