@@ -1571,7 +1571,8 @@ def _non_content(value: Any) -> Any:
     return value
 
 
-# Field names that hold a connection setting or a credential (whole names, any case): CONTRACT section 1.6.
+# Field names that hold a connection setting or a credential (whole names, any case); see the
+# principles of docs/development/nodes/vector-tool-contract.md: no reply carries a host, DSN or credential.
 SECRET_KEY = re.compile(
     r'^(host|hostname|dsn|password|passwd|pwd|user|username|port|url|uri|connection_?string|api_?key|secret|token)$',
     re.IGNORECASE,

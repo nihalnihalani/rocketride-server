@@ -12,6 +12,11 @@
 # test_vector_toolpath_full.py, test_vector_wire_fixtures_full.py) and run the
 # pgvector suites a second time through the transaction pooler; the manual
 # fixture and browser lanes are not run here (see README.md in this folder).
+# Written for the integrated branch: the vector-ui-test and apps-build steps
+# run builder actions (vector-ui:test, vector-ui:build) that exist once the
+# app lane is merged, so on a lane branch without the app those two fail.
+# The harness's JavaScript selftests need Node >= 18 (node --test); their
+# file list is expanded by the shell.
 #
 # Prerequisites: the containers from README.md (the nodes:test and
 # nodes:test-db steps require them via RR_REQUIRE_DB_TESTS=1, together with the
@@ -56,13 +61,17 @@ shown() {
 echo "pgvector pooler $(shown "$RR_TEST_PGVECTOR_POOLER_DSN")" | tee -a "$SUMMARY"
 echo "AGE pooler $(shown "$RR_TEST_AGE_POOLER_DSN")" | tee -a "$SUMMARY"
 
+CONSTANTS=packages/client-typescript/src/client/constants.ts
 step() {
 	local name=$1; shift
 	"$@" > "$LOGS/$name.log" 2>&1
 	local rc=$?
-	# The builder rewrites this file during builds; never leave it modified.
-	git checkout -- packages/client-typescript/src/client/constants.ts 2>/dev/null
 	printf '%-28s exit=%s\n' "$name" "$rc" | tee -a "$SUMMARY"
+	# The builder rewrites this file during builds; never leave it modified, and say so.
+	if ! git diff --quiet -- "$CONSTANTS" 2>/dev/null; then
+		git checkout -- "$CONSTANTS" 2>/dev/null
+		printf '%-28s restored %s (rewritten by this step)\n' '' "$CONSTANTS" | tee -a "$SUMMARY"
+	fi
 	STEPS=$((STEPS + 1))
 	if [ "$rc" -ne 0 ]; then FAILED=$((FAILED + 1)); fi
 }
@@ -71,7 +80,7 @@ FAILED=0
 
 # The acceptance harness's own selftests (no engine): a lane check that cannot observe what it names must fail
 step harness-selftest-py python3 -m unittest discover -s "$HERE/selftest"
-step harness-selftest-js node --test "$HERE/selftest/*.test.cjs"
+step harness-selftest-js node --test "$HERE"/selftest/*.test.cjs
 # Templates, chunking and the write default stay generated from their sources
 step corpus-check         sh -c 'd=$(mktemp -d) && python3 "$1/demo/gen_corpus.py" "$d" >/dev/null && python3 "$1/demo/gen_corpus.py" "$d" --check' sh "$HERE"
 step defaults-check       python3 apps/vector-ui/scripts/gen_defaults.py --check
