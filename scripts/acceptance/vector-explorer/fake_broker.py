@@ -12,11 +12,11 @@ database here. Logs only tenant ids and status codes, never the token or the DSN
 
 The defaults are the Vector Explorer lanes' (port 18788, the throwaway token
 ``local-broker-placeholder``, the gx-pgvector container directly). For the
-pooled pass, point ``--dsn`` at the vx-pgbouncer container instead:
-``postgresql://rruser:rrpass@127.0.0.1:56434/rrtenant``. Every default is a
+pooled pass, point ``--dsn`` at the vx-pgbouncer container instead
+(``--pooler`` is a shortcut): ``postgresql://rruser:rrpass@127.0.0.1:56434/rrtenant?sslmode=disable``. Every default is a
 LOCAL-ONLY test value for a disposable container, not a secret.
 
-Usage: python fake_broker.py [--port 18788] [--token TOKEN] [--dsn DSN]
+Usage: python fake_broker.py [--port 18788] [--token TOKEN] [--dsn DSN | --pooler]
 """
 
 import argparse
@@ -25,8 +25,10 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 DEFAULT_PORT = 18788
 DEFAULT_TOKEN = 'local-broker-placeholder'
-DIRECT_DSN = 'postgresql://rruser:rrpass@127.0.0.1:55432/rrtenant'
-POOLER_DSN = 'postgresql://rruser:rrpass@127.0.0.1:56434/rrtenant'
+# sslmode=disable: the engine appends sslmode=require to a broker DSN that names no sslmode and
+# accepts a DSN without TLS only when every host is a loopback host; the containers have no TLS.
+DIRECT_DSN = 'postgresql://rruser:rrpass@127.0.0.1:55432/rrtenant?sslmode=disable'
+POOLER_DSN = 'postgresql://rruser:rrpass@127.0.0.1:56434/rrtenant?sslmode=disable'
 
 
 def make_handler(token: str, dsn: str):
@@ -64,8 +66,10 @@ def main():
     parser = argparse.ArgumentParser(description='Local stand-in for the DB broker (disposable tests only).')
     parser.add_argument('--port', type=int, default=DEFAULT_PORT)
     parser.add_argument('--token', default=DEFAULT_TOKEN)
-    parser.add_argument('--dsn', default=DIRECT_DSN)
+    parser.add_argument('--dsn', default=None, help='default: the direct gx-pgvector DSN')
+    parser.add_argument('--pooler', action='store_true', help='answer with the vx-pgbouncer DSN')
     args = parser.parse_args()
+    args.dsn = args.dsn or (POOLER_DSN if args.pooler else DIRECT_DSN)
     server = HTTPServer(('127.0.0.1', args.port), make_handler(args.token, args.dsn))
     print(f'fake broker on http://127.0.0.1:{args.port}/provision', flush=True)
     try:
