@@ -82,6 +82,10 @@ def _same(a: Any, b: Any) -> bool:
     return a == b
 
 
+# Fewest $and/$or clauses the server refuses (see _matches_where).
+_MAX_WHERE_CLAUSES = 998
+
+
 def _number(value: Any) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool)
 
@@ -97,6 +101,10 @@ def _matches_where(metadata: Dict[str, Any], where: Optional[Dict[str, Any]]) ->
             raise ValueError(
                 f'Expected where value for {op} to be a list with at least two where expressions, got {clauses}'
             )
+        if len(clauses) >= _MAX_WHERE_CLAUSES:
+            # chromadb 1.5.9 answers 500 for an $or of 998 clauses (500 work): SQLite's
+            # expression tree depth limit of 1000. An $in list has no such limit.
+            raise RuntimeError('Expression tree is too large (maximum depth 1000)')
         results = [_matches_where(metadata, clause) for clause in clauses]
         return all(results) if op == '$and' else any(results)
     for field, condition in where.items():
@@ -108,6 +116,12 @@ def _matches_where(metadata: Dict[str, Any], where: Optional[Dict[str, Any]]) ->
                 ok = value is not _MISSING and _same(value, expected)
             elif op == '$ne':
                 ok = value is _MISSING or not _same(value, expected)
+            elif op in ('$in', '$nin') and (not isinstance(expected, list) or not expected):
+                # The server refuses an empty list (chromadb 1.5.9 validates it client side).
+                raise ValueError(
+                    'Expected where operand value to be a non-empty list, '
+                    f'and all values to be of the same type got {expected}'
+                )
             elif op == '$in':
                 ok = value is not _MISSING and any(_same(value, e) for e in expected)
             elif op == '$nin':

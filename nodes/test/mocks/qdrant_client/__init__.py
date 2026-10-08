@@ -74,6 +74,7 @@ Or manually:
 
 import copy
 import random
+import uuid
 from types import SimpleNamespace
 from typing import List, Any, Optional, Tuple, Dict
 from dataclasses import dataclass, field
@@ -289,6 +290,42 @@ def _lower_is_better(distance: str) -> bool:
     return distance in ('Euclid', 'Manhattan')
 
 
+def _is_point_id(value: Any) -> bool:
+    """Whether ``value`` is a point id the server accepts: an unsigned integer or a UUID string."""
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        return value >= 0
+    if isinstance(value, str):
+        try:
+            uuid.UUID(value)
+        except ValueError:
+            return False
+        return True
+    return False
+
+
+def _index_kind(entry: Any) -> str:
+    """The data type of a payload index entry ('keyword', 'integer', ...), as a plain string."""
+    kind = getattr(entry, 'data_type', None) or getattr(entry, 'type', None) or entry
+    return str(getattr(kind, 'value', kind) or '').lower()
+
+
+def _select_payload(payload: Dict[str, Any], keys: Any) -> Dict[str, Any]:
+    """The parts of ``payload`` a payload selector names; a dotted key keeps its nesting."""
+    out: Dict[str, Any] = {}
+    for key in keys:
+        value = _payload_value(payload, key)
+        if value is _MISSING:
+            continue
+        parts = str(key).split('.')
+        target = out
+        for part in parts[:-1]:
+            target = target.setdefault(part, {})
+        target[parts[-1]] = value
+    return out
+
+
 # =============================================================================
 # Mock QdrantClient
 # =============================================================================
@@ -333,6 +370,11 @@ class QdrantClient:
            server does too).
         6. query_points() scores by the collection's distance; a ``SampleQuery``
            draws random points.
+        7. facet() needs a keyword or integer index on its key (the server answers
+           400 "No appropriate index for faceting" otherwise).
+        8. A scroll ``offset`` must be a point id (unsigned integer or UUID);
+           anything else is a 400, as on the server.
+        9. A payload selector list may name nested keys (``['meta.objectId']``).
     """
 
     # -------------------------------------------------------------------------
@@ -391,7 +433,7 @@ class QdrantClient:
     def _record(point: PointStruct, with_payload: Any, with_vectors: Any) -> Record:
         payload = point.payload if with_payload else None
         if isinstance(with_payload, (list, tuple)):
-            payload = {k: v for k, v in (point.payload or {}).items() if k in with_payload}
+            payload = _select_payload(point.payload or {}, with_payload)
         return Record(id=point.id, payload=copy.deepcopy(payload), vector=list(point.vector) if with_vectors else None)
 
     def _select(self, collection_name: str, selector: Any) -> List[PointStruct]:
@@ -485,6 +527,8 @@ class QdrantClient:
         (as the real server does), optionally starting at ``start_from``.
         """
         QdrantClient._count_call('scroll')
+        if offset is not None and not _is_point_id(offset):
+            raise Exception(f'Bad request: Format error in JSON body: value {offset} is not a valid point ID')
         limit = 10 if limit is None else int(limit)
         points = self._sorted_points(collection_name, scroll_filter)
 
@@ -540,6 +584,9 @@ class QdrantClient:
     ) -> Any:
         """Count matching points per distinct value of ``key`` (highest counts first)."""
         QdrantClient._count_call('facet')
+        schema = QdrantClient._collections.get(collection_name, {}).get('payload_schema', {})
+        if _index_kind(schema.get(key)) not in ('keyword', 'integer', 'uuid'):
+            raise Exception(f'Bad request: Wrong input: No appropriate index for faceting: `{key}`')
         counts: Dict[Any, int] = {}
         for p in self._sorted_points(collection_name, facet_filter):
             value = _payload_value(p.payload, key)
