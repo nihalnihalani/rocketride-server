@@ -219,6 +219,8 @@ class Adapter:
     remove_counts: bool = True
     #: path of the services.json whose test cases are replayed (None: no cases)
     services: Optional[str] = None
+    #: whether the legacy control record kept vectorSize/modelName (Astra/Atlas wrote only declared fields)
+    legacy_control_has_model: bool = True
 
     def new_store(self) -> Any:  # pragma: no cover - interface
         raise NotImplementedError
@@ -620,3 +622,123 @@ class PineconeAdapter(Adapter):
                     store.client.Index = saved
 
         store.searchSemantic = search
+
+
+def legacy_document_rows() -> List[Tuple[str, int, Dict[str, Any], str]]:
+    """Legacy rows as Astra/Atlas wrote them (``metadata.__dict__``): explicit nulls, no control extras."""
+    rows = []
+    for object_id, chunk_id, meta, content in legacy_rows():
+        if object_id == 'schema':
+            meta = {
+                'objectId': 'schema',
+                'chunkId': 0,
+                'nodeId': None,
+                'parent': None,
+                'permissionId': None,
+                'isDeleted': True,
+                'isTable': None,
+                'tableId': None,
+            }
+        rows.append((object_id, chunk_id, {**meta, 'signature': None}, content))
+    return rows
+
+
+class AstraAdapter(Adapter):
+    """Astra DB through ``nodes/test/mocks/astrapy``."""
+
+    name = 'astra_db'
+    backend = 'astra'
+    services = 'store_astra/services.json'
+    floor = 0.2
+    offset_raises = False
+    extras_stored = False
+    legacy_control_has_model = False
+
+    def __init__(self) -> None:
+        """Load the driver against the astrapy mock."""
+        self.module, mocks = load_driver(
+            'store_astra/astra_db.py', '_vx_astra_driver', mock_libs=('astrapy',), preload=('astrapy.exceptions',)
+        )
+        self.mock = mocks['astrapy']
+
+    def new_store(self) -> Any:
+        """A store on an empty mock database."""
+        self.mock.Database.reset()
+        client = self.mock.DataAPIClient()
+        return bare_store(
+            self.module.Store,
+            collection_name='vx_test',
+            api_endpoint='https://db-id-region.apps.example.invalid',
+            similarity='cosine',
+            application_token=None,
+            threshold_search=0.5,
+            client=client,
+            database=client.get_database('https://db-id-region.apps.example.invalid', token=None),
+        )
+
+    def rows(self, store: Any) -> List[Dict[str, Any]]:
+        """The mock's documents for the collection."""
+        return self.mock.Database._data.setdefault(store.collection_name, [])
+
+    def seed_legacy(self, store: Any) -> None:
+        """Documents as today's driver wrote them: uuid4 ids, declared fields with explicit nulls."""
+        store._createCollection(DIM)
+        for object_id, chunk_id, meta, content in legacy_document_rows():
+            vector = [1e-8] * DIM if object_id == 'schema' else vector_for(object_id, chunk_id)
+            self.rows(store).append({'_id': random_uuid(), '$vector': vector, 'content': content, 'meta': dict(meta)})
+
+    def ignore_offsets(self, store: Any) -> None:
+        """Make find ignore skip."""
+        original_get = store.database.get_collection
+
+        def get_collection(name: str) -> Any:
+            collection = original_get(name)
+
+            def factory(original: Callable[..., Any]) -> Callable[..., Any]:
+                def find(*args: Any, **kwargs: Any) -> Any:
+                    kwargs.pop('skip', None)
+                    return original(*args, **kwargs)
+
+                return find
+
+            replace_method(collection, 'find', factory)
+            return collection
+
+        store.database.get_collection = get_collection
+
+    def raw_rows(self, store: Any) -> List[Dict[str, Any]]:
+        """Every stored document."""
+        return [
+            {
+                'objectId': d['meta'].get('objectId'),
+                'chunkId': d['meta'].get('chunkId'),
+                'meta': d['meta'],
+                'id': d['_id'],
+            }
+            for d in self.rows(store)
+        ]
+
+    def set_scores(self, store: Any, scores: Sequence[float]) -> None:
+        """Answer the next vector search with one hit per score ($similarity)."""
+        docs = [d for d in self.rows(store) if d['meta'].get('objectId') != 'schema']
+        original_get = store.database.get_collection
+
+        def get_collection(name: str) -> Any:
+            collection = original_get(name)
+
+            def factory(original: Callable[..., Any]) -> Callable[..., Any]:
+                def find(*args: Any, **kwargs: Any) -> Any:
+                    if '$vector' not in (kwargs.get('sort') or {}):
+                        return original(*args, **kwargs)
+                    hits = [
+                        {k: v for k, v in d.items() if k != '$vector'} | {'$similarity': s}
+                        for d, s in zip(docs, scores)
+                    ]
+                    return iter(hits)
+
+                return find
+
+            replace_method(collection, 'find', factory)
+            return collection
+
+        store.database.get_collection = get_collection

@@ -62,7 +62,7 @@ The first successful ingest fixes the collection's vector dimension from the inc
 
 ### Retrieval score
 
-The generated configuration supplies the requested retrieval score, while the store also has a hard floor: semantic hits below `0.20` are discarded before they reach any output lane. Raise the configured score when loosely related context is polluting answers; lower it when relevant content is absent, while remembering that values below the hard floor cannot restore those results. Keyword search does not carry this vector-similarity filter.
+The generated configuration supplies the requested retrieval score, while the store also has a floor: semantic hits below `0.20` are discarded before they reach any output lane. Scores are the Data API's normalised `$similarity`, between `0` and `1` for every metric. Raise the configured score when loosely related context is polluting answers; lower it when relevant content is absent, while remembering that values below the floor cannot restore those results. Keyword search does not carry this vector-similarity filter.
 
 ### Profile choice and first write
 
@@ -94,11 +94,22 @@ The two search modes are selected by the incoming question rather than by a seco
 
 ### Ingestion, replacement, and deletion
 
-The node stores each chunk with a generated `_id`, the content, metadata, and its vector. It collects up to 500 chunks before inserting. If a chunk with `chunkId` 0 arrives, all existing chunks with the same `objectId` are deleted first, so a complete re-ingest replaces that object instead of duplicating it. Near-zero vectors are omitted from the insert batch; the special zero-vector schema control document is adjusted to a tiny non-zero vector.
+The node stores each chunk with a generated `_id`, the content, metadata, and its vector. It collects up to 500 chunks before inserting. If a chunk with `chunkId` 0 arrives, all existing chunks with the same `objectId` are deleted first, so a complete re-ingest replaces that object instead of duplicating it. Near-zero vectors are omitted from the insert batch; the collection's zero-vector control record is stored with a unit vector instead, so it is kept (earlier releases dropped it, and the second write to a collection then failed).
+
+The stored metadata is the declared document fields plus the control record's embedding model and vector size, without empty values; other metadata, such as file size and ingest time, is not stored on Astra. Rows written by earlier releases carry empty values and are still read. Counts use the Data API's `count_documents` with a ceiling of 1,000: the node's document count falls back to Astra's estimate above it, and a filtered count above it is reported as unknown. Reads by filter honour their offset (paging with a sort, as the Data API requires), and path listing returns live documents only, never the control record.
 
 `markDeleted` and `markActive` update the `meta.isDeleted` flag for all chunks of the supplied object IDs, while `remove` permanently deletes those chunks. Rendering an object fetches its non-deleted chunks, sorts them by `chunkId` in the node, and joins their content because Astra does not guarantee the returned order.
 
 That ordering detail matters when rendering a document whose chunks were written in parallel: do not rely on Astra's natural return order to reproduce the source text. The node makes the ordering decision itself, then calls the render callback with the combined text.
+
+### Vector Explorer
+
+The Vector Explorer app supports Astra DB as **experimental**: its explorer functions are tested against an in-memory stand-in for the Data API client, not against Astra. What the app sees on Astra:
+
+- The document list pages through each document's chunk 0, ordered by object id (the app sorts what it has loaded by path), with chunk counts up to 1,000 per document. A document whose chunk 0 is missing is not listed. File size and ingest time are not shown because Astra does not keep them.
+- Chunk counts honour the active, deleted and all views; the collection's control record is never counted or listed. Collections written by earlier releases have no embedding model in their control record, so the model is shown as unknown there.
+- Samples for the embedding map are taken in storage order, and the neighbour graph is computed on the node.
+- Removing a document reports the number of chunks it removed.
 
 ### Tool embedding dependency
 

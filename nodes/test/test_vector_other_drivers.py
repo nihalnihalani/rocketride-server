@@ -32,6 +32,7 @@ ADAPTERS = {
     'milvus': h.MilvusAdapter,
     'weaviate': h.WeaviateAdapter,
     'pinecone': h.PineconeAdapter,
+    'astra_db': h.AstraAdapter,
 }
 
 
@@ -114,8 +115,9 @@ def test_describe_reads_a_legacy_collection(adapter, store):
     info = store.describe()
     assert info.collection_exists is True
     assert info.control_record is True
-    assert info.model == h.MODEL
     assert info.dimension == h.DIM
+    # Astra and Atlas used to drop the control record's extras: the model is unknown there
+    assert info.model == (h.MODEL if adapter.legacy_control_has_model else None)
 
 
 def test_score_info_reports_floor_and_threshold(adapter, store):

@@ -60,6 +60,9 @@ Or manually:
 """
 
 from typing import List, Any, Dict, Iterator
+from dataclasses import dataclass
+import copy
+import math
 import re
 
 
@@ -68,7 +71,9 @@ import re
 # =============================================================================
 
 from . import data_types
+from . import exceptions
 from . import info
+from .exceptions import TooManyDocumentsToCountException
 
 # Re-export commonly used types
 from .data_types import DataAPIVector
@@ -130,6 +135,16 @@ def _evaluate_filter(filter_dict: Dict[str, Any], document: Dict[str, Any]) -> b
         return True
 
     for field_path, condition in filter_dict.items():
+        # Logical operators
+        if field_path == '$and':
+            if not all(_evaluate_filter(sub, document) for sub in condition):
+                return False
+            continue
+        if field_path == '$or':
+            if not any(_evaluate_filter(sub, document) for sub in condition):
+                return False
+            continue
+
         # Get the value from the document using dot notation
         value = document
         for part in field_path.split('.'):
@@ -192,6 +207,40 @@ def _evaluate_filter(filter_dict: Dict[str, Any], document: Dict[str, Any]) -> b
 # =============================================================================
 
 
+@dataclass
+class CollectionDeleteResult:
+    """Result of ``delete_many`` (``astrapy.results.CollectionDeleteResult``)."""
+
+    deleted_count: int
+
+
+def _get_path(document: Dict[str, Any], path: str) -> Any:
+    """Read a dotted path from a document."""
+    value: Any = document
+    for part in path.split('.'):
+        if isinstance(value, dict):
+            value = value.get(part)
+        else:
+            return None
+    return value
+
+
+def _similarity(metric: str, a: List[float], b: List[float]) -> float:
+    """The Data API's ``$similarity``: normalised to [0, 1] for every metric."""
+    if not a or not b or len(a) != len(b):
+        return 0.0
+    if metric == 'euclidean':
+        return 1.0 / (1.0 + sum((x - y) ** 2 for x, y in zip(a, b)))
+    dot = sum(x * y for x, y in zip(a, b))
+    if metric == 'dot_product':
+        return (1.0 + dot) / 2.0
+    na = math.sqrt(sum(x * x for x in a))
+    nb = math.sqrt(sum(y * y for y in b))
+    if na == 0 or nb == 0:
+        return 0.0
+    return (1.0 + dot / (na * nb)) / 2.0
+
+
 class Collection:
     """
     Mock implementation of an Astra DB collection.
@@ -220,8 +269,8 @@ class Collection:
         filter: Dict[str, Any] = None,
         sort: Dict[str, Any] = None,
         limit: int = None,
-        skip: int = 0,
-        projection: Dict[str, int] = None,
+        skip: int = None,
+        projection: Dict[str, Any] = None,
         include_similarity: bool = False,
         include_sort_vector: bool = False,
         **kwargs,
@@ -229,11 +278,16 @@ class Collection:
         """
         Find documents matching the filter.
 
+        Mirrors the Data API: ``sort`` is either ``{'$vector': [...]}`` (ranked by
+        similarity, ``$similarity`` added when ``include_similarity``) or field sorts
+        (``{'meta.chunkId': 1}``); ``skip`` is only accepted with a field sort; ``$vector``
+        is returned only when the projection asks for it. Stored documents are never mutated.
+
         Args:
             filter: MongoDB-style filter conditions
-            sort: Sort specification (e.g., {'$vector': [0.1, ...]})
+            sort: Sort specification
             limit: Maximum documents to return
-            skip: Number of documents to skip
+            skip: Number of documents to skip (needs a field sort)
             projection: Fields to include/exclude
             include_similarity: Whether to include similarity scores
             include_sort_vector: Whether to include sort vector
@@ -241,19 +295,26 @@ class Collection:
         Returns:
             Cursor over matching documents
         """
-        data = self._get_data()
+        data = [doc for doc in self._get_data() if not filter or _evaluate_filter(filter, doc)]
+        vector_sort = bool(sort) and '$vector' in sort
+        if skip and (not sort or vector_sort):
+            raise ValueError('skip is only allowed together with a field sort')
 
-        # Apply filter
-        if filter:
-            data = [doc for doc in data if _evaluate_filter(filter, doc)]
-
-        # Handle vector sort (semantic search)
-        if sort and '$vector' in sort:
-            # For mock, we just return documents with a fixed similarity score
-            # In real Astra, this would compute actual vector similarity
-            for doc in data:
+        if vector_sort:
+            metric = self._metric()
+            scored = [(_similarity(metric, sort['$vector'], list(doc.get('$vector') or [])), doc) for doc in data]
+            scored.sort(key=lambda pair: -pair[0])
+            data = []
+            for score, doc in scored:
+                doc = dict(doc)
                 if include_similarity:
-                    doc['$similarity'] = 0.925  # Fixed mock score
+                    doc['$similarity'] = score
+                data.append(doc)
+        elif sort:
+            for key, direction in reversed(list(sort.items())):
+                data.sort(
+                    key=lambda doc: (_get_path(doc, key) is not None, _get_path(doc, key)), reverse=direction == -1
+                )
 
         # Apply skip
         if skip:
@@ -263,23 +324,40 @@ class Collection:
         if limit:
             data = data[:limit]
 
-        # Apply projection (remove excluded fields)
-        if projection:
-            filtered_data = []
-            for doc in data:
-                new_doc = {}
-                for key, value in doc.items():
-                    if key in projection:
-                        if projection[key] == 1:
-                            new_doc[key] = value
-                    elif projection.get(key) != 0:
-                        # Include by default unless explicitly excluded
-                        if key not in projection or projection[key] != 0:
-                            new_doc[key] = value
-                filtered_data.append(new_doc if new_doc else doc)
-            data = filtered_data
+        # Apply projection: $vector only on request; allow-list or deny-list of top-level fields
+        projection = projection or {}
+        include_vector = projection.get('$vector') in (1, True)
+        allow = [k for k, v in projection.items() if v in (1, True) and not k.startswith('$')]
+        deny = [k for k, v in projection.items() if v in (0, False) and not k.startswith('$')]
+        projected = []
+        for doc in data:
+            out = {k: copy.deepcopy(v) for k, v in doc.items() if k != '$vector'}
+            if allow:
+                out = {k: v for k, v in out.items() if k in allow or k in ('_id', '$similarity')}
+            for k in deny:
+                out.pop(k, None)
+            if include_vector and '$vector' in doc:
+                out['$vector'] = list(doc['$vector'])
+            projected.append(out)
 
-        return Cursor(data)
+        return Cursor(projected)
+
+    def _metric(self) -> str:
+        """The collection's vector metric."""
+        definition = (Database._collections.get(self.name) or {}).get('definition')
+        vector = getattr(definition, 'vector', None)
+        return getattr(vector, 'metric', None) or 'cosine'
+
+    def options(self, **kwargs) -> 'CollectionDefinition':
+        """The collection's definition as read from the database."""
+        info = Database._collections.get(self.name)
+        if info is None:
+            raise RuntimeError(f'Collection {self.name} not found')
+        return info.get('definition') or CollectionDefinition()
+
+    def estimated_document_count(self, **kwargs) -> int:
+        """An estimate of the documents in the collection."""
+        return len(self._get_data())
 
     def insert_many(self, documents: List[Dict[str, Any]]) -> Dict[str, Any]:
         """
@@ -324,12 +402,12 @@ class Collection:
             Delete result with count
         """
         if self.name not in Database._data:
-            return {'deleted_count': 0}
+            return CollectionDeleteResult(deleted_count=0)
 
         original_count = len(Database._data[self.name])
         Database._data[self.name] = [doc for doc in Database._data[self.name] if not _evaluate_filter(filter, doc)]
 
-        return {'deleted_count': original_count - len(Database._data[self.name])}
+        return CollectionDeleteResult(deleted_count=original_count - len(Database._data[self.name]))
 
     def update_many(self, filter: Dict[str, Any], update: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -366,12 +444,13 @@ class Collection:
 
         return {'matched_count': matched, 'modified_count': modified}
 
-    def count_documents(self, filter: Dict[str, Any] = None) -> int:
+    def count_documents(self, filter: Dict[str, Any], *, upper_bound: int) -> int:
         """
-        Count documents matching the filter.
+        Count documents matching the filter (``upper_bound`` is required, as in astrapy 2).
 
         Args:
-            filter: Optional filter conditions
+            filter: Filter conditions
+            upper_bound: Ceiling on the count; above it TooManyDocumentsToCountException is raised
 
         Returns:
             Count of matching documents
@@ -381,6 +460,10 @@ class Collection:
         if filter:
             data = [doc for doc in data if _evaluate_filter(filter, doc)]
 
+        if len(data) > upper_bound:
+            raise TooManyDocumentsToCountException(
+                'Document count exceeds required upper bound', server_max_count_exceeded=False
+            )
         return len(data)
 
 
@@ -542,8 +625,10 @@ __all__ = [
     'Database',
     'Collection',
     'Cursor',
+    'CollectionDeleteResult',
     # Submodules
     'data_types',
+    'exceptions',
     'info',
     # Re-exported types
     'DataAPIVector',
