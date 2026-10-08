@@ -10,7 +10,7 @@ throwaway local-only value, not a secret.
 
 | File | Pins |
 | --- | --- |
-| `test_g0_1_template_start.py` | **G0-1**: a template started through `start_fixtures.py --llm stub` runs `tools_1`, `chat_1` and `ingest_1` under the fixture's project id with no idle timeout, and its `parse_1` pins `index.maxFileSize`. The oversize-upload check is skipped (`NEEDS:`) until the size cap is applied (see below). **G0-1b**: the raw template (placeholder key, empty `base_url`) starts its chat source, and a chat answers with the LLM error as its answer text. |
+| `test_g0_1_template_start.py` | **G0-1**: a template started through `start_fixtures.py --llm stub` runs `tools_1`, `chat_1` and `ingest_1` under the fixture's project id with no idle timeout, and its `parse_1` pins `index.maxFileSize`. The oversize-upload check (an `Excluded` status warning; the upload itself answers `complete`) is skipped (`NEEDS:`) until the size cap is applied (see below). **G0-1b**: the raw template (placeholder key, empty `base_url`) starts its chat source, and a chat answers with the LLM error as its answer text. |
 | `test_g0_2_reachability.py` | **G0-2**: on the Tools and Chat tokens, `store_1`, `store_2`, `embed_1` and `llm_1` are in the call chain ("No handler found" for a tool they lack); `parse_1` and `chunk_1` are not ("not found in pipeline"). |
 | `test_g0_3_context_sources.py` | **G0-3**: the call context's `source_type` is the provider of the calling task's source (`tools`, `chat`, `dropper`), and `caller.auth` follows the key kind (account key, `tk_` task token, `pk_` public task key). |
 | `test_g0_5_services.py` | **G0-5**: `vx-qdrant` and `vx-chroma` answer health and their clients connect; `psycopg2` and `psql` reach `rrtenant` through `vx-pgbouncer`. |
@@ -61,11 +61,16 @@ the end (set `VX_PHASE0_KEEP=1` to leave them running).
 
 ## What the pins observed (engine at the Vector Explorer day-0 tip)
 
-- **Parser size cap.** A 51 MB upload through `ingest_1` completes: the parser
+- **Parser size cap.** A 51 MB upload through `ingest_1` is parsed: the parser
   reads `maxFileSize` from the task configuration's `index` section, and the
   engine builds the task configuration without one, so `parse_1.config.index`
   in the templates is not applied. Until that changes the upload limit is the
-  app's alone.
+  app's alone. When the task configuration does carry the section (tried with
+  a local, uncommitted engine change), the parser excludes the file: the
+  upload still answers `complete`, with no `result.error`, and the ingest
+  task's status `warnings` gain `Excluded*Skipping <file> due to file size
+  <n> which exceeds processing configured limit <cap>`. The oversize pin
+  checks for that warning.
 - **Source type.** The data connection's target endpoint is the pipeline's
   Null endpoint (logical type `null` for every task); the source type comes
   from the task's pipeline configuration (`pipeline.source` and that
