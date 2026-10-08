@@ -610,6 +610,40 @@ class TestPgVectorTransactions:
         rows = sorted((r['objectid'], r['chunkid']) for r in mock_rv.db.table('rr_vec').rows.values())
         assert rows == [('a', 0), ('a', 1), ('schema', 0)]  # the delete of the failed batch was undone
 
+    def test_connection_slots_are_handed_out_first_come_first_served(self, mock_rv):
+        """A released slot goes to the longest waiter, never back to a caller that arrives later."""
+        import threading
+        import time
+
+        from ai.common.store.pgvector.pool import FairGate
+
+        gate = FairGate(1)
+        assert gate.acquire(1.0)
+        order: list[str] = []
+
+        def waiter(name):
+            assert gate.acquire(5.0)
+            order.append(name)
+            time.sleep(0.05)
+            gate.release()
+
+        first = threading.Thread(target=waiter, args=('first',))
+        first.start()
+        time.sleep(0.1)
+        second = threading.Thread(target=waiter, args=('second',))
+        second.start()
+        time.sleep(0.1)
+        gate.release()
+        # A caller arriving right after the release must queue behind both waiters.
+        assert gate.acquire(5.0)
+        order.append('late')
+        gate.release()
+        first.join(5)
+        second.join(5)
+        assert order == ['first', 'second', 'late']
+        assert gate.acquire(0.01)
+        assert not gate.acquire(0.05)  # the only slot is taken: a bounded wait gives up
+
     def test_unreachable_server_error_names_no_host(self, mock_rv):
         from ai.common.store.errors import StoreError
 

@@ -51,8 +51,11 @@ from __future__ import annotations
 
 import re
 import threading
+import time
 
-from typing import Any, Callable, Dict, Iterable, Mapping, Optional, TypeVar
+from collections import deque
+from contextlib import contextmanager
+from typing import Any, Callable, Deque, Dict, Iterable, Iterator, Mapping, Optional, TypeVar
 
 import psycopg2
 
@@ -93,6 +96,48 @@ class LockUnavailable(StoreError):
     """A lock could not be taken within the transaction's ``lock_timeout``."""
 
 
+class FairGate:
+    """A counting semaphore that hands a released slot to the longest waiter.
+
+    The pool wakes one waiter when a connection comes back, but the thread that
+    returned it may take it again first; under steady load from many threads a
+    waiter can lose that race until its acquire timeout runs out. Passing every
+    checkout through this gate (with as many slots as the pool has connections)
+    serves callers in arrival order, so a wait is bounded by the work queued
+    ahead of it.
+    """
+
+    def __init__(self, slots: int) -> None:
+        """Start with ``slots`` free slots."""
+        self._lock = threading.Lock()
+        self._free = max(1, int(slots))
+        self._waiters: Deque[threading.Event] = deque()
+
+    def acquire(self, timeout_s: float) -> bool:
+        """Take a slot, waiting at most ``timeout_s``; False when none came in time."""
+        with self._lock:
+            if self._free > 0 and not self._waiters:
+                self._free -= 1
+                return True
+            ticket = threading.Event()
+            self._waiters.append(ticket)
+        if ticket.wait(max(0.0, timeout_s)):
+            return True
+        with self._lock:
+            if ticket.is_set():  # handed over between the timeout and the lock
+                return True
+            self._waiters.remove(ticket)
+            return False
+
+    def release(self) -> None:
+        """Give the slot to the longest waiter, or back to the free count."""
+        with self._lock:
+            if self._waiters:
+                self._waiters.popleft().set()
+            else:
+                self._free += 1
+
+
 def _reset_connection(conn: Any) -> None:
     conn.rollback()
     if conn.get_transaction_status() != _TRANSACTION_STATUS_IDLE:
@@ -127,10 +172,12 @@ class PgDatabase:
         #: Whether read transactions set ``hnsw.iterative_scan`` (pgvector 0.8 and later); decided at open.
         self.iterative_scan = False
         self._secrets = _secrets_of(self._connect_args)
+        self._acquire_timeout_s = self.statement_timeout_ms / 1000.0 + acquire_grace_s
+        self._gate = FairGate(max(1, int(max_size)))
         self._pool = ConnectionPool(
             self._connect,
             max_size=max(1, int(max_size)),
-            acquire_timeout_s=self.statement_timeout_ms / 1000.0 + acquire_grace_s,
+            acquire_timeout_s=self._acquire_timeout_s,
             reset=_reset_connection,
             is_usable=_connection_usable,
             close=_close_connection,
@@ -160,6 +207,19 @@ class PgDatabase:
     # Transactions
     # ------------------------------------------------------------------
 
+    @contextmanager
+    def _checkout(self, *, fresh: bool = False) -> Iterator[Any]:
+        """A pooled connection for one transaction, taken in arrival order (see :class:`FairGate`)."""
+        started = time.monotonic()
+        if not self._gate.acquire(self._acquire_timeout_s):
+            raise PoolTimeout(f'Timed out after {self._acquire_timeout_s:g} s waiting for a database connection')
+        try:
+            left = max(0.0, self._acquire_timeout_s - (time.monotonic() - started))
+            with self._pool.connection(fresh=fresh, timeout_s=left) as conn:
+                yield conn
+        finally:
+            self._gate.release()
+
     def run_read(self, work: Callable[[Any], T]) -> T:
         """Run ``work(cursor)`` in one read-only transaction and return its result.
 
@@ -170,7 +230,7 @@ class PgDatabase:
         begin = self._sql.begin_read(self.statement_timeout_ms, self.iterative_scan)
         for attempt in (0, 1):
             try:
-                with self._pool.connection(fresh=attempt > 0) as conn:
+                with self._checkout(fresh=attempt > 0) as conn:
                     try:
                         with conn.cursor() as cur:
                             cur.execute(begin)
@@ -197,7 +257,7 @@ class PgDatabase:
         """
         begin = self._sql.begin_write(self.statement_timeout_ms, lock_timeout_ms)
         try:
-            with self._pool.connection() as conn:
+            with self._checkout() as conn:
                 try:
                     with conn.cursor() as cur:
                         cur.execute(begin)
@@ -304,4 +364,4 @@ def _secrets_of(connect_args: Mapping[str, Any]) -> Iterable[str]:
     return sorted(values, key=len, reverse=True)
 
 
-__all__ = ['APPLICATION_NAME', 'CollectionMissing', 'LockUnavailable', 'PgDatabase', 'UNREACHABLE_TEXT']
+__all__ = ['APPLICATION_NAME', 'CollectionMissing', 'FairGate', 'LockUnavailable', 'PgDatabase', 'UNREACHABLE_TEXT']
