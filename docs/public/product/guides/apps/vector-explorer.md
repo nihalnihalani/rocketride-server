@@ -86,10 +86,12 @@ are never listed.
   `replace-with-your-key` and an empty `base_url` on the LLM node
   ([OpenAI-Compatible API](/nodes/llm_openai_api)). Replace the key, and set
   `base_url` only for an OpenAI-compatible server other than OpenAI. Until you
-  do, the chat source cannot answer: an empty `base_url` sends questions to
-  OpenAI, which refuses the placeholder key (or, offline, cannot be reached).
-  Everything else (counts, the directory, adding and removing documents, the
-  map) works without an LLM.
+  do, every chat answer is an error message: an empty `base_url` sends
+  questions to OpenAI, which refuses the placeholder key, and the answer reads
+  "**LLM error** — ValueError: Invalid API key." (offline, it names the failed
+  connection instead). That is the expected state of a template whose key has
+  not been replaced, not a fault in the app. Everything else (counts, the
+  directory, adding and removing documents, the map) works without an LLM.
 - **Removing documents needs the write switch.** Every vector store node that
   Vector Explorer lists reads an `allow_writes` setting, off by default. The
   Vector Explorer templates turn it on for `store_1` and leave it off for
