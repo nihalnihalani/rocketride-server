@@ -1,0 +1,8 @@
+apps/vscode/docs/usage.md
+apps/vscode/src/engine/local/connectionDiscovery.ts
+apps/vscode/src/engine/local/engine-local.ts
+apps/vscode/src/test/connectionDiscovery.test.ts
+packages/client-python/src/rocketride/_connection_discovery.py
+packages/client-python/src/rocketride/client.py
+packages/client-python/tests/test_client_env_loading.py
+packages/client-python/tests/test_connection_discovery.py

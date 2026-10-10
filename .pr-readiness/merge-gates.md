@@ -1,0 +1,5 @@
+# Observable merge gates (rocketride-org/rocketride-server, develop)
+- Branch protection: NOT readable with this token (GET /branches/develop/protection → 404); rulesets endpoint returns []. Required-check names cannot be enumerated authoritatively.
+- Observable check set on every PR head: `CI OK` (aggregate gate) over Build / Ubuntu 22.04, Windows Server 2022, macOS (ARM64); Ruff; gitleaks; Shell API contract; check-externals (PR); Compile universal node constraints; Detect changes / Detect Helm changes; Auto-label; discord-notify; CodeRabbit. Matrix placeholders (`Build / ${{ matrix.label }}`, `Container scan / ${{ matrix.dockerfile }}`), Helm lint, and check-externals (nightly) appear as skipped.
+- Review gate: mergeStateStatus=BLOCKED on all five = approving review required; the three CLI PRs carry APPROVED reviews at their pre-sync heads (a new head does not inherit approval); #683/#1489 carry CHANGES_REQUESTED (#683's is the withdrawn split request — only the reviewer can clear it; #1489's is the catalog review being addressed).
+- Docs site build: push-to-develop only (docs.yml), not a PR gate.

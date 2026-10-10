@@ -1,0 +1,7 @@
+## Thread reply drafts
+
+**T1 (root 3980191483)**
+> Good catch — fixed in 942a9eb. `eval` registers only `--uri`/`--apikey` (`_add_connection_args(eval_parser, json_arg=False)`), and `run_eval` passes just those to `connect_client`, so `--token`/`ROCKETRIDE_TOKEN` never applied here. Removed it from the eval section of `docs/README-python-client.md` and from `packages/client-python/docs/index.md` — those were the only two eval mentions. `upload`/`status`/`stop`/`events` keep theirs, since they genuinely take `--token`. Verified against the real parser: `rocketride eval --help` now lists exactly `-h, --uri, --apikey, --case, --fail-fast, --json, --junit`.
+
+**T2 (root 3980191498)**
+> Fixed in 942a9eb — you're right that this could publish a green artifact for a failed run. Spec-run failures are now collected as `SpecError` records (path, message, exception type) and threaded through all three renderers: `render_json` gains a top-level `spec_errors` list plus `summary.spec_errors` (both always present, so consumers needn't probe for the key); `render_junit` emits a one-test `<testsuite>` with an errored `<testcase>`, counted in the `<testsuites>` totals; `render_human` lists them and appends `, E spec error(s)`. stderr output and the 0/1/2 contract are unchanged, including all-specs-errored → 2, whose reports now carry the errors. 14 new tests; reverting the two source files fa

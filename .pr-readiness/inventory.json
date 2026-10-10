@@ -1,0 +1,133 @@
+{
+  "captured_utc": "2026-09-10T12:58:35Z",
+  "author": "nihalnihalani",
+  "authenticated_as": "nihalnihalani",
+  "target": {
+    "repo": "rocketride-org/rocketride-server",
+    "branch": "develop",
+    "sha": "f9a25cbbd73f8feb9fbc99ea3aeb5bd241dafc1e"
+  },
+  "prs": {
+    "683": {
+      "title": "feat(test,nodes): integrated Cobalt pipeline evaluation (testing framework + dataset + evaluator)",
+      "url": "https://github.com/rocketride-org/rocketride-server/pull/683",
+      "source": "nihalnihalani:feat/cobalt-pipeline-evaluation-consolidated",
+      "initial_head": "d8ff8f9edfe68669840dd9a84a6522236ad41972",
+      "base": "develop",
+      "draft": false,
+      "mergeable_initial": "CONFLICTING",
+      "review_decision_initial": "CHANGES_REQUESTED",
+      "git_facts": "head=d8ff8f9ed fork=nihalnihalani mergeable=CONFLICTING/DIRTY decision=CHANGES_REQUESTED files=53 commits=46 apimatch=ok mb=d5e38780b behind=26 integrate=CONFLICTS backup=refs/backup/683/20260910T125859Z",
+      "final_head": "3dc37c65671c29c32e9f0b1f12d8288fc40fed8e",
+      "final_status": null,
+      "pushed_utc": "2026-09-10T~15:0xZ",
+      "final_ci_run": "34492100993"
+    },
+    "1489": {
+      "title": "feat(nodes): add context window optimizer node for token budget management (continues #527)",
+      "url": "https://github.com/rocketride-org/rocketride-server/pull/1489",
+      "source": "nihalnihalani:feature/context-optimizer-node",
+      "initial_head": "a61e8483358e8b7ce3b7e4db2db2bf7261d401fc",
+      "base": "develop",
+      "draft": false,
+      "mergeable_initial": "UNKNOWN",
+      "review_decision_initial": "CHANGES_REQUESTED",
+      "git_facts": "head=a61e84833 fork=nihalnihalani mergeable=UNKNOWN/UNKNOWN decision=CHANGES_REQUESTED files=12 commits=5 apimatch=ok mb=d956cb169 behind=27 integrate=clean backup=refs/backup/1489/20260910T125859Z",
+      "final_head": "90b8e247f97e55b235e859f241b742c051bdb34e",
+      "final_status": null,
+      "pushed_utc": "2026-09-10T~15:0xZ",
+      "round3_heads": [
+        "cd5db1b1c0f9263ef78825d881b529a974561c91",
+        "30011d2f1b85eb971a9179ea532f21cfdfdc6edd"
+      ],
+      "round3_status": "published (replies, resolved, comment to asclearuc, summary+description updated)",
+      "round3_head": "30011d2f1b85eb971a9179ea532f21cfdfdc6edd",
+      "round3_ci_run": "34602242917",
+      "round4_status": "reply-only (r3990338024), resolved; MERGEABLE/CLEAN APPROVED ×2"
+    },
+    "1581": {
+      "title": "feat(sdk,cli): 'rocketride eval' — golden-dataset evaluation runner for .pipe files (assertions, pipeline-as-judge, JUnit)",
+      "url": "https://github.com/rocketride-org/rocketride-server/pull/1581",
+      "source": "nihalnihalani:feat/RR-1578-eval-runner",
+      "initial_head": "1b7ed6697f1f28d11aa794ae4008f9d59c596ccd",
+      "base": "develop",
+      "draft": false,
+      "mergeable_initial": "CONFLICTING",
+      "review_decision_initial": "APPROVED",
+      "git_facts": "head=1b7ed6697 fork=nihalnihalani mergeable=CONFLICTING/DIRTY decision=APPROVED files=25 commits=9 apimatch=ok mb=65a2e133a behind=49 integrate=CONFLICTS backup=refs/backup/1581/20260910T125859Z",
+      "final_head": "be41c2e05b083daaaa2baf2238d21e418bc97b9a",
+      "final_status": null,
+      "pushed_utc": "2026-09-10T~15:2xZ",
+      "synced_head": "8e7ef7230458003426ec30702c48084241facdd4",
+      "final_ci_run": "34502903010",
+      "followup": "CodeRabbit re-review of 8e7ef723: 3 threads, fixed in be41c2e0, verified + auto-resolved by CodeRabbit; replies r3981536094 r3981536566 r3981537093",
+      "round3_head": "335d3ec0cc10f745c03bcb3c047698d8304d81e0",
+      "round3_ci_run": "34599266430",
+      "round3_status": "published (replies, resolved, comment to asclearuc, summary+description updated)",
+      "round4_head": "5dd841ea1eedaa65b6cabfd855ed13039dcc4c18",
+      "round4_ci_run": "34617839997",
+      "round4_status": "published (reply r3991090709, resolved, comment 5637273338, description bullet, summary; asclearuc re-requested)"
+    },
+    "1607": {
+      "title": "feat(sdk,ci): 'rocketride diff' — semantic .pipe diff (layout-noise-free) + PR-comment Action",
+      "url": "https://github.com/rocketride-org/rocketride-server/pull/1607",
+      "source": "nihalnihalani:feat/RR-1606-pipe-diff",
+      "initial_head": "6f9199758160457114a568bb53e68d1077fa8077",
+      "base": "develop",
+      "draft": false,
+      "mergeable_initial": "CONFLICTING",
+      "review_decision_initial": "APPROVED",
+      "git_facts": "head=6f9199758 fork=nihalnihalani mergeable=CONFLICTING/DIRTY decision=APPROVED files=20 commits=11 apimatch=ok mb=65a2e133a behind=49 integrate=CONFLICTS backup=refs/backup/1607/20260910T125859Z",
+      "final_head": "b2d6d5bda711ddbde084fa8b85bfd619aa6671f2",
+      "final_status": null,
+      "pushed_utc": "2026-09-10T~15:2xZ",
+      "round3_head": "05278aae1d4f1f4e63ae2879269fb202640a3013",
+      "round3_ci_run": "34600631836",
+      "round3_status": "published (replies, resolved, comment to asclearuc, summary+description updated)",
+      "round4_head": "c16b0eb912d7f2809c05246b9e169a04b7e72623",
+      "round4_ci_run": "34619198961",
+      "round4_status": "published (replies r3991262387/r3991262996, resolved, comment 5637497919, description bullet, summary; asclearuc re-requested)"
+    },
+    "1612": {
+      "title": "feat(sdk,cli): 'rocketride otel' — OpenTelemetry bridge over the documented ingester protocol (zero engine changes)",
+      "url": "https://github.com/rocketride-org/rocketride-server/pull/1612",
+      "source": "nihalnihalani:feat/RR-1609-otel-bridge",
+      "initial_head": "0a5c6f8ce9937a77eaf1d29f17801b1901e6a06e",
+      "base": "develop",
+      "draft": false,
+      "mergeable_initial": "CONFLICTING",
+      "review_decision_initial": "APPROVED",
+      "git_facts": "head=0a5c6f8ce fork=nihalnihalani mergeable=CONFLICTING/DIRTY decision=APPROVED files=20 commits=13 apimatch=ok mb=65a2e133a behind=49 integrate=CONFLICTS backup=refs/backup/1612/20260910T125859Z",
+      "final_head": "1d16eed5f0af20c4669b84f288b47bac51dbc322",
+      "final_status": null,
+      "pushed_utc": "2026-09-10T~15:2xZ",
+      "round3_head": "3a4c06aab927064754533319daa34af9e6106836",
+      "round3_ci_run": "34599673259",
+      "round3_status": "published (replies, resolved, comment to asclearuc, summary+description updated)",
+      "round4_head": "2bf3e65ef41feb7c9978838f420b1167968ededb",
+      "round4_ci_run": "34615044697",
+      "round4_status": "published (reply, resolved, comment, description ×3 lines + bullet, summary; re-requested dsapandora+asclearuc)"
+    }
+  },
+  "state_changes": {
+    "1573": "MERGED 2026-09-08 by Leela8256",
+    "1586": "MERGED 2026-09-08 by Leela8256",
+    "1613": "MERGED 2026-09-08 by Leela8256",
+    "897": "MERGED 2026-09-08 by dsapandora",
+    "899": "MERGED 2026-09-08 by dsapandora"
+  },
+  "final_sweep": {
+    "utc": "2026-09-10T17:00:00Z",
+    "develop_sha": "fd7d9565742e314941e872f1e8f115ef1b52c6ea",
+    "heads": {
+      "683": "3dc37c65671c29c32e9f0b1f12d8288fc40fed8e",
+      "1489": "90b8e247",
+      "1607": "b2d6d5bd",
+      "1581": "be41c2e05b083daaaa2baf2238d21e418bc97b9a",
+      "1612": "1d16eed5"
+    },
+    "all_ci_ok": true,
+    "all_merge_tree_clean": true,
+    "unresolved_threads": 0
+  }
+}

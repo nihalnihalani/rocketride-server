@@ -1,0 +1,5 @@
+packages/client-typescript/package.json
+packages/client-typescript/tests/build-config.test.ts
+packages/client-typescript/tsconfig.cjs.json
+packages/client-typescript/tsconfig.esm.json
+packages/client-typescript/tsconfig.types.json

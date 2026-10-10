@@ -1,0 +1,3 @@
+{
+ "body": "Addressed in c258211d. The questions-lane sentence now says every question takes the natural-language path and only valid generated SQL is executed: when the LLM reports the question is not a database query (`isValid: false`), its prose answer is emitted and nothing runs. The dialect/execute distinction is kept as it was."
+}

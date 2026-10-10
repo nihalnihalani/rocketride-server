@@ -1,0 +1,3 @@
+{
+ "body": "Addressed in c258211d. The ClickHouse README no longer mentions an `answers` insert lane — its `services.json` declares only `questions`. (db_mysql, db_postgres and rocketride_sql do declare `answers`; their sentence now says the refresh invalidates the configured table's column map, which is rebuilt on the next insert.) `scripts/validate-node-readme.py` passes for the node (15 checks)."
+}

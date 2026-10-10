@@ -1,0 +1,3 @@
+{
+ "body": "Addressed in becb1c28. The `result is None` branch and its comment are deleted and `_executeRawQuery` is annotated `-> dict` (docstring: every failure raises). Its only caller is `execute`; `test_execute_raw_query_returns_a_dict_for_ddl_and_select` guards the contract. On the PR the old comment did not name: #1908 (`feat/drizzle-over-pipes`, open, currently conflicting with develop) rewrites this same session block with the opposite policy — it removes rollback-on-failure so a client can `rollback to savepoint`, keeps the `None` branch, and threads a `row_mode` argument through `_executeRawQuery` — so whichever of the two lands second has a textual and a policy conflict to reconcile. Flagging it rather than working around it."
+}

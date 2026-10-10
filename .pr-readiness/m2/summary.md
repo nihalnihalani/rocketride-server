@@ -1,0 +1,10 @@
+# Summary — PRs #2283 and #2282 (closed 2026-09-16, after the mandated devil's-advocate gate)
+
+| PR | Original head | Final head | Commits | Tests | CI OK | Reviewer verdict (final rev.) | Devil's-advocate verdict (final rev.) | Readiness |
+|---|---|---|---|---|---|---|---|---|
+| #2283 backend | 28c461e3 | 251bd3bc | 15 | targeted 148 → 194; whole packages/ai 3003 / 122 env skips | run 34996726235 | APPROVE (delta on 170ee484; 251bd3bc is comment/README-only, verified by the orchestrator) | A/B/D PASS WITH DOCUMENTED NON-BLOCKING LIMITATIONS, C PASS (re-verification of 170ee484; DA-F1 verified fixed on the real ClickHouse stack) | Ready for maintainer re-review (asclearuc's approval of de71b048 was dismissed by the push; re-requested) |
+| #2282 frontend | 07278af6 | 6cfe6e31 | 16 | 521 → 630 / 76 suites; typechecks, build, docs:build green | run 34996398236 | APPROVE (delta on 8d68e9d6; 6cfe6e31 is docs/comment-only, verified by the orchestrator) | A PASS, B PASS-with-limitations, C PASS, D PASS WITH DOCUMENTED NON-BLOCKING LIMITATIONS (re-verification of 8d68e9d6) | Ready for maintainer re-review (approval of cd18eefd dismissed by the push; re-requested) |
+
+Maintainer state: asclearuc approved both PRs earlier today (cd18eefd, de71b048) with non-blocking notes; all notes are now taken as written, answered in-thread, and re-verified. Both PRs are MERGEABLE against develop; BLOCKED only on the re-approval.
+
+Accepted non-blocking limitations (documented on the PRs): no live PostgreSQL/MySQL/ClickHouse (compile-level, constructed-shape, and real-driver-with-patched-transport evidence only); no rendered React harness; node-originated refusals still headline as "Database reported: …"; `begin` connect failure escapes unformatted (pre-existing); `generated_defaults` makes a `UNIQUE DEFAULT ''` column collide where NULLs did not; `get_data` on ClickHouse still raises instead of returning `{valid: false}` (pre-existing; follow-up); #1908 rewrites the same session block with the opposite policy.

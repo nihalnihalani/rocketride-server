@@ -1,0 +1,3 @@
+{
+  "body": "Addressed in 56072ad9. The template's `questions` are now cleared for every dataset item and the item text is appended only when it is non-empty, so an item with empty text no longer emits the incoming template prompt. Verified with `test_empty_text_clears_template_prompt[''/None]` in nodes/test/cobalt/test_dataset_cobalt.py (fails on the previous code, passes now) and the full cobalt suite (230 passed, 1 credential skip) at 56072ad9.\n"
+}

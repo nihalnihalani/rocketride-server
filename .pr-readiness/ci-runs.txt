@@ -1,0 +1,17 @@
+#1489 90b8e247f97e55b235e859f241b742c051bdb34e run=34487046212
+#683 56072ad97a081d1dfa997773f0060e1f495a9303 run=34487052426
+#1607 b2d6d5bda711ddbde084fa8b85bfd619aa6671f2 run=34488896663
+#1581 8e7ef7230458003426ec30702c48084241facdd4 run=
+#1612 1d16eed5f0af20c4669b84f288b47bac51dbc322 run=
+#683 3dc37c65671c29c32e9f0b1f12d8288fc40fed8e run=34492100993
+#1581 8e7ef7230458003426ec30702c48084241facdd4 run=34488933105
+#1612 1d16eed5f0af20c4669b84f288b47bac51dbc322 run=34488937607
+34502903010 #1581 be41c2e0 CI OK success (15 passed / 4 skipped) 2026-09-10
+34599266430 #1581 335d3ec0 CI OK success (17 passed / 4 skipped) 2026-09-11 round 3
+34600631836 #1607 05278aae CI OK success (16 passed / 4 skipped) 2026-09-11 round 3
+34600524213 #1489 cd5db1b1 CI OK FAILURE (test_dynamic ci_tiny case_2) 2026-09-11 round 3 — superseded by 30011d2f
+34599673259 #1612 3a4c06aa CI OK success (16 passed / 4 skipped; otel mapper 46/0 setup 28/1 skipif on all legs) 2026-09-11 round 3
+34602242917 #1489 30011d2f CI OK success (17 passed / 4 skipped) 2026-09-11 round 3
+34615044697 #1612 2bf3e65e CI OK success (17/4; setup-test-deps ran on all legs; otel mapper 46 / setup 29 collected+passed) 2026-09-11 round 4
+34617839997 #1581 5dd841ea CI OK success (16/4) 2026-09-11 round 4
+34619198961 #1607 c16b0eb9 CI OK success (16/4) 2026-09-11 round 4

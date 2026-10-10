@@ -1,0 +1,3 @@
+{
+ "body": "Addressed in c258211d and de71b048, with the in-code twins in 17a38764 (the `refresh_schema` tool description and the `get_schema` docstring said the same stale thing): `get_schema` serves the cached snapshot the node currently holds — the start-up reflection until a `refresh_schema` call replaces it; `refresh_schema` replaces the database-wide cache and invalidates the insert-lane column map, which is rebuilt lazily on the next insert. Same wording in all four READMEs; a grep for the old \"reflected when the node started\" phrasing is now empty."
+}

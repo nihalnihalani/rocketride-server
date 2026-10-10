@@ -1,0 +1,3 @@
+{
+  "body": "Addressed in 56072ad9. The synthetic score answer now carries a deep copy of the incoming answer's metadata (`eval_answer.metadata = copy.deepcopy(metadata)` when it is a dict), so a consumer can join a score to its dataset item by key instead of by answer order. Verified with `test_score_answer_carries_incoming_metadata` (asserts equality, distinct object identity, and nested-copy isolation) and `test_score_answer_without_metadata_has_none` at 56072ad9; the original answer's metadata is untouched.\n"
+}

@@ -1,0 +1,3 @@
+packages/client-python/docs/index.md
+packages/client-python/src/rocketride/mixins/data.py
+packages/client-python/tests/test_pipe_open_retry.py

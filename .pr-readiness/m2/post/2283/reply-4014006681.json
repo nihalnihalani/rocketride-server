@@ -1,0 +1,3 @@
+{
+ "body": "Addressed in 0c324a2a. `_format_table` is a module-level function that both `get_schema` and `refresh_schema` call; the nested copy and the \"deliberately spelled out again\" paragraph are gone, and the wire shape is byte-identical (existing tests untouched). `test_format_table_keeps_the_optional_keys_optional` pins the shared rendering, and `test_refresh_schema_matches_get_schema_shape` now reflects a table with a primary key and a foreign key, so a key added to one tool would fail it."
+}

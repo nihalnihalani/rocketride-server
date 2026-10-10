@@ -1,0 +1,5 @@
+docs/agents/ROCKETRIDE_python_API.md
+docs/agents/ROCKETRIDE_typescript_API.md
+packages/client-python/src/rocketride/mixins/execution.py
+packages/client-typescript/docs/guide/methods/use.md
+packages/client-typescript/src/client/client.ts
