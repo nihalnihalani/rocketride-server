@@ -194,10 +194,13 @@ descriptors byte-for-byte, and `test_tool_audience.py` pins that.
   engine under `ROCKETRIDE_MOCK`. A driver that starts using a new native call
   adds it to that client's mock and pairs the mocked assertion with the same
   assertion in the unmocked suite. Do not mock numpy there.
-- **Support level.** `dialect.support` is `supported` only for a provider whose
-  unmocked live suite passes on a new and a legacy collection (and, for the two
-  pgvector providers, through the pooler). Everything else is `experimental`,
-  and a mocked test never changes that.
+- **Support level.** `dialect.support` is the driver's class constant
+  `VX_SUPPORT`. The base default is `'experimental'`, for which `dialect` also
+  adds the `experimental` caveat and the app shows the Experimental badge. Set
+  `VX_SUPPORT = 'supported'` only once the driver's unmocked live suite passes
+  on a new and a legacy collection (and, for the two pgvector providers,
+  through the pooler); a mocked test never justifies it. The public guide
+  names no supported store, so changing the constant needs no change there.
 
 ## Tests
 
