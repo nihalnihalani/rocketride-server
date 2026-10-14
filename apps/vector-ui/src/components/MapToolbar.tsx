@@ -107,6 +107,11 @@ export function MapToolbar(props: MapToolbarProps): React.ReactElement {
 					))}
 				</select>
 			</label>
+			{sample ? (
+				<span style={MAP_STYLES.small}>
+					of {sample.result.of.chunks === null ? '—' : num(sample.result.of.chunks)} chunks · {sample.result.of.documents === null ? '—' : num(sample.result.of.documents)} docs · seed {seed}
+				</span>
+			) : null}
 			<button type="button" style={MAP_STYLES.button} disabled={busy} onClick={() => props.onSample({ n, mode, seed: seed + 1 })}>
 				New sample
 			</button>

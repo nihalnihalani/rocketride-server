@@ -112,6 +112,9 @@ export const LAYOUT_NOT_BETTER = 'Neighbour layout did not improve on PCA for th
 /** Text queries cannot run. */
 export const QUERY_NEEDS_EMBED = 'Text queries need the embedding node reachable from the Tools source';
 
+/** Light samples on PCA: positions are rounded to 2 decimals and spread within that step (model.ditherRounded). */
+export const LIGHT_POSITIONS = 'Light sample: positions are rounded to 0.01 and spread within that step, so each point is drawn within 0.01 of its PCA place.';
+
 /** A query was run before any sample was drawn (or after sampling failed). */
 export const QUERY_NEEDS_SAMPLE = 'Draw a sample of the collection first; the query is placed among its points.';
 

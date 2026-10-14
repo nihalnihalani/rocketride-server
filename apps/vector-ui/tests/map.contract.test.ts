@@ -90,3 +90,11 @@ test('components keep their frozen export names and extend the frozen props in t
 	assert.match(read('components/PointCanvas.tsx'), /export interface PointCanvasProps extends ContractPointCanvasProps/);
 	assert.match(read('views/MapView.tsx'), /export function MapView\(props: MapViewProps\)/);
 });
+
+test('map/calls.ts forwards a call\'s input untouched: it never reads a field of it, so it never reads the query vector it carries', () => {
+	const calls = read('map/calls.ts');
+	assert.match(calls, /channel\.invoke<T>\(tool, input, /);
+	assert.doesNotMatch(calls, /\binput\s*(\.|\[)|\bvector\b/, 'calls.ts reads the input');
+	// The view's own header says what is true: the vector passes through calls.ts, no map module reads or keeps it.
+	assert.doesNotMatch(fs.readFileSync(path.join(SRC, 'views', 'MapView.tsx'), 'utf8'), /nothing under src\/map receives it/);
+});

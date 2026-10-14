@@ -129,3 +129,8 @@ test('a chat highlight re-embeds only a question the chat told the map; otherwis
 	assert.match(view, /selection\.setQuery\(null\)/);
 	assert.match(view, /queryBlocker\(/);
 });
+
+test('a light sample on PCA says its positions are spread within their 0.01 rounding step', () => {
+	const view = read('views/MapView.tsx');
+	assert.match(view, /sample\?\.mode === 'light' && layout === 'pca' \? \[LIGHT_POSITIONS\]/);
+});

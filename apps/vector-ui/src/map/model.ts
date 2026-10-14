@@ -235,7 +235,10 @@ export function applyTransform(place: { x: number; y: number; z?: number }, t: I
  * Spread coordinates that were rounded to `step` (light samples carry 2-decimal
  * floats) uniformly within their rounding interval, seeded. Rounding already
  * moved every point by up to step/2; drawing the rounded values as they are
- * shows a lattice that is not in the data.
+ * shows a lattice that is not in the data. The spread adds up to another
+ * step/2, so a drawn point sits within ONE step of its true PCA position (the
+ * legend says so: wording.LIGHT_POSITIONS). The refined layouts start from the
+ * undithered values.
  *
  * @param positions - Rounded coordinates.
  * @param step - The rounding step (0.01 for 2 decimals); 0 returns a copy.

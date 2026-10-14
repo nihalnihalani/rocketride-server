@@ -10,7 +10,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { applyTransform, chunkPath, ditherRounded, hiddenMask, keyIndex, keyString, neighboursOf, normaliseLayout, pcaPositions, pointKey, visibleCount } from '../src/map/model';
-import { biasedNote, sampleLabel } from '../src/map/wording';
+import { LIGHT_POSITIONS, biasedNote, sampleLabel } from '../src/map/wording';
 import { loadSample, modelOf } from './support/map.samples';
 
 const demo = loadSample('sample_demo_1000.json');
@@ -117,4 +117,14 @@ test('light samples (2-decimal coordinates) are dithered within their rounding s
 	assert.ok(moved > raw.length * 0.9, 'nearly every coordinate leaves the lattice');
 	assert.notDeepEqual(Array.from(ditherRounded(raw, 0.01, 12)), Array.from(a));
 	assert.deepEqual(Array.from(ditherRounded(raw, 0, 11)), Array.from(raw), 'no step, no dither');
+});
+
+test('the light-sample note tells the reader how far a drawn point may sit from its place: within one 0.01 step', () => {
+	assert.match(LIGHT_POSITIONS, /0\.01/);
+	assert.match(LIGHT_POSITIONS, /within/);
+	// What the note claims: rounding (up to half a step) plus the spread (up to half a step) is at most one step.
+	const truth = new Float32Array([0.123456, -0.987654, 0.5, 0.004999]);
+	const rounded = truth.map((v) => Math.round(v * 100) / 100);
+	const drawn = ditherRounded(rounded, 0.01, 7);
+	truth.forEach((v, i) => assert.ok(Math.abs((drawn[i] as number) - v) <= 0.01 + 1e-6, `${drawn[i]} vs ${v}`));
 });

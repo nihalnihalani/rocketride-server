@@ -197,3 +197,12 @@ test('PointCanvas root carries the browser lanes\' attribute table: mode, layout
 	}
 	assert.match(canvasRoot(loadSample('sample_light_5000.json')), /data-mode="light"/);
 });
+
+test('MapToolbar states what the sample is drawn from and its seed, so "New sample" visibly moves the seed', () => {
+	const base = { limits, busy: null, layout: 'pca' as const, colourBy: 'document' as const, lasso: false, table: false, query: { enabled: true, reason: null }, onSample: noop, onLayout: noop, onCancel: noop, onColourBy: noop, onQuery: noop, onToggleLasso: noop, onFit: noop, onToggleTable: noop };
+	assert.match(html(<MapToolbar {...base} sample={demo} />), /of 1,318 chunks · 42 docs · seed 7/);
+	assert.match(html(<MapToolbar {...base} sample={modelOf(demo.result, { seed: 8 })} />), /seed 8/);
+	const unknown = modelOf({ ...demo.result, of: { chunks: null, documents: null } } as unknown as ISampleResult);
+	assert.match(html(<MapToolbar {...base} sample={unknown} />), /of — chunks · — docs · seed 7/);
+	assert.doesNotMatch(html(<MapToolbar {...base} sample={null} />), /chunks ·/);
+});

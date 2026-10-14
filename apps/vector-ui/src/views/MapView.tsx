@@ -38,7 +38,8 @@
 // `neighbors`, `search`, `chunks`; and `embed` on the embedding node. The ONE
 // raw vector the map handles is the query vector `embed` returns: it stays in
 // this view (queryVector) and is sent unchanged to `project`, `search` and
-// `neighbors` (scope scores); nothing under src/map receives it. The map never
+// `neighbors` (scope scores). It passes through map/calls.ts, which forwards a
+// call's input untouched; no module under src/map reads or keeps it. The map never
 // writes: removals are asked of the console (actions.requestRemove), which
 // confirms them.
 //
@@ -75,7 +76,7 @@ import { readPalette } from '../map/tokens';
 import type { IMapPalette } from '../map/tokens';
 import { createLayoutClient } from '../map/workerClient';
 import type { ILayoutClient } from '../map/workerClient';
-import { BUSY, CENTROID_APPROX, LAYOUT_CANCELLED, LAYOUT_NOT_BETTER, MAP_UNAVAILABLE, QUERY_NEEDS_EMBED, QUERY_PLACED_APPROX, mapFailure, num, pointAnnouncement, sampleLabel } from '../map/wording';
+import { BUSY, CENTROID_APPROX, LAYOUT_CANCELLED, LAYOUT_NOT_BETTER, LIGHT_POSITIONS, MAP_UNAVAILABLE, QUERY_NEEDS_EMBED, QUERY_PLACED_APPROX, mapFailure, num, pointAnnouncement, sampleLabel } from '../map/wording';
 
 export type { MapViewProps };
 
@@ -874,7 +875,7 @@ export function MapView(props: MapViewProps): React.ReactElement {
 	const selectedKey = selected !== null && sample ? pointKey(sample, selected) : null;
 	const selectedScore = selectedKey && query?.search ? (query.search.results.find((r) => r.metadata?.objectId === selectedKey[0] && r.metadata?.chunkId === selectedKey[1])?.score ?? null) : null;
 	const lassoKeys = state.highlight?.source === 'lasso' ? state.highlight.keys : state.keys;
-	const legendNotes = [...(query?.notes ?? []), ...(star && !star.exact && !query?.item ? [CENTROID_APPROX] : [])];
+	const legendNotes = [...(query?.notes ?? []), ...(star && !star.exact && !query?.item ? [CENTROID_APPROX] : []), ...(sample?.mode === 'light' && layout === 'pca' ? [LIGHT_POSITIONS] : [])];
 	const describe = (index: number): string => {
 		if (!sample) return '';
 		const doc = documentOf(sample, index);
