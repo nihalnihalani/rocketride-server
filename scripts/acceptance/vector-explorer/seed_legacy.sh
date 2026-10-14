@@ -9,10 +9,12 @@
 # engine whose store drivers are still the old ones, before any driver change
 # is merged; the collections are kept for the driver and tool-path suites.
 #
-# Environment: ENGINE_URL (the engine under test, started with
-# RR_DB_BROKER_URL/RR_DB_BROKER_TOKEN pointing at fake_broker.py), SERVER_DIR
-# (default: dist/server of this checkout), UV_CACHE_DIR, and the VX_* settings
-# of README.md. Arguments go to seed_legacy.py (--only, --recreate, --verify-only).
+# Environment: ENGINE_URL (an engine whose store drivers are the old ones,
+# started with RR_DB_BROKER_URL/RR_DB_BROKER_TOKEN pointing at fake_broker.py;
+# the seed refuses, before dropping anything, when that engine's chunker or
+# drivers would not write the legacy shape), SERVER_DIR (default: dist/server of
+# this checkout), UV_CACHE_DIR, and the VX_* settings of README.md. Arguments go
+# to seed_legacy.py (--only, --recreate, --verify-only).
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 REPO=$(cd "$HERE/../../.." && pwd)

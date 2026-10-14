@@ -125,7 +125,16 @@ table or collection (`seed_legacy.sh --recreate` drops only `vx_legacy_` names).
 the store drivers did before the explorer, so every explorer tool is also
 tested on old data: random point ids, no file size or ingest time, no `meta`
 column on pgvector, and one document without its first chunk. Run it once with
-an engine whose drivers are still the old ones; later runs only verify.
+an engine whose drivers are still the old ones; later runs only verify. The
+seed ingests through `ENGINE_URL`, so point that at such an engine: the default
+(`http://127.0.0.1:5590`) is the integration engine, whose drivers are the new
+ones once the driver lanes are merged, and the seed then refuses (below).
+
+```bash
+ENGINE_URL=http://127.0.0.1:<old-driver engine port> $ACC/seed_legacy.sh             # seed what is missing, verify
+ENGINE_URL=http://127.0.0.1:<old-driver engine port> $ACC/seed_legacy.sh --recreate  # drop vx_legacy_docs, seed again
+$ACC/seed_legacy.sh --verify-only                                                        # no engine needed
+```
 
 - **pgvector**: the table is created with the old driver's DDL plus the
   `signature` column its insert writes, and the control row exactly as
@@ -153,16 +162,24 @@ containers, not about this file: `seed_legacy.sh --verify-only` (no engine
 needed) prints their `facts` and the `problems` found, and exits 1 when any
 check fails. Read those before relying on the shape.
 
-The calibrated shape needs a chunker that passes `strlen` to its splitter,
-which the chunker node as it stands does not (see "What these lanes found"
-below): there the manual becomes about 36 chunks of up to 4,000 characters.
-Before it creates or drops anything, the seed previews the corpus with the
-chunker node the engine imports (an engine inside a checkout imports the
-checkout's `nodes/src`, not its `dist/server/nodes` copy) and refuses, with
-exit 1 and what it found under `refused`, when the result would not keep more
-than 64 chunks for the manual or a median chunk of 400-1,200 characters. A
-`--recreate` on such an engine therefore leaves the existing collections as
-they are.
+Before it creates or drops anything named `vx_legacy_docs`, the seed asks the
+engine at `ENGINE_URL` twice, and refuses with exit 1 and the engine's answer
+under `refused` when either answer is wrong, so a `--recreate` on the wrong
+engine leaves the existing collections as they are:
+
+- **Chunking.** The templates' `ingest_1 -> parse_1 -> chunk_1` lanes run on
+  the engine with a `response_documents` answer (no model, no store, seconds)
+  over the corpus; the manual must give more than 64 chunks and the median
+  chunk must be 400-1,200 characters. The calibrated shape needs a chunker
+  that passes `strlen` to its splitter, which the chunker node as it stands
+  does not (see "What these lanes found" below): there the manual becomes 36
+  chunks and the median about 3,400 characters. What this checkout's own
+  chunker node would cut is reported as `checkout_node`, but the engine's
+  answer decides (the engine may run another checkout's code).
+- **Drivers.** One small corpus file is written through every driver the seed
+  would use (pgvector through `postgres.pipe` and `rocketride_vector.pipe`) into
+  `vx_legacy_probe`, which must come out in the old drivers' shape above; the
+  probe is dropped again either way.
 
 ## Live node suites
 

@@ -48,14 +48,22 @@ exactly the old columns (``LEGACY_COLUMNS``); a ``meta`` column is allowed only
 when this run did not seed the table (a newer driver adds it when it first opens
 the table), and no row may carry ``meta``. Exits 1 when any check fails.
 
-Before anything is created or dropped, the seed asks the chunker node the
-engine imports (``engine_chunker``) what it would cut from
-the corpus with the templates' ``chunk_1`` length, and refuses to seed when
-that is not the calibrated shape (``ChunkerRefused``, exit 1): the chunker node
-as it stands drops the length (see the README), so a seed on it would replace
-good collections with ones that fail the verification above.
+Before anything named ``vx_legacy_docs`` is created or dropped, two preflights
+ask the engine the seed ingests through (``ENGINE_URL``), and the seed is
+refused (exit 1, with the engine's answer under ``refused``) when either fails:
 
-Usage (from dist/server; the engine must run with RR_DB_BROKER_URL/TOKEN):
+* chunking (``ChunkerRefused``): the templates' ``ingest_1 -> parse_1 ->
+  chunk_1`` lanes run on that engine with a ``response_documents`` answer (no
+  model, no store) over the corpus; the long manual must give more than 64
+  chunks and the median chunk must be 400-1,200 characters. What this
+  checkout's own chunker node would do is reported (``checkout_node``) but does
+  not decide: the engine may run other code than this checkout.
+* drivers (``DriverRefused``): one small corpus file is written through every
+  driver the seed would use into ``vx_legacy_probe``, whose shape must be the
+  old drivers' (the same checks as above); the probe is dropped again.
+
+Usage (from dist/server; ENGINE_URL must be an engine whose store drivers are
+the old ones, started with RR_DB_BROKER_URL/TOKEN):
   ./engine <this folder>/seed_legacy.py [--only pgvector,qdrant,chroma] [--recreate] [--verify-only]
 """
 
@@ -64,6 +72,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import collections
+import copy
 import importlib.util
 import json
 import statistics
@@ -81,11 +90,16 @@ import calibrate_chunking as cal  # noqa: E402
 import vx_fixtures as fx  # noqa: E402
 
 LEGACY = 'vx_legacy_docs'
+# The driver preflight writes one file here through each driver, reads its shape and drops it again.
+PROBE = 'vx_legacy_probe'
+PROBE_REL = 'archive/old_radio_schedule.txt'
 PREFIX = '/srv/legacy/'
 RR_PREFIX = '/srv/legacy-rr/'
 RR_FOLDER = 'kitchen'
 ORPHAN_REL = 'manuals/long_manual.md'
 BACKENDS = ('pgvector', 'qdrant', 'chroma')
+# The templates this seed starts (their parse_1 and chunk_1 must agree).
+SEED_TEMPLATES = ('postgres', 'rocketride_vector', 'qdrant', 'chroma')
 # The chunker node in the repository; an engine runs its own copy (dist/server/nodes).
 REPO_CHUNKER = cal.NODE
 # The long manual has more than 64 chunks at the calibrated chunking, so at least 64 rows once chunk 0 is gone.
@@ -308,25 +322,40 @@ def verdict(
 
 
 # ---------------------------------------------------------------------------
-# Preflight: what the engine's chunker node would cut
+# Preflight: what the engine at ENGINE_URL would cut and write
 # ---------------------------------------------------------------------------
 
 
-class ChunkerRefused(RuntimeError):
-    """The engine's chunker would not give the calibrated shape; nothing was created or dropped."""
+class SeedRefused(RuntimeError):
+    """A preflight on the engine failed; nothing named vx_legacy_docs was created or dropped."""
 
     def __init__(self, preview: Dict[str, Any]) -> None:
-        super().__init__('; '.join(preview.get('problems') or ['the chunker preflight failed']))
+        super().__init__('; '.join(preview.get('problems') or ['the preflight failed']))
         self.preview = preview
 
 
-def engine_chunker(executable: str = sys.executable) -> Path:
-    """The chunker node file the engine imports.
+class ChunkerRefused(SeedRefused):
+    """The engine's chunker would not give the calibrated shape."""
 
-    That is the ``nodes`` package first on this interpreter's path (run under
-    the engine, which puts a checkout's ``nodes/src`` ahead of its own
-    ``dist/server/nodes``), else the copy next to ``executable``, else the
-    repository's. The package is located, never imported.
+
+class DriverRefused(SeedRefused):
+    """The engine's store drivers do not write the old drivers' shape."""
+
+
+def engine_client():
+    """A client for the engine the seed ingests through (ENGINE_URL)."""
+    from rocketride import RocketRideClient
+
+    return RocketRideClient(uri=fx.ENGINE_URL, auth=fx.API_KEY, request_timeout=900000)
+
+
+def checkout_chunker(executable: str = sys.executable) -> Path:
+    """The chunker node file an engine started from this checkout imports (reported, never obeyed).
+
+    That is the ``nodes`` package first on this interpreter's path (an engine
+    puts a checkout's ``nodes/src`` ahead of its own ``dist/server/nodes``),
+    else the copy next to ``executable``, else the repository's. The package is
+    located, never imported. The engine at ENGINE_URL may run other code.
     """
     try:
         spec = importlib.util.find_spec('nodes')
@@ -336,20 +365,45 @@ def engine_chunker(executable: str = sys.executable) -> Path:
         node = Path(location) / 'preprocessor_langchain' / 'langchain.py'
         if node.is_file():
             return node.resolve()
-    copy = Path(executable).resolve().parent / 'nodes' / 'preprocessor_langchain' / 'langchain.py'
-    return copy if copy.is_file() else REPO_CHUNKER
+    copy_ = Path(executable).resolve().parent / 'nodes' / 'preprocessor_langchain' / 'langchain.py'
+    return copy_ if copy_.is_file() else REPO_CHUNKER
 
 
-def template_strlen(keys: Sequence[str] = ('postgres', 'rocketride_vector', 'qdrant', 'chroma')) -> int:
-    """The chunk length (``strlen``) of chunk_1 in the templates this seed starts (one value for all)."""
-    lengths = set()
+def template_chunking(keys: Sequence[str] = SEED_TEMPLATES) -> Dict[str, Dict[str, Any]]:
+    """``ingest_1``, ``parse_1`` and ``chunk_1`` of the templates this seed starts (they must agree)."""
+    found: Dict[str, Dict[str, Any]] = {}
     for key in keys:
-        (chunker,) = [c for c in fx.load_template(fx.FIXTURES[key].template)['components'] if c['id'] == 'chunk_1']
-        config = chunker['config']
-        lengths.add(int(config[config.get('profile', 'default')]['strlen']))
-    if len(lengths) != 1:
-        raise RuntimeError(f'the templates disagree on the chunk length: {sorted(lengths)}')
-    return lengths.pop()
+        components = {c['id']: c for c in fx.load_template(fx.FIXTURES[key].template)['components']}
+        for cid in ('ingest_1', 'parse_1', 'chunk_1'):
+            part = {k: components[cid][k] for k in ('provider', 'name', 'config', 'input') if k in components[cid]}
+            seen = found.setdefault(cid, part)
+            if {k: seen.get(k) for k in ('provider', 'config', 'input')} != {
+                k: part.get(k) for k in ('provider', 'config', 'input')
+            }:
+                raise RuntimeError(f'the templates disagree on {cid}: {sorted(keys)}')
+    return found
+
+
+def template_strlen(keys: Sequence[str] = SEED_TEMPLATES) -> int:
+    """The chunk length (``strlen``) of chunk_1 in the templates this seed starts (one value for all)."""
+    config = template_chunking(keys)['chunk_1']['config']
+    return int(config[config.get('profile', 'default')]['strlen'])
+
+
+def chunk_probe_pipeline() -> Dict[str, Any]:
+    """The templates' ``ingest_1 -> parse_1 -> chunk_1``, answering with the chunks (no model, no store)."""
+    parts = template_chunking()
+    components = [dict(copy.deepcopy(parts[cid]), id=cid) for cid in ('ingest_1', 'parse_1', 'chunk_1')]
+    components.append(
+        {
+            'id': 'response_1',
+            'provider': 'response_documents',
+            'name': 'Return Documents',
+            'config': {'laneName': 'documents'},
+            'input': [{'lane': 'documents', 'from': 'chunk_1'}],
+        }
+    )
+    return {'name': 'vx-legacy seed chunk probe', 'project_id': str(uuid.uuid4()), 'components': components}
 
 
 def corpus_texts() -> Dict[str, str]:
@@ -358,7 +412,7 @@ def corpus_texts() -> Dict[str, str]:
 
 
 def chunker_preview(texts: Dict[str, str], strlen: int, node_source: str) -> Dict[str, Any]:
-    """What the chunker node in ``node_source`` cuts from ``texts`` with ``strlen``.
+    """What the chunker node in ``node_source`` cuts from ``texts`` with ``strlen`` (needs LangChain).
 
     The node's own keyword filter (``calibrate_chunking.node_splitter_kwargs``)
     is applied to the arguments it builds for LangChain's splitter, so the
@@ -378,6 +432,17 @@ def chunker_preview(texts: Dict[str, str], strlen: int, node_source: str) -> Dic
     }
 
 
+def checkout_preview(strlen: int) -> Dict[str, Any]:
+    """What this checkout's chunker node would cut (``passes_chunk_size`` None when that cannot be read here)."""
+    node = checkout_chunker()
+    try:
+        preview = chunker_preview(corpus_texts(), strlen, node.read_text(encoding='utf-8'))
+    except (ImportError, RuntimeError, OSError) as error:
+        preview = {'passes_chunk_size': None, 'unread': f'{type(error).__name__}: {error}'}
+    preview['node'] = str(node)
+    return preview
+
+
 def chunking_problems(preview: Dict[str, Any]) -> List[str]:
     """Why ``preview`` would not seed the calibrated shape (empty when it would)."""
     problems = []
@@ -395,14 +460,25 @@ def chunking_problems(preview: Dict[str, Any]) -> List[str]:
     return problems
 
 
-def chunker_check() -> Dict[str, Any]:
-    """Preview the engine's chunker on the corpus with the templates' length; ``problems`` says what is wrong."""
-    node = engine_chunker()
-    preview = chunker_preview(corpus_texts(), template_strlen(), node.read_text(encoding='utf-8'))
-    preview['node'] = str(node)
+async def chunker_check(client, root: Path, files: Sequence[Path]) -> Dict[str, Any]:
+    """Run the templates' chunking on the engine over the corpus files; ``problems`` says what is wrong.
+
+    The engine's answer decides; ``checkout_node`` records what this checkout's
+    chunker node would cut, which explains a refusal when the engine runs it.
+    """
+    lengths = await cal.measure_pipeline(client, files, root, chunk_probe_pipeline())
+    every = sorted(n for parts in lengths.values() for n in parts if n)
+    strlen = template_strlen()
+    preview = {
+        'engine': fx.ENGINE_URL,
+        'strlen': strlen,
+        'documents': len(lengths),
+        'chunks': len(every),
+        'long_manual_chunks': len(lengths.get(ORPHAN_REL, [])),
+        'median_chunk_chars': int(statistics.median(every)) if every else None,
+    }
     preview['problems'] = chunking_problems(preview)
-    if not preview['passes_chunk_size']:
-        preview['problems'].append(f'{node} drops chunk_size: its splitter keeps its own 4,000-character default')
+    preview['checkout_node'] = checkout_preview(strlen)
     return preview
 
 
@@ -432,15 +508,22 @@ def pg_exists(table: str) -> bool:
         return bool(cur.fetchone()[0])
 
 
+def pg_drop(table: str) -> None:
+    from psycopg2 import sql
+
+    with _pg() as conn, conn.cursor() as cur:
+        cur.execute(sql.SQL('DROP TABLE IF EXISTS {}').format(sql.Identifier(_guard(table))))
+
+
 def pg_create(table: str, recreate: bool) -> None:
     """Create the legacy table and its control row (dropping it first with --recreate)."""
     from psycopg2 import sql
 
+    if recreate:
+        pg_drop(table)
     conn = _pg()
     try:
         with conn.cursor() as cur:
-            if recreate:
-                cur.execute(sql.SQL('DROP TABLE IF EXISTS {}').format(sql.Identifier(_guard(table))))
             cur.execute(LEGACY_DDL.format(table=sql.Identifier(table).as_string(conn), dim=fx.EMBEDDING_DIMENSION))
             row = control_row()
             columns = list(row)
@@ -631,6 +714,11 @@ def chroma_facts(collection: str) -> Dict[str, Any]:
     return facts
 
 
+def collection_shape(backend: str, name: str) -> Dict[str, Any]:
+    """The shape facts of one collection (see shape_problems)."""
+    return {'pgvector': pg_facts, 'qdrant': qdrant_facts, 'chroma': chroma_facts}[backend](name)['shape']
+
+
 # ---------------------------------------------------------------------------
 # Ingest through the engine (the old drivers write the rows)
 # ---------------------------------------------------------------------------
@@ -649,21 +737,46 @@ async def ingest(client, key: str, collection: str, files: Sequence[Tuple[Path, 
         await client.terminate(tokens['ingest_1'])
 
 
+def _drop_probe(backend: str) -> None:
+    {'pgvector': pg_drop, 'qdrant': qdrant_drop, 'chroma': chroma_drop}[backend](PROBE)
+
+
+async def driver_check(client, todo: Sequence[str], root: Path) -> Dict[str, Any]:
+    """Write one small corpus file through every driver the seed would use into PROBE and read its shape.
+
+    ``problems`` lists where that shape is not the old drivers' (shape_problems,
+    as right after a seed). The probe is dropped again whatever happens.
+    """
+    probe = root / PROBE_REL
+    report: Dict[str, Any] = {'engine': fx.ENGINE_URL, 'collection': PROBE, 'problems': []}
+    try:
+        for backend in todo:
+            if backend == 'pgvector':
+                pg_create(PROBE, recreate=True)
+                await ingest(client, 'postgres', PROBE, [(probe, PREFIX + PROBE_REL)])
+                await ingest(client, 'rocketride_vector', PROBE, [(probe, RR_PREFIX + PROBE_REL)])
+            else:
+                _drop_probe(backend)
+                await ingest(client, backend, PROBE, [(probe, PREFIX + PROBE_REL)])
+            report[backend] = collection_shape(backend, PROBE)
+            report['problems'] += shape_problems(backend, report[backend], seeded_now=True)
+    finally:
+        for backend in todo:
+            _drop_probe(backend)
+    return report
+
+
 async def seed(backends: Sequence[str], recreate: bool) -> Dict[str, Any]:
     """Seed the selected backends that are missing (or all of them with --recreate).
 
-    Raises ChunkerRefused, before anything is created or dropped, when the
-    engine's chunker would not give the calibrated shape.
+    Raises ChunkerRefused or DriverRefused, before anything named LEGACY is
+    created or dropped, when the engine at ENGINE_URL would not cut the
+    calibrated chunks or its drivers do not write the old shape.
     """
     exists = {'pgvector': pg_exists, 'qdrant': qdrant_exists, 'chroma': chroma_exists}
     todo = [b for b in BACKENDS if b in backends and (recreate or not exists[b](LEGACY))]
     if not todo:
         return {}
-    preview = chunker_check()
-    if preview['problems']:
-        raise ChunkerRefused(preview)
-
-    from rocketride import RocketRideClient
 
     corpus = _corpus()
     notes: Dict[str, Any] = {}
@@ -677,7 +790,13 @@ async def seed(backends: Sequence[str], recreate: bool) -> Dict[str, Any]:
             if p.relative_to(root).parts[0] == RR_FOLDER
         ]
         orphan_id = fx.object_id(PREFIX + ORPHAN_REL)
-        async with RocketRideClient(uri=fx.ENGINE_URL, auth=fx.API_KEY, request_timeout=900000) as client:
+        async with engine_client() as client:
+            preview = await chunker_check(client, root, written)
+            if preview['problems']:
+                raise ChunkerRefused(preview)
+            drivers = await driver_check(client, todo, root)
+            if drivers['problems']:
+                raise DriverRefused(drivers)
             if 'pgvector' in todo:
                 pg_create(LEGACY, recreate)
                 await ingest(client, 'postgres', LEGACY, files)
@@ -700,8 +819,10 @@ async def seed(backends: Sequence[str], recreate: bool) -> Dict[str, Any]:
                 await ingest(client, 'chroma', LEGACY, files)
                 chroma_plant_orphan(LEGACY, orphan_id)
                 notes['chroma'] = {'seeded': True}
-    for note in notes.values():
-        note['chunker'] = {k: preview[k] for k in ('node', 'strlen', 'long_manual_chunks', 'median_chunk_chars')}
+    chunker = {k: preview[k] for k in ('engine', 'strlen', 'long_manual_chunks', 'median_chunk_chars', 'checkout_node')}
+    for backend, note in notes.items():
+        note['chunker'] = chunker
+        note['drivers'] = drivers.get(backend)
     return notes
 
 
@@ -763,7 +884,7 @@ def main() -> int:
         parser.error(f'unknown backend(s): {", ".join(unknown)}')
     try:
         notes = {} if args.verify_only else asyncio.run(seed(backends, args.recreate))
-    except ChunkerRefused as refused:
+    except SeedRefused as refused:
         print(json.dumps({'seeded': {}, 'refused': refused.preview}, indent=2, default=str))
         return 1
     facts, problems = verify(backends, seeded_now=list(notes))

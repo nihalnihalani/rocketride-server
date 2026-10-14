@@ -8,9 +8,11 @@ They check that its verification cannot pass a collection that is not what the
 driver suites expect (one control record, exactly the planted document without
 chunk 0, every document present, the calibrated chunk shape, and the old
 drivers' shape: random point ids, only the old metadata keys, only the old
-columns), that a seed on a chunker that ignores the chunk length is refused
-before any collection is dropped, that it only ever drops the legacy names, and
-that the control row matches the old driver's columns.
+columns), that a seed is refused before any collection is dropped when the
+engine it ingests through would cut the corpus without the chunk length or
+write the new drivers' shape (whatever this checkout's own files say), that it
+only ever drops the legacy names, and that the control row matches the old
+driver's columns. The engine is a stand-in here.
 
 Run: python3 -m unittest discover -s scripts/acceptance/vector-explorer/selftest -v
 """
@@ -254,7 +256,7 @@ class VerifyShapeTests(unittest.TestCase):
 
 
 class ChunkerPreflightTests(unittest.TestCase):
-    """Before seeding, the engine's own chunker node is asked what it would cut (no engine call)."""
+    """What a chunker node file would cut (the seed reports it for this checkout's node; no engine call)."""
 
     def setUp(self):
         if seed.cal.node_splitter_kwargs({}) is None:
@@ -284,7 +286,7 @@ class ChunkerPreflightTests(unittest.TestCase):
 
 
 class ChunkerLocationTests(unittest.TestCase):
-    """The node file checked is the one the engine imports, not merely a copy lying next to it."""
+    """The checkout's node file the seed reports is the one an engine started from this checkout imports."""
 
     def setUp(self):
         self.saved_path = list(sys.path)
@@ -304,56 +306,211 @@ class ChunkerLocationTests(unittest.TestCase):
         node.write_text('# a chunker node\n', encoding='utf-8')
         return node
 
-    def test_the_nodes_package_the_engine_imports_wins_over_its_dist_copy(self):
-        # The engine puts the checkout's nodes/src ahead of dist/server on its path: that copy runs.
+    def test_the_nodes_package_on_the_path_wins_over_the_dist_copy(self):
+        # An engine puts the checkout's nodes/src ahead of dist/server on its path: that copy runs.
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp).resolve()
             imported = self._node(root / 'src')
             self._node(root / 'dist')
             sys.path.insert(0, str(root / 'src'))
-            self.assertEqual(seed.engine_chunker(str(root / 'dist' / 'engine')), imported)
+            self.assertEqual(seed.checkout_chunker(str(root / 'dist' / 'engine')), imported)
 
     def test_without_an_importable_nodes_package_the_copy_next_to_the_engine_is_checked(self):
         sys.path[:] = [p for p in sys.path if not (Path(p) / 'nodes' / '__init__.py').is_file()]
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp).resolve()
-            self.assertEqual(seed.engine_chunker(str(root / 'engine')), seed.REPO_CHUNKER)
+            self.assertEqual(seed.checkout_chunker(str(root / 'engine')), seed.REPO_CHUNKER)
             copy = self._node(root)
-            self.assertEqual(seed.engine_chunker(str(root / 'engine')), copy)
+            self.assertEqual(seed.checkout_chunker(str(root / 'engine')), copy)
 
     def test_the_seed_uses_the_templates_chunk_length(self):
         self.assertEqual(seed.template_strlen(), 1000)
 
 
+class FakeEngine:
+    """An engine stand-in at ENGINE_URL: a chunk probe answers fixed-size slices of each uploaded file."""
+
+    def __init__(self, size: int) -> None:
+        self.size = size
+        self.used = []
+        self.uploads = []
+        self.terminated = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def use(self, *, pipeline, source, ttl=None, **kwargs):
+        self.used.append((pipeline, source, ttl))
+        return {'token': f'task-{len(self.used)}'}
+
+    async def send_files(self, files, token):
+        out = []
+        for path, info in files:
+            self.uploads.append(info['name'])
+            text = Path(path).read_text(encoding='utf-8')
+            pieces = [text[i : i + self.size] for i in range(0, len(text), self.size)]
+            out.append({'result': {'documents': [{'page_content': piece} for piece in pieces]}})
+        return out
+
+    async def terminate(self, token):
+        self.terminated.append(token)
+
+
+def run_check(engine):
+    """chunker_check on the corpus against ``engine``."""
+    corpus = seed._corpus()
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        return asyncio.run(seed.chunker_check(engine, root, corpus.write_corpus(root)))
+
+
+class EnginePreflightTests(unittest.TestCase):
+    """The chunker preflight asks the engine the seed ingests through (ENGINE_URL), not this checkout's file."""
+
+    def test_the_probe_runs_the_templates_parse_and_chunk_lanes_on_the_engine(self):
+        engine = FakeEngine(900)
+        preview = run_check(engine)
+        ((pipeline, source, ttl),) = engine.used
+        self.assertEqual(source, 'ingest_1')
+        self.assertEqual(ttl, 0)
+        parts = {c['id']: c for c in pipeline['components']}
+        template = {c['id']: c for c in seed.fx.load_template('postgres')['components']}
+        for cid in ('ingest_1', 'parse_1', 'chunk_1'):
+            self.assertEqual(parts[cid]['provider'], template[cid]['provider'], cid)
+            self.assertEqual(parts[cid]['config'], template[cid]['config'], cid)
+        self.assertEqual(parts['response_1']['provider'], 'response_documents')
+        self.assertEqual(parts['response_1']['input'], [{'lane': 'documents', 'from': 'chunk_1'}])
+        self.assertNotIn('embed_1', parts)
+        self.assertEqual(len(engine.uploads), 40)
+        self.assertEqual(engine.terminated, ['task-1'])
+        self.assertEqual(preview['engine'], seed.fx.ENGINE_URL)
+        self.assertEqual((preview['long_manual_chunks'], preview['median_chunk_chars']), (145, 900))
+        self.assertEqual(preview['problems'], [])
+
+    def test_an_engine_that_cuts_4000_character_chunks_is_refused(self):
+        preview = run_check(FakeEngine(4000))
+        self.assertEqual(preview['long_manual_chunks'], 33)
+        self.assertTrue(any('long manual' in p for p in preview['problems']), preview['problems'])
+        self.assertTrue(any('median' in p for p in preview['problems']), preview['problems'])
+
+    def test_an_engine_that_answers_no_chunks_is_refused(self):
+        preview = run_check(FakeEngine(10**9))
+        self.assertTrue(preview['problems'])
+
+
 class SeedRefusalTests(unittest.TestCase):
-    """A seed on a chunker that ignores the length is refused before any collection is touched."""
+    """A seed the engine would get wrong is refused before any legacy collection is touched."""
+
+    TOUCH = (
+        'pg_create',
+        'pg_drop',
+        'qdrant_drop',
+        'chroma_drop',
+        'pg_plant_orphan',
+        'qdrant_plant_orphan',
+        'chroma_plant_orphan',
+    )
 
     def setUp(self):
         self.calls = []
-        names = ('pg_create', 'qdrant_drop', 'chroma_drop', 'pg_plant_orphan', 'qdrant_plant_orphan', 'ingest')
-        self.saved = {
-            n: getattr(seed, n) for n in names + ('chunker_check', 'pg_exists', 'qdrant_exists', 'chroma_exists')
-        }
-        for n in names:
-            setattr(seed, n, lambda *a, _n=n, **k: self.calls.append(_n))
+        names = self.TOUCH + ('ingest', 'pg_chunk_ids', 'collection_shape', 'checkout_chunker', 'engine_client')
+        self.saved = {n: getattr(seed, n) for n in names + ('pg_exists', 'qdrant_exists', 'chroma_exists')}
+        for n in self.TOUCH:
+            setattr(seed, n, lambda name, *a, _n=n, **k: self.calls.append((_n, name)))
+
+        async def ingest(client, key, collection, files):
+            self.calls.append(('ingest', key, collection))
+
+        seed.ingest = ingest
+        seed.pg_chunk_ids = lambda name, object_id: list(range(160))
         for n in ('pg_exists', 'qdrant_exists', 'chroma_exists'):
             setattr(seed, n, lambda *a: False)
+        self.engine = FakeEngine(900)
+        seed.engine_client = lambda: self.engine
+        self.shape = self.old_shape
 
     def tearDown(self):
         for n, f in self.saved.items():
             setattr(seed, n, f)
 
-    def test_a_refused_preflight_touches_nothing(self):
-        seed.chunker_check = lambda: {'long_manual_chunks': 35, 'median_chunk_chars': 3407, 'problems': ['short']}
+    @staticmethod
+    def old_shape(backend, name):
+        return (
+            OLD_PG_SHAPE
+            if backend == 'pgvector'
+            else seed.point_shape([(str(uuid.uuid4()), OLD_META, ('content', 'meta'))])
+        )
+
+    @staticmethod
+    def new_shape(backend, name):
+        if backend == 'pgvector':
+            return {'columns': sorted(seed.LEGACY_COLUMNS | {'meta'}), 'meta_rows': 1}
+        return seed.point_shape([(seed.derived_id('o', 1), dict(OLD_META, **NEW_META), ('content', 'meta'))])
+
+    def run_seed(self, recreate=True):
+        seed.collection_shape = lambda backend, name: self.shape(backend, name)
+        return asyncio.run(seed.seed(list(seed.BACKENDS), recreate=recreate))
+
+    def legacy_calls(self):
+        return [c for c in self.calls if seed.LEGACY in c]
+
+    def node_file(self, source):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        node = Path(tmp.name) / 'langchain.py'
+        node.write_text(source, encoding='utf-8')
+        seed.checkout_chunker = lambda *a: node
+
+    def test_an_engine_that_ignores_the_length_is_refused_although_this_checkouts_node_passes_it(self):
+        self.engine.size = 4000
+        self.node_file(FILTER_MRO)
         with self.assertRaises(seed.ChunkerRefused) as refused:
-            asyncio.run(seed.seed(list(seed.BACKENDS), recreate=True))
-        self.assertEqual(refused.exception.preview['problems'], ['short'])
+            self.run_seed()
+        self.assertEqual(refused.exception.preview['engine'], seed.fx.ENGINE_URL)
         self.assertEqual(self.calls, [])
+
+    def test_an_engine_that_cuts_the_calibrated_shape_seeds_although_this_checkouts_node_drops_the_length(self):
+        self.node_file(FILTER_OWN_INIT)
+        notes = self.run_seed()
+        self.assertEqual(sorted(notes), sorted(seed.BACKENDS))
+        self.assertIn(('pg_create', seed.LEGACY), self.calls)
+        self.assertIn(('ingest', 'qdrant', seed.LEGACY), self.calls)
+        chunker = notes['pgvector']['chunker']
+        self.assertEqual((chunker['engine'], chunker['long_manual_chunks']), (seed.fx.ENGINE_URL, 145))
+        # This checkout's node is reported, not obeyed.
+        self.assertIn(chunker['checkout_node']['passes_chunk_size'], (False, None))
+
+    def test_an_engine_whose_drivers_write_the_new_shape_is_refused_before_a_legacy_name_is_touched(self):
+        self.node_file(FILTER_MRO)
+        self.shape = self.new_shape
+        with self.assertRaises(seed.DriverRefused) as refused:
+            self.run_seed()
+        problems = refused.exception.preview['problems']
+        for backend in seed.BACKENDS:
+            self.assertTrue(any(p.startswith(backend) for p in problems), (backend, problems))
+        self.assertEqual(self.legacy_calls(), [])
+        # Only the probe collection was written, through every driver the seed uses, and it is gone again.
+        written = {(c[1], c[2]) for c in self.calls if c[0] == 'ingest'}
+        self.assertEqual(written, {(k, seed.PROBE) for k in ('postgres', 'rocketride_vector', 'qdrant', 'chroma')})
+        for drop in ('pg_drop', 'qdrant_drop', 'chroma_drop'):
+            self.assertEqual(self.calls[-3:].count((drop, seed.PROBE)), 1, (drop, self.calls[-3:]))
+
+    def test_the_driver_probe_runs_before_the_seed_and_cleans_up(self):
+        self.node_file(FILTER_MRO)
+        notes = self.run_seed()
+        first_legacy = self.calls.index(self.legacy_calls()[0])
+        probe = [c for c in self.calls[:first_legacy] if seed.PROBE in c]
+        self.assertTrue(probe)
+        self.assertFalse([c for c in self.calls[first_legacy:] if seed.PROBE in c])
+        self.assertEqual(notes['qdrant']['drivers']['id_versions'], {'4': 1})
 
     def test_nothing_to_seed_needs_no_preflight(self):
         for n in ('pg_exists', 'qdrant_exists', 'chroma_exists'):
             setattr(seed, n, lambda *a: True)
-        seed.chunker_check = lambda: self.fail('the preflight ran although nothing is seeded')
+        seed.engine_client = lambda: self.fail('the engine was asked although nothing is seeded')
         self.assertEqual(asyncio.run(seed.seed(list(seed.BACKENDS), recreate=False)), {})
         self.assertEqual(self.calls, [])
 
@@ -380,6 +537,13 @@ class SafetyTests(unittest.TestCase):
             [k for k, v in row.items() if v is None],
             ['nodeid', 'parent', 'permissionid', 'istable', 'tableid', 'signature'],
         )
+
+    def test_the_driver_probe_is_a_legacy_name_and_one_small_corpus_file(self):
+        self.assertEqual(seed._guard(seed.PROBE), seed.PROBE)
+        self.assertNotEqual(seed.PROBE, seed.LEGACY)
+        texts = seed.corpus_texts()
+        self.assertIn(seed.PROBE_REL, texts)
+        self.assertLess(len(texts[seed.PROBE_REL]), seed.template_strlen())  # a single chunk
 
     def test_paths_are_posix_under_the_legacy_prefix(self):
         corpus = seed._corpus()

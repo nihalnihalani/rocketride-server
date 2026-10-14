@@ -196,7 +196,12 @@ def setting_ignored(candidates: Dict[str, Dict[str, Any]]) -> bool:
 
 async def measure(client, files: List[Path], root: Path, strlen: int) -> Dict[str, List[int]]:
     """Run one candidate over the corpus; chunk lengths by relative path."""
-    task = await client.use(pipeline=probe_pipeline(chunk_config(strlen)), source='ingest_1', ttl=0)
+    return await measure_pipeline(client, files, root, probe_pipeline(chunk_config(strlen)))
+
+
+async def measure_pipeline(client, files: List[Path], root: Path, pipeline: Dict[str, Any]) -> Dict[str, List[int]]:
+    """Send the files through ``pipeline`` (source ``ingest_1``, answering documents); chunk lengths by relative path."""
+    task = await client.use(pipeline=pipeline, source='ingest_1', ttl=0)
     try:
         out: Dict[str, List[int]] = {}
         for path in files:
