@@ -82,6 +82,19 @@ export interface ChatDeps {
 	announce(message: string): void;
 }
 
+/**
+ * What the end of the thread shows: it changes when a question is posted and
+ * again when that question ends (answered, failed, timed out or stopped), so
+ * the panel scrolls to an answer when it arrives, not only to the question.
+ *
+ * @param turns - The thread.
+ * @returns A key that changes whenever the end of the thread does.
+ */
+export function threadScrollKey(turns: readonly ChatTurn[]): string {
+	const last = turns[turns.length - 1];
+	return last === undefined ? '0' : `${turns.length}:${last.id}:${last.status}`;
+}
+
 /** One connection's conversation. */
 export interface ChatSession {
 	getState(): ChatState;

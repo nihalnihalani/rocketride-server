@@ -37,7 +37,7 @@ import path from 'node:path';
 import { ExplorerToolError } from 'shared/explorer';
 import type { IGenerationTicket } from 'shared/explorer';
 import { CHAT_TIMEOUT_MS, CHAT_TIMEOUT_SENTENCE } from '../src/vector/chatResult';
-import { HISTORY_MAX, STOPPED_SENTENCE, createChatSession } from '../src/chat/chatSession';
+import { HISTORY_MAX, STOPPED_SENTENCE, createChatSession, threadScrollKey } from '../src/chat/chatSession';
 import type { ChatDeps, ChatTurn } from '../src/chat/chatSession';
 
 /** Most a test here may take: they await fakes, so a regression must fail, not hang the run. */
@@ -127,6 +127,30 @@ test('chat: a question is asked once, with a 120 s wait and a generation ticket'
 	assert.equal(session.getState().asking, false);
 	assert.equal(fake.answered.length, 1);
 	assert.ok(fake.announced.includes('Answer received with 3 sources.'));
+});
+
+test('chat: the thread scrolls when a question is posted and again when its answer arrives', async () => {
+	const fake = fakeDeps();
+	const session = createChatSession(fake.deps);
+	const keys = [threadScrollKey(session.getState().turns)];
+	const sending = session.send('Where does Falcon Station get its water?', null);
+	await flush();
+	keys.push(threadScrollKey(session.getState().turns));
+	fake.asks[0].answer.resolve(WITH_DOCUMENTS);
+	await sending;
+	keys.push(threadScrollKey(session.getState().turns));
+	// Each step changes what the thread shows at its end, so each must scroll.
+	assert.equal(new Set(keys).size, 3, keys.join(' | '));
+	// A change elsewhere in the state (a refused second send) does not.
+	const before = threadScrollKey(session.getState().turns);
+	void session.send('', null);
+	assert.equal(threadScrollKey(session.getState().turns), before);
+	// A question that ends without an answer (Stop waiting) also changes the end of the thread.
+	void session.send('Second question?', null);
+	await flush();
+	const asking = threadScrollKey(session.getState().turns);
+	session.stopWaiting();
+	assert.notEqual(threadScrollKey(session.getState().turns), asking);
 });
 
 test('chat: one question in flight per connection; a second send is refused, not queued', async () => {

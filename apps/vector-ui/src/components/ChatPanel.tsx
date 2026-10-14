@@ -42,6 +42,7 @@ import type { CSSProperties } from 'react';
 import { EmptyState, commonStyles } from 'shell';
 import type { ChatPanelProps, IChatSource } from '../contract/types';
 import { useVectorChat } from '../chat/useVectorChat';
+import { threadScrollKey } from '../chat/chatSession';
 import type { ChatTurn } from '../chat/chatSession';
 import { Markdown } from '../chat/Markdown';
 import { CHAT_MAX_CHARS, summariseSources } from '../vector/chatResult';
@@ -162,11 +163,13 @@ export function ChatPanel(props: ChatPanelProps): React.ReactElement {
 	const [debugging, setDebugging] = useState<number | null>(null);
 	const thread = useRef<HTMLDivElement>(null);
 	const turns = chat.state.turns;
+	const scrollKey = threadScrollKey(turns);
 
+	// Scroll to the end when a question is posted and again when its answer (often much taller) arrives.
 	useEffect(() => {
 		const element = thread.current;
 		if (element && element.scrollHeight > element.clientHeight) element.scrollTop = element.scrollHeight;
-	}, [turns.length]);
+	}, [scrollKey]);
 
 	const available = model.chat.enabled && channels.chat !== null;
 	const llm = model.nodes.llmName;

@@ -141,6 +141,13 @@ test('wiring: answers render through the safe Markdown renderer, never the shell
 	for (const file of FILES) assert.doesNotMatch(code(file), /\bMarkdownRenderer\b|\bChatView\b|\bMessageList\b|\buseChatMessages\b/, path.relative(SRC, file));
 });
 
+test('wiring: the chat thread scrolls on the key that changes when an answer arrives, not on the turn count alone', () => {
+	const panel = source(path.join('components', 'ChatPanel.tsx'));
+	assert.match(panel, /const scrollKey = threadScrollKey\(turns\);/);
+	assert.match(panel, /element\.scrollTop = element\.scrollHeight;\s*\}, \[scrollKey\]\);/);
+	assert.doesNotMatch(panel, /\}, \[turns\.length\]\);/);
+});
+
 test('wiring: the replace dialog moves the focus to Cancel when it opens', () => {
 	const dialog = source(path.join('ingest', 'ReplaceConfirmDialog.tsx'));
 	assert.match(dialog, /useEffect\(\(\) => \{\s*focusCancelIn\(anchor\.current, question\.cancelLabel\);/);
