@@ -268,9 +268,10 @@ record each server's version.
    engine seeds an app version once per store, so use a fresh store after a
    rebuild (see "Trying a production build on a local engine" in
    [the apps index](index.md#trying-a-production-build-on-a-local-engine)).
-3. Start the fixture pipelines with `start_fixtures.py` (one per supported
-   store, all three sources, no idle timeout, the stub LLM in place of a
-   model).
+3. Start the fixture pipelines with `start_fixtures.py`: one template for each
+   of the four stores Vector Explorer is built for, with all three sources,
+   plus a RAG pipeline without a Tools source for the read-only card; no idle
+   timeout, and the stub LLM in place of a model.
 4. Open the engine's URL in a browser, sign in with any non-empty key on an
    OSS engine, and open Vector Explorer.
 
