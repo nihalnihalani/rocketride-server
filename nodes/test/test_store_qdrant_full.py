@@ -34,6 +34,7 @@ import importlib.util
 import math
 import os
 import sys
+import time
 import types
 import urllib.request
 import uuid
@@ -513,6 +514,72 @@ def test_scale_default_sample_graph_is_computed_on_the_node(scale_store, monkeyp
     assert RAW.collection_exists(scale_store.collection)
     if before is not None and after is not None:
         assert after - before < 64, (before, after)
+
+
+# --- past the document cap (COUNT_DOCUMENTS_CAP + 503 documents) ----------------------------
+
+
+@pytest.fixture(scope='module')
+def capped_store():
+    """One-row documents 500 past the driver's document cap, plus three whose only row is chunk 1."""
+    from ai.common.schema import Doc, DocMetadata
+
+    store = _store(_new_collection('capped'))
+    rng = np.random.default_rng(31)
+    rows = [(f'cap-{d:05d}', 0) for d in range(drv.Store.COUNT_DOCUMENTS_CAP + 500)]
+    rows += [(oid, 1) for oid in contract.SCALE_ORPHANS]
+    docs = []
+    for oid, chunk in rows:
+        v = rng.normal(size=8)
+        metadata = DocMetadata(
+            objectId=oid,
+            chunkId=chunk,
+            nodeId='chunk_1',
+            parent=f'/srv/vx-capped/{oid}.txt',
+            permissionId=0,
+            isDeleted=False,
+            isTable=False,
+            tableId=0,
+        )
+        doc = Doc(page_content=f'{oid} chunk {chunk}', metadata=metadata)
+        doc.embedding = (v / np.linalg.norm(v)).tolist()
+        doc.embedding_model = contract.MODEL
+        docs.append(doc)
+    store.addChunks(docs)
+    return store, len(rows)
+
+
+def test_capped_listing_has_no_slow_page_and_never_facets_over_the_counted_ids(capped_store, monkeypatch):
+    # On qdrant 1.17.1 an exact facet over a MatchAny of the 10,000 counted ids took 17-35 s
+    # (500 ids: 0.05 s), which made the page where the chunk-0 rows run out stall the listing.
+    store, documents = capped_store
+    calls = []
+    facet = store.client.facet
+
+    def spy(*args, **kwargs):
+        conditions = getattr(kwargs.get('facet_filter'), 'must', None) or []
+        lists = [c.match.any for c in conditions if getattr(getattr(c, 'match', None), 'any', None) is not None]
+        calls.append(max((len(values) for values in lists), default=0))
+        return facet(*args, **kwargs)
+
+    monkeypatch.setattr(store.client, 'facet', spy)
+    seen, orphans, slowest, cursor = [], [], 0.0, None
+    for _ in range(documents // 500 + 5):
+        started = time.monotonic()
+        page = store.listDocuments(cursor=cursor, limit=500, object_ids=None, deleted='active', sort='path')
+        slowest = max(slowest, time.monotonic() - started)
+        assert 'document_count_capped' in page.caveats and page.total is None
+        seen += [i.objectId for i in page.items]
+        orphans += [i.objectId for i in page.items if not i.has_first_chunk]
+        cursor = page.next_cursor
+        if cursor is None:
+            break
+    assert cursor is None, 'the listing never ended'
+    assert len(seen) == len(set(seen))
+    assert set(seen) >= {f'cap-{d:05d}' for d in range(drv.Store.COUNT_DOCUMENTS_CAP + 500)}
+    assert set(orphans) <= set(contract.SCALE_ORPHANS)  # capped may miss one, never invents one
+    assert max(calls) <= 500, max(calls)  # no facet over more objectIds than one page holds
+    assert slowest < 5, f'slowest page {slowest:.1f}s'
 
 
 @pytest.mark.parametrize('shape', ['new', 'legacy'])
