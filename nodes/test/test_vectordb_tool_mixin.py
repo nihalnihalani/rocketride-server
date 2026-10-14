@@ -2398,6 +2398,80 @@ def test_objdir_clamps_the_limit():
     assert len(node(store).objdir({'limit': 0})['entries']) == 1
 
 
+class _EmptyPageListing(VectorMemoryStore):
+    """A native listing that filters every page to nothing but still hands out a cursor."""
+
+    def listDocuments(self, *, cursor, limit, object_ids, deleted, sort):
+        self.calls.append(('listDocuments', cursor, limit))
+        pages = len(_backend_calls(self, 'listDocuments'))
+        if pages > 200:
+            raise RuntimeError(f'asked for {pages} pages: the listing loop does not end')
+        return DocPage([], f'c{pages}', None, False, True, True, [])
+
+
+class _RepeatingListing(VectorMemoryStore):
+    """A native listing that ignores its cursor: every page is the first one, with a fresh cursor."""
+
+    def listDocuments(self, *, cursor, limit, object_ids, deleted, sort):
+        self.calls.append(('listDocuments', cursor, limit))
+        pages = len(_backend_calls(self, 'listDocuments'))
+        if pages > 200:
+            raise RuntimeError(f'asked for {pages} pages: the listing loop does not end')
+        firsts = [doc for key, doc in self.rows.items() if key[1] == 0 and key[0] != 'schema']
+        return DocPage([_store_module.documentRow(doc) for doc in firsts], f'c{pages}', None, False, True, True, [])
+
+
+@pytest.mark.parametrize('store_cls', [_EmptyPageListing, _RepeatingListing])
+def test_objdir_stops_paging_a_listing_that_brings_nothing_new(store_cls):
+    store = store_cls().seed(corpus({'a': [0], 'b': [0]}))
+    answer = node(store).objdir({})
+    assert answer['success'] is True
+    expected = [] if store_cls is _EmptyPageListing else ['a', 'b']
+    assert sorted(entry['objectId'] for entry in answer['entries']) == expected
+    assert len(_backend_calls(store, 'listDocuments')) <= 3
+
+
+def test_objdir_stops_when_the_listing_reports_it_cannot_page():
+    class Unpageable(VectorMemoryStore):
+        def listDocuments(self, *, cursor, limit, object_ids, deleted, sort):
+            self.calls.append(('listDocuments', cursor, limit))
+            page = len(_backend_calls(self, 'listDocuments'))
+            row = _store_module.documentRow(make_doc(f'p{page}', 0))
+            return DocPage([row], f'c{page}', None, False, True, True, ['documents_paging_unsupported'])
+
+    store = Unpageable().seed(corpus({'a': [0]}))
+    answer = node(store).objdir({})
+    assert [entry['objectId'] for entry in answer['entries']] == ['p1']
+    assert len(_backend_calls(store, 'listDocuments')) == 1
+
+
+def test_objdir_stops_at_its_time_budget(monkeypatch):
+    clock = [100.0]
+
+    class Slow(VectorMemoryStore):
+        def listDocuments(self, *, cursor, limit, object_ids, deleted, sort):
+            self.calls.append(('listDocuments', cursor, limit))
+            page = len(_backend_calls(self, 'listDocuments'))
+            clock[0] += 31.0
+            return DocPage(
+                [_store_module.documentRow(make_doc(f'p{page}', 0))], f'c{page}', None, False, True, True, []
+            )
+
+    monkeypatch.setattr(vx_tools, '_monotonic', lambda: clock[0])
+    store = Slow().seed(corpus({'a': [0]}))
+    answer = node(store).objdir({})
+    assert answer['success'] is True and len(answer['entries']) == 2
+    assert len(_backend_calls(store, 'listDocuments')) == 2
+
+
+@pytest.mark.parametrize('store_cls', [_EmptyPageListing, _RepeatingListing])
+def test_sample_stops_paging_a_listing_that_brings_nothing_new(store_cls):
+    store = store_cls().seed(corpus({'a': [0, 1], 'b': [0, 1]}, dim=8))
+    answer = node(store).sample({'n': 10})
+    assert answer['success'] is True and answer['n'] == 4
+    assert len(_backend_calls(store, 'listDocuments')) <= 3
+
+
 # ---------------------------------------------------------------------------
 # concurrency smoke: a sample and a neighbour search on one store
 # ---------------------------------------------------------------------------

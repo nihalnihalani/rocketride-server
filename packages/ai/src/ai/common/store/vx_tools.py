@@ -88,6 +88,12 @@ OBJDIR_SCAN_MAX = 10000
 #: Documents the sampler lists to build its key space.
 SAMPLE_LISTING_MAX = 500
 
+#: Pages in a row a document listing may answer without a new document before paging stops.
+LISTING_STALE_PAGES = 2
+
+#: Pages a document listing may take beyond the ones its row budget needs.
+LISTING_SLACK_PAGES = 8
+
 #: Keys read through ``getVectors`` in one call.
 VECTOR_READ_BATCH = 500
 
@@ -658,6 +664,35 @@ def _vx_state(store: Any) -> _VxState:
                 state = _VxState()
                 store._vx_state = state
     return state
+
+
+class ListingGuard:
+    """Ends a cursor loop over ``listDocuments`` that would not end on its own.
+
+    Paging stops when the page has no cursor, when the driver reports
+    ``documents_paging_unsupported``, after :data:`LISTING_STALE_PAGES` pages in a row
+    that bring no new document (empty pages handed out with a cursor, a backend that
+    ignores the cursor), after the pages ``rows_wanted`` needs plus
+    :data:`LISTING_SLACK_PAGES`, or once ``budget_s`` seconds have passed.
+    """
+
+    def __init__(self, rows_wanted: int, page_size: int, budget_s: Optional[float] = None) -> None:
+        self.max_pages = -(-max(1, int(rows_wanted)) // max(1, int(page_size))) + LISTING_SLACK_PAGES
+        self.deadline = None if budget_s is None else _monotonic() + budget_s
+        self.pages = 0
+        self.stale = 0
+
+    def stop(self, page: Any, new_documents: int) -> bool:
+        """Record one page that added ``new_documents``; return whether to stop paging."""
+        self.pages += 1
+        self.stale = 0 if new_documents else self.stale + 1
+        return (
+            not page.next_cursor
+            or 'documents_paging_unsupported' in (page.caveats or ())
+            or self.stale >= LISTING_STALE_PAGES
+            or self.pages >= self.max_pages
+            or (self.deadline is not None and _monotonic() > self.deadline)
+        )
 
 
 def _cross_product(batch: Sequence[Key]) -> int:
@@ -1332,21 +1367,24 @@ class VectorExplorerTools:
     def _vx_list_rows(
         self, store: Any, object_ids: Optional[List[str]], deleted: str, limit: int, deadline: float
     ) -> List[DocumentRow]:
-        """List up to ``limit`` documents (distinct by objectId), following cursors."""
+        """List up to ``limit`` documents (distinct by objectId), following cursors (:class:`ListingGuard`)."""
         rows: Dict[str, DocumentRow] = {}
         cursor: Optional[str] = None
+        page_size = min(LIMITS['documents_page'], limit)
+        guard = ListingGuard(limit, page_size)
         while len(rows) < limit:
             page = store.listDocuments(
                 cursor=cursor,
-                limit=min(LIMITS['documents_page'], limit),
+                limit=page_size,
                 object_ids=object_ids,
                 deleted=deleted,
                 sort='path',
             )
+            before = len(rows)
             for row in page.items:
                 if row.objectId != CONTROL_OBJECT_ID and row.objectId not in rows and len(rows) < limit:
                     rows[row.objectId] = row
-            if not page.next_cursor or 'documents_paging_unsupported' in page.caveats:
+            if guard.stop(page, len(rows) - before):
                 break
             cursor = page.next_cursor
             self._vx_check_deadline(deadline)

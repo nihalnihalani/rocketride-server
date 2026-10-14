@@ -9,6 +9,7 @@ from . import vx_write_gate
 from .errors import StoreUnsupported, ToolRefusal
 from .vx_defaults import VECTOR_TOOL_LIMITS
 from .vx_tools import (  # noqa: F401 - re-exported for the drivers that override the hooks
+    ListingGuard,
     VectorExplorerTools,
     decodeCursor,
     defaultCursorState,
@@ -1773,21 +1774,34 @@ class VectorStoreToolMixin(VectorExplorerTools):
     def _vectordb_objdir_listing(
         store: 'DocumentStoreBase', parent: Any, offset: int, limit: int
     ) -> List[Dict[str, str]]:
-        """``objdir`` entries from a native ``listDocuments``: active documents under ``parent``, paged."""
+        """``objdir`` entries from a native ``listDocuments``: active documents under ``parent``, paged.
+
+        Each document is listed once. Paging ends after ``_OBJDIR_SCAN_MAX`` rows or as
+        :class:`ListingGuard` decides (empty or repeated pages, a listing that cannot
+        page, the time budget), so a driver whose cursor never ends cannot hang the tool.
+        """
         entries: List[Dict[str, str]] = []
+        seen: set = set()
         skipped = 0
         scanned = 0
+        page_size = VECTOR_TOOL_LIMITS['documents_page']
+        guard = ListingGuard(_OBJDIR_SCAN_MAX, page_size, VECTOR_TOOL_LIMITS['sample_budget_ms'] / 1000.0)
         cursor: Optional[str] = None
         while len(entries) < limit:
             page = store.listDocuments(
                 cursor=cursor,
-                limit=VECTOR_TOOL_LIMITS['documents_page'],
+                limit=page_size,
                 object_ids=None,
                 deleted='active',
                 sort='path',
             )
+            new_documents = 0
             for row in page.items:
-                if row.objectId == CONTROL_OBJECT_ID or row.deleted:
+                if row.objectId == CONTROL_OBJECT_ID or row.objectId in seen:
+                    continue
+                seen.add(row.objectId)
+                new_documents += 1
+                if row.deleted:
                     continue
                 if isinstance(parent, str) and parent and not row.path.startswith(parent):
                     continue
@@ -1797,7 +1811,7 @@ class VectorStoreToolMixin(VectorExplorerTools):
                 if len(entries) < limit:
                     entries.append({'path': row.path, 'objectId': row.objectId})
             scanned += len(page.items)
-            if not page.next_cursor or scanned >= _OBJDIR_SCAN_MAX:
+            if guard.stop(page, new_documents) or scanned >= _OBJDIR_SCAN_MAX:
                 break
             cursor = page.next_cursor
         return entries
