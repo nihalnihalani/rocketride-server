@@ -2001,8 +2001,9 @@ class VectorStoreToolMixin(VectorExplorerTools):
         from the control record. The answer adds documents, chunks, deleted chunks,
         tables, documents without a first chunk and the average chunks per document
         (None where the store cannot count). ``{"mode": "quick"}`` returns the raw count
-        with the figures cached by the last full call (``counts_as_of``). A missing
-        collection answers ``count: 0`` with ``collection_exists: false``.
+        with the cached figures (``counts_as_of``), recounting only when nothing is cached,
+        the figures are older than ``counts_cached_s`` or the store was written since. A
+        missing collection answers ``count: 0`` with ``collection_exists: false``.
         """
         store = self._vectordb_store()
         mode = args.get('mode', 'full') or 'full'

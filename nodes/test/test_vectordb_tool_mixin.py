@@ -984,10 +984,7 @@ def test_stats_quick_recounts_after_a_failed_write_outside_the_tools(monkeypatch
     assert inst.stats({'mode': 'quick'})['chunks'] == 5
 
 
-@pytest.mark.parametrize('age_s', [VECTOR_TOOL_LIMITS['counts_cached_s'] + 1, 3600])
-def test_stats_quick_never_recounts_and_reports_the_age_through_counts_as_of(monkeypatch, age_s):
-    # Only mode 'full' (open, after a write, Refresh) recounts; counts_cached_s is the
-    # staleness the console expects between full calls, counts_as_of the actual age.
+def _quick_after(monkeypatch, age_s: float):
     store = clustered(CountingStore, docs=2, chunks=2)
     clock = [1_760_000_000.0]
     monkeypatch.setattr(vx_tools, '_wall_clock', lambda: clock[0])
@@ -996,8 +993,24 @@ def test_stats_quick_never_recounts_and_reports_the_age_through_counts_as_of(mon
     clock[0] += age_s
     counted = len([c for c in store.calls if c[0] in ('countChunks', 'countDocuments')])
     quick = inst.stats({'mode': 'quick'})
-    assert len([c for c in store.calls if c[0] in ('countChunks', 'countDocuments')]) == counted
+    recounted = len([c for c in store.calls if c[0] in ('countChunks', 'countDocuments')]) > counted
+    return full, quick, recounted
+
+
+@pytest.mark.parametrize('age_s', [0, 15, VECTOR_TOOL_LIMITS['counts_cached_s']])
+def test_stats_quick_keeps_figures_up_to_counts_cached_s_old(monkeypatch, age_s):
+    full, quick, recounted = _quick_after(monkeypatch, age_s)
+    assert not recounted
     assert quick['counts_as_of'] == full['computed_at'] and quick['documents'] == full['documents']
+
+
+@pytest.mark.parametrize('age_s', [VECTOR_TOOL_LIMITS['counts_cached_s'] + 1, 3600])
+def test_stats_quick_recounts_figures_older_than_counts_cached_s(monkeypatch, age_s):
+    # Contract section 4.2: filtered counts are cached per instance for counts_cached_s.
+    full, quick, recounted = _quick_after(monkeypatch, age_s)
+    assert recounted
+    assert quick['counts_as_of'] == quick['computed_at'] != full['computed_at']
+    assert quick['documents'] == full['documents']
 
 
 def test_stats_quick_without_a_cache_computes_once():

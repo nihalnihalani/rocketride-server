@@ -1205,7 +1205,11 @@ class VectorExplorerTools:
         }
 
     def _vx_stats(self, store: Any, mode: str) -> Dict[str, Any]:
-        """The ``stats`` answer: legacy keys plus the explorer's figures (see the contract, ``stats``)."""
+        """The ``stats`` answer: legacy keys plus the explorer's figures (see the contract, ``stats``).
+
+        ``full`` always recounts. ``quick`` returns the cached figures while they are at most
+        ``counts_cached_s`` old; any write to the store drops them (``vxForgetCounts``).
+        """
         now = _wall_clock()
         state = _vx_state(store)
         if not store._doesCollectionExist():
@@ -1232,7 +1236,8 @@ class VectorExplorerTools:
         count = int(store.count_documents())
         with state.lock:
             cached, as_of = state.counts, state.counts_as_of
-        if mode == 'quick' and cached is not None:
+        fresh = cached is not None and as_of is not None and now - as_of <= LIMITS['counts_cached_s']
+        if mode == 'quick' and fresh:
             figures = cached
         else:
             figures = self._vx_compute_counts(store)
