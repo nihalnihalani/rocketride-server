@@ -20,7 +20,8 @@ import type { IProjectResult, ISearchResult } from '../src/contract/types';
 import { callTool, isExpired } from '../src/map/calls';
 import { keyIndex, pcaPositions } from '../src/map/model';
 import { createLatestQueue } from '../src/map/neighbours';
-import { centroidStar, placeProjected, querySims, raysFromSearch, resolveKeys, starFromProject, withSampleRetry } from '../src/map/queryProjection';
+import { centroidStar, chatQueryPlan, placeProjected, queryBlocker, querySims, raysFromSearch, resolveKeys, starFromProject, withSampleRetry } from '../src/map/queryProjection';
+import { QUERY_NEEDS_EMBED, QUERY_NEEDS_SAMPLE } from '../src/map/wording';
 import { loadSample } from './support/map.samples';
 
 const FIX = path.resolve(__dirname, 'fixtures', 'provisional');
@@ -199,4 +200,24 @@ test('a failed neighbour call settles as failed and does not block the next one'
 	});
 	assert.deepEqual(await queue.request(1), { status: 'failed', error: new Error('boom') });
 	assert.deepEqual(await queue.request(2), { status: 'done', value: 'ok' });
+});
+
+test('a query that cannot run says why: the embedding node first, then a missing sample (not the embedding sentence for both)', () => {
+	assert.equal(queryBlocker({ embedReady: true, hasSample: true }), null);
+	assert.equal(queryBlocker({ embedReady: true, hasSample: false }), QUERY_NEEDS_SAMPLE);
+	assert.equal(queryBlocker({ embedReady: false, hasSample: true }), QUERY_NEEDS_EMBED);
+	assert.equal(queryBlocker({ embedReady: false, hasSample: false }), QUERY_NEEDS_EMBED);
+	assert.match(QUERY_NEEDS_SAMPLE, /Draw a sample/);
+});
+
+test("a chat answer's star: the question's own vector only when the chat told the map a NEW question, else the sources' centre (never the last map query's star)", () => {
+	// No map query and nothing told: the centre of the sources.
+	assert.equal(chatQueryPlan({ told: null, mapQuery: null, embedReady: true }), 'centroid');
+	// The map's own last query is not the chat's question: drop it, show the centre (approximate).
+	assert.equal(chatQueryPlan({ told: 'radio check-in schedule', mapQuery: 'radio check-in schedule', embedReady: true }), 'centroid');
+	// The chat set its question before highlighting: embed and place exactly that.
+	assert.equal(chatQueryPlan({ told: 'Where does Falcon Station get its water?', mapQuery: 'radio check-in schedule', embedReady: true }), 'run');
+	assert.equal(chatQueryPlan({ told: 'Where does Falcon Station get its water?', mapQuery: null, embedReady: true }), 'run');
+	// Without the embedding node the centre is all there is.
+	assert.equal(chatQueryPlan({ told: 'Where does Falcon Station get its water?', mapQuery: null, embedReady: false }), 'centroid');
 });

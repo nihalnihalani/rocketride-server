@@ -112,6 +112,9 @@ export const LAYOUT_NOT_BETTER = 'Neighbour layout did not improve on PCA for th
 /** Text queries cannot run. */
 export const QUERY_NEEDS_EMBED = 'Text queries need the embedding node reachable from the Tools source';
 
+/** A query was run before any sample was drawn (or after sampling failed). */
+export const QUERY_NEEDS_SAMPLE = 'Draw a sample of the collection first; the query is placed among its points.';
+
 /** On a refined layout the query cannot be projected exactly. */
 export const QUERY_PLACED_APPROX = 'On this layout the query is placed among its nearest points (approximate); its rays go to the true top results.';
 

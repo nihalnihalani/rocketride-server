@@ -45,6 +45,7 @@ import type { IProjectItem, IProjectResult, ISearchResult, MapLayout, VectorKey 
 import { isExpired } from './calls';
 import type { ToolAnswer } from './calls';
 import { keyString } from './model';
+import { QUERY_NEEDS_EMBED, QUERY_NEEDS_SAMPLE } from './wording';
 
 /** Where the query (or an answer's centre) is drawn. */
 export interface IStar {
@@ -227,4 +228,32 @@ export async function withSampleRetry<T>(sampleId: string, call: (id: string) =>
 	const next = await resample();
 	if (next === null) return first;
 	return call(next);
+}
+
+/**
+ * Why a text query cannot run on the map, or null when it can.
+ *
+ * @param state - Whether the embedding node is reachable and a sample is drawn.
+ * @returns The sentence to show, or null.
+ */
+export function queryBlocker(state: { embedReady: boolean; hasSample: boolean }): string | null {
+	if (!state.embedReady) return QUERY_NEEDS_EMBED;
+	if (!state.hasSample) return QUERY_NEEDS_SAMPLE;
+	return null;
+}
+
+/**
+ * Which star a chat answer's highlight gets. The map only knows the chat's
+ * question when the chat told it (`selection.setQuery(question)` before
+ * `setHighlight`), i.e. when the selection's query differs from the map's own
+ * last query: then that question is embedded and placed exactly ('run').
+ * Otherwise the selection's query is the map's own earlier query, which is not
+ * this answer's question, so the map drops it and shows the score-weighted
+ * centre of the sources, marked approximate ('centroid').
+ *
+ * @param state - The selection's query, the map's last placed query text, embed reachability.
+ * @returns 'run' or 'centroid'.
+ */
+export function chatQueryPlan(state: { told: string | null; mapQuery: string | null; embedReady: boolean }): 'run' | 'centroid' {
+	return state.embedReady && state.told !== null && state.told !== '' && state.told !== state.mapQuery ? 'run' : 'centroid';
 }

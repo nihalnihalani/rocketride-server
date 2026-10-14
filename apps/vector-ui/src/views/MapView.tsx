@@ -58,7 +58,7 @@ import { PointInspector } from '../components/PointInspector';
 import { PointsTable } from '../components/PointsTable';
 import type { Availability, ColourBy, IChunksResult, IEmbedResult, INeighborsResult, INeighborsScopeResult, IProjectItem, IProjectResult, ISampleInput, ISampleResult, ISearchResult, MapLayout, MapViewProps, SampleMode, VectorKey } from '../contract/types';
 import { TSNE_MAX_POINTS } from '../map/budgets';
-import { callTool } from '../map/calls';
+import { callTool, isExpired } from '../map/calls';
 import type { ToolAnswer } from '../map/calls';
 import { forgetCameras } from '../map/cameraMemory';
 import { colourPoints } from '../map/colours';
@@ -67,7 +67,7 @@ import type { KeyAction } from '../map/interaction';
 import { applyTransform, chunkPath, ditherRounded, documentOf, hiddenMask, keyIndex, keyString, neighboursOf, normaliseLayout, pcaPositions, pointKey } from '../map/model';
 import { createLatestQueue } from '../map/neighbours';
 import type { IOverlayEnd, IPlace } from '../map/overlay';
-import { centroidStar, placeProjected, querySims, raysFromSearch, resolveKeys, starFromProject, withSampleRetry } from '../map/queryProjection';
+import { centroidStar, chatQueryPlan, placeProjected, queryBlocker, querySims, raysFromSearch, resolveKeys, starFromProject, withSampleRetry } from '../map/queryProjection';
 import type { IStar } from '../map/queryProjection';
 import { spawnLayoutWorker } from '../map/spawnWorker';
 import { MAP_STYLES } from '../map/styles';
@@ -241,6 +241,7 @@ export function MapView(props: MapViewProps): React.ReactElement {
 	const limits = model.limits;
 	const channel = channels.tools ?? channels.chat ?? channels.ingest;
 	const embedChannel = channels.tools ?? channels.chat;
+	const embedReady = embedChannel !== null && !!model.nodes.embed && model.embed.enabled;
 	const storeNode = model.nodes.store;
 	const canSample = model.capabilities.sample !== false;
 	const sampleModel = state.sampleModel !== null && state.connectionKey === model.connectionKey ? state.sampleModel : null;
@@ -279,6 +280,8 @@ export function MapView(props: MapViewProps): React.ReactElement {
 	const connectionRef = useRef(model.connectionKey);
 	connectionRef.current = model.connectionKey;
 	const autoSampled = useRef<string | null>(null);
+	// A point to inspect again once a re-drawn sample arrives (its neighbour ends met SAMPLE_EXPIRED).
+	const repick = useRef<string | null>(null);
 	const seq = useRef(0);
 	const clientRef = useRef<ILayoutClient | null>(null);
 	if (clientRef.current === null) clientRef.current = createLayoutClient({ createWorker: spawnLayoutWorker });
@@ -477,9 +480,9 @@ export function MapView(props: MapViewProps): React.ReactElement {
 	}, [visible, canSample, channel, sampleModel, busy, model.connectionKey, limits, drawSample]);
 
 	/** Draw the current sample again (same seed, pinned and highlighted keys kept): SAMPLE_EXPIRED. */
-	const resample = useCallback(async (): Promise<string | null> => {
+	const resample = useCallback(async (extra: readonly VectorKey[] = []): Promise<string | null> => {
 		if (!sampleModel) return null;
-		const keep = [...sampleModel.pinned.flatMap((p) => (p.key ? [p.key] : [])), ...(highlight?.keys ?? [])].slice(0, limits.project_keys_max);
+		const keep = [...extra, ...sampleModel.pinned.flatMap((p) => (p.key ? [p.key] : [])), ...(highlight?.keys ?? [])].slice(0, limits.project_keys_max);
 		return drawSample({ n: sampleModel.result.n_requested, mode: sampleModel.mode, seed: sampleModel.seed, includeKeys: keep.map((k) => [k[0], k[1]] as VectorKey), keepQuery: true });
 	}, [sampleModel, highlight, limits.project_keys_max, drawSample]);
 
@@ -561,7 +564,7 @@ export function MapView(props: MapViewProps): React.ReactElement {
 	// -------------------------------------------------------------------------
 
 	const onPick = useCallback(
-		async (index: number | null): Promise<void> => {
+		async (index: number | null, retried = false): Promise<void> => {
 			setSelected(index);
 			setFocused(index);
 			setNeighbourError(null);
@@ -595,19 +598,41 @@ export function MapView(props: MapViewProps): React.ReactElement {
 			const result = outcome.value.value;
 			setNeighbours({ index, result });
 			const outside = result.items.filter((item) => !keyIdx.has(keyString(item.key[0], item.key[1]))).map((item) => [item.key[0], item.key[1]] as VectorKey);
-			setNeighbourPins(outside.length > 0 && model.capabilities.project !== false ? await pinKeysQuiet(outside) : []);
+			setNeighbourPins(outside.length > 0 && model.capabilities.project !== false ? await pinKeysQuiet(outside, key, retried) : []);
 		},
 		// pinKeysQuiet is defined below and stable for a sample.
 		// eslint-disable-next-line react-hooks/exhaustive-deps
 		[sample, neighbourQueue, channel, selection, storeNode, model.capabilities, keyIdx],
 	);
 
-	/** Project keys without pinning them in the shared model (neighbour ends). */
-	const pinKeysQuiet = async (keys: VectorKey[]): Promise<IProjectItem[]> => {
+	/**
+	 * Project keys without pinning them in the shared model (neighbour ends of
+	 * `key`). When the node dropped the sample (SAMPLE_EXPIRED) the sample is
+	 * drawn again keeping `key`, and the point is inspected again on it (once:
+	 * `retried` stops a second re-sample).
+	 */
+	const pinKeysQuiet = async (keys: VectorKey[], key: VectorKey, retried: boolean): Promise<IProjectItem[]> => {
 		if (channel === null || !sampleModel) return [];
 		const answer = await callTool<IProjectResult>(channel, 'project', { sample_id: sampleModel.sampleId, keys: keys.slice(0, limits.project_keys_max), m: PROJECT_M }, { nodeId: storeNode });
+		if (isExpired(answer) && !retried) {
+			repick.current = keyString(key[0], key[1]);
+			void resample([key]).then((id) => {
+				if (id === null) repick.current = null;
+			});
+			return [];
+		}
 		return answer.ok ? answer.value.items : [];
 	};
+
+	// A re-drawn sample arrived for a point whose neighbour ends expired: inspect it again there.
+	useEffect(() => {
+		const pending = repick.current;
+		if (pending === null || !sample) return;
+		repick.current = null;
+		const index = keyIdx.get(pending);
+		if (index !== undefined) void onPick(index, true);
+		// eslint-disable-next-line react-hooks/exhaustive-deps
+	}, [sample]);
 
 	const selectKey = useCallback(
 		(key: VectorKey): void => {
@@ -641,7 +666,14 @@ export function MapView(props: MapViewProps): React.ReactElement {
 		const first = res.points[0];
 		if (first !== undefined) setCentreOn({ index: first, seq: ++seq.current });
 		if (highlight.source === 'chat') {
-			if (state.query && model.embed.enabled && embedChannel !== null && model.nodes.embed) void runQuery(state.query, false);
+			if (chatQueryPlan({ told: state.query, mapQuery: query?.text ?? null, embedReady }) === 'run') void runQuery(state.query as string, false);
+			else if (query !== null || state.query !== null) {
+				// The map's last query is not this answer's question: drop it, so the star is the sources' centre (approximate).
+				setQueryView(null);
+				queryVector.current = null;
+				selection.setQuery(null);
+				setColourBy((by) => (by === 'query-similarity' ? 'document' : by));
+			}
 			if (!reducedMotion && typeof requestAnimationFrame === 'function') {
 				const started = performance.now();
 				const step = (): void => {
@@ -660,8 +692,9 @@ export function MapView(props: MapViewProps): React.ReactElement {
 	// -------------------------------------------------------------------------
 
 	const runQuery = async (text: string, setHighlightToTopK = true): Promise<void> => {
-		if (!sampleModel || channel === null || embedChannel === null || !model.nodes.embed || !model.embed.enabled) {
-			setError(QUERY_NEEDS_EMBED);
+		const blocked = queryBlocker({ embedReady, hasSample: sampleModel !== null && channel !== null });
+		if (blocked !== null || !sampleModel || channel === null || embedChannel === null || !model.nodes.embed) {
+			setError(blocked ?? QUERY_NEEDS_EMBED);
 			return;
 		}
 		const key = model.connectionKey;
@@ -801,6 +834,7 @@ export function MapView(props: MapViewProps): React.ReactElement {
 		// Sign-out or identity change: the console resets the selection to no connection.
 		if (state.connectionKey === null) {
 			forgetCameras();
+			autoSampled.current = null;
 			queryVector.current = null;
 			client.cancel();
 		}

@@ -102,3 +102,30 @@ test('the Lasso toggle stays pressed after a selection (the next outline selects
 	assert.match(view, /onToggleLasso=\{\(\) => setLasso\(\(on\) => !on\)\}/);
 	assert.match(view, /action === 'lasso'\) setLasso\(\(on\) => !on\)/);
 });
+
+test('sign-out forgets that the map sampled, so the same connection samples again on its next first open', () => {
+	const view = read('views/MapView.tsx');
+	const reset = /if \(state\.connectionKey === null\) \{([\s\S]*?)\n\t\t\}/.exec(view);
+	assert.ok(reset, 'the reset-to-no-connection branch');
+	assert.match(reset[1] as string, /autoSampled\.current = null/);
+	assert.match(reset[1] as string, /forgetCameras\(\)/);
+});
+
+test('neighbour ends outside the sample survive SAMPLE_EXPIRED: the sample is drawn again (keeping the clicked key) and the point inspected again, once', () => {
+	const view = read('views/MapView.tsx');
+	const quiet = /const pinKeysQuiet = async \(([\s\S]*?)\n\t\};/.exec(view);
+	assert.ok(quiet, 'pinKeysQuiet');
+	assert.match(quiet[1] as string, /isExpired\(/);
+	assert.match(quiet[1] as string, /repick\.current = keyString\(/);
+	assert.match(quiet[1] as string, /resample\(\[/);
+	assert.match(quiet[1] as string, /!retried/, 'the second inspection does not re-sample again');
+	assert.match(view, /void onPick\(index, true\)/);
+});
+
+test('a chat highlight re-embeds only a question the chat told the map; otherwise the map query is dropped for the sources\' centre', () => {
+	const view = read('views/MapView.tsx');
+	assert.match(view, /chatQueryPlan\(\{ told: state\.query, mapQuery: query\?\.text \?\? null, embedReady \}\)/);
+	assert.doesNotMatch(view, /if \(state\.query && model\.embed\.enabled[^\n]*runQuery\(state\.query/, 'the old rule re-embedded the last MAP query');
+	assert.match(view, /selection\.setQuery\(null\)/);
+	assert.match(view, /queryBlocker\(/);
+});
