@@ -226,12 +226,15 @@ class Store(DocumentStoreBase):
     FACET_SCROLL_ROWS_CAP = 200000
 
     # Largest sample whose neighbour graph Qdrant computes (search_matrix_offsets
-    # restricted to the sample's point ids). The server's memory for that call
-    # grows with the square of the sample. Measured on qdrant 1.17.1: nothing
-    # measurable up to 500 points; at 1,000 a peak of about +170 MB, of which
-    # about +125 MB stayed allocated after the call (and after the collection
-    # was dropped); about +500 MB at 2,000; killed on a 2 GB host at 5,000.
-    # Larger samples are computed on the node.
+    # restricted to the sample's point ids); larger samples, the explorer's
+    # default of 1,000 included, are computed on the node. The server's memory
+    # for that call grows faster than the sample and stays allocated (also after
+    # the collection is dropped). Measured on qdrant 1.17.1: 500-point graphs
+    # leave nothing measurable, also on a 12,000-point collection; 1,000-point
+    # graphs left about +125 MB on a 3,000-point collection, +380 MB over twenty
+    # graphs on 6,000 points and +630 MB over eight graphs on 12,000 points, and
+    # a 2,000-point graph about +500 MB; a 5,000-point graph killed the server
+    # on a 2 GB host.
     NATIVE_KNN_MAX = 500
 
     # Most (objectId, chunkId) -> point id entries remembered between getVectors and knnGraph.

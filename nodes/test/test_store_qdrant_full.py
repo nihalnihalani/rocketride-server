@@ -495,8 +495,12 @@ def test_scale_native_neighbour_graph_at_the_cap_keeps_the_server_up(scale_store
         assert after - before < 64, (before, after)
 
 
-def test_scale_neighbour_graph_above_the_cap_is_computed_on_the_node(scale_store, monkeypatch):
-    n = 2 * drv.Store.NATIVE_KNN_MAX
+def test_scale_default_sample_graph_is_computed_on_the_node(scale_store, monkeypatch):
+    # The explorer's default sample is above the native cap (its server memory, see the driver).
+    from ai.common.store.vx_defaults import VECTOR_TOOL_LIMITS
+
+    n = VECTOR_TOOL_LIMITS['sample_default']
+    assert n > drv.Store.NATIVE_KNN_MAX
     keys = _scale_keys(n)
     X = np.asarray([d.embedding for d in scale_store.getVectors(keys)], dtype=np.float32)
     calls = []
