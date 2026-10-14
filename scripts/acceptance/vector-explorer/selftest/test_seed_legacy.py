@@ -6,21 +6,28 @@
 
 They check that its verification cannot pass a collection that is not what the
 driver suites expect (one control record, exactly the planted document without
-chunk 0, every document present, no meta column), that it only ever drops the
-legacy names, and that the control row matches the old driver's columns.
+chunk 0, every document present, no meta column, the calibrated chunk shape),
+that a seed on a chunker that ignores the chunk length is refused before any
+collection is dropped, that it only ever drops the legacy names, and that the
+control row matches the old driver's columns.
 
 Run: python3 -m unittest discover -s scripts/acceptance/vector-explorer/selftest -v
 """
 
+import asyncio
 import importlib.util
 import re
 import sys
+import tempfile
 import unittest
 
 from pathlib import Path
 
 ACC = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ACC))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from test_calibration import FILTER_MRO, FILTER_OWN_INIT  # noqa: E402 - the two keyword filters, one source
 
 
 def _load(name: str, path: Path):
@@ -73,7 +80,7 @@ class VerdictTests(unittest.TestCase):
         self.assertTrue(self.ok(missing=['a-missing-document']))
 
     def test_a_collection_chunked_without_the_calibrated_length_fails(self):
-        # A seed on an engine whose chunker ignores strlen: about 33 chunks of up to 4,000 characters.
+        # A seed on an engine whose chunker ignores strlen: about 36 chunks of up to 4,000 characters.
         self.assertTrue(self.ok(long_manual_chunks=33))
         self.assertTrue(self.ok(median_chunk_chars=3409))
         self.assertTrue(self.ok(median_chunk_chars=399))
@@ -90,6 +97,83 @@ class VerdictTests(unittest.TestCase):
         # Observed on the engine: an upload named '/srv/legacy/ops/memo_q2.txt' is stored with
         # parent 'srv/legacy/ops/memo_q2.txt' and this objectId (derived from the name as sent).
         self.assertEqual(seed.fx.object_id('/srv/legacy/ops/memo_q2.txt'), '9f2bee29-b134-547e-9ba8-2ff9f8dd0f42')
+
+
+class ChunkerPreflightTests(unittest.TestCase):
+    """Before seeding, the engine's own chunker node is asked what it would cut (no engine call)."""
+
+    def setUp(self):
+        if seed.cal.node_splitter_kwargs({}) is None:
+            self.skipTest('NOT RUN: langchain_text_splitters is not importable here (run with the engine python)')
+
+    def test_a_chunker_that_drops_the_length_is_refused(self):
+        preview = seed.chunker_preview(seed.corpus_texts(), 1000, FILTER_OWN_INIT)
+        self.assertFalse(preview['passes_chunk_size'])
+        # LangChain's own 4,000-character default: about 35 chunks for the manual.
+        self.assertLess(preview['long_manual_chunks'], seed.LONG_MANUAL_MIN_ROWS)
+        problems = seed.chunking_problems(preview)
+        self.assertTrue(any('long manual' in p for p in problems), problems)
+        self.assertTrue(any('median' in p for p in problems), problems)
+
+    def test_a_chunker_that_passes_the_length_gives_the_calibrated_shape(self):
+        preview = seed.chunker_preview(seed.corpus_texts(), 1000, FILTER_MRO)
+        self.assertTrue(preview['passes_chunk_size'])
+        # More than 64 chunks, so at least 64 rows stay once chunk 0 is deleted.
+        self.assertGreater(preview['long_manual_chunks'], seed.LONG_MANUAL_MIN_ROWS)
+        self.assertEqual(seed.chunking_problems(preview), [])
+
+    def test_a_shape_just_short_of_the_promise_is_refused(self):
+        ok = {'long_manual_chunks': seed.LONG_MANUAL_MIN_ROWS + 1, 'median_chunk_chars': 806}
+        self.assertEqual(seed.chunking_problems(ok), [])
+        self.assertTrue(seed.chunking_problems(dict(ok, long_manual_chunks=seed.LONG_MANUAL_MIN_ROWS)))
+        self.assertTrue(seed.chunking_problems(dict(ok, median_chunk_chars=1201)))
+
+
+class ChunkerLocationTests(unittest.TestCase):
+    def test_the_engines_own_copy_of_the_node_is_the_one_checked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            node = root / 'nodes' / 'preprocessor_langchain' / 'langchain.py'
+            self.assertEqual(seed.engine_chunker(str(root / 'engine')), seed.REPO_CHUNKER)
+            node.parent.mkdir(parents=True)
+            node.write_text('# the engine copy\n', encoding='utf-8')
+            self.assertEqual(seed.engine_chunker(str(root / 'engine')), node)
+
+    def test_the_seed_uses_the_templates_chunk_length(self):
+        self.assertEqual(seed.template_strlen(), 1000)
+
+
+class SeedRefusalTests(unittest.TestCase):
+    """A seed on a chunker that ignores the length is refused before any collection is touched."""
+
+    def setUp(self):
+        self.calls = []
+        names = ('pg_create', 'qdrant_drop', 'chroma_drop', 'pg_plant_orphan', 'qdrant_plant_orphan', 'ingest')
+        self.saved = {
+            n: getattr(seed, n) for n in names + ('chunker_check', 'pg_exists', 'qdrant_exists', 'chroma_exists')
+        }
+        for n in names:
+            setattr(seed, n, lambda *a, _n=n, **k: self.calls.append(_n))
+        for n in ('pg_exists', 'qdrant_exists', 'chroma_exists'):
+            setattr(seed, n, lambda *a: False)
+
+    def tearDown(self):
+        for n, f in self.saved.items():
+            setattr(seed, n, f)
+
+    def test_a_refused_preflight_touches_nothing(self):
+        seed.chunker_check = lambda: {'long_manual_chunks': 35, 'median_chunk_chars': 3407, 'problems': ['short']}
+        with self.assertRaises(seed.ChunkerRefused) as refused:
+            asyncio.run(seed.seed(list(seed.BACKENDS), recreate=True))
+        self.assertEqual(refused.exception.preview['problems'], ['short'])
+        self.assertEqual(self.calls, [])
+
+    def test_nothing_to_seed_needs_no_preflight(self):
+        for n in ('pg_exists', 'qdrant_exists', 'chroma_exists'):
+            setattr(seed, n, lambda *a: True)
+        seed.chunker_check = lambda: self.fail('the preflight ran although nothing is seeded')
+        self.assertEqual(asyncio.run(seed.seed(list(seed.BACKENDS), recreate=False)), {})
+        self.assertEqual(self.calls, [])
 
 
 class SafetyTests(unittest.TestCase):

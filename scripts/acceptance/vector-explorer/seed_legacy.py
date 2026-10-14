@@ -39,8 +39,15 @@ present; no ``meta`` column on a pgvector table seeded in this run (a newer
 driver adds it when it first opens the table); the long manual still has at
 least 64 rows and the median chunk is 400-1,200 characters, the calibrated
 chunking of ``apps/vector-ui/tests/fixtures/chunking.json``. A seed on an
-engine whose chunker ignores ``strlen`` (about 33 chunks of up to 4,000
+engine whose chunker ignores ``strlen`` (about 36 chunks of up to 4,000
 characters for the manual) fails here. Exits 1 when any check fails.
+
+Before anything is created or dropped, the seed asks the engine's own chunker
+node (the copy next to the engine running this script) what it would cut from
+the corpus with the templates' ``chunk_1`` length, and refuses to seed when
+that is not the calibrated shape (``ChunkerRefused``, exit 1): the chunker node
+as it stands drops the length (see the README), so a seed on it would replace
+good collections with ones that fail the verification above.
 
 Usage (from dist/server; the engine must run with RR_DB_BROKER_URL/TOKEN):
   ./engine <this folder>/seed_legacy.py [--only pgvector,qdrant,chroma] [--recreate] [--verify-only]
@@ -64,6 +71,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
+import calibrate_chunking as cal  # noqa: E402
 import vx_fixtures as fx  # noqa: E402
 
 LEGACY = 'vx_legacy_docs'
@@ -72,6 +80,8 @@ RR_PREFIX = '/srv/legacy-rr/'
 RR_FOLDER = 'kitchen'
 ORPHAN_REL = 'manuals/long_manual.md'
 BACKENDS = ('pgvector', 'qdrant', 'chroma')
+# The chunker node in the repository; an engine runs its own copy (dist/server/nodes).
+REPO_CHUNKER = cal.NODE
 # The long manual has more than 64 chunks at the calibrated chunking, so at least 64 rows once chunk 0 is gone.
 LONG_MANUAL_MIN_ROWS = 64
 # The calibrated median chunk (apps/vector-ui/tests/fixtures/chunking.json target_median_chars).
@@ -176,6 +186,91 @@ def verdict(
             f'{backend}: median chunk of {median_chunk_chars} characters (expected {MEDIAN_CHARS[0]}-{MEDIAN_CHARS[1]:,})'
         )
     return problems
+
+
+# ---------------------------------------------------------------------------
+# Preflight: what the engine's chunker node would cut
+# ---------------------------------------------------------------------------
+
+
+class ChunkerRefused(RuntimeError):
+    """The engine's chunker would not give the calibrated shape; nothing was created or dropped."""
+
+    def __init__(self, preview: Dict[str, Any]) -> None:
+        super().__init__('; '.join(preview.get('problems') or ['the chunker preflight failed']))
+        self.preview = preview
+
+
+def engine_chunker(executable: str = sys.executable) -> Path:
+    """The chunker node file of the engine running this script (its own copy), else the repository's."""
+    copy = Path(executable).resolve().parent / 'nodes' / 'preprocessor_langchain' / 'langchain.py'
+    return copy if copy.is_file() else REPO_CHUNKER
+
+
+def template_strlen(keys: Sequence[str] = ('postgres', 'rocketride_vector', 'qdrant', 'chroma')) -> int:
+    """The chunk length (``strlen``) of chunk_1 in the templates this seed starts (one value for all)."""
+    lengths = set()
+    for key in keys:
+        (chunker,) = [c for c in fx.load_template(fx.FIXTURES[key].template)['components'] if c['id'] == 'chunk_1']
+        config = chunker['config']
+        lengths.add(int(config[config.get('profile', 'default')]['strlen']))
+    if len(lengths) != 1:
+        raise RuntimeError(f'the templates disagree on the chunk length: {sorted(lengths)}')
+    return lengths.pop()
+
+
+def corpus_texts() -> Dict[str, str]:
+    """The demo corpus, by relative path."""
+    return dict(_corpus().build_corpus())
+
+
+def chunker_preview(texts: Dict[str, str], strlen: int, node_source: str) -> Dict[str, Any]:
+    """What the chunker node in ``node_source`` cuts from ``texts`` with ``strlen``.
+
+    The node's own keyword filter (``calibrate_chunking.node_splitter_kwargs``)
+    is applied to the arguments it builds for LangChain's splitter, so the
+    answer follows the node's code; the texts are the corpus files as written
+    (the parser hands text and markdown through unchanged).
+    """
+    import langchain_text_splitters
+
+    kept = cal.node_splitter_kwargs({'chunk_size': strlen, 'chunk_overlap': 0, 'length_function': len}, node_source)
+    splitter = langchain_text_splitters.RecursiveCharacterTextSplitter(**kept)
+    chunks = {rel: splitter.split_text(text) for rel, text in texts.items()}
+    return {
+        'strlen': strlen,
+        'passes_chunk_size': 'chunk_size' in kept,
+        'long_manual_chunks': len(chunks.get(ORPHAN_REL, [])),
+        'median_chunk_chars': median_length([c for parts in chunks.values() for c in parts]),
+    }
+
+
+def chunking_problems(preview: Dict[str, Any]) -> List[str]:
+    """Why ``preview`` would not seed the calibrated shape (empty when it would)."""
+    problems = []
+    rows = preview.get('long_manual_chunks')
+    if rows is None or rows <= LONG_MANUAL_MIN_ROWS:
+        problems.append(
+            f'the chunker would cut the long manual into {rows} chunks (more than {LONG_MANUAL_MIN_ROWS} needed, '
+            'so at least that many rows stay once chunk 0 is deleted)'
+        )
+    median = preview.get('median_chunk_chars')
+    if median is None or not MEDIAN_CHARS[0] <= median <= MEDIAN_CHARS[1]:
+        problems.append(
+            f'the chunker would give a median chunk of {median} characters (expected {MEDIAN_CHARS[0]}-{MEDIAN_CHARS[1]:,})'
+        )
+    return problems
+
+
+def chunker_check() -> Dict[str, Any]:
+    """Preview the engine's chunker on the corpus with the templates' length; ``problems`` says what is wrong."""
+    node = engine_chunker()
+    preview = chunker_preview(corpus_texts(), template_strlen(), node.read_text(encoding='utf-8'))
+    preview['node'] = str(node)
+    preview['problems'] = chunking_problems(preview)
+    if not preview['passes_chunk_size']:
+        preview['problems'].append(f'{node} drops chunk_size: its splitter keeps its own 4,000-character default')
+    return preview
 
 
 # ---------------------------------------------------------------------------
@@ -408,7 +503,19 @@ async def ingest(client, key: str, collection: str, files: Sequence[Tuple[Path, 
 
 
 async def seed(backends: Sequence[str], recreate: bool) -> Dict[str, Any]:
-    """Seed the selected backends that are missing (or all of them with --recreate)."""
+    """Seed the selected backends that are missing (or all of them with --recreate).
+
+    Raises ChunkerRefused, before anything is created or dropped, when the
+    engine's chunker would not give the calibrated shape.
+    """
+    exists = {'pgvector': pg_exists, 'qdrant': qdrant_exists, 'chroma': chroma_exists}
+    todo = [b for b in BACKENDS if b in backends and (recreate or not exists[b](LEGACY))]
+    if not todo:
+        return {}
+    preview = chunker_check()
+    if preview['problems']:
+        raise ChunkerRefused(preview)
+
     from rocketride import RocketRideClient
 
     corpus = _corpus()
@@ -424,7 +531,7 @@ async def seed(backends: Sequence[str], recreate: bool) -> Dict[str, Any]:
         ]
         orphan_id = fx.object_id(PREFIX + ORPHAN_REL)
         async with RocketRideClient(uri=fx.ENGINE_URL, auth=fx.API_KEY, request_timeout=900000) as client:
-            if 'pgvector' in backends and (recreate or not pg_exists(LEGACY)):
+            if 'pgvector' in todo:
                 pg_create(LEGACY, recreate)
                 await ingest(client, 'postgres', LEGACY, files)
                 await ingest(client, 'rocketride_vector', LEGACY, rr_files)
@@ -434,18 +541,20 @@ async def seed(backends: Sequence[str], recreate: bool) -> Dict[str, Any]:
                     'long_manual_kept_chunk0': bool(kept) and kept[0] == 0,
                     'planted_rows': pg_plant_orphan(LEGACY, orphan_id),
                 }
-            if 'qdrant' in backends and (recreate or not qdrant_exists(LEGACY)):
+            if 'qdrant' in todo:
                 if recreate:
                     qdrant_drop(LEGACY)
                 await ingest(client, 'qdrant', LEGACY, files)
                 qdrant_plant_orphan(LEGACY, orphan_id)
-                notes['qdrant'] = 'seeded'
-            if 'chroma' in backends and (recreate or not chroma_exists(LEGACY)):
+                notes['qdrant'] = {'seeded': True}
+            if 'chroma' in todo:
                 if recreate:
                     chroma_drop(LEGACY)
                 await ingest(client, 'chroma', LEGACY, files)
                 chroma_plant_orphan(LEGACY, orphan_id)
-                notes['chroma'] = 'seeded'
+                notes['chroma'] = {'seeded': True}
+    for note in notes.values():
+        note['chunker'] = {k: preview[k] for k in ('node', 'strlen', 'long_manual_chunks', 'median_chunk_chars')}
     return notes
 
 
@@ -504,7 +613,11 @@ def main() -> int:
     unknown = [b for b in backends if b not in BACKENDS]
     if unknown:
         parser.error(f'unknown backend(s): {", ".join(unknown)}')
-    notes = {} if args.verify_only else asyncio.run(seed(backends, args.recreate))
+    try:
+        notes = {} if args.verify_only else asyncio.run(seed(backends, args.recreate))
+    except ChunkerRefused as refused:
+        print(json.dumps({'seeded': {}, 'refused': refused.preview}, indent=2, default=str))
+        return 1
     facts, problems = verify(backends, seeded_now=list(notes))
     print(json.dumps({'seeded': notes, 'facts': facts, 'problems': problems}, indent=2, default=str))
     return 1 if problems else 0
