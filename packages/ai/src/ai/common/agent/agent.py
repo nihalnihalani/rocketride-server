@@ -23,7 +23,7 @@ from ai.common.schema import Answer, Question
 from ai.common.config import Config
 from ai.common.llm_adapter import turn_usage
 
-from ai.common.utils import parse_bool, safe_str
+from ai.common.utils import merge_metadata, parse_bool, safe_str
 
 from ._internal.host import AgentContext, AgentHostServices
 from ._internal.utils import (
@@ -308,6 +308,7 @@ class AgentBase(ABC):
                 )
                 answer = Answer(expectJson=False)
                 answer.setAnswer(answer_payload.get('content', ''))
+                merge_metadata(answer, getattr(question, 'metadata', None))
                 # The whole turn's total (every model call the run made, across threads
                 # and sub-agents), read back from the turn collector.
                 usage = read_usage()
