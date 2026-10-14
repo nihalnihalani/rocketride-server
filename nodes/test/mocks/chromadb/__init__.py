@@ -42,12 +42,14 @@ with the same assertions against a live Chroma, chromadb/chroma 1.5.9):
       fields left out of ``include`` come back as None.
     - where filters support $and/$or (each with at least two clauses),
       $eq/$ne/$in/$nin/$gt/$gte/$lt/$lte and plain equality; a value of
-      another type never matches (True is not 1).
+      another type never matches (True is not 1). A filter the server refuses
+      (an empty or over-long $in/$nin list, a short or huge $and/$or) is
+      refused by get(), query() and delete() before any record is read.
     - query() distances follow the collection's ``hnsw:space``: cosine
       (1 - cos), l2 (squared euclidean, the default) or ip (1 - dot).
     - upsert() with duplicate ids in one call is refused, as the server does.
-    - Every get() is recorded in ``MockCollection.calls`` so tests can assert
-      which reads a code path made.
+    - Every get() is recorded in ``MockCollection.calls`` and every delete()
+      in ``MockCollection.deletes`` so tests can assert what a code path sent.
 """
 
 from typing import Any, Dict, List, Optional
@@ -85,9 +87,49 @@ def _same(a: Any, b: Any) -> bool:
 # Fewest $and/$or clauses the server refuses (see _matches_where).
 _MAX_WHERE_CLAUSES = 998
 
+# Longest $in/$nin list the server accepts. chromadb 1.5.9 binds every value as
+# an SQL variable and SQLite allows 32,766 per statement: a lone $in is refused
+# from 32,763 values, and from 32,758 next to one more clause ("too many SQL
+# variables"). The mock refuses from the smaller of the two.
+_MAX_IN_VALUES = 32757
+
 
 def _number(value: Any) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _check_where(where: Optional[Dict[str, Any]]) -> None:
+    """Refuse a filter the server refuses before reading any record (empty or over-long lists, short $and/$or)."""
+    if not where:
+        return
+    if '$and' in where or '$or' in where:
+        op = '$and' if '$and' in where else '$or'
+        clauses = where[op]
+        if not isinstance(clauses, list) or len(clauses) < 2:
+            raise ValueError(
+                f'Expected where value for {op} to be a list with at least two where expressions, got {clauses}'
+            )
+        if len(clauses) >= _MAX_WHERE_CLAUSES:
+            raise RuntimeError('Expression tree is too large (maximum depth 1000)')
+        for clause in clauses:
+            _check_where(clause)
+        return
+    for condition in where.values():
+        if not isinstance(condition, dict):
+            continue
+        for op, expected in condition.items():
+            if op not in ('$in', '$nin'):
+                continue
+            if not isinstance(expected, list) or not expected:
+                raise ValueError(
+                    'Expected where operand value to be a non-empty list, '
+                    f'and all values to be of the same type got {expected}'
+                )
+            if len(expected) > _MAX_IN_VALUES:
+                raise RuntimeError(
+                    'Error executing plan: Internal error: error returned from database: '
+                    '(code: 1) too many SQL variables'
+                )
 
 
 def _matches_where(metadata: Dict[str, Any], where: Optional[Dict[str, Any]]) -> bool:
@@ -103,7 +145,8 @@ def _matches_where(metadata: Dict[str, Any], where: Optional[Dict[str, Any]]) ->
             )
         if len(clauses) >= _MAX_WHERE_CLAUSES:
             # chromadb 1.5.9 answers 500 for an $or of 998 clauses (500 work): SQLite's
-            # expression tree depth limit of 1000. An $in list has no such limit.
+            # expression tree depth limit of 1000. An $in list is bounded by the
+            # number of SQL variables instead (_MAX_IN_VALUES).
             raise RuntimeError('Expression tree is too large (maximum depth 1000)')
         results = [_matches_where(metadata, clause) for clause in clauses]
         return all(results) if op == '$and' else any(results)
@@ -181,6 +224,9 @@ class MockCollection:
     # Every get(): {'collection', 'ids', 'where', 'include', 'limit', 'offset'}
     calls: List[Dict[str, Any]] = []
 
+    # Every delete(): {'collection', 'ids', 'where'}
+    deletes: List[Dict[str, Any]] = []
+
     def __init__(self, name: str, metadata: Dict = None):
         self.name = name
         self.id = name
@@ -221,6 +267,7 @@ class MockCollection:
         """Nearest records to each query embedding, by the collection's distance."""
         if include is None:
             include = ['metadatas', 'documents', 'distances']
+        _check_where(where)
         results: Dict[str, Any] = {'ids': [], 'metadatas': [], 'documents': [], 'distances': [], 'embeddings': []}
         space = self._space()
         for query_vector in query_embeddings or []:
@@ -267,6 +314,7 @@ class MockCollection:
                 'offset': offset,
             }
         )
+        _check_where(where)
         wanted = None if ids is None else set(ids)
         rows = [
             (id, data)
@@ -314,6 +362,10 @@ class MockCollection:
 
     def delete(self, ids: List[str] = None, where: Optional[Dict] = None, where_document: Optional[Dict] = None):
         """Delete the records matching ``ids`` and/or ``where``."""
+        _check_where(where)
+        MockCollection.deletes.append(
+            {'collection': self.name, 'ids': None if ids is None else list(ids), 'where': where}
+        )
         wanted = None if ids is None else set(ids)
         doomed = [
             id
@@ -417,6 +469,7 @@ class HttpClient:
         MockCollection._all_storage.clear()
         MockCollection._collection_metadata.clear()
         MockCollection.calls.clear()
+        MockCollection.deletes.clear()
 
 
 # Alias for backwards compatibility
