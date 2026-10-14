@@ -94,10 +94,16 @@ function loadPlaywright() {
 /** Sign in to the served shell with the local test key and wait for the connection. */
 async function signIn(page, base = ENGINE_URL) {
 	await page.goto(base + '/');
-	await page.getByRole('button', { name: /sign in/i }).first().click();
+	await page
+		.getByRole('button', { name: /sign in/i })
+		.first()
+		.click();
 	await page.getByPlaceholder('API key').fill(API_KEY);
 	await page.getByPlaceholder('API key').press('Enter');
-	await page.getByText(/connected/i).first().waitFor({ timeout: 20000 });
+	await page
+		.getByText(/connected/i)
+		.first()
+		.waitFor({ timeout: 20000 });
 }
 
 module.exports = {
