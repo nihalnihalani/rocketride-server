@@ -45,7 +45,7 @@ export RR_TEST_PGVECTOR_POOLER_DSN=${RR_TEST_PGVECTOR_POOLER_DSN:-postgresql://r
 export RR_TEST_AGE_POOLER_DSN=${RR_TEST_AGE_POOLER_DSN:-postgresql://rruser:rrpass@127.0.0.1:56433/rrtenant}
 SUMMARY=$LOGS/SUMMARY.txt
 : > "$SUMMARY"
-echo "revision $(git rev-parse HEAD) dirty=$(git status --porcelain | grep -v constants.ts | wc -l | tr -d ' ')" | tee -a "$SUMMARY"
+echo "revision $(git rev-parse HEAD) dirty=$(git status --porcelain | wc -l | tr -d ' ')" | tee -a "$SUMMARY"
 echo "store $RR_STORE_URL" | tee -a "$SUMMARY"
 # Where a pooler pass connects. A DSN carries a password, so only a plain URL,
 # scheme://[user[:password]@]host[:port][/path][?query] with no other '@', shows its
@@ -62,19 +62,10 @@ echo "pgvector pooler $(shown "$RR_TEST_PGVECTOR_POOLER_DSN")" | tee -a "$SUMMAR
 echo "AGE pooler $(shown "$RR_TEST_AGE_POOLER_DSN")" | tee -a "$SUMMARY"
 
 CONSTANTS=packages/client-typescript/src/client/constants.ts
-step() {
-	local name=$1; shift
-	"$@" > "$LOGS/$name.log" 2>&1
-	local rc=$?
-	printf '%-28s exit=%s\n' "$name" "$rc" | tee -a "$SUMMARY"
-	# The builder rewrites this file during builds; never leave it modified, and say so.
-	if ! git diff --quiet -- "$CONSTANTS" 2>/dev/null; then
-		git checkout -- "$CONSTANTS" 2>/dev/null
-		printf '%-28s restored %s (rewritten by this step)\n' '' "$CONSTANTS" | tee -a "$SUMMARY"
-	fi
-	STEPS=$((STEPS + 1))
-	if [ "$rc" -ne 0 ]; then FAILED=$((FAILED + 1)); fi
-}
+if git diff --quiet -- "$CONSTANTS" 2>/dev/null; then constants_state=clean; else constants_state=modified; fi
+echo "$CONSTANTS $constants_state before the run (each step that rewrites it gets it back as it was)" | tee -a "$SUMMARY"
+# shellcheck source=validate_lib.sh
+. "$HERE/validate_lib.sh"
 STEPS=0
 FAILED=0
 

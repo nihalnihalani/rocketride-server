@@ -30,9 +30,9 @@ not a secret. Never point them at a database that holds data you care about.
 | `browser/lane_vector_map.cjs` | The map lane (gate G4): both sample modes, hover, neighbours, lasso, query star and rays, the Table alternative, chunk path, duplicates, outliers, keyboard sectors, the layout-quality rule, the Qdrant legend, t-SNE's limit, Cancel, privacy. Writes `out/lane_vector_map.json` (with what each step measured). |
 | `browser/ui.cjs` | Every selector, sentence and canvas data attribute the two lanes look for, in one table. |
 | `browser/common.cjs` | What the lanes share: the step recorder, the WebSocket frame capture, the store's side through the TypeScript client, the privacy property. |
-| `validate_all.sh` | Every repository gate the feature touches, with real builder actions; never stops early, exits non-zero when a step failed. |
+| `validate_all.sh` | Every repository gate the feature touches, with real builder actions; never stops early, exits non-zero when a step failed. A step that rewrites the TypeScript client's `constants.ts` (the builder does) gets the file back as it was before that step, an uncommitted edit included (`validate_lib.sh`). |
 | `env.cjs` | Settings shared by the Node scripts and the browser lane, read from the environment. |
-| `selftest/` | Self-tests of the harness itself (no engine, database or browser): the corpus, the calibration writer, the legacy seed's verdicts, the fixture builders, the stand-ins, and the browser lane run against an empty stand-in page, where every check must fail. |
+| `selftest/` | Self-tests of the harness itself (no engine, database or browser): the corpus, the calibration writer, the legacy seed's verdicts, the fixture builders, the stand-ins, `validate_all.sh`'s step runner, and the browser lane run against an empty stand-in page, where every check must fail. |
 
 ## Ports
 
