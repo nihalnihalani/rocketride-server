@@ -210,6 +210,39 @@ test('a failed page stops the listing with the reason; Retry asks for the same c
 	store.dispose();
 });
 
+test('a store that answers the same page again is asked twice, not without end', async () => {
+	// Two stores that ignore the page cursor: one hands the same cursor back, one a new
+	// cursor each time; neither says documents_paging_unsupported. The scripted store
+	// throws at the 50th call so a listing that never ends fails here instead of hanging.
+	for (const cursorOf of [(_n: number) => 'c1', (n: number) => `o${n}`]) {
+		let asked = 0;
+		const { store, clock, calls } = harness({
+			documents: async (cursor, limit) => {
+				calls.push({ tool: 'documents', args: [cursor, limit] });
+				asked += 1;
+				if (asked >= 50) throw new Error('still asking after 50 pages');
+				return { items: [doc('b', 'C:/x/b.md'), doc('a', 'C:/x/a.md')], nextCursor: cursorOf(asked), total: null, countsExact: true, distinct: true, sorted: false, caveats: [], warnings: [], pagingUnsupported: false };
+			},
+		});
+		store.open();
+		await clock.settle();
+		const state = store.getState().directory;
+		assert.equal(calls.filter((c) => c.tool === 'documents').length, 2, 'the first page and the one repeat');
+		assert.equal(state.status, 'stalled');
+		assert.equal(state.rows.length, 2);
+		store.setVisible(false);
+		store.setVisible(true);
+		store.retryDocuments();
+		store.loadMoreDocuments();
+		await clock.settle();
+		assert.equal(calls.filter((c) => c.tool === 'documents').length, 2, 'showing the console, Retry and Load more ask nothing more');
+		store.refresh();
+		await clock.settle();
+		assert.equal(calls.filter((c) => c.tool === 'documents').length, 4, 'Refresh starts over, and stops again after the repeat');
+		store.dispose();
+	}
+});
+
 test('selecting a document lists its chunks, 100 per page, and "more" continues after the last one', async () => {
 	const { store, clock, calls } = harness();
 	store.open();

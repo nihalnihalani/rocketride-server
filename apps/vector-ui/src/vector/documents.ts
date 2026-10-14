@@ -40,14 +40,17 @@
 // ends, pauses or fails. Past the cap the footer says "Limit reached at N
 // documents; more may exist" with Load more (+5,000). A store that ignores
 // the page offset ends the listing with `documents_paging_unsupported`. A row
-// seen before (same objectId) is never listed twice.
+// seen before (same objectId) is never listed twice, and a page that brings no
+// row not already listed ends the listing too (the store sent rows it had sent
+// before; asking again would get them again), so every page that keeps the
+// listing going adds a row and the cap always ends it.
 // =============================================================================
 
 import type { IDocumentItem } from '../contract/types';
 import { DIRECTORY_AUTO_ROWS, DIRECTORY_LOAD_MORE } from './budgets';
 import type { IDocumentsPageView } from './results';
 import { formatCount } from './stats';
-import { CAVEAT_SENTENCES } from './wording';
+import { CAVEAT_SENTENCES, DOCUMENTS_REPEATED_TEXT } from './wording';
 import type { IFailureText } from './wording';
 
 // =============================================================================
@@ -189,7 +192,7 @@ export function filterItems(items: readonly IDocumentItem[], text: string): IDoc
 // =============================================================================
 
 /** Where the directory's listing is. */
-export type PagerStatus = 'idle' | 'loading' | 'paused' | 'done' | 'capped' | 'unsupported' | 'error';
+export type PagerStatus = 'idle' | 'loading' | 'paused' | 'done' | 'capped' | 'unsupported' | 'stalled' | 'error';
 
 /** The directory's listing state (replaced, never mutated). */
 export interface IPagerState {
@@ -263,9 +266,13 @@ export function pagerApplyPage(state: IPagerState, page: IDocumentsPageView): IP
 	let status: PagerStatus = 'loading';
 	if (page.pagingUnsupported) status = 'unsupported';
 	else if (page.nextCursor === null || page.items.length === 0) status = 'done';
+	// Nothing new on a page means the store answered rows it had already sent (it
+	// ignored the cursor): asking again would get the same rows. Every page that
+	// does not end the listing therefore adds a row, so the listing ends by the cap.
+	else if (fresh.length === 0) status = base.total !== null && rows.length >= base.total ? 'done' : 'stalled';
 	else if (rows.length >= state.cap) status = 'capped';
 	if (status !== 'loading') rows = sortDocuments(rows);
-	return { ...base, rows, status, cursor: status === 'unsupported' ? null : base.cursor };
+	return { ...base, rows, status, cursor: status === 'loading' || status === 'capped' ? base.cursor : null };
 }
 
 /**
@@ -346,6 +353,8 @@ export function pagerFooter(state: IPagerState): IPagerFooter | null {
 			return { text: `Limit reached at ${loaded} documents; more may exist`, loadMore: true, caveat: null, retry: false };
 		case 'unsupported':
 			return { text: `Limit reached at ${loaded} documents; more may exist`, loadMore: false, caveat: CAVEAT_SENTENCES.documents_paging_unsupported, retry: false };
+		case 'stalled':
+			return { text: `Loading stopped at ${loaded} documents; more may exist`, loadMore: false, caveat: DOCUMENTS_REPEATED_TEXT, retry: false };
 		case 'error':
 			return { text: `Loading stopped at ${loaded} documents: ${state.error?.headline ?? 'the store did not answer.'}`, loadMore: false, caveat: null, retry: true };
 		case 'paused':

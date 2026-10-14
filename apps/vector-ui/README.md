@@ -107,8 +107,10 @@ Opening a connection opens its console, the main screen.
   documents… 1,200 of 10,000"); rows are re-sorted only when loading ends or
   pauses, so nothing moves under the pointer. Past 5,000 the footer says "Limit
   reached at 5,000 documents; more may exist" with **Load more**. A store that
-  lists documents in storage order is sorted here, and the footer says so. The
-  filter box filters what is loaded. Selecting a document lists its chunks.
+  lists documents in storage order is sorted here, and the footer says so; when
+  a store sends back documents already listed instead of the next page, loading
+  stops there and the footer says that too. The filter box filters what is
+  loaded. Selecting a document lists its chunks.
 - **Remove**: the trash button of a row removes that document and all its
   chunks, after a confirmation whose **Cancel** has the focus. The answer says
   how many chunks were removed, and the statistics and the list refresh. Select

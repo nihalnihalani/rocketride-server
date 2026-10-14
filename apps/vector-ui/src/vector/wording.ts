@@ -121,6 +121,9 @@ export const WRITE_TIMEOUT_TEXT = 'The request may still complete on the server.
 /** What a cancelled confirmation says. */
 export const CANCELLED_TEXT = 'Cancelled. Nothing was sent.';
 
+/** Under the directory when a page brought no document that was not already listed (the listing stops there). */
+export const DOCUMENTS_REPEATED_TEXT = 'The store sent documents it had already listed instead of the next page, so the directory stopped asking.';
+
 /** Server codes that mean the task is not running (yet). */
 const NOT_RUNNING_CODES: ReadonlySet<string> = new Set(['TASK_STOPPED', 'TASK_NOT_REGISTERED', 'TASK_COMPLETED']);
 

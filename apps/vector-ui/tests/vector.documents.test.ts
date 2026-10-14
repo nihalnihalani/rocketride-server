@@ -14,7 +14,7 @@ import { DIRECTORY_AUTO_ROWS, DIRECTORY_LOAD_MORE } from '../src/vector/budgets'
 import { buildGroups, directoryHeading, filterItems, filterSummary, pagerApplyPage, pagerBegin, pagerFail, pagerFooter, pagerInit, pagerLoadMore, pagerPause, pagerProgressText, pagerResume, pagerWantsPage, splitPath } from '../src/vector/documents';
 import { readDocumentsPage } from '../src/vector/results';
 import type { IDocumentsPageView } from '../src/vector/results';
-import { CAVEAT_SENTENCES } from '../src/vector/wording';
+import { CAVEAT_SENTENCES, DOCUMENTS_REPEATED_TEXT } from '../src/vector/wording';
 import { fixture } from './support/fixtures';
 
 /** A synthetic document row. */
@@ -180,6 +180,48 @@ test('auto-pager: handles a null total, a repeated page and an error', () => {
 	assert.equal(pagerWantsPage(state), false);
 	assert.deepEqual(pagerFooter(state), { text: 'Loading stopped at 3 documents: The store answered with an error.', loadMore: false, caveat: null, retry: true });
 	assert.equal(pagerResume(state).status, 'loading', 'Retry asks for the same cursor again');
+});
+
+test('auto-pager: a repeated page ends the listing instead of asking for it again and again', () => {
+	const rows = [doc('b', 'C:/x/b.md'), doc('a', 'C:/x/a.md')];
+	// The same page again with the same cursor: a store that ignores the cursor.
+	let state = pagerApplyPage(pagerBegin(pagerInit()), page(rows, { nextCursor: 'c1', total: null }));
+	assert.equal(state.status, 'loading');
+	state = pagerApplyPage(state, page(rows, { nextCursor: 'c1', total: null }));
+	assert.equal(state.status, 'stalled');
+	assert.equal(pagerWantsPage(state), false);
+	assert.equal(state.cursor, null, 'nothing is left to resume from');
+	assert.deepEqual(
+		state.rows.map((r) => r.objectId),
+		['a', 'b'],
+		'what is loaded stays, sorted'
+	);
+	assert.equal(pagerProgressText(state), null);
+	assert.deepEqual(pagerFooter(state), { text: 'Loading stopped at 2 documents; more may exist', loadMore: false, caveat: DOCUMENTS_REPEATED_TEXT, retry: false });
+	assert.equal(pagerResume(state).status, 'stalled', 'Retry is not offered: the store would answer the same page');
+	assert.equal(pagerLoadMore(state).status, 'stalled');
+	assert.equal(pagerPause(state).status, 'stalled');
+	// The cursor moves on but the rows do not: an offset the store ignores, answered without the node's caveat.
+	let moving = pagerApplyPage(pagerBegin(pagerInit()), page(rows, { nextCursor: 'o500', total: 9 }));
+	moving = pagerApplyPage(moving, page([rows[1]], { nextCursor: 'o1000', total: 9 }));
+	assert.equal(moving.status, 'stalled');
+	assert.equal(directoryHeading(moving), '9 documents', 'the heading still says what the store counted');
+	// The node's own caveat still names the reason when it comes with the repeated page.
+	const named = pagerApplyPage(pagerApplyPage(pagerBegin(pagerInit()), page(rows, { nextCursor: 'c1' })), page(rows, { nextCursor: null, pagingUnsupported: true }));
+	assert.equal(named.status, 'unsupported');
+	// A page of rows already listed after everything the store counted is just the end.
+	let full = pagerApplyPage(pagerBegin(pagerInit()), page(rows, { nextCursor: 'c1', total: 2 }));
+	full = pagerApplyPage(full, page(rows, { nextCursor: 'c2', total: 2 }));
+	assert.equal(full.status, 'done');
+	assert.equal(full.cursor, null);
+	// Bounded: a store that answers the same page forever is asked for it twice.
+	let loop = pagerBegin(pagerInit());
+	let asks = 0;
+	while (pagerWantsPage(loop) && asks < 10_000) {
+		loop = pagerApplyPage(loop, page(rows, { nextCursor: `o${asks}` }));
+		asks += 1;
+	}
+	assert.equal(asks, 2);
 });
 
 test('a store that cannot page ends the listing with its caveat; one that lists in storage order is sorted here', () => {
