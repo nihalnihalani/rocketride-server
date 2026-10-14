@@ -42,9 +42,10 @@ unmocked:
    few documents of the demo corpus through ``ingest_1`` and checks what
    reached the database through an independent admin connection.
 3. It builds a legacy-shaped copy of that collection (the shape the store
-   drivers wrote before the explorer: random point ids, no file size or ingest
-   time, no ``meta`` column on pgvector, one document without chunk 0) and
-   starts the template a second time on it. ``RR_TEST_VECTOR_LEGACY=seeded``
+   drivers wrote before the explorer: random-looking point ids, here
+   reproducible ones (``legacy_point_ids``), no file size or ingest time, no
+   ``meta`` column on pgvector, one document without chunk 0) and starts the
+   template a second time on it. ``RR_TEST_VECTOR_LEGACY=seeded``
    uses the collections ``seed_legacy.sh`` wrote (``vx_legacy_docs``) instead;
    the suite then only adds and removes documents of its own there.
 4. Every explorer tool is called by name through ``client.tool`` on the
@@ -245,6 +246,23 @@ LEGACY_META_KEYS = (
     'tableId',
     'signature',
 )
+
+
+# The old drivers wrote random point ids. The legacy copies get ids that look as random (uuid5 under
+# this suite's own namespace, never the objectId/chunk derivation of a new driver) but are the same on
+# every run and whatever order the source is read in, so a listing in point-id order is reproducible.
+LEGACY_ID_NAMESPACE = uuid.UUID('7d3f5a9e-2c41-4b8e-9f06-1e5b8c2d4a70')
+
+
+def legacy_point_ids(metas: Sequence[Dict[str, Any]]) -> List[str]:
+    """One reproducible point id per row of a legacy copy, keyed by what identifies the row."""
+    seen: Dict[str, int] = collections.Counter()
+    out = []
+    for m in metas:
+        key = '#'.join(str(m.get(k)) for k in ('objectId', 'chunkId', 'isTable', 'tableId'))
+        seen[key] += 1
+        out.append(str(uuid.uuid5(LEGACY_ID_NAMESPACE, f'{key}#{seen[key]}')))
+    return out
 
 
 class _PgVector:
@@ -454,7 +472,7 @@ class _Qdrant:
         raise KeyError((oid, chunk))
 
     def make_legacy(self, src: str, dst: str, orphan: str) -> None:
-        """Copy src into dst as the old driver wrote it: uuid4 ids, payload {content, meta} with the old keys only."""
+        """Copy src into dst as the old driver wrote it: random-looking ids (legacy_point_ids), payload {content, meta} with the old keys only."""
         from qdrant_client import models
 
         client = self.client()
@@ -468,15 +486,16 @@ class _Qdrant:
             client.create_payload_index(dst, field_name=key, field_schema=models.PayloadSchemaType.INTEGER)
         for key in ('meta.isDeleted', 'meta.isTable'):
             client.create_payload_index(dst, field_name=key, field_schema=models.PayloadSchemaType.BOOL)
+        source = self._points(src, vectors=True)
+        metas = [dict((p.payload or {}).get('meta') or {}) for p in source]
         points = []
-        for p in self._points(src, vectors=True):
-            meta = dict((p.payload or {}).get('meta') or {})
+        for p, meta, point_id in zip(source, metas, legacy_point_ids(metas)):
             keep = LEGACY_META_KEYS + (('vectorSize', 'modelName') if meta.get('objectId') == 'schema' else ())
             payload = {
                 'content': (p.payload or {}).get('content', ''),
                 'meta': {k: meta.get(k) for k in keep if k in meta},
             }
-            points.append(models.PointStruct(id=str(uuid.uuid4()), vector=list(p.vector), payload=payload))
+            points.append(models.PointStruct(id=point_id, vector=list(p.vector), payload=payload))
         client.upsert(dst, points=points, wait=True)
         self.delete_chunk0(dst, orphan)
 
@@ -556,7 +575,7 @@ class _Chroma:
         raise KeyError((oid, chunk))
 
     def make_legacy(self, src: str, dst: str, orphan: str) -> None:
-        """Copy src into dst as the old driver wrote it: uuid4 ids, flat metadata with the old keys only."""
+        """Copy src into dst as the old driver wrote it: random-looking ids (legacy_point_ids), flat metadata with the old keys only."""
         got = self._get(src, ['metadatas', 'embeddings', 'documents'])
         self.drop(dst)
         target = self.client().create_collection(dst, metadata={'hnsw:space': 'cosine'})
@@ -565,7 +584,7 @@ class _Chroma:
             keep = LEGACY_META_KEYS + (('vectorSize', 'modelName') if m.get('objectId') == 'schema' else ())
             metas.append({k: m[k] for k in keep if m.get(k) is not None})
         target.add(
-            ids=[str(uuid.uuid4()) for _ in metas],
+            ids=legacy_point_ids(got['metadatas']),
             embeddings=[[float(x) for x in v] for v in got['embeddings']],
             metadatas=metas,
             documents=list(got['documents']),
@@ -1513,6 +1532,75 @@ def test_a_write_without_a_call_context_is_refused():
         'NOT RUN: a context-less call cannot be produced through a real engine (the dispatcher stamps every '
         'client.tool call); covered by test_vector_write_gate.py and the G0-7 probe'
     )
+
+
+# ---------------------------------------------------------------------------
+# The legacy copies (no engine or database call)
+# ---------------------------------------------------------------------------
+
+
+def _source_rows() -> List[Dict[str, Any]]:
+    metas = [{'objectId': 'schema', 'chunkId': 0, 'isDeleted': True, 'vectorSize': DIMENSION, 'modelName': 'm'}]
+    metas += [{'objectId': oid, 'chunkId': c, 'parent': f'C:/demo/{oid}.md'} for oid in ('a', 'b') for c in (0, 1)]
+    return [{'meta': m, 'content': f'text {i}', 'vector': [0.01 * (i + 1)] * DIMENSION} for i, m in enumerate(metas)]
+
+
+class _FakeQdrantClient:
+    def __init__(self) -> None:
+        self.upserted: List[Any] = []
+
+    def collection_exists(self, name):
+        return False
+
+    def create_collection(self, *a, **k):
+        pass
+
+    def create_payload_index(self, *a, **k):
+        pass
+
+    def upsert(self, name, points, wait=True):
+        self.upserted = list(points)
+
+    def delete(self, *a, **k):
+        pass
+
+
+def _qdrant_legacy_ids(rows: List[Dict[str, Any]]) -> Dict[Tuple[str, int], str]:
+    service, client = _Qdrant(), _FakeQdrantClient()
+    service.client = lambda: client
+    points = [SimpleNamespace(payload={'content': r['content'], 'meta': r['meta']}, vector=r['vector']) for r in rows]
+    service._points = lambda collection, vectors=False: points
+    service.make_legacy('vx_tp_src', 'vx_tp_dst', 'a')
+    return {(p.payload['meta']['objectId'], p.payload['meta']['chunkId']): str(p.id) for p in client.upserted}
+
+
+def _chroma_legacy_ids(rows: List[Dict[str, Any]]) -> Dict[Tuple[str, int], str]:
+    added: Dict[str, Any] = {}
+    target = SimpleNamespace(add=lambda **k: added.update(k), delete=lambda **k: None)
+    service = _Chroma()
+    service.client = lambda: SimpleNamespace(
+        create_collection=lambda *a, **k: target, get_collection=lambda *a, **k: target, list_collections=lambda: []
+    )
+    service._get = lambda collection, include: {
+        'metadatas': [r['meta'] for r in rows],
+        'embeddings': [r['vector'] for r in rows],
+        'documents': [r['content'] for r in rows],
+    }
+    service.make_legacy('vx_tp_src', 'vx_tp_dst', 'a')
+    return {(m['objectId'], m['chunkId']): i for m, i in zip(added['metadatas'], added['ids'])}
+
+
+@pytest.mark.parametrize('copy', (_qdrant_legacy_ids, _chroma_legacy_ids), ids=('qdrant', 'chroma'))
+def test_a_legacy_copy_gets_the_same_point_ids_on_every_run(copy):
+    # Qdrant lists in point-id order: random ids would reorder the legacy listing (and move its cursor) per run.
+    rows = _source_rows()
+    first = copy(rows)
+    assert copy(list(reversed(rows))) == first, 'the ids depend on the run or on the order the source was read in'
+    assert len(set(first.values())) == len(first)
+    # They are not the ids a new driver derives from the objectId and chunk (the legacy fallbacks stay exercised).
+    for (oid, chunk), point in first.items():
+        assert point not in {str(uuid.uuid5(ns, f'{oid}#{chunk}')) for ns in (uuid.NAMESPACE_URL, uuid.NAMESPACE_OID)}
+        assert uuid.UUID(point).version == 5
 
 
 # ---------------------------------------------------------------------------
