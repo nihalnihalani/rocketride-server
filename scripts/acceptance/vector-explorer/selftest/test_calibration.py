@@ -204,5 +204,28 @@ class CommittedTemplatesTests(unittest.TestCase):
             self.assertIn(cal.chunk_sentence(record), _annotation(path), path.name)
 
 
+# The calibration takes effect only once preprocessor_langchain hands chunk_size, chunk_overlap and
+# length_function to its splitter (its keyword filter reads the splitter's own __init__ only). That node
+# is not this lane's file; once it does, `calibrate_chunking.py --sync` flips chunking.json and the notes.
+@unittest.skip('NEEDS:lead merged — integration gate G2 (preprocessor_langchain passes the chunk length on)')
+class CalibrationInEffectTests(unittest.TestCase):
+    """The shipped templates cut the calibrated chunks: no caveat left in chunking.json or in any template."""
+
+    def test_the_chunker_node_hands_the_length_to_its_splitter(self):
+        passes = cal.node_passes_chunk_size()
+        if passes is None:
+            self.skipTest('NOT RUN: langchain_text_splitters is not importable here (run with the engine python)')
+        self.assertIs(passes, True, 'preprocessor_langchain drops chunk_size: chunks stay at up to 4,000 characters')
+
+    def test_chunking_json_says_the_setting_takes_effect(self):
+        record = json.loads(CHUNKING.read_text(encoding='utf-8'))
+        self.assertIs(record.get('effective'), True, 'run calibrate_chunking.py --sync once the node passes the length')
+        self.assertNotIn('known_issue', record)
+
+    def test_no_template_carries_the_caveat(self):
+        for path in sorted(TEMPLATES.glob('*.pipe')):
+            self.assertNotIn('does not pass `strlen`', _annotation(path), path.name)
+
+
 if __name__ == '__main__':
     unittest.main()
