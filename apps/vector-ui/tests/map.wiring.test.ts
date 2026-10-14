@@ -73,3 +73,9 @@ test('the browser lanes can read the map\'s state: tooltip, query, rays, layout,
 test('light samples are dithered within their 2-decimal rounding on PCA, so no lattice is drawn', () => {
 	assert.match(read('views/MapView.tsx'), /sample\.mode === 'light' \? ditherRounded\(pca, 0\.01, /);
 });
+
+test('the Selection tab is wired to the console unchanged: every selected document goes to requestRemove (no cap here)', () => {
+	const view = read('views/MapView.tsx');
+	assert.match(view, /<SelectionTab[\s\S]*?onRemove=\{\(ids\) => actions\.requestRemove\(ids\)\}/);
+	assert.doesNotMatch(view, /requestRemove\([^)]*\.slice\(|\.slice\(0, limits\.write_ids_max\)/, 'the map never truncates a removal to write_ids_max');
+});

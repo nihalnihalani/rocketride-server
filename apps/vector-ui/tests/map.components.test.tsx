@@ -26,9 +26,10 @@ import { NeighbourList } from '../src/components/NeighbourList';
 import { OutliersPanel } from '../src/components/OutliersPanel';
 import { PointInspector } from '../src/components/PointInspector';
 import { PointsTable } from '../src/components/PointsTable';
-import type { INeighborsResult, IVectorLimits } from '../src/contract/types';
+import type { INeighborsResult, IVectorLimits, VectorKey } from '../src/contract/types';
 import { colourPoints } from '../src/map/colours';
 import { readPalette } from '../src/map/tokens';
+import { SelectionTab } from '../src/views/MapView';
 import { loadSample, modelOf } from './support/map.samples';
 
 const FIX = path.resolve(__dirname, 'fixtures', 'provisional');
@@ -39,6 +40,23 @@ const native = modelOf(loadSample('sample_native_knn.json'));
 const palette = readPalette((t) => ({ '--rr-palette-mode': 'dark', '--rr-bg-default': '#161616', '--rr-bg-paper': '#242424' } as Record<string, string>)[t] ?? '');
 const noop = (): void => undefined;
 const html = (el: React.ReactElement): string => renderToStaticMarkup(el);
+
+/** Elements of a rendered tree (function components are not called; plain JSX only). */
+function elements(node: unknown, out: React.ReactElement[] = []): React.ReactElement[] {
+	if (Array.isArray(node)) node.forEach((child) => elements(child, out));
+	else if (React.isValidElement(node)) {
+		out.push(node);
+		elements((node.props as { children?: unknown }).children, out);
+	}
+	return out;
+}
+
+/** The button whose text is `label`. */
+function button(tree: React.ReactElement, label: string): React.ReactElement<{ onClick(): void; disabled?: boolean }> {
+	const found = elements(tree).find((el) => el.type === 'button' && elements((el.props as { children?: unknown }).children).length === 0 && String((el.props as { children?: unknown }).children).trim() === label);
+	assert.ok(found, `a "${label}" button`);
+	return found as React.ReactElement<{ onClick(): void; disabled?: boolean }>;
+}
 
 test('Legend: sample line, one row per colour, the point cap, who computed the neighbour graph, and the distance caveat', () => {
 	const colouring = colourPoints(demo.result, 'document', palette);
@@ -127,4 +145,23 @@ test('MapToolbar: sizes capped by the node\'s limits, t-SNE disabled above 1,000
 	const busy = html(<MapToolbar {...base} busy="Laying out…" canCancel query={{ enabled: true, reason: null }} />);
 	assert.match(busy, /Laying out…/);
 	assert.match(busy, />Cancel<\/button>/);
+});
+
+test('Selection tab: "Remove these documents" hands the console EVERY selected document (it confirms and batches), never a silent first 100', () => {
+	// 260 points over 250 documents: more than write_ids_max (100).
+	const keys: VectorKey[] = Array.from({ length: 260 }, (_, i) => [`doc-${i % 250}`, Math.floor(i / 250)] as VectorKey);
+	const asked: Array<readonly string[]> = [];
+	const props = { keys, chat: { enabled: true, reason: null }, writes: { enabled: true, reason: null }, onAskAbout: (ids: readonly string[]) => asked.push(ids), onRemove: (ids: readonly string[]) => asked.push(ids), onCopy: noop };
+	assert.equal(limits.write_ids_max, 100);
+	const tree = SelectionTab(props);
+	assert.match(html(tree), /260 points selected from 250 documents\./);
+	button(tree, 'Remove these documents').props.onClick();
+	assert.equal(asked[0]?.length, 250, 'the console is asked about all 250 documents the tab names');
+	assert.deepEqual([...(asked[0] ?? [])].sort(), Array.from({ length: 250 }, (_, i) => `doc-${i}`).sort());
+	button(tree, 'Ask about these only').props.onClick();
+	assert.equal(asked[1]?.length, 250);
+	const off = SelectionTab({ ...props, writes: { enabled: false, reason: 'Removing documents is turned off on this store node (allow_writes).' } });
+	assert.equal(button(off, 'Remove these documents').props.disabled, true);
+	assert.match(html(off), /turned off on this store node/);
+	assert.match(html(SelectionTab({ ...props, keys: [] })), /Turn on the lasso \(L\)/);
 });

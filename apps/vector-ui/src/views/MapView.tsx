@@ -56,7 +56,7 @@ import { OutliersPanel } from '../components/OutliersPanel';
 import { PointCanvas } from '../components/PointCanvas';
 import { PointInspector } from '../components/PointInspector';
 import { PointsTable } from '../components/PointsTable';
-import type { ColourBy, IChunksResult, IEmbedResult, INeighborsResult, INeighborsScopeResult, IProjectItem, IProjectResult, ISampleInput, ISampleResult, ISearchResult, MapLayout, MapViewProps, SampleMode, VectorKey } from '../contract/types';
+import type { Availability, ColourBy, IChunksResult, IEmbedResult, INeighborsResult, INeighborsScopeResult, IProjectItem, IProjectResult, ISampleInput, ISampleResult, ISearchResult, MapLayout, MapViewProps, SampleMode, VectorKey } from '../contract/types';
 import { TSNE_MAX_POINTS } from '../map/budgets';
 import { callTool } from '../map/calls';
 import type { ToolAnswer } from '../map/calls';
@@ -177,6 +177,51 @@ interface IRefined {
 
 /** The layout's state, for the toolbar and the lanes. */
 type LayoutState = 'idle' | 'running' | 'done' | 'kept-pca' | 'cancelled' | 'refused' | 'failed' | 'unavailable';
+
+/** Props of the Selection tab. */
+export interface SelectionTabProps {
+	/** The lasso selection (one key per point). */
+	keys: readonly VectorKey[];
+	chat: Availability;
+	writes: Availability;
+	/** "Ask about these only": the documents of the selection. */
+	onAskAbout(objectIds: readonly string[]): void;
+	/** "Remove these documents": EVERY document of the selection; the console confirms and batches the writes (APP_SPEC §6). */
+	onRemove(objectIds: readonly string[]): void;
+	onCopy(keys: readonly VectorKey[]): void;
+}
+
+/**
+ * The Selection tab: what the lasso selected and what can be done with it.
+ *
+ * @param props - The selection and the actions.
+ * @returns The tab body.
+ */
+export function SelectionTab(props: SelectionTabProps): React.ReactElement {
+	const { keys, chat, writes } = props;
+	if (keys.length === 0) return <p style={MAP_STYLES.note}>Turn on the lasso (L) and draw around points to select them.</p>;
+	const docs = Array.from(new Set(keys.map((k) => k[0])));
+	return (
+		<section aria-label="Selected points">
+			<p style={MAP_STYLES.text}>
+				{num(keys.length)} points selected from {num(docs.length)} documents.
+			</p>
+			<div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, margin: '8px 0' }}>
+				<button type="button" style={MAP_STYLES.button} disabled={!chat.enabled} onClick={() => props.onAskAbout(docs)}>
+					Ask about these only
+				</button>
+				<button type="button" style={MAP_STYLES.button} disabled={!writes.enabled} onClick={() => props.onRemove(docs)}>
+					Remove these documents
+				</button>
+				<button type="button" style={MAP_STYLES.button} onClick={() => props.onCopy(keys)}>
+					Copy keys
+				</button>
+			</div>
+			{!writes.enabled && writes.reason ? <p style={MAP_STYLES.note}>{writes.reason}</p> : null}
+			{!chat.enabled && chat.reason ? <p style={MAP_STYLES.note}>{chat.reason}</p> : null}
+		</section>
+	);
+}
 
 // =============================================================================
 // VIEW
@@ -793,7 +838,6 @@ export function MapView(props: MapViewProps): React.ReactElement {
 	const selectedKey = selected !== null && sample ? pointKey(sample, selected) : null;
 	const selectedScore = selectedKey && query?.search ? (query.search.results.find((r) => r.metadata?.objectId === selectedKey[0] && r.metadata?.chunkId === selectedKey[1])?.score ?? null) : null;
 	const lassoKeys = state.highlight?.source === 'lasso' ? state.highlight.keys : state.keys;
-	const lassoDocs = Array.from(new Set(lassoKeys.map((k) => k[0])));
 	const legendNotes = [...(query?.notes ?? []), ...(star && !star.exact && !query?.item ? [CENTROID_APPROX] : [])];
 	const describe = (index: number): string => {
 		if (!sample) return '';
@@ -944,35 +988,17 @@ export function MapView(props: MapViewProps): React.ReactElement {
 								setCentreOn({ index: i, seq: ++seq.current });
 							}} /> : null}
 							{tab === 'selection' ? (
-								lassoKeys.length === 0 ? (
-									<p style={MAP_STYLES.note}>Turn on the lasso (L) and draw around points to select them.</p>
-								) : (
-									<section aria-label="Selected points">
-										<p style={MAP_STYLES.text}>
-											{num(lassoKeys.length)} points selected from {num(lassoDocs.length)} documents.
-										</p>
-										<div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, margin: '8px 0' }}>
-											<button type="button" style={MAP_STYLES.button} disabled={!model.chat.enabled} onClick={() => actions.askAbout(lassoDocs)}>
-												Ask about these only
-											</button>
-											<button type="button" style={MAP_STYLES.button} disabled={!model.writes.enabled} onClick={() => actions.requestRemove(lassoDocs.slice(0, limits.write_ids_max))}>
-												Remove these documents
-											</button>
-											<button
-												type="button"
-												style={MAP_STYLES.button}
-												onClick={() => {
-													const text = JSON.stringify(lassoKeys);
-													if (typeof navigator !== 'undefined' && navigator.clipboard) void navigator.clipboard.writeText(text).then(() => actions.announce(`Copied ${num(lassoKeys.length)} keys.`));
-												}}
-											>
-												Copy keys
-											</button>
-										</div>
-										{!model.writes.enabled && model.writes.reason ? <p style={MAP_STYLES.note}>{model.writes.reason}</p> : null}
-										{!model.chat.enabled && model.chat.reason ? <p style={MAP_STYLES.note}>{model.chat.reason}</p> : null}
-									</section>
-								)
+								<SelectionTab
+									keys={lassoKeys}
+									chat={model.chat}
+									writes={model.writes}
+									onAskAbout={(ids) => actions.askAbout(ids)}
+									onRemove={(ids) => actions.requestRemove(ids)}
+									onCopy={(keys) => {
+										const text = JSON.stringify(keys);
+										if (typeof navigator !== 'undefined' && navigator.clipboard) void navigator.clipboard.writeText(text).then(() => actions.announce(`Copied ${num(keys.length)} keys.`));
+									}}
+								/>
 							) : null}
 							{tab === 'heat' ? (
 								selected === null || query === null ? (
