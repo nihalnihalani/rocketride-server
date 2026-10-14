@@ -721,25 +721,32 @@ def test_backend_failures_do_not_name_the_server(adapter, store, call, after_exi
         with pytest.raises(StoreUnsupported):
             TOOL_CALLS[call](store)
         return
+    if expected == 'reads_missing':
+        assert TOOL_CALLS[call](store) is False
+        return
+
+    def assert_host_free(error):
+        answer = f'{type(error).__name__}: {error}'  # what the tool wrapper puts in STORE_ERROR
+        assert address not in answer, answer
+        assert error_name in answer, answer
+        if failure == 'client-error':
+            assert '(code 2)' in answer, answer
+        assert any(link is injected for link in _chain(error)), f'{call} never reached the backend: {answer}'
+
     if expected == 'inherits':
         assert _method(call) not in vars(type(store)), f'{call} is now overridden: drop it from the allowlist'
         try:
             answer = TOOL_CALLS[call](store)
-        except StoreUnsupported:  # removeCounted's day-0 base default (NEEDS:L1 makes it None)
-            answer = None
+        except StoreUnsupported:  # removeCounted's day-0 base default
+            return
+        except Exception as error:  # noqa: BLE001 - a base default that goes through the driver (remove)
+            assert_host_free(error)
+            return
         assert answer is None
-        return
-    if expected == 'reads_missing':
-        assert TOOL_CALLS[call](store) is False
         return
     with pytest.raises(Exception) as raised:
         TOOL_CALLS[call](store)
-    answer = f'{type(raised.value).__name__}: {raised.value}'  # what the tool wrapper puts in STORE_ERROR
-    assert address not in answer, answer
-    assert error_name in answer, answer
-    if failure == 'client-error':
-        assert '(code 2)' in answer, answer
-    assert any(link is injected for link in _chain(raised.value)), f'{call} never reached the backend: {answer}'
+    assert_host_free(raised.value)
 
 
 @pytest.mark.parametrize(
