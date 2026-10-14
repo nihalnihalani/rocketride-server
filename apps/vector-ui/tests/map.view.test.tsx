@@ -28,6 +28,7 @@ import { renderToStaticMarkup } from 'react-dom/server';
 import type { IRoleChannel } from 'shared/explorer';
 import { createSelectionStore } from '../src/contract/bridge';
 import type { ConsoleActions, ConsoleModel, IDialectResult, ISampleModel, VectorChannels } from '../src/contract/types';
+import { PointCanvas } from '../src/components/PointCanvas';
 import { MAP_UNAVAILABLE } from '../src/map/wording';
 import { MapView } from '../src/views/MapView';
 import { loadSample, modelOf } from './support/map.samples';
@@ -74,10 +75,10 @@ const channels: VectorChannels = { tools, chat: null, ingest: null };
 const actions: ConsoleActions = { openDocument: noop, showOnMap: noop, requestRemove: noop, askAbout: noop, documentsChanged: noop, announce: noop };
 
 /** The Map tab, statically rendered. */
-function render(opts: { model?: ConsoleModel; channels?: VectorChannels; sample?: ISampleModel | null; selectionKey?: string } = {}): string {
+function render(opts: { model?: ConsoleModel; channels?: VectorChannels; sample?: ISampleModel | null; selectionKey?: string; initialTable?: boolean } = {}): string {
 	const selection = createSelectionStore(opts.selectionKey ?? KEY);
 	if (opts.sample) selection.setSampleModel(opts.sample);
-	return renderToStaticMarkup(<MapView model={opts.model ?? modelWith()} channels={opts.channels ?? channels} selection={selection} actions={actions} visible />);
+	return renderToStaticMarkup(<MapView model={opts.model ?? modelWith()} channels={opts.channels ?? channels} selection={selection} actions={actions} visible initialTable={opts.initialTable} />);
 }
 
 /** The value of `attr` on the first element with class `cls`. */
@@ -133,4 +134,33 @@ test('with the light 5,000-point fixture drawn: data-points 5000 in light mode, 
 	assert.match(out, /<option value="tsne" disabled=""/);
 	assert.match(out, /t-SNE is limited to 1,000 points; this sample has 5,000\./);
 	assert.match(out, /Light sample: positions are rounded to 0\.01/);
+});
+
+test('with the Table on, the canvas stays mounted but hidden: data-points and data-selected sit beside the table, and nothing is drawn', () => {
+	const sample = modelOf(loadSample('sample_demo_1000.json'));
+	const out = render({ sample, initialTable: true });
+	assert.match(out, /<caption[^>]*>Points of the sample \(the map as a table\)<\/caption>/);
+	assert.match(out, /aria-pressed="true"[^>]*>Table<\/button>/);
+	// The lanes read the canvas root while the table shows (lane_vector_map.cjs polls data-selected after "Inspect point 1").
+	assert.equal(attrOf(out, 'vector-map-canvas', 'data-points'), '1000');
+	assert.equal(attrOf(out, 'vector-map-canvas', 'data-selected'), '');
+	// Hidden under the table: display none, and no drawing context is created for it.
+	assert.match(out, /<div style="display:none;[^"]*"><div[^>]*class="vector-map-canvas"/);
+	assert.equal(attrOf(out, 'vector-map-canvas', 'data-renderer'), 'pending');
+	// Table off: the same canvas is shown and the table is gone.
+	const off = render({ sample });
+	assert.match(off, /<div style="display:flex;[^"]*"><div[^>]*class="vector-map-canvas"/);
+	assert.doesNotMatch(off, /Points of the sample/);
+});
+
+test('a hidden canvas still carries the inspected point: data-selected is rendered from the overlay, not by a frame', () => {
+	const sample = modelOf(loadSample('sample_demo_1000.json'));
+	const out = renderToStaticMarkup(
+		<div style={{ display: 'none' }}>
+			<PointCanvas sample={sample} positions={new Float32Array(2 * sample.result.n)} dimensions={2} colours={[]} overlay={{ selected: 0, focused: 0 }} visible={false} selection={createSelectionStore(KEY)} lasso={false} onHover={noop} onPick={noop} onLasso={noop} />
+		</div>
+	);
+	assert.equal(attrOf(out, 'vector-map-canvas', 'data-selected'), '0');
+	assert.equal(attrOf(out, 'vector-map-canvas', 'data-focused'), '0');
+	assert.equal(attrOf(out, 'vector-map-canvas', 'data-renderer'), 'pending');
 });

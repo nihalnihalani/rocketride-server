@@ -158,3 +158,17 @@ test('a press keeps working when the browser refuses pointer capture (the gestur
 	assert.match(body, /try \{[\s\S]*?el\.setPointerCapture\(event\.pointerId\);[\s\S]*?\} catch \{/);
 	assert.ok(body.indexOf('gesture.down(') > body.indexOf('} catch {'), 'gesture.down runs after (outside) the try/catch');
 });
+
+test('the Table alternative hides the canvas instead of replacing it (the lanes read data-points / data-selected while the table shows; no WebGL context per toggle)', () => {
+	const view = read('views/MapView.tsx');
+	const column = /<div style=\{MAP_STYLES\.canvasColumn\}>([\s\S]*?)<Legend /.exec(view);
+	assert.ok(column, 'the canvas column');
+	const body = column[1] as string;
+	assert.match(body, /<PointsTable /);
+	assert.match(body, /<PointCanvas\s/);
+	assert.doesNotMatch(body, /\)\s*:\s*\(\s*<PointCanvas|:\s*<PointCanvas/, 'PointCanvas is not the other branch of the table toggle');
+	assert.match(body, /\{table \? \(\s*<div[^>]*>\s*<PointsTable /, 'the table is shown only while toggled on');
+	assert.match(body, /<div style=\{\{ display: table \? 'none' : 'flex', [^}]*\}\}>\s*<PointCanvas\s/, 'the canvas wrapper is hidden, not removed, under the table');
+	assert.match(body, /<PointCanvas[\s\S]*?visible=\{visible && !table\}/, 'nothing is drawn (and no context created) while the table shows');
+	assert.match(view, /useState\(initialTable === true\)/, 'initialTable only sets where the toggle starts');
+});

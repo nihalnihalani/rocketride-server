@@ -57,7 +57,7 @@ import { OutliersPanel } from '../components/OutliersPanel';
 import { PointCanvas } from '../components/PointCanvas';
 import { PointInspector } from '../components/PointInspector';
 import { PointsTable } from '../components/PointsTable';
-import type { Availability, ColourBy, IChunksResult, IEmbedResult, INeighborsResult, INeighborsScopeResult, IProjectItem, IProjectResult, ISampleInput, ISampleResult, ISearchResult, MapLayout, MapViewProps, SampleMode, VectorKey } from '../contract/types';
+import type { Availability, ColourBy, IChunksResult, IEmbedResult, INeighborsResult, INeighborsScopeResult, IProjectItem, IProjectResult, ISampleInput, ISampleResult, ISearchResult, MapLayout, MapViewProps as ContractMapViewProps, SampleMode, VectorKey } from '../contract/types';
 import { TSNE_MAX_POINTS } from '../map/budgets';
 import { callTool, isExpired } from '../map/calls';
 import type { ToolAnswer } from '../map/calls';
@@ -78,7 +78,11 @@ import { createLayoutClient } from '../map/workerClient';
 import type { ILayoutClient } from '../map/workerClient';
 import { BUSY, CENTROID_APPROX, LAYOUT_CANCELLED, LAYOUT_NOT_BETTER, LIGHT_POSITIONS, MAP_UNAVAILABLE, QUERY_NEEDS_EMBED, QUERY_PLACED_APPROX, mapFailure, num, pointAnnouncement, sampleLabel } from '../map/wording';
 
-export type { MapViewProps };
+/** Props: the frozen ones plus where the Table toggle starts. */
+export interface MapViewProps extends ContractMapViewProps {
+	/** Open with the Table alternative shown (only the toggle's starting state; off when not given). */
+	initialTable?: boolean;
+}
 
 // =============================================================================
 // CONSTANTS AND HOOKS
@@ -235,7 +239,7 @@ export function SelectionTab(props: SelectionTabProps): React.ReactElement {
  * @returns The map.
  */
 export function MapView(props: MapViewProps): React.ReactElement {
-	const { model, channels, selection, actions, visible } = props;
+	const { model, channels, selection, actions, visible, initialTable } = props;
 	const state = useSyncExternalStore(selection.subscribe, selection.getState, selection.getState);
 	const palette = useMapPalette();
 	const reducedMotion = useReducedMotion();
@@ -259,7 +263,7 @@ export function MapView(props: MapViewProps): React.ReactElement {
 	const [quality, setQuality] = useState<{ overlap: number; pcaOverlap: number } | null>(null);
 	const [colourBy, setColourBy] = useState<ColourBy>('document');
 	const [lasso, setLasso] = useState(false);
-	const [table, setTable] = useState(false);
+	const [table, setTable] = useState(initialTable === true);
 	const [threeD, setThreeD] = useState(false);
 	const [tab, setTab] = useState<SideTab>('point');
 	const [selected, setSelected] = useState<number | null>(null);
@@ -944,7 +948,10 @@ export function MapView(props: MapViewProps): React.ReactElement {
 							<div style={{ flex: 1, overflow: 'auto', padding: 8 }}>
 								<PointsTable sample={sampleModel!} querySims={querySimsArray} selected={selected} onSelect={(i) => void onPick(i)} />
 							</div>
-						) : (
+						) : null}
+						{/* Hidden, not unmounted, under the table: it keeps its renderer and camera, and its root keeps
+						    data-points / data-selected for the browser lanes while the table shows. */}
+						<div style={{ display: table ? 'none' : 'flex', flex: 1, minHeight: 0, flexDirection: 'column' }}>
 							<PointCanvas
 								sample={sampleModel!}
 								positions={shown}
@@ -960,7 +967,7 @@ export function MapView(props: MapViewProps): React.ReactElement {
 								cameraKey={model.connectionKey}
 								fitToken={fitToken}
 								centreOn={centreOn}
-								visible={visible}
+								visible={visible && !table}
 								selection={selection}
 								lasso={lasso}
 								describe={describe}
@@ -974,7 +981,7 @@ export function MapView(props: MapViewProps): React.ReactElement {
 								selectionCount={lassoKeys.length > 0 ? lassoKeys.length : null}
 								overlap={quality ? { layout: quality.overlap, pca: quality.pcaOverlap } : null}
 							/>
-						)}
+						</div>
 						<Legend sample={sampleModel!} colourBy={colourBy} pointCap={pointCap} backend={backend} colouring={colouring} notes={legendNotes} />
 					</div>
 					<aside style={MAP_STYLES.side} aria-label="Map details">
