@@ -1203,7 +1203,12 @@ class Store(DocumentStoreBase):
         per_object: Dict[str, Dict[str, Any]] = {}
         cap = max(1, int(self.SWEEP_ROWS_CAP))
         read = 0
-        for record_id, row in self._readAll(self._documentsWhere(deleted, object_ids), ['metadatas'], cap=cap):
+        capped = False
+        # One row past the cap tells a capped sweep from one that read exactly the cap.
+        for record_id, row in self._readAll(self._documentsWhere(deleted, object_ids), ['metadatas'], cap=cap + 1):
+            if read == cap:
+                capped = True
+                break
             read += 1
             meta = row.get('metadata') or {}
             oid = str(meta.get('objectId', ''))
@@ -1214,7 +1219,6 @@ class Store(DocumentStoreBase):
                 entry['first'] = True
             if chunk is not None and (entry['low'] is None or chunk < entry['low'][0]):
                 entry['low'] = (chunk, record_id, meta)
-        capped = read >= cap
         orphans = [
             (oid, entry['low'][1], entry['low'][2], entry['rows'])
             for oid, entry in sorted(per_object.items())
@@ -1314,8 +1318,10 @@ class Store(DocumentStoreBase):
         """
         The chunks of one document after ``after_chunk``, in chunk order, without vectors.
 
-        Reads the window (after_chunk, after_chunk + limit] first; when chunk ids
-        have gaps, reads the remaining chunk ids and fetches the next ``limit`` by id.
+        Reads the window (after_chunk, after_chunk + limit] and probes for one row
+        beyond it; only when the window is short and rows lie beyond it (gaps in
+        the chunk ids) reads the remaining chunk ids and fetches the next
+        ``limit`` by id.
         """
         vx = _vx()
         after_chunk = int(after_chunk)
@@ -1332,7 +1338,13 @@ class Store(DocumentStoreBase):
             include=['metadatas', 'documents'],
         )
         rows = [(rid, self._row(window, i)) for i, rid in enumerate(window.get('ids') or [])]
-        if len(rows) < limit:
+        beyond = self.collectionObj.get(
+            where=self._documentsWhere(deleted, [objectId], {'chunkId': {'$gt': after_chunk + limit}}),
+            include=[],
+            limit=1,
+        )
+        more = bool(beyond.get('ids'))
+        if len(rows) < limit and more:
             # Gaps in the chunk ids: find the next `limit` chunk ids, then read those records.
             remaining = sorted(
                 (
@@ -1346,13 +1358,6 @@ class Store(DocumentStoreBase):
             more = len(remaining) > limit
             fetched = self.collectionObj.get(ids=wanted, include=['metadatas', 'documents']) if wanted else {'ids': []}
             rows = [(rid, self._row(fetched, i)) for i, rid in enumerate(fetched.get('ids') or [])]
-        else:
-            beyond = self.collectionObj.get(
-                where=self._documentsWhere(deleted, [objectId], {'chunkId': {'$gt': after_chunk + limit}}),
-                include=[],
-                limit=1,
-            )
-            more = bool(beyond.get('ids'))
         rows.sort(key=lambda item: _int_or_none((item[1].get('metadata') or {}).get('chunkId')) or 0)
         docs = [self._rowToDoc(rid, row) for rid, row in rows[:limit]]
         next_after = docs[-1].metadata.chunkId if docs else after_chunk

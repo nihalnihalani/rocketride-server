@@ -303,6 +303,19 @@ def test_list_documents_caps_the_orphan_sweep(monkeypatch):
     assert 'document_count_capped' in pages[-1].caveats
 
 
+def test_list_documents_reports_a_sweep_of_exactly_the_cap_as_complete(monkeypatch):
+    store = make_store(drv)
+    _corpus(store, docs=4, chunks=2)  # eight document rows
+    monkeypatch.setattr(drv.Store, 'READ_PAGE', 3)
+    monkeypatch.setattr(drv.Store, 'SWEEP_ROWS_CAP', 8)
+    _, pages = _all_pages(store, limit=10)
+    assert 'document_count_capped' not in pages[-1].caveats
+    assert pages[-1].total == 4 and pages[-1].counts_exact is True
+    monkeypatch.setattr(drv.Store, 'SWEEP_ROWS_CAP', 7)
+    _, pages = _all_pages(store, limit=10)
+    assert 'document_count_capped' in pages[-1].caveats and pages[-1].total is None
+
+
 def _cursor(state):
     return base64.urlsafe_b64encode(json.dumps(state).encode()).decode()
 
@@ -341,6 +354,18 @@ def test_scroll_chunks_pages_in_chunk_order_without_vectors():
     third = store.scrollChunks('doc-0', after_chunk=second.next_after, limit=3, deleted='active')
     assert [d.metadata.chunkId for d in second.docs] == [3, 4, 5]
     assert [d.metadata.chunkId for d in third.docs] == [6] and third.has_more is False
+
+
+def test_scroll_chunks_reads_a_short_last_window_without_a_metadata_sweep():
+    store = make_store(drv)
+    store.addChunks([make_doc('doc-0', c, _unit([1, c, 0])) for c in range(7)])
+    Collection.calls.clear()
+    last = store.scrollChunks('doc-0', after_chunk=5, limit=3, deleted='active')
+    assert [d.metadata.chunkId for d in last.docs] == [6] and last.has_more is False
+    # The window and a one-row probe beyond it; no read of every remaining chunk, no fetch by id.
+    assert len(Collection.calls) == 2
+    assert all(c['ids'] is None for c in Collection.calls)
+    assert Collection.calls[1]['include'] == [] and Collection.calls[1]['limit'] == 1
 
 
 def test_scroll_chunks_handles_gaps_and_refuses_the_control_record():
