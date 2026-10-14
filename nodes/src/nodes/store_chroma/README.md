@@ -100,7 +100,7 @@ When the server reports a version, this node requires Chroma 0.6 or later. An un
 
 ### Ingestion, replacement, and rendering
 
-Every ingested chunk needs an embedding. Inserts are batched and flush at 500 chunks or when the accumulated payload exceeds the configured limit. A chunk with `chunkId` 0 causes older chunks with the same `objectId` to be deleted before the new chunks are upserted, so a re-ingest replaces an object rather than adding a second copy. The delete names the documents in one ID list per thousand documents, so a large batch stays within the server's limit on filter size.
+Every ingested chunk needs an embedding. Inserts are batched and flush at 500 chunks or when the accumulated payload exceeds the configured limit. A chunk with `chunkId` 0 causes older chunks with the same `objectId` to be deleted before the new chunks are upserted, so a re-ingest replaces an object rather than adding a second copy. That delete, like every deletion and soft deletion, names the documents in ID lists of at most a thousand, so a large batch or folder deletion stays within the server's limit on filter size (about 32,000 values per list).
 
 Each chunk is stored under a record ID derived from its document and position, `uuid5(NAMESPACE_URL, '<objectId>#<chunkId>')`, so a chunk always maps to one record; if one batch carries the same chunk twice, the later one is kept. Collections written by earlier versions of this node hold random record IDs; every read by document and chunk falls back to a metadata filter for those. Keep `objectId` and `chunkId` consistent across imports to make replacement, filters, and rendering predictable.
 
