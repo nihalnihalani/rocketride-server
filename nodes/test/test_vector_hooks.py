@@ -644,9 +644,62 @@ def test_scroll_chunks_default_pages_in_chunk_order_without_vectors():
 def test_scroll_chunks_default_crosses_gaps_in_chunk_ids():
     store = seeded(spec={'g': [3, 7, 64]})
     first = store.scrollChunks('g', after_chunk=-1, limit=2, deleted='active')
-    assert first.docs == [] and first.has_more is True and first.next_after == 1
+    assert [d.metadata.chunkId for d in first.docs] == [3] and first.has_more is True
     window = store.scrollChunks('g', after_chunk=-1, limit=100, deleted='active')
     assert [d.metadata.chunkId for d in window.docs] == [3, 7, 64] and window.has_more is False
+
+
+class ReversedGetStore(MemoryStore):
+    """A backend whose ``get`` answers in descending chunk order (a probe with limit 1 finds the last chunk)."""
+
+    def get(self, docFilter: DocFilter, checkCollection: bool = True) -> List[Doc]:
+        self.calls.append(('get', docFilter))
+        rows = sorted((d for d in self.rows.values() if self._match(d, docFilter)), key=lambda d: -d.metadata.chunkId)
+        limit = docFilter.limit if docFilter.limit is not None else len(rows)
+        return [self._copy(d) for d in rows[:limit]]
+
+
+def _scroll_all(store, object_id: str, limit: int) -> Tuple[List[int], int]:
+    seen: List[int] = []
+    after, pages = -1, 0
+    while True:
+        page = store.scrollChunks(object_id, after_chunk=after, limit=limit, deleted='active')
+        pages += 1
+        seen.extend(d.metadata.chunkId for d in page.docs)
+        if not page.has_more:
+            return seen, pages
+        assert page.next_after > after
+        after = page.next_after
+
+
+@pytest.mark.parametrize(
+    'chunk_ids,limit,first',
+    [
+        ([1, 2, 3, 4, 5], 1, [1]),  # a legacy document whose chunk 0 was removed
+        (list(range(100, 110)), 100, list(range(100, 110))),
+        (list(range(100, 110)), 1, [100]),
+        ([5, 1000, 100000], 2, [5]),
+    ],
+)
+@pytest.mark.parametrize('store_cls', [MemoryStore, ReversedGetStore])
+def test_scroll_chunks_default_first_page_carries_the_first_stored_chunk(store_cls, chunk_ids, limit, first):
+    store = seeded(store_cls, spec={'g': chunk_ids})
+    page = store.scrollChunks('g', after_chunk=-1, limit=limit, deleted='active')
+    assert [d.metadata.chunkId for d in page.docs] == first
+    assert page.has_more is (len(first) < len(chunk_ids))
+
+
+@pytest.mark.parametrize(
+    'chunk_ids', [[0, 1, 2], [3, 7, 64], list(range(100, 110)), [5, 1000, 100000], [0, 2**20], [9]]
+)
+@pytest.mark.parametrize('limit', [1, 2, 100])
+@pytest.mark.parametrize('store_cls', [MemoryStore, ReversedGetStore])
+def test_scroll_chunks_default_reads_every_chunk_once_in_order(store_cls, chunk_ids, limit):
+    store = seeded(store_cls, spec={'g': chunk_ids})
+    seen, pages = _scroll_all(store, 'g', limit)
+    assert seen == sorted(chunk_ids)
+    assert pages <= len(chunk_ids) + 1
+    assert len([c for c in store.calls if c[0] == 'get']) <= pages * 2 + 2 * 21 * len(chunk_ids)
 
 
 def test_scroll_chunks_default_never_returns_the_control_record():

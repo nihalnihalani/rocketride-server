@@ -1106,7 +1106,15 @@ def test_chunks_of_the_control_record_is_not_found():
 
 def test_chunks_existence_probe_succeeds_on_a_document_without_low_chunks():
     answer = node(CountingStore().seed(corpus({'g': [3, 7, 64]}))).chunks({'object_id': 'g', 'limit': 1})
-    assert answer['success'] is True and answer['items'] == [] and answer['has_more'] is True
+    assert answer['success'] is True and answer['has_more'] is True
+    assert [item['chunkId'] for item in answer['items']] == [3]
+
+
+def test_chunks_existence_probe_on_a_document_without_chunk_zero_answers_its_first_chunk():
+    store = CountingStore().seed(corpus({'orphan': [1, 2, 3, 4, 5], 'whole': [0, 1]}))
+    answer = node(store).chunks({'object_id': 'orphan', 'limit': 1})
+    assert answer['success'] is True and [item['chunkId'] for item in answer['items']] == [1]
+    assert answer['has_more'] is True and answer['total'] == 5
 
 
 @pytest.mark.parametrize(
@@ -2315,6 +2323,13 @@ def test_get_clamps_the_limit():
 def test_get_rejects_bad_input(args):
     answer = node(clustered()).get(args)
     assert (answer['success'], answer['code']) == (False, 'INVALID_INPUT')
+
+
+def test_get_starts_at_the_first_stored_chunk():
+    store = ExactListingStore().seed([make_doc('gap', c) for c in range(100, 110)])
+    answer = node(store).get({'object_id': 'gap'})
+    assert [c['chunkId'] for c in answer['chunks']] == list(range(100, 110))
+    assert answer['total'] == 10 and answer['has_more'] is False
 
 
 def test_get_of_the_control_record_is_empty():

@@ -62,6 +62,9 @@ VX_METADATA_EXTRAS: Tuple[str, ...] = ('size', 'modifyTime', 'ingestedAt')
 #: INSERT column list) and therefore fail on an unknown key until they keep extras elsewhere.
 _COLUMN_PER_KEY_MODULES = frozenset({'store_postgres', 'rocketride_vector'})
 
+#: Most times the default ``scrollChunks`` slides an empty window forward (each slide doubles it).
+_SCROLL_SLIDES_MAX = 64
+
 
 def _without_extras(doc: Doc) -> Doc:
     """Return ``doc`` without :data:`VX_METADATA_EXTRAS` in its metadata (a copy; ``doc`` is not changed)."""
@@ -488,13 +491,43 @@ class DocumentStoreBase(ABC):
 
         Default: ``get(DocFilter(objectIds=[objectId], minChunkId=after_chunk + 1,
         maxChunkId=after_chunk + limit, deleted=deleted))`` sorted by chunkId, plus a
-        one-row probe past the window for ``has_more``. ``next_after`` is the end of
-        the window, so a gap in the chunk ids never stops the scroll early.
+        one-row probe past the window for ``has_more``. When the window is empty but the
+        probe finds a later chunk, the window slides forward (doubling its width, never
+        past the probed chunk's own window) until it holds a chunk, so a page is never
+        empty while chunks follow: the first page of a document carries its first stored
+        chunk however its ids are spaced (a document whose chunk 0 was removed answers
+        its chunk 1). A page holds at most ``limit`` chunks; ``next_after`` is the end of
+        the window read, or the last chunk returned when the window held more.
         """
         if objectId == CONTROL_OBJECT_ID:
             return ChunkPage(docs=[], has_more=False, next_after=int(after_chunk))
+        limit = max(1, int(limit))
         low = int(after_chunk) + 1
-        high = int(after_chunk) + max(1, int(limit))
+        high = int(after_chunk) + limit
+        rows = self._vxChunkWindow(objectId, low, high, deleted)
+        following: Optional[int] = None
+        probed = False
+        if not rows:
+            following, probed = self._vxChunkAfter(objectId, high, deleted), True
+            width = limit
+            for _ in range(_SCROLL_SLIDES_MAX):
+                if following is None:
+                    break
+                low, width = high + 1, width * 2
+                high = min(following + limit - 1, low + width - 1)
+                rows = self._vxChunkWindow(objectId, low, high, deleted)
+                if rows or high >= following:  # found, or the probed chunk went away meanwhile
+                    probed = False
+                    break
+        if len(rows) > limit:
+            rows = rows[:limit]
+            return ChunkPage(docs=[doc for _, doc in rows], has_more=True, next_after=rows[-1][0])
+        if not probed:
+            following = self._vxChunkAfter(objectId, high, deleted)
+        return ChunkPage(docs=[doc for _, doc in rows], has_more=following is not None, next_after=high)
+
+    def _vxChunkWindow(self, objectId: str, low: int, high: int, deleted: 'Deleted') -> List[Tuple[int, Doc]]:
+        """``(chunkId, doc)`` of the document's chunks in ``[low, high]``, sorted, without embeddings."""
         window = self.get(
             deletedFilter(
                 deleted, objectIds=[objectId], minChunkId=low, maxChunkId=high, limit=high - low + 1, offset=0
@@ -511,14 +544,21 @@ class DocumentStoreBase(ABC):
             ):
                 doc.embedding = None
                 by_chunk.setdefault(chunk, doc)
+        return [(chunk, by_chunk[chunk]) for chunk in sorted(by_chunk)]
+
+    def _vxChunkAfter(self, objectId: str, high: int, deleted: 'Deleted') -> Optional[int]:
+        """The id of some chunk of the document above ``high`` (a one-row probe), or None."""
         beyond = self.get(deletedFilter(deleted, objectIds=[objectId], minChunkId=high + 1, limit=1, offset=0))
-        has_more = any(
-            metadataValue(doc, 'objectId') == objectId
-            and (_int_or_none(metadataValue(doc, 'chunkId')) or -1) > high
-            and matchesDeleted(doc, deleted)
-            for doc in beyond
-        )
-        return ChunkPage(docs=[by_chunk[c] for c in sorted(by_chunk)], has_more=has_more, next_after=high)
+        for doc in beyond:
+            chunk = _int_or_none(metadataValue(doc, 'chunkId'))
+            if (
+                metadataValue(doc, 'objectId') == objectId
+                and chunk is not None
+                and chunk > high
+                and matchesDeleted(doc, deleted)
+            ):
+                return chunk
+        return None
 
     def sampleChunks(
         self,
@@ -1857,7 +1897,15 @@ class VectorStoreToolMixin(VectorExplorerTools):
     )
     @vectordb_tool
     def get(self, args):
-        """Retrieve document chunks by objectId, in chunk order (``has_more`` says whether more follow)."""
+        """Retrieve document chunks by objectId, in chunk order (``has_more`` says whether more follow).
+
+        ``offset`` is a chunk id, not a row count: the page starts at the first stored chunk
+        whose id is ``offset`` or more (the next page starts after the last ``chunkId``
+        returned). For a document whose chunk ids run 0, 1, 2, ... this is the row offset
+        it always was; with gaps in the ids, ``offset`` 0 still starts at the first stored
+        chunk. The descriptor text ("chunks to skip") is unchanged so agents see the same
+        catalog.
+        """
         store = self._vectordb_store()
 
         object_id = str(args.get('object_id') or '').strip()
