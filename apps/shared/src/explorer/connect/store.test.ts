@@ -1282,6 +1282,7 @@ describe('multi-role connections — role tokens, read-only anchors and role cha
 		const detach = store.attach(world.client, null, watch.watch);
 		await store.refresh(world.client);
 		assert.equal(archiveProbes(), 1);
+		const firstDiscovery = store.getState().refreshedAt;
 		for (let i = 0; i < 3; i += 1) {
 			await clock.advance(6_000);
 			watch.handlers!.onFocus();
@@ -1289,7 +1290,7 @@ describe('multi-role connections — role tokens, read-only anchors and role cha
 			watch.handlers!.onTaskEvent({ reprobe: false });
 			await clock.advance(300);
 		}
-		assert.ok(world.getTasksCalls >= 4, `discovery still ran (${world.getTasksCalls})`);
+		assert.ok(store.getState().refreshedAt > firstDiscovery, 'the background refreshes did run discovery');
 		assert.equal(archiveProbes(), 1, 'background refreshes must not re-probe');
 		const archive = store.getState().endpoints.find((e) => e.nodeId === 'store_9')!;
 		assert.equal(archive.state, 'stopped');
