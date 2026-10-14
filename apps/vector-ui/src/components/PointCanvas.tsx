@@ -42,21 +42,32 @@
 // container is the only focusable element and handles its own keys; it never
 // stops an event from propagating and registers no window listeners.
 //
-// `data-points` on the container is the number of points drawn (the browser
-// lanes read it); `data-renderer` says which renderer runs.
+// The container's data attributes are what the browser lanes read (the map is
+// a canvas, so what they cannot read from text they read here):
+//   data-points     points drawn (hidden ones left out)
+//   data-renderer   'webgl' | 'canvas2d' | 'none'
+//   data-mode       'detailed' | 'light'
+//   data-layout     the layout shown: 'pca' | 'neighbour-graph' | 'tsne'
+//   data-selected / data-focused   the inspected / keyboard-focused point, '' for none
+//   data-selection  points in the lasso selection, '' for none
+//   data-overlap-pca / data-overlap-layout   kNN overlaps (4 dp), '' before a run
+// and, written by each frame (what it DREW, not what was asked):
+//   data-star ('1'/'0'), data-rays, data-links, data-chunk-path,
+//   data-draw-count (frames drawn so far), data-camera, data-draw-p95.
+// The hover box is role="tooltip" (data-map-tooltip holds the point index).
 // =============================================================================
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import type { PointCanvasProps as ContractPointCanvasProps } from '../contract/types';
-import { boundsOf, dollyCamera, fitCamera, fitCamera3D, orbitCamera, panBy, projectToScreen, viewMatrix, zoomAt } from '../map/camera';
+import type { PointCanvasProps as ContractPointCanvasProps, MapLayout } from '../contract/types';
+import { boundsOf, cameraSignature, dollyCamera, fitCamera, fitCamera3D, orbitCamera, panBy, projectToScreen, viewMatrix, zoomAt } from '../map/camera';
 import type { ICamera2D, IViewport, MapCamera } from '../map/camera';
 import { recallCamera, rememberCamera } from '../map/cameraMemory';
 import { opaqueOver, parseColor } from '../map/contrast';
 import { createFrameStats, createGesture, keyAction, wheelZoomFactor } from '../map/interaction';
 import type { KeyAction } from '../map/interaction';
 import { lassoSelect, simplifyPath } from '../map/lasso';
-import { drawOverlay } from '../map/overlay';
-import type { IOverlayModel, IPlace } from '../map/overlay';
+import { drawOverlay, overlayDataset } from '../map/overlay';
+import type { IOverlayDrawn, IOverlayModel, IPlace } from '../map/overlay';
 import { buildScreenIndex, nearestInSector, pickNearest } from '../map/picking';
 import type { IScreenIndex } from '../map/picking';
 import { createCanvas2dRenderer } from '../map/renderer.canvas2d';
@@ -98,7 +109,19 @@ export interface PointCanvasProps extends ContractPointCanvasProps {
 	onKeyAction?(action: KeyAction): void;
 	/** Which renderer runs. */
 	onRendererInfo?(kind: 'webgl' | 'canvas2d' | 'none'): void;
+	/** The layout shown (data-layout; 'pca' when not given). */
+	layout?: MapLayout;
+	/** Points in the lasso selection (data-selection), or null for none. */
+	selectionCount?: number | null;
+	/** kNN overlaps of the last refined layout and of PCA (data-overlap-layout / data-overlap-pca), or null before a run. */
+	overlap?: { layout: number | null; pca: number | null } | null;
 }
+
+/** Nothing drawn (no overlay context). */
+const NOTHING_DRAWN: IOverlayDrawn = { star: false, rays: 0, links: 0, chunkPath: 0 };
+
+/** An overlap for its data attribute: 4 decimals, '' when there is none. */
+const overlapAttr = (value: number | null | undefined): string => (typeof value === 'number' && Number.isFinite(value) ? value.toFixed(4) : '');
 
 /** Points canvas and overlay share the container's size. */
 const LAYER: React.CSSProperties = { position: 'absolute', inset: 0, width: '100%', height: '100%' };
@@ -141,6 +164,7 @@ export function PointCanvas(props: PointCanvasProps): React.ReactElement {
 	const hoveredRef = useRef<number | null>(null);
 	const frameRef = useRef(0);
 	const statsRef = useRef(createFrameStats());
+	const drawCountRef = useRef(0);
 	const propsRef = useRef(props);
 	propsRef.current = props;
 	const [rendererKind, setRendererKind] = useState<'webgl' | 'canvas2d' | 'none'>('none');
@@ -214,6 +238,7 @@ export function PointCanvas(props: PointCanvasProps): React.ReactElement {
 		screen.index = null;
 		const overlay = overlayRef.current;
 		const ctx = overlay ? overlay.getContext('2d') : null;
+		let drawn = NOTHING_DRAWN;
 		if (ctx && overlay) {
 			ctx.setTransform(1, 0, 0, 1, 0, 0);
 			ctx.clearRect(0, 0, overlay.width, overlay.height);
@@ -250,12 +275,19 @@ export function PointCanvas(props: PointCanvasProps): React.ReactElement {
 				lasso: lassoRef.current,
 				pulse: o.pulse ?? 0,
 			};
-			drawOverlay(ctx, model, screenOf, placeOf, coloursRef.current.overlay, size.dpr);
+			drawn = drawOverlay(ctx, model, screenOf, placeOf, coloursRef.current.overlay, size.dpr);
 		}
 		const ended = typeof performance !== 'undefined' ? performance.now() : Date.now();
 		statsRef.current.record(ended - started);
+		drawCountRef.current += 1;
 		const el = containerRef.current;
-		if (el && statsRef.current.count() % 30 === 0) el.dataset.drawP95 = String(Math.round((statsRef.current.p95() ?? 0) * 10) / 10);
+		if (el) {
+			// What this frame drew, for the browser lanes (React never renders these attributes).
+			Object.assign(el.dataset, overlayDataset(drawn));
+			el.dataset.drawCount = String(drawCountRef.current);
+			el.dataset.camera = cameraSignature(camera);
+			if (statsRef.current.count() % 30 === 0) el.dataset.drawP95 = String(Math.round((statsRef.current.p95() ?? 0) * 10) / 10);
+		}
 	}, [fit]);
 
 	/** Ask for a frame (coalesced). */
@@ -514,13 +546,20 @@ export function PointCanvas(props: PointCanvasProps): React.ReactElement {
 			data-points={visibleCount}
 			data-renderer={rendererKind}
 			data-dimensions={props.dimensions}
+			data-mode={props.sample.mode}
+			data-layout={props.layout ?? 'pca'}
+			data-selected={props.overlay?.selected ?? ''}
+			data-focused={props.overlay?.focused ?? ''}
+			data-selection={props.selectionCount ?? ''}
+			data-overlap-pca={overlapAttr(props.overlap?.pca)}
+			data-overlap-layout={overlapAttr(props.overlap?.layout)}
 			onKeyDown={onKeyDown}
 			style={{ position: 'relative', flex: 1, minHeight: 240, overflow: 'hidden', background: 'var(--rr-bg-default)', cursor: props.lasso ? 'crosshair' : 'grab', touchAction: 'none', userSelect: 'none' }}
 		>
 			<canvas ref={canvasRef} style={LAYER} aria-hidden="true" />
 			<canvas ref={overlayRef} style={{ ...LAYER, pointerEvents: 'none' }} aria-hidden="true" />
 			{tooltip !== null ? (
-				<div data-map-tooltip={tooltip.index} style={{ ...MAP_STYLES.tooltip, left: Math.min(tooltip.x + 14, Math.max(0, sizeRef.current.width - 330)), top: tooltip.y + 14 }} aria-hidden="true">
+				<div role="tooltip" data-map-tooltip={tooltip.index} style={{ ...MAP_STYLES.tooltip, left: Math.min(tooltip.x + 14, Math.max(0, sizeRef.current.width - 330)), top: tooltip.y + 14 }}>
 					{tooltipText}
 				</div>
 			) : null}

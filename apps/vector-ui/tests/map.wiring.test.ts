@@ -79,3 +79,26 @@ test('the Selection tab is wired to the console unchanged: every selected docume
 	assert.match(view, /<SelectionTab[\s\S]*?onRemove=\{\(ids\) => actions\.requestRemove\(ids\)\}/);
 	assert.doesNotMatch(view, /requestRemove\([^)]*\.slice\(|\.slice\(0, limits\.write_ids_max\)/, 'the map never truncates a removal to write_ids_max');
 });
+
+test('the view gives the canvas the layout shown, the lasso count and the overlaps, so its root carries the lanes\' attribute table', () => {
+	const view = read('views/MapView.tsx');
+	assert.match(view, /<PointCanvas[\s\S]*?layout=\{layout\}[\s\S]*?selectionCount=\{lassoKeys\.length > 0 \? lassoKeys\.length : null\}[\s\S]*?overlap=\{quality \? \{ layout: quality\.overlap, pca: quality\.pcaOverlap \} : null\}/);
+	assert.match(view, /setLayoutState\('running'\);[\s\S]{0,200}setQuality\(null\)/, 'a new run clears the previous overlaps');
+	const canvas = read('components/PointCanvas.tsx');
+	// Written by each frame from what it drew; React never renders them (it would overwrite the frame's values).
+	assert.match(canvas, /Object\.assign\(el\.dataset, overlayDataset\(drawn\)\)/);
+	assert.match(canvas, /el\.dataset\.drawCount = /);
+	assert.match(canvas, /el\.dataset\.camera = cameraSignature\(camera\)/);
+	assert.doesNotMatch(canvas, /data-(star|rays|links|chunk-path|draw-count|camera)=\{/);
+	// The hover box is a tooltip for the lanes and assistive tech, and keeps the perf lane's attribute.
+	assert.match(canvas, /<div role="tooltip" data-map-tooltip=\{tooltip\.index\}/);
+});
+
+test('the Lasso toggle stays pressed after a selection (the next outline selects again); Lasso, L or Escape turn it off', () => {
+	const view = read('views/MapView.tsx');
+	const onLasso = /const onLasso = useCallback\(([\s\S]*?)\n\t\t\[sample/.exec(view);
+	assert.ok(onLasso, 'onLasso found');
+	assert.doesNotMatch(onLasso[1] as string, /setLasso\(/, 'a finished lasso leaves the toggle as the user set it');
+	assert.match(view, /onToggleLasso=\{\(\) => setLasso\(\(on\) => !on\)\}/);
+	assert.match(view, /action === 'lasso'\) setLasso\(\(on\) => !on\)/);
+});

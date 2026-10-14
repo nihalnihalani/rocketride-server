@@ -268,6 +268,21 @@ function eyeOf(cam: ICamera3D): [number, number, number] {
 // =============================================================================
 
 /**
+ * A short text that changes whenever the camera moves (`data-camera` on the
+ * map, which the performance lane compares before and after a pan to prove
+ * the gesture reached the camera). Six significant digits per number.
+ *
+ * @param cam - Either camera, or null when there is none yet.
+ * @returns e.g. '2d:0.125,-2,37.5'; '' for none.
+ */
+export function cameraSignature(cam: MapCamera | null): string {
+	if (cam === null) return '';
+	const f = (v: number): string => String(Number(v.toPrecision(6)));
+	if (cam.mode === '2d') return `2d:${f(cam.cx)},${f(cam.cy)},${f(cam.scale)}`;
+	return `3d:${cam.target.map(f).join(',')},${f(cam.yaw)},${f(cam.pitch)},${f(cam.distance)}`;
+}
+
+/**
  * The column-major matrix from layout coordinates to clip space.
  *
  * @param cam - Either camera.

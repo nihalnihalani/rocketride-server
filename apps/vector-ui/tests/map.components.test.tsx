@@ -24,13 +24,15 @@ import { Legend } from '../src/components/Legend';
 import { MapToolbar } from '../src/components/MapToolbar';
 import { NeighbourList } from '../src/components/NeighbourList';
 import { OutliersPanel } from '../src/components/OutliersPanel';
+import { PointCanvas } from '../src/components/PointCanvas';
 import { PointInspector } from '../src/components/PointInspector';
 import { PointsTable } from '../src/components/PointsTable';
-import type { INeighborsResult, IVectorLimits, VectorKey } from '../src/contract/types';
+import { createSelectionStore } from '../src/contract/bridge';
+import type { INeighborsResult, ISampleResult, IVectorLimits, VectorKey } from '../src/contract/types';
 import { colourPoints } from '../src/map/colours';
 import { readPalette } from '../src/map/tokens';
 import { SelectionTab } from '../src/views/MapView';
-import { loadSample, modelOf } from './support/map.samples';
+import { loadSample, modelOf, pcaXY } from './support/map.samples';
 
 const FIX = path.resolve(__dirname, 'fixtures', 'provisional');
 const neighbours = JSON.parse(fs.readFileSync(path.join(FIX, 'neighbors_key.json'), 'utf8')) as INeighborsResult;
@@ -164,4 +166,34 @@ test('Selection tab: "Remove these documents" hands the console EVERY selected d
 	assert.equal(button(off, 'Remove these documents').props.disabled, true);
 	assert.match(html(off), /turned off on this store node/);
 	assert.match(html(SelectionTab({ ...props, keys: [] })), /Turn on the lasso \(L\)/);
+});
+
+/** The PointCanvas root's opening tag, statically rendered (effects do not run: no canvas is needed). */
+function canvasRoot(result: ISampleResult, extra: Partial<React.ComponentProps<typeof PointCanvas>> = {}): string {
+	const props: React.ComponentProps<typeof PointCanvas> = { sample: modelOf(result), positions: pcaXY(result), dimensions: 2, colours: Array.from({ length: result.n }, () => '#888888'), selection: createSelectionStore(), lasso: false, onHover: noop, onPick: noop, onLasso: noop, ...extra };
+	const out = html(<PointCanvas {...props} />);
+	const tag = /<div[^>]*class="vector-map-canvas"[^>]*>/.exec(out);
+	assert.ok(tag, 'the canvas root renders');
+	return tag[0];
+}
+
+test('PointCanvas draws sample_demo_1000.json and the light 5,000 fixture with data-points equal to the points drawn (hidden ones left out)', () => {
+	assert.match(canvasRoot(loadSample('sample_demo_1000.json')), /data-points="1000"/);
+	assert.match(canvasRoot(loadSample('sample_light_5000.json')), /data-points="5000"/);
+	const hidden = new Uint8Array(1000);
+	hidden[3] = hidden[10] = hidden[999] = 1;
+	assert.match(canvasRoot(loadSample('sample_demo_1000.json'), { hidden }), /data-points="997"/);
+});
+
+test('PointCanvas root carries the browser lanes\' attribute table: mode, layout, selected / focused / lasso count (empty for none), both kNN overlaps', () => {
+	const demo1000 = loadSample('sample_demo_1000.json');
+	const idle = canvasRoot(demo1000);
+	for (const [attr, value] of [['data-mode', 'detailed'], ['data-layout', 'pca'], ['data-selected', ''], ['data-focused', ''], ['data-selection', ''], ['data-overlap-pca', ''], ['data-overlap-layout', '']]) {
+		assert.ok(idle.includes(`${attr}="${value}"`), `${attr}="${value}" in ${idle}`);
+	}
+	const busy = canvasRoot(demo1000, { layout: 'neighbour-graph', overlay: { selected: 5, focused: 0 }, selectionCount: 42, overlap: { layout: 0.50234, pca: 0.16719 } });
+	for (const [attr, value] of [['data-layout', 'neighbour-graph'], ['data-selected', '5'], ['data-focused', '0'], ['data-selection', '42'], ['data-overlap-layout', '0.5023'], ['data-overlap-pca', '0.1672']]) {
+		assert.ok(busy.includes(`${attr}="${value}"`), `${attr}="${value}" in ${busy}`);
+	}
+	assert.match(canvasRoot(loadSample('sample_light_5000.json')), /data-mode="light"/);
 });

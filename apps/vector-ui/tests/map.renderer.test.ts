@@ -10,7 +10,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { viewMatrix } from '../src/map/camera';
-import { drawOverlay } from '../src/map/overlay';
+import { drawOverlay, overlayDataset } from '../src/map/overlay';
 import type { IOverlayModel } from '../src/map/overlay';
 import { createCanvas2dRenderer } from '../src/map/renderer.canvas2d';
 import { FLAG, FRAGMENT_SHADER, VERTEX_SHADER, createWebglRenderer, packPoints, sizeCanvas } from '../src/map/renderer.webgl';
@@ -157,4 +157,31 @@ test('duplicates are dashed, the chunk path is a polyline in chunk order, the la
 	assert.ok(fake.count('closePath') >= 1, 'the lasso is closed');
 	// The duplicate pair with an off-screen end is not drawn: only one moveTo for duplicates.
 	assert.ok(fake.count('moveTo') >= 3);
+});
+
+test('the overlay reports what it drew, not what it was asked for: the star, rays and links whose ends are on screen, chunk-path points on a drawn segment', () => {
+	assert.deepEqual(drawOverlay(fake2d().ctx, empty(), screen, place, colours, 1), { star: false, rays: 0, links: 0, chunkPath: 0 });
+	const asked: IOverlayModel = {
+		...empty(),
+		selected: 2,
+		// 9 is off screen; an end with neither index nor place resolves to nothing.
+		neighbours: [{ index: 1 }, { index: 9 }, { at: { x: 5, y: 5 } }, {}],
+		star: { x: 100, y: 100, exact: true },
+		rays: [{ index: 1 }, { index: 9 }, { index: 3 }],
+		// Segments 1-2 and 5-6 are drawn; 4 sits between two off-screen points and joins nothing.
+		chunkPath: [1, 2, 9, 4, 9, 5, 6],
+	};
+	assert.deepEqual(drawOverlay(fake2d().ctx, asked, screen, place, colours, 1), { star: true, rays: 2, links: 2, chunkPath: 4 });
+	// The selected point itself off screen: no link is drawn, whatever was asked.
+	assert.equal(drawOverlay(fake2d().ctx, { ...empty(), selected: 9, neighbours: [{ index: 1 }] }, screen, place, colours, 1).links, 0);
+	// A star that cannot be placed draws neither itself nor its rays.
+	const nowhere = (p: { x: number; y: number }): [number, number] | null => (Number.isFinite(p.x) ? [p.x, p.y] : null);
+	assert.deepEqual(drawOverlay(fake2d().ctx, { ...empty(), star: { x: NaN, y: 0, exact: true }, rays: [{ index: 1 }] }, screen, nowhere, colours, 1), { star: false, rays: 0, links: 0, chunkPath: 0 });
+	// A one-point path is not a path.
+	assert.equal(drawOverlay(fake2d().ctx, { ...empty(), chunkPath: [3] }, screen, place, colours, 1).chunkPath, 0);
+});
+
+test('what the overlay drew becomes the canvas root\'s data attributes (data-star, data-rays, data-links, data-chunk-path)', () => {
+	assert.deepEqual(overlayDataset({ star: true, rays: 10, links: 12, chunkPath: 7 }), { star: '1', rays: '10', links: '12', chunkPath: '7' });
+	assert.deepEqual(overlayDataset({ star: false, rays: 0, links: 0, chunkPath: 0 }), { star: '0', rays: '0', links: '0', chunkPath: '0' });
 });

@@ -522,6 +522,8 @@ export function MapView(props: MapViewProps): React.ReactElement {
 			setThreeD(false);
 			setLayoutState('running');
 			setLayoutProgress(0);
+			// The overlaps on the map are this run's, once it ends (never the last run's while this one runs).
+			setQuality(null);
 			const sampleId = sample.sample_id;
 			const outcome = await client.run({ sample, algorithm: next === 'tsne' ? 'tsne' : 'force', seed: sampleModel.seed, hidden }, (ticks, total) => setLayoutProgress(total > 0 ? ticks / total : null));
 			setLayoutProgress(null);
@@ -746,7 +748,7 @@ export function MapView(props: MapViewProps): React.ReactElement {
 			const keys = indices.map((i) => pointKey(sample, i));
 			selection.setKeys(keys);
 			selection.setHighlight({ source: 'lasso', keys });
-			setLasso(false);
+			// The toggle stays pressed: the next outline selects again (Lasso, L or Escape turn it off).
 			setTab('selection');
 			const docs = new Set(keys.map((k) => k[0])).size;
 			actions.announce(`Selected ${num(keys.length)} points from ${num(docs)} documents.`);
@@ -933,6 +935,9 @@ export function MapView(props: MapViewProps): React.ReactElement {
 								onFocusMove={onFocusMove}
 								onKeyAction={onKeyAction}
 								onRendererInfo={setRendererKind}
+								layout={layout}
+								selectionCount={lassoKeys.length > 0 ? lassoKeys.length : null}
+								overlap={quality ? { layout: quality.overlap, pca: quality.pcaOverlap } : null}
 							/>
 						)}
 						<Legend sample={sampleModel!} colourBy={colourBy} pointCap={pointCap} backend={backend} colouring={colouring} notes={legendNotes} />

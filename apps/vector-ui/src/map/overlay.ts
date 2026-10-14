@@ -80,6 +80,30 @@ export interface IOverlayModel {
 	pulse: number;
 }
 
+/** What a frame of the overlay actually drew (ends that resolved to a screen position, not what was asked). */
+export interface IOverlayDrawn {
+	/** The query star is on screen. */
+	star: boolean;
+	/** Rays drawn from the star. */
+	rays: number;
+	/** Neighbour links drawn from the selected point. */
+	links: number;
+	/** Chunk-path points that are an end of a drawn segment. */
+	chunkPath: number;
+}
+
+/**
+ * The canvas root's data attributes for what the overlay drew (`data-star`
+ * '1'/'0', `data-rays`, `data-links`, `data-chunk-path`): the browser lanes
+ * read the canvas through them.
+ *
+ * @param drawn - What the last frame drew.
+ * @returns dataset entries (camelCase keys).
+ */
+export function overlayDataset(drawn: IOverlayDrawn): { star: string; rays: string; links: string; chunkPath: string } {
+	return { star: drawn.star ? '1' : '0', rays: String(drawn.rays), links: String(drawn.links), chunkPath: String(drawn.chunkPath) };
+}
+
 /** Colours (resolved CSS). */
 export interface IOverlayColours {
 	accent: string;
@@ -99,9 +123,11 @@ export interface IOverlayColours {
  * @param place - Screen position of a layout place, or null.
  * @param colours - Resolved colours.
  * @param dpr - devicePixelRatio (line widths stay in CSS pixels).
+ * @returns What was drawn (counts of the marks whose ends were on screen).
  */
-export function drawOverlay(ctx: CanvasRenderingContext2D, model: IOverlayModel, screen: (index: number) => [number, number] | null, place: (p: IPlace) => [number, number] | null, colours: IOverlayColours, dpr: number): void {
+export function drawOverlay(ctx: CanvasRenderingContext2D, model: IOverlayModel, screen: (index: number) => [number, number] | null, place: (p: IPlace) => [number, number] | null, colours: IOverlayColours, dpr: number): IOverlayDrawn {
 	void dpr;
+	const drawn: IOverlayDrawn = { star: false, rays: 0, links: 0, chunkPath: 0 };
 	const at = (end: IOverlayEnd): [number, number] | null => (end.index !== undefined ? screen(end.index) : end.at ? place(end.at) : null);
 	const ring = (p: [number, number] | null, r: number): boolean => {
 		if (p === null) return false;
@@ -135,18 +161,23 @@ export function drawOverlay(ctx: CanvasRenderingContext2D, model: IOverlayModel,
 	if (model.chunkPath.length > 1) {
 		let any = false;
 		let pen = false;
+		// A point counts once it is an end of a drawn segment (the first end is counted with the second).
+		let run = 0;
 		ctx.beginPath();
 		for (const i of model.chunkPath) {
 			const p = screen(i);
 			if (p === null) {
 				pen = false;
+				run = 0;
 				continue;
 			}
 			if (pen) {
 				ctx.lineTo(p[0], p[1]);
 				any = true;
+				drawn.chunkPath += run === 1 ? 2 : 1;
 			} else ctx.moveTo(p[0], p[1]);
 			pen = true;
+			run += 1;
 		}
 		if (any) {
 			ctx.strokeStyle = colours.accent;
@@ -166,6 +197,7 @@ export function drawOverlay(ctx: CanvasRenderingContext2D, model: IOverlayModel,
 			ctx.moveTo(from[0], from[1]);
 			ctx.lineTo(p[0], p[1]);
 			any = true;
+			drawn.links += 1;
 		}
 		if (any) {
 			ctx.strokeStyle = colours.accent;
@@ -185,6 +217,7 @@ export function drawOverlay(ctx: CanvasRenderingContext2D, model: IOverlayModel,
 			ctx.moveTo(star[0], star[1]);
 			ctx.lineTo(p[0], p[1]);
 			any = true;
+			drawn.rays += 1;
 		}
 		if (any) {
 			ctx.setLineDash(model.star?.exact === false ? [6, 3] : []);
@@ -234,6 +267,7 @@ export function drawOverlay(ctx: CanvasRenderingContext2D, model: IOverlayModel,
 
 	// The star: a five-pointed star filled with the accent, edged with the surface.
 	if (star !== null) {
+		drawn.star = true;
 		const outer = 9;
 		const inner = 4;
 		ctx.beginPath();
@@ -292,4 +326,5 @@ export function drawOverlay(ctx: CanvasRenderingContext2D, model: IOverlayModel,
 		ctx.stroke();
 		ctx.setLineDash([]);
 	}
+	return drawn;
 }

@@ -14,7 +14,7 @@
 
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { boundsOf, fitCamera, orbitCamera, panBy, projectToScreen, screenToWorld, viewMatrix, worldToScreen, zoomAt } from '../src/map/camera';
+import { boundsOf, cameraSignature, fitCamera, fitCamera3D, orbitCamera, panBy, projectToScreen, screenToWorld, viewMatrix, worldToScreen, zoomAt } from '../src/map/camera';
 import type { ICamera2D, ICamera3D, IViewport } from '../src/map/camera';
 import { lassoSelect, pointInPolygon, simplifyPath } from '../src/map/lasso';
 import { buildScreenIndex, nearestInSector, pickNearest } from '../src/map/picking';
@@ -201,4 +201,16 @@ test('a lasso over 20,000 points answers well within a frame budget', () => {
 	const ms = performance.now() - t0;
 	assert.ok(inside.length > 0.15 * n && inside.length < 0.25 * n, `${inside.length}`);
 	assert.ok(ms < 100, `${ms.toFixed(1)} ms`);
+});
+
+test('the camera signature (data-camera) changes with any pan, zoom or orbit and is stable otherwise', () => {
+	const cam = { mode: '2d' as const, cx: 0.125, cy: -2, scale: 37.5 };
+	assert.equal(cameraSignature(cam), cameraSignature({ ...cam }));
+	assert.notEqual(cameraSignature(panBy(cam, 3, 0)), cameraSignature(cam));
+	assert.notEqual(cameraSignature(panBy(cam, 0, 1)), cameraSignature(cam));
+	assert.notEqual(cameraSignature(zoomAt(cam, { width: 400, height: 300 }, 200, 150, 1.25)), cameraSignature(cam));
+	const c3 = fitCamera3D(new Float32Array([0, 0, 0, 1, 1, 1, -1, 2, 0]));
+	assert.notEqual(cameraSignature(orbitCamera(c3, 0.1, 0)), cameraSignature(c3));
+	assert.equal(cameraSignature(null), '');
+	assert.match(cameraSignature(cam), /^2d:/);
 });
