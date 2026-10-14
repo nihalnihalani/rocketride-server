@@ -103,7 +103,7 @@ export {
 	createToolSession,
 } from './connect/session';
 export type { EndpointStatus, EndpointWatch, IEndpointState, IEndpointStore, IEndpointStoreOptions, IRoleChannel, IStoreClock, IWatchHandlers } from './connect/store';
-export { createEndpointStore, probeInfo } from './connect/store';
+export { DEFAULT_ASK_TIMEOUT_MS, createEndpointStore, probeInfo } from './connect/store';
 
 export type { IConnectionFlags, IConnectionFlagsOptions } from './history/flags';
 export { createConnectionFlags } from './history/flags';

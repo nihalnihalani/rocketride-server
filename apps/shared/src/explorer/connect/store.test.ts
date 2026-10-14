@@ -26,7 +26,7 @@
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { createEndpointStore } from './store';
+import { DEFAULT_ASK_TIMEOUT_MS, createEndpointStore } from './store';
 import type { EndpointWatch, IEndpointStore, IWatchHandlers } from './store';
 import { CONFIG_SENTINEL, codedError, fakeWorld, manualClock, projectRows, ragComponents, row } from './testing';
 import type { IFakeRow, IFakeWorld, IManualClock, IToolCall } from './testing';
@@ -1038,9 +1038,16 @@ describe('multi-role connections — role tokens, read-only anchors and role cha
 		const last = world.calls[world.calls.length - 1]!;
 		assert.deepEqual({ token: last.token, tool: last.tool, nodeId: last.nodeId }, { token: tokenOf(rows, 'tools_1'), tool: 'embed', nodeId: 'embed_1' });
 
-		const sse = async (): Promise<void> => undefined;
+		const streamed: string[] = [];
+		const sse = async (type: string): Promise<void> => { streamed.push(type); };
+		world.chatBehave = async (call) => {
+			await call.onSSE?.('token', { text: 'a' });
+			return { answers: ['[fake] answer'] };
+		};
 		assert.deepEqual(await chat.ask({ text: 'hello' }, { onSSE: sse }), { answers: ['[fake] answer'] });
-		assert.deepEqual(world.chats.map((c) => ({ token: c.token, question: c.question, sse: c.onSSE === sse })), [{ token: tokenOf(rows, 'chat_1'), question: { text: 'hello' }, sse: true }]);
+		assert.deepEqual(world.chats.map((c) => ({ token: c.token, question: c.question })), [{ token: tokenOf(rows, 'chat_1'), question: { text: 'hello' } }]);
+		// Stream events of the pending question reach the app's callback.
+		assert.deepEqual(streamed, ['token']);
 
 		const results = await ingest.sendFiles([FILE('a.pdf'), FILE('b.md')], { maxConcurrent: 2 });
 		assert.deepEqual(world.uploads.map((u) => ({ token: u.token, files: u.files.map((f) => f.file.name), maxConcurrent: u.maxConcurrent })), [{ token: tokenOf(rows, 'ingest_1'), files: ['a.pdf', 'b.md'], maxConcurrent: 2 }]);
@@ -1267,6 +1274,37 @@ describe('multi-role connections — role tokens, read-only anchors and role cha
 		assert.equal(tools.store.getState().endpoints[0]!.state, 'unreachable');
 	});
 
+	it('does not re-probe a Not reachable read-only card on refreshes nobody asked for; does when asked', async () => {
+		const rows = projectRows(['webhook_1', 'chat_1'], ragWithArchive());
+		const { store, world, clock } = makeVx(rows, unreachableArchive);
+		const archiveProbes = (): number => world.calls.filter((c) => c.tool === 'dialect' && c.nodeId === 'store_9').length;
+		const watch = watchProbe();
+		const detach = store.attach(world.client, null, watch.watch);
+		await store.refresh(world.client);
+		assert.equal(archiveProbes(), 1);
+		for (let i = 0; i < 3; i += 1) {
+			await clock.advance(6_000);
+			watch.handlers!.onFocus();
+			await clock.advance(300);
+			watch.handlers!.onTaskEvent({ reprobe: false });
+			await clock.advance(300);
+		}
+		assert.ok(world.getTasksCalls >= 4, `discovery still ran (${world.getTasksCalls})`);
+		assert.equal(archiveProbes(), 1, 'background refreshes must not re-probe');
+		const archive = store.getState().endpoints.find((e) => e.nodeId === 'store_9')!;
+		assert.equal(archive.state, 'stopped');
+		assert.equal(archive.stateDetail, 'Not reachable from the chat source');
+		// An explicit refresh, a restart event and Test connection still re-probe.
+		await store.refresh(world.client);
+		assert.equal(archiveProbes(), 2);
+		watch.handlers!.onTaskEvent({ reprobe: true });
+		await clock.advance(300);
+		assert.equal(archiveProbes(), 3);
+		await store.probe(world.client, archive.key);
+		assert.equal(archiveProbes(), 4);
+		detach();
+	});
+
 	it('lists only store_1 while the Tools source is stopped: read-only on the chat token, under the callable card\'s key', async () => {
 		const rows = projectRows(['ingest_1', 'chat_1', 'tools_1']);
 		const { store, world } = makeVx(rows);
@@ -1280,6 +1318,77 @@ describe('multi-role connections — role tokens, read-only anchors and role cha
 		assert.equal(endpoints[0]!.readOnly, true);
 		assert.equal(endpoints[0]!.anchorRole, 'chat');
 		assert.equal(store.channel(world.client, endpoints[0]!, 'tools').bound, false);
+	});
+
+	it('drops stream events of a question that timed out, was replaced, or already settled', async () => {
+		const { store, world, clock } = makeVx(projectRows(['chat_1', 'tools_1']));
+		await store.refresh(world.client);
+		const chat = store.channel(world.client, store.getState().endpoints[0]!, 'chat');
+		const streamed: string[] = [];
+		const onSSE = async (type: string): Promise<void> => { streamed.push(type); };
+		let finish: (answer: unknown) => void = () => undefined;
+		world.chatBehave = () => new Promise((resolve) => { finish = resolve; });
+		const emit = async (type: string): Promise<void> => { await world.chats[world.chats.length - 1]!.onSSE?.(type, {}); };
+
+		// Timed out: events after the timeout are dropped.
+		const timedOut = chat.ask('slow', { onSSE, timeoutMs: 5_000 }).catch((e: unknown) => e);
+		await emit('before-timeout');
+		await clock.advance(5_000);
+		assert.equal(((await timedOut) as ExplorerToolError).kind, 'timeout');
+		await emit('after-timeout');
+		assert.deepEqual(streamed, ['before-timeout']);
+
+		// Replaced: events after the generation expired are dropped.
+		const generation = createGeneration();
+		const replaced = chat.ask('old', { onSSE, generation: generation.next() }).catch((e: unknown) => e);
+		await emit('current');
+		generation.invalidate();
+		await emit('after-invalidate');
+		finish({ answers: ['late'] });
+		assert.equal(((await replaced) as ExplorerToolError).kind, 'stale');
+		assert.deepEqual(streamed, ['before-timeout', 'current']);
+
+		// Settled: nothing is delivered once the answer came back.
+		const answered = chat.ask('q', { onSSE });
+		finish({ answers: ['done'] });
+		await answered;
+		await emit('after-answer');
+		assert.deepEqual(streamed, ['before-timeout', 'current']);
+	});
+
+	it('bounds ask() by DEFAULT_ASK_TIMEOUT_MS when no timeout is given; null waits without a bound', async () => {
+		assert.equal(DEFAULT_ASK_TIMEOUT_MS, 120_000);
+		const { store, world, clock } = makeVx(projectRows(['chat_1', 'tools_1']));
+		await store.refresh(world.client);
+		const chat = store.channel(world.client, store.getState().endpoints[0]!, 'chat');
+		world.chatBehave = () => new Promise(() => undefined);
+		const bounded: { outcome: unknown } = { outcome: 'pending' };
+		void chat.ask('slow').catch((e: unknown) => { bounded.outcome = e; });
+		await clock.advance(DEFAULT_ASK_TIMEOUT_MS - 1);
+		assert.equal(String(bounded.outcome), 'pending');
+		await clock.advance(1);
+		assert.equal((bounded.outcome as ExplorerToolError).kind, 'timeout');
+		assert.equal(clock.pending(), 0);
+
+		const unbounded: { outcome: unknown } = { outcome: 'pending' };
+		void chat.ask('slow', { timeoutMs: null }).catch((e: unknown) => { unbounded.outcome = e; });
+		await clock.settle();
+		assert.equal(clock.pending(), 0, 'no timer for an explicit opt-out');
+		await clock.advance(10 * DEFAULT_ASK_TIMEOUT_MS);
+		assert.equal(unbounded.outcome, 'pending');
+	});
+
+	it('hands out one channel per endpoint, role and client, until reset', async () => {
+		const { store, world } = makeVx(projectRows(['chat_1', 'tools_1']));
+		await store.refresh(world.client);
+		const endpoint = store.getState().endpoints[0]!;
+		const chat = store.channel(world.client, endpoint, 'chat');
+		assert.equal(store.channel(world.client, { ...endpoint }, 'chat'), chat);
+		assert.notEqual(store.channel(world.client, endpoint, 'tools'), chat);
+		const other = { ...world.client };
+		assert.notEqual(store.channel(other, endpoint, 'chat'), chat);
+		store.reset();
+		assert.notEqual(store.channel(world.client, endpoint, 'chat'), chat);
 	});
 
 	it('gives single-role (SQL, Graph) stores a tools channel too, on the endpoint\'s token', async () => {
