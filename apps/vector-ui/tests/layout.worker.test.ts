@@ -105,6 +105,20 @@ test('the budget ends a run with the positions so far, flagged timedOut, still m
 	assert.ok(Number.isFinite(result.overlap) && Number.isFinite(result.pcaOverlap));
 });
 
+test('past its budget a large sample stops within a couple of ticks, and only one overlap is left to measure (the watchdog grace is not eaten)', async () => {
+	// The clock reads 0 for the start and the first budget check, then the whole budget is gone.
+	let calls = 0;
+	const { srv, posted } = server(() => (calls++ < 2 ? 0 : FORCE_BUDGET_MS));
+	srv.receive(toLayoutRequest(light, { requestId: 6, algorithm: 'force', seed: 7, hidden: null }));
+	await srv.idle();
+	const result = posted.find((m): m is ILayoutResult => m.type === 'result') as ILayoutResult;
+	assert.equal(result.timedOut, true);
+	assert.ok(result.ticks >= 1 && result.ticks <= 2, `${result.ticks} ticks ran past the budget check at 5,000 points (at most 2)`);
+	// The PCA overlap does not depend on the run, so it is measured before the loop, not after the budget.
+	const text = fs.readFileSync(path.join(SRC, 'layout.server.ts'), 'utf8');
+	assert.ok(text.indexOf('const pcaOverlap = knnOverlap(') < text.indexOf('while (!job.done)'), 'PCA overlap first');
+});
+
 test('the worker entry wires the server to the worker scope and imports nothing of the app', () => {
 	const entry = fs.readFileSync(path.join(SRC, 'layout.worker.ts'), 'utf8');
 	const imports = [...entry.matchAll(/from '([^']+)'/g)].map((m) => m[1]);

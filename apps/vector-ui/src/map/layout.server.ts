@@ -57,6 +57,19 @@ export interface ILayoutServer {
 /** Steps between yields: about 20-30 ms of work at 1,000 points. */
 const STEP = { force: 10, tsne: 5 } as const;
 
+/**
+ * Ticks per step for `n` points: fewer for larger samples, so the budget is
+ * checked about as often in time (at 5,000 points a step is 2 force ticks)
+ * and a run past its budget leaves little work before it answers.
+ *
+ * @param algorithm - The layout.
+ * @param n - Points in the sample.
+ * @returns Ticks per step, at least 1.
+ */
+function stepFor(algorithm: keyof typeof STEP, n: number): number {
+	return Math.max(1, Math.floor(STEP[algorithm] * Math.min(1, 1000 / Math.max(1, n))));
+}
+
 /** Steps between progress messages. */
 const PROGRESS_EVERY = { force: 30, tsne: 50 } as const;
 
@@ -83,10 +96,12 @@ export function createLayoutServer(deps: ILayoutServerDeps): ILayoutServer {
 			if (current === id) deps.post({ type: 'error', requestId: id, message: error instanceof Error ? error.message : String(error), tooLarge: error instanceof TsneTooLargeError });
 			return;
 		}
-		const step = STEP[request.algorithm];
+		const step = stepFor(request.algorithm, request.n);
 		let sinceProgress = 0;
 		let timedOut = false;
 		try {
+			// PCA's overlap does not depend on the run: measure it now, so only the layout's is left after the budget.
+			const pcaOverlap = knnOverlap(request.init, graph, request.qualityK, 2, request.hidden);
 			while (!job.done) {
 				if (current !== id) return;
 				if (deps.now() - started >= request.budgetMs) {
@@ -104,7 +119,6 @@ export function createLayoutServer(deps: ILayoutServerDeps): ILayoutServer {
 			if (current !== id) return;
 			const positions = job.positions();
 			const overlap = knnOverlap(positions, graph, request.qualityK, 2, request.hidden);
-			const pcaOverlap = knnOverlap(request.init, graph, request.qualityK, 2, request.hidden);
 			deps.post({ type: 'result', requestId: id, algorithm: request.algorithm, positions, ticks: job.ticks, total: job.total, elapsedMs: deps.now() - started, timedOut, overlap, pcaOverlap });
 		} catch (error) {
 			if (current === id) deps.post({ type: 'error', requestId: id, message: `The layout failed: ${error instanceof Error ? error.message : String(error)}`, tooLarge: false });
