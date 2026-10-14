@@ -206,3 +206,13 @@ test('MapToolbar states what the sample is drawn from and its seed, so "New samp
 	assert.match(html(<MapToolbar {...base} sample={unknown} />), /of — chunks · — docs · seed 7/);
 	assert.doesNotMatch(html(<MapToolbar {...base} sample={null} />), /chunks ·/);
 });
+
+test('a pressed toggle restyles its border with the same shorthand as an unpressed one (React warns when a toggle mixes border and borderColor)', () => {
+	const base = { limits, sample: demo, busy: null, layout: 'pca' as const, colourBy: 'document' as const, table: false, query: { enabled: true, reason: null }, onSample: noop, onLayout: noop, onCancel: noop, onColourBy: noop, onQuery: noop, onToggleLasso: noop, onFit: noop, onToggleTable: noop };
+	const lassoTag = (lasso: boolean): string => /<button[^>]*aria-pressed="(?:true|false)"[^>]*>Lasso/.exec(html(<MapToolbar {...base} lasso={lasso} />))?.[0] ?? '';
+	for (const pressed of [true, false]) {
+		const tag = lassoTag(pressed);
+		assert.match(tag, /border:1px solid/, `the ${pressed ? 'pressed' : 'unpressed'} Lasso sets the border shorthand`);
+		assert.doesNotMatch(tag, /border-color/, `the ${pressed ? 'pressed' : 'unpressed'} Lasso mixes in border-color`);
+	}
+});

@@ -53,7 +53,8 @@ export const MAP_STYLES = {
 	select: { ...text, height: 28, borderRadius: 6, border: '1px solid var(--rr-border-input, var(--rr-border))', background: 'var(--rr-bg-default)', padding: '0 6px' } as CSSProperties,
 	input: { ...text, height: 28, minWidth: 180, borderRadius: 6, border: '1px solid var(--rr-border-input, var(--rr-border))', background: 'var(--rr-bg-default)', padding: '0 8px' } as CSSProperties,
 	button: { ...text, height: 28, padding: '0 10px', borderRadius: 6, border: '1px solid var(--rr-border-input, var(--rr-border))', background: 'var(--rr-bg-default)', fontWeight: 600, cursor: 'pointer', whiteSpace: 'nowrap' } as CSSProperties,
-	buttonPressed: { borderColor: `var(${ACCENT_TOKEN})`, boxShadow: `inset 0 0 0 1px var(${ACCENT_TOKEN})` } as CSSProperties,
+	// The whole border shorthand (as `button` sets it): React warns when a toggle mixes border and borderColor.
+	buttonPressed: { border: `1px solid var(${ACCENT_TOKEN})`, boxShadow: `inset 0 0 0 1px var(${ACCENT_TOKEN})` } as CSSProperties,
 	buttonDisabled: { opacity: 0.55, cursor: 'not-allowed' } as CSSProperties,
 	linkButton: { ...text, background: 'none', border: 'none', padding: 0, cursor: 'pointer', textAlign: 'left', textDecoration: 'underline' } as CSSProperties,
 	list: { listStyle: 'none', margin: 0, padding: 0 } as CSSProperties,
