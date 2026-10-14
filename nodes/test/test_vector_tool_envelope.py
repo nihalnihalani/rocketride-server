@@ -23,7 +23,7 @@ import json
 import math
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Dict
+from typing import Any, Callable, Dict, List
 
 import numpy as np
 import pytest
@@ -312,10 +312,145 @@ def test_store_errors_never_carry_the_fixture_identities(message):
         'error in postgres.py line 12',
         'qdrant_client.http.exceptions.UnexpectedResponse: Unexpected Response: 404 (Not Found)',
         'canceling statement due to statement timeout',
+        'cannot execute UPDATE in a read-only transaction',
+        'the server-side cursor was closed',
+        'Could not connect to a Chroma server. Are you sure it is running?',
     ],
 )
 def test_ordinary_error_text_survives_the_scrubber(message):
     assert vx_tools.safe_error_text(message) == message
+
+
+@pytest.mark.parametrize(
+    'message,secrets',
+    [
+        ('Name or service not known: gx-pgvector', ['gx-pgvector']),
+        ('nodename nor servname provided, or not known: vx-qdrant', ['vx-qdrant']),
+        ('getaddrinfo failed for gx-pgvector', ['gx-pgvector']),
+        ('SSL error: certificate verify failed for rrtenant.vx-pgbouncer', ['rrtenant', 'vx-pgbouncer']),
+        ('collection vx_demo_docs on server vx-qdrant (grpc 56334) is locked', ['vx-qdrant', '56334']),
+        ('could not resolve host vx-chroma', ['vx-chroma']),
+        ('token AstraCS:abcdefghijklmnop:0123456789abcdef is invalid', ['AstraCS', 'abcdefghijklmnop', '0123456789']),
+        ('x-api-key header value pcsk_1234567890abcdef rejected', ['pcsk_', '1234567890abcdef']),
+    ],
+)
+def test_bare_host_names_and_token_shapes_are_scrubbed(message, secrets):
+    out = vx_tools.safe_error_text(message)
+    assert not [secret for secret in secrets if secret in out], out
+
+
+def _rpc_error(code_name: str) -> BaseException:
+    status = _lib('grpc', 'StatusCode')
+
+    class _Rpc(_lib('grpc', 'RpcError')):
+        def code(self):
+            return getattr(status, code_name)
+
+        def __str__(self) -> str:
+            return f'<_Rpc {code_name} ipv4:172.18.0.9:56334 vx-qdrant>'
+
+    return _Rpc()
+
+
+def _wrapped_refusal() -> BaseException:
+    try:
+        try:
+            raise ConnectionRefusedError(61, 'Connection refused: vx-qdrant')
+        except ConnectionRefusedError as inner:
+            raise RuntimeError('the store vx-qdrant failed') from inner
+    except RuntimeError as outer:
+        return outer
+
+
+def _lib(module: str, name: str) -> Any:
+    """A real client-library class; skip the case when the library is absent or shadowed by a mock."""
+    import importlib
+
+    try:
+        return getattr(importlib.import_module(module), name)
+    except (ImportError, AttributeError):
+        pytest.skip(f'NOT RUN: {module}.{name} is not importable here (library absent or mocked)')
+
+
+def _httpx_connect(message: str) -> BaseException:
+    return _lib('httpx', 'ConnectError')(message)
+
+
+def _qdrant_response(status: int, content: bytes = b'') -> BaseException:
+    headers = _lib('httpx', 'Headers')()
+    return _lib('qdrant_client.http.exceptions', 'UnexpectedResponse')(
+        status_code=status, reason_phrase='x', content=content, headers=headers
+    )
+
+
+_UNREACHABLE: Dict[str, Callable[[], BaseException]] = {
+    'refused': lambda: ConnectionRefusedError(61, 'Connection refused: gx-pgvector'),
+    'gaierror': lambda: __import__('socket').gaierror(8, 'nodename nor servname provided, or not known: gx-pgvector'),
+    'tls': lambda: __import__('ssl').SSLCertVerificationError('certificate verify failed for rrtenant.vx-pgbouncer'),
+    'libpq': lambda: _lib('psycopg2', 'OperationalError')(
+        'connection to server at "gx-pgvector" (172.18.0.3), port 5432 failed: FATAL:  password authentication '
+        'failed for user "rruser"'
+    ),
+    'libpq-closed': lambda: _lib('psycopg2', 'InterfaceError')('connection already closed'),
+    'httpx': lambda: _httpx_connect('All connection attempts failed: vx-chroma'),
+    'requests': lambda: _lib('requests.exceptions', 'ConnectionError')(
+        "HTTPConnectionPool(host='vx-chroma', port=8000)"
+    ),
+    'qdrant-transport': lambda: _lib('qdrant_client.http.exceptions', 'ResponseHandlingException')(
+        _httpx_connect('vx-qdrant refused')
+    ),
+    'qdrant-401': lambda: _qdrant_response(401, b'vx-qdrant'),
+    'weaviate': lambda: _lib('weaviate.exceptions', 'WeaviateConnectionError')('Connection failed at vx-weaviate'),
+    'weaviate-auth': lambda: _lib('weaviate.exceptions', 'AuthenticationFailedError')('bad key for vx-weaviate'),
+    'pinecone-401': lambda: _lib('pinecone.exceptions', 'UnauthorizedException')(
+        'Invalid API key pcsk_1234567890abcdef'
+    ),
+    'milvus-connect': lambda: _lib('pymilvus.exceptions', 'MilvusException')(
+        code=2, message='Fail connecting to server on vx-milvus:19530'
+    ),
+    'mongo-select': lambda: _lib('pymongo.errors', 'ServerSelectionTimeoutError')(
+        'vx-mongo:27017: [Errno 61] Connection refused'
+    ),
+    'mongo-auth': lambda: _lib('pymongo.errors', 'OperationFailure')('Authentication failed for vx-mongo.', code=18),
+    'grpc-unavailable': lambda: _rpc_error('UNAVAILABLE'),
+    'grpc-unauthenticated': lambda: _rpc_error('UNAUTHENTICATED'),
+    'wrapped': _wrapped_refusal,
+}
+
+
+@pytest.mark.parametrize('case', sorted(_UNREACHABLE))
+def test_connection_and_credential_failures_answer_a_fixed_sentence(case, monkeypatch):
+    logged: List[str] = []
+    monkeypatch.setattr(vx_tools, 'warning', lambda message: logged.append(str(message)))
+    exc = _UNREACHABLE[case]()
+    answer = _run(exc)
+    assert answer == {
+        'success': False,
+        'code': 'STORE_ERROR',
+        'error': f'{type(exc).__name__}: The store could not be reached or refused the credentials; see the engine log.',
+    }
+    assert len(logged) == 1 and type(exc).__name__ in logged[0]
+    assert not [s for s in ('gx-pgvector', 'vx-pgbouncer', 'rruser', '172.18', 'pcsk_') if s in logged[0]]
+
+
+_OTHER: Dict[str, Callable[[], BaseException]] = {
+    'statement-timeout': lambda: _lib('psycopg2.errors', 'QueryCanceled')(
+        'canceling statement due to statement timeout'
+    ),
+    'lock-timeout': lambda: _lib('psycopg2.errors', 'LockNotAvailable')('could not obtain lock on relation'),
+    'qdrant-404': lambda: _qdrant_response(404),
+    'milvus-other': lambda: _lib('pymilvus.exceptions', 'MilvusException')(code=1, message='collection not loaded'),
+    'file': lambda: FileNotFoundError(2, 'No such file or directory'),
+    'grpc-invalid': lambda: _rpc_error('INVALID_ARGUMENT'),
+}
+
+
+@pytest.mark.parametrize('case', sorted(_OTHER))
+def test_other_backend_failures_keep_their_scrubbed_text(case):
+    exc = _OTHER[case]()
+    answer = _run(exc)
+    assert answer['code'] == 'STORE_ERROR'
+    assert 'could not be reached' not in answer['error'] and answer['error'].startswith(type(exc).__name__)
 
 
 def test_error_text_is_bounded():

@@ -355,11 +355,24 @@ _SCRUB = (
         ),
         r'\1 <redacted>',
     ),
+    (re.compile(r'\bAstraCS:[\w:.+/=-]+'), '<redacted>'),
+    (re.compile(r'\bpcsk_[\w-]+'), '<redacted>'),
     # hosts and identities quoted by the backend
     (
         re.compile(r'\b(server at|host name|host|on socket|socket)\s+(?:"[^"]*"|\'[^\']*\')', re.IGNORECASE),
         r'\1 <host>',
     ),
+    # bare hyphenated names (container and service names) where a message names a host
+    (
+        re.compile(
+            r'\b(not known:?|failed for|could not resolve|resolve|resolving|(?:on|to|at) server|host|hostname'
+            r'|refused(?: by)?:?|connect(?:ing|ion)? to)'
+            r'\s+[A-Za-z0-9][\w.]*-[\w.-]*[A-Za-z0-9]',
+            re.IGNORECASE,
+        ),
+        r'\1 <host>',
+    ),
+    (re.compile(r'\b(grpc|http|https|tcp)\s+\d{2,5}\b', re.IGNORECASE), r'\1 <port>'),
     (re.compile(rf'\b({_QUOTED_IDENTITIES})\s+(?:"[^"]*"|\'[^\']*\'|`[^`]*`)', re.IGNORECASE), r'\1 <redacted>'),
     (re.compile(r'\b(to|for) (tenant|database|keyspace) [\w.-]*\w', re.IGNORECASE), r'\1 \2 <redacted>'),
     # bare addresses, host:port pairs and DNS names
@@ -394,8 +407,109 @@ def safe_error_text(error: Any, limit: int = 300) -> str:
     return text
 
 
+#: What a ``STORE_ERROR`` says when the store could not be reached or refused the credentials.
+STORE_UNREACHABLE = 'The store could not be reached or refused the credentials; see the engine log.'
+
+#: Connection and credential failures of the client libraries, as ``module.QualName`` of any class in
+#: the exception's MRO (the stdlib ones are checked with ``isinstance``).
+_UNREACHABLE_CLASSES = frozenset(
+    {
+        'httpx.ConnectError',
+        'httpx.ConnectTimeout',
+        'httpcore.ConnectError',
+        'httpcore.ConnectTimeout',
+        'requests.exceptions.ConnectionError',
+        'urllib3.exceptions.NewConnectionError',
+        'urllib3.exceptions.MaxRetryError',
+        'qdrant_client.http.exceptions.ResponseHandlingException',
+        'weaviate.exceptions.WeaviateConnectionError',
+        'weaviate.exceptions.WeaviateStartUpError',
+        'weaviate.exceptions.AuthenticationFailedError',
+        'pinecone.errors.exceptions.UnauthorizedError',
+        'pinecone.errors.exceptions.ForbiddenError',
+        'pymilvus.exceptions.MilvusUnavailableException',
+        'chromadb.errors.AuthorizationError',
+        'pymongo.errors.ConnectionFailure',
+    }
+)
+
+#: Classes that mean a connection failure only as themselves: their subclasses are statement
+#: errors (``QueryCanceled``, ``LockNotAvailable``, ...).
+_UNREACHABLE_EXACT = frozenset(
+    {'psycopg2.OperationalError', 'psycopg2.InterfaceError', 'psycopg.OperationalError', 'psycopg.InterfaceError'}
+)
+
+#: gRPC status codes that mean the server is unreachable or refused the caller.
+_UNREACHABLE_GRPC = frozenset({'UNAVAILABLE', 'UNAUTHENTICATED', 'PERMISSION_DENIED'})
+
+
+def _qualname(cls: type) -> str:
+    return f'{getattr(cls, "__module__", "")}.{getattr(cls, "__qualname__", "")}'
+
+
+def _http_status(exc: BaseException) -> Optional[int]:
+    for owner, attr in ((exc, 'status_code'), (exc, 'status'), (exc, 'http_status')):
+        value = getattr(owner, attr, None)
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+    value = getattr(getattr(exc, 'response', None), 'status_code', None)
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _unreachable_itself(exc: BaseException) -> bool:
+    import socket
+    import ssl
+
+    if isinstance(exc, (ConnectionError, socket.gaierror, socket.herror, ssl.SSLError)):
+        return True
+    if _qualname(type(exc)) in _UNREACHABLE_EXACT:
+        return True
+    names = {_qualname(cls) for cls in type(exc).__mro__}
+    if names & _UNREACHABLE_CLASSES or _http_status(exc) in (401, 403, 407):
+        return True
+    if 'pymilvus.exceptions.MilvusException' in names:
+        return getattr(exc, 'code', None) == 2
+    if 'pymongo.errors.OperationFailure' in names:
+        return getattr(exc, 'code', None) in (13, 18)
+    if 'grpc.RpcError' in names and callable(getattr(exc, 'code', None)):
+        return getattr(exc.code(), 'name', None) in _UNREACHABLE_GRPC
+    return False
+
+
+def store_unreachable(exc: BaseException) -> bool:
+    """Whether ``exc`` (or what caused it) says the store could not be reached or refused the credentials.
+
+    Checks the stdlib connection, DNS and TLS errors, the client libraries' connection and
+    authentication classes, HTTP 401/403/407 answers, Milvus code 2, MongoDB auth codes and
+    gRPC UNAVAILABLE/UNAUTHENTICATED/PERMISSION_DENIED, following ``__cause__`` and an
+    unsuppressed ``__context__``.
+    """
+    pending: List[Optional[BaseException]] = [exc]
+    seen: set = set()
+    while pending and len(seen) < 8:
+        current = pending.pop(0)
+        if current is None or id(current) in seen:
+            continue
+        seen.add(id(current))
+        try:
+            if _unreachable_itself(current):
+                return True
+        except Exception:  # an exception whose attributes cannot be read is not a connection failure
+            pass
+        pending.append(current.__cause__)
+        if not current.__suppress_context__:
+            pending.append(current.__context__)
+    return False
+
+
 def safe_error(exc: BaseException) -> str:
-    """``'<ExceptionType>: <scrubbed message>'`` (just the type when there is no message)."""
+    """``'<ExceptionType>: <scrubbed message>'`` (just the type when there is no message).
+
+    A connection or credential failure (:func:`store_unreachable`) answers the fixed
+    :data:`STORE_UNREACHABLE` sentence instead of its message.
+    """
+    if store_unreachable(exc):
+        return f'{type(exc).__name__}: {STORE_UNREACHABLE}'
     message = safe_error_text(exc)
     return f'{type(exc).__name__}: {message}' if message else type(exc).__name__
 
@@ -470,6 +584,11 @@ def vectordb_tool(fn: Callable) -> Callable:
             raise
         except BaseException as exc:  # noqa: BLE001 - the tool boundary: nothing escapes it
             result = {'success': False, 'code': 'STORE_ERROR', 'error': safe_error(exc)}
+            if store_unreachable(exc):  # the answer carries a fixed sentence; the scrubbed text goes to the log
+                try:
+                    warning(f'vector store tool {fn.__name__}: {type(exc).__name__}: {safe_error_text(exc)}')
+                except Exception:
+                    pass
         try:
             return finish_answer(result)
         except (KeyboardInterrupt, SystemExit):
