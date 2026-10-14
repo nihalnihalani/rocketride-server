@@ -23,11 +23,28 @@
  * a text query (when the embedding node answers) draws its star and rays.
  *
  * GATE: 2,000 detailed points at 4x CPU throttling, p95 frame interval while
- * panning <= 33 ms. A check that measured nothing FAILS. The neighbour layout
- * may only be shown when it keeps at least as much of each neighbourhood as PCA.
+ * panning <= 33 ms. A check that measured nothing FAILS: the frame intervals
+ * count only when the pan really drew (a renderer runs, the canvas's
+ * data-draw-count advanced by at least GATE.minSamples frames and its
+ * data-camera moved), since requestAnimationFrame ticks at ~16.7 ms on an idle
+ * page whether or not anything is drawn. A neighbour-graph or t-SNE layout
+ * that failed, could not start or was refused fails its row; the neighbour
+ * layout may only be shown when it keeps at least as much of each
+ * neighbourhood as PCA (a run stopped by its 15 s budget is reported as
+ * timedOut and judged like any other).
+ *
+ * PRIVACY (B4), on every row over that row's WebSocket frames: no response
+ * carries a float array as long as dialect.dimension except `vectors` answers
+ * (at most 2) and `embed` answers; no request carries one other than the
+ * exact query vector an `embed` answer returned in the same session. The
+ * check is L10's (common.cjs privacyViolations); dialect.dimension is the
+ * store's own, read through the TypeScript client with the fixture's Tools
+ * token. Nothing captured FAILS, and a row whose text query ran must have seen
+ * that vector go out.
  *
  * Fixture: gen_perf.py (a disposable collection of >= 6,000 chunks; its card is
- * VX_PERF_FIXTURE, default "vx-local Map performance (Qdrant)").
+ * VX_PERF_FIXTURE, default "vx-local Map performance (Qdrant)", project id
+ * VX_PERF_PROJECT_ID, default gen_perf.py's PERF_PROJECT_ID).
  *
  * Usage: node lane_vector_perf.cjs [base-url] [out-json] [sizes] [rates]
  *   sizes: comma list of n (detailed) or light:n   (default 500,1000,2000,light:5000)
@@ -46,8 +63,16 @@ const GATE = { n: 2000, mode: 'detailed', rate: 4, maxP95: 33, minSamples: 30 };
 const DEFAULT_SIZES = '500,1000,2000,light:5000';
 const DEFAULT_RATES = '1,4';
 const PERF_FIXTURE = process.env.VX_PERF_FIXTURE || 'vx-local Map performance (Qdrant)';
+/** gen_perf.py PERF_PROJECT_ID (tests/map.perflane.test.ts keeps them equal). */
+const PERF_PROJECT_ID = process.env.VX_PERF_PROJECT_ID || '00000000-0000-4000-8000-00000000d1a7';
 const QUERY = process.env.VX_PERF_QUERY || 'radio check-in schedule';
 const FINAL_LAYOUT_STATES = ['done', 'kept-pca', 'cancelled', 'refused', 'failed', 'unavailable'];
+/** Layout outcomes of a run that worked (kept-pca: it ran and did not beat PCA, so PCA stays). */
+const LAYOUT_RAN = ['done', 'kept-pca'];
+/** Renderers that draw. */
+const RENDERERS = ['webgl', 'canvas2d'];
+/** The text-query step's name (its row must see the query vector go out). */
+const QUERY_STEP = 'a text query draws its star and rays (when the embedding node answers)';
 
 // ---------------------------------------------------------------------------
 // Pure helpers (exported for tests/map.perflane.test.ts)
@@ -78,23 +103,80 @@ function summarise(frames) {
 	return { samples: frames.length, p50: r(pct(frames, 50)), p95: r(pct(frames, 95)), max: frames.length ? r(Math.max(...frames)) : null };
 }
 
+/** Why the gate row's pan proves no drawing (null when it does): a renderer ran, frames were drawn, the camera moved. */
+function panWorkProblem(row) {
+	if (!RENDERERS.includes(row.renderer)) return `no renderer draws the map (data-renderer ${JSON.stringify(row.renderer)})`;
+	const work = row.panWork;
+	if (!work) return 'the frames drawn during the pan were not read';
+	if (!Number.isFinite(work.draws) || work.draws < GATE.minSamples) return `${work.draws} frames drawn during the pan (at least ${GATE.minSamples})`;
+	if (!work.cameraBefore || !work.cameraAfter || work.cameraBefore === work.cameraAfter) return `the pan did not move the camera (${JSON.stringify(work.cameraBefore)} -> ${JSON.stringify(work.cameraAfter)})`;
+	return null;
+}
+
+/** The B4 privacy row of one measured row. */
+function privacyGate(row) {
+	const name = `privacy (B4): no dialect.dimension-float array outside vectors / embed answers, none sent but the query's own (${row.mode} ${row.n} at ${row.cpuThrottle}x)`;
+	const p = row.privacy;
+	const fail = (detail) => ({ name, status: 'FAIL', detail });
+	if (!p) return fail('not measured');
+	if (!(p.frames > 0)) return fail('no WebSocket frames were captured');
+	if (!Number.isInteger(p.dimension) || p.dimension <= 0) return fail(`dialect.dimension is unknown (${JSON.stringify(p.dimension)}${p.dimensionError ? `: ${p.dimensionError}` : ''})`);
+	if (p.violations.length) return fail(p.violations.slice(0, 3).join('; '));
+	const queried = (row.steps || []).some((s) => s.name === QUERY_STEP && s.status === 'PASS');
+	if (queried && !(p.embedAnswers > 0 && p.vectorRequests > 0)) return fail(`the text query ran, but the capture saw ${p.embedAnswers} embed answers and ${p.vectorRequests} requests carrying the query vector`);
+	return { name, status: 'PASS', detail: `${p.frames} frames, dimension ${p.dimension}, ${p.embedAnswers} embed answers, ${p.vectorRequests} requests carried the query vector` };
+}
+
 /** PASS/FAIL rows from the measured rows. Nothing measured is a FAIL, never a pass. */
 function evaluateGates(rows) {
 	const out = [];
 	const gateRow = rows.find((r) => r.n === GATE.n && r.mode === GATE.mode && r.cpuThrottle === GATE.rate);
 	const name = `GATE ${GATE.n.toLocaleString('en-US')} ${GATE.mode} points at ${GATE.rate}x: pan p95 frame <= ${GATE.maxP95} ms`;
+	const problem = gateRow && !gateRow.error ? panWorkProblem(gateRow) : null;
 	if (!gateRow) out.push({ name, status: 'FAIL', detail: 'not measured' });
 	else if (gateRow.error) out.push({ name, status: 'FAIL', detail: `the row failed: ${gateRow.error}` });
 	else if (!gateRow.panFrameMs || gateRow.panFrameMs.samples < GATE.minSamples || gateRow.panFrameMs.p95 === null) out.push({ name, status: 'FAIL', detail: `too few frames measured (${gateRow.panFrameMs ? gateRow.panFrameMs.samples : 0})` });
-	else out.push({ name, status: gateRow.panFrameMs.p95 <= GATE.maxP95 ? 'PASS' : 'FAIL', detail: `p95 ${gateRow.panFrameMs.p95} ms over ${gateRow.panFrameMs.samples} frames` });
+	else if (problem) out.push({ name, status: 'FAIL', detail: `frame intervals without drawing: ${problem}` });
+	else out.push({ name, status: gateRow.panFrameMs.p95 <= GATE.maxP95 ? 'PASS' : 'FAIL', detail: `p95 ${gateRow.panFrameMs.p95} ms over ${gateRow.panFrameMs.samples} frames, ${gateRow.panWork.draws} drawn` });
 	for (const row of rows) {
+		const where = `${row.mode} ${row.n} at ${row.cpuThrottle}x`;
 		const layout = row.neighbourLayout;
+		if (layout && !LAYOUT_RAN.includes(layout.state)) out.push({ name: `the neighbour-graph layout runs (${where})`, status: 'FAIL', detail: `it ended ${layout.state}` });
+		if (row.tsne && row.tsne.state !== 'done') out.push({ name: `the t-SNE layout runs (${where})`, status: 'FAIL', detail: `it ended ${row.tsne.state}` });
 		if (layout && layout.state === 'done' && layout.overlap !== null && layout.pcaOverlap !== null) {
-			out.push({ name: `neighbour layout shown only when it keeps at least PCA's neighbours (${row.mode} ${row.n} at ${row.cpuThrottle}x)`, status: layout.overlap >= layout.pcaOverlap ? 'PASS' : 'FAIL', detail: `overlap ${layout.overlap} vs PCA ${layout.pcaOverlap}` });
+			out.push({ name: `neighbour layout shown only when it keeps at least PCA's neighbours (${where})`, status: layout.overlap >= layout.pcaOverlap ? 'PASS' : 'FAIL', detail: `overlap ${layout.overlap} vs PCA ${layout.pcaOverlap}${layout.timedOut ? ' (stopped at its time budget)' : ''}` });
 		}
+		out.push(privacyGate(row));
 		for (const step of row.steps || []) out.push({ name: `${step.name} (${row.mode} ${row.n})`, status: step.status === 'PASS' ? 'PASS' : 'FAIL', detail: step.detail || '' });
 	}
 	return out;
+}
+
+/**
+ * The privacy facts of one row's frames: B4's violations (L10's checker), the
+ * dimension used, how many embed answers returned a query vector, and how many
+ * requests carried exactly such a vector (so a row that queried shows the check
+ * saw the vector go out).
+ *
+ * @param frames - [{dir: 'sent'|'received', msg}] in order (common.cjs captureFrames).
+ * @param dimension - dialect.dimension, or null when unknown.
+ * @param checker - common.cjs (privacyViolations, exchanges, fullVectors, sameVector).
+ */
+function privacySummary(frames, dimension, checker) {
+	const embedded = [];
+	if (Number.isInteger(dimension) && dimension > 0) {
+		for (const x of checker.exchanges({ frames, sockets: 1 }, 'embed')) {
+			const vectors = x.result && Array.isArray(x.result.vectors) ? x.result.vectors : [];
+			for (const v of vectors) if (Array.isArray(v) && v.length === dimension) embedded.push(v);
+		}
+	}
+	let vectorRequests = 0;
+	for (const f of frames) {
+		if (f.dir !== 'sent' || !f.msg || f.msg.type !== 'request' || !embedded.length) continue;
+		const hits = checker.fullVectors(f.msg.arguments, dimension);
+		if (hits.length && hits.every((h) => embedded.some((v) => checker.sameVector(v, h.vector)))) vectorRequests += 1;
+	}
+	return { frames: frames.length, dimension: Number.isInteger(dimension) ? dimension : null, embedAnswers: embedded.length, vectorRequests, violations: checker.privacyViolations(frames, dimension) };
 }
 
 // ---------------------------------------------------------------------------
@@ -195,7 +277,8 @@ async function runLayout(page, layout, timeout = 120000) {
 		const v = await map.getAttribute(attr);
 		return v === null || v === '' ? null : Number(v);
 	};
-	const result = { layout, ms: Date.now() - t0, state, overlap: await num('data-knn-overlap'), pcaOverlap: await num('data-pca-overlap') };
+	const timedOut = (await page.getByText(/stopped at its time budget/).count()) > 0;
+	const result = { layout, ms: Date.now() - t0, state, timedOut, overlap: await num('data-knn-overlap'), pcaOverlap: await num('data-pca-overlap') };
 	await page.getByRole('combobox', { name: 'Layout' }).selectOption('pca');
 	return result;
 }
@@ -261,6 +344,8 @@ async function mapSteps(page, box, row) {
 		const m = /([\d,]+) points selected from ([\d,]+) documents/.exec(text);
 		if (!m) return `no count in ${JSON.stringify(text.slice(0, 120))}`;
 		const n = Number(m[1].replace(/,/g, ''));
+		// The toggle stays pressed after a selection: turn it off for the steps that follow.
+		await page.getByRole('button', { name: 'Lasso' }).click();
 		return n > 0 && n <= points ? true : `${n} selected of ${points}`;
 	});
 	await step(steps, 'the Table alternative lists the points', async () => {
@@ -290,7 +375,7 @@ async function mapSteps(page, box, row) {
 			return (await map.getAttribute('data-layout')) === 'pca' ? true : 'the cancelled layout is not back on PCA';
 		});
 	} else {
-		await step(steps, 'a text query draws its star and rays (when the embedding node answers)', async () => {
+		await step(steps, QUERY_STEP, async () => {
 			const box = page.getByRole('searchbox', { name: 'Query' }).first();
 			if (await box.isDisabled()) return 'query disabled: the embedding node is not reachable from the Tools source';
 			await box.fill(QUERY);
@@ -310,17 +395,28 @@ async function mapSteps(page, box, row) {
 
 async function main() {
 	const E = require('../env.cjs');
+	const C = require('./common.cjs');
 	const [, , base = E.ENGINE_URL, outFile = path.join(E.OUT_DIR, 'lane_vector_perf.json'), sizesArg = DEFAULT_SIZES, ratesArg = DEFAULT_RATES] = process.argv;
 	const sizes = parseSizes(sizesArg);
 	const rates = String(ratesArg).split(',').map(Number).filter((r) => r > 0);
 	fs.mkdirSync(path.dirname(path.resolve(outFile)), { recursive: true });
 	const { chromium } = E.loadPlaywright();
 	const browser = await chromium.launch({ channel: 'chrome', headless: true });
+	// dialect.dimension from the store itself (not from the page), once.
+	const store = C.storeClient(base);
+	let dimension = null;
+	let dimensionError = null;
+	try {
+		dimension = await store.dimension({ name: PERF_FIXTURE, projectId: PERF_PROJECT_ID });
+	} catch (e) {
+		dimensionError = String(e && e.message ? e.message : e).split('\n')[0];
+	}
 	const rows = [];
 	for (const rate of rates) {
 		for (const size of sizes) {
 			const context = await browser.newContext({ viewport: { width: 1440, height: 920 } });
 			const page = await context.newPage();
+			const capture = C.captureFrames(page);
 			const cdp = await context.newCDPSession(page);
 			const row = { n: size.n, mode: size.mode, cpuThrottle: rate, browser: `Chrome ${browser.version()}`, fixture: PERF_FIXTURE };
 			try {
@@ -342,7 +438,12 @@ async function main() {
 				await page.waitForTimeout(600);
 				const box = await canvas.boundingBox();
 				if (!box) throw new Error('the map canvas has no box');
+				// What the pan really drew: frames drawn (data-draw-count) and the camera it moved (data-camera).
+				const work = async () => ({ draws: await canvas.getAttribute('data-draw-count'), camera: await canvas.getAttribute('data-camera') });
+				const before = await work();
 				row.panFrameMs = summarise(await sampleFrames(page, () => pan(page, box)));
+				const after = await work();
+				row.panWork = { draws: before.draws === null || after.draws === null ? null : Number(after.draws) - Number(before.draws), cameraBefore: before.camera, cameraAfter: after.camera };
 				row.hoverFrameMs = summarise(await sampleFrames(page, () => hover(page, box)));
 				row.zoomFrameMs = summarise(await sampleFrames(page, () => zoom(page, box)));
 				const draw = await canvas.getAttribute('data-draw-p95');
@@ -359,12 +460,14 @@ async function main() {
 				row.error = String(e && e.message ? e.message : e).split('\n')[0];
 				await page.screenshot({ path: outFile.replace(/\.json$/, `-${size.mode}-${size.n}-x${rate}-error.png`) }).catch(() => {});
 			}
+			row.privacy = { ...privacySummary(capture.frames, dimension, C), ...(dimensionError ? { dimensionError } : {}) };
 			rows.push(row);
 			console.log(JSON.stringify(row));
 			await context.close();
 		}
 	}
 	await browser.close();
+	await store.close();
 	const gates = evaluateGates(rows);
 	for (const g of gates) console.log(`  [${g.status}] ${g.name}${g.detail ? ` -- ${g.detail}` : ''}`);
 	const pass = gates.every((g) => g.status === 'PASS');
@@ -372,7 +475,7 @@ async function main() {
 	return pass ? 0 : 1;
 }
 
-module.exports = { GATE, pct, parseSizes, summarise, evaluateGates };
+module.exports = { GATE, PERF_PROJECT_ID, QUERY_STEP, pct, parseSizes, summarise, evaluateGates, privacySummary };
 
 if (require.main === module) {
 	main().then(
