@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import base64
 import json
+import types
 import uuid
 
 import numpy as np
@@ -194,6 +195,25 @@ def test_count_documents_answers_none_above_the_cap(monkeypatch):
     _corpus(store, docs=5, chunks=1)
     monkeypatch.setattr(drv.Store, 'COUNT_DOCUMENTS_CAP', 3)
     assert store.countDocuments(vx_filter()) is None
+
+
+@pytest.mark.skip(
+    reason='NEEDS:L1 merged (stats counts first chunks when countDocuments answers None) — integration gate G2'
+)
+def test_stats_above_the_document_cap_counts_first_chunks(monkeypatch):
+    # countDocuments is overridden (so dialect says count_documents) yet answers None
+    # above COUNT_DOCUMENTS_CAP: stats must fall back on that None, not on the capability.
+    from ai.common.store import VectorStoreToolMixin
+
+    store = make_store(drv)
+    _corpus(store, docs=5, chunks=2)
+    monkeypatch.setattr(drv.Store, 'COUNT_DOCUMENTS_CAP', 3)
+    node = VectorStoreToolMixin()
+    node.IGlobal = types.SimpleNamespace(store=store)
+    answer = node.stats({'mode': 'full'})
+    assert answer['success'] is True
+    assert answer['documents'] == 5 and answer['chunks'] == 10
+    assert 'documents_by_first_chunk' in answer['caveats']
 
 
 # --- listDocuments --------------------------------------------------------------------
