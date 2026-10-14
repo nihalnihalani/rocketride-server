@@ -143,22 +143,33 @@ test('the typed calls: stats in full or quick mode, document pages, chunks, all 
 	]);
 });
 
-test('a failure envelope rejects with its code; the existence probe reads NOT_FOUND as "not stored"', async () => {
+test('a failure envelope rejects with its code; the existence probe reads NOT_FOUND as "not stored" and never claims a count the node did not give', async () => {
+	const probe = fixture('chunks_exists_probe');
+	const answers: Record<string, unknown> = {
+		missing: fixture('chunks_not_found'),
+		report: probe,
+		uncounted: { ...probe, total: null, has_more: true },
+		single: { ...probe, total: null, has_more: false },
+	};
 	const w = world(undefined, {
 		stats: () => fixture('errors').STORE_ERROR,
-		chunks: (call) => (call.input?.object_id === 'missing' ? fixture('chunks_not_found') : fixture('chunks_exists_probe')),
+		chunks: (call) => answers[String(call.input?.object_id)],
 	});
 	const { store } = await ready(w);
 	const endpoint = store.getState().endpoints[0];
 	const session = store.session(w.client, endpoint);
 	await assert.rejects(fetchStats(session, endpoint.nodeId, 'full'), (error: ExplorerToolError) => error.kind === 'store' && error.code === 'STORE_ERROR');
 	assert.equal(await chunkCount(session, endpoint.nodeId, 'missing'), null);
-	assert.equal(await chunkCount(session, endpoint.nodeId, 'report'), 19);
+	assert.deepEqual(await chunkCount(session, endpoint.nodeId, 'report'), { chunks: 19 });
+	assert.deepEqual(await chunkCount(session, endpoint.nodeId, 'uncounted'), { chunks: null }, 'stored, but the store did not count its chunks');
+	assert.deepEqual(await chunkCount(session, endpoint.nodeId, 'single'), { chunks: 1 }, 'one chunk and no more: that is the count');
 	assert.deepEqual(
 		w.calls.filter((c) => c.tool === 'chunks').map((c) => c.input),
 		[
 			{ object_id: 'missing', limit: 1 },
 			{ object_id: 'report', limit: 1 },
+			{ object_id: 'uncounted', limit: 1 },
+			{ object_id: 'single', limit: 1 },
 		]
 	);
 });

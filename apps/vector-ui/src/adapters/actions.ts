@@ -97,17 +97,18 @@ export async function fetchChunks(caller: IVectorCaller, nodeId: string, page: {
 }
 
 /**
- * The existence probe: how many chunks a document has, or null when it is not stored.
+ * The existence probe: whether a document is stored and, when the store
+ * counted them, how many chunks it has.
  *
  * @param caller - A session or channel.
  * @param nodeId - The store node.
  * @param objectId - The objectId.
- * @returns The chunk count (or 0 when the store does not say), or null for NOT_FOUND.
+ * @returns `{ chunks }` when stored (`chunks` null when the store gave no total and has more than the one chunk asked for), or null for NOT_FOUND.
  */
-export async function chunkCount(caller: IVectorCaller, nodeId: string, objectId: string): Promise<number | null> {
+export async function chunkCount(caller: IVectorCaller, nodeId: string, objectId: string): Promise<{ chunks: number | null } | null> {
 	try {
 		const page = readChunksPage(await callVector(caller, nodeId, TOOL.chunks, { object_id: objectId, limit: 1 }));
-		return page.total ?? page.items.length;
+		return { chunks: page.total ?? (page.hasMore ? null : page.items.length) };
 	} catch (error) {
 		if (error instanceof Error && (error as { code?: string }).code === 'NOT_FOUND') return null;
 		throw error;
