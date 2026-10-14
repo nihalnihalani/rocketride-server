@@ -449,6 +449,32 @@ def test_scale_listing_finds_every_low_count_orphan(scale_store):
     contract.check_scale_listing(scale_store)
 
 
+def test_scale_orphan_pages_reuse_the_listing_sweep(scale_store, monkeypatch):
+    # One document per page over a chunk-0 document and the three without chunk 0:
+    # the page where the chunk-0 rows run out sweeps; the later pages only read rows.
+    scope = [contract.scale_object_id(0), *contract.SCALE_ORPHANS]
+    calls = []
+    facet = scale_store.client.facet
+
+    def spy(*args, **kwargs):
+        calls.append(kwargs.get('limit'))
+        return facet(*args, **kwargs)
+
+    monkeypatch.setattr(scale_store.client, 'facet', spy)
+    pages, cursor = [], None
+    for _ in range(10):
+        calls.clear()
+        page = scale_store.listDocuments(cursor=cursor, limit=1, object_ids=scope, deleted='active', sort='path')
+        pages.append((page, list(calls)))
+        cursor = page.next_cursor
+        if cursor is None:
+            break
+    orphan_pages = [(page, facets) for page, facets in pages if page.items and not page.items[0].has_first_chunk]
+    assert [page.items[0].objectId for page, _ in orphan_pages] == sorted(contract.SCALE_ORPHANS)
+    assert all(facets == [] for _, facets in orphan_pages[1:]), [facets for _, facets in orphan_pages]
+    assert {page.total for page, _ in pages} == {len(scope)}
+
+
 def _scale_keys(n):
     keys = [(contract.scale_object_id(d), c) for c in range(2) for d in range(contract.SCALE_DOCS)]
     return keys[:n]

@@ -36,6 +36,11 @@ depends(requirements)
 import base64
 import binascii
 import json
+import re
+import secrets
+import threading
+import time
+from collections import OrderedDict
 from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Set, Tuple
 from uuid import NAMESPACE_URL, UUID, uuid5
 import sys
@@ -101,6 +106,10 @@ _SCROLL_PAGE = 256
 # Rows per block of the node-side exact kNN: the similarity block is
 # _KNN_BLOCK x n floats, never the whole n x n matrix.
 _KNN_BLOCK = 256
+
+
+# The listing token in a documents cursor (see Store._rememberOrphans).
+_LISTING_TOKEN = re.compile(r'[0-9a-f]{16}')
 
 
 def point_id_for(objectId: str, chunkId: int) -> str:
@@ -227,6 +236,14 @@ class Store(DocumentStoreBase):
 
     # Most (objectId, chunkId) -> point id entries remembered between getVectors and knnGraph.
     POINT_ID_MEMO_MAX = 20000
+
+    # A listing builds its list of documents without chunk 0 once, on the page where
+    # the chunk-0 rows run out; its later pages reuse it for this many seconds (the
+    # explorer's counts_cached_s). An expired or unknown list is rebuilt.
+    ORPHAN_LIST_TTL_S = 60
+
+    # Listings whose list of documents without chunk 0 is remembered at once.
+    ORPHAN_LISTS_MAX = 8
 
     apikey: str | None = None
     node: str = 'qdrant'
@@ -1144,7 +1161,8 @@ class Store(DocumentStoreBase):
 
         {'ph': 'c', 'p': next point id} pages the chunk-0 rows, {'ph': 'o', 'i': n}
         the documents without chunk 0; 't' (total or None) and 'x' (capped)
-        carry the first page's count so later pages do not recount.
+        carry the first page's count so later pages do not recount, and 'k'
+        names the listing's remembered list of documents without chunk 0.
         """
         if cursor is None:
             return {'ph': 'c', 'p': None}
@@ -1169,6 +1187,7 @@ class Store(DocumentStoreBase):
             )
             and count(state.get('t'))
             and isinstance(state.get('x', False), bool)
+            and (state.get('k') is None or (isinstance(state.get('k'), str) and _LISTING_TOKEN.fullmatch(state['k'])))
         )
         if not valid:
             raise _errors().ToolRefusal(
@@ -1232,6 +1251,37 @@ class Store(DocumentStoreBase):
             with_first = {oid for oid, _ in found}
         return sorted((oid, n) for oid, n in counts if oid not in with_first), capped
 
+    _orphan_lists_lock = threading.Lock()
+
+    def _orphanLists(self) -> 'OrderedDict[str, Tuple[float, Any, List[Tuple[str, int]], bool]]':
+        lists = self.__dict__.get('_orphan_lists')
+        if lists is None:
+            lists = self.__dict__['_orphan_lists'] = OrderedDict()
+        return lists
+
+    def _recallOrphans(self, token: Optional[str], scope: Any) -> Optional[Tuple[List[Tuple[str, int]], bool]]:
+        """The list a listing remembered under ``token`` for ``scope``, unless unknown or expired."""
+        if not token:
+            return None
+        with self._orphan_lists_lock:
+            entry = self._orphanLists().get(token)
+        if entry is None:
+            return None
+        stored_at, stored_scope, orphans, capped = entry
+        if stored_scope != scope or time.monotonic() - stored_at > self.ORPHAN_LIST_TTL_S:
+            return None
+        return orphans, capped
+
+    def _rememberOrphans(self, scope: Any, orphans: List[Tuple[str, int]], capped: bool) -> str:
+        """Remember a listing's documents without chunk 0 for its later pages; the token goes in the cursor."""
+        token = secrets.token_hex(8)
+        with self._orphan_lists_lock:
+            lists = self._orphanLists()
+            lists[token] = (time.monotonic(), scope, orphans, capped)
+            while len(lists) > max(1, int(self.ORPHAN_LISTS_MAX)):
+                lists.popitem(last=False)
+        return token
+
     def listDocuments(self, *, cursor, limit, object_ids, deleted, sort):
         """
         One page of documents: chunk-0 rows in storage order, then documents without chunk 0.
@@ -1241,8 +1291,11 @@ class Store(DocumentStoreBase):
         ``document_count_capped``) and later pages carry that total in the
         cursor. Chunk and table counts come from facets over the page's
         objectIds. Documents without a first chunk are every document minus
-        those with a chunk-0 row. Rows are not sorted by path (``sorted=False``);
-        each objectId is listed once.
+        those with a chunk-0 row: that list is built on the page where the
+        chunk-0 rows run out and reused by the listing's later pages for
+        ``ORPHAN_LIST_TTL_S`` (a page whose list has expired, or that reaches
+        another instance, rebuilds it). Rows are not sorted by path
+        (``sorted=False``); each objectId is listed once.
         """
         vx = _vx()
         limit = max(1, int(limit))
@@ -1316,7 +1369,14 @@ class Store(DocumentStoreBase):
             state = {'ph': 'o', 'i': 0}
 
         # The chunk-0 rows are exhausted: fill the page with documents that have no chunk 0.
-        orphans, swept_capped = self._orphans(deleted, ids, every())
+        scope = (deleted, None if ids is None else tuple(sorted(ids)))
+        token = state.get('k')
+        remembered = self._recallOrphans(token, scope)
+        if remembered is None:
+            orphans, swept_capped = self._orphans(deleted, ids, every())
+            token = None
+        else:
+            orphans, swept_capped = remembered
         capped = capped or swept_capped
         start = state['i']
         room = max(0, limit - len(items))
@@ -1324,7 +1384,11 @@ class Store(DocumentStoreBase):
             record = self._firstRow(oid, deleted)
             if record is not None:
                 items.append(self._documentRow(record, rows, None, False))
-        return page(items, {'ph': 'o', 'i': start + room} if start + room < len(orphans) else None)
+        if start + room >= len(orphans):
+            return page(items, None)
+        if token is None:
+            token = self._rememberOrphans(scope, orphans, swept_capped)
+        return page(items, {'ph': 'o', 'i': start + room, 'k': token})
 
     def scrollChunks(self, objectId: str, *, after_chunk: int, limit: int, deleted: str):
         """The chunks of one document after ``after_chunk``, in chunk order, without vectors."""

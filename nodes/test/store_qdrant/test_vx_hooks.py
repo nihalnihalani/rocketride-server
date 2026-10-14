@@ -321,6 +321,69 @@ def test_list_documents_computes_the_total_once_per_listing(monkeypatch):
     assert limits and max(limits) <= 3  # later pages facet over their own objectIds only
 
 
+def _orphan_corpus(store, orphans=6):
+    _corpus(store, docs=2, chunks=2)
+    # Documents whose chunk 0 was never written, each with two rows.
+    store.addChunks(
+        [make_doc(f'orphan-{i}', c, _unit([0.5, i + 1, c, 0, 0, 0])) for i in range(orphans) for c in (1, 2)]
+    )
+
+
+def _pages_with_facets(store, monkeypatch, limit=2, cursor=None):
+    """Every page of a listing from ``cursor``, each with the limits of the facets it asked for."""
+    calls = []
+    facet = store.client.facet
+
+    def spy(*args, **kwargs):
+        calls.append(kwargs.get('limit'))
+        return facet(*args, **kwargs)
+
+    monkeypatch.setattr(store.client, 'facet', spy)
+    pages = []
+    for _ in range(50):
+        calls.clear()
+        page = store.listDocuments(cursor=cursor, limit=limit, object_ids=None, deleted='active', sort='path')
+        pages.append((page, list(calls)))
+        cursor = page.next_cursor
+        if cursor is None:
+            return pages
+    raise AssertionError('listDocuments never ended')
+
+
+def test_list_documents_builds_the_orphan_list_once_per_listing(monkeypatch):
+    store = make_store(drv)
+    _orphan_corpus(store)
+    pages = _pages_with_facets(store, monkeypatch)
+
+    items = [i for page, _ in pages for i in page.items]
+    assert sorted(i.objectId for i in items if not i.has_first_chunk) == [f'orphan-{i}' for i in range(6)]
+    assert all(i.chunks == 2 for i in items if not i.has_first_chunk)
+    orphan_pages = [(page, facets) for page, facets in pages if page.items and not page.items[0].has_first_chunk]
+    assert len(orphan_pages) == 3
+    # The page where the chunk-0 rows run out builds the list; later pages reuse it.
+    for page, facets in orphan_pages:
+        assert facets == [], facets
+    assert {page.total for page, _ in pages} == {8}
+
+
+def test_list_documents_rebuilds_the_orphan_list_for_a_cursor_it_does_not_remember(monkeypatch):
+    # Another instance (or an expired list) answers the same page from a fresh sweep.
+    store = make_store(drv)
+    _orphan_corpus(store)
+    first = store.listDocuments(cursor=None, limit=2, object_ids=None, deleted='active', sort='path')
+    second = store.listDocuments(cursor=first.next_cursor, limit=2, object_ids=None, deleted='active', sort='path')
+    expected = store.listDocuments(cursor=second.next_cursor, limit=2, object_ids=None, deleted='active', sort='path')
+
+    other = make_store(drv)
+    page = other.listDocuments(cursor=second.next_cursor, limit=2, object_ids=None, deleted='active', sort='path')
+    assert [i.objectId for i in page.items] == [i.objectId for i in expected.items]
+    assert page.total == expected.total == 8
+
+    monkeypatch.setattr(drv.Store, 'ORPHAN_LIST_TTL_S', -1)  # every remembered list has expired
+    page = store.listDocuments(cursor=second.next_cursor, limit=2, object_ids=None, deleted='active', sort='path')
+    assert [i.objectId for i in page.items] == [i.objectId for i in expected.items]
+
+
 def test_documents_are_counted_without_an_object_id_index():
     # A collection created outside this driver may lack the keyword index Qdrant needs to facet.
     store = make_store(drv)
@@ -352,6 +415,8 @@ def _cursor(state):
         _cursor({'ph': 'c', 'p': '{12345678-1234-1234-1234-123456789abc}'}),
         _cursor({'ph': 'c', 'p': 5, 't': 'many'}),
         _cursor({'ph': 'o', 'i': 0, 'x': 'yes'}),
+        _cursor({'ph': 'o', 'i': 0, 'k': 7}),
+        _cursor({'ph': 'o', 'i': 0, 'k': 'not hex at all!'}),
     ],
 )
 def test_list_documents_refuses_a_cursor_it_did_not_issue(cursor):
