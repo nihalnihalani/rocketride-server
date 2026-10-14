@@ -70,8 +70,11 @@ METRICS = {'COSINE': 'cosine', 'L2': 'l2', 'IP': 'ip'}
 VECTOR_BATCH_ROWS = 4096
 
 
-#: Exception types the driver and the store base raise with their own text (never a client message)
-_OWN_ERRORS = (Exception, RuntimeError, ValueError)
+# Network libraries under the clients (their errors can name the server too)
+_TRANSPORTS = ('grpc', 'httpx', 'httpcore', 'h11', 'h2', 'urllib3', 'requests', 'aiohttp', 'ssl', 'socket', 'dns')
+
+#: Libraries whose errors can carry the server address: the client and the transports under it
+_CLIENT_MODULES = frozenset(('pymilvus',) + _TRANSPORTS)
 
 
 def _error_code(error: BaseException) -> Optional[str]:
@@ -90,6 +93,30 @@ def _error_code(error: BaseException) -> Optional[str]:
     return None
 
 
+def _module_root(name: Any) -> str:
+    """The top-level package of a module name ('grpc' for 'grpc._channel')."""
+    return str(name or '').split('.', 1)[0]
+
+
+def _from_client(error: BaseException) -> bool:
+    """
+    Whether ``error`` came out of the client library or the network under it.
+
+    It does when its type is defined there, when it is a network failure (an OSError: refused
+    connections, timeouts, DNS and TLS errors) or when a frame of those libraries raised it (a
+    plain ValueError raised inside the client still carries the client's text). An error the
+    driver's own code raises (a KeyError on an odd row, say) does not.
+    """
+    if isinstance(error, OSError) or _module_root(type(error).__module__) in _CLIENT_MODULES:
+        return True
+    trace = error.__traceback__
+    while trace is not None:
+        if _module_root(trace.tb_frame.f_globals.get('__name__')) in _CLIENT_MODULES:
+            return True
+        trace = trace.tb_next
+    return False
+
+
 def _client_failure(error: BaseException) -> Optional[BaseException]:
     """The client-library exception in ``error``'s chain, or None when the driver raised it itself."""
     seen = set()
@@ -98,7 +125,7 @@ def _client_failure(error: BaseException) -> Optional[BaseException]:
         seen.add(id(link))
         if isinstance(link, (StoreError, StoreUnsupported, ToolRefusal)):
             return None
-        if type(link) not in _OWN_ERRORS:
+        if _from_client(link):
             return link
         link = link.__cause__ or link.__context__
     return None

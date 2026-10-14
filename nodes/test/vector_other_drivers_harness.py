@@ -215,37 +215,60 @@ def keyed_uuid(object_id: str, chunk_id: int) -> str:
 # -----------------------------------------------------------------------------
 
 
+def client_error(module: str, message: str) -> BaseException:
+    """An error of a client-library type (defined under ``module``) whose message names the server."""
+    error_type = type('FakeClientError', (Exception,), {'code': 2, '__module__': f'{module}.exceptions'})
+    return error_type(message)
+
+
+def raising_in(module: str) -> Callable[[BaseException], None]:
+    """A function that raises its argument from a frame of ``module``, as code inside a client library would."""
+    namespace: Dict[str, Any] = {'__name__': f'{module}.transport'}
+    exec('def throw(error):\n    raise error\n', namespace)
+    return namespace['throw']
+
+
+def _raise(error: BaseException) -> None:
+    raise error
+
+
 class FailingProxy:
     """Stands in for a client object whose server is unreachable: every call raises ``error``.
 
     Attribute chains (``client.collections.exists``) resolve to further proxies, so the
     failure surfaces at the first call. Names in ``allow`` are read from ``real`` instead,
-    which lets an existence check succeed while every data call fails.
+    which lets an existence check succeed while every data call fails. With ``raise_from``
+    the error is raised from a frame of that module (a client library raising a plain
+    ``ValueError``, say), not from this harness.
     """
 
-    def __init__(self, error: BaseException, real: Any = None, allow: Sequence[str] = ()) -> None:
-        """Remember the error to raise and what still answers for real."""
+    def __init__(
+        self, error: BaseException, real: Any = None, allow: Sequence[str] = (), raise_from: Optional[str] = None
+    ) -> None:
+        """Remember the error to raise, what still answers for real and where the error is raised."""
         self._error = error
         self._real = real
         self._allow = tuple(allow)
+        self._raise_from = raise_from
+        self._throw = raising_in(raise_from) if raise_from else _raise
 
     def __getattr__(self, name: str) -> Any:
         """A real attribute when allowed, else another failing proxy."""
         if name in self._allow:
             return getattr(self._real, name)
-        return FailingProxy(self._error)
+        return FailingProxy(self._error, raise_from=self._raise_from)
 
     def __getitem__(self, key: Any) -> Any:
         """Subscripts (``client['db']``) fail the same way."""
-        return FailingProxy(self._error)
+        return FailingProxy(self._error, raise_from=self._raise_from)
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         """Any call raises the client error."""
-        raise self._error
+        self._throw(self._error)
 
     def __iter__(self) -> Any:
         """Iterating a cursor raises the client error."""
-        raise self._error
+        self._throw(self._error)
 
 
 class CountingProxy:
@@ -302,6 +325,8 @@ class Adapter:
     services: Optional[str] = None
     #: whether the legacy control record kept vectorSize/modelName (Astra/Atlas wrote only declared fields)
     legacy_control_has_model: bool = True
+    #: the client library the driver talks to (its errors may carry the server address)
+    client_module: str = ''
 
     def new_store(self) -> Any:  # pragma: no cover - interface
         raise NotImplementedError
@@ -327,8 +352,13 @@ class Adapter:
         """The configured server address a client error message would name."""
         raise NotImplementedError
 
-    def fail_backend(self, store: Any, error: BaseException, *, after_exists: bool) -> None:  # pragma: no cover
-        """Make every client call raise ``error`` (``after_exists``: the existence check still answers)."""
+    def fail_backend(  # pragma: no cover - interface
+        self, store: Any, error: BaseException, *, after_exists: bool, raise_from: Optional[str] = None
+    ) -> None:
+        """Make every client call raise ``error`` (``after_exists``: the existence check still answers).
+
+        ``raise_from`` names the module whose frame raises it (see :class:`FailingProxy`).
+        """
         raise NotImplementedError
 
     def count_calls(self, store: Any) -> Dict[str, int]:  # pragma: no cover - interface
@@ -438,6 +468,7 @@ class MilvusAdapter(Adapter):
     """Milvus through ``nodes/test/mocks/pymilvus``."""
 
     name = 'milvus'
+    client_module = 'pymilvus'
     backend = 'milvus'
     services = 'store_milvus/services.json'
     floor = 0.2
@@ -474,9 +505,13 @@ class MilvusAdapter(Adapter):
         """host:port of the Milvus server."""
         return f'{store.host}:{store.port}'
 
-    def fail_backend(self, store: Any, error: BaseException, *, after_exists: bool) -> None:
+    def fail_backend(
+        self, store: Any, error: BaseException, *, after_exists: bool, raise_from: Optional[str] = None
+    ) -> None:
         """Every MilvusClient call raises (has_collection still answers when ``after_exists``)."""
-        store.client = FailingProxy(error, store.client, ('has_collection',) if after_exists else ())
+        store.client = FailingProxy(
+            error, store.client, ('has_collection',) if after_exists else (), raise_from=raise_from
+        )
 
     def count_calls(self, store: Any) -> Dict[str, int]:
         """Count MilvusClient calls."""
@@ -540,6 +575,7 @@ class WeaviateAdapter(Adapter):
     """Weaviate through ``nodes/test/mocks/weaviate``."""
 
     name = 'weaviate'
+    client_module = 'weaviate'
     backend = 'weaviate'
     services = 'store_weaviate/services.json'
     floor = 0.2
@@ -576,15 +612,17 @@ class WeaviateAdapter(Adapter):
         """host:port of the Weaviate server."""
         return f'{store.host}:{store.port}'
 
-    def fail_backend(self, store: Any, error: BaseException, *, after_exists: bool) -> None:
+    def fail_backend(
+        self, store: Any, error: BaseException, *, after_exists: bool, raise_from: Optional[str] = None
+    ) -> None:
         """Every client and collection call raises (collections.exists still answers when ``after_exists``)."""
         if after_exists:
             store._doesCollectionExist()
-            store.collectionObj = FailingProxy(error)
+            store.collectionObj = FailingProxy(error, raise_from=raise_from)
             return
         # close() still reaches the mock so the store's destructor stays quiet
-        store.client = FailingProxy(error, store.client, ('close',))
-        store.collectionObj = FailingProxy(error)
+        store.client = FailingProxy(error, store.client, ('close',), raise_from=raise_from)
+        store.collectionObj = FailingProxy(error, raise_from=raise_from)
 
     def count_calls(self, store: Any) -> Dict[str, int]:
         """Count client and collection calls."""
@@ -656,6 +694,7 @@ class PineconeAdapter(Adapter):
     """Pinecone (serverless) through ``nodes/test/mocks/pinecone``."""
 
     name = 'pinecone'
+    client_module = 'pinecone'
     backend = 'pinecone'
     services = 'store_pinecone/services.json'
     floor = 0.0
@@ -694,9 +733,11 @@ class PineconeAdapter(Adapter):
         """The index host the control plane reports (the data-plane address)."""
         return f'{store.collection}-mock.svc.example.invalid'
 
-    def fail_backend(self, store: Any, error: BaseException, *, after_exists: bool) -> None:
+    def fail_backend(
+        self, store: Any, error: BaseException, *, after_exists: bool, raise_from: Optional[str] = None
+    ) -> None:
         """Every client call raises (has_index still answers when ``after_exists``)."""
-        store.client = FailingProxy(error, store.client, ('has_index',) if after_exists else ())
+        store.client = FailingProxy(error, store.client, ('has_index',) if after_exists else (), raise_from=raise_from)
 
     def count_calls(self, store: Any) -> Dict[str, int]:
         """Count control-plane calls and calls on the index objects the client hands out."""
@@ -814,6 +855,7 @@ class AstraAdapter(Adapter):
     """Astra DB through ``nodes/test/mocks/astrapy``."""
 
     name = 'astra_db'
+    client_module = 'astrapy'
     backend = 'astra'
     services = 'store_astra/services.json'
     floor = 0.2
@@ -852,9 +894,13 @@ class AstraAdapter(Adapter):
         """The Data API endpoint."""
         return store.api_endpoint
 
-    def fail_backend(self, store: Any, error: BaseException, *, after_exists: bool) -> None:
+    def fail_backend(
+        self, store: Any, error: BaseException, *, after_exists: bool, raise_from: Optional[str] = None
+    ) -> None:
         """Every database call raises (list_collection_names still answers when ``after_exists``)."""
-        store.database = FailingProxy(error, store.database, ('list_collection_names',) if after_exists else ())
+        store.database = FailingProxy(
+            error, store.database, ('list_collection_names',) if after_exists else (), raise_from=raise_from
+        )
 
     def count_calls(self, store: Any) -> Dict[str, int]:
         """Count database calls and calls on the collections it hands out."""
@@ -932,6 +978,7 @@ class AtlasAdapter(Adapter):
     """MongoDB Atlas through ``store_atlas/fake_pymongo.py`` (the driver imports the real pymongo)."""
 
     name = 'atlas'
+    client_module = 'pymongo'
     backend = 'atlas'
     services = None
     floor = 0.2
@@ -994,10 +1041,14 @@ class AtlasAdapter(Adapter):
         """The cluster address from the connection string."""
         return store.host.split('://', 1)[-1]
 
-    def fail_backend(self, store: Any, error: BaseException, *, after_exists: bool) -> None:
+    def fail_backend(
+        self, store: Any, error: BaseException, *, after_exists: bool, raise_from: Optional[str] = None
+    ) -> None:
         """Every database and collection call raises (list_collection_names answers when ``after_exists``)."""
-        store.database = FailingProxy(error, store.database, ('list_collection_names',) if after_exists else ())
-        store.collection = FailingProxy(error)
+        store.database = FailingProxy(
+            error, store.database, ('list_collection_names',) if after_exists else (), raise_from=raise_from
+        )
+        store.collection = FailingProxy(error, raise_from=raise_from)
 
     def count_calls(self, store: Any) -> Dict[str, int]:
         """Count database and collection calls."""

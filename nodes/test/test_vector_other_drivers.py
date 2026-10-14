@@ -514,12 +514,6 @@ def test_services_json_cases_replay_on_the_mock(adapter, store):
 # -----------------------------------------------------------------------------
 
 
-class FakeClientError(Exception):
-    """A client library error: like pymongo's or pymilvus', its message names the server."""
-
-    code = 2
-
-
 #: Every store call a tool or the data lane can reach: the explorer hooks, the methods behind the
 #: legacy tools (``upsert`` writes through addChunks) and the data lane's writes, marks and render.
 TOOL_CALLS = {
@@ -578,14 +572,27 @@ def _chain(error):
     return links
 
 
+#: How a backend failure reaches the driver: (error built from the message, module raising it, what the
+#: host-free answer still names). A client's own error type; a network failure under the client (an
+#: OSError); and a plain ValueError raised inside the client library, which carries the client's text.
+FAILURES = {
+    'client-error': (lambda adapter, message: h.client_error(adapter.client_module, message), False, 'FakeClientError'),
+    'network': (lambda adapter, message: ConnectionRefusedError(message), False, 'ConnectionRefusedError'),
+    'raised-in-client': (lambda adapter, message: ValueError(message), True, 'ValueError'),
+}
+
+
+@pytest.mark.parametrize('failure', sorted(FAILURES))
 @pytest.mark.parametrize('after_exists', [False, True], ids=['unreachable', 'reads-fail'])
 @pytest.mark.parametrize('call', sorted(TOOL_CALLS))
-def test_backend_failures_do_not_name_the_server(adapter, store, call, after_exists):
+def test_backend_failures_do_not_name_the_server(adapter, store, call, after_exists, failure):
     """A client error that names the server surfaces as a host-free error (the tool's STORE_ERROR text)."""
     h.ingest(store, 'doc-a', '/docs/a.md', [0, 1])
     address = adapter.server_address(store)
-    injected = FakeClientError(f'Fail connecting to server on {address}: Connection refused')
-    adapter.fail_backend(store, injected, after_exists=after_exists)
+    build, in_client, error_name = FAILURES[failure]
+    injected = build(adapter, f'Fail connecting to server on {address}: Connection refused')
+    raise_from = adapter.client_module if in_client else None
+    adapter.fail_backend(store, injected, after_exists=after_exists, raise_from=raise_from)
     expected = ANSWERS_WITHOUT_BACKEND.get((adapter.name, call))
     if expected == 'refuses':
         with pytest.raises(StoreUnsupported):
@@ -606,9 +613,30 @@ def test_backend_failures_do_not_name_the_server(adapter, store, call, after_exi
         TOOL_CALLS[call](store)
     answer = f'{type(raised.value).__name__}: {raised.value}'  # what the tool wrapper puts in STORE_ERROR
     assert address not in answer, answer
-    assert 'FakeClientError' in answer, answer
-    assert '(code 2)' in answer, answer
+    assert error_name in answer, answer
+    if failure == 'client-error':
+        assert '(code 2)' in answer, answer
     assert any(link is injected for link in _chain(raised.value)), f'{call} never reached the backend: {answer}'
+
+
+@pytest.mark.parametrize(
+    'call',
+    [
+        'getVectors',
+        'scrollChunks',
+        'sampleChunks',
+    ],
+)
+def test_driver_bugs_keep_their_own_error(adapter, store, call, monkeypatch):
+    """A bug in the driver's own code is not reported as a backend failure: its error and text pass through."""
+    h.ingest(store, 'doc-a', '/docs/a.md', [0, 1])
+
+    def broken(*args, **kwargs):
+        raise KeyError('objectId missing from a stored row')
+
+    monkeypatch.setattr(store, '_toDoc', broken)
+    with pytest.raises(KeyError, match='objectId missing from a stored row'):
+        TOOL_CALLS[call](store)
 
 
 @pytest.mark.skip(reason='NEEDS:L1 merged — integration gate G2 (dialect/stats live in vx_tools on L1)')
