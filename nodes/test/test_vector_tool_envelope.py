@@ -371,9 +371,12 @@ def _lib(module: str, name: str) -> Any:
     import importlib
 
     try:
-        return getattr(importlib.import_module(module), name)
+        value = getattr(importlib.import_module(module), name)
     except (ImportError, AttributeError):
+        value = None
+    if not isinstance(value, type):  # absent, a mock package, or a MagicMock left in sys.modules
         pytest.skip(f'NOT RUN: {module}.{name} is not importable here (library absent or mocked)')
+    return value
 
 
 def _httpx_connect(message: str) -> BaseException:
