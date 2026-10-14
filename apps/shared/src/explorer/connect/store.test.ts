@@ -30,9 +30,9 @@ import { createEndpointStore } from './store';
 import type { EndpointWatch, IEndpointStore, IWatchHandlers } from './store';
 import { CONFIG_SENTINEL, codedError, fakeWorld, manualClock, projectRows, ragComponents, row } from './testing';
 import type { IFakeRow, IFakeWorld, IManualClock, IToolCall } from './testing';
-import { READ_ONLY_DETAIL } from './discovery';
+import { READ_ONLY_DETAIL, controlledByTools } from './discovery';
 import { SINGLE_TOOLS_ROLE, VECTOR_ROLES } from '../types';
-import type { IExplorerComponent, IExplorerIdentity, IRoleSpec, ISendFile } from '../types';
+import type { IExplorerIdentity, IRoleSpec, ISendFile } from '../types';
 import { createGeneration } from '../generation';
 import { identityFingerprint, identityFromConnectResult } from './identity';
 import { ExplorerToolError } from '../errors';
@@ -984,9 +984,6 @@ describe('factory isolation — SQL, Graph and a mocked Vector store side by sid
 
 describe('multi-role connections — role tokens, read-only anchors and role channels', () => {
 	const VX_INFO = { dialect: 'qdrant', capabilities: { remove: true }, limits: { statement_timeout_ms: 30000 } };
-	/** The app's filter: with a Tools source, only nodes it controls; without one, every store. */
-	const controlledByTools = (component: IExplorerComponent, group: { toolsSource: string | null }) =>
-		group.toolsSource === null || (component.control ?? []).some((edge) => edge.from === group.toolsSource);
 	const FILE = (name: string): ISendFile => ({ file: { name, size: 3 } as unknown as File, objinfo: { name } });
 
 	/**
@@ -1248,21 +1245,41 @@ describe('multi-role connections — role tokens, read-only anchors and role cha
 		assert.equal(store.getState().endpoints[0]!.stateDetail, READ_ONLY_DETAIL);
 	});
 
+	/** A stock RAG pipeline (no Tools component) with a second store its chat source does not reach. */
+	const ragWithArchive = () => ragComponents().concat([{ id: 'store_9', provider: 'qdrant', name: 'Archive' }]);
+	/** The engine's answer for a node outside the calling source's pipeline. */
+	const unreachableArchive: IFakeWorld['behave'] = (call) => {
+		if (call.nodeId === 'store_9') throw new Error('Node "store_9" not found in pipeline');
+		return VX_INFO;
+	};
+
 	it('classifies a read-only card whose node the anchor source cannot reach as stopped, naming the role', async () => {
-		const rows = projectRows(['ingest_1']);
-		const { store, world } = makeVx(rows, (call) => {
-			if (call.nodeId === 'store_2') throw new Error("Component 'store_2' not found in pipeline");
-			return VX_INFO;
-		});
+		const rows = projectRows(['webhook_1', 'chat_1'], ragWithArchive());
+		const { store, world } = makeVx(rows, unreachableArchive);
 		await store.refresh(world.client);
 		const byNode = Object.fromEntries(store.getState().endpoints.map((e) => [e.nodeId, e]));
 		assert.equal(byNode.store_1!.state, 'ready');
-		assert.equal(byNode.store_2!.state, 'stopped');
-		assert.equal(byNode.store_2!.stateDetail, 'Not reachable from the ingest source');
+		assert.equal(byNode.store_9!.state, 'stopped');
+		assert.equal(byNode.store_9!.stateDetail, 'Not reachable from the chat source');
 		// The same answer on a callable (tools-anchored) card stays `unreachable`.
 		const tools = makeVx(projectRows(['tools_1']), () => { throw new Error("Component 'store_1' not found in pipeline"); });
 		await tools.store.refresh(tools.world.client);
 		assert.equal(tools.store.getState().endpoints[0]!.state, 'unreachable');
+	});
+
+	it('lists only store_1 while the Tools source is stopped: read-only on the chat token, under the callable card\'s key', async () => {
+		const rows = projectRows(['ingest_1', 'chat_1', 'tools_1']);
+		const { store, world } = makeVx(rows);
+		await store.refresh(world.client);
+		const callable = store.getState().endpoints[0]!;
+		world.rows.splice(world.rows.findIndex((r) => r.source === 'tools_1'), 1);
+		await store.refresh(world.client);
+		const { endpoints } = store.getState();
+		assert.deepEqual(endpoints.map((e) => e.nodeId), ['store_1']);
+		assert.equal(endpoints[0]!.key, callable.key);
+		assert.equal(endpoints[0]!.readOnly, true);
+		assert.equal(endpoints[0]!.anchorRole, 'chat');
+		assert.equal(store.channel(world.client, endpoints[0]!, 'tools').bound, false);
 	});
 
 	it('gives single-role (SQL, Graph) stores a tools channel too, on the endpoint\'s token', async () => {

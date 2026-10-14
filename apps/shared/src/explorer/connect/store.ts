@@ -100,9 +100,9 @@
 import { ExplorerToolError, readErrorCode, readErrorMessage } from '../errors';
 import { checkObject, isPlainObject } from '../checks';
 import type { IGenerationTicket } from '../generation';
-import type { IExplorerClient, IExplorerComponent, IExplorerEndpoint, IExplorerIdentity, IProbeResult, IRoleSpec, ISendFile } from '../types';
+import type { IExplorerClient, IExplorerEndpoint, IExplorerIdentity, IProbeResult, IRoleSpec, ISendFile } from '../types';
 import { READ_ONLY_DETAIL, discoverToolEndpoints, mapWithConcurrency } from './discovery';
-import type { IDiscoveredEndpoint } from './discovery';
+import type { IDiscoveredEndpoint, NodeFilter } from './discovery';
 import { identityFingerprint } from './identity';
 import { DEFAULT_TOOL_TIMEOUTS, createToolSession } from './session';
 import type { IInvokeOptions, IToolSession, IToolSessionOptions } from './session';
@@ -184,7 +184,7 @@ export interface IEndpointStoreOptions {
 	 * Which matching components of a group become endpoints (default: all);
 	 * passed to discovery (see `IDiscoveryOptions.nodeFilter`).
 	 */
-	nodeFilter?: (component: IExplorerComponent, group: { toolsSource: string | null; anchorRole: string; boundRoles: readonly string[] }) => boolean;
+	nodeFilter?: NodeFilter;
 }
 
 /**
@@ -419,7 +419,7 @@ export function createEndpointStore(options: IEndpointStoreOptions): IEndpointSt
 		if (result.ok) return endpoint.readOnly === true ? { state: 'ready', detail: READ_ONLY_DETAIL } : { state: 'ready' };
 		const error = result.error;
 		if (endpoint.readOnly === true && error !== undefined && /not found in pipeline/i.test(error.message)) {
-			// The anchor source cannot reach this node (a read-only card lists every store).
+			// The anchor source cannot reach this node (a read-only card can list a store it does not feed).
 			return { state: 'stopped', detail: `Not reachable from the ${endpoint.anchorRole ?? 'anchor'} source` };
 		}
 		if (error !== undefined && error.code !== undefined && NOT_RUNNING_CODES.has(error.code)) {
