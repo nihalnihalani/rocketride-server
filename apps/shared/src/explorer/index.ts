@@ -89,8 +89,8 @@ export { createActiveKeyStore, createRequestChannel } from './nav/stores';
 export type { IDocSchemes } from './nav/addresses';
 export { createCounter, endpointKeyFromAnyUri, endpointKeyFromUri } from './nav/addresses';
 
-export type { IDiscoveredEndpoint, IDiscoveryOptions } from './connect/discovery';
-export { READ_ONLY_DETAIL, discoverToolEndpoints, isMultiRoleEndpoint, mapWithConcurrency, readTaskRow } from './connect/discovery';
+export type { IDiscoveredEndpoint, IDiscoveryOptions, INodeFilterGroup, NodeFilter } from './connect/discovery';
+export { READ_ONLY_DETAIL, controlledByTools, discoverToolEndpoints, isMultiRoleEndpoint, mapWithConcurrency, readTaskRow } from './connect/discovery';
 export { TOOL_CALL_PERMISSION, identityCanCallTools, identityFingerprint, identityFromConnectResult } from './connect/identity';
 export type { IInvokeOptions, ISessionDeps, IToolSession, IToolSessionOptions, IToolSpec } from './connect/session';
 export {
@@ -103,7 +103,7 @@ export {
 	createToolSession,
 } from './connect/session';
 export type { EndpointStatus, EndpointWatch, IEndpointState, IEndpointStore, IEndpointStoreOptions, IRoleChannel, IStoreClock, IWatchHandlers } from './connect/store';
-export { createEndpointStore, probeInfo } from './connect/store';
+export { DEFAULT_ASK_TIMEOUT_MS, createEndpointStore, probeInfo } from './connect/store';
 
 export type { IConnectionFlags, IConnectionFlagsOptions } from './history/flags';
 export { createConnectionFlags } from './history/flags';
