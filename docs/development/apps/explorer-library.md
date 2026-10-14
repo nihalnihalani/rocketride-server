@@ -100,11 +100,24 @@ endpoint to `IMultiRoleEndpoint`, where the three are required.
 
 **`nodeFilter`** (an option of `createEndpointStore` and of discovery) decides
 which components of the app's providers become endpoints. It receives the
-component as the endpoint will carry it and `{ toolsSource, anchorRole,
-boundRoles }`. Vector keeps, when a tools source runs, only the nodes it
-controls (`component.control` has an edge from `toolsSource`), so the chat
-path's second instance of the same store never becomes a card; on a read-only
-connection (`toolsSource` null) it keeps every store.
+component as the endpoint will carry it and a frozen `INodeFilterGroup`:
+
+| Field | Value |
+|---|---|
+| `toolsSource` | the running source that fills the tools role, or `null` |
+| `toolsSources` | every component of the pipeline that could fill the tools role (a declared source id or a tools provider), running or not; empty when the pipeline has no Tools source at all |
+| `anchorRole` | the role whose token carries the connection's calls |
+| `boundRoles` | the running roles, in spec order |
+
+Vector passes `controlledByTools`, exported beside it:
+
+- a Tools source runs: only the nodes it controls (`component.control` has an
+  edge from `toolsSource`), so the chat path's second instance of the same
+  store never becomes a card;
+- the pipeline has a Tools source that is not running (read-only): the nodes
+  any of `toolsSources` controls. That is the card the callable connection
+  shows, under the same key, and the chat path's store still never appears;
+- the pipeline has no Tools source (the stock RAG shape): every store.
 
 ## Endpoint keys
 
@@ -144,14 +157,15 @@ show as one card.
 |---|---|
 | `probing` | discovered; the one `dialect` probe is pending |
 | `ready` | the probe answered |
-| `stopped` | its task is not running (kept in the list after it disappears), or a required role is missing, or (read-only endpoints only) its anchor source answered "not found in pipeline": "Not reachable from the `<role>` source" |
+| `stopped` | its task is not running (kept in the list after it disappears), or a required role is missing, or (read-only endpoints only) its anchor source answered "not found in pipeline": "Not reachable from the `<role>` source". The engine raises that answer with no code (`packages/ai/src/ai/modules/data/data_conn.py`), so its text is the only signal; if the wording changes, these cards show `unreachable` instead |
 | `unreachable` | running, but the probe failed (not wired to a tools source, node error, timeout) |
 | `inaccessible` | the probe failed and the identity's team permissions lack `task.data` for that run's team (a hint, never a gate) |
 
 The probe runs once per endpoint, with bounded concurrency (default 4), and one
 failure never affects another. A `ready` endpoint is not probed again unless a
 refresh asks for it, its token changes, or it disappears and returns. An
-`unreachable` or `inaccessible` endpoint is probed again only on an explicit
+`unreachable` or `inaccessible` endpoint, and a read-only endpoint that is
+"Not reachable from the `<role>` source", is probed again only on an explicit
 `store.refresh()`, a restart or reconnect, `store.probe()` (Test connection) or
 a changed token, never on a focus or an ordinary task event: a probe is a tool
 call, and a tool call that reaches the task counts as activity for its idle
@@ -265,12 +279,15 @@ applies. An empty or non-string `nodeId` is refused as `malformed`.
 `store.channel(client, endpoint, role)` returns an `IRoleChannel` on one role
 of a multi-role connection, called on **that role's own token**, read from the
 role vault at call time (a channel made before its source started works once
-it runs). `bound` says whether the store holds a token for the role.
+it runs). `bound` says whether the store holds a token for the role. The store
+hands out the same channel for the same endpoint key, role and client until
+`reset()`, so a card may keep its channels (and use them as React
+dependencies).
 
 | Method | Calls | Notes |
 |---|---|---|
-| `sendFiles(files, { maxConcurrent? })` | `client.sendFiles` | resolves with one plain record per file, in order: a copy of the SDK's upload result, or `{ action: 'error', filepath, error }` when none came back |
-| `ask(question, { onSSE?, timeoutMs?, generation? })` | `client.chat` | `timeoutMs` bounds the wait (`timeout`), an expired `generation` drops the answer (`stale`), a non-object answer is `malformed` |
+| `sendFiles(files, { maxConcurrent? })` | `client.sendFiles` | resolves with one plain record per file, in order: a copy of the SDK's upload result, or `{ action: 'error', filepath, error }` when none came back. No client timeout, by design: a large upload legitimately takes long, and the SDK reports its progress through its own events |
+| `ask(question, { onSSE?, timeoutMs?, generation? })` | `client.chat` | `timeoutMs` bounds the wait (`timeout`; default `DEFAULT_ASK_TIMEOUT_MS`, 120 s; `null` waits without a bound), an expired `generation` drops the answer (`stale`), a non-object answer is `malformed`. Stream events reach `onSSE` only while the question is pending and its generation is current; those of a question that timed out, was replaced or already settled are dropped |
 | `invoke(tool, input, { nodeId, ... })` | `client.tool` | `nodeId` is required; the same checks and budgets as a session |
 
 **Nothing on a channel is retried**, not even an idempotent tool on

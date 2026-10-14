@@ -86,6 +86,50 @@ export const READ_ONLY_DETAIL = 'Read-only: no Tools source is running';
 // TYPES
 // =============================================================================
 
+/**
+ * What a node filter is told about the connection a component belongs to.
+ * Frozen: one description serves every component of the group.
+ */
+export interface INodeFilterGroup {
+	/** The running source that fills the tools role, or null when none runs. */
+	readonly toolsSource: string | null;
+	/**
+	 * Every component of the pipeline that could fill the tools role (a declared
+	 * tools source id, or a source of a tools provider), running or not, in
+	 * pipeline order. Empty when the pipeline has no Tools source at all.
+	 */
+	readonly toolsSources: readonly string[];
+	/** The role whose token carries the connection's calls. */
+	readonly anchorRole: string;
+	/** The running roles, in spec order. */
+	readonly boundRoles: readonly string[];
+}
+
+/** Decides whether one matching component of a connection becomes an endpoint. */
+export type NodeFilter = (component: IExplorerComponent, group: INodeFilterGroup) => boolean;
+
+/**
+ * The node filter Vector Explorer uses: the nodes a Tools source controls.
+ *
+ * - A Tools source runs: only the nodes it controls (`component.control` has
+ *   an edge from it), so the chat path's second store never becomes a card.
+ * - The pipeline has a Tools source that is not running (read-only): the
+ *   nodes any of its Tools components controls. The card is the one the
+ *   callable connection shows, under the same key; the chat path's store
+ *   still never appears.
+ * - The pipeline has no Tools source at all (stock RAG): every node.
+ *
+ * @param component - The component, as the endpoint will carry it.
+ * @param group - The connection it belongs to.
+ * @returns True when the component becomes an endpoint.
+ */
+export function controlledByTools(component: IExplorerComponent, group: INodeFilterGroup): boolean {
+	const edges = component.control ?? [];
+	if (group.toolsSource !== null) return edges.some((edge) => edge.from === group.toolsSource);
+	if (group.toolsSources.length === 0) return true;
+	return edges.some((edge) => edge.from !== undefined && group.toolsSources.includes(edge.from));
+}
+
 /** What discovery needs to know. */
 export interface IDiscoveryOptions {
 	/** Component provider ids that are tool nodes for this app. */
@@ -99,12 +143,11 @@ export interface IDiscoveryOptions {
 	/**
 	 * Which components of the app's providers become endpoints (default: all).
 	 * Called with the component as the endpoint will carry it (id, provider,
-	 * name, control edges) and a description of its connection: the tools
-	 * role's source (null when no tools source runs), the anchor role and the
-	 * running roles in spec order. Vector keeps, when a Tools source runs, only
-	 * the nodes it controls, so the chat path's second store never becomes a card.
+	 * name, control edges) and a frozen description of its connection (see
+	 * {@link INodeFilterGroup}). Vector passes {@link controlledByTools}, so the
+	 * chat path's second store never becomes a card, running Tools source or not.
 	 */
-	nodeFilter?: (component: IExplorerComponent, group: { toolsSource: string | null; anchorRole: string; boundRoles: readonly string[] }) => boolean;
+	nodeFilter?: NodeFilter;
 }
 
 /** One discovered endpoint, with the secret that belongs in the vault. */
@@ -245,6 +288,30 @@ function fillRank(def: IRoleDef, row: IExplorerTaskRow): number {
 function anchorRoleOf(spec: IRoleSpec, byRole: Map<string, IExplorerTaskRow | null>): string {
 	if (byRole.get(spec.toolsRole)) return spec.toolsRole;
 	return spec.readOnlyAnchors?.find((role) => byRole.get(role)) ?? spec.toolsRole;
+}
+
+/**
+ * The ids of a pipeline's components that could fill the tools role (a
+ * declared source id, or a component of one of the role's providers), running
+ * or not, in pipeline order; plus the running tools source when the role takes
+ * any source (the single-role shape).
+ *
+ * @param spec - The role spec.
+ * @param components - The pipeline's components (raw).
+ * @param toolsRow - The row filling the tools role, or null.
+ * @returns The ids, without duplicates.
+ */
+function toolsSourcesOf(spec: IRoleSpec, components: readonly unknown[], toolsRow: IExplorerTaskRow | null): string[] {
+	const def = spec.roles[spec.toolsRole];
+	const ids: string[] = [];
+	for (const raw of components) {
+		if (!isPlainObject(raw) || typeof raw.id !== 'string' || raw.id === '' || ids.includes(raw.id)) continue;
+		const declared = def !== undefined && def.sources !== null && def.sources.includes(raw.id);
+		const byProvider = def?.providers !== undefined && typeof raw.provider === 'string' && def.providers.includes(raw.provider);
+		if (declared || byProvider) ids.push(raw.id);
+	}
+	if (toolsRow !== null && !ids.includes(toolsRow.source)) ids.push(toolsRow.source);
+	return ids;
 }
 
 /**
@@ -451,7 +518,13 @@ export async function discoverToolEndpoints(client: IExplorerClient, options: ID
 		// Multi-role endpoints carry the pipeline's components (never config);
 		// one copy per group, shared by its endpoints.
 		const safeComponents = multiRole ? components.map(safeComponent).filter((c): c is IExplorerComponent => c !== null) : [];
-		const groupInfo = { toolsSource: toolsRow ? toolsRow.source : null, anchorRole, boundRoles };
+		// Frozen, so a filter cannot change what it is told about the next component.
+		const groupInfo: INodeFilterGroup = Object.freeze({
+			toolsSource: toolsRow ? toolsRow.source : null,
+			toolsSources: Object.freeze(toolsSourcesOf(options.roles, components, toolsRow)),
+			anchorRole,
+			boundRoles: Object.freeze([...boundRoles]),
+		});
 
 		for (const component of components) {
 			if (!component || typeof component.id !== 'string' || typeof component.provider !== 'string' || component.id === '') continue;
