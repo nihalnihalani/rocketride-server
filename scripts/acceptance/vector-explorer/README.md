@@ -143,13 +143,21 @@ chunk 0, every corpus document present by its objectId, no `meta` column on
 pgvector (until a newer driver opens the table and adds it), at least 64 rows
 left for the long manual and a median chunk of 400-1,200 characters.
 
-The chunk checks fail on an engine whose chunker ignores `strlen` (see "What
-these lanes found" below): there the manual becomes about 33 chunks of up to
-4,000 characters. The `vx_legacy_docs` collections in the shared local
-containers were seeded on 2026-10-08 with the chunker passing `chunk_size` to
-its splitter (a local, uncommitted change to `preprocessor_langchain`), which
-is why they hold 159 rows for the manual and a median chunk of 806 characters.
-Re-seed them (`--recreate`) only on an engine with that fix.
+What the collections in your containers hold right now is a fact about the
+containers, not about this file: `seed_legacy.sh --verify-only` (no engine
+needed) prints their `facts` and the `problems` found, and exits 1 when any
+check fails. Read those before relying on the shape.
+
+The calibrated shape needs a chunker that passes `strlen` to its splitter,
+which the chunker node as it stands does not (see "What these lanes found"
+below): there the manual becomes about 36 chunks of up to 4,000 characters.
+Before it creates or drops anything, the seed previews the corpus with the
+chunker node the engine imports (an engine inside a checkout imports the
+checkout's `nodes/src`, not its `dist/server/nodes` copy) and refuses, with
+exit 1 and what it found under `refused`, when the result would not keep more
+than 64 chunks for the manual or a median chunk of 400-1,200 characters. A
+`--recreate` on such an engine therefore leaves the existing collections as
+they are.
 
 ## Live node suites
 
