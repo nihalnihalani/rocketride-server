@@ -31,7 +31,7 @@ from depends import depends
 requirements = os.path.dirname(os.path.realpath(__file__)) + '/requirements.txt'
 depends(requirements)
 
-from typing import List, Callable, Dict, Any, Iterator, Optional, Sequence, Tuple
+from typing import List, Callable, Dict, Any, Iterable, Iterator, Optional, Sequence, Tuple
 from uuid import uuid4
 import sys
 import functools
@@ -110,6 +110,14 @@ def _error_code(error: BaseException) -> Optional[str]:
         if isinstance(value, str) and re.fullmatch(r'[A-Z][A-Z0-9_]{0,63}', value):
             return value
     return None
+
+
+def _one_per_chunk(docs: Iterable[Doc]) -> List[Doc]:
+    """``docs`` in chunk order, one per chunk id (an earlier retried write may have stored a chunk twice)."""
+    by_chunk: Dict[int, Doc] = {}
+    for doc in docs:
+        by_chunk.setdefault(doc.metadata.chunkId, doc)
+    return [by_chunk[chunk] for chunk in sorted(by_chunk)]
 
 
 def _deleted_mode(docFilter: DocFilter, deleted: Optional[str]) -> str:
@@ -556,6 +564,15 @@ class Store(DocumentStoreBase):
         # Delete existing documents with same object IDs
         if objectIds:
             self.collection.delete_many({'meta.objectId': {'$in': list(objectIds)}})
+
+        # A later batch replaces its own chunks: sent again (a retried flush) it must not store them twice
+        later: Dict[str, List[int]] = {}
+        for chunk in chunks:
+            if chunk.metadata.objectId not in objectIds:
+                later.setdefault(chunk.metadata.objectId, []).append(chunk.metadata.chunkId)
+        if later:
+            clauses = [{'meta.objectId': o, 'meta.chunkId': {'$in': sorted(set(c))}} for o, c in later.items()]
+            self.collection.delete_many(clauses[0] if len(clauses) == 1 else {'$or': clauses})
 
         # Prepare documents for insertion
         documents = []
@@ -1043,7 +1060,9 @@ class Store(DocumentStoreBase):
             self.collection.find(filter_conditions, {'embedding': 0}).sort('meta.chunkId', 1).limit(limit + 1)
         )
         has_more = len(documents) > limit
-        docs = [doc for doc in (self._toDoc(document) for document in documents[:limit]) if doc is not None]
+        docs = _one_per_chunk(
+            doc for doc in (self._toDoc(document) for document in documents[:limit]) if doc is not None
+        )
         return ChunkPage(docs=docs, has_more=has_more, next_after=docs[-1].metadata.chunkId if docs else after_chunk)
 
     @_backend_errors('sampleChunks')

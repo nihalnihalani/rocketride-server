@@ -27,7 +27,7 @@ from depends import depends
 requirements = os.path.dirname(os.path.realpath(__file__)) + '/requirements.txt'
 depends(requirements)
 
-from typing import List, Callable, Dict, Any, Iterator, Optional, Sequence, Tuple
+from typing import List, Callable, Dict, Any, Iterable, Iterator, Optional, Sequence, Tuple
 from uuid import uuid4
 import re
 import functools
@@ -99,6 +99,14 @@ def _error_code(error: BaseException) -> Optional[str]:
         if isinstance(value, str) and re.fullmatch(r'[A-Z][A-Z0-9_]{0,63}', value):
             return value
     return None
+
+
+def _one_per_chunk(docs: Iterable[Doc]) -> List[Doc]:
+    """``docs`` in chunk order, one per chunk id (an earlier retried write may have stored a chunk twice)."""
+    by_chunk: Dict[int, Doc] = {}
+    for doc in docs:
+        by_chunk.setdefault(doc.metadata.chunkId, doc)
+    return [by_chunk[chunk] for chunk in sorted(by_chunk)]
 
 
 def _deleted_mode(docFilter: DocFilter, deleted: Optional[str]) -> str:
@@ -665,6 +673,15 @@ class Store(DocumentStoreBase):
                 # Save this object id to be deleted
                 objectIds[chunk.metadata.objectId] = True
 
+        # A later batch replaces its own chunks: sent again (a retried flush) it must not store them twice
+        later: Dict[str, List[int]] = {}
+        for chunk in chunks:
+            if chunk.metadata.objectId not in objectIds:
+                later.setdefault(chunk.metadata.objectId, []).append(chunk.metadata.chunkId)
+        if later:
+            clauses = [{'meta.objectId': o, 'meta.chunkId': {'$in': sorted(set(c))}} for o, c in later.items()]
+            collection.delete_many(clauses[0] if len(clauses) == 1 else {'$or': clauses})
+
         # For each document, prepare the data for insertion
         for chunk in chunks:
             # Get the embedding
@@ -1044,7 +1061,7 @@ class Store(DocumentStoreBase):
                 low = first - 1
                 docs = self._chunkWindow(document, low, low + limit)
                 more = self._chunkAfter(document, low + limit)
-        docs.sort(key=lambda doc: doc.metadata.chunkId)
+        docs = _one_per_chunk(docs)
         if more:
             next_after = low + limit
         else:

@@ -33,7 +33,7 @@ requirements = os.path.dirname(os.path.realpath(__file__)) + '/requirements.txt'
 depends(requirements)
 
 # Load what we need
-from typing import List, Callable, Dict, Any, Iterator, Optional, Sequence, Tuple
+from typing import List, Callable, Dict, Any, Iterable, Iterator, Optional, Sequence, Tuple
 import sys
 import functools
 import json
@@ -98,6 +98,14 @@ def _error_code(error: BaseException) -> Optional[str]:
         if isinstance(value, str) and re.fullmatch(r'[A-Z][A-Z0-9_]{0,63}', value):
             return value
     return None
+
+
+def _one_per_chunk(docs: Iterable[Doc]) -> List[Doc]:
+    """``docs`` in chunk order, one per chunk id (an earlier retried write may have stored a chunk twice)."""
+    by_chunk: Dict[int, Doc] = {}
+    for doc in docs:
+        by_chunk.setdefault(doc.metadata.chunkId, doc)
+    return [by_chunk[chunk] for chunk in sorted(by_chunk)]
 
 
 def _deleted_mode(docFilter: DocFilter, deleted: Optional[str]) -> str:
@@ -1097,7 +1105,7 @@ class Store(DocumentStoreBase):
                 low = first - 1
                 rows = window(low, low + limit)
                 more = beyond(low + limit)
-        docs = sorted((self._toDoc(row, score=0.0) for row in rows), key=lambda doc: doc.metadata.chunkId)
+        docs = _one_per_chunk(self._toDoc(row, score=0.0) for row in rows)
         if more:
             next_after = low + limit
         else:

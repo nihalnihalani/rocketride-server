@@ -33,7 +33,7 @@ requirements = os.path.dirname(os.path.realpath(__file__)) + '/requirements.txt'
 depends(requirements)
 
 # Load what we need
-from typing import List, Callable, Dict, Any, Iterator, Optional, Sequence, Tuple
+from typing import List, Callable, Dict, Any, Iterable, Iterator, Optional, Sequence, Tuple
 import numpy as np
 from pymilvus import MilvusClient, DataType
 
@@ -91,6 +91,14 @@ def _error_code(error: BaseException) -> Optional[str]:
         if isinstance(value, str) and re.fullmatch(r'[A-Z][A-Z0-9_]{0,63}', value):
             return value
     return None
+
+
+def _one_per_chunk(docs: Iterable[Doc]) -> List[Doc]:
+    """``docs`` in chunk order, one per chunk id (an earlier retried write may have stored a chunk twice)."""
+    by_chunk: Dict[int, Doc] = {}
+    for doc in docs:
+        by_chunk.setdefault(doc.metadata.chunkId, doc)
+    return [by_chunk[chunk] for chunk in sorted(by_chunk)]
 
 
 def _deleted_mode(docFilter: DocFilter, deleted: Optional[str]) -> str:
@@ -714,6 +722,20 @@ class Store(DocumentStoreBase):
             except Exception as e:
                 engLib.debug(f'Error deleting old chunks: {e}')
 
+        # A later batch replaces its own chunks: sent again (a retried flush) it must not store them twice
+        later: Dict[str, List[int]] = {}
+        for chunk in chunks:
+            if chunk.metadata.objectId not in objectIds:
+                later.setdefault(chunk.metadata.objectId, []).append(int(chunk.metadata.chunkId))
+        for objectId, chunkIds in later.items():
+            self.client.delete(
+                collection_name=self.collection,
+                filter=(
+                    f"meta['objectId'] == '{_escape_milvus_str(objectId)}' and "
+                    f"meta['chunkId'] in [{_int_list(sorted(set(chunkIds)))}]"
+                ),
+            )
+
         # Collect chunks into batches for bulk upsert instead of one-at-a-time
         batch: List[dict] = []
 
@@ -1219,7 +1241,7 @@ class Store(DocumentStoreBase):
                 low = first - 1
                 rows = window(low, low + limit)
                 more = beyond(low + limit)
-        docs = sorted((self._toDoc(row, with_vector=False) for row in rows), key=lambda doc: doc.metadata.chunkId)
+        docs = _one_per_chunk(self._toDoc(row, with_vector=False) for row in rows)
         if more:
             next_after = low + limit
         else:

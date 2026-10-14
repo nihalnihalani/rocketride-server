@@ -150,6 +150,33 @@ def test_a_new_chunk0_batch_replaces_the_document(adapter, store):
     assert _chunk_ids(adapter.raw_rows(store), 'doc-a') == [0, 1]
 
 
+def test_a_later_batch_sent_twice_keeps_one_row_per_chunk(adapter, store):
+    """A retried later batch replaces its own chunks instead of storing them twice."""
+    h.ingest(store, 'doc-a', '/docs/a.md', [0, 1])
+    h.ingest(store, 'doc-a', '/docs/a.md', [2, 3])
+    h.ingest(store, 'doc-a', '/docs/a.md', [2, 3])
+    assert _chunk_ids(adapter.raw_rows(store), 'doc-a') == [0, 1, 2, 3]
+    if adapter.counts:
+        assert store.countChunks(DocFilter(objectIds=['doc-a'])) == 4
+    listed, _ = h.collect_listing(store, limit=10)
+    assert [row.chunks for row in listed] == [4 if adapter.listing_counts else None]
+
+
+def test_scroll_chunks_shows_a_chunk_stored_twice_once(adapter, store):
+    """Rows an earlier retried write stored twice: each chunk appears once and no page exceeds its limit."""
+    h.ingest(store, 'doc-a', '/docs/a.md', [0, 1, 2, 3, 4])
+    adapter.duplicate_rows(store, 'doc-a')
+    seen, after = [], -1
+    for _ in range(10):
+        page = store.scrollChunks('doc-a', after_chunk=after, limit=2, deleted='active')
+        assert len(page.docs) <= 2, [doc.metadata.chunkId for doc in page.docs]
+        seen.extend(doc.metadata.chunkId for doc in page.docs)
+        after = page.next_after
+        if not page.has_more:
+            break
+    assert seen == [0, 1, 2, 3, 4]
+
+
 # -----------------------------------------------------------------------------
 # Counts
 # -----------------------------------------------------------------------------

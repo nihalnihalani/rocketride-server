@@ -23,6 +23,7 @@ ignore paging offsets. This evidence is mocked: it never changes a driver's
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import importlib
 import importlib.util
@@ -361,6 +362,10 @@ class Adapter:
         """
         raise NotImplementedError
 
+    def duplicate_rows(self, store: Any, object_id: str) -> None:  # pragma: no cover - interface
+        """Store a second copy (another id) of every row of ``object_id``, as a retried write once could."""
+        raise NotImplementedError
+
     def count_calls(self, store: Any) -> Dict[str, int]:  # pragma: no cover - interface
         """Count every backend call the store makes from now on; returns the live counter."""
         raise NotImplementedError
@@ -513,6 +518,12 @@ class MilvusAdapter(Adapter):
             error, store.client, ('has_collection',) if after_exists else (), raise_from=raise_from
         )
 
+    def duplicate_rows(self, store: Any, object_id: str) -> None:
+        """Copies of the document's records under new random ids."""
+        rows = [r for r in self.records(store) if _plain(r.get('meta')).get('objectId') == object_id]
+        for row in rows:
+            self.records(store).append({**copy.deepcopy(row), 'id': random.getrandbits(62)})
+
     def count_calls(self, store: Any) -> Dict[str, int]:
         """Count MilvusClient calls."""
         counter = {'calls': 0}
@@ -623,6 +634,12 @@ class WeaviateAdapter(Adapter):
         # close() still reaches the mock so the store's destructor stays quiet
         store.client = FailingProxy(error, store.client, ('close',), raise_from=raise_from)
         store.collectionObj = FailingProxy(error, raise_from=raise_from)
+
+    def duplicate_rows(self, store: Any, object_id: str) -> None:
+        """Copies of the document's objects under random uuids."""
+        storage = self.storage(store)
+        for obj in [o for o in storage.values() if (o.get('properties') or {}).get('objectId') == object_id]:
+            storage[random_uuid()] = copy.deepcopy(obj)
 
     def count_calls(self, store: Any) -> Dict[str, int]:
         """Count client and collection calls."""
@@ -738,6 +755,12 @@ class PineconeAdapter(Adapter):
     ) -> None:
         """Every client call raises (has_index still answers when ``after_exists``)."""
         store.client = FailingProxy(error, store.client, ('has_index',) if after_exists else (), raise_from=raise_from)
+
+    def duplicate_rows(self, store: Any, object_id: str) -> None:
+        """Copies of the document's vectors under random ids."""
+        storage = self.storage(store)
+        for vector in [v for v in storage.values() if (v.get('metadata') or {}).get('objectId') == object_id]:
+            storage[random_uuid()] = copy.deepcopy(vector)
 
     def count_calls(self, store: Any) -> Dict[str, int]:
         """Count control-plane calls and calls on the index objects the client hands out."""
@@ -902,6 +925,12 @@ class AstraAdapter(Adapter):
             error, store.database, ('list_collection_names',) if after_exists else (), raise_from=raise_from
         )
 
+    def duplicate_rows(self, store: Any, object_id: str) -> None:
+        """Copies of the document's rows under new uuid4 ids."""
+        rows = self.rows(store)
+        for row in [r for r in rows if (r.get('meta') or {}).get('objectId') == object_id]:
+            rows.append({**copy.deepcopy(row), '_id': random_uuid()})
+
     def count_calls(self, store: Any) -> Dict[str, int]:
         """Count database calls and calls on the collections it hands out."""
         counter = {'calls': 0}
@@ -1049,6 +1078,12 @@ class AtlasAdapter(Adapter):
             error, store.database, ('list_collection_names',) if after_exists else (), raise_from=raise_from
         )
         store.collection = FailingProxy(error, raise_from=raise_from)
+
+    def duplicate_rows(self, store: Any, object_id: str) -> None:
+        """Copies of the document's rows under new uuid4 ids."""
+        docs = store.collection.docs
+        for doc in [d for d in docs if (d.get('meta') or {}).get('objectId') == object_id]:
+            docs.append({**copy.deepcopy(doc), '_id': random_uuid()})
 
     def count_calls(self, store: Any) -> Dict[str, int]:
         """Count database and collection calls."""
