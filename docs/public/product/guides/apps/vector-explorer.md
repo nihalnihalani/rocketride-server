@@ -208,7 +208,7 @@ A drop with the same path twice is refused before anything is sent.
 Before sending, the app checks each path against the store. If a document
 added through a Drag & Drop source has that path (see
 [Where document paths come from](#where-document-paths-come-from)), it asks
-"Replace existing '`<name>`' (N chunks)? The old chunks are removed when the
+"Replace existing '`<path>`' (N chunks)? The old chunks are removed when the
 new file is stored." with **Cancel** focused. Each file
 then shows queued, uploading, processing, and "N chunks added". A failed upload
 says "Failed. The engine did not return the reason; the pipeline's run log
