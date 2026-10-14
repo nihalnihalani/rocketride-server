@@ -125,10 +125,10 @@ as on the other stores.
 The Vector Explorer app supports Pinecone as **experimental**: its explorer functions are tested against an in-memory stand-in for the Pinecone client, not against Pinecone. What the app sees on Pinecone:
 
 - Pinecone cannot count with a filter, so the statistics show no document or chunk counts, the document list shows no chunk counts, and removing a document does not report how many chunks it removed.
-- The document list pages through each document's chunk 0 with Pinecone's metadata fetch, in storage order (the app sorts what it has loaded). A pod-based index has no metadata fetch: it lists the first 1,000 documents only.
+- The document list pages through each document's chunk 0 with Pinecone's metadata fetch, in storage order (the app sorts what it has loaded). A pod-based index has no metadata fetch: it lists the first 1,000 documents only. Lists, chunk pages and samples take the active, deleted and all views; any other view is refused as invalid input.
 - Samples for the embedding map are taken in storage order on serverless indexes; a pod-based index cannot provide them. The neighbour graph is computed on the node.
 - Keyword search is reported as unsupported, and the scores shown are Pinecone's raw values.
-- When Pinecone fails (unreachable, or a request it rejects), the explorer and the store's tools report `Pinecone <operation> failed: <error class> (code N)`. The client's own message, which can name the server, is not passed on.
+- When Pinecone fails (unreachable, or a request it rejects), the explorer, the store's tools and the pipeline's writes report `Pinecone <operation> failed: <error class> (code N)`, for reads, writes, marks, renders and the collection checks alike. The client's own message, which can name the server, is not passed on. An error raised by the node's own code is reported as it is.
 
 ## Upstream docs
 

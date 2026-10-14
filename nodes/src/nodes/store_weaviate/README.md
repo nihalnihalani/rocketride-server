@@ -120,10 +120,10 @@ The Vector Explorer app supports Weaviate as **experimental**: its explorer func
 
 - The document list pages through each document's chunk 0 by offset, in storage order (the app sorts what it has loaded), with chunk counts grouped by object id. A document whose chunk 0 is missing is not listed but is still counted in the statistics, so the list's total (documents with a chunk 0) can be lower than the statistics' document count. Weaviate does not page past 10,000 results, so a longer list ends there with a note.
 - New collections declare the file size, modification time and ingest time of each chunk (`size`, `modifyTime` and `ingestedAt`). On a collection created by an earlier release, Weaviate's auto-schema types them on the first write (the ingest time as a date, the numbers as decimals); the app still shows them as they were written.
-- Chunk and document counts honour the active, deleted and all views; the collection's control record is never counted or listed, and its embedding model and dimension are reported from it.
+- Chunk and document counts honour the active, deleted and all views (any other view is refused as invalid input); the collection's control record is never counted or listed, and its embedding model and dimension are reported from it.
 - Samples for the embedding map are taken in object-id order, and the neighbour graph is computed on the node, not by Weaviate.
 - Removing a document reports the number of chunks it removed.
-- When Weaviate fails (unreachable, or a request it rejects), the explorer and the store's tools report `Weaviate <operation> failed: <error class> (code N)`. The client's own message, which can name the server, is not passed on.
+- When Weaviate fails (unreachable, or a request it rejects), the explorer, the store's tools and the pipeline's writes report `Weaviate <operation> failed: <error class> (code N)`, for reads, writes, marks, renders and the collection checks alike. The client's own message, which can name the server, is not passed on. An error raised by the node's own code is reported as it is.
 
 ## Upstream docs
 

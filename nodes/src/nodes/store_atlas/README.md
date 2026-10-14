@@ -85,7 +85,7 @@ Supply the MongoDB SRV URI, including its credentials, as the host value. The sa
 
 Both search modes apply filters for node, parent, permissions, object, table, and chunk information. Default filters also require `meta.isDeleted` to be false, so soft-deleted chunks remain stored but do not appear in ordinary searches. `markDeleted` and `markActive` toggle that flag, while `remove` permanently deletes the selected objects.
 
-When a batch includes `chunkId` 0 for an object, the node removes all older chunks for that object before inserting the new batch. This is replacement behavior for a full re-ingest, not an append-only import. Inserts flush at 500 documents or when their accumulated Python object size passes the configured payload limit. Rendering an object rebuilds its text by chunk ID in windows, so it can handle large multi-chunk documents.
+When a batch includes `chunkId` 0 for an object, the node removes all older chunks for that object before inserting the new batch. This is replacement behavior for a full re-ingest, not an append-only import. A later batch of the same object (one without chunk 0) is added to it, and sent again (a retried batch) it replaces the chunks it holds instead of storing them twice. Inserts flush at 500 documents or when their accumulated Python object size passes the configured payload limit. Rendering an object rebuilds its text by chunk ID in windows, so it can handle large multi-chunk documents.
 
 Each chunk stores the declared document fields as metadata, plus the embedding model and vector size on the collection's control record, without empty values; other metadata, such as file size and ingest time, is not stored on Atlas. Rows written by earlier releases carry empty values and are still read. Earlier releases also left the embedding model and vector size out of the control record, so a collection they created cannot be searched or written by this node: re-create it. Path listing returns live documents only, never the control record.
 
@@ -96,10 +96,10 @@ Rendering does not query an application-level full-text document. Instead, it fe
 The Vector Explorer app supports MongoDB Atlas as **experimental**: its explorer functions are tested against an in-memory stand-in for the MongoDB client, not against Atlas. What the app sees on Atlas:
 
 - The document list is aggregated by object id and sorted by path, with exact chunk and table counts per document; a document whose chunk 0 is missing is listed and flagged. File size and ingest time are not shown because Atlas does not keep them.
-- Chunk and document counts honour the active, deleted and all views; the control record is never counted or listed. The description reports the vector index type, so a collection still on the old `knnVector` mapping is visible.
+- Chunk and document counts honour the active, deleted and all views (any other view is refused as invalid input); the control record is never counted or listed. The description reports the vector index type, so a collection still on the old `knnVector` mapping is visible.
 - Samples for the embedding map are stratified natively: every document's first chunk, then random chunks spread across documents (Atlas cannot seed its random sampling, so a sample is not reproducible). The neighbour graph is computed on the node.
 - Removing a document reports the number of chunks Atlas deleted.
-- When Atlas fails (unreachable, or a request it rejects), the explorer and the store's tools report `Atlas <operation> failed: <error class> (code N)`. The client's own message, which can name the server, is not passed on.
+- When Atlas fails (unreachable, or a request it rejects), the explorer, the store's tools and the pipeline's writes report `Atlas <operation> failed: <error class> (code N)`, for reads, writes, marks, renders and the collection checks alike. The client's own message, which can name the server, is not passed on. An error raised by the node's own code is reported as it is.
 
 ### Search-mode selection
 
