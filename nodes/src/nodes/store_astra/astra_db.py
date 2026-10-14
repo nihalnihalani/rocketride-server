@@ -568,6 +568,12 @@ class Store(DocumentStoreBase):
 
         return paths
 
+    @_backend_errors('createCollection')
+    def createCollection(self, documents: List[Doc]) -> bool:
+        """Create the collection as the base does; a client failure is reported without the server address."""
+        return super().createCollection(documents)
+
+    @_backend_errors('addChunks')
     def addChunks(self, chunks: List[Doc], checkCollection: bool = True) -> None:
         """
         Add document chunks to the document store.
@@ -665,6 +671,7 @@ class Store(DocumentStoreBase):
         collection.delete_many(filter_objectId)
         return
 
+    @_backend_errors('markDeleted')
     def markDeleted(self, objectIds: List[str]) -> None:
         """
         Mark the set of documents with the given objectId as deleted.
@@ -684,6 +691,7 @@ class Store(DocumentStoreBase):
         collection.update_many(filter_objectId, {'$set': {'meta.isDeleted': True}})
         return
 
+    @_backend_errors('markActive')
     def markActive(self, objectIds: List[str]) -> None:
         """
         Mark the set of documents with the given objectId as active.
@@ -707,6 +715,7 @@ class Store(DocumentStoreBase):
     # may contain tens of thousands of chunks, we grave them one
     # group at a time (renderChunkSize), put them into an array,
     # join them and call the callback
+    @_backend_errors('render')
     def render(self, objectId: str, callback: Callable[[str], None]) -> None:
         """
         Given an object id, render the complete document.

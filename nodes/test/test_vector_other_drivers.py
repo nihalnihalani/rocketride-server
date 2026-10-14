@@ -520,7 +520,8 @@ class FakeClientError(Exception):
     code = 2
 
 
-#: Every store call a tool can reach: the explorer hooks and the methods behind the legacy tools.
+#: Every store call a tool or the data lane can reach: the explorer hooks, the methods behind the
+#: legacy tools (``upsert`` writes through addChunks) and the data lane's writes, marks and render.
 TOOL_CALLS = {
     'describe': lambda store: store.describe(),
     'countChunks': lambda store: store.countChunks(DocFilter()),
@@ -540,32 +541,74 @@ TOOL_CALLS = {
     'get': lambda store: store.get(DocFilter(objectIds=['doc-a'])),
     'getPaths': lambda store: store.getPaths(),
     'remove': lambda store: store.remove(['doc-a']),
+    'addChunks-new-document': lambda store: store.addChunks(h.make_docs('doc-b', '/docs/b.md', [0, 1])),
+    'addChunks-later-batch': lambda store: store.addChunks(h.make_docs('doc-a', '/docs/a.md', [2])),
+    'createCollection': lambda store: store.createCollection(h.make_docs('doc-b', '/docs/b.md', [0])),
+    'doesCollectionExist': lambda store: store.doesCollectionExist(),
+    'markDeleted': lambda store: store.markDeleted(['doc-a']),
+    'markActive': lambda store: store.markActive(['doc-a']),
+    'render': lambda store: store.render('doc-a', lambda text: None),
 }
+
+#: The (driver, call) pairs that answer without reaching the backend, and how. Every other pair
+#: must fail with the injected client error in its chain, so a hook that starts refusing (or
+#: answering) before it reaches the backend fails here instead of passing unchecked.
+ANSWERS_WITHOUT_BACKEND = {
+    ('pinecone', 'searchKeyword'): 'refuses',  # no keyword search on Pinecone: StoreUnsupported
+    ('milvus', 'countDocuments'): 'inherits',  # base default None: no distinct count
+    ('astra_db', 'countDocuments'): 'inherits',
+    ('pinecone', 'countChunks'): 'inherits',  # Pinecone cannot count
+    ('pinecone', 'countDocuments'): 'inherits',
+    ('pinecone', 'removeCounted'): 'inherits',
+    ('astra_db', 'doesCollectionExist'): 'reads_missing',  # Astra reads a failed check as a missing collection
+}
+
+
+def _method(call):
+    """The store method a TOOL_CALLS entry calls ('addChunks' for 'addChunks-later-batch')."""
+    return call.split('-', 1)[0]
+
+
+def _chain(error):
+    """``error`` and every exception it was raised from or during."""
+    links = []
+    while error is not None and not any(error is link for link in links):
+        links.append(error)
+        error = error.__cause__ or error.__context__
+    return links
 
 
 @pytest.mark.parametrize('after_exists', [False, True], ids=['unreachable', 'reads-fail'])
 @pytest.mark.parametrize('call', sorted(TOOL_CALLS))
 def test_backend_failures_do_not_name_the_server(adapter, store, call, after_exists):
     """A client error that names the server surfaces as a host-free error (the tool's STORE_ERROR text)."""
-    if not hasattr(store, call):
-        pytest.skip(f'NOT RUN: {adapter.name} has no {call}')
     h.ingest(store, 'doc-a', '/docs/a.md', [0, 1])
     address = adapter.server_address(store)
-    adapter.fail_backend(
-        store, FakeClientError(f'Fail connecting to server on {address}: Connection refused'), after_exists=after_exists
-    )
-    try:
+    injected = FakeClientError(f'Fail connecting to server on {address}: Connection refused')
+    adapter.fail_backend(store, injected, after_exists=after_exists)
+    expected = ANSWERS_WITHOUT_BACKEND.get((adapter.name, call))
+    if expected == 'refuses':
+        with pytest.raises(StoreUnsupported):
+            TOOL_CALLS[call](store)
+        return
+    if expected == 'inherits':
+        assert _method(call) not in vars(type(store)), f'{call} is now overridden: drop it from the allowlist'
+        try:
+            answer = TOOL_CALLS[call](store)
+        except StoreUnsupported:  # removeCounted's day-0 base default (NEEDS:L1 makes it None)
+            answer = None
+        assert answer is None
+        return
+    if expected == 'reads_missing':
+        assert TOOL_CALLS[call](store) is False
+        return
+    with pytest.raises(Exception) as raised:
         TOOL_CALLS[call](store)
-    except StoreUnsupported:
-        return  # refused before any backend call (e.g. keyword search on Pinecone)
-    except Exception as error:  # noqa: BLE001 - every failure must be host-free
-        answer = f'{type(error).__name__}: {error}'  # what the tool wrapper puts in a STORE_ERROR answer
-        assert address not in answer, answer
-        assert 'FakeClientError' in answer, answer
-        assert '(code 2)' in answer, answer
-    else:
-        # Only the base defaults that never touch the backend may answer
-        assert call not in vars(type(store)), f'{call} answered although every backend call fails'
+    answer = f'{type(raised.value).__name__}: {raised.value}'  # what the tool wrapper puts in STORE_ERROR
+    assert address not in answer, answer
+    assert 'FakeClientError' in answer, answer
+    assert '(code 2)' in answer, answer
+    assert any(link is injected for link in _chain(raised.value)), f'{call} never reached the backend: {answer}'
 
 
 @pytest.mark.skip(reason='NEEDS:L1 merged — integration gate G2 (dialect/stats live in vx_tools on L1)')

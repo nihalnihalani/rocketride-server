@@ -606,6 +606,17 @@ class Store(DocumentStoreBase):
         # And return what we found
         return paths
 
+    @_backend_errors('createCollection')
+    def createCollection(self, documents: List[Doc]) -> bool:
+        """Create the collection as the base does; a client failure is reported without the server address."""
+        return super().createCollection(documents)
+
+    @_backend_errors('doesCollectionExist')
+    def doesCollectionExist(self, modelName: str = None) -> bool:
+        """Check the collection as the base does; a client failure is reported without the server address."""
+        return super().doesCollectionExist(modelName)
+
+    @_backend_errors('addChunks')
     def addChunks(self, chunks: List[Doc], checkCollection: bool = True) -> None:
         """
         Add document chunks to the document store.
@@ -760,6 +771,7 @@ class Store(DocumentStoreBase):
         self.updateRecords(objectIds, isDeleteOperation=True)
         return
 
+    @_backend_errors('markDeleted')
     def markDeleted(self, objectIds: List[str]) -> None:
         """
         Mark the set of documents with the given objectId as deleted.
@@ -769,6 +781,7 @@ class Store(DocumentStoreBase):
         self.updateRecords(objectIds, {'isDeleted': True})
         return
 
+    @_backend_errors('markActive')
     def markActive(self, objectIds: List[str]) -> None:
         """
         Mark the set of documents with the given objectId as active.
@@ -778,6 +791,7 @@ class Store(DocumentStoreBase):
         self.updateRecords(objectIds, {'isDeleted': False})
         return
 
+    @_backend_errors('render')
     def render(self, objectId: str, callback: Callable[[str], None]) -> None:
         """
         Render the complete document.
