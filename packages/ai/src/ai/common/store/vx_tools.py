@@ -439,8 +439,9 @@ _UNREACHABLE_EXACT = frozenset(
     {'psycopg2.OperationalError', 'psycopg2.InterfaceError', 'psycopg.OperationalError', 'psycopg.InterfaceError'}
 )
 
-#: gRPC status codes that mean the server is unreachable or refused the caller.
-_UNREACHABLE_GRPC = frozenset({'UNAVAILABLE', 'UNAUTHENTICATED', 'PERMISSION_DENIED'})
+#: gRPC status codes (``StatusCode.value[0]``) that mean the server is unreachable or refused the
+#: caller: 14 unavailable, 16 no valid credentials, 7 permission denied.
+_UNREACHABLE_GRPC = frozenset({14, 16, 7})
 
 
 def _qualname(cls: type) -> str:
@@ -472,7 +473,9 @@ def _unreachable_itself(exc: BaseException) -> bool:
     if 'pymongo.errors.OperationFailure' in names:
         return getattr(exc, 'code', None) in (13, 18)
     if 'grpc.RpcError' in names and callable(getattr(exc, 'code', None)):
-        return getattr(exc.code(), 'name', None) in _UNREACHABLE_GRPC
+        value = getattr(exc.code(), 'value', None)
+        number = value[0] if isinstance(value, tuple) and value else value
+        return number in _UNREACHABLE_GRPC
     return False
 
 
@@ -481,7 +484,7 @@ def store_unreachable(exc: BaseException) -> bool:
 
     Checks the stdlib connection, DNS and TLS errors, the client libraries' connection and
     authentication classes, HTTP 401/403/407 answers, Milvus code 2, MongoDB auth codes and
-    gRPC UNAVAILABLE/UNAUTHENTICATED/PERMISSION_DENIED, following ``__cause__`` and an
+    gRPC codes 14, 16 and 7 (:data:`_UNREACHABLE_GRPC`), following ``__cause__`` and an
     unsuppressed ``__context__``.
     """
     pending: List[Optional[BaseException]] = [exc]

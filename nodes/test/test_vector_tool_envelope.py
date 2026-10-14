@@ -343,15 +343,16 @@ def test_bare_host_names_and_token_shapes_are_scrubbed(message, secrets):
     assert not [secret for secret in secrets if secret in out], out
 
 
-def _rpc_error(code_name: str) -> BaseException:
-    status = _lib('grpc', 'StatusCode')
+def _rpc_error(number: int) -> BaseException:
+    """A gRPC error whose ``code()`` is the ``StatusCode`` numbered ``number``."""
+    status = next(code for code in _lib('grpc', 'StatusCode') if code.value[0] == number)
 
     class _Rpc(_lib('grpc', 'RpcError')):
         def code(self):
-            return getattr(status, code_name)
+            return status
 
         def __str__(self) -> str:
-            return f'<_Rpc {code_name} ipv4:172.18.0.9:56334 vx-qdrant>'
+            return f'<_Rpc {number} ipv4:172.18.0.9:56334 vx-qdrant>'
 
     return _Rpc()
 
@@ -419,8 +420,9 @@ _UNREACHABLE: Dict[str, Callable[[], BaseException]] = {
         'vx-mongo:27017: [Errno 61] Connection refused'
     ),
     'mongo-auth': lambda: _lib('pymongo.errors', 'OperationFailure')('Authentication failed for vx-mongo.', code=18),
-    'grpc-unavailable': lambda: _rpc_error('UNAVAILABLE'),
-    'grpc-unauthenticated': lambda: _rpc_error('UNAUTHENTICATED'),
+    'grpc-14-unavailable': lambda: _rpc_error(14),
+    'grpc-16-no-credentials': lambda: _rpc_error(16),
+    'grpc-7-permission-denied': lambda: _rpc_error(7),
     'wrapped': _wrapped_refusal,
 }
 
@@ -448,7 +450,7 @@ _OTHER: Dict[str, Callable[[], BaseException]] = {
     'qdrant-404': lambda: _qdrant_response(404),
     'milvus-other': lambda: _lib('pymilvus.exceptions', 'MilvusException')(code=1, message='collection not loaded'),
     'file': lambda: FileNotFoundError(2, 'No such file or directory'),
-    'grpc-invalid': lambda: _rpc_error('INVALID_ARGUMENT'),
+    'grpc-3-invalid-argument': lambda: _rpc_error(3),
 }
 
 
