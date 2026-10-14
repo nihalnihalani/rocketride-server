@@ -17,19 +17,22 @@ node is configured for, with that node's settings. If apps are new to you, read
 [Apps](/concepts/apps) first. What the app deliberately does not do is under
 [Limits](#limits).
 
-Four stores are supported:
-[PostgreSQL with pgvector](/nodes/store_postgres),
+Vector Explorer is built for four stores, the ones with tests that run against
+a live server: [PostgreSQL with pgvector](/nodes/store_postgres),
 [RocketRide Vector](/nodes/rocketride_vector) (your organization's managed
 RocketRide database), [Qdrant](/nodes/store_qdrant) and
 [Chroma](/nodes/store_chroma). [Milvus](/nodes/store_milvus),
 [Weaviate](/nodes/store_weaviate), [Pinecone](/nodes/store_pinecone),
 [Astra DB](/nodes/store_astra) and [MongoDB Atlas](/nodes/store_atlas) are
-available but marked **Experimental**: a store is marked supported only after
-its tests against a live server pass, and in this build these five were tested
-against mock clients only. The level each connection shows is the one its node
-reports.
+listed too, and are marked **Experimental**: in this build they were tested
+against mock clients only.
 [Elasticsearch and OpenSearch](/nodes/store_elasticsearch) are not supported and
 are never listed.
+
+Each connection shows the support level its node reports, in its drawer and as
+a chip on the console's stats strip: **Supported** when that store's tests
+passed against a live server in this build, on a new collection and on one
+written by an earlier release, and **Experimental** otherwise.
 
 ## Before you start
 
@@ -404,9 +407,11 @@ Explorer.
   browser and has **Cancel**.)
 - **Elasticsearch and OpenSearch** store nodes are not supported and are not
   listed.
-- **Experimental stores** (Milvus, Weaviate, Pinecone, Astra DB, MongoDB Atlas)
-  were tested against mock clients only in this build. Pinecone cannot count
-  documents or chunks and has no keyword search.
+- **Experimental stores.** Milvus, Weaviate, Pinecone, Astra DB and MongoDB
+  Atlas are Experimental in this build: they were tested against mock clients
+  only. Any store whose connection shows **Experimental** has not passed tests
+  against a live server in this build. Pinecone cannot count documents or
+  chunks and has no keyword search.
 - **Size.** The map draws at most 2,000 points in detailed mode and 5,000 in
   light mode, and t-SNE at most 1,000. The directory loads 5,000 documents on
   its own; **Load more** goes further.
