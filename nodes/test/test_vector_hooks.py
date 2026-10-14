@@ -299,6 +299,33 @@ class NativeStratifiedStore(ExactListingStore):
         return [self._copy(self.rows[k], with_vector=True) for k in keys], 'stratified'
 
 
+class EveryRowFlagStore(MemoryStore):
+    """Reads only the legacy ``isDeleted`` flag and ignores ``DocFilter.deleted``, as drivers written before it do.
+
+    None or False selects the active rows; True selects every row, as the pgvector,
+    Qdrant, Milvus, Weaviate, Astra and Atlas drivers read it.
+    """
+
+    FLAG_TRUE_SELECTS = 'all'
+
+    def _match(self, doc: Doc, flt: DocFilter) -> bool:
+        legacy = flt.model_copy(update={'deleted': self.FLAG_TRUE_SELECTS if flt.isDeleted else 'active'})
+        return super()._match(doc, legacy)
+
+
+class DeletedOnlyFlagStore(EveryRowFlagStore):
+    """As :class:`EveryRowFlagStore`, but True selects only the deleted rows, as the Chroma and Pinecone drivers read it.
+
+    ``deletedFilter('all')`` therefore reads no active row here.
+    """
+
+    FLAG_TRUE_SELECTS = 'deleted'
+
+
+#: The three ways a driver may read the deleted selector: exactly (``DocFilter.deleted``), or the legacy flag only.
+DELETED_READINGS = [MemoryStore, EveryRowFlagStore, DeletedOnlyFlagStore]
+
+
 # ---------------------------------------------------------------------------
 # Corpus helpers
 # ---------------------------------------------------------------------------
@@ -416,6 +443,27 @@ def test_deleted_filter_sets_both_the_exact_and_the_legacy_field():
     assert (ds.deletedFilter('all').deleted, ds.deletedFilter('all').isDeleted) == ('all', True)
     flt = ds.deletedFilter('deleted', objectIds=['a'], limit=3)
     assert (flt.deleted, flt.isDeleted, flt.objectIds, flt.limit) == ('deleted', True, ['a'], 3)
+
+
+def _object_ids_read(store: MemoryStore, deleted: str) -> List[str]:
+    return sorted(
+        {d.metadata.objectId for d in store.get(ds.deletedFilter(deleted)) if d.metadata.objectId != 'schema'}
+    )
+
+
+@pytest.mark.parametrize('store_cls', DELETED_READINGS)
+def test_active_then_deleted_reads_cover_every_row_whatever_the_legacy_flag_selects(store_cls):
+    store = seeded(store_cls)
+    store.markDeleted(['b'])
+    assert _object_ids_read(store, 'active') == ['a', 'c']
+    assert 'b' in _object_ids_read(store, 'deleted')
+
+
+def test_the_all_selector_misses_active_rows_where_the_legacy_flag_selects_deleted_rows_only():
+    store = seeded(DeletedOnlyFlagStore)
+    store.markDeleted(['b'])
+    assert _object_ids_read(store, 'all') == ['b']
+    assert _object_ids_read(seeded(EveryRowFlagStore), 'all') == ['a', 'b', 'c']
 
 
 def test_cursor_round_trip_is_url_safe_and_unpadded():
@@ -618,6 +666,17 @@ def test_list_documents_default_honours_deleted():
     assert [r.objectId for r in everything.items] == ['a', 'b', 'c']
 
 
+@pytest.mark.parametrize('store_cls', DELETED_READINGS)
+def test_list_documents_and_scroll_chunks_default_read_active_rows_whatever_the_legacy_flag_selects(store_cls):
+    store = seeded(store_cls)
+    store.markDeleted(['b'])
+    page = store.listDocuments(cursor=None, limit=10, object_ids=None, deleted='active', sort='path')
+    assert [r.objectId for r in page.items] == ['a', 'c']
+    chunks = store.scrollChunks('a', after_chunk=-1, limit=10, deleted='active')
+    assert [d.metadata.chunkId for d in chunks.docs] == [0, 1]
+    assert store.scrollChunks('b', after_chunk=-1, limit=10, deleted='active').docs == []
+
+
 def test_list_documents_default_asks_for_one_extra_row_to_detect_more():
     store = seeded()
     store.listDocuments(cursor=None, limit=2, object_ids=None, deleted='active', sort='path')
@@ -742,10 +801,12 @@ def test_remove_counted_default_counts_then_removes():
     assert ('remove', ['b', 'zzz']) in store.calls
 
 
-def test_remove_counted_default_without_counts_is_none_but_still_removes():
-    store = seeded()
-    assert store.removeCounted(['b']) is None
-    assert not any(k[0] == 'b' for k in store.rows)
+@pytest.mark.parametrize('store_cls', DELETED_READINGS)
+def test_remove_counted_default_without_counts_is_none_but_still_removes(store_cls):
+    store = seeded(store_cls)
+    store.markDeleted(['c'])
+    assert store.removeCounted(['b', 'c']) is None
+    assert not any(k[0] in ('b', 'c') for k in store.rows)
 
 
 def test_remove_counted_never_removes_the_control_record():

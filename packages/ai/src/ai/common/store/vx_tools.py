@@ -126,7 +126,10 @@ def deletedFilter(deleted: str, **fields: Any) -> DocFilter:
     Sets the exact ``deleted`` selector and the legacy ``isDeleted`` flag drivers
     read today (``'active'`` -> False, otherwise True). A store whose ``isDeleted=True``
     means "both" returns deleted and active rows for ``'deleted'``; callers that need
-    exactly the deleted ones filter what comes back (see :func:`matchesDeleted`).
+    exactly the deleted ones filter what comes back (see :func:`matchesDeleted`). A
+    store that ignores ``deleted`` and reads ``isDeleted=True`` as "deleted rows only"
+    returns no active row for ``'all'``; a read that must see every row of a document
+    reads ``'active'`` and then ``'deleted'``.
     """
     flt = DocFilter(**fields)
     flt.deleted = deleted
@@ -1065,10 +1068,17 @@ class VectorExplorerTools:
 
     @staticmethod
     def _vx_document_stored(store: Any, object_id: str) -> bool:
-        """Whether any row of ``object_id`` (active or deleted) is stored: a one-row read."""
-        for doc in store.get(deletedFilter('all', objectIds=[object_id], limit=1, offset=0)):
-            if metadataValue(doc, 'objectId') == object_id:
-                return True
+        """Whether any row of ``object_id`` (active or deleted) is stored: one one-row read for an active document.
+
+        Reads the active rows, then (only when none) the deleted ones, never ``'all'``: a
+        driver that reads only the legacy ``isDeleted`` flag takes True as "every row" or as
+        "deleted rows only" depending on the backend, while False is "active rows" on every
+        one, so the pair covers every row whichever reading the driver has.
+        """
+        for deleted in ('active', 'deleted'):
+            for doc in store.get(deletedFilter(deleted, objectIds=[object_id], limit=1, offset=0)):
+                if metadataValue(doc, 'objectId') == object_id:
+                    return True
         return False
 
     def _vx_remove(self, store: Any, ids: Sequence[str]) -> Tuple[List[Dict[str, Any]], List[str], Optional[int]]:
@@ -1079,8 +1089,9 @@ class VectorExplorerTools:
         any other driver is counted per document (free when it cannot count) and then
         removed once, so no batch is counted twice. Where no count tells a stored document
         from an unknown id (a single id on a native removal, which may answer None; a
-        driver that cannot count), a one-row read decides, for up to ``write_ids_max``
-        ids; beyond that an unknown id is reported removed with a null count.
+        driver that cannot count), a one-row read decides (a second one for an id with no
+        active row; see :meth:`_vx_document_stored`), for up to ``write_ids_max`` ids;
+        beyond that an unknown id is reported removed with a null count.
         """
         ids = [oid for oid in ids if oid != CONTROL_OBJECT_ID]
         native = 'removeCounted' in store.capabilities()

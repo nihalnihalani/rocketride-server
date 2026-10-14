@@ -47,6 +47,7 @@ from ai.common.store.vx_defaults import VECTOR_TOOL_LIMITS
 from ai.common.store.vx_types import DocPage, DocumentRow
 
 from .test_vector_hooks import (
+    DELETED_READINGS,
     FORGED_CURSORS,
     MODEL,
     CountingStore,
@@ -2143,6 +2144,90 @@ def test_remove_document_without_any_count_still_finds_unknown_ids(context, stor
     assert answer['removed'] == [{'objectId': 'a', 'chunks_removed': None}, {'objectId': 'b', 'chunks_removed': None}]
     assert answer['not_found'] == ['ghost'] and answer['removed_chunks'] is None
     assert not any(key[0] in ('a', 'b') for key in store.rows)
+
+
+def _native_removal(base):
+    """``base`` plus a native ``removeCounted`` that counts the rows it removes."""
+
+    class Native(base):
+        def removeCounted(self, objectIds):
+            self.calls.append(('removeCounted', list(objectIds)))
+            removed = [key for key in self.rows if key[0] in objectIds]
+            self.remove(list(objectIds))
+            return len(removed)
+
+    Native.__name__ = f'NativeRemoval{base.__name__}'
+    return Native
+
+
+_REMOVAL_DRIVERS = DELETED_READINGS + [_native_removal(cls) for cls in DELETED_READINGS]
+
+
+def _removal_corpus(store_cls):
+    """Documents 'a' (2 chunks) and 'b' (1 chunk) active, 'gone' (2 chunks) soft-deleted."""
+    store = store_cls().seed(corpus({'a': [0, 1], 'b': [0], 'gone': [0, 1]}))
+    store.markDeleted(['gone'])
+    store.calls.clear()
+    return store
+
+
+def _stored(store, object_id):
+    return any(key[0] == object_id for key in store.rows)
+
+
+@pytest.mark.parametrize('store_cls', _REMOVAL_DRIVERS, ids=lambda cls: cls.__name__)
+@pytest.mark.parametrize('object_id', ['a', 'gone'])
+def test_remove_document_removes_a_stored_document_whatever_the_legacy_flag_selects(context, store_cls, object_id):
+    context(dap())
+    store = _removal_corpus(store_cls)
+    answer = node(store, allow_writes=True).remove_document({'object_ids': [object_id]})
+    assert answer['not_found'] == [] and [row['objectId'] for row in answer['removed']] == [object_id]
+    assert answer['removed_chunks'] in (2, None) and answer['audit']['rows'] == answer['removed_chunks']
+    assert not _stored(store, object_id) and _stored(store, 'b')
+
+
+@pytest.mark.parametrize('store_cls', _REMOVAL_DRIVERS, ids=lambda cls: cls.__name__)
+def test_remove_document_tells_stored_documents_from_unknown_ids_whatever_the_legacy_flag_selects(context, store_cls):
+    context(dap())
+    store = _removal_corpus(store_cls)
+    answer = node(store, allow_writes=True).remove_document({'object_ids': ['a', 'ghost', 'gone']})
+    assert [row['objectId'] for row in answer['removed']] == ['a', 'gone'] and answer['not_found'] == ['ghost']
+    assert not _stored(store, 'a') and not _stored(store, 'gone') and _stored(store, 'b')
+
+
+@pytest.mark.parametrize('store_cls', _REMOVAL_DRIVERS, ids=lambda cls: cls.__name__)
+def test_remove_document_of_an_unknown_id_removes_nothing_whatever_the_legacy_flag_selects(context, store_cls):
+    context(dap())
+    store = _removal_corpus(store_cls)
+    answer = node(store, allow_writes=True).remove_document({'object_ids': ['ghost']})
+    assert (answer['removed'], answer['not_found'], answer['removed_chunks']) == ([], ['ghost'], 0)
+    assert not _backend_calls(store, 'remove', 'removeCounted')
+
+
+@pytest.mark.parametrize('store_cls', DELETED_READINGS)
+def test_delete_removes_a_stored_document_whatever_the_legacy_flag_selects(context, store_cls):
+    context(dap())
+    store = _removal_corpus(store_cls)
+    answer = node(store, allow_writes=True).delete({'object_ids': ['a', 'ghost']})
+    assert answer['success'] is True and answer['not_found'] == ['ghost']
+    assert not _stored(store, 'a') and _stored(store, 'b')
+
+
+@pytest.mark.parametrize('store_cls', DELETED_READINGS)
+def test_remove_document_confirms_an_active_document_with_one_one_row_read(context, store_cls):
+    context(dap())
+    store = _removal_corpus(store_cls)
+    node(store, allow_writes=True).remove_document({'object_ids': ['a']})
+    reads = [call[1] for call in _backend_calls(store, 'get')]
+    assert len(reads) == 1 and (reads[0].objectIds, reads[0].limit, reads[0].deleted) == (['a'], 1, 'active')
+
+
+@pytest.mark.parametrize('store_cls', DELETED_READINGS)
+def test_documents_and_chunks_read_active_documents_whatever_the_legacy_flag_selects(store_cls):
+    inst = node(_removal_corpus(store_cls))
+    assert [row['objectId'] for row in inst.documents({})['items']] == ['a', 'b']
+    assert [item['chunkId'] for item in inst.chunks({'object_id': 'a'})['items']] == [0, 1]
+    assert inst.chunks({'object_id': 'gone'})['code'] == 'NOT_FOUND'
 
 
 def test_remove_document_reserved_id(context):
