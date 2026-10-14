@@ -241,7 +241,7 @@ function queuedRow(file: PlannedUpload): UploadRow {
 	return { id: file.id, path: file.path, name: file.name, objectId: file.objectId, size: file.size, status: 'queued', bytesSent: 0, fileSize: file.size, chunks: null, existingChunks: null, message: null, detail: null };
 }
 
-test('applyUploadEvent: open, write, close and complete move a row forward; an error event is only provisional', () => {
+test('applyUploadEvent: open, write, close and complete move a row forward; an error event changes nothing', () => {
 	const events = fixture<{ events: IUploadEvent[] }>('upload_events.json').events;
 	const plan = planDrop([candidate('memo_q3.docx', 22016), candidate('scan_unreadable.pdf', 4096)]);
 	let memo = queuedRow(plan.accepted[0]);
@@ -257,11 +257,11 @@ test('applyUploadEvent: open, write, close and complete move a row forward; an e
 	assert.equal(memo.status, 'counting');
 	assert.equal(memo.bytesSent, 22016);
 	// Every app in the shell sees upload events, keyed by base name only, so an
-	// error event cannot finish a row: the engine's text is kept, the row waits.
+	// error event cannot finish a row or put its words on it: the row waits.
 	assert.equal(scan.status, 'processing');
 	assert.equal(scan.message, null);
-	assert.equal(scan.detail, 'Pipe closed with an error');
-	// The result sendFiles returns for the file decides.
+	assert.equal(scan.detail, null);
+	// The result sendFiles returns for the file decides, with its own words.
 	const failed = applyFinalResult(scan, events[events.length - 1] as unknown as Record<string, unknown>);
 	assert.equal(failed.status, 'failed');
 	assert.equal(failed.message, FAILED_SENTENCE);

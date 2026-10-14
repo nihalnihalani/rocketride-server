@@ -425,8 +425,9 @@ const PROGRESS: Partial<Record<UploadStatus, number>> = { queued: 0, uploading: 
  * file by base name only, so an event may belong to another app's file of the
  * same name. Events therefore only move a row through the sending states: an
  * event whose file size is not this file's is ignored, and an 'error' event
- * keeps the engine's words in `detail` without finishing the row. The result
- * sendFiles returns for the file decides how it ends ({@link applyFinalResult}).
+ * changes nothing (it may be another app's, and the SDK returns the same words
+ * in the file's result). The result sendFiles returns for the file decides how
+ * it ends, with its own error text ({@link applyFinalResult}).
  *
  * @param row - The row.
  * @param event - An `apaevt_status_upload` body.
@@ -447,8 +448,9 @@ export function applyUploadEvent(row: UploadRow, event: IUploadEvent): UploadRow
 		case 'complete':
 			return { ...row, status: 'counting', bytesSent, fileSize };
 		case 'error':
-			// Provisional: it may be another app's file of the same name.
-			return { ...row, bytesSent, fileSize, detail: typeof event.error === 'string' && event.error !== '' ? event.error : row.detail };
+			// It may be another app's file of the same name: its words must not
+			// show on this row. This file's own words arrive with its result.
+			return row;
 	}
 	return row;
 }

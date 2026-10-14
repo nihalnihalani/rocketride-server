@@ -34,12 +34,13 @@ import assert from 'node:assert/strict';
 import { ExplorerToolError } from 'shared/explorer';
 import type { ISendFile } from 'shared/explorer';
 import { objectIdForPath } from '../src/vector/objectId';
-import { uploadLabel } from '../src/vector/uploads';
+import { FAILED_SENTENCE, uploadLabel } from '../src/vector/uploads';
 import type { DropCandidate } from '../src/vector/uploads';
 import { RECOUNT_DELAY_MS, createIngestQueue } from '../src/ingest/ingestQueue';
 import type { IngestDeps } from '../src/ingest/ingestQueue';
 import { createNameLocks } from '../src/ingest/nameLocks';
 import type { CallOutcome } from '../src/chat/toolCalls';
+import type { IUploadEvent } from '../src/contract/types';
 
 /** Most a test here may take: they await fakes, so a regression must fail, not hang the run. */
 const TEST_TIMEOUT_MS = 10_000;
@@ -338,6 +339,37 @@ test('queue: the chunk count and the change report use the objectId the engine r
 	assert.equal(uploadLabel(row), '4 chunks added');
 	assert.equal(row.objectId, engineId);
 	assert.match(row.detail ?? '', /the console expected/);
+});
+
+test("queue: another app's error words never show on a row in flight; the result brings this file's own", async () => {
+	const started = deferred<void>();
+	const gate = deferred<boolean>();
+	const fake = fakeDeps({
+		async sendFiles(files: ISendFile[]) {
+			started.resolve();
+			const fails = await gate.promise;
+			return files.map((file) => (fails ? { action: 'error', filepath: file.file.name, bytes_sent: 0, file_size: file.file.size, upload_time: 0.1, error: 'Pipe closed with an error' } : { action: 'complete', filepath: file.file.name, bytes_sent: file.file.size, file_size: file.file.size, upload_time: 0.1 }));
+		},
+	});
+	const queue = createIngestQueue(fake.deps);
+	await queue.addDrop([candidate('x/report.pdf', 100)]);
+	await started.promise;
+	queue.handleEvent({ action: 'write', filepath: 'report.pdf', bytes_sent: 40, file_size: 100, upload_time: 0 });
+	const before = queue.getState().rows[0];
+	// Another app's report.pdf of the same size fails while this one is still sending.
+	queue.handleEvent({ action: 'error', filepath: 'report.pdf', bytes_sent: 3, file_size: 100, upload_time: 0, error: 'another app: pipe error' });
+	queue.handleEvent({ action: 'error', filepath: 'report.pdf', error: 'another app: no size' } as unknown as IUploadEvent);
+	assert.equal(queue.getState().rows[0], before, 'an error event changes nothing on the row');
+	assert.equal(queue.getState().rows[0].detail, null);
+	assert.equal(uploadLabel(queue.getState().rows[0]), 'Uploading… 40%');
+	// This file's own failure: the words come with the result sendFiles returns.
+	gate.resolve(true);
+	await queue.idle();
+	const row = queue.getState().rows[0];
+	assert.equal(row.status, 'failed');
+	assert.equal(uploadLabel(row), FAILED_SENTENCE);
+	assert.equal(row.detail, 'Pipe closed with an error');
+	assert.deepEqual(fake.changed, []);
 });
 
 test('queue: dispose while the replace question is open sends nothing', async () => {
