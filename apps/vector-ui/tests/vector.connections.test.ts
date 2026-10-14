@@ -14,10 +14,10 @@ import { CONFIG_SENTINEL, fakeWorld, manualClock, projectRows, ragComponents, ro
 import type { IFakeWorld } from 'shared/explorer/connect/testing';
 import { makeVectorEndpointStore } from '../src/adapters/explorer';
 import { NOT_GROUPED_NOTE, drawerKeyAfter, drawerView, landingView, roleLine, testResultText, vectorCardView } from '../src/vector/connections';
-import { buildConsoleModel, consoleNodes } from '../src/vector/consoleModel';
+import { buildConsoleModel, consoleNodes, writesDuringRemoval } from '../src/vector/consoleModel';
 import { providerTitle } from '../src/vector/support';
 import { readStats } from '../src/vector/results';
-import { CODE_SENTENCES, EMPTY } from '../src/vector/wording';
+import { BUSY, CODE_SENTENCES, EMPTY } from '../src/vector/wording';
 import { fixture } from './support/fixtures';
 
 /** Discover over a fake world and return the endpoints with their probes. */
@@ -209,6 +209,16 @@ test('the console model: nodes, limits, capabilities and why each action is or i
 	assert.match(noRemove.writes.reason ?? '', /cannot remove documents/);
 	const unprobed = buildConsoleModel(f.endpoint, undefined, null);
 	assert.equal(unprobed.writes.enabled, false, 'nothing is enabled before the node answered');
+	// The tools role filled by a source that is not a Tools source (a webhook named tools_1): the node would refuse.
+	const webhook = { ...f.endpoint, components: (f.endpoint.components ?? []).map((c) => (c.id === f.endpoint.roles.tools?.source ? { ...c, provider: 'webhook' } : c)) };
+	assert.equal(f.endpoint.roles.tools?.source, 'tools_1', 'the premise: the tools role is bound to tools_1');
+	assert.deepEqual(buildConsoleModel(webhook, f.probe, null).writes, { enabled: false, reason: CODE_SENTENCES.WRITES_SOURCE });
+	const unlisted = { ...f.endpoint, components: (f.endpoint.components ?? []).filter((c) => c.id !== 'tools_1') };
+	assert.deepEqual(buildConsoleModel(unlisted, f.probe, null).writes, { enabled: false, reason: CODE_SENTENCES.WRITES_SOURCE }, 'a source the component list does not show is not taken for a Tools source');
+	// While a removal runs the trash buttons are disabled and say so; otherwise they follow the model.
+	assert.deepEqual(writesDuringRemoval(model.writes, 'running'), { enabled: false, reason: BUSY.removing });
+	assert.deepEqual(writesDuringRemoval(model.writes, 'done'), model.writes);
+	assert.deepEqual(writesDuringRemoval(off.writes, 'running'), off.writes, 'a reason that already holds is kept');
 	assert.equal(unprobed.limits.documents_page, 500, 'documented limits until it does');
 });
 

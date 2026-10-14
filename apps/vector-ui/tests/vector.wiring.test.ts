@@ -97,7 +97,8 @@ test('the console renders the strip, the directory, the chunks, adding documents
 	for (const part of ['<StatsStrip', '<DocumentDirectory', '<ChunkList', '<IngestPanel', '<ChatPanel']) assert.ok(view.includes(part), part);
 	assert.match(view, /entry\.controller\.setVisible\(active\)/, 'hidden: no quick stats, the directory pauses');
 	assert.match(view, /entry\.controller\.setWritesEnabled\(model\.writes\.enabled\)/, 'nothing is confirmed or sent while writes are off');
-	assert.match(view, /writes=\{model\.writes\}/);
+	assert.match(view, /writes=\{writesDuringRemoval\(model\.writes, state\.removal\.status\)\}/, 'the trash follows the model, and is disabled while a removal runs');
+	assert.match(view, /\(state\.removal\.status === 'running' \|\| state\.removal\.message\) &&/, 'the status line says Removing… while a removal runs');
 	assert.match(view, /entry\.controller\.open\(\)/);
 	assert.match(view, /consoleColumns\(width\)/, 'the ratios come from vector/layout.ts');
 	const strip = code('components/StatsStrip.tsx');

@@ -17,7 +17,7 @@ import { createConsoleStore } from '../src/vector/consoleStore';
 import type { IConsoleDeps } from '../src/vector/consoleStore';
 import { readChunksPage, readDocumentsPage, readRemoveResult, readStats } from '../src/vector/results';
 import type { IDocumentsPageView } from '../src/vector/results';
-import { CANCELLED_TEXT, CODE_SENTENCES } from '../src/vector/wording';
+import { BUSY, CANCELLED_TEXT, CODE_SENTENCES } from '../src/vector/wording';
 import { fixture } from './support/fixtures';
 
 interface ICall {
@@ -124,6 +124,37 @@ test('a stats failure keeps the last figures and says why', async () => {
 	assert.equal(stats.status, 'error');
 	assert.equal(stats.view?.documents, 42, 'the strip keeps its last values (shown greyed)');
 	assert.deepEqual(stats.error, { headline: CODE_SENTENCES.STORE_ERROR, detail: 'OperationalError: the store did not answer' });
+	store.dispose();
+});
+
+test('a failed first stats load is asked again in full every 15 s while visible, until it answers', async () => {
+	let fail = true;
+	const { store, clock, calls } = harness({
+		stats: async (mode) => {
+			calls.push({ tool: 'stats', args: [mode] });
+			if (fail) throw new ExplorerToolError({ kind: 'raised', tool: 'stats', message: 'Task is not running', code: 'TASK_STOPPED' });
+			return readStats(mode === 'quick' ? fixture('stats_quick') : fixture('stats_pgvector'));
+		},
+	});
+	const modes = () => calls.filter((c) => c.tool === 'stats').map((c) => c.args[0]);
+	store.open();
+	await clock.settle();
+	assert.equal(store.getState().stats.status, 'error');
+	await clock.advance(QUICK_STATS_INTERVAL_MS - 1);
+	assert.deepEqual(modes(), ['full'], 'not before 15 s');
+	await clock.advance(1);
+	assert.deepEqual(modes(), ['full', 'full'], 'a full call: there are no figures yet to refresh quickly');
+	store.setVisible(false);
+	await clock.advance(QUICK_STATS_INTERVAL_MS * 3);
+	assert.equal(modes().length, 2, 'never while hidden');
+	store.setVisible(true);
+	fail = false;
+	await clock.advance(QUICK_STATS_INTERVAL_MS);
+	assert.deepEqual(modes(), ['full', 'full', 'full']);
+	assert.equal(store.getState().stats.status, 'ready');
+	assert.equal(store.getState().stats.view?.documents, 42);
+	await clock.advance(QUICK_STATS_INTERVAL_MS);
+	assert.deepEqual(modes(), ['full', 'full', 'full', 'quick'], 'once it answered, the quick refresh takes over');
 	store.dispose();
 });
 
@@ -331,6 +362,41 @@ test('remove: refused by the node, the sentence names the rule; with writes off 
 	assert.equal(store.getState().confirm, null, 'no confirmation opens while writes are off');
 	await store.confirmRemove();
 	assert.equal(sent, 1, 'only the first, refused, call');
+	store.dispose();
+});
+
+test('remove: while a removal runs no second confirmation opens and nothing more is sent', async () => {
+	let release: (() => void) | null = null;
+	let inFlight = 0;
+	let maxInFlight = 0;
+	const { store, clock, announced } = harness({
+		remove: async (ids) => {
+			inFlight += 1;
+			maxInFlight = Math.max(maxInFlight, inFlight);
+			await new Promise<void>((resolve) => (release = resolve));
+			inFlight -= 1;
+			return readRemoveResult({ ...fixture('remove_document_ok'), removed: ids.map((objectId) => ({ objectId, chunks_removed: 2 })), removed_chunks: 2 * ids.length });
+		},
+	});
+	store.setWritesEnabled(true);
+	store.open();
+	await clock.settle();
+	store.requestRemove([{ objectId: 'a', path: 'a.md', chunks: 2 }]);
+	const first = store.confirmRemove();
+	await clock.settle();
+	assert.equal(store.getState().removal.status, 'running');
+	store.requestRemove([{ objectId: 'b', path: 'b.md', chunks: 2 }]);
+	assert.equal(store.getState().confirm, null, 'no second confirmation opens while a removal runs');
+	assert.deepEqual(announced, [BUSY.removing], 'and the screen reader hears why');
+	await store.confirmRemove();
+	await clock.settle();
+	assert.equal(maxInFlight, 1, 'one removal at a time');
+	release!();
+	await first;
+	await clock.settle();
+	assert.equal(store.getState().removal.status, 'done');
+	store.requestRemove([{ objectId: 'b', path: 'b.md', chunks: 2 }]);
+	assert.equal(store.getState().confirm?.targets[0].objectId, 'b', 'once it ended, removing is offered again');
 	store.dispose();
 });
 

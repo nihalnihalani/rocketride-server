@@ -186,15 +186,21 @@ export function statsChips(input: { dialect: IDialectResult | null; stats: IStat
 export type StatsTrigger = 'open' | 'write' | 'upload' | 'manual' | 'tick';
 
 /**
- * Which `stats` mode to call now, if any.
+ * Which `stats` mode to call now, if any. Before the first answer a tick asks
+ * nothing, except after a failed call: then it asks again in full at the
+ * quick-stats pace (a task that was restarting answers once it runs).
  *
  * @param trigger - What asked.
- * @param ctx - Whether the console is visible, when the last answer arrived (null: none yet), the time and whether a call is in flight.
+ * @param ctx - Whether the console is visible, when the last answer arrived (null: none yet), when the last call failed (null: none since), the time and whether a call is in flight.
  * @returns 'full', 'quick', or null for no call.
  */
-export function statsRefreshPlan(trigger: StatsTrigger, ctx: { visible: boolean; lastAt: number | null; now: number; inFlight: boolean }): 'full' | 'quick' | null {
+export function statsRefreshPlan(trigger: StatsTrigger, ctx: { visible: boolean; lastAt: number | null; failedAt?: number | null; now: number; inFlight: boolean }): 'full' | 'quick' | null {
 	if (trigger !== 'tick') return 'full';
-	if (!ctx.visible || ctx.inFlight || ctx.lastAt === null) return null;
+	if (!ctx.visible || ctx.inFlight) return null;
+	if (ctx.lastAt === null) {
+		const failedAt = ctx.failedAt ?? null;
+		return failedAt !== null && ctx.now - failedAt >= QUICK_STATS_INTERVAL_MS ? 'full' : null;
+	}
 	return ctx.now - ctx.lastAt >= QUICK_STATS_INTERVAL_MS ? 'quick' : null;
 }
 

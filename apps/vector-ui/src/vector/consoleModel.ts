@@ -40,7 +40,7 @@ import type { IExplorerEndpoint, IProbeResult } from 'shared/explorer';
 import type { Availability, ConsoleModel, VectorNodes } from '../contract/types';
 import { DEFAULT_LIMITS, readDialect } from './results';
 import type { IStatsView } from './results';
-import { CODE_SENTENCES, EMPTY } from './wording';
+import { BUSY, CODE_SENTENCES, EMPTY } from './wording';
 
 /** Available. */
 const ON: Availability = { enabled: true, reason: null };
@@ -96,6 +96,32 @@ export function alsoReaches(endpoint: IExplorerEndpoint, providers: ReadonlySet<
 }
 
 /**
+ * Whether the source bound to the tools role is a Tools source by the
+ * pipeline's component list (the store refuses removal from any other source,
+ * so the trash is disabled up front). A source the list does not show is not
+ * taken for one.
+ *
+ * @param endpoint - The endpoint.
+ * @returns True when the bound source's component has the `tools` provider.
+ */
+export function toolsSourceIsTools(endpoint: IExplorerEndpoint): boolean {
+	const source = endpoint.roles.tools?.source;
+	if (!source) return false;
+	return (endpoint.components ?? []).some((c) => c.id === source && c.provider === 'tools');
+}
+
+/**
+ * What the console's remove controls get: the model's `writes`, disabled while a removal runs.
+ *
+ * @param writes - The model's writes.
+ * @param removal - The controller's removal status.
+ * @returns The availability the trash buttons and "Remove selected" use.
+ */
+export function writesDuringRemoval(writes: Availability, removal: 'idle' | 'running' | 'done' | 'error'): Availability {
+	return removal === 'running' && writes.enabled ? off(BUSY.removing) : writes;
+}
+
+/**
  * Build the console model of a connection.
  *
  * @param endpoint - The live endpoint.
@@ -111,6 +137,7 @@ export function buildConsoleModel(endpoint: IExplorerEndpoint, probe: IProbeResu
 
 	let writes: Availability;
 	if (readOnly || !toolsBound) writes = off(EMPTY.readOnly);
+	else if (!toolsSourceIsTools(endpoint)) writes = off(CODE_SENTENCES.WRITES_SOURCE);
 	else if (dialect === null) writes = off('The store node has not answered yet.');
 	else if (!dialect.allow_writes) writes = off(CODE_SENTENCES.WRITES_DISABLED);
 	else if (dialect.capabilities.remove !== true) writes = off("This store node cannot remove documents. Update the pipeline's store node to a version that supports Vector Explorer.");

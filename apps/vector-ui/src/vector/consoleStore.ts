@@ -30,7 +30,8 @@
 //   STATS      `stats({mode:'full'})` on open, after a removal, after a
 //              completed upload and on Refresh; `stats({mode:'quick'})` at
 //              most every 15 s while the console is visible. A failure keeps
-//              the last figures (the strip greys them) and says why.
+//              the last figures (the strip greys them) and says why; with no
+//              figures yet, the full call is asked again every 15 s.
 //   DIRECTORY  the auto-pager of vector/documents.ts: page after page in the
 //              background while the console is visible; hidden, it pauses
 //              (and sorts what is loaded); shown, it resumes at its cursor. A
@@ -40,7 +41,8 @@
 //              sends nothing and says so; Confirm sends the batches once
 //              (never retried), announces the rows the node removed, then
 //              refreshes the stats in full and the directory. Nothing opens
-//              or is sent while writes are not available.
+//              or is sent while writes are not available, or while another
+//              removal runs.
 //
 // Every call goes through injected functions, and time through an injected
 // clock, so tests drive it without a browser.
@@ -55,7 +57,7 @@ import type { IPagerState } from './documents';
 import type { IChunksPageView, IDocumentsPageView, IRemoveView, IStatsView } from './results';
 import { statsRefreshPlan } from './stats';
 import type { StatsTrigger } from './stats';
-import { CANCELLED_TEXT, failureText } from './wording';
+import { BUSY, CANCELLED_TEXT, failureText } from './wording';
 import type { IFailureText } from './wording';
 
 // =============================================================================
@@ -183,6 +185,8 @@ export function createConsoleStore(deps: IConsoleDeps, opts: IConsoleOptions): I
 	let statsSeq = 0;
 	let statsApplied = 0;
 	let statsInFlight = 0;
+	// When the last stats call failed (null once one answers): before any answer, ticks retry in full.
+	let statsFailedAt: number | null = null;
 	// Directory: each listing is a run; a page of an older run never lands.
 	let dirRun = 0;
 	let pumping: number | null = null;
@@ -207,11 +211,13 @@ export function createConsoleStore(deps: IConsoleDeps, opts: IConsoleOptions): I
 			const view = await deps.stats(mode);
 			if (disposed || seq < statsApplied) return;
 			statsApplied = seq;
+			statsFailedAt = null;
 			set({ stats: { view, status: 'ready', error: null, lastAt: deps.clock.now(), mode } });
 		} catch (error) {
 			if (disposed || seq < statsApplied) return;
 			const text = failureText(error);
 			if (text === null) return;
+			statsFailedAt = deps.clock.now();
 			set({ stats: { ...state.stats, status: 'error', error: text } });
 		} finally {
 			statsInFlight -= 1;
@@ -220,7 +226,7 @@ export function createConsoleStore(deps: IConsoleDeps, opts: IConsoleOptions): I
 
 	/** Run the refresh plan for a trigger. */
 	function planStats(trigger: StatsTrigger): void {
-		const mode = statsRefreshPlan(trigger, { visible: state.visible, lastAt: state.stats.lastAt, now: deps.clock.now(), inFlight: statsInFlight > 0 });
+		const mode = statsRefreshPlan(trigger, { visible: state.visible, lastAt: state.stats.lastAt, failedAt: statsFailedAt, now: deps.clock.now(), inFlight: statsInFlight > 0 });
 		if (mode !== null) void loadStats(mode);
 	}
 
@@ -348,6 +354,11 @@ export function createConsoleStore(deps: IConsoleDeps, opts: IConsoleOptions): I
 		},
 		requestRemove(targets: readonly IRemoveTarget[]): void {
 			if (!writesEnabled || targets.length === 0) return;
+			// One removal at a time: nothing opens while one runs (a trash button outside the directory says why).
+			if (state.removal.status === 'running') {
+				deps.announce(BUSY.removing);
+				return;
+			}
 			set({ confirm: { kind: targets.length === 1 ? 'single' : 'multi', targets: [...targets] } });
 		},
 		cancelRemove(): void {
@@ -357,7 +368,7 @@ export function createConsoleStore(deps: IConsoleDeps, opts: IConsoleOptions): I
 		},
 		async confirmRemove(): Promise<void> {
 			const pending = state.confirm;
-			if (pending === null || !writesEnabled) return;
+			if (pending === null || !writesEnabled || state.removal.status === 'running') return;
 			set({ confirm: null, removal: { status: 'running', message: null } });
 			const outcome = await runRemoval(
 				pending.targets.map((t) => t.objectId),

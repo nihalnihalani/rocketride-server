@@ -51,7 +51,7 @@ import IngestPanel from '../components/IngestPanel';
 import StatsStrip from '../components/StatsStrip';
 import { getDocs } from '../docs';
 import { documentUri } from '../vector/addresses';
-import { alsoReaches } from '../vector/consoleModel';
+import { alsoReaches, writesDuringRemoval } from '../vector/consoleModel';
 import { roleLine, vectorCardView } from '../vector/connections';
 import { consoleColumns } from '../vector/layout';
 import { providerTitle } from '../vector/support';
@@ -171,14 +171,14 @@ export const ConsoleView: React.FC<IConsoleViewProps> = ({ opened, active }) => 
 				</div>
 			)}
 			<StatsStrip stats={state.stats} dialect={dialect} readOnly={model.readOnly} />
-			{state.removal.message && (
+			{(state.removal.status === 'running' || state.removal.message) && (
 				<div role="status" style={{ ...styles.small, padding: '6px 24px' }}>
 					{state.removal.status === 'running' ? BUSY.removing : state.removal.message}
 				</div>
 			)}
 			<div ref={body} style={{ flex: 1, minHeight: 0, display: tab === 'console' ? 'flex' : 'none', flexDirection: cols.stacked ? 'column' : 'row', gap: 12, padding: 12, overflow: cols.stacked ? 'auto' : 'hidden' }}>
 				<div style={{ flex: cols.stacked ? 'none' : `0 0 ${cols.left}`, height: cols.stacked ? 520 : undefined, display: 'flex', flexDirection: 'column', minWidth: 0, minHeight: 0 }}>
-					<DocumentDirectory pager={state.directory} selectedId={selectedId} writes={model.writes} onSelect={(item) => entry.selection.selectDocument({ objectId: item.objectId, path: item.path })} onRemove={(targets) => entry.controller.requestRemove(targets)} onLoadMore={() => entry.controller.loadMoreDocuments()} onRetry={() => entry.controller.retryDocuments()} />
+					<DocumentDirectory pager={state.directory} selectedId={selectedId} writes={writesDuringRemoval(model.writes, state.removal.status)} onSelect={(item) => entry.selection.selectDocument({ objectId: item.objectId, path: item.path })} onRemove={(targets) => entry.controller.requestRemove(targets)} onLoadMore={() => entry.controller.loadMoreDocuments()} onRetry={() => entry.controller.retryDocuments()} />
 					<ChunkList chunks={state.chunks} path={selection.document?.path ?? null} onMore={() => entry.controller.loadMoreChunks()} onOpen={(chunkId) => actions.openDocument(state.chunks.objectId ?? '', chunkId)} onMap={(key) => actions.showOnMap([key], 'document')} />
 				</div>
 				<div style={{ flex: cols.stacked ? 'none' : `1 1 ${cols.right}`, display: 'flex', flexDirection: 'column', gap: 12, minWidth: 0, minHeight: 0 }}>

@@ -99,6 +99,10 @@ test('refresh plan: full on open, after a write or an upload and on Refresh; qui
 	assert.equal(statsRefreshPlan('tick', { visible: false, lastAt: now - 60_000, now, inFlight: false }), null, 'never while hidden');
 	assert.equal(statsRefreshPlan('tick', { visible: true, lastAt: now - 60_000, now, inFlight: true }), null, 'never on top of a call in flight');
 	assert.equal(statsRefreshPlan('tick', { visible: true, lastAt: null, now, inFlight: false }), null, 'the first answer is a full one');
+	assert.equal(statsRefreshPlan('tick', { visible: true, lastAt: null, failedAt: now - 15_000, now, inFlight: false }), 'full', 'a failed first load is asked again in full');
+	assert.equal(statsRefreshPlan('tick', { visible: true, lastAt: null, failedAt: now - 14_999, now, inFlight: false }), null, 'at the quick-stats pace');
+	assert.equal(statsRefreshPlan('tick', { visible: false, lastAt: null, failedAt: now - 60_000, now, inFlight: false }), null, 'never while hidden');
+	assert.equal(statsRefreshPlan('tick', { visible: true, lastAt: now - 15_000, failedAt: now - 60_000, now, inFlight: false }), 'quick', 'with figures, a failure is refreshed quickly as before');
 });
 
 test('"counts as of": seconds, then minutes; nothing when the node gave no time', () => {
