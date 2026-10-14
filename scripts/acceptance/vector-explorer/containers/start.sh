@@ -98,10 +98,11 @@ run_args_of() {
 	esac
 }
 
-# running | stopped | absent
+# running | stopped | absent. Scoped to containers: an image, network or volume of the
+# same name would otherwise answer, with no container state.
 state_of() {
 	local running
-	if ! running="$("$DOCKER" inspect -f '{{.State.Running}}' "$1" 2>/dev/null)"; then
+	if ! running="$("$DOCKER" inspect --type container -f '{{.State.Running}}' "$1" 2>/dev/null)"; then
 		echo absent
 	elif [ "$running" = 'true' ]; then
 		echo running
@@ -115,7 +116,7 @@ check_pin() {
 	local name="$1" pinned digest image_id repo_digests
 	pinned="$(image_of "$name")"
 	digest="${pinned##*@}"
-	image_id="$("$DOCKER" inspect -f '{{.Image}}' "$name" 2>/dev/null || true)"
+	image_id="$("$DOCKER" inspect --type container -f '{{.Image}}' "$name" 2>/dev/null || true)"
 	repo_digests="$("$DOCKER" image inspect -f '{{json .RepoDigests}}' "$image_id" 2>/dev/null || true)"
 	case "$image_id $repo_digests" in
 	*"$digest"*) return 0 ;;

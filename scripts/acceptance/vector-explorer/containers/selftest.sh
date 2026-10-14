@@ -17,17 +17,30 @@ FAILURES=0
 
 cat > "$WORK/docker" <<'FAKE'
 #!/usr/bin/env bash
-# Fake docker: state lines are "<name> <running|stopped>" in $FAKE_STATE; calls go to $FAKE_LOG.
+# Fake docker: state lines are "<name> <running|stopped|image>" in $FAKE_STATE; calls go to $FAKE_LOG.
+# "image" is an image (not a container) of that name: `inspect` without `--type container`
+# resolves it and, as some docker versions do for a key the object lacks, prints <no value>.
 echo "$*" >> "$FAKE_LOG"
 cmd="$1"; shift
 case "$cmd" in
   inspect)
-    fmt=''
-    if [ "$1" = "-f" ] || [ "$1" = "--format" ]; then fmt="$2"; shift 2; fi
+    fmt=''; kind=''
+    while [ $# -gt 1 ]; do
+      case "$1" in
+        -f | --format) fmt="$2"; shift 2 ;;
+        --type) kind="$2"; shift 2 ;;
+        *) break ;;
+      esac
+    done
     name="$1"
-    line="$(grep "^$name " "$FAKE_STATE" || true)"
-    [ -z "$line" ] && { echo "Error: No such object: $name" >&2; exit 1; }
+    line="$(grep "^$name " "$FAKE_STATE" | head -1 || true)"
     state="${line#* }"
+    if [ -z "$line" ] || { [ "$state" = image ] && [ "$kind" = container ]; }; then
+      echo "Error: No such object: $name" >&2; exit 1
+    fi
+    if [ "$state" = image ]; then
+      echo '<no value>'; exit 0
+    fi
     case "$fmt" in
       *State.Running*) [ "$state" = running ] && echo true || echo false ;;
       *.Image*) echo "sha256:0000" ;;
@@ -148,6 +161,26 @@ if [ "$STATUS" -eq 0 ] && [ "$(calls '^run ')" -eq 1 ] && [ "$(calls '^run .*--n
   pass 'only vx-chroma created'
 else
   fail 'more than the named container was touched'
+fi
+
+# 8. Every container lookup is scoped to containers (an image, network or volume can share the name).
+run_case 'inspect scoped to containers' "$ALL_RUNNING" --check
+lookups="$(grep '^inspect ' "$WORK/log" || true)"
+if [ "$STATUS" -eq 0 ] && [ -n "$lookups" ] && ! echo "$lookups" | grep -v -q -- '--type container'; then
+  pass 'every inspect names --type container'
+else
+  fail 'a lookup could resolve a non-container object'
+fi
+
+# 9. An image named like a missing container: the container is created, not "started".
+run_case 'image named like the container' 'gx-pgvector running
+vx-pgbouncer running
+vx-qdrant running
+vx-chroma image' vx-chroma
+if [ "$STATUS" -eq 0 ] && [ "$(calls '^run .*--name vx-chroma')" -eq 1 ] && [ "$(calls '^start ')" -eq 0 ]; then
+  pass 'created, not started'
+else
+  fail 'the image was taken for a stopped container'
 fi
 
 if [ "$FAILURES" -ne 0 ]; then
