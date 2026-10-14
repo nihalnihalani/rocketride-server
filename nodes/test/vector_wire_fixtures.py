@@ -14,9 +14,15 @@ stub), on a new collection and on a legacy-shaped copy of it, written to
 
 Answers are stored in a canonical form: floats are rounded to 4 decimal
 places, and the values of the keys in ``SCRUB_KEYS`` (times, durations, point
-ids, caller ids, sizes) are replaced by ``"<scrubbed>"``; every file lists the
-keys it scrubbed in ``__scrub__``. The upload names are fixed
-(``C:/demo/<folder>/<file>``), so objectIds are too. The comparison is exact,
+ids, caller ids, sizes, cursors, sample ids) are replaced by ``"<scrubbed>"``
+(a null stays null); every file lists the keys it scrubbed in ``__scrub__``.
+The upload names are fixed (``C:/demo/<folder>/<file>``), so objectIds are
+too, and the legacy copy's point ids are derived, not random, so a listing in
+point-id order is the same on every run. A ``documents`` page that says
+``sorted: false`` is compared as a set of documents; the samples ask for more
+points than the corpus has chunks (``WIRE_SAMPLE_N``), and generation fails
+when a sample holds fewer, because a partial sample may be filled at random.
+The comparison is exact,
 except that the floats of the embedding-derived answers (``SIMILARITY_TOOLS``:
 PCA coordinates, similarities, scores) may differ by ``FLOAT_TOLERANCE``,
 because their last digits depend on the CPU and BLAS build; their shapes,
@@ -62,6 +68,9 @@ SCRUB_KEYS = frozenset(
         'orgId',
         'backend_version',
         'retry_after_s',
+        # Opaque handles: a cursor may be a point id, a sample id hashes the sampled keys.
+        'next_cursor',
+        'sample_id',
     }
 )
 SCRUBBED = '<scrubbed>'
@@ -71,6 +80,14 @@ FLOAT_DIGITS = 4
 WIRE_PREFIX = 'C:/demo/'
 WIRE_COLLECTION = 'vx_tp_wire'
 WIRE_LEGACY = 'vx_tp_wire_legacy'
+
+# The wire samples ask for more points than the wire corpus has chunks, so every
+# chunk is in the sample: a partial sample may be filled at random (Qdrant's
+# native RANDOM), which no committed capture could match on the next run.
+WIRE_SAMPLE_N = 500
+
+# The tools every backend has a capture of, on the new and on the legacy side.
+REQUIRED_TOOLS = ('dialect', 'stats', 'documents', 'chunks', 'sample', 'search', 'remove_document')
 
 
 # Answers derived from embeddings (similarities, PCA coordinates, scores): their
@@ -182,6 +199,24 @@ def file_name(backend: str, tool: str, case: Optional[str] = None) -> str:
     return f'{backend}/{tool}{"." + case if case else ""}.json'
 
 
+def required_captures(backend: str) -> List[str]:
+    """The capture files every backend must have: each REQUIRED_TOOLS answer, new and legacy."""
+    return [file_name(backend, tool, case) for tool in REQUIRED_TOOLS for case in (None, 'legacy')]
+
+
+def sample_problem(answer: Any) -> Optional[str]:
+    """Why a successful sample answer is not reproducible (it holds fewer points than the collection has chunks)."""
+    if not isinstance(answer, dict) or answer.get('success') is False:
+        return None
+    total = (answer.get('of') or {}).get('chunks')
+    if answer.get('n') is None or total is None or answer['n'] != total:
+        return (
+            f'the sample holds {answer.get("n")} of {total} chunks: a wire sample must hold every chunk '
+            f'(n={WIRE_SAMPLE_N}) or its capture is not reproducible'
+        )
+    return None
+
+
 def _write(out_dir: Path, captures: Dict[str, Any]) -> None:
     for name, value in sorted(captures.items()):
         target = out_dir / name
@@ -205,7 +240,7 @@ def _captures_for(
 
     def put(tool: str, c: Optional[str], answer: Any) -> None:
         name = file_name(backend, tool, case(c))
-        problem = outcome_problem(answer, EXPECTED[(tool, c)])
+        problem = outcome_problem(answer, EXPECTED[(tool, c)]) or (sample_problem(answer) if tool == 'sample' else None)
         if problem:
             problems.append(f'{name}: {problem}')
         out[name] = answer
@@ -217,9 +252,9 @@ def _captures_for(
     put('chunks', None, side.tool('chunks', {'object_id': multi, 'after_chunk': -1, 'limit': 2, 'deleted': 'active'}))
     put('chunks', 'not_found', side.tool('chunks', {'object_id': 'schema'}))
     put('vectors', None, side.tool('vectors', {'keys': [[multi, 0]]}))
-    sample = side.tool('sample', {'n': 40, 'seed': 7, 'mode': 'detailed', 'knn_k': 5})
+    sample = side.tool('sample', {'n': WIRE_SAMPLE_N, 'seed': 7, 'mode': 'detailed', 'knn_k': 5})
     put('sample', None, sample)
-    put('sample', 'light', side.tool('sample', {'n': 40, 'seed': 7, 'mode': 'light', 'knn_k': 5}))
+    put('sample', 'light', side.tool('sample', {'n': WIRE_SAMPLE_N, 'seed': 7, 'mode': 'light', 'knn_k': 5}))
     if isinstance(sample, dict) and sample.get('sample_id'):
         put(
             'project',
@@ -245,6 +280,22 @@ def _captures_for(
     put('remove_document', 'reserved_id', side.tool('remove_document', {'object_ids': ['schema']}))
     if problems:
         raise CaptureMismatch('; '.join(problems))
+    return out
+
+
+def _backend_captures(
+    tp, new, legacy, backend: str, multi: str, second: str, water: List[float], unrelated: List[float]
+) -> Dict[str, Any]:
+    """Both sides' captures, then on each side the removal of ``second`` (it changes the data, so it goes last)."""
+    out = _captures_for(tp, new, 'new', backend, multi, water, unrelated)
+    out.update(_captures_for(tp, legacy, 'legacy', backend, second, water, unrelated))
+    for side, case in ((new, None), (legacy, 'legacy')):
+        name = file_name(backend, 'remove_document', case)
+        removed = side.tool('remove_document', {'object_ids': [second]})
+        problem = outcome_problem(removed, OK)
+        if problem:
+            raise CaptureMismatch(f'{name}: {problem}')
+        out[name] = removed
     return out
 
 
@@ -317,15 +368,8 @@ def live_fixtures(only: Optional[Sequence[str]] = None) -> Dict[str, Any]:
                         ('tools_1', 'chat_1', 'ingest_1'),
                     )
                     sides.append(legacy)
-                    out.update(_captures_for(tp, new, 'new', backend, multi, water, unrelated))
                     second = tp.object_id(WIRE_PREFIX + 'field/kestrel_field_guide.md')
-                    out.update(_captures_for(tp, legacy, 'legacy', backend, second, water, unrelated))
-                    # Last, because it changes the data: a removal and what it reports.
-                    removed = new.tool('remove_document', {'object_ids': [second]})
-                    problem = outcome_problem(removed, OK)
-                    if problem:
-                        raise CaptureMismatch(f'{file_name(backend, "remove_document")}: {problem}')
-                    out[file_name(backend, 'remove_document')] = removed
+                    out.update(_backend_captures(tp, new, legacy, backend, multi, second, water, unrelated))
                 finally:
                     for side in sides:
                         side.stop()
@@ -367,6 +411,19 @@ def _close(a: Any, b: Any, tolerance: float) -> bool:
     return a == b
 
 
+def _comparable(name: str, value: Any) -> Any:
+    """A documents page that says ``sorted: false`` compared as a set: its items ordered by objectId.
+
+    Such a backend lists in storage order (Qdrant: point-id order), which the
+    answer itself declares unordered; the page's members are still compared.
+    """
+    if _tool_of(name) == 'documents' and isinstance(value, dict) and value.get('sorted') is False:
+        items = value.get('items')
+        if isinstance(items, list) and all(isinstance(i, dict) for i in items):
+            return {**value, 'items': sorted(items, key=lambda i: (str(i.get('objectId')), str(i.get('path'))))}
+    return value
+
+
 def differences(regenerated: Dict[str, Any], on_disk: Dict[str, Any]) -> List[str]:
     """File names whose canonical form differs, is missing on disk or is not regenerated."""
     out = []
@@ -374,9 +431,9 @@ def differences(regenerated: Dict[str, Any], on_disk: Dict[str, Any]) -> List[st
         if name not in on_disk or name not in regenerated:
             out.append(name)
             continue
-        fresh = stored(regenerated[name])
+        fresh = _comparable(name, stored(regenerated[name]))
         tolerance = FLOAT_TOLERANCE if _tool_of(name) in SIMILARITY_TOOLS else 0.0
-        if not _close(fresh, on_disk[name], tolerance):
+        if not _close(fresh, _comparable(name, on_disk[name]), tolerance):
             out.append(name)
     return out
 

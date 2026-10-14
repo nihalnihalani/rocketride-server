@@ -78,6 +78,30 @@ def test_stored_form_is_idempotent_and_valid_json():
     json.dumps(once, allow_nan=False)
 
 
+def test_opaque_cursors_and_sample_ids_are_scrubbed_but_their_absence_is_kept():
+    out = gen.stored({'items': [], 'next_cursor': 'eyJvIjoyfQ', 'sample_id': 's-7-a1b2c3d4'})
+    assert out['next_cursor'] == gen.SCRUBBED and out['sample_id'] == gen.SCRUBBED
+    # The end of a listing (no cursor) is part of the answer.
+    assert gen.stored({'items': [], 'next_cursor': None})['next_cursor'] is None
+
+
+def test_an_unsorted_documents_page_compares_as_a_set_of_documents():
+    a = {'objectId': 'a', 'path': 'C:/demo/a.md', 'chunks': 2}
+    b = {'objectId': 'b', 'path': 'C:/demo/b.md', 'chunks': 1}
+    on_disk = {'qdrant/documents.legacy.json': gen.stored({'items': [a, b], 'sorted': False})}
+    # A backend that lists in storage order may return the same page in another order.
+    assert gen.differences({'qdrant/documents.legacy.json': {'items': [b, a], 'sorted': False}}, on_disk) == []
+    # Another page, or a sorted listing in another order, is a difference.
+    c = dict(b, objectId='c')
+    assert gen.differences({'qdrant/documents.legacy.json': {'items': [c, a], 'sorted': False}}, on_disk) == [
+        'qdrant/documents.legacy.json'
+    ]
+    sorted_disk = {'pgvector/documents.json': gen.stored({'items': [a, b], 'sorted': True})}
+    assert gen.differences({'pgvector/documents.json': {'items': [b, a], 'sorted': True}}, sorted_disk) == [
+        'pgvector/documents.json'
+    ]
+
+
 def test_file_names_and_differences():
     assert gen.file_name('pgvector', 'stats') == 'pgvector/stats.json'
     assert gen.file_name('qdrant', 'stats', 'quick.legacy') == 'qdrant/stats.quick.legacy.json'
@@ -151,7 +175,7 @@ class _FakeSide:
             if node != 'store_1':
                 return {'success': False, 'code': 'WRITES_DISABLED', 'error': 'switch'}
         if name == 'sample':
-            return {'success': True, 'sample_id': 's-7-0000aaaa'}
+            return {'success': True, 'sample_id': 's-7-0000aaaa', 'n': 12, 'of': {'chunks': 12, 'documents': 8}}
         return {'success': True}
 
 
@@ -177,6 +201,32 @@ def test_generation_fails_when_a_refusal_is_answered_as_success():
         gen._captures_for(_TP, side, 'new', 'qdrant', 'multi', [0.1] * 384, [0.2] * 384)
 
 
+def test_a_wire_sample_must_hold_every_chunk_so_its_capture_is_reproducible():
+    side = _FakeSide()
+    gen._captures_for(_TP, side, 'new', 'qdrant', 'multi', [0.1] * 384, [0.2] * 384)
+    asked = [inp['n'] for name, inp, _, _ in side.calls if name == 'sample']
+    assert asked and all(n == gen.WIRE_SAMPLE_N for n in asked)
+    # A backend that fills a partial sample at random (Qdrant's native RANDOM) answers differently each run.
+    partial = {'success': True, 'sample_id': 's-7-0000bbbb', 'n': 40, 'of': {'chunks': 80, 'documents': 8}}
+    with pytest.raises(gen.CaptureMismatch, match='sample'):
+        gen._captures_for(
+            _TP, _FakeSide(wrong={('sample', 'tools_1', 'store_1'): partial}), 'new', 'qdrant', 'multi', [0.1], [0.2]
+        )
+
+
+def test_every_required_capture_is_generated_for_both_sides():
+    new, legacy = _FakeSide(), _FakeSide()
+    out = gen._backend_captures(_TP, new, legacy, 'qdrant', 'multi', 'second', [0.1] * 384, [0.2] * 384)
+    missing = sorted(set(gen.required_captures('qdrant')) - set(out))
+    assert missing == [], f'the coverage test demands captures the generator never writes: {missing}'
+    # Each side removes a document of its own last, after every read of that side.
+    for side in (new, legacy):
+        removal = [
+            i for i, c in enumerate(side.calls) if c[0] == 'remove_document' and c[1] == {'object_ids': ['second']}
+        ]
+        assert removal == [len(side.calls) - 1], side.calls[-3:]
+
+
 def test_a_live_suite_does_not_run_under_mocks(monkeypatch):
     monkeypatch.setenv('ROCKETRIDE_MOCK', '/somewhere/mocks')
     assert gen.live_blocker().startswith('NOT RUN: ')
@@ -193,9 +243,8 @@ def test_a_live_suite_does_not_run_under_mocks(monkeypatch):
 def test_captures_are_committed_for_every_supported_backend():
     names = set(_committed())
     for backend in ('pgvector', 'rocketride_vector', 'qdrant', 'chroma'):
-        for tool in ('dialect', 'stats', 'documents', 'chunks', 'sample', 'search', 'remove_document'):
-            assert gen.file_name(backend, tool) in names, f'missing {gen.file_name(backend, tool)}'
-            assert gen.file_name(backend, tool, 'legacy') in names, f'missing {gen.file_name(backend, tool, "legacy")}'
+        missing = sorted(set(gen.required_captures(backend)) - names)
+        assert missing == [], f'missing {missing}'
 
 
 @pytest.fixture(scope='module')
