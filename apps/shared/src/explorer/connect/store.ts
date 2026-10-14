@@ -53,7 +53,8 @@
 //   detail "Read-only: no Tools source is running" while it is ready. A probe
 //   of such a card that fails with "not found in pipeline" means the anchor
 //   source cannot reach that node: the card is `stopped`, "Not reachable from
-//   the <role> source".
+//   the <role> source". Like a probe that failed at the node, that answer is
+//   kept on refreshes nobody asked for (see "WHEN IT PROBES AGAIN").
 //
 // A VANISHED ENDPOINT KEEPS ITS TOKEN
 //   Discovery lists RUNNING tasks only, so a task that is restarting vanishes
@@ -84,7 +85,9 @@
 //   when somebody asked: an explicit `refresh`, a restart or reconnect
 //   (`reprobe`), `probe` (Test connection), or a changed token. A refresh
 //   nobody asked for (focus, an ordinary task event, a rebind) keeps its last
-//   answer. An endpoint whose probe said its task is not running is cheap to
+//   answer. A read-only card whose node the anchor source cannot reach is kept
+//   the same way: that answer, too, came from the task. An endpoint whose
+//   probe said its task is not running is cheap to
 //   ask again (the server refuses before the task) and is probed on any refresh.
 //   An endpoint that vanished from discovery is not probed at all: `probe`
 //   sends nothing and answers null, and an answer to a probe that was in
@@ -100,9 +103,9 @@
 import { ExplorerToolError, readErrorCode, readErrorMessage } from '../errors';
 import { checkObject, isPlainObject } from '../checks';
 import type { IGenerationTicket } from '../generation';
-import type { IExplorerClient, IExplorerComponent, IExplorerEndpoint, IExplorerIdentity, IProbeResult, IRoleSpec, ISendFile } from '../types';
+import type { IExplorerClient, IExplorerEndpoint, IExplorerIdentity, IProbeResult, IRoleSpec, ISendFile } from '../types';
 import { READ_ONLY_DETAIL, discoverToolEndpoints, mapWithConcurrency } from './discovery';
-import type { IDiscoveredEndpoint } from './discovery';
+import type { IDiscoveredEndpoint, NodeFilter } from './discovery';
 import { identityFingerprint } from './identity';
 import { DEFAULT_TOOL_TIMEOUTS, createToolSession } from './session';
 import type { IInvokeOptions, IToolSession, IToolSessionOptions } from './session';
@@ -184,8 +187,15 @@ export interface IEndpointStoreOptions {
 	 * Which matching components of a group become endpoints (default: all);
 	 * passed to discovery (see `IDiscoveryOptions.nodeFilter`).
 	 */
-	nodeFilter?: (component: IExplorerComponent, group: { toolsSource: string | null; anchorRole: string; boundRoles: readonly string[] }) => boolean;
+	nodeFilter?: NodeFilter;
 }
+
+/**
+ * How long `IRoleChannel.ask` waits for an answer when the caller names no
+ * timeout (120 s, Vector Explorer's chat wait). Pass `timeoutMs: null` to wait
+ * without a bound.
+ */
+export const DEFAULT_ASK_TIMEOUT_MS = 120_000;
 
 /**
  * One role of a multi-role connection (Vector Explorer: ingest, chat, tools),
@@ -205,10 +215,19 @@ export interface IRoleChannel {
 	 * Upload files through the role's data lane (`client.sendFiles`). Resolves
 	 * with one plain record per file, in order: a copy of the SDK's upload
 	 * result, or `{ action: 'error', filepath, error }` when none came back.
+	 * Not bounded by a client timeout, by design: a large upload legitimately
+	 * takes long, and the SDK reports its progress through its own events.
 	 */
 	sendFiles(files: ISendFile[], opts?: { maxConcurrent?: number }): Promise<Array<Record<string, unknown>>>;
-	/** Ask the role's source a question (`client.chat`); `timeoutMs` bounds the wait, an expired `generation` drops the answer. */
-	ask(question: unknown, opts?: { onSSE?: (type: string, data: Record<string, unknown>) => Promise<void>; timeoutMs?: number; generation?: IGenerationTicket }): Promise<Record<string, unknown>>;
+	/**
+	 * Ask the role's source a question (`client.chat`). `timeoutMs` bounds the
+	 * wait (default {@link DEFAULT_ASK_TIMEOUT_MS}; `null` waits without a
+	 * bound); an expired `generation` drops the answer as `stale`. Stream
+	 * events reach `onSSE` only while the question is pending and its
+	 * generation is current: those of a question that timed out, was replaced
+	 * or already settled are dropped.
+	 */
+	ask(question: unknown, opts?: { onSSE?: (type: string, data: Record<string, unknown>) => Promise<void>; timeoutMs?: number | null; generation?: IGenerationTicket }): Promise<Record<string, unknown>>;
 	/** Call a node tool through the role's token; `opts.nodeId` is required. Same checks and budgets as a session, never retried. */
 	invoke<T = unknown>(tool: string, input?: Record<string, unknown>, opts?: IInvokeOptions): Promise<T>;
 }
@@ -249,7 +268,9 @@ export interface IEndpointStore {
 	 * A channel on one role of an endpoint's connection. Its calls reject with
 	 * `ExplorerToolError{kind:'unavailable'}` while the role is not bound; the
 	 * token is read at call time, so a channel made before the role's source
-	 * started works once it runs.
+	 * started works once it runs. The same channel is handed out for the same
+	 * endpoint key, role and client until `reset()`, so it may be kept for the
+	 * life of a card (and is stable as a React dependency).
 	 */
 	channel(client: IExplorerClient, endpoint: IExplorerEndpoint, role: string): IRoleChannel;
 }
@@ -320,6 +341,8 @@ export function createEndpointStore(options: IEndpointStoreOptions): IEndpointSt
 	const callHints = new Map<string, boolean | undefined>();
 	/** Sessions already opened, by endpoint key and client. */
 	const sessions = new Map<string, { client: IExplorerClient; session: IToolSession }>();
+	/** Role channels already handed out: endpoint key -> role -> the channel and its client. */
+	const channels = new Map<string, Map<string, { client: IExplorerClient; channel: IRoleChannel }>>();
 	/**
 	 * The last good `dialect` answer of an endpoint that vanished from discovery
 	 * while its token is kept (see "A VANISHED ENDPOINT KEEPS ITS TOKEN"). Read by
@@ -409,6 +432,21 @@ export function createEndpointStore(options: IEndpointStoreOptions): IEndpointSt
 	}
 
 	/**
+	 * Whether a failed probe of a read-only card says the anchor source cannot
+	 * reach the node. The engine raises this as a plain error with no code
+	 * (packages/ai/src/ai/modules/data/data_conn.py, `Node "<id>" not found in
+	 * pipeline`), so its text is the only signal; a change of that wording
+	 * turns these cards `unreachable` instead.
+	 *
+	 * @param endpoint - The endpoint.
+	 * @param result - What its probe returned.
+	 * @returns True when the node is not reachable from the anchor source.
+	 */
+	function notReachableFromAnchor(endpoint: IExplorerEndpoint, result: IProbeResult | undefined): boolean {
+		return endpoint.readOnly === true && result !== undefined && !result.ok && result.error !== undefined && /not found in pipeline/i.test(result.error.message);
+	}
+
+	/**
 	 * Decide an endpoint's state from a probe result.
 	 *
 	 * @param endpoint - The endpoint.
@@ -418,8 +456,8 @@ export function createEndpointStore(options: IEndpointStoreOptions): IEndpointSt
 	function classify(endpoint: IExplorerEndpoint, result: IProbeResult): { state: IExplorerEndpoint['state']; detail?: string } {
 		if (result.ok) return endpoint.readOnly === true ? { state: 'ready', detail: READ_ONLY_DETAIL } : { state: 'ready' };
 		const error = result.error;
-		if (endpoint.readOnly === true && error !== undefined && /not found in pipeline/i.test(error.message)) {
-			// The anchor source cannot reach this node (a read-only card lists every store).
+		if (notReachableFromAnchor(endpoint, result)) {
+			// The anchor source cannot reach this node (a read-only card can list a store it does not feed).
 			return { state: 'stopped', detail: `Not reachable from the ${endpoint.anchorRole ?? 'anchor'} source` };
 		}
 		if (error !== undefined && error.code !== undefined && NOT_RUNNING_CODES.has(error.code)) {
@@ -532,6 +570,27 @@ export function createEndpointStore(options: IEndpointStoreOptions): IEndpointSt
 	// ── Role channels ─────────────────────────────────────────────────────────
 
 	function channel(client: IExplorerClient, endpoint: IExplorerEndpoint, role: string): IRoleChannel {
+		let byRole = channels.get(endpoint.key);
+		const cached = byRole?.get(role);
+		if (cached && cached.client === client) return cached.channel;
+		const created = createChannel(client, endpoint, role);
+		if (byRole === undefined) {
+			byRole = new Map();
+			channels.set(endpoint.key, byRole);
+		}
+		byRole.set(role, { client, channel: created });
+		return created;
+	}
+
+	/**
+	 * Build a role channel (see {@link IRoleChannel}).
+	 *
+	 * @param client - The client.
+	 * @param endpoint - The endpoint.
+	 * @param role - The role.
+	 * @returns The channel.
+	 */
+	function createChannel(client: IExplorerClient, endpoint: IExplorerEndpoint, role: string): IRoleChannel {
 		const known = Object.prototype.hasOwnProperty.call(options.roles.roles, role);
 		/**
 		 * The role's token now, or undefined.
@@ -598,7 +657,7 @@ export function createEndpointStore(options: IEndpointStoreOptions): IEndpointSt
 			});
 		}
 
-		async function ask(question: unknown, opts: { onSSE?: (type: string, data: Record<string, unknown>) => Promise<void>; timeoutMs?: number; generation?: IGenerationTicket } = {}): Promise<Record<string, unknown>> {
+		async function ask(question: unknown, opts: { onSSE?: (type: string, data: Record<string, unknown>) => Promise<void>; timeoutMs?: number | null; generation?: IGenerationTicket } = {}): Promise<Record<string, unknown>> {
 			const tool = 'chat';
 			const token = requireToken(tool);
 			if (typeof client.chat !== 'function') {
@@ -610,12 +669,21 @@ export function createEndpointStore(options: IEndpointStoreOptions): IEndpointSt
 					throw new ExplorerToolError({ kind: 'stale', tool, message: 'The answer was dropped: a newer question replaced it.' });
 				}
 			};
-			const waitMs = opts.timeoutMs;
+			const waitMs = opts.timeoutMs === undefined ? DEFAULT_ASK_TIMEOUT_MS : opts.timeoutMs;
+			// Stream events count only while this question is pending and current:
+			// nothing can cancel it, so a dropped question's stream is dropped here.
+			let pending = true;
+			const appSSE = opts.onSSE;
+			const onSSE = appSSE === undefined ? undefined : async (type: string, data: Record<string, unknown>): Promise<void> => {
+				if (!pending || (ticket !== undefined && !ticket.isCurrent())) return;
+				await appSSE(type, data);
+			};
 			let value: unknown;
 			try {
-				const call = client.chat({ token, question, ...(opts.onSSE !== undefined ? { onSSE: opts.onSSE } : {}) });
-				value = waitMs === undefined ? await call : await new Promise<unknown>((resolve, reject) => {
+				const call = client.chat({ token, question, ...(onSSE !== undefined ? { onSSE } : {}) });
+				value = waitMs === null ? await call : await new Promise<unknown>((resolve, reject) => {
 					const timer = clock.setTimer(() => {
+						pending = false;
 						call.catch(() => undefined);
 						reject(new ExplorerToolError({
 							kind: 'timeout',
@@ -631,6 +699,8 @@ export function createEndpointStore(options: IEndpointStoreOptions): IEndpointSt
 			} catch (error) {
 				dropIfStale();
 				throw raised(tool, error);
+			} finally {
+				pending = false;
 			}
 			dropIfStale();
 			if (!isPlainObject(value)) throw new ExplorerToolError({ kind: 'malformed', tool, message: 'The chat answer is not an object.' });
@@ -708,8 +778,9 @@ export function createEndpointStore(options: IEndpointStoreOptions): IEndpointSt
 				next.push({ ...endpoint, state: 'ready', running: true });
 				continue;
 			}
-			const failedAtNode = before !== undefined && probes[endpoint.key]?.ok === false
-				&& (before.state === 'unreachable' || before.state === 'inaccessible');
+			const lastProbe = probes[endpoint.key];
+			const failedAtNode = before !== undefined && lastProbe?.ok === false
+				&& (before.state === 'unreachable' || before.state === 'inaccessible' || (before.state === 'stopped' && notReachableFromAnchor(before, lastProbe)));
 			if (failedAtNode && background && !reprobe && !tokenChanged) {
 				// Nobody asked: keep the last answer rather than call the node again.
 				const kept: IExplorerEndpoint = { ...endpoint, state: before.state, running: false };
@@ -858,6 +929,7 @@ export function createEndpointStore(options: IEndpointStoreOptions): IEndpointSt
 		vanished.clear();
 		callHints.clear();
 		sessions.clear();
+		channels.clear();
 		inFlight = null;
 		followUp = null;
 		lastRefreshStartedAt = 0;
