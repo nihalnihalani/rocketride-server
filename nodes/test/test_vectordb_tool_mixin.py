@@ -2102,6 +2102,51 @@ def test_remove_document_of_several_documents_on_a_counting_driver(context):
     assert _backend_calls(store, 'removeCounted') == [('removeCounted', ['doc00', 'doc02'])]
 
 
+class _UncountedRemovalStore(CountingStore):
+    """Removes natively but cannot say how many rows went (``removeCounted`` answers None)."""
+
+    def removeCounted(self, objectIds):
+        self.calls.append(('removeCounted', list(objectIds)))
+        self.remove(list(objectIds))
+        return None
+
+
+class _UncountedEverythingStore(MemoryStore):
+    """Counts nothing: no countChunks and a native removal that answers None."""
+
+    def removeCounted(self, objectIds):
+        self.calls.append(('removeCounted', list(objectIds)))
+        self.remove(list(objectIds))
+        return None
+
+
+def test_remove_document_of_an_unknown_id_when_the_driver_cannot_count_removals(context):
+    context(dap())
+    store = clustered(_UncountedRemovalStore, docs=2, chunks=3)
+    answer = node(store, allow_writes=True).remove_document({'object_ids': ['ghost']})
+    assert (answer['removed'], answer['not_found'], answer['removed_chunks']) == ([], ['ghost'], 0)
+    assert not _backend_calls(store, 'removeCounted')
+
+
+def test_remove_document_of_a_stored_id_when_the_driver_cannot_count_removals(context):
+    context(dap())
+    store = clustered(_UncountedRemovalStore, docs=2, chunks=3)
+    answer = node(store, allow_writes=True).remove_document({'object_ids': ['doc01']})
+    assert answer['removed'] == [{'objectId': 'doc01', 'chunks_removed': None}]
+    assert answer['not_found'] == [] and answer['removed_chunks'] is None
+    assert not any(key[0] == 'doc01' for key in store.rows)
+
+
+@pytest.mark.parametrize('store_cls', [_UncountedEverythingStore, MemoryStore])
+def test_remove_document_without_any_count_still_finds_unknown_ids(context, store_cls):
+    context(dap())
+    store = store_cls().seed(corpus({'a': [0, 1], 'b': [3]}))
+    answer = node(store, allow_writes=True).remove_document({'object_ids': ['a', 'ghost', 'b']})
+    assert answer['removed'] == [{'objectId': 'a', 'chunks_removed': None}, {'objectId': 'b', 'chunks_removed': None}]
+    assert answer['not_found'] == ['ghost'] and answer['removed_chunks'] is None
+    assert not any(key[0] in ('a', 'b') for key in store.rows)
+
+
 def test_remove_document_reserved_id(context):
     context(dap())
     store = clustered(CountingStore)

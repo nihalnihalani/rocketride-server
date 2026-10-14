@@ -1060,18 +1060,31 @@ class VectorExplorerTools:
         except Exception:
             pass
 
+    @staticmethod
+    def _vx_document_stored(store: Any, object_id: str) -> bool:
+        """Whether any row of ``object_id`` (active or deleted) is stored: a one-row read."""
+        for doc in store.get(deletedFilter('all', objectIds=[object_id], limit=1, offset=0)):
+            if metadataValue(doc, 'objectId') == object_id:
+                return True
+        return False
+
     def _vx_remove(self, store: Any, ids: Sequence[str]) -> Tuple[List[Dict[str, Any]], List[str], Optional[int]]:
         """Remove documents; return ``(removed, not_found, rows)`` with per-document counts where known.
 
         A driver that counts what it removes (``removeCounted`` overridden) is asked once
         for a single document and counted per document otherwise (for ``not_found``);
         any other driver is counted per document (free when it cannot count) and then
-        removed once, so no batch is counted twice.
+        removed once, so no batch is counted twice. Where no count tells a stored document
+        from an unknown id (a single id on a native removal, which may answer None; a
+        driver that cannot count), a one-row read decides, for up to ``write_ids_max``
+        ids; beyond that an unknown id is reported removed with a null count.
         """
         ids = [oid for oid in ids if oid != CONTROL_OBJECT_ID]
         native = 'removeCounted' in store.capabilities()
         try:
             if native and len(ids) == 1:
+                if not self._vx_document_stored(store, ids[0]):
+                    return [], list(ids), 0
                 rows = _int_or_none(store.removeCounted(list(ids)))
                 if rows == 0:
                     return [], list(ids), 0
@@ -1079,6 +1092,10 @@ class VectorExplorerTools:
             per: Dict[str, Optional[int]] = {
                 oid: self._vx_count(store.countChunks, deletedFilter('all', objectIds=[oid])) for oid in ids
             }
+            if len(ids) <= LIMITS['write_ids_max']:
+                for oid in ids:
+                    if per[oid] is None and not self._vx_document_stored(store, oid):
+                        per[oid] = 0
             not_found = [oid for oid in ids if per[oid] == 0]
             targets = [oid for oid in ids if per[oid] != 0]
             known = all(per[oid] is not None for oid in targets)
