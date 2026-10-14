@@ -440,6 +440,11 @@ class DocumentStoreBase(ABC):
         """
         Count the chunk rows matching ``docFilter`` (control record excluded).
 
+        A driver that counts selects rows by :meth:`resolveDeleted`, never by the
+        legacy ``isDeleted`` flag alone: some backends read ``isDeleted=True`` as
+        "deleted rows only", so ``deleted='all'`` would count no active row (and
+        :meth:`removeCounted` would report a stored document as empty).
+
         Default: None (the backend cannot count with a filter).
         """
         return None
@@ -447,6 +452,8 @@ class DocumentStoreBase(ABC):
     def countDocuments(self, docFilter: DocFilter) -> Optional[int]:
         """
         Count the distinct objectIds matching ``docFilter`` (control record excluded).
+
+        Rows are selected by :meth:`resolveDeleted`, as in :meth:`countChunks`.
 
         Default: None.
         """
