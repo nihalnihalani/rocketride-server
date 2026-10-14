@@ -253,6 +253,34 @@ def test_listing_honours_the_deleted_modes(adapter, store):
     assert sorted(_object_ids(every)) == ['doc-a', 'doc-b']
 
 
+#: Every hook read that takes a deleted mode, asked for one outside active / deleted / all
+UNKNOWN_DELETED_MODE = {
+    'listDocuments': lambda store: store.listDocuments(
+        cursor=None, limit=5, object_ids=None, deleted='bogus', sort='path'
+    ),
+    'scrollChunks': lambda store: store.scrollChunks('doc-a', after_chunk=-1, limit=5, deleted='bogus'),
+    'sampleChunks': lambda store: store.sampleChunks(
+        n=3, seed=1, strategy='random', docFilter=h.VxFilter(deleted='bogus'), include_keys=[]
+    ),
+    'countChunks': lambda store: store.countChunks(h.VxFilter(deleted='bogus')),
+    'countDocuments': lambda store: store.countDocuments(h.VxFilter(deleted='bogus')),
+}
+
+
+@pytest.mark.parametrize('call', sorted(UNKNOWN_DELETED_MODE))
+def test_an_unknown_deleted_mode_is_invalid_input(adapter, store, call):
+    """Listings, chunk pages, samples and counts refuse an unknown mode alike (none reads it as 'all')."""
+    h.ingest(store, 'doc-a', '/docs/a.md', [0, 1])
+    h.ingest(store, 'doc-b', '/docs/b.md', [0])
+    store.markDeleted(['doc-b'])
+    if ANSWERS_WITHOUT_BACKEND.get((adapter.name, call)) == 'inherits':
+        assert UNKNOWN_DELETED_MODE[call](store) is None  # the base default reads nothing
+        return
+    with pytest.raises(ToolRefusal) as refused:
+        UNKNOWN_DELETED_MODE[call](store)
+    assert refused.value.code == 'INVALID_INPUT'
+
+
 def test_listing_a_legacy_collection(adapter, store):
     """Legacy rows list without the new extras; a document without chunk 0 is flagged or noted."""
     adapter.seed_legacy(store)

@@ -54,7 +54,7 @@ from weaviate.exceptions import UnexpectedStatusCodeError, WeaviateBaseError
 from ai.common.schema import Doc, DocFilter, DocMetadata, QuestionText
 from ai.common.store import DocumentStoreBase
 from ai.common.store.errors import StoreError, StoreUnsupported, ToolRefusal
-from ai.common.store.vx_types import ChunkPage, DocPage, DocumentRow, StoreInfo
+from ai.common.store.vx_types import DELETED_VALUES, ChunkPage, DocPage, DocumentRow, StoreInfo
 from ai.common.config import Config
 
 # objectId of the collection's control record
@@ -98,6 +98,21 @@ def _error_code(error: BaseException) -> Optional[str]:
         if isinstance(value, str) and re.fullmatch(r'[A-Z][A-Z0-9_]{0,63}', value):
             return value
     return None
+
+
+def _deleted_mode(docFilter: DocFilter, deleted: Optional[str]) -> str:
+    """
+    The rows a read covers: 'active', 'deleted' or 'all'.
+
+    ``deleted`` wins over ``DocFilter.deleted``; with neither, the legacy ``isDeleted`` flag decides.
+    Any other value is INVALID_INPUT (it must not quietly read as 'all' here and 'active' there).
+    """
+    asked = deleted if deleted is not None else getattr(docFilter, 'deleted', None)
+    if asked is None:
+        return DocumentStoreBase.resolveDeleted(docFilter)
+    if asked not in DELETED_VALUES:
+        raise ToolRefusal('INVALID_INPUT', 'deleted must be active, deleted or all')
+    return asked
 
 
 def _module_root(name: Any) -> str:
@@ -533,7 +548,7 @@ class Store(DocumentStoreBase):
             must.append(_any_equal('objectId', docFilter.objectIds))
 
         # Soft-deleted rows: active (default), deleted only, or all
-        mode = deleted or self.resolveDeleted(docFilter)
+        mode = _deleted_mode(docFilter, deleted)
         if mode == 'active':
             must.append(Filter.by_property('isDeleted').equal(False))
         elif mode == 'deleted':
