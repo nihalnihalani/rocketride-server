@@ -116,10 +116,14 @@ test('neighbour ends outside the sample survive SAMPLE_EXPIRED: the sample is dr
 	const quiet = /const pinKeysQuiet = async \(([\s\S]*?)\n\t\};/.exec(view);
 	assert.ok(quiet, 'pinKeysQuiet');
 	assert.match(quiet[1] as string, /isExpired\(/);
-	assert.match(quiet[1] as string, /repick\.current = keyString\(/);
+	assert.match(quiet[1] as string, /repick\.current = \{ key: keyString\(key\[0\], key\[1\]\), drawnAt: sampleModel\.receivedAt \}/);
 	assert.match(quiet[1] as string, /resample\(\[/);
 	assert.match(quiet[1] as string, /!retried/, 'the second inspection does not re-sample again');
 	assert.match(view, /void onPick\(index, true\)/);
+	// The re-drawn sample is recognised by its arrival (a new model), not by its answer object or id: the same seed
+	// and keys give the same sample id, and pinning a point also makes a new model with the same receivedAt.
+	assert.match(view, /if \(pending === null \|\| !sampleModel \|\| sampleModel\.receivedAt === pending\.drawnAt\) return;/);
+	assert.match(view, /void onPick\(index, true\);[\s\S]{0,120}\}, \[sampleModel\]\);/);
 });
 
 test('a chat highlight re-embeds only a question the chat told the map; otherwise the map query is dropped for the sources\' centre', () => {

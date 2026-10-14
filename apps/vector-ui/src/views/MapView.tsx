@@ -282,7 +282,7 @@ export function MapView(props: MapViewProps): React.ReactElement {
 	connectionRef.current = model.connectionKey;
 	const autoSampled = useRef<string | null>(null);
 	// A point to inspect again once a re-drawn sample arrives (its neighbour ends met SAMPLE_EXPIRED).
-	const repick = useRef<string | null>(null);
+	const repick = useRef<{ key: string; drawnAt: number } | null>(null);
 	const seq = useRef(0);
 	const clientRef = useRef<ILayoutClient | null>(null);
 	if (clientRef.current === null) clientRef.current = createLayoutClient({ createWorker: spawnLayoutWorker });
@@ -616,7 +616,7 @@ export function MapView(props: MapViewProps): React.ReactElement {
 		if (channel === null || !sampleModel) return [];
 		const answer = await callTool<IProjectResult>(channel, 'project', { sample_id: sampleModel.sampleId, keys: keys.slice(0, limits.project_keys_max), m: PROJECT_M }, { nodeId: storeNode });
 		if (isExpired(answer) && !retried) {
-			repick.current = keyString(key[0], key[1]);
+			repick.current = { key: keyString(key[0], key[1]), drawnAt: sampleModel.receivedAt };
 			void resample([key]).then((id) => {
 				if (id === null) repick.current = null;
 			});
@@ -628,12 +628,12 @@ export function MapView(props: MapViewProps): React.ReactElement {
 	// A re-drawn sample arrived for a point whose neighbour ends expired: inspect it again there.
 	useEffect(() => {
 		const pending = repick.current;
-		if (pending === null || !sample) return;
+		if (pending === null || !sampleModel || sampleModel.receivedAt === pending.drawnAt) return;
 		repick.current = null;
-		const index = keyIdx.get(pending);
+		const index = keyIdx.get(pending.key);
 		if (index !== undefined) void onPick(index, true);
 		// eslint-disable-next-line react-hooks/exhaustive-deps
-	}, [sample]);
+	}, [sampleModel]);
 
 	const selectKey = useCallback(
 		(key: VectorKey): void => {
