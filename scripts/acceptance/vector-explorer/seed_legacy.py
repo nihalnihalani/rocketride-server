@@ -42,8 +42,8 @@ chunking of ``apps/vector-ui/tests/fixtures/chunking.json``. A seed on an
 engine whose chunker ignores ``strlen`` (about 36 chunks of up to 4,000
 characters for the manual) fails here. Exits 1 when any check fails.
 
-Before anything is created or dropped, the seed asks the engine's own chunker
-node (the copy next to the engine running this script) what it would cut from
+Before anything is created or dropped, the seed asks the chunker node the
+engine imports (``engine_chunker``) what it would cut from
 the corpus with the templates' ``chunk_1`` length, and refuses to seed when
 that is not the calibrated shape (``ChunkerRefused``, exit 1): the chunker node
 as it stands drops the length (see the README), so a seed on it would replace
@@ -202,7 +202,21 @@ class ChunkerRefused(RuntimeError):
 
 
 def engine_chunker(executable: str = sys.executable) -> Path:
-    """The chunker node file of the engine running this script (its own copy), else the repository's."""
+    """The chunker node file the engine imports.
+
+    That is the ``nodes`` package first on this interpreter's path (run under
+    the engine, which puts a checkout's ``nodes/src`` ahead of its own
+    ``dist/server/nodes``), else the copy next to ``executable``, else the
+    repository's. The package is located, never imported.
+    """
+    try:
+        spec = importlib.util.find_spec('nodes')
+    except (ImportError, ValueError):
+        spec = None
+    for location in (spec.submodule_search_locations or []) if spec else []:
+        node = Path(location) / 'preprocessor_langchain' / 'langchain.py'
+        if node.is_file():
+            return node.resolve()
     copy = Path(executable).resolve().parent / 'nodes' / 'preprocessor_langchain' / 'langchain.py'
     return copy if copy.is_file() else REPO_CHUNKER
 

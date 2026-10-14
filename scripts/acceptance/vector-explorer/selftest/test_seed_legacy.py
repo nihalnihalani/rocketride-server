@@ -130,14 +130,42 @@ class ChunkerPreflightTests(unittest.TestCase):
 
 
 class ChunkerLocationTests(unittest.TestCase):
-    def test_the_engines_own_copy_of_the_node_is_the_one_checked(self):
+    """The node file checked is the one the engine imports, not merely a copy lying next to it."""
+
+    def setUp(self):
+        self.saved_path = list(sys.path)
+        self.saved_nodes = sys.modules.pop('nodes', None)
+
+    def tearDown(self):
+        sys.path[:] = self.saved_path
+        sys.modules.pop('nodes', None)
+        if self.saved_nodes is not None:
+            sys.modules['nodes'] = self.saved_nodes
+
+    @staticmethod
+    def _node(root: Path) -> Path:
+        node = root / 'nodes' / 'preprocessor_langchain' / 'langchain.py'
+        node.parent.mkdir(parents=True)
+        (root / 'nodes' / '__init__.py').write_text('raise RuntimeError("never imported")\n', encoding='utf-8')
+        node.write_text('# a chunker node\n', encoding='utf-8')
+        return node
+
+    def test_the_nodes_package_the_engine_imports_wins_over_its_dist_copy(self):
+        # The engine puts the checkout's nodes/src ahead of dist/server on its path: that copy runs.
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp).resolve()
-            node = root / 'nodes' / 'preprocessor_langchain' / 'langchain.py'
+            imported = self._node(root / 'src')
+            self._node(root / 'dist')
+            sys.path.insert(0, str(root / 'src'))
+            self.assertEqual(seed.engine_chunker(str(root / 'dist' / 'engine')), imported)
+
+    def test_without_an_importable_nodes_package_the_copy_next_to_the_engine_is_checked(self):
+        sys.path[:] = [p for p in sys.path if not (Path(p) / 'nodes' / '__init__.py').is_file()]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
             self.assertEqual(seed.engine_chunker(str(root / 'engine')), seed.REPO_CHUNKER)
-            node.parent.mkdir(parents=True)
-            node.write_text('# the engine copy\n', encoding='utf-8')
-            self.assertEqual(seed.engine_chunker(str(root / 'engine')), node)
+            copy = self._node(root)
+            self.assertEqual(seed.engine_chunker(str(root / 'engine')), copy)
 
     def test_the_seed_uses_the_templates_chunk_length(self):
         self.assertEqual(seed.template_strlen(), 1000)
