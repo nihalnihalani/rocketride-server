@@ -27,7 +27,7 @@ from depends import depends
 requirements = os.path.dirname(os.path.realpath(__file__)) + '/requirements.txt'
 depends(requirements)
 
-from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple
 import chromadb
 from ai.common.schema import Doc, DocFilter, DocMetadata, QuestionText
 from ai.common.store import DocumentStoreBase
@@ -146,6 +146,11 @@ class Store(DocumentStoreBase):
     # Most rows the sweep for documents without chunk 0 reads; beyond it the
     # listing ends with the caveat 'document_count_capped'.
     SWEEP_ROWS_CAP = 200000
+
+    # Most objectIds in one `$in` list when deleting or marking documents.
+    # chromadb 1.5.9 binds every value as an SQL variable and refuses a list of
+    # about 32,760 values ("too many SQL variables"); an engine delete can name more.
+    ID_LIST_MAX = 1000
 
     apikey: str | None = None
     node: str = 'chroma'
@@ -537,6 +542,9 @@ class Store(DocumentStoreBase):
     def _space(self) -> str:
         """The collection's distance space ('cosine', 'l2' or 'ip'); the configured one until it exists."""
         collection = self.__dict__.get('collectionObj')
+        if collection is None and self._exists():
+            # Not read yet on this instance: the collection's space wins over the configuration.
+            collection = self.__dict__.get('collectionObj')
         if collection is not None:
             config = getattr(collection, 'configuration_json', None)
             space = ((config or {}).get('hnsw') or {}).get('space') if isinstance(config, dict) else None
@@ -792,11 +800,10 @@ class Store(DocumentStoreBase):
                     'index documents. Check the Chroma server connection and version.'
                 )
             if object_ids_to_delete:
-                # One $in list per thousand documents: an $or with a clause per document
-                # exceeds the server's expression depth (about 1,000) on a large batch.
-                pending = list(object_ids_to_delete)
-                for start in range(0, len(pending), 1000):
-                    self.collectionObj.delete(where={'objectId': {'$in': pending[start : start + 1000]}})
+                # $in lists, not an $or with a clause per document: the server refuses an
+                # expression deeper than about 1,000 clauses.
+                for batch in self._idBatches(object_ids_to_delete):
+                    self.collectionObj.delete(where={'objectId': {'$in': batch}})
                 object_ids_to_delete.clear()
 
             if ids:
@@ -852,7 +859,8 @@ class Store(DocumentStoreBase):
             return
 
         # Delete the points with the given object Id
-        self.collectionObj.delete(where={'objectId': {'$in': objectIds}})
+        for batch in self._idBatches(objectIds):
+            self.collectionObj.delete(where={'objectId': {'$in': batch}})
 
         return
 
@@ -892,13 +900,14 @@ class Store(DocumentStoreBase):
 
     def _setDeleted(self, objectIds: List[str], value: bool) -> None:
         """Set isDeleted on every record of ``objectIds`` (update takes ids and full metadata)."""
-        results = self.collectionObj.get(where={'objectId': {'$in': list(objectIds)}}, include=['metadatas'])
-        ids = list(results.get('ids') or [])
-        if not ids:
-            return
-        metadatas = [{**(meta or {}), 'isDeleted': value} for meta in results['metadatas']]
-        for start in range(0, len(ids), 1000):
-            self.collectionObj.update(ids=ids[start : start + 1000], metadatas=metadatas[start : start + 1000])
+        for batch in self._idBatches(objectIds):
+            results = self.collectionObj.get(where={'objectId': {'$in': batch}}, include=['metadatas'])
+            ids = list(results.get('ids') or [])
+            if not ids:
+                continue
+            metadatas = [{**(meta or {}), 'isDeleted': value} for meta in results['metadatas']]
+            for start in range(0, len(ids), 1000):
+                self.collectionObj.update(ids=ids[start : start + 1000], metadatas=metadatas[start : start + 1000])
 
     def render(self, objectId: str, callback: Callable[[str], None]) -> None:
         """
@@ -994,6 +1003,13 @@ class Store(DocumentStoreBase):
     def _exists(self) -> bool:
         """Whether the collection exists (no control-record read)."""
         return bool(self.collection) and self._doesCollectionExist()
+
+    def _idBatches(self, object_ids: Iterable[str]) -> Iterator[List[str]]:
+        """The distinct ``object_ids`` in lists of at most ``ID_LIST_MAX``, for `$in` filters."""
+        ids = [str(oid) for oid in dict.fromkeys(object_ids)]
+        step = max(1, int(self.ID_LIST_MAX))
+        for start in range(0, len(ids), step):
+            yield ids[start : start + step]
 
     def _readAll(
         self, where: Optional[Dict[str, Any]], include: List[str], cap: Optional[int] = None
@@ -1144,9 +1160,13 @@ class Store(DocumentStoreBase):
             state = json.loads(base64.urlsafe_b64decode(str(cursor).encode()).decode())
         except (binascii.Error, UnicodeDecodeError, ValueError):
             state = None
+
+        def position(value: Any) -> bool:
+            return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
         valid = isinstance(state, dict) and (
-            (state.get('ph') == 'c' and isinstance(state.get('o'), int) and state['o'] >= 0)
-            or (state.get('ph') == 'o' and isinstance(state.get('i'), int) and state['i'] >= 0)
+            (state.get('ph') == 'c' and position(state.get('o')))
+            or (state.get('ph') == 'o' and position(state.get('i')))
         )
         if not valid:
             raise _errors().ToolRefusal(
@@ -1411,8 +1431,11 @@ class Store(DocumentStoreBase):
         ids = [oid for oid in dict.fromkeys(str(o).strip() for o in objectIds) if oid and oid != CONTROL_OBJECT_ID]
         if not ids or not self._exists():
             return 0
-        where = {'objectId': {'$in': ids}}
-        removed = sum(1 for _ in self._readAll(where, []))
-        if removed:
-            self.collectionObj.delete(where=where)
+        removed = 0
+        for batch in self._idBatches(ids):
+            where = {'objectId': {'$in': batch}}
+            rows = sum(1 for _ in self._readAll(where, []))
+            if rows:
+                self.collectionObj.delete(where=where)
+                removed += rows
         return removed

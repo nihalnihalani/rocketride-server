@@ -383,6 +383,31 @@ def test_empty_id_lists_select_nothing(new_store):
     assert store.get(_vx_filter(objectIds=[], limit=10)) == []
 
 
+def test_score_info_on_a_fresh_instance_reads_the_collection_space():
+    # A node configured for cosine on a collection an earlier configuration created with l2.
+    name = _new_collection('space')
+    _store(name, similarity='l2').addChunks(contract.corpus_docs()[:3])
+    fresh = _store(name, similarity='cosine')
+    assert fresh.scoreInfo()['formula'] == '1 / (1 + euclidean_distance)'
+    assert fresh.describe().metric == 'l2'
+
+
+def test_deletes_of_many_documents_are_accepted():
+    # The server refuses an $in list of about 32,760 values ("too many SQL variables").
+    store = _store(_new_collection('many_ids'))
+    store.addChunks(contract.corpus_docs())
+    many = [f'gone-{i:05d}' for i in range(33000)]
+    store.markDeleted(many + ['doc-01'])
+    assert store.countChunks(_vx_filter(deleted='deleted')) == contract.DOCS['doc-01']
+    store.markActive(many + ['doc-01'])
+    assert store.countChunks(_vx_filter(deleted='deleted')) == 0
+    assert store.removeCounted(many + ['doc-02']) == contract.DOCS['doc-02']
+    store.remove(many + ['doc-03'])
+    assert store.countChunks(_vx_filter(objectIds=['doc-02', 'doc-03'], deleted='all')) == 0
+    assert store.countChunks(_vx_filter(objectIds=['doc-01'])) == contract.DOCS['doc-01']
+    assert store.describe().control_record is True
+
+
 # --- past the caps (1,503 documents) --------------------------------------------------------
 
 

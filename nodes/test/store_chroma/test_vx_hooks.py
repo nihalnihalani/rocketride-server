@@ -15,6 +15,8 @@ assertions run against a live Chroma in ``nodes/test/test_store_chroma_full.py``
 
 from __future__ import annotations
 
+import base64
+import json
 import uuid
 
 import numpy as np
@@ -178,6 +180,17 @@ def test_score_info():
     assert 'range' in ip and ip['range'] is None  # unbounded unless the vectors are unit length
 
 
+def test_score_info_on_a_fresh_instance_reads_the_collection_space():
+    # A node whose configured space differs from the collection's (created l2 by an
+    # earlier configuration) must label scores by the collection before any read.
+    _corpus(make_store(drv, collection='vx_space', similarity='l2'))
+    fresh = make_store(drv, collection='vx_space', similarity='cosine')
+    assert fresh.scoreInfo()['formula'] == '1 / (1 + euclidean_distance)'
+    assert make_store(drv, collection='vx_not_created', similarity='ip').scoreInfo()['formula'] == (
+        '(2 - ip_distance) / 2'
+    )
+
+
 def test_empty_id_lists_answer_nothing_without_asking_the_server():
     # Chroma refuses `$in: []`; an empty list selects no row, as it does on Qdrant.
     store = make_store(drv)
@@ -290,11 +303,25 @@ def test_list_documents_caps_the_orphan_sweep(monkeypatch):
     assert 'document_count_capped' in pages[-1].caveats
 
 
-def test_list_documents_refuses_a_forged_cursor():
+def _cursor(state):
+    return base64.urlsafe_b64encode(json.dumps(state).encode()).decode()
+
+
+@pytest.mark.parametrize(
+    'cursor',
+    [
+        '%%%',
+        _cursor({'ph': 'o', 'i': True}),
+        _cursor({'ph': 'c', 'o': False}),
+        _cursor({'ph': 'c', 'o': -1}),
+        _cursor({'ph': 'x', 'o': 0}),
+    ],
+)
+def test_list_documents_refuses_a_forged_cursor(cursor):
     store = make_store(drv)
     _corpus(store)
     with pytest.raises(ToolRefusal) as err:
-        store.listDocuments(cursor='%%%', limit=5, object_ids=None, deleted='active', sort='path')
+        store.listDocuments(cursor=cursor, limit=5, object_ids=None, deleted='active', sort='path')
     assert err.value.code == 'INVALID_INPUT'
 
 

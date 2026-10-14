@@ -212,3 +212,42 @@ def test_a_large_batch_replaces_its_documents_with_one_id_list():
     store.addChunks(batch[:4])  # a re-ingest of two documents keeps one record per chunk
     assert store.countChunks(vx_filter()) == 2200
     assert store.countChunks(vx_filter(objectIds=['doc-0000', 'doc-0001'])) == 4
+
+
+def _id_lists(where):
+    """Every $in list in a where filter."""
+    if not isinstance(where, dict):
+        return []
+    lists = []
+    for key, value in where.items():
+        if key in ('$and', '$or'):
+            for clause in value:
+                lists += _id_lists(clause)
+        elif isinstance(value, dict) and isinstance(value.get('$in'), list):
+            lists.append(value['$in'])
+    return lists
+
+
+def test_deletes_of_many_documents_send_id_lists_the_server_accepts():
+    # chromadb 1.5.9 refuses an $in list of about 32,760 values or more ("too many
+    # SQL variables"); a folder deletion can name more documents than that.
+    store = make_store(drv)
+    store.addChunks([make_doc(f'doc-{d}', c, [1.0, d, c]) for d in range(4) for c in range(2)])
+    many = [f'gone-{i:05d}' for i in range(33000)]
+
+    store.markDeleted(many + ['doc-0'])
+    assert store.countChunks(vx_filter(deleted='deleted')) == 2
+    store.markActive(many + ['doc-0'])
+    assert store.countChunks(vx_filter(deleted='deleted')) == 0
+
+    Collection.calls.clear()
+    Collection.deletes.clear()
+    assert store.removeCounted(many + ['doc-1']) == 2
+    store.remove(many + ['doc-2'])
+    left = store.countChunks(vx_filter(objectIds=['doc-0', 'doc-1', 'doc-2', 'doc-3'], deleted='all'))
+    assert left == 4  # doc-0 and doc-3 stay; doc-1 and doc-2 are gone
+    assert store.countChunks(vx_filter(objectIds=['doc-1', 'doc-2'], deleted='all')) == 0
+
+    sent = [ids for call in Collection.calls + Collection.deletes for ids in _id_lists(call['where'])]
+    assert sent and max(len(ids) for ids in sent) <= 1000
+    assert store.describe().control_record is True
