@@ -206,17 +206,35 @@ descriptors byte-for-byte, and `test_tool_audience.py` pins that.
 | Tool mixin, hooks, math goldens, write gate, envelope and caps | `nodes/test/test_vectordb_tool_mixin.py`, `test_vector_hooks.py`, `test_vector_math.py`, `test_vector_write_gate.py`, `test_vector_tool_envelope.py` | `./builder nodes:test` (mocked pass) |
 | The `embed` tool | `nodes/test/test_embed_tool.py` | `./builder nodes:test` |
 | Call context and tool audience | `test_tool_context.py`, `test_tool_audience.py` | `./builder ai:test` |
-| Live drivers on new and legacy collections | `nodes/test/test_store_postgres_full.py`, `test_rocketride_db_full.py`, `test_store_qdrant_full.py`, `test_store_chroma_full.py` | `./builder nodes:test-db` |
-| Every tool through a real engine and the shipped templates | `nodes/test/test_vector_toolpath_full.py` (needs `dist/server`) | `./builder nodes:test-db` |
-| Wire fixtures still match the drivers | `nodes/test/test_vector_wire_fixtures_full.py` | `./builder nodes:test-db` |
+| Live `rocketride_vector` driver on new and legacy collections | `nodes/test/test_rocketride_db_full.py` | `./builder nodes:test-db`, or by name |
+| Live `store_postgres`, Qdrant and Chroma drivers on new and legacy collections | `nodes/test/test_store_postgres_full.py`, `test_store_qdrant_full.py`, `test_store_chroma_full.py` | By name |
+| Every tool through a real engine and the shipped templates | `nodes/test/test_vector_toolpath_full.py` (needs `dist/server`) | By name |
+| Wire fixtures still match the drivers | `nodes/test/test_vector_wire_fixtures_full.py` | By name |
 | The app | `apps/vector-ui/tests/*.test.ts` | `./builder vector-ui:test` |
 | Browser lanes | `scripts/acceptance/vector-explorer/` | `./builder vector-ui:e2e-live`, manual |
 
-The live suites are listed in `DB_LIVE_SUITES` in `nodes/scripts/tasks.js` and
-follow the rules in [Live database tests](../nodes/testing.md#live-database-tests):
-a required run fails on an unreachable server, and a deliberate skip says
-`NOT RUN:`. The pooler pass is part of the suites themselves: the driver cases
-in `test_store_postgres_full.py` and the `rocketride_vector` cases in
+`./builder nodes:test-db` runs only the suites listed in `DB_LIVE_SUITES` in
+`nodes/scripts/tasks.js`, and of the vector live suites that list holds only
+`test_rocketride_db_full.py`. Run the others by name with the engine in
+`dist/server`:
+
+```bash
+cd dist/server
+export RR_REQUIRE_DB_TESTS=1   # an unreachable server fails the suite instead of skipping it
+./engine -m pytest ../../nodes/test/test_store_postgres_full.py ../../nodes/test/test_store_qdrant_full.py ../../nodes/test/test_store_chroma_full.py -q -rs
+./engine -m pytest ../../nodes/test/test_vector_toolpath_full.py -q -rs
+./engine -m pytest ../../nodes/test/test_vector_wire_fixtures_full.py -q -rs
+```
+
+Without `RR_REQUIRE_DB_TESTS` a suite whose server is unreachable skips with a
+`NOT RUN:` reason, so a run can pass without touching a database; read the skip
+summary that `-rs` prints. A run by name also leaves out the checks
+`nodes:test-db` adds to a required run (every suite passes at least one test,
+and no test skips without a `NOT RUN:` reason); see
+[Live database tests](../nodes/testing.md#live-database-tests).
+
+The pooler pass is part of the suites themselves: the driver cases in
+`test_store_postgres_full.py` and the `rocketride_vector` cases in
 `test_rocketride_db_full.py` run once against the database and, with
 `RR_TEST_PGVECTOR_POOLER_DSN` set, once more through that transaction-mode
 pooler, and `test_vector_toolpath_full.py` runs `rocketride_vector.pipe` through
