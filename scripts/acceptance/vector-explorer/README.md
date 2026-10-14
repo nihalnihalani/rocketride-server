@@ -139,9 +139,14 @@ an engine whose drivers are still the old ones; later runs only verify.
   call, so the store sees one write per document.
 
 Verified after seeding: one control record, exactly the long manual without
-chunk 0, every corpus document present by its objectId, no `meta` column on
-pgvector (until a newer driver opens the table and adds it), at least 64 rows
-left for the long manual and a median chunk of 400-1,200 characters.
+chunk 0, every corpus document present by its objectId, at least 64 rows left
+for the long manual and a median chunk of 400-1,200 characters, and the old
+drivers' shape: on Qdrant and Chroma only random (version 4) point ids, none of
+them the `objectId#chunkId` uuid5 the new drivers derive, and only the old
+metadata keys (no `ingestedAt`, `size` or `modifyTime`; on Qdrant no payload key
+besides `content` and `meta`); on pgvector exactly the old columns, with a
+`meta` column allowed only once a newer driver has opened the table (never
+right after a seed) and no row carrying `meta`.
 
 What the collections in your containers hold right now is a fact about the
 containers, not about this file: `seed_legacy.sh --verify-only` (no engine

@@ -6,10 +6,11 @@
 
 They check that its verification cannot pass a collection that is not what the
 driver suites expect (one control record, exactly the planted document without
-chunk 0, every document present, no meta column, the calibrated chunk shape),
-that a seed on a chunker that ignores the chunk length is refused before any
-collection is dropped, that it only ever drops the legacy names, and that the
-control row matches the old driver's columns.
+chunk 0, every document present, the calibrated chunk shape, and the old
+drivers' shape: random point ids, only the old metadata keys, only the old
+columns), that a seed on a chunker that ignores the chunk length is refused
+before any collection is dropped, that it only ever drops the legacy names, and
+that the control row matches the old driver's columns.
 
 Run: python3 -m unittest discover -s scripts/acceptance/vector-explorer/selftest -v
 """
@@ -20,6 +21,7 @@ import re
 import sys
 import tempfile
 import unittest
+import uuid
 
 from pathlib import Path
 
@@ -40,6 +42,44 @@ def _load(name: str, path: Path):
 
 seed = _load('vx_seed_legacy', ACC / 'seed_legacy.py')
 
+# The shape an old-driver collection has: pgvector's columns, and on Qdrant/Chroma random ids and the old keys.
+OLD_PG_SHAPE = {'columns': sorted(seed.LEGACY_COLUMNS), 'rows': 1, 'meta_rows': 0}
+OLD_META = {
+    'objectId': 'o',
+    'chunkId': 1,
+    'nodeId': 'n',
+    'parent': 'srv/legacy/a.md',
+    'permissionId': 0,
+    'isDeleted': False,
+    'isTable': False,
+    'tableId': 0,
+    'signature': 's',
+}
+# What the explorer's drivers add to every chunk's metadata.
+NEW_META = {'ingestedAt': '2026-10-14T23:00:00Z', 'size': 1234, 'modifyTime': 1760000000}
+
+
+def corpus_points(ids='random', extra_meta=None, extra_payload=None):
+    """Qdrant-like (point id, payload) records of a seeded corpus: a control record, every document, the orphan.
+
+    ``ids='derived'`` gives the new drivers' ids; ``extra_meta``/``extra_payload`` add keys to every chunk.
+    """
+    orphan = seed.fx.object_id(seed.PREFIX + seed.ORPHAN_REL)
+    control = {'objectId': 'schema', 'chunkId': 0, 'isDeleted': True, 'vectorSize': 384, 'modelName': 'm'}
+    points = [(str(uuid.uuid4()), {'content': '', 'meta': control})]
+    for name in seed.corpus_names(seed._corpus()):
+        oid = seed.fx.object_id(name)
+        for cid in range(1, 70) if oid == orphan else range(3):
+            meta = dict(OLD_META, objectId=oid, chunkId=cid, parent=name[1:], **(extra_meta or {}))
+            pid = seed.derived_id(oid, cid) if ids == 'derived' else str(uuid.uuid4())
+            points.append((pid, {'content': 'x' * 800, 'meta': meta, **(extra_payload or {})}))
+    return points
+
+
+def as_chroma(points):
+    """The same records the way Chroma returns them: (id, metadata, document)."""
+    return [(pid, payload['meta'], payload['content']) for pid, payload in points]
+
 
 class OrphanTests(unittest.TestCase):
     def test_a_document_without_chunk_0_is_an_orphan(self):
@@ -58,9 +98,9 @@ class VerdictTests(unittest.TestCase):
             expected_orphan='x',
             documents=40,
             expected_documents=40,
-            meta_column=False,
             long_manual_chunks=159,
             median_chunk_chars=806,
+            shape=OLD_PG_SHAPE,
         )
         args.update(overrides)
         return seed.verdict('pgvector', **args)
@@ -76,8 +116,14 @@ class VerdictTests(unittest.TestCase):
         self.assertTrue(self.ok(orphan_ids=['y']))
         self.assertTrue(self.ok(expected_orphan=None, orphan_ids=[]))
         self.assertTrue(self.ok(documents=39))
-        self.assertTrue(self.ok(meta_column=True))
         self.assertTrue(self.ok(missing=['a-missing-document']))
+        with_meta = dict(OLD_PG_SHAPE, columns=sorted(seed.LEGACY_COLUMNS | {'meta'}))
+        self.assertTrue(self.ok(shape=with_meta, seeded_now=True))
+
+    def test_a_collection_whose_shape_was_not_read_fails(self):
+        # No backend can pass without its shape being checked.
+        self.assertTrue(self.ok(shape=None))
+        self.assertTrue(self.ok(shape={}))
 
     def test_a_collection_chunked_without_the_calibrated_length_fails(self):
         # A seed on an engine whose chunker ignores strlen: about 36 chunks of up to 4,000 characters.
@@ -97,6 +143,114 @@ class VerdictTests(unittest.TestCase):
         # Observed on the engine: an upload named '/srv/legacy/ops/memo_q2.txt' is stored with
         # parent 'srv/legacy/ops/memo_q2.txt' and this objectId (derived from the name as sent).
         self.assertEqual(seed.fx.object_id('/srv/legacy/ops/memo_q2.txt'), '9f2bee29-b134-547e-9ba8-2ff9f8dd0f42')
+
+
+class ShapeTests(unittest.TestCase):
+    """A collection in the explorer drivers' shape is not a legacy collection, whatever its counts say."""
+
+    @staticmethod
+    def shape(points):
+        return seed.point_shape((pid, payload.get('meta') or {}, payload.keys()) for pid, payload in points)
+
+    def test_the_old_drivers_points_pass(self):
+        shape = self.shape(corpus_points())
+        self.assertEqual(seed.shape_problems('qdrant', shape), [])
+        self.assertEqual(seed.shape_problems('chroma', shape), [])
+        self.assertEqual(shape['derived_ids'], 0)
+        self.assertEqual(shape['id_versions'], {'4': len(corpus_points())})
+
+    def test_the_new_drivers_derived_ids_fail(self):
+        shape = self.shape(corpus_points(ids='derived'))
+        self.assertEqual(shape['derived_ids'], len(corpus_points()) - 1)  # every chunk but the control record
+        for backend in ('qdrant', 'chroma'):
+            problems = seed.shape_problems(backend, shape)
+            self.assertTrue(any('derived' in p for p in problems), problems)
+            self.assertTrue(any('random' in p for p in problems), problems)
+
+    def test_ids_that_are_not_random_uuids_fail(self):
+        for odd in (7, str(uuid.uuid1()), 'not-a-uuid'):
+            points = corpus_points()
+            points[1] = (odd, points[1][1])
+            self.assertTrue(seed.shape_problems('qdrant', self.shape(points)), odd)
+
+    def test_each_metadata_key_the_new_drivers_add_fails(self):
+        for key, value in NEW_META.items():
+            problems = seed.shape_problems('chroma', self.shape(corpus_points(extra_meta={key: value})))
+            self.assertTrue(any(key in p for p in problems), (key, problems))
+
+    def test_a_top_level_payload_key_fails_on_qdrant(self):
+        problems = seed.shape_problems('qdrant', self.shape(corpus_points(extra_payload={'pointId': 'x'})))
+        self.assertTrue(any('pointId' in p for p in problems), problems)
+
+    def test_the_control_records_own_keys_are_legacy(self):
+        self.assertEqual(seed.CONTROL_META_KEYS, {'vectorSize', 'modelName'})
+        self.assertFalse(seed.LEGACY_META_KEYS & set(NEW_META))
+
+    def test_a_collection_without_chunks_has_no_shape_to_pass(self):
+        # A probe whose upload wrote nothing but the driver's control record proves nothing either.
+        self.assertTrue(seed.shape_problems('qdrant', seed.point_shape([])))
+        control_only = corpus_points()[:1]
+        self.assertTrue(seed.shape_problems('chroma', self.shape(control_only)))
+        self.assertTrue(seed.shape_problems('pgvector', dict(OLD_PG_SHAPE, rows=0)))
+
+    def test_pgvector_has_exactly_the_old_columns(self):
+        self.assertEqual(seed.shape_problems('pgvector', OLD_PG_SHAPE), [])
+        missing = dict(OLD_PG_SHAPE, columns=sorted(seed.LEGACY_COLUMNS - {'signature'}))
+        self.assertTrue(seed.shape_problems('pgvector', missing))
+        extra = dict(OLD_PG_SHAPE, columns=sorted(seed.LEGACY_COLUMNS | {'pointid'}))
+        self.assertTrue(seed.shape_problems('pgvector', extra))
+
+    def test_a_meta_column_is_new_only_right_after_a_seed_and_never_holds_corpus_rows(self):
+        with_meta = dict(OLD_PG_SHAPE, columns=sorted(seed.LEGACY_COLUMNS | {'meta'}))
+        # A newer driver adds the column when it first opens the table ...
+        self.assertEqual(seed.shape_problems('pgvector', with_meta), [])
+        # ... but a seed that ends with one ran through a newer driver ...
+        self.assertTrue(seed.shape_problems('pgvector', with_meta, seeded_now=True))
+        # ... and rows that carry meta were written by one, whenever that was.
+        self.assertTrue(seed.shape_problems('pgvector', dict(with_meta, meta_rows=3)))
+
+    def test_the_legacy_columns_are_the_old_ddls(self):
+        ddl_columns = re.findall(r'(\w+) (?:bigserial|text|int|boolean|vector)', seed.LEGACY_DDL)
+        self.assertEqual({c.lower() for c in ddl_columns}, seed.LEGACY_COLUMNS)
+
+    def test_the_derived_id_is_the_new_drivers(self):
+        # store_qdrant / store_chroma after the explorer: uuid5(NAMESPACE_URL, 'objectId#chunkId').
+        self.assertEqual(seed.derived_id('o', 3), str(uuid.uuid5(uuid.NAMESPACE_URL, 'o#3')))
+
+
+class VerifyShapeTests(unittest.TestCase):
+    """verify() reads the shape of every backend: the new drivers' shape fails with every count right."""
+
+    def setUp(self):
+        names = ('qdrant_exists', 'chroma_exists', '_qdrant_records', '_chroma_records')
+        self.saved = {n: getattr(seed, n) for n in names}
+        seed.qdrant_exists = seed.chroma_exists = lambda name: True
+
+    def tearDown(self):
+        for n, f in self.saved.items():
+            setattr(seed, n, f)
+
+    def verify(self, points):
+        seed._qdrant_records = lambda name: points
+        seed._chroma_records = lambda name: as_chroma(points)
+        return seed.verify(['qdrant', 'chroma'])
+
+    def test_an_old_driver_collection_passes(self):
+        facts, problems = self.verify(corpus_points())
+        self.assertEqual(problems, [])
+        self.assertEqual(facts['qdrant']['shape']['id_versions'], {'4': len(corpus_points())})
+
+    def test_a_copy_in_the_new_drivers_shape_fails(self):
+        # The counterexample: the same documents and chunks, written with derived ids and the new keys.
+        new = corpus_points(ids='derived', extra_meta=NEW_META, extra_payload={'pointId': 'x'})
+        facts, problems = self.verify(new)
+        self.assertEqual(facts['qdrant']['documents'], 40)
+        self.assertEqual(facts['qdrant']['orphans'], [seed.fx.object_id(seed.PREFIX + seed.ORPHAN_REL)])
+        for backend in ('qdrant', 'chroma'):
+            mine = [p for p in problems if p.startswith(backend)]
+            self.assertTrue(any('derived' in p for p in mine), mine)
+            self.assertTrue(any('ingestedAt' in p for p in mine), mine)
+        self.assertTrue(any(p.startswith('qdrant') and 'pointId' in p for p in problems), problems)
 
 
 class ChunkerPreflightTests(unittest.TestCase):

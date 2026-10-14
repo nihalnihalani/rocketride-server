@@ -35,12 +35,18 @@ call, so the store sees a single write per document.
 
 Verification (always run, also after seeding): exactly one control record;
 exactly one document (the long manual) without chunk 0; every corpus document
-present; no ``meta`` column on a pgvector table seeded in this run (a newer
-driver adds it when it first opens the table); the long manual still has at
-least 64 rows and the median chunk is 400-1,200 characters, the calibrated
-chunking of ``apps/vector-ui/tests/fixtures/chunking.json``. A seed on an
-engine whose chunker ignores ``strlen`` (about 36 chunks of up to 4,000
-characters for the manual) fails here. Exits 1 when any check fails.
+present; the long manual still has at least 64 rows and the median chunk is
+400-1,200 characters, the calibrated chunking of
+``apps/vector-ui/tests/fixtures/chunking.json`` (a seed on an engine whose
+chunker ignores ``strlen``, about 36 chunks of up to 4,000 characters for the
+manual, fails here); and the old drivers' shape. On Qdrant and Chroma every
+point id is a random (version 4) uuid, never the ``objectId#chunkId`` uuid5 the
+explorer's drivers derive, the metadata holds only the old keys
+(``LEGACY_META_KEYS``, plus ``vectorSize``/``modelName`` on the control record)
+and a Qdrant payload only ``content`` and ``meta``. On pgvector the table has
+exactly the old columns (``LEGACY_COLUMNS``); a ``meta`` column is allowed only
+when this run did not seed the table (a newer driver adds it when it first opens
+the table), and no row may carry ``meta``. Exits 1 when any check fails.
 
 Before anything is created or dropped, the seed asks the chunker node the
 engine imports (``engine_chunker``) what it would cut from
@@ -66,7 +72,7 @@ import tempfile
 import uuid
 
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -93,6 +99,35 @@ LEGACY_DDL = (
     'permissionId int, isDeleted boolean, chunkId int, isTable boolean, tableId int, vectorSize int, '
     'modelName text, embedding vector({dim}), signature text)'
 )
+
+# What the old drivers write, and nothing more. pgvector: exactly the columns of LEGACY_DDL (a newer
+# driver adds a ``meta`` column when it opens the table and fills it on every row it writes) ...
+LEGACY_COLUMNS = frozenset(
+    (
+        'id',
+        'content',
+        'objectid',
+        'nodeid',
+        'parent',
+        'permissionid',
+        'isdeleted',
+        'chunkid',
+        'istable',
+        'tableid',
+        'vectorsize',
+        'modelname',
+        'embedding',
+        'signature',
+    )
+)
+# ... Qdrant and Chroma: the metadata of DocMetadata's own fields (the explorer's drivers add
+# ingestedAt, size and modifyTime), with the control record's two keys besides ...
+LEGACY_META_KEYS = frozenset(
+    ('objectId', 'chunkId', 'nodeId', 'parent', 'permissionId', 'isDeleted', 'isTable', 'tableId', 'signature')
+)
+CONTROL_META_KEYS = frozenset(('vectorSize', 'modelName'))
+# ... a Qdrant payload of these keys, and random (uuid4) point ids, never the derived ``derived_id``.
+QDRANT_PAYLOAD_KEYS = frozenset(('content', 'meta'))
 
 
 def _guard(name: str) -> str:
@@ -149,6 +184,90 @@ def orphans(rows: Sequence[Tuple[str, int]]) -> List[str]:
     return sorted(o for o, ids in chunks.items() if 0 not in ids)
 
 
+def derived_id(object_id: Any, chunk_id: Any) -> str:
+    """The point id the explorer's Qdrant and Chroma drivers derive for a chunk; the old drivers' ids are random."""
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f'{object_id}#{int(chunk_id)}'))
+
+
+def _id_version(point_id: Any) -> str:
+    """'4' for a random uuid; another uuid version, 'integer' or 'not a uuid' otherwise."""
+    if isinstance(point_id, int):
+        return 'integer'
+    try:
+        return str(uuid.UUID(str(point_id)).version)
+    except ValueError:
+        return 'not a uuid'
+
+
+def point_shape(records: Iterable[Tuple[Any, Dict[str, Any], Iterable[str]]]) -> Dict[str, Any]:
+    """The shape of (point id, metadata, payload keys) records: id versions, derived ids, every key seen.
+
+    ``chunks`` counts the records other than the control record.
+    """
+    versions: Dict[str, int] = collections.Counter()
+    derived, points, chunks = 0, 0, 0
+    meta_keys: set = set()
+    payload_keys: set = set()
+    for point_id, meta, keys in records:
+        points += 1
+        chunks += meta.get('objectId') != 'schema'
+        versions[_id_version(point_id)] += 1
+        try:
+            derived += str(point_id) == derived_id(meta.get('objectId'), meta.get('chunkId') or 0)
+        except (TypeError, ValueError):
+            pass
+        meta_keys.update(meta)
+        payload_keys.update(keys)
+    return {
+        'points': points,
+        'chunks': chunks,
+        'id_versions': dict(versions),
+        'derived_ids': derived,
+        'meta_keys': sorted(meta_keys),
+        'payload_keys': sorted(payload_keys),
+    }
+
+
+def shape_problems(backend: str, shape: Optional[Dict[str, Any]], seeded_now: bool = False) -> List[str]:
+    """Where a collection is not in the old drivers' shape (empty when it is; see the module docstring)."""
+    if not shape:
+        return [f'{backend}: its shape was not read']
+    problems = []
+    if backend == 'pgvector':
+        columns = set(shape.get('columns') or ())
+        missing = sorted(LEGACY_COLUMNS - columns)
+        extra = sorted(columns - LEGACY_COLUMNS - (set() if seeded_now else {'meta'}))
+        if missing:
+            problems.append(f'pgvector: columns of the old DDL missing: {missing}')
+        if extra:
+            problems.append(
+                f'pgvector: columns the old driver never had: {extra}'
+                + (' (a meta column right after seeding: a newer driver opened the table)' if 'meta' in extra else '')
+            )
+        if not shape.get('rows'):
+            problems.append('pgvector: no rows besides the control record to read the shape of')
+        if shape.get('meta_rows'):
+            problems.append(f'pgvector: {shape["meta_rows"]} rows carry meta (written by a newer driver)')
+        return problems
+    if not shape.get('chunks'):
+        problems.append(f'{backend}: no points besides the control record to read the shape of')
+    other = {v: n for v, n in (shape.get('id_versions') or {}).items() if v != '4'}
+    if other:
+        problems.append(f'{backend}: {sum(other.values())} point ids are not random (version 4) uuids: {other}')
+    if shape.get('derived_ids'):
+        problems.append(
+            f"{backend}: {shape['derived_ids']} point ids are derived from objectId#chunkId (the new drivers' ids)"
+        )
+    keys = sorted(set(shape.get('meta_keys') or ()) - LEGACY_META_KEYS - CONTROL_META_KEYS)
+    if keys:
+        problems.append(f'{backend}: metadata keys the old drivers never wrote: {keys}')
+    if backend == 'qdrant':
+        keys = sorted(set(shape.get('payload_keys') or ()) - QDRANT_PAYLOAD_KEYS)
+        if keys:
+            problems.append(f'qdrant: payload keys the old driver never wrote: {keys}')
+    return problems
+
+
 def verdict(
     backend: str,
     *,
@@ -158,18 +277,18 @@ def verdict(
     documents: int,
     expected_documents: int,
     missing: Sequence[str] = (),
-    meta_column: Optional[bool] = None,
     long_manual_chunks: Optional[int] = None,
     median_chunk_chars: Optional[int] = None,
+    shape: Optional[Dict[str, Any]] = None,
+    seeded_now: bool = False,
 ) -> List[str]:
-    """Problems with one seeded collection (empty when it is as promised)."""
+    """Problems with one seeded collection (empty when it is as promised; a shape not read is a problem)."""
     problems = []
     if missing:
         problems.append(f'{backend}: {len(missing)} corpus documents missing, e.g. {list(missing)[:3]}')
     if control != 1:
         problems.append(f'{backend}: {control} control records (expected 1)')
-    if meta_column:
-        problems.append(f'{backend}: has a meta column (a legacy table has none)')
+    problems += shape_problems(backend, shape, seeded_now)
     if expected_orphan is None or list(orphan_ids) != [expected_orphan]:
         problems.append(
             f'{backend}: documents without chunk 0 = {list(orphan_ids)} (expected exactly [{expected_orphan}])'
@@ -368,10 +487,14 @@ def pg_facts(table: str) -> Dict[str, Any]:
         cur.execute(sql.SQL("SELECT count(*) FROM {} WHERE objectid = 'schema'").format(t))
         control = cur.fetchone()[0]
         cur.execute(
-            'SELECT count(*) FROM information_schema.columns WHERE table_name = %s AND column_name = %s',
-            (table, 'meta'),
+            "SELECT column_name FROM information_schema.columns WHERE table_schema = 'public' AND table_name = %s",
+            (table,),
         )
-        meta = cur.fetchone()[0] > 0
+        columns = sorted(r[0] for r in cur.fetchall())
+        meta_rows = 0
+        if 'meta' in columns:
+            cur.execute(sql.SQL("SELECT count(*) FROM {} WHERE objectid <> 'schema' AND meta IS NOT NULL").format(t))
+            meta_rows = cur.fetchone()[0]
         cur.execute(
             sql.SQL(
                 "SELECT objectid FROM {} WHERE objectid <> 'schema' GROUP BY objectid HAVING NOT bool_or(chunkid = 0) ORDER BY objectid"
@@ -384,7 +507,8 @@ def pg_facts(table: str) -> Dict[str, Any]:
         contents = [r[0] or '' for r in cur.fetchall()]
     return {
         'control': control,
-        'meta_column': meta,
+        'meta_column': 'meta' in columns,
+        'shape': {'columns': columns, 'rows': len(contents), 'meta_rows': meta_rows},
         'orphans': orphan_ids,
         'documents': len(counts),
         'chunks': sum(counts.values()),
@@ -405,15 +529,15 @@ def _qdrant():
     return QdrantClient(host=fx.QDRANT['host'], port=fx.QDRANT['port'], timeout=30)
 
 
-def _qdrant_points(collection: str) -> List[Tuple[Dict[str, Any], str]]:
-    """(meta, content) of every point."""
+def _qdrant_records(collection: str) -> List[Tuple[Any, Dict[str, Any]]]:
+    """(point id, payload) of every point."""
     client = _qdrant()
     out, offset = [], None
     while True:
         points, offset = client.scroll(
             collection_name=collection, limit=1000, offset=offset, with_payload=True, with_vectors=False
         )
-        out.extend((((p.payload or {}).get('meta') or {}), (p.payload or {}).get('content') or '') for p in points)
+        out.extend((p.id, p.payload or {}) for p in points)
         if offset is None:
             return out
 
@@ -461,7 +585,10 @@ def _row_facts(rows: Sequence[Tuple[str, int, str]]) -> Dict[str, Any]:
 
 
 def qdrant_facts(collection: str) -> Dict[str, Any]:
-    return _row_facts([(m.get('objectId'), m.get('chunkId') or 0, text) for m, text in _qdrant_points(collection)])
+    records = [(pid, payload.get('meta') or {}, payload) for pid, payload in _qdrant_records(collection)]
+    facts = _row_facts([(m.get('objectId'), m.get('chunkId') or 0, p.get('content') or '') for _, m, p in records])
+    facts['shape'] = point_shape((pid, m, p.keys()) for pid, m, p in records)
+    return facts
 
 
 # ---------------------------------------------------------------------------
@@ -484,10 +611,13 @@ def chroma_drop(collection: str) -> None:
         _chroma().delete_collection(collection)
 
 
-def _chroma_rows(collection: str) -> List[Tuple[Dict[str, Any], str]]:
-    """(metadata, document) of every record."""
+def _chroma_records(collection: str) -> List[Tuple[str, Dict[str, Any], str]]:
+    """(id, metadata, document) of every record."""
     got = _chroma().get_collection(collection).get(include=['metadatas', 'documents'])
-    return list(zip(got['metadatas'] or [], [d or '' for d in (got['documents'] or [])]))
+    return [
+        (rid, meta or {}, doc or '')
+        for rid, meta, doc in zip(got['ids'], got['metadatas'] or [], got['documents'] or [])
+    ]
 
 
 def chroma_plant_orphan(collection: str, object_id: str) -> None:
@@ -495,7 +625,10 @@ def chroma_plant_orphan(collection: str, object_id: str) -> None:
 
 
 def chroma_facts(collection: str) -> Dict[str, Any]:
-    return _row_facts([(m.get('objectId'), m.get('chunkId') or 0, text) for m, text in _chroma_rows(collection)])
+    records = _chroma_records(collection)
+    facts = _row_facts([(m.get('objectId'), m.get('chunkId') or 0, text) for _, m, text in records])
+    facts['shape'] = point_shape((rid, m, ()) for rid, m, _ in records)
+    return facts
 
 
 # ---------------------------------------------------------------------------
@@ -573,7 +706,7 @@ async def seed(backends: Sequence[str], recreate: bool) -> Dict[str, Any]:
 
 
 def verify(backends: Sequence[str], seeded_now: Sequence[str] = ()) -> Tuple[Dict[str, Any], List[str]]:
-    """Facts and problems for every selected backend.
+    """Facts and problems for every selected backend (``seeded_now``: the backends this run seeded).
 
     A ``meta`` column on pgvector is a problem only right after this run seeded
     the table: a newer driver adds the column when it first opens the table.
@@ -607,9 +740,10 @@ def verify(backends: Sequence[str], seeded_now: Sequence[str] = ()) -> Tuple[Dic
             documents=f['documents'],
             expected_documents=len(wanted),
             missing=sorted(wanted - present),
-            meta_column=f.get('meta_column') if backend in seeded_now else None,
             long_manual_chunks=f['long_manual_chunks'],
             median_chunk_chars=f['median_chunk_chars'],
+            shape=f.get('shape'),
+            seeded_now=backend in seeded_now,
         )
     return facts, problems
 
