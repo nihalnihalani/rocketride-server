@@ -335,19 +335,17 @@ def test_search_returns_error_envelope_when_no_embedder() -> None:
     assert store.semantic_calls == []
 
 
-def test_search_warns_only_once_across_calls() -> None:
-    """The no-embedder warning (if any) must fire at most once across repeated calls."""
+def test_search_without_an_embedder_answers_no_embedder_every_time_and_logs_nothing() -> None:
+    """Repeated calls without an embedder each answer NO_EMBEDDER; nothing is logged, nothing is searched."""
     _fresh_warnings()
     store = FakeStore()
     instance = FakeIInstance(FakeIGlobal(store=store, server_name='vdb'))
 
-    instance.search({'query': 'a'})
-    instance.search({'query': 'b'})
-    instance.search({'query': 'c'})
+    answers = [instance.search({'query': query}) for query in ('a', 'b', 'c')]
 
-    # At most one warning mentioning the missing embedder
-    embedder_warnings = [w for w in _WARNINGS if 'embed' in w.lower()]
-    assert len(embedder_warnings) <= 1
+    assert [(answer['success'], answer.get('code')) for answer in answers] == [(False, 'NO_EMBEDDER')] * 3
+    assert [w for w in _WARNINGS if 'embed' in w.lower()] == []
+    assert store.keyword_calls == [] and store.semantic_calls == []
 
 
 def test_search_uses_semantic_when_embed_query_present() -> None:

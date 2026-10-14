@@ -170,8 +170,12 @@ def test_an_oversized_answer_is_refused(monkeypatch):
     assert (answer['success'], answer['code']) == (False, 'LIMIT_EXCEEDED')
 
 
-def test_the_size_cap_is_eight_megabytes():
-    assert vx_tools.MAX_ANSWER_BYTES == 8 * 1024 * 1024
+def test_answers_up_to_eight_megabytes_pass_and_larger_ones_are_refused():
+    cap = 8 * 1024 * 1024
+    overhead = len(json.dumps({'success': True, 'blob': ''}, separators=(',', ':')))
+    assert _run({'blob': 'x' * (cap - overhead)})['success'] is True
+    answer = _run({'blob': 'x' * (cap - overhead + 1)})
+    assert (answer['success'], answer.get('code')) == (False, 'LIMIT_EXCEEDED')
 
 
 class _Unprintable:

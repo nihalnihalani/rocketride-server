@@ -15,7 +15,6 @@ numbers, and seeded random data is checked against brute-force reference code.
 from __future__ import annotations
 
 import hashlib
-import math
 import threading
 from typing import List, Tuple
 
@@ -485,6 +484,10 @@ def test_light_budget_allows_up_to_two_thousand_points_of_any_width():
     cache_mod.check_light_budget(n=2000, dimension=100_000)
 
 
-def test_light_budget_allows_five_thousand_small_vectors():
+def test_light_budget_allows_five_thousand_vectors_up_to_the_byte_budget():
+    widest = int(cache_mod.VECTOR_TOOL_DEFAULTS['sample_light_max_bytes']) // (5000 * 4)
     cache_mod.check_light_budget(n=5000, dimension=384)
-    assert math.isclose(5000 * 384 * 4 / (64 * 1024 * 1024), 0.1144, rel_tol=1e-3)
+    cache_mod.check_light_budget(n=5000, dimension=widest)
+    with pytest.raises(ToolRefusal) as err:
+        cache_mod.check_light_budget(n=5000, dimension=widest + 1)
+    assert err.value.code == 'LIMIT_EXCEEDED'
