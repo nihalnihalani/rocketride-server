@@ -54,7 +54,11 @@ unmocked:
    remove_document, the legacy get/objdir/delete/upsert, and ``embed`` on
    ``embed_1``. Writes are refused through the chat and ingest tokens, on
    ``store_2``, as a broadcast, with the switch off and for the control record;
-   the expectation for the switch reads ``VECTOR_ALLOW_WRITES_DEFAULT``.
+   the expectation for the switch reads ``VECTOR_ALLOW_WRITES_DEFAULT``. The
+   refusal of a call that carries no context at all (``WRITES_UNKNOWN_CALLER``)
+   cannot be produced through a real engine, which stamps every
+   ``client.tool`` call: the write gate's unit tests (``test_vector_write_gate.py``)
+   and the G0-7 probe cover that row.
 5. A chat through ``chat_1`` returns the stub's answer and the retrieved chunks;
    a pipeline shaped like the repository's RAG example (webhook and chat, no
    Tools source) answers ``dialect``/``stats`` through its chat token and
@@ -63,7 +67,9 @@ unmocked:
    (``RR_TEST_PGVECTOR_POOLER_DSN``) and a search filtered to one document
    still returns ``k`` rows.
 6. No answer (tool or chat) carries a host, DSN, user, credential, database
-   name or token, and none has a non-empty field named like one (``SECRET_KEY``).
+   name or token, and none has a non-empty field named like one (``SECRET_KEY``):
+   each template's answers right after its tests, and every answer of the run
+   (the stock-RAG shape's included) at the end of the module.
 
 Services (the defaults are the local containers of
 ``scripts/acceptance/vector-explorer/README.md``):
@@ -1526,14 +1532,6 @@ def test_rocketride_vector_through_the_transaction_pooler(engine, broker, stub, 
         broker.dsn = direct
 
 
-def test_a_write_without_a_call_context_is_refused():
-    """The 'no context' row (WRITES_UNKNOWN_CALLER) of the refusal table."""
-    pytest.skip(
-        'NOT RUN: a context-less call cannot be produced through a real engine (the dispatcher stamps every '
-        'client.tool call); covered by test_vector_write_gate.py and the G0-7 probe'
-    )
-
-
 # ---------------------------------------------------------------------------
 # The legacy copies (no engine or database call)
 # ---------------------------------------------------------------------------
@@ -1618,6 +1616,8 @@ def test_the_secrets_scan_reads_every_field_but_document_text():
     # A field named like a connection setting is a finding whatever its value, unless it is empty.
     for key in ('host', 'Host', 'dsn', 'password', 'user', 'username', 'port', 'url', 'uri', 'apikey', 'api_key'):
         assert _secret_findings({'backend': {key: 'x'}}, []), key
+    for key in ('database', 'Database', 'dbname', 'db_name', 'server', 'endpoint', 'address'):
+        assert _secret_findings({'backend': {key: 'x'}}, []), key
     assert _secret_findings({'backend': {'password': ''}, 'url': None}, []) == []
     # Ids named after users are not connection settings.
     assert _secret_findings({'audit': {'caller': {'userId': 'u-1', 'teamId': None}}, 'user_count': 3}, []) == []
@@ -1626,6 +1626,26 @@ def test_the_secrets_scan_reads_every_field_but_document_text():
 def test_the_pgvector_secrets_include_the_database_user():
     service = _PgVector('postgres')
     assert service.user and service.user in service.secrets()
+
+
+def test_the_end_of_run_scan_reads_every_template_including_the_stock_rag_shape():
+    # The stock-RAG shape records its answers under its own name, which no deployment's own scan reads.
+    leaked = ('stock_rag', 'stock', 'stats', {'success': True, 'where': '127.0.0.1:55432', 'ok': 1})
+    clean = ('qdrant', 'new', 'stats', {'success': True, 'documents': 3})
+    banned = _run_banned(
+        SimpleNamespace(token='broker-t', url='http://127.0.0.1:1/provision'), SimpleNamespace(apikey='engine-key')
+    )
+    assert {'127.0.0.1:55432', 'broker-t', 'engine-key'} <= set(banned)
+    findings = _run_findings([clean, leaked], banned)
+    assert len(findings) == 1 and findings[0].startswith('stock_rag/stock stats'), findings
+
+
+def test_the_end_of_run_scan_is_the_last_test_of_the_module(request):
+    mine = [i.name for i in request.session.items if i.module is sys.modules[__name__]]
+    last = 'test_no_answer_of_the_run_carries_a_host_credential_or_token'
+    if last not in mine:
+        pytest.skip('NOT RUN: the end-of-run scan is not selected in this run')
+    assert mine[-1] == last, f'{mine[-1]} records answers after the end-of-run scan'
 
 
 def test_a_chat_answer_is_scanned_too():
@@ -1662,7 +1682,8 @@ def _non_content(value: Any) -> Any:
 # Field names that hold a connection setting or a credential (whole names, any case); see the
 # principles of docs/development/nodes/vector-tool-contract.md: no reply carries a host, DSN or credential.
 SECRET_KEY = re.compile(
-    r'^(host|hostname|dsn|password|passwd|pwd|user|username|port|url|uri|connection_?string|api_?key|secret|token)$',
+    r'^(host|hostname|dsn|password|passwd|pwd|user|username|port|url|uri|connection_?string|api_?key|secret|token'
+    r'|database|db_?name|server|endpoint|address)$',
     re.IGNORECASE,
 )
 
@@ -1689,6 +1710,24 @@ def _secret_findings(answer: Any, banned: Sequence[str]) -> List[str]:
     return [s for s in banned if s and s in blob] + _secret_keys(answer)
 
 
+def _run_banned(broker_, engine_) -> List[str]:
+    """Every fixture secret of the run: each supported service's, the broker's token and URL, the engine's key."""
+    banned = [broker_.token, broker_.url, engine_.apikey]
+    for provider in SUPPORTED:
+        banned += _service(provider).secrets()
+    return sorted({b for b in banned if b})
+
+
+def _run_findings(answers: Sequence[Tuple[str, str, str, Any]], banned: Sequence[str]) -> List[str]:
+    """``<template>/<kind> <tool>: <findings>`` for every recorded answer that carries a secret."""
+    out = []
+    for template, kind, tool, answer in answers:
+        leaked = _secret_findings(answer, banned)
+        if leaked:
+            out.append(f'{template}/{kind} {tool}: {leaked}')
+    return out
+
+
 def test_no_answer_carries_a_host_credential_or_token(deployment, broker, engine):
     answers = [a for a in ANSWERS if a[0] == deployment.provider]
     assert answers, 'no tool answers were recorded for this template'
@@ -1696,3 +1735,15 @@ def test_no_answer_carries_a_host_credential_or_token(deployment, broker, engine
     for template, kind, tool, answer in answers:
         leaked = _secret_findings(answer, banned)
         assert leaked == [], f'{template}/{kind} {tool} answer carries {leaked}'
+
+
+def test_no_answer_of_the_run_carries_a_host_credential_or_token(broker, engine):
+    """Every answer of the run, whatever template recorded it (the stock-RAG shape's too), against every secret.
+
+    Kept last in the module (a unit test checks it): the stock-RAG test runs
+    after every deployment's own scan, so only this one reads its answers.
+    """
+    if not ANSWERS:
+        pytest.skip('NOT RUN: no answers were recorded in this run (every template was skipped)')
+    findings = _run_findings(ANSWERS, _run_banned(broker, engine))
+    assert findings == [], findings
