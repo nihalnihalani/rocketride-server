@@ -78,6 +78,9 @@ GAP_SEARCH_STEPS = 64
 # is therefore unsorted (the Data API pages it) and ordered on the node where order matters.
 
 
+# Most documents of one Data API page a listing cursor can skip (a find page holds at most 20)
+MAX_PAGE_SKIP = 1000
+
 # Network libraries under the clients (their errors can name the server too)
 _TRANSPORTS = ('grpc', 'httpx', 'httpcore', 'h11', 'h2', 'urllib3', 'requests', 'aiohttp', 'ssl', 'socket', 'dns')
 
@@ -206,6 +209,11 @@ def _field(obj: Any, name: str, default: Any = None) -> Any:
     return getattr(obj, name, default)
 
 
+def _is_count(value: Any) -> bool:
+    """Whether a cursor field is a non-negative integer (a float or a boolean is not)."""
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
 def _encode_cursor(state: Optional[str], skip: int, first: Optional[str]) -> str:
     """
     Opaque listing cursor: the Data API page state to resume from (None: the first page), how many
@@ -223,9 +231,9 @@ def _decode_cursor(cursor: Optional[str]) -> Tuple[Optional[str], int, Optional[
         padded = cursor + '=' * (-len(cursor) % 4)
         data = json.loads(base64.urlsafe_b64decode(padded.encode('ascii')).decode('utf-8'))
         state = data['s']
-        skip = int(data['k'])
+        skip = data['k']
         first = data.get('f')
-        if (state is not None and not isinstance(state, str)) or skip < 0:
+        if (state is not None and not isinstance(state, str)) or not _is_count(skip) or skip > MAX_PAGE_SKIP:
             raise ValueError('cursor out of range')
         if first is not None and not isinstance(first, str):
             raise ValueError('cursor out of range')
@@ -941,7 +949,8 @@ class Store(DocumentStoreBase):
         limit = max(1, int(limit))
         caveats = ['documents_unsorted', 'documents_by_first_chunk', 'extras_not_stored']
 
-        if not self._doesCollectionExist():
+        # No collection, or an empty id list (no document asked for): an empty last page
+        if (object_ids is not None and not object_ids) or not self._doesCollectionExist():
             return DocPage(
                 items=[], next_cursor=None, total=0, counts_exact=False, distinct=False, sorted=False, caveats=caveats
             )

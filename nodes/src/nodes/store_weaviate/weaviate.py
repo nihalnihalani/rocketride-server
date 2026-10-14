@@ -193,6 +193,11 @@ def _keyed_uuid(objectId: str, chunkId: int) -> str:
     return str(uuid.uuid5(uuid.NAMESPACE_URL, f'{objectId}#{chunkId}'))
 
 
+def _is_count(value: Any) -> bool:
+    """Whether a cursor field is a non-negative integer (a float or a boolean is not)."""
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
 def _encode_cursor(offset: int, first: Optional[str]) -> str:
     """Opaque listing cursor: the next offset and the first objectId of the page just served."""
     raw = json.dumps({'o': offset, 'f': first}, separators=(',', ':')).encode('utf-8')
@@ -206,9 +211,11 @@ def _decode_cursor(cursor: Optional[str]) -> Tuple[int, Optional[str]]:
     try:
         padded = cursor + '=' * (-len(cursor) % 4)
         data = json.loads(base64.urlsafe_b64decode(padded.encode('ascii')).decode('utf-8'))
-        offset = int(data['o'])
+        offset = data['o']
         first = data.get('f')
-        if offset < 0 or (first is not None and not isinstance(first, str)):
+        if not _is_count(offset) or offset > MAX_QUERY_RESULTS:
+            raise ValueError('cursor out of range')
+        if first is not None and not isinstance(first, str):
             raise ValueError('cursor out of range')
         return offset, first
     except Exception:
@@ -1097,7 +1104,8 @@ class Store(DocumentStoreBase):
         limit = max(1, int(limit))
         caveats = ['documents_unsorted', 'documents_by_first_chunk']
 
-        if not self._doesCollectionExist():
+        # No collection, or an empty id list (no document asked for): an empty last page
+        if (object_ids is not None and not object_ids) or not self._doesCollectionExist():
             return DocPage(
                 items=[], next_cursor=None, total=0, counts_exact=True, distinct=False, sorted=False, caveats=caveats
             )

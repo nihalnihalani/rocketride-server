@@ -1009,7 +1009,8 @@ class Store(DocumentStoreBase):
             items=[], next_cursor=None, total=None, counts_exact=False, distinct=False, sorted=False, caveats=caveats
         )
 
-        if not self._doesCollectionExist():
+        # No collection, or an empty id list (no document asked for): an empty last page
+        if (object_ids is not None and not object_ids) or not self._doesCollectionExist():
             return empty
 
         flt = self._convertFilter(

@@ -45,6 +45,22 @@ from dataclasses import dataclass
 
 
 # =============================================================================
+# Errors
+# =============================================================================
+
+
+class PineconeApiException(Exception):
+    """The client's error for a request the service rejected (``status`` is the HTTP status)."""
+
+    def __init__(self, status: int = 400, reason: str = 'Bad Request', body: str = '') -> None:
+        """Keep the status and reason as the client does."""
+        super().__init__(f'({status})\nReason: {reason}\nHTTP response body: {body}')
+        self.status = status
+        self.reason = reason
+        self.body = body
+
+
+# =============================================================================
 # Index Specifications
 # =============================================================================
 
@@ -191,6 +207,9 @@ class MockIndex:
         if limit is not None and not 1 <= limit <= 10000:
             raise ValueError('limit must be between 1 and 10000')
         size = limit or 100
+        if pagination_token is not None and not str(pagination_token).isdigit():
+            # The service rejects a token it did not issue
+            raise PineconeApiException(status=400, body='{"error": {"message": "invalid pagination token"}}')
         start = int(pagination_token or 0)
         ids = [
             vec_id for vec_id, data in self._storage.items() if self._matches_filter(data.get('metadata', {}), filter)

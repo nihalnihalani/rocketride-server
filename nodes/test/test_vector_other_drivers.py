@@ -16,6 +16,7 @@ evidence that a driver works against a live server: these drivers stay
 ``support='experimental'`` whatever this suite says.
 """
 
+import base64
 import dataclasses
 import json
 import math
@@ -23,7 +24,7 @@ import math
 import pytest
 
 from ai.common.schema import Doc, DocFilter, Question, QuestionText
-from ai.common.store.errors import StoreUnsupported, ToolRefusal
+from ai.common.store.errors import StoreError, StoreUnsupported, ToolRefusal
 from ai.common.store.vx_types import ChunkPage, DocPage, StoreInfo
 
 from . import vector_other_drivers_harness as h
@@ -345,6 +346,73 @@ def test_listing_refuses_a_cursor_it_did_not_issue(adapter, store):
     with pytest.raises(ToolRefusal) as excinfo:
         store.listDocuments(cursor='%%not-a-cursor%%', limit=2, object_ids=None, deleted='active', sort='path')
     assert excinfo.value.code == 'INVALID_INPUT'
+
+
+def _cursor(data):
+    """A listing cursor in the drivers' encoding (url-safe base64 JSON) holding ``data``."""
+    raw = json.dumps(data, separators=(',', ':')).encode('utf-8')
+    return base64.urlsafe_b64encode(raw).decode('ascii').rstrip('=')
+
+
+#: A cursor of each driver's shape whose position field (offset, skip or page token) holds ``value``
+CURSOR_SHAPES = {
+    'milvus': lambda value: {'o': value, 'f': None},
+    'weaviate': lambda value: {'o': value, 'f': None},
+    'atlas': lambda value: {'o': value, 'f': None},
+    'astra_db': lambda value: {'s': None, 'k': value, 'f': None},
+    'pinecone': lambda value: {'t': value, 'f': None},
+}
+
+
+@pytest.mark.parametrize(
+    'value', [1.5, True, -1, 10**30, '7'], ids=['float', 'bool', 'negative', 'beyond-reach', 'string']
+)
+def test_listing_refuses_a_forged_position(adapter, store, value):
+    """A cursor carrying a position the driver never issues (not an integer, or out of reach) is INVALID_INPUT."""
+    h.ingest(store, 'doc-a', '/docs/a.md', [0])
+    if adapter.name == 'pinecone' and isinstance(value, str):
+        value = 7  # Pinecone's position is the backend's token: a string is its own shape
+    with pytest.raises(ToolRefusal) as excinfo:
+        store.listDocuments(
+            cursor=_cursor(CURSOR_SHAPES[adapter.name](value)), limit=2, object_ids=None, deleted='active', sort='path'
+        )
+    assert excinfo.value.code == 'INVALID_INPUT'
+
+
+#: A forged backend page token is only caught by the backend: (cursor, the client error it answers)
+BACKEND_TOKENS = {
+    'pinecone': ({'t': 'garbage-token', 'f': None}, 'PineconeApiException (code 400)'),
+    'astra_db': ({'s': 'garbage-state', 'k': 0, 'f': None}, 'DataAPIResponseException'),
+}
+
+
+def test_listing_with_a_page_token_the_backend_rejects(adapter, store):
+    """A forged backend token fails as a host-free backend error naming the client's rejection."""
+    h.ingest(store, 'doc-a', '/docs/a.md', [0])
+    if adapter.name not in BACKEND_TOKENS:
+        # Offset cursors: the driver itself refuses a position it never issues
+        with pytest.raises(ToolRefusal):
+            store.listDocuments(
+                cursor=_cursor(CURSOR_SHAPES[adapter.name]('garbage')),
+                limit=2,
+                object_ids=None,
+                deleted='active',
+                sort='path',
+            )
+        return
+    cursor, rejection = BACKEND_TOKENS[adapter.name]
+    with pytest.raises(StoreError) as excinfo:
+        store.listDocuments(cursor=_cursor(cursor), limit=2, object_ids=None, deleted='active', sort='path')
+    assert rejection in str(excinfo.value)
+
+
+def test_listing_an_empty_id_list_is_empty(adapter, store):
+    """object_ids=[] asks for no document: an empty last page, not the whole collection."""
+    h.ingest(store, 'doc-a', '/docs/a.md', [0])
+    h.ingest(store, 'doc-b', '/docs/b.md', [0])
+    page = store.listDocuments(cursor=None, limit=5, object_ids=[], deleted='active', sort='path')
+    assert page.items == []
+    assert page.next_cursor is None
 
 
 def test_listing_a_missing_collection_is_empty(adapter, store):
