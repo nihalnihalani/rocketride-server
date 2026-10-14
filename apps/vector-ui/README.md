@@ -141,8 +141,7 @@ console. **Table** lists the same points for keyboard and screen-reader use.
 - Up to 20 files per drop, 50 MB per file and 200 MB per drop; PDF, DOCX, PPTX,
   XLSX, ODT, RTF, TXT, MD, CSV, HTML and JSON. The app checks these limits
   before sending, and every template's parser refuses a file over 50 MB
-  (`maxFileSize`). The engine itself does not limit the bytes an upload writes
-  in this release.
+  (`maxFileSize`).
 - A file is stored under its path in the drop (a folder keeps its structure);
   **Store under folder** puts a prefix in front. Dropping a file whose path is
   already stored asks before replacing it; the old chunks are removed when the
