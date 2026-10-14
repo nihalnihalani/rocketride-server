@@ -63,10 +63,38 @@ test('privacy: raw vectors in any other answer are a violation; vectors may carr
 
 test('privacy: sample columns of n values are not vectors, other keys in a sample answer are', () => {
 	const column = vec(5);
-	assert.deepStrictEqual(C.privacyViolations(pair('sample', {}, { points: { x: column, y: column }, density: column }), DIM), []);
-	assert.strictEqual(C.privacyViolations(pair('sample', {}, { points: { x: column }, raw: [column] }), DIM).length, 1);
+	assert.deepStrictEqual(C.privacyViolations(pair('sample', {}, { n: DIM, points: { x: column, y: column }, density: column }), DIM), []);
+	assert.strictEqual(C.privacyViolations(pair('sample', {}, { n: DIM, points: { x: column }, raw: [column] }), DIM).length, 1);
 	// Integer arrays (ids, lengths) are not embeddings.
+	assert.deepStrictEqual(C.privacyViolations(pair('sample', {}, { n: 1000, points: { doc: Array.from({ length: DIM }, (_, i) => i) } }), DIM), []);
 	assert.deepStrictEqual(C.privacyViolations(pair('documents', {}, { ids: Array.from({ length: DIM }, (_, i) => i) }), DIM), []);
+});
+
+test("privacy: a column path is exempt only when its length is the answer's own count", () => {
+	const stray = vec(6);
+	// A 1,000-point sample has columns of 1,000: a dimension-long float array under points is a vector.
+	assert.strictEqual(C.privacyViolations(pair('sample', {}, { n: 1000, points: { vectors: stray } }), DIM).length, 1);
+	assert.strictEqual(C.privacyViolations(pair('sample', {}, { n: 1000, density: stray }), DIM).length, 1);
+	assert.strictEqual(C.privacyViolations(pair('sample', {}, { points: { x: stray } }), DIM).length, 1, 'no n: nothing is exempt');
+	// knn.sims holds one similarity per edge: as many as knn.cols.
+	const cols = Array.from({ length: DIM }, (_, i) => i % 7);
+	assert.deepStrictEqual(C.privacyViolations(pair('sample', {}, { n: 32, knn: { cols, sims: stray } }), DIM), []);
+	assert.strictEqual(C.privacyViolations(pair('sample', {}, { n: 32, knn: { cols: cols.slice(1), sims: stray } }), DIM).length, 1);
+});
+
+test('privacy: project similarities follow their sample, neighbors scores their scope', () => {
+	const stray = vec(8);
+	const [s1, s1Res] = pair('sample', { n: DIM }, { sample_id: 's-7-aaaaaaaa', n: DIM });
+	const [s2, s2Res] = pair('sample', { n: 1000 }, { sample_id: 's-7-bbbbbbbb', n: 1000 });
+	const ok = pair('project', { sample_id: 's-7-aaaaaaaa', vector: [0.5] }, { similarities: stray });
+	assert.deepStrictEqual(C.privacyViolations([s1, s1Res, s2, s2Res, ...ok], DIM), []);
+	const wrong = pair('project', { sample_id: 's-7-bbbbbbbb', vector: [0.5] }, { similarities: stray });
+	assert.strictEqual(C.privacyViolations([s1, s1Res, s2, s2Res, ...wrong], DIM).length, 1);
+	const unknown = pair('project', { sample_id: 's-7-cccccccc', vector: [0.5] }, { similarities: stray });
+	assert.strictEqual(C.privacyViolations(unknown, DIM).length, 1);
+	const keys = Array.from({ length: DIM }, (_, i) => ['x', i]);
+	assert.deepStrictEqual(C.privacyViolations(pair('neighbors', { key: ['x', 0], scope_keys: keys }, { scores: stray }), DIM), []);
+	assert.strictEqual(C.privacyViolations(pair('neighbors', { key: ['x', 0] }, { scores: stray }), DIM).length, 1);
 });
 
 test('privacy: the length checked is dialect.dimension, not a fixed 384', () => {

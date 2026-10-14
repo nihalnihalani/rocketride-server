@@ -126,20 +126,39 @@ function sameVector(a, b) {
 	return Array.isArray(a) && Array.isArray(b) && a.length === b.length && a.every((x, i) => x === b[i]);
 }
 
-// Columns of n values in sample/project/neighbors answers: n may equal the dimension by chance.
+// Columns of a sample/project/neighbors answer hold one value per point (or edge, or scoped key), so
+// their length can equal the dimension by chance. Such a path is exempt only when the array is exactly
+// as long as the answer's own count: a dimension-long float array anywhere else is a vector.
 const COLUMN_TOOLS = new Set(['sample', 'project', 'neighbors']);
-const COLUMN_PATH = /\.(points\.\w+|density|outliers|knn\.\w+|similarities|scores)$/;
+const COLUMN_PATH = /\.(points\.\w+|density|knn\.sims|similarities|scores)$/;
+
+/**
+ * How many values the column at `at` must hold: the sample's `n` (points.*, density), its edge count
+ * (knn.sims, as many as knn.cols), the size of the sample a project call names (similarities), or the
+ * scope a neighbors call sent (scores). Null when the answer does not say.
+ */
+function columnLength(tool, at, answer, input, sampleSizes) {
+	const a = answer || {};
+	if (tool === 'sample' && /\.(points\.\w+|density)$/.test(at)) return Number.isInteger(a.n) ? a.n : null;
+	if (tool === 'sample' && /\.knn\.sims$/.test(at)) return a.knn && Array.isArray(a.knn.cols) ? a.knn.cols.length : null;
+	if (tool === 'project' && /\.similarities$/.test(at)) return sampleSizes.has(input.sample_id) ? sampleSizes.get(input.sample_id) : null;
+	if (tool === 'neighbors' && /\.scores$/.test(at)) return Array.isArray(input.scope_keys) ? input.scope_keys.length : null;
+	return null;
+}
 
 /**
  * The privacy property (B4) over captured WebSocket frames (parsed JSON, in
  * order), for vectors of `dim` (dialect.dimension) floats: no response carries
  * one except `vectors` (at most 2) and `embed` answers; no event carries one;
  * no request carries one other than a vector an embed answer returned earlier.
+ * A column of a sample/project/neighbors answer (COLUMN_PATH) is not a vector
+ * when it holds exactly the answer's own count of values (columnLength).
  * Returns the violations (empty when the property holds).
  */
 function privacyViolations(frames, dim) {
 	if (!Number.isInteger(dim) || dim <= 0) return [`dialect.dimension is unknown (${JSON.stringify(dim)}), so the property cannot be checked`];
 	const requests = new Map();
+	const sampleSizes = new Map();
 	const embedded = [];
 	const violations = [];
 	for (const { dir, msg } of frames) {
@@ -152,7 +171,11 @@ function privacyViolations(frames, dim) {
 		} else if (dir === 'received' && msg.type === 'response') {
 			const req = requests.get(msg.request_seq);
 			const tool = toolOf(req);
-			const hits = fullVectors(msg.body, dim).filter((h) => !(COLUMN_TOOLS.has(tool) && COLUMN_PATH.test(h.at)));
+			const answer = msg.body && msg.body.result !== undefined ? msg.body.result : msg.body;
+			const input = (req && req.arguments && req.arguments.input) || {};
+			if (tool === 'sample' && answer && answer.sample_id) sampleSizes.set(answer.sample_id, answer.n);
+			const exempt = (h) => COLUMN_TOOLS.has(tool) && COLUMN_PATH.test(h.at) && columnLength(tool, h.at, answer, input, sampleSizes) === h.vector.length;
+			const hits = fullVectors(msg.body, dim).filter((h) => !exempt(h));
 			if (!hits.length) continue;
 			if (tool === 'embed') {
 				hits.forEach((h) => embedded.push(h.vector));
