@@ -40,7 +40,7 @@ import pytest
 from rocketlib import IInstanceBase
 
 from ai.common.schema import Doc, DocMetadata
-from ai.common.store import VectorStoreToolMixin, vx_tools, vx_write_gate
+from ai.common.store import StoreInstanceBase, VectorStoreToolMixin, vx_tools, vx_write_gate
 from ai.common.store import document_store as _store_module
 from ai.common.store.errors import StoreUnsupported
 from ai.common.store.vx_defaults import VECTOR_TOOL_LIMITS
@@ -919,16 +919,69 @@ def test_stats_quick_returns_cached_figures_with_their_time(monkeypatch):
     monkeypatch.setattr(vx_tools, '_wall_clock', lambda: clock[0])
     inst = node(store)
     full = inst.stats({'mode': 'full'})
-    store.addChunks([make_doc('new', 0, dim=8)])
     clock[0] += 45
     calls_before = len([c for c in store.calls if c[0] in ('countChunks', 'countDocuments')])
     quick = inst.stats({'mode': 'quick'})
     calls_after = len([c for c in store.calls if c[0] in ('countChunks', 'countDocuments')])
     assert calls_after == calls_before
-    assert quick['documents'] == full['documents'] == 2
-    assert quick['count'] == full['count'] + 1
+    assert quick['documents'] == full['documents'] == 2 and quick['count'] == full['count']
     assert quick['counts_as_of'] == full['computed_at'] and quick['computed_at'] != full['computed_at']
-    assert inst.stats({'mode': 'full'})['documents'] == 3
+
+
+class _DataLane(StoreInstanceBase, IInstanceBase):
+    """The ingest path (writeDocuments -> store.addChunks), which is not a tool."""
+
+
+def _data_lane(store) -> _DataLane:
+    inst = object.__new__(_DataLane)
+    inst.IGlobal = SimpleNamespace(store=store)
+    return inst
+
+
+_WRITES_OUTSIDE_THE_TOOLS: Dict[str, Callable[[Any], None]] = {
+    'ingest': lambda store: _data_lane(store).writeDocuments([make_doc('late', c, dim=8) for c in range(3)]),
+    'driver_add_chunks': lambda store: store.addChunks([make_doc('late', 0, dim=8)]),
+    'driver_remove': lambda store: store.remove(['doc00']),
+    'driver_mark_deleted': lambda store: store.markDeleted(['doc00']),
+    'driver_mark_active': lambda store: store.markActive(['doc01']),
+}
+
+
+@pytest.mark.parametrize('write', sorted(_WRITES_OUTSIDE_THE_TOOLS))
+def test_stats_quick_recounts_after_a_write_outside_the_tools(write, monkeypatch):
+    store = clustered(CountingStore, docs=2, chunks=2)
+    store.markDeleted(['doc01'])
+    clock = [1_760_000_000.0]
+    monkeypatch.setattr(vx_tools, '_wall_clock', lambda: clock[0])
+    inst = node(store)
+    full = inst.stats({'mode': 'full'})
+    clock[0] += 5
+    _WRITES_OUTSIDE_THE_TOOLS[write](store)
+    quick = inst.stats({'mode': 'quick'})
+    assert quick['counts_as_of'] == quick['computed_at'] != full['counts_as_of']
+    fresh = node(store).stats({'mode': 'full'})
+    figures = ('documents', 'chunks', 'deleted_chunks', 'tables')
+    assert [quick[key] for key in figures] == [fresh[key] for key in figures]
+    assert [quick[key] for key in figures] != [full[key] for key in figures]
+
+
+def test_stats_quick_recounts_after_a_failed_write_outside_the_tools(monkeypatch):
+    class Failing(CountingStore):
+        fail = False
+
+        def addChunks(self, chunks, checkCollection=True):
+            if not self.fail:
+                return super().addChunks(chunks, checkCollection)
+            super().addChunks(chunks[:1], checkCollection)
+            raise RuntimeError('the second chunk was refused')
+
+    store = clustered(Failing, docs=2, chunks=2)
+    inst = node(store)
+    assert inst.stats({'mode': 'full'})['chunks'] == 4
+    store.fail = True
+    with pytest.raises(RuntimeError):
+        store.addChunks([make_doc('late', 0, dim=8), make_doc('late', 1, dim=8)])
+    assert inst.stats({'mode': 'quick'})['chunks'] == 5
 
 
 @pytest.mark.parametrize('age_s', [VECTOR_TOOL_LIMITS['counts_cached_s'] + 1, 3600])

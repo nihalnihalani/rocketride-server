@@ -65,6 +65,33 @@ _COLUMN_PER_KEY_MODULES = frozenset({'store_postgres', 'rocketride_vector'})
 #: Most times the default ``scrollChunks`` slides an empty window forward (each slide doubles it).
 _SCROLL_SLIDES_MAX = 64
 
+#: Driver methods that change stored rows; ``DocumentStoreBase.__init_subclass__`` guards them.
+_VX_GUARDED_WRITES = ('addChunks', 'remove', 'markDeleted', 'markActive')
+
+
+def _guarded_write(name: str, method: Callable) -> Callable:
+    """Wrap a driver write method: extras trimmed for ``addChunks``, cached counts dropped afterwards."""
+    if name == 'addChunks':
+
+        @functools.wraps(method)
+        def guarded(self, chunks, *args, **kw):
+            try:
+                return method(self, self.vxWritableChunks(chunks), *args, **kw)
+            finally:
+                self.vxForgetCounts()
+
+    else:
+
+        @functools.wraps(method)
+        def guarded(self, *args, **kw):
+            try:
+                return method(self, *args, **kw)
+            finally:
+                self.vxForgetCounts()
+
+    guarded.__vx_write_guard__ = True
+    return guarded
+
 
 def _without_extras(doc: Doc) -> Doc:
     """Return ``doc`` without :data:`VX_METADATA_EXTRAS` in its metadata (a copy; ``doc`` is not changed)."""
@@ -257,23 +284,29 @@ class DocumentStoreBase(ABC):
     VX_STORES_EXTRAS: Optional[bool] = None
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
-        """Route every driver's own ``addChunks`` through :meth:`vxWritableChunks`.
+        """Route every driver's own write methods through the explorer's guards.
 
-        Covers every path to the driver (``writeDocuments``, nodes that call
-        ``store.addChunks`` directly, ``createCollection``), so a driver that cannot store
-        the explorer's metadata extras keeps ingesting exactly what it wrote before.
+        ``addChunks`` goes through :meth:`vxWritableChunks`, so a driver that cannot store
+        the explorer's metadata extras keeps ingesting exactly what it wrote before; it and
+        ``remove``, ``markDeleted`` and ``markActive`` then drop the cached ``stats``
+        figures (:meth:`vxForgetCounts`), whether they succeed or fail. Covers every path to
+        the driver: ``writeDocuments`` (the data lane), nodes that call the store directly,
+        ``createCollection`` and the tools.
         """
         super().__init_subclass__(**kwargs)
-        add = cls.__dict__.get('addChunks')
-        if add is None or getattr(add, '__isabstractmethod__', False) or getattr(add, '__vx_extras_guard__', False):
-            return
+        for name in _VX_GUARDED_WRITES:
+            method = cls.__dict__.get(name)
+            if method is None or getattr(method, '__isabstractmethod__', False):
+                continue
+            if getattr(method, '__vx_write_guard__', False):
+                continue
+            setattr(cls, name, _guarded_write(name, method))
 
-        @functools.wraps(add)
-        def addChunks(self, chunks, *args, **kw):
-            return add(self, self.vxWritableChunks(chunks), *args, **kw)
-
-        addChunks.__vx_extras_guard__ = True
-        cls.addChunks = addChunks
+    def vxForgetCounts(self) -> None:
+        """Drop the ``stats`` figures cached for this store, so the next ``stats`` recounts."""
+        state = self.__dict__.get('_vx_state')
+        if state is not None:
+            state.forget_counts()
 
     def vxStoresExtras(self) -> bool:
         """Return whether this driver stores the explorer's metadata extras.
