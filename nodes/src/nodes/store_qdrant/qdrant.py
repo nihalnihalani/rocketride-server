@@ -221,8 +221,9 @@ class Store(DocumentStoreBase):
     # and the listing carries the caveat 'document_count_capped'.
     COUNT_DOCUMENTS_CAP = 10000
 
-    # Most rows read to count documents by scrolling, on a collection whose
-    # meta.objectId has no keyword index (Qdrant refuses to facet on it).
+    # Most rows read to count documents by scrolling: on a collection whose
+    # meta.objectId has no keyword index (Qdrant refuses to facet on it), and to find
+    # which documents of a listing's id list have chunk 0.
     FACET_SCROLL_ROWS_CAP = 200000
 
     # Largest sample whose neighbour graph Qdrant computes (search_matrix_offsets
@@ -1022,6 +1023,15 @@ class Store(DocumentStoreBase):
             ).hits
             counts = [(str(h.value), int(h.count)) for h in hits if int(h.count) > 0]
             return counts[:limit], len(counts) > limit
+        return self._documentCountsByScroll(flt, limit)
+
+    def _documentCountsByScroll(self, flt: Filter, limit: int) -> Tuple[List[Tuple[str, int]], bool]:
+        """
+        Rows per distinct objectId matching ``flt``, read by scrolling the rows (at most ``FACET_SCROLL_ROWS_CAP``).
+
+        Same answer as ``_documentCounts``; ``capped`` is also True when the row cap stopped the read.
+        """
+        limit = max(1, int(limit))
         tally: Dict[str, int] = {}
         capped = False
         for read, record in enumerate(self._scrollAll(flt, with_payload=['meta.objectId'], page=1024)):
@@ -1243,15 +1253,26 @@ class Store(DocumentStoreBase):
         documents that do have chunk 0 come from a second count over the
         chunk-0 rows. When ``every`` is capped that count is restricted to the
         ids it holds, so a capped sweep may miss a document but never lists
-        one that has chunk 0.
+        one that has chunk 0. Over an id list (capped, or the caller's scope)
+        the chunk-0 rows are read rather than faceted: Qdrant's exact facet
+        slows down much faster than its MatchAny list grows (qdrant 1.17.1: 500
+        ids 0.05 s, 2,000 ids 0.65 s, the 10,000 ids of a capped listing 17-35
+        s), while reading those 10,000 rows takes about 0.1 s. If not every
+        chunk-0 row could be read, no document is listed as without one.
         """
         counts, capped = every
+        if not counts:
+            return [], capped
         first = FieldCondition(key='meta.chunkId', match=MatchValue(value=0))
         scope = [oid for oid, _ in counts] if capped else object_ids
-        with_first: Set[str] = set()
-        if counts:
-            found, _ = self._documentCounts(self._documentsFilter(deleted, scope, first), len(counts))
-            with_first = {oid for oid, _ in found}
+        flt = self._documentsFilter(deleted, scope, first)
+        if scope is None:
+            found, partial = self._documentCounts(flt, len(counts))
+        else:
+            found, partial = self._documentCountsByScroll(flt, self.FACET_SCROLL_ROWS_CAP)
+        if partial:
+            return [], True
+        with_first = {oid for oid, _ in found}
         return sorted((oid, n) for oid, n in counts if oid not in with_first), capped
 
     _orphan_lists_lock = threading.Lock()

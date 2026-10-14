@@ -320,6 +320,73 @@ def test_list_documents_flags_a_capped_count_and_lists_no_false_orphan(monkeypat
     assert store.countDocuments(vx_filter()) is None
 
 
+def _capped_orphan_corpus(store):
+    # Four documents of two rows, and one of three rows whose chunk 0 was never written:
+    # with the cap at 3 the counted documents are orphan-x, doc-0 and doc-1.
+    store.addChunks([make_doc(f'doc-{d}', c, _unit([1.0, d + 1, c, 0, 0, 0])) for d in range(4) for c in (0, 1)])
+    store.addChunks([make_doc('orphan-x', c, _unit([0.5, 9.0, c, 0, 0, 0])) for c in (1, 2, 3)])
+
+
+def _facet_match_any_sizes(store, monkeypatch):
+    """Spy on facet: per call, (length of the longest MatchAny list in its filter, whether it keeps chunk 0 only)."""
+    calls = []
+    facet = store.client.facet
+
+    def spy(*args, **kwargs):
+        conditions = getattr(kwargs.get('facet_filter'), 'must', None) or []
+        lists = [c.match.any for c in conditions if getattr(getattr(c, 'match', None), 'any', None) is not None]
+        first = any(c.key == 'meta.chunkId' and getattr(c.match, 'value', None) == 0 for c in conditions)
+        calls.append((max((len(values) for values in lists), default=0), first))
+        return facet(*args, **kwargs)
+
+    monkeypatch.setattr(store.client, 'facet', spy)
+    return calls
+
+
+def test_list_documents_above_the_cap_reads_first_chunks_instead_of_faceting_over_the_counted_ids(monkeypatch):
+    # Qdrant's exact facet slows down much faster than its MatchAny list grows (17-35 s for the
+    # 10,000 ids of a capped listing): the sweep reads the counted documents' chunk-0 rows.
+    store = make_store(drv)
+    _capped_orphan_corpus(store)
+    monkeypatch.setattr(drv.Store, 'COUNT_DOCUMENTS_CAP', 3)
+    calls = _facet_match_any_sizes(store, monkeypatch)
+    items, pages = _all_pages(store, limit=1)
+
+    assert calls and max(size for size, _ in calls) <= 1, calls  # facets only ever cover one page's objectIds
+    assert sorted(i.objectId for i in items) == ['doc-0', 'doc-1', 'doc-2', 'doc-3', 'orphan-x']
+    assert [(i.objectId, i.chunks) for i in items if not i.has_first_chunk] == [('orphan-x', 3)]
+    assert all('document_count_capped' in p.caveats and p.total is None for p in pages)
+
+
+def test_a_sweep_that_cannot_read_every_first_chunk_lists_no_false_orphan(monkeypatch):
+    # Past the row cap some chunk-0 rows are unread: no document may be listed as without chunk 0 on that basis.
+    store = make_store(drv)
+    _capped_orphan_corpus(store)
+    monkeypatch.setattr(drv.Store, 'COUNT_DOCUMENTS_CAP', 3)
+    monkeypatch.setattr(drv.Store, 'FACET_SCROLL_ROWS_CAP', 1)
+    items, pages = _all_pages(store, limit=1)
+
+    assert sorted(i.objectId for i in items if i.has_first_chunk) == ['doc-0', 'doc-1', 'doc-2', 'doc-3']
+    assert {i.objectId for i in items if not i.has_first_chunk} <= {'orphan-x'}
+    assert all('document_count_capped' in p.caveats for p in pages)
+
+
+def test_a_scoped_listing_sweeps_without_faceting_over_the_scope(monkeypatch):
+    # A scope (the sample tool passes up to 2,000 ids) is counted by facets; the sweep
+    # reads the scope's chunk-0 rows rather than faceting over the list a second time.
+    store = make_store(drv)
+    _capped_orphan_corpus(store)
+    scope = ['doc-1', 'doc-3', 'orphan-x', 'no-such-document']
+    calls = _facet_match_any_sizes(store, monkeypatch)
+    items, pages = _all_pages(store, limit=1, object_ids=scope)
+
+    assert sorted(i.objectId for i in items) == ['doc-1', 'doc-3', 'orphan-x']
+    assert [i.objectId for i in items if not i.has_first_chunk] == ['orphan-x']
+    assert {p.total for p in pages} == {3}
+    assert (len(scope), False) in calls, calls  # every row of the scope is counted by a facet
+    assert not [size for size, first in calls if first and size > 1], calls  # but not its first chunks
+
+
 def test_list_documents_computes_the_total_once_per_listing(monkeypatch):
     store = make_store(drv)
     _corpus(store, docs=7, chunks=2)
