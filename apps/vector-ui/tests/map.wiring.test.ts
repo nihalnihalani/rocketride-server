@@ -134,3 +134,23 @@ test('a light sample on PCA says its positions are spread within their 0.01 roun
 	const view = read('views/MapView.tsx');
 	assert.match(view, /sample\?\.mode === 'light' && layout === 'pca' \? \[LIGHT_POSITIONS\]/);
 });
+
+test('a map mounted hidden holds no WebGL context: the renderer is created on the first reveal and let go only on unmount', () => {
+	const canvas = read('components/PointCanvas.tsx');
+	const create = /useEffect\(\(\) => \{\s*ensureMapStyle\(\);([\s\S]*?)\n\t\}, \[([^\]]*)\]\);/.exec(canvas);
+	assert.ok(create, 'the renderer effect');
+	assert.match(create[1] as string, /if \(!canvas \|\| !wanted \|\| rendererRef\.current !== null\) return/, 'no context while hidden, and only one');
+	assert.match(create[2] as string, /\bwanted\b/, 'the effect runs again on reveal');
+	assert.match(canvas, /const wanted = props\.visible !== false;/);
+	assert.match(canvas, /useEffect\(\s*\(\) => \(\) => \{[\s\S]*?rendererRef\.current\?\.destroy\(\);[\s\S]*?\},\s*\[\],?\s*\);/, 'destroyed on unmount only');
+	assert.match(canvas, /rendererKind === 'none' \?/, 'the no-canvas note is for a browser that cannot draw, not for a map not shown yet');
+});
+
+test('a press keeps working when the browser refuses pointer capture (the gesture starts either way)', () => {
+	const canvas = read('components/PointCanvas.tsx');
+	const down = /const onDown = \(event: PointerEvent\): void => \{([\s\S]*?)\n\t\t\};/.exec(canvas);
+	assert.ok(down, 'onDown');
+	const body = down[1] as string;
+	assert.match(body, /try \{[\s\S]*?el\.setPointerCapture\(event\.pointerId\);[\s\S]*?\} catch \{/);
+	assert.ok(body.indexOf('gesture.down(') > body.indexOf('} catch {'), 'gesture.down runs after (outside) the try/catch');
+});

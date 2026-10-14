@@ -167,7 +167,9 @@ export function PointCanvas(props: PointCanvasProps): React.ReactElement {
 	const drawCountRef = useRef(0);
 	const propsRef = useRef(props);
 	propsRef.current = props;
-	const [rendererKind, setRendererKind] = useState<'webgl' | 'canvas2d' | 'none'>('none');
+	// 'pending' until the map is first shown (no context is created for a hidden map).
+	const [rendererKind, setRendererKind] = useState<'webgl' | 'canvas2d' | 'none' | 'pending'>('pending');
+	const wanted = props.visible !== false;
 	const [tooltip, setTooltip] = useState<{ index: number; x: number; y: number } | null>(null);
 
 	const data: IPointData = useMemo(
@@ -299,23 +301,30 @@ export function PointCanvas(props: PointCanvasProps): React.ReactElement {
 		});
 	}, [draw]);
 
-	// The renderer: WebGL1 first, Canvas2D when WebGL is unavailable.
+	// The renderer: WebGL1 first, Canvas2D when WebGL is unavailable. Created on
+	// the first reveal, never for a map mounted hidden: browsers cap the live
+	// WebGL contexts of a page (~16) and drop the oldest past it.
 	useEffect(() => {
 		ensureMapStyle();
 		const canvas = canvasRef.current;
-		if (!canvas) return undefined;
+		if (!canvas || !wanted || rendererRef.current !== null) return;
 		const renderer = createWebglRenderer(canvas, () => requestDraw()) ?? createCanvas2dRenderer(canvas);
 		rendererRef.current = renderer;
 		const kind = renderer ? renderer.kind : 'none';
 		setRendererKind(kind);
 		propsRef.current.onRendererInfo?.(kind);
-		return () => {
+	}, [requestDraw, wanted]);
+
+	// The renderer is let go on unmount only (hiding the tab keeps it).
+	useEffect(
+		() => () => {
 			if (frameRef.current !== 0 && typeof cancelAnimationFrame === 'function') cancelAnimationFrame(frameRef.current);
 			frameRef.current = 0;
-			renderer?.destroy();
+			rendererRef.current?.destroy();
 			rendererRef.current = null;
-		};
-	}, [requestDraw]);
+		},
+		[],
+	);
 
 	// Size: observed; a hidden tab measures 0 and is skipped (never a 0x0 store).
 	const measure = useCallback((): void => {
