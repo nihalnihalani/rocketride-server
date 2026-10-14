@@ -21,6 +21,7 @@ from .vx_tools import (  # noqa: F401 - re-exported for the drivers that overrid
     matchesDeleted,
     metadataValue,
     normalize_tool_input,
+    read_vectors,
     safe_error,
     vectordb_tool,
 )
@@ -1457,7 +1458,7 @@ class VectorStoreToolMixin(VectorExplorerTools):
 
         keys = [key for key in (_vxDocKey(doc) for doc in docs) if key is not None]
         try:
-            stored = {_vxDocKey(doc): doc.embedding for doc in store.getVectors(keys) if hasVector(doc)}
+            stored = {key: doc.embedding for key, doc in read_vectors(store, keys).items()}
         except Exception:
             return {}
         metric = normalize_metric(getattr(store, 'similarity', None)) or 'cosine'

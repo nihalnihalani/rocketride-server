@@ -91,6 +91,14 @@ SAMPLE_LISTING_MAX = 500
 #: Keys read through ``getVectors`` in one call.
 VECTOR_READ_BATCH = 500
 
+#: Most candidate rows one ``getVectors`` call may cover. A driver reads by filter
+#: (``objectId IN ... AND chunkId IN ...``), so a batch of keys spanning D documents and
+#: C chunk ids can match D x C rows; :func:`vector_batches` keeps D x C at or under this.
+VECTOR_PAIR_BUDGET = 2048
+
+#: What one more ``getVectors`` round trip is worth, in candidate rows, when batches are shaped.
+VECTOR_TRIP_ROWS = 128
+
 #: Fewest sampled points for which ``sample`` reports outliers (1 % of fewer points is noise).
 OUTLIERS_MIN_POINTS = 10
 
@@ -652,9 +660,86 @@ def _vx_state(store: Any) -> _VxState:
     return state
 
 
-def _batches(items: Sequence[Any], size: int) -> Iterable[Sequence[Any]]:
-    for start in range(0, len(items), size):
-        yield items[start : start + size]
+def _cross_product(batch: Sequence[Key]) -> int:
+    return len({key[0] for key in batch}) * len({key[1] for key in batch})
+
+
+def _pack_along(keys: Sequence[Key], axis: int) -> List[List[Key]]:
+    """Group ``keys`` by one coordinate (0: objectId, 1: chunkId) and pack the groups into batches.
+
+    A group joins the current batch while the batch stays within :data:`VECTOR_READ_BATCH`
+    keys and :data:`VECTOR_PAIR_BUDGET` candidate rows, and the candidate rows it adds are
+    worth less than another round trip (:data:`VECTOR_TRIP_ROWS`).
+    """
+    other = 1 - axis
+    groups: Dict[Any, List[Key]] = {}
+    for key in keys:
+        groups.setdefault(key[axis], []).append(key)
+    batches: List[List[Key]] = []
+    current: List[Key] = []
+    firsts: set = set()
+    seconds: set = set()
+    for value in sorted(groups):
+        members = sorted(groups[value], key=lambda key: key[other])
+        for start in range(0, len(members), VECTOR_READ_BATCH):
+            part = members[start : start + VECTOR_READ_BATCH]
+            others = {key[other] for key in part}
+            if current:
+                before = len(firsts) * len(seconds)
+                after = (len(firsts) + (value not in firsts)) * len(seconds | others)
+                if (
+                    after > VECTOR_PAIR_BUDGET
+                    or len(current) + len(part) > VECTOR_READ_BATCH
+                    or after - before > len(part) + VECTOR_TRIP_ROWS
+                ):
+                    batches.append(current)
+                    current, firsts, seconds = [], set(), set()
+            current.extend(part)
+            firsts.add(value)
+            seconds |= others
+    if current:
+        batches.append(current)
+    return batches
+
+
+def vector_batches(keys: Iterable[Key]) -> List[List[Key]]:
+    """Split ``keys`` into ``getVectors`` batches that a read by filter answers cheaply.
+
+    Every distinct key lands in exactly one batch of at most :data:`VECTOR_READ_BATCH`
+    keys whose objectId x chunkId cross product (the rows an ``objectId IN ... AND
+    chunkId IN ...`` filter can match) is at most :data:`VECTOR_PAIR_BUDGET`. Keys are
+    grouped by document or by chunk id, whichever covers fewer candidate rows and round
+    trips; a block of keys (every chunk of a few documents) is read exactly.
+    """
+    unique = list(dict.fromkeys((str(key[0]), int(key[1])) for key in keys))
+    if not unique:
+        return []
+    by_document = _pack_along(unique, 0)
+    by_chunk = _pack_along(unique, 1)
+
+    def cost(batches: List[List[Key]]) -> int:
+        return sum(_cross_product(batch) + VECTOR_TRIP_ROWS for batch in batches)
+
+    return by_document if cost(by_document) <= cost(by_chunk) else by_chunk
+
+
+def read_vectors(store: Any, keys: Iterable[Key], check: Optional[Callable[[], None]] = None) -> Dict[Key, Doc]:
+    """Read ``keys`` through ``store.getVectors`` in :func:`vector_batches`; return ``{key: doc}``.
+
+    Only the keys asked for are kept (a driver may answer a wider candidate set) and only
+    rows that carry a vector. ``check`` runs after every batch (a deadline).
+    ``StoreUnsupported`` propagates.
+    """
+    out: Dict[Key, Doc] = {}
+    for batch in vector_batches(keys):
+        wanted = set(batch)
+        for doc in store.getVectors(batch):
+            key = docKey(doc)
+            if key in wanted and key not in out and hasVector(doc):
+                out[key] = doc
+        if check is not None:
+            check()
+    return out
 
 
 # =============================================================================
@@ -1306,9 +1391,10 @@ class VectorExplorerTools:
         readable = False  # becomes True once the store answers getVectors or sampleChunks
         if pinned:
             try:
-                for doc in store.getVectors(pinned):
-                    if docKey(doc) in pinned:
-                        add(doc)
+                fetched = read_vectors(store, pinned)
+                for key in pinned:
+                    if key in fetched:
+                        add(fetched[key])
                 readable = True
             except StoreUnsupported:
                 pass
@@ -1341,10 +1427,10 @@ class VectorExplorerTools:
             rows_by_doc = {row.objectId: [(row.objectId, 0)] for row in rows if row.has_first_chunk}
         keys = [key for key in stratified_pick(rows_by_doc, n, seed, pinned=list(chosen)) if key not in chosen]
         try:
-            for batch in _batches(keys, VECTOR_READ_BATCH):
-                for doc in store.getVectors(list(batch)):
-                    add(doc)
-                self._vx_check_deadline(deadline)
+            fetched = read_vectors(store, keys, check=lambda: self._vx_check_deadline(deadline))
+            for key in keys:
+                if key in fetched:
+                    add(fetched[key])
             readable = readable or bool(keys) or 'getVectors' in store.capabilities()
         except StoreUnsupported:
             pass
@@ -1690,9 +1776,8 @@ class VectorExplorerTools:
                 fetched: Dict[Key, Any] = {}
                 if missing:
                     try:
-                        for doc in store.getVectors(missing):
-                            key = docKey(doc)
-                            if key in missing and doc.embedding is not None and len(doc.embedding) == entry.dimension:
+                        for key, doc in read_vectors(store, missing).items():
+                            if len(doc.embedding) == entry.dimension:
                                 fetched[key] = np.asarray(doc.embedding, dtype=np.float32)
                     except StoreUnsupported:
                         pass
@@ -1753,11 +1838,8 @@ class VectorExplorerTools:
         missing = [key for key in keys if key not in out and key[0] != CONTROL_OBJECT_ID]
         if missing:
             try:
-                for batch in _batches(missing, VECTOR_READ_BATCH):
-                    for doc in store.getVectors(list(batch)):
-                        key = docKey(doc)
-                        if key is not None and doc.embedding is not None and key not in out:
-                            out[key] = np.asarray(doc.embedding, dtype=np.float32)
+                for key, doc in read_vectors(store, missing).items():
+                    out[key] = np.asarray(doc.embedding, dtype=np.float32)
             except StoreUnsupported:
                 pass
         return out

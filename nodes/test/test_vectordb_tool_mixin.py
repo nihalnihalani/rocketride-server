@@ -30,6 +30,7 @@ with the ``context`` fixture (``agent()`` / ``dap()``).
 from __future__ import annotations
 
 import json
+import random
 import threading
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, Optional
@@ -43,6 +44,7 @@ from ai.common.store import VectorStoreToolMixin, vx_tools, vx_write_gate
 from ai.common.store import document_store as _store_module
 from ai.common.store.errors import StoreUnsupported
 from ai.common.store.vx_defaults import VECTOR_TOOL_LIMITS
+from ai.common.store.vx_types import DocPage, DocumentRow
 
 from .test_vector_hooks import (
     FORGED_CURSORS,
@@ -1465,6 +1467,147 @@ def test_sample_payload_light_five_thousand_points_fits_one_megabyte():
     answer = node(store).sample({'n': 5000, 'mode': 'light', 'knn_k': 10})
     assert answer['n'] == 5000 and answer['knn']['k'] == 10
     assert _payload_bytes(answer) <= 1024 * 1024
+
+
+# ---------------------------------------------------------------------------
+# getVectors batch shape: a read by filter covers few candidate rows
+# ---------------------------------------------------------------------------
+
+#: Most candidate rows (objectIds x chunkIds) one getVectors call may cover.
+PAIR_BUDGET = 2048
+
+
+def _candidate_rows(batch, chunks_per_doc: Optional[int] = None) -> int:
+    """Rows a literal ``objectId IN (...) AND chunkId IN (...)`` filter can match for ``batch``."""
+    oids = {key[0] for key in batch}
+    cids = {key[1] for key in batch}
+    if chunks_per_doc is not None:
+        cids = {c for c in cids if c < chunks_per_doc}
+    return len(oids) * len(cids)
+
+
+class _GridStore(ExactListingStore):
+    """``docs`` documents of ``chunks`` chunks each: listed exactly, read lazily, every getVectors batch recorded."""
+
+    def __init__(self, docs: int, chunks: int, dim: int = 8) -> None:
+        super().__init__(provider='postgres')
+        self.grid = (docs, chunks)
+        self.dim = dim
+        self.batches: List[List[tuple]] = []
+        self.seed([make_doc('seed', 0, dim=dim)])  # creates the collection and its control record
+        del self.rows[('seed', 0)]
+
+    def listDocuments(self, *, cursor, limit, object_ids, deleted, sort) -> DocPage:
+        docs, chunks = self.grid
+        rows = [
+            DocumentRow(
+                objectId=f'g{d:04d}',
+                path=f'/grid/g{d:04d}.md',
+                chunks=chunks,
+                has_first_chunk=True,
+                deleted=False,
+                tables=0,
+                nodeId='chunk_1',
+                size=None,
+                modifyTime=None,
+                ingestedAt=None,
+                pointId=None,
+            )
+            for d in range(docs)
+        ]
+        if object_ids:
+            rows = [row for row in rows if row.objectId in object_ids]
+        offset = _store_module.defaultCursorState(cursor)[0]
+        nxt = _store_module.encodeCursor({'o': offset + limit}) if offset + limit < len(rows) else None
+        return DocPage(rows[offset : offset + limit], nxt, len(rows), True, True, True, [])
+
+    def getVectors(self, keys):
+        docs, chunks = self.grid
+        self.batches.append([tuple(key) for key in keys])
+        out = []
+        for oid, chunk in keys:
+            if str(oid).startswith('g') and int(str(oid)[1:]) < docs and 0 <= int(chunk) < chunks:
+                doc = make_doc(str(oid), int(chunk), dim=self.dim, path=f'/grid/{oid}.md')
+                doc.metadata.pointId = f'pt-{oid}-{chunk}'
+                out.append(doc)
+        return out
+
+
+def _scattered_keys(docs: int, chunks: int, count: int, seed: int) -> List[List[Any]]:
+    rng = random.Random(seed)
+    keys: Dict[tuple, None] = {}
+    while len(keys) < count:
+        keys[(f'g{rng.randrange(docs):04d}', rng.randrange(chunks))] = None
+    return [list(key) for key in keys]
+
+
+def test_vector_batches_cover_every_key_once_within_the_caps():
+    rng = random.Random(3)
+    keys = [(f'd{rng.randrange(400):03d}', rng.randrange(900)) for _ in range(3000)]
+    batches = vx_tools.vector_batches(keys)
+    assert vx_tools.VECTOR_PAIR_BUDGET == PAIR_BUDGET
+    flat = [key for batch in batches for key in batch]
+    assert sorted(flat) == sorted(set(keys)) and len(flat) == len(set(keys))
+    for batch in batches:
+        assert len(batch) <= vx_tools.VECTOR_READ_BATCH
+        assert _candidate_rows(batch) <= PAIR_BUDGET
+
+
+def test_vector_batches_read_a_full_block_of_keys_exactly():
+    keys = [(f'd{d}', c) for d in range(4) for c in range(100)]
+    batches = vx_tools.vector_batches(keys)
+    assert sum(_candidate_rows(batch) for batch in batches) == len(keys)
+
+
+def test_vector_batches_of_nothing_is_no_call():
+    assert vx_tools.vector_batches([]) == []
+
+
+@pytest.mark.parametrize('docs,chunks', [(500, 500), (500, 50), (100, 2000)])
+def test_sample_reads_vectors_in_batches_that_cover_few_candidate_rows(docs, chunks):
+    # One call per 500 picked keys spans every listed document and ~500 chunk ids: a filter
+    # read then matched 74,000 to 469,500 rows on these grids for 2,000 wanted.
+    store = _GridStore(docs, chunks)
+    answer = node(store).sample({'n': 2000, 'seed': 7, 'knn_k': 15})
+    assert answer['success'] is True and answer['n'] == 2000
+    assert max(_candidate_rows(batch, chunks) for batch in store.batches) <= PAIR_BUDGET
+    assert sum(_candidate_rows(batch, chunks) for batch in store.batches) <= 20 * 2000
+
+
+def test_project_reads_keys_outside_the_sample_in_bounded_batches():
+    store = _GridStore(300, 300)
+    inst = node(store)
+    sample = inst.sample({'n': 50, 'seed': 1})
+    keys = _scattered_keys(300, 300, 200, seed=9)
+    store.batches.clear()
+    answer = inst.project({'sample_id': sample['sample_id'], 'keys': keys, 'm': 3})
+    assert answer['success'] is True and len(answer['items']) == 200 and 'not_found' not in answer
+    assert store.batches and max(_candidate_rows(batch) for batch in store.batches) <= PAIR_BUDGET
+
+
+def test_neighbors_scope_reads_vectors_in_bounded_batches():
+    store = _GridStore(500, 500)
+    keys = _scattered_keys(500, 500, 2000, seed=4)
+    answer = node(store).neighbors({'key': ['g0000', 0], 'scope_keys': keys})
+    assert answer['success'] is True and len(answer['scores']) == 2000
+    assert all(score is not None for score in answer['scores'])
+    assert max(_candidate_rows(batch) for batch in store.batches) <= PAIR_BUDGET
+
+
+def test_search_reads_result_vectors_in_bounded_batches():
+    class Spy(ExactListingStore):
+        batches: List[List[tuple]] = []
+
+        def getVectors(self, keys):
+            Spy.batches.append([tuple(key) for key in keys])
+            return super().getVectors(keys)
+
+    Spy.batches = []
+    store = clustered(Spy, docs=100, chunks=40)
+    hits = [store.rows[(f'doc{i:02d}', (i * 7) % 40)] for i in range(100)]
+    sims = node(store)._vectordb_result_sims(store, hits[0].embedding, hits)
+    assert len(sims) == 100
+    assert Spy.batches and max(_candidate_rows(batch) for batch in Spy.batches) <= PAIR_BUDGET
 
 
 # ---------------------------------------------------------------------------
