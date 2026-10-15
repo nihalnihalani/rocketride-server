@@ -88,10 +88,6 @@ needs the network or a warm uv cache and the model in the Hugging Face cache,
 and takes minutes cold (about 90 s warm); an offline machine without them
 fails a required run rather than skipping it. Optional: ``RR_TEST_TOOLPATH_ENGINE_PORT``
 fixes the engine's port (default: a free one).
-
-Tests marked ``NEEDS:`` exercise code of other Vector Explorer lanes that is
-not on this branch; the integration step removes each mark when that lane is
-merged, and a NEEDS skip is never a pass.
 """
 
 from __future__ import annotations
@@ -163,26 +159,6 @@ vx_types = _load('vx_toolpath_types', _STORE / 'vx_types.py')
 gen_corpus = _load('vx_toolpath_corpus', _ACC / 'demo' / 'gen_corpus.py')
 stub_llm = _load('vx_toolpath_stub_llm', _ACC / 'stub_llm.py')
 
-# ---------------------------------------------------------------------------
-# Cross-lane code this suite exercises that is not on this branch. The
-# integration step deletes each mark (or table entry) when the lane is merged.
-# ---------------------------------------------------------------------------
-
-NEEDS_TOOLS = 'NEEDS:L0,L1 merged — integration gate G2'  # explorer tools, call context, write gate
-NEEDS_EMBED = 'NEEDS:L0,L1,L5 merged — integration gate G2'  # embed on embed_1 (+ the tools that use it)
-NEEDS_STOCK_RAG = 'NEEDS:L0,L1,L2 merged — integration gate G2'
-NEEDS_POOLER = 'NEEDS:L1,L2 merged — integration gate G2'
-needs_tools = pytest.mark.skip(reason=NEEDS_TOOLS)
-needs_embed = pytest.mark.skip(reason=NEEDS_EMBED)
-# The Chroma driver before L3 filters objdir on a key it never writes ('chunk'), so it lists nothing.
-OBJDIR_NEEDS = {'chroma': 'NEEDS:L3 merged — integration gate G2'}
-# The pgvector drivers before L2 cannot create a table (their DDL lacks the signature column
-# their insert writes), so neither pgvector template can ingest into a new collection.
-TEMPLATE_NEEDS = {
-    'postgres': 'NEEDS:L2 merged — integration gate G2',
-    'rocketride_vector': 'NEEDS:L2 merged — integration gate G2',
-}
-
 SUPPORTED = ('postgres', 'rocketride_vector', 'qdrant', 'chroma')
 PROVIDER_BACKEND = {'postgres': 'pgvector', 'rocketride_vector': 'pgvector', 'qdrant': 'qdrant', 'chroma': 'chroma'}
 EMBEDDING_MODEL = 'sentence-transformers/all-MiniLM-L6-v2'
@@ -213,7 +189,6 @@ CORPUS_DOCS = (
 # The multi-chunk document; on the emulated legacy collection it loses chunk 0.
 MULTI_DOC = 'handbooks/falcon_handbook.md'
 WATER_QUESTION = 'Where does Falcon Station get its drinking water?'
-UNRELATED_QUESTION = 'Lattice regularisation of quantum chromodynamics at finite temperature'
 
 # Keys whose values are document text; the secrets scan skips them.
 CONTENT_KEYS = frozenset({'content', 'page_content', 'snip', 'preview', 'text', 'answers', 'answer'})
@@ -899,8 +874,6 @@ class _Side:
 def deployment(request, corpus_files):
     """The template started on a new collection (with the corpus uploaded) and on a legacy one."""
     provider: str = request.param
-    if provider in TEMPLATE_NEEDS:
-        pytest.skip(TEMPLATE_NEEDS[provider])
     service = _service(provider)
     reason = service.unavailable()
     if reason:
@@ -1034,8 +1007,6 @@ def test_legacy_tools_answer_with_their_legacy_keys(side, deployment):
 
 
 def test_objdir_lists_every_document_with_a_first_chunk(side, deployment):
-    if deployment.provider in OBJDIR_NEEDS:
-        pytest.skip(OBJDIR_NEEDS[deployment.provider])
     paths = side.ok('objdir')['paths']
     assert 'schema' not in paths.values()
     for name, oid in side.documents.items():
@@ -1062,7 +1033,6 @@ def test_chat_returns_the_stub_answer_and_the_retrieved_chunks(side, deployment)
 # ---------------------------------------------------------------------------
 
 
-@needs_tools
 def test_dialect_describes_the_store(side, deployment):
     d = side.ok('dialect')
     assert (d['dialect'], d['contract']) == ('vector', 'vector/1')
@@ -1073,17 +1043,22 @@ def test_dialect_describes_the_store(side, deployment):
     assert d['allow_writes'] is True and d['agent_writes'] is vx_defaults.VECTOR_AGENT_WRITES_DEFAULT
     assert d['writes_scope'] == 'tools_source'
     assert set(d['write_tools']) == {'remove_document', 'delete', 'upsert'}
-    assert set(vx_types.CAPABILITY_KEYS) <= set(d['capabilities'])
+    # embed_node is the one capability the app fills in (CONTRACT section 4.1); the node reports the rest.
+    assert set(vx_types.CAPABILITY_KEYS) - {'embed_node'} <= set(d['capabilities'])
+    assert 'embed_node' not in d['capabilities']
     assert d['capabilities']['search_vector'] is True and d['capabilities']['soft_delete'] is False
     assert d['capabilities']['knn_native'] is (deployment.provider == 'qdrant')
-    assert d['limits'] == vx_defaults.VECTOR_TOOL_LIMITS
+    # statement_timeout_ms is pgvector's own (CONTRACT section 4.1); the other backends report null.
+    limits = dict(vx_defaults.VECTOR_TOOL_LIMITS)
+    if PROVIDER_BACKEND[deployment.provider] != 'pgvector':
+        limits['statement_timeout_ms'] = None
+    assert d['limits'] == limits
     health = d['health']
     assert health['collection_exists'] is True and health['control_record'] is True
     s2 = side.ok('dialect', node='store_2')
     assert s2['allow_writes'] is False, 'store_2 must report writes off'
 
 
-@needs_tools
 def test_stats_full_and_quick(side, deployment):
     counts = deployment.service.counts(side.collection)
     full = side.ok('stats', {'mode': 'full'})
@@ -1114,7 +1089,6 @@ def _all_documents(side_: _Side, limit: int = 3) -> Tuple[List[Dict[str, Any]], 
     return items, last
 
 
-@needs_tools
 def test_documents_lists_every_document_once(side, deployment):
     items, last = _all_documents(side)
     counts = deployment.service.counts(side.collection)
@@ -1134,7 +1108,6 @@ def test_documents_lists_every_document_once(side, deployment):
         assert last['total'] == len(counts)
 
 
-@needs_tools
 def test_chunks_page_in_order_and_never_carry_vectors(side, deployment):
     expected = deployment.service.chunk_ids(side.collection, side.multi)
     seen, after = [], -1
@@ -1153,7 +1126,6 @@ def test_chunks_page_in_order_and_never_carry_vectors(side, deployment):
     assert len(probe['items']) == 1
 
 
-@needs_tools
 def test_vectors_returns_the_stored_vector_for_at_most_two_keys(side, deployment):
     stored = deployment.service.vector(side.collection, side.multi, 0)
     out = side.ok('vectors', {'keys': [[side.multi, 0]]})
@@ -1165,7 +1137,6 @@ def test_vectors_returns_the_stored_vector_for_at_most_two_keys(side, deployment
     assert side.refused('vectors', {'keys': too_many}) in ('LIMIT_EXCEEDED', 'INVALID_INPUT')
 
 
-@needs_tools
 def test_sample_is_seeded_columnar_and_within_its_caps(side, deployment):
     rows = sum(deployment.service.counts(side.collection).values())
     one = side.ok('sample', {'n': 1000, 'seed': 7, 'mode': 'detailed', 'knn_k': 5})
@@ -1185,7 +1156,6 @@ def test_sample_is_seeded_columnar_and_within_its_caps(side, deployment):
     assert big.get('success') is False or big.get('n') <= vx_defaults.VECTOR_TOOL_LIMITS['sample_max']
 
 
-@needs_embed
 def test_embed_project_neighbors_and_search(side, deployment):
     emb = side.ok('embed', {'texts': [WATER_QUESTION], 'kind': 'query'}, node='embed_1')
     (vector,) = emb['vectors']
@@ -1208,21 +1178,36 @@ def test_embed_project_neighbors_and_search(side, deployment):
     assert side.refused('search', {'vector': vector[:10], 'top_k': 3}) == 'DIMENSION_MISMATCH'
 
 
-@needs_embed
 def test_search_returns_below_floor_rows_only_when_asked(side):
-    (vector,) = side.ok('embed', {'texts': [UNRELATED_QUESTION], 'kind': 'query'}, node='embed_1')['vectors']
-    plain = side.ok('search', {'vector': vector, 'top_k': 5})
+    # A query pointing away from a stored chunk scores it at the bottom of every scale (pgvector's
+    # cosine -1, Qdrant's and Chroma's (1 + cosine) / 2 = 0), so it is under the floor on every
+    # backend; an unrelated question is not (on a 0-1 scale it still scores about 0.5). The search
+    # is filtered to that chunk's document.
+    key = [side.multi, 0]
+    (item,) = side.ok('vectors', {'keys': [key]})['items']
+    away = [-float(x) for x in item['values']]
+    scope = {'objectIds': [side.multi]}
+    floor = side.ok('dialect')['score']['floor']
+
+    def keys(rows):
+        return [[r['metadata']['objectId'], r['metadata']['chunkId']] for r in rows]
+
+    # top_k above the document's chunk count, so the ranking cannot leave chunk 0 out.
+    top_k = vx_defaults.VECTOR_TOOL_LIMITS['top_k_max']
+    plain = side.ok('search', {'vector': away, 'top_k': top_k, 'filter': scope})
     assert not any(r.get('below_floor') for r in plain['results'])
+    assert key not in keys(plain['results']), plain['results']
     wide = side.ok(
-        'search', {'vector': vector, 'top_k': 5, 'include_below_floor': True, 'include_below_threshold': True}
+        'search',
+        {'vector': away, 'top_k': top_k, 'filter': scope, 'include_below_floor': True, 'include_below_threshold': True},
     )
     below = [r for r in wide['results'] if r.get('below_floor')]
-    assert below and all(r['score'] < 0.2 for r in below), wide['results']
+    assert key in keys(below), wide['results']
+    assert all(r['score'] < floor for r in below), (floor, wide['results'])
     for row in wide['results']:
         assert {'raw_score', 'sim', 'below_threshold', 'below_floor'} <= set(row)
 
 
-@needs_tools
 def test_a_text_query_without_an_embedder_on_the_store_is_refused(side):
     assert side.refused('search', {'query': WATER_QUESTION}) == 'NO_EMBEDDER'
 
@@ -1245,7 +1230,6 @@ def _own_document(side_: _Side, label: str, tmp_dir: Path) -> Tuple[str, str]:
     return name, object_id(name)
 
 
-@needs_tools
 def test_remove_document_removes_exactly_that_documents_rows(side, deployment, tmp_path):
     name, oid = _own_document(side, 'remove', tmp_path)
     before = deployment.service.counts(side.collection)
@@ -1323,7 +1307,6 @@ def _write_cases() -> List[Tuple[str, str, str, str, Callable[[str], Dict[str, A
     ]
 
 
-@needs_tools
 @pytest.mark.parametrize('case', _write_cases(), ids=lambda c: c[0])
 def test_writes_are_refused_with_the_data_unchanged(side, deployment, tmp_path, case):
     label, source, node, tool, make_input, expected = case
@@ -1334,7 +1317,6 @@ def test_writes_are_refused_with_the_data_unchanged(side, deployment, tmp_path, 
     side.ok('remove_document', {'object_ids': [oid]})
 
 
-@needs_tools
 def test_a_broadcast_write_is_refused(side, deployment, tmp_path):
     _name, oid = _own_document(side, 'broadcast', tmp_path)
     before = deployment.service.counts(side.collection)
@@ -1346,7 +1328,6 @@ def test_a_broadcast_write_is_refused(side, deployment, tmp_path):
     side.ok('remove_document', {'object_ids': [oid]})
 
 
-@needs_tools
 def test_the_write_switch_default_is_the_shared_constant(deployment):
     """store_1 without allow_writes follows VECTOR_ALLOW_WRITES_DEFAULT (vx_defaults.py)."""
     pipe = _pipeline(
@@ -1474,7 +1455,6 @@ def _stock_rag_pipeline(service: _PgVector, collection: str, stub_url: str) -> D
     }
 
 
-@pytest.mark.skip(reason=NEEDS_STOCK_RAG)
 def test_a_pipeline_without_a_tools_source_is_read_only(engine, stub, corpus_files):
     service = _PgVector('postgres')
     reason = service.unavailable()
@@ -1505,7 +1485,6 @@ def test_a_pipeline_without_a_tools_source_is_read_only(engine, stub, corpus_fil
         service.drop(collection)
 
 
-@pytest.mark.skip(reason=NEEDS_POOLER)
 def test_rocketride_vector_through_the_transaction_pooler(engine, broker, stub, deployment):
     if deployment.provider != 'rocketride_vector':
         pytest.skip('NOT RUN: the pooled pass is for rocketride_vector.pipe only')
