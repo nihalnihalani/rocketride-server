@@ -69,7 +69,7 @@ The collection is the destination for stored chunks. The save-time probe accepts
 
 The runtime accepts `L2`, `IP`, `COSINE`, `JACCARD`, `HAMMING`, or `BM25` as the similarity setting, defaulting to `COSINE`; another value stops initialization. It builds the vector index using this metric, so select the metric that matches the embeddings already in the collection before writing its first data. Changing it later does not rebuild an existing index.
 
-The retrieval score defaults to `0.5` and filters converted result scores. For cosine results the driver converts the returned distance to `(distance + 1) / 2`; for other metrics it applies a sigmoid conversion. Raise the score when retrieved context is noisy or unrelated; lower it when the expected source material is absent. The tradeoff is recall versus the amount of weak context passed downstream, and a threshold can only be meaningful with the same metric used to create the collection.
+The retrieval score defaults to `0.5` and filters converted result scores on the `questions` lane. For cosine results the driver converts the returned similarity to `(similarity + 1) / 2`; for `L2`, `JACCARD` and `HAMMING` distances it uses `1 / (1 + distance)`, so the closest result scores highest; for `IP` and `BM25` it applies a sigmoid conversion. The driver itself drops only results under a fixed floor of `0.2`; the agent `search` function therefore returns results between the floor and the retrieval score that the `questions` lane would filter out. Raise the score when retrieved context is noisy or unrelated; lower it when the expected source material is absent. The tradeoff is recall versus the amount of weak context passed downstream, and a threshold can only be meaningful with the same metric used to create the collection.
 
 ### Write batch size and timeout
 
@@ -93,7 +93,7 @@ For a cloud profile, provide the API key; the runtime passes it as the Milvus to
 
 ### Search and document lifecycle
 
-Semantic search requires an embedding and does not accept a non-zero offset. Keyword search uses the same metadata filters as retrieval. Re-ingesting an object deletes its existing chunks before the replacement chunks are inserted. The store can mark chunks deleted or active, and its default filters exclude marked-deleted chunks.
+Semantic search requires an embedding and does not accept a non-zero offset. Keyword search matches the question text against the stored content and uses the same metadata filters as retrieval. A write that holds an object's chunk 0 starts a new version of the object and deletes its existing chunks first; later writes of the same object (embedding nodes send long documents in several batches) add to it, and a later write sent again (a retried batch) replaces the chunks it holds instead of storing them twice. Metadata is stored as plain JSON, including the file size, modification time and ingest time when the pipeline provides them. The store can mark chunks deleted or active, and its default filters exclude marked-deleted chunks.
 
 Milvus inserts chunks in batches of 50. A semantic search against an existing
 collection also checks the embedding model before querying, so a model or vector
@@ -108,7 +108,17 @@ separation.
 
 ### Rendering
 
-Rendering retrieves an object's chunks in `chunkId` order and sends joined text to the callback in `renderChunkSize` groups. The node's document count is a count of stored vectors (chunks).
+Rendering retrieves an object's chunks in `chunkId` order and sends joined text to the callback in `renderChunkSize` groups (at most 16,384 chunks per group, the largest window a Milvus query returns). The node's document count is a count of stored vectors (chunks).
+
+### Vector Explorer
+
+The Vector Explorer app supports Milvus as **experimental**: its explorer functions are tested against an in-memory stand-in for the Milvus client, not against a live server. What the app sees on Milvus:
+
+- The document list pages through each document's chunk 0, in storage order (the app sorts what it has loaded), with an exact chunk count per document, tallied from one query per page. A page whose documents hold more chunks than one Milvus query returns (16,384) shows no counts. A document whose chunk 0 is missing is not listed.
+- Chunk counts honour the active, deleted and all views (any other view is refused as invalid input); the collection's control record is never counted or listed, and its embedding model and dimension are reported from it.
+- Samples for the embedding map are taken in storage order, and the neighbour graph is computed on the node, not by Milvus.
+- Removing a document reports the number of chunks it removed.
+- When Milvus fails (unreachable, or a request it rejects), the explorer, the store's tools and the pipeline's writes report `Milvus <operation> failed: <error class> (code N)`, for reads, writes, marks, renders and the collection checks alike. The client's own message, which can name the server, is not passed on. An error raised by the node's own code is reported as it is.
 
 ## Upstream docs
 

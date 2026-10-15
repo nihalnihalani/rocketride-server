@@ -1,116 +1,59 @@
 """
-Tests for Milvus Store.searchSemantic score threshold filtering.
+Tests for Milvus Store.searchSemantic score filtering.
 
-Validates that hits below ``retrieval_score_threshold`` are excluded
-from the result set returned by ``searchSemantic``.
+The driver drops hits below its score floor (``scoreInfo()['floor']``, lifted by
+``DocFilter.minScore``); the node's ``score`` threshold is applied by the data
+lane (``DocumentStoreBase._queryDocuments``), not twice in the driver.
 """
 
-import sys
-import os
-import unittest
-from unittest.mock import MagicMock, patch
+import math
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'src', 'nodes', 'store_milvus'))
+import pytest
 
+from ai.common.schema import DocFilter, QuestionText
 
-# Mock heavy dependencies only for the duration of the milvus import so that
-# real modules (numpy, ai.*) remain available to other test files collected in
-# the same pytest session.
-class _FakeDocumentStoreBase:
-    pass
+from .. import vector_other_drivers_harness as h
 
 
-with patch.dict(
-    sys.modules,
-    {
-        'numpy': MagicMock(),
-        'pymilvus': MagicMock(),
-        'depends': MagicMock(),
-        'engLib': MagicMock(),
-        'ai': MagicMock(),
-        'ai.common': MagicMock(),
-        'ai.common.schema': MagicMock(),
-        'ai.common.store': MagicMock(DocumentStoreBase=_FakeDocumentStoreBase),
-        'ai.common.config': MagicMock(),
-    },
-):
-    from milvus import Store
+@pytest.fixture(scope='module')
+def adapter():
+    """Milvus driver loaded against the pymilvus mock."""
+    return h.MilvusAdapter()
 
 
-class _Doc:
-    def __init__(self, score: float, page_content: str) -> None:
-        self.score = score
-        self.page_content = page_content
+@pytest.fixture
+def store(adapter):
+    """A store holding four chunks."""
+    store = adapter.new_store()
+    h.ingest(store, 'doc-a', '/docs/a.md', [0, 1, 2, 3])
+    return store
 
 
-class TestSearchSemanticScoreThreshold(unittest.TestCase):
-    """``searchSemantic`` must filter out hits below retrieval_score_threshold."""
-
-    def _make_self(self, threshold: float = 0.5) -> MagicMock:
-        mock_self = MagicMock()
-        mock_self.collection = 'c'
-        mock_self.threshold_search = threshold
-        mock_self.doesCollectionExist.return_value = True
-        mock_self._convertFilter.return_value = []
-        mock_self.client.search.return_value = [[]]
-        return mock_self
-
-    def _make_query_and_filter(self) -> tuple[MagicMock, MagicMock]:
-        query = MagicMock()
-        query.embedding = [0.1, 0.2]
-        doc_filter = MagicMock()
-        doc_filter.limit = 10
-        doc_filter.offset = 0
-        return query, doc_filter
-
-    def test_filters_below_threshold(self):
-        mock_self = self._make_self(threshold=0.5)
-        mock_self._convertToDocs.return_value = [
-            _Doc(0.6, 'high 1'),
-            _Doc(0.25, 'low'),
-            _Doc(0.8, 'high 2'),
-        ]
-        query, doc_filter = self._make_query_and_filter()
-
-        results = Store.searchSemantic(mock_self, query, doc_filter)
-
-        self.assertEqual(len(results), 2)
-        self.assertEqual(results[0].page_content, 'high 1')
-        self.assertEqual(results[1].page_content, 'high 2')
-
-    def test_exact_threshold_included(self):
-        mock_self = self._make_self(threshold=0.5)
-        mock_self._convertToDocs.return_value = [_Doc(0.5, 'exact')]
-        query, doc_filter = self._make_query_and_filter()
-
-        results = Store.searchSemantic(mock_self, query, doc_filter)
-
-        self.assertEqual(len(results), 1)
-
-    def test_all_below_threshold_returns_empty(self):
-        mock_self = self._make_self(threshold=0.9)
-        mock_self._convertToDocs.return_value = [
-            _Doc(0.3, 'a'),
-            _Doc(0.5, 'b'),
-        ]
-        query, doc_filter = self._make_query_and_filter()
-
-        results = Store.searchSemantic(mock_self, query, doc_filter)
-
-        self.assertEqual(results, [])
-
-    def test_all_above_threshold_returned(self):
-        mock_self = self._make_self(threshold=0.1)
-        mock_self._convertToDocs.return_value = [
-            _Doc(0.6, 'a'),
-            _Doc(0.7, 'b'),
-        ]
-        query, doc_filter = self._make_query_and_filter()
-
-        results = Store.searchSemantic(mock_self, query, doc_filter)
-
-        self.assertEqual(len(results), 2)
+def _search(store, doc_filter):
+    query = QuestionText(text='q', embedding=h.vector_for('q', 0), embedding_model=h.MODEL)
+    return [doc.score for doc in store.searchSemantic(query, doc_filter)]
 
 
-if __name__ == '__main__':
-    unittest.main()
+def test_hits_below_the_floor_are_dropped(adapter, store):
+    """0.1 is under the 0.2 floor; 0.3 is kept although it is under the 0.5 threshold."""
+    adapter.set_scores(store, [0.6, 0.1, 0.8, 0.3])
+    assert _search(store, DocFilter()) == pytest.approx([0.6, 0.8, 0.3])
+
+
+def test_exact_floor_is_included(adapter, store):
+    """A hit scoring exactly the floor is kept."""
+    adapter.set_scores(store, [0.2])
+    assert _search(store, DocFilter()) == pytest.approx([0.2])
+
+
+def test_min_score_minus_infinity_keeps_every_hit(adapter, store):
+    """The explorer's neighbours view asks for every row."""
+    adapter.set_scores(store, [0.6, 0.05, 0.0])
+    assert _search(store, h.VxFilter(minScore=-math.inf)) == pytest.approx([0.6, 0.05, 0.0])
+
+
+def test_the_threshold_is_not_applied_by_the_driver(adapter, store):
+    """Raising the node threshold does not change what the driver returns."""
+    store.threshold_search = 0.9
+    adapter.set_scores(store, [0.6, 0.7])
+    assert _search(store, DocFilter()) == pytest.approx([0.6, 0.7])
