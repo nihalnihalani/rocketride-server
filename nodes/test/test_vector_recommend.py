@@ -30,7 +30,9 @@ per store), ``UNSUPPORTED``, ``READS_PUBLIC``.
 
 from __future__ import annotations
 
+import ast
 import json
+from pathlib import Path
 from typing import Any, Dict, List
 
 import numpy as np
@@ -561,3 +563,50 @@ def test_the_store_answers_the_model_it_was_asked_for():
     node(store).recommend({'positive': [['doc00', 0]]})
     semantic = [call for call in store.calls if call[0] == 'semantic'][-1]
     assert semantic[1].embedding_model == MODEL and semantic[1].text == ''
+
+
+# ---------------------------------------------------------------------------
+# Which drivers rank best_score themselves
+# ---------------------------------------------------------------------------
+
+_REPO = Path(__file__).resolve().parents[2]
+
+#: The keyword-only parameters the tool passes to ``recommendNative``.
+_NATIVE_PARAMS = {'positive', 'negative', 'strategy', 'limit', 'object_ids', 'vector'}
+
+
+def _declares_best_score(cls: ast.ClassDef) -> bool:
+    for node_ in cls.body:
+        targets = node_.targets if isinstance(node_, ast.Assign) else [getattr(node_, 'target', None)]
+        if any(isinstance(t, ast.Name) and t.id == 'VX_DRIVER_CAPABILITIES' for t in targets):
+            value = getattr(node_, 'value', None)
+            if value is not None and any(
+                isinstance(c, ast.Constant) and c.value == 'recommend_best_score' for c in ast.walk(value)
+            ):
+                return True
+    return False
+
+
+def test_only_qdrant_declares_best_score_and_every_declaring_driver_serves_the_hook():
+    sources = [
+        *sorted((_REPO / 'packages/ai/src/ai/common/store').rglob('*.py')),
+        *sorted((_REPO / 'nodes/src/nodes').glob('*/**/*.py')),
+    ]
+    declaring = {}
+    for path in sources:
+        for cls in ast.walk(ast.parse(path.read_text(encoding='utf-8'))):
+            if isinstance(cls, ast.ClassDef) and _declares_best_score(cls):
+                hook = next(
+                    (n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == 'recommendNative'), None
+                )
+                declaring[f'{path.parent.name}/{path.name}:{cls.name}'] = (
+                    hook is not None and {a.arg for a in hook.args.kwonlyargs} >= _NATIVE_PARAMS
+                )
+    assert declaring == {'store_qdrant/qdrant.py:Store': True}
+
+
+def test_pgvector_answers_unsupported_for_best_score():
+    from ai.common.store.pgvector import PgVectorStore
+
+    assert 'recommend_best_score' not in PgVectorStore.VX_DRIVER_CAPABILITIES
+    assert not callable(getattr(PgVectorStore, 'recommendNative', None))
