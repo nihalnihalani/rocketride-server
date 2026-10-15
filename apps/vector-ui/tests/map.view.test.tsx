@@ -320,8 +320,12 @@ test('edges: Tree draws the spanning tree (n-1 edges on a connected graph), Neig
 	assert.deepEqual(calls, []);
 	// The canvas gets the edge set and the perf lane's switch (default on).
 	assert.equal((last<{ edges: { count: number } | null }>('PointCanvas').edges), null, 'no edges by default');
-	render({ sample: demo, extra: { edges: 'tree', edgesAutoDegrade: false } });
+	const off = render({ sample: demo, extra: { edges: 'tree', edgesAutoDegrade: false } });
 	assert.equal(last<{ edges: { count: number } }>('PointCanvas').edges.count, demo.result.n - tree.components);
+	// The perf lane reads whether the switch was off and whether the map degraded while it measured.
+	assert.equal(attr(off, 'data-edges-auto-degrade'), 'off');
+	assert.equal(attr(off, 'data-edges-degraded'), '0');
+	assert.equal(attr(treeOut, 'data-edges-auto-degrade'), 'on');
 });
 
 test('a scope applied to the map is sent with the sample, the neighbours and recommend, and the legend says so', async () => {

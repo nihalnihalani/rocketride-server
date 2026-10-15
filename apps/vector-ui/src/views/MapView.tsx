@@ -1506,6 +1506,8 @@ export function MapView(props: MapViewProps): React.ReactElement {
 			data-colour-by={colourBy}
 			data-edge-mode={edges}
 			data-edges-per-point={edgesPerPoint}
+			data-edges-auto-degrade={edgesAutoDegrade ? 'on' : 'off'}
+			data-edges-degraded={edgesDegraded ? '1' : '0'}
 			data-edge-count={edgeSet?.count ?? 0}
 			data-clusters={clusters ? clusters.count : ''}
 			data-min-cluster-size={minClusterSize}
