@@ -41,6 +41,7 @@ import path from 'node:path';
 import type { ConsoleModel, IDialectResult, IScopeState, IScoreInfo, ISearchResult, IVectorCapabilities, IVectorLimits, VectorKey } from '../src/contract/types';
 import { EXPORT_COLUMNS } from '../src/contract/types';
 import type { CallOutcome } from '../src/chat/toolCalls';
+import { classifyRetrieval } from '../src/vector/retrieval';
 import { QUERY_NEEDS_EMBED } from '../src/map/wording';
 import {
 	HYBRID_LABEL,
@@ -61,7 +62,9 @@ import {
 	modeOptions,
 	nodeSettingText,
 	plan,
+	previewOf,
 	rateLimitSentence,
+	retrievalExportRows,
 	retryAfterSeconds,
 	rowsFromSearch,
 	runWorkbench,
@@ -298,7 +301,9 @@ test('rowsFromSearch: path #chunk, a 120-character preview, the cited mark; keyw
 	const cited: VectorKey[] = [['ef35cb9c-f98f-e472-d795-298a40a5cb2b', 67]];
 	const rows = rowsFromSearch(long, true, cited);
 	assert.equal(rows.length, 8);
-	assert.equal(rows[0].preview, `${'x'.repeat(120)}…`);
+	assert.equal(rows[0].preview, `${'x'.repeat(119)}…`);
+	assert.equal(rows[0].preview.length, 120, 'never longer than snippet_chars, the ellipsis included');
+	assert.equal(rowsFromSearch(long, true, [], 40)[0].preview.length, 40);
 	assert.deepEqual(rows[1].key, ['ef35cb9c-f98f-e472-d795-298a40a5cb2b', 67]);
 	assert.equal(rows[1].path, 'C:/demo/ops/ops_005.pdf');
 	assert.equal(rows[1].cited, true);
@@ -577,6 +582,19 @@ test('workbenchExportRows: the search columns, the words on screen, no vector', 
 	const both = workbenchExportRows(classifyAt(rows, 0.3, dialect.score), 'A');
 	assert.deepEqual(both.columns, ['run', ...EXPORT_COLUMNS.search]);
 	assert.equal(both.rows[0].run, 'A');
+});
+
+test('retrievalExportRows: the debugger\'s rows in the search columns, its own words, previews cut to 120 characters', () => {
+	const view = classifyRetrieval({ ...searchVector, results: [{ ...searchVector.results[0], content: 'z'.repeat(400) }, ...searchVector.results.slice(1)] }, dialect.score, [{ rank: 1, key: ['2ed1cfeb-37ac-4394-30f7-699303f093bd', 39], objectId: '2ed1cfeb-37ac-4394-30f7-699303f093bd', chunkId: 39, path: 'C:/demo/ops/ops_021.pdf', score: 0.5433, text: '' }]);
+	const words = { used: 'passed the threshold', near_miss: 'near miss: below the threshold', below_floor: 'below the floor' } as const;
+	const exported = retrievalExportRows(view, words);
+	assert.deepEqual(exported.columns, EXPORT_COLUMNS.search);
+	assert.equal(exported.rows.length, 8);
+	assert.equal(exported.rows[0].cited, true);
+	assert.equal(exported.rows[0].status, 'passed the threshold');
+	assert.equal(String(exported.rows[0].preview).length, 120);
+	assert.equal(previewOf('short'), 'short');
+	assert.ok(exported.rows.every((row) => Object.values(row).every((cell) => !Array.isArray(cell))));
 });
 
 test('searchExportItems: A, and with Compare B and both; disabled until a run', () => {

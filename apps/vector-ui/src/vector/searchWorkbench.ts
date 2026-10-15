@@ -272,8 +272,20 @@ export function searchScope(scope: IScopeState | null | undefined, limits: Pick<
 
 // ── Rows ────────────────────────────────────────────────────────────────────
 
-/** Characters of a row's content shown (and exported). */
+/** Characters of a row's content shown and exported, the ellipsis included (the node's snippet_chars by default). */
 export const PREVIEW_CHARS = 120;
+
+/**
+ * At most `max` characters of a text, the ellipsis included.
+ *
+ * @param text - The text.
+ * @param max - The most characters.
+ * @returns The text, or its start and '…'.
+ */
+export function previewOf(text: string, max: number = PREVIEW_CHARS): string {
+	const most = Math.max(1, Math.floor(max));
+	return text.length > most ? `${text.slice(0, most - 1)}…` : text;
+}
 
 /** One result of a run. */
 export interface WorkbenchRow {
@@ -299,7 +311,7 @@ export interface WorkbenchRow {
 	fused: number | null;
 	/** The chat's answer cited this chunk ("Open in Search"). */
 	cited: boolean;
-	/** At most {@link PREVIEW_CHARS} characters of the chunk, then '…'. */
+	/** At most {@link PREVIEW_CHARS} (or the node's snippet_chars, if fewer) characters of the chunk, the ellipsis included. */
 	preview: string;
 }
 
@@ -319,9 +331,10 @@ function num(value: unknown): number | null {
  * @param result - The answer.
  * @param rated - True for a semantic answer (scores are similarities), false for a keyword one.
  * @param cited - Chunks to mark as cited.
+ * @param previewChars - The longest preview (the node's snippet_chars when it is below {@link PREVIEW_CHARS}).
  * @returns The rows, in the store's order.
  */
-export function rowsFromSearch(result: ISearchResult, rated: boolean, cited: readonly VectorKey[]): WorkbenchRow[] {
+export function rowsFromSearch(result: ISearchResult, rated: boolean, cited: readonly VectorKey[], previewChars: number = PREVIEW_CHARS): WorkbenchRow[] {
 	const marked = new Set(cited.map(keyId));
 	const items = Array.isArray(result?.results) ? result.results : [];
 	return items.map((item, index) => {
@@ -346,7 +359,7 @@ export function rowsFromSearch(result: ISearchResult, rated: boolean, cited: rea
 			keywordScore: rated ? null : num(item.score),
 			fused: null,
 			cited: marked.has(keyId(key)),
-			preview: content.length > PREVIEW_CHARS ? `${content.slice(0, PREVIEW_CHARS)}…` : content,
+			preview: previewOf(content, Math.min(PREVIEW_CHARS, previewChars)),
 		};
 	});
 }
@@ -695,6 +708,7 @@ export async function runWorkbench(deps: WorkbenchDeps, request: WorkbenchReques
 	if (question === '') return failed('input', null, 'Type a question to search for.');
 	const steps = plan(request.mode);
 	const topK = clampTopK(request.topK, request.limits);
+	const previewChars = Number.isFinite(request.limits.snippet_chars) && request.limits.snippet_chars > 0 ? request.limits.snippet_chars : PREVIEW_CHARS;
 	let semantic: ISearchResult | null = null;
 	let keyword: ISearchResult | null = null;
 	let embeddingModel: string | null = null;
@@ -727,13 +741,13 @@ export async function runWorkbench(deps: WorkbenchDeps, request: WorkbenchReques
 	let rows: WorkbenchRow[];
 	let modeUsed: WorkbenchRun['modeUsed'];
 	if (semantic !== null && keyword !== null) {
-		rows = fuse(rowsFromSearch(semantic, rated, request.cited), rowsFromSearch(keyword, false, request.cited), RRF_K, topK);
+		rows = fuse(rowsFromSearch(semantic, rated, request.cited, previewChars), rowsFromSearch(keyword, false, request.cited, previewChars), RRF_K, topK);
 		modeUsed = 'hybrid';
 	} else if (semantic !== null) {
-		rows = rowsFromSearch(semantic, rated, request.cited);
+		rows = rowsFromSearch(semantic, rated, request.cited, previewChars);
 		modeUsed = rated ? 'semantic' : 'keyword';
 	} else {
-		rows = rowsFromSearch(keyword as ISearchResult, false, request.cited);
+		rows = rowsFromSearch(keyword as ISearchResult, false, request.cited, previewChars);
 		modeUsed = 'keyword';
 	}
 	return {
@@ -852,7 +866,7 @@ export function retrievalExportRows(view: RetrievalView, words: Readonly<Record<
 			raw_score: row.rawScore,
 			status: words[row.status],
 			cited: row.inAnswer,
-			preview: row.preview.length > PREVIEW_CHARS ? `${row.preview.slice(0, PREVIEW_CHARS)}…` : row.preview,
+			preview: previewOf(row.preview),
 		})),
 	};
 }
