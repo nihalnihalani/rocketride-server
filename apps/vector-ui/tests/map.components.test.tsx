@@ -107,7 +107,7 @@ test('DuplicatesPanel and OutliersPanel list the node\'s findings, or say there 
 	const dup = html(<DuplicatesPanel sample={demo} writes={writes} onSelect={noop} onRemoveDocument={noop} />);
 	assert.equal((dup.match(/<li/g) ?? []).length, demo.result.duplicates.length);
 	assert.match(dup, /0\.9998/);
-	const none = modelOf({ ...demo.result, duplicates: [], outliers: [] });
+	const none = modelOf({ ...demo.result, duplicates: [], outliers: [], knn: { k: 0, offsets_row: demo.result.knn.offsets_row.map(() => 0), cols: [], sims: [] } });
 	assert.match(html(<DuplicatesPanel sample={none} writes={writes} onSelect={noop} onRemoveDocument={noop} />), /No near-duplicate pairs/);
 	const out = html(<OutliersPanel sample={demo} onSelect={noop} />);
 	assert.equal((out.match(/<li/g) ?? []).length, demo.result.outliers.length);
