@@ -926,7 +926,6 @@ class TestRocketrideVectorNode:
         finally:
             glb.endGlobal()
 
-    @pytest.mark.skip(reason='NEEDS:L1,L0 merged — integration gate G2')
     def test_writes_refused_with_the_switch_off(self, rv, table):
         """A DAP call from a Tools source is refused while rrvector.allow_writes is off; the rows stay."""
         from ai.common.tool_context import ToolCallContext, tool_call
@@ -954,7 +953,6 @@ class TestRocketrideVectorNode:
         finally:
             glb.endGlobal()
 
-    @pytest.mark.skip(reason='NEEDS:L1,L0 merged — integration gate G2')
     def test_writes_refused_without_a_call_context(self, rv, table):
         """With the switch on, a call that carries no call context is refused; the rows stay."""
         rng = np.random.default_rng(43)
