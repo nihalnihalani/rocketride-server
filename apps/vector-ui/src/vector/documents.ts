@@ -28,9 +28,10 @@
 // derived here, in the browser, from `/` and `\` in the stored path (the
 // store keeps paths as the ingest sent them: Windows drive letters, network
 // shares and POSIX roots stay as they are). A bare file name goes under
-// "Uploaded"; a document whose chunk 0 is missing goes under "Without first
-// chunk"; two documents with the same path stay two rows, told apart by a
-// short objectId.
+// "Uploaded"; a document with a health flag (vector/health.ts: no first
+// chunk, gaps, deleted chunks, empty parse, oversize) goes under "Needs
+// attention", by its whole path, with its flags as badges; two documents
+// with the same path stay two rows, told apart by a short objectId.
 //
 // AUTO-PAGING. After the first page the directory keeps asking for pages in
 // the background, up to DIRECTORY_AUTO_ROWS (5,000) rows. The first page is
@@ -49,6 +50,7 @@
 import type { FilterApplied, IDocumentItem, IDocumentsFilter, IExportRows } from '../contract/types';
 import { EXPORT_COLUMNS } from '../contract/types';
 import { DIRECTORY_AUTO_ROWS, DIRECTORY_LOAD_MORE } from './budgets';
+import { documentHealth } from './health';
 import type { IDocumentsPageView } from './results';
 import { formatCount } from './stats';
 import { CAVEAT_SENTENCES, DOCUMENTS_REPEATED_TEXT } from './wording';
@@ -86,28 +88,30 @@ export function splitPath(path: string): IPathParts {
 /** One row of the directory. */
 export interface IDirectoryRow {
 	item: IDocumentItem;
-	/** The name shown: the file name, or the whole path in the "Without first chunk" group. */
+	/** The name shown: the file name, or the whole path in the "Needs attention" group. */
 	name: string;
 	/** True when another loaded document has the same path. */
 	duplicate: boolean;
 	/** The first 8 characters of the objectId (shown on hover, and beside a duplicate). */
 	shortId: string;
+	/** The health flags' badges ('no first chunk', '1 deleted chunk'); empty for a healthy document. */
+	flags: string[];
 }
 
 /** One group of the directory. */
 export interface IDirectoryGroup {
 	key: string;
 	label: string;
-	kind: 'folder' | 'uploaded' | 'orphans';
+	kind: 'folder' | 'uploaded' | 'attention';
 	rows: IDirectoryRow[];
 }
 
-/** Rank of each group kind: folders, then Uploaded, then Without first chunk. */
-const KIND_RANK: Readonly<Record<IDirectoryGroup['kind'], number>> = { folder: 0, uploaded: 1, orphans: 2 };
+/** Rank of each group kind: folders, then Uploaded, then Needs attention. */
+const KIND_RANK: Readonly<Record<IDirectoryGroup['kind'], number>> = { folder: 0, uploaded: 1, attention: 2 };
 
-/** The group kind and folder label of one document. */
+/** The group kind and folder label of one document (by its first chunk; buildGroups adds the other flags). */
 function placeOf(item: IDocumentItem): { kind: IDirectoryGroup['kind']; folder: string; name: string } {
-	if (!item.has_first_chunk) return { kind: 'orphans', folder: '', name: item.path || '(no path)' };
+	if (!item.has_first_chunk) return { kind: 'attention', folder: '', name: item.path || '(no path)' };
 	const parts = splitPath(item.path);
 	return { kind: parts.uploaded ? 'uploaded' : 'folder', folder: parts.folder, name: parts.name };
 }
@@ -121,7 +125,7 @@ function compareText(a: string, b: string): number {
 }
 
 /**
- * The directory's order: folders (by label), Uploaded, Without first chunk; inside a group by name, path, objectId.
+ * The directory's order: folders (by label), Uploaded, documents without a first chunk; inside a group by name, path, objectId.
  *
  * @param a - A document.
  * @param b - Another document.
@@ -145,22 +149,27 @@ export function sortDocuments(items: readonly IDocumentItem[]): IDocumentItem[] 
 
 /**
  * Group rows for display, keeping their order: folders in order of first
- * appearance, then Uploaded, then Without first chunk. The pager decides when
- * the rows are sorted (see the header), so grouping never reorders anything.
+ * appearance, then Uploaded, then Needs attention (by path). The pager decides
+ * when the rows are sorted (see the header), so grouping never reorders a
+ * folder. A document goes under Needs attention when it has a health flag;
+ * "oversize" needs the median, which the directory passes only once its
+ * listing settled, so no row moves while pages arrive.
  *
  * @param rows - The documents, in display order.
+ * @param health - The median chunks per loaded document (null while unknown).
  * @returns The groups.
  */
-export function buildGroups(rows: readonly IDocumentItem[]): IDirectoryGroup[] {
+export function buildGroups(rows: readonly IDocumentItem[], health: { medianChunks: number | null } = { medianChunks: null }): IDirectoryGroup[] {
 	const pathCounts = new Map<string, number>();
 	for (const item of rows) pathCounts.set(item.path, (pathCounts.get(item.path) ?? 0) + 1);
 	const folders = new Map<string, IDirectoryGroup>();
 	const uploaded: IDirectoryGroup = { key: 'uploaded', label: UPLOADED_LABEL, kind: 'uploaded', rows: [] };
-	const orphans: IDirectoryGroup = { key: 'orphans', label: '', kind: 'orphans', rows: [] };
+	const attention: IDirectoryGroup = { key: 'attention', label: '', kind: 'attention', rows: [] };
 	for (const item of rows) {
 		const place = placeOf(item);
-		const row: IDirectoryRow = { item, name: place.name, duplicate: (pathCounts.get(item.path) ?? 0) > 1, shortId: item.objectId.slice(0, 8) };
-		if (place.kind === 'orphans') orphans.rows.push(row);
+		const flags = documentHealth(item, { medianChunks: health.medianChunks }).flags.map((f) => f.label);
+		const row: IDirectoryRow = { item, name: place.name, duplicate: (pathCounts.get(item.path) ?? 0) > 1, shortId: item.objectId.slice(0, 8), flags };
+		if (flags.length > 0) attention.rows.push({ ...row, name: item.path || '(no path)' });
 		else if (place.kind === 'uploaded') uploaded.rows.push(row);
 		else {
 			let group = folders.get(place.folder);
@@ -171,8 +180,9 @@ export function buildGroups(rows: readonly IDocumentItem[]): IDirectoryGroup[] {
 			group.rows.push(row);
 		}
 	}
-	orphans.label = `Without first chunk (${formatCount(orphans.rows.length)})`;
-	return [...folders.values(), uploaded, orphans].filter((group) => group.rows.length > 0);
+	attention.rows.sort((a, b) => compareText(a.item.path, b.item.path) || compareText(a.item.objectId, b.item.objectId));
+	attention.label = `Needs attention (${formatCount(attention.rows.length)})`;
+	return [...folders.values(), uploaded, attention].filter((group) => group.rows.length > 0);
 }
 
 /**

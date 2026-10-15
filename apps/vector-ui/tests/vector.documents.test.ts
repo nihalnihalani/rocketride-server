@@ -43,7 +43,7 @@ test('paths: forward and back slashes, drive letters, network shares, POSIX root
 	assert.deepEqual(splitPath(''), { folder: 'Uploaded', name: '(no path)', uploaded: true });
 });
 
-test('groups: one per folder, then Uploaded, then Without first chunk; duplicate paths kept with a short objectId', () => {
+test('groups: one per folder, then Uploaded, then Needs attention; duplicate paths kept with a short objectId', () => {
 	const items = readDocumentsPage(fixture('documents_windows_and_posix_paths')).items;
 	items.push(doc('orphan-1', 'ops/old_memo.txt', { has_first_chunk: false }));
 	const state = pagerApplyPage(pagerBegin(pagerInit()), page(items, { nextCursor: null, total: items.length }));
@@ -58,7 +58,7 @@ test('groups: one per folder, then Uploaded, then Without first chunk; duplicate
 			['folder', 'D:/archive/2024/', 1],
 			['folder', 'Uploaded/', 1],
 			['uploaded', 'Uploaded', 2],
-			['orphans', 'Without first chunk (1)', 1],
+			['attention', 'Needs attention (1)', 1],
 		]
 	);
 	const reports = groups.find((g) => g.kind === 'uploaded')!.rows;
@@ -71,7 +71,10 @@ test('groups: one per folder, then Uploaded, then Without first chunk; duplicate
 	);
 	assert.notEqual(reports[0].shortId, reports[1].shortId, 'two documents with one path stay two rows, told apart by their objectId');
 	assert.equal(reports[0].shortId.length, 8);
-	assert.equal(groups.find((g) => g.kind === 'orphans')!.rows[0].name, 'ops/old_memo.txt', 'an orphan shows its whole path');
+	const orphan = groups.find((g) => g.kind === 'attention')!.rows[0];
+	assert.equal(orphan.name, 'ops/old_memo.txt', 'an orphan shows its whole path');
+	assert.deepEqual(orphan.flags, ['no first chunk'], 'and says why it needs attention');
+	assert.deepEqual(reports[0].flags, [], 'a healthy document has no badge');
 });
 
 test('the filter is client-side over what is loaded, case-insensitive, and says how much is loaded while loading', () => {
@@ -234,6 +237,6 @@ test('a store that cannot page ends the listing with its caveat; one that lists 
 	assert.deepEqual(pagerFooter(unsorted), { text: 'sorted here; this store lists documents in storage order', loadMore: false, caveat: null, retry: false });
 	assert.deepEqual(
 		buildGroups(unsorted.rows).map((g) => g.label),
-		['C:/demo/field/', 'C:/demo/handbooks/', 'Uploaded', 'Without first chunk (1)']
+		['C:/demo/field/', 'C:/demo/handbooks/', 'Uploaded', 'Needs attention (1)']
 	);
 });
