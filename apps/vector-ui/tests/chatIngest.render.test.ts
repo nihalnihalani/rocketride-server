@@ -43,7 +43,7 @@ import { createSelectionStore } from '../src/contract/bridge';
 import type { UploadRow } from '../src/vector/uploads';
 import { QUERY_NEEDS_EMBED } from '../src/map/wording';
 import { classifyAt, runWorkbench, sliderRange } from '../src/vector/searchWorkbench';
-import type { WorkbenchDeps, WorkbenchRun } from '../src/vector/searchWorkbench';
+import type { ChatPrefill, WorkbenchDeps, WorkbenchRun } from '../src/vector/searchWorkbench';
 
 /** Most a test here may take: they await fakes, so a regression must fail, not hang the run. */
 const TEST_TIMEOUT_MS = 10_000;
@@ -359,11 +359,13 @@ function answering(answers: Record<string, Array<Record<string, unknown>>>): Wor
  * @param question - The question.
  * @param mode - The mode.
  * @param search - The search answers, in call order.
+ * @param chat - What "Open in Search" brought (by default this question, citing ops_005 #67).
+ * @param objectIds - The run's scope, or null.
  * @returns The run.
  */
-async function finishedRun(question: string, mode: 'semantic' | 'keyword' | 'hybrid', search: ISearchResult[]): Promise<WorkbenchRun> {
+async function finishedRun(question: string, mode: 'semantic' | 'keyword' | 'hybrid', search: ISearchResult[], chat: ChatPrefill | null = { question, cited: [['ef35cb9c-f98f-e472-d795-298a40a5cb2b', 67]] }, objectIds: string[] | null = null): Promise<WorkbenchRun> {
 	const deps = answering({ embed: [embedOk], search: search.map((s) => s as unknown as Record<string, unknown>) });
-	const outcome = await runWorkbench(deps, { question, mode, topK: 50, limits: dialect.limits, storeNode: 'store_1', embedNode: 'embed_1', objectIds: null, cited: [['ef35cb9c-f98f-e472-d795-298a40a5cb2b', 67]] });
+	const outcome = await runWorkbench(deps, { question, mode, topK: 50, limits: dialect.limits, storeNode: 'store_1', embedNode: 'embed_1', objectIds, chat });
 	assert.ok(outcome.ok);
 	return outcome.run;
 }
@@ -425,7 +427,7 @@ test('SearchPanel: a scope above the cap turns Run off with its sentence; a scop
 	assert.match(within, /Searching 2 documents in scope: folder is under C:\/demo\//);
 });
 
-test('SearchPanel: "Open in Search" fills the question and says the cited chunks are marked', () => {
+test('SearchPanel: "Open in Search" fills the question; the "From the chat" line waits for a run of it', () => {
 	const cited: VectorKey[] = [
 		['a', 0],
 		['b', 1],
@@ -433,8 +435,28 @@ test('SearchPanel: "Open in Search" fills the question and says the cited chunks
 	];
 	const html = render(h(SearchPanel, { model: modelOn(enriched), channels, selection: createSelectionStore('render-1'), actions, prefill: { question: 'Where does Falcon Station get its water?', cited } }));
 	assert.match(html, /<input type="search"[^>]*value="Where does Falcon Station get its water\?"/);
-	assert.match(html, /From the chat: the 3 chunks its answer cited are marked “cited”\./);
+	// The line describes a run's rows; before the run there are none.
+	assert.doesNotMatch(html, /From the chat/);
 	assert.match(html, /<button type="submit"(?![^>]*disabled)[^>]*>Run<\/button>/);
+});
+
+test('SearchResults: "From the chat" and the cited mark on a run of the brought question only', async () => {
+	const water = 'Where does Falcon Station get its water?';
+	const brought: ChatPrefill = { question: water, cited: [['ef35cb9c-f98f-e472-d795-298a40a5cb2b', 67]] };
+	const vector = fixture<ISearchResult>('search_vector.json');
+	const same = await finishedRun(water, 'semantic', [vector], brought);
+	const shown = render(h(SearchResults, { run: same, view: classifyAt(same.rows, 0.3, dialect.score), score: dialect.score, range: sliderRange(dialect.score), ...resultHandlers }));
+	assert.match(shown, /<p[^>]*data-from-chat=""[^>]*>From the chat: the chunk its answer cited is marked “cited”\.<\/p>/);
+	assert.match(shown, /#67 · cited/);
+	const other = await finishedRun('greenhouse orchid pressure', 'semantic', [vector], brought);
+	const otherHtml = render(h(SearchResults, { run: other, view: classifyAt(other.rows, 0.3, dialect.score), score: dialect.score, range: sliderRange(dialect.score), ...resultHandlers }));
+	assert.match(otherHtml, /#67</, 'the chunk is listed');
+	assert.doesNotMatch(otherHtml, /· cited|From the chat/);
+	const keyword = await finishedRun('falcon', 'keyword', [fixture<ISearchResult>('search_keyword_fallback_warning.json')], brought);
+	assert.doesNotMatch(render(h(SearchResults, { run: keyword, view: classifyAt(keyword.rows, 0.3, dialect.score), score: dialect.score, range: sliderRange(dialect.score), ...resultHandlers })), /· cited|From the chat/);
+	// The console's scope is on and this run searched within it; the answer did not.
+	const scoped = await finishedRun(water, 'semantic', [vector], brought, ['d1', 'd2']);
+	assert.match(render(h(SearchResults, { run: scoped, view: classifyAt(scoped.rows, 0.3, dialect.score), score: dialect.score, range: sliderRange(dialect.score), scopeOn: true, ...resultHandlers })), /Searched within the scope; the answer was not\./);
 });
 
 test("SearchResults: the slider over the store's range, its count beside the node setting, the histogram, and a table whose 'passes' rows match the count", async () => {
@@ -498,6 +520,19 @@ test('QueryCompare: A and B side by side, the shared count and the Jaccard index
 	assert.match(html, />Show A ★ and B ☆ on the map</);
 	assert.equal((html.match(/data-side="only-a"/g) ?? []).length, 2);
 	assert.equal((html.match(/data-side="both"/g) ?? []).length, 12);
+});
+
+test('QueryCompare: the column of the brought question says "From the chat" and marks its cited chunk; the other does not', async () => {
+	const water = 'Where does Falcon Station get its water?';
+	const brought: ChatPrefill = { question: water, cited: [['ef35cb9c-f98f-e472-d795-298a40a5cb2b', 67]] };
+	const vector = fixture<ISearchResult>('search_vector.json');
+	const a = await finishedRun(water, 'semantic', [vector], brought);
+	const b = await finishedRun('kestrel survey', 'semantic', [vector], brought);
+	const html = render(h(QueryCompare, { a: { run: a, view: classifyAt(a.rows, 0.3, dialect.score) }, b: { run: b, view: classifyAt(b.rows, 0.3, dialect.score) }, score: dialect.score, onShowBoth: () => undefined, onOpen: () => undefined }));
+	const column = (letter: 'A' | 'B'): string => html.slice(html.indexOf(`data-run="${letter}"`), letter === 'A' ? html.indexOf('data-run="B"') : undefined);
+	assert.match(column('A'), /From the chat: the chunk its answer cited is marked “cited”\./);
+	assert.match(column('A'), /#67<\/button> · cited/);
+	assert.doesNotMatch(column('B'), /From the chat|· cited/);
 });
 
 test('ChatPanel: Search on swaps the body in the same space; the chat (thread and draft) stays mounted, hidden, and comes back', async () => {

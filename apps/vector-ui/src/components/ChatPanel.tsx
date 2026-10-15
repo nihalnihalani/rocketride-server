@@ -180,7 +180,8 @@ export function ChatPanel(props: ChatPanelProps): React.ReactElement {
 	const [recall, setRecall] = useState(-1);
 	const [debugging, setDebugging] = useState<number | null>(null);
 	const [searching, setSearching] = useState(initialSearch);
-	const [prefill, setPrefill] = useState<SearchPrefill | null>(null);
+	// Kept with its connection: a Search panel remounted for another identity starts empty.
+	const [prefill, setPrefill] = useState<{ connectionKey: string; value: SearchPrefill } | null>(null);
 	const thread = useRef<HTMLDivElement>(null);
 	const turns = chat.state.turns;
 	const scrollKey = threadScrollKey(turns);
@@ -200,7 +201,7 @@ export function ChatPanel(props: ChatPanelProps): React.ReactElement {
 	 * @param next - The question and the keys its answer cited.
 	 */
 	const openInSearch = (next: SearchPrefill): void => {
-		setPrefill(next);
+		setPrefill({ connectionKey: model.connectionKey, value: next });
 		setSearching(true);
 	};
 
@@ -252,7 +253,7 @@ export function ChatPanel(props: ChatPanelProps): React.ReactElement {
 				</p>
 			)}
 			<div hidden={!searching} data-surface="search" style={S.surface}>
-				<SearchPanel key={model.connectionKey} model={model} channels={channels} selection={selection} actions={actions} prefill={prefill} onShowChat={() => setSearching(false)} />
+				<SearchPanel key={model.connectionKey} model={model} channels={channels} selection={selection} actions={actions} prefill={prefill !== null && prefill.connectionKey === model.connectionKey ? prefill.value : null} onShowChat={() => setSearching(false)} />
 			</div>
 			<div data-surface="chat" style={{ display: searching ? 'none' : 'contents' }}>
 				{!available ? (

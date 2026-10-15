@@ -38,7 +38,10 @@
 //     count it names is the table's count of passing rows at every position,
 //     next to what today's node setting passes, with the node setting to copy;
 //   - the scope (folder, file type, ...) goes out as `filter.objectIds`, never
-//     more than `limits.scope_keys_max` ids.
+//     more than `limits.scope_keys_max` ids;
+//   - "Open in Search" brings the chat's question with the chunks its answer
+//     cited: the "cited" marks go only on a run of that question, never on
+//     another one on the same panel.
 //
 // `runWorkbench` makes a run's calls through the function it is given (the
 // panel passes chat/toolCalls' callTool): the query vector is a local of that
@@ -598,8 +601,8 @@ export interface WorkbenchRequest {
 	embedNode: string | null;
 	/** The scope's ids, or null for the whole collection. */
 	objectIds: readonly string[] | null;
-	/** Chunks to mark as cited. */
-	cited: readonly VectorKey[];
+	/** What "Open in Search" brought: its cited chunks are marked on a run of its question only. */
+	chat?: ChatPrefill | null;
 }
 
 /** A finished run. Holds no vector. */
@@ -617,6 +620,8 @@ export interface WorkbenchRun {
 	embeddingModel: string | null;
 	/** Documents in scope, or null without one. */
 	scoped: number | null;
+	/** The chat answer behind this run: set only when its question is the one "Open in Search" brought. */
+	fromChat: RunFromChat | null;
 }
 
 /** A run's outcome. */
@@ -709,6 +714,7 @@ export async function runWorkbench(deps: WorkbenchDeps, request: WorkbenchReques
 	const steps = plan(request.mode);
 	const topK = clampTopK(request.topK, request.limits);
 	const previewChars = Number.isFinite(request.limits.snippet_chars) && request.limits.snippet_chars > 0 ? request.limits.snippet_chars : PREVIEW_CHARS;
+	const { cited, fromChat } = chatTie(request.chat ?? null, question, request.objectIds);
 	let semantic: ISearchResult | null = null;
 	let keyword: ISearchResult | null = null;
 	let embeddingModel: string | null = null;
@@ -741,13 +747,13 @@ export async function runWorkbench(deps: WorkbenchDeps, request: WorkbenchReques
 	let rows: WorkbenchRow[];
 	let modeUsed: WorkbenchRun['modeUsed'];
 	if (semantic !== null && keyword !== null) {
-		rows = fuse(rowsFromSearch(semantic, rated, request.cited, previewChars), rowsFromSearch(keyword, false, request.cited, previewChars), RRF_K, topK);
+		rows = fuse(rowsFromSearch(semantic, rated, cited, previewChars), rowsFromSearch(keyword, false, cited, previewChars), RRF_K, topK);
 		modeUsed = 'hybrid';
 	} else if (semantic !== null) {
-		rows = rowsFromSearch(semantic, rated, request.cited, previewChars);
+		rows = rowsFromSearch(semantic, rated, cited, previewChars);
 		modeUsed = rated ? 'semantic' : 'keyword';
 	} else {
-		rows = rowsFromSearch(keyword as ISearchResult, false, request.cited, previewChars);
+		rows = rowsFromSearch(keyword as ISearchResult, false, cited, previewChars);
 		modeUsed = 'keyword';
 	}
 	return {
@@ -763,6 +769,7 @@ export async function runWorkbench(deps: WorkbenchDeps, request: WorkbenchReques
 			modelMismatch: warnings.includes('model_mismatch'),
 			embeddingModel,
 			scoped: request.objectIds !== null ? request.objectIds.length : null,
+			fromChat,
 		},
 	};
 }
@@ -791,6 +798,102 @@ export function noResultsSentence(run: Pick<WorkbenchRun, 'question'>): string {
 
 /** Re-exported for the panel: the model-mismatch banner's words. */
 export { MODEL_MISMATCH_SENTENCE };
+
+// ── From the chat ("Open in Search") ────────────────────────────────────────
+
+/** What "Open in Search" brings from the chat: the question, the chunks its answer cited, and how "Why these?" searched. */
+export interface ChatPrefill {
+	question: string;
+	/** The chunks the answer cited. */
+	cited: readonly VectorKey[];
+	/** The k "Why these?" searched with; absent: the panel picks one that shows the cited chunks plus ten. */
+	topK?: number | null;
+	/** The documents the question was asked about ("Why these?" searched only them); null or absent: the whole collection. */
+	objectIds?: readonly string[] | null;
+}
+
+/** A run's tie to the chat answer "Open in Search" brought. */
+export interface RunFromChat {
+	/** Chunks the answer cited. */
+	cited: number;
+	/** Documents the question was asked about, or null for the whole collection. */
+	askedAbout: number | null;
+	/** The run searched what the answer did: the whole collection both, or the same documents. */
+	sameScope: boolean;
+}
+
+/**
+ * Some documents, or null for none (an empty list is the whole collection, as the chat sends it).
+ *
+ * @param objectIds - The ids, or null.
+ * @returns A copy, or null.
+ */
+function scopeIds(objectIds: readonly string[] | null | undefined): string[] | null {
+	return objectIds && objectIds.length > 0 ? [...objectIds] : null;
+}
+
+/**
+ * Whether two scopes cover the same documents (null is the whole collection).
+ *
+ * @param a - A scope.
+ * @param b - Another.
+ * @returns True when they are the same set.
+ */
+function sameScope(a: readonly string[] | null, b: readonly string[] | null): boolean {
+	if (a === null || b === null) return a === b;
+	const set = new Set(a);
+	return set.size === new Set(b).size && b.every((id) => set.has(id));
+}
+
+/**
+ * The chat's citations for one run: a run of the question "Open in Search" brought carries them; any other carries none.
+ *
+ * @param chat - What "Open in Search" brought, or null.
+ * @param question - The run's question (trimmed).
+ * @param objectIds - The run's scope, or null.
+ * @returns The keys to mark and the run's tie to the answer.
+ */
+function chatTie(chat: ChatPrefill | null, question: string, objectIds: readonly string[] | null): { cited: readonly VectorKey[]; fromChat: RunFromChat | null } {
+	if (chat === null || chat.question.trim() !== question.trim()) return { cited: [], fromChat: null };
+	const askedAbout = scopeIds(chat.objectIds);
+	return { cited: chat.cited, fromChat: { cited: chat.cited.length, askedAbout: askedAbout !== null ? askedAbout.length : null, sameScope: sameScope(askedAbout, scopeIds(objectIds)) } };
+}
+
+/**
+ * Some documents in words.
+ *
+ * @param n - How many.
+ * @returns "1 document", "4 documents".
+ */
+function documents(n: number): string {
+	return n === 1 ? '1 document' : `${n.toLocaleString('en-US')} documents`;
+}
+
+/**
+ * The line over a run of the question "Open in Search" brought: how many of
+ * the answer's cited chunks it lists, and whether it searched what the answer did.
+ *
+ * @param run - The run's rows, its tie to the answer and its scope.
+ * @param scopeOn - Run searches within the console's scope.
+ * @returns The line, or null on any other run.
+ */
+export function fromChatLine(run: { rows: readonly Pick<WorkbenchRow, 'cited'>[]; fromChat: RunFromChat | null; scoped: number | null }, scopeOn: boolean): string | null {
+	const tie = run.fromChat;
+	if (tie === null) return null;
+	const n = tie.cited;
+	const listed = run.rows.filter((row) => row.cited).length;
+	let line: string;
+	if (n === 0) line = 'From the chat: its answer cited no chunks.';
+	else if (listed >= n) line = n === 1 ? 'From the chat: the chunk its answer cited is marked “cited”.' : `From the chat: the ${n} chunks its answer cited are marked “cited”.`;
+	else if (listed === 0) line = n === 1 ? 'From the chat: the chunk its answer cited is not in these results.' : `From the chat: none of the ${n} chunks its answer cited is in these results.`;
+	else line = `From the chat: ${listed} of the ${n} chunks its answer cited ${listed === 1 ? 'is' : 'are'} in these results, marked “cited”.`;
+	if (tie.sameScope) {
+		if (tie.askedAbout !== null) return `${line} Searched only the ${tie.askedAbout === 1 ? 'document' : `${tie.askedAbout.toLocaleString('en-US')} documents`} the question was asked about, as the answer did.`;
+		return scopeOn ? `${line} Searched the whole collection, as the answer did; Run searches within the scope.` : line;
+	}
+	if (tie.askedAbout === null) return `${line} Searched within the scope; the answer was not.`;
+	return `${line} The question was asked about ${documents(tie.askedAbout)} only; this search ${run.scoped === null ? 'covered the whole collection' : 'used the scope instead'}.`;
+}
 
 // ── Export ──────────────────────────────────────────────────────────────────
 

@@ -30,6 +30,8 @@
 // and B ☆ on the map" tells the map both questions so it can place a star
 // for each (adapters/consoleActions.ts showCompareOnMap). The letters, not
 // colours, tell the runs apart; chunk text is a React child, never markup.
+// A column whose question is the one "Open in Search" brought says so and
+// marks the chunks the chat's answer cited; the other column does not.
 // =============================================================================
 
 import React from 'react';
@@ -38,7 +40,7 @@ import { commonStyles } from 'shell';
 import type { IScoreInfo } from '../contract/types';
 import { compareRuns, compareSentence, sideOf } from '../vector/compare';
 import type { CompareSide, CompareSummary } from '../vector/compare';
-import { STATUS_WORDS, runCaption, scoreTitle } from '../vector/searchWorkbench';
+import { STATUS_WORDS, fromChatLine, runCaption, scoreTitle } from '../vector/searchWorkbench';
 import type { Classification, WorkbenchRow, WorkbenchRun } from '../vector/searchWorkbench';
 
 /** One side of the comparison: the run and its rows at the slider. */
@@ -56,6 +58,8 @@ export interface QueryCompareProps {
 	onShowBoth(): void;
 	/** Open a row's document at its chunk. */
 	onOpen(row: WorkbenchRow): void;
+	/** Run searches within the console's scope (for the "From the chat" line). */
+	scopeOn?: boolean;
 }
 
 /** The star each run gets on the map. */
@@ -86,6 +90,7 @@ interface SideProps {
 	summary: CompareSummary;
 	score: IScoreInfo | null;
 	onOpen(row: WorkbenchRow): void;
+	scopeOn: boolean;
 }
 
 /**
@@ -94,13 +99,19 @@ interface SideProps {
  * @param props - {@link SideProps}.
  * @returns The column.
  */
-function Column({ letter, side, summary, score, onOpen }: SideProps): React.ReactElement {
+function Column({ letter, side, summary, score, onOpen, scopeOn }: SideProps): React.ReactElement {
 	const { run, view } = side;
 	const passing = view.counts.rated > 0 ? ` · ${view.counts.passing} of ${view.counts.rated} pass at ${view.at.toFixed(2)}` : '';
+	const fromChat = fromChatLine(run, scopeOn);
 	return (
 		<section style={S.side} aria-label={`${letter}: ${run.question}`} data-run={letter}>
 			<h4 style={S.title}>{`${letter} ${STARS[letter]} ${run.question}`}</h4>
 			<p style={S.line}>{`${runCaption(run)}${passing}`}</p>
+			{fromChat !== null && (
+				<p style={S.line} data-from-chat="">
+					{fromChat}
+				</p>
+			)}
 			{view.rows.length === 0 ? (
 				<p style={S.line}>{`No chunks matched “${run.question}”.`}</p>
 			) : (
@@ -133,6 +144,7 @@ function Column({ letter, side, summary, score, onOpen }: SideProps): React.Reac
 										<button type="button" style={S.link} aria-label={`Open ${path} at chunk ${row.chunkId}`} onClick={() => onOpen(row)}>
 											{`${path} #${row.chunkId}`}
 										</button>
+										{row.cited ? ' · cited' : ''}
 									</td>
 									<td style={S.td} title={`${scoreTitle(row, score)} · ${STATUS_WORDS[row.status]}`}>
 										{row.score !== null ? row.score.toFixed(3) : 'match'}
@@ -154,7 +166,7 @@ function Column({ letter, side, summary, score, onOpen }: SideProps): React.Reac
  * @param props - {@link QueryCompareProps}.
  * @returns The comparison.
  */
-export function QueryCompare({ a, b, score, onShowBoth, onOpen }: QueryCompareProps): React.ReactElement {
+export function QueryCompare({ a, b, score, onShowBoth, onOpen, scopeOn = false }: QueryCompareProps): React.ReactElement {
 	const summary = compareRuns(a.run.rows, b.run.rows);
 	return (
 		<section style={S.root} aria-label="Compare A and B" data-component="QueryCompare">
@@ -167,8 +179,8 @@ export function QueryCompare({ a, b, score, onShowBoth, onOpen }: QueryComparePr
 				</button>
 			</div>
 			<div style={S.columns}>
-				<Column letter="A" side={a} summary={summary} score={score} onOpen={onOpen} />
-				<Column letter="B" side={b} summary={summary} score={score} onOpen={onOpen} />
+				<Column letter="A" side={a} summary={summary} score={score} onOpen={onOpen} scopeOn={scopeOn} />
+				<Column letter="B" side={b} summary={summary} score={score} onOpen={onOpen} scopeOn={scopeOn} />
 			</div>
 		</section>
 	);

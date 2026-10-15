@@ -36,6 +36,10 @@
 // changes node settings). Compare runs a second question beside the first
 // and shows them side by side (QueryCompare), with two stars on the map.
 //
+// "Open in Search" brings the chat's question and the chunks its answer
+// cited. The "cited" marks and the "From the chat" line belong to a run of
+// that question only: another question on the same panel carries neither.
+//
 // The model is src/vector/searchWorkbench.ts. Calls go through
 // chat/toolCalls' callTool only: `embed` on the embedding node and `search`
 // on the store node. The query vector lives in the run's closure for those
@@ -46,13 +50,13 @@
 import React, { useEffect, useId, useMemo, useRef, useState } from 'react';
 import type { CSSProperties } from 'react';
 import { Banner, commonStyles } from 'shell';
-import type { SearchPanelProps as ContractSearchPanelProps, IScoreInfo, VectorKey } from '../contract/types';
+import type { SearchPanelProps as ContractSearchPanelProps, IScoreInfo } from '../contract/types';
 import { callTool, toolChannelFor } from '../chat/toolCalls';
 import { showCompareOnMap } from '../adapters/consoleActions';
 import { DEBUGGER_EXTRA } from '../vector/retrieval';
 import { compareRuns, compareSentence } from '../vector/compare';
-import { CALL_TIMEOUT_MS, DEFAULT_TOP_K, KEYWORD_FALLBACK_SENTENCE, MODEL_MISMATCH_SENTENCE, MODE_HINTS, NODE_SETTING_FIELD, NODE_SETTING_NOTE, NODE_SETTING_RANGE, STATUS_WORDS, classifyAt, defaultMode, initialThreshold, keywordCaption, modeOptions, noResultsSentence, nodeSettingText, onGrid, rateLimitSentence, runCaption, runWorkbench, scoreTitle, searchExportItems, searchScope, secondsLeft, showSearchOnMap, sliderRange, sliderValueText, thresholdSentence, topKOptions } from '../vector/searchWorkbench';
-import type { Classification, ModeOption, SearchMode, SliderRange, WorkbenchDeps, WorkbenchOutcome, WorkbenchRow, WorkbenchRun } from '../vector/searchWorkbench';
+import { CALL_TIMEOUT_MS, DEFAULT_TOP_K, KEYWORD_FALLBACK_SENTENCE, MODEL_MISMATCH_SENTENCE, MODE_HINTS, NODE_SETTING_FIELD, NODE_SETTING_NOTE, NODE_SETTING_RANGE, STATUS_WORDS, classifyAt, defaultMode, fromChatLine, initialThreshold, keywordCaption, modeOptions, noResultsSentence, nodeSettingText, onGrid, rateLimitSentence, runCaption, runWorkbench, scoreTitle, searchExportItems, searchScope, secondsLeft, showSearchOnMap, sliderRange, sliderValueText, thresholdSentence, topKOptions } from '../vector/searchWorkbench';
+import type { ChatPrefill, Classification, ModeOption, SearchMode, SliderRange, WorkbenchDeps, WorkbenchOutcome, WorkbenchRow, WorkbenchRun } from '../vector/searchWorkbench';
 import { ExportMenu } from './ExportMenu';
 import { QueryCompare } from './QueryCompare';
 import { ScoreHistogram } from './ScoreHistogram';
@@ -156,6 +160,8 @@ export interface SearchResultsProps {
 	askReason?: string | null;
 	/** Show every row on the map. */
 	onShowAll?(): void;
+	/** Run searches within the console's scope (for the "From the chat" line). */
+	scopeOn?: boolean;
 }
 
 /**
@@ -175,9 +181,15 @@ function fusedFrom(row: WorkbenchRow): string | null {
  * @param props - {@link SearchResultsProps}.
  * @returns The results.
  */
-export function SearchResults({ run, view, score, range, onThreshold, onCopySetting, copied, onOpen, onMap, onAsk, canAsk, askReason = null, onShowAll }: SearchResultsProps): React.ReactElement {
+export function SearchResults({ run, view, score, range, onThreshold, onCopySetting, copied, onOpen, onMap, onAsk, canAsk, askReason = null, onShowAll, scopeOn = false }: SearchResultsProps): React.ReactElement {
+	const fromChat = fromChatLine(run, scopeOn);
 	return (
 		<div data-results="" data-mode-used={run.modeUsed}>
+			{fromChat !== null && (
+				<p style={S.note} data-from-chat="">
+					{fromChat}
+				</p>
+			)}
 			{run.modelMismatch && <Banner variant="warning">{MODEL_MISMATCH_SENTENCE}</Banner>}
 			{run.keywordFallback && <p style={S.note}>{KEYWORD_FALLBACK_SENTENCE}</p>}
 			{run.rows.length === 0 ? null : run.rated ? (
@@ -265,7 +277,8 @@ interface RunPlan {
 	questionB: string | null;
 	mode: SearchMode;
 	topK: number;
-	cited: readonly VectorKey[];
+	/** What "Open in Search" brought; a run of another question carries none of it. */
+	chat: ChatPrefill | null;
 }
 
 /**
@@ -317,7 +330,8 @@ export function SearchPanel({ model, channels, selection, actions, prefill = nul
 	const [topK, setTopK] = useState(() => (ks.includes(DEFAULT_TOP_K) ? DEFAULT_TOP_K : (ks[ks.length - 1] ?? DEFAULT_TOP_K)));
 	// null follows the node's setting (the dialect may answer after the panel mounted); a number is the user's.
 	const [chosenAt, setAt] = useState<number | null>(null);
-	const [cited, setCited] = useState<readonly VectorKey[]>(prefill?.cited ?? []);
+	// What "Open in Search" brought: kept with its question, so only a run of that question is marked.
+	const [chat, setChat] = useState<ChatPrefill | null>(prefill);
 	const [phase, setPhase] = useState<Phase>({ kind: 'idle' });
 	const [runs, setRuns] = useState<{ a: WorkbenchRun | null; b: WorkbenchRun | null }>({ a: null, b: null });
 	const [limitedUntil, setLimitedUntil] = useState<number | null>(null);
@@ -402,7 +416,7 @@ export function SearchPanel({ model, channels, selection, actions, prefill = nul
 				if (runId.current === id) setPhase({ kind: step, side });
 			},
 		});
-		const base = { mode: request.mode, topK: request.topK, limits: model.limits, storeNode: model.nodes.store, embedNode: model.nodes.embed, objectIds: gate.objectIds, cited: request.cited };
+		const base = { mode: request.mode, topK: request.topK, limits: model.limits, storeNode: model.nodes.store, embedNode: model.nodes.embed, objectIds: gate.objectIds, chat: request.chat };
 		setRuns({ a: null, b: null });
 		setPhase({ kind: request.mode === 'keyword' ? 'searching' : 'embedding', side: 'A' });
 		const a = await runWorkbench(deps('A'), { ...base, question: request.question });
@@ -432,11 +446,11 @@ export function SearchPanel({ model, channels, selection, actions, prefill = nul
 		const semantic = options.find((o) => o.mode === 'semantic')?.enabled ? 'semantic' : mode;
 		const k = topKFor(ks, prefill.cited.length);
 		setQuestion(prefill.question);
-		setCited(prefill.cited);
+		setChat(prefill);
 		setComparing(false);
 		setMode(semantic);
 		setTopK(k);
-		if (semantic !== null && gate.blocked === null && !limited && prefill.question.trim() !== '') void run({ question: prefill.question, questionB: null, mode: semantic, topK: k, cited: prefill.cited });
+		if (semantic !== null && gate.blocked === null && !limited && prefill.question.trim() !== '') void run({ question: prefill.question, questionB: null, mode: semantic, topK: k, chat: prefill });
 		// Runs once per prefill; the rest of the panel's state does not restart it.
 		// eslint-disable-next-line react-hooks/exhaustive-deps
 	}, [prefill]);
@@ -490,7 +504,7 @@ export function SearchPanel({ model, channels, selection, actions, prefill = nul
 				onSubmit={(event) => {
 					event.preventDefault();
 					if (blockedBy !== null || running || mode === null) return;
-					void run({ question, questionB: comparing ? questionB : null, mode, topK, cited });
+					void run({ question, questionB: comparing ? questionB : null, mode, topK, chat });
 				}}
 			>
 				<div style={S.row}>
@@ -534,7 +548,6 @@ export function SearchPanel({ model, channels, selection, actions, prefill = nul
 			</form>
 			{gate.line !== null && <p style={S.note}>{gate.line}</p>}
 			{gate.blocked !== null && <p style={S.note}>{gate.blocked}</p>}
-			{cited.length > 0 && <p style={S.note}>{`From the chat: the ${cited.length === 1 ? 'chunk' : `${cited.length} chunks`} its answer cited ${cited.length === 1 ? 'is' : 'are'} marked “cited”.`}</p>}
 			{limited && (
 				<p style={S.note} role="timer">
 					{rateLimitSentence(secondsLeft(limitedUntil as number, now))}
@@ -552,6 +565,7 @@ export function SearchPanel({ model, channels, selection, actions, prefill = nul
 					score={score}
 					range={range}
 					{...handlers}
+					scopeOn={gate.objectIds !== null}
 					onMap={(row) => showSearchOnMap(selection, actions, (runs.a as WorkbenchRun).question, [row.key])}
 					onShowAll={() =>
 						showSearchOnMap(
@@ -570,6 +584,7 @@ export function SearchPanel({ model, channels, selection, actions, prefill = nul
 						a={{ run: runs.a, view: viewA }}
 						b={{ run: runs.b, view: viewB }}
 						score={score}
+						scopeOn={gate.objectIds !== null}
 						onOpen={handlers.onOpen}
 						onShowBoth={() =>
 							showCompareOnMap(

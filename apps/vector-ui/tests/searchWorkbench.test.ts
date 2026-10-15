@@ -43,8 +43,8 @@ import { EXPORT_COLUMNS } from '../src/contract/types';
 import type { CallOutcome } from '../src/chat/toolCalls';
 import { classifyRetrieval } from '../src/vector/retrieval';
 import { QUERY_NEEDS_EMBED } from '../src/map/wording';
-import { HYBRID_LABEL, HYBRID_NEEDS_KEYWORD, KEYWORD_UNSUPPORTED, NODE_SETTING_NOTE, RRF_K, SEARCH_MODES, STATUS_WORDS, TOP_K_OPTIONS, VECTOR_UNSUPPORTED, classifyAt, defaultMode, fuse, initialThreshold, keywordCaption, keywordSearchInput, modeOptions, nodeSettingText, plan, previewOf, rateLimitSentence, retrievalExportRows, retryAfterSeconds, rowsFromSearch, runWorkbench, scoreTitle, searchExportItems, searchScope, secondsLeft, semanticSearchInput, showSearchOnMap, sliderRange, sliderValueText, thresholdSentence, topKOptions, workbenchExportRows } from '../src/vector/searchWorkbench';
-import type { WorkbenchDeps, WorkbenchRow } from '../src/vector/searchWorkbench';
+import { HYBRID_LABEL, HYBRID_NEEDS_KEYWORD, KEYWORD_UNSUPPORTED, NODE_SETTING_NOTE, RRF_K, SEARCH_MODES, STATUS_WORDS, TOP_K_OPTIONS, VECTOR_UNSUPPORTED, classifyAt, defaultMode, fromChatLine, fuse, initialThreshold, keywordCaption, keywordSearchInput, modeOptions, nodeSettingText, plan, previewOf, rateLimitSentence, retrievalExportRows, retryAfterSeconds, rowsFromSearch, runWorkbench, scoreTitle, searchExportItems, searchScope, secondsLeft, semanticSearchInput, showSearchOnMap, sliderRange, sliderValueText, thresholdSentence, topKOptions, workbenchExportRows } from '../src/vector/searchWorkbench';
+import type { ChatPrefill, RunFromChat, SearchMode, WorkbenchDeps, WorkbenchRow, WorkbenchRun } from '../src/vector/searchWorkbench';
 
 // ── Fixtures ────────────────────────────────────────────────────────────────
 
@@ -430,7 +430,7 @@ test('fuse: reciprocal rank fusion (k = 60) — a chunk in both lists rises; tie
 
 // ── A run ───────────────────────────────────────────────────────────────────
 
-const base = { topK: 10, limits, storeNode: 'store_1', embedNode: 'embed_1', objectIds: null, cited: [] as VectorKey[] };
+const base = { topK: 10, limits, storeNode: 'store_1', embedNode: 'embed_1', objectIds: null, chat: null };
 
 test('runWorkbench semantic: embed on the embedding node, then search the store with exactly that vector; the run keeps no vector', async () => {
 	const { deps, calls, phases } = fakeCalls({ embed: [embedOk as unknown as Record<string, unknown>], search: [searchVector as unknown as Record<string, unknown>] });
@@ -552,6 +552,103 @@ test('rate limit: the countdown sentence and the seconds left', () => {
 	assert.equal(rateLimitSentence(1), 'Too many searches were embedded in the last minute. Run again in 1 s.');
 });
 
+// ── From the chat ("Open in Search") ────────────────────────────────────────
+
+const FALCON = 'Where does Falcon Station get its water?';
+const CITED: VectorKey = ['ef35cb9c-f98f-e472-d795-298a40a5cb2b', 67];
+const BROUGHT: ChatPrefill = { question: FALCON, cited: [CITED] };
+
+/**
+ * A finished run over search_vector.json (the cited chunk is on it).
+ *
+ * @param question - The question.
+ * @param mode - The mode.
+ * @param chat - What "Open in Search" brought, or null.
+ * @param objectIds - The run's scope, or null.
+ * @returns The run.
+ */
+async function runOf(question: string, mode: SearchMode, chat: ChatPrefill | null, objectIds: string[] | null = null): Promise<WorkbenchRun> {
+	const { deps } = fakeCalls({ embed: [embedOk as unknown as Record<string, unknown>], search: [searchVector as unknown as Record<string, unknown>, keywordFallback as unknown as Record<string, unknown>] });
+	const outcome = await runWorkbench(deps, { ...base, question, mode, chat, objectIds });
+	assert.ok(outcome.ok);
+	return outcome.run;
+}
+
+/**
+ * The keys a run marks as cited.
+ *
+ * @param run - The run.
+ * @returns "objectId#chunkId" per cited row.
+ */
+function citedKeys(run: WorkbenchRun): string[] {
+	return run.rows.filter((row) => row.cited).map((row) => `${row.objectId}#${row.chunkId}`);
+}
+
+test('runWorkbench: the chat\'s cited chunks are marked only on a run of the question "Open in Search" brought', async () => {
+	const same = await runOf(`  ${FALCON} `, 'semantic', BROUGHT);
+	assert.deepEqual(citedKeys(same), [`${CITED[0]}#${CITED[1]}`]);
+	assert.deepEqual(same.fromChat, { cited: 1, askedAbout: null, sameScope: true });
+	// Another question on the same panel: the chunk is listed, but no answer to this question cited it.
+	const other = await runOf('greenhouse orchid pressure', 'semantic', BROUGHT);
+	assert.ok(
+		other.rows.some((row) => row.objectId === CITED[0] && row.chunkId === CITED[1]),
+		'the chunk is in the results'
+	);
+	assert.deepEqual(citedKeys(other), []);
+	assert.equal(other.fromChat, null);
+	assert.equal(fromChatLine(other, false), null);
+	assert.ok(
+		workbenchExportRows(classifyAt(other.rows, 0.3, dialect.score)).rows.every((row) => row.cited === false),
+		'nor in the export'
+	);
+	const keyword = await runOf('falcon', 'keyword', BROUGHT);
+	assert.deepEqual(citedKeys(keyword), []);
+	assert.equal(keyword.fromChat, null);
+	// The brought question in another mode: the answer did cite that chunk.
+	assert.deepEqual(citedKeys(await runOf(FALCON, 'keyword', BROUGHT)), [`${CITED[0]}#${CITED[1]}`]);
+	assert.deepEqual(citedKeys(await runOf(FALCON, 'hybrid', BROUGHT)), [`${CITED[0]}#${CITED[1]}`]);
+	// Nothing brought: nothing marked.
+	const none = await runOf(FALCON, 'semantic', null);
+	assert.deepEqual(citedKeys(none), []);
+	assert.equal(none.fromChat, null);
+});
+
+test('runWorkbench: whether a run searched the documents the answer did (the whole collection both, or the same ids in any order)', async () => {
+	const askedAbout: ChatPrefill = { ...BROUGHT, objectIds: ['d2', 'd1'] };
+	assert.deepEqual((await runOf(FALCON, 'semantic', askedAbout, ['d1', 'd2'])).fromChat, { cited: 1, askedAbout: 2, sameScope: true });
+	assert.deepEqual((await runOf(FALCON, 'semantic', askedAbout, null)).fromChat, { cited: 1, askedAbout: 2, sameScope: false });
+	assert.deepEqual((await runOf(FALCON, 'semantic', askedAbout, ['d1'])).fromChat, { cited: 1, askedAbout: 2, sameScope: false });
+	assert.deepEqual((await runOf(FALCON, 'semantic', BROUGHT, ['d1'])).fromChat, { cited: 1, askedAbout: null, sameScope: false });
+	assert.deepEqual((await runOf(FALCON, 'semantic', { ...BROUGHT, objectIds: [] }, null)).fromChat, { cited: 1, askedAbout: null, sameScope: true }, 'an empty scope is the whole collection, as the chat sends it');
+});
+
+test('fromChatLine: how many of the cited chunks the run lists, and whether it searched what the answer did', () => {
+	/**
+	 * The line for a run that lists `listed` of the answer's `cited` chunks.
+	 *
+	 * @param cited - Chunks the answer cited.
+	 * @param listed - How many of them the run lists.
+	 * @param scope - askedAbout, sameScope and the run's own scope.
+	 * @param scopeOn - Run searches within the console's scope.
+	 * @returns The line.
+	 */
+	const lineOf = (cited: number, listed: number, scope: Partial<RunFromChat> & { scoped?: number | null } = {}, scopeOn = false): string | null => fromChatLine({ rows: [...Array.from({ length: listed }, () => ({ cited: true })), { cited: false }], fromChat: { cited, askedAbout: scope.askedAbout ?? null, sameScope: scope.sameScope ?? true }, scoped: scope.scoped ?? null }, scopeOn);
+	assert.equal(fromChatLine({ rows: [{ cited: false }], fromChat: null, scoped: null }, true), null);
+	assert.equal(lineOf(3, 3), 'From the chat: the 3 chunks its answer cited are marked “cited”.');
+	assert.equal(lineOf(1, 1), 'From the chat: the chunk its answer cited is marked “cited”.');
+	assert.equal(lineOf(3, 2), 'From the chat: 2 of the 3 chunks its answer cited are in these results, marked “cited”.');
+	assert.equal(lineOf(3, 1), 'From the chat: 1 of the 3 chunks its answer cited is in these results, marked “cited”.');
+	assert.equal(lineOf(3, 0), 'From the chat: none of the 3 chunks its answer cited is in these results.');
+	assert.equal(lineOf(1, 0), 'From the chat: the chunk its answer cited is not in these results.');
+	assert.equal(lineOf(0, 0), 'From the chat: its answer cited no chunks.');
+	assert.equal(lineOf(3, 3, { askedAbout: 1, scoped: 1 }), 'From the chat: the 3 chunks its answer cited are marked “cited”. Searched only the document the question was asked about, as the answer did.');
+	assert.equal(lineOf(3, 3, { askedAbout: 2, scoped: 2 }), 'From the chat: the 3 chunks its answer cited are marked “cited”. Searched only the 2 documents the question was asked about, as the answer did.');
+	assert.equal(lineOf(3, 3, {}, true), 'From the chat: the 3 chunks its answer cited are marked “cited”. Searched the whole collection, as the answer did; Run searches within the scope.');
+	assert.equal(lineOf(3, 0, { sameScope: false, scoped: 2 }, true), 'From the chat: none of the 3 chunks its answer cited is in these results. Searched within the scope; the answer was not.');
+	assert.equal(lineOf(3, 3, { askedAbout: 1, sameScope: false, scoped: null }), 'From the chat: the 3 chunks its answer cited are marked “cited”. The question was asked about 1 document only; this search covered the whole collection.');
+	assert.equal(lineOf(3, 3, { askedAbout: 4, sameScope: false, scoped: 2 }, true), 'From the chat: the 3 chunks its answer cited are marked “cited”. The question was asked about 4 documents only; this search used the scope instead.');
+});
+
 // ── Export and the map ──────────────────────────────────────────────────────
 
 test('workbenchExportRows: the search columns, the words on screen, no vector', () => {
@@ -649,6 +746,13 @@ test('wiring: the workbench is pure, the panel calls embed and search through ch
 	const phase = /type Phase = [^;]*;/.exec(panel)?.[0] ?? '';
 	assert.ok(phase !== '', 'the panel declares its Phase');
 	assert.doesNotMatch(phase, /vector|number\[\]/);
+});
+
+test("wiring: the panel hands each run the chat's prefill, never cited keys apart from their question", () => {
+	const panel = code(path.join('components', 'SearchPanel.tsx'));
+	assert.doesNotMatch(panel, /setCited|useState<readonly VectorKey\[\]>/, 'no cited keys kept apart from their question');
+	assert.match(panel, /chat: request\.chat/);
+	assert.match(panel, /void run\(\{ question, questionB: comparing \? questionB : null, mode, topK, chat \}\)/);
 });
 
 test('wiring: the search files insert no HTML, stop no propagation, listen for no keys, log nothing and hold no token', () => {
