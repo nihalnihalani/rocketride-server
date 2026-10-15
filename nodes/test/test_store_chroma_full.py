@@ -363,14 +363,21 @@ def test_documents_filter_on_the_first_chunk_is_applied_by_the_store(collection)
     assert all(not r.has_first_chunk and r.chunks == expect.documents[r.objectId] for r in orphans)
     assert all(p.filter_ignored == () for p in pages)
     assert {p.total for p in pages} == {len(expect.orphans)}
-    whole, pages = _filtered(store, DocListFilter(has_first_chunk=True), limit=3)
-    assert {r.objectId for r in whole} == set(expect.documents) - expect.orphans
-    assert len(whole) == len(set(expect.documents) - expect.orphans)
-    assert all(r.has_first_chunk and r.chunks == expect.documents[r.objectId] for r in whole)
-    assert all(p.filter_ignored == () and p.total in (None, len(whole)) for p in pages)
+    with_first = set(expect.documents) - expect.orphans
+    # Page sizes that end the chunk-0 records mid-page, exactly on a page boundary, and in one page.
+    for limit in (2, 3, len(with_first), 50):
+        whole, pages = _filtered(store, DocListFilter(has_first_chunk=True), limit=limit)
+        assert {r.objectId for r in whole} == with_first and len(whole) == len(with_first), limit
+        assert all(r.has_first_chunk and r.chunks == expect.documents[r.objectId] for r in whole)
+        assert all(p.filter_ignored == () for p in pages)
+        # The listing's last page says how many documents matched; earlier pages may not know yet.
+        assert pages[-1].total == len(whole), (limit, [p.total for p in pages])
+        assert all(p.total in (None, len(whole)) for p in pages), limit
     for deleted in ('deleted', 'all'):
         every = {r.objectId for r in contract.list_all(store, limit=50, deleted=deleted)[0]}
-        with_first = {r.objectId for r in _filtered(store, DocListFilter(has_first_chunk=True), deleted=deleted)[0]}
+        listed, pages = _filtered(store, DocListFilter(has_first_chunk=True), deleted=deleted)
+        assert pages[-1].total == len(listed), (deleted, [p.total for p in pages])
+        with_first = {r.objectId for r in listed}
         without = {r.objectId for r in _filtered(store, DocListFilter(has_first_chunk=False), deleted=deleted)[0]}
         assert with_first | without == every and not with_first & without, deleted
 
@@ -425,6 +432,9 @@ def test_documents_tool_answers_partial_and_none_on_chroma(new_store):
     answer = node(store, logical_type='chroma').documents({'filter': {'has_first_chunk': True}})
     assert (answer['filter_applied'], answer['filter_ignored']) == ('server', [])
     assert expect.orphans.isdisjoint(item['objectId'] for item in answer['items'])
+    # A 'server' answer carries the count the app shows ("N documents match").
+    assert answer['next_cursor'] is None
+    assert answer['total'] == len(answer['items']) == len(set(expect.documents) - expect.orphans)
 
 
 # --- repairs and writes (collections this suite owns) -------------------------------------

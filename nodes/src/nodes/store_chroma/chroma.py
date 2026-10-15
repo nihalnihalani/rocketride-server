@@ -1248,8 +1248,8 @@ class Store(DocumentStoreBase):
 
         ``filter`` (contract section 4.4-A): ``has_first_chunk`` is applied by
         reading only the phase that holds the answer (true: the chunk-0 records,
-        and no sweep; false: the sweep alone, whose ``total`` then counts the
-        documents without chunk 0). Chroma's metadata filters compare numbers
+        and no sweep, the last page's ``total`` counting them; false: the sweep
+        alone, whose ``total`` then counts the documents without chunk 0). Chroma's metadata filters compare numbers
         only and cannot aggregate, so every other key is named in
         ``filter_ignored`` and left to the app. A cursor remembers the
         ``has_first_chunk`` it was issued under and is refused with another.
@@ -1326,8 +1326,11 @@ class Store(DocumentStoreBase):
             if more:
                 return page_of(items, {'ph': 'c', 'o': offset + limit}, None)
             if first is True:
-                # Only documents with a first chunk: the listing ends with the chunk-0 records.
-                return page_of(items, None, None)
+                # Only documents with a first chunk: the listing ends with the chunk-0 records, and
+                # its last page knows how many there were: the records paged past plus this page's.
+                # One chunk-0 record per document (the ids are objectId#chunkId), as distinct=True
+                # already relies on, so that is the number of documents listed.
+                return page_of(items, None, offset + len(rows))
             state = {'ph': 'o', 'i': 0}
 
         # The chunk-0 records are exhausted: fill the page with documents that have no chunk 0.
