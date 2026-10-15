@@ -21,39 +21,95 @@
 // SOFTWARE.
 
 // =============================================================================
-// VECTOR-UI — SourcesPanel (placeholder)
+// VECTOR-UI — SourcesPanel (the chunks an answer cites)
 // =============================================================================
 //
-// Placeholder until the real component lands: it exports the frozen props
-// (src/contract/types.ts) and renders a framed "Not built yet" notice, so the
-// files that render it compile and run today. Keep the export names and the
-// props type when replacing it.
+// One row per cited chunk, in the order the store ranked them: rank, path,
+// chunk number, the driver's score (its formula on hover), the chunk text
+// behind a disclosure, and two ways back into the console — "open" (the
+// document tab at that chunk) and "map" (the chunk highlighted on the map).
+// Chunk text is a React child, never markup.
 // =============================================================================
 
 import React from 'react';
-import { EmptyState } from 'shell';
-import type { SourcesPanelProps } from '../contract/types';
+import type { CSSProperties } from 'react';
+import { commonStyles } from 'shell';
+import type { IChatSource, SourcesPanelProps } from '../contract/types';
 
 export type { SourcesPanelProps };
 
-/** Dashed frame that marks the placeholder on screen. */
-const FRAME: React.CSSProperties = {
-	border: '1px dashed var(--rr-border-input)',
-	borderRadius: 6,
-	padding: 12,
+/** Characters of chunk text shown before the disclosure is opened. */
+const PREVIEW_CHARS = 140;
+
+const S = {
+	list: { listStyle: 'none', margin: '4px 0 0', padding: 0, display: 'flex', flexDirection: 'column', gap: 4 } as CSSProperties,
+	row: { display: 'grid', gridTemplateColumns: '22px minmax(0, 1fr) auto', columnGap: 6, alignItems: 'start', fontSize: 12, padding: '4px 0', borderTop: '1px solid var(--rr-border)' } as CSSProperties,
+	rank: { color: 'var(--rr-text-secondary)', textAlign: 'right' } as CSSProperties,
+	path: { color: 'var(--rr-text-primary)', overflowWrap: 'anywhere' } as CSSProperties,
+	meta: { color: 'var(--rr-text-secondary)', marginLeft: 6, whiteSpace: 'nowrap' } as CSSProperties,
+	actions: { display: 'flex', gap: 4 } as CSSProperties,
+	button: { ...commonStyles.buttonSecondary, padding: '1px 8px', fontSize: 11 } as CSSProperties,
+	details: { gridColumn: '2 / span 2', color: 'var(--rr-text-secondary)', whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' } as CSSProperties,
+	summary: { cursor: 'pointer' } as CSSProperties,
 };
 
 /**
- * Placeholder for the cited sources of a chat answer.
+ * The score as shown, with what it means on hover.
  *
- * @param _props - The frozen props (unused until the component is built).
- * @returns A framed "Not built yet" notice.
+ * @param source - The cited chunk.
+ * @param score - dialect.score, or null.
+ * @returns Text and tooltip.
  */
-export function SourcesPanel(_props: SourcesPanelProps): React.ReactElement {
+export function scoreText(source: IChatSource, score: SourcesPanelProps['score']): { text: string; title: string } {
+	if (source.score === null) return { text: 'no score', title: 'The pipeline did not return a score for this chunk.' };
+	const formula = score?.formula && score.formula !== 'unknown' ? ` (${score.formula}${score.higher_is_better === false ? ', lower is better' : ''})` : '';
+	return { text: source.score.toFixed(2), title: `Score ${source.score}${formula}` };
+}
+
+/**
+ * The cited chunks of an answer.
+ *
+ * @param props - The frozen props.
+ * @returns The list, or a sentence when there is none.
+ */
+export function SourcesPanel({ sources, score, onOpen, onShowOnMap }: SourcesPanelProps): React.ReactElement {
+	if (sources.length === 0) {
+		return <p style={{ fontSize: 12, color: 'var(--rr-text-secondary)', margin: '4px 0 0' }}>The answer cited no stored chunks.</p>;
+	}
 	return (
-		<div style={FRAME} data-placeholder="SourcesPanel">
-			<EmptyState title="Not built yet" description="The sources cited by an answer will appear here." />
-		</div>
+		<ol style={S.list} aria-label="Sources of this answer">
+			{sources.map((source) => {
+				const shown = scoreText(source, score);
+				const path = source.path !== '' ? source.path : source.objectId;
+				const preview = source.text.length > PREVIEW_CHARS ? `${source.text.slice(0, PREVIEW_CHARS)}…` : source.text;
+				return (
+					<li key={`${source.objectId}#${source.chunkId}`} style={S.row}>
+						<span style={S.rank}>{source.rank}</span>
+						<span style={S.path}>
+							{path}
+							<span style={S.meta}>{`#${source.chunkId}`}</span>
+							<span style={S.meta} title={shown.title}>
+								{shown.text}
+							</span>
+						</span>
+						<span style={S.actions}>
+							<button type="button" style={S.button} aria-label={`Open ${path} at chunk ${source.chunkId}`} onClick={() => onOpen(source)}>
+								open
+							</button>
+							<button type="button" style={S.button} aria-label={`Show chunk ${source.chunkId} of ${path} on the map`} onClick={() => onShowOnMap([source.key])}>
+								map
+							</button>
+						</span>
+						{source.text !== '' && (
+							<details style={S.details}>
+								<summary style={S.summary}>{preview}</summary>
+								{source.text}
+							</details>
+						)}
+					</li>
+				);
+			})}
+		</ol>
 	);
 }
 

@@ -1,0 +1,122 @@
+// =============================================================================
+// MIT License
+// Copyright (c) 2026 Aparavi Software AG
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+
+// =============================================================================
+// VECTOR-UI — useIngest (the console's drop zone and upload list)
+// =============================================================================
+//
+// Wires the connection's upload queue (ingestQueue.ts, kept per connection in
+// src/chat/registry.ts) to the console:
+//
+//   - uploads go through the shared library's ingest role channel (which
+//     holds the token);
+//   - the collision probe and the chunk count call the store node through
+//     the Tools source (src/chat/toolCalls.ts);
+//   - upload progress arrives as `apaevt_status_upload` events on the shell's
+//     event stream, which every app shares; the queue applies an event only
+//     to the one file of that base name it has in flight;
+//   - finished uploads tell the console to refresh its stats and directory.
+// =============================================================================
+
+import { useCallback, useSyncExternalStore } from 'react';
+import { useShellEvent } from 'shell';
+import { ExplorerToolError } from 'shared/explorer';
+import type { IUploadEvent, IngestPanelProps } from '../contract/types';
+import { callTool, toolChannelFor } from '../chat/toolCalls';
+import { ingestQueueFor } from '../chat/registry';
+import type { IngestDeps, IngestState } from './ingestQueue';
+import { entriesFromDataTransfer, filesFromInput, traverseEntries } from './dropTraversal';
+import type { DataTransferLike } from './dropTraversal';
+
+/** How long the probe and the count may take. */
+const TOOL_TIMEOUT_MS = 30_000;
+
+/** What the ingest panel gets from the hook. */
+export interface VectorIngest {
+	state: IngestState;
+	/** A drop on the zone: call inside the drop handler (the entries are taken synchronously). */
+	addFromDrop(transfer: DataTransferLike, prefix: string): void;
+	/** Files chosen with "Add files" or "Add folder". */
+	addFromInput(files: ArrayLike<File>, prefix: string): void;
+	answerConfirm(replace: boolean): void;
+	clearFinished(): void;
+}
+
+/**
+ * Whether a value is a plain object.
+ *
+ * @param value - Anything.
+ * @returns True for non-null, non-array objects.
+ */
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+/**
+ * The connection's uploads.
+ *
+ * @param props - The ingest panel's props.
+ * @returns State and actions.
+ */
+export function useIngest(props: Pick<IngestPanelProps, 'model' | 'channels' | 'actions'>): VectorIngest {
+	const { model, channels, actions } = props;
+	const tools = toolChannelFor(model, channels);
+	const store = model.nodes.store;
+	const deps: IngestDeps = {
+		canProbe: tools !== null && model.capabilities.chunks !== false,
+		canCount: tools !== null && model.capabilities.documents !== false,
+		callTool: (tool, input) => callTool(tools, tool, input, store, { timeoutMs: TOOL_TIMEOUT_MS }),
+		sendFiles: (files, options) => {
+			const ingest = channels.ingest;
+			if (ingest === null) return Promise.reject(new ExplorerToolError({ kind: 'unavailable', tool: 'sendFiles', message: 'This pipeline has no running Ingest source.' }));
+			return ingest.sendFiles(files, options);
+		},
+		onDocumentsChanged: (objectIds) => actions.documentsChanged(objectIds),
+		announce: (message) => actions.announce(message),
+	};
+	const queue = ingestQueueFor(model.connectionKey, deps);
+	const state = useSyncExternalStore(queue.subscribe, queue.getState, queue.getState);
+
+	useShellEvent('shell:event', (payload) => {
+		const message = payload?.event as unknown;
+		if (!isRecord(message) || message.event !== 'apaevt_status_upload' || !isRecord(message.body)) return;
+		queue.handleEvent(message.body as unknown as IUploadEvent);
+	});
+
+	const addFromDrop = useCallback(
+		(transfer: DataTransferLike, prefix: string) => {
+			// Taken now: the browser empties the DataTransfer when the drop handler returns.
+			const snapshot = entriesFromDataTransfer(transfer);
+			void traverseEntries(snapshot.entries, snapshot.loose).then((result) => queue.addDrop(result.files, { prefix, skipped: result.skipped, errors: result.errors, truncated: result.truncated }));
+		},
+		[queue]
+	);
+	const addFromInput = useCallback(
+		(files: ArrayLike<File>, prefix: string) => {
+			const picked = filesFromInput(files);
+			void queue.addDrop(picked.files, { prefix, skipped: picked.skipped });
+		},
+		[queue]
+	);
+
+	return { state, addFromDrop, addFromInput, answerConfirm: queue.answerConfirm, clearFinished: queue.clearFinished };
+}
