@@ -290,6 +290,12 @@ def _lower_is_better(distance: str) -> bool:
     return distance in ('Euclid', 'Manhattan')
 
 
+def _strategy_of(recommend: Any) -> str:
+    """A recommendation's strategy as its string value ('average_vector' when unset)."""
+    strategy = getattr(recommend, 'strategy', None)
+    return str(getattr(strategy, 'value', strategy) or 'average_vector')
+
+
 def _is_point_id(value: Any) -> bool:
     """Whether ``value`` is a point id the server accepts: an unsigned integer or a UUID string."""
     if isinstance(value, bool):
@@ -369,7 +375,9 @@ class QdrantClient:
            object to merge into (overwriting ``meta`` wholesale is what the real
            server does too).
         6. query_points() scores by the collection's distance; a ``SampleQuery``
-           draws random points.
+           draws random points; a ``RecommendQuery`` recommends from positive and
+           negative examples (point ids or raw vectors) by ``average_vector``,
+           ``best_score`` or ``sum_scores`` and never returns an example point.
         7. facet() needs a keyword or integer index on its key (the server answers
            400 "No appropriate index for faceting" otherwise).
         8. A scroll ``offset`` must be a point id (unsigned integer or UUID);
@@ -612,11 +620,32 @@ class QdrantClient:
         """
         Score matching points against ``query`` by the collection's distance.
 
-        A ``SampleQuery`` returns ``limit`` random matching points instead.
+        A ``SampleQuery`` returns ``limit`` random matching points instead; a
+        ``RecommendQuery`` recommends from examples (see :meth:`_recommend`).
         """
         QdrantClient._count_call('query_points')
         points = self._sorted_points(collection_name, query_filter)
         limit = 10 if limit is None else int(limit)
+
+        if isinstance(query, models.RecommendQuery):
+            scored = self._recommend(collection_name, query.recommend, points)
+            if score_threshold is not None:
+                lower = (
+                    _lower_is_better(self._distance(collection_name))
+                    and _strategy_of(query.recommend) == 'average_vector'
+                )
+                scored = [ps for ps in scored if (ps[1] <= score_threshold if lower else ps[1] >= score_threshold)]
+            return QueryResult(
+                points=[
+                    ScoredPoint(
+                        id=p.id,
+                        score=s,
+                        payload=copy.deepcopy(p.payload) if with_payload else None,
+                        vector=list(p.vector) if with_vectors else None,
+                    )
+                    for p, s in scored[:limit]
+                ]
+            )
 
         if isinstance(query, models.SampleQuery):
             chosen = random.sample(points, min(limit, len(points)))
@@ -651,6 +680,105 @@ class QdrantClient:
                 for p, s in scored[:limit]
             ]
         )
+
+    def _example_vectors(self, collection_name: str, examples: Optional[List[Any]]) -> Tuple[List[List[float]], set]:
+        """The vectors of a recommendation's examples on one side, and the point ids among them.
+
+        An example is a point id (looked up whatever the query's filter says, as the
+        server does; an unknown id is a 404) or a raw vector.
+        """
+        store = self._store(collection_name)
+        vectors: List[List[float]] = []
+        ids: set = set()
+        for example in examples or []:
+            if isinstance(example, (list, tuple)):
+                vectors.append([float(v) for v in example])
+                continue
+            if example not in store:
+                raise Exception(f'Not found: No point with id {example} found')
+            vectors.append(list(store[example].vector))
+            ids.add(example)
+        return vectors, ids
+
+    def _recommend(
+        self, collection_name: str, recommend: 'models.RecommendInput', candidates: List[PointStruct]
+    ) -> List[Tuple[PointStruct, float]]:
+        """
+        Score ``candidates`` for a recommendation, best first, never returning an example point.
+
+        Mirrors a Qdrant 1.17 server (checked against one):
+
+        * ``average_vector`` (the default) searches with
+          ``avg_positive + avg_positive - avg_negative`` (``avg_positive`` without
+          negatives). On a Cosine collection the server stores unit vectors, so the
+          examples are averaged at unit length; on Dot and Euclid they are averaged
+          as given. No positive example is a 400.
+        * ``best_score`` measures each candidate against every example and keeps
+          its best positive and best negative similarity: ``sigmoid(best_positive)``
+          when that is the larger, else ``-sigmoid(best_negative)``, with
+          ``sigmoid(x) = 0.5 * (1 + x / (1 + |x|))``. Negatives alone are allowed.
+        * ``sum_scores`` adds the positive similarities and subtracts the negative ones.
+
+        For ``best_score`` and ``sum_scores`` on a distance metric (Euclid, Manhattan)
+        the similarity is the negated distance, so higher stays closer.
+        """
+        distance = self._distance(collection_name)
+        strategy = _strategy_of(recommend)
+        positives, positive_ids = self._example_vectors(collection_name, recommend.positive)
+        negatives, negative_ids = self._example_vectors(collection_name, recommend.negative)
+        examples = positive_ids | negative_ids
+        candidates = [p for p in candidates if p.id not in examples]
+
+        if strategy == 'average_vector':
+            if not positives:
+                raise Exception(
+                    'Bad request: Wrong input: Positive vectors should not be empty with `average` strategy'
+                )
+
+            def prepared(vector: List[float]) -> List[float]:
+                if distance != 'Cosine':
+                    return list(vector)
+                norm = sum(x * x for x in vector) ** 0.5
+                return [x / norm for x in vector] if norm else list(vector)
+
+            def mean(vectors: List[List[float]]) -> List[float]:
+                rows = [prepared(v) for v in vectors]
+                return [sum(column) / len(rows) for column in zip(*rows)]
+
+            avg_positive = mean(positives)
+            query = avg_positive
+            if negatives:
+                avg_negative = mean(negatives)
+                query = [p + p - n for p, n in zip(avg_positive, avg_negative)]
+            scored = [(p, _similarity(distance, query, p.vector)) for p in candidates]
+            scored.sort(key=lambda ps: ps[1], reverse=not _lower_is_better(distance))
+            return scored
+
+        if strategy not in ('best_score', 'sum_scores'):
+            raise Exception(f'Bad request: Format error in JSON body: unknown variant `{strategy}`')
+        if not positives and not negatives:
+            raise Exception('Bad request: Wrong input: No positive or negative examples given')
+
+        def sim(a: List[float], b: List[float]) -> float:
+            value = _similarity(distance, a, b)
+            return -value if _lower_is_better(distance) else value
+
+        def sigmoid(x: float) -> float:
+            return 0.5 * (1.0 + (x / (1.0 + abs(x))))
+
+        scored = []
+        for p in candidates:
+            to_positive = [sim(p.vector, v) for v in positives]
+            to_negative = [sim(p.vector, v) for v in negatives]
+            if strategy == 'sum_scores':
+                score = sum(to_positive) - sum(to_negative)
+            else:
+                best_positive = max(to_positive) if to_positive else float('-inf')
+                best_negative = max(to_negative) if to_negative else float('-inf')
+                score = sigmoid(best_positive) if best_positive > best_negative else -sigmoid(best_negative)
+            scored.append((p, float(score)))
+        scored.sort(key=lambda ps: ps[1], reverse=True)
+        return scored
 
     def search_matrix_offsets(
         self,
