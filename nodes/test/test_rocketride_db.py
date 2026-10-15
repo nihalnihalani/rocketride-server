@@ -781,35 +781,57 @@ class TestRocketrideVectorWriteCheck:
         ('origin', 'switches', 'code'),
         [('dap', {'allow_writes': False}, 'WRITES_DISABLED'), ('agent', {'agent_writes': False}, 'WRITES_AGENT')],
     )
-    def test_switches_refuse_calls_with_a_context(self, mock_rv, monkeypatch, origin, switches, code):
-        import importlib
-
-        from ai.common.tool_context import ToolCallContext
+    def test_switches_refuse_calls_with_a_context(self, mock_rv, origin, switches, code):
+        from ai.common.tool_context import ToolCallContext, tool_call
 
         glb, inst = self._node(mock_rv, {'collection': 'rr_vec', 'similarity': 'cosine', **switches})
         ctx = ToolCallContext(origin=origin, source_type='tools', targeted=True, caller={'auth': 'account'})
-        monkeypatch.setattr(
-            importlib.import_module('nodes.rocketride_vector.IInstance'), 'current_tool_call', lambda: ctx
-        )
         upsert = {
             'documents': [{'content': 'x', 'object_id': 'new', 'embedding': [0, 1, 0, 0, 0], 'embedding_model': 'm'}]
         }
-        assert inst.delete({'object_ids': ['doc']})['code'] == code
-        assert inst.upsert(upsert)['code'] == code
+        with tool_call(ctx):
+            assert inst.delete({'object_ids': ['doc']})['code'] == code
+            assert inst.upsert(upsert)['code'] == code
         assert self._rows(mock_rv) == ['doc', 'schema']
         glb.endGlobal()
 
-    def test_agent_call_with_default_switches_reaches_the_store(self, mock_rv, monkeypatch):
-        import importlib
-
-        from ai.common.tool_context import ToolCallContext
+    def test_agent_call_with_default_switches_reaches_the_store(self, mock_rv):
+        """The node's own check and the store write gate both read the bound context and let it through."""
+        from ai.common.tool_context import ToolCallContext, tool_call
 
         glb, inst = self._node(mock_rv, {'collection': 'rr_vec', 'similarity': 'cosine'})
         ctx = ToolCallContext(origin='agent', source_type=None, targeted=True, caller={'auth': 'agent'})
-        monkeypatch.setattr(
-            importlib.import_module('nodes.rocketride_vector.IInstance'), 'current_tool_call', lambda: ctx
+        with tool_call(ctx):
+            assert inst.delete({'object_ids': ['doc']})['success'] is True
+        assert self._rows(mock_rv) == ['schema']
+        glb.endGlobal()
+
+    def test_dap_call_with_default_switches_is_refused_and_keeps_the_rows(self, mock_rv):
+        """A console (DAP) delete with the shipped switches answers WRITES_DISABLED and removes nothing."""
+        from ai.common.tool_context import ToolCallContext, tool_call
+
+        glb, inst = self._node(mock_rv, {'collection': 'rr_vec', 'similarity': 'cosine'})
+        ctx = ToolCallContext(
+            origin='dap', source_type='tools', targeted=True, caller={'auth': 'account', 'userId': 'u-1'}
         )
-        assert inst.delete({'object_ids': ['doc']})['success'] is True
+        with tool_call(ctx):
+            answer = inst.delete({'object_ids': ['doc']})
+        assert answer['success'] is False and answer['code'] == 'WRITES_DISABLED'
+        assert self._rows(mock_rv) == ['doc', 'schema']
+        glb.endGlobal()
+
+    def test_dap_call_with_allow_writes_on_passes_both_checks(self, mock_rv):
+        """With rrvector.allow_writes on, the store gate (read from the node config) agrees with the node's check."""
+        from ai.common.tool_context import ToolCallContext, tool_call
+
+        glb, inst = self._node(mock_rv, {'collection': 'rr_vec', 'similarity': 'cosine', 'allow_writes': True})
+        assert glb.allow_writes is True
+        ctx = ToolCallContext(
+            origin='dap', source_type='tools', targeted=True, caller={'auth': 'account', 'userId': 'u-1'}
+        )
+        with tool_call(ctx):
+            answer = inst.delete({'object_ids': ['doc']})
+        assert answer['success'] is True, answer
         assert self._rows(mock_rv) == ['schema']
         glb.endGlobal()
 
