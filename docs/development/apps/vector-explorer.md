@@ -25,6 +25,8 @@ drivers behind them.
 | Discovery, roles, role channels, tool sessions | `apps/shared/src/explorer/` |
 | Optional driver hooks and their defaults | `packages/ai/src/ai/common/store/document_store.py` (`DocumentStoreBase`) |
 | The store tools | `packages/ai/src/ai/common/store/vx_tools.py`, mixed into `VectorStoreToolMixin` |
+| The additive tools (`recommend`, `similarity_matrix`) | `packages/ai/src/ai/common/store/vx_tools_ext.py` (`VectorExplorerExtTools`, mixed in beside `VectorExplorerTools`) |
+| A sample's clusters and their labels | `packages/ai/src/ai/common/store/vx_cluster.py` (union-find over the mutual kNN edges, TF-IDF labels) |
 | Write gate | `packages/ai/src/ai/common/store/vx_write_gate.py` |
 | Similarity, PCA, kNN, density, duplicates, sampling helpers | `packages/ai/src/ai/common/store/vx_math.py` |
 | Per-instance sample cache | `packages/ai/src/ai/common/store/vx_sample_cache.py` |
@@ -100,8 +102,8 @@ and disables text queries on the map, with the reason, when nothing reaches it.
 | --- | --- |
 | `adapters/` | The one seam to the shared library and the shell: provider list, tool names, the endpoint store with its roles and node filter, history, the announcer, the per-connection request channel for `neighbors` |
 | `contract/` | The wire types and the selection bridge, changed only together with the contract (see [Changing the contract](#changing-the-contract)) |
-| `vector/` | Pure modules tested under `node:test`: addresses, connections, stats, the document tree and its background pager, pure-JS SHA-1 and the uuid5 objectId, file types, upload batching, chat results, retrieval, safe markdown, wording, colours, support levels, identity changes, budgets, panel ratios |
-| `map/` | Renderer (WebGL points with a Canvas2D fallback), camera, picking, lasso, the layouts and their worker, the layout-quality metric, query projection |
+| `vector/` | Pure modules tested under `node:test`: addresses, connections, stats, the document tree and its background pager, pure-JS SHA-1 and the uuid5 objectId, file types, upload batching, chat results, retrieval, safe markdown, wording, colours, support levels, identity changes, budgets, panel ratios; the scope and saved filters (`filters.ts`, `savedFilters.ts`), the collection charts (`charts.ts`, `chartTokens.ts`), document health (`health.ts`), the search workbench and its comparison (`searchWorkbench.ts`, `compare.ts`), exports (`export.ts`), saved views (`savedViews.ts`) and query-word highlighting (`highlight.ts`) |
+| `map/` | Renderer (WebGL points with a Canvas2D fallback, both with `snapshot` for the PNG export), camera, picking, lasso, the layouts and their worker, the layout-quality metric, query projection; clusters folded in the browser (`clusters.ts`), similarity edges and the spanning tree (`graph.ts`), isolation (`isolate.ts`), the duplicates queue (`dedupe.ts`), outlier review (`outliers.ts`), recommend examples (`recommend.ts`), matrix ordering (`matrixOrder.ts`), the PNG composite (`exportPng.ts`) |
 | `chat/`, `ingest/` | The chat and upload hooks and the folder-drop traversal |
 | `views/`, `components/` | Connections, the console (the default view), the map and the document tab, and their parts |
 
@@ -124,6 +126,17 @@ Rules the tests pin:
 - **Same-name uploads.** The upload queue sends files whose base name repeats
   within one drop one at a time, because upload progress events are keyed by
   file name.
+- **No browser storage.** Nothing under `src/` touches `localStorage`,
+  `sessionStorage` or IndexedDB. Saved filters, saved views, the reviewed
+  documents and the recommend examples are per-connection maps registered with
+  the connection caches and cleared with them.
+- **A derived view never re-samples.** Minimum cluster size, the duplicates
+  threshold, the outlier share, edges and isolation are computed from the
+  sample the browser holds (`sample.knn`, `sample.density`,
+  `sample.duplicates`, `clusters.labels`); `sample` is called again only for
+  another size, mode, seed, scope, or an expired sample.
+- **Exports carry no vector.** `vector/export.ts` imports nothing that calls a
+  tool; its rows are words and numbers, snippets at most `snippet_chars`.
 
 Builder tasks (see the [builder reference](../builder/reference.md)):
 
@@ -217,8 +230,12 @@ runs `check_write` (§6.3).
 | Live `store_postgres`, Qdrant and Chroma drivers on new and legacy collections | `nodes/test/test_store_postgres_full.py`, `test_store_qdrant_full.py`, `test_store_chroma_full.py` | `./builder nodes:test-db`, or by name |
 | Every tool through a real engine and the shipped templates | `nodes/test/test_vector_toolpath_full.py` (needs `dist/server`) | `./builder nodes:test-db`, or by name |
 | Wire fixtures still match the drivers | `nodes/test/test_vector_wire_fixtures_full.py` | `./builder nodes:test-db`, or by name |
+| Clusters and their labels, the sampler's listing, the table flag | `nodes/test/test_vector_clusters.py`, `test_vector_sample_ext.py` | `./builder nodes:test` |
+| `recommend` and `similarity_matrix` (Qdrant's native best score through the Qdrant fake) | `nodes/test/test_vector_recommend.py`, `test_vector_similarity_matrix.py`, `store_qdrant/test_vx_recommend.py` | `./builder nodes:test` |
+| The documents filter and its `filter_applied` | `nodes/test/test_vector_documents_filter.py` | `./builder nodes:test` |
 | The app | `apps/vector-ui/tests/*.test.ts` | `./builder vector-ui:test` |
-| Browser lanes | `scripts/acceptance/vector-explorer/` | `./builder vector-ui:e2e-live`, manual |
+| Browser lanes | `scripts/acceptance/vector-explorer/browser/` (`lane_vector.cjs` console, `lane_vector_map.cjs` map, `lane_vector_enrich.cjs` the enrichment, `lane_vector_perf.cjs` frame times) | `./builder vector-ui:e2e-live`, manual |
+| The lanes' own self-tests (no browser or engine: every step must fail on a stand-in page) | `scripts/acceptance/vector-explorer/selftest/` | `node --test scripts/acceptance/vector-explorer/selftest/*.test.cjs`, `python3 -m unittest discover -s scripts/acceptance/vector-explorer/selftest -p 'test_*.py'` |
 
 `./builder nodes:test-db` runs the suites listed in `DB_LIVE_SUITES` in
 `nodes/scripts/tasks.js`, which holds all six vector live suites; CI runs them
@@ -251,12 +268,60 @@ passed at least one pooled case (`DB_PGVECTOR_POOLER_SUITES`). The
 servers, their pinned images and the local ports are in the acceptance
 [README](../../../scripts/acceptance/vector-explorer/README.md).
 
+`test_vector_toolpath_full.py` also calls the additive surface of the contract
+(§4.4): the documents filter (server on pgvector, partial on the legacy table
+for ingest dates, through the pooler too), the listing's health fields, the
+dialect's `size_bytes` and `keyword_match`, keyword search for the corpus's
+one token (`KX4471` in `ops/memo_q3.txt`), the `objectIds` cap, `sample`
+clusters and listing, `recommend` and `similarity_matrix`. Each of these runs
+once the code that answers it is on the branch, judged from the branch's own
+source, and is skipped with a `NEEDS:` reason until then; a tool missing from a
+running engine fails.
+
+### The enrichment lane
+
+`lane_vector_enrich.cjs` drives the enrichment in the served shell, one of the
+four supported backends per run (`node lane_vector_enrich.cjs <url> <out-dir>
+<backend>`; vector-ui:e2e-live's form `<url> <out-dir> chrome [backends]` runs
+it once per backend). Each step records PASS only on an explicit `true` from a
+verdict that is a pure function of the page's WebSocket frames and the store's
+own answers (read through the TypeScript client, never through the page);
+the self-test runs every verdict on a sound and on each broken answer, and the
+whole lane on two stand-in pages, where every step must fail. It needs, besides
+the demo corpus:
+
+```bash
+cd dist/server
+./engine ../../scripts/acceptance/vector-explorer/demo/gen_corpus.py --seed-pad 600   # scope cards (Qdrant, Chroma): 600 one-chunk documents in vx_scope_docs
+./engine ../../scripts/acceptance/vector-explorer/demo/gen_corpus.py --legacy-card    # the legacy pgvector card over vx_legacy_docs (after seed_legacy.sh)
+```
+
+The lane removes demo documents (the duplicates queue, an outlier) and uploads
+three files of its own, then uploads the removed documents again under their own
+names and removes its own, so the corpus is as it was.
+
+The perf lane (`lane_vector_perf.cjs`) measures the map's edges per mode
+(`EDGE_MODES`: none, tree, neighbours:3, neighbours:5) on its 2,000-point
+detailed sample, at 1x and 4x CPU throttling. Before the shell loads it sets
+`window.__VX_PERF_LANE__ = { edgesAutoDegrade: false }`, so the map keeps every
+edge however slow its frames; each row records what the map root reports
+(`data-edges-auto-degrade`, `data-edges-degraded`, `data-edge-count`), and each
+mode at 4x is its own gate (p95 frame interval ≤ 33 ms), failing when it was
+measured with the switch on. `gen_perf.py --check` says whether the perf
+fixture's sample can carry every edge row.
+
+`scripts/acceptance/vector-explorer/lanes.json` lists which change lane owns
+which file in a multi-lane build of the app, the commit the lanes branch from
+and the order they merge in; `selftest/test_lanes.py diff-all` reports every
+lane branch's changes outside its list and `day0` checks the list against that
+commit.
+
 ## Fixtures
 
 | Folder | What | How it is made |
 | --- | --- | --- |
 | `apps/vector-ui/tests/fixtures/provisional/` | One hand-written answer per tool and case, including the error envelopes | By hand, from the contract |
-| `apps/vector-ui/tests/fixtures/v1/live/<backend>/` | Answers captured from the live drivers, on a new and a legacy collection, scrubbed of volatile values | `nodes/test/vector_wire_fixtures.py`; `test_vector_wire_fixtures_full.py` regenerates and compares |
+| `apps/vector-ui/tests/fixtures/v1/live/<backend>/` | Answers captured from the live drivers, on a new and a legacy collection, scrubbed of volatile values; with the additive tools on the branch also `documents.filter`, `sample.clusters`, `search.keyword`, `recommend`, `recommend.best_score`, `similarity_matrix` and `dialect.enriched` | `nodes/test/vector_wire_fixtures.py`; `test_vector_wire_fixtures_full.py` regenerates and compares |
 | `sample_*.json` among the provisional fixtures | Seeded synthetic `sample` answers for the map's tests | `apps/vector-ui/tests/fixtures/gen_sample.ts` (`--check` verifies them) |
 | `defaults.json` | The write defaults and tool limits | `apps/vector-ui/scripts/gen_defaults.py` (`--check`) |
 | `chunking.json` | The chunker settings every template carries | The chunking calibration run |

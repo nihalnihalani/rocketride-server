@@ -183,24 +183,63 @@ console opens, after every removal or completed upload, and on **Refresh**.
 While the console is visible a lighter check runs at most every 15 seconds and
 the strip says "counts as of N s ago". Numbers the node did not return are
 shown as "—" with a tooltip, never estimated: Pinecone, for example, cannot
-count. "N without first chunk" means N documents have lost their first chunk
-(left by an older node or an interrupted ingest); they are still documents and
-are listed in their own group.
+count. "N need attention" counts the documents whose stored chunks look wrong
+(see [Documents](#documents)); its tooltip breaks the number down, for example
+"2 without first chunk · 1 with deleted chunks".
+
+**Charts**, at the end of the strip, opens four small charts: chunks per
+document (log-scale bins), chunk length (from the map's sample: "Draw the map's
+sample to see chunk lengths" until there is one), documents by file type and
+documents by ingest time (day, week or month, depending on the span; off on a
+store that does not keep ingest times). Each says what it covers ("1,200 of
+10,000 documents loaded") and has a table alternative; clicking a bar scopes the
+documents to it. Where the store reports how much space the collection takes,
+a **Size** figure joins the strip ("48.2 MB on the store").
 
 ### Documents
 
 Every document is listed once, by its path, with its chunk count, folders built
 from `/` and `\` (Windows drive roots included). Names without a folder are
-grouped under **Uploaded**, and documents without a first chunk under
-**Without first chunk**. Two documents with the same path are both listed;
-hover shows their short ids.
+grouped under **Uploaded**. Documents whose stored chunks look wrong are listed
+under **Needs attention**, each with a badge: *no first chunk* (chunk 0 is not
+stored: the document was partly removed or partly ingested), *gaps* (chunk
+numbers are missing), *N deleted chunks* (soft-deleted rows are still stored),
+*empty* (the parser found no text) or *oversize* (more than ten times the median
+chunk count). Gaps and deleted chunks are reported by pgvector stores; on other
+stores the document's page says these are not checked. Two documents with the
+same path are both listed; hover shows their short ids.
 
 The first page loads at once, then the rest load in the background, up to
 5,000 documents, with "Loading documents… 1,200 of 10,000". The list does not
 reshuffle while pages arrive; it is re-sorted when loading finishes. Past
 5,000, or when a store cannot page its list, the footer reads "Limit reached at
-N documents; more may exist" with **Load more**. The filter box works on the
-documents loaded so far and says so while loading continues.
+N documents; more may exist" with **Load more**.
+
+#### Scope
+
+The row above the directory starts with the path box ("Filter paths…") and
+carries **Add condition** and **Saved**; with no condition it is that one row.
+The conditions are *Folder is under* (also offered on a folder's menu as "Scope
+to this folder"), *File type is*, *Ingested after* and *Ingested before* (off on
+a store that does not keep ingest times), *Chunks between*, *Has tables* and
+*Missing first chunk*. Each shows as a chip you can remove; with the first one,
+**Apply to: Documents · Map · Search · Chat** appears, all on.
+
+The directory then says who applied the conditions: "12 documents match
+(store)" when the store filtered, "12 documents match (store; ingest dates
+filtered here)" when it applied some, and "12 of 1,200 loaded match (filtered
+here; the store cannot filter by these)" when the app filtered the rows it
+loaded. pgvector stores filter in the store; Chroma filters by first chunk only;
+Qdrant and the experimental stores do not, so the app filters there. While a
+scope is active the stats strip adds "Scope: 12 of 42 documents · 318 chunks
+(counted here)".
+
+The map, the search and the chat take a scope of at most 2,000 documents. A
+larger one says "Scope too large for the map, search and chat (2,340 documents;
+at most 2,000). Narrow the folder." and leaves them unscoped, with their toggles
+off. **Save…** keeps the conditions under a name; **Saved** lists them with
+**Apply** and **Delete**. Saved filters belong to the connection and last until
+you sign out.
 
 Selecting a document lists its chunks, 100 at a time, each with its length and
 a **map** button.
@@ -232,6 +271,12 @@ When the Ingest source feeds more than one store node, the panel names the
 others: "This pipeline's ingest also reaches: `<names>`". Without a running
 Ingest source, or on a read-only card, the panel says so instead.
 
+Above the upload list, the drop is summed up as it runs: "Drop of 12 files: 9
+added (341 chunks) · 2 replaced · 1 not added · 00:48". When it completes,
+**Show new chunks on the map** places the new chunks on the map, up to 200 of
+them as hollow points, and says "N of M new chunks placed" when it placed fewer
+than were added.
+
 ### Chat
 
 Ask a question about the documents (up to 4,000 characters, one at a time). The
@@ -255,6 +300,33 @@ the threshold shows as a near miss and none as below the floor.
 The app stops waiting after 120 seconds: "Stopped waiting after 120 s. The
 pipeline may still be answering; there is no way to cancel it from here." The
 chat header names the LLM node. The question history keeps your questions only.
+
+### Search
+
+**Search** in the chat's header ("Search without the LLM") swaps the chat for a
+search in the same column; the chat, its history and your draft are one click
+away. Type a question, choose a mode and **Run**:
+
+- **Semantic** embeds the question with the pipeline's embedding node and asks
+  the store for the nearest chunks.
+- **Keyword** asks the store for the text itself, where the store can: "Keyword
+  search matches text fragments on this store" (pgvector, Chroma) or "… matches
+  whole words on this store" (Qdrant). It is off, with "This store cannot search
+  by keyword", elsewhere (Pinecone).
+- **Hybrid** runs both and fuses the two rankings in your browser, labelled
+  "hybrid (fused here)"; **Auto** lets the store node choose.
+
+Results show rank, path and chunk, score (the formula on hover), whether the
+node's threshold would keep them, a short preview, and **open**, **map** and
+**ask about this**. The **Threshold** slider re-classifies them as you move it:
+"At 0.42: 7 of 20 would pass (today's node setting 0.30 passes 11)", with the
+score histogram under it. **Copy as node setting** copies `threshold_search:
+0.42`: set it on the store node in the pipeline editor; this console cannot
+change node settings. **Compare** runs a second question beside the first and
+says what they share: "A and B share 4 of 10 results (Jaccard 0.25); 3
+documents only in A, 2 only in B"; with the map open, both are drawn as stars (A
+★, B ☆). **Why these?** under a chat answer gains **Open in Search**, which
+opens this view with the answer's question and its cited chunks marked.
 
 ## Removing documents
 
@@ -325,11 +397,71 @@ with the reason, when the store node cannot sample; the console is unaffected.
   Tools source, the star is the score-weighted centre of the sources instead,
   and the legend marks it approximate.
 - **Lasso** (`L`): select an area, then **Ask about these only**, **Remove
-  these documents** or **Copy keys**.
-- **Duplicates, Outliers, Heat strip and Table.** Near-identical chunks are
-  joined by a dashed line, unusually isolated chunks are ringed, the heat strip
-  shows a document's chunks in order against the active query, and the
-  **Table** tab lists the points for screen readers and keyboard use.
+  these documents**, **Isolate** or **Copy keys**. The **Selection** tab also
+  shows a **similarity matrix** of 2 to 100 selected points: a heatmap (values
+  in the cells up to 20 × 20), ordered so that close points sit together, with a
+  table alternative, **Export CSV** and **Show pair**. The store computes it from
+  the points' keys, so a sample drawn again cannot shift it.
+- **Clusters.** With each sample the store node groups the points (connected
+  groups of the neighbour graph) and names the largest groups by their most
+  frequent terms. **Colour by → Cluster** colours them; the **Clusters** tab
+  lists them by size with their label, points and documents, and **Show**,
+  **Ask about these** (scopes the chat to their documents) and **Export**; a
+  **Noise** row lists the points in no group. **Minimum size** (2, 5 or 10)
+  regroups at once, without asking the store again. The legend says how the
+  groups were made, for example "Clusters: connected groups of the sample's
+  neighbour graph above similarity 0.61 (the 60th percentile of its edges,
+  computed by the store node), groups of at least 5 points; labels are the most
+  frequent terms of up to 50 of their chunks."
+- **Colour by** also offers file type, folder, chunk position, table chunks,
+  ingest date, file size, health, ingest node, density and query similarity,
+  each with a legend; a mode the data cannot support is off with the reason.
+- **Edges.** **None**, **Neighbours** (each point's 3, 5 or 10 strongest
+  links) or **Tree** (the strongest path connecting every point: the spanning
+  tree of the neighbour graph, "2,000 points, 1,999 edges"). Hovering a point
+  thickens its edges; **Expand selected** adds the selected point's own. When
+  frames get slow the map draws fewer edges and says so.
+- **Isolate, Show all, Expand by neighbours.** Show only the selection or a
+  cluster ("Showing 212 of 1,000"), grow it by one ring of neighbours, or bring
+  every point back. The keyboard and the layouts skip hidden points.
+- **Duplicates.** Near-identical chunks are joined by a dashed line, and the
+  **Duplicates** tab is a review queue: pairs grouped by document, each group
+  with its similarity range, a **Keep** choice per document and a policy (keep
+  oldest ingest, shortest path, most chunks, or choose by hand). The similarity
+  slider (0.90 to 0.995) regroups at once, from each point's 15 nearest
+  neighbours in the sample. **Show group**, **Mark reviewed**, **Remove the
+  others** and **Remove all queued (N documents)** follow; removal is confirmed
+  by typing the count. Repeated text inside one document is listed apart, with
+  **Open** only.
+- **Outliers.** Unusually isolated chunks are ringed, and the **Outliers** tab
+  lists the lowest-density share of the sample (1, 2 or 5 %, chosen without
+  asking the store again), each with why ("density 0.12 vs sample median 0.61;
+  nearest neighbour 0.31 in `<path>`"), **Mark reviewed**, **Show neighbours**
+  and **Remove document**.
+- **Recommend.** From a point's panel, **Add as example (+)** or **(−)**; the
+  **Recommend** tab finds the chunks most like the positives and least like the
+  negatives in the whole collection (**Average vector** everywhere; **Best
+  score** on Qdrant, which ranks it itself), and can pin the results on the
+  map. "+ current query" adds the text query as a positive.
+- **Full text.** **Show full text** on a point shows its chunk with the active
+  question's words marked: "Lexical matches only; retrieval is by meaning."
+- **Heat strip and Table.** The heat strip shows a document's chunks in order
+  against the active query, and the **Table** tab lists the points for screen
+  readers and keyboard use.
+- **Export.** The map's **Export** menu saves the sample, the lasso selection,
+  the points shown, the clusters, the duplicates or the outliers as CSV or
+  JSON, and the map as a PNG with its legend and a footer; the directory and
+  the search export their rows the same way. Files are named
+  `vector-explorer_<collection>_<kind>_<date>.csv`; cells that start with `=`,
+  `+`, `-` or `@` are guarded against spreadsheet formulas.
+- **Views.** **Views → Save current view** keeps the sample size, mode and
+  seed, layout, colouring, edges, minimum cluster size, query text, scope,
+  selection (up to 2,000 points) and camera under a name; **Apply** draws the
+  sample again with its seed and restores the selection: "1,340 of 1,900
+  selected points restored; 200 drawn hollow" (up to 200 points missing from the
+  new sample are drawn hollow, the rest are dropped). A saved query runs again
+  only on **Run saved query**, because it costs an embedding. Up to 20 views
+  per connection, kept until you sign out.
 - **Keyboard.** The arrow keys move to the nearest point in that direction,
   Enter inspects it, Escape clears.
 
@@ -340,8 +472,9 @@ browser never receives the raw embedding vectors of a sample.
 
 **Open** on a document, a source or a point opens the document's page: its
 path, id (with a copy button), chunk count, size, type and ingest time when the
-store keeps them, a note when its first chunk is missing, and its chunks in
-reading order with table chunks tagged. **Show chunk path on map** draws the
+store keeps them, its health (the problems listed under [Documents](#documents),
+each with a sentence, or which stores report them), and its chunks in reading
+order with table chunks tagged. **Show chunk path on map** draws the
 document's chunks in order on the map. When a query is active (a text query
 placed on the map, or a chat answer shown there), a heat strip above the
 chunks shows how similar each one is to it: the query is embedded by the
@@ -373,6 +506,12 @@ sentence:
 | The chat's embedding model is not the collection's | The chat embedding model differs from the one this collection was built with; results may be meaningless. |
 | pgvector could not add its metadata column yet | File size and ingest time are not stored yet: another session holds this table; the store will retry. |
 | The server runs pgvector older than 0.8, whose index search can stop short when a search is limited to some documents | A search limited to some documents may return fewer results than asked: this pgvector is older than 0.8. |
+| The map's sample was drawn from the first 500 documents of a larger collection | Sampled from the first 500 documents by path; the collection has more |
+| The store's document listing stopped early | Sampled from part of the collection: the store's listing stopped early |
+| The store applied some of a scope's conditions | N documents match (store; ingest dates filtered here) |
+| The store cannot filter documents | N of M loaded match (filtered here; the store cannot filter by these) |
+| The store node does not compute clusters | This store node does not compute clusters; update the node. |
+| The map drew fewer edges to stay smooth | Fewer edges drawn to keep the map smooth |
 
 On RocketRide Vector the drawer also says that the table is shared; that
 sentence is quoted under [Connections](#connections).
@@ -435,6 +574,13 @@ Explorer.
   or set the deployment's schedule, with the trace level `none`.
 - **Chat history** keeps the text of your questions only, and is forgotten on
   sign-out.
+- **Cluster names** are up to five words each, taken from the sampled chunks'
+  own text by the store node; they travel with the sample like its snippets.
+- **Exports** you download contain paths, chunk numbers, scores and the short
+  snippets shown on screen; never a vector, a token, a host or a node setting.
+- **Saved filters and views** are kept in memory for the session, per
+  connection, and cleared on sign-out; nothing is written to the browser's
+  storage.
 
 ## Limits
 
@@ -461,20 +607,37 @@ Explorer.
 - **Read-only cards** cannot add or remove documents.
 - **Answers need a model.** Chat needs a working LLM (a key, or a local
   OpenAI-compatible server); everything else does not.
+- **The map's analysis covers its sample.** Clusters, duplicates, outliers and
+  edges are found among the sampled chunks; draw a larger or light sample to
+  cover more. An unscoped sample of a collection of more than 500 documents is
+  drawn from the first 500 the store lists, and the legend says so.
+- **Scopes** reach the map, the search and the chat up to 2,000 documents.
+  Stores that cannot filter are filtered by the app over the rows it loaded.
+- **Keyword search and best-score recommendations depend on the store**: see
+  [Search](#search) and the map's **Recommend**.
+- **Saved filters and views last for the session.** They are not kept across
+  sign-ins or browsers.
 
 ## Compared with the native consoles
 
-Vector Explorer does not replace your database's own console. Where it goes
-further:
+Vector Explorer does not replace your database's own console. Within one app,
+across pgvector, RocketRide Vector, Qdrant and Chroma, it gives you:
 
-- a text query placed on the map, with rays to its true top results from the
-  whole collection;
-- chat answers linked to the exact chunks they were given;
-- document-level removal that reports the rows actually removed;
-- one interface across four backends: pgvector, RocketRide Vector, Qdrant and
-  Chroma;
-- duplicates and outliers found on the store node.
+- a search surface, one click from the chat, with semantic, keyword and fused
+  modes and a threshold slider that shows what the node's setting would keep;
+- a text question placed on the map with rays to the chunks the store really
+  ranks first, and two questions compared side by side;
+- the collection's clusters named by their own words;
+- the neighbour graph and its spanning tree drawn over the sample;
+- near-duplicate groups removed in one confirmed batch, with the rows reported;
+- a folder, file-type or date scope that applies to the documents, the map, the
+  search and the chat;
+- charts of chunks per document, chunk length, file types and ingest time;
+- CSV, JSON and PNG exports of what you see;
+- chat answers linked to the exact chunks they were given.
 
-The map draws up to 2,000 points in detailed mode and 5,000 in light mode;
-Qdrant's own visualiser draws more. On Qdrant, Vector Explorer asks Qdrant for
-the neighbour graph rather than computing it.
+The map draws at most 2,000 points with text or 5,000 without, and says when it
+was drawn from the first 500 documents of a larger collection; Qdrant's own
+visualiser draws more points. On Qdrant the neighbour graph of a sample of up
+to 500 points is computed by Qdrant itself; a larger sample gets the store
+node's graph.
