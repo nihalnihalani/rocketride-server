@@ -1,0 +1,244 @@
+# =============================================================================
+# MIT License
+# Copyright (c) 2026 Aparavi Software AG
+# =============================================================================
+"""Self-tests of lanes.json: which lane owns which file in the Vector Explorer enrichment wave.
+
+``scripts/acceptance/vector-explorer/lanes.json`` lists, per lane, the paths it alone
+may change after the day-0 commit (``owns``; a trailing ``/**`` covers a folder) and
+the owned paths that did not exist on that commit (``new``); the paths the day-0
+commit added or changed (``day0``); and every file the enrichment backlog names
+(``backlog``). These tests hold the file to its rules:
+
+* every owned path exists, or is marked new;
+* no path has two owners (a folder glob of one lane never covers another lane's path);
+* every backlog path and every day-0 path has exactly one owner;
+* the checker itself reports each kind of mistake (it is run on broken copies).
+
+At each gate the per-lane diff is checked from the command line, which lists every
+changed path outside the lane's list and exits 1 when there is one:
+
+    python3 scripts/acceptance/vector-explorer/selftest/test_lanes.py diff <lane> <day-0 commit> <lane tip>
+    python3 scripts/acceptance/vector-explorer/selftest/test_lanes.py check
+
+Run the tests: python3 -m unittest discover -s scripts/acceptance/vector-explorer/selftest -p test_lanes.py -v
+"""
+
+import copy
+import json
+import subprocess
+import sys
+import unittest
+from pathlib import Path
+from typing import Any, Callable, Dict, Iterable, List
+
+HERE = Path(__file__).resolve().parent
+LANES_JSON = HERE.parent / 'lanes.json'
+REPO = HERE.parents[3]
+
+#: The lanes of the wave, in order.
+LANE_IDS = ['E0', 'E1', 'E2', 'E3', 'E4', 'E5', 'E6', 'E7', 'E8', 'E9', 'E10']
+
+
+def load(path: Path = LANES_JSON) -> Dict[str, Any]:
+    """Read lanes.json."""
+    return json.loads(path.read_text(encoding='utf-8'))
+
+
+def covers(owned: str, path: str) -> bool:
+    """Whether an owned entry (a path, or a folder ending in ``/**``) covers a repository path."""
+    if owned.endswith('/**'):
+        return path.startswith(owned[:-2])
+    return path == owned
+
+
+def owners(doc: Dict[str, Any], path: str) -> List[str]:
+    """The lanes whose list covers ``path``."""
+    return [lane['lane'] for lane in doc['lanes'] if any(covers(owned, path) for owned in lane['owns'])]
+
+
+def present(path: str, root: Path = REPO) -> bool:
+    """Whether a listed path exists under ``root`` (a ``/**`` entry: its folder)."""
+    target = root / (path[:-3] if path.endswith('/**') else path)
+    return target.is_dir() if path.endswith('/**') else target.exists()
+
+
+def problems(doc: Dict[str, Any], exists: Callable[[str], bool] = present) -> List[str]:
+    """Every rule of lanes.json the document breaks, as sentences (none: it is sound)."""
+    out: List[str] = []
+    ids = [lane.get('lane') for lane in doc.get('lanes', [])]
+    if ids != LANE_IDS:
+        out.append(f'the lanes are {ids}, expected {LANE_IDS}')
+    branches = [lane.get('branch') for lane in doc.get('lanes', [])]
+    if len(set(branches)) != len(branches) or not all(isinstance(b, str) and b.startswith('vx/') for b in branches):
+        out.append(f'every lane needs its own vx/ branch: {branches}')
+    for lane in doc.get('lanes', []):
+        name = lane.get('lane')
+        owns, new = lane.get('owns', []), lane.get('new', [])
+        if len(set(owns)) != len(owns):
+            out.append(f'{name} lists a path twice')
+        for path in new:
+            if path not in owns:
+                out.append(f'{name} marks {path} new but does not own it')
+        for path in owns:
+            if path not in new and not exists(path):
+                out.append(f'{name} owns {path}, which does not exist and is not marked new')
+    # Two owners: an exact repeat, or a folder of one lane covering another lane's path or folder.
+    entries = [(lane['lane'], owned) for lane in doc.get('lanes', []) for owned in lane.get('owns', [])]
+    for i, (lane_a, a) in enumerate(entries):
+        for lane_b, b in entries[i + 1 :]:
+            if lane_a != lane_b and (
+                covers(a, b.rstrip('*').rstrip('/')) or covers(b, a.rstrip('*').rstrip('/')) or a == b
+            ):
+                out.append(f'{a} ({lane_a}) and {b} ({lane_b}) overlap')
+    for key in ('backlog', 'day0'):
+        for path in doc.get(key, []):
+            found = owners(doc, path)
+            if len(found) != 1:
+                out.append(f'{key} path {path} has {len(found)} owners {found}')
+    for path in doc.get('day0', []):
+        if not exists(path):
+            out.append(f'day-0 path {path} does not exist')
+    return out
+
+
+def outside(doc: Dict[str, Any], lane: str, paths: Iterable[str]) -> List[str]:
+    """The changed paths a lane's list does not cover."""
+    entry = next((item for item in doc['lanes'] if item['lane'] == lane), None)
+    if entry is None:
+        raise ValueError(f'no lane {lane} in lanes.json')
+    return sorted(path for path in set(paths) if not any(covers(owned, path) for owned in entry['owns']))
+
+
+def changed(base: str, tip: str, root: Path = REPO) -> List[str]:
+    """The paths changed between two commits (a rename counts as both of its paths)."""
+    result = subprocess.run(
+        ['git', 'diff', '--name-only', '--no-renames', f'{base}..{tip}'],
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return [line for line in result.stdout.splitlines() if line]
+
+
+class LanesFileTests(unittest.TestCase):
+    """lanes.json as committed."""
+
+    def setUp(self):
+        self.doc = load()
+
+    def test_the_file_has_every_lane_with_its_branch(self):
+        self.assertEqual([lane['lane'] for lane in self.doc['lanes']], LANE_IDS)
+        self.assertEqual(self.doc['lanes'][0]['branch'], 'vx/integration')
+        for lane in self.doc['lanes']:
+            self.assertTrue(lane['title'] and lane['owns'], lane['lane'])
+
+    def test_the_file_breaks_none_of_its_rules(self):
+        self.assertEqual(problems(self.doc), [])
+
+    def test_every_owned_path_exists_or_is_marked_new(self):
+        for lane in self.doc['lanes']:
+            for path in lane['owns']:
+                if path not in lane['new']:
+                    self.assertTrue(present(path), f'{lane["lane"]}: {path}')
+
+    def test_the_backlog_and_the_day0_commit_are_each_owned_once(self):
+        self.assertGreaterEqual(len(self.doc['backlog']), 100)
+        self.assertGreaterEqual(len(self.doc['day0']), 50)
+        for key in ('backlog', 'day0'):
+            for path in self.doc[key]:
+                self.assertEqual(len(owners(self.doc, path)), 1, f'{key}: {path}')
+
+    def test_this_file_and_lanes_json_are_owned_by_the_acceptance_lane(self):
+        for path in (
+            'scripts/acceptance/vector-explorer/lanes.json',
+            'scripts/acceptance/vector-explorer/selftest/test_lanes.py',
+        ):
+            self.assertEqual(owners(self.doc, path), ['E10'], path)
+            self.assertIn(path, self.doc['day0'])
+
+
+class CheckerTests(unittest.TestCase):
+    """The checker on small documents, sound and broken, so a pass is never vacuous."""
+
+    def sound(self) -> Dict[str, Any]:
+        lanes = [
+            {'lane': lane, 'branch': f'vx/{lane.lower()}', 'title': lane, 'owns': [f'src/{lane}.ts'], 'new': []}
+            for lane in LANE_IDS
+        ]
+        lanes[1]['owns'].append('nodes/mocks/client/**')
+        lanes[2]['owns'].append('src/new_module.ts')
+        lanes[2]['new'].append('src/new_module.ts')
+        return {'lanes': lanes, 'backlog': ['src/E3.ts', 'nodes/mocks/client/models.py'], 'day0': ['src/E0.ts']}
+
+    @staticmethod
+    def exists(path: str) -> bool:
+        return path != 'src/new_module.ts' and path != 'src/missing.ts'
+
+    def test_a_sound_document_has_no_problem(self):
+        self.assertEqual(problems(self.sound(), self.exists), [])
+
+    def test_each_kind_of_mistake_is_reported(self):
+        cases = {
+            'two owners': lambda d: d['lanes'][5]['owns'].append('src/E4.ts'),
+            'a folder covering another lane': lambda d: d['lanes'][7]['owns'].append('nodes/mocks/client/models.py'),
+            'a path that does not exist': lambda d: d['lanes'][3]['owns'].append('src/missing.ts'),
+            'new but not owned': lambda d: d['lanes'][4]['new'].append('src/E5.ts'),
+            'a backlog path nobody owns': lambda d: d['backlog'].append('src/orphan.ts'),
+            'a day-0 path nobody owns': lambda d: d['day0'].append('src/orphan.ts'),
+            'a day-0 path that does not exist': lambda d: (
+                d['lanes'][0]['owns'].append('src/missing.ts'),
+                d['lanes'][0]['new'].append('src/missing.ts'),
+                d['day0'].append('src/missing.ts'),
+            ),
+            'a lane missing': lambda d: d['lanes'].pop(),
+            'a shared branch': lambda d: d['lanes'][2].update(branch='vx/e1'),
+            'a path listed twice': lambda d: d['lanes'][6]['owns'].append('src/E6.ts'),
+        }
+        for name, breaks in cases.items():
+            doc = copy.deepcopy(self.sound())
+            breaks(doc)
+            self.assertNotEqual(problems(doc, self.exists), [], name)
+
+    def test_outside_lists_exactly_what_a_lane_may_not_change(self):
+        doc = self.sound()
+        changed_paths = [
+            'src/E1.ts',
+            'nodes/mocks/client/models.py',
+            'nodes/mocks/client/sub/x.py',
+            'src/E2.ts',
+            'nodes/mocks/clientele.py',
+        ]
+        self.assertEqual(outside(doc, 'E1', changed_paths), ['nodes/mocks/clientele.py', 'src/E2.ts'])
+        self.assertEqual(outside(doc, 'E1', []), [])
+        with self.assertRaises(ValueError):
+            outside(doc, 'E11', changed_paths)
+
+    def test_a_folder_glob_covers_its_folder_only(self):
+        self.assertTrue(covers('a/b/**', 'a/b/c'))
+        self.assertTrue(covers('a/b/**', 'a/b/c/d.py'))
+        self.assertFalse(covers('a/b/**', 'a/bc/d.py'))
+        self.assertFalse(covers('a/b.py', 'a/b.pyc'))
+
+
+def main(argv: List[str]) -> int:
+    """``diff <lane> <base> <tip>`` or ``check``; anything else runs the tests."""
+    if len(argv) == 4 and argv[0] == 'diff':
+        lane, base, tip = argv[1:]
+        stray = outside(load(), lane, changed(base, tip))
+        for path in stray:
+            print(f'{lane} changed {path}, which is not in its list')
+        print(f'{lane}: {len(stray)} paths outside its list between {base} and {tip}')
+        return 1 if stray else 0
+    if argv == ['check']:
+        found = problems(load())
+        for line in found:
+            print(line)
+        print(f'lanes.json: {len(found)} problems')
+        return 1 if found else 0
+    return 0 if unittest.main(argv=[sys.argv[0], *argv], exit=False).result.wasSuccessful() else 1
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))
