@@ -32,10 +32,6 @@ from . import vector_wire_fixtures as gen
 FIXTURES = Path(__file__).resolve().parents[2] / 'apps' / 'vector-ui' / 'tests' / 'fixtures' / 'v1' / 'live'
 _REQUIRED = bool(os.environ.get('RR_REQUIRE_DB_TESTS'))
 
-# The captures need the explorer tools (and every supported driver) merged; the
-# integration step removes this mark and commits the first capture.
-NEEDS_LIVE = 'NEEDS:L0,L1,L2,L3,L5 merged — integration gate G2'
-
 
 def _committed():
     return gen.committed(FIXTURES) if FIXTURES.is_dir() else {}
@@ -239,7 +235,6 @@ def test_a_live_suite_does_not_run_under_mocks(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skip(reason=NEEDS_LIVE)
 def test_captures_are_committed_for_every_supported_backend():
     names = set(_committed())
     for backend in ('pgvector', 'rocketride_vector', 'qdrant', 'chroma'):
@@ -260,12 +255,10 @@ def live():
         pytest.skip(f'NOT RUN: live captures not possible here: {e}')
 
 
-@pytest.mark.skip(reason=NEEDS_LIVE)
 def test_the_generator_covers_every_committed_capture(live):
     assert sorted(_committed()) == sorted(live)
 
 
-@pytest.mark.skip(reason=NEEDS_LIVE)
 def test_live_captures_match_the_tools(live):
     diff = gen.differences(live, _committed())
     assert diff == [], (

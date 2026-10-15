@@ -1,0 +1,30 @@
+{
+  "__scrub__": [
+    "teamId",
+    "userId"
+  ],
+  "success": true,
+  "removed": [
+    {
+      "objectId": "91ae15d4-3f6e-589f-bb81-72301f2ca1b6",
+      "chunks_removed": 5
+    }
+  ],
+  "not_found": [],
+  "removed_chunks": 5,
+  "audit": {
+    "action": "vector.remove_document",
+    "node": "store_1",
+    "provider": "rocketride_vector",
+    "collection": "vx_tp_wire",
+    "object_ids": [
+      "91ae15d4-3f6e-589f-bb81-72301f2ca1b6"
+    ],
+    "rows": 5,
+    "caller": {
+      "auth": "account",
+      "userId": "<scrubbed>",
+      "teamId": "<scrubbed>"
+    }
+  }
+}

@@ -189,6 +189,8 @@ CORPUS_DOCS = (
 # The multi-chunk document; on the emulated legacy collection it loses chunk 0.
 MULTI_DOC = 'handbooks/falcon_handbook.md'
 WATER_QUESTION = 'Where does Falcon Station get its drinking water?'
+# Off-topic for the demo corpus (vector_wire_fixtures.py captures its search answers).
+UNRELATED_QUESTION = 'Lattice regularisation of quantum chromodynamics at finite temperature'
 
 # Keys whose values are document text; the secrets scan skips them.
 CONTENT_KEYS = frozenset({'content', 'page_content', 'snip', 'preview', 'text', 'answers', 'answer'})
