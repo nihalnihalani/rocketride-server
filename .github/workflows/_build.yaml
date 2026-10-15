@@ -338,6 +338,20 @@ jobs:
         #       after the appropriate fixes have been made, see #743 #1048 for details.
         run: ${{ matrix.builder_cmd }} test --verbose --sequential
 
+      # nodes:test skips every test_*_full.py (--ignore-glob in nodes/scripts/tasks.js), so the
+      # suites that need the Postgres containers above never ran in this job. Run them directly
+      # with the built engine. RR_REQUIRE_DB_TESTS=1 (exported above) turns any skip into a failure.
+      - name: Test cloud DB integration suites / Linux
+        if: matrix.platform == 'ubuntu' && inputs.codeql == false && inputs.test
+        working-directory: nodes
+        run: |
+          ../dist/server/engine -m pytest -v --rootdir . \
+            test/test_rocketride_db_full.py \
+            test/test_rocketride_graph_full.py \
+            test/test_vector_store_writes_full.py \
+            test/test_rocketride_db_tls_full.py \
+            test/test_rocketride_db_isolation_full.py
+
       - name: Perform CodeQL Analysis
         if: inputs.codeql && matrix.platform == 'ubuntu'
         uses: github/codeql-action/analyze@6f5948dfacef28e207b48d0905cf90c03365536d # v3
