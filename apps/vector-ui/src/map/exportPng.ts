@@ -43,7 +43,8 @@
 //   footer                             the legend (swatches with counts, or the
 //                                      ramp's ends), its note, and
 //                                      "<collection> · <N> of <M> chunks ·
-//                                      <layout> · <colour by> · <date>"
+//                                      <layout> · <colour by> · <date>",
+//                                      wrapped at the map's width"
 //
 // No renderer, a lost context or a refused snapshot gives no picture (null);
 // the menu then says "The map is not drawn right now.". Nothing is sent
@@ -277,6 +278,29 @@ function placeRows(ctx: CanvasRenderingContext2D, rows: readonly IPngLegendRow[]
 }
 
 /**
+ * Pack parts into lines no wider than `width` (a part wider than the width gets a line of its own).
+ *
+ * @param ctx - A context with the footer font (measureText).
+ * @param parts - Words, or the footer line's parts.
+ * @param joiner - What joins two parts on a line.
+ * @param width - CSS width available.
+ * @returns The lines.
+ */
+function wrapText(ctx: CanvasRenderingContext2D, parts: readonly string[], joiner: string, width: number): string[] {
+	const lines: string[] = [];
+	let line = '';
+	for (const part of parts) {
+		const next = line === '' ? part : `${line}${joiner}${part}`;
+		if (line !== '' && ctx.measureText(next).width > width) {
+			lines.push(line);
+			line = part;
+		} else line = next;
+	}
+	if (line !== '') lines.push(line);
+	return lines;
+}
+
+/**
  * Draw the ramp strip (a gradient when the context has one, else its stops side by side).
  *
  * @param ctx - The context.
@@ -324,12 +348,13 @@ export async function composeMapPng(input: IMapPngInput): Promise<Blob | null> {
 	pctx.setTransform(scale, 0, 0, scale, 0, 0);
 	if (!renderer.snapshot(pctx)) return null;
 
-	// 2. The footer's size (the legend wraps at the map's width).
+	// 2. The footer's size (the legend, the note and the line wrap at the map's width).
 	pctx.font = FONT;
 	const { placed, lines } = placeRows(pctx, input.legend.rows, widthCss);
 	const rampLines = input.legend.ramp ? 1 : 0;
-	const noteLines = input.legend.note ? 1 : 0;
-	const footerHeightCss = PAD + (lines + rampLines + noteLines + 1) * LINE + PAD / 2;
+	const noteLines = input.legend.note ? wrapText(pctx, input.legend.note.split(' '), ' ', widthCss - 2 * PAD) : [];
+	const footerLines = wrapText(pctx, footerLine(input.footer).split(' · '), ' · ', widthCss - 2 * PAD);
+	const footerHeightCss = PAD + (lines + rampLines + noteLines.length + footerLines.length) * LINE + PAD / 2;
 	const canvas = make(width, mapHeight + Math.round(footerHeightCss * scale));
 	const ctx = canvas?.getContext('2d') ?? null;
 	if (!canvas || !ctx) return null;
@@ -374,13 +399,11 @@ export async function composeMapPng(input: IMapPngInput): Promise<Blob | null> {
 		ctx.fillText(ramp.high, PAD + lowWidth + 12 + RAMP_WIDTH, y);
 		y += LINE;
 	}
-	if (input.legend.note) {
-		ctx.fillStyle = theme.text;
-		ctx.fillText(input.legend.note, PAD, y);
+	ctx.fillStyle = theme.text;
+	for (const line of [...noteLines, ...footerLines]) {
+		ctx.fillText(line, PAD, y);
 		y += LINE;
 	}
-	ctx.fillStyle = theme.text;
-	ctx.fillText(footerLine(input.footer), PAD, y);
 
 	const blob = await encode(canvas);
 	return blob && blob.size > 0 ? blob : null;

@@ -240,7 +240,7 @@ test('the snapshot is taken before anything is composited; the points, the overl
 	assert.deepEqual(canvas.pixel(21 * 2, 21 * 2), [200, 30, 30, 255], 'a point pixel is the point colour');
 	assert.deepEqual(canvas.pixel(152 * 2, 12 * 2), [0, 120, 212, 255], 'the overlay is on top');
 	assert.equal(canvas.pixel(5, 5)[3], 255, 'the background is opaque');
-	const words = canvas.texts.join('\n');
+	const words = canvas.texts.join(' · ');
 	assert.match(words, /vx_demo_docs · 1,000 of 1,318 chunks · PCA · Colour by cluster · 2026-10-15 09:05/);
 	assert.match(words, /falcon · orchid \(42\)/);
 	assert.match(words, /manual · valve \(17\)/);
@@ -283,4 +283,16 @@ test('a ramp colouring writes its ends in the footer instead of rows', async () 
 	assert.match(words, /sparse/);
 	assert.match(words, /dense/);
 	assert.match(words, /Density of the sample\./);
+});
+
+test('a narrow map wraps the footer line at its parts, every line within the width', async () => {
+	const log: string[] = [];
+	const { input: run, made } = input(log, 1, { widthCss: 150, legend: { rows: [], ramp: null, note: 'A note long enough to need more than one line in a narrow picture.' } });
+	await composeMapPng(run);
+	const canvas = exported(made);
+	const footer = canvas.texts.slice(-6);
+	for (const line of canvas.texts) assert.ok(line.length * 6 <= 150 - 20 || !line.includes(' '), `"${line}" fits`);
+	assert.ok(canvas.texts.length >= 4, 'the note and the footer line wrapped');
+	assert.match(footer.join(' · '), /vx_demo_docs · 1,000 of 1,318 chunks · PCA · Colour by cluster · 2026-10-15 09:05/);
+	assert.ok(canvas.height > 120 + 4 * 16, 'the footer grew with its lines');
 });
