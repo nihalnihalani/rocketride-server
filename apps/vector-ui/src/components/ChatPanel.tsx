@@ -39,15 +39,16 @@
 // The header's Search toggle swaps the chat body for the SearchPanel (search
 // without the LLM) in the same space, so the console's layout does not move;
 // the chat's thread and draft stay mounted, hidden, and come back with the
-// toggle. "Why these?" can open its question in Search with the answer's
-// cited chunks marked, and Search's "ask about this" comes back to the chat
-// with the next question scoped to that document.
+// toggle. "Why these?" searches the documents the question was asked about
+// and can open its question in Search, whose first run is that same search
+// with the answer's cited chunks marked; Search's "ask about this" comes
+// back to the chat with the next question scoped to that document.
 // =============================================================================
 
 import React, { useEffect, useRef, useState } from 'react';
 import type { CSSProperties } from 'react';
 import { EmptyState, commonStyles } from 'shell';
-import type { ChatPanelProps as ContractChatPanelProps, IChatSource, SearchPanelProps as ContractSearchPanelProps } from '../contract/types';
+import type { ChatPanelProps as ContractChatPanelProps, IChatSource } from '../contract/types';
 import { useVectorChat } from '../chat/useVectorChat';
 import { threadScrollKey } from '../chat/chatSession';
 import type { ChatTurn } from '../chat/chatSession';
@@ -57,6 +58,7 @@ import { showAnswerOnMap } from '../adapters/consoleActions';
 import { SourcesPanel } from './SourcesPanel';
 import { RetrievalDebugger } from './RetrievalDebugger';
 import { SHOWING_SEARCH, SearchPanel } from './SearchPanel';
+import type { ChatPrefill } from '../vector/searchWorkbench';
 
 /** The contract props plus the surface it opens on (the static render tests show Search with it). */
 export interface ChatPanelProps extends ContractChatPanelProps {
@@ -64,8 +66,8 @@ export interface ChatPanelProps extends ContractChatPanelProps {
 	initialSearch?: boolean;
 }
 
-/** What "Open in Search" hands the SearchPanel. */
-type SearchPrefill = NonNullable<ContractSearchPanelProps['prefill']>;
+/** What "Open in Search" hands the SearchPanel: the question, its cited chunks, and the k and documents "Why these?" searched. */
+type SearchPrefill = ChatPrefill;
 
 /** Shown when the connection has no running Chat source. */
 export const NO_CHAT_SENTENCE = 'This pipeline has no running Chat source.';
@@ -160,7 +162,7 @@ function TurnView({ turn, model, channels, selection, actions, debugging, onDebu
 					</div>
 					{!answer.hasDocumentsLane && <p style={S.line}>This pipeline does not return the chunks it used, so the answer cannot cite them.</p>}
 					{sources.length > 0 && <SourcesPanel sources={sources} score={model.connection.dialect?.score ?? null} onOpen={(source) => actions.openDocument(source.objectId, source.chunkId)} onShowOnMap={(keys) => showAnswerOnMap(selection, actions, turn.question, keys)} />}
-					{debugging && <RetrievalDebugger model={model} channels={channels} question={turn.question} topK={sources.length} answerSources={sources} onClose={() => onDebug(false)} onOpenInSearch={onOpenInSearch} />}
+					{debugging && <RetrievalDebugger model={model} channels={channels} question={turn.question} topK={sources.length} answerSources={sources} scope={turn.scope} onClose={() => onDebug(false)} onOpenInSearch={onOpenInSearch} />}
 				</div>
 			)}
 		</article>

@@ -38,12 +38,12 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
-import type { ConsoleModel, IDialectResult, IScopeState, IScoreInfo, ISearchResult, IVectorCapabilities, IVectorLimits, VectorKey } from '../src/contract/types';
+import type { ConsoleModel, IChatSource, IDialectResult, IScopeState, IScoreInfo, ISearchResult, IVectorCapabilities, IVectorLimits, VectorKey } from '../src/contract/types';
 import { EXPORT_COLUMNS } from '../src/contract/types';
 import type { CallOutcome } from '../src/chat/toolCalls';
-import { classifyRetrieval } from '../src/vector/retrieval';
+import { classifyRetrieval, debuggerSearchInput, withScope } from '../src/vector/retrieval';
 import { QUERY_NEEDS_EMBED } from '../src/map/wording';
-import { HYBRID_LABEL, HYBRID_NEEDS_KEYWORD, KEYWORD_UNSUPPORTED, NODE_SETTING_NOTE, RRF_K, SEARCH_MODES, STATUS_WORDS, TOP_K_OPTIONS, VECTOR_UNSUPPORTED, classifyAt, defaultMode, fromChatLine, fuse, initialThreshold, keywordCaption, keywordSearchInput, modeOptions, nodeSettingText, plan, previewOf, rateLimitSentence, retrievalExportRows, retryAfterSeconds, rowsFromSearch, runWorkbench, scoreTitle, searchExportItems, searchScope, secondsLeft, semanticSearchInput, showSearchOnMap, sliderRange, sliderValueText, thresholdSentence, topKOptions, workbenchExportRows } from '../src/vector/searchWorkbench';
+import { HYBRID_LABEL, HYBRID_NEEDS_KEYWORD, KEYWORD_UNSUPPORTED, NODE_SETTING_NOTE, RRF_K, SEARCH_MODES, STATUS_WORDS, TOP_K_OPTIONS, VECTOR_UNSUPPORTED, classifyAt, defaultMode, fromChatLine, fuse, initialThreshold, keywordCaption, keywordSearchInput, modeOptions, nodeSettingText, openInSearchPrefill, plan, prefillRun, previewOf, rateLimitSentence, retrievalExportRows, retryAfterSeconds, rowsFromSearch, runWorkbench, scoreTitle, searchExportItems, searchScope, secondsLeft, semanticSearchInput, showSearchOnMap, sliderRange, sliderValueText, thresholdSentence, topKChoices, topKOptions, workbenchExportRows } from '../src/vector/searchWorkbench';
 import type { ChatPrefill, RunFromChat, SearchMode, WorkbenchDeps, WorkbenchRow, WorkbenchRun } from '../src/vector/searchWorkbench';
 
 // ── Fixtures ────────────────────────────────────────────────────────────────
@@ -649,6 +649,35 @@ test('fromChatLine: how many of the cited chunks the run lists, and whether it s
 	assert.equal(lineOf(3, 3, { askedAbout: 4, sameScope: false, scoped: 2 }, true), 'From the chat: the 3 chunks its answer cited are marked “cited”. The question was asked about 4 documents only; this search used the scope instead.');
 });
 
+test('"Open in Search": its first run sends the search "Why these?" sent — same vector, k, documents and flags', async () => {
+	const sources: IChatSource[] = [
+		{ rank: 1, key: ['2ed1cfeb-37ac-4394-30f7-699303f093bd', 39], objectId: '2ed1cfeb-37ac-4394-30f7-699303f093bd', chunkId: 39, path: 'C:/demo/ops/ops_021.pdf', score: 0.5433, text: '' },
+		{ rank: 2, key: CITED, objectId: CITED[0], chunkId: CITED[1], path: 'C:/demo/ops/ops_005.pdf', score: 0.5247, text: '' },
+		{ rank: 3, key: ['0ab4bcf8-0000-0000-0000-000000000000', 27], objectId: '0ab4bcf8-0000-0000-0000-000000000000', chunkId: 27, path: 'C:/demo/x.md', score: 0.5, text: '' },
+	];
+	for (const scope of [null, ['d1', 'd2']]) {
+		const prefill = openInSearchPrefill(FALCON, sources, sources.length, limits, scope);
+		assert.deepEqual(prefill, { question: FALCON, cited: sources.map((source) => source.key), topK: 13, objectIds: scope });
+		const next = prefillRun(prefill, modeOptions(model()), topKOptions(limits));
+		assert.deepEqual(next, { question: FALCON, mode: 'semantic', topK: 13, objectIds: scope });
+		const { deps, calls } = fakeCalls({ embed: [embedOk as unknown as Record<string, unknown>], search: [searchVector as unknown as Record<string, unknown>] });
+		const outcome = await runWorkbench(deps, { ...base, question: next.question, mode: next.mode as SearchMode, topK: next.topK, objectIds: next.objectIds, chat: prefill });
+		assert.ok(outcome.ok);
+		assert.deepEqual(calls[1].input, { ...withScope(debuggerSearchInput(embedOk.vectors[0], embedOk.model, sources.length, limits), scope) }, `scope ${JSON.stringify(scope)}`);
+		assert.equal(outcome.run.fromChat?.sameScope, true);
+	}
+	assert.equal(openInSearchPrefill(FALCON, [], 0, limits, []).objectIds, null, 'no scope: the whole collection');
+});
+
+test('prefillRun and topKChoices: a prefill without k shows the cited chunks plus ten; Semantic when offered; the k joins the choices', () => {
+	const contractOnly: ChatPrefill = { question: FALCON, cited: [CITED, CITED, CITED] };
+	assert.deepEqual(prefillRun(contractOnly, modeOptions(model()), topKOptions(limits)), { question: FALCON, mode: 'semantic', topK: 25, objectIds: null });
+	const noEmbed = modeOptions(model({ embed: { enabled: false, reason: null }, nodes: { store: 'store_1', embed: null, llm: null, llmName: null } }));
+	assert.equal(prefillRun(BROUGHT, noEmbed, topKOptions(limits)).mode, 'keyword');
+	assert.deepEqual(topKChoices([5, 10, 25, 50], 13), [5, 10, 13, 25, 50]);
+	assert.deepEqual(topKChoices([5, 10, 25, 50], 10), [5, 10, 25, 50]);
+});
+
 // ── Export and the map ──────────────────────────────────────────────────────
 
 test('workbenchExportRows: the search columns, the words on screen, no vector', () => {
@@ -748,11 +777,18 @@ test('wiring: the workbench is pure, the panel calls embed and search through ch
 	assert.doesNotMatch(phase, /vector|number\[\]/);
 });
 
-test("wiring: the panel hands each run the chat's prefill, never cited keys apart from their question", () => {
+test('wiring: the panel hands each run the chat\'s prefill (never cited keys apart from their question); "Why these?" searches what the chat asked and hands Search its k and documents', () => {
 	const panel = code(path.join('components', 'SearchPanel.tsx'));
 	assert.doesNotMatch(panel, /setCited|useState<readonly VectorKey\[\]>/, 'no cited keys kept apart from their question');
 	assert.match(panel, /chat: request\.chat/);
-	assert.match(panel, /void run\(\{ question, questionB: comparing \? questionB : null, mode, topK, chat \}\)/);
+	assert.match(panel, /const next = prefillRun\(prefill, options, ks\);/);
+	assert.match(panel, /objectIds: next\.objectIds/);
+	assert.match(panel, /objectIds: gate\.objectIds/);
+	const debuggerSource = code(path.join('components', 'RetrievalDebugger.tsx'));
+	assert.match(debuggerSource, /withScope\(debuggerSearchInput\(vector, embeddingModel, topK, model\.limits\), scope\)/);
+	assert.match(debuggerSource, /openInSearchPrefill\(question, answerSources \?\? \[\], topK, model\.limits, scope\)/);
+	const chatPanel = code(path.join('components', 'ChatPanel.tsx'));
+	assert.match(chatPanel, /<RetrievalDebugger [^>]*scope=\{turn\.scope\}/);
 });
 
 test('wiring: the search files insert no HTML, stop no propagation, listen for no keys, log nothing and hold no token', () => {

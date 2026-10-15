@@ -30,7 +30,8 @@
 //      the Tools source) — the one vector the console ever sends is the exact
 //      vector this call returned;
 //   2. searches the store with it for k + 10 rows, asking for the rows below
-//      the node's threshold and below the driver's floor too;
+//      the node's threshold and below the driver's floor too, within the
+//      documents the question was asked about when the chat was scoped;
 //   3. lays the rows out against the threshold and floor: "used" rows are what
 //      the chat pipeline's store would pass on, "near misses" fell under the
 //      threshold, the rest fell under the floor.
@@ -106,6 +107,20 @@ export function embedInput(question: string): IEmbedInput {
 }
 
 /**
+ * How many rows the debugger asks for: the answer's k plus {@link DEBUGGER_EXTRA}, within the node's limit.
+ * "Open in Search" hands this k to Search, so its first run lists the same rows.
+ *
+ * @param topK - The answer's k.
+ * @param limits - The node's limits, or null.
+ * @returns k.
+ */
+export function debuggerTopK(topK: number, limits: Pick<IVectorLimits, 'top_k_max'> | null): number {
+	const max = limits?.top_k_max ?? TOP_K_MAX;
+	const k = Number.isFinite(topK) && topK > 0 ? Math.floor(topK) : DEFAULT_TOP_K - DEBUGGER_EXTRA;
+	return Math.max(1, Math.min(max, k + DEBUGGER_EXTRA));
+}
+
+/**
  * The `search` input of the debugger.
  *
  * @param vector - Exactly the vector `embed` returned for the question.
@@ -115,17 +130,39 @@ export function embedInput(question: string): IEmbedInput {
  * @returns The input.
  */
 export function debuggerSearchInput(vector: number[], embeddingModel: string | null, topK: number, limits: IVectorLimits | null): ISearchInput {
-	const max = limits?.top_k_max ?? TOP_K_MAX;
-	const k = Number.isFinite(topK) && topK > 0 ? Math.floor(topK) : DEFAULT_TOP_K - DEBUGGER_EXTRA;
 	const input: ISearchInput = {
 		vector,
-		top_k: Math.max(1, Math.min(max, k + DEBUGGER_EXTRA)),
+		top_k: debuggerTopK(topK, limits),
 		mode: 'semantic',
 		include_below_floor: true,
 		include_below_threshold: true,
 	};
 	if (embeddingModel !== null && embeddingModel !== '') input.embedding_model = embeddingModel;
 	return input;
+}
+
+/**
+ * A search input limited to the documents the question was asked about, as the chat sent them
+ * (`filter.objectIds`); no documents means the whole collection, as the chat does.
+ *
+ * @param input - The input.
+ * @param objectIds - The documents, or null.
+ * @returns A copy with the filter (the same vector), or the input itself.
+ */
+export function withScope(input: ISearchInput, objectIds: readonly string[] | null | undefined): ISearchInput {
+	if (!objectIds || objectIds.length === 0) return input;
+	return { ...input, filter: { ...input.filter, objectIds: [...objectIds] } };
+}
+
+/**
+ * The debugger's line when the question was asked about some documents only.
+ *
+ * @param objectIds - The documents, or null.
+ * @returns The sentence, or null for the whole collection.
+ */
+export function debuggerScopeSentence(objectIds: readonly string[] | null | undefined): string | null {
+	if (!objectIds || objectIds.length === 0) return null;
+	return `Searched only the ${objectIds.length === 1 ? 'document' : `${objectIds.length.toLocaleString('en-US')} documents`} the question was asked about.`;
 }
 
 /**

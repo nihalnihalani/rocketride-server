@@ -40,19 +40,20 @@
 //   - the scope (folder, file type, ...) goes out as `filter.objectIds`, never
 //     more than `limits.scope_keys_max` ids;
 //   - "Open in Search" brings the chat's question with the chunks its answer
-//     cited: the "cited" marks go only on a run of that question, never on
-//     another one on the same panel.
+//     cited: the first run searches as "Why these?" did (its k, the
+//     documents the question was asked about), and the "cited" marks go only
+//     on a run of that question, never on another one on the same panel.
 //
 // `runWorkbench` makes a run's calls through the function it is given (the
 // panel passes chat/toolCalls' callTool): the query vector is a local of that
 // function, sent once to `search` and never returned or kept.
 // =============================================================================
 
-import type { ConsoleActions, ConsoleModel, IExportItem, IExportRows, IScopeState, IScoreInfo, ISearchInput, ISearchResult, IVectorLimits, KeywordMatch, SelectionStore, VectorKey } from '../contract/types';
+import type { ConsoleActions, ConsoleModel, IChatSource, IExportItem, IExportRows, IScopeState, IScoreInfo, ISearchInput, ISearchResult, IVectorLimits, KeywordMatch, SelectionStore, VectorKey } from '../contract/types';
 import { EXPORT_COLUMNS } from '../contract/types';
 import type { CallOutcome } from '../chat/toolCalls';
 import { QUERY_NEEDS_EMBED } from '../map/wording';
-import { MODEL_MISMATCH_SENTENCE, embedInput } from './retrieval';
+import { DEBUGGER_EXTRA, MODEL_MISMATCH_SENTENCE, debuggerTopK, embedInput } from './retrieval';
 import type { RetrievalStatus, RetrievalView } from './retrieval';
 import { keyId } from './compare';
 
@@ -893,6 +894,68 @@ export function fromChatLine(run: { rows: readonly Pick<WorkbenchRow, 'cited'>[]
 	}
 	if (tie.askedAbout === null) return `${line} Searched within the scope; the answer was not.`;
 	return `${line} The question was asked about ${documents(tie.askedAbout)} only; this search ${run.scoped === null ? 'covered the whole collection' : 'used the scope instead'}.`;
+}
+
+/**
+ * What "Why these?" hands Search: the question, the answer's cited chunks, the k it searched with and the documents it searched.
+ *
+ * @param question - The question.
+ * @param answerSources - The answer's citations.
+ * @param answerTopK - The answer's k (the debugger asks for it plus ten).
+ * @param limits - The node's limits, or null.
+ * @param objectIds - The documents the question was asked about, or null.
+ * @returns The prefill.
+ */
+export function openInSearchPrefill(question: string, answerSources: readonly IChatSource[], answerTopK: number, limits: Pick<IVectorLimits, 'top_k_max'> | null, objectIds: readonly string[] | null): ChatPrefill {
+	return { question, cited: answerSources.map((source) => source.key), topK: debuggerTopK(answerTopK, limits), objectIds: scopeIds(objectIds) };
+}
+
+/**
+ * The smallest offered k that shows the cited chunks plus ten (as the debugger does), else the largest.
+ *
+ * @param options - The offered k.
+ * @param cited - How many chunks the answer cited.
+ * @returns k.
+ */
+function topKFor(options: readonly number[], cited: number): number {
+	const want = cited + DEBUGGER_EXTRA;
+	return options.find((k) => k >= want) ?? options[options.length - 1] ?? DEFAULT_TOP_K;
+}
+
+/** The run "Open in Search" starts. */
+export interface PrefillRun {
+	question: string;
+	/** Semantic (as "Why these?" searched) when offered, else the panel's default; null when nothing can run. */
+	mode: SearchMode | null;
+	topK: number;
+	/** The documents the question was asked about, or null for the whole collection. */
+	objectIds: string[] | null;
+}
+
+/**
+ * The run "Open in Search" starts: the search "Why these?" made (Semantic, its k, its documents), so both list the same rows.
+ *
+ * @param prefill - What "Open in Search" brought.
+ * @param options - {@link modeOptions}.
+ * @param ks - {@link topKOptions}.
+ * @returns The run.
+ */
+export function prefillRun(prefill: ChatPrefill, options: readonly ModeOption[], ks: readonly number[]): PrefillRun {
+	const mode = options.find((o) => o.mode === 'semantic')?.enabled ? 'semantic' : defaultMode(options);
+	const given = prefill.topK;
+	const topK = typeof given === 'number' && Number.isFinite(given) && given >= 1 ? Math.floor(given) : topKFor(ks, prefill.cited.length);
+	return { question: prefill.question, mode, topK, objectIds: scopeIds(prefill.objectIds) };
+}
+
+/**
+ * The k the panel offers: {@link topKOptions}, plus the current k when "Open in Search" brought another.
+ *
+ * @param ks - {@link topKOptions}.
+ * @param current - The panel's k.
+ * @returns The choices, ascending.
+ */
+export function topKChoices(ks: readonly number[], current: number): number[] {
+	return ks.includes(current) ? [...ks] : [...ks, current].sort((a, b) => a - b);
 }
 
 // ── Export ──────────────────────────────────────────────────────────────────

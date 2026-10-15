@@ -427,14 +427,19 @@ test('SearchPanel: a scope above the cap turns Run off with its sentence; a scop
 	assert.match(within, /Searching 2 documents in scope: folder is under C:\/demo\//);
 });
 
-test('SearchPanel: "Open in Search" fills the question; the "From the chat" line waits for a run of it', () => {
+test('SearchPanel: "Open in Search" fills the question and the k "Why these?" used; the "From the chat" line waits for a run of it', () => {
 	const cited: VectorKey[] = [
 		['a', 0],
 		['b', 1],
 		['c', 2],
 	];
-	const html = render(h(SearchPanel, { model: modelOn(enriched), channels, selection: createSelectionStore('render-1'), actions, prefill: { question: 'Where does Falcon Station get its water?', cited } }));
+	const html = render(h(SearchPanel, { model: modelOn(enriched), channels, selection: createSelectionStore('render-1'), actions, prefill: { question: 'Where does Falcon Station get its water?', cited, topK: 13, objectIds: null } }));
 	assert.match(html, /<input type="search"[^>]*value="Where does Falcon Station get its water\?"/);
+	assert.deepEqual(
+		[...html.matchAll(/<option value="(\d+)"/g)].map((m) => Number(m[1])),
+		[5, 10, 13, 25, 50]
+	);
+	assert.match(html, /<option value="13" selected="">/);
 	// The line describes a run's rows; before the run there are none.
 	assert.doesNotMatch(html, /From the chat/);
 	assert.match(html, /<button type="submit"(?![^>]*disabled)[^>]*>Run<\/button>/);
@@ -533,6 +538,13 @@ test('QueryCompare: the column of the brought question says "From the chat" and 
 	assert.match(column('A'), /From the chat: the chunk its answer cited is marked “cited”\./);
 	assert.match(column('A'), /#67<\/button> · cited/);
 	assert.doesNotMatch(column('B'), /From the chat|· cited/);
+});
+
+test('RetrievalDebugger: says when it searches only the documents the question was asked about', () => {
+	const one = render(h(RetrievalDebugger, { model: model(), channels, question: 'q', topK: 3, onClose: () => undefined, scope: ['d1'] }));
+	assert.match(one, /Searched only the document the question was asked about\./);
+	const all = render(h(RetrievalDebugger, { model: model(), channels, question: 'q', topK: 3, onClose: () => undefined, scope: null }));
+	assert.doesNotMatch(all, /Searched only/);
 });
 
 test('ChatPanel: Search on swaps the body in the same space; the chat (thread and draft) stays mounted, hidden, and comes back', async () => {

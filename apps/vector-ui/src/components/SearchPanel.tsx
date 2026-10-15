@@ -37,8 +37,11 @@
 // and shows them side by side (QueryCompare), with two stars on the map.
 //
 // "Open in Search" brings the chat's question and the chunks its answer
-// cited. The "cited" marks and the "From the chat" line belong to a run of
-// that question only: another question on the same panel carries neither.
+// cited. Its first run is the search "Why these?" made (Semantic, the same
+// k, the documents the question was asked about), so both list the same
+// rows; later runs use the panel's own k and the console's scope. The
+// "cited" marks and the "From the chat" line belong to a run of that
+// question only: another question on the same panel carries neither.
 //
 // The model is src/vector/searchWorkbench.ts. Calls go through
 // chat/toolCalls' callTool only: `embed` on the embedding node and `search`
@@ -53,9 +56,8 @@ import { Banner, commonStyles } from 'shell';
 import type { SearchPanelProps as ContractSearchPanelProps, IScoreInfo } from '../contract/types';
 import { callTool, toolChannelFor } from '../chat/toolCalls';
 import { showCompareOnMap } from '../adapters/consoleActions';
-import { DEBUGGER_EXTRA } from '../vector/retrieval';
 import { compareRuns, compareSentence } from '../vector/compare';
-import { CALL_TIMEOUT_MS, DEFAULT_TOP_K, KEYWORD_FALLBACK_SENTENCE, MODEL_MISMATCH_SENTENCE, MODE_HINTS, NODE_SETTING_FIELD, NODE_SETTING_NOTE, NODE_SETTING_RANGE, STATUS_WORDS, classifyAt, defaultMode, fromChatLine, initialThreshold, keywordCaption, modeOptions, noResultsSentence, nodeSettingText, onGrid, rateLimitSentence, runCaption, runWorkbench, scoreTitle, searchExportItems, searchScope, secondsLeft, showSearchOnMap, sliderRange, sliderValueText, thresholdSentence, topKOptions } from '../vector/searchWorkbench';
+import { CALL_TIMEOUT_MS, DEFAULT_TOP_K, KEYWORD_FALLBACK_SENTENCE, MODEL_MISMATCH_SENTENCE, MODE_HINTS, NODE_SETTING_FIELD, NODE_SETTING_NOTE, NODE_SETTING_RANGE, STATUS_WORDS, classifyAt, defaultMode, fromChatLine, initialThreshold, keywordCaption, modeOptions, noResultsSentence, nodeSettingText, onGrid, prefillRun, rateLimitSentence, runCaption, runWorkbench, scoreTitle, searchExportItems, searchScope, secondsLeft, showSearchOnMap, sliderRange, sliderValueText, thresholdSentence, topKChoices, topKOptions } from '../vector/searchWorkbench';
 import type { ChatPrefill, Classification, ModeOption, SearchMode, SliderRange, WorkbenchDeps, WorkbenchOutcome, WorkbenchRow, WorkbenchRun } from '../vector/searchWorkbench';
 import { ExportMenu } from './ExportMenu';
 import { QueryCompare } from './QueryCompare';
@@ -64,8 +66,10 @@ import { ScoreHistogram } from './ScoreHistogram';
 /** The chat panel's line while Search is shown in its place. */
 export const SHOWING_SEARCH = 'Showing Search; the chat is one click away';
 
-/** The contract props plus a way back to the chat (after "ask about this"). */
+/** The contract props, with how "Why these?" searched in the prefill, and a way back to the chat (after "ask about this"). */
 export interface SearchPanelProps extends ContractSearchPanelProps {
+	/** Filled by "Open in Search": the question, the chunks its answer cited, and the k and documents "Why these?" searched. */
+	prefill?: ChatPrefill | null;
 	/** Show the chat again: "ask about this" scoped its next question. */
 	onShowChat?(): void;
 }
@@ -277,6 +281,8 @@ interface RunPlan {
 	questionB: string | null;
 	mode: SearchMode;
 	topK: number;
+	/** The documents to search, or null for the whole collection. */
+	objectIds: readonly string[] | null;
 	/** What "Open in Search" brought; a run of another question carries none of it. */
 	chat: ChatPrefill | null;
 }
@@ -294,18 +300,6 @@ function reasonLines(options: readonly ModeOption[]): string[] {
 		byReason.set(option.reason, [...(byReason.get(option.reason) ?? []), option.label]);
 	}
 	return [...byReason.entries()].map(([reason, labels]) => `${labels.join(', ')}: ${reason}`);
-}
-
-/**
- * The smallest offered k that shows the debugger's rows (the answer's cited chunks plus ten), else the largest.
- *
- * @param options - The offered k.
- * @param cited - How many chunks the answer cited.
- * @returns k.
- */
-function topKFor(options: readonly number[], cited: number): number {
-	const want = cited + DEBUGGER_EXTRA;
-	return options.find((k) => k >= want) ?? options[options.length - 1] ?? DEFAULT_TOP_K;
 }
 
 /**
@@ -327,7 +321,7 @@ export function SearchPanel({ model, channels, selection, actions, prefill = nul
 	const [questionB, setQuestionB] = useState('');
 	const [comparing, setComparing] = useState(false);
 	const [chosenMode, setMode] = useState<SearchMode | null>(() => defaultMode(options));
-	const [topK, setTopK] = useState(() => (ks.includes(DEFAULT_TOP_K) ? DEFAULT_TOP_K : (ks[ks.length - 1] ?? DEFAULT_TOP_K)));
+	const [topK, setTopK] = useState(() => (prefill !== null ? prefillRun(prefill, options, ks).topK : ks.includes(DEFAULT_TOP_K) ? DEFAULT_TOP_K : (ks[ks.length - 1] ?? DEFAULT_TOP_K)));
 	// null follows the node's setting (the dialect may answer after the panel mounted); a number is the user's.
 	const [chosenAt, setAt] = useState<number | null>(null);
 	// What "Open in Search" brought: kept with its question, so only a run of that question is marked.
@@ -416,7 +410,7 @@ export function SearchPanel({ model, channels, selection, actions, prefill = nul
 				if (runId.current === id) setPhase({ kind: step, side });
 			},
 		});
-		const base = { mode: request.mode, topK: request.topK, limits: model.limits, storeNode: model.nodes.store, embedNode: model.nodes.embed, objectIds: gate.objectIds, chat: request.chat };
+		const base = { mode: request.mode, topK: request.topK, limits: model.limits, storeNode: model.nodes.store, embedNode: model.nodes.embed, objectIds: request.objectIds, chat: request.chat };
 		setRuns({ a: null, b: null });
 		setPhase({ kind: request.mode === 'keyword' ? 'searching' : 'embedding', side: 'A' });
 		const a = await runWorkbench(deps('A'), { ...base, question: request.question });
@@ -439,18 +433,18 @@ export function SearchPanel({ model, channels, selection, actions, prefill = nul
 		actions.announce(compareSentence(compareRuns(a.run.rows, b.run.rows)));
 	};
 
-	// "Open in Search" from the chat: take the question and its cited chunks, and run it once.
+	// "Open in Search" from the chat: take the question and its cited chunks, and run once the search "Why these?" made.
 	useEffect(() => {
 		if (prefill === null || prefill === lastPrefill.current) return;
 		lastPrefill.current = prefill;
-		const semantic = options.find((o) => o.mode === 'semantic')?.enabled ? 'semantic' : mode;
-		const k = topKFor(ks, prefill.cited.length);
-		setQuestion(prefill.question);
+		const next = prefillRun(prefill, options, ks);
+		setQuestion(next.question);
 		setChat(prefill);
 		setComparing(false);
-		setMode(semantic);
-		setTopK(k);
-		if (semantic !== null && gate.blocked === null && !limited && prefill.question.trim() !== '') void run({ question: prefill.question, questionB: null, mode: semantic, topK: k, chat: prefill });
+		setMode(next.mode);
+		setTopK(next.topK);
+		// Its own documents (the question's), not the console's scope, so the console's gate does not stop it.
+		if (next.mode !== null && !limited && next.question.trim() !== '') void run({ question: next.question, questionB: null, mode: next.mode, topK: next.topK, objectIds: next.objectIds, chat: prefill });
 		// Runs once per prefill; the rest of the panel's state does not restart it.
 		// eslint-disable-next-line react-hooks/exhaustive-deps
 	}, [prefill]);
@@ -504,7 +498,7 @@ export function SearchPanel({ model, channels, selection, actions, prefill = nul
 				onSubmit={(event) => {
 					event.preventDefault();
 					if (blockedBy !== null || running || mode === null) return;
-					void run({ question, questionB: comparing ? questionB : null, mode, topK, chat });
+					void run({ question, questionB: comparing ? questionB : null, mode, topK, objectIds: gate.objectIds, chat });
 				}}
 			>
 				<div style={S.row}>
@@ -532,7 +526,7 @@ export function SearchPanel({ model, channels, selection, actions, prefill = nul
 				{keywordOffered && <p style={S.note}>{keywordCaption(dialect?.keyword_match)}</p>}
 				<div style={S.row}>
 					<select aria-label="Results to show (top k)" value={topK} style={S.select} onChange={(event) => setTopK(Number(event.currentTarget.value))}>
-						{ks.map((k) => (
+						{topKChoices(ks, topK).map((k) => (
 							<option key={k} value={k}>
 								{k}
 							</option>
