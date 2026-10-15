@@ -115,7 +115,7 @@ const S = {
 	td: { padding: '3px 4px', borderBottom: '1px solid var(--rr-border)', verticalAlign: 'top', overflowWrap: 'anywhere' } as CSSProperties,
 	muted: { color: 'var(--rr-text-secondary)' } as CSSProperties,
 	meta: { display: 'block', color: 'var(--rr-text-secondary)' } as CSSProperties,
-	actions: { display: 'flex', gap: 4, flexWrap: 'wrap' } as CSSProperties,
+	actions: { display: 'flex', gap: 4, flexWrap: 'wrap', marginTop: 2 } as CSSProperties,
 	slider: { flex: '1 1 160px', minWidth: 0 } as CSSProperties,
 	code: { fontFamily: 'var(--rr-font-mono, monospace)', fontSize: 11, padding: '0 4px', border: '1px solid var(--rr-border)', borderRadius: 4 } as CSSProperties,
 };
@@ -124,6 +124,8 @@ const S = {
 
 /** Props of {@link ThresholdControls}. */
 interface ThresholdControlsProps {
+	/** Words before the line (Compare: 'A — '), or none. */
+	lead?: string;
 	rows: readonly WorkbenchRow[];
 	view: Classification;
 	score: IScoreInfo | null;
@@ -140,7 +142,7 @@ interface ThresholdControlsProps {
  * @param props - {@link ThresholdControlsProps}.
  * @returns The controls.
  */
-function ThresholdControls({ rows, view, score, range, onThreshold, onCopySetting, copied }: ThresholdControlsProps): React.ReactElement {
+function ThresholdControls({ lead = '', rows, view, score, range, onThreshold, onCopySetting, copied }: ThresholdControlsProps): React.ReactElement {
 	const setting = nodeSettingText(view.at);
 	const scores = view.rows.map((row) => row.score).filter((value): value is number => value !== null);
 	return (
@@ -148,7 +150,7 @@ function ThresholdControls({ rows, view, score, range, onThreshold, onCopySettin
 			<div style={S.row}>
 				<input type="range" aria-label="Threshold" min={range.min} max={range.max} step={range.step} value={view.at} aria-valuetext={sliderValueText(view)} style={S.slider} onChange={(event) => onThreshold(onGrid(Number(event.currentTarget.value)))} />
 				<output role="status" style={S.note}>
-					{thresholdSentence(rows, view.at, score)}
+					{`${lead}${thresholdSentence(rows, view.at, score)}`}
 				</output>
 			</div>
 			<div style={S.row}>
@@ -242,9 +244,6 @@ export function SearchResults({ run, view, score, range, onThreshold, onCopySett
 								<th scope="col" style={S.th}>
 									Status
 								</th>
-								<th scope="col" style={S.th}>
-									<span style={{ position: 'absolute', width: 1, height: 1, overflow: 'hidden', clip: 'rect(0 0 0 0)' }}>Actions</span>
-								</th>
 							</tr>
 						</thead>
 						<tbody>
@@ -258,12 +257,6 @@ export function SearchResults({ run, view, score, range, onThreshold, onCopySett
 											<span>{`${path} #${row.chunkId}${row.cited ? ' · cited' : ''}`}</span>
 											{from !== null && <span style={S.meta}>{from}</span>}
 											{row.preview !== '' && <span style={S.meta}>{row.preview}</span>}
-										</td>
-										<td style={S.td} title={scoreTitle(row, score)}>
-											{row.score !== null ? row.score.toFixed(3) : 'match'}
-										</td>
-										<td style={S.td}>{STATUS_WORDS[row.status]}</td>
-										<td style={S.td}>
 											<span style={S.actions}>
 												<button type="button" style={S.button} aria-label={`Open ${path} at chunk ${row.chunkId}`} onClick={() => onOpen(row)}>
 													open
@@ -276,6 +269,10 @@ export function SearchResults({ run, view, score, range, onThreshold, onCopySett
 												</button>
 											</span>
 										</td>
+										<td style={S.td} title={scoreTitle(row, score)}>
+											{row.score !== null ? row.score.toFixed(3) : 'match'}
+										</td>
+										<td style={S.td}>{STATUS_WORDS[row.status]}</td>
 									</tr>
 								);
 							})}
@@ -581,7 +578,7 @@ export function SearchPanel({ model, channels, selection, actions, prefill = nul
 			{runs.a !== null && viewA !== null && runs.b === null && <SearchResults run={runs.a} view={viewA} score={score} range={range} {...handlers} onMap={(row) => showSearchOnMap(selection, actions, (runs.a as WorkbenchRun).question, [row.key])} onShowAll={() => showSearchOnMap(selection, actions, (runs.a as WorkbenchRun).question, (runs.a as WorkbenchRun).rows.map((row) => row.key))} />}
 			{runs.a !== null && viewA !== null && runs.b !== null && viewB !== null && (
 				<>
-					{runs.a.rated && runs.a.rows.length > 0 && <ThresholdControls rows={runs.a.rows} view={viewA} score={score} range={range} onThreshold={setAt} onCopySetting={copySetting} copied={copied} />}
+					{runs.a.rated && runs.a.rows.length > 0 && <ThresholdControls lead="A — " rows={runs.a.rows} view={viewA} score={score} range={range} onThreshold={setAt} onCopySetting={copySetting} copied={copied} />}
 					<QueryCompare
 						a={{ run: runs.a, view: viewA }}
 						b={{ run: runs.b, view: viewB }}

@@ -61,11 +61,8 @@ export interface QueryCompareProps {
 /** The star each run gets on the map. */
 const STARS = { A: '★', B: '☆' } as const;
 
-/** Words for where a row stands against the other run. */
-const SIDE_WORDS: Record<'A' | 'B', Record<CompareSide, string>> = {
-	A: { both: 'also in B', 'only-a': 'only in A', 'only-b': 'only in B' },
-	B: { both: 'also in A', 'only-a': 'only in A', 'only-b': 'only in B' },
-};
+/** Whether the other run found the row too, in the "Also in" column. */
+const SIDE_WORDS: Record<CompareSide, string> = { both: 'yes', 'only-a': 'no', 'only-b': 'no' };
 
 const S = {
 	root: { display: 'flex', flexDirection: 'column', gap: 6, marginTop: 6 } as CSSProperties,
@@ -79,6 +76,7 @@ const S = {
 	td: { padding: '2px 4px', borderBottom: '1px solid var(--rr-border)', verticalAlign: 'top', overflowWrap: 'anywhere' } as CSSProperties,
 	muted: { color: 'var(--rr-text-secondary)' } as CSSProperties,
 	button: { ...commonStyles.buttonSecondary, padding: '1px 8px', fontSize: 11 } as CSSProperties,
+	link: { background: 'none', border: 'none', padding: 0, margin: 0, font: 'inherit', color: 'inherit', textAlign: 'left', textDecoration: 'underline', cursor: 'pointer', overflowWrap: 'anywhere' } as CSSProperties,
 };
 
 /** Props of one column. */
@@ -120,7 +118,7 @@ function Column({ letter, side, summary, score, onOpen }: SideProps): React.Reac
 								Score
 							</th>
 							<th scope="col" style={S.th}>
-								{letter === 'A' ? 'In B' : 'In A'}
+								{letter === 'A' ? 'Also in B' : 'Also in A'}
 							</th>
 						</tr>
 					</thead>
@@ -132,14 +130,14 @@ function Column({ letter, side, summary, score, onOpen }: SideProps): React.Reac
 								<tr key={`${row.objectId}#${row.chunkId}`} data-status={row.status} data-side={where} style={row.status === 'used' || row.status === 'keyword' ? undefined : S.muted}>
 									<td style={S.td}>{row.rank}</td>
 									<td style={S.td} title={row.preview}>
-										<button type="button" style={S.button} aria-label={`Open ${path} at chunk ${row.chunkId}`} onClick={() => onOpen(row)}>
+										<button type="button" style={S.link} aria-label={`Open ${path} at chunk ${row.chunkId}`} onClick={() => onOpen(row)}>
 											{`${path} #${row.chunkId}`}
 										</button>
 									</td>
 									<td style={S.td} title={`${scoreTitle(row, score)} · ${STATUS_WORDS[row.status]}`}>
 										{row.score !== null ? row.score.toFixed(3) : 'match'}
 									</td>
-									<td style={S.td}>{SIDE_WORDS[letter][where]}</td>
+									<td style={S.td}>{SIDE_WORDS[where]}</td>
 								</tr>
 							);
 						})}
