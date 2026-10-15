@@ -198,3 +198,15 @@ test('the directory lists flagged documents under "Needs attention" with their b
 	const strip = renderToStaticMarkup(<StatsStrip stats={stats} dialect={dialect} readOnly={false} health={healthSummary(rows, { medianChunks: 9, complete: true })} />);
 	assert.match(strip, /data-chip="attention">1 needs attention</);
 });
+
+test('an oversize document stays in its folder with a muted "oversize" badge; its tooltip does not say it needs attention', () => {
+	const memo = (i: number): IDocumentItem => ({ objectId: `m${i}`, path: `C:/corp/memos/memo_${i}.txt`, chunks: 1, has_first_chunk: true, tables: 0, deleted: false, nodeId: null, size: null, modifyTime: null, ingestedAt: null, pointId: null, max_chunk_id: 0, deleted_chunks: 0 });
+	const manual: IDocumentItem = { ...memo(0), objectId: 'manual-1', path: 'C:/corp/handbooks/manual.pdf', chunks: 40, max_chunk_id: 39 };
+	const rows = [...Array.from({ length: 20 }, (_, i) => memo(i)), manual];
+	const pager = pagerApplyPage(pagerBegin(pagerInit()), readDocumentsPage({ success: true, items: rows, next_cursor: null, total: rows.length, counts_exact: true, distinct: true, sorted: true, caveats: [] }));
+	const html = renderToStaticMarkup(<DocumentDirectory pager={pager} selectedId={null} writes={on} onSelect={noop} onRemove={noop} onLoadMore={noop} onRetry={noop} />);
+	assert.match(html, /aria-label="Folder C:\/corp\/handbooks\/"/);
+	assert.doesNotMatch(html, /Needs attention/);
+	assert.match(html, /<span style="[^"]*var\(--rr-border-input\)[^"]*" data-flag="">oversize<\/span>/);
+	assert.match(html, /title="C:\/corp\/handbooks\/manual\.pdf · [^"]*· oversize · objectId manual-1"/);
+});

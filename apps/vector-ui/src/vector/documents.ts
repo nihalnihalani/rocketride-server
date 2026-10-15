@@ -28,10 +28,11 @@
 // derived here, in the browser, from `/` and `\` in the stored path (the
 // store keeps paths as the ingest sent them: Windows drive letters, network
 // shares and POSIX roots stay as they are). A bare file name goes under
-// "Uploaded"; a document with a health flag (vector/health.ts: no first
-// chunk, gaps, deleted chunks, empty parse, oversize) goes under "Needs
-// attention", by its whole path, with its flags as badges; two documents
-// with the same path stay two rows, told apart by a short objectId.
+// "Uploaded"; a document with a defect (vector/health.ts: no first chunk,
+// gaps, deleted chunks, empty parse) goes under "Needs attention", by its
+// whole path, with its flags as badges; an oversize document keeps its
+// folder and gets the badge there; two documents with the same path stay two
+// rows, told apart by a short objectId.
 //
 // AUTO-PAGING. After the first page the directory keeps asking for pages in
 // the background, up to DIRECTORY_AUTO_ROWS (5,000) rows. The first page is
@@ -50,7 +51,7 @@
 import type { FilterApplied, IDocumentItem, IDocumentsFilter, IExportRows } from '../contract/types';
 import { EXPORT_COLUMNS } from '../contract/types';
 import { DIRECTORY_AUTO_ROWS, DIRECTORY_LOAD_MORE } from './budgets';
-import { documentHealth } from './health';
+import { documentHealth, needsAttention } from './health';
 import type { IDocumentsPageView } from './results';
 import { formatCount } from './stats';
 import { CAVEAT_SENTENCES, DOCUMENTS_REPEATED_TEXT } from './wording';
@@ -94,8 +95,10 @@ export interface IDirectoryRow {
 	duplicate: boolean;
 	/** The first 8 characters of the objectId (shown on hover, and beside a duplicate). */
 	shortId: string;
-	/** The health flags' badges ('no first chunk', '1 deleted chunk'); empty for a healthy document. */
+	/** The health flags' badges ('no first chunk', '1 deleted chunk', 'oversize'); empty for a healthy document. */
 	flags: string[];
+	/** The row is under "Needs attention" (a defect; an oversize document alone keeps its folder). */
+	attention: boolean;
 }
 
 /** One group of the directory. */
@@ -151,9 +154,9 @@ export function sortDocuments(items: readonly IDocumentItem[]): IDocumentItem[] 
  * Group rows for display, keeping their order: folders in order of first
  * appearance, then Uploaded, then Needs attention (by path). The pager decides
  * when the rows are sorted (see the header), so grouping never reorders a
- * folder. A document goes under Needs attention when it has a health flag;
- * "oversize" needs the median, which the directory passes only once its
- * listing settled, so no row moves while pages arrive.
+ * folder. A document goes under Needs attention when it has a defect flag;
+ * "oversize" (which needs the median, passed once the listing settled) is a
+ * badge in the document's own folder, so no row moves when it comes or goes.
  *
  * @param rows - The documents, in display order.
  * @param health - The median chunks per loaded document (null while unknown).
@@ -167,9 +170,10 @@ export function buildGroups(rows: readonly IDocumentItem[], health: { medianChun
 	const attention: IDirectoryGroup = { key: 'attention', label: '', kind: 'attention', rows: [] };
 	for (const item of rows) {
 		const place = placeOf(item);
-		const flags = documentHealth(item, { medianChunks: health.medianChunks }).flags.map((f) => f.label);
-		const row: IDirectoryRow = { item, name: place.name, duplicate: (pathCounts.get(item.path) ?? 0) > 1, shortId: item.objectId.slice(0, 8), flags };
-		if (flags.length > 0) attention.rows.push({ ...row, name: item.path || '(no path)' });
+		const itemHealth = documentHealth(item, { medianChunks: health.medianChunks });
+		const flags = itemHealth.flags.map((f) => f.label);
+		const row: IDirectoryRow = { item, name: place.name, duplicate: (pathCounts.get(item.path) ?? 0) > 1, shortId: item.objectId.slice(0, 8), flags, attention: needsAttention(itemHealth) };
+		if (row.attention) attention.rows.push({ ...row, name: item.path || '(no path)' });
 		else if (place.kind === 'uploaded') uploaded.rows.push(row);
 		else {
 			let group = folders.get(place.folder);

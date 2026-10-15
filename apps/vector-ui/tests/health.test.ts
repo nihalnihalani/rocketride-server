@@ -116,34 +116,33 @@ test('medianChunks over the loaded rows (documents without a count left out); de
 	assert.equal(deletedFromTotals(10, 11), null, 'a store whose totals disagree is not trusted');
 });
 
-test('the directory groups every flagged document under "Needs attention" (sorted by path); oversize only once the listing settled', () => {
+test('the directory lists a document with a defect under "Needs attention" (sorted by path); an oversize one keeps its folder, with the badge', () => {
 	const rows = [doc('a', 'C:/demo/a.md'), doc('b', 'C:/demo/b.md', { deleted_chunks: 1, max_chunk_id: 4 }), doc('c', 'C:/demo/c.md', { has_first_chunk: false, max_chunk_id: 4 }), doc('m', 'C:/demo/big.pdf', { chunks: 96, max_chunk_id: 95 }), doc('d', 'C:/demo/d.md', { chunks: 2, max_chunk_id: 1 })];
 	const settled = buildGroups(rows, { medianChunks: 4 });
 	assert.deepEqual(
 		settled.map((g) => [g.kind, g.label, g.rows.map((r) => r.item.objectId)]),
 		[
-			['folder', 'C:/demo/', ['a', 'd']],
-			['attention', 'Needs attention (3)', ['b', 'm', 'c']],
+			['folder', 'C:/demo/', ['a', 'm', 'd']],
+			['attention', 'Needs attention (2)', ['b', 'c']],
 		]
 	);
-	const attention = settled[1]?.rows ?? [];
 	assert.deepEqual(
-		attention.map((r) => [r.name, r.flags]),
+		settled.flatMap((g) => g.rows).map((r) => [r.name, r.flags, r.attention]),
 		[
-			['C:/demo/b.md', ['1 deleted chunk']],
-			['C:/demo/big.pdf', ['oversize']],
-			['C:/demo/c.md', ['no first chunk']],
+			['a.md', [], false],
+			['big.pdf', ['oversize'], false],
+			['d.md', [], false],
+			['C:/demo/b.md', ['1 deleted chunk'], true],
+			['C:/demo/c.md', ['no first chunk'], true],
 		]
 	);
 	const loading = buildGroups(rows, { medianChunks: null });
 	assert.deepEqual(
 		loading.map((g) => [g.kind, g.rows.map((r) => r.item.objectId)]),
-		[
-			['folder', ['a', 'm', 'd']],
-			['attention', ['b', 'c']],
-		],
-		'while pages arrive the oversize flag waits, so no row moves'
+		settled.map((g) => [g.kind, g.rows.map((r) => r.item.objectId)]),
+		'with or without the median, no row moves: only the oversize badge waits for it'
 	);
+	assert.deepEqual(loading[0]?.rows[1]?.flags, []);
 	assert.deepEqual(
 		buildGroups(rows).map((g) => g.label),
 		['C:/demo/', 'Needs attention (2)'],
@@ -155,20 +154,25 @@ test('the chip: "N need attention" with the breakdown in its tooltip; counted ov
 	const rows = [doc('a', 'C:/demo/a.md'), doc('b', 'C:/demo/b.md', { deleted_chunks: 1, max_chunk_id: 4 }), doc('c', 'C:/demo/c.md', { has_first_chunk: false, max_chunk_id: 4 }), doc('m', 'C:/demo/big.pdf', { chunks: 96, max_chunk_id: 95 })];
 	const summary = healthSummary(rows, { medianChunks: 4, complete: true });
 	assert.deepEqual(summary.counts, { no_first_chunk: 1, gaps: 0, deleted_chunks: 1, empty_parse: 0, oversize: 1 });
-	assert.equal(summary.flagged, 3);
+	assert.equal(summary.flagged, 2, 'the documents under "Needs attention": an oversize one is not among them');
 	const stats = readStats({ ...fixture('stats_pgvector'), documents_without_first_chunk: 2 });
 	const chip = statsChips({ dialect: null, stats, readOnly: false, health: summary }).find((c) => c.key === 'attention');
 	assert.ok(chip);
-	assert.equal(chip.label, '3 need attention');
+	assert.equal(chip.label, '2 need attention');
 	assert.equal(chip.tone, 'warning');
-	assert.equal(chip.tooltip, 'Without a first chunk: 1 · Gaps in chunk ids: 0 · Deleted chunks: 1 · Empty: 0 · Oversize: 1. Counted over the 4 documents loaded; the directory lists them under "Needs attention". The store counts 2 documents without a first chunk.');
+	assert.equal(chip.tooltip, 'Without a first chunk: 1 · Gaps in chunk ids: 0 · Deleted chunks: 1 · Empty: 0 · Oversize: 1. Counted over the 4 documents loaded; the directory lists them under "Needs attention" and marks oversize documents in their folders. The store counts 2 documents without a first chunk.');
+	assert.equal(
+		statsChips({ dialect: null, stats: readStats(fixture('stats_pgvector')), readOnly: false, health: healthSummary([rows[0] as IDocumentItem, rows[3] as IDocumentItem], { medianChunks: 4, complete: true }) }).some((c) => c.key === 'attention'),
+		false,
+		'only oversize documents: nothing needs attention'
+	);
 	assert.equal(
 		statsChips({ dialect: null, stats, readOnly: false, health: summary }).some((c) => c.key === 'orphans'),
 		false,
 		'the attention chip replaces the orphan chip'
 	);
 	const partial = statsChips({ dialect: null, stats: readStats(fixture('stats_pgvector')), readOnly: false, health: healthSummary(rows, { medianChunks: 4, complete: false }) }).find((c) => c.key === 'attention');
-	assert.equal(partial?.label, '3 of 4 loaded need attention');
+	assert.equal(partial?.label, '2 of 4 loaded need attention');
 	const one = statsChips({ dialect: null, stats: readStats(fixture('stats_pgvector')), readOnly: false, health: healthSummary([rows[2] as IDocumentItem], { medianChunks: null, complete: true }) }).find((c) => c.key === 'attention');
 	assert.equal(one?.label, '1 needs attention');
 	const unreported = healthSummary([{ ...doc('q', 'q.md'), max_chunk_id: null, deleted_chunks: null }], { medianChunks: null, complete: true });

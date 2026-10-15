@@ -188,8 +188,9 @@ export function statsChips(input: { dialect: IDialectResult | null; stats: IStat
 }
 
 /**
- * The "N need attention" chip: documents of the loaded ones with a health
- * flag, the breakdown per flag in its tooltip, and the store's own count of
+ * The "N need attention" chip: documents of the loaded ones with a defect
+ * (vector/health.ts needsAttention; oversize alone is not one), the breakdown
+ * per flag in its tooltip, and the store's own count of
  * documents without a first chunk when it differs from the loaded one.
  *
  * @param health - The loaded documents' health.
@@ -200,7 +201,7 @@ function attentionChip(health: IHealthSummary, storeOrphans: number | null): ISt
 	const n = formatCount(health.flagged);
 	const label = health.complete ? `${n} ${health.flagged === 1 ? 'needs' : 'need'} attention` : `${n} of ${formatCount(health.loaded)} loaded need attention`;
 	const parts = HEALTH_KINDS.map((kind) => `${HEALTH_TITLES[kind]}: ${health.unreported.includes(kind) ? 'not reported' : formatCount(health.counts[kind])}`);
-	let tooltip = `${parts.join(' · ')}. Counted over the ${formatCount(health.loaded)} ${health.loaded === 1 ? 'document' : 'documents'} loaded; the directory lists them under "Needs attention".`;
+	let tooltip = `${parts.join(' · ')}. Counted over the ${formatCount(health.loaded)} ${health.loaded === 1 ? 'document' : 'documents'} loaded; the directory lists them under "Needs attention" and marks oversize documents in their folders.`;
 	if (storeOrphans !== null && storeOrphans !== health.counts.no_first_chunk) tooltip += ` The store counts ${formatCount(storeOrphans)} ${storeOrphans === 1 ? 'document' : 'documents'} without a first chunk.`;
 	return { key: 'attention', label, tone: 'warning', tooltip };
 }

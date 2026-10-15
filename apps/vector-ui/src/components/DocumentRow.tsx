@@ -24,8 +24,8 @@
 // VECTOR-UI — DOCUMENT ROW (one document in the directory)
 // =============================================================================
 //
-// Name, its health badges under "Needs attention" ('no first chunk', '1
-// deleted chunk'; two at most, then "+N"), chunk count ("—" when the store
+// Name, its health badges ('no first chunk', '1 deleted chunk' under "Needs
+// attention"; a muted 'oversize' in a folder; two at most, then "+N"), chunk count ("—" when the store
 // cannot count), a tables badge, a tooltip with size, type, ingest time, the
 // health flags and the short objectId, a multi-select
 // checkbox and the trash button. The trash button is disabled with the reason
@@ -65,7 +65,7 @@ export function rowTooltip(row: IDirectoryRow): string {
 	const parts = [item.path || '(no path)', fileTypeOf(item.path)];
 	if (item.size !== null) parts.push(formatSize(item.size));
 	if (item.ingestedAt !== null) parts.push(`ingested ${item.ingestedAt.replace('T', ' ').replace('Z', ' UTC')}`);
-	if (row.flags.length > 0) parts.push(`needs attention: ${row.flags.join(', ')}`);
+	if (row.flags.length > 0) parts.push(row.attention ? `needs attention: ${row.flags.join(', ')}` : row.flags.join(', '));
 	parts.push(`objectId ${item.objectId}`);
 	return parts.join(' · ');
 }
@@ -79,6 +79,8 @@ export function rowTooltip(row: IDirectoryRow): string {
 export function DocumentRow({ row, selected, checked, writes, onSelect, onToggleCheck, onRemove }: IDocumentRowProps): React.ReactElement {
 	const { item } = row;
 	const label = item.path || item.objectId;
+	// A defect is a warning; a badge on a row that stays in its folder (oversize) is a note.
+	const badgeEdge = row.attention ? TONE_EDGE.warning : TONE_EDGE.muted;
 	return (
 		<div role="listitem" aria-current={selected ? 'true' : undefined} style={styles.row(selected)} title={rowTooltip(row)} data-object-id={item.objectId}>
 			<input type="checkbox" checked={checked} aria-label={`Select ${label}`} onChange={onToggleCheck} style={{ margin: 0, outlineOffset: 2 }} disabled={!writes.enabled} />
@@ -87,11 +89,11 @@ export function DocumentRow({ row, selected, checked, writes, onSelect, onToggle
 				{row.duplicate ? ` (${row.shortId})` : ''}
 			</button>
 			{row.flags.slice(0, 2).map((flag) => (
-				<span key={flag} style={styles.chip(TONE_EDGE.warning)} data-flag="">
+				<span key={flag} style={styles.chip(badgeEdge)} data-flag="">
 					{flag}
 				</span>
 			))}
-			{row.flags.length > 2 && <span style={styles.chip(TONE_EDGE.warning)}>{`+${row.flags.length - 2}`}</span>}
+			{row.flags.length > 2 && <span style={styles.chip(badgeEdge)}>{`+${row.flags.length - 2}`}</span>}
 			{item.tables !== null && item.tables > 0 && <span style={styles.chip('var(--rr-border-input)')}>{`${formatCount(item.tables)} ${item.tables === 1 ? 'table' : 'tables'}`}</span>}
 			<span style={{ ...styles.small, minWidth: 28, textAlign: 'right' }} aria-label={item.chunks === null ? 'chunk count unknown' : `${item.chunks} chunks`}>
 				{item.chunks === null ? '—' : formatCount(item.chunks)}

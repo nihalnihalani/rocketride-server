@@ -40,6 +40,11 @@
 //   oversize        more than 10 times the median chunks per loaded
 //                   document (only once that median is settled).
 //
+// The first four are defects of what is stored and put the document under
+// the directory's "Needs attention" (ATTENTION_KINDS, needsAttention).
+// Oversize compares with whatever else is loaded, so it is a badge only: the
+// document stays in its folder.
+//
 // A flag whose fields the store did not give is not computed and listed as
 // unchecked; the panel says which stores report them. Nothing here calls.
 // =============================================================================
@@ -51,6 +56,9 @@ export const HEALTH_KINDS = ['no_first_chunk', 'gaps', 'deleted_chunks', 'empty_
 
 /** One kind of flag. */
 export type HealthKind = (typeof HEALTH_KINDS)[number];
+
+/** The flags that put a document under "Needs attention": defects of what is stored, not its size. */
+export const ATTENTION_KINDS: readonly HealthKind[] = ['no_first_chunk', 'gaps', 'deleted_chunks', 'empty_parse'];
 
 /** A document with more than this many times the median chunks is oversize. */
 export const OVERSIZE_FACTOR = 10;
@@ -144,6 +152,17 @@ export function documentHealth(item: IDocumentItem, ctx: IHealthContext = {}): I
 }
 
 /**
+ * Whether a document goes under "Needs attention": it has a defect flag (an
+ * oversize document alone stays in its folder, with the badge).
+ *
+ * @param health - Its health.
+ * @returns True with at least one of {@link ATTENTION_KINDS}.
+ */
+export function needsAttention(health: Pick<IDocumentHealth, 'flags'>): boolean {
+	return health.flags.some((flag) => ATTENTION_KINDS.includes(flag.kind));
+}
+
+/**
  * The median chunks per document of the loaded rows (documents without a count left out).
  *
  * @param rows - The loaded rows.
@@ -173,7 +192,7 @@ export function deletedFromTotals(all: number | null, active: number | null): nu
 
 /** The health of the loaded documents, for the stats strip's chip. */
 export interface IHealthSummary {
-	/** Documents with at least one flag. */
+	/** Documents that need attention (a defect flag; oversize alone does not count). */
 	flagged: number;
 	/** Documents per flag. */
 	counts: Record<HealthKind, number>;
@@ -197,7 +216,7 @@ export function healthSummary(rows: readonly IDocumentItem[], ctx: { medianChunk
 	let flagged = 0;
 	for (const row of rows) {
 		const health = documentHealth(row, { medianChunks: ctx.medianChunks });
-		if (health.flags.length > 0) flagged += 1;
+		if (needsAttention(health)) flagged += 1;
 		for (const flag of health.flags) counts[flag.kind] += 1;
 		for (const kind of HEALTH_KINDS) if (!health.unchecked.includes(kind)) checked[kind] += 1;
 	}

@@ -77,6 +77,32 @@ test('groups: one per folder, then Uploaded, then Needs attention; duplicate pat
 	assert.deepEqual(reports[0].flags, [], 'a healthy document has no badge');
 });
 
+test('"oversize" is a badge in its folder, never a reason to leave it: a folder of manuals among one-chunk memos stays listed', () => {
+	// 400 one-chunk memos and 20 manuals of 20 chunks: the median is 1, so every manual is more than 10 times it.
+	const rows: IDocumentItem[] = [];
+	for (let i = 0; i < 400; i += 1) rows.push(doc(`m${i}`, `C:/corp/memos/memo_${i}.txt`, { chunks: 1, max_chunk_id: 0, deleted_chunks: 0 }));
+	for (let i = 0; i < 20; i += 1) rows.push(doc(`h${i}`, `C:/corp/handbooks/manual_${i}.pdf`, { chunks: 20, max_chunk_id: 19, deleted_chunks: 0 }));
+	const groups = buildGroups(rows, { medianChunks: 1 });
+	assert.deepEqual(
+		groups.map((g) => [g.kind, g.label, g.rows.length]),
+		[
+			['folder', 'C:/corp/memos/', 400],
+			['folder', 'C:/corp/handbooks/', 20],
+		]
+	);
+	const manual = groups[1]?.rows[0];
+	assert.equal(manual?.name, 'manual_0.pdf', 'listed by its name in its folder');
+	assert.deepEqual(manual?.flags, ['oversize'], 'with the badge');
+	assert.equal(manual?.attention, false);
+	// A defect still moves the document, with every badge it has.
+	const broken = buildGroups([...rows, doc('x', 'C:/corp/handbooks/broken.pdf', { chunks: 19, max_chunk_id: 19, has_first_chunk: false, deleted_chunks: 0 })], { medianChunks: 1 });
+	const attention = broken.find((g) => g.kind === 'attention');
+	assert.deepEqual(
+		attention?.rows.map((r) => [r.name, r.flags, r.attention]),
+		[['C:/corp/handbooks/broken.pdf', ['no first chunk', 'oversize'], true]]
+	);
+});
+
 test('the filter is client-side over what is loaded, case-insensitive, and says how much is loaded while loading', () => {
 	const items = readDocumentsPage(fixture('documents_page1')).items;
 	assert.deepEqual(
