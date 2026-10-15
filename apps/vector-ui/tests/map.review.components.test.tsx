@@ -18,8 +18,10 @@ import { test } from 'node:test';
 import React from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { DuplicatesBody, DuplicatesPanel, requestRemoval } from '../src/components/DuplicatesPanel';
+import { OutliersBody, OutliersPanel } from '../src/components/OutliersPanel';
 import type { Availability, IDocumentItem, IDocumentRowsSource, IKnnBlock, ISampleModel, ISampleResult } from '../src/contract/types';
 import { dedupeView, docInfo, queueInit, queueReducer, queued } from '../src/map/dedupe';
+import { outlierRows } from '../src/map/outliers';
 import { loadSample, modelOf } from './support/map.samples';
 
 const noop = (): void => undefined;
@@ -235,4 +237,75 @@ test('a group of shared passages says so; nothing is removable before a keep is 
 	assert.equal((out.match(/Shared passages only: each of these documents also has text the others do not\./g) ?? []).length, 3, 'one chunk of documents with many: passages, not copies');
 	assert.doesNotMatch(html(<DuplicatesPanel sample={SMALL} writes={on} onSelect={noop} onRemoveDocument={noop} />), /Shared passages only/, 'a copy shares most of its chunks');
 	assert.match(out, /<button[^>]*disabled=""[^>]*title="Choose the document to keep first"[^>]*>Remove the others<\/button>/);
+});
+
+// =============================================================================
+// OUTLIER REVIEW
+// =============================================================================
+
+test('the outlier review: a percentile select, one row per outlier with why, and the count spoken', () => {
+	const out = html(<OutliersPanel sample={demo} onSelect={noop} onShowNeighbours={noop} onRemoveDocument={noop} writes={on} />);
+	assert.equal((out.match(/<li/g) ?? []).length, 10);
+	assert.match(out, /Lowest density/);
+	assert.match(out, /<option value="1" selected="">1 %<\/option><option value="2">2 %<\/option><option value="5">5 %<\/option>/);
+	assert.match(out, /role="status"[^>]*>10 points: the lowest 1 % by density/);
+	assert.match(out, /C:\/demo\/finance\/ocr_scan_junk\.txt #\d+/);
+	assert.match(out, /density 0\.24 vs sample median 0\.68; nearest neighbour 0\.\d\d in /);
+	assert.equal((out.match(/>Show neighbours</g) ?? []).length, 10);
+	assert.equal((out.match(/>Mark reviewed</g) ?? []).length, 10);
+	assert.equal((out.match(/<button[^>]*>Remove document<\/button>/g) ?? []).length, 10);
+	assert.doesNotMatch(out, /<button[^>]*disabled=""[^>]*>Remove document<\/button>/);
+});
+
+test('a larger percentile lists more rows from the same sample', () => {
+	assert.equal((html(<OutliersPanel sample={demo} onSelect={noop} initial={{ percentile: 5 }} />).match(/<li/g) ?? []).length, 50);
+	assert.match(html(<OutliersPanel sample={demo} onSelect={noop} initial={{ percentile: 2 }} />), /20 points: the lowest 2 % by density/);
+});
+
+test('Remove document is disabled with the reason when writes are off, and absent without a remove handler', () => {
+	const out = html(<OutliersPanel sample={demo} onSelect={noop} onRemoveDocument={noop} writes={off} />);
+	assert.equal((out.match(/<button[^>]*disabled=""[^>]*>Remove document<\/button>/g) ?? []).length, 10);
+	assert.ok(out.includes(off.reason as string));
+	assert.equal((html(<OutliersPanel sample={demo} onSelect={noop} onRemoveDocument={noop} />).match(/<button[^>]*disabled=""[^>]*>Remove document<\/button>/g) ?? []).length, 10, 'no writes given: closed');
+	assert.doesNotMatch(html(<OutliersPanel sample={demo} onSelect={noop} />), /Remove document|Show neighbours/);
+});
+
+test('the outlier buttons hand the host the point or its document', () => {
+	const rows = outlierRows(demo.result, 1);
+	const picked: number[] = [];
+	const neighbours: number[] = [];
+	const reviewed: Array<[string, boolean]> = [];
+	const removed: string[] = [];
+	const tree = OutliersBody({ rows, percentile: 1, writes: on, canRemove: true, canShowNeighbours: true, onPercentile: noop, onSelect: (i) => picked.push(i), onReview: (id, value) => reviewed.push([id, value]), onRemove: (id) => removed.push(id), onShowNeighbours: (i) => neighbours.push(i) });
+	button(tree, 'C:/demo/finance/ocr_scan_junk.txt').props.onClick();
+	button(tree, 'Show neighbours').props.onClick();
+	button(tree, 'Mark reviewed').props.onClick();
+	button(tree, 'Remove document').props.onClick();
+	assert.deepEqual(picked, [262]);
+	assert.deepEqual(neighbours, [262]);
+	assert.deepEqual(reviewed, [[rows[0]!.objectId, true]]);
+	assert.deepEqual(removed, [rows[0]!.objectId]);
+});
+
+test("reviewed outliers are tagged and counted, from the connection's cache", () => {
+	const ocr = demo.result.docs[demo.result.points.doc[262] as number]!.objectId;
+	const cache = new Map<string, ReadonlySet<string>>([['conn-o', new Set([ocr])]]);
+	const out = html(<OutliersPanel sample={demo} onSelect={noop} connectionKey="conn-o" reviewedCache={cache} />);
+	const ocrRows = outlierRows(demo.result, 1).filter((r) => r.objectId === ocr).length;
+	assert.equal((out.match(/>reviewed</g) ?? []).length, ocrRows);
+	assert.equal((out.match(/>Review again</g) ?? []).length, ocrRows);
+	assert.match(out, new RegExp(`10 points: the lowest 1 % by density · ${ocrRows} reviewed`));
+});
+
+test('no outliers: the sentence, and nothing to pick', () => {
+	const none = modelOf({ ...demo.result, outliers: [] });
+	const out = html(<OutliersPanel sample={none} onSelect={noop} />);
+	assert.match(out, /No outliers in this sample\./);
+	assert.doesNotMatch(out, /<select/);
+});
+
+test('an outlier of a removed document leaves the list', () => {
+	const ocr = demo.result.docs[demo.result.points.doc[262] as number]!.objectId;
+	const out = html(<OutliersPanel sample={{ ...demo, removed: [ocr] }} onSelect={noop} />);
+	assert.doesNotMatch(out, /ocr_scan_junk/);
 });

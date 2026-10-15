@@ -252,3 +252,25 @@ export function morePairsLine(n: number): string {
 export function reviewedGroupsHeading(n: number): string {
 	return `Reviewed (${plural(n, 'group')})`;
 }
+
+// =============================================================================
+// OUTLIER REVIEW
+// =============================================================================
+
+/** No outlier (the node found none: a handful of points, or all equally dense). */
+export const OUTLIERS_NONE = 'No outliers in this sample.';
+
+/** What the review lists. */
+export const OUTLIERS_NOTE = "The sample's sparsest points, lowest density first. The store node's lowest 1 % are ringed on the map; a larger share is picked here from the same sample, without drawing it again.";
+
+/**
+ * The review's spoken count.
+ *
+ * @param n - Rows listed.
+ * @param pct - The percentile.
+ * @param reviewed - Rows whose document was marked reviewed.
+ * @returns E.g. "10 points: the lowest 1 % by density · 2 reviewed".
+ */
+export function outliersStatus(n: number, pct: number, reviewed: number): string {
+	return `${plural(n, 'point')}: the lowest ${pct} % by density${reviewed > 0 ? ` · ${num(reviewed)} reviewed` : ''}`;
+}

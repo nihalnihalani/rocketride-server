@@ -21,46 +21,148 @@
 // SOFTWARE.
 
 // =============================================================================
-// VECTOR-UI — OutliersPanel (the sample's least-dense points)
+// VECTOR-UI — OutliersPanel (the map's outlier review)
 // =============================================================================
 //
-// Points whose neighbourhood in the node's kNN graph is the sparsest (the node
-// reports the lowest 1 % by density): OCR noise, a stray table, a document that
-// is unlike everything else. Each row selects the point on the map.
+// The sample's sparsest points: OCR noise, a stray table, a document unlike
+// everything else. A percentile select (1 %, 2 %, 5 %) picks them in the
+// browser from the sample's density, so changing it sends nothing; 1 % is
+// the node's own list. Each row says why (density against the sample's
+// median, nearest neighbour in the sample) and offers Show neighbours, Mark
+// reviewed and Remove document (the console confirms; without writes the
+// button is disabled with the reason as text). Reviewed documents are the
+// connection's 'reviewed documents' cache, shared with the duplicates queue.
 // =============================================================================
 
-import React from 'react';
-import type { OutliersPanelProps as ContractOutliersPanelProps } from '../contract/types';
-import { documentOf } from '../map/model';
+import React, { useCallback, useMemo, useState } from 'react';
+import type { Availability, OutliersPanelProps as ContractOutliersPanelProps } from '../contract/types';
+import { reviewedDocuments } from '../adapters/connections';
+import { markReviewed, reviewedOf, unmarkReviewed } from '../map/dedupe';
+import type { ReviewedCache } from '../map/dedupe';
+import { OUTLIER_PERCENTILES, outlierRows } from '../map/outliers';
+import type { IOutlierRow, OutlierPercentile } from '../map/outliers';
+import { OUTLIERS_NONE, OUTLIERS_NOTE, outliersStatus } from '../map/reviewWording';
 import { MAP_STYLES } from '../map/styles';
 
-/** Props (frozen). */
-export type OutliersPanelProps = ContractOutliersPanelProps;
+/** Props: the frozen ones, plus the starting percentile and the reviewed cache. */
+export interface OutliersPanelProps extends ContractOutliersPanelProps {
+	/** The starting percentile (a host restoring it; the tests). */
+	initial?: { percentile?: OutlierPercentile };
+	/** The reviewed documents per connection (default: the registry's 'reviewed documents'). */
+	reviewedCache?: ReviewedCache;
+}
+
+/** What the review's body is drawn from. */
+export interface OutliersBodyProps {
+	rows: readonly IOutlierRow[];
+	percentile: OutlierPercentile;
+	/** Writes on this connection; absent: closed. */
+	writes?: Availability;
+	/** The host gave a remove handler. */
+	canRemove: boolean;
+	/** The host gave a Show neighbours handler. */
+	canShowNeighbours: boolean;
+	onPercentile(pct: OutlierPercentile): void;
+	onSelect(index: number): void;
+	onReview(objectId: string, reviewed: boolean): void;
+	onRemove(objectId: string): void;
+	onShowNeighbours(index: number): void;
+}
 
 /**
- * The outliers panel.
+ * The review's body: a plain function of its rows (no hooks), so the tests
+ * can call it and press its buttons.
  *
- * @param props - Sample and select handler.
- * @returns A list of outlier points.
+ * @param props - The rows and the handlers.
+ * @returns The body.
  */
-export function OutliersPanel(props: OutliersPanelProps): React.ReactElement {
-	const result = props.sample.result;
-	if (result.outliers.length === 0) return <p style={MAP_STYLES.note}>No outliers in this sample.</p>;
+export function OutliersBody(props: OutliersBodyProps): React.ReactElement {
+	const writes = props.writes ?? { enabled: false, reason: null };
+	const reviewedCount = props.rows.filter((r) => r.reviewed).length;
 	return (
-		<>
-			<p style={MAP_STYLES.note}>The points with the sparsest neighbourhoods in this sample (lowest density first). They are ringed on the map.</p>
+		<section aria-label="Outlier review" data-component="OutliersPanel" data-percentile={props.percentile} data-rows={props.rows.length}>
+			<p style={MAP_STYLES.note}>{OUTLIERS_NOTE}</p>
+			<label style={{ ...MAP_STYLES.label, display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+				<span>Lowest density</span>
+				<select style={MAP_STYLES.select} value={String(props.percentile)} aria-label="Which share of the sample to review, by lowest density" onChange={(event) => props.onPercentile(Number(event.currentTarget.value) as OutlierPercentile)}>
+					{OUTLIER_PERCENTILES.map((pct) => (
+						<option key={pct} value={String(pct)}>
+							{pct} %
+						</option>
+					))}
+				</select>
+			</label>
+			<p style={MAP_STYLES.note} role="status">
+				{outliersStatus(props.rows.length, props.percentile, reviewedCount)}
+			</p>
+			{props.canRemove && !writes.enabled && writes.reason ? <p style={MAP_STYLES.note}>{writes.reason}</p> : null}
 			<ul aria-label="Outliers" style={MAP_STYLES.list}>
-				{result.outliers.map((i) => (
-					<li key={i} style={MAP_STYLES.row}>
-						<button type="button" style={MAP_STYLES.linkButton} onClick={() => props.onSelect(i)}>
-							{documentOf(result, i)?.path ?? '?'} #{result.points.chunk[i]}
+				{props.rows.map((row) => (
+					<li key={row.index} style={{ ...MAP_STYLES.row, opacity: row.reviewed ? 0.8 : 1 }} data-point={row.index}>
+						<button type="button" style={MAP_STYLES.linkButton} onClick={() => props.onSelect(row.index)}>
+							{row.path} #{row.chunk}
 						</button>
-						<div style={MAP_STYLES.small}>density {(result.density[i] ?? 0).toFixed(3)}</div>
+						{row.reviewed ? <span style={MAP_STYLES.tag}>reviewed</span> : null}
+						<div style={MAP_STYLES.small}>{row.why}</div>
+						<div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 4 }}>
+							{props.canShowNeighbours ? (
+								<button type="button" style={MAP_STYLES.button} onClick={() => props.onShowNeighbours(row.index)}>
+									Show neighbours
+								</button>
+							) : null}
+							<button type="button" style={MAP_STYLES.button} onClick={() => props.onReview(row.objectId, !row.reviewed)}>
+								{row.reviewed ? 'Review again' : 'Mark reviewed'}
+							</button>
+							{props.canRemove ? (
+								<button type="button" style={MAP_STYLES.button} disabled={!writes.enabled} title={writes.enabled ? undefined : (writes.reason ?? undefined)} onClick={() => props.onRemove(row.objectId)}>
+									Remove document
+								</button>
+							) : null}
+						</div>
 					</li>
 				))}
 			</ul>
-		</>
+		</section>
 	);
+}
+
+/**
+ * The outlier review.
+ *
+ * @param props - Sample, handlers, writes, the connection.
+ * @returns The panel.
+ */
+export function OutliersPanel(props: OutliersPanelProps): React.ReactElement {
+	const [percentile, setPercentile] = useState<OutlierPercentile>(props.initial?.percentile ?? 1);
+	const cache = props.reviewedCache ?? reviewedDocuments;
+	const [local, setLocal] = useState<ReadonlySet<string>>(() => new Set());
+	const [tick, setTick] = useState(0);
+	const reviewed = props.connectionKey ? reviewedOf(cache, props.connectionKey) : local;
+	const result = props.sample.result;
+	const removed = props.sample.removed;
+	// eslint-disable-next-line react-hooks/exhaustive-deps
+	const rows = useMemo(() => outlierRows(result, percentile, removed, reviewed), [result, percentile, removed, reviewed, tick]);
+
+	const onReview = useCallback(
+		(objectId: string, value: boolean): void => {
+			if (props.connectionKey) {
+				if (value) markReviewed(cache, props.connectionKey, [objectId]);
+				else unmarkReviewed(cache, props.connectionKey, [objectId]);
+				setTick((t) => t + 1);
+				return;
+			}
+			setLocal((prev) => {
+				const next = new Set(prev);
+				if (value) next.add(objectId);
+				else next.delete(objectId);
+				return next;
+			});
+		},
+		[cache, props.connectionKey]
+	);
+
+	if (result.outliers.length === 0) return <p style={MAP_STYLES.note}>{OUTLIERS_NONE}</p>;
+	return <OutliersBody rows={rows} percentile={percentile} writes={props.writes} canRemove={props.onRemoveDocument !== undefined} canShowNeighbours={props.onShowNeighbours !== undefined} onPercentile={setPercentile} onSelect={(index) => props.onSelect(index)} onReview={onReview} onRemove={(objectId) => props.onRemoveDocument?.(objectId)} onShowNeighbours={(index) => props.onShowNeighbours?.(index)} />;
 }
 
 export default OutliersPanel;
