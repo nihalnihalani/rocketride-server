@@ -19,7 +19,7 @@ import path from 'node:path';
 import { test } from 'node:test';
 import type { IExplorerEndpoint } from 'shared/explorer';
 import { manualClock } from 'shared/explorer/connect/testing';
-import { makeConsoleActions, removeTargets } from '../src/adapters/consoleActions';
+import { makeConsoleActions, removeTargets, showAnswerOnMap } from '../src/adapters/consoleActions';
 import { connectionEntry, entryCount, existingEntry } from '../src/adapters/connections';
 import { connectionCaches } from '../src/adapters/explorer';
 import { DEFAULT_LIMITS } from '../src/vector/results';
@@ -204,6 +204,26 @@ test('a call made while disconnected fails with a sentence, and never reaches a 
 	await clock.settle();
 	assert.equal(entry.controller.getState().stats.status, 'error');
 	assert.match(entry.controller.getState().stats.error?.headline ?? '', /Not connected to the server/);
+	connectionCaches.clearAll();
+});
+
+test("a chat answer's map action tells the map its question before the highlight lands, so the star is the question's own vector", () => {
+	const clock = manualClock();
+	const entry = connectionEntry(endpoint('key-answer'), null, DEFAULT_LIMITS, clock);
+	const actions = makeConsoleActions(entry, { openDocument: () => undefined, showConsole: () => undefined, announce: () => undefined });
+	entry.selection.setQuery('radio check-in schedule');
+	const seen: Array<{ query: string | null; source: string | null }> = [];
+	const unsubscribe = entry.selection.subscribe(() => {
+		const state = entry.selection.getState();
+		seen.push({ query: state.query, source: state.highlight?.source ?? null });
+	});
+	showAnswerOnMap(entry.selection, actions, 'Where does Falcon Station get its water?', [['doc-1', 3]]);
+	unsubscribe();
+	const firstChat = seen.find((state) => state.source === 'chat');
+	assert.ok(firstChat, 'the chat highlight landed');
+	assert.equal(firstChat.query, 'Where does Falcon Station get its water?', 'the question was there when the map saw the highlight');
+	assert.deepEqual(entry.selection.getState().highlight, { source: 'chat', keys: [['doc-1', 3]] });
+	assert.equal(entry.tab.get(), 'map');
 	connectionCaches.clearAll();
 });
 

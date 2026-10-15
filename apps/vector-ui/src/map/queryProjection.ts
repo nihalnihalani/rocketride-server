@@ -35,7 +35,8 @@
 //     drawn to its sample point, to a pinned point once projected, or listed as
 //     outside the sample so the view can `project({keys})` it;
 //   - colours by similarity from `project`'s per-point similarities;
-//   - the chat star without `embed`: the score-weighted centre of the sources.
+//   - a chat answer's star: its question embedded and placed like a query
+//     (chatQueryPlan); without `embed`, the score-weighted centre of the sources.
 //
 // SAMPLE_EXPIRED: the node dropped the sample (600 s, 2 entries); the view draws
 // it again with the same seed and pinned keys and retries the call once.
@@ -243,17 +244,22 @@ export function queryBlocker(state: { embedReady: boolean; hasSample: boolean })
 }
 
 /**
- * Which star a chat answer's highlight gets. The map only knows the chat's
- * question when the chat told it (`selection.setQuery(question)` before
- * `setHighlight`), i.e. when the selection's query differs from the map's own
- * last query: then that question is embedded and placed exactly ('run').
- * Otherwise the selection's query is the map's own earlier query, which is not
- * this answer's question, so the map drops it and shows the score-weighted
- * centre of the sources, marked approximate ('centroid').
+ * Which star a chat answer's highlight gets. The chat tells the map the
+ * answer's question before it highlights the sources (`showAnswerOnMap` in
+ * src/adapters/consoleActions.ts sets `selection.setQuery(question)` first), so
+ * the selection's query is that question when the highlight lands:
  *
- * @param state - The selection's query, the map's last placed query text, embed reachability.
- * @returns 'run' or 'centroid'.
+ *   - 'run': the embedding node is reachable and the map has not placed this
+ *     question: embed it and place the star exactly, with rays to its top-k;
+ *   - 'keep': the map already placed this very question (the same answer's
+ *     "map" again, or the same text run on the map): its star stays;
+ *   - 'centroid': no question, or no embedding node: the score-weighted centre
+ *     of the sources, marked approximate (the labelled fallback).
+ *
+ * @param state - The question the chat told the map, the map's last placed query text, embed reachability.
+ * @returns 'run', 'keep' or 'centroid'.
  */
-export function chatQueryPlan(state: { told: string | null; mapQuery: string | null; embedReady: boolean }): 'run' | 'centroid' {
-	return state.embedReady && state.told !== null && state.told !== '' && state.told !== state.mapQuery ? 'run' : 'centroid';
+export function chatQueryPlan(state: { told: string | null; mapQuery: string | null; embedReady: boolean }): 'run' | 'keep' | 'centroid' {
+	if (!state.embedReady || state.told === null || state.told === '') return 'centroid';
+	return state.told === state.mapQuery ? 'keep' : 'run';
 }

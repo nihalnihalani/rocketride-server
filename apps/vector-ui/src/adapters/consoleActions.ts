@@ -30,7 +30,7 @@
 // here), scope the next chat question, refresh after an upload, announce.
 // =============================================================================
 
-import type { ConsoleActions, HighlightSource, VectorKey } from '../contract/types';
+import type { ConsoleActions, HighlightSource, SelectionStore, VectorKey } from '../contract/types';
 import type { IRemoveTarget } from '../vector/confirm';
 import type { IConnectionEntry } from './connections';
 
@@ -63,6 +63,24 @@ export function removeTargets(entry: Pick<IConnectionEntry, 'controller' | 'sele
 		if (row) return { objectId, path: row.path, chunks: row.chunks };
 		return { objectId, path: selected?.objectId === objectId ? selected.path : objectId, chunks: null };
 	});
+}
+
+/**
+ * Show a chat answer's sources on the map. The map is told the answer's
+ * question first, so the highlight that brings it to the front finds the
+ * question there: the map embeds it and places the answer's star exactly, and
+ * falls back to the centre of the sources only when the embedding node cannot
+ * be reached (src/map/queryProjection.ts chatQueryPlan). This is the one way
+ * the chat highlights.
+ *
+ * @param selection - The connection's selection.
+ * @param actions - The console's actions.
+ * @param question - The question the answer is for.
+ * @param keys - The sources to highlight.
+ */
+export function showAnswerOnMap(selection: Pick<SelectionStore, 'setQuery'>, actions: Pick<ConsoleActions, 'showOnMap'>, question: string, keys: readonly VectorKey[]): void {
+	selection.setQuery(question);
+	actions.showOnMap(keys, 'chat');
 }
 
 /**

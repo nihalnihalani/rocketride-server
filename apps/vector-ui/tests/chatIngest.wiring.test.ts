@@ -136,6 +136,18 @@ test('wiring: upload progress comes from the shell event stream and only upload 
 	assert.match(hook, /errors: result\.errors/);
 });
 
+test("wiring: an answer's sources go to the map with the answer's question, through the one function that tells the map first", () => {
+	const panel = source(path.join('components', 'ChatPanel.tsx'));
+	assert.match(panel, /onShowOnMap=\{\(keys\) => showAnswerOnMap\(selection, actions, turn\.question, keys\)\}/);
+	assert.match(panel, /import \{ showAnswerOnMap \} from '\.\.\/adapters\/consoleActions';/);
+	// Nothing else highlights for the chat: a chat highlight without its question would get the centre, not the star.
+	for (const file of sourcesUnder(SRC)) {
+		const rel = path.relative(SRC, file);
+		if (rel === path.join('adapters', 'consoleActions.ts')) continue;
+		assert.doesNotMatch(code(file), /showOnMap\([^)]*'chat'\)/, `${rel} highlights for the chat without telling the map the question`);
+	}
+});
+
 test('wiring: answers render through the safe Markdown renderer, never the shell chat renderers', () => {
 	const panel = source(path.join('components', 'ChatPanel.tsx'));
 	assert.match(panel, /<Markdown text=\{answer\.text\} \/>/);

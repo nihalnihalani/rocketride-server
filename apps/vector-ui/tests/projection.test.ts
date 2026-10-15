@@ -210,14 +210,16 @@ test('a query that cannot run says why: the embedding node first, then a missing
 	assert.match(QUERY_NEEDS_SAMPLE, /Draw a sample/);
 });
 
-test("a chat answer's star: the question's own vector only when the chat told the map a NEW question, else the sources' centre (never the last map query's star)", () => {
-	// No map query and nothing told: the centre of the sources.
+test("a chat answer's star: the question's own vector whenever the chat told the map its question and embed is reachable, else the sources' centre", () => {
+	// Nothing told: the centre of the sources (approximate).
 	assert.equal(chatQueryPlan({ told: null, mapQuery: null, embedReady: true }), 'centroid');
-	// The map's own last query is not the chat's question: drop it, show the centre (approximate).
-	assert.equal(chatQueryPlan({ told: 'radio check-in schedule', mapQuery: 'radio check-in schedule', embedReady: true }), 'centroid');
-	// The chat set its question before highlighting: embed and place exactly that.
+	assert.equal(chatQueryPlan({ told: '', mapQuery: 'radio check-in schedule', embedReady: true }), 'centroid');
+	// The chat told a question the map has not placed: embed and place exactly that.
 	assert.equal(chatQueryPlan({ told: 'Where does Falcon Station get its water?', mapQuery: 'radio check-in schedule', embedReady: true }), 'run');
 	assert.equal(chatQueryPlan({ told: 'Where does Falcon Station get its water?', mapQuery: null, embedReady: true }), 'run');
+	// The map already placed this very question (the same answer's "map" again, or the same text typed on the map): keep that exact star.
+	assert.equal(chatQueryPlan({ told: 'Where does Falcon Station get its water?', mapQuery: 'Where does Falcon Station get its water?', embedReady: true }), 'keep');
 	// Without the embedding node the centre is all there is.
 	assert.equal(chatQueryPlan({ told: 'Where does Falcon Station get its water?', mapQuery: null, embedReady: false }), 'centroid');
+	assert.equal(chatQueryPlan({ told: 'Where does Falcon Station get its water?', mapQuery: 'Where does Falcon Station get its water?', embedReady: false }), 'centroid');
 });

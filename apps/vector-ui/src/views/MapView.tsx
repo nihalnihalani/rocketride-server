@@ -274,6 +274,8 @@ export function MapView(props: MapViewProps): React.ReactElement {
 	const [neighbourError, setNeighbourError] = useState<string | null>(null);
 	const [chunkText, setChunkText] = useState<{ key: string; text: string } | null>(null);
 	const [query, setQueryView] = useState<IQueryView | null>(null);
+	/** True while a chat answer's question is being embedded and placed (no star until it lands, or fails). */
+	const [placingAnswer, setPlacingAnswer] = useState(false);
 	const [heat, setHeat] = useState<{ objectId: string; chunks: number; scores: Array<{ chunkId: number; sim: number }> } | null>(null);
 	const [fitToken, setFitToken] = useState(0);
 	const [centreOn, setCentreOn] = useState<{ index: number; seq: number } | null>(null);
@@ -352,12 +354,14 @@ export function MapView(props: MapViewProps): React.ReactElement {
 			return s ? { ...applyTransform(s, frame.transform), exact: s.exact } : null;
 		}
 		if (highlight?.source === 'chat') {
+			if (placingAnswer) return null;
+			// The labelled fallback: the answer's question could not be placed (no embedding node, or it failed).
 			const res = resolveKeys(highlight.keys, keyIdx, sampleModel?.pinned ?? []);
 			const s = centroidStar(res.points, raw, dims);
 			return s ? { ...applyTransform(s, frame.transform), exact: false } : null;
 		}
 		return null;
-	}, [sample, query, layout, raw, dims, frame, highlight, keyIdx, sampleModel]);
+	}, [sample, query, layout, raw, dims, frame, highlight, keyIdx, sampleModel, placingAnswer]);
 
 	const pinnedPlaces = useMemo(() => (sampleModel?.pinned ?? []).map((item) => place(placeProjected(item, layout, raw, dims))), [sampleModel, layout, raw, dims, place]);
 	const rays: IOverlayEnd[] = useMemo(() => {
@@ -671,13 +675,23 @@ export function MapView(props: MapViewProps): React.ReactElement {
 		const first = res.points[0];
 		if (first !== undefined) setCentreOn({ index: first, seq: ++seq.current });
 		if (highlight.source === 'chat') {
-			if (chatQueryPlan({ told: state.query, mapQuery: query?.text ?? null, embedReady }) === 'run') void runQuery(state.query as string, false);
-			else if (query !== null || state.query !== null) {
-				// The map's last query is not this answer's question: drop it, so the star is the sources' centre (approximate).
+			/** Forget the placed query: its star, rays, vector and colouring. */
+			const clearQuery = (): void => {
 				setQueryView(null);
 				queryVector.current = null;
-				selection.setQuery(null);
 				setColourBy((by) => (by === 'query-similarity' ? 'document' : by));
+			};
+			// The chat told the map the answer's question (showAnswerOnMap) before it highlighted the sources.
+			const plan = chatQueryPlan({ told: state.query, mapQuery: query?.text ?? null, embedReady });
+			if (plan === 'run') {
+				// Another question's star must not stand in while this one is embedded, or if embedding fails.
+				clearQuery();
+				setPlacingAnswer(true);
+				void runQuery(state.query as string, false).finally(() => setPlacingAnswer(false));
+			} else if (plan === 'centroid' && (query !== null || state.query !== null)) {
+				// No embedding node (or no question): the star is the sources' centre, marked approximate.
+				clearQuery();
+				selection.setQuery(null);
 			}
 			if (!reducedMotion && typeof requestAnimationFrame === 'function') {
 				const started = performance.now();

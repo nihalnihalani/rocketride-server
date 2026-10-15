@@ -46,6 +46,7 @@ import { threadScrollKey } from '../chat/chatSession';
 import type { ChatTurn } from '../chat/chatSession';
 import { Markdown } from '../chat/Markdown';
 import { CHAT_MAX_CHARS, summariseSources } from '../vector/chatResult';
+import { showAnswerOnMap } from '../adapters/consoleActions';
 import { SourcesPanel } from './SourcesPanel';
 import { RetrievalDebugger } from './RetrievalDebugger';
 
@@ -77,7 +78,7 @@ const S = {
 };
 
 /** Props of one turn. */
-interface TurnViewProps extends Pick<ChatPanelProps, 'model' | 'channels' | 'actions'> {
+interface TurnViewProps extends Pick<ChatPanelProps, 'model' | 'channels' | 'selection' | 'actions'> {
 	turn: ChatTurn;
 	debugging: boolean;
 	onDebug(open: boolean): void;
@@ -90,7 +91,7 @@ interface TurnViewProps extends Pick<ChatPanelProps, 'model' | 'channels' | 'act
  * @param props - {@link TurnViewProps}.
  * @returns The turn.
  */
-function TurnView({ turn, model, channels, actions, debugging, onDebug, onStopWaiting }: TurnViewProps): React.ReactElement {
+function TurnView({ turn, model, channels, selection, actions, debugging, onDebug, onStopWaiting }: TurnViewProps): React.ReactElement {
 	const answer = turn.answer;
 	const sources: readonly IChatSource[] = answer?.sources ?? [];
 	const threshold = model.connection.dialect?.score?.threshold;
@@ -141,7 +142,7 @@ function TurnView({ turn, model, channels, actions, debugging, onDebug, onStopWa
 						)}
 					</div>
 					{!answer.hasDocumentsLane && <p style={S.line}>This pipeline does not return the chunks it used, so the answer cannot cite them.</p>}
-					{sources.length > 0 && <SourcesPanel sources={sources} score={model.connection.dialect?.score ?? null} onOpen={(source) => actions.openDocument(source.objectId, source.chunkId)} onShowOnMap={(keys) => actions.showOnMap(keys, 'chat')} />}
+					{sources.length > 0 && <SourcesPanel sources={sources} score={model.connection.dialect?.score ?? null} onOpen={(source) => actions.openDocument(source.objectId, source.chunkId)} onShowOnMap={(keys) => showAnswerOnMap(selection, actions, turn.question, keys)} />}
 					{debugging && <RetrievalDebugger model={model} channels={channels} question={turn.question} topK={sources.length} answerSources={sources} onClose={() => onDebug(false)} />}
 				</div>
 			)}
@@ -156,7 +157,7 @@ function TurnView({ turn, model, channels, actions, debugging, onDebug, onStopWa
  * @returns The panel.
  */
 export function ChatPanel(props: ChatPanelProps): React.ReactElement {
-	const { model, channels, actions, scope, onClearScope } = props;
+	const { model, channels, selection, actions, scope, onClearScope } = props;
 	const chat = useVectorChat(props);
 	const [draft, setDraft] = useState('');
 	const [recall, setRecall] = useState(-1);
@@ -220,7 +221,7 @@ export function ChatPanel(props: ChatPanelProps): React.ReactElement {
 					<div ref={thread} style={S.thread} role="log" aria-label="Questions and answers" aria-live="off">
 						{turns.length === 0 && <p style={S.notice}>Ask a question; the answer cites the stored chunks it used.</p>}
 						{turns.map((turn) => (
-							<TurnView key={turn.id} turn={turn} model={model} channels={channels} actions={actions} debugging={debugging === turn.id} onDebug={(open) => setDebugging(open ? turn.id : null)} onStopWaiting={chat.stopWaiting} />
+							<TurnView key={turn.id} turn={turn} model={model} channels={channels} selection={selection} actions={actions} debugging={debugging === turn.id} onDebug={(open) => setDebugging(open ? turn.id : null)} onStopWaiting={chat.stopWaiting} />
 						))}
 					</div>
 					{scope !== null && scope.length > 0 && (

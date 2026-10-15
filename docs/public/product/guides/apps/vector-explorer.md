@@ -309,7 +309,11 @@ with the reason, when the store node cannot sample; the console is unaffected.
   sample are drawn hollow. **Open document**, **Find similar** and **Remove
   document** act on it.
 - **Answers.** The sources of a chat answer light up on the map; sources
-  outside the sample are added to it.
+  outside the sample are added to it. The answer's question becomes the star:
+  it is embedded by the pipeline's embedding node and placed like a query, with
+  rays to its true top results. When that node cannot be reached from the
+  Tools source, the star is the score-weighted centre of the sources instead,
+  and the legend marks it approximate.
 - **Lasso** (`L`): select an area, then **Ask about these only**, **Remove
   these documents** or **Copy keys**.
 - **Duplicates, Outliers, Heat strip and Table.** Near-identical chunks are

@@ -126,11 +126,28 @@ test('neighbour ends outside the sample survive SAMPLE_EXPIRED: the sample is dr
 	assert.match(view, /void onPick\(index, true\);[\s\S]{0,120}\}, \[sampleModel\]\);/);
 });
 
-test('a chat highlight re-embeds only a question the chat told the map; otherwise the map query is dropped for the sources\' centre', () => {
+test('a chat highlight embeds the question the chat told the map, keeps a star already placed for it, and otherwise drops the map query for the sources\' centre', () => {
 	const view = read('views/MapView.tsx');
-	assert.match(view, /chatQueryPlan\(\{ told: state\.query, mapQuery: query\?\.text \?\? null, embedReady \}\)/);
+	assert.match(view, /const plan = chatQueryPlan\(\{ told: state\.query, mapQuery: query\?\.text \?\? null, embedReady \}\);/);
 	assert.doesNotMatch(view, /if \(state\.query && model\.embed\.enabled[^\n]*runQuery\(state\.query/, 'the old rule re-embedded the last MAP query');
-	assert.match(view, /selection\.setQuery\(null\)/);
+	// 'run': the star of another question must not stand in while the new one is embedded (or if embedding fails).
+	const run = /if \(plan === 'run'\) \{([\s\S]*?)\n\t\t\t\}/.exec(view);
+	assert.ok(run, "the 'run' branch");
+	assert.ok((run[1] as string).indexOf('clearQuery()') >= 0 && (run[1] as string).indexOf('clearQuery()') < (run[1] as string).indexOf('void runQuery(state.query as string, false)'), 'cleared, then embedded');
+	// 'centroid': the map query is dropped, and the selection forgets it.
+	const centroid = /else if \(plan === 'centroid' && \(query !== null \|\| state\.query !== null\)\) \{([\s\S]*?)\n\t\t\t\}/.exec(view);
+	assert.ok(centroid, "the 'centroid' branch");
+	assert.match(centroid[1] as string, /clearQuery\(\);/);
+	assert.match(centroid[1] as string, /selection\.setQuery\(null\)/);
+	// While the question is placed there is no star; the centre appears only if placing it fails.
+	assert.match(run[1] as string, /setPlacingAnswer\(true\);/);
+	assert.match(run[1] as string, /void runQuery\(state\.query as string, false\)\.finally\(\(\) => setPlacingAnswer\(false\)\);/);
+	const star = /const star: IStar \| null = useMemo\(\(\) => \{([\s\S]*?)\n\t\}, \[([^\]]*)\]\);/.exec(view);
+	assert.ok(star, 'the star memo');
+	assert.match(star[1] as string, /if \(highlight\?\.source === 'chat'\) \{\s*if \(placingAnswer\) return null;/);
+	assert.match(star[2] as string, /\bplacingAnswer\b/);
+	// 'keep' changes nothing: no branch of its own.
+	assert.doesNotMatch(view, /plan === 'keep'/);
 	assert.match(view, /queryBlocker\(/);
 });
 
