@@ -22,12 +22,12 @@
     {
       "objectId": "dcfda41e-afa5-5f8d-b1c7-860cc0e03189",
       "path": "C:/demo/greenhouse/orchid_notes.txt",
-      "chunks": 3,
+      "chunks": 4,
       "has_first_chunk": true,
       "tables": 0,
       "deleted": false,
       "nodeId": "9a0b9f66-f693-4b3b-a85b-bb810261c26e",
-      "size": 2550,
+      "size": 2737,
       "modifyTime": null,
       "ingestedAt": "<scrubbed>",
       "pointId": "<scrubbed>"
