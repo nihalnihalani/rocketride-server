@@ -23,7 +23,7 @@ import json
 import math
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Callable, Dict, List
+from typing import Any, Callable, Dict, Iterable, List
 
 import numpy as np
 import pytest
@@ -653,10 +653,19 @@ def _fixture(name: str) -> Dict[str, Any]:
     return json.loads((_FIXTURES / f'{name}.json').read_text(encoding='utf-8'))
 
 
-def _same_keys(answer: Dict[str, Any], fixture: Dict[str, Any], where: str) -> None:
-    mine, theirs = set(answer), set(fixture)
+def _same_keys(answer: Dict[str, Any], fixture: Dict[str, Any], where: str, additive: Iterable[str] = ()) -> None:
+    mine, theirs, allowed = set(answer), set(fixture), set(_OPTIONAL) | set(additive)
     assert theirs - _OPTIONAL <= mine, f'{where}: missing {sorted(theirs - _OPTIONAL - mine)}'
-    assert mine <= theirs | _OPTIONAL, f'{where}: unexpected {sorted(mine - theirs - _OPTIONAL)}'
+    assert mine <= theirs | allowed, f'{where}: unexpected {sorted(mine - theirs - allowed)}'
+
+
+def _additive(base: Dict[str, Any], *enriched: Dict[str, Any]) -> set:
+    """The keys the additive extensions (contract section 4.4) add to an answer of the first contract.
+
+    An answer may carry them or not, whichever node change is merged; the enriched
+    provisional fixtures fix which keys they are.
+    """
+    return set().union(*(set(e) for e in enriched)) - set(base)
 
 
 @pytest.fixture
@@ -680,7 +689,7 @@ def wired(monkeypatch):
 def test_dialect_matches_the_fixture(wired):
     _store, inst, _sample = wired
     answer, fixture = inst.dialect({}), _fixture('dialect_pgvector')
-    _same_keys(answer, fixture, 'dialect')
+    _same_keys(answer, fixture, 'dialect', _additive(fixture, _fixture('dialect_enriched')))
     for part in ('score', 'limits', 'health'):
         _same_keys(answer[part], fixture[part], f'dialect.{part}')
     assert set(answer['capabilities']) == set(fixture['capabilities'])
@@ -708,10 +717,13 @@ def test_chunks_matches_the_fixture(wired):
 
 def test_sample_matches_the_fixtures(wired):
     _store, _inst, sample = wired
+    enriched = (_fixture('sample_demo_1000_clusters'), _fixture('sample_listing_truncated'))
     for name in ('sample_demo_1000', 'sample_biased_refilled', 'sample_native_knn'):
         fixture = _fixture(name)
-        _same_keys(sample, fixture, name)
-        _same_keys(sample['points'], fixture['points'], f'{name}.points')
+        _same_keys(sample, fixture, name, _additive(fixture, *enriched))
+        _same_keys(
+            sample['points'], fixture['points'], f'{name}.points', _additive(fixture['points'], enriched[0]['points'])
+        )
         _same_keys(sample['knn'], fixture['knn'], f'{name}.knn')
         _same_keys(sample['docs'][0], fixture['docs'][0], f'{name}.docs[]')
         _same_keys(sample['pca'], fixture['pca'], f'{name}.pca')
@@ -736,6 +748,19 @@ def test_neighbors_matches_the_fixtures(wired):
     _same_keys(answer['items'][0], fixture['items'][0], 'neighbors.items[]')
     scoped = inst.neighbors({'key': ['doc00', 0], 'scope_keys': [['doc01', 0]]})
     _same_keys(scoped, _fixture('neighbors_scope_scores'), 'neighbors(scope)')
+
+
+def test_the_additive_keys_are_the_enriched_fixtures_own():
+    assert _additive(_fixture('dialect_pgvector'), _fixture('dialect_enriched')) == {'keyword_match', 'size_bytes'}
+    sample = _fixture('sample_demo_1000')
+    assert _additive(sample, _fixture('sample_demo_1000_clusters'), _fixture('sample_listing_truncated')) == {
+        'clusters',
+        'listing',
+        'caveats',
+    }
+    assert _additive(sample['points'], _fixture('sample_demo_1000_clusters')['points']) == {'table'}
+    with pytest.raises(AssertionError, match='unexpected'):
+        _same_keys({**sample, 'vectors': []}, sample, 'sample', {'listing'})
 
 
 def test_recommend_matches_the_fixtures(wired):
