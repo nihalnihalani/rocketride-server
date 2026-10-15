@@ -85,6 +85,5 @@
 			"parameters": {}
 		}
 	},
-	"effective": false,
-	"known_issue": "preprocessor_langchain filters the splitter's keyword arguments by the splitter class's own __init__ signature, which drops chunk_size, chunk_overlap and length_function (LangChain's splitters take them through **kwargs). Until the node passes them through, every chunk is up to LangChain's 4,000-character default whatever strlen says: on the demo corpus 81 chunks, median 3,409 characters, identical at strlen 200, 512 and 1,000. The measurement in 'measured' and 'candidates' was taken with the node passing chunk_size to the splitter; the templates' value takes effect once it does."
+	"effective": true
 }

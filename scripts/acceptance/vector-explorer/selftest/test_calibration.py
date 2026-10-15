@@ -204,10 +204,9 @@ class CommittedTemplatesTests(unittest.TestCase):
             self.assertIn(cal.chunk_sentence(record), _annotation(path), path.name)
 
 
-# The calibration takes effect only once preprocessor_langchain hands chunk_size, chunk_overlap and
-# length_function to its splitter (its keyword filter reads the splitter's own __init__ only). That node
-# is not this lane's file; once it does, `calibrate_chunking.py --sync` flips chunking.json and the notes.
-@unittest.skip('NEEDS:lead merged — integration gate G2 (preprocessor_langchain passes the chunk length on)')
+# The calibration takes effect because preprocessor_langchain hands chunk_size, chunk_overlap and
+# length_function to its splitter (its keyword filter reads every __init__ along the splitter's MRO).
+# `calibrate_chunking.py --sync` keeps chunking.json and the templates' notes in step with the node.
 class CalibrationInEffectTests(unittest.TestCase):
     """The shipped templates cut the calibrated chunks: no caveat left in chunking.json or in any template."""
 
