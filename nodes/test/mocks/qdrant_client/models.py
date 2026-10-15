@@ -56,6 +56,7 @@ Finding What Models to Mock:
 4. Start minimal and add types as tests fail
 """
 
+from enum import Enum
 from typing import List, Any, Optional
 from dataclasses import dataclass
 
@@ -441,6 +442,34 @@ class SampleQuery:
     """``query_points(query=SampleQuery(sample=Sample.RANDOM))`` draws random points."""
 
     sample: str
+
+
+class RecommendStrategy(str, Enum):
+    """How a recommendation combines its examples (the real model is a string enum too)."""
+
+    AVERAGE_VECTOR = 'average_vector'
+    BEST_SCORE = 'best_score'
+    SUM_SCORES = 'sum_scores'
+
+
+@dataclass
+class RecommendInput:
+    """Examples of a recommendation: point ids or raw vectors on each side, and the strategy.
+
+    ``strategy`` may be a :class:`RecommendStrategy` or its string value (the real model
+    coerces one into the other); None is ``average_vector``.
+    """
+
+    positive: Optional[List[Any]] = None
+    negative: Optional[List[Any]] = None
+    strategy: Optional[Any] = None
+
+
+@dataclass
+class RecommendQuery:
+    """``query_points(query=RecommendQuery(recommend=RecommendInput(...)))`` recommends from examples."""
+
+    recommend: RecommendInput
 
 
 @dataclass
