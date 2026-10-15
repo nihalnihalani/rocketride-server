@@ -69,6 +69,8 @@ from .vx_defaults import (
     VECTOR_TOOL_LIMITS,
 )
 from .vx_types import (
+    CLUSTER_LABEL_SOURCES,
+    CLUSTER_METHODS,
     CONTROL_OBJECT_ID,
     DELETED_VALUES,
     FILTER_APPLIED_VALUES,
@@ -723,6 +725,29 @@ def _gate_ids(value: Any) -> List[str]:
     return [item if isinstance(item, str) else str(item) for item in value]
 
 
+def _cluster_arg(args: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+    """The ``sample`` call's ``cluster`` (contract section 4.4-C), normalised; None when it asks for none."""
+    value = args.get('cluster')
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise _invalid('cluster must be an object such as {"method": "knn-components", "labels": true}.')
+    unknown = sorted(str(key) for key in value if key not in ('method', 'labels'))
+    if unknown:
+        raise _invalid(f'cluster has unknown keys: {", ".join(unknown)}. Known: method, labels.')
+    method = value.get('method')
+    method = CLUSTER_METHODS[0] if method is None else method
+    if method not in CLUSTER_METHODS:
+        if method == 'label-propagation':
+            raise _invalid("cluster.method 'label-propagation' is reserved and not computed yet; use 'knn-components'.")
+        raise _invalid("cluster.method must be 'knn-components'.")
+    labels = value.get('labels')
+    labels = True if labels is None else labels
+    if not isinstance(labels, bool):
+        raise _invalid('cluster.labels must be true or false.')
+    return {'method': method, 'labels': labels}
+
+
 def _filter_object_ids(args: Mapping[str, Any]) -> Optional[List[str]]:
     flt = args.get('filter')
     if flt is None:
@@ -1101,9 +1126,9 @@ class VectorExplorerTools:
             'remove': True,
             'remove_count': has('removeCounted') or has('countChunks'),
             'soft_delete': False,
-            # Additive extensions (contract section 4.4): the node does not compute clusters yet;
-            # a driver declares the other two in VX_DRIVER_CAPABILITIES once it serves them.
-            'clusters': False,
+            # Additive extensions (contract section 4.4): the node computes clusters wherever it
+            # samples; a driver declares the other two in VX_DRIVER_CAPABILITIES once it serves them.
+            'clusters': sample,
             'documents_filter': has('documents_filter'),
             'recommend_best_score': has('recommend_best_score'),
             'projection': list(PROJECTIONS),
@@ -1810,6 +1835,14 @@ class VectorExplorerTools:
                 'components': {'type': 'integer', 'enum': [2, 3]},
                 'duplicate_threshold': {'type': 'number'},
                 'include_text': {'type': 'boolean'},
+                'cluster': {
+                    'type': ['object', 'null'],
+                    'description': 'Group the sample by its neighbour graph and label the largest groups.',
+                    'properties': {
+                        'method': {'type': 'string', 'enum': list(CLUSTER_METHODS)},
+                        'labels': {'type': 'boolean'},
+                    },
+                },
             },
         },
         output_schema={
@@ -1820,6 +1853,24 @@ class VectorExplorerTools:
                 'n': {'type': 'integer'},
                 'points': {'type': 'object'},
                 'knn': {'type': 'object'},
+                'clusters': {
+                    'type': 'object',
+                    'description': 'Present when cluster was sent: one group number per point (-1 = noise).',
+                    'properties': {
+                        'method': {'type': 'string', 'enum': list(CLUSTER_METHODS)},
+                        'edge_threshold': {'type': ['number', 'null']},
+                        'percentile': {'type': 'integer'},
+                        'count': {'type': 'integer'},
+                        'noise': {'type': 'integer'},
+                        'labels': {'type': 'array', 'items': {'type': 'integer'}},
+                        'sizes': {'type': 'array', 'items': {'type': 'integer'}},
+                        'keywords': {'type': 'array', 'items': {'type': 'array', 'items': {'type': 'string'}}},
+                        'labelled': {'type': 'integer'},
+                        'label_source': {'type': ['string', 'null'], 'enum': [*CLUSTER_LABEL_SOURCES, None]},
+                        'labelled_from': {'type': 'integer'},
+                        'took_ms': {'type': 'object'},
+                    },
+                },
                 'listing': {
                     'type': 'object',
                     'description': 'How the documents the sample was drawn from were listed, and why the listing ended.',
@@ -1833,7 +1884,7 @@ class VectorExplorerTools:
         },
         description=(
             'Draw a sample of chunks and compute, on the node, a PCA layout, the k-nearest-neighbour graph, '
-            'density, outliers and near-duplicates. Columnar; never returns vectors.'
+            'density, outliers, near-duplicates and, when asked, labelled clusters. Columnar; never returns vectors.'
         ),
         audience=('dap',),
     )
@@ -1843,7 +1894,7 @@ class VectorExplorerTools:
         vx_write_gate.check_read()
         import numpy as np
 
-        from . import vx_math
+        from . import vx_cluster, vx_math
         from .vx_sample_cache import SampleEntry, check_light_budget, make_sample_id
 
         started = _monotonic()
@@ -1886,6 +1937,7 @@ class VectorExplorerTools:
         if isinstance(threshold, bool) or not isinstance(threshold, (int, float)) or not 0 < float(threshold) <= 1:
             raise _invalid('duplicate_threshold must be a number above 0 and at most 1.')
         include_text = False if light else _bool_arg(args, 'include_text', True)
+        cluster = _cluster_arg(args)
         dp = 2 if light else 4
 
         cache = _vx_state(store).samples()
@@ -1968,6 +2020,21 @@ class VectorExplorerTools:
                 duplicates = duplicates[:DUPLICATES_MAX]
                 warnings.append('duplicates_capped')
             self._vx_check_deadline(deadline)
+            clusters = None
+            if cluster is not None:
+                # Computed once, inside the sample's exclusive section, from the graph and the texts the
+                # sample already holds; the app folds groups below its own minimum size without a call.
+                clusters = vx_cluster.cluster_sample(
+                    offsets,
+                    cols,
+                    sims,
+                    [doc.page_content for doc in docs],
+                    [paths[key[0]] for key in keys],
+                    labels=cluster['labels'],
+                    max_components=LIMITS['max_components'],
+                    clock=_monotonic,
+                )
+                self._vx_check_deadline(deadline)
 
             in_sample = Counter(key[0] for key in keys)
             pinned_set = set(pinned)
@@ -1983,6 +2050,7 @@ class VectorExplorerTools:
             if include_text:
                 points['snip'] = [vx_math.snippet(doc.page_content, LIMITS['snippet_chars']) for doc in docs]
             points['pinned'] = [1 if key in pinned_set else 0 for key in keys]
+            points['table'] = [1 if metadataValue(doc, 'isTable') else 0 for doc in docs]
 
             sample_id = make_sample_id(seed, keys)
             cache.put(
@@ -2050,6 +2118,8 @@ class VectorExplorerTools:
             caveats.append('listing_truncated')
         if caveats:
             answer['caveats'] = caveats
+        if clusters is not None:
+            answer['clusters'] = clusters
         answer['listing'] = listed
         if warnings:
             answer['warnings'] = warnings

@@ -1249,7 +1249,7 @@ def test_sample_detailed_answer_shape():
     assert (answer['strategy_used'], answer['biased'], answer['knn_source']) == ('stratified', False, 'node')
     assert (answer['metric'], answer['dimension'], answer['expires_in_s']) == ('cosine', 8, 600)
     points = answer['points']
-    assert set(points) == {'doc', 'chunk', 'x', 'y', 'z', 'len', 'snip', 'pinned'}
+    assert set(points) == {'doc', 'chunk', 'x', 'y', 'z', 'len', 'snip', 'pinned', 'table'}
     assert all(len(points[key]) == 20 for key in points)
     assert answer['knn']['k'] == 15 and len(answer['knn']['offsets_row']) == 21
     assert len(answer['knn']['cols']) == len(answer['knn']['sims']) == 20 * 15
@@ -1427,6 +1427,36 @@ def test_sample_marks_planted_duplicates():
 def test_sample_rejects_bad_input(args):
     answer = node(clustered()).sample(args)
     assert (answer['success'], answer['code']) == (False, 'INVALID_INPUT')
+
+
+@pytest.mark.parametrize(
+    'cluster,words',
+    [
+        ({'method': 'k-means'}, "must be 'knn-components'"),
+        ({'method': 'label-propagation'}, 'reserved'),
+        ({'method': 'knn-components', 'labels': 'yes'}, 'true or false'),
+        ({'method': 'knn-components', 'labels': 1}, 'true or false'),
+        ({'method': 'knn-components', 'min_size': 5}, 'unknown keys: min_size'),
+        ('knn-components', 'must be an object'),
+        ([], 'must be an object'),
+    ],
+)
+def test_sample_refuses_a_cluster_request_it_cannot_serve(cluster, words):
+    store = clustered()
+    answer = node(store).sample({'n': 10, 'cluster': cluster})
+    assert (answer['success'], answer['code']) == (False, 'INVALID_INPUT')
+    assert words in answer['error']
+    assert not any(call[0] in ('getVectors', 'listDocuments') for call in store.calls), 'refused before the store'
+
+
+@pytest.mark.parametrize('cluster', [{'method': 'knn-components'}, {'labels': True}, {'method': None, 'labels': None}])
+def test_sample_cluster_defaults_to_the_one_method_with_labels(cluster):
+    answer = node(clustered()).sample({'n': 10, 'cluster': cluster})
+    assert answer['clusters']['method'] == 'knn-components' and answer['clusters']['label_source'] == 'text'
+
+
+def test_sample_cluster_null_asks_for_no_clusters():
+    assert 'clusters' not in node(clustered()).sample({'n': 10, 'cluster': None})
 
 
 def test_sample_limits():
