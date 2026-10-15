@@ -22,8 +22,21 @@
  * neighbour graph; t-SNE is refused above 1,000 points; Cancel stops a layout;
  * a text query (when the embedding node answers) draws its star and rays.
  *
+ * EDGE ROWS: at 2,000 detailed points, at every rate, one more row per edge
+ * mode (EDGE_MODES: none, tree, neighbours:3, neighbours:5): the Edges and
+ * Edges per point controls are set, the row waits until the map says it draws
+ * that mode (data-edge-mode, data-edges-per-point, data-edge-count) and pans
+ * as the points row does. The map's slow-frame switch is turned off before the
+ * shell loads (PERF_LANE_FLAGS through page.addInitScript; MapViewProps
+ * edgesAutoDegrade false), and each row records what the map root says about
+ * it (data-edges-auto-degrade, data-edges-degraded), so a slow mode cannot pass
+ * by quietly drawing fewer edges.
+ *
  * GATE: 2,000 detailed points at 4x CPU throttling, p95 frame interval while
- * panning <= 33 ms. A check that measured nothing FAILS: the frame intervals
+ * panning <= 33 ms; and the same for each edge mode (EDGE GATES): a row that is
+ * missing, errored, slow, drew no edges (or any edge at None), drew more than
+ * the mode allows (n - 1 for the tree, m * n for neighbours), was measured with
+ * the switch on or unrecorded, or degraded while it was measured fails. A check that measured nothing FAILS: the frame intervals
  * count only when the pan really drew (a renderer runs, the canvas's
  * data-draw-count advanced by at least GATE.minSamples frames and its
  * data-camera moved), since requestAnimationFrame ticks at ~16.7 ms on an idle
@@ -63,6 +76,14 @@ const path = require('path');
 
 /** The performance gate (PLAN G4). */
 const GATE = { n: 2000, mode: 'detailed', rate: 4, maxP95: 33, minSamples: 30 };
+/** The similarity-edge modes measured at GATE.n detailed points: one row per mode and rate, a gate per mode at GATE.rate. */
+const EDGE_MODES = ['none', 'tree', 'neighbours:3', 'neighbours:5'];
+/**
+ * Set on the page's window before the shell loads (window.__VX_PERF_LANE__): the map keeps every
+ * edge however slow its frames are (MapViewProps.edgesAutoDegrade false). The map root reports the
+ * switch it ran with in data-edges-auto-degrade, and every edge row records it.
+ */
+const PERF_LANE_FLAGS = { edgesAutoDegrade: false };
 const DEFAULT_SIZES = '500,1000,2000,light:5000';
 const DEFAULT_RATES = '1,4';
 const PERF_FIXTURE = process.env.VX_PERF_FIXTURE || 'vx-local Map performance (Qdrant)';
@@ -120,7 +141,7 @@ function panWorkProblem(row) {
 
 /** The B4 privacy row of one measured row. */
 function privacyGate(row) {
-	const name = `privacy (B4): no dialect.dimension-float array outside vectors / embed answers, none sent but the query's own (${row.mode} ${row.n} at ${row.cpuThrottle}x)`;
+	const name = `privacy (B4): no dialect.dimension-float array outside vectors / embed answers, none sent but the query's own (${rowWhere(row)})`;
 	const p = row.privacy;
 	const fail = (detail) => ({ name, status: 'FAIL', detail });
 	if (!p) return fail('not measured');
@@ -132,10 +153,64 @@ function privacyGate(row) {
 	return { name, status: 'PASS', detail: `${p.frames} frames, dimension ${p.dimension}, ${p.embedAnswers} embed answers, ${p.vectorRequests} requests carried the query vector` };
 }
 
+/** 'neighbours:5' -> { edges: 'neighbours', m: 5 }; 'tree' -> { edges: 'tree', m: null }; also accepts the 'edges:' prefix of a row. */
+function edgeModeOf(mode) {
+	const parts = String(mode)
+		.replace(/^edges:/, '')
+		.split(':');
+	return { edges: parts[0], m: parts[1] === undefined ? null : Number(parts[1]) };
+}
+
+/** The most edges a mode may draw over n points: none 0, the spanning tree n - 1, neighbours m per point. */
+function edgeLimit(mode, n) {
+	const { edges, m } = edgeModeOf(mode);
+	if (edges === 'none') return 0;
+	if (edges === 'tree') return Math.max(0, n - 1);
+	return Number.isInteger(m) && m > 0 ? m * n : 0;
+}
+
+/**
+ * Why an edge row proves nothing about its mode (null when it does): it must have been drawn with
+ * the slow-frame switch recorded off and never degraded, with edges drawn for every mode but None
+ * (none at None), at most the mode's limit, and at the requested edges per point when the map said.
+ */
+function edgeRowProblem(row, mode) {
+	const { edges, m } = edgeModeOf(mode);
+	if (row.edgesAutoDegrade !== false) return `measured with the map's slow-frame switch ${row.edgesAutoDegrade === true ? 'on' : 'unrecorded'} (edgesAutoDegrade must be false)`;
+	if (row.edgesDegraded === true) return 'the map dropped to fewer edges while it was measured';
+	const drawn = row.edgesDrawn;
+	if (!Number.isInteger(drawn)) return `the edges drawn were not read (${JSON.stringify(drawn)})`;
+	if (edges === 'none') return drawn === 0 ? null : `${drawn} edges drawn with Edges: None`;
+	if (drawn <= 0) return `no edges drawn in ${mode}`;
+	if (drawn > edgeLimit(mode, row.n)) return `${drawn} edges drawn, more than ${mode} allows over ${row.n} points (${edgeLimit(mode, row.n)})`;
+	if (m !== null && row.edgesPerPoint !== undefined && row.edgesPerPoint !== m) return `the map drew ${row.edgesPerPoint} edges per point, not ${m}`;
+	return null;
+}
+
+/** The gate of one edge mode: the row at GATE.n detailed points and GATE.rate, panned like the points gate. */
+function edgeGate(rows, mode) {
+	const name = `GATE edges:${mode} at ${GATE.n.toLocaleString('en-US')} ${GATE.mode} points, ${GATE.rate}x, slow-frame switch off: pan p95 frame <= ${GATE.maxP95} ms`;
+	const row = rows.find((r) => r.edges === `edges:${mode}` && r.n === GATE.n && r.mode === GATE.mode && r.cpuThrottle === GATE.rate);
+	if (!row) return { name, status: 'FAIL', detail: 'not measured' };
+	if (row.error) return { name, status: 'FAIL', detail: `the row failed: ${row.error}` };
+	const edgeProblem = edgeRowProblem(row, mode);
+	if (edgeProblem) return { name, status: 'FAIL', detail: edgeProblem };
+	if (!row.panFrameMs || row.panFrameMs.samples < GATE.minSamples || row.panFrameMs.p95 === null) return { name, status: 'FAIL', detail: `too few frames measured (${row.panFrameMs ? row.panFrameMs.samples : 0})` };
+	const panProblem = panWorkProblem(row);
+	if (panProblem) return { name, status: 'FAIL', detail: `frame intervals without drawing: ${panProblem}` };
+	return { name, status: row.panFrameMs.p95 <= GATE.maxP95 ? 'PASS' : 'FAIL', detail: `p95 ${row.panFrameMs.p95} ms over ${row.panFrameMs.samples} frames, ${row.panWork.draws} drawn, ${row.edgesDrawn} edges` };
+}
+
+/** Where a row was measured, for its row names: size, mode, edge mode and rate. */
+function rowWhere(row) {
+	return `${row.mode} ${row.n}${row.edges ? ` ${row.edges}` : ''} at ${row.cpuThrottle}x`;
+}
+
 /** PASS/FAIL rows from the measured rows. Nothing measured is a FAIL, never a pass. */
 function evaluateGates(rows) {
 	const out = [];
-	const gateRow = rows.find((r) => r.n === GATE.n && r.mode === GATE.mode && r.cpuThrottle === GATE.rate);
+	// The points gate is the row without edges (the edge rows are measured on the same sample, after it).
+	const gateRow = rows.find((r) => !r.edges && r.n === GATE.n && r.mode === GATE.mode && r.cpuThrottle === GATE.rate);
 	const name = `GATE ${GATE.n.toLocaleString('en-US')} ${GATE.mode} points at ${GATE.rate}x: pan p95 frame <= ${GATE.maxP95} ms`;
 	const problem = gateRow && !gateRow.error ? panWorkProblem(gateRow) : null;
 	if (!gateRow) out.push({ name, status: 'FAIL', detail: 'not measured' });
@@ -143,8 +218,11 @@ function evaluateGates(rows) {
 	else if (!gateRow.panFrameMs || gateRow.panFrameMs.samples < GATE.minSamples || gateRow.panFrameMs.p95 === null) out.push({ name, status: 'FAIL', detail: `too few frames measured (${gateRow.panFrameMs ? gateRow.panFrameMs.samples : 0})` });
 	else if (problem) out.push({ name, status: 'FAIL', detail: `frame intervals without drawing: ${problem}` });
 	else out.push({ name, status: gateRow.panFrameMs.p95 <= GATE.maxP95 ? 'PASS' : 'FAIL', detail: `p95 ${gateRow.panFrameMs.p95} ms over ${gateRow.panFrameMs.samples} frames, ${gateRow.panWork.draws} drawn` });
+	// The edge gates belong to a run that measured edges: one with an edge row, or whose points row
+	// says the edge rows were due on its sample (edgeModes, set by the lane on every GATE-size row).
+	if (rows.some((r) => r.edges || Array.isArray(r.edgeModes))) for (const mode of EDGE_MODES) out.push(edgeGate(rows, mode));
 	for (const row of rows) {
-		const where = `${row.mode} ${row.n} at ${row.cpuThrottle}x`;
+		const where = rowWhere(row);
 		const layout = row.neighbourLayout;
 		if (layout && !LAYOUT_RAN.includes(layout.state)) out.push({ name: `the neighbour-graph layout runs (${where})`, status: 'FAIL', detail: `it ended ${layout.state}` });
 		if (row.tsne && row.tsne.state !== 'done') out.push({ name: `the t-SNE layout runs (${where})`, status: 'FAIL', detail: `it ended ${row.tsne.state}` });
@@ -217,7 +295,7 @@ async function waitSample(page, n, mode, timeout) {
 			return Number(canvas.getAttribute('data-points')) === n;
 		},
 		{ n, mode },
-		{ timeout, polling: 100 },
+		{ timeout, polling: 100 }
 	);
 }
 
@@ -252,6 +330,55 @@ async function pan(page, box) {
 		await page.waitForTimeout(30);
 	}
 	await page.mouse.up();
+}
+
+/**
+ * Pan for about two seconds while recording frame intervals, and what the pan really drew: the
+ * frames drawn (the canvas's data-draw-count) and the camera it moved (data-camera).
+ */
+async function measurePan(page, canvas, box) {
+	const work = async () => ({ draws: await canvas.getAttribute('data-draw-count'), camera: await canvas.getAttribute('data-camera') });
+	const before = await work();
+	const panFrameMs = summarise(await sampleFrames(page, () => pan(page, box)));
+	const after = await work();
+	return { panFrameMs, panWork: { draws: before.draws === null || after.draws === null ? null : Number(after.draws) - Number(before.draws), cameraBefore: before.camera, cameraAfter: after.camera } };
+}
+
+/**
+ * One edge row on the sample in front: set Edges (and Edges per point), wait until the map root
+ * says it draws that mode, pan, and read what the root says about the edges it drew and the
+ * slow-frame switch it ran with. Missing attributes are recorded as such, never as a pass.
+ */
+async function measureEdges(page, mode) {
+	const { edges, m } = edgeModeOf(mode);
+	const map = page.locator('.vector-map').first();
+	const canvas = page.locator('[data-points]').first();
+	await page.getByRole('combobox', { name: 'Edges', exact: true }).selectOption(edges);
+	if (m !== null) await page.getByRole('combobox', { name: 'Edges per point', exact: true }).selectOption(String(m));
+	await page.waitForFunction(
+		(want) => {
+			const root = document.querySelector('.vector-map');
+			if (!root || root.getAttribute('data-edge-mode') !== want.edges) return false;
+			if (want.m !== null && root.getAttribute('data-edges-per-point') !== String(want.m)) return false;
+			return want.edges === 'none' || Number(root.getAttribute('data-edge-count')) > 0;
+		},
+		{ edges, m },
+		{ timeout: 60000, polling: 100 }
+	);
+	await page.waitForTimeout(600);
+	const box = await canvas.boundingBox();
+	if (!box) throw new Error('the map canvas has no box');
+	const row = { renderer: await canvas.getAttribute('data-renderer'), ...(await measurePan(page, canvas, box)) };
+	const int = (v) => (typeof v === 'string' && /^\d+$/.test(v) ? Number(v) : null);
+	const auto = await map.getAttribute('data-edges-auto-degrade');
+	row.edgesAutoDegrade = auto === 'off' ? false : auto === 'on' ? true : undefined;
+	const degraded = await map.getAttribute('data-edges-degraded');
+	row.edgesDegraded = degraded === '1' ? true : degraded === '0' ? false : undefined;
+	row.edgesDrawn = int(await map.getAttribute('data-edge-count'));
+	if (m !== null) row.edgesPerPoint = int(await map.getAttribute('data-edges-per-point'));
+	const draw = await canvas.getAttribute('data-draw-p95');
+	row.drawP95Ms = draw === null ? null : Number(draw);
+	return row;
 }
 
 /** Move the pointer across the canvas without a button (hover picking). */
@@ -343,7 +470,13 @@ async function mapSteps(page, box, row) {
 		const cy = box.y + box.height / 2;
 		await page.mouse.move(cx - 150, cy - 110);
 		await page.mouse.down();
-		for (const [dx, dy] of [[150, -110], [150, 110], [-150, 110], [-150, -110]]) await page.mouse.move(cx + dx, cy + dy, { steps: 8 });
+		for (const [dx, dy] of [
+			[150, -110],
+			[150, 110],
+			[-150, 110],
+			[-150, -110],
+		])
+			await page.mouse.move(cx + dx, cy + dy, { steps: 8 });
 		await page.mouse.up();
 		const text = await page.getByRole('region', { name: 'Selected points' }).first().innerText({ timeout: 15000 });
 		const m = /([\d,]+) points selected from ([\d,]+) documents/.exec(text);
@@ -446,7 +579,10 @@ async function main() {
 		return 1;
 	}
 	const sizes = parseSizes(sizesArg);
-	const rates = String(ratesArg).split(',').map(Number).filter((r) => r > 0);
+	const rates = String(ratesArg)
+		.split(',')
+		.map(Number)
+		.filter((r) => r > 0);
 	const { chromium } = E.loadPlaywright();
 	const browser = await chromium.launch({ channel: 'chrome', headless: true });
 	// dialect.dimension from the store itself (not from the page), once.
@@ -462,10 +598,17 @@ async function main() {
 	for (const rate of rates) {
 		for (const size of sizes) {
 			const context = await browser.newContext({ viewport: { width: 1440, height: 920 } });
+			// Before the shell loads: the map keeps every edge however slow its frames (edgesAutoDegrade false).
+			await context.addInitScript((flags) => {
+				window.__VX_PERF_LANE__ = flags;
+			}, PERF_LANE_FLAGS);
 			const page = await context.newPage();
 			const capture = C.captureFrames(page);
 			const cdp = await context.newCDPSession(page);
 			const row = { n: size.n, mode: size.mode, cpuThrottle: rate, browser: `Chrome ${browser.version()}`, fixture: PERF_FIXTURE };
+			const edgeSample = size.n === GATE.n && size.mode === GATE.mode;
+			// The edge rows are due on this sample: their gates are reported even when the rows cannot be measured.
+			if (edgeSample) row.edgeModes = EDGE_MODES.slice();
 			try {
 				await E.signIn(page, base);
 				await page.getByRole('button', { name: 'Open Vector Explorer' }).click();
@@ -485,12 +628,7 @@ async function main() {
 				await page.waitForTimeout(600);
 				const box = await canvas.boundingBox();
 				if (!box) throw new Error('the map canvas has no box');
-				// What the pan really drew: frames drawn (data-draw-count) and the camera it moved (data-camera).
-				const work = async () => ({ draws: await canvas.getAttribute('data-draw-count'), camera: await canvas.getAttribute('data-camera') });
-				const before = await work();
-				row.panFrameMs = summarise(await sampleFrames(page, () => pan(page, box)));
-				const after = await work();
-				row.panWork = { draws: before.draws === null || after.draws === null ? null : Number(after.draws) - Number(before.draws), cameraBefore: before.camera, cameraAfter: after.camera };
+				Object.assign(row, await measurePan(page, canvas, box));
 				row.hoverFrameMs = summarise(await sampleFrames(page, () => hover(page, box)));
 				row.zoomFrameMs = summarise(await sampleFrames(page, () => zoom(page, box)));
 				const draw = await canvas.getAttribute('data-draw-p95');
@@ -510,6 +648,25 @@ async function main() {
 			row.privacy = { ...privacySummary(capture.frames, dimension, C), ...(dimensionError ? { dimensionError } : {}) };
 			rows.push(row);
 			console.log(JSON.stringify(row));
+			// The edge rows, on the same sample (still throttled at this rate), one per mode.
+			for (const mode of edgeSample ? EDGE_MODES : []) {
+				const edgeRow = { n: size.n, mode: size.mode, cpuThrottle: rate, edges: `edges:${mode}`, browser: row.browser, fixture: PERF_FIXTURE };
+				if (row.error) edgeRow.error = `the points row failed first: ${row.error}`;
+				else {
+					try {
+						await cdp.send('Emulation.setCPUThrottlingRate', { rate });
+						Object.assign(edgeRow, await measureEdges(page, mode));
+						await page.screenshot({ path: outFile.replace(/\.json$/, `-${size.mode}-${size.n}-edges-${mode.replace(':', '')}-x${rate}.png`) });
+					} catch (e) {
+						edgeRow.error = String(e && e.message ? e.message : e).split('\n')[0];
+						await page.screenshot({ path: outFile.replace(/\.json$/, `-${size.mode}-${size.n}-edges-${mode.replace(':', '')}-x${rate}-error.png`) }).catch(() => {});
+					}
+				}
+				// Edges are drawn from the sample the page already holds (no call), so the row is checked over the page's whole capture.
+				edgeRow.privacy = { ...privacySummary(capture.frames, dimension, C), ...(dimensionError ? { dimensionError } : {}) };
+				rows.push(edgeRow);
+				console.log(JSON.stringify(edgeRow));
+			}
 			await context.close();
 		}
 	}
@@ -522,7 +679,7 @@ async function main() {
 	return result.pass ? 0 : 1;
 }
 
-module.exports = { GATE, PERF_PROJECT_ID, QUERY_STEP, pct, parseSizes, summarise, evaluateGates, privacySummary, laneArgs, resultOf };
+module.exports = { GATE, EDGE_MODES, PERF_LANE_FLAGS, PERF_PROJECT_ID, QUERY_STEP, pct, parseSizes, summarise, edgeModeOf, edgeLimit, edgeRowProblem, evaluateGates, privacySummary, laneArgs, resultOf };
 
 if (require.main === module) {
 	main().then(
@@ -530,6 +687,6 @@ if (require.main === module) {
 		(e) => {
 			console.error(e);
 			process.exit(2);
-		},
+		}
 	);
 }

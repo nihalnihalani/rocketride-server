@@ -19,7 +19,13 @@ At each gate the per-lane diff is checked from the command line, which lists eve
 changed path outside the lane's list and exits 1 when there is one:
 
     python3 scripts/acceptance/vector-explorer/selftest/test_lanes.py diff <lane> <day-0 commit> <lane tip>
+    python3 scripts/acceptance/vector-explorer/selftest/test_lanes.py diff-all   # every lane branch since day0_commit
     python3 scripts/acceptance/vector-explorer/selftest/test_lanes.py check
+    python3 scripts/acceptance/vector-explorer/selftest/test_lanes.py day0       # new/owned paths against day0_commit, merge_order
+
+``day0_commit`` is the commit every lane branches from; ``merge_order`` the order
+the lanes merge into the integration branch (the acceptance lane last, because it
+regenerates the live wire fixtures over every other lane's code).
 
 Run the tests: python3 -m unittest discover -s scripts/acceptance/vector-explorer/selftest -p test_lanes.py -v
 """
@@ -30,7 +36,7 @@ import subprocess
 import sys
 import unittest
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List
+from typing import Any, Callable, Dict, Iterable, List, Optional
 
 HERE = Path(__file__).resolve().parent
 LANES_JSON = HERE.parent / 'lanes.json'
@@ -110,6 +116,66 @@ def outside(doc: Dict[str, Any], lane: str, paths: Iterable[str]) -> List[str]:
     return sorted(path for path in set(paths) if not any(covers(owned, path) for owned in entry['owns']))
 
 
+def at_commit(commit: str, path: str, root: Path = REPO) -> bool:
+    """Whether ``path`` (a file, or for a ``/**`` entry its folder) exists on ``commit``."""
+    target = path[:-3] if path.endswith('/**') else path
+    result = subprocess.run(
+        ['git', 'cat-file', '-e', f'{commit}:{target}'], cwd=root, capture_output=True, text=True, check=False
+    )
+    return result.returncode == 0
+
+
+def day0_problems(doc: Dict[str, Any], exists: Callable[[str, str], bool] = at_commit) -> List[str]:
+    """Owned paths the day-0 commit contradicts: one marked new that it already has, one not new that it lacks."""
+    commit = doc.get('day0_commit', '')
+    out: List[str] = []
+    for lane in doc.get('lanes', []):
+        for path in lane.get('owns', []):
+            here = exists(commit, path)
+            if path in lane.get('new', []) and here:
+                out.append(f'{lane["lane"]} marked {path} new but exists on the day-0 commit {commit}')
+            elif path not in lane.get('new', []) and not here:
+                out.append(f'{lane["lane"]} owns {path}, which is not on the day-0 commit {commit} and not marked new')
+    return out
+
+
+def order_problems(doc: Dict[str, Any]) -> List[str]:
+    """What is wrong with ``merge_order``: every lane but the lead's once, the acceptance lane last."""
+    order = doc.get('merge_order', [])
+    out: List[str] = []
+    if len(set(order)) != len(order):
+        out.append(f'merge_order names a lane twice: {order}')
+    if set(order) != set(LANE_IDS[1:]):
+        out.append(f'merge_order must name {LANE_IDS[1:]} once each, not {order}')
+    if order and order[-1] != 'E10':
+        out.append('the acceptance lane (E10) merges last: it regenerates the live fixtures over every other lane')
+    return out
+
+
+def branch_present(branch: str, root: Path = REPO) -> bool:
+    """Whether a local branch exists."""
+    result = subprocess.run(
+        ['git', 'rev-parse', '--verify', '--quiet', f'refs/heads/{branch}'], cwd=root, capture_output=True, check=False
+    )
+    return result.returncode == 0
+
+
+def diff_all(
+    doc: Dict[str, Any],
+    changed_paths: Callable[..., List[str]] = None,
+    branch_exists: Callable[[str], bool] = branch_present,
+) -> Dict[str, Optional[List[str]]]:
+    """Every lane's paths outside its list, from the day-0 commit to its branch (None: no such branch)."""
+    changed_paths = changed_paths or changed
+    report: Dict[str, Optional[List[str]]] = {}
+    for lane in doc['lanes'][1:]:
+        branch = lane['branch']
+        report[lane['lane']] = (
+            outside(doc, lane['lane'], changed_paths(doc['day0_commit'], branch)) if branch_exists(branch) else None
+        )
+    return report
+
+
 def changed(base: str, tip: str, root: Path = REPO) -> List[str]:
     """The paths changed between two commits (a rename counts as both of its paths)."""
     result = subprocess.run(
@@ -157,6 +223,65 @@ class LanesFileTests(unittest.TestCase):
         ):
             self.assertEqual(owners(self.doc, path), ['E10'], path)
             self.assertIn(path, self.doc['day0'])
+
+
+class Day0AndOrderTests(unittest.TestCase):
+    """The day-0 commit lanes.json names, and the order the lanes merge in."""
+
+    def setUp(self):
+        self.doc = load()
+
+    def test_the_file_names_the_day0_commit_and_the_merge_order(self):
+        self.assertRegex(self.doc.get('day0_commit', ''), r'^[0-9a-f]{9,40}$')
+        self.assertEqual(sorted(self.doc['merge_order']), sorted(LANE_IDS[1:]))
+        self.assertEqual(order_problems(self.doc), [])
+
+    def test_new_paths_are_new_and_owned_paths_exist_on_the_day0_commit(self):
+        commit = self.doc['day0_commit']
+        if not at_commit(commit, 'scripts/acceptance/vector-explorer/lanes.json'):
+            self.skipTest(f'the day-0 commit {commit} is not in this clone')
+        self.assertEqual(day0_problems(self.doc), [])
+
+    def test_the_day0_checker_reports_each_kind_of_mistake(self):
+        doc = copy.deepcopy(self.doc)
+        lane = next(item for item in doc['lanes'] if item['lane'] == 'E10')
+        lane['new'].append('scripts/acceptance/vector-explorer/lanes.json')
+        lane['owns'].append('scripts/acceptance/vector-explorer/not_on_day0.py')
+        found = day0_problems(doc, exists=lambda commit, path: path == 'scripts/acceptance/vector-explorer/lanes.json')
+        self.assertTrue(any('lanes.json new but exists on the day-0 commit' in line for line in found), found)
+        self.assertTrue(any('not_on_day0.py' in line and 'not on the day-0 commit' in line for line in found), found)
+
+    def test_the_order_checker_reports_each_kind_of_mistake(self):
+        for name, breaks in {
+            'a lane missing': lambda d: d['merge_order'].remove('E4'),
+            'a lane twice': lambda d: d['merge_order'].append('E1'),
+            'the lead lane': lambda d: d['merge_order'].insert(0, 'E0'),
+            'the acceptance lane not last': lambda d: d['merge_order'].insert(0, d['merge_order'].pop()),
+            'an unknown lane': lambda d: d['merge_order'].append('E11'),
+        }.items():
+            doc = copy.deepcopy(self.doc)
+            breaks(doc)
+            self.assertNotEqual(order_problems(doc), [], name)
+
+    def test_every_lane_branch_can_be_checked_at_once(self):
+        doc = self.doc
+        calls = []
+
+        def fake_changed(base, tip, root=REPO):
+            calls.append((base, tip))
+            return {
+                'vx/acceptance-2': [
+                    'scripts/acceptance/vector-explorer/lanes.json',
+                    'apps/vector-ui/src/views/MapView.tsx',
+                ]
+            }.get(tip, [])
+
+        report = diff_all(doc, changed_paths=fake_changed, branch_exists=lambda b: b != 'vx/app-ingest-2')
+        self.assertEqual(report['E10'], ['apps/vector-ui/src/views/MapView.tsx'])
+        self.assertEqual(report['E1'], [])
+        self.assertIsNone(report['E9'], 'a lane whose branch does not exist is reported as unchecked')
+        self.assertNotIn('E0', report)
+        self.assertTrue(all(base == doc['day0_commit'] for base, _ in calls))
 
 
 class CheckerTests(unittest.TestCase):
@@ -223,7 +348,23 @@ class CheckerTests(unittest.TestCase):
 
 
 def main(argv: List[str]) -> int:
-    """``diff <lane> <base> <tip>`` or ``check``; anything else runs the tests."""
+    """``diff <lane> <base> <tip>``, ``diff-all``, ``check`` or ``day0``; anything else runs the tests."""
+    if argv == ['diff-all']:
+        report = diff_all(load())
+        for lane, stray in report.items():
+            if stray is None:
+                print(f'{lane}: no branch')
+            for path in stray or []:
+                print(f'{lane} changed {path}, which is not in its list')
+        strays = sum(len(stray or []) for stray in report.values())
+        print(f'{strays} paths outside their lane lists since {load()["day0_commit"]}')
+        return 1 if strays else 0
+    if argv == ['day0']:
+        found = day0_problems(load()) + order_problems(load())
+        for line in found:
+            print(line)
+        print(f'lanes.json against its day-0 commit: {len(found)} problems')
+        return 1 if found else 0
     if len(argv) == 4 and argv[0] == 'diff':
         lane, base, tip = argv[1:]
         stray = outside(load(), lane, changed(base, tip))

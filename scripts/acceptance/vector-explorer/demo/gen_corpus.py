@@ -16,13 +16,35 @@ eleven folders, written so the map and the chat have something to show:
   ``archive/kestrel_field_guide_copy.md``);
 * one boilerplate paragraph (``BOILERPLATE``) at the end of exactly six files;
 * one OCR-junk file (``scans/ocr_scan_0417.txt``) and one table file
-  (``tables/equipment_inventory.html``).
+  (``tables/equipment_inventory.html``);
+* one keyword token, ``KX4471`` (``KEYWORD_TOKEN``), written once, as a whole
+  word, in ``ops/memo_q3.txt`` (``KEYWORD_FILE``, one of the documents the live
+  tool suites upload), so keyword search has one exact answer on every store.
+
+With ``--pad N`` the corpus gains N padding documents, one short note each
+(one chunk), in their own folder ``pad/`` (``PAD_FOLDER``). Seeded as
+``C:/demo/pad/...`` into a collection of their own (``SCOPE_COLLECTION``, the
+scope cards below, never the demo collection, whose samples must keep every demo
+document), they make a scope larger than the sampler's 500-document listing (the
+enrichment lane scopes the map to that folder) and a collection of more than 500
+documents (an unscoped sample's listing then stops at its cap).
+
+The enrichment lane's own fixture cards are templates pointed at a collection
+of their own, built the way gen_perf.py builds the perf card: the scope cards
+(``SCOPE_CARDS``, Qdrant and Chroma, over ``SCOPE_COLLECTION``) and the legacy
+card (``LEGACY_CARD``, pgvector, over the legacy table seed_legacy.sh seeds).
 
 Every name, place and number is invented. The same run always writes the same
 bytes, so a seeded store can be compared across runs.
 
-Usage: python3 gen_corpus.py OUT_DIR [--check]
+Usage: python3 gen_corpus.py OUT_DIR [--pad N] [--check]
+  --pad N   also write N padding documents under pad/
   --check   exit 1 when OUT_DIR differs from what this script writes
+The enrichment lane's cards (the engine's Python, from dist/server; local
+containers only; the forty demo documents are seed_demo.sh's):
+  ./engine <this folder>/gen_corpus.py --seed-pad 600 [--only qdrant,chroma]   # start the scope cards, upload the padding
+  ./engine <this folder>/gen_corpus.py --legacy-card                          # start the legacy card (after seed_legacy.sh)
+  ./engine <this folder>/gen_corpus.py --stop-cards                           # terminate both
 """
 
 from __future__ import annotations
@@ -31,7 +53,7 @@ import random
 import sys
 
 from pathlib import Path
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 SEED = 20261008
 
@@ -60,6 +82,29 @@ NEAR_DUPLICATES = (
 LONG_MANUAL = 'manuals/long_manual.md'
 TABLE_FILE = 'tables/equipment_inventory.html'
 OCR_FILE = 'scans/ocr_scan_0417.txt'
+
+# One token that keyword search must find exactly once, as a whole word (no other text contains it).
+KEYWORD_TOKEN = 'KX4471'
+KEYWORD_FILE = 'ops/memo_q3.txt'
+KEYWORD_SENTENCE = (
+    f'The spare impeller for the intake pump is stocked as part {KEYWORD_TOKEN} in the north store; '
+    'order a replacement as soon as the spare is fitted.'
+)
+
+# The padding documents of --pad: their folder, and the prefix seed_demo.py uploads the corpus under.
+PAD_FOLDER = 'pad'
+DEMO_PREFIX = 'C:/demo/'
+
+# The enrichment lane's own cards (lane_vector_enrich.cjs SCOPE_FIXTURES and LEGACY_FIXTURE; its selftest keeps them equal).
+SCOPE_COLLECTION = 'vx_scope_docs'
+SCOPE_CARDS = {
+    'qdrant': ('vx-local Scope 600 (Qdrant)', '00000000-0000-4000-8000-00000000d1a9'),
+    'chroma': ('vx-local Scope 600 (Chroma)', '00000000-0000-4000-8000-00000000d1aa'),
+}
+LEGACY_TABLE = 'vx_legacy_docs'
+LEGACY_CARD = ('vx-local Legacy (pgvector)', '00000000-0000-4000-8000-00000000d1a8')
+PAD_SHIFTS = ('night watch', 'morning crew', 'day crew', 'evening watch')
+PAD_SUBJECTS = ('the generator', 'the battery bank', 'the intake pump', 'the radio mast', 'the greenhouse heater')
 
 # ---------------------------------------------------------------------------
 # Sentence banks, one per topic. {x} placeholders are filled per document.
@@ -117,21 +162,21 @@ GREENHOUSE = [
     'The {plant} bench sits on the east side of the greenhouse, where it gets morning light and afternoon shade.',
     'Water the {plant} only when the top two centimetres of the potting mix feel dry to the touch.',
     'Humidity in the orchid corner is held near sixty percent with a cool-mist humidifier on a timer.',
-    'Night temperatures must not drop below twelve degrees; the paraffin heater starts at ten.',
-    'Feed with a quarter-strength balanced fertiliser every second watering during the growing season.',
+    'Night temperatures in the orchid house must not drop below twelve degrees; the paraffin heater starts at ten.',
+    'Feed the orchid benches with a quarter-strength balanced fertiliser every second watering during the growing season.',
     'Yellowing lower leaves usually mean overwatering rather than a lack of nutrients.',
     'Tomato trials compare three cultivars for yield, flavour and resistance to grey mould.',
     'Side shoots on cordon tomatoes are pinched out weekly so the plant puts its energy into fruit.',
     'Fern beds need constant moisture and no direct sun; the shade cloth stays up from May to August.',
     'Aphids are the commonest pest; ladybird larvae released in spring keep them under control.',
     'Fungus gnats breed in wet compost, so let the surface dry between waterings and use yellow sticky traps.',
-    'The drip irrigation lines run for twelve minutes at dawn, fed from the rainwater tank.',
+    'The drip irrigation lines of the orchid house run for twelve minutes at dawn, fed from the rainwater tank.',
     'Seed packets are stored in airtight jars in the cool cupboard, labelled with variety and harvest year.',
     'Germination tests are run every spring on a damp paper towel before sowing the trays.',
     'Repot orchids after flowering, in fresh bark mix, and keep them slightly drier for two weeks.',
     'Record every sowing, transplant and harvest in the greenhouse log with the date and the bench number.',
-    'Ventilation flaps open automatically above twenty-six degrees and close again at twenty.',
-    'Grey mould spreads quickly in still, damp air; remove infected leaves at once and improve air flow.',
+    'The orchid house ventilation flaps open automatically above twenty-six degrees and close again at twenty.',
+    'Grey mould spreads quickly in the still, damp air of the orchid house; remove infected leaves at once and improve air flow.',
 ]
 
 OPS = [
@@ -436,8 +481,29 @@ def _ocr_junk() -> str:
     return '\n'.join(lines) + '\n'
 
 
-def build_corpus() -> Dict[str, str]:
-    """Every document of the corpus: relative path -> text."""
+def pad_documents(count: int) -> Dict[str, str]:
+    """``count`` padding documents (``pad/scope_note_<n>.txt``), one short note each, the same every run."""
+    if count < 0:
+        raise ValueError(f'the padding count must be 0 or more, not {count}')
+    rng = random.Random(f'{SEED}:{PAD_FOLDER}:{count}')
+    docs: Dict[str, str] = {}
+    for n in range(1, count + 1):
+        shift = PAD_SHIFTS[n % len(PAD_SHIFTS)]
+        subject = PAD_SUBJECTS[(n // len(PAD_SHIFTS)) % len(PAD_SUBJECTS)]
+        docs[f'{PAD_FOLDER}/scope_note_{n:04d}.txt'] = (
+            f'Scope note {n}: the {shift} checked {subject} at {rng.randint(0, 23):02d}:{rng.randint(0, 59):02d} '
+            f'and logged a reading of {rng.randint(1, 999)}; nothing else to report.\n'
+        )
+    return docs
+
+
+def pad_upload_names(pad: Dict[str, str]) -> List[str]:
+    """The names the padding documents are uploaded under (``C:/demo/pad/...``), in path order."""
+    return [DEMO_PREFIX + rel for rel in sorted(pad)]
+
+
+def build_corpus(pad: int = 0) -> Dict[str, str]:
+    """Every document of the corpus (and ``pad`` padding documents): relative path -> text."""
     docs: Dict[str, str] = {}
     for path, title, bank, subs, sections in PLANS:
         docs[path] = _document(path, title, bank, subs, sections)
@@ -445,16 +511,18 @@ def build_corpus() -> Dict[str, str]:
         docs[copy] = _near_duplicate(docs[original])
     for path in BOILERPLATE_FILES:
         docs[path] = docs[path].rstrip() + '\n\n' + BOILERPLATE + '\n'
+    docs[KEYWORD_FILE] = docs[KEYWORD_FILE].rstrip() + '\n\n' + KEYWORD_SENTENCE + '\n'
     docs[LONG_MANUAL] = _long_manual()
     docs[TABLE_FILE] = _table_file()
     docs[OCR_FILE] = _ocr_junk()
+    docs.update(pad_documents(pad))
     return dict(sorted(docs.items()))
 
 
-def write_corpus(out_dir: Path) -> List[Path]:
-    """Write the corpus under out_dir; returns the written files in path order."""
+def write_corpus(out_dir: Path, pad: int = 0) -> List[Path]:
+    """Write the corpus (and ``pad`` padding documents) under out_dir; returns the written files in path order."""
     written = []
-    for rel, text in build_corpus().items():
+    for rel, text in build_corpus(pad).items():
         target = out_dir / rel
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(text, encoding='utf-8', newline='\n')
@@ -462,9 +530,9 @@ def write_corpus(out_dir: Path) -> List[Path]:
     return written
 
 
-def differences(out_dir: Path) -> List[str]:
+def differences(out_dir: Path, pad: int = 0) -> List[str]:
     """Relative paths whose content in out_dir differs from (or is missing against) the generator."""
-    corpus = build_corpus()
+    corpus = build_corpus(pad)
     out = [
         rel
         for rel, text in corpus.items()
@@ -475,19 +543,136 @@ def differences(out_dir: Path) -> List[str]:
     return out
 
 
+def _fixtures():
+    """vx_fixtures.py (the acceptance scripts' fixture builder, one folder up)."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    import vx_fixtures
+
+    return vx_fixtures
+
+
+def seed_pad(count: int, only: Sequence[str]) -> int:
+    """Start the scope cards of ``only`` and upload ``count`` padding documents into each (the engine's Python)."""
+    import asyncio
+    import tempfile
+
+    fx = _fixtures()
+    unknown = [key for key in only if key not in SCOPE_CARDS]
+    if unknown:
+        print(f'gen_corpus.py: no scope card for {", ".join(unknown)} (known: {", ".join(SCOPE_CARDS)})')
+        return 2
+
+    async def run() -> int:
+        from rocketride import RocketRideClient
+
+        failures = 0
+        with tempfile.TemporaryDirectory(prefix='vx-pad-') as tmp:
+            root = Path(tmp)
+            files = []
+            for rel, text in sorted(pad_documents(count).items()):
+                target = root / rel
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(text, encoding='utf-8', newline='\n')
+                files.append((target, DEMO_PREFIX + rel))
+            async with RocketRideClient(uri=fx.ENGINE_URL, auth=fx.API_KEY, request_timeout=900000) as client:
+                for key in only:
+                    name, project_id = SCOPE_CARDS[key]
+                    pipe = fx.build_pipeline(key, collection=SCOPE_COLLECTION, project_id=project_id, name=name)
+                    tokens = await fx.ensure_started(client, pipe, fx.TEMPLATE_SOURCES)
+                    failed = 0
+                    for start in range(0, len(files), 25):
+                        failed += len(
+                            fx.failed_uploads(
+                                await fx.send_named(client, tokens['ingest_1'], files[start : start + 25])
+                            )
+                        )
+                    failures += failed
+                    print(
+                        f'{name}: {len(files) - failed} of {len(files)} padding documents ingested into {SCOPE_COLLECTION}'
+                    )
+        return 1 if failures else 0
+
+    return asyncio.run(run())
+
+
+def legacy_card() -> int:
+    """Start the legacy card: the pgvector template over the legacy table (seed_legacy.sh seeds it)."""
+    import asyncio
+
+    fx = _fixtures()
+
+    async def run() -> int:
+        from rocketride import RocketRideClient
+
+        name, project_id = LEGACY_CARD
+        pipe = fx.build_pipeline('postgres', collection=LEGACY_TABLE, project_id=project_id, name=name)
+        async with RocketRideClient(uri=fx.ENGINE_URL, auth=fx.API_KEY) as client:
+            await fx.ensure_started(client, pipe, ('tools_1', 'chat_1'))
+        print(f'{name}: running over {LEGACY_TABLE}')
+        return 0
+
+    return asyncio.run(run())
+
+
+def stop_cards() -> int:
+    """Terminate the scope cards and the legacy card."""
+    import asyncio
+
+    fx = _fixtures()
+
+    async def run() -> int:
+        from rocketride import RocketRideClient
+
+        async with RocketRideClient(uri=fx.ENGINE_URL, auth=fx.API_KEY) as client:
+            for name, project_id in [*SCOPE_CARDS.values(), LEGACY_CARD]:
+                stopped = await fx.stop(client, project_id, fx.TEMPLATE_SOURCES)
+                print(f'{name}: stopped {", ".join(stopped) or "nothing"}')
+        return 0
+
+    return asyncio.run(run())
+
+
+def _option(argv: List[str], name: str) -> Tuple[List[str], Optional[str]]:
+    """Remove ``name VALUE`` from argv; (the rest, VALUE or None)."""
+    if name not in argv:
+        return argv, None
+    i = argv.index(name)
+    if i + 1 >= len(argv):
+        raise ValueError(f'{name} needs a value')
+    return argv[:i] + argv[i + 2 :], argv[i + 1]
+
+
 def main(argv: Sequence[str]) -> int:
-    """Write (or with --check, compare) the corpus."""
-    args = [a for a in argv if a != '--check']
+    """Write (or with --check, compare) the corpus; or with --seed-pad, upload the padding."""
+    try:
+        args, pad_text = _option(list(argv), '--pad')
+        args, seed_text = _option(args, '--seed-pad')
+        args, only_text = _option(args, '--only')
+        pad = int(pad_text) if pad_text is not None else 0
+        if pad < 0:
+            raise ValueError(f'--pad must be 0 or more, not {pad}')
+    except ValueError as error:
+        print(f'gen_corpus.py: {error}')
+        return 2
+    if seed_text is not None:
+        only = [k.strip() for k in (only_text or ','.join(SCOPE_CARDS)).split(',') if k.strip()]
+        return seed_pad(int(seed_text), only)
+    if '--legacy-card' in args:
+        return legacy_card()
+    if '--stop-cards' in args:
+        return stop_cards()
+    check = '--check' in args
+    args = [a for a in args if a != '--check']
     if len(args) != 1:
         print(__doc__)
         return 2
     out_dir = Path(args[0])
-    if '--check' in argv:
-        diff = differences(out_dir)
+    if check:
+        diff = differences(out_dir, pad)
         for rel in diff:
             print(f'differs: {rel}')
         return 1 if diff else 0
-    files = write_corpus(out_dir)
+    files = write_corpus(out_dir, pad)
     print(f'{len(files)} documents in {out_dir}')
     return 0
 

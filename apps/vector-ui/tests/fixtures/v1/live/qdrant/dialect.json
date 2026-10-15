@@ -58,6 +58,9 @@
     "remove": true,
     "remove_count": true,
     "soft_delete": false,
+    "clusters": false,
+    "documents_filter": false,
+    "recommend_best_score": false,
     "projection": [
       "pca"
     ]
@@ -78,7 +81,10 @@
     "write_ids_max": 100,
     "sample_budget_ms": 60000,
     "statement_timeout_ms": null,
-    "counts_cached_s": 60
+    "counts_cached_s": 60,
+    "recommend_examples_max": 10,
+    "matrix_keys_max": 100,
+    "max_components": 200
   },
   "health": {
     "collection_exists": true,

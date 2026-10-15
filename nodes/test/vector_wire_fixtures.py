@@ -89,11 +89,16 @@ WIRE_SAMPLE_N = 500
 # The tools every backend has a capture of, on the new and on the legacy side.
 REQUIRED_TOOLS = ('dialect', 'stats', 'documents', 'chunks', 'sample', 'search', 'remove_document')
 
+# The corpus's one keyword token (demo/gen_corpus.py KEYWORD_TOKEN, in ops/memo_q3.txt).
+WIRE_KEYWORD = 'KX4471'
+
 
 # Answers derived from embeddings (similarities, PCA coordinates, scores): their
 # last digits depend on the CPU and BLAS build, so their floats are compared
 # within FLOAT_TOLERANCE; everything else, and every non-float, exactly.
-SIMILARITY_TOOLS = frozenset({'sample', 'project', 'neighbors', 'search', 'embed', 'vectors'})
+SIMILARITY_TOOLS = frozenset(
+    {'sample', 'project', 'neighbors', 'search', 'embed', 'vectors', 'recommend', 'similarity_matrix'}
+)
 FLOAT_TOLERANCE = 1e-3
 
 # The outcome each capture is for: OK, or the refusal code it must carry.
@@ -116,7 +121,47 @@ EXPECTED: Dict[Tuple[str, Optional[str]], str] = {
     ('remove_document', 'reserved_id'): 'RESERVED_ID',
     ('remove_document', 'writes_source'): 'WRITES_SOURCE',
     ('remove_document', 'writes_disabled'): 'WRITES_DISABLED',
+    # The additive surface (contract section 4.4); see ENRICHED below.
+    ('dialect', 'enriched'): OK,
+    ('documents', 'filter'): OK,
+    ('sample', 'clusters'): OK,
+    ('search', 'keyword'): OK,
+    ('recommend', None): OK,
+    ('recommend', 'best_score'): OK,
+    ('similarity_matrix', None): OK,
 }
+
+# Captures whose outcome depends on the backend: (tool, case) -> {backend: outcome}, else EXPECTED.
+BACKEND_EXPECTED: Dict[Tuple[str, Optional[str]], Dict[str, str]] = {
+    # Only Qdrant ranks recommendations by best score itself; every other store refuses it.
+    ('recommend', 'best_score'): {
+        'pgvector': 'UNSUPPORTED',
+        'rocketride_vector': 'UNSUPPORTED',
+        'chroma': 'UNSUPPORTED',
+    },
+}
+
+# The additive captures, by the code that answers them: each group is captured only once that
+# code is on the branch (the tool-path suite's NEEDS flags, read from the branch's own source),
+# so captures regenerate on a lane branch before the merge and gain the new files after it.
+ENRICHED: Dict[str, Tuple[Tuple[str, Optional[str]], ...]] = {
+    '_NEEDS_DIALECT': (('dialect', 'enriched'), ('search', 'keyword')),
+    '_NEEDS_DOCUMENTS': (('documents', 'filter'),),
+    '_NEEDS_SAMPLE_EXT': (('sample', 'clusters'),),
+    '_NEEDS_EXT_TOOLS': (('recommend', None), ('recommend', 'best_score'), ('similarity_matrix', None)),
+}
+
+
+def expected_for(tool: str, case: Optional[str], backend: str) -> str:
+    """The outcome a capture is for on ``backend``."""
+    return BACKEND_EXPECTED.get((tool, case), {}).get(backend, EXPECTED[(tool, case)])
+
+
+def enriched_captures(tp) -> List[Tuple[str, Optional[str]]]:
+    """The additive captures whose code is on this branch (a module without the flags has none)."""
+    return [
+        capture for flag, captures in ENRICHED.items() if getattr(tp, flag, 'absent') is None for capture in captures
+    ]
 
 
 class CaptureMismatch(AssertionError):
@@ -240,7 +285,9 @@ def _captures_for(
 
     def put(tool: str, c: Optional[str], answer: Any) -> None:
         name = file_name(backend, tool, case(c))
-        problem = outcome_problem(answer, EXPECTED[(tool, c)]) or (sample_problem(answer) if tool == 'sample' else None)
+        problem = outcome_problem(answer, expected_for(tool, c, backend)) or (
+            sample_problem(answer) if tool == 'sample' else None
+        )
         if problem:
             problems.append(f'{name}: {problem}')
         out[name] = answer
@@ -273,6 +320,43 @@ def _captures_for(
         ),
     )
     put('search', 'dimension_mismatch', side.tool('search', {'vector': water[:10], 'top_k': 3}))
+    enriched = set(enriched_captures(tp))
+    if ('dialect', 'enriched') in enriched:
+        # dialect.json already carries the new keys (size_bytes, keyword_match, the new capabilities);
+        # this capture pins them on their own so a change of one names itself.
+        d = side.tool('dialect')
+        keys = ('size_bytes', 'keyword_match', 'capabilities')
+        put(
+            'dialect',
+            'enriched',
+            {'success': d.get('success'), **{k: d.get(k) for k in keys}} if isinstance(d, dict) else d,
+        )
+    if ('search', 'keyword') in enriched:
+        put('search', 'keyword', side.tool('search', {'query': WIRE_KEYWORD, 'mode': 'keyword', 'top_k': 3}))
+    if ('documents', 'filter') in enriched:
+        prefix = WIRE_PREFIX + 'handbooks/'
+        put(
+            'documents',
+            'filter',
+            side.tool(
+                'documents',
+                {'cursor': None, 'limit': 3, 'deleted': 'active', 'sort': 'path', 'filter': {'path_prefix': prefix}},
+            ),
+        )
+    if ('sample', 'clusters') in enriched:
+        cluster = {'method': 'knn-components', 'labels': True}
+        put(
+            'sample',
+            'clusters',
+            side.tool('sample', {'n': WIRE_SAMPLE_N, 'seed': 7, 'mode': 'detailed', 'knn_k': 5, 'cluster': cluster}),
+        )
+    if ('recommend', None) in enriched:
+        other = tp.object_id(WIRE_PREFIX + 'greenhouse/orchid_notes.txt')
+        examples = {'positive': [[multi, 0]], 'negative': [[other, 0]], 'k': 3}
+        put('recommend', None, side.tool('recommend', examples))
+        put('recommend', 'best_score', side.tool('recommend', {**examples, 'strategy': 'best_score'}))
+        keys = [[multi, 0], [multi, 1], [other, 0]]
+        put('similarity_matrix', None, side.tool('similarity_matrix', {'keys': keys}))
     # Last, and on an id nothing was uploaded under: writes that must be refused.
     nobody = disposable_id(tp)
     put('remove_document', 'writes_source', side.tool('remove_document', {'object_ids': [nobody]}, source='chat_1'))

@@ -4,9 +4,12 @@
 		"owns: the paths a lane alone may change after the day-0 commit (a trailing /** covers a folder). new: owned paths that did not exist on the day-0 commit.",
 		"day0: every path the day-0 commit (the frozen contract, every placeholder mounted in its host, the pass-throughs, stubs and fixtures) added or changed.",
 		"backlog: every file the enrichment backlog names; each is owned by exactly one lane.",
-		"A lane diff is checked with: python3 scripts/acceptance/vector-explorer/selftest/test_lanes.py diff <lane> <day-0 commit> <lane tip>"
+		"A lane diff is checked with: python3 scripts/acceptance/vector-explorer/selftest/test_lanes.py diff <lane> <day-0 commit> <lane tip>; every lane at once with diff-all.",
+		"day0_commit: the commit every lane branches from (test_lanes.py day0 checks owns/new against it). merge_order: the order the lanes merge into vx/integration, the acceptance lane last (it regenerates the live wire fixtures over every other lane)."
 	],
 	"version": 1,
+	"day0_commit": "355a3a8b1",
+	"merge_order": ["E1", "E2", "E3", "E5", "E6", "E7", "E4", "E8", "E9", "E10"],
 	"lanes": [
 		{
 			"lane": "E0",

@@ -97,6 +97,54 @@ test('privacy: project similarities follow their sample, neighbors scores their 
 	assert.strictEqual(C.privacyViolations(pair('neighbors', { key: ['x', 0] }, { scores: stray }), DIM).length, 1);
 });
 
+test('privacy: similarity_matrix rows of n values are not vectors, a row of any other length is', () => {
+	const row = vec(9);
+	// A matrix exactly as wide as the dimension: every row holds DIM floats, one per resolved key.
+	const matrix = Array.from({ length: DIM }, () => row);
+	assert.deepStrictEqual(C.privacyViolations(pair('similarity_matrix', { keys: [] }, { success: true, n: DIM, matrix }), DIM), []);
+	// The answer's n is not the row length, or the matrix does not have n rows: the row is a vector.
+	assert.strictEqual(C.privacyViolations(pair('similarity_matrix', {}, { n: 3, matrix: [row, row, row] }), DIM).length, 1);
+	assert.strictEqual(C.privacyViolations(pair('similarity_matrix', {}, { n: DIM, matrix: [row] }), DIM).length, 1);
+	assert.strictEqual(C.privacyViolations(pair('similarity_matrix', {}, { matrix }), DIM).length, 1, 'no n: nothing is exempt');
+	// Only the matrix rows are columns: another key of the answer, or a matrix in another tool's answer, is not.
+	assert.strictEqual(C.privacyViolations(pair('similarity_matrix', {}, { n: DIM, matrix, raw: [row] }), DIM).length, 1);
+	assert.strictEqual(C.privacyViolations(pair('recommend', {}, { n: DIM, matrix }), DIM).length, 1);
+});
+
+test('privacy: the enrichment answers carry no vector (clusters, the listing, recommend items, the table flag)', () => {
+	const n = DIM;
+	const labels = Array.from({ length: n }, (_, i) => (i % 5) - 1);
+	const table = Array.from({ length: n }, (_, i) => i % 2);
+	const sample = { success: true, n, points: { x: vec(1), table }, clusters: { labels, sizes: [80, 77], keywords: [['falcon', 'water']], edge_threshold: 0.6123 }, listing: { documents: 412, truncated: false, reason: 'complete' } };
+	assert.deepStrictEqual(C.privacyViolations(pair('sample', { cluster: { method: 'knn-components', labels: true } }, sample), DIM), []);
+	const items = [{ key: ['a', 2], sim: 0.71, score: 0.71, path: 'C:/demo/a.md', preview: 'x' }];
+	assert.deepStrictEqual(C.privacyViolations(pair('recommend', { positive: [['a', 0]], negative: [] }, { success: true, items }), DIM), []);
+	// A recommend answer that returned the averaged query vector would leak it.
+	assert.strictEqual(C.privacyViolations(pair('recommend', { positive: [['a', 0]] }, { success: true, items, query: vec(4) }), DIM).length, 1);
+	// So does a recommend request carrying a vector no embed answer returned (only the query vector may go out).
+	assert.strictEqual(C.privacyViolations([req('recommend', { positive: [['a', 0]], vector: vec(5) })], DIM).length, 1);
+});
+
+test('downloadVectors: a downloaded CSV or JSON holds no float array as long as the dimension, and no secret', () => {
+	const csv = 'objectId,chunkId,path,x,y,snippet\r\nabc,0,C:/demo/a.md,0.1,0.2,"a, ""quoted"" snippet\nover two lines"\r\n';
+	assert.deepStrictEqual(C.downloadVectors(csv, 8), []);
+	const json = JSON.stringify({ schema_version: 1, rows: [{ objectId: 'abc', x: 0.1, y: 0.2 }] });
+	assert.deepStrictEqual(C.downloadVectors(json, 8), []);
+	const v = vec(3, 8);
+	// A vector as a JSON array, as a string inside JSON, inside a CSV cell, or spread over a CSV record's fields.
+	assert.strictEqual(C.downloadVectors(JSON.stringify({ rows: [{ objectId: 'abc', embedding: v }] }), 8).length > 0, true);
+	assert.strictEqual(C.downloadVectors(JSON.stringify({ rows: [{ embedding: JSON.stringify(v) }] }), 8).length > 0, true);
+	assert.strictEqual(C.downloadVectors(`objectId,embedding\r\nabc,"${JSON.stringify(v)}"\r\n`, 8).length > 0, true);
+	assert.strictEqual(C.downloadVectors(`objectId,${v.map((_, i) => `e${i}`).join(',')}\r\nabc,${v.join(',')}\r\n`, 8).length > 0, true);
+	// Integer columns (chunk ids, counts) are not vectors, however many.
+	assert.deepStrictEqual(C.downloadVectors(`a,b,c,d,e,f,g,h,i\r\n${[1, 2, 3, 4, 5, 6, 7, 8, 9].join(',')}\r\n`, 8), []);
+	// A secret anywhere in the file is reported by name, never echoed.
+	const found = C.downloadVectors(`objectId,note\r\nabc,local-acceptance-key\r\n`, 8, { 'the API key': 'local-acceptance-key' });
+	assert.deepStrictEqual(found, ['the API key']);
+	// Without a dimension the property cannot hold.
+	assert.strictEqual(C.downloadVectors(csv, null).length, 1);
+});
+
 test('privacy: the length checked is dialect.dimension, not a fixed 384', () => {
 	const wide = vec(7, 768);
 	assert.strictEqual(C.privacyViolations(pair('chunks', {}, { items: [{ embedding: wide }] }), 768).length, 1);
