@@ -23,9 +23,16 @@ eleven folders, written so the map and the chat have something to show:
 
 With ``--pad N`` the corpus gains N padding documents, one short note each
 (one chunk), in their own folder ``pad/`` (``PAD_FOLDER``). Seeded as
-``C:/demo/pad/...``, they make a scope larger than the sampler's 500-document
-listing (the enrichment lane scopes the map to that folder) and a collection of
-more than 500 documents (the listing then stops at its cap).
+``C:/demo/pad/...`` into a collection of their own (``SCOPE_COLLECTION``, the
+scope cards below, never the demo collection, whose samples must keep every demo
+document), they make a scope larger than the sampler's 500-document listing (the
+enrichment lane scopes the map to that folder) and a collection of more than 500
+documents (an unscoped sample's listing then stops at its cap).
+
+The enrichment lane's own fixture cards are templates pointed at a collection
+of their own, built the way gen_perf.py builds the perf card: the scope cards
+(``SCOPE_CARDS``, Qdrant and Chroma, over ``SCOPE_COLLECTION``) and the legacy
+card (``LEGACY_CARD``, pgvector, over the legacy table seed_legacy.sh seeds).
 
 Every name, place and number is invented. The same run always writes the same
 bytes, so a seeded store can be compared across runs.
@@ -33,9 +40,11 @@ bytes, so a seeded store can be compared across runs.
 Usage: python3 gen_corpus.py OUT_DIR [--pad N] [--check]
   --pad N   also write N padding documents under pad/
   --check   exit 1 when OUT_DIR differs from what this script writes
-Seed the padding into running fixtures (the engine's Python, from dist/server;
-the forty documents are seed_demo.sh's):
-  ./engine <this folder>/gen_corpus.py --seed-pad 600 [--only qdrant,chroma]
+The enrichment lane's cards (the engine's Python, from dist/server; local
+containers only; the forty demo documents are seed_demo.sh's):
+  ./engine <this folder>/gen_corpus.py --seed-pad 600 [--only qdrant,chroma]   # start the scope cards, upload the padding
+  ./engine <this folder>/gen_corpus.py --legacy-card                          # start the legacy card (after seed_legacy.sh)
+  ./engine <this folder>/gen_corpus.py --stop-cards                           # terminate both
 """
 
 from __future__ import annotations
@@ -85,6 +94,15 @@ KEYWORD_SENTENCE = (
 # The padding documents of --pad: their folder, and the prefix seed_demo.py uploads the corpus under.
 PAD_FOLDER = 'pad'
 DEMO_PREFIX = 'C:/demo/'
+
+# The enrichment lane's own cards (lane_vector_enrich.cjs SCOPE_FIXTURES and LEGACY_FIXTURE; its selftest keeps them equal).
+SCOPE_COLLECTION = 'vx_scope_docs'
+SCOPE_CARDS = {
+    'qdrant': ('vx-local Scope 600 (Qdrant)', '00000000-0000-4000-8000-00000000d1a9'),
+    'chroma': ('vx-local Scope 600 (Chroma)', '00000000-0000-4000-8000-00000000d1aa'),
+}
+LEGACY_TABLE = 'vx_legacy_docs'
+LEGACY_CARD = ('vx-local Legacy (pgvector)', '00000000-0000-4000-8000-00000000d1a8')
 PAD_SHIFTS = ('night watch', 'morning crew', 'day crew', 'evening watch')
 PAD_SUBJECTS = ('the generator', 'the battery bank', 'the intake pump', 'the radio mast', 'the greenhouse heater')
 
@@ -525,37 +543,91 @@ def differences(out_dir: Path, pad: int = 0) -> List[str]:
     return out
 
 
+def _fixtures():
+    """vx_fixtures.py (the acceptance scripts' fixture builder, one folder up)."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    import vx_fixtures
+
+    return vx_fixtures
+
+
 def seed_pad(count: int, only: Sequence[str]) -> int:
-    """Upload ``count`` padding documents into the running fixtures ``only`` (the engine's Python; local containers)."""
+    """Start the scope cards of ``only`` and upload ``count`` padding documents into each (the engine's Python)."""
     import asyncio
-    import importlib.util
     import tempfile
 
-    here = Path(__file__).resolve().parent
-    spec = importlib.util.spec_from_file_location('vx_seed_demo', here / 'seed_demo.py')
-    seeder = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(seeder)
-    fx = seeder.fx
+    fx = _fixtures()
+    unknown = [key for key in only if key not in SCOPE_CARDS]
+    if unknown:
+        print(f'gen_corpus.py: no scope card for {", ".join(unknown)} (known: {", ".join(SCOPE_CARDS)})')
+        return 2
 
     async def run() -> int:
         from rocketride import RocketRideClient
 
         failures = 0
-        pad = pad_documents(count)
         with tempfile.TemporaryDirectory(prefix='vx-pad-') as tmp:
             root = Path(tmp)
             files = []
-            for rel, text in sorted(pad.items()):
+            for rel, text in sorted(pad_documents(count).items()):
                 target = root / rel
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_text(text, encoding='utf-8', newline='\n')
                 files.append((target, DEMO_PREFIX + rel))
             async with RocketRideClient(uri=fx.ENGINE_URL, auth=fx.API_KEY, request_timeout=900000) as client:
                 for key in only:
-                    failed = await seeder.upload(client, key, 'ingest_1', files)
+                    name, project_id = SCOPE_CARDS[key]
+                    pipe = fx.build_pipeline(key, collection=SCOPE_COLLECTION, project_id=project_id, name=name)
+                    tokens = await fx.ensure_started(client, pipe, fx.TEMPLATE_SOURCES)
+                    failed = 0
+                    for start in range(0, len(files), 25):
+                        failed += len(
+                            fx.failed_uploads(
+                                await fx.send_named(client, tokens['ingest_1'], files[start : start + 25])
+                            )
+                        )
                     failures += failed
-                    print(f'{fx.FIXTURES[key].name}: {len(files) - failed} of {len(files)} padding documents ingested')
+                    print(
+                        f'{name}: {len(files) - failed} of {len(files)} padding documents ingested into {SCOPE_COLLECTION}'
+                    )
         return 1 if failures else 0
+
+    return asyncio.run(run())
+
+
+def legacy_card() -> int:
+    """Start the legacy card: the pgvector template over the legacy table (seed_legacy.sh seeds it)."""
+    import asyncio
+
+    fx = _fixtures()
+
+    async def run() -> int:
+        from rocketride import RocketRideClient
+
+        name, project_id = LEGACY_CARD
+        pipe = fx.build_pipeline('postgres', collection=LEGACY_TABLE, project_id=project_id, name=name)
+        async with RocketRideClient(uri=fx.ENGINE_URL, auth=fx.API_KEY) as client:
+            await fx.ensure_started(client, pipe, ('tools_1', 'chat_1'))
+        print(f'{name}: running over {LEGACY_TABLE}')
+        return 0
+
+    return asyncio.run(run())
+
+
+def stop_cards() -> int:
+    """Terminate the scope cards and the legacy card."""
+    import asyncio
+
+    fx = _fixtures()
+
+    async def run() -> int:
+        from rocketride import RocketRideClient
+
+        async with RocketRideClient(uri=fx.ENGINE_URL, auth=fx.API_KEY) as client:
+            for name, project_id in [*SCOPE_CARDS.values(), LEGACY_CARD]:
+                stopped = await fx.stop(client, project_id, fx.TEMPLATE_SOURCES)
+                print(f'{name}: stopped {", ".join(stopped) or "nothing"}')
+        return 0
 
     return asyncio.run(run())
 
@@ -583,8 +655,12 @@ def main(argv: Sequence[str]) -> int:
         print(f'gen_corpus.py: {error}')
         return 2
     if seed_text is not None:
-        only = [k.strip() for k in (only_text or 'qdrant,chroma').split(',') if k.strip()]
+        only = [k.strip() for k in (only_text or ','.join(SCOPE_CARDS)).split(',') if k.strip()]
         return seed_pad(int(seed_text), only)
+    if '--legacy-card' in args:
+        return legacy_card()
+    if '--stop-cards' in args:
+        return stop_cards()
     check = '--check' in args
     args = [a for a in args if a != '--check']
     if len(args) != 1:

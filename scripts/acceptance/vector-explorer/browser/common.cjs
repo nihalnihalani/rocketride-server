@@ -367,6 +367,16 @@ function storeClient(base) {
 		const client = await server();
 		return client.tool({ token: await tokenOf(fixture, 'tools_1'), tool: name, nodeId, input, timeout: 60000 });
 	}
+	/**
+	 * Upload texts through the fixture's ingest source, each under its own name (the name the
+	 * objectId derives from, e.g. C:/demo/ops/memo_q1.txt): [{ name, text }] -> the upload results.
+	 */
+	async function upload(fixture, files) {
+		const client = await server();
+		const token = await tokenOf(fixture, 'ingest_1');
+		const items = files.map((f) => ({ file: new File([f.text], path.posix.basename(f.name), { type: 'text/plain' }), objinfo: { name: f.name } }));
+		return client.sendFiles(items, token, 4);
+	}
 	/** dialect.dimension of the fixture's managed store (null when it does not say). */
 	async function dimension(fixture) {
 		const answer = await tool(fixture, 'dialect');
@@ -375,7 +385,7 @@ function storeClient(base) {
 	async function close() {
 		if (sdk) await sdk.disconnect().catch(() => {});
 	}
-	return { server, runningTasks, tokenOf, tool, dimension, close };
+	return { server, runningTasks, tokenOf, tool, upload, dimension, close };
 }
 
 // ---------------------------------------------------------------------------
