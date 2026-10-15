@@ -370,8 +370,12 @@ async function mapSteps(page, box, row) {
 	});
 	if (row.n > 1000) {
 		await step(steps, 't-SNE is refused above 1,000 points', async () => {
-			const disabled = await page.locator('select option[value="tsne"]').first().isDisabled();
-			return disabled ? true : 'the t-SNE option is enabled';
+			// Read the option's own disabled property: Playwright's isDisabled() does not apply to an <option>.
+			const disabled = await page
+				.locator('select option[value="tsne"]')
+				.first()
+				.evaluate((option) => option.disabled);
+			return disabled === true ? true : 'the t-SNE option is enabled';
 		});
 		await step(steps, 'Cancel stops a layout', async () => {
 			await page.getByRole('combobox', { name: 'Layout' }).selectOption('neighbour-graph');
@@ -385,7 +389,16 @@ async function mapSteps(page, box, row) {
 			if (await box.isDisabled()) return 'query disabled: the embedding node is not reachable from the Tools source';
 			await box.fill(QUERY);
 			await page.getByRole('button', { name: 'Run' }).click();
-			await page.waitForFunction(() => ['placed', 'failed'].includes(document.querySelector('.vector-map')?.getAttribute('data-query-state') || ''), null, { timeout: 90000 });
+			// 'placed' comes with the projected star; the rays come with the search answer after it.
+			await page.waitForFunction(
+				() => {
+					const root = document.querySelector('.vector-map');
+					const state = root?.getAttribute('data-query-state') || '';
+					return state === 'failed' || (state === 'placed' && Number(root.getAttribute('data-rays')) > 0);
+				},
+				null,
+				{ timeout: 90000 }
+			);
 			const state = await map.getAttribute('data-query-state');
 			const rays = Number(await map.getAttribute('data-rays'));
 			return state === 'placed' && rays > 0 ? true : `query ${state}, ${rays} rays`;
