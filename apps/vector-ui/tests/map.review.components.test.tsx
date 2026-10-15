@@ -409,3 +409,10 @@ test('Recommend buttons: a chip removes its example, Clear removes all, Run runs
 	assert.equal(ran, 1);
 	assert.deepEqual(query, [true]);
 });
+
+test('another connection starts a fresh duplicates queue (its choices are keyed by the connection)', () => {
+	const a = DuplicatesPanel({ sample: SMALL, writes: on, onSelect: noop, onRemoveDocument: noop, connectionKey: 'conn-a' });
+	const b = DuplicatesPanel({ sample: SMALL, writes: on, onSelect: noop, onRemoveDocument: noop, connectionKey: 'conn-b' });
+	assert.equal(a.key, 'conn-a');
+	assert.equal(b.key, 'conn-b');
+});

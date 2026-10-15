@@ -319,12 +319,12 @@ const NO_ROWS: readonly IDocumentItem[] = [];
 const noSubscribe = (): (() => void) => () => undefined;
 
 /**
- * The duplicates queue.
+ * The duplicates queue of one connection.
  *
  * @param props - Sample, write availability, the console's rows and handlers.
  * @returns The panel.
  */
-export function DuplicatesPanel(props: DuplicatesPanelProps): React.ReactElement {
+function DuplicatesQueue(props: DuplicatesPanelProps): React.ReactElement {
 	const source: IDocumentRowsSource | null = props.documents ?? null;
 	const subscribe = useCallback((listener: () => void) => (source ? source.subscribe(listener) : noSubscribe()), [source]);
 	const getRows = useCallback(() => (source ? source.getRows() : NO_ROWS), [source]);
@@ -383,6 +383,18 @@ export function DuplicatesPanel(props: DuplicatesPanelProps): React.ReactElement
 	}
 
 	return <DuplicatesBody sample={props.sample} writes={props.writes} view={view} info={info} state={state} reviewed={reviewed} queue={queue} done={done} bulk={props.onRemoveDocuments !== undefined} onThreshold={(value) => dispatch({ type: 'threshold', value })} onPolicy={(value) => dispatch({ type: 'policy', value })} onKeep={(group, objectId) => dispatch({ type: 'keep', group, objectId })} onShow={(points) => props.onSelect(points)} onReview={onReview} onRemove={onRemove} onOpenDocument={props.onOpenDocument} />;
+}
+
+/**
+ * The duplicates queue. Its choices (threshold, policy, hand-picked keeps,
+ * the removal it asked for) belong to one connection: another connection
+ * starts a fresh queue.
+ *
+ * @param props - Sample, write availability, the console's rows and handlers.
+ * @returns The panel.
+ */
+export function DuplicatesPanel(props: DuplicatesPanelProps): React.ReactElement {
+	return <DuplicatesQueue key={props.connectionKey ?? ''} {...props} />;
 }
 
 export default DuplicatesPanel;
