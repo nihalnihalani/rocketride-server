@@ -564,13 +564,18 @@ def test_sample_chunks_stratified(adapter, store):
 
 
 def test_remove_counted_reports_the_rows_removed(adapter, store):
-    """Removing a document reports its chunk rows and leaves the rest (and the control record)."""
-    if not adapter.remove_counts:
-        pytest.skip('NEEDS:L1 merged — integration gate G2 (base removeCounted default; this driver cannot count)')
+    """Removing a document reports its chunk rows and leaves the rest (and the control record).
+
+    A driver that cannot count chunks gets the base removeCounted, which still removes
+    the rows and answers None (the tools then report removed_chunks as null).
+    """
     h.ingest(store, 'doc-a', '/docs/a.md', [0, 1, 2])
     h.ingest(store, 'doc-b', '/docs/b.md', [0, 1])
     removed = store.removeCounted(['doc-a', 'no-such-doc'])
-    assert removed == 3
+    if adapter.remove_counts:
+        assert removed == 3
+    else:
+        assert removed is None
     rows = adapter.raw_rows(store)
     assert _chunk_ids(rows, 'doc-a') == []
     assert _chunk_ids(rows, 'doc-b') == [0, 1]
@@ -769,7 +774,6 @@ def test_driver_bugs_keep_their_own_error(adapter, store, call, monkeypatch):
         TOOL_CALLS[call](store)
 
 
-@pytest.mark.skip(reason='NEEDS:L1 merged — integration gate G2 (dialect/stats live in vx_tools on L1)')
 def test_dialect_and_stats_through_the_mixin(adapter, store):
     """The dialect and stats tools answer through VectorStoreToolMixin with this driver's hooks."""
     from types import SimpleNamespace
@@ -777,15 +781,14 @@ def test_dialect_and_stats_through_the_mixin(adapter, store):
     from ai.common.store import VectorStoreToolMixin
 
     h.ingest(store, 'doc-a', '/docs/a.md', [0, 1, 2])
-    node = SimpleNamespace(
-        IGlobal=SimpleNamespace(store=store, serverName=adapter.name, glb=SimpleNamespace(logicalType=adapter.name))
-    )
-    dialect = VectorStoreToolMixin.dialect(node, {})
-    assert dialect['success'] is True
+    node = VectorStoreToolMixin()
+    node.IGlobal = SimpleNamespace(store=store, serverName=adapter.name, glb=SimpleNamespace(logicalType=adapter.name))
+    dialect = node.dialect({})
+    assert dialect['success'] is True, dialect
     assert dialect['support'] == 'experimental'
     assert dialect['backend'] == adapter.backend
     assert 'experimental' in dialect['caveats']
-    stats = VectorStoreToolMixin.stats(node, {'mode': 'full'})
-    assert stats['success'] is True
+    stats = node.stats({'mode': 'full'})
+    assert stats['success'] is True, stats
     assert stats['model'] == h.MODEL
     assert stats['vector_size'] == h.DIM
