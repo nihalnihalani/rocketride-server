@@ -114,6 +114,9 @@ class PgVectorStore(DocumentStoreBase):
     #: ``describe().backend``.
     backend = 'pgvector'
 
+    #: The extras (size, modifyTime, ingestedAt) go to the ``meta`` column; without it they are dropped per row.
+    VX_STORES_EXTRAS = True
+
     VX_DRIVER_CAPABILITIES: FrozenSet[str] = frozenset(
         {'sample_stratified_native', 'documents_distinct', 'documents_sorted', 'search_keyword'}
     )
