@@ -50,16 +50,7 @@ export interface ITextSegment {
 }
 
 /** Common English function words: never marked. */
-export const STOP_WORDS: ReadonlySet<string> = new Set(
-	(
-		'a about above after again against all also am an and any are as at be because been before being below between both but by ' +
-		'can could did do does doing done down during each few for from further get gets got had has have having he her here hers ' +
-		'herself him himself his how i if in into is it its itself just me more most my myself no nor not now of off on once only or ' +
-		'other our ours ourselves out over own same she should so some such than that the their theirs them themselves then there ' +
-		'these they this those through to too under until up us very was we were what when where which while who whom whose why will ' +
-		'with would you your yours yourself yourselves shall may might must let lets'
-	).split(' ')
-);
+export const STOP_WORDS: ReadonlySet<string> = new Set(('a about above after again against all also am an and any are as at be because been before being below between both but by ' + 'can could did do does doing done down during each few for from further get gets got had has have having he her here hers ' + 'herself him himself his how i if in into is it its itself just me more most my myself no nor not now of off on once only or ' + 'other our ours ourselves out over own same she should so some such than that the their theirs them themselves then there ' + 'these they this those through to too under until up us very was we were what when where which while who whom whose why will ' + 'with would you your yours yourself yourselves shall may might must let lets').split(' '));
 
 /**
  * Whether a character belongs to a word: a letter of any script, or a digit.

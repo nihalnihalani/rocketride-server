@@ -56,8 +56,14 @@ test('segments mark the query words case-insensitively and join back to the text
 	assert.equal(joined(segments), text);
 	assert.deepEqual(marked(segments), ['water', 'Falcon', 'Station', 'station', 'waters']);
 	assert.equal(markedWords(segments), 5);
-	assert.ok(segments.every((s) => typeof s.text === 'string' && typeof s.mark === 'boolean' && Object.keys(s).length === 2), 'plain text segments, nothing else');
-	assert.ok(segments.every((s, i) => i === 0 || s.mark || segments[i - 1]!.mark), 'unmarked runs are merged');
+	assert.ok(
+		segments.every((s) => typeof s.text === 'string' && typeof s.mark === 'boolean' && Object.keys(s).length === 2),
+		'plain text segments, nothing else'
+	);
+	assert.ok(
+		segments.every((s, i) => i === 0 || s.mark || segments[i - 1]!.mark),
+		'unmarked runs are merged'
+	);
 });
 
 test('never HTML: markup in the chunk stays characters, and a query cannot inject any', () => {
