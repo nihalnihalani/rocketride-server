@@ -67,8 +67,14 @@ from .db_harness import engine as engine_mod
 from .db_harness import pg_tls, pki
 from .db_harness.broker import FakeBroker
 
-psycopg2 = pytest.importorskip('psycopg2')
-rocketride = pytest.importorskip('rocketride')
+# Under RR_REQUIRE_DB_TESTS a missing client must fail the run, not skip the
+# whole module at import time (same rule as test_rocketride_db_tls_full.py).
+if pg_tls.required():
+    import psycopg2
+    import rocketride
+else:
+    psycopg2 = pytest.importorskip('psycopg2')
+    rocketride = pytest.importorskip('rocketride')
 
 BROKER_TOKEN = 'isolation-broker-token-5d1c0e'
 KEYS = {'orga': 'key-orga', 'orgb': 'key-orgb', 'noorg': 'key-noorg'}
