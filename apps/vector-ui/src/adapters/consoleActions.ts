@@ -34,7 +34,19 @@
 
 import type { ConsoleActions, HighlightSource, SelectionStore, VectorKey } from '../contract/types';
 import type { IRemoveTarget } from '../vector/confirm';
+import { DEFAULT_LIMITS } from '../vector/results';
 import type { IConnectionEntry } from './connections';
+
+/**
+ * What "Ask about these" says instead of scoping the chat to more documents than the node takes.
+ *
+ * @param count - Documents asked about.
+ * @param cap - `limits.scope_keys_max`.
+ * @returns The sentence.
+ */
+export function askAboutTooMany(count: number, cap: number): string {
+	return `Too many documents to ask about (${count.toLocaleString('en-US')}; at most ${cap.toLocaleString('en-US')}). Narrow the selection.`;
+}
 
 /** What the actions need from the app around them. */
 export interface IConsoleActionDeps {
@@ -119,7 +131,7 @@ export function showCompareOnMap(selection: Pick<SelectionStore, 'setQuery' | 's
  * @param deps - Opening a document tab, fronting the connection's console and announcing.
  * @returns The actions.
  */
-export function makeConsoleActions(entry: Pick<IConnectionEntry, 'controller' | 'selection' | 'tab' | 'chatScope'>, deps: IConsoleActionDeps): ConsoleActions {
+export function makeConsoleActions(entry: Pick<IConnectionEntry, 'controller' | 'selection' | 'tab' | 'chatScope'> & Partial<Pick<IConnectionEntry, 'ctx'>>, deps: IConsoleActionDeps): ConsoleActions {
 	return {
 		openDocument: (objectId: string, chunkId?: number) => deps.openDocument(objectId, chunkId),
 		showOnMap: (keys: readonly VectorKey[], source: HighlightSource) => {
@@ -129,6 +141,12 @@ export function makeConsoleActions(entry: Pick<IConnectionEntry, 'controller' | 
 		},
 		requestRemove: (objectIds: readonly string[]) => entry.controller.requestRemove(removeTargets(entry, objectIds)),
 		askAbout: (objectIds: readonly string[]) => {
+			// The chat's question carries the ids as its filter: never more than the node takes.
+			const cap = entry.ctx?.limits.scope_keys_max ?? DEFAULT_LIMITS.scope_keys_max;
+			if (objectIds.length > cap) {
+				deps.announce(askAboutTooMany(objectIds.length, cap));
+				return;
+			}
 			entry.chatScope.set(objectIds.length === 0 ? null : [...objectIds]);
 			entry.tab.set('console');
 			deps.showConsole();

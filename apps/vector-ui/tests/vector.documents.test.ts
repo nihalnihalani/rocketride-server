@@ -43,7 +43,7 @@ test('paths: forward and back slashes, drive letters, network shares, POSIX root
 	assert.deepEqual(splitPath(''), { folder: 'Uploaded', name: '(no path)', uploaded: true });
 });
 
-test('groups: one per folder, then Uploaded, then Without first chunk; duplicate paths kept with a short objectId', () => {
+test('groups: one per folder, then Uploaded, then Needs attention; duplicate paths kept with a short objectId', () => {
 	const items = readDocumentsPage(fixture('documents_windows_and_posix_paths')).items;
 	items.push(doc('orphan-1', 'ops/old_memo.txt', { has_first_chunk: false }));
 	const state = pagerApplyPage(pagerBegin(pagerInit()), page(items, { nextCursor: null, total: items.length }));
@@ -58,7 +58,7 @@ test('groups: one per folder, then Uploaded, then Without first chunk; duplicate
 			['folder', 'D:/archive/2024/', 1],
 			['folder', 'Uploaded/', 1],
 			['uploaded', 'Uploaded', 2],
-			['orphans', 'Without first chunk (1)', 1],
+			['attention', 'Needs attention (1)', 1],
 		]
 	);
 	const reports = groups.find((g) => g.kind === 'uploaded')!.rows;
@@ -71,7 +71,36 @@ test('groups: one per folder, then Uploaded, then Without first chunk; duplicate
 	);
 	assert.notEqual(reports[0].shortId, reports[1].shortId, 'two documents with one path stay two rows, told apart by their objectId');
 	assert.equal(reports[0].shortId.length, 8);
-	assert.equal(groups.find((g) => g.kind === 'orphans')!.rows[0].name, 'ops/old_memo.txt', 'an orphan shows its whole path');
+	const orphan = groups.find((g) => g.kind === 'attention')!.rows[0];
+	assert.equal(orphan.name, 'ops/old_memo.txt', 'an orphan shows its whole path');
+	assert.deepEqual(orphan.flags, ['no first chunk'], 'and says why it needs attention');
+	assert.deepEqual(reports[0].flags, [], 'a healthy document has no badge');
+});
+
+test('"oversize" is a badge in its folder, never a reason to leave it: a folder of manuals among one-chunk memos stays listed', () => {
+	// 400 one-chunk memos and 20 manuals of 20 chunks: the median is 1, so every manual is more than 10 times it.
+	const rows: IDocumentItem[] = [];
+	for (let i = 0; i < 400; i += 1) rows.push(doc(`m${i}`, `C:/corp/memos/memo_${i}.txt`, { chunks: 1, max_chunk_id: 0, deleted_chunks: 0 }));
+	for (let i = 0; i < 20; i += 1) rows.push(doc(`h${i}`, `C:/corp/handbooks/manual_${i}.pdf`, { chunks: 20, max_chunk_id: 19, deleted_chunks: 0 }));
+	const groups = buildGroups(rows, { medianChunks: 1 });
+	assert.deepEqual(
+		groups.map((g) => [g.kind, g.label, g.rows.length]),
+		[
+			['folder', 'C:/corp/memos/', 400],
+			['folder', 'C:/corp/handbooks/', 20],
+		]
+	);
+	const manual = groups[1]?.rows[0];
+	assert.equal(manual?.name, 'manual_0.pdf', 'listed by its name in its folder');
+	assert.deepEqual(manual?.flags, ['oversize'], 'with the badge');
+	assert.equal(manual?.attention, false);
+	// A defect still moves the document, with every badge it has.
+	const broken = buildGroups([...rows, doc('x', 'C:/corp/handbooks/broken.pdf', { chunks: 19, max_chunk_id: 19, has_first_chunk: false, deleted_chunks: 0 })], { medianChunks: 1 });
+	const attention = broken.find((g) => g.kind === 'attention');
+	assert.deepEqual(
+		attention?.rows.map((r) => [r.name, r.flags, r.attention]),
+		[['C:/corp/handbooks/broken.pdf', ['no first chunk', 'oversize'], true]]
+	);
 });
 
 test('the filter is client-side over what is loaded, case-insensitive, and says how much is loaded while loading', () => {
@@ -234,6 +263,19 @@ test('a store that cannot page ends the listing with its caveat; one that lists 
 	assert.deepEqual(pagerFooter(unsorted), { text: 'sorted here; this store lists documents in storage order', loadMore: false, caveat: null, retry: false });
 	assert.deepEqual(
 		buildGroups(unsorted.rows).map((g) => g.label),
-		['C:/demo/field/', 'C:/demo/handbooks/', 'Uploaded', 'Without first chunk (1)']
+		['C:/demo/field/', 'C:/demo/handbooks/', 'Uploaded', 'Needs attention (1)']
 	);
+});
+
+test("the directory's export: the documents columns, each row the directory's own words and numbers, nothing else the store sent", () => {
+	const { documentExportRows } = require('../src/vector/documents') as typeof import('../src/vector/documents');
+	const { EXPORT_COLUMNS } = require('../src/contract/types') as typeof import('../src/contract/types');
+	const items = readDocumentsPage(fixture('documents_filter_server')).items;
+	const out = documentExportRows([{ ...items[0], embedding: [0.1, 0.2], token: 'secret' } as unknown as IDocumentItem, items[1] as IDocumentItem]);
+	assert.deepEqual(out.columns, EXPORT_COLUMNS.documents);
+	assert.equal(out.rows.length, 2);
+	assert.deepEqual(Object.keys(out.rows[0] as object), [...EXPORT_COLUMNS.documents]);
+	assert.deepEqual(out.rows[0], { objectId: items[0]?.objectId, path: 'C:/demo/greenhouse/orchid_notes.pdf', chunks: 6, has_first_chunk: true, tables: 0, size: 181220, ingestedAt: '2026-10-08T18:20:11Z', deleted_chunks: 0, max_chunk_id: 5 });
+	assert.doesNotMatch(JSON.stringify(out), /secret|embedding/);
+	assert.equal(documentExportRows([doc('a', 'a.md')]).rows[0]?.deleted_chunks, null, 'not reported: empty, not 0');
 });

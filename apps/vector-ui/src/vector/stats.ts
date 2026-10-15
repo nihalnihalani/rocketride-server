@@ -38,6 +38,9 @@
 
 import type { IDialectResult } from '../contract/types';
 import { QUICK_STATS_INTERVAL_MS } from './budgets';
+import { formatSize } from './fileType';
+import { HEALTH_KINDS, HEALTH_TITLES } from './health';
+import type { IHealthSummary } from './health';
 import type { IStatsView } from './results';
 import { CAVEAT_SENTENCES, CODE_SENTENCES, EMPTY, caveatSentence } from './wording';
 
@@ -47,7 +50,7 @@ import { CAVEAT_SENTENCES, CODE_SENTENCES, EMPTY, caveatSentence } from './wordi
 
 /** One figure of the strip. */
 export interface IStatFigure {
-	key: 'documents' | 'chunks' | 'deleted' | 'avg' | 'model' | 'metric';
+	key: 'documents' | 'chunks' | 'deleted' | 'avg' | 'model' | 'metric' | 'size';
 	label: string;
 	/** The text shown: a formatted number, or "—" when the store did not say. */
 	value: string;
@@ -89,7 +92,7 @@ function figure(key: IStatFigure['key'], label: string, value: string | null, wh
  *
  * @param stats - The last `stats` answer, or null before the first.
  * @param dialect - The probe's answer, or null.
- * @returns Documents, Chunks, Deleted, Avg, Model and Metric, in that order.
+ * @returns Documents, Chunks, Deleted, Avg, Model and Metric, in that order, then Size when the dialect reports the bytes the collection takes.
  */
 export function statsFigures(stats: IStatsView | null, dialect: IDialectResult | null): IStatFigure[] {
 	const caveats = new Set([...(stats?.caveats ?? []), ...(dialect?.caveats ?? [])]);
@@ -114,7 +117,11 @@ export function statsFigures(stats: IStatsView | null, dialect: IDialectResult |
 	}
 	const metricFigure: IStatFigure = metric === null && index === null ? { key: 'metric', label: 'Metric', value: MISSING, tooltip: 'This store does not report its metric or index.', missing: true } : { key: 'metric', label: 'Metric', value: [metric ?? 'unknown metric', index === null ? null : index.toUpperCase()].filter(Boolean).join(' · '), tooltip: null, missing: false };
 
-	return [documents, chunks, figure('deleted', 'Deleted', fmt(stats?.deleted), 'deleted chunks'), figure('avg', 'Avg', avg === null || avg === undefined ? null : `${(Math.round(avg * 10) / 10).toLocaleString('en-US')}/doc`, 'chunks per document'), modelFigure, metricFigure];
+	const figures = [documents, chunks, figure('deleted', 'Deleted', fmt(stats?.deleted), 'deleted chunks'), figure('avg', 'Avg', avg === null || avg === undefined ? null : `${(Math.round(avg * 10) / 10).toLocaleString('en-US')}/doc`, 'chunks per document'), modelFigure, metricFigure];
+	// Size only joins the strip when the store reports it (pgvector: the table's total relation size); never a dash.
+	const bytes = dialect?.size_bytes;
+	if (typeof bytes === 'number' && Number.isFinite(bytes) && bytes >= 0) figures.push({ key: 'size', label: 'Size', value: formatSize(bytes), tooltip: `${formatSize(bytes)} on the store (${formatCount(bytes)} bytes)`, missing: false });
+	return figures;
 }
 
 // =============================================================================
@@ -153,8 +160,8 @@ const NOT_A_CHIP: ReadonlySet<string> = new Set(['experimental', 'documents_by_f
  * @param input - The dialect, the last stats and whether the connection is read-only.
  * @returns The chips.
  */
-export function statsChips(input: { dialect: IDialectResult | null; stats: IStatsView | null; readOnly: boolean }): IStatChip[] {
-	const { dialect, stats, readOnly } = input;
+export function statsChips(input: { dialect: IDialectResult | null; stats: IStatsView | null; readOnly: boolean; health?: IHealthSummary | null }): IStatChip[] {
+	const { dialect, stats, readOnly, health = null } = input;
 	const chips: IStatChip[] = [];
 	if (dialect) {
 		chips.push(dialect.support === 'supported' ? { key: 'support', label: 'Supported', tone: 'success', tooltip: 'Run against a live server on new and legacy collections in this build.' } : { key: 'support', label: 'Experimental', tone: 'warning', tooltip: CAVEAT_SENTENCES.experimental });
@@ -175,8 +182,28 @@ export function statsChips(input: { dialect: IDialectResult | null; stats: IStat
 	const missing = dialect?.health.collection_exists === false || stats?.collectionExists === false;
 	if (missing) chips.push({ key: 'empty', label: 'Empty collection', tone: 'muted', tooltip: CODE_SENTENCES.COLLECTION_MISSING });
 	const orphans = stats?.withoutFirstChunk ?? 0;
-	if (orphans > 0) chips.push({ key: 'orphans', label: `${formatCount(orphans)} without first chunk`, tone: 'warning', tooltip: `${formatCount(orphans)} ${orphans === 1 ? 'document has' : 'documents have'} lost its first chunk; the directory lists ${orphans === 1 ? 'it' : 'them'} under "Without first chunk".` });
+	if (health !== null && health.flagged > 0) chips.push(attentionChip(health, stats?.withoutFirstChunk ?? null));
+	else if (orphans > 0) chips.push({ key: 'orphans', label: `${formatCount(orphans)} without first chunk`, tone: 'warning', tooltip: `${formatCount(orphans)} ${orphans === 1 ? 'document has' : 'documents have'} lost its first chunk; the directory lists ${orphans === 1 ? 'it' : 'them'} under "Needs attention".` });
 	return chips;
+}
+
+/**
+ * The "N need attention" chip: documents of the loaded ones with a defect
+ * (vector/health.ts needsAttention; oversize alone is not one), the breakdown
+ * per flag in its tooltip, and the store's own count of
+ * documents without a first chunk when it differs from the loaded one.
+ *
+ * @param health - The loaded documents' health.
+ * @param storeOrphans - The store's count of documents without a first chunk, or null.
+ * @returns The chip.
+ */
+function attentionChip(health: IHealthSummary, storeOrphans: number | null): IStatChip {
+	const n = formatCount(health.flagged);
+	const label = health.complete ? `${n} ${health.flagged === 1 ? 'needs' : 'need'} attention` : `${n} of ${formatCount(health.loaded)} loaded need attention`;
+	const parts = HEALTH_KINDS.map((kind) => `${HEALTH_TITLES[kind]}: ${health.unreported.includes(kind) ? 'not reported' : formatCount(health.counts[kind])}`);
+	let tooltip = `${parts.join(' · ')}. Counted over the ${formatCount(health.loaded)} ${health.loaded === 1 ? 'document' : 'documents'} loaded; the directory lists them under "Needs attention" and marks oversize documents in their folders.`;
+	if (storeOrphans !== null && storeOrphans !== health.counts.no_first_chunk) tooltip += ` The store counts ${formatCount(storeOrphans)} ${storeOrphans === 1 ? 'document' : 'documents'} without a first chunk.`;
+	return { key: 'attention', label, tone: 'warning', tooltip };
 }
 
 // =============================================================================

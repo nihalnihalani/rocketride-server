@@ -29,15 +29,18 @@
 // "counts as of N s ago" after a quick refresh. While the first answer is
 // pending it shows a skeleton; after a failure it keeps the last figures,
 // marked "last known", under the shell's error banner. The Charts disclosure
-// at the end, collapsed by default, holds the collection's charts.
+// at the end, collapsed by default, holds the collection's charts. While a
+// scope is active a second line says what it covers ("Scope: 12 of 42
+// documents · 318 chunks (counted here)").
 // =============================================================================
 
 import React, { useEffect, useState } from 'react';
 import { Banner } from 'shell';
-import type { IDialectResult, IDocumentItem } from '../contract/types';
+import type { IDialectResult, IDocumentItem, IDocumentsFilter, ISampleModel } from '../contract/types';
 import type { IStatsSlot } from '../vector/consoleStore';
 import { TONE_EDGE } from '../vector/colors';
 import { countsAsOfText, statsChips, statsFigures } from '../vector/stats';
+import type { IHealthSummary } from '../vector/health';
 import { styles } from '../styles';
 import StatsCharts from './StatsCharts';
 
@@ -48,6 +51,18 @@ export interface IStatsStripProps {
 	readOnly: boolean;
 	/** The directory rows loaded so far (the charts read them). */
 	documents?: readonly IDocumentItem[];
+	/** What the console's scope covers, while one is active (vector/filters.ts scopeStripText). */
+	scopeLine?: string | null;
+	/** The map's sample, for the chunk-length chart. */
+	sample?: ISampleModel | null;
+	/** The directory is still loading pages. */
+	loading?: boolean;
+	/** The scope's conditions (the charts mark the bar they select). */
+	scopeFilter?: IDocumentsFilter | null;
+	/** A chart's bar was clicked: scope the directory to it. */
+	onScope?(filter: IDocumentsFilter): void;
+	/** The loaded documents' health, for the "N need attention" chip. */
+	health?: IHealthSummary | null;
 }
 
 /** Re-render once a second so "counts as of N s ago" stays true. */
@@ -66,13 +81,15 @@ function useNow(): number {
  * @param props - {@link IStatsStripProps}.
  * @returns The strip element.
  */
-export function StatsStrip({ stats, dialect, readOnly, documents = [] }: IStatsStripProps): React.ReactElement {
+export function StatsStrip({ stats, dialect, readOnly, documents = [], scopeLine = null, sample = null, loading = false, scopeFilter = null, onScope, health = null }: IStatsStripProps): React.ReactElement {
 	const now = useNow();
 	const figures = statsFigures(stats.view, dialect);
-	const chips = statsChips({ dialect, stats: stats.view, readOnly });
+	const chips = statsChips({ dialect, stats: stats.view, readOnly, health });
 	const asOf = countsAsOfText(stats.view, now);
 	const pending = stats.view === null && stats.status !== 'error';
 	const stale = stats.status === 'error' && stats.view !== null;
+	// An empty collection has nothing to chart: the disclosure is left out.
+	const empty = stats.view !== null && (stats.view.collectionExists === false || stats.view.documents === 0) && documents.length === 0;
 	return (
 		<section aria-label="Database summary" style={{ padding: '10px 24px', borderBottom: '1px solid var(--rr-border)' }}>
 			{stats.status === 'error' && stats.error && (
@@ -102,11 +119,18 @@ export function StatsStrip({ stats, dialect, readOnly, documents = [] }: IStatsS
 				<span style={{ ...styles.small, marginLeft: 'auto' }} aria-live="off">
 					{stale ? 'last known values' : stats.status === 'loading' && stats.view !== null ? 'Refreshing…' : (asOf ?? '')}
 				</span>
-				<details style={styles.small}>
-					<summary style={{ cursor: 'pointer' }}>Charts</summary>
-					<StatsCharts rows={documents} dialect={dialect} />
-				</details>
+				{!empty && (
+					<details style={styles.small}>
+						<summary style={{ cursor: 'pointer' }}>Charts</summary>
+						<StatsCharts rows={documents} total={stats.view?.documents ?? null} sample={sample} dialect={dialect} onScope={onScope} loading={loading} scope={scopeFilter} />
+					</details>
+				)}
 			</div>
+			{scopeLine !== null && (
+				<div role="status" style={{ ...styles.small, marginTop: 6 }} data-scope-line="">
+					{scopeLine}
+				</div>
+			)}
 		</section>
 	);
 }

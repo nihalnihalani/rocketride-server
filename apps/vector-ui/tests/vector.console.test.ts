@@ -11,9 +11,15 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { ExplorerToolError } from 'shared/explorer';
 import { manualClock } from 'shared/explorer/connect/testing';
-import type { IDocumentItem } from '../src/contract/types';
+import type { IDocumentItem, IDocumentsFilter, IScopeState } from '../src/contract/types';
+import { connectionCaches } from '../src/adapters/explorer';
+import { connectionEntry } from '../src/adapters/connections';
+import { makeConsoleActions } from '../src/adapters/consoleActions';
 import { QUICK_STATS_INTERVAL_MS } from '../src/vector/budgets';
+import { chatScopeFor } from '../src/vector/consoleModel';
 import { createConsoleStore } from '../src/vector/consoleStore';
+import { directoryView } from '../src/vector/filters';
+import { DEFAULT_LIMITS } from '../src/vector/results';
 import type { IConsoleDeps } from '../src/vector/consoleStore';
 import { readChunksPage, readDocumentsPage, readRemoveResult, readStats } from '../src/vector/results';
 import type { IDocumentsPageView } from '../src/vector/results';
@@ -421,4 +427,184 @@ test('several documents go in batches of write_ids_max and stop at the first err
 	);
 	assert.equal(announced[0], `Removed 100 documents (100 chunks). Stopped after 1 of 3 batches: ${CODE_SENTENCES.WRITES_DISABLED}`);
 	store.dispose();
+});
+
+// =============================================================================
+// THE SCOPE: the listing's filter, the words for what the store applied, and the cap on every surface
+// =============================================================================
+
+/** A harness whose documents call records the filter and answers with a filtered fixture when given one. */
+function scoped(answer: string = 'documents_filter_server') {
+	const filters: Array<IDocumentsFilter | null | undefined> = [];
+	const h = harness({
+		documents: async (cursor, limit, filter) => {
+			filters.push(filter);
+			if (filter) return readDocumentsPage(fixture(answer));
+			return readDocumentsPage(cursor ? fixture('documents_page2_last') : fixture('documents_page1'));
+		},
+	});
+	return { ...h, filters };
+}
+
+test("the pager sends the scope's conditions; a new filter lists again from the first page, the same one asks nothing", async () => {
+	const { store, clock, filters } = scoped();
+	store.open();
+	await clock.settle();
+	assert.deepEqual(filters, [null, null], 'no scope: every page without a filter');
+	const greenhouse = { path_prefix: 'C:/demo/greenhouse/' };
+	store.setFilter(greenhouse);
+	assert.equal(store.getState().directory.status, 'loading');
+	assert.deepEqual(store.getState().directory.rows, [], 'the old listing is dropped');
+	await clock.settle();
+	assert.deepEqual(filters.slice(2), [greenhouse]);
+	assert.equal(store.getState().directory.filterApplied, 'server');
+	assert.equal(store.getState().directory.rows.length, 2);
+	store.setFilter({ ...greenhouse });
+	store.setFilter({ path_prefix: 'C:/demo/greenhouse/', min_chunks: null });
+	await clock.settle();
+	assert.equal(filters.length, 3, 'the same conditions ask nothing');
+	store.refresh();
+	await clock.settle();
+	assert.deepEqual(filters[3], greenhouse, 'a refresh keeps the scope');
+	store.setFilter(null);
+	await clock.settle();
+	assert.deepEqual(filters.slice(4), [null, null], 'no scope again: every document');
+	assert.equal(store.getState().directory.filterApplied, null);
+	store.dispose();
+});
+
+test('the path box with the scope: a store that filters by it lists again; one that skips it keeps the rows it listed', async () => {
+	// pgvector answers 'server': the box is the store's to apply.
+	{
+		const { store, clock, filters } = scoped('documents_filter_server');
+		const greenhouse = { path_prefix: 'C:/demo/greenhouse/' };
+		store.setFilter(greenhouse);
+		store.open();
+		await clock.settle();
+		store.setFilter({ ...greenhouse, path_contains: 'txt' });
+		await clock.settle();
+		assert.deepEqual(filters, [greenhouse, { ...greenhouse, path_contains: 'txt' }], 'asked again, with the box');
+		store.dispose();
+	}
+	// A store that filters nothing ('none') would list the same rows for any text: they are kept, under the new filter.
+	{
+		const { store, clock, filters } = scoped('documents_filter_client');
+		const handbooks = { path_prefix: 'C:/demo/handbooks/', file_types: ['md'] };
+		store.setFilter(handbooks);
+		store.open();
+		await clock.settle();
+		const asked = filters.length;
+		const before = store.getState().directory;
+		assert.equal(before.filterApplied, 'none');
+		store.setFilter({ ...handbooks, path_contains: 'falcon' });
+		await clock.settle();
+		const after = store.getState().directory;
+		assert.equal(filters.length, asked, 'nothing is asked');
+		assert.equal(after.rows, before.rows, 'the rows are kept');
+		assert.equal(after.status, before.status);
+		assert.deepEqual(after.filter, { ...handbooks, path_contains: 'falcon' });
+		assert.deepEqual(after.filterIgnored, ['path_prefix', 'file_types', 'path_contains']);
+		const scope: IScopeState = { filter: { ...handbooks, path_contains: 'falcon' }, label: '', objectIds: null, overflow: null, applyTo: { documents: true, map: true, search: true, chat: true } };
+		assert.equal(directoryView(after, scope, 'falcon', 2_000).summary, '1 of 3 loaded match (filtered here; the store cannot filter by these)');
+		store.setFilter({ path_prefix: 'C:/demo/field/', path_contains: 'falcon' });
+		await clock.settle();
+		assert.deepEqual(filters[asked], { path_prefix: 'C:/demo/field/', path_contains: 'falcon' }, 'new conditions list again');
+		store.dispose();
+	}
+	// A store that skipped the path text ('partial' naming it, as Chroma does): new text keeps the rows; clearing it lists again.
+	{
+		const filters: Array<IDocumentsFilter | null | undefined> = [];
+		const { store, clock } = harness({
+			documents: async (_cursor, _limit, filter) => {
+				filters.push(filter);
+				const skipped = filter?.path_contains != null;
+				return readDocumentsPage({ ...fixture('documents_filter_server'), filter_applied: skipped ? 'partial' : 'server', filter_ignored: skipped ? ['path_contains'] : [], caveats: skipped ? ['documents_filter_partial'] : [] });
+			},
+		});
+		const greenhouse = { path_prefix: 'C:/demo/greenhouse/' };
+		store.setFilter({ ...greenhouse, path_contains: 'orchid' });
+		store.open();
+		await clock.settle();
+		assert.equal(store.getState().directory.filterApplied, 'partial');
+		store.setFilter({ ...greenhouse, path_contains: 'txt' });
+		await clock.settle();
+		assert.equal(filters.length, 1, 'the store skips the box: nothing is asked');
+		assert.deepEqual(store.getState().directory.filter, { ...greenhouse, path_contains: 'txt' });
+		assert.deepEqual(store.getState().directory.filterIgnored, ['path_contains']);
+		store.setFilter(greenhouse);
+		await clock.settle();
+		assert.deepEqual(filters.slice(1), [greenhouse], 'without the box the store may apply everything: asked again');
+		assert.equal(store.getState().directory.filterApplied, 'server');
+		store.dispose();
+	}
+});
+
+test("a filter set before the console opens is the first listing's; a removal lists again with it", async () => {
+	const { store, clock, filters } = scoped();
+	const handbooks = { path_prefix: 'C:/demo/handbooks/' };
+	store.setFilter(handbooks);
+	assert.equal(store.getState().directory.status, 'idle', 'nothing is asked before the console opens');
+	store.open();
+	await clock.settle();
+	assert.deepEqual(filters, [handbooks]);
+	store.setWritesEnabled(true);
+	store.requestRemove([{ objectId: 'x', path: 'C:/demo/handbooks/x.md', chunks: 1 }]);
+	await store.confirmRemove();
+	await clock.settle();
+	assert.deepEqual(filters, [handbooks, handbooks]);
+	store.dispose();
+});
+
+test("the directory's status line says how much the store applied: server, partial, or here over what is loaded", async () => {
+	const scope = (filter: IDocumentsFilter, documents = true): IScopeState => ({ filter, label: '', objectIds: null, overflow: null, applyTo: { documents, map: true, search: true, chat: true } });
+	const cases: Array<[string, IDocumentsFilter, string]> = [
+		['documents_filter_server', { path_prefix: 'C:/demo/greenhouse/' }, '2 documents match (store)'],
+		['documents_filter_partial', { path_prefix: 'C:/demo/handbooks/', ingested_after: '2026-10-01T00:00:00Z' }, '0 documents match (store; ingest dates filtered here)'],
+		['documents_filter_client', { path_prefix: 'C:/demo/handbooks/', file_types: ['md'] }, '1 of 3 loaded match (filtered here; the store cannot filter by these)'],
+	];
+	for (const [answer, filter, words] of cases) {
+		const { store, clock } = scoped(answer);
+		store.setFilter(filter);
+		store.open();
+		await clock.settle();
+		const view = directoryView(store.getState().directory, scope(filter), '', 2_000);
+		assert.equal(view.summary, words, answer);
+		store.dispose();
+	}
+	const { store, clock } = scoped();
+	store.open();
+	await clock.settle();
+	const off = directoryView(store.getState().directory, scope({ path_prefix: 'C:/demo/greenhouse/' }, false), '', 2_000);
+	assert.equal(off.rows.length, 7, 'the Documents toggle off: the list shows every document');
+	assert.equal(off.summary, 'Not applied to this list. Scope: 2 of 7 loaded match (filtered here)');
+	const box = directoryView(store.getState().directory, null, 'orchid', 2_000);
+	assert.equal(box.rows.length, 2, 'no scope: the path box filters what is loaded, as before');
+	assert.equal(box.summary, '2 of 7 documents');
+	store.dispose();
+});
+
+test('askAbout never scopes the chat to more than scope_keys_max documents; it says why instead', () => {
+	const limits = { ...DEFAULT_LIMITS, scope_keys_max: 3 };
+	const entry = connectionEntry({ key: 'key-ask-cap', nodeId: 'store_1', roles: {}, provider: 'postgres', pipelineName: 'p' } as unknown as Parameters<typeof connectionEntry>[0], null, limits, manualClock());
+	const announced: string[] = [];
+	const actions = makeConsoleActions(entry, { openDocument: () => undefined, showConsole: () => undefined, announce: (t) => announced.push(t) });
+	actions.askAbout(['a', 'b', 'c', 'd']);
+	assert.equal(entry.chatScope.get(), null, 'nothing is scoped');
+	assert.deepEqual(announced, ['Too many documents to ask about (4; at most 3). Narrow the selection.']);
+	actions.askAbout(['a', 'b', 'c']);
+	assert.deepEqual(entry.chatScope.get(), ['a', 'b', 'c']);
+	connectionCaches.clearAll();
+});
+
+test('the chat is scoped by "Ask about these" first, else by the scope while its Chat toggle is on, never above the cap or to nothing', () => {
+	const scope = (over: Partial<IScopeState> = {}): IScopeState => ({ filter: { path_prefix: 'C:/demo/' }, label: '', objectIds: ['a', 'b'], overflow: null, applyTo: { documents: true, map: true, search: true, chat: true }, ...over });
+	assert.deepEqual(chatScopeFor(['x'], scope(), 2_000), ['x'], '"Ask about these" wins');
+	assert.deepEqual(chatScopeFor(null, scope(), 2_000), ['a', 'b']);
+	assert.equal(chatScopeFor(null, scope({ applyTo: { documents: true, map: true, search: true, chat: false } }), 2_000), null, 'Chat toggle off');
+	assert.equal(chatScopeFor(null, scope({ objectIds: null }), 2_000), null, 'unresolved');
+	assert.equal(chatScopeFor(null, scope({ objectIds: null, overflow: 2_340 }), 2_000), null, 'too large');
+	assert.equal(chatScopeFor(null, scope({ objectIds: [] }), 2_000), null, 'a scope that keeps nothing does not scope the chat');
+	assert.equal(chatScopeFor(null, scope({ objectIds: ['a', 'b', 'c'] }), 2), null, 'never more than the cap');
+	assert.equal(chatScopeFor(['a', 'b', 'c'], null, 2), null, 'not even from "Ask about these"');
+	assert.equal(chatScopeFor(null, null, 2_000), null);
 });

@@ -25,8 +25,11 @@
 // =============================================================================
 //
 // Header: path, objectId (copy), chunk count, size, type and ingest time
-// where the store keeps them, the "no first chunk" note, the support badge
-// and the trash button (gated; it asks the console, which confirms). Body:
+// where the store keeps them, the document's health (no first chunk, gaps,
+// deleted chunks, empty parse, oversize against the console's loaded
+// documents; "Count deleted chunks" on demand where the store soft-deletes
+// without reporting the count), the support badge and the trash button
+// (gated; it asks the console, which confirms). Body:
 // the chunks in reading order, a page of 100 at a time, table chunks tagged,
 // each with its length and "map"; "Show chunk path on map"; a toggle that
 // includes deleted chunks; the heat strip, every chunk's similarity to the
@@ -41,11 +44,14 @@ import { Banner, Button, BxTrash, ContentHeader } from 'shell';
 import type { DocumentViewProps as ContractDocumentViewProps, IChunkItem, IDocumentItem, VectorKey } from '../contract/types';
 import { fetchChunks, fetchDocument, scoreChunks } from '../adapters/actions';
 import type { IVectorCaller } from '../adapters/actions';
+import { existingEntry } from '../adapters/connections';
 import HealthPanel from '../components/HealthPanel';
+import type { IHealthProbe } from '../components/HealthPanel';
 import HeatStrip from '../components/HeatStrip';
 import SupportBadge from '../components/SupportBadge';
 import { CHUNKS_PAGE } from '../vector/budgets';
 import { fileTypeOf, formatSize } from '../vector/fileType';
+import { deletedFromTotals, medianChunks } from '../vector/health';
 import { HEAT_NO_EMBED, HEAT_NO_QUERY, HEAT_SCORING, heatCaption, heatKeys } from '../vector/heat';
 import type { IHeatScore } from '../vector/heat';
 import { formatCount } from '../vector/stats';
@@ -72,6 +78,11 @@ interface IChunkState {
 
 const NO_CHUNKS: IChunkState = { items: [], hasMore: false, nextAfter: -1, total: null, loading: false, error: null };
 
+/** Nothing loaded in the console: no rows to compare with. */
+const NO_ROWS: readonly IDocumentItem[] = [];
+const noRows = (): readonly IDocumentItem[] => NO_ROWS;
+const noSubscription = (): (() => void) => () => undefined;
+
 /** The heat strip's answer for one query: the scores, or why there are none. */
 type HeatState = { query: string; chunks: number; scores: IHeatScore[] } | { query: string; chunks: number; error: IFailureText };
 
@@ -94,7 +105,12 @@ export function DocumentView({ model, channels, selection, actions, objectId, pa
 	const [withDeleted, setWithDeleted] = useState(false);
 	const [chunks, setChunks] = useState<IChunkState>(NO_CHUNKS);
 	const [heat, setHeat] = useState<HeatState | null>(null);
+	const [probe, setProbe] = useState<IHealthProbe>({ status: 'idle' });
 	const run = useRef(0);
+	// The console's loaded documents (when its connection is open), for the median chunks "oversize" compares with.
+	const consoleEntry = existingEntry(model.connectionKey);
+	const consoleState = useSyncExternalStore(consoleEntry ? consoleEntry.controller.subscribe : noSubscription, consoleEntry ? () => consoleEntry.controller.getState().directory.rows : noRows, consoleEntry ? () => consoleEntry.controller.getState().directory.rows : noRows);
+	const median = medianChunks(consoleState);
 
 	const load = useCallback(
 		async (afterChunk: number) => {
@@ -168,6 +184,20 @@ export function DocumentView({ model, channels, selection, actions, objectId, pa
 	}, [active, query, embedReady, caller, embedCaller, embedNode, store, objectId, chunkCount, scopeMax]);
 	const heatNow = heat !== null && heat.query === query ? heat : null;
 
+	// "Count deleted chunks": the document's chunk totals with and without soft-deleted rows (one row each).
+	const countDeleted = useCallback(async () => {
+		if (caller === null) return;
+		setProbe({ status: 'running' });
+		try {
+			const all = await fetchChunks(caller, store, { objectId, afterChunk: -1, limit: 1, deleted: 'all' });
+			const active = await fetchChunks(caller, store, { objectId, afterChunk: -1, limit: 1, deleted: 'active' });
+			setProbe({ status: 'done', deleted: deletedFromTotals(all.total, active.total) });
+		} catch (error) {
+			setProbe({ status: 'error', message: failureText(error)?.headline ?? null });
+		}
+	}, [caller, store, objectId]);
+	const canProbe = caller !== null && info !== null && (info.deleted_chunks === null || info.deleted_chunks === undefined) && model.capabilities.soft_delete === true;
+
 	const shownPath = info?.path ?? path ?? objectId;
 	const focused = state.chunk;
 	const keys: VectorKey[] = chunks.items.map((c) => [objectId, c.chunkId] as const);
@@ -217,8 +247,7 @@ export function DocumentView({ model, channels, selection, actions, objectId, pa
 						</>
 					)}
 				</dl>
-				<HealthPanel item={info} />
-				{info && !info.has_first_chunk && <Banner variant="info">This document has no first chunk on this store (it was partly removed or partly ingested); it is listed under "Without first chunk".</Banner>}
+				<HealthPanel item={info} medianChunks={median} listing="all" chunkLengths={withDeleted ? null : { lengths: chunks.items.map((c) => c.length), complete: chunks.items.length > 0 && !chunks.hasMore && !chunks.loading }} canProbe={canProbe} probe={probe} onProbe={() => void countDeleted()} />
 				<div style={{ display: 'flex', gap: 12, alignItems: 'center', margin: '12px 0' }}>
 					<label style={{ display: 'flex', gap: 6, alignItems: 'center', ...styles.small }}>
 						<input type="checkbox" checked={withDeleted} onChange={(event) => setWithDeleted(event.target.checked)} />

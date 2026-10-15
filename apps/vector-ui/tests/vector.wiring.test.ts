@@ -48,6 +48,9 @@ const LANE_FILES = [
 	'adapters/consoleActions.ts',
 	'adapters/react.ts',
 	'components/StatsStrip.tsx',
+	'components/StatsCharts.tsx',
+	'components/ScopeBar.tsx',
+	'components/HealthPanel.tsx',
 	'components/DocumentDirectory.tsx',
 	'components/DocumentRow.tsx',
 	'components/ChunkList.tsx',
@@ -61,7 +64,7 @@ const LANE_FILES = [
 	'views/DocumentView.tsx',
 	...fs
 		.readdirSync(path.join(SRC, 'vector'))
-		.filter((f) => /^(addresses|budgets|colors|confirm|connections|consoleModel|consoleStore|documents|fileType|identityChange|layout|results|stats|support|wording)\.ts$/.test(f))
+		.filter((f) => /^(addresses|budgets|chartTokens|charts|colors|confirm|connections|consoleModel|consoleStore|documents|fileType|filters|health|identityChange|layout|results|savedFilters|stats|support|wording)\.ts$/.test(f))
 		.map((f) => `vector/${f}`),
 ];
 
@@ -123,6 +126,36 @@ test('the console renders the strip, the directory, the chunks, adding documents
 	assert.match(view, /consoleColumns\(width\)/, 'the ratios come from vector/layout.ts');
 	const strip = code('components/StatsStrip.tsx');
 	for (const fn of ['statsFigures(', 'statsChips(', 'countsAsOfText(']) assert.ok(strip.includes(fn), fn);
+});
+
+test('the scope: the listing asks for its conditions, its documents resolve from the listing, the chat is scoped within the cap, filters are saved per connection', () => {
+	const view = code('views/ConsoleView.tsx');
+	assert.match(view, /scope !== null && scope\.applyTo\.documents \? listingFilter\(scope\.filter\) : null/, 'the list is filtered by the scope only while its Documents toggle is on');
+	assert.match(view, /entry\.controller\.setFilter\(listing\)/);
+	assert.match(view, /resolveScope\(current, state\.directory, cap\)/);
+	assert.match(view, /if \(next !== current\) entry\.scope\.set\(next\)/, 'set only when it changed, so the effect settles');
+	assert.match(view, /const chatDocuments = chatScopeFor\(chatScope, scope, cap\)/);
+	assert.match(view, /<ChatPanel [^>]*scope=\{chatDocuments\}/);
+	assert.match(view, /savedFiltersFor\(savedFilters, entry\.key\)/, "the app's per-connection map, emptied on a change of identity");
+	assert.match(view, /<DocumentDirectory [\s\S]*?scope=\{scope\} onScope=\{setScope\} cap=\{cap\}/);
+	assert.match(view, /<StatsStrip [^>]*scopeLine=\{scopeLine\}/);
+	assert.match(view, /<StatsStrip [^>]*sample=\{selection\.connectionKey === entry\.key \? selection\.sampleModel : null\}[^>]*onScope=\{scopeFromChart\}/, "the charts read the map's sample and a bar scopes the directory");
+	assert.match(view, /scopeWith\(scope, scope\?\.filter\.path_contains \?\? '', filter\)/, "a bar sets its kind of condition and keeps the scope's others");
+	const dir = code('components/DocumentDirectory.tsx');
+	assert.match(dir, /directoryView\(pager, scope, applied, cap\)/);
+	assert.match(dir, /useDebounced\(filter, FILTER_DEBOUNCE_MS\)/);
+	assert.match(dir, /Scope to this folder/);
+});
+
+test("a document's health: the tab compares with the console's loaded documents and counts deleted chunks only when asked; the directory and the strip use the same flags", () => {
+	const view = code('views/DocumentView.tsx');
+	assert.match(view, /<HealthPanel item=\{info\} medianChunks=\{median\} listing="all"/, "the tab's row is listed with deleted:'all'");
+	assert.match(view, /const median = medianChunks\(consoleState\)/);
+	assert.match(view, /onProbe=\{\(\) => void countDeleted\(\)\}/, 'the two one-row chunks calls run only on the click');
+	assert.match(view, /model\.capabilities\.soft_delete === true/, 'offered only where the store soft-deletes');
+	assert.doesNotMatch(view, /Without first chunk/);
+	assert.match(code('components/DocumentDirectory.tsx'), /buildGroups\(matches, \{ medianChunks: median \}\)/);
+	assert.match(code('views/ConsoleView.tsx'), /healthSummary\(state\.directory\.rows, \{ medianChunks: settled \? medianChunks\(state\.directory\.rows\) : null, complete: state\.directory\.status === 'done' && state\.directory\.filter === null \}\)/);
 });
 
 test("every removal is confirmed by the app-level host, with Cancel focused by the dialog's own mount effect", () => {

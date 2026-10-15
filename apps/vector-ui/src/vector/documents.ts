@@ -28,9 +28,11 @@
 // derived here, in the browser, from `/` and `\` in the stored path (the
 // store keeps paths as the ingest sent them: Windows drive letters, network
 // shares and POSIX roots stay as they are). A bare file name goes under
-// "Uploaded"; a document whose chunk 0 is missing goes under "Without first
-// chunk"; two documents with the same path stay two rows, told apart by a
-// short objectId.
+// "Uploaded"; a document with a defect (vector/health.ts: no first chunk,
+// gaps, deleted chunks, empty parse) goes under "Needs attention", by its
+// whole path, with its flags as badges; an oversize document keeps its
+// folder and gets the badge there; two documents with the same path stay two
+// rows, told apart by a short objectId.
 //
 // AUTO-PAGING. After the first page the directory keeps asking for pages in
 // the background, up to DIRECTORY_AUTO_ROWS (5,000) rows. The first page is
@@ -46,8 +48,10 @@
 // listing going adds a row and the cap always ends it.
 // =============================================================================
 
-import type { IDocumentItem } from '../contract/types';
+import type { FilterApplied, IDocumentItem, IDocumentsFilter, IExportRows } from '../contract/types';
+import { EXPORT_COLUMNS } from '../contract/types';
 import { DIRECTORY_AUTO_ROWS, DIRECTORY_LOAD_MORE } from './budgets';
+import { documentHealth, needsAttention } from './health';
 import type { IDocumentsPageView } from './results';
 import { formatCount } from './stats';
 import { CAVEAT_SENTENCES, DOCUMENTS_REPEATED_TEXT } from './wording';
@@ -85,28 +89,32 @@ export function splitPath(path: string): IPathParts {
 /** One row of the directory. */
 export interface IDirectoryRow {
 	item: IDocumentItem;
-	/** The name shown: the file name, or the whole path in the "Without first chunk" group. */
+	/** The name shown: the file name, or the whole path in the "Needs attention" group. */
 	name: string;
 	/** True when another loaded document has the same path. */
 	duplicate: boolean;
 	/** The first 8 characters of the objectId (shown on hover, and beside a duplicate). */
 	shortId: string;
+	/** The health flags' badges ('no first chunk', '1 deleted chunk', 'oversize'); empty for a healthy document. */
+	flags: string[];
+	/** The row is under "Needs attention" (a defect; an oversize document alone keeps its folder). */
+	attention: boolean;
 }
 
 /** One group of the directory. */
 export interface IDirectoryGroup {
 	key: string;
 	label: string;
-	kind: 'folder' | 'uploaded' | 'orphans';
+	kind: 'folder' | 'uploaded' | 'attention';
 	rows: IDirectoryRow[];
 }
 
-/** Rank of each group kind: folders, then Uploaded, then Without first chunk. */
-const KIND_RANK: Readonly<Record<IDirectoryGroup['kind'], number>> = { folder: 0, uploaded: 1, orphans: 2 };
+/** Rank of each group kind: folders, then Uploaded, then Needs attention. */
+const KIND_RANK: Readonly<Record<IDirectoryGroup['kind'], number>> = { folder: 0, uploaded: 1, attention: 2 };
 
-/** The group kind and folder label of one document. */
+/** The group kind and folder label of one document (by its first chunk; buildGroups adds the other flags). */
 function placeOf(item: IDocumentItem): { kind: IDirectoryGroup['kind']; folder: string; name: string } {
-	if (!item.has_first_chunk) return { kind: 'orphans', folder: '', name: item.path || '(no path)' };
+	if (!item.has_first_chunk) return { kind: 'attention', folder: '', name: item.path || '(no path)' };
 	const parts = splitPath(item.path);
 	return { kind: parts.uploaded ? 'uploaded' : 'folder', folder: parts.folder, name: parts.name };
 }
@@ -120,7 +128,7 @@ function compareText(a: string, b: string): number {
 }
 
 /**
- * The directory's order: folders (by label), Uploaded, Without first chunk; inside a group by name, path, objectId.
+ * The directory's order: folders (by label), Uploaded, documents without a first chunk; inside a group by name, path, objectId.
  *
  * @param a - A document.
  * @param b - Another document.
@@ -144,22 +152,28 @@ export function sortDocuments(items: readonly IDocumentItem[]): IDocumentItem[] 
 
 /**
  * Group rows for display, keeping their order: folders in order of first
- * appearance, then Uploaded, then Without first chunk. The pager decides when
- * the rows are sorted (see the header), so grouping never reorders anything.
+ * appearance, then Uploaded, then Needs attention (by path). The pager decides
+ * when the rows are sorted (see the header), so grouping never reorders a
+ * folder. A document goes under Needs attention when it has a defect flag;
+ * "oversize" (which needs the median, passed once the listing settled) is a
+ * badge in the document's own folder, so no row moves when it comes or goes.
  *
  * @param rows - The documents, in display order.
+ * @param health - The median chunks per loaded document (null while unknown).
  * @returns The groups.
  */
-export function buildGroups(rows: readonly IDocumentItem[]): IDirectoryGroup[] {
+export function buildGroups(rows: readonly IDocumentItem[], health: { medianChunks: number | null } = { medianChunks: null }): IDirectoryGroup[] {
 	const pathCounts = new Map<string, number>();
 	for (const item of rows) pathCounts.set(item.path, (pathCounts.get(item.path) ?? 0) + 1);
 	const folders = new Map<string, IDirectoryGroup>();
 	const uploaded: IDirectoryGroup = { key: 'uploaded', label: UPLOADED_LABEL, kind: 'uploaded', rows: [] };
-	const orphans: IDirectoryGroup = { key: 'orphans', label: '', kind: 'orphans', rows: [] };
+	const attention: IDirectoryGroup = { key: 'attention', label: '', kind: 'attention', rows: [] };
 	for (const item of rows) {
 		const place = placeOf(item);
-		const row: IDirectoryRow = { item, name: place.name, duplicate: (pathCounts.get(item.path) ?? 0) > 1, shortId: item.objectId.slice(0, 8) };
-		if (place.kind === 'orphans') orphans.rows.push(row);
+		const itemHealth = documentHealth(item, { medianChunks: health.medianChunks });
+		const flags = itemHealth.flags.map((f) => f.label);
+		const row: IDirectoryRow = { item, name: place.name, duplicate: (pathCounts.get(item.path) ?? 0) > 1, shortId: item.objectId.slice(0, 8), flags, attention: needsAttention(itemHealth) };
+		if (row.attention) attention.rows.push({ ...row, name: item.path || '(no path)' });
 		else if (place.kind === 'uploaded') uploaded.rows.push(row);
 		else {
 			let group = folders.get(place.folder);
@@ -170,8 +184,9 @@ export function buildGroups(rows: readonly IDocumentItem[]): IDirectoryGroup[] {
 			group.rows.push(row);
 		}
 	}
-	orphans.label = `Without first chunk (${formatCount(orphans.rows.length)})`;
-	return [...folders.values(), uploaded, orphans].filter((group) => group.rows.length > 0);
+	attention.rows.sort((a, b) => compareText(a.item.path, b.item.path) || compareText(a.item.objectId, b.item.objectId));
+	attention.label = `Needs attention (${formatCount(attention.rows.length)})`;
+	return [...folders.values(), uploaded, attention].filter((group) => group.rows.length > 0);
 }
 
 /**
@@ -213,6 +228,15 @@ export interface IPagerState {
 	error: IFailureText | null;
 	/** Pages applied so far. */
 	pages: number;
+	/** What this listing asked the store for (the scope's conditions and path box), or null for every document. */
+	filter: IDocumentsFilter | null;
+	/**
+	 * How much of `filter` the store applied, from its first answer: 'server', 'partial' or 'none' ('none' too
+	 * when an older node answered without saying, having ignored it); null while unknown or without a filter.
+	 */
+	filterApplied: FilterApplied | null;
+	/** The keys of `filter` the store did not apply (filtered here). */
+	filterIgnored: string[];
 }
 
 /**
@@ -222,17 +246,25 @@ export interface IPagerState {
  * @returns The state.
  */
 export function pagerInit(cap: number = DIRECTORY_AUTO_ROWS): IPagerState {
-	return { rows: [], cursor: null, total: null, status: 'idle', cap, storeSorted: true, caveats: [], error: null, pages: 0 };
+	return { rows: [], cursor: null, total: null, status: 'idle', cap, storeSorted: true, caveats: [], error: null, pages: 0, filter: null, filterApplied: null, filterIgnored: [] };
 }
 
 /**
  * Start (or restart) the listing from the first page.
  *
  * @param state - The state (its cap is kept).
+ * @param filter - The conditions to ask the store for (default: the listing's own; null for every document).
  * @returns A loading state with nothing loaded.
  */
-export function pagerBegin(state: IPagerState): IPagerState {
-	return { ...pagerInit(state.cap), status: 'loading' };
+export function pagerBegin(state: IPagerState, filter: IDocumentsFilter | null = state.filter): IPagerState {
+	return { ...pagerInit(state.cap), status: 'loading', filter };
+}
+
+/** The keys a filter sets (null and absent keys are not filtered by). */
+function setKeys(filter: IDocumentsFilter): string[] {
+	return Object.entries(filter)
+		.filter(([, value]) => value !== null && value !== undefined)
+		.map(([key]) => key);
 }
 
 /**
@@ -262,7 +294,14 @@ export function pagerApplyPage(state: IPagerState, page: IDocumentsPageView): IP
 	}
 	const first = state.pages === 0;
 	let rows = first ? sortDocuments(fresh) : [...state.rows, ...fresh];
-	const base = { ...state, cursor: page.nextCursor, total: page.total ?? state.total, storeSorted: page.sorted, caveats: page.caveats, error: null, pages: state.pages + 1 };
+	// With a filter, the first answer says how much of it the store applied; an older node says nothing (it ignored it).
+	let filterApplied = state.filterApplied;
+	let filterIgnored = state.filterIgnored;
+	if (first && state.filter !== null) {
+		filterApplied = page.filterApplied ?? 'none';
+		filterIgnored = page.filterApplied === undefined ? setKeys(state.filter) : [...(page.filterIgnored ?? [])];
+	}
+	const base = { ...state, cursor: page.nextCursor, total: page.total ?? state.total, storeSorted: page.sorted, caveats: page.caveats, error: null, pages: state.pages + 1, filterApplied, filterIgnored };
 	let status: PagerStatus = 'loading';
 	if (page.pagingUnsupported) status = 'unsupported';
 	else if (page.nextCursor === null || page.items.length === 0) status = 'done';
@@ -392,4 +431,28 @@ export function filterSummary(state: IPagerState, filter: string, matches: numbe
 	const total = state.total ?? state.rows.length;
 	if (state.status === 'loading' || state.status === 'paused') return `filtering ${formatCount(state.rows.length)} of ${formatCount(total)} loaded`;
 	return `${formatCount(matches)} of ${formatCount(total)} documents`;
+}
+
+/**
+ * Directory rows as an export (the documents columns): words and numbers the
+ * directory shows, never anything else the store sent.
+ *
+ * @param items - The documents, in the directory's order.
+ * @returns The columns and rows.
+ */
+export function documentExportRows(items: readonly IDocumentItem[]): IExportRows {
+	return {
+		columns: EXPORT_COLUMNS.documents,
+		rows: items.map((item) => ({
+			objectId: item.objectId,
+			path: item.path,
+			chunks: item.chunks,
+			has_first_chunk: item.has_first_chunk,
+			tables: item.tables,
+			size: item.size,
+			ingestedAt: item.ingestedAt,
+			deleted_chunks: item.deleted_chunks ?? null,
+			max_chunk_id: item.max_chunk_id ?? null,
+		})),
+	};
 }

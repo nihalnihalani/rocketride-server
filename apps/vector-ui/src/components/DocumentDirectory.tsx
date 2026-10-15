@@ -27,17 +27,25 @@
 // Renders the auto-pager's rows (vector/documents.ts) as folder groups in a
 // hand-windowed list (fixed 28 px rows, only the visible window mounted), so
 // 5,000 documents scroll smoothly without a windowing library. The filter row
-// is the ScopeBar: its path box filters what is loaded, client-side; its
-// conditions come once they are built. Rows can be checked to remove several
-// at once; removing always goes through the console's confirmation.
+// is the ScopeBar: without a condition its path box filters what is loaded,
+// as it always did (150 ms after the last keystroke); its conditions make
+// the console's scope, which the listing asks the store for together with
+// the path box, and the status line words honestly (vector/filters.ts
+// directoryView). Right-clicking a folder offers "Scope to
+// this folder". Rows can be checked to remove several at once; removing
+// always goes through the console's confirmation.
 // =============================================================================
 
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { Button } from 'shell';
-import type { Availability, IDocumentItem } from '../contract/types';
+import type { Availability, IDocumentItem, IDocumentsFilter, IExportItem, IScopeState, ISavedFilter } from '../contract/types';
 import type { IRemoveTarget } from '../vector/confirm';
-import { buildGroups, directoryHeading, filterItems, filterSummary, pagerFooter, pagerProgressText } from '../vector/documents';
+import { buildGroups, directoryHeading, documentExportRows, pagerFooter, pagerProgressText } from '../vector/documents';
 import type { IDirectoryGroup, IDirectoryRow, IPagerState } from '../vector/documents';
+import { FILTER_DEBOUNCE_MS, directoryView, scopeWith, withText } from '../vector/filters';
+import { medianChunks } from '../vector/health';
+import type { ConditionKind } from '../vector/filters';
+import { DEFAULT_LIMITS } from '../vector/results';
 import { EMPTY } from '../vector/wording';
 import { ChevronIcon } from '../icons';
 import { FOCUS_RING, styles } from '../styles';
@@ -62,6 +70,36 @@ export interface IDocumentDirectoryProps {
 	onRetry(): void;
 	/** The collection, for export file names. */
 	collection?: string | null;
+	/** The console's scope (ConsoleModel.scope), or null with no condition. */
+	scope?: IScopeState | null;
+	/** The ScopeBar changed the scope (null: no condition left). */
+	onScope?(scope: IScopeState | null): void;
+	/** `limits.scope_keys_max`. */
+	cap?: number;
+	/** Whether each kind of condition can be offered on this store. */
+	available?: Partial<Record<ConditionKind, Availability>>;
+	/** This connection's saved filters, and saving and deleting them. */
+	saved?: readonly ISavedFilter[];
+	onSave?(name: string, filter: IDocumentsFilter): string | null;
+	onDeleteSaved?(id: string): void;
+}
+
+/** The value, once it has not changed for `ms`. */
+function useDebounced<T>(value: T, ms: number): T {
+	const [settled, setSettled] = useState(value);
+	useEffect(() => {
+		if (Object.is(settled, value)) return undefined;
+		const id = setTimeout(() => setSettled(value), ms);
+		return () => clearTimeout(id);
+	}, [value, settled, ms]);
+	return settled;
+}
+
+/** The "Scope to this folder" menu of one folder group, at the pointer. */
+interface IFolderMenu {
+	folder: string;
+	x: number;
+	y: number;
 }
 
 /** One line of the flattened list. */
@@ -83,8 +121,10 @@ export function targetOf(item: IDocumentItem): IRemoveTarget {
  * @param props - {@link IDocumentDirectoryProps}.
  * @returns The panel element.
  */
-export function DocumentDirectory({ pager, selectedId, writes, onSelect, onRemove, onLoadMore, onRetry, collection = null }: IDocumentDirectoryProps): React.ReactElement {
+export function DocumentDirectory({ pager, selectedId, writes, onSelect, onRemove, onLoadMore, onRetry, collection = null, scope = null, onScope, cap = DEFAULT_LIMITS.scope_keys_max, available, saved, onSave, onDeleteSaved }: IDocumentDirectoryProps): React.ReactElement {
 	const [filter, setFilter] = useState('');
+	const applied = useDebounced(filter, FILTER_DEBOUNCE_MS);
+	const [folderMenu, setFolderMenu] = useState<IFolderMenu | null>(null);
 	const [collapsed, setCollapsed] = useState<ReadonlySet<string>>(new Set());
 	const [checked, setChecked] = useState<ReadonlySet<string>>(new Set());
 	const [scrollTop, setScrollTop] = useState(0);
@@ -110,8 +150,25 @@ export function DocumentDirectory({ pager, selectedId, writes, onSelect, onRemov
 		if (kept.length !== checked.size) setChecked(new Set(kept));
 	}, [pager.rows, checked]);
 
-	const matches = useMemo(() => filterItems(pager.rows, filter), [pager.rows, filter]);
-	const groups = useMemo(() => buildGroups(matches), [matches]);
+	// The path box joins the scope (as path_contains) once its text settles, and any scope set elsewhere (a chart's
+	// bar, a saved filter) takes the box's text too; withText returns the same scope when nothing changes, so this settles.
+	useEffect(() => {
+		if (scope === null || !onScope) return;
+		const next = withText(scope, applied);
+		if (next !== scope) onScope(next);
+	}, [applied, scope, onScope]);
+
+	const view = useMemo(() => directoryView(pager, scope, applied, cap), [pager, scope, applied, cap]);
+	const matches = view.rows;
+	// "Oversize" compares with the median of the loaded documents, once the listing settled (no row moves while pages arrive).
+	const median = useMemo(() => (pager.status === 'loading' || pager.status === 'idle' ? null : medianChunks(pager.rows)), [pager.status, pager.rows]);
+	const groups = useMemo(() => buildGroups(matches, { medianChunks: median }), [matches, median]);
+	const folders = useMemo(() => [...new Set(groups.filter((g) => g.kind === 'folder').map((g) => g.label))], [groups]);
+	const exportItems = useMemo<IExportItem[]>(() => {
+		const items: IExportItem[] = [{ id: 'directory-loaded', label: `Loaded documents (${pager.rows.length.toLocaleString('en-US')})`, kind: 'documents', disabled: pager.rows.length === 0 ? 'Nothing loaded yet' : null, rows: () => documentExportRows(pager.rows) }];
+		if (scope !== null) items.push({ id: 'directory-scope', label: `Documents in scope (${matches.length.toLocaleString('en-US')})`, kind: 'documents', disabled: matches.length === 0 ? 'No document matches the scope' : null, rows: () => documentExportRows(matches) });
+		return items;
+	}, [pager.rows, scope, matches]);
 	const lines = useMemo<Line[]>(() => {
 		const out: Line[] = [];
 		for (const group of groups) {
@@ -126,7 +183,7 @@ export function DocumentDirectory({ pager, selectedId, writes, onSelect, onRemov
 	const last = Math.min(lines.length, Math.ceil((scrollTop + height) / ROW_HEIGHT) + OVERSCAN);
 	const progress = pagerProgressText(pager);
 	const footer = pagerFooter(pager);
-	const summary = filterSummary(pager, filter, matches.length);
+	const summary = view.summary;
 	const checkedItems = pager.rows.filter((r) => checked.has(r.objectId));
 
 	const toggle = (key: string): void => {
@@ -143,18 +200,19 @@ export function DocumentDirectory({ pager, selectedId, writes, onSelect, onRemov
 	};
 
 	let empty: string | null = null;
-	if (pager.rows.length === 0 && pager.status === 'done') empty = EMPTY.noDocuments;
+	if (pager.rows.length === 0 && pager.status === 'done' && !(scope !== null && scope.applyTo.documents)) empty = EMPTY.noDocuments;
 	else if (pager.rows.length === 0 && pager.status === 'error') empty = EMPTY.unreachable(pager.error?.headline ?? 'the store did not answer.');
-	else if (pager.rows.length > 0 && matches.length === 0) empty = EMPTY.noMatch(filter.trim());
+	else if (pager.rows.length > 0 && matches.length === 0) empty = scope !== null ? 'No documents match these conditions.' : EMPTY.noMatch(applied.trim());
+	else if (pager.rows.length === 0 && pager.status === 'done' && scope !== null && scope.applyTo.documents) empty = 'No documents match these conditions.';
 
 	return (
 		<section aria-label="Documents" style={{ ...styles.panel, flex: 1 }}>
 			<div style={styles.panelTitle}>
 				<span>Documents</span>
 				<span style={{ ...styles.small, fontWeight: 400, textTransform: 'none', letterSpacing: 0, marginLeft: 'auto' }}>{pager.status === 'idle' ? '' : directoryHeading(pager)}</span>
-				<ExportMenu items={[]} collection={collection} />
+				<ExportMenu items={exportItems} collection={collection} />
 			</div>
-			<ScopeBar text={filter} onText={setFilter} />
+			<ScopeBar text={filter} scopeText={applied} onText={setFilter} scope={scope} onScope={onScope} cap={cap} available={available} folders={folders} saved={saved} onSave={onSave} onDeleteSaved={onDeleteSaved} />
 			{(summary || progress) && (
 				<div style={{ ...styles.small, padding: '0 12px 6px' }} role="status">
 					{summary ?? progress}
@@ -184,7 +242,21 @@ export function DocumentDirectory({ pager, selectedId, writes, onSelect, onRemov
 							if (line.kind === 'group') {
 								return (
 									<div key={line.group.key} role="listitem" aria-label={`Folder ${line.group.label}`} style={{ position: 'absolute', top, left: 0, right: 0, height: ROW_HEIGHT }}>
-										<button type="button" aria-expanded={!line.collapsed} onClick={() => toggle(line.group.key)} style={{ display: 'flex', alignItems: 'center', gap: 4, width: '100%', height: ROW_HEIGHT, padding: '0 8px', background: 'none', border: 'none', color: 'inherit', font: 'inherit', fontSize: 12, fontWeight: 700, cursor: 'pointer', textAlign: 'left', overflow: 'hidden', whiteSpace: 'nowrap', textOverflow: 'ellipsis' }} onFocus={(event) => (event.currentTarget.style.outline = FOCUS_RING)} onBlur={(event) => (event.currentTarget.style.outline = 'none')}>
+										<button
+											type="button"
+											aria-expanded={!line.collapsed}
+											onClick={() => toggle(line.group.key)}
+											onContextMenu={(event) => {
+												if (line.group.kind !== 'folder' || !onScope) return;
+												event.preventDefault();
+												const rect = event.currentTarget.getBoundingClientRect();
+												const keyboard = event.clientX === 0 && event.clientY === 0;
+												setFolderMenu({ folder: line.group.label, x: keyboard ? rect.left + 16 : event.clientX, y: keyboard ? rect.bottom : event.clientY });
+											}}
+											style={{ display: 'flex', alignItems: 'center', gap: 4, width: '100%', height: ROW_HEIGHT, padding: '0 8px', background: 'none', border: 'none', color: 'inherit', font: 'inherit', fontSize: 12, fontWeight: 700, cursor: 'pointer', textAlign: 'left', overflow: 'hidden', whiteSpace: 'nowrap', textOverflow: 'ellipsis' }}
+											onFocus={(event) => (event.currentTarget.style.outline = FOCUS_RING)}
+											onBlur={(event) => (event.currentTarget.style.outline = 'none')}
+										>
 											<span style={{ width: 12, height: 12, flex: 'none', transform: line.collapsed ? 'none' : 'rotate(90deg)' }}>
 												<ChevronIcon />
 											</span>
@@ -203,6 +275,33 @@ export function DocumentDirectory({ pager, selectedId, writes, onSelect, onRemov
 					</div>
 				)}
 			</div>
+			{folderMenu !== null && (
+				<div
+					role="menu"
+					aria-label={`Folder ${folderMenu.folder}`}
+					style={{ position: 'fixed', left: folderMenu.x, top: folderMenu.y, zIndex: 10, display: 'flex', flexDirection: 'column', padding: 4, background: 'var(--rr-bg-paper)', border: '1px solid var(--rr-border-input)', borderRadius: 6 }}
+					onKeyDown={(event) => {
+						if (event.key === 'Escape') setFolderMenu(null);
+					}}
+					onBlur={(event) => {
+						if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setFolderMenu(null);
+					}}
+				>
+					<button
+						type="button"
+						role="menuitem"
+						autoFocus
+						style={{ ...styles.small, textAlign: 'left', padding: '4px 10px', background: 'none', border: 'none', color: 'inherit', cursor: 'pointer' }}
+						onClick={() => {
+							onScope?.(scopeWith(scope, applied, { path_prefix: folderMenu.folder }));
+							setFolderMenu(null);
+						}}
+						onFocus={(event) => (event.currentTarget.style.outline = FOCUS_RING)}
+					>
+						Scope to this folder
+					</button>
+				</div>
+			)}
 			{footer && (
 				<div style={{ ...styles.small, padding: '6px 12px', borderTop: '1px solid var(--rr-border)', display: 'flex', flexWrap: 'wrap', gap: 8, alignItems: 'center' }}>
 					<span>{footer.text}</span>
