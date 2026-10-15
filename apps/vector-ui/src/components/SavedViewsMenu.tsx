@@ -49,9 +49,13 @@ import React, { useCallback, useEffect, useId, useRef, useState } from 'react';
 import { savedViews } from '../adapters/connections';
 import type { ISavedView, IVectorLimits, SavedViewsMenuProps } from '../contract/types';
 import { MAP_STYLES } from '../map/styles';
+import { sideFor, sideStyle } from './ExportMenu';
 import { VIEW_NAME_MAX, defaultViewName, deleteView, keepSentence, listViews, newViewId, restoreSentence, saveBlocker, saveView, viewSummary } from '../vector/savedViews';
 
 export type { SavedViewsMenuProps };
+
+/** The panel's width, CSS pixels. */
+const VIEWS_PANEL_WIDTH = 360;
 
 /** A failed apply. */
 const APPLY_FAILED = 'The view could not be applied.';
@@ -76,11 +80,15 @@ export interface SavedViewsPanelProps {
 	onSave(): void;
 	onApply(view: ISavedView): void;
 	onDelete(view: ISavedView): void;
+	/** The name field, for moving focus into it when the menu opens. */
+	nameRef?: React.Ref<HTMLInputElement>;
+	/** Which edge of the button the panel hangs from (default 'right'). */
+	side?: 'left' | 'right';
 }
 
 const S = {
 	root: { position: 'relative', display: 'inline-flex', alignItems: 'center' } as React.CSSProperties,
-	panel: { position: 'absolute', top: 'calc(100% + 4px)', right: 0, zIndex: 20, width: 360, maxWidth: '80vw', padding: 10, borderRadius: 8, border: '1px solid var(--rr-border)', background: 'var(--rr-bg-paper)', color: 'var(--rr-text-primary)', boxShadow: '0 4px 16px rgba(0,0,0,0.25)' } as React.CSSProperties,
+	panel: { position: 'absolute', top: 'calc(100% + 4px)', zIndex: 20, width: VIEWS_PANEL_WIDTH, boxSizing: 'border-box', padding: 10, borderRadius: 8, border: '1px solid var(--rr-border)', background: 'var(--rr-bg-paper)', color: 'var(--rr-text-primary)', boxShadow: '0 4px 16px rgba(0,0,0,0.25)' } as React.CSSProperties,
 	save: { display: 'flex', gap: 6, alignItems: 'center', marginBottom: 8 } as React.CSSProperties,
 	input: { ...MAP_STYLES.input, minWidth: 0, flex: 1 } as React.CSSProperties,
 	entry: { display: 'flex', alignItems: 'center', gap: 6, padding: '6px 0', borderBottom: '1px solid var(--rr-border)' } as React.CSSProperties,
@@ -113,7 +121,7 @@ export function SavedViewsPanel(props: SavedViewsPanelProps): React.ReactElement
 	const busy = props.busyId !== null;
 	const saveOff = props.saveDisabled !== null || busy;
 	return (
-		<div id={props.id} role="group" aria-label="Saved views" style={S.panel} data-views-panel="">
+		<div id={props.id} role="group" aria-label="Saved views" style={{ ...S.panel, ...sideStyle(props.side ?? 'right') }} data-views-panel="">
 			<form
 				style={S.save}
 				onSubmit={(event) => {
@@ -121,7 +129,7 @@ export function SavedViewsPanel(props: SavedViewsPanelProps): React.ReactElement
 					if (!saveOff) props.onSave();
 				}}
 			>
-				<input type="text" style={S.input} aria-label="View name" maxLength={VIEW_NAME_MAX} placeholder={defaultViewName(props.views)} value={props.name} onChange={(event) => props.onName(event.target.value)} />
+				<input ref={props.nameRef} type="text" style={S.input} aria-label="View name" maxLength={VIEW_NAME_MAX} placeholder={defaultViewName(props.views)} value={props.name} onChange={(event) => props.onName(event.target.value)} />
 				<button type="submit" style={{ ...MAP_STYLES.button, ...(saveOff ? MAP_STYLES.buttonDisabled : null) }} disabled={saveOff} title={props.saveDisabled ?? 'Save the current view'} data-views-save="">
 					Save
 				</button>
@@ -169,11 +177,14 @@ export function SavedViewsMenu(props: SavedViewsMenuProps): React.ReactElement {
 	const { connectionKey, limits } = props;
 	const panelId = `views-${useId().replace(/:/g, '')}`;
 	const [open, setOpen] = useState(false);
+	const [side, setSide] = useState<'left' | 'right'>('right');
 	const [name, setName] = useState('');
 	const [status, setStatus] = useState<string | null>(null);
 	const [busyId, setBusyId] = useState<string | null>(null);
 	const [, setVersion] = useState(0);
 	const root = useRef<HTMLSpanElement>(null);
+	const button = useRef<HTMLButtonElement>(null);
+	const nameField = useRef<HTMLInputElement>(null);
 	const live = useRef(true);
 	const views = listViews(savedViews, connectionKey);
 	const refresh = (): void => setVersion((v) => v + 1);
@@ -201,8 +212,19 @@ export function SavedViewsMenu(props: SavedViewsMenuProps): React.ReactElement {
 		return () => document.removeEventListener('mousedown', onDown);
 	}, [open]);
 
+	// Opening puts the cursor in the name field.
+	useEffect(() => {
+		if (open) nameField.current?.focus();
+	}, [open]);
+
 	const save = useCallback((): void => {
-		const state = props.current();
+		let state: ReturnType<typeof props.current>;
+		try {
+			state = props.current();
+		} catch {
+			setStatus('The current view could not be read.');
+			return;
+		}
 		const now = Date.now();
 		const chosen = name.trim() === '' ? defaultViewName(listViews(savedViews, connectionKey)) : name;
 		const result = saveView(savedViews, connectionKey, chosen, state, limits, { now, id: newViewId(now) });
@@ -220,8 +242,8 @@ export function SavedViewsMenu(props: SavedViewsMenuProps): React.ReactElement {
 		(view: ISavedView): void => {
 			setBusyId(view.id);
 			setStatus(`Applying ${view.name}…`);
-			props
-				.onApply(view)
+			Promise.resolve()
+				.then(() => props.onApply(view))
 				.then(
 					(restored) => (restored ? `${restoreSentence(restored)}.${view.query ? ` ${QUERY_NOT_RUN}` : ''}` : APPLY_FAILED),
 					() => APPLY_FAILED
@@ -255,13 +277,24 @@ export function SavedViewsMenu(props: SavedViewsMenuProps): React.ReactElement {
 				if (event.key === 'Escape' && open) {
 					event.stopPropagation();
 					setOpen(false);
+					button.current?.focus();
 				}
 			}}
 		>
-			<button type="button" style={MAP_STYLES.button} aria-expanded={open} aria-controls={open ? panelId : undefined} onClick={() => setOpen((v) => !v)}>
+			<button
+				ref={button}
+				type="button"
+				style={MAP_STYLES.button}
+				aria-expanded={open}
+				aria-controls={open ? panelId : undefined}
+				onClick={() => {
+					if (!open) setSide(sideFor(root.current, VIEWS_PANEL_WIDTH));
+					setOpen((v) => !v);
+				}}
+			>
 				Views{views.length > 0 ? ` (${views.length})` : ''} ▾
 			</button>
-			{open ? <SavedViewsPanel id={panelId} limits={limits} views={views} name={name} busyId={busyId} status={status} saveDisabled={saveBlocker(savedViews, connectionKey)} onName={setName} onSave={save} onApply={apply} onDelete={remove} /> : null}
+			{open ? <SavedViewsPanel id={panelId} side={side} limits={limits} views={views} name={name} busyId={busyId} status={status} saveDisabled={saveBlocker(savedViews, connectionKey)} nameRef={nameField} onName={setName} onSave={save} onApply={apply} onDelete={remove} /> : null}
 			{!open && status ? (
 				<span role="status" style={S.hidden}>
 					{status}

@@ -20,7 +20,7 @@ import React from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { EXPORT_COLUMNS } from '../src/contract/types';
 import type { IDocumentItem, IExportItem, IExportRows, ISampleResult, VectorKey } from '../src/contract/types';
-import { ExportMenu, ExportMenuPanel, stepFocus } from '../src/components/ExportMenu';
+import { ExportMenu, ExportMenuPanel, popoverSide, stepFocus } from '../src/components/ExportMenu';
 import { BLOCKED_SENTENCE, EXPORT_SCHEMA_VERSION, LARGE_EXPORT_ROWS, MAP_NOT_DRAWN, NOTHING_SELECTED, cleanRows, documentExportItems, documentRows, fileName, guardCell, keyRows, mapExportItems, pointRows, runExport, searchExportItems, searchRows, toCsv, toJson } from '../src/vector/export';
 import type { ISearchExportRow } from '../src/vector/export';
 import { fixture } from './support/fixtures';
@@ -560,4 +560,11 @@ test('the menu keys: arrows wrap, Home and End jump, other keys leave focus alon
 	assert.equal(stepFocus(0, 5, 'End'), 4);
 	assert.equal(stepFocus(2, 5, 'a'), null);
 	assert.equal(stepFocus(0, 0, 'ArrowDown'), null);
+});
+
+test('a menu opens towards the side with room: from the left edge of its button when it fits, else from the right', () => {
+	assert.equal(popoverSide(10, 90, 1200, 320), 'left', 'a button at the left edge (the directory)');
+	assert.equal(popoverSide(1000, 1080, 1200, 320), 'right', 'a button at the right edge (the toolbar)');
+	assert.equal(popoverSide(100, 180, 300, 320), 'left', 'neither fits: the side with more room');
+	assert.equal(popoverSide(200, 280, 300, 320), 'right');
 });

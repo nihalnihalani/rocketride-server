@@ -109,6 +109,50 @@ export function exportNow(item: IExportItem, format: ExportFormat, collection: s
 	return runExport(item, format, { collection, download: browserDownload });
 }
 
+/** The width a menu panel is laid out for, CSS pixels (for choosing its side). */
+export const EXPORT_PANEL_WIDTH = 320;
+
+/**
+ * Which edge of its button a popover hangs from: the left edge when the panel
+ * fits to the right of it, else the right edge when it fits to the left, else
+ * the side with more room (the panel is also capped at the viewport's width).
+ *
+ * @param buttonLeft - The button's left edge, CSS pixels from the viewport's.
+ * @param buttonRight - Its right edge.
+ * @param viewportWidth - window.innerWidth.
+ * @param panelWidth - The panel's width.
+ * @returns 'left' (panel starts at the button's left edge) or 'right' (ends at its right edge).
+ */
+export function popoverSide(buttonLeft: number, buttonRight: number, viewportWidth: number, panelWidth: number): 'left' | 'right' {
+	const margin = 8;
+	if (buttonLeft + panelWidth <= viewportWidth - margin) return 'left';
+	if (buttonRight - panelWidth >= margin) return 'right';
+	return viewportWidth - buttonLeft >= buttonRight ? 'left' : 'right';
+}
+
+/**
+ * The side a popover anchored in `root` should open on now.
+ *
+ * @param root - The menu's root element.
+ * @param panelWidth - The panel's width.
+ * @returns The side ('right' outside a browser).
+ */
+export function sideFor(root: HTMLElement | null, panelWidth: number): 'left' | 'right' {
+	if (!root || typeof window === 'undefined') return 'right';
+	const rect = root.getBoundingClientRect();
+	return popoverSide(rect.left, rect.right, window.innerWidth, panelWidth);
+}
+
+/**
+ * The anchoring style of a popover on its side.
+ *
+ * @param side - 'left' or 'right'.
+ * @returns left/right offsets and a width cap.
+ */
+export function sideStyle(side: 'left' | 'right'): React.CSSProperties {
+	return side === 'left' ? { left: 0, right: 'auto', maxWidth: 'calc(100vw - 16px)' } : { right: 0, left: 'auto', maxWidth: 'calc(100vw - 16px)' };
+}
+
 /** The formats an item offers: PNG for a picture, CSV and JSON for rows. */
 function formatsOf(item: IExportItem): ExportFormat[] {
 	const out: ExportFormat[] = [];
@@ -131,10 +175,12 @@ export interface ExportMenuPanelProps {
 	progress: { done: number; total: number } | null;
 	onChoose(item: IExportItem, format: ExportFormat): void;
 	onCancel(): void;
-	/** Escape or Tab inside the menu: close it (the menu returns focus to its button). */
+	/** Escape or Tab inside the menu: close it and put focus back on its button. */
 	onClose?(refocus: boolean): void;
 	/** The menu element, for moving focus into it when it opens. */
 	menuRef?: React.Ref<HTMLDivElement>;
+	/** Which edge of the button the panel hangs from (default 'right'). */
+	side?: 'left' | 'right';
 }
 
 /**
@@ -166,7 +212,7 @@ function enabledChoices(menu: HTMLElement | null): HTMLElement[] {
 
 const S = {
 	root: { position: 'relative', display: 'inline-flex', alignItems: 'center' } as React.CSSProperties,
-	panel: { position: 'absolute', top: 'calc(100% + 4px)', right: 0, zIndex: 20, minWidth: 300, maxWidth: 420, padding: 8, borderRadius: 8, border: '1px solid var(--rr-border)', background: 'var(--rr-bg-paper)', color: 'var(--rr-text-primary)', boxShadow: '0 4px 16px rgba(0,0,0,0.25)' } as React.CSSProperties,
+	panel: { position: 'absolute', top: 'calc(100% + 4px)', zIndex: 20, minWidth: 300, width: EXPORT_PANEL_WIDTH, boxSizing: 'border-box', padding: 8, borderRadius: 8, border: '1px solid var(--rr-border)', background: 'var(--rr-bg-paper)', color: 'var(--rr-text-primary)', boxShadow: '0 4px 16px rgba(0,0,0,0.25)' } as React.CSSProperties,
 	entry: { display: 'flex', alignItems: 'center', gap: 6, padding: '5px 2px', borderBottom: '1px solid var(--rr-border)' } as React.CSSProperties,
 	label: { ...MAP_STYLES.small, flex: 1, minWidth: 0 } as React.CSSProperties,
 	reason: { ...MAP_STYLES.small, display: 'block', fontStyle: 'italic' } as React.CSSProperties,
@@ -189,7 +235,8 @@ export function ExportMenuPanel(props: ExportMenuPanelProps): React.ReactElement
 				event.preventDefault();
 				event.stopPropagation();
 			}
-			props.onClose?.(event.key === 'Escape');
+			// Focus goes back to the button either way: Escape stays there, Tab moves on from it.
+			props.onClose?.(true);
 			return;
 		}
 		const choices = enabledChoices(event.currentTarget);
@@ -200,7 +247,7 @@ export function ExportMenuPanel(props: ExportMenuPanelProps): React.ReactElement
 		choices[next]?.focus();
 	};
 	return (
-		<div id={props.id} style={S.panel} data-export-panel="">
+		<div id={props.id} style={{ ...S.panel, ...sideStyle(props.side ?? 'right') }} data-export-panel="">
 			<div ref={props.menuRef} role="menu" aria-label="Export choices" aria-busy={props.busy || undefined} tabIndex={-1} onKeyDown={onKeyDown}>
 				{props.items.map((item, index) => {
 					const labelId = `${props.id}-item-${index}`;
@@ -265,6 +312,7 @@ export function ExportMenu(props: ExportMenuProps): React.ReactElement {
 	const label = props.label ?? DEFAULT_LABEL;
 	const panelId = `export-${useId().replace(/:/g, '')}`;
 	const [open, setOpen] = useState(false);
+	const [side, setSide] = useState<'left' | 'right'>('right');
 	const [busy, setBusy] = useState(false);
 	const [status, setStatus] = useState<string | null>(null);
 	const [progress, setProgress] = useState<{ done: number; total: number } | null>(null);
@@ -291,6 +339,11 @@ export function ExportMenu(props: ExportMenuProps): React.ReactElement {
 		const first = enabledChoices(menu.current)[0];
 		(first ?? menu.current)?.focus();
 	}, [open]);
+
+	// A host whose items all went away closes the menu.
+	useEffect(() => {
+		if (empty && open) setOpen(false);
+	}, [empty, open]);
 
 	// A host that unmounts mid-export stops it.
 	useEffect(() => {
@@ -336,10 +389,14 @@ export function ExportMenu(props: ExportMenuProps): React.ReactElement {
 				aria-haspopup="menu"
 				aria-expanded={open}
 				aria-controls={open ? panelId : undefined}
-				onClick={() => setOpen((v) => !v)}
+				onClick={() => {
+					if (!open) setSide(sideFor(root.current, EXPORT_PANEL_WIDTH));
+					setOpen((v) => !v);
+				}}
 				onKeyDown={(event) => {
 					if ((event.key === 'ArrowDown' || event.key === 'ArrowUp') && !open) {
 						event.preventDefault();
+						setSide(sideFor(root.current, EXPORT_PANEL_WIDTH));
 						setOpen(true);
 					} else if (event.key === 'Escape' && open) {
 						event.stopPropagation();
@@ -353,6 +410,7 @@ export function ExportMenu(props: ExportMenuProps): React.ReactElement {
 				<ExportMenuPanel
 					id={panelId}
 					menuRef={menu}
+					side={side}
 					items={props.items}
 					busy={busy}
 					status={status}
