@@ -29,6 +29,7 @@ with the ``context`` fixture (``agent()`` / ``dap()``).
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import random
 import threading
@@ -1171,10 +1172,71 @@ def test_documents_lists_rows_with_paths_and_counts():
         'modifyTime',
         'ingestedAt',
         'pointId',
+        'max_chunk_id',
+        'deleted_chunks',
     }
     assert (first['path'], first['chunks'], first['has_first_chunk']) == ('C:/demo/folder0/doc00.md', 2, True)
+    # A driver whose rows carry no health fields answers null for both.
+    assert (first['max_chunk_id'], first['deleted_chunks']) == (None, None)
     assert (answer['total'], answer['distinct'], answer['sorted'], answer['counts_exact']) == (3, True, True, True)
     assert answer['caveats'] == [] and answer['next_cursor'] is None
+
+
+@dataclasses.dataclass(frozen=True)
+class _HealthRow(DocumentRow):
+    """A driver's document row with the per-document health fields (contract section 4.4-F)."""
+
+    max_chunk_id: Optional[Any] = None
+    deleted_chunks: Optional[Any] = None
+
+
+def _with_health(store: Any, health: Dict[str, tuple]) -> Any:
+    """Make ``store`` list the documents named in ``health`` as rows carrying those two fields."""
+    list_documents = store.listDocuments
+
+    def listing(**kw: Any) -> DocPage:
+        page = list_documents(**kw)
+        rows = [
+            _HealthRow(
+                **{f.name: getattr(row, f.name) for f in dataclasses.fields(DocumentRow)},
+                max_chunk_id=health[row.objectId][0],
+                deleted_chunks=health[row.objectId][1],
+            )
+            if row.objectId in health
+            else row
+            for row in page.items
+        ]
+        return dataclasses.replace(page, items=rows)
+
+    store.listDocuments = listing
+    return store
+
+
+def test_documents_items_carry_the_health_fields_the_driver_reports():
+    """``max_chunk_id`` and ``deleted_chunks`` come from the driver's row, null where it has none."""
+    store = _with_health(clustered(docs=3, chunks=2), {'doc00': (4, 1), 'doc02': (1, 0)})
+    items = {item['objectId']: item for item in node(store).documents({})['items']}
+    assert (items['doc00']['max_chunk_id'], items['doc00']['deleted_chunks']) == (4, 1)
+    assert (items['doc01']['max_chunk_id'], items['doc01']['deleted_chunks']) == (None, None)
+    assert (items['doc02']['max_chunk_id'], items['doc02']['deleted_chunks']) == (1, 0)
+    # The other figures of a row are unchanged.
+    assert (items['doc00']['chunks'], items['doc00']['has_first_chunk']) == (2, True)
+
+
+@pytest.mark.parametrize(
+    'reported, answered',
+    [
+        ((np.int64(7), np.int64(2)), (7, 2)),
+        ((7.0, 0.0), (7, 0)),
+        ((7.5, -1), (None, None)),
+        (('7', True), (None, None)),
+    ],
+)
+def test_documents_health_fields_are_whole_numbers_or_null(reported, answered):
+    """A health figure that is not a whole number of 0 or more is answered null, never rounded."""
+    store = _with_health(clustered(docs=1, chunks=2), {'doc00': reported})
+    item = node(store).documents({})['items'][0]
+    assert (item['max_chunk_id'], item['deleted_chunks']) == answered
 
 
 def test_documents_pages_with_the_cursor():

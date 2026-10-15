@@ -249,8 +249,8 @@ def _int_or_none(value: Any) -> Optional[int]:
         return None
 
 
-def _byte_count(value: Any) -> Optional[int]:
-    """A size in bytes a driver reported: a whole number of 0 or more, else None (never a guess)."""
+def _whole_number(value: Any) -> Optional[int]:
+    """A size or count a driver reported: a whole number of 0 or more, else None (never a guess)."""
     if isinstance(value, bool) or value is None:
         return None
     if isinstance(value, float):
@@ -1318,7 +1318,7 @@ class VectorExplorerTools:
             },
             'caveats': list(dict.fromkeys(caveats)),
             # Additive keys (contract section 4.4-F/G): null where the driver does not say.
-            'size_bytes': _byte_count(getattr(info, 'size_bytes', None)),
+            'size_bytes': _whole_number(getattr(info, 'size_bytes', None)),
             'keyword_match': keyword_match,
         }
 
@@ -1508,6 +1508,10 @@ class VectorExplorerTools:
                 'modifyTime': row.modifyTime,
                 'ingestedAt': row.ingestedAt,
                 'pointId': row.pointId,
+                # Per-document health (contract section 4.4-F): from a driver whose rows carry
+                # it (pgvector), null for every other driver.
+                'max_chunk_id': _whole_number(getattr(row, 'max_chunk_id', None)),
+                'deleted_chunks': _whole_number(getattr(row, 'deleted_chunks', None)),
             }
             for row in page.items
             if row.objectId != CONTROL_OBJECT_ID
