@@ -153,11 +153,14 @@ async function main() {
 	const page = await context.newPage();
 	page.setDefaultTimeout(30000);
 	const capture = C.captureFrames(page);
-	const canvas = page.locator(MAP.canvas).first();
-	const toolbar = page.getByRole('toolbar', { name: MAP.toolbar }).first();
-	const samplePicker = page.getByRole('combobox', { name: MAP.samplePicker }).first();
-	const layoutPicker = page.getByRole('combobox', { name: MAP.layoutPicker }).first();
-	const inspector = page.getByRole('region', { name: MAP.inspector }).first();
+	// Every open connection keeps its console and its map mounted, hidden behind the one in front, so
+	// each locator is scoped to the visible map root (the canvas itself is hidden under the Table).
+	const map = page.locator(MAP.root).filter({ visible: true }).first();
+	const canvas = map.locator(MAP.canvas).first();
+	const toolbar = map.getByRole('toolbar', { name: MAP.toolbar }).first();
+	const samplePicker = map.getByRole('combobox', { name: MAP.samplePicker }).first();
+	const layoutPicker = map.getByRole('combobox', { name: MAP.layoutPicker }).first();
+	const inspector = map.getByRole('region', { name: MAP.inspector }).first();
 
 	/** Wait until a canvas attribute (as an integer) satisfies ok; its last value. */
 	const pollInt = async (attr, ok, timeout = 15000) => {
@@ -284,7 +287,7 @@ async function main() {
 			await page.mouse.click(hover.x, hover.y);
 			const x = await C.waitForExchange(capture, 'neighbors', { since, timeout: 60000 });
 			const selected = await pollInt(MAP.attr.selected, (v) => v !== null);
-			const list = page.getByRole('list', { name: MAP.neighbourList }).first();
+			const list = map.getByRole('list', { name: MAP.neighbourList }).first();
 			await list.waitFor({ timeout: 30000 });
 			const rows = await list.locator('li').count();
 			const links = await pollInt(MAP.attr.links, (v) => v === 12);
@@ -365,10 +368,10 @@ async function main() {
 			if (!sample) return 'no sample';
 			const table = toolbar.getByRole('button', { name: MAP.table }).first();
 			await table.click();
-			await page.getByText(MAP.tableCaption).first().waitFor({ timeout: 15000 });
+			await map.getByText(MAP.tableCaption).first().waitFor({ timeout: 15000 });
 			const m = MAP.tableRows.exec(await C.bodyText(page));
 			const total = m ? Number(m[3].replace(/,/g, '')) : null;
-			await page
+			await map
 				.getByRole('button', { name: MAP.inspectPoint(0), exact: true })
 				.first()
 				.click();
@@ -388,24 +391,27 @@ async function main() {
 			const i = points[0];
 			const table = toolbar.getByRole('button', { name: MAP.table }).first();
 			await table.click();
-			for (let p = 0; p < Math.floor(i / 100); p += 1) await page.getByRole('button', { name: MAP.next }).first().click();
-			await page
+			for (let p = 0; p < Math.floor(i / 100); p += 1) await map.getByRole('button', { name: MAP.next }).first().click();
+			await map
 				.getByRole('button', { name: MAP.inspectPoint(i), exact: true })
 				.first()
 				.click();
 			await table.click();
 			await inspector.getByRole('button', { name: MAP.openDocument }).first().click();
-			await page.getByRole('button', { name: MAP.showChunkPath }).first().click();
-			if (!(await canvas.isVisible().catch(() => false))) await C.switchView(page, CONSOLE.mapTab);
-			const drawn = await pollInt(MAP.attr.chunkPath, (v) => v === points.length);
-			note({ document: pathOf(sample, i), in_sample: points.length, drawn });
+			// The document tab is in front now; its "Show chunk path on map" must bring the map back by itself.
+			await page.getByRole('button', { name: MAP.showChunkPath }).filter({ visible: true }).first().click();
+			await canvas.waitFor({ timeout: 10000 }).catch(() => {});
+			const inFront = await canvas.isVisible().catch(() => false);
+			const drawn = inFront ? await pollInt(MAP.attr.chunkPath, (v) => v === points.length) : null;
+			note({ document: pathOf(sample, i), in_sample: points.length, map_in_front: inFront, drawn });
+			if (!inFront) return 'the map is not in front after "Show chunk path on map" (the document tab stayed in front)';
 			return drawn === points.length ? true : `the path has ${drawn} points; the sample holds ${points.length} of that document`;
 		});
 
 		await step(page, "duplicates: the panel lists the sample's pairs, the planted near-duplicates among them", async (note) => {
 			if (!sample) return 'no sample';
 			await C.switchView(page, MAP.tabs.duplicates);
-			const list = page.getByRole('list', { name: MAP.duplicatesList }).first();
+			const list = map.getByRole('list', { name: MAP.duplicatesList }).first();
 			await list.waitFor({ timeout: 15000 });
 			const rows = await list.locator('li').allInnerTexts();
 			const missing = missingPairs(Array.isArray(rows) ? rows : [], E.DEMO_CORPUS.nearDuplicates);
@@ -417,7 +423,7 @@ async function main() {
 		await step(page, "outliers: the panel lists the sample's outliers, the OCR scan first", async (note) => {
 			if (!sample) return 'no sample';
 			await C.switchView(page, MAP.tabs.outliers);
-			const list = page.getByRole('list', { name: MAP.outliersList }).first();
+			const list = map.getByRole('list', { name: MAP.outliersList }).first();
 			await list.waitFor({ timeout: 15000 });
 			const rows = await list.locator('li').allInnerTexts();
 			const first = sample.outliers.length ? pathOf(sample, sample.outliers[0]) : null;
@@ -443,7 +449,8 @@ async function main() {
 			const wantC = b === null ? null : sectorTarget(xs, ys, b, 'up');
 			await page.keyboard.press('Enter');
 			const selected = await pollInt(MAP.attr.selected, (v) => v === c);
-			const said = MAP.announcement(c === null ? -1 : c, sample.n).test(await C.bodyText(page));
+			// The live region empties and refills (50 ms later) on every announcement: look for up to 2 s.
+			const said = await C.waitForText(page, MAP.announcement(c === null ? -1 : c, sample.n), 2000);
 			const named = c !== null && (await C.textOf(inspector)).includes(pathOf(sample, c));
 			await page.keyboard.press('Escape');
 			const cleared = (await C.attrText(canvas, MAP.attr.selected)) === '' && MAP.inspectorEmpty.test(await C.bodyText(page));
@@ -485,7 +492,7 @@ async function main() {
 
 		await step(page, 'legend: "neighbour graph computed by Qdrant" for Qdrant\'s own graph', async (note) => {
 			if (!sample) return 'no sample';
-			const text = await C.textOf(page.getByRole('region', { name: MAP.legend }).first());
+			const text = await C.textOf(map.getByRole('region', { name: MAP.legend }).first());
 			const backend = BACKEND_NAMES[fixtureKey];
 			note({ knn_source: sample.knn_source, legend: text.slice(0, 300) });
 			if (fixtureKey === 'qdrant' && sample.knn_source !== 'native') return `the Qdrant sample's kNN graph is ${sample.knn_source}, not Qdrant's own`;

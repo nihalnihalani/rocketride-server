@@ -214,6 +214,18 @@ when it returns `true`: a lane that cannot observe what a step names fails
 it, which the selftest checks on two stand-in pages (one empty, one where
 every element is visible but says nothing).
 
+The app keeps every open connection's console and map mounted, hidden
+behind the shell tab in front, so the lanes read only what is visible: the
+map lane scopes its locators to the visible `.vector-map`, the console's
+document count is the visible stats figure (`data-figure="documents"`), an
+upload is finished when its own row in the upload list says so
+(`data-status`), and `openConnection` returns to the Connections shell tab
+before it opens (or focuses) a console. Map actions taken in a document tab
+must bring the console back to the front by themselves; the chunk-path step
+fails when they do not. `vector-ui:e2e-live` runs the console lane once per
+backend in a child process that keeps the runner's own Node options (for
+example a `-r` preload).
+
 The lanes look for the app's wording as its design states it;
 `browser/ui.cjs` is the single place to adjust when the app's wording or
 structure differs. The map draws on a canvas, so the map lane also reads
