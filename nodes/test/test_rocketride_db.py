@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import re
 import sys
 import types
 
@@ -356,147 +357,120 @@ class TestRocketrideSqlConnection:
 
 
 # ---------------------------------------------------------------------------
-# rocketride_vector: HNSW default-index logic
+# rocketride_vector: the shared pgvector driver over the psycopg2 test double
+#
+# The real node Store and the real ai.common.store.pgvector driver run against
+# nodes/test/mocks/psycopg2 (an in-memory database that understands the
+# driver's statements). Every behaviour checked here is also checked live in
+# test_rocketride_db_full.py / test_store_postgres_full.py.
 # ---------------------------------------------------------------------------
 
-
-class _FakeCursor:
-    def __init__(self, executed, fetch_batches):
-        self._executed = executed
-        self._fetch_batches = fetch_batches
-
-    def execute(self, sql, params=None):
-        self._executed.append(sql)
-
-    def fetchone(self):
-        # Existence probes (_doesCollectionExist) read a single boolean.
-        return (True,)
-
-    def fetchall(self):
-        return self._fetch_batches.pop(0) if self._fetch_batches else []
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        return False
+_MOCK_PSYCOPG2 = _REPO / 'nodes' / 'test' / 'mocks' / 'psycopg2'
+_SWAPPED_MODULES = (
+    'psycopg2',
+    'psycopg2.sql',
+    'psycopg2.extensions',
+    'depends',
+    'ai.common.store.pgvector',
+    'ai.common.store.pgvector.sql',
+    'ai.common.store.pgvector.pool',
+    'ai.common.store.pgvector.driver',
+    'nodes.rocketride_vector',
+    'nodes.rocketride_vector.IEndpoint',
+    'nodes.rocketride_vector.IGlobal',
+    'nodes.rocketride_vector.IInstance',
+    'nodes.rocketride_vector.rocketride_vector',
+)
 
 
-class _FakeClient:
-    def __init__(self):
-        self.executed: list[str] = []
-        self.commits = 0
-        # Queue of row batches returned by successive fetchall() calls.
-        self.fetch_batches: list[list] = []
+@pytest.fixture()
+def mock_rv(monkeypatch):
+    """The real rocketride_vector Store, with psycopg2 replaced by the test double; sys.modules restored afterwards."""
+    import importlib
 
-    def cursor(self):
-        return _FakeCursor(self.executed, self.fetch_batches)
+    saved = {name: sys.modules.get(name) for name in _SWAPPED_MODULES}
+    import ai.common.store as store_pkg
 
-    def commit(self):
-        self.commits += 1
+    saved_attr = store_pkg.__dict__.get('pgvector')
+    for name in _SWAPPED_MODULES:
+        sys.modules.pop(name, None)
+    try:
+        import depends as real_depends  # noqa: F401 - reloaded below as a stand-in
 
-    def close(self):
-        pass
+        depends_mod = types.ModuleType('depends')
+        depends_mod.__dict__.update(saved['depends'].__dict__ if saved['depends'] else {})
+        depends_mod.depends = lambda *a, **kw: None
+        sys.modules['depends'] = depends_mod
+        spec = importlib.util.spec_from_file_location(
+            'psycopg2', _MOCK_PSYCOPG2 / '__init__.py', submodule_search_locations=[str(_MOCK_PSYCOPG2)]
+        )
+        psycopg2_mock = importlib.util.module_from_spec(spec)
+        sys.modules['psycopg2'] = psycopg2_mock
+        spec.loader.exec_module(psycopg2_mock)
+        psycopg2_mock.MockConnection.reset()
 
+        from ai.common.config import Config
 
-def _vector_store_cls(monkeypatch):
-    """Load the rocketride_vector Store with heavy deps stubbed."""
-    warnings: list[str] = []
-
-    depends_mod = types.ModuleType('depends')
-    depends_mod.depends = lambda *a, **kw: None
-    monkeypatch.setitem(sys.modules, 'depends', depends_mod)
-
-    rocketlib = types.ModuleType('rocketlib')
-    rocketlib.warning = warnings.append
-    rocketlib.OPEN_MODE = types.SimpleNamespace(CONFIG=object())
-    rocketlib.Entry = type('Entry', (), {})
-    monkeypatch.setitem(sys.modules, 'rocketlib', rocketlib)
-
-    numpy_mod = types.ModuleType('numpy')
-    numpy_mod.array = lambda x: x
-    monkeypatch.setitem(sys.modules, 'numpy', numpy_mod)
-
-    psycopg2_mod = types.ModuleType('psycopg2')
-    psycopg2_mod.connect = lambda *a, **kw: _FakeClient()
-    monkeypatch.setitem(sys.modules, 'psycopg2', psycopg2_mod)
-    pgvector_mod = types.ModuleType('pgvector')
-    pgvector_psycopg2 = types.ModuleType('pgvector.psycopg2')
-    pgvector_psycopg2.register_vector = lambda client: None
-    pgvector_mod.psycopg2 = pgvector_psycopg2
-    monkeypatch.setitem(sys.modules, 'pgvector', pgvector_mod)
-    monkeypatch.setitem(sys.modules, 'pgvector.psycopg2', pgvector_psycopg2)
-
-    ai_pkg = types.ModuleType('ai')
-    ai_pkg.__path__ = []
-    common_pkg = types.ModuleType('ai.common')
-    common_pkg.__path__ = []
-    schema = types.ModuleType('ai.common.schema')
-    for name in ('Doc', 'DocFilter', 'DocMetadata', 'QuestionText'):
-        setattr(schema, name, type(name, (), {}))
-    store_mod = types.ModuleType('ai.common.store')
-
-    class _StubDocumentStoreBase:
-        def __init__(self, provider, connConfig, bag):
-            self.vectorSize = 0
-            self.modelName = ''
-            self.threshold_search = 0.5
-
-    store_mod.DocumentStoreBase = _StubDocumentStoreBase
-    config = types.ModuleType('ai.common.config')
-    config.Config = types.SimpleNamespace(getNodeConfig=lambda provider, connConfig: dict(connConfig))
-    transform = types.ModuleType('ai.common.transform')
-    for name in ('IGlobalTransform', 'IInstanceTransform', 'IEndpointTransform'):
-        setattr(transform, name, type(name, (), {}))
-    monkeypatch.setitem(sys.modules, 'ai', ai_pkg)
-    monkeypatch.setitem(sys.modules, 'ai.common', common_pkg)
-    monkeypatch.setitem(sys.modules, 'ai.common.schema', schema)
-    monkeypatch.setitem(sys.modules, 'ai.common.store', store_mod)
-    monkeypatch.setitem(sys.modules, 'ai.common.config', config)
-    monkeypatch.setitem(sys.modules, 'ai.common.transform', transform)
-
-    rrdb_mod = _load_from_path('ai.common.rocketride_db', _RRDB_PATH)
-    monkeypatch.setitem(sys.modules, 'ai.common.rocketride_db', rrdb_mod)
-
-    account_mod = types.ModuleType('ai.account')
-
-    async def fake(client_id):
-        return TEST_DSN
-
-    account_mod.account = types.SimpleNamespace(resolve_db_dsn=fake)
-    monkeypatch.setitem(sys.modules, 'ai.account', account_mod)
-    monkeypatch.setenv('ROCKETRIDE_CLIENT_ID', 'tenant-42')
-    monkeypatch.delenv('ROCKETRIDE_DB_DSN', raising=False)
-
-    iglobal = _load_from_path('nodes.rocketride_vector.IGlobal', _VEC_NODE_DIR / 'IGlobal.py')
-    pkg = types.ModuleType('nodes.rocketride_vector')
-    pkg.__path__ = [str(_VEC_NODE_DIR)]
-    pkg.IGlobal = iglobal
-    monkeypatch.setitem(sys.modules, 'nodes.rocketride_vector', pkg)
-    monkeypatch.setitem(sys.modules, 'nodes.rocketride_vector.IGlobal', iglobal)
-    store = _load_from_path('nodes.rocketride_vector.rocketride_vector', _VEC_NODE_DIR / 'rocketride_vector.py')
-    return store.Store, warnings
+        monkeypatch.setattr(Config, 'getNodeConfig', staticmethod(lambda provider, connConfig: dict(connConfig)))
+        monkeypatch.setenv('ROCKETRIDE_DB_DSN', TEST_DSN)
+        monkeypatch.delenv('ROCKETRIDE_DB_RESOLVE_ERROR', raising=False)
+        store_mod = importlib.import_module('nodes.rocketride_vector.rocketride_vector')
+        driver = importlib.import_module('ai.common.store.pgvector.driver')
+        warnings: list[str] = []
+        monkeypatch.setattr(driver, 'warning', warnings.append)
+        yield types.SimpleNamespace(
+            Store=store_mod.Store, db=psycopg2_mock.MockConnection, psycopg2=psycopg2_mock, warnings=warnings
+        )
+    finally:
+        for name in _SWAPPED_MODULES:
+            sys.modules.pop(name, None)
+            if saved[name] is not None:
+                sys.modules[name] = saved[name]
+        if saved_attr is not None:
+            store_pkg.pgvector = saved_attr
+        else:
+            store_pkg.__dict__.pop('pgvector', None)
 
 
-def _make_store(cls, config):
-    return cls('rocketride_vector', config, {})
+def _make_store(env, config):
+    return env.Store('rocketride_vector', config, {})
+
+
+def _statements(env, tag=None):
+    """Every statement the driver sent, optionally only those named ``tag``."""
+    out = []
+    for conn in env.db.opened:
+        for text, _params in conn.executed:
+            if tag is None or text.startswith(f'/* rr-pgvector:{tag} */'):
+                out.append(text)
+    return out
+
+
+def _doc(object_id, chunk_id, embedding, content=None):
+    from ai.common.schema import Doc, DocMetadata
+
+    return Doc(
+        page_content=content if content is not None else f'{object_id}/{chunk_id}',
+        metadata=DocMetadata(objectId=object_id, chunkId=chunk_id, isDeleted=False, signature='sig', size=7),
+        embedding=list(embedding),
+        embedding_model='m',
+    )
 
 
 class TestRocketrideVectorStore:
-    def test_connects_via_resolved_dsn(self, monkeypatch):
-        cls, _ = _vector_store_cls(monkeypatch)
-        store = _make_store(cls, {'collection': 'rr_vec', 'similarity': 'cosine'})
+    def test_connects_via_resolved_dsn(self, mock_rv):
+        store = _make_store(mock_rv, {'collection': 'rr_vec', 'similarity': 'cosine'})
         # No client_id on the store: identity rides the task file (#1686);
         # tenant scoping keys on the DSN's database (see IGlobal's subKey).
         assert store.host == 'localhost'
         assert store.port == 55432
         assert store.database == 'rrtenant'
-        assert isinstance(store.client, _FakeClient)
+        conn = mock_rv.db.opened[0]
+        assert conn.dsn == TEST_DSN and conn.application_name == 'rocketride-pgvector'
 
-    def test_invalid_collection_rejected(self, monkeypatch):
-        cls, _ = _vector_store_cls(monkeypatch)
+    def test_invalid_collection_rejected(self, mock_rv):
         with pytest.raises(ValueError, match='Invalid collection name'):
-            _make_store(cls, {'collection': 'bad-name;drop', 'similarity': 'cosine'})
+            _make_store(mock_rv, {'collection': 'bad-name;drop', 'similarity': 'cosine'})
 
     @pytest.mark.parametrize(
         ('similarity', 'opclass'),
@@ -506,91 +480,338 @@ class TestRocketrideVectorStore:
             ('inner_product', 'vector_ip_ops'),
         ],
     )
-    def test_hnsw_index_opclass_follows_similarity(self, monkeypatch, similarity, opclass):
-        cls, _ = _vector_store_cls(monkeypatch)
-        store = _make_store(cls, {'collection': 'rr_vec', 'similarity': similarity})
+    def test_hnsw_index_opclass_follows_similarity(self, mock_rv, similarity, opclass):
+        store = _make_store(mock_rv, {'collection': 'rr_vec', 'similarity': similarity})
         store._createCollection(vectorSize=5)
-        ddl = store.client.executed
-        assert any('CREATE TABLE IF NOT EXISTS rr_vec' in sql for sql in ddl)
-        index_sql = [sql for sql in ddl if 'USING hnsw' in sql]
+        assert any(
+            sql.startswith('/* rr-pgvector:create_table */ CREATE TABLE IF NOT EXISTS "rr_vec"')
+            for sql in _statements(mock_rv)
+        )
+        index_sql = _statements(mock_rv, 'create_hnsw_index')
         assert len(index_sql) == 1
-        assert f'(embedding {opclass})' in index_sql[0]
-        assert 'rr_vec_embedding_hnsw' in index_sql[0]
+        assert f'USING hnsw ("embedding" {opclass})' in index_sql[0]
+        assert '"rr_vec_embedding_hnsw"' in index_sql[0]
         assert 'm = 16' in index_sql[0]
         assert 'ef_construction = 64' in index_sql[0]
 
-    def test_hnsw_params_overridable(self, monkeypatch):
-        cls, _ = _vector_store_cls(monkeypatch)
+    def test_hnsw_params_overridable(self, mock_rv):
         store = _make_store(
-            cls,
+            mock_rv,
             {'collection': 'rr_vec', 'similarity': 'cosine', 'hnsw_m': 32, 'hnsw_ef_construction': 128},
         )
         store._createCollection(vectorSize=5)
-        index_sql = [sql for sql in store.client.executed if 'USING hnsw' in sql]
+        index_sql = _statements(mock_rv, 'create_hnsw_index')
         assert 'm = 32' in index_sql[0]
         assert 'ef_construction = 128' in index_sql[0]
 
-    def test_render_orders_chunks_and_bridges_gaps(self, monkeypatch):
+    def test_render_orders_chunks_and_bridges_gaps(self, mock_rv):
         """Chunks at 0, 1 and 3 (gap at 2): index order preserved, gap skipped."""
-        cls, _ = _vector_store_cls(monkeypatch)
-        store = _make_store(cls, {'collection': 'rr_vec', 'similarity': 'cosine'})
-        store.client.fetch_batches = [[('A', 0), ('D', 3), ('B', 1)]]
+        store = _make_store(mock_rv, {'collection': 'rr_vec', 'similarity': 'cosine'})
+        store.addChunks([_doc('obj-1', 0, [1, 0, 0, 0, 0], 'A')])
+        store.addChunks([_doc('obj-1', 3, [1, 0, 0, 0, 0], 'D'), _doc('obj-1', 1, [1, 0, 0, 0, 0], 'B')])
         out: list[str] = []
         store.render('obj-1', out.append)
-        assert out == ['ABD']
+        assert ''.join(out) == 'ABD'
 
-    def test_render_empty_batch_emits_nothing(self, monkeypatch):
-        cls, _ = _vector_store_cls(monkeypatch)
-        store = _make_store(cls, {'collection': 'rr_vec', 'similarity': 'cosine'})
-        store.client.fetch_batches = [[]]
+    def test_render_empty_batch_emits_nothing(self, mock_rv):
+        store = _make_store(mock_rv, {'collection': 'rr_vec', 'similarity': 'cosine'})
+        store.addChunks([_doc('obj-2', 0, [1, 0, 0, 0, 0], 'A')])
         out: list[str] = []
         store.render('obj-1', out.append)
         assert out == []
 
-    def test_render_single_high_chunk_id(self, monkeypatch):
+    def test_render_single_high_chunk_id(self, mock_rv):
         """One row with a high chunkId renders that row — allocation is bounded
         by rows fetched, never by the chunkId value.
         """
-        cls, _ = _vector_store_cls(monkeypatch)
-        store = _make_store(cls, {'collection': 'rr_vec', 'similarity': 'cosine'})
-        store.client.fetch_batches = [[('X', 999_999)]]
+        store = _make_store(mock_rv, {'collection': 'rr_vec', 'similarity': 'cosine'})
+        store.addChunks([_doc('obj-0', 0, [1, 0, 0, 0, 0], 'seed')])
+        store.addChunks([_doc('obj-1', 999_999, [1, 0, 0, 0, 0], 'X')])
         out: list[str] = []
         store.render('obj-1', out.append)
         assert out == ['X']
 
-    def test_hnsw_params_clamped_to_pgvector_bounds(self, monkeypatch):
-        cls, _ = _vector_store_cls(monkeypatch)
+    def test_hnsw_params_clamped_to_pgvector_bounds(self, mock_rv):
         store = _make_store(
-            cls,
+            mock_rv,
             {'collection': 'rr_vec', 'similarity': 'cosine', 'hnsw_m': 1, 'hnsw_ef_construction': 1},
         )
         # pgvector requires m >= 2, ef_construction >= 4 and >= 2 * m.
         assert store.hnsw_m == 2
         assert store.hnsw_ef_construction == 4
 
-    def test_hnsw_ef_construction_raised_to_twice_m(self, monkeypatch):
-        cls, _ = _vector_store_cls(monkeypatch)
+    def test_hnsw_ef_construction_raised_to_twice_m(self, mock_rv):
         store = _make_store(
-            cls,
+            mock_rv,
             {'collection': 'rr_vec', 'similarity': 'cosine', 'hnsw_m': 64, 'hnsw_ef_construction': 64},
         )
         assert store.hnsw_ef_construction == 128
 
-    def test_hnsw_skipped_above_dimension_ceiling(self, monkeypatch):
-        cls, warnings = _vector_store_cls(monkeypatch)
-        store = _make_store(cls, {'collection': 'rr_vec', 'similarity': 'cosine'})
-        store._createCollection(vectorSize=2001)
-        ddl = store.client.executed
-        assert any('CREATE TABLE IF NOT EXISTS rr_vec' in sql for sql in ddl)
-        assert not any('USING hnsw' in sql for sql in ddl)
-        assert any('2000' in w and 'Skipping index' in w for w in warnings)
+    def test_long_table_names_get_distinct_index_names(self, mock_rv):
+        for length in (61, 62, 63):
+            name = ('t' * 70)[:length]
+            store = _make_store(mock_rv, {'collection': name, 'similarity': 'cosine'})
+            store.addChunks([_doc('a', 0, [1, 0, 0, 0, 0])])
+            indexes = set(mock_rv.db.table(name).indexes)
+            assert len(indexes) == 2 and name not in indexes and all(len(n) <= 63 for n in indexes)
 
-    def test_hnsw_created_at_dimension_ceiling(self, monkeypatch):
-        cls, warnings = _vector_store_cls(monkeypatch)
-        store = _make_store(cls, {'collection': 'rr_vec', 'similarity': 'cosine'})
+    def test_hnsw_skipped_above_dimension_ceiling(self, mock_rv):
+        store = _make_store(mock_rv, {'collection': 'rr_vec', 'similarity': 'cosine'})
+        store._createCollection(vectorSize=2001)
+        assert _statements(mock_rv, 'create_table')
+        assert not _statements(mock_rv, 'create_hnsw_index')
+        assert any('2000' in w and 'Skipping index' in w for w in mock_rv.warnings)
+
+    def test_hnsw_created_at_dimension_ceiling(self, mock_rv):
+        store = _make_store(mock_rv, {'collection': 'rr_vec', 'similarity': 'cosine'})
         store._createCollection(vectorSize=2000)
-        assert any('USING hnsw' in sql for sql in store.client.executed)
-        assert not warnings
+        assert _statements(mock_rv, 'create_hnsw_index')
+        assert not mock_rv.warnings
+
+
+class TestPgVectorTransactions:
+    """Transaction hygiene of the shared driver (live twins: test_store_postgres_full.py TestConnections)."""
+
+    def test_reads_are_read_only_bounded_and_end_their_transaction(self, mock_rv):
+        from ai.common.schema import DocFilter, QuestionText
+
+        store = _make_store(mock_rv, {'collection': 'rr_vec', 'similarity': 'cosine'})
+        store.addChunks([_doc('a', 0, [1, 0, 0, 0, 0])])
+        query = QuestionText(text='q')
+        query.embedding = [1, 0, 0, 0, 0]
+        assert [d.metadata.objectId for d in store.searchSemantic(query, DocFilter(limit=3))] == ['a']
+        begins = _statements(mock_rv, 'begin_read')
+        assert len(begins) > 1
+        assert all('SET TRANSACTION READ ONLY' in b and "statement_timeout = '30000ms'" in b for b in begins)
+        # The open probe reads the pgvector version; every read after it sets the iterative scan.
+        assert 'hnsw.iterative_scan' not in begins[0]
+        assert all('hnsw.iterative_scan = relaxed_order' in b for b in begins[1:])
+        assert all(b.startswith("/* rr-pgvector:begin_read */ SELECT '[0]'::vector;") for b in begins)
+        # Nothing is ever set for the session (a transaction-mode pooler would leak it).
+        every = _statements(mock_rv)
+        assert not [s for s in every if re.search(r'(^|; )SET (?!LOCAL|TRANSACTION)', s.split('*/', 1)[-1].strip())]
+        assert all(conn.get_transaction_status() == 0 for conn in mock_rv.db.opened)
+
+    def test_iterative_scan_left_out_before_pgvector_0_8(self, mock_rv):
+        mock_rv.db.extension_version = '0.7.4'
+        store = _make_store(mock_rv, {'collection': 'rr_vec', 'similarity': 'cosine'})
+        store.countChunks(None)
+        assert not any('hnsw.iterative_scan' in b for b in _statements(mock_rv, 'begin_read'))
+        # Without the iterative scan a filtered search may return fewer than k rows: say so.
+        assert 'filtered_search_may_underfill' in store.describe().caveats
+        store.addChunks([_doc('a', 0, [1, 0, 0, 0, 0])])
+        assert 'filtered_search_may_underfill' in store.describe().caveats
+
+    def test_no_underfill_caveat_from_pgvector_0_8(self, mock_rv):
+        store = _make_store(mock_rv, {'collection': 'rr_vec', 'similarity': 'cosine'})
+        store.addChunks([_doc('a', 0, [1, 0, 0, 0, 0])])
+        assert 'filtered_search_may_underfill' not in store.describe().caveats
+
+    def test_failed_statement_does_not_poison_the_next_call(self, mock_rv):
+        from ai.common.schema import DocFilter
+
+        store = _make_store(mock_rv, {'collection': 'rr_vec', 'similarity': 'cosine'})
+        store.addChunks([_doc('a', 0, [1, 0, 0, 0, 0])])
+        mock_rv.db.fail_next['count_chunks'] = mock_rv.psycopg2.ProgrammingError('boom', '42000')
+        with pytest.raises(Exception, match='boom'):
+            store.countChunks(DocFilter())
+        assert store.countChunks(DocFilter()) == 1
+        assert all(conn.get_transaction_status() == 0 for conn in mock_rv.db.opened)
+
+    def test_failed_write_rolls_back_the_whole_batch(self, mock_rv):
+        store = _make_store(mock_rv, {'collection': 'rr_vec', 'similarity': 'cosine'})
+        store.addChunks([_doc('a', 0, [1, 0, 0, 0, 0]), _doc('a', 1, [1, 0, 0, 0, 0])])
+        mock_rv.db.fail_next['insert'] = mock_rv.psycopg2.OperationalError('insert failed', '53100')
+        with pytest.raises(Exception):
+            store.addChunks([_doc('a', 0, [0, 1, 0, 0, 0], 'new')])
+        rows = sorted((r['objectid'], r['chunkid']) for r in mock_rv.db.table('rr_vec').rows.values())
+        assert rows == [('a', 0), ('a', 1), ('schema', 0)]  # the delete of the failed batch was undone
+
+    def test_connection_slots_are_handed_out_first_come_first_served(self, mock_rv):
+        """A released slot goes to the longest waiter, never back to a caller that arrives later."""
+        import threading
+        import time
+
+        from ai.common.store.pgvector.pool import FairGate
+
+        gate = FairGate(1)
+        assert gate.acquire(1.0)
+        order: list[str] = []
+
+        def waiter(name):
+            assert gate.acquire(5.0)
+            order.append(name)
+            time.sleep(0.05)
+            gate.release()
+
+        first = threading.Thread(target=waiter, args=('first',))
+        first.start()
+        time.sleep(0.1)
+        second = threading.Thread(target=waiter, args=('second',))
+        second.start()
+        time.sleep(0.1)
+        gate.release()
+        # A caller arriving right after the release must queue behind both waiters.
+        assert gate.acquire(5.0)
+        order.append('late')
+        gate.release()
+        first.join(5)
+        second.join(5)
+        assert order == ['first', 'second', 'late']
+        assert gate.acquire(0.01)
+        assert not gate.acquire(0.05)  # the only slot is taken: a bounded wait gives up
+
+    def test_seeded_samples_set_nothing_for_the_session(self, mock_rv):
+        from ai.common.schema import DocFilter
+
+        store = _make_store(mock_rv, {'collection': 'rr_vec', 'similarity': 'cosine'})
+        for i in range(6):
+            store.addChunks([_doc(f'd{i}', c, [1, 0, 0, 0, c]) for c in range(4)])
+
+        def keys(seed, strategy):
+            docs, _ = store.sampleChunks(n=9, seed=seed, strategy=strategy, docFilter=DocFilter(), include_keys=[])
+            return [(d.metadata.objectId, d.metadata.chunkId) for d in docs]
+
+        for strategy in ('random', 'stratified'):
+            assert keys(3, strategy) == keys(3, strategy)
+            assert any(keys(seed, strategy) != keys(3, strategy) for seed in (4, 5, 6))
+        assert len({oid for oid, _cid in keys(3, 'stratified')}) == 6
+        samples = _statements(mock_rv, 'sample_random') + _statements(mock_rv, 'sample_stratified')
+        assert samples and all('hashtextextended("id"::text, %s)' in text for text in samples)
+        assert not [text for text in _statements(mock_rv) if 'setseed' in text or 'random()' in text]
+
+    def test_rows_with_a_null_deleted_flag_read_as_active(self, mock_rv):
+        from ai.common.schema import DocFilter
+
+        store = _make_store(mock_rv, {'collection': 'rr_vec', 'similarity': 'cosine'})
+        store.addChunks([_doc('a', 0, [1, 0, 0, 0, 0]), _doc('a', 1, [1, 0, 0, 0, 0])])
+        for row in mock_rv.db.table('rr_vec').rows.values():
+            if row['objectid'] == 'a':
+                row['isdeleted'] = None  # a row written by hand or by another client
+        assert store.countChunks(DocFilter()) == 2
+        assert store.countDocuments(DocFilter()) == 1
+        listed = store.listDocuments(cursor=None, limit=5, object_ids=None, deleted='active', sort='path')
+        assert [(r.objectId, r.chunks, r.deleted) for r in listed.items] == [('a', 2, False)]
+        assert all(d.metadata.isDeleted is False for d in store.get(DocFilter(objectIds=['a'])))
+
+    def test_document_pages_aggregate_only_their_own_documents(self, mock_rv):
+        store = _make_store(mock_rv, {'collection': 'rr_vec', 'similarity': 'cosine'})
+        for i in range(5):
+            store.addChunks([_doc(f'd{i}', c, [1, 0, 0, 0, c]) for c in range(2)])
+        cursor, seen, totals = None, [], []
+        while True:
+            page = store.listDocuments(cursor=cursor, limit=2, object_ids=None, deleted='active', sort='path')
+            seen += [r.objectId for r in page.items]
+            totals.append(page.total)
+            cursor = page.next_cursor
+            if cursor is None:
+                break
+        assert seen == [f'd{i}' for i in range(5)] and totals == [5, 5, 5]
+        assert not _statements(mock_rv, 'count_documents')
+        details = _statements(mock_rv, 'list_documents')
+        assert len(details) == 3 and all('"objectid" = ANY(%s)' in text for text in details)
+        assert all('HAVING' not in text and 'LIMIT' not in text for text in details)
+
+    def test_unreachable_server_error_names_no_host(self, mock_rv):
+        from ai.common.store.errors import StoreError
+
+        mock_rv.db.fail_next['connect'] = mock_rv.psycopg2.OperationalError(
+            'connection to server at "10.1.2.3", port 6432 failed: password authentication failed for user "rruser"'
+        )
+        with pytest.raises(StoreError) as err:
+            _make_store(mock_rv, {'collection': 'rr_vec', 'similarity': 'cosine'})
+        assert '10.1.2.3' not in str(err.value) and 'rruser' not in str(err.value)
+
+    def test_meta_column_falls_back_while_the_table_is_locked(self, mock_rv):
+        store = _make_store(mock_rv, {'collection': 'rr_vec', 'similarity': 'cosine'})
+        store.addChunks([_doc('a', 0, [1, 0, 0, 0, 0])])
+        table = mock_rv.db.table('rr_vec')
+        table.columns = [c for c in table.columns if c[0] != 'meta']  # a table without the column
+        for row in table.rows.values():
+            row.pop('meta', None)
+        mock_rv.db.locked_tables.add('rr_vec')
+        reopened = _make_store(mock_rv, {'collection': 'rr_vec', 'similarity': 'cosine'})
+        reopened.addChunks([_doc('b', 0, [1, 0, 0, 0, 0])])
+        info = reopened.describe()
+        assert info.meta_column is False and 'extras_not_stored' in info.caveats
+        mock_rv.db.locked_tables.clear()
+        reopened.META_RETRY_S = 0.0
+        reopened.addChunks([_doc('c', 0, [1, 0, 0, 0, 0])])
+        assert reopened.describe().meta_column is True
+        assert 'meta' in [name for name, _type in mock_rv.db.table('rr_vec').columns]
+        rows = {r['objectid']: r for r in mock_rv.db.table('rr_vec').rows.values()}
+        assert rows['c']['meta'] == {'size': 7} and 'meta' not in rows['b']
+
+
+class TestRocketrideVectorWriteCheck:
+    """The node's local write check (live twins: test_rocketride_db_full.py TestRocketrideVectorNode)."""
+
+    @staticmethod
+    def _node(env, config):
+        import importlib
+
+        from rocketlib import OPEN_MODE
+
+        IGlobal = importlib.import_module('nodes.rocketride_vector.IGlobal').IGlobal
+        IInstance = importlib.import_module('nodes.rocketride_vector.IInstance').IInstance
+        glb = IGlobal()
+        glb.IEndpoint = types.SimpleNamespace(
+            endpoint=types.SimpleNamespace(openMode=OPEN_MODE.SOURCE, bag={}, parameters={})
+        )
+        glb.glb = types.SimpleNamespace(logicalType='rocketride_vector', connConfig=config)
+        glb.beginGlobal()
+        inst = IInstance()
+        inst.IGlobal = glb
+        glb.store.addChunks([_doc('doc', 0, [1, 0, 0, 0, 0])])
+        return glb, inst
+
+    @staticmethod
+    def _rows(env):
+        return sorted(r['objectid'] for r in env.db.table('rr_vec').rows.values())
+
+    def test_delete_without_a_call_context_is_refused(self, mock_rv):
+        glb, inst = self._node(mock_rv, {'collection': 'rr_vec', 'similarity': 'cosine', 'allow_writes': True})
+        answer = inst.delete({'object_ids': ['doc']})
+        assert answer['success'] is False and answer['code'] == 'WRITES_UNKNOWN_CALLER'
+        assert inst.delete({'object_ids': ['schema']})['code'] == 'RESERVED_ID'
+        assert self._rows(mock_rv) == ['doc', 'schema']
+        glb.endGlobal()
+
+    @pytest.mark.parametrize(
+        ('origin', 'switches', 'code'),
+        [('dap', {'allow_writes': False}, 'WRITES_DISABLED'), ('agent', {'agent_writes': False}, 'WRITES_AGENT')],
+    )
+    def test_switches_refuse_calls_with_a_context(self, mock_rv, monkeypatch, origin, switches, code):
+        import importlib
+
+        from ai.common.tool_context import ToolCallContext
+
+        glb, inst = self._node(mock_rv, {'collection': 'rr_vec', 'similarity': 'cosine', **switches})
+        ctx = ToolCallContext(origin=origin, source_type='tools', targeted=True, caller={'auth': 'account'})
+        monkeypatch.setattr(
+            importlib.import_module('nodes.rocketride_vector.IInstance'), 'current_tool_call', lambda: ctx
+        )
+        upsert = {
+            'documents': [{'content': 'x', 'object_id': 'new', 'embedding': [0, 1, 0, 0, 0], 'embedding_model': 'm'}]
+        }
+        assert inst.delete({'object_ids': ['doc']})['code'] == code
+        assert inst.upsert(upsert)['code'] == code
+        assert self._rows(mock_rv) == ['doc', 'schema']
+        glb.endGlobal()
+
+    def test_agent_call_with_default_switches_reaches_the_store(self, mock_rv, monkeypatch):
+        import importlib
+
+        from ai.common.tool_context import ToolCallContext
+
+        glb, inst = self._node(mock_rv, {'collection': 'rr_vec', 'similarity': 'cosine'})
+        ctx = ToolCallContext(origin='agent', source_type=None, targeted=True, caller={'auth': 'agent'})
+        monkeypatch.setattr(
+            importlib.import_module('nodes.rocketride_vector.IInstance'), 'current_tool_call', lambda: ctx
+        )
+        assert inst.delete({'object_ids': ['doc']})['success'] is True
+        assert self._rows(mock_rv) == ['schema']
+        glb.endGlobal()
 
 
 # ---------------------------------------------------------------------------

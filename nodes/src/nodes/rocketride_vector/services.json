@@ -13,13 +13,13 @@
 	// Required:
 	//		Class type of the node - what it does
 	//
-	"classType": ["store"],
+	"classType": ["store", "tool"],
 	//
 	// Required:
 	//     Capabilities are flags that change the behavior of the underlying
 	//     engine
 	//
-	"capabilities": [],
+	"capabilities": ["invoke"],
 	//
 	// Optional:
 	//		Register is either filter, endpoint or ignored if not specified. If the
@@ -130,9 +130,21 @@
 			"minimum": 4,
 			"maximum": 1000
 		},
+		"rrvector.allow_writes": {
+			"title": "Allow document management from tool calls",
+			"description": "Lets a Tools source of this pipeline remove documents through tool calls (the Vector Explorer's trash can, and the delete and upsert tools). Off by default. The table is shared by every pipeline of the organization that names it.",
+			"type": "boolean",
+			"default": false
+		},
+		"rrvector.agent_writes": {
+			"title": "Allow agent writes",
+			"description": "Lets an agent in this pipeline call the upsert and delete tools.",
+			"type": "boolean",
+			"default": true
+		},
 		"rrvector.cloud": {
 			"object": "cloud",
-			"properties": ["rrvector.collection", "rrvector.score", "rrvector.similarity", "rrvector.hnsw_m", "rrvector.hnsw_ef_construction"]
+			"properties": ["rrvector.collection", "rrvector.score", "rrvector.similarity", "rrvector.hnsw_m", "rrvector.hnsw_ef_construction", "rrvector.allow_writes", "rrvector.agent_writes"]
 		},
 		"rrvector.profile": {
 			"hidden": true,
