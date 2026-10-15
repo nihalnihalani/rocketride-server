@@ -40,7 +40,17 @@ from .test_vector_hooks import MemoryStore, corpus
 LEGACY_AGENT_CATALOG_SHA256 = 'ac5b61b8273890e938c91c5c090c9dc292e8de685c39ff6d86ba231de218b4b7'
 
 LEGACY_TOOLS = ('delete', 'get', 'objdir', 'search', 'stats', 'upsert')
-EXPLORER_TOOLS = ('chunks', 'dialect', 'documents', 'neighbors', 'project', 'remove_document', 'sample', 'vectors')
+EXPLORER_TOOLS = (
+    'chunks',
+    'dialect',
+    'documents',
+    'neighbors',
+    'project',
+    'recommend',
+    'remove_document',
+    'sample',
+    'vectors',
+)
 
 
 class _Probe:
@@ -504,6 +514,7 @@ _INPUTS = {
     'sample': {'n': 5},
     'project': {'sample_id': 's-1-aaaaaaaa', 'vector': [0.1, 0.2]},
     'neighbors': {'vector': [0.1, 0.2]},
+    'recommend': {'positive': [['a', 0]]},
     'search': {'vector': [0.1, 0.2]},
     'remove_document': {'object_ids': ['a']},
     'delete': {'object_ids': ['a']},
@@ -723,6 +734,16 @@ def test_neighbors_matches_the_fixtures(wired):
     _same_keys(answer['items'][0], fixture['items'][0], 'neighbors.items[]')
     scoped = inst.neighbors({'key': ['doc00', 0], 'scope_keys': [['doc01', 0]]})
     _same_keys(scoped, _fixture('neighbors_scope_scores'), 'neighbors(scope)')
+
+
+def test_recommend_matches_the_fixtures(wired):
+    _store, inst, _sample = wired
+    answer = inst.recommend({'positive': [['doc00', 0], ['doc01', 1]], 'negative': [['doc03', 2]], 'k': 6})
+    fixture = _fixture('recommend_ok')
+    _same_keys(answer, fixture, 'recommend')
+    _same_keys(answer['items'][0], fixture['items'][0], 'recommend.items[]')
+    _same_keys(answer['examples_resolved'], fixture['examples_resolved'], 'recommend.examples_resolved')
+    assert inst.recommend({'positive': [['doc00', 0]], 'strategy': 'best_score'}) == _fixture('recommend_unsupported')
 
 
 def test_search_matches_the_fixture(wired):
