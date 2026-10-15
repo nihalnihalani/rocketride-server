@@ -37,14 +37,18 @@
 // adds a line, ArrowUp in an empty box recalls earlier questions.
 //
 // The header's Search toggle swaps the chat body for the SearchPanel (search
-// without the LLM) in the same space; the chat's thread and draft are hidden,
-// not lost, and come back with the toggle.
+// without the LLM) in the same space, so the console's layout does not move;
+// the chat's thread and draft stay mounted, hidden, and come back with the
+// toggle. "Why these?" searches the documents the question was asked about
+// and can open its question in Search, whose first run is that same search
+// with the answer's cited chunks marked; Search's "ask about this" comes
+// back to the chat with the next question scoped to that document.
 // =============================================================================
 
 import React, { useEffect, useRef, useState } from 'react';
 import type { CSSProperties } from 'react';
 import { EmptyState, commonStyles } from 'shell';
-import type { ChatPanelProps, IChatSource } from '../contract/types';
+import type { ChatPanelProps as ContractChatPanelProps, IChatSource } from '../contract/types';
 import { useVectorChat } from '../chat/useVectorChat';
 import { threadScrollKey } from '../chat/chatSession';
 import type { ChatTurn } from '../chat/chatSession';
@@ -53,9 +57,17 @@ import { CHAT_MAX_CHARS, summariseSources } from '../vector/chatResult';
 import { showAnswerOnMap } from '../adapters/consoleActions';
 import { SourcesPanel } from './SourcesPanel';
 import { RetrievalDebugger } from './RetrievalDebugger';
-import { SearchPanel } from './SearchPanel';
+import { SHOWING_SEARCH, SearchPanel } from './SearchPanel';
+import type { ChatPrefill } from '../vector/searchWorkbench';
 
-export type { ChatPanelProps };
+/** The contract props plus the surface it opens on (the static render tests show Search with it). */
+export interface ChatPanelProps extends ContractChatPanelProps {
+	/** Open with Search shown instead of the chat (default false). */
+	initialSearch?: boolean;
+}
+
+/** What "Open in Search" hands the SearchPanel: the question, its cited chunks, and the k and documents "Why these?" searched. */
+type SearchPrefill = ChatPrefill;
 
 /** Shown when the connection has no running Chat source. */
 export const NO_CHAT_SENTENCE = 'This pipeline has no running Chat source.';
@@ -80,6 +92,7 @@ const S = {
 	composer: { display: 'flex', gap: 6, alignItems: 'flex-end' } as CSSProperties,
 	textarea: { flex: '1 1 auto', minHeight: 34, maxHeight: 120, resize: 'vertical', fontSize: 13, padding: '6px 8px', borderRadius: 4, border: '1px solid var(--rr-border-input)', background: 'var(--rr-bg-input)', color: 'var(--rr-text-primary)', fontFamily: 'inherit' } as CSSProperties,
 	notice: { fontSize: 12, color: 'var(--rr-text-secondary)', margin: 0 } as CSSProperties,
+	surface: { flex: '1 1 auto', minHeight: 0, overflowY: 'auto' } as CSSProperties,
 };
 
 /** Props of one turn. */
@@ -88,6 +101,7 @@ interface TurnViewProps extends Pick<ChatPanelProps, 'model' | 'channels' | 'sel
 	debugging: boolean;
 	onDebug(open: boolean): void;
 	onStopWaiting(): void;
+	onOpenInSearch(prefill: SearchPrefill): void;
 }
 
 /**
@@ -96,7 +110,7 @@ interface TurnViewProps extends Pick<ChatPanelProps, 'model' | 'channels' | 'sel
  * @param props - {@link TurnViewProps}.
  * @returns The turn.
  */
-function TurnView({ turn, model, channels, selection, actions, debugging, onDebug, onStopWaiting }: TurnViewProps): React.ReactElement {
+function TurnView({ turn, model, channels, selection, actions, debugging, onDebug, onStopWaiting, onOpenInSearch }: TurnViewProps): React.ReactElement {
 	const answer = turn.answer;
 	const sources: readonly IChatSource[] = answer?.sources ?? [];
 	const threshold = model.connection.dialect?.score?.threshold;
@@ -148,7 +162,7 @@ function TurnView({ turn, model, channels, selection, actions, debugging, onDebu
 					</div>
 					{!answer.hasDocumentsLane && <p style={S.line}>This pipeline does not return the chunks it used, so the answer cannot cite them.</p>}
 					{sources.length > 0 && <SourcesPanel sources={sources} score={model.connection.dialect?.score ?? null} onOpen={(source) => actions.openDocument(source.objectId, source.chunkId)} onShowOnMap={(keys) => showAnswerOnMap(selection, actions, turn.question, keys)} />}
-					{debugging && <RetrievalDebugger model={model} channels={channels} question={turn.question} topK={sources.length} answerSources={sources} onClose={() => onDebug(false)} />}
+					{debugging && <RetrievalDebugger model={model} channels={channels} question={turn.question} topK={sources.length} answerSources={sources} scope={turn.scope} onClose={() => onDebug(false)} onOpenInSearch={onOpenInSearch} />}
 				</div>
 			)}
 		</article>
@@ -162,12 +176,14 @@ function TurnView({ turn, model, channels, selection, actions, debugging, onDebu
  * @returns The panel.
  */
 export function ChatPanel(props: ChatPanelProps): React.ReactElement {
-	const { model, channels, selection, actions, scope, onClearScope } = props;
+	const { model, channels, selection, actions, scope, onClearScope, initialSearch = false } = props;
 	const chat = useVectorChat(props);
 	const [draft, setDraft] = useState('');
 	const [recall, setRecall] = useState(-1);
 	const [debugging, setDebugging] = useState<number | null>(null);
-	const [searching, setSearching] = useState(false);
+	const [searching, setSearching] = useState(initialSearch);
+	// Kept with its connection: a Search panel remounted for another identity starts empty.
+	const [prefill, setPrefill] = useState<{ connectionKey: string; value: SearchPrefill } | null>(null);
 	const thread = useRef<HTMLDivElement>(null);
 	const turns = chat.state.turns;
 	const scrollKey = threadScrollKey(turns);
@@ -180,6 +196,16 @@ export function ChatPanel(props: ChatPanelProps): React.ReactElement {
 
 	const available = model.chat.enabled && channels.chat !== null;
 	const llm = model.nodes.llmName;
+
+	/**
+	 * "Open in Search": show Search with the question and its cited chunks.
+	 *
+	 * @param next - The question and the keys its answer cited.
+	 */
+	const openInSearch = (next: SearchPrefill): void => {
+		setPrefill({ connectionKey: model.connectionKey, value: next });
+		setSearching(true);
+	};
 
 	/** Send the draft. */
 	const ask = (): void => {
@@ -223,10 +249,15 @@ export function ChatPanel(props: ChatPanelProps): React.ReactElement {
 					Search
 				</button>
 			</div>
-			<div hidden={!searching} style={{ flex: '1 1 auto', minHeight: 0, overflowY: 'auto' }}>
-				<SearchPanel model={model} channels={channels} selection={selection} actions={actions} />
+			{searching && (
+				<p style={S.notice} role="status">
+					{SHOWING_SEARCH}
+				</p>
+			)}
+			<div hidden={!searching} data-surface="search" style={S.surface}>
+				<SearchPanel key={model.connectionKey} model={model} channels={channels} selection={selection} actions={actions} prefill={prefill !== null && prefill.connectionKey === model.connectionKey ? prefill.value : null} onShowChat={() => setSearching(false)} />
 			</div>
-			<div style={{ display: searching ? 'none' : 'contents' }}>
+			<div data-surface="chat" style={{ display: searching ? 'none' : 'contents' }}>
 				{!available ? (
 					<EmptyState title="Chat is not available" description={model.chat.reason ?? NO_CHAT_SENTENCE} />
 				) : (
@@ -234,7 +265,7 @@ export function ChatPanel(props: ChatPanelProps): React.ReactElement {
 						<div ref={thread} style={S.thread} role="log" aria-label="Questions and answers" aria-live="off">
 							{turns.length === 0 && <p style={S.notice}>Ask a question; the answer cites the stored chunks it used.</p>}
 							{turns.map((turn) => (
-								<TurnView key={turn.id} turn={turn} model={model} channels={channels} selection={selection} actions={actions} debugging={debugging === turn.id} onDebug={(open) => setDebugging(open ? turn.id : null)} onStopWaiting={chat.stopWaiting} />
+								<TurnView key={turn.id} turn={turn} model={model} channels={channels} selection={selection} actions={actions} debugging={debugging === turn.id} onDebug={(open) => setDebugging(open ? turn.id : null)} onStopWaiting={chat.stopWaiting} onOpenInSearch={openInSearch} />
 							))}
 						</div>
 						{scope !== null && scope.length > 0 && (

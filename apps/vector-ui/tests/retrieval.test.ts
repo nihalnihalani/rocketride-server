@@ -38,7 +38,7 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { ExplorerToolError } from 'shared/explorer';
 import type { IChatSource, IDialectResult, ISearchResult } from '../src/contract/types';
-import { DEBUGGER_EXTRA, HISTOGRAM_BINS, classifyRetrieval, debuggerSearchInput, embedErrorSentence, embedInput, retrievalErrorSentence, scoreHistogram } from '../src/vector/retrieval';
+import { DEBUGGER_EXTRA, HISTOGRAM_BINS, classifyRetrieval, debuggerScopeSentence, debuggerSearchInput, debuggerTopK, embedErrorSentence, embedInput, retrievalErrorSentence, scoreHistogram, withScope } from '../src/vector/retrieval';
 
 /**
  * Read a provisional fixture.
@@ -72,6 +72,37 @@ test('debuggerSearchInput: clamps to the node limit and to at least one row', ()
 	assert.equal(debuggerSearchInput([0.1], null, 0, null).top_k, 10);
 	assert.equal(debuggerSearchInput([0.1], null, -5, null).top_k, 10);
 	assert.equal('embedding_model' in debuggerSearchInput([0.1], null, 2, null), false);
+});
+
+test('debuggerTopK: the k debuggerSearchInput asks for, so Search can run the same search', () => {
+	for (const [topK, limits] of [
+		[3, dialect.limits],
+		[0, null],
+		[-5, null],
+		[95, dialect.limits],
+		[2.7, null],
+		[Number.NaN, null],
+	] as const) {
+		assert.equal(debuggerTopK(topK, limits), debuggerSearchInput([0.1], null, topK, limits).top_k, `topK ${topK}`);
+	}
+	assert.equal(debuggerTopK(3, dialect.limits), 13);
+});
+
+test('withScope: the documents the question was asked about go out as filter.objectIds; none means the whole collection', () => {
+	const input = debuggerSearchInput([0.1], null, 3, dialect.limits);
+	const scoped = withScope(input, ['d2', 'd1']);
+	assert.deepEqual(scoped.filter, { objectIds: ['d2', 'd1'] });
+	assert.equal(scoped.vector, input.vector, 'the same vector, not a copy');
+	assert.equal('filter' in input, false, 'the input it was given is left alone');
+	assert.equal('filter' in withScope(input, null), false);
+	assert.equal('filter' in withScope(input, []), false, 'an empty scope would search the whole collection, as the chat does');
+});
+
+test('debuggerScopeSentence: says when "Why these?" searched only the documents the question was asked about', () => {
+	assert.equal(debuggerScopeSentence(null), null);
+	assert.equal(debuggerScopeSentence([]), null);
+	assert.equal(debuggerScopeSentence(['d1']), 'Searched only the document the question was asked about.');
+	assert.equal(debuggerScopeSentence(['d1', 'd2']), 'Searched only the 2 documents the question was asked about.');
 });
 
 test('embedInput: one query text, trimmed and capped', () => {
