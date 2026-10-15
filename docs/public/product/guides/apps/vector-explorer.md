@@ -336,7 +336,12 @@ browser never receives the raw embedding vectors of a sample.
 path, id (with a copy button), chunk count, size, type and ingest time when the
 store keeps them, a note when its first chunk is missing, and its chunks in
 reading order with table chunks tagged. **Show chunk path on map** draws the
-document's chunks in order on the map.
+document's chunks in order on the map. When a query is active (a text query
+placed on the map, or a chat answer shown there), a heat strip above the
+chunks shows how similar each one is to it: the query is embedded by the
+pipeline's embedding node and the store scores the document's chunks against
+it. A chunk the store does not hold has no bar. Without a query, the page says
+how to get one.
 
 ## What the notes mean
 

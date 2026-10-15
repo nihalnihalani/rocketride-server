@@ -29,19 +29,24 @@
 // and the trash button (gated; it asks the console, which confirms). Body:
 // the chunks in reading order, a page of 100 at a time, table chunks tagged,
 // each with its length and "map"; "Show chunk path on map"; a toggle that
-// includes deleted chunks. Calls ride on the connection's anchor channel
-// (Tools, or Chat on a read-only connection).
+// includes deleted chunks; the heat strip, every chunk's similarity to the
+// active query (the map's text query or the chat question shown there:
+// embedded on the embedding node, scored by the store's `neighbors`), or a
+// line saying how to get a query when there is none. Calls ride on the
+// connection's anchor channel (Tools, or Chat on a read-only connection).
 // =============================================================================
 
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { Banner, Button, BxTrash, ContentHeader } from 'shell';
 import type { DocumentViewProps, IChunkItem, IDocumentItem, VectorKey } from '../contract/types';
-import { fetchChunks, fetchDocument } from '../adapters/actions';
+import { fetchChunks, fetchDocument, scoreChunks } from '../adapters/actions';
 import type { IVectorCaller } from '../adapters/actions';
 import HeatStrip from '../components/HeatStrip';
 import SupportBadge from '../components/SupportBadge';
 import { CHUNKS_PAGE } from '../vector/budgets';
 import { fileTypeOf, formatSize } from '../vector/fileType';
+import { HEAT_NO_EMBED, HEAT_NO_QUERY, HEAT_SCORING, heatCaption, heatKeys } from '../vector/heat';
+import type { IHeatScore } from '../vector/heat';
 import { formatCount } from '../vector/stats';
 import { supportOf } from '../vector/support';
 import { failureText } from '../vector/wording';
@@ -62,6 +67,9 @@ interface IChunkState {
 
 const NO_CHUNKS: IChunkState = { items: [], hasMore: false, nextAfter: -1, total: null, loading: false, error: null };
 
+/** The heat strip's answer for one query: the scores, or why there are none. */
+type HeatState = { query: string; scores: IHeatScore[] } | { query: string; error: IFailureText };
+
 /**
  * One document's tab.
  *
@@ -70,11 +78,17 @@ const NO_CHUNKS: IChunkState = { items: [], hasMore: false, nextAfter: -1, total
  */
 export function DocumentView({ model, channels, selection, actions, objectId, path, chunkId }: DocumentViewProps): React.ReactElement {
 	const caller: IVectorCaller | null = channels.tools ?? channels.chat ?? channels.ingest;
+	const embedCaller: IVectorCaller | null = channels.tools ?? channels.chat;
 	const store = model.nodes.store;
+	const embedNode = model.nodes.embed;
+	const embedReady = embedCaller !== null && !!embedNode && model.embed.enabled;
+	const state = useSyncExternalStore(selection.subscribe, selection.getState, selection.getState);
+	const query = state.connectionKey === model.connectionKey ? state.query : null;
 	const [info, setInfo] = useState<IDocumentItem | null>(null);
 	const [infoError, setInfoError] = useState<IFailureText | null>(null);
 	const [withDeleted, setWithDeleted] = useState(false);
 	const [chunks, setChunks] = useState<IChunkState>(NO_CHUNKS);
+	const [heat, setHeat] = useState<HeatState | null>(null);
 	const run = useRef(0);
 
 	const load = useCallback(
@@ -124,8 +138,29 @@ export function DocumentView({ model, channels, selection, actions, objectId, pa
 		if (el && 'scrollIntoView' in el) (el as HTMLElement).scrollIntoView({ block: 'center' });
 	}, [chunkId, chunks.items.length]);
 
+	// The heat strip: every chunk scored against the active query, again when the query changes.
+	const chunkCount = info?.chunks ?? chunks.total ?? chunks.items.length;
+	const scopeMax = model.limits.scope_keys_max;
+	useEffect(() => {
+		if (query === null || !embedReady || caller === null || embedCaller === null || !embedNode || chunkCount <= 0) return undefined;
+		let live = true;
+		scoreChunks({ caller, nodeId: store }, { caller: embedCaller, nodeId: embedNode }, heatKeys(objectId, chunkCount, scopeMax), query).then(
+			(scores) => {
+				if (live) setHeat({ query, scores });
+			},
+			(error) => {
+				const text = failureText(error);
+				if (live && text) setHeat({ query, error: text });
+			}
+		);
+		return () => {
+			live = false;
+		};
+	}, [query, embedReady, caller, embedCaller, embedNode, store, objectId, chunkCount, scopeMax]);
+	const heatNow = heat !== null && heat.query === query ? heat : null;
+
 	const shownPath = info?.path ?? path ?? objectId;
-	const focused = selection.getState().chunk;
+	const focused = state.chunk;
 	const keys: VectorKey[] = chunks.items.map((c) => [objectId, c.chunkId] as const);
 
 	return (
@@ -180,7 +215,22 @@ export function DocumentView({ model, channels, selection, actions, objectId, pa
 						Include deleted chunks
 					</label>
 				</div>
-				<HeatStrip chunks={chunks.total ?? chunks.items.length} scores={[]} focused={focused !== null && focused[0] === objectId ? focused[1] : null} onSelectChunk={(id) => selection.focusChunk([objectId, id])} label="Similarity of each chunk to the query" />
+				{query === null ? (
+					<p style={{ ...styles.small, margin: '4px 0' }}>{HEAT_NO_QUERY}</p>
+				) : !embedReady ? (
+					<p style={{ ...styles.small, margin: '4px 0' }}>{HEAT_NO_EMBED}</p>
+				) : heatNow !== null && 'error' in heatNow ? (
+					<Banner variant="error">{heatNow.error.headline}</Banner>
+				) : heatNow !== null ? (
+					<>
+						<div style={styles.small}>{heatCaption(query)}</div>
+						<HeatStrip chunks={chunkCount} scores={heatNow.scores} focused={focused !== null && focused[0] === objectId ? focused[1] : null} onSelectChunk={(id) => selection.focusChunk([objectId, id])} label="Similarity of each chunk to the query" />
+					</>
+				) : (
+					<p role="status" style={{ ...styles.small, margin: '4px 0' }}>
+						{HEAT_SCORING}
+					</p>
+				)}
 				{chunks.error && <Banner variant="error">{chunks.error.headline}</Banner>}
 				<ol ref={listRef} aria-label="Chunks in reading order" style={{ listStyle: 'none', margin: '12px 0 0', padding: 0 }}>
 					{chunks.items.map((chunk) => (

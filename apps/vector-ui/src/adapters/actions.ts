@@ -31,8 +31,11 @@
 // only, once per batch, never retried (the tool table marks them so).
 // =============================================================================
 
+import { ExplorerToolError } from 'shared/explorer';
 import type { IExplorerClient, IExplorerEndpoint, IEndpointStore, IInvokeOptions } from 'shared/explorer';
-import type { IEmbedResult, VectorChannels } from '../contract/types';
+import type { IEmbedResult, INeighborsScopeResult, VectorChannels, VectorKey } from '../contract/types';
+import { heatScores } from '../vector/heat';
+import type { IHeatScore } from '../vector/heat';
 import { readChunksPage, readDocumentsPage, readRemoveResult, readStats, unwrapEnvelope } from '../vector/results';
 import type { IChunksPageView, IDocumentsPageView, IRemoveView, IStatsView } from '../vector/results';
 import { TOOL } from './explorer';
@@ -137,6 +140,29 @@ export async function removeDocumentsBatch(caller: IVectorCaller, nodeId: string
  */
 export async function embedTexts(caller: IVectorCaller, embedNodeId: string, texts: readonly string[]): Promise<IEmbedResult> {
 	return callVector<IEmbedResult>(caller, embedNodeId, TOOL.embed, { texts: [...texts], kind: 'query' });
+}
+
+/**
+ * Score chunks against a query text: embed it on the embedding node, then send
+ * that exact vector to the store's `neighbors` with the keys as `scope_keys`.
+ * The vector is used for this one call and not kept.
+ *
+ * @param store - The store node and a caller that reaches it.
+ * @param embed - The embedding node and a caller that reaches it.
+ * @param keys - The chunk keys of one document (at most `limits.scope_keys_max`).
+ * @param query - The query text.
+ * @returns The chunks that have a similarity (none for an empty `keys`, without a call).
+ */
+export async function scoreChunks(store: { caller: IVectorCaller; nodeId: string }, embed: { caller: IVectorCaller; nodeId: string }, keys: readonly VectorKey[], query: string): Promise<IHeatScore[]> {
+	if (keys.length === 0) return [];
+	const embedded = await embedTexts(embed.caller, embed.nodeId, [query]);
+	const vector = Array.isArray(embedded.vectors) ? embedded.vectors[0] : undefined;
+	if (!Array.isArray(vector) || vector.length === 0) throw new ExplorerToolError({ kind: 'malformed', tool: TOOL.embed, message: 'The embedding node answered without a vector.' });
+	const answer = await callVector<INeighborsScopeResult>(store.caller, store.nodeId, TOOL.neighbors, { vector, scope_keys: keys.map((key) => [...key]) });
+	return heatScores(
+		keys.map((key) => key[1]),
+		Array.isArray(answer.scores) ? answer.scores : []
+	);
 }
 
 /**

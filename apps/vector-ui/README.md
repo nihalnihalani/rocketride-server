@@ -133,7 +133,9 @@ Opening a connection opens its console, the main screen.
 
 A document tab shows one document: its path, objectId, chunk count, size,
 type and ingest time where the store keeps them, and every chunk in reading
-order.
+order. Once a text query is placed on the map (or a chat answer is shown
+there), its heat strip shows how similar each chunk is to that query; until
+then it says how to get one.
 
 ## The map
 

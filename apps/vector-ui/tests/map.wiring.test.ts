@@ -189,3 +189,10 @@ test('the Table alternative hides the canvas instead of replacing it (the lanes 
 	assert.match(body, /<PointCanvas[\s\S]*?visible=\{visible && !table\}/, 'nothing is drawn (and no context created) while the table shows');
 	assert.match(view, /useState\(initialTable === true\)/, 'initialTable only sets where the toggle starts');
 });
+
+test("the Heat strip tab reads the store's scope scores through heatScores: a chunk the store does not hold has no similarity, not 0", () => {
+	const view = read('views/MapView.tsx');
+	assert.match(view, /import \{ heatScores \} from '\.\.\/vector\/heat';/);
+	assert.match(view, /scores: heatScores\(ids, answer\.value\.scores\)/);
+	assert.doesNotMatch(view, /sim: scores\[t\] as number/, 'a null score was drawn as a similarity');
+});

@@ -77,6 +77,7 @@ import type { IMapPalette } from '../map/tokens';
 import { createLayoutClient } from '../map/workerClient';
 import type { ILayoutClient } from '../map/workerClient';
 import { BUSY, CENTROID_APPROX, LAYOUT_CANCELLED, LAYOUT_NOT_BETTER, LIGHT_POSITIONS, MAP_UNAVAILABLE, QUERY_NEEDS_EMBED, QUERY_PLACED_APPROX, mapFailure, num, pointAnnouncement, sampleLabel } from '../map/wording';
+import { heatScores } from '../vector/heat';
 
 /** Props: the frozen ones plus where the Table toggle starts. */
 export interface MapViewProps extends ContractMapViewProps {
@@ -782,8 +783,7 @@ export function MapView(props: MapViewProps): React.ReactElement {
 				if (!answer.ok && !answer.stale) setNotice(mapFailure(answer.code, answer.message));
 				return;
 			}
-			const scores = answer.value.scores;
-			setHeat({ objectId: doc.objectId, chunks: Math.max(ids.length, (doc.chunks ?? 0)), scores: ids.map((c, t) => ({ chunkId: c, sim: scores[t] as number })) });
+			setHeat({ objectId: doc.objectId, chunks: Math.max(ids.length, (doc.chunks ?? 0)), scores: heatScores(ids, answer.value.scores) });
 		});
 		return () => {
 			live = false;

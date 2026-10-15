@@ -58,6 +58,7 @@ const REQUIRED_TESTS = [
 	'vector.wording.test.ts',
 	'vector.identity-change.test.ts',
 	'vector.wiring.test.ts',
+	'vector.heat.test.ts',
 	'builder.e2e.test.ts',
 	'a11y.contrast.test.ts',
 	// The live wire captures (tests/fixtures/v1/live) through the same readers.
