@@ -1514,7 +1514,8 @@
   {
     "name": "rocketride_vector",
     "classType": [
-      "store"
+      "store",
+      "tool"
     ],
     "lanes": {
       "documents": [],
