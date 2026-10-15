@@ -40,9 +40,58 @@ const ACCEPTANCE_BROWSER_DIR = path.join(ACCEPTANCE_DIR, 'browser');
 
 // Suites that must exist for the gate to mean anything. A missing file here is
 // a broken checkout or a deleted suite, not an app "without tests", so the
-// gate fails instead of running whatever happens to be left. Suites not listed
-// here (the map's, the chat's and the uploads') run as well.
-const REQUIRED_TESTS = ['scaffold.test.ts', 'templates.test.ts', 'adapter.test.ts', 'vector.results.test.ts', 'vector.documents.test.ts', 'vector.objectId.grep.test.ts', 'vector.stats.test.ts', 'vector.connections.test.ts', 'vector.confirm.test.ts', 'vector.console.test.ts', 'vector.fileType.test.ts', 'vector.wording.test.ts', 'vector.identity-change.test.ts', 'vector.wiring.test.ts', 'builder.e2e.test.ts', 'a11y.contrast.test.ts'];
+// gate fails instead of running whatever happens to be left. Every suite in
+// tests/ is listed; a new one runs as soon as it is added and belongs here too.
+const REQUIRED_TESTS = [
+	// The console: scaffold, adapter, directory, stats, connections, wording and wiring.
+	'scaffold.test.ts',
+	'templates.test.ts',
+	'adapter.test.ts',
+	'vector.results.test.ts',
+	'vector.documents.test.ts',
+	'vector.objectId.grep.test.ts',
+	'vector.stats.test.ts',
+	'vector.connections.test.ts',
+	'vector.confirm.test.ts',
+	'vector.console.test.ts',
+	'vector.fileType.test.ts',
+	'vector.wording.test.ts',
+	'vector.identity-change.test.ts',
+	'vector.wiring.test.ts',
+	'builder.e2e.test.ts',
+	'a11y.contrast.test.ts',
+	// The map: renderer, picking, layouts, projection, quality and contrast.
+	'map.components.test.tsx',
+	'map.view.test.tsx',
+	'map.contract.test.ts',
+	'map.model.test.ts',
+	'map.picking.test.ts',
+	'map.renderer.test.ts',
+	'map.interaction.test.ts',
+	'map.wiring.test.ts',
+	'map.colours.test.ts',
+	'map.perflane.test.ts',
+	'layout.core.test.ts',
+	'layout.worker.test.ts',
+	'tsne.core.test.ts',
+	'projection.test.ts',
+	'quality.knnOverlap.test.ts',
+	'a11y.contrast.map.test.ts',
+	// Uploads and chat.
+	'uploads.test.ts',
+	'ingest.queue.test.ts',
+	'dropTraversal.test.ts',
+	'objectId.test.ts',
+	'sha1.test.ts',
+	'chat.session.test.ts',
+	'chat.registry.test.ts',
+	'chatResult.test.ts',
+	'retrieval.test.ts',
+	'markdown.test.ts',
+	'toolCalls.test.ts',
+	'chatIngest.render.test.ts',
+	'chatIngest.wiring.test.ts',
+];
 
 const mod = createAppModule({
 	name: 'vector-ui',
