@@ -420,3 +420,62 @@ test('another connection starts a fresh duplicates queue (its choices are keyed 
 	assert.equal(a.key, 'conn-a');
 	assert.equal(b.key, 'conn-b');
 });
+
+// =============================================================================
+// THE MAP'S WIRING (the host passes the values; checked once both sides are merged)
+// =============================================================================
+
+/** The source of a src file, comments stripped. */
+function source(rel: string): string {
+	const fs = require('node:fs') as typeof import('node:fs');
+	const path = require('node:path') as typeof import('node:path');
+	return fs
+		.readFileSync(path.resolve(__dirname, '..', 'src', rel), 'utf8')
+		.replace(/\/\*[\s\S]*?\*\//g, '')
+		.replace(/^\s*\/\/.*$/gm, '');
+}
+
+/** The JSX element `<Name ... />` in a source (up to its first self-closing end). */
+function element(text: string, name: string): string {
+	const found = new RegExp(`<${name}\\b[\\s\\S]*?\\/>`).exec(text);
+	assert.ok(found, `<${name}> in the source`);
+	return found[0];
+}
+
+const NEEDS_MAP = 'NEEDS:E5 merged — integration gate G2';
+
+test('the map hands the duplicates queue its connection, the console rows and the batched, confirmed removal', { skip: NEEDS_MAP }, () => {
+	const panel = element(source('views/MapView.tsx'), 'DuplicatesPanel');
+	for (const prop of ['connectionKey=', 'documents=', 'onRemoveDocuments=', 'onOpenDocument=']) assert.ok(panel.includes(prop), prop);
+	assert.match(panel, /onRemoveDocuments=\{[^}]*requestRemove\(/);
+	assert.doesNotMatch(panel, /\.slice\(0, limits\.write_ids_max\)/, 'the queue is never cut to write_ids_max');
+});
+
+test('the map hands the outlier review its connection, writes, the confirmed removal and Show neighbours', { skip: NEEDS_MAP }, () => {
+	const panel = element(source('views/MapView.tsx'), 'OutliersPanel');
+	for (const prop of ['connectionKey=', 'writes=', 'onRemoveDocument=', 'onShowNeighbours=']) assert.ok(panel.includes(prop), prop);
+	assert.match(panel, /onRemoveDocument=\{[^}]*requestRemove\(\[/);
+});
+
+test("the map runs Recommend through runRecommendCall and keeps the examples in the connection's cache", { skip: NEEDS_MAP }, () => {
+	const view = source('views/MapView.tsx');
+	assert.match(element(view, 'RecommendPanel'), /onRun=\{[\s\S]*runRecommendCall\(/);
+	assert.match(view, /recallExamples\(recommendExamples, /);
+	assert.match(view, /rememberExamples\(recommendExamples, /);
+	assert.doesNotMatch(view, /callRecommend\(/, 'the one call path is map/recommend.ts');
+});
+
+test('the inspector gets the text loader, the query, Add as example with its side, and the tree neighbours', { skip: NEEDS_MAP }, () => {
+	const inspector = element(source('views/MapView.tsx'), 'PointInspector');
+	for (const prop of ['loadText=', 'query=', 'onAddExample=', 'examplePolarity=', 'treeNeighbours=']) assert.ok(inspector.includes(prop), prop);
+	assert.match(inspector, /fetchChunkText\(/);
+});
+
+test('the matrix can show its pair on the map and hand its rows to the export', { skip: NEEDS_MAP }, () => {
+	const matrix = element(source('views/MapView.tsx'), 'SimilarityMatrix');
+	for (const prop of ['onShowPair=', 'onExport=']) assert.ok(matrix.includes(prop), prop);
+});
+
+test("the Points table numbers each point by the duplicates queue's group", { skip: NEEDS_MAP }, () => {
+	assert.match(source('components/PointsTable.tsx'), /duplicateGroupOf\(|groupOf\(\s*\[\s*\.\.\.view\.groups/);
+});
