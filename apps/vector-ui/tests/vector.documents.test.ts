@@ -240,3 +240,16 @@ test('a store that cannot page ends the listing with its caveat; one that lists 
 		['C:/demo/field/', 'C:/demo/handbooks/', 'Uploaded', 'Needs attention (1)']
 	);
 });
+
+test("the directory's export: the documents columns, each row the directory's own words and numbers, nothing else the store sent", () => {
+	const { documentExportRows } = require('../src/vector/documents') as typeof import('../src/vector/documents');
+	const { EXPORT_COLUMNS } = require('../src/contract/types') as typeof import('../src/contract/types');
+	const items = readDocumentsPage(fixture('documents_filter_server')).items;
+	const out = documentExportRows([{ ...items[0], embedding: [0.1, 0.2], token: 'secret' } as unknown as IDocumentItem, items[1] as IDocumentItem]);
+	assert.deepEqual(out.columns, EXPORT_COLUMNS.documents);
+	assert.equal(out.rows.length, 2);
+	assert.deepEqual(Object.keys(out.rows[0] as object), [...EXPORT_COLUMNS.documents]);
+	assert.deepEqual(out.rows[0], { objectId: items[0]?.objectId, path: 'C:/demo/greenhouse/orchid_notes.pdf', chunks: 6, has_first_chunk: true, tables: 0, size: 181220, ingestedAt: '2026-10-08T18:20:11Z', deleted_chunks: 0, max_chunk_id: 5 });
+	assert.doesNotMatch(JSON.stringify(out), /secret|embedding/);
+	assert.equal(documentExportRows([doc('a', 'a.md')]).rows[0]?.deleted_chunks, null, 'not reported: empty, not 0');
+});
