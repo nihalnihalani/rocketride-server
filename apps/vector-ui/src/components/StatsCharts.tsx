@@ -37,7 +37,7 @@
 // coloured. Under 140 px each.
 // =============================================================================
 
-import React from 'react';
+import React, { useMemo } from 'react';
 import type { CSSProperties } from 'react';
 import type { IDocumentsFilter, StatsChartsProps as ContractStatsChartsProps } from '../contract/types';
 import { collectionCharts } from '../vector/charts';
@@ -202,7 +202,8 @@ function Chart({ chart, scope, onScope }: { chart: IChart; scope: IDocumentsFilt
  * @returns The section.
  */
 export function StatsCharts({ rows, total = null, sample = null, dialect = null, onScope, loading = false, scope = null }: StatsChartsProps): React.ReactElement {
-	const charts = collectionCharts({ rows, total, sample, dialect, loading });
+	// Re-binned only when what the charts read changes (a page, the sample), not on the strip's clock.
+	const charts = useMemo(() => collectionCharts({ rows, total, sample, dialect, loading }), [rows, total, sample, dialect, loading]);
 	if (rows.length === 0 && !loading && sample === null) {
 		return (
 			<section aria-label="Collection charts" data-component="StatsCharts">
