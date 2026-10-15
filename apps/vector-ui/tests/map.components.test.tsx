@@ -18,9 +18,10 @@ import path from 'node:path';
 import { test } from 'node:test';
 import React from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
+import { ClustersPanel } from '../src/components/ClustersPanel';
 import { DuplicatesPanel } from '../src/components/DuplicatesPanel';
 import { HeatStrip } from '../src/components/HeatStrip';
-import { Legend } from '../src/components/Legend';
+import { LEGEND_CLUSTERS, Legend } from '../src/components/Legend';
 import { MapToolbar } from '../src/components/MapToolbar';
 import { NeighbourList } from '../src/components/NeighbourList';
 import { OutliersPanel } from '../src/components/OutliersPanel';
@@ -29,10 +30,12 @@ import { PointInspector } from '../src/components/PointInspector';
 import { PointsTable } from '../src/components/PointsTable';
 import { createSelectionStore } from '../src/contract/bridge';
 import type { INeighborsResult, ISampleResult, IVectorLimits, VectorKey } from '../src/contract/types';
-import { colourPoints } from '../src/map/colours';
+import { clusterLabel, clusterRows, clusterSentence, clusterView } from '../src/map/clusters';
+import { clusterColours, colourPoints } from '../src/map/colours';
+import { isolateMask } from '../src/map/isolate';
 import { readPalette } from '../src/map/tokens';
 import { SelectionTab } from '../src/views/MapView';
-import { loadSample, modelOf, pcaXY } from './support/map.samples';
+import { deepFreeze, loadSample, modelOf, pcaXY } from './support/map.samples';
 
 const FIX = path.resolve(__dirname, 'fixtures', 'provisional');
 const neighbours = JSON.parse(fs.readFileSync(path.join(FIX, 'neighbors_key.json'), 'utf8')) as INeighborsResult;
@@ -215,4 +218,101 @@ test('a pressed toggle restyles its border with the same shorthand as an unpress
 		assert.match(tag, /border:1px solid/, `the ${pressed ? 'pressed' : 'unpressed'} Lasso sets the border shorthand`);
 		assert.doesNotMatch(tag, /border-color/, `the ${pressed ? 'pressed' : 'unpressed'} Lasso mixes in border-color`);
 	}
+});
+
+// -----------------------------------------------------------------------------
+// Clusters tab, the toolbar's edges and colour groups, the legend by cluster,
+// the table's Cluster column and isolation, the edge layer's canvas
+// -----------------------------------------------------------------------------
+
+const clustered = deepFreeze(JSON.parse(fs.readFileSync(path.join(FIX, 'sample_demo_1000_clusters.json'), 'utf8')) as ISampleResult);
+const clusteredModel = modelOf(clustered);
+const view5 = clusterView(clustered.clusters!, 5);
+
+/** The Clusters tab's props over the clusters fixture. */
+function clustersProps(extra: Partial<React.ComponentProps<typeof ClustersPanel>> = {}): React.ComponentProps<typeof ClustersPanel> {
+	return { sample: clusteredModel, minSize: 5, view: view5, colours: clusterColours(view5.count, palette).map((c) => c.colour), chat: { enabled: true, reason: null }, clustersOffered: true, maxDocuments: 2000, ...extra };
+}
+
+test('ClustersPanel renders the clusters fixture: one row per group of at least 5, largest first, labelled by its terms, with Show, Ask about these and Export, and a Noise row', () => {
+	const out = html(<ClustersPanel {...clustersProps({ exportItemOf: (g) => ({ id: `c${g}`, label: `Cluster ${g + 1}`, kind: 'clusters', disabled: null }), collection: 'vx_demo_docs' })} />);
+	assert.doesNotMatch(/<section[^>]*data-component="ClustersPanel"[^>]*>/.exec(out)?.[0] ?? '', /data-placeholder/, 'the panel is built');
+	assert.equal((out.match(/data-cluster="\d+"/g) ?? []).length, view5.count);
+	assert.match(out, /data-cluster="noise"/);
+	assert.match(out, new RegExp(`${view5.count} clusters, ${view5.noise} unassigned points`));
+	assert.ok(out.includes(clusterLabel(view5, 0)), 'the largest group\'s terms');
+	assert.match(out, /aria-label="Minimum size"/);
+	assert.match(out, /<option value="2">2<\/option><option value="5" selected="">5<\/option><option value="10">10<\/option>/);
+	assert.match(out, /Clusters: connected groups of the sample&#x27;s neighbour graph above similarity 0\.70/);
+	assert.equal((out.match(/>Show<\/button>/g) ?? []).length, view5.count);
+	assert.equal((out.match(/>Ask about these<\/button>/g) ?? []).length, view5.count);
+	assert.equal((out.match(/data-component="ExportMenu"/g) ?? []).length, view5.count, 'one export menu per cluster');
+	// The greenhouse folder's group is labelled with its own words.
+	assert.ok(view5.keywords.some((k) => k.includes('orchid')), 'a group labelled with "orchid"');
+});
+
+test('ClustersPanel actions: Minimum size, Show (isolate), Ask about these (its documents), highlight; Ask is off with a reason when the chat is off or a group spans too many documents', () => {
+	const asked: Array<readonly string[]> = [];
+	const sizes: number[] = [];
+	const shown: number[] = [];
+	const tree = ClustersPanel(clustersProps({ onMinSize: (s) => sizes.push(s), onShow: (g) => shown.push(g), onAskAbout: (ids) => asked.push(ids) }));
+	const select = elements(tree).find((el) => el.type === 'select') as React.ReactElement<{ onChange(e: { target: { value: string } }): void }>;
+	select.props.onChange({ target: { value: '2' } });
+	assert.deepEqual(sizes, [2]);
+	const buttons = elements(tree).filter((el) => el.type === 'button') as Array<React.ReactElement<{ onClick(): void; children?: unknown; disabled?: boolean }>>;
+	buttons.find((b) => b.props.children === 'Show')!.props.onClick();
+	assert.deepEqual(shown, [0]);
+	buttons.find((b) => b.props.children === 'Ask about these')!.props.onClick();
+	const first = clusterRows(clustered, view5).rows[0]!;
+	assert.deepEqual(asked[0], first.documents);
+	const off = ClustersPanel(clustersProps({ chat: { enabled: false, reason: 'The chat needs an LLM node.' } }));
+	assert.ok((elements(off).filter((el) => el.type === 'button' && (el.props as { children?: unknown }).children === 'Ask about these') as Array<React.ReactElement<{ disabled?: boolean }>>).every((b) => b.props.disabled === true));
+	const capped = html(<ClustersPanel {...clustersProps({ maxDocuments: 1 })} />);
+	assert.match(capped, /Too many documents to ask about \(\d+; at most 1\)/);
+});
+
+test('ClustersPanel states: an older node, a node whose sample has none, no group of the minimum size, and an isolated map with Show all and Expand', () => {
+	const old = modelOf(loadSample('sample_demo_1000.json'));
+	assert.match(html(<ClustersPanel sample={old} view={null} clustersOffered={false} />), /This store node does not compute clusters; update the node\./);
+	assert.match(html(<ClustersPanel sample={old} view={null} clustersOffered />), /drawn without clusters; draw a new sample/);
+	const tiny = clusterView({ ...clustered.clusters!, sizes: clustered.clusters!.sizes.map(() => 2) }, 10);
+	assert.match(html(<ClustersPanel {...clustersProps({ minSize: 10, view: tiny })} />), /No groups of 10 or more at this similarity; the sample is evenly spread\./);
+	const isolated = html(<ClustersPanel {...clustersProps({ isolated: { shown: 212, n: 1000 } })} />);
+	assert.match(isolated, /Showing 212 of 1,000/);
+	assert.match(isolated, />Expand by neighbours<\/button>/);
+	assert.match(isolated, />Show all<\/button>/);
+});
+
+test('Legend coloured by cluster: the 12 largest groups by name, the noise row, and how many more the Clusters tab lists', () => {
+	const colouring = colourPoints(clustered, 'cluster', palette, { clusters: view5 });
+	const out = html(<Legend sample={clusteredModel} colourBy="cluster" pointCap={2000} backend="pgvector" colouring={colouring} notes={[clusterSentence(clustered.clusters!, 5)]} />);
+	assert.equal((out.match(/<li/g) ?? []).length, LEGEND_CLUSTERS + 1);
+	assert.match(out, /Unassigned \(in no group\)/);
+	assert.match(out, new RegExp(`and ${view5.count - LEGEND_CLUSTERS} more groups, each with its own colour \\(the Clusters tab lists them all\\)`));
+	assert.match(out, /Clusters: connected groups/);
+});
+
+test('PointsTable: a Cluster column with the group\'s words, duplicate groups in Notes, and only the points the map shows (an isolation of 40 lists 40)', () => {
+	const groupsOf = new Int32Array(clustered.n).fill(-1);
+	groupsOf[0] = 2;
+	const out = html(<PointsTable sample={clusteredModel} querySims={null} selected={null} onSelect={noop} clusters={view5} duplicateGroups={groupsOf} />);
+	assert.match(out, /<th scope="col"[^>]*>Cluster<\/th>/);
+	const g = view5.labels[0] as number;
+	assert.ok(out.includes(g >= 0 ? `${g + 1}: ${clusterLabel(view5, g)}` : '>none<'), 'point 1\'s cluster');
+	assert.match(out, /duplicate group 3/);
+	const keep = Array.from({ length: 40 }, (_, i) => i * 7);
+	const isolated = html(<PointsTable sample={clusteredModel} querySims={null} selected={null} onSelect={noop} hidden={isolateMask(clustered.n, keep)} />);
+	assert.match(isolated, /Rows 1–40 of 40/);
+	assert.match(html(<PointsTable sample={clusteredModel} querySims={null} selected={null} onSelect={noop} hidden={null} />), /Rows 1–100 of 1,000/);
+});
+
+test('PointCanvas: the edge layer is its own canvas under the points and the overlay', () => {
+	const out = html(<PointCanvas sample={demo} positions={pcaXY(demo.result)} dimensions={2} colours={[]} selection={createSelectionStore()} lasso={false} onHover={noop} onPick={noop} onLasso={noop} />);
+	const canvases = [...out.matchAll(/<canvas[^>]*>/g)].map((m) => m[0]);
+	assert.equal(canvases.length, 3);
+	assert.match(canvases[0] as string, /data-layer="edges"/);
+	assert.match(canvases[0] as string, /pointer-events:none/);
+	assert.match(canvases[0] as string, /transition:opacity 250ms/);
+	const reduced = html(<PointCanvas sample={demo} positions={pcaXY(demo.result)} dimensions={2} colours={[]} selection={createSelectionStore()} lasso={false} onHover={noop} onPick={noop} onLasso={noop} reducedMotion />);
+	assert.match(reduced, /<canvas[^>]*transition:none[^>]*data-layer="edges"/, 'no fade-in under reduced motion');
 });

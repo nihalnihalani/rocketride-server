@@ -263,3 +263,19 @@ export function chatQueryPlan(state: { told: string | null; mapQuery: string | n
 	if (!state.embedReady || state.told === null || state.told === '') return 'centroid';
 	return state.told === state.mapQuery ? 'keep' : 'run';
 }
+
+/**
+ * Which questions a Search Compare highlight places. Search tells the map both
+ * questions before it highlights both result lists (`showCompareOnMap` in
+ * src/adapters/consoleActions.ts sets the selection's `query` and `queryB`
+ * first), so they are there when the highlight lands: A becomes the map's query
+ * (★) and B a second, hollow star (☆). A question already placed is not
+ * embedded again; without an embedding node nothing is placed.
+ *
+ * @param state - The questions Search told the map, the ones the map placed, embed reachability.
+ * @returns Whether to place A and B.
+ */
+export function comparePlan(state: { told: string | null; toldB: string | null; mapQuery: string | null; mapQueryB: string | null; embedReady: boolean }): { runA: boolean; runB: boolean } {
+	if (!state.embedReady || state.told === null || state.told === '' || state.toldB === null || state.toldB === '') return { runA: false, runB: false };
+	return { runA: state.told !== state.mapQuery, runB: state.toldB !== state.mapQueryB };
+}

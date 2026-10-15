@@ -53,8 +53,20 @@
 //   data-overlap-pca / data-overlap-layout   kNN overlaps (4 dp), '' before a run
 // and, written by each frame (what it DREW, not what was asked):
 //   data-star ('1'/'0'), data-rays, data-links, data-chunk-path,
+//   data-star-b ('1'/'0'), data-rays-b, data-labels (cluster labels),
+//   data-edges (segments of the edge layer's last redraw), data-edge-strokes,
 //   data-draw-count (frames drawn so far), data-camera, data-draw-p95.
 // The hover box is role="tooltip" (data-map-tooltip holds the point index).
+//
+// The similarity edges (Neighbours or Tree) have their own canvas UNDER the
+// points, redrawn only when the camera, the size or the edge set changes (in
+// 2D the paths are built once per edge set, in layout units, and stroked
+// through the camera's transform: map/overlay.ts). They fade in unless reduced
+// motion is asked for. When two frames that drew edges each take over 33 ms,
+// onSlowEdges is called once per edge set (the view may draw fewer). Hovering
+// a point thickens its edges; hovering a cluster label rings its points.
+// onSnapshotter receives the function the map's PNG uses: it copies the edge
+// layer, the points (the renderer's snapshot) and the overlay, in that order.
 // =============================================================================
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
@@ -66,8 +78,11 @@ import { opaqueOver, parseColor } from '../map/contrast';
 import { createFrameStats, createGesture, keyAction, wheelZoomFactor } from '../map/interaction';
 import type { KeyAction } from '../map/interaction';
 import { lassoSelect, simplifyPath } from '../map/lasso';
-import { drawOverlay, overlayDataset } from '../map/overlay';
-import type { IOverlayDrawn, IOverlayModel, IPlace } from '../map/overlay';
+import { incidentEdges } from '../map/graph';
+import type { IEdgeSet } from '../map/graph';
+import { buildEdgePaths, drawExtras, drawOverlay, edgeBuckets, edgeTransform2d, extrasDataset, overlayDataset, strokeEdgePaths } from '../map/overlay';
+import type { IClusterLabel, IExtrasDrawn, IOverlayDrawn, IOverlayModel, IPlace } from '../map/overlay';
+import type { IStar } from '../map/queryProjection';
 import { buildScreenIndex, nearestInSector, pickNearest } from '../map/picking';
 import type { IScreenIndex } from '../map/picking';
 import { createCanvas2dRenderer } from '../map/renderer.canvas2d';
@@ -115,10 +130,53 @@ export interface PointCanvasProps extends ContractPointCanvasProps {
 	selectionCount?: number | null;
 	/** kNN overlaps of the last refined layout and of PCA (data-overlap-layout / data-overlap-pca), or null before a run. */
 	overlap?: { layout: number | null; pca: number | null } | null;
+	/** Similarity edges drawn under the points (none when absent). */
+	edges?: IEdgeSet | null;
+	/** The compared question's star (B) and its rays. */
+	starB?: IStar | null;
+	raysB?: IOverlayModel['rays'];
+	/** Cluster labels, largest groups first (drawn at their medoids). */
+	clusterLabels?: readonly IClusterLabel[];
+	/** Each point's cluster (-1: none), so hovering a label rings its points. */
+	clusterOf?: ArrayLike<number> | null;
+	/** No fade-in of the edges. */
+	reducedMotion?: boolean;
+	/** Two frames that drew edges took over 33 ms each (called once per edge set). */
+	onSlowEdges?(): void;
+	/**
+	 * Receives the PNG's copy function while a renderer runs (null when it is let go): it returns a new canvas
+	 * at the map's backing size holding the edge layer, the points and the overlay, or null when the map is
+	 * not drawn (a lost context).
+	 */
+	onSnapshotter?(snapshot: (() => HTMLCanvasElement | null) | null): void;
+	/** Put the camera here (a saved view; a new `seq` each time). */
+	cameraOverride?: { camera: MapCamera; seq: number } | null;
 }
+
+/** Labels hide below this fraction of the fitted zoom. */
+export const LABEL_MIN_ZOOM = 0.6;
+
+/** A frame slower than this counts towards dropping edges. */
+const SLOW_FRAME_MS = 33;
 
 /** Nothing drawn (no overlay context). */
 const NOTHING_DRAWN: IOverlayDrawn = { star: false, rays: 0, links: 0, chunkPath: 0 };
+const NO_EXTRAS_DRAWN: IExtrasDrawn = { starB: false, raysB: 0, labels: 0, boxes: [], hoverEdges: 0 };
+
+/** The edge layer's cached paths and what they were built from. */
+interface IEdgeCache {
+	edges: IEdgeSet | null;
+	positions: Float32Array | null;
+	dims: number;
+	/** World-space paths (2D); rebuilt per frame in 3D. */
+	paths: Array<Path2D | null>;
+	segments: number;
+	/** camera|size|dpr|colour of the last redraw ('' forces one). */
+	drawnKey: string;
+	/** Frames over SLOW_FRAME_MS that drew edges, and whether onSlowEdges was called for this set. */
+	slow: number;
+	fired: boolean;
+}
 
 /** An overlap for its data attribute: 4 decimals, '' when there is none. */
 const overlapAttr = (value: number | null | undefined): string => (typeof value === 'number' && Number.isFinite(value) ? value.toFixed(4) : '');
@@ -154,7 +212,12 @@ function rgbaOf(colours: readonly string[]): Uint8Array {
 export function PointCanvas(props: PointCanvasProps): React.ReactElement {
 	const containerRef = useRef<HTMLDivElement>(null);
 	const canvasRef = useRef<HTMLCanvasElement>(null);
+	const edgeRef = useRef<HTMLCanvasElement>(null);
 	const overlayRef = useRef<HTMLCanvasElement>(null);
+	const edgeCacheRef = useRef<IEdgeCache>({ edges: null, positions: null, dims: 2, paths: [], segments: 0, drawnKey: '', slow: 0, fired: false });
+	const fitScaleRef = useRef<number | null>(null);
+	const labelBoxesRef = useRef<IExtrasDrawn['boxes']>([]);
+	const hoveredClusterRef = useRef<number | null>(null);
 	const rendererRef = useRef<IPointRenderer | null>(null);
 	const cameraRef = useRef<MapCamera | null>(null);
 	const sizeRef = useRef({ width: 0, height: 0, dpr: 1 });
@@ -214,8 +277,71 @@ export function PointCanvas(props: PointCanvasProps): React.ReactElement {
 		else {
 			const bounds = boundsOf(p.positions, 2, p.hidden ?? null);
 			cameraRef.current = bounds ? fitCamera(bounds, vp, 28) : { mode: '2d', cx: 0, cy: 0, scale: 1 };
+			fitScaleRef.current = cameraRef.current.scale;
 		}
 		if (p.cameraKey) rememberCamera(p.cameraKey, cameraRef.current);
+	}, []);
+
+	/**
+	 * Redraw the edge layer when the camera, the size, the colour or the edge set changed.
+	 *
+	 * @returns True when it drew (the frame counts towards the slow-frame rule).
+	 */
+	const drawEdges = useCallback((camera: MapCamera, vp: IViewport): boolean => {
+		const canvas = edgeRef.current;
+		const ctx = canvas ? canvas.getContext('2d') : null;
+		if (!canvas || !ctx) return false;
+		const p = propsRef.current;
+		const edges = p.edges ?? null;
+		const cache = edgeCacheRef.current;
+		const size = sizeRef.current;
+		const colour = coloursRef.current.overlay.other;
+		const positions = dataRef.current.positions;
+		if (cache.edges !== edges) {
+			cache.slow = 0;
+			cache.fired = false;
+		}
+		const rebuild = cache.edges !== edges || cache.positions !== positions || camera.mode === '3d';
+		const key = `${cameraSignature(camera)}|${size.width}x${size.height}@${size.dpr}|${colour}`;
+		if (!rebuild && key === cache.drawnKey) return false;
+		ctx.setTransform(1, 0, 0, 1, 0, 0);
+		ctx.clearRect(0, 0, canvas.width, canvas.height);
+		cache.drawnKey = key;
+		if (edges === null || edges.count === 0) {
+			cache.edges = edges;
+			cache.positions = positions;
+			cache.paths = [];
+			cache.segments = 0;
+			return false;
+		}
+		const makePath = (): Path2D => new Path2D();
+		if (camera.mode === '2d') {
+			if (rebuild) {
+				// Layout units (x, y of the packed points): built once per edge set and stroked through the camera.
+				const built = buildEdgePaths(edges, edgeBuckets(edges), (i) => (i < dataRef.current.count ? [positions[3 * i] as number, positions[3 * i + 1] as number] : null), makePath);
+				cache.paths = built.paths;
+				cache.segments = built.segments;
+			}
+			const t = edgeTransform2d(camera, vp, size.dpr);
+			ctx.setTransform(t.a, t.b, t.c, t.d, t.e, t.f);
+			strokeEdgePaths(ctx, cache.paths, colour, t.lineWidth);
+		} else {
+			const xy = screenRef.current.xy;
+			const hidden = p.hidden ?? null;
+			const built = buildEdgePaths(edges, edgeBuckets(edges), (i) => {
+				if (hidden && hidden[i]) return null;
+				const x = xy[2 * i] as number;
+				const y = xy[2 * i + 1] as number;
+				return Number.isFinite(x) && Number.isFinite(y) ? [x, y] : null;
+			}, makePath);
+			cache.paths = built.paths;
+			cache.segments = built.segments;
+			ctx.setTransform(size.dpr, 0, 0, size.dpr, 0, 0);
+			strokeEdgePaths(ctx, cache.paths, colour, 1);
+		}
+		cache.edges = edges;
+		cache.positions = positions;
+		return true;
 	}, []);
 
 	/** Draw one frame now. */
@@ -241,6 +367,7 @@ export function PointCanvas(props: PointCanvasProps): React.ReactElement {
 		const overlay = overlayRef.current;
 		const ctx = overlay ? overlay.getContext('2d') : null;
 		let drawn = NOTHING_DRAWN;
+		let extras = NO_EXTRAS_DRAWN;
 		if (ctx && overlay) {
 			ctx.setTransform(1, 0, 0, 1, 0, 0);
 			ctx.clearRect(0, 0, overlay.width, overlay.height);
@@ -278,19 +405,42 @@ export function PointCanvas(props: PointCanvasProps): React.ReactElement {
 				pulse: o.pulse ?? 0,
 			};
 			drawn = drawOverlay(ctx, model, screenOf, placeOf, coloursRef.current.overlay, size.dpr);
+			const edgesNow = p.edges ?? null;
+			const hovered = hoveredRef.current;
+			const hoverEdges: Array<[number, number]> = hovered !== null && edgesNow !== null ? incidentEdges(edgesNow, hovered).map((e) => [edgesNow.a[e] as number, edgesNow.b[e] as number]) : [];
+			const cluster = hoveredClusterRef.current;
+			const clusterOf = p.clusterOf ?? null;
+			const clusterHighlight: number[] = [];
+			if (cluster !== null && clusterOf !== null) for (let i = 0; i < points.count; i += 1) if (clusterOf[i] === cluster) clusterHighlight.push(i);
+			const fitScale = fitScaleRef.current;
+			const showLabels = camera.mode === '3d' || fitScale === null || camera.scale >= LABEL_MIN_ZOOM * fitScale;
+			extras = drawExtras(ctx, { starB: p.starB ?? null, raysB: p.raysB ?? [], hoverEdges, labels: [...(p.clusterLabels ?? [])], showLabels, clusterHighlight }, screenOf, placeOf, coloursRef.current.overlay);
+			labelBoxesRef.current = extras.boxes;
 		}
+		const edgesDrawn = drawEdges(camera, vp);
 		const ended = typeof performance !== 'undefined' ? performance.now() : Date.now();
 		statsRef.current.record(ended - started);
 		drawCountRef.current += 1;
+		const cache = edgeCacheRef.current;
+		if (edgesDrawn && ended - started > SLOW_FRAME_MS) {
+			cache.slow += 1;
+			if (cache.slow >= 2 && !cache.fired) {
+				cache.fired = true;
+				p.onSlowEdges?.();
+			}
+		}
 		const el = containerRef.current;
 		if (el) {
 			// What this frame drew, for the browser lanes (React never renders these attributes).
 			Object.assign(el.dataset, overlayDataset(drawn));
+			Object.assign(el.dataset, extrasDataset(extras));
+			el.dataset.edges = String(cache.segments);
+			el.dataset.edgeStrokes = String(cache.paths.filter((path) => path !== null).length);
 			el.dataset.drawCount = String(drawCountRef.current);
 			el.dataset.camera = cameraSignature(camera);
 			if (statsRef.current.count() % 30 === 0) el.dataset.drawP95 = String(Math.round((statsRef.current.p95() ?? 0) * 10) / 10);
 		}
-	}, [fit]);
+	}, [fit, drawEdges]);
 
 	/** Ask for a frame (coalesced). */
 	const requestDraw = useCallback((): void => {
@@ -337,6 +487,7 @@ export function PointCanvas(props: PointCanvasProps): React.ReactElement {
 		sizeRef.current = { width: rect.width, height: rect.height, dpr };
 		rendererRef.current?.resize(rect.width, rect.height, dpr);
 		if (overlayRef.current) sizeCanvas(overlayRef.current, rect.width, rect.height, dpr);
+		if (edgeRef.current) sizeCanvas(edgeRef.current, rect.width, rect.height, dpr);
 		if (cameraRef.current !== null && cameraRef.current.mode === '2d' && before.width > 0 && before.height > 0) {
 			// Keep the same layout in view when the box changes size.
 			const scale = cameraRef.current.scale * Math.min(rect.width / before.width, rect.height / before.height);
@@ -376,10 +527,52 @@ export function PointCanvas(props: PointCanvasProps): React.ReactElement {
 		requestDraw();
 	}, [data, colours, rendererKind, requestDraw]);
 
-	// Overlay or size changes.
+	// Overlay, extras or size changes.
 	useEffect(() => {
 		requestDraw();
-	}, [props.overlay, props.pointSizePx, requestDraw]);
+	}, [props.overlay, props.pointSizePx, props.starB, props.raysB, props.clusterLabels, requestDraw]);
+
+	// A new edge set: drawn on the next frame, faded in unless reduced motion is asked for.
+	useEffect(() => {
+		const canvas = edgeRef.current;
+		edgeCacheRef.current.drawnKey = '';
+		requestDraw();
+		if (!canvas || propsRef.current.reducedMotion || !props.edges || props.edges.count === 0 || typeof requestAnimationFrame !== 'function') {
+			if (canvas) canvas.style.opacity = '1';
+			return undefined;
+		}
+		canvas.style.opacity = '0';
+		const raf = requestAnimationFrame(() => {
+			canvas.style.opacity = '1';
+		});
+		return () => cancelAnimationFrame(raf);
+	}, [props.edges, requestDraw]);
+
+	// The PNG's copy: the edge layer, the points (drawn again by the renderer) and the overlay, in that order.
+	useEffect(() => {
+		const report = propsRef.current.onSnapshotter;
+		if (!report) return undefined;
+		if (rendererRef.current === null) {
+			report(null);
+			return undefined;
+		}
+		report((): HTMLCanvasElement | null => {
+			const renderer = rendererRef.current;
+			const points = canvasRef.current;
+			if (renderer === null || renderer.lost || !points || typeof document === 'undefined') return null;
+			draw();
+			const out = document.createElement('canvas');
+			out.width = points.width;
+			out.height = points.height;
+			const target = out.getContext('2d');
+			if (!target) return null;
+			if (edgeRef.current) target.drawImage(edgeRef.current, 0, 0);
+			if (!renderer.snapshot(target)) return null;
+			if (overlayRef.current) target.drawImage(overlayRef.current, 0, 0);
+			return out;
+		});
+		return () => report(null);
+	}, [rendererKind, draw]);
 
 	// Refit on request.
 	useEffect(() => {
@@ -387,6 +580,15 @@ export function PointCanvas(props: PointCanvasProps): React.ReactElement {
 		fit();
 		requestDraw();
 	}, [props.fitToken, fit, requestDraw]);
+
+	// A saved view's camera.
+	useEffect(() => {
+		const target = props.cameraOverride;
+		if (!target) return;
+		cameraRef.current = target.camera;
+		if (propsRef.current.cameraKey) rememberCamera(propsRef.current.cameraKey, target.camera);
+		requestDraw();
+	}, [props.cameraOverride, requestDraw]);
 
 	// Bring a point into view.
 	useEffect(() => {
@@ -461,6 +663,13 @@ export function PointCanvas(props: PointCanvasProps): React.ReactElement {
 				setTooltip(index === null ? null : { index, x, y });
 				requestDraw();
 			}
+			// Over a cluster label (and no point): ring that cluster's points.
+			const box = index === null ? labelBoxesRef.current.find((b) => x >= b.x && x <= b.x + b.w && y >= b.y && y <= b.y + b.h) : undefined;
+			const cluster = box ? box.cluster : null;
+			if (cluster !== hoveredClusterRef.current) {
+				hoveredClusterRef.current = cluster;
+				requestDraw();
+			}
 		};
 		const onUp = (event: PointerEvent): void => {
 			const [x, y] = local(event);
@@ -477,6 +686,7 @@ export function PointCanvas(props: PointCanvasProps): React.ReactElement {
 		const onCancel = (): void => {
 			gesture.cancel();
 			lassoRef.current = [];
+			hoveredClusterRef.current = null;
 			if (hoveredRef.current !== null) {
 				hoveredRef.current = null;
 				propsRef.current.onHover(null);
@@ -565,6 +775,7 @@ export function PointCanvas(props: PointCanvasProps): React.ReactElement {
 			onKeyDown={onKeyDown}
 			style={{ position: 'relative', flex: 1, minHeight: 240, overflow: 'hidden', background: 'var(--rr-bg-default)', cursor: props.lasso ? 'crosshair' : 'grab', touchAction: 'none', userSelect: 'none' }}
 		>
+			<canvas ref={edgeRef} style={{ ...LAYER, pointerEvents: 'none', transition: props.reducedMotion ? 'none' : 'opacity 250ms ease-out' }} aria-hidden="true" data-layer="edges" />
 			<canvas ref={canvasRef} style={LAYER} aria-hidden="true" />
 			<canvas ref={overlayRef} style={{ ...LAYER, pointerEvents: 'none' }} aria-hidden="true" />
 			{tooltip !== null ? (
