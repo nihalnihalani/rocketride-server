@@ -94,6 +94,12 @@ const REQUIRED_TESTS = [
 	'toolCalls.test.ts',
 	'chatIngest.render.test.ts',
 	'chatIngest.wiring.test.ts',
+	// The additive features: the frozen contract shapes, and every panel mounted in its host.
+	'contract.ext.test.ts',
+	'mounts.test.tsx',
+	'console.mounts.test.tsx',
+	'chunkText.test.tsx',
+	'ingest.summary.test.ts',
 ];
 
 const mod = createAppModule({

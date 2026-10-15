@@ -27,7 +27,8 @@
 // One store per open connection. The console's directory, the document tab,
 // the chat sources and the map all read and write it, so selecting a document
 // in the console highlights its chunks on the map even while the map tab is
-// hidden, and a click on the map lands back in the console.
+// hidden, and a click on the map lands back in the console. Search's Compare
+// sets a second question (queryB) beside the first, for a second star.
 //
 // Plain external store: every change replaces the snapshot (never mutates it),
 // so React reads it with useSyncExternalStore and tests read it directly. No
@@ -43,7 +44,7 @@ import type { IProjectItem, SelectionState, SelectionStore, VectorKey } from './
  * @returns A fresh state.
  */
 export function emptySelection(connectionKey: string | null): SelectionState {
-	return { connectionKey, document: null, chunk: null, keys: [], highlight: null, query: null, sampleModel: null };
+	return { connectionKey, document: null, chunk: null, keys: [], highlight: null, query: null, queryB: null, sampleModel: null };
 }
 
 /**
@@ -103,6 +104,12 @@ export function createSelectionStore(connectionKey: string | null = null): Selec
 		},
 		setQuery(query): void {
 			set({ ...state, query });
+		},
+		setQueryB(queryB): void {
+			set({ ...state, queryB });
+		},
+		clearQueryB(): void {
+			if (state.queryB !== null) set({ ...state, queryB: null });
 		},
 		setSampleModel(model): void {
 			set({ ...state, sampleModel: model });

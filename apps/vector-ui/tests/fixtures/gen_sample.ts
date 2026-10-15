@@ -14,6 +14,10 @@
 //   provisional/sample_light_5000.json      light, 5,000 of 12,000 chunks, 300 documents, k = 10, 2-dp
 //   provisional/sample_biased_refilled.json detailed, 180 of 200 requested, refilled ('random', biased)
 //   provisional/sample_native_knn.json      detailed, 300 points, neighbour graph computed by the backend
+//   provisional/sample_demo_1000_clusters.json  sample_demo_1000 asked with `cluster` (contract section
+//                                           4.4-C): `clusters`, `points.table` and `listing`
+//   provisional/sample_listing_truncated.json   detailed, 300 points of a 600-document collection whose
+//                                           sampler listed only the first 500 (caveat listing_truncated)
 //
 // The points come from seeded synthetic clusters in a 48-dimensional space:
 // topics (folders) -> documents -> chunks drifting along a per-document
@@ -23,6 +27,12 @@
 // them, so a layout built from the kNN graph has real structure to recover.
 // The vectors themselves are never written.
 //
+// Clusters are computed as the contract describes them: mutual kNN edges at
+// or above the given percentile of all edge similarities (60 first, raised by
+// 10 while one group holds half the points and the percentile is below 95),
+// connected groups by union-find, numbered by size, groups of 2 or more kept
+// up to 200, and the 5 top TF-IDF terms of the largest groups of 5 or more.
+//
 // Usage (repository root):
 //   npx tsx apps/vector-ui/tests/fixtures/gen_sample.ts          # write the files
 //   npx tsx apps/vector-ui/tests/fixtures/gen_sample.ts --check  # exit 1 when a file differs
@@ -30,7 +40,7 @@
 
 import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import type { IDuplicatePair, ISampleDoc, ISampleResult, KnnSource, SampleMode, SampleStrategy } from '../../src/contract/types';
+import type { IDuplicatePair, ISampleClusters, ISampleDoc, ISampleListing, ISampleResult, KnnSource, SampleMode, SampleStrategy } from '../../src/contract/types';
 
 const OUT_DIR = join(__dirname, 'provisional');
 // The app's programs declare a narrower global `process` (env only); this script runs under Node.
@@ -397,6 +407,133 @@ function knnOverlap(x: number[], y: number[], offsets: number[], cols: number[],
 }
 
 // =============================================================================
+// CLUSTERS (what a node that computes clusters answers)
+// =============================================================================
+
+/** Words never used as a label (a short English stop list; the node's is longer). */
+const STOP_WORDS = new Set(
+	('the and for are but not you all any can had her was one our out has his how its may new now old see two way who did get let put say she too use part this that with from have they will your what when were been into than them then some more also only over such each most other which their there these those about after before under while where would could should').split(' ')
+);
+
+/** At most this many chunk texts are read per labelled group. */
+const LABELLED_FROM = 50;
+
+/** At most this many groups are labelled (the largest with at least 5 points). */
+const LABELLED_MAX = 50;
+
+/** Groups kept (limits.max_components). */
+const MAX_COMPONENTS = 200;
+
+/**
+ * The p-th percentile of values (linear interpolation, as numpy's default).
+ *
+ * @param sorted - Values, ascending.
+ * @param p - Percentile, 0 to 100.
+ * @returns The percentile.
+ */
+function percentileOf(sorted: readonly number[], p: number): number {
+	if (sorted.length === 0) return 0;
+	const at = (Math.min(100, Math.max(0, p)) / 100) * (sorted.length - 1);
+	const lo = Math.floor(at);
+	const hi = Math.min(sorted.length - 1, lo + 1);
+	return (sorted[lo] as number) + ((sorted[hi] as number) - (sorted[lo] as number)) * (at - lo);
+}
+
+/**
+ * Connected groups of the mutual kNN edges at or above a threshold (union-find with path halving).
+ *
+ * @param n - Points.
+ * @param graph - The kNN graph.
+ * @param threshold - The similarity an edge needs.
+ * @returns The root of every point.
+ */
+function components(n: number, graph: { offsets: number[]; cols: number[]; sims: number[] }, threshold: number): number[] {
+	const parent = Array.from({ length: n }, (_, i) => i);
+	const find = (x: number): number => {
+		let r = x;
+		while (parent[r] !== r) {
+			parent[r] = parent[parent[r] as number] as number;
+			r = parent[r] as number;
+		}
+		return r;
+	};
+	const neighbours = (i: number): number[] => graph.cols.slice(graph.offsets[i] as number, graph.offsets[i + 1] as number);
+	for (let i = 0; i < n; i += 1) {
+		for (let e = graph.offsets[i] as number; e < (graph.offsets[i + 1] as number); e += 1) {
+			const j = graph.cols[e] as number;
+			if (j <= i || (graph.sims[e] as number) < threshold || !neighbours(j).includes(i)) continue;
+			const a = find(i);
+			const b = find(j);
+			if (a !== b) parent[Math.max(a, b)] = Math.min(a, b);
+		}
+	}
+	return Array.from({ length: n }, (_, i) => find(i));
+}
+
+/**
+ * The `clusters` block of a sample answer.
+ *
+ * @param points - The sampled points.
+ * @param graph - Their kNN graph.
+ * @returns The clusters, numbered by size (largest first), with labels for the largest.
+ */
+function clustersOf(points: IPoint[], graph: { offsets: number[]; cols: number[]; sims: number[] }): ISampleClusters {
+	const n = points.length;
+	const sorted = [...graph.sims].sort((a, b) => a - b);
+	let percentile = 60;
+	let threshold = percentileOf(sorted, percentile);
+	let roots = components(n, graph, threshold);
+	const largest = (rs: number[]): number => Math.max(0, ...[...rs.reduce((m, r) => m.set(r, (m.get(r) ?? 0) + 1), new Map<number, number>()).values()]);
+	while (largest(roots) >= n / 2 && percentile < 95) {
+		percentile += 10;
+		threshold = percentileOf(sorted, percentile);
+		roots = components(n, graph, threshold);
+	}
+	const members = new Map<number, number[]>();
+	roots.forEach((r, i) => members.set(r, [...(members.get(r) ?? []), i]));
+	const groups = [...members.values()].filter((g) => g.length >= 2).sort((a, b) => b.length - a.length || (a[0] as number) - (b[0] as number)).slice(0, MAX_COMPONENTS);
+	const labels = new Array<number>(n).fill(-1);
+	groups.forEach((g, id) => g.forEach((i) => (labels[i] = id)));
+	// Labels: the top 5 TF-IDF terms of the largest groups of 5 or more, over their first 50 chunk texts.
+	const labelled = groups.filter((g) => g.length >= 5).slice(0, LABELLED_MAX);
+	const terms = labelled.map((g) => {
+		const counts = new Map<string, number>();
+		for (const i of g.slice(0, LABELLED_FROM)) {
+			for (const token of (points[i] as IPoint).snip.toLowerCase().match(/[a-z][a-z0-9]*/g) ?? []) {
+				if (token.length < 3 || STOP_WORDS.has(token)) continue;
+				counts.set(token, (counts.get(token) ?? 0) + 1);
+			}
+		}
+		return counts;
+	});
+	const df = new Map<string, number>();
+	for (const counts of terms) for (const token of counts.keys()) df.set(token, (df.get(token) ?? 0) + 1);
+	const keywords = groups.map((_g, id) => {
+		const counts = id < terms.length ? (terms[id] as Map<string, number>) : null;
+		if (counts === null) return [];
+		return [...counts.entries()]
+			.map(([token, tf]) => ({ token, tf, score: tf * Math.log(1 + terms.length / (df.get(token) as number)) }))
+			.sort((a, b) => b.score - a.score || b.tf - a.tf || (a.token < b.token ? -1 : a.token > b.token ? 1 : 0))
+			.slice(0, 5)
+			.map((t) => t.token);
+	});
+	return {
+		method: 'knn-components',
+		edge_threshold: round(threshold, 4),
+		percentile,
+		count: groups.length,
+		noise: labels.filter((l) => l < 0).length,
+		labels,
+		sizes: groups.map((g) => g.length),
+		keywords,
+		labelled: labelled.length,
+		label_source: 'text',
+		labelled_from: LABELLED_FROM,
+		took_ms: { clusters: 41, labels: 120 },
+	};
+}
+
+// =============================================================================
 // ANSWER
 // =============================================================================
 
@@ -415,6 +552,14 @@ interface IFixtureSpec {
 	tookMs: number;
 	caveats: string[];
 	pinnedDoc: number;
+	/** Sample only from the first this many documents by path (the sampler's listing stopped there). */
+	listed?: number;
+	/** The answer's `listing` (contract section 4.4-B). */
+	listing?: ISampleListing;
+	/** Add `clusters` (the call sent `cluster`). */
+	clusters?: boolean;
+	/** Add `points.table`: the folder whose chunks every fifth of are tables. */
+	tableFolder?: string;
 }
 
 /**
@@ -424,7 +569,8 @@ interface IFixtureSpec {
  * @returns The answer and PCA's kNN overlap.
  */
 function buildAnswer(spec: IFixtureSpec): { answer: ISampleResult; pcaOverlap: number } {
-	const docs = buildCorpus(spec.corpus);
+	const corpus = buildCorpus(spec.corpus);
+	const docs = spec.listed === undefined ? corpus : corpus.slice(0, spec.listed);
 	const points = stratifiedSample(docs, spec.n, spec.seed, spec.pinnedDoc);
 	const graph = knn(points, spec.k);
 	const { coords, explained } = pca(points, 3);
@@ -480,6 +626,7 @@ function buildAnswer(spec: IFixtureSpec): { answer: ISampleResult; pcaOverlap: n
 			len: points.map((p) => p.len),
 			...(light ? {} : { snip: points.map((p) => p.snip) }),
 			pinned: points.map((p) => p.pinned),
+			...(spec.tableFolder === undefined ? {} : { table: points.map((p) => ((docs[p.doc] as IDocSpec).path.includes(`/${spec.tableFolder}/`) && p.chunk % 5 === 4 ? 1 : 0)) }),
 		},
 		knn: { k: spec.k, offsets_row: graph.offsets, cols: graph.cols, sims: graph.sims.map((s) => round(s, bulk)) },
 		density: density.map((d) => round(d, bulk)),
@@ -488,6 +635,8 @@ function buildAnswer(spec: IFixtureSpec): { answer: ISampleResult; pcaOverlap: n
 		pca: { explained: explained.map((e) => round(e, 5)) },
 		took_ms: spec.tookMs,
 		...(spec.caveats.length > 0 ? { caveats: spec.caveats } : {}),
+		...(spec.clusters ? { clusters: clustersOf(points, graph) } : {}),
+		...(spec.listing === undefined ? {} : { listing: spec.listing }),
 	};
 	return { answer, pcaOverlap: knnOverlap(x, y, graph.offsets, graph.cols, Math.min(spec.k, 15)) };
 }
@@ -520,6 +669,20 @@ const FIXTURES: IFixtureSpec[] = [
 		n: 300, nRequested: 300, seed: 31, mode: 'detailed', k: 15,
 		strategyUsed: 'random', biased: false, knnSource: 'native', tookMs: 160, caveats: [], pinnedDoc: -1,
 	},
+	{
+		file: 'sample_demo_1000_clusters.json',
+		corpus: { seed: 7, folders: DEMO_FOLDERS, documents: 42, totalChunks: 1318, docSpread: 0.9, chunkSpread: 0.75, plant: true },
+		n: 1000, nRequested: 1000, seed: 7, mode: 'detailed', k: 15,
+		strategyUsed: 'stratified', biased: false, knnSource: 'node', tookMs: 581, caveats: [], pinnedDoc: 5,
+		clusters: true, tableFolder: 'finance', listing: { documents: 42, truncated: false, reason: 'complete' },
+	},
+	{
+		file: 'sample_listing_truncated.json',
+		corpus: { seed: 41, folders: DEMO_FOLDERS, documents: 600, totalChunks: 1800, docSpread: 0.9, chunkSpread: 0.75, plant: false },
+		n: 300, nRequested: 300, seed: 41, mode: 'detailed', k: 15, listed: 500,
+		strategyUsed: 'stratified', biased: false, knnSource: 'native', tookMs: 240, caveats: ['listing_truncated'], pinnedDoc: -1,
+		listing: { documents: 500, truncated: true, reason: 'cap' },
+	},
 ];
 
 /**
@@ -549,7 +712,8 @@ function main(): number {
 		} else {
 			writeFileSync(path, text);
 		}
-		console.log(`${spec.file}: n=${answer.n} k=${answer.knn.k} duplicates=${answer.duplicates.length} outliers=${answer.outliers.length} bytes=${text.length} pca_knn_overlap=${pcaOverlap.toFixed(3)}`);
+		const clusters = answer.clusters ? ` clusters=${answer.clusters.count} noise=${answer.clusters.noise} percentile=${answer.clusters.percentile} labelled=${answer.clusters.labelled}` : '';
+		console.log(`${spec.file}: n=${answer.n} k=${answer.knn.k} duplicates=${answer.duplicates.length} outliers=${answer.outliers.length}${clusters} bytes=${text.length} pca_knn_overlap=${pcaOverlap.toFixed(3)}`);
 	}
 	return drift === 0 ? 0 : 1;
 }

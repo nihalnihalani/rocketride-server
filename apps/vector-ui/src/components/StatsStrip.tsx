@@ -28,22 +28,26 @@
 // did not count), the chips (each label carries its whole message), and
 // "counts as of N s ago" after a quick refresh. While the first answer is
 // pending it shows a skeleton; after a failure it keeps the last figures,
-// marked "last known", under the shell's error banner.
+// marked "last known", under the shell's error banner. The Charts disclosure
+// at the end, collapsed by default, holds the collection's charts.
 // =============================================================================
 
 import React, { useEffect, useState } from 'react';
 import { Banner } from 'shell';
-import type { IDialectResult } from '../contract/types';
+import type { IDialectResult, IDocumentItem } from '../contract/types';
 import type { IStatsSlot } from '../vector/consoleStore';
 import { TONE_EDGE } from '../vector/colors';
 import { countsAsOfText, statsChips, statsFigures } from '../vector/stats';
 import { styles } from '../styles';
+import StatsCharts from './StatsCharts';
 
 /** Props for the {@link StatsStrip} component. */
 export interface IStatsStripProps {
 	stats: IStatsSlot;
 	dialect: IDialectResult | null;
 	readOnly: boolean;
+	/** The directory rows loaded so far (the charts read them). */
+	documents?: readonly IDocumentItem[];
 }
 
 /** Re-render once a second so "counts as of N s ago" stays true. */
@@ -62,7 +66,7 @@ function useNow(): number {
  * @param props - {@link IStatsStripProps}.
  * @returns The strip element.
  */
-export function StatsStrip({ stats, dialect, readOnly }: IStatsStripProps): React.ReactElement {
+export function StatsStrip({ stats, dialect, readOnly, documents = [] }: IStatsStripProps): React.ReactElement {
 	const now = useNow();
 	const figures = statsFigures(stats.view, dialect);
 	const chips = statsChips({ dialect, stats: stats.view, readOnly });
@@ -98,6 +102,10 @@ export function StatsStrip({ stats, dialect, readOnly }: IStatsStripProps): Reac
 				<span style={{ ...styles.small, marginLeft: 'auto' }} aria-live="off">
 					{stale ? 'last known values' : stats.status === 'loading' && stats.view !== null ? 'Refreshing…' : (asOf ?? '')}
 				</span>
+				<details style={styles.small}>
+					<summary style={{ cursor: 'pointer' }}>Charts</summary>
+					<StatsCharts rows={documents} dialect={dialect} />
+				</details>
 			</div>
 		</section>
 	);

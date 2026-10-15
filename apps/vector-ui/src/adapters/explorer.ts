@@ -85,6 +85,9 @@ export const TOOL = {
 	delete: 'delete',
 	upsert: 'upsert',
 	embed: EMBED_TOOL,
+	// Additive tools (contract section 4.4): reads that return keys and scalars, never a stored vector.
+	recommend: 'recommend',
+	similarityMatrix: 'similarity_matrix',
 } as const;
 
 /** The tools that change data. Never idempotent, never replayed, never called without a confirmation. */
@@ -125,6 +128,10 @@ export function makeVectorTools(): Readonly<Record<string, IToolSpec>> {
 		[TOOL.neighbors]: read('neighbors'),
 		[TOOL.search]: read('search_vector'),
 		[TOOL.embed]: read(undefined, EMBED_TIMEOUT_MS),
+		// Recommend searches the whole collection as `neighbors` does; the matrix reads the vectors of a
+		// sample's keys (cached, else from the store). A node older than these tools answers that it has none.
+		[TOOL.recommend]: read('neighbors'),
+		[TOOL.similarityMatrix]: read('sample'),
 		[TOOL.removeDocument]: write('remove'),
 		[TOOL.delete]: write(),
 		[TOOL.upsert]: write(),

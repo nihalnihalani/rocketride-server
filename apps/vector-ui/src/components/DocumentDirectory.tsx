@@ -26,9 +26,10 @@
 //
 // Renders the auto-pager's rows (vector/documents.ts) as folder groups in a
 // hand-windowed list (fixed 28 px rows, only the visible window mounted), so
-// 5,000 documents scroll smoothly without a windowing library. The filter is
-// client-side over what is loaded. Rows can be checked to remove several at
-// once; removing always goes through the console's confirmation.
+// 5,000 documents scroll smoothly without a windowing library. The filter row
+// is the ScopeBar: its path box filters what is loaded, client-side; its
+// conditions come once they are built. Rows can be checked to remove several
+// at once; removing always goes through the console's confirmation.
 // =============================================================================
 
 import React, { useEffect, useMemo, useRef, useState } from 'react';
@@ -41,6 +42,8 @@ import { EMPTY } from '../vector/wording';
 import { ChevronIcon } from '../icons';
 import { FOCUS_RING, styles } from '../styles';
 import DocumentRow from './DocumentRow';
+import ExportMenu from './ExportMenu';
+import ScopeBar from './ScopeBar';
 
 /** The height of every row of the list (the windowing depends on it). */
 export const ROW_HEIGHT = 28;
@@ -57,6 +60,8 @@ export interface IDocumentDirectoryProps {
 	onRemove(targets: IRemoveTarget[]): void;
 	onLoadMore(): void;
 	onRetry(): void;
+	/** The collection, for export file names. */
+	collection?: string | null;
 }
 
 /** One line of the flattened list. */
@@ -78,7 +83,7 @@ export function targetOf(item: IDocumentItem): IRemoveTarget {
  * @param props - {@link IDocumentDirectoryProps}.
  * @returns The panel element.
  */
-export function DocumentDirectory({ pager, selectedId, writes, onSelect, onRemove, onLoadMore, onRetry }: IDocumentDirectoryProps): React.ReactElement {
+export function DocumentDirectory({ pager, selectedId, writes, onSelect, onRemove, onLoadMore, onRetry, collection = null }: IDocumentDirectoryProps): React.ReactElement {
 	const [filter, setFilter] = useState('');
 	const [collapsed, setCollapsed] = useState<ReadonlySet<string>>(new Set());
 	const [checked, setChecked] = useState<ReadonlySet<string>>(new Set());
@@ -147,10 +152,9 @@ export function DocumentDirectory({ pager, selectedId, writes, onSelect, onRemov
 			<div style={styles.panelTitle}>
 				<span>Documents</span>
 				<span style={{ ...styles.small, fontWeight: 400, textTransform: 'none', letterSpacing: 0, marginLeft: 'auto' }}>{pager.status === 'idle' ? '' : directoryHeading(pager)}</span>
+				<ExportMenu items={[]} collection={collection} />
 			</div>
-			<div style={{ display: 'flex', gap: 8, padding: '8px 12px', alignItems: 'center' }}>
-				<input type="search" value={filter} placeholder="Filter paths…" aria-label="Filter documents by path" style={styles.input} onChange={(event) => setFilter(event.target.value)} />
-			</div>
+			<ScopeBar text={filter} onText={setFilter} />
 			{(summary || progress) && (
 				<div style={{ ...styles.small, padding: '0 12px 6px' }} role="status">
 					{summary ?? progress}

@@ -111,7 +111,8 @@ export function useConnection(endpoint: IExplorerEndpoint, client: IExplorerClie
 	const selection = useSyncExternalStore(entry.selection.subscribe, entry.selection.getState, entry.selection.getState);
 	const tab = useValue(entry.tab);
 	const chatScope = useValue(entry.chatScope);
-	const model = useMemo(() => buildConsoleModel(endpoint, probe, consoleState.stats.view), [endpoint, probe, consoleState.stats.view]);
+	const scope = useValue(entry.scope);
+	const model = useMemo(() => ({ ...buildConsoleModel(endpoint, probe, consoleState.stats.view), scope }), [endpoint, probe, consoleState.stats.view, scope]);
 	const channels = useMemo(() => (client ? vectorChannels(vectorEndpoints, client, endpoint) : { tools: null, chat: null, ingest: null }), [client, endpoint]);
 	return { entry, console: consoleState, selection, tab, chatScope, model, channels };
 }

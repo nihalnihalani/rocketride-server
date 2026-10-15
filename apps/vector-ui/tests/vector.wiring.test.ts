@@ -108,7 +108,7 @@ test('the Map is a tab of the console: both stay mounted, the map is told when i
 	const view = code('views/ConsoleView.tsx');
 	assert.match(view, /display: tab === 'console' \? 'flex' : 'none'/);
 	assert.match(view, /display: tab === 'map' \? 'flex' : 'none'/);
-	assert.match(view, /<MapView model=\{model\} channels=\{channels\} selection=\{entry\.selection\} actions=\{actions\} visible=\{active && tab === 'map'\} \/>/);
+	assert.match(view, /<MapView model=\{model\} channels=\{channels\} selection=\{entry\.selection\} actions=\{actions\} visible=\{active && tab === 'map'\} documents=\{entry\.documents\} \/>/);
 	assert.match(view, /\{ id: 'console', label: 'Console' \},\s*\{ id: 'map', label: 'Map' \}/);
 });
 

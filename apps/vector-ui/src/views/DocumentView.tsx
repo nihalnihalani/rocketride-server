@@ -41,6 +41,7 @@ import { Banner, Button, BxTrash, ContentHeader } from 'shell';
 import type { DocumentViewProps as ContractDocumentViewProps, IChunkItem, IDocumentItem, VectorKey } from '../contract/types';
 import { fetchChunks, fetchDocument, scoreChunks } from '../adapters/actions';
 import type { IVectorCaller } from '../adapters/actions';
+import HealthPanel from '../components/HealthPanel';
 import HeatStrip from '../components/HeatStrip';
 import SupportBadge from '../components/SupportBadge';
 import { CHUNKS_PAGE } from '../vector/budgets';
@@ -216,6 +217,7 @@ export function DocumentView({ model, channels, selection, actions, objectId, pa
 						</>
 					)}
 				</dl>
+				<HealthPanel item={info} />
 				{info && !info.has_first_chunk && <Banner variant="info">This document has no first chunk on this store (it was partly removed or partly ingested); it is listed under "Without first chunk".</Banner>}
 				<div style={{ display: 'flex', gap: 12, alignItems: 'center', margin: '12px 0' }}>
 					<label style={{ display: 'flex', gap: 6, alignItems: 'center', ...styles.small }}>

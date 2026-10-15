@@ -26,21 +26,28 @@
 //
 // What one open connection keeps while its console and document tabs come
 // and go: the console controller (stats, directory, chunks, removal), the
-// shared selection (vector/bridge), the console's tab (Console or Map) and
-// the chat's scope ("Ask about these only"). Every one is built from the
-// endpoint KEY plus refs: the controller reads the client and the live
-// endpoint from `ctx` at call time, so a restarted pipeline (same key, new
-// token) is called correctly without rebuilding anything.
+// shared selection (vector/bridge), the console's tab (Console or Map), the
+// chat's scope ("Ask about these only"), the directory's scope (conditions
+// shared with the map, search and chat) and its loaded rows as a source for
+// the map. Every one is built from the endpoint KEY plus refs: the controller
+// reads the client and the live endpoint from `ctx` at call time, so a
+// restarted pipeline (same key, new token) is called correctly without
+// rebuilding anything.
+//
+// Beside them, four in-memory caches keyed by the endpoint key: saved
+// filters, saved views, reviewed documents and recommend examples. Nothing
+// here is kept in browser storage.
 //
 // A change of identity clears them all (the app's cache registry): every
-// controller is disposed (its late answers are dropped) and every selection
-// is reset, so nothing of the previous identity's connections remains.
+// controller is disposed (its late answers are dropped), every selection is
+// reset and every cache is emptied, so nothing of the previous identity's
+// connections remains.
 // =============================================================================
 
 import { ExplorerToolError } from 'shared/explorer';
 import type { IExplorerClient, IExplorerEndpoint } from 'shared/explorer';
 import { createSelectionStore } from '../contract/bridge';
-import type { IVectorLimits, SelectionStore } from '../contract/types';
+import type { IDocumentRowsSource, IRecommendExamples, IScopeState, ISavedFilter, ISavedView, IVectorLimits, SelectionStore } from '../contract/types';
 import { CHUNKS_PAGE } from '../vector/budgets';
 import { createConsoleStore } from '../vector/consoleStore';
 import type { IConsoleClock, IConsoleStore } from '../vector/consoleStore';
@@ -98,6 +105,10 @@ export interface IConnectionEntry {
 	selection: SelectionStore;
 	tab: IValueStore<ConsoleTab>;
 	chatScope: IValueStore<readonly string[] | null>;
+	/** The directory's scope (ConsoleModel.scope), or null with no condition. */
+	scope: IValueStore<IScopeState | null>;
+	/** The directory's loaded rows, for the map (MapViewProps.documents). */
+	documents: IDocumentRowsSource;
 	/** True once the console asked for its first stats and page. */
 	opened: boolean;
 }
@@ -127,7 +138,7 @@ function makeController(entry: Pick<IConnectionEntry, 'ctx' | 'selection'>, cloc
 	return createConsoleStore(
 		{
 			stats: (mode) => fetchStats(session('stats'), ctx.endpoint.nodeId, mode),
-			documents: (cursor, limit) => fetchDocumentsPage(session('documents'), ctx.endpoint.nodeId, { cursor, limit }),
+			documents: (cursor, limit, filter) => fetchDocumentsPage(session('documents'), ctx.endpoint.nodeId, { cursor, limit }, {}, filter),
 			chunks: (objectId, afterChunk, limit) => fetchChunks(session('chunks'), ctx.endpoint.nodeId, { objectId, afterChunk, limit }),
 			remove: (ids) => removeDocumentsBatch(session('remove_document'), ctx.endpoint.nodeId, ids),
 			announce: (text) => announcer.announce(text),
@@ -164,8 +175,19 @@ export function connectionEntry(endpoint: IExplorerEndpoint, client: IExplorerCl
 	if (!entry) {
 		const ctx: IConnectionContext = { client, endpoint, limits };
 		const selection = createSelectionStore(endpoint.key);
-		const made: IConnectionEntry = { key: endpoint.key, ctx, selection, controller: undefined as unknown as IConsoleStore, tab: createValueStore<ConsoleTab>('console'), chatScope: createValueStore<readonly string[] | null>(null), opened: false };
+		const made: IConnectionEntry = {
+			key: endpoint.key,
+			ctx,
+			selection,
+			controller: undefined as unknown as IConsoleStore,
+			tab: createValueStore<ConsoleTab>('console'),
+			chatScope: createValueStore<readonly string[] | null>(null),
+			scope: createValueStore<IScopeState | null>(null),
+			documents: undefined as unknown as IDocumentRowsSource,
+			opened: false,
+		};
 		made.controller = makeController(made, clock);
+		made.documents = directoryRows(made.controller);
 		entries.set(endpoint.key, made);
 		entry = made;
 	}
@@ -173,6 +195,16 @@ export function connectionEntry(endpoint: IExplorerEndpoint, client: IExplorerCl
 	entry.ctx.endpoint = endpoint;
 	entry.ctx.limits = limits;
 	return entry;
+}
+
+/**
+ * The directory's loaded rows of a controller, as a source the map can subscribe to.
+ *
+ * @param controller - The console controller.
+ * @returns The source (the rows array is replaced, never mutated, when they change).
+ */
+function directoryRows(controller: IConsoleStore): IDocumentRowsSource {
+	return { getRows: () => controller.getState().directory.rows, subscribe: (listener) => controller.subscribe(listener) };
 }
 
 /**
@@ -199,3 +231,24 @@ connectionCaches.register('selection and sample models', () => {
 connectionCaches.register('console tabs and chat scope', () => {
 	entries.clear();
 });
+
+// =============================================================================
+// IN-MEMORY CACHES PER CONNECTION (keyed by endpoint key; never browser storage)
+// =============================================================================
+
+/** Saved condition sets (vector/savedFilters.ts reads and writes them). */
+export const savedFilters = new Map<string, readonly ISavedFilter[]>();
+
+/** Saved map views, at most 20 per connection (vector/savedViews.ts). */
+export const savedViews = new Map<string, readonly ISavedView[]>();
+
+/** objectIds marked reviewed in the duplicates and outliers queues. */
+export const reviewedDocuments = new Map<string, ReadonlySet<string>>();
+
+/** The examples of the map's Recommend tab. */
+export const recommendExamples = new Map<string, IRecommendExamples>();
+
+connectionCaches.register('saved filters', () => savedFilters.clear());
+connectionCaches.register('saved views', () => savedViews.clear());
+connectionCaches.register('reviewed documents', () => reviewedDocuments.clear());
+connectionCaches.register('recommend examples', () => recommendExamples.clear());

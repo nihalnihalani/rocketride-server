@@ -35,8 +35,9 @@ package.
 
 The Vector Explorer additions live beside them: the optional hooks' value types
 (``vx_types``), errors (``errors``), the numpy helpers (``vx_math``), the sample
-cache (``vx_sample_cache``), the write gate (``vx_write_gate``) and the explorer
-tools with the wrapper every store tool runs in (``vx_tools``). See
+cache (``vx_sample_cache``), the write gate (``vx_write_gate``), the explorer
+tools with the wrapper every store tool runs in (``vx_tools``) and the additive
+tools mixed in ahead of them (``vx_tools_ext``). See
 ``docs/development/nodes/vector-tool-contract.md``.
 """
 
@@ -49,6 +50,7 @@ from .errors import StoreError, StoreUnsupported, ToolRefusal
 from .store_global_base import StoreGlobalBase
 from .store_instance_base import StoreInstanceBase
 from .vx_tools import VectorExplorerTools, vectordb_tool
+from .vx_tools_ext import VectorExplorerExtTools
 
 __all__ = [
     'DocumentStoreBase',
@@ -57,6 +59,7 @@ __all__ = [
     'StoreInstanceBase',
     'StoreUnsupported',
     'ToolRefusal',
+    'VectorExplorerExtTools',
     'VectorExplorerTools',
     'VectorStoreToolMixin',
     'getStore',

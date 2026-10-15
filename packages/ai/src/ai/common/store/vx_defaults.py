@@ -46,6 +46,10 @@ VECTOR_AGENT_WRITES_DEFAULT = True
 #: Node-enforced limits, reported verbatim in ``dialect.limits`` (contract section 4.1).
 #: Page sizes and counts are maxima; the ``*_default`` keys are the defaults.
 #: ``statement_timeout_ms`` applies to pgvector; other drivers report None.
+#: The last three belong to the additive extensions (contract section 4.4):
+#: ``recommend_examples_max`` keys per side of a ``recommend`` call, ``matrix_keys_max``
+#: keys of a ``similarity_matrix`` call, and ``max_components`` clusters a ``sample``
+#: answer keeps (the rest are folded into noise).
 VECTOR_TOOL_LIMITS = {
     'documents_page': 500,
     'chunks_page': 200,
@@ -63,6 +67,9 @@ VECTOR_TOOL_LIMITS = {
     'sample_budget_ms': 60000,
     'statement_timeout_ms': 30000,
     'counts_cached_s': 60,
+    'recommend_examples_max': 10,
+    'matrix_keys_max': 100,
+    'max_components': 200,
 }
 
 #: Defaults applied when a tool call leaves the value out (contract section 4.1).

@@ -172,7 +172,9 @@ test("the selectors the lanes read exist in the app's source", () => {
 	const src = (file) => fs.readFileSync(path.join(__dirname, '..', '..', '..', '..', 'apps', 'vector-ui', 'src', file), 'utf8');
 	assert.match(src('components/StatsStrip.tsx'), /data-figure=\{f\.key\}/, 'each stats figure carries data-figure');
 	assert.match(src('components/UploadList.tsx'), /aria-label="Uploads"[\s\S]*<li key=\{row\.id\} style=\{S\.row\} data-status=\{row\.status\}>[\s\S]*title=\{row\.path\}/, 'each upload row carries data-status and its path as a title');
-	assert.match(src('components/DocumentDirectory.tsx'), new RegExp(`placeholder="${CONSOLE.filterPaths}"`));
+	// The directory's filter row is the ScopeBar; the path box is its first field.
+	assert.match(src('components/ScopeBar.tsx'), new RegExp(`placeholder="${CONSOLE.filterPaths}"`));
+	assert.match(src('components/DocumentDirectory.tsx'), /<ScopeBar\b/);
 	assert.match(src('components/SourcesPanel.tsx'), new RegExp(`aria-label="${CONSOLE.sources}"`));
 	assert.match(src('components/SourcesPanel.tsx'), /aria-label=\{`Open \$\{path\} at chunk \$\{source\.chunkId\}`\}/);
 	assert.ok(CONSOLE.sourceOpen.test('Open C:/demo/a.md at chunk 3'));

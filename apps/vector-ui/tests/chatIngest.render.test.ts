@@ -268,6 +268,18 @@ test('ChatPanel: no "Why these?" without the embedding node; the scope chip when
 	forgetChatAndIngest();
 });
 
+test('ChatPanel: a Search toggle in the header; the SearchPanel is mounted in the same space, hidden until it is on', async () => {
+	forgetChatAndIngest();
+	const html = render(h(ChatPanel, { model: model(), channels, selection: createSelectionStore('render-1'), actions, scope: null, onClearScope: () => undefined }));
+	assert.match(html, /<button[^>]*aria-pressed="false"[^>]*>Search<\/button>/);
+	const at = html.search(/<[a-z]+[^>]*data-component="SearchPanel"/);
+	assert.ok(at >= 0, 'the panel is mounted');
+	assert.match(html.slice(0, at), /<div hidden=""[^>]*>$/, 'inside a hidden wrapper while Search is off');
+	if (html.slice(at, html.indexOf('>', at)).includes('data-placeholder')) assert.match(html.slice(at, at + 600), /Not built yet/);
+	assert.match(html, /aria-label="Ask about these documents"/, 'the chat stays the panel shown');
+	forgetChatAndIngest();
+});
+
 test('ChatPanel: without a Chat source it says so and offers no composer', () => {
 	forgetChatAndIngest();
 	const html = render(h(ChatPanel, { model: model(), channels: { ...channels, chat: null }, selection: createSelectionStore('render-1'), actions, scope: null, onClearScope: () => undefined }));

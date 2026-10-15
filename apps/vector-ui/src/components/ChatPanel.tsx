@@ -35,6 +35,10 @@
 // The header names only the LLM node. Stub answers carry the stub's prefix
 // and a "Stub LLM" mark. One question in flight; Enter asks, Shift+Enter
 // adds a line, ArrowUp in an empty box recalls earlier questions.
+//
+// The header's Search toggle swaps the chat body for the SearchPanel (search
+// without the LLM) in the same space; the chat's thread and draft are hidden,
+// not lost, and come back with the toggle.
 // =============================================================================
 
 import React, { useEffect, useRef, useState } from 'react';
@@ -49,6 +53,7 @@ import { CHAT_MAX_CHARS, summariseSources } from '../vector/chatResult';
 import { showAnswerOnMap } from '../adapters/consoleActions';
 import { SourcesPanel } from './SourcesPanel';
 import { RetrievalDebugger } from './RetrievalDebugger';
+import { SearchPanel } from './SearchPanel';
 
 export type { ChatPanelProps };
 
@@ -162,6 +167,7 @@ export function ChatPanel(props: ChatPanelProps): React.ReactElement {
 	const [draft, setDraft] = useState('');
 	const [recall, setRecall] = useState(-1);
 	const [debugging, setDebugging] = useState<number | null>(null);
+	const [searching, setSearching] = useState(false);
 	const thread = useRef<HTMLDivElement>(null);
 	const turns = chat.state.turns;
 	const scrollKey = threadScrollKey(turns);
@@ -213,47 +219,55 @@ export function ChatPanel(props: ChatPanelProps): React.ReactElement {
 			<div style={S.head}>
 				<h2 style={S.heading}>Chat</h2>
 				{llm !== null && <span style={S.llm}>{`Answers by ${llm}`}</span>}
+				<button type="button" style={S.link} aria-pressed={searching} title="Search without the LLM" onClick={() => setSearching((on) => !on)}>
+					Search
+				</button>
 			</div>
-			{!available ? (
-				<EmptyState title="Chat is not available" description={model.chat.reason ?? NO_CHAT_SENTENCE} />
-			) : (
-				<>
-					<div ref={thread} style={S.thread} role="log" aria-label="Questions and answers" aria-live="off">
-						{turns.length === 0 && <p style={S.notice}>Ask a question; the answer cites the stored chunks it used.</p>}
-						{turns.map((turn) => (
-							<TurnView key={turn.id} turn={turn} model={model} channels={channels} selection={selection} actions={actions} debugging={debugging === turn.id} onDebug={(open) => setDebugging(open ? turn.id : null)} onStopWaiting={chat.stopWaiting} />
-						))}
-					</div>
-					{scope !== null && scope.length > 0 && (
-						<div style={S.scope}>
-							<span>{`Asking about ${scope.length === 1 ? '1 document' : `${scope.length.toLocaleString('en-US')} documents`} only`}</span>
-							<button type="button" style={S.link} onClick={onClearScope}>
-								Ask about all documents
+			<div hidden={!searching} style={{ flex: '1 1 auto', minHeight: 0, overflowY: 'auto' }}>
+				<SearchPanel model={model} channels={channels} selection={selection} actions={actions} />
+			</div>
+			<div style={{ display: searching ? 'none' : 'contents' }}>
+				{!available ? (
+					<EmptyState title="Chat is not available" description={model.chat.reason ?? NO_CHAT_SENTENCE} />
+				) : (
+					<>
+						<div ref={thread} style={S.thread} role="log" aria-label="Questions and answers" aria-live="off">
+							{turns.length === 0 && <p style={S.notice}>Ask a question; the answer cites the stored chunks it used.</p>}
+							{turns.map((turn) => (
+								<TurnView key={turn.id} turn={turn} model={model} channels={channels} selection={selection} actions={actions} debugging={debugging === turn.id} onDebug={(open) => setDebugging(open ? turn.id : null)} onStopWaiting={chat.stopWaiting} />
+							))}
+						</div>
+						{scope !== null && scope.length > 0 && (
+							<div style={S.scope}>
+								<span>{`Asking about ${scope.length === 1 ? '1 document' : `${scope.length.toLocaleString('en-US')} documents`} only`}</span>
+								<button type="button" style={S.link} onClick={onClearScope}>
+									Ask about all documents
+								</button>
+							</div>
+						)}
+						{chat.state.notice !== null && <p style={S.notice}>{chat.state.notice}</p>}
+						<div style={S.composer}>
+							<textarea
+								style={S.textarea}
+								aria-label="Ask about these documents"
+								placeholder="Ask about these documents…"
+								value={draft}
+								maxLength={CHAT_MAX_CHARS}
+								rows={2}
+								onChange={(event) => {
+									setDraft(event.currentTarget.value);
+									setRecall(-1);
+								}}
+								onKeyDown={onKeyDown}
+							/>
+							<button type="button" style={commonStyles.buttonPrimary} disabled={chat.state.asking || draft.trim() === ''} onClick={ask}>
+								{chat.state.asking ? 'Asking…' : 'Ask'}
 							</button>
 						</div>
-					)}
-					{chat.state.notice !== null && <p style={S.notice}>{chat.state.notice}</p>}
-					<div style={S.composer}>
-						<textarea
-							style={S.textarea}
-							aria-label="Ask about these documents"
-							placeholder="Ask about these documents…"
-							value={draft}
-							maxLength={CHAT_MAX_CHARS}
-							rows={2}
-							onChange={(event) => {
-								setDraft(event.currentTarget.value);
-								setRecall(-1);
-							}}
-							onKeyDown={onKeyDown}
-						/>
-						<button type="button" style={commonStyles.buttonPrimary} disabled={chat.state.asking || draft.trim() === ''} onClick={ask}>
-							{chat.state.asking ? 'Asking…' : 'Ask'}
-						</button>
-					</div>
-					{draft.length > COUNTER_FROM && <p style={S.notice}>{`${draft.length.toLocaleString('en-US')} of ${CHAT_MAX_CHARS.toLocaleString('en-US')} characters`}</p>}
-				</>
-			)}
+						{draft.length > COUNTER_FROM && <p style={S.notice}>{`${draft.length.toLocaleString('en-US')} of ${CHAT_MAX_CHARS.toLocaleString('en-US')} characters`}</p>}
+					</>
+				)}
+			</div>
 		</section>
 	);
 }

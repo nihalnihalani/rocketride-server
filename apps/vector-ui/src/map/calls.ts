@@ -33,9 +33,15 @@
 //
 // The error is read by shape (kind, code, message), not by class, so this
 // module imports no value from the shared library.
+//
+// The additive tools (contract section 4.4) have typed helpers here, so every
+// panel that calls them goes through this one module: `recommend` (examples
+// as keys; the one vector it may carry is the query vector the view holds,
+// passed through untouched) and `similarity_matrix` (keys only).
 // =============================================================================
 
 import type { IGenerationTicket, IRoleChannel } from 'shared/explorer';
+import type { IRecommendInput, IRecommendResult, ISimilarityMatrixInput, ISimilarityMatrixResult } from '../contract/types';
 
 /** The outcome of one tool call. */
 export type ToolAnswer<T> = { ok: true; value: T } | { ok: false; code: string | undefined; message: string; stale: boolean };
@@ -83,4 +89,31 @@ export async function callTool<T>(channel: Pick<IRoleChannel, 'invoke'>, tool: s
  */
 export function isExpired(answer: ToolAnswer<unknown>): boolean {
 	return !answer.ok && answer.code === 'SAMPLE_EXPIRED';
+}
+
+/**
+ * Call `recommend` on the store node: chunks of the whole collection like the
+ * positive examples and unlike the negative ones (contract section 4.4-D).
+ *
+ * @param channel - The role channel.
+ * @param input - Example keys (and, at most, the query vector the view holds).
+ * @param opts - Node id, wait, generation.
+ * @returns The ranked rows, or the code and sentence of the failure.
+ */
+export function callRecommend(channel: Pick<IRoleChannel, 'invoke'>, input: IRecommendInput, opts: ICallOptions): Promise<ToolAnswer<IRecommendResult>> {
+	return callTool<IRecommendResult>(channel, 'recommend', { ...input }, opts);
+}
+
+/**
+ * Call `similarity_matrix` on the store node: the pairwise similarities of
+ * these keys by the store's metric (contract section 4.4-E). Keys, never
+ * sample indices, so a re-drawn sample cannot shift the matrix.
+ *
+ * @param channel - The role channel.
+ * @param input - 2 to `limits.matrix_keys_max` keys.
+ * @param opts - Node id, wait, generation.
+ * @returns The matrix over the keys the store holds, or the code and sentence of the failure.
+ */
+export function callSimilarityMatrix(channel: Pick<IRoleChannel, 'invoke'>, input: ISimilarityMatrixInput, opts: ICallOptions): Promise<ToolAnswer<ISimilarityMatrixResult>> {
+	return callTool<ISimilarityMatrixResult>(channel, 'similarity_matrix', { ...input }, opts);
 }

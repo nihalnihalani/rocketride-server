@@ -44,7 +44,7 @@
 
 import { ExplorerToolError, isPlainObject } from 'shared/explorer';
 import { CONTROL_OBJECT_ID } from '../contract/types';
-import type { IChunkItem, IDialectResult, IDocumentItem, IVectorLimits } from '../contract/types';
+import type { FilterApplied, IChunkItem, IDialectResult, IDocumentItem, IVectorLimits } from '../contract/types';
 
 // =============================================================================
 // ENVELOPE
@@ -119,6 +119,9 @@ export const DEFAULT_LIMITS: Readonly<IVectorLimits> = {
 	sample_budget_ms: 60000,
 	statement_timeout_ms: 30000,
 	counts_cached_s: 60,
+	recommend_examples_max: 10,
+	matrix_keys_max: 100,
+	max_components: 200,
 };
 
 /**
@@ -180,6 +183,9 @@ export function readDialect(info: Record<string, unknown> | null | undefined): I
 			meta_column: typeof health.meta_column === 'boolean' ? health.meta_column : null,
 		},
 		caveats: strings(info.caveats),
+		// Additive keys (contract section 4.4-F/G): kept only when the node sent them.
+		...('size_bytes' in info ? { size_bytes: count(info.size_bytes) } : {}),
+		...('keyword_match' in info ? { keyword_match: info.keyword_match === 'substring' || info.keyword_match === 'token' ? info.keyword_match : null } : {}),
 	};
 }
 
@@ -256,6 +262,10 @@ export interface IDocumentsPageView {
 	warnings: string[];
 	/** The store ignored the page offset: the listing ends here (caveat documents_paging_unsupported). */
 	pagingUnsupported: boolean;
+	/** With a `filter`: how much of it the store applied (contract section 4.4-A); absent when the answer does not say. */
+	filterApplied?: FilterApplied;
+	/** The filter keys the store did not apply. */
+	filterIgnored?: string[];
 }
 
 /**
@@ -280,6 +290,9 @@ function readDocument(raw: unknown): IDocumentItem | null {
 		modifyTime: num(raw.modifyTime),
 		ingestedAt: str(raw.ingestedAt),
 		pointId: str(raw.pointId),
+		// Additive health fields (contract section 4.4-F): kept only when the node sent them.
+		...('max_chunk_id' in raw ? { max_chunk_id: count(raw.max_chunk_id) } : {}),
+		...('deleted_chunks' in raw ? { deleted_chunks: count(raw.deleted_chunks) } : {}),
 	};
 }
 
@@ -304,6 +317,7 @@ export function readDocumentsPage(value: Record<string, unknown>): IDocumentsPag
 		caveats,
 		warnings: strings(value.warnings),
 		pagingUnsupported: caveats.includes('documents_paging_unsupported'),
+		...(value.filter_applied === 'server' || value.filter_applied === 'partial' || value.filter_applied === 'none' ? { filterApplied: value.filter_applied, filterIgnored: strings(value.filter_ignored) } : {}),
 	};
 }
 

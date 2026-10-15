@@ -28,7 +28,8 @@
 // is to the active query (and the pipeline's own score when known), its 12
 // nearest chunks in the whole collection, and the actions that land back in the
 // console: Open document, Find similar, Remove document (gated; when it is not
-// available the reason is shown as text).
+// available the reason is shown as text). Under the snippet, the chunk's full
+// text panel (with the query's terms marked) once it is built.
 // =============================================================================
 
 import React from 'react';
@@ -36,6 +37,7 @@ import type { PointInspectorProps as ContractPointInspectorProps, VectorKey } fr
 import { documentOf, pointKey } from '../map/model';
 import { MAP_STYLES } from '../map/styles';
 import { num } from '../map/wording';
+import { ChunkTextPanel } from './ChunkTextPanel';
 import { NeighbourList } from './NeighbourList';
 
 /** Props: the frozen ones plus what the map fetched. */
@@ -84,6 +86,7 @@ export function PointInspector(props: PointInspectorProps): React.ReactElement {
 				</p>
 			) : null}
 			{snippet ? <p style={{ ...MAP_STYLES.text, whiteSpace: 'pre-wrap', margin: '6px 0' }}>{snippet}</p> : <p style={MAP_STYLES.note}>This sample carries no text for its points (light mode).</p>}
+			<ChunkTextPanel chunkKey={[objectId, chunkId]} text={props.text ?? null} />
 			<div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, margin: '8px 0' }}>
 				<button type="button" style={MAP_STYLES.button} onClick={() => props.onOpenDocument(objectId, chunkId)}>
 					Open document

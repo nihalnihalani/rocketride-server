@@ -45,11 +45,17 @@
 //
 // Every action lands back in the console: Open document, Ask about these only,
 // Remove, and the shared selection (focused chunk, highlights, lasso keys).
+//
+// The additive features are mounted with their frozen props and say "Not built
+// yet" until they are: the Clusters and Recommend tabs, the similarity matrix
+// in the Selection tab, and the toolbar's Edges, Export and Views.
 // =============================================================================
 
 import React, { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import { Banner, Button, EmptyState } from 'shell';
+import { ClustersPanel } from '../components/ClustersPanel';
 import { DuplicatesPanel } from '../components/DuplicatesPanel';
+import { ExportMenu } from '../components/ExportMenu';
 import { HeatStrip } from '../components/HeatStrip';
 import { Legend } from '../components/Legend';
 import { MapToolbar } from '../components/MapToolbar';
@@ -57,7 +63,10 @@ import { OutliersPanel } from '../components/OutliersPanel';
 import { PointCanvas } from '../components/PointCanvas';
 import { PointInspector } from '../components/PointInspector';
 import { PointsTable } from '../components/PointsTable';
-import type { Availability, ColourBy, IChunksResult, IEmbedResult, INeighborsResult, INeighborsScopeResult, IProjectItem, IProjectResult, ISampleInput, ISampleResult, ISearchResult, MapLayout, MapViewProps as ContractMapViewProps, SampleMode, VectorKey } from '../contract/types';
+import { RecommendPanel } from '../components/RecommendPanel';
+import { SavedViewsMenu } from '../components/SavedViewsMenu';
+import { SimilarityMatrix } from '../components/SimilarityMatrix';
+import type { Availability, ColourBy, IChunksResult, IEmbedResult, INeighborsResult, INeighborsScopeResult, IProjectItem, IProjectResult, IRecommendExamples, ISampleInput, ISampleResult, ISearchResult, MapLayout, MapViewProps as ContractMapViewProps, SampleMode, VectorKey } from '../contract/types';
 import { TSNE_MAX_POINTS } from '../map/budgets';
 import { callTool, isExpired } from '../map/calls';
 import type { ToolAnswer } from '../map/calls';
@@ -79,10 +88,12 @@ import type { ILayoutClient } from '../map/workerClient';
 import { BUSY, CENTROID_APPROX, LAYOUT_CANCELLED, LAYOUT_NOT_BETTER, LIGHT_POSITIONS, MAP_UNAVAILABLE, QUERY_NEEDS_EMBED, QUERY_PLACED_APPROX, mapFailure, num, pointAnnouncement, sampleLabel } from '../map/wording';
 import { heatScores } from '../vector/heat';
 
-/** Props: the frozen ones plus where the Table toggle starts. */
+/** Props: the frozen ones plus where the Table toggle and the side panel start. */
 export interface MapViewProps extends ContractMapViewProps {
 	/** Open with the Table alternative shown (only the toggle's starting state; off when not given). */
 	initialTable?: boolean;
+	/** The side panel's first tab (only its starting state; 'point' when not given). */
+	initialTab?: SideTab;
 }
 
 // =============================================================================
@@ -105,16 +116,21 @@ const RAYS_TOP_K = 10;
 const MAX_DRAWN_DUPLICATES = 200;
 
 /** Side panel tabs. */
-type SideTab = 'point' | 'neighbours' | 'duplicates' | 'outliers' | 'selection' | 'heat';
+export type SideTab = 'point' | 'neighbours' | 'duplicates' | 'outliers' | 'clusters' | 'recommend' | 'selection' | 'heat';
 
 const TABS: Array<{ id: SideTab; label: string }> = [
 	{ id: 'point', label: 'Point' },
 	{ id: 'neighbours', label: 'Neighbours' },
 	{ id: 'duplicates', label: 'Duplicates' },
 	{ id: 'outliers', label: 'Outliers' },
+	{ id: 'clusters', label: 'Clusters' },
+	{ id: 'recommend', label: 'Recommend' },
 	{ id: 'selection', label: 'Selection' },
 	{ id: 'heat', label: 'Heat strip' },
 ];
+
+/** No Recommend examples yet. */
+const NO_EXAMPLES: IRecommendExamples = { positive: [], negative: [], withQuery: false };
 
 /**
  * The map palette, re-read when the shell switches theme (it writes tokens onto the root element).
@@ -195,6 +211,8 @@ export interface SelectionTabProps {
 	/** "Remove these documents": EVERY document of the selection; the console confirms and batches the writes (APP_SPEC §6). */
 	onRemove(objectIds: readonly string[]): void;
 	onCopy(keys: readonly VectorKey[]): void;
+	/** What the tab shows under its actions (the similarity matrix of the selection). */
+	children?: React.ReactNode;
 }
 
 /**
@@ -225,6 +243,7 @@ export function SelectionTab(props: SelectionTabProps): React.ReactElement {
 			</div>
 			{!writes.enabled && writes.reason ? <p style={MAP_STYLES.note}>{writes.reason}</p> : null}
 			{!chat.enabled && chat.reason ? <p style={MAP_STYLES.note}>{chat.reason}</p> : null}
+			{props.children ?? null}
 		</section>
 	);
 }
@@ -240,7 +259,7 @@ export function SelectionTab(props: SelectionTabProps): React.ReactElement {
  * @returns The map.
  */
 export function MapView(props: MapViewProps): React.ReactElement {
-	const { model, channels, selection, actions, visible, initialTable } = props;
+	const { model, channels, selection, actions, visible, initialTable, initialTab } = props;
 	const state = useSyncExternalStore(selection.subscribe, selection.getState, selection.getState);
 	const palette = useMapPalette();
 	const reducedMotion = useReducedMotion();
@@ -266,7 +285,8 @@ export function MapView(props: MapViewProps): React.ReactElement {
 	const [lasso, setLasso] = useState(false);
 	const [table, setTable] = useState(initialTable === true);
 	const [threeD, setThreeD] = useState(false);
-	const [tab, setTab] = useState<SideTab>('point');
+	const [tab, setTab] = useState<SideTab>(initialTab ?? 'point');
+	const [examples, setExamples] = useState<IRecommendExamples>(NO_EXAMPLES);
 	const [selected, setSelected] = useState<number | null>(null);
 	const [focused, setFocused] = useState<number | null>(null);
 	const [neighbours, setNeighbours] = useState<{ index: number; result: INeighborsResult } | null>(null);
@@ -940,6 +960,12 @@ export function MapView(props: MapViewProps): React.ReactElement {
 				onToggleLasso={() => setLasso((on) => !on)}
 				onFit={() => setFitToken((t) => t + 1)}
 				onToggleTable={() => setTable((on) => !on)}
+				extras={
+					<>
+						<ExportMenu items={[]} collection={model.collection} />
+						<SavedViewsMenu connectionKey={model.connectionKey} limits={limits} current={() => null} onApply={async () => null} />
+					</>
+				}
 			/>
 			{error ? (
 				<div style={{ padding: '8px 10px' }}>
@@ -1048,6 +1074,20 @@ export function MapView(props: MapViewProps): React.ReactElement {
 								void onPick(i);
 								setCentreOn({ index: i, seq: ++seq.current });
 							}} /> : null}
+							{tab === 'clusters' ? <ClustersPanel sample={sampleModel!} /> : null}
+							{tab === 'recommend' ? (
+								<RecommendPanel
+									sample={sampleModel}
+									limits={limits}
+									capabilities={model.capabilities}
+									examples={examples}
+									onExamplesChange={setExamples}
+									queryText={query?.text ?? null}
+									onRun={async () => ({ ok: false, code: undefined, message: 'Not built yet.' })}
+									onSelect={selectKey}
+									onPin={(keys) => void pinKeys(keys.map((key) => [key[0], key[1]] as VectorKey))}
+								/>
+							) : null}
 							{tab === 'selection' ? (
 								<SelectionTab
 									keys={lassoKeys}
@@ -1059,7 +1099,18 @@ export function MapView(props: MapViewProps): React.ReactElement {
 										const text = JSON.stringify(keys);
 										if (typeof navigator !== 'undefined' && navigator.clipboard) void navigator.clipboard.writeText(text).then(() => actions.announce(`Copied ${num(keys.length)} keys.`));
 									}}
-								/>
+								>
+									<SimilarityMatrix
+										keys={lassoKeys}
+										limits={limits}
+										channel={channel}
+										storeNode={storeNode}
+										labelOf={(key) => {
+											const index = keyIdx.get(keyString(key[0], key[1]));
+											return index === undefined ? `${key[0]} #${key[1]}` : `${documentOf(sample, index)?.path ?? key[0]} #${key[1]}`;
+										}}
+									/>
+								</SelectionTab>
 							) : null}
 							{tab === 'heat' ? (
 								selected === null || query === null ? (

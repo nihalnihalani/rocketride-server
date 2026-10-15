@@ -29,6 +29,7 @@
 // "7 chunks added", or a sentence saying why it was not added. The words
 // carry the whole message; the colour of the status mark only repeats it.
 // What the engine said about a failure is one click away, not in the row.
+// Above the rows, the drop's summary once it is built.
 // =============================================================================
 
 import React from 'react';
@@ -76,6 +77,11 @@ export function UploadList({ rows, notes, onClearFinished }: UploadListProps): R
 	const finished = rows.filter((row) => FINISHED.has(row.status)).length;
 	return (
 		<div>
+			{rows.length > 0 && (
+				<p role="note" data-component="IngestSummary" data-placeholder="" style={S.notes}>
+					Not built yet: a summary of this drop and where its chunks landed on the map.
+				</p>
+			)}
 			{notes.length > 0 && (
 				<ul style={S.notes} aria-label="About the last drop">
 					{notes.map((note, index) => (

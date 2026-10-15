@@ -31,6 +31,7 @@
 // and the floor (src/vector/retrieval.ts), and lays them out against both
 // lines with a 100-bin histogram. The vector lives only for the two calls;
 // it is never kept in state or shown. Hidden when `embed` is not reachable.
+// Its rows go to the ExportMenu (CSV, JSON) once export is built.
 // =============================================================================
 
 import React, { useEffect, useState } from 'react';
@@ -40,6 +41,7 @@ import type { IChatSource, ISearchResult, RetrievalDebuggerProps as ContractRetr
 import { callTool, toolChannelFor } from '../chat/toolCalls';
 import { classifyRetrieval, debuggerSearchInput, embedErrorSentence, embedInput, retrievalErrorSentence } from '../vector/retrieval';
 import type { RetrievalStatus, RetrievalView } from '../vector/retrieval';
+import { ExportMenu } from './ExportMenu';
 import { ScoreHistogram } from './ScoreHistogram';
 
 /** The contract props plus the answer's citations (marked in the table). */
@@ -124,6 +126,7 @@ export function RetrievalDebugger({ model, channels, question, topK, onClose, an
 		<section style={S.root} aria-label="Why these sources">
 			<div style={S.head}>
 				<h3 style={S.title}>Why these sources?</h3>
+				<ExportMenu items={[]} collection={model.collection} />
 				<button type="button" style={commonStyles.buttonSecondary} onClick={onClose}>
 					Close
 				</button>

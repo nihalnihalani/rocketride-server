@@ -219,6 +219,10 @@ export function colourPoints(sample: ISampleResult, by: ColourBy, palette: IMapP
 			const [one, many] = OTHER_NOUN[by];
 			legend.push({ key: 'other', label: `Other (${rest.length.toLocaleString('en-US')} ${rest.length === 1 ? one : many})`, colour: other, count: rest.reduce((s, [, row]) => s + row.count, 0), outlined: false });
 		}
+	} else if (by === 'cluster') {
+		// Clusters come with the sample from a node that computes them (contract section 4.4-C). Until this
+		// mode is built (the toolbar does not offer it yet), every point keeps the neutral colour and says so.
+		note = 'Not built yet: colouring by cluster.';
 	} else {
 		const values = new Float64Array(n).fill(Number.NaN);
 		if (by === 'chunk-position') {

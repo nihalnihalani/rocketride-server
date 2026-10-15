@@ -30,12 +30,14 @@
 // the kNN graph), t-SNE (at most 1,000 points; disabled with its reason above
 // that). A running layout shows "Laying out…" and Cancel. Colour by, the text
 // query (disabled with its reason when the embedding node is unreachable), and
-// the Lasso, Fit and Table toggles. Native controls with labels; no key
-// listeners of its own.
+// the Lasso, Fit and Table toggles. Edges (None, Neighbours, Tree) are offered
+// once they are built; `extras` holds the view's menus (Export, Views). Native
+// controls with labels; no key listeners of its own.
 // =============================================================================
 
 import React, { useState } from 'react';
-import type { ColourBy, MapLayout, MapToolbarProps as ContractMapToolbarProps, SampleMode } from '../contract/types';
+import type { ReactNode } from 'react';
+import type { ColourBy, EdgeMode, MapLayout, MapToolbarProps as ContractMapToolbarProps, SampleMode } from '../contract/types';
 import { MAP_STYLES } from '../map/styles';
 import { num } from '../map/wording';
 
@@ -48,7 +50,19 @@ export interface MapToolbarProps extends ContractMapToolbarProps {
 	/** The 3D toggle (PCA only), when offered. */
 	threeD?: boolean;
 	onToggle3D?(): void;
+	/** The similarity edges drawn (default 'none'). */
+	edges?: EdgeMode;
+	onEdges?(edges: EdgeMode): void;
+	/** The view's menus, after the toggles (Export, Views). */
+	extras?: ReactNode;
 }
+
+/** The edge modes; only None is offered until the others are built. */
+const EDGES: Array<{ id: EdgeMode; label: string; built: boolean }> = [
+	{ id: 'none', label: 'None', built: true },
+	{ id: 'neighbours', label: 'Neighbours', built: false },
+	{ id: 'tree', label: 'Tree', built: false },
+];
 
 /** Detailed and light sizes offered (capped by the node's limits). */
 const DETAILED_SIZES = [250, 500, 1000, 2000];
@@ -131,6 +145,16 @@ export function MapToolbar(props: MapToolbarProps): React.ReactElement {
 				</button>
 			) : null}
 			<label style={MAP_STYLES.group}>
+				<span style={MAP_STYLES.label}>Edges</span>
+				<select aria-label="Edges" style={MAP_STYLES.select} value={props.edges ?? 'none'} disabled={busy || !sample} onChange={(event) => props.onEdges?.(event.target.value as EdgeMode)}>
+					{EDGES.map((e) => (
+						<option key={e.id} value={e.id} disabled={!e.built} title={e.built ? undefined : 'Not built yet'}>
+							{e.built ? e.label : `${e.label} (not built yet)`}
+						</option>
+					))}
+				</select>
+			</label>
+			<label style={MAP_STYLES.group}>
 				<span style={MAP_STYLES.label}>Colour by</span>
 				<select aria-label="Colour by" style={MAP_STYLES.select} value={props.colourBy} onChange={(event) => props.onColourBy(event.target.value as ColourBy)}>
 					{COLOURS.map((c) => (
@@ -161,6 +185,7 @@ export function MapToolbar(props: MapToolbarProps): React.ReactElement {
 			{props.onToggle3D ? (
 				<button type="button" style={toggle(!!props.threeD)} aria-pressed={!!props.threeD} onClick={props.onToggle3D} disabled={!sample || props.layout !== 'pca'}>3D</button>
 			) : null}
+			{props.extras ?? null}
 			{props.busy ? (
 				<span role="status" style={MAP_STYLES.small}>
 					{props.busy}

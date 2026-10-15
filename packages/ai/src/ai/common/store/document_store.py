@@ -26,6 +26,7 @@ from .vx_tools import (  # noqa: F401 - re-exported for the drivers that overrid
     safe_error,
     vectordb_tool,
 )
+from .vx_tools_ext import VectorExplorerExtTools
 from .vx_types import CONTROL_OBJECT_ID, ChunkPage, DocPage, KnnGraph, StoreInfo
 
 if TYPE_CHECKING:  # annotations only: numpy is imported where a hook needs it
@@ -1173,7 +1174,7 @@ _OBJDIR_SCAN_MAX = 10000
 _normalize_vectordb_tool_input = normalize_tool_input
 
 
-class VectorStoreToolMixin(VectorExplorerTools):
+class VectorStoreToolMixin(VectorExplorerExtTools, VectorExplorerTools):
     """
     Expose vector DB search/upsert/delete as agent tools.
 

@@ -31,6 +31,7 @@ import type { ConsoleActions, ConsoleModel, IDialectResult, ISampleModel, Vector
 import { PointCanvas } from '../src/components/PointCanvas';
 import { MAP_UNAVAILABLE } from '../src/map/wording';
 import { MapView } from '../src/views/MapView';
+import type { SideTab } from '../src/views/MapView';
 import { loadSample, modelOf } from './support/map.samples';
 
 const shell = require('shell') as Record<string, unknown>;
@@ -75,10 +76,10 @@ const channels: VectorChannels = { tools, chat: null, ingest: null };
 const actions: ConsoleActions = { openDocument: noop, showOnMap: noop, requestRemove: noop, askAbout: noop, documentsChanged: noop, announce: noop };
 
 /** The Map tab, statically rendered. */
-function render(opts: { model?: ConsoleModel; channels?: VectorChannels; sample?: ISampleModel | null; selectionKey?: string; initialTable?: boolean } = {}): string {
+function render(opts: { model?: ConsoleModel; channels?: VectorChannels; sample?: ISampleModel | null; selectionKey?: string; initialTable?: boolean; initialTab?: SideTab } = {}): string {
 	const selection = createSelectionStore(opts.selectionKey ?? KEY);
 	if (opts.sample) selection.setSampleModel(opts.sample);
-	return renderToStaticMarkup(<MapView model={opts.model ?? modelWith()} channels={opts.channels ?? channels} selection={selection} actions={actions} visible initialTable={opts.initialTable} />);
+	return renderToStaticMarkup(<MapView model={opts.model ?? modelWith()} channels={opts.channels ?? channels} selection={selection} actions={actions} visible initialTable={opts.initialTable} initialTab={opts.initialTab} />);
 }
 
 /** The value of `attr` on the first element with class `cls`. */
@@ -163,4 +164,14 @@ test('a hidden canvas still carries the inspected point: data-selected is render
 	assert.equal(attrOf(out, 'vector-map-canvas', 'data-selected'), '0');
 	assert.equal(attrOf(out, 'vector-map-canvas', 'data-focused'), '0');
 	assert.equal(attrOf(out, 'vector-map-canvas', 'data-renderer'), 'pending');
+});
+
+test('the Clusters tab holds the ClustersPanel, and the toolbar offers Edges with None until the others are built', () => {
+	const out = render({ sample: modelOf(loadSample('sample_demo_1000.json')), initialTab: 'clusters' });
+	assert.match(out, /role="tab" aria-selected="true"[^>]*>Clusters</);
+	const at = out.search(/<[a-z]+[^>]*data-component="ClustersPanel"/);
+	assert.ok(at >= 0, 'the panel is mounted in its tab');
+	if (out.slice(at, out.indexOf('>', at)).includes('data-placeholder')) assert.match(out.slice(at, at + 600), /Not built yet/);
+	assert.match(out, /<select aria-label="Edges"[^>]*>/);
+	assert.match(out, /<option value="none" selected="">None<\/option>/);
 });

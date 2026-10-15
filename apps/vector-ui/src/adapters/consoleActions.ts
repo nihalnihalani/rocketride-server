@@ -28,6 +28,8 @@
 // app changes what the console shows: open a document tab, show keys on the
 // map, ask to remove documents (the console confirms first; nothing is sent
 // here), scope the next chat question, refresh after an upload, announce.
+// Two helpers tell the map a question before they highlight: a chat answer's
+// (showAnswerOnMap) and Search's two compared questions (showCompareOnMap).
 // =============================================================================
 
 import type { ConsoleActions, HighlightSource, SelectionStore, VectorKey } from '../contract/types';
@@ -81,6 +83,33 @@ export function removeTargets(entry: Pick<IConnectionEntry, 'controller' | 'sele
 export function showAnswerOnMap(selection: Pick<SelectionStore, 'setQuery'>, actions: Pick<ConsoleActions, 'showOnMap'>, question: string, keys: readonly VectorKey[]): void {
 	selection.setQuery(question);
 	actions.showOnMap(keys, 'chat');
+}
+
+/**
+ * Show two searches side by side on the map (Search's Compare): question A is
+ * the map's query and question B the second one, both told to the map before
+ * the highlight brings it to the front, so it can place a star for each (A ★,
+ * B ☆). The highlighted keys are both result lists, each key once, A's first.
+ *
+ * @param selection - The connection's selection.
+ * @param actions - The console's actions.
+ * @param questionA - The first question.
+ * @param questionB - The question compared with it.
+ * @param keysA - A's results.
+ * @param keysB - B's results.
+ */
+export function showCompareOnMap(selection: Pick<SelectionStore, 'setQuery' | 'setQueryB'>, actions: Pick<ConsoleActions, 'showOnMap'>, questionA: string, questionB: string, keysA: readonly VectorKey[], keysB: readonly VectorKey[]): void {
+	selection.setQuery(questionA);
+	selection.setQueryB(questionB);
+	const seen = new Set<string>();
+	const keys: VectorKey[] = [];
+	for (const key of [...keysA, ...keysB]) {
+		const id = `${key[0]}#${key[1]}`;
+		if (seen.has(id)) continue;
+		seen.add(id);
+		keys.push(key);
+	}
+	actions.showOnMap(keys, 'search');
 }
 
 /**

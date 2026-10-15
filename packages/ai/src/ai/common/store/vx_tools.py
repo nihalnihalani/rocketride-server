@@ -1046,6 +1046,11 @@ class VectorExplorerTools:
             'remove': True,
             'remove_count': has('removeCounted') or has('countChunks'),
             'soft_delete': False,
+            # Additive extensions (contract section 4.4): the node does not compute clusters yet;
+            # a driver declares the other two in VX_DRIVER_CAPABILITIES once it serves them.
+            'clusters': False,
+            'documents_filter': has('documents_filter'),
+            'recommend_best_score': has('recommend_best_score'),
             'projection': list(PROJECTIONS),
         }
 

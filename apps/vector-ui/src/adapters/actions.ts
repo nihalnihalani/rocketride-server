@@ -33,7 +33,7 @@
 
 import { ExplorerToolError } from 'shared/explorer';
 import type { IExplorerClient, IExplorerEndpoint, IEndpointStore, IInvokeOptions } from 'shared/explorer';
-import type { IEmbedResult, INeighborsScopeResult, VectorChannels, VectorKey } from '../contract/types';
+import type { IDocumentsFilter, IEmbedResult, INeighborsScopeResult, VectorChannels, VectorKey } from '../contract/types';
 import { heatScores } from '../vector/heat';
 import type { IHeatScore } from '../vector/heat';
 import { readChunksPage, readDocumentsPage, readRemoveResult, readStats, unwrapEnvelope } from '../vector/results';
@@ -74,16 +74,20 @@ export async function fetchStats(caller: IVectorCaller, nodeId: string, mode: 'f
 }
 
 /**
- * One page of `documents` (active documents, path order).
+ * One page of `documents` (active documents, path order), optionally filtered.
  *
  * @param caller - A session or channel.
  * @param nodeId - The store node.
  * @param page - The cursor (null for the first page) and the page size.
  * @param opts - Per-call options.
+ * @param filter - The directory's conditions (contract section 4.4-A), sent only when given; the answer says
+ *   how much of it the store applied (`filterApplied`), and an older node ignores it.
  * @returns The page.
  */
-export async function fetchDocumentsPage(caller: IVectorCaller, nodeId: string, page: { cursor: string | null; limit: number }, opts: IInvokeOptions = {}): Promise<IDocumentsPageView> {
-	return readDocumentsPage(await callVector(caller, nodeId, TOOL.documents, { cursor: page.cursor, limit: page.limit, deleted: 'active', sort: 'path' }, opts));
+export async function fetchDocumentsPage(caller: IVectorCaller, nodeId: string, page: { cursor: string | null; limit: number }, opts: IInvokeOptions = {}, filter?: IDocumentsFilter | null): Promise<IDocumentsPageView> {
+	const input: Record<string, unknown> = { cursor: page.cursor, limit: page.limit, deleted: 'active', sort: 'path' };
+	if (filter) input.filter = { ...filter };
+	return readDocumentsPage(await callVector(caller, nodeId, TOOL.documents, input, opts));
 }
 
 /**

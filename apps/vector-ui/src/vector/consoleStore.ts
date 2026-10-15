@@ -48,7 +48,7 @@
 // clock, so tests drive it without a browser.
 // =============================================================================
 
-import type { IChunkItem } from '../contract/types';
+import type { IChunkItem, IDocumentsFilter } from '../contract/types';
 import { QUICK_STATS_INTERVAL_MS } from './budgets';
 import { removalSummary, runRemoval } from './confirm';
 import type { IRemoveTarget } from './confirm';
@@ -74,7 +74,8 @@ export interface IConsoleClock {
 /** What the controller calls. Each rejects with an ExplorerToolError on failure. */
 export interface IConsoleDeps {
 	stats(mode: 'full' | 'quick'): Promise<IStatsView>;
-	documents(cursor: string | null, limit: number): Promise<IDocumentsPageView>;
+	/** One directory page; `filter` (the scope's conditions) is passed to the node when given. */
+	documents(cursor: string | null, limit: number, filter?: IDocumentsFilter | null): Promise<IDocumentsPageView>;
 	chunks(objectId: string, afterChunk: number, limit: number): Promise<IChunksPageView>;
 	/** One remove_document batch. */
 	remove(objectIds: string[]): Promise<IRemoveView>;
