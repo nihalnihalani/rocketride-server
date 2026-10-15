@@ -17,7 +17,8 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { test } from 'node:test';
-import { categoricalColour, rampStops } from '../src/map/colours';
+import type { IDocumentItem, ISampleResult } from '../src/contract/types';
+import { categoricalColour, clusterColours, colourPoints, rampStops } from '../src/map/colours';
 import { contrastRatio, opaqueOver, parseColor } from '../src/map/contrast';
 import type { Rgb } from '../src/map/contrast';
 import { ACCENT_TOKEN, CHART_COLOR_VARS, MAP_SURFACES, MIN_GRAPHIC_CONTRAST, MIN_TEXT_CONTRAST, OTHER_TOKEN, OUTLINE_TOKEN, TEXT_TOKEN, readPalette } from '../src/map/tokens';
@@ -104,12 +105,44 @@ test('every step of the sequential ramp clears 3:1 in every theme', () => {
 
 test('no map file draws with the brand colour', () => {
 	const roots = [path.resolve(__dirname, '..', 'src', 'map'), path.resolve(__dirname, '..', 'src', 'components'), path.resolve(__dirname, '..', 'src', 'views')];
-	const mine = /^(MapToolbar|PointCanvas|PointInspector|NeighbourList|DuplicatesPanel|OutliersPanel|PointsTable|Legend|HeatStrip|MapView)\.tsx$|\.ts$/;
+	const mine = /^(MapToolbar|PointCanvas|PointInspector|NeighbourList|DuplicatesPanel|OutliersPanel|PointsTable|Legend|HeatStrip|ClustersPanel|MapView)\.tsx$|\.ts$/;
 	for (const root of roots) {
 		for (const file of fs.readdirSync(root)) {
 			if (root.endsWith('map') ? !file.endsWith('.ts') : !mine.test(file) || file.endsWith('.ts')) continue;
 			const text = fs.readFileSync(path.join(root, file), 'utf8').replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
 			assert.doesNotMatch(text, /--rr-brand/, `${file} uses the brand colour`);
+		}
+	}
+});
+
+test('cluster colours, up to the node\'s 200 groups: distinct, and each clears 3:1 on both surfaces or is drawn with the outline', () => {
+	for (const { name, tokens } of themes) {
+		const palette = readPalette((t) => tokens[t] ?? '');
+		const colours = clusterColours(200, palette);
+		assert.equal(new Set(colours.map((c) => c.colour)).size, 200, `${name}: no two groups share a colour`);
+		for (const [g, c] of colours.entries()) {
+			const below = MAP_SURFACES.some((s) => ratio(tokens, c.colour, s) < MIN_GRAPHIC_CONTRAST);
+			assert.equal(c.outlined, below, `${name}: group ${g} ${c.colour}`);
+			// Past the six chart colours every group's hue is moved until it clears 3:1 by itself.
+			if (g >= CHART_COLOR_VARS.length) assert.equal(below, false, `${name}: group ${g} ${c.colour}`);
+		}
+	}
+});
+
+test('the document-detail modes (ingest date, file size, health, ingest node, table chunks) draw only ramp steps, chart or hashed colours, each clearing 3:1 or outlined', () => {
+	const sample = JSON.parse(fs.readFileSync(path.resolve(__dirname, 'fixtures', 'provisional', 'sample_demo_1000_clusters.json'), 'utf8')) as ISampleResult;
+	const rows = new Map<string, IDocumentItem>(
+		sample.docs.map((doc, d) => [doc.objectId, { objectId: doc.objectId, path: doc.path, chunks: doc.chunks, has_first_chunk: d % 5 !== 0, tables: 0, deleted: false, nodeId: `node_${d % 12}`, size: 500 * (d + 1), modifyTime: null, ingestedAt: `2026-10-0${1 + (d % 2)}T10:00:00Z`, pointId: null, max_chunk_id: d % 7 === 0 ? (doc.chunks ?? 1) + 3 : (doc.chunks ?? 1) - 1, deleted_chunks: d % 9 === 0 ? 1 : 0 }]),
+	);
+	for (const { name, tokens } of themes) {
+		const palette = readPalette((t) => tokens[t] ?? '');
+		for (const mode of ['ingest-date', 'file-size', 'health', 'ingest-node', 'table'] as const) {
+			const out = colourPoints(sample, mode, palette, { docRows: rows });
+			assert.equal(out.note, null, `${name} ${mode}`);
+			for (let i = 0; i < sample.n; i += 1) {
+				const below = MAP_SURFACES.some((s) => ratio(tokens, out.colours[i] as string, s) < MIN_GRAPHIC_CONTRAST);
+				assert.equal(out.outlined[i], below ? 1 : 0, `${name} ${mode}: point ${i} ${out.colours[i]}`);
+			}
 		}
 	}
 });

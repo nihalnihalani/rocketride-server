@@ -28,10 +28,14 @@
 // (x[i], y[i], z[i]). These helpers give the map keys, the hidden mask of
 // removed documents (indices never shift: a removed document's points are only
 // hidden), PCA positions, a document's chunk path and a point's neighbours from
-// the node's kNN graph.
+// the node's kNN graph; and the rows of the map's exports (points, clusters,
+// duplicate pairs), built only when an export is chosen. An export row holds
+// words and numbers only: paths, chunk numbers, scores, layout coordinates and
+// the short snippet the node already sent; never a vector.
 // =============================================================================
 
-import type { ISampleDoc, ISampleModel, ISampleResult, VectorKey } from '../contract/types';
+import { EXPORT_COLUMNS } from '../contract/types';
+import type { ExportCell, IExportRows, ISampleDoc, ISampleModel, ISampleResult, VectorKey } from '../contract/types';
 
 /**
  * The string form of a key.
@@ -257,4 +261,102 @@ export function ditherRounded(positions: Float32Array, step: number, seed: numbe
 		out[i] = (out[i] as number) + (u - 0.5) * step * 0.999;
 	}
 	return out;
+}
+
+// =============================================================================
+// EXPORT ROWS
+// =============================================================================
+
+/** What a points export reads besides the sample. */
+export interface IPointRowContext {
+	/** The layout shown, `dims` per point (raw layout units), or null. */
+	positions: ArrayLike<number> | null;
+	dims: 2 | 3;
+	/** Similarity of each point to the active query, or null. */
+	querySims: ArrayLike<number> | null;
+	/** Each point's cluster (-1: none) and a cluster's words, or null without clusters. */
+	clusters: { labels: ArrayLike<number>; label(cluster: number): string } | null;
+}
+
+/** Four decimals (coordinates, similarities). */
+const dp4 = (v: number): number => Math.round(v * 1e4) / 1e4;
+
+/**
+ * Export rows of some points (EXPORT_COLUMNS.points). `chunk_index` is the
+ * chunk's position in its document, which is its chunk id in this store layout.
+ *
+ * @param sample - The `sample` answer.
+ * @param indices - The points, in order.
+ * @param ctx - Layout, query similarities, clusters.
+ * @returns Columns and rows.
+ */
+export function pointExportRows(sample: ISampleResult, indices: readonly number[], ctx: IPointRowContext): IExportRows {
+	const duplicate = new Set<number>();
+	for (const d of sample.duplicates) {
+		duplicate.add(d.a);
+		duplicate.add(d.b);
+	}
+	const outliers = new Set(sample.outliers);
+	const rows = indices.map((i): Record<string, ExportCell> => {
+		const doc = documentOf(sample, i);
+		const chunk = sample.points.chunk[i] as number;
+		const g = ctx.clusters ? ((ctx.clusters.labels[i] as number | undefined) ?? -1) : -1;
+		const at = (d: number): number | null => (ctx.positions && i * ctx.dims + d < ctx.positions.length ? dp4(ctx.positions[i * ctx.dims + d] as number) : null);
+		return {
+			objectId: doc?.objectId ?? '',
+			chunkId: chunk,
+			path: doc?.path ?? '',
+			chunk_index: chunk,
+			length: sample.points.len[i] ?? null,
+			density: typeof sample.density[i] === 'number' ? dp4(sample.density[i] as number) : null,
+			cluster: g >= 0 ? g + 1 : null,
+			cluster_label: g >= 0 && ctx.clusters ? ctx.clusters.label(g) : null,
+			query_similarity: ctx.querySims && typeof ctx.querySims[i] === 'number' ? dp4(ctx.querySims[i] as number) : null,
+			is_duplicate: duplicate.has(i),
+			is_outlier: outliers.has(i),
+			x: at(0),
+			y: at(1),
+			z: ctx.dims === 3 ? at(2) : null,
+			snippet: sample.points.snip?.[i] ?? null,
+		};
+	});
+	return { columns: EXPORT_COLUMNS.points, rows };
+}
+
+/**
+ * Export rows of the clusters: one per cluster with its words, size and documents.
+ *
+ * @param rows - The Clusters tab's rows (map/clusters.ts clusterRows).
+ * @returns Columns and rows.
+ */
+export function clusterExportRows(rows: ReadonlyArray<{ cluster: number; label: string; keywords: readonly string[]; size: number; documents: readonly string[] }>): IExportRows {
+	return {
+		columns: ['cluster', 'label', 'keywords', 'points', 'documents'],
+		rows: rows.map((row) => ({ cluster: row.cluster + 1, label: row.label, keywords: row.keywords.join(' '), points: row.size, documents: row.documents.length })),
+	};
+}
+
+/**
+ * Export rows of the node's near-duplicate pairs whose points are both shown.
+ *
+ * @param sample - The `sample` answer.
+ * @param hidden - Points not shown.
+ * @returns Columns and rows.
+ */
+export function duplicateExportRows(sample: ISampleResult, hidden: ArrayLike<number> | null): IExportRows {
+	const shown = (i: number): boolean => !(hidden && (hidden[i] as number) !== 0);
+	return {
+		columns: ['objectId_a', 'chunkId_a', 'path_a', 'objectId_b', 'chunkId_b', 'path_b', 'similarity'],
+		rows: sample.duplicates
+			.filter((d) => shown(d.a) && shown(d.b))
+			.map((d) => ({
+				objectId_a: documentOf(sample, d.a)?.objectId ?? '',
+				chunkId_a: sample.points.chunk[d.a] ?? null,
+				path_a: documentOf(sample, d.a)?.path ?? '',
+				objectId_b: documentOf(sample, d.b)?.objectId ?? '',
+				chunkId_b: sample.points.chunk[d.b] ?? null,
+				path_b: documentOf(sample, d.b)?.path ?? '',
+				similarity: dp4(d.sim),
+			})),
+	};
 }

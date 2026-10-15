@@ -9,12 +9,14 @@
 
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { viewMatrix } from '../src/map/camera';
-import { drawOverlay, overlayDataset } from '../src/map/overlay';
-import type { IOverlayModel } from '../src/map/overlay';
+import { projectToScreen, viewMatrix } from '../src/map/camera';
+import { NO_EDGES, edgeStats, spanningTree, topEdges } from '../src/map/graph';
+import { EDGE_BUCKETS, buildEdgePaths, drawExtras, drawOverlay, edgeAlpha, edgeBuckets, edgeTransform2d, extrasDataset, overlayDataset, strokeEdgePaths } from '../src/map/overlay';
+import type { IOverlayExtras, IOverlayModel } from '../src/map/overlay';
 import { createCanvas2dRenderer } from '../src/map/renderer.canvas2d';
 import { FLAG, FRAGMENT_SHADER, VERTEX_SHADER, createWebglRenderer, packPoints, sizeCanvas } from '../src/map/renderer.webgl';
 import { FakeCanvas, fake2d, fakeGl } from './support/map.fakes';
+import { loadSample } from './support/map.samples';
 
 const vp = { width: 400, height: 300 };
 const matrix = viewMatrix({ mode: '2d', cx: 0, cy: 0, scale: 10 }, vp);
@@ -184,4 +186,182 @@ test('the overlay reports what it drew, not what it was asked for: the star, ray
 test('what the overlay drew becomes the canvas root\'s data attributes (data-star, data-rays, data-links, data-chunk-path)', () => {
 	assert.deepEqual(overlayDataset({ star: true, rays: 10, links: 12, chunkPath: 7 }), { star: '1', rays: '10', links: '12', chunkPath: '7' });
 	assert.deepEqual(overlayDataset({ star: false, rays: 0, links: 0, chunkPath: 0 }), { star: '0', rays: '0', links: '0', chunkPath: '0' });
+});
+
+// -----------------------------------------------------------------------------
+// Snapshot: the points for a PNG, drawn again and copied in the same task
+// -----------------------------------------------------------------------------
+
+/** A 2D target that records when it copied an image, against the GL draws so far. */
+function target(drawsSoFar: () => number) {
+	const images: Array<{ source: unknown; drawsBefore: number }> = [];
+	const ctx = { drawImage: (source: unknown) => images.push({ source, drawsBefore: drawsSoFar() }) } as unknown as CanvasRenderingContext2D;
+	return { ctx, images };
+}
+
+test('WebGL snapshot: with preserveDrawingBuffer off it draws the last frame again and copies the canvas in the same call', () => {
+	const fake = fakeGl();
+	const canvas = new FakeCanvas({ webgl: fake.gl });
+	const renderer = createWebglRenderer(canvas as unknown as HTMLCanvasElement, () => undefined);
+	assert.ok(renderer);
+	const t = target(() => fake.count('drawArrays'));
+	assert.equal(renderer.snapshot(t.ctx), false, 'nothing drawn yet: nothing to copy');
+	assert.equal(t.images.length, 0);
+	renderer.resize(400, 300, 1);
+	renderer.setPoints(three(), [1, 1, 1]);
+	renderer.render({ matrix, pointSizePx: 6, dpr: 1 });
+	const before = fake.count('drawArrays');
+	assert.equal(renderer.snapshot(t.ctx), true);
+	assert.equal(fake.count('drawArrays'), before + 1, 'the last frame is drawn again');
+	assert.equal(t.images.length, 1);
+	assert.equal(t.images[0]?.source, canvas, 'the WebGL canvas is copied');
+	assert.equal(t.images[0]?.drawsBefore, before + 1, 'after it was drawn again, before the browser could clear it');
+	canvas.dispatch('webglcontextlost');
+	assert.equal(renderer.snapshot(t.ctx), false, 'a lost context has nothing to copy');
+	assert.equal(t.images.length, 1);
+});
+
+test('Canvas2D snapshot: draws the last frame again and copies it', () => {
+	const fake = fake2d();
+	const canvas = new FakeCanvas({ '2d': fake.ctx });
+	const renderer = createCanvas2dRenderer(canvas as unknown as HTMLCanvasElement);
+	assert.ok(renderer);
+	const t = target(() => fake.count('arc'));
+	assert.equal(renderer.snapshot(t.ctx), false);
+	renderer.resize(400, 300, 1);
+	renderer.setPoints(three(), [0, 0, 0]);
+	renderer.render({ matrix, pointSizePx: 6, dpr: 1 });
+	const arcs = fake.count('arc');
+	assert.equal(renderer.snapshot(t.ctx), true);
+	assert.equal(fake.count('arc'), arcs * 2);
+	assert.equal(t.images[0]?.source, canvas);
+});
+
+// -----------------------------------------------------------------------------
+// The edge layer: one path per alpha bucket, at most 8 strokes a frame
+// -----------------------------------------------------------------------------
+
+/** A Path2D stand-in that counts its segments. */
+class FakePath {
+	moves = 0;
+	lines = 0;
+	moveTo(): void {
+		this.moves += 1;
+	}
+	lineTo(): void {
+		this.lines += 1;
+	}
+}
+
+test('edges are bucketed by similarity into 8 alpha steps, weakest faintest', () => {
+	const sample = loadSample('sample_demo_1000.json');
+	const edges = topEdges(sample.knn, sample.n, 5);
+	const buckets = edgeBuckets(edges);
+	assert.equal(buckets.length, edges.count);
+	const stats = edgeStats(edges);
+	let weakest = 0;
+	let strongest = 0;
+	for (let e = 0; e < edges.count; e += 1) {
+		if (Math.abs((edges.sim[e] as number) - (stats.min as number)) < 1e-4) weakest = e;
+		if (Math.abs((edges.sim[e] as number) - (stats.max as number)) < 1e-4) strongest = e;
+		assert.ok((buckets[e] as number) >= 0 && (buckets[e] as number) < EDGE_BUCKETS);
+	}
+	assert.equal(buckets[weakest], 0);
+	assert.equal(buckets[strongest], EDGE_BUCKETS - 1);
+	for (let b = 1; b < EDGE_BUCKETS; b += 1) assert.ok(edgeAlpha(b) > edgeAlpha(b - 1));
+	// All edges equally similar: one bucket.
+	assert.equal(new Set(edgeBuckets({ ...edges, sim: new Float32Array(edges.count).fill(0.5) })).size, 1);
+});
+
+test('the tree draws n-1 segments, Neighbours m=5 at most 5n, each frame in at most 8 strokes', () => {
+	const sample = loadSample('sample_demo_1000.json');
+	const at = (i: number): [number, number] => [sample.points.x[i] as number, sample.points.y[i] as number];
+	const tree = spanningTree(sample.knn, sample.n);
+	const treePaths = buildEdgePaths(tree.edges, edgeBuckets(tree.edges), at, () => new FakePath());
+	assert.equal(treePaths.segments, sample.n - tree.components);
+	assert.equal(treePaths.paths.reduce((s, p) => s + (p ? p.lines : 0), 0), treePaths.segments);
+	const five = topEdges(sample.knn, sample.n, 5);
+	const fivePaths = buildEdgePaths(five, edgeBuckets(five), at, () => new FakePath());
+	assert.ok(fivePaths.segments <= 5 * sample.n);
+	assert.equal(fivePaths.segments, five.count);
+	const fake = fake2d();
+	const strokes = strokeEdgePaths(fake.ctx, fivePaths.paths as unknown as Array<Path2D | null>, '#666666', 1);
+	assert.ok(strokes >= 1 && strokes <= EDGE_BUCKETS, `${strokes} strokes`);
+	assert.equal(fake.count('stroke'), strokes);
+	assert.equal(fake.count('lineTo'), 0, 'the frame strokes the cached paths; it builds none');
+	// Ends off screen (behind the 3D eye) are skipped, never guessed.
+	const offscreen = buildEdgePaths(tree.edges, edgeBuckets(tree.edges), (i) => (i % 2 === 0 ? null : at(i)), () => new FakePath());
+	assert.ok(offscreen.segments < treePaths.segments);
+	assert.equal(buildEdgePaths(NO_EDGES, new Uint8Array(0), at, () => new FakePath()).segments, 0);
+});
+
+test('in 2D the cached paths are in layout units: the edge transform maps them exactly where the points are drawn', () => {
+	const camera = { mode: '2d' as const, cx: 1.5, cy: -2, scale: 37 };
+	const view = { width: 640, height: 360 };
+	const dpr = 2;
+	const t = edgeTransform2d(camera, view, dpr);
+	const m = viewMatrix(camera, view);
+	for (const [x, y] of [[0, 0], [1.5, -2], [-3, 4.25]] as Array<[number, number]>) {
+		const [sx, sy] = projectToScreen(new Float32Array([x, y]), 2, m, view) as unknown as [number, number];
+		// The view matrix is float32: agree within a thousandth of a device pixel.
+		assert.ok(Math.abs(t.a * x + t.c * y + t.e - sx * dpr) < 1e-3);
+		assert.ok(Math.abs(t.b * x + t.d * y + t.f - sy * dpr) < 1e-3);
+	}
+	assert.ok(Math.abs(t.lineWidth * t.a - dpr) < 1e-9, 'a 1 CSS-pixel line');
+});
+
+// -----------------------------------------------------------------------------
+// Extras: the second star, hover edges, cluster labels
+// -----------------------------------------------------------------------------
+
+/** No extras. */
+function noExtras(): IOverlayExtras {
+	return { starB: null, raysB: [], hoverEdges: [], labels: [], showLabels: true, clusterHighlight: [] };
+}
+
+test('star B is drawn hollow with its own rays; what was drawn becomes data-star-b and data-rays-b', () => {
+	const fake = fake2d();
+	const drawn = drawExtras(fake.ctx, { ...noExtras(), starB: { x: 50, y: 50, exact: true }, raysB: [{ index: 1 }, { index: 9 }, { index: 2 }] }, screen, place, colours);
+	assert.equal(drawn.starB, true);
+	assert.equal(drawn.raysB, 2, 'the ray to an off-screen point is not drawn');
+	assert.deepEqual(extrasDataset(drawn), { starB: '1', raysB: '2', labels: '0' });
+	assert.equal(fake.count('fill'), 1, 'hollow: filled with the surface, outlined in the accent');
+	assert.ok(fake.sets.some(([k, v]) => k === 'fillStyle' && v === colours.surface));
+	assert.deepEqual(extrasDataset(drawExtras(fake2d().ctx, noExtras(), screen, place, colours)), { starB: '0', raysB: '0', labels: '0' });
+});
+
+test('cluster labels: drawn once at their medoid in 11 px text with a halo, never overlapping, hidden when zoomed out, at most 50', () => {
+	const fake = fake2d();
+	const labels = [
+		{ cluster: 0, at: 1, text: 'falcon · station · water · spring' },
+		{ cluster: 1, at: 2, text: 'orchid · greenhouse' },
+		// Same place as the first: skipped rather than drawn over it.
+		{ cluster: 2, at: 1, text: 'manual' },
+		{ cluster: 3, at: 9, text: 'off screen' },
+	];
+	const spread = (i: number): [number, number] | null => (i === 9 ? null : [i * 200, i * 60]);
+	const drawn = drawExtras(fake.ctx, { ...noExtras(), labels }, spread, place, colours);
+	assert.equal(drawn.labels, 2);
+	assert.equal(drawn.boxes.length, 2);
+	assert.deepEqual(drawn.boxes.map((b) => b.cluster), [0, 1]);
+	assert.equal(fake.count('fillText'), 2);
+	assert.equal(fake.count('strokeText'), 2, 'the halo');
+	assert.ok(fake.sets.some(([k, v]) => k === 'font' && String(v).startsWith('11px')));
+	assert.ok(fake.sets.some(([k, v]) => k === 'fillStyle' && v === colours.text));
+	assert.equal(drawExtras(fake2d().ctx, { ...noExtras(), labels, showLabels: false }, spread, place, colours).labels, 0);
+	const many = Array.from({ length: 80 }, (_, g) => ({ cluster: g, at: g === 9 ? 0 : g, text: `g${g}` }));
+	const far = (i: number): [number, number] => [i * 100, i * 40];
+	assert.ok(drawExtras(fake2d().ctx, { ...noExtras(), labels: many }, far, place, colours).labels <= 50);
+	// Only the first three terms go on the canvas (the Clusters tab shows them all).
+	const one = fake2d();
+	drawExtras(one.ctx, { ...noExtras(), labels: [labels[0]!] }, screen, place, colours);
+	assert.equal(one.calls.find((c) => c.name === 'fillText')?.args[0], 'falcon · station · water');
+});
+
+test('hovering a point thickens its edges; hovering a label rings its cluster', () => {
+	const fake = fake2d();
+	const drawn = drawExtras(fake.ctx, { ...noExtras(), hoverEdges: [[1, 2], [2, 9]], clusterHighlight: [1, 2, 3] }, screen, place, colours);
+	assert.equal(drawn.hoverEdges, 1, 'an edge to an off-screen point is not drawn');
+	assert.ok(fake.sets.some(([k, v]) => k === 'lineWidth' && (v as number) >= 2));
+	assert.ok(fake.count('arc') >= 3);
 });

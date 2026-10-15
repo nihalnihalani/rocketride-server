@@ -24,14 +24,18 @@
 // VECTOR-UI — PointsTable (the accessible alternative to the canvas)
 // =============================================================================
 //
-// Every point of the sample as a table row, 100 rows a page: document, chunk,
-// length, density, similarity to the active query, and flags (duplicate,
-// outlier, pinned). Rows can be sorted by query similarity when there is a
-// query. Choosing a row selects the point, exactly like a click on the map.
+// Every point the map shows as a table row, 100 rows a page: document, chunk,
+// length, density, similarity to the active query, its cluster when the map
+// has clusters, and flags (duplicate with its group number, outlier, pinned).
+// Rows can be sorted by query similarity when there is a query. Hidden points
+// (a removed document, outside an isolation) are left out, as on the map.
+// Choosing a row selects the point, exactly like a click on the map.
 // =============================================================================
 
 import React, { useMemo, useState } from 'react';
 import type { PointsTableProps as ContractPointsTableProps } from '../contract/types';
+import { clusterLabel, clusterOf } from '../map/clusters';
+import type { IClusterView } from '../map/clusters';
 import { hiddenMask } from '../map/model';
 import { MAP_STYLES } from '../map/styles';
 import { num } from '../map/wording';
@@ -40,6 +44,12 @@ import { num } from '../map/wording';
 export interface PointsTableProps extends ContractPointsTableProps {
 	/** Rows per page (default 100). */
 	pageSize?: number;
+	/** The points not shown (removed documents and an isolation); absent: the removed documents only. */
+	hidden?: ArrayLike<number> | null;
+	/** The folded clusters: adds the Cluster column. */
+	clusters?: IClusterView | null;
+	/** Each point's near-duplicate group (-1: none), for the Notes column. */
+	duplicateGroups?: ArrayLike<number> | null;
 }
 
 /**
@@ -62,14 +72,16 @@ export function PointsTable(props: PointsTableProps): React.ReactElement {
 		return { dup, outliers: new Set(result.outliers) };
 	}, [result]);
 	const order = useMemo(() => {
-		const hidden = hiddenMask(props.sample);
+		const hidden = props.hidden !== undefined ? props.hidden : hiddenMask(props.sample);
 		const rows = Array.from({ length: result.n }, (_, i) => i).filter((i) => !(hidden && hidden[i]));
 		if (byQuery && props.querySims) {
 			const sims = props.querySims;
 			rows.sort((a, b) => (sims[b] as number) - (sims[a] as number) || a - b);
 		}
 		return rows;
-	}, [result, props.sample, byQuery, props.querySims]);
+	}, [result, props.sample, props.hidden, byQuery, props.querySims]);
+	const clusters = props.clusters ?? null;
+	const dupGroups = props.duplicateGroups ?? null;
 	const pages = Math.max(1, Math.ceil(order.length / pageSize));
 	const current = Math.min(page, pages - 1);
 	const rows = order.slice(current * pageSize, current * pageSize + pageSize);
@@ -117,6 +129,11 @@ export function PointsTable(props: PointsTableProps): React.ReactElement {
 								Query similarity
 							</th>
 						) : null}
+						{clusters ? (
+							<th scope="col" style={MAP_STYLES.th}>
+								Cluster
+							</th>
+						) : null}
 						<th scope="col" style={MAP_STYLES.th}>
 							Notes
 						</th>
@@ -125,7 +142,10 @@ export function PointsTable(props: PointsTableProps): React.ReactElement {
 				<tbody>
 					{rows.map((i) => {
 						const doc = result.docs[result.points.doc[i] as number];
-						const notes = [flags.dup.has(i) ? 'duplicate' : '', flags.outliers.has(i) ? 'outlier' : '', result.points.pinned[i] ? 'pinned' : ''].filter(Boolean).join(', ');
+						const group = dupGroups ? (dupGroups[i] ?? -1) : -1;
+						const duplicate = group >= 0 ? `duplicate group ${group + 1}` : flags.dup.has(i) ? 'duplicate' : '';
+						const notes = [duplicate, flags.outliers.has(i) ? 'outlier' : '', result.points.pinned[i] ? 'pinned' : ''].filter(Boolean).join(', ');
+						const cluster = clusters ? clusterOf(clusters, i) : -1;
 						const selected = props.selected === i;
 						return (
 							<tr key={i} aria-selected={selected} style={selected ? { outline: '2px solid var(--rr-border-focus)' } : undefined}>
@@ -139,6 +159,7 @@ export function PointsTable(props: PointsTableProps): React.ReactElement {
 								<td style={MAP_STYLES.td}>{num(result.points.len[i] ?? 0)}</td>
 								<td style={MAP_STYLES.td}>{(result.density[i] ?? 0).toFixed(3)}</td>
 								{props.querySims ? <td style={MAP_STYLES.td}>{(props.querySims[i] ?? 0).toFixed(3)}</td> : null}
+								{clusters ? <td style={MAP_STYLES.td}>{cluster >= 0 ? `${cluster + 1}: ${clusterLabel(clusters, cluster)}` : 'none'}</td> : null}
 								<td style={MAP_STYLES.td}>{notes}</td>
 							</tr>
 						);

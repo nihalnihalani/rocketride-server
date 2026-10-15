@@ -173,6 +173,53 @@ test("the lane's perf fixture is gen_perf.py's (same project id), so the store's
 });
 
 // -----------------------------------------------------------------------------
+// The edge rows: the similarity edges measured per mode, each its own gate
+// -----------------------------------------------------------------------------
+//
+// The map draws edges on their own canvas (Neighbours: each point's m strongest;
+// Tree: the spanning tree). The lane measures them at 2,000 detailed points, 1x
+// and 4x, one row per mode, with the map's slow-frame switch OFF
+// (MapViewProps.edgesAutoDegrade false), so a slow mode cannot pass by quietly
+// drawing fewer edges. Each mode at 4x is a gate (p95 <= 33 ms); a row missing,
+// errored, measured with the switch on, or without its edges drawn fails.
+// The lane's edge rows are added by the acceptance lane's owner; until they are
+// on this branch these tests are skipped and the integration step runs them.
+
+/** The edge-row contract the lane implements. */
+interface IEdgeLane extends ILane {
+	EDGE_MODES: string[];
+}
+const EDGE_NEEDS = 'NEEDS:E10 merged — integration gate GE2 (lane_vector_perf.cjs edge rows)';
+const edgeRow = (edges: string, extra: Partial<IRow> & Record<string, unknown> = {}): IRow & Record<string, unknown> => ({ ...gateRow(), edges, edgesAutoDegrade: false, edgesDrawn: edges === 'none' ? 0 : edges === 'tree' ? 1999 : 2000 * Number(edges.split(':')[2] ?? 1) - 1, ...extra });
+const edgeGate = (rows: IRow[], mode: string) => lane.evaluateGates(rows).find((g) => g.name.startsWith(`GATE edges:${mode}`));
+const EDGE_GATED = ['tree', 'neighbours:3', 'neighbours:5'];
+
+test('the lane measures the edge modes none, tree, neighbours:3 and neighbours:5', { skip: (lane as Partial<IEdgeLane>).EDGE_MODES ? false : EDGE_NEEDS }, () => {
+	assert.deepEqual((lane as IEdgeLane).EDGE_MODES, ['none', 'tree', 'neighbours:3', 'neighbours:5']);
+});
+
+test('each edge mode at 2,000 detailed points and 4x is a gate: a real, fast measurement with the switch off passes', { skip: (lane as Partial<IEdgeLane>).EDGE_MODES ? false : EDGE_NEEDS }, () => {
+	const rows = [gateRow(), ...['none', ...EDGE_GATED].map((mode) => edgeRow(`edges:${mode}`))];
+	for (const mode of EDGE_GATED) assert.equal(edgeGate(rows, mode)?.status, 'PASS', `${mode}: ${edgeGate(rows, mode)?.detail}`);
+});
+
+test('an edge gate fails when its row is missing, errored, slow, drew no edges, or was measured with edgesAutoDegrade on', { skip: (lane as Partial<IEdgeLane>).EDGE_MODES ? false : EDGE_NEEDS }, () => {
+	for (const mode of EDGE_GATED) {
+		const others = EDGE_GATED.filter((m) => m !== mode).map((m) => edgeRow(`edges:${m}`));
+		const cases: Array<[string, IRow[]]> = [
+			['unmeasured', [gateRow(), ...others]],
+			['errored', [gateRow(), ...others, edgeRow(`edges:${mode}`, { error: 'the edge layer never drew' })]],
+			['slow', [gateRow(), ...others, edgeRow(`edges:${mode}`, { panFrameMs: lane.summarise([...frames(70, 20), ...frames(10, 60)]) })]],
+			['no edges drawn', [gateRow(), ...others, edgeRow(`edges:${mode}`, { edgesDrawn: 0 })]],
+			['switch on', [gateRow(), ...others, edgeRow(`edges:${mode}`, { edgesAutoDegrade: true })]],
+			['switch not recorded', [gateRow(), ...others, edgeRow(`edges:${mode}`, { edgesAutoDegrade: undefined })]],
+			['only at 1x', [gateRow(), ...others, edgeRow(`edges:${mode}`, { cpuThrottle: 1 })]],
+		];
+		for (const [what, rows] of cases) assert.equal(edgeGate(rows, mode)?.status, 'FAIL', `${mode} ${what}`);
+	}
+});
+
+// -----------------------------------------------------------------------------
 // The lane's privacy summary over L10's checker (common.cjs)
 // -----------------------------------------------------------------------------
 

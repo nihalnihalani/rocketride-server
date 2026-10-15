@@ -42,7 +42,7 @@ test('no module under src/map receives a raw vector: no vectors or embed answer 
 /** Every callTool call in a source: the tool and the text of its input object. */
 function toolCalls(text: string): Array<{ tool: string; input: string }> {
 	const out: Array<{ tool: string; input: string }> = [];
-	const re = /callTool(?:<[^>]*>)?\(\s*[\w.?]+\s*,\s*'([a-z_]+)'\s*,\s*/g;
+	const re = /callTool(?:<[^>]*>)?\(\s*[\w.?]+\s*,\s*'([a-z_]+)'\s*,\s*|call(Recommend|SimilarityMatrix)\(\s*[\w.?]+\s*,\s*/g;
 	for (let m = re.exec(text); m !== null; m = re.exec(text)) {
 		// The input runs to the comma that closes it at depth 0.
 		let depth = 0;
@@ -53,21 +53,25 @@ function toolCalls(text: string): Array<{ tool: string; input: string }> {
 			else if (c === '}' || c === ')' || c === ']') depth -= 1;
 			else if (c === ',' && depth === 0) break;
 		}
-		out.push({ tool: m[1] as string, input: text.slice(re.lastIndex, end) });
+		const tool = m[1] ?? (m[2] === 'Recommend' ? 'recommend' : 'similarity_matrix');
+		out.push({ tool, input: text.slice(re.lastIndex, end) });
 	}
 	return out;
 }
 
-test('the view calls embed once, never vectors, and sends the query vector only to project, search and neighbors', () => {
+test('the view calls embed at one place, never vectors, and sends a query vector only to project, search, neighbors and recommend', () => {
 	const view = read('views/MapView.tsx');
 	const calls = toolCalls(view);
 	const tools = calls.map((c) => c.tool);
 	assert.equal(tools.filter((t) => t === 'embed').length, 1, `tools called: ${tools.join(', ')}`);
 	assert.ok(!tools.includes('vectors'));
-	for (const required of ['sample', 'project', 'search', 'neighbors', 'chunks']) assert.ok(tools.includes(required), `the view calls ${required}`);
+	for (const required of ['sample', 'project', 'search', 'neighbors', 'chunks', 'recommend']) assert.ok(tools.includes(required), `the view calls ${required}`);
 	const carrying = calls.filter((c) => /\bvector\b|queryVector/.test(c.input));
 	assert.ok(carrying.length >= 3, 'the query vector is sent somewhere');
-	for (const c of carrying) assert.ok(['project', 'search', 'neighbors'].includes(c.tool), `${c.tool} receives the query vector`);
+	for (const c of carrying) assert.ok(['project', 'search', 'neighbors', 'recommend'].includes(c.tool), `${c.tool} receives the query vector`);
+	// Recommend carries the query vector the view holds (or none), never another vector.
+	const recommend = calls.find((c) => c.tool === 'recommend');
+	assert.match(recommend?.input ?? '', /vector: request\.withQuery \? queryVector\.current : null/);
 	// The vector is taken from the embed answer as it came (no rounding or copying into a map module).
 	assert.match(view, /\.vectors\[0\]/);
 	assert.doesNotMatch(view, /vectors\[0\]\.map\(|toFixed\([^)]*\)[^;]*vector/);

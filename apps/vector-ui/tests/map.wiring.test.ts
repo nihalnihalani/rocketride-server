@@ -196,3 +196,80 @@ test("the Heat strip tab reads the store's scope scores through heatScores: a ch
 	assert.match(view, /scores: heatScores\(ids, answer\.value\.scores\)/);
 	assert.doesNotMatch(view, /sim: scores\[t\] as number/, 'a null score was drawn as a similarity');
 });
+
+// -----------------------------------------------------------------------------
+// Clusters, edges, star B, isolation, the PNG's snapshot, no browser storage
+// -----------------------------------------------------------------------------
+
+/** The body of a `const name = useCallback(...)` in a source (to its dependency list). */
+function callbackBody(text: string, name: string): string {
+	const at = text.indexOf(`const ${name} = useCallback(`);
+	assert.ok(at >= 0, `${name} found`);
+	const end = text.indexOf('\n\t);', at);
+	const close = text.indexOf('}, [', at);
+	return text.slice(at, Math.min(end > 0 ? end : Infinity, close > 0 ? close : Infinity));
+}
+
+test('controls over data the browser holds never sample: Minimum size, colour, edges, Expand selected, isolation', () => {
+	const view = read('views/MapView.tsx');
+	for (const name of ['onMinSize', 'onColourBy', 'onEdges', 'onEdgesM', 'onExpandSelected', 'onSlowEdges', 'isolate', 'onShowAll', 'onExpandIsolation']) {
+		const body = callbackBody(view, name);
+		assert.doesNotMatch(body, /drawSample|resample|callTool|callRecommend|channel\.invoke/, `${name} calls the store`);
+	}
+	// Clusters are asked only of a node that offers them, and a scope travels with the sample.
+	assert.match(view, /model\.capabilities\.clusters === true \? \{ cluster: \{ method: 'knn-components' as const, labels: true \} \}/);
+	assert.match(view, /scopeRef\.current \? \{ filter: \{ object_ids: \[\.\.\.scopeRef\.current\] \} \}/);
+});
+
+test('the slow-frame rule drops to 3 edges per point only while edgesAutoDegrade is on (the perf lane turns it off)', () => {
+	const view = read('views/MapView.tsx');
+	const body = callbackBody(view, 'onSlowEdges');
+	assert.match(body, /if \(!edgesAutoDegrade \|\| edges !== 'neighbours' \|\| edgesPerPoint <= 3\) return;/);
+	assert.match(view, /const edgesAutoDegrade = props\.edgesAutoDegrade !== false;/);
+	const canvas = read('components/PointCanvas.tsx');
+	assert.match(canvas, /if \(edgesDrawn && ended - started > SLOW_FRAME_MS\)/, 'only frames that drew edges count');
+	assert.match(canvas, /cache\.slow >= 2 && !cache\.fired/, 'twice, then once per edge set');
+});
+
+test('Search\'s Compare places two stars: the highlight runs the compare plan, B is embedded through the one embed call and drawn hollow with its own rays', () => {
+	const view = read('views/MapView.tsx');
+	assert.match(view, /const compare = comparePlan\(\{ told: state\.query, toldB: state\.queryB, mapQuery: query\?\.text \?\? null, mapQueryB: queryB\?\.text \?\? null, embedReady \}\);/);
+	assert.match(view, /if \(compare\.runB\) void runQueryB\(state\.queryB as string\);/);
+	assert.match(view, /<PointCanvas[\s\S]*?starB=\{starB\}[\s\S]*?raysB=\{raysB\}/);
+	const runB = /const runQueryB = async \(text: string\): Promise<void> => \{([\s\S]*?)\n\t\};/.exec(view);
+	assert.ok(runB, 'runQueryB');
+	assert.match(runB[1] as string, /await embedQuestion\(text\)/);
+	// A question typed on the map drops the compared pair.
+	assert.match(view, /if \(ownQuery\) clearCompare\(\);/);
+	const canvas = read('components/PointCanvas.tsx');
+	assert.match(canvas, /Object\.assign\(el\.dataset, extrasDataset\(extras\)\)/);
+});
+
+test('the edge layer is drawn on its own canvas only when the camera, the size or the edge set changes, and the frame says what it drew', () => {
+	const canvas = read('components/PointCanvas.tsx');
+	assert.match(canvas, /if \(!rebuild && key === cache\.drawnKey\) return false;/);
+	assert.match(canvas, /el\.dataset\.edges = String\(cache\.segments\)/);
+	assert.match(canvas, /edgeTransform2d\(camera, vp, size\.dpr\)/, '2D strokes the cached paths through the camera transform');
+	assert.doesNotMatch(canvas, /data-edges=\{/);
+});
+
+test('the PNG copies the edge layer, then the points through the renderer\'s snapshot, then the overlay', () => {
+	const canvas = read('components/PointCanvas.tsx');
+	const copy = /report\(\(\): HTMLCanvasElement \| null => \{([\s\S]*?)\n\t\t\}\);/.exec(canvas);
+	assert.ok(copy, 'the snapshotter');
+	const body = copy[1] as string;
+	const edges = body.indexOf('target.drawImage(edgeRef.current');
+	const points = body.indexOf('renderer.snapshot(target)');
+	const overlay = body.indexOf('target.drawImage(overlayRef.current');
+	assert.ok(edges >= 0 && points > edges && overlay > points, 'edges, points, overlay');
+	const view = read('views/MapView.tsx');
+	assert.match(view, /const source = snap\(\);/, 'the map\'s PNG goes through the snapshot');
+});
+
+test('nothing on the map is kept in browser storage; Recommend examples live in the per-connection cache the registry clears', () => {
+	const sources = [...fs.readdirSync(path.join(SRC, 'map')).map((f) => `map/${f}`), 'views/MapView.tsx', ...['MapToolbar', 'PointCanvas', 'PointsTable', 'Legend', 'ClustersPanel'].map((n) => `components/${n}.tsx`)];
+	for (const file of sources) assert.doesNotMatch(read(file), /localStorage|sessionStorage|indexedDB/, file);
+	const view = read('views/MapView.tsx');
+	assert.match(view, /recommendExamples\.set\(model\.connectionKey, next\)/);
+	assert.match(view, /recommendExamples\.get\(model\.connectionKey\) \?\? NO_EXAMPLES/);
+});

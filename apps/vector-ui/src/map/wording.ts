@@ -176,3 +176,84 @@ export function mapFailure(code: string | undefined, fallback: string): string {
 export function pointAnnouncement(index: number, total: number, path: string, chunk: number): string {
 	return `Point ${num(index + 1)} of ${num(total)}: ${path}, chunk ${num(chunk)}`;
 }
+
+// -----------------------------------------------------------------------------
+// Clusters, edges, isolation and colour modes
+// -----------------------------------------------------------------------------
+
+/** A node that does not compute clusters (no `sample.clusters`, capability `clusters` off). */
+export const CLUSTERS_UNSUPPORTED = 'This store node does not compute clusters; update the node.';
+
+/** A node that computes clusters, on a sample drawn without them. */
+export const CLUSTERS_NOT_IN_SAMPLE = 'This sample was drawn without clusters; draw a new sample to compute them.';
+
+/**
+ * No group reaches the minimum size.
+ *
+ * @param minSize - The minimum size applied.
+ * @returns The sentence.
+ */
+export function clustersNone(minSize: number): string {
+	return `No groups of ${num(minSize)} or more at this similarity; the sample is evenly spread.`;
+}
+
+/**
+ * The announcement when the map is coloured by cluster.
+ *
+ * @param count - Groups shown.
+ * @param noise - Points in none.
+ * @returns E.g. "Coloured by cluster: 7 clusters, 38 unassigned points."
+ */
+export function clusterAnnouncement(count: number, noise: number): string {
+	return `Coloured by cluster: ${num(count)} ${count === 1 ? 'cluster' : 'clusters'}, ${num(noise)} unassigned ${noise === 1 ? 'point' : 'points'}.`;
+}
+
+/** The edge layer dropped to 3 edges per point after slow frames. */
+export const EDGES_DEGRADED = 'Fewer edges drawn to keep the map smooth';
+
+/** Light samples above this many points draw at most 3 neighbour edges per point. */
+export const EDGES_LIGHT_LIMIT = 3000;
+
+/** Why Neighbours is limited to 3 per point. */
+export const EDGES_LIGHT_NOTE = `Light samples above ${num(EDGES_LIGHT_LIMIT)} points draw 3 neighbour edges per point`;
+
+/**
+ * The legend's line for the edges drawn.
+ *
+ * @param state - The mode, edges per point, counts and similarity range, the tree's points and pieces, expanded points.
+ * @returns The line, or null when no edge is drawn.
+ */
+export function edgeLegend(state: { mode: 'none' | 'neighbours' | 'tree'; m: number; count: number; min: number | null; max: number | null; points: number; components: number; expanded: number }): string | null {
+	const range = state.min !== null && state.max !== null ? `, similarity ${state.min.toFixed(2)}–${state.max.toFixed(2)}` : '';
+	const plus = state.expanded > 0 ? `; plus the neighbour edges of ${num(state.expanded)} expanded ${state.expanded === 1 ? 'point' : 'points'}` : '';
+	if (state.mode === 'neighbours') return `Neighbour edges: each point's ${num(state.m)} strongest (${num(state.count)} edges${range})${plus}`;
+	if (state.mode === 'tree') {
+		const what = state.components > 1 ? `the strongest paths connecting the points (${num(state.points)} points in ${num(state.components)} groups, ${num(state.count)} edges${range})` : `the strongest path connecting every point (${num(state.points)} points, ${num(state.count)} edges${range})`;
+		return `Spanning tree: ${what}${plus}`;
+	}
+	return state.expanded > 0 ? `Neighbour edges of ${num(state.expanded)} expanded ${state.expanded === 1 ? 'point' : 'points'} (${num(state.count)} edges${range})` : null;
+}
+
+/**
+ * The legend's line when the sampler's document listing stopped before the end (caveat `listing_truncated`).
+ *
+ * @param sample - The answer.
+ * @returns The line, or null when the listing was complete or not reported.
+ */
+export function listingNote(sample: ISampleResult): string | null {
+	const listing = sample.listing;
+	if (!listing || !listing.truncated) return null;
+	if (listing.reason === 'cap') return `Sampled from the first ${num(listing.documents)} documents by path; the collection has more`;
+	return "Sampled from part of the collection: the store's listing stopped early";
+}
+
+/**
+ * The legend's line for a scope applied to the map.
+ *
+ * @param label - The scope's words.
+ * @param documents - Documents in scope.
+ * @returns The line.
+ */
+export function scopeNote(label: string, documents: number): string {
+	return `Scope: ${label} (${num(documents)} ${documents === 1 ? 'document' : 'documents'}); the sample is drawn from these only`;
+}

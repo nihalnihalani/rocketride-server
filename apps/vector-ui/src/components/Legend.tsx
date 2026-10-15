@@ -27,17 +27,24 @@
 // Names every colour (colour is never the only carrier), states the sample line
 // and the point cap of the mode, who computed the neighbour graph ("neighbour
 // graph computed by Qdrant" when the store did it natively) and the caveat that
-// 2D distances are approximate while ranks and scores are exact.
+// 2D distances are approximate while ranks and scores are exact. Coloured by
+// cluster it lists the largest groups and says how many more the Clusters tab
+// lists; the view adds its lines (what a cluster is, the edges drawn, how the
+// sample's listing ended, an isolation) as notes.
 // =============================================================================
 
 import React from 'react';
 import type { LegendProps as ContractLegendProps } from '../contract/types';
-import type { IColouring } from '../map/colours';
+import type { IColouring, MapColourBy } from '../map/colours';
 import { MAP_STYLES } from '../map/styles';
 import { DISTANCE_CAVEAT, biasedNote, knnSourceLine, num, pointCapLine, sampleLabel } from '../map/wording';
 
-/** Legend props: the frozen ones plus what the map computed. */
-export interface LegendProps extends ContractLegendProps {
+/** Groups listed by name when coloured by cluster (the Clusters tab lists every one). */
+export const LEGEND_CLUSTERS = 12;
+
+/** Legend props: the frozen ones (Colour by widened) plus what the map computed. */
+export interface LegendProps extends Omit<ContractLegendProps, 'colourBy'> {
+	colourBy: MapColourBy;
 	/** The current colouring (legend rows, ramp, note), when there is one. */
 	colouring?: IColouring | null;
 	/** Extra lines (query placement, layout notes). */
@@ -55,13 +62,18 @@ export function Legend(props: LegendProps): React.ReactElement {
 	const colouring = props.colouring ?? null;
 	const bias = biasedNote(sample);
 	const rampStyle: React.CSSProperties | null = colouring?.ramp ? { height: 10, borderRadius: 3, background: `linear-gradient(to right, ${colouring.ramp.stops.join(', ')})`, margin: '4px 0' } : null;
+	// Coloured by cluster: the largest groups by name, then the noise row; the rest are counted.
+	const all = colouring?.legend ?? [];
+	const groups = props.colourBy === 'cluster' ? all.filter((e) => e.key !== 'noise') : all;
+	const rows = props.colourBy === 'cluster' ? [...groups.slice(0, LEGEND_CLUSTERS), ...all.filter((e) => e.key === 'noise')] : all;
+	const more = props.colourBy === 'cluster' ? Math.max(0, groups.length - LEGEND_CLUSTERS) : 0;
 	return (
 		<section aria-label="Map legend" style={MAP_STYLES.legend} data-knn-source={sample.knn_source} data-colour-by={props.colourBy}>
 			<p style={MAP_STYLES.note}>{sampleLabel(sample)}</p>
 			{bias ? <p style={MAP_STYLES.note}>{bias}</p> : null}
-			{colouring && colouring.legend.length > 0 ? (
+			{rows.length > 0 ? (
 				<ul aria-label="Colours" style={{ ...MAP_STYLES.list, display: 'flex', flexWrap: 'wrap', gap: '2px 14px', margin: '4px 0' }}>
-					{colouring.legend.map((entry) => (
+					{rows.map((entry) => (
 						<li key={entry.key} style={{ ...MAP_STYLES.small, display: 'inline-flex', alignItems: 'center' }}>
 							<span aria-hidden="true" style={MAP_STYLES.swatch(entry.colour, entry.outlined)} />
 							<span>{entry.label}</span>
@@ -70,6 +82,7 @@ export function Legend(props: LegendProps): React.ReactElement {
 					))}
 				</ul>
 			) : null}
+			{more > 0 ? <p style={MAP_STYLES.note}>{`and ${num(more)} more ${more === 1 ? 'group' : 'groups'}, each with its own colour (the Clusters tab lists them all)`}</p> : null}
 			{colouring?.ramp && rampStyle ? (
 				<div role="img" aria-label={`Colour ramp from ${colouring.ramp.low} to ${colouring.ramp.high}`} style={{ maxWidth: 320 }}>
 					<div style={rampStyle} />
