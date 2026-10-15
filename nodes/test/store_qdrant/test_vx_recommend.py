@@ -3,7 +3,7 @@
 # Copyright (c) 2026 Aparavi Software AG
 # =============================================================================
 
-"""Qdrant's recommendation query, as the mock server answers it.
+"""Qdrant's recommendation query: the mock server answers it, the driver serves it natively.
 
 The mock ``qdrant_client`` (``nodes/test/mocks/qdrant_client``) answers
 ``query_points(query=RecommendQuery(recommend=RecommendInput(...)))`` the way a
@@ -14,14 +14,27 @@ negatives) over unit-length examples on a Cosine collection and refuses an empty
 positive side; ``best_score`` scores every candidate by its best positive and
 best negative similarity through Qdrant's sigmoid step and accepts negatives
 alone; ``sum_scores`` sums them.
+
+The driver's ``recommendNative`` hook resolves explorer keys to point ids (the
+deterministic ids and the random ids of older rows alike), keeps to the active
+rows of real documents (and to a scope of objectIds), counts the query vector as
+a positive example and hands back each hit with the score Qdrant gave it. The
+driver declares ``recommend_best_score`` and keyword search by whole words
+(``VX_KEYWORD_MATCH = 'token'``).
 """
 
 from __future__ import annotations
 
+import uuid
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
+from rocketlib import IInstanceBase
 
-from ._mock_driver import load_driver
+from ai.common.store import VectorStoreToolMixin, vx_types
+
+from ._mock_driver import load_driver, make_doc, make_store
 
 drv = load_driver('_vx_qdrant_driver_mock_recommend')
 Client = drv.QdrantClient
@@ -176,3 +189,231 @@ def test_the_limit_and_the_call_counter():
     before = Client.calls.get('query_points', 0)
     assert len(_recommend(client, positive=[1], limit=3)) == 3
     assert Client.calls['query_points'] == before + 1
+
+
+# ---------------------------------------------------------------------------
+# The driver
+# ---------------------------------------------------------------------------
+
+
+def _corpus(store, *, docs=5, chunks=4, dim=6, seed=21):
+    rng = np.random.default_rng(seed)
+    batch = []
+    for d in range(docs):
+        centre = rng.normal(size=dim)
+        for c in range(chunks):
+            batch.append(make_doc(f'doc-{d}', c, _unit(centre + 0.4 * rng.normal(size=dim)).tolist()))
+    store.addChunks(batch)
+    return {(f'doc-{d}', c): None for d in range(docs) for c in range(chunks)}
+
+
+def _vector_of(store, key):
+    return np.asarray(store.getVectors([key])[0].embedding, dtype=float)
+
+
+def _keys(docs):
+    return [(d.metadata.objectId, d.metadata.chunkId) for d in docs]
+
+
+def test_the_driver_declares_native_recommendation_and_whole_word_keyword_search():
+    store = make_store(drv)
+    assert 'recommend_best_score' in store.capabilities()
+    assert {'knn_native', 'documents_distinct', 'search_keyword'} <= store.capabilities()
+    assert drv.Store.VX_KEYWORD_MATCH == 'token'
+    assert drv.Store.VX_KEYWORD_MATCH in vx_types.KEYWORD_MATCHES
+    assert callable(getattr(store, 'recommendNative', None))
+
+
+def test_recommend_native_best_score_by_keys_matches_the_formula():
+    store = make_store(drv, collection='vx_rec')
+    _corpus(store)
+    pos, neg = [('doc-0', 0), ('doc-1', 2)], [('doc-3', 1)]
+    docs = store.recommendNative(positive=pos, negative=neg, strategy='best_score', limit=30)
+    examples = {k: _vector_of(store, k) for k in pos + neg}
+    expected = []
+    for d in range(5):
+        for c in range(4):
+            key = (f'doc-{d}', c)
+            if key in examples:
+                continue
+            v = _vector_of(store, key)
+            best_p = max(_cos(v, examples[k]) for k in pos)
+            best_n = max(_cos(v, examples[k]) for k in neg)
+            expected.append((_sigmoid(best_p) if best_p > best_n else -_sigmoid(best_n), key))
+    expected.sort(key=lambda sk: -sk[0])
+    assert _keys(docs) == [k for _s, k in expected]
+    assert [d.score for d in docs] == pytest.approx([s for s, _k in expected])
+
+
+def test_recommend_native_hands_back_docs_with_text_path_point_id_and_no_vector():
+    store = make_store(drv, collection='vx_rec')
+    _corpus(store)
+    doc = store.recommendNative(positive=[('doc-0', 0)], negative=[], strategy='best_score', limit=1)[0]
+    assert doc.page_content == f'{doc.metadata.objectId} chunk {doc.metadata.chunkId}'
+    assert doc.metadata.parent == f'C:/docs/{doc.metadata.objectId}.md'
+    assert doc.metadata.pointId == drv.point_id_for(doc.metadata.objectId, doc.metadata.chunkId)
+    assert doc.embedding is None
+    assert isinstance(doc.score, float) and -1.0 <= doc.score <= 1.0
+
+
+def test_recommend_native_average_vector_is_the_servers_own_ranking():
+    store = make_store(drv, collection='vx_rec')
+    _corpus(store)
+    pos, neg = [('doc-2', 0), ('doc-2', 3)], [('doc-4', 1)]
+    docs = store.recommendNative(positive=pos, negative=neg, strategy='average_vector', limit=30)
+    avg_p = np.mean([_unit(_vector_of(store, k)) for k in pos], axis=0)
+    query = 2 * avg_p - _unit(_vector_of(store, neg[0]))
+    others = [(f'doc-{d}', c) for d in range(5) for c in range(4) if (f'doc-{d}', c) not in pos + neg]
+    assert _keys(docs) == sorted(others, key=lambda k: -_cos(query, _vector_of(store, k)))
+
+
+def test_recommend_native_accepts_negatives_alone():
+    store = make_store(drv, collection='vx_rec')
+    _corpus(store)
+    docs = store.recommendNative(positive=[], negative=[('doc-1', 1)], strategy='best_score', limit=5)
+    assert len(docs) == 5 and all(d.score < 0 for d in docs)
+    assert ('doc-1', 1) not in _keys(docs)
+
+
+def test_recommend_native_counts_the_query_vector_as_a_positive():
+    store = make_store(drv, collection='vx_rec')
+    _corpus(store)
+    target = _vector_of(store, ('doc-3', 2))
+    docs = store.recommendNative(positive=[], negative=[], vector=target.tolist(), strategy='best_score', limit=3)
+    assert _keys(docs)[0] == ('doc-3', 2), 'a raw vector is not an example point, so its twin ranks first'
+    assert docs[0].score == pytest.approx(_sigmoid(1.0))
+
+
+def test_recommend_native_keeps_to_active_rows_of_real_documents_and_the_scope():
+    store = make_store(drv, collection='vx_rec')
+    _corpus(store)
+    store.markDeleted(['doc-4'])
+    docs = store.recommendNative(positive=[('doc-0', 1)], negative=[], strategy='best_score', limit=100)
+    found = {k[0] for k in _keys(docs)}
+    assert 'doc-4' not in found and 'schema' not in found
+    assert len(docs) == 4 * 4 - 1
+    scoped = store.recommendNative(
+        positive=[('doc-0', 1)], negative=[], strategy='best_score', limit=100, object_ids=['doc-2', 'doc-3']
+    )
+    assert {k[0] for k in _keys(scoped)} == {'doc-2', 'doc-3'}
+
+
+def test_recommend_native_resolves_the_random_ids_of_older_rows():
+    store = make_store(drv, collection='vx_rec')
+    _corpus(store)
+    legacy = _unit([1, 0, 0, 0, 0, 0])
+    pid = str(uuid.uuid4())
+    store.client.upsert(
+        store.collection,
+        points=[
+            drv.PointStruct(
+                id=pid,
+                vector=legacy.tolist(),
+                payload={
+                    'content': 'legacy',
+                    'meta': {
+                        'objectId': 'old',
+                        'chunkId': 0,
+                        'nodeId': 'chunk_1',
+                        'parent': 'C:/old.md',
+                        'isDeleted': False,
+                        'isTable': False,
+                        'tableId': 0,
+                    },
+                },
+            )
+        ],
+    )
+    docs = store.recommendNative(positive=[('old', 0)], negative=[], strategy='best_score', limit=100)
+    assert ('old', 0) not in _keys(docs), 'the example (a random id) is excluded like any other'
+    assert len(docs) == 20
+
+
+def test_recommend_native_without_any_resolvable_example_asks_nothing():
+    store = make_store(drv, collection='vx_rec')
+    _corpus(store)
+    before = Client.calls.get('query_points', 0)
+    assert (
+        store.recommendNative(positive=[('ghost', 0), ('schema', 0)], negative=[], strategy='best_score', limit=5) == []
+    )
+    assert Client.calls.get('query_points', 0) == before
+
+
+def test_recommend_native_drops_unknown_examples_and_keeps_the_rest():
+    store = make_store(drv, collection='vx_rec')
+    _corpus(store)
+    docs = store.recommendNative(
+        positive=[('ghost', 0), ('doc-1', 0)], negative=[('ghost', 1)], strategy='best_score', limit=100
+    )
+    assert len(docs) == 19 and ('doc-1', 0) not in _keys(docs)
+
+
+def test_recommend_native_on_a_missing_collection_is_empty():
+    store = make_store(drv, collection='vx_absent')
+    assert store.recommendNative(positive=[('doc-0', 0)], negative=[], strategy='best_score', limit=5) == []
+
+
+@pytest.mark.parametrize('strategy', ['', 'nearest', None, 'sum'])
+def test_recommend_native_refuses_a_strategy_it_does_not_serve(strategy):
+    store = make_store(drv, collection='vx_rec')
+    _corpus(store)
+    with pytest.raises(ValueError):
+        store.recommendNative(positive=[('doc-0', 0)], negative=[], strategy=strategy, limit=5)
+
+
+def test_recommend_native_searches_exactly():
+    store = make_store(drv, collection='vx_rec')
+    _corpus(store)
+    seen = {}
+    original = Client.query_points
+
+    def spy(self, *args, **kwargs):
+        seen.update(kwargs)
+        return original(self, *args, **kwargs)
+
+    Client.query_points = spy
+    try:
+        store.recommendNative(positive=[('doc-0', 0)], negative=[], strategy='best_score', limit=4)
+    finally:
+        Client.query_points = original
+    assert seen['limit'] == 4 and seen['with_vectors'] is False and seen['with_payload'] is True
+    assert seen['search_params'].exact is True
+    assert seen['query'].recommend.strategy == 'best_score'
+    assert seen['query'].recommend.positive and seen['query'].recommend.negative is None
+
+
+def test_recommend_native_never_hands_qdrant_an_id_remembered_for_a_removed_point():
+    store = make_store(drv, collection='vx_rec')
+    _corpus(store)
+    store.getVectors([('doc-1', 0), ('doc-2', 0)])  # the driver remembers both point ids
+    store.removeCounted(['doc-1'])
+    docs = store.recommendNative(positive=[('doc-1', 0), ('doc-2', 0)], negative=[], strategy='best_score', limit=100)
+    assert ('doc-2', 0) not in _keys(docs) and not any(k[0] == 'doc-1' for k in _keys(docs))
+    assert len(docs) == 15
+
+
+# ---------------------------------------------------------------------------
+# What the node reports for the driver
+# ---------------------------------------------------------------------------
+
+
+class _Node(VectorStoreToolMixin, IInstanceBase):
+    pass
+
+
+def _node(store):
+    inst = object.__new__(_Node)
+    inst.IGlobal = SimpleNamespace(store=store, glb=SimpleNamespace(logicalType='qdrant'))
+    inst.instance = SimpleNamespace(pipeType={'id': 'store_1'})
+    return inst
+
+
+def test_the_dialect_reports_native_recommendation_and_whole_word_keyword_search():
+    store = make_store(drv, collection='vx_rec')
+    _corpus(store)
+    answer = _node(store).dialect({})
+    assert answer['capabilities']['recommend_best_score'] is True
+    assert answer['capabilities']['search_keyword'] is True
+    if 'keyword_match' not in answer:
+        pytest.skip('NEEDS:E1 merged — integration gate G2 (dialect reports VX_KEYWORD_MATCH as keyword_match)')
+    assert answer['keyword_match'] == 'token'

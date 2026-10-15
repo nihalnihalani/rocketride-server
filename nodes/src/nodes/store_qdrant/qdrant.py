@@ -210,7 +210,15 @@ def _exact_knn(
 
 class Store(DocumentStoreBase):
     # Explorer capabilities beyond the hooks this class overrides (vx_types.CAPABILITY_KEYS).
-    VX_DRIVER_CAPABILITIES = frozenset({'documents_distinct', 'knn_native', 'search_keyword'})
+    # 'recommend_best_score': Qdrant ranks a best_score recommendation itself (recommendNative).
+    VX_DRIVER_CAPABILITIES = frozenset({'documents_distinct', 'knn_native', 'search_keyword', 'recommend_best_score'})
+
+    # How keyword search matches (dialect.keyword_match): MatchText over the content
+    # text index, which matches whole words (tokens), not fragments of them.
+    VX_KEYWORD_MATCH = 'token'
+
+    # The recommendation strategies recommendNative asks Qdrant for.
+    RECOMMEND_STRATEGIES = ('average_vector', 'best_score')
 
     # Support level reported by the explorer's dialect: the unmocked live suite
     # (nodes/test/test_store_qdrant_full.py) runs on a new and a legacy collection.
@@ -1546,6 +1554,38 @@ class Store(DocumentStoreBase):
                     resolved[key] = record.id
         return resolved
 
+    def _storedPointIds(self, keys: Sequence[Tuple[str, int]]) -> Dict[Tuple[str, int], Any]:
+        """
+        Point id per key, read from the collection now (never from the remembered ids).
+
+        The deterministic id first, then by filter for every miss (rows written before
+        deterministic ids). A key with no stored point is left out, so an id remembered
+        for a point removed since is never handed to Qdrant (which would answer 404).
+        """
+        if not keys:
+            return {}
+        want = set(keys)
+        found: Dict[Tuple[str, int], Any] = {}
+        ids = [point_id_for(oid, chunk) for oid, chunk in keys]
+        for start in range(0, len(ids), 1000):
+            for record in self.client.retrieve(
+                collection_name=self.collection,
+                ids=ids[start : start + 1000],
+                with_payload=['meta'],
+                with_vectors=False,
+            ):
+                meta = _meta_of(record)
+                key = (str(meta.get('objectId')), _int_or_none(meta.get('chunkId')))
+                if key in want and key not in found:
+                    found[key] = record.id
+        misses = [key for key in keys if key not in found]
+        for record in self._readByKeys(misses, with_payload=['meta']):
+            meta = _meta_of(record)
+            key = (str(meta.get('objectId')), _int_or_none(meta.get('chunkId')))
+            if key in want and key not in found:
+                found[key] = record.id
+        return found
+
     def knnGraph(self, keys, vectors, metric, k):
         """
         The k-nearest-neighbour graph over the sampled keys, computed by Qdrant.
@@ -1611,6 +1651,75 @@ class Store(DocumentStoreBase):
             sims=np.concatenate(out_sims) if out_sims else np.zeros(0, dtype=np.float32),
             source='native',
         )
+
+    def recommendNative(
+        self,
+        *,
+        positive: Sequence[Tuple[str, int]],
+        negative: Sequence[Tuple[str, int]],
+        strategy: str,
+        limit: int,
+        object_ids: Optional[Sequence[str]] = None,
+        vector: Optional[Sequence[float]] = None,
+    ) -> List[Doc]:
+        """
+        The chunks Qdrant recommends from example keys (and the query vector), best first.
+
+        The explorer's ``recommend`` tool calls this for ``strategy='best_score'``
+        (capability ``recommend_best_score``); ``'average_vector'`` is answered too, so
+        the node's own average can be held against Qdrant's ranking.
+
+        Keys resolve to point ids (the deterministic id, else by filter for rows
+        written before it); a key that resolves to no point is left out, and the
+        control record is never an example. ``vector`` (the query vector the embedding
+        node returned) is one more positive example. Candidates are the active rows of
+        real documents, within ``object_ids`` when given; Qdrant never returns an
+        example point. Each Doc carries ``metadata.pointId``, no vector, and as
+        ``score`` the score Qdrant gave it: for ``best_score``, ``sigmoid(s)`` of the
+        best positive similarity when it beats the best negative one, else
+        ``-sigmoid(s)`` of the best negative similarity (a value in [-1, 1]).
+
+        Returns [] when the collection is missing or no example resolves (for
+        ``average_vector``: no positive one). Raises ValueError for any other strategy.
+        """
+        if strategy not in self.RECOMMEND_STRATEGIES:
+            raise ValueError(f'unknown recommendation strategy {strategy!r}')
+        if not self._exists():
+            return []
+
+        def wanted(keys: Sequence[Tuple[str, int]]) -> List[Tuple[str, int]]:
+            return list(dict.fromkeys((str(o), int(c)) for o, c in keys or () if str(o) != CONTROL_OBJECT_ID))
+
+        pos, neg = wanted(positive), wanted(negative)
+        pids = self._storedPointIds(list(dict.fromkeys(pos + neg)))
+        positives: List[Any] = [pids[key] for key in pos if key in pids]
+        negatives: List[Any] = [pids[key] for key in neg if key in pids]
+        if vector is not None:
+            positives.append([float(v) for v in vector])
+        if not positives and (strategy == 'average_vector' or not negatives):
+            return []
+        points = self.client.query_points(
+            collection_name=self.collection,
+            query=models.RecommendQuery(
+                recommend=models.RecommendInput(
+                    positive=positives or None, negative=negatives or None, strategy=strategy
+                )
+            ),
+            query_filter=self._documentsFilter('active', object_ids),
+            with_vectors=False,
+            with_payload=True,
+            limit=max(1, int(limit)),
+            search_params=SearchParams(exact=True),
+        ).points
+        self._rememberPointIds(points)
+        docs: List[Doc] = []
+        for point in points:
+            if point.payload is None:
+                continue
+            doc = self._recordToDoc(point)
+            doc.score = float(point.score)
+            docs.append(doc)
+        return docs
 
     def removeCounted(self, objectIds: List[str]) -> Optional[int]:
         """Remove every chunk of ``objectIds`` (deleted rows too); return the rows removed. Never the control record."""
