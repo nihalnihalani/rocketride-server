@@ -201,8 +201,9 @@ Drop files or folders on the drop zone, or use **Add files** and **Add
 folder**. A folder keeps its structure in the stored paths, and the **Store
 under folder** box puts a prefix in front of every path. Accepted: PDF, DOCX,
 PPTX, XLSX, ODT, RTF, TXT, MD, CSV, HTML and JSON, up to 20 files per drop,
-50 MB per file and 200 MB per drop. The app checks these before sending. A
-drop with the same path twice is refused before anything is sent.
+50 MB per file and 200 MB per drop. The app checks these before sending: a
+file over a limit is excluded, not ingested, and its row says why. A drop with
+the same path twice is refused before anything is sent.
 
 Before sending, the app checks each path against the store. If a document
 added through a Drag & Drop source has that path (see
@@ -416,7 +417,9 @@ Explorer.
   light mode, and t-SNE at most 1,000. The directory loads 5,000 documents on
   its own; **Load more** goes further.
 - **Uploads.** 20 files, 50 MB per file and 200 MB per drop, checked by the
-  app before it sends anything.
+  app before it sends anything; a file over a limit is excluded, not ingested.
+  These are the only upload limits: the engine does not apply the templates'
+  parser size setting in this release.
 - **Read-only cards** cannot add or remove documents.
 - **Answers need a model.** Chat needs a working LLM (a key, or a local
   OpenAI-compatible server); everything else does not.
