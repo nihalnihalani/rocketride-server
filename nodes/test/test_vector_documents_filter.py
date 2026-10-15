@@ -531,16 +531,6 @@ def test_pgvector_a_document_whose_rows_left_the_mode_between_the_two_statements
     assert [r.objectId for r in page.items] == ['gappy', 'whole']
 
 
-def _tool_reports_health() -> bool:
-    import ai.common.store.vx_tools as vx_tools
-
-    return "'max_chunk_id'" in inspect.getsource(vx_tools.VectorExplorerTools.documents)
-
-
-@pytest.mark.skipif(
-    not _tool_reports_health(),
-    reason='NEEDS:E0,E1 merged — integration gate G2 (DocumentRow and the documents answer gain max_chunk_id/deleted_chunks)',
-)
 def test_documents_tool_answers_the_health_fields(pg):
     store = pg.open()
     _seed(store, HEALTH)

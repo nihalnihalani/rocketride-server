@@ -414,6 +414,4 @@ def test_the_dialect_reports_native_recommendation_and_whole_word_keyword_search
     answer = _node(store).dialect({})
     assert answer['capabilities']['recommend_best_score'] is True
     assert answer['capabilities']['search_keyword'] is True
-    if 'keyword_match' not in answer:
-        pytest.skip('NEEDS:E1 merged — integration gate G2 (dialect reports VX_KEYWORD_MATCH as keyword_match)')
     assert answer['keyword_match'] == 'token'
