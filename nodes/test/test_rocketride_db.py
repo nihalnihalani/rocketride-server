@@ -237,6 +237,147 @@ class TestBrokerConfig:
         assert (config.tier, config.missing) == ('legacy', ('ROCKETRIDE_DB_BROKER_URL',))
 
 
+BASE_DSN = 'postgresql://role:pw@rocketride-data-pool.ns.svc:5432/t_acme'
+CA = '/etc/rocketride/trust/db-ca.crt'
+
+
+class TestEnforceDsnTls:
+    """The DSN is parsed and rebuilt, never appended to; anything it does not
+    understand fails closed instead of being dropped.
+    """
+
+    def _hosted(self, dsn):
+        return rrdb.enforce_dsn_tls(dsn, hosted=True, ca_file=CA)
+
+    @pytest.mark.parametrize('query', ['?sslmode=require', '', '?sslmode=verify-ca', '?sslmode=verify-full'])
+    def test_hosted_upgrades_to_verify_full_against_the_operator_ca(self, query):
+        out = self._hosted(BASE_DSN + query)
+        assert out == f'{BASE_DSN}?sslmode=verify-full&sslrootcert={CA}'
+
+    def test_hosted_keeps_userinfo_host_port_and_database_byte_for_byte(self):
+        dsn = 'postgresql://ro%40le:p%40ss%25w%2Fd@pool.internal:6432/t_acme?sslmode=require'
+        out = self._hosted(dsn)
+        before, after = urllib_split(dsn), urllib_split(out)
+        assert (after.netloc, after.path) == (before.netloc, before.path)
+        assert after.scheme == 'postgresql' and not after.fragment
+
+    @pytest.mark.parametrize(
+        'dsn',
+        [
+            BASE_DSN + '?sslmode=disable',
+            BASE_DSN + '?sslmode=allow',
+            BASE_DSN + '?sslmode=prefer',
+            BASE_DSN + '?sslmode=Require',
+            BASE_DSN + '?sslmode=',
+            BASE_DSN + '?sslmode=verify-full&sslmode=disable',
+            BASE_DSN + '?sslmode=disable&sslmode=verify-full',
+            BASE_DSN + '?sslmode=require&ssl%6dode=disable',
+            BASE_DSN + '?host=evil.example',
+            BASE_DSN + '?hostaddr=203.0.113.9',
+            BASE_DSN + '?service=x',
+            BASE_DSN + '?passfile=/tmp/x',
+            BASE_DSN + '?options=-c%20search_path%3Dpublic',
+            BASE_DSN + '?sslcert=/tmp/c',
+            BASE_DSN + '?sslkey=/tmp/k',
+            BASE_DSN + '?sslnegotiation=direct',
+            BASE_DSN + '?requiressl=0',
+            BASE_DSN + '?channel_binding=disable',
+            BASE_DSN + '?target_session_attrs=any',
+            BASE_DSN + '?dbname=t_other',
+            BASE_DSN + '?user=other',
+            BASE_DSN + '?sslrootcert=/dev/null',
+            BASE_DSN + '?sslmode=require#frag',
+            BASE_DSN + '?foo',
+            'postgresql://role:pw@a:5432,evil:5432/t_acme?sslmode=require',
+            'postgresql:///t_acme?sslmode=require',
+            'host=evil sslmode=disable',
+            'mysql://u:p@h/db',
+        ],
+    )
+    def test_hosted_refuses_what_it_does_not_understand(self, dsn):
+        with pytest.raises(RuntimeError) as excinfo:
+            self._hosted(dsn)
+        assert 'pw' not in str(excinfo.value).replace('password', '')  # never echoes the DSN
+        assert 'rocketride-data-pool' not in str(excinfo.value)
+
+    def test_hosted_without_a_ca_fails_closed_naming_the_variable(self):
+        with pytest.raises(RuntimeError, match='RR_DB_TLS_ROOT_CERT'):
+            rrdb.enforce_dsn_tls(BASE_DSN + '?sslmode=require', hosted=True, ca_file='')
+
+    def test_non_hosted_default_pins_require_and_keeps_stronger_modes(self):
+        assert rrdb.enforce_dsn_tls(BASE_DSN, hosted=False) == BASE_DSN + '?sslmode=require'
+        assert rrdb.enforce_dsn_tls(BASE_DSN + '?sslmode=require', hosted=False) == BASE_DSN + '?sslmode=require'
+        out = rrdb.enforce_dsn_tls(f'{BASE_DSN}?sslmode=verify-full&sslrootcert=/ca.pem', hosted=False)
+        assert out == f'{BASE_DSN}?sslmode=verify-full&sslrootcert=/ca.pem'
+
+    @pytest.mark.parametrize('mode', ['disable', 'allow', 'prefer'])
+    def test_non_hosted_rejects_a_downgrade_unless_the_operator_opts_in(self, mode):
+        with pytest.raises(RuntimeError, match='RR_DB_ALLOW_INSECURE_DSN'):
+            rrdb.enforce_dsn_tls(f'{BASE_DSN}?sslmode={mode}', hosted=False)
+        out = rrdb.enforce_dsn_tls(f'{BASE_DSN}?sslmode={mode}', hosted=False, allow_insecure=True)
+        assert out == f'{BASE_DSN}?sslmode={mode}'
+
+    def test_the_insecure_opt_in_is_ignored_on_a_hosted_engine(self):
+        with pytest.raises(RuntimeError):
+            rrdb.enforce_dsn_tls(BASE_DSN + '?sslmode=disable', hosted=True, ca_file=CA, allow_insecure=True)
+
+    @pytest.mark.parametrize('dsn', [BASE_DSN + '?host=evil.example', BASE_DSN + '?sslmode=a&sslmode=b'])
+    def test_non_hosted_still_refuses_overrides_and_duplicates(self, dsn):
+        with pytest.raises(RuntimeError):
+            rrdb.enforce_dsn_tls(dsn, hosted=False)
+
+    def test_the_sqlalchemy_form_keeps_the_rebuilt_query_unchanged(self):
+        out = self._hosted(BASE_DSN + '?sslmode=require')
+        url = rrdb.to_sqlalchemy_url(out)
+        assert url == out.replace('postgresql://', 'postgresql+psycopg2://', 1)
+        assert url.endswith('?sslmode=verify-full&sslrootcert=' + CA)
+
+
+def urllib_split(dsn):
+    import urllib.parse
+
+    return urllib.parse.urlsplit(dsn)
+
+
+class TestHostedChildAssertion:
+    """A hosted task re-checks the delivered DSN; it never rewrites it."""
+
+    GOOD = f'{BASE_DSN}?sslmode=verify-full&sslrootcert={CA}'
+
+    @pytest.fixture(autouse=True)
+    def _clean_env(self, monkeypatch):
+        for name in (rrdb.DB_DSNS_ENV, rrdb.DB_RESOLVE_ERROR_ENV):
+            monkeypatch.delenv(name, raising=False)
+
+    def _deliver(self, monkeypatch, dsn, *, hosted):
+        monkeypatch.setenv(rrdb.DB_DSNS_ENV, json.dumps({'org': dsn}))
+        monkeypatch.setattr(sys, 'argv', ['engine', 'node.py', '--hosted'] if hosted else ['engine', 'node.py'])
+
+    def test_a_conforming_dsn_passes_unchanged(self, monkeypatch):
+        self._deliver(monkeypatch, self.GOOD, hosted=True)
+        assert rrdb.resolve_rocketride_dsn() == self.GOOD
+
+    @pytest.mark.parametrize(
+        'dsn',
+        [
+            BASE_DSN + '?sslmode=require',
+            BASE_DSN,
+            BASE_DSN + '?sslmode=verify-full',
+            f'{BASE_DSN}?sslmode=verify-full&sslrootcert={CA}&sslmode=disable',
+            f'{BASE_DSN}?sslmode=verify-full&sslrootcert={CA}&host=evil.example',
+            f'{BASE_DSN}?sslmode=disable&sslrootcert={CA}',
+        ],
+    )
+    def test_a_weaker_or_conflicting_dsn_is_refused_in_a_hosted_task(self, monkeypatch, dsn):
+        self._deliver(monkeypatch, dsn, hosted=True)
+        with pytest.raises(ValueError, match='hosted'):
+            rrdb.resolve_rocketride_dsn()
+
+    def test_a_task_that_is_not_hosted_is_not_asserted(self, monkeypatch):
+        self._deliver(monkeypatch, BASE_DSN + '?sslmode=require', hosted=False)
+        assert rrdb.resolve_rocketride_dsn() == BASE_DSN + '?sslmode=require'
+
+
 class TestResolveRocketrideDsn:
     """Nodes only read what the task engine delivered; they never resolve."""
 

@@ -458,6 +458,8 @@ class AccountBase(ABC):
         Returns:
             A libpq/SQLAlchemy-compatible PostgreSQL DSN for the tenant DB
             (e.g. ``postgresql://role:pass@pooler:5432/t_<slug>?sslmode=require``).
+            On a hosted engine the query is always
+            ``sslmode=verify-full&sslrootcert=<RR_DB_TLS_ROOT_CERT>``.
 
         Raises:
             NotImplementedError: broker environment not configured.
@@ -490,11 +492,15 @@ class AccountBase(ABC):
             raise ValueError(f'unknown database scope: {scope!r}')
         # A hosted engine takes https only: the loopback http exception is for
         # a local dev rig, and nothing on a hosted engine runs one.
-        self._check_broker_url(broker_url, allow_loopback_http=not self._is_hosted())
+        hosted = self._is_hosted()
+        self._check_broker_url(broker_url, allow_loopback_http=not hosted)
+        ca_file = self._db_tls_ca_file(hosted)
 
         import asyncio
 
-        return await asyncio.to_thread(self._call_db_broker, broker_url, broker_token, body)
+        return await asyncio.to_thread(
+            self._call_db_broker, broker_url, broker_token, body, hosted=hosted, ca_file=ca_file
+        )
 
     @staticmethod
     def _warn_legacy_broker_names() -> None:
@@ -585,7 +591,7 @@ class AccountBase(ABC):
         return urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
 
     @staticmethod
-    def _call_db_broker(url: str, token: str, body: dict) -> str:
+    def _call_db_broker(url: str, token: str, body: dict, *, hosted: bool = False, ca_file: str = '') -> str:
         """Blocking POST of ``body`` to the provisioner; runs in a worker thread.
 
         Stdlib-only on purpose: the account layer has no async-HTTP dependency,
@@ -634,25 +640,61 @@ class AccountBase(ABC):
         dsn = answer.get('dsn') if isinstance(answer, dict) else None
         if not dsn or not isinstance(dsn, str):
             raise RuntimeError('DB broker response did not include a DSN')
-        return AccountBase._pin_dsn_tls(dsn)
+        return AccountBase._pin_dsn_tls(dsn, hosted=hosted, ca_file=ca_file)
 
     @staticmethod
-    def _pin_dsn_tls(dsn: str) -> str:
-        """Validate the broker's DSN and guarantee it carries an sslmode.
+    def _db_tls_ca_file(hosted: bool) -> str:
+        """The operator's CA file for tenant database connections, or '' off a hosted engine.
 
-        The broker contract sends ``sslmode=require``; this pins that
-        guarantee client-side so a broker regression cannot silently
-        downgrade every tenant connection to cleartext.
+        ``RR_DB_TLS_ROOT_CERT`` names a SINGLE-PURPOSE CA file (the CA that
+        signs the database servers). libpq ignores ``SSL_CERT_FILE``, and the
+        merged system + broker bundle it points at on the hosted engine is not
+        acceptable. On a hosted engine a missing, unreadable or certificate-less
+        file fails closed; the check runs before the broker is called so that
+        nothing is provisioned for a DSN that cannot be delivered.
+
+        Raises:
+            RuntimeError: hosted, and the variable is unset or names no usable CA.
         """
-        from urllib.parse import parse_qs, urlparse
+        from ai.common.rocketride_db import DB_TLS_ROOT_CERT_ENV
 
-        parsed = urlparse(dsn)
-        if parsed.scheme.lower() not in ('postgres', 'postgresql'):
-            raise RuntimeError(f'DB broker returned a non-PostgreSQL DSN (scheme {parsed.scheme!r})')
-        if 'sslmode' in parse_qs(parsed.query):
-            return dsn
-        separator = '&' if parsed.query else '?'
-        return f'{dsn}{separator}sslmode=require'
+        path = os.environ.get(DB_TLS_ROOT_CERT_ENV, '').strip()
+        if not hosted:
+            return path
+        if not path:
+            raise RuntimeError(
+                f'{DB_TLS_ROOT_CERT_ENV} is not set: a hosted engine verifies the database server certificate '
+                'and has no CA file to verify it against'
+            )
+        try:
+            with open(path, encoding='utf-8') as f:
+                pem = f.read()
+        except (OSError, UnicodeDecodeError):
+            pem = ''
+        if '-----BEGIN CERTIFICATE-----' not in pem or '-----END CERTIFICATE-----' not in pem:
+            raise RuntimeError(
+                f'{DB_TLS_ROOT_CERT_ENV} names a file that is missing, unreadable or holds no PEM certificate'
+            )
+        return path
+
+    @staticmethod
+    def _pin_dsn_tls(dsn: str, *, hosted: bool = False, ca_file: str = '') -> str:
+        """Check the broker's DSN against the TLS policy and return the DSN to issue.
+
+        The broker contract sends ``sslmode=require``; this enforces the policy
+        client-side so a broker regression cannot silently downgrade every
+        tenant connection, and a hosted engine verifies the database server
+        (``verify-full`` against ``ca_file``). See
+        :func:`ai.common.rocketride_db.enforce_dsn_tls` for the rules.
+        """
+        from ai.common.rocketride_db import DB_ALLOW_INSECURE_DSN_ENV, enforce_dsn_tls
+
+        return enforce_dsn_tls(
+            dsn,
+            hosted=hosted,
+            ca_file=ca_file,
+            allow_insecure=os.environ.get(DB_ALLOW_INSECURE_DSN_ENV, '').strip() == '1',
+        )
 
     # =========================================================================
     # DEPLOYMENTS — the teams-as-environments interface.

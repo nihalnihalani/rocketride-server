@@ -37,6 +37,7 @@ import io
 import json
 import ssl
 import threading
+import types
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -84,6 +85,8 @@ class _FakeBroker(BaseHTTPRequestHandler):
         elif tenant == 'no-sslmode-tenant':
             bare = 'postgresql://r_t1_ab:secret@pooler.internal:5432/t_t1_ab'
             payload = {'database': 't_t1_ab', 'role': 't_t1_ab_rw', 'dsn': bare, 'created': False}
+        elif tenant == 'disable-tenant':
+            payload = {'database': 't', 'role': 'r', 'dsn': 'postgresql://r:p@pooler.internal/t?sslmode=disable'}
         elif tenant == 'bad-scheme-tenant':
             payload = {'database': 't_t1_ab', 'role': 't_t1_ab_rw', 'dsn': 'mysql://u:p@h/db', 'created': False}
         else:
@@ -558,3 +561,117 @@ def test_the_two_tiers_are_never_mixed(two_brokers, monkeypatch, url_var, token_
         _resolve('tenant-1')
     assert str(excinfo.value).endswith(f'(missing: {missing})')
     assert broker_a.requests == []
+
+
+# ---------------------------------------------------------------------------
+# Tenant database TLS: hosted verify-full against the operator CA, fail closed
+# ---------------------------------------------------------------------------
+
+PEM = '-----BEGIN CERTIFICATE-----\nMIIBszCCAVmgAwIBAgIUEXAMPLEONLYnotARealCertificate\n-----END CERTIFICATE-----\n'
+BROKER_DSN = 'postgresql://role:p%40ss%25w@rocketride-data-pool.ns.svc:5432/t_acme?sslmode=require'
+
+
+class _Hosted(_Minimal):
+    capabilities = ('saas',)
+
+
+class _FakeResponse:
+    def __init__(self, dsn):
+        self._raw = json.dumps({'dsn': dsn}).encode('utf-8')
+
+    def read(self):
+        return self._raw
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+@pytest.fixture()
+def hosted_broker(monkeypatch, tmp_path):
+    """A hosted engine, https broker URL, operator CA file; the wire is faked."""
+    ca = tmp_path / 'db-ca.crt'
+    ca.write_text(PEM)
+    monkeypatch.setenv('RR_DB_BROKER_URL', 'https://broker.example/provision')
+    monkeypatch.setenv('RR_DB_BROKER_TOKEN', TEST_TOKEN)
+    monkeypatch.setenv('RR_DB_TLS_ROOT_CERT', str(ca))
+    answer = {'dsn': BROKER_DSN}
+    calls = []
+
+    def fake_open(self, request, data=None, timeout=None):
+        calls.append(request)
+        return _FakeResponse(answer['dsn'])
+
+    monkeypatch.setattr(urllib.request.OpenerDirector, 'open', fake_open)
+    return types.SimpleNamespace(ca=ca, answer=answer, calls=calls)
+
+
+def _resolve_hosted():
+    return asyncio.run(_Hosted().resolve_db_dsn('org-1'))
+
+
+def test_hosted_issues_verify_full_against_the_operator_ca(hosted_broker):
+    dsn = _resolve_hosted()
+    assert dsn == (
+        'postgresql://role:p%40ss%25w@rocketride-data-pool.ns.svc:5432/t_acme'
+        f'?sslmode=verify-full&sslrootcert={hosted_broker.ca}'
+    )
+    assert len(hosted_broker.calls) == 1
+
+
+@pytest.mark.parametrize(
+    'dsn',
+    [
+        'postgresql://r:p@pool.ns.svc/t?sslmode=disable',
+        'postgresql://r:p@pool.ns.svc/t?sslmode=require&sslmode=disable',
+        'postgresql://r:p@pool.ns.svc/t?sslmode=require&host=evil.example',
+        'postgresql://r:p@pool.ns.svc/t?sslmode=require&sslrootcert=/dev/null',
+    ],
+)
+def test_hosted_refuses_a_broker_dsn_that_weakens_or_overrides(hosted_broker, dsn):
+    hosted_broker.answer['dsn'] = dsn
+    with pytest.raises(RuntimeError, match='DB broker returned'):
+        _resolve_hosted()
+
+
+def test_hosted_without_a_ca_variable_fails_before_the_broker_is_called(hosted_broker, monkeypatch):
+    monkeypatch.delenv('RR_DB_TLS_ROOT_CERT')
+    with pytest.raises(RuntimeError) as excinfo:
+        _resolve_hosted()
+    assert 'RR_DB_TLS_ROOT_CERT' in str(excinfo.value)
+    assert hosted_broker.calls == []  # nothing was provisioned for a DSN that could not be delivered
+
+
+@pytest.mark.parametrize(
+    'content', [None, '', 'not a certificate\n', '-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----\n']
+)
+def test_hosted_with_a_missing_or_useless_ca_file_fails_closed(hosted_broker, content):
+    if content is None:
+        hosted_broker.ca.unlink()
+    else:
+        hosted_broker.ca.write_text(content)
+    with pytest.raises(RuntimeError) as excinfo:
+        _resolve_hosted()
+    message = str(excinfo.value)
+    assert 'RR_DB_TLS_ROOT_CERT' in message
+    assert str(hosted_broker.ca) not in message and 'rocketride-data-pool' not in message
+    assert hosted_broker.calls == []
+
+
+def test_a_non_hosted_engine_rejects_a_broker_downgrade_by_default(broker):
+    with pytest.raises(RuntimeError, match='RR_DB_ALLOW_INSECURE_DSN'):
+        _resolve('disable-tenant')
+
+
+def test_the_insecure_opt_in_lets_a_non_hosted_engine_accept_it(broker, monkeypatch):
+    monkeypatch.setenv('RR_DB_ALLOW_INSECURE_DSN', '1')
+    assert _resolve('disable-tenant') == 'postgresql://r:p@pooler.internal/t?sslmode=disable'
+
+
+def test_the_insecure_opt_in_does_nothing_on_a_hosted_engine(hosted_broker, monkeypatch):
+    monkeypatch.setenv('RR_DB_ALLOW_INSECURE_DSN', '1')
+    hosted_broker.answer['dsn'] = 'postgresql://r:p@pool.ns.svc/t?sslmode=disable'
+    with pytest.raises(RuntimeError, match='DB broker returned'):
+        _resolve_hosted()

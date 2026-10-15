@@ -40,6 +40,7 @@ Stdlib only: nodes tests load this file in isolation.
 import json
 import os
 import re
+import sys
 import urllib.parse
 from collections.abc import Iterable, Mapping, MutableMapping
 from typing import NamedTuple
@@ -230,6 +231,138 @@ def _describe(scope: str, target: str) -> str:
     return f'the {scope} database {target!r}' if target else f"the run's own {scope} database"
 
 
+# Task subprocesses of a hosted engine get this flag on their command line
+# (task_engine.CONST_HOSTED_CHILD_FLAG); a pipeline can add flags but not remove it.
+HOSTED_CHILD_FLAG = '--hosted'
+
+_DSN_SCHEMES = ('postgres', 'postgresql')
+_INSECURE_SSLMODES = ('disable', 'allow', 'prefer')
+_SSLMODES = (*_INSECURE_SSLMODES, 'require', 'verify-ca', 'verify-full')
+# The only connection parameters a tenant DSN may carry. Anything else (host,
+# hostaddr, service, dbname, user, passfile, options, sslcert, sslkey,
+# sslnegotiation, requiressl, channel_binding, ...) can redirect the
+# connection or weaken its TLS, so it is refused, not dropped.
+_DSN_QUERY_KEYS = ('sslmode', 'sslrootcert')
+
+
+def _inspect_dsn(dsn: str) -> tuple:
+    """Split a tenant DSN into ``(SplitResult, {query key: value})`` or refuse it.
+
+    Raises:
+        ValueError: with a noun phrase that never repeats any part of the DSN
+            (it carries a password): a non-PostgreSQL DSN, one with a
+            fragment / several hosts / no host / a bad port, a repeated
+            parameter (after percent-decoding, so ``ssl%6dode`` counts as
+            ``sslmode``), or a parameter outside ``_DSN_QUERY_KEYS``.
+    """
+    try:
+        parts = urllib.parse.urlsplit(dsn)
+        host = parts.hostname
+        parts.port  # noqa: B018 (raises ValueError on a bad port)
+    except ValueError:
+        raise ValueError('DSN that cannot be parsed') from None
+    if parts.scheme.lower() not in _DSN_SCHEMES:
+        raise ValueError(f'non-PostgreSQL DSN (scheme {parts.scheme!r})')
+    if parts.fragment or not host or ',' in parts.netloc.rpartition('@')[2]:
+        raise ValueError('DSN with a fragment, several hosts or no host')
+    pairs = urllib.parse.parse_qsl(parts.query, keep_blank_values=True, separator='&')
+    keys = [key for key, _ in pairs]
+    repeated = sorted({key for key in keys if keys.count(key) > 1})
+    if repeated:
+        raise ValueError(f'DSN with a repeated parameter: {", ".join(repeated)}')
+    unsupported = sorted(set(keys) - set(_DSN_QUERY_KEYS))
+    if unsupported:
+        raise ValueError(f'DSN with unsupported parameter(s): {", ".join(unsupported)}')
+    return parts, dict(pairs)
+
+
+def enforce_dsn_tls(dsn: str, *, hosted: bool, ca_file: str = '', allow_insecure: bool = False) -> str:
+    """Check a broker-issued tenant DSN against the TLS policy and return the DSN to hand out.
+
+    The DSN is PARSED and REBUILT, never appended to: scheme, userinfo, host,
+    port and database are carried over byte for byte (a password with ``%40``
+    or ``%25`` stays as it was) and only the query is rewritten. Any query
+    parameter other than ``sslmode`` / ``sslrootcert``, a repeated one, a
+    fragment, several hosts or a non-PostgreSQL scheme is refused. libpq takes
+    the LAST of a repeated parameter while SQLAlchemy turns it into a tuple,
+    and ``host=`` / ``hostaddr=`` / ``service=`` in the query override the
+    URL, so a DSN is only safe when it says each thing once.
+
+    Hosted engine (``hosted=True``): the connection must verify the server.
+    A broker ``sslmode`` of require, verify-ca or verify-full is raised to
+    ``verify-full`` and ``sslrootcert=<ca_file>`` is added. disable, allow,
+    prefer, an unknown mode or a broker-chosen ``sslrootcert`` are refused,
+    and a missing ``ca_file`` fails closed (``RR_DB_TLS_ROOT_CERT``).
+    ``ca_file`` must be a single-purpose CA file: libpq reads ``sslrootcert``
+    only and ignores ``SSL_CERT_FILE``, so the merged system + broker bundle
+    that ``SSL_CERT_FILE`` points at is NOT acceptable here. Giving it a CA
+    that signs only the database servers is also what makes a DSN host the
+    broker should not have chosen unusable. ``allow_insecure`` is ignored.
+
+    Otherwise (a local or self-hosted engine): an absent ``sslmode`` becomes
+    ``require`` and a stronger one passes. disable, allow and prefer are
+    refused unless ``allow_insecure`` (``RR_DB_ALLOW_INSECURE_DSN=1``) is set.
+    A ``sslrootcert`` the broker chose is kept there.
+
+    Raises:
+        RuntimeError: the DSN or the configuration fails the policy; the
+            message never contains the DSN.
+    """
+    try:
+        parts, query = _inspect_dsn(dsn)
+    except ValueError as e:
+        raise RuntimeError(f'DB broker returned a {e}') from None
+
+    mode = query.get('sslmode')
+    if mode is not None and mode not in _SSLMODES:
+        raise RuntimeError('DB broker returned a DSN with an unsupported sslmode')
+    if hosted:
+        if not ca_file:
+            raise RuntimeError(
+                f'{DB_TLS_ROOT_CERT_ENV} is not set: a hosted engine verifies the database server certificate '
+                'and has no CA file to verify it against'
+            )
+        if mode in _INSECURE_SSLMODES:
+            raise RuntimeError(f'DB broker returned a DSN with sslmode={mode}, which a hosted engine never accepts')
+        if 'sslrootcert' in query:
+            raise RuntimeError('DB broker returned a DSN that chooses its own CA: only the operator names it')
+        query = {'sslmode': 'verify-full', 'sslrootcert': ca_file}
+    else:
+        if mode in _INSECURE_SSLMODES and not allow_insecure:
+            raise RuntimeError(
+                f'DB broker returned a DSN with sslmode={mode}; set {DB_ALLOW_INSECURE_DSN_ENV}=1 to accept it '
+                'on a local engine'
+            )
+        query = {
+            'sslmode': mode or 'require',
+            **({'sslrootcert': query['sslrootcert']} if 'sslrootcert' in query else {}),
+        }
+    rebuilt = urllib.parse.urlencode(query, quote_via=urllib.parse.quote, safe='/')
+    return urllib.parse.urlunsplit((parts.scheme, parts.netloc, parts.path, rebuilt, ''))
+
+
+def check_hosted_dsn(dsn: str) -> None:
+    """Assert that ``dsn`` carries the hosted TLS policy; never rewrites it.
+
+    The engine already rebuilt the DSN (:func:`enforce_dsn_tls`); a hosted
+    task checks what it was handed before connecting, so a regression or a
+    tampered delivery fails the node instead of connecting weakly.
+
+    Raises:
+        ValueError: ``sslmode`` is not ``verify-full``, ``sslrootcert`` is
+            missing, or the DSN has a repeated or unsupported parameter.
+    """
+    try:
+        _, query = _inspect_dsn(dsn)
+    except ValueError as e:
+        raise ValueError(f'hosted policy: the delivered database connection is a {e}') from None
+    if query.get('sslmode') != 'verify-full' or not query.get('sslrootcert'):
+        raise ValueError(
+            'hosted policy: the delivered database connection does not verify the server '
+            '(it needs sslmode=verify-full and an sslrootcert)'
+        )
+
+
 def to_sqlalchemy_url(dsn: str) -> str:
     """Normalise a libpq URL DSN to a SQLAlchemy psycopg2 URL.
 
@@ -260,12 +393,15 @@ def resolve_rocketride_dsn(scope: str = 'org', target: str = '') -> str:
     3. Nothing delivered: this process is not a task. Raises DsnNotDelivered.
 
     Returns the raw DSN (URL form, directly usable by ``psycopg2.connect``).
+    In a hosted task (``--hosted`` on the command line) the DSN is first
+    checked against the hosted TLS policy (:func:`check_hosted_dsn`).
     Callers that need a SQLAlchemy engine URL should wrap the result in
     :func:`to_sqlalchemy_url`.
 
     Raises:
-        ValueError: bad scope/target, a key missing from the map, or a
-            server-side resolution failure.
+        ValueError: bad scope/target, a key missing from the map, a
+            server-side resolution failure, or (hosted) a DSN that fails the
+            TLS policy.
         DsnNotDelivered: called outside a task.
     """
     scope, target = db_target({'scope': scope, 'target': target})
@@ -282,7 +418,10 @@ def resolve_rocketride_dsn(scope: str = 'org', target: str = '') -> str:
             raise ValueError(
                 f'this task was not given {_describe(scope, target)}; the engine authorizes it at task start'
             )
-        return dsn.strip()
+        dsn = dsn.strip()
+        if HOSTED_CHILD_FLAG in sys.argv:
+            check_hosted_dsn(dsn)
+        return dsn
 
     # Server-side resolution was attempted and failed, or the engine has no
     # database broker: report that reason.
