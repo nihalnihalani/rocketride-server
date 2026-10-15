@@ -134,7 +134,11 @@ def _check_server_version(version: str) -> None:
 
 class Store(DocumentStoreBase):
     # Explorer capabilities beyond the hooks this class overrides (vx_types.CAPABILITY_KEYS).
-    VX_DRIVER_CAPABILITIES = frozenset({'documents_distinct', 'search_keyword'})
+    # documents_filter: listDocuments applies the filter's has_first_chunk (and names the other keys).
+    VX_DRIVER_CAPABILITIES = frozenset({'documents_distinct', 'search_keyword', 'documents_filter'})
+
+    # dialect.keyword_match: searchKeyword is where_document {'$contains': text}, which matches text fragments.
+    VX_KEYWORD_MATCH = 'substring'
 
     # Support level reported by the explorer's dialect: the unmocked live suite
     # (nodes/test/test_store_chroma_full.py) runs on a new and a legacy collection.
@@ -1164,9 +1168,14 @@ class Store(DocumentStoreBase):
         def position(value: Any) -> bool:
             return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 
-        valid = isinstance(state, dict) and (
-            (state.get('ph') == 'c' and position(state.get('o')))
-            or (state.get('ph') == 'o' and position(state.get('i')))
+        valid = (
+            isinstance(state, dict)
+            and (
+                (state.get('ph') == 'c' and position(state.get('o')))
+                or (state.get('ph') == 'o' and position(state.get('i')))
+            )
+            # 'hf': the has_first_chunk the listing was filtered on (absent when it was not).
+            and state.get('hf', None) in (None, True, False)
         )
         if not valid:
             raise _errors().ToolRefusal(
@@ -1226,7 +1235,7 @@ class Store(DocumentStoreBase):
         ]
         return orphans, len(per_object), capped
 
-    def listDocuments(self, *, cursor, limit, object_ids, deleted, sort):
+    def listDocuments(self, *, cursor, limit, object_ids, deleted, sort, filter=None):
         """
         One page of documents: chunk-0 records by offset, then documents without chunk 0.
 
@@ -1236,22 +1245,53 @@ class Store(DocumentStoreBase):
         ``SWEEP_ROWS_CAP`` rows; beyond it the caveat ``document_count_capped``);
         that read also gives ``total``, so earlier pages answer total=None.
         Rows are not sorted by path (``sorted=False``).
+
+        ``filter`` (contract section 4.4-A): ``has_first_chunk`` is applied by
+        reading only the phase that holds the answer (true: the chunk-0 records,
+        and no sweep, the last page's ``total`` counting them; false: the sweep
+        alone, whose ``total`` then counts the documents without chunk 0). Chroma's metadata filters compare numbers
+        only and cannot aggregate, so every other key is named in
+        ``filter_ignored`` and left to the app. A cursor remembers the
+        ``has_first_chunk`` it was issued under and is refused with another.
         """
         vx = _vx()
         limit = max(1, int(limit))
+        first = filter.has_first_chunk if filter is not None else None
+        ignored = tuple(key for key in filter.given() if key != 'has_first_chunk') if filter is not None else ()
         state = self._decodeCursor(cursor)
-        caveats = ['documents_unsorted']
-        if not self._exists():
-            return vx.DocPage(
-                items=[], next_cursor=None, total=0, counts_exact=True, distinct=True, sorted=False, caveats=caveats
+        if cursor is not None and state.get('hf') != first:
+            raise _errors().ToolRefusal(
+                'INVALID_INPUT',
+                'The documents cursor belongs to a listing with another filter; start again without one.',
             )
+        if cursor is None and first is False:
+            state = {'ph': 'o', 'i': 0}
+        caveats = ['documents_unsorted']
+
+        def page_of(items, next_state, total, *, counts_exact=True):
+            if next_state is not None and first is not None:
+                next_state = {**next_state, 'hf': first}
+            # Only a filtered call names skipped keys: the tool of an older ai package never hands a
+            # filter over, and its DocPage has no filter_ignored.
+            extra = {'filter_ignored': ignored} if filter is not None else {}
+            return vx.DocPage(
+                items=items,
+                next_cursor=None if next_state is None else self._encodeCursor(next_state),
+                total=total,
+                counts_exact=counts_exact,
+                distinct=True,
+                sorted=False,
+                caveats=caveats,
+                **extra,
+            )
+
+        if not self._exists():
+            return page_of([], None, 0)
 
         ids = None if object_ids is None else [str(o) for o in object_ids if str(o) != CONTROL_OBJECT_ID]
         if ids == []:
             # No document asked for (or only the control record): Chroma refuses `$in: []`.
-            return vx.DocPage(
-                items=[], next_cursor=None, total=0, counts_exact=True, distinct=True, sorted=False, caveats=caveats
-            )
+            return page_of([], None, 0)
         items = []
         if state['ph'] == 'c':
             offset = state['o']
@@ -1284,35 +1324,27 @@ class Store(DocumentStoreBase):
                 oid = str(meta.get('objectId'))
                 items.append(self._documentRow(record_id, meta, counts.get(oid), tables.get(oid, 0), True))
             if more:
-                return vx.DocPage(
-                    items=items,
-                    next_cursor=self._encodeCursor({'ph': 'c', 'o': offset + limit}),
-                    total=None,
-                    counts_exact=True,
-                    distinct=True,
-                    sorted=False,
-                    caveats=caveats,
-                )
+                return page_of(items, {'ph': 'c', 'o': offset + limit}, None)
+            if first is True:
+                # Only documents with a first chunk: the listing ends with the chunk-0 records, and
+                # its last page knows how many there were: the records paged past plus this page's.
+                # One chunk-0 record per document (the ids are objectId#chunkId), as distinct=True
+                # already relies on, so that is the number of documents listed.
+                return page_of(items, None, offset + len(rows))
             state = {'ph': 'o', 'i': 0}
 
         # The chunk-0 records are exhausted: fill the page with documents that have no chunk 0.
         orphans, total, capped = self._sweep(deleted, ids)
         if capped:
             caveats.append('document_count_capped')
+        if first is False:
+            total = len(orphans)
         start = state['i']
         room = max(0, limit - len(items))
         for oid, record_id, meta, rows_count in orphans[start : start + room]:
             items.append(self._documentRow(record_id, meta, rows_count, None, False))
-        next_cursor = self._encodeCursor({'ph': 'o', 'i': start + room}) if start + room < len(orphans) else None
-        return vx.DocPage(
-            items=items,
-            next_cursor=next_cursor,
-            total=None if capped else total,
-            counts_exact=not capped,
-            distinct=True,
-            sorted=False,
-            caveats=caveats,
-        )
+        next_state = {'ph': 'o', 'i': start + room} if start + room < len(orphans) else None
+        return page_of(items, next_state, None if capped else total, counts_exact=not capped)
 
     def scrollChunks(self, objectId: str, *, after_chunk: int, limit: int, deleted: str):
         """

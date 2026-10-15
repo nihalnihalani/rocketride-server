@@ -623,6 +623,10 @@ class TestSearch:
         s = _schema()
         found = store.searchKeyword(s.QuestionText(text='kestrel'), s.DocFilter(limit=5))
         assert [d.metadata.objectId for d in found] == ['kestrel']
+        # dialect.keyword_match 'substring': a fragment inside a word matches, whatever its case.
+        assert type(store).VX_KEYWORD_MATCH == 'substring'
+        fragment = store.searchKeyword(s.QuestionText(text='ESTREL HOV'), s.DocFilter(limit=5))
+        assert [d.metadata.objectId for d in fragment] == ['kestrel']
         assert store.searchKeyword(s.QuestionText(text='50%'), s.DocFilter(limit=5))[0].metadata.objectId == 'kestrel'
         assert store.searchKeyword(s.QuestionText(text='5_%'), s.DocFilter(limit=5)) == []
 
@@ -741,7 +745,13 @@ class TestHooks:
             'removeCounted',
         ):
             assert hook in caps
-        assert {'sample_stratified_native', 'documents_distinct', 'documents_sorted', 'search_keyword'} <= caps
+        assert {
+            'sample_stratified_native',
+            'documents_distinct',
+            'documents_sorted',
+            'search_keyword',
+            'documents_filter',
+        } <= caps
         assert 'knnGraph' not in caps and 'knn_native' not in caps
         info = store.scoreInfo()
         assert info['formula'] == '1 - cosine_distance' and info['floor'] == 0.2 and info['higher_is_better'] is True
@@ -941,6 +951,192 @@ class TestHooks:
 
 
 # ---------------------------------------------------------------------------
+# The documents filter and the per-document health fields (contract section 4.4-A, 4.4-F)
+# ---------------------------------------------------------------------------
+
+#: objectId -> (path, chunk ids, ingestedAt or None, table chunk ids).
+FILTER_LIBRARY = {
+    'falcon': ('C:/demo/handbooks/falcon_handbook.md', [0, 1, 2], '2026-10-01T09:00:00Z', []),
+    'osprey': ('C:/demo/handbooks/osprey_station.PDF', [0, 1], '2026-10-02T00:00:00Z', []),
+    'orphan': ('C:/demo/handbooks/orphan.md', [5, 6, 7], '2026-10-03T00:00:00Z', []),
+    'notes': ('C:/demo/handbooks_old/notes.md', [0], '2026-09-30T23:59:59Z', []),
+    'pct': ('C:/demo/100%_done/report.md', [0, 1], None, []),
+    'under': ('C:/demo/a_b/table.html', [0, 1, 2, 3], '2026-10-05T12:00:00Z', [2]),
+    'axb': ('C:/demo/axb/file.txt', [0], '2026-10-05T12:00:00Z', []),
+    'win': ('C:\\demo\\win\\Readme.MD', [0, 1], '2026-10-04T00:00:00Z', []),
+    'mdx': ('C:/demo/x/page.mdx', [0], '2026-10-04T00:00:00Z', []),
+    'bak': ('C:/demo/x/file.md.bak', [0], '2026-10-04T00:00:00Z', []),
+    'bare': ('README', [0, 1, 2, 3, 4], None, []),
+}
+
+
+def _ingest_library(store, rng, library=FILTER_LIBRARY) -> None:
+    for oid, (path, chunk_ids, ingested, tables) in library.items():
+        extra = {'ingestedAt': ingested} if ingested else {}
+        docs = [_doc(oid, c, _unit(rng), parent=path, **extra) for c in chunk_ids]
+        for doc in docs:
+            doc.metadata.isTable = doc.metadata.chunkId in tables
+        store.addChunks(docs)
+
+
+def _doc_filter(**kw):
+    from ai.common.store.vx_types import parse_doc_list_filter
+
+    return parse_doc_list_filter(kw)
+
+
+def _selected(flt, library=FILTER_LIBRARY, *, dates: bool = True) -> set:
+    """The objectIds the contract's words select (the order is the database's collation, so a set)."""
+    out = set()
+    for oid, (path, chunk_ids, ingested, tables) in library.items():
+        checks = [
+            flt.path_prefix is None or path.startswith(flt.path_prefix),
+            not flt.file_types or any(path.lower().endswith('.' + t) for t in flt.file_types),
+            flt.path_contains is None or flt.path_contains.lower() in path.lower(),
+            not dates or flt.ingested_after is None or (ingested is not None and ingested >= flt.ingested_after),
+            not dates or flt.ingested_before is None or (ingested is not None and ingested < flt.ingested_before),
+            flt.min_chunks is None or len(chunk_ids) >= flt.min_chunks,
+            flt.max_chunks is None or len(chunk_ids) <= flt.max_chunks,
+            flt.has_first_chunk is None or (0 in chunk_ids) == flt.has_first_chunk,
+            flt.has_tables is None or bool(tables) == flt.has_tables,
+        ]
+        if all(checks):
+            out.add(oid)
+    return out
+
+
+def _listed(store, flt, *, limit: int = 3, deleted: str = 'active'):
+    """Every page of a listing: (objectIds in the store's order, the pages)."""
+    pages, cursor = [], None
+    while True:
+        page = store.listDocuments(
+            cursor=cursor, limit=limit, object_ids=None, deleted=deleted, sort='path', filter=flt
+        )
+        pages.append(page)
+        cursor = page.next_cursor
+        if cursor is None:
+            return [r.objectId for p in pages for r in p.items], pages
+
+
+_FILTER_CASES = [
+    ({'path_prefix': 'C:/demo/handbooks/'}, {'falcon', 'orphan', 'osprey'}),
+    ({'path_prefix': 'C:/demo/a_b/'}, {'under'}),
+    ({'path_prefix': '%'}, set()),
+    ({'path_prefix': 'C:\\demo\\win\\'}, {'win'}),
+    ({'file_types': ['md']}, {'pct', 'falcon', 'orphan', 'notes', 'win'}),
+    ({'file_types': ['.PDF', 'html']}, {'under', 'osprey'}),
+    ({'path_contains': 'HANDBOOK'}, {'falcon', 'orphan', 'osprey', 'notes'}),
+    ({'path_contains': '%'}, {'pct'}),
+    ({'ingested_after': '2026-10-01T09:00:00Z'}, {'falcon', 'orphan', 'osprey', 'under', 'axb', 'win', 'bak', 'mdx'}),
+    ({'ingested_before': '2026-10-02'}, {'falcon', 'notes'}),
+    ({'min_chunks': 4}, {'under', 'bare'}),
+    ({'max_chunks': 1}, {'notes', 'axb', 'bak', 'mdx'}),
+    ({'has_first_chunk': False}, {'orphan'}),
+    ({'has_tables': True}, {'under'}),
+    ({'path_prefix': 'C:/demo/', 'file_types': ['md'], 'has_first_chunk': True, 'min_chunks': 2}, {'pct', 'falcon'}),
+]
+
+
+class TestDocumentsFilter:
+    def test_every_key_is_applied_by_the_store(self, dsn, table, stores):
+        rng = np.random.default_rng(70)
+        store = _open(dsn, table, stores)
+        _ingest_library(store, rng)
+        for given, expected in _FILTER_CASES:
+            flt = _doc_filter(**given)
+            assert _selected(flt) == expected, given  # the reference agrees with the hand-checked answer
+            listed, pages = _listed(store, flt, limit=50)
+            assert set(listed) == expected and len(listed) == len(expected), given
+            assert pages[0].total == len(expected) and pages[0].filter_ignored == (), given
+
+    def test_filtered_pages_follow_one_another_and_carry_the_filtered_total(self, dsn, table, stores):
+        rng = np.random.default_rng(71)
+        store = _open(dsn, table, stores)
+        _ingest_library(store, rng)
+        for given in (
+            {'has_first_chunk': True},
+            {'path_contains': '_'},
+            {'file_types': ['md', 'txt'], 'max_chunks': 3},
+        ):
+            flt = _doc_filter(**given)
+            whole, _ = _listed(store, flt, limit=100)
+            paged, pages = _listed(store, flt, limit=2)
+            assert paged == whole and set(whole) == _selected(flt), given
+            assert all(p.total == len(whole) for p in pages), given
+            assert all((p.counts_exact, p.distinct, p.sorted) == (True, True, True) for p in pages)
+
+    def test_a_cursor_is_bound_to_its_filter(self, dsn, table, stores):
+        from ai.common.store.errors import ToolRefusal
+
+        rng = np.random.default_rng(72)
+        store = _open(dsn, table, stores)
+        _ingest_library(store, rng)
+        md = _doc_filter(file_types=['md'])
+        plain = store.listDocuments(cursor=None, limit=2, object_ids=None, deleted='active', sort='path')
+        first = store.listDocuments(cursor=None, limit=2, object_ids=None, deleted='active', sort='path', filter=md)
+        for cursor, flt in ((plain.next_cursor, md), (first.next_cursor, None)):
+            with pytest.raises(ToolRefusal) as err:
+                store.listDocuments(cursor=cursor, limit=2, object_ids=None, deleted='active', sort='path', filter=flt)
+            assert err.value.code == 'INVALID_INPUT'
+        rest = store.listDocuments(
+            cursor=first.next_cursor, limit=50, object_ids=None, deleted='active', sort='path', filter=md
+        )
+        assert {r.objectId for r in first.items + rest.items} == _selected(md) and rest.total == 5
+
+    def test_filter_and_deleted_mode_combine(self, dsn, table, stores):
+        rng = np.random.default_rng(73)
+        store = _open(dsn, table, stores)
+        _ingest_library(store, rng)
+        store.markDeleted(['falcon'])
+        flt = _doc_filter(path_prefix='C:/demo/handbooks/')
+        assert set(_listed(store, flt)[0]) == {'orphan', 'osprey'}
+        assert _listed(store, flt, deleted='deleted')[0] == ['falcon']
+        assert set(_listed(store, flt, deleted='all')[0]) == {'falcon', 'orphan', 'osprey'}
+
+    def test_documents_tool_answers_server(self, dsn, table, stores):
+        from .test_vectordb_tool_mixin import node
+
+        rng = np.random.default_rng(74)
+        store = _open(dsn, table, stores)
+        _ingest_library(store, rng)
+        answer = node(store).documents({'filter': {'path_prefix': 'C:/demo/handbooks/', 'file_types': ['md']}})
+        assert answer['success'] is True
+        assert {item['objectId'] for item in answer['items']} == {'falcon', 'orphan'}
+        assert (answer['filter_applied'], answer['filter_ignored'], answer['total']) == ('server', [], 2)
+        assert not {'documents_filter_partial', 'documents_filter_client'} & set(answer['caveats'])
+
+    def test_rows_report_the_last_chunk_and_the_soft_deleted_rows(self, dsn, table, stores, admin):
+        rng = np.random.default_rng(75)
+        store = _open(dsn, table, stores)
+        library = {
+            'whole': ('C:/h/whole.md', [0, 1, 2], None, []),
+            'gappy': ('C:/h/gappy.md', [0, 1, 3, 4], None, []),
+            'tail': ('C:/h/tail.md', [3, 4], None, []),
+        }
+        _ingest_library(store, rng, library)
+        with admin.cursor() as cur:
+            cur.execute(
+                f'UPDATE "{table}" SET isdeleted = true WHERE (objectid, chunkid) IN ((%s, 4), (%s, 3), (%s, 4))',
+                ('gappy', 'tail', 'tail'),
+            )
+
+        def health(deleted):
+            rows = [r for p in _listed(store, None, deleted=deleted)[1] for r in p.items]
+            return {
+                r.objectId: (r.chunks, r.max_chunk_id, r.deleted_chunks, r.has_first_chunk, r.deleted) for r in rows
+            }
+
+        # (chunks, max_chunk_id, deleted_chunks, has_first_chunk, deleted)
+        assert health('active') == {'whole': (3, 2, 0, True, False), 'gappy': (3, 3, 1, True, False)}
+        assert health('deleted') == {'gappy': (1, 4, 1, False, True), 'tail': (2, 4, 2, False, True)}
+        assert health('all') == {
+            'whole': (3, 2, 0, True, False),
+            'gappy': (4, 4, 1, True, True),
+            'tail': (2, 4, 2, False, True),
+        }
+
+
+# ---------------------------------------------------------------------------
 # Legacy tables: the meta column, a document without chunk 0
 # ---------------------------------------------------------------------------
 
@@ -1112,6 +1308,64 @@ class TestLegacy:
         assert all(r.objectId != 'schema' for r in rows)
         assert store.describe().control_record is True
         assert store.modelName and store.vectorSize
+
+    def test_shared_legacy_table_reports_its_soft_deleted_row_under_active(self, dsn, table, stores, admin):
+        """The seed soft-deletes one row of one document; the copy plants one the same way when the seed predates it."""
+        if not _legacy_source_exists(admin):
+            pytest.skip(f'NOT RUN: legacy table {LEGACY_TABLE} is not seeded in this database')
+        _legacy_copy(admin, LEGACY_TABLE, table)
+        with admin.cursor() as cur:
+            cur.execute(f'SELECT count(*) FROM "{table}" WHERE objectid <> %s AND isdeleted IS TRUE', ('schema',))
+            if cur.fetchone()[0] == 0:
+                cur.execute(
+                    f'UPDATE "{table}" SET isdeleted = true WHERE id = (SELECT min(id) FROM "{table}" '
+                    'WHERE objectid <> %s AND chunkid = 1)',
+                    ('schema',),
+                )
+            cur.execute(
+                f'SELECT objectid, chunkid FROM "{table}" WHERE objectid <> %s AND isdeleted IS TRUE', ('schema',)
+            )
+            ((soft_object, soft_chunk),) = cur.fetchall()
+            cur.execute(
+                f'SELECT count(*), max(chunkid) FROM "{table}" WHERE objectid = %s AND isdeleted IS NOT TRUE',
+                (soft_object,),
+            )
+            active_rows, active_max = cur.fetchone()
+        store = _open(dsn, table, stores)
+        active = {r.objectId: r for p in _listed(store, None, limit=200)[1] for r in p.items}
+        flagged = [r for r in active.values() if r.deleted_chunks]
+        assert [r.objectId for r in flagged] == [soft_object]
+        assert (flagged[0].deleted_chunks, flagged[0].chunks, flagged[0].max_chunk_id) == (1, active_rows, active_max)
+        assert len([r for r in active.values() if not r.has_first_chunk]) == 1
+        assert all(r.deleted_chunks == 0 for r in active.values() if r.objectId != soft_object)
+        deleted = {r.objectId: r for p in _listed(store, None, limit=200, deleted='deleted')[1] for r in p.items}
+        assert list(deleted) == [soft_object] and deleted[soft_object].chunks == 1
+        assert deleted[soft_object].max_chunk_id == soft_chunk
+
+    def test_legacy_table_without_meta_leaves_the_ingest_keys_to_the_app(self, dsn, table, stores, admin):
+        rng = np.random.default_rng(55)
+        _legacy_synthetic(admin, table, rng)
+        holder = psycopg2.connect(ADMIN_DSN, connect_timeout=5)
+        try:
+            with holder.cursor() as cur:
+                cur.execute(f'SELECT count(*) FROM "{table}"')  # holds ACCESS SHARE: the meta ALTER gives up
+            store = _open(dsn, table, stores)
+            assert store.describe().meta_column is False
+            flt = _doc_filter(ingested_after='2026-10-01', path_contains='ORPHAN')
+            page = store.listDocuments(
+                cursor=None, limit=10, object_ids=None, deleted='active', sort='path', filter=flt
+            )
+            assert [r.objectId for r in page.items] == ['orphan'] and page.total == 1
+            assert page.filter_ignored == ('ingested_after',)
+            from .test_vectordb_tool_mixin import node
+
+            answer = node(store).documents({'filter': {'ingested_before': '2026-10-01', 'has_first_chunk': True}})
+            assert (answer['filter_applied'], answer['filter_ignored']) == ('partial', ['ingested_before'])
+            assert [item['objectId'] for item in answer['items']] == ['whole']
+            assert 'documents_filter_partial' in answer['caveats']
+        finally:
+            holder.rollback()
+            holder.close()
 
 
 # ---------------------------------------------------------------------------

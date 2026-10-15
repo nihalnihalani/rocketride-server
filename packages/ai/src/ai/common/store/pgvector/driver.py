@@ -57,6 +57,7 @@ from __future__ import annotations
 import base64
 import binascii
 import dataclasses
+import hashlib
 import json
 import math
 import threading
@@ -70,11 +71,12 @@ from ai.common.schema import Doc, DocFilter, DocMetadata, QuestionText
 
 from ..document_store import DocumentStoreBase
 from ..errors import ToolRefusal
-from ..vx_types import ChunkPage, DocPage, DocumentRow, StoreInfo
+from ..vx_types import ChunkPage, DocListFilter, DocPage, DocumentRow, StoreInfo
 from .pool import CollectionMissing, PgDatabase
 from .sql import (
     CONTROL_OBJECT_ID,
     HNSW_MAX_DIMS,
+    Having,
     METADATA_COLUMNS,
     METRICS,
     OPERATORS,
@@ -123,9 +125,13 @@ class PgVectorStore(DocumentStoreBase):
     #: table, directly and through a transaction-mode pooler.
     VX_SUPPORT = 'supported'
 
+    #: ``documents_filter``: ``listDocuments`` applies the documents filter in the statement that pages the keys.
     VX_DRIVER_CAPABILITIES: FrozenSet[str] = frozenset(
-        {'sample_stratified_native', 'documents_distinct', 'documents_sorted', 'search_keyword'}
+        {'sample_stratified_native', 'documents_distinct', 'documents_sorted', 'search_keyword', 'documents_filter'}
     )
+
+    #: ``dialect.keyword_match``: the keyword search is ``"content" ILIKE '%<text>%'``, so it matches text fragments.
+    VX_KEYWORD_MATCH = 'substring'
 
     #: Seconds between two attempts to add the ``meta`` column after one was blocked.
     META_RETRY_S = 60.0
@@ -801,6 +807,7 @@ class PgVectorStore(DocumentStoreBase):
         object_ids: Optional[Sequence[str]],
         deleted: str,
         sort: str,
+        filter: Optional[DocListFilter] = None,
     ) -> DocPage:
         """One page of documents ordered by ``(path, objectId)``, with exact per-document counts.
 
@@ -809,18 +816,36 @@ class PgVectorStore(DocumentStoreBase):
         documents (read through the ``(objectid, chunkid)`` index). The total
         is counted on the first page and carried by the cursor, so later
         pages do not count again.
+
+        ``filter`` (contract section 4.4-A) is applied in the pass that pages
+        the keys (:class:`Having`), so the page, the keyset cursor and the
+        total cover only matching documents. On a table without the ``meta``
+        column the ingest-time keys cannot be applied: they are named in
+        ``filter_ignored`` and the app applies them. A cursor carries a
+        digest of the filter it was issued under and is refused with any
+        other filter. Each row also reports ``max_chunk_id`` and
+        ``deleted_chunks`` (contract section 4.4-F).
         """
+        columns = self._columns_now()
+        having, ignored = _listing_filter(filter, 'meta' in columns)
+        bound = _filter_digest(having)
         after: Optional[Tuple[str, str]] = None
         carried: Optional[int] = None
         if cursor:
-            path, object_id, carried = _decode_cursor(cursor)
+            path, object_id, carried, issued = _decode_cursor(cursor)
+            # A cursor of another filter would page from the wrong position with the wrong total;
+            # one of this filter always carries its total (only the unfiltered listing may recount).
+            if issued != bound or (having is not None and carried is None):
+                raise ToolRefusal(
+                    'INVALID_INPUT',
+                    'The documents cursor belongs to a listing with another filter; start again without one',
+                )
             after = (path, object_id)
         page = max(1, int(limit))
         where = Where(deleted=deleted if deleted in ('active', 'deleted', 'all') else 'active')
         if object_ids is not None:
             where.object_ids = [str(o) for o in object_ids]
-        columns = self._columns_now()
-        keys_statement = self._sql.list_document_keys(where, after, page + 1, with_total=after is None)
+        keys_statement = self._sql.list_document_keys(where, after, page + 1, with_total=after is None, having=having)
         count_statement = self._sql.count_documents(where) if after is not None and carried is None else None
 
         def work(cur):
@@ -848,9 +873,10 @@ class PgVectorStore(DocumentStoreBase):
         items = []
         for key in keys:
             row = by_id.get(key['objectid'])
-            if row is not None:  # gone between the two statements
+            # Gone between the two statements, or none of its rows is of the listing's mode any more.
+            if row is not None and int(row.get('chunks') or 0) > 0:
                 items.append(_document_row({**row, 'path': key['path']}))
-        next_cursor = _encode_cursor(keys[-1]['path'], keys[-1]['objectid'], total) if more and keys else None
+        next_cursor = _encode_cursor(keys[-1]['path'], keys[-1]['objectid'], total, bound) if more and keys else None
         return DocPage(
             items=items,
             next_cursor=next_cursor,
@@ -859,6 +885,7 @@ class PgVectorStore(DocumentStoreBase):
             distinct=True,
             sorted=True,
             caveats=[],
+            filter_ignored=ignored,
         )
 
     def scrollChunks(self, objectId: str, *, after_chunk: int, limit: int, deleted: str) -> ChunkPage:
@@ -1042,17 +1069,50 @@ def _vector_index(indexes: Sequence[Sequence[Any]]) -> Dict[str, Any]:
     return {'type': 'none', 'params': {}}
 
 
-def _encode_cursor(path: str, object_id: str, total: Optional[int] = None) -> str:
-    """The documents cursor: the last ``(path, objectId)`` of a page and the listing's total."""
+#: The ingest-time keys of the documents filter: applied only where the table has its ``meta`` column.
+_INGEST_KEYS = ('ingested_after', 'ingested_before')
+
+
+def _listing_filter(flt: Optional[DocListFilter], meta_column: bool) -> Tuple[Optional[Having], Tuple[str, ...]]:
+    """``(conditions to apply, keys left to the app)`` for a documents filter (contract section 4.4-A).
+
+    Every key is applied, except the ingest-time keys on a table without the ``meta``
+    column, which holds the ingest time. None when nothing is left to apply.
+    """
+    if flt is None:
+        return None, ()
+    given = flt.given()
+    ignored = tuple(key for key in given if key in _INGEST_KEYS and not meta_column)
+    applied = {key: getattr(flt, key) for key in given if key not in ignored}
+    if not applied:
+        return None, ignored
+    return Having(**applied), ignored
+
+
+def _filter_digest(having: Optional[Having]) -> Optional[str]:
+    """A short digest of the conditions a listing applies (None without any), bound into its cursors."""
+    if having is None:
+        return None
+    applied = {
+        k: list(v) if isinstance(v, tuple) else v for k, v in dataclasses.asdict(having).items() if v is not None
+    }
+    raw = json.dumps(applied, sort_keys=True, separators=(',', ':')).encode('utf-8')
+    return hashlib.sha256(raw).hexdigest()[:16]
+
+
+def _encode_cursor(path: str, object_id: str, total: Optional[int] = None, digest: Optional[str] = None) -> str:
+    """The documents cursor: the last ``(path, objectId)`` of a page, the listing's total and its filter digest."""
     value: Dict[str, Any] = {'p': path, 'o': object_id}
     if total is not None:
         value['t'] = int(total)
+    if digest is not None:
+        value['f'] = digest
     raw = json.dumps(value, separators=(',', ':')).encode('utf-8')
     return base64.urlsafe_b64encode(raw).decode('ascii').rstrip('=')
 
 
-def _decode_cursor(cursor: str) -> Tuple[str, str, Optional[int]]:
-    """``(path, objectId, total)`` of a documents cursor; the total is None when the cursor has none."""
+def _decode_cursor(cursor: str) -> Tuple[str, str, Optional[int], Optional[str]]:
+    """``(path, objectId, total, filter digest)`` of a documents cursor; None for what the cursor does not carry."""
     try:
         padded = cursor + '=' * (-len(cursor) % 4)
         value = json.loads(base64.urlsafe_b64decode(padded.encode('ascii')).decode('utf-8'))
@@ -1060,10 +1120,21 @@ def _decode_cursor(cursor: str) -> Tuple[str, str, Optional[int]]:
             total = value.get('t')
             if not (isinstance(total, int) and not isinstance(total, bool) and total >= 0):
                 total = None
-            return value['p'], value['o'], total
+            digest = value.get('f')
+            return value['p'], value['o'], total, digest if isinstance(digest, str) else None
     except (ValueError, TypeError, UnicodeError, binascii.Error):
         pass
     raise ToolRefusal('INVALID_INPUT', 'The documents cursor is not valid; start again without one')
+
+
+@dataclasses.dataclass(frozen=True)
+class PgDocumentRow(DocumentRow):
+    """A ``DocumentRow`` with the per-document health fields of contract section 4.4-F."""
+
+    #: The largest chunkId among the rows the listing's ``deleted`` mode selects.
+    max_chunk_id: Optional[int] = None
+    #: The document's soft-deleted rows, whatever the listing's mode.
+    deleted_chunks: Optional[int] = None
 
 
 def _document_row(row: Mapping[str, Any]) -> DocumentRow:
@@ -1077,7 +1148,7 @@ def _document_row(row: Mapping[str, Any]) -> DocumentRow:
 
     ingested = meta.get('ingestedAt')
     point_id = row.get('point_id')
-    return DocumentRow(
+    return PgDocumentRow(
         objectId=row['objectid'],
         path=row.get('path') or '',
         chunks=int(row['chunks']),
@@ -1089,7 +1160,9 @@ def _document_row(row: Mapping[str, Any]) -> DocumentRow:
         modifyTime=as_int(meta.get('modifyTime')),
         ingestedAt=str(ingested) if ingested is not None else None,
         pointId=str(point_id) if point_id is not None else None,
+        max_chunk_id=as_int(row.get('max_chunk_id')),
+        deleted_chunks=as_int(row.get('deleted_chunks')),
     )
 
 
-__all__ = ['DEFAULT_STATEMENT_TIMEOUT_MS', 'MIN_SIMILARITY_SCORE', 'PgVectorStore']
+__all__ = ['DEFAULT_STATEMENT_TIMEOUT_MS', 'MIN_SIMILARITY_SCORE', 'PgDocumentRow', 'PgVectorStore']

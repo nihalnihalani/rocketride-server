@@ -8,6 +8,9 @@
 # Qdrant and Chroma. See seed_legacy.py for the recipes. Run it once, with an
 # engine whose store drivers are still the old ones, before any driver change
 # is merged; the collections are kept for the driver and tool-path suites.
+# On pgvector it also soft-deletes one row (the health fields' live case); a
+# table seeded before that row existed gets it in place on a run without
+# --verify-only, which needs no engine.
 #
 # Environment: ENGINE_URL (an engine whose store drivers are the old ones,
 # started with RR_DB_BROKER_URL/RR_DB_BROKER_TOKEN pointing at fake_broker.py;

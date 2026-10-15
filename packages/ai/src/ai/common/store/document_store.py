@@ -275,6 +275,12 @@ class DocumentStoreBase(ABC):
     #: ``dialect.backend`` of the driver ('pgvector', 'qdrant', ...). None: derived from the provider.
     VX_BACKEND: Optional[str] = None
 
+    #: ``dialect.keyword_match`` (contract section 4.4-G): how ``searchKeyword`` matches the question's
+    #: text, from ``vx_types.KEYWORD_MATCHES``. ``'substring'``: a fragment anywhere in the chunk text
+    #: (pgvector's ``ILIKE``, Chroma's ``$contains``); ``'token'``: whole words of a full-text index
+    #: (Qdrant's ``MatchText``). None: the driver has no keyword search, or does not say.
+    VX_KEYWORD_MATCH: Optional[str] = None
+
     #: ``dialect.support``: 'supported' once the driver's unmocked suites pass on a new and a legacy
     #: collection, else 'experimental'. A driver lane sets it; mocked evidence never does.
     VX_SUPPORT: str = 'experimental'
@@ -1510,7 +1516,16 @@ class VectorStoreToolMixin(VectorExplorerExtTools, VectorExplorerTools):
             object_ids.extend([object_id] if isinstance(object_id, str) else list(object_id))
         extra_ids = raw_filter.get('objectIds')
         if extra_ids:
-            object_ids.extend([extra_ids] if isinstance(extra_ids, str) else list(extra_ids))
+            extra = [extra_ids] if isinstance(extra_ids, str) else list(extra_ids)
+            # The explorer's scope (contract section 4.4-B): at most scope_keys_max documents, as for
+            # filter.object_ids of sample and neighbors. The legacy objectId key is not capped.
+            cap = VECTOR_TOOL_LIMITS['scope_keys_max']
+            if len(extra) > cap:
+                raise ToolRefusal(
+                    'LIMIT_EXCEEDED',
+                    f'filter.objectIds names {len(extra):,} documents; a search takes at most {cap:,}. Narrow the scope.',
+                )
+            object_ids.extend(extra)
         if object_ids:
             doc_filter.objectIds = list(dict.fromkeys(str(oid) for oid in object_ids))
         node_id = raw_filter.get('nodeId')

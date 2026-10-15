@@ -137,6 +137,9 @@ class MockTable:
 
 
 _TAG = re.compile(r'\s*/\*\s*rr-pgvector:(\w+)\s*\*/\s*', re.S)
+#: The per-document expressions of a filtered listing (ai.common.store.pgvector.sql.Having).
+_DOC_PATH = 'coalesce(min("parent"), \'\')'
+_DOC_INGESTED = '(array_agg("meta"->>\'ingestedAt\' ORDER BY "chunkid"))[1]'
 _TABLE = re.compile(r'(?:FROM|INTO|TABLE(?: IF NOT EXISTS)?|ON|UPDATE) "([^"]+)"')
 
 
@@ -177,8 +180,8 @@ def _id_hash(row_id: Any, seed: int) -> int:
     return int.from_bytes(digest, 'big', signed=True)
 
 
-def _like(pattern: str, text: Optional[str]) -> bool:
-    """``text ILIKE pattern ESCAPE '\\'``."""
+def _like(pattern: str, text: Optional[str], *, ignore_case: bool = True) -> bool:
+    """``text ILIKE pattern ESCAPE '\\'`` (``LIKE`` with ``ignore_case=False``)."""
     if text is None:
         return False
     out = ''
@@ -191,7 +194,7 @@ def _like(pattern: str, text: Optional[str]) -> bool:
             continue
         out += '.*' if ch == '%' else '.' if ch == '_' else re.escape(ch)
         i += 1
-    return re.fullmatch(out, text, re.S | re.I) is not None
+    return re.fullmatch(out, text, re.S | re.I if ignore_case else re.S) is not None
 
 
 def _predicate(where: str, params: Iterator[Any]) -> Callable[[Dict[str, Any]], bool]:
@@ -579,13 +582,68 @@ class MockCursor:
         parents = [r.get('parent') for r in rows if r.get('parent') is not None]
         return min(parents) if parents else ''
 
+    @classmethod
+    def _having(cls, conditions: str, it: Iterator[Any]) -> Tuple[Optional[Tuple[str, str]], List[Callable]]:
+        """The keyset position and the document tests of a listing's ``HAVING`` (the documents filter).
+
+        Each test takes ``(path, rows)``: a document's path and its rows in chunk order.
+        """
+        after: Optional[Tuple[str, str]] = None
+        tests: List[Callable[[str, List[Dict[str, Any]]], bool]] = []
+        path = re.escape(_DOC_PATH)
+        ingested = re.escape(_DOC_INGESTED)
+        for part in conditions.split(' AND '):
+            part = part.strip()
+            if re.fullmatch(r'\(' + path + r', "objectid"\) > \(%s, %s\)', part):
+                after = (next(it), next(it))
+                continue
+            match = re.fullmatch(path + r" (I?LIKE) %s ESCAPE '\\'", part)
+            if match:
+                pattern, ignore_case = next(it), match.group(1) == 'ILIKE'
+                tests.append(lambda p, rows, pat=pattern, ic=ignore_case: _like(pat, p, ignore_case=ic))
+                continue
+            if re.fullmatch(r'lower\(' + path + r'\) LIKE ANY\(%s\)', part):
+                patterns = list(next(it))
+                tests.append(lambda p, rows, pats=patterns: any(_like(x, p.lower(), ignore_case=False) for x in pats))
+                continue
+            match = re.fullmatch(ingested + r' (>=|<) %s', part)
+            if match:
+                op, bound = match.group(1), next(it)
+
+                def first_ingested(p, rows, op=op, bound=bound):
+                    value = (rows[0].get('meta') or {}).get('ingestedAt') if rows else None
+                    if value is None:
+                        return False
+                    return value >= bound if op == '>=' else value < bound
+
+                tests.append(first_ingested)
+                continue
+            match = re.fullmatch(r'count\(\*\) (>=|<=) %s', part)
+            if match:
+                op, bound = match.group(1), next(it)
+                tests.append(lambda p, rows, op=op, b=bound: len(rows) >= b if op == '>=' else len(rows) <= b)
+                continue
+            match = re.fullmatch(r'coalesce\(bool_or\(("chunkid" = 0|"istable")\), false\) = %s', part)
+            if match:
+                flag, wanted = match.group(1), next(it)
+                if flag == '"istable"':
+                    tests.append(lambda p, rows, w=wanted: any(r.get('istable') is True for r in rows) == w)
+                else:
+                    tests.append(lambda p, rows, w=wanted: any(r.get('chunkid') == 0 for r in rows) == w)
+                continue
+            raise NotImplementedError(f'psycopg2 test double: unsupported HAVING condition {part!r}')
+        return after, tests
+
     def _op_list_document_keys(self, body: str, params: List[Any], tag: str) -> None:
         table = self._table(body)
         test, it = self._where(body, params, stop=r' GROUP BY ')
         groups = self._documents(table, test)
-        after = (next(it), next(it)) if ' HAVING ' in body else None
+        having = re.search(r' HAVING (.*) ORDER BY 2, 1 LIMIT ', body, re.S)
+        after, tests = self._having(having.group(1), it) if having else (None, [])
         limit = next(it)
-        keys = sorted((self._path(rows), oid) for oid, rows in groups.items())
+        keys = sorted(
+            (self._path(rows), oid) for oid, rows in groups.items() if all(t(self._path(rows), rows) for t in tests)
+        )
         with_total = 'count(*) OVER ()' in body
         out = [
             (oid, path, len(keys)) if with_total else (oid, path)
@@ -598,10 +656,17 @@ class MockCursor:
         table = self._table(body)
         if ' HAVING ' in body or ' LIMIT ' in body:
             raise NotImplementedError('psycopg2 test double: a documents page is read by its objectIds')
+        # Every figure but deleted_chunks counts the rows of the listing's mode (FILTER (WHERE <mode>)).
+        mode = re.search(r'count\(\*\) FILTER \(WHERE (.*?)\) AS "chunks"', body)
+        if mode is None:
+            raise NotImplementedError('psycopg2 test double: a documents page names the rows of its mode')
+        in_mode = _predicate(mode.group(1), iter(()))
         test, _ = self._where(body, params, stop=r' GROUP BY ')
         has_meta = '"meta" ORDER BY' in body
         out = []
-        for object_id, rows in self._documents(table, test).items():
+        for object_id, every in self._documents(table, test).items():
+            rows = [r for r in every if in_mode(r)]
+            chunk_ids = [r.get('chunkid') for r in rows if r.get('chunkid') is not None]
             out.append(
                 (
                     object_id,
@@ -610,14 +675,29 @@ class MockCursor:
                     any(r.get('chunkid') == 0 for r in rows),
                     any(bool(r.get('isdeleted')) for r in rows),
                     sum(1 for r in rows if r.get('istable')),
-                    rows[0].get('nodeid'),
-                    rows[0].get('id'),
-                    copy.deepcopy(rows[0].get('meta')) if has_meta else None,
+                    rows[0].get('nodeid') if rows else None,
+                    rows[0].get('id') if rows else None,
+                    copy.deepcopy(rows[0].get('meta')) if has_meta and rows else None,
+                    max(chunk_ids) if chunk_ids else None,
+                    sum(1 for r in every if r.get('isdeleted') is True),
                 )
             )
         out.sort(key=lambda r: (r[1], r[0]))
         self._set(
-            ['objectid', 'path', 'chunks', 'has_first_chunk', 'deleted', 'tables', 'nodeid', 'point_id', 'meta'], out
+            [
+                'objectid',
+                'path',
+                'chunks',
+                'has_first_chunk',
+                'deleted',
+                'tables',
+                'nodeid',
+                'point_id',
+                'meta',
+                'max_chunk_id',
+                'deleted_chunks',
+            ],
+            out,
         )
 
     def _op_scroll(self, body: str, params: List[Any], tag: str) -> None:

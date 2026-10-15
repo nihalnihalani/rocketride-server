@@ -322,6 +322,121 @@ def test_documents_tool_lists_the_orphan_unsorted(collection):
     assert orphans == expect.orphans
 
 
+# --- the documents filter (contract section 4.4-A) ----------------------------------------
+#
+# Chroma's listing reads the chunk-0 records first and finds the documents without one in a
+# sweep afterwards, so it applies has_first_chunk by reading only the phase that holds the
+# answer. Every other key is named in filter_ignored and applied by the app.
+
+
+def _filtered(store, flt, *, limit: int = 3, deleted: str = 'active'):
+    items, pages, cursor = [], [], None
+    for _ in range(10000):
+        page = store.listDocuments(
+            cursor=cursor, limit=limit, object_ids=None, deleted=deleted, sort='path', filter=flt
+        )
+        contract.assert_no_connection_details(page)
+        pages.append(page)
+        items.extend(page.items)
+        cursor = page.next_cursor
+        if cursor is None:
+            return items, pages
+    raise AssertionError('listDocuments did not end')
+
+
+def test_chroma_declares_the_documents_filter():
+    from ai.common.store.vx_types import DocListFilter  # noqa: F401 - the hook's annotation
+
+    assert 'documents_filter' in drv.Store.VX_DRIVER_CAPABILITIES
+    import inspect
+
+    parameter = inspect.signature(drv.Store.listDocuments).parameters['filter']
+    assert parameter.kind is inspect.Parameter.KEYWORD_ONLY and parameter.default is None
+
+
+def test_documents_filter_on_the_first_chunk_is_applied_by_the_store(collection):
+    from ai.common.store.vx_types import DocListFilter
+
+    store, expect = collection
+    orphans, pages = _filtered(store, DocListFilter(has_first_chunk=False), limit=2)
+    assert {r.objectId for r in orphans} == expect.orphans and len(orphans) == len(expect.orphans)
+    assert all(not r.has_first_chunk and r.chunks == expect.documents[r.objectId] for r in orphans)
+    assert all(p.filter_ignored == () for p in pages)
+    assert {p.total for p in pages} == {len(expect.orphans)}
+    with_first = set(expect.documents) - expect.orphans
+    # Page sizes that end the chunk-0 records mid-page, exactly on a page boundary, and in one page.
+    for limit in (2, 3, len(with_first), 50):
+        whole, pages = _filtered(store, DocListFilter(has_first_chunk=True), limit=limit)
+        assert {r.objectId for r in whole} == with_first and len(whole) == len(with_first), limit
+        assert all(r.has_first_chunk and r.chunks == expect.documents[r.objectId] for r in whole)
+        assert all(p.filter_ignored == () for p in pages)
+        # The listing's last page says how many documents matched; earlier pages may not know yet.
+        assert pages[-1].total == len(whole), (limit, [p.total for p in pages])
+        assert all(p.total in (None, len(whole)) for p in pages), limit
+    for deleted in ('deleted', 'all'):
+        every = {r.objectId for r in contract.list_all(store, limit=50, deleted=deleted)[0]}
+        listed, pages = _filtered(store, DocListFilter(has_first_chunk=True), deleted=deleted)
+        assert pages[-1].total == len(listed), (deleted, [p.total for p in pages])
+        with_first = {r.objectId for r in listed}
+        without = {r.objectId for r in _filtered(store, DocListFilter(has_first_chunk=False), deleted=deleted)[0]}
+        assert with_first | without == every and not with_first & without, deleted
+
+
+def test_documents_filter_names_the_keys_chroma_cannot_apply(collection):
+    from ai.common.store.vx_types import DocListFilter
+
+    store, expect = collection
+    items, pages = _filtered(store, DocListFilter(has_first_chunk=False, path_prefix='nowhere/', min_chunks=1))
+    assert {r.objectId for r in items} == expect.orphans
+    assert all(p.filter_ignored == ('path_prefix', 'min_chunks') for p in pages)
+    items, pages = _filtered(store, DocListFilter(path_prefix='nowhere/'), limit=50)
+    assert {r.objectId for r in items} == set(expect.documents)
+    assert all(p.filter_ignored == ('path_prefix',) for p in pages)
+
+
+def test_a_documents_cursor_is_bound_to_its_first_chunk_filter(collection):
+    from ai.common.store.errors import ToolRefusal
+    from ai.common.store.vx_types import DocListFilter
+
+    store, expect = collection
+    if len(expect.documents) - len(expect.orphans) < 2:
+        pytest.skip('the collection has fewer than two documents with a first chunk')
+    first = store.listDocuments(
+        cursor=None, limit=1, object_ids=None, deleted='active', sort='path', filter=DocListFilter(has_first_chunk=True)
+    )
+    plain = store.listDocuments(cursor=None, limit=1, object_ids=None, deleted='active', sort='path')
+    for cursor, flt in (
+        (first.next_cursor, None),
+        (first.next_cursor, DocListFilter(has_first_chunk=False)),
+        (plain.next_cursor, DocListFilter(has_first_chunk=True)),
+    ):
+        with pytest.raises(ToolRefusal) as err:
+            store.listDocuments(cursor=cursor, limit=1, object_ids=None, deleted='active', sort='path', filter=flt)
+        assert err.value.code == 'INVALID_INPUT'
+
+
+def test_documents_tool_answers_partial_and_none_on_chroma(new_store):
+    from .test_vectordb_tool_mixin import node
+
+    store, expect = new_store
+    answer = node(store, logical_type='chroma').documents(
+        {'filter': {'has_first_chunk': False, 'path_contains': 'doc'}}
+    )
+    assert answer['success'] is True
+    assert (answer['filter_applied'], answer['filter_ignored']) == ('partial', ['path_contains'])
+    assert 'documents_filter_partial' in answer['caveats']
+    assert {item['objectId'] for item in answer['items']} == expect.orphans
+    answer = node(store, logical_type='chroma').documents({'filter': {'path_prefix': 'nowhere/'}})
+    assert (answer['filter_applied'], answer['filter_ignored']) == ('none', ['path_prefix'])
+    assert 'documents_filter_client' in answer['caveats']
+    answer = node(store, logical_type='chroma').documents({'filter': {'has_first_chunk': True}})
+    assert (answer['filter_applied'], answer['filter_ignored']) == ('server', [])
+    assert expect.orphans.isdisjoint(item['objectId'] for item in answer['items'])
+    # A 'server' answer carries the count the app shows ("N documents match").
+    assert answer['next_cursor'] is None
+    assert answer['total'] == len(answer['items']) == len(set(expect.documents) - expect.orphans)
+
+
 # --- repairs and writes (collections this suite owns) -------------------------------------
 
 
@@ -368,6 +483,16 @@ def test_soft_delete_keeps_the_metadata(new_store):
     assert len(got['ids']) == contract.DOCS[contract.SOFT_DELETED]
     for meta in got['metadatas']:
         assert meta['isDeleted'] is True and meta['parent'] == contract.path_of(contract.SOFT_DELETED)
+
+
+def test_keyword_search_matches_text_fragments(new_store):
+    """dialect.keyword_match 'substring': ``$contains`` matches a fragment that spans words (Chroma compares case)."""
+    store, _ = new_store
+    assert type(store).VX_KEYWORD_MATCH == 'substring'
+    found = store.searchKeyword(QuestionText(text='c-04 chu'), DocFilter(limit=100))
+    assert {d.metadata.objectId for d in found} == {'doc-04'}
+    assert len(found) == contract.DOCS['doc-04']
+    assert store.searchKeyword(QuestionText(text='C-04 CHU'), DocFilter(limit=100)) == []
 
 
 def test_empty_id_lists_select_nothing(new_store):

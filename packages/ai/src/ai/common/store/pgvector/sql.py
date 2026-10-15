@@ -45,7 +45,7 @@ from __future__ import annotations
 import hashlib
 import re
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as dataclass_replace
 from typing import Any, List, Optional, Sequence, Tuple
 
 from psycopg2 import sql
@@ -134,6 +134,24 @@ def _col(name: str) -> sql.Identifier:
     return sql.Identifier(name)
 
 
+def like_escape(text: str) -> str:
+    """``text`` with ``\\``, ``%`` and ``_`` escaped, to be matched literally by ``LIKE ... ESCAPE '\\'``."""
+    return text.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_')
+
+
+def deleted_predicate(deleted: str) -> str:
+    """The row predicate of a ``deleted`` mode: 'active', 'deleted' or 'all' (``TRUE``).
+
+    A NULL flag (a row written by hand or by another client) reads as not deleted, so
+    'active' and 'deleted' together always make 'all'.
+    """
+    if deleted == 'active':
+        return '"isdeleted" IS NOT TRUE'
+    if deleted == 'deleted':
+        return '"isdeleted" IS TRUE'
+    return 'TRUE'
+
+
 # -----------------------------------------------------------------------------
 # Filters
 # -----------------------------------------------------------------------------
@@ -192,10 +210,8 @@ class Where:
         if self.permissions is not None:
             add('"permissionid" = ANY(%s)', [int(p) for p in self.permissions])
         # A NULL flag (a row written by hand or by another client) reads as not deleted.
-        if self.deleted == 'active':
-            add('"isdeleted" IS NOT TRUE')
-        elif self.deleted == 'deleted':
-            add('"isdeleted" IS TRUE')
+        if self.deleted in ('active', 'deleted'):
+            add(deleted_predicate(self.deleted))
         if self.chunk_ids is not None:
             add('"chunkid" = ANY(%s)', [int(c) for c in self.chunk_ids])
         if self.min_chunk_id is not None:
@@ -220,6 +236,76 @@ class Where:
         if not parts:
             return sql.SQL('TRUE'), params
         return sql.SQL(' AND ').join(parts), params
+
+
+#: A document's path in a listing: the smallest ``parent`` of its rows (every chunk of a document carries the same).
+_DOC_PATH = 'coalesce(min("parent"), \'\')'
+
+#: A document's ingest time in a listing: the ``meta`` of its first chunk, as :meth:`Statements.list_documents` reads it.
+_DOC_INGESTED = '(array_agg("meta"->>\'ingestedAt\' ORDER BY "chunkid"))[1]'
+
+
+@dataclass
+class Having:
+    """Conditions on whole documents: the ``documents`` filter (contract section 4.4-A).
+
+    Each condition holds for a document as the listing reports it, over the rows the
+    statement's :class:`Where` selects (so under the listing's ``deleted`` mode): the path
+    is the smallest ``parent``, the chunk count the number of rows, the ingest time the
+    ``meta.ingestedAt`` of the first chunk (compared as text: the stored form is UTC
+    ``YYYY-MM-DDTHH:MM:SSZ``, which ``parse_doc_list_filter`` gives the bounds too), and
+    the two flags ``bool_or`` over the rows. They go into the ``HAVING`` of the statement
+    that pages the document keys, so the keyset cursor and the total it carries count
+    only matching documents. A document without an ingest time matches no ingest bound.
+    Text is matched literally (``LIKE`` patterns are escaped here); every value is a
+    bound parameter. ``ingested_*`` need the table's ``meta`` column: the driver leaves
+    them out on a table without it.
+    """
+
+    #: The path starts with this text (case-sensitive).
+    path_prefix: Optional[str] = None
+    #: Lower-case extensions without the dot: the path ends with ``.<one of them>``, ignoring case.
+    file_types: Optional[Sequence[str]] = None
+    #: The path contains this text, ignoring case.
+    path_contains: Optional[str] = None
+    #: Ingested at or after this UTC ``YYYY-MM-DDTHH:MM:SSZ``.
+    ingested_after: Optional[str] = None
+    #: Ingested before this UTC ``YYYY-MM-DDTHH:MM:SSZ``.
+    ingested_before: Optional[str] = None
+    min_chunks: Optional[int] = None
+    max_chunks: Optional[int] = None
+    has_first_chunk: Optional[bool] = None
+    has_tables: Optional[bool] = None
+
+    def build(self) -> Tuple[List[sql.Composable], List[Any]]:
+        """Return ``(conditions, params)``: the conditions to AND into a ``HAVING``, in parameter order."""
+        parts: List[sql.Composable] = []
+        params: List[Any] = []
+
+        def add(text: str, value: Any) -> None:
+            parts.append(sql.SQL(text))
+            params.append(value)
+
+        if self.path_prefix is not None:
+            add(_DOC_PATH + " LIKE %s ESCAPE '\\'", like_escape(self.path_prefix) + '%')
+        if self.file_types:
+            # The extensions are letters and digits (parse_doc_list_filter), escaped all the same.
+            add('lower(' + _DOC_PATH + ') LIKE ANY(%s)', ['%.' + like_escape(ext.lower()) for ext in self.file_types])
+        if self.path_contains is not None:
+            add(_DOC_PATH + " ILIKE %s ESCAPE '\\'", '%' + like_escape(self.path_contains) + '%')
+        if self.ingested_after is not None:
+            add(_DOC_INGESTED + ' >= %s', self.ingested_after)
+        if self.ingested_before is not None:
+            add(_DOC_INGESTED + ' < %s', self.ingested_before)
+        if self.min_chunks is not None:
+            add('count(*) >= %s', int(self.min_chunks))
+        if self.max_chunks is not None:
+            add('count(*) <= %s', int(self.max_chunks))
+        if self.has_first_chunk is not None:
+            add('coalesce(bool_or("chunkid" = 0), false) = %s', bool(self.has_first_chunk))
+        if self.has_tables is not None:
+            add('coalesce(bool_or("istable"), false) = %s', bool(self.has_tables))
+        return parts, params
 
 
 # -----------------------------------------------------------------------------
@@ -452,7 +538,13 @@ class Statements:
         )
 
     def list_document_keys(
-        self, where: Where, after: Optional[Tuple[str, str]], limit: int, *, with_total: bool
+        self,
+        where: Where,
+        after: Optional[Tuple[str, str]],
+        limit: int,
+        *,
+        with_total: bool,
+        having: Optional[Having] = None,
     ) -> Tuple[sql.Composed, List[Any]]:
         """The ``(objectId, path)`` keys of one page of documents, ordered by ``(path, objectId)`` from ``after``.
 
@@ -460,13 +552,22 @@ class Statements:
         aggregate does in one pass; the page's counts and metadata are read
         by :meth:`list_documents` for its own objectIds only. With
         ``with_total`` (the first page, which has no ``after``) every row
-        also carries the number of matching documents.
+        also carries the number of matching documents. ``having`` (the
+        documents filter) adds its conditions to the same ``HAVING`` as the
+        keyset position, so the total counts only the documents it keeps.
         """
         pred, params = where.build()
-        having = sql.SQL('')
+        conditions: List[sql.Composable] = []
         if after is not None:
-            having = sql.SQL('HAVING (coalesce(min("parent"), \'\'), "objectid") > (%s, %s) ')
+            conditions.append(sql.SQL('(' + _DOC_PATH + ', "objectid") > (%s, %s)'))
             params = params + [after[0], after[1]]
+        if having is not None:
+            filter_parts, filter_params = having.build()
+            conditions.extend(filter_parts)
+            params = params + filter_params
+        having_sql = sql.SQL('')
+        if conditions:
+            having_sql = sql.SQL('HAVING {} ').format(sql.SQL(' AND ').join(conditions))
         total = sql.SQL(', count(*) OVER () AS "total"') if with_total else sql.SQL('')
         return (
             _q(
@@ -476,26 +577,43 @@ class Statements:
                 total=total,
                 t=self.t,
                 w=pred,
-                having=having,
+                having=having_sql,
             ),
             params + [int(limit)],
         )
 
     def list_documents(self, columns: Sequence[str], where: Where) -> Tuple[sql.Composed, List[Any]]:
-        """One row per objectId of ``where`` (which names the page's objectIds): counts, flags and metadata."""
-        pred, params = where.build()
-        meta = sql.SQL('(array_agg("meta" ORDER BY "chunkid"))[1]') if 'meta' in columns else sql.SQL('NULL::jsonb')
+        """One row per objectId of ``where`` (which names the page's objectIds): counts, flags and metadata.
+
+        The rows are read whatever their ``deleted`` flag, and ``where.deleted`` (the
+        listing's mode) selects, per column, the rows each figure counts: ``chunks``,
+        ``has_first_chunk``, ``deleted``, ``tables``, ``max_chunk_id`` and the first chunk's
+        ``nodeid``, ``point_id`` and ``meta`` are those of the mode's rows, exactly as
+        under a ``WHERE`` on the mode; ``deleted_chunks`` counts the document's
+        soft-deleted rows under every mode (contract section 4.4-F). A document with no
+        row of the mode any more (changed since its key was read) answers ``chunks`` 0.
+        """
+        mode = sql.SQL(deleted_predicate(where.deleted))
+        pred, params = dataclass_replace(where, deleted='all').build()
+        if 'meta' in columns:
+            meta = sql.SQL('(array_agg("meta" ORDER BY "chunkid") FILTER (WHERE {m}))[1]').format(m=mode)
+        else:
+            meta = sql.SQL('NULL::jsonb')
         return (
             _q(
                 'list_documents',
-                'SELECT "objectid", coalesce(min("parent"), \'\') AS "path", count(*) AS "chunks", '
-                'coalesce(bool_or("chunkid" = 0), false) AS "has_first_chunk", '
-                'coalesce(bool_or("isdeleted"), false) AS "deleted", '
-                'count(*) FILTER (WHERE "istable") AS "tables", '
-                '(array_agg("nodeid" ORDER BY "chunkid"))[1] AS "nodeid", '
-                '(array_agg("id" ORDER BY "chunkid"))[1] AS "point_id", '
-                '{meta} AS "meta" '
+                'SELECT "objectid", coalesce(min("parent") FILTER (WHERE {m}), \'\') AS "path", '
+                'count(*) FILTER (WHERE {m}) AS "chunks", '
+                'coalesce(bool_or("chunkid" = 0) FILTER (WHERE {m}), false) AS "has_first_chunk", '
+                'coalesce(bool_or("isdeleted") FILTER (WHERE {m}), false) AS "deleted", '
+                'count(*) FILTER (WHERE "istable" AND {m}) AS "tables", '
+                '(array_agg("nodeid" ORDER BY "chunkid") FILTER (WHERE {m}))[1] AS "nodeid", '
+                '(array_agg("id" ORDER BY "chunkid") FILTER (WHERE {m}))[1] AS "point_id", '
+                '{meta} AS "meta", '
+                'max("chunkid") FILTER (WHERE {m}) AS "max_chunk_id", '
+                'count(*) FILTER (WHERE "isdeleted" IS TRUE) AS "deleted_chunks" '
                 'FROM {t} WHERE {w} GROUP BY "objectid" ORDER BY 2, 1',
+                m=mode,
                 meta=meta,
                 t=self.t,
                 w=pred,
@@ -635,6 +753,7 @@ def vector_literal(values: Sequence[float]) -> str:
 __all__ = [
     'CONTROL_OBJECT_ID',
     'HNSW_MAX_DIMS',
+    'Having',
     'METADATA_COLUMNS',
     'METRICS',
     'OPCLASSES',
@@ -645,5 +764,7 @@ __all__ = [
     'VALID_TABLE',
     'WRITE_COLUMNS',
     'Where',
+    'deleted_predicate',
+    'like_escape',
     'vector_literal',
 ]

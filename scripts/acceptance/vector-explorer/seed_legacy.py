@@ -31,10 +31,18 @@ Then one document per backend loses its first chunk: the chunk-0 row or point
 of ``manuals/long_manual.md`` is deleted through the database's own client.
 The old drivers never lose chunk 0 by themselves on a fresh ingest: the
 chunker hands every text chunk of a document to the embedding node in one
-call, so the store sees a single write per document.
+call, so the store sees a single write per document. On pgvector one more row
+is soft-deleted the same way: chunk 1 of ``observatory/star_party_guide.md``
+gets ``isDeleted = true``, so the documents listing reports that document's
+``deleted_chunks`` as 1 under the active rows (the per-document health fields).
+A pgvector table seeded before that row was planted gets it in place on any run
+that is not ``--verify-only`` (an UPDATE through the database's client: no
+engine, no re-ingest).
 
 Verification (always run, also after seeding): exactly one control record;
-exactly one document (the long manual) without chunk 0; every corpus document
+exactly one document (the long manual) without chunk 0; on pgvector exactly one
+soft-deleted row besides the control record (the star party guide's chunk 1);
+every corpus document
 present; the long manual still has at least 64 rows and the median chunk is
 400-1,200 characters, the calibrated chunking of
 ``apps/vector-ui/tests/fixtures/chunking.json`` (a seed on an engine whose
@@ -97,6 +105,9 @@ PREFIX = '/srv/legacy/'
 RR_PREFIX = '/srv/legacy-rr/'
 RR_FOLDER = 'kitchen'
 ORPHAN_REL = 'manuals/long_manual.md'
+# pgvector only: this chunk of this document is soft-deleted (isDeleted = true) after the ingest.
+SOFT_DELETED_REL = 'observatory/star_party_guide.md'
+SOFT_DELETED_CHUNK = 1
 BACKENDS = ('pgvector', 'qdrant', 'chroma')
 # The templates this seed starts (their parse_1 and chunk_1 must agree).
 SEED_TEMPLATES = ('postgres', 'rocketride_vector', 'qdrant', 'chroma')
@@ -295,9 +306,21 @@ def verdict(
     median_chunk_chars: Optional[int] = None,
     shape: Optional[Dict[str, Any]] = None,
     seeded_now: bool = False,
+    soft_deleted: Optional[Sequence[Sequence[Any]]] = None,
+    expected_soft_deleted: Optional[Tuple[str, int]] = None,
 ) -> List[str]:
-    """Problems with one seeded collection (empty when it is as promised; a shape not read is a problem)."""
+    """Problems with one seeded collection (empty when it is as promised; a shape not read is a problem).
+
+    ``expected_soft_deleted`` (pgvector): the one ``(objectId, chunkId)`` that must be the only
+    soft-deleted row besides the control record; ``soft_deleted`` is what the table holds.
+    """
     problems = []
+    if expected_soft_deleted is not None:
+        held = [tuple(row) for row in soft_deleted or ()]
+        if held != [tuple(expected_soft_deleted)]:
+            problems.append(
+                f'{backend}: soft-deleted rows = {held} (expected exactly [{tuple(expected_soft_deleted)}])'
+            )
     if missing:
         problems.append(f'{backend}: {len(missing)} corpus documents missing, e.g. {list(missing)[:3]}')
     if control != 1:
@@ -562,6 +585,34 @@ def pg_plant_orphan(table: str, object_id: str) -> int:
         return cur.rowcount
 
 
+def pg_plant_soft_deleted(table: str, object_id: str, chunk_id: int) -> int:
+    """Soft-delete one row (``isDeleted = true``) as a driver's markDeleted would; return the rows changed."""
+    from psycopg2 import sql
+
+    with _pg() as conn, conn.cursor() as cur:
+        cur.execute(
+            sql.SQL('UPDATE {} SET isdeleted = true WHERE objectid = %s AND chunkid = %s').format(
+                sql.Identifier(table)
+            ),
+            (object_id, int(chunk_id)),
+        )
+        return cur.rowcount
+
+
+def pg_soft_deleted(table: str) -> List[Tuple[str, int]]:
+    """The ``(objectId, chunkId)`` of every soft-deleted row but the control record, in order."""
+    from psycopg2 import sql
+
+    with _pg() as conn, conn.cursor() as cur:
+        cur.execute(
+            sql.SQL(
+                "SELECT objectid, chunkid FROM {} WHERE objectid <> 'schema' AND isdeleted IS TRUE "
+                'ORDER BY objectid, chunkid'
+            ).format(sql.Identifier(table))
+        )
+        return [(r[0], r[1]) for r in cur.fetchall()]
+
+
 def pg_facts(table: str) -> Dict[str, Any]:
     from psycopg2 import sql
 
@@ -598,6 +649,7 @@ def pg_facts(table: str) -> Dict[str, Any]:
         'object_ids': set(counts),
         'counts': counts,
         'median_chunk_chars': median_length(contents),
+        'soft_deleted': pg_soft_deleted(table),
     }
 
 
@@ -790,6 +842,7 @@ async def seed(backends: Sequence[str], recreate: bool) -> Dict[str, Any]:
             if p.relative_to(root).parts[0] == RR_FOLDER
         ]
         orphan_id = fx.object_id(PREFIX + ORPHAN_REL)
+        soft_id = fx.object_id(PREFIX + SOFT_DELETED_REL)
         async with engine_client() as client:
             preview = await chunker_check(client, root, written)
             if preview['problems']:
@@ -806,6 +859,7 @@ async def seed(backends: Sequence[str], recreate: bool) -> Dict[str, Any]:
                     'long_manual_chunks': len(kept),
                     'long_manual_kept_chunk0': bool(kept) and kept[0] == 0,
                     'planted_rows': pg_plant_orphan(LEGACY, orphan_id),
+                    'soft_deleted_rows': pg_plant_soft_deleted(LEGACY, soft_id, SOFT_DELETED_CHUNK),
                 }
             if 'qdrant' in todo:
                 if recreate:
@@ -826,6 +880,20 @@ async def seed(backends: Sequence[str], recreate: bool) -> Dict[str, Any]:
     return notes
 
 
+def top_up(backends: Sequence[str], seeded: Sequence[str] = ()) -> Dict[str, Any]:
+    """Plant, in place, what an existing table seeded before this script planted it lacks.
+
+    pgvector: the soft-deleted row, when the table holds no soft-deleted row at all (one a
+    driver made since is left alone, and verification then names both). A table this run
+    seeded already has it. Needs no engine: an UPDATE through the database's client.
+    """
+    notes: Dict[str, Any] = {}
+    if 'pgvector' in backends and 'pgvector' not in seeded and pg_exists(LEGACY) and not pg_soft_deleted(LEGACY):
+        soft_id = fx.object_id(PREFIX + SOFT_DELETED_REL)
+        notes['pgvector'] = {'soft_deleted_rows': pg_plant_soft_deleted(LEGACY, soft_id, SOFT_DELETED_CHUNK)}
+    return notes
+
+
 def verify(backends: Sequence[str], seeded_now: Sequence[str] = ()) -> Tuple[Dict[str, Any], List[str]]:
     """Facts and problems for every selected backend (``seeded_now``: the backends this run seeded).
 
@@ -836,6 +904,7 @@ def verify(backends: Sequence[str], seeded_now: Sequence[str] = ()) -> Tuple[Dic
     expected_ids = {fx.object_id(n) for n in corpus_names(corpus)}
     rr_ids = {fx.object_id(n) for n in corpus_names(corpus, RR_PREFIX, RR_FOLDER)}
     orphan_id = fx.object_id(PREFIX + ORPHAN_REL)
+    soft_key = (fx.object_id(PREFIX + SOFT_DELETED_REL), SOFT_DELETED_CHUNK)
     facts: Dict[str, Any] = {}
     problems: List[str] = []
     for backend, exists, facts_of, wanted in (
@@ -865,6 +934,8 @@ def verify(backends: Sequence[str], seeded_now: Sequence[str] = ()) -> Tuple[Dic
             median_chunk_chars=f['median_chunk_chars'],
             shape=f.get('shape'),
             seeded_now=backend in seeded_now,
+            soft_deleted=f.get('soft_deleted'),
+            expected_soft_deleted=soft_key if backend == 'pgvector' else None,
         )
     return facts, problems
 
@@ -887,8 +958,11 @@ def main() -> int:
     except SeedRefused as refused:
         print(json.dumps({'seeded': {}, 'refused': refused.preview}, indent=2, default=str))
         return 1
+    topped = {} if args.verify_only else top_up(backends, seeded=list(notes))
     facts, problems = verify(backends, seeded_now=list(notes))
-    print(json.dumps({'seeded': notes, 'facts': facts, 'problems': problems}, indent=2, default=str))
+    print(
+        json.dumps({'seeded': notes, 'topped_up': topped, 'facts': facts, 'problems': problems}, indent=2, default=str)
+    )
     return 1 if problems else 0
 
 
