@@ -1,0 +1,303 @@
+[
+ {
+  "description": "Demo corpus Delete documents from the vector database by their object IDs.",
+  "inputSchema": {
+   "properties": {
+    "object_ids": {
+     "description": "List of object IDs to delete.",
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    }
+   },
+   "required": [
+    "object_ids"
+   ],
+   "type": "object"
+  },
+  "name": "delete",
+  "outputSchema": {
+   "properties": {
+    "deleted_count": {
+     "type": "integer"
+    },
+    "success": {
+     "type": "boolean"
+    }
+   },
+   "type": "object"
+  }
+ },
+ {
+  "description": "Demo corpus Retrieve document chunks by objectId from the vector database.",
+  "inputSchema": {
+   "properties": {
+    "limit": {
+     "description": "Maximum number of chunks to return (default 100).",
+     "type": "integer"
+    },
+    "object_id": {
+     "description": "The objectId of the document to retrieve.",
+     "type": "string"
+    },
+    "offset": {
+     "description": "Number of chunks to skip (default 0).",
+     "type": "integer"
+    }
+   },
+   "required": [
+    "object_id"
+   ],
+   "type": "object"
+  },
+  "name": "get",
+  "outputSchema": {
+   "properties": {
+    "chunks": {
+     "items": {
+      "properties": {
+       "chunkId": {
+        "type": "integer"
+       },
+       "content": {
+        "type": "string"
+       },
+       "metadata": {
+        "type": "object"
+       }
+      },
+      "type": "object"
+     },
+     "type": "array"
+    },
+    "success": {
+     "type": "boolean"
+    },
+    "total": {
+     "type": "integer"
+    }
+   },
+   "type": "object"
+  }
+ },
+ {
+  "description": "Demo corpus List unique document paths stored in this vector database.",
+  "inputSchema": {
+   "properties": {
+    "limit": {
+     "description": "Maximum number of results to return (default 1000).",
+     "type": "integer"
+    },
+    "offset": {
+     "description": "Number of results to skip (default 0).",
+     "type": "integer"
+    },
+    "parent": {
+     "description": "Optional parent path filter. Only return paths under this parent.",
+     "type": "string"
+    }
+   },
+   "type": "object"
+  },
+  "name": "objdir",
+  "outputSchema": {
+   "properties": {
+    "paths": {
+     "description": "Map of unique parent paths to their object IDs.",
+     "type": "object"
+    },
+    "success": {
+     "type": "boolean"
+    }
+   },
+   "type": "object"
+  }
+ },
+ {
+  "description": "Demo corpus Search for documents in the vector database. Requires an embedding provider bound to this node (via IGlobal.embed_query) for semantic similarity search. Returns matching documents with their content, metadata, and scores. Returns {\"success\": false, \"error\": \"...\"} on failure (missing embedder, empty query, store error).",
+  "inputSchema": {
+   "properties": {
+    "filter": {
+     "additionalProperties": false,
+     "description": "Optional metadata filter. Only objectId, nodeId and parent are supported; unrecognized keys are rejected. Example: {\"nodeId\": \"my-node\", \"parent\": \"/docs\"}",
+     "properties": {
+      "nodeId": {
+       "description": "Match documents written by this node ID.",
+       "type": "string"
+      },
+      "objectId": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "items": {
+          "type": "string"
+         },
+         "type": "array"
+        }
+       ],
+       "description": "Match documents with this object ID. A string or an array of strings."
+      },
+      "parent": {
+       "description": "Match documents under this parent path.",
+       "type": "string"
+      }
+     },
+     "type": "object"
+    },
+    "query": {
+     "description": "The search query text. Will be matched against stored documents using semantic similarity.",
+     "type": "string"
+    },
+    "top_k": {
+     "default": 10,
+     "description": "Maximum number of results to return (default: 10).",
+     "type": "integer"
+    }
+   },
+   "required": [
+    "query"
+   ],
+   "type": "object"
+  },
+  "name": "search",
+  "outputSchema": {
+   "properties": {
+    "error": {
+     "type": "string"
+    },
+    "results": {
+     "items": {
+      "properties": {
+       "content": {
+        "type": "string"
+       },
+       "metadata": {
+        "type": "object"
+       },
+       "score": {
+        "type": "number"
+       }
+      },
+      "type": "object"
+     },
+     "type": "array"
+    },
+    "success": {
+     "type": "boolean"
+    },
+    "total": {
+     "type": "integer"
+    }
+   },
+   "type": "object"
+  }
+ },
+ {
+  "description": "Demo corpus Return statistics about this vector store collection.",
+  "inputSchema": {
+   "properties": {},
+   "type": "object"
+  },
+  "name": "stats",
+  "outputSchema": {
+   "properties": {
+    "count": {
+     "description": "Total number of documents.",
+     "type": "integer"
+    },
+    "model": {
+     "description": "Embedding model name.",
+     "type": "string"
+    },
+    "success": {
+     "type": "boolean"
+    },
+    "vector_size": {
+     "description": "Embedding vector dimension.",
+     "type": "integer"
+    }
+   },
+   "type": "object"
+  }
+ },
+ {
+  "description": "Demo corpus Add or update documents in the vector database. Each document requires content text and an object ID for deduplication. Embeddings are computed automatically when an embedding provider is bound to this node (via IGlobal.embed_query). Alternatively, supply pre-computed \"embedding\" (float array) and \"embedding_model\" (string) per document to skip auto-computation. Returns {\"success\": false, \"error\": \"...\"} when embeddings cannot be obtained.",
+  "inputSchema": {
+   "properties": {
+    "documents": {
+     "description": "Array of documents to upsert.",
+     "items": {
+      "properties": {
+       "content": {
+        "description": "The text content of the document.",
+        "type": "string"
+       },
+       "embedding": {
+        "description": "Pre-computed embedding vector. If provided together with embedding_model, skips automatic embedding computation.",
+        "items": {
+         "type": "number"
+        },
+        "type": "array"
+       },
+       "embedding_model": {
+        "description": "Name of the model used to compute the supplied embedding vector.",
+        "type": "string"
+       },
+       "metadata": {
+        "additionalProperties": false,
+        "description": "Optional metadata. Only nodeId, parent and chunkId are stored; unrecognized keys are rejected.",
+        "properties": {
+         "chunkId": {
+          "description": "Chunk index recorded on the document (default: 0).",
+          "type": "integer"
+         },
+         "nodeId": {
+          "description": "Writing node ID recorded on the document (default: \"vectordb_tool\").",
+          "type": "string"
+         },
+         "parent": {
+          "description": "Parent path recorded on the document (default: \"/\").",
+          "type": "string"
+         }
+        },
+        "type": "object"
+       },
+       "object_id": {
+        "description": "Unique identifier for the document. Used for deduplication.",
+        "type": "string"
+       }
+      },
+      "required": [
+       "content",
+       "object_id"
+      ],
+      "type": "object"
+     },
+     "type": "array"
+    }
+   },
+   "required": [
+    "documents"
+   ],
+   "type": "object"
+  },
+  "name": "upsert",
+  "outputSchema": {
+   "properties": {
+    "count": {
+     "type": "integer"
+    },
+    "skipped": {
+     "type": "integer"
+    },
+    "success": {
+     "type": "boolean"
+    }
+   },
+   "type": "object"
+  }
+ }
+]
