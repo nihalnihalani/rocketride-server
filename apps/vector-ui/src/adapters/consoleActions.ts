@@ -38,6 +38,11 @@ import type { IConnectionEntry } from './connections';
 export interface IConsoleActionDeps {
 	/** Open (or focus) the document tab of one document. */
 	openDocument(objectId: string, chunkId?: number): void;
+	/**
+	 * Bring this connection's console tab to the front (reopening it if it was closed). An action that changes
+	 * what the console shows may come from a document tab, which would otherwise stay in front of it.
+	 */
+	showConsole(): void;
 	/** Speak through the polite live region. */
 	announce(text: string): void;
 }
@@ -64,7 +69,7 @@ export function removeTargets(entry: Pick<IConnectionEntry, 'controller' | 'sele
  * The console's actions for one connection.
  *
  * @param entry - The connection's objects.
- * @param deps - Opening a document tab and announcing.
+ * @param deps - Opening a document tab, fronting the connection's console and announcing.
  * @returns The actions.
  */
 export function makeConsoleActions(entry: Pick<IConnectionEntry, 'controller' | 'selection' | 'tab' | 'chatScope'>, deps: IConsoleActionDeps): ConsoleActions {
@@ -73,11 +78,13 @@ export function makeConsoleActions(entry: Pick<IConnectionEntry, 'controller' | 
 		showOnMap: (keys: readonly VectorKey[], source: HighlightSource) => {
 			entry.selection.setHighlight({ source, keys });
 			entry.tab.set('map');
+			deps.showConsole();
 		},
 		requestRemove: (objectIds: readonly string[]) => entry.controller.requestRemove(removeTargets(entry, objectIds)),
 		askAbout: (objectIds: readonly string[]) => {
 			entry.chatScope.set(objectIds.length === 0 ? null : [...objectIds]);
 			entry.tab.set('console');
+			deps.showConsole();
 		},
 		documentsChanged: () => entry.controller.documentsChanged(),
 		announce: (text: string) => deps.announce(text),

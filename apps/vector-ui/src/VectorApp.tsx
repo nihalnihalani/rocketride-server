@@ -51,7 +51,7 @@ import { CONNECTIONS_URI, endpointKeyFromUri, isConsoleUri, isDocumentUri } from
 import { forgetConnections } from './vector/identityChange';
 import VectorSidebar from './VectorSidebar';
 import { VectorIcon } from './icons';
-import ConnectionsView from './views/ConnectionsView';
+import ConnectionsView, { openConsole } from './views/ConnectionsView';
 import ConsoleView, { openDocumentTab } from './views/ConsoleView';
 import DocumentView from './views/DocumentView';
 
@@ -185,6 +185,8 @@ const DocumentTab: React.FC<{ payload: IDocumentDocPayload }> = ({ payload }) =>
 		() =>
 			makeConsoleActions(entry, {
 				openDocument: (objectId, chunkId) => openDocumentTab(entry.ctx.endpoint, objectId, objectId === payload.objectId ? payload.path : null, chunkId),
+				// "Show chunk path on map", a chunk's "map" and "Ask about" land on the console, in front of this tab.
+				showConsole: () => openConsole(entry.ctx.endpoint),
 				announce: (text) => announcer.announce(text),
 			}),
 		[entry, payload.objectId, payload.path]

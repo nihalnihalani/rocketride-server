@@ -57,6 +57,7 @@ import { consoleColumns } from '../vector/layout';
 import { providerTitle } from '../vector/support';
 import { BUSY } from '../vector/wording';
 import { styles } from '../styles';
+import { openConsole } from './ConnectionsView';
 import MapView from './MapView';
 
 /** The console's two tabs. */
@@ -128,6 +129,8 @@ export const ConsoleView: React.FC<IConsoleViewProps> = ({ opened, active }) => 
 					const row = entry.controller.getState().directory.rows.find((r) => r.objectId === objectId);
 					openDocumentTab(entry.ctx.endpoint, objectId, row?.path ?? null, chunkId);
 				},
+				// Focuses this console's tab: nothing changes while it is in front; in a split it activates its group.
+				showConsole: () => openConsole(entry.ctx.endpoint),
 				announce: (text) => announcer.announce(text),
 			}),
 		[entry]

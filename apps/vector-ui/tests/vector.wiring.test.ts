@@ -75,6 +75,17 @@ test('every lane file exists (the premise of the checks below)', () => {
 	for (const file of LANE_FILES) assert.ok(fs.existsSync(path.join(SRC, file)), file);
 });
 
+test("a document tab and the console both front the connection's console tab for map and chat actions", () => {
+	// From a document tab, "Show chunk path on map" and the per-chunk "map" must land on the visible map, not
+	// leave the document tab in front with the map hidden behind it (APP_SPEC R9: every action lands back in the console).
+	const app = code('VectorApp.tsx');
+	assert.match(app, /import ConnectionsView, \{ openConsole \} from '\.\/views\/ConnectionsView';/);
+	assert.match(app, /makeConsoleActions\(entry, \{[\s\S]*?showConsole: \(\) => openConsole\(entry\.ctx\.endpoint\),[\s\S]*?\}\)/);
+	const view = code('views/ConsoleView.tsx');
+	assert.match(view, /import \{ openConsole \} from '\.\/ConnectionsView';/);
+	assert.match(view, /makeConsoleActions\(entry, \{[\s\S]*?showConsole: \(\) => openConsole\(entry\.ctx\.endpoint\),[\s\S]*?\}\)/);
+});
+
 test('the console is the first view of a connection: the landing and the sidebar open its console', () => {
 	assert.match(code('views/ConnectionsView.tsx'), /openStaticDocument\(consoleUri\(endpoint\.key\)/);
 	assert.match(code('views/ConnectionsView.tsx'), /Elasticsearch and OpenSearch stores are not listed\./, "the landing's help text says which stores are left out");
@@ -201,17 +212,26 @@ test('console actions: show on the map, ask about these, remove (confirmed by th
 	const entry = connectionEntry(endpoint('key-actions'), null, DEFAULT_LIMITS, clock);
 	const opened: Array<[string, number | undefined]> = [];
 	const announced: string[] = [];
-	const actions = makeConsoleActions(entry, { openDocument: (id, chunk) => opened.push([id, chunk]), announce: (t) => announced.push(t) });
+	// Every action that changes what the console shows also brings the connection's console tab to the front.
+	const fronted: string[] = [];
+	const actions = makeConsoleActions(entry, {
+		openDocument: (id, chunk) => opened.push([id, chunk]),
+		showConsole: () => fronted.push(`${entry.tab.get()}:${entry.selection.getState().highlight?.keys.length ?? 0}`),
+		announce: (t) => announced.push(t),
+	});
 	actions.showOnMap([['doc-1', 3]], 'chat');
 	assert.deepEqual(entry.selection.getState().highlight, { source: 'chat', keys: [['doc-1', 3]] });
 	assert.equal(entry.tab.get(), 'map');
+	assert.deepEqual(fronted, ['map:1'], 'showing on the map fronts the console, already on its Map tab with the highlight set');
 	actions.askAbout(['doc-1', 'doc-2']);
 	assert.deepEqual(entry.chatScope.get(), ['doc-1', 'doc-2']);
 	assert.equal(entry.tab.get(), 'console', 'asking lands back in the console');
+	assert.deepEqual(fronted, ['map:1', 'console:1'], 'asking about documents fronts the console too');
 	actions.askAbout([]);
 	assert.equal(entry.chatScope.get(), null);
 	actions.openDocument('doc-1', 4);
 	assert.deepEqual(opened, [['doc-1', 4]]);
+	assert.equal(fronted.length, 3, 'opening a document tab does not front the console');
 	actions.announce('hello');
 	assert.deepEqual(announced, ['hello']);
 	entry.controller.setWritesEnabled(true);
