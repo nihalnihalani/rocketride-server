@@ -74,6 +74,7 @@ from .vx_types import (
     CONTROL_OBJECT_ID,
     DELETED_VALUES,
     FILTER_APPLIED_VALUES,
+    KEYWORD_MATCHES,
     LISTING_REASONS,
     PROJECTIONS,
     SAMPLE_STRATEGIES,
@@ -246,6 +247,19 @@ def _int_or_none(value: Any) -> Optional[int]:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _byte_count(value: Any) -> Optional[int]:
+    """A size in bytes a driver reported: a whole number of 0 or more, else None (never a guess)."""
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, float):
+        return int(value) if value.is_integer() and value >= 0 else None
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number >= 0 and number == value else None
 
 
 def documentRow(doc: Doc, *, chunks: Optional[int] = None, tables: Optional[int] = None) -> DocumentRow:
@@ -1238,6 +1252,12 @@ class VectorExplorerTools:
                 'limits': {'type': 'object'},
                 'health': {'type': 'object'},
                 'caveats': {'type': 'array', 'items': {'type': 'string'}},
+                'size_bytes': {'type': ['integer', 'null'], 'description': 'Storage the collection takes, when known.'},
+                'keyword_match': {
+                    'type': ['string', 'null'],
+                    'enum': [*KEYWORD_MATCHES, None],
+                    'description': 'How keyword search matches: text fragments (substring) or whole words (token).',
+                },
             },
         },
         description=(
@@ -1264,6 +1284,12 @@ class VectorExplorerTools:
         if info.backend != 'pgvector':
             limits['statement_timeout_ms'] = None
         mismatch = getattr(store, 'modelMismatch', None) if info.collection_exists else None
+        capabilities = self._vx_capabilities(store.capabilities())
+        # How keyword search matches (contract section 4.4-G): the driver's constant, and only
+        # where it searches by keyword at all.
+        keyword_match = getattr(type(store), 'VX_KEYWORD_MATCH', None)
+        if not capabilities['search_keyword'] or keyword_match not in KEYWORD_MATCHES:
+            keyword_match = None
         return {
             'success': True,
             'dialect': 'vector',
@@ -1282,7 +1308,7 @@ class VectorExplorerTools:
             'agent_writes': self._vx_agent_writes(),
             'writes_scope': 'tools_source',
             'write_tools': list(WRITE_TOOLS),
-            'capabilities': self._vx_capabilities(store.capabilities()),
+            'capabilities': capabilities,
             'limits': limits,
             'health': {
                 'collection_exists': info.collection_exists,
@@ -1291,6 +1317,9 @@ class VectorExplorerTools:
                 'meta_column': info.meta_column,
             },
             'caveats': list(dict.fromkeys(caveats)),
+            # Additive keys (contract section 4.4-F/G): null where the driver does not say.
+            'size_bytes': _byte_count(getattr(info, 'size_bytes', None)),
+            'keyword_match': keyword_match,
         }
 
     # ------------------------------------------------------------------

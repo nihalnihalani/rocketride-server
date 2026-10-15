@@ -843,6 +843,57 @@ def test_dialect_statement_timeout_is_pgvector_only():
     )
 
 
+def test_dialect_reports_the_store_size_where_the_driver_measures_it():
+    class Measured(ExactListingStore):
+        def describe(self):
+            import dataclasses
+
+            return dataclasses.replace(super().describe(), size_bytes=48234496)
+
+    answer = node(clustered(Measured)).dialect({})
+    assert answer['size_bytes'] == 48234496
+    assert list(answer)[-2:] == ['size_bytes', 'keyword_match'], 'the additive keys follow the first contract'
+    assert node(clustered()).dialect({})['size_bytes'] is None
+    assert node(MemoryStore()).dialect({})['size_bytes'] is None
+
+
+@pytest.mark.parametrize('size', [-1, 'big', 1.5, True])
+def test_dialect_reports_no_size_it_cannot_trust(size):
+    class Odd(ExactListingStore):
+        def describe(self):
+            import dataclasses
+
+            return dataclasses.replace(super().describe(), size_bytes=size)
+
+    assert node(clustered(Odd)).dialect({})['size_bytes'] is None
+
+
+@pytest.mark.parametrize(
+    'constant,keyword_search,expected',
+    [
+        ('substring', True, 'substring'),
+        ('token', True, 'token'),
+        (None, True, None),
+        ('regex', True, None),
+        ('substring', False, None),
+    ],
+)
+def test_dialect_says_how_keyword_search_matches(constant, keyword_search, expected):
+    class Keyword(ExactListingStore):
+        VX_KEYWORD_MATCH = constant
+        VX_DRIVER_CAPABILITIES = (
+            frozenset({'search_keyword', 'documents_distinct'}) if keyword_search else frozenset({'documents_distinct'})
+        )
+
+    answer = node(clustered(Keyword)).dialect({})
+    assert answer['capabilities']['search_keyword'] is keyword_search
+    assert answer['keyword_match'] == expected
+
+
+def test_dialect_keyword_match_is_null_for_a_driver_that_does_not_say():
+    assert node(clustered()).dialect({})['keyword_match'] is None
+
+
 def test_dialect_store_failure_is_the_only_failure():
     class Broken(MemoryStore):
         def _doesCollectionExist(self):
