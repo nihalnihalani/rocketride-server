@@ -43,43 +43,7 @@ import { EXPORT_COLUMNS } from '../src/contract/types';
 import type { CallOutcome } from '../src/chat/toolCalls';
 import { classifyRetrieval } from '../src/vector/retrieval';
 import { QUERY_NEEDS_EMBED } from '../src/map/wording';
-import {
-	HYBRID_LABEL,
-	HYBRID_NEEDS_KEYWORD,
-	KEYWORD_UNSUPPORTED,
-	NODE_SETTING_NOTE,
-	RRF_K,
-	SEARCH_MODES,
-	STATUS_WORDS,
-	TOP_K_OPTIONS,
-	VECTOR_UNSUPPORTED,
-	classifyAt,
-	defaultMode,
-	fuse,
-	initialThreshold,
-	keywordCaption,
-	keywordSearchInput,
-	modeOptions,
-	nodeSettingText,
-	plan,
-	previewOf,
-	rateLimitSentence,
-	retrievalExportRows,
-	retryAfterSeconds,
-	rowsFromSearch,
-	runWorkbench,
-	scoreTitle,
-	searchExportItems,
-	searchScope,
-	secondsLeft,
-	semanticSearchInput,
-	showSearchOnMap,
-	sliderRange,
-	sliderValueText,
-	thresholdSentence,
-	topKOptions,
-	workbenchExportRows,
-} from '../src/vector/searchWorkbench';
+import { HYBRID_LABEL, HYBRID_NEEDS_KEYWORD, KEYWORD_UNSUPPORTED, NODE_SETTING_NOTE, RRF_K, SEARCH_MODES, STATUS_WORDS, TOP_K_OPTIONS, VECTOR_UNSUPPORTED, classifyAt, defaultMode, fuse, initialThreshold, keywordCaption, keywordSearchInput, modeOptions, nodeSettingText, plan, previewOf, rateLimitSentence, retrievalExportRows, retryAfterSeconds, rowsFromSearch, runWorkbench, scoreTitle, searchExportItems, searchScope, secondsLeft, semanticSearchInput, showSearchOnMap, sliderRange, sliderValueText, thresholdSentence, topKOptions, workbenchExportRows } from '../src/vector/searchWorkbench';
 import type { WorkbenchDeps, WorkbenchRow } from '../src/vector/searchWorkbench';
 
 // ── Fixtures ────────────────────────────────────────────────────────────────
@@ -205,16 +169,29 @@ test('modes: Semantic, Keyword, Hybrid and Auto, all offered on a store that sea
 test('modes: a store without keyword search (Pinecone) disables Keyword and Hybrid with their sentences', () => {
 	const options = modeOptions(model({ capabilities: pineconeCapabilities }));
 	assert.equal(KEYWORD_UNSUPPORTED, 'This store cannot search by keyword');
-	assert.deepEqual(options.find((o) => o.mode === 'keyword'), { mode: 'keyword', label: 'Keyword', enabled: false, reason: KEYWORD_UNSUPPORTED });
-	assert.deepEqual(options.find((o) => o.mode === 'hybrid'), { mode: 'hybrid', label: 'Hybrid', enabled: false, reason: HYBRID_NEEDS_KEYWORD });
+	assert.deepEqual(
+		options.find((o) => o.mode === 'keyword'),
+		{ mode: 'keyword', label: 'Keyword', enabled: false, reason: KEYWORD_UNSUPPORTED }
+	);
+	assert.deepEqual(
+		options.find((o) => o.mode === 'hybrid'),
+		{ mode: 'hybrid', label: 'Hybrid', enabled: false, reason: HYBRID_NEEDS_KEYWORD }
+	);
 	assert.equal(options.find((o) => o.mode === 'semantic')?.enabled, true);
 	assert.equal(options.find((o) => o.mode === 'auto')?.enabled, true);
 });
 
 test('modes: without the embedding node Semantic, Hybrid and Auto say why; Keyword stays and becomes the default', () => {
-	for (const embed of [{ enabled: false, reason: null }, { enabled: true, reason: null }]) {
+	for (const embed of [
+		{ enabled: false, reason: null },
+		{ enabled: true, reason: null },
+	]) {
 		const options = modeOptions(model({ embed, nodes: { store: 'store_1', embed: embed.enabled ? null : 'embed_1', llm: null, llmName: null } }));
-		for (const mode of ['semantic', 'hybrid', 'auto'] as const) assert.deepEqual(options.find((o) => o.mode === mode), { mode, label: mode[0].toUpperCase() + mode.slice(1), enabled: false, reason: QUERY_NEEDS_EMBED });
+		for (const mode of ['semantic', 'hybrid', 'auto'] as const)
+			assert.deepEqual(
+				options.find((o) => o.mode === mode),
+				{ mode, label: mode[0].toUpperCase() + mode.slice(1), enabled: false, reason: QUERY_NEEDS_EMBED }
+			);
 		assert.equal(options.find((o) => o.mode === 'keyword')?.enabled, true);
 		assert.equal(defaultMode(options), 'keyword');
 	}
@@ -477,7 +454,13 @@ test('runWorkbench semantic: embed on the embedding node, then search the store 
 	assert.equal(outcome.run.scoped, 1);
 	assert.equal(vectorsIn(outcome, embedOk.dimension), 0, 'nothing vector-shaped is kept');
 	// Only the search request carries it, once.
-	assert.equal(vectorsIn(calls.map((call) => call.input), embedOk.dimension), 1);
+	assert.equal(
+		vectorsIn(
+			calls.map((call) => call.input),
+			embedOk.dimension
+		),
+		1
+	);
 });
 
 test('runWorkbench keyword: one search by the question, no embed; KX4471 is sent as typed', async () => {
@@ -584,7 +567,7 @@ test('workbenchExportRows: the search columns, the words on screen, no vector', 
 	assert.equal(both.rows[0].run, 'A');
 });
 
-test('retrievalExportRows: the debugger\'s rows in the search columns, its own words, previews cut to 120 characters', () => {
+test("retrievalExportRows: the debugger's rows in the search columns, its own words, previews cut to 120 characters", () => {
 	const view = classifyRetrieval({ ...searchVector, results: [{ ...searchVector.results[0], content: 'z'.repeat(400) }, ...searchVector.results.slice(1)] }, dialect.score, [{ rank: 1, key: ['2ed1cfeb-37ac-4394-30f7-699303f093bd', 39], objectId: '2ed1cfeb-37ac-4394-30f7-699303f093bd', chunkId: 39, path: 'C:/demo/ops/ops_021.pdf', score: 0.5433, text: '' }]);
 	const words = { used: 'passed the threshold', near_miss: 'near miss: below the threshold', below_floor: 'below the floor' } as const;
 	const exported = retrievalExportRows(view, words);
@@ -617,7 +600,10 @@ test('searchExportItems: A, and with Compare B and both; disabled until a run', 
 		]
 	);
 	assert.deepEqual(
-		two[2].rows?.().rows.map((row) => row.run).slice(7, 9),
+		two[2]
+			.rows?.()
+			.rows.map((row) => row.run)
+			.slice(7, 9),
 		['A', 'B']
 	);
 });

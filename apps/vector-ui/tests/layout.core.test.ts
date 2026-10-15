@@ -107,7 +107,10 @@ test('the seeded random source is deterministic and uniform in [0, 1)', () => {
 	const a = seededRandom(42);
 	const b = seededRandom(42);
 	const draws = Array.from({ length: 1000 }, () => a());
-	assert.deepEqual(draws.slice(0, 5), Array.from({ length: 5 }, () => b()));
+	assert.deepEqual(
+		draws.slice(0, 5),
+		Array.from({ length: 5 }, () => b())
+	);
 	assert.ok(draws.every((v) => v >= 0 && v < 1));
 	const mean = draws.reduce((s, v) => s + v, 0) / draws.length;
 	assert.ok(Math.abs(mean - 0.5) < 0.05);

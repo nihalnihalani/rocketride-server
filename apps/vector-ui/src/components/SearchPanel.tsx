@@ -51,37 +51,7 @@ import { callTool, toolChannelFor } from '../chat/toolCalls';
 import { showCompareOnMap } from '../adapters/consoleActions';
 import { DEBUGGER_EXTRA } from '../vector/retrieval';
 import { compareRuns, compareSentence } from '../vector/compare';
-import {
-	CALL_TIMEOUT_MS,
-	DEFAULT_TOP_K,
-	KEYWORD_FALLBACK_SENTENCE,
-	MODEL_MISMATCH_SENTENCE,
-	MODE_HINTS,
-	NODE_SETTING_FIELD,
-	NODE_SETTING_NOTE,
-	NODE_SETTING_RANGE,
-	STATUS_WORDS,
-	classifyAt,
-	defaultMode,
-	initialThreshold,
-	keywordCaption,
-	modeOptions,
-	noResultsSentence,
-	nodeSettingText,
-	onGrid,
-	rateLimitSentence,
-	runCaption,
-	runWorkbench,
-	scoreTitle,
-	searchExportItems,
-	searchScope,
-	secondsLeft,
-	showSearchOnMap,
-	sliderRange,
-	sliderValueText,
-	thresholdSentence,
-	topKOptions,
-} from '../vector/searchWorkbench';
+import { CALL_TIMEOUT_MS, DEFAULT_TOP_K, KEYWORD_FALLBACK_SENTENCE, MODEL_MISMATCH_SENTENCE, MODE_HINTS, NODE_SETTING_FIELD, NODE_SETTING_NOTE, NODE_SETTING_RANGE, STATUS_WORDS, classifyAt, defaultMode, initialThreshold, keywordCaption, modeOptions, noResultsSentence, nodeSettingText, onGrid, rateLimitSentence, runCaption, runWorkbench, scoreTitle, searchExportItems, searchScope, secondsLeft, showSearchOnMap, sliderRange, sliderValueText, thresholdSentence, topKOptions } from '../vector/searchWorkbench';
 import type { Classification, ModeOption, SearchMode, SliderRange, WorkbenchDeps, WorkbenchOutcome, WorkbenchRow, WorkbenchRun } from '../vector/searchWorkbench';
 import { ExportMenu } from './ExportMenu';
 import { QueryCompare } from './QueryCompare';
@@ -575,7 +545,24 @@ export function SearchPanel({ model, channels, selection, actions, prefill = nul
 					{comparing ? `${phase.side}: ${phase.message}` : phase.message}
 				</p>
 			)}
-			{runs.a !== null && viewA !== null && runs.b === null && <SearchResults run={runs.a} view={viewA} score={score} range={range} {...handlers} onMap={(row) => showSearchOnMap(selection, actions, (runs.a as WorkbenchRun).question, [row.key])} onShowAll={() => showSearchOnMap(selection, actions, (runs.a as WorkbenchRun).question, (runs.a as WorkbenchRun).rows.map((row) => row.key))} />}
+			{runs.a !== null && viewA !== null && runs.b === null && (
+				<SearchResults
+					run={runs.a}
+					view={viewA}
+					score={score}
+					range={range}
+					{...handlers}
+					onMap={(row) => showSearchOnMap(selection, actions, (runs.a as WorkbenchRun).question, [row.key])}
+					onShowAll={() =>
+						showSearchOnMap(
+							selection,
+							actions,
+							(runs.a as WorkbenchRun).question,
+							(runs.a as WorkbenchRun).rows.map((row) => row.key)
+						)
+					}
+				/>
+			)}
 			{runs.a !== null && viewA !== null && runs.b !== null && viewB !== null && (
 				<>
 					{runs.a.rated && runs.a.rows.length > 0 && <ThresholdControls lead="A — " rows={runs.a.rows} view={viewA} score={score} range={range} onThreshold={setAt} onCopySetting={copySetting} copied={copied} />}

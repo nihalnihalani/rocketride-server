@@ -128,10 +128,7 @@ export function RetrievalDebugger({ model, channels, question, topK, onClose, an
 
 	if (!enabled) return null;
 	const range = model.connection.dialect?.score?.range ?? null;
-	const exportItems: IExportItem[] =
-		phase.kind === 'done'
-			? [{ id: 'retrieval', label: `"Why these?" rows (${phase.view.rows.length})`, kind: 'retrieval', disabled: null, rows: () => retrievalExportRows(phase.view, STATUS_WORDS) }]
-			: [{ id: 'retrieval', label: '"Why these?" rows', kind: 'retrieval', disabled: phase.kind === 'error' ? 'The search did not run' : 'Nothing to export yet' }];
+	const exportItems: IExportItem[] = phase.kind === 'done' ? [{ id: 'retrieval', label: `"Why these?" rows (${phase.view.rows.length})`, kind: 'retrieval', disabled: null, rows: () => retrievalExportRows(phase.view, STATUS_WORDS) }] : [{ id: 'retrieval', label: '"Why these?" rows', kind: 'retrieval', disabled: phase.kind === 'error' ? 'The search did not run' : 'Nothing to export yet' }];
 	return (
 		<section style={S.root} aria-label="Why these sources">
 			<div style={S.head}>
