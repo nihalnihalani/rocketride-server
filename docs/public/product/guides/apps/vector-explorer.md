@@ -212,8 +212,11 @@ added through a Drag & Drop source has that path (see
 new file is stored." with **Cancel** focused. Each file
 then shows queued, uploading, processing, and "N chunks added". A failed upload
 says "Failed. The engine did not return the reason; the pipeline's run log
-may. The document was not added." Files with the same name in different folders
-are sent one after another so each row reports its own file.
+may. The document was not added." An upload that completes but leaves nothing
+in the store, such as a PDF without text the parser can read, is looked up
+again for a few seconds and then says "Not added: the pipeline stored no chunks
+for this file." Files with the same name in different folders are sent one
+after another so each row reports its own file.
 
 When the Ingest source feeds more than one store node, the panel names the
 others: "This pipeline's ingest also reaches: `<names>`". Without a running

@@ -153,6 +153,10 @@ console. **Table** lists the same points for keyboard and screen-reader use.
   **Store under folder** puts a prefix in front. Dropping a file whose path is
   already stored asks before replacing it; the old chunks are removed when the
   new file is stored.
+- An upload that completes but leaves no chunks in the store (for example a PDF
+  without text the parser can read) says "Not added: the pipeline stored no
+  chunks for this file." once the store still does not list it a few seconds
+  later.
 - Anyone with the data permission on the Ingest task can add documents, with or
   without this app.
 

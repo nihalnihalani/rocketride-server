@@ -36,7 +36,7 @@ import type { ISendFile } from 'shared/explorer';
 import { objectIdForPath } from '../src/vector/objectId';
 import { FAILED_SENTENCE, uploadLabel } from '../src/vector/uploads';
 import type { DropCandidate } from '../src/vector/uploads';
-import { RECOUNT_DELAY_MS, createIngestQueue } from '../src/ingest/ingestQueue';
+import { NOT_STORED_SENTENCE, RECOUNT_DELAYS_MS, createIngestQueue } from '../src/ingest/ingestQueue';
 import type { IngestDeps } from '../src/ingest/ingestQueue';
 import { createNameLocks } from '../src/ingest/nameLocks';
 import type { CallOutcome } from '../src/chat/toolCalls';
@@ -129,7 +129,7 @@ test('queue: a finished upload is counted and the console is told which document
 	assert.equal(queue.getState().busy, false);
 });
 
-test('queue: a document the store does not list yet is asked for once more, then reported honestly', async () => {
+test('queue: a completed upload the store never lists is not added, after the recounts, and says why', async () => {
 	let documentsCalls = 0;
 	const fake = fakeDeps({
 		async callTool(tool): Promise<CallOutcome> {
@@ -139,13 +139,41 @@ test('queue: a document the store does not list yet is asked for once more, then
 		},
 	});
 	const queue = createIngestQueue(fake.deps);
+	await queue.addDrop([candidate('broken.pdf')]);
+	await queue.idle();
+	assert.equal(documentsCalls, RECOUNT_DELAYS_MS.length + 1, 'one look, then one per recount');
+	assert.deepEqual(fake.slept, [...RECOUNT_DELAYS_MS]);
+	assert.ok(RECOUNT_DELAYS_MS.reduce((a, b) => a + b, 0) >= 4_000, 'a store that lists a little late still gets a few seconds');
+	const row = queue.getState().rows[0];
+	// A completed upload the store lists no chunk of was not added: never a 'done' row that promises it will appear.
+	assert.equal(row.status, 'failed');
+	assert.equal(row.chunks, null);
+	assert.equal(uploadLabel(row), NOT_STORED_SENTENCE);
+	assert.match(NOT_STORED_SENTENCE, /^Not added: the pipeline stored no chunks for this file\./);
+	assert.doesNotMatch(uploadLabel(row), /yet|in a moment/);
+	assert.ok(fake.announced.includes(`broken.pdf: ${NOT_STORED_SENTENCE}`));
+	// The pipeline ran, so the console still refreshes what it shows.
+	assert.deepEqual(fake.changed, [[objectIdForPath('broken.pdf')]]);
+	assert.equal(queue.getState().busy, false);
+});
+
+test('queue: a document the store lists only on a recount is counted like any other', async () => {
+	let documentsCalls = 0;
+	const fake = fakeDeps({
+		async callTool(tool, input): Promise<CallOutcome> {
+			if (tool === 'chunks') return { ok: false, code: 'NOT_FOUND', message: 'not stored', kind: null, error: null };
+			documentsCalls += 1;
+			const id = (input.object_ids as string[])[0];
+			return { ok: true, value: { success: true, items: documentsCalls < RECOUNT_DELAYS_MS.length + 1 ? [] : [{ objectId: id, chunks: 3 }] } };
+		},
+	});
+	const queue = createIngestQueue(fake.deps);
 	await queue.addDrop([candidate('late.md')]);
 	await queue.idle();
-	assert.equal(documentsCalls, 2);
-	assert.deepEqual(fake.slept, [RECOUNT_DELAY_MS]);
+	assert.deepEqual(fake.slept, [...RECOUNT_DELAYS_MS]);
 	const row = queue.getState().rows[0];
 	assert.equal(row.status, 'done');
-	assert.equal(uploadLabel(row), 'Sent, but the store does not list it yet. Refresh in a moment.');
+	assert.equal(uploadLabel(row), '3 chunks added');
 });
 
 test('queue: zero chunks, an uncountable store and a failed count each read as what they are', async () => {

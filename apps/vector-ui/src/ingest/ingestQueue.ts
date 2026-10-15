@@ -40,8 +40,12 @@
 //               the one file of that name in flight; the result sendFiles
 //               returns decides the outcome.
 //   5. COUNT    `documents({object_ids: [id]})` reports how many chunks the
-//               store holds ("N chunks added"); then onDocumentsChanged lets
-//               the console refresh its stats and directory.
+//               store holds ("N chunks added"). A completed upload the store
+//               still does not list after the recounts was not added: the
+//               pipeline stored no chunks for it (a file without text the
+//               parser can read ends this way; the engine reports no error).
+//               Then onDocumentsChanged lets the console refresh its stats
+//               and directory.
 //
 // Drops are planned and asked about in order; sends run one call at a time.
 // Nothing here retries, and nothing ever sends an objectId. dispose() forgets
@@ -59,8 +63,16 @@ import { sharedUploadLocks } from './nameLocks';
 import type { NameLocks } from './nameLocks';
 import { TRAVERSAL_SCAN_CAP } from './dropTraversal';
 
-/** Wait before the one recount when a finished upload is not listed yet. */
-export const RECOUNT_DELAY_MS = 1_500;
+/**
+ * Waits before each recount of a completed upload the store does not list. The
+ * engine answers an upload once its pipeline has run, so a stored document is
+ * normally listed at the first look; the recounts give a store that lists a
+ * little late a few seconds before the row says the file was not added.
+ */
+export const RECOUNT_DELAYS_MS: readonly number[] = [1_500, 3_000];
+
+/** A completed upload the store lists no chunk of after the recounts. */
+export const NOT_STORED_SENTENCE = "Not added: the pipeline stored no chunks for this file. The parser may have found no text in it; the pipeline's run log may say why.";
 
 /** What the queue needs from the connection. Read on every use, so getters may change. */
 export interface IngestDeps {
@@ -72,7 +84,7 @@ export interface IngestDeps {
 	callTool(tool: 'chunks' | 'documents', input: Record<string, unknown>): Promise<CallOutcome>;
 	/** The ingest role's sendFiles. */
 	sendFiles(files: ISendFile[], options: { maxConcurrent: number }): Promise<Array<Record<string, unknown>>>;
-	/** Documents were added: refresh stats and the directory. */
+	/** Uploads completed (stored or not): refresh stats and the directory. */
 	onDocumentsChanged(objectIds: readonly string[]): void;
 	/** Say something through the polite live region. */
 	announce(message: string): void;
@@ -216,20 +228,21 @@ export function createIngestQueue(deps: IngestDeps): IngestQueue {
 	 * @param files - Files whose upload completed.
 	 */
 	const countChunks = async (files: readonly PlannedUpload[]): Promise<void> => {
-		const added: string[] = [];
+		const completed: string[] = [];
 		for (const file of files) {
 			if (disposed) return;
 			// The id the engine reported for the upload (applyFinalResult), else the derived one.
 			const objectId = rowOf(file.id)?.objectId ?? file.objectId;
 			let chunks: number | null = null;
 			let message: string | null;
+			let stored = true;
 			if (!deps.canCount) {
 				message = 'Sent. Refresh to see it in the list.';
 			} else {
 				let listed = false;
 				let failure: string | null = null;
-				for (let attempt = 0; attempt < 2 && !listed && failure === null; attempt++) {
-					if (attempt > 0) await sleep(RECOUNT_DELAY_MS);
+				for (let attempt = 0; attempt <= RECOUNT_DELAYS_MS.length && !listed && failure === null; attempt++) {
+					if (attempt > 0) await sleep(RECOUNT_DELAYS_MS[attempt - 1] as number);
 					const outcome = await deps.callTool('documents', { object_ids: [objectId], limit: 1 });
 					if (disposed) return;
 					if (!outcome.ok) {
@@ -244,15 +257,18 @@ export function createIngestQueue(deps: IngestDeps): IngestQueue {
 					}
 				}
 				if (failure !== null) message = `Added. The chunk count could not be read: ${failure}`;
-				else if (!listed) message = 'Sent, but the store does not list it yet. Refresh in a moment.';
-				else message = chunkCountMessage(chunks);
+				else if (!listed) {
+					stored = false;
+					message = NOT_STORED_SENTENCE;
+				} else message = chunkCountMessage(chunks);
 			}
-			updateRow(file.id, { status: 'done', chunks, message });
-			added.push(objectId);
+			updateRow(file.id, { status: stored ? 'done' : 'failed', chunks, message });
+			completed.push(objectId);
 			const row = rowOf(file.id);
 			if (row) deps.announce(`${file.path}: ${uploadLabel(row)}`);
 		}
-		if (added.length > 0 && !disposed) deps.onDocumentsChanged(added);
+		// The pipeline ran for every one of them, so the console refreshes what it shows either way.
+		if (completed.length > 0 && !disposed) deps.onDocumentsChanged(completed);
 	};
 
 	/** Send queued units one call at a time. */
