@@ -354,6 +354,9 @@ export function createIngestQueue(deps: IngestDeps): IngestQueue {
 		set({ rows: [...state.rows, ...fresh.map((entry) => entry.row)], notes });
 		if (plan.refused.length > 0) {
 			deps.announce(plan.refused.length === 1 ? '1 file was not added; the list says why.' : `${plan.refused.length} files were not added; the list says why.`);
+		} else if (plan.accepted.length === 0 && notes.length > 0) {
+			// Nothing to add and no row to show: the notes are all this drop has to say.
+			deps.announce(notes.join(' '));
 		}
 
 		// Probe every accepted file before anything of this drop is sent.

@@ -265,6 +265,18 @@ test('queue: refused files get a row and an announcement; traversal notes are sh
 	assert.deepEqual(queue.getState().notes, ['Skipped 2 hidden or system files.', 'Could not read x/broken.pdf.', 'More than 1,000 files were dropped; only the first 1,000 were read.']);
 });
 
+test('queue: a drop with no file to add but something to say shows and announces it', async () => {
+	const fake = fakeDeps();
+	const queue = createIngestQueue(fake.deps);
+	const sentence = '2 dropped items could not be read as files. Use Add files or Add folder for them.';
+	await queue.addDrop([], { errors: [sentence] });
+	await queue.idle();
+	assert.deepEqual(queue.getState().rows, []);
+	assert.deepEqual(queue.getState().notes, [sentence]);
+	assert.ok(fake.announced.includes(sentence));
+	assert.deepEqual(fake.sent, []);
+});
+
 test('queue: a second drop of a path still being added is refused; drops are handled in order', async () => {
 	const gate = deferred<void>();
 	const fake = fakeDeps({

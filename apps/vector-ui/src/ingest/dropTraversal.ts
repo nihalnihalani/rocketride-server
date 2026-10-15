@@ -32,13 +32,17 @@
 // Two rules the browser imposes:
 //   - The DataTransfer is emptied when the drop handler returns, so the
 //     entries are taken synchronously (`entriesFromDataTransfer`) and walked
-//     afterwards (`traverseEntries`).
+//     afterwards (`traverseDrop`).
 //   - A directory reader hands out its children in batches; `readEntries` is
 //     called until it answers with an empty list.
 //
 // The walk is bounded (TRAVERSAL_SCAN_CAP files, MAX_TRAVERSAL_DEPTH levels),
 // sorted by name at every level so the order is predictable, and skips hidden
 // and system files (.DS_Store, Thumbs.db, .git/…), reporting what it skipped.
+// An item the browser gives no entry for (webkitGetAsEntry() answers null,
+// as it does for a drop a page script builds) is read with getAsFile() and
+// stored under its name; an item that yields neither is counted, and the
+// drop says so, as it does when nothing at all could be read.
 // The upload caps themselves are applied later (src/vector/uploads.ts).
 // =============================================================================
 
@@ -61,8 +65,31 @@ export interface FsEntryLike {
 
 /** The parts of a DataTransfer the walk uses. */
 export interface DataTransferLike {
-	items?: ArrayLike<{ kind?: string; webkitGetAsEntry?: () => FsEntryLike | null }> | null;
+	items?: ArrayLike<{ kind?: string; webkitGetAsEntry?: () => FsEntryLike | null; getAsFile?: () => File | null }> | null;
 	files?: ArrayLike<File> | null;
+}
+
+/** What a drop handed over, taken while the drop event runs. */
+export interface DropSnapshot {
+	/** Entries to walk (files and folders). */
+	entries: FsEntryLike[];
+	/** Files without an entry: each is stored under its name. */
+	loose: File[];
+	/** File items that gave neither an entry nor a file. */
+	unreadable: number;
+}
+
+/** A drop that yielded no file, no skipped file and no other message. */
+export const DROP_NOTHING_READ = 'Nothing in this drop could be read as a file. Use Add files or Add folder instead.';
+
+/**
+ * The sentence for dropped items that could not be read.
+ *
+ * @param count - How many.
+ * @returns The sentence.
+ */
+export function unreadableSentence(count: number): string {
+	return count === 1 ? '1 dropped item could not be read as a file. Use Add files or Add folder for it.' : `${count.toLocaleString('en-US')} dropped items could not be read as files. Use Add files or Add folder for them.`;
 }
 
 /** A file and the path it is stored under (before any "Store under folder" prefix). */
@@ -100,10 +127,13 @@ export function isHiddenName(name: string): boolean {
  * empties the DataTransfer when the handler returns.
  *
  * @param transfer - The drop's DataTransfer.
- * @returns The entries to walk, and plain files when the browser gave no entries.
+ * @returns The entries to walk, the files that came without an entry (or the
+ *   plain file list when the browser gives no entries), and how many items gave neither.
  */
-export function entriesFromDataTransfer(transfer: DataTransferLike | null | undefined): { entries: FsEntryLike[]; loose: File[] } {
+export function entriesFromDataTransfer(transfer: DataTransferLike | null | undefined): DropSnapshot {
 	const entries: FsEntryLike[] = [];
+	const loose: File[] = [];
+	let unreadable = 0;
 	const items = transfer?.items ?? null;
 	let entrySupport = false;
 	if (items) {
@@ -112,14 +142,20 @@ export function entriesFromDataTransfer(transfer: DataTransferLike | null | unde
 			if (!item || item.kind !== 'file' || typeof item.webkitGetAsEntry !== 'function') continue;
 			entrySupport = true;
 			const entry = item.webkitGetAsEntry();
-			if (entry) entries.push(entry);
+			if (entry) {
+				entries.push(entry);
+				continue;
+			}
+			// No entry for this item: its file, when the browser hands one over.
+			const file = typeof item.getAsFile === 'function' ? item.getAsFile() : null;
+			if (file) loose.push(file);
+			else unreadable += 1;
 		}
 	}
-	const loose: File[] = [];
 	if (!entrySupport && transfer?.files) {
 		for (let i = 0; i < transfer.files.length; i++) loose.push(transfer.files[i]);
 	}
-	return { entries, loose };
+	return { entries, loose, unreadable };
 }
 
 /**
@@ -242,6 +278,22 @@ export async function traverseEntries(entries: readonly FsEntryLike[], loose: re
 		}
 		result.files.push({ file, relPath: file.name });
 	}
+	return result;
+}
+
+/**
+ * Walk a drop taken with {@link entriesFromDataTransfer}, and say what could
+ * not be read: items that gave neither an entry nor a file, or a drop that
+ * yielded nothing at all.
+ *
+ * @param snapshot - The drop.
+ * @param cap - Most files read (default {@link TRAVERSAL_SCAN_CAP}).
+ * @returns The files, what was skipped, and the sentences for what failed.
+ */
+export async function traverseDrop(snapshot: DropSnapshot, cap = TRAVERSAL_SCAN_CAP): Promise<TraversalResult> {
+	const result = await traverseEntries(snapshot.entries, snapshot.loose, cap);
+	if (snapshot.unreadable > 0) result.errors.push(unreadableSentence(snapshot.unreadable));
+	if (result.files.length === 0 && result.skipped.length === 0 && result.errors.length === 0) result.errors.push(DROP_NOTHING_READ);
 	return result;
 }
 

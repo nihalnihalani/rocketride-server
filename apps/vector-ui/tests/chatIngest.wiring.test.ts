@@ -131,8 +131,9 @@ test('wiring: upload progress comes from the shell event stream and only upload 
 	assert.match(hook, /useShellEvent\('shell:event'/);
 	assert.match(hook, /'apaevt_status_upload'/);
 	assert.match(hook, /queue\.handleEvent\(/);
-	// The drop's entries are taken inside the handler, before any await.
-	assert.match(hook, /const snapshot = entriesFromDataTransfer\(transfer\);\s*void traverseEntries/);
+	// The drop's entries are taken inside the handler, before any await; the walk says what it could not read.
+	assert.match(hook, /const snapshot = entriesFromDataTransfer\(transfer\);\s*void traverseDrop\(snapshot\)/);
+	assert.match(hook, /errors: result\.errors/);
 });
 
 test('wiring: answers render through the safe Markdown renderer, never the shell chat renderers', () => {

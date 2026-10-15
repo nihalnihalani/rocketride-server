@@ -32,7 +32,7 @@
 
 import { test as nodeTest } from 'node:test';
 import assert from 'node:assert/strict';
-import { MAX_TRAVERSAL_DEPTH, TRAVERSAL_SCAN_CAP, entriesFromDataTransfer, filesFromInput, isHiddenName, traverseEntries } from '../src/ingest/dropTraversal';
+import { DROP_NOTHING_READ, MAX_TRAVERSAL_DEPTH, TRAVERSAL_SCAN_CAP, entriesFromDataTransfer, filesFromInput, isHiddenName, traverseDrop, traverseEntries, unreadableSentence } from '../src/ingest/dropTraversal';
 import type { DataTransferLike, FsEntryLike } from '../src/ingest/dropTraversal';
 
 /** Most a test here may take: they await fakes, so a regression must fail, not hang the run. */
@@ -195,6 +195,56 @@ test('entriesFromDataTransfer: without entry support, the plain file list is use
 		result.files.map((f) => f.relPath),
 		['one.pdf', 'two.md']
 	);
+});
+
+test('entriesFromDataTransfer: an item the browser gives no entry for is read through getAsFile', async () => {
+	// A drop built by a page script (or some browsers for some sources) answers webkitGetAsEntry() with null.
+	const items = [
+		{ kind: 'file', webkitGetAsEntry: () => null, getAsFile: () => fakeFile('one.pdf') },
+		{ kind: 'file', webkitGetAsEntry: () => fileEntry('/folder/two.md') },
+		{ kind: 'file', webkitGetAsEntry: () => null, getAsFile: () => fakeFile('three.txt') },
+	];
+	const transfer: DataTransferLike = { items: items as unknown as DataTransferLike['items'], files: [] as unknown as DataTransferLike['files'] };
+	const snapshot = entriesFromDataTransfer(transfer);
+	assert.equal(snapshot.unreadable, 0);
+	const result = await traverseDrop(snapshot);
+	assert.deepEqual(
+		result.files.map((f) => f.relPath),
+		['folder/two.md', 'one.pdf', 'three.txt']
+	);
+	assert.deepEqual(result.errors, []);
+});
+
+test('traverseDrop: items with neither an entry nor a file are counted and the drop says so', async () => {
+	const items = [
+		{ kind: 'file', webkitGetAsEntry: () => null, getAsFile: () => null },
+		{ kind: 'file', webkitGetAsEntry: () => null },
+		{ kind: 'file', webkitGetAsEntry: () => fileEntry('/ok.md') },
+	];
+	const snapshot = entriesFromDataTransfer({ items: items as unknown as DataTransferLike['items'], files: [] as unknown as DataTransferLike['files'] });
+	assert.equal(snapshot.unreadable, 2);
+	const result = await traverseDrop(snapshot);
+	assert.deepEqual(
+		result.files.map((f) => f.relPath),
+		['ok.md']
+	);
+	assert.deepEqual(result.errors, [unreadableSentence(2)]);
+	assert.match(unreadableSentence(1), /^1 dropped item could not be read as a file\./);
+	assert.match(unreadableSentence(2), /^2 dropped items could not be read as files\./);
+	assert.match(unreadableSentence(2), /Add files or Add folder/);
+});
+
+test('traverseDrop: a drop that yields nothing at all says so instead of doing nothing', async () => {
+	const nothing = await traverseDrop(entriesFromDataTransfer({ items: [{ kind: 'file', webkitGetAsEntry: () => null }] as unknown as DataTransferLike['items'], files: [] as unknown as DataTransferLike['files'] }));
+	assert.deepEqual(nothing.files, []);
+	assert.deepEqual(nothing.errors, [unreadableSentence(1)]);
+	const empty = await traverseDrop(entriesFromDataTransfer({ items: [] as unknown as DataTransferLike['items'], files: [] as unknown as DataTransferLike['files'] }));
+	assert.deepEqual(empty.errors, [DROP_NOTHING_READ]);
+	assert.match(DROP_NOTHING_READ, /Add files or Add folder/);
+	// A drop of only hidden files reports what it skipped, not "nothing".
+	const hidden = await traverseDrop(entriesFromDataTransfer({ items: [{ kind: 'file', webkitGetAsEntry: () => fileEntry('/.DS_Store') }] as unknown as DataTransferLike['items'], files: [] as unknown as DataTransferLike['files'] }));
+	assert.deepEqual(hidden.errors, []);
+	assert.deepEqual(hidden.skipped, ['.DS_Store']);
 });
 
 test('filesFromInput: the folder picker keeps webkitRelativePath; hidden files inside folders are skipped', () => {

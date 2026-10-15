@@ -44,7 +44,7 @@ import type { IUploadEvent, IngestPanelProps } from '../contract/types';
 import { callTool, toolChannelFor } from '../chat/toolCalls';
 import { ingestQueueFor } from '../chat/registry';
 import type { IngestDeps, IngestState } from './ingestQueue';
-import { entriesFromDataTransfer, filesFromInput, traverseEntries } from './dropTraversal';
+import { entriesFromDataTransfer, filesFromInput, traverseDrop } from './dropTraversal';
 import type { DataTransferLike } from './dropTraversal';
 
 /** How long the probe and the count may take. */
@@ -106,7 +106,7 @@ export function useIngest(props: Pick<IngestPanelProps, 'model' | 'channels' | '
 		(transfer: DataTransferLike, prefix: string) => {
 			// Taken now: the browser empties the DataTransfer when the drop handler returns.
 			const snapshot = entriesFromDataTransfer(transfer);
-			void traverseEntries(snapshot.entries, snapshot.loose).then((result) => queue.addDrop(result.files, { prefix, skipped: result.skipped, errors: result.errors, truncated: result.truncated }));
+			void traverseDrop(snapshot).then((result) => queue.addDrop(result.files, { prefix, skipped: result.skipped, errors: result.errors, truncated: result.truncated }));
 		},
 		[queue]
 	);
