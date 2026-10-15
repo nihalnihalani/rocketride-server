@@ -250,6 +250,29 @@ def test_missing_dsn_in_response_raises(broker):
         _resolve('no-dsn-tenant')
 
 
+@pytest.mark.parametrize(
+    'raw',
+    [b'<html>not json</html>', b'{"dsn": "postgresql://u:p@h/db"', b'\xff\xfe not utf-8'],
+    ids=['html-page', 'truncated-json', 'invalid-utf8'],
+)
+def test_a_reachable_broker_with_a_non_json_answer_is_a_bad_response_not_unreachable(monkeypatch, raw):
+    """The broker was reached and answered 200: an operator must not be sent
+    looking for a network fault, and the body (which may carry a DSN) is not repeated.
+    """
+
+    class FakeResponse(io.BytesIO):
+        status = 200
+
+    def fake_open(self, request, data=None, timeout=None):
+        return FakeResponse(raw)
+
+    monkeypatch.setattr(urllib.request.OpenerDirector, 'open', fake_open)
+    with pytest.raises(RuntimeError) as excinfo:
+        AccountBase._call_db_broker('https://broker.example/provision', TEST_TOKEN, {'tenant_id': 't'})
+    assert str(excinfo.value) == 'DB broker answered with a response that is not JSON'
+    assert 'postgresql://' not in str(excinfo.value)
+
+
 def test_unreachable_broker_raises(monkeypatch):
     monkeypatch.setenv('ROCKETRIDE_DB_BROKER_URL', 'http://127.0.0.1:9/provision')
     monkeypatch.setenv('ROCKETRIDE_DB_BROKER_TOKEN', TEST_TOKEN)

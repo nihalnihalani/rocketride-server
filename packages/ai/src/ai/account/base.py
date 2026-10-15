@@ -625,7 +625,7 @@ class AccountBase(ABC):
         request = urllib.request.Request(url, data=json.dumps(body).encode('utf-8'), headers=headers, method='POST')
         try:
             with AccountBase._broker_opener().open(request, timeout=_BROKER_TIMEOUT_S) as response:
-                answer = json.loads(response.read().decode('utf-8'))
+                raw = response.read()
         except urllib.error.HTTPError as e:
             # 4xx = unknown/invalid tenant per the broker contract; 5xx = broker fault.
             code, reason = e.code, e.reason
@@ -644,6 +644,13 @@ class AccountBase(ABC):
             cause = e.reason if isinstance(e, urllib.error.URLError) and isinstance(e.reason, BaseException) else e
             _server_log(f'DB broker call failed: {type(cause).__name__}: {str(cause).replace(token, "***")}')
             raise RuntimeError(f'DB broker unreachable ({type(cause).__name__})') from None
+
+        # The broker was reached and answered: a body that is not JSON is a bad
+        # answer, not a transport fault. The body is not repeated (it may hold a DSN).
+        try:
+            answer = json.loads(raw.decode('utf-8'))
+        except (UnicodeDecodeError, ValueError):
+            raise RuntimeError('DB broker answered with a response that is not JSON') from None
 
         dsn = answer.get('dsn') if isinstance(answer, dict) else None
         if not dsn or not isinstance(dsn, str):
