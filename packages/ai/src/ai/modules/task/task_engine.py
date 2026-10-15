@@ -56,7 +56,7 @@ from ai.constants import (
 )
 from ai import CONST_AI_NODE_SCRIPT
 from ai.common.dap import DAPBase, DAPClient, TransportWebSocket
-from ai.common.rocketride_db import db_target, dsn_key, exposes_public_endpoint, is_db_provider
+from ai.common.rocketride_db import db_target, dsn_key, exposes_public_endpoint, is_db_provider, scrub_db_env
 from ai.modules.task.pipeflow import apply_pipeflow_event
 from ai.modules.task.run_log import RunLogWriter
 from rocketride import (
@@ -873,11 +873,10 @@ class Task(DAPBase):
         """
         subprocess_env = filter_subprocess_env(os.environ)
 
-        subprocess_env.pop('ROCKETRIDE_DB_BROKER_URL', None)
-        subprocess_env.pop('ROCKETRIDE_DB_BROKER_TOKEN', None)
-        subprocess_env.pop('ROCKETRIDE_DB_DSNS', None)
-        subprocess_env.pop('ROCKETRIDE_DB_DSN', None)
-        subprocess_env.pop('ROCKETRIDE_DB_RESOLVE_ERROR', None)
+        # Both broker tiers (RR_DB_BROKER_*, the legacy ROCKETRIDE_DB_BROKER_*),
+        # the DSN delivery names and the database TLS settings, in any case:
+        # RR_SUBPROCESS_ENV='*' or 'RR_*' would otherwise hand them over.
+        scrub_db_env(subprocess_env)
 
         # Authorize and resolve every database the DB nodes use, server-side
         # (the SaaS account context exists only in this process), and hand

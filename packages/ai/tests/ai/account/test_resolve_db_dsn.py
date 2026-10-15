@@ -99,6 +99,21 @@ class _FakeBroker(BaseHTTPRequestHandler):
         pass
 
 
+@pytest.fixture(autouse=True)
+def _clean_broker_env(monkeypatch):
+    for name in (
+        'RR_DB_BROKER_URL',
+        'RR_DB_BROKER_TOKEN',
+        'ROCKETRIDE_DB_BROKER_URL',
+        'ROCKETRIDE_DB_BROKER_TOKEN',
+        'RR_DB_TLS_ROOT_CERT',
+        'RR_DB_ALLOW_INSECURE_DSN',
+    ):
+        monkeypatch.delenv(name, raising=False)
+    # The legacy-name warning fires once per process; each test starts afresh.
+    monkeypatch.setattr(base_module, '_LEGACY_BROKER_WARNED', False, raising=False)
+
+
 @pytest.fixture()
 def broker(monkeypatch):
     _FakeBroker.requests = []
@@ -129,7 +144,7 @@ def test_unconfigured_env_raises_no_cloud_db_error(monkeypatch):
     [
         ('', TEST_TOKEN, 'ROCKETRIDE_DB_BROKER_URL'),
         ('https://broker.example/provision', '   ', 'ROCKETRIDE_DB_BROKER_TOKEN'),
-        (' ', '', 'ROCKETRIDE_DB_BROKER_URL, ROCKETRIDE_DB_BROKER_TOKEN'),
+        (' ', '', 'RR_DB_BROKER_URL, RR_DB_BROKER_TOKEN'),
     ],
 )
 def test_missing_broker_variables_named_without_values(monkeypatch, url, token, missing):
@@ -463,3 +478,83 @@ def test_a_credential_bearing_url_never_reaches_the_network(monkeypatch):
     with pytest.raises(RuntimeError) as excinfo:
         _resolve('tenant-1')
     assert 'HUNTER2' not in str(excinfo.value)
+
+
+# ---------------------------------------------------------------------------
+# Broker configuration tiers: operator-only RR_DB_BROKER_*, legacy fallback
+# ---------------------------------------------------------------------------
+
+
+def _set_broker(monkeypatch, url_name, token_name, server_port, token=TEST_TOKEN):
+    monkeypatch.setenv(url_name, f'http://127.0.0.1:{server_port}/provision')
+    monkeypatch.setenv(token_name, token)
+
+
+@pytest.fixture()
+def two_brokers():
+    """Two fake provisioners on different ports, each recording its requests."""
+
+    class _A(_FakeBroker):
+        requests: list = []
+
+    class _B(_FakeBroker):
+        requests: list = []
+
+    servers = [HTTPServer(('127.0.0.1', 0), cls) for cls in (_A, _B)]
+    for server in servers:
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+    yield (_A, servers[0].server_port), (_B, servers[1].server_port)
+    for server in servers:
+        server.shutdown()
+        server.server_close()
+
+
+def test_the_operator_tier_resolves_without_a_deprecation_warning(two_brokers, monkeypatch):
+    (operator, port), _ = two_brokers
+    logged = []
+    monkeypatch.setattr(base_module, '_server_log', logged.append)
+    _set_broker(monkeypatch, 'RR_DB_BROKER_URL', 'RR_DB_BROKER_TOKEN', port)
+    assert _resolve('tenant-1') == TEST_DSN
+    assert len(operator.requests) == 1
+    assert logged == []
+
+
+def test_the_operator_tier_wins_over_the_legacy_tier(two_brokers, monkeypatch):
+    (operator, operator_port), (legacy, legacy_port) = two_brokers
+    _set_broker(monkeypatch, 'RR_DB_BROKER_URL', 'RR_DB_BROKER_TOKEN', operator_port)
+    _set_broker(monkeypatch, 'ROCKETRIDE_DB_BROKER_URL', 'ROCKETRIDE_DB_BROKER_TOKEN', legacy_port)
+    _resolve('tenant-1')
+    assert (len(operator.requests), len(legacy.requests)) == (1, 0)
+
+
+def test_the_legacy_tier_still_works_and_warns_once(two_brokers, monkeypatch):
+    (legacy, port), _ = two_brokers
+    logged = []
+    monkeypatch.setattr(base_module, '_server_log', logged.append)
+    _set_broker(monkeypatch, 'ROCKETRIDE_DB_BROKER_URL', 'ROCKETRIDE_DB_BROKER_TOKEN', port)
+    assert _resolve('tenant-1') == _resolve('tenant-1') == TEST_DSN
+    assert len(legacy.requests) == 2
+    assert len(logged) == 1
+    assert 'deprecated' in logged[0] and 'RR_DB_BROKER_URL' in logged[0]
+    assert TEST_TOKEN not in logged[0]
+
+
+@pytest.mark.parametrize(
+    ('url_var', 'token_var', 'missing'),
+    [
+        ('RR_DB_BROKER_URL', 'ROCKETRIDE_DB_BROKER_TOKEN', 'RR_DB_BROKER_TOKEN'),
+        ('ROCKETRIDE_DB_BROKER_URL', 'RR_DB_BROKER_TOKEN', 'ROCKETRIDE_DB_BROKER_TOKEN'),
+    ],
+)
+def test_the_two_tiers_are_never_mixed(two_brokers, monkeypatch, url_var, token_var, missing):
+    """The URL picks the tier and the token must come from that tier: a token
+    from the other tier (which a client may have been able to write) is never
+    sent to this tier's URL.
+    """
+    (broker_a, port), _ = two_brokers
+    monkeypatch.setenv(url_var, f'http://127.0.0.1:{port}/provision')
+    monkeypatch.setenv(token_var, TEST_TOKEN)
+    with pytest.raises(NotImplementedError) as excinfo:
+        _resolve('tenant-1')
+    assert str(excinfo.value).endswith(f'(missing: {missing})')
+    assert broker_a.requests == []

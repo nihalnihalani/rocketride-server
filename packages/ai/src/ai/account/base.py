@@ -39,6 +39,9 @@ from typing import NamedTuple
 # of the same broker allows the same minute.
 _BROKER_TIMEOUT_S = 60
 
+# Set once the deprecation warning for the legacy ROCKETRIDE_DB_BROKER_* names was logged.
+_LEGACY_BROKER_WARNED = False
+
 # The only hosts for which a non-hosted engine accepts a plain-http broker URL.
 _LOOPBACK_HOSTS = ('localhost', '127.0.0.1', '::1')
 
@@ -176,8 +179,11 @@ class AccountBase(ABC):
         Merge order: os.environ → org → team → user.  Each layer overrides
         the previous.
 
-        OSS default: returns ROCKETRIDE_* entries from os.environ only.
-        SaaS override: also decrypts org/team/user secrets from the database.
+        OSS default: returns ROCKETRIDE_* entries from os.environ only, minus
+        the engine-owned database names (the broker credential and the DSN
+        delivery variables), so ``${ROCKETRIDE_DB_BROKER_TOKEN}`` in a node
+        config stays a literal. SaaS override: also decrypts org/team/user
+        secrets from the database.
 
         Args:
             user_id: The user's internal ID.
@@ -187,7 +193,9 @@ class AccountBase(ABC):
         Returns:
             Merged key-value dict ready for pipeline variable resolution.
         """
-        return {k: v for k, v in os.environ.items() if k.startswith('ROCKETRIDE_')}
+        from ai.common.rocketride_db import is_engine_db_env
+
+        return {k: v for k, v in os.environ.items() if k.startswith('ROCKETRIDE_') and not is_engine_db_env(k)}
 
     async def init_account(self, server) -> None:
         """
@@ -419,9 +427,15 @@ class AccountBase(ABC):
         Default implementation (both editions): call the data-core provisioner
         configured via server-side environment —
 
-            ROCKETRIDE_DB_BROKER_URL    the /provision endpoint URL
-            ROCKETRIDE_DB_BROKER_TOKEN  its Bearer token (from ASM/k8s; never
-                                        hardcoded)
+            RR_DB_BROKER_URL    the /provision endpoint URL
+            RR_DB_BROKER_TOKEN  its Bearer token (from ASM/k8s; never
+                                hardcoded)
+
+        These are operator-only: unlike ROCKETRIDE_*, no client can list,
+        read, rewrite or ``${...}``-expand them. The legacy
+        ROCKETRIDE_DB_BROKER_URL / ROCKETRIDE_DB_BROKER_TOKEN still work as a
+        deprecated fallback (logged once). The URL picks the tier and the
+        token must come from the same tier; the tiers are never mixed.
 
         Org scope sends ``{"tenant_id": client_id}`` (unchanged, so existing
         org databases keep their name and password). Team and user scope send
@@ -451,20 +465,16 @@ class AccountBase(ABC):
             RuntimeError: the broker rejected the request (HTTP 409: the
                 database is retired or being deleted) or returned no DSN.
         """
-        broker_url = os.environ.get('ROCKETRIDE_DB_BROKER_URL', '').strip()
-        broker_token = os.environ.get('ROCKETRIDE_DB_BROKER_TOKEN', '').strip()
-        if not broker_url or not broker_token:
-            missing = [
-                name
-                for name, value in (
-                    ('ROCKETRIDE_DB_BROKER_URL', broker_url),
-                    ('ROCKETRIDE_DB_BROKER_TOKEN', broker_token),
-                )
-                if not value
-            ]
+        from ai.common.rocketride_db import broker_config
+
+        config = broker_config(os.environ)
+        broker_url, broker_token = config.url, config.token
+        if config.missing:
             raise NotImplementedError(
-                f'no RocketRide cloud database is configured on this server (missing: {", ".join(missing)})'
+                f'no RocketRide cloud database is configured on this server (missing: {", ".join(config.missing)})'
             )
+        if config.tier == 'legacy':
+            self._warn_legacy_broker_names()
         if not client_id or not client_id.strip():
             raise ValueError('resolve_db_dsn requires a non-empty client_id')
         owner_id = (owner_id or '').strip()
@@ -485,6 +495,19 @@ class AccountBase(ABC):
         import asyncio
 
         return await asyncio.to_thread(self._call_db_broker, broker_url, broker_token, body)
+
+    @staticmethod
+    def _warn_legacy_broker_names() -> None:
+        """Log, once per process, that ROCKETRIDE_DB_BROKER_* is deprecated."""
+        global _LEGACY_BROKER_WARNED
+        if _LEGACY_BROKER_WARNED:
+            return
+        _LEGACY_BROKER_WARNED = True
+        _server_log(
+            'ROCKETRIDE_DB_BROKER_URL / ROCKETRIDE_DB_BROKER_TOKEN are deprecated: set the operator-only '
+            'RR_DB_BROKER_URL / RR_DB_BROKER_TOKEN instead (the ROCKETRIDE_* namespace is readable and '
+            'writable by clients on a self-hosted engine)'
+        )
 
     def _is_hosted(self) -> bool:
         """True on the hosted (SaaS) engine.

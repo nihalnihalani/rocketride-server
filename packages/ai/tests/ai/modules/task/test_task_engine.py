@@ -849,6 +849,36 @@ async def test_subprocess_env_scrubs_broker_credentials(monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('opt_in', ['', '*', 'RR_*', 'RR_DB_BROKER_URL,RR_DB_BROKER_TOKEN'])
+async def test_subprocess_env_scrubs_both_broker_tiers_in_any_case(monkeypatch, opt_in):
+    """The operator tier (RR_DB_BROKER_*) and the legacy one, spelled in any
+    case, never reach a task, whatever the operator opted in to pass.
+    """
+    names = [
+        'RR_DB_BROKER_URL',
+        'RR_DB_BROKER_TOKEN',
+        'RR_DB_TLS_ROOT_CERT',
+        'RR_DB_ALLOW_INSECURE_DSN',
+        'ROCKETRIDE_DB_BROKER_URL',
+        'ROCKETRIDE_DB_BROKER_TOKEN',
+        'rocketride_db_broker_token',
+        'Rr_Db_Broker_Token',
+        'rocketride_db_dsns',
+        'ROCKETRIDE_DB_DSN',
+        'ROCKETRIDE_DB_RESOLVE_ERROR',
+    ]
+    for name in names:
+        monkeypatch.setenv(name, 'secret-value')
+    monkeypatch.setenv('RR_SUBPROCESS_ENV', opt_in)
+    monkeypatch.setenv('ROCKETRIDE_OPENAI_KEY', 'kept')
+
+    env = await _build_env(_env_task())
+
+    assert not [k for k in env if k.upper() in {n.upper() for n in names}]
+    assert env['ROCKETRIDE_OPENAI_KEY'] == 'kept'
+
+
+@pytest.mark.asyncio
 async def test_subprocess_env_injects_resolved_dsn(monkeypatch):
     # Capture the tenant OUTSIDE the stub and assert after: _build_subprocess_env
     # converts resolver exceptions into ROCKETRIDE_DB_RESOLVE_ERROR, so an

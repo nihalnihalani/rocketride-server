@@ -178,6 +178,65 @@ class TestDbTarget:
         assert not rrdb.exposes_public_endpoint([{'provider': 'chat '}, {'provider': None}, {}])
 
 
+class TestEngineOwnedEnv:
+    """The broker credential and the DSN delivery names are the engine's."""
+
+    def test_names_match_in_any_case(self):
+        for name in (
+            'RR_DB_BROKER_URL',
+            'rr_db_broker_token',
+            'ROCKETRIDE_DB_BROKER_URL',
+            'Rocketride_Db_Broker_Token',
+            'ROCKETRIDE_DB_DSNS',
+            'rocketride_db_dsn',
+            'ROCKETRIDE_DB_RESOLVE_ERROR',
+            'RR_DB_TLS_ROOT_CERT',
+            'RR_DB_ALLOW_INSECURE_DSN',
+        ):
+            assert rrdb.is_engine_db_env(name), name
+
+    def test_other_names_are_left_alone(self):
+        for name in ('ROCKETRIDE_DB_HOTDATA_KEY', 'ROCKETRIDE_OPENAI_KEY', 'RR_STORE_URL', 'ROCKETRIDE_DB_DSNS_X', ''):
+            assert not rrdb.is_engine_db_env(name), name
+        assert not rrdb.is_engine_db_env(None)
+
+    def test_scrub_removes_only_engine_owned_names(self):
+        env = {'RR_DB_BROKER_TOKEN': 'a', 'rocketride_db_broker_url': 'b', 'ROCKETRIDE_OPENAI_KEY': 'c', 'PATH': 'd'}
+        rrdb.scrub_db_env(env)
+        assert env == {'ROCKETRIDE_OPENAI_KEY': 'c', 'PATH': 'd'}
+
+
+class TestBrokerConfig:
+    """The URL picks the tier; the token comes from the same tier."""
+
+    def test_operator_tier_wins(self):
+        env = {
+            'RR_DB_BROKER_URL': ' https://op ',
+            'RR_DB_BROKER_TOKEN': 't1',
+            'ROCKETRIDE_DB_BROKER_URL': 'https://legacy',
+            'ROCKETRIDE_DB_BROKER_TOKEN': 't2',
+        }
+        assert rrdb.broker_config(env) == ('https://op', 't1', 'operator', ())
+
+    def test_legacy_tier_is_the_fallback(self):
+        env = {'ROCKETRIDE_DB_BROKER_URL': 'https://legacy', 'ROCKETRIDE_DB_BROKER_TOKEN': 't2'}
+        assert rrdb.broker_config(env) == ('https://legacy', 't2', 'legacy', ())
+
+    def test_tiers_are_never_mixed(self):
+        config = rrdb.broker_config({'RR_DB_BROKER_URL': 'https://op', 'ROCKETRIDE_DB_BROKER_TOKEN': 't2'})
+        assert (config.tier, config.missing) == ('operator', ('RR_DB_BROKER_TOKEN',))
+        config = rrdb.broker_config({'ROCKETRIDE_DB_BROKER_URL': 'https://l', 'RR_DB_BROKER_TOKEN': 't1'})
+        assert (config.tier, config.missing) == ('legacy', ('ROCKETRIDE_DB_BROKER_TOKEN',))
+
+    def test_nothing_configured_names_the_operator_tier(self):
+        config = rrdb.broker_config({'RR_DB_BROKER_URL': '  ', 'ROCKETRIDE_DB_BROKER_TOKEN': ''})
+        assert (config.tier, config.missing) == ('', ('RR_DB_BROKER_URL', 'RR_DB_BROKER_TOKEN'))
+
+    def test_a_lone_legacy_token_reports_the_legacy_url_missing(self):
+        config = rrdb.broker_config({'ROCKETRIDE_DB_BROKER_TOKEN': 't2'})
+        assert (config.tier, config.missing) == ('legacy', ('ROCKETRIDE_DB_BROKER_URL',))
+
+
 class TestResolveRocketrideDsn:
     """Nodes only read what the task engine delivered; they never resolve."""
 

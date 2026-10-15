@@ -41,7 +41,8 @@ import json
 import os
 import re
 import urllib.parse
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, MutableMapping
+from typing import NamedTuple
 
 # The task engine resolves every DSN server-side at task start (only the
 # server process has SaaS account context) and delivers them here as a JSON
@@ -54,6 +55,93 @@ DB_DSNS_ENV = 'ROCKETRIDE_DB_DSNS'
 # instead of a DSN, so the node can report the real cause rather than a
 # missing-identity error that nothing the user does can fix.
 DB_RESOLVE_ERROR_ENV = 'ROCKETRIDE_DB_RESOLVE_ERROR'
+
+
+# The database broker (the data-core provisioner) is configured by the
+# operator in the engine's own environment. The operator-only RR_ tier is the
+# home of that credential: unlike ROCKETRIDE_*, no client can list, read,
+# rewrite or expand it. The legacy ROCKETRIDE_DB_BROKER_* names still work as
+# a deprecated fallback, but only as a pair from the same tier (see
+# ``broker_config``), and they are hidden from the client-facing paths too.
+DB_BROKER_URL_ENV = 'RR_DB_BROKER_URL'
+DB_BROKER_TOKEN_ENV = 'RR_DB_BROKER_TOKEN'
+LEGACY_DB_BROKER_URL_ENV = 'ROCKETRIDE_DB_BROKER_URL'
+LEGACY_DB_BROKER_TOKEN_ENV = 'ROCKETRIDE_DB_BROKER_TOKEN'
+
+# Operator-only settings for the tenant database connection itself (see
+# ``enforce_dsn_tls``).
+DB_TLS_ROOT_CERT_ENV = 'RR_DB_TLS_ROOT_CERT'
+DB_ALLOW_INSECURE_DSN_ENV = 'RR_DB_ALLOW_INSECURE_DSN'
+
+# Names that belong to the engine, not to a client or a pipeline. They are
+# hidden from ``get_env``/``env_keys`` and from the ${...} expansion source,
+# immune to ``set_env`` (it can neither create, change nor delete them), and
+# scrubbed from every task's environment. Compared case-insensitively, like
+# the task environment allowlist.
+ENGINE_DB_ENV = frozenset(
+    {
+        DB_BROKER_URL_ENV,
+        DB_BROKER_TOKEN_ENV,
+        LEGACY_DB_BROKER_URL_ENV,
+        LEGACY_DB_BROKER_TOKEN_ENV,
+        DB_TLS_ROOT_CERT_ENV,
+        DB_ALLOW_INSECURE_DSN_ENV,
+        DB_DSNS_ENV,
+        'ROCKETRIDE_DB_DSN',
+        DB_RESOLVE_ERROR_ENV,
+    }
+)
+
+
+def is_engine_db_env(name: str) -> bool:
+    """True for a name in ``ENGINE_DB_ENV``, in any case."""
+    return isinstance(name, str) and name.upper() in ENGINE_DB_ENV
+
+
+def scrub_db_env(env: MutableMapping) -> None:
+    """Remove every ``ENGINE_DB_ENV`` name, in any case, from ``env`` in place."""
+    for name in [name for name in env if is_engine_db_env(name)]:
+        del env[name]
+
+
+class BrokerConfig(NamedTuple):
+    """The database broker settings found in an environment.
+
+    ``tier`` is 'operator' (RR_DB_BROKER_*), 'legacy' (ROCKETRIDE_DB_BROKER_*)
+    or '' when nothing is set. ``missing`` names the variables of that tier
+    that are unset or blank; the broker is configured when it is empty.
+    """
+
+    url: str
+    token: str
+    tier: str
+    missing: tuple
+
+
+def broker_config(environ: Mapping[str, str]) -> BrokerConfig:
+    """Read the broker URL and token from ONE tier of ``environ``.
+
+    The URL picks the tier (the operator tier first), and the token must come
+    from the same tier: a token from the other tier is never paired with this
+    tier's URL, because the legacy names live in the namespace a client may
+    have been able to write. With no URL in either tier, the first tier with
+    any value is reported, else the operator tier.
+    """
+    tiers = (
+        ('operator', DB_BROKER_URL_ENV, DB_BROKER_TOKEN_ENV),
+        ('legacy', LEGACY_DB_BROKER_URL_ENV, LEGACY_DB_BROKER_TOKEN_ENV),
+    )
+    values = {
+        tier: ((environ.get(url_var) or '').strip(), (environ.get(token_var) or '').strip())
+        for tier, url_var, token_var in tiers
+    }
+    chosen = next((t for t in tiers if values[t[0]][0]), None) or next(
+        (t for t in tiers if any(values[t[0]])), tiers[0]
+    )
+    tier, url_var, token_var = chosen
+    url, token = values[tier]
+    missing = tuple(name for name, value in ((url_var, url), (token_var, token)) if not value)
+    return BrokerConfig(url, token, tier if (url or token) else '', missing)
 
 
 # The node providers that use a RocketRide cloud database.
