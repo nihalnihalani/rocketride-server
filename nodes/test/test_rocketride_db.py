@@ -494,6 +494,23 @@ class TestRocketrideVectorStore:
         assert 'm = 16' in index_sql[0]
         assert 'ef_construction = 64' in index_sql[0]
 
+    @pytest.mark.parametrize(
+        ('similarity', 'metric'),
+        [('cosine', 'cosine'), ('l2', 'l2'), ('inner_product', 'ip')],
+    )
+    def test_the_explorer_tools_read_the_table_metric(self, mock_rv, similarity, metric):
+        """stats, sample, project and neighbors compute with the table's metric, not the SQL operator."""
+        from ai.common.store import VectorStoreToolMixin
+        from ai.common.store.vx_math import normalize_metric
+
+        store = _make_store(mock_rv, {'collection': 'rr_vec', 'similarity': similarity})
+        store.addChunks([_doc('doc', 0, [1, 0, 0, 0, 0])])
+        assert normalize_metric(store.similarity) == metric
+        assert store.describe().metric == metric
+        node = VectorStoreToolMixin()
+        node.IGlobal = types.SimpleNamespace(store=store)
+        assert node.stats({'mode': 'full'})['metric'] == metric
+
     def test_hnsw_params_overridable(self, mock_rv):
         store = _make_store(
             mock_rv,

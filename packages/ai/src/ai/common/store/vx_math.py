@@ -58,13 +58,17 @@ _METRIC_ALIASES = {
     'dot_product': 'ip',
     'inner_product': 'ip',
     'innerproduct': 'ip',
+    # pgvector's distance operators, which the pgvector driver keeps as its ``similarity``.
+    '<=>': 'cosine',
+    '<->': 'l2',
+    '<#>': 'ip',
 }
 
 Key = Tuple[str, int]
 
 
 def normalize_metric(name: Optional[str]) -> Optional[str]:
-    """Map a backend's similarity name (``'COSINE'``, ``'euclidean'``, ``'dotproduct'``...) to a metric.
+    """Map a backend's similarity name (``'COSINE'``, ``'euclidean'``, ``'dotproduct'``, pgvector's ``'<=>'``...) to a metric.
 
     Returns None for a name the helpers do not understand (for example ``'manhattan'``).
     """
