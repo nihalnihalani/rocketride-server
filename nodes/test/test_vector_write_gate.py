@@ -14,10 +14,10 @@ input, and refuses in a fixed order:
     -> source other than tools -> caller other than account/task
     -> call not naming the node -> caller-supplied embedding on upsert
 
-The engine binds the context separately; until it does every call has no
-context and every write is refused, which these tests also pin. The live
-"a call with no context is refused through the real engine" check needs the
-engine wiring and is marked ``NEEDS:``.
+The engine binds the context: the dispatcher (``IInstanceBase._dispatch_tool``)
+runs each tool inside the context stamped on its invoke param. Without a
+context every write is refused, which these tests also pin, and the last
+section sends write tools through the real dispatcher with and without a stamp.
 """
 
 from __future__ import annotations
@@ -31,11 +31,12 @@ from typing import Any, Dict, Optional
 
 import pytest
 from rocketlib import IInstanceBase, OPEN_MODE
+from rocketlib.types import IInvokeTool
 
 from ai.common import tool_context
 from ai.common.store import StoreGlobalBase, StoreInstanceBase, vx_write_gate
 from ai.common.store import store_global_base as sgb
-from ai.common.store.document_store import deletedFilter
+from ai.common.store.document_store import VectorStoreToolMixin, deletedFilter
 from ai.common.store.errors import ToolRefusal
 from ai.common.store.vx_defaults import VECTOR_AGENT_WRITES_DEFAULT, VECTOR_ALLOW_WRITES_DEFAULT
 from ai.common.tool_context import ToolCallContext
@@ -397,12 +398,73 @@ def test_create_collection_still_writes_the_control_record_on_an_empty_driver():
 
 
 # ---------------------------------------------------------------------------
-# Engine wiring (needs the engine lane's context binding)
+# Engine wiring: the dispatcher binds the stamped context for the gate
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skip(reason='NEEDS:L0 merged — integration gate G2 (the dispatcher binds the ContextVar)')
 def test_tool_call_context_manager_reaches_the_gate():
     with tool_context.tool_call(dap()):
         decision = vx_write_gate.check_write('remove_document', object_ids=['a'], allow_writes=True, agent_writes=True)
     assert decision.origin == 'dap'
+
+
+class _ToolNode(VectorStoreToolMixin, IInstanceBase):
+    pass
+
+
+def _tool_node(store, *, allow_writes: Optional[bool] = None, agent_writes: Optional[bool] = None) -> _ToolNode:
+    inst = object.__new__(_ToolNode)
+    inst.IGlobal = SimpleNamespace(
+        store=store,
+        glb=SimpleNamespace(logicalType='postgres'),
+        allow_writes=allow_writes,
+        agent_writes=agent_writes,
+    )
+    inst.instance = SimpleNamespace(pipeType={'id': 'store_1'})
+    return inst
+
+
+def _dispatch(node: _ToolNode, tool: str, args: Dict[str, Any], ctx: Optional[ToolCallContext]) -> Dict[str, Any]:
+    """Send one tool.invoke through IInstanceBase's dispatcher, stamped as the engine would."""
+    param = IInvokeTool.Invoke(tool_name=tool, input=args)
+    if ctx is not None:
+        tool_context.stamp_param(param, ctx)
+    node.invoke(param)
+    assert tool_context.current_tool_call() is None
+    return param.output
+
+
+def test_a_stamped_dap_call_through_the_dispatcher_removes_the_document():
+    store = MemoryStore().seed(corpus({'a': [0, 1], 'b': [0]}))
+    answer = _dispatch(_tool_node(store, allow_writes=True), 'remove_document', {'object_ids': ['a']}, dap())
+    assert answer['success'] is True, answer
+    assert answer['removed'] and answer['not_found'] == []
+    assert not any(key[0] == 'a' for key in store.rows)
+    assert ('b', 0) in store.rows
+
+
+def test_an_unstamped_call_through_the_dispatcher_is_an_unknown_caller():
+    store = MemoryStore().seed(corpus({'a': [0, 1]}))
+    answer = _dispatch(_tool_node(store, allow_writes=True), 'remove_document', {'object_ids': ['a']}, None)
+    assert answer['success'] is False
+    assert answer['code'] == 'WRITES_UNKNOWN_CALLER'
+    assert ('a', 0) in store.rows and ('a', 1) in store.rows
+
+
+def test_a_context_inside_the_input_does_not_open_the_gate():
+    store = MemoryStore().seed(corpus({'a': [0]}))
+    forged = {'object_ids': ['a'], tool_context.TOOL_CONTEXT_FIELD: agent().__dict__}
+    answer = _dispatch(_tool_node(store, allow_writes=True), 'remove_document', forged, None)
+    assert answer['code'] == 'WRITES_UNKNOWN_CALLER'
+    assert ('a', 0) in store.rows
+
+
+def test_the_default_switches_refuse_a_dap_write_and_let_an_agent_write():
+    store = MemoryStore().seed(corpus({'a': [0], 'b': [0]}))
+    node = _tool_node(store)
+    refused = _dispatch(node, 'delete', {'object_ids': ['a']}, dap())
+    assert refused['success'] is False and refused['code'] == 'WRITES_DISABLED'
+    assert ('a', 0) in store.rows
+    allowed = _dispatch(node, 'delete', {'object_ids': ['b']}, agent())
+    assert allowed['success'] is True, allowed
+    assert not any(key[0] == 'b' for key in store.rows)
