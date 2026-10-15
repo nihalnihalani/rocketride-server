@@ -30,6 +30,11 @@
 // source (parse → chunk → embed → store); when that source also feeds other
 // store nodes, the panel says so. Without a running Ingest source, or on a
 // read-only connection, it says why nothing can be added.
+//
+// Above the upload rows, each drop's summary; a finished drop offers "Show
+// new chunks on the map" (the console's showOnMap, cut at the connection's
+// pin limit), disabled with the reason on a store whose map cannot place
+// them.
 // =============================================================================
 
 import React, { useState } from 'react';
@@ -38,7 +43,7 @@ import { EmptyState } from 'shell';
 import type { IngestPanelProps } from '../contract/types';
 import { useIngest } from '../ingest/useIngest';
 import { ReplaceConfirmDialog } from '../ingest/ReplaceConfirmDialog';
-import { normaliseFolderPrefix } from '../vector/uploads';
+import { normaliseFolderPrefix, showNewChunksReason } from '../vector/uploads';
 import { IngestDropZone } from './IngestDropZone';
 import { UploadList } from './UploadList';
 
@@ -87,7 +92,7 @@ export function IngestPanel(props: IngestPanelProps): React.ReactElement {
 					{alsoReaches.length > 0 && <p style={S.note}>{`This pipeline's ingest also reaches: ${alsoReaches.join(', ')}`}</p>}
 				</>
 			)}
-			<UploadList rows={ingest.state.rows} notes={ingest.state.notes} onClearFinished={ingest.clearFinished} />
+			<UploadList rows={ingest.state.rows} notes={ingest.state.notes} onClearFinished={ingest.clearFinished} drops={ingest.state.drops} onShowNew={ingest.showNewChunks} showNewReason={showNewChunksReason(model.capabilities)} pinLimit={model.limits.project_keys_max} />
 			{ingest.state.confirm !== null && <ReplaceConfirmDialog key={ingest.state.confirm.id} question={ingest.state.confirm} onReplace={() => ingest.answerConfirm(true)} onCancel={() => ingest.answerConfirm(false)} />}
 		</section>
 	);

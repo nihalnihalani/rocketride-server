@@ -428,9 +428,85 @@ test('queue: clearFinished keeps only rows still in progress', async () => {
 	const queue = createIngestQueue(fake.deps);
 	await queue.addDrop([candidate('a.md'), candidate('b.exe')]);
 	await queue.idle();
+	assert.equal(queue.getState().drops.length, 1);
 	queue.clearFinished();
 	assert.deepEqual(queue.getState().rows, []);
 	assert.deepEqual(queue.getState().notes, []);
+	assert.deepEqual(queue.getState().drops, []);
+});
+
+test('queue: a replacing file whose chunk count cannot be read says it replaced, not added', async () => {
+	const stored = objectIdForPath('report.pdf');
+	const fake = fakeDeps({
+		async callTool(tool, input): Promise<CallOutcome> {
+			if (tool === 'chunks') return input.object_id === stored ? { ok: true, value: { success: true, items: [{ chunkId: 0 }], total: 9 } } : { ok: false, code: 'NOT_FOUND', message: 'not stored', kind: null, error: null };
+			const id = (input.object_ids as string[])[0];
+			if (id === stored) return { ok: false, code: 'STORE_ERROR', message: 'the store did not answer', kind: null, error: null };
+			return { ok: true, value: { success: true, items: [{ objectId: id, chunks: null }] } };
+		},
+	});
+	const queue = createIngestQueue(fake.deps);
+	const drop = queue.addDrop([candidate('report.pdf'), candidate('fresh.md')]);
+	await queue.waitFor((state) => state.confirm !== null);
+	queue.answerConfirm(true);
+	await drop;
+	await queue.idle();
+	assert.deepEqual(
+		queue.getState().rows.map((row) => [row.path, row.replaces === true, uploadLabel(row)]),
+		[
+			['report.pdf', true, 'Replaced. The chunk count could not be read: the store did not answer'],
+			['fresh.md', false, 'Added. This store does not report chunk counts.'],
+		]
+	);
+});
+
+test('queue: the drop of a store that answers late starts at the drop and ends with its last count', async () => {
+	let clock = 50_000;
+	const fake = fakeDeps({
+		now: () => clock,
+		async sleep(ms) {
+			clock += ms;
+		},
+		async callTool(tool, input): Promise<CallOutcome> {
+			if (tool === 'chunks') return { ok: false, code: 'NOT_FOUND', message: 'not stored', kind: null, error: null };
+			const id = (input.object_ids as string[])[0];
+			// Listed only at the second recount.
+			return { ok: true, value: { success: true, items: clock >= 50_000 + RECOUNT_DELAYS_MS[0] + RECOUNT_DELAYS_MS[1] ? [{ objectId: id, chunks: 2 }] : [] } };
+		},
+	});
+	const queue = createIngestQueue(fake.deps);
+	await queue.addDrop([candidate('late.md')]);
+	await queue.idle();
+	const drop = queue.getState().drops[0];
+	assert.equal(drop.startedAt, 50_000);
+	assert.equal(drop.finishedAt, 50_000 + RECOUNT_DELAYS_MS[0] + RECOUNT_DELAYS_MS[1]);
+	assert.deepEqual(drop.rowIds, [queue.getState().rows[0].id]);
+});
+
+test('queue: a drop that waits behind another one\'s question is timed from when it was dropped', async () => {
+	let clock = 10_000;
+	const fake = fakeDeps({ canProbe: false, now: () => clock });
+	const queue = createIngestQueue(fake.deps);
+	const first = queue.addDrop([candidate('one.md')]);
+	await queue.waitFor((state) => state.confirm !== null);
+	clock = 12_000;
+	const second = queue.addDrop([candidate('two.md')]);
+	clock = 30_000;
+	queue.answerConfirm(true);
+	await first;
+	await queue.waitFor((state) => state.rows.some((row) => row.path === 'one.md' && row.status === 'done'));
+	await queue.waitFor((state) => state.confirm !== null);
+	clock = 31_000;
+	queue.answerConfirm(true);
+	await second;
+	await queue.idle();
+	assert.deepEqual(
+		queue.getState().drops.map((drop) => [drop.startedAt, drop.finishedAt]),
+		[
+			[10_000, 30_000],
+			[12_000, 31_000],
+		]
+	);
 });
 
 test('name locks: two connections sending report.pdf take turns; different names run side by side', async () => {

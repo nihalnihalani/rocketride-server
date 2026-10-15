@@ -46,6 +46,12 @@
 //               parser can read ends this way; the engine reports no error).
 //               Then onDocumentsChanged lets the console refresh its stats
 //               and directory.
+//   6. SUMMARY  every drop with a row is kept as an IngestDrop (uploads.ts):
+//               its row ids, each row as it ended, and its start and end
+//               times, so the list can say "Drop of 12 files: 9 added (341
+//               chunks) · …" live and after Clear finished. A drop of more
+//               than one file is announced once, after its last file's own
+//               line. Clear finished forgets the drops that have finished.
 //
 // Drops are planned and asked about in order; sends run one call at a time.
 // Nothing here retries, and nothing ever sends an objectId. dispose() forgets
@@ -57,8 +63,8 @@ import type { ISendFile } from 'shared/explorer';
 import type { IUploadEvent } from '../contract/types';
 import { outcomeFromError } from '../chat/toolCalls';
 import type { CallOutcome } from '../chat/toolCalls';
-import { CANCELLED_SENTENCE, FINISHED, applyFinalResult, applyUploadEvent, batchForSend, chunkCountMessage, classifyProbe, planDrop, replaceQuestion, sendFilesPayload, uploadLabel } from '../vector/uploads';
-import type { ConfirmItem, DropCandidate, PlannedUpload, ProbeOutcome, ReplaceQuestion, SendUnit, UploadRow } from '../vector/uploads';
+import { CANCELLED_SENTENCE, FINISHED, applyFinalResult, applyUploadEvent, batchForSend, chunkCountMessage, classifyProbe, dropSummaryText, planDrop, replaceQuestion, sendFilesPayload, settleDrops, summariseDrop, uploadLabel } from '../vector/uploads';
+import type { ConfirmItem, DropCandidate, DropShown, IngestDrop, PlannedUpload, ProbeOutcome, ReplaceQuestion, SendUnit, UploadRow } from '../vector/uploads';
 import { sharedUploadLocks } from './nameLocks';
 import type { NameLocks } from './nameLocks';
 import { TRAVERSAL_SCAN_CAP } from './dropTraversal';
@@ -90,6 +96,8 @@ export interface IngestDeps {
 	announce(message: string): void;
 	/** Timer seam (tests). */
 	sleep?(ms: number): Promise<void>;
+	/** Clock seam for the drops' times (tests; default Date.now). */
+	now?(): number;
 	/** Base-name locks (default: shared by every queue of the app). */
 	locks?: NameLocks;
 }
@@ -106,6 +114,8 @@ export interface IngestState {
 	confirm: ConfirmRequest | null;
 	/** Sentences about the latest drop (skipped hidden files, unreadable files, the scan cap). */
 	notes: readonly string[];
+	/** The drops whose rows are listed (or were, until Clear finished), oldest first. */
+	drops: readonly IngestDrop[];
 	/** True while anything is being checked, sent or counted. */
 	busy: boolean;
 }
@@ -128,8 +138,10 @@ export interface IngestQueue {
 	answerConfirm(replace: boolean): void;
 	/** An `apaevt_status_upload` body from the shell's event stream. */
 	handleEvent(event: IUploadEvent): void;
-	/** Drop finished rows from the list. */
+	/** Drop finished rows, and the drops that have finished, from the list. */
 	clearFinished(): void;
+	/** Remember what "Show new chunks on the map" sent for a drop. */
+	markShown(dropId: string, shown: DropShown): void;
 	/** Resolves when nothing is being planned, sent or counted. */
 	idle(): Promise<void>;
 	/** Resolves when the state satisfies `predicate`. */
@@ -168,11 +180,13 @@ function notSentSentence(failure: Extract<CallOutcome, { ok: false }>): string {
 export function createIngestQueue(deps: IngestDeps): IngestQueue {
 	const locks = deps.locks ?? sharedUploadLocks;
 	const sleep = (ms: number): Promise<void> => (deps.sleep ? deps.sleep(ms) : new Promise((resolve) => setTimeout(resolve, ms)));
+	const now = (): number => (deps.now ? deps.now() : Date.now());
 	const listeners = new Set<() => void>();
 
-	let state: IngestState = { rows: [], confirm: null, notes: [], busy: false };
+	let state: IngestState = { rows: [], confirm: null, notes: [], drops: [], busy: false };
 	let disposed = false;
 	let rowCounter = 0;
+	let dropCounter = 0;
 	let confirmCounter = 0;
 	let dropsPending = 0;
 	let dropChain: Promise<void> = Promise.resolve();
@@ -191,9 +205,26 @@ export function createIngestQueue(deps: IngestDeps): IngestQueue {
 	const set = (patch: Partial<IngestState>): void => {
 		if (disposed) return;
 		const next = { ...state, ...patch };
+		const settled = settleDrops(next.drops, next.rows, now());
+		next.drops = settled.drops;
 		next.busy = dropsPending > 0 || runner !== null || counting.size > 0 || next.rows.some((row) => !FINISHED.has(row.status));
 		state = next;
 		for (const listener of [...listeners]) listener();
+		for (const drop of settled.finished) announceDrop(drop);
+	};
+
+	/**
+	 * Say a finished drop's summary, after the line its last file says (a
+	 * one-file drop's row already said everything).
+	 *
+	 * @param drop - The drop that just finished.
+	 */
+	const announceDrop = (drop: IngestDrop): void => {
+		if (drop.rowIds.length < 2) return;
+		const line = dropSummaryText(summariseDrop(drop, state.rows, drop.finishedAt ?? now()));
+		void Promise.resolve().then(() => {
+			if (!disposed) deps.announce(line);
+		});
 	};
 
 	/**
@@ -256,11 +287,12 @@ export function createIngestQueue(deps: IngestDeps): IngestQueue {
 						chunks = typeof item.chunks === 'number' && Number.isFinite(item.chunks) ? item.chunks : null;
 					}
 				}
-				if (failure !== null) message = `Added. The chunk count could not be read: ${failure}`;
+				const replaced = rowOf(file.id)?.replaces === true;
+				if (failure !== null) message = `${replaced ? 'Replaced' : 'Added'}. The chunk count could not be read: ${failure}`;
 				else if (!listed) {
 					stored = false;
 					message = NOT_STORED_SENTENCE;
-				} else message = chunkCountMessage(chunks);
+				} else message = chunkCountMessage(chunks, replaced);
 			}
 			updateRow(file.id, { status: stored ? 'done' : 'failed', chunks, message });
 			completed.push(objectId);
@@ -331,7 +363,7 @@ export function createIngestQueue(deps: IngestDeps): IngestQueue {
 	 * @param candidates - The dropped files.
 	 * @param options - Traversal facts and the folder prefix.
 	 */
-	const runDrop = async (candidates: readonly DropCandidate[], options: AddDropOptions): Promise<void> => {
+	const runDrop = async (candidates: readonly DropCandidate[], options: AddDropOptions, startedAt: number): Promise<void> => {
 		if (disposed) return;
 		const inFlightPaths = new Set(state.rows.filter((row) => !FINISHED.has(row.status)).map((row) => row.path));
 		const plan = planDrop(candidates, {
@@ -351,7 +383,12 @@ export function createIngestQueue(deps: IngestDeps): IngestQueue {
 
 		const fresh: Array<{ index: number; row: UploadRow }> = [...plan.accepted.map((file) => ({ index: file.index, row: { id: file.id, path: file.path, name: file.name, objectId: file.objectId, size: file.size, status: 'checking' as const, bytesSent: 0, fileSize: file.size, chunks: null, existingChunks: null, message: null, detail: null } })), ...plan.refused.map((file) => ({ index: file.index, row: { id: file.id, path: file.path, name: file.name, objectId: '', size: file.size, status: 'refused' as const, bytesSent: 0, fileSize: file.size, chunks: null, existingChunks: null, message: file.reason, detail: null } }))];
 		fresh.sort((a, b) => a.index - b.index);
-		set({ rows: [...state.rows, ...fresh.map((entry) => entry.row)], notes });
+		const drops = [...state.drops];
+		if (fresh.length > 0) {
+			dropCounter += 1;
+			drops.push({ id: `d${dropCounter}`, startedAt, finishedAt: null, rowIds: fresh.map((entry) => entry.row.id), ended: {}, shown: null });
+		}
+		set({ rows: [...state.rows, ...fresh.map((entry) => entry.row)], notes, drops });
 		if (plan.refused.length > 0) {
 			deps.announce(plan.refused.length === 1 ? '1 file was not added; the list says why.' : `${plan.refused.length} files were not added; the list says why.`);
 		} else if (plan.accepted.length === 0 && notes.length > 0) {
@@ -385,7 +422,8 @@ export function createIngestQueue(deps: IngestDeps): IngestQueue {
 			for (const item of confirmItems) {
 				if (replace) {
 					ready.add(item.rowId);
-					updateRow(item.rowId, { status: 'queued' });
+					// A path the probe found stored is replaced; one it could not check is only sent.
+					updateRow(item.rowId, item.state === 'exists' ? { status: 'queued', replaces: true } : { status: 'queued' });
 				} else {
 					updateRow(item.rowId, { status: 'cancelled', message: CANCELLED_SENTENCE });
 				}
@@ -418,7 +456,8 @@ export function createIngestQueue(deps: IngestDeps): IngestQueue {
 			if (disposed) return Promise.resolve();
 			dropsPending += 1;
 			set({});
-			const run = (): Promise<void> => runDrop(candidates, options);
+			const startedAt = now();
+			const run = (): Promise<void> => runDrop(candidates, options, startedAt);
 			const step = dropChain.then(run, run).finally(() => {
 				dropsPending -= 1;
 				set({});
@@ -439,7 +478,11 @@ export function createIngestQueue(deps: IngestDeps): IngestQueue {
 			updateRow(id, (row) => applyUploadEvent(row, event));
 		},
 		clearFinished() {
-			set({ rows: state.rows.filter((row) => !FINISHED.has(row.status)), notes: [] });
+			set({ rows: state.rows.filter((row) => !FINISHED.has(row.status)), notes: [], drops: state.drops.filter((drop) => drop.finishedAt === null) });
+		},
+		markShown(dropId, shown) {
+			if (!state.drops.some((drop) => drop.id === dropId)) return;
+			set({ drops: state.drops.map((drop) => (drop.id === dropId ? { ...drop, shown: { placed: shown.placed, total: shown.total } } : drop)) });
 		},
 		async idle() {
 			for (;;) {
@@ -465,7 +508,7 @@ export function createIngestQueue(deps: IngestDeps): IngestQueue {
 			pendingConfirm = null;
 			units.length = 0;
 			inFlight = new Map();
-			state = { rows: [], confirm: null, notes: [], busy: false };
+			state = { rows: [], confirm: null, notes: [], drops: [], busy: false };
 			for (const listener of [...listeners]) listener();
 			disposed = true;
 			resolve?.(false);

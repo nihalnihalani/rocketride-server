@@ -40,7 +40,7 @@ import { ExplorerToolError } from 'shared/explorer';
 import type { IUploadEvent } from '../src/contract/types';
 import type { ISendFile } from 'shared/explorer';
 import { objectIdForPath } from '../src/vector/objectId';
-import { ALLOWED_EXTENSIONS, CANCELLED_SENTENCE, FAILED_SENTENCE, FINISHED, UPLOAD_LIMITS, UPLOAD_ORIGIN, applyFinalResult, applyUploadEvent, batchForSend, classifyProbe, mimeTypeFor, normaliseFolderPrefix, normaliseRelPath, planDrop, replaceQuestion, sendFilesPayload, uploadLabel } from '../src/vector/uploads';
+import { ALLOWED_EXTENSIONS, CANCELLED_SENTENCE, FAILED_SENTENCE, FINISHED, UPLOAD_LIMITS, UPLOAD_ORIGIN, applyFinalResult, applyUploadEvent, batchForSend, chunkCountMessage, classifyProbe, mimeTypeFor, normaliseFolderPrefix, normaliseRelPath, planDrop, replaceQuestion, sendFilesPayload, uploadLabel } from '../src/vector/uploads';
 import type { DropCandidate, PlannedUpload, UploadRow } from '../src/vector/uploads';
 import { createIngestQueue } from '../src/ingest/ingestQueue';
 import type { IngestDeps } from '../src/ingest/ingestQueue';
@@ -328,6 +328,20 @@ test('uploadLabel: the finished states', () => {
 	assert.equal(uploadLabel({ ...base, status: 'cancelled', message: CANCELLED_SENTENCE }), 'Cancelled. Nothing was sent.');
 	assert.equal(uploadLabel({ ...base, status: 'queued' }), 'Queued');
 	assert.equal(uploadLabel({ ...base, status: 'checking' }), 'Checking…');
+});
+
+test('uploadLabel: a file that replaced a stored document says so, with the chunks stored for it', () => {
+	const base = queuedRow(planDrop([candidate('report.pdf')]).accepted[0]);
+	assert.equal(uploadLabel({ ...base, status: 'done', chunks: 7, replaces: true }), 'Replaced: 7 chunks stored');
+	assert.equal(uploadLabel({ ...base, status: 'done', chunks: 1, replaces: true }), 'Replaced: 1 chunk stored');
+	assert.equal(uploadLabel({ ...base, status: 'done', chunks: 1_250, replaces: true }), 'Replaced: 1,250 chunks stored');
+	assert.equal(uploadLabel({ ...base, status: 'done', chunks: null, replaces: true }), 'Replaced');
+	assert.equal(uploadLabel({ ...base, status: 'done', chunks: 7, replaces: false }), '7 chunks added');
+	// A row's own sentence still wins (zero chunks, an uncountable store).
+	assert.equal(uploadLabel({ ...base, status: 'done', chunks: null, replaces: true, message: chunkCountMessage(null, true) }), 'Replaced. This store does not report chunk counts.');
+	assert.equal(chunkCountMessage(null), 'Added. This store does not report chunk counts.');
+	assert.equal(chunkCountMessage(0, true), 'No chunks were stored: the file may have no text the parser can read.');
+	assert.equal(chunkCountMessage(4, true), null);
 });
 
 // -----------------------------------------------------------------------------

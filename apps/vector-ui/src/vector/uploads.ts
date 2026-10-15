@@ -47,10 +47,18 @@
 //           Events (which other apps' files of the same name can produce)
 //           only move a row through the sending states; the result sendFiles
 //           returns for the file ends it.
+//   DROPS   Each drop keeps its row ids and a copy of every row as it ended,
+//           so its summary ("Drop of 12 files: 9 added (341 chunks) ·
+//           2 replaced (19 chunks) · 1 not added · 00:48") counts exactly
+//           what the rows said, live, and still after Clear finished drops
+//           the rows. Chunk counts the store did not report are never added
+//           up as if it had. Once the drop has finished, its new documents'
+//           chunk keys go to the map, every document's first chunk before
+//           any document's second, cut at the map's pin limit.
 // =============================================================================
 
 import type { ISendFile } from 'shared/explorer';
-import type { IUploadEvent } from '../contract/types';
+import type { IUploadEvent, IVectorCapabilities, VectorKey } from '../contract/types';
 import { objectIdForPath } from './objectId';
 import { utf8Bytes } from './sha1';
 
@@ -410,6 +418,8 @@ export interface UploadRow {
 	message: string | null;
 	/** What the engine or the store said, shown on request. */
 	detail: string | null;
+	/** True when the file was sent to replace a stored document (Replace was chosen); absent or false otherwise. */
+	replaces?: boolean;
 }
 
 /** Statuses after which nothing changes a row. */
@@ -499,6 +509,16 @@ export function applyFinalResult(row: UploadRow, result: Record<string, unknown>
 }
 
 /**
+ * "1 chunk" or "N chunks" (en-US grouping).
+ *
+ * @param chunks - The count.
+ * @returns The words.
+ */
+function chunksWord(chunks: number): string {
+	return chunks === 1 ? '1 chunk' : `${chunks.toLocaleString('en-US')} chunks`;
+}
+
+/**
  * The words a row shows.
  *
  * @param row - The row.
@@ -522,8 +542,9 @@ export function uploadLabel(row: UploadRow): string {
 			return 'Counting chunks…';
 		case 'done':
 			if (row.message !== null) return row.message;
+			if (row.replaces === true) return row.chunks === null ? 'Replaced' : `Replaced: ${chunksWord(row.chunks)} stored`;
 			if (row.chunks === null) return 'Added';
-			return row.chunks === 1 ? '1 chunk added' : `${row.chunks.toLocaleString('en-US')} chunks added`;
+			return `${chunksWord(row.chunks)} added`;
 		case 'failed':
 		case 'refused':
 		case 'cancelled':
@@ -625,10 +646,309 @@ export function replaceQuestion(items: readonly ConfirmItem[]): ReplaceQuestion 
  * The sentence a finished upload shows, from the store's chunk count.
  *
  * @param chunks - Chunks stored for the document (null when the store does not count).
- * @returns A sentence, or null for the plain "N chunks added" label.
+ * @param replaced - Whether the file replaced a stored document.
+ * @returns A sentence, or null for the plain "N chunks added" (or "Replaced: N chunks stored") label.
  */
-export function chunkCountMessage(chunks: number | null): string | null {
+export function chunkCountMessage(chunks: number | null, replaced = false): string | null {
 	if (chunks === 0) return 'No chunks were stored: the file may have no text the parser can read.';
-	if (chunks === null) return 'Added. This store does not report chunk counts.';
+	if (chunks === null) return `${replaced ? 'Replaced' : 'Added'}. This store does not report chunk counts.`;
+	return null;
+}
+
+// =============================================================================
+// Drops: the summary above the rows, and where the new chunks landed
+// =============================================================================
+
+/** What "Show new chunks on the map" sent for a drop. */
+export interface DropShown {
+	/** Keys handed to the map (at most its pin limit). */
+	placed: number;
+	/** New chunks the drop stored (counted ones). */
+	total: number;
+}
+
+/** One drop, as the queue keeps it for its summary. */
+export interface IngestDrop {
+	/** 'd<n>', unique within the connection's queue. */
+	id: string;
+	/** When the drop was handed to the queue (ms since the epoch). */
+	startedAt: number;
+	/** When its last file finished; null while any is in progress. */
+	finishedAt: number | null;
+	/** Its rows, in drop order. */
+	rowIds: readonly string[];
+	/** Each of its rows as it ended (the summary still counts a row Clear finished removed). */
+	ended: Readonly<Record<string, UploadRow>>;
+	/** What "Show new chunks on the map" sent, once it was used. */
+	shown: DropShown | null;
+}
+
+/** A document of a drop that stored chunks the store counted. */
+export interface DropDocument {
+	/** The objectId the engine stored it under. */
+	objectId: string;
+	path: string;
+	/** Chunks the store holds for it (> 0). */
+	chunks: number;
+}
+
+/** What a drop became, counted from its rows. */
+export interface DropSummary {
+	id: string;
+	/** Rows of the drop: every file it held, refused ones included. */
+	files: number;
+	/** Stored, and not as the replacement of a stored document. */
+	added: number;
+	/** Stored in place of a stored document (Replace was chosen). */
+	replaced: number;
+	/** Refused before sending, or failed. */
+	notAdded: number;
+	/** The replace question was answered Cancel. */
+	cancelled: number;
+	/** Waiting for the answer to the replace question. */
+	waiting: number;
+	/** Checking, queued, sending, processing or counting. */
+	inProgress: number;
+	/** Chunks of the added documents whose count the store reported. */
+	chunksAdded: number;
+	/** Chunks of the replacing documents whose count the store reported. */
+	chunksReplaced: number;
+	/** Added documents whose chunk count the store did not report. */
+	uncountedAdded: number;
+	/** Replacing documents whose chunk count the store did not report. */
+	uncountedReplaced: number;
+	/** uncountedAdded + uncountedReplaced. */
+	uncounted: number;
+	/** Documents with counted chunks, in drop order. */
+	newDocuments: DropDocument[];
+	/** Sum of their chunks. */
+	newChunks: number;
+	/** Every file of the drop has finished. */
+	finished: boolean;
+	/** From the drop to its last file's end (or to `now` while it runs). */
+	elapsedMs: number;
+	shown: DropShown | null;
+}
+
+/** The button under a finished drop that added chunks. */
+export const SHOW_NEW_LABEL = 'Show new chunks on the map';
+
+/** The store cannot draw a map (no `sample`). */
+export const NO_MAP_SENTENCE = 'This store cannot draw a map, so new chunks cannot be shown on one.';
+
+/** The store cannot place chunks outside the map's sample (no `project`). */
+export const NO_PLACING_SENTENCE = "This store cannot place chunks outside the map's sample. Draw a new sample on the Map tab to see the new chunks.";
+
+/** None of the drop's documents has a chunk count, so their chunk keys are unknown. */
+export const UNCOUNTED_SENTENCE = 'The store did not report how many chunks these documents have, so they cannot be found on the map.';
+
+/** Under a shown drop that replaced documents. */
+export const REPLACED_PLACE_SENTENCE = 'Replaced documents the map already shows may keep their old place until the map draws a new sample.';
+
+/**
+ * Record the rows of running drops as they end, and end a drop with its last row.
+ * Pure; a drop that does not change is returned as the same object.
+ *
+ * @param drops - The drops, oldest first.
+ * @param rows - The current rows.
+ * @param now - The time a drop that ends now ends at.
+ * @returns The drops, and those that ended in this step.
+ */
+export function settleDrops(drops: readonly IngestDrop[], rows: readonly UploadRow[], now: number): { drops: IngestDrop[]; finished: IngestDrop[] } {
+	const byId = new Map(rows.map((one) => [one.id, one]));
+	const finished: IngestDrop[] = [];
+	const next = drops.map((drop) => {
+		if (drop.finishedAt !== null) return drop;
+		let ended: Record<string, UploadRow> | null = null;
+		for (const id of drop.rowIds) {
+			if (drop.ended[id] !== undefined) continue;
+			const one = byId.get(id);
+			if (one === undefined || !FINISHED.has(one.status)) continue;
+			ended = ended ?? { ...drop.ended };
+			ended[id] = one;
+		}
+		const record = ended ?? drop.ended;
+		const done = drop.rowIds.every((id) => record[id] !== undefined);
+		if (ended === null && !done) return drop;
+		const settled: IngestDrop = { ...drop, ended: record, finishedAt: done ? now : null };
+		if (done) finished.push(settled);
+		return settled;
+	});
+	return { drops: next, finished };
+}
+
+/**
+ * Count a drop: ended rows from its record, the others from the live rows.
+ *
+ * @param drop - The drop.
+ * @param rows - The current rows.
+ * @param now - The clock, for a drop still running.
+ * @returns The summary.
+ */
+export function summariseDrop(drop: IngestDrop, rows: readonly UploadRow[], now: number): DropSummary {
+	const byId = new Map(rows.map((one) => [one.id, one]));
+	const summary: DropSummary = {
+		id: drop.id,
+		files: drop.rowIds.length,
+		added: 0,
+		replaced: 0,
+		notAdded: 0,
+		cancelled: 0,
+		waiting: 0,
+		inProgress: 0,
+		chunksAdded: 0,
+		chunksReplaced: 0,
+		uncountedAdded: 0,
+		uncountedReplaced: 0,
+		uncounted: 0,
+		newDocuments: [],
+		newChunks: 0,
+		finished: drop.finishedAt !== null,
+		elapsedMs: Math.max(0, (drop.finishedAt ?? now) - drop.startedAt),
+		shown: drop.shown,
+	};
+	for (const id of drop.rowIds) {
+		const one = drop.ended[id] ?? byId.get(id);
+		if (one === undefined) continue;
+		switch (one.status) {
+			case 'done': {
+				const counted = typeof one.chunks === 'number' && Number.isInteger(one.chunks) && one.chunks >= 0;
+				if (one.replaces === true) {
+					summary.replaced += 1;
+					if (counted) summary.chunksReplaced += one.chunks as number;
+					else summary.uncountedReplaced += 1;
+				} else {
+					summary.added += 1;
+					if (counted) summary.chunksAdded += one.chunks as number;
+					else summary.uncountedAdded += 1;
+				}
+				if (counted && (one.chunks as number) > 0) summary.newDocuments.push({ objectId: one.objectId, path: one.path, chunks: one.chunks as number });
+				break;
+			}
+			case 'failed':
+			case 'refused':
+				summary.notAdded += 1;
+				break;
+			case 'cancelled':
+				summary.cancelled += 1;
+				break;
+			case 'confirm':
+				summary.waiting += 1;
+				break;
+			default:
+				summary.inProgress += 1;
+		}
+	}
+	summary.uncounted = summary.uncountedAdded + summary.uncountedReplaced;
+	summary.newChunks = summary.newDocuments.reduce((sum, doc) => sum + doc.chunks, 0);
+	return summary;
+}
+
+/**
+ * Elapsed time as "mm:ss", or "h:mm:ss" from an hour.
+ *
+ * @param ms - Milliseconds.
+ * @returns The clock text ("00:00" for nothing, a negative or a non-number).
+ */
+export function formatElapsed(ms: number): string {
+	const total = Number.isFinite(ms) && ms > 0 ? Math.floor(ms / 1000) : 0;
+	const pad = (value: number): string => String(value).padStart(2, '0');
+	const hours = Math.floor(total / 3600);
+	const minutes = Math.floor((total % 3600) / 60);
+	const seconds = total % 60;
+	return hours > 0 ? `${hours}:${pad(minutes)}:${pad(seconds)}` : `${pad(minutes)}:${pad(seconds)}`;
+}
+
+/**
+ * " (N chunks)", " (N chunks; K not counted)" or " (chunks not counted)" after a count of documents.
+ *
+ * @param documents - Documents in the segment.
+ * @param chunks - Their counted chunks.
+ * @param uncounted - Those without a count.
+ * @returns The suffix.
+ */
+function chunkPart(documents: number, chunks: number, uncounted: number): string {
+	if (uncounted === 0) return ` (${chunksWord(chunks)})`;
+	if (uncounted >= documents) return ' (chunks not counted)';
+	return ` (${chunksWord(chunks)}; ${uncounted.toLocaleString('en-US')} not counted)`;
+}
+
+/**
+ * The summary line in pieces: the head ("Drop of 12 files:") and the
+ * segments joined by " · " ("9 added (341 chunks)", …, "00:48"), so a
+ * narrow panel can break the line between segments and never inside one.
+ *
+ * @param summary - The drop's counts.
+ * @returns The head and the segments.
+ */
+export function dropSummaryParts(summary: DropSummary): { head: string; parts: string[] } {
+	const n = (value: number): string => value.toLocaleString('en-US');
+	const parts: string[] = [];
+	if (summary.added > 0) parts.push(`${n(summary.added)} added${chunkPart(summary.added, summary.chunksAdded, summary.uncountedAdded)}`);
+	if (summary.replaced > 0) parts.push(`${n(summary.replaced)} replaced${chunkPart(summary.replaced, summary.chunksReplaced, summary.uncountedReplaced)}`);
+	if (summary.notAdded > 0) parts.push(`${n(summary.notAdded)} not added`);
+	if (summary.cancelled > 0) parts.push(`${n(summary.cancelled)} cancelled`);
+	if (summary.waiting > 0) parts.push(`${n(summary.waiting)} waiting for your answer`);
+	if (summary.inProgress > 0) parts.push(`${n(summary.inProgress)} in progress`);
+	parts.push(formatElapsed(summary.elapsedMs));
+	return { head: `Drop of ${summary.files === 1 ? '1 file' : `${n(summary.files)} files`}:`, parts };
+}
+
+/**
+ * The summary line: "Drop of 12 files: 9 added (341 chunks) · 2 replaced (19 chunks) · 1 not added · 00:48".
+ *
+ * @param summary - The drop's counts.
+ * @returns The line.
+ */
+export function dropSummaryText(summary: DropSummary): string {
+	const { head, parts } = dropSummaryParts(summary);
+	return `${head} ${parts.join(' · ')}`;
+}
+
+/**
+ * The chunk keys of a drop's new documents for the map: every document's
+ * chunk 0, then every document's chunk 1, and so on, cut at `cap`, so a
+ * capped list still places every document (up to `cap` documents).
+ *
+ * @param documents - The documents, in drop order.
+ * @param cap - Most keys (the map's pin limit, limits.project_keys_max).
+ * @returns The keys, and how many new chunks there are in all.
+ */
+export function newChunkKeys(documents: readonly DropDocument[], cap: number): { keys: VectorKey[]; total: number } {
+	const total = documents.reduce((sum, doc) => sum + doc.chunks, 0);
+	const limit = Math.max(0, Math.min(Math.floor(cap), total));
+	const keys: VectorKey[] = [];
+	for (let chunk = 0; keys.length < limit; chunk++) {
+		for (const doc of documents) {
+			if (keys.length >= limit) break;
+			if (chunk < doc.chunks) keys.push([doc.objectId, chunk]);
+		}
+	}
+	return { keys, total };
+}
+
+/**
+ * "N of M new chunks placed" when the map's pin limit cut the list.
+ *
+ * @param placed - Keys sent.
+ * @param total - New chunks in all.
+ * @param cap - The pin limit.
+ * @returns The sentence, or null when every new chunk was sent.
+ */
+export function placedSentence(placed: number, total: number, cap: number): string | null {
+	if (placed >= total) return null;
+	const n = (value: number): string => value.toLocaleString('en-US');
+	return `${n(placed)} of ${n(total)} new chunks placed: the map pins at most ${n(cap)} chunks outside its sample.`;
+}
+
+/**
+ * Why the map cannot show a drop's new chunks on this store.
+ *
+ * @param capabilities - dialect.capabilities.
+ * @returns The sentence, or null when it can.
+ */
+export function showNewChunksReason(capabilities: IVectorCapabilities): string | null {
+	if (capabilities.sample === false) return NO_MAP_SENTENCE;
+	if (capabilities.project === false) return NO_PLACING_SENTENCE;
 	return null;
 }
