@@ -52,7 +52,15 @@ unmocked:
    template's node ids, on the new and the legacy collection: dialect, stats,
    documents, chunks, vectors, sample, project, neighbors, search,
    remove_document, the legacy get/objdir/delete/upsert, and ``embed`` on
-   ``embed_1``. Writes are refused through the chat and ingest tokens, on
+   ``embed_1``; and the additive surface of contract section 4.4: the
+   documents filter and its ``filter_applied`` (server on pgvector, partial on
+   the legacy table for ingest dates; also through the pooler), the health
+   fields of a listing, ``dialect.size_bytes``/``keyword_match`` and keyword
+   search for the corpus's one token, the ``objectIds`` cap on ``search``,
+   ``sample`` clusters, listing and table flags, ``recommend`` (best_score
+   native on Qdrant only) and ``similarity_matrix`` (from the store and from the
+   sample cache). Each of these runs once the code that answers it is on the
+   branch, and is skipped with a NEEDS reason until then. Writes are refused through the chat and ingest tokens, on
    ``store_2``, as a broadcast, with the switch off and for the control record;
    the expectation for the switch reads ``VECTOR_ALLOW_WRITES_DEFAULT``. The
    refusal of a call that carries no context at all (``WRITES_UNKNOWN_CALLER``)
@@ -1215,6 +1223,243 @@ def test_a_text_query_without_an_embedder_on_the_store_is_refused(side):
 
 
 # ---------------------------------------------------------------------------
+# The additive tools and answer keys (contract section 4.4)
+# ---------------------------------------------------------------------------
+#
+# Each runs once the code that answers it is on this branch; until then it is
+# skipped with a NEEDS reason (a NEEDS skip is never a pass: the integration
+# gate runs them all). What decides is the branch's own source, never the live
+# answer, so a tool missing from a running engine fails instead of skipping.
+
+_STORE_SOURCE = {
+    name: (_STORE / name).read_text(encoding='utf-8')
+    for name in ('vx_tools.py', 'vx_tools_ext.py', 'document_store.py')
+}
+_PGVECTOR_DRIVER = (_STORE / 'pgvector' / 'driver.py').read_text(encoding='utf-8')
+_NEEDS_SAMPLE_EXT = (
+    None
+    if (_STORE / 'vx_cluster.py').exists()
+    else 'NEEDS:E1 merged — integration gate GE2 (sample clusters, listing, table)'
+)
+_NEEDS_EXT_TOOLS = (
+    None
+    if 'def recommend' in _STORE_SOURCE['vx_tools_ext.py']
+    else 'NEEDS:E2 merged — integration gate GE2 (recommend, similarity_matrix)'
+)
+_NEEDS_DOCUMENTS = (
+    None
+    if 'documents_filter' in _PGVECTOR_DRIVER and 'VX_KEYWORD_MATCH' in _STORE_SOURCE['document_store.py']
+    else 'NEEDS:E3 merged — integration gate GE2 (documents filter, health fields, objectIds cap)'
+)
+_NEEDS_DIALECT = next(
+    (reason for reason in (_NEEDS_SAMPLE_EXT, _NEEDS_EXT_TOOLS, _NEEDS_DOCUMENTS) if reason),
+    None
+    if "'keyword_match'" in _STORE_SOURCE['vx_tools.py']
+    else 'NEEDS:E1 merged — integration gate GE2 (dialect keys)',
+)
+
+#: How each backend matches a keyword (dialect.keyword_match, contract section 2.2-G).
+PROVIDER_KEYWORD_MATCH = {
+    'postgres': 'substring',
+    'rocketride_vector': 'substring',
+    'qdrant': 'token',
+    'chroma': 'substring',
+}
+#: The corpus's one keyword token and the document that holds it (gen_corpus.py).
+KEYWORD_TOKEN = gen_corpus.KEYWORD_TOKEN
+KEYWORD_FILE = gen_corpus.KEYWORD_FILE
+
+
+def _document_of(side_: _Side, rel: str) -> str:
+    """The objectId of the corpus document ``rel`` on this side (its upload name ends with it)."""
+    found = [oid for name, oid in side_.documents.items() if name.endswith('/' + rel)]
+    assert found, f'{rel} is not among the documents of {side_.template}/{side_.kind}'
+    return found[0]
+
+
+def _other_document(side_: _Side) -> str:
+    """A document of this side other than the multi-chunk one and the orphan (it has chunk 0)."""
+    return next(oid for oid in side_.documents.values() if oid not in (side_.multi, side_.orphan))
+
+
+@pytest.mark.skipif(bool(_NEEDS_DIALECT), reason=_NEEDS_DIALECT or '')
+def test_dialect_reports_the_size_and_how_keywords_match(side, deployment):
+    d = side.ok('dialect')
+    pgvector = PROVIDER_BACKEND[deployment.provider] == 'pgvector'
+    if pgvector:
+        assert isinstance(d['size_bytes'], int) and d['size_bytes'] > 0, d.get('size_bytes')
+    else:
+        assert d['size_bytes'] is None, d.get('size_bytes')
+    want = PROVIDER_KEYWORD_MATCH[deployment.provider] if d['capabilities']['search_keyword'] else None
+    assert d['keyword_match'] == want, (d.get('keyword_match'), d['capabilities']['search_keyword'])
+    for key in ('clusters', 'documents_filter', 'recommend_best_score'):
+        assert isinstance(d['capabilities'][key], bool), key
+    assert d['capabilities']['clusters'] is d['capabilities']['sample']
+    assert d['capabilities']['recommend_best_score'] is (deployment.provider == 'qdrant')
+    assert d['capabilities']['documents_filter'] is (deployment.provider in ('postgres', 'rocketride_vector', 'chroma'))
+
+
+@pytest.mark.skipif(bool(_NEEDS_DIALECT), reason=_NEEDS_DIALECT or '')
+def test_keyword_search_finds_the_planted_token_as_a_whole_word(side, deployment):
+    if not side.ok('dialect')['capabilities']['search_keyword']:
+        pytest.skip(f'NOT RUN: {deployment.provider} cannot search by keyword')
+    holder = _document_of(side, KEYWORD_FILE)
+    found = side.ok('search', {'query': KEYWORD_TOKEN, 'mode': 'keyword', 'top_k': 5})
+    rows = found['results']
+    assert rows, (
+        f'no keyword result for {KEYWORD_TOKEN} (a seeded legacy collection older than the token needs seed_legacy.sh --recreate)'
+    )
+    assert rows[0]['metadata']['objectId'] == holder, [r['metadata'].get('parent') for r in rows]
+    assert {r['metadata']['objectId'] for r in rows} == {holder}, 'the token is in one document only'
+    assert KEYWORD_TOKEN in rows[0]['content']
+
+
+@pytest.mark.skipif(bool(_NEEDS_DOCUMENTS), reason=_NEEDS_DOCUMENTS or '')
+def test_the_documents_filter_says_how_much_the_store_applied(side, deployment):
+    items, _ = _all_documents(side)
+    prefix = next(i['path'] for i in items if i['objectId'] == side.multi).rsplit('/', 1)[0] + '/'
+    want = {i['objectId'] for i in items if i['path'].startswith(prefix)}
+    page = side.ok('documents', {'limit': 200, 'deleted': 'active', 'sort': 'path', 'filter': {'path_prefix': prefix}})
+    applied, ignored = page['filter_applied'], page['filter_ignored']
+    got = {i['objectId'] for i in page['items']}
+    if deployment.provider in ('postgres', 'rocketride_vector'):
+        assert applied == 'server' and ignored == [], (applied, ignored)
+    if applied == 'server':
+        assert got == want, 'a server-side path filter listed other documents than the prefix holds'
+        assert page['total'] in (None, len(want))
+    elif applied == 'partial':
+        assert 'path_prefix' in ignored and 'documents_filter_partial' in page['caveats'], page
+    else:
+        assert applied == 'none' and ignored == ['path_prefix'] and 'documents_filter_client' in page['caveats'], page
+        assert want <= got, 'a store that did not filter must still list the documents'
+    # The ingest time lives in the meta column, which the legacy pgvector table does not have.
+    dated = side.ok(
+        'documents',
+        {
+            'limit': 200,
+            'deleted': 'active',
+            'filter': {'path_prefix': prefix, 'ingested_after': '2000-01-01T00:00:00Z'},
+        },
+    )
+    if PROVIDER_BACKEND[deployment.provider] == 'pgvector':
+        legacy_pg = side.kind == 'legacy' and not side.ok('dialect')['health'].get('meta_column', True)
+        assert dated['filter_applied'] == ('partial' if legacy_pg else 'server'), dated
+        assert dated['filter_ignored'] == (['ingested_after'] if legacy_pg else []), dated
+    for bad in (
+        {'colour': 'red'},
+        {'ingested_after': 'yesterday'},
+        {'min_chunks': 5, 'max_chunks': 2},
+        {'path_prefix': 'x' * 1025},
+    ):
+        assert side.refused('documents', {'limit': 10, 'filter': bad}) == 'INVALID_INPUT', bad
+
+
+@pytest.mark.skipif(bool(_NEEDS_DOCUMENTS), reason=_NEEDS_DOCUMENTS or '')
+def test_documents_items_report_their_last_chunk_and_deleted_chunks(side, deployment):
+    items, _ = _all_documents(side)
+    for item in items:
+        assert 'max_chunk_id' in item and 'deleted_chunks' in item, item.keys()
+    if PROVIDER_BACKEND[deployment.provider] != 'pgvector':
+        assert all(i['max_chunk_id'] is None and i['deleted_chunks'] is None for i in items)
+        return
+    # seed_legacy.sh plants one soft-deleted row in the seeded legacy table; every other collection has none.
+    planted = 1 if (side.kind == 'legacy' and LEGACY_MODE == 'seeded') else 0
+    assert sum(i['deleted_chunks'] for i in items) == planted, [(i['path'], i['deleted_chunks']) for i in items]
+    for item in items:
+        if item['deleted_chunks']:
+            continue
+        ids = deployment.service.chunk_ids(side.collection, item['objectId'])
+        assert item['max_chunk_id'] == max(ids), (item['path'], item['max_chunk_id'], ids)
+
+
+@pytest.mark.skipif(bool(_NEEDS_DOCUMENTS), reason=_NEEDS_DOCUMENTS or '')
+def test_search_refuses_more_object_ids_than_the_scope_limit(side):
+    cap = vx_defaults.VECTOR_TOOL_LIMITS['scope_keys_max']
+    (item,) = side.ok('vectors', {'keys': [[side.multi, 0]]})['items']
+    ids = [side.multi] + [str(uuid.uuid4()) for _ in range(cap)]
+    assert (
+        side.refused('search', {'vector': item['values'], 'top_k': 3, 'filter': {'objectIds': ids}}) == 'LIMIT_EXCEEDED'
+    )
+    within = side.ok('search', {'vector': item['values'], 'top_k': 3, 'filter': {'objectIds': ids[:cap]}})
+    assert all(r['metadata']['objectId'] == side.multi for r in within['results'])
+
+
+@pytest.mark.skipif(bool(_NEEDS_SAMPLE_EXT), reason=_NEEDS_SAMPLE_EXT or '')
+def test_sample_names_its_clusters_lists_the_scope_and_flags_tables(side, deployment):
+    rows = sum(deployment.service.counts(side.collection).values())
+    out = side.ok('sample', {'n': 1000, 'seed': 7, 'cluster': {'method': 'knn-components', 'labels': True}})
+    clusters = out['clusters']
+    assert len(clusters['labels']) == out['n'] == rows
+    assert clusters['sizes'] == sorted(clusters['sizes'], reverse=True) and all(s >= 2 for s in clusters['sizes'])
+    assert sum(clusters['sizes']) + clusters['noise'] == out['n'] and len(clusters['sizes']) == clusters['count']
+    assert all(len(words) <= 5 for words in clusters['keywords']) and len(clusters['keywords']) == clusters['count']
+    assert clusters['label_source'] == 'text'
+    assert out['listing']['truncated'] is False and out['listing']['reason'] == 'complete', out['listing']
+    assert 'listing_truncated' not in (out.get('caveats') or [])
+    table = out['points']['table']
+    assert len(table) == out['n'] and set(table) <= {0, 1}
+    tables = _document_of(side, 'tables/equipment_inventory.html')
+    flagged = {out['docs'][out['points']['doc'][i]]['objectId'] for i, t in enumerate(table) if t == 1}
+    assert flagged <= {tables}, flagged
+    again = side.ok('sample', {'n': 1000, 'seed': 7, 'cluster': {'method': 'knn-components', 'labels': True}})
+    assert again['clusters']['labels'] == clusters['labels'] and again['clusters']['keywords'] == clusters['keywords']
+    plain = side.ok('sample', {'n': 1000, 'seed': 7})
+    assert 'clusters' not in plain, 'clusters only when asked'
+    scope = [side.multi, _other_document(side)]
+    scoped = side.ok('sample', {'n': 1000, 'seed': 7, 'filter': {'object_ids': scope}})
+    assert {d['objectId'] for d in scoped['docs']} <= set(scope) and scoped['listing']['truncated'] is False
+    assert side.refused('sample', {'n': 10, 'cluster': {'method': 'louvain', 'labels': True}}) == 'INVALID_INPUT'
+
+
+@pytest.mark.skipif(bool(_NEEDS_EXT_TOOLS), reason=_NEEDS_EXT_TOOLS or '')
+def test_recommend_ranks_from_positive_and_negative_examples(side, deployment):
+    positive, negative = [side.multi, 0], [_other_document(side), 0]
+    out = side.ok('recommend', {'positive': [positive], 'negative': [negative], 'k': 5})
+    assert out['strategy_used'] == 'average_vector' and out['native'] is False and out['metric'] == 'cosine'
+    assert out['examples_resolved'] == {'positive': 1, 'negative': 1} and out['not_found'] == []
+    keys = [i['key'] for i in out['items']]
+    assert 0 < len(keys) <= 5 and positive not in keys and negative not in keys
+    sims = [i['sim'] for i in out['items']]
+    assert sims == sorted(sims, reverse=True)
+    assert not {'values', 'vector', 'embedding'} & _keys(out), 'recommend returned a vector'
+    missing = [str(uuid.uuid4()), 0]
+    partial = side.ok('recommend', {'positive': [positive, missing], 'k': 3})
+    assert partial['not_found'] == [missing]
+    assert side.refused('recommend', {'positive': [missing], 'k': 3}) == 'NOT_FOUND'
+    assert side.refused('recommend', {'positive': [], 'negative': [negative], 'k': 3}) == 'INVALID_INPUT'
+    best = side.tool('recommend', {'positive': [positive], 'negative': [negative], 'k': 5, 'strategy': 'best_score'})
+    if deployment.provider == 'qdrant':
+        assert best.get('success') is True and best['native'] is True and best['strategy_used'] == 'best_score', best
+        assert positive not in [i['key'] for i in best['items']]
+    else:
+        assert best.get('success') is False and best.get('code') == 'UNSUPPORTED', best
+
+
+@pytest.mark.skipif(bool(_NEEDS_EXT_TOOLS), reason=_NEEDS_EXT_TOOLS or '')
+def test_similarity_matrix_compares_keys_from_the_store_and_the_sample_cache(side, deployment):
+    other = _other_document(side)
+    keys = [[side.multi, 0], [side.multi, 1], [other, 0]]
+    out = side.ok('similarity_matrix', {'keys': keys})
+    m = out['matrix']
+    assert out['n'] == 3 and out['keys'] == keys and out['metric'] == 'cosine' and out['not_found'] == []
+    assert all(abs(m[i][i] - 1) <= 0.01 for i in range(3))
+    assert all(abs(m[i][j] - m[j][i]) <= 0.01 for i in range(3) for j in range(3))
+    assert out['source'] in ('store', 'cache', 'mixed')
+    side.ok('sample', {'n': 1000, 'seed': 11})
+    cached = side.ok('similarity_matrix', {'keys': keys})
+    assert cached['source'] == 'cache', cached['source']
+    assert all(abs(cached['matrix'][i][j] - m[i][j]) <= 0.011 for i in range(3) for j in range(3))
+    missing = [str(uuid.uuid4()), 0]
+    partial = side.ok('similarity_matrix', {'keys': [*keys, missing]})
+    assert partial['n'] == 3 and partial['not_found'] == [missing]
+    assert side.refused('similarity_matrix', {'keys': [keys[0], missing]}) == 'NOT_FOUND'
+    cap = vx_defaults.VECTOR_TOOL_LIMITS['matrix_keys_max']
+    assert side.refused('similarity_matrix', {'keys': [[side.multi, i] for i in range(cap + 1)]}) == 'LIMIT_EXCEEDED'
+    assert side.refused('similarity_matrix', {'keys': [[side.multi], 'x']}) == 'INVALID_INPUT'
+    assert not {'values', 'vector', 'embedding'} & _keys(out), 'similarity_matrix returned a vector'
+
+
+# ---------------------------------------------------------------------------
 # Writes: the gate end to end (CONTRACT section 6)
 # ---------------------------------------------------------------------------
 
@@ -1508,6 +1753,11 @@ def test_rocketride_vector_through_the_transaction_pooler(engine, broker, stub, 
         assert len(found['results']) == k, 'a filtered search through the pooler returned fewer than k rows'
         assert all(r['metadata']['objectId'] == oid for r in found['results'])
         assert pooled.ok('dialect')['health']['collection_exists'] is True
+        if not _NEEDS_DOCUMENTS:
+            # The documents filter runs in the statement that pages the keys, through the pooler too.
+            prefix = stored_path(UPLOAD_PREFIX) + 'handbooks/'
+            page = pooled.ok('documents', {'limit': 200, 'deleted': 'active', 'filter': {'path_prefix': prefix}})
+            assert page['filter_applied'] == 'server' and {i['objectId'] for i in page['items']} == {oid}, page
     finally:
         pooled.stop()
         broker.dsn = direct
