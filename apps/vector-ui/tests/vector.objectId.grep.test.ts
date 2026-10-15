@@ -36,12 +36,9 @@ test('no source file uses crypto.subtle (undefined on a LAN origin)', () => {
 	}
 });
 
-test('the objectId derivation is pure JavaScript over vector/sha1.ts', (t) => {
+test('the objectId derivation is pure JavaScript over vector/sha1.ts', () => {
 	const objectId = path.join(SRC, 'vector', 'objectId.ts');
-	if (!fs.existsSync(objectId)) {
-		t.skip('NEEDS:L9 merged — integration gate G2 (vector/objectId.ts and vector/sha1.ts are on the chat and ingest lane)');
-		return;
-	}
+	assert.ok(fs.existsSync(objectId), 'vector/objectId.ts derives the objectId the uploads check for collisions');
 	assert.match(fs.readFileSync(objectId, 'utf8'), /from '\.\/sha1'/);
 	assert.ok(fs.existsSync(path.join(SRC, 'vector', 'sha1.ts')));
 });

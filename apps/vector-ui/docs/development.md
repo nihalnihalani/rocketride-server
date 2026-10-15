@@ -50,9 +50,9 @@ limits) is `docs/development/nodes/vector-tool-contract.md`.
   `vx_defaults.py` by `scripts/gen_defaults.py` (so the templates test follows
   a change of the write default), and `tests/fixtures/chunking.json` holds the
   calibrated chunking the templates carry.
-- A test that can only pass once another part of the app is in the tree is
-  skipped with a reason starting `NEEDS:` (for example the browser lanes'
-  result files). A `NEEDS:` skip is never a pass; the integration removes it.
+- A test whose subject lives outside the app (the browser lanes and their
+  privacy checker in `scripts/acceptance/vector-explorer/browser`) asserts
+  that the file is there instead of skipping: a missing lane fails the suite.
 - `./builder vector-ui:e2e-live` runs the browser lanes in
   `scripts/acceptance/vector-explorer/browser` against `ENGINE_URL`. It is
   opt-in: not part of `vector-ui:test`, `builder test` or CI.

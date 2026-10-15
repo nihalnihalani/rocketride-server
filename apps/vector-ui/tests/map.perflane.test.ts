@@ -15,10 +15,9 @@
 // the B4 privacy row, which fails when nothing was captured; and that a layout
 // that never ran fails.
 //
-// The privacy check itself is L10's (scripts/acceptance/vector-explorer/
-// browser/common.cjs, privacyViolations); the lane applies it to each row's
-// WebSocket frames. Until L10's branch is merged the tests that run the lane's
-// summary over that checker are skipped with a NEEDS reason (B8);
+// The privacy check itself lives in scripts/acceptance/vector-explorer/
+// browser/common.cjs (privacyViolations); the lane applies it to each row's
+// WebSocket frames, and the tests below run the lane's summary over it.
 // VX_ACCEPTANCE_COMMON points them at another copy of common.cjs.
 // =============================================================================
 
@@ -57,6 +56,8 @@ interface ILane {
 	privacySummary(frames: Frame[], dimension: number | null, checker: unknown): IPrivacy;
 	PERF_PROJECT_ID: string;
 	QUERY_STEP: string;
+	laneArgs(args: string[], defaults: { base: string; outDir: string }): { base: string; outFile: string; browser: string; sizesArg: string; ratesArg: string };
+	resultOf(base: string, browser: string, rows: IRow[], gates: Array<{ name: string; status: string; detail?: string }>): { pass: boolean; results: Array<Record<string, unknown>> };
 }
 
 const lane = require(path.resolve(__dirname, '..', '..', '..', 'scripts', 'acceptance', 'vector-explorer', 'browser', 'lane_vector_perf.cjs')) as ILane;
@@ -176,7 +177,6 @@ test("the lane's perf fixture is gen_perf.py's (same project id), so the store's
 // -----------------------------------------------------------------------------
 
 const COMMON = process.env.VX_ACCEPTANCE_COMMON || path.resolve(__dirname, '..', '..', '..', 'scripts', 'acceptance', 'vector-explorer', 'browser', 'common.cjs');
-const NEEDS_COMMON = fs.existsSync(COMMON) ? false : 'NEEDS:L10 merged — integration gate G2 (browser/common.cjs privacyViolations)';
 const DIM = 8;
 const vec = (seed: number): number[] => Array.from({ length: DIM }, (_, i) => Math.round(Math.sin(seed * 7 + i) * 1e6) / 1e6 + 0.0001);
 let seq = 0;
@@ -189,7 +189,8 @@ function call(tool: string, input: Record<string, unknown>, result: Record<strin
 	];
 }
 
-test('privacy summary: the exact embed vector sent to project, search and neighbors passes and is counted', { skip: NEEDS_COMMON }, () => {
+test('privacy summary: the exact embed vector sent to project, search and neighbors passes and is counted', () => {
+	assert.ok(fs.existsSync(COMMON), `the privacy checker is at ${COMMON}`);
 	const checker = require(COMMON) as unknown;
 	const q = vec(1);
 	const frames = [...call('sample', { n: 3 }, { sample_id: 's-1', n: 3, points: { x: [0.1, 0.2, 0.3] } }), ...call('embed', { texts: ['q'], kind: 'query' }, { dimension: DIM, vectors: [q] }), ...call('project', { sample_id: 's-1', vector: q, m: 10 }, { items: [] }), ...call('search', { vector: q, top_k: 10 }, { results: [] }), ...call('neighbors', { vector: q, scope_keys: [['a', 0]] }, { scores: [0.5] })];
@@ -202,7 +203,7 @@ test('privacy summary: the exact embed vector sent to project, search and neighb
 	assert.equal(gates[0]?.status, 'PASS', JSON.stringify(gates));
 });
 
-test('privacy summary: a vector in any other answer, a vector the page made up, or nothing captured fails the row', { skip: NEEDS_COMMON }, () => {
+test('privacy summary: a vector in any other answer, a vector the page made up, or nothing captured fails the row', () => {
 	const checker = require(COMMON) as unknown;
 	const q = vec(1);
 	const leakedAnswer = [...call('embed', { texts: ['q'], kind: 'query' }, { vectors: [q] }), ...call('chunks', { object_id: 'a' }, { items: [{ content: 'x', embedding: vec(2) }] })];
@@ -211,4 +212,41 @@ test('privacy summary: a vector in any other answer, a vector the page made up, 
 	assert.equal(privacyOf([gateRow({ privacy: lane.privacySummary(madeUp, DIM, checker) })])[0]?.status, 'FAIL', 'a request with a vector no embed answer returned');
 	assert.equal(privacyOf([gateRow({ privacy: lane.privacySummary([], DIM, checker) })])[0]?.status, 'FAIL', 'nothing captured');
 	assert.equal(privacyOf([gateRow({ privacy: lane.privacySummary(leakedAnswer, null, checker) })])[0]?.status, 'FAIL', 'no dimension');
+});
+
+// -----------------------------------------------------------------------------
+// The two ways the lane is run: directly, and by vector-ui:e2e-live
+// -----------------------------------------------------------------------------
+
+test('run by vector-ui:e2e-live (<url> <out-dir> <browser>) it writes <out-dir>/lane_vector_perf.json with the default sizes', () => {
+	const args = lane.laneArgs(['http://127.0.0.1:5590', '/tmp/e2e/chrome', 'chrome'], { base: 'http://x', outDir: '/tmp/out' });
+	assert.equal(args.base, 'http://127.0.0.1:5590');
+	assert.equal(args.outFile, path.join('/tmp/e2e/chrome', 'lane_vector_perf.json'));
+	assert.equal(args.browser, 'chrome');
+	assert.equal(args.sizesArg, '500,1000,2000,light:5000');
+	assert.equal(args.ratesArg, '1,4');
+	assert.equal(lane.laneArgs(['http://h', '/tmp/e2e/webkit', 'webkit'], { base: 'http://x', outDir: '/tmp/out' }).browser, 'webkit');
+});
+
+test('run directly it keeps its own form: an out file or folder, then sizes and rates', () => {
+	const direct = lane.laneArgs(['http://h', '/tmp/r/perf.json', '2000', '4'], { base: 'http://x', outDir: '/tmp/out' });
+	assert.deepEqual(direct, { base: 'http://h', outFile: '/tmp/r/perf.json', browser: 'chrome', sizesArg: '2000', ratesArg: '4' });
+	const defaults = lane.laneArgs([], { base: 'http://x', outDir: '/tmp/out' });
+	assert.equal(defaults.base, 'http://x');
+	assert.equal(defaults.outFile, path.join('/tmp/out', 'lane_vector_perf.json'));
+});
+
+test('the result lists the gates as rows vector-ui:e2e-live reads, and passes only when every gate passes', () => {
+	const gates = [
+		{ name: 'GATE p95', status: 'PASS', detail: 'p95 20 ms' },
+		{ name: 'privacy', status: 'FAIL', detail: 'a vector' },
+	];
+	const result = lane.resultOf('http://h', 'chrome', [], gates);
+	assert.equal(result.pass, false);
+	assert.deepEqual(result.results, [
+		{ browser: 'chrome', run: 'perf', name: 'GATE p95', status: 'PASS', detail: 'p95 20 ms' },
+		{ browser: 'chrome', run: 'perf', name: 'privacy', status: 'FAIL', detail: 'a vector' },
+	]);
+	assert.equal(lane.resultOf('http://h', 'chrome', [], [gates[0]]).pass, true);
+	assert.equal(lane.resultOf('http://h', 'chrome', [], []).pass, false, 'no gate measured is not a pass');
 });

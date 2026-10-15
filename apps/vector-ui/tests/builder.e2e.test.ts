@@ -234,12 +234,9 @@ test('a failed lane run is summarised by the rows that failed in its own result 
 	}
 });
 
-test('every lane it runs is a committed pass/fail lane that writes the result file the summary reads', (t) => {
+test('every lane it runs is a committed pass/fail lane that writes the result file the summary reads', () => {
 	const missing = Object.values(tasks.e2e.LANES).filter((script) => !fs.existsSync(path.join(tasks.e2e.ACCEPTANCE_BROWSER_DIR, script)));
-	if (missing.length > 0) {
-		t.skip(`NEEDS:L10,L8 merged — integration gate G3 (${missing.join(', ')} not on this branch)`);
-		return;
-	}
+	assert.deepEqual(missing, [], 'every lane vector-ui:e2e-live runs is committed under scripts/acceptance/vector-explorer/browser');
 	assert.equal(path.relative(REPO, tasks.e2e.ACCEPTANCE_BROWSER_DIR), path.join('scripts', 'acceptance', 'vector-explorer', 'browser'));
 	for (const script of Object.values(tasks.e2e.LANES)) {
 		const source = fs.readFileSync(path.join(tasks.e2e.ACCEPTANCE_BROWSER_DIR, script), 'utf8');
