@@ -903,11 +903,12 @@ export function MapView(props: MapViewProps): React.ReactElement {
 		const first = res.points[0];
 		if (first !== undefined) setCentreOn({ index: first, seq: ++seq.current });
 		if (highlight.source === 'chat') {
-			/** Forget the placed query: its star, rays, vector and colouring. */
+			/** Forget the placed query (its star, rays, vector and colouring) and a compared one (star B). */
 			const clearQuery = (): void => {
 				setQueryView(null);
 				queryVector.current = null;
 				setColourBy((by) => colourAfterQuery(by, colourBefore.current));
+				clearCompare();
 			};
 			// The chat told the map the answer's question (showAnswerOnMap) before it highlighted the sources.
 			const plan = chatQueryPlan({ told: state.query, mapQuery: query?.text ?? null, embedReady });
@@ -1307,7 +1308,12 @@ export function MapView(props: MapViewProps): React.ReactElement {
 		if (source === null) return null;
 		const dpr = typeof window !== 'undefined' && window.devicePixelRatio > 0 ? window.devicePixelRatio : 1;
 		const scale = Math.min(2, dpr) / dpr;
-		const lines = [...(colouring?.legend ?? []).slice(0, 12).map((e) => `${e.label} (${num(e.count)})`), `${model.collection ?? 'collection'} · ${num(shownPoints)} of ${sample.of.chunks === null ? '?' : num(sample.of.chunks)} chunks · ${layout} · colour by ${COLOUR_MODES.find((m) => m.id === colourBy)?.label ?? colourBy} · ${new Date().toISOString().slice(0, 10)}`];
+		// The legend's colours (swatch and words), then the footer.
+		const legendRows = (colouring?.legend ?? []).slice(0, 12);
+		const lines: Array<{ text: string; colour: string | null }> = [
+			...legendRows.map((e) => ({ text: `${e.label} (${num(e.count)})`, colour: e.colour })),
+			{ text: `${model.collection ?? 'collection'} · ${num(shownPoints)} of ${sample.of.chunks === null ? '?' : num(sample.of.chunks)} chunks · ${layout} · colour by ${COLOUR_MODES.find((m) => m.id === colourBy)?.label ?? colourBy} · ${new Date().toISOString().slice(0, 10)}`, colour: null },
+		];
 		const ratio = Math.min(2, dpr);
 		const lineH = 16 * ratio;
 		const out = document.createElement('canvas');
@@ -1321,7 +1327,16 @@ export function MapView(props: MapViewProps): React.ReactElement {
 		octx.drawImage(source, 0, 0, out.width, Math.round(source.height * scale));
 		octx.fillStyle = style.getPropertyValue('--rr-text-primary').trim() || '#1a1a1a';
 		octx.font = `${12 * ratio}px system-ui, sans-serif`;
-		lines.forEach((line, n) => octx.fillText(line, 8 * ratio, Math.round(source.height * scale) + lineH * (n + 1)));
+		const top = Math.round(source.height * scale);
+		lines.forEach((line, n) => {
+			const y = top + lineH * (n + 1);
+			if (line.colour) {
+				octx.fillStyle = line.colour;
+				octx.fillRect(8 * ratio, y - 9 * ratio, 9 * ratio, 9 * ratio);
+			}
+			octx.fillStyle = style.getPropertyValue('--rr-text-primary').trim() || '#1a1a1a';
+			octx.fillText(line.text, (line.colour ? 22 : 8) * ratio, y);
+		});
 		return new Promise<Blob | null>((resolve) => out.toBlob((blob) => resolve(blob), 'image/png'));
 	}, [sample, colouring, model.collection, shownPoints, layout, colourBy]);
 
