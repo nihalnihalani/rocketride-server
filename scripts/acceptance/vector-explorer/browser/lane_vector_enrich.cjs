@@ -1025,6 +1025,7 @@ async function main(fixtureKey, base, out) {
 	let greenhouseKey = null;
 	let queued = []; // { objectId, path } the duplicates queue would remove
 	let savedView = null;
+	let savedFilter = false; // the scope step saved 'handbooks' and applied it again
 	try {
 		await E.signIn(page, base);
 
@@ -1352,6 +1353,7 @@ async function main(fixtureKey, base, out) {
 				sample = x.result;
 				sampleInput = x.input;
 			}
+			savedView.listed = listedAfterSwitch;
 			note({ saved: savedView, applied: x ? { seed: x.input.seed, include_keys: (x.input.include_keys || []).length } : null, line });
 			return viewsVerdict({ listedAfterSwitch, saved: savedView, apply: x, line });
 		});
@@ -1453,6 +1455,7 @@ async function main(fixtureKey, base, out) {
 				.isVisible()
 				.catch(() => false);
 			note({ filter_applied: listing && listing.result && listing.result.filter_applied, status: statusLine, directory: directory.length, scope: scopeIds.length, sampled: x.result && x.result.docs ? x.result.docs.length : null, sources, reapplied });
+			savedFilter = reapplied;
 			const verdict = scopeVerdict({ prefix: CORPUS.scopeFolder, listing: listing && listing.result, status: statusLine, directory, sampleInput: x.input, sample: x.result, scopeIds, sources, reapplied });
 			await button(UI.scope.clear).click();
 			return verdict;
@@ -1655,7 +1658,13 @@ async function main(fixtureKey, base, out) {
 			const ocr = DEMO(E.DEMO_CORPUS.outlier);
 			const before = await stats();
 			const since = capture.frames.length;
-			await button(UI.outliers.remove, list.locator('li').first()).click();
+			await button(
+				UI.outliers.remove,
+				list
+					.locator('li')
+					.filter({ hasText: E.DEMO_CORPUS.outlier.split('/').pop() })
+					.first()
+			).click();
 			await answerRemoval(true, 1);
 			await poll(
 				async () => C.exchanges(capture, 'remove_document', since).filter((x) => x.response).length,
@@ -1714,11 +1723,16 @@ async function main(fixtureKey, base, out) {
 			const again = [...removedDemo].map((p) => ({ name: p, text: corpus[p.slice(E.DEMO_PREFIX.length)] })).filter((f) => typeof f.text === 'string');
 			if (again.length) await store.upload(fixture, again);
 			await C.openConnection(page, fixture);
+			// The directory draws the rows in view only: filter it down to the lane's own uploads first.
+			const box = visible(page.getByRole('searchbox', { name: 'Filter documents by path' }));
+			await box.fill(`enrich-${run}`);
+			await C.sleep(1000);
 			for (const p of ownUploads) {
 				await button(CONSOLE.trash(p)).click();
 				await answerRemoval(true, 1);
 				await C.sleep(1500);
 			}
+			await box.fill('');
 			const back = [];
 			for (const f of again) {
 				const answer = await store.tool(fixture, 'chunks', { object_id: C.objectId(f.name), limit: 1 });
@@ -1754,7 +1768,8 @@ async function main(fixtureKey, base, out) {
 				.isVisible()
 				.catch(() => false);
 			note({ filterListed, viewListed });
-			if (!savedView) return 'no view was saved (views step)';
+			if (!savedView || !savedView.listed) return 'no view was saved and listed (views step), so its absence proves nothing';
+			if (!savedFilter) return 'no filter was saved and applied (scope step), so its absence proves nothing';
 			if (filterListed) return "the saved filter 'handbooks' is still listed after signing in again";
 			return viewListed ? "the saved view 'dupes' is still listed after signing in again" : true;
 		});
