@@ -80,6 +80,7 @@ them only with `RR_REQUIRE_DB_TESTS` set. See
 | `tika` | Java document parser | build-jar, build-dbgconn, sync, test-jar, test-dbgconn |
 | `ui` | All UI applications | build, clean, register |
 | `vcpkg` | C++ package manager (auto-installed for server build) | bootstrap, clone |
+| `vector-ui` | Vector Explorer application | build, clean, dev, e2e-live, test |
 | `vscode` | VSCode extension | build, compile, clean |
 | `world-ui` | Hello World demo application | build, clean |
 
