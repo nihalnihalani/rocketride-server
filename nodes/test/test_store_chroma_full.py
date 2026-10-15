@@ -293,7 +293,6 @@ def test_no_native_neighbour_graph(collection):
     assert 'knnGraph' not in store.capabilities()
 
 
-@pytest.mark.skip(reason='NEEDS:L1 merged (stats counts cache) — integration gate G2')
 def test_quick_stats_never_reads_every_id(collection):
     from ai.common.store import VectorStoreToolMixin
 
@@ -311,7 +310,6 @@ def test_quick_stats_never_reads_every_id(collection):
     assert [] not in spy.includes
 
 
-@pytest.mark.skip(reason='NEEDS:L1 merged (explorer tools on VectorStoreToolMixin) — integration gate G2')
 def test_documents_tool_lists_the_orphan_unsorted(collection):
     from ai.common.store import VectorStoreToolMixin
 

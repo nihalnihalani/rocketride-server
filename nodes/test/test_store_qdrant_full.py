@@ -302,7 +302,6 @@ def test_neighbour_graph_is_computed_by_qdrant(collection):
     assert contract.knn_agreement(graph, contract.exact_knn_sets(X.astype(np.float64), k), k) >= 0.95
 
 
-@pytest.mark.skip(reason='NEEDS:L1 merged (vx_math) — integration gate G2')
 def test_neighbour_graph_agrees_with_vx_math(collection):
     from ai.common.store import vx_math
 
@@ -317,7 +316,6 @@ def test_neighbour_graph_agrees_with_vx_math(collection):
     assert contract.knn_agreement(graph, exact, k) >= 0.95
 
 
-@pytest.mark.skip(reason='NEEDS:L1 merged (explorer tools on VectorStoreToolMixin) — integration gate G2')
 def test_documents_tool_lists_the_orphan_unsorted(collection):
     from ai.common.store import VectorStoreToolMixin
 

@@ -197,9 +197,6 @@ def test_count_documents_answers_none_above_the_cap(monkeypatch):
     assert store.countDocuments(vx_filter()) is None
 
 
-@pytest.mark.skip(
-    reason='NEEDS:L1 merged (stats counts first chunks when countDocuments answers None) — integration gate G2'
-)
 def test_stats_above_the_document_cap_counts_first_chunks(monkeypatch):
     # countDocuments is overridden (so dialect says count_documents) yet answers None
     # above COUNT_DOCUMENTS_CAP: stats must fall back on that None, not on the capability.
