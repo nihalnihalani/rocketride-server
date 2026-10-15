@@ -9,7 +9,12 @@
 
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import type { IExplorerEndpoint } from 'shared/explorer';
+import { manualClock } from 'shared/explorer/connect/testing';
+import { connectionEntry, savedFilters } from '../src/adapters/connections';
 import { connectionCaches, neighbourRequests } from '../src/adapters/explorer';
+import { savedFiltersFor } from '../src/vector/savedFilters';
+import { DEFAULT_LIMITS } from '../src/vector/results';
 import { CONNECTIONS_URI, consoleUri, documentUri, endpointKeyFromUri } from '../src/vector/addresses';
 import { connectionEditorIds, createCacheRegistry, forgetConnections } from '../src/vector/identityChange';
 import type { IConnectionDocs } from '../src/vector/identityChange';
@@ -99,4 +104,18 @@ test("the app's registry clears the neighbour request queues of every connection
 	assert.ok(connectionCaches.names().includes('neighbour queues'));
 	connectionCaches.clearAll();
 	assert.notEqual(neighbourRequests(KEY_A), before, 'a new identity gets a new channel');
+});
+
+test("the console's scope and the saved filters are per connection and gone after a change of identity", () => {
+	const endpoint = (key: string) => ({ key, nodeId: 'store_1', roles: {}, provider: 'postgres', pipelineName: 'p' }) as unknown as IExplorerEndpoint;
+	const a = connectionEntry(endpoint(KEY_A), null, DEFAULT_LIMITS, manualClock());
+	a.scope.set({ filter: { path_prefix: 'C:/demo/' }, label: 'folder is under C:/demo/', objectIds: ['doc-1'], overflow: null, applyTo: { documents: true, map: true, search: true, chat: true } });
+	assert.ok(savedFiltersFor(savedFilters, KEY_A).save('demo', { path_prefix: 'C:/demo/' }, 1).ok);
+	assert.equal(connectionEntry(endpoint(KEY_B), null, DEFAULT_LIMITS, manualClock()).scope.get(), null, 'another connection has its own scope');
+	assert.deepEqual(savedFiltersFor(savedFilters, KEY_B).list(), [], 'and its own saved filters');
+	assert.equal(connectionEntry(endpoint(KEY_A), null).scope.get()?.label, 'folder is under C:/demo/', 'switching back keeps it within the session');
+	connectionCaches.clearAll();
+	assert.equal(connectionEntry(endpoint(KEY_A), null, DEFAULT_LIMITS, manualClock()).scope.get(), null, 'a new identity starts without a scope');
+	assert.deepEqual(savedFiltersFor(savedFilters, KEY_A).list(), [], 'and without saved filters');
+	connectionCaches.clearAll();
 });
