@@ -75,6 +75,21 @@ The implementation flushes an insert batch at 500 documents or when its accumula
 
 This is the namespace for the three agent functions: `atlas.search`, `atlas.upsert`, and `atlas.delete` by default. Change it to avoid collisions between multiple Atlas tool nodes.
 
+### Write switches
+
+Allow document management from tool calls (`allow_writes`) is off by default.
+Turn it on in the pipeline whose Tools source should be able to remove
+documents from the collection, or add them with the `upsert` tool, through
+tool calls, for example the pipeline the Vector Explorer manages. Even when it
+is on, such a write is accepted only from a Tools source of the pipeline,
+addressed to this node; calls from the pipeline's chat or ingest sources are
+refused. Documents the pipeline's own lanes write are not affected by this
+switch.
+
+Allow writes from agents (`agent_writes`) is on by default and keeps an
+agent's `upsert` and `delete` calls working as before. Turn it off when the
+agents of this pipeline should only search.
+
 ## Authentication
 
 Supply the MongoDB SRV URI, including its credentials, as the host value. The save-time check also requires a non-empty API key value; the runtime client is constructed from the configured URI. The node has no separate local or unauthenticated profile.

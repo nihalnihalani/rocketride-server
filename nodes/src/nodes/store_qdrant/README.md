@@ -113,6 +113,21 @@ Prefix for the tool names agents see: `qdrant` exposes `qdrant.search`,
 in the same pipeline — give each a distinct name so their tool names do not
 collide and the agent can tell the stores apart.
 
+### Write switches
+
+Allow document management from tool calls (`allow_writes`) is off by default.
+Turn it on in the pipeline whose Tools source should be able to remove
+documents from the collection, or add them with the `upsert` tool, through
+tool calls, for example the pipeline the Vector Explorer manages. Even when it
+is on, such a write is accepted only from a Tools source of the pipeline,
+addressed to this node; calls from the pipeline's chat or ingest sources are
+refused. Documents the pipeline's own lanes write are not affected by this
+switch.
+
+Allow writes from agents (`agent_writes`) is on by default and keeps an
+agent's `upsert` and `delete` calls working as before. Turn it off when the
+agents of this pipeline should only search.
+
 ## Authentication
 
 Self-hosted Qdrant typically needs no credentials: leave `apikey` empty. For Qdrant Cloud, set `host` to your instance endpoint (`<instance>.<region>.qdrant.io`) and provide the cluster API key in `apikey`. The key is passed as the `api_key` argument of the Qdrant client.

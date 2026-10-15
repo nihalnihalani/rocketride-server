@@ -84,6 +84,21 @@ not see every index available to a broader application credential.
 
 The tool-server name defaults to `pinecone` and prefixes the three agent functions. Change it when multiple Pinecone stores are connected to the same agent so their functions do not share a namespace.
 
+### Write switches
+
+Allow document management from tool calls (`allow_writes`) is off by default.
+Turn it on in the pipeline whose Tools source should be able to remove
+documents from the index, or add them with the `upsert` tool, through tool
+calls, for example the pipeline the Vector Explorer manages. Even when it is
+on, such a write is accepted only from a Tools source of the pipeline,
+addressed to this node; calls from the pipeline's chat or ingest sources are
+refused. Documents the pipeline's own lanes write are not affected by this
+switch.
+
+Allow writes from agents (`agent_writes`) is on by default and keeps an
+agent's `upsert` and `delete` calls working as before. Turn it off when the
+agents of this pipeline should only search.
+
 ## Authentication
 
 Set the API key for the selected Pinecone profile. The runtime creates its client with that key, and the save-time probe uses it to list indexes and check an existing index's deployment mode.

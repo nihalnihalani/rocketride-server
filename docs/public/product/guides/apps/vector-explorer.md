@@ -110,9 +110,10 @@ written by an earlier release, and **Experimental** otherwise.
   `store_2`. To turn it on in a pipeline of your own, set
   `config.<profile>.allow_writes` to `true` on the store component in the
   `.pipe` (for example `"local": { …, "allow_writes": true }`), then restart the
-  pipeline. RocketRide Vector's node form also shows it, as **Allow document
-  management from tool calls**; in this build the other store nodes' forms do
-  not show it. With it off, the trash buttons are disabled and say why. Adding
+  pipeline. Every store node's form also shows it, as **Allow document
+  management from tool calls**, next to **Allow writes from agents** (**Allow
+  agent writes** on RocketRide Vector). With it off, the trash buttons are
+  disabled and say why. Adding
   documents is not governed by this switch: it goes through the Ingest source,
   and anyone with the data permission on the ingest task can add documents.
   Agents that use a store as a tool are unaffected; they have their own switch,

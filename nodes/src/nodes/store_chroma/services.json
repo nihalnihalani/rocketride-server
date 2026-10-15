@@ -215,11 +215,11 @@
 		},
 		"chroma.cloud": {
 			"object": "cloud",
-			"properties": ["vector.cloud.host", "vector.cloud.port", "vector.apikey", "chroma.tenant", "chroma.database", "vector.collection", "vector.top_k", "chroma.serverName", "chroma.ssl"]
+			"properties": ["vector.cloud.host", "vector.cloud.port", "vector.apikey", "chroma.tenant", "chroma.database", "vector.collection", "vector.top_k", "chroma.serverName", "chroma.ssl", "vector.allow_writes", "vector.agent_writes"]
 		},
 		"chroma.local": {
 			"object": "local",
-			"properties": ["vector.local.host", "vector.local.port", "vector.collection", "vector.top_k", "chroma.serverName"]
+			"properties": ["vector.local.host", "vector.local.port", "vector.collection", "vector.top_k", "chroma.serverName", "vector.allow_writes", "vector.agent_writes"]
 		},
 		//
 		// Profile selection for ChromaDB service

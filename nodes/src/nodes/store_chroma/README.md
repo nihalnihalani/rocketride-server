@@ -88,6 +88,21 @@ Use the bound provider for an agent that must add or search information without 
 
 This value namespaces the agent functions: `chroma.search`, `chroma.upsert`, and `chroma.delete` by default. Change it for distinct Chroma stores exposed to the same agent.
 
+### Write switches
+
+Allow document management from tool calls (`allow_writes`) is off by default.
+Turn it on in the pipeline whose Tools source should be able to remove
+documents from the collection, or add them with the `upsert` tool, through
+tool calls, for example the pipeline the Vector Explorer manages. Even when it
+is on, such a write is accepted only from a Tools source of the pipeline,
+addressed to this node; calls from the pipeline's chat or ingest sources are
+refused. Documents the pipeline's own lanes write are not affected by this
+switch.
+
+Allow writes from agents (`agent_writes`) is on by default and keeps an
+agent's `upsert` and `delete` calls working as before. Turn it off when the
+agents of this pipeline should only search.
+
 ## Authentication
 
 The cloud profile passes **API Key** to Chroma's token-authentication client. The local profile constructs the HTTP client without those authentication settings. A failed connection reports the host and port and points to connectivity, credentials, or an incompatible server as possible causes.

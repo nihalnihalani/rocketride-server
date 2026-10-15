@@ -246,7 +246,7 @@
 		{
 			"section": "Pipe",
 			"title": "Astra DB Vector Store",
-			"properties": ["astra_db.api_endpoint", "astra_db.application_token", "vector.score", "vector.collection", "astra_db.serverName"]
+			"properties": ["astra_db.api_endpoint", "astra_db.application_token", "vector.score", "vector.collection", "astra_db.serverName", "vector.allow_writes", "vector.agent_writes"]
 		},
 		{
 			"section": "Transform",

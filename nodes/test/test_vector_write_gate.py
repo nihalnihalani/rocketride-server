@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import re
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -358,6 +359,86 @@ def test_the_form_fields_default_to_the_same_constants():
     assert fields['vector.agent_writes']['type'] == 'boolean'
     assert fields['vector.agent_writes']['default'] is VECTOR_AGENT_WRITES_DEFAULT
     assert fields['vector.allow_writes']['title'] == 'Allow document management from tool calls'
+
+
+_NODES_DIR = _ROOT / 'nodes' / 'src' / 'nodes'
+
+#: The vector store nodes whose tools run the gate on ``vector.allow_writes`` / ``vector.agent_writes``
+#: (rocketride_vector has its own ``rrvector.*`` pair; Elasticsearch and OpenSearch have no explorer tools).
+_VECTOR_STORE_NODES = (
+    'store_postgres',
+    'store_qdrant',
+    'store_chroma',
+    'store_milvus',
+    'store_weaviate',
+    'store_pinecone',
+    'store_astra',
+    'store_atlas',
+)
+
+
+def _load_services(path: Path) -> dict:
+    """Read a services.json: JSON with // comments (outside strings) and trailing commas."""
+    text = path.read_text(encoding='utf-8')
+    out, i, in_string = [], 0, False
+    while i < len(text):
+        ch = text[i]
+        if in_string:
+            if ch == '\\':
+                out.append(text[i : i + 2])
+                i += 2
+                continue
+            if ch == '"':
+                in_string = False
+            out.append(ch)
+            i += 1
+            continue
+        if ch == '"':
+            in_string = True
+        elif text.startswith('//', i):
+            i = text.find('\n', i)
+            i = len(text) if i < 0 else i
+            continue
+        out.append(ch)
+        i += 1
+    return json.loads(re.sub(r',(\s*[}\]])', r'\1', ''.join(out)))
+
+
+def _settings_lists(services: dict) -> list:
+    """Every property list of a node's form that holds the store's own settings (the lists naming its collection)."""
+    lists = [
+        field['properties']
+        for field in services.get('fields', {}).values()
+        if isinstance(field, dict) and isinstance(field.get('properties'), list)
+    ]
+    lists += [
+        section['properties']
+        for section in services.get('shape', [])
+        if isinstance(section, dict) and isinstance(section.get('properties'), list)
+    ]
+    return [props for props in lists if any(isinstance(p, str) and p.endswith('.collection') for p in props)]
+
+
+def test_the_listed_store_nodes_are_every_vector_store_with_tools():
+    with_tools = {
+        path.parent.name
+        for path in _NODES_DIR.glob('*/services*.json')
+        if {'store', 'tool'} <= set(_load_services(path).get('classType') or [])
+    }
+    assert with_tools - {'rocketride_vector'} == set(_VECTOR_STORE_NODES)
+
+
+@pytest.mark.parametrize('node', _VECTOR_STORE_NODES)
+def test_every_vector_store_form_shows_both_write_switches(node):
+    services = _load_services(_NODES_DIR / node / 'services.json')
+    lists = _settings_lists(services)
+    assert lists, f'{node}: no form list names the collection'
+    for props in lists:
+        assert 'vector.allow_writes' in props, (node, props)
+        assert 'vector.agent_writes' in props, (node, props)
+    # The defaults live in vx_defaults only: no profile pins them.
+    for name, profile in services.get('preconfig', {}).get('profiles', {}).items():
+        assert 'allow_writes' not in profile and 'agent_writes' not in profile, (node, name)
 
 
 # ---------------------------------------------------------------------------
