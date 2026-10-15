@@ -301,12 +301,13 @@ export function ChunkTextSection(props: ChunkTextSectionProps): React.ReactEleme
 		if (!open) return;
 		props.onShowText?.(key);
 		if (!loadText) return;
+		// Whatever was asked before is no longer wanted, even when this key is already kept.
+		asked.current = `${sampleId}|${current}`;
 		const hit = chunkTexts.peek(sampleId, key);
 		if (hit) {
 			setLoaded({ text: hit, error: null });
 			return;
 		}
-		asked.current = `${sampleId}|${current}`;
 		setLoaded({ text: null, error: null });
 		const mine = asked.current;
 		void chunkTexts.load(sampleId, key, loadText).then((outcome) => {

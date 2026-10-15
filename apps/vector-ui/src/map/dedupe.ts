@@ -518,15 +518,18 @@ export function queued(found: readonly IDocumentGroup[], state: IQueueState, inf
 /** The registry map of reviewed documents (adapters/connections.ts `reviewedDocuments`). */
 export type ReviewedCache = Map<string, ReadonlySet<string>>;
 
+/** One empty set for every connection without reviewed documents (stable, so memoised views do not recompute). */
+const NONE_REVIEWED: ReadonlySet<string> = new Set<string>();
+
 /**
  * A connection's reviewed documents.
  *
  * @param cache - The registry map.
  * @param connectionKey - The connection.
- * @returns The set (empty when none).
+ * @returns The set (the same empty set when none).
  */
 export function reviewedOf(cache: ReviewedCache, connectionKey: string): ReadonlySet<string> {
-	return cache.get(connectionKey) ?? new Set<string>();
+	return cache.get(connectionKey) ?? NONE_REVIEWED;
 }
 
 /**

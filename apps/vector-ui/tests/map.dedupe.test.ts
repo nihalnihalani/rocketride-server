@@ -366,6 +366,7 @@ test("reviewed documents: per connection in the 'reviewed documents' cache, clea
 	unmarkReviewed(reviewedDocuments, 'conn-a', ['oa']);
 	assert.deepEqual([...reviewedOf(reviewedDocuments, 'conn-a')], ['ob']);
 	assert.deepEqual([...reviewedOf(reviewedDocuments, 'unknown')], []);
+	assert.equal(reviewedOf(reviewedDocuments, 'unknown'), reviewedOf(reviewedDocuments, 'other'), 'one stable empty set, so a memoised queue does not recompute on every render');
 	assert.ok(connectionCaches.names().includes('reviewed documents'));
 	connectionCaches.clearAll();
 	assert.equal(reviewedDocuments.size, 0);
