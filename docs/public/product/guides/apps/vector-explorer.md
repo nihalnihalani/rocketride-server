@@ -297,8 +297,11 @@ with the reason, when the store node cannot sample; the console is unaffected.
   least as well as PCA; otherwise the map says "Neighbour layout did not improve
   on PCA for this sample". **t-SNE** is offered up to 1,000 points. Both have a
   time limit and **Cancel**. The legend reminds you that 2D distance is
-  approximate; ranks and scores are exact. On Qdrant the neighbour graph is
-  computed by Qdrant, and the legend says "neighbour graph computed by Qdrant".
+  approximate; ranks and scores are exact. On Qdrant the neighbour graph of a
+  sample of up to 500 points is computed by Qdrant, and the legend says
+  "neighbour graph computed by Qdrant"; a larger sample, such as the default
+  1,000 points, gets the store node's graph, and the legend says "neighbour
+  graph computed by the store node".
 - **Query.** Type text and **Run**: the text is embedded by the pipeline's
   embedding node, drawn as a star, and joined by rays to its true top results
   from the whole collection, not only from the sample. This needs the embedding

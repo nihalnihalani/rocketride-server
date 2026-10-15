@@ -181,7 +181,9 @@ first; chat answers linked to the chunks they used; removing a whole document
 with the number of rows removed reported; near-duplicate and outlier chunks
 listed; and the same console for every store. The map draws at most 2,000
 points with text, or 5,000 without; Qdrant's own visualiser draws more points.
-On Qdrant the neighbour graph of the map is computed by Qdrant itself.
+On Qdrant the neighbour graph of a sample of up to 500 points is computed by
+Qdrant itself; a larger sample, such as the default 1,000, gets the store
+node's graph, and the legend says which one computed it.
 
 ## Limits
 

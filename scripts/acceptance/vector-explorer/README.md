@@ -256,7 +256,7 @@ What G4 asks and where it is checked:
 | keyboard sector path and Table alternative | map lane: keyboard (each move checked against the sample's PCA coordinates), table |
 | t-SNE refuses above 1,000; Cancel stops a layout | map lane on `qdrant_pager` |
 | force layout kept only when kNN overlap >= PCA's | map lane: kNN overlap (both numbers in the lane JSON) |
-| Qdrant legend says "neighbour graph computed by Qdrant" | map lane: legend |
+| Qdrant legend says "neighbour graph computed by Qdrant" (a sample of up to 500 points; a larger one gets the store node's graph) | map lane: legend |
 | privacy property | both lanes, with `dialect.dimension` read from the store; the columns of a `sample`, `project` or `neighbors` answer (`points.*`, `density`, `knn.sims`, `similarities`, `scores`) are not counted as vectors when they hold exactly the answer's own count (the sample's `n`, its edge count, the named sample's `n`, the scope's length), so a dimension-long float array there is still caught |
 | `a11y.contrast` in six themes | the app's unit test `tests/a11y.contrast.map.test.ts` |
 | 2,000 points at 4x throttle, p95 frame <= 33 ms | the performance lane `browser/lane_vector_perf.cjs` (the map lane does not measure frame times) |

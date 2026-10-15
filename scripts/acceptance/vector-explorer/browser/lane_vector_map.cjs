@@ -41,7 +41,7 @@
  *     at least PCA's, else PCA stays with the sentence; both numbers are
  *     recorded in the lane JSON
  *   legend: "neighbour graph computed by Qdrant" when the sample's kNN graph
- *     is Qdrant's own
+ *     is Qdrant's own (Qdrant computes it for samples of up to 500 points)
  *   t-SNE: refused for a sample above 1,000 points, offered at 1,000
  *     (qdrant_pager)
  *   Cancel: stops a running layout and leaves PCA (qdrant_pager)

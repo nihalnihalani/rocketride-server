@@ -223,6 +223,25 @@ test('the README served with the app links only to absolute URLs or its own head
 	assert.ok(/not installed with the app/.test(readme), 'and the README says they do not come with it');
 });
 
+test("the README and the user guide give Qdrant's own neighbour graph the driver's sample limit", () => {
+	const driver = fs.readFileSync(path.join(REPO_ROOT, 'nodes', 'src', 'nodes', 'store_qdrant', 'qdrant.py'), 'utf8');
+	const max = /^\s*NATIVE_KNN_MAX = (\d+)\s*$/m.exec(driver);
+	assert.ok(max, 'the premise: the driver names its limit');
+	const limit = `up to ${Number(max[1]).toLocaleString('en-US')} points`;
+	for (const doc of ['apps/vector-ui/README.md', 'docs/public/product/guides/apps/vector-explorer.md']) {
+		const paragraphs = fs
+			.readFileSync(path.join(REPO_ROOT, doc), 'utf8')
+			.split(/\n\s*\n/)
+			.map((paragraph) => paragraph.replace(/\s+/g, ' '));
+		const about = paragraphs.filter((paragraph) => /computed by Qdrant/.test(paragraph));
+		assert.ok(about.length > 0, `${doc} says when Qdrant computes the neighbour graph`);
+		for (const paragraph of about) {
+			assert.ok(paragraph.includes(limit), `${doc}: "${paragraph.slice(0, 120)}…" names the limit (${limit})`);
+			assert.match(paragraph, /store node/, `${doc}: and that a larger sample gets the store node's graph`);
+		}
+	}
+});
+
 test('the labeler tags a change under apps/vector-ui as a UI change', () => {
 	const labeler = readLf(path.join(REPO_ROOT, '.github', 'labeler.yml'));
 	const ui = labeler.slice(labeler.indexOf('module:ui:'), labeler.indexOf('\n\n', labeler.indexOf('module:ui:')));
