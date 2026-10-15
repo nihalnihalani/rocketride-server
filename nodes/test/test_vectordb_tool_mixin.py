@@ -37,13 +37,14 @@ from typing import Any, Callable, Dict, List, Optional
 
 import numpy as np
 import pytest
-from rocketlib import IInstanceBase
+from rocketlib import IInstanceBase, tool_function
 
 from ai.common.schema import Doc, DocMetadata
 from ai.common.store import StoreInstanceBase, VectorStoreToolMixin, vx_tools, vx_write_gate
 from ai.common.store import document_store as _store_module
 from ai.common.store.errors import StoreUnsupported
 from ai.common.store.vx_defaults import VECTOR_TOOL_LIMITS
+from ai.common.store.vx_tools_ext import VectorExplorerExtTools
 from ai.common.store.vx_types import DocPage, DocumentRow
 
 from .test_vector_hooks import (
@@ -249,6 +250,29 @@ def test_normalize_non_dict_json_returns_empty() -> None:
 _LEGACY_TOOLS = {'search', 'upsert', 'delete', 'objdir', 'stats', 'get'}
 _EXPLORER_TOOLS = {'dialect', 'documents', 'chunks', 'vectors', 'sample', 'project', 'neighbors', 'remove_document'}
 _EXPECTED_TOOLS = _LEGACY_TOOLS | _EXPLORER_TOOLS
+# The additive tools of the extension contract (recommend and similarity_matrix). A node
+# lists them once ``VectorExplorerExtTools`` defines them, and never lists any other tool.
+_ADDITIVE_TOOLS = {'recommend', 'similarity_matrix'}
+
+
+def _ext_tools() -> set:
+    """The tools ``VectorExplorerExtTools`` defines (none until the additive tools land)."""
+    declared = {name for name, attr in vars(VectorExplorerExtTools).items() if hasattr(attr, '__tool_meta__')}
+    assert declared <= _ADDITIVE_TOOLS, f'not an additive tool of the contract: {sorted(declared - _ADDITIVE_TOOLS)}'
+    return declared
+
+
+def _assert_tool_names(names: Any, ext: Any = None) -> None:
+    """Assert a node lists exactly the legacy and explorer tools plus the additive tools in ``ext``.
+
+    ``ext`` defaults to the tools ``VectorExplorerExtTools`` defines, so the check holds
+    whether or not the additive tools have landed, and refuses any other tool.
+    """
+    names, ext = set(names), (_ext_tools() if ext is None else set(ext))
+    assert ext <= _ADDITIVE_TOOLS, f'not an additive tool of the contract: {sorted(ext - _ADDITIVE_TOOLS)}'
+    expected = _EXPECTED_TOOLS | ext
+    assert names <= expected, f'unexpected tools: {sorted(names - expected)}'
+    assert expected <= names, f'missing tools: {sorted(expected - names)}'
 
 
 def test_collect_tool_methods_returns_bare_names() -> None:
@@ -256,7 +280,7 @@ def test_collect_tool_methods_returns_bare_names() -> None:
     instance = FakeIInstance(FakeIGlobal(store=FakeStore(), server_name='myvdb'))
     methods = instance._collect_tool_methods()
 
-    assert set(methods.keys()) == _EXPECTED_TOOLS
+    _assert_tool_names(methods)
     # Each value is a callable bound to the fake instance
     for bound in methods.values():
         assert callable(bound)
@@ -266,7 +290,7 @@ def test_collect_tool_methods_bare_names_regardless_of_provider() -> None:
     """Bare names must be identical regardless of the provider / serverName."""
     instance = FakeIInstance(FakeIGlobal(store=FakeStore(), logical_type='chroma'))
     methods = instance._collect_tool_methods()
-    assert set(methods.keys()) == _EXPECTED_TOOLS
+    _assert_tool_names(methods)
 
 
 def test_collect_tool_methods_bare_names_when_no_globals() -> None:
@@ -276,7 +300,7 @@ def test_collect_tool_methods_bare_names_when_no_globals() -> None:
     orphan = object.__new__(Orphan)
     orphan.IGlobal = None
     methods = orphan._collect_tool_methods()
-    assert set(methods.keys()) == _EXPECTED_TOOLS
+    _assert_tool_names(methods)
 
 
 def test_two_instances_share_bare_names() -> None:
@@ -289,7 +313,50 @@ def test_two_instances_share_bare_names() -> None:
 
     names_a = set(a._collect_tool_methods().keys())
     names_b = set(b._collect_tool_methods().keys())
-    assert names_a == names_b == _EXPECTED_TOOLS
+    assert names_a == names_b
+    _assert_tool_names(names_a)
+
+
+def _stub_tool() -> Callable:
+    """A DAP-only tool that does nothing, to give a test node an extra tool name."""
+
+    @tool_function(input_schema={'type': 'object'}, description='stub', audience=('dap',))
+    def stub(self, args: Any = None) -> Dict[str, Any]:
+        return {'success': True}
+
+    return stub
+
+
+def test_tool_name_check_takes_the_additive_tools_and_refuses_any_other(monkeypatch) -> None:
+    """The tool-name check accepts the contract's additive tools and nothing else.
+
+    A node lists ``recommend`` and ``similarity_matrix`` once ``VectorExplorerExtTools``
+    defines them; the check must hold both before and after that, and must still
+    refuse a tool outside the legacy, explorer and additive sets.
+    """
+
+    class WithAdditive(FakeIInstance):
+        recommend = _stub_tool()
+        similarity_matrix = _stub_tool()
+
+    class WithStray(FakeIInstance):
+        frobnicate = _stub_tool()
+
+    with_additive = WithAdditive(FakeIGlobal(store=FakeStore()))._collect_tool_methods()
+    _assert_tool_names(with_additive, ext=_ADDITIVE_TOOLS)
+    with pytest.raises(AssertionError, match='recommend'):
+        _assert_tool_names(with_additive, ext=())
+
+    stray = WithStray(FakeIGlobal(store=FakeStore()))._collect_tool_methods()
+    with pytest.raises(AssertionError, match='frobnicate'):
+        _assert_tool_names(stray)
+    with pytest.raises(AssertionError, match='frobnicate'):
+        _assert_tool_names(stray, ext=_ADDITIVE_TOOLS)
+
+    # A tool the extension class defines outside the contract's additive names is refused too.
+    monkeypatch.setattr(VectorExplorerExtTools, 'frobnicate', _stub_tool(), raising=False)
+    with pytest.raises(AssertionError, match='frobnicate'):
+        _ext_tools()
 
 
 # ---------------------------------------------------------------------------
