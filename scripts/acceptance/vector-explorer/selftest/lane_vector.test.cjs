@@ -69,3 +69,34 @@ test('run by vector-ui:e2e-live (<url> <out-dir> <browser> [backends]) the lane 
 	assert.deepStrictEqual(lane.laneArgs(['http://h', '/tmp/e', 'chrome'], { VECTOR_UI_E2E_BACKENDS: 'chroma' }).fixtures, ['chroma']);
 	assert.deepStrictEqual(lane.laneArgs(['http://h', '/tmp/e', 'firefox'], {}).fixtures, ['postgres', 'rocketride_vector', 'qdrant', 'chroma']);
 });
+
+test('a watched load passes only with the progress line, no reshuffle while it shows, and every document at the end', () => {
+	// What the 1,500-document fixture shows (three pages of 500), recorded change by change.
+	const seen = [
+		{ loading: null, first: null },
+		{ loading: 'Loading documents…', first: null },
+		{ loading: 'Loading documents… 500 of 1,500', first: 'note-0073.txt' },
+		{ loading: 'Loading documents… 1,000 of 1,500', first: 'note-0073.txt' },
+		// Re-sorted once, when loading completes (APP_SPEC 3.2): not a reshuffle.
+		{ loading: null, first: 'note-0001.txt' },
+	];
+	assert.strictEqual(lane.loadVerdict(seen, 1500, 1500), true);
+	assert.match(lane.loadVerdict(seen, 1000, 1500), /shows 1000 documents/);
+	assert.match(lane.loadVerdict([{ loading: null, first: 'note-0001.txt' }], 1500, 1500), /never showed/);
+	assert.match(
+		lane.loadVerdict(
+			seen.filter((r) => !/ of /.test(r.loading || '')),
+			1500,
+			1500
+		),
+		/no "N of 1,500"/
+	);
+	const reshuffle = [seen[1], seen[2], { loading: 'Loading documents… 1,000 of 1,500', first: 'note-0001.txt' }, seen[4]];
+	assert.match(lane.loadVerdict(reshuffle, 1500, 1500), /note-0073\.txt -> note-0001\.txt/);
+	assert.match(lane.loadVerdict(seen.slice(0, 4), 1500, 1500), /still loading/);
+});
+
+test("the per-backend children of an e2e-live run keep the runner's Node options (e.g. a -r preload)", () => {
+	assert.deepStrictEqual(lane.childArgv(['-r', '/x/preload.cjs'], '/lane.cjs', ['http://h', '/out/qdrant', 'qdrant']), ['-r', '/x/preload.cjs', '/lane.cjs', 'http://h', '/out/qdrant', 'qdrant']);
+	assert.deepStrictEqual(lane.childArgv([], '/lane.cjs', ['a']), ['/lane.cjs', 'a']);
+});

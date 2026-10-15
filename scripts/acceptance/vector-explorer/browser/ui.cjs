@@ -20,15 +20,19 @@
 const CONSOLE = {
 	launcher: 'Open Vector Explorer',
 	openConsole: [/^Open console$/i, /^Open documents$/i, /^Open$/i],
-	statsDocuments: /Documents\s*\n?\s*([\d,]+)/,
 	directoryCount: /([\d,]+)\s+documents/,
-	chunksAdded: /([\d,]+)\s+chunks?\s+added/,
 	replace: /Replace existing/,
 	chatBox: /Ask about these documents/i,
 	askButton: /^Ask$/,
-	sourceOpen: /^open$/i,
+	// The answer's cited chunks; each "open" button is named "Open <path> at chunk <n>" (label in name).
+	sources: 'Sources of this answer',
+	sourceOpen: /^open\b/i,
+	sourceTarget: /^Open (.+) at chunk (\d+)$/,
 	trash: (p) => `Remove ${p} from the database`,
 	removeConfirm: 'Remove document',
+	// A shared rocketride_vector table asks for its name typed before "Remove document" is enabled.
+	typedConfirm: /Type the table name '([^']+)' to confirm/,
+	filterPaths: 'Filter paths…',
 	cancel: 'Cancel',
 	loading: /Loading documents…/,
 	readOnly: /Read-only/,
@@ -36,9 +40,16 @@ const CONSOLE = {
 	signIn: /sign in/i,
 	consoleTab: /^Console$/,
 	mapTab: /^Map$/,
+	// The shell tab of the landing (the tabs above the panes; consoles and documents get their own).
+	connectionsTab: 'Connections',
+	// The stats strip's figures (data-figure on each value) and the upload list (one row per file).
+	statsFigure: (key) => `[data-figure="${key}"]`,
+	uploads: 'ul[aria-label="Uploads"] > li[data-status]',
 };
 
 const MAP = {
+	// The Map view's root: one per open connection, only the one in front is visible.
+	root: '.vector-map',
 	// The PointCanvas root carries the number of points it drew and the state of its marks.
 	canvas: '[data-points]',
 	attr: {

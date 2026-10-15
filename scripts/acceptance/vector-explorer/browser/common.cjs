@@ -312,11 +312,93 @@ async function bodyText(page) {
 	return typeof text === 'string' ? text : '';
 }
 
-/** Click a view switch ("Console", "Map") or a panel tab: a tab, or a button where the app uses buttons. */
+/**
+ * Click a view switch ("Console", "Map") or a panel tab: a tab, or a button where the app uses buttons.
+ * Only a visible one counts: every open connection keeps its console mounted (hidden) behind the one in front.
+ */
 async function switchView(page, name) {
-	const tab = page.getByRole('tab', { name }).first();
+	const tab = page.getByRole('tab', { name }).filter({ visible: true }).first();
 	if (await tab.isVisible().catch(() => false)) return tab.click();
-	return page.getByRole('button', { name }).first().click();
+	return page.getByRole('button', { name }).filter({ visible: true }).first().click();
+}
+
+/** A shell tab by its label: the tabs above the panes (the Connections landing, each console, each document). */
+function shellTab(page, label) {
+	return page.locator('div[draggable="true"]').getByText(label, { exact: true }).first();
+}
+
+/** A stats-strip figure as shown ('1,500'): the number, or null while it shows none ('…', '—', ''). */
+function figureNumber(text) {
+	const t = typeof text === 'string' ? text.trim() : '';
+	return /^\d{1,3}(,\d{3})*$|^\d+$/.test(t) ? Number(t.replace(/,/g, '')) : null;
+}
+
+/**
+ * A figure of the stats strip in front (data-figure="<key>"), as a number; null when there is none yet.
+ * Read from the strip's own element: a regex over the page text also matches the directory's
+ * "Documents" header, and a hidden console's strip is not the one shown.
+ */
+async function statsFigure(page, key) {
+	const text = await page.evaluate((selector) => {
+		const shown = [...document.querySelectorAll(selector)].find((el) => el.getClientRects().length > 0);
+		return shown ? shown.textContent : '';
+	}, CONSOLE.statsFigure(key));
+	return figureNumber(text);
+}
+
+/** Wait (at most `timeout` ms) until the stats strip in front shows a number for `key`, optionally `value`. */
+async function waitForStatsFigure(page, key, timeout, value = null) {
+	await page.waitForFunction(
+		([selector, want]) => {
+			const shown = [...document.querySelectorAll(selector)].find((el) => el.getClientRects().length > 0);
+			const t = shown ? shown.textContent.trim() : '';
+			if (!/^\d{1,3}(,\d{3})*$|^\d+$/.test(t)) return false;
+			return want === null || Number(t.replace(/,/g, '')) === want;
+		},
+		[CONSOLE.statsFigure(key), value],
+		{ timeout }
+	);
+}
+
+/** The rows of the upload list in front: { path, status } (status is the row's data-status). */
+async function uploadRows(page) {
+	const rows = await page.evaluate((selector) => [...document.querySelectorAll(selector)].filter((li) => li.getClientRects().length > 0).map((li) => ({ path: (li.querySelector('span[title]') || {}).title || '', status: li.getAttribute('data-status') })), CONSOLE.uploads);
+	return Array.isArray(rows) ? rows : [];
+}
+
+/**
+ * Wait (at most `timeout` ms) until the upload list in front has a finished row (done, failed, refused,
+ * cancelled) for every path ending with one of `suffixes`, then return the rows. Each row is matched by
+ * its own path: a count of "chunks added" anywhere in the page also matches the polite announcement.
+ */
+async function waitForUploads(page, suffixes, timeout) {
+	await page
+		.waitForFunction(
+			([selector, ends]) => {
+				const rows = [...document.querySelectorAll(selector)].filter((li) => li.getClientRects().length > 0);
+				const finished = (li) => ['done', 'failed', 'refused', 'cancelled'].includes(li.getAttribute('data-status'));
+				return ends.every((end) => rows.some((li) => ((li.querySelector('span[title]') || {}).title || '').endsWith(end) && finished(li)));
+			},
+			[CONSOLE.uploads, suffixes],
+			{ timeout }
+		)
+		.catch(() => {});
+	return uploadRows(page);
+}
+
+/** Whether every path ending with one of `suffixes` has a row that is done. */
+function uploadsDone(rows, suffixes) {
+	return suffixes.every((end) => rows.some((row) => row.path.endsWith(end) && row.status === 'done'));
+}
+
+/** Wait (at most `timeout` ms, polling) until the page text matches `pattern`; whether it did. */
+async function waitForText(page, pattern, timeout) {
+	const deadline = Date.now() + timeout;
+	for (;;) {
+		if (pattern.test(await bodyText(page))) return true;
+		if (Date.now() > deadline) return false;
+		await sleep(100);
+	}
 }
 
 async function focusedText(page) {
@@ -348,19 +430,26 @@ async function textOf(locator) {
 	return typeof v === 'string' ? v : '';
 }
 
-/** From the connections landing: open a fixture's connection on its console. */
+/**
+ * Open a fixture's connection on its console, from wherever the page is: the launcher, the
+ * Connections landing, or another connection's console or a document tab (the landing's shell tab
+ * is brought to the front first). A console already open is focused, not opened twice. Returns once
+ * the console's stats strip shows its document count.
+ */
 async function openConnection(page, fixture) {
 	const launcher = page.getByRole('button', { name: CONSOLE.launcher });
 	if (await launcher.isVisible().catch(() => false)) await launcher.click();
-	await page.getByText(fixture.name).first().click();
+	const landing = shellTab(page, CONSOLE.connectionsTab);
+	if (await landing.isVisible().catch(() => false)) await landing.click();
+	await page.getByText(fixture.name).filter({ visible: true }).first().click();
 	for (const name of CONSOLE.openConsole) {
-		const button = page.getByRole('button', { name }).first();
+		const button = page.getByRole('button', { name }).filter({ visible: true }).first();
 		if (await button.isVisible().catch(() => false)) {
 			await button.click();
 			break;
 		}
 	}
-	await page.getByText(CONSOLE.statsDocuments).first().waitFor({ timeout: 60000 });
+	await waitForStatsFigure(page, 'documents', 60000);
 }
 
 module.exports = {
@@ -381,6 +470,14 @@ module.exports = {
 	storeClient,
 	bodyText,
 	switchView,
+	shellTab,
+	figureNumber,
+	statsFigure,
+	waitForStatsFigure,
+	uploadRows,
+	waitForUploads,
+	uploadsDone,
+	waitForText,
 	focusedText,
 	attrInt,
 	attrNum,

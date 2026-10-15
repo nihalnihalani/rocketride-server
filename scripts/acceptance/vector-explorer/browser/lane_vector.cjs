@@ -51,7 +51,7 @@
  * browser and backend, to <out-dir>/lane_vector.json. It drives Google Chrome only.
  */
 'use strict';
-/* global document, localStorage, sessionStorage */
+/* global document, localStorage, sessionStorage, window, MutationObserver */
 const E = require('../env.cjs');
 const C = require('./common.cjs');
 const { CONSOLE: UI } = require('./ui.cjs');
@@ -101,6 +101,40 @@ function sentWrites(frames) {
 }
 
 /**
+ * Runs in the page: record { loading, first } on every DOM change while documents load, where
+ * loading is the "Loading documents…" line (null when none) and first the first note-NNNN.txt row
+ * shown (null when none). Kept in window.__vxLoading, one entry per change of either.
+ */
+function watchLoading() {
+	window.__vxLoading = [];
+	const look = () => {
+		const text = document.body.innerText;
+		const line = /Loading documents…[^\n]*/.exec(text);
+		const row = { loading: line ? line[0] : null, first: text.split('\n').find((l) => /note-\d{4}\.txt/.test(l)) || null };
+		const last = window.__vxLoading[window.__vxLoading.length - 1];
+		if (!last || last.loading !== row.loading || last.first !== row.first) window.__vxLoading.push(row);
+	};
+	new MutationObserver(look).observe(document.body, { subtree: true, childList: true, characterData: true });
+}
+
+/**
+ * The verdict on a watched load of `expected` documents: true, or why not. The progress line must
+ * show with "N of <expected>", the first row must not change while it shows (reshuffled), and the
+ * directory must end with every document listed and nothing loading.
+ */
+function loadVerdict(seen, shown, expected) {
+	const during = seen.filter((r) => r.loading !== null);
+	if (!during.length) return 'the progress line never showed';
+	const total = expected.toLocaleString('en-US');
+	if (!during.some((r) => new RegExp(`of\\s+${total}\\b`).test(r.loading))) return `no "N of ${total}" progress line`;
+	const problem = reshuffled(during.map((r) => r.first));
+	if (problem) return problem;
+	const last = seen[seen.length - 1];
+	if (!last || last.loading !== null) return 'documents were still loading at the end';
+	return shown === expected ? true : `the directory shows ${shown} documents`;
+}
+
+/**
  * Why the first rows seen while documents loaded show a reshuffle (null when
  * they do not). Looks before the first row rendered (null) are ignored; after
  * it, any other first row (or none) is a reshuffle.
@@ -130,10 +164,8 @@ async function main() {
 	const page = await context.newPage();
 	page.setDefaultTimeout(30000);
 	const capture = C.captureFrames(page);
-	const statsDocuments = async () => {
-		const m = UI.statsDocuments.exec(await C.bodyText(page));
-		return m ? Number(m[1].replace(/,/g, '')) : null;
-	};
+	// The document count of the stats strip in front (null while it shows none).
+	const statsDocuments = () => C.statsFigure(page, 'documents');
 	const uploadFiles = (files) => page.locator('input[type="file"]:not([webkitdirectory])').first().setInputFiles(files);
 	const uploadFolder = (dir) => page.locator('input[type="file"][webkitdirectory]').first().setInputFiles(dir);
 	const own = { single: `lane-${RUN}.md`, folder: `lane-${RUN}`, nested: `lane-${RUN}/nested/deeper/note.md`, reportA: `lane-${RUN}/a/report.pdf`, reportB: `lane-${RUN}/b/report.pdf` };
@@ -166,9 +198,10 @@ async function main() {
 			const file = path.join(work, own.single);
 			fs.writeFileSync(file, `# Lane note ${RUN}\n\nThe lane uploads this note to check the ingest panel. Glassbrook spring feeds the settling tank.\n`);
 			await uploadFiles([file]);
-			await page.getByText(UI.chunksAdded).first().waitFor({ timeout: 120000 });
+			const rows = await C.waitForUploads(page, [own.single], 120000);
+			if (!C.uploadsDone(rows, [own.single])) return `the upload row did not finish as done: ${JSON.stringify(rows.slice(-3))}`;
 			if (!(await storeHas(own.single))) return 'the store does not have the uploaded document';
-			await page.waitForFunction((n) => /Documents\s*\n?\s*([\d,]+)/.test(document.body.innerText) && Number(/Documents\s*\n?\s*([\d,]+)/.exec(document.body.innerText)[1].replace(/,/g, '')) === n, before + 1, { timeout: 30000 });
+			await C.waitForStatsFigure(page, 'documents', 30000, before + 1).catch(() => {});
 			return (await statsDocuments()) === before + 1 ? true : `stats show ${await statsDocuments()}, expected ${before + 1}`;
 		});
 
@@ -177,12 +210,14 @@ async function main() {
 			fs.mkdirSync(path.dirname(file), { recursive: true });
 			fs.writeFileSync(file, `# Nested note ${RUN}\n\nA note two folders deep.\n`);
 			await uploadFolder(path.join(work, own.folder));
-			await page.getByText(UI.chunksAdded).nth(1).waitFor({ timeout: 120000 });
+			// Wait for the nested file's own row: the polite announcement also says "chunks added".
+			const rows = await C.waitForUploads(page, [own.nested], 120000);
+			if (!C.uploadsDone(rows, [own.nested])) return `the nested file's row did not finish as done: ${JSON.stringify(rows.filter((r) => r.path.endsWith('note.md')))}`;
 			if (!(await storeHas(own.nested))) return `the store has no document named ${own.nested}`;
 			return (await C.bodyText(page)).includes('deeper') ? true : 'the directory does not show the nested folder';
 		});
 
-		await step(page, 'two report.pdf files land on two rows, each attributed to its own document', async () => {
+		await step(page, 'two report.pdf files land on two rows, each attributed to its own document', async (note) => {
 			const dir = path.join(work, `${own.folder}-reports`, own.folder);
 			for (const [sub, word] of [
 				['a', 'alpha'],
@@ -193,9 +228,11 @@ async function main() {
 			}
 			fs.rmSync(path.join(work, own.folder), { recursive: true, force: true });
 			await uploadFolder(dir);
-			await page.waitForTimeout(1000);
-			const rows = await page.getByText(/report\.pdf/).count();
-			if (rows < 2) return `${rows} rows name report.pdf`;
+			// The two same-named files go out one after the other (DA3-17): wait until both rows are finished.
+			const rows = (await C.waitForUploads(page, [own.reportA, own.reportB], 180000)).filter((r) => /report\.pdf$/.test(r.path));
+			note({ rows });
+			if (rows.length < 2) return `${rows.length} upload rows name report.pdf`;
+			if (!C.uploadsDone(rows, [own.reportA, own.reportB])) return `the report.pdf rows did not both finish as done: ${JSON.stringify(rows)}`;
 			for (const [name, word] of [
 				[own.reportA, 'alpha'],
 				[own.reportB, 'bravo'],
@@ -235,21 +272,35 @@ async function main() {
 		// The LAN origin needs the engine listening on that address (LAN_URL, e.g. http://<this host's address>:5590).
 		await replaceStep('LAN origin', process.env.LAN_URL || null);
 
-		await step(page, 'a chat answer carries sources and "open" lands on the chunk', async () => {
-			await page.getByRole('textbox', { name: UI.chatBox }).first().fill(E.WATER_QUESTION);
-			await page.getByRole('button', { name: UI.askButton }).first().click();
+		await step(page, 'a chat answer carries sources and "open" lands on the chunk', async (note) => {
+			await page.getByRole('textbox', { name: UI.chatBox }).filter({ visible: true }).first().fill(E.WATER_QUESTION);
+			await page.getByRole('button', { name: UI.askButton }).filter({ visible: true }).first().click();
 			await page.getByText(E.STUB_LLM_TAG).first().waitFor({ timeout: 120000 });
 			if (!(await C.bodyText(page)).includes(E.STUB_LLM_TAG)) return 'no stub answer is shown';
-			const opens = page.getByRole('button', { name: UI.sourceOpen });
+			const opens = page.getByRole('list', { name: UI.sources }).filter({ visible: true }).first().getByRole('button', { name: UI.sourceOpen });
 			if ((await opens.count()) < 1) return 'the answer shows no source';
+			const label = await opens.first().getAttribute('aria-label');
+			const target = UI.sourceTarget.exec(label || '');
+			if (!target) return `the first source's "open" is named ${JSON.stringify(label)}`;
 			await opens.first().click();
-			await page.waitForTimeout(1000);
-			return /#\s?\d+|chunk/i.test(await C.bodyText(page)) ? true : 'no chunk shown after open';
+			// The document tab in front shows that chunk (its row carries data-chunk).
+			const shown = (n) => [...document.querySelectorAll(`[data-document] [data-chunk="${n}"]`)].some((el) => el.getClientRects().length > 0);
+			await page.waitForFunction(shown, Number(target[2]), { timeout: 30000 }).catch(() => {});
+			const landed = await page.evaluate(shown, Number(target[2]));
+			note({ source: label, landed });
+			return landed === true ? true : `no chunk #${target[2]} of ${target[1]} is shown after open`;
 		});
 
-		await step(page, 'trash: Cancel focused and sending nothing, Confirm removes exactly that document', async () => {
+		await step(page, 'trash: Cancel focused and sending nothing, Confirm removes exactly that document', async (note) => {
+			// The chat step's "open" left a document tab in front: back to this connection's console.
+			await C.openConnection(page, fixture);
 			const shown = await statsDocuments();
-			const trash = page.getByRole('button', { name: UI.trash(own.single) }).first();
+			// The directory renders only the rows in view: filter it to the lane's document so its row is there.
+			await page.getByPlaceholder(UI.filterPaths).filter({ visible: true }).first().fill(own.single);
+			const trash = page
+				.getByRole('button', { name: UI.trash(own.single) })
+				.filter({ visible: true })
+				.first();
 			const since = capture.frames.length;
 			await trash.click();
 			await page.getByRole('button', { name: UI.removeConfirm }).first().waitFor({ timeout: 15000 });
@@ -262,33 +313,37 @@ async function main() {
 			if (sent.length) return `the page sent ${sent.join(', ')} although Cancel was chosen`;
 			if (!(await storeHas(own.single))) return 'Cancel removed the document';
 			await trash.click();
-			await page.getByRole('button', { name: UI.removeConfirm }).first().click();
+			const confirm = page.getByRole('button', { name: UI.removeConfirm }).first();
+			await confirm.waitFor({ timeout: 15000 });
+			// A shared rocketride_vector table asks for its name typed first; Remove stays disabled until then.
+			const typed = UI.typedConfirm.exec(await C.bodyText(page));
+			note({ typed: typed ? typed[1] : null });
+			if (fixtureKey === 'rocketride_vector' && !typed) return 'the shared table asked for no typed table name';
+			if (typed) {
+				if (!(await confirm.isDisabled())) return 'Remove is enabled before the table name is typed';
+				await page.getByRole('textbox', { name: UI.typedConfirm }).first().fill(typed[1]);
+			}
+			await confirm.click();
 			await page.waitForTimeout(2000);
 			if (await storeHas(own.single)) return 'Confirm did not remove the document';
 			if (!(await storeHas(own.nested))) return 'Confirm removed another document';
+			if (shown !== null) await C.waitForStatsFigure(page, 'documents', 30000, shown - 1).catch(() => {});
 			const after = await statsDocuments();
 			return shown !== null && after === shown - 1 ? true : `stats ${shown} -> ${after}`;
 		});
 
-		await step(page, 'the 1,500-document store loads to completion without reshuffling', async () => {
-			await C.openConnection(page, E.FIXTURES.qdrant_pager).catch(() => {});
-			await page.getByText(UI.loading).first().waitFor({ timeout: 60000 });
-			const firstRow = async () => (await C.bodyText(page)).split('\n').find((l) => /note-\d{4}\.txt/.test(l)) || null;
-			// Look at the first row again and again while "Loading documents…" is shown.
-			const looks = [];
-			const deadline = Date.now() + 120000;
-			while (Date.now() < deadline && (await page.getByText(UI.loading).count()) > 0 && looks.length < 400) {
-				looks.push(await firstRow());
-				// The first page is in before the progress line shows; 5 s without a row is a failure.
-				if (looks.length >= 20 && looks.every((r) => r === null)) break;
-				await C.sleep(250);
-			}
-			const problem = reshuffled(looks);
-			if (problem) return problem;
-			await page.getByText(UI.loading).first().waitFor({ state: 'detached', timeout: 120000 });
+		await step(page, 'the 1,500-document store loads to completion without reshuffling', async (note) => {
+			// The whole load can take under a second, too fast to poll: record every change of the progress
+			// line and of the first row from before the connection opens.
+			await page.evaluate(watchLoading);
+			await C.openConnection(page, E.FIXTURES.qdrant_pager);
+			await page.waitForFunction(() => !/Loading documents…/.test(document.body.innerText), null, { timeout: 120000 }).catch(() => {});
+			const seen = await page.evaluate(() => window.__vxLoading || null);
 			const m = UI.directoryCount.exec(await C.bodyText(page));
 			const n = m ? Number(m[1].replace(/,/g, '')) : null;
-			return n === E.PAGER_DOCUMENTS ? true : `the directory shows ${n} documents`;
+			const verdict = loadVerdict(Array.isArray(seen) ? seen : [], n, E.PAGER_DOCUMENTS);
+			note({ seen, n });
+			return verdict;
 		});
 
 		await step(page, 'sign-out leaves no task token in the page storage', async () => {
@@ -329,6 +384,14 @@ async function main() {
 }
 
 /**
+ * The argv of a per-backend child: this process's own Node options first (e.g. a -r preload or
+ * --inspect given to the runner), then the script and its arguments.
+ */
+function childArgv(execArgv, script, args) {
+	return [...execArgv, script, ...args];
+}
+
+/**
  * A vector-ui:e2e-live run: the lane once per backend, each in its own process and folder, then
  * every row (with its browser and backend) in <out>/lane_vector.json.
  *
@@ -346,7 +409,7 @@ function runForE2e(args) {
 		const sub = path.join(args.out, key);
 		const file = path.join(sub, 'lane_vector.json');
 		fs.rmSync(file, { force: true });
-		const run = spawnSync(process.execPath, [__filename, args.base, sub, key], { stdio: 'inherit', env: process.env });
+		const run = spawnSync(process.execPath, childArgv(process.execArgv, __filename, [args.base, sub, key]), { stdio: 'inherit', env: process.env });
 		let data = null;
 		try {
 			data = JSON.parse(fs.readFileSync(file, 'utf8'));
@@ -384,4 +447,4 @@ if (require.main === module && ARGS.browser !== null) {
 		});
 }
 
-module.exports = { reshuffled, sentWrites, laneArgs };
+module.exports = { reshuffled, loadVerdict, sentWrites, laneArgs, childArgv };

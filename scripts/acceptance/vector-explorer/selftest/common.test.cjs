@@ -144,3 +144,42 @@ test("the selector table holds the app's wording", () => {
 	assert.deepStrictEqual(MAP.tableRows.exec('Rows 1–100 of 1,318').slice(1), ['1', '100', '1,318']);
 	assert.strictEqual(Object.keys(MAP.attr).length, new Set(Object.values(MAP.attr)).size);
 });
+
+test('a stats figure is a number only once the strip shows one', () => {
+	assert.strictEqual(C.figureNumber('1,500'), 1500);
+	assert.strictEqual(C.figureNumber(' 40 '), 40);
+	assert.strictEqual(C.figureNumber('0'), 0);
+	// Pending, unknown, or not a count: no number (never 0).
+	for (const text of ['…', '—', '', null, undefined, '1,50', '12 MB', 'Documents0 loaded']) assert.strictEqual(C.figureNumber(text), null, String(text));
+});
+
+test("an upload is done only when the row of that file says so (not another row's count)", () => {
+	const rows = [
+		{ path: 'lane-1/a/report.pdf', status: 'done' },
+		{ path: 'lane-1/b/report.pdf', status: 'processing' },
+		{ path: 'lane-1/nested/deeper/note.md', status: 'done' },
+	];
+	assert.ok(C.uploadsDone(rows, ['lane-1/a/report.pdf', 'lane-1/nested/deeper/note.md']));
+	assert.ok(!C.uploadsDone(rows, ['lane-1/a/report.pdf', 'lane-1/b/report.pdf']), 'one of the same-named files is still processing');
+	assert.ok(!C.uploadsDone(rows, ['lane-1/c/report.pdf']), 'no row for that file');
+	assert.ok(!C.uploadsDone([], ['x.md']));
+});
+
+test("the selectors the lanes read exist in the app's source", () => {
+	const fs = require('fs');
+	const path = require('path');
+	const src = (file) => fs.readFileSync(path.join(__dirname, '..', '..', '..', '..', 'apps', 'vector-ui', 'src', file), 'utf8');
+	assert.match(src('components/StatsStrip.tsx'), /data-figure=\{f\.key\}/, 'each stats figure carries data-figure');
+	assert.match(src('components/UploadList.tsx'), /aria-label="Uploads"[\s\S]*<li key=\{row\.id\} style=\{S\.row\} data-status=\{row\.status\}>[\s\S]*title=\{row\.path\}/, 'each upload row carries data-status and its path as a title');
+	assert.match(src('components/DocumentDirectory.tsx'), new RegExp(`placeholder="${CONSOLE.filterPaths}"`));
+	assert.match(src('components/SourcesPanel.tsx'), new RegExp(`aria-label="${CONSOLE.sources}"`));
+	assert.match(src('components/SourcesPanel.tsx'), /aria-label=\{`Open \$\{path\} at chunk \$\{source\.chunkId\}`\}/);
+	assert.ok(CONSOLE.sourceOpen.test('Open C:/demo/a.md at chunk 3'));
+	assert.deepStrictEqual(CONSOLE.sourceTarget.exec('Open C:/demo/a b.md at chunk 12').slice(1), ['C:/demo/a b.md', '12']);
+	assert.match(src('vector/confirm.ts'), /prompt: `Type the table name '\$\{table\}' to confirm\.`/);
+	assert.deepStrictEqual(CONSOLE.typedConfirm.exec("Type the table name 'vx_demo_rr' to confirm.").slice(1), ['vx_demo_rr']);
+	assert.match(src('views/DocumentView.tsx'), /data-document=\{objectId\}/);
+	assert.match(src('views/DocumentView.tsx'), /data-chunk=\{chunk\.chunkId\}/);
+	assert.match(src('views/MapView.tsx'), new RegExp(`className="${MAP.root.slice(1)}"`));
+	assert.match(src('VectorApp.tsx'), new RegExp(`label: '${CONSOLE.connectionsTab}'`), "the landing's shell tab label");
+});
