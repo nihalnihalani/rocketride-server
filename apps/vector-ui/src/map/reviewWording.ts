@@ -31,6 +31,8 @@
 // =============================================================================
 
 import type { KeepPolicy } from './dedupe';
+import type { MatrixSource, VectorMetric } from '../contract/types';
+import { mapFailure } from './wording';
 
 /**
  * en-US number.
@@ -273,4 +275,123 @@ export const OUTLIERS_NOTE = "The sample's sparsest points, lowest density first
  */
 export function outliersStatus(n: number, pct: number, reviewed: number): string {
 	return `${plural(n, 'point')}: the lowest ${pct} % by density${reviewed > 0 ? ` · ${num(reviewed)} reviewed` : ''}`;
+}
+
+// =============================================================================
+// SIMILARITY MATRIX
+// =============================================================================
+
+/** A node without the tool. */
+export const MATRIX_UNSUPPORTED = 'This store node does not compute a similarity matrix; update the node.';
+
+/** No channel reaches the store node. */
+export const MATRIX_NO_CHANNEL = 'No running source reaches the store node, so the matrix cannot be computed.';
+
+/** The call is on its way. */
+export const MATRIX_BUSY = 'Computing…';
+
+/** No pair picked yet. */
+export const PICK_A_PAIR = 'Click a cell to pick a pair.';
+
+/**
+ * Too few points selected.
+ *
+ * @param max - The node's matrix_keys_max.
+ * @returns The sentence.
+ */
+export function matrixTooFew(max: number): string {
+	return `Select 2 to ${num(max)} points to compare them.`;
+}
+
+/**
+ * Too many points selected.
+ *
+ * @param max - The node's matrix_keys_max.
+ * @param n - Points selected.
+ * @returns The sentence.
+ */
+export function matrixTooMany(max: number, n: number): string {
+	return `Select at most ${num(max)} points for a matrix (${num(n)} selected).`;
+}
+
+/**
+ * A failed matrix call in words.
+ *
+ * @param code - The code, if any.
+ * @param message - The node's own sentence.
+ * @param max - The node's matrix_keys_max.
+ * @returns The sentence.
+ */
+export function matrixFailure(code: string | undefined, message: string, max = 100): string {
+	switch (code) {
+		case 'NOT_FOUND':
+			return 'Fewer than 2 of the selected points are still in the store.';
+		case 'LIMIT_EXCEEDED':
+			return `Select at most ${num(max)} points for a matrix.`;
+		case 'UNSUPPORTED':
+			return MATRIX_UNSUPPORTED;
+		case 'BUSY':
+			return 'The store is busy with another request; try again in a moment.';
+		default:
+			return mapFailure(code, message);
+	}
+}
+
+/**
+ * Where the matrix's vectors came from.
+ *
+ * @param source - The answer's `source`.
+ * @returns The sentence.
+ */
+export function matrixSourceLine(source: MatrixSource): string {
+	if (source === 'cache') return "Computed by the store node from the map's sample.";
+	if (source === 'store') return 'Computed by the store node from the stored vectors.';
+	return "Computed by the store node, partly from the map's sample and partly from the stored vectors.";
+}
+
+/**
+ * What the matrix shows.
+ *
+ * @param n - Chunks compared.
+ * @param metric - The store's metric.
+ * @returns The caption.
+ */
+export function matrixCaption(n: number, metric: VectorMetric): string {
+	const words = metric === 'cosine' ? 'cosine similarity' : metric === 'ip' ? 'inner product' : "the store's L2 similarity";
+	return `${plural(n, 'chunk')} compared by ${words}; similar chunks are placed next to each other.`;
+}
+
+/**
+ * The ramp's legend in words.
+ *
+ * @param min - The lowest value between two chunks.
+ * @param max - The highest value between two chunks.
+ * @param dp - Decimal places.
+ * @returns The legend.
+ */
+export function matrixLegend(min: number, max: number, dp: number): string {
+	return `Lighter: less similar (${min.toFixed(dp)}) · darker: more similar (${max.toFixed(dp)} and above)`;
+}
+
+/**
+ * Selected keys the store no longer holds.
+ *
+ * @param labels - Their words.
+ * @returns The sentence, or null when there are none.
+ */
+export function matrixNotFound(labels: readonly string[]): string | null {
+	if (labels.length === 0) return null;
+	return `${labels.length === 1 ? '1 selected point is' : `${num(labels.length)} selected points are`} no longer in the store: ${labels.join(', ')}`;
+}
+
+/**
+ * The picked pair.
+ *
+ * @param a - Its first chunk's words.
+ * @param b - Its second chunk's words.
+ * @param value - Their similarity, as printed.
+ * @returns The line.
+ */
+export function selectedPairLine(a: string, b: string, value: string): string {
+	return `Selected: ${a} ↔ ${b} · similarity ${value}`;
 }
