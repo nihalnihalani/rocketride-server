@@ -40,14 +40,21 @@
 //     (actions.showOnMap(keys, 'document')), at most the connection's pin
 //     limit (limits.project_keys_max); the map pins them through its own
 //     `project` call, and the drop remembers how many of how many it sent.
+//
+// The connection's uploads (rows and drops) and its chat live in the
+// registry, keyed by the endpoint key, so they outlive the panels. A change
+// of identity must forget them with every other per-connection cache, so
+// this module registers the registry's reset with the app's cache registry
+// (`connectionCaches`); the same endpoint key then gets a new, empty queue.
 // =============================================================================
 
 import { useCallback, useSyncExternalStore } from 'react';
 import { useShellEvent } from 'shell';
 import { ExplorerToolError } from 'shared/explorer';
 import type { ConsoleActions, IUploadEvent, IngestPanelProps } from '../contract/types';
+import { connectionCaches } from '../adapters/explorer';
 import { callTool, toolChannelFor } from '../chat/toolCalls';
-import { ingestQueueFor } from '../chat/registry';
+import { forgetChatAndIngest, ingestQueueFor } from '../chat/registry';
 import { newChunkKeys, placedSentence, summariseDrop } from '../vector/uploads';
 import type { DropShown } from '../vector/uploads';
 import type { IngestDeps, IngestQueue, IngestState } from './ingestQueue';
@@ -56,6 +63,11 @@ import type { DataTransferLike } from './dropTraversal';
 
 /** How long the probe and the count may take. */
 const TOOL_TIMEOUT_MS = 30_000;
+
+/** The name the uploads and the chat are cleared under when the signed-in identity changes. */
+export const CHAT_AND_INGEST_CACHE = 'chat and ingest';
+
+connectionCaches.register(CHAT_AND_INGEST_CACHE, () => forgetChatAndIngest());
 
 /** What the ingest panel gets from the hook. */
 export interface VectorIngest {

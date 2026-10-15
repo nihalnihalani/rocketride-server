@@ -67,7 +67,9 @@ const { objectIdForPath } = require('../src/vector/objectId') as typeof import('
 const { showDropOnMap } = require('../src/ingest/useIngest') as typeof import('../src/ingest/useIngest');
 const { UploadList } = require('../src/components/UploadList') as typeof import('../src/components/UploadList');
 const { IngestPanel } = require('../src/components/IngestPanel') as typeof import('../src/components/IngestPanel');
-const { ingestQueueFor, forgetChatAndIngest } = require('../src/chat/registry') as typeof import('../src/chat/registry');
+const { chatSessionFor, ingestQueueFor, forgetChatAndIngest, heldConnections } = require('../src/chat/registry') as typeof import('../src/chat/registry');
+const { connectionCaches } = require('../src/adapters/explorer') as typeof import('../src/adapters/explorer');
+const { forgetConnections } = require('../src/vector/identityChange') as typeof import('../src/vector/identityChange');
 
 // ── Fixtures and fakes ──────────────────────────────────────────────────────
 
@@ -781,6 +783,26 @@ test("IngestPanel: the connection's drop summary is shown above its rows, with t
 	assert.ok(noMap.includes(NO_MAP_SENTENCE));
 	forgetChatAndIngest();
 	assert.equal(ingestQueueFor('summary-1', fakeDeps().deps).getState().drops.length, 0, 'forgetting the connection forgets its drops');
+	forgetChatAndIngest();
+});
+
+test("identity change: clearing the app's per-connection caches forgets every connection's drops, uploads and chat", async () => {
+	forgetChatAndIngest();
+	const queue = ingestQueueFor('identity-1', fakeDeps().deps);
+	await queue.addDrop([candidate('a.md'), candidate('b.md')]);
+	await queue.idle();
+	assert.equal(queue.getState().drops.length, 1);
+	assert.equal(queue.getState().rows.length, 2);
+	chatSessionFor('identity-2', { ask: async () => ({}), makeQuestion: (text) => text, now: () => 0, announce: () => undefined });
+	assert.deepEqual(heldConnections(), ['identity-1', 'identity-2']);
+	// The app's identity-change path (VectorApp.tsx): every registered per-connection cache is cleared.
+	const { cleared } = forgetConnections(null, connectionCaches, () => null, { uri: 'connections', label: 'Connections' });
+	assert.ok(cleared.includes('chat and ingest'), `cleared: ${cleared.join(', ')}`);
+	assert.deepEqual(heldConnections(), [], 'nothing of the previous identity is kept');
+	const after = ingestQueueFor('identity-1', fakeDeps().deps);
+	assert.notEqual(after, queue, 'the same endpoint key gets a new queue');
+	assert.equal(after.getState().drops.length, 0, "the previous identity's drops are gone");
+	assert.equal(after.getState().rows.length, 0, "the previous identity's uploads are gone");
 	forgetChatAndIngest();
 });
 
