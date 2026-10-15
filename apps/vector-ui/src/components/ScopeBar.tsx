@@ -38,7 +38,7 @@
 // what is open. The logic lives in vector/filters.ts; this file draws it.
 // =============================================================================
 
-import React, { useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import type { CSSProperties } from 'react';
 import type { Availability, IDocumentsFilter, IScopeState, ISavedFilter, ScopeBarProps as ContractScopeBarProps } from '../contract/types';
 import { ALL_TARGETS, CONDITION_KINDS, CONDITION_TITLES, conditionLabel, dateToIso, filterOf, removeCondition, scopeAvailability, scopeFromFilter, setCondition, toDocumentsFilter, validateFilter } from '../vector/filters';
@@ -111,6 +111,25 @@ const ring = {
 	onBlur: (event: React.FocusEvent<HTMLElement>) => (event.currentTarget.style.outline = 'none'),
 };
 
+/**
+ * Arrow keys, Home and End move between a menu's items (the WAI-ARIA menu pattern); disabled items are skipped.
+ *
+ * @param event - The key event on the menu.
+ */
+export function moveInMenu(event: React.KeyboardEvent<HTMLElement>): void {
+	const items = [...event.currentTarget.querySelectorAll<HTMLElement>('[role="menuitem"]:not([disabled])')];
+	if (items.length === 0) return;
+	const at = items.indexOf(document.activeElement as HTMLElement);
+	let next: number | null = null;
+	if (event.key === 'ArrowDown' || event.key === 'ArrowRight') next = (at + 1) % items.length;
+	else if (event.key === 'ArrowUp' || event.key === 'ArrowLeft') next = (at - 1 + items.length) % items.length;
+	else if (event.key === 'Home') next = 0;
+	else if (event.key === 'End') next = items.length - 1;
+	if (next === null) return;
+	event.preventDefault();
+	items[next]?.focus();
+}
+
 /** The draft values of the condition editors. */
 interface IDraft {
 	prefix: string;
@@ -175,6 +194,11 @@ export function ScopeBar({ text, onText, scope = null, onScope, available = {}, 
 	const [saving, setSaving] = useState(initial.saving ?? false);
 	const [name, setName] = useState('');
 	const [error, setError] = useState<string | null>(null);
+	// An opened menu takes the focus on its first item, as a menu button's menu does.
+	const menuRef = useRef<HTMLDivElement>(null);
+	useEffect(() => {
+		if (menu !== null) menuRef.current?.querySelector<HTMLElement>('[role="menuitem"]:not([disabled])')?.focus();
+	}, [menu]);
 
 	const filter: IFilter = filterOf(scope, scopeText);
 	const conditions = filter.conditions;
@@ -261,7 +285,7 @@ export function ScopeBar({ text, onText, scope = null, onScope, available = {}, 
 				</button>
 			</div>
 			{menu === 'add' && (
-				<div role="menu" aria-label="Add condition" style={{ display: 'flex', flexWrap: 'wrap', gap: 6, padding: '0 12px 8px' }}>
+				<div ref={menuRef} role="menu" aria-label="Add condition" style={{ display: 'flex', flexWrap: 'wrap', gap: 6, padding: '0 12px 8px' }} onKeyDown={moveInMenu}>
 					{CONDITION_KINDS.map((kind) => {
 						const av = availability(kind);
 						return (
@@ -273,7 +297,7 @@ export function ScopeBar({ text, onText, scope = null, onScope, available = {}, 
 				</div>
 			)}
 			{menu === 'saved' && (
-				<div role="menu" aria-label="Saved filters" style={{ padding: '0 12px 8px', ...styles.small }}>
+				<div ref={menuRef} role="menu" aria-label="Saved filters" style={{ padding: '0 12px 8px', ...styles.small }} onKeyDown={moveInMenu}>
 					{saved.length === 0 ? (
 						<p style={{ margin: 0 }}>No saved filters for this connection yet. Add a condition, then Save.</p>
 					) : (
