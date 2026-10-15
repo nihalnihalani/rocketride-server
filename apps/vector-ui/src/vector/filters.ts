@@ -510,7 +510,9 @@ export interface IScopeView {
 	ids: string[] | null;
 	/** The rows loaded. */
 	loaded: number;
-	/** The listing ended (complete, capped, stopped). */
+	/** The listing is the one this scope asks for (filtered by it while its Documents toggle is on, else unfiltered). */
+	current: boolean;
+	/** The listing is current and ended (complete, capped, stopped). */
 	settled: boolean;
 	/** How the store answered for this scope: 'here' when the listing did not ask it. */
 	applied: FilterApplied | 'here';
@@ -522,25 +524,29 @@ export interface IScopeView {
 /**
  * What the directory knows about a scope.
  *
- * @param scope - The scope.
+ * @param scope - The scope (its conditions and whether it filters the list).
  * @param dir - The directory's listing.
  * @param cap - `limits.scope_keys_max`.
  * @returns The view.
  */
-export function scopeView(scope: Pick<IScopeState, 'filter'>, dir: IPagerState, cap: number): IScopeView {
-	const asked = dir.filter !== null && sameFilter(dir.filter, listingFilter(scope.filter));
+export function scopeView(scope: Pick<IScopeState, 'filter'> & { applyTo?: Pick<IScopeState['applyTo'], 'documents'> }, dir: IPagerState, cap: number): IScopeView {
+	const wanted = listingFilter(scope.filter);
+	const asked = dir.filter !== null && sameFilter(dir.filter, wanted);
+	// While the list is filtered by the scope, the listing must be the one that asked for it; otherwise an unfiltered one.
+	const current = (scope.applyTo?.documents ?? true) && wanted !== null ? asked : dir.filter === null;
 	const applied: FilterApplied | 'here' = asked ? (dir.filterApplied ?? 'none') : 'here';
 	const keys = clientKeys(scope.filter, asked ? dir.filterApplied : null, dir.filterIgnored);
 	const match = scopeObjectIds(dir.rows, scope.filter, cap, keys);
 	const storeCounts = applied === 'server' && keys.length === 0 && dir.total !== null;
 	const count = storeCounts ? Math.max(dir.total as number, match.count) : match.count;
-	return { count, chunks: match.chunks, ids: count > cap ? null : match.ids, loaded: dir.rows.length, settled: SETTLED.has(dir.status), applied, ignored: asked ? dir.filterIgnored : [], total: dir.total };
+	return { count, chunks: match.chunks, ids: count > cap ? null : match.ids, loaded: dir.rows.length, current, settled: current && SETTLED.has(dir.status), applied, ignored: asked ? dir.filterIgnored : [], total: dir.total };
 }
 
 /**
  * Resolve a scope's documents from the directory: its objectIds once the
- * listing settles (null while it loads), or, above the cap, the count as soon
- * as it is known. Returns the same object when nothing changed.
+ * listing for it settles (null while it loads, or while the list still shows
+ * another listing), or, above the cap, the count as soon as it is known.
+ * Returns the same object when nothing changed.
  *
  * @param scope - The scope.
  * @param dir - The directory's listing (filtered by the scope when its Documents toggle is on).
@@ -549,12 +555,74 @@ export function scopeView(scope: Pick<IScopeState, 'filter'>, dir: IPagerState, 
  */
 export function resolveScope(scope: IScopeState, dir: IPagerState, cap: number): IScopeState {
 	const view = scopeView(scope, dir, cap);
-	const overflow = view.count > cap ? view.count : null;
+	const overflow = view.current && view.count > cap ? view.count : null;
 	const objectIds = overflow === null && view.settled ? view.ids : null;
 	const label = describeFilter(scope.filter);
 	const sameIds = scope.objectIds === objectIds || (scope.objectIds !== null && objectIds !== null && scope.objectIds.length === objectIds.length && scope.objectIds.every((id, i) => id === objectIds[i]));
 	if (sameIds && scope.overflow === overflow && scope.label === label) return scope;
 	return { ...scope, label, objectIds, overflow };
+}
+
+// =============================================================================
+// BUILDING A SCOPE
+// =============================================================================
+
+/** Every surface on: what a new scope applies to. */
+export const ALL_TARGETS: IScopeState['applyTo'] = Object.freeze({ documents: true, map: true, search: true, chat: true });
+
+/**
+ * The ScopeBar's state behind a scope: its conditions, and the path box.
+ *
+ * @param scope - The scope, or null.
+ * @param text - The path box's text.
+ * @returns The filter.
+ */
+export function filterOf(scope: Pick<IScopeState, 'filter'> | null | undefined, text: string): IFilter {
+	if (!scope) return { conditions: [], text };
+	return { conditions: fromDocumentsFilter(scope.filter).conditions, text };
+}
+
+/**
+ * The scope of a filter: null with no condition (the path box alone is not a
+ * scope); the previous scope itself when nothing changed; else a new,
+ * unresolved scope that keeps the previous one's toggles.
+ *
+ * @param filter - The conditions and the path box.
+ * @param prev - The scope before, or null.
+ * @returns The scope.
+ */
+export function scopeFromFilter(filter: IFilter, prev: IScopeState | null | undefined): IScopeState | null {
+	if (filter.conditions.length === 0) return null;
+	const wire = toDocumentsFilter(filter);
+	if (prev && sameFilter(prev.filter, wire)) return prev;
+	return { filter: wire, label: describeFilter(wire), objectIds: null, overflow: null, applyTo: { ...(prev?.applyTo ?? ALL_TARGETS) } };
+}
+
+/**
+ * A scope with the path box's new text (the same scope when it did not change).
+ *
+ * @param scope - The scope.
+ * @param text - The path box, after its debounce.
+ * @returns The scope.
+ */
+export function withText(scope: IScopeState, text: string): IScopeState {
+	return scopeFromFilter(filterOf(scope, text), scope) ?? scope;
+}
+
+/**
+ * A scope with conditions set from a wire filter (a chart's bar, a saved
+ * filter, "Scope to this folder"): those kinds replace the scope's own, the
+ * others stay.
+ *
+ * @param scope - The scope, or null.
+ * @param text - The path box.
+ * @param conditions - The conditions to set, in the wire shape.
+ * @returns The new scope.
+ */
+export function scopeWith(scope: IScopeState | null | undefined, text: string, conditions: IDocumentsFilter): IScopeState | null {
+	let filter = filterOf(scope, text);
+	for (const condition of fromDocumentsFilter(conditions).conditions) filter = setCondition(filter, condition);
+	return scopeFromFilter(filter, scope ?? null);
 }
 
 /** What the directory shows: its rows and the status line under the ScopeBar. */

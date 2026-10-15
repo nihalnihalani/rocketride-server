@@ -48,6 +48,9 @@ const LANE_FILES = [
 	'adapters/consoleActions.ts',
 	'adapters/react.ts',
 	'components/StatsStrip.tsx',
+	'components/StatsCharts.tsx',
+	'components/ScopeBar.tsx',
+	'components/HealthPanel.tsx',
 	'components/DocumentDirectory.tsx',
 	'components/DocumentRow.tsx',
 	'components/ChunkList.tsx',
@@ -61,7 +64,7 @@ const LANE_FILES = [
 	'views/DocumentView.tsx',
 	...fs
 		.readdirSync(path.join(SRC, 'vector'))
-		.filter((f) => /^(addresses|budgets|colors|confirm|connections|consoleModel|consoleStore|documents|fileType|identityChange|layout|results|stats|support|wording)\.ts$/.test(f))
+		.filter((f) => /^(addresses|budgets|chartTokens|charts|colors|confirm|connections|consoleModel|consoleStore|documents|fileType|filters|health|identityChange|layout|results|savedFilters|stats|support|wording)\.ts$/.test(f))
 		.map((f) => `vector/${f}`),
 ];
 
@@ -123,6 +126,23 @@ test('the console renders the strip, the directory, the chunks, adding documents
 	assert.match(view, /consoleColumns\(width\)/, 'the ratios come from vector/layout.ts');
 	const strip = code('components/StatsStrip.tsx');
 	for (const fn of ['statsFigures(', 'statsChips(', 'countsAsOfText(']) assert.ok(strip.includes(fn), fn);
+});
+
+test('the scope: the listing asks for its conditions, its documents resolve from the listing, the chat is scoped within the cap, filters are saved per connection', () => {
+	const view = code('views/ConsoleView.tsx');
+	assert.match(view, /scope !== null && scope\.applyTo\.documents \? listingFilter\(scope\.filter\) : null/, 'the list is filtered by the scope only while its Documents toggle is on');
+	assert.match(view, /entry\.controller\.setFilter\(listing\)/);
+	assert.match(view, /resolveScope\(current, state\.directory, cap\)/);
+	assert.match(view, /if \(next !== current\) entry\.scope\.set\(next\)/, 'set only when it changed, so the effect settles');
+	assert.match(view, /const chatDocuments = chatScopeFor\(chatScope, scope, cap\)/);
+	assert.match(view, /<ChatPanel [^>]*scope=\{chatDocuments\}/);
+	assert.match(view, /savedFiltersFor\(savedFilters, entry\.key\)/, "the app's per-connection map, emptied on a change of identity");
+	assert.match(view, /<DocumentDirectory [\s\S]*?scope=\{scope\} onScope=\{setScope\} cap=\{cap\}/);
+	assert.match(view, /<StatsStrip [^>]*scopeLine=\{scopeLine\}/);
+	const dir = code('components/DocumentDirectory.tsx');
+	assert.match(dir, /directoryView\(pager, scope, applied, cap\)/);
+	assert.match(dir, /useDebounced\(filter, FILTER_DEBOUNCE_MS\)/);
+	assert.match(dir, /Scope to this folder/);
 });
 
 test("every removal is confirmed by the app-level host, with Cancel focused by the dialog's own mount effect", () => {

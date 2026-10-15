@@ -29,6 +29,10 @@ import {
 	resolveScope,
 	sameFilter,
 	scopeAvailability,
+	scopeFromFilter,
+	scopeWith,
+	filterOf,
+	withText,
 	scopeObjectIds,
 	scopeStatusText,
 	scopeStripText,
@@ -345,4 +349,38 @@ test('above the cap: overflow with the count (from the store total when it said)
 	assert.equal(resolved.overflow, 2_340, "known from the store's total before the listing ends");
 	assert.equal(resolved.objectIds, null);
 	assert.equal(resolveScope(resolved, loading, 2_000), resolved, 'resolving again returns the same object');
+});
+
+test('a scope is resolved only from the listing it asked for: a stale listing (the list not yet re-listed) resolves nothing', () => {
+	const rows = readDocumentsPage(fixture('documents_page1')).items;
+	const unfiltered = listed(rows, null);
+	const scope = scopeOf({ path_prefix: 'C:/demo/greenhouse/' });
+	const stale = resolveScope(scope, unfiltered, 2_000);
+	assert.equal(stale.objectIds, null, 'the list is still the unfiltered one: wait for the filtered listing');
+	assert.equal(stale.overflow, null);
+	const greenhouse = listed(rows.filter((r) => r.path.startsWith('C:/demo/greenhouse/')), { path_prefix: 'C:/demo/handbooks/' }, { filter_applied: 'server', filter_ignored: [] });
+	assert.equal(resolveScope(scope, greenhouse, 2_000).objectIds, null, 'a listing for other conditions resolves nothing');
+	const off = resolveScope({ ...scope, applyTo: { ...scope.applyTo, documents: false } }, greenhouse, 2_000);
+	assert.equal(off.objectIds, null, 'Documents off waits for the unfiltered listing');
+	assert.equal(resolveScope({ ...scope, applyTo: { ...scope.applyTo, documents: false } }, unfiltered, 2_000).objectIds?.length, 2);
+});
+
+test('building scopes: no condition is no scope, the same conditions keep the scope, a chart or a saved filter sets its kinds', () => {
+	assert.equal(scopeFromFilter({ conditions: [], text: 'falcon' }, null), null, 'the path box alone is not a scope');
+	const first = scopeFromFilter({ conditions: [{ kind: 'folder', prefix: 'C:/demo/' }], text: '' }, null);
+	assert.ok(first);
+	assert.deepEqual(first.applyTo, { documents: true, map: true, search: true, chat: true });
+	assert.equal(first.label, 'folder is under C:/demo/');
+	const resolved = { ...first, objectIds: ['a'], applyTo: { ...first.applyTo, chat: false } };
+	assert.equal(scopeFromFilter(filterOf(resolved, ''), resolved), resolved, 'nothing changed: the same scope');
+	const typed = withText(resolved, 'orchid');
+	assert.deepEqual(typed.filter, { path_prefix: 'C:/demo/', path_contains: 'orchid' });
+	assert.equal(typed.objectIds, null, 'new conditions are unresolved');
+	assert.equal(typed.applyTo.chat, false, 'the toggles are kept');
+	assert.equal(withText(typed, 'orchid'), typed);
+	const charted = scopeWith(typed, 'orchid', { min_chunks: 64, max_chunks: 127 });
+	assert.deepEqual(charted?.filter, { path_prefix: 'C:/demo/', min_chunks: 64, max_chunks: 127, path_contains: 'orchid' });
+	const folder = scopeWith(charted, 'orchid', { path_prefix: 'C:/demo/handbooks/' });
+	assert.equal(folder?.filter.path_prefix, 'C:/demo/handbooks/', 'Scope to this folder replaces the folder');
+	assert.deepEqual(scopeWith(null, '', { file_types: ['pdf'] })?.filter, { file_types: ['pdf'] }, 'a chart bar with no scope starts one');
 });

@@ -35,12 +35,22 @@
 // The console's calls and their pacing live in its controller
 // (vector/consoleStore.ts); this view renders the controller's snapshot and
 // forwards clicks. Removal is confirmed by the app-level dialog host.
+//
+// THE SCOPE. The directory's ScopeBar sets the connection's scope (the
+// entry's value store, read by the map and search as ConsoleModel.scope);
+// this view hands its conditions to the controller's listing while its
+// Documents toggle is on, resolves the documents it covers from the listing
+// (vector/filters.ts resolveScope: their objectIds once it settles, the count
+// above limits.scope_keys_max), scopes the chat to them while the Chat toggle
+// is on (never above the cap), and keeps the saved filters of the connection.
 // =============================================================================
 
 import React, { useEffect, useMemo, useRef, useState } from 'react';
+import type { Availability, IDocumentsFilter, IScopeState } from '../contract/types';
 import { Banner, Button, ContentHeader, EmptyState, ToggleGroup, useShellConnection } from 'shell';
 import type { IExplorerEndpoint } from 'shared/explorer';
 import { makeConsoleActions } from '../adapters/consoleActions';
+import { savedFilters } from '../adapters/connections';
 import type { ConsoleTab } from '../adapters/connections';
 import { VECTOR_PROVIDERS, announcer } from '../adapters/explorer';
 import { useConnection, useLiveEndpoint, useVectorEndpoints } from '../adapters/react';
@@ -51,7 +61,10 @@ import IngestPanel from '../components/IngestPanel';
 import StatsStrip from '../components/StatsStrip';
 import { getDocs } from '../docs';
 import { documentUri } from '../vector/addresses';
-import { alsoReaches, writesDuringRemoval } from '../vector/consoleModel';
+import { alsoReaches, chatScopeFor, writesDuringRemoval } from '../vector/consoleModel';
+import { CONDITION_KINDS, conditionAvailability, listingFilter, resolveScope, scopeStripText, scopeView } from '../vector/filters';
+import type { ConditionKind } from '../vector/filters';
+import { savedFiltersFor } from '../vector/savedFilters';
 import { roleLine, vectorCardView } from '../vector/connections';
 import { consoleColumns } from '../vector/layout';
 import { providerTitle } from '../vector/support';
@@ -122,6 +135,55 @@ export const ConsoleView: React.FC<IConsoleViewProps> = ({ opened, active }) => 
 		if (selectedId !== state.chunks.objectId) entry.controller.selectDocument(selectedId);
 	}, [selectedId, state.chunks.objectId, entry]);
 
+	// The scope: its conditions go to the listing while it filters the list; its documents resolve from the listing.
+	const scope = model.scope ?? null;
+	const cap = model.limits.scope_keys_max;
+	const listing = scope !== null && scope.applyTo.documents ? listingFilter(scope.filter) : null;
+	const listingKey = JSON.stringify(listing);
+	useEffect(() => {
+		entry.controller.setFilter(listing);
+		// The key is the listing filter's meaning; the object is rebuilt every render.
+		// eslint-disable-next-line react-hooks/exhaustive-deps
+	}, [listingKey, entry]);
+	useEffect(() => {
+		const current = entry.scope.get();
+		if (current === null) return;
+		const next = resolveScope(current, state.directory, cap);
+		if (next !== current) entry.scope.set(next);
+	}, [scope, state.directory, cap, entry]);
+	const setScope = (next: IScopeState | null): void => entry.scope.set(next);
+	const caveatsKey = [...(dialect?.caveats ?? []), ...(state.stats.view?.caveats ?? [])].join('|');
+	const available = useMemo(() => {
+		const caveats = caveatsKey === '' ? [] : caveatsKey.split('|');
+		const out: Partial<Record<ConditionKind, Availability>> = {};
+		for (const kind of CONDITION_KINDS) out[kind] = conditionAvailability(kind, { caveats, rows: state.directory.rows });
+		return out;
+	}, [caveatsKey, state.directory.rows]);
+	const scopeLine = scope !== null ? scopeStripText(scopeView(scope, state.directory, cap), state.stats.view) : null;
+
+	// Saved filters: per connection, in memory (the app's map, emptied on a change of identity).
+	const savedStore = useMemo(() => savedFiltersFor(savedFilters, entry.key), [entry.key]);
+	const [saved, setSaved] = useState(() => savedStore.list());
+	useEffect(() => setSaved(savedStore.list()), [savedStore]);
+	const saveFilter = (name: string, filter: IDocumentsFilter): string | null => {
+		const outcome = savedStore.save(name, filter);
+		if (!outcome.ok) return outcome.error;
+		setSaved(savedStore.list());
+		announcer.announce(`Saved the filter "${outcome.saved.name}".`);
+		return null;
+	};
+	const deleteFilter = (id: string): void => {
+		savedStore.remove(id);
+		setSaved(savedStore.list());
+	};
+
+	// The chat: "Ask about these" first, else the scope's documents while its Chat toggle is on.
+	const chatDocuments = chatScopeFor(chatScope, scope, cap);
+	const clearChatScope = (): void => {
+		if (chatScope !== null) entry.chatScope.set(null);
+		else if (scope !== null) entry.scope.set({ ...scope, applyTo: { ...scope.applyTo, chat: false } });
+	};
+
 	const actions = useMemo(
 		() =>
 			makeConsoleActions(entry, {
@@ -173,7 +235,7 @@ export const ConsoleView: React.FC<IConsoleViewProps> = ({ opened, active }) => 
 					<Banner variant={endpoint.state === 'ready' ? 'warning' : 'info'}>{card.blocked}</Banner>
 				</div>
 			)}
-			<StatsStrip stats={state.stats} dialect={dialect} readOnly={model.readOnly} documents={state.directory.rows} />
+			<StatsStrip stats={state.stats} dialect={dialect} readOnly={model.readOnly} documents={state.directory.rows} scopeLine={scopeLine} />
 			{(state.removal.status === 'running' || state.removal.message) && (
 				<div role="status" style={{ ...styles.small, padding: '6px 24px' }}>
 					{state.removal.status === 'running' ? BUSY.removing : state.removal.message}
@@ -181,7 +243,7 @@ export const ConsoleView: React.FC<IConsoleViewProps> = ({ opened, active }) => 
 			)}
 			<div ref={body} style={{ flex: 1, minHeight: 0, display: tab === 'console' ? 'flex' : 'none', flexDirection: cols.stacked ? 'column' : 'row', gap: 12, padding: 12, overflow: cols.stacked ? 'auto' : 'hidden' }}>
 				<div style={{ flex: cols.stacked ? 'none' : `0 0 ${cols.left}`, height: cols.stacked ? 520 : undefined, display: 'flex', flexDirection: 'column', minWidth: 0, minHeight: 0 }}>
-					<DocumentDirectory pager={state.directory} selectedId={selectedId} writes={writesDuringRemoval(model.writes, state.removal.status)} onSelect={(item) => entry.selection.selectDocument({ objectId: item.objectId, path: item.path })} onRemove={(targets) => entry.controller.requestRemove(targets)} onLoadMore={() => entry.controller.loadMoreDocuments()} onRetry={() => entry.controller.retryDocuments()} collection={model.collection} />
+					<DocumentDirectory pager={state.directory} selectedId={selectedId} writes={writesDuringRemoval(model.writes, state.removal.status)} onSelect={(item) => entry.selection.selectDocument({ objectId: item.objectId, path: item.path })} onRemove={(targets) => entry.controller.requestRemove(targets)} onLoadMore={() => entry.controller.loadMoreDocuments()} onRetry={() => entry.controller.retryDocuments()} collection={model.collection} scope={scope} onScope={setScope} cap={cap} available={available} saved={saved} onSave={saveFilter} onDeleteSaved={deleteFilter} />
 					<ChunkList chunks={state.chunks} path={selection.document?.path ?? null} onMore={() => entry.controller.loadMoreChunks()} onOpen={(chunkId) => actions.openDocument(state.chunks.objectId ?? '', chunkId)} onMap={(key) => actions.showOnMap([key], 'document')} />
 				</div>
 				<div style={{ flex: cols.stacked ? 'none' : `1 1 ${cols.right}`, display: 'flex', flexDirection: 'column', gap: 12, minWidth: 0, minHeight: 0 }}>
@@ -189,7 +251,7 @@ export const ConsoleView: React.FC<IConsoleViewProps> = ({ opened, active }) => 
 						{model.ingest.enabled ? <IngestPanel model={model} channels={channels} actions={actions} alsoReaches={alsoReaches(endpoint, VECTOR_PROVIDERS)} /> : <EmptyState title="Add documents" description={model.ingest.reason ?? undefined} />}
 					</div>
 					<div style={{ flex: cols.stacked ? 'none' : `1 1 ${cols.chat}`, minHeight: cols.stacked ? 360 : 0, display: 'flex', flexDirection: 'column', overflow: 'auto' }} aria-label="Chat" role="region">
-						{model.chat.enabled ? <ChatPanel model={model} channels={channels} selection={entry.selection} actions={actions} scope={chatScope} onClearScope={() => entry.chatScope.set(null)} /> : <EmptyState title="Chat" description={model.chat.reason ?? undefined} />}
+						{model.chat.enabled ? <ChatPanel model={model} channels={channels} selection={entry.selection} actions={actions} scope={chatDocuments} onClearScope={clearChatScope} /> : <EmptyState title="Chat" description={model.chat.reason ?? undefined} />}
 					</div>
 				</div>
 			</div>

@@ -29,7 +29,9 @@
 // "counts as of N s ago" after a quick refresh. While the first answer is
 // pending it shows a skeleton; after a failure it keeps the last figures,
 // marked "last known", under the shell's error banner. The Charts disclosure
-// at the end, collapsed by default, holds the collection's charts.
+// at the end, collapsed by default, holds the collection's charts. While a
+// scope is active a second line says what it covers ("Scope: 12 of 42
+// documents · 318 chunks (counted here)").
 // =============================================================================
 
 import React, { useEffect, useState } from 'react';
@@ -48,6 +50,8 @@ export interface IStatsStripProps {
 	readOnly: boolean;
 	/** The directory rows loaded so far (the charts read them). */
 	documents?: readonly IDocumentItem[];
+	/** What the console's scope covers, while one is active (vector/filters.ts scopeStripText). */
+	scopeLine?: string | null;
 }
 
 /** Re-render once a second so "counts as of N s ago" stays true. */
@@ -66,7 +70,7 @@ function useNow(): number {
  * @param props - {@link IStatsStripProps}.
  * @returns The strip element.
  */
-export function StatsStrip({ stats, dialect, readOnly, documents = [] }: IStatsStripProps): React.ReactElement {
+export function StatsStrip({ stats, dialect, readOnly, documents = [], scopeLine = null }: IStatsStripProps): React.ReactElement {
 	const now = useNow();
 	const figures = statsFigures(stats.view, dialect);
 	const chips = statsChips({ dialect, stats: stats.view, readOnly });
@@ -107,6 +111,11 @@ export function StatsStrip({ stats, dialect, readOnly, documents = [] }: IStatsS
 					<StatsCharts rows={documents} dialect={dialect} />
 				</details>
 			</div>
+			{scopeLine !== null && (
+				<div role="status" style={{ ...styles.small, marginTop: 6 }} data-scope-line="">
+					{scopeLine}
+				</div>
+			)}
 		</section>
 	);
 }

@@ -79,7 +79,7 @@ test('the directory: the ScopeBar is its filter row, with the path box first, an
 	const html = renderToStaticMarkup(<DocumentDirectory pager={pager} selectedId={null} writes={on} onSelect={noop} onRemove={noop} onLoadMore={noop} onRetry={noop} />);
 	const at = mounted(html, 'ScopeBar');
 	const bar = html.slice(at, html.indexOf('</div>', at));
-	assert.match(bar, /^<div[^>]*><input type="search" placeholder="Filter paths…" aria-label="Filter documents by path"/, 'the path box is its first field');
+	assert.match(bar, /^<div[^>]*>(<div[^>]*>)?<input type="search" placeholder="Filter paths…" aria-label="Filter documents by path"/, 'the path box is its first field');
 	assert.equal((html.match(/aria-label="Filter documents by path"/g) ?? []).length, 1, 'one path box');
 	assert.ok(html.indexOf('data-component="ScopeBar"') < html.indexOf('aria-label="Stored documents"'));
 });
@@ -91,6 +91,13 @@ test('the stats strip ends with a collapsed Charts disclosure holding the StatsC
 	assert.match(html, /<details[^>]*><summary[^>]*>Charts<\/summary>/);
 	assert.doesNotMatch(html, /<details[^>]* open/, 'collapsed by default');
 	assert.ok(mounted(html, 'StatsCharts') > html.indexOf('>Charts</summary>'));
+});
+
+test('while a scope is active the stats strip says what it covers on a second line', () => {
+	const stats = { view: readStats(fixture('stats_pgvector')), status: 'ready' as const, error: null, lastAt: 0, mode: 'full' as const };
+	const html = renderToStaticMarkup(<StatsStrip stats={stats} dialect={dialect} readOnly={false} scopeLine="Scope: 12 of 42 documents · 318 chunks (counted here)" />);
+	assert.match(html, /role="status"[^>]*data-scope-line=""[^>]*>Scope: 12 of 42 documents · 318 chunks \(counted here\)<\/div>/);
+	assert.doesNotMatch(renderToStaticMarkup(<StatsStrip stats={stats} dialect={dialect} readOnly={false} />), /data-scope-line/, 'no line without a scope');
 });
 
 test('a document tab holds its HealthPanel', () => {

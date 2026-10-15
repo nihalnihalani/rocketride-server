@@ -46,7 +46,8 @@
 // listing going adds a row and the cap always ends it.
 // =============================================================================
 
-import type { FilterApplied, IDocumentItem, IDocumentsFilter } from '../contract/types';
+import type { FilterApplied, IDocumentItem, IDocumentsFilter, IExportRows } from '../contract/types';
+import { EXPORT_COLUMNS } from '../contract/types';
 import { DIRECTORY_AUTO_ROWS, DIRECTORY_LOAD_MORE } from './budgets';
 import type { IDocumentsPageView } from './results';
 import { formatCount } from './stats';
@@ -416,4 +417,28 @@ export function filterSummary(state: IPagerState, filter: string, matches: numbe
 	const total = state.total ?? state.rows.length;
 	if (state.status === 'loading' || state.status === 'paused') return `filtering ${formatCount(state.rows.length)} of ${formatCount(total)} loaded`;
 	return `${formatCount(matches)} of ${formatCount(total)} documents`;
+}
+
+/**
+ * Directory rows as an export (the documents columns): words and numbers the
+ * directory shows, never anything else the store sent.
+ *
+ * @param items - The documents, in the directory's order.
+ * @returns The columns and rows.
+ */
+export function documentExportRows(items: readonly IDocumentItem[]): IExportRows {
+	return {
+		columns: EXPORT_COLUMNS.documents,
+		rows: items.map((item) => ({
+			objectId: item.objectId,
+			path: item.path,
+			chunks: item.chunks,
+			has_first_chunk: item.has_first_chunk,
+			tables: item.tables,
+			size: item.size,
+			ingestedAt: item.ingestedAt,
+			deleted_chunks: item.deleted_chunks ?? null,
+			max_chunk_id: item.max_chunk_id ?? null,
+		})),
+	};
 }
