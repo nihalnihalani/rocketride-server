@@ -60,6 +60,8 @@ const REQUIRED_TESTS = [
 	'vector.wiring.test.ts',
 	'builder.e2e.test.ts',
 	'a11y.contrast.test.ts',
+	// The live wire captures (tests/fixtures/v1/live) through the same readers.
+	'vector.live.test.ts',
 	// The map: renderer, picking, layouts, projection, quality and contrast.
 	'map.components.test.tsx',
 	'map.view.test.tsx',
