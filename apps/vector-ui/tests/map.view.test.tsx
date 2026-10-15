@@ -36,6 +36,7 @@ import { clusterLabel, clusterRows, clusterView } from '../src/map/clusters';
 import { spanningTree } from '../src/map/graph';
 import { clusterExportRows, duplicateExportRows, pointExportRows } from '../src/map/model';
 import { comparePlan } from '../src/map/queryProjection';
+import type { ILayoutClient, ILayoutSpec, LayoutOutcome } from '../src/map/workerClient';
 import { EDGES_LIGHT_NOTE, MAP_UNAVAILABLE, edgeLegend, listingNote, scopeNote } from '../src/map/wording';
 import type { SideTab } from '../src/views/MapView';
 import { deepFreeze, loadSample, modelOf, pcaXY } from './support/map.samples';
@@ -50,11 +51,27 @@ import { deepFreeze, loadSample, modelOf, pcaXY } from './support/map.samples';
 const CAPTURED = new Set(['ClustersPanel', 'MapToolbar', 'RecommendPanel', 'SavedViewsMenu', 'ExportMenu', 'SimilarityMatrix', 'PointInspector', 'PointCanvas', 'PointsTable', 'DuplicatesPanel', 'OutliersPanel', 'Legend']);
 const captured = new Map<string, Array<Record<string, unknown>>>();
 const spies = new Map<string, unknown>();
+
+// The view's layout client, faked: a static render has no worker, and a test
+// reads which sample, seed and algorithm each layout run was given.
+const layoutRuns: ILayoutSpec[] = [];
+let layoutAnswer: (spec: ILayoutSpec) => LayoutOutcome = () => ({ kind: 'unavailable', message: 'No layout worker in a static render.' });
+const fakeLayoutClient = (): ILayoutClient => ({
+	run: (spec) => {
+		layoutRuns.push(spec);
+		return Promise.resolve(layoutAnswer(spec));
+	},
+	cancel: () => undefined,
+	dispose: () => undefined,
+	busy: false,
+});
+
 const loader = Module as unknown as { _load: (request: string, parent: { filename?: string } | null, isMain: boolean) => unknown };
 const originalLoad = loader._load;
 loader._load = function (request: string, parent: { filename?: string } | null, isMain: boolean): unknown {
 	const loaded = originalLoad.call(this, request, parent, isMain) as Record<string, unknown>;
 	const name = request.split('/').pop() as string;
+	if (name === 'workerClient' && parent?.filename && /views[\\/]MapView\.tsx$/.test(parent.filename)) return { ...loaded, createLayoutClient: fakeLayoutClient };
 	if (!CAPTURED.has(name) || !parent?.filename || !/views[\\/]MapView\.tsx$/.test(parent.filename)) return loaded;
 	let spy = spies.get(name);
 	if (!spy) {
@@ -414,6 +431,89 @@ test('saved views: captured without a vector; applied by drawing the seed again 
 	assert.equal(selection.getState().keys.length, 150, 'the selection is restored by key lookup');
 	assert.equal(selection.getState().sampleModel?.pinned.length, 200);
 });
+
+// -----------------------------------------------------------------------------
+// Saved views with a refined layout: the run lays out the sample drawn for the
+// view. A static render never re-renders, so the handler captured here holds
+// the render before Apply, as a real map's does until the drawn sample lands.
+// -----------------------------------------------------------------------------
+
+type SavedViews = { current(): ISavedViewState | null; onApply(v: ISavedView): Promise<ISavedViewRestore | null> };
+
+/** The sample a saved view draws (another id than the fixtures' s-7-c6774b86). */
+const drawnForView = { ...clustered, sample_id: 's-9-fresh' } as ISampleResult;
+
+/** A saved view over `layout` with seed 9 and no selection. */
+function savedView(layout: ISavedView['layout'], selection: readonly VectorKey[] = []): ISavedView {
+	return { n: 1000, mode: 'detailed', seed: 9, layout, colourBy: 'document', edges: 'none', edgesM: 5, minClusterSize: 5, query: null, scopeFilterId: null, selection, camera: null, id: `v-${layout}`, name: layout, savedAt: 0 };
+}
+
+/** Run `body` with layout runs answered as finished (kNN overlap above PCA's), then put the fake back. */
+async function withLayoutsDone(body: () => Promise<void>): Promise<void> {
+	layoutRuns.length = 0;
+	layoutAnswer = (spec) => ({ kind: 'done', result: { type: 'result', requestId: 1, algorithm: spec.algorithm, positions: new Float32Array(spec.sample.n * 2), ticks: 1, total: 1, elapsedMs: 1, timedOut: false, overlap: 0.8, pcaOverlap: 0.5 } });
+	try {
+		await body();
+	} finally {
+		layoutAnswer = () => ({ kind: 'unavailable', message: 'No layout worker in a static render.' });
+		layoutRuns.length = 0;
+	}
+}
+
+test('a saved view with the neighbour graph layout lays out the sample drawn for the view, not the one shown before Apply', () =>
+	withLayoutsDone(async () => {
+		const before = modelOf(loadSample('sample_demo_1000.json'));
+		assert.notEqual(before.sampleId, drawnForView.sample_id, 'the view draws another sample than the one shown');
+		const rec = recording();
+		const selection = createSelectionStore(KEY);
+		const { calls, channels: counted } = counting({ sample: () => drawnForView });
+		render({ model: enrichedModel(), channels: counted, sample: before, selection, actions: rec.actions });
+		const restore = await last<SavedViews>('SavedViewsMenu').onApply(savedView('neighbour-graph'));
+		assert.ok(restore, 'the view was applied');
+		assert.equal(calls.filter((c) => c.tool === 'sample').length, 1);
+		assert.equal(selection.getState().sampleModel?.sampleId, drawnForView.sample_id, 'the drawn sample is the one shown');
+		assert.equal(layoutRuns.length, 1, 'the saved layout runs once');
+		assert.equal(layoutRuns[0]?.sample.sample_id, drawnForView.sample_id, 'over the sample drawn for the view (its id is what the refined positions are kept under)');
+		assert.equal(layoutRuns[0]?.sample.n, drawnForView.n);
+		assert.equal(layoutRuns[0]?.algorithm, 'force');
+		assert.equal(layoutRuns[0]?.seed, 9, "with the view's seed");
+		assert.equal(layoutRuns[0]?.hidden, null, 'a new sample hides nothing');
+		assert.match(rec.announced.join(' '), /Neighbour graph layout ready/);
+	}));
+
+test('a saved view applied on an empty map (no sample yet) still restores its layout, here t-SNE, over the drawn sample', () =>
+	withLayoutsDone(async () => {
+		const selection = createSelectionStore(KEY);
+		render({ model: enrichedModel(), channels: counting({ sample: () => drawnForView }).channels, selection });
+		const menu = last<SavedViews>('SavedViewsMenu');
+		assert.equal(menu.current(), null, 'nothing to save without a sample, but the Views menu is offered');
+		await menu.onApply(savedView('tsne'));
+		assert.equal(layoutRuns.length, 1, 'the saved layout is restored on an empty map too');
+		assert.equal(layoutRuns[0]?.sample.sample_id, drawnForView.sample_id);
+		assert.equal(layoutRuns[0]?.algorithm, 'tsne');
+	}));
+
+test('a saved view lays out nothing when another sample replaced its own while the absent keys were pinned, or when it was saved on PCA', () =>
+	withLayoutsDone(async () => {
+		const before = modelOf(loadSample('sample_demo_1000.json'));
+		const selection = createSelectionStore(KEY);
+		const { calls, channels: counted } = counting({
+			sample: () => drawnForView,
+			project: () => {
+				selection.setSampleModel(before);
+				return { success: true, items: [] };
+			},
+		});
+		render({ model: enrichedModel(), channels: counted, sample: before, selection });
+		await last<SavedViews>('SavedViewsMenu').onApply(savedView('neighbour-graph', [['not-in-sample', 0]]));
+		assert.equal(calls.filter((c) => c.tool === 'project').length, 1, 'the absent key was projected');
+		assert.equal(selection.getState().sampleModel?.sampleId, before.sampleId, 'another sample is shown now');
+		assert.equal(layoutRuns.length, 0, 'no layout runs over a sample that is no longer shown');
+		// Saved on PCA: the drawn sample starts on PCA, so no layout runs.
+		render({ model: enrichedModel(), channels: counting({ sample: () => drawnForView }).channels, sample: before, selection: createSelectionStore(KEY) });
+		await last<SavedViews>('SavedViewsMenu').onApply(savedView('pca'));
+		assert.equal(layoutRuns.length, 0);
+	}));
 
 test('the inspector and the panels get their values: examples kept per connection, the matrix\'s pair and export, the outliers\' neighbours', () => {
 	recommendExamples.clear();

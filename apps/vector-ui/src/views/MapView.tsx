@@ -260,6 +260,14 @@ interface IRefined {
 	positions: Float32Array;
 }
 
+/** What a layout run lays out: a sample, its seed and its points not shown. */
+interface ILayoutTarget {
+	sample: ISampleResult;
+	seed: number;
+	/** 1 for a point not shown (a removed document, the isolation), or null. */
+	hidden: Uint8Array | null;
+}
+
 /** The layout's state, for the toolbar and the lanes. */
 type LayoutState = 'idle' | 'running' | 'done' | 'kept-pca' | 'cancelled' | 'refused' | 'failed' | 'unavailable';
 
@@ -736,9 +744,14 @@ export function MapView(props: MapViewProps): React.ReactElement {
 	// Layouts
 	// -------------------------------------------------------------------------
 
-	const onLayout = useCallback(
-		async (next: MapLayout): Promise<void> => {
-			if (!sample || !sampleModel) return;
+	/**
+	 * Lay out `target` (the sample it is given, never one read from this
+	 * render): a saved view's layout runs over the sample drawn for the view,
+	 * before the view has re-rendered with it.
+	 */
+	const runLayout = useCallback(
+		async (next: MapLayout, target: ILayoutTarget): Promise<void> => {
+			const { sample, seed, hidden } = target;
 			setNotice(null);
 			if (next === 'pca') {
 				client.cancel();
@@ -758,7 +771,7 @@ export function MapView(props: MapViewProps): React.ReactElement {
 			// The overlaps on the map are this run's, once it ends (never the last run's while this one runs).
 			setQuality(null);
 			const sampleId = sample.sample_id;
-			const outcome = await client.run({ sample, algorithm: next === 'tsne' ? 'tsne' : 'force', seed: sampleModel.seed, hidden }, (ticks, total) => setLayoutProgress(total > 0 ? ticks / total : null));
+			const outcome = await client.run({ sample, algorithm: next === 'tsne' ? 'tsne' : 'force', seed, hidden }, (ticks, total) => setLayoutProgress(total > 0 ? ticks / total : null));
 			setLayoutProgress(null);
 			if (outcome.kind === 'superseded') return;
 			if (outcome.kind === 'done') {
@@ -782,7 +795,13 @@ export function MapView(props: MapViewProps): React.ReactElement {
 			setLayoutState(outcome.kind);
 			setNotice(outcome.kind === 'cancelled' ? LAYOUT_CANCELLED : outcome.message);
 		},
-		[sample, sampleModel, client, hidden, actions],
+		[client, actions],
+	);
+
+	/** The toolbar's layout: the sample shown, with its seed and the points not shown. */
+	const onLayout = useCallback(
+		(next: MapLayout): Promise<void> => (sample && sampleModel ? runLayout(next, { sample, seed: sampleModel.seed, hidden }) : Promise.resolve()),
+		[sample, sampleModel, hidden, runLayout],
 	);
 
 	const onCancel = useCallback((): void => {
@@ -1410,15 +1429,16 @@ export function MapView(props: MapViewProps): React.ReactElement {
 			setEdgesM(view.edgesM);
 			if (view.minClusterSize === 2 || view.minClusterSize === 5 || view.minClusterSize === 10) setMinClusterSize(view.minClusterSize);
 			if (view.camera && typeof view.camera === 'object' && 'mode' in (view.camera as object)) setCameraOverride({ camera: view.camera as MapCamera, seq: Date.now() });
-			if (view.layout !== 'pca') void onLayout(view.layout);
+			// The saved layout runs over the sample drawn for the view (this render's is the one it replaced,
+			// or none), and only while that sample is still the one shown.
+			const drawn = selection.getState().sampleModel;
+			if (view.layout !== 'pca' && drawn !== null && drawn.sampleId === id) void runLayout(view.layout, { sample: drawn.result, seed: drawn.seed, hidden: hiddenMask(drawn) });
 			setSavedQuery(view.query);
 			const result: ISavedViewRestore = { selected: saved.length, restored: restored.length, hollow, dropped: Math.max(0, saved.length - restored.length - hollow) };
 			actions.announce(`${num(result.restored)} of ${num(result.selected)} selected points restored; ${num(result.hollow)} drawn hollow.`);
 			return result;
 		},
-		// onLayout reads the sample it is given once the view re-renders.
-		// eslint-disable-next-line react-hooks/exhaustive-deps
-		[channel, drawSample, selection, limits.project_keys_max, model.capabilities.project, storeNode, actions],
+		[channel, drawSample, runLayout, selection, limits.project_keys_max, model.capabilities.project, storeNode, actions],
 	);
 
 	// -------------------------------------------------------------------------
