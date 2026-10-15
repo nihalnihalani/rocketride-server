@@ -662,6 +662,8 @@ def test_hosted_ca_path_round_trips_through_the_dsn_whatever_its_characters():
     dsn = AccountBase._pin_dsn_tls('postgresql://r:p@pool.ns.svc/t?sslmode=require', hosted=True, ca_file=ca)
     query = dsn.partition('?')[2]
     assert urllib.parse.parse_qs(query, strict_parsing=True) == {'sslmode': ['verify-full'], 'sslrootcert': [ca]}
+    # libpq percent-decodes but keeps '+' literal, so a space must be %20, never '+'.
+    assert query == 'sslmode=verify-full&sslrootcert=C%3A%5CUsers%5Crunner%5Cdb%20ca%26100%25.crt'
 
 
 @pytest.mark.parametrize(
