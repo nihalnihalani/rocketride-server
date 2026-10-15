@@ -114,9 +114,26 @@ def dsn_key(scope: str, target: str = '') -> str:
     return f'{scope}:{target}' if target else scope
 
 
+def is_db_provider(provider: object) -> bool:
+    """True when ``provider`` names one of the RocketRide cloud DB nodes.
+
+    The service registry finds a node whatever the case of its provider
+    (``ROCKETRIDE_SQL`` loads ``rocketride_sql``), so the engine must too, or a
+    differently-cased node would run without being authorized. Not stripped:
+    the registry does not strip either, so ``' rocketride_sql'`` names nothing.
+    """
+    return isinstance(provider, str) and provider.lower() in DB_PROVIDERS
+
+
 def exposes_public_endpoint(components: Iterable) -> bool:
-    """True when any component is a public source (``PUBLIC_SOURCE_PROVIDERS``)."""
-    return any(isinstance(c, dict) and c.get('provider') in PUBLIC_SOURCE_PROVIDERS for c in components or ())
+    """True when any component is a public source (``PUBLIC_SOURCE_PROVIDERS``).
+
+    Providers compare case-insensitively, like the service registry.
+    """
+    return any(
+        isinstance(c, dict) and isinstance(c.get('provider'), str) and c['provider'].lower() in PUBLIC_SOURCE_PROVIDERS
+        for c in components or ()
+    )
 
 
 def _describe(scope: str, target: str) -> str:

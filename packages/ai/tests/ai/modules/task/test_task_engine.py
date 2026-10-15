@@ -769,6 +769,27 @@ def test_db_access_detects_each_provider():
         assert Task._db_access(_task(), pipeline) == ([('org', '')], True), provider
 
 
+@pytest.mark.parametrize('provider', ['ROCKETRIDE_SQL', 'Rocketride_Graph', 'rocketRide_vector'])
+def test_db_access_matches_providers_case_insensitively(provider):
+    """The service registry finds a node whatever the case of its provider, so
+    a differently-cased DB node must be authorized, not skipped.
+    """
+    pipeline = {'components': [{'id': 'a', 'provider': 'tools'}, {'id': 'b', 'provider': provider}]}
+    assert Task._db_access(_task(), pipeline) == ([('org', '')], False), provider
+
+
+@pytest.mark.parametrize('provider', ['WEBHOOK', 'Chat', 'Dropper', 'discord'])
+def test_db_access_flags_public_sources_whatever_their_case(provider):
+    pipeline = {'components': [{'id': 'a', 'provider': provider}, {'id': 'b', 'provider': 'rocketride_sql'}]}
+    assert Task._db_access(_task(), pipeline) == ([('org', '')], True), provider
+
+
+def test_db_access_does_not_strip_providers():
+    """The registry does not strip either: ' rocketride_sql' names no service."""
+    pipeline = {'components': [{'id': 'b', 'provider': ' rocketride_sql'}, {'id': 'c', 'provider': 'chat '}]}
+    assert Task._db_access(_task(), pipeline) == ([], False)
+
+
 def test_db_access_empty_without_db_nodes():
     """Ordinary pipelines never trigger provisioning."""
     pipeline = {'components': [{'id': 'a', 'provider': 'chat'}, {'id': 'b', 'provider': 'db_postgres'}]}

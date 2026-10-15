@@ -56,7 +56,7 @@ from ai.constants import (
 )
 from ai import CONST_AI_NODE_SCRIPT
 from ai.common.dap import DAPBase, DAPClient, TransportWebSocket
-from ai.common.rocketride_db import DB_PROVIDERS, db_target, dsn_key, exposes_public_endpoint
+from ai.common.rocketride_db import db_target, dsn_key, exposes_public_endpoint, is_db_provider
 from ai.modules.task.pipeflow import apply_pipeflow_event
 from ai.modules.task.run_log import RunLogWriter
 from rocketride import (
@@ -734,10 +734,10 @@ class Task(DAPBase):
         components = pipeline.get('components') or []
         targets: List[Tuple[str, str]] = []
         for component in components:
-            if not isinstance(component, dict) or component.get('provider') not in DB_PROVIDERS:
+            if not isinstance(component, dict) or not is_db_provider(component.get('provider')):
                 continue
             try:
-                pair = db_target(Config.getNodeConfig(component['provider'], component.get('config') or {}))
+                pair = db_target(Config.getNodeConfig(component['provider'].lower(), component.get('config') or {}))
             except ValueError as e:
                 raise ValueError(f'{component.get("id") or component["provider"]}: {e}') from e
             if pair not in targets:

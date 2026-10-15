@@ -171,6 +171,12 @@ class TestDbTarget:
         assert not rrdb.exposes_public_endpoint([{'provider': 'tools'}, {'provider': 'rocketride_sql'}])
         assert not rrdb.exposes_public_endpoint(None)
 
+    def test_public_sources_match_whatever_their_case(self):
+        """The service registry is case-insensitive, so the flag must be too."""
+        for provider in ('WEBHOOK', 'Chat', 'Dropper', 'DISCORD', 'Telegram'):
+            assert rrdb.exposes_public_endpoint([{'provider': provider}]), provider
+        assert not rrdb.exposes_public_endpoint([{'provider': 'chat '}, {'provider': None}, {}])
+
 
 class TestResolveRocketrideDsn:
     """Nodes only read what the task engine delivered; they never resolve."""
