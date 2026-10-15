@@ -141,6 +141,7 @@ const CAVEAT_CHIPS: Readonly<Record<string, { label: string; tone: IStatChip['to
 	document_count_capped: { label: 'Orphan count capped', tone: 'muted' },
 	model_mismatch: { label: 'Model mismatch', tone: 'error' },
 	meta_column_pending: { label: 'Metadata column pending', tone: 'warning' },
+	filtered_search_may_underfill: { label: 'Filtered search may return fewer', tone: 'info' },
 };
 
 /** Caveats shown elsewhere (or as their own chip below), never as a caveat chip here. */

@@ -340,6 +340,7 @@ sentence:
 | The store cannot page its document list | This store cannot page its document list; only the first page is shown. |
 | The chat's embedding model is not the collection's | The chat embedding model differs from the one this collection was built with; results may be meaningless. |
 | pgvector could not add its metadata column yet | File size and ingest time are not stored yet: another session holds this table; the store will retry. |
+| The server runs pgvector older than 0.8, whose index search can stop short when a search is limited to some documents | A search limited to some documents may return fewer results than asked: this pgvector is older than 0.8. |
 
 On RocketRide Vector the drawer also says that the table is shared; that
 sentence is quoted under [Connections](#connections).

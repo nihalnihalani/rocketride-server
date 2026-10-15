@@ -99,6 +99,7 @@ export const CAVEATS = [
 	'documents_paging_unsupported',
 	'model_mismatch',
 	'meta_column_pending',
+	'filtered_search_may_underfill',
 ] as const;
 
 /** A documented caveat. */

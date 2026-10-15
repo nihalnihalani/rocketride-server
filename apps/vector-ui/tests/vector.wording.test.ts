@@ -51,6 +51,7 @@ test('the caveat sentences the console shows', () => {
 	assert.equal(caveatSentence('documents_paging_unsupported'), 'This store cannot page its document list; only the first page is shown.');
 	assert.equal(caveatSentence('model_mismatch'), 'The chat embedding model differs from the one this collection was built with; results may be meaningless.');
 	assert.equal(caveatSentence('meta_column_pending'), 'File size and ingest time are not stored yet: another session holds this table; the store will retry.');
+	assert.equal(caveatSentence('filtered_search_may_underfill'), 'A search limited to some documents may return fewer results than asked: this pgvector is older than 0.8.');
 	assert.equal(caveatSentence('a_caveat_from_a_newer_node'), null, 'an unknown caveat is not invented a sentence');
 });
 

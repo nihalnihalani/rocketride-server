@@ -228,6 +228,7 @@ CAVEATS: Tuple[str, ...] = (
     'documents_paging_unsupported',
     'model_mismatch',
     'meta_column_pending',
+    'filtered_search_may_underfill',
 )
 
 #: ``sampleChunks`` strategies and the ``strategy_used`` values of a ``sample`` answer.

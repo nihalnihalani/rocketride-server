@@ -99,6 +99,7 @@ export const CAVEAT_SENTENCES: Readonly<Record<Caveat, string>> = {
 	documents_paging_unsupported: 'This store cannot page its document list; only the first page is shown.',
 	model_mismatch: 'The chat embedding model differs from the one this collection was built with; results may be meaningless.',
 	meta_column_pending: 'File size and ingest time are not stored yet: another session holds this table; the store will retry.',
+	filtered_search_may_underfill: 'A search limited to some documents may return fewer results than asked: this pgvector is older than 0.8.',
 };
 
 /**
