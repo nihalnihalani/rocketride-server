@@ -13,7 +13,7 @@ import type { IDocumentItem, IDocumentsFilter, IScopeState } from '../src/contra
 import { DOCUMENTS_FILTER_KEYS } from '../src/contract/types';
 import { pagerApplyPage, pagerBegin, pagerInit } from '../src/vector/documents';
 import type { IPagerState } from '../src/vector/documents';
-import { EMPTY_FILTER, FILTER_TEXT_MAX, clientKeys, conditionAvailability, conditionLabel, dateToIso, describeFilter, fromDocumentsFilter, listingFilter, matches, parseFilter, removeCondition, resolveScope, sameFilter, scopeAvailability, scopeFromFilter, scopeWith, filterOf, withText, scopeObjectIds, scopeStatusText, scopeStripText, setCondition, toDocumentsFilter, tooLargeText, validateFilter } from '../src/vector/filters';
+import { EMPTY_FILTER, FILTER_TEXT_MAX, clientKeys, conditionAvailability, conditionsFilter, directoryView, scopeView, conditionLabel, dateToIso, describeFilter, fromDocumentsFilter, listingFilter, matches, parseFilter, removeCondition, resolveScope, sameFilter, scopeAvailability, scopeFromFilter, scopeWith, filterOf, withText, scopeObjectIds, scopeStatusText, scopeStripText, setCondition, toDocumentsFilter, tooLargeText, validateFilter } from '../src/vector/filters';
 import type { IFilter } from '../src/vector/filters';
 import { readDocumentsPage, readStats } from '../src/vector/results';
 import { fixture } from './support/fixtures';
@@ -105,8 +105,10 @@ test('toDocumentsFilter sends only the keys that are set, the path box as path_c
 	assert.deepEqual(toDocumentsFilter(filter), { path_prefix: 'C:/demo/handbooks/', file_types: ['md', 'pdf'], ingested_after: '2026-10-01T00:00:00Z', min_chunks: 1, has_first_chunk: true, has_tables: false, path_contains: 'hand' });
 	assert.deepEqual(toDocumentsFilter({ conditions: [], text: '' }), {});
 	for (const key of Object.keys(toDocumentsFilter(filter))) assert.ok((DOCUMENTS_FILTER_KEYS as readonly string[]).includes(key), key);
-	assert.deepEqual(listingFilter(toDocumentsFilter(filter)), { path_prefix: 'C:/demo/handbooks/', file_types: ['md', 'pdf'], ingested_after: '2026-10-01T00:00:00Z', min_chunks: 1, has_first_chunk: true, has_tables: false }, 'the listing asks for the conditions; the path box filters what is loaded');
-	assert.equal(listingFilter({ path_contains: 'x' }), null, 'the path box alone asks the store for nothing');
+	assert.deepEqual(listingFilter(toDocumentsFilter(filter)), { path_prefix: 'C:/demo/handbooks/', file_types: ['md', 'pdf'], ingested_after: '2026-10-01T00:00:00Z', min_chunks: 1, has_first_chunk: true, has_tables: false, path_contains: 'hand' }, 'the listing asks the store for the conditions and the path box');
+	assert.equal(listingFilter({ path_contains: 'x' }), null, 'the path box alone is not a scope: it asks the store for nothing');
+	assert.deepEqual(conditionsFilter(toDocumentsFilter(filter)), { path_prefix: 'C:/demo/handbooks/', file_types: ['md', 'pdf'], ingested_after: '2026-10-01T00:00:00Z', min_chunks: 1, has_first_chunk: true, has_tables: false }, 'the conditions alone (what a saved filter keeps)');
+	assert.equal(conditionsFilter({ path_contains: 'x' }), null);
 });
 
 test('parseFilter reads the wire shape back into conditions (round trip), and refuses what the node would refuse', () => {
@@ -182,8 +184,9 @@ test('ingest dates, chunk counts, tables, first chunk and the path box; a value 
 
 test('clientKeys: what the app filters itself after the store answered server, partial or none (or an older node said nothing)', () => {
 	const sent: IDocumentsFilter = { path_prefix: 'C:/demo/', ingested_after: '2026-10-01T00:00:00Z', path_contains: 'fal' };
-	assert.deepEqual(clientKeys(sent, 'server', []), ['path_contains']);
-	assert.deepEqual(clientKeys(sent, 'partial', ['ingested_after']), ['ingested_after', 'path_contains']);
+	assert.deepEqual(clientKeys(sent, 'server', []), [], 'the store applied every key it was sent, the path box among them');
+	assert.deepEqual(clientKeys(sent, 'partial', ['ingested_after']), ['ingested_after']);
+	assert.deepEqual(clientKeys(sent, 'partial', ['ingested_after', 'path_contains']), ['ingested_after', 'path_contains']);
 	assert.deepEqual(clientKeys(sent, 'none', ['path_prefix', 'ingested_after']), ['path_prefix', 'ingested_after', 'path_contains']);
 	assert.deepEqual(clientKeys(sent, null, []), ['path_prefix', 'ingested_after', 'path_contains'], 'not asked of the store, or an older node: everything here');
 });
@@ -232,6 +235,8 @@ test('the status line under the bar: store, partly here, or here over what is lo
 	assert.equal(scopeStatusText({ applied: 'partial', ignored: ['file_types', 'min_chunks'], count: 3, loaded: 9, total: 9, settled: true }), '3 documents match (store; file types and chunk counts filtered here)');
 	assert.equal(scopeStatusText({ applied: 'none', ignored: ['path_prefix'], count: 12, loaded: 1_200, total: null, settled: false }), '12 of 1,200 loaded match (filtered here; the store cannot filter by these)');
 	assert.equal(scopeStatusText({ applied: 'here', ignored: [], count: 12, loaded: 1_200, total: null, settled: true }), '12 of 1,200 loaded match (filtered here)');
+	assert.equal(scopeStatusText({ applied: 'partial', ignored: ['ingested_after'], count: 12, loaded: 5_000, total: 8_000, settled: true, exact: false }), '12 of 5,000 loaded match (store; ingest dates filtered here)', 'counted here over a listing that stopped short');
+	assert.equal(scopeStatusText({ applied: 'server', ignored: [], count: 5_000, loaded: 5_000, total: null, settled: true, exact: false }), '5,000 of 5,000 loaded match (store)');
 });
 
 test('the scope too large for the map, search and chat: the sentence, and those three toggles disabled with it', () => {
@@ -252,6 +257,8 @@ test("the stats strip's scope line counts documents against the store's figure a
 	assert.equal(scopeStripText({ count: 12, chunks: null, settled: true, loaded: 12 }, stats), 'Scope: 12 of 42 documents');
 	assert.equal(scopeStripText({ count: 1, chunks: 4, settled: true, loaded: 1 }, null), 'Scope: 1 document · 4 chunks (counted here)');
 	assert.equal(scopeStripText({ count: 2_340, chunks: 900, settled: false, loaded: 500 }, stats), 'Scope: 2,340 of 42 documents · 900 chunks in the 500 loaded (counted here)');
+	assert.equal(scopeStripText({ count: 12, chunks: 30, settled: true, loaded: 5_000, exact: false }, stats), 'Scope: at least 12 of 42 documents · 30 chunks in the 5,000 loaded (counted here)');
+	assert.equal(scopeStripText({ count: 12, chunks: null, settled: true, loaded: 5_000, exact: false }, null), 'Scope: at least 12 documents in the 5,000 loaded');
 });
 
 // =============================================================================
@@ -302,14 +309,73 @@ test('the Documents toggle off: the directory lists everything and the scope is 
 	assert.equal(dir.filterApplied, null);
 });
 
-test('the path box narrows the scope here, never through the store', () => {
+test('the path box goes to the store with the conditions: the store counts it when it applied it, else it is matched here', () => {
 	const filter: IDocumentsFilter = { path_prefix: 'C:/demo/greenhouse/', path_contains: 'TXT' };
-	const done = pagerApplyPage(pagerBegin(pagerInit(), listingFilter(filter)), readDocumentsPage(fixture('documents_filter_server')));
-	const resolved = resolveScope(scopeOf(filter), done, 2_000);
-	assert.deepEqual(
-		resolved.objectIds,
-		done.rows.filter((r) => r.path.endsWith('.txt')).map((r) => r.objectId)
-	);
+	const rows = readDocumentsPage(fixture('documents_filter_server')).items;
+	const txt = rows.filter((r) => r.path.endsWith('.txt'));
+	assert.equal(txt.length, 1);
+	assert.deepEqual(clientKeys(filter, 'server', []), [], 'the store applied every key, the path box among them');
+	const server = listed(txt, listingFilter(filter), { filter_applied: 'server', filter_ignored: [] });
+	assert.deepEqual(server.filter, filter, 'the listing asked for the box too');
+	assert.deepEqual(resolveScope(scopeOf(filter), server, 2_000).objectIds, [txt[0]?.objectId]);
+	assert.equal(directoryView(server, scopeOf(filter), 'TXT', 2_000).summary, '1 document matches (store)');
+	// A store that skipped the path text (Chroma answers 'partial' for it): its rows are matched here by the box.
+	const partial = listed(rows, listingFilter(filter), { filter_applied: 'partial', filter_ignored: ['path_contains'] });
+	assert.deepEqual(clientKeys(filter, 'partial', ['path_contains']), ['path_contains']);
+	assert.deepEqual(resolveScope(scopeOf(filter), partial, 2_000).objectIds, [txt[0]?.objectId]);
+	assert.equal(directoryView(partial, scopeOf(filter), 'TXT', 2_000).summary, '1 document matches (store; the path text filtered here)');
+});
+
+/** `pages` pages of 500 rows from `make`, answered with `answer` (the store's total and how much it applied); `more` when the store has more after them. */
+function paged(filter: IDocumentsFilter, pages: number, make: (i: number) => IDocumentItem, answer: Record<string, unknown>, more = false): IPagerState {
+	let pager = pagerBegin(pagerInit(), filter);
+	for (let p = 0; p < pages; p += 1) {
+		const items = Array.from({ length: 500 }, (_, k) => make(p * 500 + k));
+		pager = pagerApplyPage(pager, readDocumentsPage({ success: true, items, next_cursor: more || p + 1 < pages ? `c${p + 1}` : null, counts_exact: true, distinct: true, sorted: true, caveats: [], ...answer }));
+	}
+	return pager;
+}
+
+test("the path box in a large folder: the store's count, and the scope is every document it listed, never the loaded ones' match", () => {
+	// 8,000 documents under the folder, a quarter of them 'falcon'; the store applies the box and lists the 2,000.
+	const name = (i: number): string => `C:/demo/handbooks/${i % 4 === 0 ? 'falcon' : 'orchid'}_${i}.md`;
+	const folder = { path_prefix: 'C:/demo/handbooks/' };
+	const boxed: IDocumentsFilter = { ...folder, path_contains: 'falcon' };
+	const scope = scopeOf(boxed);
+	const store = paged(listingFilter(boxed) as IDocumentsFilter, 4, (i) => doc(`f${i}`, name(i * 4), { chunks: 4 }), { total: 2_000, filter_applied: 'server', filter_ignored: [] });
+	assert.equal(store.status, 'done');
+	assert.equal(directoryView(store, scope, 'falcon', 2_000).summary, '2,000 documents match (store)');
+	assert.equal(resolveScope(scope, store, 2_000).objectIds?.length, 2_000, 'the whole scope, at the cap');
+	assert.equal(scopeStripText(scopeView(scope, store, 2_000), { documents: 8_000 }), 'Scope: 2,000 of 8,000 documents · 8,000 chunks (counted here)');
+	// The listing of the folder alone (the box not sent yet), capped at 5,000 of 8,000: nothing is said to be the store's.
+	const folderOnly = paged(folder, 10, (i) => doc(`d${i}`, name(i), { chunks: 4 }), { total: 8_000, filter_applied: 'server', filter_ignored: [] }, true);
+	assert.equal(folderOnly.status, 'capped');
+	assert.equal(directoryView(folderOnly, scope, 'falcon', 2_000).summary, '1,250 of 5,000 loaded match (filtered here)');
+	assert.equal(resolveScope(scope, folderOnly, 2_000).objectIds, null, 'the listing did not ask for the box: the scope waits for the one that does');
+});
+
+test('a listing that stopped short (capped, stalled): a count matched here is "N of M loaded", and the strip says "at least"', () => {
+	// The legacy table: the store filters the folder and skips the ingest date; 8,000 documents, 5,000 loaded.
+	const filter: IDocumentsFilter = { path_prefix: 'C:/demo/', ingested_after: '2026-10-01T00:00:00Z' };
+	const capped = paged(filter, 10, (i) => doc(`d${i}`, `C:/demo/${i}.md`, { chunks: 2, ingestedAt: i % 5 === 0 ? '2026-10-05T00:00:00Z' : '2026-09-01T00:00:00Z' }), { total: 8_000, filter_applied: 'partial', filter_ignored: ['ingested_after'] }, true);
+	assert.equal(capped.status, 'capped');
+	const scope = scopeOf(filter);
+	const view = scopeView(scope, capped, 2_000);
+	assert.equal(view.exact, false);
+	assert.equal(directoryView(capped, scope, '', 2_000).summary, '1,000 of 5,000 loaded match (store; ingest dates filtered here)');
+	assert.equal(scopeStripText(view, { documents: 8_000 }), 'Scope: at least 1,000 of 8,000 documents · 2,000 chunks in the 5,000 loaded (counted here)');
+	assert.equal(resolveScope(scope, capped, 2_000).objectIds?.length, 1_000, 'the loaded matches (a part of the scope, and the strip says so)');
+	// Every document loaded: the same count is the scope's.
+	const done = paged(filter, 2, (i) => doc(`d${i}`, `C:/demo/${i}.md`, { chunks: 2, ingestedAt: i % 5 === 0 ? '2026-10-05T00:00:00Z' : '2026-09-01T00:00:00Z' }), { total: 1_000, filter_applied: 'partial', filter_ignored: ['ingested_after'] });
+	assert.equal(done.status, 'done');
+	assert.equal(scopeView(scope, done, 2_000).exact, true);
+	assert.equal(directoryView(done, scope, '', 2_000).summary, '200 documents match (store; ingest dates filtered here)');
+	assert.equal(scopeStripText(scopeView(scope, done, 2_000), { documents: 8_000 }), 'Scope: 200 of 8,000 documents · 400 chunks (counted here)');
+	// A store that applied everything but gave no total, capped: it cannot say how many match.
+	const noTotal = paged({ path_prefix: 'C:/demo/' }, 10, (i) => doc(`d${i}`, `C:/demo/${i}.md`), { total: null, filter_applied: 'server', filter_ignored: [] }, true);
+	assert.equal(noTotal.status, 'capped');
+	assert.equal(directoryView(noTotal, scopeOf({ path_prefix: 'C:/demo/' }), '', 2_000).summary, '5,000 of 5,000 loaded match (store)');
+	assert.equal(resolveScope(scopeOf({ path_prefix: 'C:/demo/' }), noTotal, 2_000).overflow, 5_000, 'at least 5,000: above the cap all the same');
 });
 
 test('above the cap: overflow with the count (from the store total when it said), no ids; resolution is stable', () => {

@@ -30,15 +30,19 @@
 // the directory lists and, when their toggles are on, the only documents the
 // map samples, search searches and the chat asks about.
 //
-// THE STORE AND HERE. The listing asks the store for the conditions in the
-// wire shape of `documents.filter` (contract section 4.4-A, `listingFilter`);
-// its answer says how much it applied (`filter_applied`: server, partial,
-// none; an older node says nothing because it ignored the filter). Whatever
-// the store did not apply is matched here over the loaded rows (`clientKeys`,
-// `matches`), and the words always say which ("(store)", "(store; ingest
-// dates filtered here)", "(filtered here; the store cannot filter by these)").
-// The path box is never sent: it filters what is loaded, as it always did,
-// and joins the scope as `path_contains` only while a condition is set.
+// THE STORE AND HERE. The listing asks the store for the conditions and the
+// path box (as `path_contains`) in the wire shape of `documents.filter`
+// (contract section 4.4-A, `listingFilter`); its answer says how much it
+// applied (`filter_applied`: server, partial, none; an older node says
+// nothing because it ignored the filter). Whatever the store did not apply is
+// matched here over the loaded rows (`clientKeys`, `matches`), and the words
+// always say which ("(store)", "(store; the path text filtered here)",
+// "(filtered here; the store cannot filter by these)"). A count matched here
+// over a listing that stopped short (capped, stalled) is only of the rows
+// loaded, and the words say that too ("N of M loaded match", "at least").
+// Without a condition the path box is not a scope and is never sent: it
+// filters what is loaded, as it always did. A saved filter keeps the
+// conditions only (`conditionsFilter`).
 //
 // THE SCOPE'S DOCUMENTS. `resolveScope` turns the listing into the objectIds
 // the scope covers once the listing settles; above `limits.scope_keys_max`
@@ -263,18 +267,42 @@ export function filterKeys(filter: IDocumentsFilter | null | undefined): FilterK
 }
 
 /**
- * What the directory's listing asks the store for: the conditions, never the
- * path box (it filters the loaded rows here, as it always did).
+ * A copy of some keys of a wire filter.
  *
- * @param filter - The scope's wire filter.
- * @returns The listing's filter, or null when no condition is left.
+ * @param filter - The wire filter.
+ * @param keys - The keys to keep.
+ * @returns The copy.
  */
-export function listingFilter(filter: IDocumentsFilter | null | undefined): IDocumentsFilter | null {
-	const keys = filterKeys(filter).filter((key) => key !== 'path_contains');
-	if (!filter || keys.length === 0) return null;
+function pick(filter: IDocumentsFilter, keys: readonly FilterKey[]): IDocumentsFilter {
 	const out: IDocumentsFilter = {};
 	for (const key of keys) (out as Record<string, unknown>)[key] = Array.isArray(filter[key]) ? [...(filter[key] as string[])] : filter[key];
 	return out;
+}
+
+/**
+ * The conditions of a wire filter without the path box: what a saved filter keeps.
+ *
+ * @param filter - The wire filter.
+ * @returns The conditions, or null when there is none.
+ */
+export function conditionsFilter(filter: IDocumentsFilter | null | undefined): IDocumentsFilter | null {
+	const keys = filterKeys(filter).filter((key) => key !== 'path_contains');
+	if (!filter || keys.length === 0) return null;
+	return pick(filter, keys);
+}
+
+/**
+ * What the directory's listing asks the store for: the scope's conditions and
+ * its path box, so a store that filters by path text counts the box too.
+ * The path box alone is not a scope and asks for nothing (it filters the
+ * loaded rows here, as it always did).
+ *
+ * @param filter - The scope's wire filter.
+ * @returns The listing's filter, or null when no condition is set.
+ */
+export function listingFilter(filter: IDocumentsFilter | null | undefined): IDocumentsFilter | null {
+	if (!filter || conditionsFilter(filter) === null) return null;
+	return pick(filter, filterKeys(filter));
 }
 
 /**
@@ -438,8 +466,7 @@ export function matches(item: IDocumentItem, filter: IDocumentsFilter, keys?: re
 
 /**
  * The keys of a scope's filter matched here: the ones the store did not apply
- * (all of them when it applied none, said nothing or was not asked), and the
- * path box always.
+ * (all of them when it applied none, said nothing or was not asked).
  *
  * @param filter - The scope's wire filter.
  * @param applied - What the listing's answer said, or null when the listing did not ask for it.
@@ -448,8 +475,8 @@ export function matches(item: IDocumentItem, filter: IDocumentsFilter, keys?: re
  */
 export function clientKeys(filter: IDocumentsFilter, applied: FilterApplied | null, ignored: readonly string[]): FilterKey[] {
 	const keys = filterKeys(filter);
-	if (applied === 'server') return keys.filter((k) => k === 'path_contains');
-	if (applied === 'partial') return keys.filter((k) => k === 'path_contains' || ignored.includes(k));
+	if (applied === 'server') return [];
+	if (applied === 'partial') return keys.filter((k) => ignored.includes(k));
 	return keys;
 }
 
@@ -512,6 +539,12 @@ export interface IScopeView {
 	ignored: string[];
 	/** The store's total for the listing, when it gave one. */
 	total: number | null;
+	/**
+	 * The count is the scope's own: the store counted it, or it was matched over a
+	 * listing that loaded every document. False while pages arrive and when the
+	 * listing stopped short (capped, stalled, failed): then it is of the loaded rows.
+	 */
+	exact: boolean;
 }
 
 /**
@@ -532,7 +565,8 @@ export function scopeView(scope: Pick<IScopeState, 'filter'> & { applyTo?: Pick<
 	const match = scopeObjectIds(dir.rows, scope.filter, cap, keys);
 	const storeCounts = applied === 'server' && keys.length === 0 && dir.total !== null;
 	const count = storeCounts ? Math.max(dir.total as number, match.count) : match.count;
-	return { count, chunks: match.chunks, ids: count > cap ? null : match.ids, loaded: dir.rows.length, current, settled: current && SETTLED.has(dir.status), applied, ignored: asked ? dir.filterIgnored : [], total: dir.total };
+	const complete = dir.status === 'done' || (dir.total !== null && dir.rows.length >= dir.total);
+	return { count, chunks: match.chunks, ids: count > cap ? null : match.ids, loaded: dir.rows.length, current, settled: current && SETTLED.has(dir.status), applied, ignored: asked ? dir.filterIgnored : [], total: dir.total, exact: storeCounts || complete };
 }
 
 /**
@@ -692,13 +726,15 @@ const KEY_WORDS: Readonly<Record<string, string>> = {
 };
 
 /**
- * The directory's status line for a scope.
+ * The directory's status line for a scope. A count that is not the scope's
+ * own (matched here over a listing that stopped short, or one the store
+ * applied without a total) is said to be of the rows loaded.
  *
- * @param view - What the directory knows ({@link scopeView}).
- * @returns e.g. '12 documents match (store)'.
+ * @param view - What the directory knows ({@link scopeView}); `exact` defaults to true.
+ * @returns e.g. '12 documents match (store)', '12 of 5,000 loaded match (store; ingest dates filtered here)'.
  */
-export function scopeStatusText(view: Pick<IScopeView, 'applied' | 'ignored' | 'count' | 'loaded' | 'total' | 'settled'>): string {
-	const docs = (n: number) => `${n.toLocaleString('en-US')} ${n === 1 ? 'document matches' : 'documents match'}`;
+export function scopeStatusText(view: Pick<IScopeView, 'applied' | 'ignored' | 'count' | 'loaded' | 'total' | 'settled'> & { exact?: boolean }): string {
+	const docs = (n: number) => (view.exact === false ? `${n.toLocaleString('en-US')} of ${view.loaded.toLocaleString('en-US')} loaded match` : `${n.toLocaleString('en-US')} ${n === 1 ? 'document matches' : 'documents match'}`);
 	switch (view.applied) {
 		case 'server':
 			return `${docs(view.count)} (store)`;
@@ -742,16 +778,20 @@ export function scopeAvailability(scope: IScopeState, cap: number): Record<keyof
 }
 
 /**
- * The stats strip's line while a scope is active.
+ * The stats strip's line while a scope is active. A count that is not the
+ * scope's own (`exact` false: matched over the rows loaded so far) is "at
+ * least", in the rows loaded.
  *
- * @param view - The scope's count, its chunks (summed here), whether the listing settled and how many rows are loaded.
+ * @param view - The scope's count, its chunks (summed here), whether the listing settled, how many rows are loaded and whether the count is the scope's own (default true).
  * @param stats - The last stats answer (its document count), or null.
  * @returns e.g. 'Scope: 12 of 42 documents · 318 chunks (counted here)'.
  */
-export function scopeStripText(view: Pick<IScopeView, 'count' | 'chunks' | 'settled' | 'loaded'>, stats: Pick<IStatsView, 'documents'> | Pick<IStatsResult, 'documents'> | null): string {
+export function scopeStripText(view: Pick<IScopeView, 'count' | 'chunks' | 'settled' | 'loaded'> & { exact?: boolean }, stats: Pick<IStatsView, 'documents'> | Pick<IStatsResult, 'documents'> | null): string {
 	const of = stats?.documents ?? null;
-	const docs = of === null ? plural(view.count, 'document', 'documents') : `${view.count.toLocaleString('en-US')} of ${plural(of, 'document', 'documents')}`;
-	if (view.chunks === null) return `Scope: ${docs}`;
-	const partial = view.loaded < view.count;
-	return `Scope: ${docs} · ${plural(view.chunks, 'chunk', 'chunks')}${partial ? ` in the ${view.loaded.toLocaleString('en-US')} loaded` : ''} (counted here)`;
+	const exact = view.exact !== false;
+	const docs = `${exact ? '' : 'at least '}${of === null ? plural(view.count, 'document', 'documents') : `${view.count.toLocaleString('en-US')} of ${plural(of, 'document', 'documents')}`}`;
+	const inLoaded = ` in the ${view.loaded.toLocaleString('en-US')} loaded`;
+	if (view.chunks === null) return `Scope: ${docs}${exact ? '' : inLoaded}`;
+	const partial = !exact || view.loaded < view.count;
+	return `Scope: ${docs} · ${plural(view.chunks, 'chunk', 'chunks')}${partial ? inLoaded : ''} (counted here)`;
 }

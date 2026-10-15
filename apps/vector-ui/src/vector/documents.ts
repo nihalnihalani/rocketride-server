@@ -224,7 +224,7 @@ export interface IPagerState {
 	error: IFailureText | null;
 	/** Pages applied so far. */
 	pages: number;
-	/** The conditions this listing asked the store for (the scope's, without the path box), or null for every document. */
+	/** What this listing asked the store for (the scope's conditions and path box), or null for every document. */
 	filter: IDocumentsFilter | null;
 	/**
 	 * How much of `filter` the store applied, from its first answer: 'server', 'partial' or 'none' ('none' too

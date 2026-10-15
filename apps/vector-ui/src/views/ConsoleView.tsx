@@ -38,8 +38,8 @@
 //
 // THE SCOPE. The directory's ScopeBar sets the connection's scope (the
 // entry's value store, read by the map and search as ConsoleModel.scope);
-// this view hands its conditions to the controller's listing while its
-// Documents toggle is on, resolves the documents it covers from the listing
+// this view hands its conditions and path box to the controller's listing
+// while its Documents toggle is on, resolves the documents it covers from the listing
 // (vector/filters.ts resolveScope: their objectIds once it settles, the count
 // above limits.scope_keys_max), scopes the chat to them while the Chat toggle
 // is on (never above the cap), and keeps the saved filters of the connection.
@@ -136,7 +136,7 @@ export const ConsoleView: React.FC<IConsoleViewProps> = ({ opened, active }) => 
 		if (selectedId !== state.chunks.objectId) entry.controller.selectDocument(selectedId);
 	}, [selectedId, state.chunks.objectId, entry]);
 
-	// The scope: its conditions go to the listing while it filters the list; its documents resolve from the listing.
+	// The scope: its conditions and path box go to the listing while it filters the list; its documents resolve from the listing.
 	const scope = model.scope ?? null;
 	const cap = model.limits.scope_keys_max;
 	const listing = scope !== null && scope.applyTo.documents ? listingFilter(scope.filter) : null;

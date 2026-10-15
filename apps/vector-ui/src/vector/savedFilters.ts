@@ -34,7 +34,7 @@
 // =============================================================================
 
 import type { IDocumentsFilter, ISavedFilter } from '../contract/types';
-import { listingFilter, validateFilter } from './filters';
+import { conditionsFilter, validateFilter } from './filters';
 
 /** At most this many saved filters per connection. */
 export const SAVED_FILTERS_MAX = 20;
@@ -94,7 +94,7 @@ export function savedFiltersFor(map: SavedFiltersMap, connectionKey: string, opt
 			const clean = name.trim();
 			if (clean === '') return { ok: false, error: 'Name the filter first.' };
 			if (clean.length > SAVED_NAME_MAX) return { ok: false, error: `A name has at most ${SAVED_NAME_MAX} characters.` };
-			const conditions = listingFilter(filter);
+			const conditions = conditionsFilter(filter);
 			if (conditions === null) return { ok: false, error: 'Add a condition before saving.' };
 			const invalid = validateFilter(conditions);
 			if (invalid !== null) return { ok: false, error: invalid };

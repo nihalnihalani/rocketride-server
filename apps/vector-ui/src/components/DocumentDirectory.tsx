@@ -27,10 +27,11 @@
 // Renders the auto-pager's rows (vector/documents.ts) as folder groups in a
 // hand-windowed list (fixed 28 px rows, only the visible window mounted), so
 // 5,000 documents scroll smoothly without a windowing library. The filter row
-// is the ScopeBar: its path box filters what is loaded, as it always did
-// (150 ms after the last keystroke); its conditions make the console's scope,
-// which the listing asks the store for and the status line words honestly
-// (vector/filters.ts directoryView). Right-clicking a folder offers "Scope to
+// is the ScopeBar: without a condition its path box filters what is loaded,
+// as it always did (150 ms after the last keystroke); its conditions make
+// the console's scope, which the listing asks the store for together with
+// the path box, and the status line words honestly (vector/filters.ts
+// directoryView). Right-clicking a folder offers "Scope to
 // this folder". Rows can be checked to remove several at once; removing
 // always goes through the console's confirmation.
 // =============================================================================
