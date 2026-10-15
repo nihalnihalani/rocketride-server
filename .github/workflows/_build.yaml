@@ -298,6 +298,15 @@ jobs:
             echo "RR_REQUIRE_DB_TESTS=1"
           } >> "$GITHUB_ENV"
 
+      # TLS-only PostgreSQL for the database TLS and isolation suites
+      # (nodes/test/test_rocketride_db_{tls,isolation}_full.py). The script mints a
+      # throwaway CA, starts the same pgvector image as above with ssl=on and every
+      # non-TLS connection rejected, creates two synthetic tenant databases, and
+      # exports RR_TEST_PG_TLS_PORT / RR_TEST_PG_TLS_CA. No key is committed.
+      - name: Start TLS PostgreSQL for tests / Linux
+        if: matrix.platform == 'ubuntu' && inputs.codeql == false
+        run: nodes/test/db_harness/start-pg-tls.sh rr-pgtls 55434 "$RUNNER_TEMP/rr-pgtls"
+
       - name: Test
         if: inputs.codeql == false && inputs.test
         # Integration tests boot a local server on :5565 and connect a test
