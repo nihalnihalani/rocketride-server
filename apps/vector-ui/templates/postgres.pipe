@@ -109,7 +109,7 @@
         "default": {
           "mode": "strlen",
           "splitter": "RecursiveCharacterTextSplitter",
-          "strlen": 512
+          "strlen": 1000
         },
         "parameters": {}
       },
@@ -347,7 +347,7 @@
       "provider": "annotation",
       "name": "Read this first",
       "config": {
-        "content": "**Vector Explorer: PostgreSQL (pgvector)**\n\nThis pipeline is laid out for Vector Explorer. It has three sources: **Ingest** (drop files here to add documents), **Chat** (ask questions over them) and **Tools** (Vector Explorer's own calls). Start all three, save the pipeline as a project, then open Vector Explorer and choose the connection.\n\n`store_1` is the store Vector Explorer manages; `store_2` reads the same collection for the chat. Keep both on the same collection and connection settings.\n\n**Removing documents is on for `store_1`** (`allow_writes`). Turn it off to make Vector Explorer read-only for this store. Adding documents goes through the Ingest source: anyone who can send data to it can add documents.\n\nThe LLM node needs your key: replace `replace-with-your-key`, and set `base_url` only for an OpenAI-compatible server other than OpenAI.\n\nChunk size is provisional and will be tuned.",
+        "content": "**Vector Explorer: PostgreSQL (pgvector)**\n\nThis pipeline is laid out for Vector Explorer. It has three sources: **Ingest** (drop files here to add documents), **Chat** (ask questions over them) and **Tools** (Vector Explorer's own calls). Start all three, save the pipeline as a project, then open Vector Explorer and choose the connection.\n\n`store_1` is the store Vector Explorer manages; `store_2` reads the same collection for the chat. Keep both on the same collection and connection settings.\n\n**Removing documents is on for `store_1`** (`allow_writes`). Turn it off to make Vector Explorer read-only for this store. Adding documents goes through the Ingest source: anyone who can send data to it can add documents.\n\nThe LLM node needs your key: replace `replace-with-your-key`, and set `base_url` only for an OpenAI-compatible server other than OpenAI.\n\n`chunk_1` asks for chunks of at most 1,000 characters (`strlen`), which on mixed documents gives a median chunk of about 800 characters. The chunker node does not pass `strlen` on to its splitter yet, so chunks run up to about 4,000 characters until it does.",
         "bgColor": "var(--rr-annotation-bg-default)",
         "fgColor": "var(--rr-text-primary)"
       },

@@ -4,16 +4,24 @@
 # =============================================================================
 """Start the Vector Explorer fixture pipelines (local disposable containers only).
 
-Each fixture is one of the shipped templates (``apps/vector-ui/templates``)
-pointed at a local container: ``postgres.pipe`` at gx-pgvector,
-``rocketride_vector.pipe`` through the fake DB broker, ``qdrant.pipe`` at
-vx-qdrant and ``chroma.pipe`` at vx-chroma. The script fills in a fixed
-local-only project id and display name, sets the store connection on
-``store_1`` and ``store_2``, and starts the three sources (``tools_1``,
-``chat_1``, ``ingest_1``) with ``ttl=0`` so the engine does not stop them after
-its idle timeout. Only what is not running yet is started; ``--stop``
-terminates the fixtures' tasks. It never creates, drops or rewrites a table or
-collection: the stores create their collection on the first ingest.
+The fixtures (``vx_fixtures.FIXTURES``):
+
+* ``postgres``, ``rocketride_vector``, ``qdrant``, ``chroma``: one shipped
+  template each (``apps/vector-ui/templates``) pointed at a local container:
+  ``postgres.pipe`` at gx-pgvector, ``rocketride_vector.pipe`` through the
+  fake DB broker, ``qdrant.pipe`` at vx-qdrant, ``chroma.pipe`` at vx-chroma.
+  Their three sources (``tools_1``, ``chat_1``, ``ingest_1``) are started.
+* ``stock_rag``: the shape of the repository's RAG example on pgvector (a
+  webhook ingest and a chat with its own store node, no Tools source), the
+  read-only case; its ``chat_1`` and ``webhook_1`` are started.
+* ``qdrant_pager`` (only when named): ``qdrant.pipe`` on the collection of
+  1,500 one-chunk documents that ``demo/seed_demo.sh --pager`` fills.
+
+Each gets a fixed local-only project id and display name, and every source
+is started with ``ttl=0`` so the engine does not stop it after its idle
+timeout. Only what is not running yet is started; ``--stop`` terminates the
+fixtures' tasks. It never creates, drops or rewrites a table or collection:
+the stores create their collection on the first ingest (``demo/seed_demo.sh``).
 
 ``--llm stub`` (the default) points ``llm_1`` at the local test stub
 (``stub_llm.py``, http://127.0.0.1:18901/v1) and names it "Local stub LLM";
@@ -24,91 +32,36 @@ Before starting, it warms the tiktoken encodings the LLM node counts tokens
 with, so the first chat does not wait for a download (best effort: offline it
 says so and goes on).
 
-Prints names and project ids only, never tokens. Every default below is a
+Prints names and project ids only, never tokens. Every default is a
 throwaway LOCAL-ONLY test value for a disposable container, not a secret.
 
-Usage (from dist/server): ./engine <this folder>/start_fixtures.py [--only postgres,qdrant] [--llm stub|template] [--stop]
+Usage (from dist/server): ./engine <this folder>/start_fixtures.py [--only postgres,qdrant_pager] [--llm stub|template] [--stop]
 The engine must run with RR_DB_BROKER_URL/RR_DB_BROKER_TOKEN for the rocketride_vector fixture (see README.md).
+Settings: ENGINE_URL, RR_TEST_APIKEY and the VX_* variables of README.md.
 """
+
+from __future__ import annotations
 
 import argparse
 import asyncio
-import copy
-import json
-import os
-from pathlib import Path
+import sys
 
-from rocketride import RocketRideClient
+from pathlib import Path
+from typing import List
 
 HERE = Path(__file__).resolve().parent
-REPO = HERE.parents[2]
+sys.path.insert(0, str(HERE))
 
-# Engine under test. An OSS engine started without ROCKETRIDE_APIKEY accepts any
-# non-empty key, so RR_TEST_APIKEY is a local label, not a credential.
-ENGINE_URL = os.environ.get('ENGINE_URL', 'http://127.0.0.1:5590')
-API_KEY = os.environ.get('RR_TEST_APIKEY', 'local-acceptance-key')
-TEMPLATES = Path(os.environ.get('VX_TEMPLATES_DIR', str(REPO / 'apps' / 'vector-ui' / 'templates')))
-STUB_LLM_URL = os.environ.get('VX_STUB_LLM_URL', 'http://127.0.0.1:18901/v1')
-COLLECTION = os.environ.get('VX_COLLECTION', 'vx_demo_docs')
-
-PG = {
-    'host': os.environ.get('VX_PG_HOST', '127.0.0.1'),
-    'port': int(os.environ.get('VX_PG_PORT', '55432')),
-    'user': os.environ.get('VX_PG_USER', 'rruser'),
-    'password': os.environ.get('VX_PG_PASSWORD', 'rrpass'),
-    'database': os.environ.get('VX_PG_DATABASE', 'rrtenant'),
-}
-QDRANT = {'host': os.environ.get('VX_QDRANT_HOST', '127.0.0.1'), 'port': int(os.environ.get('VX_QDRANT_PORT', '56333'))}
-CHROMA = {'host': os.environ.get('VX_CHROMA_HOST', '127.0.0.1'), 'port': os.environ.get('VX_CHROMA_PORT', '58000')}
-
-# The three sources, in start order (the Tools source is the cheapest to start).
-SOURCES = ('tools_1', 'chat_1', 'ingest_1')
-
-# key -> (display name, fixed local-only project id, template stem, connection settings for the store profile).
-# The browser lanes find the fixtures by these display names (env.cjs FIXTURES).
-FIXTURES = {
-    'postgres': (
-        'vx-local Vector (pgvector)',
-        '00000000-0000-4000-8000-00000000d1a1',
-        'postgres',
-        {**PG, 'collection': COLLECTION},
-    ),
-    'rocketride_vector': (
-        'vx-local Vector (RocketRide Vector)',
-        '00000000-0000-4000-8000-00000000d1a2',
-        'rocketride_vector',
-        {'collection': os.environ.get('VX_RR_TABLE', 'vx_demo_rr')},
-    ),
-    'qdrant': (
-        'vx-local Vector (Qdrant)',
-        '00000000-0000-4000-8000-00000000d1a3',
-        'qdrant',
-        {**QDRANT, 'collection': COLLECTION},
-    ),
-    'chroma': (
-        'vx-local Vector (Chroma)',
-        '00000000-0000-4000-8000-00000000d1a4',
-        'chroma',
-        {**CHROMA, 'collection': COLLECTION},
-    ),
-}
+import vx_fixtures as fx  # noqa: E402
 
 
-def build_pipeline(key: str, llm: str) -> dict:
-    """Load one template and fill in the fixture's identity, store connection and LLM."""
-    name, project_id, stem, connection = FIXTURES[key]
-    pipe = json.loads((TEMPLATES / f'{stem}.pipe').read_text(encoding='utf-8'))
-    pipe = copy.deepcopy(pipe)
-    pipe['name'] = name
-    pipe['project_id'] = project_id
-    for comp in pipe['components']:
-        if comp['id'] in ('store_1', 'store_2'):
-            profile = comp['config']['profile']
-            comp['config'][profile].update(connection)
-        elif comp['id'] == 'llm_1' and llm == 'stub':
-            comp['name'] = 'Local stub LLM'
-            comp['config']['custom'].update({'base_url': STUB_LLM_URL, 'apikey': 'local-stub-not-a-key'})
-    return pipe
+def select(only: str) -> List[str]:
+    """The fixture keys to act on: the comma-separated ``only`` list, or the defaults."""
+    keys = [k.strip() for k in only.split(',') if k.strip()] or list(fx.DEFAULT_FIXTURES)
+    unknown = [k for k in keys if k not in fx.FIXTURES]
+    if unknown:
+        raise ValueError(f'unknown fixture(s): {", ".join(unknown)}; known: {", ".join(fx.FIXTURES)}')
+    return keys
 
 
 def warm_tiktoken() -> None:
@@ -126,49 +79,46 @@ def warm_tiktoken() -> None:
             print(f'tiktoken {encoding}: not cached ({type(e).__name__}); the first chat may wait for it')
 
 
-async def main() -> None:
+async def main() -> int:
     """Start (or with --stop, terminate) the selected fixtures."""
+    from rocketride import RocketRideClient
+
     parser = argparse.ArgumentParser(description='Start the Vector Explorer fixture pipelines (local containers only).')
-    parser.add_argument('--only', default='', help='comma-separated fixture keys: ' + ', '.join(FIXTURES))
+    parser.add_argument('--only', default='', help='comma-separated fixture keys: ' + ', '.join(fx.FIXTURES))
     parser.add_argument('--llm', choices=('stub', 'template'), default='stub')
     parser.add_argument('--stop', action='store_true')
     parser.add_argument('--no-warm-tiktoken', action='store_true')
     args = parser.parse_args()
-
-    keys = [k.strip() for k in args.only.split(',') if k.strip()] or list(FIXTURES)
-    unknown = [k for k in keys if k not in FIXTURES]
-    if unknown:
-        parser.error(f'unknown fixture(s): {", ".join(unknown)}')
+    try:
+        keys = select(args.only)
+    except ValueError as e:
+        parser.error(str(e))
     if not args.stop and not args.no_warm_tiktoken:
         warm_tiktoken()
 
+    failures = 0
     # A first start installs and loads the embedding model, which can take minutes.
-    async with RocketRideClient(uri=ENGINE_URL, auth=API_KEY, request_timeout=900000) as client:
-        running = {}
-        for task in await client.get_tasks():
-            pid = (task.get('pipeline') or {}).get('project_id')
-            running[(pid, task.get('source'))] = task
+    async with RocketRideClient(uri=fx.ENGINE_URL, auth=fx.API_KEY, request_timeout=900000) as client:
         for key in keys:
-            name, project_id, _stem, _connection = FIXTURES[key]
+            fixture = fx.FIXTURES[key]
             if args.stop:
-                for source in SOURCES:
-                    task = running.get((project_id, source))
-                    if task is not None:
-                        await client.terminate(task['token'])
-                        print(f'stopped {name} / {source}')
+                for source in await fx.stop(client, fixture.project_id, fixture.sources):
+                    print(f'stopped {fixture.name} / {source}')
                 continue
-            pipe = build_pipeline(key, args.llm)
-            for source in SOURCES:
-                if (project_id, source) in running:
-                    print(f'running {name} / {source} ({project_id})')
+            pipe = fx.build_pipeline(key, args.llm)
+            running = await fx.running_tasks(client)
+            for source in fixture.sources:
+                if (fixture.project_id, source) in running:
+                    print(f'running {fixture.name} / {source} ({fixture.project_id})')
                     continue
                 try:
-                    # ttl=0: run until --stop (the engine stops a task idle for its TTL, 15 minutes by default).
-                    await client.use(pipeline=pipe, source=source, ttl=0)
-                    print(f'started {name} / {source} ({project_id})')
+                    await fx.ensure_started(client, pipe, (source,))
+                    print(f'started {fixture.name} / {source} ({fixture.project_id})')
                 except Exception as e:  # noqa: BLE001 - the other fixtures still start
-                    print(f'FAILED {name} / {source}: {type(e).__name__}: {str(e)[:200]}')
+                    failures += 1
+                    print(f'FAILED {fixture.name} / {source}: {type(e).__name__}: {str(e)[:200]}')
+    return 1 if failures else 0
 
 
 if __name__ == '__main__':
-    asyncio.run(main())
+    sys.exit(asyncio.run(main()))
