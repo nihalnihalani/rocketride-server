@@ -29,7 +29,7 @@
     "floor": 0.2,
     "threshold": 0.3
   },
-  "support": "experimental",
+  "support": "supported",
   "allow_writes": true,
   "agent_writes": true,
   "writes_scope": "tools_source",
@@ -86,7 +86,5 @@
     "model_mismatch": null,
     "meta_column": true
   },
-  "caveats": [
-    "experimental"
-  ]
+  "caveats": []
 }

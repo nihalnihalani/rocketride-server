@@ -380,6 +380,11 @@ _SWAPPED_MODULES = (
     'nodes.rocketride_vector.IGlobal',
     'nodes.rocketride_vector.IInstance',
     'nodes.rocketride_vector.rocketride_vector',
+    'nodes.store_postgres',
+    'nodes.store_postgres.IEndpoint',
+    'nodes.store_postgres.IGlobal',
+    'nodes.store_postgres.IInstance',
+    'nodes.store_postgres.postgres',
 )
 
 
@@ -758,6 +763,38 @@ class TestPgVectorTransactions:
         assert 'meta' in [name for name, _type in mock_rv.db.table('rr_vec').columns]
         rows = {r['objectid']: r for r in mock_rv.db.table('rr_vec').rows.values()}
         assert rows['c']['meta'] == {'size': 7} and 'meta' not in rows['b']
+
+
+class TestPgVectorSupportLevel:
+    """Both pgvector providers report support 'supported' (vector-tool-contract.md §3).
+
+    The level is set from the unmocked evidence, never from this file: the live suites
+    test_store_postgres_full.py and test_rocketride_db_full.py (direct DSN and
+    RR_TEST_PGVECTOR_POOLER_DSN) and test_vector_toolpath_full.py (postgres.pipe and
+    rocketride_vector.pipe on a new and a legacy table, and through the pooler). These
+    pins only keep the constant and the dialect answer from drifting.
+    """
+
+    def test_the_shared_driver_and_both_node_stores_are_supported(self, mock_rv):
+        import importlib
+
+        driver = importlib.import_module('ai.common.store.pgvector.driver')
+        postgres = importlib.import_module('nodes.store_postgres.postgres')
+        assert driver.PgVectorStore.VX_SUPPORT == 'supported'
+        assert mock_rv.Store.VX_SUPPORT == 'supported'
+        assert postgres.Store.VX_SUPPORT == 'supported'
+
+    def test_dialect_reports_supported_without_the_experimental_caveat(self, mock_rv):
+        from ai.common.store import VectorStoreToolMixin
+
+        store = _make_store(mock_rv, {'collection': 'rr_vec', 'similarity': 'cosine'})
+        store.addChunks([_doc('doc', 0, [1, 0, 0, 0, 0])])
+        node = VectorStoreToolMixin()
+        node.IGlobal = types.SimpleNamespace(store=store)
+        answer = node.dialect({})
+        assert answer['success'] is True
+        assert answer['support'] == 'supported'
+        assert 'experimental' not in answer['caveats']
 
 
 class TestRocketrideVectorWriteCheck:

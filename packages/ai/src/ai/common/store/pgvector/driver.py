@@ -117,6 +117,12 @@ class PgVectorStore(DocumentStoreBase):
     #: The extras (size, modifyTime, ingestedAt) go to the ``meta`` column; without it they are dropped per row.
     VX_STORES_EXTRAS = True
 
+    #: Support level reported by the explorer's dialect, for both pgvector providers (postgres and
+    #: rocketride_vector): the unmocked live suites (nodes/test/test_store_postgres_full.py,
+    #: test_rocketride_db_full.py and test_vector_toolpath_full.py) run on a new and a legacy
+    #: table, directly and through a transaction-mode pooler.
+    VX_SUPPORT = 'supported'
+
     VX_DRIVER_CAPABILITIES: FrozenSet[str] = frozenset(
         {'sample_stratified_native', 'documents_distinct', 'documents_sorted', 'search_keyword'}
     )
