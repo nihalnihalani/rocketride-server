@@ -250,6 +250,11 @@ export RR_REQUIRE_DB_TESTS=1   # an unreachable server fails the suite instead o
 ./engine -m pytest ../../nodes/test/test_vector_wire_fixtures_full.py -q -rs
 ```
 
+The tool-path suite and the wire captures start their own engine; each run
+takes its own block of free task ports (from `RR_TEST_TOOLPATH_BASE_PORT`,
+default 44000), so runs from two checkouts at once do not reach each other's
+tasks, and `RR_TEST_TOOLPATH_ENGINE_PORT` fixes the engine's own port.
+
 Without `RR_REQUIRE_DB_TESTS` a suite whose server is unreachable skips with a
 `NOT RUN:` reason, so a run can pass without touching a database; read the skip
 summary that `-rs` prints. A run by name also leaves out the checks
