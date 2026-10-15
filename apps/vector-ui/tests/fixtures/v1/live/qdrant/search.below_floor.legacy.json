@@ -13,7 +13,7 @@
       },
       "raw_score": 0.5733,
       "sim": 0.1466,
-      "below_threshold": false,
+      "below_threshold": true,
       "below_floor": false,
       "rank": 1
     },
@@ -28,7 +28,7 @@
       },
       "raw_score": 0.5557,
       "sim": 0.1113,
-      "below_threshold": false,
+      "below_threshold": true,
       "below_floor": false,
       "rank": 2
     },
@@ -43,7 +43,7 @@
       },
       "raw_score": 0.5504,
       "sim": 0.1007,
-      "below_threshold": false,
+      "below_threshold": true,
       "below_floor": false,
       "rank": 3
     }

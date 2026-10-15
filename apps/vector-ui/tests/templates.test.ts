@@ -277,6 +277,22 @@ test("the retrieval threshold is the same cosine cut on every store's own score 
 	}
 });
 
+/** Template file -> the folder of its live captures (tests/fixtures/v1/live), for the templates that have them. */
+const CAPTURED_AS: Record<string, string> = { postgres: 'pgvector', rocketride_vector: 'rocketride_vector', qdrant: 'qdrant', chroma: 'chroma' };
+
+test("the live dialect captures report the template's current threshold (regenerate them when a threshold changes)", () => {
+	// The captures are taken from these templates (nodes/test/vector_wire_fixtures.py); a template edit
+	// without a regeneration only shows up in the live suite, so the threshold they echo is checked here too.
+	for (const [key, folder] of Object.entries(CAPTURED_AS)) {
+		const expected = settings(byId(read(key).components, 'store_1')).score;
+		for (const kind of ['', '.legacy']) {
+			const file = path.join(FIXTURES, 'v1', 'live', folder, `dialect${kind}.json`);
+			const dialect = JSON.parse(fs.readFileSync(file, 'utf8')) as { score?: { threshold?: unknown } };
+			assert.equal(dialect.score?.threshold, expected, `${folder}/dialect${kind}.json reports threshold ${String(dialect.score?.threshold)}, ${key}.pipe sets ${String(expected)}: regenerate the captures`);
+		}
+	}
+});
+
 test('the parser refuses files over 50 MB in every template', () => {
 	for (const key of FILES) {
 		const parse = byId(read(key).components, 'parse_1');
