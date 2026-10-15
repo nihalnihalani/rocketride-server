@@ -43,8 +43,10 @@ from rocketlib import OPEN_MODE, warning
 
 from ai.common.config import Config
 from ai.common.transform import IGlobalTransform
+from ai.common.utils.config_utils import parse_bool
 
 from .document_store import DocumentStoreBase
+from .vx_defaults import VECTOR_AGENT_WRITES_DEFAULT, VECTOR_ALLOW_WRITES_DEFAULT
 
 
 class StoreGlobalBase(IGlobalTransform, ABC):
@@ -61,6 +63,13 @@ class StoreGlobalBase(IGlobalTransform, ABC):
     # beginGlobal only when an embedding sub-block is configured.
     embed_query = None
     embed_model_name: Optional[str] = None
+
+    # Write switches of the vector store tools (remove_document, delete, upsert),
+    # read in beginGlobal from the node config keys ``allow_writes`` and
+    # ``agent_writes``. ``allow_writes`` governs external tool calls (DAP);
+    # ``agent_writes`` governs calls made by an agent inside the pipeline.
+    allow_writes: bool = VECTOR_ALLOW_WRITES_DEFAULT
+    agent_writes: bool = VECTOR_AGENT_WRITES_DEFAULT
 
     # ------------------------------------------------------------------
     # Abstract interface — every store driver must implement these
@@ -111,6 +120,14 @@ class StoreGlobalBase(IGlobalTransform, ABC):
         resolved_name = cfg.get('serverName') if hasattr(cfg, 'get') else None
         if isinstance(resolved_name, str) and resolved_name.strip():
             self.serverName = resolved_name.strip()
+
+        # Write switches: loose booleans ("yes", "off", ...); anything else keeps the default.
+        self.allow_writes = parse_bool(
+            cfg.get('allow_writes') if hasattr(cfg, 'get') else None, VECTOR_ALLOW_WRITES_DEFAULT
+        )
+        self.agent_writes = parse_bool(
+            cfg.get('agent_writes') if hasattr(cfg, 'get') else None, VECTOR_AGENT_WRITES_DEFAULT
+        )
 
         # Open the driver's store, then wire an optional embedder for the tool path.
         # Pass the raw connConfig, not the merged cfg above: each driver's Store
