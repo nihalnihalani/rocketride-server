@@ -473,6 +473,72 @@ test("the pager sends the scope's conditions; a new filter lists again from the 
 	store.dispose();
 });
 
+test('the path box with the scope: a store that filters by it lists again; one that skips it keeps the rows it listed', async () => {
+	// pgvector answers 'server': the box is the store's to apply.
+	{
+		const { store, clock, filters } = scoped('documents_filter_server');
+		const greenhouse = { path_prefix: 'C:/demo/greenhouse/' };
+		store.setFilter(greenhouse);
+		store.open();
+		await clock.settle();
+		store.setFilter({ ...greenhouse, path_contains: 'txt' });
+		await clock.settle();
+		assert.deepEqual(filters, [greenhouse, { ...greenhouse, path_contains: 'txt' }], 'asked again, with the box');
+		store.dispose();
+	}
+	// A store that filters nothing ('none') would list the same rows for any text: they are kept, under the new filter.
+	{
+		const { store, clock, filters } = scoped('documents_filter_client');
+		const handbooks = { path_prefix: 'C:/demo/handbooks/', file_types: ['md'] };
+		store.setFilter(handbooks);
+		store.open();
+		await clock.settle();
+		const asked = filters.length;
+		const before = store.getState().directory;
+		assert.equal(before.filterApplied, 'none');
+		store.setFilter({ ...handbooks, path_contains: 'falcon' });
+		await clock.settle();
+		const after = store.getState().directory;
+		assert.equal(filters.length, asked, 'nothing is asked');
+		assert.equal(after.rows, before.rows, 'the rows are kept');
+		assert.equal(after.status, before.status);
+		assert.deepEqual(after.filter, { ...handbooks, path_contains: 'falcon' });
+		assert.deepEqual(after.filterIgnored, ['path_prefix', 'file_types', 'path_contains']);
+		const scope: IScopeState = { filter: { ...handbooks, path_contains: 'falcon' }, label: '', objectIds: null, overflow: null, applyTo: { documents: true, map: true, search: true, chat: true } };
+		assert.equal(directoryView(after, scope, 'falcon', 2_000).summary, '1 of 3 loaded match (filtered here; the store cannot filter by these)');
+		store.setFilter({ path_prefix: 'C:/demo/field/', path_contains: 'falcon' });
+		await clock.settle();
+		assert.deepEqual(filters[asked], { path_prefix: 'C:/demo/field/', path_contains: 'falcon' }, 'new conditions list again');
+		store.dispose();
+	}
+	// A store that skipped the path text ('partial' naming it, as Chroma does): new text keeps the rows; clearing it lists again.
+	{
+		const filters: Array<IDocumentsFilter | null | undefined> = [];
+		const { store, clock } = harness({
+			documents: async (_cursor, _limit, filter) => {
+				filters.push(filter);
+				const skipped = filter?.path_contains != null;
+				return readDocumentsPage({ ...fixture('documents_filter_server'), filter_applied: skipped ? 'partial' : 'server', filter_ignored: skipped ? ['path_contains'] : [], caveats: skipped ? ['documents_filter_partial'] : [] });
+			},
+		});
+		const greenhouse = { path_prefix: 'C:/demo/greenhouse/' };
+		store.setFilter({ ...greenhouse, path_contains: 'orchid' });
+		store.open();
+		await clock.settle();
+		assert.equal(store.getState().directory.filterApplied, 'partial');
+		store.setFilter({ ...greenhouse, path_contains: 'txt' });
+		await clock.settle();
+		assert.equal(filters.length, 1, 'the store skips the box: nothing is asked');
+		assert.deepEqual(store.getState().directory.filter, { ...greenhouse, path_contains: 'txt' });
+		assert.deepEqual(store.getState().directory.filterIgnored, ['path_contains']);
+		store.setFilter(greenhouse);
+		await clock.settle();
+		assert.deepEqual(filters.slice(1), [greenhouse], 'without the box the store may apply everything: asked again');
+		assert.equal(store.getState().directory.filterApplied, 'server');
+		store.dispose();
+	}
+});
+
 test("a filter set before the console opens is the first listing's; a removal lists again with it", async () => {
 	const { store, clock, filters } = scoped();
 	const handbooks = { path_prefix: 'C:/demo/handbooks/' };

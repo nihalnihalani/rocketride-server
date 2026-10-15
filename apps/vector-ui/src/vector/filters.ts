@@ -306,6 +306,26 @@ export function listingFilter(filter: IDocumentsFilter | null | undefined): IDoc
 }
 
 /**
+ * The listing kept for a new filter when the store would list the same rows
+ * for it: only the path box changed, and the store skipped the path text: it
+ * filters nothing ('none', or an older node that ignored the filter), or it
+ * named `path_contains` among the keys it skipped ('partial') and the box is
+ * still set. The rows, cursor and status stay; only the filter is the new one.
+ * Else null: the new filter lists again.
+ *
+ * @param dir - The listing.
+ * @param next - The new filter, or null for every document.
+ * @returns The kept listing, or null.
+ */
+export function keepListing(dir: IPagerState, next: IDocumentsFilter | null): IPagerState | null {
+	if (next === null || dir.filter === null || dir.filterApplied === null) return null;
+	if (!sameFilter(conditionsFilter(dir.filter), conditionsFilter(next))) return null;
+	if (dir.filterApplied === 'none') return { ...dir, filter: next, filterIgnored: filterKeys(next) };
+	if (dir.filterApplied === 'partial' && dir.filterIgnored.includes('path_contains') && filterKeys(next).includes('path_contains')) return { ...dir, filter: next };
+	return null;
+}
+
+/**
  * Whether two wire filters mean the same (key order, empty keys and the order of file types do not matter).
  *
  * @param a - A filter, or null for none.

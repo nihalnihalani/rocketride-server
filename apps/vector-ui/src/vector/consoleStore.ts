@@ -37,8 +37,10 @@
 //              (and sorts what is loaded); shown, it resumes at its cursor. A
 //              refresh starts over and drops any page of the old listing.
 //              With a scope, every page asks the store for its conditions
-//              (setFilter); new conditions list again from the first page,
-//              the same ones ask nothing, and refreshes keep them.
+//              and its path box (setFilter); a new filter lists again from
+//              the first page, the same one asks nothing, and refreshes keep
+//              it. New path text alone keeps the rows when the store skipped
+//              the path text (it would list the same ones).
 //   CHUNKS     the selected document's chunks, a page at a time.
 //   REMOVAL    requestRemove opens a confirmation and sends NOTHING; Cancel
 //              sends nothing and says so; Confirm sends the batches once
@@ -57,7 +59,7 @@ import { removalSummary, runRemoval } from './confirm';
 import type { IRemoveTarget } from './confirm';
 import { pagerApplyPage, pagerBegin, pagerFail, pagerInit, pagerLoadMore, pagerPause, pagerResume, pagerWantsPage } from './documents';
 import type { IPagerState } from './documents';
-import { filterKeys, sameFilter } from './filters';
+import { filterKeys, keepListing, sameFilter } from './filters';
 import type { IChunksPageView, IDocumentsPageView, IRemoveView, IStatsView } from './results';
 import { statsRefreshPlan } from './stats';
 import type { StatsTrigger } from './stats';
@@ -354,6 +356,12 @@ export function createConsoleStore(deps: IConsoleDeps, opts: IConsoleOptions): I
 			if (sameFilter(next, state.directory.filter)) return;
 			if (state.directory.status === 'idle') {
 				set({ directory: { ...state.directory, filter: next } });
+				return;
+			}
+			// Only the path box changed and the store skipped it: it would list the same rows again.
+			const kept = keepListing(state.directory, next);
+			if (kept !== null) {
+				set({ directory: kept });
 				return;
 			}
 			startDirectory(next);
