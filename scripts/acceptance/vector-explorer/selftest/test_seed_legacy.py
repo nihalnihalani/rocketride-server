@@ -6,7 +6,8 @@
 
 They check that its verification cannot pass a collection that is not what the
 driver suites expect (one control record, exactly the planted document without
-chunk 0, every document present, the calibrated chunk shape, and the old
+chunk 0, on pgvector exactly the planted soft-deleted row, every document
+present, the calibrated chunk shape, and the old
 drivers' shape: random point ids, only the old metadata keys, only the old
 columns), that a seed is refused before any collection is dropped when the
 engine it ingests through would cut the corpus without the chunk length or
@@ -103,6 +104,8 @@ class VerdictTests(unittest.TestCase):
             long_manual_chunks=159,
             median_chunk_chars=806,
             shape=OLD_PG_SHAPE,
+            soft_deleted=[('s', 1)],
+            expected_soft_deleted=('s', 1),
         )
         args.update(overrides)
         return seed.verdict('pgvector', **args)
@@ -121,6 +124,21 @@ class VerdictTests(unittest.TestCase):
         self.assertTrue(self.ok(missing=['a-missing-document']))
         with_meta = dict(OLD_PG_SHAPE, columns=sorted(seed.LEGACY_COLUMNS | {'meta'}))
         self.assertTrue(self.ok(shape=with_meta, seeded_now=True))
+
+    def test_pgvector_needs_exactly_the_planted_soft_deleted_row(self):
+        # The health fields' live case: one soft-deleted row of a document that keeps its other rows.
+        for soft in ([], [('s', 1), ('s', 2)], [('s', 2)], [('t', 1)], None):
+            problems = self.ok(soft_deleted=soft)
+            self.assertTrue(any('soft-deleted' in p for p in problems), (soft, problems))
+        self.assertEqual(self.ok(soft_deleted=[['s', 1]]), [])  # rows read back as lists
+        # Qdrant and Chroma report no soft-deleted chunks, so their verdict asks for none.
+        self.assertEqual(self.ok(soft_deleted=None, expected_soft_deleted=None), [])
+
+    def test_the_soft_deleted_row_is_a_middle_chunk_of_a_corpus_document_other_than_the_orphan(self):
+        names = seed.corpus_names(seed._corpus())
+        self.assertIn(seed.PREFIX + seed.SOFT_DELETED_REL, names)
+        self.assertNotEqual(seed.SOFT_DELETED_REL, seed.ORPHAN_REL)
+        self.assertGreater(seed.SOFT_DELETED_CHUNK, 0)
 
     def test_a_collection_whose_shape_was_not_read_fails(self):
         # No backend can pass without its shape being checked.
@@ -410,6 +428,7 @@ class SeedRefusalTests(unittest.TestCase):
         'qdrant_drop',
         'chroma_drop',
         'pg_plant_orphan',
+        'pg_plant_soft_deleted',
         'qdrant_plant_orphan',
         'chroma_plant_orphan',
     )
@@ -478,6 +497,10 @@ class SeedRefusalTests(unittest.TestCase):
         self.assertEqual(sorted(notes), sorted(seed.BACKENDS))
         self.assertIn(('pg_create', seed.LEGACY), self.calls)
         self.assertIn(('ingest', 'qdrant', seed.LEGACY), self.calls)
+        # The soft-deleted row is planted after the ingest, on pgvector only.
+        planted = [c for c in self.calls if c[0].endswith('_plant_soft_deleted')]
+        self.assertEqual(planted, [('pg_plant_soft_deleted', seed.LEGACY)])
+        self.assertGreater(self.calls.index(planted[0]), self.calls.index(('ingest', 'postgres', seed.LEGACY)))
         chunker = notes['pgvector']['chunker']
         self.assertEqual((chunker['engine'], chunker['long_manual_chunks']), (seed.fx.ENGINE_URL, 145))
         # This checkout's node is reported, not obeyed.
@@ -513,6 +536,65 @@ class SeedRefusalTests(unittest.TestCase):
         seed.engine_client = lambda: self.fail('the engine was asked although nothing is seeded')
         self.assertEqual(asyncio.run(seed.seed(list(seed.BACKENDS), recreate=False)), {})
         self.assertEqual(self.calls, [])
+
+
+class TopUpTests(unittest.TestCase):
+    """A pgvector table seeded before the soft-deleted row existed gets it in place: no engine, no re-ingest."""
+
+    def setUp(self):
+        self.calls = []
+        names = ('pg_exists', 'pg_soft_deleted', 'pg_plant_soft_deleted', 'engine_client', 'seed', 'verify')
+        self.saved = {n: getattr(seed, n) for n in names}
+        seed.pg_exists = lambda name: True
+        seed.pg_soft_deleted = lambda name: list(self.present)
+        seed.pg_plant_soft_deleted = lambda name, oid, chunk: self.calls.append((name, oid, chunk)) or 1
+        seed.engine_client = lambda: self.fail('the top-up asked the engine')
+        self.present = []
+
+    def tearDown(self):
+        for n, f in self.saved.items():
+            setattr(seed, n, f)
+
+    def test_a_table_without_the_row_gets_it(self):
+        notes = seed.top_up(['pgvector'])
+        soft_id = seed.fx.object_id(seed.PREFIX + seed.SOFT_DELETED_REL)
+        self.assertEqual(self.calls, [(seed.LEGACY, soft_id, seed.SOFT_DELETED_CHUNK)])
+        self.assertEqual(notes, {'pgvector': {'soft_deleted_rows': 1}})
+
+    def test_nothing_is_planted_twice_or_over_other_soft_deletes(self):
+        self.present = [('someone', 3)]
+        self.assertEqual(seed.top_up(['pgvector']), {})
+        self.assertEqual(self.calls, [])
+
+    def test_a_table_this_run_seeded_or_not_selected_is_left_alone(self):
+        self.assertEqual(seed.top_up(['pgvector'], seeded=['pgvector']), {})
+        self.assertEqual(seed.top_up(['qdrant', 'chroma']), {})
+        seed.pg_exists = lambda name: False
+        self.assertEqual(seed.top_up(['pgvector']), {})
+        self.assertEqual(self.calls, [])
+
+    def run_main(self, *argv):
+        async def no_seed(backends, recreate):
+            return {}
+
+        seed.seed = no_seed
+        seed.verify = lambda backends, seeded_now=(): ({}, [])
+        saved_argv = sys.argv
+        sys.argv = ['seed_legacy.py', *argv]
+        try:
+            import contextlib
+            import io
+
+            with contextlib.redirect_stdout(io.StringIO()):
+                return seed.main()
+        finally:
+            sys.argv = saved_argv
+
+    def test_main_tops_up_but_verify_only_never_writes(self):
+        self.assertEqual(self.run_main('--only', 'pgvector', '--verify-only'), 0)
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.run_main('--only', 'pgvector'), 0)
+        self.assertEqual(len(self.calls), 1)
 
 
 class SafetyTests(unittest.TestCase):
