@@ -244,7 +244,13 @@ HTML and remote images in an answer are not rendered.
 **Why these?** re-runs the search with the question and shows every candidate:
 the node's score threshold, the store's floor below which rows are dropped, the
 near misses greyed out, and a histogram of scores. It is hidden when the
-pipeline's embedding node cannot be reached from the app.
+pipeline's embedding node cannot be reached from the app. The floor is the
+store node's long-standing cut, on the same score scale as the threshold:
+`0.2` on most stores (`0` on Pinecone). On pgvector and RocketRide Vector that
+is a cosine similarity of 0.2, so off-topic chunks show up below it. On the
+stores that score (1 + cosine similarity) / 2, such as Qdrant and Chroma, `0.2`
+is a cosine of −0.6, which almost no chunk falls under: there, every chunk under
+the threshold shows as a near miss and none as below the floor.
 
 The app stops waiting after 120 seconds: "Stopped waiting after 120 s. The
 pipeline may still be answering; there is no way to cancel it from here." The
