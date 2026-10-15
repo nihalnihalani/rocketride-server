@@ -28,7 +28,7 @@
 // projected on the CPU and drawn as circles, batched by colour (one path and one
 // fill per colour), then one stroke for every outlined or emphasised point and
 // one per colour for hollow points. Slower than WebGL at thousands of points,
-// but complete.
+// but complete. `snapshot` draws the last frame again and copies it (the PNG).
 // =============================================================================
 
 import { projectToScreen } from './camera';
@@ -51,6 +51,7 @@ export function createCanvas2dRenderer(canvas: HTMLCanvasElement): IPointRendere
 	let heightCss = 1;
 	let dpr = 1;
 	let xy = new Float32Array(0);
+	let lastFrame: IRenderFrame | null = null;
 
 	return {
 		kind: 'canvas2d',
@@ -76,6 +77,7 @@ export function createCanvas2dRenderer(canvas: HTMLCanvasElement): IPointRendere
 			xy = new Float32Array(next.count * 2);
 		},
 		render(frame: IRenderFrame): void {
+			lastFrame = frame;
 			const ratio = frame.dpr || dpr;
 			ctx.setTransform(1, 0, 0, 1, 0, 0);
 			ctx.clearRect(0, 0, canvas.width, canvas.height);
@@ -132,9 +134,16 @@ export function createCanvas2dRenderer(canvas: HTMLCanvasElement): IPointRendere
 				ctx.stroke();
 			}
 		},
+		snapshot(target: CanvasRenderingContext2D): boolean {
+			if (lastFrame === null) return false;
+			this.render(lastFrame);
+			target.drawImage(canvas, 0, 0);
+			return true;
+		},
 		destroy(): void {
 			data = null;
 			groups = new Map();
+			lastFrame = null;
 		},
 	};
 }

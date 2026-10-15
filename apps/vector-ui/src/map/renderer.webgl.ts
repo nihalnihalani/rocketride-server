@@ -37,6 +37,10 @@
 //   - `webglcontextlost` is prevented (so the browser may restore it) and stops
 //     drawing; `webglcontextrestored` rebuilds the program and buffers from the
 //     last points and asks for a redraw.
+//   - `preserveDrawingBuffer` stays false (faster), so the canvas may be cleared
+//     once a frame is presented: `snapshot` (the map's PNG) draws the last frame
+//     again and copies the canvas into the target in the same task, before the
+//     browser can clear it.
 //
 // Flags: bit 1 outlined (1 px outline in --rr-text-primary), bit 2 hidden (a
 // removed document's point: not drawn), bit 4 hollow (a ring in the point's
@@ -88,6 +92,11 @@ export interface IPointRenderer {
 	/** Replace the points; `outline` is the outline colour, 0-1 per channel. */
 	setPoints(data: IPointData, outline: [number, number, number]): void;
 	render(frame: IRenderFrame): void;
+	/**
+	 * Draw the last frame again and copy it into `target` (at the canvas's backing size, top left), in the
+	 * same task. False when there is nothing to copy (no frame drawn yet, or the WebGL context is lost).
+	 */
+	snapshot(target: CanvasRenderingContext2D): boolean;
 	destroy(): void;
 }
 
@@ -262,6 +271,7 @@ export function createWebglRenderer(canvas: HTMLCanvasElement, onRestored: () =>
 	let outline: [number, number, number] = [0, 0, 0];
 	let lost = false;
 	let dpr = 1;
+	let lastFrame: IRenderFrame | null = null;
 
 	/** Upload the current points. */
 	function upload(): void {
@@ -304,6 +314,7 @@ export function createWebglRenderer(canvas: HTMLCanvasElement, onRestored: () =>
 		},
 		render(frame: IRenderFrame): void {
 			if (lost || state === null) return;
+			lastFrame = frame;
 			const s = state;
 			gl.viewport(0, 0, canvas.width, canvas.height);
 			gl.clearColor(0, 0, 0, 0);
@@ -327,6 +338,12 @@ export function createWebglRenderer(canvas: HTMLCanvasElement, onRestored: () =>
 			gl.uniform1f(s.uniform.dpr, frame.dpr || dpr);
 			gl.drawArrays(gl.POINTS, 0, data.count);
 		},
+		snapshot(target: CanvasRenderingContext2D): boolean {
+			if (lost || state === null || lastFrame === null) return false;
+			this.render(lastFrame);
+			target.drawImage(canvas, 0, 0);
+			return true;
+		},
 		destroy(): void {
 			canvas.removeEventListener('webglcontextlost', onLost as EventListener);
 			canvas.removeEventListener('webglcontextrestored', onRestoredEvent as EventListener);
@@ -338,6 +355,7 @@ export function createWebglRenderer(canvas: HTMLCanvasElement, onRestored: () =>
 			}
 			state = null;
 			data = null;
+			lastFrame = null;
 		},
 	};
 }
