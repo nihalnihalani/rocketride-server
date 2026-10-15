@@ -45,6 +45,10 @@
  * Usage: node lane_vector.cjs [base-url] [out-dir] [fixture]
  *   (base-url and out-dir default to ENGINE_URL and OUT_DIR; fixture is a key of
  *   env.cjs FIXTURES, default qdrant). LAN_URL: the same engine on a LAN address.
+ * vector-ui:e2e-live runs it as `node lane_vector.cjs <base-url> <out-dir> <browser> [backends]`
+ * (backends: a comma list, else VECTOR_UI_E2E_BACKENDS, else the four supported ones). The
+ * lane then runs once per backend into <out-dir>/<backend> and writes every row, with its
+ * browser and backend, to <out-dir>/lane_vector.json. It drives Google Chrome only.
  */
 'use strict';
 /* global document, localStorage, sessionStorage */
@@ -56,7 +60,32 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
-const [, , base = E.ENGINE_URL, out = E.OUT_DIR, fixtureKey = 'qdrant'] = process.argv;
+/** The browsers vector-ui:e2e-live names (third argument); this lane drives Google Chrome only. */
+const RUNNER_BROWSERS = ['chrome', 'firefox', 'webkit'];
+/** The backends a vector-ui:e2e-live run covers when none are named. */
+const RUNNER_BACKENDS = ['postgres', 'rocketride_vector', 'qdrant', 'chroma'];
+
+/**
+ * The lane's arguments: `<base-url> <out-dir> [fixture]` run directly, or
+ * `<base-url> <out-dir> <browser> [backends]` from vector-ui:e2e-live.
+ *
+ * @param {string[]} args - process.argv without the node binary and the script.
+ * @param {Record<string, string | undefined>} env - The environment.
+ * @returns {{ base: string, out: string, browser: string | null, fixtures: string[] }} browser is null when run directly.
+ */
+function laneArgs(args, env) {
+	const [base = E.ENGINE_URL, out = E.OUT_DIR, third, fourth] = args;
+	if (!RUNNER_BROWSERS.includes(third)) return { base, out, browser: null, fixtures: [third || 'qdrant'] };
+	const named = (fourth || env.VECTOR_UI_E2E_BACKENDS || RUNNER_BACKENDS.join(','))
+		.split(',')
+		.map((item) => item.trim())
+		.filter(Boolean);
+	return { base, out, browser: third, fixtures: named };
+}
+
+const ARGS = laneArgs(process.argv.slice(2), process.env);
+const { base, out } = ARGS;
+const fixtureKey = ARGS.fixtures[0];
 const RUN = nodeCrypto.randomBytes(4).toString('hex');
 
 /** The writes among sent frames: removals ('remove_document', 'delete') and uploads ('upload'). */
@@ -299,7 +328,44 @@ async function main() {
 	}
 }
 
-if (require.main === module) {
+/**
+ * A vector-ui:e2e-live run: the lane once per backend, each in its own process and folder, then
+ * every row (with its browser and backend) in <out>/lane_vector.json.
+ *
+ * @param {ReturnType<typeof laneArgs>} args - The arguments (browser set).
+ * @returns {number} The exit code: 0 only when every row passed.
+ */
+function runForE2e(args) {
+	const { spawnSync } = require('child_process');
+	const rows = [];
+	for (const key of args.fixtures) {
+		if (args.browser !== 'chrome') {
+			rows.push({ browser: args.browser, backend: key, fixture: key, name: 'lane', status: 'FAIL', detail: `the console lane drives Google Chrome only, not ${args.browser}` });
+			continue;
+		}
+		const sub = path.join(args.out, key);
+		const file = path.join(sub, 'lane_vector.json');
+		fs.rmSync(file, { force: true });
+		const run = spawnSync(process.execPath, [__filename, args.base, sub, key], { stdio: 'inherit', env: process.env });
+		let data = null;
+		try {
+			data = JSON.parse(fs.readFileSync(file, 'utf8'));
+		} catch {
+			data = null;
+		}
+		if (!Array.isArray(data)) data = [{ fixture: key, name: 'lane', status: 'FAIL', detail: `the lane wrote no result (exit ${run.status})` }];
+		for (const row of data) rows.push({ browser: args.browser, backend: key, ...row });
+	}
+	fs.mkdirSync(args.out, { recursive: true });
+	fs.writeFileSync(path.join(args.out, 'lane_vector.json'), JSON.stringify(rows, null, 2));
+	const failed = rows.filter((r) => r.status !== 'PASS').length;
+	console.log(`${rows.length - failed} of ${rows.length} steps passed over ${args.fixtures.join(', ')}`);
+	return failed || rows.length === 0 ? 1 : 0;
+}
+
+if (require.main === module && ARGS.browser !== null) {
+	process.exitCode = runForE2e(ARGS);
+} else if (require.main === module) {
 	main()
 		.then(() => {
 			const data = JSON.parse(fs.readFileSync(path.join(out, 'lane_vector.json'), 'utf8'));
@@ -318,4 +384,4 @@ if (require.main === module) {
 		});
 }
 
-module.exports = { reshuffled, sentWrites };
+module.exports = { reshuffled, sentWrites, laneArgs };

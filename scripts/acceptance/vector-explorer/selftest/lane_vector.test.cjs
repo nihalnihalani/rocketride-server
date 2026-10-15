@@ -56,3 +56,16 @@ test('Cancel sent nothing: no removal, no upload in the frames after the click',
 	assert.deepStrictEqual(lane.sentWrites([tool('chunks'), tool('remove_document')]), ['remove_document']);
 	assert.deepStrictEqual(lane.sentWrites([tool('delete'), upload]), ['delete', 'upload']);
 });
+
+test('run directly the lane takes one fixture (default qdrant)', () => {
+	const args = lane.laneArgs(['http://127.0.0.1:5590', '/tmp/out', 'chroma'], {});
+	assert.deepStrictEqual(args, { base: 'http://127.0.0.1:5590', out: '/tmp/out', browser: null, fixtures: ['chroma'] });
+	assert.deepStrictEqual(lane.laneArgs(['http://h', '/tmp/out'], {}).fixtures, ['qdrant']);
+});
+
+test('run by vector-ui:e2e-live (<url> <out-dir> <browser> [backends]) the lane covers each backend', () => {
+	const named = lane.laneArgs(['http://h', '/tmp/e2e/chrome', 'chrome', 'qdrant, postgres'], {});
+	assert.deepStrictEqual(named, { base: 'http://h', out: '/tmp/e2e/chrome', browser: 'chrome', fixtures: ['qdrant', 'postgres'] });
+	assert.deepStrictEqual(lane.laneArgs(['http://h', '/tmp/e', 'chrome'], { VECTOR_UI_E2E_BACKENDS: 'chroma' }).fixtures, ['chroma']);
+	assert.deepStrictEqual(lane.laneArgs(['http://h', '/tmp/e', 'firefox'], {}).fixtures, ['postgres', 'rocketride_vector', 'qdrant', 'chroma']);
+});

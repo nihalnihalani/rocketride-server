@@ -46,9 +46,12 @@
  * VX_PERF_FIXTURE, default "vx-local Map performance (Qdrant)", project id
  * VX_PERF_PROJECT_ID, default gen_perf.py's PERF_PROJECT_ID).
  *
- * Usage: node lane_vector_perf.cjs [base-url] [out-json] [sizes] [rates]
+ * Usage: node lane_vector_perf.cjs [base-url] [out-json|out-dir] [sizes] [rates]
  *   sizes: comma list of n (detailed) or light:n   (default 500,1000,2000,light:5000)
  *   rates: comma list of CPU throttling rates       (default 1,4)
+ * vector-ui:e2e-live runs it as `node lane_vector_perf.cjs <base-url> <out-dir> <browser>`
+ * and reads <out-dir>/lane_vector_perf.json (its `results` are the gate rows).
+ * The lane drives Google Chrome only; another browser is one FAIL row.
  *   VX_PERF_QUERY: the text query of the query step (default "radio check-in schedule")
  * Exit code 0 only when every gate row passes.
  */
@@ -71,6 +74,8 @@ const FINAL_LAYOUT_STATES = ['done', 'kept-pca', 'cancelled', 'refused', 'failed
 const LAYOUT_RAN = ['done', 'kept-pca'];
 /** Renderers that draw. */
 const RENDERERS = ['webgl', 'canvas2d'];
+/** The browsers vector-ui:e2e-live names (third argument); this lane drives Google Chrome only. */
+const RUNNER_BROWSERS = ['chrome', 'firefox', 'webkit'];
 /** The text-query step's name (its row must see the query vector go out). */
 const QUERY_STEP = 'a text query draws its star and rays (when the embedding node answers)';
 
@@ -393,13 +398,42 @@ async function mapSteps(page, box, row) {
 // The lane
 // ---------------------------------------------------------------------------
 
+/**
+ * The lane's arguments, in either of its two forms.
+ *
+ * Run directly: `<base-url> [out-json|out-dir] [sizes] [rates]`. From vector-ui:e2e-live:
+ * `<base-url> <out-dir> <browser>`; the result then goes to <out-dir>/lane_vector_perf.json,
+ * where the runner reads it.
+ *
+ * @param args - process.argv without the node binary and the script.
+ * @param defaults - { base, outDir } when an argument is left out.
+ */
+function laneArgs(args, defaults) {
+	const [base = defaults.base, target = defaults.outDir, third, fourth] = args;
+	const out = target.endsWith('.json') ? path.dirname(target) : target;
+	const outFile = target.endsWith('.json') ? target : path.join(out, 'lane_vector_perf.json');
+	if (RUNNER_BROWSERS.includes(third)) return { base, outFile, browser: third, sizesArg: DEFAULT_SIZES, ratesArg: DEFAULT_RATES };
+	return { base, outFile, browser: 'chrome', sizesArg: third || DEFAULT_SIZES, ratesArg: fourth || DEFAULT_RATES };
+}
+
+/** The result file: the measured rows, the gates, and the gates again as `results` rows for vector-ui:e2e-live. */
+function resultOf(base, browserName, rows, gates) {
+	const pass = gates.length > 0 && gates.every((g) => g.status === 'PASS');
+	return { lane: 'vector-perf', fixture: PERF_FIXTURE, base, rows, gates, pass, results: gates.map((g) => ({ browser: browserName, run: 'perf', ...g })) };
+}
+
 async function main() {
 	const E = require('../env.cjs');
 	const C = require('./common.cjs');
-	const [, , base = E.ENGINE_URL, outFile = path.join(E.OUT_DIR, 'lane_vector_perf.json'), sizesArg = DEFAULT_SIZES, ratesArg = DEFAULT_RATES] = process.argv;
+	const { base, outFile, browser: browserName, sizesArg, ratesArg } = laneArgs(process.argv.slice(2), { base: E.ENGINE_URL, outDir: E.OUT_DIR });
+	fs.mkdirSync(path.dirname(path.resolve(outFile)), { recursive: true });
+	if (browserName !== 'chrome') {
+		const refused = [{ name: 'lane', status: 'FAIL', detail: `the performance lane drives Google Chrome only, not ${browserName}` }];
+		fs.writeFileSync(outFile, JSON.stringify(resultOf(base, browserName, [], refused), null, 1));
+		return 1;
+	}
 	const sizes = parseSizes(sizesArg);
 	const rates = String(ratesArg).split(',').map(Number).filter((r) => r > 0);
-	fs.mkdirSync(path.dirname(path.resolve(outFile)), { recursive: true });
 	const { chromium } = E.loadPlaywright();
 	const browser = await chromium.launch({ channel: 'chrome', headless: true });
 	// dialect.dimension from the store itself (not from the page), once.
@@ -470,12 +504,12 @@ async function main() {
 	await store.close();
 	const gates = evaluateGates(rows);
 	for (const g of gates) console.log(`  [${g.status}] ${g.name}${g.detail ? ` -- ${g.detail}` : ''}`);
-	const pass = gates.every((g) => g.status === 'PASS');
-	fs.writeFileSync(outFile, JSON.stringify({ lane: 'vector-perf', fixture: PERF_FIXTURE, base, rows, gates, pass }, null, 1));
-	return pass ? 0 : 1;
+	const result = resultOf(base, browserName, rows, gates);
+	fs.writeFileSync(outFile, JSON.stringify(result, null, 1));
+	return result.pass ? 0 : 1;
 }
 
-module.exports = { GATE, PERF_PROJECT_ID, QUERY_STEP, pct, parseSizes, summarise, evaluateGates, privacySummary };
+module.exports = { GATE, PERF_PROJECT_ID, QUERY_STEP, pct, parseSizes, summarise, evaluateGates, privacySummary, laneArgs, resultOf };
 
 if (require.main === module) {
 	main().then(
