@@ -62,7 +62,7 @@ import StatsStrip from '../components/StatsStrip';
 import { getDocs } from '../docs';
 import { documentUri } from '../vector/addresses';
 import { alsoReaches, chatScopeFor, writesDuringRemoval } from '../vector/consoleModel';
-import { CONDITION_KINDS, conditionAvailability, listingFilter, resolveScope, scopeStripText, scopeView } from '../vector/filters';
+import { CONDITION_KINDS, conditionAvailability, listingFilter, resolveScope, scopeStripText, scopeView, scopeWith } from '../vector/filters';
 import type { ConditionKind } from '../vector/filters';
 import { savedFiltersFor } from '../vector/savedFilters';
 import { roleLine, vectorCardView } from '../vector/connections';
@@ -160,6 +160,8 @@ export const ConsoleView: React.FC<IConsoleViewProps> = ({ opened, active }) => 
 		return out;
 	}, [caveatsKey, state.directory.rows]);
 	const scopeLine = scope !== null ? scopeStripText(scopeView(scope, state.directory, cap), state.stats.view) : null;
+	// A chart's bar sets its kind of condition (a chunk range, a file type, a period) and keeps the others.
+	const scopeFromChart = (filter: IDocumentsFilter): void => entry.scope.set(scopeWith(scope, scope?.filter.path_contains ?? '', filter));
 
 	// Saved filters: per connection, in memory (the app's map, emptied on a change of identity).
 	const savedStore = useMemo(() => savedFiltersFor(savedFilters, entry.key), [entry.key]);
@@ -235,7 +237,7 @@ export const ConsoleView: React.FC<IConsoleViewProps> = ({ opened, active }) => 
 					<Banner variant={endpoint.state === 'ready' ? 'warning' : 'info'}>{card.blocked}</Banner>
 				</div>
 			)}
-			<StatsStrip stats={state.stats} dialect={dialect} readOnly={model.readOnly} documents={state.directory.rows} scopeLine={scopeLine} />
+			<StatsStrip stats={state.stats} dialect={dialect} readOnly={model.readOnly} documents={state.directory.rows} scopeLine={scopeLine} sample={selection.connectionKey === entry.key ? selection.sampleModel : null} loading={state.directory.status === 'loading'} scopeFilter={scope?.filter ?? null} onScope={scopeFromChart} />
 			{(state.removal.status === 'running' || state.removal.message) && (
 				<div role="status" style={{ ...styles.small, padding: '6px 24px' }}>
 					{state.removal.status === 'running' ? BUSY.removing : state.removal.message}

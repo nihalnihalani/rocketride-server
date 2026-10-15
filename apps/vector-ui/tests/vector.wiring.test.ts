@@ -139,6 +139,8 @@ test('the scope: the listing asks for its conditions, its documents resolve from
 	assert.match(view, /savedFiltersFor\(savedFilters, entry\.key\)/, "the app's per-connection map, emptied on a change of identity");
 	assert.match(view, /<DocumentDirectory [\s\S]*?scope=\{scope\} onScope=\{setScope\} cap=\{cap\}/);
 	assert.match(view, /<StatsStrip [^>]*scopeLine=\{scopeLine\}/);
+	assert.match(view, /<StatsStrip [^>]*sample=\{selection\.connectionKey === entry\.key \? selection\.sampleModel : null\}[^>]*onScope=\{scopeFromChart\}/, "the charts read the map's sample and a bar scopes the directory");
+	assert.match(view, /scopeWith\(scope, scope\?\.filter\.path_contains \?\? '', filter\)/, "a bar sets its kind of condition and keeps the scope's others");
 	const dir = code('components/DocumentDirectory.tsx');
 	assert.match(dir, /directoryView\(pager, scope, applied, cap\)/);
 	assert.match(dir, /useDebounced\(filter, FILTER_DEBOUNCE_MS\)/);

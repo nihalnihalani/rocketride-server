@@ -115,3 +115,25 @@ test('"counts as of": seconds, then minutes; nothing when the node gave no time'
 	assert.equal(countsAsOfText(null, asOf), null);
 	assert.equal(countsAsOfText(readStats({ ...fixture('stats_quick'), counts_as_of: 'not a time' }), asOf), null);
 });
+
+test('a Size figure joins the strip when the dialect reports the bytes the collection takes; never otherwise', () => {
+	const enriched = readDialect(fixture('dialect_enriched'));
+	assert.ok(enriched);
+	const figures = statsFigures(readStats(fixture('stats_pgvector')), enriched);
+	const size = figures.find((f) => f.key === 'size');
+	assert.ok(size, 'present');
+	assert.equal(figures[figures.length - 1], size, 'at the end of the strip');
+	assert.equal(size.label, 'Size');
+	assert.equal(size.value, '46 MB');
+	assert.equal(size.tooltip, '46 MB on the store (48,234,496 bytes)');
+	assert.equal(size.missing, false);
+	assert.equal(
+		statsFigures(readStats(fixture('stats_pgvector')), pg).some((f) => f.key === 'size'),
+		false,
+		'a dialect without size_bytes: no figure, not a dash'
+	);
+	assert.equal(
+		statsFigures(readStats(fixture('stats_pgvector')), readDialect({ ...fixture('dialect_enriched'), size_bytes: null })).some((f) => f.key === 'size'),
+		false
+	);
+});

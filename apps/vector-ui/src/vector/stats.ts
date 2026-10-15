@@ -38,6 +38,7 @@
 
 import type { IDialectResult } from '../contract/types';
 import { QUICK_STATS_INTERVAL_MS } from './budgets';
+import { formatSize } from './fileType';
 import type { IStatsView } from './results';
 import { CAVEAT_SENTENCES, CODE_SENTENCES, EMPTY, caveatSentence } from './wording';
 
@@ -47,7 +48,7 @@ import { CAVEAT_SENTENCES, CODE_SENTENCES, EMPTY, caveatSentence } from './wordi
 
 /** One figure of the strip. */
 export interface IStatFigure {
-	key: 'documents' | 'chunks' | 'deleted' | 'avg' | 'model' | 'metric';
+	key: 'documents' | 'chunks' | 'deleted' | 'avg' | 'model' | 'metric' | 'size';
 	label: string;
 	/** The text shown: a formatted number, or "—" when the store did not say. */
 	value: string;
@@ -89,7 +90,7 @@ function figure(key: IStatFigure['key'], label: string, value: string | null, wh
  *
  * @param stats - The last `stats` answer, or null before the first.
  * @param dialect - The probe's answer, or null.
- * @returns Documents, Chunks, Deleted, Avg, Model and Metric, in that order.
+ * @returns Documents, Chunks, Deleted, Avg, Model and Metric, in that order, then Size when the dialect reports the bytes the collection takes.
  */
 export function statsFigures(stats: IStatsView | null, dialect: IDialectResult | null): IStatFigure[] {
 	const caveats = new Set([...(stats?.caveats ?? []), ...(dialect?.caveats ?? [])]);
@@ -114,7 +115,11 @@ export function statsFigures(stats: IStatsView | null, dialect: IDialectResult |
 	}
 	const metricFigure: IStatFigure = metric === null && index === null ? { key: 'metric', label: 'Metric', value: MISSING, tooltip: 'This store does not report its metric or index.', missing: true } : { key: 'metric', label: 'Metric', value: [metric ?? 'unknown metric', index === null ? null : index.toUpperCase()].filter(Boolean).join(' · '), tooltip: null, missing: false };
 
-	return [documents, chunks, figure('deleted', 'Deleted', fmt(stats?.deleted), 'deleted chunks'), figure('avg', 'Avg', avg === null || avg === undefined ? null : `${(Math.round(avg * 10) / 10).toLocaleString('en-US')}/doc`, 'chunks per document'), modelFigure, metricFigure];
+	const figures = [documents, chunks, figure('deleted', 'Deleted', fmt(stats?.deleted), 'deleted chunks'), figure('avg', 'Avg', avg === null || avg === undefined ? null : `${(Math.round(avg * 10) / 10).toLocaleString('en-US')}/doc`, 'chunks per document'), modelFigure, metricFigure];
+	// Size only joins the strip when the store reports it (pgvector: the table's total relation size); never a dash.
+	const bytes = dialect?.size_bytes;
+	if (typeof bytes === 'number' && Number.isFinite(bytes) && bytes >= 0) figures.push({ key: 'size', label: 'Size', value: formatSize(bytes), tooltip: `${formatSize(bytes)} on the store (${formatCount(bytes)} bytes)`, missing: false });
+	return figures;
 }
 
 // =============================================================================

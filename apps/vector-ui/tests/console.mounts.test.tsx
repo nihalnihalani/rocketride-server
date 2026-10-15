@@ -52,6 +52,8 @@ moduleWithLoad._load = function (request: string, parent: unknown, isMain: boole
 const { createSelectionStore } = require('../src/contract/bridge') as typeof import('../src/contract/bridge');
 const { DocumentDirectory } = require('../src/components/DocumentDirectory') as typeof import('../src/components/DocumentDirectory');
 const { StatsStrip } = require('../src/components/StatsStrip') as typeof import('../src/components/StatsStrip');
+const { StatsCharts } = require('../src/components/StatsCharts') as typeof import('../src/components/StatsCharts');
+const { readDialect } = require('../src/vector/results') as typeof import('../src/vector/results');
 const { DocumentView } = require('../src/views/DocumentView') as typeof import('../src/views/DocumentView');
 const { pagerApplyPage, pagerBegin, pagerInit } = require('../src/vector/documents') as typeof import('../src/vector/documents');
 const { readDocumentsPage, readStats } = require('../src/vector/results') as typeof import('../src/vector/results');
@@ -98,6 +100,44 @@ test('while a scope is active the stats strip says what it covers on a second li
 	const html = renderToStaticMarkup(<StatsStrip stats={stats} dialect={dialect} readOnly={false} scopeLine="Scope: 12 of 42 documents · 318 chunks (counted here)" />);
 	assert.match(html, /role="status"[^>]*data-scope-line=""[^>]*>Scope: 12 of 42 documents · 318 chunks \(counted here\)<\/div>/);
 	assert.doesNotMatch(renderToStaticMarkup(<StatsStrip stats={stats} dialect={dialect} readOnly={false} />), /data-scope-line/, 'no line without a scope');
+});
+
+test('the charts: four figures, each a labelled picture over real buttons for the bars the store can be asked for, and a table of every bin', () => {
+	const rows: IDocumentItem[] = [...readDocumentsPage(fixture('documents_page1')).items, ...readDocumentsPage(fixture('documents_page2_last')).items];
+	const html = renderToStaticMarkup(<StatsCharts rows={rows} total={42} dialect={dialect} onScope={noop} />);
+	assert.doesNotMatch(html, /Not built yet/);
+	for (const id of ['chunks', 'length', 'types', 'ingest']) assert.match(html, new RegExp(`data-chart="${id}"`), id);
+	assert.equal((html.match(/<svg role="img" aria-label="/g) ?? []).length, 3, 'three pictures; chunk length waits for the sample');
+	assert.match(html, /<svg role="img" aria-label="Chunks per document, 7 documents in 5 bins: most in 4–7 \(3\); the top bin is 16–31 \(2\)\."[^>]*><title>Chunks per document, 7 documents/);
+	assert.match(html, /<button type="button" aria-label="16–31 chunks: 2 documents\. Scope the documents to these" aria-pressed="false"/);
+	assert.match(html, /<span style="flex:1" aria-hidden="true"><\/span><span style="flex:1" aria-hidden="true"><\/span><button/, 'empty bins have no button');
+	assert.match(html, /aria-label="pdf: 2 documents\. Scope the documents to these"/);
+	assert.match(html, /Draw the map&#x27;s sample to see chunk lengths/);
+	assert.match(html, /<caption>Chunks per document: 7 of 42 documents loaded · median 9 chunks<\/caption>/);
+	assert.match(html, /<tr><td>4–7<\/td><td>3<\/td><\/tr>/);
+	assert.match(html, /<tr><td>1<\/td><td>0<\/td><\/tr>/, 'empty bins are in the table too');
+	assert.doesNotMatch(renderToStaticMarkup(<StatsCharts rows={rows} dialect={dialect} />), /<button/, 'no click handler: the bars are not buttons');
+});
+
+test('the charts mark the bar the scope selected (pressed, outlined) and say what they cannot draw', () => {
+	const rows: IDocumentItem[] = readDocumentsPage(fixture('documents_page1')).items;
+	const html = renderToStaticMarkup(<StatsCharts rows={rows} dialect={dialect} onScope={noop} scope={{ file_types: ['md'] }} />);
+	assert.match(html, /aria-label="md: 2 documents\. Scope the documents to these" aria-pressed="true"/);
+	assert.equal((html.match(/data-selected=""/g) ?? []).length, 1);
+	const nostore = readDialect({ ...fixture('dialect_pgvector'), caveats: ['extras_not_stored'] });
+	assert.match(renderToStaticMarkup(<StatsCharts rows={rows} dialect={nostore} />), /<p role="note"[^>]*>This store does not keep ingest times<\/p>/);
+	const loading = renderToStaticMarkup(<StatsCharts rows={[]} dialect={dialect} loading />);
+	assert.match(loading, /<svg aria-hidden="true"/, 'skeleton bars');
+	assert.match(loading, /role="status"[^>]*>Loading documents…</);
+	assert.match(renderToStaticMarkup(<StatsCharts rows={[]} dialect={dialect} />), /No documents to chart yet\./);
+});
+
+test('the strip: a Size figure when the store reports it; no Charts disclosure for an empty collection', () => {
+	const stats = { view: readStats(fixture('stats_pgvector')), status: 'ready' as const, error: null, lastAt: 0, mode: 'full' as const };
+	const enriched = readDialect(fixture('dialect_enriched'));
+	assert.match(renderToStaticMarkup(<StatsStrip stats={stats} dialect={enriched} readOnly={false} />), /data-figure="size"[^>]*>46 MB</);
+	const empty = { ...stats, view: readStats(fixture('stats_collection_missing_legacy')) };
+	assert.doesNotMatch(renderToStaticMarkup(<StatsStrip stats={empty} dialect={dialect} readOnly={false} />), />Charts<\/summary>/);
 });
 
 test('a document tab holds its HealthPanel', () => {
