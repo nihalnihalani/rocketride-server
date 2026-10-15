@@ -266,7 +266,6 @@ def test_embed_is_registered_as_a_dap_only_tool(node):
     assert meta['audience'] == ('dap',), 'embed is for external tool calls only; agents never see it'
 
 
-@pytest.mark.skip(reason='NEEDS:L0 merged — integration gate G2 (tool.query lists agent-audience tools only)')
 @pytest.mark.parametrize('node', NODES)
 def test_agents_never_see_embed(node):
     from rocketlib import APERR, Ec
