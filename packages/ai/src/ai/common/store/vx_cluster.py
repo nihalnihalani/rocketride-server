@@ -229,7 +229,7 @@ def union_find(n: int, a: Sequence[int], b: Sequence[int]) -> List[int]:
     return [find(i) for i in range(n)]
 
 
-def _number(n: int, roots: List[int], max_components: int) -> Tuple[List[int], List[int]]:
+def _number(roots: List[int], max_components: int) -> Tuple[List[int], List[int]]:
     """Number the groups of 2 or more points by size (ties by root); return ``(labels, sizes)``."""
     size = Counter(roots)
     groups = sorted((root for root, count in size.items() if count >= MIN_GROUP), key=lambda r: (-size[r], r))
@@ -255,7 +255,7 @@ def knn_components(
     n, rows, col, sim = _edge_arrays(offsets_row, cols, sims)
     a, b, s = mutual_edges(n, rows, col, sim)
     if sim.size == 0:
-        labels, sizes = _number(n, list(range(n)), max_components)
+        labels, sizes = _number(list(range(n)), max_components)
         return Components(labels, sizes, len(sizes), labels.count(-1), int(percentile), None)
     level = int(percentile)
     while True:
@@ -267,7 +267,7 @@ def knn_components(
             level = min(100, level + PERCENTILE_STEP)
             continue
         break
-    labels, sizes = _number(n, roots, max_components)
+    labels, sizes = _number(roots, max_components)
     return Components(labels, sizes, len(sizes), labels.count(-1), level, round(threshold, 4))
 
 
