@@ -166,6 +166,25 @@ export function shadeOf(value: number, range: { min: number; max: number }): num
 }
 
 /**
+ * The heatmap cell under a point of its canvas: [row, column], or null
+ * outside the grid. A gap belongs to the cell before it, so a pointer
+ * between two 3 px cells still picks one.
+ *
+ * @param x - Pixels from the canvas's left edge (CSS pixels).
+ * @param y - Pixels from its top edge.
+ * @param n - Keys (rows and columns).
+ * @param size - A cell's side.
+ * @param gap - The gap between cells.
+ * @returns The cell, or null.
+ */
+export function heatCellAt(x: number, y: number, n: number, size: number, gap: number): [number, number] | null {
+	const pitch = size + gap;
+	const side = n * pitch - gap;
+	if (!(x >= 0 && y >= 0 && x < side && y < side)) return null;
+	return [Math.min(n - 1, Math.floor(y / pitch)), Math.min(n - 1, Math.floor(x / pitch))];
+}
+
+/**
  * The matrix as export rows: one per key with its objectId, chunk and
  * words, then a column per key (column names made unique).
  *

@@ -299,6 +299,18 @@ export const MATRIX_NO_CHANNEL = 'No running source reaches the store node, so t
 /** The call is on its way. */
 export const MATRIX_BUSY = 'Computing…';
 
+/**
+ * Which rows of the matrix's table are shown.
+ *
+ * @param from - The first row (from 1).
+ * @param to - The last row.
+ * @param n - All rows.
+ * @returns E.g. "Rows 21–40 of 100".
+ */
+export function matrixTableRowsLine(from: number, to: number, n: number): string {
+	return `Rows ${num(from)}–${num(to)} of ${num(n)}`;
+}
+
 /** No pair picked yet. */
 export const PICK_A_PAIR = 'Click a cell to pick a pair.';
 

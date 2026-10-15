@@ -21,11 +21,11 @@ import { test } from 'node:test';
 import React from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import type { IRoleChannel } from 'shared/explorer';
-import { MatrixBody, SimilarityMatrix, loadMatrix } from '../src/components/SimilarityMatrix';
-import type { MatrixBodyProps } from '../src/components/SimilarityMatrix';
+import { MatrixBody, SimilarityMatrix, loadMatrix, paintHeatmap } from '../src/components/SimilarityMatrix';
+import type { MatrixBodyProps, MatrixState } from '../src/components/SimilarityMatrix';
 import { createSelectionStore } from '../src/contract/bridge';
 import type { IExportItem, ISimilarityMatrixResult, IVectorLimits, VectorKey } from '../src/contract/types';
-import { chainOrder, matrixInput, matrixRange, matrixRows, reorder } from '../src/map/matrixOrder';
+import { chainOrder, heatCellAt, matrixInput, matrixRange, matrixRows, reorder } from '../src/map/matrixOrder';
 import { matrixFailure, matrixSourceLine } from '../src/map/reviewWording';
 import { fixture } from './support/fixtures';
 import { loadSample, modelOf } from './support/map.samples';
@@ -289,4 +289,109 @@ test('the export item the panel hands the host: kind matrix, n rows built on dem
 	assert.equal(items[0]!.disabled, null);
 	assert.equal(items[0]!.rows!().rows.length, 3);
 	assert.match(items[0]!.label, /Similarity matrix \(3 × 3\)/);
+});
+
+// =============================================================================
+// BUDGET AT THE CAP (100 keys, 10,000 cells)
+// =============================================================================
+
+/** A matrix of n keys at the cap's shape: symmetric, unit diagonal, values spread over 0.3 to 0.9. */
+function bigState(n = 100): Extract<MatrixState, { kind: 'ok' }> {
+	const matrix = Array.from({ length: n }, (_, i) => Array.from({ length: n }, (_, j) => (i === j ? 1 : Math.round((0.3 + 0.6 * Math.abs(Math.sin((i + 1) * (j + 1)))) * 100) / 100)));
+	const keys = Array.from({ length: n }, (_, i) => [`75b89d86-a64e-5143-bf50-55d4a7fd8cd2-${i}`, i] as VectorKey);
+	return { kind: 'ok', keys, matrix, metric: 'cosine', source: 'cache', notFound: [], dp: 2 };
+}
+const bigLabel = (key: VectorKey): string => `C:/demo/handbooks/falcon_handbook_${key[1]}.md #${key[1]}`;
+
+/**
+ * Render a body a few times and keep the fastest.
+ *
+ * @param make - The body.
+ * @returns The fastest time and the markup.
+ */
+function timed(make: () => React.ReactElement): { ms: number; out: string } {
+	let ms = Infinity;
+	let out = '';
+	for (let run = 0; run < 3; run += 1) {
+		const started = performance.now();
+		out = renderToStaticMarkup(make());
+		ms = Math.min(ms, performance.now() - started);
+	}
+	return { ms, out };
+}
+
+test('budget: the heatmap at the cap is one canvas, a bounded handful of elements within 50 ms, a picked pair outlined without re-drawing the cells', () => {
+	for (const selected of [null, [3, 7] as const]) {
+		const { ms, out } = timed(() => body({ state: bigState(), labelOf: bigLabel, selected }));
+		const tags = (out.match(/<[a-z]/g) ?? []).length;
+		assert.ok(tags < 80, `${tags} elements for 10,000 cells`);
+		assert.ok(ms < 50, `rendered in ${ms.toFixed(1)} ms`);
+		assert.match(out, /<canvas[^>]*data-matrix-size="100"/);
+		assert.doesNotMatch(out, /data-cell=/, 'no element per cell');
+		assert.equal((out.match(/data-picked=/g) ?? []).length, selected ? 2 : 0, 'the pair and its mirror outlined');
+	}
+	const small = renderToStaticMarkup(body({ state: bigState(20), labelOf: bigLabel, selected: null }));
+	assert.equal((small.match(/data-cell="/g) ?? []).length, 400, 'up to 20 × 20 the cells stay elements, values printed in them');
+	assert.doesNotMatch(small, /<canvas/);
+});
+
+test('budget: the table alternative at the cap shows 20 rows at a time, every row reachable through Previous and Next', () => {
+	const pages: number[] = [];
+	const make = (page: number): React.ReactElement => body({ state: bigState(), labelOf: bigLabel, showTable: true, tablePage: page, onTablePage: (p) => pages.push(p) });
+	const { ms, out } = timed(() => make(1));
+	assert.ok(ms < 50, `rendered in ${ms.toFixed(1)} ms`);
+	assert.equal((out.match(/<th scope="row"/g) ?? []).length, 20);
+	assert.equal((out.match(/<th scope="col"/g) ?? []).length, 100, 'every column on every page');
+	assert.ok((out.match(/<button/g) ?? []).length <= 2010, 'about 2,000 value buttons, not 10,000');
+	assert.match(out, /Rows 21–40 of 100/);
+	assert.match(out, />C:\/demo\/handbooks\/falcon_handbook_20\.md #20</);
+	const tree = make(1);
+	const buttons = elements(tree).filter((el) => el.type === 'button');
+	(buttons.find((b) => textOf(b) === 'Next rows') as React.ReactElement<{ onClick(): void }>).props.onClick();
+	(buttons.find((b) => textOf(b) === 'Previous rows') as React.ReactElement<{ onClick(): void }>).props.onClick();
+	assert.deepEqual(pages, [2, 0]);
+	const last = renderToStaticMarkup(make(4));
+	assert.match(last, /Rows 81–100 of 100/);
+	assert.match(last, /<button[^>]*disabled=""[^>]*>Next rows<\/button>/);
+	assert.match(renderToStaticMarkup(make(9)), /Rows 81–100 of 100/, 'a page past the end shows the last');
+	assert.match(renderToStaticMarkup(make(0)), /<button[^>]*disabled=""[^>]*>Previous rows<\/button>/);
+	assert.doesNotMatch(renderToStaticMarkup(body({ showTable: true })), /Next rows|Rows 1–/, 'a small matrix is one page');
+});
+
+test('the canvas heatmap: a pointer maps to its cell (a gap belongs to the cell before it), outside the grid to none', () => {
+	// 100 keys: 3 px cells, 1 px gaps, a 399 px square.
+	assert.deepEqual(heatCellAt(0, 0, 100, 3, 1), [0, 0]);
+	assert.deepEqual(heatCellAt(4, 8, 100, 3, 1), [2, 1], 'row from y, column from x');
+	assert.deepEqual(heatCellAt(3.5, 0, 100, 3, 1), [0, 0]);
+	assert.deepEqual(heatCellAt(398.9, 398.9, 100, 3, 1), [99, 99]);
+	assert.equal(heatCellAt(399, 0, 100, 3, 1), null);
+	assert.equal(heatCellAt(-0.5, 10, 100, 3, 1), null);
+	assert.equal(heatCellAt(Number.NaN, 10, 100, 3, 1), null);
+});
+
+test('the canvas heatmap paints every cell: the surface first, then the ramp at the shade the legend describes', () => {
+	const rects: Array<{ x: number; y: number; w: number; h: number; style: string; alpha: number }> = [];
+	let cleared = 0;
+	const ctx = {
+		fillStyle: '' as string,
+		globalAlpha: 1,
+		clearRect: (): void => {
+			cleared += 1;
+		},
+		fillRect(x: number, y: number, w: number, h: number): void {
+			rects.push({ x, y, w, h, style: String(this.fillStyle), alpha: this.globalAlpha });
+		},
+	};
+	paintHeatmap(ctx, BLOCKS, matrixRange(BLOCKS), 3, 1, { surface: '#ffffff', ramp: '#4263eb' });
+	assert.equal(cleared, 1);
+	assert.equal(rects.length, 50, 'one surface and one ramp rectangle per cell');
+	assert.ok(rects.slice(0, 25).every((r) => r.style === '#ffffff' && r.alpha === 1));
+	const ramp = rects.slice(25);
+	assert.ok(ramp.every((r) => r.style === '#4263eb' && r.w === 3 && r.h === 3));
+	const at = (i: number, j: number) => ramp.find((r) => r.x === j * 4 && r.y === i * 4)!;
+	assert.equal(at(1, 3).alpha, 0.9, 'the most similar pair is darkest');
+	assert.equal(at(0, 1).alpha, 0.06, 'the least similar pair is lightest');
+	assert.equal(at(2, 2).alpha, 0.9, 'the diagonal, above the range, as dark as the darkest');
+	assert.ok(at(0, 2).alpha > at(0, 4).alpha, '0.9 is darker than 0.85');
+	assert.equal(ctx.globalAlpha, 1, 'the context is left opaque');
 });
