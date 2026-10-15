@@ -19,8 +19,9 @@ with a context forged inside the tool input.
 - the agent catalog leaves out tools listed for external callers only, which
   the DAP still reaches
 
-The G2 re-run against a real store is written here and skipped until the
-write gate and the store driver land (NEEDS).
+- against a real store (``store_postgres`` on gx-pgvector, default switches):
+  an agent upsert succeeds while the same upsert through client.tool() is
+  refused with WRITES_DISABLED (gate G2)
 
 Needs the probe nodes: start the engine with --node_path=<repo>/nodes/test/vx_context_probe.
 """
@@ -134,18 +135,19 @@ def test_agent_catalog_leaves_out_dap_only_tools_which_the_dap_still_reaches(pro
     assert 'not found in tool catalog' in str(raised.value)
 
 
-@pytest.mark.skip(
-    reason='NEEDS:L1,L2 merged — integration gate G2 (write gate on the store tools and the pgvector driver)'
-)
 def test_g2_agent_upsert_succeeds_while_the_same_dap_upsert_is_refused(engine):
     """Re-run against a real store: an agent upsert succeeds with default switches; the DAP upsert is refused."""
     import importlib.util
+    import sys
 
     from phase0_lib import ACC, source
 
-    spec = importlib.util.spec_from_file_location('vx_start_fixtures', ACC / 'start_fixtures.py')
-    fixtures = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(fixtures)
+    fixtures = sys.modules.get('vx_phase0_fixtures')
+    if fixtures is None:
+        spec = importlib.util.spec_from_file_location('vx_phase0_fixtures', ACC / 'vx_fixtures.py')
+        fixtures = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = fixtures  # its dataclasses look their module up by name
+        spec.loader.exec_module(fixtures)
     template = fixtures.build_pipeline('postgres', 'stub')
     store = [c for c in template['components'] if c['id'] == 'store_1'][0]
     profile = store['config']['profile']

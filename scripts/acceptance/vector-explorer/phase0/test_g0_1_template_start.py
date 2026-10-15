@@ -22,6 +22,7 @@ import ast
 import asyncio
 import importlib.util
 import os
+import sys
 import time
 from typing import Any, Dict
 
@@ -47,9 +48,13 @@ RAW_PROJECT_ID = '00000000-0000-4000-8000-0000000d1b01'
 RAW_COLLECTION = os.environ.get('VX_PHASE0_RAW_COLLECTION', 'vx_phase0_raw')
 
 
-def _load_start_fixtures() -> Any:
-    spec = importlib.util.spec_from_file_location('vx_start_fixtures', ACC / 'start_fixtures.py')
+def _load_fixtures() -> Any:
+    """vx_fixtures.py: the pipelines start_fixtures.py starts and the call that starts them."""
+    if 'vx_phase0_fixtures' in sys.modules:
+        return sys.modules['vx_phase0_fixtures']
+    spec = importlib.util.spec_from_file_location('vx_phase0_fixtures', ACC / 'vx_fixtures.py')
     module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module  # its dataclasses look their module up by name
     spec.loader.exec_module(module)
     return module
 
@@ -68,23 +73,45 @@ def test_every_fixture_runs_its_three_sources_under_its_project_id(vx_fixtures):
     record('g0_1_sources', {'fixtures': observed, 'start_output': vx_fixtures['output']})
 
 
-def test_start_fixtures_starts_every_source_without_an_idle_timeout():
-    """start_fixtures.py starts each source with ttl=0, so the engine never stops it as idle."""
-    tree = ast.parse((ACC / 'start_fixtures.py').read_text(encoding='utf-8'))
-    use_calls = [
+def _calls(tree: ast.AST, name: str) -> list:
+    return [
         node
         for node in ast.walk(tree)
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == 'use'
+        if isinstance(node, ast.Call)
+        and (getattr(node.func, 'attr', None) == name or getattr(node.func, 'id', None) == name)
     ]
-    assert use_calls, 'start_fixtures.py no longer calls client.use()'
+
+
+def test_start_fixtures_starts_every_source_without_an_idle_timeout():
+    """start_fixtures.py starts each source with ttl=0, so the engine never stops it as idle.
+
+    It starts them through vx_fixtures.ensure_started, whose one client.use() call passes
+    its ``ttl`` argument (default 0); start_fixtures.py never passes another.
+    """
+    fixtures = ast.parse((ACC / 'vx_fixtures.py').read_text(encoding='utf-8'))
+    ensure = [n for n in ast.walk(fixtures) if isinstance(n, ast.AsyncFunctionDef) and n.name == 'ensure_started']
+    assert len(ensure) == 1, 'vx_fixtures.py no longer defines ensure_started()'
+    args = ensure[0].args
+    defaults = dict(zip([a.arg for a in args.args][-len(args.defaults) :], args.defaults))
+    assert isinstance(defaults.get('ttl'), ast.Constant) and defaults['ttl'].value == 0
+    use_calls = _calls(fixtures, 'use')
+    assert use_calls and all(c in list(ast.walk(ensure[0])) for c in use_calls), 'client.use() outside ensure_started'
     for call in use_calls:
-        ttl = [kw for kw in call.keywords if kw.arg == 'ttl']
-        assert ttl and isinstance(ttl[0].value, ast.Constant) and ttl[0].value.value == 0
+        ttl = [kw.value for kw in call.keywords if kw.arg == 'ttl']
+        assert ttl and isinstance(ttl[0], ast.Name) and ttl[0].id == 'ttl'
+    starter = ast.parse((ACC / 'start_fixtures.py').read_text(encoding='utf-8'))
+    starts = _calls(starter, 'ensure_started')
+    assert starts, 'start_fixtures.py no longer starts its sources through ensure_started()'
+    for call in starts:
+        assert all(
+            kw.arg != 'ttl' or (isinstance(kw.value, ast.Constant) and kw.value.value == 0) for kw in call.keywords
+        )
+        assert len(call.args) <= 3, 'ttl passed positionally'
 
 
 def test_templates_pin_the_parser_size_cap():
     """Every template's parse_1 carries index.maxFileSize (the cap the next test expects to be enforced)."""
-    module = _load_start_fixtures()
+    module = _load_fixtures()
     for key in FIXTURES:
         pipeline = module.build_pipeline(key, 'stub')
         parse = [c for c in pipeline['components'] if c['id'] == 'parse_1'][0]
@@ -120,26 +147,31 @@ async def _upload_oversize(ingest_token: str, key: str) -> Dict[str, Any]:
         path.unlink(missing_ok=True)
 
 
-@pytest.mark.skip(
-    reason='NEEDS:L10 parser size cap location (B6, orchestrator decision): the parser reads maxFileSize only '
-    'from the task config index section, which task_engine._build_task never emits, so parse_1.config.index '
-    'is not applied and a 51 MB upload is parsed'
-)
-def test_an_oversize_file_is_refused_by_the_parser_cap(vx_fixtures):
-    """A file over the template's cap is excluded by the parser (an Excluded status warning), not ingested."""
+def test_the_parser_does_not_apply_the_template_size_cap(vx_fixtures):
+    """An upload over the template's maxFileSize is parsed, not excluded: the app's limit is the only one.
+
+    The parser reads ``index.maxFileSize`` from a task configuration section the
+    engine does not build from a ``.pipe``, so ``parse_1.config.index`` in the
+    templates is not applied. Vector Explorer therefore excludes a file over its
+    limit before sending it (``apps/vector-ui/src/vector/uploads.ts``), and the
+    docs say such a file is excluded, not ingested. When this pin fails the engine
+    has started applying the cap: update contract rule 5, the app README, the user
+    guide and this pin together.
+    """
     for key in FIXTURES:
         ingest = vx_fixtures['tasks'][key]['ingest_1']['token']
         observed = run(_upload_oversize(ingest, key))
         record(f'g0_1_oversize_{key}', observed)
         rows = observed['result']
         assert rows and rows[0].get('action') == 'complete', f'{key}: oversize upload answered {rows}'
-        assert any(OVERSIZE_WARNING in w and str(TEMPLATE_MAX_FILE_SIZE) in w for w in observed['warnings']), (
-            f'{key}: no parser exclusion for the oversize upload; status warnings {observed["warnings"]}'
+        assert not any(OVERSIZE_WARNING in w for w in observed['warnings']), (
+            f'{key}: the parser now excludes a file over the template cap ({observed["warnings"]}); '
+            'the docs and the app still say that the app limit is the only one'
         )
 
 
 async def _raw_template_chat() -> Dict[str, Any]:
-    module = _load_start_fixtures()
+    module = _load_fixtures()
     pipeline = module.build_pipeline('postgres', 'template')
     pipeline['project_id'] = RAW_PROJECT_ID
     pipeline['name'] = 'vx-local Phase-0 raw template (pgvector)'
