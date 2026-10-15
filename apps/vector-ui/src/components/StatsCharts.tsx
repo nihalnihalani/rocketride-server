@@ -151,19 +151,7 @@ function Chart({ chart, scope, onScope }: { chart: IChart; scope: IDocumentsFilt
 						{chart.bins.map((bin) => {
 							if (bin.scope === null || bin.count === 0) return <span key={bin.key} style={{ flex: 1 }} aria-hidden="true" />;
 							const words = `${binWords(chart, bin)}: ${countWords(chart, bin.count)}. Scope the documents to these`;
-							return (
-								<button
-									key={bin.key}
-									type="button"
-									aria-label={words}
-									aria-pressed={binSelected(bin, scope)}
-									title={words}
-									style={{ flex: 1, minWidth: 0, padding: 0, background: 'transparent', border: 'none', cursor: 'pointer' }}
-									onClick={() => bin.scope && onScope?.(bin.scope)}
-									onFocus={(event) => (event.currentTarget.style.outline = FOCUS_RING)}
-									onBlur={(event) => (event.currentTarget.style.outline = 'none')}
-								/>
-							);
+							return <button key={bin.key} type="button" aria-label={words} aria-pressed={binSelected(bin, scope)} title={words} style={{ flex: 1, minWidth: 0, padding: 0, background: 'transparent', border: 'none', cursor: 'pointer' }} onClick={() => bin.scope && onScope?.(bin.scope)} onFocus={(event) => (event.currentTarget.style.outline = FOCUS_RING)} onBlur={(event) => (event.currentTarget.style.outline = 'none')} />;
 						})}
 					</div>
 				)}

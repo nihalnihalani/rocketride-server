@@ -113,9 +113,7 @@ export function HealthPanel({ item, medianChunks = null, listing = 'all', chunkL
 					<button type="button" disabled={probe.status === 'running'} style={{ ...styles.small, padding: '2px 8px', color: 'inherit', background: 'var(--rr-bg-paper)', border: '1px solid var(--rr-border-input)', borderRadius: 4, cursor: probe.status === 'running' ? 'progress' : 'pointer' }} onClick={() => onProbe?.()} onFocus={(event) => (event.currentTarget.style.outline = FOCUS_RING)} onBlur={(event) => (event.currentTarget.style.outline = 'none')}>
 						{probe.status === 'running' ? 'Counting…' : 'Count deleted chunks'}
 					</button>
-					{probe.status === 'done' && (
-						<span role="status">{probe.deleted === null || probe.deleted === undefined ? (probe.message ?? 'The store did not count the chunks, so deleted chunks cannot be counted.') : probe.deleted === 0 ? 'No soft-deleted chunk of this document is stored.' : `${probe.deleted.toLocaleString('en-US')} soft-deleted ${probe.deleted === 1 ? 'chunk' : 'chunks'} of this document ${probe.deleted === 1 ? 'is' : 'are'} still stored.`}</span>
-					)}
+					{probe.status === 'done' && <span role="status">{probe.deleted === null || probe.deleted === undefined ? (probe.message ?? 'The store did not count the chunks, so deleted chunks cannot be counted.') : probe.deleted === 0 ? 'No soft-deleted chunk of this document is stored.' : `${probe.deleted.toLocaleString('en-US')} soft-deleted ${probe.deleted === 1 ? 'chunk' : 'chunks'} of this document ${probe.deleted === 1 ? 'is' : 'are'} still stored.`}</span>}
 					{probe.status === 'error' && <span role="alert">{probe.message ?? 'The store did not answer.'}</span>}
 				</div>
 			)}

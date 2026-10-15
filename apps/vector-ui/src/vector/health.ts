@@ -150,7 +150,10 @@ export function documentHealth(item: IDocumentItem, ctx: IHealthContext = {}): I
  * @returns The median, or null.
  */
 export function medianChunks(rows: readonly IDocumentItem[]): number | null {
-	const counts = rows.map((r) => r.chunks).filter(reported).sort((a, b) => a - b);
+	const counts = rows
+		.map((r) => r.chunks)
+		.filter(reported)
+		.sort((a, b) => a - b);
 	if (counts.length === 0) return null;
 	const mid = Math.floor(counts.length / 2);
 	return counts.length % 2 === 1 ? (counts[mid] as number) : ((counts[mid - 1] as number) + (counts[mid] as number)) / 2;

@@ -77,14 +77,7 @@ export const CONDITION_KINDS = ['folder', 'fileType', 'ingestedAfter', 'ingested
 export type ConditionKind = (typeof CONDITION_KINDS)[number];
 
 /** One condition of the scope (at most one of each kind). */
-export type ICondition =
-	| { kind: 'folder'; prefix: string }
-	| { kind: 'fileType'; types: readonly string[] }
-	| { kind: 'ingestedAfter'; at: string }
-	| { kind: 'ingestedBefore'; at: string }
-	| { kind: 'chunks'; min: number | null; max: number | null }
-	| { kind: 'hasTables'; value: boolean }
-	| { kind: 'firstChunk'; present: boolean };
+export type ICondition = { kind: 'folder'; prefix: string } | { kind: 'fileType'; types: readonly string[] } | { kind: 'ingestedAfter'; at: string } | { kind: 'ingestedBefore'; at: string } | { kind: 'chunks'; min: number | null; max: number | null } | { kind: 'hasTables'; value: boolean } | { kind: 'firstChunk'; present: boolean };
 
 /** The ScopeBar's state: its conditions and the path box's text. */
 export interface IFilter {

@@ -13,34 +13,7 @@ import type { IDocumentItem, IDocumentsFilter, IScopeState } from '../src/contra
 import { DOCUMENTS_FILTER_KEYS } from '../src/contract/types';
 import { pagerApplyPage, pagerBegin, pagerInit } from '../src/vector/documents';
 import type { IPagerState } from '../src/vector/documents';
-import {
-	EMPTY_FILTER,
-	FILTER_TEXT_MAX,
-	clientKeys,
-	conditionAvailability,
-	conditionLabel,
-	dateToIso,
-	describeFilter,
-	fromDocumentsFilter,
-	listingFilter,
-	matches,
-	parseFilter,
-	removeCondition,
-	resolveScope,
-	sameFilter,
-	scopeAvailability,
-	scopeFromFilter,
-	scopeWith,
-	filterOf,
-	withText,
-	scopeObjectIds,
-	scopeStatusText,
-	scopeStripText,
-	setCondition,
-	toDocumentsFilter,
-	tooLargeText,
-	validateFilter,
-} from '../src/vector/filters';
+import { EMPTY_FILTER, FILTER_TEXT_MAX, clientKeys, conditionAvailability, conditionLabel, dateToIso, describeFilter, fromDocumentsFilter, listingFilter, matches, parseFilter, removeCondition, resolveScope, sameFilter, scopeAvailability, scopeFromFilter, scopeWith, filterOf, withText, scopeObjectIds, scopeStatusText, scopeStripText, setCondition, toDocumentsFilter, tooLargeText, validateFilter } from '../src/vector/filters';
 import type { IFilter } from '../src/vector/filters';
 import { readDocumentsPage, readStats } from '../src/vector/results';
 import { fixture } from './support/fixtures';
@@ -186,11 +159,7 @@ test('file type: by the extension of the file name, ignoring case; bare names co
 });
 
 test('ingest dates, chunk counts, tables, first chunk and the path box; a value the store did not give never matches', () => {
-	const rows = [
-		doc('a', 'C:/demo/a.md', { ingestedAt: '2026-10-01T09:00:00Z', chunks: 1, tables: 0 }),
-		doc('b', 'C:/demo/b.md', { ingestedAt: '2026-10-08T18:20:11Z', chunks: 64, tables: 2 }),
-		doc('c', 'C:/demo/c.md', { ingestedAt: null, chunks: null, tables: null, has_first_chunk: false }),
-	];
+	const rows = [doc('a', 'C:/demo/a.md', { ingestedAt: '2026-10-01T09:00:00Z', chunks: 1, tables: 0 }), doc('b', 'C:/demo/b.md', { ingestedAt: '2026-10-08T18:20:11Z', chunks: 64, tables: 2 }), doc('c', 'C:/demo/c.md', { ingestedAt: null, chunks: null, tables: null, has_first_chunk: false })];
 	const ids = (filter: IDocumentsFilter) => rows.filter((r) => matches(r, filter)).map((r) => r.objectId);
 	assert.deepEqual(ids({ ingested_after: '2026-10-02T00:00:00Z' }), ['b']);
 	assert.deepEqual(ids({ ingested_before: '2026-10-02T00:00:00Z' }), ['a']);
@@ -297,7 +266,10 @@ test('a server-filtered listing: the scope is every listed document once the lis
 	const done = pagerApplyPage(loading, server);
 	assert.equal(done.filterApplied, 'server');
 	const resolved = resolveScope(scopeOf(filter), done, 2_000);
-	assert.deepEqual(resolved.objectIds, server.items.map((i) => i.objectId));
+	assert.deepEqual(
+		resolved.objectIds,
+		server.items.map((i) => i.objectId)
+	);
 	assert.equal(resolved.overflow, null);
 	assert.equal(resolved.label, 'folder is under C:/demo/greenhouse/');
 });
@@ -358,7 +330,11 @@ test('a scope is resolved only from the listing it asked for: a stale listing (t
 	const stale = resolveScope(scope, unfiltered, 2_000);
 	assert.equal(stale.objectIds, null, 'the list is still the unfiltered one: wait for the filtered listing');
 	assert.equal(stale.overflow, null);
-	const greenhouse = listed(rows.filter((r) => r.path.startsWith('C:/demo/greenhouse/')), { path_prefix: 'C:/demo/handbooks/' }, { filter_applied: 'server', filter_ignored: [] });
+	const greenhouse = listed(
+		rows.filter((r) => r.path.startsWith('C:/demo/greenhouse/')),
+		{ path_prefix: 'C:/demo/handbooks/' },
+		{ filter_applied: 'server', filter_ignored: [] }
+	);
 	assert.equal(resolveScope(scope, greenhouse, 2_000).objectIds, null, 'a listing for other conditions resolves nothing');
 	const off = resolveScope({ ...scope, applyTo: { ...scope.applyTo, documents: false } }, greenhouse, 2_000);
 	assert.equal(off.objectIds, null, 'Documents off waits for the unfiltered listing');

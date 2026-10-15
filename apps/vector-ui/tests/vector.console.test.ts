@@ -446,7 +446,7 @@ function scoped(answer: string = 'documents_filter_server') {
 	return { ...h, filters };
 }
 
-test('the pager sends the scope\'s conditions; a new filter lists again from the first page, the same one asks nothing', async () => {
+test("the pager sends the scope's conditions; a new filter lists again from the first page, the same one asks nothing", async () => {
 	const { store, clock, filters } = scoped();
 	store.open();
 	await clock.settle();
@@ -473,7 +473,7 @@ test('the pager sends the scope\'s conditions; a new filter lists again from the
 	store.dispose();
 });
 
-test('a filter set before the console opens is the first listing\'s; a removal lists again with it', async () => {
+test("a filter set before the console opens is the first listing's; a removal lists again with it", async () => {
 	const { store, clock, filters } = scoped();
 	const handbooks = { path_prefix: 'C:/demo/handbooks/' };
 	store.setFilter(handbooks);
@@ -489,7 +489,7 @@ test('a filter set before the console opens is the first listing\'s; a removal l
 	store.dispose();
 });
 
-test('the directory\'s status line says how much the store applied: server, partial, or here over what is loaded', async () => {
+test("the directory's status line says how much the store applied: server, partial, or here over what is loaded", async () => {
 	const scope = (filter: IDocumentsFilter, documents = true): IScopeState => ({ filter, label: '', objectIds: null, overflow: null, applyTo: { documents, map: true, search: true, chat: true } });
 	const cases: Array<[string, IDocumentsFilter, string]> = [
 		['documents_filter_server', { path_prefix: 'C:/demo/greenhouse/' }, '2 documents match (store)'],

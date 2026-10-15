@@ -251,7 +251,11 @@ export function DocumentDirectory({ pager, selectedId, writes, onSelect, onRemov
 												const rect = event.currentTarget.getBoundingClientRect();
 												const keyboard = event.clientX === 0 && event.clientY === 0;
 												setFolderMenu({ folder: line.group.label, x: keyboard ? rect.left + 16 : event.clientX, y: keyboard ? rect.bottom : event.clientY });
-											}} style={{ display: 'flex', alignItems: 'center', gap: 4, width: '100%', height: ROW_HEIGHT, padding: '0 8px', background: 'none', border: 'none', color: 'inherit', font: 'inherit', fontSize: 12, fontWeight: 700, cursor: 'pointer', textAlign: 'left', overflow: 'hidden', whiteSpace: 'nowrap', textOverflow: 'ellipsis' }} onFocus={(event) => (event.currentTarget.style.outline = FOCUS_RING)} onBlur={(event) => (event.currentTarget.style.outline = 'none')}>
+											}}
+											style={{ display: 'flex', alignItems: 'center', gap: 4, width: '100%', height: ROW_HEIGHT, padding: '0 8px', background: 'none', border: 'none', color: 'inherit', font: 'inherit', fontSize: 12, fontWeight: 700, cursor: 'pointer', textAlign: 'left', overflow: 'hidden', whiteSpace: 'nowrap', textOverflow: 'ellipsis' }}
+											onFocus={(event) => (event.currentTarget.style.outline = FOCUS_RING)}
+											onBlur={(event) => (event.currentTarget.style.outline = 'none')}
+										>
 											<span style={{ width: 12, height: 12, flex: 'none', transform: line.collapsed ? 'none' : 'rotate(90deg)' }}>
 												<ChevronIcon />
 											</span>

@@ -61,7 +61,7 @@ test('logBins: powers of two, labelled and contiguous from the smallest value to
 	assert.deepEqual(logBins([]), []);
 });
 
-test('chunks per document: the long manual lands in the top bin, a click scopes to that bin\'s chunk range, documents without a count are left out and said', () => {
+test("chunks per document: the long manual lands in the top bin, a click scopes to that bin's chunk range, documents without a count are left out and said", () => {
 	const rows = [doc('a', 'C:/demo/a.md', { chunks: 2 }), doc('b', 'C:/demo/b.md', { chunks: 5 }), doc('c', 'C:/demo/c.md', { chunks: 6 }), doc('manual', 'C:/demo/manuals/pump_manual.pdf', { chunks: 96 }), doc('n', 'C:/demo/n.md', { chunks: null })];
 	const chart = chunksPerDocument(rows, 10);
 	const top = chart.bins[chart.bins.length - 1];
@@ -74,7 +74,7 @@ test('chunks per document: the long manual lands in the top bin, a click scopes 
 	assert.match(chart.summary, /^Chunks per document, 4 documents in 7 bins: most in 4–7 \(2\); the top bin is 64–127 \(1\)\.$/);
 });
 
-test('chunk length: from the map\'s sample (its pinned points left out), with the caption saying so; no sample says how to get one', () => {
+test("chunk length: from the map's sample (its pinned points left out), with the caption saying so; no sample says how to get one", () => {
 	const sample = fixture<ISampleResult>('sample_demo_1000');
 	const lengths = sample.points.len.filter((_, i) => sample.points.pinned[i] !== 1);
 	const bins = lengthBins(lengths);
@@ -139,10 +139,7 @@ test('ingested over time: by day within a month, by week within half a year, els
 	assert.equal(weeks.bins.length, 10);
 	const months = byIngestPeriod([doc('a', 'a', { ingestedAt: '2025-12-30T10:00:00Z' }), doc('b', 'b', { ingestedAt: '2026-10-08T10:00:00Z' })]);
 	assert.equal(months.unit, 'month');
-	assert.deepEqual(
-		months.bins.map((b) => b.label).slice(0, 2),
-		['2025-12', '2026-01']
-	);
+	assert.deepEqual(months.bins.map((b) => b.label).slice(0, 2), ['2025-12', '2026-01']);
 	assert.equal(months.bins.length, 11);
 	assert.deepEqual(months.bins[0]?.scope, { ingested_after: '2025-12-01T00:00:00Z', ingested_before: '2026-01-01T00:00:00Z' });
 	assert.deepEqual(byIngestPeriod([doc('a', 'a')]), { unit: 'day', bins: [], dated: 0 });

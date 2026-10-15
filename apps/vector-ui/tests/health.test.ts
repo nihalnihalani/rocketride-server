@@ -162,11 +162,15 @@ test('the chip: "N need attention" with the breakdown in its tooltip; counted ov
 	assert.equal(chip.label, '3 need attention');
 	assert.equal(chip.tone, 'warning');
 	assert.equal(chip.tooltip, 'Without a first chunk: 1 · Gaps in chunk ids: 0 · Deleted chunks: 1 · Empty: 0 · Oversize: 1. Counted over the 4 documents loaded; the directory lists them under "Needs attention". The store counts 2 documents without a first chunk.');
-	assert.equal(statsChips({ dialect: null, stats, readOnly: false, health: summary }).some((c) => c.key === 'orphans'), false, 'the attention chip replaces the orphan chip');
+	assert.equal(
+		statsChips({ dialect: null, stats, readOnly: false, health: summary }).some((c) => c.key === 'orphans'),
+		false,
+		'the attention chip replaces the orphan chip'
+	);
 	const partial = statsChips({ dialect: null, stats: readStats(fixture('stats_pgvector')), readOnly: false, health: healthSummary(rows, { medianChunks: 4, complete: false }) }).find((c) => c.key === 'attention');
 	assert.equal(partial?.label, '3 of 4 loaded need attention');
 	const one = statsChips({ dialect: null, stats: readStats(fixture('stats_pgvector')), readOnly: false, health: healthSummary([rows[2] as IDocumentItem], { medianChunks: null, complete: true }) }).find((c) => c.key === 'attention');
 	assert.equal(one?.label, '1 needs attention');
 	const unreported = healthSummary([{ ...doc('q', 'q.md'), max_chunk_id: null, deleted_chunks: null }], { medianChunks: null, complete: true });
-	assert.equal(statsChips({ dialect: null, stats: readStats(fixture('stats_orphans')), readOnly: false, health: unreported }).find((c) => c.key === 'orphans')?.label, '1 without first chunk', 'nothing flagged in what is loaded: the store\'s orphan chip stays');
+	assert.equal(statsChips({ dialect: null, stats: readStats(fixture('stats_orphans')), readOnly: false, health: unreported }).find((c) => c.key === 'orphans')?.label, '1 without first chunk', "nothing flagged in what is loaded: the store's orphan chip stays");
 });

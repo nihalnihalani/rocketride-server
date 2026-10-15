@@ -68,7 +68,7 @@ test('no scope: the bar is one row (snapshot), the path box its first field, not
 	assert.equal(bar(), IDLE);
 });
 
-test('the directory header with no scope: the title row, then the bar\'s one row, then the list', () => {
+test("the directory header with no scope: the title row, then the bar's one row, then the list", () => {
 	const pager = pagerApplyPage(pagerApplyPage(pagerBegin(pagerInit()), readDocumentsPage(fixture('documents_page1'))), readDocumentsPage(fixture('documents_page2_last')));
 	assert.equal(pager.status, 'done');
 	const html = renderToStaticMarkup(<DocumentDirectory pager={pager} selectedId={null} writes={on} onSelect={noop} onRemove={noop} onLoadMore={noop} onRetry={noop} />);
@@ -148,7 +148,7 @@ test("an editor's draft makes its condition, or says what is missing", () => {
 	assert.deepEqual(draftCondition('firstChunk', empty), { kind: 'firstChunk', present: false });
 });
 
-test('Saved: the connection\'s filters with Apply and Delete, or a sentence when there are none', () => {
+test("Saved: the connection's filters with Apply and Delete, or a sentence when there are none", () => {
 	const saved: ISavedFilter[] = [{ id: 'f1', name: 'handbooks', filter: { path_prefix: 'C:/demo/handbooks/' }, savedAt: 1 }];
 	const html = bar({ initial: { menu: 'saved' }, saved });
 	assert.match(html, /aria-expanded="true"[^>]*>Saved \(1\)<\/button>/);
