@@ -24,7 +24,7 @@ import { test } from 'node:test';
 import type { IDocumentItem, IDuplicatePair, IKnnBlock, ISampleResult } from '../src/contract/types';
 import { reviewedDocuments } from '../src/adapters/connections';
 import { connectionCaches } from '../src/adapters/explorer';
-import { KEEP_POLICIES, THRESHOLD_DEFAULT, THRESHOLD_MAX, THRESHOLD_MIN, applyPolicy, dedupeView, docInfo, duplicateGroupOf, groupOf, groups, isCopyGroup, keepOf, markReviewed, pairsAt, queueInit, queueReducer, queued, reviewedOf, unmarkReviewed } from '../src/map/dedupe';
+import { KEEP_POLICIES, THRESHOLD_DEFAULT, THRESHOLD_MAX, THRESHOLD_MIN, applyPolicy, copyVerdict, dedupeView, docInfo, duplicateGroupOf, groupOf, groups, isCopyGroup, keepOf, markReviewed, pairsAt, queueInit, queueReducer, queued, reviewedOf, unmarkReviewed } from '../src/map/dedupe';
 import { loadSample } from './support/map.samples';
 
 // =============================================================================
@@ -84,12 +84,12 @@ function row(objectId: string, p: string, chunks: number | null, ingestedAt: str
 	return { objectId, path: p, chunks, has_first_chunk: true, tables: 0, deleted: false, nodeId: null, size, modifyTime: null, ingestedAt, pointId: null };
 }
 
-// Documents A (handbook), B (its revision), C (a kestrel guide), D (its copy), E (unrelated).
+// Documents A (handbook), B (its revision), C (a one-chunk kestrel guide), D (its copy), E (unrelated).
 const DOCS: Array<[string, string, number | null]> = [
 	['oa', 'C:/demo/handbooks/falcon_handbook.md', 3],
 	['ob', 'C:/demo/handbooks/falcon_handbook_rev2.md', 3],
-	['oc', 'C:/demo/field/kestrel_field_guide.md', 2],
-	['od', 'C:/demo/archive/kestrel_field_guide_copy.md', 2],
+	['oc', 'C:/demo/field/kestrel_field_guide.md', 1],
+	['od', 'C:/demo/archive/kestrel_field_guide_copy.md', 1],
 	['oe', 'C:/demo/ops/memo_q1.txt', 4],
 ];
 // Points: A#0 A#1 B#0 B#1 C#0 D#0 E#0 E#2 (E#0 and E#2 repeat a paragraph inside E).
@@ -259,11 +259,12 @@ test('the demo sample: three groups of different documents, none inside one docu
 // KEEP POLICIES
 // =============================================================================
 
-const ROWS_INFO = [row('oa', 'C:/demo/handbooks/falcon_handbook.md', 3, '2026-10-02T09:00:00Z', 4000), row('ob', 'C:/demo/handbooks/falcon_handbook_rev2.md', 5, '2026-10-01T09:00:00Z', 5000), row('oc', 'C:/demo/field/kestrel_field_guide.md', 2, null), row('od', 'C:/demo/archive/kestrel_field_guide_copy.md', 2, null)];
+// The revision has one chunk more than the handbook (both of its sampled chunks pair up, half of its four).
+const ROWS_INFO = [row('oa', 'C:/demo/handbooks/falcon_handbook.md', 3, '2026-10-02T09:00:00Z', 4000), row('ob', 'C:/demo/handbooks/falcon_handbook_rev2.md', 4, '2026-10-01T09:00:00Z', 5000), row('oc', 'C:/demo/field/kestrel_field_guide.md', 1, null), row('od', 'C:/demo/archive/kestrel_field_guide_copy.md', 1, null)];
 
 test("docInfo joins the directory rows over the sample's documents (rows win; the sample fills paths and chunk counts)", () => {
 	const info = docInfo(SMALL, ROWS_INFO);
-	assert.deepEqual(info.get('ob'), { objectId: 'ob', path: 'C:/demo/handbooks/falcon_handbook_rev2.md', chunks: 5, ingestedAt: '2026-10-01T09:00:00Z', size: 5000, inSample: 2 });
+	assert.deepEqual(info.get('ob'), { objectId: 'ob', path: 'C:/demo/handbooks/falcon_handbook_rev2.md', chunks: 4, ingestedAt: '2026-10-01T09:00:00Z', size: 5000, inSample: 2 });
 	assert.deepEqual(info.get('oe'), { objectId: 'oe', path: 'C:/demo/ops/memo_q1.txt', chunks: 4, ingestedAt: null, size: null, inSample: 2 });
 	assert.equal(docInfo(SMALL, null).get('oa')?.ingestedAt, null);
 });
@@ -279,9 +280,9 @@ test('policies: oldest ingest, shortest path, most chunks; ties by objectId; unk
 	assert.equal(applyPolicy(kestrels!, 'shortest-path', info), 'oc', 'field/kestrel_field_guide.md is shorter than the archive copy');
 	assert.equal(applyPolicy(kestrels!, 'most-chunks', info), 'oc', 'a tie keeps the lower objectId');
 	assert.equal(applyPolicy(kestrels!, 'oldest', info), null, 'no ingest time known in the group: no choice');
-	const partly = docInfo(SMALL, [row('oc', 'C:/demo/field/kestrel_field_guide.md', 2, null), row('od', 'C:/demo/archive/kestrel_field_guide_copy.md', 2, '2026-10-05T00:00:00Z')]);
+	const partly = docInfo(SMALL, [row('oc', 'C:/demo/field/kestrel_field_guide.md', 1, null), row('od', 'C:/demo/archive/kestrel_field_guide_copy.md', 1, '2026-10-05T00:00:00Z')]);
 	assert.equal(applyPolicy(kestrels!, 'oldest', partly), 'od', 'a known time beats an unknown one');
-	const tied = docInfo(SMALL, [row('oc', 'x/aa.md', 2, '2026-10-05T00:00:00Z'), row('od', 'x/bb.md', 2, '2026-10-05T00:00:00Z')]);
+	const tied = docInfo(SMALL, [row('oc', 'x/aa.md', 1, '2026-10-05T00:00:00Z'), row('od', 'x/bb.md', 1, '2026-10-05T00:00:00Z')]);
 	assert.equal(applyPolicy(kestrels!, 'oldest', tied), 'oc');
 	assert.equal(applyPolicy(kestrels!, 'shortest-path', tied), 'oc');
 });
@@ -356,11 +357,132 @@ test('a policy keeps only in groups of copies; a group of shared passages (a boi
 	const small = docInfo(SMALL, ROWS_INFO);
 	assert.ok(
 		dedupeView(SMALL, 0.97).groups.every((g) => isCopyGroup(g, small)),
-		'copies: every document has at least half of its sampled chunks in the group'
+		"copies: at least half of every document's chunks, as the store counts them, are sampled and in the group"
 	);
 	const demo = loadSample('sample_demo_1000.json');
 	const demoInfo = docInfo(demo, null);
 	assert.deepEqual(queued(dedupeView(demo, 0.97).groups, policy, demoInfo, new Set()).objectIds, [], "the demo sample's groups are one shared chunk of long documents each: nothing is queued by a policy");
+});
+
+// The demo corpus seeded on the store: the six files ending with the records
+// notice are 3 to 4 chunks each and share one; the falcon handbook and its
+// revision are 7 chunks each and all 7 pair up. A light sample over a large
+// collection holds ONE chunk of most documents, often the shared one.
+const NOTICE_FILES = ['handbooks/osprey_station_handbook.md', 'ops/memo_q1.txt', 'ops/memo_q2.txt', 'ops/staffing_plan.md', 'greenhouse/irrigation_schedule.md', 'observatory/dark_sky_policy.md'];
+
+/**
+ * A sparse sample: the six notice files, each with only its notice chunk
+ * sampled (all six pair up), and the falcon handbook with its revision,
+ * every one of their 7 chunks sampled and paired chunk by chunk.
+ *
+ * @param noticeChunks - The store's chunk count for each notice file (null: unknown).
+ * @returns The sample.
+ */
+function sparseSample(noticeChunks: number | null): ISampleResult {
+	const docs: Array<[string, string, number | null]> = [...NOTICE_FILES.map((p, i): [string, string, number | null] => [`n${i}`, `C:/corp/${p}`, noticeChunks]), ['fa', 'C:/demo/handbooks/falcon_handbook.md', 7], ['fb', 'C:/demo/handbooks/falcon_handbook_rev2.md', 7]];
+	const points: IPointSpec[] = [...NOTICE_FILES.map((_, i) => ({ doc: i, chunk: 39 })), ...Array.from({ length: 7 }, (_, c) => ({ doc: 6, chunk: c })), ...Array.from({ length: 7 }, (_, c) => ({ doc: 7, chunk: c }))];
+	const rows: Array<Array<[number, number]>> = points.map((_, i) => {
+		if (i < 6) return NOTICE_FILES.map((__, j): [number, number] => [j, 0.993]).filter(([j]) => j !== i);
+		return [[i < 13 ? i + 7 : i - 7, 0.995]];
+	});
+	return sampleOf(docs, points, rows);
+}
+
+test('a sparse sample cannot make copies: one sampled notice chunk of 40-chunk files queues nothing, the planted copies still are', () => {
+	const sample = sparseSample(40);
+	const info = docInfo(sample, null);
+	const view = dedupeView(sample, 0.97);
+	const notice = view.groups.find((g) => g.objectIds.length === 6);
+	const falcon = view.groups.find((g) => g.objectIds.includes('fa'));
+	assert.ok(notice && falcon, 'the notice group and the handbook pair');
+	assert.deepEqual(notice.shared, { n0: 1, n1: 1, n2: 1, n3: 1, n4: 1, n5: 1 }, 'one of one sampled chunks matches in each file');
+	assert.equal(isCopyGroup(notice, info), false, 'one shared chunk of 40 is no copy');
+	assert.equal(copyVerdict(notice, info), 'sparse', 'too few chunks sampled to tell');
+	assert.equal(isCopyGroup(falcon, info), true, 'all 7 of 7 chunks pair up');
+	for (const policy of ['shortest-path', 'oldest', 'most-chunks'] as const) {
+		const state = queueReducer(queueInit(), { type: 'policy', value: policy });
+		assert.equal(keepOf(notice, state, info), null, `${policy} leaves the notice group alone`);
+	}
+	const shortest = queueReducer(queueInit(), { type: 'policy', value: 'shortest-path' });
+	assert.deepEqual(queued(view.groups, shortest, info, new Set()).objectIds, ['fb'], 'only the revision is queued');
+	const picked = queueReducer(shortest, { type: 'keep', group: notice.key, objectId: 'n1' });
+	assert.equal(queued(view.groups, picked, info, new Set()).objectIds.length, 6, 'a keep picked by hand still queues the other five');
+});
+
+test("the store's chunk count decides, from the sample or from the directory rows; unknown counts leave the group to a hand-picked keep", () => {
+	// Two long, different files ending with the same paragraph, one chunk of each sampled (the shared one).
+	const long = sampleOf(
+		[
+			['long-a', 'C:/corp/legal/contracts/master_services_agreement_2024.pdf', null],
+			['long-b', 'C:/corp/hr/policies/leave.md', null],
+		],
+		[
+			{ doc: 0, chunk: 119 },
+			{ doc: 1, chunk: 79 },
+		],
+		[[[1, 0.996]], [[0, 0.996]]]
+	);
+	const [group] = dedupeView(long, 0.97).groups;
+	const state = queueReducer(queueInit(), { type: 'policy', value: 'shortest-path' });
+	const counted = docInfo(long, [row('long-a', 'C:/corp/legal/contracts/master_services_agreement_2024.pdf', 120, '2026-10-01T00:00:00Z'), row('long-b', 'C:/corp/hr/policies/leave.md', 80, '2026-10-02T00:00:00Z')]);
+	assert.equal(isCopyGroup(group!, counted), false, '1 of 120 and 1 of 80 chunks match: not copies');
+	assert.equal(copyVerdict(group!, counted), 'sparse');
+	assert.deepEqual(queued([group!], state, counted, new Set()).objectIds, []);
+	const unknown = docInfo(long, null);
+	assert.equal(isCopyGroup(group!, unknown), false, 'no chunk count from the store: the sample alone cannot tell');
+	assert.equal(copyVerdict(group!, unknown), 'sparse');
+	assert.deepEqual(queued([group!], state, unknown, new Set()).objectIds, []);
+	const uncounted = sparseSample(null);
+	assert.deepEqual(queued(dedupeView(uncounted, 0.97).groups, state, docInfo(uncounted, null), new Set()).objectIds, ['fb'], 'unknown counts of the notice files hold back only their group');
+	const single = docInfo(long, [row('long-a', 'C:/a.md', 1, null), row('long-b', 'C:/b.md', 1, null)]);
+	assert.equal(isCopyGroup(group!, single), true, 'one-chunk documents whose only chunk pairs up are copies');
+	assert.deepEqual(queued([group!], state, single, new Set()).objectIds, ['long-b']);
+});
+
+test('one shared chunk never makes a longer document a copy, even when it is half of it', () => {
+	// Two 2-chunk notes, both chunks sampled: their second chunks are the same notice, their first chunks differ.
+	const notes = sampleOf(
+		[
+			['na', 'C:/ops/note_a.md', 2],
+			['nb', 'C:/ops/note_b.md', 2],
+		],
+		[
+			{ doc: 0, chunk: 0 },
+			{ doc: 0, chunk: 1 },
+			{ doc: 1, chunk: 0 },
+			{ doc: 1, chunk: 1 },
+		],
+		[[[2, 0.6]], [[3, 0.99]], [[0, 0.6]], [[1, 0.99]]]
+	);
+	const [group] = dedupeView(notes, 0.97).groups;
+	const info = docInfo(notes, null);
+	assert.equal(isCopyGroup(group!, info), false, '1 of 2 chunks shared');
+	assert.equal(keepOf(group!, queueReducer(queueInit(), { type: 'policy', value: 'shortest-path' }), info), null);
+});
+
+test('the verdict behind the note: copies, shared passages, not whole copies, or too few chunks sampled', () => {
+	const small = docInfo(SMALL, ROWS_INFO);
+	assert.deepEqual(
+		dedupeView(SMALL, 0.97).groups.map((g) => copyVerdict(g, small)),
+		['copies', 'copies']
+	);
+	const demo = loadSample('sample_demo_1000.json');
+	const demoInfo = docInfo(demo, null);
+	assert.deepEqual(
+		dedupeView(demo, 0.97).groups.map((g) => copyVerdict(g, demoInfo)),
+		['passages', 'passages', 'passages'],
+		'one chunk of documents with many sampled'
+	);
+	// A short note quoted whole inside a long manual: the note is all copy, the manual mostly its own text.
+	const quoted = sampleOf(
+		[
+			['q', 'C:/ops/note.md', 1],
+			['m', 'C:/manuals/long_manual.md', 160],
+		],
+		[{ doc: 0, chunk: 0 }, ...Array.from({ length: 6 }, (_, c) => ({ doc: 1, chunk: c * 20 }))],
+		[[[1, 0.99]], [[0, 0.99]], [], [], [], [], []]
+	);
+	assert.equal(copyVerdict(dedupeView(quoted, 0.97).groups[0]!, docInfo(quoted, null)), 'mixed');
 });
 
 test('the threshold moves within 0.90 to 0.995 and re-groups at once from the sample alone', () => {

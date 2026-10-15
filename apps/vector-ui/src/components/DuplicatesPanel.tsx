@@ -42,11 +42,11 @@
 import React, { useCallback, useMemo, useReducer, useState, useSyncExternalStore } from 'react';
 import type { Availability, DuplicatesPanelProps as ContractDuplicatesPanelProps, IDocumentItem, IDocumentRowsSource, ISampleModel } from '../contract/types';
 import { reviewedDocuments } from '../adapters/connections';
-import { GROUPS_SHOWN_MAX, KEEP_POLICIES, PAIRS_SHOWN_MAX, THRESHOLD_MAX, THRESHOLD_MIN, THRESHOLD_STEP, dedupeView, docInfo, isCopyGroup, isPassagesOnly, isReviewed, keepOf, markReviewed, policyChooses, queueInit, queueReducer, queued, reviewedOf, unmarkReviewed } from '../map/dedupe';
-import type { IDedupeView, IDocInfo, IDocumentGroup, IQueueState, IQueued, KeepPolicy, ReviewedCache } from '../map/dedupe';
+import { GROUPS_SHOWN_MAX, KEEP_POLICIES, PAIRS_SHOWN_MAX, THRESHOLD_MAX, THRESHOLD_MIN, THRESHOLD_STEP, copyVerdict, dedupeView, docInfo, isReviewed, keepOf, markReviewed, policyChooses, queueInit, queueReducer, queued, reviewedOf, unmarkReviewed } from '../map/dedupe';
+import type { CopyVerdict, IDedupeView, IDocInfo, IDocumentGroup, IQueueState, IQueued, KeepPolicy, ReviewedCache } from '../map/dedupe';
 import { formatSize } from '../vector/fileType';
 import { MAP_STYLES } from '../map/styles';
-import { CHOOSE_KEEP_FIRST, KEPT_ELSEWHERE, NOT_WHOLE_COPIES_NOTE, NO_BULK_REMOVE, POLICY_LEAVES_GROUP, SHARED_PASSAGES_NOTE, POLICY_LABELS, POLICY_UNAVAILABLE, REPEATED_HEADING, REPEATED_NOTE, duplicatesKnnCaveat, duplicatesNone, duplicatesSampleCaveat, groupLegend, groupsCappedLine, morePairsLine, num, plural, queuedLine, removeAllLabel, removeOthersLabel, removedLine, reviewedGroupsHeading, sharedLine, simText, thresholdValueText } from '../map/reviewWording';
+import { CHOOSE_KEEP_FIRST, KEPT_ELSEWHERE, NOT_WHOLE_COPIES_NOTE, NO_BULK_REMOVE, POLICY_LEAVES_GROUP, SHARED_PASSAGES_NOTE, POLICY_LABELS, POLICY_UNAVAILABLE, REPEATED_HEADING, REPEATED_NOTE, TOO_FEW_SAMPLED_NOTE, duplicatesKnnCaveat, duplicatesNone, duplicatesSampleCaveat, groupLegend, groupsCappedLine, morePairsLine, num, plural, queuedLine, removeAllLabel, removeOthersLabel, removedLine, reviewedGroupsHeading, sharedLine, simText, thresholdValueText } from '../map/reviewWording';
 
 /** Props: the frozen ones, plus the queue's starting choices and the reviewed cache. */
 export interface DuplicatesPanelProps extends ContractDuplicatesPanelProps {
@@ -77,6 +77,13 @@ export interface DuplicatesBodyProps {
 	onRemove(objectIds: readonly string[]): void;
 	onOpenDocument?(objectId: string, chunkId: number): void;
 }
+
+/** Why a policy leaves a group alone, by what the sample shows about it. */
+const NOT_COPIES_NOTES: Readonly<Record<Exclude<CopyVerdict, 'copies'>, string>> = {
+	passages: SHARED_PASSAGES_NOTE,
+	mixed: NOT_WHOLE_COPIES_NOTE,
+	sparse: TOO_FEW_SAMPLED_NOTE,
+};
 
 /** The last path segment. */
 function base(path: string): string {
@@ -165,8 +172,7 @@ function groupFieldset(props: DuplicatesBodyProps, group: IDocumentGroup, review
 	const cannotBulk = mine.length > 1 && !props.bulk;
 	const removeWhy = writesOff ? reason : keep === null ? CHOOSE_KEEP_FIRST : cannotBulk ? NO_BULK_REMOVE : undefined;
 	// Not copies: a policy leaves the group alone, and the panel says why.
-	const copies = isCopyGroup(group, props.info);
-	const passagesOnly = !copies && isPassagesOnly(group, props.info);
+	const verdict = copyVerdict(group, props.info);
 	return (
 		<fieldset key={group.key} data-group={group.id} style={{ border: '1px solid var(--rr-border)', borderRadius: 6, margin: '8px 0', padding: '6px 8px', opacity: reviewed ? 0.8 : 1 }}>
 			<legend style={MAP_STYLES.label}>{groupLegend(group.id, group.objectIds.length, group.simMin, group.simMax)}</legend>
@@ -191,9 +197,9 @@ function groupFieldset(props: DuplicatesBodyProps, group: IDocumentGroup, review
 				);
 			})}
 			{pairList(props, group)}
-			{copies ? null : (
+			{verdict === 'copies' ? null : (
 				<p style={MAP_STYLES.note}>
-					{passagesOnly ? SHARED_PASSAGES_NOTE : NOT_WHOLE_COPIES_NOTE} {POLICY_LEAVES_GROUP}
+					{NOT_COPIES_NOTES[verdict]} {POLICY_LEAVES_GROUP}
 				</p>
 			)}
 			<div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 4 }}>

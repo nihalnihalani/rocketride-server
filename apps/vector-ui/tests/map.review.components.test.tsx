@@ -60,13 +60,13 @@ function button(tree: React.ReactElement, label: string): React.ReactElement<{ o
 	return found as React.ReactElement<{ onClick(): void; disabled?: boolean; title?: string }>;
 }
 
-// A two-document handbook copy, a kestrel copy and a paragraph repeated inside one memo.
+// A two-document handbook copy, a one-chunk kestrel copy and a paragraph repeated inside one memo.
 function small(): ISampleResult {
 	const docs: Array<[string, string, number]> = [
 		['oa', 'C:/demo/handbooks/falcon_handbook.md', 3],
 		['ob', 'C:/demo/handbooks/falcon_handbook_rev2.md', 3],
-		['oc', 'C:/demo/field/kestrel_field_guide.md', 2],
-		['od', 'C:/demo/archive/kestrel_field_guide_copy.md', 2],
+		['oc', 'C:/demo/field/kestrel_field_guide.md', 1],
+		['od', 'C:/demo/archive/kestrel_field_guide_copy.md', 1],
 		['oe', 'C:/demo/ops/memo_q1.txt', 4],
 	];
 	const points = [0, 0, 1, 1, 2, 3, 4, 4].map((doc, i) => ({ doc, chunk: [0, 1, 0, 1, 0, 0, 0, 2][i] as number }));
@@ -97,7 +97,7 @@ const SMALL = modelOf(small());
 /** Directory rows for the small sample. */
 const ROWS: IDocumentItem[] = [
 	{ objectId: 'oa', path: 'C:/demo/handbooks/falcon_handbook.md', chunks: 3, has_first_chunk: true, tables: 0, deleted: false, nodeId: null, size: 4096, modifyTime: null, ingestedAt: '2026-10-02T09:00:00Z', pointId: null },
-	{ objectId: 'ob', path: 'C:/demo/handbooks/falcon_handbook_rev2.md', chunks: 5, has_first_chunk: true, tables: 0, deleted: false, nodeId: null, size: 5120, modifyTime: null, ingestedAt: '2026-10-01T09:00:00Z', pointId: null },
+	{ objectId: 'ob', path: 'C:/demo/handbooks/falcon_handbook_rev2.md', chunks: 4, has_first_chunk: true, tables: 0, deleted: false, nodeId: null, size: 5120, modifyTime: null, ingestedAt: '2026-10-01T09:00:00Z', pointId: null },
 ];
 const rowsSource: IDocumentRowsSource = { getRows: () => ROWS, subscribe: () => noop };
 
@@ -223,9 +223,9 @@ test("the sample model's removed documents leave the groups", () => {
 test('after the console removed queued documents the panel says how many, with the chunks the store reported per document', () => {
 	const sample: ISampleModel = { ...SMALL, removed: ['ob'] };
 	const out = html(<DuplicatesPanel sample={sample} writes={on} documents={rowsSource} onSelect={noop} onRemoveDocument={noop} onRemoveDocuments={noop} initial={{ requested: ['ob', 'od'] }} />);
-	assert.match(out, /Removed 1 of 2 documents \(5 chunks\); 1 is still stored\./);
+	assert.match(out, /Removed 1 of 2 documents \(4 chunks\); 1 is still stored\./);
 	const all: ISampleModel = { ...SMALL, removed: ['ob', 'od'] };
-	assert.match(html(<DuplicatesPanel sample={all} writes={on} documents={rowsSource} onSelect={noop} onRemoveDocument={noop} onRemoveDocuments={noop} initial={{ requested: ['ob', 'od'] }} />), /Removed 2 documents \(7 chunks\)/);
+	assert.match(html(<DuplicatesPanel sample={all} writes={on} documents={rowsSource} onSelect={noop} onRemoveDocument={noop} onRemoveDocuments={noop} initial={{ requested: ['ob', 'od'] }} />), /Removed 2 documents \(5 chunks\)/);
 });
 
 test('the reviewed documents of a connection come from its cache, so the queue keeps them across tab switches', () => {
@@ -245,6 +245,31 @@ test('a group of shared passages says so; nothing is removable before a keep is 
 	assert.doesNotMatch(policy, /checked=""/);
 	assert.doesNotMatch(html(<DuplicatesPanel sample={SMALL} writes={on} onSelect={noop} onRemoveDocument={noop} />), /Shared passages only/, 'a copy shares most of its chunks');
 	assert.match(out, /<button[^>]*disabled=""[^>]*title="Choose the document to keep first"[^>]*>Remove the others<\/button>/);
+});
+
+test('two long files sampled once each through the shared paragraph: the panel says it cannot tell, and a policy queues nothing', () => {
+	const base = loadSample('sample_demo_1000.json');
+	const knn: IKnnBlock = { k: 1, offsets_row: [0, 1, 2], cols: [1, 0], sims: [0.996, 0.996] };
+	const sparse: ISampleResult = {
+		...base,
+		n: 2,
+		n_requested: 2,
+		docs: [
+			{ i: 0, objectId: 'long-a', path: 'C:/corp/legal/contracts/master_services_agreement_2024.pdf', chunks: 120, in_sample: 1 },
+			{ i: 1, objectId: 'long-b', path: 'C:/corp/hr/policies/leave.md', chunks: 80, in_sample: 1 },
+		],
+		points: { doc: [0, 1], chunk: [119, 79], x: [0, 0], y: [0, 0], len: [400, 400], snip: ['text', 'text'], pinned: [0, 0] },
+		knn,
+		density: [0.5, 0.5],
+		outliers: [],
+		duplicates: [],
+	};
+	const out = html(<DuplicatesPanel sample={modelOf(sparse)} writes={on} onSelect={noop} onRemoveDocument={noop} onRemoveDocuments={noop} initial={{ policy: 'shortest-path' }} />);
+	assert.match(out, /This sample holds too few chunks of these documents to tell copies from shared text\. A keep policy leaves this group alone; pick the document to keep by hand to queue the others\./);
+	assert.doesNotMatch(out, /Shared passages only|Not every document here is a copy/);
+	assert.match(out, /role="status"[^>]*>No document queued/);
+	assert.match(out, /<button[^>]*disabled=""[^>]*>Remove all queued \(0 documents\)<\/button>/);
+	assert.doesNotMatch(out, /checked=""/, 'no document is kept by the policy');
 });
 
 // =============================================================================

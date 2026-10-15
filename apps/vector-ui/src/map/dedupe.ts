@@ -36,10 +36,13 @@
 // A keep policy (oldest ingest, shortest path, most chunks) or a hand-picked
 // keep chooses one document per group; the others are queued for removal,
 // except a document another group keeps. A policy only chooses in a group
-// of copies (every document has at least half of its sampled chunks in the
-// group): a paragraph several files share is never queued by a policy. Removal itself is the console's:
-// the panel hands the queued objectIds to `requestRemove`, which confirms
-// with the typed count and sends `remove_document` in batches.
+// of copies, judged against the store's chunk counts rather than the
+// sample's: at least half of every document's chunks are sampled and in the
+// group, and one shared chunk never makes a longer document a copy. A
+// paragraph several files share is never queued by a policy, however thinly
+// the sample covers them. Removal itself is the console's: the panel hands
+// the queued objectIds to `requestRemove`, which confirms with the typed
+// count and sends `remove_document` in batches.
 //
 // The reviewed documents of a connection live in the registry's 'reviewed
 // documents' cache (adapters/connections.ts), cleared on a change of
@@ -431,22 +434,62 @@ export function queueReducer(state: IQueueState, action: QueueAction): IQueueSta
 	}
 }
 
+/** What the sample shows about a group's documents (the note under a group that is not copies). */
+export type CopyVerdict = 'copies' | 'passages' | 'mixed' | 'sparse';
+
 /**
- * Whether a group's documents are copies of each other: every document has
- * at least half of its sampled chunks in the group. A group that is not
- * (a boilerplate paragraph at the end of otherwise different files, a
- * short note quoted inside a long manual) is shared text, and removing a
- * document would remove everything else it holds.
+ * What the sample shows about one document of a group. 'whole': at least
+ * half of its chunks, as the store counts them, are sampled and in the
+ * group, and more than one of them unless it has only one. 'own': most of
+ * its sampled chunks are outside the group (text the others do not have).
+ * 'unknown': neither, because too few of its chunks are in the sample or
+ * the store did not count them; the sample's own ratio is not trusted then
+ * (one sampled chunk that happens to be a shared footer reads "1 of 1").
+ *
+ * @param shared - Its points in the group.
+ * @param doc - The document.
+ * @returns The verdict for the document.
+ */
+function docVerdict(shared: number, doc: IDocInfo | undefined): 'whole' | 'own' | 'unknown' {
+	const inSample = doc?.inSample ?? 0;
+	if (inSample <= 0) return 'unknown';
+	if (shared * 2 < inSample) return 'own';
+	if (doc?.chunks === null || doc?.chunks === undefined) return 'unknown';
+	const total = Math.max(doc.chunks, inSample);
+	return shared * 2 >= total && (shared >= 2 || shared === total) ? 'whole' : 'unknown';
+}
+
+/**
+ * What a group is: 'copies' when every document is a whole copy (a policy
+ * may choose); 'passages' when every document has most of its sampled
+ * chunks elsewhere (shared text); 'mixed' when some do; 'sparse' when the
+ * sample holds too few chunks of its documents to tell copies from shared
+ * text (a boilerplate paragraph at the end of long files, sampled once each).
+ *
+ * @param group - The group.
+ * @param info - The documents.
+ * @returns The verdict.
+ */
+export function copyVerdict(group: Pick<IDocumentGroup, 'objectIds' | 'shared'>, info: ReadonlyMap<string, IDocInfo>): CopyVerdict {
+	const each = group.objectIds.map((id) => docVerdict(group.shared[id] ?? 0, info.get(id)));
+	if (each.length > 0 && each.every((v) => v === 'whole')) return 'copies';
+	if (each.length > 0 && each.every((v) => v === 'own')) return 'passages';
+	return each.includes('own') ? 'mixed' : 'sparse';
+}
+
+/**
+ * Whether a group's documents are copies of each other (see copyVerdict).
+ * A group that is not (a boilerplate paragraph at the end of otherwise
+ * different files, a short note quoted inside a long manual, or files the
+ * sample holds too little of) needs its keep picked by hand: removing a
+ * document removes everything else it holds.
  *
  * @param group - The group.
  * @param info - The documents.
  * @returns True for copies.
  */
 export function isCopyGroup(group: Pick<IDocumentGroup, 'objectIds' | 'shared'>, info: ReadonlyMap<string, IDocInfo>): boolean {
-	return group.objectIds.every((id) => {
-		const inSample = info.get(id)?.inSample ?? 0;
-		return inSample > 0 && (group.shared[id] ?? 0) * 2 >= inSample;
-	});
+	return copyVerdict(group, info) === 'copies';
 }
 
 /**
@@ -457,16 +500,14 @@ export function isCopyGroup(group: Pick<IDocumentGroup, 'objectIds' | 'shared'>,
  * @returns True when the group holds shared passages only.
  */
 export function isPassagesOnly(group: Pick<IDocumentGroup, 'objectIds' | 'shared'>, info: ReadonlyMap<string, IDocInfo>): boolean {
-	return group.objectIds.every((id) => {
-		const inSample = info.get(id)?.inSample ?? 0;
-		return inSample > 0 && (group.shared[id] ?? 0) * 2 < inSample;
-	});
+	return copyVerdict(group, info) === 'passages';
 }
 
 /**
  * The document a group keeps: the hand-picked one, else the policy's. A
- * policy only chooses in a group of copies; shared text needs a keep picked
- * by hand, so no policy ever queues a document for a paragraph it shares.
+ * policy only chooses in a group of copies (isCopyGroup); shared text, or
+ * documents the sample holds too little of to tell, need a keep picked by
+ * hand, so no policy ever queues a document for a paragraph it shares.
  *
  * @param group - The group.
  * @param state - The choices.

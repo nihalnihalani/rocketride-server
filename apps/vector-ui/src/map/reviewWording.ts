@@ -176,6 +176,9 @@ export const SHARED_PASSAGES_NOTE = 'Shared passages only: each of these documen
 /** Some document of a group is not a copy of the others. */
 export const NOT_WHOLE_COPIES_NOTE = 'Not every document here is a copy of the others: removing one removes text the others do not have.';
 
+/** The sample holds too few chunks of a group's documents to tell copies from shared text. */
+export const TOO_FEW_SAMPLED_NOTE = 'This sample holds too few chunks of these documents to tell copies from shared text.';
+
 /** A policy does not choose in a group that is not copies. */
 export const POLICY_LEAVES_GROUP = 'A keep policy leaves this group alone; pick the document to keep by hand to queue the others.';
 
