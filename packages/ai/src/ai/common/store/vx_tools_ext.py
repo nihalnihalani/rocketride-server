@@ -58,7 +58,7 @@ from rocketlib import tool_function
 
 from ..schema import Doc, QuestionText
 from . import vx_write_gate
-from .errors import ToolRefusal
+from .errors import StoreUnsupported, ToolRefusal
 from .vx_tools import (
     _ENVELOPE,
     _KEY_SCHEMA,
@@ -77,15 +77,19 @@ from .vx_tools import (
     deletedFilter,
     docKey,
     metadataValue,
+    read_vectors,
     vectordb_tool,
 )
-from .vx_types import CONTROL_OBJECT_ID, RECOMMEND_STRATEGIES
+from .vx_types import CONTROL_OBJECT_ID, MATRIX_SOURCES, RECOMMEND_STRATEGIES
 
 #: The sentence of a ``best_score`` call to a store that cannot rank it (the app shows it as is).
 BEST_SCORE_UNSUPPORTED = 'best_score is not supported by this store; use average_vector.'
 
 #: The warning of a native recommendation asked to keep its examples: the store always leaves them out.
 EXAMPLES_ALWAYS_EXCLUDED = 'examples_always_excluded'
+
+#: Decimal places of every ``similarity_matrix`` value (reported as ``dp``).
+MATRIX_DP = 2
 
 
 def _examples_arg(args: Dict[str, Any], name: str) -> List[Key]:
@@ -142,7 +146,22 @@ def average_vector_query(metric: str, positives: Sequence[Any], negatives: Seque
     return query
 
 
-__all__ = ['BEST_SCORE_UNSUPPORTED', 'EXAMPLES_ALWAYS_EXCLUDED', 'VectorExplorerExtTools', 'average_vector_query']
+def _matrix_value(value: float) -> Optional[float]:
+    """One matrix cell: rounded to :data:`MATRIX_DP` places, never ``-0.0``, null when not finite."""
+    number = float(value)
+    if not math.isfinite(number):
+        return None
+    number = round(number, MATRIX_DP)
+    return 0.0 if number == 0 else number
+
+
+__all__ = [
+    'BEST_SCORE_UNSUPPORTED',
+    'EXAMPLES_ALWAYS_EXCLUDED',
+    'MATRIX_DP',
+    'VectorExplorerExtTools',
+    'average_vector_query',
+]
 
 
 class VectorExplorerExtTools:
@@ -366,3 +385,119 @@ class VectorExplorerExtTools:
             return answer
         finally:
             state.neighbors_busy.release()
+
+    # ------------------------------------------------------------------
+    # similarity_matrix
+    # ------------------------------------------------------------------
+
+    def _vx_matrix_vectors(self, store: Any, keys: Sequence[Key]) -> 'tuple[Dict[Key, Any], set]':
+        """Vectors for ``keys`` and the keys read from the cache.
+
+        The latest cached sample first (by ``SampleEntry.index``), then ``getVectors`` for the
+        rest; the control record is never read. A store that cannot read vectors leaves those
+        keys out.
+        """
+        import numpy as np
+
+        out: Dict[Key, Any] = {}
+        cached: set = set()
+        latest = _vx_state(store).samples().latest()
+        if latest is not None:
+            for key in keys:
+                idx = latest.index.get(key)
+                if idx is not None:
+                    out[key] = latest.vectors[idx]
+                    cached.add(key)
+        missing = [key for key in keys if key not in out and key[0] != CONTROL_OBJECT_ID]
+        if missing:
+            try:
+                for key, doc in read_vectors(store, missing).items():
+                    out[key] = np.asarray(doc.embedding, dtype=np.float32)
+            except StoreUnsupported:
+                pass
+        return out, cached
+
+    @tool_function(
+        input_schema={
+            'type': 'object',
+            'required': ['keys'],
+            'properties': {
+                'keys': {
+                    'type': 'array',
+                    'items': _KEY_SCHEMA,
+                    'minItems': 2,
+                    'maxItems': LIMITS['matrix_keys_max'],
+                    'description': 'The chunks to compare, by [objectId, chunkId].',
+                }
+            },
+        },
+        output_schema={
+            'type': 'object',
+            'properties': {
+                **_ENVELOPE,
+                'n': {'type': 'integer'},
+                'keys': {'type': 'array', 'items': _KEY_SCHEMA},
+                'metric': {'type': 'string'},
+                'dp': {'type': 'integer'},
+                'matrix': {'type': 'array', 'items': {'type': 'array', 'items': {'type': ['number', 'null']}}},
+                'source': {'type': 'string', 'enum': list(MATRIX_SOURCES)},
+                'not_found': {'type': 'array', 'items': _KEY_SCHEMA},
+            },
+        },
+        description='Return the pairwise similarities of up to 100 stored chunks, by [objectId, chunkId].',
+        audience=('dap',),
+    )
+    @vectordb_tool
+    def similarity_matrix(self, args):
+        """The pairwise similarities of 2 to ``matrix_keys_max`` chunks, by key (contract section 4.4-E).
+
+        Keys only: there is no sample id or index input, so the matrix does not depend on
+        which sample the caller drew last. Each key's vector comes from the latest cached
+        sample, else from the store (``source``); keys found in neither are listed in
+        ``not_found`` and the matrix covers the others, in the order given, by the store's
+        metric (``vx_math.similarity``), made exactly symmetric and rounded to ``dp`` places.
+        Scalars only. Takes no lock: it reads the cache and the store as ``neighbors`` does
+        and holds nothing another call waits for.
+        """
+        vx_write_gate.check_read()
+        import numpy as np
+
+        from . import vx_math
+
+        store = self._vx_store()
+        raw = args.get('keys')
+        max_n = LIMITS['matrix_keys_max']
+        if isinstance(raw, (list, tuple)) and len(raw) > max_n:
+            raise ToolRefusal('LIMIT_EXCEEDED', f'A matrix compares at most {max_n} chunks; {len(raw)} were given.')
+        keys = _keys_arg(raw, 'keys', max_n, min_n=2)
+        if len(keys) < 2:
+            raise _invalid('keys must name at least 2 different chunks.')
+        if not store._doesCollectionExist():
+            raise ToolRefusal('COLLECTION_MISSING', 'The collection does not exist yet; add a document first.')
+        metric = self._vx_metric(store) or 'cosine'
+        vectors, cached = self._vx_matrix_vectors(store, keys)
+        resolved = [key for key in keys if key in vectors]
+        not_found = [[key[0], key[1]] for key in keys if key not in vectors]
+        if len(resolved) < 2:
+            raise ToolRefusal(
+                'NOT_FOUND', 'Fewer than 2 of those chunks are stored in this collection.', {'not_found': not_found}
+            )
+        if len({len(vectors[key]) for key in resolved}) > 1:
+            raise ToolRefusal(
+                'DIMENSION_MISMATCH', 'Those chunks hold vectors of different lengths; they cannot be compared.'
+            )
+        V = np.vstack([np.asarray(vectors[key], dtype=np.float32).reshape(1, -1) for key in resolved])
+        S = vx_math.similarity(metric, V, V).astype(np.float64)
+        S = (S + S.T) / 2.0
+        from_cache = sum(1 for key in resolved if key in cached)
+        source = 'cache' if from_cache == len(resolved) else ('store' if from_cache == 0 else 'mixed')
+        return {
+            'success': True,
+            'n': len(resolved),
+            'keys': [[key[0], key[1]] for key in resolved],
+            'metric': metric,
+            'dp': MATRIX_DP,
+            'matrix': [[_matrix_value(value) for value in row] for row in S],
+            'source': source,
+            'not_found': not_found,
+        }

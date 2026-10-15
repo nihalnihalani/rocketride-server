@@ -49,6 +49,7 @@ EXPLORER_TOOLS = (
     'recommend',
     'remove_document',
     'sample',
+    'similarity_matrix',
     'vectors',
 )
 
@@ -515,6 +516,7 @@ _INPUTS = {
     'project': {'sample_id': 's-1-aaaaaaaa', 'vector': [0.1, 0.2]},
     'neighbors': {'vector': [0.1, 0.2]},
     'recommend': {'positive': [['a', 0]]},
+    'similarity_matrix': {'keys': [['a', 0], ['a', 1]]},
     'search': {'vector': [0.1, 0.2]},
     'remove_document': {'object_ids': ['a']},
     'delete': {'object_ids': ['a']},
@@ -744,6 +746,16 @@ def test_recommend_matches_the_fixtures(wired):
     _same_keys(answer['items'][0], fixture['items'][0], 'recommend.items[]')
     _same_keys(answer['examples_resolved'], fixture['examples_resolved'], 'recommend.examples_resolved')
     assert inst.recommend({'positive': [['doc00', 0]], 'strategy': 'best_score'}) == _fixture('recommend_unsupported')
+
+
+def test_similarity_matrix_matches_the_fixture(wired):
+    _store, inst, _sample = wired
+    answer = inst.similarity_matrix({'keys': [['doc00', 0], ['doc00', 3], ['doc02', 0]]})
+    fixture = _fixture('similarity_matrix_ok')
+    _same_keys(answer, fixture, 'similarity_matrix')
+    assert (answer['n'], answer['dp'], answer['metric']) == (fixture['n'], fixture['dp'], fixture['metric'])
+    assert answer['keys'] == [['doc00', 0], ['doc00', 3], ['doc02', 0]] and len(answer['matrix']) == 3
+    assert answer['source'] in ('cache', 'store', 'mixed') and answer['not_found'] == fixture['not_found'] == []
 
 
 def test_search_matches_the_fixture(wired):
