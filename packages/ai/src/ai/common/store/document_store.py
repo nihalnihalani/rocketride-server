@@ -26,6 +26,7 @@ from .vx_tools import (  # noqa: F401 - re-exported for the drivers that overrid
     safe_error,
     vectordb_tool,
 )
+from .vx_tools import _strings_arg
 from .vx_tools_ext import VectorExplorerExtTools
 from .vx_types import CONTROL_OBJECT_ID, ChunkPage, DocListFilter, DocPage, KnnGraph, StoreInfo
 
@@ -1515,17 +1516,21 @@ class VectorStoreToolMixin(VectorExplorerExtTools, VectorExplorerTools):
         if object_id:
             object_ids.extend([object_id] if isinstance(object_id, str) else list(object_id))
         extra_ids = raw_filter.get('objectIds')
-        if extra_ids:
-            extra = [extra_ids] if isinstance(extra_ids, str) else list(extra_ids)
-            # The explorer's scope (contract section 4.4-B): at most scope_keys_max documents, as for
-            # filter.object_ids of sample and neighbors. The legacy objectId key is not capped.
+        if extra_ids is not None:
+            # The explorer's scope (contract section 4.4-B), checked like filter.object_ids of sample
+            # and neighbors: a list of 1 to scope_keys_max non-empty strings (one string is one id).
+            # A list over the cap is refused by its length before its items are looked at. The
+            # legacy objectId key is neither capped nor checked, so agents' calls do not change.
             cap = VECTOR_TOOL_LIMITS['scope_keys_max']
-            if len(extra) > cap:
+            if isinstance(extra_ids, (list, tuple)) and len(extra_ids) > cap:
                 raise ToolRefusal(
                     'LIMIT_EXCEEDED',
-                    f'filter.objectIds names {len(extra):,} documents; a search takes at most {cap:,}. Narrow the scope.',
+                    f'filter.objectIds names {len(extra_ids):,} documents; a search takes at most {cap:,}. '
+                    'Narrow the scope.',
                 )
-            object_ids.extend(extra)
+            if isinstance(extra_ids, str):
+                extra_ids = [extra_ids]
+            object_ids.extend(_strings_arg(extra_ids, 'filter.objectIds', cap))
         if object_ids:
             doc_filter.objectIds = list(dict.fromkeys(str(oid) for oid in object_ids))
         node_id = raw_filter.get('nodeId')

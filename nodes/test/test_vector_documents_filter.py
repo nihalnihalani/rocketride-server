@@ -19,7 +19,9 @@ Contract section 4.4-A (the filter), 4.4-B (the cap on ``search``'s ``filter.obj
   ``deleted_chunks``, its soft-deleted rows whatever the mode; which documents are listed
   does not change.
 * ``search`` refuses more than ``limits.scope_keys_max`` ids in ``filter.objectIds`` with
-  ``LIMIT_EXCEEDED``; the legacy ``objectId`` key is unchanged.
+  ``LIMIT_EXCEEDED`` and anything but 1 to that many non-empty strings with
+  ``INVALID_INPUT``, as ``sample`` checks ``filter.object_ids``; the legacy ``objectId``
+  key is unchanged.
 * ``VX_KEYWORD_MATCH`` says how a driver's keyword search matches: ``'substring'`` for
   pgvector (``ILIKE``) and Chroma (``$contains``), unset (null) for a driver without
   keyword search.
@@ -591,6 +593,68 @@ def test_search_keeps_the_legacy_object_id_key_unchanged():
     assert len(_semantic_filter(store).objectIds) == SCOPE_MAX + 5
     inst.search({'query': 'kestrel', 'filter': {'objectIds': 'doc00'}})
     assert _semantic_filter(store).objectIds == ['doc00']
+
+
+def _search_calls(store) -> List[Any]:
+    return [call for call in store.calls if call[0] in ('semantic', 'keyword')]
+
+
+@pytest.mark.parametrize('mode', ['auto', 'keyword'])
+@pytest.mark.parametrize(
+    'object_ids',
+    [
+        pytest.param(5, id='int'),
+        pytest.param({'a': 1, 'b': 2}, id='mapping'),
+        pytest.param([''] * 3, id='empty-strings'),
+        pytest.param(['   '], id='blank-string'),
+        pytest.param([1, 2, 3], id='ints'),
+        pytest.param(['doc00', None], id='none-item'),
+        pytest.param([], id='empty-list'),
+        pytest.param('', id='empty-string'),
+        pytest.param(False, id='false'),
+    ],
+)
+def test_search_checks_the_shape_of_object_ids_like_the_sample_scope(object_ids, mode):
+    # The same check as filter.object_ids of sample and neighbors: a list of 1 to scope_keys_max
+    # non-empty strings, refused before anything is embedded or searched.
+    store = clustered()
+    embedded: List[str] = []
+    inst = node(store, embed_query=lambda text: embedded.append(text) or [0.1] * 8, embed_model_name='m')
+    answer = inst.search({'query': 'kestrel', 'mode': mode, 'filter': {'objectIds': object_ids}})
+    assert (answer['success'], answer['code']) == (False, 'INVALID_INPUT')
+    assert answer['error'] == f'filter.objectIds must be a list of 1 to {SCOPE_MAX} strings.'
+    assert embedded == [] and _search_calls(store) == []
+
+
+def test_search_counts_object_ids_before_checking_their_shape():
+    store = clustered()
+    answer = node(store).search({'query': 'kestrel', 'filter': {'objectIds': [None] * (SCOPE_MAX + 1)}})
+    assert (answer['success'], answer['code']) == (False, 'LIMIT_EXCEEDED')
+    assert f'{SCOPE_MAX:,}' in answer['error'] and f'{SCOPE_MAX + 1:,}' in answer['error']
+    assert _search_calls(store) == []
+
+
+def test_search_object_ids_are_trimmed_and_named_once():
+    store = clustered()
+    inst = node(store, embed_query=lambda text: [0.1] * 8, embed_model_name='m')
+    answer = inst.search({'query': 'kestrel', 'filter': {'objectIds': (' doc01 ', 'doc00', 'doc01')}})
+    assert answer['success'] is True
+    assert _semantic_filter(store).objectIds == ['doc01', 'doc00']
+
+
+def test_search_without_object_ids_searches_the_whole_collection():
+    store = clustered()
+    inst = node(store, embed_query=lambda text: [0.1] * 8, embed_model_name='m')
+    assert inst.search({'query': 'kestrel', 'filter': {'objectIds': None}})['success'] is True
+    assert not _semantic_filter(store).objectIds
+
+
+def test_search_joins_the_legacy_object_id_and_the_scope():
+    store = clustered()
+    inst = node(store, embed_query=lambda text: [0.1] * 8, embed_model_name='m')
+    answer = inst.search({'query': 'kestrel', 'filter': {'objectId': 'doc02', 'objectIds': ['doc00', 'doc02']}})
+    assert answer['success'] is True
+    assert _semantic_filter(store).objectIds == ['doc02', 'doc00']
 
 
 # ---------------------------------------------------------------------------
