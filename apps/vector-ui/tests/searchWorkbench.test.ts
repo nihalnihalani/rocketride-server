@@ -650,3 +650,14 @@ test('wiring: the workbench is pure, the panel calls embed and search through ch
 	assert.ok(phase !== '', 'the panel declares its Phase');
 	assert.doesNotMatch(phase, /vector|number\[\]/);
 });
+
+test('wiring: the search files insert no HTML, stop no propagation, listen for no keys, log nothing and hold no token', () => {
+	const files = [path.join('components', 'SearchPanel.tsx'), path.join('components', 'QueryCompare.tsx'), path.join('vector', 'searchWorkbench.ts'), path.join('vector', 'compare.ts')];
+	for (const file of files) {
+		const text = code(file);
+		assert.doesNotMatch(text, /dangerouslySetInnerHTML|\.innerHTML|\.outerHTML|insertAdjacentHTML|document\.write|\beval\s*\(|new\s+Function\s*\(/, file);
+		assert.doesNotMatch(text, /stopPropagation|stopImmediatePropagation|(window|document)\s*\.\s*addEventListener\s*\(\s*['"]key/, file);
+		assert.doesNotMatch(text, /localStorage|sessionStorage|indexedDB|document\.cookie|console\.(log|info|debug|warn|error)/, file);
+		assert.doesNotMatch(text, /\.token\b|\btoken\s*:|getToken|roleTokens/, file);
+	}
+});
