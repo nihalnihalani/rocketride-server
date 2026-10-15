@@ -165,7 +165,6 @@ pooler. Errors never name the database server, user or database.
 ## Dependencies
 
 - `psycopg2-binary`
-- `pgvector`
 
 ## Source
 

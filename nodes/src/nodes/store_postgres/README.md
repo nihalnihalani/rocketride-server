@@ -162,7 +162,6 @@ again at most once a minute.
 ## Dependencies
 
 - `psycopg2-binary`
-- `pgvector`
 
 ## Source
 
