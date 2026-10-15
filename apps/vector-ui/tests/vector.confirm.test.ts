@@ -6,11 +6,26 @@
 // =============================================================================
 // CONFIRM AND REMOVE: what the dialogs say, typed confirmations, batches that stop at the first error
 // =============================================================================
+//
+// The map's duplicates queue removes through the same path: its queued
+// documents reach the console's multi-remove dialog whole (typed count, the
+// paths listed), and the confirmed removal sends them in batches of the
+// node's write_ids_max, nothing before Confirm and nothing after Cancel.
+// =============================================================================
 
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { ExplorerToolError } from 'shared/explorer';
+import { manualClock } from 'shared/explorer/connect/testing';
+import { requestRemoval } from '../src/components/DuplicatesPanel';
+import type { IDocumentItem } from '../src/contract/types';
+import { dedupeView, docInfo, queueInit, queueReducer, queued } from '../src/map/dedupe';
 import { MULTI_REMOVE_LIST_MAX } from '../src/vector/budgets';
+import { createConsoleStore } from '../src/vector/consoleStore';
+import type { IConsoleDeps } from '../src/vector/consoleStore';
+import { readChunksPage, readDocumentsPage, readRemoveResult, readStats } from '../src/vector/results';
+import { loadSample } from './support/map.samples';
+import { fixture } from './support/fixtures';
 import { REMOVE_CANCEL_LABEL, batches, confirmReady, multiRemoveConfirmation, removalSummary, removeConfirmation, runRemoval } from '../src/vector/confirm';
 import type { IRemoveContext } from '../src/vector/confirm';
 import type { IRemoveView } from '../src/vector/results';
@@ -138,4 +153,79 @@ test('the announcement after a removal names the document and the rows removed',
 	assert.equal(removalSummary(many, []), 'Removed 2 documents (3 chunks). 1 was not stored any more.');
 	const timeout = { removed: [], notFound: [], removedChunks: null, batchesRun: 0, batchesTotal: 1, error: { headline: 'The request may still complete on the server. Refresh to check.' } };
 	assert.equal(removalSummary(timeout, [{ objectId: 'k', path: 'x.md' }]), 'The request may still complete on the server. Refresh to check.');
+});
+
+// =============================================================================
+// THE DUPLICATES QUEUE THROUGH THE CONSOLE'S DIALOG
+// =============================================================================
+
+/** The demo sample's queue under "Keep shortest path", with directory rows for every document of the sample. */
+function demoQueue(): { ids: string[]; rows: IDocumentItem[] } {
+	const sample = loadSample('sample_demo_1000.json');
+	const rows: IDocumentItem[] = sample.docs.map((d) => ({ objectId: d.objectId, path: d.path, chunks: d.chunks, has_first_chunk: true, tables: 0, deleted: false, nodeId: null, size: null, modifyTime: null, ingestedAt: null, pointId: null }));
+	const view = dedupeView(sample, 0.97);
+	const state = queueReducer(queueInit(), { type: 'policy', value: 'shortest-path' });
+	return { ids: queued(view.groups, state, docInfo(sample, rows), new Set()).objectIds, rows };
+}
+
+/** A console controller whose removals are recorded batch by batch. */
+function consoleWith(rows: IDocumentItem[], writeBatch: number) {
+	const sent: string[][] = [];
+	const clock = manualClock(Date.parse('2026-10-15T09:00:00Z'));
+	const deps: IConsoleDeps = {
+		stats: async () => readStats(fixture('stats_pgvector')),
+		documents: async () => readDocumentsPage({ ...fixture('documents_page2_last'), items: rows }),
+		chunks: async () => readChunksPage(fixture('chunks_page')),
+		remove: async (ids) => {
+			sent.push([...ids]);
+			return readRemoveResult({ ...fixture('remove_document_ok'), removed: ids.map((objectId) => ({ objectId, chunks_removed: 3 })), removed_chunks: 3 * ids.length });
+		},
+		announce: () => undefined,
+		clock,
+	};
+	const store = createConsoleStore(deps, { pageSize: 500, chunkPage: 100, writeBatch });
+	store.setWritesEnabled(true);
+	return { store, sent };
+}
+
+test('the queued duplicates reach the multi-remove dialog whole: typed count, their paths, nothing sent before Confirm', () => {
+	const { ids, rows } = demoQueue();
+	assert.equal(ids.length, 5, 'the four-document group queues three, each pair one');
+	const { store, sent } = consoleWith(rows, 100);
+	const byId = new Map(rows.map((r) => [r.objectId, r]));
+	const asked: string[][] = [];
+	assert.equal(requestRemoval(ids, { onRemoveDocument: () => assert.fail('never the single dialog for a queue'), onRemoveDocuments: (objectIds) => asked.push([...objectIds]) }), true);
+	assert.deepEqual(asked, [ids], 'the whole queue, never cut to write_ids_max');
+	store.requestRemove(asked[0]!.map((objectId) => ({ objectId, path: byId.get(objectId)!.path, chunks: byId.get(objectId)!.chunks })));
+	const pending = store.getState().confirm;
+	assert.equal(pending?.kind, 'multi');
+	assert.deepEqual(
+		pending?.targets.map((t) => t.objectId),
+		ids
+	);
+	const dialog = multiRemoveConfirmation(pending!.targets, PG);
+	assert.equal(dialog.title, 'Remove 5 documents?');
+	assert.deepEqual(dialog.typed, { expected: '5', prompt: 'Type 5 to confirm.' });
+	assert.deepEqual(
+		dialog.listed,
+		ids.map((id) => byId.get(id)!.path)
+	);
+	assert.deepEqual(sent, [], 'nothing is sent while the dialog is open');
+	store.cancelRemove();
+	assert.deepEqual(sent, [], 'Cancel sends nothing');
+	store.dispose();
+});
+
+test("confirming the queue sends it in batches of the node's write_ids_max, every queued document once", async () => {
+	const { ids, rows } = demoQueue();
+	const { store, sent } = consoleWith(rows, 2);
+	store.requestRemove(ids.map((objectId) => ({ objectId, path: objectId, chunks: null })));
+	await store.confirmRemove();
+	assert.deepEqual(
+		sent.map((b) => b.length),
+		[2, 2, 1]
+	);
+	assert.deepEqual(sent.flat(), ids);
+	assert.equal(store.getState().removal.status, 'done');
+	store.dispose();
 });

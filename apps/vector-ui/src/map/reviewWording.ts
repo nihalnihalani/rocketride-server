@@ -1,0 +1,254 @@
+// =============================================================================
+// MIT License
+// Copyright (c) 2026 Aparavi Software AG
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+
+// =============================================================================
+// MAP - WHAT THE REVIEW PANELS SAY (duplicates, outliers, recommend, matrix, text)
+// =============================================================================
+//
+// Every sentence of the duplicates queue, the outlier review, Recommend, the
+// similarity matrix and the chunk text panel, in one place so the tests and
+// the browser lanes read the same words. Counts are the ones the node
+// returned or the browser counted from the sample; nothing here invents one.
+// =============================================================================
+
+import type { KeepPolicy } from './dedupe';
+
+/**
+ * en-US number.
+ *
+ * @param value - A number.
+ * @returns It with thousands separators.
+ */
+export function num(value: number): string {
+	return value.toLocaleString('en-US');
+}
+
+/**
+ * "1 document" / "3 documents".
+ *
+ * @param n - A count.
+ * @param one - The singular.
+ * @param many - The plural (default: singular + s).
+ * @returns The phrase.
+ */
+export function plural(n: number, one: string, many = `${one}s`): string {
+	return `${num(n)} ${n === 1 ? one : many}`;
+}
+
+/**
+ * A similarity as the panels print it: 2 to 4 decimals, no trailing zeros past 2.
+ *
+ * @param value - A similarity.
+ * @returns E.g. "0.97", "0.975", "0.9998".
+ */
+export function simText(value: number): string {
+	const fixed = value.toFixed(4).replace(/0{1,2}$/, '');
+	return fixed;
+}
+
+/**
+ * A range of similarities ("0.9991–0.9992", or one value when they are equal).
+ *
+ * @param lo - The lowest.
+ * @param hi - The highest.
+ * @returns The range.
+ */
+export function simRange(lo: number, hi: number): string {
+	return lo === hi ? simText(lo) : `${simText(lo)}–${simText(hi)}`;
+}
+
+// =============================================================================
+// DUPLICATES QUEUE
+// =============================================================================
+
+/** The picker's words per policy. */
+export const POLICY_LABELS: Readonly<Record<KeepPolicy, string>> = {
+	oldest: 'Keep oldest ingest',
+	'shortest-path': 'Keep shortest path',
+	'most-chunks': 'Keep most chunks',
+	manual: 'Choose manually',
+};
+
+/** Why a policy cannot choose anywhere in this queue. */
+export const POLICY_UNAVAILABLE: Readonly<Record<Exclude<KeepPolicy, 'manual' | 'shortest-path'>, string>> = {
+	oldest: 'no ingest time is known for these documents',
+	'most-chunks': 'no chunk count is known for these documents',
+};
+
+/**
+ * No pair at the threshold.
+ *
+ * @param threshold - The slider's similarity.
+ * @returns The sentence.
+ */
+export function duplicatesNone(threshold: number): string {
+	return `No near-duplicate pairs at similarity ${simText(threshold)} or above in this sample.`;
+}
+
+/**
+ * Where the pairs come from.
+ *
+ * @param k - The sample's kNN width.
+ * @returns The caveat under the slider.
+ */
+export function duplicatesKnnCaveat(k: number): string {
+	return `Pairs among each point's ${num(k)} nearest neighbours in this sample, plus the pairs the store node reported.`;
+}
+
+/**
+ * The queue covers the sample only.
+ *
+ * @param n - Points in the sample.
+ * @returns The sentence.
+ */
+export function duplicatesSampleCaveat(n: number): string {
+	return `Within this sample of ${plural(n, 'chunk')}; draw a larger or light sample to cover more.`;
+}
+
+/**
+ * The slider's spoken value.
+ *
+ * @param threshold - The similarity.
+ * @returns E.g. "similarity 0.97".
+ */
+export function thresholdValueText(threshold: number): string {
+	return `similarity ${simText(threshold)}`;
+}
+
+/**
+ * How many documents are queued.
+ *
+ * @param n - Queued documents.
+ * @returns E.g. "3 documents queued".
+ */
+export function queuedLine(n: number): string {
+	return n === 0 ? 'No document queued. Choose which document to keep in each group.' : `${plural(n, 'document')} queued`;
+}
+
+/**
+ * The bulk button.
+ *
+ * @param n - Queued documents.
+ * @returns E.g. "Remove all queued (3 documents)".
+ */
+export function removeAllLabel(n: number): string {
+	return `Remove all queued (${plural(n, 'document')})`;
+}
+
+/**
+ * A group's own remove button.
+ *
+ * @param n - The group's queued documents.
+ * @returns E.g. "Remove the others (2)".
+ */
+export function removeOthersLabel(n: number): string {
+	if (n === 0) return 'Remove the others';
+	return n === 1 ? 'Remove the other' : `Remove the others (${num(n)})`;
+}
+
+/** A group has no kept document yet. */
+export const CHOOSE_KEEP_FIRST = 'Choose the document to keep first';
+
+/** Every document of a group has text of its own beside the shared passages. */
+export const SHARED_PASSAGES_NOTE = 'Shared passages only: each of these documents also has text the others do not. Removing a document removes all of it.';
+
+/**
+ * After the console removed queued documents.
+ *
+ * @param removed - Documents now gone.
+ * @param asked - Documents asked for.
+ * @param chunks - Their chunks as the store reported them per document, or null when one is unknown.
+ * @returns E.g. "Removed 3 documents (41 chunks)".
+ */
+export function removedLine(removed: number, asked: number, chunks: number | null): string {
+	const counted = chunks === null ? '' : ` (${plural(chunks, 'chunk')})`;
+	if (removed >= asked) return `Removed ${plural(removed, 'document')}${counted}`;
+	const left = asked - removed;
+	return `Removed ${num(removed)} of ${plural(asked, 'document')}${counted}; ${num(left)} ${left === 1 ? 'is' : 'are'} still stored.`;
+}
+
+/**
+ * A group's legend.
+ *
+ * @param id - The group number (from 0).
+ * @param documents - Its documents.
+ * @param lo - Lowest similarity inside.
+ * @param hi - Highest similarity inside.
+ * @returns E.g. "Group 1 · 2 documents · similarity 0.981–0.995".
+ */
+export function groupLegend(id: number, documents: number, lo: number, hi: number): string {
+	return `Group ${num(id + 1)} · ${plural(documents, 'document')} · similarity ${simRange(lo, hi)}`;
+}
+
+/**
+ * How much of a document the group covers.
+ *
+ * @param shared - Its points in the group.
+ * @param inSample - Its points in the sample.
+ * @returns E.g. "2 of 7 sampled chunks match".
+ */
+export function sharedLine(shared: number, inSample: number): string {
+	return `${num(shared)} of ${plural(inSample, 'sampled chunk')} ${shared === 1 ? 'matches' : 'match'}`;
+}
+
+/** A document another group keeps is not queued. */
+export const KEPT_ELSEWHERE = 'kept by another group, so not queued';
+
+/** Heading of the groups inside one document. */
+export const REPEATED_HEADING = 'Repeated text inside one document';
+
+/** What a repeated-text group is. */
+export const REPEATED_NOTE = 'The same text more than once inside one document. Open the document to look; nothing is removed from here.';
+
+/** Several documents need the console's multi-remove dialog, which this view was not given. */
+export const NO_BULK_REMOVE = 'This view cannot remove several documents at once.';
+
+/**
+ * Only the largest groups are drawn.
+ *
+ * @param shown - Groups drawn.
+ * @param total - Groups found.
+ * @returns The sentence.
+ */
+export function groupsCappedLine(shown: number, total: number): string {
+	return `Showing the ${num(shown)} largest of ${num(total)} groups.`;
+}
+
+/**
+ * Pairs not listed under a group.
+ *
+ * @param n - Pairs left out.
+ * @returns E.g. "and 4 more pairs".
+ */
+export function morePairsLine(n: number): string {
+	return `and ${plural(n, 'more pair')}`;
+}
+
+/**
+ * Reviewed groups.
+ *
+ * @param n - Reviewed groups.
+ * @returns E.g. "Reviewed (2 groups)".
+ */
+export function reviewedGroupsHeading(n: number): string {
+	return `Reviewed (${plural(n, 'group')})`;
+}
