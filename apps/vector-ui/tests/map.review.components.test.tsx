@@ -19,9 +19,13 @@ import React from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { DuplicatesBody, DuplicatesPanel, requestRemoval } from '../src/components/DuplicatesPanel';
 import { OutliersBody, OutliersPanel } from '../src/components/OutliersPanel';
-import type { Availability, IDocumentItem, IDocumentRowsSource, IKnnBlock, ISampleModel, ISampleResult } from '../src/contract/types';
+import { RecommendBody, RecommendPanel } from '../src/components/RecommendPanel';
+import type { RecommendBodyProps } from '../src/components/RecommendPanel';
+import type { Availability, IDocumentItem, IDocumentRowsSource, IKnnBlock, IRecommendResult, ISampleModel, ISampleResult, IVectorCapabilities, IVectorLimits, VectorKey } from '../src/contract/types';
 import { dedupeView, docInfo, queueInit, queueReducer, queued } from '../src/map/dedupe';
 import { outlierRows } from '../src/map/outliers';
+import { EMPTY_EXAMPLES, recommendRows, resolvedLine } from '../src/map/recommend';
+import { fixture } from './support/fixtures';
 import { loadSample, modelOf } from './support/map.samples';
 
 const noop = (): void => undefined;
@@ -308,4 +312,100 @@ test('an outlier of a removed document leaves the list', () => {
 	const ocr = demo.result.docs[demo.result.points.doc[262] as number]!.objectId;
 	const out = html(<OutliersPanel sample={{ ...demo, removed: [ocr] }} onSelect={noop} />);
 	assert.doesNotMatch(out, /ocr_scan_junk/);
+});
+
+// =============================================================================
+// RECOMMEND
+// =============================================================================
+
+const ENRICHED = fixture<{ limits: IVectorLimits; capabilities: IVectorCapabilities }>('dialect_enriched');
+const OLD_LIMITS: IVectorLimits = (({ recommend_examples_max: _r, matrix_keys_max: _m, max_components: _c, ...rest }) => rest)(ENRICHED.limits);
+const DOC0 = demo.result.docs[0]!;
+const POS: VectorKey = [DOC0.objectId, 3];
+const NEG: VectorKey = ['greenhouse-object-id', 1];
+const run = async () => ({ ok: false as const, code: undefined, message: 'not run' });
+
+test('Recommend on a node without the tool says to update the node and offers nothing else', () => {
+	const out = html(<RecommendPanel sample={demo} limits={OLD_LIMITS} capabilities={ENRICHED.capabilities} examples={EMPTY_EXAMPLES} onExamplesChange={noop} queryText={null} onRun={run} onSelect={noop} onPin={noop} />);
+	assert.match(out, /data-component="RecommendPanel"/);
+	assert.doesNotMatch(out, /data-placeholder/);
+	assert.match(out, /This store node does not recommend from examples; update the node\./);
+	assert.doesNotMatch(out, /<button/);
+});
+
+test('Recommend with no example: Run disabled with the sentence; how to add examples is said', () => {
+	const out = html(<RecommendPanel sample={demo} limits={ENRICHED.limits} capabilities={ENRICHED.capabilities} examples={EMPTY_EXAMPLES} onExamplesChange={noop} queryText={null} onRun={run} onSelect={noop} onPin={noop} />);
+	assert.match(out, /<button[^>]*disabled=""[^>]*>Run<\/button>/);
+	assert.match(out, /Add at least one positive example/);
+	assert.match(out, /Add as example \(\+\) or \(−\)/);
+	assert.match(out, /type="checkbox"[^>]*disabled=""/, 'no query on the map: the query cannot count');
+	assert.match(out, /Run a text query on the map to count it as a positive/);
+});
+
+test('Recommend with examples: removable chips per side, the query offered, Best score disabled where the store cannot rank, k and Run', () => {
+	const examples = { positive: [POS], negative: [NEG], withQuery: false };
+	const out = html(<RecommendPanel sample={demo} limits={ENRICHED.limits} capabilities={ENRICHED.capabilities} examples={examples} onExamplesChange={noop} queryText="falcon water" onRun={run} onSelect={noop} onPin={noop} />);
+	assert.ok(out.includes(`aria-label="Remove positive example: ${DOC0.path} #3"`));
+	assert.match(out, /aria-label="Remove negative example: greenhou… #1"/);
+	assert.match(out, /Also like the current query “falcon water”/);
+	assert.match(out, /<option value="best_score" disabled="">Best score \(only where the store ranks examples itself\)<\/option>/);
+	assert.match(out, /<option value="12" selected="">12<\/option>/);
+	assert.match(out, /<button[^>]*>Run<\/button>/);
+	assert.doesNotMatch(out, /<button[^>]*disabled=""[^>]*>Run<\/button>/);
+	const qdrant = html(<RecommendPanel sample={demo} limits={ENRICHED.limits} capabilities={{ ...ENRICHED.capabilities, recommend_best_score: true }} examples={examples} onExamplesChange={noop} queryText={null} onRun={run} onSelect={noop} onPin={noop} />);
+	assert.match(qdrant, /<option value="best_score">Best score \(ranked by the store\)<\/option>/);
+});
+
+/** A body with defaults. */
+function recommendBody(over: Partial<RecommendBodyProps>): React.ReactElement {
+	return RecommendBody({ available: true, examples: { positive: [POS], negative: [], withQuery: false }, labelOf: (key) => `${key[0]} #${key[1]}`, strategy: 'average_vector', k: 12, bestScore: false, queryText: null, blocker: null, note: null, busy: false, outcome: null, pinMax: 200, onStrategy: noop, onK: noop, onWithQuery: noop, onRemoveExample: noop, onClear: noop, onRun: noop, onSelect: noop, onPin: noop, ...over });
+}
+
+test('Recommend results: ranked rows with their similarity and preview, what was used, outside points pinned on request', () => {
+	const answer = fixture<IRecommendResult>('recommend_ok');
+	const rows = recommendRows(answer, (key) => key[1] === 7);
+	const selected: VectorKey[] = [];
+	const pinned: VectorKey[][] = [];
+	const tree = recommendBody({ outcome: { kind: 'rows', rows, resolved: resolvedLine(answer), notFound: '1 example is no longer in the store: x #1', stale: false }, onSelect: (key) => selected.push(key), onPin: (keys) => pinned.push([...keys]) });
+	const out = renderToStaticMarkup(tree);
+	assert.match(out, /Ranked by 2 positive and 1 negative examples \(average vector, computed by the store node\)\./);
+	assert.match(out, /1 example is no longer in the store: x #1/);
+	assert.equal((out.match(/<li/g) ?? []).length, 6);
+	assert.match(out, /1\. C:\/demo\/handbooks\/falcon_handbook\.md #7/);
+	assert.match(out, /similarity 0\.710/);
+	assert.match(out, /Falcon Station draws its drinking water/);
+	assert.equal((out.match(/>outside the sample</g) ?? []).length, 5);
+	button(tree, '1. C:/demo/handbooks/falcon_handbook.md #7').props.onClick();
+	button(tree, 'Pin 5 results outside the sample').props.onClick();
+	assert.deepEqual(selected, [['75b89d86-a64e-5143-bf50-55d4a7fd8cd2', 7]]);
+	assert.deepEqual(pinned, [rows.filter((r) => !r.inSample).map((r) => r.key)]);
+	const capped = renderToStaticMarkup(recommendBody({ pinMax: 2, outcome: { kind: 'rows', rows, resolved: '', notFound: null, stale: false } }));
+	assert.match(capped, /Pin 2 of 5 results outside the sample/);
+});
+
+test('Recommend states: busy, a failure, results of examples changed since, negatives only', () => {
+	assert.match(renderToStaticMarkup(recommendBody({ busy: true })), /role="status"[^>]*>Finding chunks like the examples…/);
+	assert.match(renderToStaticMarkup(recommendBody({ busy: true })), /<button[^>]*disabled=""[^>]*>Run<\/button>/, 'one run at a time');
+	assert.match(renderToStaticMarkup(recommendBody({ outcome: { kind: 'error', message: 'The store is answering another neighbour search; try again in a moment.' } })), /another neighbour search/);
+	assert.match(renderToStaticMarkup(recommendBody({ outcome: { kind: 'rows', rows: [], resolved: 'Ranked by 1 positive example (average vector, computed by the store node).', notFound: null, stale: true } })), /These results are for the examples before your last change; run again\./);
+	assert.match(renderToStaticMarkup(recommendBody({ outcome: { kind: 'rows', rows: [], resolved: '', notFound: null, stale: false } })), /The store returned no chunk for these examples\./);
+	assert.match(renderToStaticMarkup(recommendBody({ strategy: 'best_score', bestScore: true, note: 'Only negatives: showing the least similar chunks' })), /Only negatives: showing the least similar chunks/);
+});
+
+test('Recommend buttons: a chip removes its example, Clear removes all, Run runs, the query box counts the query', () => {
+	const removed: VectorKey[] = [];
+	let cleared = 0;
+	let ran = 0;
+	const query: boolean[] = [];
+	const tree = recommendBody({ queryText: 'falcon', onRemoveExample: (key) => removed.push(key), onClear: () => (cleared += 1), onRun: () => (ran += 1), onWithQuery: (value) => query.push(value) });
+	const chip = elements(tree).find((el) => el.type === 'button' && String((el.props as { 'aria-label'?: string })['aria-label']).startsWith('Remove positive example'));
+	(chip as React.ReactElement<{ onClick(): void }>).props.onClick();
+	button(tree, 'Clear examples').props.onClick();
+	button(tree, 'Run').props.onClick();
+	const box = elements(tree).find((el) => el.type === 'input' && (el.props as { type?: string }).type === 'checkbox') as React.ReactElement<{ onChange(e: { currentTarget: { checked: boolean } }): void }>;
+	box.props.onChange({ currentTarget: { checked: true } });
+	assert.deepEqual(removed, [POS]);
+	assert.equal(cleared, 1);
+	assert.equal(ran, 1);
+	assert.deepEqual(query, [true]);
 });
