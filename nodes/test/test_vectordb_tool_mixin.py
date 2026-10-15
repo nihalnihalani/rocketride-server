@@ -29,6 +29,7 @@ with the ``context`` fixture (``agent()`` / ``dap()``).
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import random
 import threading
@@ -37,13 +38,14 @@ from typing import Any, Callable, Dict, List, Optional
 
 import numpy as np
 import pytest
-from rocketlib import IInstanceBase
+from rocketlib import IInstanceBase, tool_function
 
 from ai.common.schema import Doc, DocMetadata
 from ai.common.store import StoreInstanceBase, VectorStoreToolMixin, vx_tools, vx_write_gate
 from ai.common.store import document_store as _store_module
 from ai.common.store.errors import StoreUnsupported
 from ai.common.store.vx_defaults import VECTOR_TOOL_LIMITS
+from ai.common.store.vx_tools_ext import VectorExplorerExtTools
 from ai.common.store.vx_types import DocPage, DocumentRow
 
 from .test_vector_hooks import (
@@ -249,6 +251,29 @@ def test_normalize_non_dict_json_returns_empty() -> None:
 _LEGACY_TOOLS = {'search', 'upsert', 'delete', 'objdir', 'stats', 'get'}
 _EXPLORER_TOOLS = {'dialect', 'documents', 'chunks', 'vectors', 'sample', 'project', 'neighbors', 'remove_document'}
 _EXPECTED_TOOLS = _LEGACY_TOOLS | _EXPLORER_TOOLS
+# The additive tools of the extension contract (recommend and similarity_matrix). A node
+# lists them once ``VectorExplorerExtTools`` defines them, and never lists any other tool.
+_ADDITIVE_TOOLS = {'recommend', 'similarity_matrix'}
+
+
+def _ext_tools() -> set:
+    """The tools ``VectorExplorerExtTools`` defines (none until the additive tools land)."""
+    declared = {name for name, attr in vars(VectorExplorerExtTools).items() if hasattr(attr, '__tool_meta__')}
+    assert declared <= _ADDITIVE_TOOLS, f'not an additive tool of the contract: {sorted(declared - _ADDITIVE_TOOLS)}'
+    return declared
+
+
+def _assert_tool_names(names: Any, ext: Any = None) -> None:
+    """Assert a node lists exactly the legacy and explorer tools plus the additive tools in ``ext``.
+
+    ``ext`` defaults to the tools ``VectorExplorerExtTools`` defines, so the check holds
+    whether or not the additive tools have landed, and refuses any other tool.
+    """
+    names, ext = set(names), (_ext_tools() if ext is None else set(ext))
+    assert ext <= _ADDITIVE_TOOLS, f'not an additive tool of the contract: {sorted(ext - _ADDITIVE_TOOLS)}'
+    expected = _EXPECTED_TOOLS | ext
+    assert names <= expected, f'unexpected tools: {sorted(names - expected)}'
+    assert expected <= names, f'missing tools: {sorted(expected - names)}'
 
 
 def test_collect_tool_methods_returns_bare_names() -> None:
@@ -256,7 +281,7 @@ def test_collect_tool_methods_returns_bare_names() -> None:
     instance = FakeIInstance(FakeIGlobal(store=FakeStore(), server_name='myvdb'))
     methods = instance._collect_tool_methods()
 
-    assert set(methods.keys()) == _EXPECTED_TOOLS
+    _assert_tool_names(methods)
     # Each value is a callable bound to the fake instance
     for bound in methods.values():
         assert callable(bound)
@@ -266,7 +291,7 @@ def test_collect_tool_methods_bare_names_regardless_of_provider() -> None:
     """Bare names must be identical regardless of the provider / serverName."""
     instance = FakeIInstance(FakeIGlobal(store=FakeStore(), logical_type='chroma'))
     methods = instance._collect_tool_methods()
-    assert set(methods.keys()) == _EXPECTED_TOOLS
+    _assert_tool_names(methods)
 
 
 def test_collect_tool_methods_bare_names_when_no_globals() -> None:
@@ -276,7 +301,7 @@ def test_collect_tool_methods_bare_names_when_no_globals() -> None:
     orphan = object.__new__(Orphan)
     orphan.IGlobal = None
     methods = orphan._collect_tool_methods()
-    assert set(methods.keys()) == _EXPECTED_TOOLS
+    _assert_tool_names(methods)
 
 
 def test_two_instances_share_bare_names() -> None:
@@ -289,7 +314,50 @@ def test_two_instances_share_bare_names() -> None:
 
     names_a = set(a._collect_tool_methods().keys())
     names_b = set(b._collect_tool_methods().keys())
-    assert names_a == names_b == _EXPECTED_TOOLS
+    assert names_a == names_b
+    _assert_tool_names(names_a)
+
+
+def _stub_tool() -> Callable:
+    """A DAP-only tool that does nothing, to give a test node an extra tool name."""
+
+    @tool_function(input_schema={'type': 'object'}, description='stub', audience=('dap',))
+    def stub(self, args: Any = None) -> Dict[str, Any]:
+        return {'success': True}
+
+    return stub
+
+
+def test_tool_name_check_takes_the_additive_tools_and_refuses_any_other(monkeypatch) -> None:
+    """The tool-name check accepts the contract's additive tools and nothing else.
+
+    A node lists ``recommend`` and ``similarity_matrix`` once ``VectorExplorerExtTools``
+    defines them; the check must hold both before and after that, and must still
+    refuse a tool outside the legacy, explorer and additive sets.
+    """
+
+    class WithAdditive(FakeIInstance):
+        recommend = _stub_tool()
+        similarity_matrix = _stub_tool()
+
+    class WithStray(FakeIInstance):
+        frobnicate = _stub_tool()
+
+    with_additive = WithAdditive(FakeIGlobal(store=FakeStore()))._collect_tool_methods()
+    _assert_tool_names(with_additive, ext=_ADDITIVE_TOOLS)
+    with pytest.raises(AssertionError, match='recommend'):
+        _assert_tool_names(with_additive, ext=())
+
+    stray = WithStray(FakeIGlobal(store=FakeStore()))._collect_tool_methods()
+    with pytest.raises(AssertionError, match='frobnicate'):
+        _assert_tool_names(stray)
+    with pytest.raises(AssertionError, match='frobnicate'):
+        _assert_tool_names(stray, ext=_ADDITIVE_TOOLS)
+
+    # A tool the extension class defines outside the contract's additive names is refused too.
+    monkeypatch.setattr(VectorExplorerExtTools, 'frobnicate', _stub_tool(), raising=False)
+    with pytest.raises(AssertionError, match='frobnicate'):
+        _ext_tools()
 
 
 # ---------------------------------------------------------------------------
@@ -843,6 +911,57 @@ def test_dialect_statement_timeout_is_pgvector_only():
     )
 
 
+def test_dialect_reports_the_store_size_where_the_driver_measures_it():
+    class Measured(ExactListingStore):
+        def describe(self):
+            import dataclasses
+
+            return dataclasses.replace(super().describe(), size_bytes=48234496)
+
+    answer = node(clustered(Measured)).dialect({})
+    assert answer['size_bytes'] == 48234496
+    assert list(answer)[-2:] == ['size_bytes', 'keyword_match'], 'the additive keys follow the first contract'
+    assert node(clustered()).dialect({})['size_bytes'] is None
+    assert node(MemoryStore()).dialect({})['size_bytes'] is None
+
+
+@pytest.mark.parametrize('size', [-1, 'big', 1.5, True])
+def test_dialect_reports_no_size_it_cannot_trust(size):
+    class Odd(ExactListingStore):
+        def describe(self):
+            import dataclasses
+
+            return dataclasses.replace(super().describe(), size_bytes=size)
+
+    assert node(clustered(Odd)).dialect({})['size_bytes'] is None
+
+
+@pytest.mark.parametrize(
+    'constant,keyword_search,expected',
+    [
+        ('substring', True, 'substring'),
+        ('token', True, 'token'),
+        (None, True, None),
+        ('regex', True, None),
+        ('substring', False, None),
+    ],
+)
+def test_dialect_says_how_keyword_search_matches(constant, keyword_search, expected):
+    class Keyword(ExactListingStore):
+        VX_KEYWORD_MATCH = constant
+        VX_DRIVER_CAPABILITIES = (
+            frozenset({'search_keyword', 'documents_distinct'}) if keyword_search else frozenset({'documents_distinct'})
+        )
+
+    answer = node(clustered(Keyword)).dialect({})
+    assert answer['capabilities']['search_keyword'] is keyword_search
+    assert answer['keyword_match'] == expected
+
+
+def test_dialect_keyword_match_is_null_for_a_driver_that_does_not_say():
+    assert node(clustered()).dialect({})['keyword_match'] is None
+
+
 def test_dialect_store_failure_is_the_only_failure():
     class Broken(MemoryStore):
         def _doesCollectionExist(self):
@@ -1053,10 +1172,71 @@ def test_documents_lists_rows_with_paths_and_counts():
         'modifyTime',
         'ingestedAt',
         'pointId',
+        'max_chunk_id',
+        'deleted_chunks',
     }
     assert (first['path'], first['chunks'], first['has_first_chunk']) == ('C:/demo/folder0/doc00.md', 2, True)
+    # A driver whose rows carry no health fields answers null for both.
+    assert (first['max_chunk_id'], first['deleted_chunks']) == (None, None)
     assert (answer['total'], answer['distinct'], answer['sorted'], answer['counts_exact']) == (3, True, True, True)
     assert answer['caveats'] == [] and answer['next_cursor'] is None
+
+
+@dataclasses.dataclass(frozen=True)
+class _HealthRow(DocumentRow):
+    """A driver's document row with the per-document health fields (contract section 4.4-F)."""
+
+    max_chunk_id: Optional[Any] = None
+    deleted_chunks: Optional[Any] = None
+
+
+def _with_health(store: Any, health: Dict[str, tuple]) -> Any:
+    """Make ``store`` list the documents named in ``health`` as rows carrying those two fields."""
+    list_documents = store.listDocuments
+
+    def listing(**kw: Any) -> DocPage:
+        page = list_documents(**kw)
+        rows = [
+            _HealthRow(
+                **{f.name: getattr(row, f.name) for f in dataclasses.fields(DocumentRow)},
+                max_chunk_id=health[row.objectId][0],
+                deleted_chunks=health[row.objectId][1],
+            )
+            if row.objectId in health
+            else row
+            for row in page.items
+        ]
+        return dataclasses.replace(page, items=rows)
+
+    store.listDocuments = listing
+    return store
+
+
+def test_documents_items_carry_the_health_fields_the_driver_reports():
+    """``max_chunk_id`` and ``deleted_chunks`` come from the driver's row, null where it has none."""
+    store = _with_health(clustered(docs=3, chunks=2), {'doc00': (4, 1), 'doc02': (1, 0)})
+    items = {item['objectId']: item for item in node(store).documents({})['items']}
+    assert (items['doc00']['max_chunk_id'], items['doc00']['deleted_chunks']) == (4, 1)
+    assert (items['doc01']['max_chunk_id'], items['doc01']['deleted_chunks']) == (None, None)
+    assert (items['doc02']['max_chunk_id'], items['doc02']['deleted_chunks']) == (1, 0)
+    # The other figures of a row are unchanged.
+    assert (items['doc00']['chunks'], items['doc00']['has_first_chunk']) == (2, True)
+
+
+@pytest.mark.parametrize(
+    'reported, answered',
+    [
+        ((np.int64(7), np.int64(2)), (7, 2)),
+        ((7.0, 0.0), (7, 0)),
+        ((7.5, -1), (None, None)),
+        (('7', True), (None, None)),
+    ],
+)
+def test_documents_health_fields_are_whole_numbers_or_null(reported, answered):
+    """A health figure that is not a whole number of 0 or more is answered null, never rounded."""
+    store = _with_health(clustered(docs=1, chunks=2), {'doc00': reported})
+    item = node(store).documents({})['items'][0]
+    assert (item['max_chunk_id'], item['deleted_chunks']) == answered
 
 
 def test_documents_pages_with_the_cursor():
@@ -1249,7 +1429,7 @@ def test_sample_detailed_answer_shape():
     assert (answer['strategy_used'], answer['biased'], answer['knn_source']) == ('stratified', False, 'node')
     assert (answer['metric'], answer['dimension'], answer['expires_in_s']) == ('cosine', 8, 600)
     points = answer['points']
-    assert set(points) == {'doc', 'chunk', 'x', 'y', 'z', 'len', 'snip', 'pinned'}
+    assert set(points) == {'doc', 'chunk', 'x', 'y', 'z', 'len', 'snip', 'pinned', 'table'}
     assert all(len(points[key]) == 20 for key in points)
     assert answer['knn']['k'] == 15 and len(answer['knn']['offsets_row']) == 21
     assert len(answer['knn']['cols']) == len(answer['knn']['sims']) == 20 * 15
@@ -1427,6 +1607,36 @@ def test_sample_marks_planted_duplicates():
 def test_sample_rejects_bad_input(args):
     answer = node(clustered()).sample(args)
     assert (answer['success'], answer['code']) == (False, 'INVALID_INPUT')
+
+
+@pytest.mark.parametrize(
+    'cluster,words',
+    [
+        ({'method': 'k-means'}, "must be 'knn-components'"),
+        ({'method': 'label-propagation'}, 'reserved'),
+        ({'method': 'knn-components', 'labels': 'yes'}, 'true or false'),
+        ({'method': 'knn-components', 'labels': 1}, 'true or false'),
+        ({'method': 'knn-components', 'min_size': 5}, 'unknown keys: min_size'),
+        ('knn-components', 'must be an object'),
+        ([], 'must be an object'),
+    ],
+)
+def test_sample_refuses_a_cluster_request_it_cannot_serve(cluster, words):
+    store = clustered()
+    answer = node(store).sample({'n': 10, 'cluster': cluster})
+    assert (answer['success'], answer['code']) == (False, 'INVALID_INPUT')
+    assert words in answer['error']
+    assert not any(call[0] in ('getVectors', 'listDocuments') for call in store.calls), 'refused before the store'
+
+
+@pytest.mark.parametrize('cluster', [{'method': 'knn-components'}, {'labels': True}, {'method': None, 'labels': None}])
+def test_sample_cluster_defaults_to_the_one_method_with_labels(cluster):
+    answer = node(clustered()).sample({'n': 10, 'cluster': cluster})
+    assert answer['clusters']['method'] == 'knn-components' and answer['clusters']['label_source'] == 'text'
+
+
+def test_sample_cluster_null_asks_for_no_clusters():
+    assert 'clusters' not in node(clustered()).sample({'n': 10, 'cluster': None})
 
 
 def test_sample_limits():

@@ -69,9 +69,13 @@ from .vx_defaults import (
     VECTOR_TOOL_LIMITS,
 )
 from .vx_types import (
+    CLUSTER_LABEL_SOURCES,
+    CLUSTER_METHODS,
     CONTROL_OBJECT_ID,
     DELETED_VALUES,
     FILTER_APPLIED_VALUES,
+    KEYWORD_MATCHES,
+    LISTING_REASONS,
     PROJECTIONS,
     SAMPLE_STRATEGIES,
     SUPPORT_LEVELS,
@@ -97,8 +101,13 @@ WRITE_TOOLS = ('remove_document', 'delete', 'upsert')
 #: Most rows ``objdir`` scans through ``listDocuments`` to fill one answer.
 OBJDIR_SCAN_MAX = 10000
 
-#: Documents the sampler lists to build its key space.
+#: Documents the sampler lists to build its key space (a scope of more documents is listed whole,
+#: up to ``scope_keys_max``; contract section 4.4-B).
 SAMPLE_LISTING_MAX = 500
+
+#: Share of the sample's time budget its document listing may use; the listing then stops
+#: (``listing.reason: 'budget'``) and the sample is drawn from what it listed.
+SAMPLE_LISTING_BUDGET_SHARE = 0.5
 
 #: Pages in a row a document listing may answer without a new document before paging stops.
 LISTING_STALE_PAGES = 2
@@ -238,6 +247,19 @@ def _int_or_none(value: Any) -> Optional[int]:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _whole_number(value: Any) -> Optional[int]:
+    """A size or count a driver reported: a whole number of 0 or more, else None (never a guess)."""
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, float):
+        return int(value) if value.is_integer() and value >= 0 else None
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number >= 0 and number == value else None
 
 
 def documentRow(doc: Doc, *, chunks: Optional[int] = None, tables: Optional[int] = None) -> DocumentRow:
@@ -717,6 +739,29 @@ def _gate_ids(value: Any) -> List[str]:
     return [item if isinstance(item, str) else str(item) for item in value]
 
 
+def _cluster_arg(args: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+    """The ``sample`` call's ``cluster`` (contract section 4.4-C), normalised; None when it asks for none."""
+    value = args.get('cluster')
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise _invalid('cluster must be an object such as {"method": "knn-components", "labels": true}.')
+    unknown = sorted(str(key) for key in value if key not in ('method', 'labels'))
+    if unknown:
+        raise _invalid(f'cluster has unknown keys: {", ".join(unknown)}. Known: method, labels.')
+    method = value.get('method')
+    method = CLUSTER_METHODS[0] if method is None else method
+    if method not in CLUSTER_METHODS:
+        if method == 'label-propagation':
+            raise _invalid("cluster.method 'label-propagation' is reserved and not computed yet; use 'knn-components'.")
+        raise _invalid("cluster.method must be 'knn-components'.")
+    labels = value.get('labels')
+    labels = True if labels is None else labels
+    if not isinstance(labels, bool):
+        raise _invalid('cluster.labels must be true or false.')
+    return {'method': method, 'labels': labels}
+
+
 def _filter_object_ids(args: Mapping[str, Any]) -> Optional[List[str]]:
     flt = args.get('filter')
     if flt is None:
@@ -839,6 +884,11 @@ class ListingGuard:
     that bring no new document (empty pages handed out with a cursor, a backend that
     ignores the cursor), after the pages ``rows_wanted`` needs plus
     :data:`LISTING_SLACK_PAGES`, or once ``budget_s`` seconds have passed.
+
+    After :meth:`stop` returned True, :attr:`reason` says why, in the words of a
+    ``sample`` answer's ``listing.reason`` (contract section 4.4-B): ``'complete'``
+    (no cursor left), ``'stale'`` (pages without a new document, or a store that says
+    it cannot page), ``'pages'`` (the page budget) or ``'budget'`` (the time budget).
     """
 
     def __init__(self, rows_wanted: int, page_size: int, budget_s: Optional[float] = None) -> None:
@@ -846,18 +896,24 @@ class ListingGuard:
         self.deadline = None if budget_s is None else _monotonic() + budget_s
         self.pages = 0
         self.stale = 0
+        self.reason: Optional[str] = None
 
     def stop(self, page: Any, new_documents: int) -> bool:
-        """Record one page that added ``new_documents``; return whether to stop paging."""
+        """Record one page that added ``new_documents``; return whether to stop paging (see :attr:`reason`)."""
         self.pages += 1
         self.stale = 0 if new_documents else self.stale + 1
-        return (
-            not page.next_cursor
-            or 'documents_paging_unsupported' in (page.caveats or ())
-            or self.stale >= LISTING_STALE_PAGES
-            or self.pages >= self.max_pages
-            or (self.deadline is not None and _monotonic() > self.deadline)
-        )
+        cannot_page = 'documents_paging_unsupported' in (page.caveats or ())
+        if not page.next_cursor and not cannot_page:
+            self.reason = 'complete'
+        elif cannot_page or self.stale >= LISTING_STALE_PAGES:
+            self.reason = 'stale'
+        elif self.pages >= self.max_pages:
+            self.reason = 'pages'
+        elif self.deadline is not None and _monotonic() > self.deadline:
+            self.reason = 'budget'
+        else:
+            self.reason = None
+        return self.reason is not None
 
 
 def _cross_product(batch: Sequence[Key]) -> int:
@@ -1084,9 +1140,9 @@ class VectorExplorerTools:
             'remove': True,
             'remove_count': has('removeCounted') or has('countChunks'),
             'soft_delete': False,
-            # Additive extensions (contract section 4.4): the node does not compute clusters yet;
-            # a driver declares the other two in VX_DRIVER_CAPABILITIES once it serves them.
-            'clusters': False,
+            # Additive extensions (contract section 4.4): the node computes clusters wherever it
+            # samples; a driver declares the other two in VX_DRIVER_CAPABILITIES once it serves them.
+            'clusters': sample,
             'documents_filter': has('documents_filter'),
             'recommend_best_score': has('recommend_best_score'),
             'projection': list(PROJECTIONS),
@@ -1196,6 +1252,12 @@ class VectorExplorerTools:
                 'limits': {'type': 'object'},
                 'health': {'type': 'object'},
                 'caveats': {'type': 'array', 'items': {'type': 'string'}},
+                'size_bytes': {'type': ['integer', 'null'], 'description': 'Storage the collection takes, when known.'},
+                'keyword_match': {
+                    'type': ['string', 'null'],
+                    'enum': [*KEYWORD_MATCHES, None],
+                    'description': 'How keyword search matches: text fragments (substring) or whole words (token).',
+                },
             },
         },
         description=(
@@ -1222,6 +1284,12 @@ class VectorExplorerTools:
         if info.backend != 'pgvector':
             limits['statement_timeout_ms'] = None
         mismatch = getattr(store, 'modelMismatch', None) if info.collection_exists else None
+        capabilities = self._vx_capabilities(store.capabilities())
+        # How keyword search matches (contract section 4.4-G): the driver's constant, and only
+        # where it searches by keyword at all.
+        keyword_match = getattr(type(store), 'VX_KEYWORD_MATCH', None)
+        if not capabilities['search_keyword'] or keyword_match not in KEYWORD_MATCHES:
+            keyword_match = None
         return {
             'success': True,
             'dialect': 'vector',
@@ -1240,7 +1308,7 @@ class VectorExplorerTools:
             'agent_writes': self._vx_agent_writes(),
             'writes_scope': 'tools_source',
             'write_tools': list(WRITE_TOOLS),
-            'capabilities': self._vx_capabilities(store.capabilities()),
+            'capabilities': capabilities,
             'limits': limits,
             'health': {
                 'collection_exists': info.collection_exists,
@@ -1249,6 +1317,9 @@ class VectorExplorerTools:
                 'meta_column': info.meta_column,
             },
             'caveats': list(dict.fromkeys(caveats)),
+            # Additive keys (contract section 4.4-F/G): null where the driver does not say.
+            'size_bytes': _whole_number(getattr(info, 'size_bytes', None)),
+            'keyword_match': keyword_match,
         }
 
     # ------------------------------------------------------------------
@@ -1437,6 +1508,10 @@ class VectorExplorerTools:
                 'modifyTime': row.modifyTime,
                 'ingestedAt': row.ingestedAt,
                 'pointId': row.pointId,
+                # Per-document health (contract section 4.4-F): from a driver whose rows carry
+                # it (pgvector), null for every other driver.
+                'max_chunk_id': _whole_number(getattr(row, 'max_chunk_id', None)),
+                'deleted_chunks': _whole_number(getattr(row, 'deleted_chunks', None)),
             }
             for row in page.items
             if row.objectId != CONTROL_OBJECT_ID
@@ -1602,13 +1677,25 @@ class VectorExplorerTools:
 
     def _vx_list_rows(
         self, store: Any, object_ids: Optional[List[str]], deleted: str, limit: int, deadline: float
-    ) -> List[DocumentRow]:
-        """List up to ``limit`` documents (distinct by objectId), following cursors (:class:`ListingGuard`)."""
+    ) -> Tuple[List[DocumentRow], Dict[str, Any]]:
+        """List up to ``limit`` documents (distinct by objectId), following cursors (:class:`ListingGuard`).
+
+        Returns ``(rows, listing)``, where ``listing`` is the ``sample`` answer's
+        ``{"documents", "truncated", "reason"}`` (contract section 4.4-B): ``truncated`` is
+        true whenever documents were left when the listing ended (the last page still had a
+        cursor, the store said it cannot page, or the row cap left a listed document out),
+        and ``reason`` says why it ended (``'cap'`` for the row cap, else
+        :attr:`ListingGuard.reason`). The listing may use :data:`SAMPLE_LISTING_BUDGET_SHARE`
+        of the sample's time budget; past ``deadline`` the whole sample is ``TIMEOUT``.
+        """
         rows: Dict[str, DocumentRow] = {}
         cursor: Optional[str] = None
         page_size = min(LIMITS['documents_page'], limit)
-        guard = ListingGuard(limit, page_size)
-        while len(rows) < limit:
+        budget_s = LIMITS['sample_budget_ms'] / 1000.0
+        listing_deadline = deadline - budget_s * (1.0 - SAMPLE_LISTING_BUDGET_SHARE)
+        guard = ListingGuard(limit, page_size, max(0.0, listing_deadline - _monotonic()))
+        reason = 'complete'
+        while True:
             page = store.listDocuments(
                 cursor=cursor,
                 limit=page_size,
@@ -1617,14 +1704,26 @@ class VectorExplorerTools:
                 sort='path',
             )
             before = len(rows)
+            left_out = False
             for row in page.items:
-                if row.objectId != CONTROL_OBJECT_ID and row.objectId not in rows and len(rows) < limit:
+                if row.objectId == CONTROL_OBJECT_ID or row.objectId in rows:
+                    continue
+                if len(rows) < limit:
                     rows[row.objectId] = row
-            if guard.stop(page, len(rows) - before):
+                else:
+                    left_out = True
+            stop = guard.stop(page, len(rows) - before)
+            if len(rows) >= limit:
+                more = left_out or bool(page.next_cursor) or 'documents_paging_unsupported' in (page.caveats or ())
+                reason = 'cap' if more else 'complete'
+                break
+            if stop:
+                reason = guard.reason or 'complete'
                 break
             cursor = page.next_cursor
             self._vx_check_deadline(deadline)
-        return list(rows.values())
+        listing = {'documents': len(rows), 'truncated': reason != 'complete', 'reason': reason}
+        return list(rows.values()), listing
 
     @staticmethod
     def _vx_check_deadline(deadline: float) -> None:
@@ -1642,8 +1741,16 @@ class VectorExplorerTools:
         object_ids: Optional[List[str]],
         deleted: str,
         deadline: float,
-    ) -> Tuple[List[Doc], str, bool, Dict[str, DocumentRow]]:
-        """Draw the sample (contract section 2.4): ``(docs with vectors, strategy_used, biased, listing)``."""
+    ) -> Tuple[List[Doc], str, bool, Dict[str, DocumentRow], Optional[Dict[str, Any]]]:
+        """Draw the sample (contract section 2.4).
+
+        Returns ``(docs with vectors, strategy_used, biased, rows, listing)``: ``rows`` are the
+        listed documents by objectId; ``listing`` is the answer's ``listing`` object when the
+        key space came from the document listing, None when a native sampler drew the sample
+        (it lists nothing; its key space is the whole scope). Without a scope the listing
+        stops at :data:`SAMPLE_LISTING_MAX` documents; a scope (``filter.object_ids``, at most
+        ``scope_keys_max``) is listed whole, so the stratified pick spans every scoped document.
+        """
         flt = deletedFilter(deleted, objectIds=object_ids)
         chosen: Dict[Key, Doc] = {}
 
@@ -1688,10 +1795,11 @@ class VectorExplorerTools:
                 continue
             for doc in docs:
                 add(doc)
-            return list(chosen.values()), used if used in SAMPLE_STRATEGIES else strat, False, listing
+            return list(chosen.values()), used if used in SAMPLE_STRATEGIES else strat, False, listing, None
 
         # (3) / (4) keys from the document listing, read through getVectors.
-        rows = self._vx_list_rows(store, object_ids, deleted, SAMPLE_LISTING_MAX, deadline)
+        listing_max = max(SAMPLE_LISTING_MAX, len(object_ids)) if object_ids else SAMPLE_LISTING_MAX
+        rows, listed = self._vx_list_rows(store, object_ids, deleted, listing_max, deadline)
         listing = {row.objectId: row for row in rows}
         from .vx_math import stratified_pick
 
@@ -1724,7 +1832,7 @@ class VectorExplorerTools:
                 break
         if not readable and not chosen:
             raise StoreUnsupported('sample needs getVectors or sampleChunks, which this store does not support')
-        return list(chosen.values()), strategy_used, biased, listing
+        return list(chosen.values()), strategy_used, biased, listing, listed
 
     def _vx_refill(self, store, strat, chosen, add, n, seed, flt, deadline) -> int:
         added_total = 0
@@ -1760,6 +1868,14 @@ class VectorExplorerTools:
                 'components': {'type': 'integer', 'enum': [2, 3]},
                 'duplicate_threshold': {'type': 'number'},
                 'include_text': {'type': 'boolean'},
+                'cluster': {
+                    'type': ['object', 'null'],
+                    'description': 'Group the sample by its neighbour graph and label the largest groups.',
+                    'properties': {
+                        'method': {'type': 'string', 'enum': list(CLUSTER_METHODS)},
+                        'labels': {'type': 'boolean'},
+                    },
+                },
             },
         },
         output_schema={
@@ -1770,11 +1886,38 @@ class VectorExplorerTools:
                 'n': {'type': 'integer'},
                 'points': {'type': 'object'},
                 'knn': {'type': 'object'},
+                'clusters': {
+                    'type': 'object',
+                    'description': 'Present when cluster was sent: one group number per point (-1 = noise).',
+                    'properties': {
+                        'method': {'type': 'string', 'enum': list(CLUSTER_METHODS)},
+                        'edge_threshold': {'type': ['number', 'null']},
+                        'percentile': {'type': 'integer'},
+                        'count': {'type': 'integer'},
+                        'noise': {'type': 'integer'},
+                        'labels': {'type': 'array', 'items': {'type': 'integer'}},
+                        'sizes': {'type': 'array', 'items': {'type': 'integer'}},
+                        'keywords': {'type': 'array', 'items': {'type': 'array', 'items': {'type': 'string'}}},
+                        'labelled': {'type': 'integer'},
+                        'label_source': {'type': ['string', 'null'], 'enum': [*CLUSTER_LABEL_SOURCES, None]},
+                        'labelled_from': {'type': 'integer'},
+                        'took_ms': {'type': 'object'},
+                    },
+                },
+                'listing': {
+                    'type': 'object',
+                    'description': 'How the documents the sample was drawn from were listed, and why the listing ended.',
+                    'properties': {
+                        'documents': {'type': 'integer'},
+                        'truncated': {'type': 'boolean'},
+                        'reason': {'type': 'string', 'enum': list(LISTING_REASONS)},
+                    },
+                },
             },
         },
         description=(
             'Draw a sample of chunks and compute, on the node, a PCA layout, the k-nearest-neighbour graph, '
-            'density, outliers and near-duplicates. Columnar; never returns vectors.'
+            'density, outliers, near-duplicates and, when asked, labelled clusters. Columnar; never returns vectors.'
         ),
         audience=('dap',),
     )
@@ -1784,7 +1927,7 @@ class VectorExplorerTools:
         vx_write_gate.check_read()
         import numpy as np
 
-        from . import vx_math
+        from . import vx_cluster, vx_math
         from .vx_sample_cache import SampleEntry, check_light_budget, make_sample_id
 
         started = _monotonic()
@@ -1827,6 +1970,7 @@ class VectorExplorerTools:
         if isinstance(threshold, bool) or not isinstance(threshold, (int, float)) or not 0 < float(threshold) <= 1:
             raise _invalid('duplicate_threshold must be a number above 0 and at most 1.')
         include_text = False if light else _bool_arg(args, 'include_text', True)
+        cluster = _cluster_arg(args)
         dp = 2 if light else 4
 
         cache = _vx_state(store).samples()
@@ -1837,7 +1981,7 @@ class VectorExplorerTools:
             if light and store.vectorSize:
                 check_light_budget(n, int(store.vectorSize))
             deadline = started + LIMITS['sample_budget_ms'] / 1000.0
-            docs, strategy_used, biased, listing = self._vx_collect_sample(
+            docs, strategy_used, biased, listing, listed = self._vx_collect_sample(
                 store,
                 n=n,
                 seed=seed,
@@ -1909,6 +2053,21 @@ class VectorExplorerTools:
                 duplicates = duplicates[:DUPLICATES_MAX]
                 warnings.append('duplicates_capped')
             self._vx_check_deadline(deadline)
+            clusters = None
+            if cluster is not None:
+                # Computed once, inside the sample's exclusive section, from the graph and the texts the
+                # sample already holds; the app folds groups below its own minimum size without a call.
+                clusters = vx_cluster.cluster_sample(
+                    offsets,
+                    cols,
+                    sims,
+                    [doc.page_content for doc in docs],
+                    [paths[key[0]] for key in keys],
+                    labels=cluster['labels'],
+                    max_components=LIMITS['max_components'],
+                    clock=_monotonic,
+                )
+                self._vx_check_deadline(deadline)
 
             in_sample = Counter(key[0] for key in keys)
             pinned_set = set(pinned)
@@ -1924,6 +2083,7 @@ class VectorExplorerTools:
             if include_text:
                 points['snip'] = [vx_math.snippet(doc.page_content, LIMITS['snippet_chars']) for doc in docs]
             points['pinned'] = [1 if key in pinned_set else 0 for key in keys]
+            points['table'] = [1 if metadataValue(doc, 'isTable') else 0 for doc in docs]
 
             sample_id = make_sample_id(seed, keys)
             cache.put(
@@ -1941,6 +2101,15 @@ class VectorExplorerTools:
             )
 
         of_filter = {'objectIds': object_ids} if object_ids else {}
+        of = {
+            'chunks': self._vx_count(store.countChunks, deletedFilter(deleted, **of_filter)),
+            'documents': self._vx_count(store.countDocuments, deletedFilter(deleted, **of_filter)),
+        }
+        if listed is None:
+            # A native sampler drew from the whole scope without listing it: its key space is
+            # complete, and spans the documents the store counts (else the ones it drew from).
+            documents = of['documents'] if of['documents'] is not None else len(doc_order)
+            listed = {'documents': documents, 'truncated': False, 'reason': 'complete'}
         answer = {
             'success': True,
             'sample_id': sample_id,
@@ -1948,10 +2117,7 @@ class VectorExplorerTools:
             'n': len(keys),
             'n_requested': n,
             'mode': mode,
-            'of': {
-                'chunks': self._vx_count(store.countChunks, deletedFilter(deleted, **of_filter)),
-                'documents': self._vx_count(store.countDocuments, deletedFilter(deleted, **of_filter)),
-            },
+            'of': of,
             'strategy_used': strategy_used,
             'biased': biased,
             'knn_source': knn_source,
@@ -1980,8 +2146,14 @@ class VectorExplorerTools:
             'pca': {'explained': _round_list(explained, 5)},
             'took_ms': int((_monotonic() - started) * 1000),
         }
-        if biased:
-            answer['caveats'] = ['biased_sample']
+        caveats = ['biased_sample'] if biased else []
+        if listed['truncated']:
+            caveats.append('listing_truncated')
+        if caveats:
+            answer['caveats'] = caveats
+        if clusters is not None:
+            answer['clusters'] = clusters
+        answer['listing'] = listed
         if warnings:
             answer['warnings'] = warnings
         return answer
