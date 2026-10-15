@@ -94,6 +94,7 @@ const MAP = {
 	next: /^Next$/,
 	legend: 'Map legend',
 	nativeGraph: (backend) => new RegExp(`neighbour graph computed by ${backend}`),
+	nodeGraph: /neighbour graph computed by the store node/,
 	layoutNotBetter: /Neighbour layout did not improve on PCA/,
 	layoutCancelled: /Layout cancelled/,
 	layoutBusy: /Laying out…/,

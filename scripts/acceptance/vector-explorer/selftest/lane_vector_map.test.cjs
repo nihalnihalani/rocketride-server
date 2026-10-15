@@ -64,6 +64,21 @@ test("layoutVerdict: the refined layout stays only when its overlap is at least 
 	assert.match(lane.layoutVerdict({ pca: null, refined: 0.31, shown: 'pca', notBetter: true }), /overlap/);
 });
 
+test('legendVerdict: Qdrant names its own graph; every other store names the store node, and no store claims a graph it did not compute', () => {
+	const native = 'Map legend · neighbour graph computed by Qdrant · 2D distance is approximate';
+	const node = 'Map legend · neighbour graph computed by the store node · 2D distance is approximate';
+	assert.strictEqual(lane.legendVerdict({ fixtureKey: 'qdrant', knnSource: 'native', text: native }), true);
+	assert.match(lane.legendVerdict({ fixtureKey: 'qdrant', knnSource: 'node', text: node }), /not Qdrant's own/);
+	assert.match(lane.legendVerdict({ fixtureKey: 'qdrant', knnSource: 'native', text: node }), /does not say "neighbour graph computed by Qdrant"/);
+	for (const fixtureKey of ['postgres', 'rocketride_vector', 'chroma']) {
+		assert.strictEqual(lane.legendVerdict({ fixtureKey, knnSource: 'node', text: node }), true, fixtureKey);
+		assert.match(lane.legendVerdict({ fixtureKey, knnSource: 'node', text: 'Map legend · 2D distance is approximate' }), /store node/, fixtureKey);
+	}
+	assert.match(lane.legendVerdict({ fixtureKey: 'chroma', knnSource: 'node', text: `${node} · neighbour graph computed by Chroma` }), /claims/);
+	assert.strictEqual(lane.legendVerdict({ fixtureKey: 'chroma', knnSource: 'native', text: 'neighbour graph computed by Chroma' }), true);
+	assert.match(lane.legendVerdict({ fixtureKey: 'chroma', knnSource: undefined, text: node }), /knn_source/);
+});
+
 const SAMPLE = {
 	n: 5,
 	docs: [

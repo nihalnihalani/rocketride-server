@@ -138,6 +138,7 @@ test('isUpload recognises the SDK upload requests only', () => {
 test("the selector table holds the app's wording", () => {
 	assert.strictEqual(CONSOLE.trash('C:/demo/a.md'), 'Remove C:/demo/a.md from the database');
 	assert.ok(MAP.nativeGraph('Qdrant').test('… · neighbour graph computed by Qdrant · …'));
+	assert.ok(MAP.nodeGraph.test('… · neighbour graph computed by the store node · …'));
 	assert.ok(MAP.layoutNotBetter.test('Neighbour layout did not improve on PCA for this sample'));
 	assert.ok(MAP.announcement(11, 1000).test('Point 12 of 1,000: C:/demo/a.md, chunk 3'));
 	assert.ok(!MAP.announcement(1, 1000).test('Point 12 of 1,000: C:/demo/a.md, chunk 3'));

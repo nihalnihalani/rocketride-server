@@ -40,8 +40,11 @@
  *   kNN overlap: the neighbour-graph layout is kept only when its overlap is
  *     at least PCA's, else PCA stays with the sentence; both numbers are
  *     recorded in the lane JSON
- *   legend: "neighbour graph computed by Qdrant" when the sample's kNN graph
- *     is Qdrant's own (Qdrant computes it for samples of up to 500 points)
+ *   legend: names who computed the sample's kNN graph: "neighbour graph
+ *     computed by Qdrant" on the qdrant fixture, whose graph must be Qdrant's
+ *     own (Qdrant computes it for samples of up to 500 points); "neighbour
+ *     graph computed by the store node" on a store that has no graph of its
+ *     own, and never the backend's name for a graph the store node computed
  *   t-SNE: refused for a sample above 1,000 points, offered at 1,000
  *     (qdrant_pager)
  *   Cancel: stops a running layout and leaves PCA (qdrant_pager)
@@ -129,6 +132,20 @@ function layoutVerdict({ pca, refined, shown, notBetter }) {
 	}
 	if (shown !== 'pca') return `overlap ${refined} < PCA ${pca} but the refined layout was kept (shown: ${shown})`;
 	return notBetter ? true : 'PCA stayed but the map did not say the neighbour layout did not improve';
+}
+
+/**
+ * The legend step's verdict: the legend names who computed the sample's kNN
+ * graph. The qdrant fixture's graph must be Qdrant's own; a graph the store
+ * node computed is named as the store node's, never the backend's.
+ */
+function legendVerdict({ fixtureKey, knnSource, text }) {
+	const backend = BACKEND_NAMES[fixtureKey];
+	if (fixtureKey === 'qdrant' && knnSource !== 'native') return `the Qdrant sample's kNN graph is ${knnSource}, not Qdrant's own`;
+	if (knnSource === 'native') return MAP.nativeGraph(backend).test(text) ? true : `the legend does not say "neighbour graph computed by ${backend}"`;
+	if (knnSource !== 'node') return `the sample's knn_source is ${knnSource}, neither native nor node`;
+	if (backend && MAP.nativeGraph(backend).test(text)) return `the legend claims "neighbour graph computed by ${backend}" for the store node's graph`;
+	return MAP.nodeGraph.test(text) ? true : 'the legend does not say "neighbour graph computed by the store node"';
 }
 
 /** The planted pairs no row names both halves of (a path matches whole, after a '/'). */
@@ -490,14 +507,11 @@ async function main() {
 			return layoutVerdict(verdict);
 		});
 
-		await step(page, 'legend: "neighbour graph computed by Qdrant" for Qdrant\'s own graph', async (note) => {
+		await step(page, 'legend: who computed the neighbour graph (Qdrant its own, other stores the store node)', async (note) => {
 			if (!sample) return 'no sample';
 			const text = await C.textOf(map.getByRole('region', { name: MAP.legend }).first());
-			const backend = BACKEND_NAMES[fixtureKey];
 			note({ knn_source: sample.knn_source, legend: text.slice(0, 300) });
-			if (fixtureKey === 'qdrant' && sample.knn_source !== 'native') return `the Qdrant sample's kNN graph is ${sample.knn_source}, not Qdrant's own`;
-			if (sample.knn_source !== 'native') return `this fixture's graph is ${sample.knn_source}; run the lane on the qdrant fixture`;
-			return MAP.nativeGraph(backend).test(text) ? true : `the legend does not say "neighbour graph computed by ${backend}"`;
+			return legendVerdict({ fixtureKey, knnSource: sample.knn_source, text });
 		});
 
 		let pagerSample = null;
@@ -577,4 +591,4 @@ if (require.main === module) {
 		});
 }
 
-module.exports = { pathOf, keyOf, pointsOf, sectorTarget, layoutVerdict, missingPairs };
+module.exports = { pathOf, keyOf, pointsOf, sectorTarget, layoutVerdict, legendVerdict, missingPairs };
