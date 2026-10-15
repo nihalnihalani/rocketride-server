@@ -95,7 +95,9 @@ sentence-transformers, through depends/uv) and loads all-MiniLM-L6-v2: that
 needs the network or a warm uv cache and the model in the Hugging Face cache,
 and takes minutes cold (about 90 s warm); an offline machine without them
 fails a required run rather than skipping it. Optional: ``RR_TEST_TOOLPATH_ENGINE_PORT``
-fixes the engine's port (default: a free one).
+fixes the engine's port (default: a free one); ``RR_TEST_TOOLPATH_BASE_PORT``
+is where the search for the engine's block of free task ports starts (default
+44000), so two runs at once never share a task port.
 """
 
 from __future__ import annotations
@@ -179,6 +181,10 @@ SEEDED_LEGACY = 'vx_legacy_docs'
 LEGACY_MODE = os.environ.get('RR_TEST_VECTOR_LEGACY', 'emulated').strip().lower() or 'emulated'
 
 ENGINE_START_S = 180
+# The engine gives each task a port counting up from --base_port. Two runs of this suite (or of the
+# wire captures) at once must not share them, or one run's calls reach the other's tasks: each run
+# takes the first block of TASK_PORT_BLOCK free ports from RR_TEST_TOOLPATH_BASE_PORT (default 44000).
+TASK_PORT_BLOCK = 40
 USE_TIMEOUT_S = 300
 TOOL_TIMEOUT_MS = 90_000
 
@@ -651,6 +657,27 @@ class _Stub:
         self._server.server_close()
 
 
+def free_port_block(start: int, count: int = TASK_PORT_BLOCK, is_free: Optional[Callable[[int], bool]] = None) -> int:
+    """The first port at or above ``start``, in steps of ``count``, whose ``count`` ports are all free."""
+    import socket
+
+    def bindable(port: int) -> bool:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            try:
+                sock.bind(('127.0.0.1', port))
+            except OSError:
+                return False
+            return True
+
+    is_free = is_free or bindable
+    base = start
+    while base + count <= 65535:
+        if all(is_free(port) for port in range(base, base + count)):
+            return base
+        base += count
+    raise RuntimeError(f'no block of {count} free ports at or above {start}')
+
+
 class _Engine:
     """``engine ai/eaas.py`` without mocks, plus one SDK client on a loop thread of its own."""
 
@@ -677,12 +704,20 @@ class _Engine:
             }
         )
         port = int(os.environ.get('RR_TEST_TOOLPATH_ENGINE_PORT') or 0)
+        self.base_port = free_port_block(int(os.environ.get('RR_TEST_TOOLPATH_BASE_PORT') or 44000))
         self.output: collections.deque = collections.deque(maxlen=200)
         self._port: Optional[int] = None
         self._ready = threading.Event()
         # --autoterm: the engine exits when this process does (its stdin closes).
         self.proc = subprocess.Popen(
-            [str(_ENGINE), '--autoterm', 'ai/eaas.py', '--host=127.0.0.1', f'--port={port}', '--base_port=44000'],
+            [
+                str(_ENGINE),
+                '--autoterm',
+                'ai/eaas.py',
+                '--host=127.0.0.1',
+                f'--port={port}',
+                f'--base_port={self.base_port}',
+            ],
             cwd=str(_SERVER_DIR),
             env=env,
             stdin=subprocess.PIPE,
@@ -1835,6 +1870,14 @@ def test_a_legacy_copy_gets_the_same_point_ids_on_every_run(copy):
 # ---------------------------------------------------------------------------
 # The secrets scan's own rules (no engine call)
 # ---------------------------------------------------------------------------
+
+
+def test_two_runs_never_share_a_task_port():
+    taken = set(range(44000, 44006))
+    assert free_port_block(44000, 40, lambda port: port not in taken) == 44040
+    assert free_port_block(44000, 40, lambda port: True) == 44000
+    with pytest.raises(RuntimeError):
+        free_port_block(65500, 40, lambda port: True)
 
 
 def test_the_secrets_scan_reads_every_field_but_document_text():
