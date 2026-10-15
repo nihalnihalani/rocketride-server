@@ -165,6 +165,27 @@ test('scoreChunks: no keys, no calls; a refusal keeps its code; an answer withou
 	assert.equal(store.calls.length, 0);
 });
 
+test('scoreChunks: a store busy with another neighbour search is asked again, a few times, without embedding again', async () => {
+	const vector = [0.1, 0.2, 0.3];
+	const busy = { success: false, code: 'BUSY', error: 'Another neighbour search is running on this store; try again when it ends.' };
+	const answers: unknown[] = [busy, busy, { success: true, scores: [0.5] }];
+	const embed = recorder({ embed: { success: true, model: 'm', dimension: 3, vectors: [vector], prefix_applied: null, ms: 1 } });
+	const store = { calls: 0, caller: { invoke: async <T>(): Promise<T> => answers[store.calls++] as T } };
+	const waits: number[] = [];
+	const wait = async (ms: number): Promise<void> => {
+		waits.push(ms);
+	};
+	assert.deepEqual(await scoreChunks({ caller: store.caller, nodeId: 'store_1' }, { caller: embed.caller, nodeId: 'embed_1' }, heatKeys('o-1', 1, 2000), 'q', { wait }), [{ chunkId: 0, sim: 0.5 }]);
+	assert.equal(embed.calls.length, 1, 'embedded once');
+	assert.equal(store.calls, 3);
+	assert.equal(waits.length, 2);
+	assert.ok(waits[1]! > waits[0]!, 'each wait is longer');
+
+	const always = { calls: 0, caller: { invoke: async <T>(): Promise<T> => (always.calls++, busy) as T } };
+	await assert.rejects(scoreChunks({ caller: always.caller, nodeId: 'store_1' }, { caller: embed.caller, nodeId: 'embed_1' }, heatKeys('o-1', 1, 2000), 'q', { wait }), (error: unknown) => error instanceof ExplorerToolError && error.code === 'BUSY');
+	assert.ok(always.calls >= 3 && always.calls <= 5, `gave up after ${always.calls} tries`);
+});
+
 // ── The document tab ──────────────────────────────────────────────────────────
 
 /** Whether the markup holds the heat strip itself. */

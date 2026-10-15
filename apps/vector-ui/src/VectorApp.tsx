@@ -177,7 +177,7 @@ const VectorAppReady: React.FC<{ docs: Documents }> = ({ docs }) => {
 };
 
 /** One stored document's tab, bound to its connection's live model. */
-const DocumentTab: React.FC<{ payload: IDocumentDocPayload }> = ({ payload }) => {
+const DocumentTab: React.FC<{ payload: IDocumentDocPayload; active: boolean }> = ({ payload, active }) => {
 	const { client } = useShellConnection();
 	const endpoint = useLiveEndpoint(payload.endpoint);
 	const { entry, model, channels } = useConnection(endpoint, client);
@@ -195,7 +195,7 @@ const DocumentTab: React.FC<{ payload: IDocumentDocPayload }> = ({ payload }) =>
 	useEffect(() => {
 		entry.controller.setWritesEnabled(model.writes.enabled);
 	}, [model.writes.enabled, entry]);
-	return <DocumentView model={model} channels={channels} selection={entry.selection} actions={actions} objectId={payload.objectId} path={payload.path} {...(payload.chunkId === undefined ? {} : { chunkId: payload.chunkId })} />;
+	return <DocumentView model={model} channels={channels} selection={entry.selection} actions={actions} objectId={payload.objectId} path={payload.path} active={active} {...(payload.chunkId === undefined ? {} : { chunkId: payload.chunkId })} />;
 };
 
 /**
@@ -215,7 +215,7 @@ const DocumentPane: React.FC<{ uri: string; docs: Documents; active: boolean }> 
 	}
 	if (isDocumentUri(uri)) {
 		const payload = content as IDocumentDocPayload | undefined;
-		if (payload?.endpoint && payload.objectId) return <DocumentTab key={uri} payload={payload} />;
+		if (payload?.endpoint && payload.objectId) return <DocumentTab key={uri} payload={payload} active={active} />;
 	}
 	return <EmptyState title="Unknown document" description={uri} />;
 };

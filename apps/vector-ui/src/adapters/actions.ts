@@ -142,27 +142,44 @@ export async function embedTexts(caller: IVectorCaller, embedNodeId: string, tex
 	return callVector<IEmbedResult>(caller, embedNodeId, TOOL.embed, { texts: [...texts], kind: 'query' });
 }
 
+/** How long `scoreChunks` waits before asking a busy store again: one wait per retry. */
+const BUSY_RETRY_MS = [400, 1000, 2500];
+
 /**
  * Score chunks against a query text: embed it on the embedding node, then send
  * that exact vector to the store's `neighbors` with the keys as `scope_keys`.
- * The vector is used for this one call and not kept.
+ * The vector is used for this one call and not kept. A store runs one
+ * neighbour search at a time and refuses another with BUSY (the map may be
+ * asking at the same moment), so a BUSY is asked again after a short wait, a
+ * few times, with the same vector.
  *
  * @param store - The store node and a caller that reaches it.
  * @param embed - The embedding node and a caller that reaches it.
  * @param keys - The chunk keys of one document (at most `limits.scope_keys_max`).
  * @param query - The query text.
+ * @param opts - `wait` (tests replace the timer).
  * @returns The chunks that have a similarity (none for an empty `keys`, without a call).
  */
-export async function scoreChunks(store: { caller: IVectorCaller; nodeId: string }, embed: { caller: IVectorCaller; nodeId: string }, keys: readonly VectorKey[], query: string): Promise<IHeatScore[]> {
+export async function scoreChunks(store: { caller: IVectorCaller; nodeId: string }, embed: { caller: IVectorCaller; nodeId: string }, keys: readonly VectorKey[], query: string, opts: { wait?: (ms: number) => Promise<void> } = {}): Promise<IHeatScore[]> {
 	if (keys.length === 0) return [];
+	const wait = opts.wait ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
 	const embedded = await embedTexts(embed.caller, embed.nodeId, [query]);
 	const vector = Array.isArray(embedded.vectors) ? embedded.vectors[0] : undefined;
 	if (!Array.isArray(vector) || vector.length === 0) throw new ExplorerToolError({ kind: 'malformed', tool: TOOL.embed, message: 'The embedding node answered without a vector.' });
-	const answer = await callVector<INeighborsScopeResult>(store.caller, store.nodeId, TOOL.neighbors, { vector, scope_keys: keys.map((key) => [...key]) });
-	return heatScores(
-		keys.map((key) => key[1]),
-		Array.isArray(answer.scores) ? answer.scores : []
-	);
+	const input = { vector, scope_keys: keys.map((key) => [...key]) };
+	for (let attempt = 0; ; attempt += 1) {
+		try {
+			const answer = await callVector<INeighborsScopeResult>(store.caller, store.nodeId, TOOL.neighbors, input);
+			return heatScores(
+				keys.map((key) => key[1]),
+				Array.isArray(answer.scores) ? answer.scores : []
+			);
+		} catch (error) {
+			const delay = BUSY_RETRY_MS[attempt];
+			if (!(error instanceof ExplorerToolError && error.code === 'BUSY') || delay === undefined) throw error;
+			await wait(delay);
+		}
+	}
 }
 
 /**

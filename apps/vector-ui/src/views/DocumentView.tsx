@@ -38,7 +38,7 @@
 
 import React, { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { Banner, Button, BxTrash, ContentHeader } from 'shell';
-import type { DocumentViewProps, IChunkItem, IDocumentItem, VectorKey } from '../contract/types';
+import type { DocumentViewProps as ContractDocumentViewProps, IChunkItem, IDocumentItem, VectorKey } from '../contract/types';
 import { fetchChunks, fetchDocument, scoreChunks } from '../adapters/actions';
 import type { IVectorCaller } from '../adapters/actions';
 import HeatStrip from '../components/HeatStrip';
@@ -53,7 +53,11 @@ import { failureText } from '../vector/wording';
 import type { IFailureText } from '../vector/wording';
 import { FOCUS_RING, styles } from '../styles';
 
-export type { DocumentViewProps };
+/** Props: the frozen ones plus whether the tab is in front. */
+export interface DocumentViewProps extends ContractDocumentViewProps {
+	/** The tab is the one in front (editors stay mounted when hidden); nothing is scored while it is not. Default true. */
+	active?: boolean;
+}
 
 /** The chunks of the document, loaded a page at a time. */
 interface IChunkState {
@@ -68,7 +72,7 @@ interface IChunkState {
 const NO_CHUNKS: IChunkState = { items: [], hasMore: false, nextAfter: -1, total: null, loading: false, error: null };
 
 /** The heat strip's answer for one query: the scores, or why there are none. */
-type HeatState = { query: string; scores: IHeatScore[] } | { query: string; error: IFailureText };
+type HeatState = { query: string; chunks: number; scores: IHeatScore[] } | { query: string; chunks: number; error: IFailureText };
 
 /**
  * One document's tab.
@@ -76,7 +80,7 @@ type HeatState = { query: string; scores: IHeatScore[] } | { query: string; erro
  * @param props - The frozen DocumentViewProps.
  * @returns The view.
  */
-export function DocumentView({ model, channels, selection, actions, objectId, path, chunkId }: DocumentViewProps): React.ReactElement {
+export function DocumentView({ model, channels, selection, actions, objectId, path, chunkId, active = true }: DocumentViewProps): React.ReactElement {
 	const caller: IVectorCaller | null = channels.tools ?? channels.chat ?? channels.ingest;
 	const embedCaller: IVectorCaller | null = channels.tools ?? channels.chat;
 	const store = model.nodes.store;
@@ -138,25 +142,29 @@ export function DocumentView({ model, channels, selection, actions, objectId, pa
 		if (el && 'scrollIntoView' in el) (el as HTMLElement).scrollIntoView({ block: 'center' });
 	}, [chunkId, chunks.items.length]);
 
-	// The heat strip: every chunk scored against the active query, again when the query changes.
+	// The heat strip: every chunk scored against the active query while the tab is in front, again when
+	// the query (or the chunk count) changes; a hidden tab sends nothing until it is in front again.
 	const chunkCount = info?.chunks ?? chunks.total ?? chunks.items.length;
 	const scopeMax = model.limits.scope_keys_max;
 	useEffect(() => {
-		if (query === null || !embedReady || caller === null || embedCaller === null || !embedNode || chunkCount <= 0) return undefined;
+		if (!active || query === null || !embedReady || caller === null || embedCaller === null || !embedNode || chunkCount <= 0) return undefined;
+		if (heat !== null && heat.query === query && heat.chunks === chunkCount) return undefined;
 		let live = true;
 		scoreChunks({ caller, nodeId: store }, { caller: embedCaller, nodeId: embedNode }, heatKeys(objectId, chunkCount, scopeMax), query).then(
 			(scores) => {
-				if (live) setHeat({ query, scores });
+				if (live) setHeat({ query, chunks: chunkCount, scores });
 			},
 			(error) => {
 				const text = failureText(error);
-				if (live && text) setHeat({ query, error: text });
+				if (live && text) setHeat({ query, chunks: chunkCount, error: text });
 			}
 		);
 		return () => {
 			live = false;
 		};
-	}, [query, embedReady, caller, embedCaller, embedNode, store, objectId, chunkCount, scopeMax]);
+		// `heat` is read to skip a query already scored, not to score again when the answer lands.
+		// eslint-disable-next-line react-hooks/exhaustive-deps
+	}, [active, query, embedReady, caller, embedCaller, embedNode, store, objectId, chunkCount, scopeMax]);
 	const heatNow = heat !== null && heat.query === query ? heat : null;
 
 	const shownPath = info?.path ?? path ?? objectId;

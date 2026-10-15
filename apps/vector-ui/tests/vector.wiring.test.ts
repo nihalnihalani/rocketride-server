@@ -95,6 +95,15 @@ test('the console is the first view of a connection: the landing and the sidebar
 	assert.match(app, /docs\.openStaticDocument\(CONNECTIONS_URI, 'Connections'\)/, 'the landing opens with the app');
 });
 
+test('a document tab is told when it is in front, and scores its chunks against the query only then', () => {
+	const app = code('VectorApp.tsx');
+	assert.match(app, /if \(isDocumentUri\(uri\)\)[\s\S]*<DocumentTab key=\{uri\} payload=\{payload\} active=\{active\} \/>/);
+	assert.match(app, /<DocumentView [^>]*active=\{active\}/);
+	const view = code('views/DocumentView.tsx');
+	assert.match(view, /if \(!active \|\| query === null \|\| !embedReady/, 'a hidden tab (every editor stays mounted) sends nothing');
+	assert.match(view, /heat\.query === query && heat\.chunks === chunkCount\) return undefined;/, 'coming back to the same query does not score again');
+});
+
 test('the Map is a tab of the console: both stay mounted, the map is told when it is visible', () => {
 	const view = code('views/ConsoleView.tsx');
 	assert.match(view, /display: tab === 'console' \? 'flex' : 'none'/);
