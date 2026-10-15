@@ -72,6 +72,8 @@ export interface ScopeBarProps extends ContractScopeBarProps {
 	onDeleteSaved?(id: string): void;
 	/** What is open on the first render (the directory opens nothing; tests open each part). */
 	initial?: IScopeBarOpen;
+	/** The path box's settled text (after its debounce), which a new scope carries; default `text`. */
+	scopeText?: string;
 }
 
 export type { ContractScopeBarProps };
@@ -166,7 +168,7 @@ export function draftCondition(kind: ConditionKind, draft: IDraft): ICondition |
  * @param props - {@link ScopeBarProps}.
  * @returns The bar.
  */
-export function ScopeBar({ text, onText, scope = null, onScope, available = {}, folders = [], cap = DEFAULT_LIMITS.scope_keys_max, saved = [], onSave, onDeleteSaved, initial = {} }: ScopeBarProps): React.ReactElement {
+export function ScopeBar({ text, onText, scope = null, onScope, available = {}, folders = [], cap = DEFAULT_LIMITS.scope_keys_max, saved = [], onSave, onDeleteSaved, initial = {}, scopeText = text }: ScopeBarProps): React.ReactElement {
 	const [menu, setMenu] = useState<IScopeBarOpen['menu']>(initial.menu ?? null);
 	const [editor, setEditor] = useState<ConditionKind | null>(initial.editor ?? null);
 	const [draft, setDraft] = useState<IDraft>(EMPTY_DRAFT);
@@ -174,7 +176,7 @@ export function ScopeBar({ text, onText, scope = null, onScope, available = {}, 
 	const [name, setName] = useState('');
 	const [error, setError] = useState<string | null>(null);
 
-	const filter: IFilter = filterOf(scope, text);
+	const filter: IFilter = filterOf(scope, scopeText);
 	const conditions = filter.conditions;
 	const targets = scope ? scopeAvailability(scope, cap) : null;
 	const blocked = targets ? (TARGETS.map((t) => targets[t.key]).find((a) => !a.enabled)?.reason ?? null) : null;
@@ -236,8 +238,8 @@ export function ScopeBar({ text, onText, scope = null, onScope, available = {}, 
 	};
 	const apply = (entry: ISavedFilter): void => {
 		setMenu(null);
-		let next: IFilter = { conditions: [], text };
-		for (const condition of filterOf({ filter: entry.filter }, text).conditions) next = setCondition(next, condition);
+		let next: IFilter = { conditions: [], text: scopeText };
+		for (const condition of filterOf({ filter: entry.filter }, scopeText).conditions) next = setCondition(next, condition);
 		commit(next);
 	};
 
@@ -371,7 +373,7 @@ export function ScopeBar({ text, onText, scope = null, onScope, available = {}, 
 							Save…
 						</button>
 					)}
-					<button type="button" style={buttonStyle()} onClick={() => commit({ conditions: [], text })} {...ring}>
+					<button type="button" style={buttonStyle()} onClick={() => commit({ conditions: [], text: scopeText })} {...ring}>
 						Clear
 					</button>
 				</div>

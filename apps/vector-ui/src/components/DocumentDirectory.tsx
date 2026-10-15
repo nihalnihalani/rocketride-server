@@ -148,17 +148,13 @@ export function DocumentDirectory({ pager, selectedId, writes, onSelect, onRemov
 		if (kept.length !== checked.size) setChecked(new Set(kept));
 	}, [pager.rows, checked]);
 
-	// The path box joins the scope (as path_contains) once its text settles; a scope set meanwhile keeps its own text.
-	const scopeRef = useRef(scope);
-	scopeRef.current = scope;
+	// The path box joins the scope (as path_contains) once its text settles, and any scope set elsewhere (a chart's
+	// bar, a saved filter) takes the box's text too; withText returns the same scope when nothing changes, so this settles.
 	useEffect(() => {
-		const current = scopeRef.current;
-		if (current === null || !onScope) return;
-		const next = withText(current, applied);
-		if (next !== current) onScope(next);
-		// Only a change of the box's settled text re-scopes; a new scope already carries the box.
-		// eslint-disable-next-line react-hooks/exhaustive-deps
-	}, [applied]);
+		if (scope === null || !onScope) return;
+		const next = withText(scope, applied);
+		if (next !== scope) onScope(next);
+	}, [applied, scope, onScope]);
 
 	const view = useMemo(() => directoryView(pager, scope, applied, cap), [pager, scope, applied, cap]);
 	const matches = view.rows;
@@ -212,7 +208,7 @@ export function DocumentDirectory({ pager, selectedId, writes, onSelect, onRemov
 				<span style={{ ...styles.small, fontWeight: 400, textTransform: 'none', letterSpacing: 0, marginLeft: 'auto' }}>{pager.status === 'idle' ? '' : directoryHeading(pager)}</span>
 				<ExportMenu items={exportItems} collection={collection} />
 			</div>
-			<ScopeBar text={filter} onText={setFilter} scope={scope} onScope={onScope} cap={cap} available={available} folders={folders} saved={saved} onSave={onSave} onDeleteSaved={onDeleteSaved} />
+			<ScopeBar text={filter} scopeText={applied} onText={setFilter} scope={scope} onScope={onScope} cap={cap} available={available} folders={folders} saved={saved} onSave={onSave} onDeleteSaved={onDeleteSaved} />
 			{(summary || progress) && (
 				<div style={{ ...styles.small, padding: '0 12px 6px' }} role="status">
 					{summary ?? progress}
