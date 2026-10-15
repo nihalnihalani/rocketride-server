@@ -131,6 +131,10 @@ class DocPage:
     sorted: bool
     #: Entries from :data:`CAVEATS`.
     caveats: List[str]
+    #: The keys of the call's :class:`DocListFilter` the hook did not apply, in
+    #: :data:`DOC_LIST_FILTER_KEYS` order (contract section 4.4-A). Empty when the
+    #: call had no filter or the hook applied every key it was given.
+    filter_ignored: Tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

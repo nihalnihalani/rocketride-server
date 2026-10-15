@@ -68,7 +68,17 @@ from .vx_defaults import (
     VECTOR_TOOL_DEFAULTS,
     VECTOR_TOOL_LIMITS,
 )
-from .vx_types import CONTROL_OBJECT_ID, DELETED_VALUES, PROJECTIONS, SAMPLE_STRATEGIES, SUPPORT_LEVELS, DocumentRow
+from .vx_types import (
+    CONTROL_OBJECT_ID,
+    DELETED_VALUES,
+    FILTER_APPLIED_VALUES,
+    PROJECTIONS,
+    SAMPLE_STRATEGIES,
+    SUPPORT_LEVELS,
+    DocListFilter,
+    DocumentRow,
+    parse_doc_list_filter,
+)
 
 if TYPE_CHECKING:  # pragma: no cover
     from .document_store import DocumentStoreBase
@@ -615,6 +625,34 @@ def vectordb_tool(fn: Callable) -> Callable:
 
 def _invalid(message: str) -> ToolRefusal:
     return ToolRefusal('INVALID_INPUT', message)
+
+
+#: The caveat a ``documents`` answer carries for each ``filter_applied`` (none for ``'server'``).
+_FILTER_CAVEATS: Dict[str, str] = {'partial': 'documents_filter_partial', 'none': 'documents_filter_client'}
+
+
+def _doc_list_filter_arg(args: Mapping[str, Any]) -> Optional[DocListFilter]:
+    """The ``documents`` call's ``filter``, normalised; None when it sets nothing (contract section 4.4-A)."""
+    try:
+        return parse_doc_list_filter(args.get('filter'))
+    except ValueError as exc:
+        raise _invalid(str(exc)) from None
+
+
+def _filter_outcome(doc_filter: DocListFilter, skipped: Optional[Sequence[str]]) -> Tuple[str, List[str]]:
+    """Return ``(filter_applied, filter_ignored)`` for a filtered ``documents`` page.
+
+    ``skipped`` is the page's ``filter_ignored`` when the driver was handed the filter, None
+    when it was not (every given key is then left to the app). Only keys the call gave are
+    reported, in :data:`DOC_LIST_FILTER_KEYS` order: ``'server'`` when none was skipped,
+    ``'none'`` when all were, ``'partial'`` otherwise.
+    """
+    given = doc_filter.given()
+    left = set(given if skipped is None else skipped)
+    ignored = [key for key in given if key in left]
+    if not ignored:
+        return 'server', []
+    return ('none' if len(ignored) == len(given) else 'partial'), ignored
 
 
 def _int_arg(args: Mapping[str, Any], name: str, default: int) -> int:
@@ -1319,6 +1357,21 @@ class VectorExplorerTools:
                 'object_ids': {'type': ['array', 'null'], 'items': {'type': 'string'}},
                 'deleted': _DELETED_SCHEMA,
                 'sort': {'type': 'string', 'enum': ['path']},
+                'filter': {
+                    'type': ['object', 'null'],
+                    'description': 'Restrict the listing; the answer says how much of it the store applied.',
+                    'properties': {
+                        'path_prefix': {'type': ['string', 'null']},
+                        'file_types': {'type': ['array', 'null'], 'items': {'type': 'string'}},
+                        'ingested_after': {'type': ['string', 'null']},
+                        'ingested_before': {'type': ['string', 'null']},
+                        'min_chunks': {'type': ['integer', 'null']},
+                        'max_chunks': {'type': ['integer', 'null']},
+                        'has_first_chunk': {'type': ['boolean', 'null']},
+                        'has_tables': {'type': ['boolean', 'null']},
+                        'path_contains': {'type': ['string', 'null']},
+                    },
+                },
             },
         },
         output_schema={
@@ -1331,6 +1384,8 @@ class VectorExplorerTools:
                 'counts_exact': {'type': 'boolean'},
                 'distinct': {'type': 'boolean'},
                 'sorted': {'type': 'boolean'},
+                'filter_applied': {'type': 'string', 'enum': list(FILTER_APPLIED_VALUES)},
+                'filter_ignored': {'type': 'array', 'items': {'type': 'string'}},
                 'caveats': {'type': 'array', 'items': {'type': 'string'}},
             },
         },
@@ -1361,7 +1416,14 @@ class VectorExplorerTools:
         sort = args.get('sort', 'path') or 'path'
         if sort != 'path':
             raise _invalid("sort must be 'path'.")
-        page = store.listDocuments(cursor=cursor, limit=limit, object_ids=object_ids, deleted=deleted, sort=sort)
+        doc_filter = _doc_list_filter_arg(args)
+        # Only a driver that declares documents_filter is handed the filter: the others keep
+        # the closed keyword-only signature of the first contract and are filtered by the app.
+        hand_over = doc_filter is not None and 'documents_filter' in store.capabilities()
+        hook_args: Dict[str, Any] = {'filter': doc_filter} if hand_over else {}
+        page = store.listDocuments(
+            cursor=cursor, limit=limit, object_ids=object_ids, deleted=deleted, sort=sort, **hook_args
+        )
         items = [
             {
                 'objectId': row.objectId,
@@ -1382,7 +1444,7 @@ class VectorExplorerTools:
         caveats = list(page.caveats)
         if not page.sorted and 'documents_unsorted' not in caveats:
             caveats.append('documents_unsorted')
-        answer = {
+        answer: Dict[str, Any] = {
             'success': True,
             'items': items,
             'next_cursor': page.next_cursor,
@@ -1390,8 +1452,16 @@ class VectorExplorerTools:
             'counts_exact': page.counts_exact,
             'distinct': page.distinct,
             'sorted': page.sorted,
-            'caveats': caveats,
         }
+        if doc_filter is not None:
+            skipped = (getattr(page, 'filter_ignored', None) or ()) if hand_over else None
+            applied, ignored = _filter_outcome(doc_filter, skipped)
+            answer['filter_applied'] = applied
+            answer['filter_ignored'] = ignored
+            caveat = _FILTER_CAVEATS.get(applied)
+            if caveat and caveat not in caveats:
+                caveats.append(caveat)
+        answer['caveats'] = caveats
         if warnings:
             answer['warnings'] = ['limit_clamped']
         return answer

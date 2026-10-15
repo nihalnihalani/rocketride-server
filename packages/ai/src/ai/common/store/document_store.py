@@ -27,7 +27,7 @@ from .vx_tools import (  # noqa: F401 - re-exported for the drivers that overrid
     vectordb_tool,
 )
 from .vx_tools_ext import VectorExplorerExtTools
-from .vx_types import CONTROL_OBJECT_ID, ChunkPage, DocPage, KnnGraph, StoreInfo
+from .vx_types import CONTROL_OBJECT_ID, ChunkPage, DocListFilter, DocPage, KnnGraph, StoreInfo
 
 if TYPE_CHECKING:  # annotations only: numpy is imported where a hook needs it
     import numpy as np
@@ -468,12 +468,20 @@ class DocumentStoreBase(ABC):
         object_ids: Optional[Sequence[str]],
         deleted: 'Deleted',
         sort: str,
+        filter: Optional[DocListFilter] = None,
     ) -> DocPage:
         """
         Return one page of documents (one row per objectId).
 
         ``cursor`` is the opaque ``next_cursor`` of the previous page (None for the first
         page); ``object_ids`` restricts the listing; ``sort`` is ``'path'``.
+
+        ``filter`` (contract section 4.4-A) restricts the listing further. The ``documents``
+        tool passes it only to a driver that declares ``documents_filter`` in
+        :attr:`VX_DRIVER_CAPABILITIES`, so a driver whose override does not take it is never
+        handed one. A driver applies the keys it can and names the others in
+        ``DocPage.filter_ignored``; the tool answers ``filter_applied`` from that. This
+        default applies none of them and names every given key.
 
         Default (``distinct=False``, ``sorted=False``):
         ``get(DocFilter(chunkIds=[0], deleted=deleted, limit=limit + 1, offset=cursor.offset))``,
@@ -497,6 +505,7 @@ class DocumentStoreBase(ABC):
         )
         raw = self.get(flt)
         first_key = _docKey(raw[0]) if raw else None
+        ignored = filter.given() if filter is not None else ()
         if previous_first is not None and first_key == previous_first:
             return DocPage(
                 items=[],
@@ -506,6 +515,7 @@ class DocumentStoreBase(ABC):
                 distinct=False,
                 sorted=False,
                 caveats=['documents_paging_unsupported'],
+                filter_ignored=ignored,
             )
         items = [
             documentRow(doc)
@@ -524,6 +534,7 @@ class DocumentStoreBase(ABC):
             distinct=False,
             sorted=False,
             caveats=[],
+            filter_ignored=ignored,
         )
 
     def scrollChunks(self, objectId: str, *, after_chunk: int, limit: int, deleted: 'Deleted') -> ChunkPage:
