@@ -508,6 +508,7 @@ export function initialThreshold(score: IScoreInfo | null): number {
  */
 export function thresholdSentence(rows: readonly WorkbenchRow[], at: number, score: IScoreInfo | null): string {
 	const view = classifyAt(rows, at, score);
+	if (rows.length === 0) return 'Nothing to weigh against the threshold.';
 	if (view.counts.rated === 0) return 'Keyword results carry no similarity, so the threshold does not apply.';
 	const node = score !== null ? num(score.threshold) : null;
 	const atNode = node !== null && onGrid(node) === onGrid(at);

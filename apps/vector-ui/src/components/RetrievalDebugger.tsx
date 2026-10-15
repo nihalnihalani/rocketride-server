@@ -31,22 +31,28 @@
 // and the floor (src/vector/retrieval.ts), and lays them out against both
 // lines with a 100-bin histogram. The vector lives only for the two calls;
 // it is never kept in state or shown. Hidden when `embed` is not reachable.
-// Its rows go to the ExportMenu (CSV, JSON) once export is built.
+// Its rows go to the ExportMenu in the search columns (src/vector/
+// searchWorkbench.ts), and "Open in Search" hands the question and the
+// answer's cited chunks to the Search surface, where the threshold can be
+// tried at other values.
 // =============================================================================
 
 import React, { useEffect, useState } from 'react';
 import type { CSSProperties } from 'react';
 import { Banner, commonStyles } from 'shell';
-import type { IChatSource, ISearchResult, RetrievalDebuggerProps as ContractRetrievalDebuggerProps } from '../contract/types';
+import type { IChatSource, IExportItem, ISearchResult, RetrievalDebuggerProps as ContractRetrievalDebuggerProps, VectorKey } from '../contract/types';
 import { callTool, toolChannelFor } from '../chat/toolCalls';
 import { classifyRetrieval, debuggerSearchInput, embedErrorSentence, embedInput, retrievalErrorSentence } from '../vector/retrieval';
 import type { RetrievalStatus, RetrievalView } from '../vector/retrieval';
+import { retrievalExportRows } from '../vector/searchWorkbench';
 import { ExportMenu } from './ExportMenu';
 import { ScoreHistogram } from './ScoreHistogram';
 
-/** The contract props plus the answer's citations (marked in the table). */
+/** The contract props plus the answer's citations (marked in the table) and the way into Search. */
 export interface RetrievalDebuggerProps extends ContractRetrievalDebuggerProps {
 	answerSources?: readonly IChatSource[];
+	/** "Open in Search": the question and the keys the answer cited. Absent: no button. */
+	onOpenInSearch?(prefill: { question: string; cited: readonly VectorKey[] }): void;
 }
 
 /** How long each of the two calls may take. */
@@ -79,7 +85,7 @@ type Phase = { kind: 'embedding' } | { kind: 'searching' } | { kind: 'error'; me
  * @param props - {@link RetrievalDebuggerProps}.
  * @returns The debugger.
  */
-export function RetrievalDebugger({ model, channels, question, topK, onClose, answerSources }: RetrievalDebuggerProps): React.ReactElement | null {
+export function RetrievalDebugger({ model, channels, question, topK, onClose, answerSources, onOpenInSearch }: RetrievalDebuggerProps): React.ReactElement | null {
 	const [phase, setPhase] = useState<Phase>({ kind: 'embedding' });
 	const embedNode = model.nodes.embed;
 	const enabled = model.embed.enabled && embedNode !== null;
@@ -122,11 +128,20 @@ export function RetrievalDebugger({ model, channels, question, topK, onClose, an
 
 	if (!enabled) return null;
 	const range = model.connection.dialect?.score?.range ?? null;
+	const exportItems: IExportItem[] =
+		phase.kind === 'done'
+			? [{ id: 'retrieval', label: `"Why these?" rows (${phase.view.rows.length})`, kind: 'retrieval', disabled: null, rows: () => retrievalExportRows(phase.view, STATUS_WORDS) }]
+			: [{ id: 'retrieval', label: '"Why these?" rows', kind: 'retrieval', disabled: phase.kind === 'error' ? 'The search did not run' : 'Nothing to export yet' }];
 	return (
 		<section style={S.root} aria-label="Why these sources">
 			<div style={S.head}>
 				<h3 style={S.title}>Why these sources?</h3>
-				<ExportMenu items={[]} collection={model.collection} />
+				<ExportMenu items={exportItems} collection={model.collection} />
+				{onOpenInSearch && (
+					<button type="button" style={commonStyles.buttonSecondary} title="Try other thresholds, modes and questions on these results" onClick={() => onOpenInSearch({ question, cited: (answerSources ?? []).map((source) => source.key) })}>
+						Open in Search
+					</button>
+				)}
 				<button type="button" style={commonStyles.buttonSecondary} onClick={onClose}>
 					Close
 				</button>

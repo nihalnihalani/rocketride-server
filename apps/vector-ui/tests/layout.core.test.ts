@@ -6,12 +6,19 @@
 // =============================================================================
 // LAYOUT CORE: the seeded neighbour-graph force layout the worker runs
 // =============================================================================
+//
+// The last tests pin the console's own layout (src/vector/layout.ts): the
+// Search surface opens inside the chat panel, so the console's ratios stay.
+// =============================================================================
 
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { FORCE_TICKS, LAYOUT_UNIT, createForceJob, neighbourLinks, normaliseInit, runJob, seededRandom } from '../src/map/layout.core';
 import type { IForceLayoutInput, ILayoutClock } from '../src/map/layout.core';
 import { knnFromRows, loadSample, pcaXY } from './support/map.samples';
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
+import { CONSOLE_LAYOUT, consoleColumns } from '../src/vector/layout';
 
 const native = loadSample('sample_native_knn.json');
 
@@ -111,4 +118,23 @@ test('empty and single-point samples lay out without error', () => {
 	const one = runJob(createForceJob({ n: 1, init: new Float32Array([0.3, 0.1]), knn: { offsets_row: [0, 0], cols: [], sims: [] }, seed: 1 }), forever);
 	assert.equal(one.positions.length, 2);
 	assert.ok(one.positions.every((v) => Number.isFinite(v)));
+});
+
+// ── The console's layout: Search lives inside the chat's 55 % ──────────────
+
+test("the console's panel ratios are unchanged: documents 38 %, right column 62 % split 45 % ingest / 55 % chat", () => {
+	assert.deepEqual({ ...CONSOLE_LAYOUT }, { left: 0.38, right: 0.62, ingest: 0.45, chat: 0.55, stackBelowPx: 900 });
+	assert.deepEqual(consoleColumns(1440), { stacked: false, left: '38%', right: '62%', ingest: '45%', chat: '55%' });
+	assert.equal(consoleColumns(800).stacked, true);
+});
+
+test('the Search toggle swaps what the chat panel shows, not the console layout: neither panel sizes itself', () => {
+	const src = (relative: string): string => readFileSync(path.join(__dirname, '..', 'src', 'components', relative), 'utf8');
+	for (const file of ['ChatPanel.tsx', 'SearchPanel.tsx', 'QueryCompare.tsx']) {
+		const text = src(file);
+		assert.doesNotMatch(text, /vector\/layout|CONSOLE_LAYOUT|consoleColumns/, `${file} reads the console layout`);
+		assert.doesNotMatch(text, /\b(width|minWidth|maxWidth|flexBasis)\s*:\s*['"]?(?!100%)\d+(\.\d+)?(%|vw)/, `${file} sets its own share of the console`);
+	}
+	// The search body sits in the chat panel's own flex column, in the space the thread uses.
+	assert.match(src('ChatPanel.tsx'), /<div hidden=\{!searching\} data-surface="search" style=\{S\.surface\}>/);
 });

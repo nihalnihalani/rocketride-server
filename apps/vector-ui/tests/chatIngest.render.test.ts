@@ -38,9 +38,12 @@ import Module from 'node:module';
 import React from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import type { IExplorerEndpoint, IRoleChannel } from 'shared/explorer';
-import type { ConsoleActions, ConsoleModel, IChatSource, IDialectResult, VectorChannels } from '../src/contract/types';
+import type { ConsoleActions, ConsoleModel, IChatSource, IDialectResult, IScopeState, ISearchResult, VectorChannels, VectorKey } from '../src/contract/types';
 import { createSelectionStore } from '../src/contract/bridge';
 import type { UploadRow } from '../src/vector/uploads';
+import { QUERY_NEEDS_EMBED } from '../src/map/wording';
+import { classifyAt, runWorkbench, sliderRange } from '../src/vector/searchWorkbench';
+import type { WorkbenchDeps, WorkbenchRun } from '../src/vector/searchWorkbench';
 
 /** Most a test here may take: they await fakes, so a regression must fail, not hang the run. */
 const TEST_TIMEOUT_MS = 10_000;
@@ -77,6 +80,8 @@ const { ChatPanel, NO_CHAT_SENTENCE } = require('../src/components/ChatPanel') a
 const { SourcesPanel } = require('../src/components/SourcesPanel') as typeof import('../src/components/SourcesPanel');
 const { RetrievalDebugger } = require('../src/components/RetrievalDebugger') as typeof import('../src/components/RetrievalDebugger');
 const { ScoreHistogram } = require('../src/components/ScoreHistogram') as typeof import('../src/components/ScoreHistogram');
+const { SearchPanel, SearchResults, SHOWING_SEARCH } = require('../src/components/SearchPanel') as typeof import('../src/components/SearchPanel');
+const { QueryCompare } = require('../src/components/QueryCompare') as typeof import('../src/components/QueryCompare');
 const { UploadList } = require('../src/components/UploadList') as typeof import('../src/components/UploadList');
 const { IngestDropZone } = require('../src/components/IngestDropZone') as typeof import('../src/components/IngestDropZone');
 const { ReplaceConfirmDialog } = require('../src/ingest/ReplaceConfirmDialog') as typeof import('../src/ingest/ReplaceConfirmDialog');
@@ -314,4 +319,221 @@ test('ScoreHistogram: bars for the non-empty bins, the threshold and floor lines
 	assert.match(html, /data-line="threshold"/);
 	assert.match(html, /data-line="floor"/);
 	assert.match(html, /role="img" aria-label="Scores of 4 results from -1\.00 to 1\.00; threshold 0\.30, floor 0\.20\."/);
+});
+
+// ── Search (without the LLM) ────────────────────────────────────────────────
+
+const enriched = fixture<IDialectResult>('dialect_enriched.json');
+const embedOk = fixture<Record<string, unknown>>('embed_ok.json');
+
+/**
+ * A console model over another dialect.
+ *
+ * @param d - The dialect.
+ * @param overrides - Fields to replace.
+ * @returns The model.
+ */
+function modelOn(d: IDialectResult, overrides: Partial<ConsoleModel> = {}): ConsoleModel {
+	const base = model();
+	return model({ connection: { ...base.connection, dialect: d }, limits: d.limits, capabilities: d.capabilities, ...overrides });
+}
+
+/**
+ * Deps whose calls answer from queues (render tests run the pure workbench, never the panel's effects).
+ *
+ * @param answers - Answers per tool.
+ * @returns The deps.
+ */
+function answering(answers: Record<string, Array<Record<string, unknown>>>): WorkbenchDeps {
+	return {
+		call: async (tool) => {
+			const value = answers[tool]?.shift();
+			return value === undefined ? { ok: false, code: null, message: 'none', kind: null, error: null } : { ok: true, value };
+		},
+	};
+}
+
+/**
+ * A finished run of `question` over a search answer.
+ *
+ * @param question - The question.
+ * @param mode - The mode.
+ * @param search - The search answers, in call order.
+ * @returns The run.
+ */
+async function finishedRun(question: string, mode: 'semantic' | 'keyword' | 'hybrid', search: ISearchResult[]): Promise<WorkbenchRun> {
+	const deps = answering({ embed: [embedOk], search: search.map((s) => s as unknown as Record<string, unknown>) });
+	const outcome = await runWorkbench(deps, { question, mode, topK: 50, limits: dialect.limits, storeNode: 'store_1', embedNode: 'embed_1', objectIds: null, cited: [['ef35cb9c-f98f-e472-d795-298a40a5cb2b', 67]] });
+	assert.ok(outcome.ok);
+	return outcome.run;
+}
+
+/**
+ * Twenty rows: 7 at or above 0.42, 11 at or above the node's 0.30, 3 under the floor 0.20.
+ *
+ * @returns The answer.
+ */
+function twentyRows(): ISearchResult {
+	const scores = [0.62, 0.58, 0.55, 0.51, 0.48, 0.45, 0.43, 0.4, 0.38, 0.36, 0.33, 0.295, 0.29, 0.27, 0.25, 0.22, 0.21, 0.19, 0.15, 0.12];
+	return { success: true, total: 20, mode_used: 'semantic', warnings: [], results: scores.map((score, i) => ({ content: `chunk ${i} about <b>water</b>`, score, metadata: { objectId: `doc${i}`, chunkId: i, parent: `C:/demo/doc${i}.md` }, rank: i + 1, raw_score: score, sim: score, below_threshold: score < 0.3, below_floor: score < 0.2 })) };
+}
+
+/** No-op handlers of SearchResults. */
+const resultHandlers = { onThreshold: () => undefined, onCopySetting: () => undefined, copied: null, onOpen: () => undefined, onMap: () => undefined, onAsk: () => undefined, canAsk: true };
+
+test('SearchPanel: the question box, the four modes, top k, the keyword caption and Compare; Run waits for a question', () => {
+	const html = render(h(SearchPanel, { model: modelOn(enriched), channels, selection: createSelectionStore('render-1'), actions }));
+	assert.match(html, /<section[^>]*aria-label="Search"[^>]*data-component="SearchPanel"/);
+	assert.doesNotMatch(html.slice(0, html.indexOf('>') + 1), /data-placeholder/);
+	assert.match(html, /<input type="search"[^>]*aria-label="Search question"/);
+	for (const label of ['Semantic', 'Keyword', 'Hybrid', 'Auto']) assert.match(html, new RegExp(`<input type="radio"[^>]*value="${label.toLowerCase()}"[^>]*/>${label}</label>`));
+	assert.match(html, /<input type="radio"[^>]*checked=""[^>]*value="semantic"/);
+	assert.match(html, /Keyword search matches text fragments on this store/);
+	assert.match(html, /<select[^>]*aria-label="Results to show \(top k\)"/);
+	assert.deepEqual(
+		[...html.matchAll(/<option value="(\d+)"/g)].map((m) => Number(m[1])),
+		[5, 10, 25, 50]
+	);
+	assert.match(html, /<option value="10" selected="">/);
+	assert.match(html, /<button type="button"[^>]*aria-pressed="false"[^>]*>Compare<\/button>/);
+	assert.match(html, /<button type="submit"[^>]*disabled=""[^>]*>Run<\/button>/);
+	assert.match(html, /data-component="ExportMenu"/);
+});
+
+test('SearchPanel: a store without keyword search (Pinecone) disables Keyword and Hybrid with the sentence', () => {
+	const pinecone = { ...enriched, keyword_match: null, capabilities: { ...enriched.capabilities, search_keyword: false } };
+	const html = render(h(SearchPanel, { model: modelOn(pinecone), channels, selection: createSelectionStore('render-1'), actions }));
+	assert.match(html, /<input type="radio"[^>]*disabled=""[^>]*value="keyword"/);
+	assert.match(html, /<input type="radio"[^>]*disabled=""[^>]*value="hybrid"/);
+	assert.match(html, /Keyword: This store cannot search by keyword/);
+	assert.doesNotMatch(html, /Keyword search matches/);
+});
+
+test('SearchPanel: without the embedding node only Keyword is offered, and it is chosen', () => {
+	const html = render(h(SearchPanel, { model: modelOn(enriched, { embed: { enabled: false, reason: null }, nodes: { store: 'store_1', embed: null, llm: null, llmName: null } }), channels, selection: createSelectionStore('render-1'), actions }));
+	for (const mode of ['semantic', 'hybrid', 'auto']) assert.match(html, new RegExp(`<input type="radio"[^>]*disabled=""[^>]*value="${mode}"`));
+	assert.match(html, /<input type="radio"[^>]*checked=""[^>]*value="keyword"/);
+	assert.ok(html.includes(`Semantic, Hybrid, Auto: ${QUERY_NEEDS_EMBED}`));
+});
+
+test('SearchPanel: a scope above the cap turns Run off with its sentence; a scope within it is named', () => {
+	const over: IScopeState = { filter: {}, label: 'folder is under C:/demo/', objectIds: null, overflow: 2340, applyTo: { documents: true, map: true, search: true, chat: true } };
+	const big = render(h(SearchPanel, { model: modelOn(enriched, { scope: over }), channels, selection: createSelectionStore('render-1'), actions }));
+	assert.match(big, /Scope too large for the map, search and chat \(2,340 documents; at most 2,000\)\. Narrow the folder\./);
+	assert.match(big, /<button type="submit"[^>]*disabled=""[^>]*>Run<\/button>/);
+	const within = render(h(SearchPanel, { model: modelOn(enriched, { scope: { ...over, objectIds: ['a', 'b'], overflow: null } }), channels, selection: createSelectionStore('render-1'), actions }));
+	assert.match(within, /Searching 2 documents in scope: folder is under C:\/demo\//);
+});
+
+test('SearchPanel: "Open in Search" fills the question and says the cited chunks are marked', () => {
+	const cited: VectorKey[] = [
+		['a', 0],
+		['b', 1],
+		['c', 2],
+	];
+	const html = render(h(SearchPanel, { model: modelOn(enriched), channels, selection: createSelectionStore('render-1'), actions, prefill: { question: 'Where does Falcon Station get its water?', cited } }));
+	assert.match(html, /<input type="search"[^>]*value="Where does Falcon Station get its water\?"/);
+	assert.match(html, /From the chat: the 3 chunks its answer cited are marked “cited”\./);
+	assert.match(html, /<button type="submit"(?![^>]*disabled)[^>]*>Run<\/button>/);
+});
+
+test("SearchResults: the slider over the store's range, its count beside the node setting, the histogram, and a table whose 'passes' rows match the count", async () => {
+	const run = await finishedRun('water', 'semantic', [twentyRows()]);
+	const range = sliderRange(dialect.score);
+	for (const at of [-1, 0.1, 0.3, 0.42, 0.6, 1]) {
+		const view = classifyAt(run.rows, at, dialect.score);
+		const html = render(h(SearchResults, { run, view, score: dialect.score, range, ...resultHandlers }));
+		const shown = Number(/At [-\d.]+: (\d+) of 20/.exec(html)?.[1]);
+		assert.equal(shown, (html.match(/<tr[^>]*data-status="used"/g) ?? []).length, `at ${at}`);
+		assert.match(html, new RegExp(`<input type="range"[^>]*aria-label="Threshold"[^>]*min="-1"[^>]*max="1"[^>]*step="0.01"[^>]*aria-valuetext="${at.toFixed(2)}: ${shown} of 20 pass"[^>]*value="${at}"`));
+	}
+	const html = render(h(SearchResults, { run, view: classifyAt(run.rows, 0.42, dialect.score), score: dialect.score, range, ...resultHandlers }));
+	assert.match(html, /<output[^>]*role="status"[^>]*>At 0\.42: 7 of 20 would pass \(today&#x27;s node setting 0\.30 passes 11\)<\/output>/);
+	assert.match(html, />Copy as node setting</);
+	assert.match(html, /Set this on the store node in the pipeline editor; this console cannot change node settings\./);
+	assert.match(html, /data-line="threshold"/);
+	assert.match(html, /data-line="setting"/);
+	assert.match(html, /<caption[^>]*>Semantic search: 20 results/);
+	assert.match(html, /title="Score 0\.62 \(1 - cosine_distance\)"/);
+	assert.match(html, /chunk 0 about &lt;b&gt;water&lt;\/b&gt;/, 'chunk text is text, not markup');
+	assert.match(html, /aria-label="Open C:\/demo\/doc0\.md at chunk 0"/);
+	assert.match(html, /aria-label="Show chunk 0 of C:\/demo\/doc0\.md on the map"/);
+	assert.match(html, /aria-label="Ask about C:\/demo\/doc0\.md"/);
+	assert.match(html, /near miss: below the threshold/);
+	assert.match(html, /below the floor \(the store drops it\)/);
+});
+
+test('SearchResults: keyword rows have no slider; hybrid says it was fused here; the cited mark; warnings', async () => {
+	const keyword = await finishedRun('KX4471', 'keyword', [fixture<ISearchResult>('search_keyword_fallback_warning.json')]);
+	const kw = render(h(SearchResults, { run: keyword, view: classifyAt(keyword.rows, 0.3, dialect.score), score: dialect.score, range: sliderRange(dialect.score), ...resultHandlers }));
+	assert.doesNotMatch(kw, /type="range"/);
+	assert.match(kw, /Keyword results carry no similarity, so the threshold does not apply\./);
+	assert.match(kw, /keyword match \(no similarity\)/);
+	assert.match(kw, /<caption[^>]*>Keyword search: 3 results/);
+	const hybrid = await finishedRun('water', 'hybrid', [fixture<ISearchResult>('search_vector.json'), fixture<ISearchResult>('search_keyword_fallback_warning.json')]);
+	const hy = render(h(SearchResults, { run: hybrid, view: classifyAt(hybrid.rows, 0.3, dialect.score), score: dialect.score, range: sliderRange(dialect.score), ...resultHandlers }));
+	assert.match(hy, /<caption[^>]*>Hybrid search: 8 results, hybrid \(fused here\) by reciprocal rank fusion \(k = 60\)/);
+	assert.match(hy, /semantic #1 · keyword #1/);
+	assert.match(hy, /#67 · cited/);
+	const mismatch = await finishedRun('water', 'semantic', [fixture<ISearchResult>('search_model_mismatch_warning.json')]);
+	assert.match(render(h(SearchResults, { run: mismatch, view: classifyAt(mismatch.rows, 0.3, dialect.score), score: dialect.score, range: sliderRange(dialect.score), ...resultHandlers })), /data-banner="warning">The chat embedding model differs/);
+	const fallback = await finishedRun('water', 'semantic', [fixture<ISearchResult>('search_keyword_fallback_warning.json')]);
+	assert.match(render(h(SearchResults, { run: fallback, view: classifyAt(fallback.rows, 0.3, dialect.score), score: dialect.score, range: sliderRange(dialect.score), ...resultHandlers })), /The store fell back to a keyword search, so these scores are not similarities\./);
+	const empty = await finishedRun('nothing', 'semantic', [{ success: true, results: [], total: 0, warnings: [], mode_used: 'semantic' }]);
+	const none = render(h(SearchResults, { run: empty, view: classifyAt(empty.rows, 0.3, dialect.score), score: dialect.score, range: sliderRange(dialect.score), ...resultHandlers }));
+	assert.match(none, /No chunks matched “nothing”\./);
+	assert.doesNotMatch(none, /type="range"|Keyword results carry no similarity/, 'an empty semantic run has no slider and is no keyword run');
+});
+
+test('QueryCompare: A and B side by side, the shared count and the Jaccard index, and both stars on the map', async () => {
+	const a = await finishedRun('water', 'semantic', [fixture<ISearchResult>('search_vector.json')]);
+	const vector = fixture<ISearchResult>('search_vector.json');
+	const b = await finishedRun('kestrel survey', 'semantic', [{ ...vector, results: vector.results.slice(2) }]);
+	const html = render(h(QueryCompare, { a: { run: a, view: classifyAt(a.rows, 0.3, dialect.score) }, b: { run: b, view: classifyAt(b.rows, 0.3, dialect.score) }, score: dialect.score, onShowBoth: () => undefined, onOpen: () => undefined }));
+	assert.match(html, /<p[^>]*role="status"[^>]*data-compare-summary=""[^>]*>A and B share 6 of 8 results \(Jaccard 0\.75\); 1 document only in A, 0 only in B<\/p>/, 'ops_005 is only in A; ops_021 is in B through another chunk');
+	assert.match(html, /aria-label="A: water"/);
+	assert.match(html, /aria-label="B: kestrel survey"/);
+	assert.match(html, /A ★/);
+	assert.match(html, /B ☆/);
+	assert.match(html, />Show A ★ and B ☆ on the map</);
+	assert.equal((html.match(/data-side="only-a"/g) ?? []).length, 2);
+	assert.equal((html.match(/data-side="both"/g) ?? []).length, 12);
+});
+
+test('ChatPanel: Search on swaps the body in the same space; the chat (thread and draft) stays mounted, hidden, and comes back', async () => {
+	forgetChatAndIngest();
+	const session = chatSessionFor('render-1', { ask: async () => chatAnswer, makeQuestion: (text) => ({ text }), now: () => 0, announce: () => undefined });
+	await session.send('Where does Falcon Station get its drinking water?', null);
+	const props = { model: model(), channels, selection: createSelectionStore('render-1'), actions, scope: null, onClearScope: () => undefined };
+	const off = render(h(ChatPanel, props));
+	const on = render(h(ChatPanel, { ...props, initialSearch: true }));
+	assert.match(on, /<button[^>]*aria-pressed="true"[^>]*>Search<\/button>/);
+	assert.ok(on.includes(SHOWING_SEARCH));
+	assert.equal(SHOWING_SEARCH, 'Showing Search; the chat is one click away');
+	assert.doesNotMatch(off, /Showing Search/);
+	// The search body is shown; the chat body is hidden but still rendered (thread, composer).
+	assert.match(on, /<div data-surface="search"[^>]*><section[^>]*data-component="SearchPanel"/);
+	assert.doesNotMatch(on, /<div data-surface="search" hidden=""/);
+	assert.match(on, /<div data-surface="chat" style="display:none">/);
+	assert.match(on, /aria-label="Ask about these documents"/);
+	assert.match(on, /Where does Falcon Station get its drinking water\?/);
+	// Same tree in both states: only the two wrappers change, so React keeps the composer's draft and the thread.
+	const chatBody = (html: string): string => html.slice(html.indexOf('<div data-surface="chat"')).replace(/^<div data-surface="chat"[^>]*>/, '');
+	assert.equal(chatBody(on), chatBody(off));
+	forgetChatAndIngest();
+});
+
+test('RetrievalDebugger: "Open in Search" when the chat offers it', () => {
+	const sources: IChatSource[] = parseChatResult(chatAnswer).sources;
+	const withSearch = render(h(RetrievalDebugger, { model: model(), channels, question: 'q', topK: 3, onClose: () => undefined, answerSources: sources, onOpenInSearch: () => undefined }));
+	assert.match(withSearch, /<button[^>]*>Open in Search<\/button>/);
+	const without = render(h(RetrievalDebugger, { model: model(), channels, question: 'q', topK: 3, onClose: () => undefined }));
+	assert.doesNotMatch(without, /Open in Search/);
+});
+
+test("ScoreHistogram: the store node's setting as a second line when the slider moved away from it", () => {
+	const html = render(h(ScoreHistogram, { scores: [0.5433, 0.5247, 0.19, 0.09], range: [-1, 1], threshold: 0.42, floor: 0.2, setting: 0.3 }));
+	assert.match(html, /data-line="setting"/);
+	assert.match(html, /aria-label="Scores of 4 results from -1\.00 to 1\.00; threshold 0\.42, floor 0\.20, node setting 0\.30\."/);
+	assert.doesNotMatch(render(h(ScoreHistogram, { scores: [0.5], range: [-1, 1], threshold: 0.3, floor: 0.2, setting: 0.3 })), /data-line="setting"/);
 });

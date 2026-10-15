@@ -362,6 +362,7 @@ test("thresholdSentence: the count at the slider beside today's node setting", (
 	assert.equal(thresholdSentence(rows, 0.3, dialect.score), "At 0.30: 11 of 20 pass (today's node setting)");
 	assert.equal(thresholdSentence(rows, 0.42, { ...dialect.score, threshold: null }), 'At 0.42: 7 of 20 would pass (the store node has no threshold set)');
 	assert.equal(thresholdSentence(rowsFromSearch(keywordFallback, false, []), 0.42, dialect.score), 'Keyword results carry no similarity, so the threshold does not apply.');
+	assert.equal(thresholdSentence([], 0.42, dialect.score), 'Nothing to weigh against the threshold.');
 	assert.equal(sliderValueText(classifyAt(rows, 0.42, dialect.score)), '0.42: 7 of 20 pass');
 });
 
@@ -628,11 +629,20 @@ function code(relative: string): string {
 		.replace(/(^|[^:'"`])\/\/.*$/gm, '$1');
 }
 
-test('wiring: the workbench is pure: it calls nothing on its own and keeps nothing in browser storage', () => {
+test('wiring: the workbench is pure, the panel calls embed and search through chat/toolCalls only, and never holds a vector in state', () => {
 	const workbench = code(path.join('vector', 'searchWorkbench.ts'));
 	for (const line of workbench.split('\n').filter((l) => /^import /.test(l))) {
 		if (/^import type /.test(line)) continue;
 		assert.doesNotMatch(line, /chat\/toolCalls|map\/calls|adapters\/|from 'shell'|from 'react'/, line);
 	}
 	assert.doesNotMatch(workbench, /localStorage|sessionStorage|indexedDB/);
+	const panel = code(path.join('components', 'SearchPanel.tsx'));
+	assert.match(panel, /import \{ callTool, toolChannelFor \} from '\.\.\/chat\/toolCalls';/);
+	assert.doesNotMatch(panel, /\.invoke\(/, 'no call around chat/toolCalls');
+	assert.doesNotMatch(panel, /useState<[^>]*number\[\]/);
+	assert.doesNotMatch(panel, /useRef<[^>]*number\[\]/);
+	assert.doesNotMatch(panel, /localStorage|sessionStorage|indexedDB|console\.(log|info|debug|warn|error)/);
+	const phase = /type Phase = [^;]*;/.exec(panel)?.[0] ?? '';
+	assert.ok(phase !== '', 'the panel declares its Phase');
+	assert.doesNotMatch(phase, /vector|number\[\]/);
 });
