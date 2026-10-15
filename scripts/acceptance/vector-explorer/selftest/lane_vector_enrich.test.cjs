@@ -765,3 +765,58 @@ for (const [owner, file, marker, patterns] of SOURCES) {
 		for (const p of patterns) assert.ok(text.includes(p), `${file} has no ${JSON.stringify(p)}`);
 	});
 }
+
+// ---------------------------------------------------------------------------
+// The perf lane's edge rows (lane_vector_perf.cjs; the app's map.perflane.test.ts pins the same gates)
+// ---------------------------------------------------------------------------
+
+test('perf lane: each edge mode is its own gate at 2,000 detailed points and 4x, measured with the slow-frame switch off', () => {
+	const perf = require('../browser/lane_vector_perf.cjs');
+	assert.deepStrictEqual(perf.EDGE_MODES, ['none', 'tree', 'neighbours:3', 'neighbours:5']);
+	assert.deepStrictEqual(perf.PERF_LANE_FLAGS, { edgesAutoDegrade: false });
+	assert.deepStrictEqual(perf.edgeModeOf('edges:neighbours:5'), { edges: 'neighbours', m: 5 });
+	assert.deepStrictEqual(perf.edgeModeOf('tree'), { edges: 'tree', m: null });
+	assert.strictEqual(perf.edgeLimit('tree', 2000), 1999);
+	assert.strictEqual(perf.edgeLimit('neighbours:3', 2000), 6000);
+	assert.strictEqual(perf.edgeLimit('none', 2000), 0);
+	const frames = (count, ms) => Array.from({ length: count }, () => ms);
+	const base = { n: 2000, mode: 'detailed', cpuThrottle: 4, renderer: 'webgl', panFrameMs: perf.summarise(frames(80, 18)), panWork: { draws: 74, cameraBefore: '2d:0,0,40', cameraAfter: '2d:3,1,40' }, privacy: { frames: 120, dimension: 384, embedAnswers: 0, vectorRequests: 0, violations: [] } };
+	const drawn = { none: 0, tree: 1999, 'neighbours:3': 5400, 'neighbours:5': 8800 };
+	const row = (mode, extra = {}) => ({ ...base, edges: `edges:${mode}`, edgesAutoDegrade: false, edgesDegraded: false, edgesDrawn: drawn[mode], ...(mode.startsWith('neighbours') ? { edgesPerPoint: Number(mode.split(':')[1]) } : {}), ...extra });
+	const gate = (rows, mode) => perf.evaluateGates(rows).find((g) => g.name.startsWith(`GATE edges:${mode} `));
+	const all = [{ ...base, edgeModes: perf.EDGE_MODES }, ...perf.EDGE_MODES.map((m) => row(m))];
+	for (const mode of perf.EDGE_MODES) assert.strictEqual(gate(all, mode).status, 'PASS', `${mode}: ${gate(all, mode).detail}`);
+	const broken = {
+		'switch on': { edgesAutoDegrade: true },
+		'switch unrecorded': { edgesAutoDegrade: undefined },
+		degraded: { edgesDegraded: true },
+		'edges unread': { edgesDrawn: null },
+		'too slow': { panFrameMs: perf.summarise([...frames(60, 20), ...frames(20, 60)]) },
+		'nothing drawn by the pan': { panWork: { draws: 2, cameraBefore: '2d:0,0,40', cameraAfter: '2d:3,1,40' } },
+		errored: { error: 'the edge layer never drew' },
+	};
+	for (const mode of perf.EDGE_MODES) {
+		for (const [what, extra] of Object.entries(broken)) {
+			const rows = [{ ...base, edgeModes: perf.EDGE_MODES }, ...perf.EDGE_MODES.map((m) => (m === mode ? row(m, extra) : row(m)))];
+			assert.strictEqual(gate(rows, mode).status, 'FAIL', `${mode} ${what}`);
+		}
+	}
+	// Mode-specific: edges at None, none in a drawing mode, more than the mode allows, fewer per point than asked.
+	assert.strictEqual(perf.edgeRowProblem(row('none', { edgesDrawn: 3 }), 'none') !== null, true);
+	assert.strictEqual(perf.edgeRowProblem(row('tree', { edgesDrawn: 0 }), 'tree') !== null, true);
+	assert.strictEqual(perf.edgeRowProblem(row('tree', { edgesDrawn: 2000 }), 'tree') !== null, true);
+	assert.strictEqual(perf.edgeRowProblem(row('neighbours:5', { edgesPerPoint: 3 }), 'neighbours:5') !== null, true);
+	assert.strictEqual(perf.edgeRowProblem(row('neighbours:5', { edgesPerPoint: null }), 'neighbours:5') !== null, true);
+	// A run whose points row was due to carry edge rows but has none reports every edge gate as not measured.
+	const missing = perf.evaluateGates([{ ...base, edgeModes: perf.EDGE_MODES }]).filter((g) => g.name.startsWith('GATE edges:'));
+	assert.deepStrictEqual(
+		missing.map((g) => [g.status, g.detail]),
+		perf.EDGE_MODES.map(() => ['FAIL', 'not measured'])
+	);
+	// The 1x rows are measured, not gated; the points gate stays the row without edges.
+	const at1 = perf.evaluateGates([...all, ...perf.EDGE_MODES.map((m) => row(m, { cpuThrottle: 1, edgesAutoDegrade: true }))]);
+	assert.ok(at1.filter((g) => g.name.startsWith('GATE edges:')).every((g) => g.status === 'PASS'));
+	assert.match(at1[0].name, /^GATE 2,000 detailed points at 4x/);
+	// Each edge row carries its own privacy row, named with its mode.
+	assert.ok(at1.some((g) => /^privacy \(B4\).*edges:tree at 4x/.test(g.name)));
+});
