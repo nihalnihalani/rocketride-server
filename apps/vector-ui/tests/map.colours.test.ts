@@ -11,7 +11,8 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { test } from 'node:test';
-import { TOP_CATEGORIES, categoryOf, colourPoints } from '../src/map/colours';
+import type { IDocumentItem, ISampleResult } from '../src/contract/types';
+import { COLOUR_MODES, DOCUMENT_ROWS_NONE, TABLE_UNSUPPORTED, TOP_CATEGORIES, categoryOf, colourModeReason, colourPoints, documentHealth } from '../src/map/colours';
 import { contrastRatio, parseColor } from '../src/map/contrast';
 import { MIN_GRAPHIC_CONTRAST, readPalette } from '../src/map/tokens';
 import type { IMapPalette } from '../src/map/tokens';
@@ -97,4 +98,87 @@ test('hidden points keep their slot but are left out of the legend counts', () =
 	assert.equal(out.colours.length, demo.n);
 	assert.equal(out.legend.reduce((s, e) => s + e.count, 0), demo.n - 70);
 	assert.ok(!out.legend.some((e) => e.label === 'ops_005.pdf'));
+});
+
+// -----------------------------------------------------------------------------
+// Colour by document details (the console's directory rows) and table chunks
+// -----------------------------------------------------------------------------
+
+const clustered = JSON.parse(fs.readFileSync(path.resolve(__dirname, 'fixtures', 'provisional', 'sample_demo_1000_clusters.json'), 'utf8')) as ISampleResult;
+
+/** Directory rows for the sample's documents (every other one loaded unless `all`). */
+function rowsFor(sample: ISampleResult, fill: (doc: ISampleResult['docs'][number], d: number) => Partial<IDocumentItem>, all = true): Map<string, IDocumentItem> {
+	const rows = new Map<string, IDocumentItem>();
+	sample.docs.forEach((doc, d) => {
+		if (!all && d % 2 === 1) return;
+		rows.set(doc.objectId, { objectId: doc.objectId, path: doc.path, chunks: doc.chunks, has_first_chunk: true, tables: 0, deleted: false, nodeId: 'parse_1', size: 1000, modifyTime: null, ingestedAt: '2026-10-01T09:00:00Z', pointId: null, ...fill(doc, d) });
+	});
+	return rows;
+}
+
+/** Visible points per legend row add up to the sample. */
+const total = (legend: Array<{ count: number }>): number => legend.reduce((s, e) => s + e.count, 0);
+
+test('colour by ingest date: a ramp from the oldest to the newest ingest day of the loaded documents', () => {
+	const rows = rowsFor(demo, (_doc, d) => ({ ingestedAt: d % 3 === 0 ? '2026-10-01T09:00:00Z' : '2026-10-02T17:30:00Z' }));
+	const out = colourPoints(demo, 'ingest-date', theme('dark'), { docRows: rows });
+	assert.equal(out.note, null);
+	assert.equal(out.ramp?.low, 'oldest (2026-10-01)');
+	assert.equal(out.ramp?.high, 'newest (2026-10-02)');
+	const first = demo.points.doc.findIndex((d) => d % 3 === 0);
+	const later = demo.points.doc.findIndex((d) => d % 3 !== 0);
+	assert.equal(out.colours[first], out.ramp?.stops[0]);
+	assert.equal(out.colours[later], out.ramp?.stops.at(-1));
+	// Points whose document the directory has not loaded keep the neutral colour and are counted so.
+	const half = colourPoints(demo, 'ingest-date', theme('dark'), { docRows: rowsFor(demo, () => ({}), false) });
+	const notLoaded = half.legend.find((e) => e.key === 'not-loaded');
+	assert.ok(notLoaded && notLoaded.count > 0);
+	assert.equal(notLoaded.count, demo.points.doc.filter((d) => d % 2 === 1).length);
+});
+
+test('colour by file size: a log ramp named by the smallest and largest sizes', () => {
+	const rows = rowsFor(demo, (_doc, d) => ({ size: 1024 * (d + 1) }));
+	const out = colourPoints(demo, 'file-size', theme('light'), { docRows: rows });
+	assert.equal(out.ramp?.low, 'smallest (1 KB)');
+	assert.equal(out.ramp?.high, `largest (${demo.docs.length} KB)`);
+});
+
+test('colour by health: the first flag of each document from its directory row, coloured by a fixed slot', () => {
+	const rows = rowsFor(demo, (doc, d) => (d === 0 ? { has_first_chunk: false } : d === 1 ? { max_chunk_id: (doc.chunks ?? 1) + 2 } : d === 2 ? { deleted_chunks: 1, max_chunk_id: (doc.chunks ?? 1) - 1 } : { max_chunk_id: (doc.chunks ?? 1) - 1, deleted_chunks: 0 }));
+	const out = colourPoints(demo, 'health', theme('rocketride'), { docRows: rows });
+	const labels = out.legend.map((e) => e.label);
+	for (const label of ['No first chunk', 'Gaps in chunk numbers', 'Has deleted chunks', 'Nothing to report']) assert.ok(labels.includes(label), `${label} in ${labels.join(', ')}`);
+	assert.equal(total(out.legend), demo.n);
+	assert.equal(out.legend.find((e) => e.label === 'No first chunk')?.count, demo.points.doc.filter((d) => d === 0).length);
+	assert.equal(documentHealth({ ...[...rows.values()][3]!, chunks: 0 }, 10), 'empty');
+	assert.equal(documentHealth({ ...[...rows.values()][3]!, chunks: 500, max_chunk_id: 499 }, 10), 'oversize');
+	assert.equal(documentHealth({ ...[...rows.values()][3]!, chunks: 500, max_chunk_id: 499 }, null), 'healthy', 'no median, no oversize');
+	assert.equal(documentHealth({ ...[...rows.values()][3]!, chunks: 500, max_chunk_id: null }, null), 'healthy', 'a store that does not report max_chunk_id has no gaps flag');
+});
+
+test('colour by ingest node and by table chunks', () => {
+	const rows = rowsFor(demo, (_doc, d) => ({ nodeId: d < 10 ? 'parse_1' : 'ocr_2' }));
+	const byNode = colourPoints(demo, 'ingest-node', theme('gray'), { docRows: rows });
+	assert.deepEqual(byNode.legend.map((e) => e.label).sort(), ['ocr_2', 'parse_1']);
+	assert.equal(total(byNode.legend), demo.n);
+	const table = colourPoints(clustered, 'table', theme('gray'));
+	const tables = (clustered.points.table ?? []).filter((t) => t === 1).length;
+	assert.equal(table.legend.find((e) => e.key === 'table')?.count, tables);
+	assert.equal(table.legend.find((e) => e.key === 'text')?.count, clustered.n - tables);
+});
+
+test('a document-detail mode without its data, or table chunks on an older node, is disabled with the reason', () => {
+	assert.equal(colourModeReason('ingest-date', { sample: demo }), DOCUMENT_ROWS_NONE);
+	assert.equal(colourModeReason('health', { sample: demo, docRows: new Map() }), DOCUMENT_ROWS_NONE);
+	assert.equal(colourModeReason('ingest-date', { sample: demo, docRows: rowsFor(demo, () => ({ ingestedAt: null })) }), 'This store does not keep ingest times.');
+	assert.equal(colourModeReason('file-size', { sample: demo, docRows: rowsFor(demo, () => ({ size: null })) }), 'This store does not report file sizes.');
+	assert.equal(colourModeReason('ingest-node', { sample: demo, docRows: rowsFor(demo, () => ({ nodeId: null })) }), 'This store does not record which node added a document.');
+	assert.equal(colourModeReason('ingest-date', { sample: demo, docRows: rowsFor(demo, () => ({})) }), null);
+	assert.equal(colourModeReason('table', { sample: demo }), TABLE_UNSUPPORTED);
+	assert.equal(colourModeReason('table', { sample: clustered }), null);
+	for (const mode of ['document', 'folder', 'type', 'chunk-position', 'query-similarity', 'density'] as const) assert.equal(colourModeReason(mode, { sample: demo }), null, mode);
+	// Every mode is offered, grouped as the toolbar shows them.
+	assert.deepEqual([...new Set(COLOUR_MODES.map((m) => m.group))], ['Content', 'Document', 'Analysis']);
+	assert.equal(COLOUR_MODES.length, 12);
+	assert.equal(colourPoints(demo, 'ingest-date', theme('dark'), {}).note, DOCUMENT_ROWS_NONE);
 });

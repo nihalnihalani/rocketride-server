@@ -176,3 +176,34 @@ export function mapFailure(code: string | undefined, fallback: string): string {
 export function pointAnnouncement(index: number, total: number, path: string, chunk: number): string {
 	return `Point ${num(index + 1)} of ${num(total)}: ${path}, chunk ${num(chunk)}`;
 }
+
+// -----------------------------------------------------------------------------
+// Clusters, edges, isolation and colour modes
+// -----------------------------------------------------------------------------
+
+/** A node that does not compute clusters (no `sample.clusters`, capability `clusters` off). */
+export const CLUSTERS_UNSUPPORTED = 'This store node does not compute clusters; update the node.';
+
+/** A node that computes clusters, on a sample drawn without them. */
+export const CLUSTERS_NOT_IN_SAMPLE = 'This sample was drawn without clusters; draw a new sample to compute them.';
+
+/**
+ * No group reaches the minimum size.
+ *
+ * @param minSize - The minimum size applied.
+ * @returns The sentence.
+ */
+export function clustersNone(minSize: number): string {
+	return `No groups of ${num(minSize)} or more at this similarity; the sample is evenly spread.`;
+}
+
+/**
+ * The announcement when the map is coloured by cluster.
+ *
+ * @param count - Groups shown.
+ * @param noise - Points in none.
+ * @returns E.g. "Coloured by cluster: 7 clusters, 38 unassigned points."
+ */
+export function clusterAnnouncement(count: number, noise: number): string {
+	return `Coloured by cluster: ${num(count)} ${count === 1 ? 'cluster' : 'clusters'}, ${num(noise)} unassigned ${noise === 1 ? 'point' : 'points'}.`;
+}
