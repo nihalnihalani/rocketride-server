@@ -8,7 +8,10 @@ not a database client of its own. Every call travels through a store node
 inside one of your running pipelines, so it reaches exactly the collection that
 node is configured for, with that node's settings. If apps are new to you, read
 [Apps](https://github.com/rocketride-org/rocketride-server/blob/develop/docs/public/product/concepts/apps.md)
-first. What the app deliberately does not do is under [Limits](#limits).
+first. What the app deliberately does not do is under [Limits](#limits). The
+full user guide, from preparing a pipeline to what every note means, is
+[Vector Explorer](https://docs.rocketride.org/guides/apps/vector-explorer) on
+docs.rocketride.org.
 
 The store nodes it opens are
 [`postgres`](https://github.com/rocketride-org/rocketride-server/blob/develop/nodes/src/nodes/store_postgres/README.md)
