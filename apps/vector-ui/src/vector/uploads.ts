@@ -874,12 +874,14 @@ function chunkPart(documents: number, chunks: number, uncounted: number): string
 }
 
 /**
- * The summary line: "Drop of 12 files: 9 added (341 chunks) · 2 replaced (19 chunks) · 1 not added · 00:48".
+ * The summary line in pieces: the head ("Drop of 12 files:") and the
+ * segments joined by " · " ("9 added (341 chunks)", …, "00:48"), so a
+ * narrow panel can break the line between segments and never inside one.
  *
  * @param summary - The drop's counts.
- * @returns The line.
+ * @returns The head and the segments.
  */
-export function dropSummaryText(summary: DropSummary): string {
+export function dropSummaryParts(summary: DropSummary): { head: string; parts: string[] } {
 	const n = (value: number): string => value.toLocaleString('en-US');
 	const parts: string[] = [];
 	if (summary.added > 0) parts.push(`${n(summary.added)} added${chunkPart(summary.added, summary.chunksAdded, summary.uncountedAdded)}`);
@@ -889,7 +891,18 @@ export function dropSummaryText(summary: DropSummary): string {
 	if (summary.waiting > 0) parts.push(`${n(summary.waiting)} waiting for your answer`);
 	if (summary.inProgress > 0) parts.push(`${n(summary.inProgress)} in progress`);
 	parts.push(formatElapsed(summary.elapsedMs));
-	return `Drop of ${summary.files === 1 ? '1 file' : `${n(summary.files)} files`}: ${parts.join(' · ')}`;
+	return { head: `Drop of ${summary.files === 1 ? '1 file' : `${n(summary.files)} files`}:`, parts };
+}
+
+/**
+ * The summary line: "Drop of 12 files: 9 added (341 chunks) · 2 replaced (19 chunks) · 1 not added · 00:48".
+ *
+ * @param summary - The drop's counts.
+ * @returns The line.
+ */
+export function dropSummaryText(summary: DropSummary): string {
+	const { head, parts } = dropSummaryParts(summary);
+	return `${head} ${parts.join(' · ')}`;
 }
 
 /**

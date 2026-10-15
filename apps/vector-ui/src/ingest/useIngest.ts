@@ -34,16 +34,23 @@
 //   - upload progress arrives as `apaevt_status_upload` events on the shell's
 //     event stream, which every app shares; the queue applies an event only
 //     to the one file of that base name it has in flight;
-//   - finished uploads tell the console to refresh its stats and directory.
+//   - finished uploads tell the console to refresh its stats and directory;
+//   - "Show new chunks on the map" under a finished drop hands the drop's
+//     new chunk keys to the map as a document highlight
+//     (actions.showOnMap(keys, 'document')), at most the connection's pin
+//     limit (limits.project_keys_max); the map pins them through its own
+//     `project` call, and the drop remembers how many of how many it sent.
 // =============================================================================
 
 import { useCallback, useSyncExternalStore } from 'react';
 import { useShellEvent } from 'shell';
 import { ExplorerToolError } from 'shared/explorer';
-import type { IUploadEvent, IngestPanelProps } from '../contract/types';
+import type { ConsoleActions, IUploadEvent, IngestPanelProps } from '../contract/types';
 import { callTool, toolChannelFor } from '../chat/toolCalls';
 import { ingestQueueFor } from '../chat/registry';
-import type { IngestDeps, IngestState } from './ingestQueue';
+import { newChunkKeys, placedSentence, summariseDrop } from '../vector/uploads';
+import type { DropShown } from '../vector/uploads';
+import type { IngestDeps, IngestQueue, IngestState } from './ingestQueue';
 import { entriesFromDataTransfer, filesFromInput, traverseDrop } from './dropTraversal';
 import type { DataTransferLike } from './dropTraversal';
 
@@ -59,6 +66,8 @@ export interface VectorIngest {
 	addFromInput(files: ArrayLike<File>, prefix: string): void;
 	answerConfirm(replace: boolean): void;
 	clearFinished(): void;
+	/** "Show new chunks on the map" under a finished drop. */
+	showNewChunks(dropId: string): void;
 }
 
 /**
@@ -69,6 +78,31 @@ export interface VectorIngest {
  */
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+/**
+ * Show a finished drop's new chunks on the map: every new document's chunk
+ * 0 first, cut at `cap`, as one document highlight; say what was sent and
+ * remember it on the drop. Nothing happens for a drop that is unknown, still
+ * running, or has no counted chunk.
+ *
+ * @param queue - The connection's queue.
+ * @param dropId - The drop.
+ * @param actions - The console's actions (showOnMap, announce).
+ * @param cap - The map's pin limit (limits.project_keys_max).
+ * @returns What was sent, or null when nothing was.
+ */
+export function showDropOnMap(queue: Pick<IngestQueue, 'getState' | 'markShown'>, dropId: string, actions: Pick<ConsoleActions, 'showOnMap' | 'announce'>, cap: number): DropShown | null {
+	const state = queue.getState();
+	const drop = state.drops.find((candidate) => candidate.id === dropId);
+	if (drop === undefined || drop.finishedAt === null) return null;
+	const plan = newChunkKeys(summariseDrop(drop, state.rows, drop.finishedAt).newDocuments, cap);
+	if (plan.keys.length === 0) return null;
+	const shown: DropShown = { placed: plan.keys.length, total: plan.total };
+	actions.showOnMap(plan.keys, 'document');
+	queue.markShown(dropId, shown);
+	actions.announce(placedSentence(shown.placed, shown.total, cap) ?? `Showing ${shown.total === 1 ? '1 new chunk' : `${shown.total.toLocaleString('en-US')} new chunks`} on the map.`);
+	return shown;
 }
 
 /**
@@ -118,5 +152,12 @@ export function useIngest(props: Pick<IngestPanelProps, 'model' | 'channels' | '
 		[queue]
 	);
 
-	return { state, addFromDrop, addFromInput, answerConfirm: queue.answerConfirm, clearFinished: queue.clearFinished };
+	const showNewChunks = useCallback(
+		(dropId: string) => {
+			showDropOnMap(queue, dropId, actions, model.limits.project_keys_max);
+		},
+		[queue, actions, model.limits.project_keys_max]
+	);
+
+	return { state, addFromDrop, addFromInput, answerConfirm: queue.answerConfirm, clearFinished: queue.clearFinished, showNewChunks };
 }

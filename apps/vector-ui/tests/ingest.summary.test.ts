@@ -4,14 +4,16 @@
 // =============================================================================
 
 // =============================================================================
-// INGEST SUMMARY: what a drop became
+// INGEST SUMMARY: what a drop became, and where its chunks landed
 // =============================================================================
 //
-// The upload queue keeps every drop (its rows, each row as it ended, its
-// start and end), so one line can say "Drop of 12 files: 9 added (341
-// chunks) · 2 replaced (19 chunks) · 1 not added · 00:48", live while the
-// drop runs and still after Clear finished drops its rows. The upload list
-// still holds the summary's placeholder above its rows.
+// Above the upload rows, one line per drop: "Drop of 12 files: 9 added
+// (341 chunks) · 2 replaced (19 chunks) · 1 not added · 00:48", live while
+// the drop runs and kept when Clear finished drops its rows. Once every file
+// of the drop has finished, "Show new chunks on the map" hands the new
+// documents' chunk keys to the map (actions.showOnMap(keys, 'document')),
+// which pins at most limits.project_keys_max of them through `project`; the
+// summary says "N of M new chunks placed" when the cap cut the list.
 // =============================================================================
 
 import assert from 'node:assert/strict';
@@ -21,8 +23,8 @@ import path from 'node:path';
 import { test as nodeTest } from 'node:test';
 import React from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
-import type { ISendFile } from 'shared/explorer';
-import type { IUploadEvent } from '../src/contract/types';
+import type { IExplorerEndpoint, IRoleChannel, ISendFile } from 'shared/explorer';
+import type { ConsoleActions, ConsoleModel, HighlightSource, IDialectResult, IUploadEvent, VectorChannels, VectorKey } from '../src/contract/types';
 import type { CallOutcome } from '../src/chat/toolCalls';
 import type { DropCandidate, IngestDrop, UploadRow } from '../src/vector/uploads';
 import type { IngestDeps } from '../src/ingest/ingestQueue';
@@ -44,7 +46,8 @@ function test(name: string, fn: () => void | Promise<void>): void {
 
 const h = React.createElement;
 const shellStandIn = {
-	commonStyles: new Proxy({}, { get: () => ({}) }),
+	// The shell's disabled modifier, so a test can tell a disabled button by its look.
+	commonStyles: new Proxy({}, { get: (_target, key) => (key === 'buttonDisabled' ? { opacity: 0.5, cursor: 'default' } : {}) }),
 	EmptyState: ({ title, description }: { title: string; description?: string }) => h('div', { 'data-empty-state': '' }, h('strong', null, title), description ? h('p', null, description) : null),
 	ConfirmDialog: (props: { title: string; message: React.ReactNode }) => h('div', { role: 'dialog', 'aria-label': props.title }, props.message),
 	useShellEvent: () => undefined,
@@ -61,7 +64,10 @@ const { NO_MAP_SENTENCE, NO_PLACING_SENTENCE, SHOW_NEW_LABEL, UNCOUNTED_SENTENCE
 const { createIngestQueue } = require('../src/ingest/ingestQueue') as typeof import('../src/ingest/ingestQueue');
 const { createNameLocks } = require('../src/ingest/nameLocks') as typeof import('../src/ingest/nameLocks');
 const { objectIdForPath } = require('../src/vector/objectId') as typeof import('../src/vector/objectId');
+const { showDropOnMap } = require('../src/ingest/useIngest') as typeof import('../src/ingest/useIngest');
 const { UploadList } = require('../src/components/UploadList') as typeof import('../src/components/UploadList');
+const { IngestPanel } = require('../src/components/IngestPanel') as typeof import('../src/components/IngestPanel');
+const { ingestQueueFor, forgetChatAndIngest } = require('../src/chat/registry') as typeof import('../src/chat/registry');
 
 // ── Fixtures and fakes ──────────────────────────────────────────────────────
 
@@ -192,6 +198,29 @@ function fakeDeps(options: { stored?: Record<string, number>; counts?: Record<st
 }
 
 /**
+ * Actions that record what the summary asked of the console.
+ *
+ * @returns The actions and the calls.
+ */
+function recordingActions(): { actions: ConsoleActions; shown: Array<{ keys: VectorKey[]; source: HighlightSource }>; announced: string[] } {
+	const shown: Array<{ keys: VectorKey[]; source: HighlightSource }> = [];
+	const announced: string[] = [];
+	const actions: ConsoleActions = {
+		openDocument: () => undefined,
+		showOnMap: (keys, source) => {
+			shown.push({ keys: keys.map((key) => [key[0], key[1]] as VectorKey), source });
+		},
+		requestRemove: () => undefined,
+		askAbout: () => undefined,
+		documentsChanged: () => undefined,
+		announce: (message) => {
+			announced.push(message);
+		},
+	};
+	return { actions, shown, announced };
+}
+
+/**
  * Render to static markup.
  *
  * @param element - The element.
@@ -199,6 +228,26 @@ function fakeDeps(options: { stored?: Record<string, number>; counts?: Record<st
  */
 function render(element: React.ReactElement): string {
 	return renderToStaticMarkup(element);
+}
+
+/**
+ * The markup with HTML entities for quotes and ampersands decoded.
+ *
+ * @param html - The markup.
+ * @returns Readable text.
+ */
+function decoded(html: string): string {
+	return html.replace(/&#x27;/g, "'").replace(/&quot;/g, '"').replace(/&amp;/g, '&');
+}
+
+/**
+ * The text a reader sees: the markup without tags.
+ *
+ * @param html - The markup.
+ * @returns Its text.
+ */
+function textOf(html: string): string {
+	return decoded(html.replace(/<!-- -->/g, '').replace(/<[^>]+>/g, ''));
 }
 
 // ── The sentence ────────────────────────────────────────────────────────────
@@ -497,14 +546,257 @@ test('queue: dispose forgets every drop; a drop with nothing to add records no d
 	assert.deepEqual(queue.getState().drops, []);
 });
 
-// ── The list ────────────────────────────────────────────────────────────────
+// ── "Show new chunks on the map" ────────────────────────────────────────────
 
-test('the upload list holds the drop summary above its rows, and renders nothing without rows', () => {
-	const one = row('u1', 'docs/a.md', 'done', { chunks: 7 });
-	const html = render(h(UploadList, { rows: [one], notes: [], onClearFinished: () => undefined }));
+test('show on map: the drop\'s new chunks go to the map as one document highlight, and the drop remembers it', async () => {
+	const fake = fakeDeps({ counts: { 'a.md': 2, 'b.md': 1, 'c.md': 3 } });
+	const queue = createIngestQueue(fake.deps);
+	await queue.addDrop([candidate('a.md'), candidate('b.md'), candidate('c.md')]);
+	await queue.idle();
+	const drop = queue.getState().drops[0];
+	const rec = recordingActions();
+	const shown = showDropOnMap(queue, drop.id, rec.actions, 200);
+	assert.deepEqual(shown, { placed: 6, total: 6 });
+	const [a, b, c] = ['a.md', 'b.md', 'c.md'].map(objectIdForPath);
+	assert.deepEqual(rec.shown, [
+		{
+			source: 'document',
+			keys: [
+				[a, 0],
+				[b, 0],
+				[c, 0],
+				[a, 1],
+				[c, 1],
+				[c, 2],
+			],
+		},
+	]);
+	assert.deepEqual(rec.announced, ['Showing 6 new chunks on the map.']);
+	assert.deepEqual(queue.getState().drops[0].shown, { placed: 6, total: 6 });
+});
+
+test('show on map: above the pin limit it sends at most the limit and says how many of how many were placed', async () => {
+	const counts: Record<string, number> = {};
+	const files = Array.from({ length: 9 }, (_, i) => `docs/part${i}.md`);
+	files.forEach((file, i) => (counts[file] = i < 8 ? 40 : 21));
+	const fake = fakeDeps({ counts });
+	const queue = createIngestQueue(fake.deps);
+	await queue.addDrop(files.map((file) => candidate(file)));
+	await queue.idle();
+	const rec = recordingActions();
+	const shown = showDropOnMap(queue, queue.getState().drops[0].id, rec.actions, 200);
+	assert.deepEqual(shown, { placed: 200, total: 341 });
+	assert.equal(rec.shown[0].keys.length, 200);
+	assert.ok(rec.shown[0].keys.length <= 200);
+	assert.deepEqual(rec.announced, ['200 of 341 new chunks placed: the map pins at most 200 chunks outside its sample.']);
+});
+
+test('show on map: the keys use the objectId the engine reported; nothing is sent for a drop still running or unknown', async () => {
+	const engineId = '00000000-0000-5000-8000-0000000000aa';
+	const fake = fakeDeps({ sendResult: (file) => ({ action: 'complete', filepath: file.file.name, bytes_sent: 1, file_size: 1, upload_time: 0, result: { objectId: engineId } }), counts: { 'e.md': 2 } });
+	const queue = createIngestQueue(fake.deps);
+	await queue.addDrop([candidate('e.md')]);
+	await queue.idle();
+	const rec = recordingActions();
+	showDropOnMap(queue, queue.getState().drops[0].id, rec.actions, 200);
+	assert.deepEqual(rec.shown[0].keys, [
+		[engineId, 0],
+		[engineId, 1],
+	]);
+
+	const gate = deferred<void>();
+	const slow = fakeDeps();
+	const sendFiles = slow.deps.sendFiles;
+	slow.deps.sendFiles = async (filesToSend, options) => {
+		await gate.promise;
+		return sendFiles(filesToSend, options);
+	};
+	const running = createIngestQueue(slow.deps);
+	await running.addDrop([candidate('wait.md')]);
+	const idle = recordingActions();
+	assert.equal(showDropOnMap(running, running.getState().drops[0].id, idle.actions, 200), null);
+	assert.equal(showDropOnMap(running, 'd-nope', idle.actions, 200), null);
+	assert.deepEqual(idle.shown, []);
+	gate.resolve();
+	await running.idle();
+});
+
+test('show on map: a drop whose documents have no counted chunk sends nothing', async () => {
+	const fake = fakeDeps({ counts: { 'n.md': null } });
+	const queue = createIngestQueue(fake.deps);
+	await queue.addDrop([candidate('n.md')]);
+	await queue.idle();
+	const rec = recordingActions();
+	assert.equal(showDropOnMap(queue, queue.getState().drops[0].id, rec.actions, 200), null);
+	assert.deepEqual(rec.shown, []);
+});
+
+// ── The list shows it ───────────────────────────────────────────────────────
+
+const NOW = 1_700_000_100_000;
+const doneRows = [row('u1', 'a.md', 'done', { chunks: 2 }), row('u2', 'b.md', 'done', { chunks: 2 }), row('u3', 'c.md', 'done', { chunks: 2 })];
+const doneDrop = dropOf(doneRows, NOW - 10_000, NOW - 6_000);
+
+test('UploadList: the drop summary sits above the rows, is built (no placeholder), and carries its counts', () => {
+	const html = decoded(render(h(UploadList, { rows: doneRows, notes: [], onClearFinished: () => undefined, drops: [doneDrop], onShowNew: () => undefined, showNewReason: null, pinLimit: 200, now: NOW })));
 	const at = html.search(/<[a-z]+[^>]*data-component="IngestSummary"/);
 	assert.ok(at >= 0, 'the summary is mounted');
 	assert.ok(at < html.indexOf('aria-label="Uploads"'), 'above the rows');
-	if (html.slice(at, html.indexOf('>', at)).includes('data-placeholder')) assert.match(html.slice(at, at + 600), /Not built yet/);
-	assert.equal(render(h(UploadList, { rows: [], notes: [], onClearFinished: () => undefined })), '');
+	assert.doesNotMatch(html, /data-placeholder/);
+	assert.doesNotMatch(html, /Not built yet/);
+	assert.match(html, /<div role="group" aria-label="Drop summary" data-component="IngestSummary"/);
+	assert.match(textOf(html), /Drop of 3 files: 3 added \(6 chunks\) · 00:04/);
+	// A segment never breaks inside: each one is kept on one line, the line breaks between them.
+	assert.match(html, /<span style="white-space:nowrap">3 added \(6 chunks\)<\/span> · <span style="white-space:nowrap">00:04<\/span>/);
+	assert.match(html, /data-drop="d1"/);
+	assert.match(html, /data-finished="true"/);
+	assert.match(html, /data-added="3"/);
+	assert.match(html, /data-new-chunks="6"/);
+	assert.match(html, /<button type="button"[^>]*>Show new chunks on the map<\/button>/);
+	assert.doesNotMatch(html, /<button[^>]*disabled=""[^>]*>Show new chunks/);
+	// The line is not a live region: the queue announces the drop once, the clock must not be read out every second.
+	assert.doesNotMatch(html.slice(at, html.indexOf('aria-label="Uploads"')), /aria-live|role="status"/);
+	assert.equal(render(h(UploadList, { rows: [], notes: [], onClearFinished: () => undefined, drops: [], now: NOW })), '');
+});
+
+test('UploadList: no button while the drop runs; the clock runs from the drop', () => {
+	const rows = [row('u1', 'a.md', 'done', { chunks: 2 }), row('u2', 'b.md', 'processing')];
+	const drop = dropOf(rows, NOW - 75_000, null);
+	const html = decoded(render(h(UploadList, { rows, notes: [], onClearFinished: () => undefined, drops: [drop], onShowNew: () => undefined, showNewReason: null, pinLimit: 200, now: NOW })));
+	assert.match(textOf(html), /Drop of 2 files: 1 added \(2 chunks\) · 1 in progress · 01:15/);
+	assert.match(html, /data-finished="false"/);
+	assert.doesNotMatch(html, /Show new chunks on the map/);
+});
+
+test('UploadList: the button is disabled with the reason when the map cannot place new chunks, or none was counted', () => {
+	const html = decoded(render(h(UploadList, { rows: doneRows, notes: [], onClearFinished: () => undefined, drops: [doneDrop], onShowNew: () => undefined, showNewReason: NO_PLACING_SENTENCE, pinLimit: 200, now: NOW })));
+	assert.match(html, /<button type="button"[^>]*disabled=""[^>]*aria-describedby="([^"]+)"[^>]*>Show new chunks on the map<\/button>/);
+	assert.match(html, /<button type="button" style="[^"]*opacity:0\.5[^"]*"[^>]*disabled=""/, "the shell's disabled look, not only the attribute");
+	const id = /aria-describedby="([^"]+)"/.exec(html)?.[1] ?? '';
+	assert.ok(html.includes(`id="${id}"`), 'the reason is the description');
+	assert.ok(html.includes(NO_PLACING_SENTENCE));
+
+	const uncountedRows = [row('u1', 'a.md', 'done'), row('u2', 'b.md', 'done')];
+	const uncounted = decoded(render(h(UploadList, { rows: uncountedRows, notes: [], onClearFinished: () => undefined, drops: [dropOf(uncountedRows, NOW - 1_000, NOW)], onShowNew: () => undefined, showNewReason: null, pinLimit: 200, now: NOW })));
+	assert.match(uncounted, /<button type="button"[^>]*disabled=""[^>]*>Show new chunks on the map<\/button>/);
+	assert.ok(uncounted.includes(UNCOUNTED_SENTENCE));
+
+	// A drop that added nothing offers nothing to show.
+	const refusedRows = [row('u1', 'x.exe', 'refused', { message: 'Not added.' })];
+	const refused = decoded(render(h(UploadList, { rows: refusedRows, notes: [], onClearFinished: () => undefined, drops: [dropOf(refusedRows, NOW, NOW)], onShowNew: () => undefined, showNewReason: null, pinLimit: 200, now: NOW })));
+	assert.match(textOf(refused), /Drop of 1 file: 1 not added · 00:00/);
+	assert.doesNotMatch(refused, /Show new chunks/);
+});
+
+test('UploadList: after "Show new chunks", a capped drop says how many of how many were placed; a replaced document may keep its old place', () => {
+	const rows = [row('u1', 'a.md', 'done', { chunks: 250 }), row('u2', 'b.md', 'done', { chunks: 91, replaces: true })];
+	const drop: IngestDrop = { ...dropOf(rows, NOW - 48_000, NOW), shown: { placed: 200, total: 341 } };
+	const html = decoded(render(h(UploadList, { rows, notes: [], onClearFinished: () => undefined, drops: [drop], onShowNew: () => undefined, showNewReason: null, pinLimit: 200, now: NOW })));
+	assert.match(html, /200 of 341 new chunks placed: the map pins at most 200 chunks outside its sample\./);
+	assert.match(html, /data-placed="200"/);
+	assert.match(html, /data-total="341"/);
+	assert.match(html, /Replaced documents the map already shows may keep their old place until the map draws a new sample\./);
+	const uncapped = decoded(render(h(UploadList, { rows: doneRows, notes: [], onClearFinished: () => undefined, drops: [{ ...doneDrop, shown: { placed: 6, total: 6 } }], onShowNew: () => undefined, showNewReason: null, pinLimit: 200, now: NOW })));
+	assert.doesNotMatch(uncapped, /new chunks placed/);
+	assert.doesNotMatch(uncapped, /old place/);
+});
+
+test('UploadList: the latest drop leads; earlier drops fold under a disclosure', () => {
+	const older = [row('o1', 'old.md', 'done', { chunks: 4 })];
+	const newer = [row('n1', 'new.md', 'uploading', { bytesSent: 10 })];
+	const drops: IngestDrop[] = [
+		{ ...dropOf(older, NOW - 90_000, NOW - 80_000), id: 'd1' },
+		{ ...dropOf(newer, NOW - 3_000, null), id: 'd2' },
+	];
+	const html = decoded(render(h(UploadList, { rows: [...older, ...newer], notes: [], onClearFinished: () => undefined, drops, onShowNew: () => undefined, showNewReason: null, pinLimit: 200, now: NOW })));
+	const latest = html.indexOf('data-drop="d2"');
+	const earlier = html.indexOf('data-drop="d1"');
+	assert.ok(latest >= 0 && earlier > latest, 'the latest drop first');
+	assert.match(html, /<details[^>]*><summary>Earlier drops \(1\)<\/summary>/);
+	assert.ok(html.indexOf('<details') < earlier, 'the earlier drop is inside the disclosure');
+});
+
+test('UploadList: without drops (older hosts) the rows render as before', () => {
+	const html = render(h(UploadList, { rows: doneRows, notes: [], onClearFinished: () => undefined }));
+	assert.match(html, /aria-label="Uploads"/);
+	assert.doesNotMatch(html, /data-component="IngestSummary"/);
+	assert.doesNotMatch(html, /Not built yet/);
+});
+
+// ── The panel wires it ──────────────────────────────────────────────────────
+
+const dialect = fixture<IDialectResult>('dialect_pgvector.json');
+
+/**
+ * A console model for one connection.
+ *
+ * @param overrides - Fields to replace.
+ * @returns The model.
+ */
+function model(overrides: Partial<ConsoleModel> = {}): ConsoleModel {
+	return {
+		connectionKey: 'summary-1',
+		connection: { endpoint: { key: 'summary-1', anchorRole: 'tools', readOnly: false, nodeId: 'store_1', pipelineName: 'Vector demo' } as unknown as IExplorerEndpoint, dialect },
+		nodes: { store: 'store_1', embed: 'embed_1', llm: 'llm_1', llmName: 'Local stub LLM' },
+		collection: 'vx_demo_docs',
+		stats: null,
+		limits: dialect.limits,
+		capabilities: dialect.capabilities,
+		writes: { enabled: true, reason: null },
+		ingest: { enabled: true, reason: null },
+		chat: { enabled: true, reason: null },
+		embed: { enabled: true, reason: null },
+		readOnly: false,
+		...overrides,
+	};
+}
+
+/**
+ * A channel that answers nothing (rendering never calls it).
+ *
+ * @param role - The role.
+ * @returns The channel.
+ */
+function idleChannel(role: string): IRoleChannel {
+	return { role, bound: true, sendFiles: async () => [], ask: async () => ({}), invoke: async <T>() => ({}) as T };
+}
+
+const channels: VectorChannels = { tools: idleChannel('tools'), chat: idleChannel('chat'), ingest: idleChannel('ingest') };
+
+test("IngestPanel: the connection's drop summary is shown above its rows, with the map's reason when it cannot place chunks", async () => {
+	forgetChatAndIngest();
+	const fake = fakeDeps();
+	const queue = ingestQueueFor('summary-1', fake.deps);
+	await queue.addDrop([candidate('a.md'), candidate('b.md'), candidate('c.md')]);
+	await queue.idle();
+	const rec = recordingActions();
+	const html = decoded(render(h(IngestPanel, { model: model(), channels, actions: rec.actions, alsoReaches: [] })));
+	assert.match(textOf(html), /Drop of 3 files: 3 added \(6 chunks\) · /);
+	assert.ok(html.indexOf('data-component="IngestSummary"') < html.indexOf('aria-label="Uploads"'));
+	assert.match(html, /<button type="button"[^>]*>Show new chunks on the map<\/button>/);
+	assert.doesNotMatch(html, /<button[^>]*disabled=""[^>]*>Show new chunks/);
+	const noPlacing = decoded(render(h(IngestPanel, { model: model({ capabilities: { ...dialect.capabilities, project: false } }), channels, actions: rec.actions, alsoReaches: [] })));
+	assert.ok(noPlacing.includes(NO_PLACING_SENTENCE));
+	const noMap = decoded(render(h(IngestPanel, { model: model({ capabilities: { ...dialect.capabilities, sample: false } }), channels, actions: rec.actions, alsoReaches: [] })));
+	assert.ok(noMap.includes(NO_MAP_SENTENCE));
+	forgetChatAndIngest();
+	assert.equal(ingestQueueFor('summary-1', fakeDeps().deps).getState().drops.length, 0, 'forgetting the connection forgets its drops');
+	forgetChatAndIngest();
+});
+
+test('wiring: the panel hands the summary its drops and the pin limit, and the hook places them with the connection\'s limit', () => {
+	const code = (relative: string): string =>
+		readFileSync(path.join(__dirname, '..', 'src', relative), 'utf8')
+			.replace(/\/\*[\s\S]*?\*\//g, '')
+			.replace(/(^|[^:'"`])\/\/.*$/gm, '$1');
+	const panel = code(path.join('components', 'IngestPanel.tsx'));
+	assert.match(panel, /drops=\{ingest\.state\.drops\}/);
+	assert.match(panel, /onShowNew=\{ingest\.showNewChunks\}/);
+	assert.match(panel, /showNewReason=\{showNewChunksReason\(model\.capabilities\)\}/);
+	assert.match(panel, /pinLimit=\{model\.limits\.project_keys_max\}/);
+	const hook = code(path.join('ingest', 'useIngest.ts'));
+	assert.match(hook, /showDropOnMap\(queue, dropId, actions, model\.limits\.project_keys_max\)/);
+	assert.match(hook, /actions\.showOnMap\(plan\.keys, 'document'\)/);
+	// The summary never calls a tool itself: the map pins through its own `project` call.
+	for (const file of [path.join('components', 'UploadList.tsx'), path.join('components', 'IngestPanel.tsx')]) assert.doesNotMatch(code(file), /callTool|'project'/, file);
 });
