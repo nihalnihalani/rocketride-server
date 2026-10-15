@@ -21,39 +21,45 @@
 // SOFTWARE.
 
 // =============================================================================
-// VECTOR-UI — OutliersPanel (placeholder)
+// VECTOR-UI — OutliersPanel (the sample's least-dense points)
 // =============================================================================
 //
-// Placeholder until the real component lands: it exports the frozen props
-// (src/contract/types.ts) and renders a framed "Not built yet" notice, so the
-// files that render it compile and run today. Keep the export names and the
-// props type when replacing it.
+// Points whose neighbourhood in the node's kNN graph is the sparsest (the node
+// reports the lowest 1 % by density): OCR noise, a stray table, a document that
+// is unlike everything else. Each row selects the point on the map.
 // =============================================================================
 
 import React from 'react';
-import { EmptyState } from 'shell';
-import type { OutliersPanelProps } from '../contract/types';
+import type { OutliersPanelProps as ContractOutliersPanelProps } from '../contract/types';
+import { documentOf } from '../map/model';
+import { MAP_STYLES } from '../map/styles';
 
-export type { OutliersPanelProps };
-
-/** Dashed frame that marks the placeholder on screen. */
-const FRAME: React.CSSProperties = {
-	border: '1px dashed var(--rr-border-input)',
-	borderRadius: 6,
-	padding: 12,
-};
+/** Props (frozen). */
+export type OutliersPanelProps = ContractOutliersPanelProps;
 
 /**
- * Placeholder for the outlying chunks of the sample.
+ * The outliers panel.
  *
- * @param _props - The frozen props (unused until the component is built).
- * @returns A framed "Not built yet" notice.
+ * @param props - Sample and select handler.
+ * @returns A list of outlier points.
  */
-export function OutliersPanel(_props: OutliersPanelProps): React.ReactElement {
+export function OutliersPanel(props: OutliersPanelProps): React.ReactElement {
+	const result = props.sample.result;
+	if (result.outliers.length === 0) return <p style={MAP_STYLES.note}>No outliers in this sample.</p>;
 	return (
-		<div style={FRAME} data-placeholder="OutliersPanel">
-			<EmptyState title="Not built yet" description="Outlying chunks in the sample will appear here." />
-		</div>
+		<>
+			<p style={MAP_STYLES.note}>The points with the sparsest neighbourhoods in this sample (lowest density first). They are ringed on the map.</p>
+			<ul aria-label="Outliers" style={MAP_STYLES.list}>
+				{result.outliers.map((i) => (
+					<li key={i} style={MAP_STYLES.row}>
+						<button type="button" style={MAP_STYLES.linkButton} onClick={() => props.onSelect(i)}>
+							{documentOf(result, i)?.path ?? '?'} #{result.points.chunk[i]}
+						</button>
+						<div style={MAP_STYLES.small}>density {(result.density[i] ?? 0).toFixed(3)}</div>
+					</li>
+				))}
+			</ul>
+		</>
 	);
 }
 

@@ -21,38 +21,130 @@
 // SOFTWARE.
 
 // =============================================================================
-// VECTOR-UI — PointsTable (placeholder)
+// VECTOR-UI — PointsTable (the accessible alternative to the canvas)
 // =============================================================================
 //
-// Placeholder until the real component lands: it exports the frozen props
-// (src/contract/types.ts) and renders a framed "Not built yet" notice, so the
-// files that render it compile and run today. Keep the export names and the
-// props type when replacing it.
+// Every point of the sample as a table row, 100 rows a page: document, chunk,
+// length, density, similarity to the active query, and flags (duplicate,
+// outlier, pinned). Rows can be sorted by query similarity when there is a
+// query. Choosing a row selects the point, exactly like a click on the map.
 // =============================================================================
 
-import React from 'react';
-import { EmptyState } from 'shell';
-import type { PointsTableProps } from '../contract/types';
+import React, { useMemo, useState } from 'react';
+import type { PointsTableProps as ContractPointsTableProps } from '../contract/types';
+import { hiddenMask } from '../map/model';
+import { MAP_STYLES } from '../map/styles';
+import { num } from '../map/wording';
 
-export type { PointsTableProps };
-
-/** Dashed frame that marks the placeholder on screen. */
-const FRAME: React.CSSProperties = {
-	border: '1px dashed var(--rr-border-input)',
-	borderRadius: 6,
-	padding: 12,
-};
+/** Props: the frozen ones plus the page size. */
+export interface PointsTableProps extends ContractPointsTableProps {
+	/** Rows per page (default 100). */
+	pageSize?: number;
+}
 
 /**
- * Placeholder for the table alternative to the point map.
+ * The points table.
  *
- * @param _props - The frozen props (unused until the component is built).
- * @returns A framed "Not built yet" notice.
+ * @param props - Sample, query similarities, selection, select handler.
+ * @returns The table with paging.
  */
-export function PointsTable(_props: PointsTableProps): React.ReactElement {
+export function PointsTable(props: PointsTableProps): React.ReactElement {
+	const result = props.sample.result;
+	const pageSize = props.pageSize ?? 100;
+	const [page, setPage] = useState(0);
+	const [byQuery, setByQuery] = useState(false);
+	const flags = useMemo(() => {
+		const dup = new Set<number>();
+		for (const d of result.duplicates) {
+			dup.add(d.a);
+			dup.add(d.b);
+		}
+		return { dup, outliers: new Set(result.outliers) };
+	}, [result]);
+	const order = useMemo(() => {
+		const hidden = hiddenMask(props.sample);
+		const rows = Array.from({ length: result.n }, (_, i) => i).filter((i) => !(hidden && hidden[i]));
+		if (byQuery && props.querySims) {
+			const sims = props.querySims;
+			rows.sort((a, b) => (sims[b] as number) - (sims[a] as number) || a - b);
+		}
+		return rows;
+	}, [result, props.sample, byQuery, props.querySims]);
+	const pages = Math.max(1, Math.ceil(order.length / pageSize));
+	const current = Math.min(page, pages - 1);
+	const rows = order.slice(current * pageSize, current * pageSize + pageSize);
+	const first = order.length === 0 ? 0 : current * pageSize + 1;
+	const last = current * pageSize + rows.length;
 	return (
-		<div style={FRAME} data-placeholder="PointsTable">
-			<EmptyState title="Not built yet" description="A table of the sampled points will appear here." />
+		<div>
+			<div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, alignItems: 'center', marginBottom: 6 }}>
+				<span style={MAP_STYLES.small}>
+					Rows {num(first)}–{num(last)} of {num(order.length)}
+				</span>
+				<button type="button" style={MAP_STYLES.button} disabled={current === 0} onClick={() => setPage(current - 1)}>
+					Previous
+				</button>
+				<button type="button" style={MAP_STYLES.button} disabled={current >= pages - 1} onClick={() => setPage(current + 1)}>
+					Next
+				</button>
+				{props.querySims ? (
+					<button type="button" style={{ ...MAP_STYLES.button, ...(byQuery ? MAP_STYLES.buttonPressed : {}) }} aria-pressed={byQuery} onClick={() => setByQuery(!byQuery)}>
+						Sort by query similarity
+					</button>
+				) : null}
+			</div>
+			<table style={MAP_STYLES.table}>
+				<caption style={{ ...MAP_STYLES.small, textAlign: 'left', marginBottom: 4 }}>Points of the sample (the map as a table)</caption>
+				<thead>
+					<tr>
+						<th scope="col" style={MAP_STYLES.th}>
+							#
+						</th>
+						<th scope="col" style={MAP_STYLES.th}>
+							Document
+						</th>
+						<th scope="col" style={MAP_STYLES.th}>
+							Chunk
+						</th>
+						<th scope="col" style={MAP_STYLES.th}>
+							Length
+						</th>
+						<th scope="col" style={MAP_STYLES.th}>
+							Density
+						</th>
+						{props.querySims ? (
+							<th scope="col" style={MAP_STYLES.th}>
+								Query similarity
+							</th>
+						) : null}
+						<th scope="col" style={MAP_STYLES.th}>
+							Notes
+						</th>
+					</tr>
+				</thead>
+				<tbody>
+					{rows.map((i) => {
+						const doc = result.docs[result.points.doc[i] as number];
+						const notes = [flags.dup.has(i) ? 'duplicate' : '', flags.outliers.has(i) ? 'outlier' : '', result.points.pinned[i] ? 'pinned' : ''].filter(Boolean).join(', ');
+						const selected = props.selected === i;
+						return (
+							<tr key={i} aria-selected={selected} style={selected ? { outline: '2px solid var(--rr-border-focus)' } : undefined}>
+								<td style={MAP_STYLES.td}>
+									<button type="button" style={MAP_STYLES.linkButton} onClick={() => props.onSelect(i)} aria-label={`Inspect point ${i + 1}`}>
+										{num(i + 1)}
+									</button>
+								</td>
+								<td style={MAP_STYLES.td}>{doc?.path ?? '?'}</td>
+								<td style={MAP_STYLES.td}>{num(result.points.chunk[i] ?? 0)}</td>
+								<td style={MAP_STYLES.td}>{num(result.points.len[i] ?? 0)}</td>
+								<td style={MAP_STYLES.td}>{(result.density[i] ?? 0).toFixed(3)}</td>
+								{props.querySims ? <td style={MAP_STYLES.td}>{(props.querySims[i] ?? 0).toFixed(3)}</td> : null}
+								<td style={MAP_STYLES.td}>{notes}</td>
+							</tr>
+						);
+					})}
+				</tbody>
+			</table>
 		</div>
 	);
 }

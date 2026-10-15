@@ -21,38 +21,153 @@
 // SOFTWARE.
 
 // =============================================================================
-// VECTOR-UI — MapToolbar (placeholder)
+// VECTOR-UI — MapToolbar (sample, layout, colour, query, lasso, fit, table)
 // =============================================================================
 //
-// Placeholder until the real component lands: it exports the frozen props
-// (src/contract/types.ts) and renders a framed "Not built yet" notice, so the
-// files that render it compile and run today. Keep the export names and the
-// props type when replacing it.
+// Sample: how many points and which mode (Detailed up to the node's sample_max,
+// Light up to sample_max_light), and "New sample" draws another with the next
+// seed. Layout: PCA (the node's own), Neighbour graph (seeded force layout over
+// the kNN graph), t-SNE (at most 1,000 points; disabled with its reason above
+// that). A running layout shows "Laying out…" and Cancel. Colour by, the text
+// query (disabled with its reason when the embedding node is unreachable), and
+// the Lasso, Fit and Table toggles. Native controls with labels; no key
+// listeners of its own.
 // =============================================================================
 
-import React from 'react';
-import { EmptyState } from 'shell';
-import type { MapToolbarProps } from '../contract/types';
+import React, { useState } from 'react';
+import type { ColourBy, MapLayout, MapToolbarProps as ContractMapToolbarProps, SampleMode } from '../contract/types';
+import { MAP_STYLES } from '../map/styles';
+import { num } from '../map/wording';
 
-export type { MapToolbarProps };
+/** Props: the frozen ones plus map extras. */
+export interface MapToolbarProps extends ContractMapToolbarProps {
+	/** Why t-SNE is unavailable for this sample, or null. */
+	tsneReason?: string | null;
+	/** Show Cancel (a layout is running). */
+	canCancel?: boolean;
+	/** The 3D toggle (PCA only), when offered. */
+	threeD?: boolean;
+	onToggle3D?(): void;
+}
 
-/** Dashed frame that marks the placeholder on screen. */
-const FRAME: React.CSSProperties = {
-	border: '1px dashed var(--rr-border-input)',
-	borderRadius: 6,
-	padding: 12,
-};
+/** Detailed and light sizes offered (capped by the node's limits). */
+const DETAILED_SIZES = [250, 500, 1000, 2000];
+const LIGHT_SIZES = [3000, 5000];
+
+const LAYOUTS: Array<{ id: MapLayout; label: string }> = [
+	{ id: 'pca', label: 'PCA' },
+	{ id: 'neighbour-graph', label: 'Neighbour graph' },
+	{ id: 'tsne', label: 't-SNE (≤1,000)' },
+];
+
+const COLOURS: Array<{ id: ColourBy; label: string }> = [
+	{ id: 'document', label: 'Document' },
+	{ id: 'folder', label: 'Folder' },
+	{ id: 'type', label: 'File type' },
+	{ id: 'chunk-position', label: 'Chunk position' },
+	{ id: 'query-similarity', label: 'Query similarity' },
+	{ id: 'density', label: 'Density' },
+];
 
 /**
- * Placeholder for the sample, layout, colour, query and lasso controls of the map.
+ * The map toolbar.
  *
- * @param _props - The frozen props (unused until the component is built).
- * @returns A framed "Not built yet" notice.
+ * @param props - Limits, sample, state and handlers.
+ * @returns The toolbar.
  */
-export function MapToolbar(_props: MapToolbarProps): React.ReactElement {
+export function MapToolbar(props: MapToolbarProps): React.ReactElement {
+	const [text, setText] = useState('');
+	const sample = props.sample;
+	const mode: SampleMode = sample?.mode ?? 'detailed';
+	const n = sample?.result.n_requested ?? Math.min(props.limits.sample_default, props.limits.sample_max);
+	const seed = sample?.seed ?? 7;
+	const sizes = [...DETAILED_SIZES.filter((s) => s <= props.limits.sample_max).map((s) => ({ mode: 'detailed' as const, n: s })), ...LIGHT_SIZES.filter((s) => s <= props.limits.sample_max_light && s > props.limits.sample_max).map((s) => ({ mode: 'light' as const, n: s }))];
+	const current = `${mode}:${n}`;
+	if (!sizes.some((s) => `${s.mode}:${s.n}` === current)) sizes.push({ mode, n });
+	const busy = props.busy !== null;
+	const toggle = (pressed: boolean): React.CSSProperties => ({ ...MAP_STYLES.button, ...(pressed ? MAP_STYLES.buttonPressed : {}) });
 	return (
-		<div style={FRAME} data-placeholder="MapToolbar">
-			<EmptyState title="Not built yet" description="Sample, layout, colour, query and lasso controls will appear here." />
+		<div role="toolbar" aria-label="Map controls" style={MAP_STYLES.toolbar}>
+			<label style={MAP_STYLES.group}>
+				<span style={MAP_STYLES.label}>Points</span>
+				<select
+					aria-label="Points"
+					style={MAP_STYLES.select}
+					value={current}
+					disabled={busy}
+					onChange={(event) => {
+						const [m, size] = event.target.value.split(':');
+						props.onSample({ n: Number(size), mode: m === 'light' ? 'light' : 'detailed', seed });
+					}}
+				>
+					{sizes.map((s) => (
+						<option key={`${s.mode}:${s.n}`} value={`${s.mode}:${s.n}`}>
+							{num(s.n)} {s.mode === 'light' ? '(light: no text)' : '(detailed)'}
+						</option>
+					))}
+				</select>
+			</label>
+			{sample ? (
+				<span style={MAP_STYLES.small}>
+					of {sample.result.of.chunks === null ? '—' : num(sample.result.of.chunks)} chunks · {sample.result.of.documents === null ? '—' : num(sample.result.of.documents)} docs · seed {seed}
+				</span>
+			) : null}
+			<button type="button" style={MAP_STYLES.button} disabled={busy} onClick={() => props.onSample({ n, mode, seed: seed + 1 })}>
+				New sample
+			</button>
+			<label style={MAP_STYLES.group}>
+				<span style={MAP_STYLES.label}>Layout</span>
+				<select aria-label="Layout" style={MAP_STYLES.select} value={props.layout} disabled={busy || !sample} onChange={(event) => props.onLayout(event.target.value as MapLayout)}>
+					{LAYOUTS.map((l) => (
+						<option key={l.id} value={l.id} disabled={l.id === 'tsne' && !!props.tsneReason} title={l.id === 'tsne' ? (props.tsneReason ?? undefined) : undefined}>
+							{l.label}
+						</option>
+					))}
+				</select>
+			</label>
+			{props.canCancel ? (
+				<button type="button" style={MAP_STYLES.button} onClick={props.onCancel}>
+					Cancel
+				</button>
+			) : null}
+			<label style={MAP_STYLES.group}>
+				<span style={MAP_STYLES.label}>Colour by</span>
+				<select aria-label="Colour by" style={MAP_STYLES.select} value={props.colourBy} onChange={(event) => props.onColourBy(event.target.value as ColourBy)}>
+					{COLOURS.map((c) => (
+						<option key={c.id} value={c.id}>
+							{c.label}
+						</option>
+					))}
+				</select>
+			</label>
+			<form
+				style={MAP_STYLES.group}
+				onSubmit={(event) => {
+					event.preventDefault();
+					if (props.query.enabled && text.trim() !== '' && !busy) props.onQuery(text.trim());
+				}}
+			>
+				<label style={MAP_STYLES.group}>
+					<span style={MAP_STYLES.label}>Query</span>
+					<input aria-label="Query" style={MAP_STYLES.input} type="search" value={text} maxLength={8000} placeholder="Place a question on the map" disabled={!props.query.enabled} onChange={(event) => setText(event.target.value)} />
+				</label>
+				<button type="submit" style={MAP_STYLES.button} disabled={!props.query.enabled || busy || text.trim() === ''}>Run</button>
+			</form>
+			<button type="button" style={toggle(props.lasso)} aria-pressed={props.lasso} onClick={props.onToggleLasso} disabled={!sample}>Lasso</button>
+			<button type="button" style={MAP_STYLES.button} onClick={props.onFit} disabled={!sample}>
+				Fit
+			</button>
+			<button type="button" style={toggle(props.table)} aria-pressed={props.table} onClick={props.onToggleTable} disabled={!sample}>Table</button>
+			{props.onToggle3D ? (
+				<button type="button" style={toggle(!!props.threeD)} aria-pressed={!!props.threeD} onClick={props.onToggle3D} disabled={!sample || props.layout !== 'pca'}>3D</button>
+			) : null}
+			{props.busy ? (
+				<span role="status" style={MAP_STYLES.small}>
+					{props.busy}
+				</span>
+			) : null}
+			{!props.query.enabled && props.query.reason ? <span style={MAP_STYLES.small}>{props.query.reason}</span> : null}
+			{props.tsneReason ? <span style={MAP_STYLES.small}>{props.tsneReason}</span> : null}
 		</div>
 	);
 }
