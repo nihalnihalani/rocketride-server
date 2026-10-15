@@ -371,6 +371,139 @@ class PointsList:
 
 
 # =============================================================================
+# Vector Explorer additions (explorer hooks on the Qdrant store)
+# =============================================================================
+# The store's explorer hooks use these as well: conditions on ids and nulls,
+# ordered scrolls, random sampling, counts, facets and the distance matrix.
+# Field names match the real qdrant_client models.
+
+
+class MatchExcept:
+    """Match any value NOT in a list (``FieldCondition(match=MatchExcept(**{'except': [...]}))``)."""
+
+    def __init__(self, **kwargs: Any) -> None:
+        """Accept the real model's ``except`` keyword (a Python keyword, hence the alias)."""
+        self.except_ = list(kwargs.get('except', kwargs.get('except_', [])) or [])
+
+
+@dataclass
+class HasIdCondition:
+    """Match points whose id is in ``has_id``."""
+
+    has_id: List[Any]
+
+
+@dataclass
+class PayloadField:
+    """A payload key, as used by ``IsNullCondition`` / ``IsEmptyCondition``."""
+
+    key: str
+
+
+@dataclass
+class IsNullCondition:
+    """Match points whose payload value at ``is_null.key`` is null."""
+
+    is_null: PayloadField
+
+
+@dataclass
+class IsEmptyCondition:
+    """Match points whose payload value at ``is_empty.key`` is missing, null or an empty list."""
+
+    is_empty: PayloadField
+
+
+class Direction:
+    """Constants for the ordering direction of ``OrderBy``."""
+
+    ASC = 'asc'
+    DESC = 'desc'
+
+
+@dataclass
+class OrderBy:
+    """Order a scroll by a payload key (real Qdrant needs a range index on it)."""
+
+    key: str
+    direction: Optional[str] = None
+    start_from: Optional[Any] = None
+
+
+class Sample:
+    """Constants for ``SampleQuery``."""
+
+    RANDOM = 'random'
+
+
+@dataclass
+class SampleQuery:
+    """``query_points(query=SampleQuery(sample=Sample.RANDOM))`` draws random points."""
+
+    sample: str
+
+
+@dataclass
+class CountResult:
+    """Result of ``count()``."""
+
+    count: int
+
+
+@dataclass
+class FacetValueHit:
+    """One facet value and the number of matching points that carry it."""
+
+    value: Any
+    count: int
+
+
+@dataclass
+class FacetResponse:
+    """Result of ``facet()``: hits sorted by count (descending), then value."""
+
+    hits: List[FacetValueHit]
+
+
+@dataclass
+class SearchMatrixOffsetsResponse:
+    """Result of ``search_matrix_offsets()``: a sparse matrix in coordinate form.
+
+    ``offsets_row[i]`` and ``offsets_col[i]`` index ``ids``; ``scores[i]`` is their score.
+    """
+
+    offsets_row: List[int]
+    offsets_col: List[int]
+    scores: List[float]
+    ids: List[Any]
+
+
+@dataclass
+class PointIdsList:
+    """Selects points by id."""
+
+    points: List[Any]
+
+
+class Distance:
+    """Constants for the distance of a collection's vectors."""
+
+    COSINE = 'Cosine'
+    EUCLID = 'Euclid'
+    DOT = 'Dot'
+    MANHATTAN = 'Manhattan'
+
+
+@dataclass
+class VersionInfo:
+    """Result of ``info()``."""
+
+    title: str = 'qdrant - vector search engine'
+    version: str = 'mock'
+    commit: Optional[str] = None
+
+
+# =============================================================================
 # Aliases
 # =============================================================================
 # Some code may use alternative names for the same types
