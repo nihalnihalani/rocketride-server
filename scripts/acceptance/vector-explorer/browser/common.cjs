@@ -127,15 +127,17 @@ function sameVector(a, b) {
 }
 
 // Columns of a sample/project/neighbors answer hold one value per point (or edge, or scoped key), so
-// their length can equal the dimension by chance. Such a path is exempt only when the array is exactly
-// as long as the answer's own count: a dimension-long float array anywhere else is a vector.
-const COLUMN_TOOLS = new Set(['sample', 'project', 'neighbors']);
-const COLUMN_PATH = /\.(points\.\w+|density|knn\.sims|similarities|scores)$/;
+// their length can equal the dimension by chance; so can a row of a similarity_matrix answer, which holds
+// one similarity per resolved key. Such a path is exempt only when the array is exactly as long as the
+// answer's own count: a dimension-long float array anywhere else is a vector.
+const COLUMN_TOOLS = new Set(['sample', 'project', 'neighbors', 'similarity_matrix']);
+const COLUMN_PATH = /\.(points\.\w+|density|knn\.sims|similarities|scores|matrix\[\d+\])$/;
 
 /**
  * How many values the column at `at` must hold: the sample's `n` (points.*, density), its edge count
- * (knn.sims, as many as knn.cols), the size of the sample a project call names (similarities), or the
- * scope a neighbors call sent (scores). Null when the answer does not say.
+ * (knn.sims, as many as knn.cols), the size of the sample a project call names (similarities), the
+ * scope a neighbors call sent (scores), or a similarity matrix's `n` (matrix[i], when the matrix has
+ * exactly n rows). Null when the answer does not say.
  */
 function columnLength(tool, at, answer, input, sampleSizes) {
 	const a = answer || {};
@@ -143,6 +145,7 @@ function columnLength(tool, at, answer, input, sampleSizes) {
 	if (tool === 'sample' && /\.knn\.sims$/.test(at)) return a.knn && Array.isArray(a.knn.cols) ? a.knn.cols.length : null;
 	if (tool === 'project' && /\.similarities$/.test(at)) return sampleSizes.has(input.sample_id) ? sampleSizes.get(input.sample_id) : null;
 	if (tool === 'neighbors' && /\.scores$/.test(at)) return Array.isArray(input.scope_keys) ? input.scope_keys.length : null;
+	if (tool === 'similarity_matrix' && /\.matrix\[\d+\]$/.test(at)) return Number.isInteger(a.n) && Array.isArray(a.matrix) && a.matrix.length === a.n ? a.n : null;
 	return null;
 }
 
@@ -190,6 +193,78 @@ function privacyViolations(frames, dim) {
 		}
 	}
 	return violations;
+}
+
+/** The records of a CSV text (RFC 4180: quoted fields, doubled quotes, line breaks inside quotes). */
+function csvRecords(text) {
+	const records = [];
+	let record = [];
+	let field = '';
+	let quoted = false;
+	for (let i = 0; i < text.length; i += 1) {
+		const c = text[i];
+		if (quoted) {
+			if (c === '"' && text[i + 1] === '"') {
+				field += '"';
+				i += 1;
+			} else if (c === '"') quoted = false;
+			else field += c;
+		} else if (c === '"') quoted = true;
+		else if (c === ',') {
+			record.push(field);
+			field = '';
+		} else if (c === '\n' || c === '\r') {
+			if (c === '\r' && text[i + 1] === '\n') i += 1;
+			record.push(field);
+			records.push(record);
+			record = [];
+			field = '';
+		} else field += c;
+	}
+	if (field !== '' || record.length) {
+		record.push(field);
+		records.push(record);
+	}
+	return records;
+}
+
+const NUMBER = /^\s*-?(\d+\.?\d*|\.\d+)(e[-+]?\d+)?\s*$/i;
+
+/** Whether a list of number-like strings is a float vector of at least `dim` values. */
+function floatRun(values, dim) {
+	const nums = values.filter((v) => NUMBER.test(v)).map(Number);
+	return nums.length >= dim && nums.some((x) => !Number.isInteger(x));
+}
+
+/**
+ * The B4 property over a file the page let the user download (a CSV or JSON export): where it
+ * holds a float array of at least `dim` (dialect.dimension) numbers, as a JSON array, as a
+ * bracketed list inside a string or a CSV cell, or spread over the numeric fields of one CSV
+ * record; and the names of the `secrets` ({name: value}) whose value appears anywhere in it.
+ * Empty when the file is clean; one entry when the dimension is unknown (nothing can be checked).
+ */
+function downloadVectors(text, dim, secrets = {}) {
+	if (!Number.isInteger(dim) || dim <= 0) return [`dialect.dimension is unknown (${JSON.stringify(dim)}), so the download cannot be checked`];
+	const body = typeof text === 'string' ? text : String(text);
+	const found = [];
+	let parsed;
+	try {
+		parsed = JSON.parse(body);
+	} catch {
+		parsed = undefined;
+	}
+	if (parsed !== undefined) for (const hit of fullVectors(parsed, dim)) found.push(`a ${dim}-float array at ${hit.at}`);
+	// A vector serialised inside a string or a cell: every bracketed list of numbers in the raw text.
+	for (const m of body.matchAll(/\[([^[\]]*)\]/g)) {
+		if (floatRun(m[1].split(','), dim) && m[1].split(',').every((v) => NUMBER.test(v))) found.push(`a bracketed list of ${m[1].split(',').length} floats at offset ${m.index}`);
+	}
+	if (parsed === undefined) {
+		csvRecords(body).forEach((record, i) => {
+			if (floatRun(record, dim)) found.push(`record ${i + 1} holds ${record.filter((v) => NUMBER.test(v)).length} numeric fields`);
+		});
+	}
+	for (const [name, value] of Object.entries(secrets)) if (typeof value === 'string' && value && body.includes(value)) found.push(name);
+	return found;
 }
 
 // ---------------------------------------------------------------------------
@@ -463,6 +538,8 @@ module.exports = {
 	isUpload,
 	sameVector,
 	privacyViolations,
+	csvRecords,
+	downloadVectors,
 	captureFrames,
 	exchanges,
 	waitForExchange,
