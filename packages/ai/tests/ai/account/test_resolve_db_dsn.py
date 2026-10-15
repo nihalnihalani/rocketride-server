@@ -39,6 +39,7 @@ import ssl
 import threading
 import types
 import urllib.error
+import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -644,11 +645,23 @@ def _resolve_hosted():
 
 def test_hosted_issues_verify_full_against_the_operator_ca(hosted_broker):
     dsn = _resolve_hosted()
-    assert dsn == (
-        'postgresql://role:p%40ss%25w@rocketride-data-pool.ns.svc:5432/t_acme'
-        f'?sslmode=verify-full&sslrootcert={hosted_broker.ca}'
-    )
+    base, _, query = dsn.partition('?')
+    assert base == 'postgresql://role:p%40ss%25w@rocketride-data-pool.ns.svc:5432/t_acme'
+    # The CA path is percent-encoded in the query (libpq and SQLAlchemy decode
+    # it), so compare decoded values: a Windows path has ':' and '\'.
+    assert urllib.parse.parse_qs(query, strict_parsing=True) == {
+        'sslmode': ['verify-full'],
+        'sslrootcert': [str(hosted_broker.ca)],
+    }
     assert len(hosted_broker.calls) == 1
+
+
+def test_hosted_ca_path_round_trips_through_the_dsn_whatever_its_characters():
+    """A Windows path, a space, '&' and '%' are encoded so they cannot add or end a parameter."""
+    ca = 'C:\\Users\\runner\\db ca&100%.crt'
+    dsn = AccountBase._pin_dsn_tls('postgresql://r:p@pool.ns.svc/t?sslmode=require', hosted=True, ca_file=ca)
+    query = dsn.partition('?')[2]
+    assert urllib.parse.parse_qs(query, strict_parsing=True) == {'sslmode': ['verify-full'], 'sslrootcert': [ca]}
 
 
 @pytest.mark.parametrize(
