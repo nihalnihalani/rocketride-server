@@ -49,7 +49,11 @@ test('gaps: chunk ids run past the chunks stored; under the active listing, soft
 	);
 	assert.deepEqual(kinds(doc('a', 'C:/a.md', { chunks: 3, max_chunk_id: 3, deleted_chunks: 1 })), ['deleted_chunks'], 'the one missing id is the soft-deleted chunk');
 	assert.deepEqual(kinds(doc('a', 'C:/a.md', { chunks: 3, max_chunk_id: 4, deleted_chunks: 1 })), ['gaps', 'deleted_chunks'], 'one more missing than deleted');
+	assert.equal(documentHealth(doc('a', 'C:/a.md', { chunks: 3, max_chunk_id: 4, deleted_chunks: 1 }), {}).flags[0]?.detail, 'Chunk ids run to 4 but 3 chunks are stored: 1 is missing beyond the soft-deleted ones.');
+	assert.equal(documentHealth(doc('a', 'C:/a.md', { has_first_chunk: false, chunks: 30, max_chunk_id: 40, deleted_chunks: 2 }), {}).flags[1]?.detail, 'Chunk ids run to 40 but 30 chunks are stored: 8 are missing beyond the first chunk and the soft-deleted ones.');
+	assert.equal(documentHealth(doc('a', 'C:/a.md', { has_first_chunk: false, chunks: 3, max_chunk_id: 4 }), {}).flags[1]?.detail, 'Chunk ids run to 4 but 3 chunks are stored: 1 is missing beyond the first chunk.');
 	assert.deepEqual(kinds(doc('a', 'C:/a.md', { chunks: 4, max_chunk_id: 4, deleted_chunks: 1 }), { listing: 'all' }), ['gaps', 'deleted_chunks'], "listed with deleted:'all', deleted rows are counted, so a gap is a missing row");
+	assert.equal(documentHealth(doc('a', 'C:/a.md', { has_first_chunk: false, chunks: 3, max_chunk_id: 4, deleted_chunks: 1 }), { listing: 'all' }).flags[1]?.detail, 'Chunk ids run to 4 but 3 chunks are stored: 1 is missing beyond the first chunk.', "under 'all' the deleted rows are among the chunks stored");
 	assert.deepEqual(kinds(doc('a', 'C:/a.md', { chunks: 5, max_chunk_id: 4, deleted_chunks: 1 }), { listing: 'all' }), ['deleted_chunks']);
 	const extra = documentHealth(doc('a', 'C:/a.md', { chunks: 6, max_chunk_id: 3 }), {});
 	assert.deepEqual(

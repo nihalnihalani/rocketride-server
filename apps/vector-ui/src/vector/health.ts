@@ -113,8 +113,15 @@ export function documentHealth(item: IDocumentItem, ctx: IHealthContext = {}): I
 		if (item.chunks > ids) flags.push({ kind: 'gaps', label: 'gaps', detail: `More chunks than chunk ids: ${plural(item.chunks, 'chunk is', 'chunks are')} stored under ids 0 to ${item.max_chunk_id.toLocaleString('en-US')}.` });
 		else {
 			const missing = ids - item.chunks;
-			const explained = (item.has_first_chunk ? 0 : 1) + (listing === 'active' && reported(item.deleted_chunks) ? item.deleted_chunks : 0);
-			if (missing > explained) flags.push({ kind: 'gaps', label: 'gaps', detail: `Chunk ids run to ${item.max_chunk_id.toLocaleString('en-US')} but ${plural(item.chunks, 'chunk is', 'chunks are')} stored: ${missing.toLocaleString('en-US')} ${missing === 1 ? 'is' : 'are'} missing.` });
+			// A missing chunk 0 has its own flag; in an active listing the soft-deleted chunks are not counted either.
+			const first = item.has_first_chunk ? 0 : 1;
+			const deleted = listing === 'active' && reported(item.deleted_chunks) ? item.deleted_chunks : 0;
+			if (missing > first + deleted) {
+				const unexplained = missing - first - deleted;
+				const reasons = [first > 0 ? 'the first chunk' : null, deleted > 0 ? 'the soft-deleted ones' : null].filter((r): r is string => r !== null);
+				const why = reasons.length === 0 ? '' : ` beyond ${reasons.join(' and ')}`;
+				flags.push({ kind: 'gaps', label: 'gaps', detail: `Chunk ids run to ${item.max_chunk_id.toLocaleString('en-US')} but ${plural(item.chunks, 'chunk is', 'chunks are')} stored: ${unexplained.toLocaleString('en-US')} ${unexplained === 1 ? 'is' : 'are'} missing${why}.` });
+			}
 		}
 	} else unchecked.push('gaps');
 
