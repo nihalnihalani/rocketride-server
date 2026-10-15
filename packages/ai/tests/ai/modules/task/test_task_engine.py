@@ -820,6 +820,11 @@ async def _build_env(t):
     return await Task._build_subprocess_env(t, Task._db_access(t, t._pipeline))
 
 
+def _warnings(warn, prefix):
+    """The messages of the engine's warning() calls that start with ``prefix``."""
+    return [call.args[0] for call in warn.call_args_list if call.args and str(call.args[0]).startswith(prefix)]
+
+
 def _patch_resolve(monkeypatch, fake):
     import ai.account
 
@@ -886,7 +891,7 @@ async def test_subprocess_env_injects_resolved_dsn(monkeypatch):
     # as a missing DSN key here instead of the real tenant mismatch.
     seen = {}
 
-    async def fake_resolve(tenant_id):
+    async def fake_resolve(tenant_id, **_):
         # The tenant is the ORG (B6) — the user is only the OSS fallback.
         seen['tenant'] = tenant_id
         return 'postgresql://tenant@pooler/db?sslmode=require'
@@ -905,7 +910,7 @@ async def test_subprocess_env_dsn_tenant_is_the_org(monkeypatch):
     """
     seen = {}
 
-    async def fake_resolve(tenant_id):
+    async def fake_resolve(tenant_id, **_):
         seen['tenant'] = tenant_id
         return 'postgresql://tenant@pooler/db'
 
@@ -923,7 +928,7 @@ async def test_subprocess_env_dsn_falls_back_to_client_without_an_org(monkeypatc
     """OSS/single-user (no org concept): the user stays the tenant."""
     seen = {}
 
-    async def fake_resolve(tenant_id):
+    async def fake_resolve(tenant_id, **_):
         seen['tenant'] = tenant_id
         return 'postgresql://tenant@pooler/db'
 
@@ -941,7 +946,7 @@ async def test_subprocess_env_stale_dsn_does_not_survive_broker_failure(monkeypa
     """
     monkeypatch.setenv('ROCKETRIDE_DB_DSN', 'postgresql://stale@parent/other-tenant')
 
-    async def fake_resolve(client_id):
+    async def fake_resolve(client_id, **_):
         raise RuntimeError('DB broker request failed: HTTP 503')
 
     _patch_resolve(monkeypatch, fake_resolve)
@@ -962,7 +967,7 @@ async def test_subprocess_env_unconfigured_account_reports_missing_cloud_db(monk
     the ROCKETRIDE_CLIENT_ID message nothing documents.
     """
 
-    async def fake_resolve(client_id):
+    async def fake_resolve(client_id, **_):
         raise NotImplementedError('no RocketRide cloud database is configured on this server')
 
     _patch_resolve(monkeypatch, fake_resolve)
@@ -978,7 +983,7 @@ async def test_subprocess_env_unconfigured_account_reports_missing_cloud_db(monk
     # Missing broker config is normal on a local engine: debug only.
     t.debug_message.assert_called_once()
     assert 'no database broker' in t.debug_message.call_args.args[0]
-    warn.assert_not_called()
+    assert _warnings(warn, 'RocketRide DB DSN not resolved') == []
 
 
 @pytest.mark.asyncio
@@ -986,11 +991,19 @@ async def test_subprocess_env_unconfigured_account_reports_missing_cloud_db(monk
 async def test_subprocess_env_hosted_missing_broker_warns_and_directs_to_operator(monkeypatch, hosted_signal):
     import ai.account
     import ai.modules.task.task_engine as engine
+    from ai.account.base import DbDecision
 
-    async def fake_resolve(client_id):
+    async def fake_resolve(client_id, **_):
         raise NotImplementedError('broker not configured')
 
+    async def authorize(identity, target=None):
+        return DbDecision(True, 'ok', False, '')
+
     _patch_resolve(monkeypatch, fake_resolve)
+    # The hosted engine's account brings its own authorizer (not AccountBase's default).
+    monkeypatch.setattr(
+        type(ai.account.account), 'authorize_db_target', lambda self, identity, target=None: authorize(identity, target)
+    )
     monkeypatch.setattr(engine, 'startup_args', lambda: ['--saas'] if hosted_signal == 'flag' else [])
     monkeypatch.setattr(ai.account.account, 'capabilities', ['saas'] if hosted_signal == 'capability' else [])
     warn = MagicMock()
@@ -1006,7 +1019,7 @@ async def test_subprocess_env_hosted_missing_broker_warns_and_directs_to_operato
     assert 'db_postgres' not in reason
     for name in ('ROCKETRIDE_DB_DSN', 'ROCKETRIDE_DB_BROKER_URL', 'ROCKETRIDE_DB_BROKER_TOKEN'):
         assert name not in env
-    warn.assert_called_once_with(f'RocketRide DB DSN not resolved: {reason}')
+    assert _warnings(warn, 'RocketRide DB DSN not resolved') == [f'RocketRide DB DSN not resolved: {reason}']
     t.debug_message.assert_not_called()
 
 
@@ -1026,7 +1039,7 @@ _SCOPED_PIPELINE = {
 }
 
 
-def _fake_db_account(monkeypatch, deny=None, owner=None):
+def _fake_db_account(monkeypatch, deny=None, owner=None, hosted=False):
     """Swap the account's authorize/resolve for recorders. ``deny(target)``
     returns a reason to refuse that target, or None to allow it. An allow
     names the requested team or user id as its owner_id, as the SaaS
@@ -1035,7 +1048,7 @@ def _fake_db_account(monkeypatch, deny=None, owner=None):
     import ai.account
     from ai.account.base import DbDecision
 
-    calls = {'authorize': [], 'resolve': []}
+    calls = {'authorize': [], 'resolve': [], 'request_ids': []}
 
     async def authorize(identity, target=None):
         calls['authorize'].append((identity, target))
@@ -1045,13 +1058,32 @@ def _fake_db_account(monkeypatch, deny=None, owner=None):
         approved = owner(target) if owner else target.get('team_id') or target.get('user_id') or ''
         return DbDecision(True, 'ok', False, approved)
 
-    async def resolve(client_id, scope='org', owner_id=''):
+    async def resolve(client_id, scope='org', owner_id='', *, request_id=''):
         calls['resolve'].append((client_id, scope, owner_id))
+        calls['request_ids'].append(request_id)
         return f'postgresql://{scope}-{owner_id or client_id}@pooler/db'
 
     monkeypatch.setattr(ai.account.account, 'authorize_db_target', authorize)
     monkeypatch.setattr(ai.account.account, 'resolve_db_dsn', resolve)
+    if hosted:
+        _make_hosted(monkeypatch, authorize)
     return calls
+
+
+def _make_hosted(monkeypatch, authorize=None):
+    """Make this a hosted engine whose account class brings its own authorizer
+    (as the SaaS extension does) instead of AccountBase's single-tenant default.
+    """
+    import ai.account
+    import ai.modules.task.task_engine as engine
+
+    monkeypatch.setattr(engine, '_is_saas_engine', lambda: True)
+    if authorize is not None:
+
+        async def saas_authorize(self, identity, target=None):
+            return await authorize(identity, target)
+
+        monkeypatch.setattr(type(ai.account.account), 'authorize_db_target', saas_authorize)
 
 
 @pytest.mark.asyncio
@@ -1213,7 +1245,7 @@ async def test_failed_resolve_names_the_database_that_failed(monkeypatch):
     """
     calls = _fake_db_account(monkeypatch)
 
-    async def resolve(client_id, scope='org', owner_id=''):
+    async def resolve(client_id, scope='org', owner_id='', **_):
         calls['resolve'].append((client_id, scope, owner_id))
         if scope == 'team':
             raise RuntimeError('DB broker rejected provision for this account (HTTP 403)')
@@ -1288,6 +1320,217 @@ async def test_start_authorizes_the_resolved_pipeline(monkeypatch, components, e
     # The task file is the resolved pipeline too: what was checked is what runs.
     written = t._write_task_file.call_args.args[0]['components']
     assert '${' not in json.dumps(written)
+
+
+# ---------------------------------------------------------------------------
+# Hosted engines: the authorizer must be the account layer's, not the default
+# ---------------------------------------------------------------------------
+
+
+def _log_lines(warn, prefix):
+    return [line for line in _warnings(warn, prefix)]
+
+
+@pytest.mark.asyncio
+async def test_hosted_engine_refuses_the_single_tenant_authorizer(monkeypatch):
+    """AccountBase.authorize_db_target allows the org database to anyone: right for
+    a one-tenant OSS server, a silent bypass of every membership check if a hosted
+    engine runs without the SaaS authorizer (a half-updated deploy).
+    """
+    import ai.modules.task.task_engine as engine
+
+    resolved = []
+
+    async def resolve(client_id, **kwargs):
+        resolved.append(client_id)
+        return 'postgresql://x@pooler/db'
+
+    _patch_resolve(monkeypatch, resolve)
+    monkeypatch.setattr(engine, '_is_saas_engine', lambda: True)
+    with pytest.raises(PermissionError, match='single-tenant database authorizer'):
+        await _build_env(_env_task(pipeline=_DB_PIPELINE))
+    assert resolved == []
+
+
+@pytest.mark.asyncio
+async def test_hosted_engine_runs_with_the_accounts_own_authorizer(monkeypatch):
+    calls = _fake_db_account(monkeypatch, hosted=True)
+    env = await _build_env(_env_task(pipeline=_DB_PIPELINE))
+    assert json.loads(env['ROCKETRIDE_DB_DSNS']) == {'org': 'postgresql://org-org-1@pooler/db'}
+    assert len(calls['authorize']) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_local_engine_keeps_the_single_tenant_authorizer(monkeypatch):
+    async def resolve(client_id, **kwargs):
+        return 'postgresql://x@pooler/db'
+
+    _patch_resolve(monkeypatch, resolve)
+    env = await _build_env(_env_task(pipeline=_DB_PIPELINE))
+    assert json.loads(env['ROCKETRIDE_DB_DSNS']) == {'org': 'postgresql://x@pooler/db'}
+
+
+@pytest.mark.asyncio
+async def test_hosted_engine_needs_an_org_before_any_account_call(monkeypatch):
+    calls = _fake_db_account(monkeypatch, hosted=True)
+    t = _env_task(pipeline=_DB_PIPELINE)
+    t.org_id = ''
+    with pytest.raises(PermissionError, match='no organisation'):
+        await _build_env(t)
+    assert calls['authorize'] == [] and calls['resolve'] == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('scope', 'decision_owner', 'message'),
+    [
+        ('org', 'team-9', 'owner_id'),  # the org database has no owner
+        ('team', '', 'owner_id'),  # a team database must name its team
+        ('user', None, 'owner_id'),
+        ('team', 5, 'owner_id'),
+    ],
+)
+async def test_an_allow_that_names_its_database_wrongly_is_refused(monkeypatch, scope, decision_owner, message):
+    calls = _fake_db_account(monkeypatch, owner=lambda target: decision_owner)
+    pipeline = {'components': [{'id': 'db', 'provider': 'rocketride_sql', 'config': {'scope': scope}}]}
+    with pytest.raises(PermissionError, match=message):
+        await _build_env(_env_task(pipeline=pipeline))
+    assert calls['resolve'] == []
+
+
+@pytest.mark.asyncio
+async def test_an_account_without_owner_id_fails_closed_with_a_clear_message(monkeypatch):
+    """An older SaaS account returns a decision with no owner_id at all."""
+    import ai.account
+
+    resolved = []
+
+    async def old_authorize(identity, target=None):
+        return SimpleNamespace(allowed=True, reason='ok', audit=False)
+
+    async def resolve(client_id, **kwargs):
+        resolved.append(client_id)
+        return 'postgresql://x@pooler/db'
+
+    monkeypatch.setattr(ai.account.account, 'authorize_db_target', old_authorize)
+    _patch_resolve(monkeypatch, resolve)
+    with pytest.raises(PermissionError, match='owner_id'):
+        await _build_env(_env_task(pipeline=_DB_PIPELINE))
+    assert resolved == []
+
+
+@pytest.mark.asyncio
+async def test_the_loaded_authorizer_is_logged_once(monkeypatch):
+    import ai.modules.task.task_engine as engine
+
+    _fake_db_account(monkeypatch)
+    warn = MagicMock()
+    monkeypatch.setattr(engine, 'warning', warn)
+    monkeypatch.setattr(engine, '_LOGGED_DB_AUTHORIZERS', set())
+    await _build_env(_env_task(pipeline=_DB_PIPELINE))
+    await _build_env(_env_task(pipeline=_DB_PIPELINE))
+    lines = _log_lines(warn, 'RocketRide DB authorizer')
+    assert len(lines) == 1
+    assert 'ai.account.oss.Account' in lines[0] and 'authorize_db_target' in lines[0]
+
+
+# ---------------------------------------------------------------------------
+# One audit line per database target (task, caller, tenant, outcome)
+# ---------------------------------------------------------------------------
+
+
+def _db_access_lines(warn):
+    import json as _json
+
+    prefix = 'RocketRide DB access '
+    return [_json.loads(line[len(prefix) :]) for line in _warnings(warn, prefix)]
+
+
+@pytest.fixture()
+def engine_warnings(monkeypatch):
+    import ai.modules.task.task_engine as engine
+
+    warn = MagicMock()
+    monkeypatch.setattr(engine, 'warning', warn)
+    return warn
+
+
+@pytest.mark.asyncio
+async def test_every_issued_database_is_logged_with_its_caller_and_tenant(monkeypatch, engine_warnings):
+    _fake_db_account(monkeypatch)
+    await _build_env(_env_task(pipeline=_SCOPED_PIPELINE))
+    common = {
+        'task': 'task-test',
+        'org': 'org-1',
+        'user': 'client-env-test',
+        'team': 'team-1',
+        'run_kind': 'dev',
+        'owner_kind': 'user',
+        'outcome': 'issued',
+        'reason': 'ok',
+    }
+    assert _db_access_lines(engine_warnings) == [
+        {**common, 'scope': 'org', 'owner': ''},
+        {**common, 'scope': 'team', 'owner': 'team-1'},
+        {**common, 'scope': 'user', 'owner': 'user-2'},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_denial_is_logged_and_its_siblings_are_marked_aborted(monkeypatch, engine_warnings):
+    _fake_db_account(monkeypatch, deny=lambda target: 'not_org_admin' if target['scope'] == 'user' else None)
+    with pytest.raises(PermissionError):
+        await _build_env(_env_task(pipeline=_SCOPED_PIPELINE))
+    assert [(line['scope'], line['outcome'], line['reason']) for line in _db_access_lines(engine_warnings)] == [
+        ('org', 'aborted', 'another_database_denied'),
+        ('team', 'aborted', 'another_database_denied'),
+        ('user', 'denied', 'not_org_admin'),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_failed_resolution_is_logged_with_the_exception_type_only(monkeypatch, engine_warnings):
+    _fake_db_account(monkeypatch)
+
+    async def resolve(client_id, scope='org', owner_id='', **_):
+        if scope == 'team':
+            raise RuntimeError('DB broker rejected provision for this account (HTTP 403) postgresql://leak')
+        return 'postgresql://pw-secret@pooler/db'
+
+    import ai.account
+
+    monkeypatch.setattr(ai.account.account, 'resolve_db_dsn', resolve)
+    env = await _build_env(_env_task(pipeline=_SCOPED_PIPELINE))
+    assert 'ROCKETRIDE_DB_DSNS' not in env
+    lines = _db_access_lines(engine_warnings)
+    assert [(line['scope'], line['outcome'], line['reason']) for line in lines] == [
+        ('org', 'aborted', 'another_database_failed'),
+        ('team', 'resolve_failed', 'RuntimeError'),
+        ('user', 'aborted', 'another_database_failed'),
+    ]
+    assert 'leak' not in json.dumps(lines) and 'pw-secret' not in json.dumps(lines)
+
+
+@pytest.mark.asyncio
+async def test_a_hosted_refusal_is_logged_per_database(monkeypatch, engine_warnings):
+    import ai.modules.task.task_engine as engine
+
+    monkeypatch.setattr(engine, '_is_saas_engine', lambda: True)
+    with pytest.raises(PermissionError):
+        await _build_env(_env_task(pipeline=_SCOPED_PIPELINE))
+    lines = _db_access_lines(engine_warnings)
+    assert [(line['scope'], line['outcome'], line['reason']) for line in lines] == [
+        ('org', 'denied', 'single_tenant_authorizer_on_hosted_engine'),
+        ('team', 'denied', 'single_tenant_authorizer_on_hosted_engine'),
+        ('user', 'denied', 'single_tenant_authorizer_on_hosted_engine'),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_the_task_id_is_sent_to_the_broker_as_the_request_id(monkeypatch):
+    calls = _fake_db_account(monkeypatch)
+    await _build_env(_env_task(pipeline=_SCOPED_PIPELINE))
+    assert calls['request_ids'] == ['task-test'] * 3
 
 
 # ---------------------------------------------------------------------------

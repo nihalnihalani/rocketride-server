@@ -60,11 +60,13 @@ class _FakeBroker(BaseHTTPRequestHandler):
     """Stands in for the data-core provisioner."""
 
     requests: list = []
+    request_ids: list = []
 
     def do_POST(self):  # noqa: N802 (http.server API)
         length = int(self.headers.get('Content-Length', 0))
         body = json.loads(self.rfile.read(length) or b'{}')
         type(self).requests.append({'auth': self.headers.get('Authorization'), 'body': body})
+        type(self).request_ids.append(self.headers.get('X-Request-Id'))
 
         tenant = body.get('tenant_id', '')
         if self.headers.get('Authorization') != f'Bearer {TEST_TOKEN}':
@@ -129,6 +131,11 @@ def broker(monkeypatch):
     yield _FakeBroker
     server.shutdown()
     server.server_close()
+
+
+@pytest.fixture(autouse=True)
+def _reset_request_ids():
+    _FakeBroker.request_ids = []
 
 
 def _resolve(client_id: str) -> str:
@@ -675,3 +682,24 @@ def test_the_insecure_opt_in_does_nothing_on_a_hosted_engine(hosted_broker, monk
     hosted_broker.answer['dsn'] = 'postgresql://r:p@pool.ns.svc/t?sslmode=disable'
     with pytest.raises(RuntimeError, match='DB broker returned'):
         _resolve_hosted()
+
+
+# ---------------------------------------------------------------------------
+# Request id: the task id travels to the broker for its own log line
+# ---------------------------------------------------------------------------
+
+
+def test_the_request_id_is_sent_as_a_header(broker):
+    asyncio.run(_Minimal().resolve_db_dsn('tenant-1', request_id='ab12cd34.chat_1'))
+    assert broker.request_ids == ['ab12cd34.chat_1']
+
+
+def test_no_request_id_sends_no_header(broker):
+    _resolve('tenant-1')
+    assert broker.request_ids == [None]
+
+
+def test_a_request_id_cannot_inject_a_header(broker):
+    asyncio.run(_Minimal().resolve_db_dsn('tenant-1', request_id='x\r\nX-Evil: 1'))
+    assert broker.request_ids == ['x__X-Evil:_1']
+    assert len(broker.requests) == 1

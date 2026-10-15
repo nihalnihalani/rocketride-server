@@ -413,7 +413,9 @@ class AccountBase(ABC):
             return DbDecision(True, 'single_tenant')
         return DbDecision(False, 'scope_needs_rocketride_cloud')
 
-    async def resolve_db_dsn(self, client_id: str, scope: str = 'org', owner_id: str = '') -> str:
+    async def resolve_db_dsn(
+        self, client_id: str, scope: str = 'org', owner_id: str = '', *, request_id: str = ''
+    ) -> str:
         """
         Resolve the DSN of one RocketRide cloud database.
 
@@ -454,6 +456,10 @@ class AccountBase(ABC):
             scope: ``'org'``, ``'team'`` or ``'user'``.
             owner_id: The team id or user id for team and user scope. Must be
                 empty for org scope.
+            request_id: Correlation id (the task engine passes the task id),
+                sent to the broker as ``X-Request-Id`` so its own log line can
+                be tied to this call. Characters outside ``[A-Za-z0-9._:-]``
+                become ``_``; at most 128 are sent.
 
         Returns:
             A libpq/SQLAlchemy-compatible PostgreSQL DSN for the tenant DB
@@ -499,7 +505,7 @@ class AccountBase(ABC):
         import asyncio
 
         return await asyncio.to_thread(
-            self._call_db_broker, broker_url, broker_token, body, hosted=hosted, ca_file=ca_file
+            self._call_db_broker, broker_url, broker_token, body, hosted=hosted, ca_file=ca_file, request_id=request_id
         )
 
     @staticmethod
@@ -591,7 +597,9 @@ class AccountBase(ABC):
         return urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
 
     @staticmethod
-    def _call_db_broker(url: str, token: str, body: dict, *, hosted: bool = False, ca_file: str = '') -> str:
+    def _call_db_broker(
+        url: str, token: str, body: dict, *, hosted: bool = False, ca_file: str = '', request_id: str = ''
+    ) -> str:
         """Blocking POST of ``body`` to the provisioner; runs in a worker thread.
 
         Stdlib-only on purpose: the account layer has no async-HTTP dependency,
@@ -603,18 +611,18 @@ class AccountBase(ABC):
         log, with the token masked.
         """
         import json
+        import re
         import urllib.error
         import urllib.request
 
-        request = urllib.request.Request(
-            url,
-            data=json.dumps(body).encode('utf-8'),
-            headers={
-                'Authorization': f'Bearer {token}',
-                'Content-Type': 'application/json',
-            },
-            method='POST',
-        )
+        headers = {
+            'Authorization': f'Bearer {token}',
+            'Content-Type': 'application/json',
+        }
+        if request_id:
+            # A correlation id, not free text: nothing that could end the header.
+            headers['X-Request-Id'] = re.sub(r'[^A-Za-z0-9._:-]', '_', request_id)[:128]
+        request = urllib.request.Request(url, data=json.dumps(body).encode('utf-8'), headers=headers, method='POST')
         try:
             with AccountBase._broker_opener().open(request, timeout=_BROKER_TIMEOUT_S) as response:
                 answer = json.loads(response.read().decode('utf-8'))
