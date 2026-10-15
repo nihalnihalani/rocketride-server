@@ -1527,6 +1527,31 @@ async def test_a_hosted_refusal_is_logged_per_database(monkeypatch, engine_warni
 
 
 @pytest.mark.asyncio
+async def test_a_restart_with_another_pipeline_authorizes_and_resolves_again(monkeypatch):
+    """restart_task runs start_task again: the targets come from the NEW pipeline,
+    every one is authorized again, and nothing from the previous run (or a DSN map
+    in the parent environment) survives.
+    """
+    calls = _fake_db_account(monkeypatch)
+    monkeypatch.setenv('ROCKETRIDE_DB_DSNS', '{"org": "postgresql://stale@parent/db", "team": "postgresql://stale"}')
+    t = _env_task(pipeline=_DB_PIPELINE)
+    first = await _build_env(t)
+    assert set(json.loads(first['ROCKETRIDE_DB_DSNS'])) == {'org'}
+
+    t._pipeline = {'components': [{'id': 'g', 'provider': 'rocketride_graph', 'config': {'scope': 'user'}}]}
+    second = await _build_env(t)
+    assert json.loads(second['ROCKETRIDE_DB_DSNS']) == {'user': 'postgresql://user-client-env-test@pooler/db'}
+    assert [target for _, target in calls['authorize']] == [
+        {'scope': 'org'},
+        {'scope': 'user', 'user_id': 'client-env-test'},
+    ]
+
+    t._pipeline = {'components': [{'id': 'x', 'provider': 'tools'}]}  # no DB node: nothing is provisioned
+    third = await _build_env(t)
+    assert 'ROCKETRIDE_DB_DSNS' not in third and len(calls['resolve']) == 2
+
+
+@pytest.mark.asyncio
 async def test_the_task_id_is_sent_to_the_broker_as_the_request_id(monkeypatch):
     calls = _fake_db_account(monkeypatch)
     await _build_env(_env_task(pipeline=_SCOPED_PIPELINE))
