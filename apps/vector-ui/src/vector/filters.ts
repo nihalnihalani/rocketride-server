@@ -49,6 +49,7 @@
 
 import type { Availability, FilterApplied, IDocumentItem, IDocumentsFilter, IScopeState, IStatsResult } from '../contract/types';
 import { DOCUMENTS_FILTER_KEYS } from '../contract/types';
+import { filterItems, filterSummary } from './documents';
 import type { IPagerState } from './documents';
 import type { IStatsView } from './results';
 
@@ -554,6 +555,45 @@ export function resolveScope(scope: IScopeState, dir: IPagerState, cap: number):
 	const sameIds = scope.objectIds === objectIds || (scope.objectIds !== null && objectIds !== null && scope.objectIds.length === objectIds.length && scope.objectIds.every((id, i) => id === objectIds[i]));
 	if (sameIds && scope.overflow === overflow && scope.label === label) return scope;
 	return { ...scope, label, objectIds, overflow };
+}
+
+/** What the directory shows: its rows and the status line under the ScopeBar. */
+export interface IDirectoryView {
+	/** The rows to list, in the listing's order. */
+	rows: IDocumentItem[];
+	/** The status line, or null with nothing to say. */
+	summary: string | null;
+	/** What the directory knows about the scope, or null without one. */
+	scope: IScopeView | null;
+}
+
+/**
+ * The directory's rows and status line. Without a scope the path box filters
+ * what is loaded, as it always did. With one, the rows are the listing's
+ * filtered here by the keys the store did not apply (the path box among them);
+ * with its Documents toggle off the list shows every document and the line
+ * says how many the scope keeps.
+ *
+ * @param dir - The listing.
+ * @param scope - The scope, or null.
+ * @param text - The path box (applied, after its debounce).
+ * @param cap - `limits.scope_keys_max`.
+ * @returns The view.
+ */
+export function directoryView(dir: IPagerState, scope: IScopeState | null, text: string, cap: number): IDirectoryView {
+	if (scope === null) {
+		const rows = filterItems(dir.rows, text);
+		return { rows, summary: filterSummary(dir, text, rows.length), scope: null };
+	}
+	const view = scopeView(scope, dir, cap);
+	if (!scope.applyTo.documents) {
+		const rows = filterItems(dir.rows, text);
+		return { rows, summary: `Not applied to this list. Scope: ${scopeStatusText(view)}`, scope: view };
+	}
+	const asked = view.applied !== 'here';
+	const keys = clientKeys(scope.filter, asked ? dir.filterApplied : null, dir.filterIgnored);
+	const rows = keys.length === 0 ? [...dir.rows] : dir.rows.filter((row) => matches(row, scope.filter, keys));
+	return { rows, summary: scopeStatusText(view), scope: view };
 }
 
 // =============================================================================

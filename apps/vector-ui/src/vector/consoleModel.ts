@@ -37,7 +37,7 @@
 // =============================================================================
 
 import type { IExplorerEndpoint, IProbeResult } from 'shared/explorer';
-import type { Availability, ConsoleModel, VectorNodes } from '../contract/types';
+import type { Availability, ConsoleModel, IScopeState, VectorNodes } from '../contract/types';
 import { DEFAULT_LIMITS, readDialect } from './results';
 import type { IStatsView } from './results';
 import { BUSY, CODE_SENTENCES, EMPTY } from './wording';
@@ -119,6 +119,23 @@ export function toolsSourceIsTools(endpoint: IExplorerEndpoint): boolean {
  */
 export function writesDuringRemoval(writes: Availability, removal: 'idle' | 'running' | 'done' | 'error'): Availability {
 	return removal === 'running' && writes.enabled ? off(BUSY.removing) : writes;
+}
+
+/**
+ * The documents the next chat question is asked about: those of "Ask about
+ * these" first, else the scope's while its Chat toggle is on and it resolved
+ * to at least one document; never more than `limits.scope_keys_max` (above it
+ * the chat is not scoped and the ScopeBar says why).
+ *
+ * @param asked - The documents "Ask about these" chose, or null.
+ * @param scope - The console's scope, or null.
+ * @param cap - `limits.scope_keys_max`.
+ * @returns The objectIds, or null for the whole collection.
+ */
+export function chatScopeFor(asked: readonly string[] | null, scope: IScopeState | null | undefined, cap: number): readonly string[] | null {
+	if (asked !== null && asked.length > 0) return asked.length <= cap ? asked : null;
+	if (!scope || !scope.applyTo.chat || scope.overflow !== null || scope.objectIds === null || scope.objectIds.length === 0) return null;
+	return scope.objectIds.length <= cap ? scope.objectIds : null;
 }
 
 /**

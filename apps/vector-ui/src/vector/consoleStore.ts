@@ -36,6 +36,9 @@
 //              background while the console is visible; hidden, it pauses
 //              (and sorts what is loaded); shown, it resumes at its cursor. A
 //              refresh starts over and drops any page of the old listing.
+//              With a scope, every page asks the store for its conditions
+//              (setFilter); new conditions list again from the first page,
+//              the same ones ask nothing, and refreshes keep them.
 //   CHUNKS     the selected document's chunks, a page at a time.
 //   REMOVAL    requestRemove opens a confirmation and sends NOTHING; Cancel
 //              sends nothing and says so; Confirm sends the batches once
@@ -54,6 +57,7 @@ import { removalSummary, runRemoval } from './confirm';
 import type { IRemoveTarget } from './confirm';
 import { pagerApplyPage, pagerBegin, pagerFail, pagerInit, pagerLoadMore, pagerPause, pagerResume, pagerWantsPage } from './documents';
 import type { IPagerState } from './documents';
+import { filterKeys, sameFilter } from './filters';
 import type { IChunksPageView, IDocumentsPageView, IRemoveView, IStatsView } from './results';
 import { statsRefreshPlan } from './stats';
 import type { StatsTrigger } from './stats';
@@ -147,6 +151,12 @@ export interface IConsoleStore {
 	documentsChanged(): void;
 	loadMoreDocuments(): void;
 	retryDocuments(): void;
+	/**
+	 * The conditions every page of the directory asks the store for (the scope's, without the path box), or
+	 * null for every document. New conditions list again from the first page; the same ones ask nothing.
+	 * Before the console opens they are kept for its first listing.
+	 */
+	setFilter(filter: IDocumentsFilter | null): void;
 	selectDocument(objectId: string | null): void;
 	loadMoreChunks(): void;
 	requestRemove(targets: readonly IRemoveTarget[]): void;
@@ -253,7 +263,7 @@ export function createConsoleStore(deps: IConsoleDeps, opts: IConsoleOptions): I
 			while (!disposed && run === dirRun && state.visible && pagerWantsPage(state.directory)) {
 				let page: IDocumentsPageView;
 				try {
-					page = await deps.documents(state.directory.cursor, opts.pageSize);
+					page = await deps.documents(state.directory.cursor, opts.pageSize, state.directory.filter);
 				} catch (error) {
 					if (disposed || run !== dirRun) return;
 					const text = failureText(error);
@@ -270,11 +280,11 @@ export function createConsoleStore(deps: IConsoleDeps, opts: IConsoleOptions): I
 		}
 	}
 
-	/** Start the listing over. */
-	function startDirectory(): void {
+	/** Start the listing over (with its filter unless another is given). */
+	function startDirectory(filter: IDocumentsFilter | null = state.directory.filter): void {
 		dirRun += 1;
 		pumping = null;
-		set({ directory: pagerBegin(state.directory) });
+		set({ directory: pagerBegin(state.directory, filter) });
 		void pump(dirRun);
 	}
 
@@ -338,6 +348,15 @@ export function createConsoleStore(deps: IConsoleDeps, opts: IConsoleOptions): I
 		retryDocuments(): void {
 			set({ directory: pagerResume(state.directory) });
 			void pump(dirRun);
+		},
+		setFilter(filter: IDocumentsFilter | null): void {
+			const next = filter !== null && filterKeys(filter).length > 0 ? { ...filter } : null;
+			if (sameFilter(next, state.directory.filter)) return;
+			if (state.directory.status === 'idle') {
+				set({ directory: { ...state.directory, filter: next } });
+				return;
+			}
+			startDirectory(next);
 		},
 		selectDocument(objectId: string | null): void {
 			chunkRun += 1;
