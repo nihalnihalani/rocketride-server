@@ -152,6 +152,8 @@ pooler. Errors never name the database server, user or database.
 
 | Field | Type | Description | Default |
 |---|---|---|---|
+| `rrvector.agent_writes` | `boolean` | **Allow agent writes**<br/>Lets an agent in this pipeline call the upsert and delete tools. | `true` |
+| `rrvector.allow_writes` | `boolean` | **Allow document management from tool calls**<br/>Lets a Tools source of this pipeline remove documents through tool calls (the Vector Explorer's trash can, and the delete and upsert tools). Off by default. The table is shared by every pipeline of the organization that names it. | `false` |
 | `rrvector.collection` | `string` | **Table**<br/>Name of the table to store vectors in your RocketRide cloud database. | `"rocketride"` |
 | `rrvector.hnsw_ef_construction` | `integer` | **HNSW ef_construction**<br/>HNSW build-time candidate list size used when the index is first created. | `64` |
 | `rrvector.hnsw_m` | `integer` | **HNSW m**<br/>HNSW graph degree (max connections per layer) used when the index is first created. | `16` |
