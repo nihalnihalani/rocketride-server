@@ -72,6 +72,7 @@ from .vx_types import (
     CONTROL_OBJECT_ID,
     DELETED_VALUES,
     FILTER_APPLIED_VALUES,
+    LISTING_REASONS,
     PROJECTIONS,
     SAMPLE_STRATEGIES,
     SUPPORT_LEVELS,
@@ -97,8 +98,13 @@ WRITE_TOOLS = ('remove_document', 'delete', 'upsert')
 #: Most rows ``objdir`` scans through ``listDocuments`` to fill one answer.
 OBJDIR_SCAN_MAX = 10000
 
-#: Documents the sampler lists to build its key space.
+#: Documents the sampler lists to build its key space (a scope of more documents is listed whole,
+#: up to ``scope_keys_max``; contract section 4.4-B).
 SAMPLE_LISTING_MAX = 500
+
+#: Share of the sample's time budget its document listing may use; the listing then stops
+#: (``listing.reason: 'budget'``) and the sample is drawn from what it listed.
+SAMPLE_LISTING_BUDGET_SHARE = 0.5
 
 #: Pages in a row a document listing may answer without a new document before paging stops.
 LISTING_STALE_PAGES = 2
@@ -839,6 +845,11 @@ class ListingGuard:
     that bring no new document (empty pages handed out with a cursor, a backend that
     ignores the cursor), after the pages ``rows_wanted`` needs plus
     :data:`LISTING_SLACK_PAGES`, or once ``budget_s`` seconds have passed.
+
+    After :meth:`stop` returned True, :attr:`reason` says why, in the words of a
+    ``sample`` answer's ``listing.reason`` (contract section 4.4-B): ``'complete'``
+    (no cursor left), ``'stale'`` (pages without a new document, or a store that says
+    it cannot page), ``'pages'`` (the page budget) or ``'budget'`` (the time budget).
     """
 
     def __init__(self, rows_wanted: int, page_size: int, budget_s: Optional[float] = None) -> None:
@@ -846,18 +857,24 @@ class ListingGuard:
         self.deadline = None if budget_s is None else _monotonic() + budget_s
         self.pages = 0
         self.stale = 0
+        self.reason: Optional[str] = None
 
     def stop(self, page: Any, new_documents: int) -> bool:
-        """Record one page that added ``new_documents``; return whether to stop paging."""
+        """Record one page that added ``new_documents``; return whether to stop paging (see :attr:`reason`)."""
         self.pages += 1
         self.stale = 0 if new_documents else self.stale + 1
-        return (
-            not page.next_cursor
-            or 'documents_paging_unsupported' in (page.caveats or ())
-            or self.stale >= LISTING_STALE_PAGES
-            or self.pages >= self.max_pages
-            or (self.deadline is not None and _monotonic() > self.deadline)
-        )
+        cannot_page = 'documents_paging_unsupported' in (page.caveats or ())
+        if not page.next_cursor and not cannot_page:
+            self.reason = 'complete'
+        elif cannot_page or self.stale >= LISTING_STALE_PAGES:
+            self.reason = 'stale'
+        elif self.pages >= self.max_pages:
+            self.reason = 'pages'
+        elif self.deadline is not None and _monotonic() > self.deadline:
+            self.reason = 'budget'
+        else:
+            self.reason = None
+        return self.reason is not None
 
 
 def _cross_product(batch: Sequence[Key]) -> int:
@@ -1602,13 +1619,25 @@ class VectorExplorerTools:
 
     def _vx_list_rows(
         self, store: Any, object_ids: Optional[List[str]], deleted: str, limit: int, deadline: float
-    ) -> List[DocumentRow]:
-        """List up to ``limit`` documents (distinct by objectId), following cursors (:class:`ListingGuard`)."""
+    ) -> Tuple[List[DocumentRow], Dict[str, Any]]:
+        """List up to ``limit`` documents (distinct by objectId), following cursors (:class:`ListingGuard`).
+
+        Returns ``(rows, listing)``, where ``listing`` is the ``sample`` answer's
+        ``{"documents", "truncated", "reason"}`` (contract section 4.4-B): ``truncated`` is
+        true whenever documents were left when the listing ended (the last page still had a
+        cursor, the store said it cannot page, or the row cap left a listed document out),
+        and ``reason`` says why it ended (``'cap'`` for the row cap, else
+        :attr:`ListingGuard.reason`). The listing may use :data:`SAMPLE_LISTING_BUDGET_SHARE`
+        of the sample's time budget; past ``deadline`` the whole sample is ``TIMEOUT``.
+        """
         rows: Dict[str, DocumentRow] = {}
         cursor: Optional[str] = None
         page_size = min(LIMITS['documents_page'], limit)
-        guard = ListingGuard(limit, page_size)
-        while len(rows) < limit:
+        budget_s = LIMITS['sample_budget_ms'] / 1000.0
+        listing_deadline = deadline - budget_s * (1.0 - SAMPLE_LISTING_BUDGET_SHARE)
+        guard = ListingGuard(limit, page_size, max(0.0, listing_deadline - _monotonic()))
+        reason = 'complete'
+        while True:
             page = store.listDocuments(
                 cursor=cursor,
                 limit=page_size,
@@ -1617,14 +1646,26 @@ class VectorExplorerTools:
                 sort='path',
             )
             before = len(rows)
+            left_out = False
             for row in page.items:
-                if row.objectId != CONTROL_OBJECT_ID and row.objectId not in rows and len(rows) < limit:
+                if row.objectId == CONTROL_OBJECT_ID or row.objectId in rows:
+                    continue
+                if len(rows) < limit:
                     rows[row.objectId] = row
-            if guard.stop(page, len(rows) - before):
+                else:
+                    left_out = True
+            stop = guard.stop(page, len(rows) - before)
+            if len(rows) >= limit:
+                more = left_out or bool(page.next_cursor) or 'documents_paging_unsupported' in (page.caveats or ())
+                reason = 'cap' if more else 'complete'
+                break
+            if stop:
+                reason = guard.reason or 'complete'
                 break
             cursor = page.next_cursor
             self._vx_check_deadline(deadline)
-        return list(rows.values())
+        listing = {'documents': len(rows), 'truncated': reason != 'complete', 'reason': reason}
+        return list(rows.values()), listing
 
     @staticmethod
     def _vx_check_deadline(deadline: float) -> None:
@@ -1642,8 +1683,16 @@ class VectorExplorerTools:
         object_ids: Optional[List[str]],
         deleted: str,
         deadline: float,
-    ) -> Tuple[List[Doc], str, bool, Dict[str, DocumentRow]]:
-        """Draw the sample (contract section 2.4): ``(docs with vectors, strategy_used, biased, listing)``."""
+    ) -> Tuple[List[Doc], str, bool, Dict[str, DocumentRow], Optional[Dict[str, Any]]]:
+        """Draw the sample (contract section 2.4).
+
+        Returns ``(docs with vectors, strategy_used, biased, rows, listing)``: ``rows`` are the
+        listed documents by objectId; ``listing`` is the answer's ``listing`` object when the
+        key space came from the document listing, None when a native sampler drew the sample
+        (it lists nothing; its key space is the whole scope). Without a scope the listing
+        stops at :data:`SAMPLE_LISTING_MAX` documents; a scope (``filter.object_ids``, at most
+        ``scope_keys_max``) is listed whole, so the stratified pick spans every scoped document.
+        """
         flt = deletedFilter(deleted, objectIds=object_ids)
         chosen: Dict[Key, Doc] = {}
 
@@ -1688,10 +1737,11 @@ class VectorExplorerTools:
                 continue
             for doc in docs:
                 add(doc)
-            return list(chosen.values()), used if used in SAMPLE_STRATEGIES else strat, False, listing
+            return list(chosen.values()), used if used in SAMPLE_STRATEGIES else strat, False, listing, None
 
         # (3) / (4) keys from the document listing, read through getVectors.
-        rows = self._vx_list_rows(store, object_ids, deleted, SAMPLE_LISTING_MAX, deadline)
+        listing_max = max(SAMPLE_LISTING_MAX, len(object_ids)) if object_ids else SAMPLE_LISTING_MAX
+        rows, listed = self._vx_list_rows(store, object_ids, deleted, listing_max, deadline)
         listing = {row.objectId: row for row in rows}
         from .vx_math import stratified_pick
 
@@ -1724,7 +1774,7 @@ class VectorExplorerTools:
                 break
         if not readable and not chosen:
             raise StoreUnsupported('sample needs getVectors or sampleChunks, which this store does not support')
-        return list(chosen.values()), strategy_used, biased, listing
+        return list(chosen.values()), strategy_used, biased, listing, listed
 
     def _vx_refill(self, store, strat, chosen, add, n, seed, flt, deadline) -> int:
         added_total = 0
@@ -1770,6 +1820,15 @@ class VectorExplorerTools:
                 'n': {'type': 'integer'},
                 'points': {'type': 'object'},
                 'knn': {'type': 'object'},
+                'listing': {
+                    'type': 'object',
+                    'description': 'How the documents the sample was drawn from were listed, and why the listing ended.',
+                    'properties': {
+                        'documents': {'type': 'integer'},
+                        'truncated': {'type': 'boolean'},
+                        'reason': {'type': 'string', 'enum': list(LISTING_REASONS)},
+                    },
+                },
             },
         },
         description=(
@@ -1837,7 +1896,7 @@ class VectorExplorerTools:
             if light and store.vectorSize:
                 check_light_budget(n, int(store.vectorSize))
             deadline = started + LIMITS['sample_budget_ms'] / 1000.0
-            docs, strategy_used, biased, listing = self._vx_collect_sample(
+            docs, strategy_used, biased, listing, listed = self._vx_collect_sample(
                 store,
                 n=n,
                 seed=seed,
@@ -1941,6 +2000,15 @@ class VectorExplorerTools:
             )
 
         of_filter = {'objectIds': object_ids} if object_ids else {}
+        of = {
+            'chunks': self._vx_count(store.countChunks, deletedFilter(deleted, **of_filter)),
+            'documents': self._vx_count(store.countDocuments, deletedFilter(deleted, **of_filter)),
+        }
+        if listed is None:
+            # A native sampler drew from the whole scope without listing it: its key space is
+            # complete, and spans the documents the store counts (else the ones it drew from).
+            documents = of['documents'] if of['documents'] is not None else len(doc_order)
+            listed = {'documents': documents, 'truncated': False, 'reason': 'complete'}
         answer = {
             'success': True,
             'sample_id': sample_id,
@@ -1948,10 +2016,7 @@ class VectorExplorerTools:
             'n': len(keys),
             'n_requested': n,
             'mode': mode,
-            'of': {
-                'chunks': self._vx_count(store.countChunks, deletedFilter(deleted, **of_filter)),
-                'documents': self._vx_count(store.countDocuments, deletedFilter(deleted, **of_filter)),
-            },
+            'of': of,
             'strategy_used': strategy_used,
             'biased': biased,
             'knn_source': knn_source,
@@ -1980,8 +2045,12 @@ class VectorExplorerTools:
             'pca': {'explained': _round_list(explained, 5)},
             'took_ms': int((_monotonic() - started) * 1000),
         }
-        if biased:
-            answer['caveats'] = ['biased_sample']
+        caveats = ['biased_sample'] if biased else []
+        if listed['truncated']:
+            caveats.append('listing_truncated')
+        if caveats:
+            answer['caveats'] = caveats
+        answer['listing'] = listed
         if warnings:
             answer['warnings'] = warnings
         return answer
