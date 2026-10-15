@@ -173,6 +173,12 @@ export const CHOOSE_KEEP_FIRST = 'Choose the document to keep first';
 /** Every document of a group has text of its own beside the shared passages. */
 export const SHARED_PASSAGES_NOTE = 'Shared passages only: each of these documents also has text the others do not. Removing a document removes all of it.';
 
+/** Some document of a group is not a copy of the others. */
+export const NOT_WHOLE_COPIES_NOTE = 'Not every document here is a copy of the others: removing one removes text the others do not have.';
+
+/** A policy does not choose in a group that is not copies. */
+export const POLICY_LEAVES_GROUP = 'A keep policy leaves this group alone; pick the document to keep by hand to queue the others.';
+
 /**
  * After the console removed queued documents.
  *

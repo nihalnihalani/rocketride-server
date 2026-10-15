@@ -24,7 +24,7 @@ import { test } from 'node:test';
 import type { IDocumentItem, IDuplicatePair, IKnnBlock, ISampleResult } from '../src/contract/types';
 import { reviewedDocuments } from '../src/adapters/connections';
 import { connectionCaches } from '../src/adapters/explorer';
-import { KEEP_POLICIES, THRESHOLD_DEFAULT, THRESHOLD_MAX, THRESHOLD_MIN, applyPolicy, dedupeView, docInfo, duplicateGroupOf, groupOf, groups, keepOf, markReviewed, pairsAt, queueInit, queueReducer, queued, reviewedOf, unmarkReviewed } from '../src/map/dedupe';
+import { KEEP_POLICIES, THRESHOLD_DEFAULT, THRESHOLD_MAX, THRESHOLD_MIN, applyPolicy, dedupeView, docInfo, duplicateGroupOf, groupOf, groups, isCopyGroup, keepOf, markReviewed, pairsAt, queueInit, queueReducer, queued, reviewedOf, unmarkReviewed } from '../src/map/dedupe';
 import { loadSample } from './support/map.samples';
 
 // =============================================================================
@@ -333,6 +333,34 @@ test('reviewed groups and documents removed already are not queued; a document a
 	const q = queued(two.groups, picked, docInfo(shared, null), new Set());
 	assert.deepEqual(q.objectIds, ['ob'], 'oa is kept by the first group, so the second does not queue it');
 	assert.deepEqual(q.conflicts, ['oa']);
+});
+
+test('a policy keeps only in groups of copies; a group of shared passages (a boilerplate paragraph) needs a keep picked by hand', () => {
+	// D#0 shares one paragraph with E#0, but each has three more sampled chunks of its own.
+	const passages = sampleOf(
+		[
+			['od', 'C:/demo/ops/memo_q1.txt', 4],
+			['oe', 'C:/demo/ops/memo_q2.txt', 4],
+		],
+		[0, 0, 0, 0, 1, 1, 1, 1].map((doc, i) => ({ doc, chunk: i % 4 })),
+		[[[4, 0.99]], [], [], [], [[0, 0.99]], [], [], []]
+	);
+	const info = docInfo(passages, null);
+	const [group] = dedupeView(passages, 0.97).groups;
+	assert.equal(isCopyGroup(group!, info), false);
+	const policy = queueReducer(queueInit(), { type: 'policy', value: 'shortest-path' });
+	assert.equal(keepOf(group!, policy, info), null, 'the policy leaves shared passages alone');
+	assert.deepEqual(queued([group!], policy, info, new Set()).objectIds, []);
+	const picked = queueReducer(policy, { type: 'keep', group: group!.key, objectId: 'od' });
+	assert.deepEqual(queued([group!], picked, info, new Set()).objectIds, ['oe'], 'a hand-picked keep still queues the other');
+	const small = docInfo(SMALL, ROWS_INFO);
+	assert.ok(
+		dedupeView(SMALL, 0.97).groups.every((g) => isCopyGroup(g, small)),
+		'copies: every document has at least half of its sampled chunks in the group'
+	);
+	const demo = loadSample('sample_demo_1000.json');
+	const demoInfo = docInfo(demo, null);
+	assert.deepEqual(queued(dedupeView(demo, 0.97).groups, policy, demoInfo, new Set()).objectIds, [], "the demo sample's groups are one shared chunk of long documents each: nothing is queued by a policy");
 });
 
 test('the threshold moves within 0.90 to 0.995 and re-groups at once from the sample alone', () => {

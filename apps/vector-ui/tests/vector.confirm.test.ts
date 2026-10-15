@@ -159,12 +159,13 @@ test('the announcement after a removal names the document and the rows removed',
 // THE DUPLICATES QUEUE THROUGH THE CONSOLE'S DIALOG
 // =============================================================================
 
-/** The demo sample's queue under "Keep shortest path", with directory rows for every document of the sample. */
+/** The demo sample's queue with a document kept by hand in each group, with directory rows for every document of the sample. */
 function demoQueue(): { ids: string[]; rows: IDocumentItem[] } {
 	const sample = loadSample('sample_demo_1000.json');
 	const rows: IDocumentItem[] = sample.docs.map((d) => ({ objectId: d.objectId, path: d.path, chunks: d.chunks, has_first_chunk: true, tables: 0, deleted: false, nodeId: null, size: null, modifyTime: null, ingestedAt: null, pointId: null }));
 	const view = dedupeView(sample, 0.97);
-	const state = queueReducer(queueInit(), { type: 'policy', value: 'shortest-path' });
+	// The demo's groups are shared passages, which a policy leaves alone: keep the first document of each by hand.
+	const state = view.groups.reduce((s, g) => queueReducer(s, { type: 'keep', group: g.key, objectId: g.objectIds[0] as string }), queueInit());
 	return { ids: queued(view.groups, state, docInfo(sample, rows), new Set()).objectIds, rows };
 }
 

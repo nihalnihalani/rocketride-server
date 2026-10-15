@@ -35,7 +35,9 @@
 //
 // A keep policy (oldest ingest, shortest path, most chunks) or a hand-picked
 // keep chooses one document per group; the others are queued for removal,
-// except a document another group keeps. Removal itself is the console's:
+// except a document another group keeps. A policy only chooses in a group
+// of copies (every document has at least half of its sampled chunks in the
+// group): a paragraph several files share is never queued by a policy. Removal itself is the console's:
 // the panel hands the queued objectIds to `requestRemove`, which confirms
 // with the typed count and sends `remove_document` in batches.
 //
@@ -430,7 +432,41 @@ export function queueReducer(state: IQueueState, action: QueueAction): IQueueSta
 }
 
 /**
- * The document a group keeps: the hand-picked one, else the policy's.
+ * Whether a group's documents are copies of each other: every document has
+ * at least half of its sampled chunks in the group. A group that is not
+ * (a boilerplate paragraph at the end of otherwise different files, a
+ * short note quoted inside a long manual) is shared text, and removing a
+ * document would remove everything else it holds.
+ *
+ * @param group - The group.
+ * @param info - The documents.
+ * @returns True for copies.
+ */
+export function isCopyGroup(group: Pick<IDocumentGroup, 'objectIds' | 'shared'>, info: ReadonlyMap<string, IDocInfo>): boolean {
+	return group.objectIds.every((id) => {
+		const inSample = info.get(id)?.inSample ?? 0;
+		return inSample > 0 && (group.shared[id] ?? 0) * 2 >= inSample;
+	});
+}
+
+/**
+ * Whether every document of a group has most of its sampled chunks outside it.
+ *
+ * @param group - The group.
+ * @param info - The documents.
+ * @returns True when the group holds shared passages only.
+ */
+export function isPassagesOnly(group: Pick<IDocumentGroup, 'objectIds' | 'shared'>, info: ReadonlyMap<string, IDocInfo>): boolean {
+	return group.objectIds.every((id) => {
+		const inSample = info.get(id)?.inSample ?? 0;
+		return inSample > 0 && (group.shared[id] ?? 0) * 2 < inSample;
+	});
+}
+
+/**
+ * The document a group keeps: the hand-picked one, else the policy's. A
+ * policy only chooses in a group of copies; shared text needs a keep picked
+ * by hand, so no policy ever queues a document for a paragraph it shares.
  *
  * @param group - The group.
  * @param state - The choices.
@@ -440,7 +476,7 @@ export function queueReducer(state: IQueueState, action: QueueAction): IQueueSta
 export function keepOf(group: IDocumentGroup, state: IQueueState, info: ReadonlyMap<string, IDocInfo>): string | null {
 	const picked = state.overrides[group.key];
 	if (picked !== undefined && group.objectIds.includes(picked)) return picked;
-	return applyPolicy(group, state.policy, info);
+	return isCopyGroup(group, info) ? applyPolicy(group, state.policy, info) : null;
 }
 
 /**

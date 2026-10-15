@@ -239,6 +239,10 @@ test('the reviewed documents of a connection come from its cache, so the queue k
 test('a group of shared passages says so; nothing is removable before a keep is chosen', () => {
 	const out = html(<DuplicatesPanel sample={demo} writes={on} onSelect={noop} onRemoveDocument={noop} onRemoveDocuments={noop} />);
 	assert.equal((out.match(/Shared passages only: each of these documents also has text the others do not\./g) ?? []).length, 3, 'one chunk of documents with many: passages, not copies');
+	assert.equal((out.match(/A keep policy leaves this group alone; pick the document to keep by hand to queue the others\./g) ?? []).length, 3);
+	const policy = html(<DuplicatesPanel sample={demo} writes={on} onSelect={noop} onRemoveDocument={noop} onRemoveDocuments={noop} initial={{ policy: 'shortest-path' }} />);
+	assert.match(policy, /role="status"[^>]*>No document queued/, 'a policy queues nothing from shared passages');
+	assert.doesNotMatch(policy, /checked=""/);
 	assert.doesNotMatch(html(<DuplicatesPanel sample={SMALL} writes={on} onSelect={noop} onRemoveDocument={noop} />), /Shared passages only/, 'a copy shares most of its chunks');
 	assert.match(out, /<button[^>]*disabled=""[^>]*title="Choose the document to keep first"[^>]*>Remove the others<\/button>/);
 });

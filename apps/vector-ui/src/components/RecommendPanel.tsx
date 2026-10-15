@@ -181,7 +181,7 @@ export function RecommendBody(props: RecommendBodyProps): React.ReactElement {
 			<div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 6, margin: '6px 0' }}>
 				<label style={{ ...MAP_STYLES.label, display: 'inline-flex', alignItems: 'center', gap: 6 }}>
 					<span>Strategy</span>
-					<select style={MAP_STYLES.select} value={props.strategy} aria-label="How the examples are combined" onChange={(event) => props.onStrategy(event.currentTarget.value as RecommendStrategy)}>
+					<select style={{ ...MAP_STYLES.select, maxWidth: 200 }} value={props.strategy} aria-label="How the examples are combined" onChange={(event) => props.onStrategy(event.currentTarget.value as RecommendStrategy)}>
 						<option value="average_vector">Average vector</option>
 						<option value="best_score" disabled={!props.bestScore}>
 							{props.bestScore ? 'Best score (ranked by the store)' : 'Best score (only where the store ranks examples itself)'}
