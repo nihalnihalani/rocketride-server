@@ -705,7 +705,12 @@ def test_documents_matches_the_fixture(wired):
     _store, inst, _sample = wired
     answer, fixture = inst.documents({}), _fixture('documents_page1')
     _same_keys(answer, fixture, 'documents')
-    _same_keys(answer['items'][0], fixture['items'][0], 'documents.items[]')
+    _same_keys(
+        answer['items'][0],
+        fixture['items'][0],
+        'documents.items[]',
+        _additive(fixture['items'][0], _fixture('documents_filter_server')['items'][0]),
+    )
 
 
 def test_chunks_matches_the_fixture(wired):
