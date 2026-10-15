@@ -218,6 +218,20 @@ concurrent refreshes coalesce into one follow-up. One discovery may take at most
 30 s (`discoveryTimeoutMs`); after that the refresh ends with status `error`, so
 a server that never answers cannot leave the list refreshing forever.
 
+The engine sends a task's `begin` (or `restart`) event while the task is still
+loading, and the task listing holds running tasks only, so the refresh that event
+triggers usually comes too early, and no event follows when the task starts
+running. The store therefore remembers the task the event names (project id
+and source; `readTaskEvent` in `shellBinding.ts`) and looks again 1, 2, 4 and
+8 s after the previous look, then every 15 s, until a discovery lists that
+task, its `end` event arrives, or `startWatchMs` (default 5 minutes) has passed
+since the start event. These looks are background refreshes: they probe only
+an endpoint that is new or came back, never a `ready` one, so they do not keep
+an idle task awake. Detaching and `reset()` stop them. Without them, a card
+whose pipeline started after the list was loaded, or a Vector connection whose
+ingest source restarted, stayed out of date until the next focus or explicit
+refresh.
+
 ## Calling a tool
 
 [`connect/session.ts`](../../../apps/shared/src/explorer/connect/session.ts):

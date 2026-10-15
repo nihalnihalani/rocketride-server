@@ -74,9 +74,22 @@
 //
 // WHEN IT REFRESHES
 //   explicitly (`refresh`), on task events (debounced), and on window focus
-//   (debounced and rate-limited) — never on a timer. Concurrent refreshes
-//   coalesce: while one is running, any number of triggers produce exactly ONE
-//   follow-up. A newer refresh's result is never overwritten by an older one.
+//   (debounced and rate-limited) — never on an open-ended timer. Concurrent
+//   refreshes coalesce: while one is running, any number of triggers produce
+//   exactly ONE follow-up. A newer refresh's result is never overwritten by an
+//   older one.
+//
+//   A STARTED TASK IS LOOKED FOR. The engine announces a task's start (`begin`,
+//   `restart`) while the task is still loading, and discovery lists running
+//   tasks only, so the refresh that event asks for usually comes too early;
+//   nothing announces the moment the task runs. While attached, the store
+//   therefore remembers each task a start event named (project id and source)
+//   and looks again 1, 2, 4 and 8 s after the previous look, then every 15 s,
+//   until a discovery lists it, its `end` event arrives, or
+//   `startWatchMs` (default 5 min) has passed since its start event; a new
+//   start event begins the steps again. Detach and reset forget them. A look
+//   is a background refresh: discovery only, plus the probe of an endpoint
+//   that is new or came back, so a task nobody uses is not kept awake by it.
 //
 // WHEN IT PROBES AGAIN
 //   A probe is a tool call, and a tool call that reaches a task counts as
@@ -103,7 +116,7 @@
 import { ExplorerToolError, readErrorCode, readErrorMessage } from '../errors';
 import { checkObject, isPlainObject } from '../checks';
 import type { IGenerationTicket } from '../generation';
-import type { IExplorerClient, IExplorerEndpoint, IExplorerIdentity, IProbeResult, IRoleSpec, ISendFile } from '../types';
+import type { IExplorerClient, IExplorerEndpoint, IExplorerIdentity, IProbeResult, IRoleSpec, ISendFile, ITaskRef } from '../types';
 import { READ_ONLY_DETAIL, discoverToolEndpoints, mapWithConcurrency } from './discovery';
 import type { IDiscoveredEndpoint, NodeFilter } from './discovery';
 import { identityFingerprint } from './identity';
@@ -131,10 +144,20 @@ export interface IEndpointState {
 	refreshedAt: number;
 }
 
+/** What a task lifecycle event tells the store. */
+export interface ITaskEventInfo {
+	/** Re-check endpoints that did not change identity (a restart). */
+	reprobe: boolean;
+	/** The task a `begin` or `restart` announced, when the event names it: look for it until it runs. */
+	started?: ITaskRef;
+	/** The task an `end` announced, when the event names it: stop looking for it. */
+	ended?: ITaskRef;
+}
+
 /** What woke the store up. */
 export interface IWatchHandlers {
-	/** A task event arrived; `reprobe` asks to re-check endpoints that did not change identity (a restart). */
-	onTaskEvent(info: { reprobe: boolean }): void;
+	/** A task event arrived (see {@link ITaskEventInfo}). */
+	onTaskEvent(info: ITaskEventInfo): void;
 	/** The window regained focus. */
 	onFocus(): void;
 	/** The identity changed or was cleared (sign-out). */
@@ -181,6 +204,11 @@ export interface IEndpointStoreOptions {
 	 * waiting forever.
 	 */
 	discoveryTimeoutMs?: number;
+	/**
+	 * How long after a start event the store keeps looking for the started
+	 * task (default {@link DEFAULT_START_WATCH_MS}; see "WHEN IT REFRESHES").
+	 */
+	startWatchMs?: number;
 	/** Clock and timers (default: real). */
 	clock?: IStoreClock;
 	/**
@@ -196,6 +224,17 @@ export interface IEndpointStoreOptions {
  * without a bound.
  */
 export const DEFAULT_ASK_TIMEOUT_MS = 120_000;
+
+/**
+ * How long the store keeps looking for a task after its start event (5 min):
+ * longer than a first start that loads an embedding model (about 90 s on a
+ * laptop), short enough that a start it can never see costs a bounded number
+ * of task listings.
+ */
+export const DEFAULT_START_WATCH_MS = 300_000;
+
+/** The waits between looks for a started task; the last one repeats. */
+const START_LOOK_STEPS_MS: readonly number[] = [1_000, 2_000, 4_000, 8_000, 15_000];
 
 /**
  * One role of a multi-role connection (Vector Explorer: ingest, chat, tools),
@@ -315,6 +354,7 @@ export function createEndpointStore(options: IEndpointStoreOptions): IEndpointSt
 	const debounceMs = options.debounceMs ?? 300;
 	const focusMinIntervalMs = options.focusMinIntervalMs ?? 5_000;
 	const discoveryTimeoutMs = options.discoveryTimeoutMs ?? 30_000;
+	const startWatchMs = options.startWatchMs ?? DEFAULT_START_WATCH_MS;
 	const clock: IStoreClock = options.clock ?? {
 		now: () => Date.now(),
 		setTimer: (fn, ms) => setTimeout(fn, ms),
@@ -372,6 +412,14 @@ export function createEndpointStore(options: IEndpointStoreOptions): IEndpointSt
 	let pendingDebounce: { client: IExplorerClient; reprobe: boolean } | null = null;
 	let lastRefreshStartedAt = 0;
 	let attachedClient: IExplorerClient | null = null;
+	/**
+	 * Tasks a start event named that no discovery has listed yet: task ref key
+	 * -> give up at (epoch ms). See "A STARTED TASK IS LOOKED FOR".
+	 */
+	const awaitingStart = new Map<string, number>();
+	let startLookTimer: unknown = null;
+	/** Index into START_LOOK_STEPS_MS of the next wait. */
+	let startLookStep = 0;
 
 	/**
 	 * Replace the snapshot and notify.
@@ -814,23 +862,25 @@ export function createEndpointStore(options: IEndpointStoreOptions): IEndpointSt
 	 * failure) after the timeout is dropped.
 	 *
 	 * @param client - The client.
-	 * @returns What discovery found.
+	 * @returns What discovery found, and the tasks it saw running (token-free).
 	 */
-	function boundedDiscovery(client: IExplorerClient): Promise<IDiscoveredEndpoint[]> {
+	function boundedDiscovery(client: IExplorerClient): Promise<{ found: IDiscoveredEndpoint[]; running: readonly ITaskRef[] }> {
+		let running: readonly ITaskRef[] = [];
 		const discovery = discoverToolEndpoints(client, {
 			providers: options.providers,
 			roles: options.roles,
 			identity: identityNow,
 			concurrency,
 			...(options.nodeFilter !== undefined ? { nodeFilter: options.nodeFilter } : {}),
+			onRunning: (tasks) => { running = tasks; },
 		});
-		return new Promise<IDiscoveredEndpoint[]>((resolve, reject) => {
+		return new Promise((resolve, reject) => {
 			const timer = clock.setTimer(() => {
 				discovery.catch(() => undefined);
 				reject(new Error(`The server did not answer within ${Math.round(discoveryTimeoutMs / 1000)} s with the list of running pipelines. Refresh to try again.`));
 			}, discoveryTimeoutMs);
 			discovery.then(
-				(found) => { clock.clearTimer(timer); resolve(found); },
+				(found) => { clock.clearTimer(timer); resolve({ found, running }); },
 				(error: unknown) => { clock.clearTimer(timer); reject(error); },
 			);
 		});
@@ -852,10 +902,11 @@ export function createEndpointStore(options: IEndpointStoreOptions): IEndpointSt
 
 		const run = (async (): Promise<void> => {
 			try {
-				const found = await boundedDiscovery(client);
+				const { found, running } = await boundedDiscovery(client);
 				if (epochAfterReset(startedEpoch)) return;
 				const toProbe = merge(found, opts.reprobe === true, opts.background === true);
 				setState({ ...state, status: 'ready', error: null, refreshedAt: clock.now() });
+				noteRunning(running);
 				const probes = mapWithConcurrency(toProbe, concurrency, (endpoint) => runProbe(client, endpoint));
 				// A re-discovery done to rebind a restarted endpoint must not wait on
 				// the probes it started; everything else resolves with final states.
@@ -864,6 +915,8 @@ export function createEndpointStore(options: IEndpointStoreOptions): IEndpointSt
 			} catch (error) {
 				if (epochAfterReset(startedEpoch)) return;
 				setState({ ...state, status: 'error', error: error instanceof Error ? error.message : String(error) });
+				// A failed listing says nothing about a started task: keep looking, within its window.
+				noteRunning([]);
 			}
 		})();
 		inFlight = run;
@@ -919,10 +972,88 @@ export function createEndpointStore(options: IEndpointStoreOptions): IEndpointSt
 		}, debounceMs);
 	}
 
+	// ── Started tasks ─────────────────────────────────────────────────────────
+
+	/**
+	 * The map key of a task ref.
+	 *
+	 * @param ref - The task.
+	 * @returns Its key.
+	 */
+	function taskKey(ref: ITaskRef): string {
+		return JSON.stringify([ref.projectId, ref.source]);
+	}
+
+	/** Cancel the next look, if one is scheduled. */
+	function cancelStartLook(): void {
+		if (startLookTimer !== null) {
+			clock.clearTimer(startLookTimer);
+			startLookTimer = null;
+		}
+	}
+
+	/** Forget every started task and stop looking. */
+	function forgetStarts(): void {
+		cancelStartLook();
+		awaitingStart.clear();
+		startLookStep = 0;
+	}
+
+	/**
+	 * Remember a task a start event named, and begin the steps again.
+	 *
+	 * @param ref - The task.
+	 */
+	function awaitStart(ref: ITaskRef): void {
+		awaitingStart.set(taskKey(ref), clock.now() + startWatchMs);
+		// The refresh the event asks for looks first; the next look is 1 s after it.
+		cancelStartLook();
+		startLookStep = 0;
+	}
+
+	/**
+	 * Stop looking for a task its end event named.
+	 *
+	 * @param ref - The task.
+	 */
+	function endStart(ref: ITaskRef): void {
+		awaitingStart.delete(taskKey(ref));
+		if (awaitingStart.size === 0) forgetStarts();
+	}
+
+	/**
+	 * After a discovery: forget the started tasks it listed and those whose
+	 * window passed, and schedule the next look for the rest.
+	 *
+	 * @param running - The tasks the discovery saw running (empty when it failed).
+	 */
+	function noteRunning(running: readonly ITaskRef[]): void {
+		if (awaitingStart.size === 0) return;
+		for (const ref of running) awaitingStart.delete(taskKey(ref));
+		const now = clock.now();
+		for (const [key, until] of awaitingStart) {
+			if (until <= now) awaitingStart.delete(key);
+		}
+		if (awaitingStart.size === 0) {
+			forgetStarts();
+			return;
+		}
+		const client = attachedClient;
+		if (client === null || startLookTimer !== null) return;
+		const wait = START_LOOK_STEPS_MS[Math.min(startLookStep, START_LOOK_STEPS_MS.length - 1)]!;
+		startLookStep += 1;
+		startLookTimer = clock.setTimer(() => {
+			startLookTimer = null;
+			if (attachedClient !== client || awaitingStart.size === 0) return;
+			void refresh(client, { background: true });
+		}, wait);
+	}
+
 	function reset(): void {
 		resetCount += 1;
 		probing.clear();
 		cancelDebounce();
+		forgetStarts();
 		vault.clear();
 		roleVault.clear();
 		keptInfo.clear();
@@ -957,7 +1088,11 @@ export function createEndpointStore(options: IEndpointStoreOptions): IEndpointSt
 		applyIdentity(identity);
 
 		const unwatch = watch?.({
-			onTaskEvent: ({ reprobe }) => scheduleRefresh(client, reprobe),
+			onTaskEvent: ({ reprobe, started, ended }) => {
+				if (ended !== undefined) endStart(ended);
+				if (started !== undefined && attachedClient === client) awaitStart(started);
+				scheduleRefresh(client, reprobe);
+			},
 			onFocus: () => {
 				if (clock.now() - lastRefreshStartedAt < focusMinIntervalMs) return;
 				scheduleRefresh(client, false);
@@ -971,7 +1106,10 @@ export function createEndpointStore(options: IEndpointStoreOptions): IEndpointSt
 		return () => {
 			unwatch?.();
 			cancelDebounce();
-			if (attachedClient === client) attachedClient = null;
+			if (attachedClient === client) {
+				attachedClient = null;
+				forgetStarts();
+			}
 		};
 	}
 

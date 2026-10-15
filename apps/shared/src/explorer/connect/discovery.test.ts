@@ -651,6 +651,48 @@ describe('discoverToolEndpoints — Vector role map (providers, read-only anchor
 	});
 });
 
+describe('discoverToolEndpoints — onRunning (which tasks run, token-free)', () => {
+	it('reports every usable running row once, endpoint or not, as its project id and source only', async () => {
+		const rows = [
+			...projectRows(['tools_1', 'ingest_1'], vectorComponents('rocketride_vector')),
+			// Another app's pipeline: no endpoint here, but it is running.
+			row({ source: 'tools_9', pipeline: { project_id: 'other', components: [{ id: 'db_1', provider: 'db_postgres' }] } }),
+			// A pipeline with no project id.
+			row({ source: 'chat_7', pipeline: { components: [] } }),
+		];
+		const world = fakeWorld([...rows, { source: 'no_token' } as unknown as ReturnType<typeof row>]);
+		const reports: unknown[] = [];
+		const found = await discoverToolEndpoints(world.client, { providers: VECTOR, roles: VECTOR_ROLES, nodeFilter: controlledByTools, onRunning: (running) => reports.push(running) });
+		assert.deepEqual(found.map((f) => f.endpoint.nodeId), ['store_1']);
+		assert.equal(reports.length, 1);
+		assert.deepEqual(reports[0], [
+			{ projectId: 'vp', source: 'tools_1' },
+			{ projectId: 'vp', source: 'ingest_1' },
+			{ projectId: 'other', source: 'tools_9' },
+			{ projectId: '', source: 'chat_7' },
+		]);
+		const text = JSON.stringify(reports);
+		assert.equal(rows.some((r) => text.includes(r.token)), false);
+	});
+
+	it('also reports the caller\'s own run in another organization, which never becomes an endpoint', async () => {
+		const identity: IExplorerIdentity = { userId: 'u1', orgId: 'org-B', devTeam: 'team-b1', teamPermissions: { 'team-b1': ['task.data'] }, orgPermissions: [] };
+		const world = fakeWorld([row({ teamId: 'team-a1', source: 'own_dev_in_A' })]);
+		let reported: unknown = null;
+		const found = await discoverToolEndpoints(world.client, { providers: DB, roles: SINGLE_TOOLS_ROLE, identity, onRunning: (running) => { reported = running; } });
+		assert.deepEqual(found, []);
+		assert.deepEqual(reported, [{ projectId: 'proj-1', source: 'own_dev_in_A' }]);
+	});
+
+	it('is not called when the task listing fails', async () => {
+		// The listing fails: the fake cannot read its rows.
+		const world = fakeWorld(null as unknown as ReturnType<typeof row>[]);
+		let calls = 0;
+		await assert.rejects(discoverToolEndpoints(world.client, { providers: DB, roles: SINGLE_TOOLS_ROLE, onRunning: () => { calls += 1; } }));
+		assert.equal(calls, 0);
+	});
+});
+
 describe('mapWithConcurrency', () => {
 	it('never runs more than the limit at once and keeps result order', async () => {
 		let now = 0;

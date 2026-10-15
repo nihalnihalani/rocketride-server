@@ -146,6 +146,18 @@ export interface IExplorerTaskRow {
 	pipeline: IExplorerPipeline | null;
 }
 
+/**
+ * One task named by what it runs, never by its token: its pipeline's project
+ * id and its source component id. A task lifecycle event names a task this
+ * way, and discovery reports the running tasks this way.
+ */
+export interface ITaskRef {
+	/** `pipeline.project_id` ('' when the pipeline has none). */
+	projectId: string;
+	/** The task's source component id. */
+	source: string;
+}
+
 // =============================================================================
 // IDENTITY
 // =============================================================================

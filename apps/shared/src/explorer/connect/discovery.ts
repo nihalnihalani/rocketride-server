@@ -72,7 +72,7 @@
 
 import { isPlainObject } from '../checks';
 import { buildEndpointKey, legacyKeyFromKey, roleKeySource } from '../keys';
-import type { IExplorerClient, IExplorerComponent, IExplorerEndpoint, IExplorerIdentity, IExplorerPipeline, IExplorerTaskRow, IMultiRoleEndpoint, IRoleBinding, IRoleDef, IRoleSpec } from '../types';
+import type { IExplorerClient, IExplorerComponent, IExplorerEndpoint, IExplorerIdentity, IExplorerPipeline, IExplorerTaskRow, IMultiRoleEndpoint, IRoleBinding, IRoleDef, IRoleSpec, ITaskRef } from '../types';
 import { identityCanCallTools, runInIdentityOrganization } from './identity';
 
 // =============================================================================
@@ -148,6 +148,16 @@ export interface IDiscoveryOptions {
 	 * chat path's second store never becomes a card, running Tools source or not.
 	 */
 	nodeFilter?: NodeFilter;
+	/**
+	 * Told once per discovery, after the task listing answered, which tasks are
+	 * running: every usable row (one with a token and a source) as its project
+	 * id and source, never its token, in listing order. A row counts whether
+	 * or not it becomes an endpoint (another app's pipeline, the caller's own
+	 * run in another organization). The store uses it to stop looking for a
+	 * task whose start was announced before it ran (see store.ts, "WHEN IT
+	 * REFRESHES"). Not called when the task listing fails.
+	 */
+	onRunning?: (running: readonly ITaskRef[]) => void;
 }
 
 /** One discovered endpoint, with the secret that belongs in the vault. */
@@ -481,9 +491,9 @@ function claimRank(endpoint: IExplorerEndpoint): number {
 export async function discoverToolEndpoints(client: IExplorerClient, options: IDiscoveryOptions): Promise<IDiscoveredEndpoint[]> {
 	const raw = await client.getTasks();
 	const identity = options.identity ?? null;
-	const rows = (Array.isArray(raw) ? raw : [])
-		.map(readTaskRow)
-		.filter((row): row is IExplorerTaskRow => row !== null && runInIdentityOrganization(identity, row.teamId));
+	const usable = (Array.isArray(raw) ? raw : []).map(readTaskRow).filter((row): row is IExplorerTaskRow => row !== null);
+	options.onRunning?.(usable.map((row) => ({ projectId: projectIdOf(row), source: row.source })));
+	const rows = usable.filter((row) => runInIdentityOrganization(identity, row.teamId));
 	const multiRole = !isSingleRole(options.roles);
 	const groups = groupRows(rows, options.roles);
 	const componentLists = await mapWithConcurrency(groups, options.concurrency ?? 4, (group) => componentsOf(client, group));

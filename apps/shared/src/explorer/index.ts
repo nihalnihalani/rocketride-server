@@ -47,6 +47,7 @@ export type {
 	IRoleDef,
 	IRoleSpec,
 	ISendFile,
+	ITaskRef,
 } from './types';
 export { SINGLE_TOOLS_ROLE, VECTOR_ROLES } from './types';
 
@@ -102,8 +103,8 @@ export {
 	TRANSIENT_TASK_CODE,
 	createToolSession,
 } from './connect/session';
-export type { EndpointStatus, EndpointWatch, IEndpointState, IEndpointStore, IEndpointStoreOptions, IRoleChannel, IStoreClock, IWatchHandlers } from './connect/store';
-export { DEFAULT_ASK_TIMEOUT_MS, createEndpointStore, probeInfo } from './connect/store';
+export type { EndpointStatus, EndpointWatch, IEndpointState, IEndpointStore, IEndpointStoreOptions, IRoleChannel, IStoreClock, ITaskEventInfo, IWatchHandlers } from './connect/store';
+export { DEFAULT_ASK_TIMEOUT_MS, DEFAULT_START_WATCH_MS, createEndpointStore, probeInfo } from './connect/store';
 
 export type { IConnectionFlags, IConnectionFlagsOptions } from './history/flags';
 export { createConnectionFlags } from './history/flags';

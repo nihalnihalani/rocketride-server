@@ -26,7 +26,7 @@
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { DEFAULT_ASK_TIMEOUT_MS, createEndpointStore } from './store';
+import { DEFAULT_ASK_TIMEOUT_MS, DEFAULT_START_WATCH_MS, createEndpointStore } from './store';
 import type { EndpointWatch, IEndpointStore, IWatchHandlers } from './store';
 import { CONFIG_SENTINEL, codedError, fakeWorld, manualClock, projectRows, ragComponents, row } from './testing';
 import type { IFakeRow, IFakeWorld, IManualClock, IToolCall } from './testing';
@@ -662,6 +662,209 @@ describe('refresh discipline — coalescing, debounce, focus, cleanup', () => {
 		await clock.advance(1_000);
 		// The stale handler may re-arm a timer, but the detached store's client is gone from the watch.
 		assert.equal(watch.subscribed, 1);
+	});
+});
+
+// =============================================================================
+// A STARTED TASK IS LOOKED FOR UNTIL IT RUNS
+// =============================================================================
+
+describe('a task that starts is looked for until discovery lists it (its start event comes before it runs)', () => {
+	const VX_INFO = { dialect: 'qdrant', capabilities: { remove: true }, limits: { statement_timeout_ms: 30000 } };
+	const INGEST = { projectId: 'vp', source: 'ingest_1' };
+	const NEW_TASK = { projectId: 'p-new', source: 'tools_1' };
+
+	/**
+	 * A Vector store over a fake world.
+	 *
+	 * @param rows - Task rows.
+	 * @returns The rig.
+	 */
+	function makeVx(rows: IFakeRow[]): IRig {
+		return make(rows, (call) => (call.tool === 'dialect' ? VX_INFO : { success: true }), {
+			providers: new Set(['qdrant']),
+			roles: VECTOR_ROLES,
+			nodeFilter: controlledByTools,
+			tools: { stats: { idempotent: true } },
+		});
+	}
+
+	/**
+	 * Count the discoveries a store starts: every refresh publishes `loading`
+	 * once before its one task listing, follow-ups included.
+	 *
+	 * @param store - The store.
+	 * @returns A function answering how many discoveries have started so far.
+	 */
+	function discoveries(store: IEndpointStore): () => number {
+		let started = 0;
+		let last = store.getState().status;
+		store.subscribe(() => {
+			const now = store.getState().status;
+			if (now === 'loading' && last !== 'loading') started += 1;
+			last = now;
+		});
+		return () => started;
+	}
+
+	it('gives an open connection its ingest source back after that source restarts, with no further event and no refresh', async () => {
+		const rows = projectRows(['ingest_1', 'chat_1', 'tools_1']);
+		const ingestRow = rows.find((r) => r.source === 'ingest_1')!;
+		const { store, world, clock } = makeVx(rows);
+		const looked = discoveries(store);
+		const watch = watchProbe();
+		const detach = store.attach(world.client, null, watch.watch);
+		await store.refresh(world.client);
+		const endpoint = (): ReturnType<IEndpointStore['getState']>['endpoints'][number] => store.getState().endpoints[0]!;
+		assert.deepEqual(endpoint().roles.ingest, { source: 'ingest_1' });
+
+		// ingest_1 stops: its `end` event, and discovery no longer lists it.
+		world.rows.splice(world.rows.indexOf(ingestRow), 1);
+		watch.handlers!.onTaskEvent({ reprobe: false, ended: INGEST });
+		await clock.advance(300);
+		assert.equal(endpoint().roles.ingest, null);
+		assert.equal(store.channel(world.client, endpoint(), 'ingest').bound, false);
+
+		// It starts again. Its `begin` event arrives while it is still loading,
+		// so the debounced discovery does not list it yet.
+		watch.handlers!.onTaskEvent({ reprobe: false, started: INGEST });
+		await clock.advance(300);
+		assert.equal(endpoint().roles.ingest, null);
+		const whileLoading = looked();
+
+		// Nothing announces the moment it runs: the store looks again by itself.
+		await clock.advance(5_000);
+		assert.ok(looked() > whileLoading, 'the store looked again without an event');
+		world.rows.push(ingestRow);
+		await clock.advance(15_000);
+		assert.deepEqual(endpoint().roles.ingest, { source: 'ingest_1' });
+		assert.deepEqual(endpoint().missingRoles, []);
+		assert.equal(endpoint().state, 'ready');
+		assert.equal(store.channel(world.client, endpoint(), 'ingest').bound, true);
+		// Those looks are background refreshes: the ready node was not called again.
+		assert.equal(probes(world), 1);
+
+		// Found: it stops looking.
+		const whenFound = looked();
+		await clock.advance(600_000);
+		assert.equal(looked(), whenFound);
+		assert.equal(clock.pending(), 0);
+		detach();
+	});
+
+	it('looks after 1, 2, 4 and 8 s, then every 15 s, and gives up after the start window', async () => {
+		const { store, world, clock } = make();
+		const looked = discoveries(store);
+		const watch = watchProbe();
+		const detach = store.attach(world.client, null, watch.watch);
+		await store.refresh(world.client);
+		watch.handlers!.onTaskEvent({ reprobe: false, started: NEW_TASK });
+		await clock.advance(300);
+		assert.equal(looked(), 2);
+		const looks: number[] = [];
+		for (const step of [1_000, 2_000, 4_000, 8_000, 15_000, 15_000]) {
+			await clock.advance(step - 1);
+			looks.push(looked());
+			await clock.advance(1);
+			looks.push(looked());
+		}
+		assert.deepEqual(looks, [2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8]);
+		await clock.advance(DEFAULT_START_WATCH_MS);
+		const atGiveUp = looked();
+		assert.ok(atGiveUp <= 8 + Math.ceil(DEFAULT_START_WATCH_MS / 15_000), `bounded looks (${atGiveUp})`);
+		assert.equal(clock.pending(), 0);
+		await clock.advance(600_000);
+		assert.equal(looked(), atGiveUp);
+		detach();
+	});
+
+	it('starts the steps over on a new start event', async () => {
+		const { store, world, clock } = make();
+		const looked = discoveries(store);
+		const watch = watchProbe();
+		const detach = store.attach(world.client, null, watch.watch);
+		await store.refresh(world.client);
+		watch.handlers!.onTaskEvent({ reprobe: false, started: NEW_TASK });
+		await clock.advance(300 + 1_000 + 2_000 + 4_000 + 8_000);
+		const before = looked();
+		// The next look was 15 s away; another start brings it back to 1 s after its own discovery.
+		watch.handlers!.onTaskEvent({ reprobe: false, started: { projectId: 'p-other', source: 'tools_1' } });
+		await clock.advance(300);
+		assert.equal(looked(), before + 1);
+		await clock.advance(1_000);
+		assert.equal(looked(), before + 2);
+		detach();
+	});
+
+	it('does not keep looking after an event that names no started task', async () => {
+		const { store, world, clock } = make();
+		const looked = discoveries(store);
+		const watch = watchProbe();
+		const detach = store.attach(world.client, null, watch.watch);
+		await store.refresh(world.client);
+		watch.handlers!.onTaskEvent({ reprobe: false });
+		watch.handlers!.onTaskEvent({ reprobe: false, ended: NEW_TASK });
+		await clock.advance(600_000);
+		assert.equal(looked(), 2);
+		assert.equal(clock.pending(), 0);
+		detach();
+	});
+
+	it('stops looking when the started task ends, when the store detaches, and on reset', async () => {
+		const { store, world, clock } = make();
+		const looked = discoveries(store);
+		const watch = watchProbe();
+		let detach = store.attach(world.client, null, watch.watch);
+		await store.refresh(world.client);
+
+		watch.handlers!.onTaskEvent({ reprobe: false, started: NEW_TASK });
+		await clock.advance(1_300);
+		watch.handlers!.onTaskEvent({ reprobe: false, ended: NEW_TASK });
+		await clock.advance(300);
+		const afterEnd = looked();
+		await clock.advance(600_000);
+		assert.equal(looked(), afterEnd);
+
+		watch.handlers!.onTaskEvent({ reprobe: false, started: NEW_TASK });
+		await clock.advance(300);
+		detach();
+		assert.equal(clock.pending(), 0);
+		const afterDetach = looked();
+		await clock.advance(600_000);
+		assert.equal(looked(), afterDetach);
+
+		detach = store.attach(world.client, null, watch.watch);
+		watch.handlers!.onTaskEvent({ reprobe: false, started: NEW_TASK });
+		await clock.advance(300);
+		store.reset();
+		assert.equal(clock.pending(), 0);
+		const afterReset = looked();
+		await clock.advance(600_000);
+		assert.equal(looked(), afterReset);
+		detach();
+	});
+
+	it('keeps looking after a failed discovery, within the same window', async () => {
+		const { store, world, clock } = make();
+		const looked = discoveries(store);
+		const watch = watchProbe();
+		const detach = store.attach(world.client, null, watch.watch);
+		await store.refresh(world.client);
+		// The listing fails: the fake cannot read its rows.
+		const rows = world.rows;
+		world.rows = undefined as unknown as IFakeRow[];
+		watch.handlers!.onTaskEvent({ reprobe: false, started: NEW_TASK });
+		await clock.advance(300);
+		assert.equal(store.getState().status, 'error');
+		world.rows = rows;
+		world.rows.push(row({ source: 'tools_1', pipeline: { project_id: 'p-new', components: [{ id: 'db_9', provider: 'db_postgres' }] } }));
+		await clock.advance(1_000);
+		assert.equal(store.getState().status, 'ready');
+		assert.deepEqual(store.getState().endpoints.map((e) => e.projectId).sort(), ['p-new', 'proj-1']);
+		const whenFound = looked();
+		await clock.advance(600_000);
+		assert.equal(looked(), whenFound);
+		detach();
 	});
 });
 
