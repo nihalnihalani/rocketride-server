@@ -31,7 +31,9 @@ so every store node that exposes the six agent tools (``search``, ``upsert``,
 ``dialect``, ``documents``, ``chunks``, ``vectors``, ``sample``, ``project``,
 ``neighbors`` and ``remove_document``. The explorer tools are listed for external
 (DAP) callers only (``audience=('dap',)``), so an agent's tool catalog does not
-change.
+change. The read tools first run ``vx_write_gate.check_read`` (a connection
+signed in with a task's public key is refused with ``READS_PUBLIC``);
+``remove_document`` runs the write gate.
 
 Every tool, new and legacy, runs inside :func:`vectordb_tool`: the input is
 normalised, a refusal or failure becomes ``{success: false, code, error}``
@@ -1162,6 +1164,7 @@ class VectorExplorerTools:
     @vectordb_tool
     def dialect(self, args):
         """Describe the store (the explorer's probe)."""
+        vx_write_gate.check_read()
         store = self._vx_store()
         info = store.describe()
         support = getattr(store, 'VX_SUPPORT', 'experimental')
@@ -1332,6 +1335,7 @@ class VectorExplorerTools:
     @vectordb_tool
     def documents(self, args):
         """One page of the document directory."""
+        vx_write_gate.check_read()
         store = self._vx_store()
         warnings: List[str] = []
         cursor = args.get('cursor')
@@ -1418,6 +1422,7 @@ class VectorExplorerTools:
     @vectordb_tool
     def chunks(self, args):
         """One page of a document's chunks."""
+        vx_write_gate.check_read()
         store = self._vx_store()
         object_id = args.get('object_id')
         if not isinstance(object_id, str) or not object_id.strip():
@@ -1484,6 +1489,7 @@ class VectorExplorerTools:
     @vectordb_tool
     def vectors(self, args):
         """The raw vectors of one or two chunks: the only tool that returns them."""
+        vx_write_gate.check_read()
         import numpy as np
 
         store = self._vx_store()
@@ -1700,6 +1706,7 @@ class VectorExplorerTools:
     @vectordb_tool
     def sample(self, args):
         """A map of the collection: sampled points, positions and the neighbour graph."""
+        vx_write_gate.check_read()
         import numpy as np
 
         from . import vx_math
@@ -1930,6 +1937,7 @@ class VectorExplorerTools:
     @vectordb_tool
     def project(self, args):
         """Place a vector, or chunks by key, on a cached sample."""
+        vx_write_gate.check_read()
         import numpy as np
 
         from . import vx_math
@@ -2059,6 +2067,7 @@ class VectorExplorerTools:
     @vectordb_tool
     def neighbors(self, args):
         """Nearest chunks of a key or a vector (or its similarities to scope keys)."""
+        vx_write_gate.check_read()
         import numpy as np
 
         from . import vx_math

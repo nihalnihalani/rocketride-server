@@ -171,7 +171,11 @@ across:
 New tools are `@tool_function(..., audience=('dap',))` under the
 `vectordb_tool` wrapper. The agent catalog does not change: the six legacy
 store tools (`search`, `stats`, `delete`, `get`, `objdir`, `upsert`) keep their
-descriptors byte-for-byte, and `test_tool_audience.py` pins that.
+descriptors byte-for-byte, and `test_tool_audience.py` pins that. The
+audience only decides what a catalog lists, not who may call: a new read tool
+calls `vx_write_gate.check_read()` first, which refuses a connection signed in
+with a task's public key (`READS_PUBLIC`, contract §6.6), and a new write tool
+runs `check_write` (§6.3).
 
 ## Adding or changing a store driver
 

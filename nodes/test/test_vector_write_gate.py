@@ -540,6 +540,50 @@ def test_a_context_inside_the_input_does_not_open_the_gate():
     assert ('a', 0) in store.rows
 
 
+#: The tools only external (DAP) callers are offered that read and change nothing.
+_DAP_READ_TOOLS = ('dialect', 'documents', 'chunks', 'vectors', 'sample', 'project', 'neighbors')
+
+
+@pytest.mark.parametrize('tool', _DAP_READ_TOOLS)
+def test_a_read_from_a_connection_signed_in_with_a_public_task_key_is_refused_before_the_store_is_read(tool):
+    store = MemoryStore().seed(corpus({'a': [0, 1]}))
+    seen = len(store.calls)
+    answer = _dispatch(_tool_node(store), tool, {}, dap(auth='public'))
+    assert answer == {'success': False, 'code': 'READS_PUBLIC', 'error': 'The store refused this request.'}
+    assert len(store.calls) == seen, 'nothing was read'
+
+
+@pytest.mark.parametrize(
+    'ctx',
+    [
+        dap(),
+        dap(auth='task'),
+        dap(source_type='chat'),
+        dap(source_type='dropper', auth='task'),
+        dap(targeted=False),
+        agent(),
+        None,
+    ],
+    ids=['account', 'task', 'chat-source', 'dropper-task', 'broadcast', 'agent', 'no-context'],
+)
+def test_reads_answer_every_caller_but_a_public_task_key(ctx):
+    # Read-only cards read through the Chat (or Ingest) source, so reads are not limited to Tools sources.
+    store = MemoryStore().seed(corpus({'a': [0, 1]}))
+    answer = _dispatch(_tool_node(store), 'documents', {}, ctx)
+    assert answer['success'] is True, answer
+    assert [row['objectId'] for row in answer['items']] == ['a']
+
+
+def test_the_read_check_is_the_gate_module_s_and_reads_the_engine_context():
+    with tool_context.tool_call(dap(auth='public')):
+        with pytest.raises(ToolRefusal) as refused:
+            vx_write_gate.check_read()
+    assert refused.value.code == 'READS_PUBLIC'
+    with tool_context.tool_call(dap()):
+        vx_write_gate.check_read()
+    vx_write_gate.check_read()
+
+
 def test_the_default_switches_refuse_a_dap_write_and_let_an_agent_write():
     store = MemoryStore().seed(corpus({'a': [0], 'b': [0]}))
     node = _tool_node(store)

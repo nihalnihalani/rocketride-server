@@ -29,12 +29,16 @@ test('every documented code has a sentence, and every documented caveat has one'
 	assert.deepEqual(Object.keys(CAVEAT_SENTENCES).sort(), [...CAVEATS].sort());
 });
 
+test("the app knows exactly the codes the store nodes document (the errors fixture, pinned to vx_types by the nodes' tests)", () => {
+	assert.deepEqual(Object.keys(fixture('errors')).sort(), [...TOOL_CODES].sort());
+});
+
 test('the write refusals say exactly which rule refused', () => {
 	assert.equal(codeSentence('WRITES_DISABLED'), 'Removing documents is turned off on this store node (allow_writes).');
 	assert.equal(codeSentence('WRITES_SOURCE'), 'Only a Tools source may remove documents.');
 	assert.equal(codeSentence('WRITES_UNKNOWN_CALLER'), 'The engine did not identify this request, so the store refused the write. Update the engine to a version that supports the Vector Explorer.');
 	assert.equal(codeSentence('RESERVED_ID'), "That record is the collection's control record and cannot be removed.");
-	for (const code of ['WRITES_PUBLIC', 'WRITES_BROADCAST', 'WRITES_AGENT', 'SOMETHING_NEW', undefined]) {
+	for (const code of ['WRITES_PUBLIC', 'WRITES_BROADCAST', 'WRITES_AGENT', 'READS_PUBLIC', 'SOMETHING_NEW', undefined]) {
 		assert.equal(codeSentence(code), GENERIC_REFUSAL, String(code));
 	}
 	assert.equal(GENERIC_REFUSAL, "The store refused this request; see the pipeline's run log.");

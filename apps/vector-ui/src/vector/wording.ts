@@ -66,6 +66,8 @@ export const CODE_SENTENCES: Readonly<Record<ToolCode, string>> = {
 	WRITES_BROADCAST: GENERIC_REFUSAL,
 	WRITES_AGENT: GENERIC_REFUSAL,
 	WRITES_UNKNOWN_CALLER: 'The engine did not identify this request, so the store refused the write. Update the engine to a version that supports the Vector Explorer.',
+	// The app signs in with an account, never with a task's public key, so it does not meet this one.
+	READS_PUBLIC: GENERIC_REFUSAL,
 };
 
 /**

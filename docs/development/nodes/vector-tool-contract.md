@@ -217,7 +217,7 @@ A `STORE_ERROR` message is scrubbed before it leaves the node: URLs, DSNs, `user
 
 ### 4.1 Codes, capabilities, caveats, limits
 
-Codes: `INVALID_INPUT`, `UNSUPPORTED`, `NOT_FOUND`, `RESERVED_ID`, `COLLECTION_MISSING`, `STORE_ERROR`, `DIMENSION_MISMATCH`, `MODEL_MISMATCH`, `NO_EMBEDDER`, `LIMIT_EXCEEDED`, `SAMPLE_EXPIRED`, `BUSY`, `TIMEOUT`, `RATE_LIMITED`, `WRITES_DISABLED`, `WRITES_SOURCE`, `WRITES_PUBLIC`, `WRITES_BROADCAST`, `WRITES_AGENT`, `WRITES_UNKNOWN_CALLER`.
+Codes: `INVALID_INPUT`, `UNSUPPORTED`, `NOT_FOUND`, `RESERVED_ID`, `COLLECTION_MISSING`, `STORE_ERROR`, `DIMENSION_MISMATCH`, `MODEL_MISMATCH`, `NO_EMBEDDER`, `LIMIT_EXCEEDED`, `SAMPLE_EXPIRED`, `BUSY`, `TIMEOUT`, `RATE_LIMITED`, `WRITES_DISABLED`, `WRITES_SOURCE`, `WRITES_PUBLIC`, `WRITES_BROADCAST`, `WRITES_AGENT`, `WRITES_UNKNOWN_CALLER`, `READS_PUBLIC` (§6.6).
 
 Capabilities (`dialect.capabilities`): `describe`, `count`, `count_documents`, `documents`, `documents_distinct`, `documents_sorted`, `chunks`, `vectors`, `sample`, `sample_light`, `sample_stratified_native`, `knn_native`, `project`, `neighbors`, `search_vector` (always true), `search_keyword`, `remove`, `remove_count`, `soft_delete` (false in v1), `embed_node` (filled by the app); `projection: ['pca']`.
 
@@ -297,7 +297,7 @@ A missing collection answers the same envelope with nulls and `health.collection
 
 ### 4.3 `embed` on the embedding nodes (new mixin `packages/ai/src/ai/common/embed_tool.py`)
 
-`{"texts":["…"],"kind":"query"}` (1–8 texts, each ≤8,000 chars) → `{"success":true,"model":"…","dimension":384,"vectors":[[…]],"prefix_applied":null,"ms":12}`. Token bucket per task: 30/min, burst 5 → `RATE_LIMITED` with `retry_after_s`. The mixin owns `IGlobal.embed_lock`; the tool and the flush path (`embedding_transformer/IInstance.py:83-102`, `embedding_openai/IInstance.py:52-59`) both acquire it. `audience=('dap',)`. Reachability from the tools token is pinned by a phase-0 test (`scripts/acceptance/vector-explorer/phase0/`).
+`{"texts":["…"],"kind":"query"}` (1–8 texts, each ≤8,000 chars) → `{"success":true,"model":"…","dimension":384,"vectors":[[…]],"prefix_applied":null,"ms":12}`. Token bucket per task: 30/min, burst 5 → `RATE_LIMITED` with `retry_after_s`. A call from a connection signed in with a task's public key → `READS_PUBLIC` before anything else (§6.6). The mixin owns `IGlobal.embed_lock`; the tool and the flush path (`embedding_transformer/IInstance.py:83-102`, `embedding_openai/IInstance.py:52-59`) both acquire it. `audience=('dap',)`. Reachability from the tools token is pinned by a phase-0 test (`scripts/acceptance/vector-explorer/phase0/`).
 
 - `kind:'query'` encodes like the `questions` lane (query prefix), `'document'` like the `documents` lane; vectors are rounded to 6 decimals; `ms` includes any wait for the lock.
 - `IGlobal.embed_lock` is a shared/exclusive lock that prefers the exclusive side: the node's own batches hold it shared, an `embed` call exclusively, so a call waits for the batches already on the model and new batches queue behind it. It covers the model call only, not the write that follows a flush. A call still waiting after 60 s answers `BUSY` and its token is refunded.
@@ -382,3 +382,8 @@ Refusals return the envelope and never raise; the tools stay listed for DAP.
 ### 6.5 Gate tests (`nodes/test/test_vector_write_gate.py`; mirrored live by the tool-path suite)
 - No context → `WRITES_UNKNOWN_CALLER`, data unchanged. Agent context, defaults → allowed; `agent_writes=false` → `WRITES_AGENT`. DAP context: every row of §6.3 in order. `source_type=None` → `WRITES_SOURCE`. Simulated `ImportError` → refused. A param whose `input` contains a forged `__tool_context__` → ignored. Client-sent `caller` overwritten. Audit block carries no content keys. The expectation table imports `VECTOR_ALLOW_WRITES_DEFAULT`.
 - `createCollection` on an empty mocked driver succeeds; `writeDocuments` with objectId `schema` fails before `addChunks`.
+- Reads (§6.6): each DAP-only read tool, stamped with a `'public'` caller and sent through the dispatcher, answers `READS_PUBLIC` without reading the store; account, task, chat-source, broadcast, agent and unstamped calls are answered. `nodes/test/test_embed_tool.py` pins the same for `embed`, with no token spent.
+
+### 6.6 Reads (`vx_write_gate.check_read`)
+
+The DAP-only read tools (`dialect`, `documents`, `chunks`, `vectors`, `sample`, `project`, `neighbors`) and `embed` run `check_read()` first. A DAP call whose `caller.auth` is `'public'`, that is, a connection signed in with a task's public key, is refused with `READS_PUBLIC` ("The store refused this request.") before anything is read or embedded and before `embed` spends a token. Every other caller reads as before: reads are not limited to Tools sources (a read-only card reads through the Chat or Ingest source) or to calls that name the node, and a call without a context or from an agent is answered. The Vector Explorer signs in with an account, so it never meets this refusal; `wording.ts` gives it the generic refusal sentence.

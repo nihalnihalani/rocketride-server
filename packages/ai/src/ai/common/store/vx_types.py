@@ -182,6 +182,7 @@ TOOL_CODES: Tuple[str, ...] = (
     'WRITES_BROADCAST',
     'WRITES_AGENT',
     'WRITES_UNKNOWN_CALLER',
+    'READS_PUBLIC',
 )
 
 #: Boolean keys of ``dialect.capabilities`` (``projection`` is a list, reported beside them).

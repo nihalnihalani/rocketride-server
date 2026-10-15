@@ -396,6 +396,13 @@ Explorer.
 - **Only through your nodes.** The app sees what the pipeline's nodes return
   and nothing else. Store nodes never return a host, connection string,
   credential or database name.
+- **Not through a Public Authorization Key.** The tools the app reads with
+  (the store node's document list, chunks, vectors, samples, projections and
+  neighbours, and the embedding node's `embed`) refuse a connection signed in
+  with a pipeline's Public Authorization Key (`pk_…`, the key the chat widget
+  uses): it gets "The store refused this request." (code `READS_PUBLIC`) and
+  nothing is read. The app signs in with your account, so this never affects
+  it.
 - **Tokens stay in memory.** The tokens of the pipelines' tasks are kept in
   memory for the session only, never in history, preferences or anything saved.
   When you sign out, or switch organization or team, every connection, list,

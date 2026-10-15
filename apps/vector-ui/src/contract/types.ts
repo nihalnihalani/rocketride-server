@@ -77,6 +77,7 @@ export const TOOL_CODES = [
 	'WRITES_BROADCAST',
 	'WRITES_AGENT',
 	'WRITES_UNKNOWN_CALLER',
+	'READS_PUBLIC',
 ] as const;
 
 /** A documented failure code. */

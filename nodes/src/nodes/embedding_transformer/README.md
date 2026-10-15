@@ -70,7 +70,9 @@ decimals), `prefix_applied` and `ms`. A refusal is an answer with
 (no model loaded), `RATE_LIMITED` with `retry_after_s` (each task allows 30
 calls a minute, in bursts of up to 5), `BUSY` (the model stayed busy for 60
 seconds) or `STORE_ERROR` (the model failed; the message names only the error
-type and the server log has the detail).
+type and the server log has the detail). A call from a connection signed in
+with a pipeline's Public Authorization Key (`pk_…`) is refused with
+`READS_PUBLIC` before the model runs.
 
 The tool shares the model with the node's lanes: a call waits for the batches
 already being embedded and then runs alone, and batches that arrive while it

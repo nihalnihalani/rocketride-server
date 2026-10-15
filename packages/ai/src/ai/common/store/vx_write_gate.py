@@ -50,6 +50,14 @@ wrapper turns into ``{success: false, code, error}``; nothing is written. On an
 engine without ``ai.common.tool_context``, or one that does not attach a
 context, every write is refused.
 
+Reads have one rule, :func:`check_read`, which the DAP-only read tools
+(``dialect``, ``documents``, ``chunks``, ``vectors``, ``sample``, ``project``,
+``neighbors``) and the embedding nodes' ``embed`` run first: a DAP call from a
+connection signed in with a task's public key (caller ``'public'``) is refused
+with ``READS_PUBLIC`` before anything is read. Every other caller reads as
+before, from any source of the task (a read-only card reads through the Chat
+or Ingest source), and so does a call without a context or from an agent.
+
 See ``docs/development/nodes/vector-tool-contract.md`` section 6.
 """
 
@@ -81,6 +89,9 @@ WRITE_CALLER_AUTH = ('account', 'task')
 
 #: The source type allowed to write through DAP.
 WRITE_SOURCE_TYPE = 'tools'
+
+#: Caller kinds the DAP-only read tools refuse: a connection signed in with a task's public key.
+READ_REFUSED_CALLER_AUTH = ('public',)
 
 _VERB = {'remove_document': 'remove documents', 'delete': 'remove documents', 'upsert': 'add documents'}
 _DISABLED = {
@@ -204,4 +215,18 @@ def check_write(
     )
 
 
-__all__ = ['GateDecision', 'WRITE_TOOLS', 'check_write', 'current_context']
+def check_read(context: Any = _UNSET) -> None:
+    """Refuse a DAP-only read tool called from a connection signed in with a task's public key.
+
+    Reads are not limited to Tools sources or to calls that name the node, and a
+    call without a context (an older engine) or from an agent reads as before.
+
+    :param context: The call context; read from the engine when left out.
+    :raises ToolRefusal: ``READS_PUBLIC`` for a DAP call whose caller is ``'public'``.
+    """
+    ctx = _read(current_context() if context is _UNSET else context)
+    if ctx is not None and ctx.origin == 'dap' and ctx.caller.get('auth') in READ_REFUSED_CALLER_AUTH:
+        raise ToolRefusal('READS_PUBLIC', 'The store refused this request.')
+
+
+__all__ = ['GateDecision', 'READ_REFUSED_CALLER_AUTH', 'WRITE_TOOLS', 'check_read', 'check_write', 'current_context']

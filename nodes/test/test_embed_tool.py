@@ -441,6 +441,28 @@ def _assert_failure(out: Dict[str, Any], code: str) -> None:
     assert code in importlib.import_module('ai.common.store.vx_types').TOOL_CODES
 
 
+@pytest.mark.parametrize('node', NODES)
+def test_a_caller_signed_in_with_a_public_task_key_is_refused_before_the_model_runs(node):
+    from ai.common import tool_context
+    from rocketlib.types import IInvokeTool
+
+    inst, glb = _make(node)
+    param = IInvokeTool.Invoke(tool_name='embed', input={'texts': ['probe']})
+    ctx = tool_context.dap_context(source_type='tools', node_id='embed_1', caller={'auth': 'public'})
+    tool_context.stamp_param(param, ctx)
+    inst.invoke(param)
+    _assert_failure(param.output, 'READS_PUBLIC')
+    assert glb.embedding.calls == []
+    # The refusal spent nothing: an account caller still has the whole burst.
+    for _ in range(_limits()['embed_burst']):
+        param = IInvokeTool.Invoke(tool_name='embed', input={'texts': ['probe']})
+        tool_context.stamp_param(
+            param, tool_context.dap_context(source_type='tools', node_id='embed_1', caller={'auth': 'account'})
+        )
+        inst.invoke(param)
+        assert param.output['success'] is True, param.output
+
+
 _INVALID = [
     ({}, 'no-texts'),
     ({'texts': None}, 'texts-none'),

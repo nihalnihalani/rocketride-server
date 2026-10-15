@@ -41,7 +41,9 @@ that node's model and prefixes. :class:`EmbedToolMixin` gives an embedding node'
   the way it encodes the ``documents`` lane (``encodeChunks``, with the document
   prefix). The vectors therefore equal what the pipeline itself produces, rounded
   to six decimals. ``prefix_applied`` names the prefix the model applied, or null.
-* Refusals are envelopes, never exceptions: ``INVALID_INPUT``, ``NO_EMBEDDER``
+* Refusals are envelopes, never exceptions: ``READS_PUBLIC`` (the call came
+  from a connection signed in with a task's public key; see
+  ``ai.common.store.vx_write_gate.check_read``), ``INVALID_INPUT``, ``NO_EMBEDDER``
   (no model loaded), ``RATE_LIMITED`` with ``retry_after_s``, ``BUSY`` (the model
   stayed busy for ``EMBED_LOCK_WAIT_S``) and ``STORE_ERROR`` (the model failed or
   returned unusable vectors; for a failure the message names only the exception
@@ -81,6 +83,7 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 from rocketlib import tool_function, warning
 
 from .schema import Doc, Question
+from .store import vx_write_gate
 from .store.errors import StoreError, ToolRefusal
 from .store.vx_defaults import EMBED_TOOL_LIMITS
 
@@ -421,6 +424,9 @@ class EmbedToolMixin:
 
     def _embed(self, args: Any) -> Dict[str, Any]:
         started = time.perf_counter()
+
+        # Like the stores' DAP-only read tools: a connection signed in with a task's public key is refused.
+        vx_write_gate.check_read()
 
         payload = _normalize_input(args)
         if payload is None:
