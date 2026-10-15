@@ -53,6 +53,8 @@ const { createSelectionStore } = require('../src/contract/bridge') as typeof imp
 const { DocumentDirectory } = require('../src/components/DocumentDirectory') as typeof import('../src/components/DocumentDirectory');
 const { StatsStrip } = require('../src/components/StatsStrip') as typeof import('../src/components/StatsStrip');
 const { StatsCharts } = require('../src/components/StatsCharts') as typeof import('../src/components/StatsCharts');
+const { HealthPanel } = require('../src/components/HealthPanel') as typeof import('../src/components/HealthPanel');
+const { healthSummary } = require('../src/vector/health') as typeof import('../src/vector/health');
 const { readDialect } = require('../src/vector/results') as typeof import('../src/vector/results');
 const { DocumentView } = require('../src/views/DocumentView') as typeof import('../src/views/DocumentView');
 const { pagerApplyPage, pagerBegin, pagerInit } = require('../src/vector/documents') as typeof import('../src/vector/documents');
@@ -161,4 +163,38 @@ test('a document tab holds its HealthPanel', () => {
 	const html = renderToStaticMarkup(<DocumentView model={model} channels={channels} selection={createSelectionStore('doc-1')} actions={actions} objectId="75b89d86-a64e-5143-bf50-55d4a7fd8cd2" path="C:/demo/handbooks/falcon_handbook.md" />);
 	assert.match(html, /data-document="75b89d86-a64e-5143-bf50-55d4a7fd8cd2"/);
 	mounted(html, 'HealthPanel');
+});
+
+test('the health panel: checking, the problems with their numbers, what this store does not report, and the on-demand count', () => {
+	const legacy = readDocumentsPage(fixture('documents_filter_partial')).items[0] as IDocumentItem;
+	assert.match(renderToStaticMarkup(<HealthPanel item={null} />), /role="status"[^>]*>Checking this document…</);
+	const html = renderToStaticMarkup(<HealthPanel item={{ ...legacy, has_first_chunk: false, chunks: 30 }} listing="active" medianChunks={6} />);
+	assert.doesNotMatch(html, /Not built yet/);
+	assert.match(html, /<li [^>]*data-flag="no_first_chunk"><span[^>]*>no first chunk<\/span><span>Chunk 0 is not stored: the document was partly removed or partly ingested\.<\/span><\/li>/);
+	assert.match(html, /data-flag="deleted_chunks"><span[^>]*>1 deleted chunk<\/span><span>1 soft-deleted chunk of this document is still stored\.<\/span>/);
+	assert.doesNotMatch(html, /data-flag="gaps"/, 'the missing ids are chunk 0 and the deleted one');
+	const qdrant = readDocumentsPage(fixture('documents_filter_client')).items[0] as IDocumentItem;
+	const unreported = renderToStaticMarkup(<HealthPanel item={qdrant} medianChunks={10} />);
+	assert.match(unreported, /No problem found in what this store reports\./);
+	assert.match(unreported, /role="note"[^>]*>This store does not report chunk ids or soft-deleted chunks per document, so gaps and deleted chunks are not checked; pgvector stores report them\.</);
+	const healthy = renderToStaticMarkup(<HealthPanel item={{ ...legacy, deleted_chunks: 0 }} listing="active" medianChunks={20} />);
+	assert.match(healthy, /No problem found: the first chunk is stored, the chunk ids have no gap, no chunk is soft-deleted, the parse found text and the size is ordinary\./);
+	assert.match(renderToStaticMarkup(<HealthPanel item={{ ...legacy, deleted_chunks: 0 }} listing="active" />), /Oversize is not checked until the console has loaded documents to compare with\./);
+	const probe = renderToStaticMarkup(<HealthPanel item={qdrant} canProbe onProbe={noop} />);
+	assert.match(probe, /<button type="button"[^>]*>Count deleted chunks<\/button>/);
+	assert.match(renderToStaticMarkup(<HealthPanel item={qdrant} canProbe probe={{ status: 'done', deleted: 2 }} />), /role="status">2 soft-deleted chunks of this document are still stored\./);
+	assert.match(renderToStaticMarkup(<HealthPanel item={qdrant} canProbe probe={{ status: 'done', deleted: null }} />), /The store did not count the chunks, so deleted chunks cannot be counted\./);
+	assert.match(renderToStaticMarkup(<HealthPanel item={qdrant} canProbe probe={{ status: 'running' }} />), /disabled=""[^>]*>Counting…<\/button>/);
+});
+
+test('the directory lists flagged documents under "Needs attention" with their badges; the strip says how many', () => {
+	const rows: IDocumentItem[] = [...readDocumentsPage(fixture('documents_page1')).items.map((r) => ({ ...r, max_chunk_id: (r.chunks ?? 1) - 1, deleted_chunks: 0 })), { ...(readDocumentsPage(fixture('documents_filter_partial')).items[0] as IDocumentItem), objectId: 'legacy-falcon' }];
+	const pager = pagerApplyPage(pagerBegin(pagerInit()), readDocumentsPage({ success: true, items: rows, next_cursor: null, total: rows.length, counts_exact: true, distinct: true, sorted: true, caveats: [] }));
+	const html = renderToStaticMarkup(<DocumentDirectory pager={pager} selectedId={null} writes={on} onSelect={noop} onRemove={noop} onLoadMore={noop} onRetry={noop} />);
+	assert.match(html, /aria-label="Folder Needs attention \(1\)"/);
+	assert.match(html, /<span style="[^"]*" data-flag="">1 deleted chunk<\/span>/);
+	assert.match(html, /title="[^"]*needs attention: 1 deleted chunk · objectId legacy-falcon"/);
+	const stats = { view: readStats(fixture('stats_pgvector')), status: 'ready' as const, error: null, lastAt: 0, mode: 'full' as const };
+	const strip = renderToStaticMarkup(<StatsStrip stats={stats} dialect={dialect} readOnly={false} health={healthSummary(rows, { medianChunks: 9, complete: true })} />);
+	assert.match(strip, /data-chip="attention">1 needs attention</);
 });

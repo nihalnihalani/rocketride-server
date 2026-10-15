@@ -147,6 +147,17 @@ test('the scope: the listing asks for its conditions, its documents resolve from
 	assert.match(dir, /Scope to this folder/);
 });
 
+test("a document's health: the tab compares with the console's loaded documents and counts deleted chunks only when asked; the directory and the strip use the same flags", () => {
+	const view = code('views/DocumentView.tsx');
+	assert.match(view, /<HealthPanel item=\{info\} medianChunks=\{median\} listing="all"/, "the tab's row is listed with deleted:'all'");
+	assert.match(view, /const median = medianChunks\(consoleState\)/);
+	assert.match(view, /onProbe=\{\(\) => void countDeleted\(\)\}/, 'the two one-row chunks calls run only on the click');
+	assert.match(view, /model\.capabilities\.soft_delete === true/, 'offered only where the store soft-deletes');
+	assert.doesNotMatch(view, /Without first chunk/);
+	assert.match(code('components/DocumentDirectory.tsx'), /buildGroups\(matches, \{ medianChunks: median \}\)/);
+	assert.match(code('views/ConsoleView.tsx'), /healthSummary\(state\.directory\.rows, \{ medianChunks: settled \? medianChunks\(state\.directory\.rows\) : null, complete: state\.directory\.status === 'done' && state\.directory\.filter === null \}\)/);
+});
+
 test("every removal is confirmed by the app-level host, with Cancel focused by the dialog's own mount effect", () => {
 	assert.match(code('VectorApp.tsx'), /<RemoveDialogHost \/>/);
 	for (const file of ['components/RemoveConfirmDialog.tsx', 'components/MultiRemoveConfirmDialog.tsx']) {
