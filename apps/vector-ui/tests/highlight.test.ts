@@ -16,7 +16,7 @@
 
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { CHUNK_TEXT_MAX, STOP_WORDS, clampText, highlightSegments, markedWords, queryTerms, stem } from '../src/vector/highlight';
+import { CHUNK_TEXT_MAX, STOP_WORDS, clampText, highlightSegments, markedWords, queryTerms, queryWords, stem } from '../src/vector/highlight';
 import type { ITextSegment } from '../src/vector/highlight';
 
 /** The marked words of a segment list, in order. */
@@ -96,4 +96,10 @@ test('the panel shows at most 20,000 characters of a chunk and says when it cut'
 	const started = performance.now();
 	highlightSegments(`${'water station spring intake '.repeat(800)}`.slice(0, CHUNK_TEXT_MAX), 'water spring intake falcon');
 	assert.ok(performance.now() - started < 50, 'a full-size chunk is segmented within a frame budget');
+});
+
+test("the words the panel names are the query's own (lower-cased, one per stem), not the stems", () => {
+	assert.deepEqual(queryWords('Changes to the watering of Falcon’s station; changed water'), ['changes', 'watering', 'falcon', 'station']);
+	assert.deepEqual(queryWords(null), []);
+	assert.deepEqual(queryTerms('Changes to the watering'), ['chang', 'water']);
 });

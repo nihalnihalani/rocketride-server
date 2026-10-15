@@ -28,19 +28,27 @@
 // is to the active query (and the pipeline's own score when known), its 12
 // nearest chunks in the whole collection, and the actions that land back in the
 // console: Open document, Find similar, Remove document (gated; when it is not
-// available the reason is shown as text). Under the snippet, the chunk's full
-// text panel (with the query's terms marked) once it is built.
+// available the reason is shown as text). Beside them:
+//
+//   - Add as example (+) / (−): the point becomes a Recommend example;
+//   - Show full text: the chunk's whole text with the query's words marked
+//     (ChunkTextPanel), fetched once per key, stepping through the document;
+//   - with Tree edges drawn, the point's neighbours in the spanning tree.
+//
+// The inspector itself holds no state (the text section does), so its
+// buttons can be pressed in the tests by calling it.
 // =============================================================================
 
 import React from 'react';
-import type { PointInspectorProps as ContractPointInspectorProps, VectorKey } from '../contract/types';
+import type { ExamplePolarity, PointInspectorProps as ContractPointInspectorProps, VectorKey } from '../contract/types';
 import { documentOf, pointKey } from '../map/model';
 import { MAP_STYLES } from '../map/styles';
 import { num } from '../map/wording';
-import { ChunkTextPanel } from './ChunkTextPanel';
+import { ChunkTextSection } from './ChunkTextPanel';
+import type { LoadChunkText } from './ChunkTextPanel';
 import { NeighbourList } from './NeighbourList';
 
-/** Props: the frozen ones plus what the map fetched. */
+/** Props: the frozen ones plus what the map fetched and holds. */
 export interface PointInspectorProps extends ContractPointInspectorProps {
 	/** Full chunk text (light mode fetches it through `chunks`), or null. */
 	text?: string | null;
@@ -52,6 +60,12 @@ export interface PointInspectorProps extends ContractPointInspectorProps {
 	error?: string | null;
 	/** A neighbour row was chosen (select it on the map); defaults to Find similar. */
 	onSelectNeighbour?(key: VectorKey): void;
+	/** Fetch a chunk's full text (the map binds `fetchChunkText` to its channel); offers Show full text. */
+	loadText?: LoadChunkText;
+	/** The active query's text, whose words the full text marks. */
+	query?: string | null;
+	/** The side this point is on as a Recommend example, or null. */
+	examplePolarity?: ExamplePolarity | null;
 }
 
 /**
@@ -68,16 +82,21 @@ export function PointInspector(props: PointInspectorProps): React.ReactElement {
 	const result = sample.result;
 	const doc = documentOf(result, index);
 	const [objectId, chunkId] = pointKey(result, index);
+	const key: VectorKey = [objectId, chunkId];
 	const snippet = props.text ?? result.points.snip?.[index] ?? null;
 	const removed = sample.removed.includes(objectId);
+	const path = doc?.path ?? objectId;
+	const select = props.onSelectNeighbour ?? props.onFindSimilar;
+	const tree = props.treeNeighbours ?? [];
 	return (
 		<section aria-label="Selected chunk">
-			<h3 style={MAP_STYLES.heading}>{doc?.path ?? objectId}</h3>
+			<h3 style={MAP_STYLES.heading}>{path}</h3>
 			<p style={MAP_STYLES.small}>
 				Chunk {num(chunkId)}
 				{doc?.chunks !== null && doc?.chunks !== undefined ? ` of ${num(doc.chunks)}` : ''} · {num(result.points.len[index] ?? 0)} characters
 				{result.points.pinned[index] ? <span style={MAP_STYLES.tag}>pinned</span> : null}
 				{removed ? <span style={MAP_STYLES.tag}>removed</span> : null}
+				{props.examplePolarity ? <span style={MAP_STYLES.tag}>{props.examplePolarity} example</span> : null}
 			</p>
 			{props.querySim !== null ? (
 				<p style={MAP_STYLES.small}>
@@ -86,7 +105,7 @@ export function PointInspector(props: PointInspectorProps): React.ReactElement {
 				</p>
 			) : null}
 			{snippet ? <p style={{ ...MAP_STYLES.text, whiteSpace: 'pre-wrap', margin: '6px 0' }}>{snippet}</p> : <p style={MAP_STYLES.note}>This sample carries no text for its points (light mode).</p>}
-			<ChunkTextPanel chunkKey={[objectId, chunkId]} text={props.text ?? null} />
+			{props.loadText || props.onShowText ? <ChunkTextSection key={sample.sampleId} sampleId={sample.sampleId} chunkKey={key} label={`${path} #${chunkId}`} query={props.query ?? null} loadText={props.loadText} onShowText={props.onShowText} hostText={props.text ?? null} /> : null}
 			<div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, margin: '8px 0' }}>
 				<button type="button" style={MAP_STYLES.button} onClick={() => props.onOpenDocument(objectId, chunkId)}>
 					Open document
@@ -98,6 +117,16 @@ export function PointInspector(props: PointInspectorProps): React.ReactElement {
 					Remove document
 				</button>
 			</div>
+			{props.onAddExample ? (
+				<div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, margin: '0 0 8px' }}>
+					<button type="button" style={MAP_STYLES.button} aria-label="Add as a positive example for Recommend" aria-pressed={props.examplePolarity === 'positive'} onClick={() => props.onAddExample?.(key, 'positive')}>
+						Add as example (+)
+					</button>
+					<button type="button" style={MAP_STYLES.button} aria-label="Add as a negative example for Recommend" aria-pressed={props.examplePolarity === 'negative'} onClick={() => props.onAddExample?.(key, 'negative')}>
+						Add as example (−)
+					</button>
+				</div>
+			) : null}
 			{!props.writes.enabled && props.writes.reason ? <p style={MAP_STYLES.note}>{props.writes.reason}</p> : null}
 			{props.busy ? (
 				<p style={MAP_STYLES.note} role="status">
@@ -105,10 +134,28 @@ export function PointInspector(props: PointInspectorProps): React.ReactElement {
 				</p>
 			) : null}
 			{props.error ? <p style={MAP_STYLES.note}>{props.error}</p> : null}
+			{tree.length > 0 ? (
+				<>
+					<h4 style={{ ...MAP_STYLES.heading, fontSize: 12 }}>Tree neighbours</h4>
+					<ol aria-label="Neighbours in the spanning tree" style={MAP_STYLES.list}>
+						{tree.map((nb) => {
+							const nbKey = pointKey(result, nb.i);
+							return (
+								<li key={nb.i} style={MAP_STYLES.row}>
+									<button type="button" style={MAP_STYLES.linkButton} onClick={() => select(nbKey)}>
+										{documentOf(result, nb.i)?.path ?? nbKey[0]} #{nbKey[1]}
+									</button>
+									<span style={MAP_STYLES.small}> similarity {nb.sim.toFixed(3)}</span>
+								</li>
+							);
+						})}
+					</ol>
+				</>
+			) : null}
 			{props.neighbours ? (
 				<>
 					<h4 style={{ ...MAP_STYLES.heading, fontSize: 12 }}>{num(props.neighbours.items.length)} nearest in the collection</h4>
-					<NeighbourList items={props.neighbours.items} onSelect={(key) => (props.onSelectNeighbour ?? props.onFindSimilar)(key)} />
+					<NeighbourList items={props.neighbours.items} onSelect={(k) => select(k)} />
 				</>
 			) : null}
 		</section>

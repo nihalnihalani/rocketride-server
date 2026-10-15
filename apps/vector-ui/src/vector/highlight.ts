@@ -147,6 +147,30 @@ export function queryTerms(query: string | null | undefined): string[] {
 }
 
 /**
+ * The query's words as typed (lower-cased), one per stem, in the order they
+ * first appear: what the panel names when it counts the marks.
+ *
+ * @param query - The active query, or null.
+ * @returns The words.
+ */
+export function queryWords(query: string | null | undefined): string[] {
+	if (!query) return [];
+	const stems = new Set<string>();
+	const out: string[] = [];
+	for (const run of runs(query)) {
+		if (!run.word) continue;
+		const lower = run.text.toLowerCase();
+		const bare = lower.replace(/['’]s$/, '');
+		if (bare.length < 2 || STOP_WORDS.has(lower) || STOP_WORDS.has(bare)) continue;
+		const s = stem(lower);
+		if (s.length < 2 || stems.has(s)) continue;
+		stems.add(s);
+		out.push(bare);
+	}
+	return out;
+}
+
+/**
  * Split a chunk's text into segments, marking every whole word whose stem is
  * one of the query's. Unmarked runs are merged; the segments join back to the
  * text exactly.

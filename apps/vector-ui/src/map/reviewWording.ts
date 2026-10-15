@@ -395,3 +395,43 @@ export function matrixNotFound(labels: readonly string[]): string | null {
 export function selectedPairLine(a: string, b: string, value: string): string {
 	return `Selected: ${a} ↔ ${b} · similarity ${value}`;
 }
+
+// =============================================================================
+// CHUNK TEXT
+// =============================================================================
+
+/** The text is on its way. */
+export const CHUNK_LOADING = "Loading the chunk's text…";
+
+/** Matching is by words; retrieval is not. */
+export const CHUNK_LEXICAL = 'Lexical matches only; retrieval is by meaning';
+
+/** No query to mark. */
+export const CHUNK_NO_QUERY = 'Run a text query on the map to mark its words here.';
+
+/** None of the query's words is in the chunk. */
+export const CHUNK_NO_MATCH = 'No word of the query appears in this chunk.';
+
+/** The chunk is longer than the panel shows. */
+export const CHUNK_TRUNCATED = 'Showing the first 20,000 characters of this chunk.';
+
+/**
+ * How many words are marked, and which.
+ *
+ * @param n - Marked words.
+ * @param words - The query's words.
+ * @returns E.g. "4 matches of the query's words (falcon, station, water)".
+ */
+export function chunkMatchesLine(n: number, words: readonly string[]): string {
+	return `${num(n)} ${n === 1 ? 'match' : 'matches'} of the query's words (${words.join(', ')})`;
+}
+
+/**
+ * The store has no such chunk.
+ *
+ * @param chunkId - The chunk asked for.
+ * @returns The sentence.
+ */
+export function chunkMissing(chunkId: number): string {
+	return `This document has no chunk ${chunkId} in the store.`;
+}
