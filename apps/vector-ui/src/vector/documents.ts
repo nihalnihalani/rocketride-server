@@ -46,7 +46,7 @@
 // listing going adds a row and the cap always ends it.
 // =============================================================================
 
-import type { IDocumentItem } from '../contract/types';
+import type { FilterApplied, IDocumentItem, IDocumentsFilter } from '../contract/types';
 import { DIRECTORY_AUTO_ROWS, DIRECTORY_LOAD_MORE } from './budgets';
 import type { IDocumentsPageView } from './results';
 import { formatCount } from './stats';
@@ -213,6 +213,15 @@ export interface IPagerState {
 	error: IFailureText | null;
 	/** Pages applied so far. */
 	pages: number;
+	/** The conditions this listing asked the store for (the scope's, without the path box), or null for every document. */
+	filter: IDocumentsFilter | null;
+	/**
+	 * How much of `filter` the store applied, from its first answer: 'server', 'partial' or 'none' ('none' too
+	 * when an older node answered without saying, having ignored it); null while unknown or without a filter.
+	 */
+	filterApplied: FilterApplied | null;
+	/** The keys of `filter` the store did not apply (filtered here). */
+	filterIgnored: string[];
 }
 
 /**
@@ -222,17 +231,25 @@ export interface IPagerState {
  * @returns The state.
  */
 export function pagerInit(cap: number = DIRECTORY_AUTO_ROWS): IPagerState {
-	return { rows: [], cursor: null, total: null, status: 'idle', cap, storeSorted: true, caveats: [], error: null, pages: 0 };
+	return { rows: [], cursor: null, total: null, status: 'idle', cap, storeSorted: true, caveats: [], error: null, pages: 0, filter: null, filterApplied: null, filterIgnored: [] };
 }
 
 /**
  * Start (or restart) the listing from the first page.
  *
  * @param state - The state (its cap is kept).
+ * @param filter - The conditions to ask the store for (default: the listing's own; null for every document).
  * @returns A loading state with nothing loaded.
  */
-export function pagerBegin(state: IPagerState): IPagerState {
-	return { ...pagerInit(state.cap), status: 'loading' };
+export function pagerBegin(state: IPagerState, filter: IDocumentsFilter | null = state.filter): IPagerState {
+	return { ...pagerInit(state.cap), status: 'loading', filter };
+}
+
+/** The keys a filter sets (null and absent keys are not filtered by). */
+function setKeys(filter: IDocumentsFilter): string[] {
+	return Object.entries(filter)
+		.filter(([, value]) => value !== null && value !== undefined)
+		.map(([key]) => key);
 }
 
 /**
@@ -262,7 +279,14 @@ export function pagerApplyPage(state: IPagerState, page: IDocumentsPageView): IP
 	}
 	const first = state.pages === 0;
 	let rows = first ? sortDocuments(fresh) : [...state.rows, ...fresh];
-	const base = { ...state, cursor: page.nextCursor, total: page.total ?? state.total, storeSorted: page.sorted, caveats: page.caveats, error: null, pages: state.pages + 1 };
+	// With a filter, the first answer says how much of it the store applied; an older node says nothing (it ignored it).
+	let filterApplied = state.filterApplied;
+	let filterIgnored = state.filterIgnored;
+	if (first && state.filter !== null) {
+		filterApplied = page.filterApplied ?? 'none';
+		filterIgnored = page.filterApplied === undefined ? setKeys(state.filter) : [...(page.filterIgnored ?? [])];
+	}
+	const base = { ...state, cursor: page.nextCursor, total: page.total ?? state.total, storeSorted: page.sorted, caveats: page.caveats, error: null, pages: state.pages + 1, filterApplied, filterIgnored };
 	let status: PagerStatus = 'loading';
 	if (page.pagingUnsupported) status = 'unsupported';
 	else if (page.nextCursor === null || page.items.length === 0) status = 'done';
