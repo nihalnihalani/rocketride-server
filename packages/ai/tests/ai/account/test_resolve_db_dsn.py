@@ -35,6 +35,7 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import ssl
 import threading
 import urllib.error
 import urllib.request
@@ -42,6 +43,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pytest
 
+import ai.account.base as base_module
 from ai.account.base import AccountBase
 
 TEST_DSN = 'postgresql://r_t1_ab:secret@pooler.internal:5432/t_t1_ab?sslmode=require'
@@ -210,7 +212,7 @@ def test_broker_http_error_response_is_closed(monkeypatch):
     def raise_http_error(*_args, **_kwargs):
         raise error
 
-    monkeypatch.setattr(urllib.request, 'urlopen', raise_http_error)
+    monkeypatch.setattr(urllib.request.OpenerDirector, 'open', raise_http_error)
 
     with pytest.raises(RuntimeError, match='rejected provision.*503'):
         AccountBase._call_db_broker('https://broker.example/provision', TEST_TOKEN, {'tenant_id': 'tenant-1'})
@@ -276,3 +278,188 @@ def test_dsn_with_existing_sslmode_passes_through_unchanged(broker):
 def test_non_postgres_dsn_rejected(broker):
     with pytest.raises(RuntimeError, match='non-PostgreSQL DSN'):
         _resolve('bad-scheme-tenant')
+
+
+# ---------------------------------------------------------------------------
+# Broker transport: no redirects, no ambient proxy, fixed timeout, safe errors
+# ---------------------------------------------------------------------------
+
+
+class _Hits(BaseHTTPRequestHandler):
+    """Records every request it receives (the place a redirect must not reach)."""
+
+    hits: list = []
+
+    def _record(self):
+        type(self).hits.append((self.command, self.path, self.headers.get('Authorization')))
+        raw = json.dumps({'dsn': TEST_DSN}).encode('utf-8')
+        self.send_response(200)
+        self.send_header('Content-Length', str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+    do_GET = do_POST = _record  # noqa: N815 (http.server API)
+
+    def log_message(self, *args):
+        pass
+
+
+class _Redirecting(BaseHTTPRequestHandler):
+    code = 302
+    location = ''
+
+    def do_POST(self):  # noqa: N802
+        self.rfile.read(int(self.headers.get('Content-Length', 0)))
+        self.send_response(type(self).code)
+        self.send_header('Location', type(self).location)
+        self.send_header('Content-Length', '0')
+        self.end_headers()
+
+    def log_message(self, *args):
+        pass
+
+
+def _serve(handler):
+    server = HTTPServer(('127.0.0.1', 0), handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server
+
+
+@pytest.fixture()
+def redirect_rig(monkeypatch):
+    """A broker that always redirects, and a sink on another origin."""
+    _Hits.hits = []
+    sink = _serve(_Hits)
+    broker = _serve(_Redirecting)
+    _Redirecting.location = f'http://localhost:{sink.server_port}/steal'
+    monkeypatch.setenv('ROCKETRIDE_DB_BROKER_URL', f'http://127.0.0.1:{broker.server_port}/provision')
+    monkeypatch.setenv('ROCKETRIDE_DB_BROKER_TOKEN', TEST_TOKEN)
+    yield sink
+    for server in (broker, sink):
+        server.shutdown()
+        server.server_close()
+
+
+@pytest.mark.parametrize('code', [301, 302, 303, 307, 308])
+def test_a_redirect_is_refused_and_its_target_gets_nothing(redirect_rig, code):
+    """Plain urllib follows 301/302/303 as a GET with the Authorization header,
+    to any host, and accept the redirected body as the broker's answer.
+    """
+    _Redirecting.code = code
+    with pytest.raises(RuntimeError, match=rf'redirect \(HTTP {code}\)'):
+        _resolve('tenant-1')
+    assert _Hits.hits == []
+
+
+def test_ambient_proxy_settings_are_ignored(broker, monkeypatch):
+    """The broker call carries the Tier-0 token: it never goes through an
+    http(s)_proxy picked up from the environment.
+    """
+    _Hits.hits = []
+    sink = _serve(_Hits)
+    # urlopen caches its default opener on first use; start from a clean slate
+    # so the proxy variables below are read the way a fresh process reads them.
+    monkeypatch.setattr(urllib.request, '_opener', None)
+    try:
+        monkeypatch.setenv('http_proxy', f'http://127.0.0.1:{sink.server_port}')
+        monkeypatch.setenv('HTTP_PROXY', f'http://127.0.0.1:{sink.server_port}')
+        assert _resolve('tenant-1') == TEST_DSN
+    finally:
+        sink.shutdown()
+        sink.server_close()
+    assert _Hits.hits == []
+    assert len(broker.requests) == 1
+
+
+def test_broker_call_times_out_after_sixty_seconds(monkeypatch):
+    """A first provision creates a database from a template, which is slow."""
+    seen = {}
+
+    def fake_open(self, request, data=None, timeout=None):
+        seen['timeout'] = timeout
+        raise urllib.error.URLError(ConnectionRefusedError())
+
+    monkeypatch.setattr(urllib.request.OpenerDirector, 'open', fake_open)
+    with pytest.raises(RuntimeError, match='unreachable'):
+        AccountBase._call_db_broker('https://broker.example/provision', TEST_TOKEN, {'tenant_id': 't'})
+    assert seen['timeout'] == 60
+
+
+def test_failures_report_a_fixed_phrase_and_the_exception_type_only(monkeypatch):
+    """str(e) of a URL or TLS error can carry host names or URL userinfo and
+    reaches the task's ROCKETRIDE_DB_RESOLVE_ERROR, so it is not repeated.
+    """
+
+    def fake_open(self, request, data=None, timeout=None):
+        raise urllib.error.URLError(ssl.SSLCertVerificationError(1, 'hostname mismatch: db.secret-host.internal'))
+
+    monkeypatch.setattr(urllib.request.OpenerDirector, 'open', fake_open)
+    with pytest.raises(RuntimeError) as excinfo:
+        AccountBase._call_db_broker('https://broker.example/provision', TEST_TOKEN, {'tenant_id': 't'})
+    assert str(excinfo.value) == 'DB broker unreachable (SSLCertVerificationError)'
+
+
+def test_failure_detail_goes_to_the_server_log_without_the_token(monkeypatch):
+    logged = []
+
+    def fake_open(self, request, data=None, timeout=None):
+        raise urllib.error.URLError(OSError(f'failed after sending {TEST_TOKEN}'))
+
+    monkeypatch.setattr(urllib.request.OpenerDirector, 'open', fake_open)
+    monkeypatch.setattr(base_module, '_server_log', lambda message: logged.append(message))
+    with pytest.raises(RuntimeError):
+        AccountBase._call_db_broker('https://broker.example/provision', TEST_TOKEN, {'tenant_id': 't'})
+    assert logged and 'OSError' in logged[0]
+    assert TEST_TOKEN not in ' '.join(logged)
+
+
+# ---------------------------------------------------------------------------
+# Broker URL: shape checks everywhere, https only on hosted engines
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    'url',
+    [
+        'https://user:pw@broker.example/provision',
+        'https://user@broker.example/provision',
+        'http://x@localhost/provision',
+        'http://evil.example;@localhost/provision',
+        'https://broker.example\\@evil.example/provision',
+        'https://broker.example/provision#frag',
+        'https://',
+        'https:///provision',
+        'https://broker.example:notaport/provision',
+        'https://[::1/provision',
+    ],
+)
+def test_malformed_or_credential_bearing_broker_urls_are_rejected(url):
+    with pytest.raises(RuntimeError) as excinfo:
+        AccountBase._check_broker_url(url)
+    message = str(excinfo.value)
+    assert 'user:pw' not in message and 'broker.example' not in message
+
+
+@pytest.mark.parametrize('url', ['http://localhost:8090/provision', 'http://127.0.0.1/provision', 'http://[::1]:1/p'])
+def test_hosted_engines_refuse_plain_http_even_on_loopback(url):
+    AccountBase._check_broker_url(url)  # the local rig default still works
+    with pytest.raises(RuntimeError, match='must use https'):
+        AccountBase._check_broker_url(url, allow_loopback_http=False)
+    AccountBase._check_broker_url('https://broker.example/provision', allow_loopback_http=False)
+
+
+def test_a_hosted_engine_never_sends_the_token_over_http(broker):
+    class _Hosted(_Minimal):
+        capabilities = ('saas',)
+
+    with pytest.raises(RuntimeError, match='must use https'):
+        asyncio.run(_Hosted().resolve_db_dsn('tenant-1'))
+    assert broker.requests == []
+
+
+def test_a_credential_bearing_url_never_reaches_the_network(monkeypatch):
+    monkeypatch.setenv('ROCKETRIDE_DB_BROKER_URL', 'https://svc:HUNTER2-PW@broker.example/provision')
+    monkeypatch.setenv('ROCKETRIDE_DB_BROKER_TOKEN', TEST_TOKEN)
+    with pytest.raises(RuntimeError) as excinfo:
+        _resolve('tenant-1')
+    assert 'HUNTER2' not in str(excinfo.value)

@@ -34,6 +34,26 @@ import os
 from abc import ABC, abstractmethod
 from typing import NamedTuple
 
+# Seconds the database broker gets to answer. A tenant's first provision
+# creates its database from a template, which is not instant; the SaaS client
+# of the same broker allows the same minute.
+_BROKER_TIMEOUT_S = 60
+
+# The only hosts for which a non-hosted engine accepts a plain-http broker URL.
+_LOOPBACK_HOSTS = ('localhost', '127.0.0.1', '::1')
+
+
+def _server_log(message: str) -> None:
+    """Write one line to the server-side log, never to a task or a client."""
+    try:
+        from rocketlib import warning
+
+        warning(message)
+    except Exception:
+        import logging
+
+        logging.getLogger(__name__).warning(message)
+
 
 class DbDecision(NamedTuple):
     """Answer of ``AccountBase.authorize_db_target``.
@@ -458,36 +478,88 @@ class AccountBase(ABC):
             body = {'scope': scope, 'org_id': client_id.strip(), 'owner_id': owner_id}
         else:
             raise ValueError(f'unknown database scope: {scope!r}')
-        self._check_broker_url(broker_url)
+        # A hosted engine takes https only: the loopback http exception is for
+        # a local dev rig, and nothing on a hosted engine runs one.
+        self._check_broker_url(broker_url, allow_loopback_http=not self._is_hosted())
 
         import asyncio
 
         return await asyncio.to_thread(self._call_db_broker, broker_url, broker_token, body)
 
+    def _is_hosted(self) -> bool:
+        """True on the hosted (SaaS) engine.
+
+        The same two signals as the task engine's ``_is_saas_engine``: this
+        account provider's ``saas`` capability, or the engine's own ``--saas``
+        launch flag (its argv, which no pipeline can reach).
+        """
+        if 'saas' in (getattr(self, 'capabilities', None) or ()):
+            return True
+        try:
+            from rocketlib import args as startup_args
+
+            return '--saas' in startup_args()
+        except Exception:
+            return False
+
     @staticmethod
-    def _check_broker_url(url: str) -> None:
-        """Refuse to send the broker token over anything but HTTPS.
+    def _check_broker_url(url: str, *, allow_loopback_http: bool = True) -> None:
+        """Refuse a broker URL the token must not be sent to.
 
         The token can resolve ANY tenant's DSN, so a deployment typo like an
         ``http://`` broker URL must fail loudly, not silently ship the token
         (and every returned DSN) in cleartext. Plain http is allowed only for
-        localhost — the local dev/test rig runs the provisioner there.
+        localhost, where the local dev/test rig runs the provisioner, and only
+        when ``allow_loopback_http`` is set: a hosted engine passes False.
+
+        Every URL must also be one thing to every parser: userinfo, a
+        backslash, a fragment, a bad port or an empty host make the check
+        and the connection disagree about the host (or put a password into
+        an error message), so they are refused. The message never repeats the
+        URL.
         """
         from urllib.parse import urlparse
 
+        not_https = (
+            'the database broker URL must use https (got {scheme} scheme): the broker token must never travel '
+            'unencrypted'
+            + ('; plain http is allowed only for localhost on a non-hosted engine' if allow_loopback_http else '')
+        )
+        malformed = RuntimeError(
+            'the database broker URL is malformed: it must be an https URL with a host and no credentials, '
+            'backslash, fragment or invalid port'
+        )
         try:
             parsed = urlparse(url)
             scheme, host = parsed.scheme.lower(), parsed.hostname
+            parsed.port  # noqa: B018 (raises ValueError on a bad port)
         except ValueError:
-            scheme, host = '', None
-        if scheme == 'https':
-            return
-        if scheme == 'http' and host in ('localhost', '127.0.0.1', '::1'):
-            return
-        raise RuntimeError(
-            f'ROCKETRIDE_DB_BROKER_URL must use https (got {scheme or "no"} scheme): '
-            'the broker token must never travel unencrypted; plain http is allowed only for localhost'
-        )
+            raise malformed from None
+        if scheme not in ('https', 'http'):
+            raise RuntimeError(not_https.format(scheme=scheme or 'no'))
+        if '@' in parsed.netloc or '\\' in url or parsed.fragment or not host:
+            raise malformed
+        if scheme == 'http' and not (allow_loopback_http and host in _LOOPBACK_HOSTS):
+            raise RuntimeError(not_https.format(scheme=scheme))
+
+    @staticmethod
+    def _broker_opener():
+        """The opener for the broker call: no ambient proxy, no redirects.
+
+        ``urlopen`` would follow a 301/302/303 on the POST as a GET that keeps
+        the Authorization header, to any host and from https to http, and then
+        accept the redirected body as the broker's answer; and it would send
+        the call through an http(s)_proxy from the environment. The broker
+        is addressed directly or not at all. TLS keeps the default context
+        (certificate and hostname checks, the process trust store).
+        """
+        import urllib.request
+
+        class _NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, req, fp, code, msg, headers, newurl):
+                return None
+
+        return urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
 
     @staticmethod
     def _call_db_broker(url: str, token: str, body: dict) -> str:
@@ -495,6 +567,11 @@ class AccountBase(ABC):
 
         Stdlib-only on purpose: the account layer has no async-HTTP dependency,
         and one small request per task start does not justify adding one.
+
+        Failures raise a fixed phrase plus the exception type: the text of a
+        URL or TLS error can carry host names, and this message is handed to
+        the task as ROCKETRIDE_DB_RESOLVE_ERROR. The detail goes to the server
+        log, with the token masked.
         """
         import json
         import urllib.error
@@ -510,12 +587,14 @@ class AccountBase(ABC):
             method='POST',
         )
         try:
-            with urllib.request.urlopen(request, timeout=15) as response:
-                body = json.loads(response.read().decode('utf-8'))
+            with AccountBase._broker_opener().open(request, timeout=_BROKER_TIMEOUT_S) as response:
+                answer = json.loads(response.read().decode('utf-8'))
         except urllib.error.HTTPError as e:
             # 4xx = unknown/invalid tenant per the broker contract; 5xx = broker fault.
             code, reason = e.code, e.reason
             e.close()
+            if 300 <= code < 400:
+                raise RuntimeError(f'DB broker answered with a redirect (HTTP {code}); redirects are refused') from None
             if code == 409:
                 # The provisioner refuses a retained or dropping tenant: its
                 # team was deleted or its user left the org. Only an operator
@@ -525,9 +604,11 @@ class AccountBase(ABC):
                 ) from e
             raise RuntimeError(f'DB broker rejected provision for this account (HTTP {code})') from e
         except Exception as e:
-            raise RuntimeError(f'DB broker unreachable: {e}') from e
+            cause = e.reason if isinstance(e, urllib.error.URLError) and isinstance(e.reason, BaseException) else e
+            _server_log(f'DB broker call failed: {type(cause).__name__}: {str(cause).replace(token, "***")}')
+            raise RuntimeError(f'DB broker unreachable ({type(cause).__name__})') from None
 
-        dsn = body.get('dsn') if isinstance(body, dict) else None
+        dsn = answer.get('dsn') if isinstance(answer, dict) else None
         if not dsn or not isinstance(dsn, str):
             raise RuntimeError('DB broker response did not include a DSN')
         return AccountBase._pin_dsn_tls(dsn)
