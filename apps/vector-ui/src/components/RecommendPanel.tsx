@@ -144,7 +144,7 @@ function results(props: RecommendBodyProps, outcome: Extract<RecommendOutcome, {
 					</ol>
 					{outsideCount > 0 ? (
 						<button type="button" style={{ ...MAP_STYLES.button, marginTop: 6 }} onClick={() => props.onPin(outside.keys)}>
-							{outside.capped ? `Pin ${outside.keys.length} of ${outsideCount} results outside the sample` : `Pin ${outsideCount} ${outsideCount === 1 ? 'result' : 'results'} outside the sample`}
+							{outside.capped ? `Pin results on the map (the first ${outside.keys.length} of ${outsideCount} outside the sample)` : `Pin results on the map (${outsideCount} outside the sample)`}
 						</button>
 					) : null}
 				</>
@@ -176,7 +176,7 @@ export function RecommendBody(props: RecommendBodyProps): React.ReactElement {
 			{chips(props, 'negative')}
 			<label style={{ ...MAP_STYLES.small, display: 'flex', gap: 6, alignItems: 'baseline', margin: '4px 0' }}>
 				<input type="checkbox" checked={props.examples.withQuery && props.queryText !== null} disabled={props.queryText === null} onChange={(event) => props.onWithQuery(event.currentTarget.checked)} />
-				<span>{props.queryText === null ? 'Run a text query on the map to count it as a positive' : `Also like the current query “${props.queryText}”`}</span>
+				<span>{props.queryText === null ? '+ current query (run a text query on the map to count it as a positive)' : `+ current query “${props.queryText}” as a positive`}</span>
 			</label>
 			<div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 6, margin: '6px 0' }}>
 				<label style={{ ...MAP_STYLES.label, display: 'inline-flex', alignItems: 'center', gap: 6 }}>

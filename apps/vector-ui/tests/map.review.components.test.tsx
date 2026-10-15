@@ -343,7 +343,7 @@ test('Recommend with no example: Run disabled with the sentence; how to add exam
 	assert.match(out, /Add at least one positive example/);
 	assert.match(out, /Add as example \(\+\) or \(−\)/);
 	assert.match(out, /type="checkbox"[^>]*disabled=""/, 'no query on the map: the query cannot count');
-	assert.match(out, /Run a text query on the map to count it as a positive/);
+	assert.match(out, /\+ current query \(run a text query on the map to count it as a positive\)/);
 });
 
 test('Recommend with examples: removable chips per side, the query offered, Best score disabled where the store cannot rank, k and Run', () => {
@@ -351,7 +351,7 @@ test('Recommend with examples: removable chips per side, the query offered, Best
 	const out = html(<RecommendPanel sample={demo} limits={ENRICHED.limits} capabilities={ENRICHED.capabilities} examples={examples} onExamplesChange={noop} queryText="falcon water" onRun={run} onSelect={noop} onPin={noop} />);
 	assert.ok(out.includes(`aria-label="Remove positive example: ${DOC0.path} #3"`));
 	assert.match(out, /aria-label="Remove negative example: greenhou… #1"/);
-	assert.match(out, /Also like the current query “falcon water”/);
+	assert.match(out, /\+ current query “falcon water” as a positive/);
 	assert.match(out, /<option value="best_score" disabled="">Best score \(only where the store ranks examples itself\)<\/option>/);
 	assert.match(out, /<option value="12" selected="">12<\/option>/);
 	assert.match(out, /<button[^>]*>Run<\/button>/);
@@ -380,11 +380,11 @@ test('Recommend results: ranked rows with their similarity and preview, what was
 	assert.match(out, /Falcon Station draws its drinking water/);
 	assert.equal((out.match(/>outside the sample</g) ?? []).length, 5);
 	button(tree, '1. C:/demo/handbooks/falcon_handbook.md #7').props.onClick();
-	button(tree, 'Pin 5 results outside the sample').props.onClick();
+	button(tree, 'Pin results on the map (5 outside the sample)').props.onClick();
 	assert.deepEqual(selected, [['75b89d86-a64e-5143-bf50-55d4a7fd8cd2', 7]]);
 	assert.deepEqual(pinned, [rows.filter((r) => !r.inSample).map((r) => r.key)]);
 	const capped = renderToStaticMarkup(recommendBody({ pinMax: 2, outcome: { kind: 'rows', rows, resolved: '', notFound: null, stale: false } }));
-	assert.match(capped, /Pin 2 of 5 results outside the sample/);
+	assert.match(capped, /Pin results on the map \(the first 2 of 5 outside the sample\)/);
 });
 
 test('Recommend states: busy, a failure, results of examples changed since, negatives only', () => {
