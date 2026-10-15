@@ -11,7 +11,8 @@ Where it lives in code:
 | What | File |
 | --- | --- |
 | Hook signatures and base defaults | `packages/ai/src/ai/common/store/document_store.py` (`DocumentStoreBase`) |
-| Hook value types and vocabularies (codes, capabilities, caveats) | `packages/ai/src/ai/common/store/vx_types.py` |
+| Hook value types and vocabularies (codes, capabilities, caveats), the `documents` filter (`DocListFilter`, `parse_doc_list_filter`) | `packages/ai/src/ai/common/store/vx_types.py` |
+| The additive tools (`recommend`, `similarity_matrix`, §4.4), mixed in ahead of the explorer tools | `packages/ai/src/ai/common/store/vx_tools_ext.py` (`VectorExplorerExtTools`) |
 | Hook and tool exceptions | `packages/ai/src/ai/common/store/errors.py` |
 | Write-switch defaults and tool limits (the single source) | `packages/ai/src/ai/common/store/vx_defaults.py`, exported to `apps/vector-ui/tests/fixtures/defaults.json` by `apps/vector-ui/scripts/gen_defaults.py` |
 | Call context of a tool invoke | `packages/ai/src/ai/common/tool_context.py` |
@@ -90,7 +91,17 @@ class ChunkPage:
 @dataclass(frozen=True)
 class KnnGraph:
     k: int; offsets_row: np.ndarray; cols: np.ndarray; sims: np.ndarray; source: str   # 'native'|'node'
+
+@dataclass(frozen=True)
+class DocListFilter:                        # the `documents` filter (§4.4-A); every field Optional, None = not filtered
+    path_prefix: str; file_types: Tuple[str, ...]; ingested_after: str; ingested_before: str
+    min_chunks: int; max_chunks: int; has_first_chunk: bool; has_tables: bool; path_contains: str
+    def given(self) -> Tuple[str, ...]: ...  # the keys it sets, in DOC_LIST_FILTER_KEYS order
+
+def parse_doc_list_filter(value) -> Optional[DocListFilter]: ...   # ValueError(sentence) -> INVALID_INPUT; None when it sets nothing
 ```
+
+`parse_doc_list_filter` refuses: a filter that is not an object, an unknown key, text that is not text or is longer than 1,024 characters (`DOC_LIST_FILTER_TEXT_MAX`), a date not in ISO-8601's extended form, a chunk count that is not a whole number of 0 or more, `min_chunks > max_chunks`, a flag that is not a boolean, more than 32 `file_types` (`DOC_LIST_FILTER_TYPES_MAX`) or one that is not an extension. It normalises dates to UTC `YYYY-MM-DDTHH:MM:SSZ` (the stored `ingestedAt` form, so the bounds compare as text; no offset means UTC) and extensions to lower case without the dot; an empty text or list is the same as leaving the key out. The value lists of the additive answers are constants beside the vocabularies: `FILTER_APPLIED_VALUES`, `LISTING_REASONS`, `CLUSTER_METHODS`, `CLUSTER_LABEL_SOURCES`, `RECOMMEND_STRATEGIES`, `MATRIX_SOURCES`, `KEYWORD_MATCHES`.
 
 ### 2.2 Hooks (all non-abstract; defaults in the base)
 
@@ -145,6 +156,8 @@ class DocumentStoreBase(ABC):
 
 `capabilities()` returns the hooks named in the class constant `DocumentStoreBase.VX_HOOKS` that the driver overrides, plus the names in the class constant `DocumentStoreBase.VX_DRIVER_CAPABILITIES`: an empty frozenset in the base, which a driver overrides with what its backend does natively beyond the hooks (such as `sample_stratified_native`, `knn_native`, `documents_distinct`, `documents_sorted` or `search_keyword`; the vocabulary is `vx_types.CAPABILITY_KEYS`).
 
+The additive extensions (§4.4) add to the hooks: `listDocuments(..., filter: Optional[DocListFilter] = None)` (the base default ignores it, and the tool then answers `filter_applied: 'none'`), and the class constant `VX_KEYWORD_MATCH` (`'substring' | 'token' | None`, base `None`) reported as `dialect.keyword_match`. A driver that applies the filter declares `documents_filter` in `VX_DRIVER_CAPABILITIES`; one that ranks Qdrant's `best_score` recommendation natively declares `recommend_best_score`.
+
 Base-class changes that ride along: `doesCollectionExist(modelName)` **keeps today's read-path behaviour** (never refuses on model); the comparison is exposed as `describe().caveats` `model_mismatch` and `dialect.health.model_mismatch`, and `search` adds `warnings:['model_mismatch']`. `BaseException` for non-zero offsets (`qdrant.py:404`, `chroma.py:536`, `milvus.py:365`, `weaviate.py:404`, `pinecone.py:278`) becomes `ValueError`. **The control-record path is untouched:** `createCollection` keeps calling `self.addChunks([doc], checkCollection=False)` (`ds:535`); no driver refuses `schema` inside `addChunks`.
 
 ### 2.3 Schema changes (`packages/client-python/src/rocketride/schema/`)
@@ -196,7 +209,9 @@ Per store instance: LRU of 2 entries, 600 s TTL, keyed by `sample_id = 's-<seed>
 
 ---
 
-## 4. Tools on `VectorStoreToolMixin` (`vx_tools.py`, mixed in; `ds:657` keeps its name)
+## 4. Tools on `VectorStoreToolMixin` (`vx_tools.py` and `vx_tools_ext.py`, mixed in; `ds:657` keeps its name)
+
+`class VectorStoreToolMixin(VectorExplorerExtTools, VectorExplorerTools)`: the additive tools of §4.4 live in `vx_tools_ext.py`, which may import from `vx_tools` and is never imported by it.
 
 ### 4.0 Wrapper and audience
 
@@ -219,9 +234,9 @@ A `STORE_ERROR` message is scrubbed before it leaves the node: URLs, DSNs, `user
 
 Codes: `INVALID_INPUT`, `UNSUPPORTED`, `NOT_FOUND`, `RESERVED_ID`, `COLLECTION_MISSING`, `STORE_ERROR`, `DIMENSION_MISMATCH`, `MODEL_MISMATCH`, `NO_EMBEDDER`, `LIMIT_EXCEEDED`, `SAMPLE_EXPIRED`, `BUSY`, `TIMEOUT`, `RATE_LIMITED`, `WRITES_DISABLED`, `WRITES_SOURCE`, `WRITES_PUBLIC`, `WRITES_BROADCAST`, `WRITES_AGENT`, `WRITES_UNKNOWN_CALLER`, `READS_PUBLIC` (§6.6).
 
-Capabilities (`dialect.capabilities`): `describe`, `count`, `count_documents`, `documents`, `documents_distinct`, `documents_sorted`, `chunks`, `vectors`, `sample`, `sample_light`, `sample_stratified_native`, `knn_native`, `project`, `neighbors`, `search_vector` (always true), `search_keyword`, `remove`, `remove_count`, `soft_delete` (false in v1), `embed_node` (filled by the app); `projection: ['pca']`.
+Capabilities (`dialect.capabilities`): `describe`, `count`, `count_documents`, `documents`, `documents_distinct`, `documents_sorted`, `chunks`, `vectors`, `sample`, `sample_light`, `sample_stratified_native`, `knn_native`, `project`, `neighbors`, `search_vector` (always true), `search_keyword`, `remove`, `remove_count`, `soft_delete` (false in v1), `embed_node` (filled by the app); `projection: ['pca']`. Additive (§4.4), reported by every node and false until offered: `clusters` (the node computes `sample.clusters`), `documents_filter` (the driver declares it), `recommend_best_score` (the driver declares it).
 
-Caveats: `brute_force_search`, `no_filtered_count`, `biased_sample`, `score_scale_raw`, `score_scale_inverted_fixed`, `shared_org_table`, `experimental`, `cloud_only_unverified`, `extras_not_stored`, `documents_by_first_chunk`, `document_count_capped`, `documents_unsorted`, `documents_paging_unsupported`, `model_mismatch`, `meta_column_pending`, `filtered_search_may_underfill` (pgvector older than 0.8, which has no iterative HNSW scan: a filtered search may return fewer than `k` rows).
+Caveats: `brute_force_search`, `no_filtered_count`, `biased_sample`, `score_scale_raw`, `score_scale_inverted_fixed`, `shared_org_table`, `experimental`, `cloud_only_unverified`, `extras_not_stored`, `documents_by_first_chunk`, `document_count_capped`, `documents_unsorted`, `documents_paging_unsupported`, `model_mismatch`, `meta_column_pending`, `filtered_search_may_underfill` (pgvector older than 0.8, which has no iterative HNSW scan: a filtered search may return fewer than `k` rows). Additive (§4.4): `listing_truncated` (the sampler's document listing stopped with pages left), `documents_filter_partial` (the store applied some filter keys), `documents_filter_client` (the store applied none; the app filters what it loaded).
 
 Limits (node-enforced; reported in `dialect.limits`):
 
@@ -241,6 +256,9 @@ Limits (node-enforced; reported in `dialect.limits`):
 | `sample_budget_ms` | 60,000 |
 | `statement_timeout_ms` | 30,000 (pgvector; others null) |
 | `counts_cached_s` | 60 |
+| `recommend_examples_max` | 10 example keys per side of `recommend` (§4.4-D) |
+| `matrix_keys_max` | 100 keys of `similarity_matrix` (§4.4-E) |
+| `max_components` | 200 clusters kept in `sample.clusters`; the rest are noise (§4.4-C) |
 | `embed_texts_max` | 8; `embed_per_minute` 30, burst 5 |
 
 ### 4.2 Tool table
@@ -255,8 +273,8 @@ Every input goes through the wrapper; every output has `success`. `key` is alway
  "score":{"formula":"1 - cosine_distance","range":[-1,1],"higher_is_better":true,"floor":0.2,"threshold":0.3},
  "support":"supported","allow_writes":true,"agent_writes":true,"writes_scope":"tools_source",
  "write_tools":["remove_document","delete","upsert"],
- "capabilities":{"describe":true,"count":true,"count_documents":true,"documents":true,"documents_distinct":true,"documents_sorted":true,"chunks":true,"vectors":true,"sample":true,"sample_light":true,"sample_stratified_native":true,"knn_native":false,"project":true,"neighbors":true,"search_vector":true,"search_keyword":true,"remove":true,"remove_count":true,"soft_delete":false,"projection":["pca"]},
- "limits":{"documents_page":500,"chunks_page":200,"vectors_keys_max":2,"sample_default":1000,"sample_max":2000,"sample_max_light":5000,"snippet_chars":120,"knn_k_max":30,"neighbors_k_max":50,"project_keys_max":200,"scope_keys_max":2000,"top_k_max":100,"write_ids_max":100,"sample_budget_ms":60000,"statement_timeout_ms":30000,"counts_cached_s":60},
+ "capabilities":{"describe":true,"count":true,"count_documents":true,"documents":true,"documents_distinct":true,"documents_sorted":true,"chunks":true,"vectors":true,"sample":true,"sample_light":true,"sample_stratified_native":true,"knn_native":false,"project":true,"neighbors":true,"search_vector":true,"search_keyword":true,"remove":true,"remove_count":true,"soft_delete":false,"clusters":false,"documents_filter":false,"recommend_best_score":false,"projection":["pca"]},
+ "limits":{"documents_page":500,"chunks_page":200,"vectors_keys_max":2,"sample_default":1000,"sample_max":2000,"sample_max_light":5000,"snippet_chars":120,"knn_k_max":30,"neighbors_k_max":50,"project_keys_max":200,"scope_keys_max":2000,"top_k_max":100,"write_ids_max":100,"sample_budget_ms":60000,"statement_timeout_ms":30000,"counts_cached_s":60,"recommend_examples_max":10,"matrix_keys_max":100,"max_components":200},
  "health":{"collection_exists":true,"control_record":true,"model_mismatch":null,"meta_column":true},
  "caveats":[]}
 ```
@@ -303,6 +321,65 @@ A missing collection answers the same envelope with nulls and `health.collection
 - `IGlobal.embed_lock` is a shared/exclusive lock that prefers the exclusive side: the node's own batches hold it shared, an `embed` call exclusively, so a call waits for the batches already on the model and new batches queue behind it. It covers the model call only, not the write that follows a flush. A call still waiting after 60 s answers `BUSY` and its token is refunded.
 - The token bucket lives on `IGlobal.embed_bucket`; a call refused before it reaches the model (`INVALID_INPUT`, `NO_EMBEDDER`, `BUSY`) spends no token. Blank texts are `INVALID_INPUT`.
 - A model failure is a `STORE_ERROR` whose message names only the exception type; the full text goes to the engine log.
+
+### 4.4 Additive extensions
+
+Every extension below is an optional input, a new answer key or a new tool. An agent's catalog does not change (the six legacy descriptors stay byte-identical, `nodes/test/test_vector_tool_envelope.py`); every new tool is `audience=('dap',)`, runs `vx_write_gate.check_read()` first and goes through `vectordb_tool`. None accepts or returns a stored vector. The shapes, vocabularies and limits are fixed here and in `vx_types.py`, `vx_defaults.py` and `apps/vector-ui/src/contract/types.ts` (provisional answers in `apps/vector-ui/tests/fixtures/provisional/`: `documents_filter_{server,partial,client}`, `sample_demo_1000_clusters`, `sample_listing_truncated`, `recommend_{ok,unsupported}`, `similarity_matrix_ok`, `dialect_enriched`). Until a node implements one, it reports the matching capability false and leaves the key out, and the app treats the feature as unavailable on that node.
+
+**A. `documents` filter.** Input key `filter` (keys `DOC_LIST_FILTER_KEYS`, parsed by `parse_doc_list_filter`, §2.1), passed to `listDocuments(..., filter=...)`:
+
+```json
+{"cursor":null,"limit":200,"deleted":"active","sort":"path",
+ "filter":{"path_prefix":"C:/demo/handbooks/","file_types":["md","pdf"],
+           "ingested_after":"2026-10-01T00:00:00Z","ingested_before":null,
+           "min_chunks":1,"max_chunks":null,"has_first_chunk":true,"has_tables":null,"path_contains":null}}
+→ {"success":true,"items":[…],"next_cursor":"…","total":12,"counts_exact":true,"distinct":true,"sorted":true,
+   "filter_applied":"server","filter_ignored":[],"caveats":[]}
+```
+
+`path_prefix` matches the start of the path exactly, `file_types` the extension, `ingested_after` is inclusive and `ingested_before` exclusive, `path_contains` ignores case. `filter_applied` is `"server"` when the driver applied every given key, `"partial"` (caveat `documents_filter_partial`) with `filter_ignored` naming the keys it skipped, or `"none"` (caveat `documents_filter_client`) with every given key in `filter_ignored`: the app then filters the rows it loaded and says so. Without a filter the answer carries neither key. Capability `documents_filter` (the driver declares it). pgvector applies the keys inside the statement that pages the keys (`LIKE … ESCAPE` on the escaped prefix, `lower("parent") LIKE '%.' || ext`, `ILIKE` for `path_contains`, `"meta"->>'ingestedAt'` only when the `meta` column exists, else `"partial"` with `filter_ignored:["ingested_after", …]`, `HAVING` for chunk counts, `bool_or` for the flags), so the keyset cursor and the carried total stay right; Qdrant, Chroma and the experimental drivers answer `"none"`. `INVALID_INPUT` for an unknown key, a date not in ISO-8601, text over 1,024 characters or `min_chunks > max_chunks`.
+
+**B. Scope and the sampler's listing** (no new input key). The scope limit is `limits.scope_keys_max` (2,000), already enforced on `filter.object_ids` of `sample` and `neighbors`; `recommend` and `similarity_matrix` use it too, and `search` caps its extension key `filter.objectIds` at it (`LIMIT_EXCEEDED`; the legacy `objectId` key is unchanged). With `filter.object_ids`, the sampler lists up to `max(500, len(object_ids))` documents instead of 500 (at most 4 pages of `documents_page`), so a stratified pick spans the whole scope. Every `sample` answer gains `"listing":{"documents":412,"truncated":false,"reason":"complete"}`: `truncated` is true whenever the last page the listing received still had a `next_cursor` when the listing ended, and `reason` (`LISTING_REASONS`) is `"complete"` (no cursor left), `"cap"` (the row cap), `"stale"` (pages without a new document), `"pages"` (the page budget) or `"budget"` (the deadline). A truncated listing adds the caveat `listing_truncated`. `of` is unchanged (null where the store cannot count) and is never a scope count.
+
+**C. `sample` clusters and table flags.** Input `"cluster":{"method":"knn-components","labels":true}`; the answer gains `clusters` and `points.table` (1 for a table chunk):
+
+```json
+{"n":1000,"seed":7,"strategy":"stratified","mode":"detailed","knn_k":15,"components":3,
+ "cluster":{"method":"knn-components","labels":true}}
+→ {…,"points":{…,"table":[0,1,0,…]},
+   "clusters":{"method":"knn-components","edge_threshold":0.6123,"percentile":60,"count":23,"noise":38,
+               "labels":[0,0,3,-1,…],"sizes":[412,205,…,2],
+               "keywords":[["falcon","station","water","spring","intake"],…,[]],"labelled":12,
+               "label_source":"text","labelled_from":50,"took_ms":{"clusters":41,"labels":120}}}
+```
+
+The node keeps the mutual kNN edges whose similarity is at least `edge_threshold`, the `percentile`-th percentile of all the sample's kNN edge similarities (60 first); groups are the connected components of the kept edges by union-find, numbered by size (largest first). While the largest group holds half the points or more and `percentile` is below 95, the percentile rises by 10 and the groups are computed again; the final `percentile` and `edge_threshold` are reported. Every group of 2 or more points is kept, up to `limits.max_components`; singletons and the rest are noise (`-1`). The node never applies a user's minimum group size: the app folds small groups itself, without a call. `keywords`: for the largest groups of at least 5 points (at most 50, `labelled` of them), the top 5 terms by TF-IDF over at most `labelled_from` (50) of their chunk texts, lower-cased, stop words and tokens shorter than 3 characters removed, ties by frequency then alphabet; other groups get `[]`. `label_source` is `"text"`, `"paths"` (path segments) when the driver returns no text, or null. `clusters` is absent unless `cluster` is sent. Capability `clusters`. Budgets: 2,000 points with `knn_k` 15 (detailed): clusters ≤ 300 ms, labels ≤ 500 ms, ≤ 12 KB more; 5,000 points with `knn_k` 10 (light): ≤ 500 ms, ≤ 500 ms, ≤ 25 KB. `INVALID_INPUT` for an unknown method (`label-propagation` is reserved) or a non-boolean `labels`.
+
+**D. `recommend`** (new tool; keys, and at most the query vector `embed` returned):
+
+```json
+{"positive":[["060f…",0],["9fa0…",3]],"negative":[["aa12…",7]],"vector":null,
+ "k":12,"strategy":"average_vector","filter":{"object_ids":null},"exclude_examples":true}
+→ {"success":true,"items":[{"key":["bb34…",2],"sim":0.71,"score":0.71,"below_floor":false,"path":"…","chunkId":2,"preview":"…"}],
+   "strategy_used":"average_vector","native":false,"metric":"cosine","k_requested":12,
+   "examples_resolved":{"positive":2,"negative":1},"not_found":[]}
+```
+
+At most `limits.recommend_examples_max` keys per side, read through `getVectors`. `average_vector`: `avg_positive` is the mean of the positive vectors and `vector`, `avg_negative` the mean of the negative ones; the query is `avg_positive + avg_positive − avg_negative` with negatives and `avg_positive` without (unit-normalised for cosine), searched over the whole collection as `neighbors` does, with the examples left out. `best_score` only where `capabilities.recommend_best_score` (Qdrant's recommend query, `native:true`; it accepts negatives alone), elsewhere `UNSUPPORTED`. `INVALID_INPUT` (no positive and no vector under `average_vector`), `NOT_FOUND` (no positive key resolved; unresolved keys are always listed in `not_found`), `DIMENSION_MISMATCH`, `BUSY` (one `neighbors` or `recommend` at a time per instance).
+
+**E. `similarity_matrix`** (new tool; keys only, scalars back):
+
+```json
+{"keys":[["060f…",0],["9fa0…",3],["c1d2…",0]]}
+→ {"success":true,"n":3,"keys":[["060f…",0],["9fa0…",3],["c1d2…",0]],"metric":"cosine","dp":2,
+   "matrix":[[1,0.91,0.12],[0.91,1,0.08],[0.12,0.08,1]],"source":"cache","not_found":[]}
+```
+
+2 to `limits.matrix_keys_max` keys, resolved from the latest cached sample, else `getVectors`; `source` (`MATRIX_SOURCES`) says which (`"cache"`, `"store"` or `"mixed"`). The matrix covers the resolved keys (`n`, in `keys` order) by the store's metric (`vx_math.similarity`), rounded to `dp` places; unresolved keys are listed in `not_found`. There is no `sample_id` input, so the matrix cannot go stale. `NOT_FOUND` (fewer than 2 resolved), `LIMIT_EXCEEDED`, `INVALID_INPUT`. ≤ 60 KB.
+
+**F. Per-document health and the store's size.** `documents` items gain `"max_chunk_id"` and `"deleted_chunks"`: `chunks`, `has_first_chunk`, `tables` and `max_chunk_id` count the rows the listing's `deleted` mode selects; `deleted_chunks` counts the document's soft-deleted rows whatever the mode. pgvector computes them for the page's objectIds under `deleted='all'` with the mode applied per column (`count(*) FILTER (WHERE <mode>)`), so which documents are listed does not change; other drivers answer null for both. `dialect` gains `"size_bytes"` from `StoreInfo.size_bytes` (pgvector: `pg_total_relation_size`; null elsewhere).
+
+**G. `dialect.keyword_match`**: `"substring"` (pgvector `ILIKE`, Chroma `$contains`), `"token"` (Qdrant's `MatchText` over the content text index) or null, from the driver constant `VX_KEYWORD_MATCH`, beside `capabilities.search_keyword`.
 
 ---
 
