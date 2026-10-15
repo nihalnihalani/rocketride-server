@@ -229,6 +229,54 @@ test('allow_writes: true on store_1 only, read where the node reads it (config[c
 	}
 });
 
+/** The repository root (driver sources are read from it). */
+const REPO = path.resolve(__dirname, '..', '..', '..');
+
+/** The cosine similarity every template's retrieval threshold stands for. */
+const RETRIEVAL_COSINE = 0.3;
+
+/**
+ * How each provider's store node turns a cosine match into the `score` its
+ * threshold is compared with (the drivers' scoreInfo, contract page section 3),
+ * and where the driver says so. pgvector and Pinecone report the cosine
+ * similarity itself; the others rescale it to (1 + cosine) / 2, so the same
+ * cut is a different number there. `metric` is where cosine comes from: the
+ * template's own `similarity`, or the driver's default when the template sets none.
+ */
+const SCORE_SCALE: Record<string, { driver: string; formula: string; metric: string; toScore: (cosine: number) => number }> = {
+	postgres: { driver: 'packages/ai/src/ai/common/store/pgvector/driver.py', formula: "'cosine': {'formula': '1 - cosine_distance'", metric: 'template', toScore: (c) => c },
+	rocketride_vector: { driver: 'packages/ai/src/ai/common/store/pgvector/driver.py', formula: "'cosine': {'formula': '1 - cosine_distance'", metric: 'template', toScore: (c) => c },
+	pinecone: { driver: 'nodes/src/nodes/store_pinecone/pinecone.py', formula: "'cosine similarity (raw)'", metric: "config.get('similarity', 'cosine')", toScore: (c) => c },
+	qdrant: { driver: 'nodes/src/nodes/store_qdrant/qdrant.py', formula: "'(1 + cosine_similarity) / 2'", metric: "config.get('similarity', 'Cosine')", toScore: (c) => (1 + c) / 2 },
+	chroma: { driver: 'nodes/src/nodes/store_chroma/chroma.py', formula: "'(2 - cosine_distance) / 2'", metric: "config.get('similarity', 'cosine')", toScore: (c) => (1 + c) / 2 },
+	milvus: { driver: 'nodes/src/nodes/store_milvus/milvus.py', formula: "'(1 + cosine similarity) / 2'", metric: "config.get('similarity', 'COSINE')", toScore: (c) => (1 + c) / 2 },
+	weaviate: { driver: 'nodes/src/nodes/store_weaviate/weaviate.py', formula: "'1 - cosine distance / 2'", metric: "config.get('similarity', 'cosine')", toScore: (c) => (1 + c) / 2 },
+	astra: { driver: 'nodes/src/nodes/store_astra/astra_db.py', formula: "'(1 + cosine similarity) / 2'", metric: "config.get('similarity', 'cosine')", toScore: (c) => (1 + c) / 2 },
+	atlas: { driver: 'nodes/src/nodes/store_atlas/atlas.py', formula: "'(1 + cosine similarity) / 2'", metric: "config.get('similarity', 'cosine')", toScore: (c) => (1 + c) / 2 },
+};
+
+test("the retrieval threshold is the same cosine cut on every store's own score scale", () => {
+	assert.deepEqual(Object.keys(SCORE_SCALE).sort(), [...FILES].sort(), 'every template has its scale');
+	for (const key of FILES) {
+		const scale = SCORE_SCALE[key];
+		const source = fs.readFileSync(path.join(REPO, scale.driver), 'utf8');
+		assert.ok(source.includes(scale.formula), `${key}: the driver still scores cosine as ${scale.formula}`);
+		const { components } = read(key);
+		const expected = scale.toScore(RETRIEVAL_COSINE);
+		for (const id of ['store_1', 'store_2']) {
+			const values = settings(byId(components, id));
+			if (scale.metric === 'template') assert.equal(values.similarity, 'cosine', `${key}: ${id} names cosine`);
+			else {
+				assert.equal(values.similarity, undefined, `${key}: ${id} leaves the metric to the driver`);
+				assert.ok(source.includes(scale.metric), `${key}: the driver defaults to cosine (${scale.metric})`);
+			}
+			// A threshold of 0.3 on a (1 + cosine) / 2 scale would be a cosine of -0.4: every chunk would pass.
+			assert.equal(typeof values.score, 'number', `${key}: ${id} sets a threshold`);
+			assert.ok(Math.abs((values.score as number) - expected) < 1e-9, `${key}: ${id} score ${String(values.score)} is cosine ${RETRIEVAL_COSINE} on this store's scale (${expected})`);
+		}
+	}
+});
+
 test('the parser refuses files over 50 MB in every template', () => {
 	for (const key of FILES) {
 		const parse = byId(read(key).components, 'parse_1');

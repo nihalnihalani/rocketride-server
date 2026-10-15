@@ -54,6 +54,15 @@ written by an earlier release, and **Experimental** otherwise.
   The pipeline has two store nodes on the same collection. `store_1` is the one
   Vector Explorer manages; `store_2` answers the chat. Give both the same
   connection settings and collection.
+
+  Both store nodes carry the same retrieval threshold, a cosine similarity of
+  0.3, written on that store's own score scale: `0.3` on pgvector, RocketRide
+  Vector and Pinecone, which score a match by its cosine similarity, and
+  `0.65` on Qdrant, Chroma, Milvus, Weaviate, Astra DB and MongoDB Atlas,
+  which score it as (1 + cosine similarity) / 2. A question therefore cites
+  the same chunks on every store, and one the documents do not cover cites
+  none; **Why these?** lists the chunks that fell short. Change a threshold on
+  the store's own scale; the store node's page describes it.
 - **Saved as a project, so its sources are grouped.** The three sources are
   separate tasks, and the app groups them into one connection by the
   pipeline's `project_id`. Open a template, save its text as a new `.pipe` file

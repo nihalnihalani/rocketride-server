@@ -183,7 +183,7 @@
           "host": "localhost",
           "port": 8080,
           "collection": "VectorExplorerDocs",
-          "score": 0.3,
+          "score": 0.65,
           "serverName": "weaviate",
           "allow_writes": true
         },
@@ -224,7 +224,7 @@
           "host": "localhost",
           "port": 8080,
           "collection": "VectorExplorerDocs",
-          "score": 0.3,
+          "score": 0.65,
           "serverName": "weaviate",
           "allow_writes": false
         },

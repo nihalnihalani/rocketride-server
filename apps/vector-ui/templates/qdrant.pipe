@@ -183,7 +183,7 @@
           "host": "localhost",
           "port": 6333,
           "collection": "vector_explorer_docs",
-          "score": 0.3,
+          "score": 0.65,
           "serverName": "qdrant",
           "allow_writes": true
         },
@@ -224,7 +224,7 @@
           "host": "localhost",
           "port": 6333,
           "collection": "vector_explorer_docs",
-          "score": 0.3,
+          "score": 0.65,
           "serverName": "qdrant",
           "allow_writes": false
         },

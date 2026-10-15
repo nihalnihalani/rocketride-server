@@ -183,7 +183,7 @@
           "host": "localhost",
           "port": "8000",
           "collection": "vector_explorer_docs",
-          "score": 0.3,
+          "score": 0.65,
           "serverName": "chroma",
           "allow_writes": true
         },
@@ -224,7 +224,7 @@
           "host": "localhost",
           "port": "8000",
           "collection": "vector_explorer_docs",
-          "score": 0.3,
+          "score": 0.65,
           "serverName": "chroma",
           "allow_writes": false
         },

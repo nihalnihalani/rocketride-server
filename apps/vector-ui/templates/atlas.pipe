@@ -184,7 +184,7 @@
           "apikey": "",
           "database": "rocketride",
           "collection": "vector_explorer_docs",
-          "score": 0.3,
+          "score": 0.65,
           "serverName": "atlas",
           "allow_writes": true
         },
@@ -226,7 +226,7 @@
           "apikey": "",
           "database": "rocketride",
           "collection": "vector_explorer_docs",
-          "score": 0.3,
+          "score": 0.65,
           "serverName": "atlas",
           "allow_writes": false
         },

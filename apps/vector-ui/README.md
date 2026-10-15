@@ -42,7 +42,10 @@ answer the Vector Explorer tools.
   hold no password, token or `project_id`. To use one, open it there and save
   its text as a new `.pipe` file in a VS Code workspace: the editor gives a new
   `.pipe` file its own `project_id`, and the app groups a pipeline's three
-  sources by it. Type the store's connection details into its form.
+  sources by it. Type the store's connection details into its form. Both store
+  nodes keep chunks with a cosine similarity of at least 0.3 to the question,
+  written on the store's own score scale: `0.3` on pgvector, RocketRide Vector
+  and Pinecone, `0.65` (that is, (1 + 0.3) / 2) on the other stores.
 - **All three sources running.** Connections are discovered from running tasks.
   A pipeline whose Tools source is not running still appears, as a
   **Read-only** card (see [Connections](#connections)).
