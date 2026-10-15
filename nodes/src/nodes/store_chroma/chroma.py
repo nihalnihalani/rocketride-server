@@ -136,6 +136,9 @@ class Store(DocumentStoreBase):
     # Explorer capabilities beyond the hooks this class overrides (vx_types.CAPABILITY_KEYS).
     VX_DRIVER_CAPABILITIES = frozenset({'documents_distinct', 'search_keyword'})
 
+    # dialect.keyword_match: searchKeyword is where_document {'$contains': text}, which matches text fragments.
+    VX_KEYWORD_MATCH = 'substring'
+
     # Support level reported by the explorer's dialect: the unmocked live suite
     # (nodes/test/test_store_chroma_full.py) runs on a new and a legacy collection.
     VX_SUPPORT = 'supported'

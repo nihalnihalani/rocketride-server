@@ -370,6 +370,16 @@ def test_soft_delete_keeps_the_metadata(new_store):
         assert meta['isDeleted'] is True and meta['parent'] == contract.path_of(contract.SOFT_DELETED)
 
 
+def test_keyword_search_matches_text_fragments(new_store):
+    """dialect.keyword_match 'substring': ``$contains`` matches a fragment that spans words (Chroma compares case)."""
+    store, _ = new_store
+    assert type(store).VX_KEYWORD_MATCH == 'substring'
+    found = store.searchKeyword(QuestionText(text='c-04 chu'), DocFilter(limit=100))
+    assert {d.metadata.objectId for d in found} == {'doc-04'}
+    assert len(found) == contract.DOCS['doc-04']
+    assert store.searchKeyword(QuestionText(text='C-04 CHU'), DocFilter(limit=100)) == []
+
+
 def test_empty_id_lists_select_nothing(new_store):
     # The server refuses `$in: []`; the driver answers an empty result instead.
     store, _ = new_store

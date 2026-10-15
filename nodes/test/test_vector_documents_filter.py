@@ -3,9 +3,10 @@
 # Copyright (c) 2026 Aparavi Software AG
 # =============================================================================
 
-"""The ``documents`` filter and the per-document health fields on the stores.
+"""The ``documents`` filter, the per-document health fields and the search scope cap on the stores.
 
-Contract section 4.4-A (the filter) and 4.4-F (``max_chunk_id`` and ``deleted_chunks``):
+Contract section 4.4-A (the filter), 4.4-B (the cap on ``search``'s ``filter.objectIds``),
+4.4-F (``max_chunk_id`` and ``deleted_chunks``) and 4.4-G (``keyword_match``):
 
 * the shared pgvector driver applies every key of the filter inside the statement that
   pages the document keys, on the same per-document aggregates the listing reports (the
@@ -17,6 +18,11 @@ Contract section 4.4-A (the filter) and 4.4-F (``max_chunk_id`` and ``deleted_ch
 * each listed document reports ``max_chunk_id`` under the listing's ``deleted`` mode and
   ``deleted_chunks``, its soft-deleted rows whatever the mode; which documents are listed
   does not change.
+* ``search`` refuses more than ``limits.scope_keys_max`` ids in ``filter.objectIds`` with
+  ``LIMIT_EXCEEDED``; the legacy ``objectId`` key is unchanged.
+* ``VX_KEYWORD_MATCH`` says how a driver's keyword search matches: ``'substring'`` for
+  pgvector (``ILIKE``) and Chroma (``$contains``), unset (null) for a driver without
+  keyword search.
 
 The pgvector cases run the real driver over the psycopg2 test double
 (``nodes/test/mocks/psycopg2``); the same behaviour is checked live in
@@ -25,6 +31,7 @@ The pgvector cases run the real driver over the psycopg2 test double
 
 from __future__ import annotations
 
+import ast
 import importlib
 import importlib.util
 import inspect
@@ -35,9 +42,11 @@ from typing import Any, Dict, List, Optional
 
 import pytest
 
-from ai.common.store.vx_types import DocListFilter, parse_doc_list_filter
+from ai.common.store import DocumentStoreBase
+from ai.common.store.vx_defaults import VECTOR_TOOL_LIMITS
+from ai.common.store.vx_types import KEYWORD_MATCHES, DocListFilter, parse_doc_list_filter
 
-from .test_vectordb_tool_mixin import node
+from .test_vectordb_tool_mixin import clustered, node
 
 _REPO = Path(__file__).resolve().parents[2]
 _MOCK_PSYCOPG2 = _REPO / 'nodes' / 'test' / 'mocks' / 'psycopg2'
@@ -52,6 +61,7 @@ _SWAPPED = (
 )
 DIM = 4
 MODEL = 'test-model'
+SCOPE_MAX = VECTOR_TOOL_LIMITS['scope_keys_max']
 
 
 # ---------------------------------------------------------------------------
@@ -538,3 +548,115 @@ def test_documents_tool_answers_the_health_fields(pg):
     items = {item['objectId']: item for item in node(store).documents({})['items']}
     assert (items['gappy']['max_chunk_id'], items['gappy']['deleted_chunks']) == (3, 1)
     assert (items['whole']['max_chunk_id'], items['whole']['deleted_chunks']) == (2, 0)
+
+
+# ---------------------------------------------------------------------------
+# search: the cap on filter.objectIds (contract section 4.4-B)
+# ---------------------------------------------------------------------------
+
+
+def _ids(n: int) -> List[str]:
+    return [f'doc{i:05d}' for i in range(n)]
+
+
+def _semantic_filter(store):
+    return [call for call in store.calls if call[0] == 'semantic'][-1][2]
+
+
+def test_search_takes_object_ids_up_to_the_scope_limit():
+    store = clustered()
+    answer = node(store).search(
+        {'vector': store.rows[('doc00', 0)].embedding, 'filter': {'objectIds': _ids(SCOPE_MAX)}}
+    )
+    assert answer['success'] is True
+    assert len(_semantic_filter(store).objectIds) == SCOPE_MAX
+
+
+@pytest.mark.parametrize('mode', ['semantic', 'keyword', 'auto'])
+def test_search_refuses_more_object_ids_than_the_scope_limit_before_embedding(mode):
+    store = clustered()
+    embedded: List[str] = []
+    inst = node(store, embed_query=lambda text: embedded.append(text) or [0.1] * 8, embed_model_name='m')
+    answer = inst.search({'query': 'kestrel', 'mode': mode, 'filter': {'objectIds': _ids(SCOPE_MAX + 1)}})
+    assert (answer['success'], answer['code']) == (False, 'LIMIT_EXCEEDED')
+    assert f'{SCOPE_MAX:,}' in answer['error'] and f'{SCOPE_MAX + 1:,}' in answer['error']
+    assert embedded == [] and not [call for call in store.calls if call[0] in ('semantic', 'keyword')]
+
+
+def test_search_keeps_the_legacy_object_id_key_unchanged():
+    store = clustered()
+    inst = node(store, embed_query=lambda text: [0.1] * 8, embed_model_name='m')
+    answer = inst.search({'query': 'kestrel', 'filter': {'objectId': _ids(SCOPE_MAX + 5)}})
+    assert answer['success'] is True
+    assert len(_semantic_filter(store).objectIds) == SCOPE_MAX + 5
+    inst.search({'query': 'kestrel', 'filter': {'objectIds': 'doc00'}})
+    assert _semantic_filter(store).objectIds == ['doc00']
+
+
+# ---------------------------------------------------------------------------
+# keyword_match (contract section 4.4-G)
+# ---------------------------------------------------------------------------
+
+
+def test_the_base_store_does_not_say_how_keywords_match():
+    assert DocumentStoreBase.VX_KEYWORD_MATCH is None
+
+
+def test_pgvector_keyword_search_matches_text_fragments(pg):
+    store = pg.open()
+    assert type(store).VX_KEYWORD_MATCH == 'substring'
+    _seed(store, {'station': ('C:/s/station.md', [0], None, [])})
+    from ai.common.schema import DocFilter, QuestionText
+
+    found = store.searchKeyword(QuestionText(text='TION CHU'), DocFilter(limit=5))
+    assert [d.metadata.objectId for d in found] == ['station']
+
+
+_NODES = _REPO / 'nodes' / 'src' / 'nodes'
+
+
+def _class_constants(path: Path) -> Dict[str, Dict[str, Any]]:
+    """``{class name: {constant: value}}`` of the literal class-level assignments in a driver module."""
+    out: Dict[str, Dict[str, Any]] = {}
+    for cls in [n for n in ast.parse(path.read_text(encoding='utf-8')).body if isinstance(n, ast.ClassDef)]:
+        values: Dict[str, Any] = {}
+        for stmt in cls.body:
+            target, value = None, None
+            if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 and isinstance(stmt.targets[0], ast.Name):
+                target, value = stmt.targets[0].id, stmt.value
+            elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name) and stmt.value is not None:
+                target, value = stmt.target.id, stmt.value
+            if target in ('VX_KEYWORD_MATCH', 'VX_DRIVER_CAPABILITIES'):
+                if isinstance(value, ast.Call) and value.args:  # frozenset({...})
+                    value = value.args[0]
+                elif isinstance(value, ast.Call):
+                    value = ast.Set(elts=[])
+                values[target] = ast.literal_eval(value) if not isinstance(value, ast.Set) or value.elts else set()
+        if values:
+            out[cls.name] = values
+    return out
+
+
+def test_chroma_says_its_keyword_search_matches_text_fragments():
+    constants = _class_constants(_NODES / 'store_chroma' / 'chroma.py')['Store']
+    assert constants['VX_KEYWORD_MATCH'] == 'substring'
+    assert 'search_keyword' in constants['VX_DRIVER_CAPABILITIES']
+
+
+def test_pinecone_has_no_keyword_search_and_says_nothing():
+    constants = _class_constants(_NODES / 'store_pinecone' / 'pinecone.py')['Store']
+    assert 'search_keyword' not in constants['VX_DRIVER_CAPABILITIES']
+    assert constants.get('VX_KEYWORD_MATCH') is None
+
+
+def test_every_driver_that_names_its_keyword_matching_has_keyword_search():
+    named = []
+    paths = sorted(_NODES.glob('store_*/*.py')) + [_REPO / 'packages/ai/src/ai/common/store/pgvector/driver.py']
+    for path in paths:
+        for cls, constants in _class_constants(path).items():
+            if constants.get('VX_KEYWORD_MATCH') is None:
+                continue
+            named.append(cls)
+            assert constants['VX_KEYWORD_MATCH'] in KEYWORD_MATCHES, f'{path.name}:{cls}'
+            assert 'search_keyword' in constants.get('VX_DRIVER_CAPABILITIES', set()), f'{path.name}:{cls}'
+    assert 'PgVectorStore' in named and 'Store' in named

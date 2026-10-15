@@ -130,6 +130,9 @@ class PgVectorStore(DocumentStoreBase):
         {'sample_stratified_native', 'documents_distinct', 'documents_sorted', 'search_keyword', 'documents_filter'}
     )
 
+    #: ``dialect.keyword_match``: the keyword search is ``"content" ILIKE '%<text>%'``, so it matches text fragments.
+    VX_KEYWORD_MATCH = 'substring'
+
     #: Seconds between two attempts to add the ``meta`` column after one was blocked.
     META_RETRY_S = 60.0
     #: How long the ``meta`` ALTER waits for the table lock before giving up for now.

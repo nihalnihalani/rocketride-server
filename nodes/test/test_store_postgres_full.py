@@ -623,6 +623,10 @@ class TestSearch:
         s = _schema()
         found = store.searchKeyword(s.QuestionText(text='kestrel'), s.DocFilter(limit=5))
         assert [d.metadata.objectId for d in found] == ['kestrel']
+        # dialect.keyword_match 'substring': a fragment inside a word matches, whatever its case.
+        assert type(store).VX_KEYWORD_MATCH == 'substring'
+        fragment = store.searchKeyword(s.QuestionText(text='ESTREL HOV'), s.DocFilter(limit=5))
+        assert [d.metadata.objectId for d in fragment] == ['kestrel']
         assert store.searchKeyword(s.QuestionText(text='50%'), s.DocFilter(limit=5))[0].metadata.objectId == 'kestrel'
         assert store.searchKeyword(s.QuestionText(text='5_%'), s.DocFilter(limit=5)) == []
 
