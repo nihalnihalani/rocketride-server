@@ -171,9 +171,10 @@ engine leaves the existing collections as they are:
   the engine with a `response_documents` answer (no model, no store, seconds)
   over the corpus; the manual must give more than 64 chunks and the median
   chunk must be 400-1,200 characters. The calibrated shape needs a chunker
-  that passes `strlen` to its splitter, which the chunker node as it stands
-  does not (see "What these lanes found" below): there the manual becomes 36
-  chunks and the median about 3,400 characters. What this checkout's own
+  that passes `strlen` to its splitter, as `preprocessor_langchain` does from
+  this build on; an engine running an older checkout's chunker does not (see
+  "What these lanes found" below): there the manual becomes 36 chunks and the
+  median about 3,400 characters. What this checkout's own
   chunker node would cut is reported as `checkout_node`, but the engine's
   answer decides (the engine may run another checkout's code).
 - **Drivers.** One small corpus file is written through every driver the seed
@@ -276,43 +277,46 @@ All optional; the defaults match the containers above.
 | `RR_TEST_PGVECTOR_DSN`, `RR_TEST_PGVECTOR_POOLER_DSN`, `RR_TEST_QDRANT_URL`, `RR_TEST_CHROMA_URL` | the containers above (pooler: unset) | the live node suites |
 | `RR_TEST_VECTOR_LEGACY` | `emulated` | the tool-path suite's legacy pass (`seeded`: `vx_legacy_docs`) |
 
-## What these lanes found about the engine as it stands
+## What these lanes found about the engine
 
 These shape the templates and the tests; each was measured on a local engine.
 
-- **The chunk size setting has no effect yet.** `preprocessor_langchain` filters
-  the splitter's keyword arguments by the splitter class's own `__init__`
-  signature, and LangChain's splitters take `chunk_size`, `chunk_overlap` and
-  `length_function` through `**kwargs`, so all three are dropped: every chunk
-  is up to LangChain's 4,000-character default whatever `strlen` says (on the
-  demo corpus: 81 chunks, median 3,409 characters, identical at `strlen` 200,
-  512 and 1,000). With the arguments passed through, `strlen` 1,000 gives a
-  median chunk of 806 characters, which the templates carry
-  (`apps/vector-ui/tests/fixtures/chunking.json` records both, with
-  `effective: false` read from the node itself; the templates' note says the
-  length is asked for, not applied, until the node passes it on, and
-  `calibrate_chunking.py --sync` updates both once it does).
 - **The parser's size cap is not applied to these pipelines.** The parser reads
   `index.maxFileSize` from the task's own configuration, which the engine
   builds from the pipeline without an `index` section, so neither the
   templates' `parse_1.config.index.maxFileSize` nor a pipeline-level `index`
   is honoured (a 5.3 KB file went through with the cap at 1,000 bytes in both
-  places). The templates keep the value; the app's own upload limits are what
-  holds today.
+  places). The templates keep the value; the app's own upload limits are the
+  only ones, and a file over them is excluded, not ingested. The phase-0 pin
+  `phase0/test_g0_1_template_start.py` fails the day the engine applies the cap.
 - **Upload names**: a name starting with `/` is stored without its leading
   slash (`/srv/legacy/a.md` becomes the path `srv/legacy/a.md`), while the
   objectId is derived from the name as sent: `uuid5(NAMESPACE_URL, 'null://Stream/' + name)`.
-- **The pgvector drivers as they stand cannot create a table**: their DDL lacks
-  the `signature` column their insert writes, so the first upload into a new
-  table fails (and leaves an empty table without a control record behind).
-  The legacy seed creates its table itself for that reason.
-- **Chroma's `objdir` lists nothing as it stands**: it filters on a metadata key
-  (`chunk`) the driver never writes.
 - **What the Tools token addresses** (the store tools through `client.tool`):
   `store_1`, `store_2`, `embed_1` and `llm_1`; `parse_1` and `chunk_1` answer
   "not found in pipeline". The lanes rely on nothing else.
 - **Upload errors arrive garbled**: a failed upload reports a UTF-8 decode error
   instead of the store's message, so a failure can only be shown as a failure.
+
+Fixed in this build (the lanes and suites now rely on the fix):
+
+- **The chunk size setting had no effect.** `preprocessor_langchain` filtered
+  the splitter's keyword arguments by the splitter class's own `__init__`
+  signature, and LangChain's splitters take `chunk_size`, `chunk_overlap` and
+  `length_function` through `**kwargs`, so every chunk was up to LangChain's
+  4,000-character default whatever `strlen` said (on the demo corpus: 81
+  chunks, median 3,409 characters). The filter now reads every `__init__`
+  along the splitter's MRO; `strlen` 1,000 gives a median chunk of 806
+  characters, which the templates carry, and
+  `apps/vector-ui/tests/fixtures/chunking.json` records `effective: true`
+  (`calibrate_chunking.py --sync` keeps it in step with the node).
+- **The pgvector drivers could not create a table**: their DDL lacked the
+  `signature` column their insert wrote. The shared pgvector driver creates
+  tables with `signature` and `meta`. The legacy seed still creates its table
+  itself, with the old shape, on purpose.
+- **Chroma's `objdir` listed nothing**: it filtered on a metadata key
+  (`chunk`) the driver never wrote. It now lists every document with a first
+  chunk.
 
 ## Notes
 
