@@ -28,21 +28,31 @@
 // Light up to sample_max_light), and "New sample" draws another with the next
 // seed. Layout: PCA (the node's own), Neighbour graph (seeded force layout over
 // the kNN graph), t-SNE (at most 1,000 points; disabled with its reason above
-// that). A running layout shows "Laying out…" and Cancel. Colour by, the text
-// query (disabled with its reason when the embedding node is unreachable), and
-// the Lasso, Fit and Table toggles. Edges (None, Neighbours, Tree) are offered
-// once they are built; `extras` holds the view's menus (Export, Views). Native
-// controls with labels; no key listeners of its own.
+// that). A running layout shows "Laying out…" and Cancel. Edges: None, each
+// point's strongest Neighbours (3, 5 or 10 per point; 3 only on light samples
+// above 3,000 points) or the spanning Tree, and "Expand selected" (adds the
+// selected point's own kNN edges); all computed from the sample, no call.
+// Colour by, grouped Content / Document / Analysis, each mode without its data
+// disabled with the reason as its title. The text query (disabled with its
+// reason when the embedding node is unreachable), and the Lasso, Fit and Table
+// toggles; `extras` holds the view's menus (Export, Views). Native controls
+// with labels; no key listeners of its own.
 // =============================================================================
 
 import React, { useState } from 'react';
 import type { ReactNode } from 'react';
-import type { ColourBy, EdgeMode, MapLayout, MapToolbarProps as ContractMapToolbarProps, SampleMode } from '../contract/types';
+import type { EdgeMode, EdgesPerPoint, MapLayout, MapToolbarProps as ContractMapToolbarProps, SampleMode } from '../contract/types';
+import { COLOUR_MODES } from '../map/colours';
+import type { IColourMode, MapColourBy } from '../map/colours';
 import { MAP_STYLES } from '../map/styles';
 import { num } from '../map/wording';
 
-/** Props: the frozen ones plus map extras. */
-export interface MapToolbarProps extends ContractMapToolbarProps {
+/** Props: the frozen ones (Colour by widened to the document-detail modes) plus map extras. */
+export interface MapToolbarProps extends Omit<ContractMapToolbarProps, 'colourBy' | 'onColourBy'> {
+	colourBy: MapColourBy;
+	onColourBy(colourBy: MapColourBy): void;
+	/** Why a colour mode cannot be chosen now (absent or null: it can). */
+	colourReasons?: Partial<Record<MapColourBy, string | null>>;
 	/** Why t-SNE is unavailable for this sample, or null. */
 	tsneReason?: string | null;
 	/** Show Cancel (a layout is running). */
@@ -53,16 +63,34 @@ export interface MapToolbarProps extends ContractMapToolbarProps {
 	/** The similarity edges drawn (default 'none'). */
 	edges?: EdgeMode;
 	onEdges?(edges: EdgeMode): void;
+	/** Edges per point in Neighbours mode (default 5). */
+	edgesM?: EdgesPerPoint;
+	onEdgesM?(m: EdgesPerPoint): void;
+	/** The most edges per point this sample allows (3 on light samples above 3,000 points), or null for no cap. */
+	edgesMCap?: EdgesPerPoint | null;
+	/** "Expand selected": add the selected point's kNN edges; absent: no button. */
+	onExpandSelected?(): void;
+	/** Why Expand selected is unavailable (no point selected), or null. */
+	expandReason?: string | null;
 	/** The view's menus, after the toggles (Export, Views). */
 	extras?: ReactNode;
 }
 
-/** The edge modes; only None is offered until the others are built. */
-const EDGES: Array<{ id: EdgeMode; label: string; built: boolean }> = [
-	{ id: 'none', label: 'None', built: true },
-	{ id: 'neighbours', label: 'Neighbours', built: false },
-	{ id: 'tree', label: 'Tree', built: false },
+/** The edge modes. */
+const EDGES: Array<{ id: EdgeMode; label: string }> = [
+	{ id: 'none', label: 'None' },
+	{ id: 'neighbours', label: 'Neighbours' },
+	{ id: 'tree', label: 'Tree' },
 ];
+
+/** Edges per point offered in Neighbours mode. */
+const EDGES_PER_POINT: EdgesPerPoint[] = [3, 5, 10];
+
+/** The toolbar's hint for Tree on another layout. */
+export const TREE_HINT = 'Tree reads best over the Neighbour graph layout';
+
+/** The Colour by groups, in order. */
+const COLOUR_GROUPS: Array<IColourMode['group']> = ['Content', 'Document', 'Analysis'];
 
 /** Detailed and light sizes offered (capped by the node's limits). */
 const DETAILED_SIZES = [250, 500, 1000, 2000];
@@ -72,15 +100,6 @@ const LAYOUTS: Array<{ id: MapLayout; label: string }> = [
 	{ id: 'pca', label: 'PCA' },
 	{ id: 'neighbour-graph', label: 'Neighbour graph' },
 	{ id: 'tsne', label: 't-SNE (≤1,000)' },
-];
-
-const COLOURS: Array<{ id: ColourBy; label: string }> = [
-	{ id: 'document', label: 'Document' },
-	{ id: 'folder', label: 'Folder' },
-	{ id: 'type', label: 'File type' },
-	{ id: 'chunk-position', label: 'Chunk position' },
-	{ id: 'query-similarity', label: 'Query similarity' },
-	{ id: 'density', label: 'Density' },
 ];
 
 /**
@@ -99,6 +118,9 @@ export function MapToolbar(props: MapToolbarProps): React.ReactElement {
 	const current = `${mode}:${n}`;
 	if (!sizes.some((s) => `${s.mode}:${s.n}` === current)) sizes.push({ mode, n });
 	const busy = props.busy !== null;
+	const edges = props.edges ?? 'none';
+	const cap: EdgesPerPoint = props.edgesMCap ?? 10;
+	const capReason = `Light samples above ${num(3000)} points draw at most ${cap} edges per point`;
 	const toggle = (pressed: boolean): React.CSSProperties => ({ ...MAP_STYLES.button, ...(pressed ? MAP_STYLES.buttonPressed : {}) });
 	return (
 		<div role="toolbar" aria-label="Map controls" style={MAP_STYLES.toolbar}>
@@ -146,21 +168,46 @@ export function MapToolbar(props: MapToolbarProps): React.ReactElement {
 			) : null}
 			<label style={MAP_STYLES.group}>
 				<span style={MAP_STYLES.label}>Edges</span>
-				<select aria-label="Edges" style={MAP_STYLES.select} value={props.edges ?? 'none'} disabled={busy || !sample} onChange={(event) => props.onEdges?.(event.target.value as EdgeMode)}>
+				<select aria-label="Edges" style={MAP_STYLES.select} value={edges} disabled={busy || !sample} onChange={(event) => props.onEdges?.(event.target.value as EdgeMode)}>
 					{EDGES.map((e) => (
-						<option key={e.id} value={e.id} disabled={!e.built} title={e.built ? undefined : 'Not built yet'}>
-							{e.built ? e.label : `${e.label} (not built yet)`}
+						<option key={e.id} value={e.id}>
+							{e.label}
 						</option>
 					))}
 				</select>
 			</label>
+			{edges === 'neighbours' ? (
+				<label style={MAP_STYLES.group}>
+					<span style={MAP_STYLES.label}>Per point</span>
+					<select aria-label="Edges per point" style={MAP_STYLES.select} value={String(Math.min(props.edgesM ?? 5, cap))} disabled={busy || !sample} onChange={(event) => props.onEdgesM?.(Number(event.target.value) as EdgesPerPoint)}>
+						{EDGES_PER_POINT.map((m) => (
+							<option key={m} value={String(m)} disabled={m > cap} title={m > cap ? capReason : undefined}>
+								{m}
+							</option>
+						))}
+					</select>
+				</label>
+			) : null}
+			{props.onExpandSelected ? (
+				<button type="button" style={MAP_STYLES.button} disabled={busy || !sample || !!props.expandReason} title={props.expandReason ?? 'Add the selected point\'s neighbour edges'} onClick={props.onExpandSelected}>
+					Expand selected
+				</button>
+			) : null}
+			{edges === 'tree' && props.layout !== 'neighbour-graph' ? <span style={MAP_STYLES.small}>{TREE_HINT}</span> : null}
 			<label style={MAP_STYLES.group}>
 				<span style={MAP_STYLES.label}>Colour by</span>
-				<select aria-label="Colour by" style={MAP_STYLES.select} value={props.colourBy} onChange={(event) => props.onColourBy(event.target.value as ColourBy)}>
-					{COLOURS.map((c) => (
-						<option key={c.id} value={c.id}>
-							{c.label}
-						</option>
+				<select aria-label="Colour by" style={MAP_STYLES.select} value={props.colourBy} onChange={(event) => props.onColourBy(event.target.value as MapColourBy)}>
+					{COLOUR_GROUPS.map((group) => (
+						<optgroup key={group} label={group}>
+							{COLOUR_MODES.filter((c) => c.group === group).map((c) => {
+								const reason = props.colourReasons?.[c.id] ?? null;
+								return (
+									<option key={c.id} value={c.id} disabled={reason !== null && c.id !== props.colourBy} title={reason ?? undefined}>
+										{c.label}
+									</option>
+								);
+							})}
+						</optgroup>
 					))}
 				</select>
 			</label>

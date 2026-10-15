@@ -22,7 +22,7 @@ import { ClustersPanel } from '../src/components/ClustersPanel';
 import { DuplicatesPanel } from '../src/components/DuplicatesPanel';
 import { HeatStrip } from '../src/components/HeatStrip';
 import { LEGEND_CLUSTERS, Legend } from '../src/components/Legend';
-import { MapToolbar } from '../src/components/MapToolbar';
+import { MapToolbar, TREE_HINT } from '../src/components/MapToolbar';
 import { NeighbourList } from '../src/components/NeighbourList';
 import { OutliersPanel } from '../src/components/OutliersPanel';
 import { PointCanvas } from '../src/components/PointCanvas';
@@ -31,7 +31,7 @@ import { PointsTable } from '../src/components/PointsTable';
 import { createSelectionStore } from '../src/contract/bridge';
 import type { INeighborsResult, ISampleResult, IVectorLimits, VectorKey } from '../src/contract/types';
 import { clusterLabel, clusterRows, clusterSentence, clusterView } from '../src/map/clusters';
-import { clusterColours, colourPoints } from '../src/map/colours';
+import { COLOUR_MODES, clusterColours, colourPoints } from '../src/map/colours';
 import { isolateMask } from '../src/map/isolate';
 import { readPalette } from '../src/map/tokens';
 import { SelectionTab } from '../src/views/MapView';
@@ -281,6 +281,32 @@ test('ClustersPanel states: an older node, a node whose sample has none, no grou
 	assert.match(isolated, /Showing 212 of 1,000/);
 	assert.match(isolated, />Expand by neighbours<\/button>/);
 	assert.match(isolated, />Show all<\/button>/);
+});
+
+test('MapToolbar edges: None, Neighbours (3, 5 or 10 per point; capped on light samples) and Tree; Expand selected with its reason; the Tree hint off the neighbour layout', () => {
+	const base = { limits, sample: demo, busy: null, layout: 'pca' as const, colourBy: 'document' as const, lasso: false, table: false, query: { enabled: true, reason: null }, onSample: noop, onLayout: noop, onCancel: noop, onColourBy: noop, onQuery: noop, onToggleLasso: noop, onFit: noop, onToggleTable: noop, onExpandSelected: noop };
+	const none = html(<MapToolbar {...base} edges="none" expandReason="Select a point first" />);
+	assert.match(none, /<option value="none" selected="">None<\/option><option value="neighbours">Neighbours<\/option><option value="tree">Tree<\/option>/);
+	assert.doesNotMatch(none, /Edges per point/);
+	assert.match(none, /<button[^>]*disabled=""[^>]*title="Select a point first"[^>]*>Expand selected<\/button>/);
+	const neighbours = html(<MapToolbar {...base} edges="neighbours" edgesM={10} expandReason={null} />);
+	assert.match(neighbours, /aria-label="Edges per point"/);
+	assert.match(neighbours, /<option value="10" selected="">10<\/option>/);
+	const capped = html(<MapToolbar {...base} edges="neighbours" edgesM={3} edgesMCap={3} />);
+	assert.match(capped, /<option value="5" disabled="" title="Light samples above 3,000 points draw at most 3 edges per point">5<\/option>/);
+	assert.match(html(<MapToolbar {...base} edges="tree" />), new RegExp(TREE_HINT));
+	assert.doesNotMatch(html(<MapToolbar {...base} edges="tree" layout="neighbour-graph" />), new RegExp(TREE_HINT));
+});
+
+test('MapToolbar Colour by: Content, Document and Analysis groups, every mode, a mode without its data disabled with the reason (the one shown stays selectable)', () => {
+	const base = { limits, sample: demo, busy: null, layout: 'pca' as const, lasso: false, table: false, query: { enabled: true, reason: null }, onSample: noop, onLayout: noop, onCancel: noop, onColourBy: noop, onQuery: noop, onToggleLasso: noop, onFit: noop, onToggleTable: noop };
+	const out = html(<MapToolbar {...base} colourBy="document" colourReasons={{ cluster: 'This store node does not compute clusters; update the node.', 'ingest-date': 'This store does not keep ingest times.' }} />);
+	assert.deepEqual([...out.matchAll(/<optgroup label="([^"]+)">/g)].map((m) => m[1]), ['Content', 'Document', 'Analysis']);
+	assert.equal((out.match(/<option value="[a-z-]+"/g) ?? []).filter((o) => COLOUR_MODES.some((m) => o.includes(`"${m.id}"`))).length, COLOUR_MODES.length);
+	assert.match(out, /<option value="cluster" disabled="" title="This store node does not compute clusters; update the node.">Cluster<\/option>/);
+	assert.match(out, /<option value="ingest-date" disabled="" title="This store does not keep ingest times.">Ingest date<\/option>/);
+	assert.match(out, /<option value="table">Table chunks<\/option>/);
+	assert.match(html(<MapToolbar {...base} colourBy="cluster" colourReasons={{ cluster: 'x' }} />), /<option value="cluster" title="x" selected="">Cluster<\/option>/);
 });
 
 test('Legend coloured by cluster: the 12 largest groups by name, the noise row, and how many more the Clusters tab lists', () => {

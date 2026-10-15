@@ -237,16 +237,8 @@ export function medoids(positions: ArrayLike<number>, dims: 2 | 3, view: Pick<IC
  */
 export function clusterSentence(clusters: Pick<ISampleClusters, 'edge_threshold' | 'percentile' | 'label_source' | 'labelled_from'>, minSize: number): string {
 	const threshold = clusters.edge_threshold.toFixed(2);
-	const how =
-		clusters.percentile > START_PERCENTILE
-			? `raised from the ${ordinal(START_PERCENTILE)} to the ${ordinal(clusters.percentile)} percentile because the graph was one connected group`
-			: `the ${ordinal(clusters.percentile)} percentile of its edges, computed by the store node`;
-	const labels =
-		clusters.label_source === 'text'
-			? `labels are the most frequent terms of up to ${num(clusters.labelled_from)} of their chunks.`
-			: clusters.label_source === 'paths'
-				? 'Labels from file names (this store returned no text).'
-				: 'the groups are not labelled (this store returned neither text nor file names).';
+	const how = clusters.percentile > START_PERCENTILE ? `raised from the ${ordinal(START_PERCENTILE)} to the ${ordinal(clusters.percentile)} percentile because the graph was one connected group` : `the ${ordinal(clusters.percentile)} percentile of its edges, computed by the store node`;
+	const labels = clusters.label_source === 'text' ? `labels are the most frequent terms of up to ${num(clusters.labelled_from)} of their chunks.` : clusters.label_source === 'paths' ? 'Labels from file names (this store returned no text).' : 'the groups are not labelled (this store returned neither text nor file names).';
 	return `Clusters: connected groups of the sample's neighbour graph above similarity ${threshold} (${how}), groups of at least ${num(minSize)} points; ${labels}`;
 }
 

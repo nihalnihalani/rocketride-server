@@ -46,9 +46,25 @@
 // Every action lands back in the console: Open document, Ask about these only,
 // Remove, and the shared selection (focused chunk, highlights, lasso keys).
 //
-// The additive features are mounted with their frozen props and say "Not built
-// yet" until they are: the Clusters and Recommend tabs, the similarity matrix
-// in the Selection tab, and the toolbar's Edges, Export and Views.
+// Over the sample, computed here with no call (a control over data the
+// browser already holds never re-samples):
+//   - Clusters: the node's groups (`sample.clusters`, asked for when the node
+//     offers them) folded by the Minimum size, coloured, labelled at their
+//     medoids and listed in the Clusters tab;
+//   - Edges: each point's strongest neighbours or the spanning tree of the
+//     sample's kNN graph, plus "Expand selected"; dropped to 3 per point after
+//     slow frames unless `edgesAutoDegrade` is off (the perf lane);
+//   - Colour by document details from the console's directory rows;
+//   - Isolate / Show all / Expand by neighbours.
+// A scope the console applies to the map is sent as `filter.object_ids` to
+// `sample`, `neighbors` and `recommend` (re-sampling when it changes). Search's
+// Compare puts a second question on the map (star B, hollow, with its own
+// rays). The view hands the mounted panels their values: the export items
+// (points, selection, clusters, duplicates, outliers, the PNG through the
+// renderer's snapshot), the saved views' capture and apply, Recommend's call
+// (examples as keys; the only vector is the query vector held here), the
+// similarity matrix's pair and export, and the inspector's tree neighbours,
+// examples and full text.
 // =============================================================================
 
 import React, { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
@@ -66,18 +82,25 @@ import { PointsTable } from '../components/PointsTable';
 import { RecommendPanel } from '../components/RecommendPanel';
 import { SavedViewsMenu } from '../components/SavedViewsMenu';
 import { SimilarityMatrix } from '../components/SimilarityMatrix';
-import type { Availability, ColourBy, IChunksResult, IEmbedResult, INeighborsResult, INeighborsScopeResult, IProjectItem, IProjectResult, IRecommendExamples, ISampleInput, ISampleResult, ISearchResult, MapLayout, MapViewProps as ContractMapViewProps, SampleMode, VectorKey } from '../contract/types';
+import { recommendExamples } from '../adapters/connections';
+import type { Availability, ClusterMinSize, ColourBy, EdgeMode, EdgesPerPoint, ExamplePolarity, IChunksResult, IDocumentItem, IDocumentRowsSource, IEmbedResult, IExportItem, INeighborsResult, INeighborsScopeResult, IProjectItem, IProjectResult, IRecommendExamples, IRecommendRequest, IRecommendResult, ISampleInput, ISampleResult, ISavedView, ISavedViewRestore, ISavedViewState, ISearchResult, MapLayout, MapViewProps as ContractMapViewProps, SampleMode, ToolOutcome, VectorKey } from '../contract/types';
 import { TSNE_MAX_POINTS } from '../map/budgets';
-import { callTool, isExpired } from '../map/calls';
+import { callRecommend, callTool, isExpired } from '../map/calls';
 import type { ToolAnswer } from '../map/calls';
-import { forgetCameras } from '../map/cameraMemory';
-import { colourPoints } from '../map/colours';
+import type { MapCamera } from '../map/camera';
+import { forgetCameras, recallCamera } from '../map/cameraMemory';
+import { DEFAULT_MIN_CLUSTER_SIZE, clusterLabel, clusterRows, clusterSentence, clusterView, medoids } from '../map/clusters';
+import { COLOUR_MODES, clusterColours, colourAfterQuery, colourForQuery, colourModeReason, colourPoints } from '../map/colours';
+import type { MapColourBy } from '../map/colours';
+import { groupOf, groups, pairsAt } from '../map/dedupe';
+import { NO_EDGES, edgeStats, edgesOf, mergeEdges, spanningTree, topEdges, treeNeighbours } from '../map/graph';
 import { tweenPositions } from '../map/interaction';
 import type { KeyAction } from '../map/interaction';
-import { applyTransform, chunkPath, ditherRounded, documentOf, hiddenMask, keyIndex, keyString, neighboursOf, normaliseLayout, pcaPositions, pointKey } from '../map/model';
+import { combineMasks, expandByNeighbours, isolateMask, isolationLine, shownCount } from '../map/isolate';
+import { applyTransform, chunkPath, clusterExportRows, ditherRounded, documentOf, duplicateExportRows, hiddenMask, keyIndex, keyString, neighboursOf, normaliseLayout, pcaPositions, pointExportRows, pointKey } from '../map/model';
 import { createLatestQueue } from '../map/neighbours';
-import type { IOverlayEnd, IPlace } from '../map/overlay';
-import { centroidStar, chatQueryPlan, placeProjected, queryBlocker, querySims, raysFromSearch, resolveKeys, starFromProject, withSampleRetry } from '../map/queryProjection';
+import type { IClusterLabel, IOverlayEnd, IPlace } from '../map/overlay';
+import { centroidStar, chatQueryPlan, comparePlan, placeProjected, queryBlocker, querySims, raysFromSearch, resolveKeys, starFromProject, withSampleRetry } from '../map/queryProjection';
 import type { IStar } from '../map/queryProjection';
 import { spawnLayoutWorker } from '../map/spawnWorker';
 import { MAP_STYLES } from '../map/styles';
@@ -85,7 +108,7 @@ import { readPalette } from '../map/tokens';
 import type { IMapPalette } from '../map/tokens';
 import { createLayoutClient } from '../map/workerClient';
 import type { ILayoutClient } from '../map/workerClient';
-import { BUSY, CENTROID_APPROX, LAYOUT_CANCELLED, LAYOUT_NOT_BETTER, LIGHT_POSITIONS, MAP_UNAVAILABLE, QUERY_NEEDS_EMBED, QUERY_PLACED_APPROX, mapFailure, num, pointAnnouncement, sampleLabel } from '../map/wording';
+import { BUSY, CENTROID_APPROX, CLUSTERS_UNSUPPORTED, EDGES_DEGRADED, EDGES_LIGHT_LIMIT, EDGES_LIGHT_NOTE, LAYOUT_CANCELLED, LAYOUT_NOT_BETTER, LIGHT_POSITIONS, MAP_UNAVAILABLE, QUERY_NEEDS_EMBED, QUERY_PLACED_APPROX, clusterAnnouncement, edgeLegend, listingNote, mapFailure, num, pointAnnouncement, sampleLabel, scopeNote } from '../map/wording';
 import { heatScores } from '../vector/heat';
 
 /** Props: the frozen ones plus where the Table toggle and the side panel start. */
@@ -94,6 +117,10 @@ export interface MapViewProps extends ContractMapViewProps {
 	initialTable?: boolean;
 	/** The side panel's first tab (only its starting state; 'point' when not given). */
 	initialTab?: SideTab;
+	/** The Clusters tab's first minimum size (only its starting state; 5 when not given). */
+	initialMinClusterSize?: ClusterMinSize;
+	/** The first colouring (only its starting state; Document when not given). */
+	initialColourBy?: MapColourBy;
 }
 
 // =============================================================================
@@ -114,6 +141,42 @@ const RAYS_TOP_K = 10;
 
 /** Duplicate pairs drawn at most (the panel lists them all). */
 const MAX_DRAWN_DUPLICATES = 200;
+
+/** The similarity the Points table's duplicate groups use (the queue's default threshold). */
+const TABLE_DUPLICATE_THRESHOLD = 0.97;
+
+/** A chunk's full text is shown up to this many characters. */
+const FULL_TEXT_MAX = 20_000;
+
+/** Recommend examples per side when the node does not say (contract section 4.4-D). */
+const RECOMMEND_EXAMPLES_DEFAULT = 10;
+
+/** No directory rows (a map mounted without the console's source). */
+const NO_ROWS: readonly IDocumentItem[] = [];
+const NO_ROWS_SOURCE: IDocumentRowsSource = { getRows: () => NO_ROWS, subscribe: () => () => undefined };
+
+/**
+ * A colouring as a saved view keeps it. The saved view's field is the
+ * contract's ColourBy; the document-detail modes (ingest date, file size,
+ * health, ingest node, table chunks) are kept under their own names, which the
+ * view reads back as they were saved.
+ *
+ * @param by - The colouring.
+ * @returns The value saved.
+ */
+function savedColour(by: MapColourBy): ColourBy {
+	return by as ColourBy;
+}
+
+/**
+ * A saved colouring read back: one of the map's modes, else Document.
+ *
+ * @param by - The saved value.
+ * @returns The colouring.
+ */
+function restoredColour(by: string): MapColourBy {
+	return COLOUR_MODES.some((m) => m.id === by) ? (by as MapColourBy) : 'document';
+}
 
 /** Side panel tabs. */
 export type SideTab = 'point' | 'neighbours' | 'duplicates' | 'outliers' | 'clusters' | 'recommend' | 'selection' | 'heat';
@@ -211,6 +274,12 @@ export interface SelectionTabProps {
 	/** "Remove these documents": EVERY document of the selection; the console confirms and batches the writes (APP_SPEC §6). */
 	onRemove(objectIds: readonly string[]): void;
 	onCopy(keys: readonly VectorKey[]): void;
+	/** Show only the selected points on the map; absent: no such button. */
+	onIsolate?(keys: readonly VectorKey[]): void;
+	/** The map is isolated: points shown of the sample. */
+	isolated?: { shown: number; n: number } | null;
+	onShowAll?(): void;
+	onExpand?(): void;
 	/** What the tab shows under its actions (the similarity matrix of the selection). */
 	children?: React.ReactNode;
 }
@@ -240,7 +309,25 @@ export function SelectionTab(props: SelectionTabProps): React.ReactElement {
 				<button type="button" style={MAP_STYLES.button} onClick={() => props.onCopy(keys)}>
 					Copy keys
 				</button>
+				{props.onIsolate ? (
+					<button type="button" style={MAP_STYLES.button} onClick={() => props.onIsolate?.(keys)}>
+						Isolate
+					</button>
+				) : null}
 			</div>
+			{props.isolated ? (
+				<div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, alignItems: 'center', margin: '0 0 8px' }}>
+					<span role="status" style={MAP_STYLES.small}>
+						{isolationLine(props.isolated.shown, props.isolated.n)}
+					</span>
+					<button type="button" style={MAP_STYLES.button} onClick={props.onExpand}>
+						Expand by neighbours
+					</button>
+					<button type="button" style={MAP_STYLES.button} onClick={props.onShowAll}>
+						Show all
+					</button>
+				</div>
+			) : null}
 			{!writes.enabled && writes.reason ? <p style={MAP_STYLES.note}>{writes.reason}</p> : null}
 			{!chat.enabled && chat.reason ? <p style={MAP_STYLES.note}>{chat.reason}</p> : null}
 			{props.children ?? null}
@@ -260,6 +347,7 @@ export function SelectionTab(props: SelectionTabProps): React.ReactElement {
  */
 export function MapView(props: MapViewProps): React.ReactElement {
 	const { model, channels, selection, actions, visible, initialTable, initialTab } = props;
+	const edgesAutoDegrade = props.edgesAutoDegrade !== false;
 	const state = useSyncExternalStore(selection.subscribe, selection.getState, selection.getState);
 	const palette = useMapPalette();
 	const reducedMotion = useReducedMotion();
@@ -281,12 +369,29 @@ export function MapView(props: MapViewProps): React.ReactElement {
 	const [layoutState, setLayoutState] = useState<LayoutState>('idle');
 	const [layoutProgress, setLayoutProgress] = useState<number | null>(null);
 	const [quality, setQuality] = useState<{ overlap: number; pcaOverlap: number } | null>(null);
-	const [colourBy, setColourBy] = useState<ColourBy>('document');
+	const [colourBy, setColourBy] = useState<MapColourBy>(props.initialColourBy ?? 'document');
+	// The colouring a text query replaced, restored when the query clears (Document stays the default).
+	const colourBefore = useRef<MapColourBy | null>(null);
+	const [minClusterSize, setMinClusterSize] = useState<ClusterMinSize>(props.initialMinClusterSize ?? DEFAULT_MIN_CLUSTER_SIZE);
+	const [edges, setEdges] = useState<EdgeMode>(props.edges ?? 'none');
+	const [edgesM, setEdgesM] = useState<EdgesPerPoint>(props.edgesM ?? 5);
+	const [edgesDegraded, setEdgesDegraded] = useState(false);
+	/** Points whose own kNN edges are added ("Expand selected"). */
+	const [expanded, setExpanded] = useState<number[]>([]);
+	/** The isolated points, or null when every point is shown. */
+	const [isolated, setIsolated] = useState<number[] | null>(null);
+	/** Search's compared question (star B), placed like the query. */
+	const [queryB, setQueryBView] = useState<IQueryView | null>(null);
+	const [fullText, setFullText] = useState<{ key: string; text: string } | null>(null);
+	const [matrixItem, setMatrixItem] = useState<IExportItem | null>(null);
+	const [cameraOverride, setCameraOverride] = useState<{ camera: MapCamera; seq: number } | null>(null);
+	const [savedQuery, setSavedQuery] = useState<string | null>(null);
+	const [canSnapshot, setCanSnapshot] = useState(false);
 	const [lasso, setLasso] = useState(false);
 	const [table, setTable] = useState(initialTable === true);
 	const [threeD, setThreeD] = useState(false);
 	const [tab, setTab] = useState<SideTab>(initialTab ?? 'point');
-	const [examples, setExamples] = useState<IRecommendExamples>(NO_EXAMPLES);
+	const [examples, setExamplesState] = useState<IRecommendExamples>(() => recommendExamples.get(model.connectionKey) ?? NO_EXAMPLES);
 	const [selected, setSelected] = useState<number | null>(null);
 	const [focused, setFocused] = useState<number | null>(null);
 	const [neighbours, setNeighbours] = useState<{ index: number; result: INeighborsResult } | null>(null);
@@ -303,8 +408,26 @@ export function MapView(props: MapViewProps): React.ReactElement {
 	const [pulse, setPulse] = useState(0);
 	const [rendererKind, setRendererKind] = useState<'webgl' | 'canvas2d' | 'none'>('none');
 
-	// The one query vector (from `embed`), kept here and sent only to project / search / neighbors.
+	// The one query vector (from `embed`), kept here and sent only to project / search / neighbors / recommend.
 	const queryVector = useRef<number[] | null>(null);
+	// The compared question's vector (Search's Compare), sent only to project and search.
+	const queryVectorB = useRef<number[] | null>(null);
+	// The PNG's copy of the edge layer, the points and the overlay (PointCanvas reports it).
+	const snapshotter = useRef<(() => HTMLCanvasElement | null) | null>(null);
+	const onSnapshotter = useCallback((snap: (() => HTMLCanvasElement | null) | null): void => {
+		snapshotter.current = snap;
+		setCanSnapshot(snap !== null);
+	}, []);
+	// The console's scope as the map applies it: its documents, when it applies to the map and fits the limit.
+	const scope = model.scope ?? null;
+	const scopeIds = scope && scope.applyTo.map && scope.overflow === null && scope.objectIds !== null && scope.objectIds.length > 0 && scope.objectIds.length <= limits.scope_keys_max ? scope.objectIds : null;
+	const scopeKey = scopeIds ? `${scopeIds.length}:${scopeIds.join('|')}` : '';
+	const scopeRef = useRef<readonly string[] | null>(scopeIds);
+	scopeRef.current = scopeIds;
+	/** The scope a sample was drawn with ('' for none). */
+	const sampledScope = useRef<string>('');
+	const docRows = useSyncExternalStore((props.documents ?? NO_ROWS_SOURCE).subscribe, (props.documents ?? NO_ROWS_SOURCE).getRows, (props.documents ?? NO_ROWS_SOURCE).getRows);
+	const docRowMap = useMemo(() => new Map(docRows.map((row) => [row.objectId, row])), [docRows]);
 	const connectionRef = useRef(model.connectionKey);
 	connectionRef.current = model.connectionKey;
 	const autoSampled = useRef<string | null>(null);
@@ -320,7 +443,10 @@ export function MapView(props: MapViewProps): React.ReactElement {
 		() =>
 			channel === null
 				? null
-				: createLatestQueue<VectorKey, ToolAnswer<INeighborsResult>>((key) => callTool<INeighborsResult>(channel, 'neighbors', { key, k: Math.min(NEIGHBOURS_K, limits.neighbors_k_max), exclude_self: true }, { nodeId: storeNode })),
+				: createLatestQueue<VectorKey, ToolAnswer<INeighborsResult>>((key) => {
+						const scoped = scopeRef.current;
+						return callTool<INeighborsResult>(channel, 'neighbors', { key, k: Math.min(NEIGHBOURS_K, limits.neighbors_k_max), exclude_self: true, ...(scoped ? { filter: { object_ids: [...scoped] } } : {}) }, { nodeId: storeNode });
+					}),
 		[channel, storeNode, limits.neighbors_k_max],
 	);
 	useEffect(() => () => neighbourQueue?.dispose(), [neighbourQueue]);
@@ -329,7 +455,22 @@ export function MapView(props: MapViewProps): React.ReactElement {
 	// Derived data
 	// -------------------------------------------------------------------------
 
-	const hidden = useMemo(() => (sampleModel ? hiddenMask(sampleModel) : null), [sampleModel]);
+	/** Removed documents' points (never shown again in this sample). */
+	const removedMask = useMemo(() => (sampleModel ? hiddenMask(sampleModel) : null), [sampleModel]);
+	/** Every point not shown: removed documents and the isolation. */
+	const hidden = useMemo(() => combineMasks(removedMask, isolated !== null && sample ? isolateMask(sample.n, isolated) : null), [removedMask, isolated, sample]);
+	const shownPoints = sample ? shownCount(sample.n, hidden) : 0;
+	const clusters = useMemo(() => (sample?.clusters ? clusterView(sample.clusters, minClusterSize) : null), [sample, minClusterSize]);
+	// Edges: computed from the sample's kNN graph (no call).
+	const lightCap = sample !== null && sample.mode === 'light' && sample.n > EDGES_LIGHT_LIMIT;
+	const edgesPerPoint: EdgesPerPoint = lightCap || edgesDegraded ? 3 : edgesM;
+	const tree = useMemo(() => (sample && edges === 'tree' ? spanningTree(sample.knn, sample.n, hidden) : null), [sample, edges, hidden]);
+	const edgeSet = useMemo(() => {
+		if (!sample) return null;
+		const base = edges === 'neighbours' ? topEdges(sample.knn, sample.n, edgesPerPoint, hidden) : tree ? tree.edges : NO_EDGES;
+		const merged = mergeEdges(base, ...expanded.map((i) => edgesOf(sample.knn, sample.n, i, hidden)));
+		return merged.count === 0 ? null : merged;
+	}, [sample, edges, edgesPerPoint, hidden, tree, expanded]);
 	const keyIdx = useMemo(() => (sample ? keyIndex(sample) : new Map<string, number>()), [sample]);
 	const dims: 2 | 3 = threeD && layout === 'pca' ? 3 : 2;
 	const raw = useMemo(() => {
@@ -363,7 +504,13 @@ export function MapView(props: MapViewProps): React.ReactElement {
 		return () => cancelAnimationFrame(raf);
 	}, [frame, reducedMotion]);
 
-	const colouring = useMemo(() => (sample && palette ? colourPoints(sample, colourBy, palette, { querySims: query?.sims ?? null, hidden }) : null), [sample, palette, colourBy, query, hidden]);
+	const colouring = useMemo(() => (sample && palette ? colourPoints(sample, colourBy, palette, { querySims: query?.sims ?? null, hidden, clusters, docRows: docRowMap }) : null), [sample, palette, colourBy, query, hidden, clusters, docRowMap]);
+	const colourReasons = useMemo(() => {
+		const out: Partial<Record<MapColourBy, string | null>> = {};
+		if (sample) for (const mode of COLOUR_MODES) out[mode.id] = colourModeReason(mode.id, { sample, clustersOffered: model.capabilities.clusters === true, docRows: docRowMap });
+		return out;
+	}, [sample, model.capabilities.clusters, docRowMap]);
+	const clusterPalette = useMemo(() => (clusters && palette ? clusterColours(clusters.count, palette).map((c) => c.colour) : []), [clusters, palette]);
 	const highlight = state.connectionKey === model.connectionKey ? state.highlight : null;
 	const place = useCallback((p: { x: number; y: number; z?: number } | null): IPlace | null => (p === null ? null : applyTransform(p, frame.transform)), [frame]);
 
@@ -396,6 +543,36 @@ export function MapView(props: MapViewProps): React.ReactElement {
 			return [];
 		});
 	}, [query, sampleModel, keyIdx, pinnedPlaces]);
+
+	// Search's compared question: star B (hollow) and its rays to its own top results.
+	const starB: IStar | null = useMemo(() => {
+		if (!sample || !queryB?.item) return null;
+		const s = starFromProject(queryB.item, layout, raw, dims);
+		return s ? { ...applyTransform(s, frame.transform), exact: s.exact } : null;
+	}, [sample, queryB, layout, raw, dims, frame]);
+	const raysB: IOverlayEnd[] = useMemo(() => {
+		if (!queryB?.search || !sampleModel) return [];
+		return raysFromSearch(queryB.search, keyIdx, sampleModel.pinned).targets.flatMap((t): IOverlayEnd[] => {
+			if (t.kind === 'point') return [{ index: t.index }];
+			if (t.kind === 'pinned') {
+				const at = pinnedPlaces[t.pinned];
+				return at ? [{ at }] : [];
+			}
+			return [];
+		});
+	}, [queryB, sampleModel, keyIdx, pinnedPlaces]);
+
+	// Cluster labels at their medoids (on the layout shown), largest groups first, labelled groups only.
+	const clusterLabels: IClusterLabel[] = useMemo(() => {
+		if (!clusters || !sample || (colourBy !== 'cluster' && tab !== 'clusters')) return [];
+		const at = medoids(frame.positions, dims, clusters, hidden);
+		const out: IClusterLabel[] = [];
+		for (let g = 0; g < clusters.count; g += 1) {
+			if ((clusters.keywords[g] ?? []).length === 0 || (at[g] as number) < 0) continue;
+			out.push({ cluster: g, at: at[g] as number, text: clusterLabel(clusters, g) });
+		}
+		return out;
+	}, [clusters, sample, colourBy, tab, frame, dims, hidden]);
 
 	const ringPoints = useMemo(() => {
 		if (!highlight || highlight.source === 'lasso' || highlight.source === 'document') return [];
@@ -457,10 +634,18 @@ export function MapView(props: MapViewProps): React.ReactElement {
 		setNeighbours(null);
 		setNeighbourPins([]);
 		setChunkText(null);
+		setFullText(null);
 		setHeat(null);
+		setExpanded([]);
+		setIsolated(null);
+		setEdgesDegraded(false);
+		setMatrixItem(null);
 		if (!keepQuery) {
 			setQueryView(null);
 			queryVector.current = null;
+			setQueryBView(null);
+			queryVectorB.current = null;
+			setColourBy((by) => colourAfterQuery(by, colourBefore.current));
 		}
 	}, []);
 
@@ -480,7 +665,11 @@ export function MapView(props: MapViewProps): React.ReactElement {
 				duplicate_threshold: 0.97,
 				include_text: !light,
 				...(opts.includeKeys && opts.includeKeys.length > 0 ? { include_keys: opts.includeKeys } : {}),
+				// Clusters are asked only of a node that offers them (an older one would refuse the key).
+				...(model.capabilities.clusters === true ? { cluster: { method: 'knn-components' as const, labels: true } } : {}),
+				...(scopeRef.current ? { filter: { object_ids: [...scopeRef.current] } } : {}),
 			};
+			const drawnScope = scopeRef.current ? `${scopeRef.current.length}:${scopeRef.current.join('|')}` : '';
 			client.cancel();
 			setBusy(BUSY.sampling);
 			setError(null);
@@ -492,13 +681,14 @@ export function MapView(props: MapViewProps): React.ReactElement {
 				return null;
 			}
 			const result = answer.value;
+			sampledScope.current = drawnScope;
 			resetView(opts.keepQuery === true);
 			selection.setSampleModel({ sampleId: result.sample_id, seed: opts.seed, mode: result.mode, receivedAt: Date.now(), result, pinned: [], removed: [] });
 			setFitToken((t) => t + 1);
 			actions.announce(sampleLabel(result));
 			return result.sample_id;
 		},
-		[channel, model.connectionKey, limits, storeNode, client, resetView, selection, actions],
+		[channel, model.connectionKey, model.capabilities.clusters, limits, storeNode, client, resetView, selection, actions],
 	);
 
 	// First open: sample once per connection with the node's default size.
@@ -508,6 +698,16 @@ export function MapView(props: MapViewProps): React.ReactElement {
 		autoSampled.current = model.connectionKey;
 		void drawSample({ n: Math.min(limits.sample_default, limits.sample_max), mode: 'detailed', seed: DEFAULT_SEED });
 	}, [visible, canSample, channel, sampleModel, busy, model.connectionKey, limits, drawSample]);
+
+	// The console scoped the map to other documents: draw the sample again from those (a scope is a reason to sample).
+	useEffect(() => {
+		if (!visible || !sampleModel || busy !== null || channel === null) return;
+		if (sampledScope.current === scopeKey) return;
+		sampledScope.current = scopeKey;
+		void drawSample({ n: sampleModel.result.n_requested, mode: sampleModel.mode, seed: sampleModel.seed });
+		// Runs again when a busy map frees up, so a scope changed meanwhile is not missed.
+		// eslint-disable-next-line react-hooks/exhaustive-deps
+	}, [scopeKey, visible, busy]);
 
 	/** Draw the current sample again (same seed, pinned and highlighted keys kept): SAMPLE_EXPIRED. */
 	const resample = useCallback(async (extra: readonly VectorKey[] = []): Promise<string | null> => {
@@ -690,7 +890,14 @@ export function MapView(props: MapViewProps): React.ReactElement {
 	useEffect(() => {
 		if (!sample || !highlight || highlight === lastHighlight.current) return;
 		lastHighlight.current = highlight;
-		if (highlight.source === 'search' || highlight.source === 'lasso') return;
+		if (highlight.source === 'lasso') return;
+		if (highlight.source === 'search') {
+			// Search's Compare told the map both questions before it highlighted both result lists: a star for each.
+			const compare = comparePlan({ told: state.query, toldB: state.queryB, mapQuery: query?.text ?? null, mapQueryB: queryB?.text ?? null, embedReady });
+			if (compare.runA) void runQuery(state.query as string, false, false);
+			if (compare.runB) void runQueryB(state.queryB as string);
+			return;
+		}
 		const res = resolveKeys(highlight.keys, keyIdx, sampleModel?.pinned ?? []);
 		if (res.outside.length > 0 && model.capabilities.project !== false) void pinKeys(res.outside);
 		const first = res.points[0];
@@ -700,7 +907,7 @@ export function MapView(props: MapViewProps): React.ReactElement {
 			const clearQuery = (): void => {
 				setQueryView(null);
 				queryVector.current = null;
-				setColourBy((by) => (by === 'query-similarity' ? 'document' : by));
+				setColourBy((by) => colourAfterQuery(by, colourBefore.current));
 			};
 			// The chat told the map the answer's question (showAnswerOnMap) before it highlighted the sources.
 			const plan = chatQueryPlan({ told: state.query, mapQuery: query?.text ?? null, embedReady });
@@ -731,7 +938,18 @@ export function MapView(props: MapViewProps): React.ReactElement {
 	// Text query: embed -> project -> search
 	// -------------------------------------------------------------------------
 
-	const runQuery = async (text: string, setHighlightToTopK = true): Promise<void> => {
+	/**
+	 * Embed one question on the embedding node: the map's only `embed` call
+	 * (the query, and Search's compared question). The answer is used as it came.
+	 */
+	const embedQuestion = (text: string): Promise<ToolAnswer<IEmbedResult>> => {
+		if (embedChannel === null || !model.nodes.embed) return Promise.resolve({ ok: false, code: 'NO_EMBEDDER', message: QUERY_NEEDS_EMBED, stale: false });
+		return callTool<IEmbedResult>(embedChannel, 'embed', { texts: [text], kind: 'query' }, { nodeId: model.nodes.embed, timeoutMs: 60_000 });
+	};
+
+	const runQuery = async (text: string, setHighlightToTopK = true, ownQuery = setHighlightToTopK): Promise<void> => {
+		// A question typed on the map replaces a compared pair: star B goes.
+		if (ownQuery) clearCompare();
 		const blocked = queryBlocker({ embedReady, hasSample: sampleModel !== null && channel !== null });
 		if (blocked !== null || !sampleModel || channel === null || embedChannel === null || !model.nodes.embed) {
 			setError(blocked ?? QUERY_NEEDS_EMBED);
@@ -741,7 +959,7 @@ export function MapView(props: MapViewProps): React.ReactElement {
 		setError(null);
 		setNotice(null);
 		setBusy(BUSY.embedding);
-		const embedded = await callTool<IEmbedResult>(embedChannel, 'embed', { texts: [text], kind: 'query' }, { nodeId: model.nodes.embed, timeoutMs: 60_000 });
+		const embedded = await embedQuestion(text);
 		if (connectionRef.current !== key) return;
 		if (!embedded.ok) {
 			setBusy(null);
@@ -773,7 +991,11 @@ export function MapView(props: MapViewProps): React.ReactElement {
 		if (layout !== 'pca' && item) notes.push(QUERY_PLACED_APPROX);
 		setQueryView({ text, item, sims, search, notes });
 		selection.setQuery(text);
-		if (sims) setColourBy('query-similarity');
+		if (sims) {
+			const next = colourForQuery(colourBy, colourBefore.current);
+			colourBefore.current = next.before;
+			setColourBy(next.colourBy);
+		}
 		if (search) {
 			const top = search.results.flatMap((r) => (typeof r.metadata?.objectId === 'string' && typeof r.metadata?.chunkId === 'number' ? [[r.metadata.objectId, r.metadata.chunkId] as VectorKey] : []));
 			if (setHighlightToTopK) selection.setHighlight({ source: 'search', keys: top });
@@ -782,6 +1004,51 @@ export function MapView(props: MapViewProps): React.ReactElement {
 			actions.announce(`Query placed on the map with rays to its ${num(top.length)} nearest chunks in the collection.`);
 		}
 	};
+
+	/** Forget the compared question (star B, its rays and vector). */
+	const clearCompare = (): void => {
+		setQueryBView(null);
+		queryVectorB.current = null;
+		if (selection.getState().queryB !== null) selection.clearQueryB();
+	};
+
+	/**
+	 * Place Search's compared question (B): embed it, project it among the
+	 * sample, and search its true top-k for its rays. Its vector stays here and
+	 * goes only to `project` and `search`, like the query's.
+	 */
+	const runQueryB = async (text: string): Promise<void> => {
+		if (!sampleModel || channel === null || embedChannel === null || !model.nodes.embed) return;
+		const key = model.connectionKey;
+		const embedded = await embedQuestion(text);
+		if (connectionRef.current !== key) return;
+		const vector = embedded.ok ? embedded.value.vectors[0] : undefined;
+		if (!Array.isArray(vector) || vector.length === 0) {
+			if (!embedded.ok && !embedded.stale) setNotice(mapFailure(embedded.code, embedded.message));
+			return;
+		}
+		queryVectorB.current = vector;
+		const projected = model.capabilities.project === false ? null : await withSampleRetry(sampleModel.sampleId, (id) => callTool<IProjectResult>(channel, 'project', { sample_id: id, vector, m: PROJECT_M }, { nodeId: storeNode }), resample);
+		const searched = await callTool<ISearchResult>(channel, 'search', { vector, top_k: Math.min(RAYS_TOP_K, limits.top_k_max), include_below_floor: true }, { nodeId: storeNode });
+		if (connectionRef.current !== key || selection.getState().queryB !== text) return;
+		const item = projected && projected.ok ? (projected.value.items[0] ?? null) : null;
+		const search = searched.ok ? searched.value : null;
+		setQueryBView({ text, item, sims: null, search, notes: [] });
+		if (search) {
+			const current = selection.getState().sampleModel;
+			const outside = raysFromSearch(search, current ? keyIndex(current.result) : keyIdx, current?.pinned ?? []).outside;
+			if (outside.length > 0) await pinKeys(outside);
+			actions.announce(`Second question placed on the map (hollow star) with rays to its ${num(search.results.length)} nearest chunks.`);
+		}
+	};
+
+	// Search cleared its compared question: star B goes.
+	useEffect(() => {
+		if (state.queryB === null && queryB !== null) {
+			setQueryBView(null);
+			queryVectorB.current = null;
+		}
+	}, [state.queryB, queryB]);
 
 	// Heat strip: the selected point's document, every chunk scored against the query.
 	useEffect(() => {
@@ -857,15 +1124,300 @@ export function MapView(props: MapViewProps): React.ReactElement {
 	);
 
 	// -------------------------------------------------------------------------
+	// Clusters, edges, colouring, isolation (all over data the browser holds: no call)
+	// -------------------------------------------------------------------------
+
+	/** The Clusters tab's Minimum size: folded here, so nothing is asked of the store. */
+	const onMinSize = useCallback(
+		(size: ClusterMinSize): void => {
+			setMinClusterSize(size);
+			if (sample?.clusters) {
+				const view = clusterView(sample.clusters, size);
+				actions.announce(`Clusters of at least ${num(size)} points: ${num(view.count)} ${view.count === 1 ? 'cluster' : 'clusters'}, ${num(view.noise)} unassigned ${view.noise === 1 ? 'point' : 'points'}.`);
+			}
+		},
+		[sample, actions],
+	);
+
+	const onColourBy = useCallback(
+		(by: MapColourBy): void => {
+			setColourBy(by);
+			if (by === 'cluster' && clusters && sample) {
+				const { rows, noise } = clusterRows(sample, clusters, hidden);
+				actions.announce(clusterAnnouncement(rows.length, noise.size));
+			}
+		},
+		[clusters, sample, hidden, actions],
+	);
+
+	const onEdges = useCallback((mode: EdgeMode): void => {
+		setEdges(mode);
+		setEdgesDegraded(false);
+	}, []);
+
+	const onEdgesM = useCallback((m: EdgesPerPoint): void => {
+		setEdgesM(m);
+		setEdgesDegraded(false);
+	}, []);
+
+	const onExpandSelected = useCallback((): void => {
+		if (selected === null) return;
+		setExpanded((list) => (list.includes(selected) ? list : [...list, selected]));
+		if (sample) actions.announce(`Added the neighbour edges of point ${num(selected + 1)}.`);
+	}, [selected, sample, actions]);
+
+	/** Frames that drew edges ran slow: draw 3 per point (never while the perf lane measures with the switch off). */
+	const onSlowEdges = useCallback((): void => {
+		if (!edgesAutoDegrade || edges !== 'neighbours' || edgesPerPoint <= 3) return;
+		setEdgesDegraded(true);
+		setNotice(EDGES_DEGRADED);
+	}, [edgesAutoDegrade, edges, edgesPerPoint]);
+
+	/** Show only these points (indices into the sample). */
+	const isolate = useCallback(
+		(indices: readonly number[]): void => {
+			if (!sample) return;
+			const keep = Array.from(new Set(indices.filter((i) => i >= 0 && i < sample.n && !(removedMask && removedMask[i])))).sort((a, b) => a - b);
+			if (keep.length === 0) return;
+			setIsolated(keep);
+			setFitToken((t) => t + 1);
+			actions.announce(`${isolationLine(keep.length, sample.n)} points.`);
+		},
+		[sample, removedMask, actions],
+	);
+
+	const onShowAll = useCallback((): void => {
+		setIsolated(null);
+		setFitToken((t) => t + 1);
+		if (sample) actions.announce(`Showing all ${num(shownCount(sample.n, removedMask))} points.`);
+	}, [sample, removedMask, actions]);
+
+	const onExpandIsolation = useCallback((): void => {
+		if (!sample || isolated === null) return;
+		const grown = expandByNeighbours(sample.knn, sample.n, isolated, removedMask);
+		setIsolated(grown);
+		setFitToken((t) => t + 1);
+		actions.announce(`${isolationLine(grown.length, sample.n)} points.`);
+	}, [sample, isolated, removedMask, actions]);
+
+	const isolation = sample && isolated !== null ? { shown: shownPoints, n: sample.n } : null;
+
+	// -------------------------------------------------------------------------
+	// Values for the mounted panels: Recommend, the inspector, exports, saved views
+	// -------------------------------------------------------------------------
+
+	/** Recommend's examples, kept per connection in memory (the 'recommend examples' cache). */
+	const setExamples = useCallback(
+		(next: IRecommendExamples): void => {
+			setExamplesState(next);
+			recommendExamples.set(model.connectionKey, next);
+		},
+		[model.connectionKey],
+	);
+
+	/** The inspector's "Add as example (+/-)". */
+	const onAddExample = useCallback(
+		(key: VectorKey, polarity: ExamplePolarity): void => {
+			const max = limits.recommend_examples_max ?? RECOMMEND_EXAMPLES_DEFAULT;
+			const same = (k: VectorKey): boolean => k[0] === key[0] && k[1] === key[1];
+			const positive = examples.positive.filter((k) => !same(k));
+			const negative = examples.negative.filter((k) => !same(k));
+			const side = polarity === 'positive' ? positive : negative;
+			if (side.length >= max) {
+				actions.announce(`At most ${num(max)} ${polarity} examples.`);
+				return;
+			}
+			side.push([key[0], key[1]]);
+			setExamples({ positive, negative, withQuery: examples.withQuery });
+			actions.announce(`Added as a ${polarity} example.`);
+		},
+		[examples, limits.recommend_examples_max, setExamples, actions],
+	);
+
+	/** Recommend: examples as keys, the query vector held here when asked, the scope; one call to the store node. */
+	const onRecommend = useCallback(
+		async (request: IRecommendRequest): Promise<ToolOutcome<IRecommendResult>> => {
+			if (channel === null) return { ok: false, code: undefined, message: 'No running source reaches this store.' };
+			const max = limits.recommend_examples_max ?? RECOMMEND_EXAMPLES_DEFAULT;
+			const scoped = scopeRef.current;
+			const answer = await callRecommend(
+				channel,
+				{
+					positive: request.positive.slice(0, max).map((k) => [k[0], k[1]] as VectorKey),
+					negative: request.negative.slice(0, max).map((k) => [k[0], k[1]] as VectorKey),
+					vector: request.withQuery ? queryVector.current : null,
+					k: request.k,
+					strategy: request.strategy,
+					exclude_examples: true,
+					...(scoped ? { filter: { object_ids: [...scoped] } } : {}),
+				},
+				{ nodeId: storeNode },
+			);
+			return answer.ok ? { ok: true, value: answer.value } : { ok: false, code: answer.code, message: mapFailure(answer.code, answer.message) };
+		},
+		[channel, limits.recommend_examples_max, storeNode],
+	);
+
+	/** The inspector's "Show full text": one `chunks` call per key (kept until another point is shown). */
+	const onShowText = useCallback(
+		(key: VectorKey): void => {
+			const id = keyString(key[0], key[1]);
+			if (channel === null || fullText?.key === id) return;
+			void callTool<IChunksResult>(channel, 'chunks', { object_id: key[0], after_chunk: key[1] - 1, limit: 1 }, { nodeId: storeNode }).then((answer) => {
+				const item = answer.ok ? answer.value.items.find((c) => c.chunkId === key[1]) : undefined;
+				if (item) setFullText({ key: id, text: item.content.length > FULL_TEXT_MAX ? `${item.content.slice(0, FULL_TEXT_MAX)}…` : item.content });
+				else if (!answer.ok && !answer.stale) setNotice(mapFailure(answer.code, answer.message));
+			});
+		},
+		[channel, storeNode, fullText],
+	);
+
+	/** Duplicate groups for the Points table (the queue's default threshold; computed from the sample). */
+	const duplicateGroups = useMemo(() => (sample ? groupOf(groups(pairsAt(sample, TABLE_DUPLICATE_THRESHOLD)), sample.n) : null), [sample]);
+
+	/** The points of the sample shown now (not hidden), in index order. */
+	const shownIndices = useCallback((): number[] => (sample ? Array.from({ length: sample.n }, (_, i) => i).filter((i) => !(hidden && hidden[i])) : []), [sample, hidden]);
+
+	/** Export rows of some points over the layout shown. */
+	const rowsOf = useCallback(
+		(indices: readonly number[]) =>
+			sample
+				? pointExportRows(sample, indices, { positions: raw, dims, querySims: query?.sims ?? null, clusters: clusters ? { labels: clusters.labels, label: (g) => clusterLabel(clusters, g) } : null })
+				: { columns: [], rows: [] },
+		[sample, raw, dims, query, clusters],
+	);
+
+	/** One cluster's export item (its shown points). */
+	const clusterExportItem = useCallback(
+		(cluster: number): IExportItem => {
+			const label = clusters ? clusterLabel(clusters, cluster) : `group ${cluster + 1}`;
+			return { id: `map-cluster-${cluster + 1}`, label: `Cluster ${cluster + 1}: ${label}`, kind: 'clusters', disabled: null, rows: () => rowsOf(shownIndices().filter((i) => (clusters?.labels[i] ?? -1) === cluster)) };
+		},
+		[clusters, rowsOf, shownIndices],
+	);
+
+	const lassoKeysNow = state.highlight?.source === 'lasso' ? state.highlight.keys : state.keys;
+
+	/** The map's PNG: the edge layer, the points and the overlay as drawn, at most 2x, with the legend's words and a footer. */
+	const mapPng = useCallback(async (): Promise<Blob | null> => {
+		const snap = snapshotter.current;
+		if (snap === null || typeof document === 'undefined' || !sample) return null;
+		// The renderer's snapshot draws the points again and copies them in this same call (preserveDrawingBuffer is off).
+		const source = snap();
+		if (source === null) return null;
+		const dpr = typeof window !== 'undefined' && window.devicePixelRatio > 0 ? window.devicePixelRatio : 1;
+		const scale = Math.min(2, dpr) / dpr;
+		const lines = [...(colouring?.legend ?? []).slice(0, 12).map((e) => `${e.label} (${num(e.count)})`), `${model.collection ?? 'collection'} · ${num(shownPoints)} of ${sample.of.chunks === null ? '?' : num(sample.of.chunks)} chunks · ${layout} · colour by ${COLOUR_MODES.find((m) => m.id === colourBy)?.label ?? colourBy} · ${new Date().toISOString().slice(0, 10)}`];
+		const ratio = Math.min(2, dpr);
+		const lineH = 16 * ratio;
+		const out = document.createElement('canvas');
+		out.width = Math.max(1, Math.round(source.width * scale));
+		out.height = Math.max(1, Math.round(source.height * scale)) + Math.round(lineH * (lines.length + 1));
+		const octx = out.getContext('2d');
+		if (!octx) return null;
+		const style = getComputedStyle(document.documentElement);
+		octx.fillStyle = style.getPropertyValue('--rr-bg-default').trim() || '#ffffff';
+		octx.fillRect(0, 0, out.width, out.height);
+		octx.drawImage(source, 0, 0, out.width, Math.round(source.height * scale));
+		octx.fillStyle = style.getPropertyValue('--rr-text-primary').trim() || '#1a1a1a';
+		octx.font = `${12 * ratio}px system-ui, sans-serif`;
+		lines.forEach((line, n) => octx.fillText(line, 8 * ratio, Math.round(source.height * scale) + lineH * (n + 1)));
+		return new Promise<Blob | null>((resolve) => out.toBlob((blob) => resolve(blob), 'image/png'));
+	}, [sample, colouring, model.collection, shownPoints, layout, colourBy]);
+
+	/** The toolbar's export items: the sample, the selection, the points shown, the clusters, the duplicates, the outliers, the PNG. */
+	const exportItems: IExportItem[] = useMemo(() => {
+		if (!sample) return [];
+		const selectionIdx = resolveKeys(lassoKeysNow, keyIdx, []).points;
+		const visibleOutliers = sample.outliers.filter((i) => !(hidden && hidden[i]));
+		const items: IExportItem[] = [
+			{ id: 'map-points', label: `Sample points (${num(shownCount(sample.n, removedMask))})`, kind: 'points', disabled: null, rows: () => rowsOf(Array.from({ length: sample.n }, (_, i) => i).filter((i) => !(removedMask && removedMask[i]))) },
+			{ id: 'map-selection', label: `Lasso selection (${num(selectionIdx.length)} points)`, kind: 'selection', disabled: selectionIdx.length === 0 ? 'Nothing selected' : null, rows: () => rowsOf(selectionIdx) },
+			{ id: 'map-visible', label: `Points shown (${num(shownPoints)})`, kind: 'points', disabled: null, rows: () => rowsOf(shownIndices()) },
+			{ id: 'map-clusters', label: `Clusters (${num(clusters?.count ?? 0)})`, kind: 'clusters', disabled: clusters ? (clusters.count === 0 ? 'No clusters at this minimum size' : null) : CLUSTERS_UNSUPPORTED, rows: () => clusterExportRows(clusters ? clusterRows(sample, clusters, hidden).rows : []) },
+			{ id: 'map-duplicates', label: `Duplicate pairs (${num(sample.duplicates.length)})`, kind: 'duplicates', disabled: sample.duplicates.length === 0 ? 'No near-duplicate pairs in this sample' : null, rows: () => duplicateExportRows(sample, hidden) },
+			{ id: 'map-outliers', label: `Outliers (${num(visibleOutliers.length)})`, kind: 'outliers', disabled: visibleOutliers.length === 0 ? 'No outliers in this sample' : null, rows: () => rowsOf(visibleOutliers) },
+			{ id: 'map-png', label: 'Map as PNG', kind: 'map', disabled: canSnapshot ? null : 'The map is not drawn right now.', png: mapPng },
+		];
+		if (matrixItem) items.push(matrixItem);
+		return items;
+	}, [sample, lassoKeysNow, keyIdx, hidden, removedMask, rowsOf, shownPoints, shownIndices, clusters, canSnapshot, mapPng, matrixItem]);
+
+	/** A saved view of the map now (never a vector, never a token). */
+	const currentView = useCallback((): ISavedViewState | null => {
+		if (!sampleModel) return null;
+		return {
+			n: sampleModel.result.n_requested,
+			mode: sampleModel.mode,
+			seed: sampleModel.seed,
+			layout,
+			colourBy: savedColour(colourBy),
+			edges,
+			edgesM,
+			minClusterSize,
+			query: query?.text ?? null,
+			scopeFilterId: null,
+			selection: lassoKeysNow.slice(0, limits.scope_keys_max).map((k) => [k[0], k[1]] as VectorKey),
+			camera: recallCamera(model.connectionKey),
+		};
+	}, [sampleModel, layout, colourBy, edges, edgesM, minClusterSize, query, lassoKeysNow, limits.scope_keys_max, model.connectionKey]);
+
+	/**
+	 * Apply a saved view: draw the sample again with its seed (and the current
+	 * scope), pinning the first project_keys_max saved keys; restore the
+	 * selection by key lookup; pin the first project_keys_max keys still absent
+	 * as hollow points; restore the colouring, edges, minimum size, layout and
+	 * camera. The saved query is offered, not run (it costs an embed).
+	 */
+	const applyView = useCallback(
+		async (view: ISavedView): Promise<ISavedViewRestore | null> => {
+			if (channel === null) return null;
+			const saved = view.selection.map((k) => [k[0], k[1]] as VectorKey);
+			const id = await drawSample({ n: view.n, mode: view.mode, seed: view.seed, includeKeys: saved.slice(0, limits.project_keys_max) });
+			const current = selection.getState().sampleModel;
+			if (id === null || current === null) return null;
+			const idx = keyIndex(current.result);
+			const restored = saved.filter((k) => idx.has(keyString(k[0], k[1])));
+			const absent = saved.filter((k) => !idx.has(keyString(k[0], k[1]))).slice(0, limits.project_keys_max);
+			let hollow = 0;
+			if (absent.length > 0 && model.capabilities.project !== false) {
+				const answer = await callTool<IProjectResult>(channel, 'project', { sample_id: id, keys: absent, m: PROJECT_M }, { nodeId: storeNode });
+				if (answer.ok) {
+					const items = answer.value.items.filter((item) => item.in_sample === null || item.in_sample === undefined);
+					selection.addPinned(items);
+					hollow = items.length;
+				}
+			}
+			selection.setKeys(restored);
+			selection.setHighlight(restored.length > 0 ? { source: 'lasso', keys: restored } : null);
+			setColourBy(restoredColour(view.colourBy));
+			setEdges(view.edges);
+			setEdgesM(view.edgesM);
+			if (view.minClusterSize === 2 || view.minClusterSize === 5 || view.minClusterSize === 10) setMinClusterSize(view.minClusterSize);
+			if (view.camera && typeof view.camera === 'object' && 'mode' in (view.camera as object)) setCameraOverride({ camera: view.camera as MapCamera, seq: Date.now() });
+			if (view.layout !== 'pca') void onLayout(view.layout);
+			setSavedQuery(view.query);
+			const result: ISavedViewRestore = { selected: saved.length, restored: restored.length, hollow, dropped: Math.max(0, saved.length - restored.length - hollow) };
+			actions.announce(`${num(result.restored)} of ${num(result.selected)} selected points restored; ${num(result.hollow)} drawn hollow.`);
+			return result;
+		},
+		// onLayout reads the sample it is given once the view re-renders.
+		// eslint-disable-next-line react-hooks/exhaustive-deps
+		[channel, drawSample, selection, limits.project_keys_max, model.capabilities.project, storeNode, actions],
+	);
+
+	// -------------------------------------------------------------------------
 	// Connection lifecycle
 	// -------------------------------------------------------------------------
 
 	useEffect(() => {
-		// A new connection: nothing of the old one carries over.
+		// A new connection: nothing of the old one carries over (its Recommend examples come from its own cache).
 		resetView(false);
 		setError(null);
 		setNotice(null);
 		setBusy(null);
+		setSavedQuery(null);
+		setExamplesState(recommendExamples.get(model.connectionKey) ?? NO_EXAMPLES);
 		client.cancel();
 	}, [model.connectionKey, resetView, client]);
 
@@ -913,7 +1465,22 @@ export function MapView(props: MapViewProps): React.ReactElement {
 	const selectedKey = selected !== null && sample ? pointKey(sample, selected) : null;
 	const selectedScore = selectedKey && query?.search ? (query.search.results.find((r) => r.metadata?.objectId === selectedKey[0] && r.metadata?.chunkId === selectedKey[1])?.score ?? null) : null;
 	const lassoKeys = state.highlight?.source === 'lasso' ? state.highlight.keys : state.keys;
-	const legendNotes = [...(query?.notes ?? []), ...(star && !star.exact && !query?.item ? [CENTROID_APPROX] : []), ...(sample?.mode === 'light' && layout === 'pca' ? [LIGHT_POSITIONS] : [])];
+	const edgeStatsNow = edgeSet ? edgeStats(edgeSet) : null;
+	const edgeLine = sample ? edgeLegend({ mode: edges, m: edgesPerPoint, count: edgeStatsNow?.count ?? 0, min: edgeStatsNow?.min ?? null, max: edgeStatsNow?.max ?? null, points: shownPoints, components: tree?.components ?? 0, expanded: expanded.length }) : null;
+	const listingLine = sample ? listingNote(sample) : null;
+	const legendNotes = [
+		...(query?.notes ?? []),
+		...(star && !star.exact && !query?.item ? [CENTROID_APPROX] : []),
+		...(sample?.mode === 'light' && layout === 'pca' ? [LIGHT_POSITIONS] : []),
+		...(colourBy === 'cluster' && sample?.clusters ? [clusterSentence(sample.clusters, minClusterSize)] : []),
+		...(edgeLine ? [edgeLine] : []),
+		...(edges === 'neighbours' && lightCap ? [EDGES_LIGHT_NOTE] : []),
+		...(edges === 'neighbours' && edgesDegraded ? [EDGES_DEGRADED] : []),
+		...(listingLine ? [listingLine] : []),
+		...(scopeIds && scope ? [scopeNote(scope.label, scopeIds.length)] : []),
+		...(isolation ? [isolationLine(isolation.shown, isolation.n)] : []),
+		...(queryB ? [`Hollow star: "${queryB.text}" (compared in Search)`] : []),
+	];
 	const describe = (index: number): string => {
 		if (!sample) return '';
 		const doc = documentOf(sample, index);
@@ -935,6 +1502,16 @@ export function MapView(props: MapViewProps): React.ReactElement {
 			data-renderer={rendererKind}
 			data-query-state={query === null ? 'none' : query.item || query.search ? 'placed' : 'failed'}
 			data-rays={rays.length}
+			data-query-b-state={queryB === null ? 'none' : queryB.item || queryB.search ? 'placed' : 'failed'}
+			data-colour-by={colourBy}
+			data-edge-mode={edges}
+			data-edges-per-point={edgesPerPoint}
+			data-edge-count={edgeSet?.count ?? 0}
+			data-clusters={clusters ? clusters.count : ''}
+			data-min-cluster-size={minClusterSize}
+			data-shown={sample ? shownPoints : ''}
+			data-isolated={isolation ? '1' : '0'}
+			data-scoped={scopeIds ? scopeIds.length : ''}
 		>
 			<MapToolbar
 				limits={model.capabilities.sample_light === false ? { ...limits, sample_max_light: limits.sample_max } : limits}
@@ -955,15 +1532,23 @@ export function MapView(props: MapViewProps): React.ReactElement {
 				onSample={(opts) => void drawSample(opts)}
 				onLayout={(next) => void onLayout(next)}
 				onCancel={onCancel}
-				onColourBy={setColourBy}
+				onColourBy={onColourBy}
+				colourReasons={colourReasons}
+				edges={edges}
+				onEdges={onEdges}
+				edgesM={edgesPerPoint}
+				onEdgesM={onEdgesM}
+				edgesMCap={lightCap ? 3 : null}
+				onExpandSelected={onExpandSelected}
+				expandReason={selected === null ? 'Select a point first' : null}
 				onQuery={(text) => void runQuery(text)}
 				onToggleLasso={() => setLasso((on) => !on)}
 				onFit={() => setFitToken((t) => t + 1)}
 				onToggleTable={() => setTable((on) => !on)}
 				extras={
 					<>
-						<ExportMenu items={[]} collection={model.collection} />
-						<SavedViewsMenu connectionKey={model.connectionKey} limits={limits} current={() => null} onApply={async () => null} />
+						<ExportMenu items={exportItems} collection={model.collection} onExported={(name) => actions.announce(`Exported ${name}.`)} />
+						<SavedViewsMenu connectionKey={model.connectionKey} limits={limits} current={currentView} onApply={applyView} />
 					</>
 				}
 			/>
@@ -973,6 +1558,24 @@ export function MapView(props: MapViewProps): React.ReactElement {
 				</div>
 			) : null}
 			{notice ? <p style={{ ...MAP_STYLES.note, padding: '0 10px' }}>{notice}</p> : null}
+			{savedQuery ? (
+				<div style={{ display: 'flex', gap: 6, alignItems: 'center', padding: '0 10px' }}>
+					<span style={MAP_STYLES.small}>This view had the query "{savedQuery}".</span>
+					<button
+						type="button"
+						style={MAP_STYLES.button}
+						disabled={!embedReady}
+						title={embedReady ? undefined : QUERY_NEEDS_EMBED}
+						onClick={() => {
+							const text = savedQuery;
+							setSavedQuery(null);
+							void runQuery(text);
+						}}
+					>
+						Run saved query
+					</button>
+				</div>
+			) : null}
 			{!sample ? (
 				<div style={{ padding: 16 }}>
 					<EmptyState
@@ -986,7 +1589,7 @@ export function MapView(props: MapViewProps): React.ReactElement {
 					<div style={MAP_STYLES.canvasColumn}>
 						{table ? (
 							<div style={{ flex: 1, overflow: 'auto', padding: 8 }}>
-								<PointsTable sample={sampleModel!} querySims={querySimsArray} selected={selected} onSelect={(i) => void onPick(i)} />
+								<PointsTable sample={sampleModel!} querySims={querySimsArray} selected={selected} onSelect={(i) => void onPick(i)} hidden={hidden} clusters={clusters} duplicateGroups={duplicateGroups} />
 							</div>
 						) : null}
 						{/* Hidden, not unmounted, under the table: it keeps its renderer and camera, and its root keeps
@@ -1020,6 +1623,15 @@ export function MapView(props: MapViewProps): React.ReactElement {
 								layout={layout}
 								selectionCount={lassoKeys.length > 0 ? lassoKeys.length : null}
 								overlap={quality ? { layout: quality.overlap, pca: quality.pcaOverlap } : null}
+								edges={edgeSet}
+								starB={starB}
+								raysB={raysB}
+								clusterLabels={clusterLabels}
+								clusterOf={clusters?.labels ?? null}
+								reducedMotion={reducedMotion}
+								onSlowEdges={onSlowEdges}
+								onSnapshotter={onSnapshotter}
+								cameraOverride={cameraOverride}
 							/>
 						</div>
 						<Legend sample={sampleModel!} colourBy={colourBy} pointCap={pointCap} backend={backend} colouring={colouring} notes={legendNotes} />
@@ -1040,7 +1652,7 @@ export function MapView(props: MapViewProps): React.ReactElement {
 									neighbours={neighbours && neighbours.index === selected ? neighbours.result : null}
 									querySim={selected !== null && query?.sims ? (query.sims[selected] ?? null) : null}
 									score={selectedScore}
-									text={selectedKey && chunkText?.key === keyString(selectedKey[0], selectedKey[1]) ? chunkText.text : null}
+									text={selectedKey && fullText?.key === keyString(selectedKey[0], selectedKey[1]) ? fullText.text : selectedKey && chunkText?.key === keyString(selectedKey[0], selectedKey[1]) ? chunkText.text : null}
 									busy={neighbourBusy ? BUSY.neighbours : null}
 									error={neighbourError}
 									writes={model.writes}
@@ -1051,6 +1663,9 @@ export function MapView(props: MapViewProps): React.ReactElement {
 									}}
 									onSelectNeighbour={selectKey}
 									onRemoveDocument={(objectId) => actions.requestRemove([objectId])}
+									treeNeighbours={edges === 'tree' && tree && selected !== null ? treeNeighbours(tree.edges, selected) : null}
+									onAddExample={onAddExample}
+									onShowText={onShowText}
 								/>
 							) : null}
 							{tab === 'neighbours' ? (
@@ -1069,12 +1684,56 @@ export function MapView(props: MapViewProps): React.ReactElement {
 									</ol>
 								)
 							) : null}
-							{tab === 'duplicates' ? <DuplicatesPanel sample={sampleModel!} writes={model.writes} onSelect={(indices) => selection.setHighlight({ source: 'neighbors', keys: indices.map((i) => pointKey(sample, i)) })} onRemoveDocument={(objectId) => actions.requestRemove([objectId])} /> : null}
-							{tab === 'outliers' ? <OutliersPanel sample={sampleModel!} onSelect={(i) => {
-								void onPick(i);
-								setCentreOn({ index: i, seq: ++seq.current });
-							}} /> : null}
-							{tab === 'clusters' ? <ClustersPanel sample={sampleModel!} /> : null}
+							{tab === 'duplicates' ? (
+								<DuplicatesPanel
+									sample={sampleModel!}
+									writes={model.writes}
+									onSelect={(indices) => selection.setHighlight({ source: 'neighbors', keys: indices.map((i) => pointKey(sample, i)) })}
+									onRemoveDocument={(objectId) => actions.requestRemove([objectId])}
+									connectionKey={model.connectionKey}
+									documents={props.documents ?? null}
+									onRemoveDocuments={(objectIds) => actions.requestRemove(objectIds)}
+									onOpenDocument={(objectId, chunkId) => actions.openDocument(objectId, chunkId)}
+								/>
+							) : null}
+							{tab === 'outliers' ? (
+								<OutliersPanel
+									sample={sampleModel!}
+									onSelect={(i) => {
+										void onPick(i);
+										setCentreOn({ index: i, seq: ++seq.current });
+									}}
+									connectionKey={model.connectionKey}
+									writes={model.writes}
+									onRemoveDocument={(objectId) => actions.requestRemove([objectId])}
+									onShowNeighbours={(i) => {
+										void onPick(i);
+										setTab('neighbours');
+									}}
+								/>
+							) : null}
+							{tab === 'clusters' ? (
+								<ClustersPanel
+									sample={sampleModel!}
+									minSize={minClusterSize}
+									onMinSize={onMinSize}
+									chat={model.chat}
+									onShow={(cluster) => isolate(clusters ? Array.from({ length: sample.n }, (_, i) => i).filter((i) => clusters.labels[i] === cluster) : [])}
+									onAskAbout={(objectIds) => actions.askAbout(objectIds)}
+									onSelect={(indices) => selection.setHighlight({ source: 'neighbors', keys: indices.map((i) => pointKey(sample, i)) })}
+									view={clusters}
+									colours={clusterPalette}
+									noiseColour={palette?.other}
+									hidden={hidden}
+									clustersOffered={model.capabilities.clusters === true}
+									maxDocuments={limits.scope_keys_max}
+									isolated={isolation}
+									onShowAll={onShowAll}
+									onExpand={onExpandIsolation}
+									exportItemOf={clusterExportItem}
+									collection={model.collection}
+								/>
+							) : null}
 							{tab === 'recommend' ? (
 								<RecommendPanel
 									sample={sampleModel}
@@ -1083,7 +1742,7 @@ export function MapView(props: MapViewProps): React.ReactElement {
 									examples={examples}
 									onExamplesChange={setExamples}
 									queryText={query?.text ?? null}
-									onRun={async () => ({ ok: false, code: undefined, message: 'Not built yet.' })}
+									onRun={onRecommend}
 									onSelect={selectKey}
 									onPin={(keys) => void pinKeys(keys.map((key) => [key[0], key[1]] as VectorKey))}
 								/>
@@ -1099,6 +1758,10 @@ export function MapView(props: MapViewProps): React.ReactElement {
 										const text = JSON.stringify(keys);
 										if (typeof navigator !== 'undefined' && navigator.clipboard) void navigator.clipboard.writeText(text).then(() => actions.announce(`Copied ${num(keys.length)} keys.`));
 									}}
+									onIsolate={(keys) => isolate(resolveKeys(keys, keyIdx, []).points)}
+									isolated={isolation}
+									onShowAll={onShowAll}
+									onExpand={onExpandIsolation}
 								>
 									<SimilarityMatrix
 										keys={lassoKeys}
@@ -1108,6 +1771,14 @@ export function MapView(props: MapViewProps): React.ReactElement {
 										labelOf={(key) => {
 											const index = keyIdx.get(keyString(key[0], key[1]));
 											return index === undefined ? `${key[0]} #${key[1]}` : `${documentOf(sample, index)?.path ?? key[0]} #${key[1]}`;
+										}}
+										onShowPair={(a, b) => {
+											selection.setHighlight({ source: 'neighbors', keys: [a, b] });
+											selectKey(a);
+										}}
+										onExport={(item) => {
+											setMatrixItem(item);
+											actions.announce("The similarity matrix is in the map's Export menu.");
 										}}
 									/>
 								</SelectionTab>
