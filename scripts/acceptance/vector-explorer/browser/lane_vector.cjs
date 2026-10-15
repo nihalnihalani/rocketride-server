@@ -228,7 +228,7 @@ async function main() {
 			}
 			fs.rmSync(path.join(work, own.folder), { recursive: true, force: true });
 			await uploadFolder(dir);
-			// The two same-named files go out one after the other (DA3-17): wait until both rows are finished.
+			// The two same-named files go out one after the other, not together: wait until both rows are finished.
 			const rows = (await C.waitForUploads(page, [own.reportA, own.reportB], 180000)).filter((r) => /report\.pdf$/.test(r.path));
 			note({ rows });
 			if (rows.length < 2) return `${rows.length} upload rows name report.pdf`;
