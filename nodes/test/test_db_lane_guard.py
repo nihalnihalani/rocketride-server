@@ -49,6 +49,15 @@ if (input.required !== undefined) {
     if (saved === undefined) delete process.env.RR_REQUIRE_DB_TESTS;
     out.suites = lane.DB_LIVE_SUITES;
     out.poolerSuites = lane.DB_POOLER_SUITES;
+    out.pgvectorPoolerSuites = lane.DB_PGVECTOR_POOLER_SUITES;
+}
+if (input.pooled !== undefined) {
+    try {
+        lane.checkPooledCases(input.pooled, input.suites);
+        out.pooledError = null;
+    } catch (e) {
+        out.pooledError = e.message;
+    }
 }
 process.stdout.write(JSON.stringify(out));
 """
@@ -89,7 +98,13 @@ def test_every_suite_passing_with_deliberate_skips_is_accepted():
     )
     out = _lane({'xml': xml, 'suites': SUITES})
     assert out['error'] is None
-    assert out['counts']['test_graph_a_full'] == {'passed': 1, 'skipped': 1, 'failed': 0, 'unexpectedSkips': []}
+    assert out['counts']['test_graph_a_full'] == {
+        'passed': 1,
+        'skipped': 1,
+        'failed': 0,
+        'pooledPassed': 0,
+        'unexpectedSkips': [],
+    }
 
 
 def test_a_suite_without_passes_fails_the_lane():
@@ -150,3 +165,38 @@ def test_the_lane_lists_the_graph_suites_and_the_pooler_pass():
     ):
         assert suite in out['suites']
     assert out['poolerSuites'] == ['test_rocketride_graph_full.py', 'test_graph_age_full.py']
+
+
+def test_the_lane_lists_the_vector_suites_and_the_pgvector_pooled_cases():
+    out = _lane({'required': []})
+    for suite in (
+        'test_rocketride_db_full.py',
+        'test_store_postgres_full.py',
+        'test_store_qdrant_full.py',
+        'test_store_chroma_full.py',
+        'test_vector_toolpath_full.py',
+        'test_vector_wire_fixtures_full.py',
+    ):
+        assert suite in out['suites']
+    assert len(out['suites']) == len(set(out['suites']))
+    assert out['pgvectorPoolerSuites'] == ['test_rocketride_db_full.py', 'test_store_postgres_full.py']
+    assert set(out['pgvectorPoolerSuites']) <= set(out['suites'])
+
+
+def test_pgvector_suites_must_pass_a_pooled_case_when_the_pooler_is_set():
+    suites = ['test_store_postgres_full', 'test_rocketride_db_full']
+    both = _xml(
+        _case('test_store_postgres_full', 'test_ingest[direct]'),
+        _case('test_store_postgres_full', 'test_ingest[pooler]'),
+        _case('test_rocketride_db_full', 'test_vec[pooler]'),
+    )
+    assert _lane({'pooled': both, 'suites': suites})['pooledError'] is None
+    direct_only = _xml(
+        _case('test_store_postgres_full', 'test_ingest[direct]'),
+        _case(
+            'test_store_postgres_full', 'test_ingest[pooler]', _skip('NOT RUN: RR_TEST_PGVECTOR_POOLER_DSN is not set')
+        ),
+        _case('test_rocketride_db_full', 'test_vec[pooler]'),
+    )
+    error = _lane({'pooled': direct_only, 'suites': suites})['pooledError']
+    assert error is not None and 'test_store_postgres_full' in error and 'test_rocketride_db_full' not in error

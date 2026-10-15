@@ -91,12 +91,32 @@ const DB_LIVE_SUITES = [
     // Starts dist/server's engine itself and calls the shipped Graph Explorer
     // templates' graph tools through the SDK: the one suite that is not stubbed.
     'test_graph_toolpath_full.py',
+    // Vector Explorer: the shared pgvector driver behind store_postgres, and the
+    // Qdrant and Chroma drivers, on new and legacy-shaped collections
+    // (test_rocketride_db_full.py above covers rocketride_vector).
+    'test_store_postgres_full.py',
+    'test_store_qdrant_full.py',
+    'test_store_chroma_full.py',
+    // Starts dist/server's engine and calls the shipped Vector Explorer
+    // templates' store and embed tools through the SDK.
+    'test_vector_toolpath_full.py',
+    // Regenerates vector-ui's wire fixtures (apps/vector-ui/tests/fixtures/v1/live) and compares.
+    'test_vector_wire_fixtures_full.py',
 ];
 
-// Run a second time with RR_TEST_AGE_DSN pointing at a transaction-mode pooler
-// (RR_TEST_AGE_POOLER_DSN) and RR_TEST_AGE_ADMIN_DSN at the database itself:
-// the cloud reaches tenant databases through such a pooler.
+// Pooler passes: the cloud reaches tenant databases through a transaction-mode
+// pooler, so these suites also run through one.
+//
+// AGE: run a second time with RR_TEST_AGE_DSN pointing at the pooler
+// (RR_TEST_AGE_POOLER_DSN) and RR_TEST_AGE_ADMIN_DSN at the database itself.
 const DB_POOLER_SUITES = ['test_rocketride_graph_full.py', 'test_graph_age_full.py'];
+
+// pgvector: these suites parametrise their cases over the database and the
+// pooler named by RR_TEST_PGVECTOR_POOLER_DSN, so the live pass above runs the
+// pooled cases itself (a second pass would only repeat the direct ones). With
+// the variable set and the databases required, each must pass at least one
+// pooled case (a test id carrying "pooler").
+const DB_PGVECTOR_POOLER_SUITES = ['test_rocketride_db_full.py', 'test_store_postgres_full.py'];
 
 // A skip whose reason starts with this is deliberate (e.g. a test that needs a
 // Neo4j Enterprise role); any other skip under a required run fails it.
@@ -409,6 +429,8 @@ function makeInstallTestDepsAction() {
 // (options.requireDb, nodes:test-db; or RR_REQUIRE_DB_TESTS) every suite must
 // pass at least one test, and no test may skip without a "NOT RUN:" reason: a
 // suite whose tests skip proves nothing about the database it was written for.
+// With RR_TEST_PGVECTOR_POOLER_DSN set, each of DB_PGVECTOR_POOLER_SUITES must
+// also pass at least one pooled case in the live pass.
 function makeRunDbPytestAction(options = {}) {
     return {
         run: async (ctx, task) => {
@@ -434,6 +456,11 @@ function makeRunDbPytestAction(options = {}) {
             } else if (required) {
                 task.output = 'RR_TEST_AGE_POOLER_DSN is not set: the transaction-mode pooler pass is not run';
             }
+            const pgvectorPooler = String(testEnv.RR_TEST_PGVECTOR_POOLER_DSN || '').trim();
+            if (!pgvectorPooler && required) {
+                const note = 'RR_TEST_PGVECTOR_POOLER_DSN is not set: the pgvector suites leave out their pooled cases';
+                task.output = task.output ? `${task.output}\n${note}` : note;
+            }
 
             const pytestTokens = splitPytestOpts(options.pytest);
             for (const pass of passes) {
@@ -453,7 +480,11 @@ function makeRunDbPytestAction(options = {}) {
                     execOpts: { task, cwd: PACKAGE_DIR, env: pass.env },
                 });
                 if (required) {
-                    checkRequiredDbResults(await fs.promises.readFile(report, 'utf8'), pass.suites, pass.report);
+                    const xml = await fs.promises.readFile(report, 'utf8');
+                    checkRequiredDbResults(xml, pass.suites, pass.report);
+                    if (pass.suites === DB_LIVE_SUITES && pgvectorPooler) {
+                        checkPooledCases(xml, DB_PGVECTOR_POOLER_SUITES, pass.report);
+                    }
                 }
             }
         }
@@ -480,6 +511,21 @@ function checkRequiredDbResults(xml, suites, label = 'junit.xml') {
     }
 }
 
+/**
+ * Throw unless every suite passed at least one pooled case: a test whose id
+ * carries "pooler" (the pgvector suites' cases through RR_TEST_PGVECTOR_POOLER_DSN).
+ */
+function checkPooledCases(xml, suites, label = 'junit.xml') {
+    const names = suites.map((suite) => path.basename(suite, '.py'));
+    const counts = countJunitResults(xml);
+    const missing = names.filter((name) => !(counts[name]?.pooledPassed > 0));
+    if (missing.length > 0) {
+        throw new Error(
+            `RR_TEST_PGVECTOR_POOLER_DSN is set but no pooled case passed in: ${missing.join(', ')} (${label})`
+        );
+    }
+}
+
 function unescapeXml(text) {
     return text
         .replace(/&quot;/g, '"')
@@ -502,14 +548,17 @@ function countJunitResults(xml) {
         const testName = unescapeXml((/\bname="([^"]*)"/.exec(match[1]) || [])[1] || '');
         const module = classname.split('.').find((part) => part.startsWith('test_')) || classname;
         const body = match[3] || '';
-        const entry = counts[module] || (counts[module] = { passed: 0, skipped: 0, failed: 0, unexpectedSkips: [] });
+        const entry = counts[module] || (counts[module] = { passed: 0, skipped: 0, failed: 0, pooledPassed: 0, unexpectedSkips: [] });
         const skipped = /<skipped\b([^>]*)/.exec(body);
         if (skipped) {
             entry.skipped += 1;
             const reason = unescapeXml((/message="([^"]*)"/.exec(skipped[1]) || [])[1] || '');
             if (!reason.startsWith(DB_EXPECTED_SKIP_PREFIX)) entry.unexpectedSkips.push(`${module}::${testName}: ${reason}`);
         } else if (/<(failure|error)\b/.test(body)) entry.failed += 1;
-        else entry.passed += 1;
+        else {
+            entry.passed += 1;
+            if (/pooler/.test(testName)) entry.pooledPassed += 1;
+        }
     }
     return counts;
 }
@@ -610,7 +659,7 @@ module.exports = {
 };
 
 // The live-database lane's pure helpers (nodes/test/test_db_lane_guard.py).
-module.exports.dbLane = { DB_LIVE_SUITES, DB_POOLER_SUITES, dbTestsRequired, countJunitResults, checkRequiredDbResults };
+module.exports.dbLane = { DB_LIVE_SUITES, DB_POOLER_SUITES, DB_PGVECTOR_POOLER_SUITES, dbTestsRequired, countJunitResults, checkRequiredDbResults, checkPooledCases };
 
 // Export paths for external use
 module.exports.SRC_DIR = SRC_DIR;

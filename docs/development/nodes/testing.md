@@ -537,8 +537,9 @@ Integration tests execute the test cases defined in `services*.json` through a l
 
 Some suites drive a node's real driver against a real database server:
 `test_rocketride_graph_full.py` and `test_graph_age_full.py` (Apache AGE),
-`test_rocketride_db_full.py` (PostgreSQL with pgvector),
-`test_graph_neo4j_full.py` (Neo4j) and `test_graph_falkordb_full.py`
+`test_rocketride_db_full.py` and `test_store_postgres_full.py` (PostgreSQL with
+pgvector), `test_store_qdrant_full.py` (Qdrant), `test_store_chroma_full.py`
+(Chroma), `test_graph_neo4j_full.py` (Neo4j) and `test_graph_falkordb_full.py`
 (FalkorDB). Two more need the real driver packages: `test_graph_drivers_full.py`
 (real driver objects, no server) and `test_graph_wire_fixtures_full.py`, which
 regenerates graph-ui's wire fixtures (`apps/graph-ui/tests/fixtures/v1`) from
@@ -547,9 +548,14 @@ stub the engine surface themselves. `test_graph_toolpath_full.py` does not: it
 starts the engine in `dist/server` (build it first) with a stand-in for the
 cloud database broker, starts each shipped Graph Explorer template
 (`apps/graph-ui/templates`) against the test servers, and calls its graph tools
-through the Python SDK. None of them needs the test server, but they cannot run
-in the mocked pass: `nodes/test/mocks` replaces `psycopg2` and `falkordb` for the
-whole engine. They are listed in `DB_LIVE_SUITES` in `nodes/scripts/tasks.js`,
+through the Python SDK. `test_vector_toolpath_full.py` does the same for the
+Vector Explorer templates (`apps/vector-ui/templates`) and their store and
+`embed` tools (its first start installs the embedding node's requirements and
+loads all-MiniLM-L6-v2), and `test_vector_wire_fixtures_full.py` regenerates
+vector-ui's wire fixtures (`apps/vector-ui/tests/fixtures/v1/live`) the same
+way and compares them. None of them needs the test server, but they cannot run
+in the mocked pass: `nodes/test/mocks` replaces `psycopg2`, `falkordb` and the
+vector store clients for the whole engine. They are listed in `DB_LIVE_SUITES` in `nodes/scripts/tasks.js`,
 which `nodes:test` ignores in its mocked pass and then runs in a separate pass
 without mocks:
 
@@ -573,7 +579,13 @@ that transaction-mode pooler (`RR_TEST_AGE_DSN` is pointed at it and
 `RR_TEST_AGE_ADMIN_DSN` at the database itself), the way the cloud reaches
 tenant databases; CI runs PgBouncer in front of its AGE container for this.
 Without the variable a required run still passes but leaves that pass out (it
-says so in the task output). `scripts/acceptance/graph-explorer/validate_all.sh`
+says so in the task output). The pgvector suites (`test_store_postgres_full.py`
+and the `rocketride_vector` cases of `test_rocketride_db_full.py`) run their
+pooled cases within the live pass instead: with `RR_TEST_PGVECTOR_POOLER_DSN`
+set (CI points it at a PgBouncer in front of its pgvector container) each case
+runs once directly and once through the pooler, and a required run fails unless
+both suites passed at least one pooled case; without it those cases skip with
+`NOT RUN:` and the task output says so. `scripts/acceptance/graph-explorer/validate_all.sh`
 always sets it, to the `gx-pgbouncer` container from that folder's README unless
 you point it elsewhere, so a local gate run includes the pass. The
 servers and their environment variables (`RR_TEST_AGE_DSN`, `RR_TEST_PG_DSN`,

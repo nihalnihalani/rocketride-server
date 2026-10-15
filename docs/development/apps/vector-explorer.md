@@ -210,16 +210,16 @@ descriptors byte-for-byte, and `test_tool_audience.py` pins that.
 | The `embed` tool | `nodes/test/test_embed_tool.py` | `./builder nodes:test` |
 | Call context and tool audience | `test_tool_context.py`, `test_tool_audience.py` | `./builder ai:test` |
 | Live `rocketride_vector` driver on new and legacy collections | `nodes/test/test_rocketride_db_full.py` | `./builder nodes:test-db`, or by name |
-| Live `store_postgres`, Qdrant and Chroma drivers on new and legacy collections | `nodes/test/test_store_postgres_full.py`, `test_store_qdrant_full.py`, `test_store_chroma_full.py` | By name |
-| Every tool through a real engine and the shipped templates | `nodes/test/test_vector_toolpath_full.py` (needs `dist/server`) | By name |
-| Wire fixtures still match the drivers | `nodes/test/test_vector_wire_fixtures_full.py` | By name |
+| Live `store_postgres`, Qdrant and Chroma drivers on new and legacy collections | `nodes/test/test_store_postgres_full.py`, `test_store_qdrant_full.py`, `test_store_chroma_full.py` | `./builder nodes:test-db`, or by name |
+| Every tool through a real engine and the shipped templates | `nodes/test/test_vector_toolpath_full.py` (needs `dist/server`) | `./builder nodes:test-db`, or by name |
+| Wire fixtures still match the drivers | `nodes/test/test_vector_wire_fixtures_full.py` | `./builder nodes:test-db`, or by name |
 | The app | `apps/vector-ui/tests/*.test.ts` | `./builder vector-ui:test` |
 | Browser lanes | `scripts/acceptance/vector-explorer/` | `./builder vector-ui:e2e-live`, manual |
 
-`./builder nodes:test-db` runs only the suites listed in `DB_LIVE_SUITES` in
-`nodes/scripts/tasks.js`, and of the vector live suites that list holds only
-`test_rocketride_db_full.py`. Run the others by name with the engine in
-`dist/server`:
+`./builder nodes:test-db` runs the suites listed in `DB_LIVE_SUITES` in
+`nodes/scripts/tasks.js`, which holds all six vector live suites; CI runs them
+against Qdrant, Chroma and a PgBouncer in front of its pgvector container. To
+run one or more by name, use the engine in `dist/server`:
 
 ```bash
 cd dist/server
@@ -241,7 +241,9 @@ The pooler pass is part of the suites themselves: the driver cases in
 `test_rocketride_db_full.py` run once against the database and, with
 `RR_TEST_PGVECTOR_POOLER_DSN` set, once more through that transaction-mode
 pooler, and `test_vector_toolpath_full.py` runs `rocketride_vector.pipe` through
-it a second time. Without the variable those cases skip with `NOT RUN:`. The
+it a second time. Without the variable those cases skip with `NOT RUN:`; with
+it set, a required `nodes:test-db` run also fails unless both pgvector suites
+passed at least one pooled case (`DB_PGVECTOR_POOLER_SUITES`). The
 servers, their pinned images and the local ports are in the acceptance
 [README](../../../scripts/acceptance/vector-explorer/README.md).
 
