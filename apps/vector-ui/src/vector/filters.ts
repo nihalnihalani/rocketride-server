@@ -62,6 +62,7 @@
 
 import type { Availability, FilterApplied, IDocumentItem, IDocumentsFilter, IExportItem, IScopeState, IStatsResult } from '../contract/types';
 import { DOCUMENTS_FILTER_KEYS } from '../contract/types';
+import { DIRECTORY_LOAD_MORE } from './budgets';
 import { documentExportRows, filterItems, filterSummary } from './documents';
 import type { IPagerState } from './documents';
 import type { IStatsView } from './results';
@@ -949,8 +950,18 @@ export function scopeWaitingText(loaded: number, total: number | null): string {
 /** The end of every sentence for a listing that stopped short. */
 const NOT_ALL_KNOWN = "so the scope's documents are not all known: the map, search and chat are not scoped.";
 
+/** How far Load more goes: one click when the rest fits, else the pace. */
+function loadMoreWords(left: number | null): string {
+	const pace = `(${DIRECTORY_LOAD_MORE.toLocaleString('en-US')} at a time)`;
+	if (left === null) return `Load more to include them ${pace}.`;
+	return left <= DIRECTORY_LOAD_MORE ? `Load more to include the other ${left.toLocaleString('en-US')}.` : `Load more to include the other ${left.toLocaleString('en-US')} ${pace}.`;
+}
+
 /**
  * Why the map, search and chat are not scoped by a listing that stopped short.
+ * A capped listing says how far Load more goes (the documents left when the
+ * store counted them, and how many a click lists), so on a large collection
+ * the instruction is one the user can weigh.
  *
  * @param status - How it stopped (capped, unsupported, stalled, error).
  * @param loaded - Rows loaded.
@@ -961,7 +972,7 @@ export function scopePartialText(status: IPagerState['status'], loaded: number, 
 	const n = loaded.toLocaleString('en-US');
 	switch (status) {
 		case 'capped':
-			return total !== null && total > loaded ? `Only ${n} of ${total.toLocaleString('en-US')} documents are loaded, ${NOT_ALL_KNOWN} Load more to include them.` : `Only ${n} documents are loaded and more may exist, ${NOT_ALL_KNOWN} Load more to include them.`;
+			return total !== null && total > loaded ? `Only ${n} of ${total.toLocaleString('en-US')} documents are loaded, ${NOT_ALL_KNOWN} ${loadMoreWords(total - loaded)}` : `Only ${n} documents are loaded and more may exist, ${NOT_ALL_KNOWN} ${loadMoreWords(null)}`;
 		case 'unsupported':
 			return `Only the first page of documents is listed (${n} loaded), ${NOT_ALL_KNOWN}`;
 		case 'stalled':

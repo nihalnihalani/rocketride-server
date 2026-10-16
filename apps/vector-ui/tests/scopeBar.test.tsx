@@ -236,7 +236,7 @@ test("the directory over a listing that stopped short: the loaded rows' empty ma
 	const html = renderToStaticMarkup(<DocumentDirectory pager={pager} selectedId={null} writes={on} onSelect={noop} onRemove={noop} onLoadMore={noop} onRetry={noop} scope={scopeOf(legal)} onScope={noop} cap={2_000} />);
 	assert.match(html, />No loaded document matches these conditions \(5,000 of 12,000 loaded\)\.</);
 	assert.doesNotMatch(html, /No documents? match(es)? these conditions/);
-	assert.deepEqual(chatToggle(html), { pressed: false, disabled: true, title: "Only 5,000 of 12,000 documents are loaded, so the scope's documents are not all known: the map, search and chat are not scoped. Load more to include them." });
+	assert.deepEqual(chatToggle(html), { pressed: false, disabled: true, title: "Only 5,000 of 12,000 documents are loaded, so the scope's documents are not all known: the map, search and chat are not scoped. Load more to include the other 7,000 (5,000 at a time)." });
 	assert.match(html, />Load more</);
 });
 

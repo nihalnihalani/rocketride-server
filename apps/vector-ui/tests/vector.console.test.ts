@@ -725,7 +725,7 @@ test('consoleScope: the chat is scoped only once the scope names its documents; 
 	// The first page failed, or the listing stopped short: nothing is scoped by it, and every surface is told so.
 	for (const [dir, words] of [
 		[failed, "The scope's documents did not load; Retry the directory. The map, search and chat are not scoped."],
-		[capped, "Only 500 of 12,000 documents are loaded, so the scope's documents are not all known: the map, search and chat are not scoped. Load more to include them."],
+		[capped, "Only 500 of 12,000 documents are loaded, so the scope's documents are not all known: the map, search and chat are not scoped. Load more to include the other 11,500 (5,000 at a time)."],
 	] as const) {
 		const unknown = consoleScope(null, fresh, dir, 2_000);
 		assert.equal(unknown.chat, null);

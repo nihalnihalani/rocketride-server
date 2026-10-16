@@ -13,7 +13,7 @@ import type { IDocumentItem, IDocumentsFilter, IScopeState } from '../src/contra
 import { DOCUMENTS_FILTER_KEYS } from '../src/contract/types';
 import { pagerApplyPage, pagerBegin, pagerFail, pagerInit } from '../src/vector/documents';
 import type { IPagerState } from '../src/vector/documents';
-import { EMPTY_FILTER, FILE_TYPE_RE, FILTER_TEXT_MAX, NO_MATCH_SCOPE, SCOPE_FAILED_TEXT, SCOPE_WAITING_TEXT, checkScope, clientKeys, conditionAvailability, conditionsFilter, directoryExportItems, directoryView, scopeView, conditionLabel, dateToIso, describeFilter, fromDocumentsFilter, instantMs, isFilterExtension, listingFilter, matches, parseFilter, removeCondition, resolveScope, sameFilter, scopeAvailability, scopeFromFilter, scopeWith, filterOf, withText, scopeObjectIds, scopeNoMatchText, scopeReadiness, scopeStatusText, scopeStripText, setCondition, toDocumentsFilter, tooLargeText, validateFilter } from '../src/vector/filters';
+import { EMPTY_FILTER, FILE_TYPE_RE, FILTER_TEXT_MAX, NO_MATCH_SCOPE, SCOPE_FAILED_TEXT, SCOPE_WAITING_TEXT, checkScope, clientKeys, conditionAvailability, conditionsFilter, directoryExportItems, directoryView, scopeView, conditionLabel, dateToIso, describeFilter, fromDocumentsFilter, instantMs, isFilterExtension, listingFilter, matches, parseFilter, removeCondition, resolveScope, sameFilter, scopeAvailability, scopeFromFilter, scopeWith, filterOf, withText, scopeObjectIds, scopeNoMatchText, scopePartialText, scopeReadiness, scopeStatusText, scopeStripText, setCondition, toDocumentsFilter, tooLargeText, validateFilter } from '../src/vector/filters';
 import type { IFilter } from '../src/vector/filters';
 import { readDocumentsPage, readStats } from '../src/vector/results';
 import { fixture } from './support/fixtures';
@@ -467,7 +467,7 @@ test('a listing that stopped short (capped, stalled): a count matched here is "N
 	assert.equal(directoryView(capped, scope, '', 2_000).summary, '1,000 of 5,000 loaded match (store; ingest dates filtered here)');
 	assert.equal(scopeStripText(view, { documents: 8_000 }), 'Scope: at least 1,000 of 8,000 documents · 2,000 chunks in the 5,000 loaded (counted here)');
 	assert.equal(resolveScope(scope, capped, 2_000).objectIds, null, 'the loaded matches are only a part of the scope: no surface is scoped by them');
-	assert.deepEqual(scopeAvailability(resolveScope(scope, capped, 2_000), 2_000, capped).chat, { enabled: false, reason: "Only 5,000 of 8,000 documents are loaded, so the scope's documents are not all known: the map, search and chat are not scoped. Load more to include them." });
+	assert.deepEqual(scopeAvailability(resolveScope(scope, capped, 2_000), 2_000, capped).chat, { enabled: false, reason: "Only 5,000 of 8,000 documents are loaded, so the scope's documents are not all known: the map, search and chat are not scoped. Load more to include the other 3,000." });
 	// Every document loaded: the same count is the scope's.
 	const done = paged(filter, 2, (i) => doc(`d${i}`, `C:/demo/${i}.md`, { chunks: 2, ingestedAt: i % 5 === 0 ? '2026-10-05T00:00:00Z' : '2026-09-01T00:00:00Z' }), { total: 1_000, filter_applied: 'partial', filter_ignored: ['ingested_after'] });
 	assert.equal(done.status, 'done');
@@ -572,8 +572,8 @@ test('a listing that stopped short never resolves the scope from the rows it loa
 	// 12,000 documents in storage order; the 304 under the folder all lie past the 5,000 loaded.
 	const rows = (i: number): IDocumentItem => doc(`d${i}`, `C:/corp/other/${i}.md`);
 	const cases: Array<[string, IPagerState, string]> = [
-		['capped', clientListed(legal, 10, rows, 12_000, true), "Only 5,000 of 12,000 documents are loaded, so the scope's documents are not all known: the map, search and chat are not scoped. Load more to include them."],
-		['capped, no total', clientListed(legal, 10, rows, null, true), "Only 5,000 documents are loaded and more may exist, so the scope's documents are not all known: the map, search and chat are not scoped. Load more to include them."],
+		['capped', clientListed(legal, 10, rows, 12_000, true), "Only 5,000 of 12,000 documents are loaded, so the scope's documents are not all known: the map, search and chat are not scoped. Load more to include the other 7,000 (5,000 at a time)."],
+		['capped, no total', clientListed(legal, 10, rows, null, true), "Only 5,000 documents are loaded and more may exist, so the scope's documents are not all known: the map, search and chat are not scoped. Load more to include them (5,000 at a time)."],
 		['stalled', clientListed(legal, 4, rows, 12_000, true, 'stalled'), "Loading stopped at 2,000 documents, so the scope's documents are not all known: the map, search and chat are not scoped."],
 		['unsupported', clientListed(legal, 1, rows, 12_000, true, 'unsupported'), "Only the first page of documents is listed (500 loaded), so the scope's documents are not all known: the map, search and chat are not scoped."],
 		['error', clientListed(legal, 3, rows, 12_000, true, 'error'), "Loading stopped at 1,500 documents, so the scope's documents are not all known: the map, search and chat are not scoped. Retry the directory to include them."],
@@ -595,7 +595,7 @@ test('a listing that stopped short never resolves the scope from the rows it loa
 	const unfiltered = clientListed(null, 10, (i) => doc(`d${i}`, `C:/alpha/${i}.md`), 20_000, true);
 	assert.equal(unfiltered.status, 'capped');
 	assert.equal(resolveScope(offScope, unfiltered, 2_000).objectIds, null);
-	assert.deepEqual(scopeAvailability(resolveScope(offScope, unfiltered, 2_000), 2_000, unfiltered).chat, { enabled: false, reason: "Only 5,000 of 20,000 documents are loaded, so the scope's documents are not all known: the map, search and chat are not scoped. Load more to include them." });
+	assert.deepEqual(scopeAvailability(resolveScope(offScope, unfiltered, 2_000), 2_000, unfiltered).chat, { enabled: false, reason: "Only 5,000 of 20,000 documents are loaded, so the scope's documents are not all known: the map, search and chat are not scoped. Load more to include the other 15,000 (5,000 at a time)." });
 	// "No document matches" only once every document is loaded.
 	const complete = clientListed(legal, 2, rows, 1_000, false);
 	assert.deepEqual(resolveScope(scope, complete, 2_000).objectIds, []);
@@ -606,6 +606,14 @@ test('a listing that stopped short never resolves the scope from the rows it loa
 	assert.equal(over.overflow, 2_500);
 	assert.deepEqual(scopeReadiness(over, 2_000, big), { phase: 'overflow', reason: 'Scope too large for the map, search and chat (at least 2,500 documents; at most 2,000). Narrow the folder.' });
 	assert.equal(tooLargeText(2_500, 2_000, true), 'Scope too large for the map, search and chat (at least 2,500 documents; at most 2,000). Narrow the folder.');
+});
+
+test('a capped listing says how far Load more goes: the documents still to list when the store counted them, and 5,000 a click', () => {
+	const T = "so the scope's documents are not all known: the map, search and chat are not scoped.";
+	assert.equal(scopePartialText('capped', 5_000, 10_000), `Only 5,000 of 10,000 documents are loaded, ${T} Load more to include the other 5,000.`, 'one click lists the rest');
+	assert.equal(scopePartialText('capped', 125_000, 1_000_000), `Only 125,000 of 1,000,000 documents are loaded, ${T} Load more to include the other 875,000 (5,000 at a time).`);
+	assert.equal(scopePartialText('capped', 125_000, null), `Only 125,000 documents are loaded and more may exist, ${T} Load more to include them (5,000 at a time).`);
+	assert.equal(scopePartialText('capped', 5_000, 4_000), `Only 5,000 documents are loaded and more may exist, ${T} Load more to include them (5,000 at a time).`, 'a total under the loaded rows is not a count of what is left');
 });
 
 test("the directory's empty text says when only the loaded documents were matched", () => {
