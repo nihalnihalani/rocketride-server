@@ -11,7 +11,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import type { IDocumentItem, IDocumentsFilter, IScopeState } from '../src/contract/types';
 import { DOCUMENTS_FILTER_KEYS } from '../src/contract/types';
-import { pagerApplyPage, pagerBegin, pagerInit } from '../src/vector/documents';
+import { pagerApplyPage, pagerBegin, pagerFail, pagerInit } from '../src/vector/documents';
 import type { IPagerState } from '../src/vector/documents';
 import { EMPTY_FILTER, FILTER_TEXT_MAX, clientKeys, conditionAvailability, conditionsFilter, directoryView, scopeView, conditionLabel, dateToIso, describeFilter, fromDocumentsFilter, listingFilter, matches, parseFilter, removeCondition, resolveScope, sameFilter, scopeAvailability, scopeFromFilter, scopeWith, filterOf, withText, scopeObjectIds, scopeStatusText, scopeStripText, setCondition, toDocumentsFilter, tooLargeText, validateFilter } from '../src/vector/filters';
 import type { IFilter } from '../src/vector/filters';
@@ -237,6 +237,7 @@ test('the status line under the bar: store, partly here, or here over what is lo
 	assert.equal(scopeStatusText({ applied: 'here', ignored: [], count: 12, loaded: 1_200, total: null, settled: true }), '12 of 1,200 loaded match (filtered here)');
 	assert.equal(scopeStatusText({ applied: 'partial', ignored: ['ingested_after'], count: 12, loaded: 5_000, total: 8_000, settled: true, exact: false }), '12 of 5,000 loaded match (store; ingest dates filtered here)', 'counted here over a listing that stopped short');
 	assert.equal(scopeStatusText({ applied: 'server', ignored: [], count: 5_000, loaded: 5_000, total: null, settled: true, exact: false }), '5,000 of 5,000 loaded match (store)');
+	assert.equal(scopeStatusText({ applied: 'pending', ignored: [], count: 0, loaded: 0, total: null, settled: false }), 'Loading the documents in scope…', 'the store has not answered: nothing about what it applies');
 });
 
 test('the scope too large for the map, search and chat: the sentence, and those three toggles disabled with it', () => {
@@ -376,6 +377,38 @@ test('a listing that stopped short (capped, stalled): a count matched here is "N
 	assert.equal(noTotal.status, 'capped');
 	assert.equal(directoryView(noTotal, scopeOf({ path_prefix: 'C:/demo/' }), '', 2_000).summary, '5,000 of 5,000 loaded match (store)');
 	assert.equal(resolveScope(scopeOf({ path_prefix: 'C:/demo/' }), noTotal, 2_000).overflow, 5_000, 'at least 5,000: above the cap all the same');
+});
+
+test('before the store answers for a scope: no word about what it applies and no count, while it loads or after its first page failed', () => {
+	const filter: IDocumentsFilter = { path_prefix: 'C:/demo/handbooks/', path_contains: 'fal' };
+	const scope = scopeOf(filter);
+	const stats = { documents: 42 };
+	// The first page is on its way (a settled keystroke on a store that applies the path box lists again).
+	const loading = pagerBegin(pagerInit(), filter);
+	const view = scopeView(scope, loading, 2_000);
+	assert.equal(view.applied, 'pending');
+	const pending = directoryView(loading, scope, 'fal', 2_000);
+	assert.equal(pending.summary, 'Loading the documents in scope…');
+	assert.equal(scopeStripText(view, stats), 'Scope: loading…');
+	assert.equal(resolveScope(scope, loading, 2_000).objectIds, null);
+	// The first page failed: the footer's error and Retry speak; the scope resolves to nothing known, so no toggle claims an empty match.
+	const failed = pagerFail(loading, { headline: 'The store did not answer in time.' });
+	assert.equal(scopeView(scope, failed, 2_000).applied, 'pending');
+	assert.equal(directoryView(failed, scope, 'fal', 2_000).summary, null);
+	assert.equal(scopeStripText(scopeView(scope, failed, 2_000), stats), 'Scope: not counted (the listing did not load)');
+	const unresolved = resolveScope(scope, failed, 2_000);
+	assert.equal(unresolved.objectIds, null);
+	for (const target of ['map', 'search', 'chat'] as const) assert.deepEqual(scopeAvailability(unresolved, 2_000)[target], { enabled: true, reason: null }, target);
+	// The Documents toggle just turned off while the scoped listing loads: still nothing about the store.
+	assert.equal(directoryView(loading, scopeOf(filter, { documents: false }), 'fal', 2_000).summary, 'Loading the documents in scope…');
+	for (const words of [pending.summary, scopeStripText(view, stats), directoryView(failed, scope, 'fal', 2_000).summary]) assert.doesNotMatch(words ?? '', /cannot filter|at least|0 of 0/);
+	// Once the store answers, its own words: 'none' keeps its sentence, 'server' counts.
+	const none = pagerApplyPage(loading, readDocumentsPage({ ...fixture('documents_filter_client'), next_cursor: null }));
+	assert.equal(none.filterApplied, 'none');
+	assert.match(directoryView(none, scope, 'fal', 2_000).summary ?? '', /\(filtered here; the store cannot filter by these\)$/);
+	const server = pagerApplyPage(loading, readDocumentsPage({ success: true, items: [], next_cursor: null, total: 0, counts_exact: true, distinct: true, sorted: true, caveats: [], filter_applied: 'server', filter_ignored: [] }));
+	assert.equal(directoryView(server, scope, 'fal', 2_000).summary, '0 documents match (store)');
+	assert.equal(scopeStripText(scopeView(scope, server, 2_000), stats), 'Scope: 0 of 42 documents · 0 chunks (counted here)');
 });
 
 test('above the cap: overflow with the count (from the store total when it said), no ids; resolution is stable', () => {

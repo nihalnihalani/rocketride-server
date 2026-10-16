@@ -18,7 +18,8 @@ import { makeConsoleActions } from '../src/adapters/consoleActions';
 import { QUICK_STATS_INTERVAL_MS } from '../src/vector/budgets';
 import { chatScopeFor } from '../src/vector/consoleModel';
 import { createConsoleStore } from '../src/vector/consoleStore';
-import { directoryView } from '../src/vector/filters';
+import { pagerFooter } from '../src/vector/documents';
+import { directoryView, scopeStripText } from '../src/vector/filters';
 import { DEFAULT_LIMITS } from '../src/vector/results';
 import type { IConsoleDeps } from '../src/vector/consoleStore';
 import { readChunksPage, readDocumentsPage, readRemoveResult, readStats } from '../src/vector/results';
@@ -580,6 +581,79 @@ test("the directory's status line says how much the store applied: server, parti
 	const box = directoryView(store.getState().directory, null, 'orchid', 2_000);
 	assert.equal(box.rows.length, 2, 'no scope: the path box filters what is loaded, as before');
 	assert.equal(box.summary, '2 of 7 documents');
+	store.dispose();
+});
+
+test('typing in the path box on a store that applies it: between the listings the line says the scope is loading, never that the store cannot filter', async () => {
+	const { store, clock, filters } = scoped('documents_filter_server');
+	const greenhouse = { path_prefix: 'C:/demo/greenhouse/' };
+	let filter: IDocumentsFilter = greenhouse;
+	let text = '';
+	const scope = (): IScopeState => ({ filter, label: '', objectIds: null, overflow: null, applyTo: { documents: true, map: true, search: true, chat: true } });
+	const lines: Array<{ status: string | null; strip: string }> = [];
+	const unsubscribe = store.subscribe(() => {
+		const view = directoryView(store.getState().directory, scope(), text, 2_000);
+		lines.push({ status: view.summary, strip: view.scope ? scopeStripText(view.scope, { documents: 42 }) : '' });
+	});
+	store.setFilter(greenhouse);
+	store.open();
+	await clock.settle();
+	const before = lines.length;
+	// Two settled box texts: each lists again (the store applies path_contains).
+	for (const typed of ['orc', 'orchid']) {
+		text = typed;
+		filter = { ...greenhouse, path_contains: typed };
+		store.setFilter(filter);
+		await clock.settle();
+	}
+	unsubscribe();
+	assert.deepEqual(
+		filters.slice(-2),
+		[
+			{ ...greenhouse, path_contains: 'orc' },
+			{ ...greenhouse, path_contains: 'orchid' },
+		],
+		'each settled text asked the store'
+	);
+	const typing = lines.slice(before);
+	assert.ok(
+		typing.some((l) => l.status === 'Loading the documents in scope…' && l.strip === 'Scope: loading…'),
+		'between the listings: loading'
+	);
+	assert.deepEqual(
+		typing.filter((l) => /cannot filter|0 of 0|at least/.test(`${l.status} ${l.strip}`)),
+		[],
+		'nothing about what the store cannot filter, no count of nothing loaded'
+	);
+	assert.equal(typing[typing.length - 1]?.status, '2 documents match (store)');
+	store.dispose();
+});
+
+test("a scope's first page fails: no status line about the store (the footer's error and Retry speak), and Retry lists it", async () => {
+	let fail = true;
+	const greenhouse = { path_prefix: 'C:/demo/greenhouse/' };
+	const { store, clock } = harness({
+		documents: async (_cursor, _limit, filter) => {
+			if (filter && fail) throw new ExplorerToolError({ kind: 'timeout', tool: 'documents', message: 'Stopped waiting for documents after 40 s.' });
+			return readDocumentsPage(filter ? fixture('documents_filter_server') : fixture('documents_page1'));
+		},
+	});
+	const scope: IScopeState = { filter: greenhouse, label: '', objectIds: null, overflow: null, applyTo: { documents: true, map: true, search: true, chat: true } };
+	store.setFilter(greenhouse);
+	store.open();
+	await clock.settle();
+	const failed = store.getState().directory;
+	assert.equal(failed.status, 'error');
+	assert.equal(failed.pages, 0);
+	const view = directoryView(failed, scope, '', 2_000);
+	assert.equal(view.summary, null);
+	assert.equal(view.scope?.applied, 'pending');
+	assert.equal(scopeStripText(view.scope!, { documents: 42 }), 'Scope: not counted (the listing did not load)');
+	assert.equal(pagerFooter(failed)?.retry, true, 'the footer offers Retry');
+	fail = false;
+	store.retryDocuments();
+	await clock.settle();
+	assert.equal(directoryView(store.getState().directory, scope, '', 2_000).summary, '2 documents match (store)');
 	store.dispose();
 });
 

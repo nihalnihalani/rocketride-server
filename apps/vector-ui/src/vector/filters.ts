@@ -37,9 +37,12 @@
 // nothing because it ignored the filter). Whatever the store did not apply is
 // matched here over the loaded rows (`clientKeys`, `matches`), and the words
 // always say which ("(store)", "(store; the path text filtered here)",
-// "(filtered here; the store cannot filter by these)"). A count matched here
-// over a listing that stopped short (capped, stalled) is only of the rows
-// loaded, and the words say that too ("N of M loaded match", "at least").
+// "(filtered here; the store cannot filter by these)"). Until the store
+// answers for a scope (its first page on its way, or failed) nothing is said
+// about what it applies and nothing is counted: the scope is loading
+// (`'pending'`). A count matched here over a listing that stopped short
+// (capped, stalled) is only of the rows loaded, and the words say that too
+// ("N of M loaded match", "at least").
 // Without a condition the path box is not a scope and is never sent: it
 // filters what is loaded, as it always did. A saved filter keeps the
 // conditions only (`conditionsFilter`).
@@ -554,8 +557,11 @@ export interface IScopeView {
 	current: boolean;
 	/** The listing is current and ended (complete, capped, stopped). */
 	settled: boolean;
-	/** How the store answered for this scope: 'here' when the listing did not ask it. */
-	applied: FilterApplied | 'here';
+	/**
+	 * How the store answered for this scope: 'here' when the listing did not ask it; 'pending' while the
+	 * listing asked and the store has not answered yet (its first page is on its way, or failed).
+	 */
+	applied: FilterApplied | 'here' | 'pending';
 	ignored: string[];
 	/** The store's total for the listing, when it gave one. */
 	total: number | null;
@@ -580,7 +586,8 @@ export function scopeView(scope: Pick<IScopeState, 'filter'> & { applyTo?: Pick<
 	const asked = dir.filter !== null && sameFilter(dir.filter, wanted);
 	// While the list is filtered by the scope, the listing must be the one that asked for it; otherwise an unfiltered one.
 	const current = (scope.applyTo?.documents ?? true) && wanted !== null ? asked : dir.filter === null;
-	const applied: FilterApplied | 'here' = asked ? (dir.filterApplied ?? 'none') : 'here';
+	// Asked, and no page answered yet: nothing is known about what the store applies (never 'none').
+	const applied: IScopeView['applied'] = asked ? (dir.filterApplied ?? 'pending') : 'here';
 	const keys = clientKeys(scope.filter, asked ? dir.filterApplied : null, dir.filterIgnored);
 	const match = scopeObjectIds(dir.rows, scope.filter, cap, keys);
 	const storeCounts = applied === 'server' && keys.length === 0 && dir.total !== null;
@@ -603,7 +610,8 @@ export function scopeView(scope: Pick<IScopeState, 'filter'> & { applyTo?: Pick<
 export function resolveScope(scope: IScopeState, dir: IPagerState, cap: number): IScopeState {
 	const view = scopeView(scope, dir, cap);
 	const overflow = view.current && view.count > cap ? view.count : null;
-	const objectIds = overflow === null && view.settled ? view.ids : null;
+	// A listing the store never answered (a failed first page) settles nothing: no empty scope is claimed.
+	const objectIds = overflow === null && view.settled && view.applied !== 'pending' ? view.ids : null;
 	const label = describeFilter(scope.filter);
 	const sameIds = scope.objectIds === objectIds || (scope.objectIds !== null && objectIds !== null && scope.objectIds.length === objectIds.length && scope.objectIds.every((id, i) => id === objectIds[i]));
 	if (sameIds && scope.overflow === overflow && scope.label === label) return scope;
@@ -682,6 +690,9 @@ export interface IDirectoryView {
 	scope: IScopeView | null;
 }
 
+/** The status line while the store has not answered for a scope yet. */
+export const SCOPE_LOADING_TEXT = 'Loading the documents in scope…';
+
 /**
  * The directory's rows and status line. Without a scope the path box filters
  * what is loaded, as it always did. With one, the rows are the listing's
@@ -701,10 +712,10 @@ export function directoryView(dir: IPagerState, scope: IScopeState | null, text:
 		return { rows, summary: filterSummary(dir, text, rows.length), scope: null };
 	}
 	const view = scopeView(scope, dir, cap);
-	if (!scope.applyTo.documents) {
-		const rows = filterItems(dir.rows, text);
-		return { rows, summary: `Not applied to this list. Scope: ${scopeStatusText(view)}`, scope: view };
-	}
+	const listed = scope.applyTo.documents ? null : filterItems(dir.rows, text);
+	// The store has not answered for the scope: say it is loading (a failed first page: the footer says why, with Retry).
+	if (view.applied === 'pending') return { rows: listed ?? [], summary: dir.status === 'loading' ? SCOPE_LOADING_TEXT : null, scope: view };
+	if (listed !== null) return { rows: listed, summary: `Not applied to this list. Scope: ${scopeStatusText(view)}`, scope: view };
 	const asked = view.applied !== 'here';
 	const keys = clientKeys(scope.filter, asked ? dir.filterApplied : null, dir.filterIgnored);
 	const rows = keys.length === 0 ? [...dir.rows] : dir.rows.filter((row) => matches(row, scope.filter, keys));
@@ -764,6 +775,8 @@ export function scopeStatusText(view: Pick<IScopeView, 'applied' | 'ignored' | '
 		}
 		case 'none':
 			return `${view.count.toLocaleString('en-US')} of ${view.loaded.toLocaleString('en-US')} loaded match (filtered here; the store cannot filter by these)`;
+		case 'pending':
+			return SCOPE_LOADING_TEXT;
 		default:
 			return `${view.count.toLocaleString('en-US')} of ${view.loaded.toLocaleString('en-US')} loaded match (filtered here)`;
 	}
@@ -802,11 +815,15 @@ export function scopeAvailability(scope: IScopeState, cap: number): Record<keyof
  * scope's own (`exact` false: matched over the rows loaded so far) is "at
  * least", in the rows loaded.
  *
- * @param view - The scope's count, its chunks (summed here), whether the listing settled, how many rows are loaded and whether the count is the scope's own (default true).
+ * Before the store answered for the scope (`applied` 'pending') nothing is
+ * counted: "Scope: loading…", or after a failed first page "not counted".
+ *
+ * @param view - The scope's count, its chunks (summed here), whether the listing settled, how many rows are loaded, whether the count is the scope's own (default true) and how the store answered.
  * @param stats - The last stats answer (its document count), or null.
  * @returns e.g. 'Scope: 12 of 42 documents · 318 chunks (counted here)'.
  */
-export function scopeStripText(view: Pick<IScopeView, 'count' | 'chunks' | 'settled' | 'loaded'> & { exact?: boolean }, stats: Pick<IStatsView, 'documents'> | Pick<IStatsResult, 'documents'> | null): string {
+export function scopeStripText(view: Pick<IScopeView, 'count' | 'chunks' | 'settled' | 'loaded'> & { exact?: boolean; applied?: IScopeView['applied'] }, stats: Pick<IStatsView, 'documents'> | Pick<IStatsResult, 'documents'> | null): string {
+	if (view.applied === 'pending') return view.settled ? 'Scope: not counted (the listing did not load)' : 'Scope: loading…';
 	const of = stats?.documents ?? null;
 	const exact = view.exact !== false;
 	const docs = `${exact ? '' : 'at least '}${of === null ? plural(view.count, 'document', 'documents') : `${view.count.toLocaleString('en-US')} of ${plural(of, 'document', 'documents')}`}`;

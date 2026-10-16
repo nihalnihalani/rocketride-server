@@ -20,7 +20,7 @@ import { test } from 'node:test';
 import React from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import type { IRoleChannel } from 'shared/explorer';
-import type { ConsoleActions, ConsoleModel, IDialectResult, IDocumentItem, VectorChannels } from '../src/contract/types';
+import type { ConsoleActions, ConsoleModel, IDialectResult, IDocumentItem, IScopeState, VectorChannels } from '../src/contract/types';
 import { fixture } from './support/fixtures';
 
 // The shell's building blocks exist only inside a running shell: plain stand-ins that render their text.
@@ -57,7 +57,7 @@ const { HealthPanel } = require('../src/components/HealthPanel') as typeof impor
 const { healthSummary } = require('../src/vector/health') as typeof import('../src/vector/health');
 const { readDialect } = require('../src/vector/results') as typeof import('../src/vector/results');
 const { DocumentView } = require('../src/views/DocumentView') as typeof import('../src/views/DocumentView');
-const { pagerApplyPage, pagerBegin, pagerInit } = require('../src/vector/documents') as typeof import('../src/vector/documents');
+const { pagerApplyPage, pagerBegin, pagerFail, pagerInit } = require('../src/vector/documents') as typeof import('../src/vector/documents');
 const { readDocumentsPage, readStats } = require('../src/vector/results') as typeof import('../src/vector/results');
 
 const dialect = fixture<IDialectResult>('dialect_pgvector');
@@ -209,4 +209,21 @@ test('an oversize document stays in its folder with a muted "oversize" badge; it
 	assert.doesNotMatch(html, /Needs attention/);
 	assert.match(html, /<span style="[^"]*var\(--rr-border-input\)[^"]*" data-flag="">oversize<\/span>/);
 	assert.match(html, /title="C:\/corp\/handbooks\/manual\.pdf · [^"]*· oversize · objectId manual-1"/);
+});
+
+/** A scope over a filter, on every surface unless told otherwise, not resolved yet. */
+function scopeOf(filter: IScopeState['filter'], documents = true): IScopeState {
+	return { filter, label: '', objectIds: null, overflow: null, applyTo: { documents, map: true, search: true, chat: true } };
+}
+
+test("a scope's listing before the store answers: the status line says it is loading, never what the store cannot filter; a failed first page leaves the error and Retry to the footer", () => {
+	const filter = { path_prefix: 'C:/demo/greenhouse/', path_contains: 'orc' };
+	const directory = (pager: ReturnType<typeof pagerInit>): string => renderToStaticMarkup(<DocumentDirectory pager={pager} selectedId={null} writes={on} onSelect={noop} onRemove={noop} onLoadMore={noop} onRetry={noop} scope={scopeOf(filter)} onScope={noop} />);
+	const loading = pagerBegin(pagerInit(), filter);
+	const html = directory(loading);
+	assert.match(html, /role="status">Loading the documents in scope…<\/div>/);
+	assert.doesNotMatch(html, /cannot filter|0 of 0 loaded/);
+	const failed = directory(pagerFail(loading, { headline: 'The store did not answer in time.' }));
+	assert.doesNotMatch(failed, /role="status">[^<]*(match|cannot filter|Loading)/, 'no status line about the scope');
+	assert.match(failed, /<span>Loading stopped at 0 documents: The store did not answer in time\.<\/span><button[^>]*>Retry<\/button>/);
 });
