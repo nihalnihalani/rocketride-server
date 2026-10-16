@@ -780,7 +780,10 @@ test("the map runs Recommend on the store node and keeps the examples in the con
 
 test('the inspector gets the full text with its loader, its connection and the query whose words it marks, Add as example with its side, and the tree neighbours', { skip: NEEDS_MAP }, () => {
 	const inspector = element(source('views/MapView.tsx'), 'PointInspector');
-	for (const prop of ['connectionKey=', 'query=', 'onAddExample=', 'examplePolarity=', 'treeNeighbours=']) assert.ok(inspector.includes(prop), `<PointInspector> is given ${prop}`);
+	for (const prop of ['connectionKey=', 'query=', 'onAddExample=', 'examplePolarity=', 'treeNeighbours=']) {
+		assert.ok(inspector.includes(prop), `<PointInspector> is given ${prop}`);
+		assert.doesNotMatch(inspector, new RegExp(`\\b${prop}\\{\\s*(null|undefined)\\s*\\}`), `<PointInspector> is given ${prop} a value, not a bare null or undefined`);
+	}
 	assert.ok(/loadText=\{[\s\S]*fetchChunkText\(/.test(inspector) || inspector.includes('onShowText='), '<PointInspector> is given loadText (fetchChunkText) or onShowText');
 });
 
