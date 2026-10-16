@@ -92,7 +92,9 @@
  *     chunks pins at most 200 of them
  *   health (P1-7, postgres): the legacy card lists the chunk-0-less document
  *     and the document with one deleted chunk
- *   restore: the removed demo documents are back, the lane's own gone
+ *   restore: the removed demo documents are back, the lane's own gone (the
+ *     ones the store holds removed on the page; whatever the page left is
+ *     then removed through the store, so the next run starts clean)
  *   sign-out: saved views and saved filters are gone after signing in again
  *   privacy (B4): over every frame (similarity_matrix rows exempt only at
  *     their own n) and every downloaded file
@@ -2380,29 +2382,40 @@ async function drive(fixtureKey, base, out, planned, step) {
 			const box = visible(page.getByRole('searchbox', { name: 'Filter documents by path' }));
 			await box.fill(`enrich-${run}`);
 			await C.sleep(1000);
-			for (const p of ownUploads) {
-				await button(CONSOLE.trash(p)).click();
-				await answerRemoval(true, 1);
-				await C.sleep(1500);
+			const holds = async (name) => {
+				const answer = await store.tool(fixture, 'chunks', { object_id: C.objectId(name), limit: 1 });
+				return !!(answer && Array.isArray(answer.items) && answer.items.length);
+			};
+			// Only an upload the store holds has a row to remove (a file the drop did not add has none);
+			// one removal that fails does not keep the others from being tried.
+			const stored = [];
+			for (const p of ownUploads) if (await holds(p)) stored.push(p);
+			const refused = [];
+			for (const p of stored) {
+				try {
+					await button(CONSOLE.trash(p)).click();
+					await answerRemoval(true, 1);
+					await C.sleep(1500);
+				} catch (e) {
+					refused.push(`${p}: ${String(e && e.message ? e.message : e).split('\n')[0]}`);
+				}
 			}
 			await box.fill('');
 			const back = [];
-			for (const f of again) {
-				const answer = await store.tool(fixture, 'chunks', { object_id: C.objectId(f.name), limit: 1 });
-				back.push(!!(answer && Array.isArray(answer.items) && answer.items.length));
-			}
+			for (const f of again) back.push(await holds(f.name));
 			const gone = [];
-			for (const p of ownUploads) {
-				const answer = await store.tool(fixture, 'chunks', { object_id: C.objectId(p), limit: 1 });
-				gone.push(!(answer && Array.isArray(answer.items) && answer.items.length));
-			}
-			note({ restored: again.map((f) => f.name), back, ownUploads, gone });
+			for (const p of ownUploads) gone.push(!(await holds(p)));
+			// What the page left behind goes through the store, so the next run starts from the corpus as it was (the verdict is the page's).
+			const left = ownUploads.filter((_, i) => !gone[i]);
+			const cleaned = left.length ? await store.tool(fixture, 'remove_document', { object_ids: left.map((p) => C.objectId(p)) }).catch((e) => ({ error: String(e && e.message ? e.message : e) })) : null;
+			note({ restored: again.map((f) => f.name), back, ownUploads, stored, refused, gone, cleanedThroughStore: left, cleaned: cleaned && (cleaned.removed || cleaned.error || cleaned.code) });
 			// Nothing removed or nothing uploaded means the write steps did not run: there was nothing to put back.
 			if (!removedDemo.size) return 'no demo document was removed (the removal steps did not run), so nothing was restored';
 			if (!ownUploads.length) return 'the lane uploaded nothing (the ingest summary step did not run), so nothing was cleaned up';
 			if (again.length !== removedDemo.size) return `${removedDemo.size - again.length} removed documents are not in the corpus`;
 			if (back.some((b) => !b)) return 'a removed demo document is not back';
-			return gone.every(Boolean) ? true : "one of the lane's uploads is still stored";
+			if (refused.length) return `the page did not remove ${refused[0]} (removed through the store instead)`;
+			return gone.every(Boolean) ? true : "one of the lane's uploads is still stored (removed through the store instead)";
 		});
 
 		await step(page, STEP_TITLES['sign-out'], async (note) => {
