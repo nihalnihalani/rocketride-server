@@ -50,7 +50,7 @@
 // once, when they are known.
 // =============================================================================
 
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { Availability, IDocumentsFilter, IScopeState } from '../contract/types';
 import { Banner, Button, ContentHeader, EmptyState, ToggleGroup, useShellConnection } from 'shell';
 import type { IExplorerEndpoint } from 'shared/explorer';
@@ -180,12 +180,16 @@ export const ConsoleView: React.FC<IConsoleViewProps> = ({ opened, active }) => 
 		return healthSummary(state.directory.rows, { medianChunks: settled ? medianChunks(state.directory.rows) : null, complete: state.directory.status === 'done' && state.directory.filter === null });
 	}, [state.directory]);
 	// A chart's bar sets its kind of condition (a chunk range, a file type, a period) and keeps the others.
-	const scopeFromChart = (filter: IDocumentsFilter): void => {
-		const next = scopeWith(scope, scope?.filter.path_contains ?? '', filter);
-		const refused = checkScope(next);
-		if (refused !== null) announcer.announce(refused);
-		else entry.scope.set(next);
-	};
+	// Kept between renders so the memoised charts are not drawn again for nothing.
+	const scopeFromChart = useCallback(
+		(filter: IDocumentsFilter): void => {
+			const next = scopeWith(scope, scope?.filter.path_contains ?? '', filter);
+			const refused = checkScope(next);
+			if (refused !== null) announcer.announce(refused);
+			else entry.scope.set(next);
+		},
+		[scope, entry]
+	);
 
 	// Saved filters: per connection, in memory (the app's map, emptied on a change of identity).
 	const savedStore = useMemo(() => savedFiltersFor(savedFilters, entry.key), [entry.key]);

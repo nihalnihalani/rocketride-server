@@ -10,7 +10,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import type { IDocumentItem, ISampleModel, ISampleResult } from '../src/contract/types';
-import { binCounts, byFileType, byIngestPeriod, chunksPerDocument, collectionCharts, lengthBins, logBins, median } from '../src/vector/charts';
+import { MAX_PERIOD_BINS, binCounts, byFileType, byIngestPeriod, chunksPerDocument, collectionCharts, lengthBins, logBins, median } from '../src/vector/charts';
 import { validateFilter } from '../src/vector/filters';
 import { readDialect, readDocumentsPage } from '../src/vector/results';
 import { fixture } from './support/fixtures';
@@ -155,7 +155,58 @@ test('ingested over time: by day within a month, by week within half a year, els
 	assert.deepEqual(months.bins.map((b) => b.label).slice(0, 2), ['2025-12', '2026-01']);
 	assert.equal(months.bins.length, 11);
 	assert.deepEqual(months.bins[0]?.scope, { ingested_after: '2025-12-01T00:00:00Z', ingested_before: '2026-01-01T00:00:00Z' });
-	assert.deepEqual(byIngestPeriod([doc('a', 'a')]), { unit: 'day', bins: [], dated: 0 });
+	assert.deepEqual(byIngestPeriod([doc('a', 'a')]), { unit: 'day', bins: [], dated: 0, outside: 0 });
+});
+
+/** The console's clock in these tests. */
+const NOW = Date.parse('2026-10-16T09:00:00Z');
+
+test('one far-off ingest time never makes the ingest chart thousands of bars: it is folded into an "earlier" or "later" bar with no scope', () => {
+	const rows = [doc('a', 'a', { ingestedAt: '2026-10-01T09:00:00Z' }), doc('b', 'b', { ingestedAt: '2026-10-08T10:00:00Z' }), doc('c', 'c', { ingestedAt: '9999-12-31T23:59:59Z' }), doc('d', 'd', { ingestedAt: '0001-01-01T00:00:00Z' }), doc('e', 'e', { ingestedAt: '1970-01-01T00:00:00Z' }), doc('f', 'f', { ingestedAt: '+010000-01-01T00:00:00Z' })];
+	const periods = byIngestPeriod(rows, NOW);
+	assert.equal(periods.unit, 'day', 'the span of the plausible times picks the unit');
+	assert.equal(periods.dated, 6);
+	assert.equal(periods.outside, 4);
+	assert.ok(periods.bins.length <= MAX_PERIOD_BINS + 2, `${periods.bins.length} bins`);
+	const first = periods.bins[0];
+	const last = periods.bins[periods.bins.length - 1];
+	assert.deepEqual([first?.label, first?.count, first?.scope], ['before 2000-01-01', 2, null]);
+	assert.deepEqual([last?.label, last?.count, last?.scope], ['after 2027-10-16', 2, null]);
+	assert.deepEqual(
+		periods.bins.slice(1, -1).map((b) => b.label),
+		['2026-10-01', '2026-10-02', '2026-10-03', '2026-10-04', '2026-10-05', '2026-10-06', '2026-10-07', '2026-10-08']
+	);
+	const chart = collectionCharts({ rows, total: null, sample: null, dialect: null, loading: false, now: NOW }).find((c) => c.id === 'ingest');
+	assert.equal(chart?.caption, 'by day · 6 documents · 4 ingest times outside 2000-01-01 to 2027-10-16, shown apart');
+	// Only times out of range: their bars, and no unit to speak of.
+	const odd = byIngestPeriod([doc('x', 'x', { ingestedAt: '1970-01-01T00:00:00Z' })], NOW);
+	assert.deepEqual(
+		odd.bins.map((b) => [b.label, b.count, b.scope]),
+		[['before 2000-01-01', 1, null]]
+	);
+	assert.equal(collectionCharts({ rows: [doc('x', 'x', { ingestedAt: '1970-01-01T00:00:00Z' })], total: null, sample: null, dialect: null, loading: false, now: NOW }).find((c) => c.id === 'ingest')?.caption, '1 document · 1 ingest time outside 2000-01-01 to 2027-10-16, shown apart');
+});
+
+test('long spans step up to quarters and years, never past the cap, and every period bar scopes to what the node accepts', () => {
+	const span = (from: string, to: string) => byIngestPeriod([doc('a', 'a', { ingestedAt: from }), doc('b', 'b', { ingestedAt: to })], NOW);
+	const months = span('2022-01-15T00:00:00Z', '2026-10-01T00:00:00Z');
+	assert.equal(months.unit, 'month', '58 months');
+	assert.equal(months.bins.length, 58);
+	const quarters = span('2014-02-01T00:00:00Z', '2026-10-01T00:00:00Z');
+	assert.equal(quarters.unit, 'quarter');
+	assert.equal(quarters.bins[0]?.label, '2014 Q1');
+	assert.deepEqual(quarters.bins[0]?.scope, { ingested_after: '2014-01-01T00:00:00Z', ingested_before: '2014-04-01T00:00:00Z' });
+	const years = span('2000-03-01T00:00:00Z', '2026-10-01T00:00:00Z');
+	assert.equal(years.unit, 'year');
+	assert.deepEqual([years.bins[0]?.label, years.bins.length, years.bins[0]?.scope], ['2000', 27, { ingested_after: '2000-01-01T00:00:00Z', ingested_before: '2001-01-01T00:00:00Z' }]);
+	for (const periods of [months, quarters, years]) {
+		assert.ok(periods.bins.length <= MAX_PERIOD_BINS);
+		for (const bin of periods.bins) assert.equal(validateFilter(bin.scope), null, bin.label);
+	}
+	// Decades from now the window still holds at most the cap of years.
+	const later = byIngestPeriod([doc('a', 'a', { ingestedAt: '2000-01-01T00:00:00Z' }), doc('b', 'b', { ingestedAt: '2079-06-01T00:00:00Z' })], Date.parse('2080-01-01T00:00:00Z'));
+	assert.ok(later.bins.length <= MAX_PERIOD_BINS + 2, `${later.bins.length} bins`);
+	assert.equal(later.bins[0]?.label, 'before 2031-01-01');
 });
 
 test('the four charts: their states (disabled under extras_not_stored, partial coverage, loading), sources and coverage', () => {

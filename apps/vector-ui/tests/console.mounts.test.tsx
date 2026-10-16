@@ -60,7 +60,7 @@ require.cache[exportMenuPath] = { id: exportMenuPath, filename: exportMenuPath, 
 
 const { createSelectionStore } = require('../src/contract/bridge') as typeof import('../src/contract/bridge');
 const { DocumentDirectory } = require('../src/components/DocumentDirectory') as typeof import('../src/components/DocumentDirectory');
-const { StatsStrip } = require('../src/components/StatsStrip') as typeof import('../src/components/StatsStrip');
+const { StatsAsOf, StatsStrip } = require('../src/components/StatsStrip') as typeof import('../src/components/StatsStrip');
 const { StatsCharts } = require('../src/components/StatsCharts') as typeof import('../src/components/StatsCharts');
 const { HealthPanel } = require('../src/components/HealthPanel') as typeof import('../src/components/HealthPanel');
 const { healthSummary } = require('../src/vector/health') as typeof import('../src/vector/health');
@@ -141,6 +141,49 @@ test('the charts mark the bar the scope selected (pressed, outlined) and say wha
 	assert.match(loading, /<svg aria-hidden="true"/, 'skeleton bars');
 	assert.match(loading, /role="status"[^>]*>Loading documents…</);
 	assert.match(renderToStaticMarkup(<StatsCharts rows={[]} dialect={dialect} />), /No documents to chart yet\./);
+});
+
+/** Every element in a React tree (function components are not called). */
+function elementsOf(node: React.ReactNode, out: React.ReactElement[] = []): React.ReactElement[] {
+	if (Array.isArray(node)) for (const child of node) elementsOf(child, out);
+	else if (React.isValidElement(node)) {
+		out.push(node);
+		elementsOf((node.props as { children?: React.ReactNode }).children, out);
+	}
+	return out;
+}
+
+test("the strip's one-second clock re-renders only the 'counts as of' words, never the charts", () => {
+	const rows: IDocumentItem[] = readDocumentsPage(fixture('documents_page1')).items;
+	const stats = { view: readStats(fixture('stats_pgvector')), status: 'ready' as const, error: null, lastAt: 0, mode: 'full' as const };
+	const onScope = (): void => undefined;
+	const props = { stats, dialect, readOnly: false, documents: rows, onScope };
+	// The strip itself keeps no state (called outside React, a hook would throw): the clock lives in StatsAsOf.
+	const tree = (): React.ReactElement[] => elementsOf(StatsStrip(props));
+	const first = tree();
+	const clock = first.filter((e) => e.type === StatsAsOf);
+	assert.equal(clock.length, 1, 'one clock');
+	assert.equal((clock[0]?.props as { view: unknown }).view, stats.view);
+	// The charts are memoised on props the strip passes through unchanged, so a tick of the clock leaves them alone.
+	assert.equal((StatsCharts as unknown as { $$typeof: symbol }).$$typeof, Symbol.for('react.memo'));
+	const charts = (elements: React.ReactElement[]) => elements.find((e) => e.type === StatsCharts)?.props as Record<string, unknown>;
+	const a = charts(first);
+	const b = charts(tree());
+	assert.ok(a && b);
+	for (const key of new Set([...Object.keys(a), ...Object.keys(b)])) assert.ok(Object.is(a[key], b[key]), `${key} is the same between two renders`);
+	assert.match(renderToStaticMarkup(<StatsAsOf view={stats.view} stale={false} refreshing={false} />), /aria-live="off"/);
+});
+
+test('the ingest chart with one far-off ingest time: a few dozen bars, not ninety thousand', () => {
+	const rows: IDocumentItem[] = [...readDocumentsPage(fixture('documents_page1')).items, { ...(readDocumentsPage(fixture('documents_page1')).items[0] as IDocumentItem), objectId: 'sentinel', ingestedAt: '9999-12-31T23:59:59Z' }];
+	const started = performance.now();
+	const html = renderToStaticMarkup(<StatsCharts rows={rows} total={null} dialect={dialect} onScope={noop} />);
+	const took = performance.now() - started;
+	const ingest = html.slice(html.indexOf('data-chart="ingest"'));
+	assert.ok((ingest.match(/<rect /g) ?? []).length <= 62, `${(ingest.match(/<rect /g) ?? []).length} bars`);
+	assert.match(ingest, /<tr><td>after \d{4}-\d{2}-\d{2}<\/td><td>1<\/td><\/tr>/);
+	assert.ok(html.length < 100_000, `${html.length} characters`);
+	assert.ok(took < 200, `rendered in ${took.toFixed(1)} ms`);
 });
 
 test('the strip: a Size figure when the store reports it; no Charts disclosure for an empty collection', () => {

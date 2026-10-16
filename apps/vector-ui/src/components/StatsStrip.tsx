@@ -31,7 +31,9 @@
 // marked "last known", under the shell's error banner. The Charts disclosure
 // at the end, collapsed by default, holds the collection's charts. While a
 // scope is active a second line says what it covers ("Scope: 12 of 42
-// documents · 318 chunks (counted here)").
+// documents · 318 chunks (counted here)"). Only the "counts as of" words tick
+// once a second (StatsAsOf); the charts are memoised, so the clock never
+// draws them again.
 // =============================================================================
 
 import React, { useEffect, useState } from 'react';
@@ -76,16 +78,32 @@ function useNow(): number {
 }
 
 /**
- * The strip.
+ * "counts as of N s ago" (or "last known values", "Refreshing…"): the only
+ * part of the strip on the one-second clock, so a tick re-renders these words
+ * alone, never the figures or the charts.
+ *
+ * @param props - The stats answer, and whether it is stale or refreshing.
+ * @returns The words.
+ */
+export function StatsAsOf({ view, stale, refreshing }: { view: IStatsSlot['view']; stale: boolean; refreshing: boolean }): React.ReactElement {
+	const now = useNow();
+	const asOf = countsAsOfText(view, now);
+	return (
+		<span style={{ ...styles.small, marginLeft: 'auto' }} aria-live="off">
+			{stale ? 'last known values' : refreshing ? 'Refreshing…' : (asOf ?? '')}
+		</span>
+	);
+}
+
+/**
+ * The strip. It keeps no state of its own: the clock lives in {@link StatsAsOf}.
  *
  * @param props - {@link IStatsStripProps}.
  * @returns The strip element.
  */
 export function StatsStrip({ stats, dialect, readOnly, documents = [], scopeLine = null, sample = null, loading = false, scopeFilter = null, onScope, health = null }: IStatsStripProps): React.ReactElement {
-	const now = useNow();
 	const figures = statsFigures(stats.view, dialect);
 	const chips = statsChips({ dialect, stats: stats.view, readOnly, health });
-	const asOf = countsAsOfText(stats.view, now);
 	const pending = stats.view === null && stats.status !== 'error';
 	const stale = stats.status === 'error' && stats.view !== null;
 	// An empty collection has nothing to chart: the disclosure is left out.
@@ -116,9 +134,7 @@ export function StatsStrip({ stats, dialect, readOnly, documents = [], scopeLine
 						{chip.label}
 					</span>
 				))}
-				<span style={{ ...styles.small, marginLeft: 'auto' }} aria-live="off">
-					{stale ? 'last known values' : stats.status === 'loading' && stats.view !== null ? 'Refreshing…' : (asOf ?? '')}
-				</span>
+				<StatsAsOf view={stats.view} stale={stale} refreshing={stats.status === 'loading' && stats.view !== null} />
 				{!empty && (
 					<details style={styles.small}>
 						<summary style={{ cursor: 'pointer' }}>Charts</summary>
