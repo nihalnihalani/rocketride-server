@@ -598,30 +598,78 @@ test('matrixVerdict: the selected keys, no indices, a symmetric unit-diagonal ma
 	for (const [what, change] of Object.entries(broken)) assert.notStrictEqual(lane.matrixVerdict({ ...sound, ...change }), true, what);
 });
 
-test("selectionCsvVerdict and exportNameVerdict: one row per selected point of the sample, no vector or secret, the app's file name", () => {
+test("selectionCsvVerdict and exportNameVerdict: the rows are the Selection tab's points (its copied keys, its documents), no vector or secret, the app's file name", () => {
 	const sample = sampleOf();
 	const sampleKeys = Array.from({ length: 20 }, (_, i) => lane.keyOf(sample, i));
 	const header = 'objectId,chunkId,path,chunk_index,length,density,cluster,cluster_label,query_similarity,is_duplicate,is_outlier,x,y,z,snippet';
 	const row = (i) => `${sampleKeys[i][0]},${sampleKeys[i][1]},${lane.pathOf(sample, i)},${i},800,0.61,0,procedure · pump,,false,false,0.12,-0.5,,"a ""quoted"", snippet"`;
-	const csv = [header, row(0), row(1), row(2)].join('\r\n') + '\r\n';
+	const csvOf = (idx) => [header, ...idx.map(row)].join('\r\n') + '\r\n';
+	const range = (count) => Array.from({ length: count }, (_, i) => i);
 	const secrets = { 'the API key': 'local-acceptance-key' };
-	assert.strictEqual(lane.selectionCsvVerdict({ csv, selection: 3, sampleKeys, dim: 8, secrets }), true);
-	assert.match(lane.selectionCsvVerdict({ csv, selection: 4, sampleKeys, dim: 8, secrets }), /3 rows for 4/);
-	assert.match(lane.selectionCsvVerdict({ csv: [header, row(0), row(0)].join('\r\n'), selection: 2, sampleKeys, dim: 8, secrets }), /twice/);
-	assert.match(lane.selectionCsvVerdict({ csv: [header, row(0).replace('o-manual', 'o-gone')].join('\r\n'), selection: 1, sampleKeys, dim: 8, secrets }), /not points of the sample/);
-	assert.match(lane.selectionCsvVerdict({ csv: csv.replace('procedure · pump', 'local-acceptance-key'), selection: 3, sampleKeys, dim: 8, secrets }), /API key/);
-	assert.match(lane.selectionCsvVerdict({ csv: csv.replace('"a ""quoted"", snippet"', '"[0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8]"'), selection: 3, sampleKeys, dim: 8, secrets }), /float/);
-	assert.match(lane.selectionCsvVerdict({ csv: 'path\r\nx\r\n', selection: 1, sampleKeys, dim: 8, secrets }), /objectId column/);
+	/** The verdict on `csv` when the canvas counted, and the Selection tab holds, the points `chosen` (Copy keys gave their keys). */
+	const verdict = (csv, chosen, extra = {}) => lane.selectionCsvVerdict({ csv, selection: chosen.length, sampleKeys, dim: 8, secrets, selectedKeys: chosen.map((i) => sampleKeys[i]), tab: { points: chosen.length, documents: new Set(chosen.map((i) => sampleKeys[i][0])).size }, ...extra });
+	const csv = csvOf([0, 1, 2]);
+	assert.strictEqual(verdict(csv, [0, 1, 2]), true);
+	// The Selection tab's keys in another order are the same points.
+	assert.strictEqual(verdict(csv, [0, 1, 2], { selectedKeys: [sampleKeys[2], sampleKeys[0], sampleKeys[1]] }), true);
+	assert.match(verdict(csv, [0, 1, 2, 3]), /3 rows for 4/);
+	assert.match(verdict([header, row(0), row(0)].join('\r\n'), [0, 1]), /twice/);
+	assert.match(verdict([header, row(0).replace('o-manual', 'o-gone')].join('\r\n'), [0]), /not points of the sample/);
+	assert.match(verdict(csv.replace('procedure · pump', 'local-acceptance-key'), [0, 1, 2]), /API key/);
+	assert.match(verdict(csv.replace('"a ""quoted"", snippet"', '"[0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8]"'), [0, 1, 2]), /float/);
+	assert.match(lane.selectionCsvVerdict({ csv: 'path\r\nx\r\n', selection: 1, sampleKeys, dim: 8, secrets, selectedKeys: [sampleKeys[0]], tab: { points: 1, documents: 1 } }), /objectId column/);
 	// A lasso that took the whole sample (or nothing): its CSV cannot be told from the sample's.
-	const rows = (count) => [header, ...Array.from({ length: count }, (_, i) => row(i))].join('\r\n') + '\r\n';
-	assert.strictEqual(lane.selectionCsvVerdict({ csv: rows(19), selection: 19, sampleKeys, dim: 8, secrets }), true);
-	assert.match(lane.selectionCsvVerdict({ csv: rows(20), selection: 20, sampleKeys, dim: 8, secrets }), /every point of the sample/);
-	assert.match(lane.selectionCsvVerdict({ csv: rows(0), selection: 0, sampleKeys, dim: 8, secrets }), /no point/);
+	assert.strictEqual(verdict(csvOf(range(19)), range(19)), true);
+	assert.match(verdict(csvOf(range(20)), range(20)), /every point of the sample/);
+	assert.match(verdict(csvOf([]), []), /no point/);
 	// The selection count says some, the CSV holds the whole sample.
-	assert.match(lane.selectionCsvVerdict({ csv: rows(20), selection: 19, sampleKeys, dim: 8, secrets }), /20 rows for 19/);
+	assert.match(verdict(csvOf(range(20)), range(19)), /20 rows for 19/);
+	// Rows of the right number, each a point of the sample, but not the points selected: the
+	// manual's first three chunks are selected, the CSV holds the orchid notes' three (one
+	// document each, so the documents count cannot tell them apart), or two of the three and one other.
+	assert.match(verdict(csvOf([6, 7, 8]), [0, 1, 2]), /not the Selection tab's points: 3 rows not selected \(o-orchid#6\), 3 selected points missing \(o-manual#0\)/);
+	assert.match(verdict(csvOf([0, 1, 6]), [0, 1, 2]), /not the Selection tab's points: 1 rows? not selected/);
+	// The keys Copy keys gave: read, as many as the canvas counted, each once.
+	assert.match(verdict(csv, [0, 1, 2], { selectedKeys: null }), /Copy keys/);
+	assert.match(verdict(csv, [0, 1, 2], { selectedKeys: [sampleKeys[0], sampleKeys[1]] }), /Copy keys gave 2 keys for 3 selected points/);
+	assert.match(verdict(csv, [0, 1, 2], { selectedKeys: [sampleKeys[0], sampleKeys[1], sampleKeys[1]] }), /Copy keys gave a key twice/);
+	// The tab's line: as many points as the canvas counted, from as many documents as the rows come from.
+	assert.match(verdict(csv, [0, 1, 2], { tab: null }), /Selection tab's line/);
+	assert.match(verdict(csv, [0, 1, 2], { tab: { points: 4, documents: 1 } }), /the Selection tab says 4 points selected, the canvas 3/);
+	assert.match(verdict(csv, [0, 1, 2], { tab: { points: 3, documents: 2 } }), /the Selection tab says 2 documents, the CSV's rows come from 1/);
 	assert.strictEqual(lane.exportNameVerdict('vector-explorer_vx_demo_docs_selection_20261015-2310.csv', 'vx_demo_docs', 'selection', 'csv'), true);
 	assert.notStrictEqual(lane.exportNameVerdict('export.csv', 'vx_demo_docs', 'selection', 'csv'), true);
 	assert.notStrictEqual(lane.exportNameVerdict('vector-explorer_other_selection_20261015-2310.csv', 'vx_demo_docs', 'selection', 'csv'), true);
+});
+
+test("selectionCsvVerdict over the live Qdrant sample: a lasso over the left half, a CSV of the right half's points is refused", () => {
+	const sample = JSON.parse(fs.readFileSync(path.join(ACC, '..', '..', '..', 'apps', 'vector-ui', 'tests', 'fixtures', 'v1', 'live', 'qdrant', 'sample.json'), 'utf8'));
+	const n = sample.n;
+	const sampleKeys = Array.from({ length: n }, (_, i) => lane.keyOf(sample, i));
+	const byX = Array.from({ length: n }, (_, i) => i).sort((a, b) => sample.points.x[a] - sample.points.x[b]);
+	const k = Math.floor(n / 2);
+	const left = byX.slice(0, k);
+	const right = byX.slice(n - k);
+	assert.ok(k > 0 && left.every((i) => !right.includes(i)), 'the halves share no point');
+	const header = 'objectId,chunkId,path,chunk_index,x,y,snippet';
+	const csvOf = (idx) => [header, ...idx.map((i) => [...sampleKeys[i], lane.pathOf(sample, i), sampleKeys[i][1], sample.points.x[i], sample.points.y[i], 'text'].join(','))].join('\n');
+	const docs = new Set(left.map((i) => sampleKeys[i][0])).size;
+	const args = (csv) => ({ csv, selection: k, sampleKeys, dim: sample.dimension, secrets: {}, selectedKeys: left.map((i) => sampleKeys[i]), tab: { points: k, documents: docs } });
+	assert.strictEqual(lane.selectionCsvVerdict(args(csvOf(left))), true);
+	assert.match(lane.selectionCsvVerdict(args(csvOf(right))), new RegExp(`not the Selection tab's points: ${k} rows not selected`));
+});
+
+test("selectionLine and copiedKeys: the Selection tab's line and the keys Copy keys puts on the clipboard", () => {
+	assert.deepStrictEqual(lane.selectionLine('Selected points 1,234 points selected from 56 documents. Ask about these only'), { points: 1234, documents: 56 });
+	assert.deepStrictEqual(lane.selectionLine('3 points selected from 1 documents.'), { points: 3, documents: 1 });
+	assert.strictEqual(lane.selectionLine('Turn on the lasso (L) and draw around points to select them.'), null);
+	assert.strictEqual(lane.selectionLine(null), null);
+	assert.deepStrictEqual(lane.copiedKeys('[["o-a",0],["o-b",3]]'), [
+		['o-a', 0],
+		['o-b', 3],
+	]);
+	assert.deepStrictEqual(lane.copiedKeys('[]'), []);
+	for (const text of ['', 'threshold_search: 0.79', '[1,2]', '[["o-a"]]', '[["o-a",0,1]]', '[[0,0]]', '{"keys":[]}', null]) assert.strictEqual(lane.copiedKeys(text), null, String(text));
 });
 
 /** A PNG of w x h RGBA pixels from a pixel function (filter 0 rows), as a canvas writes it. */
@@ -1011,6 +1059,7 @@ const hook = (sel) => (typeof sel === 'string' && sel.startsWith('[') && sel.end
  */
 const UI_SOURCES = [
 	['E5', 'components/MapToolbar.tsx', 'aria-label="Edges per point"', [`aria-label="${UI.map.edges}"`, `aria-label="${UI.map.edgesPerPoint}"`, `aria-label="${UI.map.colourBy}"`]],
+	['E5', 'views/MapView.tsx', 'Copy keys', [`aria-label="${UI.map.selectionSection}"`]],
 	['E5', 'components/ClustersPanel.tsx', null, [`aria-label="${UI.map.minClusterSize}"`, `aria-label="${UI.map.clustersList}"`]],
 	['E6', 'components/DuplicatesPanel.tsx', 'Near-duplicate review', [`aria-label="${UI.dedupe.section}"`, `aria-label="${UI.dedupe.threshold}"`, `aria-label="${UI.dedupe.policy}"`]],
 	['E6', 'components/OutliersPanel.tsx', 'data-component="OutliersPanel"', [hook(UI.outliers.section), `aria-label="${UI.outliers.percentile}"`]],
@@ -1038,6 +1087,8 @@ for (const [owner, file, marker, patterns] of UI_SOURCES) {
 /** The wording and hooks the lane's steps read beyond the UI names: [owner, file, marker, patterns]. */
 const SOURCES = [
 	['E5', 'views/MapView.tsx', 'data-edge-mode', ['data-colour-by', 'data-edge-count', 'data-min-cluster-size', 'data-shown', 'data-isolated', 'data-query-state', 'data-query-b-state']],
+	// The Selection tab's line and its Copy keys (the keys as JSON on the clipboard), which the export step compares the CSV with.
+	['E5', 'views/MapView.tsx', 'Copy keys', ['{num(keys.length)} points selected from {num(docs.length)} documents.', 'Copy keys', 'onCopy={(keys) => {', 'const text = JSON.stringify(keys);', 'navigator.clipboard.writeText(text)']],
 	['E5', 'components/PointCanvas.tsx', 'data-layer="edges"', ['className="vector-map-canvas"', 'data-layer="edges"', 'data-map-tooltip', 'el.dataset.camera = cameraSignature(camera)', 'el.dataset.drawCount']],
 	['E5', 'map/overlay.ts', 'hoverEdges', ['extras.hoverEdges', 'ctx.lineWidth = 2']],
 	['E5', 'components/MapToolbar.tsx', 'aria-label="Edges per point"', ['Expand selected', "{ id: 'tree', label: 'Tree' }", "{ id: 'neighbours', label: 'Neighbours' }"]],

@@ -52,8 +52,10 @@
  *     the group; the matrix is symmetric with a unit diagonal, same-document
  *     pairs above 0.5; its CSV (through the map's Export menu) has n rows
  *   export (P0-6): the lasso selection (some of the sample, not all of it)
- *     exports as a CSV with its rows and keys, no vector or secret; the map
- *     PNG is over 10 KB, drawn, named after the collection
+ *     exports as a CSV whose rows are exactly the Selection tab's points (the
+ *     keys its Copy keys puts on the clipboard, read before the export, from
+ *     as many documents as its line says), no vector or secret; the map PNG
+ *     is over 10 KB, drawn, named after the collection
  *   views (P1-5): a view saved with a selection survives a connection switch;
  *     applying it re-samples with its seed, pins at most 200 keys and says
  *     what it restored
@@ -174,6 +176,10 @@ const UI = {
 		isolate: /^Isolate$/,
 		expandRing: /^Expand by neighbours$/,
 		showAll: /^Show all$/,
+		// The Selection tab (a section of this name): its line, and Copy keys, which puts the selection's keys on the clipboard as JSON.
+		selectionSection: 'Selected points',
+		selectionLine: /([\d,]+) points? selected from ([\d,]+) documents?/,
+		copyKeys: /^Copy keys$/,
 		listingCap: (documents) => `Sampled from the first ${documents.toLocaleString('en-US')} documents by path; the collection has more`,
 		tabs: { clusters: /^Clusters$/, duplicates: /^Duplicates$/, outliers: /^Outliers$/, recommend: /^Recommend$/, selection: /^Selection$/, point: /^Point$/ },
 		// The map canvas's overlay layer (PointCanvas: the edges layer, the points, then the overlay), where the hovered point's edges are drawn thicker.
@@ -616,13 +622,32 @@ function exportNameVerdict(name, collection, kind, ext) {
 	return want.test(String(name || '')) ? true : `the file is named ${JSON.stringify(name)}, expected vector-explorer_${collection}_${kind}_<yyyymmdd-hhmm>.${ext}`;
 }
 
+/** The Selection tab's line ('N points selected from M documents.'): { points, documents }, or null. */
+function selectionLine(text) {
+	const m = UI.map.selectionLine.exec(String(text ?? ''));
+	return m ? { points: count(m[1]), documents: count(m[2]) } : null;
+}
+
+/** The keys Copy keys put on the clipboard (JSON: [[objectId, chunkId], ...]); null when the text is not that. */
+function copiedKeys(text) {
+	let keys;
+	try {
+		keys = JSON.parse(String(text));
+	} catch {
+		return null;
+	}
+	const isKey = (k) => Array.isArray(k) && k.length === 2 && typeof k[0] === 'string' && (typeof k[1] === 'number' || typeof k[1] === 'string');
+	return Array.isArray(keys) && keys.every(isKey) ? keys : null;
+}
+
 /**
  * The selection CSV's verdict: the lasso took some of the sample but not all of it (otherwise the
  * selection's CSV cannot be told from the sample's); one row per selected point, each key one of
- * the sample's, every key once, the header carrying the point columns, and nothing vector-like or
- * secret in it.
+ * the sample's, every key once, the header carrying the point columns; the rows are exactly the
+ * Selection tab's points (the keys its Copy keys gave, `selectedKeys`, as many as the canvas
+ * counted) from as many documents as its line (`tab`) says; and nothing vector-like or secret in it.
  */
-function selectionCsvVerdict({ csv, selection, sampleKeys, dim, secrets }) {
+function selectionCsvVerdict({ csv, selection, sampleKeys, dim, secrets, selectedKeys, tab }) {
 	const n = sampleKeys.length;
 	if (!(Number.isInteger(selection) && selection > 0)) return `the lasso selected no point (${selection}) to export`;
 	if (selection >= n) return `the lasso selected every point of the sample (${selection} of ${n}): its CSV cannot be told from the sample's`;
@@ -636,6 +661,20 @@ function selectionCsvVerdict({ csv, selection, sampleKeys, dim, secrets }) {
 	const known = new Set(sampleKeys.map(keyText));
 	const stray = keys.filter((k) => !known.has(k));
 	if (stray.length) return `${stray.length} rows are not points of the sample (${stray[0]})`;
+	// The rows must be the points selected, not any of the sample's points of that number.
+	if (!Array.isArray(selectedKeys)) return "the Selection tab's keys were not read (Copy keys)";
+	const chosen = selectedKeys.map(keyText);
+	if (new Set(chosen).size !== chosen.length) return 'Copy keys gave a key twice';
+	if (chosen.length !== selection) return `Copy keys gave ${chosen.length} keys for ${selection} selected points`;
+	const rowSet = new Set(keys);
+	const chosenSet = new Set(chosen);
+	const unselected = keys.filter((k) => !chosenSet.has(k));
+	const missing = chosen.filter((k) => !rowSet.has(k));
+	if (unselected.length || missing.length) return `the CSV's rows are not the Selection tab's points: ${unselected.length} rows not selected (${unselected[0] ?? '-'}), ${missing.length} selected points missing (${missing[0] ?? '-'})`;
+	if (!tab || !Number.isInteger(tab.points) || !Number.isInteger(tab.documents)) return `the Selection tab's line was not read (${JSON.stringify(tab)})`;
+	if (tab.points !== selection) return `the Selection tab says ${tab.points} points selected, the canvas ${selection}`;
+	const documents = new Set(rows.map((r) => r[o])).size;
+	if (tab.documents !== documents) return `the Selection tab says ${tab.documents} documents, the CSV's rows come from ${documents}`;
 	const leaks = C.downloadVectors(csv, dim, secrets);
 	return leaks.length === 0 ? true : `the download holds ${leaks.join('; ')}`;
 }
@@ -1202,6 +1241,25 @@ async function main(fixtureKey, base, out) {
 		if (took !== true) throw new Error(took);
 		return selected;
 	};
+	/**
+	 * What the Selection tab holds now: its line ({ points, documents }, null when unread) and the
+	 * keys its Copy keys puts on the clipboard (null when unread). The clipboard is emptied first, so
+	 * an earlier copy cannot be read as this one.
+	 */
+	const readSelectionTab = async () => {
+		await sideTab(UI.map.tabs.selection);
+		const section = visible(map.getByRole('region', { name: UI.map.selectionSection, exact: true }));
+		await section.waitFor({ timeout: 15000 });
+		const line = selectionLine(await C.textOf(section));
+		await page.evaluate(() => navigator.clipboard.writeText('')).catch(() => {});
+		await button(UI.map.copyKeys, section).click();
+		const text = await poll(
+			() => page.evaluate(() => navigator.clipboard.readText()).catch(() => null),
+			(t) => copiedKeys(t) !== null,
+			5000
+		);
+		return { line, keys: copiedKeys(text) };
+	};
 	/** Inspect sample point i through the Table alternative (pages of 100). */
 	const inspectPoint = async (i) => {
 		const table = toolbar.getByRole('button', { name: MAP.table }).first();
@@ -1657,18 +1715,22 @@ async function main(fixtureKey, base, out) {
 			return rows === x.result.n ? true : `the matrix CSV has ${rows} rows for n = ${x.result.n}`;
 		});
 
-		await step(page, "export (P0-6): the lasso selection's CSV holds its rows and keys and no vector or secret", async (note) => {
+		await step(page, "export (P0-6): the lasso selection's CSV holds exactly the Selection tab's points (the keys Copy keys gives, from as many documents as it says) and no vector or secret", async (note) => {
 			if (!sample) return 'no sample';
 			const selection = await lassoLeft(0.5);
+			// The points the Selection tab holds, read before the export: the CSV's rows must be these.
+			const tab = await readSelectionTab();
 			const got = await exportItem(map, 'map-selection', 'csv');
 			const dim = await store.dimension(fixture);
 			const dialect = await store.tool(fixture, 'dialect');
 			const sampleKeys = Array.from({ length: sample.n }, (_, i) => keyOf(sample, i));
 			const csv = got.bytes.toString('utf8');
-			note({ name: got.name, bytes: got.bytes.length, selection, rows: csvTable(csv).rows.length });
+			const table = csvTable(csv);
+			const o = table.header.indexOf('objectId');
+			note({ name: got.name, bytes: got.bytes.length, selection, rows: table.rows.length, rowDocuments: o < 0 ? null : new Set(table.rows.map((r) => r[o])).size, tab: tab.line, copiedKeys: tab.keys ? tab.keys.length : null });
 			const named = exportNameVerdict(got.name, dialect && dialect.collection, 'selection', 'csv');
 			if (named !== true) return named;
-			return selectionCsvVerdict({ csv, selection, sampleKeys, dim, secrets: { 'the API key': E.API_KEY, 'the Tools task token': await store.tokenOf(fixture, 'tools_1').catch(() => '') } });
+			return selectionCsvVerdict({ csv, selection, sampleKeys, dim, secrets: { 'the API key': E.API_KEY, 'the Tools task token': await store.tokenOf(fixture, 'tools_1').catch(() => '') }, selectedKeys: tab.keys, tab: tab.line });
 		});
 
 		await step(page, 'export: the map PNG is over 10 KB, drawn, named after the collection', async (note) => {
@@ -2295,6 +2357,8 @@ module.exports = {
 	matrixVerdict,
 	csvTable,
 	exportNameVerdict,
+	selectionLine,
+	copiedKeys,
 	selectionCsvVerdict,
 	pngInfo,
 	pngVerdict,
