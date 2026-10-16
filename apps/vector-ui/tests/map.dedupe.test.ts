@@ -30,7 +30,7 @@ import type { IDocumentItem, IDuplicatePair, IKnnBlock, ISampleResult } from '..
 import type { IDocumentGroup } from '../src/map/dedupe';
 import { reviewedDocuments } from '../src/adapters/connections';
 import { connectionCaches } from '../src/adapters/explorer';
-import { KEEP_POLICIES, THRESHOLD_DEFAULT, THRESHOLD_MAX, THRESHOLD_MIN, applyPolicy, copyVerdict, dedupeView, docInfo, duplicateGroupOf, groupOf, groups, isCopyGroup, keepOf, markReviewed, pairsAt, queueInit, queueReducer, queued, reviewedOf, unmarkReviewed } from '../src/map/dedupe';
+import { KEEP_POLICIES, THRESHOLD_DEFAULT, THRESHOLD_MAX, THRESHOLD_MIN, applyPolicy, containment, copyVerdict, dedupeView, docInfo, duplicateGroupOf, groupOf, groups, isCopyGroup, keepOf, markReviewed, pairsAt, queueInit, queueReducer, queued, reviewedOf, unmarkReviewed } from '../src/map/dedupe';
 import { loadSample } from './support/map.samples';
 
 // =============================================================================
@@ -743,6 +743,111 @@ test('a revision with text of its own is not queued behind its original, however
 			if (group && queuedCopy(sample, group).length > 0) wrong += 1;
 		}
 		assert.ok(wrong <= 4, `at ${coverage * 100}% a 60%-held document is queued in ${wrong} of 200 draws`);
+	}
+});
+
+// A kept document that prints a section more than once (a handbook reprinting its code of
+// conduct in an appendix, a mail thread quoting a message in each reply) beside a document
+// holding that section once and text of its own: each drawn chunk of the section has several
+// twins in the kept one, so it pairs with one of them more often than the kept one's draw rate.
+
+/** The kept document (document 0) prints the first `section` chunks `times` times; document 1 holds them once, then its own text. */
+const repeatedText =
+	(section: number, times: number) =>
+	(d: number, c: number): Array<[number, number]> => {
+		if (d === 1) return c < section ? Array.from({ length: times }, (_, t): [number, number] => [0, c + t * section]) : [];
+		if (d !== 0 || c >= section * times) return [];
+		const at = c % section;
+		const twins: Array<[number, number]> = [[1, at]];
+		for (let t = 0; t < times; t += 1) if (at + t * section !== c) twins.push([0, at + t * section]);
+		return twins;
+	};
+
+/**
+ * The kept document and the other, drawn as given.
+ *
+ * @param keptChunks - The kept document's chunks.
+ * @param otherChunks - The other document's chunks.
+ * @param kept - The kept document's drawn chunk ids.
+ * @param other - The other document's drawn chunk ids.
+ * @param section - Chunks of the section the kept one prints `times` times.
+ * @param times - How many times.
+ * @returns The sample, its group across the two and the documents (the kept one is older, shorter and longer).
+ */
+function repeatedDraw(keptChunks: number, otherChunks: number, kept: readonly number[], other: readonly number[], section: number, times: number): { sample: ISampleResult; group: IDocumentGroup | undefined; info: ReturnType<typeof docInfo> } {
+	const sample = drawnSample(
+		[
+			{ objectId: 'kept', path: 'C:/hb/handbook.md', chunks: keptChunks, drawn: kept },
+			{ objectId: 'other', path: 'C:/hb/archive/code_of_conduct_notes.md', chunks: otherChunks, drawn: other },
+		],
+		repeatedText(section, times)
+	);
+	const info = docInfo(sample, [row('kept', 'C:/hb/handbook.md', keptChunks, '2026-01-01T00:00:00Z'), row('other', 'C:/hb/archive/code_of_conduct_notes.md', otherChunks, '2026-03-01T00:00:00Z')]);
+	return { sample, group: dedupeView(sample, 0.97).groups.find((g) => g.objectIds.length === 2), info };
+}
+
+const POLICIES_KEEPING = ['oldest', 'shortest-path', 'most-chunks'] as const;
+
+/** Captured from the node's own vx_math.stratified_pick (12 other documents of 300 chunks, n = 2,000), as hex steps. */
+const REPEATED_CAPTURED: Record<'thrice' | 'twice', { keptChunks: number; section: number; times: number; kept: string; other: string }> = {
+	// Seed 0: a 450-chunk document printing a 150-chunk section three times; the other holds it once (half of its 300 chunks).
+	thrice: {
+		keptChunks: 450,
+		section: 150,
+		times: 3,
+		kept: '1.1.1.3.2.2.2.1.5.3.d.2.6.2.2.7.1.a.5.1.a.5.4.6.2.6.3.2.7.4.1.1.7.3.2.8.3.2.1.1.1.4.3.1.3.2.5.4.6.1.1.b.1.1.4.1.1.3.3.2.1.2.4.3.1.2.2.1.2.3.4.6.1.1.2.1.2.2.4.3.7.4.1.1.1.d.2.2.1.3.4.9.1.1.3.3.1.6.1.3.3.1.5.1.1.1.7.6.1.1.a.3.1.4.4.3.3.2.1.1.4.3.6.3.1.3.1.1.c.1.2.1.3.1.2.5.2.1.1.4.4.2.1',
+		other: '1.2.5.4.1.1.1.2.1.2.1.1.3.1.1.1.2.4.1.1.1.2.4.2.3.3.3.2.3.5.3.1.1.1.6.3.1.1.3.2.3.4.1.1.1.2.4.3.3.1.1.1.1.2.3.3.1.1.1.3.1.1.3.1.4.2.3.3.2.2.2.4.5.2.1.1.1.4.2.3.2.6.2.1.3.1.2.4.4.1.1.1.5.2.2.4.2.1.1.1.3.5.1.1.1.1.1.2.2.2.1.4.2.2.1.4.1.1.1.1.1.2.3.2.1.1.2.2.2.1.1.1.1.a.3.1.1.2.1.2.1.1.1',
+	},
+	// Seed 3: a 360-chunk document printing a 180-chunk section twice; the other holds it once (60% of its 300 chunks).
+	twice: {
+		keptChunks: 360,
+		section: 180,
+		times: 2,
+		kept: '1.1.a.1.2.2.1.3.1.1.1.1.2.1.3.7.2.1.4.1.1.1.3.3.2.1.3.3.2.2.1.5.3.1.2.2.2.4.1.1.1.4.3.1.4.1.1.1.5.2.4.1.1.8.1.4.2.1.3.2.1.2.5.2.3.4.4.3.5.1.3.2.4.9.1.1.1.3.6.2.1.1.1.1.1.4.2.7.7.2.2.5.7.1.2.1.3.2.3.4.3.1.2.1.2.3.1.4.2.1.1.1.9.3.2.2.2.1.3.2.3.2.3.3.1.2.4.2.6.1.2.1.1.1.3.1.1.5.8.1.2.2',
+		other: '1.1.1.1.4.1.4.1.3.1.2.1.2.1.2.1.2.2.1.3.1.2.2.2.1.1.3.5.1.3.1.4.1.1.1.1.3.3.2.1.4.1.1.3.2.7.1.4.1.3.3.1.2.5.1.1.1.2.1.1.9.2.2.2.5.2.3.1.1.1.3.1.1.1.1.3.2.5.6.1.2.2.3.2.1.4.1.2.3.1.8.1.1.2.3.2.4.1.1.2.4.3.3.3.2.3.2.6.3.4.1.1.2.1.1.1.1.1.2.2.1.3.1.1.1.1.1.1.1.3.2.1.3.1.2.5.2.2.1.1.1.1.1',
+	},
+};
+
+test("a kept document that prints a section two or three times never has a document with text of its own queued behind it (the node's own draws)", () => {
+	for (const [name, shape] of Object.entries(REPEATED_CAPTURED)) {
+		const kept = stepsOf(shape.kept);
+		const other = stepsOf(shape.other);
+		const { sample, group, info } = repeatedDraw(shape.keptChunks, 300, kept, other, shape.section, shape.times);
+		assert.ok(group, `${name}: one group`);
+		const held = containment(group, info, 'other', ['kept']);
+		assert.notEqual(held.verdict, 'in', `${name}: the sample does not show the kept document holds the other (${JSON.stringify(held)})`);
+		assert.notEqual(copyVerdict(group, info), 'copies', `${name}: not called copies`);
+		for (const policy of POLICIES_KEEPING) {
+			const q = queued([group], queueReducer(queueInit(), { type: 'policy', value: policy }), info, new Set());
+			assert.equal(keepOf(group, queueReducer(queueInit(), { type: 'policy', value: policy }), info), 'kept', `${name}: ${policy} keeps the handbook`);
+			assert.deepEqual(q.objectIds, [], `${name}: ${policy} queues nothing`);
+			assert.ok(q.held.get(group.key)?.has('other'), `${name}: ${policy} says why the other is left`);
+		}
+		const several = group.evidence.partners.filter((map, i) => sample.points.doc[i] === 1 && (map?.get('kept')?.count ?? 0) >= 2).length;
+		assert.ok(several > 0, `${name}: some sampled chunks of the section pair with two of the kept document's (${several})`);
+	}
+});
+
+test('a kept document that prints a section more than once: no policy queues a document it holds 50% to 70% of, however the sample draws it', () => {
+	const cases: Array<{ section: number; times: number; otherChunks: number; others: number; n: number }> = [
+		{ section: 70, times: 2, otherChunks: 100, others: 18, n: 2000 },
+		{ section: 180, times: 2, otherChunks: 300, others: 12, n: 2000 },
+		{ section: 210, times: 2, otherChunks: 300, others: 12, n: 2000 },
+		{ section: 150, times: 2, otherChunks: 300, others: 12, n: 2000 },
+		{ section: 150, times: 3, otherChunks: 300, others: 12, n: 2000 },
+		{ section: 50, times: 3, otherChunks: 100, others: 18, n: 2000 },
+		{ section: 600, times: 2, otherChunks: 1000, others: 10, n: 2000 },
+	];
+	for (const c of cases) {
+		const keptChunks = c.section * c.times + Math.max(0, c.otherChunks - c.section * c.times);
+		let wrong = 0;
+		for (let seed = 1; seed <= 60; seed += 1) {
+			const draws = stratifiedDraw([keptChunks, c.otherChunks, ...Array.from({ length: c.others }, () => c.otherChunks)], c.n, seed);
+			const { group, info } = repeatedDraw(keptChunks, c.otherChunks, draws[0] as number[], draws[1] as number[], c.section, c.times);
+			if (!group) continue;
+			for (const policy of POLICIES_KEEPING) if (queued([group], queueReducer(queueInit(), { type: 'policy', value: policy }), info, new Set()).objectIds.length > 0) wrong += 1;
+		}
+		assert.equal(wrong, 0, `section of ${c.section} printed ${c.times} times, ${(c.section / c.otherChunks) * 100}% of the other: queued in ${wrong} of 180 policy draws`);
 	}
 });
 

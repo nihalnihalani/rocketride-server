@@ -558,6 +558,65 @@ test('a revision that added chapters: keeping the original queues nothing and th
 	assert.match(most, /role="status"[^>]*>1 document queued/, 'keeping the revision queues the original it holds');
 });
 
+/**
+ * A 450-chunk handbook printing a 150-chunk section three times, beside a
+ * 300-chunk document holding that section once and 150 chunks of its own (the
+ * handbook holds half of it). Drawn by the node's own vx_math.stratified_pick
+ * (seed 0, 12 other documents of 300 chunks, n = 2,000): 143 chunks of each.
+ *
+ * @returns The sample and the directory rows (the handbook is older, shorter and longer).
+ */
+function repeatedSection(): { sample: ISampleResult; rows: IDocumentItem[] } {
+	const steps = (text: string): number[] => {
+		let at = -1;
+		return text.split('.').map((step) => (at += parseInt(step, 16)));
+	};
+	const kept = steps('1.1.1.3.2.2.2.1.5.3.d.2.6.2.2.7.1.a.5.1.a.5.4.6.2.6.3.2.7.4.1.1.7.3.2.8.3.2.1.1.1.4.3.1.3.2.5.4.6.1.1.b.1.1.4.1.1.3.3.2.1.2.4.3.1.2.2.1.2.3.4.6.1.1.2.1.2.2.4.3.7.4.1.1.1.d.2.2.1.3.4.9.1.1.3.3.1.6.1.3.3.1.5.1.1.1.7.6.1.1.a.3.1.4.4.3.3.2.1.1.4.3.6.3.1.3.1.1.c.1.2.1.3.1.2.5.2.1.1.4.4.2.1');
+	const other = steps('1.2.5.4.1.1.1.2.1.2.1.1.3.1.1.1.2.4.1.1.1.2.4.2.3.3.3.2.3.5.3.1.1.1.6.3.1.1.3.2.3.4.1.1.1.2.4.3.3.1.1.1.1.2.3.3.1.1.1.3.1.1.3.1.4.2.3.3.2.2.2.4.5.2.1.1.1.4.2.3.2.6.2.1.3.1.2.4.4.1.1.1.5.2.2.4.2.1.1.1.3.5.1.1.1.1.1.2.2.2.1.4.2.2.1.4.1.1.1.1.1.2.3.2.1.1.2.2.2.1.1.1.1.a.3.1.1.2.1.2.1.1.1');
+	const points = [...kept.map((chunk) => ({ doc: 0, chunk })), ...other.map((chunk) => ({ doc: 1, chunk }))];
+	// The text a chunk holds: the section's chunk s, or text of its own.
+	const textOf = (p: { doc: number; chunk: number }): string => (p.doc === 0 ? `s${p.chunk % 150}` : p.chunk < 150 ? `s${p.chunk}` : `own${p.chunk}`);
+	// Rows hold the twins only (shorter than k, so never crowded with near-duplicates).
+	const knn: IKnnBlock = { k: 15, offsets_row: [0], cols: [], sims: [] };
+	points.forEach((p, i) => {
+		points.forEach((q, j) => {
+			if (j !== i && textOf(q) === textOf(p)) {
+				knn.cols.push(j);
+				knn.sims.push(0.999);
+			}
+		});
+		knn.offsets_row.push(knn.cols.length);
+	});
+	const base = small();
+	const sample: ISampleResult = {
+		...base,
+		n: points.length,
+		n_requested: points.length,
+		docs: [
+			{ i: 0, objectId: 'hb', path: 'C:/hb/handbook.md', chunks: 450, in_sample: kept.length },
+			{ i: 1, objectId: 'cc', path: 'C:/hb/archive/conduct_notes.md', chunks: 300, in_sample: other.length },
+		],
+		points: { doc: points.map((p) => p.doc), chunk: points.map((p) => p.chunk), x: points.map(() => 0), y: points.map(() => 0), len: points.map(() => 90), snip: points.map(() => 'text'), pinned: points.map(() => 0) },
+		knn,
+		density: points.map(() => 0.5),
+	};
+	const row = (objectId: string, path: string, chunks: number, ingestedAt: string): IDocumentItem => ({ objectId, path, chunks, has_first_chunk: true, tables: 0, deleted: false, nodeId: null, size: null, modifyTime: null, ingestedAt, pointId: null });
+	return { sample, rows: [row('hb', 'C:/hb/handbook.md', 450, '2026-01-01T00:00:00Z'), row('cc', 'C:/hb/archive/conduct_notes.md', 300, '2026-03-01T00:00:00Z')] };
+}
+
+test('a kept handbook that prints a section three times: no policy queues the document holding that section once, and the panel says it cannot tell', () => {
+	const { sample, rows } = repeatedSection();
+	const documents: IDocumentRowsSource = { getRows: () => rows, subscribe: () => noop };
+	for (const policy of ['oldest', 'shortest-path', 'most-chunks'] as const) {
+		const out = html(<DuplicatesPanel sample={modelOf(sample)} writes={on} documents={documents} onSelect={noop} onRemoveDocument={noop} onRemoveDocuments={noop} initial={{ policy }} />);
+		assert.match(out, /aria-label="Keep C:\/hb\/handbook\.md" checked=""/, `${policy} keeps the handbook`);
+		assert.match(out, /role="status"[^>]*>No document queued/, `${policy}: nothing queued`);
+		assert.match(out, /<button[^>]*disabled=""[^>]*>Remove all queued \(0 documents\)<\/button>/, `${policy}: the bulk remove is disabled`);
+		assert.match(out, /300 chunks · ingested 2026-03-01 · \d+ of 143 sampled chunks match · this sample does not show that the kept document holds it, so not queued/, `${policy}: the document says why it is left`);
+		assert.match(out, /This sample cannot tell yet whether these documents are whole copies of each other/, `${policy}: the group is not called copies`);
+	}
+});
+
 test('another connection starts a fresh duplicates queue (its choices are keyed by the connection)', () => {
 	const a = DuplicatesPanel({ sample: SMALL, writes: on, onSelect: noop, onRemoveDocument: noop, connectionKey: 'conn-a' });
 	const b = DuplicatesPanel({ sample: SMALL, writes: on, onSelect: noop, onRemoveDocument: noop, connectionKey: 'conn-b' });

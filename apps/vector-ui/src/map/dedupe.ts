@@ -49,7 +49,10 @@
 // therefore weighted by the rate at which the partner's chunks were drawn,
 // and a document counts as held only when that estimate is at least nine in
 // ten and the sample holds enough of both to rule out seven in ten (one-sided,
-// 1%). It holds text of its own only when its matches are too few for a
+// 1%). That weight assumes one twin per chunk: when a sampled chunk pairs with
+// two of the partner's (the partner prints that text more than once, so a
+// chunk pairs with one of its twins more often than the partner's draw rate)
+// there is no estimate and the sample cannot tell yet. It holds text of its own only when its matches are too few for a
 // document held whole (under 0.1% chance; with the partner in the sample
 // whole, any unmatched sampled chunk). Otherwise the group says the sample
 // cannot tell yet, or holds too few chunks, or that the store did not report
@@ -238,6 +241,14 @@ export interface IDocumentGroup extends IDuplicateGroup {
 	evidence: ICopyEvidence;
 }
 
+/** What one point knows of another document it pairs with. */
+export interface IPartnerLink {
+	/** True when one of the partner's points it pairs with is certain to be in the sample. */
+	certain: boolean;
+	/** How many of the partner's points it pairs with: two or more when the partner holds that text more than once. */
+	count: number;
+}
+
 /**
  * What the sample shows about which documents hold which, at one threshold:
  * how each point was drawn and which documents it pairs with. Shared by every
@@ -251,8 +262,8 @@ export interface ICopyEvidence {
 	census: Uint8Array;
 	/** Per point: 1 when every one of its kNN neighbours is at or above the threshold (a twin may lie beyond the row). */
 	crowded: Uint8Array;
-	/** Per point: the other documents it pairs with, true when one of the partner's points it pairs with is certain to be in the sample. */
-	partners: ReadonlyArray<ReadonlyMap<string, boolean> | undefined>;
+	/** Per point: the other documents it pairs with, and how. */
+	partners: ReadonlyArray<ReadonlyMap<string, IPartnerLink> | undefined>;
 	/** Per document: its points. */
 	pointsOf: ReadonlyMap<string, readonly number[]>;
 	/** Containment answers already worked out, per documents map. */
@@ -304,13 +315,17 @@ function copyEvidence(sample: ISampleResult, threshold: number, pairs: readonly 
 		for (let e = start; e < end && full; e += 1) full = (sims[e] as number) >= threshold;
 		if (full) crowded[i] = 1;
 	}
-	const partners: Array<Map<string, boolean> | undefined> = new Array(Math.max(0, n));
+	const partners: Array<Map<string, IPartnerLink> | undefined> = new Array(Math.max(0, n));
 	const link = (i: number, j: number): void => {
 		const other = objectOf(j);
 		if (other === objectOf(i)) return;
-		const map = partners[i] ?? new Map<string, boolean>();
+		const map = partners[i] ?? new Map<string, IPartnerLink>();
 		partners[i] = map;
-		map.set(other, (map.get(other) ?? false) || census[j] === 1);
+		const known = map.get(other);
+		if (known) {
+			known.count += 1;
+			known.certain = known.certain || census[j] === 1;
+		} else map.set(other, { certain: census[j] === 1, count: 1 });
 	};
 	for (const { a, b } of pairs) {
 		link(a, b);
@@ -648,7 +663,13 @@ function storedChunks(info: ReadonlyMap<string, IDocInfo>, objectId: string): nu
  * an unmatched one of those counts as matched here.
  *
  * Held, where the sample holds only part of the documents and was drawn
- * evenly within each: an estimate. A point is certain (pinned, or chunk 0 of
+ * evenly within each, and no sampled chunk of the document pairs with two of
+ * theirs: an estimate. (A chunk whose text the others hold n times pairs with
+ * one of its twins at 1 - (1 - q)^n, not q, so weighting its match by 1 / q
+ * would count text of its own as held: a kept handbook that prints a section
+ * twice would make a document holding that section once look held whole.
+ * When the sample shows a repeated twin the answer is 'unsure'; the certain
+ * rule and the test for text of its own stay sound.) A point is certain (pinned, or chunk 0 of
  * a stratified sample) or drawn: the drawn ones are a uniform subset of the
  * document's other chunks (r of the pool), and each matched drawn chunk
  * stands for 1 / q drawn chunks held, so
@@ -698,22 +719,25 @@ function workOutContainment(ev: ICopyEvidence, info: ReadonlyMap<string, IDocInf
 	let viaCertain = 0;
 	let viaDrawn = 0;
 	let crowdedMisses = 0;
+	let repeated = false;
 	for (const i of points) {
 		const isCertain = ev.census[i] === 1;
 		if (isCertain) certain += 1;
 		else drawn += 1;
 		const map = ev.partners[i];
+		// true: pairs with a certain point of theirs; false: with drawn ones only; undefined: with none.
 		let hit: boolean | undefined;
+		let twins = 0;
 		if (map) {
 			for (const other of others) {
-				const c = map.get(other);
-				if (c === true) {
-					hit = true;
-					break;
-				}
-				if (c === false) hit = false;
+				const link = map.get(other);
+				if (!link) continue;
+				twins += link.count;
+				if (link.certain) hit = true;
+				else if (hit === undefined) hit = false;
 			}
 		}
+		if (twins >= 2) repeated = true;
 		if (hit === undefined) {
 			if (ev.crowded[i]) crowdedMisses += 1;
 			continue;
@@ -751,7 +775,7 @@ function workOutContainment(ev: ICopyEvidence, info: ReadonlyMap<string, IDocInf
 	if (!ev.uniform) return out('uneven', null);
 	const pool = Math.max(drawn, stored - certain);
 	const expected = sampled * q;
-	if (drawn === 0 || q <= 0 || pool === 0) return out(expected < COPY_EVIDENCE_MIN ? 'few' : 'unsure', null);
+	if (drawn === 0 || q <= 0 || pool === 0 || repeated) return out(expected < COPY_EVIDENCE_MIN ? 'few' : 'unsure', null);
 	const g = Math.min(1, (viaCertain + (whole ? viaDrawn : viaDrawn / q)) / drawn);
 	const share = Math.min(1, (certainMatched + g * pool) / stored);
 	const sd = (g0: number): number => {
