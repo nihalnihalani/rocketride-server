@@ -270,7 +270,11 @@ collection when a backend's deployment starts (each seeded document's rows,
 deleted ones included, and on pgvector the soft-deleted rows) and fails after
 that backend's live tests if the fingerprint changed, so a write that touched
 the seed is caught by the run that made it rather than by the next
-`seed_legacy.sh --verify-only`.
+`seed_legacy.sh --verify-only`. Its counts are of active rows, and the pgvector
+seed's one soft-deleted row is expected in `stats.deleted_chunks` and in the
+legacy `stats.count`. A seed written before the corpus planted its keyword
+token skips the keyword case on the legacy side with a `NOT RUN:` reason (the
+stored text has no such word); `seed_legacy.sh --recreate` seeds it again.
 
 Without `RR_REQUIRE_DB_TESTS` a suite whose server is unreachable skips with a
 `NOT RUN:` reason, so a run can pass without touching a database; read the skip

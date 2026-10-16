@@ -267,8 +267,8 @@ def seeded_fingerprint(
 ) -> Dict[str, Any]:
     """What the suite must leave as it found it on the seeded legacy collection (RR_TEST_VECTOR_LEGACY=seeded).
 
-    The rows of each seeded document (its objectId's chunk count, deleted rows included) and the
-    collection's soft-deleted rows; the suite's own uploads are left out, since it adds and removes them.
+    The active rows of each seeded document and the collection's soft-deleted rows; the suite's own
+    uploads are left out, since it adds and removes them.
     """
     return {
         'chunks': {oid: counts.get(oid) for oid in sorted(set(documents))},
@@ -344,12 +344,13 @@ class _PgVector:
         return bool(self._sql('SELECT to_regclass(%s) IS NOT NULL', (f'public.{collection}',))[0][0])
 
     def counts(self, collection: str) -> Dict[str, int]:
+        """Active rows per objectId (a soft-deleted row is counted by soft_deleted, as the tools count it)."""
         from psycopg2 import sql
 
         rows = self._sql(
-            sql.SQL("SELECT objectid, count(*) FROM {} WHERE objectid <> 'schema' GROUP BY objectid").format(
-                sql.Identifier(collection)
-            )
+            sql.SQL(
+                "SELECT objectid, count(*) FROM {} WHERE objectid <> 'schema' AND isdeleted IS NOT TRUE GROUP BY objectid"
+            ).format(sql.Identifier(collection))
         )
         return {o: int(n) for o, n in rows}
 
@@ -475,10 +476,12 @@ class _Qdrant:
                 return out
 
     def counts(self, collection: str) -> Dict[str, int]:
+        """Active points per objectId."""
         out: Dict[str, int] = collections.Counter()
         for p in self._points(collection):
-            oid = ((p.payload or {}).get('meta') or {}).get('objectId')
-            if oid != 'schema':
+            meta = (p.payload or {}).get('meta') or {}
+            oid = meta.get('objectId')
+            if oid != 'schema' and meta.get('isDeleted') is not True:
                 out[oid] += 1
         return dict(out)
 
@@ -579,9 +582,10 @@ class _Chroma:
         return self.client().get_collection(collection).get(include=list(include))
 
     def counts(self, collection: str) -> Dict[str, int]:
+        """Active records per objectId."""
         out: Dict[str, int] = collections.Counter()
         for m in self._get(collection, ['metadatas'])['metadatas'] or []:
-            if m.get('objectId') != 'schema':
+            if m.get('objectId') != 'schema' and m.get('isDeleted') is not True:
                 out[m.get('objectId')] += 1
         return dict(out)
 
@@ -940,10 +944,15 @@ class _Side:
                 pass
 
 
-def _seeded_state(service: Any, collection: str, documents: Iterable[str]) -> Dict[str, Any]:
-    """The seeded legacy collection's fingerprint now (soft-deleted rows where the store has them)."""
+def _soft_deleted(service: Any, collection: str) -> List[Tuple[str, int]]:
+    """The collection's soft-deleted rows where the service reads them (pgvector), else none."""
     soft = getattr(service, 'soft_deleted', None)
-    return seeded_fingerprint(service.counts(collection), soft(collection) if soft else [], documents)
+    return soft(collection) if soft else []
+
+
+def _seeded_state(service: Any, collection: str, documents: Iterable[str]) -> Dict[str, Any]:
+    """The seeded legacy collection's fingerprint now."""
+    return seeded_fingerprint(service.counts(collection), _soft_deleted(service, collection), documents)
 
 
 @pytest.fixture(scope='module', params=SUPPORTED)
@@ -1082,7 +1091,10 @@ def test_the_legacy_collection_has_its_planted_gap(deployment):
 def test_legacy_tools_answer_with_their_legacy_keys(side, deployment):
     stats = side.ok('stats')
     assert {'count', 'model', 'vector_size'} <= set(stats)
-    rows = sum(deployment.service.counts(side.collection).values())
+    # Every row: the active ones, the soft-deleted ones (seed_legacy.sh plants one on pgvector) and the control record.
+    rows = sum(deployment.service.counts(side.collection).values()) + len(
+        _soft_deleted(deployment.service, side.collection)
+    )
     assert stats['count'] == rows + 1, 'stats.count is every row including the control record'
     assert stats['model'] == EMBEDDING_MODEL and stats['vector_size'] == DIMENSION
     got = side.ok('get', {'object_id': side.multi})
@@ -1154,7 +1166,8 @@ def test_stats_full_and_quick(side, deployment):
     by_first_chunk = 'documents_by_first_chunk' in caveats
     assert full['documents'] == len(counts) - (orphans if by_first_chunk else 0), (full['documents'], caveats)
     assert full['chunks'] == sum(counts.values())
-    assert full['deleted_chunks'] == 0
+    # seed_legacy.sh soft-deletes one row of the seeded legacy pgvector table; every other collection has none.
+    assert full['deleted_chunks'] == len(_soft_deleted(deployment.service, side.collection))
     if full['documents_without_first_chunk'] is not None:
         assert full['documents_without_first_chunk'] == orphans
     assert (full['dimension'], full['metric']) == (DIMENSION, 'cosine')
@@ -1379,6 +1392,15 @@ def test_keyword_search_finds_the_planted_token_as_a_whole_word(side, deployment
     if not side.ok('dialect')['capabilities']['search_keyword']:
         pytest.skip(f'NOT RUN: {deployment.provider} cannot search by keyword')
     holder = _document_of(side, KEYWORD_FILE)
+    if side.kind == 'legacy' and LEGACY_MODE == 'seeded':
+        # seed_legacy.sh wrote the corpus as it was when it ran; a seed from before the token has no
+        # chunk to find (the stored text says so), and seed_legacy.sh --recreate seeds it again.
+        page = side.ok('chunks', {'object_id': holder, 'after_chunk': -1, 'limit': 200, 'deleted': 'active'})
+        if not any(KEYWORD_TOKEN in (c.get('content') or '') for c in page['items']):
+            pytest.skip(
+                f'NOT RUN: the seeded legacy collection predates the planted token {KEYWORD_TOKEN} '
+                f'(its {KEYWORD_FILE} holds no such word; seed_legacy.sh --recreate seeds it again)'
+            )
     found = side.ok('search', {'query': KEYWORD_TOKEN, 'mode': 'keyword', 'top_k': 5})
     rows = found['results']
     assert rows, (
