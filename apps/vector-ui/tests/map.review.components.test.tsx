@@ -509,9 +509,9 @@ test("the map runs Recommend through runRecommendCall and keeps the examples in 
 	assert.doesNotMatch(view, /callRecommend\(/, 'the one call path is map/recommend.ts');
 });
 
-test('the inspector gets the text loader, the query, Add as example with its side, and the tree neighbours', { skip: NEEDS_MAP }, () => {
+test('the inspector gets the text loader, its connection, the query, Add as example with its side, and the tree neighbours', { skip: NEEDS_MAP }, () => {
 	const inspector = element(source('views/MapView.tsx'), 'PointInspector');
-	for (const prop of ['loadText=', 'query=', 'onAddExample=', 'examplePolarity=', 'treeNeighbours=']) assert.ok(inspector.includes(prop), prop);
+	for (const prop of ['loadText=', 'connectionKey=', 'query=', 'onAddExample=', 'examplePolarity=', 'treeNeighbours=']) assert.ok(inspector.includes(prop), prop);
 	assert.match(inspector, /fetchChunkText\(/);
 });
 

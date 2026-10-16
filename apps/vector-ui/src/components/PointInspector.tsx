@@ -44,7 +44,7 @@ import type { ExamplePolarity, PointInspectorProps as ContractPointInspectorProp
 import { documentOf, pointKey } from '../map/model';
 import { MAP_STYLES } from '../map/styles';
 import { num } from '../map/wording';
-import { ChunkTextSection } from './ChunkTextPanel';
+import { ChunkTextSection, chunkTextScope } from './ChunkTextPanel';
 import type { LoadChunkText } from './ChunkTextPanel';
 import { NeighbourList } from './NeighbourList';
 
@@ -62,6 +62,8 @@ export interface PointInspectorProps extends ContractPointInspectorProps {
 	onSelectNeighbour?(key: VectorKey): void;
 	/** Fetch a chunk's full text (the map binds `fetchChunkText` to its channel); offers Show full text. */
 	loadText?: LoadChunkText;
+	/** The connection the sample was drawn from: the full texts are kept per connection and sample. */
+	connectionKey?: string;
 	/** The active query's text, whose words the full text marks. */
 	query?: string | null;
 	/** The side this point is on as a Recommend example, or null. */
@@ -105,7 +107,7 @@ export function PointInspector(props: PointInspectorProps): React.ReactElement {
 				</p>
 			) : null}
 			{snippet ? <p style={{ ...MAP_STYLES.text, whiteSpace: 'pre-wrap', margin: '6px 0' }}>{snippet}</p> : <p style={MAP_STYLES.note}>This sample carries no text for its points (light mode).</p>}
-			{props.loadText || props.onShowText ? <ChunkTextSection key={sample.sampleId} sampleId={sample.sampleId} chunkKey={key} label={`${path} #${chunkId}`} query={props.query ?? null} loadText={props.loadText} onShowText={props.onShowText} hostText={props.text ?? null} /> : null}
+			{props.loadText || props.onShowText ? <ChunkTextSection key={chunkTextScope(props.connectionKey, sample.sampleId)} connectionKey={props.connectionKey} sampleId={sample.sampleId} chunkKey={key} label={`${path} #${chunkId}`} query={props.query ?? null} loadText={props.loadText} onShowText={props.onShowText} hostText={props.text ?? null} /> : null}
 			<div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, margin: '8px 0' }}>
 				<button type="button" style={MAP_STYLES.button} onClick={() => props.onOpenDocument(objectId, chunkId)}>
 					Open document
