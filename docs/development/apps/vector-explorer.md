@@ -344,7 +344,12 @@ the camera (`data-camera` on the map canvas) must not move on the second Fit. A
 lasso over part of the canvas must then take some of the points drawn but not
 all of them, and one over the whole canvas every one, so the matrix step's lasso
 over a cluster shown alone selects exactly that cluster, and the export step's
-selection is some of the sample, never the whole of it. The isolate step also
+selection is some of the sample, never the whole of it. Before it exports, the
+export step reads the Selection tab: its line ("N points selected from M
+documents") and the keys its Copy keys puts on the clipboard, emptied first so
+an earlier copy is not read. The CSV's rows must be exactly those keys, as many
+as the canvas counted, from M documents; any other points of the sample of the
+same number fail the step. The isolate step also
 reads the camera the app framed by itself after Isolate and after Show all, once
 the points stop: a Fit then must leave it where it is. The duplicates step
 computes the queue's groups from the sample the page holds (the node's pairs and
