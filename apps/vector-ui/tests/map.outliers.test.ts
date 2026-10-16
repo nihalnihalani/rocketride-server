@@ -12,7 +12,8 @@
 // node's own list first so 1 % is exactly what the node said. Each outlier
 // says why: its density against the sample's median, and its nearest
 // neighbour in the sample. Reviewed documents share the connection's
-// 'reviewed documents' cache with the duplicates queue.
+// registry's reviewed cache with the duplicates queue, kept per chunk under the
+// connection's own outliers scope.
 // =============================================================================
 
 import assert from 'node:assert/strict';
@@ -24,7 +25,7 @@ import { reviewedDocuments } from '../src/adapters/connections';
 import { connectionCaches } from '../src/adapters/explorer';
 import { markReviewed, reviewedOf } from '../src/map/dedupe';
 import { neighboursOf } from '../src/map/model';
-import { OUTLIER_PERCENTILES, medianOf, outlierCount, outlierRows, outliersAt, whyText } from '../src/map/outliers';
+import { OUTLIER_PERCENTILES, medianOf, outlierCount, outlierKey, outlierRows, outliersAt, outliersScope, whyText } from '../src/map/outliers';
 import { loadSample } from './support/map.samples';
 import type { SampleFixture } from './support/map.samples';
 
@@ -95,15 +96,23 @@ test('why: density against the sample median and the nearest neighbour in the sa
 	assert.equal(medianOf([]), 0);
 });
 
-test("reviewed outliers are the connection's reviewed documents (shared with the duplicates queue), cleared through the registry", () => {
+test('reviewed outliers are kept per chunk, apart from the duplicates queue, per connection, cleared through the registry', () => {
 	const demo = loadSample('sample_demo_1000.json');
 	const ocr = demo.docs[demo.points.doc[262] as number]!.objectId;
+	const first = outlierRows(demo, 1).find((r) => r.objectId === ocr)!;
+	markReviewed(reviewedDocuments, outliersScope('conn-o'), [outlierKey(first)]);
+	const rows = outlierRows(demo, 1, [], reviewedOf(reviewedDocuments, outliersScope('conn-o')));
+	assert.deepEqual(
+		rows.filter((r) => r.reviewed).map((r) => r.index),
+		[first.index],
+		'only the chunk marked, not the other outliers of its document'
+	);
+	assert.ok(rows.filter((r) => r.objectId === ocr).length > 1, 'its document has other outliers');
 	markReviewed(reviewedDocuments, 'conn-o', [ocr]);
-	const rows = outlierRows(demo, 1, [], reviewedOf(reviewedDocuments, 'conn-o'));
-	assert.ok(rows.filter((r) => r.objectId === ocr).every((r) => r.reviewed));
-	assert.ok(rows.filter((r) => r.objectId !== ocr).every((r) => !r.reviewed));
+	assert.ok(outlierRows(demo, 1, [], reviewedOf(reviewedDocuments, outliersScope('conn-o'))).filter((r) => r.reviewed).length === 1, "a duplicates group marked reviewed does not mark the document's outliers");
+	assert.equal(reviewedOf(reviewedDocuments, outliersScope('conn-other')).size, 0, 'another connection has its own');
 	connectionCaches.clearAll();
-	assert.equal(reviewedOf(reviewedDocuments, 'conn-o').size, 0);
+	assert.equal(reviewedOf(reviewedDocuments, outliersScope('conn-o')).size, 0);
 });
 
 test('the percentile issues no call: the review and its panel import no call module and hold no channel', () => {

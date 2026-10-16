@@ -30,8 +30,9 @@
 // the node's own list. Each row says why (density against the sample's
 // median, nearest neighbour in the sample) and offers Show neighbours, Mark
 // reviewed and Remove document (the console confirms; without writes the
-// button is disabled with the reason as text). Reviewed documents are the
-// connection's 'reviewed documents' cache, shared with the duplicates queue.
+// button is disabled with the reason as text). A reviewed outlier is its
+// chunk, kept in the registry's reviewed cache under the connection's
+// outliers scope, apart from the documents the duplicates queue marks.
 // =============================================================================
 
 import React, { useCallback, useMemo, useState } from 'react';
@@ -39,7 +40,7 @@ import type { Availability, OutliersPanelProps as ContractOutliersPanelProps } f
 import { reviewedDocuments } from '../adapters/connections';
 import { markReviewed, reviewedOf, unmarkReviewed } from '../map/dedupe';
 import type { ReviewedCache } from '../map/dedupe';
-import { OUTLIER_PERCENTILES, outlierRows } from '../map/outliers';
+import { OUTLIER_PERCENTILES, outlierKey, outlierRows, outliersScope } from '../map/outliers';
 import type { IOutlierRow, OutlierPercentile } from '../map/outliers';
 import { OUTLIERS_NONE, OUTLIERS_NOTE, outliersStatus } from '../map/reviewWording';
 import { MAP_STYLES } from '../map/styles';
@@ -48,7 +49,7 @@ import { MAP_STYLES } from '../map/styles';
 export interface OutliersPanelProps extends ContractOutliersPanelProps {
 	/** The starting percentile (a host restoring it; the tests). */
 	initial?: { percentile?: OutlierPercentile };
-	/** The reviewed documents per connection (default: the registry's 'reviewed documents'). */
+	/** The reviewed cache (default: the registry's; outliers live under outliersScope(connectionKey)). */
 	reviewedCache?: ReviewedCache;
 }
 
@@ -64,7 +65,8 @@ export interface OutliersBodyProps {
 	canShowNeighbours: boolean;
 	onPercentile(pct: OutlierPercentile): void;
 	onSelect(index: number): void;
-	onReview(objectId: string, reviewed: boolean): void;
+	/** Mark or unmark one outlier (its outlierKey). */
+	onReview(key: string, reviewed: boolean): void;
 	onRemove(objectId: string): void;
 	onShowNeighbours(index: number): void;
 }
@@ -110,7 +112,7 @@ export function OutliersBody(props: OutliersBodyProps): React.ReactElement {
 									Show neighbours
 								</button>
 							) : null}
-							<button type="button" style={MAP_STYLES.button} onClick={() => props.onReview(row.objectId, !row.reviewed)}>
+							<button type="button" style={MAP_STYLES.button} onClick={() => props.onReview(outlierKey(row), !row.reviewed)}>
 								{row.reviewed ? 'Review again' : 'Mark reviewed'}
 							</button>
 							{props.canRemove ? (
@@ -137,28 +139,29 @@ export function OutliersPanel(props: OutliersPanelProps): React.ReactElement {
 	const cache = props.reviewedCache ?? reviewedDocuments;
 	const [local, setLocal] = useState<ReadonlySet<string>>(() => new Set());
 	const [tick, setTick] = useState(0);
-	const reviewed = props.connectionKey ? reviewedOf(cache, props.connectionKey) : local;
+	const scope = props.connectionKey ? outliersScope(props.connectionKey) : null;
+	const reviewed = scope !== null ? reviewedOf(cache, scope) : local;
 	const result = props.sample.result;
 	const removed = props.sample.removed;
 	// eslint-disable-next-line react-hooks/exhaustive-deps
 	const rows = useMemo(() => outlierRows(result, percentile, removed, reviewed), [result, percentile, removed, reviewed, tick]);
 
 	const onReview = useCallback(
-		(objectId: string, value: boolean): void => {
-			if (props.connectionKey) {
-				if (value) markReviewed(cache, props.connectionKey, [objectId]);
-				else unmarkReviewed(cache, props.connectionKey, [objectId]);
+		(key: string, value: boolean): void => {
+			if (scope !== null) {
+				if (value) markReviewed(cache, scope, [key]);
+				else unmarkReviewed(cache, scope, [key]);
 				setTick((t) => t + 1);
 				return;
 			}
 			setLocal((prev) => {
 				const next = new Set(prev);
-				if (value) next.add(objectId);
-				else next.delete(objectId);
+				if (value) next.add(key);
+				else next.delete(key);
 				return next;
 			});
 		},
-		[cache, props.connectionKey]
+		[cache, scope]
 	);
 
 	if (result.outliers.length === 0) return <p style={MAP_STYLES.note}>{OUTLIERS_NONE}</p>;

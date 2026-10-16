@@ -23,7 +23,7 @@ import { RecommendBody, RecommendPanel } from '../src/components/RecommendPanel'
 import type { RecommendBodyProps } from '../src/components/RecommendPanel';
 import type { Availability, IDocumentItem, IDocumentRowsSource, IKnnBlock, IRecommendResult, ISampleModel, ISampleResult, IVectorCapabilities, IVectorLimits, VectorKey } from '../src/contract/types';
 import { dedupeView, docInfo, queueInit, queueReducer, queued } from '../src/map/dedupe';
-import { outlierRows } from '../src/map/outliers';
+import { outlierKey, outlierRows, outliersScope } from '../src/map/outliers';
 import { EMPTY_EXAMPLES, recommendRows, resolvedLine } from '../src/map/recommend';
 import { fixture } from './support/fixtures';
 import { loadSample, modelOf } from './support/map.samples';
@@ -344,18 +344,20 @@ test('the outlier buttons hand the host the point or its document', () => {
 	button(tree, 'Remove document').props.onClick();
 	assert.deepEqual(picked, [262]);
 	assert.deepEqual(neighbours, [262]);
-	assert.deepEqual(reviewed, [[rows[0]!.objectId, true]]);
+	assert.deepEqual(reviewed, [[outlierKey(rows[0]!), true]], 'Mark reviewed marks the chunk');
 	assert.deepEqual(removed, [rows[0]!.objectId]);
 });
 
-test("reviewed outliers are tagged and counted, from the connection's cache", () => {
-	const ocr = demo.result.docs[demo.result.points.doc[262] as number]!.objectId;
-	const cache = new Map<string, ReadonlySet<string>>([['conn-o', new Set([ocr])]]);
+test("reviewed outliers are tagged and counted per chunk, from the connection's cache", () => {
+	const first = outlierRows(demo.result, 1)[0]!;
+	const cache = new Map<string, ReadonlySet<string>>([
+		[outliersScope('conn-o'), new Set([outlierKey(first)])],
+		['conn-o', new Set([first.objectId])],
+	]);
 	const out = html(<OutliersPanel sample={demo} onSelect={noop} connectionKey="conn-o" reviewedCache={cache} />);
-	const ocrRows = outlierRows(demo.result, 1).filter((r) => r.objectId === ocr).length;
-	assert.equal((out.match(/>reviewed</g) ?? []).length, ocrRows);
-	assert.equal((out.match(/>Review again</g) ?? []).length, ocrRows);
-	assert.match(out, new RegExp(`10 points: the lowest 1 % by density · ${ocrRows} reviewed`));
+	assert.equal((out.match(/>reviewed</g) ?? []).length, 1, 'the one chunk marked, not every outlier of its document');
+	assert.equal((out.match(/>Review again</g) ?? []).length, 1);
+	assert.match(out, /10 points: the lowest 1 % by density · 1 reviewed/);
 });
 
 test('no outliers: the sentence, and nothing to pick', () => {
