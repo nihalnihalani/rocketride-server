@@ -40,9 +40,9 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { Button } from 'shell';
 import type { Availability, IDocumentItem, IDocumentsFilter, IExportItem, IScopeState, ISavedFilter } from '../contract/types';
 import type { IRemoveTarget } from '../vector/confirm';
-import { buildGroups, directoryHeading, documentExportRows, pagerFooter, pagerProgressText } from '../vector/documents';
+import { buildGroups, directoryHeading, pagerFooter, pagerProgressText } from '../vector/documents';
 import type { IDirectoryGroup, IDirectoryRow, IPagerState } from '../vector/documents';
-import { FILTER_DEBOUNCE_MS, directoryView, scopeWith, withText } from '../vector/filters';
+import { FILTER_DEBOUNCE_MS, directoryExportItems, directoryView, scopeWith, withText } from '../vector/filters';
 import { medianChunks } from '../vector/health';
 import type { ConditionKind } from '../vector/filters';
 import { DEFAULT_LIMITS } from '../vector/results';
@@ -164,11 +164,8 @@ export function DocumentDirectory({ pager, selectedId, writes, onSelect, onRemov
 	const median = useMemo(() => (pager.status === 'loading' || pager.status === 'idle' ? null : medianChunks(pager.rows)), [pager.status, pager.rows]);
 	const groups = useMemo(() => buildGroups(matches, { medianChunks: median }), [matches, median]);
 	const folders = useMemo(() => [...new Set(groups.filter((g) => g.kind === 'folder').map((g) => g.label))], [groups]);
-	const exportItems = useMemo<IExportItem[]>(() => {
-		const items: IExportItem[] = [{ id: 'directory-loaded', label: `Loaded documents (${pager.rows.length.toLocaleString('en-US')})`, kind: 'documents', disabled: pager.rows.length === 0 ? 'Nothing loaded yet' : null, rows: () => documentExportRows(pager.rows) }];
-		if (scope !== null) items.push({ id: 'directory-scope', label: `Documents in scope (${matches.length.toLocaleString('en-US')})`, kind: 'documents', disabled: matches.length === 0 ? 'No document matches the scope' : null, rows: () => documentExportRows(matches) });
-		return items;
-	}, [pager.rows, scope, matches]);
+	// "Documents in scope" holds the scope's own documents even while its Documents toggle is off (vector/filters.ts).
+	const exportItems = useMemo<IExportItem[]>(() => directoryExportItems(pager, view), [pager, view]);
 	const lines = useMemo<Line[]>(() => {
 		const out: Line[] = [];
 		for (const group of groups) {

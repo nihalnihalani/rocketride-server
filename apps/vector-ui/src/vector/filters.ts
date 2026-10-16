@@ -42,7 +42,9 @@
 // about what it applies and nothing is counted: the scope is loading
 // (`'pending'`). A count matched here over a listing that stopped short
 // (capped, stalled) is only of the rows loaded, and the words say that too
-// ("N of M loaded match", "at least").
+// ("N of M loaded match", "at least"). The directory's "Documents in scope"
+// export holds the scope's own loaded documents, whether or not the list is
+// filtered by it (`directoryExportItems`).
 // Without a condition the path box is not a scope and is never sent: it
 // filters what is loaded, as it always did. A saved filter keeps the
 // conditions only (`conditionsFilter`).
@@ -54,9 +56,9 @@
 // cap. Nothing here is kept outside memory.
 // =============================================================================
 
-import type { Availability, FilterApplied, IDocumentItem, IDocumentsFilter, IScopeState, IStatsResult } from '../contract/types';
+import type { Availability, FilterApplied, IDocumentItem, IDocumentsFilter, IExportItem, IScopeState, IStatsResult } from '../contract/types';
 import { DOCUMENTS_FILTER_KEYS } from '../contract/types';
-import { filterItems, filterSummary } from './documents';
+import { documentExportRows, filterItems, filterSummary } from './documents';
 import type { IPagerState } from './documents';
 import type { IStatsView } from './results';
 
@@ -688,6 +690,11 @@ export interface IDirectoryView {
 	summary: string | null;
 	/** What the directory knows about the scope, or null without one. */
 	scope: IScopeView | null;
+	/**
+	 * The loaded documents the scope keeps, whatever its Documents toggle (on, they are the rows listed);
+	 * null without a scope, or while the store has not answered for it.
+	 */
+	scopeRows: IDocumentItem[] | null;
 }
 
 /** The status line while the store has not answered for a scope yet. */
@@ -709,17 +716,43 @@ export const SCOPE_LOADING_TEXT = 'Loading the documents in scope…';
 export function directoryView(dir: IPagerState, scope: IScopeState | null, text: string, cap: number): IDirectoryView {
 	if (scope === null) {
 		const rows = filterItems(dir.rows, text);
-		return { rows, summary: filterSummary(dir, text, rows.length), scope: null };
+		return { rows, summary: filterSummary(dir, text, rows.length), scope: null, scopeRows: null };
 	}
 	const view = scopeView(scope, dir, cap);
 	const listed = scope.applyTo.documents ? null : filterItems(dir.rows, text);
 	// The store has not answered for the scope: say it is loading (a failed first page: the footer says why, with Retry).
-	if (view.applied === 'pending') return { rows: listed ?? [], summary: dir.status === 'loading' ? SCOPE_LOADING_TEXT : null, scope: view };
-	if (listed !== null) return { rows: listed, summary: `Not applied to this list. Scope: ${scopeStatusText(view)}`, scope: view };
+	if (view.applied === 'pending') return { rows: listed ?? [], summary: dir.status === 'loading' ? SCOPE_LOADING_TEXT : null, scope: view, scopeRows: null };
 	const asked = view.applied !== 'here';
 	const keys = clientKeys(scope.filter, asked ? dir.filterApplied : null, dir.filterIgnored);
-	const rows = keys.length === 0 ? [...dir.rows] : dir.rows.filter((row) => matches(row, scope.filter, keys));
-	return { rows, summary: scopeStatusText(view), scope: view };
+	const scopeRows = keys.length === 0 ? [...dir.rows] : dir.rows.filter((row) => matches(row, scope.filter, keys));
+	if (listed !== null) return { rows: listed, summary: `Not applied to this list. Scope: ${scopeStatusText(view)}`, scope: view, scopeRows };
+	return { rows: scopeRows, summary: scopeStatusText(view), scope: view, scopeRows };
+}
+
+/**
+ * The directory's export items: the loaded documents, and with a scope the
+ * loaded documents it keeps (whatever its Documents toggle). The scope's
+ * label says "Loaded documents in scope" while its listing has not loaded
+ * every document, so the count never reads as the scope's whole size.
+ *
+ * @param dir - The listing.
+ * @param view - The directory's view of it ({@link directoryView}).
+ * @returns The items.
+ */
+export function directoryExportItems(dir: IPagerState, view: IDirectoryView): IExportItem[] {
+	const items: IExportItem[] = [{ id: 'directory-loaded', label: `Loaded documents (${dir.rows.length.toLocaleString('en-US')})`, kind: 'documents', disabled: dir.rows.length === 0 ? 'Nothing loaded yet' : null, rows: () => documentExportRows(dir.rows) }];
+	if (view.scope === null) return items;
+	const rows = view.scopeRows;
+	if (rows === null) {
+		items.push({ id: 'directory-scope', label: 'Documents in scope', kind: 'documents', disabled: 'The documents in scope have not loaded yet', rows: () => documentExportRows([]) });
+		return items;
+	}
+	// Every document the scope keeps is loaded: the listing asked for the scope (or for every document) and ended complete.
+	const complete = (view.scope.current || dir.filter === null) && (dir.status === 'done' || (dir.total !== null && dir.rows.length >= dir.total));
+	const label = `${complete ? 'Documents in scope' : 'Loaded documents in scope'} (${rows.length.toLocaleString('en-US')})`;
+	const disabled = rows.length > 0 ? null : complete ? 'No document matches the scope' : 'No loaded document matches the scope';
+	items.push({ id: 'directory-scope', label, kind: 'documents', disabled, rows: () => documentExportRows(rows) });
+	return items;
 }
 
 // =============================================================================

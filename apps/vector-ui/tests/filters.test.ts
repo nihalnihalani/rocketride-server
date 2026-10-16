@@ -13,7 +13,7 @@ import type { IDocumentItem, IDocumentsFilter, IScopeState } from '../src/contra
 import { DOCUMENTS_FILTER_KEYS } from '../src/contract/types';
 import { pagerApplyPage, pagerBegin, pagerFail, pagerInit } from '../src/vector/documents';
 import type { IPagerState } from '../src/vector/documents';
-import { EMPTY_FILTER, FILTER_TEXT_MAX, clientKeys, conditionAvailability, conditionsFilter, directoryView, scopeView, conditionLabel, dateToIso, describeFilter, fromDocumentsFilter, listingFilter, matches, parseFilter, removeCondition, resolveScope, sameFilter, scopeAvailability, scopeFromFilter, scopeWith, filterOf, withText, scopeObjectIds, scopeStatusText, scopeStripText, setCondition, toDocumentsFilter, tooLargeText, validateFilter } from '../src/vector/filters';
+import { EMPTY_FILTER, FILTER_TEXT_MAX, clientKeys, conditionAvailability, conditionsFilter, directoryExportItems, directoryView, scopeView, conditionLabel, dateToIso, describeFilter, fromDocumentsFilter, listingFilter, matches, parseFilter, removeCondition, resolveScope, sameFilter, scopeAvailability, scopeFromFilter, scopeWith, filterOf, withText, scopeObjectIds, scopeStatusText, scopeStripText, setCondition, toDocumentsFilter, tooLargeText, validateFilter } from '../src/vector/filters';
 import type { IFilter } from '../src/vector/filters';
 import { readDocumentsPage, readStats } from '../src/vector/results';
 import { fixture } from './support/fixtures';
@@ -409,6 +409,58 @@ test('before the store answers for a scope: no word about what it applies and no
 	const server = pagerApplyPage(loading, readDocumentsPage({ success: true, items: [], next_cursor: null, total: 0, counts_exact: true, distinct: true, sorted: true, caveats: [], filter_applied: 'server', filter_ignored: [] }));
 	assert.equal(directoryView(server, scope, 'fal', 2_000).summary, '0 documents match (store)');
 	assert.equal(scopeStripText(scopeView(scope, server, 2_000), stats), 'Scope: 0 of 42 documents · 0 chunks (counted here)');
+});
+
+test("the directory's export: 'Documents in scope' holds the scope's own documents whatever the Documents toggle, and says when it is only the loaded ones", () => {
+	const all = pagerApplyPage(pagerApplyPage(pagerBegin(pagerInit()), readDocumentsPage(fixture('documents_page1'))), readDocumentsPage(fixture('documents_page2_last')));
+	assert.equal(all.status, 'done');
+	assert.equal(all.rows.length, 7);
+	const filter = { path_prefix: 'C:/demo/greenhouse/' };
+	const inScope = (rows: ReadonlyArray<Record<string, unknown>>): boolean => rows.every((row) => String(row.path).startsWith(filter.path_prefix));
+	const item = (items: ReturnType<typeof directoryExportItems>, id: string) => {
+		const found = items.find((i) => i.id === id);
+		assert.ok(found, id);
+		return found;
+	};
+	// No scope: the loaded documents only.
+	assert.deepEqual(
+		directoryExportItems(all, directoryView(all, null, '', 2_000)).map((i) => [i.id, i.label]),
+		[['directory-loaded', 'Loaded documents (7)']]
+	);
+	// The Documents toggle off: the list shows all 7, the scope item holds the scope's 2.
+	const off = directoryExportItems(all, directoryView(all, scopeOf(filter, { documents: false }), '', 2_000));
+	assert.equal(item(off, 'directory-loaded').label, 'Loaded documents (7)');
+	const offScope = item(off, 'directory-scope');
+	const offRows = offScope.rows?.().rows ?? [];
+	assert.equal(offScope.label, `Documents in scope (${offRows.length})`);
+	assert.equal(offRows.length, 2);
+	assert.ok(inScope(offRows), 'every exported row is in the scope');
+	assert.equal(offScope.disabled, null);
+	// The toggle on, the store applied the scope: the same 2.
+	const server = listed(readDocumentsPage(fixture('documents_filter_server')).items, filter, { filter_applied: 'server', filter_ignored: [] });
+	const onScope = item(directoryExportItems(server, directoryView(server, scopeOf(filter), '', 2_000)), 'directory-scope');
+	assert.equal(onScope.label, 'Documents in scope (2)');
+	assert.ok(inScope(onScope.rows?.().rows ?? []));
+	// The toggle just turned on, the list not yet listed again: every document is loaded, so the match is the whole scope.
+	assert.equal(item(directoryExportItems(all, directoryView(all, scopeOf(filter), '', 2_000)), 'directory-scope').label, 'Documents in scope (2)');
+	// A finished listing for other conditions: its matches are only part of the scope.
+	const other = listed(readDocumentsPage(fixture('documents_filter_server')).items, { path_prefix: 'C:/demo/' }, { filter_applied: 'server', filter_ignored: [] });
+	assert.equal(item(directoryExportItems(other, directoryView(other, scopeOf(filter), '', 2_000)), 'directory-scope').label, 'Loaded documents in scope (2)');
+	// The store has not answered for the scope yet: nothing to export under its name.
+	const loading = pagerBegin(pagerInit(), filter);
+	const waiting = item(directoryExportItems(loading, directoryView(loading, scopeOf(filter), '', 2_000)), 'directory-scope');
+	assert.equal(waiting.label, 'Documents in scope');
+	assert.equal(waiting.disabled, 'The documents in scope have not loaded yet');
+	// A listing that stopped short: the item says it holds the loaded ones only.
+	const capped = paged(filter, 2, (i) => doc(`g${i}`, `C:/demo/greenhouse/${i}.md`), { total: 3_000, filter_applied: 'server', filter_ignored: [] }, true);
+	assert.equal(capped.status, 'loading');
+	const part = item(directoryExportItems(capped, directoryView(capped, scopeOf(filter), '', 2_000)), 'directory-scope');
+	assert.equal(part.label, 'Loaded documents in scope (1,000)');
+	assert.equal(part.rows?.().rows.length, 1_000);
+	// Nothing in scope among the loaded rows: disabled with the reason.
+	const none = item(directoryExportItems(all, directoryView(all, scopeOf({ path_prefix: 'C:/nothing/' }, { documents: false }), '', 2_000)), 'directory-scope');
+	assert.equal(none.label, 'Documents in scope (0)');
+	assert.equal(none.disabled, 'No document matches the scope');
 });
 
 test('above the cap: overflow with the count (from the store total when it said), no ids; resolution is stable', () => {

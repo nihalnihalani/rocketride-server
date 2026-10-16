@@ -20,7 +20,7 @@ import { test } from 'node:test';
 import React from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import type { IRoleChannel } from 'shared/explorer';
-import type { ConsoleActions, ConsoleModel, IDialectResult, IDocumentItem, IScopeState, VectorChannels } from '../src/contract/types';
+import type { ConsoleActions, ConsoleModel, IDialectResult, IDocumentItem, IExportItem, IScopeState, VectorChannels } from '../src/contract/types';
 import { fixture } from './support/fixtures';
 
 // The shell's building blocks exist only inside a running shell: plain stand-ins that render their text.
@@ -48,6 +48,15 @@ moduleWithLoad._load = function (request: string, parent: unknown, isMain: boole
 	if (request === 'shell') return shellStandIn;
 	return originalLoad.call(this, request, parent, isMain);
 };
+
+// The directory's export items as the ExportMenu receives them: a stand-in that records its props.
+let exportItems: readonly IExportItem[] = [];
+function ExportMenuStandIn(props: { items: readonly IExportItem[] }): React.ReactElement {
+	exportItems = props.items;
+	return <span data-component="ExportMenu" />;
+}
+const exportMenuPath = require.resolve('../src/components/ExportMenu');
+require.cache[exportMenuPath] = { id: exportMenuPath, filename: exportMenuPath, loaded: true, exports: { __esModule: true, default: ExportMenuStandIn, ExportMenu: ExportMenuStandIn } } as never;
 
 const { createSelectionStore } = require('../src/contract/bridge') as typeof import('../src/contract/bridge');
 const { DocumentDirectory } = require('../src/components/DocumentDirectory') as typeof import('../src/components/DocumentDirectory');
@@ -226,4 +235,21 @@ test("a scope's listing before the store answers: the status line says it is loa
 	const failed = directory(pagerFail(loading, { headline: 'The store did not answer in time.' }));
 	assert.doesNotMatch(failed, /role="status">[^<]*(match|cannot filter|Loading)/, 'no status line about the scope');
 	assert.match(failed, /<span>Loading stopped at 0 documents: The store did not answer in time\.<\/span><button[^>]*>Retry<\/button>/);
+});
+
+test("the directory's export with the Documents toggle off: 'Documents in scope' holds only the scope's documents, its count in the label", () => {
+	const pager = pagerApplyPage(pagerApplyPage(pagerBegin(pagerInit()), readDocumentsPage(fixture('documents_page1'))), readDocumentsPage(fixture('documents_page2_last')));
+	const prefix = 'C:/demo/greenhouse/';
+	const html = renderToStaticMarkup(<DocumentDirectory pager={pager} selectedId={null} writes={on} onSelect={noop} onRemove={noop} onLoadMore={noop} onRetry={noop} scope={scopeOf({ path_prefix: prefix }, false)} onScope={noop} />);
+	assert.match(html, /role="status">Not applied to this list\. Scope: 2 of 7 loaded match \(filtered here\)<\/div>/);
+	assert.equal(exportItems.find((i) => i.id === 'directory-loaded')?.label, 'Loaded documents (7)', 'the list on screen');
+	const scoped = exportItems.find((i) => i.id === 'directory-scope');
+	assert.ok(scoped);
+	const rows = scoped.rows?.().rows ?? [];
+	assert.equal(scoped.label, `Documents in scope (${rows.length})`);
+	assert.equal(rows.length, 2);
+	assert.ok(
+		rows.every((row) => String(row.path).startsWith(prefix)),
+		'every exported row is in the scope'
+	);
 });
