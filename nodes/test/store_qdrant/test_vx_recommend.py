@@ -348,6 +348,28 @@ def test_recommend_native_drops_unknown_examples_and_keeps_the_rest():
     assert len(docs) == 19 and ('doc-1', 0) not in _keys(docs)
 
 
+def test_recommend_native_never_turns_positives_that_resolve_to_nothing_into_a_negatives_only_query():
+    store = make_store(drv, collection='vx_rec')
+    _corpus(store)
+    store.getVectors([('doc-1', 0)])  # the driver remembers the point id
+    store.removeCounted(['doc-1'])
+    before = Client.calls.get('query_points', 0)
+    for positive in ([('ghost', 0)], [('doc-1', 0)], [('schema', 0)], [('ghost', 0), ('doc-1', 0), ('schema', 0)]):
+        docs = store.recommendNative(positive=positive, negative=[('doc-2', 1)], strategy='best_score', limit=5)
+        assert docs == [], positive
+    assert Client.calls.get('query_points', 0) == before, 'positives were asked for, none is stored'
+    with_vector = store.recommendNative(
+        positive=[('ghost', 0)],
+        negative=[('doc-2', 1)],
+        vector=_vector_of(store, ('doc-3', 2)).tolist(),
+        strategy='best_score',
+        limit=3,
+    )
+    assert _keys(with_vector)[0] == ('doc-3', 2), 'the query vector is a positive example of its own'
+    alone = store.recommendNative(positive=[], negative=[('doc-2', 1)], strategy='best_score', limit=5)
+    assert len(alone) == 5 and all(d.score < 0 for d in alone), 'negatives alone, as asked, are still answered'
+
+
 def test_recommend_native_on_a_missing_collection_is_empty():
     store = make_store(drv, collection='vx_absent')
     assert store.recommendNative(positive=[('doc-0', 0)], negative=[], strategy='best_score', limit=5) == []
