@@ -337,6 +337,22 @@ out), skipping a file with a `NEEDS:` reason while it is still a placeholder;
 example the merged app from a lane branch whose own copy still holds the
 placeholders.
 
+A lasso is only as good as the camera under it. Isolate, Show all and Show only
+cluster move the points (the shown ones fill the layout, over a short tween), so
+the lane fits the map once no frame has been drawn for 700 ms and fits it again:
+the camera (`data-camera` on the map canvas) must not move on the second Fit. A
+lasso over part of the canvas must then take some of the points drawn but not
+all of them, and one over the whole canvas every one, so the matrix step's lasso
+over a cluster shown alone selects exactly that cluster, and the export step's
+selection is some of the sample, never the whole of it. The isolate step also
+reads the camera the app framed by itself after Isolate and after Show all, once
+the points stop: a Fit then must leave it where it is. The duplicates step
+computes the queue's groups from the sample the page holds (the node's pairs and
+the kNN edges at or above the threshold, groups across documents only), moves
+the slider to the first position below its start at which they change, reads
+the panel's groups again, and requires the sample's groups there, with no
+`sample` frame.
+
 The perf lane (`lane_vector_perf.cjs`) measures the map's edges per mode
 (`EDGE_MODES`: none, tree, neighbours:3, neighbours:5) on its 2,000-point
 detailed sample, at 1x and 4x CPU throttling. Before the shell loads it sets
