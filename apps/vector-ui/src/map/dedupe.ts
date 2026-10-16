@@ -34,19 +34,35 @@
 // ("repeated text inside one document"), never offering to remove it.
 //
 // A keep policy (oldest ingest, shortest path, most chunks) or a hand-picked
-// keep chooses one document per group; the others are queued for removal,
-// except a document another group keeps. A policy only chooses in a group
-// of copies. A document is a copy when at least half of the chunks the store
-// holds of it are sampled and in the group, or when the sampler drew at least
-// 3 of its chunks and four in five of them are in the group (the sample's
-// own evidence, so a copy is still found where the sample caps cover a small
-// share of a large store). Chunks pinned on purpose (include_keys) are not
-// that evidence: a search for a shared section pins exactly the chunks that
-// match. One shared chunk never makes a longer document a copy, and a
-// paragraph several files share is never queued by a policy, however thinly
-// the sample covers them. Removal itself is the console's: the panel hands
-// the queued objectIds to `requestRemove`, which confirms with the typed
-// count and sends `remove_document` in batches.
+// keep chooses one document per group. A policy queues another document of
+// the group only when the sample shows the kept one holds it: at least four
+// in five of its stored chunks. That is decided per document, never per group,
+// so a revision that added chapters is never queued behind its original.
+//
+// The sample is evidence in two ways. What it holds is certain: a sampled
+// chunk that pairs with the kept document is known to be in it, so a document
+// with four in five of its stored chunks matched is held. Beyond that, the
+// sampler draws each document's chunks on its own (chunk 0 first in a
+// stratified sample, the rest a uniform subset per document), so a sampled
+// chunk of a copy pairs only when its twin was drawn too: the share of
+// matches is about the partner's coverage, not 1. Each matched drawn chunk is
+// therefore weighted by the rate at which the partner's chunks were drawn,
+// and a document counts as held only when that estimate is at least nine in
+// ten and the sample holds enough of both to rule out seven in ten (one-sided,
+// 1%). It holds text of its own only when its matches are too few for a
+// document held whole (under 0.1% chance; with the partner in the sample
+// whole, any unmatched sampled chunk). Otherwise the group says the sample
+// cannot tell yet, or holds too few chunks, or that the store did not report
+// the chunk counts, or that the sample was not drawn evenly. Chunks pinned on
+// purpose (include_keys) are certain points: they count once, never weighted
+// up, since a search for a shared section pins exactly the chunks that match.
+//
+// A hand-picked keep queues the others as the user chose, and the line under
+// a document the sample does not show to be held says so. A document kept by
+// hand in any group, reviewed or not, is never queued by another; a policy's
+// keep protects its document when its group queues something. Removal itself
+// is the console's: the panel hands the queued objectIds to `requestRemove`,
+// which confirms with the typed count and sends `remove_document` in batches.
 //
 // The reviewed documents of a connection live in the registry's 'reviewed
 // documents' cache (adapters/connections.ts), cleared on a change of
@@ -218,6 +234,29 @@ export interface IDocumentGroup extends IDuplicateGroup {
 	drawn: Readonly<Record<string, number>>;
 	/** The pairs inside the group, most similar first. */
 	pairs: readonly IDuplicatePair[];
+	/** What the whole sample shows at this threshold (one object shared by every group of a view). */
+	evidence: ICopyEvidence;
+}
+
+/**
+ * What the sample shows about which documents hold which, at one threshold:
+ * how each point was drawn and which documents it pairs with. Shared by every
+ * group of a view, so a document's evidence counts its pairs in every group
+ * (three copies drawn unevenly split into several groups).
+ */
+export interface ICopyEvidence {
+	/** True when the sampler drew evenly within each document ('stratified' or 'random', no refill). */
+	uniform: boolean;
+	/** Per point: 1 when it is certain to be in the sample (pinned by include_keys, or chunk 0, which a stratified sample takes first). */
+	census: Uint8Array;
+	/** Per point: 1 when every one of its kNN neighbours is at or above the threshold (a twin may lie beyond the row). */
+	crowded: Uint8Array;
+	/** Per point: the other documents it pairs with, true when one of the partner's points it pairs with is certain to be in the sample. */
+	partners: ReadonlyArray<ReadonlyMap<string, boolean> | undefined>;
+	/** Per document: its points. */
+	pointsOf: ReadonlyMap<string, readonly number[]>;
+	/** Containment answers already worked out, per documents map. */
+	memo: WeakMap<ReadonlyMap<string, IDocInfo>, Map<string, IContainment>>;
 }
 
 /** What the duplicates queue shows at one threshold. */
@@ -229,6 +268,55 @@ export interface IDedupeView {
 	groups: IDocumentGroup[];
 	/** Groups inside one document, numbered after `groups`. */
 	repeated: IDocumentGroup[];
+}
+
+/**
+ * The evidence of a view: how each point was drawn, whether its kNN row is
+ * crowded with near-duplicates, and the documents each point pairs with.
+ *
+ * @param sample - The `sample` answer.
+ * @param threshold - The similarity a pair needs.
+ * @param pairs - The view's pairs (documents removed already left out).
+ * @param objectOf - A point's objectId.
+ * @param gone - objectIds removed since the sample was drawn.
+ * @returns The evidence.
+ */
+function copyEvidence(sample: ISampleResult, threshold: number, pairs: readonly IDuplicatePair[], objectOf: (i: number) => string, gone: ReadonlySet<string>): ICopyEvidence {
+	const n = sample.n;
+	const strategy = sample.strategy_used ?? 'stratified';
+	const census = new Uint8Array(Math.max(0, n));
+	const crowded = new Uint8Array(Math.max(0, n));
+	const pointsOf = new Map<string, number[]>();
+	for (let i = 0; i < n; i += 1) {
+		const id = objectOf(i);
+		if (gone.has(id)) continue;
+		if (sample.points.pinned[i] || (strategy === 'stratified' && sample.points.chunk[i] === 0)) census[i] = 1;
+		const list = pointsOf.get(id);
+		if (list) list.push(i);
+		else pointsOf.set(id, [i]);
+	}
+	const { k, offsets_row: offsets, sims } = sample.knn;
+	for (let i = 0; i < offsets.length - 1 && i < n; i += 1) {
+		const start = offsets[i] as number;
+		const end = offsets[i + 1] as number;
+		if (k <= 0 || end - start < k) continue;
+		let full = true;
+		for (let e = start; e < end && full; e += 1) full = (sims[e] as number) >= threshold;
+		if (full) crowded[i] = 1;
+	}
+	const partners: Array<Map<string, boolean> | undefined> = new Array(Math.max(0, n));
+	const link = (i: number, j: number): void => {
+		const other = objectOf(j);
+		if (other === objectOf(i)) return;
+		const map = partners[i] ?? new Map<string, boolean>();
+		partners[i] = map;
+		map.set(other, (map.get(other) ?? false) || census[j] === 1);
+	};
+	for (const { a, b } of pairs) {
+		link(a, b);
+		link(b, a);
+	}
+	return { uniform: strategy !== 'first' && !sample.biased, census, crowded, partners, pointsOf, memo: new WeakMap() };
 }
 
 /**
@@ -261,6 +349,7 @@ export function dedupeView(sample: ISampleResult, threshold: number, removed: re
 		} else merged.set(key, { objectIds, points: [...group.points], chunkGroups: 1, simMin: group.simMin, simMax: group.simMax, pairs: [] });
 	}
 	for (const pair of pairs) merged.get(keyOfGroup[groupOfPoint[pair.a] as number] as string)?.pairs.push(pair);
+	const evidence = copyEvidence(sample, threshold, pairs, objectOf, gone);
 	const all = [...merged.entries()].map(([key, g]) => {
 		const points = g.points.sort((x, y) => x - y);
 		const shared: Record<string, number> = {};
@@ -270,7 +359,7 @@ export function dedupeView(sample: ISampleResult, threshold: number, removed: re
 			shared[id] = (shared[id] ?? 0) + 1;
 			if (!sample.points.pinned[i]) drawn[id] = (drawn[id] ?? 0) + 1;
 		}
-		return { key, objectIds: g.objectIds, points, chunkGroups: g.chunkGroups, simMin: g.simMin, simMax: g.simMax, pairs: g.pairs, shared, drawn, sameDocument: g.objectIds.length === 1 };
+		return { key, objectIds: g.objectIds, points, chunkGroups: g.chunkGroups, simMin: g.simMin, simMax: g.simMax, pairs: g.pairs, shared, drawn, evidence, sameDocument: g.objectIds.length === 1 };
 	});
 	const order = (x: (typeof all)[number], y: (typeof all)[number]): number => y.objectIds.length - x.objectIds.length || y.points.length - x.points.length || (x.points[0] as number) - (y.points[0] as number);
 	const across = all.filter((g) => !g.sameDocument).sort(order);
@@ -452,109 +541,323 @@ export function queueReducer(state: IQueueState, action: QueueAction): IQueueSta
 	}
 }
 
-/** What the sample shows about a group's documents (the note under a group that is not copies). */
-export type CopyVerdict = 'copies' | 'passages' | 'mixed' | 'partial' | 'sparse';
+// =============================================================================
+// WHAT THE SAMPLE SHOWS: IS ONE DOCUMENT HELD BY OTHERS?
+// =============================================================================
 
 /**
- * Fewest chunks of a document the sampler must have drawn, four in five of
- * them in the group, for the sample alone to call the document a copy.
+ * Share of a document's stored chunks another must hold for the document to
+ * count as held (a copy, or a part, of it).
  */
+export const HELD_SHARE = 0.8;
+
+/**
+ * Where the sample holds only part of the documents, the estimated share a
+ * document must reach to count as held (a margin over HELD_SHARE for the
+ * estimate's noise).
+ */
+export const HELD_ESTIMATE = 0.9;
+
+/** The share the sample must rule out (one-sided) before an estimate counts as held. */
+export const HELD_RULED_OUT = 0.7;
+
+/** z for "held": the sample rules out HELD_RULED_OUT at 1%. */
+const Z_HELD = 2.33;
+
+/** Chance below which the sample's few matches show text of its own (were the document held whole). */
+const OWN_TEXT_CHANCE = 0.001;
+
+/** Fewest matched chunks before the sample's estimate counts, and fewest expected before the sample can tell. */
 export const COPY_EVIDENCE_MIN = 3;
 
 /**
- * What the sample shows about one document of a group.
- *
- * 'whole', a copy, when either:
- *   - at least half of its chunks, as the store counts them, are sampled and
- *     in the group, and more than one of them unless it has only one; or
- *   - the sampler drew at least COPY_EVIDENCE_MIN of its chunks in the group,
- *     and four in five of its drawn chunks and of all its sampled chunks are
- *     in the group. Pinned chunks (include_keys) are not drawn: a search for
- *     a shared section pins exactly the chunks that match.
- * 'own': most of its sampled chunks are outside the group (text the others
- * do not have). 'few': neither, and the sampler drew fewer than
- * COPY_EVIDENCE_MIN of its chunks (one sampled chunk that happens to be a
- * shared footer reads "1 of 1"). 'partial': neither, with enough drawn: only
- * part of what the sample holds of it is in the group.
- *
- * @param shared - Its points in the group.
- * @param drawn - Its points in the group the sampler drew.
- * @param doc - The document.
- * @returns The verdict for the document.
+ * What the sample shows about one document and others:
+ * - 'in': they hold it (at least HELD_SHARE of its stored chunks);
+ * - 'out': it holds text they do not (more than 1 - HELD_SHARE of it);
+ * - 'unsure': the sample holds enough of them but cannot tell yet;
+ * - 'few': the sample holds too few of their chunks to tell;
+ * - 'unsized': the store did not report a chunk count it needs;
+ * - 'uneven': the sample was not drawn evenly within documents ('first', or a refill), and what it holds does not decide.
  */
-function docVerdict(shared: number, drawn: number, doc: IDocInfo | undefined): 'whole' | 'own' | 'few' | 'partial' {
-	if (!doc || doc.inSample <= 0) return 'few';
-	const { inSample } = doc;
-	if (shared * 2 < inSample) return 'own';
-	if (doc.chunks !== null) {
-		const total = Math.max(doc.chunks, inSample);
-		if (shared * 2 >= total && (shared >= 2 || shared === total)) return 'whole';
-	}
-	if (drawn >= COPY_EVIDENCE_MIN && drawn * 5 >= doc.drawn * 4 && shared * 5 >= inSample * 4) return 'whole';
-	return doc.drawn < COPY_EVIDENCE_MIN ? 'few' : 'partial';
+export type ContainmentVerdict = 'in' | 'out' | 'unsure' | 'few' | 'unsized' | 'uneven';
+
+/** The answer for one document and others. */
+export interface IContainment {
+	verdict: ContainmentVerdict;
+	/** Its sampled chunks that pair with one of the others (each one known to be in them). */
+	matched: number;
+	/** Its chunks in the sample. */
+	sampled: number;
+	/** The estimated share of its stored chunks the others hold (0 to 1), or null when there is no estimate. */
+	share: number | null;
 }
 
 /**
- * What a group is: 'copies' when every document is a whole copy (a policy
- * may choose); 'passages' when every document has most of its sampled
- * chunks elsewhere (shared text); 'mixed' when some do; 'sparse' when the
- * sampler drew too few chunks of a document to tell copies from shared text
- * (a boilerplate paragraph at the end of long files, sampled once each);
- * 'partial' when enough is drawn but only part of a document matches.
+ * P(Binomial(n, p) <= k).
+ *
+ * @param n - Trials.
+ * @param p - Chance of each.
+ * @param k - At most this many.
+ * @returns The chance.
+ */
+function binomialAtMost(n: number, p: number, k: number): number {
+	if (k >= n || p <= 0) return 1;
+	if (k < 0) return 0;
+	if (p >= 1) return 0;
+	// Terms from 0 up, in logs (n is at most the sample size).
+	const lq = Math.log(1 - p);
+	const lp = Math.log(p);
+	let logTerm = n * lq;
+	let sum = Math.exp(logTerm);
+	for (let i = 1; i <= k; i += 1) {
+		logTerm += Math.log((n - i + 1) / i) + lp - lq;
+		sum += Math.exp(logTerm);
+	}
+	return Math.min(1, sum);
+}
+
+/**
+ * A document's stored chunk count as the queue knows it (never below what the
+ * sample holds of it), or null.
+ *
+ * @param info - The documents.
+ * @param objectId - The document.
+ * @returns The count.
+ */
+function storedChunks(info: ReadonlyMap<string, IDocInfo>, objectId: string): number | null {
+	const doc = info.get(objectId);
+	if (!doc || doc.chunks === null) return null;
+	return Math.max(doc.chunks, doc.inSample);
+}
+
+/**
+ * Whether others hold a document, from the sample.
+ *
+ * Certain first: every sampled chunk that pairs with one of them is in them,
+ * so `matched >= HELD_SHARE x stored` is held.
+ *
+ * Text of its own: if the others held the whole document, each of its
+ * sampled chunks would pair with them at least at the partners' draw rate q
+ * (the lowest of theirs: a twin is certain when it is one of their certain
+ * points, else drawn at their rate), so the matches would be at least
+ * Binomial(sampled, q); the document holds text of its own when the matches
+ * are so few that this has under 0.1% chance. When the others are in the
+ * sample whole (q = 1) that is any sampled chunk that pairs with none of
+ * them, and that is the only case a sample not drawn evenly decides. A point
+ * whose kNN row is all near-duplicates may have its twin beyond the row, so
+ * an unmatched one of those counts as matched here.
+ *
+ * Held, where the sample holds only part of the documents and was drawn
+ * evenly within each: an estimate. A point is certain (pinned, or chunk 0 of
+ * a stratified sample) or drawn: the drawn ones are a uniform subset of the
+ * document's other chunks (r of the pool), and each matched drawn chunk
+ * stands for 1 / q drawn chunks held, so
+ *     g = (matched via a certain partner + matched via a drawn one / q) / r
+ *     share = (certain chunks matched + g x pool) / stored
+ * with variance, at a share g0 of the pool held,
+ *     (1 - r / pool) g0 (1 - g0) / r + g0 (1 - q) / (q r) x (poolQ - g0 r) / (poolQ - 1)
+ * (drawing r of the pool, then each twin at rate q from the partner's poolQ).
+ * Held: share >= HELD_ESTIMATE, at least COPY_EVIDENCE_MIN matched, and g
+ * rules out HELD_RULED_OUT (z = 2.33, one-sided 1%).
+ *
+ * @param group - A group of the view (for its shared evidence).
+ * @param info - The documents (their stored chunk counts).
+ * @param objectId - The document.
+ * @param others - The documents that would hold it.
+ * @returns The answer.
+ */
+export function containment(group: Pick<IDocumentGroup, 'evidence'>, info: ReadonlyMap<string, IDocInfo>, objectId: string, others: readonly string[]): IContainment {
+	const ev = group.evidence;
+	let memo = ev.memo.get(info);
+	if (!memo) {
+		memo = new Map();
+		ev.memo.set(info, memo);
+	}
+	const memoKey = `${objectId}\u0000${[...others].sort().join('\u0001')}`;
+	const known = memo.get(memoKey);
+	if (known) return known;
+	const answer = workOutContainment(ev, info, objectId, others);
+	memo.set(memoKey, answer);
+	return answer;
+}
+
+/**
+ * See containment.
+ *
+ * @param ev - The view's evidence.
+ * @param info - The documents.
+ * @param objectId - The document.
+ * @param others - The documents that would hold it.
+ * @returns The answer.
+ */
+function workOutContainment(ev: ICopyEvidence, info: ReadonlyMap<string, IDocInfo>, objectId: string, others: readonly string[]): IContainment {
+	const points = ev.pointsOf.get(objectId) ?? [];
+	let certain = 0;
+	let drawn = 0;
+	let certainMatched = 0;
+	let viaCertain = 0;
+	let viaDrawn = 0;
+	let crowdedMisses = 0;
+	for (const i of points) {
+		const isCertain = ev.census[i] === 1;
+		if (isCertain) certain += 1;
+		else drawn += 1;
+		const map = ev.partners[i];
+		let hit: boolean | undefined;
+		if (map) {
+			for (const other of others) {
+				const c = map.get(other);
+				if (c === true) {
+					hit = true;
+					break;
+				}
+				if (c === false) hit = false;
+			}
+		}
+		if (hit === undefined) {
+			if (ev.crowded[i]) crowdedMisses += 1;
+			continue;
+		}
+		if (isCertain) certainMatched += 1;
+		else if (hit) viaCertain += 1;
+		else viaDrawn += 1;
+	}
+	const matched = certainMatched + viaCertain + viaDrawn;
+	const sampled = points.length;
+	const stored = storedChunks(info, objectId);
+	const out = (verdict: ContainmentVerdict, share: number | null): IContainment => ({ verdict, matched, sampled, share });
+	if (stored === null) return out('unsized', null);
+	if (matched >= HELD_SHARE * stored) return out('in', Math.min(1, matched / stored));
+	// The partners' draw: the lowest rate at which a twin in their pool was drawn.
+	let q = 1;
+	let poolQ = 0;
+	for (const other of others) {
+		const total = storedChunks(info, other);
+		if (total === null) return out('unsized', null);
+		const theirs = ev.pointsOf.get(other) ?? [];
+		let theirCertain = 0;
+		for (const j of theirs) if (ev.census[j] === 1) theirCertain += 1;
+		const theirDrawn = theirs.length - theirCertain;
+		const pool = Math.max(theirDrawn, total - theirCertain);
+		const rate = pool === 0 || theirDrawn >= pool ? 1 : theirDrawn / pool;
+		if (rate < q) {
+			q = rate;
+			poolQ = pool;
+		}
+	}
+	const whole = q >= 1;
+	// A sample not drawn evenly says nothing about the chunks it did not draw: only partners whole in it count.
+	if ((whole || ev.uniform) && binomialAtMost(sampled, q, matched + crowdedMisses) < OWN_TEXT_CHANCE) return out('out', matched / stored);
+	if (!ev.uniform) return out('uneven', null);
+	const pool = Math.max(drawn, stored - certain);
+	const expected = sampled * q;
+	if (drawn === 0 || q <= 0 || pool === 0) return out(expected < COPY_EVIDENCE_MIN ? 'few' : 'unsure', null);
+	const g = Math.min(1, (viaCertain + (whole ? viaDrawn : viaDrawn / q)) / drawn);
+	const share = Math.min(1, (certainMatched + g * pool) / stored);
+	const sd = (g0: number): number => {
+		const sampling = drawn >= pool ? 0 : (((1 - drawn / pool) * g0 * (1 - g0)) / drawn) * (pool / Math.max(1, pool - 1));
+		const twins = whole ? 0 : ((g0 * (1 - q)) / (q * drawn)) * (Math.max(0, poolQ - g0 * drawn) / Math.max(1, poolQ - 1));
+		return Math.sqrt(Math.max(0, sampling + twins));
+	};
+	if (share >= HELD_ESTIMATE && matched >= COPY_EVIDENCE_MIN && g - HELD_RULED_OUT >= Z_HELD * sd(HELD_RULED_OUT)) return out('in', share);
+	return out(expected < COPY_EVIDENCE_MIN ? 'few' : 'unsure', share);
+}
+
+/** What the sample shows about a group's documents (the note under a group that is not copies). */
+export type CopyVerdict = 'copies' | 'passages' | 'mixed' | 'partial' | 'sparse' | 'unsized' | 'uneven';
+
+/**
+ * What the sample shows about one document of a group: 'whole' when another
+ * document of the group holds it; 'own' when it holds text the others
+ * together do not; otherwise why the sample cannot tell.
+ *
+ * @param group - The group.
+ * @param info - The documents.
+ * @param objectId - The document.
+ * @returns The verdict for the document.
+ */
+function docVerdict(group: Pick<IDocumentGroup, 'objectIds' | 'evidence'>, info: ReadonlyMap<string, IDocInfo>, objectId: string): 'whole' | 'own' | 'few' | 'partial' | 'unsized' | 'uneven' {
+	const others = group.objectIds.filter((id) => id !== objectId);
+	if (others.length === 0) return 'few';
+	const each = others.map((other) => containment(group, info, objectId, [other]));
+	if (each.some((c) => c.verdict === 'in')) return 'whole';
+	const together = others.length === 1 ? (each[0] as IContainment) : containment(group, info, objectId, others);
+	if (together.verdict === 'out') return 'own';
+	const reasons = [together, ...each].map((c) => c.verdict);
+	if (reasons.includes('unsized')) return 'unsized';
+	if (reasons.includes('uneven')) return 'uneven';
+	return together.verdict === 'few' ? 'few' : 'partial';
+}
+
+/**
+ * What a group is: 'copies' when another document of the group holds each
+ * one; 'passages' when each holds text the others do not (shared text);
+ * 'mixed' when some do; otherwise why the sample cannot tell: 'unsized' (the
+ * store did not report a chunk count), 'uneven' (the sample was not drawn
+ * evenly within documents), 'sparse' (too few chunks of a document sampled to
+ * tell, such as a boilerplate paragraph at the end of long files, sampled once
+ * each) or 'partial' (enough sampled, not enough to tell yet).
  *
  * @param group - The group.
  * @param info - The documents.
  * @returns The verdict.
  */
-export function copyVerdict(group: Pick<IDocumentGroup, 'objectIds' | 'shared' | 'drawn'>, info: ReadonlyMap<string, IDocInfo>): CopyVerdict {
-	const each = group.objectIds.map((id) => docVerdict(group.shared[id] ?? 0, group.drawn[id] ?? 0, info.get(id)));
+export function copyVerdict(group: Pick<IDocumentGroup, 'objectIds' | 'evidence'>, info: ReadonlyMap<string, IDocInfo>): CopyVerdict {
+	const each = group.objectIds.map((id) => docVerdict(group, info, id));
 	if (each.length > 0 && each.every((v) => v === 'whole')) return 'copies';
 	if (each.length > 0 && each.every((v) => v === 'own')) return 'passages';
 	if (each.includes('own')) return 'mixed';
+	if (each.includes('unsized')) return 'unsized';
+	if (each.includes('uneven')) return 'uneven';
 	return each.includes('few') || each.length === 0 ? 'sparse' : 'partial';
 }
 
 /**
  * Whether a group's documents are copies of each other (see copyVerdict).
- * A group that is not (a boilerplate paragraph at the end of otherwise
- * different files, a short note quoted inside a long manual, or files the
- * sample holds too little of) needs its keep picked by hand: removing a
- * document removes everything else it holds.
  *
  * @param group - The group.
  * @param info - The documents.
  * @returns True for copies.
  */
-export function isCopyGroup(group: Pick<IDocumentGroup, 'objectIds' | 'shared' | 'drawn'>, info: ReadonlyMap<string, IDocInfo>): boolean {
+export function isCopyGroup(group: Pick<IDocumentGroup, 'objectIds' | 'evidence'>, info: ReadonlyMap<string, IDocInfo>): boolean {
 	return copyVerdict(group, info) === 'copies';
 }
 
 /**
- * Whether every document of a group has most of its sampled chunks outside it.
+ * Whether every document of a group holds text the others do not.
  *
  * @param group - The group.
  * @param info - The documents.
  * @returns True when the group holds shared passages only.
  */
-export function isPassagesOnly(group: Pick<IDocumentGroup, 'objectIds' | 'shared' | 'drawn'>, info: ReadonlyMap<string, IDocInfo>): boolean {
+export function isPassagesOnly(group: Pick<IDocumentGroup, 'objectIds' | 'evidence'>, info: ReadonlyMap<string, IDocInfo>): boolean {
 	return copyVerdict(group, info) === 'passages';
 }
 
 /**
- * The document a group keeps: the hand-picked one, else the policy's. A
- * policy only chooses in a group of copies (isCopyGroup); shared text, or
- * documents the sample holds too little of to tell, need a keep picked by
- * hand, so no policy ever queues a document for a paragraph it shares.
+ * The document a group keeps: the hand-picked one, else the policy's. Which
+ * of the others are queued is decided per document (queued).
  *
  * @param group - The group.
  * @param state - The choices.
  * @param info - The documents.
  * @returns The kept objectId, or null when none is chosen.
  */
-export function keepOf(group: IDocumentGroup, state: IQueueState, info: ReadonlyMap<string, IDocInfo>): string | null {
+export function keepOf(group: Pick<IDocumentGroup, 'key' | 'objectIds'>, state: IQueueState, info: ReadonlyMap<string, IDocInfo>): string | null {
+	const picked = pickedKeep(group, state);
+	return picked ?? applyPolicy(group, state.policy, info);
+}
+
+/**
+ * The keep picked by hand in a group, or null.
+ *
+ * @param group - The group.
+ * @param state - The choices.
+ * @returns The objectId.
+ */
+export function pickedKeep(group: Pick<IDocumentGroup, 'key' | 'objectIds'>, state: IQueueState): string | null {
 	const picked = state.overrides[group.key];
-	if (picked !== undefined && group.objectIds.includes(picked)) return picked;
-	return isCopyGroup(group, info) ? applyPolicy(group, state.policy, info) : null;
+	return picked !== undefined && group.objectIds.includes(picked) ? picked : null;
 }
 
 /**
@@ -576,12 +879,20 @@ export interface IQueued {
 	byGroup: Map<string, string[]>;
 	/** Documents a group would queue but another group keeps (not queued). */
 	conflicts: string[];
+	/** By group key: the documents a policy leaves in place because the sample does not show the kept one holds them, and why. */
+	held: Map<string, Map<string, ContainmentVerdict>>;
+	/** By group key: the documents a hand-picked keep queues that the sample does not show the kept one holds, and why. */
+	unshown: Map<string, Map<string, ContainmentVerdict>>;
 }
 
 /**
- * The documents queued for removal: for every group across documents that is
- * not reviewed and has a kept document, the others; a document any group
- * keeps is never queued, and a group inside one document never queues.
+ * The documents queued for removal. In every group across documents that is
+ * not reviewed and has a kept document: a policy queues a document the sample
+ * shows the kept one holds; a hand-picked keep queues every other document
+ * (the ones not shown to be held are listed in `unshown`). A document kept by
+ * hand in any group (reviewed ones included), or kept by a policy in a group
+ * that queues something, is never queued; a group inside one document never
+ * queues.
  *
  * @param found - The groups.
  * @param state - The choices.
@@ -590,39 +901,59 @@ export interface IQueued {
  * @returns The queue.
  */
 export function queued(found: readonly IDocumentGroup[], state: IQueueState, info: ReadonlyMap<string, IDocInfo>, reviewed: ReadonlySet<string>): IQueued {
-	const open = found.filter((g) => !g.sameDocument && !isReviewed(g, reviewed));
+	const across = found.filter((g) => !g.sameDocument);
 	const kept = new Set<string>();
-	const keeps = new Map<string, string>();
-	for (const g of open) {
+	for (const g of across) {
+		const picked = pickedKeep(g, state);
+		if (picked !== null) kept.add(picked);
+	}
+	const held = new Map<string, Map<string, ContainmentVerdict>>();
+	const unshown = new Map<string, Map<string, ContainmentVerdict>>();
+	const candidates = new Map<string, string[]>();
+	for (const g of across) {
+		if (isReviewed(g, reviewed)) continue;
 		const keep = keepOf(g, state, info);
-		if (keep !== null) {
-			kept.add(keep);
-			keeps.set(g.key, keep);
+		if (keep === null) continue;
+		const byHand = pickedKeep(g, state) !== null;
+		const mine: string[] = [];
+		for (const id of g.objectIds) {
+			if (id === keep) continue;
+			const c = containment(g, info, id, [keep]);
+			if (c.verdict === 'in') mine.push(id);
+			else if (byHand) {
+				mine.push(id);
+				const notes = unshown.get(g.key) ?? new Map<string, ContainmentVerdict>();
+				notes.set(id, c.verdict);
+				unshown.set(g.key, notes);
+			} else {
+				const notes = held.get(g.key) ?? new Map<string, ContainmentVerdict>();
+				notes.set(id, c.verdict);
+				held.set(g.key, notes);
+			}
 		}
+		if (mine.length > 0) kept.add(keep);
+		candidates.set(g.key, mine);
 	}
 	const objectIds: string[] = [];
 	const seen = new Set<string>();
 	const conflicts = new Set<string>();
 	const byGroup = new Map<string, string[]>();
-	for (const g of open) {
-		const keep = keeps.get(g.key);
-		if (keep === undefined) continue;
-		const others = g.objectIds.filter((id) => id !== keep);
-		const mine: string[] = [];
-		for (const id of others) {
+	for (const [key, mine] of candidates) {
+		const queuedHere: string[] = [];
+		for (const id of mine) {
 			if (kept.has(id)) {
 				conflicts.add(id);
 				continue;
 			}
-			mine.push(id);
+			queuedHere.push(id);
 			if (!seen.has(id)) {
 				seen.add(id);
 				objectIds.push(id);
 			}
 		}
-		byGroup.set(g.key, mine);
+		byGroup.set(key, queuedHere);
 	}
-	return { objectIds, byGroup, conflicts: [...conflicts].sort() };
+	return { objectIds, byGroup, conflicts: [...conflicts].sort(), held, unshown };
 }
 
 // =============================================================================

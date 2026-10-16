@@ -12,9 +12,14 @@
 // moving the threshold re-groups without a call. Pairs make point groups
 // (union-find); point groups over the same documents make one queue group;
 // a group inside one document is listed apart and never offers removal. A
-// keep policy picks one document per group and queues the others, except a
-// document another group keeps. Reviewed documents live in the connection's
-// 'reviewed documents' cache, cleared on a change of identity.
+// keep policy picks one document per group and queues another only when the
+// sample shows the kept one holds it, decided per document; a hand-picked
+// keep queues the others and says which the sample does not show held. A
+// document another group keeps is never queued. The sample is drawn as the
+// node draws it (each document on its own: chunk 0, then a uniform subset),
+// with captured vx_math.stratified_pick draws and one lockstep control.
+// Reviewed documents live in the connection's 'reviewed documents' cache,
+// cleared on a change of identity.
 // =============================================================================
 
 import assert from 'node:assert/strict';
@@ -22,6 +27,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { test } from 'node:test';
 import type { IDocumentItem, IDuplicatePair, IKnnBlock, ISampleResult } from '../src/contract/types';
+import type { IDocumentGroup } from '../src/map/dedupe';
 import { reviewedDocuments } from '../src/adapters/connections';
 import { connectionCaches } from '../src/adapters/explorer';
 import { KEEP_POLICIES, THRESHOLD_DEFAULT, THRESHOLD_MAX, THRESHOLD_MIN, applyPolicy, copyVerdict, dedupeView, docInfo, duplicateGroupOf, groupOf, groups, isCopyGroup, keepOf, markReviewed, pairsAt, queueInit, queueReducer, queued, reviewedOf, unmarkReviewed } from '../src/map/dedupe';
@@ -293,8 +299,13 @@ test('policies: oldest ingest, shortest path, most chunks; ties by objectId; unk
 // THE QUEUE
 // =============================================================================
 
-test('the queue: a policy keeps one document per group and queues the others; a hand-picked keep wins; same-document groups never queue', () => {
-	const info = docInfo(SMALL, ROWS_INFO);
+// The same documents with the store's counts matching what SMALL samples: the
+// handbook and its revision are 2 chunks each and both sampled whole, the
+// kestrel guide and its copy 1 chunk each.
+const ROWS_COPIES = [row('oa', 'C:/demo/handbooks/falcon_handbook.md', 2, '2026-10-02T09:00:00Z', 4000), row('ob', 'C:/demo/handbooks/falcon_handbook_rev2.md', 2, '2026-10-01T09:00:00Z', 5000), row('oc', 'C:/demo/field/kestrel_field_guide.md', 1, null), row('od', 'C:/demo/archive/kestrel_field_guide_copy.md', 1, null)];
+
+test('the queue: a policy keeps one document per group and queues the others it holds; a hand-picked keep wins; same-document groups never queue', () => {
+	const info = docInfo(SMALL, ROWS_COPIES);
 	const view = dedupeView(SMALL, 0.97);
 	let state = queueInit();
 	assert.deepEqual(state, { threshold: THRESHOLD_DEFAULT, policy: 'manual', overrides: {} });
@@ -303,18 +314,19 @@ test('the queue: a policy keeps one document per group and queues the others; a 
 	const q = queued(view.groups, state, info, new Set());
 	assert.deepEqual(q.objectIds, ['ob', 'od']);
 	assert.deepEqual(q.byGroup.get(view.groups[0]!.key), ['ob']);
+	assert.equal(q.held.size + q.unshown.size, 0, 'every queued document is held by its kept one');
 	state = queueReducer(state, { type: 'keep', group: view.groups[0]!.key, objectId: 'ob' });
 	assert.equal(keepOf(view.groups[0]!, state, info), 'ob');
 	assert.deepEqual(queued(view.groups, state, info, new Set()).objectIds, ['oa', 'od']);
 	state = queueReducer(state, { type: 'policy', value: 'most-chunks' });
 	assert.deepEqual(state.overrides, {}, 'a new policy replaces the hand-picked keeps');
-	assert.deepEqual(queued(view.groups, state, info, new Set()).objectIds, ['oa', 'od']);
+	assert.deepEqual(queued(view.groups, state, info, new Set()).objectIds, ['ob', 'od'], 'equal chunk counts: the lower objectId is kept');
 	assert.equal(queueReducer(state, { type: 'keep', group: 'nope', objectId: 'oa' }).overrides.nope, 'oa');
 	assert.ok(!queued([...view.groups, ...view.repeated], { ...state, policy: 'shortest-path' }, info, new Set()).objectIds.includes('oe'), 'a group inside one document never queues its document');
 });
 
 test('reviewed groups and documents removed already are not queued; a document another group keeps is never queued', () => {
-	const info = docInfo(SMALL, ROWS_INFO);
+	const info = docInfo(SMALL, ROWS_COPIES);
 	const view = dedupeView(SMALL, 0.97);
 	const state = queueReducer(queueInit(), { type: 'policy', value: 'shortest-path' });
 	assert.deepEqual(queued(view.groups, state, info, new Set(['oa', 'ob'])).objectIds, ['od'], 'a group whose documents are all reviewed is out of the queue');
@@ -338,7 +350,33 @@ test('reviewed groups and documents removed already are not queued; a document a
 	assert.deepEqual(q.conflicts, ['oa']);
 });
 
-test('a policy keeps only in groups of copies; a group of shared passages (a boilerplate paragraph) needs a keep picked by hand', () => {
+test('a document kept by hand in a group marked reviewed is not queued by another group', () => {
+	// Three one-chunk copies: {A, B} and {B, C} (B pairs with both, A and C do not pair).
+	const three = sampleOf(
+		[
+			['A', 'C:/x/a.md', 1],
+			['B', 'C:/x/b.md', 1],
+			['C', 'C:/x/c.md', 1],
+		],
+		[
+			{ doc: 0, chunk: 0 },
+			{ doc: 1, chunk: 0 },
+			{ doc: 1, chunk: 0 },
+			{ doc: 2, chunk: 0 },
+		],
+		[[[1, 0.99]], [[0, 0.99]], [[3, 0.99]], [[2, 0.99]]]
+	);
+	const view = dedupeView(three, 0.97);
+	const ab = view.groups.find((g) => g.objectIds.join() === 'A,B')!;
+	const bc = view.groups.find((g) => g.objectIds.join() === 'B,C')!;
+	const info = docInfo(three, null);
+	const state = queueReducer(queueReducer(queueInit(), { type: 'keep', group: ab.key, objectId: 'B' }), { type: 'keep', group: bc.key, objectId: 'C' });
+	const q = queued(view.groups, state, info, new Set(['A', 'B']));
+	assert.ok(!q.objectIds.includes('B'), 'B, kept by hand in the reviewed group {A, B}, is not queued by {B, C}');
+	assert.deepEqual(q.conflicts, ['B']);
+});
+
+test("a policy queues only a document the sample shows the kept one holds; shared passages queue nothing, a hand-picked keep still queues and says so", () => {
 	// D#0 shares one paragraph with E#0, but each has three more sampled chunks of its own.
 	const passages = sampleOf(
 		[
@@ -351,15 +389,19 @@ test('a policy keeps only in groups of copies; a group of shared passages (a boi
 	const info = docInfo(passages, null);
 	const [group] = dedupeView(passages, 0.97).groups;
 	assert.equal(isCopyGroup(group!, info), false);
+	assert.equal(copyVerdict(group!, info), 'passages', 'both memos are sampled whole: three of four chunks of each match nothing');
 	const policy = queueReducer(queueInit(), { type: 'policy', value: 'shortest-path' });
-	assert.equal(keepOf(group!, policy, info), null, 'the policy leaves shared passages alone');
-	assert.deepEqual(queued([group!], policy, info, new Set()).objectIds, []);
+	const q = queued([group!], policy, info, new Set());
+	assert.deepEqual(q.objectIds, [], 'the policy queues neither memo');
+	assert.equal(q.held.get(group!.key)?.get('oe'), 'out', 'the memo the policy does not keep holds text the kept one does not');
 	const picked = queueReducer(policy, { type: 'keep', group: group!.key, objectId: 'od' });
-	assert.deepEqual(queued([group!], picked, info, new Set()).objectIds, ['oe'], 'a hand-picked keep still queues the other');
-	const small = docInfo(SMALL, ROWS_INFO);
+	const byHand = queued([group!], picked, info, new Set());
+	assert.deepEqual(byHand.objectIds, ['oe'], 'a hand-picked keep still queues the other');
+	assert.equal(byHand.unshown.get(group!.key)?.get('oe'), 'out', 'and the queue says the sample shows it holds text of its own');
+	const small = docInfo(SMALL, ROWS_COPIES);
 	assert.ok(
 		dedupeView(SMALL, 0.97).groups.every((g) => isCopyGroup(g, small)),
-		"copies: at least half of every document's chunks, as the store counts them, are sampled and in the group"
+		'copies: every chunk of each document is sampled and pairs with the other'
 	);
 	const demo = loadSample('sample_demo_1000.json');
 	const demoInfo = docInfo(demo, null);
@@ -403,7 +445,7 @@ test('a sparse sample cannot make copies: one sampled notice chunk of 40-chunk f
 	assert.equal(isCopyGroup(falcon, info), true, 'all 7 of 7 chunks pair up');
 	for (const policy of ['shortest-path', 'oldest', 'most-chunks'] as const) {
 		const state = queueReducer(queueInit(), { type: 'policy', value: policy });
-		assert.equal(keepOf(notice, state, info), null, `${policy} leaves the notice group alone`);
+		assert.deepEqual(queued([notice], state, info, new Set()).objectIds, [], `${policy} queues nothing of the notice group`);
 	}
 	const shortest = queueReducer(queueInit(), { type: 'policy', value: 'shortest-path' });
 	assert.deepEqual(queued(view.groups, shortest, info, new Set()).objectIds, ['fb'], 'only the revision is queued');
@@ -432,7 +474,7 @@ test("the store's chunk count decides, from the sample or from the directory row
 	assert.deepEqual(queued([group!], state, counted, new Set()).objectIds, []);
 	const unknown = docInfo(long, null);
 	assert.equal(isCopyGroup(group!, unknown), false, 'no chunk count from the store: the sample alone cannot tell');
-	assert.equal(copyVerdict(group!, unknown), 'sparse');
+	assert.equal(copyVerdict(group!, unknown), 'unsized', 'and the group says the store did not report the counts');
 	assert.deepEqual(queued([group!], state, unknown, new Set()).objectIds, []);
 	const uncounted = sparseSample(null);
 	assert.deepEqual(queued(dedupeView(uncounted, 0.97).groups, state, docInfo(uncounted, null), new Set()).objectIds, ['fb'], 'unknown counts of the notice files hold back only their group');
@@ -459,22 +501,26 @@ test('one shared chunk never makes a longer document a copy, even when it is hal
 	const [group] = dedupeView(notes, 0.97).groups;
 	const info = docInfo(notes, null);
 	assert.equal(isCopyGroup(group!, info), false, '1 of 2 chunks shared');
-	assert.equal(keepOf(group!, queueReducer(queueInit(), { type: 'policy', value: 'shortest-path' }), info), null);
+	assert.equal(copyVerdict(group!, info), 'passages');
+	assert.deepEqual(queued([group!], queueReducer(queueInit(), { type: 'policy', value: 'shortest-path' }), info, new Set()).objectIds, []);
 });
 
 test('the verdict behind the note: copies, shared passages, not whole copies, or too few chunks sampled', () => {
-	const small = docInfo(SMALL, ROWS_INFO);
+	const small = docInfo(SMALL, ROWS_COPIES);
 	assert.deepEqual(
 		dedupeView(SMALL, 0.97).groups.map((g) => copyVerdict(g, small)),
 		['copies', 'copies']
 	);
 	const demo = loadSample('sample_demo_1000.json');
 	const demoInfo = docInfo(demo, null);
+	// One shared chunk of documents with many sampled. In the second group the 7-chunk field note has 5
+	// sampled, one matched: likely text of its own, but a whole copy is not ruled out at 0.1%, so the group
+	// says only that not every document is a copy (the 78-chunk report has text of its own).
 	assert.deepEqual(
 		dedupeView(demo, 0.97).groups.map((g) => copyVerdict(g, demoInfo)),
-		['passages', 'passages', 'passages'],
-		'one chunk of documents with many sampled'
+		['passages', 'mixed', 'passages']
 	);
+	assert.ok(dedupeView(demo, 0.97).groups.every((g) => !isCopyGroup(g, demoInfo)));
 	// A short note quoted whole inside a long manual: the note is all copy, the manual mostly its own text.
 	const quoted = sampleOf(
 		[
@@ -484,78 +530,315 @@ test('the verdict behind the note: copies, shared passages, not whole copies, or
 		[{ doc: 0, chunk: 0 }, ...Array.from({ length: 6 }, (_, c) => ({ doc: 1, chunk: c * 20 }))],
 		[[[1, 0.99]], [[0, 0.99]], [], [], [], [], []]
 	);
-	assert.equal(copyVerdict(dedupeView(quoted, 0.97).groups[0]!, docInfo(quoted, null)), 'mixed');
+	const [manual] = dedupeView(quoted, 0.97).groups;
+	assert.equal(copyVerdict(manual!, docInfo(quoted, null)), 'mixed');
+	const most = queueReducer(queueInit(), { type: 'policy', value: 'most-chunks' });
+	assert.deepEqual(queued([manual!], most, docInfo(quoted, null), new Set()).objectIds, ['q'], 'keeping the manual queues the note it holds');
+	const shortest = queueReducer(queueInit(), { type: 'policy', value: 'shortest-path' });
+	assert.deepEqual(queued([manual!], shortest, docInfo(quoted, null), new Set()).objectIds, [], 'keeping the note never queues the manual');
 });
+
+// =============================================================================
+// THE SAMPLER'S OWN DRAWS (each document drawn on its own)
+// =============================================================================
 
 /**
- * Two documents of `chunks` chunks each, the same `ids` of both in the sample
- * and every one paired with its twin; `pinnedIds` of them pinned by
- * include_keys, `ownIds` in the sample but paired with nothing.
+ * A seeded generator (mulberry32).
  *
- * @param chunks - The store's chunk count of each document (null: unknown).
- * @param ids - The chunk ids sampled in both and paired.
- * @param opts - Pinned and unpaired chunk ids.
+ * @param seed - The seed.
+ * @returns Numbers in [0, 1).
+ */
+function seeded(seed: number): () => number {
+	let s = seed >>> 0;
+	return () => {
+		s = (s + 0x6d2b79f5) >>> 0;
+		let t = s;
+		t = Math.imul(t ^ (t >>> 15), t | 1);
+		t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+		return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+	};
+}
+
+/**
+ * The node's stratified pick (vx_math.stratified_pick): every document's chunk
+ * 0, then one more chunk per document in a seeded round robin, each
+ * document's other chunks shuffled on its own.
+ *
+ * @param chunks - The store's chunk count per document.
+ * @param n - The sample size.
+ * @param seed - The seed.
+ * @returns The chunk ids drawn per document, ascending.
+ */
+function stratifiedDraw(chunks: readonly number[], n: number, seed: number): number[][] {
+	const rnd = seeded(seed);
+	const shuffle = <T>(list: T[]): T[] => {
+		for (let i = list.length - 1; i > 0; i -= 1) {
+			const j = Math.floor(rnd() * (i + 1));
+			[list[i], list[j]] = [list[j] as T, list[i] as T];
+		}
+		return list;
+	};
+	let left = n;
+	const picked = chunks.map((c) => (c > 0 && left-- > 0 ? [0] : []));
+	const rest = chunks.map((c) => shuffle(Array.from({ length: Math.max(0, c - 1) }, (_, i) => i + 1)));
+	const order = shuffle(chunks.map((_, d) => d));
+	while (left > 0 && rest.some((r) => r.length > 0)) {
+		for (const d of order) {
+			const r = rest[d] as number[];
+			if (r.length > 0 && left > 0) {
+				(picked[d] as number[]).push(r.pop() as number);
+				left -= 1;
+			}
+		}
+	}
+	return picked.map((p) => p.sort((a, b) => a - b));
+}
+
+/** A document of a drawn sample. */
+interface IDrawnDoc {
+	objectId: string;
+	path: string;
+	/** The store's chunk count (null: unknown). */
+	chunks: number | null;
+	/** The chunk ids the sampler drew. */
+	drawn: readonly number[];
+	/** Chunk ids pinned by include_keys. */
+	pinned?: readonly number[];
+}
+
+/**
+ * A sample of drawn documents: a point per drawn or pinned chunk, a chunk's
+ * twin (same text, `twin`) at 0.9995 when it is in the sample, and its
+ * neighbours in its own document at 0.8 (similar, never a duplicate).
+ *
+ * @param docs - The documents.
+ * @param twin - The chunks of other documents with the same text as chunk `c` of document `d`.
+ * @param extra - Answer fields to override (strategy_used, biased).
  * @returns The sample.
  */
-function twinSample(chunks: number | null, ids: readonly number[], opts: { pinnedIds?: readonly number[]; ownIds?: readonly number[] } = {}): ISampleResult {
-	const pinned = new Set(opts.pinnedIds ?? []);
-	const own = opts.ownIds ?? [];
-	const half: IPointSpec[] = [...ids.map((chunk) => ({ chunk, pinned: pinned.has(chunk) })), ...own.map((chunk) => ({ chunk, pinned: pinned.has(chunk) }))].map((p) => ({ doc: 0, ...p }));
-	const points: IPointSpec[] = [...half, ...half.map((p) => ({ ...p, doc: 1 }))];
-	const per = half.length;
-	const rows = points.map((_, i): Array<[number, number]> => (i % per < ids.length ? [[i < per ? i + per : i - per, 0.996]] : []));
-	return sampleOf(
+function drawnSample(docs: readonly IDrawnDoc[], twin: (d: number, c: number) => Array<[number, number]>, extra: Partial<ISampleResult> = {}): ISampleResult {
+	const points: IPointSpec[] = [];
+	docs.forEach((doc, d) => {
+		const pins = new Set(doc.pinned ?? []);
+		for (const c of doc.pinned ?? []) points.push({ doc: d, chunk: c, pinned: true });
+		for (const c of doc.drawn) if (!pins.has(c)) points.push({ doc: d, chunk: c });
+	});
+	const at = new Map(points.map((p, i) => [`${p.doc}:${p.chunk}`, i] as const));
+	const rows = points.map((p): Array<[number, number]> => {
+		const out: Array<[number, number]> = [];
+		for (const [d, c] of twin(p.doc, p.chunk)) {
+			const j = at.get(`${d}:${c}`);
+			if (j !== undefined) out.push([j, 0.9995]);
+		}
+		for (const c of [p.chunk - 1, p.chunk + 1]) {
+			const j = at.get(`${p.doc}:${c}`);
+			if (j !== undefined) out.push([j, 0.8]);
+		}
+		return out;
+	});
+	return { ...sampleOf(docs.map((doc) => [doc.objectId, doc.path, doc.chunks]), points, rows), ...extra };
+}
+
+/** Chunk c of the copy (document 0) is chunk c of the original (document 1), for c < `upTo`. */
+const sameText =
+	(upTo: number) =>
+	(d: number, c: number): Array<[number, number]> =>
+		d < 2 && c < upTo ? [[1 - d, c]] : [];
+
+/**
+ * Two documents drawn by the stratified pick in a store of `docs` documents.
+ *
+ * @param chunks - Chunks of the copy and the original.
+ * @param docs - Documents in the store, all of `chunks[1]` chunks beside the copy.
+ * @param n - The sample size.
+ * @param seed - The seed.
+ * @param upTo - How many leading chunks of the copy are the original's (the copy's own text after).
+ * @returns The sample and the view's one group across the two.
+ */
+function pairDraw(chunks: readonly [number, number], docs: number, n: number, seed: number, upTo: number = chunks[0]): { sample: ISampleResult; group: IDocumentGroup | undefined } {
+	const counts = [chunks[0], ...Array.from({ length: docs - 1 }, () => chunks[1])];
+	const draws = stratifiedDraw(counts, n, seed);
+	const sample = drawnSample(
 		[
-			['ra', 'C:/big/report.md', chunks],
-			['rb', 'C:/big/report_copy.md', chunks],
+			{ objectId: 'copy', path: 'C:/big/archive/report_copy.md', chunks: chunks[0], drawn: draws[0] as number[] },
+			{ objectId: 'orig', path: 'C:/big/report.md', chunks: chunks[1], drawn: draws[1] as number[] },
 		],
-		points,
-		rows
+		sameText(upTo)
 	);
+	return { sample, group: dedupeView(sample, 0.97).groups.find((g) => g.objectIds.length === 2) };
 }
 
-/** The verdict of the twin sample's one group. */
-function twinVerdict(sample: ISampleResult): string {
-	const [group] = dedupeView(sample, 0.97).groups;
-	assert.ok(group, 'one group');
-	return copyVerdict(group, docInfo(sample, null));
+const SHORTEST = queueReducer(queueInit(), { type: 'policy', value: 'shortest-path' });
+
+/** Under 'shortest path' (the original's path is shorter): the queue of a drawn pair. */
+function queuedCopy(sample: ISampleResult, group: IDocumentGroup | undefined): string[] {
+	return group ? queued([group], SHORTEST, docInfo(sample, null), new Set()).objectIds : [];
 }
 
-const range = (from: number, n: number): number[] => Array.from({ length: n }, (_, i) => from + i);
+/** Captured from the node's own vx_math.stratified_pick (seed 7, 10 documents, n = 2,000): the chunk ids drawn of a copy and its original, as hex steps. */
+const CAPTURED: Record<'c300' | 'c500', { chunks: number; a: string; b: string }> = {
+	c300: {
+		chunks: 300,
+		a: '1.1.1.2.2.1.2.1.1.2.1.1.1.1.1.1.1.1.1.2.1.1.1.3.1.1.1.1.2.2.1.4.1.1.1.1.2.1.3.3.1.3.1.2.1.4.1.1.2.1.1.3.1.1.1.1.1.6.1.1.1.1.1.2.2.1.1.2.1.1.3.1.1.2.1.3.1.2.2.1.2.2.1.1.1.1.3.1.1.2.2.2.1.1.1.1.3.1.1.1.1.2.1.3.1.1.3.2.2.1.1.1.2.1.1.1.2.3.1.1.1.1.2.3.1.2.1.2.1.2.2.2.3.1.1.1.2.1.1.2.3.3.1.1.1.2.2.1.1.1.1.1.3.1.1.1.1.1.1.1.1.1.1.3.1.2.1.2.1.1.1.5.1.2.3.3.2.1.1.2.1.2.1.1.2.1.1.1.1.1.1.2.1.1.1.2.1.1.1.1',
+		b: '1.2.1.2.1.2.1.1.1.1.3.1.1.2.3.1.1.1.1.1.1.1.2.1.2.1.1.1.2.1.2.2.3.2.2.1.1.1.1.2.1.1.3.2.1.2.1.2.1.1.1.2.1.1.1.2.1.1.2.1.2.2.2.1.2.5.1.1.1.1.1.3.1.1.1.1.2.1.1.1.2.2.1.2.1.1.1.1.2.1.1.1.1.1.1.1.1.3.1.1.1.1.1.1.3.1.1.1.4.1.2.3.3.2.2.1.1.1.3.1.2.1.1.2.2.1.1.1.4.1.2.1.2.1.1.2.1.2.3.1.6.1.1.2.2.1.2.2.1.1.1.2.1.1.2.1.1.2.1.1.1.2.3.2.1.1.1.1.1.1.3.3.1.1.2.1.1.3.1.2.1.2.2.1.1.1.1.1.1.2.1.1.2.1.1.2.1.2.2.1',
+	},
+	c500: {
+		chunks: 500,
+		a: '1.3.4.5.8.1.3.1.1.2.2.1.1.1.1.2.2.2.2.1.2.2.1.1.1.3.1.6.1.3.1.2.2.2.3.1.3.7.1.1.4.2.1.3.1.8.4.2.2.1.4.1.4.1.2.1.7.4.4.2.1.2.1.5.4.1.2.3.2.9.1.2.2.2.2.2.2.2.1.4.3.3.1.1.1.1.1.7.2.1.2.1.2.2.6.1.3.1.3.2.4.4.2.2.2.1.1.5.3.1.5.4.1.1.2.4.1.1.3.1.2.1.3.1.1.1.1.1.1.1.2.3.7.1.4.5.1.5.4.2.1.6.2.1.1.4.1.1.5.1.1.1.1.5.9.8.2.4.5.4.1.2.1.5.1.1.1.5.4.1.2.3.2.4.1.3.3.3.6.1.2.2.1.3.4.4.1.1.1.6.2.5.1.6.2.4.1.2.2.1',
+		b: '1.1.1.1.3.2.1.1.2.4.2.1.3.1.1.2.2.1.1.5.2.1.5.1.2.1.7.1.2.6.4.2.3.2.1.2.3.1.2.1.8.1.1.1.3.4.1.1.2.5.1.2.4.2.3.2.1.2.1.2.3.1.1.2.1.4.2.1.3.2.3.2.1.1.1.1.6.1.1.1.3.2.2.2.5.2.2.6.3.4.2.3.3.6.4.2.1.1.7.3.1.3.8.7.3.3.1.1.1.3.1.5.1.1.1.1.2.5.1.2.1.2.6.1.7.1.5.1.5.5.2.2.1.1.1.1.1.7.3.1.1.3.3.1.8.2.4.3.2.5.5.2.4.9.2.d.6.1.1.2.1.2.1.2.2.2.1.1.4.2.1.3.1.1.1.2.1.1.3.3.4.1.5.1.1.2.8.5.3.2.1.1.4.1.1.2.1.3.2.1',
+	},
+};
 
-test('on a large store the sample is evidence too: 400 of 1,000 chunks of each copy sampled, every one paired, is copies', () => {
-	// A store of 40,000 chunks, a detailed sample at its cap of 2,000: two 1,000-chunk copies get about 400 chunks each.
-	const sample = twinSample(1000, range(0, 400));
+/** Decode CAPTURED's hex steps. */
+function stepsOf(text: string): number[] {
+	let at = -1;
+	return text.split('.').map((step) => (at += parseInt(step, 16)));
+}
+
+test("the node's own draws of two identical files are copies: 200 of 300 and 200 of 500 chunks of each, drawn on their own", () => {
+	for (const [name, shape] of Object.entries(CAPTURED)) {
+		const a = stepsOf(shape.a);
+		const b = stepsOf(shape.b);
+		assert.equal(a.length, 200);
+		assert.equal(b.length, 200);
+		const sample = drawnSample(
+			[
+				{ objectId: 'copy', path: 'C:/big/archive/report_copy.md', chunks: shape.chunks, drawn: a },
+				{ objectId: 'orig', path: 'C:/big/report.md', chunks: shape.chunks, drawn: b },
+			],
+			sameText(shape.chunks)
+		);
+		const [group] = dedupeView(sample, 0.97).groups;
+		const both = a.filter((c) => b.includes(c)).length;
+		assert.ok(both < 150, `${name}: only ${both} twins drawn in both (the share of matches is the other's coverage)`);
+		assert.equal(copyVerdict(group!, docInfo(sample, null)), 'copies', `${name}: copies`);
+		assert.deepEqual(queuedCopy(sample, group), ['copy'], `${name}: 'shortest path' keeps report.md and queues its copy`);
+	}
+});
+
+test('identical files drawn on their own: never called shared passages, and queued once the sample holds enough of both', () => {
+	// Two identical 100-chunk files in a store of 5 such documents; the sample covers each at 10% to 100%.
+	for (const coverage of [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 1]) {
+		let copies = 0;
+		const verdicts = new Set<string>();
+		for (let seed = 1; seed <= 100; seed += 1) {
+			const { sample, group } = pairDraw([100, 100], 5, Math.round(500 * coverage), seed);
+			if (!group) continue;
+			const verdict = copyVerdict(group, docInfo(sample, null));
+			verdicts.add(verdict);
+			if (queuedCopy(sample, group).join() === 'copy') copies += 1;
+		}
+		assert.ok(!verdicts.has('passages') && !verdicts.has('mixed'), `at ${coverage * 100}% the panel never says identical files hold text of their own (${[...verdicts]})`);
+		if (coverage >= 0.6) assert.ok(copies >= 95, `at ${coverage * 100}% the copy is queued in ${copies} of 100 draws`);
+		if (coverage <= 0.2) assert.equal(copies, 0, `at ${coverage * 100}% the sample holds too little to queue (${copies})`);
+	}
+});
+
+test('a revision with text of its own is not queued behind its original, however the sample draws it', () => {
+	// The copy holds the original's first 60 chunks and 40 of its own (60% held); the original is 100 chunks.
+	for (const coverage of [0.2, 0.4, 0.6, 0.8, 1]) {
+		let wrong = 0;
+		for (let seed = 1; seed <= 200; seed += 1) {
+			const { sample, group } = pairDraw([100, 100], 5, Math.round(500 * coverage), seed, 60);
+			if (group && queuedCopy(sample, group).length > 0) wrong += 1;
+		}
+		assert.ok(wrong <= 4, `at ${coverage * 100}% a 60%-held document is queued in ${wrong} of 200 draws`);
+	}
+});
+
+test('the lockstep control: the same chunk ids drawn of both copies are copies', () => {
+	// What a first-chunks draw would give; the node's samplers draw each document on its own.
+	const ids = Array.from({ length: 400 }, (_, i) => i);
+	const sample = drawnSample(
+		[
+			{ objectId: 'copy', path: 'C:/big/archive/report_copy.md', chunks: 1000, drawn: ids },
+			{ objectId: 'orig', path: 'C:/big/report.md', chunks: 1000, drawn: ids },
+		],
+		sameText(1000)
+	);
 	const [group] = dedupeView(sample, 0.97).groups;
-	assert.deepEqual(group!.shared, { ra: 400, rb: 400 });
 	assert.equal(copyVerdict(group!, docInfo(sample, null)), 'copies');
-	const shortest = queueReducer(queueInit(), { type: 'policy', value: 'shortest-path' });
-	assert.deepEqual(queued([group!], shortest, docInfo(sample, null), new Set()).objectIds, ['rb'], "'shortest path' keeps report.md and queues its copy");
-	assert.equal(twinVerdict(twinSample(1000, range(0, 499))), 'copies', 'no cliff at half of the stored chunks');
-	assert.equal(twinVerdict(twinSample(null, range(0, 400))), 'copies', 'with no chunk count from the store');
-	// The demo's planted copies are 7 chunks each; a sample may hold 3 of them.
-	assert.equal(twinVerdict(twinSample(7, [0, 3, 5])), 'copies', '3 of 7 sampled, all paired');
+	assert.deepEqual(queuedCopy(sample, group), ['copy']);
 });
 
-test('the sample alone calls a document a copy only from 3 drawn chunks, four in five of them paired; otherwise it says why', () => {
-	// "Too few" means fewer than 3 chunks of a document were drawn; with more, a partial match is said as such.
-	assert.equal(twinVerdict(twinSample(40, [0, 9])), 'sparse', '2 of 2 sampled chunks of 40-chunk files: too few to tell');
-	assert.equal(twinVerdict(twinSample(40, [0, 9, 21])), 'copies', '3 of 3');
-	assert.equal(twinVerdict(twinSample(40, [0, 9, 21, 30], { ownIds: [35] })), 'copies', '4 of 5 paired');
-	assert.equal(twinVerdict(twinSample(40, [0, 9, 21], { ownIds: [35] })), 'partial', '3 of 4 paired: enough sampled, too little of it matches to call it a copy');
-	assert.equal(twinVerdict(twinSample(40, [0, 9], { ownIds: [21, 35] })), 'partial', '2 of 4 paired: enough sampled, half of it matches');
-	assert.equal(twinVerdict(twinSample(40, [0], { ownIds: [9, 21] })), 'passages', 'one shared chunk of three: shared text');
+test('a revision that added chapters is never queued behind its original; keeping the revision queues the original', () => {
+	// The original is 4 chunks; the revision 8, its first 4 the original's. Both sampled whole.
+	const sample = drawnSample(
+		[
+			{ objectId: 'orig', path: 'C:/h/orig.md', chunks: 4, drawn: [0, 1, 2, 3] },
+			{ objectId: 'rev', path: 'C:/h/archive/revision.md', chunks: 8, drawn: [0, 1, 2, 3, 4, 5, 6, 7] },
+		],
+		(d, c) => (c < 4 ? [[1 - d, c]] : [])
+	);
+	const [group] = dedupeView(sample, 0.97).groups;
+	const info = docInfo(sample, [row('orig', 'C:/h/orig.md', 4, '2026-01-01T00:00:00Z'), row('rev', 'C:/h/archive/revision.md', 8, '2026-02-01T00:00:00Z')]);
+	assert.equal(copyVerdict(group!, info), 'mixed', 'the revision holds text the original does not');
+	for (const policy of ['oldest', 'shortest-path'] as const) {
+		const q = queued([group!], queueReducer(queueInit(), { type: 'policy', value: policy }), info, new Set());
+		assert.deepEqual(q.objectIds, [], `${policy} keeps the original and queues nothing`);
+		assert.equal(q.held.get(group!.key)?.get('rev'), 'out', `${policy}: the revision holds text the kept one does not`);
+	}
+	const most = queued([group!], queueReducer(queueInit(), { type: 'policy', value: 'most-chunks' }), info, new Set());
+	assert.deepEqual(most.objectIds, ['orig'], 'keeping the revision queues the original it holds');
 });
 
-test('chunks pinned on purpose are no evidence of a copy: a search for a shared section pins exactly the chunks that match', () => {
-	// Three chunks of a shared section, pinned by include_keys in each 40-chunk file, nothing else of them drawn.
-	assert.equal(twinVerdict(twinSample(40, [12, 13, 14], { pinnedIds: [12, 13, 14] })), 'sparse', 'pinned matches alone: too few drawn');
-	const state = queueReducer(queueInit(), { type: 'policy', value: 'shortest-path' });
-	const pinnedOnly = twinSample(40, [12, 13, 14], { pinnedIds: [12, 13, 14] });
-	assert.deepEqual(queued(dedupeView(pinnedOnly, 0.97).groups, state, docInfo(pinnedOnly, null), new Set()).objectIds, [], 'no policy queues them');
-	assert.equal(twinVerdict(twinSample(40, [0, 9, 21, 12, 13], { pinnedIds: [12, 13] })), 'copies', '3 drawn chunks, all paired, beside 2 pinned ones');
-	assert.equal(twinVerdict(twinSample(40, [0, 9, 21], { pinnedIds: [30, 35], ownIds: [30, 35] })), 'partial', 'pinned chunks that match nothing still count against');
+test('chunks pinned on purpose are certain points, never weighted up: a search for a shared section does not make a manual a copy', () => {
+	// A 40-chunk manual whose first 20 chunks are a 20-chunk policy: the map re-pins the 20 chunks of each a
+	// search for that section showed; the sampler drew 3 more of the manual (its own text).
+	const sample = drawnSample(
+		[
+			{ objectId: 'manual', path: 'C:/corp/manuals/operations_manual_2026.md', chunks: 40, drawn: [27, 33, 38], pinned: Array.from({ length: 20 }, (_, c) => c) },
+			{ objectId: 'policy', path: 'C:/corp/policy.md', chunks: 20, drawn: [], pinned: Array.from({ length: 20 }, (_, c) => c) },
+		],
+		(d, c) => (c < 20 ? [[1 - d, c]] : [])
+	);
+	const [group] = dedupeView(sample, 0.97).groups;
+	const info = docInfo(sample, null);
+	const shortest = queued([group!], SHORTEST, info, new Set());
+	assert.deepEqual(shortest.objectIds, [], "'shortest path' keeps the policy and never queues the manual");
+	assert.ok(shortest.held.get(group!.key)?.has('manual'));
+	const most = queued([group!], queueReducer(queueInit(), { type: 'policy', value: 'most-chunks' }), info, new Set());
+	assert.deepEqual(most.objectIds, ['policy'], 'keeping the manual queues the policy it holds whole');
+	// Pinned matches alone, of two 40-chunk copies: too few drawn to tell.
+	const pinnedOnly = drawnSample(
+		[
+			{ objectId: 'ra', path: 'C:/big/report.md', chunks: 40, drawn: [], pinned: [12, 13, 14] },
+			{ objectId: 'rb', path: 'C:/big/report_copy.md', chunks: 40, drawn: [], pinned: [12, 13, 14] },
+		],
+		sameText(40)
+	);
+	const [pinnedGroup] = dedupeView(pinnedOnly, 0.97).groups;
+	assert.equal(copyVerdict(pinnedGroup!, docInfo(pinnedOnly, null)), 'sparse');
+	assert.deepEqual(queuedCopy(pinnedOnly, pinnedGroup), []);
 	assert.equal(docInfo(pinnedOnly, null).get('ra')?.drawn, 0, 'a document of pinned points only: none drawn');
+});
+
+test('a sample not drawn evenly decides only from what it holds; a crowded kNN row never says "text of its own"', () => {
+	// The same chunk ids of two 100-chunk copies, from a first-chunks draw (strategy 'first').
+	const ids = Array.from({ length: 30 }, (_, i) => i);
+	const firsts = drawnSample(
+		[
+			{ objectId: 'copy', path: 'C:/big/archive/report_copy.md', chunks: 100, drawn: ids },
+			{ objectId: 'orig', path: 'C:/big/report.md', chunks: 100, drawn: ids },
+		],
+		sameText(100),
+		{ strategy_used: 'first', biased: true }
+	);
+	const [group] = dedupeView(firsts, 0.97).groups;
+	assert.equal(copyVerdict(group!, docInfo(firsts, null)), 'uneven');
+	assert.deepEqual(queuedCopy(firsts, group), []);
+	// Two whole 4-chunk documents, one chunk each unmatched, but every kNN row full of near-duplicates.
+	const crowdedSample = sampleOf(
+		[
+			['ca', 'C:/c/a.md', 4],
+			['cb', 'C:/c/b.md', 4],
+		],
+		[0, 1, 2, 3, 0, 1, 2, 3].map((chunk, i) => ({ doc: i < 4 ? 0 : 1, chunk })),
+		[0, 1, 2, 3, 4, 5, 6, 7].map((i): Array<[number, number]> => (i % 4 === 3 ? [[i === 3 ? 2 : 6, 0.99]] : [[i < 4 ? i + 4 : i - 4, 0.999]]))
+	);
+	const crowded = { ...crowdedSample, knn: { ...crowdedSample.knn, k: 1 } };
+	const [g2] = dedupeView(crowded, 0.97).groups;
+	assert.notEqual(copyVerdict(g2!, docInfo(crowded, null)), 'passages', 'a twin may lie beyond a full row of near-duplicates');
 });
 
 test('the threshold moves within 0.90 to 0.995 and re-groups at once from the sample alone', () => {

@@ -43,10 +43,10 @@ import React, { useCallback, useMemo, useReducer, useState, useSyncExternalStore
 import type { Availability, DuplicatesPanelProps as ContractDuplicatesPanelProps, IDocumentItem, IDocumentRowsSource, ISampleModel } from '../contract/types';
 import { reviewedDocuments } from '../adapters/connections';
 import { GROUPS_SHOWN_MAX, KEEP_POLICIES, PAIRS_SHOWN_MAX, THRESHOLD_MAX, THRESHOLD_MIN, THRESHOLD_STEP, copyVerdict, dedupeView, docInfo, isReviewed, keepOf, markReviewed, policyChooses, queueInit, queueReducer, queued, reviewedOf, unmarkReviewed } from '../map/dedupe';
-import type { CopyVerdict, IDedupeView, IDocInfo, IDocumentGroup, IQueueState, IQueued, KeepPolicy, ReviewedCache } from '../map/dedupe';
+import type { ContainmentVerdict, CopyVerdict, IDedupeView, IDocInfo, IDocumentGroup, IQueueState, IQueued, KeepPolicy, ReviewedCache } from '../map/dedupe';
 import { formatSize } from '../vector/fileType';
 import { MAP_STYLES } from '../map/styles';
-import { CHOOSE_KEEP_FIRST, KEPT_ELSEWHERE, NOT_WHOLE_COPIES_NOTE, NO_BULK_REMOVE, PARTLY_MATCHED_NOTE, POLICY_LEAVES_GROUP, SHARED_PASSAGES_NOTE, POLICY_LABELS, POLICY_UNAVAILABLE, REPEATED_HEADING, REPEATED_NOTE, TOO_FEW_SAMPLED_NOTE, duplicatesKnnCaveat, duplicatesNone, duplicatesSampleCaveat, groupLegend, groupsCappedLine, morePairsLine, num, plural, queuedLine, removeAllLabel, removeOthersLabel, removedLine, reviewedGroupsHeading, sharedLine, simText, thresholdValueText } from '../map/reviewWording';
+import { BY_HAND_NOT_SHOWN, BY_HAND_OWN_TEXT, CHOOSE_KEEP_FIRST, HELD_NOT_SHOWN, HELD_OWN_TEXT, KEPT_ELSEWHERE, NOTHING_SHOWN_HELD, NOT_WHOLE_COPIES_NOTE, NO_BULK_REMOVE, PARTLY_MATCHED_NOTE, POLICY_LEAVES_GROUP, SHARED_PASSAGES_NOTE, POLICY_LABELS, POLICY_UNAVAILABLE, REPEATED_HEADING, REPEATED_NOTE, TOO_FEW_SAMPLED_NOTE, UNEVEN_SAMPLE_NOTE, UNSIZED_NOTE, duplicatesKnnCaveat, duplicatesNone, duplicatesSampleCaveat, groupLegend, groupsCappedLine, morePairsLine, num, plural, queuedLine, removeAllLabel, removeOthersLabel, removedLine, reviewedGroupsHeading, sharedLine, simText, thresholdValueText } from '../map/reviewWording';
 
 /** Props: the frozen ones, plus the queue's starting choices and the reviewed cache. */
 export interface DuplicatesPanelProps extends ContractDuplicatesPanelProps {
@@ -84,7 +84,21 @@ const NOT_COPIES_NOTES: Readonly<Record<Exclude<CopyVerdict, 'copies'>, string>>
 	mixed: NOT_WHOLE_COPIES_NOTE,
 	partial: PARTLY_MATCHED_NOTE,
 	sparse: TOO_FEW_SAMPLED_NOTE,
+	unsized: UNSIZED_NOTE,
+	uneven: UNEVEN_SAMPLE_NOTE,
 };
+
+/**
+ * The words under a document the keep does not queue, or queues only by hand.
+ *
+ * @param verdict - What the sample shows about the kept document holding it.
+ * @param byHand - True when a hand-picked keep queues it anyway.
+ * @returns The phrase.
+ */
+function heldWords(verdict: ContainmentVerdict, byHand: boolean): string {
+	if (verdict === 'out') return byHand ? BY_HAND_OWN_TEXT : HELD_OWN_TEXT;
+	return byHand ? BY_HAND_NOT_SHOWN : HELD_NOT_SHOWN;
+}
 
 /** The last path segment. */
 function base(path: string): string {
@@ -132,6 +146,23 @@ function docLine(doc: IDocInfo | undefined, shared: number): string {
 }
 
 /**
+ * Why a document that is not kept is or is not queued, after the doc line.
+ *
+ * @param objectId - The document.
+ * @param conflicts - Documents another group keeps.
+ * @param held - The group's documents a policy leaves in place, and why.
+ * @param unshown - The group's documents queued by hand that the sample does not show held, and why.
+ * @returns The phrase with its separator, or ''.
+ */
+function docState(objectId: string, conflicts: ReadonlySet<string>, held: ReadonlyMap<string, ContainmentVerdict> | undefined, unshown: ReadonlyMap<string, ContainmentVerdict> | undefined): string {
+	const notHeld = held?.get(objectId);
+	if (notHeld !== undefined) return ` · ${heldWords(notHeld, false)}`;
+	if (conflicts.has(objectId)) return ` · ${KEPT_ELSEWHERE}`;
+	const byHand = unshown?.get(objectId);
+	return byHand !== undefined ? ` · ${heldWords(byHand, true)}` : '';
+}
+
+/**
  * The pairs of a group as list rows.
  *
  * @param props - The body's props.
@@ -171,9 +202,11 @@ function groupFieldset(props: DuplicatesBodyProps, group: IDocumentGroup, review
 	const writesOff = !props.writes.enabled;
 	const reason = props.writes.reason ?? undefined;
 	const cannotBulk = mine.length > 1 && !props.bulk;
-	const removeWhy = writesOff ? reason : keep === null ? CHOOSE_KEEP_FIRST : cannotBulk ? NO_BULK_REMOVE : undefined;
-	// Not copies: a policy leaves the group alone, and the panel says why.
+	const removeWhy = writesOff ? reason : keep === null ? CHOOSE_KEEP_FIRST : cannotBulk ? NO_BULK_REMOVE : mine.length === 0 ? NOTHING_SHOWN_HELD : undefined;
+	// Not copies: a policy queues only the documents the sample shows the kept one holds, and the panel says why.
 	const verdict = copyVerdict(group, props.info);
+	const held = props.queue.held.get(group.key);
+	const unshown = props.queue.unshown.get(group.key);
 	return (
 		<fieldset key={group.key} data-group={group.id} style={{ border: '1px solid var(--rr-border)', borderRadius: 6, margin: '8px 0', padding: '6px 8px', opacity: reviewed ? 0.8 : 1 }}>
 			<legend style={MAP_STYLES.label}>{groupLegend(group.id, group.objectIds.length, group.simMin, group.simMax)}</legend>
@@ -192,7 +225,7 @@ function groupFieldset(props: DuplicatesBodyProps, group: IDocumentGroup, review
 						</label>
 						<div style={{ ...MAP_STYLES.small, marginLeft: 22 }}>
 							{docLine(doc, group.shared[objectId] ?? 0)}
-							{!isKept && keep !== null && !reviewed && conflicts.has(objectId) ? ` · ${KEPT_ELSEWHERE}` : ''}
+							{!isKept && keep !== null && !reviewed ? docState(objectId, conflicts, held, unshown) : ''}
 						</div>
 					</div>
 				);
@@ -300,7 +333,7 @@ export function DuplicatesBody(props: DuplicatesBodyProps): React.ReactElement {
 						</button>
 					</div>
 					<p style={MAP_STYLES.note} role="status">
-						{queuedLine(total)}
+						{queuedLine(total, state.policy !== 'manual' && view.groups.some((g) => keepOf(g, state, props.info) !== null))}
 					</p>
 					{!writes.enabled && writes.reason ? <p style={MAP_STYLES.note}>{writes.reason}</p> : null}
 					{shown.map((g) => groupFieldset(props, g, false))}
