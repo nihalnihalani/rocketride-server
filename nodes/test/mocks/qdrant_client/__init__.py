@@ -681,22 +681,25 @@ class QdrantClient:
             ]
         )
 
-    def _example_vectors(self, collection_name: str, examples: Optional[List[Any]]) -> Tuple[List[List[float]], set]:
+    def _example_vectors(
+        self, collection_name: str, examples: Optional[List[Any]]
+    ) -> Tuple[List[Tuple[List[float], bool]], set]:
         """The vectors of a recommendation's examples on one side, and the point ids among them.
 
         An example is a point id (looked up whatever the query's filter says, as the
-        server does; an unknown id is a 404) or a raw vector.
+        server does; an unknown id is a 404) or a raw vector. Each vector comes with
+        whether it is a stored point's (True) or a raw vector of the query (False).
         """
         store = self._store(collection_name)
-        vectors: List[List[float]] = []
+        vectors: List[Tuple[List[float], bool]] = []
         ids: set = set()
         for example in examples or []:
             if isinstance(example, (list, tuple)):
-                vectors.append([float(v) for v in example])
+                vectors.append(([float(v) for v in example], False))
                 continue
             if example not in store:
                 raise Exception(f'Not found: No point with id {example} found')
-            vectors.append(list(store[example].vector))
+            vectors.append((list(store[example].vector), True))
             ids.add(example)
         return vectors, ids
 
@@ -710,22 +713,27 @@ class QdrantClient:
 
         * ``average_vector`` (the default) searches with
           ``avg_positive + avg_positive - avg_negative`` (``avg_positive`` without
-          negatives). On a Cosine collection the server stores unit vectors, so the
-          examples are averaged at unit length; on Dot and Euclid they are averaged
-          as given. No positive example is a 400.
+          negatives). On a Cosine collection the server stores unit vectors, so a
+          stored point counts at unit length, while a raw vector given as an example
+          is averaged as given; on Dot and Euclid every example is averaged as given.
+          No positive example is a 400.
         * ``best_score`` measures each candidate against every example and keeps
           its best positive and best negative similarity: ``sigmoid(best_positive)``
           when that is the larger, else ``-sigmoid(best_negative)``, with
           ``sigmoid(x) = 0.5 * (1 + x / (1 + |x|))``. Negatives alone are allowed.
         * ``sum_scores`` adds the positive similarities and subtracts the negative ones.
 
-        For ``best_score`` and ``sum_scores`` on a distance metric (Euclid, Manhattan)
-        the similarity is the negated distance, so higher stays closer.
+        For ``best_score`` and ``sum_scores`` the similarity on Euclid is the negated
+        squared distance (the score a server hands to ``sigmoid``, checked for
+        ``best_score``) and on Manhattan the negated distance (not checked against a
+        server), so higher stays closer.
         """
         distance = self._distance(collection_name)
         strategy = _strategy_of(recommend)
-        positives, positive_ids = self._example_vectors(collection_name, recommend.positive)
-        negatives, negative_ids = self._example_vectors(collection_name, recommend.negative)
+        positive_examples, positive_ids = self._example_vectors(collection_name, recommend.positive)
+        negative_examples, negative_ids = self._example_vectors(collection_name, recommend.negative)
+        positives = [vector for vector, _stored in positive_examples]
+        negatives = [vector for vector, _stored in negative_examples]
         examples = positive_ids | negative_ids
         candidates = [p for p in candidates if p.id not in examples]
 
@@ -735,20 +743,20 @@ class QdrantClient:
                     'Bad request: Wrong input: Positive vectors should not be empty with `average` strategy'
                 )
 
-            def prepared(vector: List[float]) -> List[float]:
-                if distance != 'Cosine':
+            def prepared(vector: List[float], stored: bool) -> List[float]:
+                if distance != 'Cosine' or not stored:
                     return list(vector)
                 norm = sum(x * x for x in vector) ** 0.5
                 return [x / norm for x in vector] if norm else list(vector)
 
-            def mean(vectors: List[List[float]]) -> List[float]:
-                rows = [prepared(v) for v in vectors]
+            def mean(side: List[Tuple[List[float], bool]]) -> List[float]:
+                rows = [prepared(vector, stored) for vector, stored in side]
                 return [sum(column) / len(rows) for column in zip(*rows)]
 
-            avg_positive = mean(positives)
+            avg_positive = mean(positive_examples)
             query = avg_positive
             if negatives:
-                avg_negative = mean(negatives)
+                avg_negative = mean(negative_examples)
                 query = [p + p - n for p, n in zip(avg_positive, avg_negative)]
             scored = [(p, _similarity(distance, query, p.vector)) for p in candidates]
             scored.sort(key=lambda ps: ps[1], reverse=not _lower_is_better(distance))
@@ -761,6 +769,8 @@ class QdrantClient:
 
         def sim(a: List[float], b: List[float]) -> float:
             value = _similarity(distance, a, b)
+            if distance == 'Euclid':
+                return -(value * value)
             return -value if _lower_is_better(distance) else value
 
         def sigmoid(x: float) -> float:
