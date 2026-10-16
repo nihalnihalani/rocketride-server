@@ -422,7 +422,7 @@ function DuplicatesQueue(props: DuplicatesPanelProps): React.ReactElement {
 	let done: string | null = null;
 	if (requested.length > 0 && removedNow.length > 0) {
 		const counts = removedNow.map((id) => info.get(id)?.chunks ?? null);
-		done = removedLine(removedNow.length, requested.length, counts.every((c) => c !== null) ? counts.reduce<number>((sum, c) => sum + (c ?? 0), 0) : null);
+		done = removedLine(removedNow.length, counts.every((c) => c !== null) ? counts.reduce<number>((sum, c) => sum + (c ?? 0), 0) : null);
 	}
 
 	return <DuplicatesBody sample={props.sample} writes={props.writes} view={view} info={info} state={state} reviewed={reviewed} queue={queue} done={done} bulk={props.onRemoveDocuments !== undefined} onThreshold={(value) => dispatch({ type: 'threshold', value })} onPolicy={(value) => dispatch({ type: 'policy', value })} onKeep={(group, objectId) => dispatch({ type: 'keep', group, objectId })} onShow={(points) => props.onSelect(points)} onReview={onReview} onRemove={onRemove} onOpenDocument={props.onOpenDocument} />;

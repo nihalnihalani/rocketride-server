@@ -209,18 +209,18 @@ export const BY_HAND_NOT_SHOWN = 'queued by your choice; this sample does not sh
 export const NOTHING_SHOWN_HELD = 'This sample does not show that the kept document holds the others.';
 
 /**
- * After the console removed queued documents.
+ * After the console removed queued documents. The chunk count is the
+ * document list's (the node's own count of what it removed does not reach
+ * the panel), and nothing is said about documents not removed: a cancelled
+ * dialog and a batch that stopped at an error look the same from here.
  *
  * @param removed - Documents now gone.
- * @param asked - Documents asked for.
- * @param chunks - Their chunks as the store reported them per document, or null when one is unknown.
- * @returns E.g. "Removed 3 documents (41 chunks)".
+ * @param chunks - Their chunks as the document list counts them, or null when one is unknown.
+ * @returns E.g. "Removed 3 documents (41 chunks as listed)".
  */
-export function removedLine(removed: number, asked: number, chunks: number | null): string {
-	const counted = chunks === null ? '' : ` (${plural(chunks, 'chunk')})`;
-	if (removed >= asked) return `Removed ${plural(removed, 'document')}${counted}`;
-	const left = asked - removed;
-	return `Removed ${num(removed)} of ${plural(asked, 'document')}${counted}; ${num(left)} ${left === 1 ? 'is' : 'are'} still stored.`;
+export function removedLine(removed: number, chunks: number | null): string {
+	const counted = chunks === null ? '' : ` (${plural(chunks, 'chunk')} as listed)`;
+	return `Removed ${plural(removed, 'document')}${counted}`;
 }
 
 /**

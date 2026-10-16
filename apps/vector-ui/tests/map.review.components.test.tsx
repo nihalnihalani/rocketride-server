@@ -220,12 +220,15 @@ test("the sample model's removed documents leave the groups", () => {
 	assert.equal((out.match(/<fieldset/g) ?? []).length, 2, 'the kestrel pair and the repeated memo');
 });
 
-test('after the console removed queued documents the panel says how many, with the chunks the store reported per document', () => {
+test('after the console removed queued documents the panel says how many, with the chunks as the document list counts them', () => {
 	const sample: ISampleModel = { ...SMALL, removed: ['ob'] };
 	const out = html(<DuplicatesPanel sample={sample} writes={on} documents={rowsSource} onSelect={noop} onRemoveDocument={noop} onRemoveDocuments={noop} initial={{ requested: ['ob', 'od'] }} />);
-	assert.match(out, /Removed 1 of 2 documents \(2 chunks\); 1 is still stored\./);
+	assert.match(out, /Removed 1 document \(2 chunks as listed\)/);
+	assert.doesNotMatch(out, /still stored/, 'a cancelled dialog and a stopped batch look the same from here: nothing is said about the rest');
 	const all: ISampleModel = { ...SMALL, removed: ['ob', 'od'] };
-	assert.match(html(<DuplicatesPanel sample={all} writes={on} documents={rowsSource} onSelect={noop} onRemoveDocument={noop} onRemoveDocuments={noop} initial={{ requested: ['ob', 'od'] }} />), /Removed 2 documents \(3 chunks\)/);
+	assert.match(html(<DuplicatesPanel sample={all} writes={on} documents={rowsSource} onSelect={noop} onRemoveDocument={noop} onRemoveDocuments={noop} initial={{ requested: ['ob', 'od'] }} />), /Removed 2 documents \(3 chunks as listed\)/);
+	const unknown: ISampleModel = { ...modelOf({ ...small(), docs: small().docs.map((d) => ({ ...d, chunks: null })) }), removed: ['ob'] };
+	assert.match(html(<DuplicatesPanel sample={unknown} writes={on} onSelect={noop} onRemoveDocument={noop} onRemoveDocuments={noop} initial={{ requested: ['ob', 'od'] }} />), /Removed 1 document</, 'no count when the list does not have one');
 });
 
 test('a removal that resolves the last group still says what was removed, beside the sentence that no pair is left', () => {
@@ -243,7 +246,7 @@ test('a removal that resolves the last group still says what was removed, beside
 	const sample: ISampleModel = { ...modelOf({ ...only, knn }), removed: ['ob'] };
 	const out = html(<DuplicatesPanel sample={sample} writes={on} documents={rowsSource} onSelect={noop} onRemoveDocument={noop} onRemoveDocuments={noop} initial={{ policy: 'shortest-path', requested: ['ob'] }} />);
 	assert.match(out, /No near-duplicate pairs at similarity 0\.97 or above in this sample\./, 'the only group is resolved');
-	assert.match(out, /Removed 1 document \(2 chunks\)/, 'and the panel says what the removal did');
+	assert.match(out, /Removed 1 document \(2 chunks as listed\)/, 'and the panel says what the removal did');
 	assert.doesNotMatch(html(<DuplicatesPanel sample={modelOf({ ...only, knn })} writes={on} onSelect={noop} onRemoveDocument={noop} />), /Removed/, 'nothing removed, nothing said');
 });
 
