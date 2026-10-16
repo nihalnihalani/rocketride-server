@@ -361,7 +361,7 @@ commit.
 | Folder | What | How it is made |
 | --- | --- | --- |
 | `apps/vector-ui/tests/fixtures/provisional/` | One hand-written answer per tool and case, including the error envelopes | By hand, from the contract |
-| `apps/vector-ui/tests/fixtures/v1/live/<backend>/` | Answers captured from the live drivers, on a new and a legacy collection, scrubbed of volatile values; with the additive tools on the branch also `documents.filter`, `sample.clusters`, `search.keyword`, `recommend`, `recommend.best_score`, `similarity_matrix` and `dialect.enriched` | `nodes/test/vector_wire_fixtures.py`; `test_vector_wire_fixtures_full.py` regenerates and compares |
+| `apps/vector-ui/tests/fixtures/v1/live/<backend>/` | Answers captured from the live drivers, on a new and a legacy collection, scrubbed of volatile values; with the additive tools on the branch also `documents.filter`, `sample.clusters`, `search.keyword`, `recommend`, `recommend.best_score` (Qdrant; `recommend.unsupported` where the store refuses it, since a refusal capture is named by its code), `similarity_matrix` and `dialect.enriched` | `nodes/test/vector_wire_fixtures.py`; `test_vector_wire_fixtures_full.py` regenerates and compares |
 | `sample_*.json` among the provisional fixtures | Seeded synthetic `sample` answers for the map's tests | `apps/vector-ui/tests/fixtures/gen_sample.ts` (`--check` verifies them) |
 | `defaults.json` | The write defaults and tool limits | `apps/vector-ui/scripts/gen_defaults.py` (`--check`) |
 | `chunking.json` | The chunker settings every template carries | The chunking calibration run |

@@ -152,9 +152,26 @@ ENRICHED: Dict[str, Tuple[Tuple[str, Optional[str]], ...]] = {
 }
 
 
+# A capture a store refuses is named by the refusal it is for, as every refusal capture is
+# (``<tool>.<code>``, which vector-ui's live tests hold the file names to): where best score is
+# refused, ``recommend.unsupported``.
+BACKEND_CASE: Dict[Tuple[str, Optional[str]], Dict[str, str]] = {
+    ('recommend', 'best_score'): {
+        'pgvector': 'unsupported',
+        'rocketride_vector': 'unsupported',
+        'chroma': 'unsupported',
+    },
+}
+
+
 def expected_for(tool: str, case: Optional[str], backend: str) -> str:
     """The outcome a capture is for on ``backend``."""
     return BACKEND_EXPECTED.get((tool, case), {}).get(backend, EXPECTED[(tool, case)])
+
+
+def case_for(tool: str, case: Optional[str], backend: str) -> Optional[str]:
+    """The case a capture's file is named by on ``backend`` (the refusal code's, where the store refuses it)."""
+    return BACKEND_CASE.get((tool, case), {}).get(backend, case)
 
 
 def enriched_captures(tp) -> List[Tuple[str, Optional[str]]]:
@@ -284,7 +301,7 @@ def _captures_for(
     problems: List[str] = []
 
     def put(tool: str, c: Optional[str], answer: Any) -> None:
-        name = file_name(backend, tool, case(c))
+        name = file_name(backend, tool, case(case_for(tool, c, backend)))
         problem = outcome_problem(answer, expected_for(tool, c, backend)) or (
             sample_problem(answer) if tool == 'sample' else None
         )

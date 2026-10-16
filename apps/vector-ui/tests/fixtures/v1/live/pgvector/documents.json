@@ -17,7 +17,9 @@
       "size": 3538,
       "modifyTime": null,
       "ingestedAt": "<scrubbed>",
-      "pointId": "<scrubbed>"
+      "pointId": "<scrubbed>",
+      "max_chunk_id": 4,
+      "deleted_chunks": 0
     },
     {
       "objectId": "dcfda41e-afa5-5f8d-b1c7-860cc0e03189",
@@ -30,7 +32,9 @@
       "size": 2737,
       "modifyTime": null,
       "ingestedAt": "<scrubbed>",
-      "pointId": "<scrubbed>"
+      "pointId": "<scrubbed>",
+      "max_chunk_id": 3,
+      "deleted_chunks": 0
     },
     {
       "objectId": "75b89d86-a64e-5143-bf50-55d4a7fd8cd2",
@@ -43,7 +47,9 @@
       "size": 4143,
       "modifyTime": null,
       "ingestedAt": "<scrubbed>",
-      "pointId": "<scrubbed>"
+      "pointId": "<scrubbed>",
+      "max_chunk_id": 6,
+      "deleted_chunks": 0
     }
   ],
   "next_cursor": "<scrubbed>",

@@ -60,8 +60,8 @@
     "remove": true,
     "remove_count": true,
     "soft_delete": false,
-    "clusters": false,
-    "documents_filter": false,
+    "clusters": true,
+    "documents_filter": true,
     "recommend_best_score": false,
     "projection": [
       "pca"
@@ -96,5 +96,7 @@
   },
   "caveats": [
     "score_scale_inverted_fixed"
-  ]
+  ],
+  "size_bytes": null,
+  "keyword_match": "substring"
 }

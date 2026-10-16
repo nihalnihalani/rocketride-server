@@ -1,6 +1,7 @@
 {
   "__scrub__": [
-    "backend_version"
+    "backend_version",
+    "size_bytes"
   ],
   "success": true,
   "dialect": "vector",
@@ -55,8 +56,8 @@
     "remove": true,
     "remove_count": true,
     "soft_delete": false,
-    "clusters": false,
-    "documents_filter": false,
+    "clusters": true,
+    "documents_filter": true,
     "recommend_best_score": false,
     "projection": [
       "pca"
@@ -91,5 +92,7 @@
   },
   "caveats": [
     "brute_force_search"
-  ]
+  ],
+  "size_bytes": "<scrubbed>",
+  "keyword_match": "substring"
 }
