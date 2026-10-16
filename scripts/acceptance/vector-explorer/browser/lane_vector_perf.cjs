@@ -29,14 +29,22 @@
  * as the points row does. The map's slow-frame switch is turned off before the
  * shell loads (PERF_LANE_FLAGS through page.addInitScript; MapViewProps
  * edgesAutoDegrade false), and each row records what the map root says about
- * it (data-edges-auto-degrade, data-edges-degraded), so a slow mode cannot pass
- * by quietly drawing fewer edges.
+ * it (data-edges-auto-degrade, data-edges-degraded). Each row also records the
+ * edges its mode must draw over the page's own sample (edgesExpected, computed
+ * from the sample answer in the page's frames as map/graph.ts computes them:
+ * the tree n minus the kNN graph's pieces, Neighbours m each point's m
+ * strongest pairs once), so a slow mode cannot pass by quietly drawing fewer
+ * edges. The points row of that sample records the switch too: a page that
+ * cannot turn it off gets one FAIL row saying so, and its edge rows are not
+ * measured.
  *
  * GATE: 2,000 detailed points at 4x CPU throttling, p95 frame interval while
  * panning <= 33 ms; and the same for each edge mode (EDGE GATES): a row that is
  * missing, errored, slow, drew no edges (or any edge at None), drew more than
- * the mode allows (n - 1 for the tree, m * n for neighbours), was measured with
- * the switch on or unrecorded, or degraded while it was measured fails. A check that measured nothing FAILS: the frame intervals
+ * the mode allows (n - 1 for the tree, m * n for neighbours), drew other than
+ * the count its sample gives (or that count could not be computed), was
+ * measured with the switch on or unrecorded, or degraded while it was measured
+ * fails. A check that measured nothing FAILS: the frame intervals
  * count only when the pan really drew (a renderer runs, the canvas's
  * data-draw-count advanced by at least GATE.minSamples frames and its
  * data-camera moved), since requestAnimationFrame ticks at ~16.7 ms on an idle
@@ -170,9 +178,84 @@ function edgeLimit(mode, n) {
 }
 
 /**
+ * The least a mode can draw over n points of a sample whose every point has a neighbour, without
+ * the sample at hand: the tree spans pieces of at least two points (at most n / 2 of them), so it
+ * has at least n / 2 edges; Neighbours m gives each point m distinct partners and counts a pair at
+ * most twice, so at least m * n / 2. None draws nothing.
+ */
+function edgeFloor(mode, n) {
+	const { edges, m } = edgeModeOf(mode);
+	if (edges === 'tree') return Math.ceil(Math.max(0, n) / 2);
+	if (edges === 'neighbours' && Number.isInteger(m) && m > 0) return Math.ceil((m * Math.max(0, n)) / 2);
+	return 0;
+}
+
+/**
+ * The edges the map draws for a mode over a sample's kNN graph, computed as map/graph.ts does:
+ * Neighbours m takes each point's m strongest neighbours (strongest first, ties to the lower index,
+ * the point itself skipped without taking a place), undirected and kept once; the Tree is the
+ * maximum spanning forest, n minus the graph's pieces (an isolated point is a piece); None draws
+ * nothing. Edges with no finite similarity are not drawn. null without a kNN graph for n points.
+ *
+ * @param knn - The sample answer's `knn` ({ offsets_row, cols, sims }).
+ * @param n - The sample's points.
+ * @param mode - 'none', 'tree' or 'neighbours:<m>' (an 'edges:' prefix is accepted).
+ */
+function expectedEdges(knn, n, mode) {
+	const { edges, m } = edgeModeOf(mode);
+	if (edges === 'none') return 0;
+	if (!knn || !Array.isArray(knn.offsets_row) || !Array.isArray(knn.cols) || !Number.isInteger(n) || n <= 0 || knn.offsets_row.length < n + 1) return null;
+	const sims = Array.isArray(knn.sims) ? knn.sims : [];
+	const usable = (j, i) => Number.isInteger(j) && j >= 0 && j < n && j !== i;
+	const rowOf = (i) => {
+		const row = [];
+		for (let e = knn.offsets_row[i]; e < knn.offsets_row[i + 1]; e += 1) row.push([knn.cols[e], sims[e]]);
+		return row;
+	};
+	if (edges === 'tree') {
+		const parent = Array.from({ length: n }, (_, i) => i);
+		const find = (a) => {
+			while (parent[a] !== a) {
+				parent[a] = parent[parent[a]];
+				a = parent[a];
+			}
+			return a;
+		};
+		let joined = 0;
+		for (let i = 0; i < n; i += 1) {
+			for (const [j, sim] of rowOf(i)) {
+				if (!usable(j, i) || !Number.isFinite(sim)) continue;
+				const a = find(i);
+				const b = find(j);
+				if (a !== b) {
+					parent[a] = b;
+					joined += 1;
+				}
+			}
+		}
+		return joined;
+	}
+	if (edges !== 'neighbours' || !Number.isInteger(m) || m <= 0) return null;
+	const pairs = new Set();
+	for (let i = 0; i < n; i += 1) {
+		let taken = 0;
+		for (const [j, sim] of rowOf(i).sort((x, y) => (y[1] ?? -Infinity) - (x[1] ?? -Infinity) || x[0] - y[0])) {
+			if (taken >= m) break;
+			if (!usable(j, i)) continue;
+			if (Number.isFinite(sim)) pairs.add(i < j ? i * n + j : j * n + i);
+			taken += 1;
+		}
+	}
+	return pairs.size;
+}
+
+/**
  * Why an edge row proves nothing about its mode (null when it does): it must have been drawn with
- * the slow-frame switch recorded off and never degraded, with edges drawn for every mode but None
- * (none at None), at most the mode's limit, and at the requested edges per point when the map said.
+ * the slow-frame switch recorded off and never degraded, with no edge at None, never more than the
+ * mode allows, and exactly the edges the page's own sample gives that mode (edgesExpected, which the
+ * lane computes from the sample answer it captured; null when it could not). A row without that
+ * count (one built by hand) is held to the least its mode can draw (edgeFloor), so a mode cannot
+ * pass by drawing a handful of edges.
  */
 function edgeRowProblem(row, mode) {
 	const { edges, m } = edgeModeOf(mode);
@@ -184,7 +267,28 @@ function edgeRowProblem(row, mode) {
 	if (drawn <= 0) return `no edges drawn in ${mode}`;
 	if (drawn > edgeLimit(mode, row.n)) return `${drawn} edges drawn, more than ${mode} allows over ${row.n} points (${edgeLimit(mode, row.n)})`;
 	if (m !== null && row.edgesPerPoint !== undefined && row.edgesPerPoint !== m) return `the map drew ${row.edgesPerPoint} edges per point, not ${m}`;
+	if (row.edgesExpected === null) return `the edges ${mode} should draw could not be computed from the page's sample answer${row.edgesExpectedError ? ` (${row.edgesExpectedError})` : ''}`;
+	if (Number.isInteger(row.edgesExpected)) return drawn === row.edgesExpected ? null : `${drawn} edges drawn; the sample's kNN graph gives ${mode} ${row.edgesExpected}`;
+	const floor = edgeFloor(mode, row.n);
+	return drawn >= floor ? null : `${drawn} edges drawn, fewer than ${mode} can draw over ${row.n} points (at least ${floor})`;
+}
+
+/** The last successful sample answer of n points among a page's sample exchanges (common.cjs exchanges), or null. */
+function lastSample(exchanges, n) {
+	for (let i = exchanges.length - 1; i >= 0; i -= 1) {
+		const result = exchanges[i].result;
+		if (result && result.success !== false && result.n === n) return result;
+	}
 	return null;
+}
+
+/** What a run's points row says when the page kept the map's slow-frame switch on. */
+const SWITCH_ON = 'the page cannot turn the map\'s slow-frame switch off: data-edges-auto-degrade stayed "on" with window.__VX_PERF_LANE__ = { edgesAutoDegrade: false } set before the shell loaded, so the edge rows were not measured';
+
+/** Why a row's page did not have the slow-frame switch off (null when it did). */
+function switchProblem(row) {
+	if (row.edgesAutoDegrade === false) return null;
+	return row.edgesAutoDegrade === true ? SWITCH_ON : 'the map did not say whether its slow-frame switch was on (no data-edges-auto-degrade)';
 }
 
 /** The gate of one edge mode: the row at GATE.n detailed points and GATE.rate, panned like the points gate. */
@@ -221,6 +325,14 @@ function evaluateGates(rows) {
 	// The edge gates belong to a run that measured edges: one with an edge row, or whose points row
 	// says the edge rows were due on its sample (edgeModes, set by the lane on every GATE-size row).
 	if (rows.some((r) => r.edges || Array.isArray(r.edgeModes))) for (const mode of EDGE_MODES) out.push(edgeGate(rows, mode));
+	// The lane's own run records, on the points row of the edge sample, whether its page turned the
+	// slow-frame switch off: one row says so (a page that cannot turn it off is the cause of every
+	// edge gate's failure, not four separate ones).
+	const edgeSample = rows.find((r) => !r.edges && Array.isArray(r.edgeModes) && r.n === GATE.n && r.mode === GATE.mode && r.cpuThrottle === GATE.rate);
+	if (edgeSample && !edgeSample.error) {
+		const problem = switchProblem(edgeSample);
+		out.push({ name: "edge rows: the page turned the map's slow-frame switch off (edgesAutoDegrade false)", status: problem ? 'FAIL' : 'PASS', detail: problem || 'data-edges-auto-degrade="off"' });
+	}
 	for (const row of rows) {
 		const where = rowWhere(row);
 		const layout = row.neighbourLayout;
@@ -349,7 +461,7 @@ async function measurePan(page, canvas, box) {
  * says it draws that mode, pan, and read what the root says about the edges it drew and the
  * slow-frame switch it ran with. Missing attributes are recorded as such, never as a pass.
  */
-async function measureEdges(page, mode) {
+async function measureEdges(page, mode, sample) {
 	const { edges, m } = edgeModeOf(mode);
 	const map = page.locator('.vector-map').first();
 	const canvas = page.locator('[data-points]').first();
@@ -376,6 +488,11 @@ async function measureEdges(page, mode) {
 	row.edgesDegraded = degraded === '1' ? true : degraded === '0' ? false : undefined;
 	row.edgesDrawn = int(await map.getAttribute('data-edge-count'));
 	if (m !== null) row.edgesPerPoint = int(await map.getAttribute('data-edges-per-point'));
+	// What this mode must draw over the sample the page holds (its answer, from the page's frames).
+	if (!sample || !sample.knn || sample.n !== GATE.n) {
+		row.edgesExpected = null;
+		row.edgesExpectedError = sample ? `the page's last sample answer has ${sample.n} points${sample.knn ? '' : ' and no kNN graph'}` : 'no sample answer was captured';
+	} else row.edgesExpected = expectedEdges(sample.knn, sample.n, mode);
 	const draw = await canvas.getAttribute('data-draw-p95');
 	row.drawP95Ms = draw === null ? null : Number(draw);
 	return row;
@@ -636,6 +753,11 @@ async function main() {
 				row.neighbourLayout = await runLayout(page, 'neighbour-graph');
 				if (size.n <= 1000) row.tsne = await runLayout(page, 'tsne');
 				row.jsHeapMB = await page.evaluate(() => (performance.memory ? Math.round((performance.memory.usedJSHeapSize / 1048576) * 10) / 10 : null));
+				if (edgeSample) {
+					// Whether this page has the map's slow-frame switch off, as the map root says; the edge rows need it off.
+					const auto = await page.locator('.vector-map').first().getAttribute('data-edges-auto-degrade');
+					row.edgesAutoDegrade = auto === 'off' ? false : auto === 'on' ? true : undefined;
+				}
 				if (rate === 1 && (size.n === 1000 || size.mode === 'light')) {
 					await cdp.send('Emulation.setCPUThrottlingRate', { rate: 1 });
 					row.steps = await mapSteps(page, box, row);
@@ -648,14 +770,17 @@ async function main() {
 			row.privacy = { ...privacySummary(capture.frames, dimension, C), ...(dimensionError ? { dimensionError } : {}) };
 			rows.push(row);
 			console.log(JSON.stringify(row));
-			// The edge rows, on the same sample (still throttled at this rate), one per mode.
+			// The edge rows, on the same sample (still throttled at this rate), one per mode. A page that
+			// cannot turn the slow-frame switch off is not measured: its rows would prove nothing.
+			const edgeSampleAnswer = edgeSample && !row.error ? lastSample(C.exchanges(capture, 'sample'), size.n) : null;
 			for (const mode of edgeSample ? EDGE_MODES : []) {
 				const edgeRow = { n: size.n, mode: size.mode, cpuThrottle: rate, edges: `edges:${mode}`, browser: row.browser, fixture: PERF_FIXTURE };
 				if (row.error) edgeRow.error = `the points row failed first: ${row.error}`;
+				else if (switchProblem(row)) edgeRow.error = `not measured: ${switchProblem(row)}`;
 				else {
 					try {
 						await cdp.send('Emulation.setCPUThrottlingRate', { rate });
-						Object.assign(edgeRow, await measureEdges(page, mode));
+						Object.assign(edgeRow, await measureEdges(page, mode, edgeSampleAnswer));
 						await page.screenshot({ path: outFile.replace(/\.json$/, `-${size.mode}-${size.n}-edges-${mode.replace(':', '')}-x${rate}.png`) });
 					} catch (e) {
 						edgeRow.error = String(e && e.message ? e.message : e).split('\n')[0];
@@ -679,7 +804,7 @@ async function main() {
 	return result.pass ? 0 : 1;
 }
 
-module.exports = { GATE, EDGE_MODES, PERF_LANE_FLAGS, PERF_PROJECT_ID, QUERY_STEP, pct, parseSizes, summarise, edgeModeOf, edgeLimit, edgeRowProblem, evaluateGates, privacySummary, laneArgs, resultOf };
+module.exports = { GATE, EDGE_MODES, PERF_LANE_FLAGS, PERF_PROJECT_ID, QUERY_STEP, SWITCH_ON, pct, parseSizes, summarise, edgeModeOf, edgeLimit, edgeFloor, expectedEdges, edgeRowProblem, switchProblem, lastSample, evaluateGates, privacySummary, laneArgs, resultOf };
 
 if (require.main === module) {
 	main().then(

@@ -820,3 +820,62 @@ test('perf lane: each edge mode is its own gate at 2,000 detailed points and 4x,
 	// Each edge row carries its own privacy row, named with its mode.
 	assert.ok(at1.some((g) => /^privacy \(B4\).*edges:tree at 4x/.test(g.name)));
 });
+
+test("perf lane: the edges a mode must draw are computed from the sample's kNN graph as the map computes them", () => {
+	const perf = require('../browser/lane_vector_perf.cjs');
+	// Two triangles {0,1,2} and {3,4,5}: each point's two neighbours are its triangle's other points, strongest first.
+	const knn = { offsets_row: [0, 2, 4, 6, 8, 10, 12], cols: [1, 2, 0, 2, 0, 1, 4, 5, 3, 5, 3, 4], sims: [0.9, 0.8, 0.9, 0.7, 0.8, 0.7, 0.9, 0.8, 0.9, 0.7, 0.8, 0.7] };
+	assert.strictEqual(perf.expectedEdges(knn, 6, 'none'), 0);
+	assert.strictEqual(perf.expectedEdges(knn, 6, 'tree'), 4, 'six points in two pieces: a forest of 6 - 2 edges');
+	assert.strictEqual(perf.expectedEdges(knn, 6, 'neighbours:1'), 4, "each point's strongest neighbour, each pair once: 0-1, 0-2, 3-4, 3-5");
+	assert.strictEqual(perf.expectedEdges(knn, 6, 'neighbours:2'), 6);
+	assert.strictEqual(perf.expectedEdges(knn, 6, 'neighbours:5'), 6, 'no more than the graph holds');
+	// A point listed as its own neighbour is skipped without taking a place; ties go to the lower index.
+	const self = { offsets_row: [0, 2, 3, 4], cols: [0, 2, 0, 1], sims: [1, 0.5, 0.5, 0.5] };
+	// Rows: 0 -> [0 (itself), 2], 1 -> [0], 2 -> [1]; strongest neighbours 0-2, 1-0, 2-1: three pairs.
+	assert.strictEqual(perf.expectedEdges(self, 3, 'neighbours:1'), 3, '0 skips itself and takes 2');
+	assert.strictEqual(perf.expectedEdges({ offsets_row: [0, 1, 2], cols: [1, 0], sims: [0.5, 0.5] }, 2, 'tree'), 1);
+	assert.strictEqual(perf.expectedEdges({ offsets_row: [0, 0, 0, 0], cols: [], sims: [] }, 3, 'tree'), 0, 'three isolated points: no tree edge');
+	assert.strictEqual(perf.expectedEdges(undefined, 6, 'tree'), null, 'no kNN graph: nothing to compute');
+	assert.strictEqual(perf.expectedEdges({ offsets_row: [0, 1], cols: [1], sims: [0.5] }, 6, 'neighbours:3'), null, 'a graph shorter than the sample');
+});
+
+test('perf lane: an edge row that drew fewer (or other) edges than its mode gives fails, with or without the computed count', () => {
+	const perf = require('../browser/lane_vector_perf.cjs');
+	const frames = (count, ms) => Array.from({ length: count }, () => ms);
+	const base = { n: 2000, mode: 'detailed', cpuThrottle: 4, renderer: 'webgl', panFrameMs: perf.summarise(frames(80, 18)), panWork: { draws: 74, cameraBefore: '2d:0,0,40', cameraAfter: '2d:3,1,40' }, privacy: { frames: 120, dimension: 384, embedAnswers: 0, vectorRequests: 0, violations: [] } };
+	const expected = { tree: 1994, 'neighbours:3': 4120, 'neighbours:5': 6630 };
+	const row = (mode, extra = {}) => ({ ...base, edges: `edges:${mode}`, edgesAutoDegrade: false, edgesDegraded: false, edgesDrawn: expected[mode], edgesExpected: expected[mode], ...(mode.startsWith('neighbours') ? { edgesPerPoint: Number(mode.split(':')[1]) } : {}), ...extra });
+	for (const mode of Object.keys(expected)) {
+		assert.strictEqual(perf.edgeRowProblem(row(mode), mode), null, `${mode} drew what its sample gives`);
+		assert.notStrictEqual(perf.edgeRowProblem(row(mode, { edgesDrawn: 1 }), mode), null, `${mode} drew 1 edge`);
+		assert.notStrictEqual(perf.edgeRowProblem(row(mode, { edgesDrawn: expected[mode] - 1 }), mode), null, `${mode} drew one edge fewer than its sample gives`);
+		assert.notStrictEqual(perf.edgeRowProblem(row(mode, { edgesDrawn: expected[mode] + 1 }), mode), null, `${mode} drew one edge more than its sample gives`);
+		assert.match(String(perf.edgeRowProblem(row(mode, { edgesExpected: null }), mode)), /could not be computed/, `${mode}: the lane could not compute the count`);
+		// A row with no computed count (a hand-made row) is still held to the least its mode can draw.
+		const bare = row(mode, { edgesExpected: undefined, edgesDrawn: 1 });
+		assert.notStrictEqual(perf.edgeRowProblem(bare, mode), null, `${mode}: 1 edge without a computed count`);
+		assert.strictEqual(perf.edgeRowProblem(row(mode, { edgesExpected: undefined }), mode), null, `${mode}: a plausible count without a computed one`);
+	}
+	assert.strictEqual(perf.edgeFloor('tree', 2000), 1000, 'every point has a neighbour, so at most n/2 pieces');
+	assert.strictEqual(perf.edgeFloor('neighbours:5', 2000), 5000, 'm distinct partners per point, each pair counted at most twice');
+	// The gate of the DA counterexample: one edge drawn and the per-point count echoing the control.
+	const all = [{ ...base, edgeModes: perf.EDGE_MODES, edgesAutoDegrade: false }, row('none', { edgesDrawn: 0, edgesExpected: 0 }), row('tree', { edgesDrawn: 1 }), row('neighbours:3', { edgesDrawn: 1 }), row('neighbours:5', { edgesDrawn: 1 })];
+	for (const mode of ['tree', 'neighbours:3', 'neighbours:5']) assert.strictEqual(perf.evaluateGates(all).find((g) => g.name.startsWith(`GATE edges:${mode} `)).status, 'FAIL', mode);
+});
+
+test('perf lane: a run whose page cannot turn the slow-frame switch off says so once, and its edge rows are not measured', () => {
+	const perf = require('../browser/lane_vector_perf.cjs');
+	const frames = (count, ms) => Array.from({ length: count }, () => ms);
+	const points = { n: 2000, mode: 'detailed', cpuThrottle: 4, renderer: 'webgl', panFrameMs: perf.summarise(frames(80, 18)), panWork: { draws: 74, cameraBefore: 'a', cameraAfter: 'b' }, privacy: { frames: 1, dimension: 384, embedAnswers: 0, vectorRequests: 0, violations: [] }, edgeModes: perf.EDGE_MODES };
+	const switchGate = (rows) => perf.evaluateGates(rows).filter((g) => /slow-frame switch/.test(g.name) && !g.name.startsWith('GATE edges:'));
+	const on = switchGate([{ ...points, edgesAutoDegrade: true }]);
+	assert.strictEqual(on.length, 1, 'one row names the cause');
+	assert.strictEqual(on[0].status, 'FAIL');
+	assert.match(on[0].detail, /cannot turn/);
+	assert.strictEqual(switchGate([{ ...points, edgesAutoDegrade: false }])[0].status, 'PASS');
+	assert.strictEqual(switchGate([{ ...points, edgesAutoDegrade: undefined }])[0].status, 'FAIL', 'unrecorded');
+	assert.deepStrictEqual(switchGate([{ ...points, edgeModes: undefined }]), [], 'a run without edge rows has no switch row');
+	assert.strictEqual(perf.switchProblem({ edgesAutoDegrade: true }), perf.SWITCH_ON);
+	assert.strictEqual(perf.switchProblem({ edgesAutoDegrade: false }), null);
+});
