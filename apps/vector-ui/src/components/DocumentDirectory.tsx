@@ -42,7 +42,7 @@ import type { Availability, IDocumentItem, IDocumentsFilter, IExportItem, IScope
 import type { IRemoveTarget } from '../vector/confirm';
 import { buildGroups, directoryHeading, pagerFooter, pagerProgressText } from '../vector/documents';
 import type { IDirectoryGroup, IDirectoryRow, IPagerState } from '../vector/documents';
-import { FILTER_DEBOUNCE_MS, directoryExportItems, directoryView, scopeWith, withText } from '../vector/filters';
+import { FILTER_DEBOUNCE_MS, directoryExportItems, directoryView, scopeNoMatchText, scopeWith, withText } from '../vector/filters';
 import { medianChunks } from '../vector/health';
 import type { ConditionKind } from '../vector/filters';
 import { DEFAULT_LIMITS } from '../vector/results';
@@ -196,11 +196,13 @@ export function DocumentDirectory({ pager, selectedId, writes, onSelect, onRemov
 		setChecked(next);
 	};
 
+	// With the scope on the list, "no match" is of the loaded rows until every document is loaded.
+	const scoped = scope !== null && scope.applyTo.documents && view.scope !== null ? view.scope : null;
 	let empty: string | null = null;
-	if (pager.rows.length === 0 && pager.status === 'done' && !(scope !== null && scope.applyTo.documents)) empty = EMPTY.noDocuments;
+	if (pager.rows.length === 0 && pager.status === 'done' && scoped === null) empty = EMPTY.noDocuments;
 	else if (pager.rows.length === 0 && pager.status === 'error') empty = EMPTY.unreachable(pager.error?.headline ?? 'the store did not answer.');
-	else if (pager.rows.length > 0 && matches.length === 0) empty = scope !== null ? 'No documents match these conditions.' : EMPTY.noMatch(applied.trim());
-	else if (pager.rows.length === 0 && pager.status === 'done' && scope !== null && scope.applyTo.documents) empty = 'No documents match these conditions.';
+	else if (pager.rows.length > 0 && matches.length === 0) empty = scoped !== null ? scopeNoMatchText(scoped) : EMPTY.noMatch(applied.trim());
+	else if (pager.rows.length === 0 && pager.status === 'done' && scoped !== null) empty = scopeNoMatchText(scoped);
 
 	return (
 		<section aria-label="Documents" style={{ ...styles.panel, flex: 1 }}>
@@ -209,7 +211,7 @@ export function DocumentDirectory({ pager, selectedId, writes, onSelect, onRemov
 				<span style={{ ...styles.small, fontWeight: 400, textTransform: 'none', letterSpacing: 0, marginLeft: 'auto' }}>{pager.status === 'idle' ? '' : directoryHeading(pager)}</span>
 				<ExportMenu items={exportItems} collection={collection} />
 			</div>
-			<ScopeBar text={filter} scopeText={applied} onText={setFilter} scope={scope} onScope={onScope} cap={cap} available={available} folders={folders} saved={saved} onSave={onSave} onDeleteSaved={onDeleteSaved} />
+			<ScopeBar text={filter} scopeText={applied} onText={setFilter} scope={scope} onScope={onScope} cap={cap} available={available} folders={folders} saved={saved} onSave={onSave} onDeleteSaved={onDeleteSaved} listing={pager} />
 			{(summary || progress) && (
 				<div style={{ ...styles.small, padding: '0 12px 6px' }} role="status">
 					{summary ?? progress}

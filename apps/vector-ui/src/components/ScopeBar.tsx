@@ -29,9 +29,11 @@
 // condition it is one row, exactly the old filter row. With conditions they
 // show as chips under it (each one removes itself), with the Apply to toggles
 // (Documents, Map, Search, Chat; all on), Save and Clear. The conditions
-// scope the documents, the map, search and chat (ConsoleModel.scope); above
-// `limits.scope_keys_max` documents the Map, Search and Chat toggles are
-// disabled with the sentence, which is shown too.
+// scope the documents, the map, search and chat (ConsoleModel.scope); until
+// the scope's documents are known (its listing pages, failed or stopped short
+// of every document) and above `limits.scope_keys_max` documents the Map,
+// Search and Chat toggles are off, disabled with the sentence, which is shown
+// too.
 //
 // Every control is a native element with a label; the menus are lists of
 // menu items under the row (nothing floats over the directory); Escape closes
@@ -43,6 +45,7 @@ import type { CSSProperties } from 'react';
 import type { Availability, IDocumentsFilter, IScopeState, ISavedFilter, ScopeBarProps as ContractScopeBarProps } from '../contract/types';
 import { ALL_TARGETS, CONDITION_KINDS, CONDITION_TITLES, conditionLabel, dateToIso, filterOf, removeCondition, scopeAvailability, scopeFromFilter, setCondition, toDocumentsFilter, validateFilter } from '../vector/filters';
 import type { ConditionKind, ICondition, IFilter } from '../vector/filters';
+import type { IPagerState } from '../vector/documents';
 import { ALLOWED_EXTENSIONS } from '../vector/fileType';
 import { ACCENT_TOKEN, CONSOLE_TEXT_TOKEN, selectedRowBackground } from '../vector/colors';
 import { DEFAULT_LIMITS } from '../vector/results';
@@ -74,6 +77,8 @@ export interface ScopeBarProps extends ContractScopeBarProps {
 	initial?: IScopeBarOpen;
 	/** The path box's settled text (after its debounce), which a new scope carries; default `text`. */
 	scopeText?: string;
+	/** The directory's listing, so the Map, Search and Chat toggles say how far the scope's documents are. */
+	listing?: IPagerState | null;
 }
 
 export type { ContractScopeBarProps };
@@ -187,7 +192,7 @@ export function draftCondition(kind: ConditionKind, draft: IDraft): ICondition |
  * @param props - {@link ScopeBarProps}.
  * @returns The bar.
  */
-export function ScopeBar({ text, onText, scope = null, onScope, available = {}, folders = [], cap = DEFAULT_LIMITS.scope_keys_max, saved = [], onSave, onDeleteSaved, initial = {}, scopeText = text }: ScopeBarProps): React.ReactElement {
+export function ScopeBar({ text, onText, scope = null, onScope, available = {}, folders = [], cap = DEFAULT_LIMITS.scope_keys_max, saved = [], onSave, onDeleteSaved, initial = {}, scopeText = text, listing = null }: ScopeBarProps): React.ReactElement {
 	const [menu, setMenu] = useState<IScopeBarOpen['menu']>(initial.menu ?? null);
 	const [editor, setEditor] = useState<ConditionKind | null>(initial.editor ?? null);
 	const [draft, setDraft] = useState<IDraft>(EMPTY_DRAFT);
@@ -202,7 +207,7 @@ export function ScopeBar({ text, onText, scope = null, onScope, available = {}, 
 
 	const filter: IFilter = filterOf(scope, scopeText);
 	const conditions = filter.conditions;
-	const targets = scope ? scopeAvailability(scope, cap) : null;
+	const targets = scope ? scopeAvailability(scope, cap, listing) : null;
 	const blocked = targets ? (TARGETS.map((t) => targets[t.key]).find((a) => !a.enabled)?.reason ?? null) : null;
 	const availability = (kind: ConditionKind): Availability => available[kind] ?? { enabled: true, reason: null };
 

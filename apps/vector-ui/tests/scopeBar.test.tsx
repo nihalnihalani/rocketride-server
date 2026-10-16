@@ -12,7 +12,9 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import React from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
-import type { IScopeState, ISavedFilter } from '../src/contract/types';
+import type { IDocumentItem, IScopeState, ISavedFilter } from '../src/contract/types';
+import type { IPagerState } from '../src/vector/documents';
+import type { IDocumentsPageView } from '../src/vector/results';
 import { fixture } from './support/fixtures';
 
 // The shell's building blocks exist only inside a running shell: plain stand-ins that render their text.
@@ -172,4 +174,54 @@ test('the directory with a scope: its status line says what the store applied', 
 	assert.match(html, /role="status"[^>]*>2 documents match \(store\)</);
 	assert.match(html, /aria-label="Remove condition: folder is under C:\/demo\/greenhouse\/"/);
 	assert.match(html, /aria-label="Folder C:\/demo\/greenhouse\/"/);
+});
+
+// =============================================================================
+// WHILE THE SCOPE'S DOCUMENTS ARE NOT ALL KNOWN
+// =============================================================================
+
+/** 600 documents in storage order, every third under C:/demo/handbooks/ (200 in scope). */
+function row(i: number): IDocumentItem {
+	return { objectId: `d${String(i).padStart(4, '0')}`, path: i % 3 === 0 ? `C:/demo/handbooks/doc_${i}.md` : `C:/demo/other/doc_${i}.md`, chunks: 4, has_first_chunk: true, tables: 0, deleted: false, nodeId: null, size: 10, modifyTime: null, ingestedAt: null, pointId: null };
+}
+
+/** A Qdrant-like page: the store filters nothing ('none'). */
+function clientPage(from: number, n: number, next: string | null, total: number | null = 600): IDocumentsPageView {
+	return readDocumentsPage({ success: true, items: Array.from({ length: n }, (_, k) => row(from + k)), next_cursor: next, total, counts_exact: true, distinct: true, sorted: false, caveats: ['documents_filter_client'], filter_applied: 'none', filter_ignored: ['path_prefix'] });
+}
+
+/** A sentence as a literal in a regular expression. */
+function literal(text: string): string {
+	return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/** The Chat toggle of a rendered bar: pressed, disabled and its title. */
+function chatToggle(html: string): { pressed: boolean; disabled: boolean; title: string | null } {
+	const tag = html.match(/<button[^>]*>Chat<\/button>/)?.[0] ?? '';
+	assert.ok(tag !== '', 'the Chat toggle is there');
+	return { pressed: /aria-pressed="true"/.test(tag), disabled: /disabled=""/.test(tag), title: tag.match(/title="([^"]*)"/)?.[1]?.replace(/&#x27;/g, "'") ?? null };
+}
+
+test('the toggles while the listing pages: Map, Search and Chat off and disabled with the sentence, which is shown', () => {
+	const filter = { path_prefix: 'C:/demo/handbooks/' };
+	const half = pagerApplyPage(pagerBegin(pagerInit(), filter), clientPage(0, 500, 'c1'));
+	const html = bar({ scope: scopeOf(filter), listing: half, cap: 2_000 }).replace(/&#x27;/g, "'");
+	const sentence = literal("Waiting for the scope's documents (500 of 600 loaded); the map, search and chat are not scoped yet.");
+	for (const label of ['Map', 'Search', 'Chat']) assert.match(html, new RegExp(`aria-pressed="false" disabled="" title="${sentence}"[^>]*>${label}</button>`), label);
+	assert.match(html, /aria-pressed="true"[^>]*>Documents<\/button>/);
+	assert.match(html, new RegExp(`role="status"[^>]*>${sentence}</div>`));
+	// Without the listing the bar cannot tell how far it is, but it never shows an unresolved scope as applied.
+	assert.deepEqual(chatToggle(bar({ scope: scopeOf(filter), cap: 2_000 })), { pressed: false, disabled: true, title: "Waiting for the scope's documents; the map, search and chat are not scoped yet." });
+});
+
+test("the directory over a listing that stopped short: the loaded rows' empty match is said to be of the loaded rows, and the toggles say why they are off", () => {
+	const legal = { path_prefix: 'C:/corp/legal/' };
+	let pager: IPagerState = pagerBegin(pagerInit(), legal);
+	for (let p = 0; p < 10; p += 1) pager = pagerApplyPage(pager, clientPage(p * 500, 500, `c${p + 1}`, 12_000));
+	assert.equal(pager.status, 'capped');
+	const html = renderToStaticMarkup(<DocumentDirectory pager={pager} selectedId={null} writes={on} onSelect={noop} onRemove={noop} onLoadMore={noop} onRetry={noop} scope={scopeOf(legal)} onScope={noop} cap={2_000} />);
+	assert.match(html, />No loaded document matches these conditions \(5,000 of 12,000 loaded\)\.</);
+	assert.doesNotMatch(html, /No documents? match(es)? these conditions/);
+	assert.deepEqual(chatToggle(html), { pressed: false, disabled: true, title: "Only 5,000 of 12,000 documents are loaded, so the scope's documents are not all known: the map, search and chat are not scoped. Load more to include them." });
+	assert.match(html, />Load more</);
 });
