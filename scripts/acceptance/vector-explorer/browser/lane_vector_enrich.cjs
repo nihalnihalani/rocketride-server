@@ -38,20 +38,22 @@
  *     selected adds that point's kNN edges
  *   colour by ingest date (P1-3): the ramp spans the sampled documents' days
  *   isolate (P1-4): Isolate shows the lasso selection only and the table
- *     lists it; Expand by neighbours grows it; Show all restores n
+ *     lists it; Expand by neighbours grows it; Show all restores n; after
+ *     Isolate and after Show all the map frames the points it shows (once
+ *     they stop moving, Fit leaves the camera where it is)
  *   text (P1-6): Show full text of a falcon chunk marks 'water' after the
  *     water question, fetched once
  *   recommend (P1-1): + a falcon chunk, - a greenhouse chunk: no greenhouse
  *     chunk in the top 12, a falcon or kestrel chunk first, examples
  *     excluded; Best score is native on Qdrant only
  *   matrix (P1-2): one group of at most 100 points with two chunks of one
- *     document, shown alone and lassoed: the selection's keys are sent (never
- *     indices), each a point of the group; the matrix is symmetric with a unit
- *     diagonal, same-document pairs above 0.5; its CSV (through the map's
- *     Export menu) has n rows
- *   export (P0-6): the lasso selection's CSV has its rows and keys, carries no
- *     vector or secret; the map PNG is over 10 KB, drawn, named after the
- *     collection
+ *     document, shown alone and lassoed whole (the lasso selects exactly the
+ *     group): the selection's keys are sent (never indices), each a point of
+ *     the group; the matrix is symmetric with a unit diagonal, same-document
+ *     pairs above 0.5; its CSV (through the map's Export menu) has n rows
+ *   export (P0-6): the lasso selection (some of the sample, not all of it)
+ *     exports as a CSV with its rows and keys, no vector or secret; the map
+ *     PNG is over 10 KB, drawn, named after the collection
  *   views (P1-5): a view saved with a selection survives a connection switch;
  *     applying it re-samples with its seed, pins at most 200 keys and says
  *     what it restored
@@ -84,6 +86,11 @@
  *   sign-out: saved views and saved filters are gone after signing in again
  *   privacy (B4): over every frame (similarity_matrix rows exempt only at
  *     their own n) and every downloaded file
+ *
+ * Every lasso is drawn on a fitted map: Fit once the points have stopped
+ * moving (no frame drawn for 700 ms), and a second Fit must leave the camera
+ * (data-camera) where the first put it. A lasso over part of the canvas must
+ * take some of the points drawn but not all; over all of it, every one.
  *
  * Selectors and wording: UI below (the enrichment's controls), ui.cjs for the
  * console and map controls of the earlier lanes.
@@ -180,6 +187,8 @@ const UI = {
 			queryState: 'data-query-state',
 			queryBState: 'data-query-b-state',
 		},
+		// PointCanvas root attributes each frame writes: its camera (a signature that changes whenever the camera moves) and frames drawn.
+		canvasAttr: { camera: 'data-camera', drawCount: 'data-draw-count' },
 	},
 	dedupe: {
 		section: 'Near-duplicate review',
@@ -472,13 +481,62 @@ function rampVerdict({ label, colourAfter, items }) {
 	return m[1] === days.first && m[2] === days.last ? true : `the ramp runs ${m[1]} to ${m[2]}; the sampled documents were ingested ${days.first} to ${days.last}`;
 }
 
-/** Isolate: the shown points follow the selection, the table lists them, Expand grows them, Show all restores n. */
-function isolateVerdict({ n, selection, isolated, tableRows, expanded, all }) {
+/**
+ * Whether the camera the app framed by itself (after Isolate or Show all) is the one Fit gives once
+ * the points have stopped moving: { camera, fitted } (data-camera signatures).
+ */
+function framedVerdict(action, framed) {
+	if (!framed || !framed.camera || !framed.fitted) return `the map reports no camera after ${action}`;
+	if (framed.camera === framed.fitted) return true;
+	return `after ${action} the map's camera is ${framed.camera}; Fit then moves it to ${framed.fitted}: the map was framed on the points where they were before they moved, so it shows them zoomed past the canvas or drawn small`;
+}
+
+/**
+ * Isolate: the shown points follow the selection, the table lists them, Expand grows them, Show all
+ * restores n; after Isolate and after Show all the map frames the points it shows (`framing`).
+ */
+function isolateVerdict({ n, selection, isolated, tableRows, expanded, all, framing }) {
 	if (!(selection > 0 && selection < n)) return `the lasso selected ${selection} of ${n} points`;
 	if (isolated.shown !== selection || isolated.flag !== '1') return `Isolate shows ${isolated.shown} points (isolated ${isolated.flag}), the selection has ${selection}`;
 	if (tableRows !== selection) return `the table lists ${tableRows} rows while ${selection} points are isolated`;
 	if (!(expanded > selection && expanded <= n)) return `Expand by neighbours shows ${expanded} points after ${selection}`;
-	return all.shown === n && all.flag === '0' ? true : `Show all shows ${all.shown} of ${n} (isolated ${all.flag})`;
+	if (!(all.shown === n && all.flag === '0')) return `Show all shows ${all.shown} of ${n} (isolated ${all.flag})`;
+	if (!framing) return 'the camera was not read after Isolate and Show all';
+	for (const [action, framed] of [
+		['Isolate', framing.isolate],
+		['Show all', framing.showAll],
+	]) {
+		const verdict = framedVerdict(action, framed);
+		if (verdict !== true) return verdict;
+	}
+	return true;
+}
+
+/**
+ * Fit: the camera a Fit gave ({ camera }) is the one a second Fit gives ({ refit }), so the first was
+ * computed over points that had stopped moving (a layout tween after Show only cluster or Show all).
+ */
+function fitVerdict(fit) {
+	if (!fit || !fit.camera || !fit.refit) return 'the map reports no camera after Fit';
+	return fit.camera === fit.refit ? true : `the camera after Fit (${fit.camera}) moved on a second Fit (${fit.refit}): the first fit framed points that were still moving`;
+}
+
+/**
+ * A lasso over the left `share` of the fitted canvas: over part of it (share < 1) it selects some of
+ * the points drawn but not all of them; over all of it, every one.
+ */
+function lassoShareVerdict({ share, selected, shown }) {
+	if (!(Number.isInteger(shown) && shown > 0)) return `the map reports ${shown} points drawn`;
+	if (!(Number.isInteger(selected) && selected > 0)) return `the lasso over the left ${Math.round(share * 100)} % of the canvas selected no point (${selected})`;
+	if (share >= 1) return selected === shown ? true : `the lasso over the whole canvas selected ${selected} of the ${shown} points drawn: the camera does not show all of them`;
+	return selected < shown ? true : `the lasso over the left ${Math.round(share * 100)} % of the canvas selected every one of the ${shown} points drawn: the map is not spread across the canvas`;
+}
+
+/** The matrix step's lasso: one group shown alone (`shown` = the group's size), the whole canvas lassoed selects exactly it. */
+function matrixLassoVerdict({ group, shown, selected }) {
+	if (!group || !(group.size >= 2)) return `the group holds ${group ? group.size : 'no'} points (a matrix needs 2)`;
+	if (shown !== group.size) return `Show only cluster ${group.cluster + 1} shows ${shown} points (${group.size} in the group)`;
+	return selected === shown ? true : `the lasso over the group shown alone selects ${selected} of the ${shown} points shown`;
 }
 
 /** Full text: a mark holds the word, and the chunk's text was fetched once for its key. */
@@ -557,10 +615,15 @@ function exportNameVerdict(name, collection, kind, ext) {
 }
 
 /**
- * The selection CSV's verdict: one row per selected point, each key one of the sample's, every
- * key once, the header carrying the point columns, and nothing vector-like or secret in it.
+ * The selection CSV's verdict: the lasso took some of the sample but not all of it (otherwise the
+ * selection's CSV cannot be told from the sample's); one row per selected point, each key one of
+ * the sample's, every key once, the header carrying the point columns, and nothing vector-like or
+ * secret in it.
  */
 function selectionCsvVerdict({ csv, selection, sampleKeys, dim, secrets }) {
+	const n = sampleKeys.length;
+	if (!(Number.isInteger(selection) && selection > 0)) return `the lasso selected no point (${selection}) to export`;
+	if (selection >= n) return `the lasso selected every point of the sample (${selection} of ${n}): its CSV cannot be told from the sample's`;
 	const { header, rows } = csvTable(csv);
 	for (const col of ['objectId', 'chunkId', 'path']) if (!header.includes(col)) return `the CSV has no ${col} column (${header.join(', ')})`;
 	if (rows.length !== selection) return `${rows.length} rows for ${selection} selected points`;
@@ -1002,9 +1065,51 @@ async function main(fixtureKey, base, out) {
 		for (const [x, y] of [...corners.slice(1), corners[0]]) await page.mouse.move(x, y, { steps: 10 });
 		await page.mouse.up();
 	};
-	/** Lasso the left `share` of the fitted canvas; the canvas's selection count. */
+	/** The map's camera (data-camera) and frames drawn (data-draw-count), as the last frame wrote them. */
+	const frameState = async () => ({ camera: await C.attrText(canvas, UI.map.canvasAttr.camera), draws: await C.attrText(canvas, UI.map.canvasAttr.drawCount) });
+	/**
+	 * Wait until the map draws no new frame for `quiet` ms (a layout tween, which Isolate, Show all and
+	 * Show only cluster start, draws a frame each step); its frame state then, or null on the timeout.
+	 */
+	const settle = async (quiet = 700, timeout = 15000) => {
+		const deadline = Date.now() + timeout;
+		let last = await frameState();
+		let since = Date.now();
+		for (;;) {
+			await C.sleep(100);
+			const now = await frameState();
+			if (now.draws !== last.draws || now.camera !== last.camera) {
+				last = now;
+				since = Date.now();
+			} else if (Date.now() - since >= quiet) return now;
+			if (Date.now() > deadline) return null;
+		}
+	};
+	const fitButton = () => toolbar.getByRole('button', { name: MAP.fit }).first();
+	/** Fit once the points have stopped moving, then Fit again: the camera of each ({ camera, refit }). */
+	const fitMap = async () => {
+		await settle();
+		await fitButton().click();
+		const first = await settle();
+		await fitButton().click();
+		const second = await settle();
+		return { camera: first && first.camera, refit: second && second.camera };
+	};
+	/** What the app framed by itself (after Isolate, Show all): its camera once the points stop, and the one Fit gives then. */
+	const framing = async () => {
+		const auto = await settle();
+		await fitButton().click();
+		const fitted = await settle();
+		return { camera: auto && auto.camera, fitted: fitted && fitted.camera };
+	};
+	/**
+	 * Lasso the left `share` of the fitted canvas; the canvas's selection count. Throws (the step
+	 * fails with the reason) when Fit did not leave the camera fitted, or when the lasso took none of
+	 * the points drawn, or all of them over part of the canvas (fewer than all over the whole of it).
+	 */
 	const lassoLeft = async (share) => {
-		await toolbar.getByRole('button', { name: MAP.fit }).first().click();
+		const fitted = fitVerdict(await fitMap());
+		if (fitted !== true) throw new Error(fitted);
 		const box = await canvas.boundingBox();
 		if (!box) throw new Error('the map canvas has no size');
 		const lasso = toolbar.getByRole('button', { name: MAP.lasso }).first();
@@ -1027,6 +1132,8 @@ async function main(fixtureKey, base, out) {
 		await C.sleep(300);
 		const selected = await C.attrInt(canvas, MAP.attr.selection);
 		await lasso.click();
+		const took = lassoShareVerdict({ share, selected, shown: await C.attrInt(canvas, MAP.attr.points) });
+		if (took !== true) throw new Error(took);
 		return selected;
 	};
 	/** Inspect sample point i through the Table alternative (pages of 100). */
@@ -1331,6 +1438,8 @@ async function main(fixtureKey, base, out) {
 				5000
 			);
 			const isolated = { shown: isolatedShown, flag: await attr(UI.map.attr.isolated) };
+			// Isolate moves the points (the shown ones fill the layout) and frames them itself: once they stop, Fit must not move the camera.
+			const framedIsolate = await framing();
 			const table = toolbar.getByRole('button', { name: MAP.table }).first();
 			await table.click();
 			const m = MAP.tableRows.exec(await C.bodyText(page));
@@ -1349,8 +1458,10 @@ async function main(fixtureKey, base, out) {
 				5000
 			);
 			const all = { shown: allShown, flag: await attr(UI.map.attr.isolated) };
-			note({ n: sample.n, selection, isolated, tableRows, expanded, all });
-			return isolateVerdict({ n: sample.n, selection, isolated, tableRows, expanded, all });
+			const framedAll = await framing();
+			const framingRead = { isolate: framedIsolate, showAll: framedAll };
+			note({ n: sample.n, selection, isolated, tableRows, expanded, all, framing: framingRead });
+			return isolateVerdict({ n: sample.n, selection, isolated, tableRows, expanded, all, framing: framingRead });
 		});
 
 		await step(page, "text (P1-6): Show full text of a falcon chunk marks 'water', fetched once", async (note) => {
@@ -1442,11 +1553,19 @@ async function main(fixtureKey, base, out) {
 				5000
 			);
 			const since = capture.frames.length;
-			const selected = await lassoLeft(1);
-			// Only the group's points can be selected while it is shown alone (the lasso may take fewer than all of them).
-			if (shown !== group.size || !(selected >= 2 && selected <= group.size)) {
+			// The whole canvas, once fitted to the group shown alone, selects exactly the group.
+			let selected = null;
+			let lassoed = null;
+			try {
+				selected = await lassoLeft(1);
+				lassoed = matrixLassoVerdict({ group, shown, selected });
+			} catch (e) {
+				lassoed = String(e && e.message ? e.message : e);
+			}
+			if (lassoed !== true) {
+				note({ group, shown, selected });
 				await button(UI.map.showAll, map).click();
-				return `Show only cluster ${group.cluster + 1} shows ${shown} points (${group.size} in the group) and the lasso over them selects ${selected}`;
+				return lassoed;
 			}
 			await sideTab(UI.map.tabs.selection);
 			const panel = visible(map.locator(UI.matrix.panel));
@@ -2086,6 +2205,10 @@ module.exports = {
 	ingestDays,
 	rampVerdict,
 	isolateVerdict,
+	framedVerdict,
+	fitVerdict,
+	lassoShareVerdict,
+	matrixLassoVerdict,
 	chunkTextVerdict,
 	recommendVerdict,
 	bestScoreVerdict,

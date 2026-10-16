@@ -453,9 +453,57 @@ test('rampVerdict: the dated ramp names the first and last ingest day of the sam
 });
 
 test('isolateVerdict: shown points follow the selection, the table, Expand and Show all', () => {
-	const sound = { n: 1000, selection: 40, isolated: { shown: 40, flag: '1' }, tableRows: 40, expanded: 95, all: { shown: 1000, flag: '0' } };
+	// What Isolate and Show all framed: the camera once the points stopped, and the one Fit gives then.
+	const framing = { isolate: { camera: '2d:0.1,-0.2,412.5', fitted: '2d:0.1,-0.2,412.5' }, showAll: { camera: '2d:0,0,198', fitted: '2d:0,0,198' } };
+	const sound = { n: 1000, selection: 40, isolated: { shown: 40, flag: '1' }, tableRows: 40, expanded: 95, all: { shown: 1000, flag: '0' }, framing };
 	assert.strictEqual(lane.isolateVerdict(sound), true);
-	for (const [what, change] of Object.entries({ 'nothing selected': { selection: 0 }, 'everything selected': { selection: 1000 }, 'not isolated': { isolated: { shown: 1000, flag: '0' } }, 'table rows': { tableRows: 1000 }, 'expand did nothing': { expanded: 40 }, 'show all short': { all: { shown: 999, flag: '0' } }, 'still isolated': { all: { shown: 1000, flag: '1' } } })) assert.notStrictEqual(lane.isolateVerdict({ ...sound, ...change }), true, what);
+	const broken = {
+		'nothing selected': { selection: 0 },
+		'everything selected': { selection: 1000 },
+		'not isolated': { isolated: { shown: 1000, flag: '0' } },
+		'table rows': { tableRows: 1000 },
+		'expand did nothing': { expanded: 40 },
+		'show all short': { all: { shown: 999, flag: '0' } },
+		'still isolated': { all: { shown: 1000, flag: '1' } },
+		// The app fitted the camera to where the points were before they moved: Fit then moves it.
+		'Isolate framed the points before they moved': { framing: { ...framing, isolate: { camera: '2d:-0.6,0.3,1650', fitted: '2d:0.1,-0.2,412.5' } } },
+		'Show all framed the points before they moved': { framing: { ...framing, showAll: { camera: '2d:1.9,-0.8,61.2', fitted: '2d:0,0,198' } } },
+		'no camera read': { framing: { ...framing, isolate: { camera: '', fitted: '' } } },
+		'framing not read': { framing: undefined },
+	};
+	for (const [what, change] of Object.entries(broken)) assert.notStrictEqual(lane.isolateVerdict({ ...sound, ...change }), true, what);
+	assert.match(lane.isolateVerdict({ ...sound, ...broken['Isolate framed the points before they moved'] }), /after Isolate .*Fit then moves it/);
+});
+
+test('fitVerdict: the camera a Fit gave is the one a second Fit gives (the points had stopped moving)', () => {
+	assert.strictEqual(lane.fitVerdict({ camera: '2d:0,0,412.5', refit: '2d:0,0,412.5' }), true);
+	assert.match(lane.fitVerdict({ camera: '2d:0.1,0,98.2', refit: '2d:0,0,412.5' }), /second Fit/);
+	assert.match(lane.fitVerdict({ camera: '', refit: '' }), /no camera/);
+	assert.match(lane.fitVerdict({ camera: null, refit: null }), /no camera/);
+	assert.match(lane.fitVerdict(null), /no camera/);
+});
+
+test('lassoShareVerdict: a lasso over part of the fitted map takes some of the points drawn, one over all of it every one', () => {
+	assert.strictEqual(lane.lassoShareVerdict({ share: 0.5, selected: 150, shown: 308 }), true);
+	// The whole sample in the left half: the map is not spread across the canvas (drawn small at its left).
+	assert.match(lane.lassoShareVerdict({ share: 0.5, selected: 308, shown: 308 }), /every one of the 308/);
+	assert.match(lane.lassoShareVerdict({ share: 0.5, selected: 0, shown: 308 }), /no point/);
+	assert.match(lane.lassoShareVerdict({ share: 0.5, selected: null, shown: 308 }), /no point/);
+	assert.strictEqual(lane.lassoShareVerdict({ share: 1, selected: 79, shown: 79 }), true);
+	// The whole canvas over one group shown alone took a patch of it: the camera did not show the whole group.
+	assert.match(lane.lassoShareVerdict({ share: 1, selected: 14, shown: 79 }), /14 of the 79/);
+	assert.notStrictEqual(lane.lassoShareVerdict({ share: 0.5, selected: 10, shown: null }), true);
+	assert.notStrictEqual(lane.lassoShareVerdict({ share: 1, selected: 0, shown: 0 }), true);
+});
+
+test('matrixLassoVerdict: the lasso over a group shown alone selects exactly the group', () => {
+	const group = { cluster: 0, size: 79 };
+	assert.strictEqual(lane.matrixLassoVerdict({ group, shown: 79, selected: 79 }), true);
+	assert.match(lane.matrixLassoVerdict({ group, shown: 79, selected: 14 }), /selects 14 of the 79/);
+	assert.match(lane.matrixLassoVerdict({ group, shown: 308, selected: 308 }), /shows 308 points \(79 in the group\)/);
+	assert.notStrictEqual(lane.matrixLassoVerdict({ group, shown: 79, selected: null }), true);
+	assert.notStrictEqual(lane.matrixLassoVerdict({ group, shown: null, selected: 79 }), true);
+	assert.notStrictEqual(lane.matrixLassoVerdict({ group: { cluster: 2, size: 1 }, shown: 1, selected: 1 }), true, 'a matrix needs two points');
 });
 
 test("chunkTextVerdict: 'water' is marked and the full text was fetched once for the key", () => {
@@ -564,6 +612,13 @@ test("selectionCsvVerdict and exportNameVerdict: one row per selected point of t
 	assert.match(lane.selectionCsvVerdict({ csv: csv.replace('procedure · pump', 'local-acceptance-key'), selection: 3, sampleKeys, dim: 8, secrets }), /API key/);
 	assert.match(lane.selectionCsvVerdict({ csv: csv.replace('"a ""quoted"", snippet"', '"[0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8]"'), selection: 3, sampleKeys, dim: 8, secrets }), /float/);
 	assert.match(lane.selectionCsvVerdict({ csv: 'path\r\nx\r\n', selection: 1, sampleKeys, dim: 8, secrets }), /objectId column/);
+	// A lasso that took the whole sample (or nothing): its CSV cannot be told from the sample's.
+	const rows = (count) => [header, ...Array.from({ length: count }, (_, i) => row(i))].join('\r\n') + '\r\n';
+	assert.strictEqual(lane.selectionCsvVerdict({ csv: rows(19), selection: 19, sampleKeys, dim: 8, secrets }), true);
+	assert.match(lane.selectionCsvVerdict({ csv: rows(20), selection: 20, sampleKeys, dim: 8, secrets }), /every point of the sample/);
+	assert.match(lane.selectionCsvVerdict({ csv: rows(0), selection: 0, sampleKeys, dim: 8, secrets }), /no point/);
+	// The selection count says some, the CSV holds the whole sample.
+	assert.match(lane.selectionCsvVerdict({ csv: rows(20), selection: 19, sampleKeys, dim: 8, secrets }), /20 rows for 19/);
 	assert.strictEqual(lane.exportNameVerdict('vector-explorer_vx_demo_docs_selection_20261015-2310.csv', 'vx_demo_docs', 'selection', 'csv'), true);
 	assert.notStrictEqual(lane.exportNameVerdict('export.csv', 'vx_demo_docs', 'selection', 'csv'), true);
 	assert.notStrictEqual(lane.exportNameVerdict('vector-explorer_other_selection_20261015-2310.csv', 'vx_demo_docs', 'selection', 'csv'), true);
@@ -904,7 +959,7 @@ for (const [owner, file, marker, patterns] of UI_SOURCES) {
 /** The wording and hooks the lane's steps read beyond the UI names: [owner, file, marker, patterns]. */
 const SOURCES = [
 	['E5', 'views/MapView.tsx', 'data-edge-mode', ['data-colour-by', 'data-edge-count', 'data-min-cluster-size', 'data-shown', 'data-isolated', 'data-query-state', 'data-query-b-state']],
-	['E5', 'components/PointCanvas.tsx', 'data-layer="edges"', ['className="vector-map-canvas"', 'data-layer="edges"', 'data-map-tooltip']],
+	['E5', 'components/PointCanvas.tsx', 'data-layer="edges"', ['className="vector-map-canvas"', 'data-layer="edges"', 'data-map-tooltip', 'el.dataset.camera = cameraSignature(camera)', 'el.dataset.drawCount']],
 	['E5', 'map/overlay.ts', 'hoverEdges', ['extras.hoverEdges', 'ctx.lineWidth = 2']],
 	['E5', 'components/MapToolbar.tsx', 'aria-label="Edges per point"', ['Expand selected', "{ id: 'tree', label: 'Tree' }", "{ id: 'neighbours', label: 'Neighbours' }"]],
 	['E5', 'components/ClustersPanel.tsx', null, ['Ask about the documents of cluster ${', 'in no group', 'data-cluster="noise"']],
