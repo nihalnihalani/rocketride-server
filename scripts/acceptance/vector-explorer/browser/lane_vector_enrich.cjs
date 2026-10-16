@@ -58,8 +58,10 @@
  *     applying it re-samples with its seed, pins at most 200 keys and says
  *     what it restored
  *   duplicates queue (P0-4): the two planted pairs form two groups; Keep
- *     shortest path keeps falcon_handbook.md; the slider at 0.92 re-groups with
- *     no sample frame
+ *     shortest path keeps falcon_handbook.md; the panel's groups are the
+ *     sample's; the slider, moved to the first position below its start at
+ *     which the sample's pairs group differently, re-groups to the sample's
+ *     groups there (read again after the move), with no sample frame
  *   outliers (P1-8): the OCR junk first with its why; 5 % lists more rows
  *     with no sample frame
  *   charts (P0-7): the long manual is in the top bin of chunks per document;
@@ -747,12 +749,71 @@ function viewsVerdict({ listedAfterSwitch, saved, apply, line }) {
 }
 
 /**
+ * The duplicates queue's groups across documents at a threshold, from the sample the page holds:
+ * every pair at or above it (the node's duplicate pairs and the kNN edges), joined into connected
+ * groups of points, each named by the documents it touches; a group inside one document (repeated
+ * text) is left out, as the queue lists it apart. Each group is its paths, sorted; the groups sorted.
+ */
+function dedupeGroupsAt(sample, threshold) {
+	const n = sample && Number.isInteger(sample.n) ? sample.n : 0;
+	const parent = new Map();
+	const find = (i) => {
+		let x = i;
+		while ((parent.get(x) ?? x) !== x) x = parent.get(x);
+		return x;
+	};
+	const touched = new Set();
+	const add = (i, j, sim) => {
+		if (i === j || !(sim >= threshold) || !(i >= 0 && j >= 0 && i < n && j < n)) return;
+		touched.add(i);
+		touched.add(j);
+		const a = find(i);
+		const b = find(j);
+		if (a !== b) parent.set(a, b);
+	};
+	for (const pair of (sample && sample.duplicates) || []) add(pair.a, pair.b, pair.sim);
+	const knn = (sample && sample.knn) || {};
+	const offsets = knn.offsets_row || [];
+	for (let i = 0; i < offsets.length - 1 && i < n; i += 1) for (let e = offsets[i]; e < offsets[i + 1]; e += 1) add(i, knn.cols[e], knn.sims[e]);
+	const members = new Map();
+	for (const i of touched) {
+		const root = find(i);
+		if (!members.has(root)) members.set(root, new Set());
+		members.get(root).add(pathOf(sample, i));
+	}
+	const groups = new Set();
+	for (const paths of members.values()) if (paths.size > 1) groups.add([...paths].sort().join('\n'));
+	return [...groups].sort().map((g) => g.split('\n'));
+}
+
+/** Groups as one comparable text (order inside and across groups ignored). */
+function groupsText(groups) {
+	return JSON.stringify((groups || []).map((g) => [...g].sort().join('\n')).sort());
+}
+
+/**
+ * The first position of the duplicates slider below `from` (its grid: `min` up in `step`s) at which
+ * the sample's groups across documents differ from those at `from`; null when none does.
+ */
+function regroupThreshold(sample, from, { min, step }) {
+	const start = groupsText(dedupeGroupsAt(sample, from));
+	const steps = Math.round((from - min) / step);
+	for (let s = steps - 1; s >= 0; s -= 1) {
+		const t = Number((min + s * step).toFixed(3));
+		if (t < from && groupsText(dedupeGroupsAt(sample, t)) !== start) return t;
+	}
+	return null;
+}
+
+/**
  * The duplicates queue's verdict: each planted pair in one group (two groups), the shortest-path
  * policy keeps falcon_handbook.md and queues the other document of each planted pair (the panel's
- * "queued" marks, which its data-queued count agrees with), and the slider re-grouped with no
- * sample request.
+ * "queued" marks, which its data-queued count agrees with); the panel's groups at the start are the
+ * sample's at that threshold (`expectedBefore`), and moving the slider from `from` to `to` (a
+ * position the sample's pairs re-group at) changed them into the sample's groups there
+ * (`groupsAfter`, read after the move, against `expectedAfter`), with no sample request.
  */
-function dedupeVerdict({ groups, keptPaths, queuedPaths, queuedCount, samplesSent, thresholdAfter }) {
+function dedupeVerdict({ groups, keptPaths, queuedPaths, queuedCount, samplesSent, from, to, thresholdAfter, groupsAfter, expectedBefore, expectedAfter }) {
 	const planted = E.DEMO_CORPUS.nearDuplicates;
 	const holding = planted.map(([a, b]) => (groups || []).findIndex((g) => g.some((p) => p.endsWith('/' + a)) && g.some((p) => p.endsWith('/' + b))));
 	if (holding.some((i) => i < 0)) return `planted pairs in no group: ${JSON.stringify(planted.filter((_, i) => holding[i] < 0))}`;
@@ -763,7 +824,12 @@ function dedupeVerdict({ groups, keptPaths, queuedPaths, queuedCount, samplesSen
 	if (unqueued.length) return `no document of the planted pair ${JSON.stringify(unqueued[0])} is queued (${JSON.stringify(queuedList)})`;
 	if (queuedList.some((p) => (keptPaths || []).includes(p))) return 'a kept document is also queued';
 	if (queuedCount !== queuedList.length) return `the panel counts ${queuedCount} queued documents and marks ${queuedList.length}`;
-	if (thresholdAfter !== '0.92') return `the slider reads ${thresholdAfter} after moving it to 0.92`;
+	if (groupsText(groups) !== groupsText(expectedBefore)) return `at ${from} the panel shows ${(groups || []).length} groups across documents, the sample's pairs give ${(expectedBefore || []).length} (${groupsText(expectedBefore).slice(0, 200)})`;
+	if (to === null || to === undefined) return `no position of the slider below ${from} changes the sample's groups: the step cannot show a re-group`;
+	if (thresholdAfter !== String(to)) return `the slider reads ${thresholdAfter} after moving it to ${to}`;
+	if (!Array.isArray(groupsAfter)) return `the groups were not read after the slider moved to ${to}`;
+	if (groupsText(groupsAfter) === groupsText(groups)) return `the groups did not change when the slider moved from ${from} to ${to} (the sample's pairs give ${(expectedAfter || []).length} groups there, ${groups.length} at ${from})`;
+	if (groupsText(groupsAfter) !== groupsText(expectedAfter)) return `at ${to} the panel shows ${groupsText(groupsAfter).slice(0, 200)}, the sample's pairs give ${groupsText(expectedAfter).slice(0, 200)}`;
 	return samplesSent === 0 ? true : `moving the slider sent ${samplesSent} sample requests`;
 }
 
@@ -1647,7 +1713,7 @@ async function main(fixtureKey, base, out) {
 			return viewsVerdict({ listedAfterSwitch, saved: savedView, apply: x, line });
 		});
 
-		await step(page, 'duplicates queue (P0-4): the planted pairs form two groups, Keep shortest path keeps falcon_handbook.md, the slider at 0.92 re-groups with no sample frame', async (note) => {
+		await step(page, "duplicates queue (P0-4): the planted pairs form two groups, Keep shortest path keeps falcon_handbook.md, the slider re-groups (to the sample's own groups below the start) with no sample frame", async (note) => {
 			if (!sample) return 'no sample';
 			await sideTab(UI.map.tabs.duplicates);
 			const section = visible(map.getByRole('region', { name: UI.dedupe.section }));
@@ -1656,29 +1722,43 @@ async function main(fixtureKey, base, out) {
 			const { groups, keptPaths, queuedPaths, queuedCount } = await readQueue(section);
 			// What Remove all queued must remove: the documents the panel queued.
 			queued = queuedPaths.map((p) => ({ path: p, objectId: C.objectId(p) }));
-			const since = capture.frames.length;
 			const slider = visible(section.getByRole('slider', { name: UI.dedupe.threshold }));
-			await slider.evaluate((el, v) => {
-				const set = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-				set.call(el, v);
-				el.dispatchEvent(new Event('input', { bubbles: true }));
-				el.dispatchEvent(new Event('change', { bubbles: true }));
-			}, '0.92');
-			const thresholdAfter = await poll(
-				() => section.getAttribute('data-threshold').catch(() => null),
-				(v) => v === '0.92',
-				5000
-			);
+			const setSlider = (value) =>
+				slider.evaluate((el, v) => {
+					const set = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+					set.call(el, v);
+					el.dispatchEvent(new Event('input', { bubbles: true }));
+					el.dispatchEvent(new Event('change', { bubbles: true }));
+				}, value);
+			// The slider's start and grid; the first position below the start at which the sample the page holds groups differently.
+			const from = await C.attrNum(section, 'data-threshold');
+			const grid = { min: (await C.attrNum(slider, 'min')) ?? 0.9, step: (await C.attrNum(slider, 'step')) ?? 0.005 };
+			const to = from === null ? null : regroupThreshold(sample, from, grid);
+			const expectedBefore = from === null ? null : dedupeGroupsAt(sample, from);
+			const expectedAfter = to === null ? null : dedupeGroupsAt(sample, to);
+			const since = capture.frames.length;
+			let thresholdAfter = null;
+			let groupsAfter = null;
+			if (to !== null) {
+				await setSlider(String(to));
+				thresholdAfter = await poll(
+					() => section.getAttribute('data-threshold').catch(() => null),
+					(v) => v === String(to),
+					5000
+				);
+				// What the panel lists now (read again after the move): it must be the sample's groups at the new threshold.
+				const changed = await poll(
+					async () => (await readQueue(section)).groups,
+					(g) => groupsText(g) !== groupsText(groups),
+					5000
+				);
+				groupsAfter = changed;
+			}
 			await C.sleep(1000);
 			const samplesSent = samplesSince(since);
-			await slider.evaluate((el, v) => {
-				const set = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-				set.call(el, v);
-				el.dispatchEvent(new Event('input', { bubbles: true }));
-				el.dispatchEvent(new Event('change', { bubbles: true }));
-			}, '0.97');
-			note({ groups, keptPaths, queued: queuedPaths, queuedCount, thresholdAfter, samplesSent });
-			return dedupeVerdict({ groups, keptPaths, queuedPaths, queuedCount, samplesSent, thresholdAfter });
+			if (from !== null) await setSlider(String(from));
+			note({ groups, keptPaths, queued: queuedPaths, queuedCount, from, to, thresholdAfter, groupsAfter, expectedAfter, samplesSent });
+			return dedupeVerdict({ groups, keptPaths, queuedPaths, queuedCount, samplesSent, from, to, thresholdAfter, groupsAfter, expectedBefore, expectedAfter });
 		});
 
 		await step(page, 'outliers (P1-8): the OCR junk first with its why; 5 % lists more rows with no sample frame', async (note) => {
@@ -2219,6 +2299,8 @@ module.exports = {
 	pngInfo,
 	pngVerdict,
 	viewsVerdict,
+	dedupeGroupsAt,
+	regroupThreshold,
 	dedupeVerdict,
 	removalVerdict,
 	outliersVerdict,

@@ -715,15 +715,87 @@ test('viewsVerdict: listed after a switch, re-sampled with the seed, at most 200
 	for (const [what, change] of Object.entries(broken)) assert.notStrictEqual(lane.viewsVerdict({ listedAfterSwitch: true, saved, apply, line, ...change }), true, what);
 });
 
-test('dedupeVerdict: two groups for the two planted pairs, the shortest path kept, the slider with no sample request', () => {
+/**
+ * A sample for the duplicates queue: the two planted pairs (0.99, 0.985), the osprey handbook next to
+ * the falcon one at 0.93 (a kNN edge), two chunks of the manual at 0.95 (repeated text inside one
+ * document, never a group across documents) and a dissimilar edge.
+ */
+const DEDUPE_DOCS = ['handbooks/falcon_handbook.md', 'handbooks/falcon_handbook_rev2.md', 'field/kestrel_field_guide.md', 'archive/kestrel_field_guide_copy.md', 'handbooks/osprey_station_handbook.md', 'manuals/long_manual.md'].map((rel, i) => ({ i, objectId: `o-${i}`, path: D + rel }));
+function dedupeSample(osprey = 0.93) {
+	// kNN rows (offsets_row/cols/sims): 0 -> 4 (osprey), 1 -> 2 (dissimilar), 5 -> 6 (the manual's own chunks).
+	const knn = { k: 1, offsets_row: [0, 1, 2, 2, 2, 2, 3, 3], cols: [4, 2, 6], sims: [osprey, 0.5, 0.95] };
+	return {
+		success: true,
+		n: 7,
+		docs: DEDUPE_DOCS,
+		points: { doc: [0, 1, 2, 3, 4, 5, 5], chunk: [0, 0, 0, 0, 0, 0, 1] },
+		knn,
+		duplicates: [
+			{ a: 0, b: 1, sim: 0.99 },
+			{ a: 2, b: 3, sim: 0.985 },
+		],
+	};
+}
+const [FALCON, REV2, KESTREL, COPY, OSPREY] = DEDUPE_DOCS.map((d) => d.path);
+
+test("dedupeGroupsAt and regroupThreshold: the queue's groups across documents from the sample's pairs; the first slider position below that changes them", () => {
+	const sample = dedupeSample();
+	const sorted = (groups) => groups.map((g) => [...g].sort()).sort((a, b) => a.join('\n').localeCompare(b.join('\n')));
+	assert.deepStrictEqual(
+		sorted(lane.dedupeGroupsAt(sample, 0.97)),
+		sorted([
+			[FALCON, REV2],
+			[KESTREL, COPY],
+		])
+	);
+	// The manual's own chunks pair at 0.95: repeated text, not a group across documents.
+	assert.deepStrictEqual(
+		sorted(lane.dedupeGroupsAt(sample, 0.95)),
+		sorted([
+			[FALCON, REV2],
+			[KESTREL, COPY],
+		])
+	);
+	assert.deepStrictEqual(
+		sorted(lane.dedupeGroupsAt(sample, 0.93)),
+		sorted([
+			[FALCON, OSPREY, REV2],
+			[KESTREL, COPY],
+		])
+	);
+	const slider = { min: 0.9, step: 0.005 };
+	assert.strictEqual(lane.regroupThreshold(sample, 0.97, slider), 0.93);
+	// Nothing between the slider's minimum and the start changes the groups: no position to move to.
+	assert.strictEqual(lane.regroupThreshold(dedupeSample(0.6), 0.97, slider), null);
+	assert.strictEqual(lane.regroupThreshold(dedupeSample(0.93), 0.92, slider), null, 'only positions below the start count');
+	// Positions are on the slider's grid (0.965, 0.96, ...), never a float sum.
+	assert.strictEqual(lane.regroupThreshold(dedupeSample(0.966), 0.97, slider), 0.965);
+});
+
+test('dedupeVerdict: two groups for the two planted pairs, the shortest path kept, the slider re-grouping with no sample request', () => {
 	const groups = [
-		[`${D}handbooks/falcon_handbook.md`, `${D}handbooks/falcon_handbook_rev2.md`],
-		[`${D}field/kestrel_field_guide.md`, `${D}archive/kestrel_field_guide_copy.md`],
+		[FALCON, REV2],
+		[KESTREL, COPY],
 	];
-	const keptPaths = [`${D}handbooks/falcon_handbook.md`, `${D}field/kestrel_field_guide.md`];
-	const queuedPaths = [groups[0][1], groups[1][1]];
-	const sound = { groups, keptPaths, queuedPaths, queuedCount: 2, samplesSent: 0, thresholdAfter: '0.92' };
+	const keptPaths = [FALCON, KESTREL];
+	const queuedPaths = [REV2, COPY];
+	const regrouped = [
+		[FALCON, REV2, OSPREY],
+		[KESTREL, COPY],
+	];
+	const sound = { groups, keptPaths, queuedPaths, queuedCount: 2, samplesSent: 0, from: 0.97, to: 0.93, thresholdAfter: '0.93', groupsAfter: regrouped, expectedBefore: groups, expectedAfter: regrouped };
 	assert.strictEqual(lane.dedupeVerdict(sound), true);
+	// Order inside and across groups does not matter.
+	assert.strictEqual(
+		lane.dedupeVerdict({
+			...sound,
+			groupsAfter: [
+				[COPY, KESTREL],
+				[OSPREY, FALCON, REV2],
+			],
+		}),
+		true
+	);
 	const broken = {
 		'a pair split': { groups: [[groups[0][0]], [groups[0][1]], groups[1]] },
 		'one group': { groups: [[...groups[0], ...groups[1]]] },
@@ -734,8 +806,15 @@ test('dedupeVerdict: two groups for the two planted pairs, the shortest path kep
 		'the count disagrees with the marks': { queuedCount: 3 },
 		'slider not moved': { thresholdAfter: '0.97' },
 		're-sampled': { samplesSent: 1 },
+		// The slider's label moved and the groups stayed: the panel did not re-group.
+		'groups unchanged after the slider': { groupsAfter: groups },
+		'groups not read after the slider': { groupsAfter: undefined },
+		"groups after the slider are not the sample's there": { groupsAfter: [[FALCON, REV2, KESTREL, COPY]] },
+		"the start's groups are not the sample's": { expectedBefore: regrouped },
+		'no slider position re-groups the sample': { to: null, thresholdAfter: null, groupsAfter: null, expectedAfter: null },
 	};
 	for (const [what, change] of Object.entries(broken)) assert.notStrictEqual(lane.dedupeVerdict({ ...sound, ...change }), true, what);
+	assert.match(lane.dedupeVerdict({ ...sound, groupsAfter: groups }), /did not change/);
 });
 
 test('removalVerdict: exactly the expected documents, batches of at most 100, the stats dropped by them', () => {
@@ -966,7 +1045,7 @@ const SOURCES = [
 	['E5', 'map/colours.ts', "'ingest-date'", ["label: 'Cluster'", "label: 'Ingest date'", 'oldest (${', 'newest (${']],
 	['E5', 'components/Legend.tsx', 'Colour ramp from', ['Colour ramp from ${']],
 	['E5', 'map/wording.ts', 'listingNote', ['Sampled from the first ${num(listing.documents)} documents by path; the collection has more']],
-	['E6', 'components/DuplicatesPanel.tsx', 'Near-duplicate review', ['data-threshold', 'data-group={group.id}', 'type="radio"', 'aria-label={`Keep ${path}`}', 'Show group']],
+	['E6', 'components/DuplicatesPanel.tsx', 'Near-duplicate review', ['data-threshold', 'data-group={group.id}', 'type="radio"', 'aria-label={`Keep ${path}`}', 'Show group', 'min={THRESHOLD_MIN}', 'step={THRESHOLD_STEP}']],
 	['E6', 'map/reviewWording.ts', 'removeAllLabel', ['Remove all queued (${', "'shortest-path'"]],
 	['E6', 'components/OutliersPanel.tsx', 'data-component="OutliersPanel"', ['Remove document', '<select', 'aria-label="Outliers"']],
 	['E6', 'map/outliers.ts', 'whyText', ['vs sample median ${']],
