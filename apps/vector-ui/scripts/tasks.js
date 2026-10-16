@@ -41,8 +41,9 @@ const ACCEPTANCE_BROWSER_DIR = path.join(ACCEPTANCE_DIR, 'browser');
 // Suites that must exist for the gate to mean anything. A missing file here is
 // a broken checkout or a deleted suite, not an app "without tests", so the
 // gate fails instead of running whatever happens to be left. Every suite in
-// tests/ is listed; a new one runs as soon as it is added and belongs here too.
-const REQUIRED_TESTS = [
+// tests/ is listed (here or in FEATURE_TESTS); a new one runs as soon as it is
+// added and belongs here too.
+const ALWAYS_REQUIRED_TESTS = [
 	// The console: scaffold, adapter, directory, stats, connections, wording and wiring.
 	'scaffold.test.ts',
 	'templates.test.ts',
@@ -101,6 +102,57 @@ const REQUIRED_TESTS = [
 	'chunkText.test.tsx',
 	'ingest.summary.test.ts',
 ];
+
+// The enrichment's suites, each with the module it tests: a suite is required
+// once its module is in the checkout, so a merge that brings a feature without
+// its suite (or drops the suite later) fails the gate instead of passing with
+// the suite never run. scripts/acceptance/vector-explorer/selftest/test_lanes.py
+// holds this list to every suite the enrichment lanes own.
+const FEATURE_TESTS = {
+	// Scope and saved filters, charts, document health (the console).
+	'filters.test.ts': 'src/vector/filters.ts',
+	'savedFilters.test.ts': 'src/vector/savedFilters.ts',
+	'scopeBar.test.tsx': 'src/vector/filters.ts',
+	'charts.test.ts': 'src/vector/charts.ts',
+	'health.test.ts': 'src/vector/health.ts',
+	'a11y.contrast.charts.test.ts': 'src/vector/chartTokens.ts',
+	// Clusters, edges, isolation (the map).
+	'map.clusters.test.ts': 'src/map/clusters.ts',
+	'map.graph.test.ts': 'src/map/graph.ts',
+	'map.isolate.test.ts': 'src/map/isolate.ts',
+	// The review queues, recommend, the matrix, highlighting.
+	'map.dedupe.test.ts': 'src/map/reviewWording.ts',
+	'map.outliers.test.ts': 'src/map/outliers.ts',
+	'map.review.components.test.tsx': 'src/map/reviewWording.ts',
+	'recommend.test.ts': 'src/map/recommend.ts',
+	'similarityMatrix.test.tsx': 'src/map/matrixOrder.ts',
+	'highlight.test.ts': 'src/vector/highlight.ts',
+	// Search without the LLM.
+	'searchWorkbench.test.ts': 'src/vector/searchWorkbench.ts',
+	'compare.test.ts': 'src/vector/compare.ts',
+	// Exports and saved views.
+	'export.test.ts': 'src/vector/export.ts',
+	'exportPng.test.ts': 'src/map/exportPng.ts',
+	'savedViews.test.ts': 'src/vector/savedViews.ts',
+};
+
+/**
+ * The suites vector-ui:test requires in a checkout: every one of
+ * ALWAYS_REQUIRED_TESTS, and each FEATURE_TESTS suite whose module is there.
+ *
+ * @param {string} [appRoot] - The app folder (apps/vector-ui).
+ * @returns {string[]} The suite file names.
+ */
+function requiredTests(appRoot = APP_ROOT) {
+	return [
+		...ALWAYS_REQUIRED_TESTS,
+		...Object.entries(FEATURE_TESTS)
+			.filter(([, module]) => existsSync(path.join(appRoot, module)))
+			.map(([suite]) => suite),
+	];
+}
+
+const REQUIRED_TESTS = requiredTests();
 
 const mod = createAppModule({
 	name: 'vector-ui',
@@ -175,14 +227,20 @@ mod.actions.push({
 //
 //   ENGINE_URL               required: the engine under test (http or https)
 //   VECTOR_UI_E2E_BROWSERS   chrome (default) | firefox | webkit | all, or a comma list
-//   VECTOR_UI_E2E_LANES      vector,perf, or all (default: vector,perf)
-//   VECTOR_UI_E2E_BACKENDS   vector lane only: postgres,rocketride_vector,qdrant,chroma
+//   VECTOR_UI_E2E_LANES      vector,perf,enrich, or all (default: vector,perf; all is
+//                            vector,perf: enrich removes demo documents and puts them
+//                            back, so a run names it)
+//   VECTOR_UI_E2E_BACKENDS   vector and enrich lanes: postgres,rocketride_vector,qdrant,chroma
 //                            (default: all four supported backends)
 //   OUT_DIR                  results (default: the acceptance folder's git-ignored out/e2e)
 //   PLAYWRIGHT_DIR, PLAYWRIGHT_BROWSERS_PATH   as in the acceptance README
 
-/** The pass/fail lanes, by the name VECTOR_UI_E2E_LANES uses. */
+/** The pass/fail lanes, by the name VECTOR_UI_E2E_LANES uses ('all' runs these). */
 const LANES = { vector: 'lane_vector.cjs', perf: 'lane_vector_perf.cjs' };
+/** Lanes a run names to get: they write to the stores (and put the data back). */
+const OPT_IN_LANES = { enrich: 'lane_vector_enrich.cjs' };
+/** The lanes that take the backends argument (one run per backend). */
+const BACKEND_LANES = ['vector', 'enrich'];
 /** The lanes a run without VECTOR_UI_E2E_LANES runs. */
 const DEFAULT_LANES = ['vector', 'perf'];
 /** How many failed rows the summary names per lane run; the rest are counted. */
@@ -233,8 +291,9 @@ function planE2e(env) {
 	}
 	const chosen = listOf(env.VECTOR_UI_E2E_BROWSERS || 'chrome', [...BROWSERS, 'all'], 'browser');
 	const browsers = chosen.includes('all') ? [...BROWSERS] : chosen;
-	const named = listOf(env.VECTOR_UI_E2E_LANES || DEFAULT_LANES.join(','), [...Object.keys(LANES), 'all'], 'lane');
-	const lanes = (named.includes('all') ? Object.keys(LANES) : named).map((name) => ({ name, script: LANES[name] }));
+	const named = listOf(env.VECTOR_UI_E2E_LANES || DEFAULT_LANES.join(','), [...Object.keys(LANES), 'all', ...Object.keys(OPT_IN_LANES)], 'lane');
+	const chosenLanes = named.includes('all') ? [...Object.keys(LANES), ...named.filter((name) => name in OPT_IN_LANES)] : named;
+	const lanes = [...new Set(chosenLanes)].map((name) => ({ name, script: LANES[name] || OPT_IN_LANES[name] }));
 	const backends = env.VECTOR_UI_E2E_BACKENDS ? listOf(env.VECTOR_UI_E2E_BACKENDS, BACKENDS, 'vector backend').join(',') : null;
 	return { url: raw.replace(/\/+$/, ''), browsers, lanes, outDir: env.OUT_DIR || path.join(ACCEPTANCE_DIR, 'out', 'e2e'), backends };
 }
@@ -368,7 +427,7 @@ async function runLanes(plan, deps) {
 		for (const browser of plan.browsers) {
 			const out = path.join(plan.outDir, browser);
 			const args = [path.join(ACCEPTANCE_BROWSER_DIR, lane.script), plan.url, out, browser];
-			if (lane.name === 'vector' && plan.backends) args.push(plan.backends);
+			if (BACKEND_LANES.includes(lane.name) && plan.backends) args.push(plan.backends);
 			const before = modifiedAt(path.join(out, `${path.basename(lane.script, '.cjs')}.json`));
 			try {
 				await deps.exec(args, { ENGINE_URL: plan.url, OUT_DIR: out });
@@ -385,7 +444,7 @@ async function runLanes(plan, deps) {
 mod.actions.push({
 	name: 'vector-ui:e2e-live',
 	action: () => ({
-		description: 'Run the Vector Explorer browser lanes against ENGINE_URL (vector, perf). Opt-in; not part of test or CI',
+		description: 'Run the Vector Explorer browser lanes against ENGINE_URL (vector, perf; enrich by name). Opt-in; not part of test or CI',
 		run: async (_ctx, task) => {
 			const plan = planE2e(process.env);
 			await preflightE2e(plan, { fetch: (url, init) => fetch(url, init), loadPlaywright: () => loadAcceptancePlaywright(process.env) });
@@ -395,4 +454,4 @@ mod.actions.push({
 });
 
 module.exports = mod;
-module.exports.e2e = { ACCEPTANCE_BROWSER_DIR, LANES, DEFAULT_LANES, BACKENDS, REQUIRED_TESTS, planE2e, preflightE2e, runLanes };
+module.exports.e2e = { ACCEPTANCE_BROWSER_DIR, LANES, OPT_IN_LANES, DEFAULT_LANES, BACKENDS, REQUIRED_TESTS, ALWAYS_REQUIRED_TESTS, FEATURE_TESTS, requiredTests, planE2e, preflightE2e, runLanes };
