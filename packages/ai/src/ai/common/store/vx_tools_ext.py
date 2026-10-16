@@ -122,6 +122,11 @@ def average_vector_query(metric: str, positives: Sequence[Any], negatives: Seque
     so a long vector does not outweigh a short one) and the result is unit length; on an
     ``ip`` or ``l2`` store the examples are averaged as stored.
 
+    The query vector ``recommend`` adds as a positive is taken at unit length on a cosine
+    store too, deliberately: a Qdrant server averages a raw vector as given, so a long one
+    would outweigh the stored examples. The two rank alike whenever the vector is unit
+    length, as the embedding models the templates use return it.
+
     :raises ToolRefusal: ``INVALID_INPUT`` when there is no positive vector, or when the
         examples cancel out on a cosine store (no direction is left to search).
     """

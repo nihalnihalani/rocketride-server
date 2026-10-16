@@ -189,6 +189,27 @@ def test_the_node_ranks_exactly_as_qdrant_ranks_average_vector_natively(pos, neg
     assert answer['native'] is False, 'average_vector is computed by the node on every store'
 
 
+def test_the_node_takes_the_query_vector_at_unit_length_where_qdrant_takes_it_as_given():
+    store = _qdrant_corpus()
+    pos, neg = [('doc00', 1), ('doc04', 4)], [('doc05', 0)]
+    vector = store.getVectors([('doc02', 3)])[0].embedding
+    raw = (np.asarray(vector, dtype=np.float64) * 6.0).tolist()
+    answer = node(store, logical_type='qdrant').recommend(
+        {'positive': [list(k) for k in pos], 'negative': [list(k) for k in neg], 'vector': raw, 'k': 50}
+    )
+    assert answer['success'] is True, answer
+    as_unit = store.recommendNative(
+        positive=pos, negative=neg, vector=_unit(raw).tolist(), strategy='average_vector', limit=50
+    )
+    as_given = store.recommendNative(positive=pos, negative=neg, vector=raw, strategy='average_vector', limit=50)
+    assert _keys(answer) == [(d.metadata.objectId, d.metadata.chunkId) for d in as_unit], (
+        'every example, the query vector too, counts at unit length on a cosine store'
+    )
+    assert _keys(answer) != [(d.metadata.objectId, d.metadata.chunkId) for d in as_given], (
+        'Qdrant would let a long query vector outweigh the examples; the node deliberately does not'
+    )
+
+
 # ---------------------------------------------------------------------------
 # Examples, results and the answer
 # ---------------------------------------------------------------------------
