@@ -98,7 +98,7 @@ import { tweenPositions } from '../map/interaction';
 import type { KeyAction } from '../map/interaction';
 import { combineMasks, expandByNeighbours, isolateMask, isolationLine, shownCount } from '../map/isolate';
 import { UNSCOPED, applyTransform, chunkPath, clusterExportRows, ditherRounded, documentOf, drawnScope, duplicateExportRows, hiddenMask, keyIndex, keyString, mapScopeState, neighboursOf, normaliseLayout, pcaPositions, pointExportRows, pointKey, scopeDrawDue } from '../map/model';
-import type { ISampleScope } from '../map/model';
+import type { ISampleScope, IScopeAttempt } from '../map/model';
 import { createLatestQueue } from '../map/neighbours';
 import type { IClusterLabel, IOverlayEnd, IPlace } from '../map/overlay';
 import { centroidStar, chatQueryPlan, comparePlan, placeProjected, queryBlocker, querySims, raysFromSearch, resolveKeys, starFromProject, withSampleRetry } from '../map/queryProjection';
@@ -707,18 +707,24 @@ export function MapView(props: MapViewProps): React.ReactElement {
 			// The scope this draw sends, noted over the sample on screen until the answer lands.
 			const target = scopeTargetRef.current;
 			const shown = selection.getState().sampleModel?.result ?? null;
-			const noteAttempt = (failed: boolean): void => {
-				if (shown) SAMPLE_SCOPES.set(shown, { drawn: scopeOfSample(shown).drawn, attempt: { key: target.key, failed } });
+			const attempt: IScopeAttempt = { key: target.key, failed: false };
+			if (shown) SAMPLE_SCOPES.set(shown, { drawn: scopeOfSample(shown).drawn, attempt });
+			/** End this draw's note over the sample it started on, unless a newer draw has replaced it. */
+			const endAttempt = (next: IScopeAttempt | null): void => {
+				const now = scopeOfSample(shown);
+				if (shown && now.attempt === attempt) SAMPLE_SCOPES.set(shown, { drawn: now.drawn, attempt: next });
 			};
-			noteAttempt(false);
 			client.cancel();
 			setBusy(BUSY.sampling);
 			setError(null);
 			const answer = await callTool<ISampleResult>(channel, 'sample', input as Record<string, unknown>, { nodeId: storeNode, timeoutMs: limits.sample_budget_ms + 30_000 });
-			if (connectionRef.current !== key) return null;
+			if (connectionRef.current !== key) {
+				endAttempt(null);
+				return null;
+			}
 			if (!answer.ok) {
 				// Noted before the render this answer causes: the legend says the scope was not applied.
-				noteAttempt(true);
+				endAttempt({ key: target.key, failed: true });
 				setBusy(null);
 				if (!answer.stale) setError(mapFailure(answer.code, answer.message));
 				return null;

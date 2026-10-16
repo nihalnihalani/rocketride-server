@@ -437,6 +437,30 @@ test('a refused scoped draw is never captioned as scoped: the legend says the sc
 	assert.doesNotMatch(applied, /data-scope-retry/);
 });
 
+test('an older draw refused after a newer one started does not mark the scope failed: the legend follows the newest draw', async () => {
+	const scope = scopeOver(4);
+	const answers: Array<(value: unknown) => void> = [];
+	const tools = { invoke: (tool: string) => (tool === 'sample' ? new Promise((resolve) => answers.push(resolve)) : new Promise<never>(() => undefined)) } as unknown as IRoleChannel;
+	const ordered: VectorChannels = { tools, chat: null, ingest: null };
+	const selection = createSelectionStore(KEY);
+	render({ model: enrichedModel({ scope }), channels: ordered, sample: modelOf(answerOf('s-7-shown')), selection });
+	const toolbar = last<ToolbarSample>('MapToolbar');
+	toolbar.onSample({ n: 1000, mode: 'detailed', seed: 8 });
+	toolbar.onSample({ n: 1000, mode: 'detailed', seed: 9 });
+	assert.equal(answers.length, 2, 'two draws in flight');
+	answers[0]!({ success: false, code: 'BUSY', error: 'Another sample is being drawn.' });
+	await settle();
+	const meanwhile = render({ model: enrichedModel({ scope }), channels: ordered, selection });
+	assert.equal(rootAttr(meanwhile, 'data-scope-state'), 'pending', 'the newer draw is still in flight');
+	assert.doesNotMatch(meanwhile, /data-scope-retry/);
+	answers[1]!(answerOf('s-9-newest'));
+	await settle();
+	const done = render({ model: enrichedModel({ scope }), channels: ordered, selection });
+	assert.equal(selection.getState().sampleModel?.sampleId, 's-9-newest');
+	assert.equal(rootAttr(done, 'data-scope-state'), 'applied');
+	assert.equal(rootAttr(done, 'data-scoped'), '4');
+});
+
 test('a sample drawn with a scope the console then cleared says its points are from that scope only until the whole collection is drawn', async () => {
 	const scope = scopeOver(3);
 	const selection = createSelectionStore(KEY);
