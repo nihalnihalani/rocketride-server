@@ -47,7 +47,7 @@ const { ScopeBar, draftCondition } = require('../src/components/ScopeBar') as ty
 const { DocumentDirectory } = require('../src/components/DocumentDirectory') as typeof import('../src/components/DocumentDirectory');
 const { pagerApplyPage, pagerBegin, pagerFail, pagerInit } = require('../src/vector/documents') as typeof import('../src/vector/documents');
 const { readDocumentsPage, readStats } = require('../src/vector/results') as typeof import('../src/vector/results');
-const { SCOPE_FAILED_TEXT, listingFilter, resolveScope, scopeFromFilter, tooLargeText } = require('../src/vector/filters') as typeof import('../src/vector/filters');
+const { FILTER_TEXT_MAX, SCOPE_FAILED_TEXT, listingFilter, resolveScope, scopeFromFilter, tooLargeText } = require('../src/vector/filters') as typeof import('../src/vector/filters');
 const { consoleScope } = require('../src/vector/consoleModel') as typeof import('../src/vector/consoleModel');
 const { createConsoleStore } = require('../src/vector/consoleStore') as typeof import('../src/vector/consoleStore');
 const { buildQuestion } = require('../src/chat/useVectorChat') as typeof import('../src/chat/useVectorChat');
@@ -238,6 +238,14 @@ test("the directory over a listing that stopped short: the loaded rows' empty ma
 	assert.doesNotMatch(html, /No documents? match(es)? these conditions/);
 	assert.deepEqual(chatToggle(html), { pressed: false, disabled: true, title: "Only 5,000 of 12,000 documents are loaded, so the scope's documents are not all known: the map, search and chat are not scoped. Load more to include them." });
 	assert.match(html, />Load more</);
+});
+
+test('the path box under a scope: text the node would refuse is not sent, and the bar says so', () => {
+	const scope = scopeOf({ path_prefix: 'C:/demo/' }, { objectIds: ['a'] });
+	const long = 'x'.repeat(FILTER_TEXT_MAX + 1);
+	assert.match(bar({ scope, text: long, scopeText: long }), /role="alert"[^>]*>The path text is longer than 1,024 characters, so it is not sent with the scope\. Shorten it\.</);
+	assert.doesNotMatch(bar({ scope, text: 'x'.repeat(FILTER_TEXT_MAX), scopeText: 'x'.repeat(FILTER_TEXT_MAX) }), /role="alert"/);
+	assert.doesNotMatch(bar({ text: long, scopeText: long }), /role="alert"/, 'without a scope the box only filters the loaded rows');
 });
 
 test("the console's scope over a paging and a failed listing: no question goes out unscoped while the Chat toggle reads on", async () => {

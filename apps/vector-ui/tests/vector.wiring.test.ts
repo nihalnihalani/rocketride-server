@@ -145,11 +145,14 @@ test('the scope: the listing asks for its conditions, its documents resolve from
 	assert.match(view, /<StatsStrip [^>]*scopeLine=\{scopeLine\}/);
 	assert.match(view, /<StatsStrip [^>]*sample=\{selection\.connectionKey === entry\.key \? selection\.sampleModel : null\}[^>]*onScope=\{scopeFromChart\}/, "the charts read the map's sample and a bar scopes the directory");
 	assert.match(view, /scopeWith\(scope, scope\?\.filter\.path_contains \?\? '', filter\)/, "a bar sets its kind of condition and keeps the scope's others");
+	assert.match(view, /const next = scopeWith\(scope, scope\?\.filter\.path_contains \?\? '', filter\);\s*const refused = checkScope\(next\);\s*if \(refused !== null\) announcer\.announce\(refused\);\s*else entry\.scope\.set\(next\);/, 'a bar the node would refuse is said, never sent');
 	const dir = code('components/DocumentDirectory.tsx');
 	assert.match(dir, /directoryView\(pager, scope, applied, cap\)/);
 	assert.match(dir, /<ScopeBar [^>]*listing=\{pager\}/, "the toggles say how far the scope's documents are");
 	assert.match(dir, /useDebounced\(filter, FILTER_DEBOUNCE_MS\)/);
 	assert.match(dir, /Scope to this folder/);
+	assert.match(dir, /const next = scopeWith\(scope, applied, \{ path_prefix: folderMenu\.folder \}\);\s*const refused = checkScope\(next\);\s*setFolderError\(refused\);\s*if \(refused === null\) onScope\?\.\(next\);/, 'a folder the node would refuse is said, never sent');
+	assert.match(dir, /\{folderError !== null && \(\s*<div role="alert"[^>]*>\s*\{folderError\}/);
 });
 
 test("a document's health: the tab compares with the console's loaded documents and counts deleted chunks only when asked; the directory and the strip use the same flags", () => {

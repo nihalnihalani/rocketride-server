@@ -36,6 +36,7 @@
 
 import type { IDialectResult, IDocumentItem, IDocumentsFilter, ISampleModel } from '../contract/types';
 import { extensionOf } from './fileType';
+import { isFilterExtension } from './filters';
 
 // =============================================================================
 // BINS
@@ -151,7 +152,8 @@ export function lengthBins(lengths: readonly number[]): IBin[] {
  *
  * @param rows - The loaded documents.
  * @param top - Bars at most (default 8).
- * @returns The bins; a type's bar scopes to it.
+ * @returns The bins; a type's bar scopes to it when the node accepts it as an extension (not '15 meeting' from
+ *   'Board 2026.10.15 meeting', 'db_old' or 'json-ld'; those bars are drawn, not clickable).
  */
 export function byFileType(rows: readonly IDocumentItem[], top = 8): IBin[] {
 	const NONE = '(no extension)';
@@ -161,7 +163,7 @@ export function byFileType(rows: readonly IDocumentItem[], top = 8): IBin[] {
 		counts.set(ext, (counts.get(ext) ?? 0) + 1);
 	}
 	const sorted = [...counts.entries()].sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
-	const bin = (ext: string, count: number, i: number): IBin => ({ key: `t${ext}`, label: ext, lo: i, hi: i, count, scope: ext === NONE ? null : { file_types: [ext] } });
+	const bin = (ext: string, count: number, i: number): IBin => ({ key: `t${ext}`, label: ext, lo: i, hi: i, count, scope: ext !== NONE && isFilterExtension(ext) ? { file_types: [ext] } : null });
 	if (sorted.length <= top) return sorted.map(([ext, count], i) => bin(ext, count, i));
 	const kept = sorted.slice(0, top - 1).map(([ext, count], i) => bin(ext, count, i));
 	const rest = sorted.slice(top - 1);

@@ -43,7 +43,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import type { CSSProperties } from 'react';
 import type { Availability, IDocumentsFilter, IScopeState, ISavedFilter, ScopeBarProps as ContractScopeBarProps } from '../contract/types';
-import { ALL_TARGETS, CONDITION_KINDS, CONDITION_TITLES, conditionLabel, dateToIso, filterOf, removeCondition, scopeAvailability, scopeFromFilter, setCondition, toDocumentsFilter, validateFilter } from '../vector/filters';
+import { ALL_TARGETS, CONDITION_KINDS, CONDITION_TITLES, FILTER_TEXT_MAX, conditionLabel, dateToIso, filterOf, removeCondition, scopeAvailability, scopeFromFilter, setCondition, toDocumentsFilter, validateFilter } from '../vector/filters';
 import type { ConditionKind, ICondition, IFilter } from '../vector/filters';
 import type { IPagerState } from '../vector/documents';
 import { ALLOWED_EXTENSIONS } from '../vector/fileType';
@@ -210,6 +210,9 @@ export function ScopeBar({ text, onText, scope = null, onScope, available = {}, 
 	const targets = scope ? scopeAvailability(scope, cap, listing) : null;
 	const blocked = targets ? (TARGETS.map((t) => targets[t.key]).find((a) => !a.enabled)?.reason ?? null) : null;
 	const availability = (kind: ConditionKind): Availability => available[kind] ?? { enabled: true, reason: null };
+	// With a scope the box goes to the store, which refuses text this long: the scope keeps its last text (withText).
+	const boxRefused = scope !== null && scopeText.trim().length > FILTER_TEXT_MAX ? `The path text is longer than ${FILTER_TEXT_MAX.toLocaleString('en-US')} characters, so it is not sent with the scope. Shorten it.` : null;
+	const alert = error ?? boxRefused;
 
 	/** Hand a new filter to the host (null scope with no condition). */
 	const commit = (next: IFilter): void => {
@@ -418,9 +421,9 @@ export function ScopeBar({ text, onText, scope = null, onScope, available = {}, 
 					</button>
 				</div>
 			)}
-			{error !== null && (
+			{alert !== null && (
 				<div role="alert" style={{ ...styles.small, padding: '0 12px 8px' }}>
-					{error}
+					{alert}
 				</div>
 			)}
 			{blocked !== null && (

@@ -13,7 +13,7 @@ import type { IDocumentItem, IDocumentsFilter, IScopeState } from '../src/contra
 import { DOCUMENTS_FILTER_KEYS } from '../src/contract/types';
 import { pagerApplyPage, pagerBegin, pagerFail, pagerInit } from '../src/vector/documents';
 import type { IPagerState } from '../src/vector/documents';
-import { EMPTY_FILTER, FILTER_TEXT_MAX, NO_MATCH_SCOPE, SCOPE_FAILED_TEXT, SCOPE_WAITING_TEXT, clientKeys, conditionAvailability, conditionsFilter, directoryExportItems, directoryView, scopeView, conditionLabel, dateToIso, describeFilter, fromDocumentsFilter, listingFilter, matches, parseFilter, removeCondition, resolveScope, sameFilter, scopeAvailability, scopeFromFilter, scopeWith, filterOf, withText, scopeObjectIds, scopeNoMatchText, scopeReadiness, scopeStatusText, scopeStripText, setCondition, toDocumentsFilter, tooLargeText, validateFilter } from '../src/vector/filters';
+import { EMPTY_FILTER, FILE_TYPE_RE, FILTER_TEXT_MAX, NO_MATCH_SCOPE, SCOPE_FAILED_TEXT, SCOPE_WAITING_TEXT, checkScope, clientKeys, conditionAvailability, conditionsFilter, directoryExportItems, directoryView, scopeView, conditionLabel, dateToIso, describeFilter, fromDocumentsFilter, instantMs, isFilterExtension, listingFilter, matches, parseFilter, removeCondition, resolveScope, sameFilter, scopeAvailability, scopeFromFilter, scopeWith, filterOf, withText, scopeObjectIds, scopeNoMatchText, scopeReadiness, scopeStatusText, scopeStripText, setCondition, toDocumentsFilter, tooLargeText, validateFilter } from '../src/vector/filters';
 import type { IFilter } from '../src/vector/filters';
 import { readDocumentsPage, readStats } from '../src/vector/results';
 import { fixture } from './support/fixtures';
@@ -133,6 +133,107 @@ test('parseFilter reads the wire shape back into conditions (round trip), and re
 	assert.match(refused({ has_tables: 'yes' }), /true or false/);
 	assert.match(refused('folder'), /object/);
 	assert.equal(validateFilter({ path_prefix: 'C:/demo/' }), null);
+});
+
+/**
+ * The node's own verdicts (vx_types.parse_doc_list_filter, run on these filters): true when it accepts one.
+ * A refusal is INVALID_INPUT, or worse: '0001-01-01T00:00:00+01:00' and '9999-12-31T23:59:59-01:00' overflow
+ * its conversion to UTC.
+ */
+const NODE_VERDICTS: Array<[IDocumentsFilter, boolean]> = [
+	[{ file_types: ['md'] }, true],
+	[{ file_types: ['MD'] }, true],
+	[{ file_types: [' md '] }, true],
+	[{ file_types: ['.md'] }, true],
+	[{ file_types: ['x8'] }, true],
+	[{ file_types: ['aaaaaaaaaaaaaaaa'] }, true],
+	[{ file_types: ['aaaaaaaaaaaaaaaaa'] }, false],
+	[{ file_types: ['db_old'] }, false],
+	[{ file_types: ['json-ld'] }, false],
+	[{ file_types: ['15 meeting'] }, false],
+	[{ file_types: [''] }, false],
+	[{ file_types: ['tar.gz'] }, false],
+	[{ file_types: ['\u00e9'] }, false],
+	[{ file_types: ['md5sum'] }, true],
+	[{ file_types: ['7z'] }, true],
+	[{ file_types: Array(32).fill('md') }, true],
+	[{ file_types: Array(33).fill('md') }, false],
+	[{ file_types: Array.from({ length: 32 }, (_, i) => `a${i}`) }, true],
+	[{ file_types: Array.from({ length: 33 }, (_, i) => `a${i}`) }, false],
+	[{ ingested_after: '2026-10-01' }, true],
+	[{ ingested_after: '2026-10-01T00:00:00Z' }, true],
+	[{ ingested_after: '2026-10-01T00:00Z' }, true],
+	[{ ingested_after: '2026-10-01T10:30' }, true],
+	[{ ingested_after: '2026-10-01T00:00:00.123456789Z' }, true],
+	[{ ingested_after: '2026-10-01T00:00:00.1234567890Z' }, false],
+	[{ ingested_after: '2026-10-01T00:00:00+02:00' }, true],
+	[{ ingested_after: '2026-10-01T00:00:00+0200' }, false],
+	[{ ingested_after: '2026-10-01T00:00:00-23:59' }, true],
+	[{ ingested_after: '2026-10-01T00:00:00+24:00' }, false],
+	[{ ingested_after: '2026-10-01T00:00:00+02:60' }, false],
+	[{ ingested_after: '2026-10-01 00:00:00Z' }, true],
+	[{ ingested_after: '2026-10-01t00:00:00z' }, true],
+	[{ ingested_after: ' 2026-10-01 ' }, true],
+	[{ ingested_after: '2026-02-30' }, false],
+	[{ ingested_after: '2026-13-01' }, false],
+	[{ ingested_after: '2026-00-10' }, false],
+	[{ ingested_after: '2026-10-00' }, false],
+	[{ ingested_after: '2026-10-01T24:00:00Z' }, false],
+	[{ ingested_after: '2026-10-01T23:60:00Z' }, false],
+	[{ ingested_after: '2026-10-01T23:59:60Z' }, false],
+	[{ ingested_after: '0000-01-01' }, false],
+	[{ ingested_after: '0001-01-01' }, true],
+	[{ ingested_after: '0001-01-01T00:00:00+01:00' }, false],
+	[{ ingested_after: '9999-12-31T23:59:59Z' }, true],
+	[{ ingested_after: '9999-12-31T23:59:59-01:00' }, false],
+	[{ ingested_after: '+010000-01-01T00:00:00Z' }, false],
+	[{ ingested_after: '2026-10-01Z' }, false],
+	[{ ingested_after: '2026-10-01T10Z' }, false],
+	[{ ingested_after: '20261001' }, false],
+	[{ ingested_after: '2024-02-29' }, true],
+	[{ ingested_after: '2023-02-29' }, false],
+	[{ ingested_after: '2026-10-01T00:00:00.Z' }, false],
+	[{ ingested_after: '1970-01-01T00:00:00Z' }, true],
+	[{ path_prefix: 'a'.repeat(1024) }, true],
+	[{ path_prefix: 'a'.repeat(1025) }, false],
+	[{ path_contains: 'b'.repeat(1024) }, true],
+	[{ path_contains: 'b'.repeat(1025) }, false],
+];
+
+test("the app's filter grammar is the node's: it never accepts what the node refuses (file types, times, text lengths)", () => {
+	for (const [filter, node] of NODE_VERDICTS) {
+		const app = validateFilter(filter) === null;
+		if (!node) assert.equal(app, false, `the node refuses ${JSON.stringify(filter).slice(0, 80)}`);
+	}
+	// What the node accepts, the app accepts too, but a leading dot (the app's own matching needs the bare extension).
+	const refusedHere = NODE_VERDICTS.filter(([filter, node]) => node && validateFilter(filter) !== null).map(([filter]) => filter);
+	assert.deepEqual(refusedHere, [{ file_types: ['.md'] }]);
+	assert.equal(FILE_TYPE_RE.source, '^[a-z0-9]{1,16}$', "the node's _FILE_TYPE");
+	assert.ok(isFilterExtension('pdf') && isFilterExtension('7z'));
+	assert.ok(!isFilterExtension('15 meeting') && !isFilterExtension('db_old') && !isFilterExtension('json-ld') && !isFilterExtension(''));
+	// A time is read as the node reads it, for the rows matched here too.
+	assert.equal(instantMs('2026-10-01'), Date.parse('2026-10-01T00:00:00Z'));
+	assert.equal(instantMs('2026-10-01 02:00:00+02:00'), Date.parse('2026-10-01T00:00:00Z'));
+	assert.equal(instantMs('2026-10-01t00:00:00.5z'), Date.parse('2026-10-01T00:00:00Z'), 'the fraction is dropped, as the node does');
+	assert.equal(instantMs('0001-01-01'), Date.parse('0001-01-01T00:00:00Z'));
+	assert.equal(instantMs('2026-02-30'), null);
+	assert.deepEqual(
+		[doc('a', 'a.md', { ingestedAt: '2026-10-01T00:30:00Z' }), doc('b', 'b.md', { ingestedAt: '2026-09-30T23:00:00Z' })].filter((r) => matches(r, { ingested_after: '2026-10-01 02:00:00+02:00' })).map((r) => r.objectId),
+		['a']
+	);
+});
+
+test('a chart bar, "Scope to this folder" and the path box reach the scope only with what the node accepts', () => {
+	assert.equal(checkScope(null), null, 'no scope is fine');
+	assert.equal(checkScope(scopeWith(null, '', { file_types: ['md'] })), null);
+	assert.match(checkScope(scopeWith(null, '', { file_types: ['15 meeting'] })) ?? '', /'15 meeting' is not a file extension/);
+	assert.match(checkScope(scopeWith(null, '', { path_prefix: 'C:/'.padEnd(FILTER_TEXT_MAX + 1, 'x') })) ?? '', /'path_prefix' is longer than 1,024 characters/);
+	assert.match(checkScope(scopeWith(null, 'x'.repeat(FILTER_TEXT_MAX + 1), { path_prefix: 'C:/' })) ?? '', /'path_contains' is longer than 1,024 characters/);
+	// The path box: text the node would refuse leaves the scope as it was.
+	const scope = scopeWith(null, 'fal', { path_prefix: 'C:/demo/' });
+	assert.ok(scope);
+	assert.equal(withText(scope, 'x'.repeat(FILTER_TEXT_MAX + 1)), scope);
+	assert.equal(withText(scope, 'x'.repeat(FILTER_TEXT_MAX)).filter.path_contains?.length, FILTER_TEXT_MAX);
 });
 
 test('sameFilter compares meaning, not key order or empty keys', () => {

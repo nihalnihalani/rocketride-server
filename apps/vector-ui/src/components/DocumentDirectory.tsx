@@ -42,7 +42,7 @@ import type { Availability, IDocumentItem, IDocumentsFilter, IExportItem, IScope
 import type { IRemoveTarget } from '../vector/confirm';
 import { buildGroups, directoryHeading, pagerFooter, pagerProgressText } from '../vector/documents';
 import type { IDirectoryGroup, IDirectoryRow, IPagerState } from '../vector/documents';
-import { FILTER_DEBOUNCE_MS, directoryExportItems, directoryView, scopeNoMatchText, scopeWith, withText } from '../vector/filters';
+import { FILTER_DEBOUNCE_MS, checkScope, directoryExportItems, directoryView, scopeNoMatchText, scopeWith, withText } from '../vector/filters';
 import { medianChunks } from '../vector/health';
 import type { ConditionKind } from '../vector/filters';
 import { DEFAULT_LIMITS } from '../vector/results';
@@ -125,6 +125,9 @@ export function DocumentDirectory({ pager, selectedId, writes, onSelect, onRemov
 	const [filter, setFilter] = useState('');
 	const applied = useDebounced(filter, FILTER_DEBOUNCE_MS);
 	const [folderMenu, setFolderMenu] = useState<IFolderMenu | null>(null);
+	// Why "Scope to this folder" was not applied (the node would refuse the folder), until the scope changes.
+	const [folderError, setFolderError] = useState<string | null>(null);
+	useEffect(() => setFolderError(null), [scope]);
 	const [collapsed, setCollapsed] = useState<ReadonlySet<string>>(new Set());
 	const [checked, setChecked] = useState<ReadonlySet<string>>(new Set());
 	const [scrollTop, setScrollTop] = useState(0);
@@ -212,6 +215,11 @@ export function DocumentDirectory({ pager, selectedId, writes, onSelect, onRemov
 				<ExportMenu items={exportItems} collection={collection} />
 			</div>
 			<ScopeBar text={filter} scopeText={applied} onText={setFilter} scope={scope} onScope={onScope} cap={cap} available={available} folders={folders} saved={saved} onSave={onSave} onDeleteSaved={onDeleteSaved} listing={pager} />
+			{folderError !== null && (
+				<div role="alert" style={{ ...styles.small, padding: '0 12px 6px' }}>
+					{folderError}
+				</div>
+			)}
 			{(summary || progress) && (
 				<div style={{ ...styles.small, padding: '0 12px 6px' }} role="status">
 					{summary ?? progress}
@@ -292,7 +300,10 @@ export function DocumentDirectory({ pager, selectedId, writes, onSelect, onRemov
 						autoFocus
 						style={{ ...styles.small, textAlign: 'left', padding: '4px 10px', background: 'none', border: 'none', color: 'inherit', cursor: 'pointer' }}
 						onClick={() => {
-							onScope?.(scopeWith(scope, applied, { path_prefix: folderMenu.folder }));
+							const next = scopeWith(scope, applied, { path_prefix: folderMenu.folder });
+							const refused = checkScope(next);
+							setFolderError(refused);
+							if (refused === null) onScope?.(next);
 							setFolderMenu(null);
 						}}
 						onFocus={(event) => (event.currentTarget.style.outline = FOCUS_RING)}

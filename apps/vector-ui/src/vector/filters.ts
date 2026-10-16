@@ -352,11 +352,68 @@ export function sameFilter(a: IDocumentsFilter | null | undefined, b: IDocuments
 	return canon(a) === canon(b);
 }
 
-/** An ISO-8601 time the node accepts (a date, or a date and time with an optional zone). */
-const ISO_RE = /^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:?\d{2})?)?$/;
+/** An extension the node accepts in `file_types` (vx_types `_FILE_TYPE`): 1 to 16 lower-case letters and digits, no dot. */
+export const FILE_TYPE_RE = /^[a-z0-9]{1,16}$/;
 
-/** An extension without a dot: letters, digits, '_' and '-'. */
-const EXT_RE = /^[a-z0-9_-]{1,16}$/i;
+/** The node refuses more entries of `file_types` than this (vx_types `DOC_LIST_FILTER_TYPES_MAX`). */
+export const FILTER_TYPES_MAX = 32;
+
+/**
+ * Whether an extension can be sent in `file_types` as it is.
+ *
+ * @param ext - The extension, without the dot.
+ * @returns True when the node accepts it.
+ */
+export function isFilterExtension(ext: string): boolean {
+	return FILE_TYPE_RE.test(ext);
+}
+
+/**
+ * An ISO-8601 time as the node reads it (vx_types `_INSTANT`): a date,
+ * optionally a time ('T', 't' or a space; seconds and up to nine fraction
+ * digits optional) and, with a time, 'Z' or an offset '+HH:MM'.
+ */
+const INSTANT_RE = /^(\d{4})-(\d{2})-(\d{2})(?:[Tt ](\d{2}):(\d{2})(?::(\d{2})(?:\.\d{1,9})?)?([Zz]|[+-]\d{2}:\d{2})?)?$/;
+
+/** The first and last instants the node can turn into its UTC form (years 1 to 9999). */
+const FIRST_INSTANT_MS = Date.parse('0001-01-01T00:00:00Z');
+const LAST_INSTANT_MS = Date.parse('9999-12-31T23:59:59Z');
+
+/** Days in a month of the proleptic Gregorian calendar. */
+function daysIn(year: number, month: number): number {
+	const leap = (year % 4 === 0 && year % 100 !== 0) || year % 400 === 0;
+	return [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1] as number;
+}
+
+/**
+ * Read an ISO-8601 time the way the node does (no offset is UTC; the fraction
+ * is dropped), refusing what it refuses: a month 13, February 30, hour 24, an
+ * offset of 24 hours, and a time whose UTC form falls outside years 1 to 9999.
+ *
+ * @param text - The time.
+ * @returns Epoch ms, or null when the node would refuse it.
+ */
+export function instantMs(text: string): number | null {
+	const m = INSTANT_RE.exec(text.trim());
+	if (m === null) return null;
+	const [year, month, day] = [Number(m[1]), Number(m[2]), Number(m[3])];
+	const [hour, minute, second] = [Number(m[4] ?? 0), Number(m[5] ?? 0), Number(m[6] ?? 0)];
+	if (year < 1 || month < 1 || month > 12 || day < 1 || day > daysIn(year, month) || hour > 23 || minute > 59 || second > 59) return null;
+	let offset = 0;
+	const zone = m[7];
+	if (zone !== undefined && zone !== 'Z' && zone !== 'z') {
+		const hours = Number(zone.slice(1, 3));
+		const minutes = Number(zone.slice(4, 6));
+		if (hours > 23 || minutes > 59) return null;
+		offset = (zone[0] === '+' ? 1 : -1) * (hours * 60 + minutes) * 60_000;
+	}
+	// setUTCFullYear, not Date.UTC, which reads the years 0 to 99 as 1900 to 1999.
+	const at = new Date(0);
+	at.setUTCFullYear(year, month - 1, day);
+	at.setUTCHours(hour, minute, second, 0);
+	const ms = at.getTime() - offset;
+	return ms >= FIRST_INSTANT_MS && ms <= LAST_INSTANT_MS ? ms : null;
+}
 
 /**
  * Check a wire filter by the node's rules (contract section 4.4-A), so the app
@@ -378,12 +435,13 @@ export function validateFilter(value: unknown): string | null {
 	if (isSet('file_types')) {
 		const types = filter.file_types;
 		if (!Array.isArray(types) || types.length === 0) return "'file_types' must list at least one extension.";
-		for (const t of types) if (typeof t !== 'string' || !EXT_RE.test(t)) return `'${String(t)}' is not a file extension (letters and digits, without the dot).`;
+		if (types.length > FILTER_TYPES_MAX) return `'file_types' lists at most ${FILTER_TYPES_MAX} extensions.`;
+		for (const t of types) if (typeof t !== 'string' || !isFilterExtension(t.trim().toLowerCase())) return `'${String(t)}' is not a file extension (letters and digits, without the dot).`;
 	}
 	for (const key of ['ingested_after', 'ingested_before']) {
 		if (!isSet(key)) continue;
 		const text = filter[key];
-		if (typeof text !== 'string' || !ISO_RE.test(text) || !Number.isFinite(Date.parse(text))) return `'${key}' must be an ISO-8601 date or time.`;
+		if (typeof text !== 'string' || instantMs(text) === null) return `'${key}' must be an ISO-8601 date or time.`;
 	}
 	for (const key of ['min_chunks', 'max_chunks']) {
 		if (!isSet(key)) continue;
@@ -454,14 +512,15 @@ function keeps(item: IDocumentItem, filter: IDocumentsFilter, key: FilterKey): b
 		case 'file_types': {
 			const path = item.path.toLowerCase();
 			const name = path.slice(Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\')) + 1);
-			return (filter.file_types as string[]).some((t) => name.endsWith(`.${t.toLowerCase()}`));
+			return (filter.file_types as string[]).some((t) => name.endsWith(`.${t.trim().toLowerCase()}`));
 		}
 		case 'ingested_after':
 		case 'ingested_before': {
 			if (item.ingestedAt === null) return false;
 			const at = Date.parse(item.ingestedAt);
-			const bound = Date.parse(filter[key] as string);
-			if (!Number.isFinite(at) || !Number.isFinite(bound)) return false;
+			// The bound is read as the node reads it, so the rows matched here agree with the store.
+			const bound = instantMs(filter[key] as string);
+			if (!Number.isFinite(at) || bound === null) return false;
 			return key === 'ingested_after' ? at >= bound : at < bound;
 		}
 		case 'min_chunks':
@@ -678,14 +737,27 @@ export function scopeFromFilter(filter: IFilter, prev: IScopeState | null | unde
 }
 
 /**
- * A scope with the path box's new text (the same scope when it did not change).
+ * A scope with the path box's new text (the same scope when it did not
+ * change, or when the node would refuse the text: the ScopeBar says so).
  *
  * @param scope - The scope.
  * @param text - The path box, after its debounce.
  * @returns The scope.
  */
 export function withText(scope: IScopeState, text: string): IScopeState {
-	return scopeFromFilter(filterOf(scope, text), scope) ?? scope;
+	const next = scopeFromFilter(filterOf(scope, text), scope) ?? scope;
+	return checkScope(next) === null ? next : scope;
+}
+
+/**
+ * Why the node would refuse a new scope's conditions (a chart's bar, "Scope
+ * to this folder", the path box), so the console says it instead of sending it.
+ *
+ * @param scope - The new scope, or null for none.
+ * @returns null when it can be sent, else the sentence.
+ */
+export function checkScope(scope: Pick<IScopeState, 'filter'> | null): string | null {
+	return scope === null ? null : validateFilter(scope.filter);
 }
 
 /**

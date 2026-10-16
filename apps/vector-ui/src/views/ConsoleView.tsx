@@ -67,7 +67,7 @@ import StatsStrip from '../components/StatsStrip';
 import { getDocs } from '../docs';
 import { documentUri } from '../vector/addresses';
 import { alsoReaches, consoleScope, mapScopeFor, writesDuringRemoval } from '../vector/consoleModel';
-import { CONDITION_KINDS, conditionAvailability, listingFilter, resolveScope, scopeStripText, scopeView, scopeWith } from '../vector/filters';
+import { CONDITION_KINDS, checkScope, conditionAvailability, listingFilter, resolveScope, scopeStripText, scopeView, scopeWith } from '../vector/filters';
 import type { ConditionKind } from '../vector/filters';
 import { healthSummary, medianChunks } from '../vector/health';
 import { savedFiltersFor } from '../vector/savedFilters';
@@ -180,7 +180,12 @@ export const ConsoleView: React.FC<IConsoleViewProps> = ({ opened, active }) => 
 		return healthSummary(state.directory.rows, { medianChunks: settled ? medianChunks(state.directory.rows) : null, complete: state.directory.status === 'done' && state.directory.filter === null });
 	}, [state.directory]);
 	// A chart's bar sets its kind of condition (a chunk range, a file type, a period) and keeps the others.
-	const scopeFromChart = (filter: IDocumentsFilter): void => entry.scope.set(scopeWith(scope, scope?.filter.path_contains ?? '', filter));
+	const scopeFromChart = (filter: IDocumentsFilter): void => {
+		const next = scopeWith(scope, scope?.filter.path_contains ?? '', filter);
+		const refused = checkScope(next);
+		if (refused !== null) announcer.announce(refused);
+		else entry.scope.set(next);
+	};
 
 	// Saved filters: per connection, in memory (the app's map, emptied on a change of identity).
 	const savedStore = useMemo(() => savedFiltersFor(savedFilters, entry.key), [entry.key]);

@@ -11,6 +11,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import type { IDocumentItem, ISampleModel, ISampleResult } from '../src/contract/types';
 import { binCounts, byFileType, byIngestPeriod, chunksPerDocument, collectionCharts, lengthBins, logBins, median } from '../src/vector/charts';
+import { validateFilter } from '../src/vector/filters';
 import { readDialect, readDocumentsPage } from '../src/vector/results';
 import { fixture } from './support/fixtures';
 
@@ -117,6 +118,18 @@ test('file types from Windows, POSIX, share and bare names; the most common firs
 			['other (6 types)', 6, true],
 		]
 	);
+});
+
+test('a type bar scopes only to an extension the node accepts: dotted dates, suffixed backups and hyphens are shown, never clickable', () => {
+	const rows = [doc('1', 'C:/minutes/Board 2026.10.15 meeting'), doc('2', 'C:/db/orders.db_old'), doc('3', 'C:/web/catalog.json-ld'), doc('4', 'C:/a/README.MD'), doc('5', 'C:/a/notes.md'), doc('6', 'C:/a/x.' + 'y'.repeat(17))];
+	const bins = byFileType(rows);
+	const scopeOf = (label: string) => bins.find((b) => b.label === label)?.scope;
+	assert.deepEqual(scopeOf('md'), { file_types: ['md'] });
+	for (const label of ['15 meeting', 'db_old', 'json-ld', 'y'.repeat(17)]) assert.equal(scopeOf(label), null, label);
+	assert.equal(bins.find((b) => b.label === '15 meeting')?.count, 1, 'still counted and drawn');
+	// Every bar of every chart that scopes sends what the node accepts.
+	const charts = collectionCharts({ rows: [...rows, doc('7', 'a.pdf', { ingestedAt: '2026-10-01T00:00:00Z', chunks: 9 })], total: null, sample: null, dialect: null, loading: false });
+	for (const chart of charts) for (const bin of chart.bins) if (bin.scope !== null) assert.equal(validateFilter(bin.scope), null, `${chart.id} ${bin.label}`);
 });
 
 test('ingested over time: by day within a month, by week within half a year, else by month; empty periods kept; a click scopes to the period', () => {
