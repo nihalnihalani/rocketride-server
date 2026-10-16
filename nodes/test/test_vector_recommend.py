@@ -10,8 +10,10 @@ Contract section 4.4-D. Examples are ``[objectId, chunkId]`` keys (at most
 query vector the embedding node returned, counted as one more positive. It
 returns neighbour rows, never a stored vector.
 
-* ``average_vector`` (every store): the node reads the examples' vectors (the
-  latest cached sample first, else ``getVectors``), averages each side
+* ``average_vector`` (every store): the node reads the examples' vectors from
+  the store (``getVectors``; the latest cached sample only where the store
+  cannot read vectors by key, since a sample keeps the chunks of a document
+  removed after it was drawn), averages each side
   (``avg_positive``, ``avg_negative``; at unit length on a cosine store, as
   Qdrant does) and searches the whole collection with
   ``avg_positive + avg_positive - avg_negative`` (``avg_positive`` without
@@ -39,6 +41,7 @@ import numpy as np
 import pytest
 
 from ai.common.store import VectorStoreToolMixin, vx_tools
+from ai.common.store.errors import StoreUnsupported
 from ai.common.store.vx_defaults import VECTOR_TOOL_LIMITS
 
 from .store_qdrant._mock_driver import load_driver, make_doc as qdrant_doc, make_store as qdrant_store
@@ -261,15 +264,34 @@ def test_unresolved_positives_with_the_query_vector_still_recommend():
     assert answer['not_found'] == [['ghost', 0]]
 
 
-def test_examples_are_read_from_the_cached_sample_before_the_store():
+def test_examples_are_read_from_the_store_even_when_the_sample_holds_them():
     store = clustered(docs=3, chunks=4)
     inst = node(store)
     inst.sample({'n': 12, 'seed': 3})
     store.calls.clear()
     answer = inst.recommend({'positive': [['doc00', 0]], 'negative': [['doc01', 1]], 'k': 2})
     assert answer['success'] is True
-    read = [keys for call, *rest in store.calls if call == 'getVectors' for keys in rest]
-    assert ('doc00', 0) not in [k for keys in read for k in keys], 'the sample held the example'
+    read = [key for call in store.calls if call[0] == 'getVectors' for key in call[1]]
+    assert {('doc00', 0), ('doc01', 1)} <= set(read), 'the store says which examples are stored, not the sample'
+
+
+class _NoVectorReads(ExactListingStore):
+    """Samples with vectors but cannot read them by key (``getVectors`` unsupported)."""
+
+    def getVectors(self, keys):
+        self.calls.append(('getVectors', [tuple(k) for k in keys]))
+        raise StoreUnsupported('getVectors is not supported by this store')
+
+
+def test_a_store_that_cannot_read_vectors_by_key_takes_the_examples_from_the_cached_sample():
+    store = clustered(_NoVectorReads, docs=3, chunks=4)
+    inst = node(store)
+    before = inst.recommend({'positive': [['doc00', 0]], 'k': 2})
+    assert (before['success'], before['code']) == (False, 'NOT_FOUND'), 'no sample, nothing to read the example from'
+    inst.sample({'n': 12, 'seed': 3})
+    answer = inst.recommend({'positive': [['doc00', 0]], 'negative': [['doc01', 1]], 'k': 2})
+    assert answer['success'] is True, answer
+    assert answer['examples_resolved'] == {'positive': 1, 'negative': 1} and answer['not_found'] == []
 
 
 def test_the_scope_restricts_the_results():
@@ -539,6 +561,69 @@ def test_negatives_alone_on_qdrant_list_the_least_similar_first():
     assert answer['success'] is True and all(item['score'] < 0 for item in answer['items'])
     sims = [item['sim'] for item in answer['items']]
     assert sims == sorted(sims), 'least similar to the negative example first'
+
+
+# ---------------------------------------------------------------------------
+# An example removed after the sample was drawn
+# ---------------------------------------------------------------------------
+
+
+def _sampled_then_removed(removed='doc00'):
+    """The mock Qdrant corpus, every chunk in a cached sample, then ``removed`` taken out through the tool."""
+    store = _qdrant_corpus()
+    inst = node(store, logical_type='qdrant')
+    assert inst.sample({'n': 30, 'seed': 3})['success'] is True
+    latest = vx_tools._vx_state(store).samples().latest()
+    assert all((removed, chunk) in latest.index for chunk in range(5)), 'the sample holds every chunk of it'
+    gone = _dispatch(_tool_node(store, allow_writes=True), 'remove_document', {'object_ids': [removed]}, dap())
+    assert gone['success'] is True and gone['removed_chunks'] == 5, gone
+    assert vx_tools._vx_state(store).samples().latest() is latest, 'and still does after the removal'
+    return store, inst
+
+
+def _query_points_calls() -> int:
+    return qdrant.QdrantClient.calls.get('query_points', 0)
+
+
+def test_best_score_with_only_a_removed_positive_is_not_found_while_the_sample_still_holds_it():
+    store, inst = _sampled_then_removed()
+    before = _query_points_calls()
+    answer = inst.recommend({'positive': [['doc00', 1]], 'negative': [['doc03', 2]], 'strategy': 'best_score'})
+    assert (answer['success'], answer.get('code')) == (False, 'NOT_FOUND'), answer
+    assert answer['not_found'] == [['doc00', 1]]
+    assert _query_points_calls() == before, 'never a negatives-only query in place of "like A, unlike B"'
+
+
+def test_best_score_with_a_removed_positive_ranks_by_the_positives_left_and_lists_it():
+    store, inst = _sampled_then_removed()
+    answer = inst.recommend(
+        {'positive': [['doc00', 1], ['doc02', 0]], 'negative': [['doc03', 2]], 'strategy': 'best_score', 'k': 50}
+    )
+    assert answer['success'] is True, answer
+    assert answer['examples_resolved'] == {'positive': 1, 'negative': 1}
+    assert answer['not_found'] == [['doc00', 1]]
+    native = store.recommendNative(positive=[('doc02', 0)], negative=[('doc03', 2)], strategy='best_score', limit=50)
+    assert _keys(answer) == [(d.metadata.objectId, d.metadata.chunkId) for d in native]
+    assert not any(key[0] == 'doc00' for key in _keys(answer))
+
+
+def test_average_vector_with_a_removed_example_lists_it_while_the_sample_still_holds_it():
+    store, inst = _sampled_then_removed()
+    alone = inst.recommend({'positive': [['doc00', 1]], 'negative': [['doc03', 2]]})
+    assert (alone['success'], alone.get('code')) == (False, 'NOT_FOUND'), alone
+    assert alone['not_found'] == [['doc00', 1]]
+    answer = inst.recommend(
+        {'positive': [['doc00', 1], ['doc02', 0]], 'negative': [['doc03', 2], ['doc00', 4]], 'k': 50}
+    )
+    assert answer['success'] is True, answer
+    assert answer['examples_resolved'] == {'positive': 1, 'negative': 1}
+    assert answer['not_found'] == [['doc00', 1], ['doc00', 4]]
+    native = store.recommendNative(
+        positive=[('doc02', 0)], negative=[('doc03', 2)], strategy='average_vector', limit=50
+    )
+    assert _keys(answer) == [(d.metadata.objectId, d.metadata.chunkId) for d in native], (
+        'the removed examples take no part in the search vector'
+    )
 
 
 # ---------------------------------------------------------------------------

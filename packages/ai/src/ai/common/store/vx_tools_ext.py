@@ -214,6 +214,24 @@ class VectorExplorerExtTools:
             rows.sort(key=lambda row: -row[0])
         return [item for _sim, item in rows]
 
+    def _vx_example_vectors(self, store: Any, keys: Sequence[Key]) -> Dict[Key, Any]:
+        """The stored vectors of a recommendation's example ``keys``, read from the store now.
+
+        The store, not the cached sample, says which examples are stored: a sample
+        keeps the chunks of a document removed after it was drawn, and a store that
+        ranks natively (``best_score``) looks its examples up in the collection, so
+        ``examples_resolved`` and ``not_found`` must count what the store holds (at
+        most ``recommend_examples_max`` keys a side, so the read is small). Only a
+        store that cannot read vectors by key (``getVectors`` unsupported) is answered
+        from the latest cached sample.
+        """
+        import numpy as np
+
+        try:
+            return {key: np.asarray(doc.embedding, dtype=np.float32) for key, doc in read_vectors(store, keys).items()}
+        except StoreUnsupported:
+            return self._vx_vectors_for(store, keys)
+
     @tool_function(
         input_schema={
             'type': 'object',
@@ -311,7 +329,7 @@ class VectorExplorerExtTools:
             metric = self._vx_metric(store) or 'cosine'
 
             wanted = [key for key in positive + negative if key[0] != CONTROL_OBJECT_ID]
-            found = self._vx_vectors_for(store, wanted) if wanted else {}
+            found = self._vx_example_vectors(store, wanted) if wanted else {}
             pos_found = [key for key in positive if key in found]
             neg_found = [key for key in negative if key in found]
             not_found = [[key[0], key[1]] for key in positive + negative if key not in found]
