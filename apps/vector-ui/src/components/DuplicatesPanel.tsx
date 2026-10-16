@@ -46,7 +46,7 @@ import { GROUPS_SHOWN_MAX, KEEP_POLICIES, PAIRS_SHOWN_MAX, THRESHOLD_MAX, THRESH
 import type { CopyVerdict, IDedupeView, IDocInfo, IDocumentGroup, IQueueState, IQueued, KeepPolicy, ReviewedCache } from '../map/dedupe';
 import { formatSize } from '../vector/fileType';
 import { MAP_STYLES } from '../map/styles';
-import { CHOOSE_KEEP_FIRST, KEPT_ELSEWHERE, NOT_WHOLE_COPIES_NOTE, NO_BULK_REMOVE, POLICY_LEAVES_GROUP, SHARED_PASSAGES_NOTE, POLICY_LABELS, POLICY_UNAVAILABLE, REPEATED_HEADING, REPEATED_NOTE, TOO_FEW_SAMPLED_NOTE, duplicatesKnnCaveat, duplicatesNone, duplicatesSampleCaveat, groupLegend, groupsCappedLine, morePairsLine, num, plural, queuedLine, removeAllLabel, removeOthersLabel, removedLine, reviewedGroupsHeading, sharedLine, simText, thresholdValueText } from '../map/reviewWording';
+import { CHOOSE_KEEP_FIRST, KEPT_ELSEWHERE, NOT_WHOLE_COPIES_NOTE, NO_BULK_REMOVE, PARTLY_MATCHED_NOTE, POLICY_LEAVES_GROUP, SHARED_PASSAGES_NOTE, POLICY_LABELS, POLICY_UNAVAILABLE, REPEATED_HEADING, REPEATED_NOTE, TOO_FEW_SAMPLED_NOTE, duplicatesKnnCaveat, duplicatesNone, duplicatesSampleCaveat, groupLegend, groupsCappedLine, morePairsLine, num, plural, queuedLine, removeAllLabel, removeOthersLabel, removedLine, reviewedGroupsHeading, sharedLine, simText, thresholdValueText } from '../map/reviewWording';
 
 /** Props: the frozen ones, plus the queue's starting choices and the reviewed cache. */
 export interface DuplicatesPanelProps extends ContractDuplicatesPanelProps {
@@ -82,6 +82,7 @@ export interface DuplicatesBodyProps {
 const NOT_COPIES_NOTES: Readonly<Record<Exclude<CopyVerdict, 'copies'>, string>> = {
 	passages: SHARED_PASSAGES_NOTE,
 	mixed: NOT_WHOLE_COPIES_NOTE,
+	partial: PARTLY_MATCHED_NOTE,
 	sparse: TOO_FEW_SAMPLED_NOTE,
 };
 

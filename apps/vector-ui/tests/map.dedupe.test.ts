@@ -34,6 +34,8 @@ import { loadSample } from './support/map.samples';
 interface IPointSpec {
 	doc: number;
 	chunk: number;
+	/** Pinned by `include_keys` (a key asked for on purpose) rather than drawn by the sampler. */
+	pinned?: boolean;
 }
 
 /**
@@ -69,7 +71,7 @@ function sampleOf(docs: Array<[string, string, number | null]>, points: IPointSp
 		metric: 'cosine',
 		dimension: 8,
 		docs: docs.map(([objectId, p, chunks], i) => ({ i, objectId, path: p, chunks, in_sample: points.filter((pt) => pt.doc === i).length })),
-		points: { doc: points.map((p) => p.doc), chunk: points.map((p) => p.chunk), x: points.map(() => 0), y: points.map(() => 0), len: points.map(() => 100), snip: points.map(() => 'text'), pinned: points.map(() => 0) },
+		points: { doc: points.map((p) => p.doc), chunk: points.map((p) => p.chunk), x: points.map(() => 0), y: points.map(() => 0), len: points.map(() => 100), snip: points.map(() => 'text'), pinned: points.map((p) => (p.pinned ? 1 : 0)) },
 		knn,
 		density: points.map(() => 0.5),
 		outliers: [],
@@ -264,8 +266,8 @@ const ROWS_INFO = [row('oa', 'C:/demo/handbooks/falcon_handbook.md', 3, '2026-10
 
 test("docInfo joins the directory rows over the sample's documents (rows win; the sample fills paths and chunk counts)", () => {
 	const info = docInfo(SMALL, ROWS_INFO);
-	assert.deepEqual(info.get('ob'), { objectId: 'ob', path: 'C:/demo/handbooks/falcon_handbook_rev2.md', chunks: 4, ingestedAt: '2026-10-01T09:00:00Z', size: 5000, inSample: 2 });
-	assert.deepEqual(info.get('oe'), { objectId: 'oe', path: 'C:/demo/ops/memo_q1.txt', chunks: 4, ingestedAt: null, size: null, inSample: 2 });
+	assert.deepEqual(info.get('ob'), { objectId: 'ob', path: 'C:/demo/handbooks/falcon_handbook_rev2.md', chunks: 4, ingestedAt: '2026-10-01T09:00:00Z', size: 5000, inSample: 2, drawn: 2 });
+	assert.deepEqual(info.get('oe'), { objectId: 'oe', path: 'C:/demo/ops/memo_q1.txt', chunks: 4, ingestedAt: null, size: null, inSample: 2, drawn: 2 });
 	assert.equal(docInfo(SMALL, null).get('oa')?.ingestedAt, null);
 });
 
@@ -483,6 +485,77 @@ test('the verdict behind the note: copies, shared passages, not whole copies, or
 		[[[1, 0.99]], [[0, 0.99]], [], [], [], [], []]
 	);
 	assert.equal(copyVerdict(dedupeView(quoted, 0.97).groups[0]!, docInfo(quoted, null)), 'mixed');
+});
+
+/**
+ * Two documents of `chunks` chunks each, the same `ids` of both in the sample
+ * and every one paired with its twin; `pinnedIds` of them pinned by
+ * include_keys, `ownIds` in the sample but paired with nothing.
+ *
+ * @param chunks - The store's chunk count of each document (null: unknown).
+ * @param ids - The chunk ids sampled in both and paired.
+ * @param opts - Pinned and unpaired chunk ids.
+ * @returns The sample.
+ */
+function twinSample(chunks: number | null, ids: readonly number[], opts: { pinnedIds?: readonly number[]; ownIds?: readonly number[] } = {}): ISampleResult {
+	const pinned = new Set(opts.pinnedIds ?? []);
+	const own = opts.ownIds ?? [];
+	const half: IPointSpec[] = [...ids.map((chunk) => ({ chunk, pinned: pinned.has(chunk) })), ...own.map((chunk) => ({ chunk, pinned: pinned.has(chunk) }))].map((p) => ({ doc: 0, ...p }));
+	const points: IPointSpec[] = [...half, ...half.map((p) => ({ ...p, doc: 1 }))];
+	const per = half.length;
+	const rows = points.map((_, i): Array<[number, number]> => (i % per < ids.length ? [[i < per ? i + per : i - per, 0.996]] : []));
+	return sampleOf(
+		[
+			['ra', 'C:/big/report.md', chunks],
+			['rb', 'C:/big/report_copy.md', chunks],
+		],
+		points,
+		rows
+	);
+}
+
+/** The verdict of the twin sample's one group. */
+function twinVerdict(sample: ISampleResult): string {
+	const [group] = dedupeView(sample, 0.97).groups;
+	assert.ok(group, 'one group');
+	return copyVerdict(group, docInfo(sample, null));
+}
+
+const range = (from: number, n: number): number[] => Array.from({ length: n }, (_, i) => from + i);
+
+test('on a large store the sample is evidence too: 400 of 1,000 chunks of each copy sampled, every one paired, is copies', () => {
+	// A store of 40,000 chunks, a detailed sample at its cap of 2,000: two 1,000-chunk copies get about 400 chunks each.
+	const sample = twinSample(1000, range(0, 400));
+	const [group] = dedupeView(sample, 0.97).groups;
+	assert.deepEqual(group!.shared, { ra: 400, rb: 400 });
+	assert.equal(copyVerdict(group!, docInfo(sample, null)), 'copies');
+	const shortest = queueReducer(queueInit(), { type: 'policy', value: 'shortest-path' });
+	assert.deepEqual(queued([group!], shortest, docInfo(sample, null), new Set()).objectIds, ['rb'], "'shortest path' keeps report.md and queues its copy");
+	assert.equal(twinVerdict(twinSample(1000, range(0, 499))), 'copies', 'no cliff at half of the stored chunks');
+	assert.equal(twinVerdict(twinSample(null, range(0, 400))), 'copies', 'with no chunk count from the store');
+	// The demo's planted copies are 7 chunks each; a sample may hold 3 of them.
+	assert.equal(twinVerdict(twinSample(7, [0, 3, 5])), 'copies', '3 of 7 sampled, all paired');
+});
+
+test('the sample alone calls a document a copy only from 3 drawn chunks, four in five of them paired; otherwise it says why', () => {
+	// "Too few" means fewer than 3 chunks of a document were drawn; with more, a partial match is said as such.
+	assert.equal(twinVerdict(twinSample(40, [0, 9])), 'sparse', '2 of 2 sampled chunks of 40-chunk files: too few to tell');
+	assert.equal(twinVerdict(twinSample(40, [0, 9, 21])), 'copies', '3 of 3');
+	assert.equal(twinVerdict(twinSample(40, [0, 9, 21, 30], { ownIds: [35] })), 'copies', '4 of 5 paired');
+	assert.equal(twinVerdict(twinSample(40, [0, 9, 21], { ownIds: [35] })), 'partial', '3 of 4 paired: enough sampled, too little of it matches to call it a copy');
+	assert.equal(twinVerdict(twinSample(40, [0, 9], { ownIds: [21, 35] })), 'partial', '2 of 4 paired: enough sampled, half of it matches');
+	assert.equal(twinVerdict(twinSample(40, [0], { ownIds: [9, 21] })), 'passages', 'one shared chunk of three: shared text');
+});
+
+test('chunks pinned on purpose are no evidence of a copy: a search for a shared section pins exactly the chunks that match', () => {
+	// Three chunks of a shared section, pinned by include_keys in each 40-chunk file, nothing else of them drawn.
+	assert.equal(twinVerdict(twinSample(40, [12, 13, 14], { pinnedIds: [12, 13, 14] })), 'sparse', 'pinned matches alone: too few drawn');
+	const state = queueReducer(queueInit(), { type: 'policy', value: 'shortest-path' });
+	const pinnedOnly = twinSample(40, [12, 13, 14], { pinnedIds: [12, 13, 14] });
+	assert.deepEqual(queued(dedupeView(pinnedOnly, 0.97).groups, state, docInfo(pinnedOnly, null), new Set()).objectIds, [], 'no policy queues them');
+	assert.equal(twinVerdict(twinSample(40, [0, 9, 21, 12, 13], { pinnedIds: [12, 13] })), 'copies', '3 drawn chunks, all paired, beside 2 pinned ones');
+	assert.equal(twinVerdict(twinSample(40, [0, 9, 21], { pinnedIds: [30, 35], ownIds: [30, 35] })), 'partial', 'pinned chunks that match nothing still count against');
+	assert.equal(docInfo(pinnedOnly, null).get('ra')?.drawn, 0, 'a document of pinned points only: none drawn');
 });
 
 test('the threshold moves within 0.90 to 0.995 and re-groups at once from the sample alone', () => {

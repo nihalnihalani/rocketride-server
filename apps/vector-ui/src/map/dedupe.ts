@@ -36,9 +36,13 @@
 // A keep policy (oldest ingest, shortest path, most chunks) or a hand-picked
 // keep chooses one document per group; the others are queued for removal,
 // except a document another group keeps. A policy only chooses in a group
-// of copies, judged against the store's chunk counts rather than the
-// sample's: at least half of every document's chunks are sampled and in the
-// group, and one shared chunk never makes a longer document a copy. A
+// of copies. A document is a copy when at least half of the chunks the store
+// holds of it are sampled and in the group, or when the sampler drew at least
+// 3 of its chunks and four in five of them are in the group (the sample's
+// own evidence, so a copy is still found where the sample caps cover a small
+// share of a large store). Chunks pinned on purpose (include_keys) are not
+// that evidence: a search for a shared section pins exactly the chunks that
+// match. One shared chunk never makes a longer document a copy, and a
 // paragraph several files share is never queued by a policy, however thinly
 // the sample covers them. Removal itself is the console's: the panel hands
 // the queued objectIds to `requestRemove`, which confirms with the typed
@@ -210,6 +214,8 @@ export interface IDocumentGroup extends IDuplicateGroup {
 	chunkGroups: number;
 	/** Points of each document inside the group. */
 	shared: Readonly<Record<string, number>>;
+	/** Of those, the points the sampler drew (not pinned by include_keys). */
+	drawn: Readonly<Record<string, number>>;
 	/** The pairs inside the group, most similar first. */
 	pairs: readonly IDuplicatePair[];
 }
@@ -258,8 +264,13 @@ export function dedupeView(sample: ISampleResult, threshold: number, removed: re
 	const all = [...merged.entries()].map(([key, g]) => {
 		const points = g.points.sort((x, y) => x - y);
 		const shared: Record<string, number> = {};
-		for (const i of points) shared[objectOf(i)] = (shared[objectOf(i)] ?? 0) + 1;
-		return { key, objectIds: g.objectIds, points, chunkGroups: g.chunkGroups, simMin: g.simMin, simMax: g.simMax, pairs: g.pairs, shared, sameDocument: g.objectIds.length === 1 };
+		const drawn: Record<string, number> = {};
+		for (const i of points) {
+			const id = objectOf(i);
+			shared[id] = (shared[id] ?? 0) + 1;
+			if (!sample.points.pinned[i]) drawn[id] = (drawn[id] ?? 0) + 1;
+		}
+		return { key, objectIds: g.objectIds, points, chunkGroups: g.chunkGroups, simMin: g.simMin, simMax: g.simMax, pairs: g.pairs, shared, drawn, sameDocument: g.objectIds.length === 1 };
 	});
 	const order = (x: (typeof all)[number], y: (typeof all)[number]): number => y.objectIds.length - x.objectIds.length || y.points.length - x.points.length || (x.points[0] as number) - (y.points[0] as number);
 	const across = all.filter((g) => !g.sameDocument).sort(order);
@@ -301,6 +312,8 @@ export interface IDocInfo {
 	size: number | null;
 	/** Its points in the sample. */
 	inSample: number;
+	/** Of those, the points the sampler drew (not pinned by include_keys). */
+	drawn: number;
 }
 
 /**
@@ -314,11 +327,16 @@ export interface IDocInfo {
 export function docInfo(sample: ISampleResult, rows: readonly IDocumentItem[] | null | undefined): Map<string, IDocInfo> {
 	const byId = new Map<string, IDocumentItem>();
 	for (const r of rows ?? []) byId.set(r.objectId, r);
+	const pinned = new Map<number, number>();
+	sample.points.doc.forEach((d, i) => {
+		if (sample.points.pinned[i]) pinned.set(d, (pinned.get(d) ?? 0) + 1);
+	});
 	const out = new Map<string, IDocInfo>();
-	for (const doc of sample.docs) {
+	sample.docs.forEach((doc, d) => {
 		const r = byId.get(doc.objectId);
-		out.set(doc.objectId, { objectId: doc.objectId, path: r?.path || doc.path, chunks: r?.chunks ?? doc.chunks, ingestedAt: r?.ingestedAt ?? null, size: r?.size ?? null, inSample: doc.in_sample });
-	}
+		const drawn = Math.max(0, doc.in_sample - (pinned.get(d) ?? 0));
+		out.set(doc.objectId, { objectId: doc.objectId, path: r?.path || doc.path, chunks: r?.chunks ?? doc.chunks, ingestedAt: r?.ingestedAt ?? null, size: r?.size ?? null, inSample: doc.in_sample, drawn });
+	});
 	return out;
 }
 
@@ -435,46 +453,65 @@ export function queueReducer(state: IQueueState, action: QueueAction): IQueueSta
 }
 
 /** What the sample shows about a group's documents (the note under a group that is not copies). */
-export type CopyVerdict = 'copies' | 'passages' | 'mixed' | 'sparse';
+export type CopyVerdict = 'copies' | 'passages' | 'mixed' | 'partial' | 'sparse';
 
 /**
- * What the sample shows about one document of a group. 'whole': at least
- * half of its chunks, as the store counts them, are sampled and in the
- * group, and more than one of them unless it has only one. 'own': most of
- * its sampled chunks are outside the group (text the others do not have).
- * 'unknown': neither, because too few of its chunks are in the sample or
- * the store did not count them; the sample's own ratio is not trusted then
- * (one sampled chunk that happens to be a shared footer reads "1 of 1").
+ * Fewest chunks of a document the sampler must have drawn, four in five of
+ * them in the group, for the sample alone to call the document a copy.
+ */
+export const COPY_EVIDENCE_MIN = 3;
+
+/**
+ * What the sample shows about one document of a group.
+ *
+ * 'whole', a copy, when either:
+ *   - at least half of its chunks, as the store counts them, are sampled and
+ *     in the group, and more than one of them unless it has only one; or
+ *   - the sampler drew at least COPY_EVIDENCE_MIN of its chunks in the group,
+ *     and four in five of its drawn chunks and of all its sampled chunks are
+ *     in the group. Pinned chunks (include_keys) are not drawn: a search for
+ *     a shared section pins exactly the chunks that match.
+ * 'own': most of its sampled chunks are outside the group (text the others
+ * do not have). 'few': neither, and the sampler drew fewer than
+ * COPY_EVIDENCE_MIN of its chunks (one sampled chunk that happens to be a
+ * shared footer reads "1 of 1"). 'partial': neither, with enough drawn: only
+ * part of what the sample holds of it is in the group.
  *
  * @param shared - Its points in the group.
+ * @param drawn - Its points in the group the sampler drew.
  * @param doc - The document.
  * @returns The verdict for the document.
  */
-function docVerdict(shared: number, doc: IDocInfo | undefined): 'whole' | 'own' | 'unknown' {
-	const inSample = doc?.inSample ?? 0;
-	if (inSample <= 0) return 'unknown';
+function docVerdict(shared: number, drawn: number, doc: IDocInfo | undefined): 'whole' | 'own' | 'few' | 'partial' {
+	if (!doc || doc.inSample <= 0) return 'few';
+	const { inSample } = doc;
 	if (shared * 2 < inSample) return 'own';
-	if (doc?.chunks === null || doc?.chunks === undefined) return 'unknown';
-	const total = Math.max(doc.chunks, inSample);
-	return shared * 2 >= total && (shared >= 2 || shared === total) ? 'whole' : 'unknown';
+	if (doc.chunks !== null) {
+		const total = Math.max(doc.chunks, inSample);
+		if (shared * 2 >= total && (shared >= 2 || shared === total)) return 'whole';
+	}
+	if (drawn >= COPY_EVIDENCE_MIN && drawn * 5 >= doc.drawn * 4 && shared * 5 >= inSample * 4) return 'whole';
+	return doc.drawn < COPY_EVIDENCE_MIN ? 'few' : 'partial';
 }
 
 /**
  * What a group is: 'copies' when every document is a whole copy (a policy
  * may choose); 'passages' when every document has most of its sampled
  * chunks elsewhere (shared text); 'mixed' when some do; 'sparse' when the
- * sample holds too few chunks of its documents to tell copies from shared
- * text (a boilerplate paragraph at the end of long files, sampled once each).
+ * sampler drew too few chunks of a document to tell copies from shared text
+ * (a boilerplate paragraph at the end of long files, sampled once each);
+ * 'partial' when enough is drawn but only part of a document matches.
  *
  * @param group - The group.
  * @param info - The documents.
  * @returns The verdict.
  */
-export function copyVerdict(group: Pick<IDocumentGroup, 'objectIds' | 'shared'>, info: ReadonlyMap<string, IDocInfo>): CopyVerdict {
-	const each = group.objectIds.map((id) => docVerdict(group.shared[id] ?? 0, info.get(id)));
+export function copyVerdict(group: Pick<IDocumentGroup, 'objectIds' | 'shared' | 'drawn'>, info: ReadonlyMap<string, IDocInfo>): CopyVerdict {
+	const each = group.objectIds.map((id) => docVerdict(group.shared[id] ?? 0, group.drawn[id] ?? 0, info.get(id)));
 	if (each.length > 0 && each.every((v) => v === 'whole')) return 'copies';
 	if (each.length > 0 && each.every((v) => v === 'own')) return 'passages';
-	return each.includes('own') ? 'mixed' : 'sparse';
+	if (each.includes('own')) return 'mixed';
+	return each.includes('few') || each.length === 0 ? 'sparse' : 'partial';
 }
 
 /**
@@ -488,7 +525,7 @@ export function copyVerdict(group: Pick<IDocumentGroup, 'objectIds' | 'shared'>,
  * @param info - The documents.
  * @returns True for copies.
  */
-export function isCopyGroup(group: Pick<IDocumentGroup, 'objectIds' | 'shared'>, info: ReadonlyMap<string, IDocInfo>): boolean {
+export function isCopyGroup(group: Pick<IDocumentGroup, 'objectIds' | 'shared' | 'drawn'>, info: ReadonlyMap<string, IDocInfo>): boolean {
 	return copyVerdict(group, info) === 'copies';
 }
 
@@ -499,7 +536,7 @@ export function isCopyGroup(group: Pick<IDocumentGroup, 'objectIds' | 'shared'>,
  * @param info - The documents.
  * @returns True when the group holds shared passages only.
  */
-export function isPassagesOnly(group: Pick<IDocumentGroup, 'objectIds' | 'shared'>, info: ReadonlyMap<string, IDocInfo>): boolean {
+export function isPassagesOnly(group: Pick<IDocumentGroup, 'objectIds' | 'shared' | 'drawn'>, info: ReadonlyMap<string, IDocInfo>): boolean {
 	return copyVerdict(group, info) === 'passages';
 }
 

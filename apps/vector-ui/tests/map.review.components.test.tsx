@@ -458,6 +458,40 @@ test('Recommend buttons: a chip removes its example, Clear removes all, Run runs
 	assert.deepEqual(query, [true]);
 });
 
+test('a group the sample holds enough of but that only partly matches says so; "too few chunks" is kept for too few', () => {
+	// Two 40-chunk files, 4 chunks of each sampled, 3 of them paired.
+	const docs: Array<[string, string, number]> = [
+		['pa', 'C:/corp/policy_a.md', 40],
+		['pb', 'C:/corp/policy_b.md', 40],
+	];
+	const points = [0, 0, 0, 0, 1, 1, 1, 1].map((doc, i) => ({ doc, chunk: [0, 9, 21, 35][i % 4] as number }));
+	const rows: Array<Array<[number, number]>> = [[[4, 0.996]], [[5, 0.996]], [[6, 0.996]], [], [[0, 0.996]], [[1, 0.996]], [[2, 0.996]], []];
+	const knn: IKnnBlock = { k: 1, offsets_row: [0], cols: [], sims: [] };
+	for (const r of rows) {
+		for (const [j, s] of r) {
+			knn.cols.push(j);
+			knn.sims.push(s);
+		}
+		knn.offsets_row.push(knn.cols.length);
+	}
+	const base = small();
+	const partly: ISampleResult = {
+		...base,
+		n: 8,
+		n_requested: 8,
+		docs: docs.map(([objectId, path, chunks], i) => ({ i, objectId, path, chunks, in_sample: 4 })),
+		points: { doc: points.map((p) => p.doc), chunk: points.map((p) => p.chunk), x: points.map(() => 0), y: points.map(() => 0), len: points.map(() => 90), snip: points.map(() => 'text'), pinned: points.map(() => 0) },
+		knn,
+		density: points.map(() => 0.5),
+	};
+	const out = html(<DuplicatesPanel sample={modelOf(partly)} writes={on} onSelect={noop} onRemoveDocument={noop} onRemoveDocuments={noop} initial={{ policy: 'shortest-path' }} />);
+	assert.match(out, /3 of 4 sampled chunks match/);
+	assert.match(out, /Only part of what this sample holds of these documents matches the others; they may hold text the others do not\./);
+	assert.doesNotMatch(out, /too few chunks/);
+	assert.match(out, /A keep policy leaves this group alone/);
+	assert.match(out, /role="status"[^>]*>No document queued/);
+});
+
 test('another connection starts a fresh duplicates queue (its choices are keyed by the connection)', () => {
 	const a = DuplicatesPanel({ sample: SMALL, writes: on, onSelect: noop, onRemoveDocument: noop, connectionKey: 'conn-a' });
 	const b = DuplicatesPanel({ sample: SMALL, writes: on, onSelect: noop, onRemoveDocument: noop, connectionKey: 'conn-b' });
