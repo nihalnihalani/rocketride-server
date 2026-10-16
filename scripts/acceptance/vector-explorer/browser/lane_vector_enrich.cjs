@@ -45,9 +45,10 @@
  *     chunk in the top 12, a falcon or kestrel chunk first, examples
  *     excluded; Best score is native on Qdrant only
  *   matrix (P1-2): one group of at most 100 points with two chunks of one
- *     document, shown alone and lassoed: the keys are sent (never indices),
- *     the matrix is symmetric with a unit diagonal, same-document pairs above
- *     0.5; its CSV (through the map's Export menu) has n rows
+ *     document, shown alone and lassoed: the selection's keys are sent (never
+ *     indices), each a point of the group; the matrix is symmetric with a unit
+ *     diagonal, same-document pairs above 0.5; its CSV (through the map's
+ *     Export menu) has n rows
  *   export (P0-6): the lasso selection's CSV has its rows and keys, carries no
  *     vector or secret; the map PNG is over 10 KB, drawn, named after the
  *     collection
@@ -514,7 +515,7 @@ function bestScoreVerdict({ capability, answer }) {
 
 /**
  * The matrix step's verdict: the selection's keys were sent (no indices, no sample id), one per
- * selected point and each a point of the selected documents; the answer is n x n, symmetric, with a
+ * selected point and each one of `allowed` (the points the lasso could select); the answer is n x n, symmetric, with a
  * unit diagonal on cosine; pairs of one document average above 0.5.
  */
 function matrixVerdict({ input, answer, selected, allowed }) {
@@ -524,7 +525,7 @@ function matrixVerdict({ input, answer, selected, allowed }) {
 	if (sent.size !== input.keys.length) return 'the request names a key twice';
 	if (sent.size !== selected) return `the request's ${sent.size} keys are not the ${selected} selected points`;
 	const stray = [...sent].filter((k) => !allowed.has(k));
-	if (stray.length) return `${stray.length} keys sent are not points of the selected documents (${stray[0]})`;
+	if (stray.length) return `${stray.length} keys sent are not points the lasso could select (${stray[0]})`;
 	if (!answer || answer.success !== true) return `similarity_matrix answered ${JSON.stringify(answer).slice(0, 200)}`;
 	const m = answer.matrix;
 	const n = answer.n;
@@ -789,18 +790,38 @@ function keywordVerdict({ input, answer, firstRow }) {
 }
 
 /** The threshold slider: at 0.6 fewer rows pass than at 0.3, out of the same rows, and the copied setting is the slider's value. */
-function thresholdVerdict({ low, high, copied }) {
+function thresholdVerdict({ low, high, copied, at = { low: 0.3, high: 0.6 } }) {
 	const parse = (t) => {
 		const m = UI.search.passing.exec(t || '');
 		return m ? { at: Number(m[1]), passing: count(m[2]), of: count(m[3]) } : null;
 	};
 	const a = parse(low);
 	const b = parse(high);
+	const lo = at.low.toFixed(2);
+	const hi = at.high.toFixed(2);
 	if (!a || !b) return `no passing count at both positions (${JSON.stringify([low, high])})`;
-	if (a.at !== 0.3 || b.at !== 0.6) return `the slider read ${a.at} and ${b.at}, not 0.30 and 0.60`;
-	if (a.of !== b.of) return `${a.of} rows at 0.3, ${b.of} at 0.6`;
-	if (!(b.passing < a.passing)) return `${b.passing} pass at 0.6, ${a.passing} at 0.3`;
-	return copied === 'threshold_search: 0.60' ? true : `Copy as node setting copied ${JSON.stringify(copied)}`;
+	if (a.at.toFixed(2) !== lo || b.at.toFixed(2) !== hi) return `the slider read ${a.at} and ${b.at}, not ${lo} and ${hi}`;
+	if (a.of !== b.of) return `${a.of} rows at ${lo}, ${b.of} at ${hi}`;
+	if (!(b.passing < a.passing)) return `${b.passing} pass at ${hi}, ${a.passing} at ${lo}`;
+	return copied === `threshold_search: ${hi}` ? true : `Copy as node setting copied ${JSON.stringify(copied)}`;
+}
+
+/**
+ * The slider positions the threshold step uses, from the scores the search answered: low passes
+ * every row (0.30, or the lowest score's two-decimal floor when a row scores under 0.30), high is the
+ * first two-decimal value above the median score and above the lowest, so at least one row fails
+ * there. null without a scored row.
+ */
+function thresholdPositions(scores) {
+	const s = (scores || []).filter((v) => typeof v === 'number' && Number.isFinite(v)).sort((x, y) => x - y);
+	if (!s.length) return null;
+	// In hundredths (a score of 0.69 is 69, not 68.99...).
+	const hundredths = (v) => Math.floor(v * 100 + 1e-6);
+	const min = hundredths(s[0]);
+	const median = hundredths(s[Math.floor(s.length / 2)]);
+	const low = Math.min(30, min) / 100;
+	const high = Math.min(100, Math.max(median, min) + 1) / 100;
+	return { low, high };
 }
 
 /** Compare: the summary's shared count and Jaccard are the two answers', and the map draws both stars. */
@@ -987,6 +1008,8 @@ async function main(fixtureKey, base, out) {
 		const box = await canvas.boundingBox();
 		if (!box) throw new Error('the map canvas has no size');
 		const lasso = toolbar.getByRole('button', { name: MAP.lasso }).first();
+		// What the canvas counted before: a reading equal to it may be the earlier selection, not this lasso's.
+		const before = await C.attrInt(canvas, MAP.attr.selection);
 		await lasso.click();
 		// The lasso's corners stay inside the canvas (2 px in).
 		const right = box.x + Math.min(box.width * share, box.width - 2);
@@ -996,10 +1019,13 @@ async function main(fixtureKey, base, out) {
 			[right, box.y + box.height - 2],
 			[box.x + 2, box.y + box.height - 2],
 		]);
-		const selected = await poll(
+		await poll(
 			() => C.attrInt(canvas, MAP.attr.selection),
-			(v) => v !== null && v > 0
+			(v) => v !== null && v > 0 && v !== before,
+			5000
 		);
+		await C.sleep(300);
+		const selected = await C.attrInt(canvas, MAP.attr.selection);
 		await lasso.click();
 		return selected;
 	};
@@ -1077,6 +1103,28 @@ async function main(fixtureKey, base, out) {
 		const opens = visible(page.getByRole('list', { name: CONSOLE.sources }).last()).getByRole('button', { name: CONSOLE.sourceOpen });
 		const labels = await opens.evaluateAll((els) => els.map((el) => el.getAttribute('aria-label') || '')).catch(() => []);
 		return (Array.isArray(labels) ? labels : []).map((l) => (CONSOLE.sourceTarget.exec(l) || [])[1]).filter(Boolean);
+	};
+	/** The duplicates panel as marked: each group's documents (its Keep radios), which are kept and queued, and its data-queued count. */
+	const readQueue = async (section) => {
+		const marked = await section.locator('fieldset[data-group]').evaluateAll((sets) =>
+			sets.map((fs) =>
+				[...fs.querySelectorAll('input[type="radio"]')].map((r) => {
+					const label = r.closest('label');
+					return {
+						path: (r.getAttribute('aria-label') || '').replace(/^Keep /, ''),
+						kept: r.checked,
+						queued: label ? [...label.querySelectorAll('span')].some((tag) => (tag.textContent || '').trim() === 'queued') : false,
+					};
+				})
+			)
+		);
+		const all = (Array.isArray(marked) ? marked : []).flat();
+		return {
+			groups: (Array.isArray(marked) ? marked : []).map((g) => g.map((d) => d.path)).filter((g) => g.length),
+			keptPaths: all.filter((d) => d.kept).map((d) => d.path),
+			queuedPaths: all.filter((d) => d.queued).map((d) => d.path),
+			queuedCount: count(String((await C.attrText(section, 'data-queued')) ?? '')),
+		};
 	};
 	/** Add a Folder is under condition; the documents answer the directory asked for with it. */
 	const scopeToFolder = async (prefix) => {
@@ -1378,7 +1426,7 @@ async function main(fixtureKey, base, out) {
 			return bestScoreVerdict({ capability, answer });
 		});
 
-		await step(page, 'matrix (P1-2): one group shown alone and lassoed sends its keys; symmetric, unit diagonal, same-document pairs above 0.5; its CSV has n rows', async (note) => {
+		await step(page, "matrix (P1-2): a lasso over one group shown alone sends the selection's keys; symmetric, unit diagonal, same-document pairs above 0.5; its CSV has n rows", async (note) => {
 			if (!sample) return 'no sample';
 			// A group of at most MATRIX_MAX points holding two chunks of one document: shown alone, then lassoed whole.
 			const group = matrixCluster(sample);
@@ -1395,16 +1443,19 @@ async function main(fixtureKey, base, out) {
 			);
 			const since = capture.frames.length;
 			const selected = await lassoLeft(1);
-			if (shown !== group.size || selected !== group.size) {
+			// Only the group's points can be selected while it is shown alone (the lasso may take fewer than all of them).
+			if (shown !== group.size || !(selected >= 2 && selected <= group.size)) {
 				await button(UI.map.showAll, map).click();
-				return `Show only cluster ${group.cluster + 1} shows ${shown} points and the lasso over them selects ${selected}; the group has ${group.size}`;
+				return `Show only cluster ${group.cluster + 1} shows ${shown} points (${group.size} in the group) and the lasso over them selects ${selected}`;
 			}
 			await sideTab(UI.map.tabs.selection);
 			const panel = visible(map.locator(UI.matrix.panel));
 			const x = await C.waitForExchange(capture, 'similarity_matrix', { since, timeout: 60000 });
-			const docs = new Set((x.input.keys || []).map((k) => k[0]));
+			// Every key sent must be a point of the group.
 			const allowed = new Set();
-			for (let i = 0; i < sample.n; i += 1) if (docs.has(objectIdOf(sample, i))) allowed.add(keyText(keyOf(sample, i)));
+			sample.clusters.labels.forEach((label, i) => {
+				if (label === group.cluster) allowed.add(keyText(keyOf(sample, i)));
+			});
 			const verdict = matrixVerdict({ input: x.input, answer: x.result, selected, allowed });
 			// Export CSV puts the matrix in the map's Export menu.
 			await poll(
@@ -1483,26 +1534,7 @@ async function main(fixtureKey, base, out) {
 			const section = visible(map.getByRole('region', { name: UI.dedupe.section }));
 			await section.waitFor({ timeout: 15000 });
 			await combo(UI.dedupe.policy, section).selectOption(UI.dedupe.shortestPath);
-			// Each group's documents (its Keep radios), which are kept, and which the panel marks queued.
-			const marked = await section.locator('fieldset[data-group]').evaluateAll((sets) =>
-				sets.map((fs) =>
-					[...fs.querySelectorAll('input[type="radio"]')].map((r) => ({
-						path: (r.getAttribute('aria-label') || '').replace(/^Keep /, ''),
-						kept: r.checked,
-						queued: [...((r.closest('label') || {}).querySelectorAll ? r.closest('label').querySelectorAll('span') : [])].some((tag) => (tag.textContent || '').trim() === 'queued'),
-					}))
-				)
-			);
-			const groups = (Array.isArray(marked) ? marked : []).map((g) => g.map((d) => d.path)).filter((g) => g.length);
-			const keptPaths = (Array.isArray(marked) ? marked : [])
-				.flat()
-				.filter((d) => d.kept)
-				.map((d) => d.path);
-			const queuedPaths = (Array.isArray(marked) ? marked : [])
-				.flat()
-				.filter((d) => d.queued)
-				.map((d) => d.path);
-			const queuedCount = count(String((await C.attrText(section, 'data-queued')) ?? ''));
+			const { groups, keptPaths, queuedPaths, queuedCount } = await readQueue(section);
 			// What Remove all queued must remove: the documents the panel queued.
 			queued = queuedPaths.map((p) => ({ path: p, objectId: C.objectId(p) }));
 			const since = capture.frames.length;
@@ -1690,18 +1722,21 @@ async function main(fixtureKey, base, out) {
 			return keywordVerdict({ input: x.input, answer: x.result, firstRow });
 		});
 
-		await step(page, 'search: the threshold slider passes fewer at 0.6 than at 0.3; Copy as node setting copies the value', async (note) => {
+		await step(page, 'search: the threshold slider passes fewer rows above the median score than at the lowest; Copy as node setting copies the value', async (note) => {
 			const panel = await searchPanel();
-			await runSearch(panel, UI.search.mode.semantic, E.WATER_QUESTION);
+			const x = await runSearch(panel, UI.search.mode.semantic, E.WATER_QUESTION);
+			// Two positions from the answer's own scores: one every row passes, one above the median.
+			const at = thresholdPositions((x.result && Array.isArray(x.result.results) ? x.result.results : []).map((r) => r.score));
+			if (!at) return `the search answered no scored rows (${JSON.stringify(x.result).slice(0, 160)})`;
 			const slider = visible(panel.getByRole('slider', { name: UI.search.threshold }));
-			await setSlider(slider, '0.3');
+			await setSlider(slider, at.low.toFixed(2));
 			const low = (UI.search.passing.exec(await C.textOf(panel)) || [''])[0];
-			await setSlider(slider, '0.6');
+			await setSlider(slider, at.high.toFixed(2));
 			const high = (UI.search.passing.exec(await C.textOf(panel)) || [''])[0];
 			await button(UI.search.copySetting, panel).click();
 			const copied = await page.evaluate(() => navigator.clipboard.readText()).catch(() => null);
-			note({ low, high, copied });
-			return thresholdVerdict({ low, high, copied });
+			note({ at, low, high, copied });
+			return thresholdVerdict({ low, high, copied, at });
 		});
 
 		await step(page, 'search: Compare reports the shared results and the map draws both stars', async (note) => {
@@ -1718,6 +1753,7 @@ async function main(fixtureKey, base, out) {
 			const runs = C.exchanges(capture, 'search', since).filter((x) => x.response);
 			const summary = (UI.search.compareSummary.exec(await C.textOf(panel)) || [''])[0];
 			// The comparison tells the map both questions; the map then places a star for each.
+			const shown = capture.frames.length;
 			await button(UI.search.showBoth, panel).click();
 			await C.switchView(page, CONSOLE.mapTab);
 			const starA = await poll(
@@ -1730,7 +1766,9 @@ async function main(fixtureKey, base, out) {
 				(v) => v === 'placed',
 				30000
 			);
-			note({ summary, runs: runs.length, starA, starB });
+			// What the map asked for after "Show A and B on the map" (star B needs an embed, a project and a search of B).
+			const asked = Object.fromEntries(['embed', 'project', 'search'].map((tool) => [tool, C.exchanges(capture, tool, shown).length]));
+			note({ summary, runs: runs.length, starA, starB, askedAfterShow: asked, legend: (await C.textOf(visible(map.getByRole('region', { name: MAP.legend })))).slice(0, 300) });
 			return compareVerdict({ a: runs[0] && runs[0].result, b: runs[1] && runs[1].result, summary, starA, starB });
 		});
 
@@ -1769,6 +1807,11 @@ async function main(fixtureKey, base, out) {
 			await C.switchView(page, CONSOLE.mapTab);
 			await sideTab(UI.map.tabs.duplicates);
 			const section = visible(map.getByRole('region', { name: UI.dedupe.section }));
+			// The queue belongs to the sample on screen, and the scope steps drew others since: choose the policy again.
+			await combo(UI.dedupe.policy, section).selectOption(UI.dedupe.shortestPath);
+			const now = await readQueue(section);
+			queued = now.queuedPaths.map((p) => ({ path: p, objectId: C.objectId(p) }));
+			if (!queued.length || now.queuedCount !== queued.length) return `after choosing Keep shortest path again the panel marks ${queued.length} documents queued and counts ${now.queuedCount}`;
 			const before = await stats();
 			const chunksOf = {};
 			for (const q of queued) {
@@ -2062,6 +2105,7 @@ module.exports = {
 	listingVerdict,
 	keywordVerdict,
 	thresholdVerdict,
+	thresholdPositions,
 	compareVerdict,
 	layoutVerdict,
 	ingestVerdict,

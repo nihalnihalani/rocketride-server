@@ -416,6 +416,24 @@ test('csvTable reads past the byte-order mark the app writes first', () => {
 	assert.strictEqual(lane.csvTable('\uFEFFobjectId,chunkId\r\na,1\r\n').rows.length, 1);
 });
 
+test("thresholdPositions and thresholdVerdict: positions from the answer's scores, every row passing at the first and fewer at the second", () => {
+	// Scores all above 0.6 (no row fails at 0.60): low stays 0.30, high goes above the median.
+	assert.deepStrictEqual(lane.thresholdPositions([0.71, 0.66, 0.68, 0.74, 0.69]), { low: 0.3, high: 0.7 });
+	// A row under 0.30: low drops to its floor so every row passes there.
+	assert.deepStrictEqual(lane.thresholdPositions([0.25, 0.4, 0.5]), { low: 0.25, high: 0.41 });
+	// One score: high is above it.
+	assert.deepStrictEqual(lane.thresholdPositions([0.55]), { low: 0.3, high: 0.56 });
+	assert.strictEqual(lane.thresholdPositions([]), null);
+	assert.strictEqual(lane.thresholdPositions([null, 'x']), null);
+	const at = { low: 0.3, high: 0.7 };
+	const low = 'At 0.30: 5 of 5 would pass (the store node has no threshold set)';
+	const high = 'At 0.70: 2 of 5 would pass (the store node has no threshold set)';
+	assert.strictEqual(lane.thresholdVerdict({ low, high, copied: 'threshold_search: 0.70', at }), true);
+	assert.notStrictEqual(lane.thresholdVerdict({ low, high: 'At 0.70: 5 of 5 would pass', copied: 'threshold_search: 0.70', at }), true, 'no fewer at high');
+	assert.notStrictEqual(lane.thresholdVerdict({ low, high, copied: 'threshold_search: 0.60', at }), true, 'another value copied');
+	assert.notStrictEqual(lane.thresholdVerdict({ low, high: high.replace('0.70', '0.60'), copied: 'threshold_search: 0.70', at }), true, 'the slider did not move there');
+});
+
 test('hoverEdgePixels: what the hover adds over its edges is the overlay difference with the edges on less the one with them off', () => {
 	// The ring alone adds 60 pixels; with the edges on the hover also draws its thicker edges (140 pixels).
 	assert.strictEqual(lane.hoverEdgePixels({ withEdges: { away: 10, over: 210 }, without: { away: 10, over: 70 } }), 140);
