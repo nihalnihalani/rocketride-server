@@ -188,6 +188,8 @@ const UI = {
 		clusterRowSize: /([\d,]+) points? · ([\d,]+) documents?/,
 		noiseRowSize: /([\d,]+) points? in no group/,
 		ramp: /^Colour ramp from .*\((\d{4}-\d{2}-\d{2})\) to .*\((\d{4}-\d{2}-\d{2})\)$/,
+		// The toolbar's busy line (a status, beside other status lines such as the Export menu's): the BUSY wording of map/wording.ts.
+		busy: /^(?:Sampling|Laying out|Embedding|Placing the query|Finding neighbours)…/,
 		isolate: /^Isolate$/,
 		expandRing: /^Expand by neighbours$/,
 		showAll: /^Show all$/,
@@ -1007,6 +1009,43 @@ function thresholdPositions(scores) {
 	return { low, high };
 }
 
+/** The map's busy line among the toolbar's status lines ('' while the map is idle). */
+function mapBusy(texts) {
+	return (Array.isArray(texts) ? texts : [])
+		.map((t) => String(t || '').trim())
+		.filter((t) => UI.map.busy.test(t))
+		.join('; ');
+}
+
+/**
+ * One connection's map calls in `capture` (the requests sent with its Tools task token; each open
+ * connection has a map of its own): the answer to its last sample request ({ index, n, scoped,
+ * success, code }, null while that request is unanswered) and its calls still unanswered: that
+ * sample request however old, its project, search and neighbors calls sent since frame `since`,
+ * and any embed sent since then (the map embeds through another task).
+ */
+function mapCalls(capture, since, token) {
+	if (!token) return { sample: null, pending: [] };
+	const tokenOf = (x) => (x.request && ((x.request.arguments && x.request.arguments.token) || x.request.token)) || null;
+	const mine = (x) => tokenOf(x) === token;
+	const samples = C.exchanges(capture, 'sample').filter(mine);
+	const last = samples.length ? samples[samples.length - 1] : null;
+	const pending = [
+		...C.exchanges(capture, 'embed', since)
+			.filter((x) => !x.response)
+			.map(() => 'embed'),
+		...['project', 'search', 'neighbors'].flatMap((tool) =>
+			C.exchanges(capture, tool, since)
+				.filter((x) => mine(x) && !x.response)
+				.map(() => tool)
+		),
+	];
+	if (last && !last.response) pending.unshift('sample');
+	const result = last && last.response ? last.result : null;
+	const sample = last && last.response ? { index: last.index, n: result && typeof result.n === 'number' ? result.n : null, scoped: !!(last.input.filter && last.input.filter.object_ids), success: !!result && result.success !== false, code: (result && result.code) || null } : null;
+	return { sample, pending };
+}
+
 /**
  * Whether the map is settled (a reading of mapReading in the lane): its root says it holds a sample
  * (data-map-state 'ready'), the toolbar shows no busy line, none of the map's calls is in flight,
@@ -1330,40 +1369,36 @@ async function drive(fixtureKey, base, out, planned, step) {
 		}
 	};
 	/**
-	 * What the map holds now (judged by mapSettledVerdict): its root's data-map-state, the toolbar's
-	 * busy line (its status, there only while the map samples, embeds, places a query or lays out),
-	 * the map's calls sent since frame `since` with no answer yet, the page's last sample request
-	 * ({ index, n, scoped, success, code }, its answer's), the points it shows, both stars and the legend.
+	 * What the map in front holds now (judged by mapSettledVerdict): its root's data-map-state, the
+	 * toolbar's busy line (mapBusy), its connection's calls (mapCalls, by the Tools task `token`:
+	 * the last sample answer and the calls in flight since frame `since`), the points it shows,
+	 * both stars and the legend.
 	 */
-	const mapReading = async (since) => {
-		const requests = C.exchanges(capture, 'sample');
-		const last = requests.length ? requests[requests.length - 1] : null;
-		const status = toolbar.getByRole('status');
-		const busy = (await status.count().catch(() => 0)) > 0 ? await C.textOf(status.first()) : '';
-		const pending = ['embed', 'project', 'search', 'neighbors'].flatMap((tool) =>
-			C.exchanges(capture, tool, since)
-				.filter((x) => !x.response)
-				.map(() => tool)
-		);
-		if (last && !last.response) pending.unshift('sample');
-		const result = last && last.result;
+	const mapReading = async (since, token) => {
+		const statuses = await toolbar
+			.getByRole('status')
+			.allTextContents()
+			.catch(() => []);
+		const calls = mapCalls(capture, since, token);
 		return {
 			state: await attr('data-map-state'),
-			busy,
-			pending,
-			sample: last && last.response ? { index: last.index, n: result && typeof result.n === 'number' ? result.n : null, scoped: !!(last.input.filter && last.input.filter.object_ids), success: !!result && result.success !== false, code: (result && result.code) || null } : null,
+			busy: mapBusy(statuses),
+			pending: calls.pending,
+			sample: calls.sample,
 			shown: await attrInt(UI.map.attr.shown),
 			queryA: await attr(UI.map.attr.queryState),
 			queryB: await attr(UI.map.attr.queryBState),
 			legend: await C.textOf(visible(map.getByRole('region', { name: MAP.legend }))),
 		};
 	};
-	/** Read the map until mapSettledVerdict(reading, expect) holds, or until `timeout`: { reading, verdict }. */
+	/** Read the demo fixture's map until mapSettledVerdict(reading, expect) holds, or until `timeout`: { reading, verdict }. */
 	const awaitMap = async (expect, since, timeout = 120000) => {
 		const deadline = Date.now() + timeout;
+		if (capture.sockets === 0) throw new Error('the page opened no WebSocket');
+		const token = await store.tokenOf(fixture, 'tools_1');
 		for (;;) {
 			if (capture.sockets === 0) throw new Error('the page opened no WebSocket');
-			const reading = await mapReading(since);
+			const reading = await mapReading(since, token);
 			const verdict = mapSettledVerdict(reading, expect);
 			if (verdict === true || Date.now() > deadline) return { reading, verdict };
 			await C.sleep(250);
@@ -2590,6 +2625,8 @@ module.exports = {
 	thresholdVerdict,
 	thresholdPositions,
 	compareVerdict,
+	mapBusy,
+	mapCalls,
 	mapSettledVerdict,
 	layoutVerdict,
 	ingestVerdict,

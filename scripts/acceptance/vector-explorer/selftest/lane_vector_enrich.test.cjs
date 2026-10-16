@@ -1159,6 +1159,48 @@ test('keywordVerdict, thresholdVerdict, compareVerdict, layoutVerdict: the searc
 	assert.notStrictEqual(lane.layoutVerdict({ before: null, after: 0.55 }), true);
 });
 
+test("mapBusy: only the map's own busy line counts, not the toolbar's other status lines", () => {
+	assert.strictEqual(lane.mapBusy([]), '');
+	assert.strictEqual(lane.mapBusy(['Saved vector-explorer_vx_demo_docs_map_20261016-2146.png.']), '', "the Export menu's status");
+	assert.strictEqual(lane.mapBusy(['Sampling…']), 'Sampling…');
+	assert.strictEqual(lane.mapBusy(['Saved x.png.', 'Laying out… 40%']), 'Laying out… 40%');
+	for (const t of ['Embedding…', 'Placing the query…']) assert.strictEqual(lane.mapBusy([t]), t);
+	assert.strictEqual(lane.mapBusy(null), '');
+});
+
+test("mapCalls: the sample and the calls in flight are those of the map in front (its connection's token), not another connection's", () => {
+	let seq = 0;
+	const frames = [];
+	/** A tool request on `token`, answered with `result` unless it is undefined. */
+	const call = (token, tool, input, result) => {
+		seq += 1;
+		frames.push({ dir: 'sent', msg: { type: 'request', seq, command: 'rrext_process', arguments: { subcommand: 'tool', tool, nodeId: 'store_1', input, token } } });
+		if (result !== undefined) frames.push({ dir: 'received', msg: { type: 'response', request_seq: seq, body: { result } } });
+	};
+	call('demo', 'sample', { n: 1000 }, { success: true, n: 308 });
+	const demoAt = frames.length - 2;
+	call('card', 'sample', { n: 1000 }, { success: true, n: 600 });
+	const capture = { frames, sockets: 1 };
+	assert.deepStrictEqual(lane.mapCalls(capture, 0, 'demo'), { sample: { index: demoAt, n: 308, scoped: false, success: true, code: null }, pending: [] });
+	assert.strictEqual(lane.mapCalls(capture, 0, 'card').sample.n, 600);
+	// Another map's call in flight does not hold this one up; this map's own does.
+	call('card', 'project', { sample_id: 's' }, undefined);
+	assert.deepStrictEqual(lane.mapCalls(capture, 0, 'demo').pending, []);
+	call('demo', 'search', { top_k: 10 }, undefined);
+	assert.deepStrictEqual(lane.mapCalls(capture, 0, 'demo').pending, ['search']);
+	assert.deepStrictEqual(lane.mapCalls(capture, frames.length, 'demo').pending, [], 'only the calls sent since the mark');
+	// A sample request still unanswered is in flight however old, and is the map's last sample.
+	call('demo', 'sample', { n: 1000, filter: { object_ids: ['o-1'] } }, undefined);
+	const late = lane.mapCalls(capture, frames.length, 'demo');
+	assert.deepStrictEqual(late.pending, ['sample']);
+	assert.strictEqual(late.sample, null);
+	// A refused sample is its last one, refused.
+	frames.push({ dir: 'received', msg: { type: 'response', request_seq: seq, body: { result: { success: false, code: 'BUSY' } } } });
+	assert.deepStrictEqual(lane.mapCalls(capture, 0, 'demo').sample, { index: frames.length - 2, n: null, scoped: true, success: false, code: 'BUSY' });
+	// No token: nothing is this map's.
+	assert.deepStrictEqual(lane.mapCalls(capture, 0, null), { sample: null, pending: [] });
+});
+
 test('mapSettledVerdict: the map is settled when its last sample request is answered and drawn whole, it is not busy, and none of its calls is in flight', () => {
 	assert.strictEqual(lane.mapSettledVerdict(mapReading(), {}), true);
 	assert.strictEqual(lane.mapSettledVerdict(mapReading(), { scoped: false, n: 308, after: 39, sampleIndex: 40 }), true);
@@ -1334,6 +1376,10 @@ const SOURCES = [
 	['E5', 'map/colours.ts', "'ingest-date'", ["label: 'Cluster'", "label: 'Ingest date'", 'oldest (${', 'newest (${']],
 	['E5', 'components/Legend.tsx', 'Colour ramp from', ['Colour ramp from ${']],
 	['E5', 'map/wording.ts', 'listingNote', ['Sampled from the first ${num(listing.documents)} documents by path; the collection has more']],
+	// A settled map (mapSettledVerdict): the root's state, the toolbar's busy line and its wording, the legend's sample line and star B.
+	['E5', 'views/MapView.tsx', 'data-edge-mode', ["data-map-state={sample ? 'ready'", 'Hollow star: "${queryB.text}" (compared in Search)']],
+	['E5', 'components/MapToolbar.tsx', 'aria-label="Edges per point"', ['<span role="status" style={MAP_STYLES.small}>', '{props.busy}']],
+	['E5', 'map/wording.ts', 'listingNote', ["sampling: 'Sampling…'", "layout: 'Laying out…'", "embedding: 'Embedding…'", "projecting: 'Placing the query…'", "neighbours: 'Finding neighbours…'", 'Showing ${num(sample.n)} of ${num(of)} chunks']],
 	['E6', 'components/DuplicatesPanel.tsx', 'Near-duplicate review', ['data-threshold', 'data-group={group.id}', 'type="radio"', 'aria-label={`Keep ${path}`}', 'Show group', 'min={THRESHOLD_MIN}', 'step={THRESHOLD_STEP}']],
 	['E6', 'map/reviewWording.ts', 'removeAllLabel', ['Remove all queued (${', "'shortest-path'"]],
 	['E6', 'components/OutliersPanel.tsx', 'data-component="OutliersPanel"', ['Remove document', '<select', 'aria-label="Outliers"']],
