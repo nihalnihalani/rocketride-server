@@ -329,6 +329,32 @@ stores, `vector-ui:e2e-live` runs it only when `VECTOR_UI_E2E_LANES` names it
 (`enrich`; the default run and `all` leave it out), once per backend of
 `VECTOR_UI_E2E_BACKENDS`.
 
+A run accounts for every step it plans (`stepsFor`, each named through
+`STEP_TITLES`): a step it never reached, because sign-in timed out or the
+browser did not start, records FAIL with the error, and so does the run in a
+`lane` row. Run by `vector-ui:e2e-live`, a backend whose child exited non-zero,
+wrote no result, or recorded fewer rows than it planned fails, so a backend
+cannot drop out of a run that reports every step passing.
+
+The steps that read the map after something has made it sample again read it
+settled, from the app's own signals and never from a quiet period: the map root
+holds a sample (`data-map-state="ready"`), the toolbar shows none of the map's
+busy wording (Sampling…, Embedding…, Placing the query…; the Export menu's
+status beside it does not count), the last `sample` request of the map's own
+connection (each open connection has a map of its own; its requests carry
+that connection's Tools task token) is answered and is what the map draws
+whole (`data-shown` and the legend's "Showing N of …" are its n), and none of
+the map's `embed`, `project`, `search` or `neighbors` calls is unanswered. After
+the scope step's last Clear, the map, shown again, must settle on a sample
+asked for after the Clear, unscoped and as large as the clusters step's.
+Compare first settles the map on that unscoped sample, then clicks Show A and
+B; once both stars are placed it reads the map again when it has settled: both
+stars still placed, the legend naming star B's question, on the same sample.
+The restore step removes on the page the uploads the store holds, then removes
+through the store whatever the page left behind (an upload it could not remove
+still fails the step), so a failed run does not leave the next one a changed
+corpus.
+
 The lane finds the enrichment's controls by the names and data hooks the app
 gives them (its `UI` table). The self-test checks each of them, and the wording
 the steps read, against the code of the app's source files (comment lines left

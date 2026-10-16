@@ -106,9 +106,11 @@
  *
  * A settled map (mapSettledVerdict) is read from the app's own signals, never
  * from a quiet period: the root holds a sample (data-map-state 'ready'), the
- * toolbar shows no busy line, the page's last sample request is answered and is
- * what the map draws whole (data-shown and the legend's "Showing N of …"), and
- * none of the map's embed, project, search or neighbors calls is unanswered.
+ * toolbar shows none of the map's busy wording (mapBusy), the last sample
+ * request of the map's own connection (mapCalls: its Tools task token) is
+ * answered and is what the map draws whole (data-shown and the legend's
+ * "Showing N of …"), and none of the map's embed, project, search or neighbors
+ * calls is unanswered.
  *
  * Selectors and wording: UI below (the enrichment's controls), ui.cjs for the
  * console and map controls of the earlier lanes.
