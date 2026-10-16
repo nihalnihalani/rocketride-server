@@ -376,7 +376,7 @@ test('a document kept by hand in a group marked reviewed is not queued by anothe
 	assert.deepEqual(q.conflicts, ['B']);
 });
 
-test("a policy queues only a document the sample shows the kept one holds; shared passages queue nothing, a hand-picked keep still queues and says so", () => {
+test('a policy queues only a document the sample shows the kept one holds; shared passages queue nothing, a hand-picked keep still queues and says so', () => {
 	// D#0 shares one paragraph with E#0, but each has three more sampled chunks of its own.
 	const passages = sampleOf(
 		[
@@ -636,7 +636,14 @@ function drawnSample(docs: readonly IDrawnDoc[], twin: (d: number, c: number) =>
 		}
 		return out;
 	});
-	return { ...sampleOf(docs.map((doc) => [doc.objectId, doc.path, doc.chunks]), points, rows), ...extra };
+	return {
+		...sampleOf(
+			docs.map((doc) => [doc.objectId, doc.path, doc.chunks]),
+			points,
+			rows
+		),
+		...extra,
+	};
 }
 
 /** Chunk c of the copy (document 0) is chunk c of the original (document 1), for c < `upTo`. */

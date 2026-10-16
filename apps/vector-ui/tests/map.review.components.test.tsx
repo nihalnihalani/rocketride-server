@@ -760,7 +760,7 @@ test("the map runs Recommend on the store node and keeps the examples in the con
 	assert.match(element(view, 'RecommendPanel'), /onRun=\{/);
 	assert.match(view, /runRecommendCall\(|callRecommend\(/, "Recommend reaches the store's recommend tool");
 	assert.match(view, /recallExamples\(recommendExamples, |recommendExamples\.get\(/, "the examples are read from the connection's cache");
-	assert.match(view, /rememberExamples\(recommendExamples, |recommendExamples\.set\(/, "and kept there");
+	assert.match(view, /rememberExamples\(recommendExamples, |recommendExamples\.set\(/, 'and kept there');
 });
 
 test('the inspector gets the full text with its loader, its connection and the query whose words it marks, Add as example with its side, and the tree neighbours', { skip: NEEDS_MAP }, () => {
