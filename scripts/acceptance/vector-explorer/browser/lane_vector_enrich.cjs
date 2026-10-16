@@ -22,7 +22,9 @@
  * the corpus is as it was.
  *
  * Steps (each records PASS/FAIL, what it measured, and a screenshot; only an
- * explicit `true` passes). "The page's answer" is the tool answer the page
+ * explicit `true` passes; a planned step the run never reached, because it
+ * threw first, records FAIL with the error, and so does the run itself, in a
+ * 'lane' row). "The page's answer" is the tool answer the page
  * received, read from its WebSocket frames; "the store" is read through the
  * TypeScript client with the fixture's Tools token, never through the page.
  *   clusters (P0-1): the sample was asked with clusters; at least 3 groups of
@@ -70,15 +72,19 @@
  *     clicking it scopes the directory to it
  *   scope (P0-2): Folder is under C:/demo/handbooks/: the directory, the
  *     map's sample and the chat's sources stay inside; the status says who
- *     filtered; saved as 'handbooks' and applied again
+ *     filtered; saved as 'handbooks' and applied again; once it is cleared,
+ *     the map, shown again, settles on an unscoped sample asked for after the
+ *     Clear, as large as the clusters step's
  *   scope of 600 (qdrant, chroma; the scope card): every scoped document with
  *     a chunk is in the sample
  *   listing (qdrant, chroma; the scope card): an unscoped sample of more than
  *     500 documents says it was drawn from the first 500
  *   search (P0-5, P1-10): Keyword finds KX4471 in ops/memo_q3.txt; the
  *     threshold slider passes fewer at 0.6 than at 0.3; Copy as node setting;
- *     Compare reports the shared results and the map draws two stars; the
- *     chat column is 55 % before and after the Search toggle
+ *     Compare reports the shared results and the map draws two stars (read
+ *     on a settled map: its unscoped sample before Show A and B, and both
+ *     stars, on that same sample, once it has settled after); the chat column
+ *     is 55 % before and after the Search toggle
  *   duplicates removal: Remove all queued, Cancel sends nothing, Confirm with
  *     the typed count removes exactly the queued documents and the stats drop
  *   outlier removal: Remove document, confirmed, the OCR junk is gone
@@ -96,6 +102,12 @@
  * (data-camera) where the first put it. A lasso over part of the canvas must
  * take some of the points drawn but not all; over all of it, every one.
  *
+ * A settled map (mapSettledVerdict) is read from the app's own signals, never
+ * from a quiet period: the root holds a sample (data-map-state 'ready'), the
+ * toolbar shows no busy line, the page's last sample request is answered and is
+ * what the map draws whole (data-shown and the legend's "Showing N of …"), and
+ * none of the map's embed, project, search or neighbors calls is unanswered.
+ *
  * Selectors and wording: UI below (the enrichment's controls), ui.cjs for the
  * console and map controls of the earlier lanes.
  *
@@ -104,7 +116,8 @@
  *   the four supported backends, default qdrant).
  * vector-ui:e2e-live may run it as `node lane_vector_enrich.cjs <base-url> <out-dir> <browser> [backends]`:
  * once per backend into <out-dir>/<backend>, every row (with its browser and
- * backend) in <out-dir>/lane_vector_enrich.json. It drives Google Chrome only.
+ * backend) in <out-dir>/lane_vector_enrich.json; a backend whose run exited
+ * non-zero or recorded fewer rows than it planned fails. It drives Google Chrome only.
  */
 'use strict';
 /* global document, window */
@@ -992,8 +1005,45 @@ function thresholdPositions(scores) {
 	return { low, high };
 }
 
-/** Compare: the summary's shared count and Jaccard are the two answers', and the map draws both stars. */
-function compareVerdict({ a, b, summary, starA, starB }) {
+/**
+ * Whether the map is settled (a reading of mapReading in the lane): its root says it holds a sample
+ * (data-map-state 'ready'), the toolbar shows no busy line, none of the map's calls is in flight,
+ * its last sample request was answered and that answer is what it draws whole (data-shown and the
+ * legend's "Showing N of …" both its n). `expect` adds what it must hold: `scoped` (true or false),
+ * `n` (the unscoped sample's size), `after` (the request was sent after that frame), `sampleIndex`
+ * (the same sample request as an earlier reading) and `stars` (both placed, the legend naming B's
+ * question). The app's own signals, never a quiet period: true, or why not.
+ */
+function mapSettledVerdict(r, expect = {}) {
+	if (!r) return 'the map was not read';
+	if (r.state !== 'ready') return `the map is ${r.state || 'not there'} (data-map-state)`;
+	if (r.busy) return `the map is busy: ${r.busy}`;
+	if (r.pending && r.pending.length) return `the map's ${[...new Set(r.pending)].join(', ')} call is still unanswered`;
+	const s = r.sample;
+	if (!s) return 'the page asked for no sample';
+	if (!s.success || typeof s.n !== 'number') return `the map's last sample request was refused (${s.code || 'no n'})`;
+	if (r.shown !== s.n) return `the map shows ${r.shown} points; its last sample answer has ${s.n}`;
+	const legend = /Showing ([\d,]+) (?:of [\d,]+ )?chunks/.exec(r.legend || '');
+	if (!legend || count(legend[1]) !== s.n) return `the legend says ${legend ? legend[0] : 'no sample line'}; the last sample has ${s.n} points`;
+	if (expect.scoped === false && s.scoped) return `the map still draws a scoped sample (${s.n} points)`;
+	if (expect.scoped === true && !s.scoped) return 'the map draws an unscoped sample';
+	if ('n' in expect && typeof expect.n !== 'number') return 'no unscoped sample size to compare with (the clusters step drew none)';
+	if ('n' in expect && s.n !== expect.n) return `the map's sample has ${s.n} points, not the ${expect.n} of the collection's unscoped sample`;
+	if ('after' in expect && !(s.index > expect.after)) return 'the map draws a sample asked for before the scope was cleared';
+	if ('sampleIndex' in expect && s.index !== expect.sampleIndex) return expect.sampleIndex === null || expect.sampleIndex === undefined ? 'no earlier sample to hold the stars on' : 'the map drew another sample since the earlier reading';
+	if (expect.stars) {
+		if (r.queryA !== 'placed' || r.queryB !== 'placed') return `the map's stars are A ${r.queryA}, B ${r.queryB}`;
+		if (!String(r.legend || '').includes(`Hollow star: "${expect.stars.b}"`)) return "the legend does not name star B's question";
+	}
+	return true;
+}
+
+/**
+ * Compare: the summary's shared count and Jaccard are the two answers', and the map draws both
+ * stars, read on a settled map: before Show A and B (the collection's unscoped sample, `n`
+ * points) and again once it is settled after it (still both stars, on that same sample).
+ */
+function compareVerdict({ a, b, summary, starA, starB, before, after, n, questionB }) {
 	const keys = (ans) => new Set((ans && Array.isArray(ans.results) ? ans.results : []).map((r) => `${(r.metadata || {}).objectId}#${(r.metadata || {}).chunkId}`));
 	const ka = keys(a);
 	const kb = keys(b);
@@ -1004,7 +1054,11 @@ function compareVerdict({ a, b, summary, starA, starB }) {
 	if (!m) return `no compare summary (${JSON.stringify(String(summary).slice(0, 120))})`;
 	if (count(m[1]) !== shared) return `the summary says ${m[1]} shared; the answers share ${shared}`;
 	if (Math.abs(Number(m[3]) - jaccard) > 0.006) return `the summary's Jaccard ${m[3]} is not ${jaccard.toFixed(2)}`;
-	return starA === 'placed' && starB === 'placed' ? true : `the map's stars are A ${starA}, B ${starB}`;
+	const ready = mapSettledVerdict(before, { scoped: false, n });
+	if (ready !== true) return `before Show A and B: ${ready}`;
+	if (starA !== 'placed' || starB !== 'placed') return `the map's stars are A ${starA}, B ${starB}`;
+	const settled = mapSettledVerdict(after, { stars: { b: questionB }, sampleIndex: before.sample.index });
+	return settled === true ? true : `once the map settled after Show A and B: ${settled}`;
 }
 
 /** The console layout: the chat is 55 % of the right column's ingest and chat panels (their heights), before and after the Search toggle. */
@@ -1058,6 +1112,7 @@ const STEP_TITLES = {
 	charts: 'charts (P0-7): the long manual is in the top bin of chunks per document; clicking it scopes the directory',
 	scope: "scope (P0-2): folder C:/demo/handbooks/ scopes the directory, the map's sample and the chat; the status says who filtered; saved and applied again",
 	'scope 600': 'scope of 600 (the scope card): every scoped document with a chunk is in the sample',
+	'scope cleared': "scope (P0-2): clearing the scope draws the map's unscoped sample again, all of it",
 	listing: 'listing (the scope card): an unscoped sample of a collection above 500 documents says it was drawn from the first 500',
 	keyword: 'search (P0-5): Keyword finds KX4471 in ops/memo_q3.txt as a whole word',
 	threshold: 'search: the threshold slider passes fewer rows above the median score than at the lowest; Copy as node setting copies the value',
@@ -1074,8 +1129,8 @@ const STEP_TITLES = {
 
 /** The steps a fixture runs (the scope of 600 and the listing cap on the scope cards: Qdrant and Chroma; health on the legacy pgvector card). */
 function stepsFor(fixtureKey) {
-	const steps = ['clusters', 'min size', 'ask', 'edges', 'ingest date', 'isolate', 'text', 'recommend', 'best score', 'matrix', 'export csv', 'export png', 'views', 'dedupe', 'outliers', 'charts', 'scope', 'keyword', 'threshold', 'compare', 'layout', 'dedupe removal', 'outlier removal', 'ingest summary', 'restore', 'sign-out', 'privacy'];
-	if (fixtureKey === 'qdrant' || fixtureKey === 'chroma') steps.splice(steps.indexOf('scope') + 1, 0, 'scope 600');
+	const steps = ['clusters', 'min size', 'ask', 'edges', 'ingest date', 'isolate', 'text', 'recommend', 'best score', 'matrix', 'export csv', 'export png', 'views', 'dedupe', 'outliers', 'charts', 'scope', 'scope cleared', 'keyword', 'threshold', 'compare', 'layout', 'dedupe removal', 'outlier removal', 'ingest summary', 'restore', 'sign-out', 'privacy'];
+	if (fixtureKey === 'qdrant' || fixtureKey === 'chroma') steps.splice(steps.indexOf('scope cleared') + 1, 0, 'scope 600');
 	if (fixtureKey === 'qdrant' || fixtureKey === 'chroma') steps.splice(steps.indexOf('scope 600') + 1, 0, 'listing');
 	if (fixtureKey === 'postgres') steps.splice(steps.indexOf('restore'), 0, 'health');
 	return steps;
@@ -1272,6 +1327,48 @@ async function drive(fixtureKey, base, out, planned, step) {
 			if (Date.now() > deadline) return null;
 		}
 	};
+	/**
+	 * What the map holds now (judged by mapSettledVerdict): its root's data-map-state, the toolbar's
+	 * busy line (its status, there only while the map samples, embeds, places a query or lays out),
+	 * the map's calls sent since frame `since` with no answer yet, the page's last sample request
+	 * ({ index, n, scoped, success, code }, its answer's), the points it shows, both stars and the legend.
+	 */
+	const mapReading = async (since) => {
+		const requests = C.exchanges(capture, 'sample');
+		const last = requests.length ? requests[requests.length - 1] : null;
+		const status = toolbar.getByRole('status');
+		const busy = (await status.count().catch(() => 0)) > 0 ? await C.textOf(status.first()) : '';
+		const pending = ['embed', 'project', 'search', 'neighbors'].flatMap((tool) =>
+			C.exchanges(capture, tool, since)
+				.filter((x) => !x.response)
+				.map(() => tool)
+		);
+		if (last && !last.response) pending.unshift('sample');
+		const result = last && last.result;
+		return {
+			state: await attr('data-map-state'),
+			busy,
+			pending,
+			sample: last && last.response ? { index: last.index, n: result && typeof result.n === 'number' ? result.n : null, scoped: !!(last.input.filter && last.input.filter.object_ids), success: !!result && result.success !== false, code: (result && result.code) || null } : null,
+			shown: await attrInt(UI.map.attr.shown),
+			queryA: await attr(UI.map.attr.queryState),
+			queryB: await attr(UI.map.attr.queryBState),
+			legend: await C.textOf(visible(map.getByRole('region', { name: MAP.legend }))),
+		};
+	};
+	/** Read the map until mapSettledVerdict(reading, expect) holds, or until `timeout`: { reading, verdict }. */
+	const awaitMap = async (expect, since, timeout = 120000) => {
+		const deadline = Date.now() + timeout;
+		for (;;) {
+			if (capture.sockets === 0) throw new Error('the page opened no WebSocket');
+			const reading = await mapReading(since);
+			const verdict = mapSettledVerdict(reading, expect);
+			if (verdict === true || Date.now() > deadline) return { reading, verdict };
+			await C.sleep(250);
+		}
+	};
+	/** A map reading for a step's note (the legend shortened). */
+	const brief = (reading) => (reading ? { ...reading, legend: String(reading.legend || '').slice(0, 300) } : null);
 	const fitButton = () => toolbar.getByRole('button', { name: MAP.fit }).first();
 	/** Fit once the points have stopped moving, then Fit again: the camera of each ({ camera, refit }). */
 	const fitMap = async () => {
@@ -1462,6 +1559,7 @@ async function drive(fixtureKey, base, out, planned, step) {
 	];
 
 	let sample = null; // the page's current detailed sample answer (demo fixture)
+	let demoN = null; // the points of the demo collection's unscoped sample (the clusters step's)
 	let sampleInput = null;
 	let falconKey = null;
 	let greenhouseKey = null;
@@ -1480,6 +1578,7 @@ async function drive(fixtureKey, base, out, planned, step) {
 			const x = await openMap(fixture);
 			sample = x.result;
 			sampleInput = x.input;
+			demoN = sample && typeof sample.n === 'number' ? sample.n : null;
 			await sideTab(UI.map.tabs.clusters);
 			const list = visible(map.getByRole('list', { name: UI.map.clustersList }));
 			await list.waitFor({ timeout: 15000 });
@@ -1952,6 +2051,7 @@ async function drive(fixtureKey, base, out, planned, step) {
 			}
 		});
 
+		let scopeClearedAt = null; // the frame before the scope step's last Clear
 		await step(page, STEP_TITLES['scope'], async (note) => {
 			await openConsole();
 			const since = capture.frames.length;
@@ -1976,7 +2076,18 @@ async function drive(fixtureKey, base, out, planned, step) {
 			note({ filter_applied: listing && listing.result && listing.result.filter_applied, status: statusLine, directory: directory.length, scope: scopeIds.length, sampled: x.result && x.result.docs ? x.result.docs.length : null, sources, reapplied });
 			savedFilter = reapplied;
 			const verdict = scopeVerdict({ prefix: CORPUS.scopeFolder, listing: listing && listing.result, status: statusLine, directory, sampleInput: x.input, sample: x.result, scopeIds, sources, reapplied });
+			scopeClearedAt = capture.frames.length;
 			await button(UI.scope.clear).click();
+			return verdict;
+		});
+
+		await step(page, STEP_TITLES['scope cleared'], async (note) => {
+			if (scopeClearedAt === null) return 'the scope step did not clear its scope';
+			// Shown again, the map must draw the collection's unscoped sample (asked for after the Clear), all of it, and settle.
+			await C.switchView(page, CONSOLE.mapTab);
+			const { reading, verdict } = await awaitMap({ scoped: false, n: demoN, after: scopeClearedAt }, scopeClearedAt);
+			note({ demoN, map: brief(reading) });
+			await openConsole();
 			return verdict;
 		});
 
@@ -2083,10 +2194,16 @@ async function drive(fixtureKey, base, out, planned, step) {
 		});
 
 		await step(page, STEP_TITLES['compare'], async (note) => {
+			const questionB = 'How is the station powered in winter?';
+			// The map first, in a known state: the collection's unscoped sample, drawn whole and settled
+			// (a sample still being drawn when Search tells it the questions would drop both stars).
+			const start = capture.frames.length;
+			await C.switchView(page, CONSOLE.mapTab);
+			const before = await awaitMap({ scoped: false, n: demoN }, start);
 			const panel = await searchPanel();
 			const since = capture.frames.length;
 			await button(UI.search.compare, panel).click();
-			await visible(panel.getByRole('searchbox', { name: UI.search.boxB, exact: true })).fill('How is the station powered in winter?');
+			await visible(panel.getByRole('searchbox', { name: UI.search.boxB, exact: true })).fill(questionB);
 			await button(UI.search.run, panel).click();
 			await poll(
 				async () => C.exchanges(capture, 'search', since).filter((x) => x.response).length,
@@ -2109,10 +2226,12 @@ async function drive(fixtureKey, base, out, planned, step) {
 				(v) => v === 'placed',
 				30000
 			);
+			// Read again once the map has settled: both stars still there, on the sample it held before the click.
+			const after = await awaitMap({ stars: { b: questionB }, sampleIndex: before.reading && before.reading.sample ? before.reading.sample.index : null }, shown, 60000);
 			// What the map asked for after "Show A and B on the map" (star B needs an embed, a project and a search of B).
-			const asked = Object.fromEntries(['embed', 'project', 'search'].map((tool) => [tool, C.exchanges(capture, tool, shown).length]));
-			note({ summary, runs: runs.length, starA, starB, askedAfterShow: asked, legend: (await C.textOf(visible(map.getByRole('region', { name: MAP.legend })))).slice(0, 300) });
-			return compareVerdict({ a: runs[0] && runs[0].result, b: runs[1] && runs[1].result, summary, starA, starB });
+			const asked = Object.fromEntries(['sample', 'embed', 'project', 'search'].map((tool) => [tool, C.exchanges(capture, tool, shown).length]));
+			note({ summary, runs: runs.length, starA, starB, askedAfterShow: asked, demoN, before: brief(before.reading), after: brief(after.reading) });
+			return compareVerdict({ a: runs[0] && runs[0].result, b: runs[1] && runs[1].result, summary, starA, starB, before: before.reading, after: after.reading, n: demoN, questionB });
 		});
 
 		await step(page, STEP_TITLES['layout'], async (note) => {
@@ -2458,6 +2577,7 @@ module.exports = {
 	thresholdVerdict,
 	thresholdPositions,
 	compareVerdict,
+	mapSettledVerdict,
 	layoutVerdict,
 	ingestVerdict,
 	healthVerdict,

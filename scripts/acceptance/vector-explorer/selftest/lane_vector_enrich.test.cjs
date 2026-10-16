@@ -169,7 +169,7 @@ const lane = require('../browser/lane_vector_enrich.cjs');
 const E = require('../env.cjs');
 
 // GE3's enrichment steps (ENRICHED_SPEC 4.1), each of which the lane must run on every backend.
-const GE3 = [/clusters \(P0-1\)/, /Minimum size 2/, /Ask about these/, /edges \(P0-3\)/, /colour by ingest date \(P1-3\)/, /isolate \(P1-4\)/, /text \(P1-6\)/, /recommend \(P1-1\)/, /Best score/, /matrix \(P1-2\)/, /export \(P0-6\)/, /map PNG/, /views \(P1-5\)/, /duplicates queue \(P0-4\)/, /outliers \(P1-8\)/, /charts \(P0-7\)/, /scope \(P0-2\)/, /Keyword finds KX4471/, /threshold slider/, /Compare/, /55 %/, /duplicates removal/, /outlier removal/, /ingest summary \(P1-9\)/, /restore/, /sign-out/, /privacy \(B4\)/];
+const GE3 = [/clusters \(P0-1\)/, /Minimum size 2/, /Ask about these/, /edges \(P0-3\)/, /colour by ingest date \(P1-3\)/, /isolate \(P1-4\)/, /text \(P1-6\)/, /recommend \(P1-1\)/, /Best score/, /matrix \(P1-2\)/, /export \(P0-6\)/, /map PNG/, /views \(P1-5\)/, /duplicates queue \(P0-4\)/, /outliers \(P1-8\)/, /charts \(P0-7\)/, /scope \(P0-2\)/, /clearing the scope/, /Keyword finds KX4471/, /threshold slider/, /Compare/, /55 %/, /duplicates removal/, /outlier removal/, /ingest summary \(P1-9\)/, /restore/, /sign-out/, /privacy \(B4\)/];
 // Steps that belong to some backends only.
 const ONLY = { qdrant: [/scope of 600/, /listing \(the scope card\)/], chroma: [/scope of 600/, /listing \(the scope card\)/], postgres: [/health \(P1-7\)/] };
 
@@ -280,6 +280,11 @@ test('vector-ui:e2e-live runs the enrichment lane when it is named, with the bac
 // Fail-closed: a planned step the lane never recorded fails, in the lane and in vector-ui:e2e-live
 // ---------------------------------------------------------------------------
 
+/** A map reading as the lane takes it (mapReading in the lane): settled on the demo collection's 308-point unscoped sample unless `extra` says otherwise. */
+const mapReading = (extra = {}) => ({ state: 'ready', busy: '', pending: [], sample: { index: 40, n: 308, scoped: false, success: true }, shown: 308, queryA: 'none', queryB: 'none', legend: 'Showing 308 of 308 chunks (random sample)', ...extra });
+/** The Compare step's second question. */
+const QUESTION_B = 'How is the station powered in winter?';
+
 /** Rows of a backend that ran every planned step and passed it. */
 const passingRows = (key) => lane.stepsFor(key).map((s) => ({ fixture: key, name: lane.STEP_TITLES[s], status: 'PASS' }));
 
@@ -337,11 +342,11 @@ test('e2eBackendRows: a backend fails when its child wrote no result, fewer rows
 	assert.deepStrictEqual(fails(lane.e2eBackendRows('postgres', 0, passingRows('postgres'))), []);
 	const empty = fails(lane.e2eBackendRows('qdrant', 1, []));
 	assert.strictEqual(empty.length, lane.stepsFor('qdrant').length + 1, 'an empty result');
-	assert.match(empty.find((r) => r.name === 'lane').detail, /exited 1 having recorded 0 of its 29 planned steps/);
+	assert.match(empty.find((r) => r.name === 'lane').detail, new RegExp(`exited 1 having recorded 0 of its ${lane.stepsFor('qdrant').length} planned steps`));
 	assert.strictEqual(fails(lane.e2eBackendRows('qdrant', 1, null)).length, lane.stepsFor('qdrant').length + 1, 'no result');
 	const short = fails(lane.e2eBackendRows('chroma', 0, passingRows('chroma').slice(0, -3)));
 	assert.strictEqual(short.length, 4, 'three planned steps missing, and how the lane ended');
-	assert.match(short[3].detail, /exited 0 having recorded 26 of its 29/);
+	assert.match(short[3].detail, new RegExp(`exited 0 having recorded ${lane.stepsFor('chroma').length - 3} of its ${lane.stepsFor('chroma').length}`));
 	// The child's own lane row (it threw, and said so) is not repeated.
 	const own = [...lane.unrecordedRows('postgres', lane.stepsFor('postgres'), [], new Error('boom'))];
 	assert.strictEqual(fails(lane.e2eBackendRows('postgres', 1, own)).length, own.length);
@@ -1141,14 +1146,72 @@ test('keywordVerdict, thresholdVerdict, compareVerdict, layoutVerdict: the searc
 	const a = r(['a', 'b', 'c', 'd']);
 	const b = r(['c', 'd', 'e', 'f']);
 	const summary = 'A and B share 2 of 4 results (Jaccard 0.33); 2 documents only in A, 2 only in B';
-	assert.strictEqual(lane.compareVerdict({ a, b, summary, starA: 'placed', starB: 'placed' }), true);
-	assert.notStrictEqual(lane.compareVerdict({ a, b, summary: summary.replace('share 2', 'share 3'), starA: 'placed', starB: 'placed' }), true);
-	assert.notStrictEqual(lane.compareVerdict({ a, b, summary: summary.replace('0.33', '0.50'), starA: 'placed', starB: 'placed' }), true);
-	assert.notStrictEqual(lane.compareVerdict({ a, b, summary, starA: 'placed', starB: 'none' }), true);
-	assert.notStrictEqual(lane.compareVerdict({ a, b: r([]), summary, starA: 'placed', starB: 'placed' }), true);
+	// The map before Show A and B (settled on the unscoped sample) and after it (settled again, both stars).
+	const map = { before: mapReading(), after: mapReading({ queryA: 'placed', queryB: 'placed', legend: `Showing 308 of 308 chunks (random sample) Hollow star: "${QUESTION_B}" (compared in Search)` }), n: 308, questionB: QUESTION_B };
+	const sound = { a, b, summary, starA: 'placed', starB: 'placed', ...map };
+	assert.strictEqual(lane.compareVerdict(sound), true);
+	assert.notStrictEqual(lane.compareVerdict({ ...sound, summary: summary.replace('share 2', 'share 3') }), true);
+	assert.notStrictEqual(lane.compareVerdict({ ...sound, summary: summary.replace('0.33', '0.50') }), true);
+	assert.notStrictEqual(lane.compareVerdict({ ...sound, starB: 'none' }), true);
+	assert.notStrictEqual(lane.compareVerdict({ ...sound, b: r([]) }), true);
 	assert.strictEqual(lane.layoutVerdict({ before: 0.55, after: 0.551 }), true);
 	assert.notStrictEqual(lane.layoutVerdict({ before: 0.55, after: 1 }), true);
 	assert.notStrictEqual(lane.layoutVerdict({ before: null, after: 0.55 }), true);
+});
+
+test('mapSettledVerdict: the map is settled when its last sample request is answered and drawn whole, it is not busy, and none of its calls is in flight', () => {
+	assert.strictEqual(lane.mapSettledVerdict(mapReading(), {}), true);
+	assert.strictEqual(lane.mapSettledVerdict(mapReading(), { scoped: false, n: 308, after: 39, sampleIndex: 40 }), true);
+	const scoped = mapReading({ sample: { index: 40, n: 31, scoped: true, success: true }, shown: 31, legend: 'Showing 31 of 31 chunks (random sample)' });
+	assert.strictEqual(lane.mapSettledVerdict(scoped, { scoped: true }), true);
+	for (const [why, reading, expect] of [
+		['no reading', null, {}],
+		['no sample drawn yet', mapReading({ state: 'sampling' }), {}],
+		['the toolbar says it is sampling', mapReading({ busy: 'Sampling…' }), {}],
+		['a sample request unanswered', mapReading({ pending: ['sample'] }), {}],
+		["star B's project unanswered", mapReading({ pending: ['project'] }), {}],
+		['no sample request at all', mapReading({ sample: null }), {}],
+		['the last sample was refused', mapReading({ sample: { index: 40, n: null, scoped: false, success: false, code: 'BUSY' } }), {}],
+		['an older sample still drawn', mapReading({ shown: 31 }), {}],
+		['the legend names another sample', mapReading({ legend: 'Showing 31 of 31 chunks (random sample)' }), {}],
+		['no sample line in the legend', mapReading({ legend: 'Map legend' }), {}],
+		['still the scoped sample', scoped, { scoped: false }],
+		['not the unscoped sample of the demo collection', mapReading(), { n: 500 }],
+		['no unscoped size to compare with', mapReading(), { n: null }],
+		['drawn before the Clear', mapReading(), { after: 40 }],
+		['another sample than the one held before', mapReading(), { sampleIndex: 12 }],
+		['no sample to hold the stars on', mapReading(), { sampleIndex: null }],
+	])
+		assert.notStrictEqual(lane.mapSettledVerdict(reading, expect), true, why);
+	// The stars: both placed, and the legend naming star B's question.
+	const stars = { stars: { b: QUESTION_B } };
+	const placed = mapReading({ queryA: 'placed', queryB: 'placed', legend: `Showing 308 of 308 chunks (random sample) Hollow star: "${QUESTION_B}" (compared in Search)` });
+	assert.strictEqual(lane.mapSettledVerdict(placed, stars), true);
+	assert.notStrictEqual(lane.mapSettledVerdict({ ...placed, queryB: 'none' }, stars), true);
+	assert.notStrictEqual(lane.mapSettledVerdict({ ...placed, queryA: 'failed' }, stars), true);
+	assert.notStrictEqual(lane.mapSettledVerdict({ ...placed, legend: 'Showing 308 of 308 chunks (random sample)' }, stars), true);
+});
+
+test('compareVerdict: the stars count only on a map settled before Show A and B and settled again after it, on the same sample', () => {
+	const r = (ids) => ({ results: ids.map((id) => ({ metadata: { objectId: id, chunkId: 0 } })) });
+	const placed = mapReading({ queryA: 'placed', queryB: 'placed', legend: `Showing 308 of 308 chunks (random sample) Hollow star: "${QUESTION_B}" (compared in Search)` });
+	const sound = { a: r(['a', 'b', 'c', 'd']), b: r(['c', 'd', 'e', 'f']), summary: 'A and B share 2 of 4 results (Jaccard 0.33)', starA: 'placed', starB: 'placed', before: mapReading(), after: placed, n: 308, questionB: QUESTION_B };
+	assert.strictEqual(lane.compareVerdict(sound), true);
+	// Show A and B was clicked while the map still held the cleared scope's 31-chunk sample.
+	assert.notStrictEqual(lane.compareVerdict({ ...sound, before: mapReading({ sample: { index: 40, n: 31, scoped: true, success: true }, shown: 31, legend: 'Showing 31 of 31 chunks (random sample)' }) }), true);
+	// ...or while it was drawing another one.
+	assert.notStrictEqual(lane.compareVerdict({ ...sound, before: mapReading({ pending: ['sample'] }) }), true);
+	assert.notStrictEqual(lane.compareVerdict({ ...sound, before: null }), true);
+	// Both stars read placed once, but the second, settled reading has star B gone (a new sample dropped it).
+	assert.notStrictEqual(lane.compareVerdict({ ...sound, after: { ...placed, queryB: 'none' } }), true);
+	assert.notStrictEqual(lane.compareVerdict({ ...sound, after: { ...placed, pending: ['search'] } }), true);
+	// The stars sit on another sample than the one the map held before the click.
+	assert.notStrictEqual(lane.compareVerdict({ ...sound, after: { ...placed, sample: { ...placed.sample, index: 77 } } }), true);
+	assert.notStrictEqual(lane.compareVerdict({ ...sound, after: null }), true);
+	// The legend does not name star B.
+	assert.notStrictEqual(lane.compareVerdict({ ...sound, after: { ...placed, legend: 'Showing 308 of 308 chunks (random sample)' } }), true);
+	// The first reading's stars still count.
+	assert.notStrictEqual(lane.compareVerdict({ ...sound, starB: 'none' }), true);
 });
 
 test('ingestVerdict and healthVerdict: the drop summary and the pin; the legacy listing flagged', () => {
