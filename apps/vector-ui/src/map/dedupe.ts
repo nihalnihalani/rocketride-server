@@ -266,8 +266,24 @@ export interface ICopyEvidence {
 	partners: ReadonlyArray<ReadonlyMap<string, IPartnerLink> | undefined>;
 	/** Per document: its points. */
 	pointsOf: ReadonlyMap<string, readonly number[]>;
-	/** Containment answers already worked out, per documents map. */
-	memo: WeakMap<ReadonlyMap<string, IDocInfo>, Map<string, IContainment>>;
+	/** What is already worked out, per documents map. */
+	memo: WeakMap<ReadonlyMap<string, IDocInfo>, IWorkedOut>;
+}
+
+/** How the sampler drew a document: the rate at which a chunk of its pool (its chunks that are not certain points) was drawn. */
+interface IDraw {
+	/** 1 when the sample holds its whole pool. */
+	rate: number;
+	/** Its pool. */
+	pool: number;
+}
+
+/** What one documents map makes of a view's evidence, kept as it is worked out. */
+interface IWorkedOut {
+	/** Containment answers by document and partners. */
+	answers: Map<string, IContainment>;
+	/** Each document's draw, or null when the store did not report its chunk count. */
+	draws: Map<string, IDraw | null>;
 }
 
 /** What the duplicates queue shows at one threshold. */
@@ -689,17 +705,84 @@ function storedChunks(info: ReadonlyMap<string, IDocInfo>, objectId: string): nu
  */
 export function containment(group: Pick<IDocumentGroup, 'evidence'>, info: ReadonlyMap<string, IDocInfo>, objectId: string, others: readonly string[]): IContainment {
 	const ev = group.evidence;
-	let memo = ev.memo.get(info);
-	if (!memo) {
-		memo = new Map();
-		ev.memo.set(info, memo);
-	}
-	const memoKey = `${objectId}\u0000${[...others].sort().join('\u0001')}`;
-	const known = memo.get(memoKey);
+	const work = workedOut(ev, info);
+	const memoKey = others.length === 1 ? `${objectId}\u0000${others[0]}` : `${objectId}\u0000${[...others].sort().join('\u0001')}`;
+	const known = work.answers.get(memoKey);
 	if (known) return known;
-	const answer = workOutContainment(ev, info, objectId, others);
-	memo.set(memoKey, answer);
+	const set = others.length === 1 ? null : new Set(others);
+	const answer = workOutContainment(ev, info, objectId, set === null ? (others[0] as string) : (id) => set.has(id), () => lowestDraw(ev, info, others));
+	work.answers.set(memoKey, answer);
 	return answer;
+}
+
+/**
+ * The view's worked-out answers for a documents map.
+ *
+ * @param ev - The view's evidence.
+ * @param info - The documents.
+ * @returns Its memo.
+ */
+function workedOut(ev: ICopyEvidence, info: ReadonlyMap<string, IDocInfo>): IWorkedOut {
+	let work = ev.memo.get(info);
+	if (!work) {
+		work = { answers: new Map(), draws: new Map() };
+		ev.memo.set(info, work);
+	}
+	return work;
+}
+
+/**
+ * How the sampler drew a document (its certain points apart).
+ *
+ * @param ev - The view's evidence.
+ * @param info - The documents.
+ * @param objectId - The document.
+ * @returns Its draw, or null when the store did not report its chunk count.
+ */
+function drawOf(ev: ICopyEvidence, info: ReadonlyMap<string, IDocInfo>, objectId: string): IDraw | null {
+	const work = workedOut(ev, info);
+	const known = work.draws.get(objectId);
+	if (known !== undefined) return known;
+	const total = storedChunks(info, objectId);
+	let draw: IDraw | null = null;
+	if (total !== null) {
+		const theirs = ev.pointsOf.get(objectId) ?? [];
+		let theirCertain = 0;
+		for (const j of theirs) if (ev.census[j] === 1) theirCertain += 1;
+		const theirDrawn = theirs.length - theirCertain;
+		const pool = Math.max(theirDrawn, total - theirCertain);
+		draw = { rate: pool === 0 || theirDrawn >= pool ? 1 : theirDrawn / pool, pool };
+	}
+	work.draws.set(objectId, draw);
+	return draw;
+}
+
+/** The partners' draw: the lowest rate at which a twin in their pool was drawn (q), and that partner's pool. */
+interface IPartnersDraw {
+	q: number;
+	poolQ: number;
+}
+
+/**
+ * The lowest draw among documents (the first of them on a tie).
+ *
+ * @param ev - The view's evidence.
+ * @param info - The documents.
+ * @param others - The documents.
+ * @returns Their draw, or null when one has no chunk count.
+ */
+function lowestDraw(ev: ICopyEvidence, info: ReadonlyMap<string, IDocInfo>, others: readonly string[]): IPartnersDraw | null {
+	let q = 1;
+	let poolQ = 0;
+	for (const other of others) {
+		const draw = drawOf(ev, info, other);
+		if (draw === null) return null;
+		if (draw.rate < q) {
+			q = draw.rate;
+			poolQ = draw.pool;
+		}
+	}
+	return { q, poolQ };
 }
 
 /**
@@ -708,10 +791,11 @@ export function containment(group: Pick<IDocumentGroup, 'evidence'>, info: Reado
  * @param ev - The view's evidence.
  * @param info - The documents.
  * @param objectId - The document.
- * @param others - The documents that would hold it.
+ * @param isOther - The one document that would hold it, or whether a document is one of those.
+ * @param partnersDraw - Their draw (asked only when the certain rule does not decide), or null when one has no chunk count.
  * @returns The answer.
  */
-function workOutContainment(ev: ICopyEvidence, info: ReadonlyMap<string, IDocInfo>, objectId: string, others: readonly string[]): IContainment {
+function workOutContainment(ev: ICopyEvidence, info: ReadonlyMap<string, IDocInfo>, objectId: string, isOther: string | ((id: string) => boolean), partnersDraw: () => IPartnersDraw | null): IContainment {
 	const points = ev.pointsOf.get(objectId) ?? [];
 	let certain = 0;
 	let drawn = 0;
@@ -728,10 +812,15 @@ function workOutContainment(ev: ICopyEvidence, info: ReadonlyMap<string, IDocInf
 		// true: pairs with a certain point of theirs; false: with drawn ones only; undefined: with none.
 		let hit: boolean | undefined;
 		let twins = 0;
-		if (map) {
-			for (const other of others) {
-				const link = map.get(other);
-				if (!link) continue;
+		if (map && typeof isOther === 'string') {
+			const link = map.get(isOther);
+			if (link) {
+				twins = link.count;
+				hit = link.certain;
+			}
+		} else if (map && typeof isOther === 'function') {
+			for (const [other, link] of map) {
+				if (!isOther(other)) continue;
 				twins += link.count;
 				if (link.certain) hit = true;
 				else if (hit === undefined) hit = false;
@@ -752,23 +841,9 @@ function workOutContainment(ev: ICopyEvidence, info: ReadonlyMap<string, IDocInf
 	const out = (verdict: ContainmentVerdict, share: number | null): IContainment => ({ verdict, matched, sampled, share });
 	if (stored === null) return out('unsized', null);
 	if (matched >= HELD_SHARE * stored) return out('in', Math.min(1, matched / stored));
-	// The partners' draw: the lowest rate at which a twin in their pool was drawn.
-	let q = 1;
-	let poolQ = 0;
-	for (const other of others) {
-		const total = storedChunks(info, other);
-		if (total === null) return out('unsized', null);
-		const theirs = ev.pointsOf.get(other) ?? [];
-		let theirCertain = 0;
-		for (const j of theirs) if (ev.census[j] === 1) theirCertain += 1;
-		const theirDrawn = theirs.length - theirCertain;
-		const pool = Math.max(theirDrawn, total - theirCertain);
-		const rate = pool === 0 || theirDrawn >= pool ? 1 : theirDrawn / pool;
-		if (rate < q) {
-			q = rate;
-			poolQ = pool;
-		}
-	}
+	const theirs = partnersDraw();
+	if (theirs === null) return out('unsized', null);
+	const { q, poolQ } = theirs;
 	const whole = q >= 1;
 	// A sample not drawn evenly says nothing about the chunks it did not draw: only partners whole in it count.
 	if ((whole || ev.uniform) && binomialAtMost(sampled, q, matched + crowdedMisses) < OWN_TEXT_CHANCE) return out('out', matched / stored);
@@ -780,8 +855,8 @@ function workOutContainment(ev: ICopyEvidence, info: ReadonlyMap<string, IDocInf
 	const share = Math.min(1, (certainMatched + g * pool) / stored);
 	const sd = (g0: number): number => {
 		const sampling = drawn >= pool ? 0 : (((1 - drawn / pool) * g0 * (1 - g0)) / drawn) * (pool / Math.max(1, pool - 1));
-		const twins = whole ? 0 : ((g0 * (1 - q)) / (q * drawn)) * (Math.max(0, poolQ - g0 * drawn) / Math.max(1, poolQ - 1));
-		return Math.sqrt(Math.max(0, sampling + twins));
+		const twinsVar = whole ? 0 : ((g0 * (1 - q)) / (q * drawn)) * (Math.max(0, poolQ - g0 * drawn) / Math.max(1, poolQ - 1));
+		return Math.sqrt(Math.max(0, sampling + twinsVar));
 	};
 	if (share >= HELD_ESTIMATE && matched >= COPY_EVIDENCE_MIN && g - HELD_RULED_OUT >= Z_HELD * sd(HELD_RULED_OUT)) return out('in', share);
 	return out(expected < COPY_EVIDENCE_MIN ? 'few' : 'unsure', share);
@@ -791,27 +866,103 @@ function workOutContainment(ev: ICopyEvidence, info: ReadonlyMap<string, IDocInf
 export type CopyVerdict = 'copies' | 'passages' | 'mixed' | 'partial' | 'sparse' | 'unsized' | 'uneven';
 
 /**
+ * The draws of a group's documents, worked out once: for every document, the
+ * lowest draw among the others (the lowest of the group unless it is that
+ * document's own, then the next lowest) and whether one of them has no chunk count.
+ *
+ * @param group - The group.
+ * @param info - The documents.
+ * @returns The others' draw of a document, or null when one of them has no chunk count.
+ */
+function othersDraw(group: Pick<IDocumentGroup, 'objectIds' | 'evidence'>, info: ReadonlyMap<string, IDocInfo>): (objectId: string) => IPartnersDraw | null {
+	let unsized = 0;
+	let lowest: { id: string; draw: IDraw } | null = null;
+	let next: { id: string; draw: IDraw } | null = null;
+	for (const id of group.objectIds) {
+		const draw = drawOf(group.evidence, info, id);
+		if (draw === null) {
+			unsized += 1;
+			continue;
+		}
+		if (lowest === null || draw.rate < lowest.draw.rate) {
+			next = lowest;
+			lowest = { id, draw };
+		} else if (next === null || draw.rate < next.draw.rate) next = { id, draw };
+	}
+	return (objectId) => {
+		const own = drawOf(group.evidence, info, objectId);
+		if (unsized - (own === null ? 1 : 0) > 0) return null;
+		const theirs = lowest !== null && lowest.id === objectId ? next : lowest;
+		return theirs === null || theirs.draw.rate >= 1 ? { q: 1, poolQ: 0 } : { q: theirs.draw.rate, poolQ: theirs.draw.pool };
+	};
+}
+
+/**
+ * The documents of a group a document's sampled chunks pair with (its points
+ * may pair with documents of other groups too: those never hold it here), and
+ * how many of its sampled chunks pair with each.
+ *
+ * @param ev - The view's evidence.
+ * @param objectId - The document.
+ * @param members - The group's documents.
+ * @returns Its partners in the group, in the order they first appear.
+ */
+function partnersOf(ev: ICopyEvidence, objectId: string, members: ReadonlySet<string>): Map<string, number> {
+	const found = new Map<string, number>();
+	for (const i of ev.pointsOf.get(objectId) ?? []) for (const other of ev.partners[i]?.keys() ?? []) if (members.has(other)) found.set(other, (found.get(other) ?? 0) + 1);
+	return found;
+}
+
+/**
  * What the sample shows about one document of a group: 'whole' when another
  * document of the group holds it; 'own' when it holds text the others
  * together do not; otherwise why the sample cannot tell.
  *
+ * Only the documents its sampled chunks pair with can hold it (one none of
+ * its chunks pairs with matches nothing of it), so it is compared with those
+ * one by one, and a partner too few of its chunks pair with to hold it by
+ * either rule (fewer than HELD_SHARE of its stored chunks and fewer than
+ * COPY_EVIDENCE_MIN) counts only for its missing chunk count. "The others
+ * together" are every other document of the group, their lowest draw worked
+ * out once for the group.
+ *
  * @param group - The group.
  * @param info - The documents.
  * @param objectId - The document.
+ * @param members - The group's documents.
+ * @param others - The others' draw (othersDraw).
  * @returns The verdict for the document.
  */
-function docVerdict(group: Pick<IDocumentGroup, 'objectIds' | 'evidence'>, info: ReadonlyMap<string, IDocInfo>, objectId: string): 'whole' | 'own' | 'few' | 'partial' | 'unsized' | 'uneven' {
-	const others = group.objectIds.filter((id) => id !== objectId);
-	if (others.length === 0) return 'few';
-	const each = others.map((other) => containment(group, info, objectId, [other]));
-	if (each.some((c) => c.verdict === 'in')) return 'whole';
-	const together = others.length === 1 ? (each[0] as IContainment) : containment(group, info, objectId, others);
+function docVerdict(group: Pick<IDocumentGroup, 'objectIds' | 'evidence'>, info: ReadonlyMap<string, IDocInfo>, objectId: string, members: ReadonlySet<string>, others: (objectId: string) => IPartnersDraw | null): 'whole' | 'own' | 'few' | 'partial' | 'unsized' | 'uneven' {
+	if (!group.objectIds.some((id) => id !== objectId)) return 'few';
+	const ev = group.evidence;
+	const stored = storedChunks(info, objectId);
+	// Without its chunk count every comparison of it says 'unsized'.
+	if (stored === null) return 'unsized';
+	const each: IContainment[] = [];
+	let partnerUnsized = false;
+	for (const [other, matched] of partnersOf(ev, objectId, members)) {
+		if (ev.uniform && matched < HELD_SHARE * stored && matched < COPY_EVIDENCE_MIN) {
+			// Never 'in', and in a sample drawn evenly never 'uneven': only its chunk count can count.
+			if (drawOf(ev, info, other) === null) partnerUnsized = true;
+			continue;
+		}
+		const c = containment(group, info, objectId, [other]);
+		if (c.verdict === 'in') return 'whole';
+		each.push(c);
+	}
+	const isOther = (id: string): boolean => id !== objectId && members.has(id);
+	const theirDraw = (): IPartnersDraw | null => others(objectId);
+	const together = group.objectIds.length === 2 && each.length === 1 ? (each[0] as IContainment) : workOutContainment(ev, info, objectId, isOther, theirDraw);
 	if (together.verdict === 'out') return 'own';
 	const reasons = [together, ...each].map((c) => c.verdict);
-	if (reasons.includes('unsized')) return 'unsized';
+	if (partnerUnsized || reasons.includes('unsized')) return 'unsized';
 	if (reasons.includes('uneven')) return 'uneven';
 	return together.verdict === 'few' ? 'few' : 'partial';
 }
+
+/** Verdicts already worked out, per group and documents map. */
+const VERDICTS = new WeakMap<object, WeakMap<ReadonlyMap<string, IDocInfo>, CopyVerdict>>();
 
 /**
  * What a group is: 'copies' when another document of the group holds each
@@ -820,20 +971,33 @@ function docVerdict(group: Pick<IDocumentGroup, 'objectIds' | 'evidence'>, info:
  * store did not report a chunk count), 'uneven' (the sample was not drawn
  * evenly within documents), 'sparse' (too few chunks of a document sampled to
  * tell, such as a boilerplate paragraph at the end of long files, sampled once
- * each) or 'partial' (enough sampled, not enough to tell yet).
+ * each) or 'partial' (enough sampled, not enough to tell yet). Worked out once
+ * per group and documents map, in time linear in the group's pairs.
  *
  * @param group - The group.
  * @param info - The documents.
  * @returns The verdict.
  */
 export function copyVerdict(group: Pick<IDocumentGroup, 'objectIds' | 'evidence'>, info: ReadonlyMap<string, IDocInfo>): CopyVerdict {
-	const each = group.objectIds.map((id) => docVerdict(group, info, id));
-	if (each.length > 0 && each.every((v) => v === 'whole')) return 'copies';
-	if (each.length > 0 && each.every((v) => v === 'own')) return 'passages';
-	if (each.includes('own')) return 'mixed';
-	if (each.includes('unsized')) return 'unsized';
-	if (each.includes('uneven')) return 'uneven';
-	return each.includes('few') || each.length === 0 ? 'sparse' : 'partial';
+	let byInfo = VERDICTS.get(group);
+	const known = byInfo?.get(info);
+	if (known !== undefined) return known;
+	const others = othersDraw(group, info);
+	const members = new Set(group.objectIds);
+	const each = group.objectIds.map((id) => docVerdict(group, info, id, members, others));
+	let verdict: CopyVerdict;
+	if (each.length > 0 && each.every((v) => v === 'whole')) verdict = 'copies';
+	else if (each.length > 0 && each.every((v) => v === 'own')) verdict = 'passages';
+	else if (each.includes('own')) verdict = 'mixed';
+	else if (each.includes('unsized')) verdict = 'unsized';
+	else if (each.includes('uneven')) verdict = 'uneven';
+	else verdict = each.includes('few') || each.length === 0 ? 'sparse' : 'partial';
+	if (!byInfo) {
+		byInfo = new WeakMap();
+		VERDICTS.set(group, byInfo);
+	}
+	byInfo.set(info, verdict);
+	return verdict;
 }
 
 /**

@@ -1006,3 +1006,46 @@ test('budget: pairs over 30,000 kNN entries and the groups of a 2,000-point samp
 	}
 	assert.ok(best < 15, `pairs and groups took ${best.toFixed(2)} ms`);
 });
+
+/**
+ * One group across `docs` documents of `per` chunks whose chunk 0 is the same
+ * cover sheet (each of the others is the document's own text).
+ *
+ * @param docs - Documents.
+ * @param per - Chunks of each, all in the sample.
+ * @param counted - Documents whose chunk count the store reported (the rest null).
+ * @returns The sample.
+ */
+function coverSheets(docs: number, per: number, counted: number = docs): ISampleResult {
+	const points: IPointSpec[] = [];
+	for (let d = 0; d < docs; d += 1) for (let c = 0; c < per; c += 1) points.push({ doc: d, chunk: c });
+	const rows = points.map((p): Array<[number, number]> => Array.from({ length: 15 }, (_, t): [number, number] => (p.chunk === 0 ? [((p.doc + (t + 1) * 37) % docs) * per, 0.995 + ((p.doc * 7 + t) % 40) / 10000] : [((p.doc + t + 1) % docs) * per + 1, 0.3])));
+	const name = (d: number): string => String(d).padStart(4, '0');
+	return sampleOf(
+		Array.from({ length: docs }, (_, d): [string, string, number | null] => [`mail-${name(d)}`, `C:/mail/2026/${name(d)}.eml`, d < counted ? per : null]),
+		points,
+		rows
+	);
+}
+
+test("budget: a group across 2,500 documents (pgvector's native pick has no listing cap) gets its verdict and its queue in a few milliseconds", () => {
+	for (const [counted, expected] of [
+		[2500, 'passages'],
+		[500, 'unsized'],
+	] as const) {
+		const sample = coverSheets(2500, 2, counted);
+		const [group] = dedupeView(sample, 0.97).groups;
+		assert.equal(group?.objectIds.length, 2500);
+		const info = docInfo(sample, null);
+		let started = performance.now();
+		const verdict = copyVerdict(group!, info);
+		const tVerdict = performance.now() - started;
+		started = performance.now();
+		const q = queued([group!], SHORTEST, info, new Set());
+		const tQueue = performance.now() - started;
+		assert.equal(verdict, expected);
+		assert.deepEqual(q.objectIds, []);
+		assert.ok(tVerdict <= 60, `${counted} counted: the verdict took ${tVerdict.toFixed(1)} ms`);
+		assert.ok(tQueue <= 30, `${counted} counted: the queue took ${tQueue.toFixed(1)} ms`);
+	}
+});
