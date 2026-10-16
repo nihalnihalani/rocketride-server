@@ -107,7 +107,7 @@ export function PointInspector(props: PointInspectorProps): React.ReactElement {
 				</p>
 			) : null}
 			{snippet ? <p style={{ ...MAP_STYLES.text, whiteSpace: 'pre-wrap', margin: '6px 0' }}>{snippet}</p> : <p style={MAP_STYLES.note}>This sample carries no text for its points (light mode).</p>}
-			{props.loadText || props.onShowText ? <ChunkTextSection key={chunkTextScope(props.connectionKey, sample.sampleId)} connectionKey={props.connectionKey} sampleId={sample.sampleId} chunkKey={key} label={`${path} #${chunkId}`} query={props.query ?? null} loadText={props.loadText} onShowText={props.onShowText} hostText={props.text ?? null} /> : null}
+			{props.loadText || props.onShowText ? <ChunkTextSection key={chunkTextScope(props.connectionKey, sample.sampleId)} connectionKey={props.connectionKey} sampleId={sample.sampleId} chunkKey={key} label={`${path} #${chunkId}`} chunks={doc?.chunks ?? null} query={props.query ?? null} loadText={props.loadText} onShowText={props.onShowText} hostText={props.text ?? null} /> : null}
 			<div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, margin: '8px 0' }}>
 				<button type="button" style={MAP_STYLES.button} onClick={() => props.onOpenDocument(objectId, chunkId)}>
 					Open document

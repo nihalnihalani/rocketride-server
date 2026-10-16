@@ -286,6 +286,8 @@ export interface ChunkTextSectionProps {
 	initialOpen?: boolean;
 	/** Words for another chunk of the same document. */
 	labelOf?(key: VectorKey): string;
+	/** The document's stored chunk count, when known: Next chunk stops at its last chunk. */
+	chunks?: number | null;
 }
 
 /** What the section shows for its current chunk. */
@@ -343,7 +345,7 @@ export function ChunkTextSection(props: ChunkTextSectionProps): React.ReactEleme
 			<button type="button" style={{ ...MAP_STYLES.button, marginTop: 4 }} aria-expanded={open} onClick={() => setOpen((v) => !v)}>
 				{open ? 'Hide full text' : 'Show full text'}
 			</button>
-			{open ? <ChunkTextPanel chunkKey={key} label={label} text={text?.text ?? null} truncated={text?.truncated ?? false} query={props.query} error={loadText ? loaded.error : null} onPrevious={loadText ? () => setKey([key[0], Math.max(0, key[1] - 1)]) : undefined} onNext={loadText ? () => setKey([key[0], key[1] + 1]) : undefined} onClose={() => setOpen(false)} /> : null}
+			{open ? <ChunkTextPanel chunkKey={key} label={label} text={text?.text ?? null} truncated={text?.truncated ?? false} query={props.query} error={loadText ? loaded.error : null} onPrevious={loadText ? () => setKey([key[0], Math.max(0, key[1] - 1)]) : undefined} onNext={loadText ? () => setKey([key[0], key[1] + 1]) : undefined} hasNext={typeof props.chunks === 'number' ? key[1] < props.chunks - 1 : undefined} onClose={() => setOpen(false)} /> : null}
 		</div>
 	);
 }

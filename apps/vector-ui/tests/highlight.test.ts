@@ -103,3 +103,43 @@ test("the words the panel names are the query's own (lower-cased, one per stem),
 	assert.deepEqual(queryWords(null), []);
 	assert.deepEqual(queryTerms('Changes to the watering'), ['chang', 'water']);
 });
+
+test('scripts without case are marked too: whole words where words are spaced, the query word inside a run where they are not', () => {
+	assert.deepEqual(marked(highlightSegments('محطة المياه في الشمال', 'المياه')), ['المياه'], 'Arabic');
+	assert.deepEqual(marked(highlightSegments('תחנת המים בצפון', 'המים')), ['המים'], 'Hebrew');
+	assert.deepEqual(marked(highlightSegments('पानी की टंकी', 'पानी')), ['पानी'], 'Devanagari');
+	assert.deepEqual(marked(highlightSegments('수도 시설 점검', '시설')), ['시설'], 'Hangul');
+	assert.deepEqual(marked(highlightSegments('관측소의 물 품질', '물')), ['물'], 'one Hangul syllable is a word');
+	assert.deepEqual(queryTerms('a b x'), [], 'one Latin letter is still no word');
+	assert.deepEqual(marked(highlightSegments('水资源管理和水质', '水质')), ['水质'], 'Chinese: the query word inside a run');
+	assert.deepEqual(marked(highlightSegments('給水設備の点検', '点検')), ['点検'], 'Japanese');
+	assert.deepEqual(marked(highlightSegments('สถานีน้ำประปา', 'น้ำ')), ['น้ำ'], 'Thai');
+	assert.deepEqual(marked(highlightSegments('水', '水')), ['水'], 'one ideograph is a word');
+	for (const [text, query] of [
+		['水资源管理和水质', '水质'],
+		['محطة المياه', 'المياه'],
+	] as const) {
+		assert.equal(
+			highlightSegments(text, query)
+				.map((s) => s.text)
+				.join(''),
+			text,
+			'the segments join back to the text'
+		);
+	}
+});
+
+test('a cut text never splits a character that takes two UTF-16 units', () => {
+	const text = `${'x'.repeat(CHUNK_TEXT_MAX - 1)}😀tail`;
+	const clamped = clampText(text);
+	assert.equal(clamped.truncated, true);
+	assert.equal(clamped.text, 'x'.repeat(CHUNK_TEXT_MAX - 1), 'the emoji that would be cut in half is left out whole');
+	assert.ok(!/[\uD800-\uDBFF]$/.test(clamped.text));
+});
+
+test('punctuation of those scripts ends a word: an Arabic question mark, a Hebrew maqaf, a Devanagari danda', () => {
+	assert.deepEqual(marked(highlightSegments('أين المياه؟ هنا', 'المياه')), ['المياه']);
+	assert.deepEqual(marked(highlightSegments('בית־המים', 'המים')), ['המים']);
+	assert.deepEqual(marked(highlightSegments('पानी। अब', 'पानी')), ['पानी']);
+	assert.deepEqual(marked(highlightSegments('٢٠٢٦ المياه', '٢٠٢٦')), ['٢٠٢٦'], 'Arabic-Indic digits are a word');
+});

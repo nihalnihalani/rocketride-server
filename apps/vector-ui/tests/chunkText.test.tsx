@@ -275,3 +275,24 @@ test("with Tree edges drawn the inspector lists the point's tree neighbours, eac
 	assert.doesNotMatch(html(<PointInspector {...base} index={0} treeNeighbours={null} />), /Tree neighbours/);
 	assert.doesNotMatch(html(<PointInspector {...base} index={0} treeNeighbours={[]} />), /Tree neighbours/);
 });
+
+test("on the last chunk of a document Next chunk is disabled: the inspector hands the section the document's chunk count", async () => {
+	const r = sample.result;
+	let index = -1;
+	for (let i = 0; i < r.n && index < 0; i += 1) {
+		const doc = r.docs[r.points.doc[i] as number]!;
+		if (doc.chunks !== null && r.points.chunk[i] === doc.chunks - 1 && doc.chunks > 1) index = i;
+	}
+	assert.ok(index >= 0, 'a last chunk is in the sample');
+	const doc = r.docs[r.points.doc[index] as number]!;
+	const key: VectorKey = [doc.objectId, r.points.chunk[index] as number];
+	await chunkTexts.load(chunkTextScope(undefined, sample.sampleId), key, async () => ok('last words'));
+	const last = html(<ChunkTextSection sampleId={sample.sampleId} chunkKey={key} label={`${doc.path} #${key[1]}`} query={null} chunks={doc.chunks} loadText={async () => ok('x')} initialOpen />);
+	assert.match(last, /<button[^>]*disabled=""[^>]*>Next chunk<\/button>/);
+	const before: VectorKey = [doc.objectId, key[1] - 1];
+	await chunkTexts.load(chunkTextScope(undefined, sample.sampleId), before, async () => ok('earlier words'));
+	assert.doesNotMatch(html(<ChunkTextSection sampleId={sample.sampleId} chunkKey={before} label="x" query={null} chunks={doc.chunks} loadText={async () => ok('x')} initialOpen />), /<button[^>]*disabled=""[^>]*>Next chunk<\/button>/, 'before the last, Next is enabled');
+	assert.doesNotMatch(html(<ChunkTextSection sampleId={sample.sampleId} chunkKey={key} label="x" query={null} loadText={async () => ok('x')} initialOpen />), /<button[^>]*disabled=""[^>]*>Next chunk<\/button>/, 'an unknown count leaves Next enabled');
+	const inspector = html(<PointInspector {...base} index={index} loadText={async () => ok('x')} />);
+	assert.match(inspector, /Show full text/);
+});

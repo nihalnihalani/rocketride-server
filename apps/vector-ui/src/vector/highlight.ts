@@ -37,7 +37,12 @@
 //
 // Words are scanned character by character (letters of any script, digits,
 // and an apostrophe between letters) rather than with Unicode property
-// regexes, which some of the browsers this app supports lack.
+// regexes or Intl.Segmenter, which some of the browsers this app supports
+// lack. Letters without case (Arabic, Hebrew, the Indic scripts, Hangul,
+// Ethiopic, Tibetan) are known by their blocks and match as whole words.
+// Scripts written without spaces between words (Chinese, Japanese, Thai,
+// Lao, Khmer, Myanmar) have no word ends to find, so there a query word is
+// marked wherever it occurs inside a run, and one character is a word.
 // =============================================================================
 
 /** Most characters of a chunk the panel shows. */
@@ -53,44 +58,98 @@ export interface ITextSegment {
 export const STOP_WORDS: ReadonlySet<string> = new Set(('a about above after again against all also am an and any are as at be because been before being below between both but by ' + 'can could did do does doing done down during each few for from further get gets got had has have having he her here hers ' + 'herself him himself his how i if in into is it its itself just me more most my myself no nor not now of off on once only or ' + 'other our ours ourselves out over own same she should so some such than that the their theirs them themselves then there ' + 'these they this those through to too under until up us very was we were what when where which while who whom whose why will ' + 'with would you your yours yourself yourselves shall may might must let lets').split(' '));
 
 /**
- * Whether a character belongs to a word: a letter of any script, or a digit.
+ * Whether a UTF-16 unit is a letter of a script written without spaces
+ * between words: Thai, Lao, Myanmar, Khmer, kana, CJK ideographs.
+ *
+ * @param code - The unit.
+ * @returns True for those scripts.
+ */
+function isUnspaced(code: number): boolean {
+	return (code >= 0x0e00 && code <= 0x0eff) || (code >= 0x1000 && code <= 0x109f) || (code >= 0x1780 && code <= 0x17ff) || (code >= 0x3040 && code <= 0x30ff) || (code >= 0x3400 && code <= 0x4dbf) || (code >= 0x4e00 && code <= 0x9fff) || (code >= 0xf900 && code <= 0xfaff);
+}
+
+/**
+ * Whether a UTF-16 unit is a letter (or a combining mark) of a script
+ * without case that spaces its words: Hebrew, Arabic, Syriac, Thaana, the
+ * Indic scripts, Tibetan, Ethiopic, Hangul.
+ *
+ * @param code - The unit.
+ * @returns True for those scripts.
+ */
+function isCaselessSpaced(code: number): boolean {
+	if (CASELESS_PUNCTUATION.has(code)) return false;
+	return (code >= 0x0591 && code <= 0x05f4) || (code >= 0x0610 && code <= 0x06ff) || (code >= 0x0700 && code <= 0x07bf) || (code >= 0x08a0 && code <= 0x08ff) || (code >= 0x0900 && code <= 0x0dff) || (code >= 0x0f00 && code <= 0x0fff) || (code >= 0x1100 && code <= 0x11ff) || (code >= 0x1200 && code <= 0x137f) || (code >= 0x3130 && code <= 0x318f) || (code >= 0xac00 && code <= 0xd7af);
+}
+
+/** Punctuation inside those blocks (Hebrew maqaf and sof pasuq, Arabic comma to full stop, the Indic dandas, Ethiopic stops): never part of a word. */
+const CASELESS_PUNCTUATION: ReadonlySet<number> = new Set([0x05be, 0x05c0, 0x05c3, 0x05c6, 0x061b, 0x061e, 0x061f, 0x066a, 0x066b, 0x066c, 0x066d, 0x06d4, 0x0964, 0x0965, 0x0f0b, 0x0f0d, 0x0f0e, 0x1361, 0x1362, 0x1363, 0x1364, 0x1365, 0x1366, 0x1367, 0x1368]);
+
+/**
+ * What a character is to the word scan: 0 not a word character, 1 a letter
+ * or digit of a spaced script, 2 a letter of a script without spaces.
  *
  * @param ch - One character (one UTF-16 unit).
- * @returns True for a word character.
+ * @returns Its kind.
  */
-function isWordChar(ch: string): boolean {
-	if (ch >= '0' && ch <= '9') return true;
-	return ch.toLowerCase() !== ch.toUpperCase();
+function kindOf(ch: string): 0 | 1 | 2 {
+	if (ch >= '0' && ch <= '9') return 1;
+	const code = ch.charCodeAt(0);
+	if (isUnspaced(code)) return 2;
+	if (isCaselessSpaced(code)) return 1;
+	return ch.toLowerCase() !== ch.toUpperCase() ? 1 : 0;
 }
 
 /** Apostrophes that may join two parts of a word ("station's"). */
 const APOSTROPHES = "'’";
 
+/** A run of the scan: a word of a spaced script, a run of an unspaced script, or anything between. */
+interface IRun {
+	text: string;
+	word: boolean;
+	/** A run of a script without spaces (a query word may sit inside it). */
+	unspaced: boolean;
+}
+
 /**
- * Split text into word and non-word runs.
+ * Split text into word and non-word runs; a run of an unspaced script is
+ * its own run.
  *
  * @param text - Any text.
  * @returns The runs, in order; they join back to `text`.
  */
-function runs(text: string): Array<{ text: string; word: boolean }> {
-	const out: Array<{ text: string; word: boolean }> = [];
+function runs(text: string): IRun[] {
+	const out: IRun[] = [];
 	let i = 0;
 	while (i < text.length) {
 		const start = i;
-		const word = isWordChar(text[i] as string);
+		const kind = kindOf(text[i] as string);
 		i += 1;
 		while (i < text.length) {
 			const ch = text[i] as string;
-			if (word) {
-				if (isWordChar(ch)) i += 1;
-				else if (APOSTROPHES.includes(ch) && i + 1 < text.length && isWordChar(text[i + 1] as string)) i += 2;
+			const next = kindOf(ch);
+			if (kind === 1) {
+				if (next === 1) i += 1;
+				else if (APOSTROPHES.includes(ch) && i + 1 < text.length && kindOf(text[i + 1] as string) === 1) i += 2;
 				else break;
-			} else if (isWordChar(ch)) break;
+			} else if (next !== kind) break;
 			else i += 1;
 		}
-		out.push({ text: text.slice(start, i), word });
+		out.push({ text: text.slice(start, i), word: kind !== 0, unspaced: kind === 2 });
 	}
 	return out;
+}
+
+/**
+ * The fewest characters a query word needs: one for a Hangul syllable block
+ * (a whole syllable, often a word: 물), two otherwise (one Latin letter is no
+ * word worth marking).
+ *
+ * @param word - The word.
+ * @returns 1 or 2.
+ */
+function shortestWord(word: string): number {
+	const code = word.charCodeAt(0);
+	return word.length === 1 && code >= 0xac00 && code <= 0xd7af ? 1 : 2;
 }
 
 /**
@@ -137,11 +196,15 @@ export function queryTerms(query: string | null | undefined): string[] {
 	const out: string[] = [];
 	for (const run of runs(query)) {
 		if (!run.word) continue;
+		if (run.unspaced) {
+			if (!out.includes(run.text)) out.push(run.text);
+			continue;
+		}
 		const lower = run.text.toLowerCase();
 		const bare = lower.replace(/['’]s$/, '');
-		if (bare.length < 2 || STOP_WORDS.has(lower) || STOP_WORDS.has(bare)) continue;
+		if (bare.length < shortestWord(bare) || STOP_WORDS.has(lower) || STOP_WORDS.has(bare)) continue;
 		const s = stem(lower);
-		if (s.length >= 2 && !out.includes(s)) out.push(s);
+		if (s.length >= shortestWord(s) && !out.includes(s)) out.push(s);
 	}
 	return out;
 }
@@ -159,11 +222,18 @@ export function queryWords(query: string | null | undefined): string[] {
 	const out: string[] = [];
 	for (const run of runs(query)) {
 		if (!run.word) continue;
+		if (run.unspaced) {
+			if (!stems.has(run.text)) {
+				stems.add(run.text);
+				out.push(run.text);
+			}
+			continue;
+		}
 		const lower = run.text.toLowerCase();
 		const bare = lower.replace(/['’]s$/, '');
-		if (bare.length < 2 || STOP_WORDS.has(lower) || STOP_WORDS.has(bare)) continue;
+		if (bare.length < shortestWord(bare) || STOP_WORDS.has(lower) || STOP_WORDS.has(bare)) continue;
 		const s = stem(lower);
-		if (s.length < 2 || stems.has(s)) continue;
+		if (s.length < shortestWord(s) || stems.has(s)) continue;
 		stems.add(s);
 		out.push(bare);
 	}
@@ -172,8 +242,9 @@ export function queryWords(query: string | null | undefined): string[] {
 
 /**
  * Split a chunk's text into segments, marking every whole word whose stem is
- * one of the query's. Unmarked runs are merged; the segments join back to the
- * text exactly.
+ * one of the query's and, in a run of a script without spaces, every place a
+ * query word of that script occurs (the longest first). Unmarked runs are
+ * merged; the segments join back to the text exactly.
  *
  * @param text - The chunk's text.
  * @param query - The active query, or null.
@@ -183,14 +254,29 @@ export function highlightSegments(text: string, query: string | null | undefined
 	if (text === '') return [];
 	const terms = new Set(queryTerms(query));
 	if (terms.size === 0) return [{ text, mark: false }];
+	const inside = [...terms].filter((t) => runs(t).every((r) => r.unspaced)).sort((a, b) => b.length - a.length);
 	const out: ITextSegment[] = [];
 	let plain = '';
+	const mark = (word: string): void => {
+		if (plain !== '') out.push({ text: plain, mark: false });
+		plain = '';
+		out.push({ text: word, mark: true });
+	};
 	for (const run of runs(text)) {
-		if (run.word && terms.has(stem(run.text))) {
-			if (plain !== '') out.push({ text: plain, mark: false });
-			plain = '';
-			out.push({ text: run.text, mark: true });
-		} else plain += run.text;
+		if (run.unspaced && inside.length > 0) {
+			let at = 0;
+			while (at < run.text.length) {
+				const found = inside.find((t) => run.text.startsWith(t, at));
+				if (found) {
+					mark(found);
+					at += found.length;
+				} else {
+					plain += run.text[at] as string;
+					at += 1;
+				}
+			}
+		} else if (run.word && !run.unspaced && terms.has(stem(run.text))) mark(run.text);
+		else plain += run.text;
 	}
 	if (plain !== '') out.push({ text: plain, mark: false });
 	return out;
@@ -209,12 +295,16 @@ export function markedWords(segments: readonly ITextSegment[]): number {
 }
 
 /**
- * Cut a chunk's text to what the panel shows.
+ * Cut a chunk's text to what the panel shows, on a character boundary.
  *
  * @param text - The full text.
  * @param max - Most characters (CHUNK_TEXT_MAX).
  * @returns The text and whether it was cut.
  */
 export function clampText(text: string, max: number = CHUNK_TEXT_MAX): { text: string; truncated: boolean } {
-	return text.length > max ? { text: text.slice(0, max), truncated: true } : { text, truncated: false };
+	if (text.length <= max) return { text, truncated: false };
+	// Never between the two halves of a character outside the BMP (an emoji, a rare ideograph).
+	const last = text.charCodeAt(max - 1);
+	const end = last >= 0xd800 && last <= 0xdbff ? max - 1 : max;
+	return { text: text.slice(0, end), truncated: true };
 }
