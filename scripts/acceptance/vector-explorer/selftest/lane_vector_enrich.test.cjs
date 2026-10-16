@@ -227,6 +227,55 @@ test('the lane writes lane_vector_enrich.json into its output folder (the file v
 	assert.ok(source.includes("path.join(out, 'lane_vector_enrich.json')"));
 });
 
+test('vector-ui:e2e-live runs the enrichment lane when it is named, with the backends, and leaves it out of the default and of all', async () => {
+	// It removes and puts back demo documents, so a run opts in by name.
+	const tasks = require(path.join(ACC, '..', '..', '..', 'apps', 'vector-ui', 'scripts', 'tasks.js'));
+	const ENV = { ENGINE_URL: 'http://127.0.0.1:5650/' };
+	assert.deepStrictEqual(tasks.e2e.planE2e({ ...ENV, VECTOR_UI_E2E_LANES: 'enrich' }).lanes, [{ name: 'enrich', script: 'lane_vector_enrich.cjs' }]);
+	assert.deepStrictEqual(
+		tasks.e2e.planE2e({ ...ENV, VECTOR_UI_E2E_LANES: 'vector,enrich' }).lanes.map((l) => l.name),
+		['vector', 'enrich']
+	);
+	assert.deepStrictEqual(
+		tasks.e2e.planE2e(ENV).lanes.map((l) => l.name),
+		['vector', 'perf']
+	);
+	assert.deepStrictEqual(
+		tasks.e2e.planE2e({ ...ENV, VECTOR_UI_E2E_LANES: 'all' }).lanes.map((l) => l.name),
+		['vector', 'perf']
+	);
+	assert.throws(() => tasks.e2e.planE2e({ ...ENV, VECTOR_UI_E2E_LANES: 'graph' }), /Unknown lane "graph".*vector, perf, all, enrich/);
+	assert.ok(fs.existsSync(path.join(tasks.e2e.ACCEPTANCE_BROWSER_DIR, tasks.e2e.OPT_IN_LANES.enrich)));
+	const outDir = fs.mkdtempSync(path.join(os.tmpdir(), 'vx-enrich-e2e-'));
+	try {
+		const plan = tasks.e2e.planE2e({ ...ENV, OUT_DIR: outDir, VECTOR_UI_E2E_LANES: 'vector,enrich', VECTOR_UI_E2E_BACKENDS: 'qdrant,chroma' });
+		const calls = [];
+		const exec = async (args) => {
+			calls.push(args);
+			const [script, , out] = args;
+			fs.mkdirSync(out, { recursive: true });
+			const name = `${path.basename(script, '.cjs')}.json`;
+			fs.writeFileSync(path.join(out, name), JSON.stringify([{ browser: 'chrome', backend: 'qdrant', name: 'clusters', status: path.basename(script) === 'lane_vector_enrich.cjs' ? 'FAIL' : 'PASS' }]));
+			if (path.basename(script) === 'lane_vector_enrich.cjs') throw new Error('Command failed (exit 1)');
+			return undefined;
+		};
+		await assert.rejects(tasks.e2e.runLanes(plan, { exec }), (error) => {
+			assert.match(error.message, /^1 of 2 lane runs failed/m);
+			assert.match(error.message, /lane_vector_enrich\.cjs \(chrome\): 1 failed row in lane_vector_enrich\.json:\n {2}qdrant: clusters$/m);
+			return true;
+		});
+		assert.deepStrictEqual(
+			calls.map((args) => [path.basename(args[0]), ...args.slice(4)]),
+			[
+				['lane_vector.cjs', 'qdrant,chroma'],
+				['lane_vector_enrich.cjs', 'qdrant,chroma'],
+			]
+		);
+	} finally {
+		fs.rmSync(outDir, { recursive: true, force: true });
+	}
+});
+
 test("the lane's planted facts and its own cards are the generator's", () => {
 	const facts = python(`
 import gen_corpus as g
@@ -347,6 +396,32 @@ test("edgesVerdict: the tree is n minus the components, neighbours at most 5n, h
 	for (const [what, change] of Object.entries({ 'tree count': { tree: 19 }, 'no neighbour edges': { neighbours5: 0 }, 'too many': { neighbours5: 101 }, 'no hover': { hovered: null }, 'no selection': { selected: null }, 'expand count': { expanded: 5 }, 'no graph': { sample: sampleOf({ knn: undefined }) } })) assert.notStrictEqual(lane.edgesVerdict({ ...sound, ...change }), true, what);
 	// A point with no neighbour (noise) cannot be expanded.
 	assert.notStrictEqual(lane.edgesVerdict({ ...sound, selected: 18, expanded: 0 }), true);
+	assert.notStrictEqual(lane.edgesVerdict({ ...sound, hovered: 0 }), true, 'the hover drew no more with the edges on than off');
+});
+
+test('matrixCluster: the largest group of at most the matrix cap that holds two chunks of one document', () => {
+	const sample = sampleOf();
+	// Group 0 is the manual (6 points, one document): it fits and has same-document pairs.
+	assert.deepStrictEqual(lane.matrixCluster(sample), { cluster: 0, size: 6 });
+	assert.strictEqual(lane.MATRIX_MAX, 100);
+	// Over the cap the next group that fits is taken; with every group one point per document none is.
+	assert.deepStrictEqual(lane.matrixCluster(sample, 5, 5), { cluster: 1, size: 5 });
+	const spread = sampleOf({ points: { ...sampleOf().points, doc: DOC_OF.map((_, i) => i % 7) } });
+	assert.strictEqual(lane.matrixCluster(spread), null, 'every group holds one chunk per document');
+	assert.strictEqual(lane.matrixCluster(sampleOf({ clusters: undefined })), null);
+});
+
+test('csvTable reads past the byte-order mark the app writes first', () => {
+	assert.deepStrictEqual(lane.csvTable('\uFEFFobjectId,chunkId\r\na,1\r\n').header, ['objectId', 'chunkId']);
+	assert.strictEqual(lane.csvTable('\uFEFFobjectId,chunkId\r\na,1\r\n').rows.length, 1);
+});
+
+test('hoverEdgePixels: what the hover adds over its edges is the overlay difference with the edges on less the one with them off', () => {
+	// The ring alone adds 60 pixels; with the edges on the hover also draws its thicker edges (140 pixels).
+	assert.strictEqual(lane.hoverEdgePixels({ withEdges: { away: 10, over: 210 }, without: { away: 10, over: 70 } }), 140);
+	// The ring and nothing else: the edges were not thickened.
+	assert.strictEqual(lane.hoverEdgePixels({ withEdges: { away: 10, over: 70 }, without: { away: 10, over: 70 } }), 0);
+	for (const broken of [null, {}, { withEdges: { away: 1, over: 2 } }, { withEdges: { away: 1, over: null }, without: { away: 1, over: 2 } }]) assert.strictEqual(lane.hoverEdgePixels(broken), null, JSON.stringify(broken));
 });
 
 test('rampVerdict: the dated ramp names the first and last ingest day of the sampled documents', () => {
@@ -573,12 +648,17 @@ test('dedupeVerdict: two groups for the two planted pairs, the shortest path kep
 		[`${D}field/kestrel_field_guide.md`, `${D}archive/kestrel_field_guide_copy.md`],
 	];
 	const keptPaths = [`${D}handbooks/falcon_handbook.md`, `${D}field/kestrel_field_guide.md`];
-	const sound = { groups, keptPaths, samplesSent: 0, thresholdAfter: '0.92' };
+	const queuedPaths = [groups[0][1], groups[1][1]];
+	const sound = { groups, keptPaths, queuedPaths, queuedCount: 2, samplesSent: 0, thresholdAfter: '0.92' };
 	assert.strictEqual(lane.dedupeVerdict(sound), true);
 	const broken = {
 		'a pair split': { groups: [[groups[0][0]], [groups[0][1]], groups[1]] },
 		'one group': { groups: [[...groups[0], ...groups[1]]] },
 		'rev2 kept': { keptPaths: [groups[0][1], groups[1][0]] },
+		'nothing queued': { queuedPaths: [], queuedCount: 0 },
+		'one pair not queued': { queuedPaths: [groups[0][1]], queuedCount: 1 },
+		'a kept document queued': { queuedPaths: [groups[0][0], groups[0][1], groups[1][1]], queuedCount: 3 },
+		'the count disagrees with the marks': { queuedCount: 3 },
 		'slider not moved': { thresholdAfter: '0.97' },
 		're-sampled': { samplesSent: 1 },
 	};
@@ -727,42 +807,125 @@ test('ingestVerdict and healthVerdict: the drop summary and the pin; the legacy 
 // ---------------------------------------------------------------------------
 // What the lane looks for exists in the app's source (once the owning lane's code is on this branch)
 // ---------------------------------------------------------------------------
+//
+// The app's source is apps/vector-ui/src of this checkout, or VX_APP_SRC (e.g. the merged app of
+// vx/integration, checked from a lane branch whose own copy still holds the day-0 placeholders).
+// Comment lines are left out before matching: a marker or a label must be in the code.
 
-const SRC = path.join(ACC, '..', '..', '..', 'apps', 'vector-ui', 'src');
-const src = (file) => (fs.existsSync(path.join(SRC, file)) ? fs.readFileSync(path.join(SRC, file), 'utf8') : null);
-/** The NEEDS reason while `file` is still the day-0 placeholder (or lacks the owning lane's marker), else false. */
+const SRC = process.env.VX_APP_SRC || path.join(ACC, '..', '..', '..', 'apps', 'vector-ui', 'src');
+/** A source file's code without its comment lines (// lines, the lines of block comments). */
+function codeOf(text) {
+	const out = [];
+	let block = false;
+	for (const line of String(text).split('\n')) {
+		const t = line.trim();
+		if (block) {
+			if (t.includes('*/')) block = false;
+			continue;
+		}
+		if (t.startsWith('/*')) {
+			block = !t.includes('*/');
+			continue;
+		}
+		if (t.startsWith('//')) continue;
+		out.push(line);
+	}
+	return out.join('\n');
+}
+/** The code of an app source file, or null when the file is absent. */
+const src = (file) => (fs.existsSync(path.join(SRC, file)) ? codeOf(fs.readFileSync(path.join(SRC, file), 'utf8')) : null);
+/** The NEEDS reason while `file` is absent or still the day-0 placeholder (or its code lacks the owning lane's marker), else false. */
 const needs = (lanes, file, marker) => {
 	const text = src(file);
 	const built = text !== null && (marker ? text.includes(marker) : !text.includes('data-placeholder'));
-	return built ? false : `NEEDS:${lanes} merged — integration gate GE2 (${file} is not built on this branch)`;
+	return built ? false : `NEEDS:${lanes} merged — integration gate GE2 (${file} is not built in ${SRC}; VX_APP_SRC checks another tree)`;
 };
+
+test('the source checks read code, not comments', () => {
+	const text = ['// Drop of 3 files', '/*', ' * aria-label="Hidden"', ' */', '/** One line: Hidden too */', 'const a = <b aria-label="Shown">Drop of {n}</b>; // trailing words stay', '\t// Indented comment'].join('\n');
+	const code = codeOf(text);
+	assert.ok(!code.includes('Hidden'), code);
+	assert.ok(!code.includes('Indented comment'));
+	assert.ok(!code.includes('Drop of 3 files'));
+	assert.ok(code.includes('aria-label="Shown"') && code.includes('Drop of {n}'));
+});
+
+const UI = lane.UI;
+/** A data hook's attribute text from its selector ('[data-x="y"]' -> 'data-x="y"'); anything else as written. */
+const hook = (sel) => (typeof sel === 'string' && sel.startsWith('[') && sel.endsWith(']') ? sel.slice(1, -1) : String(sel));
+/**
+ * The names and hooks the lane's UI table finds the enrichment's controls by, and the source file
+ * that must carry each (as an aria-label, or as the data hook itself): [owner, file, marker, patterns].
+ */
+const UI_SOURCES = [
+	['E5', 'components/MapToolbar.tsx', 'aria-label="Edges per point"', [`aria-label="${UI.map.edges}"`, `aria-label="${UI.map.edgesPerPoint}"`, `aria-label="${UI.map.colourBy}"`]],
+	['E5', 'components/ClustersPanel.tsx', null, [`aria-label="${UI.map.minClusterSize}"`, `aria-label="${UI.map.clustersList}"`]],
+	['E6', 'components/DuplicatesPanel.tsx', 'Near-duplicate review', [`aria-label="${UI.dedupe.section}"`, `aria-label="${UI.dedupe.threshold}"`, `aria-label="${UI.dedupe.policy}"`]],
+	['E6', 'components/OutliersPanel.tsx', 'data-component="OutliersPanel"', [hook(UI.outliers.section), `aria-label="${UI.outliers.percentile}"`]],
+	['E6', 'components/PointInspector.tsx', 'Add as example', [`aria-label="${UI.inspector.addPositive}"`, `aria-label="${UI.inspector.addNegative}"`]],
+	['E6', 'components/RecommendPanel.tsx', null, [hook(UI.recommend.panel), `aria-label="${UI.recommend.strategy}"`]],
+	['E6', 'components/ChunkTextPanel.tsx', null, [hook(UI.text.panel)]],
+	['E6', 'components/SimilarityMatrix.tsx', null, [hook(UI.matrix.panel)]],
+	['E7', 'components/SearchPanel.tsx', null, [hook(UI.search.panel), `aria-label="${UI.search.box}"`, `aria-label="${UI.search.boxB}"`, `aria-label="${UI.search.threshold}"`]],
+	['E8', 'components/SavedViewsMenu.tsx', null, [hook(UI.views.menu), `aria-label="${UI.views.name}"`, hook(UI.views.save)]],
+	['E8', 'components/ExportMenu.tsx', null, [hook(UI.export.menu), 'data-export-item={item.id}', 'data-export-format={format}']],
+	['E4', 'components/ScopeBar.tsx', null, [`aria-label="${UI.scope.prefix}"`, `aria-label="${UI.scope.saveName}"`]],
+	['E9', 'components/UploadList.tsx', 'data-component="IngestSummary"', [hook(UI.ingest.root)]],
+];
+for (const [owner, file, marker, patterns] of UI_SOURCES) {
+	test(`the lane's UI names for ${file} are the app's`, { skip: needs(owner, file, marker) }, () => {
+		const text = src(file);
+		assert.deepStrictEqual(
+			patterns.filter((p) => !text.includes(p)),
+			[],
+			`${file} lacks these`
+		);
+	});
+}
+
+/** The wording and hooks the lane's steps read beyond the UI names: [owner, file, marker, patterns]. */
 const SOURCES = [
-	['E5', 'views/MapView.tsx', 'data-edge-mode', ['data-colour-by', 'data-edge-count', 'data-edges-hovered', 'data-min-cluster-size', 'data-shown', 'data-isolated', 'data-query-b-state']],
-	['E5', 'components/MapToolbar.tsx', 'aria-label="Edges per point"', ['aria-label="Edges"', 'aria-label="Edges per point"', 'aria-label="Colour by"', 'Expand selected']],
-	['E5', 'components/ClustersPanel.tsx', null, ['aria-label="Minimum size"', 'aria-label="Clusters by size"', 'Ask about the documents of cluster ${', 'in no group']],
+	['E5', 'views/MapView.tsx', 'data-edge-mode', ['data-colour-by', 'data-edge-count', 'data-min-cluster-size', 'data-shown', 'data-isolated', 'data-query-state', 'data-query-b-state']],
+	['E5', 'components/PointCanvas.tsx', 'data-layer="edges"', ['className="vector-map-canvas"', 'data-layer="edges"', 'data-map-tooltip']],
+	['E5', 'map/overlay.ts', 'hoverEdges', ['extras.hoverEdges', 'ctx.lineWidth = 2']],
+	['E5', 'components/MapToolbar.tsx', 'aria-label="Edges per point"', ['Expand selected', "{ id: 'tree', label: 'Tree' }", "{ id: 'neighbours', label: 'Neighbours' }"]],
+	['E5', 'components/ClustersPanel.tsx', null, ['Ask about the documents of cluster ${', 'in no group', 'data-cluster="noise"']],
 	['E5', 'map/colours.ts', "'ingest-date'", ["label: 'Cluster'", "label: 'Ingest date'", 'oldest (${', 'newest (${']],
 	['E5', 'components/Legend.tsx', 'Colour ramp from', ['Colour ramp from ${']],
 	['E5', 'map/wording.ts', 'listingNote', ['Sampled from the first ${num(listing.documents)} documents by path; the collection has more']],
-	['E6', 'components/DuplicatesPanel.tsx', 'Near-duplicate review', ['aria-label="Near-duplicate review"', 'aria-label="Near-duplicate similarity threshold"', 'aria-label="Which document each group keeps"', 'data-threshold', 'fieldset', 'Show group']],
-	['E6', 'map/reviewWording.ts', 'removeAllLabel', ['Remove all queued (${', "'shortest-path'", 'Keep shortest path']],
-	['E6', 'components/OutliersPanel.tsx', 'data-component="OutliersPanel"', ['Remove document', '<select', 'sample median']],
-	['E6', 'components/PointInspector.tsx', 'Add as example', ['Add as example (+)', 'Add as example (−)', 'Show full text']],
-	['E6', 'components/RecommendPanel.tsx', null, ['aria-label="Strategy"', 'Best score', 'Run']],
+	['E6', 'components/DuplicatesPanel.tsx', 'Near-duplicate review', ['data-threshold', 'data-group={group.id}', 'type="radio"', 'aria-label={`Keep ${path}`}', 'Show group']],
+	['E6', 'map/reviewWording.ts', 'removeAllLabel', ['Remove all queued (${', "'shortest-path'"]],
+	['E6', 'components/OutliersPanel.tsx', 'data-component="OutliersPanel"', ['Remove document', '<select', 'aria-label="Outliers"']],
+	['E6', 'map/outliers.ts', 'whyText', ['vs sample median ${']],
+	['E6', 'components/ChunkTextPanel.tsx', null, ["'Show full text'", "'Hide full text'", '<mark']],
+	['E6', 'components/RecommendPanel.tsx', null, ['Best score (ranked by the store)', 'onClick={() => props.onRun()}']],
 	['E6', 'components/SimilarityMatrix.tsx', null, ['Export CSV']],
-	['E6', 'components/ChunkTextPanel.tsx', null, ['<mark']],
-	['E7', 'components/ChatPanel.tsx', 'Search without the LLM', ['Search without the LLM', 'aria-pressed']],
-	['E7', 'components/SearchPanel.tsx', null, ['aria-label="Search the collection"', 'aria-label="Compare with"', 'aria-label="Search mode"', 'aria-label="Threshold"', 'Copy as node setting', 'Compare']],
-	['E8', 'components/ExportMenu.tsx', null, ['data-export-item', 'data-export-format', 'role="menuitem"']],
-	['E8', 'components/SavedViewsMenu.tsx', null, ['Save current view', 'aria-label="Name of the view"', 'Apply view ${', 'selected points restored']],
-	['E9', 'components/UploadList.tsx', 'Drop of', ['data-component="IngestSummary"', 'Show new chunks on the map', 'new chunks placed']],
-	['E4', 'components/ScopeBar.tsx', null, ['Add condition', 'aria-label="Folder the paths start with"', 'aria-label="Name of the saved filter"', 'Apply saved filter ${', 'Remove condition: ${', 'Save…', 'Clear']],
+	['E7', 'components/ChatPanel.tsx', 'Search without the LLM', ['title="Search without the LLM"', 'aria-pressed']],
+	['E7', 'components/SearchPanel.tsx', null, ['type="radio"', 'Copy as node setting', "'Run A and B'", 'Compare']],
+	['E7', 'vector/searchWorkbench.ts', 'MODE_LABELS', ["semantic: 'Semantic', keyword: 'Keyword'", 'would pass', 'threshold_search: ${']],
+	['E7', 'vector/compare.ts', 'A and B share', ['A and B share ${']],
+	['E7', 'components/QueryCompare.tsx', null, ['on the map`']],
+	['E8', 'components/ExportMenu.tsx', null, ['role="menuitem"', 'aria-haspopup="menu"']],
+	['E8', 'components/SavedViewsMenu.tsx', null, ['Apply view ${', 'Save the current view']],
+	['E8', 'vector/savedViews.ts', 'restoreSentence', ['selected points restored', 'drawn hollow']],
+	['E8', 'vector/export.ts', 'vector-explorer_', ['vector-explorer_${safeCollection(collection)}_${kind}_${fileStamp(at)}.${ext}']],
+	['E9', 'components/UploadList.tsx', 'SHOW_NEW_LABEL', ['{SHOW_NEW_LABEL}']],
+	['E9', 'vector/uploads.ts', 'placedSentence', ["SHOW_NEW_LABEL = 'Show new chunks on the map'", 'Drop of ${', 'new chunks placed:']],
+	['E4', 'components/ScopeBar.tsx', null, ['Add condition', 'Apply saved filter ${', 'Remove condition: ${', 'Save…', 'Clear']],
+	['E4', 'vector/filters.ts', 'scopeStatusText', ["folder: 'Folder is under'", "'documents match'", 'loaded match (filtered here']],
 	['E4', 'components/StatsCharts.tsx', null, ['data-chart={chart.id}', 'aria-label={words}']],
+	['E4', 'components/StatsStrip.tsx', 'StatsCharts', ['>Charts</summary>']],
 	['E4', 'components/DocumentRow.tsx', 'data-flag', ['data-object-id={item.objectId}', 'data-flag']],
+	['E4', 'vector/health.ts', 'no_first_chunk', ["label: 'no first chunk'", "'deleted chunk'"]],
 ];
 for (const [owner, file, marker, patterns] of SOURCES) {
 	test(`the lane's selectors for ${file} exist in the app's source`, { skip: needs(owner, file, marker) }, () => {
 		const text = src(file);
-		for (const p of patterns) assert.ok(text.includes(p), `${file} has no ${JSON.stringify(p)}`);
+		assert.deepStrictEqual(
+			patterns.filter((p) => !text.includes(p)),
+			[],
+			`${file} lacks these`
+		);
 	});
 }
 

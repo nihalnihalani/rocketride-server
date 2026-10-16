@@ -32,8 +32,10 @@
  *   clusters: Minimum size 2 lists the node's groups of 2 or more, with no
  *     sample frame; Ask about these scopes the chat to the group's documents
  *   edges (P0-3): Tree draws n minus the kNN graph's components, Neighbours
- *     m=5 at most 5n; hovering a point thickens its edges; Expand selected
- *     adds that point's kNN edges
+ *     m=5 at most 5n; hovering a point thickens its edges (the map exposes no
+ *     count of them, so the overlay layer's drawn pixels are compared, with
+ *     the pointer over a point and away, with the edges on and off); Expand
+ *     selected adds that point's kNN edges
  *   colour by ingest date (P1-3): the ramp spans the sampled documents' days
  *   isolate (P1-4): Isolate shows the lasso selection only and the table
  *     lists it; Expand by neighbours grows it; Show all restores n
@@ -42,9 +44,10 @@
  *   recommend (P1-1): + a falcon chunk, - a greenhouse chunk: no greenhouse
  *     chunk in the top 12, a falcon or kestrel chunk first, examples
  *     excluded; Best score is native on Qdrant only
- *   matrix (P1-2): a duplicate group's points as a selection: the keys are
- *     sent (never indices), the matrix is symmetric with a unit diagonal,
- *     same-document pairs above 0.5; its CSV has n rows
+ *   matrix (P1-2): one group of at most 100 points with two chunks of one
+ *     document, shown alone and lassoed: the keys are sent (never indices),
+ *     the matrix is symmetric with a unit diagonal, same-document pairs above
+ *     0.5; its CSV (through the map's Export menu) has n rows
  *   export (P0-6): the lasso selection's CSV has its rows and keys, carries no
  *     vector or secret; the map PNG is over 10 KB, drawn, named after the
  *     collection
@@ -140,6 +143,8 @@ const LEGACY_FIXTURE = { name: 'vx-local Legacy (pgvector)', projectId: '0000000
 /** The sampler's listing cap (vx_tools.py SAMPLE_LISTING_MAX) and the pin cap (limits.project_keys_max). */
 const LISTING_MAX = 500;
 const PIN_MAX = 200;
+/** The most keys a similarity matrix takes (limits.matrix_keys_max, vx_defaults.py). */
+const MATRIX_MAX = 100;
 
 const UI = {
 	map: {
@@ -152,6 +157,7 @@ const UI = {
 		minClusterSize: 'Minimum size',
 		clustersList: 'Clusters by size',
 		askCluster: (i) => `Ask about the documents of cluster ${i + 1}`,
+		showCluster: (i) => new RegExp(`^Show only cluster ${i + 1}: `),
 		clusterRowSize: /([\d,]+) points? · ([\d,]+) documents?/,
 		noiseRowSize: /([\d,]+) points? in no group/,
 		ramp: /^Colour ramp from .*\((\d{4}-\d{2}-\d{2})\) to .*\((\d{4}-\d{2}-\d{2})\)$/,
@@ -160,12 +166,13 @@ const UI = {
 		showAll: /^Show all$/,
 		listingCap: (documents) => `Sampled from the first ${documents.toLocaleString('en-US')} documents by path; the collection has more`,
 		tabs: { clusters: /^Clusters$/, duplicates: /^Duplicates$/, outliers: /^Outliers$/, recommend: /^Recommend$/, selection: /^Selection$/, point: /^Point$/ },
+		// The map canvas's overlay layer (PointCanvas: the edges layer, the points, then the overlay), where the hovered point's edges are drawn thicker.
+		overlay: '.vector-map-canvas > canvas:not([data-layer])',
 		// Map root attributes (data-*) the steps read.
 		attr: {
 			colourBy: 'data-colour-by',
 			edgeMode: 'data-edge-mode',
 			edgeCount: 'data-edge-count',
-			edgesHovered: 'data-edges-hovered',
 			minClusterSize: 'data-min-cluster-size',
 			shown: 'data-shown',
 			isolated: 'data-isolated',
@@ -182,37 +189,48 @@ const UI = {
 		showGroup: /^Show group$/,
 		removeAll: /^Remove all queued \(/,
 	},
-	outliers: { section: '[data-component="OutliersPanel"]', percentile: 'Lowest-density share', why: /density [\d.]+ vs (?:the )?sample median [\d.]+/, remove: /^Remove document$/ },
-	inspector: { addPositive: /^Add as example \(\+\)$/, addNegative: /^Add as example \((?:−|-)\)$/, showFullText: /^Show full text$/ },
-	recommend: { panel: '[data-component="RecommendPanel"]', strategy: 'Strategy', bestScore: /^Best score$/, run: /^Run$/ },
-	matrix: { panel: '[data-component="SimilarityMatrix"]' },
+	outliers: { section: '[data-component="OutliersPanel"]', percentile: 'Which share of the sample to review, by lowest density', why: /density [\d.]+ vs (?:the )?sample median [\d.]+/, remove: /^Remove document$/ },
+	inspector: { addPositive: 'Add as a positive example for Recommend', addNegative: 'Add as a negative example for Recommend', showFullText: /^Show full text$/, hideFullText: /^Hide full text$/ },
+	recommend: { panel: '[data-component="RecommendPanel"]', strategy: 'How the examples are combined', bestScore: /^Best score\b/, run: /^Run$/ },
+	// The matrix's Export CSV puts the matrix in the map's Export menu (entry map-matrix).
+	matrix: { panel: '[data-component="SimilarityMatrix"]', exportCsv: /^Export CSV$/, exportItem: 'map-matrix' },
 	text: { panel: '[data-component="ChunkTextPanel"]' },
-	export: { menu: '[data-component="ExportMenu"]', item: (id) => `[data-export-item="${id}"]`, csv: /^CSV$/, json: /^JSON$/, png: /^PNG$/ },
-	views: { menu: '[data-component="SavedViewsMenu"]', open: /^Views/, save: /^Save current view$/, name: 'Name of the view', confirm: /^Save$/, apply: (name) => `Apply view ${name}`, restored: /([\d,]+) of ([\d,]+) selected points restored(?:; ([\d,]+) drawn hollow)?/ },
+	// An entry (data-export-item) holds one button per format (data-export-format).
+	export: { menu: '[data-component="ExportMenu"]', open: /^Export/, item: (id) => `[data-export-item="${id}"]`, format: (id, format) => `[data-export-item="${id}"] [data-export-format="${format}"]` },
+	// The Views menu's panel saves the current view under the name in its box (the Save button's hook).
+	views: { menu: '[data-component="SavedViewsMenu"]', open: /^Views/, panel: 'Saved views', name: 'View name', save: '[data-views-save]', apply: (name) => `Apply view ${name}`, restored: /([\d,]+) of ([\d,]+) selected points restored(?:; ([\d,]+) drawn hollow)?/ },
 	scope: {
 		add: /^Add condition$/,
 		folder: /^Folder is under$/,
+		editor: 'Folder is under',
+		// The prefix box offers the known folders (a datalist), so its role is combobox: found by its label.
 		prefix: 'Folder the paths start with',
 		addButton: /^Add$/,
 		saveOpen: /^Save…$/,
+		saveGroup: 'Save these conditions',
 		saveName: 'Name of the saved filter',
 		save: /^Save$/,
 		saved: /^Saved/,
 		applySaved: (name) => `Apply saved filter ${name}`,
 		clear: /^Clear$/,
 		chip: (prefix) => `Remove condition: folder is under ${prefix}`,
-		status: /([\d,]+) (?:document matches|documents match) \(store[^)]*\)|([\d,]+) of ([\d,]+) loaded match \(filtered here[^)]*\)/,
+		status: /([\d,]+) (?:document matches|documents match) \(store[^)]*\)|([\d,]+) of ([\d,]+) loaded match \((?:store|filtered here)[^)]*\)/,
 	},
 	charts: { summary: /^Charts$/, section: 'Collection charts', chunks: 'figure[data-chart="chunks"]' },
+	// The shell's account menu (its initials) holds Log out.
+	account: { menu: '[aria-haspopup="menu"]', initials: /^[A-Z]{1,3}$/ },
+	// The console's right column stacks Add documents (45 %) over the chat (55 %): their heights are compared.
 	chat: { searchToggle: /^Search$/, asking: /Asking about ([\d,]+) documents? only/, panel: 'section[aria-label="Chat"]', column: 'div[role="region"][aria-label="Chat"]', ingestColumn: 'div[role="region"][aria-label="Add documents"]' },
 	search: {
 		panel: '[data-component="SearchPanel"]',
-		box: 'Search the collection',
-		boxB: 'Compare with',
-		mode: 'Search mode',
+		box: 'Search question',
+		boxB: 'Second question (B)',
+		// The mode is a radio group (Semantic, Keyword, Hybrid, Auto).
+		mode: { semantic: /^Semantic$/, keyword: /^Keyword$/ },
 		threshold: 'Threshold',
-		run: /^Run$/,
+		run: /^Run(?: A and B)?$/,
 		compare: /^Compare$/,
+		showBoth: /^Show A .+ and B .+ on the map$/,
 		copySetting: /^Copy as node setting$/,
 		passing: /At ([\d.]+): ([\d,]+) of ([\d,]+) (?:would )?pass/,
 		compareSummary: /A and B share ([\d,]+) of ([\d,]+) results? \(Jaccard ([\d.]+)\)/,
@@ -286,6 +304,29 @@ function clusterDocuments(sample, cluster) {
 	});
 	ids.delete(null);
 	return ids;
+}
+
+/**
+ * The group the matrix step shows alone and selects: the largest group of at least `minSize` points
+ * (as the Clusters tab folds them) with at most `max` points and two points of one document, so its
+ * matrix holds same-document pairs. { cluster, size }, or null when no group fits.
+ */
+function matrixCluster(sample, minSize = 5, max = MATRIX_MAX) {
+	const folded = foldClusters(sample, minSize);
+	if (!folded) return null;
+	for (const row of folded.rows) {
+		if (row.size < 2 || row.size > max) continue;
+		const seen = new Set();
+		let pair = false;
+		sample.clusters.labels.forEach((label, i) => {
+			if (label !== row.cluster) return;
+			const id = objectIdOf(sample, i);
+			if (seen.has(id)) pair = true;
+			seen.add(id);
+		});
+		if (pair) return row;
+	}
+	return null;
 }
 
 /**
@@ -378,9 +419,22 @@ function knnDegree(knn, i) {
 }
 
 /**
+ * What hovering a point adds to the overlay over its edges: the overlay's drawn pixels with the
+ * pointer over the point less those with it away, with the edges on, less the same difference with
+ * the edges off (the hover ring is drawn either way; only the thickened edges differ). null when a
+ * reading is missing. h = { withEdges: { away, over }, without: { away, over } }.
+ */
+function hoverEdgePixels(h) {
+	const reads = h && h.withEdges && h.without ? [h.withEdges.over, h.withEdges.away, h.without.over, h.without.away] : [];
+	if (reads.length !== 4 || !reads.every(Number.isFinite)) return null;
+	return h.withEdges.over - h.withEdges.away - (h.without.over - h.without.away);
+}
+
+/**
  * The edges step's verdict. x = { sample, tree, neighbours5, hovered, expanded, selected }: the map's
- * edge counts (data-edge-count) for Tree and Neighbours m=5, the edges thickened under the pointer,
- * and the edges drawn after Expand selected (Edges: None) for the selected point.
+ * edge counts (data-edge-count) for Tree and Neighbours m=5, the overlay pixels hovering a point adds
+ * over its edges (hoverEdgePixels), and the edges drawn after Expand selected (Edges: None) for the
+ * selected point.
  */
 function edgesVerdict(x) {
 	const { sample } = x;
@@ -389,7 +443,7 @@ function edgesVerdict(x) {
 	const tree = n - knnComponents(sample.knn, n);
 	if (x.tree !== tree) return `Tree drew ${x.tree} edges; the spanning forest of the sample's kNN graph has ${tree}`;
 	if (!(x.neighbours5 > 0) || x.neighbours5 > 5 * n) return `Neighbours m=5 drew ${x.neighbours5} edges over ${n} points (1 to ${5 * n})`;
-	if (!(x.hovered > 0)) return `hovering a point thickened ${x.hovered} edges`;
+	if (!(x.hovered > 0)) return `hovering a point drew ${x.hovered} more overlay pixels with the edges on than off: its edges are not drawn thicker`;
 	if (!Number.isInteger(x.selected)) return 'no point was selected for Expand selected';
 	const degree = knnDegree(sample.knn, x.selected);
 	if (!(degree > 0)) return `the selected point has no kNN neighbours in the sample`;
@@ -490,7 +544,8 @@ function matrixVerdict({ input, answer, selected, allowed }) {
 
 /** The header and rows of a CSV export (blank trailing records dropped). */
 function csvTable(text) {
-	const records = C.csvRecords(String(text || '')).filter((r) => !(r.length === 1 && r[0] === ''));
+	// The app writes a byte-order mark first, so a spreadsheet reads the file as UTF-8.
+	const records = C.csvRecords(String(text || '').replace(/^\uFEFF/, '')).filter((r) => !(r.length === 1 && r[0] === ''));
 	return { header: records[0] || [], rows: records.slice(1) };
 }
 
@@ -629,14 +684,21 @@ function viewsVerdict({ listedAfterSwitch, saved, apply, line }) {
 
 /**
  * The duplicates queue's verdict: each planted pair in one group (two groups), the shortest-path
- * policy keeps falcon_handbook.md, and the slider re-grouped with no sample request.
+ * policy keeps falcon_handbook.md and queues the other document of each planted pair (the panel's
+ * "queued" marks, which its data-queued count agrees with), and the slider re-grouped with no
+ * sample request.
  */
-function dedupeVerdict({ groups, keptPaths, samplesSent, thresholdAfter }) {
+function dedupeVerdict({ groups, keptPaths, queuedPaths, queuedCount, samplesSent, thresholdAfter }) {
 	const planted = E.DEMO_CORPUS.nearDuplicates;
 	const holding = planted.map(([a, b]) => (groups || []).findIndex((g) => g.some((p) => p.endsWith('/' + a)) && g.some((p) => p.endsWith('/' + b))));
 	if (holding.some((i) => i < 0)) return `planted pairs in no group: ${JSON.stringify(planted.filter((_, i) => holding[i] < 0))}`;
 	if (holding[0] === holding[1]) return 'the two planted pairs share one group';
 	if (!(keptPaths || []).some((p) => p.endsWith('/' + CORPUS.falconFile))) return `Keep shortest path keeps ${JSON.stringify(keptPaths)}, not ${CORPUS.falconFile}`;
+	const queuedList = queuedPaths || [];
+	const unqueued = planted.filter((pair) => !pair.some((f) => queuedList.some((p) => p.endsWith('/' + f))));
+	if (unqueued.length) return `no document of the planted pair ${JSON.stringify(unqueued[0])} is queued (${JSON.stringify(queuedList)})`;
+	if (queuedList.some((p) => (keptPaths || []).includes(p))) return 'a kept document is also queued';
+	if (queuedCount !== queuedList.length) return `the panel counts ${queuedCount} queued documents and marks ${queuedList.length}`;
 	if (thresholdAfter !== '0.92') return `the slider reads ${thresholdAfter} after moving it to 0.92`;
 	return samplesSent === 0 ? true : `moving the slider sent ${samplesSent} sample requests`;
 }
@@ -756,7 +818,7 @@ function compareVerdict({ a, b, summary, starA, starB }) {
 	return starA === 'placed' && starB === 'placed' ? true : `the map's stars are A ${starA}, B ${starB}`;
 }
 
-/** The console layout: the chat column is 55 % of the ingest and chat columns, before and after the Search toggle. */
+/** The console layout: the chat is 55 % of the right column's ingest and chat panels (their heights), before and after the Search toggle. */
 function layoutVerdict({ before, after }) {
 	const ok = (r) => typeof r === 'number' && Math.abs(r - 0.55) <= 0.015;
 	if (!ok(before)) return `the chat column is ${before} of the row before the toggle`;
@@ -872,6 +934,20 @@ async function main(fixtureKey, base, out) {
 		}
 	};
 	const samplesSince = (since) => C.requestsSince(capture, since, (msg) => C.toolOf(msg) === 'sample').length;
+	/** The drawn (non-transparent) pixels of the map's overlay layer (the visible map canvas's last layer), or null when it cannot be read. */
+	const overlayPixels = () =>
+		page
+			.evaluate((selector) => {
+				const layers = [...document.querySelectorAll(selector)].filter((el) => el.getClientRects().length > 0);
+				const layer = layers[layers.length - 1];
+				const ctx = layer && layer.width > 0 && layer.height > 0 ? layer.getContext('2d') : null;
+				if (!ctx) return null;
+				const data = ctx.getImageData(0, 0, layer.width, layer.height).data;
+				let drawn = 0;
+				for (let i = 3; i < data.length; i += 4) if (data[i] > 0) drawn += 1;
+				return drawn;
+			}, UI.map.overlay)
+			.catch(() => null);
 	/** The labels of a select's options. */
 	const optionsOf = async (select) => {
 		const texts = await select
@@ -912,7 +988,8 @@ async function main(fixtureKey, base, out) {
 		if (!box) throw new Error('the map canvas has no size');
 		const lasso = toolbar.getByRole('button', { name: MAP.lasso }).first();
 		await lasso.click();
-		const right = box.x + box.width * share;
+		// The lasso's corners stay inside the canvas (2 px in).
+		const right = box.x + Math.min(box.width * share, box.width - 2);
 		await lassoThrough([
 			[box.x + 2, box.y + 2],
 			[right, box.y + 2],
@@ -953,8 +1030,11 @@ async function main(fixtureKey, base, out) {
 	/** Export one item of an ExportMenu (by its IExportItem id) in a format: the download. */
 	const exportItem = async (scope, id, format) => {
 		const menu = visible(scope.locator(UI.export.menu));
-		await visible(menu.getByRole('button', { name: /^Export/ })).click();
-		return download(() => visible(page.locator(`${UI.export.item(id)}[data-export-format="${format}"]`)).click());
+		const opener = visible(menu.getByRole('button', { name: UI.export.open }));
+		if ((await C.attrText(opener, 'aria-expanded')) !== 'true') await opener.click();
+		const entry = visible(page.locator(UI.export.item(id)));
+		if ((await C.attrText(entry, 'data-export-state')) === 'off') throw new Error(`the export entry ${id} is off: ${(await C.textOf(entry)).slice(0, 120)}`);
+		return download(() => visible(page.locator(UI.export.format(id, format))).click());
 	};
 	/** Confirm (or cancel) the removal dialog in front, typing what it asks for. */
 	const answerRemoval = async (confirm, typedCount) => {
@@ -1003,8 +1083,9 @@ async function main(fixtureKey, base, out) {
 		const since = capture.frames.length;
 		await button(UI.scope.add).click();
 		await visible(page.getByRole('menuitem', { name: UI.scope.folder })).click();
-		await visible(page.getByRole('textbox', { name: UI.scope.prefix })).fill(prefix);
-		await button(UI.scope.addButton).click();
+		const editor = visible(page.getByRole('group', { name: UI.scope.editor, exact: true }));
+		await visible(editor.getByLabel(UI.scope.prefix, { exact: true })).fill(prefix);
+		await button(UI.scope.addButton, editor).click();
 		await visible(page.getByRole('button', { name: UI.scope.chip(prefix) })).waitFor({ timeout: 15000 });
 		const listing = await C.waitForExchange(capture, 'documents', { since, timeout: 60000, where: (x) => x.input.filter && x.input.filter.path_prefix === prefix }).catch(() => null);
 		await C.sleep(1500);
@@ -1118,7 +1199,10 @@ async function main(fixtureKey, base, out) {
 			await edges.selectOption('neighbours');
 			await combo(UI.map.edgesPerPoint, toolbar).selectOption('5');
 			const neighbours5 = await read('neighbours');
-			// Hover: sweep for a point (the tooltip shows) and read how many edges are thickened.
+			// Hover: sweep for a point (the tooltip shows). The map says nothing about the edges it
+			// thickens, so the overlay layer's drawn pixels are read with the pointer over the point
+			// and away from it, with the edges on (Neighbours m=5) and off (None): what the hover adds
+			// over the edges is the difference (the hover ring is drawn in both).
 			await toolbar.getByRole('button', { name: MAP.fit }).first().click();
 			const box = await canvas.boundingBox();
 			let hovered = null;
@@ -1137,22 +1221,29 @@ async function main(fixtureKey, base, out) {
 						at = { x: box.x + (box.width * gx) / 20, y: box.y + (box.height * gy) / 14 };
 				}
 			}
-			if (at)
-				hovered = await poll(
-					() => attrInt(UI.map.attr.edgesHovered),
-					(v) => v !== null && v > 0,
-					3000
-				);
-			// Expand selected: Edges None, click the point, Expand selected.
+			let hover = null;
+			if (at && box) {
+				const away = { x: box.x + 3, y: box.y + 3 };
+				const drawnAt = async (where) => {
+					await page.mouse.move(where.x, where.y);
+					await C.sleep(400);
+					return overlayPixels();
+				};
+				const withEdges = { away: await drawnAt(away), over: await drawnAt(at) };
+				await edges.selectOption('none');
+				await read('none');
+				const without = { away: await drawnAt(away), over: await drawnAt(at) };
+				hover = { withEdges, without };
+				hovered = hoverEdgePixels(hover);
+			}
+			// Expand selected: Edges None, select a point that has kNN neighbours (through the Table), Expand selected.
 			await edges.selectOption('none');
+			await read('none');
 			let selected = null;
 			let expanded = null;
-			if (at) {
-				await page.mouse.click(at.x, at.y);
-				selected = await poll(
-					() => C.attrInt(canvas, MAP.attr.selected),
-					(v) => v !== null
-				);
+			const withNeighbours = Array.from({ length: sample.n }, (_, i) => i).find((i) => knnDegree(sample.knn, i) > 0);
+			if (withNeighbours !== undefined) {
+				selected = await inspectPoint(withNeighbours);
 				await button(UI.map.expandSelected, toolbar).click();
 				expanded = await poll(
 					() => attrInt(UI.map.attr.edgeCount),
@@ -1160,7 +1251,7 @@ async function main(fixtureKey, base, out) {
 					5000
 				);
 			}
-			note({ n: sample.n, tree, neighbours5, hovered, selected, expanded });
+			note({ n: sample.n, tree, neighbours5, hover, hovered, selected, expanded });
 			return edgesVerdict({ sample, tree, neighbours5, hovered, expanded, selected });
 		});
 
@@ -1229,15 +1320,22 @@ async function main(fixtureKey, base, out) {
 			const before = capture.frames.length;
 			await button(UI.inspector.showFullText, inspector).click();
 			const panel = visible(map.locator(UI.text.panel));
-			await panel.locator('mark').first().waitFor({ timeout: 30000 });
-			const marks = await panel.locator('mark').allInnerTexts();
-			// Showing it again must not fetch it again.
-			await button(UI.inspector.showFullText, inspector)
-				.click()
+			await panel.waitFor({ timeout: 30000 });
+			// The text arrives with its marks: wait for the first, then read them all (none is a finding, not an error).
+			await panel
+				.locator('mark')
+				.first()
+				.waitFor({ timeout: 15000 })
 				.catch(() => {});
-			await C.sleep(1000);
+			const marks = await panel.locator('mark').allInnerTexts();
+			const shown = (await C.textOf(panel)).slice(0, 160);
+			// Hiding and showing it again must not fetch it again.
+			await button(UI.inspector.hideFullText, inspector).click();
+			await button(UI.inspector.showFullText, inspector).click();
+			await panel.waitFor({ timeout: 30000 });
+			await C.sleep(1500);
 			const calls = C.exchanges(capture, 'chunks', before).map((x) => x.input);
-			note({ key: falconKey, marks: (marks || []).slice(0, 10), calls: calls.length });
+			note({ key: falconKey, marks: (marks || []).slice(0, 10), dataMarks: await C.attrText(panel, 'data-marks'), shown, calls: calls.length });
 			return chunkTextVerdict({ marks, calls, key: falconKey });
 		});
 
@@ -1280,25 +1378,45 @@ async function main(fixtureKey, base, out) {
 			return bestScoreVerdict({ capability, answer });
 		});
 
-		await step(page, 'matrix (P1-2): a duplicate group as the selection sends its keys; symmetric, unit diagonal, same-document pairs above 0.5; its CSV has n rows', async (note) => {
+		await step(page, 'matrix (P1-2): one group shown alone and lassoed sends its keys; symmetric, unit diagonal, same-document pairs above 0.5; its CSV has n rows', async (note) => {
 			if (!sample) return 'no sample';
-			await sideTab(UI.map.tabs.duplicates);
-			await button(UI.dedupe.showGroup, map).click();
-			const selected = await poll(
-				() => C.attrInt(canvas, MAP.attr.selection),
-				(v) => v !== null && v > 1,
+			// A group of at most MATRIX_MAX points holding two chunks of one document: shown alone, then lassoed whole.
+			const group = matrixCluster(sample);
+			if (!group) return `no group of 5 to ${MATRIX_MAX} points holds two chunks of one document`;
+			// Clear the earlier selection first (Escape on the canvas), so the lasso's selection is the group's alone.
+			await canvas.focus();
+			await page.keyboard.press('Escape');
+			await sideTab(UI.map.tabs.clusters);
+			await button(UI.map.showCluster(group.cluster), map).click();
+			const shown = await poll(
+				() => attrInt(UI.map.attr.shown),
+				(v) => v === group.size,
 				5000
 			);
+			const since = capture.frames.length;
+			const selected = await lassoLeft(1);
+			if (shown !== group.size || selected !== group.size) {
+				await button(UI.map.showAll, map).click();
+				return `Show only cluster ${group.cluster + 1} shows ${shown} points and the lasso over them selects ${selected}; the group has ${group.size}`;
+			}
 			await sideTab(UI.map.tabs.selection);
 			const panel = visible(map.locator(UI.matrix.panel));
-			const x = await C.waitForExchange(capture, 'similarity_matrix', { timeout: 60000 });
+			const x = await C.waitForExchange(capture, 'similarity_matrix', { since, timeout: 60000 });
 			const docs = new Set((x.input.keys || []).map((k) => k[0]));
 			const allowed = new Set();
 			for (let i = 0; i < sample.n; i += 1) if (docs.has(objectIdOf(sample, i))) allowed.add(keyText(keyOf(sample, i)));
 			const verdict = matrixVerdict({ input: x.input, answer: x.result, selected, allowed });
-			const csv = await download(() => button(/^Export CSV$/, panel).click());
+			// Export CSV puts the matrix in the map's Export menu.
+			await poll(
+				() => C.attrText(panel, 'data-state'),
+				(v) => v === 'ok',
+				30000
+			);
+			await button(UI.matrix.exportCsv, panel).click();
+			const csv = await exportItem(map, UI.matrix.exportItem, 'csv');
 			const rows = csvTable(csv.bytes.toString('utf8')).rows.length;
-			note({ selected, n: x.result && x.result.n, source: x.result && x.result.source, csv: csv.name, rows });
+			await button(UI.map.showAll, map).click();
+			note({ group, shown, selected, n: x.result && x.result.n, source: x.result && x.result.source, csv: csv.name, rows });
 			if (verdict !== true) return verdict;
 			return rows === x.result.n ? true : `the matrix CSV has ${rows} rows for n = ${x.result.n}`;
 		});
@@ -1331,9 +1449,10 @@ async function main(fixtureKey, base, out) {
 			const selection = await lassoLeft(0.6);
 			const menu = visible(map.locator(UI.views.menu));
 			await button(UI.views.open, menu).click();
-			await button(UI.views.save, page).click();
-			await visible(page.getByRole('textbox', { name: UI.views.name })).fill('dupes');
-			await button(UI.views.confirm, page).click();
+			const views = visible(page.getByRole('group', { name: UI.views.panel, exact: true }));
+			await visible(views.getByRole('textbox', { name: UI.views.name, exact: true })).fill('dupes');
+			await visible(views.locator(UI.views.save)).click();
+			await visible(page.getByRole('button', { name: UI.views.apply('dupes') })).waitFor({ timeout: 15000 });
 			const seed = (exchangesLast(capture, 'sample') || {}).input || {};
 			savedView = { seed: seed.seed === undefined ? sampleInput && sampleInput.seed : seed.seed, selection };
 			// Another connection and back.
@@ -1364,11 +1483,28 @@ async function main(fixtureKey, base, out) {
 			const section = visible(map.getByRole('region', { name: UI.dedupe.section }));
 			await section.waitFor({ timeout: 15000 });
 			await combo(UI.dedupe.policy, section).selectOption(UI.dedupe.shortestPath);
-			const groups = await section.locator('fieldset[data-group]').evaluateAll((sets) => sets.map((fs) => [...fs.querySelectorAll('input[type="radio"]')].map((r) => (r.getAttribute('aria-label') || '').replace(/^Keep /, ''))));
-			const keptPaths = await section.locator('input[type="radio"]:checked').evaluateAll((els) => els.map((r) => (r.getAttribute('aria-label') || '').replace(/^Keep /, '')));
-			// The queue: every document of a planted pair that is not kept.
-			queued = [];
-			for (const group of Array.isArray(groups) ? groups : []) for (const p of group) if (!(keptPaths || []).includes(p)) queued.push({ path: p, objectId: C.objectId(p) });
+			// Each group's documents (its Keep radios), which are kept, and which the panel marks queued.
+			const marked = await section.locator('fieldset[data-group]').evaluateAll((sets) =>
+				sets.map((fs) =>
+					[...fs.querySelectorAll('input[type="radio"]')].map((r) => ({
+						path: (r.getAttribute('aria-label') || '').replace(/^Keep /, ''),
+						kept: r.checked,
+						queued: [...((r.closest('label') || {}).querySelectorAll ? r.closest('label').querySelectorAll('span') : [])].some((tag) => (tag.textContent || '').trim() === 'queued'),
+					}))
+				)
+			);
+			const groups = (Array.isArray(marked) ? marked : []).map((g) => g.map((d) => d.path)).filter((g) => g.length);
+			const keptPaths = (Array.isArray(marked) ? marked : [])
+				.flat()
+				.filter((d) => d.kept)
+				.map((d) => d.path);
+			const queuedPaths = (Array.isArray(marked) ? marked : [])
+				.flat()
+				.filter((d) => d.queued)
+				.map((d) => d.path);
+			const queuedCount = count(String((await C.attrText(section, 'data-queued')) ?? ''));
+			// What Remove all queued must remove: the documents the panel queued.
+			queued = queuedPaths.map((p) => ({ path: p, objectId: C.objectId(p) }));
 			const since = capture.frames.length;
 			const slider = visible(section.getByRole('slider', { name: UI.dedupe.threshold }));
 			await slider.evaluate((el, v) => {
@@ -1390,8 +1526,8 @@ async function main(fixtureKey, base, out) {
 				el.dispatchEvent(new Event('input', { bubbles: true }));
 				el.dispatchEvent(new Event('change', { bubbles: true }));
 			}, '0.97');
-			note({ groups, keptPaths, queued: queued.map((q) => q.path), thresholdAfter, samplesSent });
-			return dedupeVerdict({ groups, keptPaths, samplesSent, thresholdAfter });
+			note({ groups, keptPaths, queued: queuedPaths, queuedCount, thresholdAfter, samplesSent });
+			return dedupeVerdict({ groups, keptPaths, queuedPaths, queuedCount, samplesSent, thresholdAfter });
 		});
 
 		await step(page, 'outliers (P1-8): the OCR junk first with its why; 5 % lists more rows with no sample frame', async (note) => {
@@ -1401,11 +1537,12 @@ async function main(fixtureKey, base, out) {
 			await list.waitFor({ timeout: 15000 });
 			const rows1 = await list.locator('li').allInnerTexts();
 			const since = capture.frames.length;
-			await choose(visible(map.locator(UI.outliers.section).getByRole('combobox')), /^5\s?%$/);
+			const percentile = combo(UI.outliers.percentile, map.locator(UI.outliers.section));
+			await choose(percentile, /^5\s?%$/);
 			await C.sleep(1000);
 			const rows5 = await list.locator('li').allInnerTexts();
 			const samplesSent = samplesSince(since);
-			await choose(visible(map.locator(UI.outliers.section).getByRole('combobox')), /^1\s?%$/);
+			await choose(percentile, /^1\s?%$/);
 			note({ rows1: Array.isArray(rows1) ? rows1.length : null, rows5: Array.isArray(rows5) ? rows5.length : null, first: Array.isArray(rows1) && rows1[0] ? rows1[0].slice(0, 160) : null, samplesSent });
 			return outliersVerdict({ sample, rows1, rows5, samplesSent });
 		});
@@ -1416,22 +1553,28 @@ async function main(fixtureKey, base, out) {
 
 		await step(page, 'charts (P0-7): the long manual is in the top bin of chunks per document; clicking it scopes the directory', async (note) => {
 			await openConsole();
-			await visible(page.locator('summary', { hasText: UI.charts.summary })).click();
-			const chart = visible(page.locator(UI.charts.chunks));
-			await chart.waitFor({ timeout: 15000 });
-			const bars = chart.getByRole('button');
-			const n = await bars.count();
-			const topBin = n > 0 ? await C.attrText(bars.nth(n - 1), 'aria-label') : null;
-			if (n > 0) await bars.nth(n - 1).click();
-			await C.sleep(2000);
-			const chip = await visible(page.getByRole('button', { name: /^Remove condition: / }))
-				.isVisible()
-				.catch(() => false);
-			const directory = await directoryPaths();
-			const documents = documentItems();
-			note({ bars: n, topBin, chip, directory: directory.slice(0, 5) });
-			if (chip) await button(UI.scope.clear).click();
-			return chartsVerdict({ topBin, documents, directory, chip });
+			const charts = visible(page.locator('summary', { hasText: UI.charts.summary }));
+			await charts.click();
+			try {
+				const chart = visible(page.locator(UI.charts.chunks));
+				await chart.waitFor({ timeout: 15000 });
+				const bars = chart.getByRole('button');
+				const n = await bars.count();
+				const topBin = n > 0 ? await C.attrText(bars.nth(n - 1), 'aria-label') : null;
+				if (n > 0) await bars.nth(n - 1).click();
+				await C.sleep(2000);
+				const chip = await visible(page.getByRole('button', { name: /^Remove condition: / }))
+					.isVisible()
+					.catch(() => false);
+				const directory = await directoryPaths();
+				const documents = documentItems();
+				note({ bars: n, topBin, chip, directory: directory.slice(0, 5) });
+				if (chip) await button(UI.scope.clear).click();
+				return chartsVerdict({ topBin, documents, directory, chip });
+			} finally {
+				// Fold the charts again: open, they take the console's height from the panels below.
+				await charts.click().catch(() => {});
+			}
 		});
 
 		await step(page, "scope (P0-2): folder C:/demo/handbooks/ scopes the directory, the map's sample and the chat; the status says who filtered; saved and applied again", async (note) => {
@@ -1446,8 +1589,9 @@ async function main(fixtureKey, base, out) {
 			await openConsole();
 			const sources = await askChat(E.WATER_QUESTION);
 			await button(UI.scope.saveOpen).click();
-			await visible(page.getByRole('textbox', { name: UI.scope.saveName })).fill('handbooks');
-			await button(UI.scope.save).click();
+			const saving = visible(page.getByRole('group', { name: UI.scope.saveGroup, exact: true }));
+			await visible(saving.getByRole('textbox', { name: UI.scope.saveName, exact: true })).fill('handbooks');
+			await button(UI.scope.save, saving).click();
 			await button(UI.scope.clear).click();
 			await button(UI.scope.saved).click();
 			await visible(page.getByRole('menuitem', { name: UI.scope.applySaved('handbooks') })).click();
@@ -1523,8 +1667,8 @@ async function main(fixtureKey, base, out) {
 			return panel;
 		};
 		const runSearch = async (panel, mode, question) => {
-			await choose(visible(panel.getByRole('combobox', { name: UI.search.mode })), mode);
-			await visible(panel.getByRole('searchbox', { name: UI.search.box })).fill(question);
+			await visible(panel.getByRole('radio', { name: mode })).check();
+			await visible(panel.getByRole('searchbox', { name: UI.search.box, exact: true })).fill(question);
 			const since = capture.frames.length;
 			await button(UI.search.run, panel).click();
 			return C.waitForExchange(capture, 'search', { since, timeout: 90000 });
@@ -1539,7 +1683,7 @@ async function main(fixtureKey, base, out) {
 
 		await step(page, 'search (P0-5): Keyword finds KX4471 in ops/memo_q3.txt as a whole word', async (note) => {
 			const panel = await searchPanel();
-			const x = await runSearch(panel, /^Keyword$/, CORPUS.keywordToken);
+			const x = await runSearch(panel, UI.search.mode.keyword, CORPUS.keywordToken);
 			await C.sleep(500);
 			const firstRow = await C.textOf(visible(panel.getByRole('row').nth(1)));
 			note({ input: x.input, results: x.result && x.result.results ? x.result.results.length : null, firstRow: firstRow.slice(0, 160) });
@@ -1548,7 +1692,7 @@ async function main(fixtureKey, base, out) {
 
 		await step(page, 'search: the threshold slider passes fewer at 0.6 than at 0.3; Copy as node setting copies the value', async (note) => {
 			const panel = await searchPanel();
-			await runSearch(panel, /^Semantic$/, E.WATER_QUESTION);
+			await runSearch(panel, UI.search.mode.semantic, E.WATER_QUESTION);
 			const slider = visible(panel.getByRole('slider', { name: UI.search.threshold }));
 			await setSlider(slider, '0.3');
 			const low = (UI.search.passing.exec(await C.textOf(panel)) || [''])[0];
@@ -1564,7 +1708,7 @@ async function main(fixtureKey, base, out) {
 			const panel = await searchPanel();
 			const since = capture.frames.length;
 			await button(UI.search.compare, panel).click();
-			await visible(panel.getByRole('searchbox', { name: UI.search.boxB })).fill('How is the station powered in winter?');
+			await visible(panel.getByRole('searchbox', { name: UI.search.boxB, exact: true })).fill('How is the station powered in winter?');
 			await button(UI.search.run, panel).click();
 			await poll(
 				async () => C.exchanges(capture, 'search', since).filter((x) => x.response).length,
@@ -1573,6 +1717,8 @@ async function main(fixtureKey, base, out) {
 			);
 			const runs = C.exchanges(capture, 'search', since).filter((x) => x.response);
 			const summary = (UI.search.compareSummary.exec(await C.textOf(panel)) || [''])[0];
+			// The comparison tells the map both questions; the map then places a star for each.
+			await button(UI.search.showBoth, panel).click();
 			await C.switchView(page, CONSOLE.mapTab);
 			const starA = await poll(
 				() => attr(UI.map.attr.queryState),
@@ -1597,8 +1743,9 @@ async function main(fixtureKey, base, out) {
 						const chat = shown(chatSel);
 						const ingest = shown(ingestSel);
 						if (!chat || !ingest) return null;
-						const c = chat.getBoundingClientRect().width;
-						const i = ingest.getBoundingClientRect().width;
+						// The right column stacks them: the chat's share is of the two panels' heights.
+						const c = chat.getBoundingClientRect().height;
+						const i = ingest.getBoundingClientRect().height;
 						return c + i > 0 ? Math.round((c / (c + i)) * 1000) / 1000 : null;
 					},
 					[UI.chat.column, UI.chat.ingestColumn]
@@ -1723,6 +1870,7 @@ async function main(fixtureKey, base, out) {
 			const again = [...removedDemo].map((p) => ({ name: p, text: corpus[p.slice(E.DEMO_PREFIX.length)] })).filter((f) => typeof f.text === 'string');
 			if (again.length) await store.upload(fixture, again);
 			await C.openConnection(page, fixture);
+			await openConsole();
 			// The directory draws the rows in view only: filter it down to the lane's own uploads first.
 			const box = visible(page.getByRole('searchbox', { name: 'Filter documents by path' }));
 			await box.fill(`enrich-${run}`);
@@ -1753,9 +1901,12 @@ async function main(fixtureKey, base, out) {
 		});
 
 		await step(page, 'sign-out: saved views and saved filters are gone after signing in again', async (note) => {
-			await button(CONSOLE.logout).click();
+			// Log out is in the shell's account menu (the button with the user's initials).
+			await visible(page.locator(UI.account.menu).filter({ hasText: UI.account.initials })).click();
+			await visible(page.getByText(CONSOLE.logout, { exact: true })).click();
 			await E.signIn(page, base);
 			await C.openConnection(page, fixture);
+			await openConsole();
 			await button(UI.scope.saved).click();
 			const filterListed = await visible(page.getByRole('menuitem', { name: UI.scope.applySaved('handbooks') }))
 				.isVisible()
@@ -1872,6 +2023,7 @@ module.exports = {
 	LEGACY_FIXTURE,
 	LISTING_MAX,
 	PIN_MAX,
+	MATRIX_MAX,
 	BACKENDS,
 	count,
 	pathOf,
@@ -1885,6 +2037,8 @@ module.exports = {
 	minSizeVerdict,
 	knnComponents,
 	knnDegree,
+	matrixCluster,
+	hoverEdgePixels,
 	edgesVerdict,
 	ingestDays,
 	rampVerdict,
