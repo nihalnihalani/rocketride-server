@@ -111,7 +111,9 @@ test('the Map is a tab of the console: both stay mounted, the map is told when i
 	const view = code('views/ConsoleView.tsx');
 	assert.match(view, /display: tab === 'console' \? 'flex' : 'none'/);
 	assert.match(view, /display: tab === 'map' \? 'flex' : 'none'/);
-	assert.match(view, /<MapView model=\{model\} channels=\{channels\} selection=\{entry\.selection\} actions=\{actions\} visible=\{active && tab === 'map'\} documents=\{entry\.documents\} \/>/);
+	assert.match(view, /<MapView model=\{mapModel\} channels=\{channels\} selection=\{entry\.selection\} actions=\{actions\} visible=\{active && tab === 'map'\} documents=\{entry\.documents\} \/>/);
+	assert.match(view, /const nextMapScope = mapScopeFor\(mapScope, wiring\);\s*if \(nextMapScope !== mapScope\) setMapScope\(nextMapScope\);/, 'the map keeps the scope it drew with while a new one finds its documents');
+	assert.match(view, /const mapModel = useMemo\(\(\) => \(nextMapScope === \(model\.scope \?\? null\) \? model : \{ \.\.\.model, scope: nextMapScope \}\), \[model, nextMapScope\]\)/);
 	assert.match(view, /\{ id: 'console', label: 'Console' \},\s*\{ id: 'map', label: 'Map' \}/);
 });
 
@@ -134,8 +136,10 @@ test('the scope: the listing asks for its conditions, its documents resolve from
 	assert.match(view, /entry\.controller\.setFilter\(listing\)/);
 	assert.match(view, /resolveScope\(current, state\.directory, cap\)/);
 	assert.match(view, /if \(next !== current\) entry\.scope\.set\(next\)/, 'set only when it changed, so the effect settles');
-	assert.match(view, /const chatDocuments = chatScopeFor\(chatScope, scope, cap\)/);
-	assert.match(view, /<ChatPanel [^>]*scope=\{chatDocuments\}/);
+	assert.match(view, /const wiring = useMemo\(\(\) => consoleScope\(chatScope, scope, state\.directory, cap\), \[chatScope, scope, state\.directory, cap\]\)/, 'the chat, search and the map are scoped exactly when the ScopeBar shows their toggles on');
+	assert.match(view, /const chatDocuments = wiring\.chat;/);
+	assert.match(view, /<ChatPanel model=\{surfaceModel\} [^>]*scope=\{chatDocuments\}/, 'search gets the scope as it applies');
+	assert.match(view, /\{model\.chat\.enabled && wiring\.chatNotice !== null && \(\s*<p role="status" data-chat-scope-notice=""[^>]*>\s*\{wiring\.chatNotice\}/, 'the chat says when its question goes to every document');
 	assert.match(view, /savedFiltersFor\(savedFilters, entry\.key\)/, "the app's per-connection map, emptied on a change of identity");
 	assert.match(view, /<DocumentDirectory [\s\S]*?scope=\{scope\} onScope=\{setScope\} cap=\{cap\}/);
 	assert.match(view, /<StatsStrip [^>]*scopeLine=\{scopeLine\}/);
@@ -143,6 +147,7 @@ test('the scope: the listing asks for its conditions, its documents resolve from
 	assert.match(view, /scopeWith\(scope, scope\?\.filter\.path_contains \?\? '', filter\)/, "a bar sets its kind of condition and keeps the scope's others");
 	const dir = code('components/DocumentDirectory.tsx');
 	assert.match(dir, /directoryView\(pager, scope, applied, cap\)/);
+	assert.match(dir, /<ScopeBar [^>]*listing=\{pager\}/, "the toggles say how far the scope's documents are");
 	assert.match(dir, /useDebounced\(filter, FILTER_DEBOUNCE_MS\)/);
 	assert.match(dir, /Scope to this folder/);
 });

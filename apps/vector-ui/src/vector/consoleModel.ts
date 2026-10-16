@@ -38,6 +38,9 @@
 
 import type { IExplorerEndpoint, IProbeResult } from 'shared/explorer';
 import type { Availability, ConsoleModel, IScopeState, VectorNodes } from '../contract/types';
+import type { IPagerState } from './documents';
+import { resolveScope, scopeReadiness } from './filters';
+import type { IScopeReadiness } from './filters';
 import { DEFAULT_LIMITS, readDialect } from './results';
 import type { IStatsView } from './results';
 import { BUSY, CODE_SENTENCES, EMPTY } from './wording';
@@ -136,6 +139,66 @@ export function chatScopeFor(asked: readonly string[] | null, scope: IScopeState
 	if (asked !== null && asked.length > 0) return asked.length <= cap ? asked : null;
 	if (!scope || !scope.applyTo.chat || scope.overflow !== null || scope.objectIds === null || scope.objectIds.length === 0) return null;
 	return scope.objectIds.length <= cap ? scope.objectIds : null;
+}
+
+/** Said over the chat while its Chat toggle is on and the chat is not scoped (after the reason). */
+export const CHAT_UNSCOPED_TEXT = 'A question asked now goes to every document.';
+
+/** What the console hands the chat, search and the map about its scope. */
+export interface IConsoleScope {
+	/** The scope with its documents resolved from this listing (before the console stores it), or null. */
+	scope: IScopeState | null;
+	/** Where its documents are, or null without a scope. */
+	readiness: IScopeReadiness | null;
+	/** The documents the next question is asked about, or null for every document. */
+	chat: readonly string[] | null;
+	/** While the Chat toggle is on and the chat is not scoped (and "Ask about these" chose nothing): why, and that a question goes to every document. */
+	chatNotice: string | null;
+	/**
+	 * The scope as Search and the map apply it: the scope itself, except when its
+	 * documents cannot be known from this listing (it failed or stopped short),
+	 * when its Map, Search and Chat toggles are off, as the ScopeBar shows them.
+	 */
+	applied: IScopeState | null;
+	/** Its documents are on their way: the map keeps the scope it drew with ({@link mapScopeFor}). */
+	waiting: boolean;
+}
+
+/**
+ * The console's scope as the chat, search and the map get it, so a surface is
+ * scoped exactly when the ScopeBar shows its toggle on: while the scope's
+ * documents are not known the chat asks every document and says so, search
+ * waits for them, and the map keeps what it drew.
+ *
+ * @param asked - The documents "Ask about these" chose, or null.
+ * @param scope - The console's scope, or null.
+ * @param dir - The directory's listing.
+ * @param cap - `limits.scope_keys_max`.
+ * @returns What each surface is handed.
+ */
+export function consoleScope(asked: readonly string[] | null, scope: IScopeState | null | undefined, dir: IPagerState, cap: number): IConsoleScope {
+	if (!scope) return { scope: null, readiness: null, chat: chatScopeFor(asked, null, cap), chatNotice: null, applied: null, waiting: false };
+	const resolved = resolveScope(scope, dir, cap);
+	const readiness = scopeReadiness(resolved, cap, dir);
+	const unknown = readiness.phase === 'failed' || readiness.phase === 'partial';
+	const applied = unknown ? { ...resolved, applyTo: { ...resolved.applyTo, map: false, search: false, chat: false } } : resolved;
+	const chat = chatScopeFor(asked, applied, cap);
+	const choseNone = asked === null || asked.length === 0;
+	const chatNotice = choseNone && resolved.applyTo.chat && readiness.phase !== 'ready' ? `${readiness.reason} ${CHAT_UNSCOPED_TEXT}` : null;
+	return { scope: resolved, readiness, chat, chatNotice, applied, waiting: readiness.phase === 'waiting' };
+}
+
+/**
+ * The scope the map is handed: what it was handed before while a new scope's
+ * documents are on their way (so it never draws every document in between),
+ * else the scope as it applies.
+ *
+ * @param held - The scope the map was last handed, or null.
+ * @param wiring - The console's scope ({@link consoleScope}).
+ * @returns The map's scope.
+ */
+export function mapScopeFor(held: IScopeState | null, wiring: Pick<IConsoleScope, 'applied' | 'waiting'>): IScopeState | null {
+	return wiring.waiting ? held : wiring.applied;
 }
 
 /**
