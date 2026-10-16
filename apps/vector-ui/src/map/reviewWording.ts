@@ -281,6 +281,20 @@ export function morePairsLine(n: number): string {
 }
 
 /**
+ * Documents of a group not listed under it.
+ *
+ * @param n - Documents left out.
+ * @param queuedAmong - Of those, the queued ones.
+ * @param unshownAmong - Of the queued ones, those queued by a hand-picked keep the sample does not show to hold them.
+ * @returns E.g. "and 980 more documents, none of them queued. Show group selects the whole group on the map."
+ */
+export function moreDocumentsLine(n: number, queuedAmong: number, unshownAmong = 0): string {
+	const which = queuedAmong <= 0 ? (n === 1 ? 'not queued' : 'none of them queued') : queuedAmong >= n ? (n === 1 ? 'queued' : `all ${num(n)} of them queued`) : `${num(queuedAmong)} of them queued`;
+	const unshown = unshownAmong > 0 ? `, ${num(unshownAmong)} by your choice although this sample does not show that the kept document holds ${unshownAmong === 1 ? 'it' : 'them'}` : '';
+	return `and ${plural(n, 'more document')}, ${which}${unshown}. Show group selects the whole group on the map.`;
+}
+
+/**
  * Reviewed groups.
  *
  * @param n - Reviewed groups.

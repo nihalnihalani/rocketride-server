@@ -99,6 +99,9 @@ export const GROUPS_SHOWN_MAX = 200;
 /** Most pairs listed under one group. */
 export const PAIRS_SHOWN_MAX = 10;
 
+/** Most documents listed under one group (its kept one always among them); Show group selects the rest on the map. */
+export const DOCS_SHOWN_MAX = 20;
+
 /** How a group's kept document is chosen. */
 export type KeepPolicy = 'oldest' | 'shortest-path' | 'most-chunks' | 'manual';
 

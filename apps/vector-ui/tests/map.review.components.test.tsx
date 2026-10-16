@@ -300,6 +300,91 @@ test('two long files sampled once each through the shared paragraph: the panel s
 	assert.match(out, /this sample does not show that the kept document holds it, so not queued/, 'the document the policy leaves says why');
 });
 
+/**
+ * One group across many documents: each of `docs` documents of `per` chunks
+ * opens with the same cover sheet (a licence header, a mail disclaimer). A
+ * stratified sample takes every chunk 0 and the kNN rows join the cover
+ * sheets into one group; the rest of each document is its own text.
+ *
+ * @param docs - Documents.
+ * @param per - Chunks of each, all in the sample.
+ * @returns The sample and the directory rows.
+ */
+function coverSheets(docs: number, per: number): { sample: ISampleResult; rows: IDocumentItem[] } {
+	const doc: number[] = [];
+	const chunk: number[] = [];
+	for (let d = 0; d < docs; d += 1) {
+		for (let c = 0; c < per; c += 1) {
+			doc.push(d);
+			chunk.push(c);
+		}
+	}
+	const k = 15;
+	const knn: IKnnBlock = { k, offsets_row: [0], cols: [], sims: [] };
+	doc.forEach((d, i) => {
+		for (let t = 1; t <= k; t += 1) {
+			// A cover sheet's nearest are other documents' cover sheets; body text neighbours far text.
+			knn.cols.push(chunk[i] === 0 ? ((d + t * 37) % docs) * per : ((d + t) % docs) * per + 1);
+			knn.sims.push(chunk[i] === 0 ? 0.995 + ((d * 7 + t) % 40) / 10000 : 0.3);
+		}
+		knn.offsets_row.push(knn.cols.length);
+	});
+	const name = (d: number): string => String(d).padStart(4, '0');
+	const base = small();
+	const sample: ISampleResult = {
+		...base,
+		n: doc.length,
+		n_requested: doc.length,
+		docs: Array.from({ length: docs }, (_, d) => ({ i: d, objectId: `mail-${name(d)}`, path: `C:/mail/2026/${name(d)}.eml`, chunks: per, in_sample: per })),
+		points: { doc, chunk, x: doc.map(() => 0), y: doc.map(() => 0), len: doc.map(() => 90), snip: doc.map(() => 'text'), pinned: doc.map(() => 0) },
+		knn,
+		density: doc.map(() => 0.5),
+	};
+	const rows = sample.docs.map((x, d): IDocumentItem => ({ objectId: x.objectId, path: x.path, chunks: per, has_first_chunk: true, tables: 0, deleted: false, nodeId: null, size: null, modifyTime: null, ingestedAt: `2026-01-${String((d % 28) + 1).padStart(2, '0')}T00:00:00Z`, pointId: null }));
+	return { sample, rows };
+}
+
+test('one group across 1,000 documents: the first 20 are listed with the count of the rest, and the panel renders in 50 ms or less', () => {
+	const { sample, rows } = coverSheets(1000, 5);
+	const documents: IDocumentRowsSource = { getRows: () => rows, subscribe: () => noop };
+	const model = modelOf(sample);
+	const render = (): string => html(<DuplicatesPanel sample={model} writes={on} documents={documents} onSelect={noop} onRemoveDocument={noop} onRemoveDocuments={noop} initial={{ policy: 'shortest-path' }} />);
+	let best = Infinity;
+	let out = '';
+	for (let run = 0; run < 3; run += 1) {
+		const started = performance.now();
+		out = render();
+		best = Math.min(best, performance.now() - started);
+	}
+	assert.match(out, /Group 1 · 1,000 documents/);
+	assert.equal((out.match(/type="radio"/g) ?? []).length, 20, 'twenty Keep radios, not a thousand');
+	assert.match(out, /and 980 more documents, none of them queued\. Show group selects the whole group on the map\./);
+	assert.match(out, /Shared passages only/, 'each mail holds text of its own');
+	assert.match(out, />Show group</);
+	assert.ok(best <= 50, `the panel rendered in ${best.toFixed(1)} ms`);
+});
+
+test("a group's kept document is listed even when it is not among the first 20, and the rest count what they queue", () => {
+	const { sample, rows } = coverSheets(40, 1);
+	const view = dedupeView(sample, 0.97);
+	const info = docInfo(sample, rows);
+	const [group] = view.groups;
+	assert.equal(group?.objectIds.length, 40);
+	// Kept by hand: the 31st mail; every other one is queued by that choice.
+	const state = queueReducer(queueInit(), { type: 'keep', group: group!.key, objectId: 'mail-0030' });
+	const out = renderToStaticMarkup(DuplicatesBody({ sample: modelOf(sample), writes: on, view, info, state, reviewed: new Set(), queue: queued(view.groups, state, info, new Set()), done: null, bulk: true, onThreshold: noop, onPolicy: noop, onKeep: noop, onShow: noop, onReview: noop, onRemove: noop }));
+	assert.equal((out.match(/type="radio"/g) ?? []).length, 20);
+	assert.match(out, /aria-label="Keep C:\/mail\/2026\/0030\.eml" checked=""/, 'the kept document is listed');
+	assert.doesNotMatch(out, /aria-label="Keep C:\/mail\/2026\/0019\.eml"/, 'the 20th place goes to the kept one');
+	// Each cover sheet pairs with 30 others in the kNN rows: the ones that never pair with the kept one are queued by that choice alone.
+	const listed = new Set([...group!.objectIds.slice(0, 19), 'mail-0030']);
+	const unshown = [...(queued(view.groups, state, info, new Set()).unshown.get(group!.key)?.keys() ?? [])].filter((id) => !listed.has(id)).length;
+	assert.ok(unshown > 0 && unshown < 20, `${unshown} of the 20 left out are not shown held`);
+	assert.match(out, new RegExp(`and 20 more documents, all 20 of them queued, ${unshown} by your choice although this sample does not show that the kept document holds them\\. Show group selects the whole group on the map\\.`));
+	assert.match(out, /role="status"[^>]*>39 documents queued/);
+	assert.match(out, />Remove the others \(39\)</);
+});
+
 // =============================================================================
 // OUTLIER REVIEW
 // =============================================================================
