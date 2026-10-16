@@ -40,7 +40,8 @@ import React, { useEffect, useRef, useState } from 'react';
 import type { IRoleChannel } from 'shared/explorer';
 import type { IExportItem, IVectorLimits, MatrixSource, SimilarityMatrixProps, VectorKey, VectorMetric } from '../contract/types';
 import { callSimilarityMatrix } from '../map/calls';
-import { chainOrder, heatCellAt, matrixInput, matrixRange, matrixRows, reorder, shadeOf } from '../map/matrixOrder';
+import { cellValue, chainOrder, heatCellAt, matrixInput, matrixRange, matrixRows, reorder, shadeOf } from '../map/matrixOrder';
+import type { MatrixCell } from '../map/matrixOrder';
 import { MATRIX_BUSY, MATRIX_NO_CHANNEL, PICK_A_PAIR, matrixCaption, matrixFailure, matrixLegend, matrixNotFound, matrixSourceLine, matrixTableRowsLine, selectedPairLine } from '../map/reviewWording';
 import { MAP_STYLES } from '../map/styles';
 import { readPalette } from '../map/tokens';
@@ -61,7 +62,19 @@ const SHADE_MIN = 0.06;
 const SHADE_SPAN = 0.84;
 
 /** What the panel shows. */
-export type MatrixState = { kind: 'blocked'; message: string } | { kind: 'busy' } | { kind: 'error'; message: string } | { kind: 'ok'; keys: VectorKey[]; matrix: number[][]; metric: VectorMetric; source: MatrixSource; notFound: VectorKey[]; dp?: number };
+export type MatrixState = { kind: 'blocked'; message: string } | { kind: 'busy' } | { kind: 'error'; message: string } | { kind: 'ok'; keys: VectorKey[]; matrix: MatrixCell[][]; metric: VectorMetric; source: MatrixSource; notFound: VectorKey[]; dp?: number };
+
+/**
+ * A cell's words: its value at `dp` decimals, or a dash where the node could not compute it.
+ *
+ * @param value - The cell.
+ * @param dp - Decimals.
+ * @returns The words.
+ */
+export function cellText(value: MatrixCell | undefined, dp: number): string {
+	const v = cellValue(value);
+	return v === null ? '–' : v.toFixed(dp);
+}
 
 /**
  * Compute a selection's matrix on the store node and order it.
@@ -78,7 +91,9 @@ export async function loadMatrix(channel: Pick<IRoleChannel, 'invoke'>, storeNod
 	const answer = await callSimilarityMatrix(channel, plan.input, { nodeId: storeNode });
 	if (!answer.ok) return { kind: 'error', message: matrixFailure(answer.code, answer.message, limits.matrix_keys_max) };
 	const result = answer.value;
-	const ordered = reorder({ keys: result.keys, matrix: result.matrix }, chainOrder(result.matrix));
+	// The node answers null for a cell it could not compute (a non-finite value).
+	const matrix = result.matrix as ReadonlyArray<ReadonlyArray<MatrixCell>>;
+	const ordered = reorder({ keys: result.keys, matrix }, chainOrder(matrix));
 	return { kind: 'ok', keys: ordered.keys, matrix: ordered.matrix, metric: result.metric, source: result.source, notFound: result.not_found, dp: result.dp };
 }
 
@@ -90,7 +105,7 @@ export async function loadMatrix(channel: Pick<IRoleChannel, 'invoke'>, storeNod
  * @param labelOf - Words for a key.
  * @returns The item.
  */
-export function matrixExportItem(keys: readonly VectorKey[], matrix: ReadonlyArray<ReadonlyArray<number>>, labelOf: (key: VectorKey) => string): IExportItem {
+export function matrixExportItem(keys: readonly VectorKey[], matrix: ReadonlyArray<ReadonlyArray<MatrixCell>>, labelOf: (key: VectorKey) => string): IExportItem {
 	return { id: 'map-matrix', label: `Similarity matrix (${keys.length} × ${keys.length})`, kind: 'matrix', disabled: null, rows: () => matrixRows(keys, matrix, labelOf) };
 }
 
@@ -124,8 +139,8 @@ export interface IHeatmapContext {
 /**
  * Paint a heatmap: every cell on the surface colour, then the ramp colour
  * over it at the cell's shade (lighter: less similar), as the element
- * cells do. Two fill colours in all, so 10,000 cells take a few
- * milliseconds.
+ * cells do; a missing cell stays on the surface. Two fill colours in all,
+ * so 10,000 cells take a few milliseconds.
  *
  * @param ctx - The context, in CSS pixels.
  * @param matrix - The matrix, in display order.
@@ -134,7 +149,7 @@ export interface IHeatmapContext {
  * @param gap - The gap between cells.
  * @param colours - The surface and the ramp colour.
  */
-export function paintHeatmap(ctx: IHeatmapContext, matrix: ReadonlyArray<ReadonlyArray<number>>, range: { min: number; max: number }, size: number, gap: number, colours: { surface: string; ramp: string }): void {
+export function paintHeatmap(ctx: IHeatmapContext, matrix: ReadonlyArray<ReadonlyArray<MatrixCell>>, range: { min: number; max: number }, size: number, gap: number, colours: { surface: string; ramp: string }): void {
 	const n = matrix.length;
 	const pitch = size + gap;
 	ctx.globalAlpha = 1;
@@ -143,9 +158,11 @@ export function paintHeatmap(ctx: IHeatmapContext, matrix: ReadonlyArray<Readonl
 	for (let i = 0; i < n; i += 1) for (let j = 0; j < n; j += 1) ctx.fillRect(j * pitch, i * pitch, size, size);
 	ctx.fillStyle = colours.ramp;
 	for (let i = 0; i < n; i += 1) {
-		const row = matrix[i] as ReadonlyArray<number>;
+		const row = matrix[i] as ReadonlyArray<MatrixCell>;
 		for (let j = 0; j < n; j += 1) {
-			ctx.globalAlpha = Math.round((SHADE_MIN + SHADE_SPAN * shadeOf(row[j] as number, range)) * 1000) / 1000;
+			const value = cellValue(row[j]);
+			if (value === null) continue;
+			ctx.globalAlpha = Math.round((SHADE_MIN + SHADE_SPAN * shadeOf(value, range)) * 1000) / 1000;
 			ctx.fillRect(j * pitch, i * pitch, size, size);
 		}
 	}
@@ -171,7 +188,7 @@ function useThemeTick(): number {
 
 /** What the canvas heatmap is drawn from. */
 interface HeatmapCanvasProps {
-	matrix: number[][];
+	matrix: MatrixCell[][];
 	labels: readonly string[];
 	dp: number;
 	size: number;
@@ -223,7 +240,7 @@ function HeatmapCanvas(props: HeatmapCanvasProps): React.ReactElement {
 				style={{ display: 'block', width: side, height: side, cursor: 'pointer' }}
 				onMouseMove={(event) => {
 					const cell = cellOf(event);
-					event.currentTarget.title = cell === null ? '' : `${props.labels[cell[0]]} ↔ ${props.labels[cell[1]]}: ${((matrix[cell[0]] as number[])[cell[1]] as number).toFixed(props.dp)}`;
+					event.currentTarget.title = cell === null ? '' : `${props.labels[cell[0]]} ↔ ${props.labels[cell[1]]}: ${cellText((matrix[cell[0]] as MatrixCell[])[cell[1]], props.dp)}`;
 				}}
 				onMouseLeave={(event) => {
 					event.currentTarget.title = '';
@@ -264,14 +281,15 @@ function heatmap(props: MatrixBodyProps, ok: Extract<MatrixState, { kind: 'ok' }
 	const range = matrixRange(ok.matrix);
 	const cells: React.ReactElement[] = [];
 	for (let i = 0; i < n; i += 1) {
-		const row = ok.matrix[i] as number[];
+		const row = ok.matrix[i] as MatrixCell[];
 		for (let j = 0; j < n; j += 1) {
-			const value = row[j] as number;
+			const value = cellValue(row[j]);
+			const words = cellText(value, dp);
 			const picked = props.selected !== null && ((props.selected[0] === i && props.selected[1] === j) || (props.selected[0] === j && props.selected[1] === i));
 			cells.push(
-				<div key={`${i}-${j}`} data-cell={`${i}-${j}`} title={`${labels[i]} ↔ ${labels[j]}: ${value.toFixed(dp)}`} onClick={() => props.onSelectPair(i, j)} style={{ position: 'relative', width: size, height: size, background: 'var(--rr-bg-default)', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', boxShadow: picked ? 'inset 0 0 0 2px var(--rr-text-primary)' : undefined }}>
-					<div style={{ position: 'absolute', inset: 0, background: 'var(--rr-chart-blue)', opacity: SHADE_MIN + SHADE_SPAN * shadeOf(value, range) }} />
-					<span style={{ position: 'relative', fontSize: 8.5, lineHeight: 1.2, color: 'var(--rr-text-primary)', background: 'var(--rr-bg-paper)', borderRadius: 2, padding: '0 1px' }}>{value.toFixed(dp)}</span>
+				<div key={`${i}-${j}`} data-cell={`${i}-${j}`} title={`${labels[i]} ↔ ${labels[j]}: ${words}`} onClick={() => props.onSelectPair(i, j)} style={{ position: 'relative', width: size, height: size, background: 'var(--rr-bg-default)', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', boxShadow: picked ? 'inset 0 0 0 2px var(--rr-text-primary)' : undefined }}>
+					{value === null ? null : <div style={{ position: 'absolute', inset: 0, background: 'var(--rr-chart-blue)', opacity: SHADE_MIN + SHADE_SPAN * shadeOf(value, range) }} />}
+					<span style={{ position: 'relative', fontSize: 8.5, lineHeight: 1.2, color: 'var(--rr-text-primary)', background: 'var(--rr-bg-paper)', borderRadius: 2, padding: '0 1px' }}>{words}</span>
 				</div>
 			);
 		}
@@ -339,8 +357,8 @@ function table(props: MatrixBodyProps, ok: Extract<MatrixState, { kind: 'ok' }>)
 										const picked = props.selected !== null && props.selected[0] === i && props.selected[1] === j;
 										return (
 											<td key={j} style={MAP_STYLES.td}>
-												<button type="button" style={MAP_STYLES.linkButton} aria-pressed={picked} aria-label={`${labels[i]} ↔ ${labels[j]}: ${value.toFixed(dp)}`} onClick={() => props.onSelectPair(i, j)}>
-													{value.toFixed(dp)}
+												<button type="button" style={MAP_STYLES.linkButton} aria-pressed={picked} aria-label={`${labels[i]} ↔ ${labels[j]}: ${cellText(value, dp)}`} onClick={() => props.onSelectPair(i, j)}>
+													{cellText(value, dp)}
 												</button>
 											</td>
 										);
@@ -390,7 +408,7 @@ export function MatrixBody(props: MatrixBodyProps): React.ReactElement {
 			{heatmap(props, state)}
 			<p style={MAP_STYLES.note}>{matrixLegend(range.min, range.max, dp)}</p>
 			<p style={MAP_STYLES.small} role="status">
-				{pair ? selectedPairLine(props.labelOf(state.keys[pair[0]] as VectorKey), props.labelOf(state.keys[pair[1]] as VectorKey), ((state.matrix[pair[0]] as number[])[pair[1]] as number).toFixed(dp)) : PICK_A_PAIR}
+				{pair ? selectedPairLine(props.labelOf(state.keys[pair[0]] as VectorKey), props.labelOf(state.keys[pair[1]] as VectorKey), cellText((state.matrix[pair[0]] as MatrixCell[])[pair[1]], dp)) : PICK_A_PAIR}
 			</p>
 			<div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, margin: '6px 0' }}>
 				{props.canShowPair ? (

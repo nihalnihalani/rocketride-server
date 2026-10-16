@@ -71,23 +71,36 @@ export function matrixInput(keys: readonly VectorKey[], limits: IVectorLimits): 
 	return { input: { keys: unique } };
 }
 
+/** A cell of a similarity matrix: null where the node could not compute one (a non-finite value). */
+export type MatrixCell = number | null;
+
+/**
+ * A cell's value when it is a finite number, else null.
+ *
+ * @param value - The cell.
+ * @returns The value, or null.
+ */
+export function cellValue(value: MatrixCell | undefined): number | null {
+	return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
 /**
  * Nearest-neighbour chaining: start at the first point of the most similar
  * pair, then step each time to the most similar point not placed yet (ties
- * to the lower index).
+ * to the lower index). A missing cell is the least similar.
  *
  * @param matrix - n × n similarities.
  * @returns The order, a permutation of 0..n-1.
  */
-export function chainOrder(matrix: ReadonlyArray<ReadonlyArray<number>>): number[] {
+export function chainOrder(matrix: ReadonlyArray<ReadonlyArray<MatrixCell>>): number[] {
 	const n = matrix.length;
 	if (n === 0) return [];
 	let start = 0;
 	let best = -Infinity;
 	for (let i = 0; i < n; i += 1) {
-		const row = matrix[i] as ReadonlyArray<number>;
+		const row = matrix[i] as ReadonlyArray<MatrixCell>;
 		for (let j = i + 1; j < n; j += 1) {
-			const v = row[j] as number;
+			const v = cellValue(row[j]) ?? -Infinity;
 			if (v > best) {
 				best = v;
 				start = i;
@@ -99,12 +112,12 @@ export function chainOrder(matrix: ReadonlyArray<ReadonlyArray<number>>): number
 	placed[start] = 1;
 	let current = start;
 	while (order.length < n) {
-		const row = matrix[current] as ReadonlyArray<number>;
+		const row = matrix[current] as ReadonlyArray<MatrixCell>;
 		let next = -1;
 		let nextValue = -Infinity;
 		for (let j = 0; j < n; j += 1) {
 			if (placed[j]) continue;
-			const v = row[j] as number;
+			const v = cellValue(row[j]) ?? -Infinity;
 			if (next === -1 || v > nextValue) {
 				next = j;
 				nextValue = v;
@@ -124,27 +137,29 @@ export function chainOrder(matrix: ReadonlyArray<ReadonlyArray<number>>): number
  * @param order - A permutation.
  * @returns The keys and matrix in that order.
  */
-export function reorder(m: { keys: readonly VectorKey[]; matrix: ReadonlyArray<ReadonlyArray<number>> }, order: readonly number[]): { keys: VectorKey[]; matrix: number[][] } {
+export function reorder(m: { keys: readonly VectorKey[]; matrix: ReadonlyArray<ReadonlyArray<MatrixCell>> }, order: readonly number[]): { keys: VectorKey[]; matrix: MatrixCell[][] } {
 	return {
 		keys: order.map((i) => m.keys[i] as VectorKey),
-		matrix: order.map((i) => order.map((j) => (m.matrix[i] as ReadonlyArray<number>)[j] as number)),
+		matrix: order.map((i) => order.map((j) => cellValue((m.matrix[i] as ReadonlyArray<MatrixCell>)[j]))),
 	};
 }
 
 /**
- * The lowest and highest similarity between two different chunks (the diagonal left out).
+ * The lowest and highest similarity between two different chunks (the
+ * diagonal and missing cells left out).
  *
  * @param matrix - n × n similarities.
  * @returns The range (0 to 1 with fewer than two chunks).
  */
-export function matrixRange(matrix: ReadonlyArray<ReadonlyArray<number>>): { min: number; max: number } {
+export function matrixRange(matrix: ReadonlyArray<ReadonlyArray<MatrixCell>>): { min: number; max: number } {
 	let min = Infinity;
 	let max = -Infinity;
 	for (let i = 0; i < matrix.length; i += 1) {
-		const row = matrix[i] as ReadonlyArray<number>;
+		const row = matrix[i] as ReadonlyArray<MatrixCell>;
 		for (let j = 0; j < row.length; j += 1) {
 			if (i === j) continue;
-			const v = row[j] as number;
+			const v = cellValue(row[j]);
+			if (v === null) continue;
 			if (v < min) min = v;
 			if (v > max) max = v;
 		}
@@ -154,13 +169,14 @@ export function matrixRange(matrix: ReadonlyArray<ReadonlyArray<number>>): { min
 
 /**
  * How dark a cell is: its place in the range, 0 (lightest) to 1 (darkest),
- * values above the range (the diagonal) at 1.
+ * values above the range (the diagonal) at 1, a missing cell at 0.
  *
- * @param value - A similarity.
+ * @param value - A similarity, or null.
  * @param range - The matrix's range.
  * @returns 0 to 1.
  */
-export function shadeOf(value: number, range: { min: number; max: number }): number {
+export function shadeOf(value: MatrixCell, range: { min: number; max: number }): number {
+	if (value === null || !Number.isFinite(value)) return 0;
 	if (range.max <= range.min) return value >= range.max ? 1 : 0;
 	return Math.min(1, Math.max(0, (value - range.min) / (range.max - range.min)));
 }
@@ -186,14 +202,15 @@ export function heatCellAt(x: number, y: number, n: number, size: number, gap: n
 
 /**
  * The matrix as export rows: one per key with its objectId, chunk and
- * words, then a column per key (column names made unique).
+ * words, then a column per key (column names made unique); a missing cell is
+ * empty.
  *
  * @param keys - The keys, in display order.
  * @param matrix - The matrix in that order.
  * @param labelOf - Words for a key.
  * @returns The rows.
  */
-export function matrixRows(keys: readonly VectorKey[], matrix: ReadonlyArray<ReadonlyArray<number>>, labelOf: (key: VectorKey) => string): IExportRows {
+export function matrixRows(keys: readonly VectorKey[], matrix: ReadonlyArray<ReadonlyArray<MatrixCell>>, labelOf: (key: VectorKey) => string): IExportRows {
 	const used = new Map<string, number>();
 	const names = keys.map((key) => {
 		const base = labelOf(key);
@@ -205,7 +222,7 @@ export function matrixRows(keys: readonly VectorKey[], matrix: ReadonlyArray<Rea
 	const rows = keys.map((key, i) => {
 		const row: Record<string, ExportCell> = { objectId: key[0], chunkId: key[1], label: labelOf(key) };
 		names.forEach((name, j) => {
-			row[name] = (matrix[i] as ReadonlyArray<number>)[j] ?? null;
+			row[name] = cellValue((matrix[i] as ReadonlyArray<MatrixCell>)[j]);
 		});
 		return row;
 	});
