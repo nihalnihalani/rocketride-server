@@ -90,6 +90,52 @@ const S = {
 type Phase = { kind: 'embedding' } | { kind: 'searching' } | { kind: 'error'; message: string } | { kind: 'done'; view: RetrievalView };
 
 /**
+ * The debugger's table: every row of its search, including those under the
+ * threshold and the floor.
+ *
+ * @param props - The view of the search.
+ * @returns The table.
+ */
+export function RetrievalTable({ view }: { view: RetrievalView }): React.ReactElement {
+	return (
+		<table style={S.table}>
+			<caption style={{ ...S.line, textAlign: 'left' }}>{`Top ${view.rows.length} chunks for the question, including those under the threshold and the floor`}</caption>
+			<thead>
+				<tr>
+					<th scope="col" style={S.th}>
+						#
+					</th>
+					<th scope="col" style={S.th}>
+						Document
+					</th>
+					<th scope="col" style={S.th}>
+						Score
+					</th>
+					<th scope="col" style={S.th}>
+						Status
+					</th>
+				</tr>
+			</thead>
+			<tbody>
+				{view.rows.map((row) => (
+					<tr key={`${row.objectId}#${row.chunkId}`} data-status={row.status} style={row.status === 'used' ? undefined : S.muted}>
+						<td style={S.td}>{row.rank}</td>
+						<td style={S.td} title={row.preview}>
+							{`${row.path || row.objectId} #${row.chunkId}`}
+							{row.inAnswer ? ' · cited' : ''}
+						</td>
+						<td style={S.td} title={row.rawScore !== null ? `raw score ${row.rawScore}` : undefined}>
+							{row.score !== null ? row.score.toFixed(3) : '—'}
+						</td>
+						<td style={S.td}>{STATUS_WORDS[row.status]}</td>
+					</tr>
+				))}
+			</tbody>
+		</table>
+	);
+}
+
+/**
  * "Why these?" for one answer.
  *
  * @param props - {@link RetrievalDebuggerProps}.
@@ -168,40 +214,7 @@ export function RetrievalDebugger({ model, channels, question, topK, onClose, an
 						{phase.view.floor !== null ? ` · floor ${phase.view.floor.toFixed(2)}` : ''}
 					</p>
 					<ScoreHistogram scores={phase.view.rows.map((row) => row.score).filter((score): score is number => score !== null)} range={range} threshold={phase.view.threshold} floor={phase.view.floor} />
-					<table style={S.table}>
-						<caption style={{ ...S.line, textAlign: 'left' }}>{`Top ${phase.view.rows.length} chunks for the question, including those under the threshold and the floor`}</caption>
-						<thead>
-							<tr>
-								<th scope="col" style={S.th}>
-									#
-								</th>
-								<th scope="col" style={S.th}>
-									Document
-								</th>
-								<th scope="col" style={S.th}>
-									Score
-								</th>
-								<th scope="col" style={S.th}>
-									Status
-								</th>
-							</tr>
-						</thead>
-						<tbody>
-							{phase.view.rows.map((row) => (
-								<tr key={`${row.objectId}#${row.chunkId}`} data-status={row.status} style={row.status === 'used' ? undefined : S.muted}>
-									<td style={S.td}>{row.rank}</td>
-									<td style={S.td} title={row.preview}>
-										{`${row.path || row.objectId} #${row.chunkId}`}
-										{row.inAnswer ? ' · cited' : ''}
-									</td>
-									<td style={S.td} title={row.rawScore !== null ? `raw score ${row.rawScore}` : undefined}>
-										{row.score !== null ? row.score.toFixed(3) : '—'}
-									</td>
-									<td style={S.td}>{STATUS_WORDS[row.status]}</td>
-								</tr>
-							))}
-						</tbody>
-					</table>
+					<RetrievalTable view={phase.view} />
 				</>
 			)}
 		</section>
