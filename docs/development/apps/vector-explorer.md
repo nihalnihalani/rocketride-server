@@ -147,6 +147,14 @@ Builder tasks (see the [builder reference](../builder/reference.md)):
 ./builder vector-ui:e2e-live  # browser lanes against ENGINE_URL; opt-in, not part of test or CI
 ```
 
+`vector-ui:test` runs every suite under `apps/vector-ui/tests` and fails when a
+suite it requires is missing: every one of `ALWAYS_REQUIRED_TESTS` in
+`apps/vector-ui/scripts/tasks.js`, and each suite of `FEATURE_TESTS` once the
+module it is paired with is in the checkout (the enrichment's suites, so a merge
+that brings a feature without its suite fails instead of passing with the suite
+never run). `scripts/acceptance/vector-explorer/selftest/test_lanes.py` holds
+both lists to every suite the change lanes own in `lanes.json`.
+
 ## The write switch
 
 - **One source for the defaults.** `VECTOR_ALLOW_WRITES_DEFAULT` (false) and
@@ -255,6 +263,15 @@ takes its own block of free task ports (from `RR_TEST_TOOLPATH_BASE_PORT`,
 default 44000), so runs from two checkouts at once do not reach each other's
 tasks, and `RR_TEST_TOOLPATH_ENGINE_PORT` fixes the engine's own port.
 
+With `RR_TEST_VECTOR_LEGACY=seeded` the tool-path suite runs its legacy pass on
+the shared `vx_legacy_docs` that `seed_legacy.sh` writes. It adds and removes
+only documents of its own there, and checks that: it fingerprints the seeded
+collection when a backend's deployment starts (each seeded document's rows,
+deleted ones included, and on pgvector the soft-deleted rows) and fails after
+that backend's live tests if the fingerprint changed, so a write that touched
+the seed is caught by the run that made it rather than by the next
+`seed_legacy.sh --verify-only`.
+
 Without `RR_REQUIRE_DB_TESTS` a suite whose server is unreachable skips with a
 `NOT RUN:` reason, so a run can pass without touching a database; read the skip
 summary that `-rs` prints. A run by name also leaves out the checks
@@ -303,7 +320,18 @@ cd dist/server
 
 The lane removes demo documents (the duplicates queue, an outlier) and uploads
 three files of its own, then uploads the removed documents again under their own
-names and removes its own, so the corpus is as it was.
+names and removes its own, so the corpus is as it was. Because it writes to the
+stores, `vector-ui:e2e-live` runs it only when `VECTOR_UI_E2E_LANES` names it
+(`enrich`; the default run and `all` leave it out), once per backend of
+`VECTOR_UI_E2E_BACKENDS`.
+
+The lane finds the enrichment's controls by the names and data hooks the app
+gives them (its `UI` table). The self-test checks each of them, and the wording
+the steps read, against the code of the app's source files (comment lines left
+out), skipping a file with a `NEEDS:` reason while it is still a placeholder;
+`VX_APP_SRC=<tree>/apps/vector-ui/src` points that check at another tree, for
+example the merged app from a lane branch whose own copy still holds the
+placeholders.
 
 The perf lane (`lane_vector_perf.cjs`) measures the map's edges per mode
 (`EDGE_MODES`: none, tree, neighbours:3, neighbours:5) on its 2,000-point
@@ -312,8 +340,15 @@ detailed sample, at 1x and 4x CPU throttling. Before the shell loads it sets
 edge however slow its frames; each row records what the map root reports
 (`data-edges-auto-degrade`, `data-edges-degraded`, `data-edge-count`), and each
 mode at 4x is its own gate (p95 frame interval ≤ 33 ms), failing when it was
-measured with the switch on. `gen_perf.py --check` says whether the perf
-fixture's sample can carry every edge row.
+measured with the switch on. Each edge row also records the edges its mode must
+draw over the page's own sample (`edgesExpected`, computed from the sample
+answer in the page's frames as `map/graph.ts` computes them: the tree is n minus
+the kNN graph's pieces, Neighbours m each point's m strongest pairs, kept once)
+and fails unless the map drew exactly that, so a slow mode cannot pass by
+drawing fewer edges. The points row of the edge sample records the switch too:
+a page that cannot turn it off gets one row saying so, and its edge rows are not
+measured. `gen_perf.py --check` says whether the perf fixture's sample can
+carry every edge row.
 
 `scripts/acceptance/vector-explorer/lanes.json` lists which change lane owns
 which file in a multi-lane build of the app, the commit the lanes branch from
