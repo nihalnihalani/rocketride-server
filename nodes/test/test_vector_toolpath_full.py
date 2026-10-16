@@ -119,7 +119,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 from urllib.parse import urlparse
 
 import pytest
@@ -262,6 +262,20 @@ def legacy_point_ids(metas: Sequence[Dict[str, Any]]) -> List[str]:
     return out
 
 
+def seeded_fingerprint(
+    counts: Dict[str, int], soft_deleted: Sequence[Tuple[str, int]], documents: Iterable[str]
+) -> Dict[str, Any]:
+    """What the suite must leave as it found it on the seeded legacy collection (RR_TEST_VECTOR_LEGACY=seeded).
+
+    The rows of each seeded document (its objectId's chunk count, deleted rows included) and the
+    collection's soft-deleted rows; the suite's own uploads are left out, since it adds and removes them.
+    """
+    return {
+        'chunks': {oid: counts.get(oid) for oid in sorted(set(documents))},
+        'soft_deleted': sorted((str(o), int(c)) for o, c in soft_deleted),
+    }
+
+
 class _PgVector:
     """postgres.pipe (direct settings) and rocketride_vector.pipe (DSN from the broker stand-in)."""
 
@@ -338,6 +352,17 @@ class _PgVector:
             )
         )
         return {o: int(n) for o, n in rows}
+
+    def soft_deleted(self, collection: str) -> List[Tuple[str, int]]:
+        """The (objectId, chunkId) of every soft-deleted row but the control record."""
+        from psycopg2 import sql
+
+        rows = self._sql(
+            sql.SQL(
+                "SELECT objectid, chunkid FROM {} WHERE objectid <> 'schema' AND isdeleted IS TRUE ORDER BY objectid, chunkid"
+            ).format(sql.Identifier(collection))
+        )
+        return [(o, int(c)) for o, c in rows]
 
     def chunk_ids(self, collection: str, oid: str) -> List[int]:
         from psycopg2 import sql
@@ -915,6 +940,12 @@ class _Side:
                 pass
 
 
+def _seeded_state(service: Any, collection: str, documents: Iterable[str]) -> Dict[str, Any]:
+    """The seeded legacy collection's fingerprint now (soft-deleted rows where the store has them)."""
+    soft = getattr(service, 'soft_deleted', None)
+    return seeded_fingerprint(service.counts(collection), soft(collection) if soft else [], documents)
+
+
 @pytest.fixture(scope='module', params=SUPPORTED)
 def deployment(request, corpus_files):
     """The template started on a new collection (with the corpus uploaded) and on a legacy one."""
@@ -950,7 +981,9 @@ def deployment(request, corpus_files):
             legacy_docs = {name: object_id(name) for name in names}
             legacy_orphan = object_id('/srv/legacy/manuals/long_manual.md')
             legacy_multi = object_id('/srv/legacy/' + MULTI_DOC)
+            seeded_before = _seeded_state(service, legacy_collection, legacy_docs.values())
         else:
+            seeded_before = None
             legacy_collection = LEGACY_COLLECTION
             service.make_legacy(NEW_COLLECTION, legacy_collection, new.multi)
             legacy_docs = dict(new.documents)
@@ -967,7 +1000,14 @@ def deployment(request, corpus_files):
         sides.append(legacy)
         legacy.documents, legacy.orphan, legacy.multi = legacy_docs, legacy_orphan, legacy_multi
         yield SimpleNamespace(
-            provider=provider, service=service, engine=eng, stub=stub_server, new=new, legacy=legacy, files=corpus_files
+            provider=provider,
+            service=service,
+            engine=eng,
+            stub=stub_server,
+            new=new,
+            legacy=legacy,
+            files=corpus_files,
+            seeded_before=seeded_before,
         )
     finally:
         for side in sides:
@@ -1798,6 +1838,16 @@ def test_rocketride_vector_through_the_transaction_pooler(engine, broker, stub, 
         broker.dsn = direct
 
 
+def test_the_suite_leaves_the_seeded_legacy_collection_as_it_found_it(deployment):
+    # Last of each backend's live tests: the writes above only add and remove documents of the suite's own.
+    if deployment.seeded_before is None:
+        pytest.skip("NOT RUN: the legacy collection is the suite's own copy (RR_TEST_VECTOR_LEGACY=emulated)")
+    after = _seeded_state(deployment.service, deployment.legacy.collection, deployment.legacy.documents.values())
+    assert after == deployment.seeded_before, (
+        'the run changed the seeded legacy collection (seed_legacy.sh --verify-only)'
+    )
+
+
 # ---------------------------------------------------------------------------
 # The legacy copies (no engine or database call)
 # ---------------------------------------------------------------------------
@@ -1870,6 +1920,16 @@ def test_a_legacy_copy_gets_the_same_point_ids_on_every_run(copy):
 # ---------------------------------------------------------------------------
 # The secrets scan's own rules (no engine call)
 # ---------------------------------------------------------------------------
+
+
+def test_the_seeded_fingerprint_names_each_documents_chunks_and_the_soft_deleted_rows():
+    fp = seeded_fingerprint({'a': 3, 'b': 2, 'own': 1}, [('b', 1)], ['b', 'a'])
+    assert fp == {'chunks': {'a': 3, 'b': 2}, 'soft_deleted': [('b', 1)]}
+    # A lost soft-deleted row, a re-ingested document or a removed one changes it; the suite's own uploads do not.
+    assert seeded_fingerprint({'a': 3, 'b': 2}, [], ['a', 'b']) != fp
+    assert seeded_fingerprint({'a': 3, 'b': 4}, [('b', 1)], ['a', 'b']) != fp
+    assert seeded_fingerprint({'b': 2}, [('b', 1)], ['a', 'b']) != fp
+    assert seeded_fingerprint({'a': 3, 'b': 2, 'own': 5}, [('b', 1)], ['a', 'b']) == fp
 
 
 def test_two_runs_never_share_a_task_port():
