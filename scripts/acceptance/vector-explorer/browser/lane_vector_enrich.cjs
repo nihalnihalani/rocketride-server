@@ -1038,6 +1038,40 @@ function healthVerdict({ items, flagged }) {
 	return (flagged || []).some((f) => f.path === deleted.path && f.kind === 'deleted_chunks') ? true : `${deleted.path} is not flagged with its deleted chunk`;
 }
 
+/** Each planned step's title (the row name it records): stepsFor's keys to the names main runs them by. */
+const STEP_TITLES = {
+	clusters: 'clusters (P0-1): at least 3 groups of 5 or more, the greenhouse group labelled orchid, rows summing to n, Colour by Cluster',
+	'min size': 'clusters: Minimum size 2 lists the groups of 2 or more, with no sample frame',
+	ask: "clusters: Ask about these scopes the chat to the group's documents",
+	edges: "edges (P0-3): Tree draws n minus the components, Neighbours m=5 at most 5n, hover thickens, Expand selected adds the point's edges",
+	'ingest date': "colour by ingest date (P1-3): the ramp spans the sampled documents' ingest days",
+	isolate: 'isolate (P1-4): Isolate shows the selection only, the table lists it, Expand grows it, Show all restores n',
+	text: "text (P1-6): Show full text of a falcon chunk marks 'water', fetched once",
+	recommend: 'recommend (P1-1): + a falcon chunk, - a greenhouse chunk: no greenhouse chunk in the top 12, a falcon or kestrel chunk first',
+	'best score': 'recommend: Best score is native where the store flags it and refused elsewhere',
+	matrix: "matrix (P1-2): a lasso over one group shown alone sends the selection's keys; symmetric, unit diagonal, same-document pairs above 0.5; its CSV has n rows",
+	'export csv': "export (P0-6): the lasso selection's CSV holds exactly the Selection tab's points (the keys Copy keys gives, from as many documents as it says) and no vector or secret",
+	'export png': 'export: the map PNG is over 10 KB, drawn, named after the collection',
+	views: 'views (P1-5): a saved view survives a connection switch; applying it re-samples with its seed, pins at most 200 keys and says what it restored',
+	dedupe: "duplicates queue (P0-4): the planted pairs form two groups, Keep shortest path keeps falcon_handbook.md, the slider re-groups (to the sample's own groups below the start) with no sample frame",
+	outliers: 'outliers (P1-8): the OCR junk first with its why; 5 % lists more rows with no sample frame',
+	charts: 'charts (P0-7): the long manual is in the top bin of chunks per document; clicking it scopes the directory',
+	scope: "scope (P0-2): folder C:/demo/handbooks/ scopes the directory, the map's sample and the chat; the status says who filtered; saved and applied again",
+	'scope 600': 'scope of 600 (the scope card): every scoped document with a chunk is in the sample',
+	listing: 'listing (the scope card): an unscoped sample of a collection above 500 documents says it was drawn from the first 500',
+	keyword: 'search (P0-5): Keyword finds KX4471 in ops/memo_q3.txt as a whole word',
+	threshold: 'search: the threshold slider passes fewer rows above the median score than at the lowest; Copy as node setting copies the value',
+	compare: 'search: Compare reports the shared results and the map draws both stars',
+	layout: 'search: the chat column is 55 % before and after the Search toggle',
+	'dedupe removal': 'duplicates removal: Remove all queued, Cancel sends nothing, Confirm with the typed count removes exactly the queued documents',
+	'outlier removal': 'outlier removal: Remove document, confirmed, removes the OCR junk',
+	'ingest summary': "ingest summary (P1-9): a 3-file drop says '3 added (N chunks)'; Show new chunks pins at most 200",
+	health: 'health (P1-7): the legacy card lists the chunk-0-less document and the document with one deleted chunk',
+	restore: "restore: the removed demo documents are back under their own names and the lane's own uploads are gone",
+	'sign-out': 'sign-out: saved views and saved filters are gone after signing in again',
+	privacy: 'privacy (B4): no full-dimension vector outside vectors and embed answers, none in a download',
+};
+
 /** The steps a fixture runs (the scope of 600 and the listing cap on the scope cards: Qdrant and Chroma; health on the legacy pgvector card). */
 function stepsFor(fixtureKey) {
 	const steps = ['clusters', 'min size', 'ask', 'edges', 'ingest date', 'isolate', 'text', 'recommend', 'best score', 'matrix', 'export csv', 'export png', 'views', 'dedupe', 'outliers', 'charts', 'scope', 'keyword', 'threshold', 'compare', 'layout', 'dedupe removal', 'outlier removal', 'ingest summary', 'restore', 'sign-out', 'privacy'];
@@ -1045,6 +1079,36 @@ function stepsFor(fixtureKey) {
 	if (fixtureKey === 'qdrant' || fixtureKey === 'chroma') steps.splice(steps.indexOf('scope 600') + 1, 0, 'listing');
 	if (fixtureKey === 'postgres') steps.splice(steps.indexOf('restore'), 0, 'health');
 	return steps;
+}
+
+/**
+ * The FAIL rows a run owes for what it did not record: one for each planned step with no row of
+ * its title (the lane stopped before it), and one 'lane' row carrying the error it threw, if any.
+ * A run that stops early therefore fails every step it skipped instead of leaving them out.
+ */
+function unrecordedRows(fixtureKey, planned, recorded, error) {
+	const names = new Set((Array.isArray(recorded) ? recorded : []).map((r) => r && r.name));
+	const why = error ? String(error && error.message ? error.message : error).split('\n')[0] : null;
+	const rows = planned.filter((s) => !names.has(STEP_TITLES[s])).map((s) => ({ fixture: fixtureKey, name: STEP_TITLES[s], status: 'FAIL', detail: why ? `not run: the lane stopped first (${why})` : 'not run: the lane stopped before this step' }));
+	if (why) rows.push({ fixture: fixtureKey, name: 'lane', status: 'FAIL', detail: why });
+	return rows;
+}
+
+/**
+ * One backend's rows in a vector-ui:e2e-live run, from its child's exit status and result file:
+ * the rows it recorded, a FAIL row for each planned step it did not record (all of them when it
+ * wrote no list), and, unless it wrote a 'lane' row of its own, a 'lane' FAIL row saying how it
+ * ended when it skipped a planned step or exited non-zero with every row passing.
+ */
+function e2eBackendRows(fixtureKey, status, data) {
+	const planned = stepsFor(fixtureKey);
+	if (!Array.isArray(data)) return [...unrecordedRows(fixtureKey, planned, [], null), { fixture: fixtureKey, name: 'lane', status: 'FAIL', detail: `the lane wrote no result (exit ${status})` }];
+	const missing = unrecordedRows(fixtureKey, planned, data, null);
+	const rows = [...data, ...missing];
+	const ownLaneRow = data.some((r) => r && r.name === 'lane');
+	if (!ownLaneRow && missing.length) rows.push({ fixture: fixtureKey, name: 'lane', status: 'FAIL', detail: `the lane exited ${status} having recorded ${planned.length - missing.length} of its ${planned.length} planned steps` });
+	else if (!ownLaneRow && status !== 0 && rows.every((r) => r.status === 'PASS')) rows.push({ fixture: fixtureKey, name: 'lane', status: 'FAIL', detail: `the lane exited ${status} with every row passing` });
+	return rows;
 }
 
 /**
@@ -1086,13 +1150,31 @@ function demoCorpus() {
 // The lane
 // ---------------------------------------------------------------------------
 
+/**
+ * One run on one backend: the planned steps (drive), then a FAIL row for each one it did not
+ * record and one for the error it threw (unrecordedRows), written before main settles.
+ */
 async function main(fixtureKey, base, out) {
+	if (!E.FIXTURES[fixtureKey] || !BACKENDS.includes(fixtureKey)) throw new Error(`unknown fixture ${fixtureKey}; this lane runs on ${BACKENDS.join(', ')}`);
+	const planned = stepsFor(fixtureKey);
+	const recorder = C.createRecorder(fixtureKey, out, 'vector-enrich');
+	let thrown = null;
+	try {
+		await drive(fixtureKey, base, out, planned, recorder.step);
+	} catch (e) {
+		thrown = e;
+	} finally {
+		for (const row of unrecordedRows(fixtureKey, planned, recorder.results, thrown)) recorder.rec(row.name, false, row.detail);
+		recorder.write(RESULTS);
+	}
+	if (thrown) throw thrown;
+}
+
+/** The steps of one run, in order (each records its own row through `step`). */
+async function drive(fixtureKey, base, out, planned, step) {
 	const { chromium } = E.loadPlaywright();
 	const fixture = E.FIXTURES[fixtureKey];
-	if (!fixture || !BACKENDS.includes(fixtureKey)) throw new Error(`unknown fixture ${fixtureKey}; this lane runs on ${BACKENDS.join(', ')}`);
 	const run = nodeCrypto.randomBytes(4).toString('hex');
-	const planned = stepsFor(fixtureKey);
-	const { step, write } = C.createRecorder(fixtureKey, out, 'vector-enrich');
 	const store = C.storeClient(base);
 	const browser = await chromium.launch({ channel: 'chrome', headless: true });
 	const context = await browser.newContext({ viewport: { width: 1440, height: 920 }, acceptDownloads: true });
@@ -1394,7 +1476,7 @@ async function main(fixtureKey, base, out) {
 		// the matrix, exports and views (nothing is removed here)
 		// ------------------------------------------------------------------
 
-		await step(page, 'clusters (P0-1): at least 3 groups of 5 or more, the greenhouse group labelled orchid, rows summing to n, Colour by Cluster', async (note) => {
+		await step(page, STEP_TITLES['clusters'], async (note) => {
 			const x = await openMap(fixture);
 			sample = x.result;
 			sampleInput = x.input;
@@ -1423,7 +1505,7 @@ async function main(fixtureKey, base, out) {
 			return clustersVerdict({ input: x.input, sample, rows, noise, colourOffered, colourAfter });
 		});
 
-		await step(page, 'clusters: Minimum size 2 lists the groups of 2 or more, with no sample frame', async (note) => {
+		await step(page, STEP_TITLES['min size'], async (note) => {
 			if (!sample) return 'no sample (clusters step)';
 			const rowsAt = async () =>
 				visible(map.getByRole('list', { name: UI.map.clustersList }))
@@ -1446,7 +1528,7 @@ async function main(fixtureKey, base, out) {
 			return minSizeVerdict({ sample, rows5, rows2, samplesSent });
 		});
 
-		await step(page, "clusters: Ask about these scopes the chat to the group's documents", async (note) => {
+		await step(page, STEP_TITLES['ask'], async (note) => {
 			if (!sample || !sample.clusters) return 'no clusters (clusters step)';
 			const docs = clusterDocuments(sample, 0);
 			await sideTab(UI.map.tabs.clusters);
@@ -1463,7 +1545,7 @@ async function main(fixtureKey, base, out) {
 			return count(m[1]) === docs.size ? true : `the chat asks about ${m[1]} documents; cluster 1 holds ${docs.size}`;
 		});
 
-		await step(page, "edges (P0-3): Tree draws n minus the components, Neighbours m=5 at most 5n, hover thickens, Expand selected adds the point's edges", async (note) => {
+		await step(page, STEP_TITLES['edges'], async (note) => {
 			if (!sample) return 'no sample';
 			await C.switchView(page, CONSOLE.mapTab);
 			const edges = combo(UI.map.edges, toolbar);
@@ -1534,7 +1616,7 @@ async function main(fixtureKey, base, out) {
 			return edgesVerdict({ sample, tree, neighbours5, hovered, expanded, selected });
 		});
 
-		await step(page, "colour by ingest date (P1-3): the ramp spans the sampled documents' ingest days", async (note) => {
+		await step(page, STEP_TITLES['ingest date'], async (note) => {
 			if (!sample) return 'no sample';
 			await choose(combo(UI.map.colourBy, toolbar), UI.map.ingestDateOption);
 			const colourAfter = await poll(
@@ -1551,7 +1633,7 @@ async function main(fixtureKey, base, out) {
 			return rampVerdict({ label, colourAfter, items });
 		});
 
-		await step(page, 'isolate (P1-4): Isolate shows the selection only, the table lists it, Expand grows it, Show all restores n', async (note) => {
+		await step(page, STEP_TITLES['isolate'], async (note) => {
 			if (!sample) return 'no sample';
 			const selection = await lassoLeft(0.35);
 			await sideTab(UI.map.tabs.selection);
@@ -1588,7 +1670,7 @@ async function main(fixtureKey, base, out) {
 			return isolateVerdict({ n: sample.n, selection, isolated, tableRows, expanded, all, framing: framingRead });
 		});
 
-		await step(page, "text (P1-6): Show full text of a falcon chunk marks 'water', fetched once", async (note) => {
+		await step(page, STEP_TITLES['text'], async (note) => {
 			if (!sample) return 'no sample';
 			// The water question is the active query whose words are marked.
 			await toolbar.getByPlaceholder(MAP.queryBox).first().fill(E.WATER_QUESTION);
@@ -1622,7 +1704,7 @@ async function main(fixtureKey, base, out) {
 			return chunkTextVerdict({ marks, calls, key: falconKey });
 		});
 
-		await step(page, 'recommend (P1-1): + a falcon chunk, - a greenhouse chunk: no greenhouse chunk in the top 12, a falcon or kestrel chunk first', async (note) => {
+		await step(page, STEP_TITLES['recommend'], async (note) => {
 			if (!sample || !falconKey) return 'no falcon chunk inspected (text step)';
 			const gi = sample.points.doc.findIndex((_, i) => String(pathOf(sample, i) || '').includes(`/${CORPUS.greenhouseFolder}`));
 			if (gi < 0) return 'no greenhouse chunk in the sample';
@@ -1641,7 +1723,7 @@ async function main(fixtureKey, base, out) {
 			return recommendVerdict({ input: x.input, answer: x.result, positive: falconKey, negative: greenhouseKey });
 		});
 
-		await step(page, 'recommend: Best score is native where the store flags it and refused elsewhere', async (note) => {
+		await step(page, STEP_TITLES['best score'], async (note) => {
 			if (!greenhouseKey) return 'no recommend examples (recommend step)';
 			const dialect = await store.tool(fixture, 'dialect');
 			const capability = !!(dialect && dialect.capabilities && dialect.capabilities.recommend_best_score);
@@ -1661,7 +1743,7 @@ async function main(fixtureKey, base, out) {
 			return bestScoreVerdict({ capability, answer });
 		});
 
-		await step(page, "matrix (P1-2): a lasso over one group shown alone sends the selection's keys; symmetric, unit diagonal, same-document pairs above 0.5; its CSV has n rows", async (note) => {
+		await step(page, STEP_TITLES['matrix'], async (note) => {
 			if (!sample) return 'no sample';
 			// A group of at most MATRIX_MAX points holding two chunks of one document: shown alone, then lassoed whole.
 			const group = matrixCluster(sample);
@@ -1715,7 +1797,7 @@ async function main(fixtureKey, base, out) {
 			return rows === x.result.n ? true : `the matrix CSV has ${rows} rows for n = ${x.result.n}`;
 		});
 
-		await step(page, "export (P0-6): the lasso selection's CSV holds exactly the Selection tab's points (the keys Copy keys gives, from as many documents as it says) and no vector or secret", async (note) => {
+		await step(page, STEP_TITLES['export csv'], async (note) => {
 			if (!sample) return 'no sample';
 			const selection = await lassoLeft(0.5);
 			// The points the Selection tab holds, read before the export: the CSV's rows must be these.
@@ -1733,7 +1815,7 @@ async function main(fixtureKey, base, out) {
 			return selectionCsvVerdict({ csv, selection, sampleKeys, dim, secrets: { 'the API key': E.API_KEY, 'the Tools task token': await store.tokenOf(fixture, 'tools_1').catch(() => '') }, selectedKeys: tab.keys, tab: tab.line });
 		});
 
-		await step(page, 'export: the map PNG is over 10 KB, drawn, named after the collection', async (note) => {
+		await step(page, STEP_TITLES['export png'], async (note) => {
 			if (!sample) return 'no sample';
 			const got = await exportItem(map, 'map-png', 'png');
 			const dialect = await store.tool(fixture, 'dialect');
@@ -1742,7 +1824,7 @@ async function main(fixtureKey, base, out) {
 			return pngVerdict({ name: got.name, bytes: got.bytes, collection: dialect && dialect.collection });
 		});
 
-		await step(page, 'views (P1-5): a saved view survives a connection switch; applying it re-samples with its seed, pins at most 200 keys and says what it restored', async (note) => {
+		await step(page, STEP_TITLES['views'], async (note) => {
 			if (!sample) return 'no sample';
 			const selection = await lassoLeft(0.6);
 			const menu = visible(map.locator(UI.views.menu));
@@ -1775,7 +1857,7 @@ async function main(fixtureKey, base, out) {
 			return viewsVerdict({ listedAfterSwitch, saved: savedView, apply: x, line });
 		});
 
-		await step(page, "duplicates queue (P0-4): the planted pairs form two groups, Keep shortest path keeps falcon_handbook.md, the slider re-groups (to the sample's own groups below the start) with no sample frame", async (note) => {
+		await step(page, STEP_TITLES['dedupe'], async (note) => {
 			if (!sample) return 'no sample';
 			await sideTab(UI.map.tabs.duplicates);
 			const section = visible(map.getByRole('region', { name: UI.dedupe.section }));
@@ -1823,7 +1905,7 @@ async function main(fixtureKey, base, out) {
 			return dedupeVerdict({ groups, keptPaths, queuedPaths, queuedCount, samplesSent, from, to, thresholdAfter, groupsAfter, expectedBefore, expectedAfter });
 		});
 
-		await step(page, 'outliers (P1-8): the OCR junk first with its why; 5 % lists more rows with no sample frame', async (note) => {
+		await step(page, STEP_TITLES['outliers'], async (note) => {
 			if (!sample) return 'no sample';
 			await sideTab(MAP.tabs.outliers);
 			const list = visible(map.getByRole('list', { name: MAP.outliersList }));
@@ -1844,7 +1926,7 @@ async function main(fixtureKey, base, out) {
 		// The console: charts, scope, search (nothing is removed here)
 		// ------------------------------------------------------------------
 
-		await step(page, 'charts (P0-7): the long manual is in the top bin of chunks per document; clicking it scopes the directory', async (note) => {
+		await step(page, STEP_TITLES['charts'], async (note) => {
 			await openConsole();
 			const charts = visible(page.locator('summary', { hasText: UI.charts.summary }));
 			await charts.click();
@@ -1870,7 +1952,7 @@ async function main(fixtureKey, base, out) {
 			}
 		});
 
-		await step(page, "scope (P0-2): folder C:/demo/handbooks/ scopes the directory, the map's sample and the chat; the status says who filtered; saved and applied again", async (note) => {
+		await step(page, STEP_TITLES['scope'], async (note) => {
 			await openConsole();
 			const since = capture.frames.length;
 			const listing = await scopeToFolder(CORPUS.scopeFolder);
@@ -1900,7 +1982,7 @@ async function main(fixtureKey, base, out) {
 
 		let scopeCleared = null; // the frame before the scope card's scope was cleared
 		if (planned.includes('scope 600')) {
-			await step(page, 'scope of 600 (the scope card): every scoped document with a chunk is in the sample', async (note) => {
+			await step(page, STEP_TITLES['scope 600'], async (note) => {
 				const since = capture.frames.length;
 				await C.openConnection(page, SCOPE_FIXTURES[fixtureKey]);
 				await scopeToFolder(CORPUS.padFolder);
@@ -1922,7 +2004,7 @@ async function main(fixtureKey, base, out) {
 		}
 
 		if (planned.includes('listing')) {
-			await step(page, 'listing (the scope card): an unscoped sample of a collection above 500 documents says it was drawn from the first 500', async (note) => {
+			await step(page, STEP_TITLES['listing'], async (note) => {
 				const card = SCOPE_FIXTURES[fixtureKey];
 				if (scopeCleared === null) {
 					await C.openConnection(page, card);
@@ -1974,7 +2056,7 @@ async function main(fixtureKey, base, out) {
 				el.dispatchEvent(new Event('change', { bubbles: true }));
 			}, value);
 
-		await step(page, 'search (P0-5): Keyword finds KX4471 in ops/memo_q3.txt as a whole word', async (note) => {
+		await step(page, STEP_TITLES['keyword'], async (note) => {
 			const panel = await searchPanel();
 			const x = await runSearch(panel, UI.search.mode.keyword, CORPUS.keywordToken);
 			await C.sleep(500);
@@ -1983,7 +2065,7 @@ async function main(fixtureKey, base, out) {
 			return keywordVerdict({ input: x.input, answer: x.result, firstRow });
 		});
 
-		await step(page, 'search: the threshold slider passes fewer rows above the median score than at the lowest; Copy as node setting copies the value', async (note) => {
+		await step(page, STEP_TITLES['threshold'], async (note) => {
 			const panel = await searchPanel();
 			const x = await runSearch(panel, UI.search.mode.semantic, E.WATER_QUESTION);
 			// Two positions from the answer's own scores: one every row passes, one above the median.
@@ -2000,7 +2082,7 @@ async function main(fixtureKey, base, out) {
 			return thresholdVerdict({ low, high, copied, at });
 		});
 
-		await step(page, 'search: Compare reports the shared results and the map draws both stars', async (note) => {
+		await step(page, STEP_TITLES['compare'], async (note) => {
 			const panel = await searchPanel();
 			const since = capture.frames.length;
 			await button(UI.search.compare, panel).click();
@@ -2033,7 +2115,7 @@ async function main(fixtureKey, base, out) {
 			return compareVerdict({ a: runs[0] && runs[0].result, b: runs[1] && runs[1].result, summary, starA, starB });
 		});
 
-		await step(page, 'search: the chat column is 55 % before and after the Search toggle', async (note) => {
+		await step(page, STEP_TITLES['layout'], async (note) => {
 			await openConsole();
 			const ratio = () =>
 				page.evaluate(
@@ -2063,7 +2145,7 @@ async function main(fixtureKey, base, out) {
 		// Writes: the duplicates queue, an outlier, a 3-file drop
 		// ------------------------------------------------------------------
 
-		await step(page, 'duplicates removal: Remove all queued, Cancel sends nothing, Confirm with the typed count removes exactly the queued documents', async (note) => {
+		await step(page, STEP_TITLES['dedupe removal'], async (note) => {
 			if (!queued.length) return 'nothing queued (duplicates queue step)';
 			await C.switchView(page, CONSOLE.mapTab);
 			await sideTab(UI.map.tabs.duplicates);
@@ -2102,7 +2184,7 @@ async function main(fixtureKey, base, out) {
 			return removalVerdict({ expected: queued.map((q) => q.objectId), sent, before, after, chunks });
 		});
 
-		await step(page, 'outlier removal: Remove document, confirmed, removes the OCR junk', async (note) => {
+		await step(page, STEP_TITLES['outlier removal'], async (note) => {
 			if (!sample) return 'no sample';
 			await sideTab(MAP.tabs.outliers);
 			const list = visible(map.getByRole('list', { name: MAP.outliersList }));
@@ -2130,7 +2212,7 @@ async function main(fixtureKey, base, out) {
 			return removalVerdict({ expected: [C.objectId(ocr)], sent, before, after, chunks: null });
 		});
 
-		await step(page, "ingest summary (P1-9): a 3-file drop says '3 added (N chunks)'; Show new chunks pins at most 200", async (note) => {
+		await step(page, STEP_TITLES['ingest summary'], async (note) => {
 			await openConsole();
 			const files = [1, 2, 3].map((n) => ({ name: `enrich-${run}-${n}.md`, mimeType: 'text/markdown', buffer: Buffer.from(`# Enrichment note ${n}\n\nThe ${['north', 'south', 'east'][n - 1]} ridge relay was checked by the night watch on run ${run}. ${'The battery bank held its charge through the storm. '.repeat(30)}\n`) }));
 			await page.locator('input[type="file"]:not([webkitdirectory])').first().setInputFiles(files);
@@ -2155,7 +2237,7 @@ async function main(fixtureKey, base, out) {
 		});
 
 		if (planned.includes('health')) {
-			await step(page, 'health (P1-7): the legacy card lists the chunk-0-less document and the document with one deleted chunk', async (note) => {
+			await step(page, STEP_TITLES['health'], async (note) => {
 				const since = capture.frames.length;
 				await C.openConnection(page, LEGACY_FIXTURE);
 				await C.sleep(2000);
@@ -2169,7 +2251,7 @@ async function main(fixtureKey, base, out) {
 			});
 		}
 
-		await step(page, "restore: the removed demo documents are back under their own names and the lane's own uploads are gone", async (note) => {
+		await step(page, STEP_TITLES['restore'], async (note) => {
 			const corpus = demoCorpus();
 			const again = [...removedDemo].map((p) => ({ name: p, text: corpus[p.slice(E.DEMO_PREFIX.length)] })).filter((f) => typeof f.text === 'string');
 			if (again.length) await store.upload(fixture, again);
@@ -2204,7 +2286,7 @@ async function main(fixtureKey, base, out) {
 			return gone.every(Boolean) ? true : "one of the lane's uploads is still stored";
 		});
 
-		await step(page, 'sign-out: saved views and saved filters are gone after signing in again', async (note) => {
+		await step(page, STEP_TITLES['sign-out'], async (note) => {
 			// Log out is in the shell's account menu (the button with the user's initials).
 			await visible(page.locator(UI.account.menu).filter({ hasText: UI.account.initials })).click();
 			await visible(page.getByText(CONSOLE.logout, { exact: true })).click();
@@ -2229,7 +2311,7 @@ async function main(fixtureKey, base, out) {
 			return viewListed ? "the saved view 'dupes' is still listed after signing in again" : true;
 		});
 
-		await step(page, 'privacy (B4): no full-dimension vector outside vectors and embed answers, none in a download', async (note) => {
+		await step(page, STEP_TITLES['privacy'], async (note) => {
 			if (!capture.frames.length) return 'no WebSocket frames were captured';
 			const dimension = await store.dimension(fixture);
 			const violations = C.privacyViolations(capture.frames, dimension);
@@ -2243,7 +2325,6 @@ async function main(fixtureKey, base, out) {
 	} finally {
 		await browser.close().catch(() => {});
 		await store.close();
-		write(RESULTS);
 	}
 }
 
@@ -2265,10 +2346,12 @@ function childArgv(execArgv, file, args) {
 
 /**
  * A vector-ui:e2e-live run: the lane once per backend, each in its own process and folder, then
- * every row (with its browser and backend) in <out>/lane_vector_enrich.json.
+ * every row (with its browser and backend) in <out>/lane_vector_enrich.json. A backend whose
+ * child exited non-zero, or recorded fewer rows than it planned (none, say, when sign-in timed
+ * out), fails (e2eBackendRows); the exit code is 1 when any row failed.
+ * `spawnSync` runs each child (the selftest gives a stand-in).
  */
-function runForE2e(args) {
-	const { spawnSync } = require('child_process');
+function runForE2e(args, spawnSync = require('child_process').spawnSync) {
 	const rows = [];
 	for (const key of args.fixtures) {
 		if (args.browser !== 'chrome') {
@@ -2285,8 +2368,7 @@ function runForE2e(args) {
 		} catch {
 			data = null;
 		}
-		if (!Array.isArray(data)) data = [{ fixture: key, name: 'lane', status: 'FAIL', detail: `the lane wrote no result (exit ${child.status})` }];
-		for (const row of data) rows.push({ browser: args.browser, backend: key, ...row });
+		for (const row of e2eBackendRows(key, child.status, data)) rows.push({ browser: args.browser, backend: key, ...row });
 	}
 	fs.mkdirSync(args.out, { recursive: true });
 	fs.writeFileSync(path.join(args.out, 'lane_vector_enrich.json'), JSON.stringify(rows, null, 2));
@@ -2380,6 +2462,10 @@ module.exports = {
 	ingestVerdict,
 	healthVerdict,
 	stepsFor,
+	STEP_TITLES,
+	unrecordedRows,
+	e2eBackendRows,
+	runForE2e,
 	laneArgs,
 	childArgv,
 };

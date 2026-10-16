@@ -276,6 +276,181 @@ test('vector-ui:e2e-live runs the enrichment lane when it is named, with the bac
 	}
 });
 
+// ---------------------------------------------------------------------------
+// Fail-closed: a planned step the lane never recorded fails, in the lane and in vector-ui:e2e-live
+// ---------------------------------------------------------------------------
+
+/** Rows of a backend that ran every planned step and passed it. */
+const passingRows = (key) => lane.stepsFor(key).map((s) => ({ fixture: key, name: lane.STEP_TITLES[s], status: 'PASS' }));
+
+test('every planned step has its own title, and the lane runs each step by its title', () => {
+	const keys = [...new Set(lane.BACKENDS.flatMap((key) => lane.stepsFor(key)))];
+	assert.deepStrictEqual(
+		keys.filter((k) => typeof lane.STEP_TITLES[k] !== 'string'),
+		[],
+		'planned steps without a title'
+	);
+	assert.deepStrictEqual(Object.keys(lane.STEP_TITLES).sort(), [...keys].sort(), 'titles of steps no backend plans');
+	const titles = Object.values(lane.STEP_TITLES);
+	assert.strictEqual(new Set(titles).size, titles.length, 'two steps share a title');
+	// main names each step through the table, so the steps it never reached are found by title.
+	const source = fs.readFileSync(path.join(ACC, 'browser', 'lane_vector_enrich.cjs'), 'utf8');
+	const calls = [...source.matchAll(/await step\(page, ([^,]+),/g)].map((m) => m[1]);
+	assert.ok(calls.length >= keys.length, `${calls.length} step calls for ${keys.length} planned steps`);
+	assert.deepStrictEqual(
+		calls.filter((c) => !/^STEP_TITLES\[(['"]).+\1\]$/.test(c)),
+		[],
+		'step calls not named through STEP_TITLES'
+	);
+	assert.deepStrictEqual([...new Set(calls.map((c) => c.slice(13, -2)))].sort(), [...keys].sort(), 'the steps main runs are the planned ones');
+});
+
+test('unrecordedRows: each planned step the lane never recorded is a FAIL row, and a thrown error its own lane row', () => {
+	const planned = lane.stepsFor('qdrant');
+	const all = passingRows('qdrant');
+	assert.deepStrictEqual(lane.unrecordedRows('qdrant', planned, all, null), []);
+	// Sign-in threw: nothing recorded.
+	const none = lane.unrecordedRows('qdrant', planned, [], new Error('locator.waitFor: Timeout 20000ms exceeded'));
+	assert.strictEqual(none.length, planned.length + 1);
+	assert.ok(
+		none.every((r) => r.status === 'FAIL' && r.fixture === 'qdrant'),
+		JSON.stringify(none.slice(0, 2))
+	);
+	assert.deepStrictEqual(
+		none.filter((r) => r.name !== 'lane').map((r) => r.name),
+		planned.map((s) => lane.STEP_TITLES[s])
+	);
+	assert.match(none.find((r) => r.name === 'lane').detail, /Timeout 20000ms/);
+	assert.match(none[0].detail, /not run/);
+	// Stopped after five steps, no error: the rest fail, and no lane row.
+	const part = lane.unrecordedRows('qdrant', planned, all.slice(0, 5), null);
+	assert.deepStrictEqual(
+		part.map((r) => r.name),
+		planned.slice(5).map((s) => lane.STEP_TITLES[s])
+	);
+	// A row recorded under another name does not stand in for a planned step.
+	assert.strictEqual(lane.unrecordedRows('qdrant', planned, [...all.slice(1), { fixture: 'qdrant', name: 'clusters', status: 'PASS' }], null).length, 1);
+});
+
+test('e2eBackendRows: a backend fails when its child wrote no result, fewer rows than it planned, or exited non-zero', () => {
+	const fails = (rows) => rows.filter((r) => r.status !== 'PASS');
+	assert.deepStrictEqual(fails(lane.e2eBackendRows('postgres', 0, passingRows('postgres'))), []);
+	const empty = fails(lane.e2eBackendRows('qdrant', 1, []));
+	assert.strictEqual(empty.length, lane.stepsFor('qdrant').length + 1, 'an empty result');
+	assert.match(empty.find((r) => r.name === 'lane').detail, /exited 1 having recorded 0 of its 29 planned steps/);
+	assert.strictEqual(fails(lane.e2eBackendRows('qdrant', 1, null)).length, lane.stepsFor('qdrant').length + 1, 'no result');
+	const short = fails(lane.e2eBackendRows('chroma', 0, passingRows('chroma').slice(0, -3)));
+	assert.strictEqual(short.length, 4, 'three planned steps missing, and how the lane ended');
+	assert.match(short[3].detail, /exited 0 having recorded 26 of its 29/);
+	// The child's own lane row (it threw, and said so) is not repeated.
+	const own = [...lane.unrecordedRows('postgres', lane.stepsFor('postgres'), [], new Error('boom'))];
+	assert.strictEqual(fails(lane.e2eBackendRows('postgres', 1, own)).length, own.length);
+	const exited = fails(lane.e2eBackendRows('chroma', 1, passingRows('chroma')));
+	assert.deepStrictEqual(
+		exited.map((r) => r.name),
+		['lane'],
+		'every row passed but the child exited 1'
+	);
+	assert.match(exited[0].detail, /exited 1/);
+	assert.strictEqual(fails(lane.e2eBackendRows('chroma', null, passingRows('chroma'))).length, 1, 'killed by a signal');
+	// A failed step already carries the non-zero exit: no extra lane row.
+	const one = passingRows('chroma');
+	one[2] = { ...one[2], status: 'FAIL' };
+	assert.strictEqual(fails(lane.e2eBackendRows('chroma', 1, one)).length, 1);
+});
+
+test('runForE2e: a backend whose child wrote [] fails the run, with a FAIL row for each of its planned steps', () => {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'vx-enrich-e2e-'));
+	try {
+		const fixtures = ['qdrant', 'postgres', 'chroma', 'rocketride_vector'];
+		/** A stand-in child: writes `written(key)` into the backend's folder and exits `status(key)`. */
+		const spawn = (written, status) => (_exe, argv) => {
+			const [sub, key] = argv.slice(-2);
+			fs.mkdirSync(sub, { recursive: true });
+			const rows = written(key);
+			if (rows !== undefined) fs.writeFileSync(path.join(sub, 'lane_vector_enrich.json'), JSON.stringify(rows));
+			return { status: status(key) };
+		};
+		const run = (written, status) => {
+			const log = console.log;
+			console.log = () => {};
+			try {
+				const code = lane.runForE2e({ base: 'http://127.0.0.1:9', out: dir, browser: 'chrome', fixtures }, spawn(written, status));
+				return { code, rows: JSON.parse(fs.readFileSync(path.join(dir, 'lane_vector_enrich.json'), 'utf8')) };
+			} finally {
+				console.log = log;
+			}
+		};
+		const sound = run(passingRows, () => 0);
+		assert.strictEqual(sound.code, 0);
+		assert.deepStrictEqual([...new Set(sound.rows.map((r) => r.backend))], fixtures);
+		// qdrant's sign-in timed out (its child wrote [] and exited 1); the other three passed.
+		const empty = run(
+			(key) => (key === 'qdrant' ? [] : passingRows(key)),
+			(key) => (key === 'qdrant' ? 1 : 0)
+		);
+		assert.strictEqual(empty.code, 1);
+		const qdrant = empty.rows.filter((r) => r.backend === 'qdrant');
+		assert.strictEqual(qdrant.length, lane.stepsFor('qdrant').length + 1);
+		assert.ok(qdrant.every((r) => r.status === 'FAIL' && r.browser === 'chrome'));
+		// A child that wrote nothing at all, and one that stopped part way.
+		assert.strictEqual(
+			run(
+				(key) => (key === 'chroma' ? undefined : passingRows(key)),
+				() => 0
+			).code,
+			1
+		);
+		assert.strictEqual(
+			run(
+				(key) => (key === 'postgres' ? passingRows(key).slice(0, 4) : passingRows(key)),
+				() => 0
+			).code,
+			1
+		);
+		assert.strictEqual(run(passingRows, (key) => (key === 'rocketride_vector' ? 1 : 0)).code, 1);
+	} finally {
+		fs.rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test('lane_vector_enrich: a run whose sign-in throws records every planned step as FAIL, and the error', () => {
+	// A stand-in Playwright whose page.goto rejects (the engine is not there): main throws before its first step.
+	const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vx-enrich-throw-'));
+	try {
+		const pw = path.join(tmp, 'pw', 'node_modules', 'playwright');
+		fs.mkdirSync(pw, { recursive: true });
+		fs.writeFileSync(
+			path.join(pw, 'index.js'),
+			`'use strict';
+const handler = {
+	get(_t, prop) {
+		if (prop === 'then') return undefined;
+		if (prop === 'goto') return async () => { throw new Error('page.goto: net::ERR_CONNECTION_REFUSED'); };
+		if (prop === 'on') return () => undefined;
+		return fake;
+	},
+	apply() { return fake; },
+};
+const fake = new Proxy(function () {}, handler);
+module.exports = { chromium: fake };
+`
+		);
+		const out = path.join(tmp, 'out');
+		const res = spawnSync(process.execPath, [path.join(ACC, 'browser', 'lane_vector_enrich.cjs'), 'http://127.0.0.1:9', out, 'chroma'], { encoding: 'utf8', timeout: 60000, env: { ...process.env, PLAYWRIGHT_DIR: path.join(tmp, 'pw'), CLIENT_TS_DIR: path.join(tmp, 'no-client') } });
+		assert.notStrictEqual(res.status, 0);
+		const rows = JSON.parse(fs.readFileSync(path.join(out, 'lane_vector_enrich.json'), 'utf8'));
+		assert.deepStrictEqual(
+			rows.filter((r) => r.name !== 'lane').map((r) => r.name),
+			lane.stepsFor('chroma').map((s) => lane.STEP_TITLES[s])
+		);
+		assert.ok(rows.every((r) => r.status === 'FAIL'));
+		assert.match(rows.find((r) => r.name === 'lane').detail, /ERR_CONNECTION_REFUSED/);
+	} finally {
+		fs.rmSync(tmp, { recursive: true, force: true });
+	}
+});
+
 test("the lane's planted facts and its own cards are the generator's", () => {
 	const facts = python(`
 import gen_corpus as g
