@@ -27,7 +27,9 @@
 // Server-rendered smoke tests (there is no DOM harness): each panel renders
 // its available and unavailable states with the right sentences, accessible
 // names and controls. The shell's components are replaced by plain stand-ins
-// that render their text, loaded before the panels are.
+// that render their text, loaded before the panels are, and the panels' JSX
+// runtime records sibling elements keyed alike (React only warns about those
+// in the browser).
 // =============================================================================
 
 import { test as nodeTest } from 'node:test';
@@ -42,6 +44,7 @@ import type { ConsoleActions, ConsoleModel, IChatSource, IDialectResult, IScopeS
 import { createSelectionStore } from '../src/contract/bridge';
 import type { UploadRow } from '../src/vector/uploads';
 import { QUERY_NEEDS_EMBED } from '../src/map/wording';
+import { classifyRetrieval } from '../src/vector/retrieval';
 import { classifyAt, runWorkbench, sliderRange } from '../src/vector/searchWorkbench';
 import type { ChatPrefill, WorkbenchDeps, WorkbenchRun } from '../src/vector/searchWorkbench';
 
@@ -68,17 +71,69 @@ const shellStandIn = {
 	ConfirmDialog: (props: { title: string; message: React.ReactNode; confirmLabel?: string; cancelLabel?: string }) => h('div', { role: 'dialog', 'aria-label': props.title }, props.message, h('button', null, props.cancelLabel ?? 'Cancel'), h('button', null, props.confirmLabel ?? 'Save')),
 	useShellEvent: () => undefined,
 };
+// ── Sibling keys (the panels' JSX runtime, installed with the stand-ins) ─────
+//
+// In the browser React warns "Encountered two children with the same key" when
+// one children array holds two elements keyed alike, and may then drop or
+// repeat rows. renderToStaticMarkup never reconciles, so it never says so: the
+// panels' JSX runtime is wrapped to record such pairs as they render here.
+
+/** The JSX runtime's two factories. */
+type JsxFactory = (type: unknown, props: { children?: unknown } | null, key?: unknown) => unknown;
+const jsxRuntime = require('react/jsx-runtime') as { jsx: JsxFactory; jsxs: JsxFactory };
+/** Sibling elements rendered with a key already used in their array, as "<parent>: <key>". */
+const keyClashes: string[] = [];
+/** Elements the panels created through the wrapped runtime (proves the check ran). */
+let checkedElements = 0;
+
+/**
+ * Record the keys used twice in one children array, as React's reconciler
+ * would warn about them (each nested array is its own set of siblings).
+ *
+ * @param parent - The element type the children belong to.
+ * @param children - Its children.
+ */
+function recordKeyClashes(parent: unknown, children: unknown): void {
+	if (!Array.isArray(children)) return;
+	const seen = new Set<string>();
+	for (const child of children) {
+		if (Array.isArray(child)) {
+			recordKeyClashes(parent, child);
+		} else if (React.isValidElement(child) && child.key !== null) {
+			const key = String(child.key);
+			if (seen.has(key)) keyClashes.push(`${typeof parent === 'function' ? parent.name : String(parent)}: ${key}`);
+			seen.add(key);
+		}
+	}
+}
+
+/**
+ * A JSX factory that checks the children's keys before creating the element.
+ *
+ * @param factory - The runtime's factory.
+ * @returns The checked factory.
+ */
+function checked(factory: JsxFactory): JsxFactory {
+	return (type, props, key) => {
+		checkedElements += 1;
+		recordKeyClashes(type, props?.children);
+		return factory(type, props, key);
+	};
+}
+const checkedJsxRuntime = { ...jsxRuntime, jsx: checked(jsxRuntime.jsx), jsxs: checked(jsxRuntime.jsxs) };
+
 const moduleWithLoad = Module as unknown as { _load: (request: string, parent: unknown, isMain: boolean) => unknown };
 const originalLoad = moduleWithLoad._load;
 moduleWithLoad._load = function (request: string, parent: unknown, isMain: boolean): unknown {
 	if (request === 'shell') return shellStandIn;
+	if (request === 'react/jsx-runtime') return checkedJsxRuntime;
 	return originalLoad.call(this, request, parent, isMain);
 };
 
 const { IngestPanel, NO_INGEST_SENTENCE } = require('../src/components/IngestPanel') as typeof import('../src/components/IngestPanel');
 const { ChatPanel, NO_CHAT_SENTENCE } = require('../src/components/ChatPanel') as typeof import('../src/components/ChatPanel');
 const { SourcesPanel } = require('../src/components/SourcesPanel') as typeof import('../src/components/SourcesPanel');
-const { RetrievalDebugger } = require('../src/components/RetrievalDebugger') as typeof import('../src/components/RetrievalDebugger');
+const { RetrievalDebugger, RetrievalTable } = require('../src/components/RetrievalDebugger') as typeof import('../src/components/RetrievalDebugger');
 const { ScoreHistogram } = require('../src/components/ScoreHistogram') as typeof import('../src/components/ScoreHistogram');
 const { SearchPanel, SearchResults, SHOWING_SEARCH } = require('../src/components/SearchPanel') as typeof import('../src/components/SearchPanel');
 const { QueryCompare } = require('../src/components/QueryCompare') as typeof import('../src/components/QueryCompare');
@@ -538,6 +593,81 @@ test('QueryCompare: the column of the brought question says "From the chat" and 
 	assert.match(column('A'), /From the chat: the chunk its answer cited is marked “cited”\./);
 	assert.match(column('A'), /#67<\/button> · cited/);
 	assert.doesNotMatch(column('B'), /From the chat|· cited/);
+});
+
+/**
+ * Render an element and collect the sibling elements it keyed alike.
+ *
+ * @param element - The element.
+ * @returns The markup and the clashes.
+ */
+function renderCheckingKeys(element: React.ReactElement): { html: string; clashes: string[] } {
+	keyClashes.length = 0;
+	const before = checkedElements;
+	const html = render(element);
+	assert.ok(checkedElements > before, 'the panel rendered through the checked JSX runtime');
+	return { html, clashes: [...keyClashes] };
+}
+
+/**
+ * The result rows of some markup (the header rows carry no status).
+ *
+ * @param html - The markup.
+ * @returns How many.
+ */
+function resultRows(html: string): number {
+	return (html.match(/<tr[^>]*data-status="/g) ?? []).length;
+}
+
+test('SearchResults, QueryCompare and the "Why these?" table: an answer that repeats a chunk, or carries no chunk ids, lists every row and keys no two alike', async () => {
+	const vector = fixture<ISearchResult>('search_vector.json');
+	const [first, second] = vector.results;
+	const repeated: ISearchResult = { ...vector, total: 3, results: [first, { ...first, rank: 2, score: first.score - 0.01 }, { ...second, rank: 3 }] };
+	// Without objectId and chunkId every row reads as the same chunk ("#-1").
+	const bare: ISearchResult = {
+		success: true,
+		mode_used: 'semantic',
+		warnings: [],
+		total: 2,
+		results: [
+			{ content: 'one', score: 0.5, metadata: {} },
+			{ content: 'two', score: 0.45, metadata: {} },
+		],
+	};
+	const clashes: Record<string, string[]> = {};
+	for (const [name, answer] of [
+		['repeated chunk', repeated],
+		['no chunk ids', bare],
+	] as const) {
+		const run = await finishedRun('water', 'semantic', [answer]);
+		const view = classifyAt(run.rows, 0.3, dialect.score);
+		const results = renderCheckingKeys(h(SearchResults, { run, view, score: dialect.score, range: sliderRange(dialect.score), ...resultHandlers }));
+		clashes[`SearchResults, ${name}`] = results.clashes;
+		assert.equal(resultRows(results.html), answer.results.length, `SearchResults, ${name}: every row`);
+		const compare = renderCheckingKeys(h(QueryCompare, { a: { run, view }, b: { run, view }, score: dialect.score, onShowBoth: () => undefined, onOpen: () => undefined }));
+		clashes[`QueryCompare, ${name}`] = compare.clashes;
+		assert.equal(resultRows(compare.html), 2 * answer.results.length, `QueryCompare, ${name}: every row of A and of B`);
+		const table = renderCheckingKeys(h(RetrievalTable, { view: classifyRetrieval(answer, dialect.score, []) }));
+		clashes[`"Why these?", ${name}`] = table.clashes;
+		assert.equal(resultRows(table.html), answer.results.length, `"Why these?", ${name}: every row`);
+		if (answer === repeated) {
+			// The acceptance scripts read the chunk from data-key; it stays the chunk's own.
+			assert.equal((results.html.match(new RegExp(`data-key="${first.metadata.objectId}#${first.metadata.chunkId}"`, 'g')) ?? []).length, 2);
+		}
+	}
+	assert.deepEqual(clashes, {
+		'SearchResults, repeated chunk': [],
+		'QueryCompare, repeated chunk': [],
+		'"Why these?", repeated chunk': [],
+		'SearchResults, no chunk ids': [],
+		'QueryCompare, no chunk ids': [],
+		'"Why these?", no chunk ids': [],
+	});
+	// The chat's sources are read once per chunk (parseChatResult), so their keys cannot repeat.
+	const doc = { page_content: 'water', score: 0.5, metadata: { objectId: 'o1', chunkId: 2, parent: 'a/b.md' } };
+	const sources = parseChatResult({ documents: [doc, doc, { ...doc, metadata: { ...doc.metadata, chunkId: 3 } }] }).sources;
+	assert.equal(sources.length, 2);
+	assert.deepEqual(renderCheckingKeys(h(SourcesPanel, { sources, score: dialect.score, onOpen: () => undefined, onShowOnMap: () => undefined })).clashes, []);
 });
 
 test('RetrievalDebugger: says when it searches only the documents the question was asked about', () => {

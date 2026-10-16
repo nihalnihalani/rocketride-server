@@ -33,7 +33,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { VectorKey } from '../src/contract/types';
-import { compareRuns, compareSentence, keyId, sideOf } from '../src/vector/compare';
+import { compareRuns, compareSentence, keyId, rowKey, sideOf } from '../src/vector/compare';
 import type { CompareRow } from '../src/vector/compare';
 
 /**
@@ -52,6 +52,22 @@ function rows(names: readonly string[]): CompareRow[] {
 test('keyId: one string per chunk', () => {
 	assert.equal(keyId(['a', 3]), 'a#3');
 	assert.notEqual(keyId(['a#3', 0]), keyId(['a', 30]));
+});
+
+test('rowKey: a chunk listed twice, or rows without chunk ids, still key each row apart; the same row keeps its key', () => {
+	const repeated: VectorKey[] = [
+		['a', 3],
+		['a', 3],
+		['b', 1],
+	];
+	assert.equal(new Set(repeated.map((key, index) => rowKey(key, index))).size, 3);
+	const bare: VectorKey[] = [
+		['', -1],
+		['', -1],
+	];
+	assert.equal(new Set(bare.map((key, index) => rowKey(key, index))).size, 2);
+	assert.equal(rowKey(['a', 3], 1), rowKey(['a', 3], 1));
+	assert.notEqual(rowKey(['a', 3], 0), rowKey(['b', 3], 0), 'another run at the same position is another row');
 });
 
 test('compareRuns: shared results, the Jaccard index and the documents only one run found', () => {

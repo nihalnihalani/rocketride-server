@@ -49,6 +49,7 @@ import type { CSSProperties } from 'react';
 import { Banner, commonStyles } from 'shell';
 import type { IChatSource, IExportItem, ISearchResult, RetrievalDebuggerProps as ContractRetrievalDebuggerProps } from '../contract/types';
 import { callTool, toolChannelFor } from '../chat/toolCalls';
+import { rowKey } from '../vector/compare';
 import { classifyRetrieval, debuggerScopeSentence, debuggerSearchInput, embedErrorSentence, embedInput, retrievalErrorSentence, withScope } from '../vector/retrieval';
 import type { RetrievalStatus, RetrievalView } from '../vector/retrieval';
 import { openInSearchPrefill, retrievalExportRows } from '../vector/searchWorkbench';
@@ -117,8 +118,8 @@ export function RetrievalTable({ view }: { view: RetrievalView }): React.ReactEl
 				</tr>
 			</thead>
 			<tbody>
-				{view.rows.map((row) => (
-					<tr key={`${row.objectId}#${row.chunkId}`} data-status={row.status} style={row.status === 'used' ? undefined : S.muted}>
+				{view.rows.map((row, index) => (
+					<tr key={rowKey(row.key, index)} data-status={row.status} style={row.status === 'used' ? undefined : S.muted}>
 						<td style={S.td}>{row.rank}</td>
 						<td style={S.td} title={row.preview}>
 							{`${row.path || row.objectId} #${row.chunkId}`}
