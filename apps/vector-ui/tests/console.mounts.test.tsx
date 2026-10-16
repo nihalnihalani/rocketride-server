@@ -106,6 +106,15 @@ test('the stats strip ends with a collapsed Charts disclosure holding the StatsC
 	assert.ok(mounted(html, 'StatsCharts') > html.indexOf('>Charts</summary>'));
 });
 
+test('the stats strip renders with 130,000 loaded rows (Load more, 25 times): the closed Charts disclosure bins them without a RangeError', () => {
+	const rows: IDocumentItem[] = Array.from({ length: 130_000 }, (_, i) => ({ objectId: `d${i}`, path: `C:/corp/f${i % 97}/d${i}.pdf`, chunks: 1 + (i % 40), has_first_chunk: true, tables: 0, deleted: false, nodeId: null, size: 1, modifyTime: null, ingestedAt: `2026-0${1 + (i % 9)}-15T00:00:00Z`, pointId: null }));
+	const stats = { view: readStats(fixture('stats_pgvector')), status: 'ready' as const, error: null, lastAt: 0, mode: 'full' as const };
+	const html = renderToStaticMarkup(<StatsStrip stats={stats} dialect={dialect} readOnly={false} documents={rows} />);
+	assert.doesNotMatch(html, /<details[^>]* open/, 'the disclosure is closed');
+	mounted(html, 'StatsCharts');
+	assert.match(html, /aria-label="Chunks per document, 130,000 documents in /, 'every loaded row is binned');
+});
+
 test('while a scope is active the stats strip says what it covers on a second line', () => {
 	const stats = { view: readStats(fixture('stats_pgvector')), status: 'ready' as const, error: null, lastAt: 0, mode: 'full' as const };
 	const html = renderToStaticMarkup(<StatsStrip stats={stats} dialect={dialect} readOnly={false} scopeLine="Scope: 12 of 42 documents · 318 chunks (counted here)" />);

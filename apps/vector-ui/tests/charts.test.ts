@@ -10,7 +10,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import type { IDocumentItem, ISampleModel, ISampleResult } from '../src/contract/types';
-import { MAX_PERIOD_BINS, binCounts, byFileType, byIngestPeriod, chunksPerDocument, collectionCharts, lengthBins, logBins, median } from '../src/vector/charts';
+import { MAX_PERIOD_BINS, binCounts, byFileType, byIngestPeriod, chunksPerDocument, collectionCharts, lengthBins, logBins, median, minMax } from '../src/vector/charts';
 import { validateFilter } from '../src/vector/filters';
 import { readDialect, readDocumentsPage } from '../src/vector/results';
 import { fixture } from './support/fixtures';
@@ -227,6 +227,58 @@ test('the four charts: their states (disabled under extras_not_stored, partial c
 	const undated = collectionCharts({ rows: rows.map((r) => ({ ...r, ingestedAt: null })), total: 5, sample: null, dialect: pg, loading: false }).find((c) => c.id === 'ingest');
 	assert.equal(undated?.disabled, 'No ingest times on the loaded documents');
 	assert.equal(collectionCharts({ rows, total: 5, sample: null, dialect: pg, loading: false }).find((c) => c.id === 'chunks')?.caption, '5 documents · median 9 chunks', 'everything loaded: no "of"');
+});
+
+test('200,000 loaded rows (Load more, 39 times) bin without overflowing the call stack, in every chart and every ingest bar', () => {
+	// Past about 125,000 values, spreading them into Math.max throws RangeError in V8; Load more has no ceiling.
+	const N = 200_000;
+	assert.deepEqual(minMax([3, Number.NaN, -1, 7]), { min: -1, max: 7 });
+	assert.deepEqual(minMax(Array.from({ length: N }, (_, i) => (i * 7919) % N)), { min: 0, max: N - 1 });
+	const counts = Array.from({ length: N }, (_, i) => 1 + (i % 300));
+	const chunkBins = logBins(counts);
+	assert.equal(
+		chunkBins.reduce((sum, b) => sum + b.count, 0),
+		N
+	);
+	assert.equal(chunkBins[chunkBins.length - 1]?.label, '256–511', 'the top bin holds the largest count');
+	const lengths = Array.from({ length: N }, (_, i) => i % 1_500);
+	const lengthChartBins = lengthBins(lengths);
+	assert.equal(
+		lengthChartBins.reduce((sum, b) => sum + b.count, 0),
+		N
+	);
+	const top = lengthChartBins[lengthChartBins.length - 1];
+	assert.ok(top !== undefined && top.lo <= 1_499 && top.hi >= 1_499, 'the top bin holds the longest chunk');
+	const dated = (at: (i: number) => string) => Array.from({ length: N }, (_, i) => doc(`d${i}`, `C:/demo/f${i % 40}/doc_${i}.pdf`, { chunks: 1 + (i % 300), ingestedAt: at(i) }));
+	const inside = byIngestPeriod(
+		dated((i) => `2026-10-0${1 + (i % 8)}T10:00:00Z`),
+		NOW
+	);
+	assert.deepEqual([inside.unit, inside.dated, inside.outside, inside.bins.length], ['day', N, 0, 8]);
+	const after = byIngestPeriod(
+		dated((i) => `9999-12-${String(1 + (i % 28)).padStart(2, '0')}T23:59:59Z`),
+		NOW
+	);
+	assert.deepEqual(
+		after.bins.map((b) => [b.label, b.count, b.hi]),
+		[['after 2027-10-16', N, Date.parse('9999-12-28T23:59:59Z')]]
+	);
+	const before = byIngestPeriod(
+		dated((i) => `1970-01-${String(1 + (i % 28)).padStart(2, '0')}T00:00:00Z`),
+		NOW
+	);
+	assert.deepEqual(
+		before.bins.map((b) => [b.label, b.count, b.lo]),
+		[['before 2000-01-01', N, Date.parse('1970-01-01T00:00:00Z')]]
+	);
+	const rows = dated((i) => (i % 3 === 0 ? '9999-12-31T23:59:59Z' : i % 3 === 1 ? '1970-01-01T00:00:00Z' : `2026-10-0${1 + (i % 8)}T10:00:00Z`));
+	const charts = collectionCharts({ rows, total: null, sample: null, dialect: null, loading: false, now: NOW });
+	for (const chart of charts.filter((c) => c.id !== 'length'))
+		assert.equal(
+			chart.bins.reduce((sum, b) => sum + b.count, 0),
+			N,
+			chart.id
+		);
 });
 
 test('binning 5,000 rows for all four charts stays inside 10 ms', () => {

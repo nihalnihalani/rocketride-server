@@ -93,6 +93,24 @@ export function binCounts(values: readonly number[], edges: readonly number[]): 
 	return counts;
 }
 
+/**
+ * The smallest and largest of some numbers, in one pass. Spreading the
+ * values into Math.min or Math.max passes each one as an argument, and past
+ * about 125,000 of them (Load more, 25 times) V8 throws RangeError.
+ *
+ * @param values - Numbers (at least one; NaN is skipped).
+ * @returns The smallest and the largest (Infinity and -Infinity for none).
+ */
+export function minMax(values: readonly number[]): { min: number; max: number } {
+	let min = Infinity;
+	let max = -Infinity;
+	for (const v of values) {
+		if (v < min) min = v;
+		if (v > max) max = v;
+	}
+	return { min, max };
+}
+
 /** A range in words: '1', '2–3'. */
 function rangeLabel(lo: number, hi: number): string {
 	return lo === hi ? lo.toLocaleString('en-US') : `${lo.toLocaleString('en-US')}–${hi.toLocaleString('en-US')}`;
@@ -107,7 +125,7 @@ function rangeLabel(lo: number, hi: number): string {
  */
 export function logBins(values: readonly number[]): IBin[] {
 	if (values.length === 0) return [];
-	const max = Math.max(...values);
+	const { max } = minMax(values);
 	const lows: number[] = values.some((v) => v < 1) ? [0] : [];
 	for (let lo = 1; lo <= Math.max(1, max); lo *= 2) lows.push(lo);
 	const counts = binCounts(values, lows);
@@ -139,7 +157,7 @@ function niceStep(max: number, target: number): number {
  */
 export function lengthBins(lengths: readonly number[]): IBin[] {
 	if (lengths.length === 0) return [];
-	const max = Math.max(...lengths);
+	const { max } = minMax(lengths);
 	const step = niceStep(max + 1, 10);
 	const lows: number[] = [];
 	for (let lo = 0; lo <= max; lo += step) lows.push(lo);
@@ -283,11 +301,10 @@ export function byIngestPeriod(rows: readonly IDocumentItem[], now: number = Dat
 	const outside = before.length + after.length;
 	if (dated === 0) return { unit: 'day', bins: [], dated: 0, outside: 0 };
 	const bins: IBin[] = [];
-	if (before.length > 0) bins.push({ key: 'pbefore', label: `before ${iso(range.from).slice(0, 10)}`, lo: Math.min(...before), hi: range.from - 1, count: before.length, scope: null });
+	if (before.length > 0) bins.push({ key: 'pbefore', label: `before ${iso(range.from).slice(0, 10)}`, lo: minMax(before).min, hi: range.from - 1, count: before.length, scope: null });
 	let unit: PeriodUnit = 'day';
 	if (times.length > 0) {
-		const min = Math.min(...times);
-		const max = Math.max(...times);
+		const { min, max } = minMax(times);
 		const spanDays = (periodStart(max, 'day') - periodStart(min, 'day')) / DAY_MS;
 		const finest = spanDays <= 31 ? 0 : spanDays <= 7 * 26 ? 1 : 2;
 		unit = UNITS.slice(finest).find((u) => periodCount(min, max, u) <= MAX_PERIOD_BINS) ?? 'year';
@@ -299,7 +316,7 @@ export function byIngestPeriod(rows: readonly IDocumentItem[], now: number = Dat
 			bins.push({ key: `p${start}`, label: periodLabel(start, unit), lo: start, hi: next - 1, count: counts[i] as number, scope: { ingested_after: iso(start), ingested_before: iso(next) } });
 		});
 	}
-	if (after.length > 0) bins.push({ key: 'pafter', label: `after ${iso(range.to - DAY_MS).slice(0, 10)}`, lo: range.to, hi: Math.max(...after), count: after.length, scope: null });
+	if (after.length > 0) bins.push({ key: 'pafter', label: `after ${iso(range.to - DAY_MS).slice(0, 10)}`, lo: range.to, hi: minMax(after).max, count: after.length, scope: null });
 	return { unit, bins, dated, outside };
 }
 
