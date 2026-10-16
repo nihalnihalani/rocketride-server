@@ -228,6 +228,25 @@ test('after the console removed queued documents the panel says how many, with t
 	assert.match(html(<DuplicatesPanel sample={all} writes={on} documents={rowsSource} onSelect={noop} onRemoveDocument={noop} onRemoveDocuments={noop} initial={{ requested: ['ob', 'od'] }} />), /Removed 2 documents \(5 chunks\)/);
 });
 
+test('a removal that resolves the last group still says what was removed, beside the sentence that no pair is left', () => {
+	// The handbook pair alone: no kestrel copy, no repeated memo.
+	const only = small();
+	const knn: IKnnBlock = { k: 1, offsets_row: [0], cols: [], sims: [] };
+	const rows: Array<Array<[number, number]>> = [[[2, 0.993]], [[3, 0.981]], [[0, 0.993]], [[1, 0.981]], [], [], [], []];
+	for (const r of rows) {
+		for (const [j, s] of r) {
+			knn.cols.push(j);
+			knn.sims.push(s);
+		}
+		knn.offsets_row.push(knn.cols.length);
+	}
+	const sample: ISampleModel = { ...modelOf({ ...only, knn }), removed: ['ob'] };
+	const out = html(<DuplicatesPanel sample={sample} writes={on} documents={rowsSource} onSelect={noop} onRemoveDocument={noop} onRemoveDocuments={noop} initial={{ policy: 'shortest-path', requested: ['ob'] }} />);
+	assert.match(out, /No near-duplicate pairs at similarity 0\.97 or above in this sample\./, 'the only group is resolved');
+	assert.match(out, /Removed 1 document \(4 chunks\)/, 'and the panel says what the removal did');
+	assert.doesNotMatch(html(<DuplicatesPanel sample={modelOf({ ...only, knn })} writes={on} onSelect={noop} onRemoveDocument={noop} />), /Removed/, 'nothing removed, nothing said');
+});
+
 test('the reviewed documents of a connection come from its cache, so the queue keeps them across tab switches', () => {
 	const cache = new Map<string, ReadonlySet<string>>([['conn-r', new Set(['oa', 'ob'])]]);
 	const out = html(<DuplicatesPanel sample={SMALL} writes={on} connectionKey="conn-r" reviewedCache={cache} onSelect={noop} onRemoveDocument={noop} onRemoveDocuments={noop} initial={{ policy: 'shortest-path' }} />);

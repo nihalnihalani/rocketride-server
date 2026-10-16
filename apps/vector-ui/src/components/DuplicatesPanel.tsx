@@ -277,6 +277,8 @@ export function DuplicatesBody(props: DuplicatesBodyProps): React.ReactElement {
 				<p style={MAP_STYLES.note}>{duplicatesKnnCaveat(result.knn.k)}</p>
 				<p style={MAP_STYLES.note}>{duplicatesSampleCaveat(result.n)}</p>
 			</div>
+			{/* Outside the groups: a removal that resolves the last group still says what it did. */}
+			{props.done ? <p style={MAP_STYLES.note}>{props.done}</p> : null}
 			{view.groups.length === 0 && view.repeated.length === 0 ? (
 				<p style={MAP_STYLES.note}>{duplicatesNone(state.threshold)}</p>
 			) : (
@@ -299,7 +301,6 @@ export function DuplicatesBody(props: DuplicatesBodyProps): React.ReactElement {
 					<p style={MAP_STYLES.note} role="status">
 						{queuedLine(total)}
 					</p>
-					{props.done ? <p style={MAP_STYLES.note}>{props.done}</p> : null}
 					{!writes.enabled && writes.reason ? <p style={MAP_STYLES.note}>{writes.reason}</p> : null}
 					{shown.map((g) => groupFieldset(props, g, false))}
 					{open.length > shown.length ? <p style={MAP_STYLES.note}>{groupsCappedLine(shown.length, open.length)}</p> : null}
