@@ -39,7 +39,8 @@ import path from 'node:path';
 import Module from 'node:module';
 import React from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
-import type { IExplorerEndpoint, IRoleChannel } from 'shared/explorer';
+import type { IExplorerEndpoint, IProbeResult, IRoleChannel } from 'shared/explorer';
+import { fakeWorld, manualClock, projectRows, vectorComponents } from 'shared/explorer/connect/testing';
 import type { ConsoleActions, ConsoleModel, IChatSource, IDialectResult, IScopeState, ISearchResult, VectorChannels, VectorKey } from '../src/contract/types';
 import { createSelectionStore } from '../src/contract/bridge';
 import type { UploadRow } from '../src/vector/uploads';
@@ -66,7 +67,7 @@ function test(name: string, fn: () => void | Promise<void>): void {
 const h = React.createElement;
 const shellStandIn = {
 	commonStyles: new Proxy({}, { get: () => ({}) }),
-	EmptyState: ({ title, description }: { title: string; description?: string }) => h('div', { 'data-empty-state': '' }, h('strong', null, title), description ? h('p', null, description) : null),
+	EmptyState: ({ title, description, action }: { title: string; description?: string; action?: React.ReactNode }) => h('div', { 'data-empty-state': '' }, h('strong', null, title), description ? h('p', null, description) : null, action ?? null),
 	Banner: ({ variant, children }: { variant: string; children: React.ReactNode }) => h('div', { 'data-banner': variant }, children),
 	ConfirmDialog: (props: { title: string; message: React.ReactNode; confirmLabel?: string; cancelLabel?: string }) => h('div', { role: 'dialog', 'aria-label': props.title }, props.message, h('button', null, props.cancelLabel ?? 'Cancel'), h('button', null, props.confirmLabel ?? 'Save')),
 	useShellEvent: () => undefined,
@@ -143,6 +144,8 @@ const { ReplaceConfirmDialog } = require('../src/ingest/ReplaceConfirmDialog') a
 const { chatSessionFor, forgetChatAndIngest } = require('../src/chat/registry') as typeof import('../src/chat/registry');
 const { parseChatResult } = require('../src/vector/chatResult') as typeof import('../src/vector/chatResult');
 const { replaceQuestion } = require('../src/vector/uploads') as typeof import('../src/vector/uploads');
+const { buildConsoleModel } = require('../src/vector/consoleModel') as typeof import('../src/vector/consoleModel');
+const { makeVectorEndpointStore } = require('../src/adapters/explorer') as typeof import('../src/adapters/explorer');
 
 // ── Fixtures ────────────────────────────────────────────────────────────────
 
@@ -349,6 +352,115 @@ test('ChatPanel: without a Chat source it says so and offers no composer', () =>
 	forgetChatAndIngest();
 });
 
+// ── Without a Chat source: Search needs no LLM ──────────────────────────────
+//
+// The console mounts this panel on every open connection, so a pipeline with
+// a Tools source and an embedding node but no running Chat source still
+// reaches Search: the header's toggle, the SearchPanel behind it, and an
+// action in the chat body's empty state that shows it.
+
+/** The console model of a connection whose Chat source is not running (as consoleModel builds it). */
+function noChatModel(overrides: Partial<ConsoleModel> = {}): ConsoleModel {
+	return model({ chat: { enabled: false, reason: NO_CHAT_SENTENCE }, nodes: { store: 'store_1', embed: 'embed_1', llm: null, llmName: null }, ...overrides });
+}
+
+/** The channels of that connection: no chat channel. */
+const noChatChannels: VectorChannels = { ...channels, chat: null };
+
+/**
+ * The radio inputs of the SearchPanel's mode choice, by value.
+ *
+ * @param html - The rendered markup.
+ * @returns Each mode and whether its radio is disabled.
+ */
+function modeRadios(html: string): Record<string, boolean> {
+	const radios: Record<string, boolean> = {};
+	for (const [tag] of html.matchAll(/<input type="radio"[^>]*\/>/g)) {
+		const value = /value="([a-z]+)"/.exec(tag)?.[1];
+		if (value !== undefined) radios[value] = tag.includes('disabled=""');
+	}
+	return radios;
+}
+
+/**
+ * The chat body's empty state.
+ *
+ * @param html - The rendered markup.
+ * @returns Its markup, or '' when there is none.
+ */
+function chatEmptyState(html: string): string {
+	const body = html.slice(html.indexOf('data-surface="chat"'));
+	const at = body.indexOf('<div data-empty-state="">');
+	if (at < 0) return '';
+	return body.slice(at, body.indexOf('</div>', at) + '</div>'.length);
+}
+
+test('ChatPanel: without a Chat source the Search toggle, the SearchPanel and a "Search without the LLM" action stay', () => {
+	forgetChatAndIngest();
+	const html = render(h(ChatPanel, { model: noChatModel(), channels: noChatChannels, selection: createSelectionStore('render-1'), actions, scope: null, onClearScope: () => undefined }));
+	assert.match(html, /<button[^>]*aria-pressed="false"[^>]*>Search<\/button>/, 'the header toggle does not depend on the chat');
+	const at = html.search(/<[a-z]+[^>]*data-component="SearchPanel"/);
+	assert.ok(at >= 0, 'the SearchPanel is mounted');
+	assert.match(html.slice(0, at), /<div hidden=""[^>]*>$/, 'hidden until Search is on');
+	assert.doesNotMatch(html, /Answers by/, 'no LLM to name');
+	assert.doesNotMatch(html, /<textarea/, 'no composer');
+	const empty = chatEmptyState(html);
+	assert.match(empty, /<strong>Chat is not available<\/strong>/);
+	assert.ok(empty.includes(NO_CHAT_SENTENCE));
+	assert.match(empty, /<button type="button"[^>]*>Search without the LLM<\/button>/, 'the empty state offers Search');
+	forgetChatAndIngest();
+});
+
+test('ChatPanel: without a Chat source, Search on shows the SearchPanel with every mode the store can run', () => {
+	forgetChatAndIngest();
+	const html = render(h(ChatPanel, { model: noChatModel(), channels: noChatChannels, selection: createSelectionStore('render-1'), actions, scope: null, onClearScope: () => undefined, initialSearch: true }));
+	assert.match(html, /<button[^>]*aria-pressed="true"[^>]*>Search<\/button>/);
+	const at = html.search(/<[a-z]+[^>]*data-component="SearchPanel"/);
+	assert.ok(at >= 0);
+	assert.doesNotMatch(html.slice(html.lastIndexOf('<div', at - 1), at), /hidden=""/, 'the SearchPanel is shown');
+	assert.deepEqual(modeRadios(html), { semantic: false, keyword: false, hybrid: false, auto: false }, 'no mode needs the chat');
+	assert.match(html, /<div data-surface="chat" style="display:none">/, 'the empty chat body is hidden behind Search');
+	forgetChatAndIngest();
+});
+
+test('ChatPanel: without a Chat source and with no search the store can run, the empty state offers no Search action', () => {
+	forgetChatAndIngest();
+	const nothing = noChatModel({ embed: { enabled: false, reason: QUERY_NEEDS_EMBED }, nodes: { store: 'store_1', embed: null, llm: null, llmName: null }, capabilities: { ...dialect.capabilities, search_keyword: false } });
+	const html = render(h(ChatPanel, { model: nothing, channels: noChatChannels, selection: createSelectionStore('render-1'), actions, scope: null, onClearScope: () => undefined }));
+	const empty = chatEmptyState(html);
+	assert.match(empty, /Chat is not available/);
+	assert.doesNotMatch(empty, /<button/, 'nothing to offer');
+	assert.match(html, /<button[^>]*aria-pressed="false"[^>]*>Search<\/button>/, 'the toggle stays; the SearchPanel says why nothing runs');
+	forgetChatAndIngest();
+});
+
+test("ChatPanel: on the console's own model of a connection with a Tools source and no Chat source, Search runs every mode", async () => {
+	forgetChatAndIngest();
+	const qdrant = fixture<IDialectResult>('dialect_qdrant.json');
+	const world = fakeWorld(projectRows(['ingest_1', 'tools_1'], vectorComponents('qdrant')), (call) => (call.tool === 'dialect' ? qdrant : {}));
+	const clock = manualClock();
+	const store = makeVectorEndpointStore({ clock, debounceMs: 0 });
+	const refreshing = store.refresh(world.client);
+	await clock.advance(0);
+	await refreshing;
+	await clock.settle();
+	const { endpoints, probes } = store.getState();
+	assert.equal(endpoints.length, 1, 'the store is one card');
+	const endpoint: IExplorerEndpoint = endpoints[0];
+	const probe: IProbeResult | undefined = probes[endpoint.key];
+	const built = buildConsoleModel(endpoint, probe, null);
+	assert.equal(built.chat.enabled, false, 'no Chat source: the chat is off');
+	assert.equal(built.embed.enabled, true, 'the Tools source reaches the embedding node');
+	const key = built.connectionKey;
+	const off = render(h(ChatPanel, { model: built, channels: noChatChannels, selection: createSelectionStore(key), actions, scope: null, onClearScope: () => undefined }));
+	assert.match(off, /<button[^>]*aria-pressed="false"[^>]*>Search<\/button>/);
+	assert.match(off, /data-component="SearchPanel"/);
+	assert.match(chatEmptyState(off), /Search without the LLM/);
+	const on = render(h(ChatPanel, { model: built, channels: noChatChannels, selection: createSelectionStore(key), actions, scope: null, onClearScope: () => undefined, initialSearch: true }));
+	assert.deepEqual(modeRadios(on), { semantic: false, keyword: false, hybrid: false, auto: false });
+	forgetChatAndIngest();
+});
+
 test('SourcesPanel: chunk text is text, not markup; scores carry their formula', () => {
 	const sources: IChatSource[] = parseChatResult({ documents: [{ page_content: '<script>alert(1)</script> water', score: 0.5757, metadata: { objectId: 'o1', chunkId: 2, parent: 'a/b.md' } }] }).sources;
 	const html = render(h(SourcesPanel, { sources, score: dialect.score, onOpen: () => undefined, onShowOnMap: () => undefined }));
@@ -543,6 +655,23 @@ test("SearchResults: the slider over the store's range, its count beside the nod
 	assert.match(html, /aria-label="Ask about C:\/demo\/doc0\.md"/);
 	assert.match(html, /near miss: below the threshold/);
 	assert.match(html, /below the floor \(the store drops it\)/);
+});
+
+test('SearchResults: without a Chat source every "ask about this" is off and says why; open and map stay', async () => {
+	const run = await finishedRun('water', 'semantic', [twentyRows()]);
+	const html = render(h(SearchResults, { run, view: classifyAt(run.rows, 0.3, dialect.score), score: dialect.score, range: sliderRange(dialect.score), ...resultHandlers, canAsk: false, askReason: NO_CHAT_SENTENCE }));
+	const asks = [...html.matchAll(/<button[^>]*aria-label="Ask about [^"]*"[^>]*>/g)].map(([tag]) => tag);
+	assert.equal(asks.length, 20);
+	for (const tag of asks) {
+		assert.ok(tag.includes('disabled=""'), tag);
+		assert.ok(tag.includes(`title="${NO_CHAT_SENTENCE}"`), tag);
+	}
+	const others = [...html.matchAll(/<button[^>]*aria-label="(?:Open|Show chunk) [^"]*"[^>]*>/g)].map(([tag]) => tag);
+	assert.equal(others.length, 40, 'open and map on every row');
+	assert.ok(
+		others.every((tag) => !tag.includes('disabled=""')),
+		'open and map do not need the chat'
+	);
 });
 
 test('SearchResults: keyword rows have no slider; hybrid says it was fused here; the cited mark; warnings', async () => {

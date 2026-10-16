@@ -43,6 +43,11 @@
 // and can open its question in Search, whose first run is that same search
 // with the answer's cited chunks marked; Search's "ask about this" comes
 // back to the chat with the next question scoped to that document.
+//
+// Search needs no LLM, so the panel is the same without a running Chat
+// source: the header keeps the toggle, and the chat body's "Chat is not
+// available" offers "Search without the LLM" whenever the store can run a
+// search (the embedding node for Semantic, keyword search for Keyword).
 // =============================================================================
 
 import React, { useEffect, useRef, useState } from 'react';
@@ -58,6 +63,7 @@ import { showAnswerOnMap } from '../adapters/consoleActions';
 import { SourcesPanel } from './SourcesPanel';
 import { RetrievalDebugger } from './RetrievalDebugger';
 import { SHOWING_SEARCH, SearchPanel } from './SearchPanel';
+import { modeOptions } from '../vector/searchWorkbench';
 import type { ChatPrefill } from '../vector/searchWorkbench';
 
 /** The contract props plus the surface it opens on (the static render tests show Search with it). */
@@ -71,6 +77,9 @@ type SearchPrefill = ChatPrefill;
 
 /** Shown when the connection has no running Chat source. */
 export const NO_CHAT_SENTENCE = 'This pipeline has no running Chat source.';
+
+/** The chat body's action without a Chat source: show Search, which needs no LLM. */
+export const SEARCH_WITHOUT_CHAT = 'Search without the LLM';
 
 /** Characters left before the counter appears. */
 const COUNTER_FROM = CHAT_MAX_CHARS - 500;
@@ -195,6 +204,8 @@ export function ChatPanel(props: ChatPanelProps): React.ReactElement {
 	}, [scrollKey]);
 
 	const available = model.chat.enabled && channels.chat !== null;
+	// Without the chat, Search is what this panel can still do (when the store can run any mode).
+	const searchable = !available && modeOptions(model).some((option) => option.enabled);
 	const llm = model.nodes.llmName;
 
 	/**
@@ -259,7 +270,17 @@ export function ChatPanel(props: ChatPanelProps): React.ReactElement {
 			</div>
 			<div data-surface="chat" style={{ display: searching ? 'none' : 'contents' }}>
 				{!available ? (
-					<EmptyState title="Chat is not available" description={model.chat.reason ?? NO_CHAT_SENTENCE} />
+					<EmptyState
+						title="Chat is not available"
+						description={model.chat.reason ?? NO_CHAT_SENTENCE}
+						action={
+							searchable ? (
+								<button type="button" style={commonStyles.buttonSecondary} onClick={() => setSearching(true)}>
+									{SEARCH_WITHOUT_CHAT}
+								</button>
+							) : undefined
+						}
+					/>
 				) : (
 					<>
 						<div ref={thread} style={S.thread} role="log" aria-label="Questions and answers" aria-live="off">
