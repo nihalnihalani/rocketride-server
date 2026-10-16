@@ -22,7 +22,7 @@ import { OutliersBody, OutliersPanel } from '../src/components/OutliersPanel';
 import { RecommendBody, RecommendPanel } from '../src/components/RecommendPanel';
 import type { RecommendBodyProps } from '../src/components/RecommendPanel';
 import type { Availability, IDocumentItem, IDocumentRowsSource, IKnnBlock, IRecommendResult, ISampleModel, ISampleResult, IVectorCapabilities, IVectorLimits, VectorKey } from '../src/contract/types';
-import { dedupeView, docInfo, queueInit, queueReducer, queued } from '../src/map/dedupe';
+import { copyVerdict, dedupeView, docInfo, queueInit, queueReducer, queued } from '../src/map/dedupe';
 import { outlierKey, outlierRows, outliersScope } from '../src/map/outliers';
 import { EMPTY_EXAMPLES, recommendRows, resolvedLine } from '../src/map/recommend';
 import { fixture } from './support/fixtures';
@@ -344,24 +344,39 @@ function coverSheets(docs: number, per: number): { sample: ISampleResult; rows: 
 	return { sample, rows };
 }
 
-test('one group across 1,000 documents: the first 20 are listed with the count of the rest, and the panel renders in 50 ms or less', () => {
+test('one group across 1,000 documents: the first 20 are listed with the count of the rest, the panel renders in 50 ms or less and a re-render costs little', () => {
 	const { sample, rows } = coverSheets(1000, 5);
 	const documents: IDocumentRowsSource = { getRows: () => rows, subscribe: () => noop };
 	const model = modelOf(sample);
-	const render = (): string => html(<DuplicatesPanel sample={model} writes={on} documents={documents} onSelect={noop} onRemoveDocument={noop} onRemoveDocuments={noop} initial={{ policy: 'shortest-path' }} />);
-	let best = Infinity;
-	let out = '';
-	for (let run = 0; run < 3; run += 1) {
-		const started = performance.now();
-		out = render();
-		best = Math.min(best, performance.now() - started);
-	}
+	/** The best of five runs after one to warm up (the suites run side by side, so one run can be slow). */
+	const bestOf = (run: () => string): { ms: number; out: string } => {
+		let out = run();
+		let ms = Infinity;
+		for (let i = 0; i < 5; i += 1) {
+			const started = performance.now();
+			out = run();
+			ms = Math.min(ms, performance.now() - started);
+		}
+		return { ms, out };
+	};
+	// The whole panel, as a slider step draws it: grouping, verdicts, queue and markup.
+	const panel = bestOf(() => html(<DuplicatesPanel sample={model} writes={on} documents={documents} onSelect={noop} onRemoveDocument={noop} onRemoveDocuments={noop} initial={{ policy: 'shortest-path' }} />));
+	const out = panel.out;
 	assert.match(out, /Group 1 · 1,000 documents/);
 	assert.equal((out.match(/type="radio"/g) ?? []).length, 20, 'twenty Keep radios, not a thousand');
 	assert.match(out, /and 980 more documents, none of them queued\. Show group selects the whole group on the map\./);
 	assert.match(out, /Shared passages only/, 'each mail holds text of its own');
 	assert.match(out, />Show group</);
-	assert.ok(best <= 50, `the panel rendered in ${best.toFixed(1)} ms`);
+	assert.ok(panel.ms <= 50, `the panel rendered in ${panel.ms.toFixed(1)} ms`);
+	// A re-render with what the panel keeps (a keep click, Mark reviewed): no verdict or queue is worked out again.
+	const view = dedupeView(sample, 0.97);
+	const info = docInfo(sample, rows);
+	const state = queueReducer(queueInit(), { type: 'policy', value: 'shortest-path' });
+	const queue = queued(view.groups, state, info, new Set());
+	const verdicts = new Map(view.groups.map((g) => [g.key, copyVerdict(g, info)] as const));
+	const again = bestOf(() => renderToStaticMarkup(DuplicatesBody({ sample: model, writes: on, view, info, state, reviewed: new Set(), queue, done: null, bulk: true, verdicts, onThreshold: noop, onPolicy: noop, onKeep: noop, onShow: noop, onReview: noop, onRemove: noop })));
+	assert.equal(again.out, out, 'the same markup');
+	assert.ok(again.ms <= 15, `a re-render took ${again.ms.toFixed(1)} ms`);
 });
 
 test("a group's kept document is listed even when it is not among the first 20, and the rest count what they queue", () => {

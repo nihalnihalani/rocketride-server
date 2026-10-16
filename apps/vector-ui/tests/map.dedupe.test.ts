@@ -1041,17 +1041,25 @@ test("budget: a group across 2,500 documents (pgvector's native pick has no list
 		[500, 'unsized'],
 	] as const) {
 		const sample = coverSheets(2500, 2, counted);
-		const [group] = dedupeView(sample, 0.97).groups;
-		assert.equal(group?.objectIds.length, 2500);
-		const info = docInfo(sample, null);
-		let started = performance.now();
-		const verdict = copyVerdict(group!, info);
-		const tVerdict = performance.now() - started;
-		started = performance.now();
-		const q = queued([group!], SHORTEST, info, new Set());
-		const tQueue = performance.now() - started;
-		assert.equal(verdict, expected);
-		assert.deepEqual(q.objectIds, []);
+		// The best of five fresh views after one to warm up (a verdict is kept per group, and the suites run side by side).
+		let tVerdict = Infinity;
+		let tQueue = Infinity;
+		for (let run = 0; run < 6; run += 1) {
+			const [group] = dedupeView(sample, 0.97).groups;
+			assert.equal(group?.objectIds.length, 2500);
+			const info = docInfo(sample, null);
+			let started = performance.now();
+			const verdict = copyVerdict(group!, info);
+			const verdictMs = performance.now() - started;
+			started = performance.now();
+			const q = queued([group!], SHORTEST, info, new Set());
+			const queueMs = performance.now() - started;
+			assert.equal(verdict, expected);
+			assert.deepEqual(q.objectIds, []);
+			if (run === 0) continue;
+			tVerdict = Math.min(tVerdict, verdictMs);
+			tQueue = Math.min(tQueue, queueMs);
+		}
 		assert.ok(tVerdict <= 60, `${counted} counted: the verdict took ${tVerdict.toFixed(1)} ms`);
 		assert.ok(tQueue <= 30, `${counted} counted: the queue took ${tQueue.toFixed(1)} ms`);
 	}
