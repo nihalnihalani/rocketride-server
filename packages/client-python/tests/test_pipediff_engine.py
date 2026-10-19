@@ -759,6 +759,62 @@ def test_load_pipe_dict_numeric_validation_handles_deep_nesting_without_recursio
         load_pipe({'components': [{'id': 'a', 'config': {'nested': nested}}]})
 
 
+def _wide_deep_config(depth=200, siblings=50, key_length=200):
+    """A config whose every level carries many long keys: deep paths, wide levels."""
+    root = current = {}
+    for _level in range(depth):
+        for sibling in range(siblings - 1):
+            current[f'{sibling:03d}' + 'k' * (key_length - 3)] = 1
+        current['n' * key_length] = current = {}
+    return {'components': [{'id': 'a', 'provider': 'p', 'config': root}], 'version': 1}
+
+
+@pytest.mark.parametrize('source', ['dict', 'file'])
+def test_load_pipe_validation_memory_is_linear_in_input_size(tmp_path, source):
+    # Building every value's full path up front made peak memory grow with depth
+    # squared: about 200 MB for this ~2 MB pipe. Paths are now built only for the
+    # value that fails, and decoded JSON is not walked again at all.
+    import tracemalloc
+
+    pipe = _wide_deep_config()
+    path = tmp_path / 'wide.pipe'
+    path.write_text(json.dumps(pipe), encoding='utf-8')
+    tracemalloc.start()
+    try:
+        load_pipe(pipe if source == 'dict' else str(path))
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+    assert peak < 40_000_000, f'peak {peak / 1e6:.1f} MB'
+
+
+def test_load_pipe_dict_nonfinite_error_names_the_full_path():
+    pipe = {'components': [{'id': 'a', 'provider': 'p', 'config': {'outer': [{'x': 1}, {'inner': float('nan')}]}}]}
+    with pytest.raises(
+        PipeDiffError, match=r'<dict>: non-finite number at \$\.components\[0\]\.config\.outer\[1\]\.inner'
+    ):
+        load_pipe(pipe)
+
+
+@pytest.mark.parametrize('shape', ['deep', 'cyclic'])
+def test_diff_pipes_reports_unsupported_nesting_as_pipediff_error(shape):
+    # load_pipe accepts these in-memory configs; diff_pipes must fail with the
+    # library's own error, not a raw RecursionError, for library callers too.
+    def build(leaf):
+        if shape == 'cyclic':
+            config = {'leaf': leaf}
+            config['self'] = config
+            return {'components': [{'id': 'a', 'provider': 'p', 'config': config}]}
+        config = current = {}
+        for _ in range(5000):
+            current['n'] = current = {}
+        current['leaf'] = leaf
+        return {'components': [{'id': 'a', 'provider': 'p', 'config': config}]}
+
+    with pytest.raises(PipeDiffError, match='too deep'):
+        diff_pipes(load_pipe(build(1)), load_pipe(build(2)))
+
+
 def test_load_pipe_dict_preserves_large_exact_integers():
     value = 10**400
     pipe = {'components': [{'id': 'a', 'config': {'value': value}}]}
