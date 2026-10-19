@@ -56,7 +56,11 @@ def _install_fake_git(monkeypatch, responses):
     lookup (``rev-parse --show-toplevel``). "rev-parse-verify" and "cat-file"
     default to success, so a test only has to name the step it cares about.
     """
-    defaults = {'rev-parse-verify': _completed(0, stdout='deadbeef\n'), 'cat-file': _completed(0)}
+    defaults = {
+        'rev-parse-verify': _completed(0, stdout='deadbeef\n'),
+        'cat-file': _completed(0),
+        'ls-tree': _completed(0),
+    }
 
     def fake_run(args, **_kwargs):
         subcommand = args[3]  # ['git', '-C', <dir>, <subcommand>, ...]
@@ -272,7 +276,7 @@ def test_resolve_raises_when_ref_content_is_not_a_pipe(monkeypatch):
 @pytest.mark.skipif(shutil.which('git') is None, reason='git not installed')
 def test_resolve_git_ref_real_repository(tmp_path):
     def git(*args):
-        result = subprocess.run(['git', *args], cwd=tmp_path, capture_output=True, text=True)
+        result = subprocess.run(['git', *args], cwd=tmp_path, capture_output=True, text=True, timeout=30)
         assert result.returncode == 0, result.stderr
         return result
 
@@ -280,7 +284,18 @@ def test_resolve_git_ref_real_repository(tmp_path):
     pipe_file = tmp_path / 'pipeline.pipe'
     pipe_file.write_text(json.dumps(SAMPLE_PIPE), encoding='utf-8')
     git('add', 'pipeline.pipe')
-    git('-c', 'user.email=t@example.com', '-c', 'user.name=Tester', 'commit', '-q', '-m', 'init')
+    git(
+        '-c',
+        'user.email=t@example.com',
+        '-c',
+        'user.name=Tester',
+        '-c',
+        'commit.gpgsign=false',
+        'commit',
+        '-q',
+        '-m',
+        'init',
+    )
 
     # The committed content is returned from HEAD.
     assert resolve_git_ref('HEAD', str(pipe_file)) == SAMPLE_PIPE
@@ -299,13 +314,24 @@ def _init_repo(path, *files):
     """Create a git repository at ``path`` committing ``files`` (names under it)."""
 
     def git(*args):
-        result = subprocess.run(['git', *args], cwd=path, capture_output=True, text=True)
+        result = subprocess.run(['git', *args], cwd=path, capture_output=True, text=True, timeout=30)
         assert result.returncode == 0, result.stderr
         return result
 
     git('init', '-q')
     git('add', '--', *files)
-    git('-c', 'user.email=t@example.com', '-c', 'user.name=Tester', 'commit', '-q', '-m', 'init')
+    git(
+        '-c',
+        'user.email=t@example.com',
+        '-c',
+        'user.name=Tester',
+        '-c',
+        'commit.gpgsign=false',
+        'commit',
+        '-q',
+        '-m',
+        'init',
+    )
     return git
 
 
@@ -383,6 +409,69 @@ def test_differently_cased_new_file_is_new_on_a_case_sensitive_filesystem(tmp_pa
     _init_repo(tmp_path, 'rag.pipe')
     (tmp_path / 'RAG.pipe').write_text(json.dumps(SAMPLE_PIPE), encoding='utf-8')
     assert resolve_git_ref('HEAD', str(tmp_path / 'RAG.pipe')) is None
+
+
+def _pipe_with(value):
+    return {'components': [{'id': 'a', 'provider': 'src', 'config': {'value': value}}], 'version': 1}
+
+
+@pytest.mark.skipif(shutil.which('git') is None, reason='git not installed')
+def test_retargeted_symlink_compares_the_target_it_had_at_the_ref(tmp_path):
+    # The old side follows the link text stored at the ref, not the link's
+    # current target: a retarget from v1 to v2 is a real pipeline swap.
+    (tmp_path / 'v1.pipe').write_text(json.dumps(_pipe_with(1)), encoding='utf-8')
+    (tmp_path / 'v2.pipe').write_text(json.dumps(_pipe_with(2)), encoding='utf-8')
+    (tmp_path / 'current.pipe').symlink_to('v1.pipe')
+    _init_repo(tmp_path, 'v1.pipe', 'v2.pipe', 'current.pipe')
+    (tmp_path / 'current.pipe').unlink()
+    (tmp_path / 'current.pipe').symlink_to('v2.pipe')
+    assert resolve_git_ref('HEAD', str(tmp_path / 'current.pipe')) == _pipe_with(1)
+
+
+@pytest.mark.skipif(shutil.which('git') is None, reason='git not installed')
+def test_symlink_at_the_ref_is_followed_even_when_the_file_is_now_regular(tmp_path):
+    (tmp_path / 'v1.pipe').write_text(json.dumps(_pipe_with(1)), encoding='utf-8')
+    (tmp_path / 'current.pipe').symlink_to('v1.pipe')
+    _init_repo(tmp_path, 'v1.pipe', 'current.pipe')
+    (tmp_path / 'current.pipe').unlink()
+    (tmp_path / 'current.pipe').write_text(json.dumps(_pipe_with(5)), encoding='utf-8')
+    assert resolve_git_ref('HEAD', str(tmp_path / 'current.pipe')) == _pipe_with(1)
+
+
+@pytest.mark.skipif(shutil.which('git') is None, reason='git not installed')
+def test_symlink_at_the_ref_pointing_outside_the_repository_is_an_error(tmp_path):
+    repo = tmp_path / 'repo'
+    repo.mkdir()
+    (repo / 'current.pipe').symlink_to('../outside.pipe')
+    _init_repo(repo, 'current.pipe')
+    (repo / 'current.pipe').unlink()
+    (repo / 'current.pipe').write_text(json.dumps(SAMPLE_PIPE), encoding='utf-8')
+    with pytest.raises(PipeDiffError, match='outside the repository'):
+        resolve_git_ref('HEAD', str(repo / 'current.pipe'))
+
+
+@pytest.mark.skipif(shutil.which('git') is None, reason='git not installed')
+def test_dotdot_after_a_directory_symlink_follows_the_physical_path(tmp_path):
+    # `lnk/..` is the parent of lnk's target (deep/), as the OS opens it, not the
+    # directory holding lnk; the blob looked up must be the same file.
+    (tmp_path / 'deep' / 'sub').mkdir(parents=True)
+    (tmp_path / 'x.pipe').write_text(json.dumps(_pipe_with(1)), encoding='utf-8')
+    (tmp_path / 'deep' / 'x.pipe').write_text(json.dumps(_pipe_with(7)), encoding='utf-8')
+    (tmp_path / 'lnk').symlink_to('deep/sub', target_is_directory=True)
+    _init_repo(tmp_path, 'x.pipe', 'deep/x.pipe', 'lnk')
+    assert resolve_git_ref('HEAD', str(tmp_path) + '/lnk/../x.pipe') == _pipe_with(7)
+
+
+@pytest.mark.skipif(shutil.which('git') is None, reason='git not installed')
+@pytest.mark.parametrize('spelling', ['RepoDir/flows/rag.pipe', 'repodir/Flows/rag.pipe', 'REPODIR/FLOWS/RAG.PIPE'])
+def test_mis_cased_directories_find_the_tracked_file_on_a_case_insensitive_filesystem(tmp_path, spelling):
+    if not _case_insensitive(tmp_path):
+        pytest.skip('filesystem is case-sensitive')
+    repo = tmp_path / 'RepoDir'
+    (repo / 'Flows').mkdir(parents=True)
+    (repo / 'Flows' / 'rag.pipe').write_text(json.dumps(SAMPLE_PIPE), encoding='utf-8')
+    _init_repo(repo, 'Flows/rag.pipe')
+    assert resolve_git_ref('HEAD', str(tmp_path / spelling)) == SAMPLE_PIPE
 
 
 if __name__ == '__main__':
