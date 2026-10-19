@@ -79,7 +79,8 @@ error it carries; the code and message come from the server's
 own `ServerException`. What is removed is the tail: SQLAlchemy's
 `[SQL: ...]` / `[parameters: ...]` echo, ClickHouse's server stack trace,
 its `failed at position` quotation of the statement, the rest of the input a
-parser prints after `here:` (for `INSERT ... VALUES`, the remaining rows),
+parser prints after `here:` or `before:` (for `INSERT ... VALUES`, the
+remaining rows),
 and the places ClickHouse is known to repeat the statement or expression it
 was working on — after `in scope` (including a named CTE's `x AS (...)`, a
 lambda's `x -> ...` and a function call such as `nofunc(...)`), after

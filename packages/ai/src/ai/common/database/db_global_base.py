@@ -153,9 +153,11 @@ DEFAULT_MAX_EXECUTE_ROWS = 25000
 #
 # The other ClickHouse phrases are distinctive enough in ClickHouse's own
 # text: `while processing: '` keeps its quote and `: While processing ` its
-# colon because the words alone are ordinary prose, and ` here: ` is where a
-# parser that stopped prints the rest of its input -- for `INSERT ... VALUES`,
-# the remaining rows with every value bound into them.
+# colon because the words alone are ordinary prose. ` here: ` and
+# ` before: '` are where a parser that stopped prints the rest of its input --
+# for `INSERT ... VALUES`, the remaining rows with every value bound into them,
+# as in `Cannot parse input: expected '(' before: 'ON DUPLICATE KEY UPDATE s =
+# ...'` when an agent writes another dialect's upsert.
 
 _CLICKHOUSE_STACK_TRACE = 'Stack trace:'
 
@@ -208,6 +210,7 @@ _CLICKHOUSE_TAILS = rf"""
     | :\ While\ processing\s
     | ,\ required\ columns:
     | \ here:\s
+    | \ before:\ '
     | [Ii]n\ (?:scope|query)\ (?={_CLICKHOUSE_ECHO})
 """
 
@@ -441,7 +444,8 @@ class DatabaseGlobalBase(IGlobalBase, ABC):
           evaluated on its own, such as a value in an ``INSERT ... VALUES``
           row); code 215 repeats it after ``In query``, a mutation repeats
           its predicate after ``while processing: '``, and a parser that
-          stopped prints the rest of its input after `` here: ``. All of
+          stopped prints the rest of its input after `` here: `` or
+          `` before: '``. All of
           those are cut by ClickHouse's markers, which apply only to text
           that opens with ``DB::Exception:``; any other ``.code`` /
           ``.message`` pair gets the backstop. The echoes are not cosmetic:
@@ -496,7 +500,8 @@ class DatabaseGlobalBase(IGlobalBase, ABC):
           left alone in the middle of a sentence, where they belong to the
           application, not to the server), ClickHouse's server stack trace,
           its ``failed at position`` echo, the rest of its input after a
-          parser's `` here: `` (for ``INSERT ... VALUES``, the remaining rows),
+          parser's `` here: `` or `` before: '`` (for ``INSERT ... VALUES``,
+          the remaining rows),
           and the statement or expression it repeats after
           ``while processing query:`` / ``while processing:`` /
           ``While processing`` / ``in scope`` / ``In query``, together with
