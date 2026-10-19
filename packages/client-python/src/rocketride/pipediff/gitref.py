@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import os
 import posixpath
+import re
 import subprocess
 
 from ._pipejson import PipeDiffError, parse_pipe_json
@@ -49,8 +50,9 @@ from ._pipejson import PipeDiffError, parse_pipe_json
 # Upper bound so a wedged git process can never hang the CLI indefinitely.
 _GIT_TIMEOUT_SECONDS = 30
 
-# The git tree-entry mode of a committed symbolic link.
+# The git tree-entry modes of a committed symbolic link and of a directory.
 _SYMLINK_MODE = '120000'
+_TREE_MODE = '040000'
 
 # Most links followed from one path at the ref before giving up (SYMLOOP_MAX).
 _MAX_SYMLINK_HOPS = 40
@@ -61,10 +63,12 @@ def resolve_git_ref(ref: str, file_path: str) -> dict | None:
     Load a pipeline file's contents at a specific git ref.
 
     Resolves ``file_path`` to its repository-relative location, verifies that
-    ``ref`` names a commit, and runs ``git show <ref>:<relative-path>`` to
-    retrieve the file as it existed at ``ref``, then parses and validates the
-    result. Used to diff a working-tree
-    ``.pipe`` file against an arbitrary commit, branch, or tag.
+    ``ref`` names a commit, walks that path through the tree at ``ref`` (following
+    each symlink, on the file or on a directory, as it was committed there, and
+    recovering the tracked case of any component on a case-insensitive
+    filesystem), and runs ``git show <ref>:<relative-path>`` to retrieve the file
+    as it existed at ``ref``, then parses and validates the result. Used to diff a
+    working-tree ``.pipe`` file against an arbitrary commit, branch, or tag.
 
     Args:
         ref: A git revision (commit sha, branch, tag, ``HEAD``, ``HEAD~1``, ...).
@@ -79,23 +83,26 @@ def resolve_git_ref(ref: str, file_path: str) -> dict | None:
     Raises:
         PipeDiffError: If the path is not inside a git repository, the ref is
             unknown (or does not name a commit), ``git`` is unavailable or times
-            out, or the retrieved contents are not a valid pipeline.
+            out, a symlink at the ref leaves the repository or loops, or the
+            retrieved contents are not a valid pipeline.
     """
-    # Resolve symlinks in the directory only, so the path matches the physical
-    # top level ``git rev-parse --show-toplevel`` reports even when the repo is
-    # reached through a symlinked directory, while the file itself is looked up
-    # under the name given -- ``git show <ref>:<FILE>``, as documented. The
-    # directory goes to realpath as given, not through abspath first: abspath
-    # folds ``lnk/..`` as text, but the OS opens it as the parent of lnk's
-    # target, so the blob looked up would not be the file being diffed. Each
-    # component is then spelled with its on-disk case, which is what git
-    # reports on a case-insensitive filesystem.
+    # Find the repository through the file's physical directory, so the path
+    # matches the top level ``git rev-parse --show-toplevel`` reports even when
+    # the repo is reached through a symlinked directory. The directory goes to
+    # realpath as given, not through abspath first: abspath folds ``lnk/..`` as
+    # text, but the OS opens it as the parent of lnk's target. Each component is
+    # spelled with its on-disk case, which is what git reports on a
+    # case-insensitive filesystem.
     file_dir = _on_disk_case(os.path.realpath(os.path.dirname(file_path) or os.curdir))
-    abs_path = _on_disk_case(os.path.join(file_dir, os.path.basename(file_path)))
-
     repo_root = _repository_root(file_dir, file_path)
-    rel_path = _repo_relative(abs_path, repo_root, file_path)
-    spec = f'{ref}:{rel_path}'
+
+    # The path below the repository root, as typed, so that a directory symlink
+    # inside the repository stays a symlink and is looked up at the ref as the
+    # link committed there. A ``..`` after a symlink is resolved on disk instead.
+    parts = _typed_components(file_path, repo_root)
+    if parts is None:
+        abs_path = _on_disk_case(os.path.join(file_dir, os.path.basename(file_path)))
+        parts = _repo_relative(abs_path, repo_root, file_path).split('/')
 
     # "Ref unknown" and "path absent from a known ref" must not be confused: the
     # first is a user error (exit 2), the second means "everything is new". Both
@@ -112,22 +119,10 @@ def resolve_git_ref(ref: str, file_path: str) -> dict | None:
         suffix = f': {detail}' if detail else ''
         raise PipeDiffError(f'Unknown git ref {ref!r}{suffix}')
 
-    # ``cat-file -e`` is the machine-readable existence check: exit 0 when the
-    # object named by <ref>:<path> exists in that (already verified) ref, non-zero
-    # when it does not.
-    present = _run_git(['-C', repo_root, 'cat-file', '-e', spec], f'checking for {spec}')
-    if present.returncode != 0:
-        # On a case-insensitive filesystem the on-disk spelling can still differ
-        # from the tracked one (a case-only rename); compare against the tracked
-        # file that is the same file on disk rather than reporting all as added.
-        rel_path = _same_file_in_ref(repo_root, ref, rel_path, abs_path) if os.path.exists(abs_path) else None
-        if rel_path is None:
-            return None
-
-    # Decided by the entry at the ref, not by the working tree: a link that has
-    # since been retargeted, or replaced by a regular file, must still be read
-    # through the target it had at the ref.
-    rel_path = _follow_ref_symlinks(repo_root, ref, rel_path)
+    # Walk the path through the tree as it was at the ref, one component at a
+    # time, following every symlink as committed there (not as it is now), and
+    # recovering the tracked spelling of any component that differs only in case.
+    rel_path = _resolve_in_ref(repo_root, ref, parts)
     if rel_path is None:
         return None
     spec = f'{ref}:{rel_path}'
@@ -191,79 +186,169 @@ def _same_file(first: str, second: str) -> bool:
     return (a.st_dev, a.st_ino) == (b.st_dev, b.st_ino)
 
 
-def _follow_ref_symlinks(repo_root: str, ref: str, rel_path: str) -> str | None:
+def _typed_components(file_path: str, repo_root: str) -> list[str] | None:
     """
-    Resolve ``rel_path`` through symlinks as they were committed at ``ref``.
+    Return the components of ``file_path`` below ``repo_root``, exactly as typed.
 
-    ``git show`` of a committed link returns its target text, not a pipe. Each
-    link is followed using the target stored at the ref, relative to the link's
-    directory, until a regular entry is reached.
+    Directory symlinks inside the repository are left in place (not resolved),
+    so each one can be looked up at the ref as the link committed there.
 
     Returns:
-        The repository-relative path of the regular file at ``ref``, or ``None``
-        when a link points at a path that does not exist at ``ref``.
+        The components below the repository root, or ``None`` when the typed path
+        never passes through the root, or has a ``..`` below it that follows a
+        symlink (or leaves the root). On POSIX ``..`` after a link is the parent
+        of the link's *target*, which only the filesystem can say, so those paths
+        are resolved on disk instead; after a real directory it is its parent.
+    """
+    typed = file_path if os.path.isabs(file_path) else os.path.join(os.getcwd(), file_path)
+    drive, rest = os.path.splitdrive(typed)
+    parts = [part for part in re.split(r'[\\/]' if os.name == 'nt' else '/', rest) if part not in ('', '.')]
+    current = drive + os.sep
+    for index in range(len(parts) + 1):
+        if _same_directory(current, repo_root):
+            return _collapse_dotdot(repo_root, parts[index:])
+        if index == len(parts):
+            break
+        # Before the root, ``..`` means the physical parent (lexical on Windows)
+        if parts[index] == '..':
+            current = os.path.dirname(current if os.name == 'nt' else os.path.realpath(current))
+        else:
+            current = os.path.join(current, parts[index])
+    return None
+
+
+def _collapse_dotdot(repo_root: str, parts: list[str]) -> list[str] | None:
+    """Apply each ``..`` in ``parts`` to the real directory before it, or return ``None`` after a link."""
+    kept: list[str] = []
+    for part in parts:
+        if part != '..':
+            kept.append(part)
+        elif kept and not os.path.islink(os.path.join(repo_root, *kept)):
+            kept.pop()
+        else:
+            return None
+    return kept
+
+
+def _same_directory(first: str, second: str) -> bool:
+    """Report whether two paths name the same directory (links followed)."""
+    try:
+        return os.path.samefile(first, second)
+    except OSError:
+        return False
+
+
+def _resolve_in_ref(repo_root: str, ref: str, parts: list[str]) -> str | None:
+    """
+    Resolve ``parts`` to a repository-relative path as the tree at ``ref`` has it.
+
+    Walks the path one component at a time. A component that is a symlink at the
+    ref is replaced by the link text stored there, which is read relative to the
+    directory holding the link; ``..`` is applied to the path resolved so far, so
+    it means the parent of a link's target, as on disk. Git trees never traverse
+    links, so this is the only way to read a file reached through one.
+
+    A component the caller typed that is not in the tree under the spelling given,
+    but is under one that differs only in case, takes the tracked spelling when
+    both name the same entry on disk (a case-insensitive filesystem). On a
+    case-sensitive one they are two entries, so nothing matches. Link text is
+    taken as committed.
+
+    Returns:
+        The repository-relative path of the entry at ``ref``, or ``None`` when
+        the path does not exist there (including a link to such a path).
 
     Raises:
-        PipeDiffError: If a link points outside the repository, or links nest
-            more than ``_MAX_SYMLINK_HOPS`` deep (a loop).
+        PipeDiffError: If a link points outside the repository, links nest more
+            than ``_MAX_SYMLINK_HOPS`` deep (a loop), or git cannot list the tree.
     """
-    for _hop in range(_MAX_SYMLINK_HOPS):
-        if _tree_mode(repo_root, ref, rel_path) != _SYMLINK_MODE:
-            return rel_path
-        spec = f'{ref}:{rel_path}'
-        link = _run_git(['-C', repo_root, 'cat-file', 'blob', spec], f'reading link {spec}')
-        if link.returncode != 0:
-            raise PipeDiffError(f'git cat-file {spec} failed: {link.stderr.strip()}')
-        target = link.stdout
-        resolved = posixpath.normpath(posixpath.join(posixpath.dirname(rel_path), target))
-        if posixpath.isabs(target) or resolved == '..' or resolved.startswith('../'):
-            raise PipeDiffError(f'{spec} is a symlink to {target!r}, outside the repository')
-        rel_path = resolved
-        present = _run_git(['-C', repo_root, 'cat-file', '-e', f'{ref}:{rel_path}'], f'checking for {ref}:{rel_path}')
-        if present.returncode != 0:
+    requested = '/'.join(parts)
+    pending = [(part, True) for part in reversed(parts)]  # a stack: the next component is last
+    resolved: list[str] = []
+    listings: dict[str, dict[str, str]] = {}
+    last_link = ''
+    hops = 0
+
+    while pending:
+        part, typed = pending.pop()
+        if part in ('', '.'):
+            continue
+        if part == '..':
+            if not resolved:
+                raise PipeDiffError(f'{last_link}, outside the repository')
+            resolved.pop()
+            continue
+
+        directory = '/'.join(resolved)
+        if directory not in listings:
+            listings[directory] = _list_tree(repo_root, ref, directory)
+        entries = listings[directory]
+        name = part
+        if name not in entries and typed:
+            name = _tracked_spelling(repo_root, resolved, part, entries)
+        mode = entries.get(name)
+        if mode is None:
             return None
-    raise PipeDiffError(f'{ref}:{rel_path}: too many levels of symbolic links')
+
+        if mode == _SYMLINK_MODE:
+            hops += 1
+            if hops > _MAX_SYMLINK_HOPS:
+                raise PipeDiffError(f'{ref}:{requested}: too many levels of symbolic links')
+            link_path = '/'.join([*resolved, name])
+            link = _run_git(
+                ['-C', repo_root, 'cat-file', 'blob', f'{ref}:{link_path}'], f'reading link {ref}:{link_path}'
+            )
+            if link.returncode != 0:
+                raise PipeDiffError(f'git cat-file {ref}:{link_path} failed: {link.stderr.strip()}')
+            target = link.stdout
+            last_link = f'{ref}:{link_path} is a symlink to {target!r}'
+            if posixpath.isabs(target):
+                raise PipeDiffError(f'{last_link}, outside the repository')
+            pending.extend((piece, False) for piece in reversed(target.split('/')))
+            continue
+
+        resolved.append(name)
+        # Only a tree can be walked into; a file (or submodule) with more path
+        # after it is no path at all
+        if pending and mode != _TREE_MODE:
+            return None
+
+    return '/'.join(resolved) if resolved else None
 
 
-def _tree_mode(repo_root: str, ref: str, rel_path: str) -> str | None:
-    """Return the git file mode of ``rel_path`` in ``ref`` (``120000`` for a link), or ``None``."""
-    listing = _run_git(['-C', repo_root, 'ls-tree', '-z', ref, '--', rel_path], f'listing {ref}:{rel_path}')
+def _list_tree(repo_root: str, ref: str, directory: str) -> dict[str, str]:
+    """
+    Return ``{entry name: git file mode}`` for ``directory`` ('' is the root) at ``ref``.
+
+    The directory is named as ``<ref>:<directory>`` and not as a pathspec, so a
+    name that looks like pathspec magic (``:(top)x``) is still taken literally.
+    The walker only asks for directories it has already seen as tree entries.
+    """
+    listing = _run_git(['-C', repo_root, 'ls-tree', '-z', f'{ref}:{directory}'], f'listing {ref}:{directory or "."}')
     if listing.returncode != 0:
-        return None
+        raise PipeDiffError(f'git ls-tree {ref}:{directory or "."} failed: {listing.stderr.strip()}')
+    entries: dict[str, str] = {}
     for entry in listing.stdout.split('\0'):
         meta, _tab, name = entry.partition('\t')
-        if name == rel_path:
-            return meta.split(' ', 1)[0]
-    return None
+        if meta:
+            entries[name] = meta.split(' ', 1)[0]
+    return entries
 
 
-def _same_file_in_ref(repo_root: str, ref: str, rel_path: str, abs_path: str) -> str | None:
+def _tracked_spelling(repo_root: str, resolved: list[str], part: str, entries: dict[str, str]) -> str:
     """
-    Find the tracked spelling of ``rel_path`` when it differs only in case.
+    Find the tracked spelling of ``part`` when it differs only in case, else ``part``.
 
-    Lists the entries of the file's directory in ``ref`` and returns the one
-    whose name matches case-insensitively *and* is the same file on disk as
-    ``abs_path``. On a case-sensitive filesystem two such names are two files,
-    so nothing matches and the file is treated as new.
+    A candidate counts only when it is the same directory entry on disk as
+    ``part`` (links not followed), so on a case-sensitive filesystem, where two
+    spellings are two entries, nothing matches.
     """
-    directory, _slash, name = rel_path.rpartition('/')
-    listing = _run_git(
-        ['-C', repo_root, 'ls-tree', '-z', '--name-only', ref, '--', f'{directory}/' if directory else '.'],
-        f'listing {ref}:{directory or "."}',
-    )
-    if listing.returncode != 0:
-        return None
-    wanted = name.casefold()
-    for candidate in listing.stdout.split('\0'):
-        if candidate == rel_path or candidate.rpartition('/')[2].casefold() != wanted:
-            continue
-        candidate_path = os.path.join(repo_root, *candidate.split('/'))
-        try:
-            if os.path.samefile(candidate_path, abs_path):
-                return candidate
-        except OSError:
-            continue
-    return None
+    wanted = part.casefold()
+    typed_path = os.path.join(repo_root, *resolved, part)
+    for name in entries:
+        if name.casefold() == wanted and _same_file(os.path.join(repo_root, *resolved, name), typed_path):
+            return name
+    return part
 
 
 def _repository_root(file_dir: str, file_path: str) -> str:
