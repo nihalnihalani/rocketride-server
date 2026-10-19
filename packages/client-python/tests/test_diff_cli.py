@@ -58,6 +58,7 @@ import sys
 from types import SimpleNamespace
 
 import pytest
+import rocketride_common
 
 from rocketride.cli.commands import diff as diff_module
 from rocketride.cli.commands.diff import run_diff
@@ -506,8 +507,11 @@ def _cli_subprocess(tmp_path, arguments):
     """Run the actual CLI entry point using the package selected by this suite."""
     env = {key: value for key, value in os.environ.items() if not key.startswith('ROCKETRIDE_')}
     # pytest's in-process sys.path is not inherited by subprocesses. Pin the
-    # child's import root to this suite's actual package, including wheel runs.
-    env['PYTHONPATH'] = str(Path(diff_module.__file__).resolve().parents[3])
+    # child's import roots to the packages this suite actually imported,
+    # including wheel runs: rocketride itself, and rocketride_common, which
+    # conftest.py puts on sys.path in-process when it is not installed (CI).
+    roots = [Path(diff_module.__file__).resolve().parents[3], Path(rocketride_common.__file__).resolve().parents[1]]
+    env['PYTHONPATH'] = os.pathsep.join(dict.fromkeys(str(root) for root in roots))
     return subprocess.run(
         [
             sys.executable,
