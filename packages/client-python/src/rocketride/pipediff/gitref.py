@@ -48,6 +48,9 @@ from .engine import PipeDiffError, _parse_pipe_json
 # Upper bound so a wedged git process can never hang the CLI indefinitely.
 _GIT_TIMEOUT_SECONDS = 30
 
+# The git tree-entry mode of a committed symbolic link.
+_SYMLINK_MODE = '120000'
+
 
 def resolve_git_ref(ref: str, file_path: str) -> dict | None:
     """
@@ -74,14 +77,18 @@ def resolve_git_ref(ref: str, file_path: str) -> dict | None:
             unknown (or does not name a commit), ``git`` is unavailable or times
             out, or the retrieved contents are not a valid pipeline.
     """
-    # realpath (not just abspath) so the file resolves to the same physical path
-    # that ``git rev-parse --show-toplevel`` reports, keeping relpath consistent
-    # even when the repo is reached through a symlinked directory.
-    abs_path = os.path.realpath(file_path)
-    file_dir = os.path.dirname(abs_path) or '.'
+    # Resolve symlinks in the directory only (realpath of the parent), so the path
+    # matches the physical top level ``git rev-parse --show-toplevel`` reports
+    # even when the repo is reached through a symlinked directory, while the file
+    # itself is looked up under the name given -- ``git show <ref>:<FILE>``, as
+    # documented. Resolving the file too made an untracked link to a tracked
+    # file compare against its target instead of being reported as new.
+    given_path = os.path.abspath(file_path)
+    file_dir = os.path.realpath(os.path.dirname(given_path))
+    abs_path = os.path.join(file_dir, os.path.basename(given_path))
 
     repo_root = _repository_root(file_dir, file_path)
-    rel_path = os.path.relpath(abs_path, repo_root).replace(os.sep, '/')
+    rel_path = _repo_relative(abs_path, repo_root, file_path)
     spec = f'{ref}:{rel_path}'
 
     # "Ref unknown" and "path absent from a known ref" must not be confused: the
@@ -104,13 +111,82 @@ def resolve_git_ref(ref: str, file_path: str) -> dict | None:
     # when it does not.
     present = _run_git(['-C', repo_root, 'cat-file', '-e', spec], f'checking for {spec}')
     if present.returncode != 0:
-        return None
+        # On a case-insensitive filesystem a mis-cased FILE opens the tracked
+        # file while git's tree lookup misses it; compare against that file
+        # rather than reporting every node as added.
+        rel_path = _same_file_in_ref(repo_root, ref, rel_path, abs_path) if os.path.exists(abs_path) else None
+        if rel_path is None:
+            return None
+        spec = f'{ref}:{rel_path}'
+    elif os.path.islink(abs_path) and _tree_mode(repo_root, ref, rel_path) == _SYMLINK_MODE:
+        # A link committed as a link: ``git show`` would return its target path,
+        # not a pipe. Compare the file the working-tree link reads instead.
+        rel_path = _repo_relative(os.path.realpath(abs_path), repo_root, file_path)
+        spec = f'{ref}:{rel_path}'
+        present = _run_git(['-C', repo_root, 'cat-file', '-e', spec], f'checking for {spec}')
+        if present.returncode != 0:
+            return None
 
     result = _run_git(['-C', repo_root, 'show', spec], f'reading {spec}')
     if result.returncode != 0:
         raise PipeDiffError(f'git show {spec} failed: {result.stderr.strip()}')
 
     return _parse_pipe_json(result.stdout, spec)
+
+
+def _repo_relative(path: str, repo_root: str, file_path: str) -> str:
+    """
+    Express ``path`` relative to ``repo_root`` in git's ``/``-separated form.
+
+    Raises:
+        PipeDiffError: If ``path`` lies outside the repository (a symlink whose
+            target is elsewhere, for instance), which no ``<ref>:<path>`` names.
+    """
+    rel_path = os.path.relpath(path, repo_root)
+    if rel_path == os.pardir or rel_path.startswith(os.pardir + os.sep):
+        raise PipeDiffError(f'{file_path} resolves outside the repository at {repo_root}')
+    return rel_path.replace(os.sep, '/')
+
+
+def _tree_mode(repo_root: str, ref: str, rel_path: str) -> str | None:
+    """Return the git file mode of ``rel_path`` in ``ref`` (``120000`` for a link), or ``None``."""
+    listing = _run_git(['-C', repo_root, 'ls-tree', '-z', ref, '--', rel_path], f'listing {ref}:{rel_path}')
+    if listing.returncode != 0:
+        return None
+    for entry in listing.stdout.split('\0'):
+        meta, _tab, name = entry.partition('\t')
+        if name == rel_path:
+            return meta.split(' ', 1)[0]
+    return None
+
+
+def _same_file_in_ref(repo_root: str, ref: str, rel_path: str, abs_path: str) -> str | None:
+    """
+    Find the tracked spelling of ``rel_path`` when it differs only in case.
+
+    Lists the entries of the file's directory in ``ref`` and returns the one
+    whose name matches case-insensitively *and* is the same file on disk as
+    ``abs_path``. On a case-sensitive filesystem two such names are two files,
+    so nothing matches and the file is treated as new.
+    """
+    directory, _slash, name = rel_path.rpartition('/')
+    listing = _run_git(
+        ['-C', repo_root, 'ls-tree', '-z', '--name-only', ref, '--', f'{directory}/' if directory else '.'],
+        f'listing {ref}:{directory or "."}',
+    )
+    if listing.returncode != 0:
+        return None
+    wanted = name.casefold()
+    for candidate in listing.stdout.split('\0'):
+        if candidate == rel_path or candidate.rpartition('/')[2].casefold() != wanted:
+            continue
+        candidate_path = os.path.join(repo_root, *candidate.split('/'))
+        try:
+            if os.path.samefile(candidate_path, abs_path):
+                return candidate
+        except OSError:
+            continue
+    return None
 
 
 def _repository_root(file_dir: str, file_path: str) -> str:

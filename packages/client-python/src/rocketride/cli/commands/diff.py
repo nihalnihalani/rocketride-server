@@ -139,7 +139,11 @@ def _resolve_inputs(args) -> tuple:
     paths: List[str] = list(getattr(args, 'paths', None) or [])
     git_ref: Optional[str] = getattr(args, 'git', None)
 
-    if git_ref:
+    # ``is not None``, not truthiness: an empty ``--git ""`` must not be read as
+    # "no --git" and silently fall back to file mode.
+    if git_ref is not None:
+        if not git_ref.strip():
+            raise ValueError('--git requires a non-empty REF')
         if len(paths) != 1:
             raise ValueError('--git requires exactly one FILE to compare against the ref')
         file_path = paths[0]

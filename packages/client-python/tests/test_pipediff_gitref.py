@@ -295,5 +295,83 @@ def test_resolve_git_ref_real_repository(tmp_path):
     assert resolve_git_ref('HEAD', str(untracked)) is None
 
 
+def _init_repo(path, *files):
+    """Create a git repository at ``path`` committing ``files`` (names under it)."""
+
+    def git(*args):
+        result = subprocess.run(['git', *args], cwd=path, capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr
+        return result
+
+    git('init', '-q')
+    git('add', '--', *files)
+    git('-c', 'user.email=t@example.com', '-c', 'user.name=Tester', 'commit', '-q', '-m', 'init')
+    return git
+
+
+def _case_insensitive(path):
+    """Report whether the filesystem holding ``path`` folds case."""
+    probe = path / 'CaseProbe.tmp'
+    probe.write_text('x', encoding='utf-8')
+    try:
+        return (path / 'caseprobe.tmp').exists()
+    finally:
+        probe.unlink()
+
+
+@pytest.mark.skipif(shutil.which('git') is None, reason='git not installed')
+def test_untracked_symlink_is_looked_up_by_its_own_path(tmp_path):
+    # Documented as `git show <ref>:<FILE>`: a link that is not in the ref is new,
+    # even when the file it points at is tracked.
+    (tmp_path / 'pipeline.pipe').write_text(json.dumps(SAMPLE_PIPE), encoding='utf-8')
+    _init_repo(tmp_path, 'pipeline.pipe')
+    (tmp_path / 'link.pipe').symlink_to('pipeline.pipe')
+    assert resolve_git_ref('HEAD', str(tmp_path / 'link.pipe')) is None
+
+
+@pytest.mark.skipif(shutil.which('git') is None, reason='git not installed')
+def test_tracked_symlink_resolves_to_its_target(tmp_path):
+    # `git show` of a committed link returns the link text, not a pipe; compare
+    # the target the working-tree link reads instead.
+    (tmp_path / 'pipeline.pipe').write_text(json.dumps(SAMPLE_PIPE), encoding='utf-8')
+    (tmp_path / 'link.pipe').symlink_to('pipeline.pipe')
+    _init_repo(tmp_path, 'pipeline.pipe', 'link.pipe')
+    (tmp_path / 'pipeline.pipe').write_text(json.dumps({**SAMPLE_PIPE, 'version': 2}), encoding='utf-8')
+    assert resolve_git_ref('HEAD', str(tmp_path / 'link.pipe')) == SAMPLE_PIPE
+
+
+@pytest.mark.skipif(shutil.which('git') is None, reason='git not installed')
+def test_repository_reached_through_a_symlinked_directory(tmp_path):
+    real = tmp_path / 'real'
+    real.mkdir()
+    (real / 'pipeline.pipe').write_text(json.dumps(SAMPLE_PIPE), encoding='utf-8')
+    _init_repo(real, 'pipeline.pipe')
+    (tmp_path / 'alias').symlink_to(real, target_is_directory=True)
+    assert resolve_git_ref('HEAD', str(tmp_path / 'alias' / 'pipeline.pipe')) == SAMPLE_PIPE
+
+
+@pytest.mark.skipif(shutil.which('git') is None, reason='git not installed')
+def test_mis_cased_path_finds_the_tracked_file_on_a_case_insensitive_filesystem(tmp_path):
+    if not _case_insensitive(tmp_path):
+        pytest.skip('filesystem is case-sensitive')
+    sub = tmp_path / 'Flows'
+    sub.mkdir()
+    (sub / 'rag.pipe').write_text(json.dumps(SAMPLE_PIPE), encoding='utf-8')
+    _init_repo(tmp_path, 'Flows/rag.pipe')
+    # The working-tree path opens the tracked file, so compare against it rather
+    # than reporting every node as added.
+    assert resolve_git_ref('HEAD', str(sub / 'RAG.pipe')) == SAMPLE_PIPE
+
+
+@pytest.mark.skipif(shutil.which('git') is None, reason='git not installed')
+def test_differently_cased_new_file_is_new_on_a_case_sensitive_filesystem(tmp_path):
+    if _case_insensitive(tmp_path):
+        pytest.skip('filesystem folds case')
+    (tmp_path / 'rag.pipe').write_text(json.dumps(SAMPLE_PIPE), encoding='utf-8')
+    _init_repo(tmp_path, 'rag.pipe')
+    (tmp_path / 'RAG.pipe').write_text(json.dumps(SAMPLE_PIPE), encoding='utf-8')
+    assert resolve_git_ref('HEAD', str(tmp_path / 'RAG.pipe')) is None
+
+
 if __name__ == '__main__':
     raise SystemExit(pytest.main([__file__, '-v']))
