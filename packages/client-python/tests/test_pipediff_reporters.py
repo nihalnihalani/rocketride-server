@@ -320,6 +320,27 @@ class TestRenderHuman(unittest.TestCase):
         self.assertIn('\\u2066', out)
         self.assertIn('f\\u202e --l\\u2066--> t\\x9b', out)
 
+    def test_escaped_control_and_literal_escape_text_stay_distinguishable(self) -> None:
+        # U+202E and the six characters `‮` both print as `‮` once the
+        # control is escaped; the pair is then JSON-quoted so the edit stays visible.
+        diff = PipeDiff(
+            node_changes=[
+                NodeChange(
+                    id='n1',
+                    kind='config',
+                    field_changes=[
+                        FieldChange(path='config.bidi', kind='changed', old='‮', new='\\u202e'),
+                        FieldChange(path='config.esc', kind='changed', old='\\x1b', new='\x1b'),
+                    ],
+                )
+            ]
+        )
+        out = render_human(diff, use_color=False)
+        self.assertIn('~ config.bidi: "\\u202e" -> "\\\\u202e"', out)
+        self.assertIn('~ config.esc: "\\\\x1b" -> "\\u001b"', out)
+        self.assertNotIn('‮', out)
+        self.assertNotIn('\x1b', out)
+
     def test_printable_non_ascii_is_left_alone(self) -> None:
         diff = PipeDiff(
             node_changes=[

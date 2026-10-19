@@ -267,6 +267,7 @@ branch is present for `--git`, then diff and post the Markdown yourself:
       - run: pip install ./packages/client-python
       - name: Semantic diff of the pipeline
         run: |
+          set -o pipefail  # keep an exit-2 input error from being masked by tee
           rocketride diff --git "origin/${{ github.base_ref }}" rag.pipe \
             --markdown --exit-zero | tee pipe-diff.md
       - name: Comment on the PR

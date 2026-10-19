@@ -263,7 +263,7 @@ def _fmt_value(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True)
 
 
-def _fmt_pair(old: Any, new: Any) -> Tuple[str, str]:
+def _fmt_pair(old: Any, new: Any, escape: Any = None) -> Tuple[str, str]:
     """
     Render the two sides of a change so that differing values never read the same.
 
@@ -272,9 +272,15 @@ def _fmt_pair(old: Any, new: Any) -> Tuple[str, str]:
     printed as ``512 -> 512``) or when two different strings print alike (``""``
     and the empty string). In those cases strings are JSON-quoted instead, so the
     type change stays visible; same-type string edits keep the compact form.
+
+    ``escape`` is the renderer's escaping (``_term_safe`` for the terminal). The
+    two sides are compared *after* it, because escaping can make them collide:
+    U+202E and the literal text ``\\u202e`` both print as ``\\u202e``. JSON
+    quoting then escapes the backslash, which keeps them apart.
     """
+    escape = escape or _identity
     old_text, new_text = _fmt_value(old), _fmt_value(new)
-    if isinstance(old, str) != isinstance(new, str) or old_text == new_text:
+    if isinstance(old, str) != isinstance(new, str) or escape(old_text) == escape(new_text):
         old_text = json.dumps(old, ensure_ascii=False, sort_keys=True)
         new_text = json.dumps(new, ensure_ascii=False, sort_keys=True)
     return old_text, new_text
@@ -370,7 +376,7 @@ def _summary_phrase(org: Dict[str, Any], fmt=_identity) -> str:
 
     version_change = org['version_change']
     if version_change:
-        old_version, new_version = _fmt_pair(version_change[0], version_change[1])
+        old_version, new_version = _fmt_pair(version_change[0], version_change[1], fmt)
         parts.append(f'version {fmt(old_version)} → {fmt(new_version)}')
 
     if org['layout_changed']:
@@ -402,7 +408,7 @@ def _human_field_line(field_change: Any, palette: _Palette) -> str:
         body = f'{_MARK_REMOVED} {path} = {_term_safe(_fmt_value(field_change.old))}'
         return '    ' + palette.removed(body)
     # changed
-    old, new = (_term_safe(text) for text in _fmt_pair(field_change.old, field_change.new))
+    old, new = (_term_safe(text) for text in _fmt_pair(field_change.old, field_change.new, _term_safe))
     return '    ' + palette.changed(f'{_MARK_CHANGED} {path}: ') + f'{old} ' + palette.dim('->') + f' {new}'
 
 
@@ -455,7 +461,7 @@ def render_human(diff: 'PipeDiff', *, use_color: bool) -> str:
         for entry in org['nodes_changed']:
             if entry['has_provider_change']:
                 marker = palette.changed(f'{_MARK_CHANGED} {_term_safe(entry["id"])} provider: ')
-                provider_old, provider_new = _fmt_pair(entry['provider_old'], entry['provider_new'])
+                provider_old, provider_new = _fmt_pair(entry['provider_old'], entry['provider_new'], _term_safe)
                 lines.append(
                     '  ' + marker + f'{_term_safe(provider_old)} ' + palette.dim('->') + f' {_term_safe(provider_new)}'
                 )
@@ -483,7 +489,7 @@ def render_human(diff: 'PipeDiff', *, use_color: bool) -> str:
 
     # --- Version / Layout ---
     if org['version_change']:
-        old, new = (_term_safe(text) for text in _fmt_pair(*org['version_change']))
+        old, new = (_term_safe(text) for text in _fmt_pair(*org['version_change'], _term_safe))
         lines.append('')
         lines.append('Version: ' + f'{old} ' + palette.dim('->') + f' {new}')
 

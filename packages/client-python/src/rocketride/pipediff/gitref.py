@@ -118,7 +118,8 @@ def resolve_git_ref(ref: str, file_path: str) -> dict | None:
         if rel_path is None:
             return None
         spec = f'{ref}:{rel_path}'
-    elif os.path.islink(abs_path) and _tree_mode(repo_root, ref, rel_path) == _SYMLINK_MODE:
+    # Checked after case recovery as well, which can land on a tracked link.
+    if os.path.islink(abs_path) and _tree_mode(repo_root, ref, rel_path) == _SYMLINK_MODE:
         # A link committed as a link: ``git show`` would return its target path,
         # not a pipe. Compare the file the working-tree link reads instead.
         rel_path = _repo_relative(os.path.realpath(abs_path), repo_root, file_path)
