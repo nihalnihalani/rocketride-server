@@ -43,6 +43,11 @@ Semantic model (see :mod:`rocketride.pipediff.model` for the shapes):
       ``include_layout`` is set, ``ui`` differences are additionally enumerated
       as ``ui.*`` field changes on the affected node and the ``viewport``
       difference as ``viewport.*`` changes on the diff itself.
+    - **Canvas groups** — the editor nests a group's children under the group's
+      ``config.pipeline.components``. Those children are flattened into the node
+      set and diffed like any other node, so a drag inside a group is layout and
+      a rewire inside a group is an edge change; group membership is the child's
+      ``ui.parentId``, which is layout too.
 
 Functions:
     load_pipe: Read and validate a pipe from a path or an already-parsed dict.
@@ -203,22 +208,106 @@ def _validate_pipe(obj: Any, source: str) -> dict:
     # indexing by id keeps only the last component with that id, which would
     # silently hide the earlier node and any change to it. Reject it as an
     # actionable exit-2 error instead of emitting a diff that is quietly wrong.
-    seen_ids: dict[str, int] = {}
-    for index, component in enumerate(components):
+    # Canvas-group children are nodes too (see :func:`_all_components`), so ids
+    # must be unique across every nesting level.
+    seen_ids: dict[str, str] = {}
+    for component, where in _all_components(obj, include_invalid=True):
         if not isinstance(component, dict):
-            raise PipeDiffError(f'{source}: component at index {index} is not an object')
+            raise PipeDiffError(f'{source}: component at {where} is not an object')
         component_id = component.get('id')
         if not isinstance(component_id, str) or not component_id:
-            raise PipeDiffError(f"{source}: component at index {index} is missing a string 'id'")
-        first_index = seen_ids.get(component_id)
-        if first_index is not None:
+            raise PipeDiffError(f"{source}: component at {where} is missing a string 'id'")
+        first_where = seen_ids.get(component_id)
+        if first_where is not None:
             raise PipeDiffError(
-                f"{source}: duplicate component id '{component_id}' at index {index} "
-                f'(already used at index {first_index})'
+                f"{source}: duplicate component id '{component_id}' at {where} (already used at {first_where})"
             )
-        seen_ids[component_id] = index
+        seen_ids[component_id] = where
         _validate_wires(component, component_id, source)
     return obj
+
+
+def _group_children(component: Any) -> list | None:
+    """
+    Return the children of a canvas group, or ``None`` for any other component.
+
+    The editor saves a group's children inside the group component itself, under
+    ``config.pipeline.components`` (``getProjectComponents`` in the canvas
+    ``util/graph.ts``), and loads any component carrying such a list back as a
+    group (``getNodesFromProject``). Each child keeps its own ``ui`` block with a
+    group-relative position and a ``parentId``.
+    """
+    if not isinstance(component, dict):
+        return None
+    config = component.get('config')
+    pipeline = config.get('pipeline') if isinstance(config, dict) else None
+    children = pipeline.get('components') if isinstance(pipeline, dict) else None
+    return children if isinstance(children, list) else None
+
+
+def _all_components(pipe: dict, *, include_invalid: bool = False) -> list[tuple[Any, str]]:
+    """
+    Flatten a pipeline's components, including canvas-group children.
+
+    Group children are diffed as ordinary nodes, matched by ``id`` like every
+    other component: their ``ui`` is layout, their ``input``/``control`` wiring
+    is edges, and their provider and config are compared on the child. Without
+    this a drag inside a group surfaced as a config change of the group.
+    Traversal is iterative so arbitrarily nested groups cannot exhaust the
+    recursion limit.
+
+    Args:
+        pipe: A pipeline dict.
+        include_invalid: Also yield entries that are not id-bearing objects, so
+            validation can report them; diffing skips them.
+
+    Returns:
+        ``(component, location)`` pairs in document order, where ``location``
+        names the component for error messages (``index 0`` at the top level,
+        ``'group_1' config.pipeline.components[0]`` inside a group).
+    """
+    found: list[tuple[Any, str]] = []
+    expanded: set[int] = set()
+    top_level = pipe.get('components')
+    pending = [
+        (component, f'index {index}')
+        for index, component in enumerate(top_level if isinstance(top_level, list) else [])
+    ]
+    pending.reverse()
+    while pending:
+        component, where = pending.pop()
+        if include_invalid or (isinstance(component, dict) and isinstance(component.get('id'), str)):
+            found.append((component, where))
+        children = _group_children(component)
+        # An in-memory dict can nest itself; expand each group once so the walk
+        # always ends (validation then reports the repeat as a duplicate id).
+        if children and id(component) not in expanded:
+            expanded.add(id(component))
+            group_id = component.get('id')
+            pending.extend(
+                (child, f"'{group_id}' config.pipeline.components[{index}]")
+                for index, child in reversed(list(enumerate(children)))
+            )
+    return found
+
+
+def _node_config(component: dict) -> Any:
+    """
+    Return the config that belongs to the node itself.
+
+    For a canvas group that excludes ``config.pipeline.components``: the children
+    are diffed as nodes in their own right, so leaving them in the group's config
+    would report every child edit a second time, as a positional change of the
+    group. Any other key under ``config.pipeline`` is kept and diffed.
+    """
+    config = component.get('config')
+    if _group_children(component) is None:
+        return config
+    pipeline = {key: value for key, value in config['pipeline'].items() if key != 'components'}
+    own = {key: value for key, value in config.items() if key != 'pipeline'}
+    if pipeline:
+        own['pipeline'] = pipeline
+    return own
 
 
 # The wire collections a component may declare, mapped to the key that labels the
@@ -292,8 +381,10 @@ def diff_pipes(old: dict, new: dict, *, include_layout: bool = False) -> PipeDif
     """
     Compute the semantic difference between two pipeline dictionaries.
 
-    Nodes are matched by ``id``. For each matched node the provider and config
-    are compared independently; unmatched nodes become added/removed changes.
+    Nodes are matched by ``id``, including canvas-group children nested under a
+    group's ``config.pipeline.components`` (see :func:`_all_components`). For each
+    matched node the provider and config are compared independently; unmatched
+    nodes become added/removed changes.
     Edges are compared as a set of directed ``(from, lane, to)`` triples drawn
     from every component's ``input[]`` and ``control[]`` wiring. The top-level
     ``version`` change is always reported. Canvas layout (each ``ui`` block and
@@ -350,7 +441,8 @@ def diff_pipes(old: dict, new: dict, *, include_layout: bool = False) -> PipeDif
 
         provider_old = old_component.get('provider')
         provider_new = new_component.get('provider')
-        if provider_old != provider_new:
+        # JSON equality, as for ``version`` below: ``0 == False`` in Python.
+        if not _json_equal(provider_old, provider_new):
             node_changes.append(
                 NodeChange(
                     id=component_id,
@@ -360,7 +452,7 @@ def diff_pipes(old: dict, new: dict, *, include_layout: bool = False) -> PipeDif
                 )
             )
 
-        field_changes = deep_diff_config(old_component.get('config'), new_component.get('config'))
+        field_changes = deep_diff_config(_node_config(old_component), _node_config(new_component))
         if include_layout:
             field_changes = field_changes + _diff_value(
                 _layout_block(old_component.get('ui')), _layout_block(new_component.get('ui')), 'ui'
@@ -417,7 +509,8 @@ def _components_by_id(pipe: dict) -> dict[str, dict]:
     """
     Index a pipeline's components by their ``id``.
 
-    Non-object components and components without an ``id`` are skipped defensively
+    Canvas-group children are included (see :func:`_all_components`). Non-object
+    components and components without an ``id`` are skipped defensively
     (``load_pipe`` normally rejects those upstream, and also rejects duplicate ids
     so that no component can be shadowed here).
 
@@ -427,11 +520,7 @@ def _components_by_id(pipe: dict) -> dict[str, dict]:
     Returns:
         A mapping of component id to the component object.
     """
-    indexed: dict[str, dict] = {}
-    for component in pipe.get('components', []) or []:
-        if isinstance(component, dict) and isinstance(component.get('id'), str):
-            indexed[component['id']] = component
-    return indexed
+    return {component['id']: component for component, _where in _all_components(pipe)}
 
 
 def _extract_edges(pipe: dict) -> set[tuple[Any, Any, Any]]:
@@ -443,7 +532,8 @@ def _extract_edges(pipe: dict) -> set[tuple[Any, Any, Any]]:
     become orchestration edges ``(control.from, control.classType, component.id)``.
     Control edges are included because agent workflows express their
     agent-to-llm/tool/memory wiring exclusively through ``control[]``; ignoring
-    them would make the diff blind to agent reconfiguration.
+    them would make the diff blind to agent reconfiguration. Canvas-group
+    children are wired the same way and are included.
 
     Args:
         pipe: A pipeline dict.
@@ -452,9 +542,7 @@ def _extract_edges(pipe: dict) -> set[tuple[Any, Any, Any]]:
         A set of ``(from, lane, to)`` triples.
     """
     edges: set[tuple[Any, Any, Any]] = set()
-    for component in pipe.get('components', []) or []:
-        if not isinstance(component, dict):
-            continue
+    for component, _where in _all_components(pipe):
         to_id = component.get('id')
         for wire in component.get('input') or []:
             if isinstance(wire, dict):
