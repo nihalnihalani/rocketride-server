@@ -237,6 +237,49 @@ async def test_git_mode_requires_exactly_one_file(tmp_path, capsys):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('ref', ['', '   '], ids=['empty', 'blank'])
+async def test_git_mode_rejects_an_empty_ref(tmp_path, capsys, ref):
+    # An empty --git used to be read as "no --git": with two files the command
+    # silently ran file mode, with one it blamed the file count.
+    a = _write_pipe(tmp_path, 'a.pipe', _old_pipe())
+    b = _write_pipe(tmp_path, 'b.pipe', _new_pipe())
+    for paths in ([a], [a, b]):
+        code = await _run(_diff_args(paths, git=ref))
+        captured = capsys.readouterr()
+        assert code == 2
+        assert captured.out == ''
+        assert '--git requires a non-empty REF' in captured.err
+
+
+def test_diff_skips_the_workspace_env_file(tmp_path, monkeypatch):
+    # diff is local-only and takes no configuration, so main() must not load the
+    # workspace .env for it; every other command still does.
+    calls = []
+    monkeypatch.setattr(cli_main, 'load_dot_env', lambda *args, **kwargs: calls.append(args))
+    a = _write_pipe(tmp_path, 'a.pipe', _old_pipe())
+
+    monkeypatch.setattr(sys, 'argv', ['rocketride', 'diff', a, a])
+    with pytest.raises(SystemExit) as diff_exit:
+        cli_main.main()
+    assert diff_exit.value.code == 0
+    assert calls == []
+
+    monkeypatch.setattr(sys, 'argv', ['rocketride'])
+    with pytest.raises(SystemExit):
+        cli_main.main()
+    assert calls == [()]
+
+
+def test_unreadable_workspace_env_does_not_break_diff(tmp_path):
+    (tmp_path / '.env').write_bytes(b'X=\xff\xfe\n')
+    _write_pipe(tmp_path, 'a.pipe', _old_pipe())
+    result = _cli_subprocess(tmp_path, ['a.pipe', 'a.pipe'])
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == 'No semantic changes.'
+    assert result.stderr == ''
+
+
+@pytest.mark.asyncio
 async def test_git_resolver_error_exit_2(tmp_path, capsys, monkeypatch):
     new = _write_pipe(tmp_path, 'pipeline.pipe', _new_pipe())
 
