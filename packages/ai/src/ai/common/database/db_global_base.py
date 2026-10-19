@@ -212,8 +212,8 @@ _CLICKHOUSE_TAILS = rf"""
 """
 
 # pymysql's `(errno, message)` when MySQL wrote the message. MySQL appends no
-# tail of its own; SQLAlchemy's markers are the strip this branch has always
-# had, kept as the backstop for a driver of the same shape that is not pymysql.
+# tail of its own, so SQLAlchemy's markers alone are kept there, as a backstop
+# for a driver of the same shape that is not pymysql.
 _SQLALCHEMY_DETAIL = re.compile(rf'\s*(?:{_SQLALCHEMY_TAILS})', re.VERBOSE)
 
 # Text ClickHouse wrote, from clickhouse-driver or over its MySQL interface.
@@ -230,12 +230,13 @@ _DB_ERROR_DETAIL = re.compile(
     re.VERBOSE,
 )
 
-# How ClickHouse names itself in every message it writes, which is how its
-# text is recognised when it arrives over the MySQL wire protocol as a
-# pymysql `(errno, message)` pair. Over that protocol the text also opens with
-# `Code: <errno>. `, which only repeats the errno already in front of it.
-_CLICKHOUSE_TEXT = re.compile(r'\bDB::Exception:')
-_CLICKHOUSE_CODE_PREFIX = re.compile(r'\ACode:\ \d+\.\ ')
+# How every message ClickHouse writes opens: `DB::Exception:`, after
+# `Code: <errno>. ` when it arrives over the MySQL wire protocol as a pymysql
+# `(errno, message)` pair (a prefix that only repeats the errno, so a match's
+# end is where the text worth keeping starts). Anchored, so text that merely
+# mentions the phrase -- a SIGNAL's, or another driver's -- is not taken for
+# ClickHouse's and cut with its markers.
+_CLICKHOUSE_TEXT = re.compile(r'\A(?:Code:\ \d+\.\ )?(?=DB::Exception:)')
 
 # ClickHouse's FUNCTION_THROW_IF_VALUE_IS_NON_ZERO: `throwIf` raised it, with
 # the caller's own message. ClickHouse then appends the runtime context of the
@@ -422,12 +423,12 @@ class DatabaseGlobalBase(IGlobalBase, ABC):
           -> ``Error <code>: <message>``. MySQL appends nothing to its own
           sentence, so only SQLAlchemy's markers apply to it, and a
           ``SIGNAL``'s ``MESSAGE_TEXT`` or MySQL's ``near '...'`` quote comes
-          back whole unless it contains one of those bracketed tails. The same
-          pair can carry ClickHouse's text: db_mysql pointed at ClickHouse's
-          MySQL interface receives ``(47, "Code: 47. DB::Exception: ... in
-          scope SELECT ...")``, statement and bound value included. Text that
-          names ``DB::Exception:`` is therefore cut with ClickHouse's markers
-          instead.
+          back whole unless it contains one of SQLAlchemy's tail markers
+          (``[SQL:``, ``(Background on this error`` ...). The same pair can
+          carry ClickHouse's text: db_mysql pointed at ClickHouse's MySQL
+          interface receives ``(47, "Code: 47. DB::Exception: ... in scope
+          SELECT ...")``, statement and bound value included. Text that opens
+          that way is therefore cut with ClickHouse's markers instead.
         * clickhouse-driver does NOT: its ``ServerException`` carries the code
           on ``.code`` and the text on ``.message``, so those attributes are
           read directly -> ``Error <code>: <message>``. The message itself
@@ -441,19 +442,21 @@ class DatabaseGlobalBase(IGlobalBase, ABC):
           row); code 215 repeats it after ``In query``, a mutation repeats
           its predicate after ``while processing: '``, and a parser that
           stopped prints the rest of its input after `` here: ``. All of
-          those are cut by ClickHouse's markers. The echoes are not cosmetic: the driver sends no
-          server-side parameters by default, so the statement it echoes back
-          has the caller's bind values already interpolated into it. A
-          ``throwIf`` failure (code 395) is the exception: its sentence is
-          the caller's own message and is kept whole (see
-          ``_strip_clickhouse_detail``). Note the two layers differ:
-          ``clickhouse+native://`` -- what the db_clickhouse node uses -- is
-          clickhouse-sqlalchemy's connector and raises its own
+          those are cut by ClickHouse's markers, which apply only to text
+          that opens with ``DB::Exception:``; any other ``.code`` /
+          ``.message`` pair gets the backstop. The echoes are not cosmetic:
+          the driver sends no server-side parameters by default, so the
+          statement it echoes back has the caller's bind values already
+          interpolated into it. A ``throwIf`` failure (code 395) is the
+          exception: its sentence is the caller's own message and is kept
+          whole (see ``_strip_clickhouse_detail``). Note the two layers
+          differ: ``clickhouse+native://`` -- what the db_clickhouse node
+          uses -- is clickhouse-sqlalchemy's connector and raises its own
           ``DatabaseException``, a plain ``Exception`` carrying the
           ``ServerException`` in ``.orig``. ``clickhouse_driver.dbapi`` raises
           ``OperationalError(ServerException)`` instead, whose ``args`` hold
-          the exception object itself, so that one is unwrapped first. Both
-          reach the same branch.
+          the exception object itself, so that one is unwrapped first when
+          its text is ClickHouse's. Both reach the same branch.
         * psycopg2 exposes the server's primary message on ``.orig.diag``;
           its ``str()`` also carries the ``LINE n:`` echo of the statement,
           which psycopg2 has already interpolated the bind values into.
@@ -545,8 +548,9 @@ class DatabaseGlobalBase(IGlobalBase, ABC):
             # MySQL's own sentence, which no other dialect's marker may cut (a
             # SIGNAL's MESSAGE_TEXT is the application's text).
             if is_seq and len(args) >= 2 and isinstance(args[0], int):
-                if isinstance(args[1], str) and _CLICKHOUSE_TEXT.search(args[1]):
-                    return _strip_clickhouse_detail(args[0], _CLICKHOUSE_CODE_PREFIX.sub('', args[1], count=1))
+                clickhouse = _CLICKHOUSE_TEXT.match(args[1]) if isinstance(args[1], str) else None
+                if clickhouse:
+                    return _strip_clickhouse_detail(args[0], args[1][clickhouse.end() :])
                 return _strip_statement_detail(f'Error {args[0]}: {args[1]}', _SQLALCHEMY_DETAIL)
 
             # psycopg2: diag.message_primary is the server message with the
@@ -570,19 +574,26 @@ class DatabaseGlobalBase(IGlobalBase, ABC):
             # the numeric branch above misses it and args[0] alone would drop
             # the code that identifies the failure. `clickhouse_driver.dbapi`
             # wraps it once more, as the only element of its own error's
-            # `args`, so that layer is unwrapped to the same place.
+            # `args`, so that layer is unwrapped to the same place -- but only
+            # when the text inside is ClickHouse's: other drivers wrap an
+            # exception the same way, and their text keeps the backstop. The
+            # `.code` / `.message` pair is not ClickHouse's alone either, so
+            # ClickHouse's markers are used only on ClickHouse's text.
             server = orig
+            inner = args[0] if is_seq and len(args) == 1 else None
             if (
                 not isinstance(getattr(orig, 'code', None), int)
-                and is_seq
-                and len(args) == 1
-                and isinstance(args[0], BaseException)
+                and isinstance(inner, BaseException)
+                and isinstance(getattr(inner, 'message', None), str)
+                and _CLICKHOUSE_TEXT.match(inner.message)
             ):
-                server = args[0]
+                server = inner
             code = getattr(server, 'code', None)
             message = getattr(server, 'message', None)
             if isinstance(code, int) and isinstance(message, str) and message.strip():
-                return _strip_clickhouse_detail(code, message)
+                if _CLICKHOUSE_TEXT.match(message):
+                    return _strip_clickhouse_detail(code, message)
+                return _strip_statement_detail(f'Error {code}: {message}')
 
             # ODBC-backed drivers report `(sqlstate, message)`. Without this
             # branch the generic one below returned the five-character code

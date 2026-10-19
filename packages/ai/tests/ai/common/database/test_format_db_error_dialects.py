@@ -491,6 +491,52 @@ def test_clickhouse_dbapi_layer_reaches_the_same_branch(base, message, code, exp
     assert base._format_db_error(exc) == expected
 
 
+class _CodedDriverError(Exception):
+    """Stand-in for a driver other than ClickHouse's that also puts ``.code`` and ``.message`` on its error."""
+
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+_POSTGRES_SHAPED_TEXT = (
+    'duplicate key value violates unique constraint "u_email"\n'
+    'DETAIL:  Key (email)=(QA_CANARY_CODED@x.io) already exists.'
+)
+
+
+def test_a_code_and_message_pair_that_is_not_clickhouses_keeps_the_backstop(base):
+    """``.code`` / ``.message`` is not ClickHouse's shape alone, so neither are its markers.
+
+    Constructed: text that does not open with ``DB::Exception:`` is cut with
+    every dialect's markers, as before, so a PostgreSQL-style DETAIL block
+    still goes.
+    """
+    exc = DBAPIError.instance('SELECT 1', {}, _CodedDriverError(23505, _POSTGRES_SHAPED_TEXT), dbapi_base_err=Exception)
+
+    result = base._format_db_error(exc)
+
+    assert result == 'Error 23505: duplicate key value violates unique constraint "u_email"'
+    assert 'QA_CANARY_CODED' not in result
+
+
+def test_a_wrapped_error_that_is_not_clickhouses_is_not_unwrapped(base):
+    """Only ClickHouse's text is unwrapped from a one-element ``args``.
+
+    Constructed: another driver wrapping its own coded error the way
+    ``clickhouse_driver.dbapi`` does keeps the old path, ``str(orig)`` and the
+    backstop, so the DETAIL block is still cut.
+    """
+    wrapper = _ClickHouseDbapiError(_CodedDriverError(23505, _POSTGRES_SHAPED_TEXT))
+    exc = DBAPIError.instance('SELECT 1', {}, wrapper, dbapi_base_err=Exception)
+
+    result = base._format_db_error(exc)
+
+    assert result == 'duplicate key value violates unique constraint "u_email"'
+    assert 'QA_CANARY_CODED' not in result
+
+
 def test_execute_reports_a_clickhouse_scope_echo_without_the_bound_value():
     """The same cut as the caller of the ``execute`` tool sees it."""
     message = _execute_error(
@@ -550,7 +596,7 @@ def test_mysql_keeps_a_signal_message_that_contains_a_new_clickhouse_marker(base
 
 
 def test_an_errno_message_pair_keeps_sqlalchemys_markers(base):
-    """The ``(int, str)`` branch keeps the strip it always had: SQLAlchemy's markers.
+    """The ``(int, str)`` branch keeps a strip: SQLAlchemy's markers, and no other dialect's.
 
     Constructed: a driver of pymysql's shape that is not pymysql, carrying a
     SQLAlchemy-style tail in its own message. Only those markers apply here,
@@ -634,6 +680,23 @@ def test_clickhouse_text_over_the_mysql_wire_gets_clickhouses_markers(base, errn
     assert result == expected
     if canary:
         assert canary not in result
+
+
+@pytest.mark.parametrize(
+    ('errno', 'text'),
+    [
+        (1644, 'Upstream DB::Exception: Import aborted: While processing row 5'),
+        (1062, "Duplicate entry 'DB::Exception: a here: b' for key 't.PRIMARY'"),
+    ],
+    ids=['signal', 'duplicate-entry'],
+)
+def test_mysql_text_that_only_mentions_db_exception_stays_whole(base, errno, text):
+    """Only text that OPENS the way ClickHouse's does is taken for ClickHouse's.
+
+    Constructed: MySQL text naming the phrase mid-sentence, with ClickHouse
+    markers after it.
+    """
+    assert base._format_db_error(_mysql(errno, text)) == f'Error {errno}: {text}'
 
 
 def test_mysql_branch_still_never_returns_the_sqlalchemy_tail(base):
