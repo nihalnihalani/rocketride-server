@@ -102,7 +102,8 @@ rocketride diff --git <ref> <file.pipe> [--include-layout] [--json | --markdown]
 unreadable / unparseable file, or a bad git ref. Errors always go to stderr, so
 `--json` and `--markdown` output on stdout stays pure. `diff` reads no
 configuration, so unlike the connected commands it does not load the workspace
-`.env`.
+`.env`: a `NO_COLOR` set only there is ignored, while one in the shell
+environment still disables color.
 
 Non-JSON constants (`NaN`, `Infinity`, `-Infinity`), numeric overflow, and
 nonzero values that underflow to zero are rejected with exit `2`. Fractional

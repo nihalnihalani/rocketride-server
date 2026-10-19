@@ -227,7 +227,8 @@ Key flags:
 Exit codes: `0` — no semantic changes (or any successful run when `--exit-zero`
 is set); `1` — semantic changes were found; `2` — usage error, or an unreadable
 / unparseable file or bad git ref. `diff` reads no configuration and does not
-load the workspace `.env`.
+load the workspace `.env`, so a `NO_COLOR` set only there is ignored; one in the
+shell environment still disables color.
 
 Non-JSON constants (`NaN`, `Infinity`, `-Infinity`), numeric overflow, and
 nonzero underflow are input errors (exit `2`). Fractional and exponent literals
