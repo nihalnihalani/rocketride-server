@@ -254,10 +254,10 @@ def test_clickhouse_cuts_a_lambda_scope_echo(base):
 def test_clickhouse_cuts_a_multi_argument_lambda_scope_echo(base):
     """A lambda over several arguments prints them as a tuple: ``(x, y) -> ...``.
 
-    Constructed from the single-argument message above, for
-    ``arrayMap((x, y) -> concat(x, y, $1, nope), ['a'], ['b'])``: ClickHouse's
-    formatter prints a one-element lambda tuple as its bare element and any
-    other as a parenthesised list.
+    ``SELECT arrayMap((x, y) -> concat(x, y, $1, nope), ['a'], ['b'])`` with
+    ``$1`` bound to ``QA_CANARY_LAMBDA_2``: ClickHouse's formatter prints a
+    one-element lambda tuple as its bare element and any other as a
+    parenthesised list.
     """
     exc = _clickhouse(
         47,
@@ -297,20 +297,19 @@ def test_clickhouse_cuts_the_in_query_echo_of_code_215(base):
 def test_clickhouse_cuts_an_in_query_echo_of_a_cte_body(base):
     """``In query`` formats its query node like ``in scope`` does, CTE name included.
 
-    Constructed from the captured code-215 message, for the same aggregate
-    error inside ``WITH x AS (SELECT order_id, count() ... WHERE qa_mark = $1
-    GROUP BY customer) SELECT * FROM x``.
+    ``WITH x AS (SELECT order_id, count() FROM t WHERE qa_mark = $1 GROUP BY
+    customer) SELECT * FROM x`` with ``$1`` bound to ``QA_CANARY_IN_QUERY_CTE``.
     """
     exc = _clickhouse(
         215,
-        "DB::Exception: Column 'db.t.order_id' is not under aggregate function and not in GROUP BY keys. "
+        "DB::Exception: Column 'qa.t.order_id' is not under aggregate function and not in GROUP BY keys. "
         "In query x AS (SELECT order_id, count() FROM t WHERE qa_mark = 'QA_CANARY_IN_QUERY_CTE' GROUP BY customer)",
     )
 
     result = base._format_db_error(exc)
 
     assert result == (
-        "Error 215: DB::Exception: Column 'db.t.order_id' is not under aggregate function and not in GROUP BY keys."
+        "Error 215: DB::Exception: Column 'qa.t.order_id' is not under aggregate function and not in GROUP BY keys."
     )
     assert 'QA_CANARY_IN_QUERY_CTE' not in result
 
@@ -318,10 +317,11 @@ def test_clickhouse_cuts_an_in_query_echo_of_a_cte_body(base):
 def test_clickhouse_cuts_the_old_interpreters_while_processing_echo(base):
     """The pre-analyzer interpreter appends ``: While processing <expr>``.
 
-    Constructed: the old interpreter runs with ``enable_analyzer = 0``, on
-    servers before 24.3, and on some mutation paths, none of which the
-    captured messages exercised. The expression it repeats carries the bound
-    value like every other echo here.
+    ``SELECT * FROM t WHERE isZeroOrNull(nofunc(qa_mark) = $1) SETTINGS
+    enable_analyzer = 0`` with ``$1`` bound to ``QA_CANARY_OLD``. The old
+    interpreter also runs on servers before 24.3 and on some mutation paths.
+    The expression it repeats carries the bound value like every other echo
+    here.
     """
     exc = _clickhouse(
         46,
@@ -426,8 +426,8 @@ def test_mysql_keeps_a_signal_message_that_contains_another_dialects_marker(base
 def test_mysql_keeps_a_signal_message_that_contains_a_new_clickhouse_marker(base, text):
     """The markers added for ClickHouse's echoes do not reach MySQL either.
 
-    Constructed SIGNAL texts, one per marker this change adds; same shape as
-    the captured ones above.
+    One SIGNAL text per marker this change adds, sent the same way as the ones
+    above.
     """
     assert base._format_db_error(_mysql(1644, text)) == f'Error 1644: {text}'
 
@@ -435,7 +435,8 @@ def test_mysql_keeps_a_signal_message_that_contains_a_new_clickhouse_marker(base
 def test_mysql_keeps_a_signal_message_that_contains_a_sqlalchemy_marker(base):
     """SQLAlchemy's tail is only ever in ``str()`` of its own exception, never in ``args``.
 
-    Constructed SIGNAL text. On this branch the marker could only misfire.
+    A SIGNAL text, sent the same way as the ones above. On this branch the
+    marker could only misfire.
     """
     text = 'Quota hit (Background on this error: see ops)'
 
@@ -537,7 +538,7 @@ def test_clickhouse_keeps_a_throwif_message_with_a_postgres_block_word(base):
 def test_clickhouse_keeps_a_throwif_message_that_contains_a_tail_marker(base, text):
     """The ClickHouse analogue of the MySQL SIGNAL cases above.
 
-    Constructed from the captured ``throwIf`` message shape. The genuine stack
+    ``SELECT throwIf(1, $1)`` with ``$1`` bound to the text. The genuine stack
     trace is the LAST ``Stack trace:`` in the message, so a literal one inside
     the caller's text does not end it early.
     """
@@ -572,29 +573,53 @@ def test_clickhouse_still_passes_a_throwif_runtime_context_through(base):
 def test_clickhouse_keeps_a_throwif_message_evaluated_lazily_inside_if(base):
     """Keyed on code 395, so the context may name the ``if`` that ran ``throwIf``.
 
-    Constructed: with short-circuit evaluation the action reported is the
-    ``if(...)`` whose branch called ``throwIf``, not ``throwIf`` itself.
+    ``SELECT if(number > 2, throwIf(1, 'Upload failed at position 3 of batch'),
+    0) FROM numbers(5)``. With short-circuit evaluation the action reported is
+    the ``if(...)`` whose branch called ``throwIf``, not ``throwIf`` itself,
+    and ClickHouse truncates its result name with ``...`` mid-literal.
     """
     exc = _clickhouse(
         395,
-        "DB::Exception: Upload failed at position 3 of batch: while executing 'FUNCTION if(greater(number, 2) :: 1, "
-        "throwIf(1_UInt8, 'Upload failed at position 3 of batch'_String) :: 3, 0_UInt8 :: 2) -> if(...) UInt8 : 4'",
+        "DB::Exception: Upload failed at position 3 of batch: while executing 'FUNCTION "
+        "if(greater(__table1.number, 2_UInt8) :: 3, throwIf(1_UInt8, 'Upload failed at position 3 of batch'_String) "
+        ':: 0, 0_UInt8 :: 4) -> if(greater(__table1.number, 2_UInt8), throwIf(1_UInt8, '
+        "'Upload failed at position 3 of batch'_String... UInt8 : 1'",
     )
 
     assert base._format_db_error(exc) == 'Error 395: DB::Exception: Upload failed at position 3 of batch'
 
 
+def test_clickhouse_keeps_a_throwif_raised_inside_a_scalar_subquery(base):
+    """A scalar subquery's ``throwIf`` is reported like a top-level one.
+
+    ``SELECT (SELECT throwIf(1, 'boom')) AS v, $1 AS c`` with ``$1`` bound to
+    ``QA_CANARY_SCALAR``. ClickHouse appends no ``In scope`` to it, before or
+    after the runtime context, so the outer statement and its bound value never
+    reach the message. The context holds no ClickHouse marker and stays.
+    """
+    exc = _clickhouse(
+        395,
+        "DB::Exception: boom: while executing 'FUNCTION throwIf(1_UInt8 :: 1, 'boom'_String :: 2) -> "
+        "throwIf(1_UInt8, 'boom'_String) UInt8 : 3'",
+    )
+
+    assert base._format_db_error(exc) == (
+        "Error 395: DB::Exception: boom: while executing 'FUNCTION throwIf(1_UInt8 :: 1, 'boom'_String :: 2) -> "
+        "throwIf(1_UInt8, 'boom'_String) UInt8 : 3'."
+    )
+
+
 def test_clickhouse_does_not_trust_a_throwif_context_spelled_into_an_echo(base):
     """Only code 395 is protected, so an alias cannot carry an echo past the markers.
 
-    Constructed: ``SELECT nope, 1 AS `: while executing 'FUNCTION throwIf(`
-    FROM t WHERE s = $1`` fails with code 47, and the analyzer echoes the
-    statement -- alias, bound value and all -- after ``in scope``.
+    ``SELECT nope, 1 AS `: while executing 'FUNCTION throwIf(` FROM t WHERE
+    qa_mark = $1`` fails with code 47, and the analyzer echoes the statement
+    -- alias, bound value and all -- after ``in scope``.
     """
     exc = _clickhouse(
         47,
         'DB::Exception: Unknown expression identifier `nope` in scope SELECT nope, 1 AS '
-        "`: while executing 'FUNCTION throwIf(` FROM t WHERE s = 'QA_CANARY_ALIAS'",
+        "`: while executing 'FUNCTION throwIf(` FROM t WHERE qa_mark = 'QA_CANARY_ALIAS'",
     )
 
     result = base._format_db_error(exc)
