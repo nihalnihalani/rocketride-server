@@ -62,7 +62,7 @@ import json
 import re
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
-from .engine import _json_equal
+from ._pipejson import json_equal
 
 if TYPE_CHECKING:  # pragma: no cover - typing-only imports
     from .model import PipeDiff
@@ -191,7 +191,7 @@ def _organize(diff: 'PipeDiff') -> Dict[str, Any]:
             )
             # JSON equality, not ``!=``: Python treats ``0 == False``, which would
             # drop a real ``0`` -> ``false`` provider change from every report.
-            if (node_change.provider_old is not None or node_change.provider_new is not None) and not _json_equal(
+            if (node_change.provider_old is not None or node_change.provider_new is not None) and not json_equal(
                 node_change.provider_old, node_change.provider_new
             ):
                 entry['provider_old'] = node_change.provider_old

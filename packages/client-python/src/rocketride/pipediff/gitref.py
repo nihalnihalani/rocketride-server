@@ -44,7 +44,7 @@ import os
 import posixpath
 import subprocess
 
-from .engine import PipeDiffError, _parse_pipe_json
+from ._pipejson import PipeDiffError, parse_pipe_json
 
 # Upper bound so a wedged git process can never hang the CLI indefinitely.
 _GIT_TIMEOUT_SECONDS = 30
@@ -136,7 +136,7 @@ def resolve_git_ref(ref: str, file_path: str) -> dict | None:
     if result.returncode != 0:
         raise PipeDiffError(f'git show {spec} failed: {result.stderr.strip()}')
 
-    return _parse_pipe_json(result.stdout, spec)
+    return parse_pipe_json(result.stdout, spec)
 
 
 def _repo_relative(path: str, repo_root: str, file_path: str) -> str:
