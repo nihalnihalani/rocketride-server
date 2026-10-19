@@ -643,7 +643,17 @@ def test_excessive_historical_nesting_cli_errors(tmp_path, exit_zero):
     for arguments in [
         ['init'],
         ['add', 'pipeline.pipe'],
-        ['-c', 'user.name=Local QA', '-c', 'user.email=qa@example.invalid', 'commit', '-m', 'nested fixture'],
+        [
+            '-c',
+            'user.name=Local QA',
+            '-c',
+            'user.email=qa@example.invalid',
+            '-c',
+            'commit.gpgsign=false',
+            'commit',
+            '-m',
+            'nested fixture',
+        ],
     ]:
         subprocess.run([git, *arguments], cwd=tmp_path, check=True, capture_output=True, timeout=20)
     path.write_text('{"components":[{"id":"n","provider":"p","config":{}}]}', encoding='utf-8')
@@ -659,6 +669,20 @@ def test_excessive_historical_nesting_cli_errors(tmp_path, exit_zero):
         new_leaf=None,
         depth=981,
     )
+
+
+@pytest.mark.asyncio
+async def test_internal_value_error_is_not_reported_as_bad_input(tmp_path, monkeypatch):
+    # A ValueError from the comparison is a bug, not a usage error: it must keep
+    # its traceback instead of becoming a one-line exit-2 "Error:".
+    a = _write_pipe(tmp_path, 'a.pipe', _old_pipe())
+
+    def _broken(*_args, **_kwargs):
+        raise ValueError('internal bug')
+
+    monkeypatch.setattr(diff_module, 'diff_pipes', _broken)
+    with pytest.raises(ValueError, match='internal bug'):
+        await _run(_diff_args([a, a]))
 
 
 @pytest.mark.asyncio

@@ -91,7 +91,7 @@ rocketride diff --git <ref> <file.pipe> [--include-layout] [--json | --markdown]
 | Flag | Description |
 | --- | --- |
 | `<old.pipe> <new.pipe>` | The two files to compare (positional, old first). Pass exactly one file with `--git` instead. |
-| `--git <ref>` | Diff the working-tree `FILE` against `<ref>` via `git show <ref>:<FILE>`, looking the file up under the path given. `<ref>` is any revision git accepts — a commit SHA, branch, tag, `HEAD`, `HEAD~1`, `origin/main` — and must not be empty. If the file does not exist in `<ref>`, everything is reported as added, plus a version change from `null` when the file has a `version`, and `layout changed` when its `viewport` is non-empty. A symlink committed as a symlink is compared through its target; on a case-insensitive filesystem, a differently cased spelling of a tracked file is compared against that file. |
+| `--git <ref>` | Diff the working-tree `FILE` against `<ref>` via `git show <ref>:<FILE>`, looking the file up under the path given. `<ref>` is any revision git accepts — a commit SHA, branch, tag, `HEAD`, `HEAD~1`, `origin/main` — and must not be empty. If the file does not exist in `<ref>`, everything is reported as added, plus a version change from `null` when the file has a `version`, and `layout changed` when its `viewport` is non-empty. A symlink committed as a symlink is compared through the target it had at `<ref>` (a target outside the repository is an error); on a case-insensitive filesystem, a differently cased spelling of a tracked file or of its directories is compared against that file. |
 | `--include-layout` | Enumerate the layout churn that is hidden by default — each node's `ui` block as `ui.*` changes on that node, and the top-level `viewport` as `viewport.*` changes — and count it, so a layout-only edit then exits `1`. |
 | `--json` | Emit a single JSON document to stdout (mutually exclusive with `--markdown`). |
 | `--markdown` | Emit compact, PR-comment-friendly Markdown to stdout (mutually exclusive with `--json`). |
@@ -100,7 +100,9 @@ rocketride diff --git <ref> <file.pipe> [--include-layout] [--json | --markdown]
 **Exit codes:** `0` no semantic changes (or any successful run with
 `--exit-zero`); `1` semantic changes were found; `2` usage error, or an
 unreadable / unparseable file, or a bad git ref. Errors always go to stderr, so
-`--json` and `--markdown` output on stdout stays pure.
+`--json` and `--markdown` output on stdout stays pure. `diff` reads no
+configuration, so unlike the connected commands it does not load the workspace
+`.env`.
 
 Non-JSON constants (`NaN`, `Infinity`, `-Infinity`), numeric overflow, and
 nonzero values that underflow to zero are rejected with exit `2`. Fractional
@@ -225,13 +227,18 @@ _Layout (ui/viewport) changed._
 Values reaching the Markdown report are untrusted `.pipe` content, so every value
 is wrapped in a code span whose fence is longer than any backtick run inside it,
 and pipes are escaped so a value cannot split the table row or break out of the
-comment. Node and edge add/remove signs are also code-spanned, preserving the
-visible `+` or `-` beside each identity after GitHub renders the list.
+comment. Control characters and the Unicode bidi and line-separator controls are
+written as `\uNNNN`-style escapes, so a crafted value cannot reorder what the
+reviewer sees in the rendered comment. Node and edge add/remove signs are also
+code-spanned, preserving the visible `+` or `-` beside each identity after
+GitHub renders the list.
 
 In every format but JSON, strings print bare and other values use JSON spelling
-(`true`, `null`, `{"k": "v"}`). An empty string prints as `""`, and when a change
-crosses types (`512` → `"512"`) strings are JSON-quoted so the two sides never
-look alike.
+(`true`, `null`, `{"k": "v"}`). A string is JSON-quoted when bare text would
+misread it: when it is empty (`""`), has leading or trailing whitespace, or
+would itself read as a JSON value (`"true"`, `"512"`). When the two sides of a
+change would still look alike, because they cross types or differ only in
+whitespace or escaped characters, both are JSON-quoted.
 
 ## Review pipelines like code in CI
 
