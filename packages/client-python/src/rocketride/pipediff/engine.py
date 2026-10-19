@@ -104,6 +104,9 @@ def load_pipe(path_or_obj: str | os.PathLike[str] | dict) -> dict:
             wiring is not a list of well-formed wire objects.
     """
     if isinstance(path_or_obj, dict):
+        # An in-memory dict never went through the JSON decoder's numeric
+        # callbacks, so it alone needs the finite-number walk.
+        _validate_finite_numbers(path_or_obj, '<dict>')
         return _validate_pipe(path_or_obj, '<dict>')
 
     if isinstance(path_or_obj, (str, os.PathLike)):
@@ -156,29 +159,43 @@ def _reject_json_constant(literal: str) -> None:
     raise ValueError(f'non-JSON numeric constant {literal!r}')
 
 
-def _validate_finite_numbers(obj: dict, source: str) -> None:
-    """Reject nonfinite floats in parsed dictionaries without recursive walks.
+def _validate_finite_numbers(obj: Any, source: str) -> None:
+    """Reject nonfinite floats in an in-memory pipe without recursive walks.
 
     ``load_pipe`` also accepts in-memory objects, bypassing the JSON decoder's
     numeric callbacks. Traverse all fields, including layout/ignored metadata,
     so such callers cannot introduce non-JSON numbers into a later report. A
     seen set also keeps shared or cyclic in-memory containers from looping.
+
+    Each pending value carries only a link to its parent's breadcrumb, and the
+    readable path is built for the one value that fails. Building every path up
+    front made memory grow with depth squared (about 200 MB for a 2 MB pipe of
+    deep, wide, long-keyed config).
     """
-    pending = [(obj, '$')]
+    pending: list[tuple[Any, Any]] = [(obj, None)]
     seen = set()
     while pending:
-        value, path = pending.pop()
+        value, crumb = pending.pop()
         if isinstance(value, float) and not math.isfinite(value):
-            raise PipeDiffError(f'{source}: non-finite number at {path}')
+            raise PipeDiffError(f'{source}: non-finite number at {_crumb_path(crumb)}')
         if isinstance(value, (dict, list)):
             identity = id(value)
             if identity in seen:
                 continue
             seen.add(identity)
             if isinstance(value, dict):
-                pending.extend((child, f'{path}.{key}') for key, child in value.items())
+                pending.extend((child, (crumb, f'.{key}')) for key, child in value.items())
             else:
-                pending.extend((child, f'{path}[{index}]') for index, child in enumerate(value))
+                pending.extend((child, (crumb, index)) for index, child in enumerate(value))
+
+
+def _crumb_path(crumb: Any) -> str:
+    """Spell a breadcrumb chain from :func:`_validate_finite_numbers` as ``$.a[0].b``."""
+    parts = []
+    while crumb is not None:
+        crumb, step = crumb
+        parts.append(f'[{step}]' if isinstance(step, int) else step)
+    return '$' + ''.join(reversed(parts))
 
 
 def _validate_pipe(obj: Any, source: str) -> dict:
@@ -200,7 +217,6 @@ def _validate_pipe(obj: Any, source: str) -> dict:
     """
     if not isinstance(obj, dict):
         raise PipeDiffError(f'{source}: pipe must be a JSON object, got {type(obj).__name__}')
-    _validate_finite_numbers(obj, source)
     components = obj.get('components')
     if not isinstance(components, list):
         raise PipeDiffError(f"{source}: pipe is missing a 'components' list")
@@ -411,7 +427,22 @@ def diff_pipes(old: dict, new: dict, *, include_layout: bool = False) -> PipeDif
     Returns:
         A :class:`PipeDiff` describing every node, edge, version, and layout
         difference between ``old`` and ``new``.
+
+    Raises:
+        PipeDiffError: If the pipelines nest too deeply to compare, including a
+            cyclic in-memory config that :func:`load_pipe` accepted.
     """
+    # The comparison recurses through nested config, so very deep or cyclic
+    # in-memory values exhaust the interpreter's recursion limit. Report that as
+    # the library's own error instead of a raw RecursionError.
+    try:
+        return _diff_pipes(old, new, include_layout)
+    except RecursionError as exc:
+        raise PipeDiffError('Pipeline nesting is too deep to compare') from exc
+
+
+def _diff_pipes(old: dict, new: dict, include_layout: bool) -> PipeDiff:
+    """Compute the diff for :func:`diff_pipes`, which converts recursion failures."""
     old_components = _components_by_id(old)
     new_components = _components_by_id(new)
     old_ids = set(old_components)
