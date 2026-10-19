@@ -549,6 +549,25 @@ class TestRenderMarkdown(unittest.TestCase):
         self.assertIn('<code>&quot;&quot;</code> → <code>x` [click]', html)
         self.assertIn('**Version:** `""` →', out)
 
+    def test_values_that_render_alike_in_markdown_stay_distinguishable(self) -> None:
+        # _md_code folds line breaks to spaces, so `a\nb` and `a b` rendered the
+        # same; such pairs are JSON-quoted in every Markdown location.
+        diff = PipeDiff(
+            node_changes=[
+                NodeChange(
+                    id='n1',
+                    kind='config',
+                    field_changes=[FieldChange(path='config.s', kind='changed', old='a\nb', new='a b')],
+                ),
+                NodeChange(id='n2', kind='provider', provider_old='p\nq', provider_new='p q'),
+            ],
+            version_change=('1\n2', '1 2'),
+        )
+        out = render_markdown(diff)
+        self.assertIn('| `n1` | `config.s` | `"a\\nb"` → `"a b"` |', out)
+        self.assertIn('- ~ `n2` provider: `"p\\nq"` → `"p q"`', out)
+        self.assertIn('**Version:** `"1\\n2"` → `"1 2"`', out)
+
     def test_md_code_never_emits_an_empty_code_span(self) -> None:
         from rocketride.pipediff.reporters import _md_code
 
