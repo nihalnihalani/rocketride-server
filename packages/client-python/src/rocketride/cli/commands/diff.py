@@ -174,7 +174,7 @@ def _render(args, diff: Any) -> str:
         The fully rendered report string for printing to stdout.
     """
     if getattr(args, 'json', False):
-        return json.dumps(render_json(diff), indent=2, ensure_ascii=False, sort_keys=True)
+        return json.dumps(render_json(diff), indent=2, ensure_ascii=False, sort_keys=True, allow_nan=False)
     if getattr(args, 'markdown', False):
         return render_markdown(diff)
     return render_human(diff, use_color=_should_use_color(sys.stdout))
@@ -209,22 +209,17 @@ async def run_diff(args) -> int:
     include_layout = bool(getattr(args, 'include_layout', False))
 
     try:
-        resolved = _resolve_inputs(args)
-    except ValueError as exc:
-        return _fail(str(exc))
-    except PipeDiffError as exc:
-        return _fail(str(exc))
-
-    old_obj, new_obj = resolved
-
-    try:
+        old_obj, new_obj = _resolve_inputs(args)
         diff = diff_pipes(old_obj, new_obj, include_layout=include_layout)
-    except PipeDiffError as exc:
+        # Build the complete report before writing stdout: loading, comparison
+        # and rendering can each exceed Python's recursion limit for deep JSON.
+        report = _render(args, diff)
+        code = 0 if getattr(args, 'exit_zero', False) else (1 if diff.has_semantic_changes else 0)
+    except (PipeDiffError, ValueError) as exc:
         return _fail(str(exc))
+    except RecursionError:
+        return _fail('Pipeline nesting is too deep to load, compare, or render; reduce nested values')
 
     # Report output goes to stdout only; nothing above this point wrote there.
-    print(_render(args, diff))
-
-    if getattr(args, 'exit_zero', False):
-        return 0
-    return 1 if diff.has_semantic_changes else 0
+    print(report)
+    return code

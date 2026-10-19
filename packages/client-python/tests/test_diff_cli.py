@@ -28,9 +28,9 @@ driving it through the same pinned engine and reporters the CLI uses in
 production. The command is fully local (no server, no auth), so no client fixture
 or network mock is needed; the only external dependency stubbed here is
 ``resolve_git_ref`` for ``--git`` mode, patched in the command's own module
-namespace the same way the engine test suite stubs subprocess. (``--git``
-against a real temporary repository is covered by
-``test_pipediff_gitref.py::test_resolve_git_ref_real_repository``.)
+namespace the same way the engine test suite stubs subprocess. Nesting-error
+regressions additionally execute real CLI subprocesses against real files and
+temporary Git history, without mocking the failing load/compare/render path.
 
 Coverage mirrors the product contract:
     - two-file happy path (semantic changes -> exit 1)
@@ -50,6 +50,11 @@ Coverage mirrors the product contract:
 import argparse
 import importlib
 import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -447,6 +452,171 @@ async def test_exit_zero_does_not_mask_errors(tmp_path, capsys):
     assert code == 2
     assert captured.out == ''
     assert 'Error:' in captured.err
+
+
+def _nested_pipe_json(depth, leaf=0):
+    """Construct real nested JSON without depending on the encoder's limit."""
+    return '{"components":[{"id":"n","provider":"p","config":{"deep":' + '[' * depth + str(leaf) + ']' * depth + '}}]}'
+
+
+def _cli_subprocess(tmp_path, arguments):
+    """Run the actual CLI entry point using the package selected by this suite."""
+    env = {key: value for key, value in os.environ.items() if not key.startswith('ROCKETRIDE_')}
+    # pytest's in-process sys.path is not inherited by subprocesses. Pin the
+    # child's import root to this suite's actual package, including wheel runs.
+    env['PYTHONPATH'] = str(Path(diff_module.__file__).resolve().parents[3])
+    return subprocess.run(
+        [
+            sys.executable,
+            '-c',
+            'import sys; from rocketride.cli.main import main; sys.setrecursionlimit(1000); main()',
+            'diff',
+            *arguments,
+        ],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+
+
+def _assert_nested_cli_result(result, *, exit_zero, path, kind, old_leaf, new_leaf, depth=0, require_error=False):
+    """Require a clean resource error or an accurate, strictly valid JSON report."""
+    assert 'Traceback' not in result.stderr
+    if result.returncode == 2:
+        assert result.stdout == ''
+        assert 'Error:' in result.stderr
+        assert 'nest' in result.stderr.lower()
+        return
+    assert not require_error
+    assert result.returncode == (0 if exit_zero else 1)
+    assert result.stderr == ''
+
+    def reject_constant(token):
+        raise ValueError(f'Non-JSON constant {token}')
+
+    # The child has a controlled 1000-frame budget. The parent may have deeper
+    # pytest frames and must still be able to inspect a valid supported result.
+    previous_limit = sys.getrecursionlimit()
+    try:
+        sys.setrecursionlimit(max(previous_limit, 10000))
+        doc = json.loads(result.stdout, parse_constant=reject_constant)
+    finally:
+        sys.setrecursionlimit(previous_limit)
+    assert doc['summary']['has_semantic_changes'] is True
+    assert doc['summary']['config_changes'] == 1
+    assert doc['summary']['nodes_changed'] == 1
+    assert doc['nodes']['added'] == []
+    assert doc['nodes']['removed'] == []
+    assert doc['edges'] == {'added': [], 'removed': []}
+    assert len(doc['nodes']['changed']) == 1
+    node = doc['nodes']['changed'][0]
+    assert node['id'] == 'n'
+    assert node['provider_change'] is None
+    assert len(node['config_changes']) == 1
+    field = node['config_changes'][0]
+    assert field['path'] == path
+    assert field['kind'] == kind
+    for key, expected in [('old', old_leaf), ('new', new_leaf)]:
+        value = field[key]
+        if expected is not None:
+            for _ in range(depth):
+                assert isinstance(value, list) and len(value) == 1
+                value = value[0]
+        assert type(value) is type(expected)
+        assert value == expected
+
+
+@pytest.mark.parametrize('depth', [981, 2000])
+@pytest.mark.parametrize('side', ['old', 'new'])
+@pytest.mark.parametrize('exit_zero', [False, True])
+def test_excessive_nesting_cli_errors(tmp_path, depth, side, exit_zero):
+    # Under the pinned child resource budget, 2000 exceeds JSON loading limits.
+    # Historical depth 981 may be supported by another interpreter; a correct
+    # report is allowed, while a traceback masquerading as exit 1 is not.
+    ordinary = tmp_path / 'ordinary.pipe'
+    ordinary.write_text('{"components":[{"id":"n","provider":"p","config":{}}]}', encoding='utf-8')
+    nested = tmp_path / 'nested.pipe'
+    nested.write_text(_nested_pipe_json(depth), encoding='utf-8')
+    paths = [str(nested), str(ordinary)] if side == 'old' else [str(ordinary), str(nested)]
+    result = _cli_subprocess(tmp_path, [*paths, '--json', *(['--exit-zero'] if exit_zero else [])])
+
+    _assert_nested_cli_result(
+        result,
+        exit_zero=exit_zero,
+        path='config.deep',
+        kind='removed' if side == 'old' else 'added',
+        old_leaf=0 if side == 'old' else None,
+        new_leaf=0 if side == 'new' else None,
+        depth=depth,
+        require_error=depth == 2000,
+    )
+
+
+@pytest.mark.parametrize('exit_zero', [False, True])
+def test_excessive_comparison_nesting_cli_errors(tmp_path, exit_zero):
+    # Both values decode within the JSON limit, but their recursive comparison
+    # requires more frames than loading a single value or reporting an add.
+    old = tmp_path / 'old.pipe'
+    new = tmp_path / 'new.pipe'
+    old.write_text(_nested_pipe_json(600, 0), encoding='utf-8')
+    new.write_text(_nested_pipe_json(600, 1), encoding='utf-8')
+
+    result = _cli_subprocess(tmp_path, [str(old), str(new), '--json', *(['--exit-zero'] if exit_zero else [])])
+
+    _assert_nested_cli_result(
+        result,
+        exit_zero=exit_zero,
+        path='config.deep' + '[0]' * 600,
+        kind='changed',
+        old_leaf=0,
+        new_leaf=1,
+    )
+
+
+@pytest.mark.parametrize('exit_zero', [False, True])
+def test_excessive_historical_nesting_cli_errors(tmp_path, exit_zero):
+    git = shutil.which('git')
+    if git is None:
+        pytest.skip('git is unavailable')
+    path = tmp_path / 'pipeline.pipe'
+    path.write_text(_nested_pipe_json(981), encoding='utf-8')
+    for arguments in [
+        ['init'],
+        ['add', 'pipeline.pipe'],
+        ['-c', 'user.name=Local QA', '-c', 'user.email=qa@example.invalid', 'commit', '-m', 'nested fixture'],
+    ]:
+        subprocess.run([git, *arguments], cwd=tmp_path, check=True, capture_output=True, timeout=20)
+    path.write_text('{"components":[{"id":"n","provider":"p","config":{}}]}', encoding='utf-8')
+
+    result = _cli_subprocess(tmp_path, ['--git', 'HEAD', str(path), '--json', *(['--exit-zero'] if exit_zero else [])])
+
+    _assert_nested_cli_result(
+        result,
+        exit_zero=exit_zero,
+        path='config.deep',
+        kind='removed',
+        old_leaf=0,
+        new_leaf=None,
+        depth=981,
+    )
+
+
+@pytest.mark.asyncio
+async def test_json_renderer_rejects_nonfinite_output(tmp_path, capsys, monkeypatch):
+    # Defense in depth: even an unexpected reporter value must never produce an
+    # Infinity token or leak json.dumps' ValueError as an exit-1 traceback.
+    path = _write_pipe(tmp_path, 'ordinary.pipe', _old_pipe())
+    monkeypatch.setattr(diff_module, 'render_json', lambda diff: {'unexpected': float('inf')})
+
+    code = await _run(_diff_args([path, path], json=True, exit_zero=True))
+
+    captured = capsys.readouterr()
+    assert code == 2
+    assert captured.out == ''
+    assert 'Error:' in captured.err
+    assert 'JSON compliant' in captured.err
 
 
 # =========================================================================

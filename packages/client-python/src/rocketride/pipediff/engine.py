@@ -57,6 +57,7 @@ Exceptions:
 from __future__ import annotations
 
 import json
+import math
 import os
 from typing import Any
 
@@ -111,13 +112,68 @@ def load_pipe(path_or_obj: str | os.PathLike[str] | dict) -> dict:
             raise PipeDiffError(f'{source} is not valid UTF-8: {exc}') from exc
         except OSError as exc:
             raise PipeDiffError(f'Could not read pipe file {source}: {exc}') from exc
-        try:
-            obj = json.loads(text)
-        except json.JSONDecodeError as exc:
-            raise PipeDiffError(f'Invalid JSON in {source}: {exc}') from exc
-        return _validate_pipe(obj, source)
+        return _parse_pipe_json(text, source)
 
     raise PipeDiffError(f'load_pipe expects a path or dict, got {type(path_or_obj).__name__}')
+
+
+def _parse_pipe_json(text: str, source: str) -> dict:
+    """Parse file/Git JSON with one numeric policy and source-aware errors.
+
+    JSON integer values retain Python's exact integer representation. Fractional
+    and exponent literals use finite binary64 floats, including normal rounding;
+    overflow and conversion of a nonzero value to zero are rejected rather than
+    silently collapsing distinct input values or emitting invalid JSON later.
+    """
+    try:
+        obj = json.loads(text, parse_float=_parse_finite_float, parse_constant=_reject_json_constant)
+    except (ValueError, RecursionError) as exc:
+        raise PipeDiffError(f'Invalid JSON in {source}: {exc}') from exc
+    return _validate_pipe(obj, source)
+
+
+def _parse_finite_float(literal: str) -> float:
+    """Keep supported float rounding while rejecting overflow/zero-underflow."""
+    number = float(literal)
+    if not math.isfinite(number):
+        raise ValueError(f'numeric literal {literal!r} is outside the supported finite float range')
+    # Check the coefficient rather than the exponent: 0e-9999 and -0e9999 are
+    # legitimate zero values, while a nonzero coefficient that becomes 0.0 has
+    # underflowed. No Decimal object or alternate numeric type reaches reporters.
+    coefficient = literal.lower().split('e', 1)[0]
+    if number == 0.0 and any(digit in '123456789' for digit in coefficient):
+        raise ValueError(f'numeric literal {literal!r} underflows the supported finite float range')
+    return number
+
+
+def _reject_json_constant(literal: str) -> None:
+    """Reject Python's permissive NaN/Infinity extensions to JSON syntax."""
+    raise ValueError(f'non-JSON numeric constant {literal!r}')
+
+
+def _validate_finite_numbers(obj: dict, source: str) -> None:
+    """Reject nonfinite floats in parsed dictionaries without recursive walks.
+
+    ``load_pipe`` also accepts in-memory objects, bypassing the JSON decoder's
+    numeric callbacks. Traverse all fields, including layout/ignored metadata,
+    so such callers cannot introduce non-JSON numbers into a later report. A
+    seen set also keeps shared or cyclic in-memory containers from looping.
+    """
+    pending = [(obj, '$')]
+    seen = set()
+    while pending:
+        value, path = pending.pop()
+        if isinstance(value, float) and not math.isfinite(value):
+            raise PipeDiffError(f'{source}: non-finite number at {path}')
+        if isinstance(value, (dict, list)):
+            identity = id(value)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            if isinstance(value, dict):
+                pending.extend((child, f'{path}.{key}') for key, child in value.items())
+            else:
+                pending.extend((child, f'{path}[{index}]') for index, child in enumerate(value))
 
 
 def _validate_pipe(obj: Any, source: str) -> dict:
@@ -139,6 +195,7 @@ def _validate_pipe(obj: Any, source: str) -> dict:
     """
     if not isinstance(obj, dict):
         raise PipeDiffError(f'{source}: pipe must be a JSON object, got {type(obj).__name__}')
+    _validate_finite_numbers(obj, source)
     components = obj.get('components')
     if not isinstance(components, list):
         raise PipeDiffError(f"{source}: pipe is missing a 'components' list")

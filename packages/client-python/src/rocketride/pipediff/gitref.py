@@ -40,11 +40,10 @@ Functions:
 
 from __future__ import annotations
 
-import json
 import os
 import subprocess
 
-from .engine import PipeDiffError, load_pipe
+from .engine import PipeDiffError, _parse_pipe_json
 
 # Upper bound so a wedged git process can never hang the CLI indefinitely.
 _GIT_TIMEOUT_SECONDS = 30
@@ -111,11 +110,7 @@ def resolve_git_ref(ref: str, file_path: str) -> dict | None:
     if result.returncode != 0:
         raise PipeDiffError(f'git show {spec} failed: {result.stderr.strip()}')
 
-    try:
-        obj = json.loads(result.stdout)
-    except json.JSONDecodeError as exc:
-        raise PipeDiffError(f'Invalid JSON in {spec}: {exc}') from exc
-    return load_pipe(obj)
+    return _parse_pipe_json(result.stdout, spec)
 
 
 def _repository_root(file_dir: str, file_path: str) -> str:
