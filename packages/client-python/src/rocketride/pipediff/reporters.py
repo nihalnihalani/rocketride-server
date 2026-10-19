@@ -273,7 +273,8 @@ def _fmt_pair(old: Any, new: Any, escape: Any = None) -> Tuple[str, str]:
     and the empty string). In those cases strings are JSON-quoted instead, so the
     type change stays visible; same-type string edits keep the compact form.
 
-    ``escape`` is the renderer's escaping (``_term_safe`` for the terminal). The
+    ``escape`` is the renderer's escaping (``_term_safe`` for the terminal,
+    ``_md_code`` for Markdown, which folds line breaks to spaces). The
     two sides are compared *after* it, because escaping can make them collide:
     U+202E and the literal text ``\\u202e`` both print as ``\\u202e``. JSON
     quoting then escapes the backslash, which keeps them apart.
@@ -681,7 +682,7 @@ def _md_field_change(field_change: Any) -> str:
         return f'{_MD_ADDED} {_md_code(_fmt_value(field_change.new))}'
     if field_change.kind == 'removed':
         return f'{_MD_REMOVED} {_md_code(_fmt_value(field_change.old))}'
-    old, new = _fmt_pair(field_change.old, field_change.new)
+    old, new = _fmt_pair(field_change.old, field_change.new, _md_code)
     return f'{_md_code(old)} → {_md_code(new)}'
 
 
@@ -734,7 +735,7 @@ def render_markdown(diff: 'PipeDiff', *, title: Optional[str] = None) -> str:
         for node_id, provider in org['nodes_removed']:
             lines.append(f'- {_md_code(_MD_REMOVED)} {_md_code(node_id)} ({_md_code(_fmt_value(provider))})')
         for entry in provider_changed:
-            provider_old, provider_new = _fmt_pair(entry['provider_old'], entry['provider_new'])
+            provider_old, provider_new = _fmt_pair(entry['provider_old'], entry['provider_new'], _md_code)
             lines.append(
                 f'- {_MD_CHANGED} {_md_code(entry["id"])} provider: {_md_code(provider_old)} → {_md_code(provider_new)}'
             )
@@ -765,7 +766,7 @@ def render_markdown(diff: 'PipeDiff', *, title: Optional[str] = None) -> str:
 
     # --- Version / Layout ---
     if org['version_change']:
-        old, new = (_md_code(text) for text in _fmt_pair(*org['version_change']))
+        old, new = (_md_code(text) for text in _fmt_pair(*org['version_change'], _md_code))
         lines.append('')
         lines.append(f'**Version:** {old} → {new}')
 
