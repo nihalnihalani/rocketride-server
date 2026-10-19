@@ -406,8 +406,22 @@ def test_clickhouse_cuts_a_mutation_while_processing_echo(base, message, expecte
             'Error 38: DB::Exception: Cannot parse date',
             ['QA_CANARY_'],
         ),
+        # INSERT INTO t (n, s) VALUES ($1, $2, $3), ($4, $5) -- an extra value in row 1
+        (
+            "DB::Exception: Cannot parse expression of type String here: 'QA_CANARY_ROW1', 'QA_CANARY_EXTRA'), "
+            "(70022, 'QA_CANARY_ROW2'): While executing ValuesBlockInputFormat",
+            'Error 62: DB::Exception: Cannot parse expression of type String',
+            ['QA_CANARY_ROW1', 'QA_CANARY_EXTRA', 'QA_CANARY_ROW2'],
+        ),
+        # INSERT INTO t (n, s) VALUES ($1, $2, ($3, $4) -- row 1 not closed
+        (
+            "DB::Exception: Cannot parse expression of type String here: 'QA_CANARY_ROW1', (70022, 'QA_CANARY_ROW2'): "
+            'While executing ValuesBlockInputFormat',
+            'Error 62: DB::Exception: Cannot parse expression of type String',
+            ['QA_CANARY_ROW1', 'QA_CANARY_ROW2'],
+        ),
     ],
-    ids=['values-row-2', 'values-row-1', 'todate'],
+    ids=['values-row-2', 'values-row-1', 'todate', 'values-extra-value', 'values-row-not-closed'],
 )
 def test_clickhouse_cuts_the_input_a_parser_prints_after_here(base, message, expected, canaries):
     """A parser that stopped prints the rest of its input after `` here: ``.
@@ -422,6 +436,73 @@ def test_clickhouse_cuts_the_input_a_parser_prints_after_here(base, message, exp
     assert result == expected
     for canary in canaries:
         assert canary not in result
+
+
+@pytest.mark.parametrize(
+    ('message', 'expected', 'canaries'),
+    [
+        # INSERT INTO t (n, s) VALUES ($1, $2) ON DUPLICATE KEY UPDATE s = $3 -- another dialect's upsert
+        (
+            "DB::Exception: Cannot parse input: expected '(' before: 'ON DUPLICATE KEY UPDATE s = \\'QA_CANARY_UPSERT_S2\\'':  at row 1: While executing ValuesBlockInputFormat. ",
+            "Error 27: DB::Exception: Cannot parse input: expected '('",
+            ['QA_CANARY_UPSERT_S2'],
+        ),
+        # INSERT INTO t (n, s) VALUES ($1, $2), $3, $4 -- second row without parentheses
+        (
+            "DB::Exception: Cannot parse input: expected '(' before: '70022, \\'QA_CANARY_ROW2\\'':  at row 1: While executing ValuesBlockInputFormat. ",
+            "Error 27: DB::Exception: Cannot parse input: expected '('",
+            ['QA_CANARY_ROW2', '70022'],
+        ),
+        # INSERT INTO t (n, s) VALUES ($1, $2) ON CONFLICT (n) DO UPDATE SET s = $3
+        (
+            "DB::Exception: Cannot parse input: expected '(' before: 'ON CONFLICT (n) DO UPDATE SET s = \\'QA_CANARY_PGUP_S2\\'':  at row 1: While executing ValuesBlockInputFormat. ",
+            "Error 27: DB::Exception: Cannot parse input: expected '('",
+            ['QA_CANARY_PGUP_S2'],
+        ),
+        # INSERT INTO t (n, s) VALUES ($1, $2) ON DUPLICATE KEY UPDATE s = $3, with a 300-character $3
+        (
+            "DB::Exception: Cannot parse input: expected '(' before: 'ON DUPLICATE KEY UPDATE s = \\'QA_CANARY_LONG_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx':  at row 1: While executing ValuesBlockInputFormat. ",
+            "Error 27: DB::Exception: Cannot parse input: expected '('",
+            ['QA_CANARY_LONG_'],
+        ),
+        # INSERT INTO t (n, s) FORMAT CSV $1,$2\nabc,$3\n -- bad UInt32 in row 2
+        (
+            'DB::Exception: Cannot parse input: expected \',\' before: \'abc,\\\'QA_CANARY_ROW2\\\'\\n\': (at row 2)\n: \nRow 1:\nColumn 0,   name: n, type: UInt32, parsed text: "70011"\nColumn 1,   name: s, type: String, parsed text: "<SINGLE QUOTE>QA_CANARY_ROW1<SINGLE QUOTE>"\n\nRow 2:\nColumn 0,   name: n, type: UInt32, ERROR: text "abc,<SINGLE QUOTE>QA_CA" is not like UInt32\n\n: While executing ParallelParsingBlockInputFormat. ',
+            "Error 27: DB::Exception: Cannot parse input: expected ','",
+            ['QA_CANARY_ROW1', 'QA_CANARY_ROW2', '70011'],
+        ),
+    ],
+    ids=['mysql-upsert', 'row-without-parentheses', 'postgres-upsert', 'truncated-tail', 'format-csv'],
+)
+def test_clickhouse_cuts_the_input_a_parser_prints_after_before(base, message, expected, canaries):
+    """A row that is not followed by ``,`` or ``(`` echoes the rest of the input after `` before: '``.
+
+    Code 27 (CANNOT_PARSE_INPUT_ASSERTION_FAILED) quotes every later bound
+    value, and for ``FORMAT CSV`` adds per-row ``parsed text`` lines that
+    repeat the earlier rows' values too.
+    """
+    result = base._format_db_error(_clickhouse(27, message.rstrip('. ')))
+
+    assert result == expected
+    for canary in canaries:
+        assert canary not in result
+
+
+def test_clickhouse_cuts_the_before_echo_over_the_mysql_wire(base):
+    """The same echo through ClickHouse's MySQL interface, as pymysql's ``(errno, message)``.
+
+    ``INSERT INTO t (n, s) VALUES (%s, %s) ON DUPLICATE KEY UPDATE s = %s``
+    on port 9004.
+    """
+    exc = _mysql(
+        27,
+        "Code: 27. DB::Exception: Cannot parse input: expected '(' before: 'ON DUPLICATE KEY UPDATE s = \\'QA_CANARY_UPSERT_S2\\'':  at row 1: While executing ValuesBlockInputFormat. (CANNOT_PARSE_INPUT_ASSERTION_FAILED) (version 25.8.33.6 (official build))",
+    )
+
+    result = base._format_db_error(exc)
+
+    assert result == "Error 27: DB::Exception: Cannot parse input: expected '('"
+    assert 'QA_CANARY_UPSERT_S2' not in result
 
 
 def test_clickhouse_cuts_a_function_call_scope_echo(base):
