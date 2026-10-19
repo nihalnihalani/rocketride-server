@@ -205,6 +205,36 @@ class DatabaseInstanceBase(IInstanceBase, ABC):
         can branch on the underlying engine (dialect-specific SQL, type coercion, etc.).
         """
 
+    def _sessionsAreTransactions(self) -> bool:
+        """Return whether a ``begin`` session is a database transaction on this dialect.
+
+        Not on ClickHouse: clickhouse-sqlalchemy's native connector makes
+        ``commit`` and ``rollback`` no-ops and ClickHouse has no savepoints, so
+        a session only reserves a connection, and every statement sent on it
+        is executed when it is sent. The session tools' descriptions read this,
+        so that no agent is told its work can be rolled back when it cannot.
+        """
+        return self._db_dialect() != 'clickhouse'
+
+    def _sessionRecoveryPolicy(self) -> str:
+        """Return the ``execute`` description's sentence on a session after a failed statement.
+
+        The error text carries no recovery advice -- both execute paths report
+        a failure byte-identically -- so this sentence is where an agent learns
+        it.
+        """
+        if not self._sessionsAreTransactions():
+            return (
+                'A failed statement inside a session_id leaves the session open. A session opens no '
+                'ClickHouse transaction, so it undoes nothing: every statement is executed when it is '
+                'sent, rollback discards nothing, and savepoints do not exist.'
+            )
+        return (
+            'A failed statement inside a session_id rolls nothing back and leaves the session open: '
+            'recover with rollback, or rollback to savepoint <name>, before sending more work on that '
+            'session. On PostgreSQL the transaction stays aborted until you do, and commit is refused.'
+        )
+
     # ------------------------------------------------------------------
     # Reflection lock
     # ------------------------------------------------------------------
@@ -424,10 +454,7 @@ class DatabaseInstanceBase(IInstanceBase, ABC):
         },
         description=lambda self: (
             f'Execute a raw SQL statement against this {self._db_display_name()} database. '
-            f'Bypasses LLM translation and SQL safety checks. '
-            f'A failed statement inside a session_id rolls nothing back and leaves the session open: '
-            f'recover with rollback, or rollback to savepoint <name>, before sending more work on that '
-            f'session. On PostgreSQL the transaction stays aborted until you do, and commit is refused.'
+            f'Bypasses LLM translation and SQL safety checks. {self._sessionRecoveryPolicy()}'
         ),
     )
     def execute(self, args):
@@ -472,6 +499,8 @@ class DatabaseInstanceBase(IInstanceBase, ABC):
                 # transactions — and the idle reaper is the backstop for abandoned
                 # sessions. Committing an aborted transaction would degrade to a
                 # silent ROLLBACK, so the registry refuses it and raises instead.
+                # ClickHouse has no transaction to recover at all; see
+                # `_sessionRecoveryPolicy`.
                 #
                 # That policy is NOT appended to this message. The two execute
                 # paths report a driver failure with the same bytes -- the
@@ -522,6 +551,9 @@ class DatabaseInstanceBase(IInstanceBase, ABC):
         output_schema={'type': 'object', 'properties': {'session_id': {'type': 'string'}}},
         description=lambda self: (
             f'Begin a transaction on this {self._db_display_name()} database; returns a session_id.'
+            if self._sessionsAreTransactions()
+            else f'Reserve a connection on this {self._db_display_name()} database; returns a session_id. '
+            f'It opens no transaction: statements sent with the session_id are executed when they are sent.'
         ),
     )
     def begin(self, args):
@@ -537,7 +569,11 @@ class DatabaseInstanceBase(IInstanceBase, ABC):
             'properties': {'session_id': {'type': 'string'}},
         },
         output_schema={'type': 'object', 'properties': {'ok': {'type': 'boolean'}}},
-        description=lambda self: 'Commit an open transaction session.',
+        description=lambda self: (
+            'Commit an open transaction session.'
+            if self._sessionsAreTransactions()
+            else 'Close a session. Its statements were already executed when they were sent.'
+        ),
     )
     def commit(self, args):
         """Commit an open transaction session."""
@@ -550,7 +586,11 @@ class DatabaseInstanceBase(IInstanceBase, ABC):
             'properties': {'session_id': {'type': 'string'}},
         },
         output_schema={'type': 'object', 'properties': {'ok': {'type': 'boolean'}}},
-        description=lambda self: 'Roll back an open transaction session.',
+        description=lambda self: (
+            'Roll back an open transaction session.'
+            if self._sessionsAreTransactions()
+            else 'Close a session. This undoes nothing: its statements were already executed when they were sent.'
+        ),
     )
     def rollback(self, args):
         """Roll back an open transaction session."""

@@ -47,9 +47,9 @@ configurable server-name prefix.
 | `refresh_schema` | Re-read the schema, replace the cache, and return it. |
 | `get_sql` | Generate a safe `SELECT` without executing it. |
 | `execute` | Run raw SQL, bypassing LLM translation and the safety check. |
-| `begin` | Open a transaction and return its session ID. |
-| `commit` | Commit and close a transaction session. |
-| `rollback` | Roll back and close a transaction session. |
+| `begin` | Reserve a connection and return its session ID; no transaction is opened. |
+| `commit` | Close a session; its statements were already executed. |
+| `rollback` | Close a session; this undoes nothing. |
 | `dialect` | Return `{ "dialect": "clickhouse" }`. |
 
 `get_data` and `get_sql` require a non-empty `question`; `get_data` accepts an
@@ -101,16 +101,16 @@ arguments and returns
 query execution** is off; unknown or expired session IDs also fail. Invalid
 tool input raises an error.
 
-A failed statement rolls nothing back and leaves the session open. The error
-text is byte-identical with and without a `session_id` and carries no recovery
-advice, so the policy is stated in the `execute` tool description instead.
-Recovery is the client's: issue `rollback` to discard the transaction, or
-`rollback to savepoint <name>` to undo only the failed portion and continue.
-A database that aborts the whole transaction on error (PostgreSQL, not
-ClickHouse) rejects every later statement on that session until one of those
-runs, and the node refuses the commit rather than letting it degrade into a
-silent rollback. The idle reaper is the backstop for a session abandoned
-instead.
+A session opens no ClickHouse transaction. `begin` reserves a connection for
+the `session_id`, but every statement sent on it is executed when it is sent,
+and other connections see its effect without waiting for a `commit`;
+`commit` and `rollback` only close the session, so `rollback` discards
+nothing. Savepoints do not exist either: `SAVEPOINT` is a syntax error, and
+`rollback to savepoint <name>` fails with `unknown savepoint`. To undo a
+write, run a statement that reverses it. A failed statement leaves the
+session open. Its error text is byte-identical with and without a
+`session_id` and carries no advice, so this policy is stated in the `execute`
+tool description instead. The idle reaper closes a session that is abandoned.
 
 ## Configuration
 
