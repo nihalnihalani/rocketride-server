@@ -28,6 +28,7 @@ an isolated temporary repository.
 """
 
 import json
+import os
 import shutil
 import subprocess
 
@@ -452,14 +453,20 @@ def test_symlink_at_the_ref_pointing_outside_the_repository_is_an_error(tmp_path
 
 @pytest.mark.skipif(shutil.which('git') is None, reason='git not installed')
 def test_dotdot_after_a_directory_symlink_follows_the_physical_path(tmp_path):
-    # `lnk/..` is the parent of lnk's target (deep/), as the OS opens it, not the
-    # directory holding lnk; the blob looked up must be the same file.
+    # The blob looked up must be the file the OS opens for this path. On POSIX
+    # `lnk/..` is the parent of lnk's target (deep/), not the directory holding
+    # lnk; Windows folds `..` lexically first and opens the top-level x.pipe.
     (tmp_path / 'deep' / 'sub').mkdir(parents=True)
     (tmp_path / 'x.pipe').write_text(json.dumps(_pipe_with(1)), encoding='utf-8')
     (tmp_path / 'deep' / 'x.pipe').write_text(json.dumps(_pipe_with(7)), encoding='utf-8')
     (tmp_path / 'lnk').symlink_to('deep/sub', target_is_directory=True)
     _init_repo(tmp_path, 'x.pipe', 'deep/x.pipe', 'lnk')
-    assert resolve_git_ref('HEAD', str(tmp_path) + '/lnk/../x.pipe') == _pipe_with(7)
+    path = str(tmp_path) + '/lnk/../x.pipe'
+    with open(path, encoding='utf-8') as handle:
+        opened = json.load(handle)
+    assert resolve_git_ref('HEAD', path) == opened
+    if os.name != 'nt':
+        assert opened == _pipe_with(7)
 
 
 @pytest.mark.skipif(shutil.which('git') is None, reason='git not installed')
