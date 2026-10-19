@@ -510,13 +510,24 @@ def _cli_subprocess(tmp_path, arguments):
     # child's import roots to the packages this suite actually imported,
     # including wheel runs: rocketride itself, and rocketride_common, which
     # conftest.py puts on sys.path in-process when it is not installed (CI).
-    roots = [Path(diff_module.__file__).resolve().parents[3], Path(rocketride_common.__file__).resolve().parents[1]]
-    env['PYTHONPATH'] = os.pathsep.join(dict.fromkeys(str(root) for root in roots))
+    # They go onto sys.path inside the child, not only into PYTHONPATH: in CI
+    # sys.executable is the engine, an isolated interpreter that ignores
+    # PYTHONPATH (PyConfig_InitIsolatedConfig).
+    roots = list(
+        dict.fromkeys(
+            str(root)
+            for root in (
+                Path(diff_module.__file__).resolve().parents[3],
+                Path(rocketride_common.__file__).resolve().parents[1],
+            )
+        )
+    )
+    env['PYTHONPATH'] = os.pathsep.join(roots)
     return subprocess.run(
         [
             sys.executable,
             '-c',
-            'import sys; from rocketride.cli.main import main; sys.setrecursionlimit(1000); main()',
+            f'import sys; sys.path[:0] = {roots!r}; from rocketride.cli.main import main; sys.setrecursionlimit(1000); main()',
             'diff',
             *arguments,
         ],
