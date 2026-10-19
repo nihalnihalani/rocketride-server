@@ -165,13 +165,13 @@ the CI job below posts on the pull request:
 **Pipeline diff:** 1 node added, 2 nodes changed, 2 edges added, 1 edge removed, layout changed
 
 **Nodes**
-- + `reranker_1` (`reranker_cohere`)
+- `+` `reranker_1` (`reranker_cohere`)
 - ~ `llm_1` provider: `llm_openai` → `llm_anthropic`
 
 **Edges**
-- + `qdrant_1` --`documents`--> `reranker_1`
-- + `reranker_1` --`documents`--> `prompt_1`
-- - `qdrant_1` --`documents`--> `prompt_1`
+- `+` `qdrant_1` --`documents`--> `reranker_1`
+- `+` `reranker_1` --`documents`--> `prompt_1`
+- `-` `qdrant_1` --`documents`--> `prompt_1`
 
 **Config**
 

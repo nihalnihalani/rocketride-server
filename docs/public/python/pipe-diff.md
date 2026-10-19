@@ -101,6 +101,17 @@ rocketride diff --git <ref> <file.pipe> [--include-layout] [--json | --markdown]
 unreadable / unparseable file, or a bad git ref. Errors always go to stderr, so
 `--json` and `--markdown` output on stdout stays pure.
 
+Non-JSON constants (`NaN`, `Infinity`, `-Infinity`), numeric overflow, and
+nonzero values that underflow to zero are rejected with exit `2`. Fractional
+and exponent literals use finite IEEE 754 binary64 precision: literals such as
+`0.1` and `0.10000000000000001` round to the same value and compare equal.
+Integer literals retain exact Python integer precision, subject to the JSON
+decoder's size limit. The same rules apply to files read from Git; an
+already-parsed `dict` must also contain only finite floats. Excessive nesting
+that exceeds the parser, comparison, or renderer limit produces an actionable
+error on stderr with exit `2` and no report on stdout. `--exit-zero` does not
+suppress these errors.
+
 `--json` here is a **format flag** — a whole JSON document on stdout — not the
 shared `--json [FILE]` result envelope the connected subcommands use. That
 difference is deliberate: `diff` produces a report, not a command result.
@@ -203,7 +214,8 @@ _Layout (ui/viewport) changed._
 Values reaching the Markdown report are untrusted `.pipe` content, so every value
 is wrapped in a code span whose fence is longer than any backtick run inside it,
 and pipes are escaped so a value cannot split the table row or break out of the
-comment.
+comment. Node and edge add/remove signs are also code-spanned, preserving the
+visible `+` or `-` beside each identity after GitHub renders the list.
 
 ## Review pipelines like code in CI
 

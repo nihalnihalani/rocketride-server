@@ -41,6 +41,7 @@ import html as html_mod
 import json
 import re
 import unittest
+from html.parser import HTMLParser
 from typing import Optional, Tuple
 
 from rocketride.pipediff import EdgeChange, FieldChange, NodeChange, PipeDiff
@@ -99,6 +100,34 @@ def _render_gfm_row(table_markdown: str) -> Tuple[int, Optional[str]]:
     cells = re.findall(r'<td[^>]*>(.*?)</td>', body.group(1) if body else '', re.S)
     code = re.search(r'<code>(.*?)</code>', cells[-1], re.S) if cells else None
     return len(cells), (html_mod.unescape(code.group(1)) if code else None)
+
+
+class _GfmListItems(HTMLParser):
+    """Read the visible list text and nesting from actual cmark-gfm output."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.items = []
+        self._items = []
+        self._depth = 0
+        self.max_depth = 0
+
+    def handle_starttag(self, tag, attrs) -> None:
+        if tag == 'ul':
+            self._depth += 1
+            self.max_depth = max(self.max_depth, self._depth)
+        elif tag == 'li':
+            self._items.append([])
+
+    def handle_data(self, data) -> None:
+        if self._items:
+            self._items[-1].append(data)
+
+    def handle_endtag(self, tag) -> None:
+        if tag == 'ul':
+            self._depth -= 1
+        elif tag == 'li':
+            self.items.append(''.join(self._items.pop()).strip())
 
 
 # Values whose escaping the two tests below both check: Windows paths and regex
@@ -362,6 +391,32 @@ class TestRenderJson(unittest.TestCase):
 
 
 class TestRenderMarkdown(unittest.TestCase):
+    @unittest.skipIf(cmarkgfm is None, 'cmarkgfm is not installed')
+    def test_node_add_remove_markers_survive_gfm_rendering(self) -> None:
+        diff = PipeDiff(
+            node_changes=[
+                NodeChange(id='new_node', kind='added', provider_new='prompt'),
+                NodeChange(id='old_node', kind='removed', provider_old='webhook'),
+            ]
+        )
+        parsed = _GfmListItems()
+        parsed.feed(cmarkgfm.github_flavored_markdown_to_html(render_markdown(diff)))
+        self.assertEqual(parsed.items, ['+ new_node (prompt)', '- old_node (webhook)'])
+        self.assertEqual(parsed.max_depth, 1)
+
+    @unittest.skipIf(cmarkgfm is None, 'cmarkgfm is not installed')
+    def test_edge_add_remove_markers_survive_gfm_rendering(self) -> None:
+        diff = PipeDiff(
+            edge_changes=[
+                EdgeChange(from_id='new_source', lane='text', to_id='target', kind='added'),
+                EdgeChange(from_id='old_source', lane='control', to_id='target', kind='removed'),
+            ]
+        )
+        parsed = _GfmListItems()
+        parsed.feed(cmarkgfm.github_flavored_markdown_to_html(render_markdown(diff)))
+        self.assertEqual(parsed.items, ['+ new_source --text--> target', '- old_source --control--> target'])
+        self.assertEqual(parsed.max_depth, 1)
+
     def test_empty_diff_summary(self) -> None:
         out = render_markdown(PipeDiff())
         self.assertIn('no semantic changes', out)

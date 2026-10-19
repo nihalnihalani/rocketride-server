@@ -211,6 +211,47 @@ def test_resolve_raises_on_invalid_json_content(monkeypatch):
         resolve_git_ref('HEAD', '/repo/pipeline.pipe')
 
 
+@pytest.mark.parametrize('literal', ['NaN', 'Infinity', '-Infinity', '1e309', '-1e309', '1e-400', '-1e-400'])
+def test_resolve_rejects_unsupported_numeric_content_with_git_context(monkeypatch, literal):
+    _install_fake_git(
+        monkeypatch,
+        {
+            'rev-parse': _completed(0, stdout='/repo\n'),
+            'show': _completed(0, stdout='{"components": [{"id": "a", "config": {"value": ' + literal + '}}]}'),
+        },
+    )
+    with pytest.raises(PipeDiffError, match='Invalid JSON') as error:
+        resolve_git_ref('HEAD', '/repo/pipeline.pipe')
+    assert 'HEAD:pipeline.pipe' in str(error.value)
+    assert literal in str(error.value)
+
+
+def test_resolve_preserves_context_for_numeric_validation_of_historical_metadata(monkeypatch):
+    _install_fake_git(
+        monkeypatch,
+        {
+            'rev-parse': _completed(0, stdout='/repo\n'),
+            'show': _completed(0, stdout='{"components": [], "project_id": 1e309}'),
+        },
+    )
+    with pytest.raises(PipeDiffError, match='HEAD:pipeline.pipe'):
+        resolve_git_ref('HEAD', '/repo/pipeline.pipe')
+
+
+@pytest.mark.parametrize('literal', ['0e9999', '-0e-9999', '5e-324', '-5e-324', '1.7976931348623157e308'])
+def test_resolve_accepts_supported_finite_numeric_content(monkeypatch, literal):
+    _install_fake_git(
+        monkeypatch,
+        {
+            'rev-parse': _completed(0, stdout='/repo\n'),
+            'show': _completed(0, stdout='{"components": [{"id": "a", "config": {"value": ' + literal + '}}]}'),
+        },
+    )
+    pipe = resolve_git_ref('HEAD', '/repo/pipeline.pipe')
+    assert pipe['components'][0]['config']['value'] == float(literal)
+    json.dumps(pipe, allow_nan=False)
+
+
 def test_resolve_raises_when_ref_content_is_not_a_pipe(monkeypatch):
     _install_fake_git(
         monkeypatch,

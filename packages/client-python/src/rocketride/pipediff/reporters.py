@@ -647,6 +647,7 @@ def render_markdown(diff: 'PipeDiff', *, title: Optional[str] = None) -> str:
     Change``), and — only when the diff was computed with ``include_layout`` — a
     ``Layout`` table of the top-level ``viewport.*`` changes. All node ids,
     providers, lanes, versions, values, and the title are wrapped in code spans;
+    add/remove signs are code-spanned so GitHub does not parse nested lists;
     table cells additionally escape ``|`` and newlines so untrusted config values
     cannot break the table or the surrounding comment. Ordering is deterministic,
     so re-running on unchanged input yields byte-identical output.
@@ -682,9 +683,9 @@ def render_markdown(diff: 'PipeDiff', *, title: Optional[str] = None) -> str:
         lines.append('')
         lines.append('**Nodes**')
         for node_id, provider in org['nodes_added']:
-            lines.append(f'- {_MD_ADDED} {_md_code(node_id)} ({_md_code(provider)})')
+            lines.append(f'- {_md_code(_MD_ADDED)} {_md_code(node_id)} ({_md_code(provider)})')
         for node_id, provider in org['nodes_removed']:
-            lines.append(f'- {_MD_REMOVED} {_md_code(node_id)} ({_md_code(provider)})')
+            lines.append(f'- {_md_code(_MD_REMOVED)} {_md_code(node_id)} ({_md_code(provider)})')
         for entry in provider_changed:
             lines.append(
                 f'- {_MD_CHANGED} {_md_code(entry["id"])} provider: '
@@ -696,9 +697,9 @@ def render_markdown(diff: 'PipeDiff', *, title: Optional[str] = None) -> str:
         lines.append('')
         lines.append('**Edges**')
         for from_id, lane, to_id in org['edges_added']:
-            lines.append(f'- {_MD_ADDED} {_md_code(from_id)} --{_md_code(lane)}--> {_md_code(to_id)}')
+            lines.append(f'- {_md_code(_MD_ADDED)} {_md_code(from_id)} --{_md_code(lane)}--> {_md_code(to_id)}')
         for from_id, lane, to_id in org['edges_removed']:
-            lines.append(f'- {_MD_REMOVED} {_md_code(from_id)} --{_md_code(lane)}--> {_md_code(to_id)}')
+            lines.append(f'- {_md_code(_MD_REMOVED)} {_md_code(from_id)} --{_md_code(lane)}--> {_md_code(to_id)}')
 
     # --- Config (table) ---
     config_nodes = [e for e in org['nodes_changed'] if e['config_changes']]

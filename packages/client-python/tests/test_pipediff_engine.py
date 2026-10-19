@@ -692,6 +692,86 @@ def test_load_pipe_invalid_utf8_raises_pipediff_error(tmp_path):
         load_pipe(str(path))
 
 
+@pytest.mark.parametrize('literal', ['NaN', 'Infinity', '-Infinity', '1e309', '-1e309', '1e-400', '-1e-400'])
+def test_load_pipe_rejects_unsupported_json_numbers_with_file_context(tmp_path, literal):
+    path = tmp_path / 'numeric.pipe'
+    path.write_text('{"components": [{"id": "a", "config": {"value": ' + literal + '}}]}', encoding='utf-8')
+
+    with pytest.raises(PipeDiffError, match='Invalid JSON') as error:
+        load_pipe(path)
+
+    assert str(path) in str(error.value)
+    assert literal in str(error.value)
+
+
+@pytest.mark.parametrize('field', ['version', 'viewport', 'project_id'])
+def test_load_pipe_rejects_nonfinite_numbers_outside_config(tmp_path, field):
+    path = tmp_path / 'numeric.pipe'
+    path.write_text('{"components": [], "' + field + '": 1e309}', encoding='utf-8')
+    with pytest.raises(PipeDiffError, match='finite float range'):
+        load_pipe(path)
+
+
+@pytest.mark.parametrize('literal', ['0e9999', '-0.0e-9999', '5e-324', '-5e-324', '1.7976931348623157e308'])
+def test_load_pipe_preserves_supported_finite_float_values(tmp_path, literal):
+    path = tmp_path / 'finite.pipe'
+    path.write_text('{"components": [{"id": "a", "config": {"value": ' + literal + '}}]}', encoding='utf-8')
+    pipe = load_pipe(path)
+    assert pipe['components'][0]['config']['value'] == float(literal)
+    json.dumps(pipe, allow_nan=False)
+
+
+@pytest.mark.parametrize('number', [float('nan'), float('inf'), float('-inf')], ids=['nan', 'inf', '-inf'])
+@pytest.mark.parametrize('field', ['config', 'ui', 'viewport', 'version', 'project_id'])
+def test_load_pipe_dict_rejects_nonfinite_numbers_in_all_fields(number, field):
+    pipe = {'components': [{'id': 'a', 'config': {}}]}
+    if field in ['config', 'ui']:
+        pipe['components'][0][field] = {'nested': [{'value': number}]}
+    else:
+        pipe[field] = {'nested': [number]}
+
+    with pytest.raises(PipeDiffError, match='non-finite number') as error:
+        load_pipe(pipe)
+
+    assert '<dict>' in str(error.value)
+    assert field in str(error.value)
+
+
+def test_load_pipe_dict_numeric_validation_handles_deep_nesting_without_recursion():
+    nested = float('inf')
+    for _ in range(2000):
+        nested = [nested]
+    with pytest.raises(PipeDiffError, match='non-finite number'):
+        load_pipe({'components': [{'id': 'a', 'config': {'nested': nested}}]})
+
+
+def test_load_pipe_dict_preserves_large_exact_integers():
+    value = 10**400
+    pipe = {'components': [{'id': 'a', 'config': {'value': value}}]}
+    assert load_pipe(pipe)['components'][0]['config']['value'] == value
+
+
+def test_load_pipe_keeps_normal_binary64_rounding(tmp_path):
+    old_path, new_path = tmp_path / 'old.pipe', tmp_path / 'new.pipe'
+    for path, literal in [(old_path, '0.1'), (new_path, '0.10000000000000001')]:
+        path.write_text('{"components": [{"id": "a", "config": {"value": ' + literal + '}}]}', encoding='utf-8')
+    assert diff_pipes(load_pipe(old_path), load_pipe(new_path)).has_semantic_changes is False
+
+
+@pytest.mark.parametrize('error', [ValueError('integer exceeds decoder limit'), RecursionError('JSON nesting limit')])
+def test_load_pipe_decoder_limits_are_contextual_pipediff_errors(tmp_path, monkeypatch, error):
+    path = tmp_path / 'limited.pipe'
+    path.write_text('{"components": []}', encoding='utf-8')
+
+    def reject(_text, **_kwargs):
+        raise error
+
+    monkeypatch.setattr(json, 'loads', reject)
+    with pytest.raises(PipeDiffError, match='Invalid JSON') as raised:
+        load_pipe(path)
+    assert str(path) in str(raised.value)
+
+
 # ---------------------------------------------------------------------------
 # Wire (input/control) validation
 # ---------------------------------------------------------------------------

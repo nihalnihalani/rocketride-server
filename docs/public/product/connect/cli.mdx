@@ -228,6 +228,15 @@ Exit codes: `0` — no semantic changes (or any successful run when `--exit-zero
 is set); `1` — semantic changes were found; `2` — usage error, or an unreadable
 / unparseable file or bad git ref.
 
+Non-JSON constants (`NaN`, `Infinity`, `-Infinity`), numeric overflow, and
+nonzero underflow are input errors (exit `2`). Fractional and exponent literals
+use finite IEEE 754 binary64 precision, so literals that round to the same
+binary64 value compare equal; integer literals remain exact within the JSON
+decoder's size limit. These rules also apply to Git blobs. Excessive nesting
+that exceeds parsing, comparison, or reporting limits returns an actionable
+error on stderr with exit `2` and empty stdout. `--exit-zero` does not suppress
+errors.
+
 #### What counts as a change
 
 - **Nodes** are matched by `id`. A new or deleted `id` is an add/remove; an `id`
