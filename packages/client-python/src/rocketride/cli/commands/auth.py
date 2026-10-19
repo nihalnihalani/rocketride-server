@@ -52,6 +52,7 @@ from rocketride_common.env import (
     ENV_DEPLOY_URI,
     ENV_DEV_APIKEY,
     ENV_DEV_URI,
+    check_dot_env_writable,
     write_dot_env,
 )
 from rocketride_common.auth_defaults import DEFAULT_CLI_CLIENT_ID, DEFAULT_ZITADEL_URL
@@ -307,6 +308,11 @@ async def _run_login(args, out: Output, for_deploy: bool) -> Optional[Dict[str, 
         Dict with the validated ``uri``/``apikey``, or None on failure.
     """
     from rocketride import RocketRideClient
+
+    # step: refuse up front, before any prompt or network call, when the existing
+    # .env cannot be rewritten faithfully (not UTF-8, NUL bytes, unreadable) -
+    # persisting would otherwise fail after the credential was already validated
+    check_dot_env_writable()
 
     env_uri_key = ENV_DEPLOY_URI if for_deploy else ENV_DEV_URI
     uri = _resolve_server_uri(args, out, env_uri_key)
