@@ -78,12 +78,23 @@ driver does not raise a DBAPI error, so the node unwraps it to the driver
 error it carries; the code and message come from the server's
 own `ServerException`. What is removed is the tail: SQLAlchemy's
 `[SQL: ...]` / `[parameters: ...]` echo, ClickHouse's server stack trace,
-and its `failed at position` quotation of the statement. The primary
-sentence itself is passed through as ClickHouse wrote it, so it can name a
-value or an identifier the statement carried or touched. That is
-deliberate: reaching this tool at all requires **Allow direct query
-execution**, and a caller who has it can read the same data with a
-`SELECT`. The full text stays in the server log. `begin` takes no
+its `failed at position` quotation of the statement, and every place
+ClickHouse is known to repeat the statement or expression it was working
+on — after `in scope` (including a named CTE's `x AS (...)` and a lambda's
+`x -> ...`), after `In query`, after `while processing query:`, a
+mutation's `while processing:` or the old interpreter's `While processing`,
+together with the `required columns` list that follows. The driver
+interpolates bound values into the statement before sending it, so each of
+those repeats carries them. A `throwIf` message (code 395) is the caller's
+own text and comes back whole, whatever it says. The rest is passed through
+as ClickHouse wrote it: the primary sentence, which can name a value or an
+identifier the statement carried or touched, and a runtime context such as
+`while executing 'FUNCTION ...'`, literals included. Two cases lose text but
+never leak it: a quoted value that itself contains one of the tails above is
+cut there, and the runtime context after a `throwIf` message is dropped whole
+when something inside it looks like one. That is deliberate: reaching this
+tool at all requires **Allow direct query execution**, and a caller who has
+it can read the same data with a `SELECT`. The full text stays in the server log. `begin` takes no
 arguments and returns
 `{session_id}`; `commit` and `rollback` require that ID and return
 `{ok: true}`. These four write-capable operations fail when **Allow direct
