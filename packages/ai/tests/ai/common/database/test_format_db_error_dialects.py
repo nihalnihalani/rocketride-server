@@ -505,6 +505,41 @@ def test_clickhouse_cuts_the_before_echo_over_the_mysql_wire(base):
     assert 'QA_CANARY_UPSERT_S2' not in result
 
 
+@pytest.mark.parametrize(
+    ('exc', 'expected'),
+    [
+        (
+            _clickhouse(
+                27,
+                "DB::ParsingException: Cannot parse input: expected '(' before: "
+                "'ON DUPLICATE KEY UPDATE s = \\'QA_CANARY_OLDER\\'':  at row 1: While executing ValuesBlockInputFormat",
+            ),
+            "Error 27: DB::ParsingException: Cannot parse input: expected '('",
+        ),
+        (
+            _mysql(
+                27,
+                "Code: 27. DB::ParsingException: Cannot parse input: expected '(' before: "
+                "'ON DUPLICATE KEY UPDATE s = \\'QA_CANARY_OLDER\\'':  at row 1: While executing "
+                'ValuesBlockInputFormat. (CANNOT_PARSE_INPUT_ASSERTION_FAILED) (version 23.3.1.1)',
+            ),
+            "Error 27: DB::ParsingException: Cannot parse input: expected '('",
+        ),
+    ],
+    ids=['native', 'mysql-wire'],
+)
+def test_clickhouse_text_from_an_older_server_is_still_recognised(base, exc, expected):
+    """Older servers name the parse error's class ``DB::ParsingException:``.
+
+    Constructed from the 25.8 capture above with the older class name; that
+    class is the one the ``here:`` / ``before:`` echoes come with there.
+    """
+    result = base._format_db_error(exc)
+
+    assert result == expected
+    assert 'QA_CANARY_OLDER' not in result
+
+
 def test_clickhouse_cuts_a_function_call_scope_echo(base):
     """An expression evaluated on its own is echoed as ``In scope f(...)``.
 
