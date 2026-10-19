@@ -44,8 +44,9 @@ dependencies.
 pip install rocketride
 ```
 
-> **Before the CLI release:** `rocketride diff` ships in a release after 1.3.0, so
-> PyPI does not serve it yet. Until then install the client package from this
+> **Before the CLI release:** `rocketride diff` is not in a PyPI release yet —
+> 1.4.0 and earlier do not include it; the first release with it will be 1.5.0
+> or later. Until then install the client package from this
 > repository at a pinned commit — pip executes the source's build code, so pin a
 > full commit SHA rather than a branch:
 >
@@ -90,7 +91,7 @@ rocketride diff --git <ref> <file.pipe> [--include-layout] [--json | --markdown]
 | Flag | Description |
 | --- | --- |
 | `<old.pipe> <new.pipe>` | The two files to compare (positional, old first). Pass exactly one file with `--git` instead. |
-| `--git <ref>` | Diff the working-tree `FILE` against `<ref>` via `git show <ref>:<FILE>`. `<ref>` is any revision git accepts — a commit SHA, branch, tag, `HEAD`, `HEAD~1`, `origin/main`. If the file does not exist in `<ref>`, everything is reported as added, plus a version change from `null`. |
+| `--git <ref>` | Diff the working-tree `FILE` against `<ref>` via `git show <ref>:<FILE>`, looking the file up under the path given. `<ref>` is any revision git accepts — a commit SHA, branch, tag, `HEAD`, `HEAD~1`, `origin/main` — and must not be empty. If the file does not exist in `<ref>`, everything is reported as added, plus a version change from `null` (and `layout changed` when the file has a `viewport`). A symlink committed as a symlink is compared through its target; on a case-insensitive filesystem, a differently cased spelling of a tracked file is compared against that file. |
 | `--include-layout` | Enumerate the layout churn that is hidden by default — each node's `ui` block as `ui.*` changes on that node, and the top-level `viewport` as `viewport.*` changes — and count it, so a layout-only edit then exits `1`. |
 | `--json` | Emit a single JSON document to stdout (mutually exclusive with `--markdown`). |
 | `--markdown` | Emit compact, PR-comment-friendly Markdown to stdout (mutually exclusive with `--json`). |
@@ -119,9 +120,9 @@ difference is deliberate: `diff` produces a report, not a command result.
 ## What counts as a change
 
 - **Nodes** are matched by `id`. A new or deleted `id` is an add/remove; an `id`
-  present on both sides with a different `provider` is a provider change. A
-  duplicate `id` within one file is rejected with exit `2` rather than silently
-  shadowing a node.
+  present on both sides with a different `provider` is a provider change
+  (compared type-sensitively, like config). A duplicate `id` within one file is
+  rejected with exit `2` rather than silently shadowing a node.
 - **Config** is deep-diffed into dotted paths — nested objects become
   `config.default.strlen`, list items become `config.instructions[0]` — and each
   leaf is reported as added, removed, or changed with its old → new value. JSON
@@ -136,6 +137,13 @@ difference is deliberate: `diff` produces a report, not a command result.
   default and summarized as a single `Layout: changed` line, so a pure canvas move
   exits `0`. `--include-layout` enumerates the individual `ui.*` and `viewport.*`
   fields and makes them count, so a canvas-only edit then exits `1`.
+- **Canvas groups.** The editor saves a group's children inside the group
+  component, under `config.pipeline.components`. Each child is diffed as a node
+  in its own right, matched by `id` like any other: its `ui` is layout, its
+  wiring is edges, and its provider and config changes are reported on the child.
+  Moving a node into or out of a group changes only its `ui` (`parentId` and a
+  group-relative position), so it is layout too. Ids must be unique across
+  groups.
 - **Everything else at the top level is ignored.** `diff` reads exactly
   `components`, `version` and `viewport`; `project_id`, `isLocked`, and any key a
   later schema adds are editor/session metadata rather than pipeline behavior, so
@@ -144,7 +152,9 @@ difference is deliberate: `diff` produces a report, not a command result.
 ## Output modes
 
 The default **human** output is grouped and colored (color auto-disables when
-piped or when `NO_COLOR` is set), with `+` added, `-` removed, `~` changed:
+piped or when `NO_COLOR` is set), with `+` added, `-` removed, `~` changed.
+Control characters in values — C0, C1, and the Unicode bidi and line-separator
+controls — are printed as `\xNN`/`\uNNNN` escapes:
 
 ```text
 Pipeline diff: 1 node changed, layout changed
@@ -156,8 +166,9 @@ Config
 Layout: changed (ui/viewport)
 ```
 
-`--json` emits one stable, sorted document — `nodes`, `edges`, `viewport`, and a
-`summary` block with counts and the overall `has_semantic_changes` flag:
+`--json` emits one stable document with sorted keys — `edges`, `nodes`, a
+`summary` block with counts and the overall `has_semantic_changes` flag, and
+`viewport`:
 
 ```json
 {
@@ -216,6 +227,11 @@ is wrapped in a code span whose fence is longer than any backtick run inside it,
 and pipes are escaped so a value cannot split the table row or break out of the
 comment. Node and edge add/remove signs are also code-spanned, preserving the
 visible `+` or `-` beside each identity after GitHub renders the list.
+
+In every format but JSON, strings print bare and other values use JSON spelling
+(`true`, `null`, `{"k": "v"}`). An empty string prints as `""`, and when a change
+crosses types (`512` → `"512"`) strings are JSON-quoted so the two sides never
+look alike.
 
 ## Review pipelines like code in CI
 
