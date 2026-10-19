@@ -22,18 +22,27 @@
 
 """Unit tests for the RocketRide pipe-diff engine, model, and config deep-diff."""
 
+import ast
 import copy
 import json
+import pickle
+import sys
+import tracemalloc
 from pathlib import Path
 
 import pytest
 
+import rocketride.pipediff
 from rocketride.pipediff import (
     EdgeChange,
     PipeDiffError,
+    _pipejson,
     deep_diff_config,
     diff_pipes,
+    engine,
+    gitref,
     load_pipe,
+    render_json,
 )
 
 
@@ -788,6 +797,22 @@ def test_load_pipe_validation_memory_is_linear_in_input_size(tmp_path, source):
     assert peak < 40_000_000, f'peak {peak / 1e6:.1f} MB'
 
 
+def test_load_pipe_validation_memory_grows_linearly_with_depth():
+    # The absolute bound above depends on the allocator; this one does not. Doubling
+    # the depth of the same wide, long-keyed shape should about double the peak
+    # (measured 2.0x). Paths built for every pending value make it quadruple.
+    peaks = []
+    for depth in (100, 200):
+        pipe = _wide_deep_config(depth=depth, siblings=20, key_length=100)
+        tracemalloc.start()
+        try:
+            load_pipe(pipe)
+            peaks.append(tracemalloc.get_traced_memory()[1])
+        finally:
+            tracemalloc.stop()
+    assert peaks[1] / peaks[0] < 3, f'peak {peaks[0] / 1e6:.2f} MB -> {peaks[1] / 1e6:.2f} MB when depth doubled'
+
+
 def test_load_pipe_dict_nonfinite_error_names_the_full_path():
     pipe = {'components': [{'id': 'a', 'provider': 'p', 'config': {'outer': [{'x': 1}, {'inner': float('nan')}]}}]}
     with pytest.raises(
@@ -813,6 +838,128 @@ def test_diff_pipes_reports_unsupported_nesting_as_pipediff_error(shape):
 
     with pytest.raises(PipeDiffError, match='too deep'):
         diff_pipes(load_pipe(build(1)), load_pipe(build(2)))
+
+
+def _unsupported_nesting(shape, leaf):
+    """A config that nests too deeply to compare: 5000 levels, or a cycle."""
+    if shape == 'cyclic':
+        config = {'leaf': leaf}
+        config['self'] = config
+        return config
+    config = current = {}
+    for _ in range(5000):
+        current['n'] = current = {}
+    current['leaf'] = leaf
+    return config
+
+
+@pytest.mark.parametrize('shape', ['deep', 'cyclic'])
+def test_deep_diff_config_reports_unsupported_nesting_as_pipediff_error(shape):
+    # deep_diff_config is public and recurses just like diff_pipes does, so it owes
+    # library callers the same error rather than a raw RecursionError.
+    with pytest.raises(PipeDiffError, match='too deep'):
+        deep_diff_config(_unsupported_nesting(shape, 1), _unsupported_nesting(shape, 2))
+
+
+def _unreportable(shape):
+    """A value no report could serialise: it contains itself, or nests past the recursion limit."""
+    if shape == 'cyclic':
+        value = {}
+        value['self'] = value
+        return value
+    return _nested(sys.getrecursionlimit() + 1)
+
+
+def _nested(levels, leaf=1):
+    """``leaf`` wrapped in ``levels`` lists, built without recursion."""
+    for _ in range(levels):
+        leaf = [leaf]
+    return leaf
+
+
+# Why the diff refuses each shape: the wording tells a cycle from nesting past the limit.
+_REFUSAL = {'cyclic': 'refers to itself', 'deep': 'nested too deeply to report'}
+
+
+# Where a value that exists on one side only ends up stored in the diff: each entry
+# builds the (old, new, include_layout) a comparison needs. The value itself is never
+# compared (it has no counterpart), so only the diff's own check can refuse it.
+_ONE_SIDED_PLACEMENTS = {
+    'config removed': lambda v: (_pipe([_node('a', 'p', {'x': v})]), _pipe([_node('a', 'p', {})]), False),
+    'config added': lambda v: (_pipe([_node('a', 'p', {})]), _pipe([_node('a', 'p', {'x': v})]), False),
+    'config retyped': lambda v: (_pipe([_node('a', 'p', {'x': v})]), _pipe([_node('a', 'p', {'x': 5})]), False),
+    'list tail removed': lambda v: (
+        _pipe([_node('a', 'p', {'x': [1, v]})]),
+        _pipe([_node('a', 'p', {'x': [1]})]),
+        False,
+    ),
+    'node removed': lambda v: (_pipe([_node('a', v)]), _pipe([]), False),
+    'node added': lambda v: (_pipe([]), _pipe([_node('a', v)]), False),
+    'provider changed': lambda v: (_pipe([_node('a', v)]), _pipe([_node('a', 'p')]), False),
+    'version changed': lambda v: (_pipe([], version=v), _pipe([], version=2), False),
+    'ui removed': lambda v: (_pipe([_node('a', 'p', ui={'x': v})]), _pipe([_node('a', 'p', ui={})]), True),
+    'viewport removed': lambda v: (_pipe([], viewport={'x': v}), _pipe([], viewport={}), True),
+}
+
+
+@pytest.mark.parametrize('shape', ['cyclic', 'deep'])
+@pytest.mark.parametrize('placement', sorted(_ONE_SIDED_PLACEMENTS))
+def test_diff_pipes_refuses_a_stored_value_it_could_not_serialise(placement, shape):
+    # load_pipe accepts a cyclic or deeply nested in-memory value, and a comparison
+    # that finds it on one side only never recurses into it, so it used to succeed
+    # and hand back a diff whose rendering then failed (ValueError, "Circular
+    # reference detected") in the caller. Refuse it where it is stored instead.
+    old, new, include_layout = _ONE_SIDED_PLACEMENTS[placement](_unreportable(shape))
+    with pytest.raises(PipeDiffError, match=_REFUSAL[shape]):
+        diff_pipes(load_pipe(old), load_pipe(new), include_layout=include_layout)
+
+
+@pytest.mark.parametrize('shape', ['cyclic', 'deep'])
+def test_deep_diff_config_refuses_a_stored_value_it_could_not_serialise(shape):
+    with pytest.raises(PipeDiffError, match=_REFUSAL[shape]):
+        deep_diff_config({'x': _unreportable(shape)}, {})
+
+
+def test_diff_pipes_reports_shared_and_deeply_nested_one_sided_values():
+    # The check refuses cycles and nesting past the recursion limit, not repeated
+    # references or deep-but-serialisable values. A 600-deep value (a valid .pipe file
+    # can hold one, and the CLI reports it) is well inside the limit.
+    shared = [1, 2]
+    deep = _nested(600)
+    old = _pipe([_node('a', 'p', {'x': {'first': shared, 'second': shared}, 'y': deep})])
+    new = _pipe([_node('a', 'p', {})])
+
+    diff = diff_pipes(load_pipe(old), load_pipe(new))
+
+    assert [(f.path, f.kind) for f in diff.node_changes[0].field_changes] == [
+        ('config.x', 'removed'),
+        ('config.y', 'removed'),
+    ]
+    json.dumps(render_json(diff), sort_keys=True)
+
+
+def test_a_shared_value_counts_at_every_depth_it_is_reached_from():
+    # A container met a second time is not walked again, but its height still counts
+    # where it is met now: the same chain is fine beside itself and too deep once one
+    # reference sits a few levels further down.
+    chain = _nested(sys.getrecursionlimit() - 5)
+
+    def removed(value):
+        return diff_pipes(load_pipe(_pipe([_node('a', 'p', {'x': value})])), load_pipe(_pipe([_node('a', 'p', {})])))
+
+    assert removed([chain, chain]).node_changes  # reported, both references fit
+    with pytest.raises(PipeDiffError, match=_REFUSAL['deep']):
+        removed([chain, _nested(5, chain)])
+
+
+def test_load_pipe_reports_unparseably_deep_json_file_as_pipediff_error(tmp_path):
+    # Real input, not a patched decoder: the C scanner gives up with a
+    # RecursionError long before 100,000 levels.
+    path = tmp_path / 'deep.pipe'
+    path.write_text('{"components": [{"id": "a", "config": ' + '[' * 100_000 + ']' * 100_000 + '}]}', encoding='utf-8')
+    with pytest.raises(PipeDiffError, match='Invalid JSON') as error:
+        load_pipe(path)
+    assert str(path) in str(error.value)
 
 
 def test_load_pipe_dict_preserves_large_exact_integers():
@@ -1051,6 +1198,84 @@ def test_deeply_nested_groups_do_not_hit_the_recursion_limit():
     assert diff.layout_changed is True
 
 
+class _CountingList(list):
+    """A list that counts how many times something starts iterating it."""
+
+    iterations = 0
+
+    def __iter__(self):
+        self.iterations += 1
+        return super().__iter__()
+
+
+def _counted_grouped_pipe(lane='questions'):
+    """A grouped pipe whose top-level and group-children lists count their walks."""
+    pipe = _grouped_pipe(lane=lane)
+    pipe['components'] = top_level = _CountingList(pipe['components'])
+    pipeline = pipe['components'][1]['config']['pipeline']
+    pipeline['components'] = children = _CountingList(pipeline['components'])
+    return pipe, top_level, children
+
+
+def test_comparing_walks_each_pipelines_group_tree_once():
+    # The id index and the edge set used to be two separate walks of the same tree.
+    # Loading (validation, and for a dict the finite-number check) is counted apart.
+    old, old_top, old_children = _counted_grouped_pipe(lane='questions')
+    new, new_top, new_children = _counted_grouped_pipe(lane='text')
+    load_pipe(old)
+    load_pipe(new)
+    lists = (old_top, old_children, new_top, new_children)
+    loaded = [lst.iterations for lst in lists]
+
+    diff = diff_pipes(old, new)
+
+    assert [(e.lane, e.kind) for e in diff.edge_changes] == [('text', 'added'), ('questions', 'removed')]
+    assert [lst.iterations - before for lst, before in zip(lists, loaded)] == [1, 1, 1, 1]
+
+
+def test_diff_pipes_neither_mutates_nor_remembers_its_inputs():
+    # The id index and edge set are built per comparison. Nothing is cached on the
+    # caller's dicts or between calls, so an edit is seen by the next comparison.
+    old, new = _grouped_pipe(lane='questions'), _grouped_pipe(lane='questions')
+    old_before, new_before = copy.deepcopy(old), copy.deepcopy(new)
+
+    assert diff_pipes(old, new).edge_changes == []
+    assert (old, new) == (old_before, new_before)
+
+    new['components'][1]['config']['pipeline']['components'][0]['input'][0]['lane'] = 'text'
+    assert [(e.lane, e.kind) for e in diff_pipes(old, new).edge_changes] == [
+        ('text', 'added'),
+        ('questions', 'removed'),
+    ]
+    assert old == old_before
+
+
+def test_control_wiring_of_a_grouped_child_is_diffed_as_edges():
+    def build(class_type):
+        agent = _child('agent_1', 'agent_crewai', 'group_1', control=[{'classType': class_type, 'from': 'llm_1'}])
+        return _pipe([_node('llm_1', 'llm_openai'), _group('group_1', [agent])])
+
+    diff = diff_pipes(build('llm'), build('tool'))
+    assert diff.node_changes == []
+    assert diff.edge_changes == [
+        EdgeChange(from_id='llm_1', lane='tool', to_id='agent_1', kind='added'),
+        EdgeChange(from_id='llm_1', lane='llm', to_id='agent_1', kind='removed'),
+    ]
+
+
+def test_diff_pipes_terminates_on_an_unvalidated_group_that_contains_itself():
+    # load_pipe rejects this; diff_pipes takes whatever dicts it is given and must
+    # still end, expanding the group once.
+    def build(provider):
+        group = _group('group_1', [])
+        group['provider'] = provider
+        group['config']['pipeline'] = {'components': [group]}
+        return _pipe([group])
+
+    diff = diff_pipes(build('a'), build('b'))
+    assert [(c.id, c.kind) for c in diff.node_changes] == [('group_1', 'provider')]
+
+
 def test_a_group_that_contains_itself_is_rejected_not_looped():
     group = _group('group_1', [])
     group['config']['pipeline'] = {'components': [group]}
@@ -1076,6 +1301,83 @@ def test_grouped_child_ids_must_be_unique_across_levels():
 def test_malformed_grouped_children_are_rejected(child, message):
     with pytest.raises(PipeDiffError, match=message):
         load_pipe(_pipe([_group('group_1', [child])]))
+
+
+# ---------------------------------------------------------------------------
+# Module boundaries
+# ---------------------------------------------------------------------------
+
+
+def _sibling_imports():
+    """``{module: {sibling: {imported names}}}`` for every ``from .x import ...`` in the package."""
+    package_dir = Path(rocketride.pipediff.__file__).parent
+    found = {}
+    for source in sorted(package_dir.glob('*.py')):
+        if source.name == '__init__.py':
+            continue
+        imports = found.setdefault(source.stem, {})
+        for node in ast.walk(ast.parse(source.read_text(encoding='utf-8'))):
+            if isinstance(node, ast.ImportFrom) and node.level == 1 and node.module:
+                imports.setdefault(node.module, set()).update(alias.name for alias in node.names)
+    return found
+
+
+def test_pipediff_modules_share_helpers_only_through_private_modules():
+    # `reporters` used to import engine._json_equal and `gitref` engine._parse_pipe_json:
+    # a contract between modules hidden behind an underscore. What the modules share
+    # lives in a private module (leading underscore on the module, plain names inside);
+    # nothing reaches an underscore name of a public sibling.
+    imports = _sibling_imports()
+    assert sum(len(siblings) for siblings in imports.values()) >= 3  # the scan found the imports
+    reached_in = [
+        f'{module} imports {name} from {sibling}'
+        for module, siblings in imports.items()
+        for sibling, names in siblings.items()
+        if not sibling.startswith('_')
+        for name in sorted(names)
+        if name.startswith('_')
+    ]
+    assert reached_in == []
+
+
+def test_pipediff_modules_do_not_import_each_other_in_a_cycle():
+    imports = {module: set(siblings) for module, siblings in _sibling_imports().items()}
+    assert imports['_pipejson'] == set()  # the shared module depends on no sibling
+    assert imports['model'] == set()
+
+    def reachable(module, seen=()):
+        for sibling in imports.get(module, ()):
+            if sibling not in seen:
+                yield sibling
+                yield from reachable(sibling, (*seen, sibling))
+
+    assert [module for module in imports if module in set(reachable(module))] == []
+
+
+def test_pipediff_error_is_one_class_under_its_public_name():
+    # The class is defined in the private shared module so that gitref can raise it
+    # without importing the engine; every route to it must lead to the same object,
+    # and it must be reported under the public package rather than the private module.
+    assert rocketride.pipediff.PipeDiffError is engine.PipeDiffError
+    assert engine.PipeDiffError is _pipejson.PipeDiffError
+    assert gitref.PipeDiffError is _pipejson.PipeDiffError
+    assert PipeDiffError.__module__ == 'rocketride.pipediff'
+    restored = pickle.loads(pickle.dumps(PipeDiffError('boom')))
+    assert type(restored) is PipeDiffError
+    assert str(restored) == 'boom'
+
+
+def test_engine_star_import_exports_only_the_documented_names():
+    # Names the engine imports from the shared private module (json_equal,
+    # parse_pipe_json, validate_pipe, ...) are not engine API and must not leak
+    # out through `from rocketride.pipediff.engine import *`.
+    documented = {'PipeDiffError', 'deep_diff_config', 'diff_pipes', 'load_pipe'}
+    namespace = {}
+    exec('from rocketride.pipediff.engine import *', namespace)
+    assert {name for name in namespace if name != '__builtins__'} == documented
+    assert sorted(engine.__all__) == sorted(documented)
+    for name in documented:
+        assert getattr(engine, name) is getattr(rocketride.pipediff, name)
 
 
 def test_diff_of_real_example_against_itself_is_empty(examples_dir):

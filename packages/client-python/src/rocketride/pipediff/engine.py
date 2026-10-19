@@ -57,27 +57,33 @@ Functions:
 Exceptions:
     PipeDiffError: Raised for unreadable, unparseable, or structurally invalid
         pipelines, with human-readable context about the offending source.
+        Re-exported here from :mod:`rocketride.pipediff._pipejson`, where the
+        parsing and validation rules shared with ``gitref`` live.
 """
 
 from __future__ import annotations
 
-import json
 import math
 import os
-from typing import Any
+import sys
+from collections.abc import Iterable, Iterator
+from typing import Any, NamedTuple
 
+from ._pipejson import PipeDiffError, group_children, iter_components, json_equal, parse_pipe_json, validate_pipe
 from .model import EdgeChange, FieldChange, NodeChange, PipeDiff
 
+# What this module documents (see the module docstring): the entry points and the
+# error they raise. Pinned so that names imported here from the shared private
+# module do not leak out through ``from ...engine import *``.
+__all__ = ['PipeDiffError', 'deep_diff_config', 'diff_pipes', 'load_pipe']
 
-class PipeDiffError(Exception):
-    """
-    Raised when a ``.pipe`` file cannot be read, parsed, or validated.
+# Message for a comparison that exhausts the interpreter's recursion limit.
+_TOO_DEEP = 'Pipeline nesting is too deep to compare'
 
-    The message always carries enough context (the source path or ``<dict>`` plus
-    the specific problem) for the CLI to print an actionable usage error and exit
-    with code ``2``. It is used both by :func:`load_pipe` (file/JSON/shape errors)
-    and by :func:`rocketride.pipediff.gitref.resolve_git_ref` (git/parse errors).
-    """
+# Messages for a value that exists on one side only, so is never compared, but that
+# the diff would have to carry into every report (see :func:`_require_reportable`).
+_CYCLIC_VALUE = 'Pipeline contains a value that refers to itself, which cannot be reported'
+_TOO_DEEP_TO_REPORT = 'Pipeline contains a value nested too deeply to report'
 
 
 def load_pipe(path_or_obj: str | os.PathLike[str] | dict) -> dict:
@@ -107,7 +113,7 @@ def load_pipe(path_or_obj: str | os.PathLike[str] | dict) -> dict:
         # An in-memory dict never went through the JSON decoder's numeric
         # callbacks, so it alone needs the finite-number walk.
         _validate_finite_numbers(path_or_obj, '<dict>')
-        return _validate_pipe(path_or_obj, '<dict>')
+        return validate_pipe(path_or_obj, '<dict>')
 
     if isinstance(path_or_obj, (str, os.PathLike)):
         source = os.fspath(path_or_obj)
@@ -120,43 +126,9 @@ def load_pipe(path_or_obj: str | os.PathLike[str] | dict) -> dict:
             raise PipeDiffError(f'{source} is not valid UTF-8: {exc}') from exc
         except OSError as exc:
             raise PipeDiffError(f'Could not read pipe file {source}: {exc}') from exc
-        return _parse_pipe_json(text, source)
+        return parse_pipe_json(text, source)
 
     raise PipeDiffError(f'load_pipe expects a path or dict, got {type(path_or_obj).__name__}')
-
-
-def _parse_pipe_json(text: str, source: str) -> dict:
-    """Parse file/Git JSON with one numeric policy and source-aware errors.
-
-    JSON integer values retain Python's exact integer representation. Fractional
-    and exponent literals use finite binary64 floats, including normal rounding;
-    overflow and conversion of a nonzero value to zero are rejected rather than
-    silently collapsing distinct input values or emitting invalid JSON later.
-    """
-    try:
-        obj = json.loads(text, parse_float=_parse_finite_float, parse_constant=_reject_json_constant)
-    except (ValueError, RecursionError) as exc:
-        raise PipeDiffError(f'Invalid JSON in {source}: {exc}') from exc
-    return _validate_pipe(obj, source)
-
-
-def _parse_finite_float(literal: str) -> float:
-    """Keep supported float rounding while rejecting overflow/zero-underflow."""
-    number = float(literal)
-    if not math.isfinite(number):
-        raise ValueError(f'numeric literal {literal!r} is outside the supported finite float range')
-    # Check the coefficient rather than the exponent: 0e-9999 and -0e9999 are
-    # legitimate zero values, while a nonzero coefficient that becomes 0.0 has
-    # underflowed. No Decimal object or alternate numeric type reaches reporters.
-    coefficient = literal.lower().split('e', 1)[0]
-    if number == 0.0 and any(digit in '123456789' for digit in coefficient):
-        raise ValueError(f'numeric literal {literal!r} underflows the supported finite float range')
-    return number
-
-
-def _reject_json_constant(literal: str) -> None:
-    """Reject Python's permissive NaN/Infinity extensions to JSON syntax."""
-    raise ValueError(f'non-JSON numeric constant {literal!r}')
 
 
 def _validate_finite_numbers(obj: Any, source: str) -> None:
@@ -198,115 +170,6 @@ def _crumb_path(crumb: Any) -> str:
     return '$' + ''.join(reversed(parts))
 
 
-def _validate_pipe(obj: Any, source: str) -> dict:
-    """
-    Validate that ``obj`` is a well-formed pipeline object and return it.
-
-    Args:
-        obj: The candidate pipeline (any JSON-decoded value).
-        source: A label for error messages (a path, or ``"<dict>"``).
-
-    Returns:
-        The validated pipeline ``dict`` (``obj`` unchanged).
-
-    Raises:
-        PipeDiffError: If ``obj`` is not an object, lacks a ``components`` list,
-            contains a component that is not an id-bearing object, reuses a
-            component ``id``, or contains a component whose ``input``/``control``
-            wiring is malformed.
-    """
-    if not isinstance(obj, dict):
-        raise PipeDiffError(f'{source}: pipe must be a JSON object, got {type(obj).__name__}')
-    components = obj.get('components')
-    if not isinstance(components, list):
-        raise PipeDiffError(f"{source}: pipe is missing a 'components' list")
-    # Ids are the diff's matching key, so a duplicate is not a harmless quirk:
-    # indexing by id keeps only the last component with that id, which would
-    # silently hide the earlier node and any change to it. Reject it as an
-    # actionable exit-2 error instead of emitting a diff that is quietly wrong.
-    # Canvas-group children are nodes too (see :func:`_all_components`), so ids
-    # must be unique across every nesting level.
-    seen_ids: dict[str, str] = {}
-    for component, where in _all_components(obj, include_invalid=True):
-        if not isinstance(component, dict):
-            raise PipeDiffError(f'{source}: component at {where} is not an object')
-        component_id = component.get('id')
-        if not isinstance(component_id, str) or not component_id:
-            raise PipeDiffError(f"{source}: component at {where} is missing a string 'id'")
-        first_where = seen_ids.get(component_id)
-        if first_where is not None:
-            raise PipeDiffError(
-                f"{source}: duplicate component id '{component_id}' at {where} (already used at {first_where})"
-            )
-        seen_ids[component_id] = where
-        _validate_wires(component, component_id, source)
-    return obj
-
-
-def _group_children(component: Any) -> list | None:
-    """
-    Return the children of a canvas group, or ``None`` for any other component.
-
-    The editor saves a group's children inside the group component itself, under
-    ``config.pipeline.components`` (``getProjectComponents`` in the canvas
-    ``util/graph.ts``), and loads any component carrying such a list back as a
-    group (``getNodesFromProject``). Each child keeps its own ``ui`` block with a
-    group-relative position and a ``parentId``.
-    """
-    if not isinstance(component, dict):
-        return None
-    config = component.get('config')
-    pipeline = config.get('pipeline') if isinstance(config, dict) else None
-    children = pipeline.get('components') if isinstance(pipeline, dict) else None
-    return children if isinstance(children, list) else None
-
-
-def _all_components(pipe: dict, *, include_invalid: bool = False) -> list[tuple[Any, str]]:
-    """
-    Flatten a pipeline's components, including canvas-group children.
-
-    Group children are diffed as ordinary nodes, matched by ``id`` like every
-    other component: their ``ui`` is layout, their ``input``/``control`` wiring
-    is edges, and their provider and config are compared on the child. Without
-    this a drag inside a group surfaced as a config change of the group.
-    Traversal is iterative so arbitrarily nested groups cannot exhaust the
-    recursion limit.
-
-    Args:
-        pipe: A pipeline dict.
-        include_invalid: Also yield entries that are not id-bearing objects, so
-            validation can report them; diffing skips them.
-
-    Returns:
-        ``(component, location)`` pairs in document order, where ``location``
-        names the component for error messages (``index 0`` at the top level,
-        ``'group_1' config.pipeline.components[0]`` inside a group).
-    """
-    found: list[tuple[Any, str]] = []
-    expanded: set[int] = set()
-    top_level = pipe.get('components')
-    pending = [
-        (component, f'index {index}')
-        for index, component in enumerate(top_level if isinstance(top_level, list) else [])
-    ]
-    pending.reverse()
-    while pending:
-        component, where = pending.pop()
-        if include_invalid or (isinstance(component, dict) and isinstance(component.get('id'), str)):
-            found.append((component, where))
-        children = _group_children(component)
-        # An in-memory dict can nest itself; expand each group once so the walk
-        # always ends (validation then reports the repeat as a duplicate id).
-        if children and id(component) not in expanded:
-            expanded.add(id(component))
-            group_id = component.get('id')
-            pending.extend(
-                (child, f"'{group_id}' config.pipeline.components[{index}]")
-                for index, child in reversed(list(enumerate(children)))
-            )
-    return found
-
-
 def _node_config(component: dict) -> Any:
     """
     Return the config that belongs to the node itself.
@@ -317,57 +180,13 @@ def _node_config(component: dict) -> Any:
     group. Any other key under ``config.pipeline`` is kept and diffed.
     """
     config = component.get('config')
-    if _group_children(component) is None:
+    if group_children(component) is None:
         return config
     pipeline = {key: value for key, value in config['pipeline'].items() if key != 'components'}
     own = {key: value for key, value in config.items() if key != 'pipeline'}
     if pipeline:
         own['pipeline'] = pipeline
     return own
-
-
-# The wire collections a component may declare, mapped to the key that labels the
-# lane on each wire: ``input`` wires carry a data ``lane``, ``control`` wires carry
-# the orchestration ``classType`` (llm/tool/memory/...).
-_WIRE_COLLECTIONS = {'input': 'lane', 'control': 'classType'}
-
-
-def _validate_wires(component: dict, component_id: str, source: str) -> None:
-    """
-    Validate a component's ``input``/``control`` wire collections.
-
-    Edge extraction reads ``from`` and ``lane``/``classType`` off every wire and
-    puts the resulting triples into a ``set``. Without this check a non-list
-    collection raises ``TypeError``, an unhashable ``from``/``lane`` (a list or
-    dict) raises ``TypeError`` inside ``set.add``, and a wire missing ``from``
-    silently produces a ``(None, None, id)`` edge — all of which surface as a
-    traceback or a nonsense diff instead of an actionable exit-2 error.
-
-    Args:
-        component: The component object to check.
-        component_id: The component's id, used for error context.
-        source: A label for error messages (a path, or ``"<dict>"``).
-
-    Raises:
-        PipeDiffError: If a wire collection is not a list, a wire is not an
-            object, or a wire's ``from``/lane label is not a non-empty string.
-    """
-    for key, lane_key in _WIRE_COLLECTIONS.items():
-        wires = component.get(key)
-        if wires is None:
-            continue
-        if not isinstance(wires, list):
-            raise PipeDiffError(f"{source}: component '{component_id}' field '{key}' must be a list")
-        for wire_index, wire in enumerate(wires):
-            where = f"component '{component_id}' {key}[{wire_index}]"
-            if not isinstance(wire, dict):
-                raise PipeDiffError(f'{source}: {where} is not an object')
-            from_id = wire.get('from')
-            if not isinstance(from_id, str) or not from_id:
-                raise PipeDiffError(f"{source}: {where} is missing a string 'from'")
-            lane = wire.get(lane_key)
-            if not isinstance(lane, str) or not lane:
-                raise PipeDiffError(f"{source}: {where} is missing a string '{lane_key}'")
 
 
 def deep_diff_config(old: dict | None, new: dict | None) -> list[FieldChange]:
@@ -389,7 +208,22 @@ def deep_diff_config(old: dict | None, new: dict | None) -> list[FieldChange]:
     Returns:
         The list of field changes, ordered deterministically by key/index. Empty
         when the two configs are equal.
+
+    Raises:
+        PipeDiffError: If the configs nest too deeply to compare, or a value that
+            appears in only one of them (and so is reported whole) is cyclic or
+            nested too deeply to serialise; this includes cyclic in-memory configs.
     """
+    try:
+        changes = _diff_config(old, new)
+    except RecursionError as exc:
+        raise PipeDiffError(_TOO_DEEP) from exc
+    _require_reportable(_changed_values(changes))
+    return changes
+
+
+def _diff_config(old: dict | None, new: dict | None) -> list[FieldChange]:
+    """Deep-diff two configs (``None`` is an empty dict) without checking the values it stores."""
     return _diff_value(old if old is not None else {}, new if new is not None else {}, 'config')
 
 
@@ -398,7 +232,7 @@ def diff_pipes(old: dict, new: dict, *, include_layout: bool = False) -> PipeDif
     Compute the semantic difference between two pipeline dictionaries.
 
     Nodes are matched by ``id``, including canvas-group children nested under a
-    group's ``config.pipeline.components`` (see :func:`_all_components`). For each
+    group's ``config.pipeline.components`` (see :func:`iter_components`). For each
     matched node the provider and config are compared independently; unmatched
     nodes become added/removed changes.
     Edges are compared as a set of directed ``(from, lane, to)`` triples drawn
@@ -430,7 +264,9 @@ def diff_pipes(old: dict, new: dict, *, include_layout: bool = False) -> PipeDif
 
     Raises:
         PipeDiffError: If the pipelines nest too deeply to compare, including a
-            cyclic in-memory config that :func:`load_pipe` accepted.
+            cyclic in-memory config that :func:`load_pipe` accepted, or if a value
+            that appears on one side only (and so is reported whole) is cyclic or
+            nested too deeply to serialise.
     """
     # The comparison recurses through nested config, so very deep or cyclic
     # in-memory values exhaust the interpreter's recursion limit. Report that as
@@ -438,13 +274,19 @@ def diff_pipes(old: dict, new: dict, *, include_layout: bool = False) -> PipeDif
     try:
         return _diff_pipes(old, new, include_layout)
     except RecursionError as exc:
-        raise PipeDiffError('Pipeline nesting is too deep to compare') from exc
+        raise PipeDiffError(_TOO_DEEP) from exc
 
 
 def _diff_pipes(old: dict, new: dict, include_layout: bool) -> PipeDiff:
     """Compute the diff for :func:`diff_pipes`, which converts recursion failures."""
-    old_components = _components_by_id(old)
-    new_components = _components_by_id(new)
+    # One walk per pipeline yields everything the comparison needs about its
+    # components. The index lives only for this call: nothing is cached on, or
+    # attached to, the caller's dicts, so editing them and diffing again sees the
+    # edit.
+    old_index = _index_pipe(old)
+    new_index = _index_pipe(new)
+    old_components = old_index.components
+    new_components = new_index.components
     old_ids = set(old_components)
     new_ids = set(new_components)
 
@@ -473,7 +315,7 @@ def _diff_pipes(old: dict, new: dict, include_layout: bool) -> PipeDiff:
         provider_old = old_component.get('provider')
         provider_new = new_component.get('provider')
         # JSON equality, as for ``version`` below: ``0 == False`` in Python.
-        if not _json_equal(provider_old, provider_new):
+        if not json_equal(provider_old, provider_new):
             node_changes.append(
                 NodeChange(
                     id=component_id,
@@ -483,7 +325,7 @@ def _diff_pipes(old: dict, new: dict, include_layout: bool) -> PipeDiff:
                 )
             )
 
-        field_changes = deep_diff_config(_node_config(old_component), _node_config(new_component))
+        field_changes = _diff_config(_node_config(old_component), _node_config(new_component))
         if include_layout:
             field_changes = field_changes + _diff_value(
                 _layout_block(old_component.get('ui')), _layout_block(new_component.get('ui')), 'ui'
@@ -491,8 +333,8 @@ def _diff_pipes(old: dict, new: dict, include_layout: bool) -> PipeDiff:
         if field_changes:
             node_changes.append(NodeChange(id=component_id, kind='config', field_changes=field_changes))
 
-    old_edges = _extract_edges(old)
-    new_edges = _extract_edges(new)
+    old_edges = old_index.edges
+    new_edges = new_index.edges
     edge_changes: list[EdgeChange] = []
     for edge in sorted(new_edges - old_edges, key=_edge_sort_key):
         edge_changes.append(EdgeChange(from_id=edge[0], lane=edge[1], to_id=edge[2], kind='added'))
@@ -502,11 +344,11 @@ def _diff_pipes(old: dict, new: dict, include_layout: bool) -> PipeDiff:
     version_change: tuple[Any, Any] | None = None
     old_version = old.get('version')
     new_version = new.get('version')
-    # Compared with :func:`_json_equal`, not ``!=``: Python treats ``False == 0``
+    # Compared with :func:`json_equal`, not ``!=``: Python treats ``False == 0``
     # and ``True == 1``, so a plain ``!=`` missed a ``1`` -> ``true`` (or
     # ``0`` -> ``false``) edit and reported no version change at all — the diff
     # then exited 0 on a file whose version really had changed type.
-    if not _json_equal(old_version, new_version):
+    if not json_equal(old_version, new_version):
         version_change = (old_version, new_version)
 
     layout_changed = _layout_changed(old, new, old_components, new_components, old_ids & new_ids)
@@ -522,6 +364,10 @@ def _diff_pipes(old: dict, new: dict, include_layout: bool) -> PipeDiff:
             _layout_block(old.get('viewport')), _layout_block(new.get('viewport')), 'viewport'
         )
 
+    # A value present on one side only is stored whole, not compared, so nothing
+    # above has walked it. Make sure what the diff hands back can be serialised.
+    _require_reportable(_reported_values(node_changes, version_change, viewport_changes))
+
     return PipeDiff(
         node_changes=node_changes,
         edge_changes=edge_changes,
@@ -536,27 +382,21 @@ def _diff_pipes(old: dict, new: dict, include_layout: bool) -> PipeDiff:
 # ---------------------------------------------------------------------------
 
 
-def _components_by_id(pipe: dict) -> dict[str, dict]:
-    """
-    Index a pipeline's components by their ``id``.
+class _PipeIndex(NamedTuple):
+    """What a comparison needs to know about one pipeline's components."""
 
-    Canvas-group children are included (see :func:`_all_components`). Non-object
+    components: dict[str, dict]
+    edges: set[tuple[Any, Any, Any]]
+
+
+def _index_pipe(pipe: dict) -> _PipeIndex:
+    """
+    Index a pipeline's components by ``id`` and reconstruct its directed wires in one walk.
+
+    Canvas-group children are included (see :func:`iter_components`). Non-object
     components and components without an ``id`` are skipped defensively
     (``load_pipe`` normally rejects those upstream, and also rejects duplicate ids
     so that no component can be shadowed here).
-
-    Args:
-        pipe: A pipeline dict.
-
-    Returns:
-        A mapping of component id to the component object.
-    """
-    return {component['id']: component for component, _where in _all_components(pipe)}
-
-
-def _extract_edges(pipe: dict) -> set[tuple[Any, Any, Any]]:
-    """
-    Reconstruct the set of directed wires in a pipeline.
 
     Each component's ``input[]`` entries become data edges
     ``(input.from, input.lane, component.id)`` and its ``control[]`` entries
@@ -570,18 +410,107 @@ def _extract_edges(pipe: dict) -> set[tuple[Any, Any, Any]]:
         pipe: A pipeline dict.
 
     Returns:
-        A set of ``(from, lane, to)`` triples.
+        The components keyed by id, and the set of ``(from, lane, to)`` triples.
     """
+    components: dict[str, dict] = {}
     edges: set[tuple[Any, Any, Any]] = set()
-    for component, _where in _all_components(pipe):
-        to_id = component.get('id')
+    for component, _where in iter_components(pipe):
+        to_id = component['id']
+        components[to_id] = component
         for wire in component.get('input') or []:
             if isinstance(wire, dict):
                 edges.add((wire.get('from'), wire.get('lane'), to_id))
         for wire in component.get('control') or []:
             if isinstance(wire, dict):
                 edges.add((wire.get('from'), wire.get('classType'), to_id))
-    return edges
+    return _PipeIndex(components, edges)
+
+
+def _changed_values(changes: Iterable[FieldChange]) -> Iterator[Any]:
+    """Yield the values a list of field changes stores."""
+    for change in changes:
+        yield change.old
+        yield change.new
+
+
+def _reported_values(
+    node_changes: Iterable[NodeChange],
+    version_change: tuple[Any, Any] | None,
+    viewport_changes: Iterable[FieldChange],
+) -> Iterator[Any]:
+    """Yield every value a diff stores whole: providers, field-change sides and the version."""
+    for node_change in node_changes:
+        yield node_change.provider_old
+        yield node_change.provider_new
+        yield from _changed_values(node_change.field_changes)
+    if version_change is not None:
+        yield from version_change
+    yield from _changed_values(viewport_changes)
+
+
+def _require_reportable(values: Iterable[Any]) -> None:
+    """
+    Raise :class:`PipeDiffError` if any value is cyclic or nested too deeply to serialise.
+
+    The comparison recurses only where both sides have a value, so a container that
+    exists on one side only is stored in the diff as it is. An in-memory value that
+    contains itself then makes the diff itself fine but every report built from it
+    fail (``ValueError: Circular reference detected``), and one nested past the
+    recursion limit does the same with ``RecursionError``. Only the cycle can be
+    reached through the CLI's JSON input: a file cannot contain one. The depth bound
+    exists for in-memory callers, and only values the diff stores are walked, so the
+    cost follows the report's size.
+
+    The walk is iterative with an explicit stack, so it cannot hit the limit it
+    guards. A container met again while it is still being walked is a cycle. One met
+    again after it was finished is merely shared: it is not walked again (so a
+    diamond-shaped value costs one walk, not one per path), but the height recorded
+    when it finished is added to where it is met now.
+
+    The depth bound is the recursion limit, what the pure-Python encoder behind the
+    CLI's indented JSON output can serialise (about one frame per level). It is
+    conservative for the C encoder the text reports use, which can go deeper on some
+    interpreters; no pipeline nests anywhere near it, and a bound this high rejects no
+    value the CLI could render. It also caps the walker's own stack.
+
+    Args:
+        values: The values to check; scalars are accepted and skipped.
+
+    Raises:
+        PipeDiffError: If a value contains itself or nests deeper than the bound.
+    """
+    max_depth = sys.getrecursionlimit()
+    for root in values:
+        if not isinstance(root, (dict, list)):
+            continue
+        walking = {id(root)}
+        heights: dict[int, int] = {}  # finished containers: levels of nesting they hold
+        stack = [[root, iter(root.values() if isinstance(root, dict) else root), 1]]
+        while stack:
+            frame = stack[-1]
+            for child in frame[1]:
+                if not isinstance(child, (dict, list)):
+                    continue
+                identity = id(child)
+                if identity in walking:
+                    raise PipeDiffError(_CYCLIC_VALUE)
+                height = heights.get(identity)
+                if height is not None:
+                    if len(stack) + height > max_depth:
+                        raise PipeDiffError(_TOO_DEEP_TO_REPORT)
+                    frame[2] = max(frame[2], height + 1)
+                    continue
+                if len(stack) >= max_depth:
+                    raise PipeDiffError(_TOO_DEEP_TO_REPORT)
+                walking.add(identity)
+                stack.append([child, iter(child.values() if isinstance(child, dict) else child), 1])
+                break
+            else:
+                stack.pop()
+                walking.discard(id(frame[0]))
+                heights[id(frame[0])] = frame[2]
+                if stack:
+                    stack[-1][2] = max(stack[-1][2], frame[2] + 1)
 
 
 def _edge_sort_key(edge: tuple[Any, Any, Any]) -> tuple[str, str, str]:
@@ -628,33 +557,6 @@ def _layout_block(value: Any) -> Any:
     return {} if value is None else value
 
 
-def _json_equal(old: Any, new: Any) -> bool:
-    """
-    Compare two JSON values the way JSON does, not the way Python does.
-
-    Python treats ``False == 0`` and ``True == 1`` as equal, so a plain ``!=``
-    would miss a ``false`` -> ``0`` edit and report no change. Booleans are
-    compared only against booleans; dicts and lists are compared element-wise
-    with the same rule; everything else falls back to ``==``.
-
-    Args:
-        old: The previous JSON value.
-        new: The new JSON value.
-
-    Returns:
-        ``True`` when the two values are the same JSON value.
-    """
-    if isinstance(old, bool) or isinstance(new, bool):
-        return isinstance(old, bool) and isinstance(new, bool) and old == new
-    if isinstance(old, dict) and isinstance(new, dict):
-        return old.keys() == new.keys() and all(_json_equal(old[k], new[k]) for k in old)
-    if isinstance(old, list) and isinstance(new, list):
-        return len(old) == len(new) and all(_json_equal(a, b) for a, b in zip(old, new))
-    if isinstance(old, (dict, list)) or isinstance(new, (dict, list)):
-        return False
-    return old == new
-
-
 def _layout_changed(
     old: dict,
     new: dict,
@@ -685,10 +587,10 @@ def _layout_changed(
     # Without this, None vs {} set layout_changed while producing no ``ui.*``/
     # ``viewport.*`` change, so ``--include-layout`` reported a layout change with
     # nothing to show and still exited 0.
-    if not _json_equal(_layout_block(old.get('viewport')), _layout_block(new.get('viewport'))):
+    if not json_equal(_layout_block(old.get('viewport')), _layout_block(new.get('viewport'))):
         return True
     for component_id in common_ids:
-        if not _json_equal(
+        if not json_equal(
             _layout_block(old_components[component_id].get('ui')),
             _layout_block(new_components[component_id].get('ui')),
         ):
@@ -716,7 +618,7 @@ def _diff_value(old: Any, new: Any, path: str) -> list[FieldChange]:
         return _diff_mapping(old, new, path)
     if isinstance(old, list) and isinstance(new, list):
         return _diff_sequence(old, new, path)
-    if not _json_equal(old, new):
+    if not json_equal(old, new):
         return [FieldChange(path=path, kind='changed', old=old, new=new)]
     return []
 
