@@ -294,6 +294,92 @@ class TestRenderHuman(unittest.TestCase):
         self.assertIn('~ viewport.x: 0 -> 120', out)
         self.assertIn('1 viewport field changed', out)
 
+    def test_c1_and_bidi_controls_are_escaped(self) -> None:
+        # C1 controls (U+009B is an 8-bit CSI on terminals that honor C1) and the
+        # Unicode bidi/isolate controls can reorder or spoof what the reviewer
+        # reads, so they are escaped like the C0 controls.
+        unsafe = ['\u009b', '\u0085', '؜', '‎', '‏', ' ', ' ']
+        unsafe += [chr(code) for code in range(0x202A, 0x202F)] + [chr(code) for code in range(0x2066, 0x206A)]
+        value = 'safe ' + ''.join(unsafe) + ' evil'
+        diff = PipeDiff(
+            node_changes=[
+                NodeChange(
+                    id='n1',
+                    kind='config',
+                    field_changes=[FieldChange(path='config.note', kind='changed', old='a', new=value)],
+                )
+            ],
+            edge_changes=[EdgeChange(from_id='f‮', lane='l⁦', to_id='t\u009b', kind='added')],
+        )
+        out = render_human(diff, use_color=False)
+        for char in unsafe:
+            self.assertNotIn(char, out)
+        self.assertIn('\\x9b', out)
+        self.assertIn('\\x85', out)
+        self.assertIn('\\u202e', out)
+        self.assertIn('\\u2066', out)
+        self.assertIn('f\\u202e --l\\u2066--> t\\x9b', out)
+
+    def test_printable_non_ascii_is_left_alone(self) -> None:
+        diff = PipeDiff(
+            node_changes=[
+                NodeChange(
+                    id='n1',
+                    kind='config',
+                    field_changes=[FieldChange(path='config.note', kind='changed', old='café', new='日本 → ok')],
+                )
+            ]
+        )
+        self.assertIn('~ config.note: café -> 日本 → ok', render_human(diff, use_color=False))
+
+    def test_type_only_changes_render_distinguishably(self) -> None:
+        diff = PipeDiff(
+            node_changes=[
+                NodeChange(
+                    id='n1',
+                    kind='config',
+                    field_changes=[
+                        FieldChange(path='config.n', kind='changed', old=512, new='512'),
+                        FieldChange(path='config.flag', kind='changed', old=True, new='true'),
+                        FieldChange(path='config.z', kind='changed', old=None, new='null'),
+                        FieldChange(path='config.s', kind='changed', old='a', new='b'),
+                        FieldChange(path='config.q', kind='changed', old='""', new=''),
+                    ],
+                )
+            ],
+            version_change=(1, '1'),
+        )
+        out = render_human(diff, use_color=False)
+        self.assertIn('~ config.n: 512 -> "512"', out)
+        self.assertIn('~ config.flag: true -> "true"', out)
+        self.assertIn('~ config.z: null -> "null"', out)
+        # Same-type string changes keep the compact bare rendering.
+        self.assertIn('~ config.s: a -> b', out)
+        self.assertIn('~ config.q: "\\"\\"" -> ""', out)
+        self.assertIn('Version: 1 -> "1"', out)
+        self.assertIn('version 1 → "1"', out.splitlines()[0])
+
+    def test_empty_string_value_is_visible(self) -> None:
+        diff = PipeDiff(
+            node_changes=[
+                NodeChange(
+                    id='n1',
+                    kind='config',
+                    field_changes=[
+                        FieldChange(path='config.note', kind='changed', old='', new='x'),
+                        FieldChange(path='config.extra', kind='added', new=''),
+                    ],
+                )
+            ]
+        )
+        out = render_human(diff, use_color=False)
+        self.assertIn('~ config.note: "" -> x', out)
+        self.assertIn('+ config.extra = ""', out)
+
+    def test_provider_type_change_uses_json_spelling(self) -> None:
+        diff = PipeDiff(node_changes=[NodeChange(id='n1', kind='provider', provider_old=0, provider_new=False)])
+        self.assertIn('~ n1 provider: 0 -> false', render_human(diff, use_color=False))
+
 
 class TestRenderJson(unittest.TestCase):
     def test_empty_diff_shape(self) -> None:
@@ -416,6 +502,61 @@ class TestRenderMarkdown(unittest.TestCase):
         parsed.feed(cmarkgfm.github_flavored_markdown_to_html(render_markdown(diff)))
         self.assertEqual(parsed.items, ['+ new_source --text--> target', '- old_source --control--> target'])
         self.assertEqual(parsed.max_depth, 1)
+
+    @unittest.skipIf(cmarkgfm is None, 'cmarkgfm is not installed')
+    def test_empty_string_value_cannot_break_out_of_its_code_span(self) -> None:
+        # An empty value used to render as a bare double backtick, which GFM pairs
+        # with the next value's two-backtick fence: the arrow became the code span
+        # and the rest of the untrusted value rendered as live Markdown.
+        hostile = 'x` [click](https://example.invalid/p) @someone ![i](https://example.invalid/i.png) **bold**'
+        diff = PipeDiff(
+            node_changes=[
+                NodeChange(
+                    id='n1',
+                    kind='config',
+                    field_changes=[FieldChange(path='config.note', kind='changed', old='', new=hostile)],
+                ),
+                NodeChange(id='n2', kind='provider', provider_old='', provider_new=hostile),
+            ],
+            version_change=('', hostile),
+        )
+        out = render_markdown(diff)
+        html = cmarkgfm.github_flavored_markdown_to_html(out)
+        for tag in ('<a ', '<img', '<strong>bold'):
+            self.assertNotIn(tag, html)
+        # The empty side is shown as a visible JSON empty string.
+        self.assertIn('<code>&quot;&quot;</code> → <code>x` [click]', html)
+        self.assertIn('**Version:** `""` →', out)
+
+    def test_md_code_never_emits_an_empty_code_span(self) -> None:
+        from rocketride.pipediff.reporters import _md_code
+
+        self.assertEqual(_md_code(''), '`""`')
+
+    def test_values_use_json_spelling(self) -> None:
+        diff = PipeDiff(
+            node_changes=[
+                NodeChange(
+                    id='n1',
+                    kind='config',
+                    field_changes=[
+                        FieldChange(path='config.flag', kind='changed', old=True, new='true'),
+                        FieldChange(path='config.n', kind='changed', old=512, new='512'),
+                        FieldChange(path='config.z', kind='removed', old=None),
+                        FieldChange(path='config.claude', kind='added', new={'apikey': 'x'}),
+                        FieldChange(path='config.on', kind='changed', old=True, new=False),
+                    ],
+                )
+            ]
+        )
+        out = render_markdown(diff)
+        self.assertIn('| `config.flag` | `true` → `"true"` |', out)
+        self.assertIn('| `config.n` | `512` → `"512"` |', out)
+        self.assertIn('| `config.z` | - `null` |', out)
+        self.assertIn('| `config.claude` | + `{"apikey": "x"}` |', out)
+        self.assertIn('| `config.on` | `true` → `false` |', out)
+        self.assertNotIn('True', out)
+        self.assertNotIn('None', out)
 
     def test_empty_diff_summary(self) -> None:
         out = render_markdown(PipeDiff())

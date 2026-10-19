@@ -62,6 +62,8 @@ import json
 import re
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
+from .engine import _json_equal
+
 if TYPE_CHECKING:  # pragma: no cover - typing-only imports
     from .model import PipeDiff
 
@@ -187,9 +189,11 @@ def _organize(diff: 'PipeDiff') -> Dict[str, Any]:
                     'config_changes': [],
                 },
             )
-            if (
-                node_change.provider_old is not None or node_change.provider_new is not None
-            ) and node_change.provider_old != node_change.provider_new:
+            # JSON equality, not ``!=``: Python treats ``0 == False``, which would
+            # drop a real ``0`` -> ``false`` provider change from every report.
+            if (node_change.provider_old is not None or node_change.provider_new is not None) and not _json_equal(
+                node_change.provider_old, node_change.provider_new
+            ):
                 entry['provider_old'] = node_change.provider_old
                 entry['provider_new'] = node_change.provider_new
                 entry['has_provider_change'] = True
@@ -251,17 +255,45 @@ def _fmt_value(value: Any) -> str:
     Strings are returned bare; every other JSON type (numbers, booleans, ``None``,
     dicts, lists) is serialized with ``json.dumps`` so the type stays unambiguous
     (``null``/``true``/``false``) and nested structures render deterministically.
+    The empty string is the exception: bare, it would print as nothing at all, so
+    it renders as ``""``.
     """
     if isinstance(value, str):
-        return value
+        return value if value else '""'
     return json.dumps(value, ensure_ascii=False, sort_keys=True)
 
 
-# C0 control characters that must never reach a terminal verbatim: CR and LF can
-# rewrite the line the user is reading, ESC starts an ANSI/OSC sequence that can
-# recolor, reposition, or (with OSC 52) touch the clipboard. Tab is harmless and
-# is left alone.
-_TERM_UNSAFE = re.compile(r'[\x00-\x08\x0b-\x1f\x7f]|\r|\n')
+def _fmt_pair(old: Any, new: Any) -> Tuple[str, str]:
+    """
+    Render the two sides of a change so that differing values never read the same.
+
+    Both sides go through :func:`_fmt_value`, which leaves strings bare. That is
+    ambiguous exactly when a string meets another type (``512`` -> ``"512"``
+    printed as ``512 -> 512``) or when two different strings print alike (``""``
+    and the empty string). In those cases strings are JSON-quoted instead, so the
+    type change stays visible; same-type string edits keep the compact form.
+    """
+    old_text, new_text = _fmt_value(old), _fmt_value(new)
+    if isinstance(old, str) != isinstance(new, str) or old_text == new_text:
+        old_text = json.dumps(old, ensure_ascii=False, sort_keys=True)
+        new_text = json.dumps(new, ensure_ascii=False, sort_keys=True)
+    return old_text, new_text
+
+
+# Control characters that must never reach a terminal verbatim. C0: CR and LF can
+# rewrite the line the user is reading, and ESC starts an ANSI/OSC sequence that
+# can recolor, reposition, or (with OSC 52) touch the clipboard. C1 (U+0080-U+009F):
+# U+009B is an 8-bit CSI on terminals that honor C1, and U+0085 is a line break.
+# Unicode line/paragraph separators and the bidi embedding, override, isolate and
+# mark controls can reorder or spoof the text a reviewer reads (Trojan Source).
+# Tab is harmless and is left alone.
+_TERM_UNSAFE = re.compile(r'[\x00-\x08\x0a-\x1f\x7f-\x9f؜‎‏  ‪-‮⁦-⁩]')
+
+
+def _escape_control(match: re.Match) -> str:
+    """Spell one unsafe character as a visible ``\\xNN`` or ``\\uNNNN`` escape."""
+    code = ord(match.group())
+    return f'\\x{code:02x}' if code <= 0xFF else f'\\u{code:04x}'
 
 
 def _term_safe(text: Any) -> str:
@@ -271,11 +303,12 @@ def _term_safe(text: Any) -> str:
     Node ids, providers, lanes, config paths, and config values all come from a
     ``.pipe`` file that the diff itself is meant to review, so they are untrusted
     input. Printing them verbatim lets a crafted value emit ANSI escapes (recolor
-    the report, hide lines, move the cursor) or a bare CR/LF that fakes extra
-    report lines. Every such byte is rendered as its ``\\xNN`` escape instead;
-    tabs and printable text pass through unchanged.
+    the report, hide lines, move the cursor), a bare CR/LF that fakes extra
+    report lines, or bidi controls that reorder what is displayed. Every such
+    character is rendered as its ``\\xNN`` (or ``\\uNNNN``) escape instead; tabs
+    and printable text pass through unchanged.
     """
-    return _TERM_UNSAFE.sub(lambda m: f'\\x{ord(m.group()):02x}', str(text))
+    return _TERM_UNSAFE.sub(_escape_control, str(text))
 
 
 def _identity(text: Any) -> str:
@@ -337,7 +370,8 @@ def _summary_phrase(org: Dict[str, Any], fmt=_identity) -> str:
 
     version_change = org['version_change']
     if version_change:
-        parts.append(f'version {fmt(_fmt_value(version_change[0]))} → {fmt(_fmt_value(version_change[1]))}')
+        old_version, new_version = _fmt_pair(version_change[0], version_change[1])
+        parts.append(f'version {fmt(old_version)} → {fmt(new_version)}')
 
     if org['layout_changed']:
         parts.append('layout changed')
@@ -368,8 +402,7 @@ def _human_field_line(field_change: Any, palette: _Palette) -> str:
         body = f'{_MARK_REMOVED} {path} = {_term_safe(_fmt_value(field_change.old))}'
         return '    ' + palette.removed(body)
     # changed
-    old = _term_safe(_fmt_value(field_change.old))
-    new = _term_safe(_fmt_value(field_change.new))
+    old, new = (_term_safe(text) for text in _fmt_pair(field_change.old, field_change.new))
     return '    ' + palette.changed(f'{_MARK_CHANGED} {path}: ') + f'{old} ' + palette.dim('->') + f' {new}'
 
 
@@ -412,18 +445,19 @@ def render_human(diff: 'PipeDiff', *, use_color: bool) -> str:
         lines.append('')
         lines.append('Nodes')
         for node_id, provider in org['nodes_added']:
-            lines.append('  ' + palette.added(f'{_MARK_ADDED} {_term_safe(node_id)} ({_term_safe(provider)})'))
+            lines.append(
+                '  ' + palette.added(f'{_MARK_ADDED} {_term_safe(node_id)} ({_term_safe(_fmt_value(provider))})')
+            )
         for node_id, provider in org['nodes_removed']:
-            lines.append('  ' + palette.removed(f'{_MARK_REMOVED} {_term_safe(node_id)} ({_term_safe(provider)})'))
+            lines.append(
+                '  ' + palette.removed(f'{_MARK_REMOVED} {_term_safe(node_id)} ({_term_safe(_fmt_value(provider))})')
+            )
         for entry in org['nodes_changed']:
             if entry['has_provider_change']:
                 marker = palette.changed(f'{_MARK_CHANGED} {_term_safe(entry["id"])} provider: ')
+                provider_old, provider_new = _fmt_pair(entry['provider_old'], entry['provider_new'])
                 lines.append(
-                    '  '
-                    + marker
-                    + f'{_term_safe(entry["provider_old"])} '
-                    + palette.dim('->')
-                    + f' {_term_safe(entry["provider_new"])}'
+                    '  ' + marker + f'{_term_safe(provider_old)} ' + palette.dim('->') + f' {_term_safe(provider_new)}'
                 )
 
     # --- Edges ---
@@ -449,8 +483,7 @@ def render_human(diff: 'PipeDiff', *, use_color: bool) -> str:
 
     # --- Version / Layout ---
     if org['version_change']:
-        old = _term_safe(_fmt_value(org['version_change'][0]))
-        new = _term_safe(_fmt_value(org['version_change'][1]))
+        old, new = (_term_safe(text) for text in _fmt_pair(*org['version_change']))
         lines.append('')
         lines.append('Version: ' + f'{old} ' + palette.dim('->') + f' {new}')
 
@@ -573,8 +606,15 @@ def _md_code(text: str) -> str:
     links) in the auto-posted PR comment. Neutralizing them here — the single choke
     point every value passes through — covers bullets, table cells, and the version
     line at once.
+
+    The empty string has no code-span form: a bare double backtick is read as an
+    opening delimiter that pairs with the next value's two-backtick fence, which
+    leaves that value's text outside any span as live Markdown. It is rendered as
+    the visible JSON empty string ``""`` instead.
     """
     text = str(text).replace('\r', ' ').replace('\n', ' ')
+    if not text:
+        return '`""`'
     if '`' not in text:
         return f'`{text}`'
     longest = max(len(run) for run in re.findall(r'`+', text))
@@ -632,10 +672,11 @@ def _md_cell(text: str) -> str:
 def _md_field_change(field_change: Any) -> str:
     """Render a config FieldChange as a compact Markdown 'change' fragment."""
     if field_change.kind == 'added':
-        return f'{_MD_ADDED} {_md_code(field_change.new)}'
+        return f'{_MD_ADDED} {_md_code(_fmt_value(field_change.new))}'
     if field_change.kind == 'removed':
-        return f'{_MD_REMOVED} {_md_code(field_change.old)}'
-    return f'{_md_code(field_change.old)} → {_md_code(field_change.new)}'
+        return f'{_MD_REMOVED} {_md_code(_fmt_value(field_change.old))}'
+    old, new = _fmt_pair(field_change.old, field_change.new)
+    return f'{_md_code(old)} → {_md_code(new)}'
 
 
 def render_markdown(diff: 'PipeDiff', *, title: Optional[str] = None) -> str:
@@ -683,13 +724,13 @@ def render_markdown(diff: 'PipeDiff', *, title: Optional[str] = None) -> str:
         lines.append('')
         lines.append('**Nodes**')
         for node_id, provider in org['nodes_added']:
-            lines.append(f'- {_md_code(_MD_ADDED)} {_md_code(node_id)} ({_md_code(provider)})')
+            lines.append(f'- {_md_code(_MD_ADDED)} {_md_code(node_id)} ({_md_code(_fmt_value(provider))})')
         for node_id, provider in org['nodes_removed']:
-            lines.append(f'- {_md_code(_MD_REMOVED)} {_md_code(node_id)} ({_md_code(provider)})')
+            lines.append(f'- {_md_code(_MD_REMOVED)} {_md_code(node_id)} ({_md_code(_fmt_value(provider))})')
         for entry in provider_changed:
+            provider_old, provider_new = _fmt_pair(entry['provider_old'], entry['provider_new'])
             lines.append(
-                f'- {_MD_CHANGED} {_md_code(entry["id"])} provider: '
-                f'{_md_code(entry["provider_old"])} → {_md_code(entry["provider_new"])}'
+                f'- {_MD_CHANGED} {_md_code(entry["id"])} provider: {_md_code(provider_old)} → {_md_code(provider_new)}'
             )
 
     # --- Edges ---
@@ -718,8 +759,7 @@ def render_markdown(diff: 'PipeDiff', *, title: Optional[str] = None) -> str:
 
     # --- Version / Layout ---
     if org['version_change']:
-        old = _md_code(_fmt_value(org['version_change'][0]))
-        new = _md_code(_fmt_value(org['version_change'][1]))
+        old, new = (_md_code(text) for text in _fmt_pair(*org['version_change']))
         lines.append('')
         lines.append(f'**Version:** {old} → {new}')
 
