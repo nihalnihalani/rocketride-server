@@ -102,14 +102,15 @@ DEFAULT_MAX_EXECUTE_ROWS = 25000
 # "Upload". So `_format_db_error` cuts the text of a driver it recognised
 # with that driver's markers alone -- only SQLAlchemy's for pymysql's
 # `(errno, message)`, where MySQL appends nothing to its own sentence, and
-# ClickHouse's for clickhouse-driver's `.code` / `.message`, or for ClickHouse
-# text arriving over its MySQL interface as an `(errno, message)` pair. Only a shape it cannot attribute to
-# one driver gets every group, as a backstop, and the backstop keeps the
-# markers it had before the ClickHouse-only ones below were added: a marker
+# ClickHouse's for ClickHouse's own text, whether it arrives as
+# clickhouse-driver's `.code` / `.message` or over ClickHouse's MySQL
+# interface as an `(errno, message)` pair. A shape it cannot attribute to one
+# driver gets the backstop: SQLAlchemy's markers, PostgreSQL's, and the
+# ClickHouse markers that predate the ClickHouse-only ones below. A marker
 # narrow enough for ClickHouse's own text is still too broad for an unknown
 # driver's prose.
 #
-# Within that backstop, two kinds of marker cannot be matched the same way:
+# Two kinds of marker cannot be matched the same way:
 #
 #   * The tails a library APPENDS can begin anywhere, mid-line included, so
 #     they stay bare substrings.
@@ -127,7 +128,8 @@ DEFAULT_MAX_EXECUTE_ROWS = 25000
 # ClickHouse formats the echoed query back out of its AST, so the phrase is
 # followed by the shape of a statement there, while in prose ("not in scope
 # for this trigger") it is not. Four shapes can follow, and each carries the
-# caller's inlined bind values:
+# caller's inlined bind values. The backstop keeps only the first, behind
+# `in scope`; the rest, and `In query`, apply only to ClickHouse's own text:
 #
 #   * a statement keyword and a space, optionally parenthesised -- a scope
 #     that is itself a subquery is formatted through `ASTSubquery`, which
@@ -233,13 +235,16 @@ _DB_ERROR_DETAIL = re.compile(
     re.VERBOSE,
 )
 
-# How every message ClickHouse writes opens: `DB::Exception:`, after
-# `Code: <errno>. ` when it arrives over the MySQL wire protocol as a pymysql
-# `(errno, message)` pair (a prefix that only repeats the errno, so a match's
-# end is where the text worth keeping starts). Anchored, so text that merely
-# mentions the phrase -- a SIGNAL's, or another driver's -- is not taken for
-# ClickHouse's and cut with its markers.
-_CLICKHOUSE_TEXT = re.compile(r'\A(?:Code:\ \d+\.\ )?(?=DB::Exception:)')
+# How every message ClickHouse writes opens: the exception class --
+# `DB::Exception:`, or on older servers a subclass such as
+# `DB::ParsingException:`, which is the one their parse errors (and so the
+# `here:` / `before:` echoes) carry -- after `Code: <errno>. ` when the text
+# arrives over the MySQL wire protocol as a pymysql `(errno, message)` pair.
+# That prefix only repeats the errno, so a match's end is where the text worth
+# keeping starts. Anchored, so text that merely mentions the phrase -- a
+# SIGNAL's, or another driver's -- is not taken for ClickHouse's and cut with
+# its markers.
+_CLICKHOUSE_TEXT = re.compile(r'\A(?:Code:\ \d+\.\ )?(?=DB::\w*Exception:)')
 
 # ClickHouse's FUNCTION_THROW_IF_VALUE_IS_NON_ZERO: `throwIf` raised it, with
 # the caller's own message. ClickHouse then appends the runtime context of the
@@ -447,7 +452,9 @@ class DatabaseGlobalBase(IGlobalBase, ABC):
           stopped prints the rest of its input after `` here: `` or
           `` before: '``. All of
           those are cut by ClickHouse's markers, which apply only to text
-          that opens with ``DB::Exception:``; any other ``.code`` /
+          that opens with ClickHouse's exception class (``DB::Exception:``,
+          or an older server's ``DB::ParsingException:``); any other
+          ``.code`` /
           ``.message`` pair gets the backstop. The echoes are not cosmetic:
           the driver sends no server-side parameters by default, so the
           statement it echoes back has the caller's bind values already
