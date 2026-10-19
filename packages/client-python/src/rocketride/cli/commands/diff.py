@@ -79,6 +79,8 @@ from ...pipediff.reporters import render_human, render_json, render_markdown
 # as newly added.
 _EMPTY_PIPE: Dict[str, Any] = {'components': []}
 
+_TOO_DEEP = 'Pipeline nesting is too deep to load, compare, or render; reduce nested values'
+
 
 def _should_use_color(stream: Any = None) -> bool:
     """
@@ -178,7 +180,10 @@ def _render(args, diff: Any) -> str:
         The fully rendered report string for printing to stdout.
     """
     if getattr(args, 'json', False):
-        return json.dumps(render_json(diff), indent=2, ensure_ascii=False, sort_keys=True, allow_nan=False)
+        try:
+            return json.dumps(render_json(diff), indent=2, ensure_ascii=False, sort_keys=True, allow_nan=False)
+        except ValueError as exc:  # a non-finite number; JSON has no spelling for it
+            raise PipeDiffError(f'The report contains a value JSON cannot represent: {exc}') from exc
     if getattr(args, 'markdown', False):
         return render_markdown(diff)
     return render_human(diff, use_color=_should_use_color(sys.stdout))
@@ -212,17 +217,25 @@ async def run_diff(args) -> int:
     """
     include_layout = bool(getattr(args, 'include_layout', False))
 
+    # ValueError is a usage error only while reading arguments and inputs; from
+    # the comparison or a reporter it would be a bug, so it is not caught there
+    # and keeps its traceback instead of passing for bad input.
     try:
         old_obj, new_obj = _resolve_inputs(args)
+    except (PipeDiffError, ValueError) as exc:
+        return _fail(str(exc))
+    except RecursionError:
+        return _fail(_TOO_DEEP)
+    try:
         diff = diff_pipes(old_obj, new_obj, include_layout=include_layout)
         # Build the complete report before writing stdout: loading, comparison
         # and rendering can each exceed Python's recursion limit for deep JSON.
         report = _render(args, diff)
-        code = 0 if getattr(args, 'exit_zero', False) else (1 if diff.has_semantic_changes else 0)
-    except (PipeDiffError, ValueError) as exc:
+    except PipeDiffError as exc:
         return _fail(str(exc))
     except RecursionError:
-        return _fail('Pipeline nesting is too deep to load, compare, or render; reduce nested values')
+        return _fail(_TOO_DEEP)
+    code = 0 if getattr(args, 'exit_zero', False) else (1 if diff.has_semantic_changes else 0)
 
     # Report output goes to stdout only; nothing above this point wrote there.
     print(report)

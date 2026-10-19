@@ -255,12 +255,33 @@ def _fmt_value(value: Any) -> str:
     Strings are returned bare; every other JSON type (numbers, booleans, ``None``,
     dicts, lists) is serialized with ``json.dumps`` so the type stays unambiguous
     (``null``/``true``/``false``) and nested structures render deterministically.
-    The empty string is the exception: bare, it would print as nothing at all, so
-    it renders as ``""``.
+    A string is JSON-quoted instead when bare text would misread it: when it
+    is empty (it would print as nothing), has leading or trailing whitespace (it
+    would look trimmed), or would itself read as a JSON value (``"true"``,
+    ``"512"``, ``"null"``, or the two-character ``""``), so ``"true"`` and
+    ``true`` never print alike.
     """
     if isinstance(value, str):
-        return value if value else '""'
+        return json.dumps(value, ensure_ascii=False) if _reads_ambiguously(value) else value
     return json.dumps(value, ensure_ascii=False, sort_keys=True)
+
+
+def _reads_ambiguously(text: str) -> bool:
+    """Report whether a bare string would be mistaken for another value (see :func:`_fmt_value`)."""
+    if not text or text != text.strip():
+        return True
+    try:
+        json.loads(text)
+    except RecursionError:
+        return True
+    except ValueError:
+        return False
+    return True
+
+
+def _visible(text: str) -> str:
+    """Collapse whitespace the way a reader sees it (code spans trim, HTML folds runs)."""
+    return ' '.join(text.split())
 
 
 def _fmt_pair(old: Any, new: Any, escape: Any = None) -> Tuple[str, str]:
@@ -281,7 +302,7 @@ def _fmt_pair(old: Any, new: Any, escape: Any = None) -> Tuple[str, str]:
     """
     escape = escape or _identity
     old_text, new_text = _fmt_value(old), _fmt_value(new)
-    if isinstance(old, str) != isinstance(new, str) or escape(old_text) == escape(new_text):
+    if isinstance(old, str) != isinstance(new, str) or _visible(escape(old_text)) == _visible(escape(new_text)):
         old_text = json.dumps(old, ensure_ascii=False, sort_keys=True)
         new_text = json.dumps(new, ensure_ascii=False, sort_keys=True)
     return old_text, new_text
@@ -294,7 +315,7 @@ def _fmt_pair(old: Any, new: Any, escape: Any = None) -> Tuple[str, str]:
 # Unicode line/paragraph separators and the bidi embedding, override, isolate and
 # mark controls can reorder or spoof the text a reviewer reads (Trojan Source).
 # Tab is harmless and is left alone.
-_TERM_UNSAFE = re.compile(r'[\x00-\x08\x0a-\x1f\x7f-\x9f؜‎‏  ‪-‮⁦-⁩]')
+_TERM_UNSAFE = re.compile(r'[\x00-\x08\x0a-\x1f\x7f-\x9f\u061c\u200e\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069]')
 
 
 def _escape_control(match: re.Match) -> str:
@@ -619,7 +640,7 @@ def _md_code(text: str) -> str:
     leaves that value's text outside any span as live Markdown. It is rendered as
     the visible JSON empty string ``""`` instead.
     """
-    text = str(text).replace('\r', ' ').replace('\n', ' ')
+    text = _TERM_UNSAFE.sub(_escape_control, str(text).replace('\r', ' ').replace('\n', ' '))
     if not text:
         return '`""`'
     if '`' not in text:

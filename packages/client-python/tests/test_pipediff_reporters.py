@@ -341,6 +341,51 @@ class TestRenderHuman(unittest.TestCase):
         self.assertNotIn('‮', out)
         self.assertNotIn('\x1b', out)
 
+    def test_one_sided_values_that_read_as_other_json_are_quoted(self) -> None:
+        diff = PipeDiff(
+            node_changes=[
+                NodeChange(
+                    id='n1',
+                    kind='config',
+                    field_changes=[
+                        FieldChange(path='config.a', kind='added', new='true'),
+                        FieldChange(path='config.b', kind='added', new=True),
+                        FieldChange(path='config.c', kind='added', new='""'),
+                        FieldChange(path='config.d', kind='added', new=''),
+                        FieldChange(path='config.e', kind='removed', old='512'),
+                        FieldChange(path='config.f', kind='added', new='gpt-4 '),
+                        FieldChange(path='config.g', kind='added', new='gpt-4'),
+                    ],
+                )
+            ]
+        )
+        out = render_human(diff, use_color=False)
+        self.assertIn('+ config.a = "true"', out)
+        self.assertIn('+ config.b = true', out)
+        self.assertIn('+ config.c = "\\"\\""', out)
+        self.assertIn('+ config.d = ""', out)
+        self.assertIn('- config.e = "512"', out)
+        self.assertIn('+ config.f = "gpt-4 "', out)
+        self.assertIn('+ config.g = gpt-4', out)
+
+    def test_whitespace_only_changes_stay_visible(self) -> None:
+        diff = PipeDiff(
+            node_changes=[
+                NodeChange(
+                    id='n1',
+                    kind='config',
+                    field_changes=[
+                        FieldChange(path='config.tab', kind='changed', old='a\tb', new='a b'),
+                        FieldChange(path='config.pad', kind='changed', old='gpt-4', new=' gpt-4 '),
+                    ],
+                )
+            ]
+        )
+        out = render_human(diff, use_color=False)
+        self.assertIn('~ config.tab: "a\\tb" -> "a b"', out)
+        # The padded side is quoted on its own, which already makes the edit visible.
+        self.assertIn('~ config.pad: gpt-4 -> " gpt-4 "', out)
+
     def test_printable_non_ascii_is_left_alone(self) -> None:
         diff = PipeDiff(
             node_changes=[
@@ -567,6 +612,54 @@ class TestRenderMarkdown(unittest.TestCase):
         self.assertIn('| `n1` | `config.s` | `"a\\nb"` → `"a b"` |', out)
         self.assertIn('- ~ `n2` provider: `"p\\nq"` → `"p q"`', out)
         self.assertIn('**Version:** `"1\\n2"` → `"1 2"`', out)
+
+    def test_control_and_bidi_characters_are_escaped_in_markdown(self) -> None:
+        # The Markdown report is auto-posted as a PR comment; a bidi override in a
+        # value or id would visually reorder the diff a reviewer reads there.
+        unsafe = ['\u202e', '\u2066', '\u200f', '\u2028', '\u009b', '\x1b']
+        diff = PipeDiff(
+            node_changes=[
+                NodeChange(id='n\u202e1', kind='added', provider_new='p\u2066'),
+                NodeChange(
+                    id='n2',
+                    kind='config',
+                    field_changes=[
+                        FieldChange(path='config.v', kind='changed', old='a', new='safe ' + ''.join(unsafe) + ' evil')
+                    ],
+                ),
+            ],
+            version_change=('1', '2\u200f'),
+        )
+        out = render_markdown(diff, title='flow\u202e.pipe')
+        for char in unsafe:
+            self.assertNotIn(char, out)
+        self.assertIn('`n\\u202e1`', out)
+        self.assertIn('\\u2066', out)
+        self.assertIn('\\x1b', out)
+
+    def test_markdown_pairs_compare_what_github_renders(self) -> None:
+        # A code span drops one leading and trailing space, so `gpt-4` and
+        # ` gpt-4 ` render alike unless the pair is quoted.
+        diff = PipeDiff(
+            node_changes=[
+                NodeChange(
+                    id='n1',
+                    kind='config',
+                    field_changes=[FieldChange(path='config.m', kind='changed', old='gpt-4', new=' gpt-4 ')],
+                )
+            ]
+        )
+        self.assertIn('| `n1` | `config.m` | `gpt-4` → `" gpt-4 "` |', render_markdown(diff))
+
+    def test_reporter_source_has_no_raw_invisible_characters(self) -> None:
+        import unicodedata
+
+        import rocketride.pipediff.reporters as reporters_module
+
+        with open(reporters_module.__file__, encoding='utf-8') as handle:
+            source = handle.read()
+        hidden = sorted({f'U+{ord(c):04X}' for c in source if unicodedata.category(c) in ('Cf', 'Zl', 'Zp')})
+        self.assertEqual(hidden, [])
 
     def test_md_code_never_emits_an_empty_code_span(self) -> None:
         from rocketride.pipediff.reporters import _md_code
