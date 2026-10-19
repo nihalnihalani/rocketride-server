@@ -270,7 +270,9 @@ class TestRenderHuman(unittest.TestCase):
         out = render_human(diff, use_color=False)
         self.assertNotIn('\x1b', out)
         self.assertNotIn('\r', out)
-        self.assertIn('\\x1b', out)
+        # A value holding an escaped character is JSON-quoted, so its ESC reads as
+        # JSON's escape; an id is not a JSON value and gets the terminal escape.
+        self.assertIn('"\\u001b[31mred\\u001b[0m"', out)
         self.assertIn('\\x0d\\x0afake line', out)
 
     def test_control_characters_escaped_in_ids_lanes_and_version(self) -> None:
@@ -298,7 +300,7 @@ class TestRenderHuman(unittest.TestCase):
         # C1 controls (U+009B is an 8-bit CSI on terminals that honor C1) and the
         # Unicode bidi/isolate controls can reorder or spoof what the reviewer
         # reads, so they are escaped like the C0 controls.
-        unsafe = ['\u009b', '\u0085', '؜', '‎', '‏', ' ', ' ']
+        unsafe = ['\u009b', '\u0085', '\u061c', '\u200e', '\u200f', '\u2028', '\u2029']
         unsafe += [chr(code) for code in range(0x202A, 0x202F)] + [chr(code) for code in range(0x2066, 0x206A)]
         value = 'safe ' + ''.join(unsafe) + ' evil'
         diff = PipeDiff(
@@ -309,7 +311,7 @@ class TestRenderHuman(unittest.TestCase):
                     field_changes=[FieldChange(path='config.note', kind='changed', old='a', new=value)],
                 )
             ],
-            edge_changes=[EdgeChange(from_id='f‮', lane='l⁦', to_id='t\u009b', kind='added')],
+            edge_changes=[EdgeChange(from_id='f\u202e', lane='l\u2066', to_id='t\u009b', kind='added')],
         )
         out = render_human(diff, use_color=False)
         for char in unsafe:
@@ -321,24 +323,27 @@ class TestRenderHuman(unittest.TestCase):
         self.assertIn('f\\u202e --l\\u2066--> t\\x9b', out)
 
     def test_escaped_control_and_literal_escape_text_stay_distinguishable(self) -> None:
-        # U+202E and the six characters `‮` both print as `‮` once the
-        # control is escaped; the pair is then JSON-quoted so the edit stays visible.
+        # U+202E and the six characters `\u202e` would both print as `\u202e` once
+        # the control is escaped, so a value holding an escaped character is
+        # JSON-quoted and the pair stays visibly different.
         diff = PipeDiff(
             node_changes=[
                 NodeChange(
                     id='n1',
                     kind='config',
                     field_changes=[
-                        FieldChange(path='config.bidi', kind='changed', old='‮', new='\\u202e'),
+                        FieldChange(path='config.bidi', kind='changed', old='\u202e', new='\\u202e'),
                         FieldChange(path='config.esc', kind='changed', old='\\x1b', new='\x1b'),
                     ],
                 )
             ]
         )
         out = render_human(diff, use_color=False)
-        self.assertIn('~ config.bidi: "\\u202e" -> "\\\\u202e"', out)
-        self.assertIn('~ config.esc: "\\\\x1b" -> "\\u001b"', out)
-        self.assertNotIn('‮', out)
+        # A value holding an escaped character is JSON-quoted, so the real control
+        # is quoted and the bare text of its escape is not.
+        self.assertIn('~ config.bidi: "\\u202e" -> \\u202e', out)
+        self.assertIn('~ config.esc: \\x1b -> "\\u001b"', out)
+        self.assertNotIn('\u202e', out)
         self.assertNotIn('\x1b', out)
 
     def test_one_sided_values_that_read_as_other_json_are_quoted(self) -> None:
@@ -595,8 +600,7 @@ class TestRenderMarkdown(unittest.TestCase):
         self.assertIn('**Version:** `""` →', out)
 
     def test_values_that_render_alike_in_markdown_stay_distinguishable(self) -> None:
-        # _md_code folds line breaks to spaces, so `a\nb` and `a b` rendered the
-        # same; such pairs are JSON-quoted in every Markdown location.
+        # `a\nb` and `a b` used to render the same in Markdown.
         diff = PipeDiff(
             node_changes=[
                 NodeChange(
@@ -609,9 +613,122 @@ class TestRenderMarkdown(unittest.TestCase):
             version_change=('1\n2', '1 2'),
         )
         out = render_markdown(diff)
-        self.assertIn('| `n1` | `config.s` | `"a\\nb"` → `"a b"` |', out)
-        self.assertIn('- ~ `n2` provider: `"p\\nq"` → `"p q"`', out)
-        self.assertIn('**Version:** `"1\\n2"` → `"1 2"`', out)
+        # A value holding a line break is JSON-quoted in every Markdown location, so
+        # it never reads like the same text with a space.
+        self.assertIn('| `n1` | `config.s` | `"a\\nb"` → `a b` |', out)
+        self.assertIn('- ~ `n2` provider: `"p\\nq"` → `p q`', out)
+        self.assertIn('**Version:** `"1\\n2"` → `1 2`', out)
+
+    # Each value differs from the plain one only by a character a reader cannot see:
+    # a zero-width space or joiner, a word joiner, a BOM, a soft hyphen, a tag
+    # character, or a space other than U+0020.
+    _LOOKALIKES = [
+        ('openai', 'open\u200bai'),
+        ('ab', 'a\u200db'),
+        ('ab', 'a\u2060b'),
+        ('ab', 'a\ufeffb'),
+        ('ab', 'a\u00adb'),
+        ('ab', 'a\U000e0041b'),
+        ('a b', 'a\u00a0b'),
+        ('a b', 'a\u3000b'),
+        # Just as invisible, but not format characters or spaces by category.
+        ('ab', 'a\u034fb'),
+        ('ab', 'a\ufe0fb'),
+        ('ab', 'a\U000e0100b'),
+        ('ab', 'a\u180bb'),
+        ('ab', 'a\u3164b'),
+        ('ab', 'a\u2800b'),
+    ]
+
+    def test_invisible_and_lookalike_characters_are_escaped(self) -> None:
+        """A change hidden in an invisible character must show in both reports."""
+        for old, new in self._LOOKALIKES:
+            with self.subTest(new=new.encode('unicode_escape').decode()):
+                diff = PipeDiff(
+                    node_changes=[
+                        NodeChange(
+                            id='n1',
+                            kind='config',
+                            field_changes=[FieldChange(path='config.v', kind='changed', old=old, new=new)],
+                        ),
+                        NodeChange(id=new, kind='added', provider_new=new),
+                    ]
+                )
+                (hidden,) = [char for char in new if char not in old]
+                code = ord(hidden)
+                escape = (
+                    f'\\x{code:02x}' if code <= 0xFF else (f'\\u{code:04x}' if code <= 0xFFFF else f'\\U{code:08x}')
+                )
+                for out in (render_markdown(diff), render_human(diff, use_color=False)):
+                    self.assertNotIn(hidden, out)
+                    self.assertIn(escape, out)
+
+    @unittest.skipIf(cmarkgfm is None, 'cmarkgfm is not installed')
+    def test_invisible_characters_render_differently_on_github(self) -> None:
+        """Checked through cmark-gfm: the two sides of each change render as different text."""
+        for old, new in self._LOOKALIKES:
+            with self.subTest(new=new.encode('unicode_escape').decode()):
+                diff = PipeDiff(
+                    node_changes=[
+                        NodeChange(
+                            id='n1',
+                            kind='config',
+                            field_changes=[FieldChange(path='config.v', kind='changed', old=old, new=new)],
+                        )
+                    ]
+                )
+                html = cmarkgfm.github_flavored_markdown_to_html(render_markdown(diff))
+                spans = re.findall(r'<code>(.*?)</code>', html)
+                change = spans[-2:]
+                self.assertEqual(len(change), 2, html)
+                self.assertNotEqual(' '.join(change[0].split()), ' '.join(change[1].split()), html)
+
+    def test_one_sided_values_keep_escapes_and_their_text_apart(self) -> None:
+        """An added real control and an added text of its escape must not print alike."""
+        diff = PipeDiff(
+            node_changes=[
+                NodeChange(
+                    id='n1',
+                    kind='config',
+                    field_changes=[
+                        FieldChange(path='config.real', kind='added', new='\u202e'),
+                        FieldChange(path='config.text', kind='added', new='\\u202e'),
+                        FieldChange(path='config.esc', kind='removed', old='\x1b'),
+                        FieldChange(path='config.esc_text', kind='removed', old='\\x1b'),
+                        FieldChange(path='config.newline', kind='added', new='a\nb'),
+                        FieldChange(path='config.space', kind='added', new='a b'),
+                    ],
+                )
+            ]
+        )
+        md = render_markdown(diff)
+        self.assertIn('| `n1` | `config.real` | + `"\\u202e"` |', md)
+        self.assertIn('| `n1` | `config.text` | + `\\u202e` |', md)
+        self.assertIn('| `n1` | `config.esc` | - `"\\u001b"` |', md)
+        self.assertIn('| `n1` | `config.esc_text` | - `\\x1b` |', md)
+        self.assertIn('| `n1` | `config.newline` | + `"a\\nb"` |', md)
+        self.assertIn('| `n1` | `config.space` | + `a b` |', md)
+        human = render_human(diff, use_color=False)
+        self.assertIn('+ config.real = "\\u202e"', human)
+        self.assertIn('+ config.text = \\u202e', human)
+        self.assertIn('- config.esc = "\\u001b"', human)
+        self.assertIn('- config.esc_text = \\x1b', human)
+
+    def test_a_lone_surrogate_is_escaped_rather_than_breaking_output(self) -> None:
+        """JSON's ``"\\ud800"`` decodes to a lone surrogate, which no UTF-8 stream can carry."""
+        diff = PipeDiff(
+            node_changes=[
+                NodeChange(
+                    id='n\ud800',
+                    kind='config',
+                    field_changes=[FieldChange(path='config.v', kind='changed', old='a', new='\udfff')],
+                )
+            ]
+        )
+        for out in (render_markdown(diff), render_human(diff, use_color=False)):
+            out.encode('utf-8')
+            self.assertIn('\\ud800', out)
+            self.assertIn('\\udfff', out)
 
     def test_control_and_bidi_characters_are_escaped_in_markdown(self) -> None:
         # The Markdown report is auto-posted as a PR comment; a bidi override in a
@@ -635,7 +752,8 @@ class TestRenderMarkdown(unittest.TestCase):
             self.assertNotIn(char, out)
         self.assertIn('`n\\u202e1`', out)
         self.assertIn('\\u2066', out)
-        self.assertIn('\\x1b', out)
+        self.assertIn('\\u001b', out)
+        self.assertIn('\\x9b', out)
 
     def test_markdown_pairs_compare_what_github_renders(self) -> None:
         # A code span drops one leading and trailing space, so `gpt-4` and
@@ -943,10 +1061,12 @@ class TestRenderMarkdown(unittest.TestCase):
         rows = _table_body_rows(out)
         self.assertEqual(len(rows), 1, out)
         row = rows[0]
-        # One row means the embedded newlines were folded, not passed through.
-        self.assertIn('a b', row)
-        self.assertIn('C:\\tmp next\\|line', row)
-        self.assertNotIn('C:\\\\tmp', row)
+        # One row means the embedded newlines were neutralized, not passed through:
+        # each value holds a newline, so it is JSON-quoted and the newline reads as
+        # JSON's `\n`. The only doubled backslash is JSON's own; the cell adds none.
+        self.assertIn('`"a\\nb"`', row)
+        self.assertIn('`"C:\\\\tmp\\nnext\\|line"`', row)
+        self.assertNotIn('C:\\\\\\tmp', row)
         self.assertEqual(row.replace('\\|', '').count('|'), 4, row)
 
 

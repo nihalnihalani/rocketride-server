@@ -60,6 +60,7 @@ from __future__ import annotations
 
 import json
 import re
+import unicodedata
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 from ._pipejson import json_equal
@@ -257,9 +258,11 @@ def _fmt_value(value: Any) -> str:
     (``null``/``true``/``false``) and nested structures render deterministically.
     A string is JSON-quoted instead when bare text would misread it: when it
     is empty (it would print as nothing), has leading or trailing whitespace (it
-    would look trimmed), or would itself read as a JSON value (``"true"``,
-    ``"512"``, ``"null"``, or the two-character ``""``), so ``"true"`` and
-    ``true`` never print alike.
+    would look trimmed), would itself read as a JSON value (``"true"``,
+    ``"512"``, ``"null"``, or the two-character ``""``), or holds a character
+    the renderers escape (a real U+202E and the six characters ``\\u202e``
+    would otherwise print alike). So ``"true"`` and ``true`` never print alike,
+    and neither does an escaped character and the text of its escape.
     """
     if isinstance(value, str):
         return json.dumps(value, ensure_ascii=False) if _reads_ambiguously(value) else value
@@ -268,7 +271,7 @@ def _fmt_value(value: Any) -> str:
 
 def _reads_ambiguously(text: str) -> bool:
     """Report whether a bare string would be mistaken for another value (see :func:`_fmt_value`)."""
-    if not text or text != text.strip():
+    if not text or text != text.strip() or _has_unsafe(text):
         return True
     try:
         json.loads(text)
@@ -295,10 +298,11 @@ def _fmt_pair(old: Any, new: Any, escape: Any = None) -> Tuple[str, str]:
     type change stays visible; same-type string edits keep the compact form.
 
     ``escape`` is the renderer's escaping (``_term_safe`` for the terminal,
-    ``_md_code`` for Markdown, which folds line breaks to spaces). The
-    two sides are compared *after* it, because escaping can make them collide:
-    U+202E and the literal text ``\\u202e`` both print as ``\\u202e``. JSON
-    quoting then escapes the backslash, which keeps them apart.
+    ``_md_code`` for Markdown). The two sides are compared *after* it, because
+    escaping and whitespace folding can make them collide: a reader sees runs of
+    spaces collapse in a code span. JSON quoting then keeps them apart. A string
+    holding an escaped character is already JSON-quoted by :func:`_fmt_value`, so
+    U+202E never prints like the literal text ``\\u202e``.
     """
     escape = escape or _identity
     old_text, new_text = _fmt_value(old), _fmt_value(new)
@@ -308,20 +312,51 @@ def _fmt_pair(old: Any, new: Any, escape: Any = None) -> Tuple[str, str]:
     return old_text, new_text
 
 
-# Control characters that must never reach a terminal verbatim. C0: CR and LF can
-# rewrite the line the user is reading, and ESC starts an ANSI/OSC sequence that
-# can recolor, reposition, or (with OSC 52) touch the clipboard. C1 (U+0080-U+009F):
-# U+009B is an 8-bit CSI on terminals that honor C1, and U+0085 is a line break.
-# Unicode line/paragraph separators and the bidi embedding, override, isolate and
-# mark controls can reorder or spoof the text a reviewer reads (Trojan Source).
-# Tab is harmless and is left alone.
-_TERM_UNSAFE = re.compile(r'[\x00-\x08\x0a-\x1f\x7f-\x9f\u061c\u200e\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069]')
+# Characters that must never reach a terminal or a PR comment verbatim, by Unicode
+# category. Controls (Cc): CR and LF can rewrite the line the user is reading, ESC
+# starts an ANSI/OSC sequence that can recolor, reposition, or (with OSC 52) touch
+# the clipboard, U+009B is an 8-bit CSI and U+0085 a line break. Format characters
+# (Cf): the bidi embedding, override, isolate and mark controls can reorder what a
+# reviewer reads (Trojan Source), and zero-width spaces and joiners, the BOM, soft
+# hyphens and tag characters are invisible, so ``openai`` and ``open<U+200B>ai``
+# would print alike. Spaces other than U+0020 (Zs: NBSP, ideographic space) look
+# like a plain space, line and paragraph separators (Zl, Zp) break lines, lone
+# surrogates (Cs) cannot even be encoded for output, and unassigned code points
+# (Cn) may be any of the above in a later Unicode version. A few characters are
+# just as invisible but sit in other categories (combining marks, letters,
+# symbols): the combining grapheme joiner, the Hangul fillers, the Khmer inherent
+# vowels, the Mongolian free variation selectors, the braille blank and the
+# variation selectors, so they are listed explicitly. Tab is harmless and is
+# left alone. The pattern only pre-selects candidates; the category decides.
+_TERM_UNSAFE = re.compile(r'[^\t\x20-\x7e]')
+_UNSAFE_CATEGORIES = frozenset({'Cc', 'Cf', 'Cs', 'Cn', 'Zl', 'Zp', 'Zs'})
+_INVISIBLE_OTHER = frozenset(
+    [0x034F, 0x115F, 0x1160, 0x17B4, 0x17B5, 0x2800, 0x3164, 0xFFA0]
+    + list(range(0x180B, 0x1810))
+    + list(range(0xFE00, 0xFE10))
+    + list(range(0xE0100, 0xE01F0))
+)
+
+
+def _is_unsafe(char: str) -> bool:
+    """Report whether one character must be escaped (see :data:`_TERM_UNSAFE`)."""
+    return unicodedata.category(char) in _UNSAFE_CATEGORIES or ord(char) in _INVISIBLE_OTHER
 
 
 def _escape_control(match: re.Match) -> str:
-    """Spell one unsafe character as a visible ``\\xNN`` or ``\\uNNNN`` escape."""
-    code = ord(match.group())
-    return f'\\x{code:02x}' if code <= 0xFF else f'\\u{code:04x}'
+    """Spell one unsafe character as a visible ``\\xNN``, ``\\uNNNN`` or ``\\UNNNNNNNN`` escape."""
+    char = match.group()
+    if not _is_unsafe(char):
+        return char
+    code = ord(char)
+    if code <= 0xFF:
+        return f'\\x{code:02x}'
+    return f'\\u{code:04x}' if code <= 0xFFFF else f'\\U{code:08x}'
+
+
+def _has_unsafe(text: str) -> bool:
+    """Report whether ``text`` holds a character :func:`_escape_control` would escape."""
+    return any(_is_unsafe(char) for char in _TERM_UNSAFE.findall(text))
 
 
 def _term_safe(text: Any) -> str:
@@ -627,20 +662,22 @@ def _md_code(text: str) -> str:
     stripped by the renderer. This picks a delimiter longer than the longest
     internal backtick run so arbitrary values render literally.
 
-    Line breaks are collapsed to spaces first. A CommonMark code span cannot span a
-    blank line, so a newline in an untrusted value (node id, provider, lane, config
-    value) would otherwise terminate the span and the enclosing bullet/table cell,
-    letting the trailing text render as real Markdown (headings, ``@`` mentions,
-    links) in the auto-posted PR comment. Neutralizing them here — the single choke
-    point every value passes through — covers bullets, table cells, and the version
-    line at once.
+    Line breaks and every other unsafe character are written as visible escapes
+    (``\\x0a``, ``\\u202e``; see :data:`_TERM_UNSAFE`). A CommonMark code span cannot
+    span a blank line, so a newline in an untrusted value (node id, provider, lane,
+    config value) would otherwise terminate the span and the enclosing bullet/table
+    cell, letting the trailing text render as real Markdown (headings, ``@``
+    mentions, links) in the auto-posted PR comment. Escaping rather than folding it
+    to a space also keeps ``a\\nb`` and ``a b`` apart. Neutralizing them here — the
+    single choke point every value passes through — covers bullets, table cells,
+    and the version line at once.
 
     The empty string has no code-span form: a bare double backtick is read as an
     opening delimiter that pairs with the next value's two-backtick fence, which
     leaves that value's text outside any span as live Markdown. It is rendered as
     the visible JSON empty string ``""`` instead.
     """
-    text = _TERM_UNSAFE.sub(_escape_control, str(text).replace('\r', ' ').replace('\n', ' '))
+    text = _TERM_UNSAFE.sub(_escape_control, str(text))
     if not text:
         return '`""`'
     if '`' not in text:

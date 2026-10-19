@@ -155,8 +155,11 @@ difference is deliberate: `diff` produces a report, not a command result.
 
 The default **human** output is grouped and colored (color auto-disables when
 piped or when `NO_COLOR` is set), with `+` added, `-` removed, `~` changed.
-Control characters in values — C0, C1, and the Unicode bidi and line-separator
-controls — are printed as `\xNN`/`\uNNNN` escapes:
+Characters a reader cannot see or trust in values and identifiers are printed
+as `\xNN`/`\uNNNN` escapes: C0 and C1 controls, the Unicode bidi controls,
+zero-width and other format characters (a zero-width space, a BOM, a soft
+hyphen), every space other than U+0020, line and paragraph separators, and lone
+surrogates:
 
 ```text
 Pipeline diff: 1 node changed, layout changed
@@ -227,18 +230,20 @@ _Layout (ui/viewport) changed._
 Values reaching the Markdown report are untrusted `.pipe` content, so every value
 is wrapped in a code span whose fence is longer than any backtick run inside it,
 and pipes are escaped so a value cannot split the table row or break out of the
-comment. Control characters and the Unicode bidi and line-separator controls are
-written as `\uNNNN`-style escapes, so a crafted value cannot reorder what the
-reviewer sees in the rendered comment. Node and edge add/remove signs are also
+comment. The same characters as in the human output — controls, bidi and other
+format characters, non-ASCII spaces, separators, line breaks — are written as
+`\xNN`/`\uNNNN`-style escapes, so a crafted value cannot reorder or hide what
+the reviewer sees in the rendered comment. Node and edge add/remove signs are also
 code-spanned, preserving the visible `+` or `-` beside each identity after
 GitHub renders the list.
 
 In every format but JSON, strings print bare and other values use JSON spelling
 (`true`, `null`, `{"k": "v"}`). A string is JSON-quoted when bare text would
-misread it: when it is empty (`""`), has leading or trailing whitespace, or
-would itself read as a JSON value (`"true"`, `"512"`). When the two sides of a
-change would still look alike, because they cross types or differ only in
-whitespace or escaped characters, both are JSON-quoted.
+misread it: when it is empty (`""`), has leading or trailing whitespace, would
+itself read as a JSON value (`"true"`, `"512"`), or holds an escaped character,
+so that a real U+202E (`"\u202e"`) and the six characters `\u202e` never print
+alike. When the two sides of a change would still look alike, because they cross
+types or differ only in whitespace, both are JSON-quoted.
 
 ## Review pipelines like code in CI
 

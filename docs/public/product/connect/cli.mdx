@@ -326,8 +326,8 @@ under `--include-layout`; `summary.viewport_changes` is its length.
 
 `--markdown` emits a compact, PR-comment-friendly report — a one-line summary,
 bullet lists for nodes and edges, and a table for config changes (with `|`,
-backticks, control and bidi characters escaped so untrusted values can't break or
-reorder the comment):
+backticks, and control, bidi, zero-width and non-ASCII space characters escaped so
+untrusted values can't break, reorder or hide anything in the comment):
 
 ```markdown
 **Pipeline diff:** 1 node changed, layout changed
