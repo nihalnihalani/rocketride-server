@@ -206,15 +206,22 @@ class DatabaseInstanceBase(IInstanceBase, ABC):
         """
 
     def _sessionsAreTransactions(self) -> bool:
-        """Return whether a ``begin`` session is a database transaction on this dialect.
+        """Return whether a ``begin`` session is a database transaction on this node.
 
-        Not on ClickHouse: clickhouse-sqlalchemy's native connector makes
-        ``commit`` and ``rollback`` no-ops and ClickHouse has no savepoints, so
-        a session only reserves a connection, and every statement sent on it
-        is executed when it is sent. The session tools' descriptions read this,
-        so that no agent is told its work can be rolled back when it cannot.
+        True here. A node whose driver cannot hold a transaction overrides it
+        to return False -- db_clickhouse does, because clickhouse-sqlalchemy's
+        native connector makes ``commit`` and ``rollback`` no-ops and
+        ClickHouse has no savepoints -- and the session tools' descriptions
+        and errors then say what such a session is: a reserved connection
+        whose statements are executed as they are sent. No agent is told its
+        work can be rolled back when it cannot.
         """
-        return self._db_dialect() != 'clickhouse'
+        return True
+
+    def _unknownSession(self, session_id: Any) -> ValueError:
+        """Return the error for a ``session_id`` the registry does not hold."""
+        kind = 'transaction session' if self._sessionsAreTransactions() else 'session'
+        return ValueError(f'unknown or expired {kind}: {session_id}')
 
     def _sessionRecoveryPolicy(self) -> str:
         """Return the ``execute`` description's sentence on a session after a failed statement.
@@ -225,9 +232,9 @@ class DatabaseInstanceBase(IInstanceBase, ABC):
         """
         if not self._sessionsAreTransactions():
             return (
-                'A failed statement inside a session_id leaves the session open. A session opens no '
-                'ClickHouse transaction, so it undoes nothing: every statement is executed when it is '
-                'sent, rollback discards nothing, and savepoints do not exist.'
+                f'A failed statement inside a session_id leaves the session open. A session on '
+                f'{self._db_display_name()} opens no transaction, so it undoes nothing: every statement is '
+                f'executed when it is sent, rollback discards nothing, and savepoints do not exist.'
             )
         return (
             'A failed statement inside a session_id rolls nothing back and leaves the session open: '
@@ -436,7 +443,7 @@ class DatabaseInstanceBase(IInstanceBase, ABC):
             'required': ['sql'],
             'properties': {
                 'sql': {'type': 'string', 'description': 'Raw SQL statement to execute.'},
-                'session_id': {'type': 'string', 'description': 'Optional transaction session id from begin.'},
+                'session_id': {'type': 'string', 'description': 'Optional session id from begin.'},
                 'params': {'type': 'array', 'description': 'Optional positional bind values for $1..$n.'},
                 'row_mode': {
                     'type': 'string',
@@ -478,7 +485,7 @@ class DatabaseInstanceBase(IInstanceBase, ABC):
             try:
                 result = self.IGlobal.tx_registry.execute(session_id, sql.strip(), params, row_mode)
             except KeyError:
-                raise ValueError(f'unknown or expired transaction session: {session_id}')
+                raise self._unknownSession(session_id)
             except Exception as e:
                 # The statement itself failed. `tx_registry` has no IGlobal and
                 # is shared with other callers, so the formatting the sessionless
@@ -605,7 +612,7 @@ class DatabaseInstanceBase(IInstanceBase, ABC):
         try:
             (self.IGlobal.tx_registry.commit if commit else self.IGlobal.tx_registry.rollback)(args['session_id'])
         except KeyError:
-            raise ValueError(f'unknown or expired transaction session: {args["session_id"]}')
+            raise self._unknownSession(args['session_id'])
         return {'ok': True}
 
     @tool_function(

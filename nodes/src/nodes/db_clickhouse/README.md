@@ -69,8 +69,8 @@ leaves the cached schema exactly as it was. `get_data` returns
 `{valid: false, answer}`, and a query execution failure returns
 `{valid: false, error, sql, rows: []}`.
 
-`execute` requires non-empty `sql` and optionally accepts a transaction
-`session_id` plus positional values for `$1`, `$2`, and so on. It returns
+`execute` requires non-empty `sql` and optionally accepts a `session_id`
+from `begin` plus positional values for `$1`, `$2`, and so on. It returns
 `{rows, affected_rows}`. A failed statement raises `SQL execution failed:`
 followed by `Error <code>:` and ClickHouse's own primary message,
 identically with and without a `session_id`. The `clickhouse+native://`
@@ -78,16 +78,21 @@ driver does not raise a DBAPI error, so the node unwraps it to the driver
 error it carries; the code and message come from the server's
 own `ServerException`. What is removed is the tail: SQLAlchemy's
 `[SQL: ...]` / `[parameters: ...]` echo, ClickHouse's server stack trace,
-its `failed at position` quotation of the statement, and every place
-ClickHouse is known to repeat the statement or expression it was working
-on — after `in scope` (including a named CTE's `x AS (...)` and a lambda's
-`x -> ...`), after `In query`, after `while processing query:`, a
+its `failed at position` quotation of the statement, the rest of the input a
+parser prints after `here:` (for `INSERT ... VALUES`, the remaining rows),
+and the places ClickHouse is known to repeat the statement or expression it
+was working on — after `in scope` (including a named CTE's `x AS (...)`, a
+lambda's `x -> ...` and a function call such as `nofunc(...)`), after
+`In query`, after `while processing query:`, a
 mutation's `while processing:` or the old interpreter's `While processing`,
 together with the `required columns` list that follows. The driver
 interpolates bound values into the statement before sending it, so each of
-those repeats carries them. A `throwIf` message (code 395) is the caller's
-own text and comes back whole, whatever it says. The rest is passed through
-as ClickHouse wrote it: the primary sentence, which can name a value or an
+those carries them. These are the shapes the node recognises, not a promise
+that ClickHouse has no other. A `throwIf` message (code 395) that ClickHouse
+reports with its runtime context, `: while executing 'FUNCTION ...'`, is the
+caller's own text and comes back whole; one reported without that context
+gets the markers like any other message. The rest is passed through as
+ClickHouse wrote it: the primary sentence, which can name a value or an
 identifier the statement carried or touched, and a runtime context such as
 `while executing 'FUNCTION ...'`, literals included. Two cases lose text but
 never leak it: a quoted value that itself contains one of the tails above is
@@ -157,9 +162,10 @@ subsequent execution will succeed.
 
 Leave this off by default. When on, the `execute`, `begin`, `commit`, and
 `rollback` tools can bypass LLM translation and the generated-query safety
-check, and raw statements use a transaction that commits on success. Enable it
-only for trusted callers that need writes or dialect-specific SQL; use
-`get_data` for ordinary read-only retrieval.
+check, and each raw statement is applied when it runs: ClickHouse holds no
+transaction for it to commit or roll back. Enable it only for trusted callers
+that need writes or dialect-specific SQL; use `get_data` for ordinary
+read-only retrieval.
 
 ## Limitations
 

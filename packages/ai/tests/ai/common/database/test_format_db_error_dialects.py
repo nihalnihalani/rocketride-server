@@ -139,6 +139,14 @@ def _clickhouse(code, message):
     return _ClickHouseDatabaseException(_ClickHouseServerException(code, message + _CLICKHOUSE_STACK_TRACE))
 
 
+class _ClickHouseDbapiError(Exception):
+    """Stand-in for ``clickhouse_driver.dbapi``'s ``OperationalError(ServerException)``.
+
+    That layer's error carries the driver's ``ServerException`` as the only
+    element of its ``args``, with no ``.code`` of its own.
+    """
+
+
 def _mysql(errno, message):
     """A pymysql error wrapped the way SQLAlchemy wraps one it catches."""
     return DBAPIError.instance('SELECT 1', {}, _PyMySQLError(errno, message), dbapi_base_err=Exception)
@@ -374,6 +382,115 @@ def test_clickhouse_cuts_a_mutation_while_processing_echo(base, message, expecte
     assert 'while processing' not in result
 
 
+@pytest.mark.parametrize(
+    ('message', 'expected', 'canaries'),
+    [
+        # INSERT INTO t (n, s) VALUES ($1, $2), ($3), ($4, $5) -- row 2 is missing a value
+        (
+            "DB::Exception: Cannot parse expression of type UInt32 here: 2), (3, 'QA_CANARY_ROW3'): "
+            'While executing ValuesBlockInputFormat',
+            'Error 62: DB::Exception: Cannot parse expression of type UInt32',
+            ['QA_CANARY_ROW3'],
+        ),
+        # INSERT INTO t (n, s) VALUES ($1), ($2, $3) -- row 1 is missing a value
+        (
+            "DB::Exception: Cannot parse expression of type UInt32 here: 1), (2, 'QA_CANARY_AFTER'): "
+            'While executing ValuesBlockInputFormat',
+            'Error 62: DB::Exception: Cannot parse expression of type UInt32',
+            ['QA_CANARY_AFTER'],
+        ),
+        # SELECT toDate($1)
+        (
+            'DB::Exception: Cannot parse date here: QA_CANARY_: Cannot parse Date from String: '
+            "In scope SELECT toDate('QA_CANARY_TODATE')",
+            'Error 38: DB::Exception: Cannot parse date',
+            ['QA_CANARY_'],
+        ),
+    ],
+    ids=['values-row-2', 'values-row-1', 'todate'],
+)
+def test_clickhouse_cuts_the_input_a_parser_prints_after_here(base, message, expected, canaries):
+    """A parser that stopped prints the rest of its input after `` here: ``.
+
+    For ``INSERT ... VALUES`` that is every later row, with the values bound
+    into them. The code is set below to the one each message was captured with.
+    """
+    code = int(expected.split(':')[0].split()[1])
+
+    result = base._format_db_error(_clickhouse(code, message))
+
+    assert result == expected
+    for canary in canaries:
+        assert canary not in result
+
+
+def test_clickhouse_cuts_a_function_call_scope_echo(base):
+    """An expression evaluated on its own is echoed as ``In scope f(...)``.
+
+    ``INSERT INTO t (n, s) VALUES ($1, $2), (nofunc($3), $4), ($5, $6)`` with
+    ``$3`` bound to ``QA_CANARY_FNARG``.
+    """
+    exc = _clickhouse(
+        46,
+        "DB::Exception: Function with name `nofunc` does not exist. In scope nofunc('QA_CANARY_FNARG'): "
+        'While executing ValuesBlockInputFormat',
+    )
+
+    result = base._format_db_error(exc)
+
+    assert result == 'Error 46: DB::Exception: Function with name `nofunc` does not exist.'
+    assert 'QA_CANARY_FNARG' not in result
+
+
+def test_clickhouse_keeps_a_bad_value_in_a_well_formed_values_row(base):
+    """Unchanged: a value the parser could read but not convert is named, nothing more.
+
+    ``INSERT INTO t (n, s) VALUES ($1, $2), ($3, $4), ($5, $6)`` with ``$3``
+    bound to ``'abc'`` and canaries in rows 1 and 3. ClickHouse evaluates the
+    value as an expression and reports only it, with a runtime context.
+    """
+    message = (
+        "DB::Exception: Cannot parse string 'abc' as UInt32: syntax error at begin of string. Note: there are "
+        'toUInt32OrZero and toUInt32OrNull functions, which returns zero/NULL instead of throwing exception: '
+        "while executing 'FUNCTION if(isNull(-dummy-0) : 3, defaultValueOfTypeName('UInt32') :: 2, "
+        "_CAST(-dummy-0, 'UInt32') :: 4) -> if(isNull(-dummy-0), defaultValueOfTypeName('UInt32'), "
+        "_CAST(-dummy-0, 'UInt32')) UInt32 : 1': While executing ValuesBlockInputFormat"
+    )
+
+    assert base._format_db_error(_clickhouse(6, message)) == f'Error 6: {message}.'
+
+
+@pytest.mark.parametrize(
+    ('message', 'code', 'expected'),
+    [
+        (
+            'DB::Exception: Unknown expression identifier `nope_col` in scope x AS (SELECT nope_col '
+            "FROM qa_lead_r_orders WHERE qa_mark = 'QA_CANARY_LEAD_R1')",
+            47,
+            'Error 47: DB::Exception: Unknown expression identifier `nope_col`',
+        ),
+        (
+            "DB::Exception: In scope SELECT secret: while executing 'FUNCTION throwIf(1_UInt8 :: 1, "
+            "'In scope SELECT secret'_String :: 2) -> throwIf(1_UInt8, 'In scope SELECT secret'_String) UInt8 : 3'",
+            395,
+            'Error 395: DB::Exception: In scope SELECT secret',
+        ),
+    ],
+    ids=['cte-echo', 'throwif'],
+)
+def test_clickhouse_dbapi_layer_reaches_the_same_branch(base, message, code, expected):
+    """``clickhouse_driver.dbapi`` is unwrapped to its ``ServerException`` first.
+
+    The captured messages above, through the other connector layer. Before,
+    its ``args`` held the exception object, so it fell through to ``str(orig)``
+    and the backstop markers, which no longer carry the ClickHouse-only ones.
+    """
+    server = _ClickHouseServerException(code, message + _CLICKHOUSE_STACK_TRACE)
+    exc = DBAPIError.instance('SELECT 1', {}, _ClickHouseDbapiError(server), dbapi_base_err=Exception)
+
+    assert base._format_db_error(exc) == expected
+
+
 def test_execute_reports_a_clickhouse_scope_echo_without_the_bound_value():
     """The same cut as the caller of the ``execute`` tool sees it."""
     message = _execute_error(
@@ -432,21 +549,22 @@ def test_mysql_keeps_a_signal_message_that_contains_a_new_clickhouse_marker(base
     assert base._format_db_error(_mysql(1644, text)) == f'Error 1644: {text}'
 
 
-def test_mysql_keeps_a_signal_message_that_contains_a_sqlalchemy_marker(base):
-    """SQLAlchemy's tail is only ever in ``str()`` of its own exception, never in ``args``.
+def test_an_errno_message_pair_keeps_sqlalchemys_markers(base):
+    """The ``(int, str)`` branch keeps the strip it always had: SQLAlchemy's markers.
 
-    A SIGNAL text, sent the same way as the ones above. On this branch the
-    marker could only misfire.
+    Constructed: a driver of pymysql's shape that is not pymysql, carrying a
+    SQLAlchemy-style tail in its own message. Only those markers apply here,
+    so MySQL's own sentences above stay whole.
     """
-    text = 'Quota hit (Background on this error: see ops)'
+    exc = _mysql(1, "boom\n[SQL: SELECT secret FROM t WHERE token = 'QA_CANARY_ERRNO']")
 
-    assert base._format_db_error(_mysql(1644, text)) == f'Error 1644: {text}'
+    assert base._format_db_error(exc) == 'Error 1: boom'
 
 
 @pytest.mark.parametrize(
     'fragment',
-    ["'LINE 1: x'", "'Stack trace: x'", "'in scope SELECT'", "'[SQL: x]'"],
-    ids=['line-n', 'stack-trace', 'in-scope', 'sqlalchemy-tail'],
+    ["'LINE 1: x'", "'Stack trace: x'", "'in scope SELECT'"],
+    ids=['line-n', 'stack-trace', 'in-scope'],
 )
 def test_mysql_keeps_its_own_near_fragment_whole(base, fragment):
     """``SELEC <fragment> FROM qa_my_customers`` -> 1064, quoting the statement it stopped on.
@@ -460,6 +578,62 @@ def test_mysql_keeps_its_own_near_fragment_whole(base, fragment):
     )
 
     assert base._format_db_error(_mysql(1064, text)) == f'Error 1064: {text}'
+
+
+@pytest.mark.parametrize(
+    ('errno', 'message', 'expected', 'canary'),
+    [
+        # SELECT nope FROM t WHERE s = %s
+        (
+            47,
+            'Code: 47. DB::Exception: Unknown expression identifier `nope` in scope SELECT nope FROM t WHERE '
+            "s = 'QA_CANARY_MYIF_1A'. (UNKNOWN_IDENTIFIER) (version 25.8.33.6 (official build))",
+            'Error 47: DB::Exception: Unknown expression identifier `nope`',
+            'QA_CANARY_MYIF_1A',
+        ),
+        # WITH x AS (SELECT nope FROM t WHERE s = %s) SELECT * FROM x
+        (
+            47,
+            'Code: 47. DB::Exception: Unknown expression identifier `nope` in scope x AS (SELECT nope FROM t '
+            "WHERE s = 'QA_CANARY_MYIF_1B'). (UNKNOWN_IDENTIFIER) (version 25.8.33.6 (official build))",
+            'Error 47: DB::Exception: Unknown expression identifier `nope`',
+            'QA_CANARY_MYIF_1B',
+        ),
+        # SELECT throwIf(1, 'In scope SELECT secret')
+        (
+            395,
+            "Code: 395. DB::Exception: In scope SELECT secret: while executing 'FUNCTION throwIf(1_UInt8 :: 1, "
+            "'In scope SELECT secret'_String :: 2) -> throwIf(1_UInt8, 'In scope SELECT secret'_String) UInt8 : 3'. "
+            '(FUNCTION_THROW_IF_VALUE_IS_NON_ZERO) (version 25.8.33.6 (official build))',
+            'Error 395: DB::Exception: In scope SELECT secret',
+            None,
+        ),
+        # SELECT throwIf(1, 'Upload failed at position 3 of batch')
+        (
+            395,
+            'Code: 395. DB::Exception: Upload failed at position 3 of batch: while executing '
+            "'FUNCTION throwIf(1_UInt8 :: 1, 'Upload failed at position 3 of batch'_String :: 2) -> "
+            "throwIf(1_UInt8, 'Upload failed at position 3 of batch'_String) UInt8 : 3'. "
+            '(FUNCTION_THROW_IF_VALUE_IS_NON_ZERO) (version 25.8.33.6 (official build))',
+            'Error 395: DB::Exception: Upload failed at position 3 of batch',
+            None,
+        ),
+    ],
+    ids=['scope-echo', 'cte-echo', 'throwif-scope-words', 'throwif-tail-words'],
+)
+def test_clickhouse_text_over_the_mysql_wire_gets_clickhouses_markers(base, errno, message, expected, canary):
+    """db_mysql pointed at ClickHouse's MySQL interface (port 9004) gets pymysql's ``(errno, message)``.
+
+    The pair says which protocol carried the error, not which server wrote
+    it: the text is ClickHouse's, statement echo and bound value included, so
+    it is cut as ClickHouse's text is -- ``throwIf`` exception and all. The
+    ``Code: N.`` prefix only repeats the errno and is dropped.
+    """
+    result = base._format_db_error(_mysql(errno, message))
+
+    assert result == expected
+    if canary:
+        assert canary not in result
 
 
 def test_mysql_branch_still_never_returns_the_sqlalchemy_tail(base):
@@ -589,6 +763,25 @@ def test_clickhouse_keeps_a_throwif_message_evaluated_lazily_inside_if(base):
     assert base._format_db_error(exc) == 'Error 395: DB::Exception: Upload failed at position 3 of batch'
 
 
+def test_clickhouse_does_not_split_a_throwif_message_at_its_own_words(base):
+    """The context starts at ``: while executing 'FUNCTION ``, not at the caller's words.
+
+    ``SELECT throwIf(1, 'step 1: while executing ''phase two'' failed at
+    position 3')``. The caller's own "while executing" comes first; inside the
+    context's literal ClickHouse escapes their quotes as ``\\'``.
+    """
+    exc = _clickhouse(
+        395,
+        "DB::Exception: step 1: while executing 'phase two' failed at position 3: while executing 'FUNCTION "
+        "throwIf(1_UInt8 :: 1, 'step 1: while executing \\'phase two\\' failed at position 3'_String :: 2) -> "
+        "throwIf(1_UInt8, 'step 1: while executing \\'phase two\\' failed at position 3'_String) UInt8 : 3'",
+    )
+
+    assert base._format_db_error(exc) == (
+        "Error 395: DB::Exception: step 1: while executing 'phase two' failed at position 3"
+    )
+
+
 def test_clickhouse_keeps_a_throwif_raised_inside_a_scalar_subquery(base):
     """A scalar subquery's ``throwIf`` is reported like a top-level one.
 
@@ -657,13 +850,29 @@ def test_execute_reports_a_clickhouse_throwif_message_whole():
         'aborted while processing batch 3',
         'temp table is not in scope x for this trigger',
         'Rule hit in query SELECT-list validation',
+        'Import aborted: While processing row 5 of upload.csv',
+        'Rejected: In query WITH clause not allowed',
+        "constraint failed while processing: 'batch 7'",
+        'Bad row here: 3',
     ],
-    ids=['in-query-prose', 'while-processing-prose', 'in-scope-name-prose', 'keyword-not-followed-by-space'],
+    ids=[
+        'in-query-prose',
+        'while-processing-prose',
+        'in-scope-name-prose',
+        'keyword-not-followed-by-space',
+        'capital-while-processing',
+        'in-query-with',
+        'while-processing-quote',
+        'here',
+    ],
 )
 def test_prose_sharing_a_word_with_a_clickhouse_marker_survives(base, text):
-    """Each marker needs the shape ClickHouse's formatter prints, not just the words.
+    """The backstop keeps the markers it had; the ClickHouse-only ones never reach it.
 
-    Constructed texts, through the generic ``args[0]`` branch.
+    Constructed texts, through the generic ``args[0]`` branch, which sqlite3
+    and psycopg2 without ``diag`` reach and which cannot say who wrote the
+    text. The last four used to be cut there by markers meant for ClickHouse's
+    own text.
     """
     exc = DBAPIError.instance('SELECT 1', {}, _DriverError(text), dbapi_base_err=Exception)
 
