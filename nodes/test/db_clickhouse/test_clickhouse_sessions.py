@@ -13,18 +13,40 @@ This pins that the real node opts out, so an agent reading the ClickHouse
 tools is never told its work can be rolled back.
 """
 
+import importlib
 import sys
+import types
 from pathlib import Path
 
-NODES_SRC = Path(__file__).parent.parent.parent / 'src' / 'nodes'
-# Move to the front rather than "insert only if absent": another test dir already on
-# sys.path can hold a package with the same name as the node (see #1687).
-while str(NODES_SRC) in sys.path:
-    sys.path.remove(str(NODES_SRC))
-sys.path.insert(0, str(NODES_SRC))
+import pytest
 
-from ai.common.database import DatabaseInstanceBase  # noqa: E402
-from db_clickhouse.IInstance import IInstance  # noqa: E402
+from ai.common.database import DatabaseInstanceBase
+
+NODE_DIR = Path(__file__).resolve().parents[2] / 'src' / 'nodes' / 'db_clickhouse'
+
+
+@pytest.fixture(scope='module')
+def IInstance():
+    """Load db_clickhouse/IInstance.py without running the package ``__init__``.
+
+    The ``__init__`` calls ``depends()``, which installs the node's driver
+    requirements; this test needs none of them. A bare package module with the
+    node directory as its path lets ``IInstance``'s relative import of
+    ``IGlobal`` resolve, and ``sys.modules`` is restored afterwards.
+    """
+    names = ('db_clickhouse', 'db_clickhouse.IGlobal', 'db_clickhouse.IInstance')
+    saved = {name: sys.modules.get(name) for name in names}
+    package = types.ModuleType('db_clickhouse')
+    package.__path__ = [str(NODE_DIR)]
+    sys.modules['db_clickhouse'] = package
+    try:
+        yield importlib.import_module('db_clickhouse.IInstance').IInstance
+    finally:
+        for name, module in saved.items():
+            if module is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = module
 
 
 def _describe(inst, name):
@@ -32,14 +54,14 @@ def _describe(inst, name):
     return getattr(DatabaseInstanceBase, name).__tool_meta__['description'](inst)
 
 
-def test_clickhouse_sessions_are_not_transactions():
+def test_clickhouse_sessions_are_not_transactions(IInstance):
     """The node overrides the hook the shared descriptions read."""
     inst = IInstance.__new__(IInstance)
 
     assert inst._sessionsAreTransactions() is False
 
 
-def test_clickhouse_tools_promise_no_rollback():
+def test_clickhouse_tools_promise_no_rollback(IInstance):
     """``execute``, ``begin``, ``commit`` and ``rollback`` all say what a session really is."""
     inst = IInstance.__new__(IInstance)
 

@@ -583,7 +583,7 @@ class DatabaseInstanceBase(IInstanceBase, ABC):
         ),
     )
     def commit(self, args):
-        """Commit an open transaction session."""
+        """Commit and close an open session; see ``_sessionsAreTransactions``."""
         return self._finishTx(args, commit=True)
 
     @tool_function(
@@ -600,7 +600,7 @@ class DatabaseInstanceBase(IInstanceBase, ABC):
         ),
     )
     def rollback(self, args):
-        """Roll back an open transaction session."""
+        """Roll back and close an open session; see ``_sessionsAreTransactions``."""
         return self._finishTx(args, commit=False)
 
     def _finishTx(self, args, *, commit: bool):
