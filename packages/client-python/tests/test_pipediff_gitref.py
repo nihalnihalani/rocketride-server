@@ -364,6 +364,18 @@ def test_mis_cased_path_finds_the_tracked_file_on_a_case_insensitive_filesystem(
 
 
 @pytest.mark.skipif(shutil.which('git') is None, reason='git not installed')
+def test_mis_cased_path_to_a_tracked_symlink_compares_its_target(tmp_path):
+    if not _case_insensitive(tmp_path):
+        pytest.skip('filesystem is case-sensitive')
+    (tmp_path / 'pipeline.pipe').write_text(json.dumps(SAMPLE_PIPE), encoding='utf-8')
+    (tmp_path / 'Link.pipe').symlink_to('pipeline.pipe')
+    _init_repo(tmp_path, 'pipeline.pipe', 'Link.pipe')
+    (tmp_path / 'pipeline.pipe').write_text(json.dumps({**SAMPLE_PIPE, 'version': 2}), encoding='utf-8')
+    # Case recovery finds the tracked link; its target is compared, not its text.
+    assert resolve_git_ref('HEAD', str(tmp_path / 'link.pipe')) == SAMPLE_PIPE
+
+
+@pytest.mark.skipif(shutil.which('git') is None, reason='git not installed')
 def test_differently_cased_new_file_is_new_on_a_case_sensitive_filesystem(tmp_path):
     if _case_insensitive(tmp_path):
         pytest.skip('filesystem folds case')
