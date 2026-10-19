@@ -153,6 +153,20 @@ def test_provider_change_is_reported_separately_from_config():
     assert paths == {'config.default.strlen'}
 
 
+@pytest.mark.parametrize(
+    ('before', 'after'), [(0, False), (1, True), (False, 0)], ids=['0-to-false', '1-to-true', 'false-to-0']
+)
+def test_provider_change_is_type_sensitive(before, after):
+    # Python treats ``0 == False`` and ``1 == True``; JSON does not, and neither
+    # does the version or config comparison.
+    old = _pipe([_node('n1', before)])
+    new = _pipe([_node('n1', after)])
+    diff = diff_pipes(old, new)
+    provider_changes = _changes_by_kind(diff, 'provider')
+    assert [(c.id, c.provider_old, c.provider_new) for c in provider_changes] == [('n1', before, after)]
+    assert diff.has_semantic_changes is True
+
+
 # ---------------------------------------------------------------------------
 # Config deep-diff
 # ---------------------------------------------------------------------------
@@ -830,6 +844,182 @@ def test_load_pipe_accepts_absent_wire_collections():
 # ---------------------------------------------------------------------------
 # End-to-end against a real bundled example
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Canvas groups
+# ---------------------------------------------------------------------------
+
+
+def _group(group_id, children, config=None, ui=None):
+    """Build a canvas group the way the editor saves one.
+
+    ``getProjectComponents`` (apps/shared canvas util/graph.ts) nests a group's
+    children under the group's ``config.pipeline.components``, each with its own
+    ``ui`` block (position relative to the group, plus ``parentId``), and omits
+    ``config.pipeline`` entirely when the group is empty.
+    """
+    group_config = dict(config or {})
+    if children:
+        group_config['pipeline'] = {'components': children}
+    return {
+        'id': group_id,
+        'provider': 'default',
+        'config': group_config,
+        'ui': ui if ui is not None else {'position': {'x': 100, 'y': 340}, 'nodeType': 'group'},
+    }
+
+
+def _child(component_id, provider, parent, x=20, **kwargs):
+    """Build a grouped child component whose ui records its parent group."""
+    return _node(
+        component_id, provider, ui={'position': {'x': x, 'y': 40}, 'nodeType': 'default', 'parentId': parent}, **kwargs
+    )
+
+
+def _grouped_pipe(
+    child_x=20, lane='questions', provider='llm_openai', child_config=None, extra_children=(), group_config=None
+):
+    """A source node feeding an llm that lives inside ``group_1``."""
+    llm = _child(
+        'llm_1', provider, 'group_1', x=child_x, config=child_config, inputs=[{'lane': lane, 'from': 'chat_1'}]
+    )
+    return _pipe(
+        [
+            _node('chat_1', 'chat', {'mode': 'Source'}),
+            _group('group_1', [*extra_children, llm], config=group_config),
+        ]
+    )
+
+
+def test_drag_inside_a_group_is_layout_only():
+    diff = diff_pipes(_grouped_pipe(child_x=20), _grouped_pipe(child_x=60))
+    assert diff.node_changes == []
+    assert diff.edge_changes == []
+    assert diff.layout_changed is True
+    assert diff.has_semantic_changes is False
+
+
+def test_include_layout_reports_a_grouped_child_ui_on_the_child():
+    diff = diff_pipes(_grouped_pipe(child_x=20), _grouped_pipe(child_x=60), include_layout=True)
+    assert [(c.id, c.kind, [f.path for f in c.field_changes]) for c in diff.node_changes] == [
+        ('llm_1', 'config', ['ui.position.x'])
+    ]
+
+
+def test_grouped_child_wiring_is_diffed_as_edges():
+    diff = diff_pipes(_grouped_pipe(lane='questions'), _grouped_pipe(lane='text'))
+    assert diff.node_changes == []
+    assert diff.edge_changes == [
+        EdgeChange(from_id='chat_1', lane='text', to_id='llm_1', kind='added'),
+        EdgeChange(from_id='chat_1', lane='questions', to_id='llm_1', kind='removed'),
+    ]
+
+
+def test_grouped_child_provider_and_config_changes_are_reported_on_the_child():
+    old = _grouped_pipe(provider='llm_openai', child_config={'model': 'a'})
+    new = _grouped_pipe(provider='llm_anthropic', child_config={'model': 'b'})
+    diff = diff_pipes(old, new)
+    assert [(c.id, c.provider_old, c.provider_new) for c in _changes_by_kind(diff, 'provider')] == [
+        ('llm_1', 'llm_openai', 'llm_anthropic')
+    ]
+    assert [(c.id, [f.path for f in c.field_changes]) for c in _changes_by_kind(diff, 'config')] == [
+        ('llm_1', ['config.model'])
+    ]
+
+
+def test_child_inserted_into_a_group_is_an_added_node():
+    # Children are matched by id, not by their index in config.pipeline.components.
+    memory = _child('memory_1', 'memory_internal', 'group_1', x=200)
+    diff = diff_pipes(_grouped_pipe(), _grouped_pipe(extra_children=[memory]))
+    assert [(c.id, c.kind, c.provider_new) for c in diff.node_changes] == [('memory_1', 'added', 'memory_internal')]
+    assert diff.edge_changes == []
+
+
+def test_moving_a_node_into_a_group_is_layout_only():
+    # Group membership is the child's ``ui.parentId``: a canvas attribute.
+    llm_top_level = _node(
+        'llm_1', 'llm_openai', inputs=[{'lane': 'questions', 'from': 'chat_1'}], ui={'position': {'x': 120, 'y': 380}}
+    )
+    memory = _child('memory_1', 'memory_internal', 'group_1', x=200)
+    old = _pipe([_node('chat_1', 'chat'), llm_top_level, _group('group_1', [memory])])
+    llm_grouped = _child('llm_1', 'llm_openai', 'group_1', inputs=[{'lane': 'questions', 'from': 'chat_1'}])
+    new = _pipe([_node('chat_1', 'chat'), _group('group_1', [memory, llm_grouped])])
+    diff = diff_pipes(old, new)
+    assert diff.node_changes == []
+    assert diff.edge_changes == []
+    assert diff.layout_changed is True
+
+
+def test_emptying_a_group_reports_only_the_removed_children():
+    # The editor omits config.pipeline once a group has no children.
+    old = _grouped_pipe()
+    new = _pipe([_node('chat_1', 'chat', {'mode': 'Source'}), _group('group_1', [])])
+    diff = diff_pipes(old, new)
+    assert [(c.id, c.kind) for c in diff.node_changes] == [('llm_1', 'removed')]
+    assert diff.edge_changes == [EdgeChange(from_id='chat_1', lane='questions', to_id='llm_1', kind='removed')]
+
+
+def test_group_container_config_outside_its_children_is_still_diffed():
+    old = _grouped_pipe(group_config={'label': 'a'})
+    new = _grouped_pipe(group_config={'label': 'b'})
+    new['components'][1]['config']['pipeline']['source'] = 'llm_1'
+    diff = diff_pipes(old, new)
+    assert [(c.id, [(f.path, f.kind, f.new) for f in c.field_changes]) for c in _changes_by_kind(diff, 'config')] == [
+        ('group_1', [('config.label', 'changed', 'b'), ('config.pipeline', 'added', {'source': 'llm_1'})])
+    ]
+
+
+def test_nested_groups_are_flattened():
+    def build(x, lane):
+        llm = _child('llm_1', 'llm_openai', 'inner', x=x, inputs=[{'lane': lane, 'from': 'chat_1'}])
+        inner = _group('inner', [llm], ui={'position': {'x': 10, 'y': 10}, 'nodeType': 'group', 'parentId': 'outer'})
+        return _pipe([_node('chat_1', 'chat'), _group('outer', [inner])])
+
+    moved = diff_pipes(build(20, 'questions'), build(60, 'questions'))
+    assert moved.has_semantic_changes is False
+    assert moved.layout_changed is True
+    rewired = diff_pipes(build(20, 'questions'), build(20, 'text'))
+    assert [(e.lane, e.kind) for e in rewired.edge_changes] == [('text', 'added'), ('questions', 'removed')]
+
+
+def test_deeply_nested_groups_do_not_hit_the_recursion_limit():
+    def build(x):
+        node = _child('leaf', 'llm_openai', 'g2999', x=x)
+        for level in reversed(range(3000)):
+            node = _group(f'g{level}', [node])
+        return {'components': [node], 'version': 1}
+
+    diff = diff_pipes(load_pipe(build(20)), load_pipe(build(60)))
+    assert diff.has_semantic_changes is False
+    assert diff.layout_changed is True
+
+
+def test_a_group_that_contains_itself_is_rejected_not_looped():
+    group = _group('group_1', [])
+    group['config']['pipeline'] = {'components': [group]}
+    with pytest.raises(PipeDiffError, match="duplicate component id 'group_1'"):
+        load_pipe(_pipe([group]))
+
+
+def test_grouped_child_ids_must_be_unique_across_levels():
+    pipe = _pipe([_node('llm_1', 'llm_openai'), _group('group_1', [_child('llm_1', 'llm_openai', 'group_1')])])
+    with pytest.raises(PipeDiffError, match="duplicate component id 'llm_1'.*group_1"):
+        load_pipe(pipe)
+
+
+@pytest.mark.parametrize(
+    ('child', 'message'),
+    [
+        ('not-an-object', "'group_1' config.pipeline.components\\[0\\] is not an object"),
+        ({'provider': 'x'}, "'group_1' config.pipeline.components\\[0\\] is missing a string 'id'"),
+        ({'id': 'c', 'input': 'oops'}, "component 'c' field 'input' must be a list"),
+    ],
+    ids=['non-object', 'missing-id', 'bad-wires'],
+)
+def test_malformed_grouped_children_are_rejected(child, message):
+    with pytest.raises(PipeDiffError, match=message):
+        load_pipe(_pipe([_group('group_1', [child])]))
 
 
 def test_diff_of_real_example_against_itself_is_empty(examples_dir):
