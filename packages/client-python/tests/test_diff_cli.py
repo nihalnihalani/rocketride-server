@@ -686,6 +686,20 @@ async def test_internal_value_error_is_not_reported_as_bad_input(tmp_path, monke
 
 
 @pytest.mark.asyncio
+async def test_reporter_value_error_is_not_reported_as_bad_input(tmp_path, monkeypatch):
+    # Only json.dumps's non-finite-number failure is converted to exit 2; a
+    # ValueError from the reporter itself is a bug and keeps its traceback.
+    a = _write_pipe(tmp_path, 'a.pipe', _old_pipe())
+
+    def _broken(_diff):
+        raise ValueError('reporter bug')
+
+    monkeypatch.setattr(diff_module, 'render_json', _broken)
+    with pytest.raises(ValueError, match='reporter bug'):
+        await _run(_diff_args([a, a], json=True))
+
+
+@pytest.mark.asyncio
 async def test_json_renderer_rejects_nonfinite_output(tmp_path, capsys, monkeypatch):
     # Defense in depth: even an unexpected reporter value must never produce an
     # Infinity token or leak json.dumps' ValueError as an exit-1 traceback.

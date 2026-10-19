@@ -180,8 +180,12 @@ def _render(args, diff: Any) -> str:
         The fully rendered report string for printing to stdout.
     """
     if getattr(args, 'json', False):
+        # Build the document outside the handler: only the serializer's
+        # non-finite-number failure is an input problem; a ValueError from the
+        # reporter itself is a bug and must keep its traceback.
+        document = render_json(diff)
         try:
-            return json.dumps(render_json(diff), indent=2, ensure_ascii=False, sort_keys=True, allow_nan=False)
+            return json.dumps(document, indent=2, ensure_ascii=False, sort_keys=True, allow_nan=False)
         except ValueError as exc:  # a non-finite number; JSON has no spelling for it
             raise PipeDiffError(f'The report contains a value JSON cannot represent: {exc}') from exc
     if getattr(args, 'markdown', False):
