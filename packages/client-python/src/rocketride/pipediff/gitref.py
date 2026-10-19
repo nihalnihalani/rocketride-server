@@ -41,6 +41,7 @@ Functions:
 from __future__ import annotations
 
 import os
+import posixpath
 import subprocess
 
 from .engine import PipeDiffError, _parse_pipe_json
@@ -50,6 +51,9 @@ _GIT_TIMEOUT_SECONDS = 30
 
 # The git tree-entry mode of a committed symbolic link.
 _SYMLINK_MODE = '120000'
+
+# Most links followed from one path at the ref before giving up (SYMLOOP_MAX).
+_MAX_SYMLINK_HOPS = 40
 
 
 def resolve_git_ref(ref: str, file_path: str) -> dict | None:
@@ -77,15 +81,17 @@ def resolve_git_ref(ref: str, file_path: str) -> dict | None:
             unknown (or does not name a commit), ``git`` is unavailable or times
             out, or the retrieved contents are not a valid pipeline.
     """
-    # Resolve symlinks in the directory only (realpath of the parent), so the path
-    # matches the physical top level ``git rev-parse --show-toplevel`` reports
-    # even when the repo is reached through a symlinked directory, while the file
-    # itself is looked up under the name given -- ``git show <ref>:<FILE>``, as
-    # documented. Resolving the file too made an untracked link to a tracked
-    # file compare against its target instead of being reported as new.
-    given_path = os.path.abspath(file_path)
-    file_dir = os.path.realpath(os.path.dirname(given_path))
-    abs_path = os.path.join(file_dir, os.path.basename(given_path))
+    # Resolve symlinks in the directory only, so the path matches the physical
+    # top level ``git rev-parse --show-toplevel`` reports even when the repo is
+    # reached through a symlinked directory, while the file itself is looked up
+    # under the name given -- ``git show <ref>:<FILE>``, as documented. The
+    # directory goes to realpath as given, not through abspath first: abspath
+    # folds ``lnk/..`` as text, but the OS opens it as the parent of lnk's
+    # target, so the blob looked up would not be the file being diffed. Each
+    # component is then spelled with its on-disk case, which is what git
+    # reports on a case-insensitive filesystem.
+    file_dir = _on_disk_case(os.path.realpath(os.path.dirname(file_path) or os.curdir))
+    abs_path = _on_disk_case(os.path.join(file_dir, os.path.basename(file_path)))
 
     repo_root = _repository_root(file_dir, file_path)
     rel_path = _repo_relative(abs_path, repo_root, file_path)
@@ -111,22 +117,20 @@ def resolve_git_ref(ref: str, file_path: str) -> dict | None:
     # when it does not.
     present = _run_git(['-C', repo_root, 'cat-file', '-e', spec], f'checking for {spec}')
     if present.returncode != 0:
-        # On a case-insensitive filesystem a mis-cased FILE opens the tracked
-        # file while git's tree lookup misses it; compare against that file
-        # rather than reporting every node as added.
+        # On a case-insensitive filesystem the on-disk spelling can still differ
+        # from the tracked one (a case-only rename); compare against the tracked
+        # file that is the same file on disk rather than reporting all as added.
         rel_path = _same_file_in_ref(repo_root, ref, rel_path, abs_path) if os.path.exists(abs_path) else None
         if rel_path is None:
             return None
-        spec = f'{ref}:{rel_path}'
-    # Checked after case recovery as well, which can land on a tracked link.
-    if os.path.islink(abs_path) and _tree_mode(repo_root, ref, rel_path) == _SYMLINK_MODE:
-        # A link committed as a link: ``git show`` would return its target path,
-        # not a pipe. Compare the file the working-tree link reads instead.
-        rel_path = _repo_relative(os.path.realpath(abs_path), repo_root, file_path)
-        spec = f'{ref}:{rel_path}'
-        present = _run_git(['-C', repo_root, 'cat-file', '-e', spec], f'checking for {spec}')
-        if present.returncode != 0:
-            return None
+
+    # Decided by the entry at the ref, not by the working tree: a link that has
+    # since been retargeted, or replaced by a regular file, must still be read
+    # through the target it had at the ref.
+    rel_path = _follow_ref_symlinks(repo_root, ref, rel_path)
+    if rel_path is None:
+        return None
+    spec = f'{ref}:{rel_path}'
 
     result = _run_git(['-C', repo_root, 'show', spec], f'reading {spec}')
     if result.returncode != 0:
@@ -147,6 +151,78 @@ def _repo_relative(path: str, repo_root: str, file_path: str) -> str:
     if rel_path == os.pardir or rel_path.startswith(os.pardir + os.sep):
         raise PipeDiffError(f'{file_path} resolves outside the repository at {repo_root}')
     return rel_path.replace(os.sep, '/')
+
+
+def _on_disk_case(path: str) -> str:
+    """
+    Spell an absolute path with the case each existing component has on disk.
+
+    On a case-insensitive filesystem ``RepoDir/flows/rag.pipe`` opens the same
+    file as ``RepoDir/Flows/rag.pipe``, but git's tree lookup and its reported
+    top level use the stored case. Components are matched against their
+    directory's listing (only to a name that is the same file), so on a
+    case-sensitive filesystem nothing changes. Components that cannot be listed
+    or do not exist are kept as given.
+    """
+    drive, rest = os.path.splitdrive(path)
+    current = drive + os.sep
+    for part in [part for part in rest.split(os.sep) if part]:
+        candidate = os.path.join(current, part)
+        try:
+            entries = os.listdir(current)
+        except OSError:
+            entries = []
+        if part not in entries:
+            wanted = part.casefold()
+            for entry in entries:
+                if entry.casefold() == wanted and _same_file(os.path.join(current, entry), candidate):
+                    candidate = os.path.join(current, entry)
+                    break
+        current = candidate
+    return current
+
+
+def _same_file(first: str, second: str) -> bool:
+    """Report whether two paths name the same filesystem entry (links not followed)."""
+    try:
+        a, b = os.lstat(first), os.lstat(second)
+    except OSError:
+        return False
+    return (a.st_dev, a.st_ino) == (b.st_dev, b.st_ino)
+
+
+def _follow_ref_symlinks(repo_root: str, ref: str, rel_path: str) -> str | None:
+    """
+    Resolve ``rel_path`` through symlinks as they were committed at ``ref``.
+
+    ``git show`` of a committed link returns its target text, not a pipe. Each
+    link is followed using the target stored at the ref, relative to the link's
+    directory, until a regular entry is reached.
+
+    Returns:
+        The repository-relative path of the regular file at ``ref``, or ``None``
+        when a link points at a path that does not exist at ``ref``.
+
+    Raises:
+        PipeDiffError: If a link points outside the repository, or links nest
+            more than ``_MAX_SYMLINK_HOPS`` deep (a loop).
+    """
+    for _hop in range(_MAX_SYMLINK_HOPS):
+        if _tree_mode(repo_root, ref, rel_path) != _SYMLINK_MODE:
+            return rel_path
+        spec = f'{ref}:{rel_path}'
+        link = _run_git(['-C', repo_root, 'cat-file', 'blob', spec], f'reading link {spec}')
+        if link.returncode != 0:
+            raise PipeDiffError(f'git cat-file {spec} failed: {link.stderr.strip()}')
+        target = link.stdout
+        resolved = posixpath.normpath(posixpath.join(posixpath.dirname(rel_path), target))
+        if posixpath.isabs(target) or resolved == '..' or resolved.startswith('../'):
+            raise PipeDiffError(f'{spec} is a symlink to {target!r}, outside the repository')
+        rel_path = resolved
+        present = _run_git(['-C', repo_root, 'cat-file', '-e', f'{ref}:{rel_path}'], f'checking for {ref}:{rel_path}')
+        if present.returncode != 0:
+            return None
+    raise PipeDiffError(f'{ref}:{rel_path}: too many levels of symbolic links')
 
 
 def _tree_mode(repo_root: str, ref: str, rel_path: str) -> str | None:
