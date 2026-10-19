@@ -49,6 +49,7 @@ Coverage mirrors the product contract:
 
 import argparse
 import importlib
+import io
 import json
 import os
 from pathlib import Path
@@ -59,6 +60,7 @@ from types import SimpleNamespace
 
 import pytest
 import rocketride_common
+from pipediff_git_helpers import init_repo, isolate_git_environment
 
 from rocketride.cli.commands import diff as diff_module
 from rocketride.cli.commands.diff import run_diff
@@ -72,6 +74,13 @@ cli_main = importlib.import_module('rocketride.cli.main')
 # =========================================================================
 # Helpers / fixtures
 # =========================================================================
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_git(monkeypatch):
+    # Tests that build a repository, or run `--git`, must not depend on the
+    # developer's git configuration, hooks or signing, nor on inherited GIT_* variables.
+    isolate_git_environment(monkeypatch)
 
 
 def _diff_args(
@@ -503,8 +512,15 @@ def _nested_pipe_json(depth, leaf=0):
     return '{"components":[{"id":"n","provider":"p","config":{"deep":' + '[' * depth + str(leaf) + ']' * depth + '}}]}'
 
 
-def _cli_subprocess(tmp_path, arguments):
-    """Run the actual CLI entry point using the package selected by this suite."""
+def _cli_subprocess(tmp_path, arguments, *, limit=1000, prelude='', output_encoding='utf-8'):
+    """
+    Run the actual CLI entry point using the package selected by this suite.
+
+    ``limit`` is the child's recursion limit, set before ``main()`` runs, and
+    ``prelude`` is Python source run just before it (a stream reconfiguration,
+    say). Both are fixed by the test, so what the child can do is deterministic.
+    ``output_encoding`` is how the child's stdout/stderr bytes are decoded here.
+    """
     env = {key: value for key, value in os.environ.items() if not key.startswith('ROCKETRIDE_')}
     # pytest's in-process sys.path is not inherited by subprocesses. Pin the
     # child's import roots to the packages this suite actually imported,
@@ -527,7 +543,8 @@ def _cli_subprocess(tmp_path, arguments):
         [
             sys.executable,
             '-c',
-            f'import sys; sys.path[:0] = {roots!r}; from rocketride.cli.main import main; sys.setrecursionlimit(1000); main()',
+            f'import sys; sys.path[:0] = {roots!r}; from rocketride.cli.main import main; '
+            f'sys.setrecursionlimit({limit}); {prelude}main()',
             'diff',
             *arguments,
         ],
@@ -535,8 +552,16 @@ def _cli_subprocess(tmp_path, arguments):
         env=env,
         capture_output=True,
         text=True,
+        encoding=output_encoding,
         timeout=20,
     )
+
+
+# What a clean refusal of an over-deep input says. The wording depends on which
+# stage first runs out of frames, and that depends on the interpreter: the CLI's
+# own "nesting is too deep", the comparison's "too deep to compare", or, where the
+# JSON parser itself is bounded by the limit, its "maximum recursion depth exceeded".
+_REFUSAL_MARKERS = ('nest', 'recursion depth')
 
 
 def _assert_nested_cli_result(result, *, exit_zero, path, kind, old_leaf, new_leaf, depth=0, require_error=False):
@@ -545,7 +570,7 @@ def _assert_nested_cli_result(result, *, exit_zero, path, kind, old_leaf, new_le
     if result.returncode == 2:
         assert result.stdout == ''
         assert 'Error:' in result.stderr
-        assert 'nest' in result.stderr.lower()
+        assert any(marker in result.stderr.lower() for marker in _REFUSAL_MARKERS), result.stderr
         return
     assert not require_error
     assert result.returncode == (0 if exit_zero else 1)
@@ -554,7 +579,7 @@ def _assert_nested_cli_result(result, *, exit_zero, path, kind, old_leaf, new_le
     def reject_constant(token):
         raise ValueError(f'Non-JSON constant {token}')
 
-    # The child has a controlled 1000-frame budget. The parent may have deeper
+    # The child has a controlled recursion budget. The parent may have deeper
     # pytest frames and must still be able to inspect a valid supported result.
     previous_limit = sys.getrecursionlimit()
     try:
@@ -586,13 +611,83 @@ def _assert_nested_cli_result(result, *, exit_zero, path, kind, old_leaf, new_le
         assert value == expected
 
 
+# -------------------------------------------------------------------------
+# The RecursionError boundary in run_diff, proven deterministically
+# -------------------------------------------------------------------------
+#
+# Whether a real deep input reaches that boundary depends on the interpreter
+# (see below), so these tests inject the failure at each stage run_diff guards
+# and require the stage to have run. They cannot pass without the handler.
+
+
+def _raise_recursion_error(calls):
+    def overflow(*_args, **_kwargs):
+        calls.append('called')
+        raise RecursionError('maximum recursion depth exceeded')
+
+    return overflow
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('exit_zero', [False, True], ids=['normal', 'exit-zero'])
+@pytest.mark.parametrize(
+    ('stage', 'flags'),
+    [
+        pytest.param('load_pipe', {}, id='load'),
+        pytest.param('resolve_git_ref', {'git': 'HEAD'}, id='git-ref'),
+        pytest.param('diff_pipes', {}, id='compare'),
+        pytest.param('render_json', {'json': True}, id='render-json'),
+        pytest.param('render_markdown', {'markdown': True}, id='render-markdown'),
+        pytest.param('render_human', {}, id='render-human'),
+    ],
+)
+async def test_recursion_error_at_each_stage_is_a_clean_exit_2(tmp_path, capsys, monkeypatch, stage, flags, exit_zero):
+    path = _write_pipe(tmp_path, 'a.pipe', _old_pipe())
+    calls = []
+    monkeypatch.setattr(diff_module, stage, _raise_recursion_error(calls))
+
+    code = await _run(_diff_args([path] if 'git' in flags else [path, path], exit_zero=exit_zero, **flags))
+
+    captured = capsys.readouterr()
+    assert calls == ['called'], f'{stage} did not run, so the RecursionError boundary was not exercised'
+    assert code == 2  # --exit-zero never turns an error into success
+    assert captured.out == ''  # nothing is printed before the whole report exists
+    assert captured.err.startswith('Error: Pipeline nesting is too deep')
+    assert captured.err.count('\n') == 1
+
+
+@pytest.mark.parametrize('exit_zero', [False, True], ids=['normal', 'exit-zero'])
+def test_recursion_error_reaches_the_exit_code_through_the_real_entry_point(tmp_path, exit_zero):
+    # Same boundary, through main() and a real process: the exit status, the
+    # untouched stdout and the single stderr line are what a CI step sees
+    (tmp_path / 'a.pipe').write_text(json.dumps(_old_pipe()), encoding='utf-8')
+    prelude = (
+        'import rocketride.cli.commands.diff as d; '
+        "d.diff_pipes = lambda *a, **k: (_ for _ in ()).throw(RecursionError('maximum recursion depth exceeded')); "
+    )
+
+    result = _cli_subprocess(tmp_path, ['a.pipe', 'a.pipe', *(['--exit-zero'] if exit_zero else [])], prelude=prelude)
+
+    assert result.returncode == 2
+    assert result.stdout == ''
+    assert result.stderr.startswith('Error: Pipeline nesting is too deep')
+    assert 'Traceback' not in result.stderr
+
+
+# -------------------------------------------------------------------------
+# Real deep inputs through a real process
+# -------------------------------------------------------------------------
+
+
 @pytest.mark.parametrize('depth', [981, 2000])
 @pytest.mark.parametrize('side', ['old', 'new'])
 @pytest.mark.parametrize('exit_zero', [False, True])
-def test_excessive_nesting_cli_errors(tmp_path, depth, side, exit_zero):
-    # Under the pinned child resource budget, 2000 exceeds JSON loading limits.
-    # Historical depth 981 may be supported by another interpreter; a correct
-    # report is allowed, while a traceback masquerading as exit 1 is not.
+def test_deep_one_sided_nesting_never_tracebacks_or_misreports(tmp_path, depth, side, exit_zero):
+    # Under the child's 1000-frame budget which stage runs out first, if any, depends on
+    # the interpreter, so depth 981 may be refused or reported: both are allowed, a
+    # traceback and a wrong report are not. This asserts that contract, NOT that the
+    # error branch ran (the injection tests above prove that). Depth 2000 is beyond
+    # the budget on every supported interpreter, so it must be refused.
     ordinary = tmp_path / 'ordinary.pipe'
     ordinary.write_text('{"components":[{"id":"n","provider":"p","config":{}}]}', encoding='utf-8')
     nested = tmp_path / 'nested.pipe'
@@ -612,50 +707,61 @@ def test_excessive_nesting_cli_errors(tmp_path, depth, side, exit_zero):
     )
 
 
+# A small, fixed budget makes the comparison case decisive: a pair 600 levels deep
+# needs ~1200 frames to compare and 20 levels needs ~40, so 300 refuses the first
+# and accepts the second on every interpreter. This relies on the comparison
+# recursing; if it becomes iterative, move the deep case to the stage that still recurses.
+_SMALL_BUDGET = 300
+
+
 @pytest.mark.parametrize('exit_zero', [False, True])
-def test_excessive_comparison_nesting_cli_errors(tmp_path, exit_zero):
-    # Both values decode within the JSON limit, but their recursive comparison
-    # requires more frames than loading a single value or reporting an add.
+def test_comparison_beyond_the_recursion_budget_is_refused(tmp_path, exit_zero):
     old = tmp_path / 'old.pipe'
     new = tmp_path / 'new.pipe'
     old.write_text(_nested_pipe_json(600, 0), encoding='utf-8')
     new.write_text(_nested_pipe_json(600, 1), encoding='utf-8')
 
-    result = _cli_subprocess(tmp_path, [str(old), str(new), '--json', *(['--exit-zero'] if exit_zero else [])])
+    result = _cli_subprocess(
+        tmp_path, [str(old), str(new), '--json', *(['--exit-zero'] if exit_zero else [])], limit=_SMALL_BUDGET
+    )
+
+    assert result.returncode == 2, result.stdout[:200]
+    assert result.stdout == ''
+    assert 'Traceback' not in result.stderr
+    assert 'Error:' in result.stderr
+    assert any(marker in result.stderr.lower() for marker in _REFUSAL_MARKERS), result.stderr
+
+
+@pytest.mark.parametrize('exit_zero', [False, True])
+def test_comparison_within_the_recursion_budget_is_reported_accurately(tmp_path, exit_zero):
+    old = tmp_path / 'old.pipe'
+    new = tmp_path / 'new.pipe'
+    old.write_text(_nested_pipe_json(20, 0), encoding='utf-8')
+    new.write_text(_nested_pipe_json(20, 1), encoding='utf-8')
+
+    result = _cli_subprocess(
+        tmp_path, [str(old), str(new), '--json', *(['--exit-zero'] if exit_zero else [])], limit=_SMALL_BUDGET
+    )
 
     _assert_nested_cli_result(
         result,
         exit_zero=exit_zero,
-        path='config.deep' + '[0]' * 600,
+        path='config.deep' + '[0]' * 20,
         kind='changed',
         old_leaf=0,
         new_leaf=1,
+        require_error=False,
     )
+    assert result.returncode == (0 if exit_zero else 1)  # it did NOT take the refusal branch
 
 
+@pytest.mark.skipif(shutil.which('git') is None, reason='git is unavailable')
 @pytest.mark.parametrize('exit_zero', [False, True])
-def test_excessive_historical_nesting_cli_errors(tmp_path, exit_zero):
-    git = shutil.which('git')
-    if git is None:
-        pytest.skip('git is unavailable')
+def test_deep_historical_nesting_never_tracebacks_or_misreports(tmp_path, exit_zero):
+    # Like the one-sided cases above, for the old side read from git history
     path = tmp_path / 'pipeline.pipe'
     path.write_text(_nested_pipe_json(981), encoding='utf-8')
-    for arguments in [
-        ['init'],
-        ['add', 'pipeline.pipe'],
-        [
-            '-c',
-            'user.name=Local QA',
-            '-c',
-            'user.email=qa@example.invalid',
-            '-c',
-            'commit.gpgsign=false',
-            'commit',
-            '-m',
-            'nested fixture',
-        ],
-    ]:
-        subprocess.run([git, *arguments], cwd=tmp_path, check=True, capture_output=True, timeout=20)
+    init_repo(tmp_path, 'pipeline.pipe', message='nested fixture')
     path.write_text('{"components":[{"id":"n","provider":"p","config":{}}]}', encoding='utf-8')
 
     result = _cli_subprocess(tmp_path, ['--git', 'HEAD', str(path), '--json', *(['--exit-zero'] if exit_zero else [])])
@@ -713,6 +819,213 @@ async def test_json_renderer_rejects_nonfinite_output(tmp_path, capsys, monkeypa
     assert captured.out == ''
     assert 'Error:' in captured.err
     assert 'JSON compliant' in captured.err
+
+
+# =========================================================================
+# --json carries every character exactly
+# =========================================================================
+
+
+def _text_pipe(tmp_path, name, value_literal):
+    """Write a .pipe whose config value is the JSON string literal ``value_literal`` (escapes kept as text)."""
+    path = tmp_path / name
+    path.write_text(
+        '{"components":[{"id":"n","provider":"p","config":{"v":' + value_literal + '}}]}',
+        encoding='utf-8',
+    )
+    return str(path)
+
+
+def test_json_keeps_values_that_differ_only_in_lone_surrogates(tmp_path):
+    # Both are valid JSON escapes in a .pipe. Printed raw they both became "?" on
+    # stdout (errors='replace'), so the report said "?" -> "?" for a real change.
+    old = _text_pipe(tmp_path, 'old.pipe', r'"\ud800"')
+    new = _text_pipe(tmp_path, 'new.pipe', r'"\udc00"')
+
+    result = _cli_subprocess(tmp_path, [old, new, '--json'])
+
+    assert result.returncode == 1, result.stderr
+    assert result.stderr == ''
+    doc = json.loads(result.stdout)
+    assert doc['summary']['has_semantic_changes'] is True
+    (change,) = doc['nodes']['changed'][0]['config_changes']
+    assert (change['old'], change['new']) == ('\ud800', '\udc00')
+
+
+def test_json_keeps_letters_an_ascii_console_cannot_print(tmp_path):
+    old = _text_pipe(tmp_path, 'old.pipe', '"caf\u00e9"')
+    new = _text_pipe(tmp_path, 'new.pipe', '"caf\u00e8"')
+
+    result = _cli_subprocess(tmp_path, [old, new, '--json'], prelude="sys.stdout.reconfigure(encoding='ascii'); ")
+
+    assert result.returncode == 1, result.stderr
+    (change,) = json.loads(result.stdout)['nodes']['changed'][0]['config_changes']
+    assert (change['old'], change['new']) == ('caf\u00e9', 'caf\u00e8')
+
+
+def test_json_stays_unescaped_when_the_console_can_print_it(tmp_path):
+    old = _text_pipe(tmp_path, 'old.pipe', '"caf\u00e9"')
+    new = _text_pipe(tmp_path, 'new.pipe', '"caf\u00e8"')
+
+    result = _cli_subprocess(tmp_path, [old, new, '--json'], prelude="sys.stdout.reconfigure(encoding='utf-8'); ")
+
+    assert 'caf\u00e9' in result.stdout  # the real letter, not the six-character escape
+
+
+@pytest.mark.parametrize('encoding', ['cp1252', 'ascii'])
+@pytest.mark.parametrize('flag', [None, '--markdown'], ids=['human', 'markdown'])
+def test_text_reports_never_print_a_change_as_question_marks(tmp_path, encoding, flag):
+    # On a console that cannot encode CJK, errors='replace' printed "?? -> ??" for a
+    # real change, indistinguishable from no change. The escapes must differ.
+    old = _text_pipe(tmp_path, 'old.pipe', '"\\u65e5\\u672c"')  # 日本
+    new = _text_pipe(tmp_path, 'new.pipe', '"\\u4e2d\\u56fd"')  # 中国
+
+    result = _cli_subprocess(
+        tmp_path, [old, new, *([flag] if flag else [])], prelude=f"sys.stdout.reconfigure(encoding='{encoding}'); "
+    )
+
+    assert result.returncode == 1, result.stderr
+    assert result.stderr == ''
+    assert '\\u65e5\\u672c' in result.stdout
+    assert '\\u4e2d\\u56fd' in result.stdout
+    assert '??' not in result.stdout
+
+
+@pytest.mark.parametrize('flag', [None, '--markdown'], ids=['human', 'markdown'])
+def test_text_reports_keep_characters_the_console_can_print(tmp_path, flag):
+    # cp1252 carries these, so they are printed as themselves; only what it cannot carry is escaped
+    old = _text_pipe(tmp_path, 'old.pipe', '"caf\\u00e9 \\u65e5"')
+    new = _text_pipe(tmp_path, 'new.pipe', '"caf\\u00e8 \\u65e5"')
+
+    result = _cli_subprocess(
+        tmp_path,
+        [old, new, *([flag] if flag else [])],
+        prelude="sys.stdout.reconfigure(encoding='cp1252'); ",
+        output_encoding='cp1252',
+    )
+
+    assert result.returncode == 1, result.stderr
+    assert 'caf\u00e9' in result.stdout
+    assert 'caf\u00e8' in result.stdout
+    assert '\\u65e5' in result.stdout
+
+
+# =========================================================================
+# --git against real history (hermetic repositories)
+# =========================================================================
+
+
+@pytest.mark.skipif(shutil.which('git') is None, reason='git is unavailable')
+@pytest.mark.asyncio
+async def test_retargeted_symlink_swap_is_reported_end_to_end(tmp_path, capsys):
+    # `current.pipe -> v1.pipe` repointed to v2.pipe is a real pipeline swap: it
+    # used to compare v2.pipe with HEAD:v2.pipe and report "No semantic changes."
+    _write_pipe(tmp_path, 'v1.pipe', _old_pipe())
+    _write_pipe(tmp_path, 'v2.pipe', _new_pipe())
+    (tmp_path / 'current.pipe').symlink_to('v1.pipe')
+    init_repo(tmp_path, 'v1.pipe', 'v2.pipe', 'current.pipe')
+    link = str(tmp_path / 'current.pipe')
+
+    # untouched: the link itself is not a difference
+    assert await _run(_diff_args([link], git='HEAD')) == 0
+    assert capsys.readouterr().out.strip() == 'No semantic changes.'
+
+    (tmp_path / 'current.pipe').unlink()
+    (tmp_path / 'current.pipe').symlink_to('v2.pipe')
+    code = await _run(_diff_args([link], git='HEAD', json=True))
+
+    doc = json.loads(capsys.readouterr().out)
+    assert code == 1
+    assert {node['id'] for node in doc['nodes']['added']} == {'c'}
+    assert doc['summary']['has_semantic_changes'] is True
+
+
+@pytest.mark.skipif(shutil.which('git') is None, reason='git is unavailable')
+@pytest.mark.asyncio
+async def test_retargeted_directory_symlink_is_reported_end_to_end(tmp_path, capsys):
+    # The same swap one level up: `flows -> flows_v1` repointed to flows_v2
+    for name, pipe in (('flows_v1', _old_pipe()), ('flows_v2', _new_pipe())):
+        (tmp_path / name).mkdir()
+        _write_pipe(tmp_path / name, 'rag.pipe', pipe)
+    (tmp_path / 'flows').symlink_to('flows_v1', target_is_directory=True)
+    init_repo(tmp_path, 'flows_v1', 'flows_v2', 'flows')
+    (tmp_path / 'flows').unlink()
+    (tmp_path / 'flows').symlink_to('flows_v2', target_is_directory=True)
+
+    code = await _run(_diff_args([str(tmp_path / 'flows' / 'rag.pipe')], git='HEAD', json=True))
+
+    doc = json.loads(capsys.readouterr().out)
+    assert code == 1
+    assert {node['id'] for node in doc['nodes']['added']} == {'c'}
+
+
+@pytest.mark.skipif(shutil.which('git') is None, reason='git is unavailable')
+def test_workspace_env_cannot_redirect_the_git_calls_of_diff(tmp_path):
+    # A GIT_DIR line in .env would point every `--git` subprocess at another
+    # repository (or none): diff reads no configuration, so it must not load it
+    _write_pipe(tmp_path, 'pipeline.pipe', _old_pipe())
+    init_repo(tmp_path, 'pipeline.pipe')
+    _write_pipe(tmp_path, 'pipeline.pipe', _new_pipe())
+    (tmp_path / '.env').write_text(
+        f'GIT_DIR={tmp_path / "nowhere"}\nGIT_WORK_TREE={tmp_path / "nowhere"}\n', encoding='utf-8'
+    )
+
+    result = _cli_subprocess(tmp_path, ['--git', 'HEAD', 'pipeline.pipe', '--json'])
+
+    assert result.returncode == 1, result.stderr
+    assert result.stderr == ''
+    assert {node['id'] for node in json.loads(result.stdout)['nodes']['added']} == {'c'}
+
+
+# =========================================================================
+# Colour: the shell's NO_COLOR applies, a workspace-only NO_COLOR does not
+# =========================================================================
+
+
+class _Terminal(io.StringIO):
+    """A stdout that claims to be a terminal, so colour is on unless NO_COLOR says otherwise."""
+
+    def isatty(self):
+        return True
+
+
+def _diff_on_a_terminal(tmp_path, monkeypatch, *, shell_no_color, env_file_no_color):
+    """Run `rocketride diff` through main() on a fake terminal and return its stdout."""
+    old = _write_pipe(tmp_path, 'old.pipe', _old_pipe())
+    new = _write_pipe(tmp_path, 'new.pipe', _new_pipe())
+    if env_file_no_color:
+        (tmp_path / '.env').write_text('NO_COLOR=1\n', encoding='utf-8')
+    monkeypatch.chdir(tmp_path)
+    # Register the original (absent) state first, so a leak out of main() is undone
+    monkeypatch.setenv('NO_COLOR', '1')
+    if shell_no_color:
+        monkeypatch.setenv('NO_COLOR', '1')
+    else:
+        monkeypatch.delenv('NO_COLOR')
+    terminal = _Terminal()
+    monkeypatch.setattr(sys, 'stdout', terminal)
+    monkeypatch.setattr(sys, 'argv', ['rocketride', 'diff', old, new])
+    with pytest.raises(SystemExit) as exit_info:
+        cli_main.main()
+    assert exit_info.value.code == 1
+    return terminal.getvalue()
+
+
+def test_diff_colours_a_terminal_when_nothing_says_otherwise(tmp_path, monkeypatch):
+    # The control for the two tests below: colour really is on in this harness
+    assert '\x1b[' in _diff_on_a_terminal(tmp_path, monkeypatch, shell_no_color=False, env_file_no_color=False)
+
+
+def test_shell_no_color_turns_diff_colour_off(tmp_path, monkeypatch):
+    assert '\x1b[' not in _diff_on_a_terminal(tmp_path, monkeypatch, shell_no_color=True, env_file_no_color=False)
+
+
+def test_workspace_only_no_color_is_ignored_by_diff_by_design(tmp_path, monkeypatch):
+    # diff reads no workspace .env at all (see test_diff_skips_the_workspace_env_file),
+    # so a NO_COLOR that exists only there does not apply; the shell's does
+    output = _diff_on_a_terminal(tmp_path, monkeypatch, shell_no_color=False, env_file_no_color=True)
+    assert '\x1b[' in output
+    assert 'NO_COLOR' not in os.environ
 
 
 # =========================================================================

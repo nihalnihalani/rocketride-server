@@ -164,6 +164,36 @@ def _resolve_inputs(args) -> tuple:
     return old_obj, new_obj
 
 
+def _stream_can_print(text: str, stream: Any) -> bool:
+    """
+    Report whether ``stream`` can carry ``text`` exactly.
+
+    ``main()`` opens the standard streams with ``errors='replace'`` so no output
+    can crash a command; a character the stream cannot encode (a lone surrogate,
+    or a letter on an ASCII console) therefore prints as ``?``.
+    """
+    try:
+        text.encode(getattr(stream, 'encoding', None) or 'utf-8')
+    except (UnicodeEncodeError, LookupError):
+        return False
+    return True
+
+
+def _show_unprintable(text: str, stream: Any) -> str:
+    """
+    Return ``text`` with every character ``stream`` cannot encode written as an escape.
+
+    The default would be ``errors='replace'``, which prints each such character as
+    ``?``: ``日本 -> 中国`` on a cp1252 console reads ``?? -> ??``, a change that looks
+    like none. Escapes (``\\u65e5``) keep the two values visibly different.
+    """
+    encoding = getattr(stream, 'encoding', None) or 'utf-8'
+    try:
+        return text.encode(encoding, errors='backslashreplace').decode(encoding)
+    except (LookupError, UnicodeError):
+        return text
+
+
 def _render(args, diff: Any) -> str:
     """
     Render the diff using the reporter selected by the command flags.
@@ -185,12 +215,18 @@ def _render(args, diff: Any) -> str:
         # reporter itself is a bug and must keep its traceback.
         document = render_json(diff)
         try:
-            return json.dumps(document, indent=2, ensure_ascii=False, sort_keys=True, allow_nan=False)
+            text = json.dumps(document, indent=2, ensure_ascii=False, sort_keys=True, allow_nan=False)
+            # Two values that differ only in characters stdout cannot carry (the
+            # lone surrogates "\ud800" and "\udc00" are both valid in a .pipe)
+            # would both print as "?": escape them instead, which is still JSON.
+            if not _stream_can_print(text, sys.stdout):
+                text = json.dumps(document, indent=2, ensure_ascii=True, sort_keys=True, allow_nan=False)
+            return text
         except ValueError as exc:  # a non-finite number; JSON has no spelling for it
             raise PipeDiffError(f'The report contains a value JSON cannot represent: {exc}') from exc
     if getattr(args, 'markdown', False):
-        return render_markdown(diff)
-    return render_human(diff, use_color=_should_use_color(sys.stdout))
+        return _show_unprintable(render_markdown(diff), sys.stdout)
+    return _show_unprintable(render_human(diff, use_color=_should_use_color(sys.stdout)), sys.stdout)
 
 
 async def run_diff(args) -> int:
