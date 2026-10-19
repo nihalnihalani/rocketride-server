@@ -71,15 +71,15 @@ def _make_iglobal(*, allow_execute: bool, engine=None):
     return iglobal
 
 
-def _make_instance(iglobal):
+def _make_instance(iglobal, *, display_name='TestDB', dialect='sqlite'):
     """Instantiate a concrete DatabaseInstanceBase subclass with the given IGlobal."""
 
     class _Concrete(DatabaseInstanceBase):
         def _db_display_name(self):
-            return 'TestDB'
+            return display_name
 
         def _db_dialect(self):
-            return 'sqlite'
+            return dialect
 
     inst = _Concrete.__new__(_Concrete)
     inst.IGlobal = iglobal
@@ -751,3 +751,47 @@ def test_the_execute_tool_description_states_the_session_recovery_policy(instanc
     assert 'rolls nothing back and leaves the session open' in description
     assert 'rollback to savepoint' in description
     assert 'commit is refused' in description
+
+
+def test_the_clickhouse_execute_tool_description_promises_no_rollback():
+    """On ClickHouse there is no transaction to recover, so none may be advertised.
+
+    clickhouse-sqlalchemy's native connector makes ``commit`` and ``rollback``
+    no-ops and ClickHouse has no savepoints, so the generic advice -- recover
+    with ``rollback`` or ``rollback to savepoint <name>`` -- told an agent its
+    work was discarded when every statement had already taken effect.
+    """
+    inst = _make_instance(_make_iglobal(allow_execute=True), display_name='ClickHouse', dialect='clickhouse')
+    description = DatabaseInstanceBase.execute.__tool_meta__['description'](inst)
+
+    assert description.startswith('Execute a raw SQL statement against this ClickHouse database. ')
+    assert 'leaves the session open' in description
+    assert 'rollback discards nothing' in description
+    assert 'savepoints do not exist' in description
+    assert 'recover with rollback' not in description
+    assert 'rollback to savepoint' not in description
+
+    # The session tools themselves say the same, so no tool contradicts it.
+    begin, commit, rollback = (
+        getattr(DatabaseInstanceBase, name).__tool_meta__['description'](inst)
+        for name in ('begin', 'commit', 'rollback')
+    )
+    assert begin.startswith('Reserve a connection on this ClickHouse database; returns a session_id.')
+    assert 'opens no transaction' in begin
+    assert commit.startswith('Close a session.')
+    assert rollback.startswith('Close a session. This undoes nothing')
+    for wording in (begin, commit, rollback):
+        assert 'Roll back' not in wording
+        assert 'Begin a transaction' not in wording
+
+
+def test_the_session_tools_still_describe_a_transaction_on_a_transactional_dialect(instance_with_sqlite_registry):
+    """Only ClickHouse is described differently; every other dialect keeps its wording."""
+    inst = instance_with_sqlite_registry
+
+    def describe(name):
+        return getattr(DatabaseInstanceBase, name).__tool_meta__['description'](inst)
+
+    assert describe('begin') == 'Begin a transaction on this TestDB database; returns a session_id.'
+    assert describe('commit') == 'Commit an open transaction session.'
+    assert describe('rollback') == 'Roll back an open transaction session.'
