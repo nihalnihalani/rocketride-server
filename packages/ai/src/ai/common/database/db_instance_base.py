@@ -564,7 +564,16 @@ class DatabaseInstanceBase(IInstanceBase, ABC):
         ),
     )
     def begin(self, args):
-        """Begin a transaction and return a session_id."""
+        """Open a session and return its ``session_id``.
+
+        Whether the session is a transaction depends on the node; see
+        ``_sessionsAreTransactions``. On a transactional node (the default)
+        it begins a transaction on a connection held for the session. On
+        db_clickhouse it only reserves that connection: no transaction is
+        opened, every statement sent on the session is executed when it is
+        sent, and ``commit`` and ``rollback`` merely close it. The ``begin``
+        tool description above is what an agent reads, and says which.
+        """
         if not self.IGlobal.allow_execute:
             raise ValueError('execute tool is disabled for this node (set allow_execute=true)')
         return {'session_id': self.IGlobal.tx_registry.begin()}
@@ -583,7 +592,13 @@ class DatabaseInstanceBase(IInstanceBase, ABC):
         ),
     )
     def commit(self, args):
-        """Commit and close an open session; see ``_sessionsAreTransactions``."""
+        """Close an open session, committing its transaction where it has one.
+
+        On a node whose sessions are not transactions (``_sessionsAreTransactions``
+        is False, as on db_clickhouse) there is nothing to commit: the session's
+        statements were already executed when they were sent, and this only
+        releases the connection.
+        """
         return self._finishTx(args, commit=True)
 
     @tool_function(
@@ -600,7 +615,13 @@ class DatabaseInstanceBase(IInstanceBase, ABC):
         ),
     )
     def rollback(self, args):
-        """Roll back and close an open session; see ``_sessionsAreTransactions``."""
+        """Close an open session, rolling back its transaction where it has one.
+
+        On a node whose sessions are not transactions (``_sessionsAreTransactions``
+        is False, as on db_clickhouse) nothing is undone: the session's
+        statements were already executed when they were sent, and this only
+        releases the connection.
+        """
         return self._finishTx(args, commit=False)
 
     def _finishTx(self, args, *, commit: bool):

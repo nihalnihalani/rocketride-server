@@ -13,6 +13,7 @@ This pins that the real node opts out, so an agent reading the ClickHouse
 tools is never told its work can be rolled back.
 """
 
+import contextlib
 import importlib
 import sys
 import types
@@ -22,31 +23,38 @@ import pytest
 
 from ai.common.database import DatabaseInstanceBase
 
-NODE_DIR = Path(__file__).resolve().parents[2] / 'src' / 'nodes' / 'db_clickhouse'
+NODES_DIR = Path(__file__).resolve().parents[2] / 'src' / 'nodes'
 
 
-@pytest.fixture(scope='module')
-def IInstance():
-    """Load db_clickhouse/IInstance.py without running the package ``__init__``.
+@contextlib.contextmanager
+def _loaded_iinstance(node):
+    """Load ``nodes/src/nodes/<node>/IInstance.py`` without running the package ``__init__``.
 
     The ``__init__`` calls ``depends()``, which installs the node's driver
-    requirements; this test needs none of them. A bare package module with the
+    requirements; these tests need none of them. A bare package module with the
     node directory as its path lets ``IInstance``'s relative import of
     ``IGlobal`` resolve, and ``sys.modules`` is restored afterwards.
     """
-    names = ('db_clickhouse', 'db_clickhouse.IGlobal', 'db_clickhouse.IInstance')
+    names = (node, f'{node}.IGlobal', f'{node}.IInstance')
     saved = {name: sys.modules.get(name) for name in names}
-    package = types.ModuleType('db_clickhouse')
-    package.__path__ = [str(NODE_DIR)]
-    sys.modules['db_clickhouse'] = package
+    package = types.ModuleType(node)
+    package.__path__ = [str(NODES_DIR / node)]
+    sys.modules[node] = package
     try:
-        yield importlib.import_module('db_clickhouse.IInstance').IInstance
+        yield importlib.import_module(f'{node}.IInstance').IInstance
     finally:
         for name, module in saved.items():
             if module is None:
                 sys.modules.pop(name, None)
             else:
                 sys.modules[name] = module
+
+
+@pytest.fixture(scope='module')
+def IInstance():
+    """The db_clickhouse node's ``IInstance`` class."""
+    with _loaded_iinstance('db_clickhouse') as cls:
+        yield cls
 
 
 def _describe(inst, name):
@@ -70,3 +78,23 @@ def test_clickhouse_tools_promise_no_rollback(IInstance):
     assert _describe(inst, 'begin').startswith('Reserve a connection on this ClickHouse database')
     assert _describe(inst, 'commit').startswith('Close a session.')
     assert _describe(inst, 'rollback').startswith('Close a session. This undoes nothing')
+
+
+@pytest.mark.parametrize('node', ['db_mysql', 'db_postgres', 'rocketride_sql'])
+def test_the_other_sql_nodes_keep_transactional_sessions(node):
+    """Only db_clickhouse opts out; every other SQL node's session is a real transaction.
+
+    Their READMEs and tool descriptions tell an agent that ``rollback`` discards
+    the session's work and that ``rollback to savepoint`` recovers a failed
+    statement. That is true only while the node leaves ``_sessionsAreTransactions``
+    at the base default, so an override copied over from db_clickhouse would
+    silently turn those promises into ClickHouse's "this undoes nothing".
+    """
+    with _loaded_iinstance(node) as cls:
+        inst = cls.__new__(cls)
+
+        assert inst._sessionsAreTransactions() is True
+        execute = _describe(inst, 'execute')
+        assert 'rollback to savepoint' in execute
+        assert 'opens no transaction' not in execute
+        assert _describe(inst, 'rollback').startswith('Roll back')
