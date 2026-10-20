@@ -103,7 +103,12 @@ def resolve_git_ref(ref: str, file_path: str) -> dict | None:
     # text, but the OS opens it as the parent of lnk's target. On a
     # case-insensitive filesystem git itself reports the top level (and, below,
     # the prefix) spelled the way it is stored, whatever case was typed.
-    file_dir = os.path.realpath(os.path.dirname(file_path) or os.curdir)
+    try:
+        file_dir = os.path.realpath(os.path.dirname(file_path) or os.curdir)
+    except OSError as exc:
+        # realpath starts a relative path from os.getcwd(), which fails once the
+        # working directory has been removed
+        raise PipeDiffError(f'Cannot resolve {file_path!r}: the working directory is gone ({exc.strerror})') from exc
     repo_root = _repository_root(file_dir, file_path)
 
     # The path below the repository root, as typed, so that a directory symlink
