@@ -42,6 +42,8 @@ to one test.
 import os
 import subprocess
 
+import pytest
+
 # Longest a single fixture git command may run before the test fails.
 GIT_TIMEOUT_SECONDS = 30
 
@@ -136,3 +138,27 @@ def init_repo(path, *files, message='init'):
     git('init', '-q')
     commit_all(path, message, *files)
     return git
+
+
+def make_symlink(link, target, directory=False):
+    """
+    Create the symbolic link ``link`` pointing at the text ``target``.
+
+    Slashes in ``target`` become the platform's separator first: Windows resolves a
+    relative link only when its text uses backslashes (a link written as ``a/b`` is
+    created but cannot be opened, ``EINVAL``), and git reads the text back with
+    slashes again, so what gets committed is the same on every platform.
+
+    Only on Windows, and only when the account is not allowed to create links
+    (it needs Developer Mode or elevation), the test is skipped; anywhere else, or
+    for any other failure, the error is the test's.
+    """
+    text = os.fspath(target)
+    if os.name == 'nt':
+        text = text.replace('/', os.sep)
+    try:
+        os.symlink(text, link, target_is_directory=directory)
+    except (OSError, NotImplementedError) as exc:
+        if os.name == 'nt' and getattr(exc, 'winerror', None) == 1314:
+            pytest.skip('this Windows account cannot create symbolic links (enable Developer Mode or run elevated)')
+        raise

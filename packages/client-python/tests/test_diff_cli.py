@@ -60,7 +60,7 @@ from types import SimpleNamespace
 
 import pytest
 import rocketride_common
-from pipediff_git_helpers import init_repo, isolate_git_environment
+from pipediff_git_helpers import init_repo, isolate_git_environment, make_symlink
 
 from rocketride.cli.commands import diff as diff_module
 from rocketride.cli.commands.diff import run_diff
@@ -922,7 +922,7 @@ async def test_retargeted_symlink_swap_is_reported_end_to_end(tmp_path, capsys):
     # used to compare v2.pipe with HEAD:v2.pipe and report "No semantic changes."
     _write_pipe(tmp_path, 'v1.pipe', _old_pipe())
     _write_pipe(tmp_path, 'v2.pipe', _new_pipe())
-    (tmp_path / 'current.pipe').symlink_to('v1.pipe')
+    make_symlink(tmp_path / 'current.pipe', 'v1.pipe')
     init_repo(tmp_path, 'v1.pipe', 'v2.pipe', 'current.pipe')
     link = str(tmp_path / 'current.pipe')
 
@@ -931,7 +931,7 @@ async def test_retargeted_symlink_swap_is_reported_end_to_end(tmp_path, capsys):
     assert capsys.readouterr().out.strip() == 'No semantic changes.'
 
     (tmp_path / 'current.pipe').unlink()
-    (tmp_path / 'current.pipe').symlink_to('v2.pipe')
+    make_symlink(tmp_path / 'current.pipe', 'v2.pipe')
     code = await _run(_diff_args([link], git='HEAD', json=True))
 
     doc = json.loads(capsys.readouterr().out)
@@ -947,10 +947,10 @@ async def test_retargeted_directory_symlink_is_reported_end_to_end(tmp_path, cap
     for name, pipe in (('flows_v1', _old_pipe()), ('flows_v2', _new_pipe())):
         (tmp_path / name).mkdir()
         _write_pipe(tmp_path / name, 'rag.pipe', pipe)
-    (tmp_path / 'flows').symlink_to('flows_v1', target_is_directory=True)
+    make_symlink(tmp_path / 'flows', 'flows_v1', directory=True)
     init_repo(tmp_path, 'flows_v1', 'flows_v2', 'flows')
     (tmp_path / 'flows').unlink()
-    (tmp_path / 'flows').symlink_to('flows_v2', target_is_directory=True)
+    make_symlink(tmp_path / 'flows', 'flows_v2', directory=True)
 
     code = await _run(_diff_args([str(tmp_path / 'flows' / 'rag.pipe')], git='HEAD', json=True))
 
@@ -960,15 +960,13 @@ async def test_retargeted_directory_symlink_is_reported_end_to_end(tmp_path, cap
 
 
 @pytest.mark.skipif(shutil.which('git') is None, reason='git is unavailable')
-def test_workspace_env_cannot_redirect_the_git_calls_of_diff(tmp_path):
-    # A GIT_DIR line in .env would point every `--git` subprocess at another
-    # repository (or none): diff reads no configuration, so it must not load it
+def test_git_diff_never_reads_the_workspace_env(tmp_path):
+    # diff reads no configuration, so the workspace .env is not loaded at all: a
+    # damaged one, which every connected command warns about, leaves diff silent
     _write_pipe(tmp_path, 'pipeline.pipe', _old_pipe())
     init_repo(tmp_path, 'pipeline.pipe')
     _write_pipe(tmp_path, 'pipeline.pipe', _new_pipe())
-    (tmp_path / '.env').write_text(
-        f'GIT_DIR={tmp_path / "nowhere"}\nGIT_WORK_TREE={tmp_path / "nowhere"}\n', encoding='utf-8'
-    )
+    (tmp_path / '.env').write_bytes(b'ROCKETRIDE_URI=http://example.invalid\nBROKEN=\xff\n')
 
     result = _cli_subprocess(tmp_path, ['--git', 'HEAD', 'pipeline.pipe', '--json'])
 
