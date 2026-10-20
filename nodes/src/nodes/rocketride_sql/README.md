@@ -80,9 +80,8 @@ primary sentence itself is passed through as PostgreSQL wrote it, so it can
 name a value the statement carried or touched — including one an
 INSERT ... SELECT or a CAST read from another table. That is deliberate:
 reaching this tool at all requires direct execution to be enabled, and a
-caller who has it can read the same data with a SELECT. The full exception,
-statement and bound values included, is written to the engine log; only the
-error execute returns is trimmed.
+caller who has it can read the same data with a SELECT. The full text stays
+in the server log.
 
 A failed statement rolls nothing back and leaves the session open; the error
 text is the same on both paths and carries no recovery advice, so the policy
