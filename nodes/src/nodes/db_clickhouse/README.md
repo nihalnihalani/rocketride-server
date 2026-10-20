@@ -71,41 +71,68 @@ leaves the cached schema exactly as it was. `get_data` returns
 
 `execute` requires non-empty `sql` and optionally accepts a `session_id`
 from `begin` plus positional values for `$1`, `$2`, and so on. It returns
-`{rows, affected_rows}`. A failed statement raises `SQL execution failed:`
-followed by `Error <code>:` and ClickHouse's own primary message,
-identically with and without a `session_id`. The `clickhouse+native://`
-driver does not raise a DBAPI error, so the node unwraps it to the driver
-error it carries; the code and message come from the server's
-own `ServerException`. What is removed is the tail: SQLAlchemy's
-`[SQL: ...]` / `[parameters: ...]` echo, ClickHouse's server stack trace,
-its `failed at position` quotation of the statement, the rest of the input a
-parser prints after `here:` or `before:` (for `INSERT ... VALUES`, the
-remaining rows),
-and the places ClickHouse is known to repeat the statement or expression it
-was working on — after `in scope` (including a named CTE's `x AS (...)`, a
-lambda's `x -> ...` and a function call such as `nofunc(...)`), after
-`In query`, after `while processing query:`, a
-mutation's `while processing:` or the old interpreter's `While processing`,
-together with the `required columns` list that follows. The driver
-interpolates bound values into the statement before sending it, so each of
-those carries them. These are the shapes the node recognises, not a promise
-that ClickHouse has no other. A `throwIf` message (code 395) that ClickHouse
-reports with its runtime context, `: while executing 'FUNCTION ...'`, is the
-caller's own text and comes back whole; one reported without that context
-gets the markers like any other message. The rest is passed through as
-ClickHouse wrote it: the primary sentence, which can name a value or an
-identifier the statement carried or touched, and a runtime context such as
-`while executing 'FUNCTION ...'`, literals included. Two cases lose text but
-never leak it: a quoted value that itself contains one of the tails above is
-cut there, and the runtime context after a `throwIf` message is dropped whole
-when something inside it looks like one. That is deliberate: reaching this
-tool at all requires **Allow direct query execution**, and a caller who has
-it can read the same data with a `SELECT`. The full text stays in the server log. `begin` takes no
-arguments and returns
+`{rows, affected_rows}`. `begin` takes no arguments and returns
 `{session_id}`; `commit` and `rollback` require that ID and return
 `{ok: true}`. These four write-capable operations fail when **Allow direct
 query execution** is off; unknown or expired session IDs also fail. Invalid
 tool input raises an error.
+
+A failed statement raises `SQL execution failed:` followed by `Error <code>:`
+and ClickHouse's own primary message, identically with and without a
+`session_id`. The `clickhouse+native://` driver does not raise a DBAPI error,
+so the node unwraps it to the driver error it carries; the code and message
+come from the server's own `ServerException`. A ClickHouse 23.x server reports
+a parse error as a `DB::ParsingException`, and clickhouse-driver writes the
+class name in front of the message as well
+(`DB::ParsingException. DB::ParsingException: ...`); that is read as
+ClickHouse's text, as is the same text inside `str()` of the exception or
+inside clickhouse-connect's one-line `Received ClickHouse exception` wrapper.
+A ClickHouse nested exception inside `str()` is not recognised and keeps the
+narrower cut that other drivers get.
+
+The driver interpolates bound values into the statement before sending it, so
+anything ClickHouse repeats from the statement or from the rows it was reading
+carries them. What is removed is that repetition:
+
+- SQLAlchemy's `[SQL: ...]` / `[parameters: ...]` echo and ClickHouse's server
+  stack trace.
+- The `failed at position` quotation of the statement.
+- The rest of the input a parser prints after `here:`, `before:` or, following
+  a quoted type, `at:`. For `INSERT ... VALUES` that is the remaining rows:
+  `before:` after a syntax error, `at:` after a `NULL` ClickHouse could not
+  insert into a column.
+- The expression after `Cannot deduce template of expression:` and after
+  `(result column not found):`. The sentence stays; the expression goes.
+- The row diagnostic a text input format (CSV, TSV, ...) appends to a row it
+  could not parse, `Row N:` followed by `Column N, ... parsed text: "<value>"`
+  lines, which restates other rows' values.
+- The statement or expression ClickHouse repeats after `in scope` (whatever
+  shape the scope takes), after `In query`, after `while processing query:`, a
+  mutation's `while processing:` or the old interpreter's `While processing`,
+  together with the `required columns` list that follows.
+
+These are the shapes the node recognises, not a promise that ClickHouse has no
+other. When what remains of the message is only the exception class, because
+ClickHouse's whole sentence was the repetition, the result says so instead of
+returning a bare header: `Error 47: DB::Exception: (the server's message only
+repeated the statement, so it is not shown here; the full text is in the engine
+log)`. A `throwIf` message (code 395) that ClickHouse reports with its
+runtime context, `: while executing 'FUNCTION ...'`, is the caller's own text
+and comes back whole; one reported without that context gets the markers like
+any other message.
+
+The rest is passed through as ClickHouse wrote it: the primary sentence, which
+can name a value or an identifier the statement carried or touched (a
+conversion error names the literal it could not convert), and a runtime context
+such as `while executing 'FUNCTION ...'`, literals included.
+Two cases lose text but never leak it: a quoted value that itself contains one
+of the markers above is cut there, and the runtime context after a `throwIf`
+message is dropped whole when something inside it looks like one.
+
+That is deliberate: reaching this tool at all requires **Allow direct query
+execution**, and a caller who has it can read the same data with a `SELECT`.
+The full exception, statement and bound values included, is written to the
+engine log; only the error `execute` returns is trimmed.
 
 A session opens no ClickHouse transaction. `begin` reserves a connection for
 the `session_id`, but every statement sent on it is executed when it is sent,
