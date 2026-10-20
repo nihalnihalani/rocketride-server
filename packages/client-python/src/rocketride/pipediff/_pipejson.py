@@ -45,6 +45,7 @@ Functions:
         validate its structure.
     validate_pipe: Check that a decoded value is a well-formed pipeline.
     iter_components: Walk a pipeline's components, descending into canvas groups.
+    describe_location: Name a component yielded by ``iter_components`` for an error.
     group_children: Return the children of a canvas group.
     json_equal: Compare two JSON values the way JSON does, not the way Python does.
 
@@ -62,6 +63,7 @@ from typing import Any
 
 __all__ = [
     'PipeDiffError',
+    'describe_location',
     'group_children',
     'iter_components',
     'json_equal',
@@ -157,19 +159,29 @@ def validate_pipe(obj: Any, source: str) -> dict:
     # actionable exit-2 error instead of emitting a diff that is quietly wrong.
     # Canvas-group children are nodes too (see :func:`iter_components`), so ids
     # must be unique across every nesting level.
-    seen_ids: dict[str, str] = {}
-    for component, where in iter_components(obj, include_invalid=True):
+    #
+    # Only the ids are remembered, and a component's location is spelled only for
+    # the one that fails: a valid pipe pays for no per-component text. Spelling it
+    # for every component repeated the group id in each child's location, so a
+    # group with a long id and many children cost their product in memory.
+    seen_ids: set[str] = set()
+    for component, parent, index in iter_components(obj, include_invalid=True):
         if not isinstance(component, dict):
-            raise PipeDiffError(f'{source}: component at {where} is not an object')
+            raise PipeDiffError(f'{source}: component at {describe_location(parent, index)} is not an object')
         component_id = component.get('id')
         if not isinstance(component_id, str) or not component_id:
-            raise PipeDiffError(f"{source}: component at {where} is missing a string 'id'")
-        first_where = seen_ids.get(component_id)
-        if first_where is not None:
-            raise PipeDiffError(
-                f"{source}: duplicate component id '{component_id}' at {where} (already used at {first_where})"
+            raise PipeDiffError(f"{source}: component at {describe_location(parent, index)} is missing a string 'id'")
+        if component_id in seen_ids:
+            first = next(
+                describe_location(first_parent, first_index)
+                for earlier, first_parent, first_index in iter_components(obj)
+                if earlier['id'] == component_id
             )
-        seen_ids[component_id] = where
+            raise PipeDiffError(
+                f"{source}: duplicate component id '{component_id}' at {describe_location(parent, index)}"
+                f' (already used at {first})'
+            )
+        seen_ids.add(component_id)
         _validate_wires(component, component_id, source)
     return obj
 
@@ -192,7 +204,25 @@ def group_children(component: Any) -> list | None:
     return children if isinstance(children, list) else None
 
 
-def iter_components(pipe: dict, *, include_invalid: bool = False) -> Iterator[tuple[Any, str]]:
+def describe_location(parent: dict | None, index: int) -> str:
+    """
+    Name a component for an error message.
+
+    Args:
+        parent: The canvas group holding the component, or ``None`` at the top
+            level (as yielded by :func:`iter_components`).
+        index: The component's index in its containing list.
+
+    Returns:
+        ``index 0`` at the top level, ``'group_1' config.pipeline.components[0]``
+        inside a group.
+    """
+    if parent is None:
+        return f'index {index}'
+    return f"'{parent.get('id')}' config.pipeline.components[{index}]"
+
+
+def iter_components(pipe: dict, *, include_invalid: bool = False) -> Iterator[tuple[Any, dict | None, int]]:
     """
     Walk a pipeline's components, including canvas-group children.
 
@@ -200,9 +230,14 @@ def iter_components(pipe: dict, *, include_invalid: bool = False) -> Iterator[tu
     other component: their ``ui`` is layout, their ``input``/``control`` wiring
     is edges, and their provider and config are compared on the child. Without
     this a drag inside a group surfaced as a config change of the group.
-    Traversal is iterative so arbitrarily nested groups cannot exhaust the
-    recursion limit, and lazy so a caller that needs several facts about each
-    component (validity, id, wires) gathers them in one pass.
+
+    The walk is iterative, so arbitrarily nested groups cannot exhaust the
+    recursion limit, and lazy, so a caller that needs several facts about each
+    component (validity, id, wires) gathers them in one pass. Its working set is
+    one list iterator per nesting level being walked, plus one integer per group
+    expanded: no location text is built, and nothing is kept once the consumer has
+    moved past a component. Spell a location with :func:`describe_location`, and
+    only when an error needs it.
 
     Args:
         pipe: A pipeline dict.
@@ -210,31 +245,29 @@ def iter_components(pipe: dict, *, include_invalid: bool = False) -> Iterator[tu
             validation can report them; diffing skips them.
 
     Yields:
-        ``(component, location)`` pairs in document order, where ``location``
-        names the component for error messages (``index 0`` at the top level,
-        ``'group_1' config.pipeline.components[0]`` inside a group).
+        ``(component, parent, index)`` in document order (a group before its
+        children), where ``parent`` is the enclosing canvas group (``None`` at the
+        top level) and ``index`` the position in the containing list.
     """
     expanded: set[int] = set()
     top_level = pipe.get('components')
-    pending = [
-        (component, f'index {index}')
-        for index, component in enumerate(top_level if isinstance(top_level, list) else [])
-    ]
-    pending.reverse()
-    while pending:
-        component, where = pending.pop()
-        if include_invalid or (isinstance(component, dict) and isinstance(component.get('id'), str)):
-            yield component, where
-        children = group_children(component)
-        # An in-memory dict can nest itself; expand each group once so the walk
-        # always ends (validation then reports the repeat as a duplicate id).
-        if children and id(component) not in expanded:
-            expanded.add(id(component))
-            group_id = component.get('id')
-            pending.extend(
-                (child, f"'{group_id}' config.pipeline.components[{index}]")
-                for index, child in reversed(list(enumerate(children)))
-            )
+    levels: list[tuple[Iterator[tuple[int, Any]], dict | None]] = []
+    if isinstance(top_level, list):
+        levels.append((enumerate(top_level), None))
+    while levels:
+        siblings, parent = levels[-1]
+        for index, component in siblings:
+            if include_invalid or (isinstance(component, dict) and isinstance(component.get('id'), str)):
+                yield component, parent, index
+            children = group_children(component)
+            # An in-memory dict can nest itself; expand each group once so the walk
+            # always ends (validation then reports the repeat as a duplicate id).
+            if children and id(component) not in expanded:
+                expanded.add(id(component))
+                levels.append((enumerate(children), component))
+                break
+        else:
+            levels.pop()
 
 
 # The wire collections a component may declare, mapped to the key that labels the
