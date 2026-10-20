@@ -459,6 +459,48 @@ def test_utf16_file_neither_crashes_nor_sets_anything(tmp_path, capsys, encoding
     assert 'UTF-16' in line
 
 
+@pytest.mark.parametrize(
+    ('encoding', 'content', 'expected'),
+    [
+        # The byte-order mark makes line 1 invalid UTF-8 and the NULs make it a NUL line: one line, counted once
+        (
+            'utf-16',
+            'X=1\n',
+            'is not valid UTF-8 (first invalid byte at offset 0, on line 1); '
+            'has 1 assignment line containing NUL characters, which was skipped (first on line 1; is the file UTF-16?)',
+        ),
+        (
+            'utf-16',
+            'A=1\nB=2\n',
+            'is not valid UTF-8 (first invalid byte at offset 0, on line 1); '
+            'has 2 assignment lines containing NUL characters, which were skipped (first on line 1; is the file UTF-16?)',
+        ),
+        (
+            'utf-16-le',
+            'A=1\nB=2\n',
+            'has 2 assignment lines containing NUL characters, which were skipped (first on line 1; is the file UTF-16?)',
+        ),
+    ],
+    ids=['bom-one-line', 'bom-two-lines', 'no-bom-two-lines'],
+)
+def test_utf16_warning_counts_each_skipped_line_once(tmp_path, capsys, encoding, content, expected):
+    _load(tmp_path, content.encode(encoding))
+
+    (line,) = _warnings(capsys)
+    assert line == f'Warning: {tmp_path / ".env"} {expected}.'
+    assert 'holding invalid bytes' not in line  # the same line is not also "invalid"
+
+
+def test_each_kind_of_skipped_line_is_counted_under_one_reason(tmp_path, capsys):
+    # line 1 invalid bytes only, line 2 NUL only, line 3 both
+    _load(tmp_path, b'A=\xff\nB=a\0b\n\xffC=1\0\nD=ok\n')
+
+    (line,) = _warnings(capsys)
+    assert os.environ['D'] == 'ok'
+    assert '1 assignment line holding invalid bytes was skipped (first on line 1)' in line
+    assert '2 assignment lines containing NUL characters, which were skipped (first on line 2' in line
+
+
 def test_deploy_pair_in_a_file_with_a_nul_line_is_still_applied(tmp_path, capsys):
     # The prod deploy pair must be visible to `login`, which refuses to
     # overwrite a deploy pair that points elsewhere
@@ -587,6 +629,7 @@ def test_write_refuses_an_unfaithful_file_and_leaves_it_untouched(tmp_path, cont
     assert expected in message
     assert 'prod.example' not in message  # no contents in the diagnostic
     assert '\n' not in message  # one line
+    assert message.endswith('Fix or remove it, then run the command again.')  # here the file is what is wrong
     assert path.read_bytes() == content
 
 
@@ -703,6 +746,10 @@ def test_write_refuses_a_connection_value_this_process_cannot_store(tmp_path, as
         assert 'on line 1' in message
         assert acute not in message and 'prod.example' not in message
         assert '\n' not in message
+        # The file is fine; the process is the limit, and the message says what helps
+        assert 'Nothing is wrong with the file' in message
+        assert 'UTF-8 locale' in message and 'LC_ALL=C.UTF-8' in message
+        assert 'Fix or remove it' not in message
     assert path.read_bytes() == content
 
 
