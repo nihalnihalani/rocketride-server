@@ -449,16 +449,30 @@ def _ident(text: Any) -> str:
 
     Identifiers are not values, so they are not quoted merely for holding an escaped
     character: ``a\\u202e`` is the plain way to show an id with a real U+202E in it.
-    They are quoted when that spelling would be ambiguous, which is when the id
-    itself holds text that reads like an escape (see :data:`_ESCAPE_LOOKALIKE`) or
-    starts with a quote (so an unquoted id never looks like a quoted one). JSON
-    quoting doubles the backslash, so ``"a\\\\u202e"`` is the six characters and
-    ``a\\u202e`` is the character. Ordinary ids and paths print as they always did.
+    They are quoted when that spelling would be ambiguous:
+
+    - the id itself holds text that reads like an escape (see :data:`_ESCAPE_LOOKALIKE`).
+      JSON quoting doubles the backslash, so ``"a\\\\u202e"`` is the six characters and
+      ``a\\u202e`` is the character;
+    - it starts with a quote, so an unquoted id never looks like a quoted one;
+    - its whitespace would not survive a reader or a Markdown code span: leading or
+      trailing whitespace, a tab, or a run of spaces. ``llm_1`` with a trailing space
+      prints like ``llm_1``, and ``a b`` with a tab or two spaces prints like ``a b``
+      with one. Quoted, the padding sits inside the quotes and the tab is written
+      ``\\t``.
+
+    Ordinary ids and paths, which are single words or single-spaced phrases, print as
+    they always did.
     """
     text = str(text)
-    if text.startswith('"') or _ESCAPE_LOOKALIKE.search(text):
+    if text.startswith('"') or _ESCAPE_LOOKALIKE.search(text) or _has_ambiguous_whitespace(text):
         return json.dumps(text, ensure_ascii=False)
     return text
+
+
+def _has_ambiguous_whitespace(text: str) -> bool:
+    """Report whether ``text`` has whitespace that bare text would hide (see :func:`_ident`)."""
+    return text != text.strip() or '\t' in text or '  ' in text
 
 
 def _identity(text: Any) -> str:
