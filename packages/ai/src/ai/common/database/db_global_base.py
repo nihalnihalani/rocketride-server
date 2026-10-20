@@ -160,6 +160,28 @@ DEFAULT_MAX_EXECUTE_ROWS = 25000
 # for `INSERT ... VALUES`, the remaining rows with every value bound into them,
 # as in `Cannot parse input: expected '(' before: 'ON DUPLICATE KEY UPDATE s =
 # ...'` when an agent writes another dialect's upsert.
+#
+# Four more shapes print a piece of the caller's input, and were found by
+# running the failing statements against live servers (23.8 and 25.8):
+#
+#   * ` at: ` after a quoted type, `Cannot insert NULL value into a column of
+#     type 'UInt32' at: NULL, 'x'), (3, 'y')`, which is the rest of the VALUES
+#     rows again. The quote in front keeps the marker to that shape.
+#   * `Cannot deduce template of expression: <expr>`, which repeats the
+#     expression ClickHouse could not template, bound values included. Only the
+#     colon is cut, so the sentence stays.
+#   * `... (result column not found): <expr>`, the same for an expression that
+#     is not constant.
+#   * The diagnostic a text input format (CSV, TSV, ...) appends to a row it
+#     could not parse: `Row 1:\nColumn 0, name: id, type: UInt32, parsed text:
+#     "1"` for the row before the failure and the columns of the failing row
+#     read so far. It restates other rows' values. The `before: '` echo above
+#     usually comes first and cuts earlier, but `Expected end of line` (a row
+#     with an extra column) and `Unsigned type must not contain '-' symbol`
+#     carry the diagnostic without it.
+#
+# Which text is ClickHouse's is decided by the three patterns below, because
+# these markers may only cut text ClickHouse wrote.
 
 _CLICKHOUSE_STACK_TRACE = 'Stack trace:'
 
@@ -194,25 +216,54 @@ _CLICKHOUSE_ECHO = rf"""(?:
     | {_CLICKHOUSE_IDENTIFIER}\(
 )"""
 
-# ClickHouse's tails as the backstop has always cut them.
-_CLICKHOUSE_BACKSTOP_TAILS = rf"""
+# The ClickHouse tails the backstop has always cut, and so ClickHouse's own
+# text cuts too.
+_CLICKHOUSE_SHARED_TAILS = rf"""
       {re.escape(_CLICKHOUSE_STACK_TRACE)}
     | failed\ at\ position
     | while\ processing\ query:
     | ,\ required\ columns:
+"""
+
+# ClickHouse's tails as the backstop has always cut them: the shared ones and
+# `in scope` before a statement keyword, nothing else.
+_CLICKHOUSE_BACKSTOP_TAILS = rf"""
+      {_CLICKHOUSE_SHARED_TAILS}
     | [Ii]n\ scope\ (?=\(?(?:SELECT|INSERT|WITH|CREATE|ALTER|DROP|DELETE|UPDATE|EXPLAIN)\b)
 """
 
-# Every ClickHouse tail, applied only to text ClickHouse wrote.
-_CLICKHOUSE_TAILS = rf"""
-      {re.escape(_CLICKHOUSE_STACK_TRACE)}
-    | failed\ at\ position
-    | while\ processing\ query:
+# Every ClickHouse tail that needs no help to be told from prose. Applied only
+# to text ClickHouse wrote.
+_CLICKHOUSE_COMMON_TAILS = rf"""
+      {_CLICKHOUSE_SHARED_TAILS}
     | while\ processing:\ '
     | :\ While\ processing\s
-    | ,\ required\ columns:
     | \ here:\s
     | \ before:\ '
+    | (?<=')\ at:\s
+    | (?<=deduce\ template\ of\ expression):\s
+    | (?<=\(result\ column\ not\ found\)):\s
+    | :?\s*\nRow\ \d+:\nColumn\ \d+,
+"""
+
+# ClickHouse's own text: `in scope` is cut wherever it stands, because the
+# analyzer writes the phrase only to introduce the scope it then prints, and
+# that scope is the failing expression, bound values included. It takes any
+# shape an expression has (`'x' = nope`, `('x', nope).1`, `['x', nope][1]`), so
+# no list of shapes could be complete. `In query` still needs the shape of a
+# statement behind it.
+_CLICKHOUSE_TAILS = rf"""
+      {_CLICKHOUSE_COMMON_TAILS}
+    | [Ii]n\ scope\s
+    | [Ii]n\ query\ (?={_CLICKHOUSE_ECHO})
+"""
+
+# The same markers with `in scope` held to the shapes of `_CLICKHOUSE_ECHO`,
+# for one use only: looking for an echo inside a `throwIf` runtime context
+# (see `_strip_clickhouse_detail`), where the caller's own words ("not in scope
+# for this trigger") are repeated as literals and must not read as one.
+_CLICKHOUSE_CONTEXT_TAILS = rf"""
+      {_CLICKHOUSE_COMMON_TAILS}
     | [Ii]n\ (?:scope|query)\ (?={_CLICKHOUSE_ECHO})
 """
 
@@ -225,6 +276,7 @@ _SQLALCHEMY_DETAIL = re.compile(rf'\s*(?:{_SQLALCHEMY_TAILS})', re.VERBOSE)
 # SQLAlchemy writes its tail into `str()` of its own exception, never into the
 # driver's message, so on this text those markers could only misfire.
 _CLICKHOUSE_DETAIL = re.compile(rf'\s*(?:{_CLICKHOUSE_TAILS})', re.VERBOSE)
+_CLICKHOUSE_CONTEXT_DETAIL = re.compile(rf'\s*(?:{_CLICKHOUSE_CONTEXT_TAILS})', re.VERBOSE)
 
 # Any shape `_format_db_error` cannot attribute to one driver.
 _DB_ERROR_DETAIL = re.compile(
@@ -235,16 +287,48 @@ _DB_ERROR_DETAIL = re.compile(
     re.VERBOSE,
 )
 
-# How every message ClickHouse writes opens: the exception class --
-# `DB::Exception:`, or on older servers a subclass such as
-# `DB::ParsingException:`, which is the one their parse errors (and so the
-# `here:` / `before:` echoes) carry -- after `Code: <errno>. ` when the text
-# arrives over the MySQL wire protocol as a pymysql `(errno, message)` pair.
-# That prefix only repeats the errno, so a match's end is where the text worth
-# keeping starts. Anchored, so text that merely mentions the phrase -- a
-# SIGNAL's, or another driver's -- is not taken for ClickHouse's and cut with
-# its markers.
-_CLICKHOUSE_TEXT = re.compile(r'\A(?:Code:\ \d+\.\ )?(?=DB::\w*Exception:)')
+# How ClickHouse's own text opens: the exception class -- `DB::Exception:`, or
+# on older servers a subclass such as `DB::ParsingException:`, which is the one
+# their parse errors (and so the `here:` / `before:` echoes) carry. What
+# stands in front of the class depends on who carried the text, and was read
+# off live servers (23.8.16.16 and 25.8.33.6) through every route. Each shape
+# has its own pattern, anchored at the start of the text, so that text which
+# merely contains the phrase -- a SIGNAL's, or another driver's -- is never
+# taken for ClickHouse's and cut with its markers:
+#
+#   * `_CLICKHOUSE_TEXT`: clickhouse-driver's `.message`, which is the class, or
+#     for a subclass the driver's own `DB::ParsingException. ` followed by the
+#     class again. The repeated name adds nothing, so a match's end is where
+#     the text worth keeping starts.
+#   * `_CLICKHOUSE_STR_TEXT`: `str()` of that exception and of the dbapi error,
+#     `Code: 27.` and a NEWLINE before the same text; clickhouse-sqlalchemy's
+#     wrapper puts `Orig exception: ` in front of that; and clickhouse-connect
+#     (HTTP) writes one line, `Received ClickHouse exception, code: 27, server
+#     response: Code: 27. DB::...`, with the same number twice. These reach the
+#     branches that cannot name the writer, and keep the form they arrived in.
+#   * `_CLICKHOUSE_MYSQL_TEXT`: ClickHouse's MySQL interface, as a pymysql
+#     `(errno, message)` pair, writes `Code: <errno>. ` with the pair's own
+#     errno and never the driver's repeated class name. This one is stricter
+#     than the rest, because MySQL's own sentence reaches the same shape and
+#     is the application's: a `SIGNAL` reading `DB::Exception: tenant X
+#     rejected. Upload failed at position 3` arrives as `(1644, 'DB::Exception:
+#     ...')` with no `Code:` in front, so it stays whole. Only `Code: <errno>.`
+#     with THE pair's errno counts. A `SIGNAL` that spells that whole prefix
+#     cannot be told apart; its text is cut at ClickHouse's markers, which can
+#     lose text and cannot leak.
+_CLICKHOUSE_TEXT = re.compile(r'\A(?:DB::\w*Exception\.\ )?(?=DB::\w*Exception:)')
+_CLICKHOUSE_STR_TEXT = re.compile(
+    r"""
+    \A(?:
+        Received\ ClickHouse\ exception,\ code:\ (\d+),\ server\ response:\ Code:\ \1\.[ ]
+      | (?:Orig\ exception:\ )?Code:\ \d+\.(?:\ |\n)
+    )
+    (?:DB::\w*Exception\.\ )?
+    (?=DB::\w*Exception:)
+    """,
+    re.VERBOSE,
+)
+_CLICKHOUSE_MYSQL_TEXT = re.compile(r'\ACode:\ (\d+)\.\ (?=DB::\w*Exception:)')
 
 # ClickHouse's FUNCTION_THROW_IF_VALUE_IS_NON_ZERO: `throwIf` raised it, with
 # the caller's own message. ClickHouse then appends the runtime context of the
@@ -257,6 +341,15 @@ _CLICKHOUSE_RUNTIME_CONTEXT = ": while executing 'FUNCTION "
 # Returned when a message carries no primary sentence at all, so the caller
 # always gets a non-empty string and never the statement echo.
 _DB_ERROR_FALLBACK = 'Database error'
+
+# What ClickHouse's own markers leave behind when its whole sentence was the
+# echo. Appended to the bare header, so the caller reads `Error 47:
+# DB::Exception: (the server's message only repeated the statement, ...)`
+# instead of `Error 47: DB::Exception:`.
+_CLICKHOUSE_CLASS_ONLY = re.compile(r'DB::\w*Exception:?\.?')
+_CLICKHOUSE_ECHO_ONLY = (
+    "(the server's message only repeated the statement, so it is not shown here; the full text is in the engine log)"
+)
 
 # A SQLSTATE as the standard defines it: five characters, digits and capitals.
 # ODBC-backed drivers (pyodbc and friends) report `(sqlstate, message)` where
@@ -290,19 +383,44 @@ def _strip_statement_detail(message: str, detail: re.Pattern = _DB_ERROR_DETAIL)
     return trimmed or _DB_ERROR_FALLBACK
 
 
+def _strip_clickhouse_text(text: str, start: int, backstop: Optional[re.Pattern] = None) -> str:
+    """Cut ClickHouse's text at its first marker; ``start`` is where that text begins in ``text``.
+
+    ClickHouse's markers apply from ``start`` on and never before it. ``backstop``
+    (``_DB_ERROR_DETAIL``) is for text that wraps ClickHouse's in another
+    driver's: it applies to the whole of ``text``, so the wrapper's own tail
+    (``[SQL: ...]``) goes as it always did.
+
+    When the cut leaves nothing but the exception class, ClickHouse's whole
+    sentence was the echo, and the bare header (``Error 47: DB::Exception:``)
+    tells the caller nothing, so ``_CLICKHOUSE_ECHO_ONLY`` says why instead. It
+    is a fixed sentence and names no part of the statement. Only a cut made by
+    ClickHouse's own markers counts; one made by the backstop's, or none at
+    all, returns the text as it is.
+    """
+    clickhouse = _CLICKHOUSE_DETAIL.search(text, start)
+    other = backstop.search(text) if backstop is not None else None
+    cuts = [match.start() for match in (clickhouse, other) if match is not None]
+    trimmed = (text[: min(cuts)] if cuts else text).strip()
+    if clickhouse is not None and min(cuts) == clickhouse.start() and _CLICKHOUSE_CLASS_ONLY.fullmatch(trimmed, start):
+        return f'{trimmed} {_CLICKHOUSE_ECHO_ONLY}'
+    return trimmed or _DB_ERROR_FALLBACK
+
+
 def _strip_clickhouse_detail(code: int, message: str) -> str:
     """Return ``Error <code>: <message>`` cut down to its primary sentence.
 
-    ``_strip_statement_detail`` with ClickHouse's markers, except for a
-    ``throwIf`` failure (code 395) that ClickHouse reports with its runtime
-    context. There the primary sentence is the caller's own text --
-    ``throwIf(1, 'In scope SELECT secret')`` raises with exactly that -- so no
-    marker may cut it, just as none cuts a MySQL ``SIGNAL`` message or a
-    PL/pgSQL ``RAISE``. Keyed on the code, not on the text, so a statement
-    cannot route an analyzer echo past the markers by spelling the context
-    into an alias. A ``throwIf`` given a custom error code (which needs
-    ``allow_custom_error_code_in_throwif``), and a 395 with no runtime
-    context, get the markers like any other message.
+    ``message`` is ClickHouse's text from its exception class on (see
+    ``_CLICKHOUSE_TEXT``). It is ``_strip_clickhouse_text`` with ClickHouse's
+    markers, except for a ``throwIf`` failure (code 395) that ClickHouse
+    reports with its runtime context. There the primary sentence is the
+    caller's own text -- ``throwIf(1, 'In scope SELECT secret')`` raises with
+    exactly that -- so no marker may cut it, just as none cuts a MySQL
+    ``SIGNAL`` message or a PL/pgSQL ``RAISE``. Keyed on the code, not on the
+    text, so a statement cannot route an analyzer echo past the markers by
+    spelling the context into an alias. A ``throwIf`` given a custom error code
+    (which needs ``allow_custom_error_code_in_throwif``), and a 395 with no
+    runtime context, get the markers like any other message.
 
     The context starts at the first ``: while executing 'FUNCTION ``, so a
     caller's message that merely says "while executing" stays whole. It is
@@ -315,19 +433,39 @@ def _strip_clickhouse_detail(code: int, message: str) -> str:
     whole rather than cut mid-literal, and the caller's sentence is what
     remains.
     """
-    text = f'Error {code}: {message}'
-    if code != _CLICKHOUSE_THROW_IF_CODE:
-        return _strip_statement_detail(text, _CLICKHOUSE_DETAIL)
-    head, sep, context = text.partition(_CLICKHOUSE_RUNTIME_CONTEXT)
+    prefix = f'Error {code}: '
+    text = prefix + message
+    head, sep, context = (
+        text.partition(_CLICKHOUSE_RUNTIME_CONTEXT) if code == _CLICKHOUSE_THROW_IF_CODE else (text, '', '')
+    )
     if not sep:
-        return _strip_statement_detail(text, _CLICKHOUSE_DETAIL)
+        return _strip_clickhouse_text(text, len(prefix))
     trace = context.rfind(_CLICKHOUSE_STACK_TRACE)
     if trace >= 0:
         context = context[:trace]
     context = sep + context
-    if _CLICKHOUSE_DETAIL.search(context):
+    if _CLICKHOUSE_CONTEXT_DETAIL.search(context):
         context = ''
     return (head + context).strip() or _DB_ERROR_FALLBACK
+
+
+def _strip_backstop_detail(message: str) -> str:
+    """Cut a message whose writer cannot be named: the backstop, and ClickHouse's markers on ClickHouse's part.
+
+    ``_strip_statement_detail`` over ``_DB_ERROR_DETAIL`` -- SQLAlchemy's,
+    PostgreSQL's and the old ClickHouse markers -- is all a message gets unless
+    it is ClickHouse's text in one of the ``str()`` shapes of
+    ``_CLICKHOUSE_STR_TEXT``. Those are cut at the EARLIER of the backstop's
+    first marker over the whole message and ClickHouse's first marker inside
+    the text: the change can only add cuts to what the backstop made, never
+    keep text the backstop would have removed. ClickHouse's ``before: '`` echo
+    goes with the rest. The text keeps the form it arrived in (``Code: 27.``
+    and a newline, or clickhouse-connect's wrapper).
+    """
+    clickhouse = _CLICKHOUSE_STR_TEXT.match(message)
+    if clickhouse is None:
+        return _strip_statement_detail(message)
+    return _strip_clickhouse_text(message, clickhouse.end(), _DB_ERROR_DETAIL)
 
 
 class DatabaseGlobalBase(IGlobalBase, ABC):
@@ -424,19 +562,27 @@ class DatabaseGlobalBase(IGlobalBase, ABC):
 
         ``str(exc)`` is the wrong answer for a SQLAlchemy ``StatementError``:
         its repr appends ``[SQL: ...]`` and ``[parameters: ...]``, which is
-        exactly the data that must stay in the server log. So each driver
-        shape is unwrapped explicitly and only the primary message is kept:
+        exactly the data this method must not return (the engine log has it).
+        So each driver shape is unwrapped explicitly and only the primary
+        message is kept:
 
         * pymysql puts ``(errno, message)`` in ``.orig.args``
           -> ``Error <code>: <message>``. MySQL appends nothing to its own
           sentence, so only SQLAlchemy's markers apply to it, and a
-          ``SIGNAL``'s ``MESSAGE_TEXT`` or MySQL's ``near '...'`` quote comes
-          back whole unless it contains one of SQLAlchemy's tail markers
-          (``[SQL:``, ``(Background on this error`` ...). The same pair can
-          carry ClickHouse's text: db_mysql pointed at ClickHouse's MySQL
-          interface receives ``(47, "Code: 47. DB::Exception: ... in scope
-          SELECT ...")``, statement and bound value included. Text that opens
-          that way is therefore cut with ClickHouse's markers instead.
+          ``SIGNAL``'s ``MESSAGE_TEXT`` or MySQL's ``near '...'`` quote (the
+          rest of the statement from where the parser stopped) comes back whole
+          unless it contains one of SQLAlchemy's tail markers (``[SQL:``,
+          ``(Background on this error`` ...). The same pair can carry
+          ClickHouse's text: db_mysql pointed at ClickHouse's MySQL interface
+          receives ``(47, "Code: 47. DB::Exception: ... in scope SELECT
+          ...")``, statement and bound value included. Text that opens with
+          ``Code: <errno>.`` -- the pair's own errno -- and then ClickHouse's
+          exception class is therefore cut with ClickHouse's markers instead.
+          Anything else keeps SQLAlchemy's alone, a ``SIGNAL`` reading
+          ``DB::Exception: tenant X rejected.`` included, which has no
+          ``Code:`` in front. A ``SIGNAL`` that spells the whole prefix, errno
+          and all, cannot be told from ClickHouse's text and is cut at
+          ClickHouse's markers: its text may be shortened, nothing leaks.
         * clickhouse-driver does NOT: its ``ServerException`` carries the code
           on ``.code`` and the text on ``.message``, so those attributes are
           read directly -> ``Error <code>: <message>``. The message itself
@@ -450,12 +596,23 @@ class DatabaseGlobalBase(IGlobalBase, ABC):
           row); code 215 repeats it after ``In query``, a mutation repeats
           its predicate after ``while processing: '``, and a parser that
           stopped prints the rest of its input after `` here: `` or
-          `` before: '``. All of
+          `` before: '``. Three more repeat the caller's input: `` at: ``
+          after a quoted type (``Cannot insert NULL value into a column of
+          type 'UInt32' at: NULL, ...``, the rest of the VALUES rows),
+          ``Cannot deduce template of expression:`` and ``(result column not
+          found):`` (the expression), and a text input format (CSV, TSV, ...)
+          appends the ``Row N:`` / ``Column N, ... parsed text:`` diagnostic
+          for the failing row and the one before it. All of
           those are cut by ClickHouse's markers, which apply only to text
           that opens with ClickHouse's exception class (``DB::Exception:``,
-          or an older server's ``DB::ParsingException:``); any other
-          ``.code`` /
-          ``.message`` pair gets the backstop. The echoes are not cosmetic:
+          or an older server's ``DB::ParsingException:``, which the driver
+          writes as ``DB::ParsingException. DB::ParsingException:``; the
+          repeated name is dropped, as the MySQL interface's ``Code: N.`` is);
+          any other ``.code`` / ``.message`` pair gets the backstop. If the
+          cut leaves nothing but the class, ClickHouse's sentence was only
+          the echo, and the result says so (``Error 47: DB::Exception: (the
+          server's message only repeated the statement, ...)``) rather than
+          returning the bare header. The echoes are not cosmetic:
           the driver sends no server-side parameters by default, so the
           statement it echoes back has the caller's bind values already
           interpolated into it. A ``throwIf`` failure (code 395) is the
@@ -467,7 +624,14 @@ class DatabaseGlobalBase(IGlobalBase, ABC):
           ``ServerException`` in ``.orig``. ``clickhouse_driver.dbapi`` raises
           ``OperationalError(ServerException)`` instead, whose ``args`` hold
           the exception object itself, so that one is unwrapped first when
-          its text is ClickHouse's. Both reach the same branch.
+          its text is ClickHouse's. Both reach the same branch. The same text
+          also arrives in two shapes that reach the backstop branches below:
+          ``str()`` of those exceptions (``Code: 27.``, a newline, then the
+          text, behind ``Orig exception: `` for clickhouse-sqlalchemy's
+          wrapper) and clickhouse-connect's one-line ``Received ClickHouse
+          exception, code: 27, server response: Code: 27. DB::...``. Both are
+          recognised by their exact opening only (``_CLICKHOUSE_STR_TEXT``),
+          and keep the form they arrived in.
         * psycopg2 exposes the server's primary message on ``.orig.diag``;
           its ``str()`` also carries the ``LINE n:`` echo of the statement,
           which psycopg2 has already interpolated the bind values into.
@@ -495,7 +659,13 @@ class DatabaseGlobalBase(IGlobalBase, ABC):
         run the backstop: SQLAlchemy's and PostgreSQL's markers, and the
         ClickHouse markers that existed before the ClickHouse-only ones, so a
         driver shape not enumerated here still cannot leak the tail, and the
-        narrower ClickHouse markers cannot cut an unknown driver's prose.
+        narrower ClickHouse markers cannot cut an unknown driver's prose. The
+        one exception is a message that opens with one of the ``str()`` shapes
+        above: ClickHouse's markers apply to it as well, and the cut is made at
+        the earlier of the backstop's first marker and ClickHouse's. That can
+        only add cuts. Any other message, including one that merely contains
+        ``DB::Exception:`` on a later line, is cut by the backstop alone, as it
+        was before ClickHouse's markers were added.
 
         What this does and does not promise, stated exactly, because the
         difference matters and is easy to overclaim:
@@ -507,8 +677,10 @@ class DatabaseGlobalBase(IGlobalBase, ABC):
           left alone in the middle of a sentence, where they belong to the
           application, not to the server), ClickHouse's server stack trace,
           its ``failed at position`` echo, the rest of its input after a
-          parser's `` here: `` or `` before: '`` (for ``INSERT ... VALUES``,
-          the remaining rows),
+          parser's `` here: ``, `` at: `` or `` before: '`` (for ``INSERT ...
+          VALUES``, the remaining rows), the expression after ``Cannot deduce
+          template of expression:`` and ``(result column not found):``, the
+          ``Row N:`` / ``Column N`` diagnostic of a text input format,
           and the statement or expression it repeats after
           ``while processing query:`` / ``while processing:`` /
           ``While processing`` / ``in scope`` / ``In query``, together with
@@ -518,12 +690,15 @@ class DatabaseGlobalBase(IGlobalBase, ABC):
         * PASSED THROUGH: the driver's own primary sentence, as the database
           wrote it -- an application's own text (a MySQL ``SIGNAL``, a
           PL/pgSQL ``RAISE``, a ClickHouse ``throwIf`` message reported with
-          its runtime context) whole. It can quote the fragment of the
-          statement the parser stopped on (sqlite3
-          ``near "'hunter2'": syntax error``, MySQL 1064
-          ``near '...' at line 1``, psycopg2 ``syntax error at or near ...``),
-          and because pymysql and psycopg2 interpolate bind values
-          client-side, such a fragment can contain a bound value. It can also
+          its runtime context) whole. It can quote part of the statement
+          itself. sqlite3 (``near "'hunter2'": syntax error``) and psycopg2
+          (``syntax error at or near ...``) name the token the parser
+          rejected, but MySQL 1064 (``near '...' at line N``) quotes the REST
+          of the statement from that token onwards, up to 80 characters, so
+          the later clauses and every value bound into them can appear.
+          pymysql and psycopg2 interpolate bind values client-side, so such a
+          quote can contain a bound value. MySQL's quote is deliberately not
+          redacted here; that is a known limit. It can also
           quote a value the statement merely TOUCHED rather than carried:
           PostgreSQL's ``invalid input syntax for type integer: "<value>"``
           names the offending row value for an ``INSERT ... SELECT`` or a
@@ -540,7 +715,8 @@ class DatabaseGlobalBase(IGlobalBase, ABC):
         because MySQL quotes identifiers with single quotes too ("Unknown
         column 'foo' in 'field list'"), so the redaction would delete the one
         thing the caller needs. The full exception, statement and binds
-        included, stays in the server log.
+        included, is written to the engine log; only the error this method
+        returns is trimmed.
         """
         try:
             # SQLAlchemy wraps driver exceptions in DBAPIError; the original
@@ -560,8 +736,12 @@ class DatabaseGlobalBase(IGlobalBase, ABC):
             # MySQL's own sentence, which no other dialect's marker may cut (a
             # SIGNAL's MESSAGE_TEXT is the application's text).
             if is_seq and len(args) >= 2 and isinstance(args[0], int):
-                clickhouse = _CLICKHOUSE_TEXT.match(args[1]) if isinstance(args[1], str) else None
-                if clickhouse:
+                # ClickHouse's MySQL interface prefixes its text with `Code:
+                # <errno>.`, the pair's own errno. MySQL's `SIGNAL` text that
+                # opens with `DB::Exception:` has no such prefix, so it is
+                # MySQL's and keeps SQLAlchemy's markers alone.
+                clickhouse = _CLICKHOUSE_MYSQL_TEXT.match(args[1]) if isinstance(args[1], str) else None
+                if clickhouse and int(clickhouse[1]) == args[0]:
                     return _strip_clickhouse_detail(args[0], args[1][clickhouse.end() :])
                 return _strip_statement_detail(f'Error {args[0]}: {args[1]}', _SQLALCHEMY_DETAIL)
 
@@ -590,22 +770,23 @@ class DatabaseGlobalBase(IGlobalBase, ABC):
             # when the text inside is ClickHouse's: other drivers wrap an
             # exception the same way, and their text keeps the backstop. The
             # `.code` / `.message` pair is not ClickHouse's alone either, so
-            # ClickHouse's markers are used only on ClickHouse's text.
+            # ClickHouse's markers are used only on ClickHouse's text, which
+            # is classified once, on whichever exception supplies the pair.
             server = orig
             inner = args[0] if is_seq and len(args) == 1 else None
-            if (
-                not isinstance(getattr(orig, 'code', None), int)
-                and isinstance(inner, BaseException)
-                and isinstance(getattr(inner, 'message', None), str)
-                and _CLICKHOUSE_TEXT.match(inner.message)
-            ):
+            if not isinstance(getattr(orig, 'code', None), int) and isinstance(inner, BaseException):
                 server = inner
             code = getattr(server, 'code', None)
             message = getattr(server, 'message', None)
             if isinstance(code, int) and isinstance(message, str) and message.strip():
-                if _CLICKHOUSE_TEXT.match(message):
-                    return _strip_clickhouse_detail(code, message)
-                return _strip_statement_detail(f'Error {code}: {message}')
+                # The driver puts its own `DB::ParsingException. ` in front of
+                # a subclass' text; it repeats the class that follows, so it
+                # is dropped like the MySQL interface's `Code: N.`
+                clickhouse = _CLICKHOUSE_TEXT.match(message)
+                if clickhouse:
+                    return _strip_clickhouse_detail(code, message[clickhouse.end() :])
+                if server is orig:
+                    return _strip_statement_detail(f'Error {code}: {message}')
 
             # ODBC-backed drivers report `(sqlstate, message)`. Without this
             # branch the generic one below returned the five-character code
@@ -618,17 +799,17 @@ class DatabaseGlobalBase(IGlobalBase, ABC):
                 and isinstance(args[1], str)
                 and args[1].strip()
             ):
-                return _strip_statement_detail(f'Error {args[0]}: {args[1]}')
+                return _strip_backstop_detail(f'Error {args[0]}: {args[1]}')
 
             # sqlite3 and the generic DBAPI shape: args[0] is the message.
             if is_seq and args and isinstance(args[0], str) and args[0].strip():
-                return _strip_statement_detail(args[0])
+                return _strip_backstop_detail(args[0])
 
             if orig is not exc:
-                return _strip_statement_detail(str(orig))
+                return _strip_backstop_detail(str(orig))
         except Exception:
             pass
-        return _strip_statement_detail(str(exc))
+        return _strip_backstop_detail(str(exc))
 
     def validateConfig(self):
         """Quick save-time validation: probe the database with SELECT 1.

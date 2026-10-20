@@ -32,6 +32,13 @@ clickhouse-driver nor clickhouse-sqlalchemy is installed in this suite, so the
 exception objects carrying the messages are stand-ins of the same shape (code
 on ``.code``, text on ``.message``, wrapped in ``.orig``).
 
+The sections added for the older-server and input-echo fixes (from "ClickHouse
+text in every shape a driver hands over" on) take their payloads from the
+``_LIVE`` table instead: ClickHouse 23.8.16.16 and 25.8.33.6 and MySQL 8.4.11,
+each entry naming the capture it was copied from. Anything else in those
+sections says it is constructed or replayed (a live payload fed through a
+different exception shape).
+
 Two separate defects, pinned in both directions:
 
 - ClickHouse echoes the statement, with the client-interpolated bind values in
@@ -51,6 +58,7 @@ open pull request.
 from __future__ import annotations
 
 import contextlib
+import re
 
 import pytest
 from sqlalchemy.exc import DBAPIError
@@ -192,6 +200,387 @@ def _execute_error(exc):
     with pytest.raises(RuntimeError) as excinfo:
         inst.execute({'sql': 'SELECT 1'})
     return str(excinfo.value)
+
+
+class _ClickHouseConnectError(Exception):
+    """Stand-in for clickhouse-connect 1.11.0's ``DatabaseError`` (HTTP).
+
+    The whole wrapper is one line in ``args[0]``, and the error also carries the
+    server's code as an integer ``.code`` -- there is no ``.message``.
+    """
+
+    def __init__(self, message, code):
+        super().__init__(message)
+        self.code = code
+
+
+def _dbapi(server_exception):
+    """What ``clickhouse_driver.dbapi`` raises, wrapped the way SQLAlchemy wraps it."""
+    return DBAPIError.instance('SELECT 1', {}, _ClickHouseDbapiError(server_exception), dbapi_base_err=Exception)
+
+
+def _server(code, message):
+    """The driver's own exception for a live ``.message``, trace appended."""
+    return _ClickHouseServerException(code, message + _CLICKHOUSE_STACK_TRACE)
+
+
+def _with_trace(text):
+    """A live ``str()`` of the driver's exception, which also ends in the trace."""
+    return text + _CLICKHOUSE_STACK_TRACE
+
+
+def _driver_error(text):
+    """An exception whose ``args`` are ``(text,)`` and that has no ``.code`` / ``.message`` / ``.orig``."""
+    return DBAPIError.instance('SELECT 1', {}, _DriverError(text), dbapi_base_err=Exception)
+
+
+# Payloads captured from live servers: ClickHouse 23.8.16.16 and 25.8.33.6 (through clickhouse-driver 0.2.9,
+# clickhouse-sqlalchemy 0.3.2, PyMySQL 1.2.3 and clickhouse-connect 1.11.0) and MySQL 8.4.11 (PyMySQL 1.2.3),
+# copied byte for byte; only the stack trace after ``. Stack trace:`` is dropped (the stripper cuts at its
+# header, so the frames are irrelevant). The comment on each entry names the capture it came from, as
+# ``<server>__<route>__<statement>`` in the evidence of the QA run for PR #2713 (kept outside this repository),
+# or a probe of the same run; the test that uses the entry names the statement. Keys read
+# ``<server>.<statement>.<route>``. QA_CANARY_* values are bound into LATER rows, which the formatter must not
+# return.
+_LIVE = {
+    # repro/captures/ch23__driver-native__c27_values_before.json .error.message
+    'ch23.c27.native': (
+        "DB::ParsingException. DB::ParsingException: Cannot parse input: expected '(' before: 'ON DUPLICA"
+        "TE KEY UPDATE s = \\'QA_CANARY_B1\\', (3, \\'QA_CANARY_B2\\')':  at row 1: While executing ValuesBlo"
+        'ckInputFormat'
+    ),
+    # repro/captures/ch23__driver-dbapi__c27_values_before.json .error.str
+    'ch23.c27.dbapi_str': (
+        "Code: 27.\nDB::ParsingException. DB::ParsingException: Cannot parse input: expected '(' before: '"
+        "ON DUPLICATE KEY UPDATE s = \\'QA_CANARY_B1\\', (3, \\'QA_CANARY_B2\\')':  at row 1: While executing"
+        ' ValuesBlockInputFormat'
+    ),
+    # repro/captures/ch23__sqla-native__c27_values_before.json .error.orig... DatabaseException str
+    'ch23.c27.sqla_str': (
+        'Orig exception: Code: 27.\nDB::ParsingException. DB::ParsingException: Cannot parse input: expect'
+        "ed '(' before: 'ON DUPLICATE KEY UPDATE s = \\'QA_CANARY_B1\\', (3, \\'QA_CANARY_B2\\')':  at row 1:"
+        ' While executing ValuesBlockInputFormat'
+    ),
+    # repro/captures/ch23__clickhouse-connect__c27_values_before.json .error.args[0]
+    'ch23.c27.connect': (
+        'Received ClickHouse exception, code: 27, server response: Code: 27. DB::ParsingException: Cannot'
+        " parse input: expected '(' before: 'ON DUPLICATE KEY UPDATE s = \\'QA_CANARY_B1\\', (3, \\'QA_CANAR"
+        "Y_B2\\')':  at row 1: While executing ValuesBlockInputFormat. (CANNOT_PARSE_INPUT_ASSERTION_FAILE"
+        'D) (version 23.8.16.16 (official build)) (for url http://127.0.0.1:28123)'
+    ),
+    # repro/captures/ch23__mysql-wire__c27_values_before.json .error.args
+    'ch23.c27.mysql': (
+        27,
+        (
+            "Code: 27. DB::ParsingException: Cannot parse input: expected '(' before: 'ON DUPLICATE KEY UPDAT"
+            "E s = \\'QA_CANARY_B1\\', (3, \\'QA_CANARY_B2\\')':  at row 1: While executing ValuesBlockInputForma"
+            't. (CANNOT_PARSE_INPUT_ASSERTION_FAILED) (version 23.8.16.16 (official build))'
+        ),
+    ),
+    # repro/captures/ch23__driver-native__c53_values_null_strict.json .error.message
+    'ch23.c53.native': (
+        "DB::Exception: Cannot insert NULL value into a column of type 'UInt32' at: NULL, 'QA_CANARY_N3')"
+        ", (3, 'QA_CANARY_N4'): While executing ValuesBlockInputFormat"
+    ),
+    # repro/captures/ch23__mysql-wire__c53_values_null_strict.json .error.args
+    'ch23.c53.mysql': (
+        53,
+        (
+            "Code: 53. DB::Exception: Cannot insert NULL value into a column of type 'UInt32' at: NULL, 'QA_C"
+            "ANARY_N3'), (3, 'QA_CANARY_N4'): While executing ValuesBlockInputFormat. (TYPE_MISMATCH) (versio"
+            'n 23.8.16.16 (official build))'
+        ),
+    ),
+    # repro/captures/ch23__clickhouse-connect__c53_values_null_strict.json .error.args[0]
+    'ch23.c53.connect': (
+        'Received ClickHouse exception, code: 53, server response: Code: 53. DB::Exception: Cannot insert'
+        " NULL value into a column of type 'UInt32' at: NULL, 'QA_CANARY_N3'), (3, 'QA_CANARY_N4'): While"
+        ' executing ValuesBlockInputFormat. (TYPE_MISMATCH) (version 23.8.16.16 (official build)) (for ur'
+        'l http://127.0.0.1:28123)'
+    ),
+    # repro/captures/ch23__driver-native__csv_row_parse.json .error.message
+    'ch23.csv.native': (
+        "DB::ParsingException. DB::ParsingException: Cannot parse input: expected ',' before: 'abc,\"QA_CA"
+        'NARY_C2"\\n3,"QA_CANARY_C3"\\n\': \nRow 1:\nColumn 0,   name: id, type: UInt32, parsed text: "1"\nColu'
+        'mn 1,   name: s,  type: String, parsed text: "<DOUBLE QUOTE>QA_CANARY_C1<DOUBLE QUOTE>"\n\nRow 2:\n'
+        'Column 0,   name: id, type: UInt32, ERROR: text "abc,<DOUBLE QUOTE>QA_CA" is not like UInt32\n\n: '
+        'While executing ParallelParsingBlockInputFormat: (at row 2)\n'
+    ),
+    # repro/captures/ch23__driver-native__tsv_row_parse.json .error.message
+    'ch23.tsv.native': (
+        "DB::ParsingException. DB::ParsingException: Cannot parse input: expected '\\t' before: 'xyz\\tQA_C"
+        'ANARY_T2\\n3\\tQA_CANARY_T3\\n\': \nRow 1:\nColumn 0,   name: id, type: UInt32, parsed text: "1"\nColum'
+        'n 1,   name: s,  type: String, parsed text: "QA_CANARY_T1"\n\nRow 2:\nColumn 0,   name: id, type: U'
+        'Int32, ERROR: text "xyz<TAB>QA_CAN" is not like UInt32\n\n: While executing ParallelParsingBlockIn'
+        'putFormat: (at row 2)\n'
+    ),
+    # repro/captures/ch23__driver-native__c62_syntax.json .error.message
+    'ch23.syntax.native': (
+        "DB::Exception: Syntax error: failed at position 1 ('SELEC'): SELEC id FROM qa_rel.t WHERE s = 'Q"
+        "A_CANARY_Y1'. Expected one of: Query, Query with output, EXPLAIN, SELECT query, possibly with UN"
+        'ION, list of union elements, SELECT query, subquery, possibly with UNION, SELECT subquery, SELEC'
+        'T query, WITH, FROM, SELECT, SHOW CREATE QUOTA query, SHOW CREATE, SHOW [FULL] [TEMPORARY] TABLE'
+        "S|DATABASES|CLUSTERS|CLUSTER 'name' [[NOT] [I]LIKE 'str'] [LIMIT expr], SHOW, SHOW COLUMNS query"
+        ', SHOW ENGINES query, SHOW ENGINES, SHOW INDEXES query, EXISTS or SHOW CREATE query, EXISTS, DES'
+        'CRIBE FILESYSTEM CACHE query, DESCRIBE, DESC, DESCRIBE query, SHOW PROCESSLIST query, SHOW PROCE'
+        'SSLIST, CREATE TABLE or ATTACH TABLE query, CREATE, ATTACH, REPLACE, CREATE DATABASE query, CREA'
+        'TE VIEW query, CREATE DICTIONARY, CREATE LIVE VIEW query, CREATE WINDOW VIEW query, ALTER query,'
+        ' ALTER TABLE, ALTER LIVE VIEW, ALTER DATABASE, RENAME query, RENAME TABLE, EXCHANGE TABLES, RENA'
+        'ME DICTIONARY, EXCHANGE DICTIONARIES, RENAME DATABASE, DROP query, DROP, DETACH, TRUNCATE, UNDRO'
+        'P query, UNDROP, CHECK TABLE, KILL QUERY query, KILL, OPTIMIZE query, OPTIMIZE TABLE, WATCH quer'
+        'y, WATCH, SHOW ACCESS query, SHOW ACCESS, ShowAccessEntitiesQuery, SHOW GRANTS query, SHOW GRANT'
+        'S, SHOW PRIVILEGES query, SHOW PRIVILEGES, INSERT query, INSERT INTO, USE query, USE, SET ROLE o'
+        'r SET DEFAULT ROLE query, SET ROLE DEFAULT, SET ROLE, SET DEFAULT ROLE, SET query, SET, SYSTEM q'
+        'uery, SYSTEM, CREATE USER or ALTER USER query, ALTER USER, CREATE USER, CREATE ROLE or ALTER ROL'
+        'E query, ALTER ROLE, CREATE ROLE, CREATE QUOTA or ALTER QUOTA query, ALTER QUOTA, CREATE QUOTA, '
+        'CREATE ROW POLICY or ALTER ROW POLICY query, ALTER POLICY, ALTER ROW POLICY, CREATE POLICY, CREA'
+        'TE ROW POLICY, CREATE SETTINGS PROFILE or ALTER SETTINGS PROFILE query, ALTER SETTINGS PROFILE, '
+        'ALTER PROFILE, CREATE SETTINGS PROFILE, CREATE PROFILE, CREATE FUNCTION query, DROP FUNCTION que'
+        'ry, CREATE NAMED COLLECTION, DROP NAMED COLLECTION query, Alter NAMED COLLECTION query, ALTER, C'
+        'REATE INDEX query, DROP INDEX query, DROP access entity query, MOVE access entity query, MOVE, G'
+        'RANT or REVOKE query, REVOKE, GRANT, EXTERNAL DDL query, EXTERNAL DDL FROM, TCL query, BEGIN TRA'
+        'NSACTION, COMMIT, ROLLBACK, SET TRANSACTION SNAPSHOT, Delete query, DELETE, BACKUP or RESTORE qu'
+        'ery, BACKUP, RESTORE'
+    ),
+    # team/formatter_engineer/probes/a62.json c62_deduce_nested_parens native
+    'ch23.deduce.native': (
+        "DB::Exception: Cannot deduce template of expression: lower((('QA_CANARY_D3')))): While executing"
+        ' ValuesBlockInputFormat'
+    ),
+    # team/formatter_engineer/probes/a62.json c62_deduce_nested_parens mysql
+    'ch23.deduce.mysql': (
+        62,
+        (
+            "Code: 62. DB::Exception: Cannot deduce template of expression: lower((('QA_CANARY_D3')))): While"
+            ' executing ValuesBlockInputFormat. (SYNTAX_ERROR) (version 23.8.16.16 (official build))'
+        ),
+    ),
+    # team/formatter_engineer/probes/a62.json c62_deduce_paren native
+    'ch23.deduce_paren.native': (
+        'DB::Exception: Cannot deduce template of expression: (1 + 1), : While executing ValuesBlockInputFormat'
+    ),
+    # team/formatter_engineer/probes/a62.json c36_not_constant_str native
+    'ch23.notconst.native': (
+        'DB::Exception: Element of set in IN, VALUES, or LIMIT, or aggregate function parameter, or a tab'
+        "le function argument is not a constant expression (result column not found): arrayJoin(['QA_CANA"
+        "RY_D7']): While executing ValuesBlockInputFormat"
+    ),
+    # team/formatter_engineer/probes/a62.json c36_not_constant_str http
+    'ch23.notconst.connect': (
+        'Received ClickHouse exception, code: 36, server response: Code: 36. DB::Exception: Element of se'
+        't in IN, VALUES, or LIMIT, or aggregate function parameter, or a table function argument is not '
+        "a constant expression (result column not found): arrayJoin(['QA_CANARY_D7']): While executing Va"
+        'luesBlockInputFormat. (BAD_ARGUMENTS) (version 23.8.16.16 (official build)) (for url http://127.'
+        '0.0.1:28123)'
+    ),
+    # team/formatter_engineer/probes/b.json b_csv_extra_col native
+    'ch23.row117.native': (
+        'DB::Exception: Expected end of line: (at row 2)\n: \nRow 1:\nColumn 0,   name: id, type: UInt32, pa'
+        'rsed text: "1"\nColumn 1,   name: s,  type: String, parsed text: "<DOUBLE QUOTE>QA_CANARY_C1<DOUB'
+        'LE QUOTE>"\n\nRow 2:\nColumn 0,   name: id, type: UInt32, parsed text: "2"\nColumn 1,   name: s,  ty'
+        'pe: String, parsed text: "<DOUBLE QUOTE>QA_CANARY_C2<DOUBLE QUOTE>"\nERROR: There is no line feed'
+        '. "9" found instead.\n It\'s like your file has more columns than expected.\nAnd if your file has t'
+        'he right number of columns, maybe it has an unquoted string value with a comma.\n\n: While executi'
+        'ng ParallelParsingBlockInputFormat'
+    ),
+    # team/formatter_engineer/probes/b.json b_csv_negative native
+    'ch23.row72.native': (
+        "DB::ParsingException. DB::ParsingException: Unsigned type must not contain '-' symbol: \nRow 1:\nC"
+        'olumn 0,   name: id, type: UInt32, parsed text: "1"\nColumn 1,   name: s,  type: String, parsed t'
+        'ext: "<DOUBLE QUOTE>QA_CANARY_C1<DOUBLE QUOTE>"\n\nRow 2:\nColumn 0,   name: id, type: UInt32, ERRO'
+        'R: text "-5,<DOUBLE QUOTE>QA_CAN" is not like UInt32\n\n: While executing CSVRowInputFormat: (at r'
+        'ow 2)\n'
+    ),
+    # team/formatter_engineer/probes/s.json throwif_empty native
+    'ch23.throwif_empty.native': "DB::Exception: while executing 'FUNCTION throwIf(1 :: 0, '' :: 1) -> throwIf(1, '') UInt8 : 2'",
+    # repro/captures/ch25__driver-native__c27_values_before.json .error.message
+    'ch25.c27.native': (
+        "DB::Exception: Cannot parse input: expected '(' before: 'ON DUPLICATE KEY UPDATE s = \\'QA_CANARY"
+        "_B1\\', (3, \\'QA_CANARY_B2\\')':  at row 1: While executing ValuesBlockInputFormat"
+    ),
+    # repro/captures/ch25__driver-dbapi__c27_values_before.json .error.str
+    'ch25.c27.dbapi_str': (
+        "Code: 27.\nDB::Exception: Cannot parse input: expected '(' before: 'ON DUPLICATE KEY UPDATE s = \\"
+        "'QA_CANARY_B1\\', (3, \\'QA_CANARY_B2\\')':  at row 1: While executing ValuesBlockInputFormat"
+    ),
+    # repro/captures/ch25__sqla-native__c27_values_before.json .error.orig... DatabaseException str
+    'ch25.c27.sqla_str': (
+        "Orig exception: Code: 27.\nDB::Exception: Cannot parse input: expected '(' before: 'ON DUPLICATE "
+        "KEY UPDATE s = \\'QA_CANARY_B1\\', (3, \\'QA_CANARY_B2\\')':  at row 1: While executing ValuesBlockI"
+        'nputFormat'
+    ),
+    # repro/captures/ch25__clickhouse-connect__c27_values_before.json .error.args[0]
+    'ch25.c27.connect': (
+        'Received ClickHouse exception, code: 27, server response: Code: 27. DB::Exception: Cannot parse '
+        "input: expected '(' before: 'ON DUPLICATE KEY UPDATE s = \\'QA_CANARY_B1\\', (3, \\'QA_CANARY_B2\\')"
+        "':  at row 1: While executing ValuesBlockInputFormat. (CANNOT_PARSE_INPUT_ASSERTION_FAILED) (ver"
+        'sion 25.8.33.6 (official build)) (for url http://127.0.0.1:38123)'
+    ),
+    # repro/captures/ch25__mysql-wire__c27_values_before.json .error.args
+    'ch25.c27.mysql': (
+        27,
+        (
+            "Code: 27. DB::Exception: Cannot parse input: expected '(' before: 'ON DUPLICATE KEY UPDATE s = \\"
+            "'QA_CANARY_B1\\', (3, \\'QA_CANARY_B2\\')':  at row 1: While executing ValuesBlockInputFormat. (CAN"
+            'NOT_PARSE_INPUT_ASSERTION_FAILED) (version 25.8.33.6 (official build))'
+        ),
+    ),
+    # repro/captures/ch25__driver-native__c53_values_null_strict.json .error.message
+    'ch25.c53.native': (
+        "DB::Exception: Cannot insert NULL value into a column of type 'UInt32' at: NULL, 'QA_CANARY_N3')"
+        ", (3, 'QA_CANARY_N4'): While executing ValuesBlockInputFormat"
+    ),
+    # repro/captures/ch25__mysql-wire__c53_values_null_strict.json .error.args
+    'ch25.c53.mysql': (
+        53,
+        (
+            "Code: 53. DB::Exception: Cannot insert NULL value into a column of type 'UInt32' at: NULL, 'QA_C"
+            "ANARY_N3'), (3, 'QA_CANARY_N4'): While executing ValuesBlockInputFormat. (TYPE_MISMATCH) (versio"
+            'n 25.8.33.6 (official build))'
+        ),
+    ),
+    # repro/captures/ch25__clickhouse-connect__c53_values_null_strict.json .error.args[0]
+    'ch25.c53.connect': (
+        'Received ClickHouse exception, code: 53, server response: Code: 53. DB::Exception: Cannot insert'
+        " NULL value into a column of type 'UInt32' at: NULL, 'QA_CANARY_N3'), (3, 'QA_CANARY_N4'): While"
+        ' executing ValuesBlockInputFormat. (TYPE_MISMATCH) (version 25.8.33.6 (official build)) (for url'
+        ' http://127.0.0.1:38123)'
+    ),
+    # repro/captures/ch25__driver-native__csv_row_parse.json .error.message
+    'ch25.csv.native': (
+        'DB::Exception: Cannot parse input: expected \',\' before: \'abc,"QA_CANARY_C2"\\n3,"QA_CANARY_C3"\\n\''
+        ': (at row 2)\n: \nRow 1:\nColumn 0,   name: id, type: UInt32, parsed text: "1"\nColumn 1,   name: s,'
+        '  type: String, parsed text: "<DOUBLE QUOTE>QA_CANARY_C1<DOUBLE QUOTE>"\n\nRow 2:\nColumn 0,   name'
+        ': id, type: UInt32, ERROR: text "abc,<DOUBLE QUOTE>QA_CA" is not like UInt32\n\n: While executing '
+        'ParallelParsingBlockInputFormat'
+    ),
+    # repro/captures/ch25__driver-native__tsv_row_parse.json .error.message
+    'ch25.tsv.native': (
+        "DB::Exception: Cannot parse input: expected '\\t' before: 'xyz\\tQA_CANARY_T2\\n3\\tQA_CANARY_T3\\n':"
+        ' (at row 2)\n: \nRow 1:\nColumn 0,   name: id, type: UInt32, parsed text: "1"\nColumn 1,   name: s, '
+        ' type: String, parsed text: "QA_CANARY_T1"\n\nRow 2:\nColumn 0,   name: id, type: UInt32, ERROR: te'
+        'xt "xyz<TAB>QA_CAN" is not like UInt32\n\n: While executing ParallelParsingBlockInputFormat'
+    ),
+    # repro/captures/ch25__driver-native__c62_syntax.json .error.message
+    'ch25.syntax.native': (
+        "DB::Exception: Syntax error: failed at position 1 (SELEC): SELEC id FROM qa_rel.t WHERE s = 'QA_"
+        "CANARY_Y1'. Expected one of: Query, Query with output, EXPLAIN, EXPLAIN, SELECT query, possibly "
+        'with UNION, list of union elements, SELECT query, subquery, possibly with UNION, SELECT subquery'
+        ', SELECT query, WITH, FROM, SELECT, SHOW CREATE QUOTA query, SHOW CREATE, SHOW [FULL] [TEMPORARY'
+        "] TABLES|DATABASES|CLUSTERS|CLUSTER|MERGES 'name' [[NOT] [I]LIKE 'str'] [LIMIT expr], SHOW, SHOW"
+        ' COLUMNS query, SHOW ENGINES query, SHOW ENGINES, SHOW FUNCTIONS query, SHOW FUNCTIONS, SHOW IND'
+        'EXES query, SHOW SETTING query, SHOW SETTING, EXISTS or SHOW CREATE query, EXISTS, DESCRIBE FILE'
+        'SYSTEM CACHE query, DESCRIBE, DESC, DESCRIBE query, SHOW PROCESSLIST query, SHOW PROCESSLIST, CR'
+        'EATE TABLE or ATTACH TABLE query, CREATE, ATTACH, REPLACE, CREATE DATABASE query, CREATE VIEW qu'
+        'ery, CREATE DICTIONARY, CREATE LIVE VIEW query, CREATE WINDOW VIEW query, ALTER query, ALTER TAB'
+        'LE, ALTER TEMPORARY TABLE, ALTER DATABASE, RENAME query, RENAME DATABASE, RENAME TABLE, EXCHANGE'
+        ' TABLES, RENAME DICTIONARY, EXCHANGE DICTIONARIES, RENAME, DROP query, DROP, DETACH, TRUNCATE, U'
+        'NDROP query, UNDROP, CHECK ALL TABLES, CHECK TABLE, KILL QUERY query, KILL, OPTIMIZE query, OPTI'
+        'MIZE TABLE, WATCH query, WATCH, SHOW ACCESS query, SHOW ACCESS, ShowAccessEntitiesQuery, SHOW GR'
+        'ANTS query, SHOW GRANTS, SHOW PRIVILEGES query, SHOW PRIVILEGES, BACKUP or RESTORE query, BACKUP'
+        ', RESTORE, INSERT query, INSERT INTO, USE query, USE, SET ROLE or SET DEFAULT ROLE query, SET RO'
+        'LE DEFAULT, SET ROLE, SET DEFAULT ROLE, SET query, SET, SYSTEM query, SYSTEM, CREATE USER or ALT'
+        'ER USER query, ALTER USER, CREATE USER, CREATE ROLE or ALTER ROLE query, ALTER ROLE, CREATE ROLE'
+        ', CREATE QUOTA or ALTER QUOTA query, ALTER QUOTA, CREATE QUOTA, CREATE ROW POLICY or ALTER ROW P'
+        'OLICY query, ALTER POLICY, ALTER ROW POLICY, CREATE POLICY, CREATE ROW POLICY, CREATE SETTINGS P'
+        'ROFILE or ALTER SETTINGS PROFILE query, ALTER SETTINGS PROFILE, ALTER PROFILE, CREATE SETTINGS P'
+        'ROFILE, CREATE PROFILE, CREATE FUNCTION query, DROP FUNCTION query, CREATE WORKLOAD query, DROP '
+        'WORKLOAD query, CREATE RESOURCE query, DROP RESOURCE query, CREATE NAMED COLLECTION, DROP NAMED '
+        'COLLECTION query, Alter NAMED COLLECTION query, ALTER, CREATE INDEX query, DROP INDEX query, DRO'
+        'P access entity query, MOVE access entity query, MOVE, GRANT or REVOKE query, REVOKE, GRANT, CHE'
+        'CK GRANT, CHECK GRANT, TCL query, BEGIN TRANSACTION, START TRANSACTION, COMMIT, ROLLBACK, SET TR'
+        'ANSACTION SNAPSHOT, Delete query, DELETE, Update query, UPDATE, COPY query, COPY'
+    ),
+    # team/formatter_engineer/probes/a62.json c62_deduce_nested_parens native
+    'ch25.deduce.native': (
+        "DB::Exception: Cannot deduce template of expression: lower((('QA_CANARY_D3')))): While executing"
+        ' ValuesBlockInputFormat'
+    ),
+    # team/formatter_engineer/probes/a62.json c62_deduce_nested_parens mysql
+    'ch25.deduce.mysql': (
+        62,
+        (
+            "Code: 62. DB::Exception: Cannot deduce template of expression: lower((('QA_CANARY_D3')))): While"
+            ' executing ValuesBlockInputFormat. (SYNTAX_ERROR) (version 25.8.33.6 (official build))'
+        ),
+    ),
+    # team/formatter_engineer/probes/a62.json c62_deduce_paren native
+    'ch25.deduce_paren.native': (
+        'DB::Exception: Cannot deduce template of expression: (1 + 1), : While executing ValuesBlockInputFormat'
+    ),
+    # team/formatter_engineer/probes/a62.json c36_not_constant_str native
+    'ch25.notconst.native': (
+        'DB::Exception: Element of set in IN, VALUES, or LIMIT, or aggregate function parameter, or a tab'
+        "le function argument is not a constant expression (result column not found): arrayJoin(['QA_CANA"
+        "RY_D7']): While executing ValuesBlockInputFormat"
+    ),
+    # team/formatter_engineer/probes/a62.json c36_not_constant_str http
+    'ch25.notconst.connect': (
+        'Received ClickHouse exception, code: 36, server response: Code: 36. DB::Exception: Element of se'
+        't in IN, VALUES, or LIMIT, or aggregate function parameter, or a table function argument is not '
+        "a constant expression (result column not found): arrayJoin(['QA_CANARY_D7']): While executing Va"
+        'luesBlockInputFormat. (BAD_ARGUMENTS) (version 25.8.33.6 (official build)) (for url http://127.0'
+        '.0.1:38123)'
+    ),
+    # team/formatter_engineer/probes/b.json b_csv_extra_col native
+    'ch25.row117.native': (
+        'DB::Exception: Expected end of line: (at row 2)\n: \nRow 1:\nColumn 0,   name: id, type: UInt32, pa'
+        'rsed text: "1"\nColumn 1,   name: s,  type: String, parsed text: "<DOUBLE QUOTE>QA_CANARY_C1<DOUB'
+        'LE QUOTE>"\n\nRow 2:\nColumn 0,   name: id, type: UInt32, parsed text: "2"\nColumn 1,   name: s,  ty'
+        'pe: String, parsed text: "<DOUBLE QUOTE>QA_CANARY_C2<DOUBLE QUOTE>"\nERROR: There is no line feed'
+        '. "9" found instead.\n It\'s like your file has more columns than expected.\nAnd if your file has t'
+        'he right number of columns, maybe it has an unquoted string value with a comma.\n\n: While executi'
+        'ng ParallelParsingBlockInputFormat'
+    ),
+    # team/formatter_engineer/probes/b.json b_csv_negative native
+    'ch25.row72.native': (
+        "DB::Exception: Unsigned type must not contain '-' symbol: (at row 2)\n: \nRow 1:\nColumn 0,   name:"
+        ' id, type: UInt32, parsed text: "1"\nColumn 1,   name: s,  type: String, parsed text: "<DOUBLE QU'
+        'OTE>QA_CANARY_C1<DOUBLE QUOTE>"\n\nRow 2:\nColumn 0,   name: id, type: UInt32, ERROR: text "-5,<DOU'
+        'BLE QUOTE>QA_CAN" is not like UInt32\n\n: While executing CSVRowInputFormat'
+    ),
+    # team/formatter_engineer/probes/s.json throwif_empty native
+    'ch25.throwif_empty.native': (
+        "DB::Exception: while executing 'FUNCTION throwIf(1_UInt8 :: 1, ''_String :: 2) -> throwIf(1_UInt"
+        "8, ''_String) UInt8 : 3'"
+    ),
+    # team/formatter_engineer/probes/s.json scope_literal_eq native
+    'ch25.scope_literal.native': (
+        "DB::Exception: Unknown expression or function identifier `nope` in scope 'QA_CANARY_S3' = nope: "
+        'While executing ValuesBlockInputFormat'
+    ),
+    # team/formatter_engineer/probes/s.json scope_tuple_elem native
+    'ch25.scope_tuple.native': (
+        "DB::Exception: Unknown expression or function identifier `nope` in scope ('QA_CANARY_S9', nope)."
+        '1: While executing ValuesBlockInputFormat'
+    ),
+    # team/formatter_engineer/probes/s.json scope_array_elem native
+    'ch25.scope_array.native': (
+        "DB::Exception: Unknown expression or function identifier `nope` in scope ['QA_CANARY_A1', nope]["
+        '1]: While executing ValuesBlockInputFormat'
+    ),
+    # team/formatter_engineer/probes/s.json scope_in_fn native (code 36)
+    'ch23.scope_in_fn.native': (
+        'DB::Exception: Element of set in IN, VALUES, or LIMIT, or aggregate function parameter, or a tab'
+        "le function argument is not a constant expression (result column not found): toString(in('QA_CAN"
+        "ARY_SB', nope)): While executing ValuesBlockInputFormat"
+    ),
+    # repro/captures/mysql84__pymysql__signal_db_exception_text.json
+    'mysql84.signal_db_exception': (
+        1644,
+        'DB::Exception: tenant QA_APP_T1 rejected. Upload failed at position 3 of batch',
+    ),
+    # repro/captures/mysql84__pymysql__signal_code_prefix_text.json
+    'mysql84.signal_code_prefix': (1644, "Code: 1644. DB::Exception: app text before: 'x' kept"),
+    # team/formatter_engineer/probes/mysql_signal.json signal_multiline_db
+    'mysql84.signal_multiline_db': (1644, 'Order rejected\nDB::Exception: app text here: kept'),
+    # team/formatter_engineer/probes/mysql_signal.json signal_class_prefix
+    'mysql84.signal_class_prefix': (1644, 'DB::ParsingException. DB::ParsingException: app text here: kept'),
+    # team/formatter_engineer/probes/mysql_signal.json signal_forged_code_same_errno
+    'mysql84.signal_forged_code_same_errno': (47, "Code: 47. DB::Exception: app text before: 'x' kept"),
+    # team/formatter_engineer/probes/mysql_signal.json signal_forged_code_other_errno
+    'mysql84.signal_forged_code_other_errno': (1644, "Code: 47. DB::Exception: app text before: 'x' kept"),
+}
 
 
 # ---------------------------------------------------------------------------
@@ -505,41 +894,6 @@ def test_clickhouse_cuts_the_before_echo_over_the_mysql_wire(base):
     assert 'QA_CANARY_UPSERT_S2' not in result
 
 
-@pytest.mark.parametrize(
-    ('exc', 'expected'),
-    [
-        (
-            _clickhouse(
-                27,
-                "DB::ParsingException: Cannot parse input: expected '(' before: "
-                "'ON DUPLICATE KEY UPDATE s = \\'QA_CANARY_OLDER\\'':  at row 1: While executing ValuesBlockInputFormat",
-            ),
-            "Error 27: DB::ParsingException: Cannot parse input: expected '('",
-        ),
-        (
-            _mysql(
-                27,
-                "Code: 27. DB::ParsingException: Cannot parse input: expected '(' before: "
-                "'ON DUPLICATE KEY UPDATE s = \\'QA_CANARY_OLDER\\'':  at row 1: While executing "
-                'ValuesBlockInputFormat. (CANNOT_PARSE_INPUT_ASSERTION_FAILED) (version 23.3.1.1)',
-            ),
-            "Error 27: DB::ParsingException: Cannot parse input: expected '('",
-        ),
-    ],
-    ids=['native', 'mysql-wire'],
-)
-def test_clickhouse_text_from_an_older_server_is_still_recognised(base, exc, expected):
-    """Older servers name the parse error's class ``DB::ParsingException:``.
-
-    Constructed from the 25.8 capture above with the older class name; that
-    class is the one the ``here:`` / ``before:`` echoes come with there.
-    """
-    result = base._format_db_error(exc)
-
-    assert result == expected
-    assert 'QA_CANARY_OLDER' not in result
-
-
 def test_clickhouse_cuts_a_function_call_scope_echo(base):
     """An expression evaluated on its own is echoed as ``In scope f(...)``.
 
@@ -729,7 +1083,7 @@ def test_an_errno_message_pair_keeps_sqlalchemys_markers(base):
     ids=['line-n', 'stack-trace', 'in-scope'],
 )
 def test_mysql_keeps_its_own_near_fragment_whole(base, fragment):
-    """``SELEC <fragment> FROM qa_my_customers`` -> 1064, quoting the statement it stopped on.
+    """``SELEC <fragment> FROM qa_my_customers`` -> 1064, quoting the rest of the statement from where it stopped.
 
     The README documents that this quote passes through; it was cut at the
     first marker inside it instead, mid-quote.
@@ -1056,3 +1410,520 @@ def test_prose_sharing_a_word_with_a_clickhouse_marker_survives(base, text):
     exc = DBAPIError.instance('SELECT 1', {}, _DriverError(text), dbapi_base_err=Exception)
 
     assert base._format_db_error(exc) == text
+
+
+# ---------------------------------------------------------------------------
+# ClickHouse text in every shape a driver hands over
+#
+# The formatter used to recognise ClickHouse's text only when it began with
+# ``DB::<Name>Exception:``. clickhouse-driver puts the class name in front of
+# the message of a subclass (``DB::ParsingException. DB::ParsingException:
+# ...``, 23.8's parse errors), ``str()`` of its exception opens with
+# ``Code: N.`` and a newline, and clickhouse-connect wraps the text in one
+# line, so the ``before: '`` echo of the rows that follow a parse error came
+# back with every later bound value.
+# ---------------------------------------------------------------------------
+
+
+def _c27_routes(server):
+    """One exception per route for the same live statement, as that route's driver raises it.
+
+    ``INSERT INTO qa_rel.t (id, s) VALUES (1, 'a') ON DUPLICATE KEY UPDATE s = 'QA_CANARY_B1', (3, 'QA_CANARY_B2')``
+    """
+    return {
+        # The db_clickhouse node's connector: clickhouse-sqlalchemy's DatabaseException around the driver's.
+        'sqla-native': _clickhouse(27, _LIVE[f'{server}.c27.native']),
+        'driver-dbapi': _dbapi(_server(27, _LIVE[f'{server}.c27.native'])),
+        # Replayed: ``str()`` of those exceptions through the generic ``args[0]`` shape.
+        'str-of-server-exception': _driver_error(_with_trace(_LIVE[f'{server}.c27.dbapi_str'])),
+        'str-of-database-exception': _driver_error(_with_trace(_LIVE[f'{server}.c27.sqla_str'])),
+        'clickhouse-connect': _ClickHouseConnectError(_LIVE[f'{server}.c27.connect'], 27),
+        'mysql-wire': _mysql(*_LIVE[f'{server}.c27.mysql']),
+    }
+
+
+@pytest.mark.parametrize(
+    ('server', 'driver_text', 'class_name'),
+    [
+        ('ch23', 'DB::ParsingException. DB::ParsingException', 'DB::ParsingException'),
+        ('ch25', 'DB::Exception', 'DB::Exception'),
+    ],
+)
+def test_clickhouse_values_before_echo_is_cut_on_every_route(base, server, driver_text, class_name):
+    """The review's blocker: 23.8's ``DB::ParsingException. DB::ParsingException:`` and its ``str()`` / HTTP shapes.
+
+    One statement, every route. On 23.8 the driver's ``.message`` opens with its
+    own repeated class name, so the text fell through to the backstop, which has
+    no ``before: '`` marker, and every later row came back. The three routes
+    that hand over a code and a message (the node's connector, the dbapi layer
+    and ClickHouse's MySQL wire) return the same sentence. The ``str()`` and
+    HTTP shapes keep the form they arrived in and lose the same echo.
+    """
+    sentence = "Cannot parse input: expected '('"
+    structured = f'Error 27: {class_name}: {sentence}'
+    expected = {
+        'sqla-native': structured,
+        'driver-dbapi': structured,
+        'mysql-wire': structured,
+        'str-of-server-exception': f'Code: 27.\n{driver_text}: {sentence}',
+        'str-of-database-exception': f'Orig exception: Code: 27.\n{driver_text}: {sentence}',
+        'clickhouse-connect': f'Received ClickHouse exception, code: 27, server response: Code: 27. {class_name}: {sentence}',
+    }
+
+    results = {route: base._format_db_error(exc) for route, exc in _c27_routes(server).items()}
+
+    assert results == expected
+    for result in results.values():
+        assert 'QA_CANARY_B1' not in result
+        assert 'QA_CANARY_B2' not in result
+
+
+def test_clickhouse_text_from_an_older_server_is_still_recognised(base):
+    """Older servers name the parse error's class ``DB::ParsingException:``.
+
+    Live: the ``.message`` clickhouse-driver builds for it, repeated class name
+    included (it used to be a hand-written ``DB::ParsingException: ...`` that
+    the driver never produces), and the same statement over ClickHouse's MySQL
+    wire, both from 23.8.16.16.
+    """
+    native = base._format_db_error(_clickhouse(27, _LIVE['ch23.c27.native']))
+    mysql_wire = base._format_db_error(_mysql(*_LIVE['ch23.c27.mysql']))
+
+    assert native == "Error 27: DB::ParsingException: Cannot parse input: expected '('"
+    assert mysql_wire == native
+    for result in (native, mysql_wire):
+        assert 'QA_CANARY_B1' not in result
+        assert 'QA_CANARY_B2' not in result
+
+
+def test_clickhouse_message_without_the_drivers_repeated_class_name_is_still_recognised(base):
+    """Constructed: ``DB::ParsingException: ...`` with no driver prefix, as an earlier test of this module wrote it.
+
+    The driver does not produce this shape (see above); it stays covered because the classifier must not
+    require the prefix.
+    """
+    exc = _clickhouse(
+        27,
+        "DB::ParsingException: Cannot parse input: expected '(' before: "
+        "'ON DUPLICATE KEY UPDATE s = \\'QA_CANARY_OLDER\\'':  at row 1: While executing ValuesBlockInputFormat",
+    )
+
+    result = base._format_db_error(exc)
+
+    assert result == "Error 27: DB::ParsingException: Cannot parse input: expected '('"
+    assert 'QA_CANARY_OLDER' not in result
+
+
+def test_clickhouse_connect_error_without_a_matching_second_code_is_not_taken_for_clickhouses(base):
+    """Constructed: the wrapper is recognised only when both codes in it are the same number.
+
+    Text that merely looks like clickhouse-connect's wrapper keeps the backstop alone, which has no ``before: '``
+    marker.
+    """
+    text = "Received ClickHouse exception, code: 27, server response: Code: 28. DB::Exception: x before: 'SECRET_BIND'"
+
+    assert base._format_db_error(_ClickHouseConnectError(text, 27)) == text
+
+
+@pytest.mark.parametrize(
+    'text',
+    [
+        # ClickHouse text on a LATER line is not ClickHouse's envelope: only the shapes seen live open the text.
+        'Order rejected\nDB::Exception: app text here: kept',
+        'ERROR:  bad row\nDB::Exception: relayed by app\nDETAIL:  Key (email)=(a@b.c) already exists.',
+        # A mid-line mention.
+        "Retry: Code: 47. DB::Exception: app text before: 'x' kept",
+        'Orig exception: relayed: Code: 47.\nDB::Exception: app text here: kept',
+    ],
+    ids=['later-line', 'later-line-with-detail', 'mid-line', 'wrapper-not-at-the-start'],
+)
+def test_text_that_only_contains_clickhouses_class_on_another_line_is_not_cut_with_its_markers(base, text):
+    """Constructed: no ClickHouse marker (`` here: ``, `` before: '``) reaches text that is not opened by a known shape.
+
+    The first three were written to come back as the backstop alone cuts them
+    (the second at its ``DETAIL:`` block), whole otherwise.
+    """
+    result = base._format_db_error(_driver_error(text))
+
+    assert result == text.split('\nDETAIL:')[0]
+
+
+@pytest.mark.parametrize(
+    ('text', 'expected'),
+    [
+        # Constructed after the shapes in E/team/devils_advocate/da_monotonic_check.py.
+        (
+            "Code: 47.\nDB::Exception: Missing columns: 'x' [SQL: SELECT 1 WHERE s = 'QA_CANARY_SQL']",
+            "Code: 47.\nDB::Exception: Missing columns: 'x'",
+        ),
+        (
+            "Orig exception: Code: 47.\nDB::Exception: Missing columns: 'x'\n[parameters: {'p1': 'QA_CANARY_PARAMS'}]",
+            "Orig exception: Code: 47.\nDB::Exception: Missing columns: 'x'",
+        ),
+        (
+            'Code: 47.\nDB::Exception: Unique violation\nDETAIL:  Key (email)=(QA_CANARY_PG) already exists.',
+            'Code: 47.\nDB::Exception: Unique violation',
+        ),
+        (
+            "Code: 47.\nDB::Exception: Cannot parse input before: 'QA_CANARY_B' [SQL: SELECT 1]",
+            'Code: 47.\nDB::Exception: Cannot parse input',
+        ),
+    ],
+    ids=['sql-tail', 'parameters-tail', 'detail-block', 'before-then-sql'],
+)
+def test_a_str_shaped_clickhouse_message_is_cut_at_the_earlier_of_the_backstop_and_clickhouses_markers(
+    base, text, expected
+):
+    """Constructed: ClickHouse's markers are added to the backstop's on such a message, never put in its place.
+
+    A message that opens as ``str()`` of ClickHouse's exception does, and then carries a SQLAlchemy or
+    PostgreSQL tail, is cut at the first marker of either kind, so nothing the backstop removed comes back.
+    """
+    result = base._format_db_error(_driver_error(text))
+
+    assert result == expected
+    assert 'QA_CANARY' not in result
+
+
+# ---------------------------------------------------------------------------
+# MySQL's own text that looks like ClickHouse's stays whole
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    'key',
+    ['signal_db_exception', 'signal_multiline_db', 'signal_class_prefix', 'signal_forged_code_other_errno'],
+)
+def test_a_mysql_signal_that_imitates_clickhouses_text_stays_whole(base, key):
+    """Live (MySQL 8.4.11): a ``SIGNAL`` whose text is written like ClickHouse's but is not ClickHouse's.
+
+    ``DB::Exception: tenant QA_APP_T1 rejected. Upload failed at position 3 of batch`` is review item F; the
+    others open on a later line, behind the driver's repeated class name, or behind ``Code: 47.`` while the
+    errno is 1644. None carries ``Code: <its own errno>.``, which ClickHouse's MySQL interface always writes.
+    """
+    errno, text = _LIVE[f'mysql84.{key}']
+
+    assert base._format_db_error(_mysql(errno, text)) == f'Error {errno}: {text}'
+
+
+def test_a_mysql_signal_that_forges_clickhouses_whole_prefix_is_cut_and_nothing_leaks(base):
+    """Live, and an accepted limit: the prefix is spelled out with the errno, so the text is cut at `` before: '``.
+
+    ``SIGNAL ... SET MYSQL_ERRNO = 47, MESSAGE_TEXT = 'Code: 47. DB::Exception: app text before: ''x'' kept'``.
+    Such a message cannot be told from ClickHouse's own over the same wire. The application's text is shortened,
+    and nothing is returned that the markers cut: the loss is the safe direction.
+    """
+    errno, text = _LIVE['mysql84.signal_forged_code_same_errno']
+
+    assert base._format_db_error(_mysql(errno, text)) == 'Error 47: DB::Exception: app text'
+    assert _LIVE['mysql84.signal_code_prefix'][1].startswith('Code: 1644. DB::Exception:')
+    assert base._format_db_error(_mysql(*_LIVE['mysql84.signal_code_prefix'])) == 'Error 1644: DB::Exception: app text'
+
+
+# ---------------------------------------------------------------------------
+# Items A and B of the review: more input echoed back after a ClickHouse parse error
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize('server', ['ch23', 'ch25'])
+def test_clickhouse_cuts_the_rest_of_the_rows_after_a_null_into_a_non_nullable_column(base, server):
+    """Item A: code 53 ``... of type 'UInt32' at: NULL, 'QA_CANARY_N3'), (3, 'QA_CANARY_N4')``.
+
+    ``INSERT INTO qa_rel.t (id, s) SETTINGS input_format_null_as_default = 0 VALUES (1, 'a'), (NULL,
+    'QA_CANARY_N3'), (3, 'QA_CANARY_N4')``: live on both servers, on every route that carries the text.
+    """
+    sentence = "Cannot insert NULL value into a column of type 'UInt32'"
+    results = [
+        base._format_db_error(_clickhouse(53, _LIVE[f'{server}.c53.native'])),
+        base._format_db_error(_dbapi(_server(53, _LIVE[f'{server}.c53.native']))),
+        base._format_db_error(_mysql(*_LIVE[f'{server}.c53.mysql'])),
+        base._format_db_error(_ClickHouseConnectError(_LIVE[f'{server}.c53.connect'], 53)),
+    ]
+
+    assert results == [f'Error 53: DB::Exception: {sentence}'] * 3 + [
+        f'Received ClickHouse exception, code: 53, server response: Code: 53. DB::Exception: {sentence}'
+    ]
+    assert all('QA_CANARY_N3' not in result and 'QA_CANARY_N4' not in result for result in results)
+
+
+@pytest.mark.parametrize('server', ['ch23', 'ch25'])
+def test_clickhouse_cuts_the_expression_it_could_not_deduce_a_template_for(base, server):
+    """Item A: code 62 ``Cannot deduce template of expression: <expr>``.
+
+    Live on both servers with ``SETTINGS input_format_values_interpret_expressions = 0``, which makes
+    ClickHouse report an expression it cannot template instead of evaluating it: ``VALUES (1, lower('A')),
+    (2, lower((('QA_CANARY_D3')))), ...``. The sentence stays; the expression, bound value included, goes.
+    """
+    expected = 'Error 62: DB::Exception: Cannot deduce template of expression'
+    results = [
+        base._format_db_error(_clickhouse(62, _LIVE[f'{server}.deduce.native'])),
+        base._format_db_error(_mysql(*_LIVE[f'{server}.deduce.mysql'])),
+        # ``(1 + 1)`` in a column whose first row used a template: no bound value, but the same cut.
+        base._format_db_error(_clickhouse(62, _LIVE[f'{server}.deduce_paren.native'])),
+    ]
+
+    assert results == [expected] * 3
+    assert 'QA_CANARY_D3' not in results[0]
+
+
+@pytest.mark.parametrize('server', ['ch23', 'ch25'])
+def test_clickhouse_cuts_the_expression_it_calls_not_constant(base, server):
+    """Code 36 ``... is not a constant expression (result column not found): <expr>``.
+
+    ``INSERT ... VALUES (1, 'a'), (2, arrayJoin(['QA_CANARY_D7'])), ...``: live on both servers. Found while
+    probing item A; the expression is the caller's, with the bound value in it.
+    """
+    sentence = (
+        'Element of set in IN, VALUES, or LIMIT, or aggregate function parameter, '
+        'or a table function argument is not a constant expression (result column not found)'
+    )
+    results = [
+        base._format_db_error(_clickhouse(36, _LIVE[f'{server}.notconst.native'])),
+        base._format_db_error(_ClickHouseConnectError(_LIVE[f'{server}.notconst.connect'], 36)),
+    ]
+
+    assert results == [
+        f'Error 36: DB::Exception: {sentence}',
+        f'Received ClickHouse exception, code: 36, server response: Code: 36. DB::Exception: {sentence}',
+    ]
+    assert all('QA_CANARY_D7' not in result for result in results)
+
+
+def test_clickhouse_cuts_a_not_constant_expression_whose_text_holds_a_bound_value_on_23_8(base):
+    """Live (23.8): ``toString('QA_CANARY_SB' IN (nope))`` is printed after ``(result column not found):``.
+
+    The shape a reviewer's probe found; on 25.8 the same statement fails earlier with code 47 and an ``in
+    scope`` echo, covered below.
+    """
+    result = base._format_db_error(_clickhouse(36, _LIVE['ch23.scope_in_fn.native']))
+
+    assert result.endswith('is not a constant expression (result column not found)')
+    assert 'QA_CANARY_SB' not in result
+
+
+@pytest.mark.parametrize(
+    ('server', 'key', 'canaries', 'expected'),
+    [
+        # 23.8: ``INSERT INTO qa_rel.t (id, s) VALUES (1, 'a'), (2, 'a'), (3, 'QA_CANARY_C3')`` ... CSV with a bad row.
+        (
+            'ch23',
+            'csv',
+            ['QA_CANARY_C1', 'QA_CANARY_C2', 'QA_CANARY_C3'],
+            "Error 27: DB::ParsingException: Cannot parse input: expected ','",
+        ),
+        (
+            'ch25',
+            'csv',
+            ['QA_CANARY_C1', 'QA_CANARY_C2', 'QA_CANARY_C3'],
+            "Error 27: DB::Exception: Cannot parse input: expected ','",
+        ),
+        (
+            'ch23',
+            'tsv',
+            ['QA_CANARY_T1', 'QA_CANARY_T2', 'QA_CANARY_T3'],
+            "Error 27: DB::ParsingException: Cannot parse input: expected '\\t'",
+        ),
+        (
+            'ch25',
+            'tsv',
+            ['QA_CANARY_T1', 'QA_CANARY_T2', 'QA_CANARY_T3'],
+            "Error 27: DB::Exception: Cannot parse input: expected '\\t'",
+        ),
+        # A row with an extra column: no ``before: '`` at all, so only the row diagnostic names the other rows.
+        (
+            'ch23',
+            'row117',
+            ['QA_CANARY_C1', 'QA_CANARY_C2'],
+            'Error 117: DB::Exception: Expected end of line: (at row 2)',
+        ),
+        (
+            'ch25',
+            'row117',
+            ['QA_CANARY_C1', 'QA_CANARY_C2'],
+            'Error 117: DB::Exception: Expected end of line: (at row 2)',
+        ),
+        # A negative number for a UInt32: 23.8 prints the diagnostic right after the colon, 25.8 after ``(at row 2)``.
+        (
+            'ch23',
+            'row72',
+            ['QA_CANARY_C1', 'QA_CANARY_C2'],
+            "Error 72: DB::ParsingException: Unsigned type must not contain '-' symbol",
+        ),
+        (
+            'ch25',
+            'row72',
+            ['QA_CANARY_C1', 'QA_CANARY_C2'],
+            "Error 72: DB::Exception: Unsigned type must not contain '-' symbol: (at row 2)",
+        ),
+    ],
+    ids=['csv-23', 'csv-25', 'tsv-23', 'tsv-25', 'extra-column-23', 'extra-column-25', 'negative-23', 'negative-25'],
+)
+def test_clickhouse_cuts_the_row_diagnostic_of_a_text_input_format(base, server, key, canaries, expected):
+    """Item B: ``Row N: ... parsed text: "<value>"`` restates the values of the rows around the failure.
+
+    Live on both servers: ``INSERT INTO qa_rel.t FORMAT CSV`` / ``TSV`` with a row that does not parse. The
+    primary sentence stays, and the row number where the server gives it after the sentence.
+    """
+    code = int(expected.split(':')[0].split()[1])
+
+    result = base._format_db_error(_clickhouse(code, _LIVE[f'{server}.{key}.native']))
+
+    assert result == expected
+    for canary in canaries:
+        assert canary not in result
+
+
+@pytest.mark.parametrize(
+    ('key', 'canaries'),
+    [
+        ('scope_literal', ['QA_CANARY_S3', 'QA_CANARY_S4']),
+        ('scope_tuple', ['QA_CANARY_S9', 'QA_CANARY_SA']),
+        ('scope_array', ['QA_CANARY_A1', 'QA_CANARY_A2']),
+    ],
+)
+def test_clickhouse_cuts_an_in_scope_echo_of_any_expression_shape(base, key, canaries):
+    """Live (25.8): ``in scope <expr>`` where the expression starts with a literal, a tuple or an array.
+
+    ``(2, 'QA_CANARY_S3' = nope)``, ``(2, ('QA_CANARY_S9', nope).1)``, ``(2, ['QA_CANARY_A1', nope][1])``. The
+    markers named the shapes of an echo (a statement, ``x AS (``, a lambda, a call); an expression can take
+    any other, so ``in scope`` in ClickHouse's own text is cut wherever it stands.
+    """
+    result = base._format_db_error(_clickhouse(47, _LIVE[f'ch25.{key}.native']))
+
+    assert result == 'Error 47: DB::Exception: Unknown expression or function identifier `nope`'
+    for canary in canaries:
+        assert canary not in result
+
+
+def test_clickhouse_text_is_cut_at_in_scope_even_before_a_word(base):
+    """Constructed: the price of cutting ``in scope`` unconditionally, stated so it is a choice and not an accident.
+
+    ClickHouse writes the phrase only to introduce the scope it prints, so in a message of its own the words
+    after it are an echo. Text that merely reads like prose there loses its tail; nothing leaks. A
+    ``throwIf`` message is the caller's own and is protected by its error code instead (see below).
+    """
+    exc = _clickhouse(47, 'DB::Exception: Identifier is not in scope for this rule')
+
+    assert base._format_db_error(exc) == 'Error 47: DB::Exception: Identifier is not'
+
+
+def test_clickhouse_keeps_a_throwif_context_that_says_in_scope_in_the_callers_words(base):
+    """Constructed, and the same input as ``test_clickhouse_still_passes_a_throwif_runtime_context_through``.
+
+    The runtime context repeats the caller's literal, here ``not in scope for this trigger``. Looking for an
+    echo inside it still uses the narrow shapes of an echo, so that sentence does not drop the context although
+    ``in scope`` is cut everywhere else.
+    """
+    exc = _clickhouse(
+        395,
+        "DB::Exception: not in scope for this trigger: while executing 'FUNCTION throwIf(1_UInt8 :: 1, "
+        "'not in scope for this trigger'_String :: 2) -> throwIf(1_UInt8, 'not in scope for this trigger'_String) "
+        "UInt8 : 3'",
+    )
+
+    result = base._format_db_error(exc)
+
+    assert result.startswith('Error 395: DB::Exception: not in scope for this trigger: while executing')
+    assert result.endswith("UInt8 : 3'.")
+
+
+# ---------------------------------------------------------------------------
+# Item E: a ClickHouse sentence that is only the echo
+# ---------------------------------------------------------------------------
+
+_ECHO_ONLY = (
+    "(the server's message only repeated the statement, so it is not shown here; the full text is in the engine log)"
+)
+
+
+@pytest.mark.parametrize(
+    ('make_exc', 'header'),
+    [
+        (lambda text: _clickhouse(47, text), 'Error 47: '),
+        (lambda text: _dbapi(_server(47, text)), 'Error 47: '),
+        (lambda text: _mysql(47, f'Code: 47. {text}'), 'Error 47: '),
+        (lambda text: _driver_error(_with_trace(f'Code: 47.\n{text}')), 'Code: 47.\n'),
+        (
+            lambda text: _ClickHouseConnectError(
+                f'Received ClickHouse exception, code: 47, server response: Code: 47. {text}', 47
+            ),
+            'Received ClickHouse exception, code: 47, server response: Code: 47. ',
+        ),
+    ],
+    ids=['sqla-native', 'driver-dbapi', 'mysql-wire', 'str-of-server-exception', 'clickhouse-connect'],
+)
+def test_clickhouse_message_that_is_only_an_echo_says_so_instead_of_returning_a_bare_header(base, make_exc, header):
+    """Constructed: no live statement produced one (47 statements on 23.8 and 25.8, 88 errors, none bare).
+
+    ``DB::Exception: In scope SELECT 'QA_CANARY_E1'`` is the shape: the sentence is the scope and nothing else.
+    The caller gets the header and a fixed explanation, never text derived from the cut part.
+    """
+    result = base._format_db_error(make_exc("DB::Exception: In scope SELECT 'QA_CANARY_E1'"))
+
+    assert result == f'{header}DB::Exception: {_ECHO_ONLY}'
+
+
+@pytest.mark.parametrize('server', ['ch23', 'ch25'])
+def test_clickhouse_syntax_error_keeps_its_sentence_and_gets_no_explanation(base, server):
+    """Live: ``Syntax error: failed at position 1 ...`` is cut to ``Syntax error:``, which is not a bare header."""
+    assert (
+        base._format_db_error(_clickhouse(62, _LIVE[f'{server}.syntax.native']))
+        == 'Error 62: DB::Exception: Syntax error:'
+    )
+
+
+@pytest.mark.parametrize('server', ['ch23', 'ch25'])
+def test_clickhouse_throwif_with_an_empty_message_gets_no_explanation(base, server):
+    """Live: ``SELECT throwIf(1, '')`` has no sentence of its own, but nothing was cut from it.
+
+    The explanation is for a sentence that was cut away, so this keeps its runtime context as before.
+    """
+    result = base._format_db_error(_clickhouse(395, _LIVE[f'{server}.throwif_empty.native']))
+
+    assert result.startswith('Error 395: DB::Exception: while executing')
+    assert _ECHO_ONLY not in result
+
+
+# ---------------------------------------------------------------------------
+# What the change must not touch
+# ---------------------------------------------------------------------------
+
+
+def test_the_backstop_marker_set_is_the_one_develop_has():
+    """The shared backstop stays what ``_DB_ERROR_DETAIL`` was before ClickHouse-only markers were added.
+
+    Review thread r4319010485: the old ClickHouse markers (and only those) live in the backstop, so nothing
+    ClickHouse-only reaches an unknown driver's prose. Compared with whitespace (insignificant in the verbose
+    pattern) removed, as a literal.
+    """
+    from ai.common.database import db_global_base
+
+    pattern = re.sub(r'(?<!\\)\s+', '', db_global_base._DB_ERROR_DETAIL.pattern)
+
+    assert pattern == (
+        r'\s*(?:\[SQL:|\[parameters:|\[cached\ since|\[generated\ in|\(Background\ on\ this\ error|LINE\ \d+:'
+        r'|Stack\ trace:|failed\ at\ position|while\ processing\ query:|,\ required\ columns:'
+        r'|[Ii]n\ scope\ (?=\(?(?:SELECT|INSERT|WITH|CREATE|ALTER|DROP|DELETE|UPDATE|EXPLAIN)\b))'
+        r'|\n[\t]*(?:DETAIL:|HINT:|CONTEXT:|QUERY:|STATEMENT:)'
+    )
+
+
+def test_the_dbapi_layer_classifies_clickhouse_text_once(base, monkeypatch):
+    """The text of ``clickhouse_driver.dbapi``'s error is classified once, not once to unwrap it and once to cut it."""
+    from ai.common.database import db_global_base
+
+    calls = []
+
+    class _Counting:
+        def __init__(self, pattern):
+            self._pattern = pattern
+
+        def match(self, string, *args):
+            calls.append(string)
+            return self._pattern.match(string, *args)
+
+    monkeypatch.setattr(db_global_base, '_CLICKHOUSE_TEXT', _Counting(db_global_base._CLICKHOUSE_TEXT))
+
+    base._format_db_error(_dbapi(_server(27, _LIVE['ch25.c27.native'])))
+
+    assert len(calls) == 1
