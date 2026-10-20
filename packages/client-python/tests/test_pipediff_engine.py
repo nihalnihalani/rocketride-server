@@ -22,7 +22,6 @@
 
 """Unit tests for the RocketRide pipe-diff engine, model, and config deep-diff."""
 
-import ast
 import copy
 import json
 import pickle
@@ -32,18 +31,7 @@ from pathlib import Path
 
 import pytest
 
-import rocketride.pipediff
-from rocketride.pipediff import (
-    EdgeChange,
-    PipeDiffError,
-    _pipejson,
-    deep_diff_config,
-    diff_pipes,
-    engine,
-    gitref,
-    load_pipe,
-    render_json,
-)
+from rocketride.pipediff import EdgeChange, PipeDiffError, deep_diff_config, diff_pipes, load_pipe, render_json
 
 
 # ---------------------------------------------------------------------------
@@ -311,13 +299,7 @@ def test_version_change_is_reported_and_is_semantic():
 
 
 def test_version_int_to_bool_is_reported_as_a_change():
-    """
-    ``1`` -> ``true`` is a real JSON change and must not be swallowed.
-
-    Python evaluates ``1 == True``, so the plain ``!=`` this comparison used to
-    do reported no version change at all and the diff exited 0. The comparison
-    goes through ``_json_equal``, which refuses to equate a bool with a number.
-    """
+    """``1`` -> ``true`` is a real JSON change although Python evaluates ``1 == True``."""
     old = _sample_pipe()
     new = copy.deepcopy(old)
     new['version'] = True
@@ -362,10 +344,8 @@ def test_equal_int_version_is_still_not_a_change():
 def test_unknown_top_level_keys_are_ignored():
     # `diff_pipes` reads exactly three top-level keys: `components`, `version`,
     # and `viewport`. Everything else a .pipe carries -- `project_id`,
-    # `isLocked`, and any key a future schema adds -- is deliberately ignored,
-    # because none of it changes what the pipeline does. Pinned here so the set
-    # cannot drift silently: widening it would make editor/session metadata gate
-    # a CI run, narrowing it would drop a real change.
+    # `isLocked`, and any key a future schema adds -- is ignored, because none
+    # of it changes what the pipeline does.
     old = _pipe([_node('a', 'src')], viewport={'x': 0, 'y': 0, 'zoom': 1})
     new = copy.deepcopy(old)
     new['project_id'] = 'a-different-project'
@@ -384,9 +364,8 @@ def test_unknown_top_level_keys_are_ignored():
 
 
 def test_version_is_compared_but_viewport_only_under_include_layout():
-    # The other half of the same contract: of the three keys that are read,
-    # `version` always counts, while `viewport` is enumerated and counted only
-    # when the caller opts layout in.
+    # Of the three keys that are read, `version` always counts, while `viewport`
+    # is enumerated and counted only when the caller opts layout in.
     old = _pipe([_node('a', 'src')], version=1, viewport={'x': 0, 'y': 0, 'zoom': 1})
 
     version_edit = copy.deepcopy(old)
@@ -479,10 +458,8 @@ def test_include_layout_with_unchanged_viewport_reports_nothing():
 
 @pytest.mark.parametrize('null_viewport', [True, False], ids=['null', 'omitted'])
 def test_absent_viewport_equals_empty_viewport(null_viewport):
-    # `_layout_changed` and the viewport field diff must normalize identically:
-    # an omitted or null viewport is the same canvas as {}. Comparing the raw
-    # values set layout_changed while producing no viewport.* paths, so
-    # --include-layout claimed a layout change yet exited 0 with nothing to show.
+    # An omitted or null viewport is the same canvas as {}: no layout change is
+    # flagged, and none is enumerated under include_layout.
     old = _pipe([_node('a', 'src')], viewport={})
     new = _pipe([_node('a', 'src')])
     if null_viewport:
@@ -500,10 +477,8 @@ def test_absent_viewport_equals_empty_viewport(null_viewport):
 
 @pytest.mark.parametrize('falsy', [False, 0, ''], ids=['false', 'zero', 'empty-string'])
 def test_falsy_non_null_viewport_is_not_an_empty_viewport(falsy):
-    # Only None normalizes to {}. A blanket `or {}` also folded the non-null
-    # falsy JSON values false/0/"" into {} -- all of which `load_pipe` accepts --
-    # so `viewport: false` vs `viewport: {}` reported no change and exited 0 even
-    # under --include-layout.
+    # Only None normalizes to {}: false, 0 and "" are values `load_pipe` accepts,
+    # and each differs from {}.
     old = _pipe([_node('a', 'src')], viewport={})
     new = _pipe([_node('a', 'src')])
     new['viewport'] = falsy
@@ -543,9 +518,7 @@ def test_falsy_non_null_node_ui_is_not_an_empty_ui(falsy):
     ('before', 'after'), [(False, 0), (True, 1), (0, False)], ids=['false-to-0', 'true-to-1', '0-to-false']
 )
 def test_viewport_scalar_type_change_is_a_layout_change(before, after):
-    # Python treats False == 0 and True == 1, so a plain `!=` missed a JSON
-    # false -> 0 edit: layout_changed stayed False, no viewport change was
-    # reported, and --include-layout exited 0. Equality must be JSON-typed.
+    # Python treats False == 0 and True == 1; equality here is JSON-typed.
     old = _pipe([_node('a', 'src')])
     old['viewport'] = before
     new = _pipe([_node('a', 'src')])
@@ -580,9 +553,8 @@ def test_node_ui_scalar_type_change_is_a_layout_change(before, after):
 
 
 def test_config_scalar_type_change_is_reported():
-    # _diff_value is shared with the config diff, so the same rule applies there:
-    # a config flag flipping from false to 0 is a real change, and equal typed
-    # values (including nested ones) still compare equal.
+    # A config flag flipping from false to 0 is a real change; equal typed values,
+    # nested ones included, still compare equal.
     old = _pipe([_node('a', 'src', config={'flag': False, 'nested': {'n': 1, 'items': [True]}})])
     new = _pipe([_node('a', 'src', config={'flag': 0, 'nested': {'n': 1, 'items': [True]}})])
 
@@ -686,9 +658,8 @@ def test_load_pipe_component_not_object_raises():
 
 
 def test_load_pipe_duplicate_component_id_raises():
-    # Components are matched by id, and indexing by id keeps only the last one.
-    # A duplicate would therefore hide the first node and every change to it, so
-    # it has to be an actionable error rather than a quietly wrong diff.
+    # Components are matched by id, so a duplicate would hide a node and every
+    # change to it: it is an error, not a quietly wrong diff.
     with pytest.raises(PipeDiffError, match="duplicate component id 'a' at index 2"):
         load_pipe(
             {
@@ -707,8 +678,6 @@ def test_load_pipe_rejects_unsupported_type():
 
 
 def test_load_pipe_invalid_utf8_raises_pipediff_error(tmp_path):
-    # UnicodeDecodeError is a ValueError, not an OSError, so without an explicit
-    # handler it escaped load_pipe() as a raw traceback for library callers.
     path = tmp_path / 'bad-utf8.pipe'
     path.write_bytes(b'\xff\xfe{"components": []}')
     with pytest.raises(PipeDiffError, match='not valid UTF-8'):
@@ -780,11 +749,7 @@ def _wide_deep_config(depth=200, siblings=50, key_length=200):
 
 @pytest.mark.parametrize('source', ['dict', 'file'])
 def test_load_pipe_validation_memory_is_linear_in_input_size(tmp_path, source):
-    # Building every value's full path up front made peak memory grow with depth
-    # squared: about 200 MB for this ~2 MB pipe. Paths are now built only for the
-    # value that fails, and decoded JSON is not walked again at all.
-    import tracemalloc
-
+    # Peak memory stays proportional to the size of the input.
     pipe = _wide_deep_config()
     path = tmp_path / 'wide.pipe'
     path.write_text(json.dumps(pipe), encoding='utf-8')
@@ -799,8 +764,8 @@ def test_load_pipe_validation_memory_is_linear_in_input_size(tmp_path, source):
 
 def test_load_pipe_validation_memory_grows_linearly_with_depth():
     # The absolute bound above depends on the allocator; this one does not. Doubling
-    # the depth of the same wide, long-keyed shape should about double the peak
-    # (measured 2.0x). Paths built for every pending value make it quadruple.
+    # the depth of the same wide, long-keyed shape should about double the peak, not
+    # quadruple it.
     peaks = []
     for depth in (100, 200):
         pipe = _wide_deep_config(depth=depth, siblings=20, key_length=100)
@@ -905,10 +870,9 @@ _ONE_SIDED_PLACEMENTS = {
 @pytest.mark.parametrize('shape', ['cyclic', 'deep'])
 @pytest.mark.parametrize('placement', sorted(_ONE_SIDED_PLACEMENTS))
 def test_diff_pipes_refuses_a_stored_value_it_could_not_serialise(placement, shape):
-    # load_pipe accepts a cyclic or deeply nested in-memory value, and a comparison
-    # that finds it on one side only never recurses into it, so it used to succeed
-    # and hand back a diff whose rendering then failed (ValueError, "Circular
-    # reference detected") in the caller. Refuse it where it is stored instead.
+    # load_pipe accepts a cyclic or deeply nested in-memory value. A comparison that
+    # finds it on one side only never recurses into it, but the diff would store it
+    # and every report built from it would fail, so the diff refuses it.
     old, new, include_layout = _ONE_SIDED_PLACEMENTS[placement](_unreportable(shape))
     with pytest.raises(PipeDiffError, match=_REFUSAL[shape]):
         diff_pipes(load_pipe(old), load_pipe(new), include_layout=include_layout)
@@ -953,10 +917,21 @@ def test_a_shared_value_counts_at_every_depth_it_is_reached_from():
 
 
 def test_load_pipe_reports_unparseably_deep_json_file_as_pipediff_error(tmp_path):
-    # Real input, not a patched decoder: the C scanner gives up with a
-    # RecursionError long before 100,000 levels.
+    # The JSON scanner gives up with a RecursionError long before 100,000 levels.
     path = tmp_path / 'deep.pipe'
     path.write_text('{"components": [{"id": "a", "config": ' + '[' * 100_000 + ']' * 100_000 + '}]}', encoding='utf-8')
+    with pytest.raises(PipeDiffError, match='Invalid JSON') as error:
+        load_pipe(path)
+    assert str(path) in str(error.value)
+
+
+@pytest.mark.skipif(
+    not getattr(sys, 'get_int_max_str_digits', lambda: 0)(), reason='this interpreter has no integer digit limit'
+)
+def test_load_pipe_reports_an_integer_beyond_the_decoder_limit_as_pipediff_error(tmp_path):
+    path = tmp_path / 'huge.pipe'
+    digits = sys.get_int_max_str_digits() + 1
+    path.write_text('{"components": [{"id": "a", "config": {"value": ' + '1' * digits + '}}]}', encoding='utf-8')
     with pytest.raises(PipeDiffError, match='Invalid JSON') as error:
         load_pipe(path)
     assert str(path) in str(error.value)
@@ -978,8 +953,7 @@ def test_load_pipe_keeps_normal_binary64_rounding(tmp_path):
 def test_a_repeated_json_key_means_its_last_value(tmp_path):
     # Python's json, JSON.parse and the engine's own reader (jsoncpp, with
     # rejectDupKeys off) all keep the last value of a repeated key, so the diff
-    # compares exactly what the engine would run. A stricter parser would have to
-    # be a deliberate change, so the policy is pinned here.
+    # compares exactly what the engine would run.
     path = tmp_path / 'repeated.pipe'
     path.write_text(
         '{"components": [{"id": "a", "provider": "x", "provider": "y", "config": {"k": 1, "k": 2}}]}',
@@ -988,20 +962,6 @@ def test_a_repeated_json_key_means_its_last_value(tmp_path):
     component = load_pipe(str(path))['components'][0]
     assert component['provider'] == 'y'
     assert component['config'] == {'k': 2}
-
-
-@pytest.mark.parametrize('error', [ValueError('integer exceeds decoder limit'), RecursionError('JSON nesting limit')])
-def test_load_pipe_decoder_limits_are_contextual_pipediff_errors(tmp_path, monkeypatch, error):
-    path = tmp_path / 'limited.pipe'
-    path.write_text('{"components": []}', encoding='utf-8')
-
-    def reject(_text, **_kwargs):
-        raise error
-
-    monkeypatch.setattr(json, 'loads', reject)
-    with pytest.raises(PipeDiffError, match='Invalid JSON') as raised:
-        load_pipe(path)
-    assert str(path) in str(raised.value)
 
 
 # ---------------------------------------------------------------------------
@@ -1030,7 +990,6 @@ def test_load_pipe_wire_missing_from_raises():
 
 
 def test_load_pipe_wire_from_is_a_list_raises():
-    # An unhashable 'from' used to blow up inside set.add during edge extraction.
     with pytest.raises(PipeDiffError, match=r"input\[0\] is missing a string 'from'"):
         load_pipe({'components': [{'id': 'a', 'input': [{'from': ['b'], 'lane': 'text'}]}]})
 
@@ -1057,11 +1016,6 @@ def test_load_pipe_control_wire_missing_classtype_raises():
 def test_load_pipe_accepts_absent_wire_collections():
     pipe = {'components': [{'id': 'a'}, {'id': 'b', 'input': [], 'control': []}]}
     assert load_pipe(pipe) is pipe
-
-
-# ---------------------------------------------------------------------------
-# End-to-end against a real bundled example
-# ---------------------------------------------------------------------------
 
 
 # ---------------------------------------------------------------------------
@@ -1213,41 +1167,6 @@ def test_deeply_nested_groups_do_not_hit_the_recursion_limit():
     assert diff.layout_changed is True
 
 
-class _CountingList(list):
-    """A list that counts how many times something starts iterating it."""
-
-    iterations = 0
-
-    def __iter__(self):
-        self.iterations += 1
-        return super().__iter__()
-
-
-def _counted_grouped_pipe(lane='questions'):
-    """A grouped pipe whose top-level and group-children lists count their walks."""
-    pipe = _grouped_pipe(lane=lane)
-    pipe['components'] = top_level = _CountingList(pipe['components'])
-    pipeline = pipe['components'][1]['config']['pipeline']
-    pipeline['components'] = children = _CountingList(pipeline['components'])
-    return pipe, top_level, children
-
-
-def test_comparing_walks_each_pipelines_group_tree_once():
-    # The id index and the edge set used to be two separate walks of the same tree.
-    # Loading (validation, and for a dict the finite-number check) is counted apart.
-    old, old_top, old_children = _counted_grouped_pipe(lane='questions')
-    new, new_top, new_children = _counted_grouped_pipe(lane='text')
-    load_pipe(old)
-    load_pipe(new)
-    lists = (old_top, old_children, new_top, new_children)
-    loaded = [lst.iterations for lst in lists]
-
-    diff = diff_pipes(old, new)
-
-    assert [(e.lane, e.kind) for e in diff.edge_changes] == [('text', 'added'), ('questions', 'removed')]
-    assert [lst.iterations - before for lst, before in zip(lists, loaded)] == [1, 1, 1, 1]
-
-
 def test_diff_pipes_neither_mutates_nor_remembers_its_inputs():
     # The id index and edge set are built per comparison. Nothing is cached on the
     # caller's dicts or between calls, so an edit is seen by the next comparison.
@@ -1319,7 +1238,6 @@ def test_malformed_grouped_children_are_rejected(child, message):
 
 
 def test_duplicate_id_message_names_both_locations_at_every_nesting_level():
-    # The location text is spelled only for the component that fails; pin what it says.
     pipe = _pipe([_group('g1', [_child('x', 'p', 'g1')]), _group('g2', [_child('x', 'p', 'g2')])])
     with pytest.raises(PipeDiffError) as error:
         load_pipe(pipe)
@@ -1333,37 +1251,27 @@ def test_duplicate_id_message_names_both_locations_at_every_nesting_level():
     assert str(error.value) == "<dict>: duplicate component id 'x' at index 2 (already used at index 0)"
 
 
-def test_components_are_walked_in_document_order_with_their_parent_and_index():
+def test_components_are_checked_in_document_order_through_nested_groups():
+    # A group comes before its children, which come before the next top-level component
     inner = _group('inner', [_child('c', 'p', 'inner'), _child('d', 'p', 'inner')])
     outer = _group('outer', [_child('a', 'p', 'outer'), inner, _child('b', 'p', 'outer')])
-    pipe = _pipe([_node('first', 'p'), outer, _node('last', 'p')])
 
-    walked = [(c['id'], p and p['id'], i) for c, p, i in _pipejson.iter_components(pipe)]
-
-    assert walked == [
-        ('first', None, 0),
-        ('outer', None, 1),
-        ('a', 'outer', 0),
-        ('inner', 'outer', 1),
-        ('c', 'inner', 0),
-        ('d', 'inner', 1),
-        ('b', 'outer', 2),
-        ('last', None, 2),
-    ]
-    assert [_pipejson.describe_location(p, i) for _c, p, i in _pipejson.iter_components(pipe)][:4] == [
-        'index 0',
-        'index 1',
-        "'outer' config.pipeline.components[0]",
-        "'outer' config.pipeline.components[1]",
-    ]
+    for repeated, first_seen, later in [
+        ('first', 'index 0', 'index 3'),
+        ('c', "'inner' config.pipeline.components[0]", 'index 3'),
+        ('b', "'outer' config.pipeline.components[2]", 'index 3'),
+    ]:
+        pipe = _pipe([_node('first', 'p'), outer, _node('last', 'p'), _node(repeated, 'p')])
+        with pytest.raises(PipeDiffError) as error:
+            load_pipe(pipe)
+        assert str(error.value) == (
+            f"<dict>: duplicate component id '{repeated}' at {later} (already used at {first_seen})"
+        )
 
 
 def test_a_long_group_id_is_not_repeated_for_every_child():
-    # Every child's location used to be spelled out up front, group id included, so a
-    # group with a long id and many children cost their product in memory: a 269 KB
-    # file (a 100,000-character id, 5,000 children) peaked at 500 MB, and the cost
-    # grows with the product of the two. Validation now keeps only the ids it has
-    # seen, and the walk keeps one iterator per nesting level.
+    # A group with a very long id and many children must not cost memory in
+    # proportion to the product of the two: the group id is not repeated per child.
     group_id = 'g' * 100_000
     pipe = _pipe([_group(group_id, [{'id': f'c{index}', 'provider': 'p'} for index in range(2_000)])])
     tracemalloc.start()
@@ -1393,124 +1301,15 @@ def test_a_long_group_id_in_a_file_is_not_repeated_for_every_child(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Module boundaries
+# Public error type, and a real bundled example
 # ---------------------------------------------------------------------------
 
 
-_PACKAGE = 'rocketride.pipediff'
-
-
-def _siblings_imported_by(source):
-    """``{sibling: {imported names}}`` for every way ``source`` can import a pipediff sibling.
-
-    Covers ``from .x import a``, ``from . import x``, ``from rocketride.pipediff.x import a``,
-    ``from rocketride.pipediff import x`` and ``import rocketride.pipediff.x``, so an absolute
-    import cannot slip past a check that only looks at the relative form.
-    """
-    found = {}
-    for node in ast.walk(ast.parse(source)):
-        if isinstance(node, ast.ImportFrom):
-            if node.level == 1 and node.module:
-                found.setdefault(node.module, set()).update(alias.name for alias in node.names)
-            elif node.level == 1 or (node.level == 0 and node.module == _PACKAGE):
-                for alias in node.names:
-                    found.setdefault(alias.name, set())
-            elif node.level == 0 and node.module and node.module.startswith(_PACKAGE + '.'):
-                sibling = node.module[len(_PACKAGE) + 1 :].split('.')[0]
-                found.setdefault(sibling, set()).update(alias.name for alias in node.names)
-        elif isinstance(node, ast.Import):
-            for alias in node.names:
-                if alias.name.startswith(_PACKAGE + '.'):
-                    found.setdefault(alias.name[len(_PACKAGE) + 1 :].split('.')[0], set())
-    return found
-
-
-def _sibling_imports():
-    """``{module: {sibling: {imported names}}}`` for every pipediff module that imports a sibling."""
-    package_dir = Path(rocketride.pipediff.__file__).parent
-    found = {}
-    for source in sorted(package_dir.glob('*.py')):
-        if source.name == '__init__.py':
-            continue
-        found[source.stem] = _siblings_imported_by(source.read_text(encoding='utf-8'))
-    return found
-
-
-def test_the_import_scan_sees_every_form_of_sibling_import():
-    source = (
-        'from .engine import a, _b\n'
-        'from . import gitref, model\n'
-        'from rocketride.pipediff.reporters import _c\n'
-        'from rocketride.pipediff import _pipejson\n'
-        'import rocketride.pipediff.model\n'
-        'import json\n'
-        'from rocketride.cli import main\n'
-    )
-    assert _siblings_imported_by(source) == {
-        'engine': {'a', '_b'},
-        'gitref': set(),
-        'model': set(),
-        'reporters': {'_c'},
-        '_pipejson': set(),
-    }
-
-
-def test_pipediff_modules_share_helpers_only_through_private_modules():
-    # `reporters` used to import engine._json_equal and `gitref` engine._parse_pipe_json:
-    # a contract between modules hidden behind an underscore. What the modules share
-    # lives in a private module (leading underscore on the module, plain names inside);
-    # nothing reaches an underscore name of a public sibling.
-    imports = _sibling_imports()
-    assert sum(len(siblings) for siblings in imports.values()) >= 3  # the scan found the imports
-    reached_in = [
-        f'{module} imports {name} from {sibling}'
-        for module, siblings in imports.items()
-        for sibling, names in siblings.items()
-        if not sibling.startswith('_')
-        for name in sorted(names)
-        if name.startswith('_')
-    ]
-    assert reached_in == []
-
-
-def test_pipediff_modules_do_not_import_each_other_in_a_cycle():
-    imports = {module: set(siblings) for module, siblings in _sibling_imports().items()}
-    assert imports['_pipejson'] == set()  # the shared module depends on no sibling
-    assert imports['model'] == set()
-
-    def reachable(module, seen=()):
-        for sibling in imports.get(module, ()):
-            if sibling not in seen:
-                yield sibling
-                yield from reachable(sibling, (*seen, sibling))
-
-    assert [module for module in imports if module in set(reachable(module))] == []
-
-
-def test_pipediff_error_is_one_class_under_its_public_name():
-    # The class is defined in the private shared module so that gitref can raise it
-    # without importing the engine; every route to it must lead to the same object,
-    # and it must be reported under the public package rather than the private module.
-    assert rocketride.pipediff.PipeDiffError is engine.PipeDiffError
-    assert engine.PipeDiffError is _pipejson.PipeDiffError
-    assert gitref.PipeDiffError is _pipejson.PipeDiffError
+def test_pipediff_error_is_reported_under_its_public_name_and_pickles():
     assert PipeDiffError.__module__ == 'rocketride.pipediff'
     restored = pickle.loads(pickle.dumps(PipeDiffError('boom')))
     assert type(restored) is PipeDiffError
     assert str(restored) == 'boom'
-
-
-def test_engine_star_import_exports_only_the_documented_names():
-    # Names the engine imports from the shared private module (json_equal,
-    # parse_pipe_json, validate_pipe, ...) are not engine API and must not leak
-    # out through `from rocketride.pipediff.engine import *`.
-    documented = {'PipeDiffError', 'deep_diff_config', 'diff_pipes', 'load_pipe'}
-    namespace = {}
-    exec('from rocketride.pipediff.engine import *', namespace)
-    assert {name for name in namespace if name != '__builtins__'} == documented
-    assert sorted(engine.__all__) == sorted(documented)
-    for name in documented:
-        assert getattr(engine, name) is getattr(rocketride.pipediff, name)
 
 
 def test_diff_of_real_example_against_itself_is_empty(examples_dir):

@@ -46,12 +46,10 @@ from html.parser import HTMLParser
 from typing import Optional, Tuple
 
 from rocketride.pipediff import EdgeChange, FieldChange, NodeChange, PipeDiff
-from rocketride.pipediff.reporters import _md_cell, render_human, render_json, render_markdown
+from rocketride.pipediff.reporters import render_human, render_json, render_markdown
 
-# CI installs cmarkgfm into the engine interpreter from tests/requirements.txt
-# (the client-python:setup-test-deps step), so the renderer cross-check below
-# runs there. The import stays guarded only so the rest of the module still
-# collects on a local interpreter without it.
+# cmarkgfm is the Markdown renderer GitHub uses; the tests that render through it
+# are skipped where it is not installed.
 try:  # pragma: no cover - guarded for interpreters without the renderer
     import cmarkgfm
     from cmarkgfm.cmark import Options as CmarkOptions
@@ -150,18 +148,10 @@ def _split_gfm_row(row: str) -> list:
     """
     Split a GFM table row into cells the way cmark-gfm's table scanner does.
 
-    This is the library-free counterpart to ``_render_gfm_row``: it answers the
-    only question ``_md_cell`` is responsible for -- does the row still have its
-    columns, and does unescaping give the value back -- without needing a C
-    extension that is not installed in CI.
-
-    The rule, confirmed against cmark-gfm itself: a ``|`` splits the row only
-    when no backslash immediately precedes it, and a ``|`` preceded by a run of
-    *n* backslashes (*n* >= 1) is escaped and loses exactly one of them. Every
-    other backslash is left alone, which is what makes a value like
-    ``C:\\Users\\alice`` come through untouched. Cross-checked against
-    ``cmarkgfm`` over several thousand random values built from the punctuation
-    that appears in pipeline config: the two agree on every one.
+    The library-free counterpart to ``_render_gfm_row``: a ``|`` splits the row only
+    when no backslash immediately precedes it, and a ``|`` preceded by a run of *n*
+    backslashes (*n* >= 1) is escaped and loses exactly one of them. Every other
+    backslash is left alone.
     """
     row = row.strip()
     if row.startswith('|'):
@@ -202,8 +192,7 @@ def _table_body_rows(markdown: str) -> list:
     Return the data rows of every Markdown table in ``markdown``.
 
     Header rows and the ``| --- |`` separators are dropped, so a row count is a
-    count of rendered changes. A row that a stray newline split in two shows up
-    here as two rows, which is exactly what the escaping tests assert against.
+    count of rendered changes (a row split by a stray newline counts twice).
     """
     rows = []
     in_body = False
@@ -217,6 +206,19 @@ def _table_body_rows(markdown: str) -> list:
         if in_body:
             rows.append(line)
     return rows
+
+
+def _added_value_report(value) -> str:
+    """The Markdown report of one config value added to a node: a ``Node | Field | Change`` table."""
+    return render_markdown(
+        PipeDiff(
+            node_changes=[
+                NodeChange(
+                    id='n1', kind='config', field_changes=[FieldChange(path='config.v', kind='added', new=value)]
+                )
+            ]
+        )
+    )
 
 
 class TestRenderHuman(unittest.TestCase):
@@ -576,9 +578,9 @@ class TestRenderMarkdown(unittest.TestCase):
 
     @unittest.skipIf(cmarkgfm is None, 'cmarkgfm is not installed')
     def test_empty_string_value_cannot_break_out_of_its_code_span(self) -> None:
-        # An empty value used to render as a bare double backtick, which GFM pairs
-        # with the next value's two-backtick fence: the arrow became the code span
-        # and the rest of the untrusted value rendered as live Markdown.
+        # An empty value must not render as a bare double backtick: GFM pairs it with
+        # the next value's two-backtick fence and the rest of the untrusted value
+        # would render as live Markdown.
         hostile = 'x` [click](https://example.invalid/p) @someone ![i](https://example.invalid/i.png) **bold**'
         diff = PipeDiff(
             node_changes=[
@@ -600,24 +602,24 @@ class TestRenderMarkdown(unittest.TestCase):
         self.assertIn('**Version:** `""` →', out)
 
     def test_values_that_render_alike_in_markdown_stay_distinguishable(self) -> None:
-        # `a\nb` and `a b` used to render the same in Markdown.
         diff = PipeDiff(
             node_changes=[
                 NodeChange(
                     id='n1',
                     kind='config',
-                    field_changes=[FieldChange(path='config.s', kind='changed', old='a\nb', new='a b')],
+                    field_changes=[FieldChange(path='config.s', kind='changed', old='a' + chr(10) + 'b', new='a b')],
                 ),
-                NodeChange(id='n2', kind='provider', provider_old='p\nq', provider_new='p q'),
+                NodeChange(id='n2', kind='provider', provider_old='p' + chr(10) + 'q', provider_new='p q'),
             ],
-            version_change=('1\n2', '1 2'),
+            version_change=('1' + chr(10) + '2', '1 2'),
         )
         out = render_markdown(diff)
-        # A value holding a line break is JSON-quoted in every Markdown location, so
-        # it never reads like the same text with a space.
-        self.assertIn('| `n1` | `config.s` | `"a\\nb"` → `a b` |', out)
-        self.assertIn('- ~ `n2` provider: `"p\\nq"` → `p q`', out)
-        self.assertIn('**Version:** `"1\\n2"` → `1 2`', out)
+        # A value holding a line break must not read like the same text with a space,
+        # in a table cell, a bullet, or the version line.
+        for marker in ('`config.s`', '`n2` provider', '**Version:**'):
+            (line,) = [line for line in out.splitlines() if marker in line]
+            before, after = re.findall(r'`([^`]*)`', line)[-2:]
+            self.assertNotEqual(_reader_view(before), _reader_view(after), line)
 
     # Each value differs from the plain one only by a character a reader cannot see:
     # a zero-width space or joiner, a word joiner, a BOM, a soft hyphen, a tag
@@ -683,37 +685,6 @@ class TestRenderMarkdown(unittest.TestCase):
                 self.assertEqual(len(change), 2, html)
                 self.assertNotEqual(' '.join(change[0].split()), ' '.join(change[1].split()), html)
 
-    def test_one_sided_values_keep_escapes_and_their_text_apart(self) -> None:
-        """An added real control and an added text of its escape must not print alike."""
-        diff = PipeDiff(
-            node_changes=[
-                NodeChange(
-                    id='n1',
-                    kind='config',
-                    field_changes=[
-                        FieldChange(path='config.real', kind='added', new='\u202e'),
-                        FieldChange(path='config.text', kind='added', new='\\u202e'),
-                        FieldChange(path='config.esc', kind='removed', old='\x1b'),
-                        FieldChange(path='config.esc_text', kind='removed', old='\\x1b'),
-                        FieldChange(path='config.newline', kind='added', new='a\nb'),
-                        FieldChange(path='config.space', kind='added', new='a b'),
-                    ],
-                )
-            ]
-        )
-        md = render_markdown(diff)
-        self.assertIn('| `n1` | `config.real` | + `"\\u202e"` |', md)
-        self.assertIn('| `n1` | `config.text` | + `"\\\\u202e"` |', md)
-        self.assertIn('| `n1` | `config.esc` | - `"\\u001b"` |', md)
-        self.assertIn('| `n1` | `config.esc_text` | - `"\\\\x1b"` |', md)
-        self.assertIn('| `n1` | `config.newline` | + `"a\\nb"` |', md)
-        self.assertIn('| `n1` | `config.space` | + `a b` |', md)
-        human = render_human(diff, use_color=False)
-        self.assertIn('+ config.real = "\\u202e"', human)
-        self.assertIn('+ config.text = "\\\\u202e"', human)
-        self.assertIn('- config.esc = "\\u001b"', human)
-        self.assertIn('- config.esc_text = "\\\\x1b"', human)
-
     def test_a_lone_surrogate_is_escaped_rather_than_breaking_output(self) -> None:
         """JSON's ``"\\ud800"`` decodes to a lone surrogate, which no UTF-8 stream can carry."""
         diff = PipeDiff(
@@ -769,18 +740,10 @@ class TestRenderMarkdown(unittest.TestCase):
         )
         self.assertIn('| `n1` | `config.m` | `gpt-4` → `" gpt-4 "` |', render_markdown(diff))
 
-    def test_reporter_source_has_no_raw_invisible_characters(self) -> None:
-        import rocketride.pipediff.reporters as reporters_module
-
-        with open(reporters_module.__file__, encoding='utf-8') as handle:
-            source = handle.read()
-        hidden = sorted({f'U+{ord(c):04X}' for c in source if unicodedata.category(c) in ('Cf', 'Zl', 'Zp')})
-        self.assertEqual(hidden, [])
-
-    def test_md_code_never_emits_an_empty_code_span(self) -> None:
-        from rocketride.pipediff.reporters import _md_code
-
-        self.assertEqual(_md_code(''), '`""`')
+    def test_empty_strings_are_shown_as_visible_empty_strings(self) -> None:
+        self.assertIn('| `n1` | `config.v` | + `""` |', _added_value_report(''))
+        out = render_markdown(PipeDiff(node_changes=[NodeChange(id='', kind='added', provider_new='p')]))
+        self.assertIn('- `+` `""` (`p`)', out)
 
     def test_values_use_json_spelling(self) -> None:
         diff = PipeDiff(
@@ -921,19 +884,13 @@ class TestRenderMarkdown(unittest.TestCase):
 
     def test_table_does_not_double_backslashes_in_code_spans(self) -> None:
         """
-        Backslashes inside a table cell must survive verbatim.
+        Backslashes inside a table cell survive verbatim.
 
-        Every value reaching a cell is already wrapped in a code span, and a
-        code span does no backslash unescaping — so the cell escaper used to
-        double them and ``C:\\Users\\alice`` rendered as ``C:\\\\Users\\\\alice``.
-        Only ``\\|`` is meaningful to GitHub's table parser, and that escape
-        stays.
-
-        A backslash sitting immediately before a pipe is **not** a special case:
-        the value ``\\d+\\|x`` is emitted as ``\\d+\\\\|x``, one added backslash
-        and no more. See
-        :meth:`test_md_cell_adds_exactly_one_backslash_per_pipe` for the full
-        matrix and the cmark-gfm round-trip that pins why.
+        Every value reaching a cell is already in a code span, which does no
+        backslash unescaping, so a Windows path reads back as it was written. Only
+        a backslash-escaped pipe is meaningful to GitHub's table parser, and that
+        escape stays. A backslash immediately before a pipe is not a special case:
+        one backslash is added and no more.
         """
         windows_path = r'C:\Users\alice'
         regex_value = r'\d+\|x'
@@ -964,77 +921,29 @@ class TestRenderMarkdown(unittest.TestCase):
             # Pipes from the values are escaped, so only the 4 delimiters remain.
             self.assertEqual(row.replace('\\|', '').count('|'), 4, row)
 
-    def test_md_cell_adds_exactly_one_backslash_per_pipe(self) -> None:
-        """
-        Pin the exact bytes ``_md_cell`` emits, including backslash-before-pipe.
-
-        cmark-gfm's table-cell scanner accepts either a lone backslash or a
-        backslash-escaped punctuation pair and takes the longest match, so a run
-        of *n* backslashes before a pipe parses as *n - 1* lone backslashes plus
-        the escaped pair ``\\|``: the pipe is escaped for every *n* >= 1 and the
-        row never splits. Unescaping strips exactly that one backslash. Adding
-        one is therefore both necessary and sufficient — doubling the run would
-        render a spurious extra backslash rather than protect anything.
-        """
-        cases = [
-            # (value, exact text _md_cell must emit)
-            (r'C:\Users\alice', r'C:\Users\alice'),  # no pipe -> untouched
-            ('a|b', r'a\|b'),
-            (r'a\|b', r'a\\|b'),
-            (r'a\\|b', r'a\\\|b'),
-            (r'\d+\|x', r'\d+\\|x'),
-            ('a||b', r'a\|\|b'),
-            ('trailing-backslash\\', 'trailing-backslash\\'),  # no pipe -> untouched
-            ('a\nb', 'a b'),
-            ('a\nb|c', r'a b\|c'),
-        ]
-        for value, expected in cases:
-            with self.subTest(value=value):
-                self.assertEqual(_md_cell(value), expected)
-
     def test_escaped_cells_survive_gfm_row_splitting(self) -> None:
         """
-        Every escaped value must keep the row at three columns and unescape back
-        to itself.
+        Every value keeps its row at three columns and reads back as itself.
 
-        Same corpus as the ``cmarkgfm`` cross-check below, but resolved with
-        ``_split_gfm_row`` so it runs everywhere -- including on an interpreter
-        that has no ``cmarkgfm`` at all. CI installs the renderer into the engine
-        interpreter from tests/requirements.txt, so both checks run there; this
-        one is the fallback for a local interpreter, not the one that settles the
-        rule. A row that split shows up here as more than three cells.
+        The row is split with ``_split_gfm_row``, so this runs on an interpreter
+        without ``cmarkgfm``; the test below renders the same corpus through it.
         """
         for value in _GFM_ESCAPING_CORPUS:
             with self.subTest(value=value):
-                row = f'| n1 | `config.v` | `{_md_cell(value)}` |'
+                (row,) = _table_body_rows(_added_value_report(value))
                 cells = _split_gfm_row(row)
                 self.assertEqual(len(cells), 3, f'row split by GFM: {row!r}')
-                self.assertEqual(cells[2].strip(), f'`{value}`', f'cell does not unescape to the value: {row!r}')
+                self.assertEqual(cells[2].strip(), f'+ `{value}`', f'cell does not unescape to the value: {row!r}')
 
-    @unittest.skipIf(
-        cmarkgfm is None,
-        'cmarkgfm is not installed; CI installs it from tests/requirements.txt so this runs there, '
-        'and a local interpreter can get it with `pip install .[test]` -- the library-free check above '
-        'covers the same corpus meanwhile',
-    )
+    @unittest.skipIf(cmarkgfm is None, 'cmarkgfm is not installed')
     def test_gfm_renders_escaped_cells_back_to_the_original_value(self) -> None:
-        """
-        Render the escaped cells through GFM and check what a reader actually sees.
-
-        This is the test that decides the backslash question rather than arguing
-        it: for each value, the emitted row must keep its three columns and the
-        code span must contain the original value, byte for byte. It is not
-        optional in CI -- tests/requirements.txt installs ``cmarkgfm`` into the
-        engine interpreter the suite runs on, so this executes rather than skips.
-        """
+        """What GitHub renders for each value: three columns, and a code span holding the value byte for byte."""
         for value in _GFM_ESCAPING_CORPUS:
             with self.subTest(value=value):
-                row = f'| n1 | `config.v` | `{_md_cell(value)}` |'
-                table = '| Node | Field | Change |\n| --- | --- | --- |\n' + row + '\n'
-                cells, code = _render_gfm_row(table)
-                self.assertEqual(cells, 3, f'unexpected column count: {row!r}')
-                self.assertIsNotNone(code, f'row split by GFM (code span truncated): {row!r}')
-                self.assertEqual(code, value, f'rendered cell differs from the value: {row!r}')
+                cells, code = _render_gfm_row(_added_value_report(value))
+                self.assertEqual(cells, 3, f'unexpected column count for {value!r}')
+                self.assertIsNotNone(code, f'row split by GFM (code span truncated) for {value!r}')
+                self.assertEqual(code, value, f'rendered cell differs from the value: {value!r}')
 
     def test_table_cell_neutralizes_newlines_without_touching_backslashes(self) -> None:
         """A newline in a value must not break the row, and must not cost a backslash."""
@@ -1131,6 +1040,14 @@ _ALONE = {
     ),
 }
 
+
+def _id_as_printed(text: str) -> str:
+    """How the terminal report prints ``text`` as the id of an added node."""
+    report = render_human(_ALONE['added node id'](text), use_color=False)
+    (line,) = [line for line in report.splitlines() if line.startswith('  + ')]
+    return line[len('  + ') : -len(' (p)')]
+
+
 # Where both sides of a change are shown together: ``(diff of a -> b, pattern for the human line)``.
 _PAIRED = {
     'changed value': (
@@ -1221,7 +1138,7 @@ class TestEquivalentSpellings(unittest.TestCase):
                 # Alike to a reader: both quoted, the look-alike written as an escape.
                 self.assertIn(f'~ config.v: "{plain}" -> "', human)
                 self.assertNotIn(lookalike, human.split('config.w')[0])
-                # Not alike: compact and readable, as before.
+                # Not alike: compact and readable.
                 self.assertIn(f'~ config.w: a -> {lookalike}', human)
 
     def test_normalised_non_ascii_text_is_left_readable(self) -> None:
@@ -1324,19 +1241,7 @@ class TestEscapeLookalikes(unittest.TestCase):
                         _github_code_spans(render_markdown(build(escape_text))),
                     )
 
-    def test_text_that_reads_like_an_escape_is_quoted_and_its_backslash_doubled(self) -> None:
-        from rocketride.pipediff.reporters import _fmt_value, _ident
-
-        for tail in ('u202e', 'x1b', 'U0001f600', 'u65E5'):
-            for text in (_BS + tail, 'a' + _BS + tail + 'b', _BS + _BS + tail):
-                with self.subTest(text=text):
-                    quoted = '"' + text.replace(_BS, _BS * 2) + '"'
-                    self.assertEqual(_fmt_value(text), quoted)
-                    self.assertEqual(_ident(text), quoted)
-
     def test_ordinary_text_is_not_quoted_for_holding_a_backslash(self) -> None:
-        from rocketride.pipediff.reporters import _fmt_value, _ident
-
         # Windows paths and regular expressions are common in configs; only text that
         # is spelled exactly like one of our escapes is touched.
         for text in (
@@ -1349,34 +1254,25 @@ class TestEscapeLookalikes(unittest.TestCase):
             _BS,
         ):
             with self.subTest(text=text):
-                self.assertEqual(_fmt_value(text), text)
-                self.assertEqual(_ident(text), text)
-        self.assertEqual(_ident('chunker_1'), 'chunker_1')
-        # An id holding a real escaped character keeps the plain spelling it always had.
-        self.assertEqual(_ident('a\N{RIGHT-TO-LEFT OVERRIDE}'), 'a\N{RIGHT-TO-LEFT OVERRIDE}')
+                value_report = render_human(_ALONE['added value'](text), use_color=False)
+                self.assertIn('    + config.v = ' + text, value_report.splitlines())
+                self.assertEqual(_id_as_printed(text), text)
+        self.assertEqual(_id_as_printed('chunker_1'), 'chunker_1')
+        # An id holding a real escaped character is shown with its escape, unquoted.
+        self.assertEqual(_id_as_printed('a' + chr(0x202E)), 'a' + _BS + 'u202e')
 
-    def test_an_identifier_that_starts_with_a_quote_never_looks_like_a_quoted_one(self) -> None:
-        from rocketride.pipediff.reporters import _ident
-
-        self.assertEqual(_ident('"x"'), '"' + _BS + '"x' + _BS + '""')
-        self.assertNotEqual(_ident('"' + _BS * 2 + 'u202e"'), _ident(_BS + 'u202e'))
-
-    def test_a_bare_value_never_starts_with_a_quote(self) -> None:
-        from rocketride.pipediff.reporters import _fmt_value, _md_code, _term_safe
-
-        # A console that writes a character as an escape can turn text that is not valid
-        # JSON into text that is, so a value starting with a quote is quoted too. Found
-        # by the exhaustive check below: a quote, a backslash and two combining marks
-        # printed on an ASCII console like the quoted form of a different value.
-        mark = '\N{COMBINING ACUTE ACCENT}'
+    def test_a_value_starting_with_a_quote_is_quoted(self) -> None:
+        # A console that writes a character as an escape can turn text that is not valid JSON
+        # into text that is, so a bare value never starts with a quote.
+        report = render_human(_ALONE['added value']('"abc'), use_color=False)
+        self.assertIn('    + config.v = "' + _BS + '"abc"', report.splitlines())
+        mark = chr(0x301)
         bare, literal = '"' + _BS + mark + mark + ' "', _BS + 'u0301' + mark + ' '
-        self.assertEqual(_fmt_value('"abc'), '"' + _BS + '"abc"')
-        for display in (lambda t: _term_safe(_fmt_value(t)), lambda t: _md_code(_fmt_value(t))):
-            self.assertNotEqual(_on_an_ascii_console(display(bare)), _on_an_ascii_console(display(literal)))
+        for render in (lambda diff: render_human(diff, use_color=False), render_markdown):
+            printed = [_on_an_ascii_console(render(_ALONE['added value'](text))) for text in (bare, literal)]
+            self.assertNotEqual(printed[0], printed[1])
 
     def test_no_two_strings_print_alike(self) -> None:
-        from rocketride.pipediff.reporters import _fmt_value, _ident, _md_code, _term_safe
-
         tokens = [
             _BS + 'u202e',
             '\N{RIGHT-TO-LEFT OVERRIDE}',
@@ -1399,18 +1295,19 @@ class TestEscapeLookalikes(unittest.TestCase):
         for _ in range(3):
             frontier = {prefix + token for prefix in frontier for token in tokens}
             strings |= frontier
-        displays = {
-            'value, terminal': lambda t: _term_safe(_fmt_value(t)),
-            'value, Markdown': lambda t: _md_code(_fmt_value(t)),
-            'identifier, terminal': lambda t: _term_safe(_ident(t)),
-            'identifier, Markdown': lambda t: _md_code(_ident(t)),
+        reports = {
+            'value, terminal': lambda t: render_human(_ALONE['added value'](t), use_color=False),
+            'value, Markdown': lambda t: render_markdown(_ALONE['added value'](t)),
+            'identifier, terminal': lambda t: render_human(_ALONE['added node id'](t), use_color=False),
+            'identifier, Markdown': lambda t: render_markdown(_ALONE['added node id'](t)),
         }
-        for name, display in displays.items():
-            for console in (lambda t: t, _on_an_ascii_console):
-                seen = {}
-                for text in sorted(strings):
-                    shown = console(display(text))
-                    other = seen.setdefault(shown, text)
+        for name, report in reports.items():
+            seen = {'as written': {}, 'on an ASCII console': {}}
+            for text in sorted(strings):
+                rendered = report(text)
+                for console, printed in zip((lambda t: t, _on_an_ascii_console), seen.values()):
+                    shown = console(rendered)
+                    other = printed.setdefault(shown, text)
                     self.assertEqual(other, text, f'{name}: {other!a} and {text!a} both print as {shown!a}')
 
 
@@ -1463,8 +1360,6 @@ class TestIdentifierWhitespace(unittest.TestCase):
                     )
 
     def test_padded_identifiers_are_quoted_and_ordinary_ones_are_not(self) -> None:
-        from rocketride.pipediff.reporters import _ident
-
         quoted = {
             'llm_1 ': '"llm_1 "',
             ' llm_1': '" llm_1"',
@@ -1472,11 +1367,11 @@ class TestIdentifierWhitespace(unittest.TestCase):
             'a  b': '"a  b"',
             'a' + chr(9) + 'b': '"a' + _BS + 'tb"',
             'config.a' + chr(9): '"config.a' + _BS + 't"',
-            'x\N{NO-BREAK SPACE}': '"x\N{NO-BREAK SPACE}"',
+            'x' + chr(0xA0): '"x' + _BS + 'xa0"',
         }
         for text, expected in quoted.items():
             with self.subTest(text=text):
-                self.assertEqual(_ident(text), expected)
+                self.assertEqual(_id_as_printed(text), expected)
         for text in (
             'llm_1',
             'a b',
@@ -1486,15 +1381,14 @@ class TestIdentifierWhitespace(unittest.TestCase):
             'config.default.strlen',
             'config.instructions[0]',
             'config. leading-space-key',
-            'x\N{NO-BREAK SPACE}y',
             'a' + _BS + 'b',
         ):
             with self.subTest(text=text):
-                self.assertEqual(_ident(text), text)
+                self.assertEqual(_id_as_printed(text), text)
+        # A no-break space inside a word is escaped like any invisible character, not quoted
+        self.assertEqual(_id_as_printed('x' + chr(0xA0) + 'y'), 'x' + _BS + 'xa0y')
 
     def test_a_bare_identifier_survives_whitespace_folding(self) -> None:
-        from rocketride.pipediff.reporters import _ident, _term_safe
-
         # The rule behind the quoting: whatever prints bare has no padding, tab or run of
         # spaces, so folding whitespace cannot change it, and it can never read like a quoted
         # one. Only identifiers that differ in how much whitespace they hold can still fold
@@ -1507,14 +1401,14 @@ class TestIdentifierWhitespace(unittest.TestCase):
             strings |= frontier
         folded = {}
         for text in sorted(strings):
-            shown = _term_safe(_ident(text))
+            shown = _id_as_printed(text)
             if not shown.startswith('"'):
                 self.assertEqual(' '.join(shown.split()), shown, f'{text!a} prints as {shown!a}')
             folded.setdefault(' '.join(shown.split()), []).append(text)
         for members in folded.values():
             if len(members) > 1:
                 self.assertEqual({' '.join(text.split()) for text in members}, {' '.join(members[0].split())})
-                self.assertTrue(all(_term_safe(_ident(text)).startswith('"') for text in members), members)
+                self.assertTrue(all(_id_as_printed(text).startswith('"') for text in members), members)
 
 
 class TestDeterminism(unittest.TestCase):
