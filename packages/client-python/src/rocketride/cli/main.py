@@ -746,12 +746,9 @@ def main() -> None:
     # The workspace .env must be in os.environ BEFORE the parser is
     # built — argparse defaults read it at construction time. Local-only
     # commands take no configuration, so they skip it: a .env they would not
-    # use must not be able to change what they compare, or add output to
-    # them. That includes a NO_COLOR set only in the .env, which `diff`
-    # therefore ignores (a NO_COLOR in the shell still applies). Every other
-    # command loads it, and a damaged .env (invalid UTF-8, NUL, text this
-    # process cannot store, unreadable) costs only its unusable lines, with
-    # a warning, rather than crashing the command; see load_dot_env.
+    # use must not be able to change what they compare or break them. That
+    # includes a NO_COLOR set only in the .env, which `diff` therefore ignores
+    # (a NO_COLOR in the shell still applies).
     if not _is_local_only_command(sys.argv[1:]):
         load_dot_env()
 
