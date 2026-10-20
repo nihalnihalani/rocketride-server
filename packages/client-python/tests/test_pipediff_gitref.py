@@ -1118,6 +1118,19 @@ def test_a_working_directory_that_is_gone_is_a_clean_error(monkeypatch):
         gitref._logical_cwd()
 
 
+@pytest.mark.skipif(os.name == 'nt', reason='Windows cannot remove the working directory of a running process')
+def test_resolve_git_ref_from_a_working_directory_that_is_gone(tmp_path, monkeypatch):
+    # The public entry point, not only the helper: realpath of a relative path
+    # needs the working directory before anything else runs
+    gone = tmp_path / 'gone'
+    gone.mkdir()
+    monkeypatch.chdir(gone)
+    gone.rmdir()
+
+    with pytest.raises(PipeDiffError, match='working directory is gone'):
+        resolve_git_ref('HEAD', 'rag.pipe')
+
+
 @pytest.mark.parametrize('failure', [PermissionError(13, 'Permission denied'), OSError(8, 'Exec format error')])
 def test_git_that_cannot_be_run_is_a_clean_error(monkeypatch, failure):
     # `git` is on PATH but cannot start (not executable, wrong architecture): not a traceback
