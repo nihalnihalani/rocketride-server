@@ -62,6 +62,25 @@ from .utils.env import (
 )
 
 
+class _SafeArgumentParser(argparse.ArgumentParser):
+    """
+    An argument parser whose error line is safe to show however the command line was written.
+
+    argparse repeats what it could not match (``unrecognized arguments: ...``), and an
+    argument can be a file name someone else chose: the pipe-diff Action passes the
+    changed files of a pull request, and pastes this stream into a comment. Control,
+    bidi, invisible and line-separator characters therefore print as escapes; text that
+    is already safe is unchanged. Sub-parsers are built from this class too.
+    """
+
+    def error(self, message: str):
+        """Print the usage and ``message`` with every unsafe character escaped, then exit with status 2."""
+        # Imported here so `rocketride --help` stays fast
+        from ..pipediff.reporters import _term_safe
+
+        super().error(_term_safe(message))
+
+
 def _add_connection_args(parser: argparse.ArgumentParser, *, json_arg: bool = True) -> None:
     """
     Add the development-connection options (``--uri``, ``--apikey``,
@@ -137,7 +156,7 @@ def setup_parser() -> argparse.ArgumentParser:
     Returns:
         The configured root parser.
     """
-    parser = argparse.ArgumentParser(
+    parser = _SafeArgumentParser(
         description='RocketRide Unified Pipeline and File Management CLI',
         epilog='Use "rocketride <command> --help" for command-specific help',
     )

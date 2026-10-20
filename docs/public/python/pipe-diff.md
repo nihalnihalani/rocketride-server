@@ -100,7 +100,11 @@ rocketride diff --git <ref> <file.pipe> [--include-layout] [--json | --markdown]
 **Exit codes:** `0` no semantic changes (or any successful run with
 `--exit-zero`); `1` semantic changes were found; `2` usage error, or an
 unreadable / unparseable file, or a bad git ref. Errors always go to stderr, so
-`--json` and `--markdown` output on stdout stays pure. `diff` reads no
+`--json` and `--markdown` output on stdout stays pure. Each error is one line,
+with control, bidi, invisible and line-separator characters taken from the
+inputs (an id, a path, a ref, an unrecognized argument) written as
+`\xNN`/`\uNNNN` escapes, so a crafted file cannot forge or reorder the error
+text a CI job pastes into a pull-request comment; ordinary text prints as typed. `diff` reads no
 configuration, so unlike the connected commands it does not load the workspace
 `.env`: a `NO_COLOR` set only there is ignored, while one in the shell
 environment still disables color.

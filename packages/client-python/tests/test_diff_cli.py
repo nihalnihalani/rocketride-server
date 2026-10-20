@@ -56,6 +56,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import unicodedata
 from types import SimpleNamespace
 
 import pytest
@@ -1082,6 +1083,280 @@ async def test_dispatch_routes_diff_to_run_diff(tmp_path, capsys):
     out = capsys.readouterr().out
     assert code == 1
     assert '+ c (qdrant)' in out
+
+
+# =========================================================================
+# Error lines cannot carry the inputs' control characters
+# =========================================================================
+#
+# An error message quotes what it was given: a component id, a path, a ref, a name git
+# echoes back. The pipe-diff Action pastes this stream into a pull-request comment, so a
+# crafted .pipe must not be able to print a forged `Error:` line (a line break), recolour
+# or hide text (ESC), or reorder it (bidi), whichever kind of error it provokes.
+#
+# The characters are built with chr(), so none of them is in this file.
+
+_ESC = chr(0x1B)
+_LF = chr(10)
+_RLO = chr(0x202E)  # right-to-left override
+_LS = chr(0x2028)  # line separator
+_BS = chr(92)
+
+# What an id holding all four prints as: each character spelled as a visible escape
+_CRAFTED = 'x' + _RLO + 'y' + _ESC + '[31mFAKE' + _LF + 'Error: forged' + _LS + 'z'
+_ESCAPED = 'x' + _BS + 'u202ey' + _BS + 'x1b[31mFAKE' + _BS + 'x0aError: forged' + _BS + 'u2028z'
+_UNSAFE_CATEGORIES = ('Cc', 'Cf', 'Zl', 'Zp')
+
+
+def _assert_one_safe_line(stderr):
+    """The stream is exactly one line, and none of its characters is a control, format or separator one."""
+    assert stderr.startswith('Error: ')
+    assert stderr.endswith('\n')
+    body = stderr[:-1]
+    assert [char for char in body if unicodedata.category(char) in _UNSAFE_CATEGORIES and char != '\t'] == []
+
+
+def _crafted_pipe(tmp_path, name, components):
+    path = tmp_path / name
+    path.write_text(json.dumps({'components': components}), encoding='utf-8')
+    return str(path)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('exit_zero', [False, True], ids=['normal', 'exit-zero'])
+@pytest.mark.parametrize(
+    'components',
+    [
+        pytest.param(
+            [{'id': _CRAFTED, 'provider': 'p'}, {'id': _CRAFTED, 'provider': 'p'}],
+            id='duplicate-id',
+        ),
+        pytest.param([{'id': _CRAFTED, 'provider': 'p', 'input': 'not a list'}], id='field-not-a-list'),
+    ],
+)
+async def test_error_naming_a_crafted_id_prints_it_as_escapes(tmp_path, capsys, components, exit_zero):
+    path = _crafted_pipe(tmp_path, 'crafted.pipe', components)
+
+    code = await _run(_diff_args([path, path], exit_zero=exit_zero))
+
+    captured = capsys.readouterr()
+    assert code == 2
+    assert captured.out == ''
+    _assert_one_safe_line(captured.err)
+    assert _ESCAPED in captured.err  # the id is there, readable, and harmless
+
+
+# What a name or a ref can hold depends on the process and the platform. ASCII controls (ESC, LF) are
+# spellable by any process on a POSIX filesystem and by none on Windows; the bidi override and the line
+# separator by any process but one whose filesystem encoding is ASCII (the engine's interpreter on Linux).
+# Each test says which it needs and skips only when the platform cannot hold it.
+_HOSTILE = {
+    'controls': (_ESC + '[31m' + _LF + 'Error: forged', _BS + 'x1b[31m' + _BS + 'x0aError: forged'),
+    'bidi': (_RLO + 'y' + _LS + 'z', _BS + 'u202ey' + _BS + 'u2028z'),
+}
+_KINDS = pytest.mark.parametrize('kind', ['controls', 'bidi'])
+
+
+def _hostile(kind):
+    """Return ``(text, how it must print)`` for the kind, or skip if this process cannot spell it as a name."""
+    raw, escaped = _HOSTILE[kind]
+    try:
+        os.fsencode(raw)
+    except UnicodeEncodeError:
+        pytest.skip(f'this process (filesystem encoding {sys.getfilesystemencoding()}) cannot spell that name')
+    return raw, escaped
+
+
+def _write_named(path, text):
+    try:
+        path.write_text(text, encoding='utf-8')
+    except OSError as exc:
+        pytest.skip(f'this filesystem cannot hold that file name: {exc}')
+
+
+@_KINDS
+@pytest.mark.asyncio
+async def test_error_naming_a_crafted_missing_path_prints_it_as_escapes(tmp_path, capsys, kind):
+    raw, escaped = _hostile(kind)
+    missing = str(tmp_path / ('no-such' + raw + '.pipe'))
+
+    code = await _run(_diff_args([missing, missing]))
+
+    captured = capsys.readouterr()
+    assert code == 2
+    _assert_one_safe_line(captured.err)
+    assert 'Pipe file not found' in captured.err or 'Could not read pipe file' in captured.err
+    assert 'no-such' + escaped + '.pipe' in captured.err
+
+
+@_KINDS
+@pytest.mark.asyncio
+async def test_error_naming_a_crafted_file_name_prints_it_as_escapes(tmp_path, capsys, kind):
+    raw, escaped = _hostile(kind)
+    path = tmp_path / ('bad' + raw + '.pipe')
+    _write_named(path, 'not json')
+
+    code = await _run(_diff_args([str(path), str(path)]))
+
+    captured = capsys.readouterr()
+    assert code == 2
+    _assert_one_safe_line(captured.err)
+    assert 'Invalid JSON in' in captured.err
+    assert 'bad' + escaped + '.pipe' in captured.err
+
+
+@_KINDS
+@pytest.mark.asyncio
+async def test_git_error_naming_a_crafted_path_prints_it_as_escapes(tmp_path, capsys, monkeypatch, kind):
+    # Not in a repository: the message says which path it looked at. (git must not look above the test directory.)
+    raw, escaped = _hostile(kind)
+    monkeypatch.setenv('GIT_CEILING_DIRECTORIES', str(tmp_path.parent))
+    path = tmp_path / ('plain' + raw + '.pipe')
+    _write_named(path, json.dumps(_old_pipe()))
+
+    code = await _run(_diff_args([str(path)], git='HEAD'))
+
+    captured = capsys.readouterr()
+    assert code == 2
+    assert captured.out == ''
+    _assert_one_safe_line(captured.err)
+    assert 'plain' + escaped + '.pipe' in captured.err
+
+
+@_KINDS
+@pytest.mark.skipif(shutil.which('git') is None, reason='git is unavailable')
+@pytest.mark.asyncio
+async def test_git_error_naming_a_crafted_link_prints_it_as_escapes(tmp_path, capsys, kind):
+    # A committed link, with a hostile name, that points outside the repository: the error names the link
+    raw, escaped = _hostile(kind)
+    repo = tmp_path / 'repo'
+    repo.mkdir()
+    (tmp_path / 'outside.pipe').write_text(json.dumps(_old_pipe()), encoding='utf-8')
+    name = 'cur' + raw + '.pipe'
+    try:
+        make_symlink(repo / name, '../outside.pipe')
+    except OSError as exc:
+        pytest.skip(f'this filesystem cannot hold that file name: {exc}')
+    init_repo(repo, name)
+
+    code = await _run(_diff_args([str(repo / name)], git='HEAD'))
+
+    captured = capsys.readouterr()
+    assert code == 2
+    assert captured.out == ''
+    _assert_one_safe_line(captured.err)
+    assert 'outside the repository' in captured.err
+    assert 'cur' + escaped + '.pipe' in captured.err
+
+
+@_KINDS
+@pytest.mark.skipif(shutil.which('git') is None, reason='git is unavailable')
+@pytest.mark.asyncio
+@pytest.mark.parametrize('option_like', [False, True], ids=['ref', 'ref-like-an-option'])
+async def test_git_error_naming_a_crafted_ref_prints_it_as_escapes(tmp_path, capsys, kind, option_like):
+    raw, _escaped = _hostile(kind)
+    path = _write_pipe(tmp_path, 'a.pipe', _old_pipe())
+    init_repo(tmp_path, 'a.pipe')
+
+    code = await _run(_diff_args([path], git=('-' if option_like else '') + 'x' + raw))
+
+    captured = capsys.readouterr()
+    assert code == 2
+    _assert_one_safe_line(captured.err)
+    assert 'Unknown git ref' in captured.err
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'error',
+    [
+        pytest.param(ValueError('usage: ' + _CRAFTED), id='usage'),
+        pytest.param(diff_module.PipeDiffError('library: ' + _CRAFTED), id='library'),
+    ],
+)
+async def test_every_error_class_goes_through_the_same_escaping(tmp_path, capsys, monkeypatch, error):
+    # Whatever raises inside input loading is reported by one function; prove the class does not matter
+    def boom(*_args, **_kwargs):
+        raise error
+
+    monkeypatch.setattr(diff_module, 'load_pipe', boom)
+    path = _write_pipe(tmp_path, 'a.pipe', _old_pipe())
+
+    code = await _run(_diff_args([path, path]))
+
+    captured = capsys.readouterr()
+    assert code == 2
+    _assert_one_safe_line(captured.err)
+    assert _ESCAPED in captured.err
+
+
+@pytest.mark.asyncio
+async def test_recursion_error_message_is_unchanged_by_the_escaping(tmp_path, capsys, monkeypatch):
+    def overflow(*_args, **_kwargs):
+        raise RecursionError('maximum recursion depth exceeded')
+
+    monkeypatch.setattr(diff_module, 'diff_pipes', overflow)
+    path = _write_pipe(tmp_path, 'a.pipe', _old_pipe())
+
+    code = await _run(_diff_args([path, path]))
+
+    assert code == 2
+    assert capsys.readouterr().err == f'Error: {diff_module._TOO_DEEP}\n'
+
+
+@pytest.mark.asyncio
+async def test_ordinary_error_text_prints_exactly_as_before(tmp_path, capsys):
+    missing = str(tmp_path / 'plain name (1).pipe')
+
+    code = await _run(_diff_args([missing, missing]))
+
+    assert code == 2
+    assert capsys.readouterr().err == f'Error: Pipe file not found: {missing}\n'
+
+
+def test_fail_leaves_text_that_is_already_safe_alone(capsys):
+    # Normalised accented text, CJK, a tab, a Windows path and a quote are all ordinary
+    message = 'caf' + chr(0xE9) + ' ' + chr(0x65E5) + chr(0x672C) + chr(9) + 'C:' + _BS + 'Users' + _BS + "x's.pipe"
+
+    assert diff_module._fail(message) == 2
+
+    assert capsys.readouterr().err == f'Error: {message}\n'
+
+
+def test_crafted_ids_reach_stderr_as_escapes_through_the_real_entry_point(tmp_path):
+    (tmp_path / 'a.pipe').write_text(
+        json.dumps({'components': [{'id': _CRAFTED, 'provider': 'p'}, {'id': _CRAFTED, 'provider': 'p'}]}),
+        encoding='utf-8',
+    )
+
+    result = _cli_subprocess(tmp_path, ['a.pipe', 'a.pipe', '--markdown'])
+
+    assert result.returncode == 2
+    assert result.stdout == ''
+    _assert_one_safe_line(result.stderr)
+    assert _ESCAPED in result.stderr
+
+
+def test_a_crafted_argument_reaches_stderr_as_escapes_through_the_real_entry_point(tmp_path):
+    # The Action passes the changed files of a pull request as arguments, and a name that begins with a dash
+    # is one argparse cannot match: it repeats it, and the usage error is a line of that same stream. The
+    # arguments are set inside the child (as the .env tests do) so the test needs no non-ASCII argv.
+    # (argparse takes an argument with a space in it for a file name, so this one has none)
+    argv = ['diff', '--git', 'HEAD', '-' + _CRAFTED.replace(' ', '')]
+    prelude = f'sys.argv = {["rocketride", *argv]!r}; '
+
+    result = _cli_subprocess(tmp_path, [], prelude=prelude)
+
+    assert result.returncode == 2
+    assert result.stdout == ''
+    assert 'Traceback' not in result.stderr
+    lines = result.stderr.splitlines()
+    assert lines[-1].startswith('rocketride diff: error: ') or lines[-1].startswith('rocketride: error: ')
+    assert len([line for line in lines if 'error:' in line]) == 1  # no forged second error line
+    assert [
+        char for char in result.stderr if unicodedata.category(char) in _UNSAFE_CATEGORIES and char != chr(10)
+    ] == []
+    assert '-' + _ESCAPED.replace(' ', '') in lines[-1]
 
 
 if __name__ == '__main__':

@@ -237,7 +237,8 @@ binary64 value compare equal; integer literals remain exact within the JSON
 decoder's size limit. These rules also apply to Git blobs. Excessive nesting
 that exceeds parsing, comparison, or reporting limits returns an actionable
 error on stderr with exit `2` and empty stdout. `--exit-zero` does not suppress
-errors.
+errors. Each error is one line, with control, bidi, invisible and line-separator
+characters taken from the inputs written as `\xNN`/`\uNNNN` escapes.
 
 #### What counts as a change
 
