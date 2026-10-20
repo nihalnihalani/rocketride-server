@@ -189,7 +189,9 @@ writes. Your options, in order of preference:
   to diff.
 - **Untrusted content.** File paths and CLI error text come from the pull
   request, so they are rendered inside code spans / a fenced block and stripped
-  of newlines before they reach a workflow-command annotation.
+  of newlines before they reach a workflow-command annotation. The CLI already
+  writes each error as one line with control, bidi and invisible characters
+  escaped.
 - **Failure semantics.** The action does **not** fail merely because semantic
   changes exist — it is informational. It **does** fail (and emits an `error`
   annotation) when a changed `.pipe` file cannot be parsed or diffed, so a broken

@@ -71,7 +71,7 @@ from ...pipediff import (
     load_pipe,
     resolve_git_ref,
 )
-from ...pipediff.reporters import render_human, render_json, render_markdown
+from ...pipediff.reporters import _term_safe, render_human, render_json, render_markdown
 
 
 # An empty pipeline used as the "old" side when --git names a ref in which the
@@ -111,13 +111,21 @@ def _fail(message: str) -> int:
     Errors are always written to stderr so that ``--json`` and ``--markdown``
     output on stdout stays pure and machine-parseable.
 
+    The message is escaped the way the human report is. It can carry text taken
+    from the inputs - a component id, a path, a ref, a name git echoes back - and
+    the pipe-diff Action pastes this stream into a pull-request comment, so a
+    crafted ``.pipe`` must not be able to print control, bidi, invisible or
+    line-separator characters there (a forged ``Error:`` line, a recoloured or
+    reordered block). They print as ``\\x1b`` / ``\\u202e`` escapes; ordinary text
+    is unchanged.
+
     Args:
         message: Human-readable error description.
 
     Returns:
         The integer exit code ``2``.
     """
-    print(f'Error: {message}', file=sys.stderr)
+    print(f'Error: {_term_safe(message)}', file=sys.stderr)
     return 2
 
 
