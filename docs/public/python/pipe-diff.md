@@ -179,6 +179,12 @@ never reads like its composed twin. When the two sides of a change differ only
 in a compatibility look-alike (a full-width digit, the `fi` ligature), both
 sides are JSON-quoted with every non-ASCII character written as a `\uNNNN`
 escape.
+A string is also JSON-quoted when it holds text that reads like one of these
+escapes (the six characters `\u202e` print as `"\\u202e"`) or starts with a
+quote. Node ids, edge endpoints and lanes, and config paths are quoted the same
+way, and only in those cases, so a real U+202E and the six characters `\u202e`
+never print alike, even on a console that writes the character as `\u202e`
+itself.
 
 `--json` emits one stable document with sorted keys — `edges`, `nodes`, a
 `summary` block with counts and the overall `has_semantic_changes` flag, and
