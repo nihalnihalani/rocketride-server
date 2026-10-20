@@ -975,6 +975,21 @@ def test_load_pipe_keeps_normal_binary64_rounding(tmp_path):
     assert diff_pipes(load_pipe(old_path), load_pipe(new_path)).has_semantic_changes is False
 
 
+def test_a_repeated_json_key_means_its_last_value(tmp_path):
+    # Python's json, JSON.parse and the engine's own reader (jsoncpp, with
+    # rejectDupKeys off) all keep the last value of a repeated key, so the diff
+    # compares exactly what the engine would run. A stricter parser would have to
+    # be a deliberate change, so the policy is pinned here.
+    path = tmp_path / 'repeated.pipe'
+    path.write_text(
+        '{"components": [{"id": "a", "provider": "x", "provider": "y", "config": {"k": 1, "k": 2}}]}',
+        encoding='utf-8',
+    )
+    component = load_pipe(str(path))['components'][0]
+    assert component['provider'] == 'y'
+    assert component['config'] == {'k': 2}
+
+
 @pytest.mark.parametrize('error', [ValueError('integer exceeds decoder limit'), RecursionError('JSON nesting limit')])
 def test_load_pipe_decoder_limits_are_contextual_pipediff_errors(tmp_path, monkeypatch, error):
     path = tmp_path / 'limited.pipe'
@@ -1303,23 +1318,141 @@ def test_malformed_grouped_children_are_rejected(child, message):
         load_pipe(_pipe([_group('group_1', [child])]))
 
 
+def test_duplicate_id_message_names_both_locations_at_every_nesting_level():
+    # The location text is spelled only for the component that fails; pin what it says.
+    pipe = _pipe([_group('g1', [_child('x', 'p', 'g1')]), _group('g2', [_child('x', 'p', 'g2')])])
+    with pytest.raises(PipeDiffError) as error:
+        load_pipe(pipe)
+    assert str(error.value) == (
+        "<dict>: duplicate component id 'x' at 'g2' config.pipeline.components[0] "
+        "(already used at 'g1' config.pipeline.components[0])"
+    )
+    pipe = _pipe([_node('x', 'p'), _node('y', 'p'), _node('x', 'p')])
+    with pytest.raises(PipeDiffError) as error:
+        load_pipe(pipe)
+    assert str(error.value) == "<dict>: duplicate component id 'x' at index 2 (already used at index 0)"
+
+
+def test_components_are_walked_in_document_order_with_their_parent_and_index():
+    inner = _group('inner', [_child('c', 'p', 'inner'), _child('d', 'p', 'inner')])
+    outer = _group('outer', [_child('a', 'p', 'outer'), inner, _child('b', 'p', 'outer')])
+    pipe = _pipe([_node('first', 'p'), outer, _node('last', 'p')])
+
+    walked = [(c['id'], p and p['id'], i) for c, p, i in _pipejson.iter_components(pipe)]
+
+    assert walked == [
+        ('first', None, 0),
+        ('outer', None, 1),
+        ('a', 'outer', 0),
+        ('inner', 'outer', 1),
+        ('c', 'inner', 0),
+        ('d', 'inner', 1),
+        ('b', 'outer', 2),
+        ('last', None, 2),
+    ]
+    assert [_pipejson.describe_location(p, i) for _c, p, i in _pipejson.iter_components(pipe)][:4] == [
+        'index 0',
+        'index 1',
+        "'outer' config.pipeline.components[0]",
+        "'outer' config.pipeline.components[1]",
+    ]
+
+
+def test_a_long_group_id_is_not_repeated_for_every_child():
+    # Every child's location used to be spelled out up front, group id included, so a
+    # group with a long id and many children cost their product in memory: a 269 KB
+    # file (a 100,000-character id, 5,000 children) peaked at 500 MB, and the cost
+    # grows with the product of the two. Validation now keeps only the ids it has
+    # seen, and the walk keeps one iterator per nesting level.
+    group_id = 'g' * 100_000
+    pipe = _pipe([_group(group_id, [{'id': f'c{index}', 'provider': 'p'} for index in range(2_000)])])
+    tracemalloc.start()
+    try:
+        loaded = load_pipe(pipe)
+        diff_pipes(loaded, loaded)
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+    assert peak < 20_000_000, f'peak {peak / 1e6:.1f} MB'
+
+
+def test_a_long_group_id_in_a_file_is_not_repeated_for_every_child(tmp_path):
+    group_id = 'g' * 100_000
+    path = tmp_path / 'wide-group.pipe'
+    path.write_text(
+        json.dumps(_pipe([_group(group_id, [{'id': f'c{index}', 'provider': 'p'} for index in range(2_000)])])),
+        encoding='utf-8',
+    )
+    tracemalloc.start()
+    try:
+        load_pipe(str(path))
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+    assert peak < 20_000_000, f'peak {peak / 1e6:.1f} MB'
+
+
 # ---------------------------------------------------------------------------
 # Module boundaries
 # ---------------------------------------------------------------------------
 
 
+_PACKAGE = 'rocketride.pipediff'
+
+
+def _siblings_imported_by(source):
+    """``{sibling: {imported names}}`` for every way ``source`` can import a pipediff sibling.
+
+    Covers ``from .x import a``, ``from . import x``, ``from rocketride.pipediff.x import a``,
+    ``from rocketride.pipediff import x`` and ``import rocketride.pipediff.x``, so an absolute
+    import cannot slip past a check that only looks at the relative form.
+    """
+    found = {}
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.ImportFrom):
+            if node.level == 1 and node.module:
+                found.setdefault(node.module, set()).update(alias.name for alias in node.names)
+            elif node.level == 1 or (node.level == 0 and node.module == _PACKAGE):
+                for alias in node.names:
+                    found.setdefault(alias.name, set())
+            elif node.level == 0 and node.module and node.module.startswith(_PACKAGE + '.'):
+                sibling = node.module[len(_PACKAGE) + 1 :].split('.')[0]
+                found.setdefault(sibling, set()).update(alias.name for alias in node.names)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name.startswith(_PACKAGE + '.'):
+                    found.setdefault(alias.name[len(_PACKAGE) + 1 :].split('.')[0], set())
+    return found
+
+
 def _sibling_imports():
-    """``{module: {sibling: {imported names}}}`` for every ``from .x import ...`` in the package."""
+    """``{module: {sibling: {imported names}}}`` for every pipediff module that imports a sibling."""
     package_dir = Path(rocketride.pipediff.__file__).parent
     found = {}
     for source in sorted(package_dir.glob('*.py')):
         if source.name == '__init__.py':
             continue
-        imports = found.setdefault(source.stem, {})
-        for node in ast.walk(ast.parse(source.read_text(encoding='utf-8'))):
-            if isinstance(node, ast.ImportFrom) and node.level == 1 and node.module:
-                imports.setdefault(node.module, set()).update(alias.name for alias in node.names)
+        found[source.stem] = _siblings_imported_by(source.read_text(encoding='utf-8'))
     return found
+
+
+def test_the_import_scan_sees_every_form_of_sibling_import():
+    source = (
+        'from .engine import a, _b\n'
+        'from . import gitref, model\n'
+        'from rocketride.pipediff.reporters import _c\n'
+        'from rocketride.pipediff import _pipejson\n'
+        'import rocketride.pipediff.model\n'
+        'import json\n'
+        'from rocketride.cli import main\n'
+    )
+    assert _siblings_imported_by(source) == {
+        'engine': {'a', '_b'},
+        'gitref': set(),
+        'model': set(),
+        'reporters': {'_c'},
+        '_pipejson': set(),
+    }
 
 
 def test_pipediff_modules_share_helpers_only_through_private_modules():

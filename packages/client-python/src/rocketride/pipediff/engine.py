@@ -414,7 +414,7 @@ def _index_pipe(pipe: dict) -> _PipeIndex:
     """
     components: dict[str, dict] = {}
     edges: set[tuple[Any, Any, Any]] = set()
-    for component, _where in iter_components(pipe):
+    for component, _parent, _index in iter_components(pipe):
         to_id = component['id']
         components[to_id] = component
         for wire in component.get('input') or []:
@@ -540,7 +540,7 @@ def _layout_block(value: Any) -> Any:
     so ``viewport: false`` versus ``viewport: {}`` reported no change and exited
     ``0`` even under ``--include-layout``.
 
-    Validation deliberately stays out of this: :func:`_validate_pipe` rejects only
+    Validation deliberately stays out of this: :func:`validate_pipe` rejects only
     shapes the diff cannot process (a non-object component, a non-list
     ``components``/wire collection, an unhashable wire endpoint). A scalar
     ``viewport``/``ui`` processes fine — :func:`_diff_value` falls back to an

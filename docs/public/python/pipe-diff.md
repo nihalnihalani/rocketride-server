@@ -114,7 +114,8 @@ decoder's size limit. The same rules apply to files read from Git; an
 already-parsed `dict` must also contain only finite floats. Excessive nesting
 that exceeds the parser, comparison, or renderer limit produces an actionable
 error on stderr with exit `2` and no report on stdout. `--exit-zero` does not
-suppress these errors.
+suppress these errors. A key repeated within one JSON object keeps its last
+value, as in `json.loads`, `JSON.parse`, and the engine's own reader.
 
 `--json` here is a **format flag** — a whole JSON document on stdout — not the
 shared `--json [FILE]` result envelope the connected subcommands use. That
@@ -302,7 +303,7 @@ if diff.has_semantic_changes:
 | `diff_pipes(old, new, *, include_layout=False)` | Compare two loaded pipelines and return a `PipeDiff`. `include_layout` folds each node's `ui` differences into its field changes and enumerates the top-level `viewport` into `PipeDiff.viewport_changes`. Raises `PipeDiffError` when a pipeline value is nested too deeply, or refers to itself, so that it cannot be compared or reported. |
 | `deep_diff_config(old, new)` | Deep-diff two config dicts into a list of `FieldChange` with dotted paths (`None` is treated as an empty dict). The building block `diff_pipes` uses per node. Raises `PipeDiffError` when a config value is nested too deeply, or refers to itself, so that it cannot be compared or reported. |
 | `resolve_git_ref(ref, file_path)` | Return the parsed pipeline at a git ref via `git show <ref>:<path>`, or `None` when the file does not exist in that ref. Raises `PipeDiffError` when the path is outside a repository, the ref is unknown, `git` is unavailable or times out, or the retrieved contents are not a valid pipeline. Arguments are passed as an argv list (never a shell string). |
-| `PipeDiffError` | The single exception type the package raises. The CLI maps it to exit code `2`. |
+| `PipeDiffError` | The single exception type the package raises for input problems: an unreadable, malformed, or structurally invalid pipeline, a non-finite number, a duplicate id, or a value nested too deeply or referring to itself. The CLI maps it to exit code `2`. `diff_pipes` expects the dicts `load_pipe` returns; passing anything else raises the ordinary `AttributeError` or `TypeError`. |
 
 ### Data model
 
