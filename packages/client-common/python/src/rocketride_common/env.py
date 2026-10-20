@@ -76,6 +76,9 @@ ENV_DEPLOY_APIKEY = 'ROCKETRIDE_DEPLOY_APIKEY'
 # The names the clients read from, and decide by, the connection pairs
 _CONNECTION_KEYS = frozenset({ENV_DEV_URI, ENV_DEV_APIKEY, ENV_DEPLOY_URI, ENV_DEPLOY_APIKEY})
 
+# What a refusal says helps when the file is what is wrong with it
+_FIX_THE_FILE = 'Fix or remove it, then run the command again.'
+
 # The standard hard-stop message for a missing deploy pair
 NO_DEPLOY_TARGET_MESSAGE = 'No deployment target configured. Set ROCKETRIDE_DEPLOY_URI / ROCKETRIDE_DEPLOY_APIKEY (or pass --uri/--apikey) - the development connection is never a deploy fallback.'
 
@@ -234,22 +237,27 @@ def _read_assignments(env_path: str, problems: List[str]) -> List[Tuple[int, str
         # os.environ raises ValueError on a NUL in a name or value (a UTF-16 file
         # reads as valid UTF-8 full of them): skip the line rather than crash
         has_nul = '\0' in pair[0] or '\0' in pair[1]
-        if damaged:
-            invalid_lines.append(number)
+        # A line is counted once, under the more telling reason: a UTF-16 file's first
+        # line is both invalid UTF-8 (the byte-order mark) and full of NULs
         if has_nul:
             nul_lines.append(number)
-        if not (damaged or has_nul):
+        elif damaged:
+            invalid_lines.append(number)
+        else:
             assignments.append((number, pair[0], pair[1]))
 
     if first_invalid is not None:
         offset, number = first_invalid
-        effect = (
-            f'{_count(len(invalid_lines), "assignment line")} holding invalid bytes '
-            f'{"was" if len(invalid_lines) == 1 else "were"} skipped (first on line {invalid_lines[0]})'
-            if invalid_lines
-            else 'no assignment line is affected'
-        )
-        problems.append(f'is not valid UTF-8 (first invalid byte at offset {offset}, on line {number}); {effect}')
+        if invalid_lines:
+            effect = (
+                f'; {_count(len(invalid_lines), "assignment line")} holding invalid bytes '
+                f'{"was" if len(invalid_lines) == 1 else "were"} skipped (first on line {invalid_lines[0]})'
+            )
+        elif nul_lines:
+            effect = ''  # the lines with invalid bytes are among those reported just below
+        else:
+            effect = '; no assignment line is affected'
+        problems.append(f'is not valid UTF-8 (first invalid byte at offset {offset}, on line {number}){effect}')
     if nul_lines:
         problems.append(
             f'has {_count(len(nul_lines), "assignment line")} containing NUL characters, which '
@@ -334,9 +342,9 @@ def load_dot_env(cwd: Optional[str] = None) -> None:
         _warn(env_path, problems)
 
 
-def _unfaithful_reason(raw: bytes) -> Optional[str]:
+def _unfaithful_reason(raw: bytes) -> Optional[Tuple[str, str]]:
     """
-    Say why rewriting ``raw`` as UTF-8 text would not preserve it, or ``None``.
+    Say why rewriting ``raw`` as UTF-8 text would not preserve it, and what helps, or ``None``.
 
     The reason names the problem and a position, never any content. A connection
     variable this process cannot store is a reason too: the reader skipped it, so
@@ -347,16 +355,22 @@ def _unfaithful_reason(raw: bytes) -> Optional[str]:
     try:
         raw.decode('utf-8')
     except UnicodeDecodeError as exc:
-        return f'it is not valid UTF-8 (first invalid byte at offset {exc.start}, on line {_line_of(raw, exc.start)})'
+        return (
+            f'it is not valid UTF-8 (first invalid byte at offset {exc.start}, on line {_line_of(raw, exc.start)})',
+            _FIX_THE_FILE,
+        )
     nul = raw.find(b'\0')
     if nul >= 0:
-        return f'it contains a NUL character (first on line {_line_of(raw, nul)}; is the file UTF-16?)'
+        return f'it contains a NUL character (first on line {_line_of(raw, nul)}; is the file UTF-16?)', _FIX_THE_FILE
     for number, _offset, line in _byte_lines(raw):
         pair = parse_env_line(line.decode('utf-8'))
         if pair and pair[0] in _CONNECTION_KEYS and not _storable(pair[1]):
+            # The file is fine: it is this process that cannot hold the value, so the advice is about the process
             return (
                 'it assigns a connection variable a value this process cannot store in its environment '
-                f'(filesystem encoding {sys.getfilesystemencoding()}, on line {number})'
+                f'(filesystem encoding {sys.getfilesystemencoding()}, on line {number})',
+                'Nothing is wrong with the file: run the command in a UTF-8 locale '
+                '(for example LC_ALL=C.UTF-8), or write that value in ASCII.',
             )
     return None
 
@@ -372,20 +386,21 @@ def _read_for_update(env_path: str) -> Optional[str]:
     """
     if not os.path.exists(env_path):
         return None
-    reason: Optional[str] = None
+    refusal: Optional[Tuple[str, str]] = None
     raw = b''
     if not os.path.isfile(env_path):
-        reason = 'it is not a regular file'
+        refusal = 'it is not a regular file', _FIX_THE_FILE
     else:
         try:
             with open(env_path, 'rb') as f:
                 raw = f.read()
         except OSError as exc:
-            reason = f'it cannot be read ({exc.strerror or type(exc).__name__})'
+            refusal = f'it cannot be read ({exc.strerror or type(exc).__name__})', _FIX_THE_FILE
         else:
-            reason = _unfaithful_reason(raw)
-    if reason is not None:
-        raise DotEnvError(f'Refusing to update {env_path}: {reason}. Fix or remove it, then run the command again.')
+            refusal = _unfaithful_reason(raw)
+    if refusal is not None:
+        reason, advice = refusal
+        raise DotEnvError(f'Refusing to update {env_path}: {reason}. {advice}')
     return raw.decode('utf-8')
 
 
