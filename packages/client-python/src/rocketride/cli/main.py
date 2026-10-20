@@ -730,9 +730,9 @@ def main() -> None:
     # use must not be able to change what they compare, or add output to
     # them. That includes a NO_COLOR set only in the .env, which `diff`
     # therefore ignores (a NO_COLOR in the shell still applies). Every other
-    # command loads it, and an unusable .env (not UTF-8, unreadable) is
-    # ignored with a warning there rather than crashing the command; see
-    # load_dot_env.
+    # command loads it, and a damaged .env (invalid UTF-8, NUL, text this
+    # process cannot store, unreadable) costs only its unusable lines, with
+    # a warning, rather than crashing the command; see load_dot_env.
     if not _is_local_only_command(sys.argv[1:]):
         load_dot_env()
 
