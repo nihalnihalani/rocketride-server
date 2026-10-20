@@ -92,8 +92,8 @@ SQLAlchemy adds after it: the `[SQL: ...]` / `[parameters: ...]` echo, its
 this error ...)` link. The message is cut at those markers and nowhere else, so
 MySQL's wording comes back whole:
 
-- A `SIGNAL`'s `MESSAGE_TEXT` is your application's text and is returned
-  exactly as written, whatever words it contains: `Upload failed at position 3
+- A `SIGNAL`'s `MESSAGE_TEXT` is your application's text and is returned as
+  written, cut only at SQLAlchemy's markers above: `Upload failed at position 3
   of batch` is not cut at `position`.
 - A syntax error (1064) quotes the statement from the point where the parser
   stopped: `near '...' at line N` holds the rest of the statement, up to 80
@@ -117,7 +117,8 @@ places where ClickHouse repeats the statement or the rest of its input are
 removed (the `db_clickhouse` README lists them). A `SIGNAL` whose text merely
 contains `DB::Exception:` is still MySQL's own text and stays whole. One that
 copies ClickHouse's whole prefix, errno included, is indistinguishable and is
-cut the same way, so some of its text can be lost; nothing is added.
+cut the same way, so some of its text can be lost; no part of the statement
+is added.
 
 A failed statement does **not** roll the session back. The session stays open
 and MySQL leaves its transaction usable, so a later `commit` persists the work
