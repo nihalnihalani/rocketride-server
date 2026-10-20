@@ -39,9 +39,8 @@ JSON output stable for snapshot tests and keeps PR comments from churning.
 Design notes:
     - The renderers are intentionally *read-only* over the diff model: they never
       construct model objects, so they depend on the model dataclasses for typing
-      only (guarded by ``TYPE_CHECKING``). This keeps the pipediff library free of
-      import-time coupling between the reporters and the engine, and lets the
-      module load even while sibling modules are still being written.
+      only (guarded by ``TYPE_CHECKING``). This keeps the reporters free of
+      import-time coupling to the engine.
     - ANSI color constants are defined locally rather than imported from
       ``rocketride.cli.ui.colors``. The pipediff package is a library that the CLI
       depends on; importing back into the CLI would invert that layering. The
@@ -256,16 +255,16 @@ def _fmt_value(value: Any) -> str:
     Strings are returned bare; every other JSON type (numbers, booleans, ``None``,
     dicts, lists) is serialized with ``json.dumps`` so the type stays unambiguous
     (``null``/``true``/``false``) and nested structures render deterministically.
-    A string is JSON-quoted instead when bare text would misread it: when it
-    is empty (it would print as nothing), has leading or trailing whitespace (it
-    would look trimmed), would itself read as a JSON value (``"true"``,
-    ``"512"``, ``"null"``, or the two-character ``""``), or holds a character
-    the renderers escape (a real U+202E and the six characters ``\\u202e``
-    would otherwise print alike), or holds text that reads like one of those
-    escapes (``\\u202e`` itself; see :data:`_ESCAPE_LOOKALIKE`), or starts with a
-    quote (so a bare string never reads as a quoted one, even after a console has
-    rewritten it). So ``"true"`` and ``true`` never print alike, and neither does an
-    escaped character and the text of its escape.
+
+    A string is JSON-quoted instead when bare text would misread it: when it is
+    empty (it would print as nothing), has leading or trailing whitespace (it would
+    look trimmed), would itself read as a JSON value (``"true"``, ``"512"``,
+    ``"null"``, or the two-character ``""``), holds a character the renderers
+    escape, holds text that reads like one of those escapes (see
+    :data:`_ESCAPE_LOOKALIKE`), or starts with a quote (so a bare string never reads
+    as a quoted one, even after a console has rewritten it). So ``"true"`` and
+    ``true`` never print alike, and neither does an escaped character and the text
+    of its escape.
     """
     if isinstance(value, str):
         return json.dumps(value, ensure_ascii=False) if _reads_ambiguously(value) else value
@@ -804,35 +803,20 @@ def _md_cell(text: str) -> str:
     renders it verbatim. A literal newline ends the row, so it is folded to a
     space.
 
-    **Exactly one backslash is added per pipe, whatever already precedes it** --
-    a backslash sitting immediately before a pipe is not a special case. In
+    **Exactly one backslash is added per pipe, whatever already precedes it.** In
     cmark-gfm, the parser GitHub runs, the table-cell scanner accepts either a
     lone backslash or a backslash-escaped punctuation pair and takes the longest
-    match, so a run of *n* backslashes before a pipe always parses as *n - 1*
-    lone backslashes followed by the escaped pair ``\\|``. For every *n* >= 1 the
-    pipe is escaped and the row does **not** split; unescaping then strips that
-    one backslash and leaves *n - 1* for the code span to print verbatim. So the
-    value ``\\|`` is emitted as ``\\\\|`` and renders back as ``\\|``. Doubling
-    the run as well (emitting ``\\\\\\|``) would still not split the row -- it
-    would render a spurious extra backslash.
+    match, so a run of *n* backslashes before a pipe always parses as *n - 1* lone
+    backslashes followed by the escaped pair: the pipe is escaped and the row does
+    not split. Unescaping then strips that one backslash and leaves *n - 1* for the
+    code span to print verbatim. Doubling the run as well would still not split the
+    row; it would render a spurious extra backslash.
 
-    Backslashes not adjacent to a pipe are deliberately **not** touched. Inside a
-    code span the inline parser performs no backslash unescaping, so doubling them
-    was emitted verbatim: ``C:\\Users\\alice`` rendered as ``C:\\\\Users\\\\alice``.
+    Backslashes not adjacent to a pipe are left alone: inside a code span the inline
+    parser performs no backslash unescaping, so doubling them would show up doubled.
 
-    ``test_pipediff_reporters.py`` pins both halves of this: the exact bytes this
-    function emits, and that each of them splits back to the original value in a
-    row that keeps its column count. That second half is checked twice over the
-    same corpus -- once by applying the scanner rule directly, so it runs on any
-    interpreter, and once by rendering the row through ``cmarkgfm`` (the same
-    cmark-gfm GitHub renders comments with), which decides the question rather
-    than restating our model of it. CI runs both: ``cmarkgfm`` is installed into
-    the engine interpreter from ``packages/client-python/tests/requirements.txt``
-    by the ``client-python:setup-test-deps`` step, so the renderer cross-check is
-    only skipped on a local interpreter that lacks it.
-
-    This function assumes code-span input; plain text with backslashes would need
-    a different escape, and no caller passes any.
+    This function assumes code-span input; plain text with backslashes would need a
+    different escape, and no caller passes any.
     """
     return str(text).replace('|', '\\|').replace('\n', ' ')
 

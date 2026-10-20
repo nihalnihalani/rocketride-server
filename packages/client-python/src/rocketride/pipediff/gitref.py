@@ -123,10 +123,8 @@ def resolve_git_ref(ref: str, file_path: str) -> dict | None:
 
     # "Ref unknown" and "path absent from a known ref" must not be confused: the
     # first is a user error (exit 2), the second means "everything is new". Both
-    # are decided on a git exit code, never on the wording of git's diagnostic —
-    # a ref whose *name* contains a phrase like "does not exist in" is echoed
-    # back in that diagnostic, and matching on it would silently downgrade a bad
-    # ref into an all-added diff.
+    # are decided on a git exit code, never on the wording of git's diagnostic,
+    # which echoes the ref's own name back.
     verified = _run_git(
         ['-C', repo_root, 'rev-parse', '--verify', '--quiet', f'{ref}^{{commit}}'],
         f'verifying ref {ref}',

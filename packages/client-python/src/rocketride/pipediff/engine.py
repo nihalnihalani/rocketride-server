@@ -72,16 +72,15 @@ from typing import Any, NamedTuple
 from ._pipejson import PipeDiffError, group_children, iter_components, json_equal, parse_pipe_json, validate_pipe
 from .model import EdgeChange, FieldChange, NodeChange, PipeDiff
 
-# What this module documents (see the module docstring): the entry points and the
-# error they raise. Pinned so that names imported here from the shared private
-# module do not leak out through ``from ...engine import *``.
+# The entry points and the error they raise; the other names imported from the
+# shared private module are not engine API.
 __all__ = ['PipeDiffError', 'deep_diff_config', 'diff_pipes', 'load_pipe']
 
 # Message for a comparison that exhausts the interpreter's recursion limit.
 _TOO_DEEP = 'Pipeline nesting is too deep to compare'
 
-# Messages for a value that exists on one side only, so is never compared, but that
-# the diff would have to carry into every report (see :func:`_require_reportable`).
+# Messages for a value that exists on one side only: it is never compared, but the
+# diff carries it into every report (see :func:`_require_reportable`).
 _CYCLIC_VALUE = 'Pipeline contains a value that refers to itself, which cannot be reported'
 _TOO_DEEP_TO_REPORT = 'Pipeline contains a value nested too deeply to report'
 
@@ -140,9 +139,8 @@ def _validate_finite_numbers(obj: Any, source: str) -> None:
     seen set also keeps shared or cyclic in-memory containers from looping.
 
     Each pending value carries only a link to its parent's breadcrumb, and the
-    readable path is built for the one value that fails. Building every path up
-    front made memory grow with depth squared (about 200 MB for a 2 MB pipe of
-    deep, wide, long-keyed config).
+    readable path is built for the one value that fails, so memory stays
+    proportional to the size of the input.
     """
     pending: list[tuple[Any, Any]] = [(obj, None)]
     seen = set()
@@ -245,8 +243,7 @@ def diff_pipes(old: dict, new: dict, *, include_layout: bool = False) -> PipeDif
     Exactly three top-level keys are read -- ``components``, ``version``, and
     ``viewport``. Every other top-level key a ``.pipe`` carries (``project_id``,
     ``isLocked``, and anything a later schema adds) is ignored, because it is
-    editor/session metadata rather than pipeline behaviour; pinned by
-    ``test_unknown_top_level_keys_are_ignored``.
+    editor/session metadata rather than pipeline behaviour.
 
     Args:
         old: The previous pipeline (already loaded/validated via ``load_pipe``).
@@ -280,9 +277,8 @@ def diff_pipes(old: dict, new: dict, *, include_layout: bool = False) -> PipeDif
 def _diff_pipes(old: dict, new: dict, include_layout: bool) -> PipeDiff:
     """Compute the diff for :func:`diff_pipes`, which converts recursion failures."""
     # One walk per pipeline yields everything the comparison needs about its
-    # components. The index lives only for this call: nothing is cached on, or
-    # attached to, the caller's dicts, so editing them and diffing again sees the
-    # edit.
+    # components. The index lives only for this call; nothing is attached to the
+    # caller's dicts.
     old_index = _index_pipe(old)
     new_index = _index_pipe(new)
     old_components = old_index.components
@@ -345,19 +341,15 @@ def _diff_pipes(old: dict, new: dict, include_layout: bool) -> PipeDiff:
     old_version = old.get('version')
     new_version = new.get('version')
     # Compared with :func:`json_equal`, not ``!=``: Python treats ``False == 0``
-    # and ``True == 1``, so a plain ``!=`` missed a ``1`` -> ``true`` (or
-    # ``0`` -> ``false``) edit and reported no version change at all — the diff
-    # then exited 0 on a file whose version really had changed type.
+    # and ``True == 1``.
     if not json_equal(old_version, new_version):
         version_change = (old_version, new_version)
 
     layout_changed = _layout_changed(old, new, old_components, new_components, old_ids & new_ids)
 
     # The top-level viewport is layout, so it is enumerated only when the caller
-    # opts layout in. Doing so is what makes `--include-layout` match its
-    # documented contract: a viewport-only edit then reports concrete
-    # `viewport.*` paths and counts as a change (exit 1) instead of exiting 0
-    # with nothing to show.
+    # opts layout in; a viewport-only edit then reports concrete `viewport.*`
+    # paths and counts as a change.
     viewport_changes: list[FieldChange] = []
     if include_layout:
         viewport_changes = _diff_value(
@@ -453,25 +445,22 @@ def _require_reportable(values: Iterable[Any]) -> None:
     Raise :class:`PipeDiffError` if any value is cyclic or nested too deeply to serialise.
 
     The comparison recurses only where both sides have a value, so a container that
-    exists on one side only is stored in the diff as it is. An in-memory value that
-    contains itself then makes the diff itself fine but every report built from it
-    fail (``ValueError: Circular reference detected``), and one nested past the
-    recursion limit does the same with ``RecursionError``. Only the cycle can be
-    reached through the CLI's JSON input: a file cannot contain one. The depth bound
-    exists for in-memory callers, and only values the diff stores are walked, so the
-    cost follows the report's size.
+    exists on one side only is stored in the diff as it is. If it contains itself, or
+    nests past the recursion limit, every report built from the diff would fail
+    (``ValueError: Circular reference detected`` or ``RecursionError``). Only a cycle
+    can arrive through the CLI's JSON input; the depth bound exists for in-memory
+    callers. Only values the diff stores are walked, so the cost follows the
+    report's size.
 
     The walk is iterative with an explicit stack, so it cannot hit the limit it
     guards. A container met again while it is still being walked is a cycle. One met
-    again after it was finished is merely shared: it is not walked again (so a
+    again after it was finished is merely shared: it is not walked again (a
     diamond-shaped value costs one walk, not one per path), but the height recorded
     when it finished is added to where it is met now.
 
-    The depth bound is the recursion limit, what the pure-Python encoder behind the
-    CLI's indented JSON output can serialise (about one frame per level). It is
-    conservative for the C encoder the text reports use, which can go deeper on some
-    interpreters; no pipeline nests anywhere near it, and a bound this high rejects no
-    value the CLI could render. It also caps the walker's own stack.
+    The depth bound is the recursion limit, which is what the pure-Python encoder
+    behind the CLI's indented JSON output can serialise (about one frame per level).
+    No pipeline nests anywhere near it.
 
     Args:
         values: The values to check; scalars are accepted and skipped.
@@ -534,19 +523,13 @@ def _layout_block(value: Any) -> Any:
     Normalize a ``viewport``/``ui`` block for comparison, mapping only ``None``.
 
     An omitted or explicitly-null layout block is the same canvas as an empty
-    object, so both must compare equal to ``{}``. Every other value is returned
-    untouched: a blanket ``or {}`` also folded the *non-null* falsy JSON values
-    ``false``, ``0`` and ``""`` into ``{}``, and :func:`load_pipe` accepts those,
-    so ``viewport: false`` versus ``viewport: {}`` reported no change and exited
-    ``0`` even under ``--include-layout``.
+    object, so both compare equal to ``{}``. Every other value is returned
+    untouched: ``false``, ``0`` and ``""`` are values :func:`load_pipe` accepts,
+    and each differs from ``{}``.
 
-    Validation deliberately stays out of this: :func:`validate_pipe` rejects only
-    shapes the diff cannot process (a non-object component, a non-list
-    ``components``/wire collection, an unhashable wire endpoint). A scalar
-    ``viewport``/``ui`` processes fine — :func:`_diff_value` falls back to an
-    equality comparison and reports it as a single ``viewport``/``ui`` change —
-    so rejecting it would be stricter than the rest of the loader without making
-    any diff correct that is not already correct.
+    A scalar ``viewport``/``ui`` is not rejected by validation: :func:`_diff_value`
+    falls back to an equality comparison and reports it as a single
+    ``viewport``/``ui`` change.
 
     Args:
         value: The raw ``viewport``/``ui`` value, or ``None`` when absent or null.
@@ -584,9 +567,6 @@ def _layout_changed(
     """
     # Normalize exactly as the layout field diffs do (:func:`_layout_block`): an
     # omitted or null ``viewport``/``ui`` is the same canvas as an empty object.
-    # Without this, None vs {} set layout_changed while producing no ``ui.*``/
-    # ``viewport.*`` change, so ``--include-layout`` reported a layout change with
-    # nothing to show and still exited 0.
     if not json_equal(_layout_block(old.get('viewport')), _layout_block(new.get('viewport'))):
         return True
     for component_id in common_ids:
