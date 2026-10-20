@@ -129,12 +129,14 @@ difference is deliberate: `diff` produces a report, not a command result.
 
 - **Nodes** are matched by `id`. A new or deleted `id` is an add/remove; an `id`
   present on both sides with a different `provider` is a provider change
-  (compared type-sensitively, like config). A duplicate `id` within one file is
+  (compared as JSON values, like config). A duplicate `id` within one file is
   rejected with exit `2` rather than silently shadowing a node.
 - **Config** is deep-diffed into dotted paths — nested objects become
   `config.default.strlen`, list items become `config.instructions[0]` — and each
-  leaf is reported as added, removed, or changed with its old → new value. JSON
-  types are compared type-sensitively, so `false` → `0` is a change.
+  leaf is reported as added, removed, or changed with its old → new value.
+  Values are compared as JSON values: a boolean never equals a number and a
+  string never equals either, so `false` → `0` is a change, while numerically
+  equal literals such as `512` and `512.0` compare equal.
 - **Edges** are the directed wires between components, reconstructed from every
   component's `input[]` (data lanes) and `control[]` (agent orchestration lanes,
   such as an agent's `llm`, `tool`, or `memory`). Rewiring a step shows up as a

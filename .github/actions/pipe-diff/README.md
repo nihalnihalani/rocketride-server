@@ -67,7 +67,7 @@ deepening and is worth it on a large repository:
         with:
           files: 'pipelines/**/*.pipe'   # restrict which .pipe files are considered
           python-version: '3.12'
-          cli-version: '>=1.5,<2'         # a published rocketride range that includes diff
+          cli-version: '>=1.5,<2'         # a future release range; use install-from until it is published
           comment: 'true'                 # set 'false' to skip commenting
           include-layout: 'false'         # set 'true' to also report ui/viewport churn
 ```
