@@ -261,8 +261,11 @@ def _fmt_value(value: Any) -> str:
     would look trimmed), would itself read as a JSON value (``"true"``,
     ``"512"``, ``"null"``, or the two-character ``""``), or holds a character
     the renderers escape (a real U+202E and the six characters ``\\u202e``
-    would otherwise print alike). So ``"true"`` and ``true`` never print alike,
-    and neither does an escaped character and the text of its escape.
+    would otherwise print alike), or holds text that reads like one of those
+    escapes (``\\u202e`` itself; see :data:`_ESCAPE_LOOKALIKE`), or starts with a
+    quote (so a bare string never reads as a quoted one, even after a console has
+    rewritten it). So ``"true"`` and ``true`` never print alike, and neither does an
+    escaped character and the text of its escape.
     """
     if isinstance(value, str):
         return json.dumps(value, ensure_ascii=False) if _reads_ambiguously(value) else value
@@ -271,8 +274,10 @@ def _fmt_value(value: Any) -> str:
 
 def _reads_ambiguously(text: str) -> bool:
     """Report whether a bare string would be mistaken for another value (see :func:`_fmt_value`)."""
-    if not text or text != text.strip() or _has_unsafe(text):
+    if not text or text != text.strip() or _has_unsafe(text) or _ESCAPE_LOOKALIKE.search(text):
         return True
+    if text.startswith('"'):
+        return True  # a bare string must never look like a quoted one, on any console
     try:
         json.loads(text)
     except RecursionError:
@@ -371,6 +376,18 @@ def _spell_char(char: str) -> str:
     return f'\\u{code:04x}' if code <= 0xFFFF else f'\\U{code:08x}'
 
 
+# Text that reads like one of the escapes written above. The reporters write a
+# hidden character as one of them, and so does a console that cannot print a
+# character (Python's ``backslashreplace``, used by the CLI on a non-UTF-8 stream,
+# spells it exactly this way). A value, identifier or path that merely contains such
+# text would therefore print the same as the character it names: the six characters
+# \u202e as a real U+202E, \u65e5 as a real CJK character on an ASCII console.
+# Such text is JSON-quoted, which doubles its backslash, so the two stay apart on
+# every console. Windows paths and regular expressions are not touched: C:\Users is
+# not an escape, because \U needs eight hex digits.
+_ESCAPE_LOOKALIKE = re.compile(r'\\(?:x[0-9a-fA-F]{2}|u[0-9a-fA-F]{4}|U[0-9a-fA-F]{8})')
+
+
 def _escape_control(match: re.Match) -> str:
     """Spell one unsafe character as an escape; any other character is returned as it is."""
     char = match.group()
@@ -424,6 +441,24 @@ def _term_safe(text: Any) -> str:
     printable text pass through unchanged.
     """
     return _spell(str(text))
+
+
+def _ident(text: Any) -> str:
+    """
+    Spell an identifier (a node id, an edge endpoint or lane, a config path) for display.
+
+    Identifiers are not values, so they are not quoted merely for holding an escaped
+    character: ``a\\u202e`` is the plain way to show an id with a real U+202E in it.
+    They are quoted when that spelling would be ambiguous, which is when the id
+    itself holds text that reads like an escape (see :data:`_ESCAPE_LOOKALIKE`) or
+    starts with a quote (so an unquoted id never looks like a quoted one). JSON
+    quoting doubles the backslash, so ``"a\\\\u202e"`` is the six characters and
+    ``a\\u202e`` is the character. Ordinary ids and paths print as they always did.
+    """
+    text = str(text)
+    if text.startswith('"') or _ESCAPE_LOOKALIKE.search(text):
+        return json.dumps(text, ensure_ascii=False)
+    return text
 
 
 def _identity(text: Any) -> str:
@@ -508,7 +543,7 @@ def _human_field_line(field_change: Any, palette: _Palette) -> str:
     The path and both values come from the diffed ``.pipe`` files, so each is run
     through :func:`_term_safe` before it reaches the terminal.
     """
-    path = _term_safe(field_change.path)
+    path = _term_safe(_ident(field_change.path))
     kind = field_change.kind
     if kind == 'added':
         body = f'{_MARK_ADDED} {path} = {_term_safe(_fmt_value(field_change.new))}'
@@ -561,15 +596,17 @@ def render_human(diff: 'PipeDiff', *, use_color: bool) -> str:
         lines.append('Nodes')
         for node_id, provider in org['nodes_added']:
             lines.append(
-                '  ' + palette.added(f'{_MARK_ADDED} {_term_safe(node_id)} ({_term_safe(_fmt_value(provider))})')
+                '  '
+                + palette.added(f'{_MARK_ADDED} {_term_safe(_ident(node_id))} ({_term_safe(_fmt_value(provider))})')
             )
         for node_id, provider in org['nodes_removed']:
             lines.append(
-                '  ' + palette.removed(f'{_MARK_REMOVED} {_term_safe(node_id)} ({_term_safe(_fmt_value(provider))})')
+                '  '
+                + palette.removed(f'{_MARK_REMOVED} {_term_safe(_ident(node_id))} ({_term_safe(_fmt_value(provider))})')
             )
         for entry in org['nodes_changed']:
             if entry['has_provider_change']:
-                marker = palette.changed(f'{_MARK_CHANGED} {_term_safe(entry["id"])} provider: ')
+                marker = palette.changed(f'{_MARK_CHANGED} {_term_safe(_ident(entry["id"]))} provider: ')
                 provider_old, provider_new = _fmt_pair(entry['provider_old'], entry['provider_new'], _term_safe)
                 lines.append(
                     '  ' + marker + f'{_term_safe(provider_old)} ' + palette.dim('->') + f' {_term_safe(provider_new)}'
@@ -580,10 +617,10 @@ def render_human(diff: 'PipeDiff', *, use_color: bool) -> str:
         lines.append('')
         lines.append('Edges')
         for from_id, lane, to_id in org['edges_added']:
-            body = f'{_MARK_ADDED} {_term_safe(from_id)} --{_term_safe(lane)}--> {_term_safe(to_id)}'
+            body = f'{_MARK_ADDED} {_term_safe(_ident(from_id))} --{_term_safe(_ident(lane))}--> {_term_safe(_ident(to_id))}'
             lines.append('  ' + palette.added(body))
         for from_id, lane, to_id in org['edges_removed']:
-            body = f'{_MARK_REMOVED} {_term_safe(from_id)} --{_term_safe(lane)}--> {_term_safe(to_id)}'
+            body = f'{_MARK_REMOVED} {_term_safe(_ident(from_id))} --{_term_safe(_ident(lane))}--> {_term_safe(_ident(to_id))}'
             lines.append('  ' + palette.removed(body))
 
     # --- Config ---
@@ -592,7 +629,7 @@ def render_human(diff: 'PipeDiff', *, use_color: bool) -> str:
         lines.append('')
         lines.append('Config')
         for entry in config_nodes:
-            lines.append(f'  {_term_safe(entry["id"])}')
+            lines.append(f'  {_term_safe(_ident(entry["id"]))}')
             for field_change in entry['config_changes']:
                 lines.append(_human_field_line(field_change, palette))
 
@@ -841,13 +878,13 @@ def render_markdown(diff: 'PipeDiff', *, title: Optional[str] = None) -> str:
         lines.append('')
         lines.append('**Nodes**')
         for node_id, provider in org['nodes_added']:
-            lines.append(f'- {_md_code(_MD_ADDED)} {_md_code(node_id)} ({_md_code(_fmt_value(provider))})')
+            lines.append(f'- {_md_code(_MD_ADDED)} {_md_code(_ident(node_id))} ({_md_code(_fmt_value(provider))})')
         for node_id, provider in org['nodes_removed']:
-            lines.append(f'- {_md_code(_MD_REMOVED)} {_md_code(node_id)} ({_md_code(_fmt_value(provider))})')
+            lines.append(f'- {_md_code(_MD_REMOVED)} {_md_code(_ident(node_id))} ({_md_code(_fmt_value(provider))})')
         for entry in provider_changed:
             provider_old, provider_new = _fmt_pair(entry['provider_old'], entry['provider_new'], _md_code)
             lines.append(
-                f'- {_MD_CHANGED} {_md_code(entry["id"])} provider: {_md_code(provider_old)} → {_md_code(provider_new)}'
+                f'- {_MD_CHANGED} {_md_code(_ident(entry["id"]))} provider: {_md_code(provider_old)} → {_md_code(provider_new)}'
             )
 
     # --- Edges ---
@@ -855,9 +892,13 @@ def render_markdown(diff: 'PipeDiff', *, title: Optional[str] = None) -> str:
         lines.append('')
         lines.append('**Edges**')
         for from_id, lane, to_id in org['edges_added']:
-            lines.append(f'- {_md_code(_MD_ADDED)} {_md_code(from_id)} --{_md_code(lane)}--> {_md_code(to_id)}')
+            lines.append(
+                f'- {_md_code(_MD_ADDED)} {_md_code(_ident(from_id))} --{_md_code(_ident(lane))}--> {_md_code(_ident(to_id))}'
+            )
         for from_id, lane, to_id in org['edges_removed']:
-            lines.append(f'- {_md_code(_MD_REMOVED)} {_md_code(from_id)} --{_md_code(lane)}--> {_md_code(to_id)}')
+            lines.append(
+                f'- {_md_code(_MD_REMOVED)} {_md_code(_ident(from_id))} --{_md_code(_ident(lane))}--> {_md_code(_ident(to_id))}'
+            )
 
     # --- Config (table) ---
     config_nodes = [e for e in org['nodes_changed'] if e['config_changes']]
@@ -869,8 +910,8 @@ def render_markdown(diff: 'PipeDiff', *, title: Optional[str] = None) -> str:
         lines.append('| --- | --- | --- |')
         for entry in config_nodes:
             for field_change in entry['config_changes']:
-                node_cell = _md_cell(_md_code(entry['id']))
-                field_cell = _md_cell(_md_code(field_change.path))
+                node_cell = _md_cell(_md_code(_ident(entry['id'])))
+                field_cell = _md_cell(_md_code(_ident(field_change.path)))
                 change_cell = _md_cell(_md_field_change(field_change))
                 lines.append(f'| {node_cell} | {field_cell} | {change_cell} |')
 
@@ -888,7 +929,7 @@ def render_markdown(diff: 'PipeDiff', *, title: Optional[str] = None) -> str:
         lines.append('| Field | Change |')
         lines.append('| --- | --- |')
         for field_change in org['viewport_changes']:
-            field_cell = _md_cell(_md_code(field_change.path))
+            field_cell = _md_cell(_md_code(_ident(field_change.path)))
             change_cell = _md_cell(_md_field_change(field_change))
             lines.append(f'| {field_cell} | {change_cell} |')
 

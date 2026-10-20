@@ -326,7 +326,8 @@ class TestRenderHuman(unittest.TestCase):
     def test_escaped_control_and_literal_escape_text_stay_distinguishable(self) -> None:
         # U+202E and the six characters `\u202e` would both print as `\u202e` once
         # the control is escaped, so a value holding an escaped character is
-        # JSON-quoted and the pair stays visibly different.
+        # JSON-quoted; so is a value holding text that reads like an escape, and JSON
+        # quoting doubles its backslash, so the pair differs by more than quotes.
         diff = PipeDiff(
             node_changes=[
                 NodeChange(
@@ -340,10 +341,8 @@ class TestRenderHuman(unittest.TestCase):
             ]
         )
         out = render_human(diff, use_color=False)
-        # A value holding an escaped character is JSON-quoted, so the real control
-        # is quoted and the bare text of its escape is not.
-        self.assertIn('~ config.bidi: "\\u202e" -> \\u202e', out)
-        self.assertIn('~ config.esc: \\x1b -> "\\u001b"', out)
+        self.assertIn('~ config.bidi: "\\u202e" -> "\\\\u202e"', out)
+        self.assertIn('~ config.esc: "\\\\x1b" -> "\\u001b"', out)
         self.assertNotIn('\u202e', out)
         self.assertNotIn('\x1b', out)
 
@@ -704,16 +703,16 @@ class TestRenderMarkdown(unittest.TestCase):
         )
         md = render_markdown(diff)
         self.assertIn('| `n1` | `config.real` | + `"\\u202e"` |', md)
-        self.assertIn('| `n1` | `config.text` | + `\\u202e` |', md)
+        self.assertIn('| `n1` | `config.text` | + `"\\\\u202e"` |', md)
         self.assertIn('| `n1` | `config.esc` | - `"\\u001b"` |', md)
-        self.assertIn('| `n1` | `config.esc_text` | - `\\x1b` |', md)
+        self.assertIn('| `n1` | `config.esc_text` | - `"\\\\x1b"` |', md)
         self.assertIn('| `n1` | `config.newline` | + `"a\\nb"` |', md)
         self.assertIn('| `n1` | `config.space` | + `a b` |', md)
         human = render_human(diff, use_color=False)
         self.assertIn('+ config.real = "\\u202e"', human)
-        self.assertIn('+ config.text = \\u202e', human)
+        self.assertIn('+ config.text = "\\\\u202e"', human)
         self.assertIn('- config.esc = "\\u001b"', human)
-        self.assertIn('- config.esc_text = \\x1b', human)
+        self.assertIn('- config.esc_text = "\\\\x1b"', human)
 
     def test_a_lone_surrogate_is_escaped_rather_than_breaking_output(self) -> None:
         """JSON's ``"\\ud800"`` decodes to a lone surrogate, which no UTF-8 stream can carry."""
@@ -1266,8 +1265,151 @@ class TestEquivalentSpellings(unittest.TestCase):
             ]
         )
         self.assertIn(
-            '~ config.v: "e' + chr(92) + 'u0301" -> e' + chr(92) + 'u0301', render_human(diff, use_color=False)
+            '~ config.v: "e' + chr(92) + 'u0301" -> "e' + chr(92) * 2 + 'u0301"', render_human(diff, use_color=False)
         )
+
+
+_BS = chr(92)  # one backslash, spelled so that no escape in this file is read as a character
+
+
+def _on_an_ascii_console(text: str) -> str:
+    """What the CLI prints on a stream that cannot encode ``text`` (``diff._show_unprintable``)."""
+    return text.encode('ascii', errors='backslashreplace').decode('ascii')
+
+
+# A hidden or unprintable character, and the text of the escape that names it. Both the
+# reporters and an ASCII console write the first as the second.
+_CHARACTER_AND_ITS_ESCAPE = [
+    ('bidi override', 'a\N{RIGHT-TO-LEFT OVERRIDE}', 'a' + _BS + 'u202e'),
+    ('escape control', 'a\x1b', 'a' + _BS + 'x1b'),
+    ('CJK on an ASCII console', '\N{CJK UNIFIED IDEOGRAPH-65E5}', _BS + 'u65e5'),
+    ('latin-1 on an ASCII console', '\N{LATIN SMALL LETTER E WITH ACUTE}', _BS + 'xe9'),
+    ('astral on an ASCII console', '\N{GRINNING FACE}', _BS + 'U0001f600'),
+]
+
+
+class TestEscapeLookalikes(unittest.TestCase):
+    """A character and the text of its escape must print apart, whatever the console."""
+
+    def test_identifiers_and_values_print_apart_from_the_text_of_their_escape(self) -> None:
+        for label, character, escape_text in _CHARACTER_AND_ITS_ESCAPE:
+            for place, build in _ALONE.items():
+                with self.subTest(case=label, place=place):
+                    real, literal = build(character), build(escape_text)
+                    for render in (lambda d: render_human(d, use_color=False), render_markdown):
+                        self.assertNotEqual(render(real), render(literal))
+                        # Nor does the console make them alike: what it writes for the
+                        # character must not be what the text already was.
+                        self.assertNotEqual(_on_an_ascii_console(render(real)), _on_an_ascii_console(render(literal)))
+
+    def test_both_sides_of_a_change_print_apart_on_an_ascii_console(self) -> None:
+        for label, character, escape_text in _CHARACTER_AND_ITS_ESCAPE:
+            for place, (build, pattern) in _PAIRED.items():
+                for old, new in ((character, escape_text), (escape_text, character)):
+                    with self.subTest(case=label, place=place, old=old.encode('unicode_escape')):
+                        human = _on_an_ascii_console(render_human(build(old, new), use_color=False))
+                        match = re.search(pattern, human, re.M)
+                        self.assertIsNotNone(match)
+                        self.assertNotEqual(match.group(1), match.group(2))
+                        spans = re.findall(r'`([^`]*)`', _on_an_ascii_console(render_markdown(build(old, new))))
+                        self.assertNotEqual(spans[-2], spans[-1])
+
+    @unittest.skipIf(cmarkgfm is None, 'cmarkgfm is not installed')
+    def test_identifiers_print_apart_in_the_markdown_github_renders(self) -> None:
+        for label, character, escape_text in _CHARACTER_AND_ITS_ESCAPE:
+            for place, build in _ALONE.items():
+                with self.subTest(case=label, place=place):
+                    self.assertNotEqual(
+                        _github_code_spans(render_markdown(build(character))),
+                        _github_code_spans(render_markdown(build(escape_text))),
+                    )
+
+    def test_text_that_reads_like_an_escape_is_quoted_and_its_backslash_doubled(self) -> None:
+        from rocketride.pipediff.reporters import _fmt_value, _ident
+
+        for tail in ('u202e', 'x1b', 'U0001f600', 'u65E5'):
+            for text in (_BS + tail, 'a' + _BS + tail + 'b', _BS + _BS + tail):
+                with self.subTest(text=text):
+                    quoted = '"' + text.replace(_BS, _BS * 2) + '"'
+                    self.assertEqual(_fmt_value(text), quoted)
+                    self.assertEqual(_ident(text), quoted)
+
+    def test_ordinary_text_is_not_quoted_for_holding_a_backslash(self) -> None:
+        from rocketride.pipediff.reporters import _fmt_value, _ident
+
+        # Windows paths and regular expressions are common in configs; only text that
+        # is spelled exactly like one of our escapes is touched.
+        for text in (
+            'C:' + _BS + 'Users' + _BS + 'alice',
+            _BS + 'd+' + _BS + 's*',
+            _BS + 'xyz',
+            _BS + 'u12',
+            _BS + 'U00ff',
+            'a' + _BS * 2 + 'b',
+            _BS,
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(_fmt_value(text), text)
+                self.assertEqual(_ident(text), text)
+        self.assertEqual(_ident('chunker_1'), 'chunker_1')
+        # An id holding a real escaped character keeps the plain spelling it always had.
+        self.assertEqual(_ident('a\N{RIGHT-TO-LEFT OVERRIDE}'), 'a\N{RIGHT-TO-LEFT OVERRIDE}')
+
+    def test_an_identifier_that_starts_with_a_quote_never_looks_like_a_quoted_one(self) -> None:
+        from rocketride.pipediff.reporters import _ident
+
+        self.assertEqual(_ident('"x"'), '"' + _BS + '"x' + _BS + '""')
+        self.assertNotEqual(_ident('"' + _BS * 2 + 'u202e"'), _ident(_BS + 'u202e'))
+
+    def test_a_bare_value_never_starts_with_a_quote(self) -> None:
+        from rocketride.pipediff.reporters import _fmt_value, _md_code, _term_safe
+
+        # A console that writes a character as an escape can turn text that is not valid
+        # JSON into text that is, so a value starting with a quote is quoted too. Found
+        # by the exhaustive check below: a quote, a backslash and two combining marks
+        # printed on an ASCII console like the quoted form of a different value.
+        mark = '\N{COMBINING ACUTE ACCENT}'
+        bare, literal = '"' + _BS + mark + mark + ' "', _BS + 'u0301' + mark + ' '
+        self.assertEqual(_fmt_value('"abc'), '"' + _BS + '"abc"')
+        for display in (lambda t: _term_safe(_fmt_value(t)), lambda t: _md_code(_fmt_value(t))):
+            self.assertNotEqual(_on_an_ascii_console(display(bare)), _on_an_ascii_console(display(literal)))
+
+    def test_no_two_strings_print_alike(self) -> None:
+        from rocketride.pipediff.reporters import _fmt_value, _ident, _md_code, _term_safe
+
+        tokens = [
+            _BS + 'u202e',
+            '\N{RIGHT-TO-LEFT OVERRIDE}',
+            _BS + 'u65e5',
+            '\N{CJK UNIFIED IDEOGRAPH-65E5}',
+            _BS + 'x1b',
+            '\x1b',
+            _BS + 'xe9',
+            '\N{LATIN SMALL LETTER E WITH ACUTE}',
+            _BS,
+            '"',
+            'a',
+            ' ',
+            'e\N{COMBINING ACUTE ACCENT}',
+        ]
+        strings = {''}
+        frontier = {''}
+        for _ in range(3):
+            frontier = {prefix + token for prefix in frontier for token in tokens}
+            strings |= frontier
+        displays = {
+            'value, terminal': lambda t: _term_safe(_fmt_value(t)),
+            'value, Markdown': lambda t: _md_code(_fmt_value(t)),
+            'identifier, terminal': lambda t: _term_safe(_ident(t)),
+            'identifier, Markdown': lambda t: _md_code(_ident(t)),
+        }
+        for name, display in displays.items():
+            for console in (lambda t: t, _on_an_ascii_console):
+                seen = {}
+                for text in sorted(strings):
+                    shown = console(display(text))
+                    other = seen.setdefault(shown, text)
+                    self.assertEqual(other, text, f'{name}: {other!a} and {text!a} both print as {shown!a}')
 
 
 class TestDeterminism(unittest.TestCase):
