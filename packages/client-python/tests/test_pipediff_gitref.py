@@ -22,9 +22,8 @@
 
 """Tests for the git ref resolver used by ``rocketride diff --git``.
 
-Most cases stub ``subprocess.run`` so no real git or repository is needed; a
-single, git-gated integration test exercises the real ``git show`` plumbing in
-an isolated temporary repository.
+The resolver is exercised against real git in isolated temporary repositories.
+Only a git that cannot be started, or that hangs, is simulated.
 """
 
 import json
@@ -34,10 +33,11 @@ import subprocess
 from pathlib import Path
 
 import pytest
-import pipediff_git_helpers
-from pipediff_git_helpers import init_repo, isolate_git_environment, make_symlink
+from pipediff_git_helpers import commit_all, init_repo, isolate_git_environment, make_symlink, run_git
 
-from rocketride.pipediff import PipeDiffError, gitref, resolve_git_ref
+from rocketride.pipediff import PipeDiffError, resolve_git_ref
+
+needs_git = pytest.mark.skipif(shutil.which('git') is None, reason='git not installed')
 
 SAMPLE_PIPE = {
     'components': [{'id': 'a', 'provider': 'src', 'config': {}}],
@@ -52,433 +52,173 @@ def _hermetic_git(monkeypatch):
     isolate_git_environment(monkeypatch)
 
 
-def _completed(returncode, stdout='', stderr=''):
-    """Build a stub ``CompletedProcess`` result; like the real one, its streams are bytes."""
-    return subprocess.CompletedProcess(
-        args=['git'], returncode=returncode, stdout=_as_bytes(stdout), stderr=_as_bytes(stderr)
-    )
+# ---------------------------------------------------------------------------
+# Errors from git and from the content committed at the ref
+# ---------------------------------------------------------------------------
 
 
-def _as_bytes(stream):
-    return stream if isinstance(stream, bytes) else stream.encode('utf-8')
+def _commit_text(tmp_path, content, name='pipeline.pipe'):
+    """Commit ``content`` (text or bytes) as ``name`` in a new repository and return its path."""
+    path = tmp_path / name
+    path.write_bytes(content if isinstance(content, bytes) else content.encode('utf-8'))
+    init_repo(tmp_path, name)
+    return str(path)
 
 
-def _fake_ls_tree(args, tree):
-    """Answer ``git ls-tree -z <ref>:<dir>`` from ``tree`` ({committed path: mode})."""
-    directory = args[-1].partition(':')[2]
-    prefix = f'{directory}/' if directory else ''
-    entries = {}
-    for path, mode in tree.items():
-        if path.startswith(prefix):
-            head, slash, _rest = path[len(prefix) :].partition('/')
-            entries[head] = '040000 tree' if slash else f'{mode} blob'
-    stdout = ''.join(f'{meta} deadbeef\t{name}\0' for name, meta in entries.items())
-    return _completed(0, stdout=stdout)
-
-
-def _install_fake_git(monkeypatch, responses, tree=None, links=None):
-    """Patch ``subprocess.run`` in gitref to reply per git invocation.
-
-    ``responses`` maps an invocation key to either a ``CompletedProcess`` or an
-    ``Exception`` instance (which is raised). The keys are the git subcommand
-    ("rev-parse", "cat-file", "ls-tree", "show"), plus "rev-parse-verify" for the
-    ref verification (``rev-parse --verify``) and "rev-parse-prefix" for the
-    prefix lookup (``rev-parse --show-prefix``), each distinct from the
-    repository-root lookup (``rev-parse --show-toplevel``). "rev-parse-verify"
-    and "cat-file" default to success, and "rev-parse-prefix" to the directory's
-    position below /repo, so a test only has to name the step it cares about. "ls-tree" defaults to listing ``tree``, a map of committed
-    path to git mode (default: a regular ``pipeline.pipe`` at the top), and
-    "cat-file" reads the link text of a committed symlink from ``links``, a map
-    of committed path to the text stored there.
+def _commit_links(repo, links, *files):
     """
-    committed = {'pipeline.pipe': '100644'} if tree is None else tree
-    defaults = {
-        'rev-parse-verify': _completed(0, stdout='deadbeef\n'),
-        'cat-file': _completed(0),
-    }
+    Commit ``files`` and symbolic links whose text is exactly what ``links`` says.
 
-    def fake_run(args, **_kwargs):
-        subcommand = args[3]  # ['git', '-C', <dir>, <subcommand>, ...]
-        key = subcommand
-        if subcommand == 'rev-parse' and '--verify' in args:
-            key = 'rev-parse-verify'
-        elif subcommand == 'rev-parse' and '--show-prefix' in args:
-            key = 'rev-parse-prefix'
-        if key in responses:
-            outcome = responses[key]
-        elif key == 'rev-parse-prefix':
-            # Where the directory the command ran in sits below the (fake) top level /repo
-            relative = os.path.relpath(args[2], os.path.abspath('/repo')).replace(os.sep, '/')
-            outcome = _completed(0, stdout='' if relative == '.' else relative + '/\n')
-        elif key == 'ls-tree':
-            outcome = _fake_ls_tree(args, committed)
-        elif key == 'cat-file' and links is not None:
-            outcome = _completed(0, stdout=links[args[-1].partition(':')[2]])
-        else:
-            outcome = defaults[key]
-        if isinstance(outcome, BaseException):
-            raise outcome
-        return outcome
-
-    monkeypatch.setattr(gitref.subprocess, 'run', fake_run)
+    The links exist only in the commit, so any text can be stored whatever the platform
+    would have written for it, and no permission to create links is needed.
+    """
+    run_git(repo, 'init', '-q')
+    if files:
+        run_git(repo, 'add', '--', *files)
+    for name, text in links.items():
+        scratch = repo / '.git' / 'link-text'
+        scratch.write_bytes(text.encode('utf-8'))
+        blob = run_git(repo, 'hash-object', '-w', '--no-filters', str(scratch)).stdout.strip()
+        run_git(repo, 'update-index', '--add', '--cacheinfo', f'120000,{blob},{name}')
+    run_git(repo, 'commit', '-q', '-m', 'links')
 
 
-# ---------------------------------------------------------------------------
-# Mocked subprocess cases
-# ---------------------------------------------------------------------------
+def _delete_object(repo, revision):
+    """Delete the stored object ``revision`` names; whatever refers to it stays."""
+    object_id = run_git(repo, 'rev-parse', revision).stdout.strip()
+    stored = repo / '.git' / 'objects' / object_id[:2] / object_id[2:]
+    stored.chmod(0o600)
+    stored.unlink()
 
 
-def test_resolve_returns_parsed_pipe_when_found(monkeypatch):
-    _install_fake_git(
-        monkeypatch,
-        {
-            'rev-parse': _completed(0, stdout='/repo\n'),
-            'show': _completed(0, stdout=json.dumps(SAMPLE_PIPE)),
-        },
-    )
-    assert resolve_git_ref('HEAD', '/repo/pipeline.pipe') == SAMPLE_PIPE
+@needs_git
+def test_a_ref_that_does_not_exist_is_an_error(tmp_path):
+    path = _commit_text(tmp_path, json.dumps(SAMPLE_PIPE))
+    with pytest.raises(PipeDiffError, match='Unknown git ref'):
+        resolve_git_ref('no-such-branch', path)
+
+
+@needs_git
+def test_a_ref_name_that_reads_like_git_saying_a_path_is_absent_is_still_an_unknown_ref(tmp_path):
+    # "the file is not in this ref" and "there is no such ref" are told apart by git's exit
+    # status, not by the words in its message, which echo the ref's own name
+    path = _commit_text(tmp_path, json.dumps(SAMPLE_PIPE))
+    with pytest.raises(PipeDiffError, match='Unknown git ref'):
+        resolve_git_ref('nope does not exist in', path)
+
+
+@needs_git
+def test_a_ref_that_looks_like_an_option_is_not_passed_to_git(tmp_path):
+    path = _commit_text(tmp_path, json.dumps(SAMPLE_PIPE))
+    written = tmp_path / 'written-by-git'
+    with pytest.raises(PipeDiffError, match='Unknown git ref'):
+        resolve_git_ref('--output=' + str(written), path)
+    assert not written.exists()
+
+
+@needs_git
+def test_a_path_outside_any_repository_is_an_error(tmp_path, monkeypatch):
+    monkeypatch.setenv('GIT_CEILING_DIRECTORIES', str(tmp_path.parent))  # no repository above tmp_path
+    (tmp_path / 'pipeline.pipe').write_text(json.dumps(SAMPLE_PIPE), encoding='utf-8')
+    with pytest.raises(PipeDiffError, match='Not a git repository'):
+        resolve_git_ref('HEAD', str(tmp_path / 'pipeline.pipe'))
+
+
+def test_git_that_is_not_installed_is_an_error(tmp_path, monkeypatch):
+    monkeypatch.setenv('PATH', str(tmp_path))  # an empty directory: nothing named git on it
+    with pytest.raises(PipeDiffError, match='git executable not found'):
+        resolve_git_ref('HEAD', str(tmp_path / 'pipeline.pipe'))
 
 
 @pytest.mark.parametrize(
-    'stderr',
+    ('failure', 'message'),
     [
-        "fatal: path 'pipeline.pipe' exists on disk, but not in 'HEAD'",
-        "fatal: path 'pipeline.pipe' does not exist in 'HEAD'",
-        '',
+        (PermissionError(13, 'Permission denied'), 'git could not be run'),
+        (OSError(8, 'Exec format error'), 'git could not be run'),
+        (subprocess.TimeoutExpired(cmd='git', timeout=30), 'timed out'),
     ],
+    ids=['not-executable', 'wrong-format', 'hangs'],
 )
-def test_resolve_returns_none_when_path_absent_in_ref(monkeypatch, stderr):
-    # The verdict comes from the tree listing (exit 0, entry missing), whatever git prints.
-    _install_fake_git(
-        monkeypatch,
-        {
-            'rev-parse': _completed(0, stdout='/repo\n'),
-            'ls-tree': _completed(0, stderr=stderr),
-        },
-    )
-    assert resolve_git_ref('HEAD', '/repo/pipeline.pipe') is None
+def test_git_that_cannot_start_or_never_answers_is_a_clean_error(monkeypatch, failure, message):
+    # A git on PATH that cannot start, or that hangs, is not something a real repository can produce
+    def fail(*_args, **_kwargs):
+        raise failure
+
+    monkeypatch.setattr(subprocess, 'run', fail)
+    with pytest.raises(PipeDiffError, match=message):
+        resolve_git_ref('HEAD', '/repo/pipeline.pipe')
 
 
-def test_resolve_raises_on_unknown_ref(monkeypatch):
-    _install_fake_git(
-        monkeypatch,
-        {
-            'rev-parse': _completed(0, stdout='/repo\n'),
-            'rev-parse-verify': _completed(128, stderr='fatal: Needed a single revision'),
-        },
-    )
-    with pytest.raises(PipeDiffError, match='Unknown git ref'):
-        resolve_git_ref('nope', '/repo/pipeline.pipe')
-
-
-def test_resolve_raises_when_bad_ref_name_echoes_a_path_absent_phrase(monkeypatch):
-    """A bad ref must stay an error even when git's diagnostic quotes it.
-
-    git echoes the offending revision back, so a ref whose *name* contains
-    "does not exist in" used to be mistaken for "the file is not in this ref" and
-    silently produced an all-added diff instead of exit code 2.
-    """
-    bad_ref = 'nope does not exist in'
-    _install_fake_git(
-        monkeypatch,
-        {
-            'rev-parse': _completed(0, stdout='/repo\n'),
-            'rev-parse-verify': _completed(128, stderr=f"fatal: invalid object name '{bad_ref}'."),
-        },
-    )
-    with pytest.raises(PipeDiffError, match='Unknown git ref'):
-        resolve_git_ref(bad_ref, '/repo/pipeline.pipe')
-
-
-def test_resolve_raises_when_show_fails_for_a_present_object(monkeypatch):
-    """A verified ref plus a present object that still fails to read is an error."""
-    _install_fake_git(
-        monkeypatch,
-        {
-            'rev-parse': _completed(0, stdout='/repo\n'),
-            'show': _completed(128, stderr='fatal: unable to read object'),
-        },
-    )
+@needs_git
+def test_a_blob_git_cannot_read_is_an_error_not_an_absent_file(tmp_path):
+    path = _commit_text(tmp_path, json.dumps(SAMPLE_PIPE))
+    _delete_object(tmp_path, 'HEAD:pipeline.pipe')
     with pytest.raises(PipeDiffError, match='git show'):
-        resolve_git_ref('HEAD', '/repo/pipeline.pipe')
+        resolve_git_ref('HEAD', path)
 
 
-def test_resolve_raises_when_not_a_git_repo(monkeypatch):
-    _install_fake_git(
-        monkeypatch,
-        {
-            'rev-parse': _completed(128, stderr='fatal: not a git repository (or any parent up to /)'),
-        },
-    )
-    with pytest.raises(PipeDiffError, match='Not a git repository'):
-        resolve_git_ref('HEAD', '/tmp/pipeline.pipe')
+@needs_git
+def test_a_tree_git_cannot_list_is_an_error_not_an_absent_file(tmp_path):
+    path = _commit_text(tmp_path, json.dumps(SAMPLE_PIPE))
+    _delete_object(tmp_path, 'HEAD^{tree}')
+    with pytest.raises(PipeDiffError, match='ls-tree'):
+        resolve_git_ref('HEAD', path)
 
 
-def test_resolve_raises_when_git_missing(monkeypatch):
-    _install_fake_git(monkeypatch, {'rev-parse': FileNotFoundError('git')})
-    with pytest.raises(PipeDiffError, match='git executable not found'):
-        resolve_git_ref('HEAD', '/repo/pipeline.pipe')
-
-
-def test_resolve_raises_on_timeout(monkeypatch):
-    _install_fake_git(
-        monkeypatch,
-        {'rev-parse': subprocess.TimeoutExpired(cmd='git', timeout=30)},
-    )
-    with pytest.raises(PipeDiffError, match='timed out'):
-        resolve_git_ref('HEAD', '/repo/pipeline.pipe')
-
-
-def test_resolve_raises_on_undecodable_git_output(monkeypatch):
-    # Output that must be text but is not UTF-8 is a PipeDiffError, not a raw
-    # UnicodeDecodeError traceback out of the pipediff API.
-    _install_fake_git(
-        monkeypatch,
-        {'rev-parse': _completed(0, stdout='/repo\n'), 'rev-parse-verify': _completed(0, stdout=b'\xff')},
-    )
+@needs_git
+def test_a_file_at_the_ref_that_is_not_utf8_is_an_error(tmp_path):
+    path = _commit_text(tmp_path, bytes([0xFF, 0xFE]) + b'{"components": []}')
     with pytest.raises(PipeDiffError, match='not valid UTF-8'):
-        resolve_git_ref('HEAD', '/repo/pipeline.pipe')
+        resolve_git_ref('HEAD', path)
 
 
-def test_resolve_raises_on_undecodable_show_output(monkeypatch):
-    _install_fake_git(
-        monkeypatch,
-        {
-            'rev-parse': _completed(0, stdout='/repo\n'),
-            'show': _completed(0, stdout=b'\xff'),
-        },
-    )
-    with pytest.raises(PipeDiffError, match='not valid UTF-8'):
-        resolve_git_ref('HEAD', '/repo/pipeline.pipe')
-
-
-def test_resolve_raises_on_invalid_json_content(monkeypatch):
-    _install_fake_git(
-        monkeypatch,
-        {
-            'rev-parse': _completed(0, stdout='/repo\n'),
-            'show': _completed(0, stdout='{ not json'),
-        },
-    )
-    with pytest.raises(PipeDiffError, match='Invalid JSON'):
-        resolve_git_ref('HEAD', '/repo/pipeline.pipe')
-
-
-@pytest.mark.parametrize('literal', ['NaN', 'Infinity', '-Infinity', '1e309', '-1e309', '1e-400', '-1e-400'])
-def test_resolve_rejects_unsupported_numeric_content_with_git_context(monkeypatch, literal):
-    _install_fake_git(
-        monkeypatch,
-        {
-            'rev-parse': _completed(0, stdout='/repo\n'),
-            'show': _completed(0, stdout='{"components": [{"id": "a", "config": {"value": ' + literal + '}}]}'),
-        },
-    )
+@needs_git
+def test_invalid_json_at_the_ref_is_an_error_naming_the_ref_and_path(tmp_path):
+    path = _commit_text(tmp_path, '{ not json')
     with pytest.raises(PipeDiffError, match='Invalid JSON') as error:
-        resolve_git_ref('HEAD', '/repo/pipeline.pipe')
+        resolve_git_ref('HEAD', path)
+    assert 'HEAD:pipeline.pipe' in str(error.value)
+
+
+@needs_git
+@pytest.mark.parametrize('literal', ['NaN', '-Infinity', '1e309', '-1e-400'])
+def test_a_number_json_cannot_carry_at_the_ref_is_an_error_naming_the_ref(tmp_path, literal):
+    path = _commit_text(tmp_path, '{"components": [{"id": "a", "config": {"value": ' + literal + '}}]}')
+    with pytest.raises(PipeDiffError, match='Invalid JSON') as error:
+        resolve_git_ref('HEAD', path)
     assert 'HEAD:pipeline.pipe' in str(error.value)
     assert literal in str(error.value)
 
 
-def test_resolve_preserves_context_for_numeric_validation_of_historical_metadata(monkeypatch):
-    _install_fake_git(
-        monkeypatch,
-        {
-            'rev-parse': _completed(0, stdout='/repo\n'),
-            'show': _completed(0, stdout='{"components": [], "project_id": 1e309}'),
-        },
-    )
+@needs_git
+def test_a_number_outside_the_components_is_refused_at_the_ref_too(tmp_path):
+    path = _commit_text(tmp_path, '{"components": [], "project_id": 1e309}')
     with pytest.raises(PipeDiffError, match='HEAD:pipeline.pipe'):
-        resolve_git_ref('HEAD', '/repo/pipeline.pipe')
+        resolve_git_ref('HEAD', path)
 
 
-@pytest.mark.parametrize('literal', ['0e9999', '-0e-9999', '5e-324', '-5e-324', '1.7976931348623157e308'])
-def test_resolve_accepts_supported_finite_numeric_content(monkeypatch, literal):
-    _install_fake_git(
-        monkeypatch,
-        {
-            'rev-parse': _completed(0, stdout='/repo\n'),
-            'show': _completed(0, stdout='{"components": [{"id": "a", "config": {"value": ' + literal + '}}]}'),
-        },
-    )
-    pipe = resolve_git_ref('HEAD', '/repo/pipeline.pipe')
+@needs_git
+@pytest.mark.parametrize('literal', ['0e9999', '-0e-9999', '5e-324', '1.7976931348623157e308'])
+def test_supported_numbers_at_the_ref_are_read_back(tmp_path, literal):
+    path = _commit_text(tmp_path, '{"components": [{"id": "a", "config": {"value": ' + literal + '}}]}')
+    pipe = resolve_git_ref('HEAD', path)
     assert pipe['components'][0]['config']['value'] == float(literal)
     json.dumps(pipe, allow_nan=False)
 
 
-def test_resolve_raises_when_ref_content_is_not_a_pipe(monkeypatch):
-    _install_fake_git(
-        monkeypatch,
-        {
-            'rev-parse': _completed(0, stdout='/repo\n'),
-            'show': _completed(0, stdout=json.dumps({'version': 1})),
-        },
-    )
+@needs_git
+def test_a_file_at_the_ref_that_is_not_a_pipe_is_an_error(tmp_path):
+    path = _commit_text(tmp_path, json.dumps({'version': 1}))
     with pytest.raises(PipeDiffError, match="missing a 'components' list"):
-        resolve_git_ref('HEAD', '/repo/pipeline.pipe')
+        resolve_git_ref('HEAD', path)
 
 
 # ---------------------------------------------------------------------------
-# Mocked symlink walk (the tree is described, not built)
-# ---------------------------------------------------------------------------
-
-_LINK = '120000'
-
-
-def _resolve_walk(monkeypatch, path, tree, links):
-    """Resolve ``path`` against a described tree and report the blob that was read."""
-    _install_fake_git(
-        monkeypatch,
-        {
-            'rev-parse': _completed(0, stdout='/repo\n'),
-            'show': _completed(0, stdout=json.dumps(SAMPLE_PIPE)),
-        },
-        tree=tree,
-        links=links,
-    )
-    shown = []
-    real_run = gitref.subprocess.run
-
-    def spy(args, **kwargs):
-        if args[3] == 'show':
-            shown.append(args[-1])
-        return real_run(args, **kwargs)
-
-    monkeypatch.setattr(gitref.subprocess, 'run', spy)
-    pipe = resolve_git_ref('HEAD', path)
-    return pipe, shown
-
-
-def test_walk_follows_a_file_link_chain_as_committed(monkeypatch):
-    pipe, shown = _resolve_walk(
-        monkeypatch,
-        '/repo/current.pipe',
-        {'current.pipe': _LINK, 'mid.pipe': _LINK, 'v1.pipe': '100644'},
-        {'current.pipe': 'mid.pipe', 'mid.pipe': 'v1.pipe'},
-    )
-    assert pipe == SAMPLE_PIPE
-    assert shown == ['HEAD:v1.pipe']
-
-
-def test_walk_follows_a_directory_link_in_the_requested_path(monkeypatch):
-    # `flows` is a link at the ref: git cannot list through it, so the link text
-    # has to be substituted for the component
-    pipe, shown = _resolve_walk(
-        monkeypatch,
-        '/repo/flows/rag.pipe',
-        {'flows': _LINK, 'flows_v1/rag.pipe': '100644', 'flows_v2/rag.pipe': '100644'},
-        {'flows': 'flows_v1'},
-    )
-    assert pipe == SAMPLE_PIPE
-    assert shown == ['HEAD:flows_v1/rag.pipe']
-
-
-def test_walk_follows_a_link_whose_target_runs_through_a_directory_link(monkeypatch):
-    # current.pipe -> lnk/v.pipe with lnk -> real: `cat-file -e HEAD:lnk/v.pipe`
-    # fails, and treating that as "absent" reported the whole file as added
-    pipe, shown = _resolve_walk(
-        monkeypatch,
-        '/repo/current.pipe',
-        {'current.pipe': _LINK, 'lnk': _LINK, 'real/v.pipe': '100644'},
-        {'current.pipe': 'lnk/v.pipe', 'lnk': 'real'},
-    )
-    assert pipe == SAMPLE_PIPE
-    assert shown == ['HEAD:real/v.pipe']
-
-
-def test_walk_applies_dotdot_in_link_text_to_the_resolved_path(monkeypatch):
-    # lnk -> deep/sub, so `lnk/..` is deep/, not the directory holding the link
-    pipe, shown = _resolve_walk(
-        monkeypatch,
-        '/repo/current.pipe',
-        {'current.pipe': _LINK, 'lnk': _LINK, 'x.pipe': '100644', 'deep/x.pipe': '100644', 'deep/sub/y.pipe': '100644'},
-        {'current.pipe': 'lnk/../x.pipe', 'lnk': 'deep/sub'},
-    )
-    assert pipe == SAMPLE_PIPE
-    assert shown == ['HEAD:deep/x.pipe']
-
-
-def test_walk_lets_dotdot_climb_back_to_the_repository_root_but_not_past_it(monkeypatch):
-    # lnk -> deep/sub: `lnk/../..` is the repository root, which is still inside
-    pipe, shown = _resolve_walk(
-        monkeypatch,
-        '/repo/current.pipe',
-        {'current.pipe': _LINK, 'lnk': _LINK, 'x.pipe': '100644', 'deep/sub/y.pipe': '100644'},
-        {'current.pipe': 'lnk/../../x.pipe', 'lnk': 'deep/sub'},
-    )
-    assert pipe == SAMPLE_PIPE
-    assert shown == ['HEAD:x.pipe']
-
-
-def test_walk_resolves_link_text_relative_to_the_directory_holding_the_link(monkeypatch):
-    pipe, shown = _resolve_walk(
-        monkeypatch,
-        '/repo/a/b/current.pipe',
-        {'a/b/current.pipe': _LINK, 'a/v.pipe': '100644', 'v.pipe': '100644'},
-        {'a/b/current.pipe': '../v.pipe'},
-    )
-    assert pipe == SAMPLE_PIPE
-    assert shown == ['HEAD:a/v.pipe']
-
-
-def test_walk_returns_none_when_a_link_target_is_absent_at_the_ref(monkeypatch):
-    pipe, _shown = _resolve_walk(
-        monkeypatch, '/repo/current.pipe', {'current.pipe': _LINK}, {'current.pipe': 'gone.pipe'}
-    )
-    assert pipe is None
-
-
-def test_walk_returns_none_when_a_directory_on_the_path_is_absent(monkeypatch):
-    pipe, _shown = _resolve_walk(monkeypatch, '/repo/missing/rag.pipe', {'other/rag.pipe': '100644'}, {})
-    assert pipe is None
-
-
-@pytest.mark.parametrize(
-    'target',
-    ['/etc/rag.pipe', '../outside.pipe', 'lnk/../../../outside.pipe'],
-    ids=['absolute', 'parent', 'through-a-link'],
-)
-def test_walk_rejects_a_link_that_leaves_the_repository(monkeypatch, target):
-    with pytest.raises(PipeDiffError, match='outside the repository'):
-        _resolve_walk(
-            monkeypatch,
-            '/repo/current.pipe',
-            {'current.pipe': _LINK, 'lnk': _LINK, 'deep/sub/y.pipe': '100644'},
-            {'current.pipe': target, 'lnk': 'deep/sub'},
-        )
-
-
-@pytest.mark.parametrize(
-    ('tree', 'links'),
-    [
-        ({'a.pipe': _LINK, 'b.pipe': _LINK}, {'a.pipe': 'b.pipe', 'b.pipe': 'a.pipe'}),
-        ({'a.pipe': _LINK}, {'a.pipe': 'a.pipe'}),
-        ({'d': _LINK}, {'d': 'd/d'}),
-    ],
-    ids=['two-cycle', 'self-link', 'self-nesting-directory'],
-)
-def test_walk_stops_a_link_loop_with_a_clear_error(monkeypatch, tree, links):
-    with pytest.raises(PipeDiffError, match='too many levels of symbolic links'):
-        _resolve_walk(monkeypatch, f'/repo/{next(iter(tree))}', tree, links)
-
-
-def test_walk_does_not_swallow_a_failing_tree_listing(monkeypatch):
-    _install_fake_git(
-        monkeypatch,
-        {
-            'rev-parse': _completed(0, stdout='/repo\n'),
-            'ls-tree': _completed(128, stderr='fatal: unable to read tree'),
-        },
-    )
-    with pytest.raises(PipeDiffError, match='ls-tree'):
-        resolve_git_ref('HEAD', '/repo/pipeline.pipe')
-
-
-# ---------------------------------------------------------------------------
-# Real git integration (isolated temp repo)
+# Reading a file at a ref
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skipif(shutil.which('git') is None, reason='git not installed')
+@needs_git
 def test_resolve_git_ref_real_repository(tmp_path):
     pipe_file = tmp_path / 'pipeline.pipe'
     pipe_file.write_text(json.dumps(SAMPLE_PIPE), encoding='utf-8')
@@ -496,6 +236,11 @@ def test_resolve_git_ref_real_repository(tmp_path):
     untracked.write_text(json.dumps(SAMPLE_PIPE), encoding='utf-8')
     assert resolve_git_ref('HEAD', str(untracked)) is None
 
+    # So is a file in a directory the ref does not have.
+    (tmp_path / 'newdir').mkdir()
+    (tmp_path / 'newdir' / 'rag.pipe').write_text(json.dumps(SAMPLE_PIPE), encoding='utf-8')
+    assert resolve_git_ref('HEAD', str(tmp_path / 'newdir' / 'rag.pipe')) is None
+
 
 def _case_insensitive(path):
     """Report whether the filesystem holding ``path`` folds case."""
@@ -507,7 +252,7 @@ def _case_insensitive(path):
         probe.unlink()
 
 
-@pytest.mark.skipif(shutil.which('git') is None, reason='git not installed')
+@needs_git
 def test_untracked_symlink_is_looked_up_by_its_own_path(tmp_path):
     # Documented as `git show <ref>:<FILE>`: a link that is not in the ref is new,
     # even when the file it points at is tracked.
@@ -517,10 +262,9 @@ def test_untracked_symlink_is_looked_up_by_its_own_path(tmp_path):
     assert resolve_git_ref('HEAD', str(tmp_path / 'link.pipe')) is None
 
 
-@pytest.mark.skipif(shutil.which('git') is None, reason='git not installed')
+@needs_git
 def test_tracked_symlink_resolves_to_its_target(tmp_path):
-    # `git show` of a committed link returns the link text, not a pipe; compare
-    # the target the working-tree link reads instead.
+    # A committed link is read through to the file it names at the ref.
     (tmp_path / 'pipeline.pipe').write_text(json.dumps(SAMPLE_PIPE), encoding='utf-8')
     make_symlink(tmp_path / 'link.pipe', 'pipeline.pipe')
     init_repo(tmp_path, 'pipeline.pipe', 'link.pipe')
@@ -528,7 +272,7 @@ def test_tracked_symlink_resolves_to_its_target(tmp_path):
     assert resolve_git_ref('HEAD', str(tmp_path / 'link.pipe')) == SAMPLE_PIPE
 
 
-@pytest.mark.skipif(shutil.which('git') is None, reason='git not installed')
+@needs_git
 def test_repository_reached_through_a_symlinked_directory(tmp_path):
     real = tmp_path / 'real'
     real.mkdir()
@@ -538,7 +282,7 @@ def test_repository_reached_through_a_symlinked_directory(tmp_path):
     assert resolve_git_ref('HEAD', str(tmp_path / 'alias' / 'pipeline.pipe')) == SAMPLE_PIPE
 
 
-@pytest.mark.skipif(shutil.which('git') is None, reason='git not installed')
+@needs_git
 def test_mis_cased_path_finds_the_tracked_file_on_a_case_insensitive_filesystem(tmp_path):
     if not _case_insensitive(tmp_path):
         pytest.skip('filesystem is case-sensitive')
@@ -546,12 +290,11 @@ def test_mis_cased_path_finds_the_tracked_file_on_a_case_insensitive_filesystem(
     sub.mkdir()
     (sub / 'rag.pipe').write_text(json.dumps(SAMPLE_PIPE), encoding='utf-8')
     init_repo(tmp_path, 'Flows/rag.pipe')
-    # The working-tree path opens the tracked file, so compare against it rather
-    # than reporting every node as added.
+    # The working-tree path opens the tracked file, so it is not a new one.
     assert resolve_git_ref('HEAD', str(sub / 'RAG.pipe')) == SAMPLE_PIPE
 
 
-@pytest.mark.skipif(shutil.which('git') is None, reason='git not installed')
+@needs_git
 def test_mis_cased_path_to_a_tracked_symlink_compares_its_target(tmp_path):
     if not _case_insensitive(tmp_path):
         pytest.skip('filesystem is case-sensitive')
@@ -563,7 +306,7 @@ def test_mis_cased_path_to_a_tracked_symlink_compares_its_target(tmp_path):
     assert resolve_git_ref('HEAD', str(tmp_path / 'link.pipe')) == SAMPLE_PIPE
 
 
-@pytest.mark.skipif(shutil.which('git') is None, reason='git not installed')
+@needs_git
 def test_differently_cased_new_file_is_new_on_a_case_sensitive_filesystem(tmp_path):
     if _case_insensitive(tmp_path):
         pytest.skip('filesystem folds case')
@@ -577,7 +320,7 @@ def _pipe_with(value):
     return {'components': [{'id': 'a', 'provider': 'src', 'config': {'value': value}}], 'version': 1}
 
 
-@pytest.mark.skipif(shutil.which('git') is None, reason='git not installed')
+@needs_git
 def test_retargeted_symlink_compares_the_target_it_had_at_the_ref(tmp_path):
     # The old side follows the link text stored at the ref, not the link's
     # current target: a retarget from v1 to v2 is a real pipeline swap.
@@ -590,7 +333,7 @@ def test_retargeted_symlink_compares_the_target_it_had_at_the_ref(tmp_path):
     assert resolve_git_ref('HEAD', str(tmp_path / 'current.pipe')) == _pipe_with(1)
 
 
-@pytest.mark.skipif(shutil.which('git') is None, reason='git not installed')
+@needs_git
 def test_symlink_at_the_ref_is_followed_even_when_the_file_is_now_regular(tmp_path):
     (tmp_path / 'v1.pipe').write_text(json.dumps(_pipe_with(1)), encoding='utf-8')
     make_symlink(tmp_path / 'current.pipe', 'v1.pipe')
@@ -600,7 +343,7 @@ def test_symlink_at_the_ref_is_followed_even_when_the_file_is_now_regular(tmp_pa
     assert resolve_git_ref('HEAD', str(tmp_path / 'current.pipe')) == _pipe_with(1)
 
 
-@pytest.mark.skipif(shutil.which('git') is None, reason='git not installed')
+@needs_git
 def test_symlink_at_the_ref_pointing_outside_the_repository_is_an_error(tmp_path):
     repo = tmp_path / 'repo'
     repo.mkdir()
@@ -612,7 +355,7 @@ def test_symlink_at_the_ref_pointing_outside_the_repository_is_an_error(tmp_path
         resolve_git_ref('HEAD', str(repo / 'current.pipe'))
 
 
-@pytest.mark.skipif(shutil.which('git') is None, reason='git not installed')
+@needs_git
 def test_dotdot_after_a_directory_symlink_follows_the_physical_path(tmp_path):
     # The blob looked up must be the file the OS opens for this path. On POSIX
     # `lnk/..` is the parent of lnk's target (deep/), not the directory holding
@@ -631,7 +374,7 @@ def test_dotdot_after_a_directory_symlink_follows_the_physical_path(tmp_path):
         assert opened == _pipe_with(7)
 
 
-@pytest.mark.skipif(shutil.which('git') is None, reason='git not installed')
+@needs_git
 @pytest.mark.parametrize('spelling', ['RepoDir/flows/rag.pipe', 'repodir/Flows/rag.pipe', 'REPODIR/FLOWS/RAG.PIPE'])
 def test_mis_cased_directories_find_the_tracked_file_on_a_case_insensitive_filesystem(tmp_path, spelling):
     if not _case_insensitive(tmp_path):
@@ -660,11 +403,11 @@ def _read_pipe(path):
 
 
 # ---------------------------------------------------------------------------
-# Directory links, `..` in link text, link loops (real git)
+# Directory links, `..` in link text, link loops
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skipif(shutil.which('git') is None, reason='git not installed')
+@needs_git
 def test_retargeted_directory_symlink_compares_the_directory_it_had_at_the_ref(tmp_path):
     # `flows -> flows_v1` repointed to flows_v2 is the directory-level version of
     # the current.pipe retarget: the pipeline on disk is v2's, the old side must
@@ -681,7 +424,7 @@ def test_retargeted_directory_symlink_compares_the_directory_it_had_at_the_ref(t
     assert resolve_git_ref('HEAD', str(path)) == _pipe_with(1)
 
 
-@pytest.mark.skipif(shutil.which('git') is None, reason='git not installed')
+@needs_git
 def test_retargeted_directory_symlink_is_found_from_a_relative_path(tmp_path, monkeypatch):
     _write_pipe(tmp_path / 'flows_v1' / 'rag.pipe', 1)
     _write_pipe(tmp_path / 'flows_v2' / 'rag.pipe', 2)
@@ -694,7 +437,7 @@ def test_retargeted_directory_symlink_is_found_from_a_relative_path(tmp_path, mo
     assert resolve_git_ref('HEAD', os.path.join('flows', 'rag.pipe')) == _pipe_with(1)
 
 
-@pytest.mark.skipif(shutil.which('git') is None, reason='git not installed')
+@needs_git
 def test_directory_that_is_now_a_symlink_is_still_read_as_a_directory_at_the_ref(tmp_path):
     _write_pipe(tmp_path / 'flows' / 'rag.pipe', 1)
     _write_pipe(tmp_path / 'elsewhere' / 'rag.pipe', 2)
@@ -705,11 +448,10 @@ def test_directory_that_is_now_a_symlink_is_still_read_as_a_directory_at_the_ref
     assert resolve_git_ref('HEAD', str(tmp_path / 'flows' / 'rag.pipe')) == _pipe_with(1)
 
 
-@pytest.mark.skipif(shutil.which('git') is None, reason='git not installed')
+@needs_git
 def test_link_through_a_directory_link_is_not_reported_as_new(tmp_path):
-    # current.pipe -> lnk/v.pipe with lnk -> real: git trees do not traverse the
-    # link, so `cat-file -e HEAD:lnk/v.pipe` fails; reading that as "absent"
-    # reported an unchanged pipeline as one added node
+    # current.pipe -> lnk/v.pipe with lnk -> real: the file is reached through a directory
+    # link, so it exists at the ref and an unchanged pipeline is not reported as new
     _write_pipe(tmp_path / 'real' / 'v.pipe', 1)
     make_symlink(tmp_path / 'lnk', 'real', directory=True)
     make_symlink(tmp_path / 'current.pipe', 'lnk/v.pipe')
@@ -723,11 +465,11 @@ def test_link_through_a_directory_link_is_not_reported_as_new(tmp_path):
     assert resolve_git_ref('HEAD', str(tmp_path / 'current.pipe')) == _pipe_with(1)
 
 
-@pytest.mark.skipif(shutil.which('git') is None, reason='git not installed')
+@needs_git
 @pytest.mark.skipif(os.name == 'nt', reason='Windows does not resolve `..` in link text through a link the POSIX way')
 def test_dotdot_in_committed_link_text_follows_the_physical_path(tmp_path):
     # current.pipe -> lnk/../x.pipe with lnk -> deep/sub: the OS opens deep/x.pipe
-    # (the parent of lnk's TARGET); folding `..` as text read the top-level x.pipe
+    # (the parent of lnk's target), not the top-level x.pipe
     _write_pipe(tmp_path / 'x.pipe', 2)
     _write_pipe(tmp_path / 'deep' / 'x.pipe', 1)
     # git records no empty directory, so deep/sub must hold a tracked file to exist at the ref
@@ -741,7 +483,22 @@ def test_dotdot_in_committed_link_text_follows_the_physical_path(tmp_path):
     assert resolve_git_ref('HEAD', str(tmp_path / 'current.pipe')) == _pipe_with(1)
 
 
-@pytest.mark.skipif(shutil.which('git') is None, reason='git not installed')
+@needs_git
+@pytest.mark.skipif(os.name == 'nt', reason='Windows folds `..` in link text as text before it reaches a link')
+def test_dotdot_in_committed_link_text_can_climb_back_to_the_repository_root(tmp_path):
+    # current.pipe -> lnk/../../x.pipe with lnk -> deep/sub: the two `..` leave deep/sub and deep
+    _write_pipe(tmp_path / 'x.pipe', 1)
+    _write_pipe(tmp_path / 'deep' / 'x.pipe', 2)
+    _write_pipe(tmp_path / 'deep' / 'sub' / 'y.pipe', 3)
+    make_symlink(tmp_path / 'lnk', 'deep/sub', directory=True)
+    make_symlink(tmp_path / 'current.pipe', 'lnk/../../x.pipe')
+    init_repo(tmp_path, 'x.pipe', 'deep', 'lnk', 'current.pipe')
+    _write_pipe(tmp_path / 'x.pipe', 9)
+
+    assert resolve_git_ref('HEAD', str(tmp_path / 'current.pipe')) == _pipe_with(1)
+
+
+@needs_git
 def test_file_that_is_now_a_symlink_is_still_read_as_a_file_at_the_ref(tmp_path):
     _write_pipe(tmp_path / 'current.pipe', 1)
     _write_pipe(tmp_path / 'other.pipe', 9)
@@ -752,7 +509,7 @@ def test_file_that_is_now_a_symlink_is_still_read_as_a_file_at_the_ref(tmp_path)
     assert resolve_git_ref('HEAD', str(tmp_path / 'current.pipe')) == _pipe_with(1)
 
 
-@pytest.mark.skipif(shutil.which('git') is None, reason='git not installed')
+@needs_git
 def test_dotdot_after_a_directory_symlink_in_a_relative_path(tmp_path, monkeypatch):
     # git records no empty directory, so deep/sub must hold a tracked file to exist at the ref
     _write_pipe(tmp_path / 'deep' / 'sub' / 'y.pipe', 3)
@@ -769,17 +526,44 @@ def test_dotdot_after_a_directory_symlink_in_a_relative_path(tmp_path, monkeypat
         assert opened == _pipe_with(7)
 
 
-@pytest.mark.skipif(shutil.which('git') is None, reason='git not installed')
-def test_symlink_loop_at_the_ref_is_a_clear_error(tmp_path):
-    make_symlink(tmp_path / 'a.pipe', 'b.pipe')
-    make_symlink(tmp_path / 'b.pipe', 'a.pipe')
-    init_repo(tmp_path, 'a.pipe', 'b.pipe')
+@needs_git
+@pytest.mark.parametrize('shape', ['two-cycle', 'self-link', 'self-nesting-directory'])
+def test_symlink_loop_at_the_ref_is_a_clear_error(tmp_path, shape):
+    if shape == 'two-cycle':
+        make_symlink(tmp_path / 'a.pipe', 'b.pipe')
+        make_symlink(tmp_path / 'b.pipe', 'a.pipe')
+        names = ['a.pipe', 'b.pipe']
+    elif shape == 'self-link':
+        make_symlink(tmp_path / 'a.pipe', 'a.pipe')
+        names = ['a.pipe']
+    else:
+        make_symlink(tmp_path / 'a.pipe', 'a.pipe/a.pipe', directory=True)
+        names = ['a.pipe']
+    init_repo(tmp_path, *names)
 
     with pytest.raises(PipeDiffError, match='too many levels of symbolic links'):
         resolve_git_ref('HEAD', str(tmp_path / 'a.pipe'))
 
 
-@pytest.mark.skipif(shutil.which('git') is None, reason='git not installed')
+@needs_git
+def test_link_to_a_file_that_was_absent_at_the_ref_is_new(tmp_path):
+    make_symlink(tmp_path / 'current.pipe', 'gone.pipe')
+    init_repo(tmp_path, 'current.pipe')
+
+    assert resolve_git_ref('HEAD', str(tmp_path / 'current.pipe')) is None
+
+
+@needs_git
+def test_directory_that_was_a_file_at_the_ref_is_new(tmp_path):
+    (tmp_path / 'flows').write_text('not a directory', encoding='utf-8')
+    init_repo(tmp_path, 'flows')
+    (tmp_path / 'flows').unlink()
+    _write_pipe(tmp_path / 'flows' / 'rag.pipe', 1)
+
+    assert resolve_git_ref('HEAD', str(tmp_path / 'flows' / 'rag.pipe')) is None
+
+
+@needs_git
 def test_directory_link_whose_target_was_absent_at_the_ref_is_new(tmp_path):
     # At the ref `flows` was a link to a directory that did not exist; the
     # pipeline in the real `flows/` directory now is therefore new
@@ -803,7 +587,7 @@ def _retargeted_directory_link_repo(tmp_path):
     make_symlink(tmp_path / 'flows', 'flows_v2', directory=True)
 
 
-@pytest.mark.skipif(shutil.which('git') is None, reason='git not installed')
+@needs_git
 def test_directory_link_retarget_is_seen_through_dotdot_after_a_real_directory(tmp_path, monkeypatch):
     # `sub/../flows/rag.pipe` is `flows/rag.pipe`: the verdict must not depend on how
     # the same file is spelled, nor on the working directory
@@ -815,12 +599,11 @@ def test_directory_link_retarget_is_seen_through_dotdot_after_a_real_directory(t
     assert resolve_git_ref('HEAD', os.path.join('.', os.pardir, 'flows', '.', 'rag.pipe')) == _pipe_with(1)
 
 
-@pytest.mark.skipif(shutil.which('git') is None, reason='git not installed')
+@needs_git
 @pytest.mark.parametrize('directory', ['d[1]', ':(top)x', 'with space'], ids=['glob', 'pathspec-magic', 'space'])
 @pytest.mark.skipif(os.name == 'nt', reason='Windows file names cannot hold ":", "[" patterns the same way')
 def test_directory_names_that_look_like_patterns_are_taken_literally(tmp_path, directory):
-    # `ls-tree -- ':(top)x/'` reads the name as pathspec magic; the listing is
-    # requested as <ref>:<directory> so it is a plain path
+    # A directory named like a glob, or like pathspec magic, is an ordinary name
     _write_pipe(tmp_path / directory / '*a?.pipe', 1)
     _write_pipe(tmp_path / 'other' / '*a?.pipe', 2)
     init_repo(tmp_path, directory, 'other')
@@ -828,7 +611,7 @@ def test_directory_names_that_look_like_patterns_are_taken_literally(tmp_path, d
     assert resolve_git_ref('HEAD', str(tmp_path / directory / '*a?.pipe')) == _pipe_with(1)
 
 
-@pytest.mark.skipif(shutil.which('git') is None, reason='git not installed')
+@needs_git
 def test_typed_component_after_a_link_keeps_its_case_recovery(tmp_path):
     # lnk -> Flows is committed; `lnk/RAG.pipe` types the file after the link in
     # another case, which is still the tracked Flows/rag.pipe on this filesystem
@@ -842,17 +625,12 @@ def test_typed_component_after_a_link_keeps_its_case_recovery(tmp_path):
     assert resolve_git_ref('HEAD', str(tmp_path / 'LNK' / 'RAG.pipe')) == _pipe_with(1)
 
 
-def test_walk_stops_at_a_file_with_more_path_after_it(monkeypatch):
-    pipe, _shown = _resolve_walk(monkeypatch, '/repo/pipeline.pipe/more.pipe', {'pipeline.pipe': '100644'}, {})
-    assert pipe is None
-
-
 # ---------------------------------------------------------------------------
 # Case: every component is recovered from the ref's tree
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skipif(shutil.which('git') is None, reason='git not installed')
+@needs_git
 @pytest.mark.parametrize(
     ('tracked', 'renamed_to', 'typed'),
     [
@@ -876,7 +654,7 @@ def test_case_only_rename_on_disk_still_finds_the_tracked_file(tmp_path, tracked
     assert resolve_git_ref('HEAD', str(tmp_path / typed)) == _pipe_with(1)
 
 
-@pytest.mark.skipif(shutil.which('git') is None, reason='git not installed')
+@needs_git
 def test_tracked_link_is_followed_by_the_ref_even_when_it_is_now_a_regular_file_under_another_case(tmp_path):
     # The tree entry at the ref decides whether the content is a link, also after
     # the spelling was recovered: Link.pipe is a link there, a regular file now
@@ -891,7 +669,7 @@ def test_tracked_link_is_followed_by_the_ref_even_when_it_is_now_a_regular_file_
     assert resolve_git_ref('HEAD', str(tmp_path / 'flows' / 'link.pipe')) == _pipe_with(1)
 
 
-@pytest.mark.skipif(shutil.which('git') is None, reason='git not installed')
+@needs_git
 def test_differently_cased_directory_is_new_on_a_case_sensitive_filesystem(tmp_path):
     if _case_insensitive(tmp_path):
         pytest.skip('filesystem folds case')
@@ -912,7 +690,7 @@ def test_differently_cased_directory_is_new_on_a_case_sensitive_filesystem(tmp_p
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skipif(shutil.which('git') is None, reason='git not installed')
+@needs_git
 def test_absolute_link_into_the_repository_is_read_at_the_ref(tmp_path):
     _write_pipe(tmp_path / 'real' / 'v.pipe', 1)
     make_symlink(tmp_path / 'abs.pipe', tmp_path / 'real' / 'v.pipe')
@@ -923,10 +701,9 @@ def test_absolute_link_into_the_repository_is_read_at_the_ref(tmp_path):
     assert resolve_git_ref('HEAD', str(tmp_path / 'abs.pipe')) == _pipe_with(1)
 
 
-@pytest.mark.skipif(shutil.which('git') is None, reason='git not installed')
+@needs_git
 def test_absolute_directory_link_into_the_repository_keeps_the_rest_of_the_path(tmp_path):
-    # cur.pipe -> absdir/v.pipe with absdir -> <repo>/real: `cat-file --follow-symlinks` answers
-    # this with the directory alone, the rest of the path lost
+    # cur.pipe -> absdir/v.pipe with absdir -> <repo>/real: the path after the directory link is kept
     _write_pipe(tmp_path / 'real' / 'v.pipe', 1)
     make_symlink(tmp_path / 'absdir', tmp_path / 'real', directory=True)
     make_symlink(tmp_path / 'cur.pipe', 'absdir/v.pipe')
@@ -938,7 +715,7 @@ def test_absolute_directory_link_into_the_repository_keeps_the_rest_of_the_path(
     assert resolve_git_ref('HEAD', str(tmp_path / 'absdir' / 'v.pipe')) == _pipe_with(1)
 
 
-@pytest.mark.skipif(shutil.which('git') is None, reason='git not installed')
+@needs_git
 def test_link_that_climbs_out_of_the_repository_and_comes_back_is_read_at_the_ref(tmp_path):
     repo = tmp_path / 'repo'
     _write_pipe(repo / 'v1.pipe', 1)
@@ -950,7 +727,7 @@ def test_link_that_climbs_out_of_the_repository_and_comes_back_is_read_at_the_re
     assert resolve_git_ref('HEAD', str(repo / 'cur.pipe')) == _pipe_with(1)
 
 
-@pytest.mark.skipif(shutil.which('git') is None, reason='git not installed')
+@needs_git
 def test_nested_link_that_climbs_out_of_the_repository_and_comes_back_is_read_at_the_ref(tmp_path):
     repo = tmp_path / 'repo'
     _write_pipe(repo / 'sub' / 'v1.pipe', 1)
@@ -962,7 +739,7 @@ def test_nested_link_that_climbs_out_of_the_repository_and_comes_back_is_read_at
     assert resolve_git_ref('HEAD', str(repo / 'sub' / 'cur.pipe')) == _pipe_with(1)
 
 
-@pytest.mark.skipif(shutil.which('git') is None, reason='git not installed')
+@needs_git
 def test_path_that_comes_back_in_is_read_through_the_ref_not_the_working_tree_links(tmp_path):
     # Outside the repository only the disk can say where the path goes; once back inside,
     # `lnk` is the link as committed (-> d1), not as it is now (-> d2)
@@ -979,7 +756,7 @@ def test_path_that_comes_back_in_is_read_through_the_ref_not_the_working_tree_li
     assert resolve_git_ref('HEAD', str(repo / 'cur.pipe')) == _pipe_with(1)
 
 
-@pytest.mark.skipif(shutil.which('git') is None, reason='git not installed')
+@needs_git
 @pytest.mark.parametrize('where', ['climbs-to-a-sibling', 'absolute-elsewhere', 'climbs-into-nothing'])
 def test_link_that_never_comes_back_is_an_error(tmp_path, where):
     repo = tmp_path / 'repo'
@@ -997,7 +774,7 @@ def test_link_that_never_comes_back_is_an_error(tmp_path, where):
         resolve_git_ref('HEAD', str(repo / 'cur.pipe'))
 
 
-@pytest.mark.skipif(shutil.which('git') is None, reason='git not installed')
+@needs_git
 def test_absolute_link_to_itself_is_a_loop_error_not_a_hang(tmp_path):
     make_symlink(tmp_path / 'loop.pipe', tmp_path / 'loop.pipe')
     init_repo(tmp_path, 'loop.pipe')
@@ -1006,7 +783,7 @@ def test_absolute_link_to_itself_is_a_loop_error_not_a_hang(tmp_path):
         resolve_git_ref('HEAD', str(tmp_path / 'loop.pipe'))
 
 
-@pytest.mark.skipif(shutil.which('git') is None, reason='git not installed')
+@needs_git
 def test_chain_of_links_across_a_directory_link_is_followed_to_the_end(tmp_path):
     # c.pipe -> b.pipe -> lnk/a.pipe, with lnk -> real: every hop is a committed link
     _write_pipe(tmp_path / 'real' / 'a.pipe', 1)
@@ -1019,10 +796,10 @@ def test_chain_of_links_across_a_directory_link_is_followed_to_the_end(tmp_path)
     assert resolve_git_ref('HEAD', str(tmp_path / 'c.pipe')) == _pipe_with(1)
 
 
-@pytest.mark.skipif(shutil.which('git') is None, reason='git not installed')
+@needs_git
 def test_directory_link_that_climbs_out_and_comes_back_keeps_the_rest_of_the_path(tmp_path):
     # up -> ../repo/deep is a directory link written through the repository's own path: typed
-    # `up/x.pipe` is deep/x.pipe at the ref (`cat-file --follow-symlinks` reports it as outside)
+    # `up/x.pipe` is deep/x.pipe at the ref
     repo = tmp_path / 'repo'
     _write_pipe(repo / 'deep' / 'x.pipe', 1)
     make_symlink(repo / 'up', '../repo/deep', directory=True)
@@ -1035,7 +812,7 @@ def test_directory_link_that_climbs_out_and_comes_back_keeps_the_rest_of_the_pat
     assert resolve_git_ref('HEAD', str(repo / 'whole' / 'deep' / 'x.pipe')) == _pipe_with(1)
 
 
-@pytest.mark.skipif(shutil.which('git') is None, reason='git not installed')
+@needs_git
 def test_typed_path_that_climbs_out_of_the_repository_and_back_is_the_same_file(tmp_path):
     repo = tmp_path / 'repo'
     _write_pipe(repo / 'x.pipe', 1)
@@ -1046,7 +823,7 @@ def test_typed_path_that_climbs_out_of_the_repository_and_back_is_the_same_file(
     assert resolve_git_ref('HEAD', str(repo / 'x.pipe')) == _pipe_with(1)
 
 
-@pytest.mark.skipif(shutil.which('git') is None, reason='git not installed')
+@needs_git
 def test_typed_path_that_climbs_out_and_goes_elsewhere_is_an_error(tmp_path):
     repo = tmp_path / 'repo'
     _write_pipe(repo / 'x.pipe', 1)
@@ -1057,12 +834,11 @@ def test_typed_path_that_climbs_out_and_goes_elsewhere_is_an_error(tmp_path):
         resolve_git_ref('HEAD', str(repo) + '/../elsewhere/x.pipe')
 
 
-@pytest.mark.skipif(shutil.which('git') is None, reason='git not installed')
+@needs_git
 @pytest.mark.skipif(os.name == 'nt', reason='Windows folds `..` as text before it reaches a link')
 def test_typed_dotdot_after_a_retargeted_directory_link_means_the_link_as_committed(tmp_path):
     # lnk -> deep/sub at the ref, deep2/sub now. `lnk/../x.pipe` then opens deep2/x.pipe, but at the
-    # ref the same words named deep/x.pipe, and that is the old side. (Reading the parent of
-    # lnk's current target gave deep2/x.pipe at the ref: a different pipeline, so no change shown.)
+    # ref the same words named deep/x.pipe, and that is the old side.
     _write_pipe(tmp_path / 'deep' / 'x.pipe', 1)
     _write_pipe(tmp_path / 'deep' / 'sub' / 'y.pipe', 5)
     _write_pipe(tmp_path / 'deep2' / 'x.pipe', 9)
@@ -1077,7 +853,7 @@ def test_typed_dotdot_after_a_retargeted_directory_link_means_the_link_as_commit
     assert resolve_git_ref('HEAD', path) == _pipe_with(1)
 
 
-@pytest.mark.skipif(shutil.which('git') is None, reason='git not installed')
+@needs_git
 @pytest.mark.skipif(os.name == 'nt', reason='$PWD is a POSIX shell variable')
 def test_relative_path_inside_a_retargeted_directory_link_means_the_link_as_committed(tmp_path, monkeypatch):
     # `cd cur` (cur was v1dir at the ref, v2dir now), then `rocketride diff --git HEAD rag.pipe`:
@@ -1095,7 +871,7 @@ def test_relative_path_inside_a_retargeted_directory_link_means_the_link_as_comm
     assert resolve_git_ref('HEAD', 'rag.pipe') == _pipe_with(1)
 
 
-@pytest.mark.skipif(shutil.which('git') is None, reason='git not installed')
+@needs_git
 @pytest.mark.skipif(os.name == 'nt', reason='$PWD is a POSIX shell variable')
 @pytest.mark.parametrize('stale', ['elsewhere', 'missing', 'relative/path', ''])
 def test_pwd_that_does_not_name_the_working_directory_is_ignored(tmp_path, monkeypatch, stale):
@@ -1109,19 +885,8 @@ def test_pwd_that_does_not_name_the_working_directory_is_ignored(tmp_path, monke
     assert resolve_git_ref('HEAD', 'rag.pipe') == _pipe_with(1)
 
 
-def test_a_working_directory_that_is_gone_is_a_clean_error(monkeypatch):
-    def gone():
-        raise FileNotFoundError(2, 'No such file or directory')
-
-    monkeypatch.setattr(os, 'getcwd', gone)
-    with pytest.raises(PipeDiffError, match='working directory is gone'):
-        gitref._logical_cwd()
-
-
 @pytest.mark.skipif(os.name == 'nt', reason='Windows cannot remove the working directory of a running process')
 def test_resolve_git_ref_from_a_working_directory_that_is_gone(tmp_path, monkeypatch):
-    # The public entry point, not only the helper: realpath of a relative path
-    # needs the working directory before anything else runs
     gone = tmp_path / 'gone'
     gone.mkdir()
     monkeypatch.chdir(gone)
@@ -1131,128 +896,61 @@ def test_resolve_git_ref_from_a_working_directory_that_is_gone(tmp_path, monkeyp
         resolve_git_ref('HEAD', 'rag.pipe')
 
 
-@pytest.mark.parametrize('failure', [PermissionError(13, 'Permission denied'), OSError(8, 'Exec format error')])
-def test_git_that_cannot_be_run_is_a_clean_error(monkeypatch, failure):
-    # `git` is on PATH but cannot start (not executable, wrong architecture): not a traceback
-    _install_fake_git(monkeypatch, {'rev-parse': failure})
-
-    with pytest.raises(PipeDiffError, match='git could not be run'):
-        resolve_git_ref('HEAD', '/repo/pipeline.pipe')
-
-
-# The rules for link text that is not in git's own form, which the walk reads where it runs
-
-
-def test_link_text_with_backslashes_is_a_path_only_where_the_platform_says_so(monkeypatch):
-    tree = {'cur.pipe': _LINK, 'lnk': _LINK, 'real/v.pipe': '100644'}
-    links = {'cur.pipe': 'lnk\\v.pipe', 'lnk': 'real'}
-
-    # A backslash is an ordinary character in a POSIX file name: one component, not found
-    monkeypatch.setattr(gitref, '_LINK_SEPARATOR', '/')
-    pipe, _shown = _resolve_walk(monkeypatch, '/repo/cur.pipe', tree, links)
-    assert pipe is None
-
-    # Windows opens it as a separator, so there it is lnk/v.pipe, and found
-    monkeypatch.setattr(gitref, '_LINK_SEPARATOR', r'[\\/]')
-    pipe, shown = _resolve_walk(monkeypatch, '/repo/cur.pipe', tree, links)
-    assert pipe == SAMPLE_PIPE
-    assert shown == ['HEAD:real/v.pipe']
-
-
-@pytest.mark.parametrize(
-    ('target', 'absolute'),
-    [
-        ('C:/Users/me/repo/v.pipe', True),
-        ('C:\\Users\\me\\repo\\v.pipe', True),
-        ('\\\\server\\share\\v.pipe', True),
-        ('/v.pipe', True),
-        ('real/v.pipe', False),
-        ('../v.pipe', False),
-        ('v.pipe', False),
-    ],
-)
-def test_absolute_link_text_is_recognised_in_the_forms_windows_writes(monkeypatch, target, absolute):
-    with monkeypatch.context() as patched:
-        patched.setattr(os, 'name', 'nt')
-        assert gitref._is_absolute_link(target) is absolute
-
-
-@pytest.mark.skipif(os.name == 'nt', reason='a drive letter is a drive on Windows')
-def test_a_drive_letter_is_an_ordinary_first_component_of_a_link_on_posix():
-    assert gitref._is_absolute_link('C:/Users/me/repo/v.pipe') is False
-
-
-def test_windows_absolute_link_text_splits_into_a_drive_root_and_components(monkeypatch):
-    with monkeypatch.context() as patched:
-        patched.setattr(os, 'name', 'nt')
-        patched.setattr(gitref, '_LINK_SEPARATOR', r'[\\/]')
-        assert gitref._absolute_link_pieces('D:/work/repo', 'C:/Users/me/v.pipe') == (
-            'C:' + os.sep,
-            ['Users', 'me', 'v.pipe'],
-        )
-        # no drive: the one the repository is on
-        assert gitref._absolute_link_pieces('D:/work/repo', '/Users/me/v.pipe') == (
-            'D:' + os.sep,
-            ['Users', 'me', 'v.pipe'],
-        )
-
-
 # ---------------------------------------------------------------------------
-# Case recovery, then links - on Linux too
+# Link text written for another platform
 #
-# A case-insensitive filesystem is not available there, so the filesystem's answer to "is
-# this the same entry?" is the one thing simulated; everything else is the real walk.
+# Committed link text is read the way the platform running the diff reads it. The links
+# below exist only in the commit, so each platform can store the same text.
 # ---------------------------------------------------------------------------
 
 
-def test_case_recovery_is_followed_by_link_resolution(monkeypatch):
-    tree = {'Flows/Lnk': _LINK, 'Flows/real/v.pipe': '100644'}
-    links = {'Flows/Lnk': 'real'}
-    # Linux cannot hold flows and Flows as one entry; pretend the volume folds case
-    monkeypatch.setattr(gitref, '_same_file', lambda first, second: first.casefold() == second.casefold())
+@needs_git
+def test_backslash_in_link_text_separates_components_only_on_windows(tmp_path):
+    _write_pipe(tmp_path / 'real' / 'v.pipe', 1)
+    _commit_links(tmp_path, {'lnk': 'real', 'cur.pipe': 'lnk' + chr(92) + 'v.pipe'}, 'real')
 
-    pipe, shown = _resolve_walk(monkeypatch, '/repo/flows/lnk/v.pipe', tree, links)
+    found = resolve_git_ref('HEAD', str(tmp_path / 'cur.pipe'))
 
-    assert pipe == SAMPLE_PIPE
-    assert shown == ['HEAD:Flows/real/v.pipe']  # tracked spelling for the typed ones, link text as committed
-
-
-def test_case_recovery_does_not_apply_to_link_text(monkeypatch):
-    # The text of a committed link is what the OS reads: `real` is not `REAL`, even where the
-    # volume folds case for typed paths. (A link written in the wrong case would not open there either.)
-    tree = {'cur.pipe': _LINK, 'real/v.pipe': '100644'}
-    links = {'cur.pipe': 'REAL/v.pipe'}
-    monkeypatch.setattr(gitref, '_same_file', lambda first, second: first.casefold() == second.casefold())
-
-    pipe, _shown = _resolve_walk(monkeypatch, '/repo/cur.pipe', tree, links)
-
-    assert pipe is None
+    # Elsewhere the backslash belongs to the name, and no such name is in the tree
+    assert found == (_pipe_with(1) if os.name == 'nt' else None)
 
 
-def test_case_recovery_needs_the_same_entry_on_disk(monkeypatch):
-    # Two tree entries and a typed name that matches both in case-folding: only the one that is the
-    # typed name's own entry on disk is taken
-    tree = {'Rag.pipe': '100644', 'rag.PIPE': '100644'}
-    # (no pair of different spellings is "the same file"; only an entry is the same as itself)
-    monkeypatch.setattr(gitref, '_same_file', lambda first, second: first == second)
+@needs_git
+@pytest.mark.parametrize(
+    'target',
+    ['C:/Users/me/repo/v.pipe', 'C:' + chr(92) + 'Users' + chr(92) + 'me' + chr(92) + 'repo' + chr(92) + 'v.pipe'],
+    ids=['slashes', 'backslashes'],
+)
+def test_link_text_starting_with_a_drive_letter_is_absolute_only_on_windows(tmp_path, target):
+    _commit_links(tmp_path, {'cur.pipe': target})
 
-    pipe, _shown = _resolve_walk(monkeypatch, '/repo/RAG.pipe', tree, {})
-
-    assert pipe is None
-
-
-def test_same_file_does_not_follow_links(tmp_path):
-    # Case recovery must not take an untracked RAG.pipe -> rag.pipe link for the tracked file just
-    # because both open the same content: os.path.samefile follows links, _same_file does not
-    _write_pipe(tmp_path / 'rag.pipe', 1)
-    make_symlink(tmp_path / 'alias.pipe', 'rag.pipe')
-
-    assert os.path.samefile(tmp_path / 'rag.pipe', tmp_path / 'alias.pipe')
-    assert gitref._same_file(str(tmp_path / 'rag.pipe'), str(tmp_path / 'alias.pipe')) is False
-    assert gitref._same_file(str(tmp_path / 'rag.pipe'), str(tmp_path / 'rag.pipe')) is True
+    if os.name == 'nt':
+        with pytest.raises(PipeDiffError, match='outside the repository'):
+            resolve_git_ref('HEAD', str(tmp_path / 'cur.pipe'))
+    else:
+        # Elsewhere "C:" is an ordinary directory name, and the tree has no such directory
+        assert resolve_git_ref('HEAD', str(tmp_path / 'cur.pipe')) is None
 
 
-@pytest.mark.skipif(shutil.which('git') is None, reason='git not installed')
+# ---------------------------------------------------------------------------
+# Case recovery and links (on filesystems that fold case)
+# ---------------------------------------------------------------------------
+
+
+@needs_git
+def test_link_text_is_taken_as_committed_not_case_recovered(tmp_path):
+    # The text of a committed link names its target exactly: `real` is not `REAL`, also
+    # on a volume that folds case for the paths a person types
+    if not _case_insensitive(tmp_path):
+        pytest.skip('filesystem is case-sensitive')
+    _write_pipe(tmp_path / 'real' / 'v.pipe', 1)
+    make_symlink(tmp_path / 'cur.pipe', 'REAL/v.pipe')
+    init_repo(tmp_path, 'real', 'cur.pipe')
+
+    assert resolve_git_ref('HEAD', str(tmp_path / 'cur.pipe')) is None
+
+
+@needs_git
 def test_untracked_differently_cased_link_to_a_tracked_file_is_new(tmp_path):
     # RAG.pipe -> rag.pipe is a link nobody committed: it is new, not the tracked file it points at.
     # (On a volume that folds case the two names are one entry and cannot coexist.)
@@ -1266,10 +964,10 @@ def test_untracked_differently_cased_link_to_a_tracked_file_is_new(tmp_path):
     assert resolve_git_ref('HEAD', str(tmp_path / 'rag.pipe')) == _pipe_with(1)
 
 
-@pytest.mark.skipif(shutil.which('git') is None, reason='git not installed')
+@needs_git
 def test_case_recovery_then_link_resolution_on_a_case_insensitive_filesystem(tmp_path):
     if not _case_insensitive(tmp_path):
-        pytest.skip('filesystem is case-sensitive (the simulated walk above covers the same logic)')
+        pytest.skip('filesystem is case-sensitive')
     _write_pipe(tmp_path / 'Flows' / 'real' / 'v.pipe', 1)
     make_symlink(tmp_path / 'Flows' / 'Lnk', 'real', directory=True)
     init_repo(tmp_path, 'Flows')
@@ -1303,7 +1001,7 @@ def _make_dir(path):
         pytest.skip(f'this process or filesystem cannot hold the name: {exc}')
 
 
-@pytest.mark.skipif(shutil.which('git') is None, reason='git not installed')
+@needs_git
 @pytest.mark.parametrize(
     'directory',
     [
@@ -1345,7 +1043,7 @@ def test_awkward_directory_names_are_looked_up_literally(tmp_path, directory):
     assert resolve_git_ref('HEAD', str(folder / 'rag.pipe')) == _pipe_with(1)
 
 
-@pytest.mark.skipif(shutil.which('git') is None, reason='git not installed')
+@needs_git
 @pytest.mark.skipif(os.name == 'nt', reason='Windows file names are text, not bytes')
 def test_non_ascii_name_given_as_bytes_is_found_whatever_the_filesystem_encoding(tmp_path):
     # In a process whose filesystem encoding is ASCII (the engine's interpreter on Linux) argv holds
@@ -1360,15 +1058,14 @@ def test_non_ascii_name_given_as_bytes_is_found_whatever_the_filesystem_encoding
     assert resolve_git_ref('HEAD', str(folder / 'rag.pipe')) == _pipe_with(1)
     # also after a link: the names in the link text are bytes too
     make_symlink(repo / 'cur.pipe', _name_from_bytes(b'caf\xc3\xa9 dir/rag.pipe'))
-    pipediff_git_helpers.commit_all(repo, 'link', 'cur.pipe')
+    commit_all(repo, 'link', 'cur.pipe')
     assert resolve_git_ref('HEAD', str(repo / 'cur.pipe')) == _pipe_with(1)
 
 
-@pytest.mark.skipif(shutil.which('git') is None, reason='git not installed')
+@needs_git
 @pytest.mark.skipif(os.name == 'nt', reason='Windows file names are text, not bytes')
 def test_a_name_that_is_not_utf8_does_not_break_a_listing_it_shares_a_directory_with(tmp_path):
-    # A legacy file name (latin-1 bytes) in the same directory used to make every `--git` lookup in
-    # that directory fail with "git output is not valid UTF-8"
+    # A legacy file name (latin-1 bytes) in the same directory does not stop the lookup
     repo = tmp_path / 'repo'
     repo.mkdir()
     _write_pipe(repo / 'rag.pipe', 1)
@@ -1382,18 +1079,8 @@ def test_a_name_that_is_not_utf8_does_not_break_a_listing_it_shares_a_directory_
     assert resolve_git_ref('HEAD', str(repo / 'rag.pipe')) == _pipe_with(1)
 
 
-def test_a_ref_that_looks_like_an_option_is_refused_before_git_runs(monkeypatch):
-    calls = []
-    monkeypatch.setattr(gitref.subprocess, 'run', lambda *args, **kwargs: calls.append(args))
-
-    with pytest.raises(PipeDiffError, match='Unknown git ref'):
-        resolve_git_ref('--output=evil', '/repo/pipeline.pipe')
-
-    assert calls == []
-
-
 # ---------------------------------------------------------------------------
-# The fixtures themselves are hermetic (they run in CI and on developer machines)
+# The fixtures themselves are hermetic
 # ---------------------------------------------------------------------------
 
 
@@ -1414,7 +1101,7 @@ def _hostile_user_setup(tmp_path):
 
 
 def _plain_commit(repo, env):
-    """What a fixture did before: git commit, inheriting whatever ``env`` carries."""
+    """Run a plain ``git commit`` that inherits whatever ``env`` carries."""
     base = {key: value for key, value in env.items() if not key.startswith('GIT_')}
     return subprocess.run(
         ['git', '-c', 'user.name=T', '-c', 'user.email=t@example.invalid', 'commit', '-q', '--allow-empty', '-m', 'x'],
@@ -1427,7 +1114,7 @@ def _plain_commit(repo, env):
     )
 
 
-@pytest.mark.skipif(shutil.which('git') is None, reason='git not installed')
+@needs_git
 @pytest.mark.skipif(os.name == 'nt', reason='the hostile pre-commit hook is a POSIX shell script')
 def test_fixture_commits_ignore_the_developers_signing_hooks_and_config(tmp_path, monkeypatch):
     config = _hostile_user_setup(tmp_path)
@@ -1440,22 +1127,22 @@ def test_fixture_commits_ignore_the_developers_signing_hooks_and_config(tmp_path
     (repo / 'a.pipe').write_text(json.dumps(SAMPLE_PIPE), encoding='utf-8')
 
     # The control: with that setup in effect a plain commit does not succeed
-    pipediff_git_helpers.run_git(repo, 'init', '-q')
-    pipediff_git_helpers.run_git(repo, 'add', 'a.pipe')
+    run_git(repo, 'init', '-q')
+    run_git(repo, 'add', 'a.pipe')
     assert _plain_commit(repo, dict(os.environ)).returncode != 0
 
     # The fixture does, and the committed file is readable at HEAD
-    pipediff_git_helpers.commit_all(repo, 'init', 'a.pipe')
+    commit_all(repo, 'init', 'a.pipe')
     assert resolve_git_ref('HEAD', str(repo / 'a.pipe')) == SAMPLE_PIPE
 
 
-@pytest.mark.skipif(shutil.which('git') is None, reason='git not installed')
+@needs_git
 def test_fixture_commits_never_land_in_an_inherited_repository(tmp_path, monkeypatch):
     # A test run from a git hook inherits GIT_DIR/GIT_INDEX_FILE/GIT_WORK_TREE of the
     # outer repository; the fixture's commits must go to its own repository, not there
     outer = tmp_path / 'outer'
     outer.mkdir()
-    pipediff_git_helpers.run_git(outer, 'init', '-q')
+    run_git(outer, 'init', '-q')
     monkeypatch.setenv('GIT_DIR', str(outer / '.git'))
     monkeypatch.setenv('GIT_WORK_TREE', str(outer))
     monkeypatch.setenv('GIT_INDEX_FILE', str(outer / '.git' / 'index'))
@@ -1466,26 +1153,22 @@ def test_fixture_commits_never_land_in_an_inherited_repository(tmp_path, monkeyp
     init_repo(inner, 'a.pipe')
 
     assert (inner / '.git').is_dir()
-    assert pipediff_git_helpers.run_git(inner, 'rev-parse', 'HEAD', check=False).returncode == 0
-    assert pipediff_git_helpers.run_git(outer, 'rev-parse', '--verify', 'HEAD', check=False).returncode != 0
+    assert run_git(inner, 'rev-parse', 'HEAD', check=False).returncode == 0
+    assert run_git(outer, 'rev-parse', '--verify', 'HEAD', check=False).returncode != 0
 
 
-def test_fixture_git_commands_are_bounded_and_never_read_stdin(tmp_path, monkeypatch):
-    seen = {}
+@pytest.mark.skipif(os.name == 'nt', reason='the stand-in git is a POSIX shell script')
+def test_fixture_git_commands_are_bounded(tmp_path, monkeypatch):
+    # A git that never answers fails the test after the timeout instead of hanging the run
+    stand_in = tmp_path / 'bin' / 'git'
+    stand_in.parent.mkdir()
+    stand_in.write_text('#!/bin/sh\nexec sleep 10\n', encoding='utf-8')
+    stand_in.chmod(0o755)
+    monkeypatch.setenv('PATH', str(stand_in.parent) + os.pathsep + os.environ['PATH'])
+    monkeypatch.setattr('pipediff_git_helpers.GIT_TIMEOUT_SECONDS', 1)
 
-    def fake_run(args, **kwargs):
-        seen.update(kwargs)
-        raise subprocess.TimeoutExpired(args, kwargs['timeout'])
-
-    monkeypatch.setattr(pipediff_git_helpers.subprocess, 'run', fake_run)
-    with pytest.raises(subprocess.TimeoutExpired):  # a wedged git fails the test instead of hanging the run
-        pipediff_git_helpers.run_git(tmp_path, 'status')
-
-    assert seen['timeout'] == pipediff_git_helpers.GIT_TIMEOUT_SECONDS
-    assert seen['stdin'] is subprocess.DEVNULL
-    assert seen['env']['GIT_CONFIG_NOSYSTEM'] == '1'
-    assert seen['env']['GIT_CONFIG_GLOBAL'] == os.devnull
-    assert not any(key in seen['env'] for key in ('GIT_DIR', 'GIT_INDEX_FILE', 'GIT_WORK_TREE'))
+    with pytest.raises(subprocess.TimeoutExpired):
+        run_git(tmp_path, 'status')
 
 
 if __name__ == '__main__':

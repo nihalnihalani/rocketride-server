@@ -29,7 +29,7 @@ production. The command is fully local (no server, no auth), so no client fixtur
 or network mock is needed; the only external dependency stubbed here is
 ``resolve_git_ref`` for ``--git`` mode, patched in the command's own module
 namespace the same way the engine test suite stubs subprocess. Nesting-error
-regressions additionally execute real CLI subprocesses against real files and
+cases additionally execute real CLI subprocesses against real files and
 temporary Git history, without mocking the failing load/compare/render path.
 
 Coverage mirrors the product contract:
@@ -250,8 +250,7 @@ async def test_git_mode_requires_exactly_one_file(tmp_path, capsys):
 @pytest.mark.asyncio
 @pytest.mark.parametrize('ref', ['', '   '], ids=['empty', 'blank'])
 async def test_git_mode_rejects_an_empty_ref(tmp_path, capsys, ref):
-    # An empty --git used to be read as "no --git": with two files the command
-    # silently ran file mode, with one it blamed the file count.
+    # An empty --git is a usage error, not "no --git"
     a = _write_pipe(tmp_path, 'a.pipe', _old_pipe())
     b = _write_pipe(tmp_path, 'b.pipe', _new_pipe())
     for paths in ([a], [a, b]):
@@ -461,8 +460,7 @@ async def test_viewport_only_hidden_by_default_exit_0(tmp_path, capsys):
 
 @pytest.mark.asyncio
 async def test_include_layout_surfaces_viewport_fields_exit_1(tmp_path, capsys):
-    # --help and the docs claim --include-layout enumerates the top-level
-    # viewport; before this it silently reported nothing and exited 0.
+    # --include-layout enumerates the top-level viewport
     old = _write_pipe(tmp_path, 'old.pipe', _old_pipe())
     new = _write_pipe(tmp_path, 'new.pipe', _viewport_only_new_pipe())
 
@@ -919,8 +917,7 @@ def test_text_reports_keep_characters_the_console_can_print(tmp_path, flag):
 @pytest.mark.skipif(shutil.which('git') is None, reason='git is unavailable')
 @pytest.mark.asyncio
 async def test_retargeted_symlink_swap_is_reported_end_to_end(tmp_path, capsys):
-    # `current.pipe -> v1.pipe` repointed to v2.pipe is a real pipeline swap: it
-    # used to compare v2.pipe with HEAD:v2.pipe and report "No semantic changes."
+    # `current.pipe -> v1.pipe` repointed to v2.pipe is a real pipeline swap
     _write_pipe(tmp_path, 'v1.pipe', _old_pipe())
     _write_pipe(tmp_path, 'v2.pipe', _new_pipe())
     make_symlink(tmp_path / 'current.pipe', 'v1.pipe')
