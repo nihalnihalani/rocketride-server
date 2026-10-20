@@ -85,15 +85,11 @@ class PipeDiffError(Exception):
 
 
 # The class lives here so every pipediff module can raise it without importing the
-# engine (which imports this module). Report it under the documented import path,
-# ``rocketride.pipediff``, rather than this private module, so tracebacks and
-# reprs name something callers can import. ``engine.PipeDiffError`` is the same
-# object, and pickles that name either path resolve to it.
-#
-# Deliberate, and not to be "fixed": ``inspect.getsource(PipeDiffError)`` now raises
-# OSError, because ``inspect`` looks the class up in the module it claims. That is
-# the accepted cost of a stable public name (numpy's ``set_module`` makes the same
-# trade); a traceback still shows the real file and line.
+# engine (which imports this module). It is reported under the documented import
+# path, ``rocketride.pipediff``, so tracebacks and reprs name something callers can
+# import, and pickles resolve it by that name. The cost is that
+# ``inspect.getsource(PipeDiffError)`` fails, because ``inspect`` looks the class up
+# in the module it claims; a traceback still shows the real file and line.
 PipeDiffError.__module__ = 'rocketride.pipediff'
 
 
@@ -153,17 +149,13 @@ def validate_pipe(obj: Any, source: str) -> dict:
     components = obj.get('components')
     if not isinstance(components, list):
         raise PipeDiffError(f"{source}: pipe is missing a 'components' list")
-    # Ids are the diff's matching key, so a duplicate is not a harmless quirk:
-    # indexing by id keeps only the last component with that id, which would
-    # silently hide the earlier node and any change to it. Reject it as an
-    # actionable exit-2 error instead of emitting a diff that is quietly wrong.
-    # Canvas-group children are nodes too (see :func:`iter_components`), so ids
-    # must be unique across every nesting level.
+    # Ids are the diff's matching key: a duplicate would silently hide the earlier
+    # node and any change to it, so it is an actionable error. Canvas-group children
+    # are nodes too (see :func:`iter_components`), so ids must be unique across every
+    # nesting level.
     #
-    # Only the ids are remembered, and a component's location is spelled only for
-    # the one that fails: a valid pipe pays for no per-component text. Spelling it
-    # for every component repeated the group id in each child's location, so a
-    # group with a long id and many children cost their product in memory.
+    # Only the ids are remembered, and a component's location is spelled only for the
+    # one that fails: a valid pipe pays for no per-component text.
     seen_ids: set[str] = set()
     for component, parent, index in iter_components(obj, include_invalid=True):
         if not isinstance(component, dict):
@@ -228,8 +220,7 @@ def iter_components(pipe: dict, *, include_invalid: bool = False) -> Iterator[tu
 
     Group children are diffed as ordinary nodes, matched by ``id`` like every
     other component: their ``ui`` is layout, their ``input``/``control`` wiring
-    is edges, and their provider and config are compared on the child. Without
-    this a drag inside a group surfaced as a config change of the group.
+    is edges, and their provider and config are compared on the child.
 
     The walk is iterative, so arbitrarily nested groups cannot exhaust the
     recursion limit, and lazy, so a caller that needs several facts about each
@@ -280,12 +271,10 @@ def _validate_wires(component: dict, component_id: str, source: str) -> None:
     """
     Validate a component's ``input``/``control`` wire collections.
 
-    Edge extraction reads ``from`` and ``lane``/``classType`` off every wire and
-    puts the resulting triples into a ``set``. Without this check a non-list
-    collection raises ``TypeError``, an unhashable ``from``/``lane`` (a list or
-    dict) raises ``TypeError`` inside ``set.add``, and a wire missing ``from``
-    silently produces a ``(None, None, id)`` edge — all of which surface as a
-    traceback or a nonsense diff instead of an actionable exit-2 error.
+    Edge extraction reads ``from`` and ``lane``/``classType`` off every wire into a
+    ``set``, so a collection that is not a list, an unhashable ``from``/``lane`` (a
+    list or dict), or a wire missing ``from`` must be an actionable exit-2 error
+    here and not a traceback or a nonsense edge later.
 
     Args:
         component: The component object to check.
