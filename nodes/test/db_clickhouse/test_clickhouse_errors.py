@@ -74,8 +74,8 @@ def _error(route, code, message):
 
 
 # Messages copied byte for byte from ClickHouse 23.8.16.16 and 25.8.33.6 (clickhouse-driver 0.2.9), 2026-10-20,
-# for statements that bind QA_CANARY_* values into later rows; the stack trace is dropped. The last two rows are
-# constructed: no live statement produced them.
+# for statements that bind QA_CANARY_* values into later rows; the stack trace is dropped. The rows added after
+# this list (ids starting `constructed-`) are constructed: no live statement produced them.
 _REAL = [
     pytest.param(
         27,
