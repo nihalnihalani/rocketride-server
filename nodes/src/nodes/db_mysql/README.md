@@ -78,47 +78,25 @@ they were. `get_data` returns
 `session_id`, positional values for `$1`, `$2`, and so on, and a `row_mode`:
 `object` (default) keys rows by column name, while `array` returns positional
 arrays that preserve column order and keep duplicate column names — the shape
-ORM drivers such as Drizzle require. It returns `{rows, affected_rows}`.
-`begin` takes no arguments and returns `{session_id}`; `commit` and `rollback`
-require that ID and return `{ok: true}`. These four write-capable operations
-fail when **Allow direct query execution** is off; unknown or expired session
-IDs also fail. Invalid tool input raises an error.
-
-A failed statement raises `SQL execution failed:` followed by `Error <errno>:`
-and MySQL's own message, identically with and without a `session_id`. MySQL
-appends nothing to its own sentence, so the only text removed is what
-SQLAlchemy adds after it: the `[SQL: ...]` / `[parameters: ...]` echo, its
-`[cached since ...]` / `[generated in ...]` timings and the `(Background on
-this error ...)` link. The message is cut at those markers and nowhere else, so
-MySQL's wording comes back whole:
-
-- A `SIGNAL`'s `MESSAGE_TEXT` is your application's text and is returned as
-  written, cut only at SQLAlchemy's markers above: `Upload failed at position 3
-  of batch` is not cut at `position`.
-- A syntax error (1064) quotes the statement from the point where the parser
-  stopped: `near '...' at line N` holds the rest of the statement, up to 80
-  characters, not only the token it rejected. The driver interpolates bound
-  values into the statement client-side, so a value bound after the error
-  point can appear in that quote. The node does not redact it.
-- A constraint or conversion error names the value involved, for example
-  `Duplicate entry '...' for key ...`.
-
-That is deliberate: reaching this tool at all requires **Allow direct query
-execution**, and a caller who has it can read the same data with a `SELECT`.
-The full exception, statement and bound values included, is written to the
-engine log; only the error `execute` returns is trimmed.
-
-If the server answering is ClickHouse's MySQL interface rather than MySQL, the
-same `(errno, message)` pair carries ClickHouse's text. The node takes a
-message for ClickHouse's only when it starts with `Code: <errno>.
-DB::...Exception:` and that number equals the pair's errno, and cuts it with
-ClickHouse's markers instead of SQLAlchemy's: the server stack trace and the
-places where ClickHouse repeats the statement or the rest of its input are
-removed (the `db_clickhouse` README lists them). A `SIGNAL` whose text merely
-contains `DB::Exception:` is still MySQL's own text and stays whole. One that
-copies ClickHouse's whole prefix, errno included, is indistinguishable and is
-cut the same way, so some of its text can be lost; no part of the statement
-is added.
+ORM drivers such as Drizzle require. It returns `{rows, affected_rows}`. A
+failed statement raises `SQL execution failed:` followed by the database's own
+primary message, identically with and without a `session_id`. What is removed
+is the tail: SQLAlchemy's `[SQL: ...]` / `[parameters: ...]` echo. The primary
+sentence itself is passed through as MySQL wrote it: a `SIGNAL`'s text comes
+back whole, a constraint error names the value that collided, and a syntax
+error (1064) quotes the rest of the statement from where the parser stopped,
+up to 80 characters (`near '...' at line N`), so a value bound after that point
+can appear in it (the driver interpolates bound values client-side; see
+#2732). That is deliberate: reaching this tool at all requires **Allow direct
+query execution**, and a caller who has it can read the same data with a
+`SELECT`. The full text is written to the server log. For ClickHouse, use the
+`db_clickhouse` node: pointed at ClickHouse's MySQL interface, this node
+returns ClickHouse's error text as is, which can repeat the statement and its
+bound values. `begin` takes no arguments and returns `{session_id}`; `commit`
+and `rollback` require that ID and return
+`{ok: true}`. These four write-capable operations fail when **Allow direct
+query execution** is off; unknown or expired session IDs also fail. Invalid
+tool input raises an error.
 
 A failed statement does **not** roll the session back. The session stays open
 and MySQL leaves its transaction usable, so a later `commit` persists the work

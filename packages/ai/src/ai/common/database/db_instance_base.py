@@ -208,13 +208,8 @@ class DatabaseInstanceBase(IInstanceBase, ABC):
     def _sessionsAreTransactions(self) -> bool:
         """Return whether a ``begin`` session is a database transaction on this node.
 
-        True here. A node whose driver cannot hold a transaction overrides it
-        to return False -- db_clickhouse does, because clickhouse-sqlalchemy's
-        native connector makes ``commit`` and ``rollback`` no-ops and
-        ClickHouse has no savepoints -- and the session tools' descriptions
-        and errors then say what such a session is: a reserved connection
-        whose statements are executed as they are sent. No agent is told its
-        work can be rolled back when it cannot.
+        db_clickhouse overrides this to False: its ``commit`` and ``rollback`` are
+        no-ops and it has no savepoints, so the session tools must not promise rollback.
         """
         return True
 
@@ -224,12 +219,7 @@ class DatabaseInstanceBase(IInstanceBase, ABC):
         return ValueError(f'unknown or expired {kind}: {session_id}')
 
     def _sessionRecoveryPolicy(self) -> str:
-        """Return the ``execute`` description's sentence on a session after a failed statement.
-
-        The error text carries no recovery advice -- both execute paths report
-        a failure byte-identically -- so this sentence is where an agent learns
-        it.
-        """
+        """Return the ``execute`` description's advice for a session after a failed statement."""
         if not self._sessionsAreTransactions():
             return (
                 f'A failed statement inside a session_id leaves the session open. A session on '
@@ -506,8 +496,6 @@ class DatabaseInstanceBase(IInstanceBase, ABC):
                 # transactions — and the idle reaper is the backstop for abandoned
                 # sessions. Committing an aborted transaction would degrade to a
                 # silent ROLLBACK, so the registry refuses it and raises instead.
-                # ClickHouse has no transaction to recover at all; see
-                # `_sessionRecoveryPolicy`.
                 #
                 # That policy is NOT appended to this message. The two execute
                 # paths report a driver failure with the same bytes -- the
@@ -564,16 +552,7 @@ class DatabaseInstanceBase(IInstanceBase, ABC):
         ),
     )
     def begin(self, args):
-        """Open a session and return its ``session_id``.
-
-        Whether the session is a transaction depends on the node; see
-        ``_sessionsAreTransactions``. On a transactional node (the default)
-        it begins a transaction on a connection held for the session. On
-        db_clickhouse it only reserves that connection: no transaction is
-        opened, every statement sent on the session is executed when it is
-        sent, and ``commit`` and ``rollback`` merely close it. The ``begin``
-        tool description above is what an agent reads, and says which.
-        """
+        """Open a session and return its session_id; a transaction unless ``_sessionsAreTransactions`` is False."""
         if not self.IGlobal.allow_execute:
             raise ValueError('execute tool is disabled for this node (set allow_execute=true)')
         return {'session_id': self.IGlobal.tx_registry.begin()}
@@ -592,13 +571,7 @@ class DatabaseInstanceBase(IInstanceBase, ABC):
         ),
     )
     def commit(self, args):
-        """Close an open session, committing its transaction where it has one.
-
-        On a node whose sessions are not transactions (``_sessionsAreTransactions``
-        is False, as on db_clickhouse) there is nothing to commit: the session's
-        statements were already executed when they were sent, and this only
-        releases the connection.
-        """
+        """Commit and close a session; where sessions are not transactions it only closes it."""
         return self._finishTx(args, commit=True)
 
     @tool_function(
@@ -615,13 +588,7 @@ class DatabaseInstanceBase(IInstanceBase, ABC):
         ),
     )
     def rollback(self, args):
-        """Close an open session, rolling back its transaction where it has one.
-
-        On a node whose sessions are not transactions (``_sessionsAreTransactions``
-        is False, as on db_clickhouse) nothing is undone: the session's
-        statements were already executed when they were sent, and this only
-        releases the connection.
-        """
+        """Roll back and close a session; where sessions are not transactions it only closes it."""
         return self._finishTx(args, commit=False)
 
     def _finishTx(self, args, *, commit: bool):
