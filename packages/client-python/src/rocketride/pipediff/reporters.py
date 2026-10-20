@@ -283,8 +283,16 @@ def _reads_ambiguously(text: str) -> bool:
 
 
 def _visible(text: str) -> str:
-    """Collapse whitespace the way a reader sees it (code spans trim, HTML folds runs)."""
-    return ' '.join(text.split())
+    """
+    Reduce text to what a reader can tell apart.
+
+    Whitespace runs collapse the way a code span trims and HTML folds them, and
+    compatibility forms fold to the character they imitate (U+FF14, the full-width
+    digit four, to ``4``; U+FB01, the ``fi`` ligature, to ``fi``). Invisible
+    characters are not handled here: they are written as escapes before a pair is
+    compared.
+    """
+    return ' '.join(unicodedata.normalize('NFKC', text).split())
 
 
 def _fmt_pair(old: Any, new: Any, escape: Any = None) -> Tuple[str, str]:
@@ -303,12 +311,24 @@ def _fmt_pair(old: Any, new: Any, escape: Any = None) -> Tuple[str, str]:
     spaces collapse in a code span. JSON quoting then keeps them apart. A string
     holding an escaped character is already JSON-quoted by :func:`_fmt_value`, so
     U+202E never prints like the literal text ``\\u202e``.
+
+    Quoting cannot separate two sides that differ only in a compatibility look-alike
+    (``gpt-4`` and ``gpt-`` followed by U+FF14, the full-width digit four): both stay
+    alike inside their quotes. Those are spelled with ASCII escapes as well, so the
+    difference shows as ``\\uff14``.
     """
     escape = escape or _identity
+
+    def alike(left: str, right: str) -> bool:
+        return _visible(escape(left)) == _visible(escape(right))
+
     old_text, new_text = _fmt_value(old), _fmt_value(new)
-    if isinstance(old, str) != isinstance(new, str) or _visible(escape(old_text)) == _visible(escape(new_text)):
+    if isinstance(old, str) != isinstance(new, str) or alike(old_text, new_text):
         old_text = json.dumps(old, ensure_ascii=False, sort_keys=True)
         new_text = json.dumps(new, ensure_ascii=False, sort_keys=True)
+        if alike(old_text, new_text):
+            old_text = json.dumps(old, ensure_ascii=True, sort_keys=True)
+            new_text = json.dumps(new, ensure_ascii=True, sort_keys=True)
     return old_text, new_text
 
 
@@ -343,20 +363,50 @@ def _is_unsafe(char: str) -> bool:
     return unicodedata.category(char) in _UNSAFE_CATEGORIES or ord(char) in _INVISIBLE_OTHER
 
 
-def _escape_control(match: re.Match) -> str:
-    """Spell one unsafe character as a visible ``\\xNN``, ``\\uNNNN`` or ``\\UNNNNNNNN`` escape."""
-    char = match.group()
-    if not _is_unsafe(char):
-        return char
+def _spell_char(char: str) -> str:
+    """Spell one character as a visible ``\\xNN``, ``\\uNNNN`` or ``\\UNNNNNNNN`` escape."""
     code = ord(char)
     if code <= 0xFF:
         return f'\\x{code:02x}'
     return f'\\u{code:04x}' if code <= 0xFFFF else f'\\U{code:08x}'
 
 
+def _escape_control(match: re.Match) -> str:
+    """Spell one unsafe character as an escape; any other character is returned as it is."""
+    char = match.group()
+    return _spell_char(char) if _is_unsafe(char) else char
+
+
+# Text that Unicode normalisation (NFC) would rewrite prints exactly like the text it
+# would be rewritten to: a decomposed accent (``e`` and U+0301) like the composed
+# one (U+00E9), Hangul jamo like their syllable, U+212B ANGSTROM SIGN like U+00C5. A
+# node renamed from one spelling to the other would then read as a node removed and
+# the same node added, and a changed value as ``x -> x``. The runs of non-ASCII
+# characters that NFC would change are therefore spelled out, so the two spellings
+# differ on the page as they do in the file. A run takes the character before it,
+# because that is what a combining mark attaches to; text that is already
+# normalised, which is nearly all of it, is left alone.
+_NON_ASCII_RUN = re.compile(r'[\x00-\x7f]?[^\x00-\x7f]+')
+
+
+def _spell_unnormalized(match: re.Match) -> str:
+    """Spell the non-ASCII characters of a run that NFC would rewrite (see :data:`_NON_ASCII_RUN`)."""
+    run = match.group()
+    if unicodedata.is_normalized('NFC', run):
+        return run
+    return ''.join(char if char.isascii() else _spell_char(char) for char in run)
+
+
+def _spell(text: str) -> str:
+    """Write every character a reader cannot see or trust as a visible escape (see :data:`_TERM_UNSAFE`)."""
+    if not text.isascii():
+        text = _NON_ASCII_RUN.sub(_spell_unnormalized, text)
+    return _TERM_UNSAFE.sub(_escape_control, text)
+
+
 def _has_unsafe(text: str) -> bool:
-    """Report whether ``text`` holds a character :func:`_escape_control` would escape."""
-    return any(_is_unsafe(char) for char in _TERM_UNSAFE.findall(text))
+    """Report whether ``text`` holds a character :func:`_spell` would escape."""
+    return _spell(text) != text
 
 
 def _term_safe(text: Any) -> str:
@@ -368,10 +418,12 @@ def _term_safe(text: Any) -> str:
     input. Printing them verbatim lets a crafted value emit ANSI escapes (recolor
     the report, hide lines, move the cursor), a bare CR/LF that fakes extra
     report lines, or bidi controls that reorder what is displayed. Every such
-    character is rendered as its ``\\xNN`` (or ``\\uNNNN``) escape instead; tabs
-    and printable text pass through unchanged.
+    character is rendered as its ``\\xNN`` (or ``\\uNNNN``) escape instead, and so
+    is non-ASCII text that Unicode normalisation would rewrite (a decomposed
+    accent), which would otherwise print like its composed twin; tabs and
+    printable text pass through unchanged.
     """
-    return _TERM_UNSAFE.sub(_escape_control, str(text))
+    return _spell(str(text))
 
 
 def _identity(text: Any) -> str:
@@ -677,7 +729,7 @@ def _md_code(text: str) -> str:
     leaves that value's text outside any span as live Markdown. It is rendered as
     the visible JSON empty string ``""`` instead.
     """
-    text = _TERM_UNSAFE.sub(_escape_control, str(text))
+    text = _spell(str(text))
     if not text:
         return '`""`'
     if '`' not in text:
