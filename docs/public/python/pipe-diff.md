@@ -173,6 +173,13 @@ Config
 Layout: changed (ui/viewport)
 ```
 
+Text that Unicode normalization would rewrite (a decomposed accent such as `e`
+followed by U+0301, or U+212B ANGSTROM SIGN) is written as escapes too, so it
+never reads like its composed twin. When the two sides of a change differ only
+in a compatibility look-alike (a full-width digit, the `fi` ligature), both
+sides are JSON-quoted with every non-ASCII character written as a `\uNNNN`
+escape.
+
 `--json` emits one stable document with sorted keys — `edges`, `nodes`, a
 `summary` block with counts and the overall `has_semantic_changes` flag, and
 `viewport`:
@@ -341,6 +348,9 @@ nothing, so they compose into your own tooling.
   under a new `id` and the diff reports a removal plus an addition, not a rename.
 - **`--git` needs a real repository.** The ref side is read through `git show`, so
   the file must live inside a git worktree and the ref must be present locally.
+- **Cross-script look-alikes are not flagged.** A Cyrillic `а` in place of a
+  Latin `a` is reported as the change it is, but the two spellings can look the
+  same; compare the `--json` output when in doubt.
 - **No engine validation.** `diff` checks that both files are well-formed
   pipelines, not that they are runnable — use [`rocketride
   validate`](/connect/cli#validate) for that.

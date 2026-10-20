@@ -40,6 +40,7 @@ Coverage:
 import html as html_mod
 import json
 import re
+import unicodedata
 import unittest
 from html.parser import HTMLParser
 from typing import Optional, Tuple
@@ -770,8 +771,6 @@ class TestRenderMarkdown(unittest.TestCase):
         self.assertIn('| `n1` | `config.m` | `gpt-4` → `" gpt-4 "` |', render_markdown(diff))
 
     def test_reporter_source_has_no_raw_invisible_characters(self) -> None:
-        import unicodedata
-
         import rocketride.pipediff.reporters as reporters_module
 
         with open(reporters_module.__file__, encoding='utf-8') as handle:
@@ -1068,6 +1067,207 @@ class TestRenderMarkdown(unittest.TestCase):
         self.assertIn('`"C:\\\\tmp\\nnext\\|line"`', row)
         self.assertNotIn('C:\\\\\\tmp', row)
         self.assertEqual(row.replace('\\|', '').count('|'), 4, row)
+
+
+# Pairs of spellings that Unicode treats as the same text, written by name because a
+# literal would be rewritten by any editor that normalises. Each pair prints alike
+# unless the unnormalised side is spelled out: ``(label, composed, unnormalised)``.
+_EQUIVALENT_SPELLINGS = [
+    ('accent', 'caf\N{LATIN SMALL LETTER E WITH ACUTE}', 'cafe\N{COMBINING ACUTE ACCENT}'),
+    ('ring', '\N{LATIN CAPITAL LETTER A WITH RING ABOVE}', 'A\N{COMBINING RING ABOVE}'),
+    (
+        'stacked marks',
+        '\N{LATIN SMALL LETTER A WITH CIRCUMFLEX AND ACUTE}',
+        'a\N{COMBINING CIRCUMFLEX ACCENT}\N{COMBINING ACUTE ACCENT}',
+    ),
+    ('angstrom sign', '\N{LATIN CAPITAL LETTER A WITH RING ABOVE}', '\N{ANGSTROM SIGN}'),
+    ('ohm sign', '\N{GREEK CAPITAL LETTER OMEGA}', '\N{OHM SIGN}'),
+    ('hangul', '\N{HANGUL SYLLABLE GA}', '\N{HANGUL CHOSEONG KIYEOK}\N{HANGUL JUNGSEONG A}'),
+    ('kana', '\N{HIRAGANA LETTER GA}', '\N{HIRAGANA LETTER KA}\N{COMBINING KATAKANA-HIRAGANA VOICED SOUND MARK}'),
+]
+
+# Compatibility look-alikes: not rewritten by NFC, so they stay readable where a value
+# is shown alone, and are separated only where both sides of a change are shown.
+_COMPATIBILITY_LOOKALIKES = [
+    ('full-width digit', 'gpt-4', 'gpt-\N{FULLWIDTH DIGIT FOUR}'),
+    ('ligature', 'fi', '\N{LATIN SMALL LIGATURE FI}'),
+    ('superscript', 'x2', 'x\N{SUPERSCRIPT TWO}'),
+]
+
+
+def _reader_view(text: str) -> str:
+    """What a reader can tell apart: compatibility forms folded, whitespace runs collapsed."""
+    return ' '.join(unicodedata.normalize('NFKC', text).split())
+
+
+def _github_code_spans(markdown: str) -> list:
+    """The text of every code span cmark-gfm renders from ``markdown``, in order."""
+    html = cmarkgfm.github_flavored_markdown_to_html(markdown, options=CmarkOptions.CMARK_OPT_UNSAFE)
+    return [html_mod.unescape(span) for span in re.findall(r'<code>(.*?)</code>', html, re.S)]
+
+
+# Where one piece of text can appear on its own in a report, each as a diff holding only that text.
+_ALONE = {
+    'added node id': lambda t: PipeDiff(node_changes=[NodeChange(id=t, kind='added', provider_new='p')]),
+    'removed node id': lambda t: PipeDiff(node_changes=[NodeChange(id=t, kind='removed', provider_old='p')]),
+    'node provider': lambda t: PipeDiff(node_changes=[NodeChange(id='n', kind='added', provider_new=t)]),
+    'edge endpoints and lane': lambda t: PipeDiff(edge_changes=[EdgeChange(from_id=t, lane=t, to_id=t, kind='added')]),
+    'config path': lambda t: PipeDiff(
+        node_changes=[
+            NodeChange(id='n', kind='config', field_changes=[FieldChange(path='config.' + t, kind='added', new=1)])
+        ]
+    ),
+    'added value': lambda t: PipeDiff(
+        node_changes=[
+            NodeChange(id='n', kind='config', field_changes=[FieldChange(path='config.v', kind='added', new=t)])
+        ]
+    ),
+    'removed value': lambda t: PipeDiff(
+        node_changes=[
+            NodeChange(id='n', kind='config', field_changes=[FieldChange(path='config.v', kind='removed', old=t)])
+        ]
+    ),
+    'viewport path': lambda t: PipeDiff(
+        viewport_changes=[FieldChange(path='viewport.' + t, kind='added', new=1)], layout_changed=True
+    ),
+}
+
+# Where both sides of a change are shown together: ``(diff of a -> b, pattern for the human line)``.
+_PAIRED = {
+    'changed value': (
+        lambda a, b: PipeDiff(
+            node_changes=[
+                NodeChange(
+                    id='n', kind='config', field_changes=[FieldChange(path='config.v', kind='changed', old=a, new=b)]
+                )
+            ]
+        ),
+        r'^    ~ config\.v: (.*) -> (.*)$',
+    ),
+    'provider change': (
+        lambda a, b: PipeDiff(node_changes=[NodeChange(id='n', kind='provider', provider_old=a, provider_new=b)]),
+        r'^  ~ n provider: (.*) -> (.*)$',
+    ),
+    'version': (lambda a, b: PipeDiff(version_change=(a, b)), r'^Version: (.*) -> (.*)$'),
+}
+
+
+class TestEquivalentSpellings(unittest.TestCase):
+    """Text that Unicode treats as equal, but that differs in the file, must differ in the report."""
+
+    def test_unnormalised_text_is_spelled_out_wherever_it_can_appear(self) -> None:
+        for label, composed, unnormalised in _EQUIVALENT_SPELLINGS:
+            for place, build in _ALONE.items():
+                with self.subTest(spelling=label, place=place):
+                    composed_human = render_human(build(composed), use_color=False)
+                    plain_human = render_human(build(unnormalised), use_color=False)
+                    # The composed spelling is ordinary printable text and stays readable.
+                    self.assertIn(composed, composed_human)
+                    self.assertIn(composed, render_markdown(build(composed)))
+                    # The other one never reaches the page raw, so the two cannot read alike.
+                    for report in (plain_human, render_markdown(build(unnormalised))):
+                        self.assertNotIn(unnormalised, report)
+                        self.assertIn('\\u', report)
+                    self.assertNotEqual(_reader_view(composed_human), _reader_view(plain_human))
+
+    @unittest.skipIf(cmarkgfm is None, 'cmarkgfm is not installed')
+    def test_unnormalised_text_differs_in_the_markdown_github_renders(self) -> None:
+        for label, composed, unnormalised in _EQUIVALENT_SPELLINGS:
+            for place, build in _ALONE.items():
+                with self.subTest(spelling=label, place=place):
+                    shown = _github_code_spans(render_markdown(build(composed)))
+                    other = _github_code_spans(render_markdown(build(unnormalised)))
+                    self.assertEqual(len(shown), len(other))
+                    self.assertNotEqual([_reader_view(s) for s in shown], [_reader_view(s) for s in other])
+            with self.subTest(spelling=label, place='title'):
+                title = _github_code_spans(render_markdown(PipeDiff(), title=composed))[0]
+                other = _github_code_spans(render_markdown(PipeDiff(), title=unnormalised))[0]
+                self.assertNotEqual(_reader_view(title), _reader_view(other))
+
+    def test_both_sides_of_a_change_never_read_alike_in_the_terminal(self) -> None:
+        for label, composed, unnormalised in _EQUIVALENT_SPELLINGS + _COMPATIBILITY_LOOKALIKES:
+            for place, (build, pattern) in _PAIRED.items():
+                for old, new in ((composed, unnormalised), (unnormalised, composed)):
+                    with self.subTest(spelling=label, place=place, old=old.encode('unicode_escape')):
+                        match = re.search(pattern, render_human(build(old, new), use_color=False), re.M)
+                        self.assertIsNotNone(match)
+                        self.assertNotEqual(_reader_view(match.group(1)), _reader_view(match.group(2)))
+
+    @unittest.skipIf(cmarkgfm is None, 'cmarkgfm is not installed')
+    def test_both_sides_of_a_change_never_read_alike_in_the_markdown_github_renders(self) -> None:
+        for label, composed, unnormalised in _EQUIVALENT_SPELLINGS + _COMPATIBILITY_LOOKALIKES:
+            for place, (build, _pattern) in _PAIRED.items():
+                for old, new in ((composed, unnormalised), (unnormalised, composed)):
+                    with self.subTest(spelling=label, place=place, old=old.encode('unicode_escape')):
+                        # The last two code spans of the report are the old and the new side.
+                        before, after = _github_code_spans(render_markdown(build(old, new)))[-2:]
+                        self.assertNotEqual(_reader_view(before), _reader_view(after))
+
+    def test_compatibility_lookalikes_are_spelled_out_only_when_they_collide(self) -> None:
+        for label, plain, lookalike in _COMPATIBILITY_LOOKALIKES:
+            with self.subTest(spelling=label):
+                changed = PipeDiff(
+                    node_changes=[
+                        NodeChange(
+                            id='n',
+                            kind='config',
+                            field_changes=[
+                                FieldChange(path='config.v', kind='changed', old=plain, new=lookalike),
+                                FieldChange(path='config.w', kind='changed', old='a', new=lookalike),
+                            ],
+                        )
+                    ]
+                )
+                human = render_human(changed, use_color=False)
+                # Alike to a reader: both quoted, the look-alike written as an escape.
+                self.assertIn(f'~ config.v: "{plain}" -> "', human)
+                self.assertNotIn(lookalike, human.split('config.w')[0])
+                # Not alike: compact and readable, as before.
+                self.assertIn(f'~ config.w: a -> {lookalike}', human)
+
+    def test_normalised_non_ascii_text_is_left_readable(self) -> None:
+        text = (
+            'caf\N{LATIN SMALL LETTER E WITH ACUTE} \N{HIRAGANA LETTER GA}\N{HIRAGANA LETTER KI} \N{HANGUL SYLLABLE GA}'
+        )
+        diff = PipeDiff(
+            node_changes=[
+                NodeChange(id=text, kind='added', provider_new=text),
+                NodeChange(id='n', kind='config', field_changes=[FieldChange(path='config.v', kind='added', new=text)]),
+            ]
+        )
+        for report in (render_human(diff, use_color=False), render_markdown(diff)):
+            self.assertNotIn('\\u', report)
+            self.assertIn(text, report)
+
+    def test_one_unnormalised_word_does_not_hide_the_rest_of_an_ascii_sentence(self) -> None:
+        text = 'use the cafe\N{COMBINING ACUTE ACCENT} model, not the cafe model'
+        diff = PipeDiff(
+            node_changes=[
+                NodeChange(id='n', kind='config', field_changes=[FieldChange(path='config.v', kind='added', new=text)])
+            ]
+        )
+        self.assertIn('"use the cafe\\u0301 model, not the cafe model"', render_human(diff, use_color=False))
+
+    def test_a_real_combining_mark_and_the_text_of_its_escape_stay_apart(self) -> None:
+        diff = PipeDiff(
+            node_changes=[
+                NodeChange(
+                    id='n',
+                    kind='config',
+                    field_changes=[
+                        FieldChange(
+                            path='config.v',
+                            kind='changed',
+                            old='e\N{COMBINING ACUTE ACCENT}',
+                            new='e' + chr(92) + 'u0301',
+                        )
+                    ],
+                )
+            ]
+        )
+        self.assertIn(
+            '~ config.v: "e' + chr(92) + 'u0301" -> e' + chr(92) + 'u0301', render_human(diff, use_color=False)
+        )
 
 
 class TestDeterminism(unittest.TestCase):
