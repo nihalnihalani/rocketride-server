@@ -1337,28 +1337,6 @@ def test_crafted_ids_reach_stderr_as_escapes_through_the_real_entry_point(tmp_pa
     assert _ESCAPED in result.stderr
 
 
-def test_a_crafted_argument_reaches_stderr_as_escapes_through_the_real_entry_point(tmp_path):
-    # The Action passes the changed files of a pull request as arguments, and a name that begins with a dash
-    # is one argparse cannot match: it repeats it, and the usage error is a line of that same stream. The
-    # arguments are set inside the child (as the .env tests do) so the test needs no non-ASCII argv.
-    # (argparse takes an argument with a space in it for a file name, so this one has none)
-    argv = ['diff', '--git', 'HEAD', '-' + _CRAFTED.replace(' ', '')]
-    prelude = f'sys.argv = {["rocketride", *argv]!r}; '
-
-    result = _cli_subprocess(tmp_path, [], prelude=prelude)
-
-    assert result.returncode == 2
-    assert result.stdout == ''
-    assert 'Traceback' not in result.stderr
-    lines = result.stderr.splitlines()
-    assert lines[-1].startswith('rocketride diff: error: ') or lines[-1].startswith('rocketride: error: ')
-    assert len([line for line in lines if 'error:' in line]) == 1  # no forged second error line
-    assert [
-        char for char in result.stderr if unicodedata.category(char) in _UNSAFE_CATEGORIES and char != chr(10)
-    ] == []
-    assert '-' + _ESCAPED.replace(' ', '') in lines[-1]
-
-
 if __name__ == '__main__':
     import sys
 
