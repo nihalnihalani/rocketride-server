@@ -1391,6 +1391,8 @@ class TestEscapeLookalikes(unittest.TestCase):
             'a',
             ' ',
             'e\N{COMBINING ACUTE ACCENT}',
+            '\t',
+            '\N{NO-BREAK SPACE}',
         ]
         strings = {''}
         frontier = {''}
@@ -1410,6 +1412,109 @@ class TestEscapeLookalikes(unittest.TestCase):
                     shown = console(display(text))
                     other = seen.setdefault(shown, text)
                     self.assertEqual(other, text, f'{name}: {other!a} and {text!a} both print as {shown!a}')
+
+
+# Identifiers that differ only in whitespace, which a reader (or a Markdown code span, which
+# trims one space from each end) cannot tell apart bare.
+_WHITESPACE_PAIRS = [
+    ('llm_1', 'llm_1 '),
+    (' llm_1', 'llm_1'),
+    (' llm_1 ', 'llm_1'),
+    ('a b', 'a' + chr(9) + 'b'),
+    ('a b', 'a  b'),
+    ('a' + chr(9) + 'b', 'a  b'),
+    ('a ', 'a' + chr(9)),
+    ('a', 'a' + chr(9)),
+]
+_IDENTIFIER_PLACES = ['added node id', 'removed node id', 'edge endpoints and lane', 'config path', 'viewport path']
+
+
+class TestIdentifierWhitespace(unittest.TestCase):
+    """Ids, endpoints, lanes and paths that differ only in whitespace must not print alike."""
+
+    def test_the_two_spellings_print_apart_in_the_terminal(self) -> None:
+        for place in _IDENTIFIER_PLACES:
+            for first, second in _WHITESPACE_PAIRS:
+                with self.subTest(place=place, first=first, second=second):
+                    shown = [render_human(_ALONE[place](text), use_color=False) for text in (first, second)]
+                    self.assertNotEqual(shown[0], shown[1])
+                    # Nor after a reader folds the whitespace the way a browser would.
+                    self.assertNotEqual(_reader_view(shown[0]), _reader_view(shown[1]))
+
+    def test_the_two_spellings_print_apart_in_the_markdown_source(self) -> None:
+        for place in _IDENTIFIER_PLACES:
+            for first, second in _WHITESPACE_PAIRS:
+                with self.subTest(place=place, first=first, second=second):
+                    shown = [render_markdown(_ALONE[place](text)) for text in (first, second)]
+                    self.assertNotEqual(shown[0], shown[1])
+                    self.assertNotEqual(_reader_view(shown[0]), _reader_view(shown[1]))
+
+    @unittest.skipIf(cmarkgfm is None, 'cmarkgfm is not installed')
+    def test_the_two_spellings_print_apart_in_the_markdown_github_renders(self) -> None:
+        for place in _IDENTIFIER_PLACES:
+            for first, second in _WHITESPACE_PAIRS:
+                with self.subTest(place=place, first=first, second=second):
+                    rendered = [_github_code_spans(render_markdown(_ALONE[place](text))) for text in (first, second)]
+                    self.assertNotEqual(rendered[0], rendered[1])
+                    # What GitHub renders, folded: code spans keep their spaces on GitHub
+                    # (`white-space: break-spaces`), but other renderers fold them.
+                    self.assertNotEqual(
+                        [_reader_view(span) for span in rendered[0]], [_reader_view(span) for span in rendered[1]]
+                    )
+
+    def test_padded_identifiers_are_quoted_and_ordinary_ones_are_not(self) -> None:
+        from rocketride.pipediff.reporters import _ident
+
+        quoted = {
+            'llm_1 ': '"llm_1 "',
+            ' llm_1': '" llm_1"',
+            ' ': '" "',
+            'a  b': '"a  b"',
+            'a' + chr(9) + 'b': '"a' + _BS + 'tb"',
+            'config.a' + chr(9): '"config.a' + _BS + 't"',
+            'x\N{NO-BREAK SPACE}': '"x\N{NO-BREAK SPACE}"',
+        }
+        for text, expected in quoted.items():
+            with self.subTest(text=text):
+                self.assertEqual(_ident(text), expected)
+        for text in (
+            'llm_1',
+            'a b',
+            'a-b',
+            'a.b',
+            'chunker_1',
+            'config.default.strlen',
+            'config.instructions[0]',
+            'config. leading-space-key',
+            'x\N{NO-BREAK SPACE}y',
+            'a' + _BS + 'b',
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(_ident(text), text)
+
+    def test_a_bare_identifier_survives_whitespace_folding(self) -> None:
+        from rocketride.pipediff.reporters import _ident, _term_safe
+
+        # The rule behind the quoting: whatever prints bare has no padding, tab or run of
+        # spaces, so folding whitespace cannot change it, and it can never read like a quoted
+        # one. Only identifiers that differ in how much whitespace they hold can still fold
+        # together, and then only inside quotes.
+        pieces = ['a', ' ', '  ', chr(9), '\N{NO-BREAK SPACE}', '"', _BS + 'u0301', '\n']
+        strings = {''}
+        frontier = {''}
+        for _ in range(4):
+            frontier = {prefix + piece for prefix in frontier for piece in pieces}
+            strings |= frontier
+        folded = {}
+        for text in sorted(strings):
+            shown = _term_safe(_ident(text))
+            if not shown.startswith('"'):
+                self.assertEqual(' '.join(shown.split()), shown, f'{text!a} prints as {shown!a}')
+            folded.setdefault(' '.join(shown.split()), []).append(text)
+        for members in folded.values():
+            if len(members) > 1:
+                self.assertEqual({' '.join(text.split()) for text in members}, {' '.join(members[0].split())})
+                self.assertTrue(all(_term_safe(_ident(text)).startswith('"') for text in members), members)
 
 
 class TestDeterminism(unittest.TestCase):

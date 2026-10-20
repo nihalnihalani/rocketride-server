@@ -185,6 +185,10 @@ quote. Node ids, edge endpoints and lanes, and config paths are quoted the same
 way, and only in those cases, so a real U+202E and the six characters `\u202e`
 never print alike, even on a console that writes the character as `\u202e`
 itself.
+An identifier is also JSON-quoted when it has leading or trailing whitespace, a
+tab, or a run of two or more spaces, so `llm_1 ` with a trailing space and
+`llm_1` never print alike: the padding shows inside the quotes and a tab is
+written `\t`. Ordinary single-spaced ids and paths print bare, as before.
 
 `--json` emits one stable document with sorted keys — `edges`, `nodes`, a
 `summary` block with counts and the overall `has_semantic_changes` flag, and
