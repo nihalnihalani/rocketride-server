@@ -68,8 +68,10 @@ class FakeGlobal(GraphGlobalBase):
             raise self.error
         return consume(self.columns, (_cells(row) for row in self.rows[:fetch_limit]))
 
-    def _raw_query_rows(self, cypher, fetch_limit, consume):
-        self.raw_calls.append(('graph', cypher, fetch_limit))
+    def _raw_query_rows(self, cypher, fetch_limit, consume, params=None):
+        self.raw_calls.append(
+            ('graph', cypher, fetch_limit) if params is None else ('graph', cypher, fetch_limit, params)
+        )
         return consume(self.columns, (_cells(row) for row in self.rows[:fetch_limit])), 2
 
     def _describe_error(self, exc):
@@ -309,6 +311,26 @@ class TestInvariantAndErrors:
         with pytest.raises(ValueError, match='"shape" must be one of'):
             make(allow_execute=True).execute({'query': 'RETURN 1', 'shape': 'table'})
 
+    def test_execute_graph_shape_binds_params_on_a_driver_that_supports_them(self):
+        inst = make([[vertex(7)]], allow_execute=True)
+        inst.IGlobal.supports_execute_params = True
+        query = 'MATCH (n) WHERE id(n) = toInteger($id) RETURN n'
+        out = inst.execute({'query': query, 'shape': 'graph', 'params': {'id': '7'}})
+        assert inst.IGlobal.raw_calls == [('graph', query, 25001, {'id': '7'})]
+        assert out['rows'][0][0]['id'] == '7'
+
+    def test_execute_graph_shape_refuses_params_on_a_driver_without_them(self):
+        inst = make(allow_execute=True)
+        with pytest.raises(ValueError, match='"params" is not supported'):
+            inst.execute({'query': 'RETURN $x', 'shape': 'graph', 'params': {'x': 1}})
+        assert inst.IGlobal.raw_calls == []
+
+    def test_execute_input_schema_lists_params_only_where_they_bind(self):
+        inst = make(allow_execute=True)
+        assert set(inst._execute_input_schema()['properties']) == {'query', 'shape'}
+        inst.IGlobal.supports_execute_params = True
+        assert set(inst._execute_input_schema()['properties']) == {'query', 'params', 'shape'}
+
 
 # ---------------------------------------------------------------------------
 # natural-language read paths (get_data, get_query, the questions lane)
@@ -361,7 +383,7 @@ class TestNaturalLanguageGate:
 
 
 # ---------------------------------------------------------------------------
-# Text that engines read differently (GX-CMP-01): every read path
+# Text that engines read differently: every read path
 # ---------------------------------------------------------------------------
 
 _URL = "'https://example.invalid/x.csv'"

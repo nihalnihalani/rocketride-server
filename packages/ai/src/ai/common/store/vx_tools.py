@@ -601,6 +601,9 @@ def finish_answer(result: Any) -> Dict[str, Any]:
 def vectordb_tool(fn: Callable) -> Callable:
     """Run a store tool inside the shared envelope.
 
+    0. the node's outer gate runs first (``_vectordb_surface_refusal`` on
+       ``VectorStoreToolMixin``: ``expose_tools``, and ``allow_write`` for a write
+       tool); a tool the node does not offer answers its failure object untouched;
     1. the input is normalised (:func:`normalize_tool_input`);
     2. ``StoreUnsupported`` -> ``UNSUPPORTED``; ``ToolRefusal`` -> its code and extra keys;
        ``KeyboardInterrupt``/``SystemExit`` propagate; anything else (any ``BaseException``)
@@ -614,6 +617,10 @@ def vectordb_tool(fn: Callable) -> Callable:
 
     @functools.wraps(fn)
     def wrapper(self, args: Any = None) -> Dict[str, Any]:
+        surface = getattr(self, '_vectordb_surface_refusal', None)
+        refused = surface(fn.__name__) if callable(surface) else None
+        if refused is not None:
+            return refused
         try:
             result = fn(self, normalize_tool_input(args))
         except StoreUnsupported as exc:
@@ -1049,11 +1056,18 @@ class VectorExplorerTools:
         value = getattr(getattr(self, 'IGlobal', None), name, None)
         return value if isinstance(value, bool) else default
 
+    def _vx_outer_writes(self) -> bool:
+        """The outer write switch (``allow_write``, see ``VectorStoreToolMixin``); on for a class without one."""
+        check = getattr(self, '_vectordb_allow_write', None)
+        return bool(check()) if callable(check) else True
+
     def _vx_allow_writes(self) -> bool:
-        return self._vx_switch('allow_writes', VECTOR_ALLOW_WRITES_DEFAULT)
+        """Whether a DAP caller may write: ``allow_write`` and ``allow_writes`` both on."""
+        return self._vx_outer_writes() and self._vx_switch('allow_writes', VECTOR_ALLOW_WRITES_DEFAULT)
 
     def _vx_agent_writes(self) -> bool:
-        return self._vx_switch('agent_writes', VECTOR_AGENT_WRITES_DEFAULT)
+        """Whether an agent may write: ``allow_write`` and ``agent_writes`` both on."""
+        return self._vx_outer_writes() and self._vx_switch('agent_writes', VECTOR_AGENT_WRITES_DEFAULT)
 
     @staticmethod
     def _vx_forget_counts(store: Any) -> None:

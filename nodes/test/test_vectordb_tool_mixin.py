@@ -2707,7 +2707,8 @@ def test_upsert_without_an_embedder_is_no_embedder(agent_context):
 def test_get_pages_in_chunk_order_with_has_more():
     inst = node(clustered(docs=1, chunks=5))
     first = inst.get({'object_id': 'doc00', 'limit': 2})
-    assert [c['chunkId'] for c in first['chunks']] == [0, 1] and first['has_more'] is True and first['total'] == 2
+    # develop's public get contract (#2631): total is the document's chunk count, offset counts chunks.
+    assert [c['chunkId'] for c in first['chunks']] == [0, 1] and first['has_more'] is True and first['total'] == 5
     rest = inst.get({'object_id': 'doc00', 'offset': 2, 'limit': 10})
     assert [c['chunkId'] for c in rest['chunks']] == [2, 3, 4] and rest['has_more'] is False
     assert set(first['chunks'][0]) == {'content', 'chunkId', 'metadata'}
@@ -2715,10 +2716,12 @@ def test_get_pages_in_chunk_order_with_has_more():
 
 
 def test_get_clamps_the_limit():
-    store = clustered(docs=1, chunks=3)
-    node(store).get({'object_id': 'doc00', 'limit': 100_000})
-    window = [call for call in store.calls if call[0] == 'get'][0][1]
-    assert window.maxChunkId - window.minChunkId + 1 == 200
+    # The tool reads the whole document once (up to 10000 chunks) and cuts a page of at most 100.
+    store = clustered(docs=1, chunks=150)
+    answer = node(store).get({'object_id': 'doc00', 'limit': 100_000})
+    assert len(answer['chunks']) == 100 and answer['has_more'] is True and answer['total'] == 150
+    doc_filter = [call for call in store.calls if call[0] == 'get'][0][1]
+    assert (doc_filter.offset, doc_filter.limit) == (0, 10_000)
 
 
 @pytest.mark.parametrize(
@@ -2803,8 +2806,9 @@ def test_objdir_on_an_offset_ignoring_store_lists_past_the_first_page():
 def test_objdir_clamps_the_limit_given_to_get_paths():
     store = _PathsSpy().seed(corpus({f'd{i}': [0] for i in range(3)}))
     node(store).objdir({'limit': 100_000})
-    node(store).objdir({'limit': 0})
-    assert [call[3] for call in store.calls if call[0] == 'getPaths'] == [1000, 1]
+    # A limit below 1 is refused before the store is read (develop's objdir contract, #2631).
+    assert node(store).objdir({'limit': 0})['code'] == 'INVALID_INPUT'
+    assert [call[3] for call in store.calls if call[0] == 'getPaths'] == [1000]
 
 
 def test_objdir_rejects_bad_integers():
@@ -2812,9 +2816,11 @@ def test_objdir_rejects_bad_integers():
     assert (answer['success'], answer['code']) == (False, 'INVALID_INPUT')
 
 
-def test_objdir_clamps_the_limit():
+def test_objdir_refuses_a_limit_below_one():
     store = ExactListingStore().seed(corpus({f'd{i}': [0] for i in range(3)}))
-    assert len(node(store).objdir({'limit': 0})['entries']) == 1
+    assert len(node(store).objdir({'limit': 1})['entries']) == 1
+    answer = node(store).objdir({'limit': 0})
+    assert (answer['success'], answer['code']) == (False, 'INVALID_INPUT')
 
 
 class _EmptyPageListing(VectorMemoryStore):

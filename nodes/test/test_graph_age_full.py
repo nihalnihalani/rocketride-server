@@ -332,8 +332,8 @@ class TestRecovery:
                 # The pooler owns server sessions; drop the node's own client
                 # connection instead (same failure as from the node's side).
                 with glb.pool.connection() as conn:
-                    victim = conn
-                victim.close()
+                    dropped = conn
+                dropped.close()
             else:
                 (pid,) = _on_pooled_session(glb, 'SELECT pg_backend_pid()')
                 with admin.cursor() as cur:
@@ -709,6 +709,25 @@ class TestReadQuery:
         finally:
             glb.endGlobal()
 
+    def test_execute_graph_shape_binds_params(self, rr_env, age_graph):
+        glb = _begin(rr_env, {'allow_execute': True})
+        inst = _instance(rr_env, glb)
+        try:
+            out = inst.execute(
+                {
+                    'query': 'CREATE (n:Person {name: $name}) RETURN n.name AS name',
+                    'params': {'name': "e've $rr_cypher$"},
+                    'shape': 'graph',
+                }
+            )
+            assert out['columns'] == ['name'] and out['rows'] == [["e've $rr_cypher$"]]
+            found = inst.read_query(
+                {'cypher': 'MATCH (p:Person) WHERE p.name = $n RETURN count(p)', 'params': {'n': "e've $rr_cypher$"}}
+            )
+            assert found['rows'] == [[1]]
+        finally:
+            glb.endGlobal()
+
 
 # The statement Graph Explorer's Connect sends to Apache AGE
 # (apps/graph-ui/src/cypher/recipes.ts connectNodes, AGE_CONNECT_MAX_NODES):
@@ -1006,7 +1025,7 @@ def _setting_ms(text):
 
 
 class TestRetryDeadline:
-    """A call retried after a lost connection gets only what is left of its budget (GX-CT-09).
+    """A call retried after a lost connection gets only what is left of its budget.
 
     The budget is what the first attempt may take: the wait for a connection
     (the query timeout plus POOL_ACQUIRE_GRACE_S) plus the query timeout. With
@@ -1273,8 +1292,8 @@ def tenant_db():
 
 
 def _begin_as_tenant(rr_env, tenant_db, monkeypatch, config=None):
-    """The node as a cloud task runs it: the resolved tenant DSN, the default graph name."""
-    monkeypatch.setenv('ROCKETRIDE_DB_DSN', tenant_db.dsn)
+    """The node as a cloud task runs it: the delivered tenant DSN, the default graph name."""
+    monkeypatch.setenv('ROCKETRIDE_DB_DSNS', json.dumps({'org': tenant_db.dsn}))
     glb = rr_env.iglobal_cls()
     glb.glb = types.SimpleNamespace(logicalType='rocketride_graph', connConfig=dict(config or {}))
     glb.beginGlobal()

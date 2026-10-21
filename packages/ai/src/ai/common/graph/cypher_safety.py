@@ -112,6 +112,17 @@ def _runs_on(text: str, end: int) -> bool:
     return ch.isalnum() or ch == '_' or (ch == '.' and text[end + 1 : end + 2] != '.')
 
 
+def strip_cypher_literals(cypher: str) -> str:
+    """Return ``cypher`` with comments, string literals and back-quoted identifiers removed.
+
+    Keyword scans run on the result, so a keyword that is only data (a
+    commented-out DELETE, or ``n.op = "CREATE"``) is not seen as a clause.
+    Each removed span becomes a space: a comment separates tokens in Cypher, so
+    ``n/**/DELETE`` must still read as two words.
+    """
+    return _STRIP_LITERALS.sub(' ', cypher)
+
+
 def is_cypher_safe(cypher: str) -> bool:
     """Return True when the Cypher statement is read-only (MATCH/RETURN/schema CALLs).
 

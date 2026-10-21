@@ -657,6 +657,21 @@ class TestExecuteGraphShape:
         finally:
             glb.endGlobal()
 
+    def test_graph_shape_binds_params(self, neo_env, neo_db):
+        glb, inst = _start(neo_env, allow_execute=True)
+        try:
+            out = inst.execute(
+                {
+                    'query': 'UNWIND $rows AS r CREATE (n:GxNew {name: r.name}) RETURN n.name AS name',
+                    'params': {'rows': [{'name': 'p1'}, {'name': "p'2"}]},
+                    'shape': 'graph',
+                }
+            )
+            assert out['columns'] == ['name'] and out['rows'] == [['p1'], ["p'2"]]
+            assert _count(neo_db, 'MATCH (n:GxNew) RETURN count(n) AS c') == 2
+        finally:
+            glb.endGlobal()
+
     def test_refused_when_execute_is_off(self, neo_env, neo_db):
         glb, inst = _start(neo_env, allow_execute=False)
         try:

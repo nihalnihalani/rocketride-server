@@ -113,7 +113,7 @@ node).
 
 | Method | Signature | Description |
 | --- | --- | --- |
-| `database.query` | `database.query({ token, sql, nodeId?, sessionId?, params?, rowMode? }): Promise<{ rows, affected_rows }>` | Execute raw SQL through the pipeline's `execute` tool function. `rowMode: 'array'` returns positional rows (TypeScript only; the Python SDK has no `row_mode`). |
+| `database.query` | `database.query({ token, sql, nodeId?, sessionId?, params?, rowMode? }): Promise<{ rows, affected_rows }>` | Execute raw SQL or Cypher through the pipeline's `execute` tool function. `params` is a positional array for SQL nodes, or an object keyed by placeholder name for the `rocketride_graph` and `graph_neo4j` nodes (`graph_falkordb` rejects params). `rowMode: 'array'` returns positional rows (TypeScript only; the Python SDK has no `row_mode`). |
 | `database.beginTransaction` | `database.beginTransaction({ token, nodeId? }): Promise<{ session_id }>` | Open a transaction (`begin` tool function). |
 | `database.commit` | `database.commit({ token, sessionId, nodeId? }): Promise<{ ok }>` | Commit the open transaction. |
 | `database.rollback` | `database.rollback({ token, sessionId, nodeId? }): Promise<{ ok }>` | Roll back the open transaction. |
@@ -262,6 +262,7 @@ constructor(options?: {
   type?: QuestionType;
   filter?: DocFilter;
   expectJson?: boolean;
+  cachePrefix?: boolean;
   role?: string;
 })
 ```
@@ -278,6 +279,7 @@ constructor(options?: {
 | `addDocuments` | `addDocuments(documents: Doc \| Doc[]): void` | Adds documents for the AI to reference. |
 | `addGoal` | `addGoal(goal: string): void` | Adds a goal statement for the AI. |
 | `getPrompt` | `getPrompt(hasPreviousJsonFailed?: boolean): string` | Returns the full prompt (internal use). |
+| `cachePrefix` | field, default `false` | Set to `true` when the question will be sent again with only its context, documents, goals or questions changed (an agent loop). A provider with prompt caching (the Anthropic node, and Claude models on the Bedrock node) may then cache the unchanging start of the prompt: role, instructions, examples and history. Other providers ignore it. |
 
 ## Answer
 

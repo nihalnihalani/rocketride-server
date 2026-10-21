@@ -115,7 +115,7 @@ test('the AGE note says the managed database already has the graph rocketride, a
 	const graph = doc.components.find((c) => c.provider === 'rocketride_graph')!;
 	assert.equal((graph.config.default as Record<string, unknown>).graph, 'rocketride');
 	const text = String(doc.components.find((c) => c.provider === 'annotation')!.config.content);
-	assert.match(text, /graph `rocketride` is created for your organization/);
+	assert.match(text, /graph `rocketride` comes with every database/);
 	assert.match(text, /stops the pipeline from starting/);
 	assert.match(text, /pipeline's log/);
 	assert.doesNotMatch(text, /browsing a name that does not exist shows an error/);

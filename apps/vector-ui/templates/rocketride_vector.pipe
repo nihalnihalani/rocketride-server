@@ -185,6 +185,8 @@
           "similarity": "cosine",
           "hnsw_m": 16,
           "hnsw_ef_construction": 64,
+          "expose_tools": true,
+          "allow_write": true,
           "allow_writes": true
         },
         "parameters": {}
@@ -226,6 +228,8 @@
           "similarity": "cosine",
           "hnsw_m": 16,
           "hnsw_ef_construction": 64,
+          "expose_tools": true,
+          "allow_write": false,
           "allow_writes": false
         },
         "parameters": {}

@@ -37,6 +37,7 @@ task-command suites (see below).
 
 import asyncio
 import itertools
+import json
 import sys
 import types
 from unittest.mock import AsyncMock, MagicMock
@@ -93,6 +94,7 @@ TENANT_SPOOF_ENV = {
     'ROCKETRIDE_TEAM_ID': 'victim-team',
     'ROCKETRIDE_TENANT_ID': 'victim-org',
     'ROCKETRIDE_DB_DSN': 'postgresql://victim@pooler/victim-org',
+    'ROCKETRIDE_DB_DSNS': '{"org": "postgresql://victim@pooler/victim-org"}',
 }
 
 
@@ -122,8 +124,9 @@ def db_tasks(monkeypatch):
 
     Returns a namespace: ``server``, ``tenants`` (each tenant id passed to
     ``resolve_db_dsn``, in call order), ``envs`` (task token -> its process
-    environment), ``pipeline()`` (a fresh spoofing DB pipeline), ``spoof``
-    and ``spoof_env``.
+    environment), ``org_dsn(token)`` (the org database's DSN in that
+    environment's ``ROCKETRIDE_DB_DSNS`` map), ``pipeline()`` (a fresh
+    spoofing DB pipeline), ``spoof`` and ``spoof_env``.
     """
     from ai.account import account as account_singleton
     from ai.modules.task.task_engine import Task
@@ -153,7 +156,8 @@ def db_tasks(monkeypatch):
         return f'postgresql://role@pooler/{tenant_id}'
 
     async def record_start(task):
-        envs[task.token] = await task._build_subprocess_env()
+        # As Task.start_task does: the databases of the RESOLVED pipeline.
+        envs[task.token] = await task._build_subprocess_env(task._db_access(task._resolve_pipeline(task._pipeline)))
 
     monkeypatch.setattr(account_singleton, 'resolve_db_dsn', resolve_db_dsn)
     monkeypatch.setattr(account_singleton, 'get_merged_env', AsyncMock(return_value=dict(TENANT_SPOOF_ENV)))
@@ -165,6 +169,7 @@ def db_tasks(monkeypatch):
         server=ts,
         tenants=tenants,
         envs=envs,
+        org_dsn=lambda token: json.loads(envs[token]['ROCKETRIDE_DB_DSNS'])['org'],
         pipeline=_spoofing_db_pipeline,
         spoof=dict(TENANT_SPOOF),
         spoof_env=dict(TENANT_SPOOF_ENV),

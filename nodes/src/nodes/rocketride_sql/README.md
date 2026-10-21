@@ -1,9 +1,9 @@
 # rocketride_sql
 
 A RocketRide database node for asking natural-language questions of, and writing
-structured pipeline data to, your organization's managed RocketRide database.
-Pick it instead of a connection-configured PostgreSQL node when the data belongs
-in that managed database.
+structured pipeline data to, a managed RocketRide database: your organization's,
+your team's or your own (see Database). Pick it instead of a connection-configured
+PostgreSQL node when the data belongs in that managed database.
 
 ## What it does
 
@@ -18,7 +18,7 @@ the sibling for Cypher graph queries.
 
 | Connection | Required | Description |
 | --- | --- | --- |
-| llm | yes | Produces SQL from a natural-language question. |
+| llm | no | Produces SQL from a natural-language question. Not needed for execute (raw SQL). |
 
 ## Lanes
 
@@ -95,13 +95,11 @@ abandoned instead.
 
 ## Configuration
 
-There is one built-in profile and no connection panel. RocketRide provisions one
-database per organization for its managed database nodes (per user only where
-there is no organization), and the RocketRide server resolves the connection to
-it from the pipeline's organization instead of a host, user, password, or
-database name you enter; nothing in the node configuration or the pipeline can
-point it at another database. Configure the table and the context supplied to
-the LLM; leave direct execution disabled unless a trusted caller needs it.
+There is one built-in profile and no connection panel. The node uses the managed
+database chosen under Database (Organization by default); the RocketRide server
+authorizes it for the run and delivers its connection at task start, instead of
+a host, user, password, or database name you enter. Configure the table and the context supplied to the
+LLM; leave direct execution disabled unless a trusted caller needs it.
 
 ### Table name and database description
 
@@ -157,12 +155,47 @@ explicit transactions; otherwise keep it off so those tools fail rather than
 executing input. It does not change the questions lane, which only ever runs
 LLM-generated, safety-checked SELECT statements.
 
+### Database
+
+Database picks which RocketRide cloud database the node uses. It defaults to
+Organization, so existing pipelines keep using the database they already had.
+
+- **Organization**: the database shared by everyone in the organization the
+  pipeline runs in. Data from before this choice existed lives here.
+- **Team**: the database of the run's team. A run from the builder uses your
+  current dev team and needs run rights (task.control) on it; a deployed
+  pipeline uses the team it is billed to.
+- **Personal**: your own database in this organization. It works only when you
+  are the person running the pipeline: builder runs, store apps you run, and
+  pipelines you deploy for yourself (@me). A pipeline deployed for a team has
+  no person behind it, so it fails at start with an error that says so.
+  Organization admins can reach members' personal databases, and that access
+  is logged.
+
+Each choice is a separate database. Switching does not move or copy data, and
+a database you have not used yet is created empty on the first run that needs
+it. Tables created in one database are not visible from the others.
+
+A pipeline exposed through a public link (a chat, dropper, webhook, Discord or
+Telegram source) runs as you, so visitors' requests use your team or personal
+database, not their own.
+
+Access is checked when the run starts. If the run may not use the chosen
+database, it does not start, and the error says which database and why. A
+self-hosted engine supports only Organization; Team and Personal fail at start
+because they need RocketRide cloud. Access is approved for the whole run, not
+each node: every node in a run can reach every database the run was approved
+for.
+
 ## Limitations
 
-This node is marked noremote. The RocketRide server resolves the database
-connection for the pipeline's organization at task start, so it needs the cloud
-database broker configured; without it the node cannot start, and DSN
-resolution is deliberately not replaced by host or credential fields.
+This node is marked noremote. The RocketRide server resolves the connection to
+the node's chosen database at task start, through its cloud database broker; DSN resolution is deliberately not replaced by host or
+credential fields. On a server without a RocketRide cloud database (for
+example, a local or self-hosted engine with no database broker) the task fails
+at start with a message that says so; use a connection-configured node such as
+db_postgres there. On RocketRide Cloud, missing broker configuration is a server
+configuration error: contact the server operator to restore it and retry.
 LLM-generated queries are limited to the safe SQL path, while raw SQL is
 unavailable until direct execution is explicitly enabled.
 

@@ -1256,7 +1256,7 @@ async def test_start_task_without_an_organization_the_runs_own_user_is_the_tenan
     task = db_tasks.server._task_control[result['token']].task
     assert (task.org_id, task.client_id) == ('', 'user-1')
     assert db_tasks.tenants == ['user-1']
-    assert db_tasks.envs[result['token']]['ROCKETRIDE_DB_DSN'] == 'postgresql://role@pooler/user-1'
+    assert db_tasks.org_dsn(result['token']) == 'postgresql://role@pooler/user-1'
 
 
 @pytest.mark.asyncio
@@ -1282,5 +1282,5 @@ async def test_start_task_with_and_without_an_organization_concurrently(db_tasks
     )
 
     for (org, user), result in zip(starts, results):
-        assert db_tasks.envs[result['token']]['ROCKETRIDE_DB_DSN'] == f'postgresql://role@pooler/{org or user}'
+        assert db_tasks.org_dsn(result['token']) == f'postgresql://role@pooler/{org or user}'
     assert sorted(db_tasks.tenants) == sorted(org or user for org, user in starts)

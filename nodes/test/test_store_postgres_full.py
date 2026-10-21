@@ -1424,7 +1424,7 @@ class TestNodes:
 
     def test_rocketride_vector_writes_through_the_shared_driver(self, node_env, dsn, table, stores, admin):
         rng = np.random.default_rng(61)
-        node_env.setenv('ROCKETRIDE_DB_DSN', dsn)
+        node_env.setenv('ROCKETRIDE_DB_DSNS', json.dumps({'org': dsn}))
         rv = importlib.import_module('nodes.rocketride_vector.rocketride_vector')
         store = rv.Store(
             'rocketride_vector', {'collection': table, 'similarity': 'l2', 'hnsw_m': 8, 'hnsw_ef_construction': 32}, {}

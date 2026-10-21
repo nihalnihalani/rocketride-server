@@ -24,17 +24,18 @@
 """Where ``resolve_rocketride_dsn`` may take a database from, by process.
 
 The RocketRide cloud DB nodes call it in two kinds of process: a task process,
-whose environment the task engine built (the DSN it resolved for that task, or
-the reason there is none), and the server process, where a node's save-time
-``validateConfig`` probe runs. A hosted engine's server process serves every
-tenant and the probe carries no tenant, so there it must never take a DSN or an
-identity from the server's own environment: it reports the broker state instead.
-The open-source server process (one tenant, ``ROCKETRIDE_DB_DSN`` set for local
-development) keeps resolving from its environment.
+whose environment the task engine built (``ROCKETRIDE_DB_DSNS``: the DSN of
+each database it authorized and resolved for that task, or the reason there
+is none), and the server process, where a node's save-time ``validateConfig``
+probe runs. Neither kind ever resolves a database itself: no account call, no
+identity from the environment (``ROCKETRIDE_CLIENT_ID``), no single
+``ROCKETRIDE_DB_DSN``, whichever account class is loaded and whatever flags
+the command line carries.
 """
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -46,9 +47,9 @@ from ai.common import rocketride_db
 
 SERVER_DSN = 'postgresql://someone@pooler/some-tenant?sslmode=require'
 BROKER = {'RR_DB_BROKER_URL': 'https://broker.example/provision', 'RR_DB_BROKER_TOKEN': 'token'}
-UNCONFIGURED = 'the RocketRide cloud database broker is not configured on this server'
-# rocketride_db.NOT_RESOLVED, spelled out so a run against older code fails on the behaviour.
-NOT_RESOLVED_TEXT = 'the task engine resolved no database for this task'
+# Names an older seam read: a caller's tenant and a single DSN.
+LEGACY_CLIENT_ID_ENV = 'ROCKETRIDE_CLIENT_ID'
+LEGACY_DSN_ENV = 'ROCKETRIDE_DB_DSN'
 
 
 class _Account(AccountBase):
@@ -67,17 +68,20 @@ class _HostedAccount(_Account):
 class _OverlayAccount(_HostedAccount):
     """A hosted overlay that resolves DSNs itself (no broker settings needed)."""
 
-    async def resolve_db_dsn(self, client_id):  # pragma: no cover - replaced per instance
+    async def resolve_db_dsn(self, client_id, scope='org', owner_id=''):  # pragma: no cover - replaced per instance
         return SERVER_DSN
 
 
 @pytest.fixture
 def server_env(monkeypatch):
-    """A server environment that names a DSN, an identity and a stale error."""
-    for name in (*BROKER, rocketride_db.DB_DSN_ENV, rocketride_db.CLIENT_ID_ENV, rocketride_db.DB_RESOLVE_ERROR_ENV):
+    """An environment that names a tenant, a single DSN and the broker, but delivers nothing."""
+    for name in (*BROKER, LEGACY_DSN_ENV, LEGACY_CLIENT_ID_ENV, rocketride_db.DB_DSNS_ENV):
         monkeypatch.delenv(name, raising=False)
-    monkeypatch.setenv(rocketride_db.DB_DSN_ENV, SERVER_DSN)
-    monkeypatch.setenv(rocketride_db.CLIENT_ID_ENV, 'some-tenant')
+    monkeypatch.delenv(rocketride_db.DB_RESOLVE_ERROR_ENV, raising=False)
+    monkeypatch.setenv(LEGACY_DSN_ENV, SERVER_DSN)
+    monkeypatch.setenv(LEGACY_CLIENT_ID_ENV, 'some-tenant')
+    for name, value in BROKER.items():
+        monkeypatch.setenv(name, value)
     return monkeypatch
 
 
@@ -85,7 +89,7 @@ def _install(monkeypatch, account_cls, argv):
     """Make ``account_cls`` the loaded account and ``argv`` the command line; return the resolver calls."""
     calls = []
 
-    async def resolver(client_id):
+    async def resolver(client_id, scope='org', owner_id=''):
         calls.append(client_id)
         return SERVER_DSN
 
@@ -96,23 +100,36 @@ def _install(monkeypatch, account_cls, argv):
     return calls
 
 
+_PROCESSES = [
+    (_Account, ['engine']),
+    (_Account, ['engine', '--saas']),
+    (_HostedAccount, ['engine']),
+    (_OverlayAccount, ['engine', '--saas']),
+    (_HostedAccount, ['engine', '--hosted']),
+    # Pipeline arguments can add flags to a task's command line, never remove --hosted.
+    (_OverlayAccount, ['engine', '--hosted', '--saas']),
+]
+_PROCESS_IDS = [
+    'open-source-server',
+    'hosted-server-saas-flag',
+    'hosted-server-saas-capability',
+    'hosted-server-overlay-resolver',
+    'hosted-task',
+    'hosted-task-with-added-saas-flag',
+]
+
+
 # ---------------------------------------------------------------------------
-# A hosted engine's server process resolves no tenant
+# No process resolves a database itself
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    'account_cls,argv',
-    [
-        (_Account, ['engine', '--saas']),  # the engine's own launch flag
-        (_HostedAccount, ['engine']),  # the account's saas capability
-    ],
-    ids=['saas-flag', 'saas-capability'],
-)
-def test_hosted_server_never_uses_its_own_dsn_or_identity(server_env, account_cls, argv):
+@pytest.mark.parametrize('account_cls,argv', _PROCESSES, ids=_PROCESS_IDS)
+def test_nothing_delivered_resolves_nothing(server_env, account_cls, argv):
+    """Neither a DSN map nor a reason: refuse, without the account, the tenant or the single DSN."""
     calls = _install(server_env, account_cls, argv)
 
-    with pytest.raises(ValueError) as caught:
+    with pytest.raises(rocketride_db.DsnNotDelivered) as caught:
         rocketride_db.resolve_rocketride_dsn()
 
     assert calls == []
@@ -120,155 +137,36 @@ def test_hosted_server_never_uses_its_own_dsn_or_identity(server_env, account_cl
     assert 'some-tenant' not in str(caught.value)
 
 
-def test_hosted_server_without_broker_reports_the_task_start_wording(server_env):
-    _install(server_env, _HostedAccount, ['engine', '--saas'])
-
-    with pytest.raises(ValueError, match=UNCONFIGURED):
-        rocketride_db.resolve_rocketride_dsn()
-
-
-def test_hosted_server_without_identity_reports_the_broker_not_the_identity(monkeypatch):
-    """The misleading 'ROCKETRIDE_CLIENT_ID is not set' message is gone."""
-    for name in (*BROKER, rocketride_db.DB_DSN_ENV, rocketride_db.CLIENT_ID_ENV, rocketride_db.DB_RESOLVE_ERROR_ENV):
-        monkeypatch.delenv(name, raising=False)
-    _install(monkeypatch, _HostedAccount, ['engine', '--saas'])
-
-    with pytest.raises(ValueError) as caught:
-        rocketride_db.resolve_rocketride_dsn()
-
-    assert UNCONFIGURED in str(caught.value)
-    assert rocketride_db.CLIENT_ID_ENV not in str(caught.value)
-
-
-def test_hosted_server_ignores_a_resolve_error_in_its_own_environment(server_env):
-    """ROCKETRIDE_DB_RESOLVE_ERROR is the engine's message to a task, not server state."""
-    server_env.setenv(rocketride_db.DB_RESOLVE_ERROR_ENV, 'stale reason from somewhere')
-    _install(server_env, _HostedAccount, ['engine', '--saas'])
-
-    with pytest.raises(ValueError) as caught:
-        rocketride_db.resolve_rocketride_dsn()
-
-    assert UNCONFIGURED in str(caught.value)
-    assert 'stale reason' not in str(caught.value)
-
-
-@pytest.mark.parametrize('account_cls', [_HostedAccount, _OverlayAccount], ids=['broker', 'overlay-resolver'])
-def test_hosted_server_with_a_resolver_defers_to_task_start(server_env, account_cls):
-    """Broker configured (or an overlay resolving DSNs itself): nothing to check before a task starts."""
-    for name, value in BROKER.items():
-        server_env.setenv(name, value)
-    calls = _install(server_env, account_cls, ['engine', '--saas'])
-
-    with pytest.raises(rocketride_db.ResolvedAtTaskStart) as caught:
-        rocketride_db.resolve_rocketride_dsn()
-
-    assert calls == []
-    assert 'when a task starts' in str(caught.value)
-    assert 'not configured' not in str(caught.value)
-
-
-def test_overlay_resolver_counts_as_configured_without_broker_settings(server_env):
-    calls = _install(server_env, _OverlayAccount, ['engine', '--saas'])
-
-    with pytest.raises(rocketride_db.ResolvedAtTaskStart):
-        rocketride_db.resolve_rocketride_dsn()
-
-    assert calls == []
-
-
-def test_broker_wording_matches_the_task_engine():
-    """The probe and a task-start failure say the same thing."""
-    from ai.modules.task import task_engine
-
-    assert rocketride_db.BROKER_UNCONFIGURED == task_engine.CONST_DB_BROKER_UNCONFIGURED
-    assert rocketride_db.HOSTED_CHILD_FLAG == task_engine.CONST_HOSTED_CHILD_FLAG
-
-
-# ---------------------------------------------------------------------------
-# Task processes and the open-source server keep resolving as before
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    'argv',
-    [
-        ['engine', '--hosted'],
-        # Pipeline arguments can add flags to a task's command line, never
-        # remove --hosted: an added --saas does not make a task the server.
-        ['engine', '--hosted', '--saas'],
-    ],
-    ids=['hosted-task', 'hosted-task-with-added-saas-flag'],
-)
-def test_hosted_task_process_uses_the_dsn_the_engine_injected(server_env, argv):
-    calls = _install(server_env, _HostedAccount, argv)
-
-    assert rocketride_db.resolve_rocketride_dsn() == SERVER_DSN
-    assert calls == []
-
-
-def test_hosted_task_process_reports_the_engine_resolve_error(server_env):
-    server_env.delenv(rocketride_db.DB_DSN_ENV)
-    server_env.setenv(rocketride_db.DB_RESOLVE_ERROR_ENV, UNCONFIGURED)
-    _install(server_env, _Account, ['engine', '--hosted'])
-
-    with pytest.raises(ValueError, match='at task start: ' + UNCONFIGURED):
-        rocketride_db.resolve_rocketride_dsn()
-
-
-@pytest.mark.parametrize('injected', [None, '   '], ids=['no-dsn', 'blank-dsn'])
-@pytest.mark.parametrize(
-    'argv',
-    [['engine', '--hosted'], ['engine', '--hosted', '--saas']],
-    ids=['hosted-task', 'hosted-task-with-added-saas-flag'],
-)
-@pytest.mark.parametrize(
-    'account_cls', [_Account, _HostedAccount, _OverlayAccount], ids=['base', 'hosted', 'overlay-resolver']
-)
-def test_hosted_task_process_without_a_resolved_database_never_resolves_one_itself(
-    server_env, account_cls, argv, injected
-):
-    """Neither a DSN nor a reason from the task engine: say so, and resolve nothing here.
-
-    The account fallback would take the tenant from the task's own environment
-    (ROCKETRIDE_CLIENT_ID) through whichever account class the task loaded, and
-    pipeline code and pipeline-added arguments (``--saas``) reach both.
-    """
-    server_env.delenv(rocketride_db.DB_DSN_ENV)
-    if injected is not None:
-        server_env.setenv(rocketride_db.DB_DSN_ENV, injected)
+@pytest.mark.parametrize('account_cls,argv', _PROCESSES, ids=_PROCESS_IDS)
+def test_only_the_delivered_map_counts(server_env, account_cls, argv):
+    """A delivered map is read for the node's key alone; nothing else in the environment is."""
     calls = _install(server_env, account_cls, argv)
+    delivered = 'postgresql://role@pooler/org-1?sslmode=require'
+    server_env.setenv(rocketride_db.DB_DSNS_ENV, json.dumps({'org': delivered}))
 
-    with pytest.raises(ValueError) as caught:
+    assert rocketride_db.resolve_rocketride_dsn() == delivered
+    with pytest.raises(ValueError, match='was not given') as caught:
+        rocketride_db.resolve_rocketride_dsn('team')
+    assert calls == []
+    assert SERVER_DSN not in str(caught.value) and delivered not in str(caught.value)
+
+
+def test_the_engines_resolve_error_is_reported(server_env):
+    calls = _install(server_env, _HostedAccount, ['engine', '--hosted'])
+    server_env.setenv(rocketride_db.DB_RESOLVE_ERROR_ENV, 'the org database failed to resolve: HTTP 503')
+
+    with pytest.raises(ValueError, match='not available for this task: the org database failed to resolve'):
         rocketride_db.resolve_rocketride_dsn()
-
-    assert calls == []
-    message = str(caught.value)
-    assert 'at task start' in message and rocketride_db.NOT_RESOLVED in message
-    assert 'some-tenant' not in message and rocketride_db.CLIENT_ID_ENV not in message
-
-
-def test_open_source_server_uses_its_own_dsn(server_env):
-    """Single-tenant local development: ROCKETRIDE_DB_DSN in the engine's environment."""
-    calls = _install(server_env, _Account, ['engine'])
-
-    assert rocketride_db.resolve_rocketride_dsn() == SERVER_DSN
     assert calls == []
 
 
-def test_open_source_server_falls_back_to_the_account(server_env):
-    server_env.delenv(rocketride_db.DB_DSN_ENV)
-    calls = _install(server_env, _Account, ['engine'])
-
-    assert rocketride_db.resolve_rocketride_dsn() == SERVER_DSN
-    assert calls == ['some-tenant']
-
-
-def test_hosted_detection_does_not_import_the_account_layer(server_env):
-    """A task process or an isolated test that never loaded ai.account is not hosted."""
-    server_env.setattr(sys, 'argv', ['engine'])
+def test_resolution_does_not_import_the_account_layer(server_env):
+    """The seam is stdlib only: a task process that never loaded ai.account does not load it here."""
+    server_env.setattr(sys, 'argv', ['engine', '--hosted'])
     server_env.delitem(sys.modules, 'ai.account')
 
-    assert rocketride_db.resolve_rocketride_dsn() == SERVER_DSN
+    with pytest.raises(rocketride_db.DsnNotDelivered):
+        rocketride_db.resolve_rocketride_dsn()
     assert 'ai.account' not in sys.modules
 
 
@@ -300,7 +198,7 @@ class Account(AccountBase):
     async def authenticate(self, credential):
         return (401, 'stand-in')
 
-    async def resolve_db_dsn(self, tenant):
+    async def resolve_db_dsn(self, tenant, scope='org', owner_id=''):
         with open(@LOG@, 'a', encoding='utf-8') as f:
             f.write(tenant + '\\n')
         return 'postgresql://role@pooler/' + tenant
@@ -355,11 +253,11 @@ def _hosted_task_launch(monkeypatch, tmp_path, pipeline, pipeline_args):
     probe = tmp_path / 'probe.py'
     probe.write_text(_PROBE.replace('@SRC@', repr(str(src))).replace('@OVERLAY@', repr(str(overlay))))
 
-    # The engine's environment: a caller's tenant, a stale DSN, the broker settings.
-    for name in (rocketride_db.DB_DSN_ENV, rocketride_db.DB_RESOLVE_ERROR_ENV):
-        monkeypatch.delenv(name, raising=False)
-    monkeypatch.setenv(rocketride_db.CLIENT_ID_ENV, VICTIM)
-    monkeypatch.setenv(rocketride_db.DB_DSN_ENV, f'postgresql://role@pooler/{VICTIM}')
+    # The engine's environment: a caller's tenant, a stale DSN and DSN map, the broker settings.
+    monkeypatch.delenv(rocketride_db.DB_RESOLVE_ERROR_ENV, raising=False)
+    monkeypatch.setenv(LEGACY_CLIENT_ID_ENV, VICTIM)
+    monkeypatch.setenv(LEGACY_DSN_ENV, f'postgresql://role@pooler/{VICTIM}')
+    monkeypatch.setenv(rocketride_db.DB_DSNS_ENV, json.dumps({'org': f'postgresql://role@pooler/{VICTIM}'}))
     for name, value in BROKER.items():
         monkeypatch.setenv(name, value)
 
@@ -367,7 +265,7 @@ def _hosted_task_launch(monkeypatch, tmp_path, pipeline, pipeline_args):
     # returns a DSN for the tenant it is given.
     server_calls = []
 
-    async def server_resolver(tenant):
+    async def server_resolver(tenant, scope='org', owner_id=''):
         server_calls.append(tenant)
         return f'postgresql://role@pooler/{tenant}?sslmode=require'
 
@@ -448,7 +346,8 @@ def test_a_hosted_task_process_never_resolves_a_database_the_engine_did_not(monk
     if pipeline_args:
         assert report['account'] == 'extension.saas', 'the task process holds a resolver for any tenant'
     assert 'dsn' not in report, f'the task process resolved {report.get("dsn")}'
-    assert report['error'] == f'RocketRide cloud database resolution failed at task start: {NOT_RESOLVED_TEXT}'
+    assert report['error'].startswith('no RocketRide cloud database is delivered'), report['error']
+    assert VICTIM not in report['error']
     assert not (tmp_path / 'task-resolver.log').exists(), 'the task process resolved a database itself'
     assert server_calls == []
 

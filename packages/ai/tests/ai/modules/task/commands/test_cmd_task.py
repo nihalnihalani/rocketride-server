@@ -325,7 +325,7 @@ async def test_on_execute_end_to_end_the_tenant_is_the_callers_organization(db_t
     task = db_tasks.server._task_control[token].task
     assert (task.org_id, task.team_id, task.client_id) == ('org-B', 'team-1', 'user-1')
     assert db_tasks.tenants == ['org-B']
-    assert db_tasks.envs[token]['ROCKETRIDE_DB_DSN'] == 'postgresql://role@pooler/org-B'
+    assert db_tasks.org_dsn(token) == 'postgresql://role@pooler/org-B'
     # Other ROCKETRIDE_* names pass to the task like any other (they are not
     # identity there); no database setting names another tenant.
     assert not [k for k, v in db_tasks.envs[token].items() if 'DB_' in k.upper() and 'victim' in v]
@@ -349,7 +349,7 @@ async def test_on_execute_end_to_end_the_tenant_is_the_run_teams_organization(db
 
     get_team.assert_awaited_once_with('team-1')
     assert db_tasks.tenants == ['org-T']
-    assert db_tasks.envs[response['body']['token']]['ROCKETRIDE_DB_DSN'] == 'postgresql://role@pooler/org-T'
+    assert db_tasks.org_dsn(response['body']['token']) == 'postgresql://role@pooler/org-T'
 
 
 @pytest.mark.asyncio
@@ -398,7 +398,7 @@ async def test_on_execute_end_to_end_concurrent_callers_keep_their_own_tenant(db
         token = response['body']['token']
         task = db_tasks.server._task_control[token].task
         assert (task.org_id, task.client_id) == (org, user)
-        assert db_tasks.envs[token]['ROCKETRIDE_DB_DSN'] == f'postgresql://role@pooler/{org}'
+        assert db_tasks.org_dsn(token) == f'postgresql://role@pooler/{org}'
     assert sorted(db_tasks.tenants) == ['org-a', 'org-a', 'org-b']
 
 

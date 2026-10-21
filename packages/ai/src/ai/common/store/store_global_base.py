@@ -37,11 +37,11 @@ worked example.
 """
 
 from abc import ABC, abstractmethod
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from rocketlib import OPEN_MODE, warning
 
-from ai.common.config import Config
+from ai.common.config import Config, check_credential_resolved
 from ai.common.transform import IGlobalTransform
 from ai.common.utils.config_utils import parse_bool
 
@@ -56,6 +56,20 @@ class StoreGlobalBase(IGlobalTransform, ABC):
     # Overridden by the driver and, when present, by the merged node config.
     serverName: str = ''
 
+    # Whether the upsert/delete tools may change the store (read by
+    # VectorStoreToolMixin). True keeps every existing driver as it was; a
+    # driver whose store is shared or managed sets the class default to False
+    # and lets the node owner opt in through an ``allow_write`` config field.
+    # Resolved from the merged node config in beginGlobal, like serverName.
+    allow_write: bool = True
+
+    # Whether the node offers its tool surface at all (read by
+    # VectorStoreToolMixin). True keeps every existing driver as it was; a
+    # driver whose store is shared or managed sets the class default to False
+    # and lets the node owner opt in through an ``expose_tools`` config field.
+    # Resolved from the merged node config in beginGlobal, like allow_write.
+    expose_tools: bool = True
+
     # The live store, opened in beginGlobal and read by StoreInstanceBase.
     store: Optional[DocumentStoreBase] = None
 
@@ -64,10 +78,13 @@ class StoreGlobalBase(IGlobalTransform, ABC):
     embed_query = None
     embed_model_name: Optional[str] = None
 
-    # Write switches of the vector store tools (remove_document, delete, upsert),
-    # read in beginGlobal from the node config keys ``allow_writes`` and
-    # ``agent_writes``. ``allow_writes`` governs external tool calls (DAP);
-    # ``agent_writes`` governs calls made by an agent inside the pipeline.
+    # Per-caller write switches of the vector store tools (remove_document,
+    # delete, upsert), read by vx_write_gate.check_write once the outer gate
+    # above (expose_tools, allow_write) lets a write tool run. Resolved in
+    # beginGlobal from the node config keys ``allow_writes`` and
+    # ``agent_writes``: ``allow_writes`` governs external tool calls (DAP),
+    # ``agent_writes`` calls made by an agent inside the pipeline. A driver
+    # may change either class default.
     allow_writes: bool = VECTOR_ALLOW_WRITES_DEFAULT
     agent_writes: bool = VECTOR_AGENT_WRITES_DEFAULT
 
@@ -90,6 +107,22 @@ class StoreGlobalBase(IGlobalTransform, ABC):
         Read from ``self.store`` after it is opened. Folded into the transform
         key that tracks which objects a given store has already ingested.
         """
+
+    # The config fields holding what the driver sends its server to sign in.
+    # A driver that uses one in some modes only overrides ``_credentials``.
+    credential_fields: Tuple[str, ...] = ()
+
+    def _credentials(self, config: Dict[str, Any]) -> List[Tuple[str, Any]]:
+        """The credentials this config has the driver send, as ``(field, value)``."""
+        return [(field, config.get(field)) for field in self.credential_fields]
+
+    def _check_credentials(self, config: Dict[str, Any], connConfig: Any) -> None:
+        """Raise when a credential is still a ${...} that no saved variable filled.
+
+        Sent as is, the server's "unauthorized" reply would not say which variable is missing.
+        """
+        for field, value in self._credentials(config):
+            check_credential_resolved(self.glb.logicalType, field, value, connConfig)
 
     @abstractmethod
     def _probe_connection(self, config: Dict[str, Any]) -> None:
@@ -121,13 +154,23 @@ class StoreGlobalBase(IGlobalTransform, ABC):
         if isinstance(resolved_name, str) and resolved_name.strip():
             self.serverName = resolved_name.strip()
 
-        # Write switches: loose booleans ("yes", "off", ...); anything else keeps the default.
-        self.allow_writes = parse_bool(
-            cfg.get('allow_writes') if hasattr(cfg, 'get') else None, VECTOR_ALLOW_WRITES_DEFAULT
-        )
-        self.agent_writes = parse_bool(
-            cfg.get('agent_writes') if hasattr(cfg, 'get') else None, VECTOR_AGENT_WRITES_DEFAULT
-        )
+        # The tool switches, from the same merged config: profile defaults and user
+        # overrides both count, loose booleans ('false', '0', 'yes', 'off', ...) read
+        # as such, and an absent or unrecognised value keeps the driver's class
+        # default. expose_tools and allow_write are the outer gate (whether a tool
+        # exists for this node at all); allow_writes (DAP calls) and agent_writes
+        # (agent calls) are the write gate's per-caller switches (vx_write_gate).
+        def _switch(name: str) -> bool:
+            raw = cfg.get(name) if hasattr(cfg, 'get') else None
+            return parse_bool(raw, default=getattr(type(self), name))
+
+        self.expose_tools = _switch('expose_tools')
+        self.allow_write = _switch('allow_write')
+        self.allow_writes = _switch('allow_writes')
+        self.agent_writes = _switch('agent_writes')
+
+        # A key left as an unfilled ${ROCKETRIDE_...} fails here, before the driver sends it.
+        self._check_credentials(cfg, connConfig)
 
         # Open the driver's store, then wire an optional embedder for the tool path.
         # Pass the raw connConfig, not the merged cfg above: each driver's Store
@@ -191,6 +234,8 @@ class StoreGlobalBase(IGlobalTransform, ABC):
         """Save-time validation: probe the server so the user sees errors immediately."""
         try:
             config = Config.getNodeConfig(self.glb.logicalType, self.glb.connConfig)
+            # An unfilled credential is reported as such, and the probe does not send it.
+            self._check_credentials(config, self.glb.connConfig)
             self._probe_connection(config)
         except Exception as e:
             warning(str(e))

@@ -77,7 +77,7 @@ rocketride upload files/*.csv --token TASK_TOKEN           # upload into an alre
 rocketride stop --token TASK_TOKEN                         # terminate a task
 ```
 
-- `start` options: `--pipeline <file>` (or `ROCKETRIDE_PIPELINE`; required), `--token <token>` (or `ROCKETRIDE_TOKEN`), `--threads <num>` (default 4), `--args <args...>`
+- `start` options: `--pipeline <file>` (or `ROCKETRIDE_PIPELINE`; required), `--token <token>` (or `ROCKETRIDE_TOKEN`; your own unguessable `tk_` token also lets one pipe run twice at once), `--threads <num>` (default 4), `--args <args...>`
 - `upload` options: `--pipeline <file>` or `--token <token>` (one required), `--threads <num>` (default 4), `--max-concurrent <num>` (default 5), `--args <args...>`
 
 There is no live-monitor command: continuous monitoring belongs to the
@@ -147,7 +147,7 @@ rocketride deploy get <projectId> --team <teamId>                   # one deploy
 rocketride deploy versions <projectId>                              # registry versions
 rocketride deploy artifact <projectId> <version>                    # fetch one registry version's artifact JSON
 rocketride deploy history <projectId>                               # deploy/publish audit trail
-rocketride deploy run <projectId> <sourceId> --team <teamId>        # trigger a run now
+rocketride deploy run <projectId> <sourceId> --team <teamId>        # run now; no run window: ends when the pipeline finishes or is terminated
 rocketride deploy schedule set <projectId> <sourceId> "0 9 * * 1-5" --team <teamId> --ttl 32400
 rocketride deploy schedule pause <projectId> <sourceId> --team <teamId>
 rocketride deploy schedule resume <projectId> <sourceId> --team <teamId>

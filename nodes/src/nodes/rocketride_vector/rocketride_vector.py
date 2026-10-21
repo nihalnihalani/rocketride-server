@@ -27,14 +27,15 @@
 # The same pgvector store as ``store_postgres`` (the shared driver
 # ``ai.common.store.pgvector.PgVectorStore``) except for two things:
 #   1. Connection: instead of reading host/user/password from config, it
-#      resolves a ready per-tenant DSN via ``ai.common.rocketride_db``
-#      (injected by the task engine, or via the account broker). The DSN
-#      usually points at a transaction-mode pooler, which the driver is built
-#      for: nothing is ever set for the session.
+#      reads the DSN the task engine delivered for the node's scope / target
+#      (``ai.common.rocketride_db``). The DSN usually points at a
+#      transaction-mode pooler, which the driver is built for: nothing is ever
+#      set for the session.
 #   2. Index parameters: the HNSW ``m`` and ``ef_construction`` come from the
 #      node configuration.
-# The table is shared by every pipeline of the organization that names it, which
-# ``describe()`` reports as the caveat ``shared_org_table``.
+# The table is shared by every pipeline that names it in the same managed
+# database (the organization's by default), which ``describe()`` reports as the
+# caveat ``shared_org_table``.
 # ------------------------------------------------------------------------------
 import os
 from depends import depends
@@ -45,7 +46,7 @@ depends(requirements)
 from typing import Any, Dict
 
 from ai.common.config import Config
-from ai.common.rocketride_db import parse_dsn_fields, resolve_rocketride_dsn
+from ai.common.rocketride_db import db_target, parse_dsn_fields, resolve_rocketride_dsn
 from ai.common.store.pgvector import HNSW_MAX_DIMS, PgVectorStore
 from .IGlobal import VALID_TABLE
 
@@ -56,7 +57,7 @@ __all__ = ['DEFAULT_POSTGRES_PORT', 'HNSW_MAX_DIMS', 'Store']
 
 
 class Store(PgVectorStore):
-    """The pgvector table of the organization's RocketRide cloud database."""
+    """A pgvector table in a managed RocketRide cloud database (the node's scope / target)."""
 
     node: str = 'rocketride'
 
@@ -78,12 +79,12 @@ class Store(PgVectorStore):
                 f'Invalid collection name: {table!r}. Must be a valid PostgreSQL identifier (letters, digits, underscores; max 63 chars).'
             )
 
-        # RocketRide cloud: no host/user/password fields. Resolve the
-        # per-tenant DSN (task-engine injected, or via the account broker).
+        # RocketRide cloud: no host/user/password fields. Read the DSN the
+        # task engine delivered for this node's scope / target.
         # host/port/database are parsed only for bookkeeping (the connection
         # subKey keys on database); the DSN is the source of truth and is
         # never reported.
-        dsn = resolve_rocketride_dsn()
+        dsn = resolve_rocketride_dsn(*db_target(config))
         fields = parse_dsn_fields(dsn)
         self.host = fields['host']
         self.port = fields['port'] or DEFAULT_POSTGRES_PORT

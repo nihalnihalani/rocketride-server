@@ -308,7 +308,7 @@ Start a RocketRide pipeline. Returns the server response body; `token` is the ta
 
 - `pipeline?: PipelineConfig` — flat pipeline object (`components`, `source`, `project_id` at top level — do **not** wrap it in `{ pipeline: { ... } }`)
 - `filepath?: string` — path to a `.pipe` or JSON file (Node.js only); `{ "pipeline": { ... } }` wrappers are unwrapped automatically
-- `token?: string` — custom task token (auto-generated if not provided)
+- `token?: string` — custom task token (auto-generated if not provided). Pass a distinct token per instance to run the same pipeline more than once at a time; tokens share one namespace across users, so use an unguessable value that keeps the `tk_` prefix
 - `source?: string` — override the pipeline's source component
 - `threads?: number` — number of execution threads. **No client default** — when omitted, the server decides
 - `useExisting?: boolean` — reuse an existing pipeline instance
@@ -673,6 +673,7 @@ interface LogStreamRef {
 }
 ```
 
+- `client.log.streams({ projectId, source }): Promise<LogStreamsResult>` — every continuum of that source you may read (own dev, own `@me` deploy, each team deploy you can monitor), each tagged with `teamId`, `teamName`, `runKind`, `ownerKind` and carrying the chapters body.
 - `client.log.chapters(stream): Promise<LogChaptersResult>` — the whole timeline in one small read: per-run chapters (`beginTime`, `beginSeq`, `endTime`, `outcome`), segment activity spans, the retained window, the retention horizon (`horizonSeq`), and `completed` (false while a run is writing)
 - `client.log.read(stream, params?): Promise<LogReadResult>` — read a seq/time range of events, paged. Range forms: `fromSeq`/`toSeq`, `fromTime`/`toTime` (omit the upper bound for "to now"), or `fromTime` → `toSegment`. Optional `types` filters server-side (e.g. `['output']`); `maxEvents`/`maxBytes` bound the page. When the response carries `nextSeq`, pass it back as `cursor` to continue; `truncatedAtSeq` means the request reached below the retention horizon
 - `client.log.segment(stream, segment, params?): Promise<LogSegmentResult>` — one segment's raw JSONL bytes, chunked by byte offset (the bulk replay path). Every chunk ends on a line boundary, so each parses standalone; repeat with the returned `nextOffset` until `final`. The segment table (ids + time extents) comes from `chapters()`
@@ -808,8 +809,8 @@ Point a team at a published version. Promotion (Staging → Production) and roll
 
 **State & runs:**
 
-- `run(projectId, sourceId, teamId): Promise<{ token?: string; version?: number }>` — start one deployed source NOW. Same trusted team dispatch the scheduler uses: the run executes as the team, carries no human identity, and who fired it lands in the audit history. The deployment must be enabled
-- `disable(projectId, teamId)` / `enable(projectId, teamId): Promise<Deployment>` — the kill switch: while disabled NOTHING runs (schedules stop firing, manual runs are refused)
+- `run(projectId, sourceId, teamId): Promise<{ token?: string; version?: number }>` — start one deployed source NOW. Same trusted team dispatch the scheduler uses: the run executes as the team, carries no human identity, and who fired it lands in the audit history. The deployment must be enabled. A manual run has no run window: it executes until the pipeline finishes or the returned `token` is terminated (the schedule's `ttl` applies to scheduled fires only), so a long-lived pipeline can keep running and billing until it finishes or is terminated; disabling the deployment refuses new runs but does not stop one already going
+- `disable(projectId, teamId)` / `enable(projectId, teamId): Promise<Deployment>` — the kill switch: while disabled nothing new runs (schedules stop firing, manual runs are refused); a run already in progress is not stopped, terminate it by token
 - `remove(projectId, teamId): Promise<Deployment>` — soft-remove one team's deployment: listings hide it, audit history and registry artifacts survive, re-deploying any version revives it
 
 **Schedules:**
@@ -956,7 +957,7 @@ Typed wrapper for subscriptions, Stripe checkout, credit wallets, and usage.
 
 Direct SQL/Cypher execution against a database pipeline node, bypassing the LLM translation layer that `chat()` uses (and its safety checks — you own the statements you send).
 
-- `query(options): Promise<{ rows: Record<string, unknown>[]; affected_rows: number }>` (`rows: unknown[][]` when `rowMode: 'array'`) — execute a raw SQL or Cypher statement. Options: `token` and `sql` (required, non-empty); `nodeId?` (empty broadcasts to all tool-lane nodes — the first database node handles it); `sessionId?` (run within a transaction session); `params?: unknown[]` (positional parameters, e.g. `[1, 'foo']` for `$1`, `$2` placeholders); `rowMode?: 'object' | 'array'` (`'array'` returns positional `unknown[][]` rows, which is what ORM drivers need — duplicate column names in joins survive)
+- `query(options): Promise<{ rows: Record<string, unknown>[]; affected_rows: number }>` (`rows: unknown[][]` when `rowMode: 'array'`) — execute a raw SQL or Cypher statement. Options: `token` and `sql` (required, non-empty); `nodeId?` (empty broadcasts to all tool-lane nodes — the first database node handles it); `sessionId?` (run within a transaction session); `params?: unknown[] | Record<string, unknown>` (an array of positional parameters for SQL nodes, e.g. `[1, 'foo']` for `$1`, `$2`; an object keyed by placeholder name for the built-in `rocketride_graph` node and `graph_neo4j`, e.g. `{ rows: [...] }` for `UNWIND $rows` (`graph_falkordb` rejects params) — bound values need no escaping and do not count toward `rocketride_graph`'s query-length limit); `rowMode?: 'object' | 'array'` (`'array'` returns positional `unknown[][]` rows, which is what ORM drivers need — duplicate column names in joins survive)
 - `beginTransaction(options: { token: string; nodeId?: string }): Promise<{ session_id: string }>` — begin a transaction; thread the returned `session_id` through subsequent `query`/`commit`/`rollback` calls
 - `commit(options: { token: string; sessionId: string; nodeId?: string }): Promise<{ ok: boolean }>` / `rollback(...)` — same shape
 - `dialect(options: { token: string; nodeId?: string }): Promise<DatabaseDialect>` — discover the underlying engine (`DatabaseDialect.POSTGRES | MYSQL | NEO4J`); branch on SQL syntax differences or detect a graph DB
@@ -1005,6 +1006,16 @@ try {
 	await client.database.rollback({ token, sessionId: session_id });
 	throw err;
 }
+```
+
+**Graph bulk upsert** (`rocketride_graph`, see Pattern 14 in ROCKETRIDE_PIPELINES.md) — named
+params, and MERGE then a separate `MATCH ... SET`:
+
+```typescript
+const rows = [{ id: 1, name: 'a' }, { id: 2, name: 'b' }];
+const graph = { token, nodeId: 'rocketride_graph_1' };
+await client.database.query({ ...graph, sql: 'UNWIND $rows AS row MERGE (:Item {id: row.id})', params: { rows } });
+await client.database.query({ ...graph, sql: 'UNWIND $rows AS row MATCH (n:Item {id: row.id}) SET n.name = row.name', params: { rows } });
 ```
 
 Pin `nodeId` on every call of a transaction when the pipeline has more than one database node — broadcasts may land on different nodes.

@@ -36,8 +36,12 @@ from ai.common.store.vx_types import TOOL_CODES
 from .test_vector_hooks import MemoryStore, corpus
 
 #: sha256 of today's six agent descriptors (search, upsert, delete, objdir, get, stats) as
-#: ``_build_tool_descriptors`` builds them, JSON with sorted keys and no spaces.
-LEGACY_AGENT_CATALOG_SHA256 = 'ac5b61b8273890e938c91c5c090c9dc292e8de685c39ff6d86ba231de218b4b7'
+#: ``_build_tool_descriptors`` builds them, JSON with sorted keys and no spaces. Regenerated
+#: for the develop merge of 87f530f39: #2631 gave objdir and get their develop descriptors
+#: (``minimum`` bounds and capped defaults on offset/limit, and get's ordered paging with
+#: ``total``/``offset``/``has_more``/``truncated``); search, upsert, delete and stats are
+#: unchanged.
+LEGACY_AGENT_CATALOG_SHA256 = '36741af73b843e2c550dbddbd1c53579d506e16740ab73755031d3aa26fb0fe6'
 
 LEGACY_TOOLS = ('delete', 'get', 'objdir', 'search', 'stats', 'upsert')
 EXPLORER_TOOLS = (

@@ -102,7 +102,7 @@ surface (`rocketride/drizzle`), plus a deprecated Sequelize binding.
 
 | Method | Signature | Description |
 | --- | --- | --- |
-| `database.query` | `async def query(*, token, sql, node_id='', session_id='', params=None) -> dict` | Execute raw SQL through the pipeline's `execute` tool function; returns `{rows, affected_rows}`. |
+| `database.query` | `async def query(*, token, sql, node_id='', session_id='', params=None) -> dict` | Execute raw SQL or Cypher through the pipeline's `execute` tool function; `params` is a positional list for SQL nodes, or a dict keyed by placeholder name for the `rocketride_graph` and `graph_neo4j` nodes (`graph_falkordb` rejects params); returns `{rows, affected_rows}`. |
 | `database.begin_transaction` | `async def begin_transaction(*, token, node_id='') -> dict` | Open a transaction (`begin` tool function); returns `{session_id}`. |
 | `database.commit` | `async def commit(*, token, session_id, node_id='') -> dict` | Commit the open transaction. |
 | `database.rollback` | `async def rollback(*, token, session_id, node_id='') -> dict` | Roll back the open transaction. |
@@ -229,6 +229,7 @@ Question(
     type: QuestionType = QuestionType.QUESTION,
     filter: DocFilter = None,
     expectJson: bool = False,
+    cachePrefix: bool = False,
     role: str = '',
 )
 ```
@@ -245,6 +246,7 @@ Question(
 | `addDocuments` | `addDocuments(self, documents: Doc \| List[Doc])` | Adds documents for the AI to reference. |
 | `addGoal` | `addGoal(self, goal: str)` | Adds a goal statement for the AI. |
 | `getPrompt` | `getPrompt(self, has_previous_json_failed: bool = False) -> str` | Returns the full prompt (internal). |
+| `cachePrefix` | field, default `False` | Set to `True` when the question will be sent again with only its context, documents, goals or questions changed (an agent loop). A provider with prompt caching (the Anthropic node, and Claude models on the Bedrock node) may then cache the unchanging start of the prompt: role, instructions, examples and history. Other providers ignore it. |
 
 ## Answer
 

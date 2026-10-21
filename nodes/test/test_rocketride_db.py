@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import json
 import re
 import sys
 import types
@@ -125,109 +126,127 @@ class TestDsnHelpers:
         assert fields == {'host': '', 'port': None, 'user': '', 'password': '', 'database': ''}
 
 
-class TestClientId:
-    def test_missing_env_raises(self, monkeypatch):
-        monkeypatch.delenv(rrdb.CLIENT_ID_ENV, raising=False)
-        with pytest.raises(ValueError, match='signed-in RocketRide cloud identity'):
-            rrdb.current_client_id()
+class TestDbTarget:
+    """A node's (scope, target), read from its resolved config."""
 
-    def test_present_env_returned_stripped(self, monkeypatch):
-        monkeypatch.setenv(rrdb.CLIENT_ID_ENV, '  tenant-42  ')
-        assert rrdb.current_client_id() == 'tenant-42'
+    def test_defaults_to_the_org_database(self):
+        assert rrdb.db_target({}) == ('org', '')
+        assert rrdb.db_target({'scope': None, 'target': None}) == ('org', '')
+
+    @pytest.mark.parametrize(
+        ('config', 'expected'),
+        [
+            ({'scope': 'team'}, ('team', '')),
+            ({'scope': ' team ', 'target': ' t-1 '}, ('team', 't-1')),
+            (
+                {'scope': 'user', 'target': '5f0c2a9e-1b2c-4d3e-8f90-123456789abc'},
+                ('user', '5f0c2a9e-1b2c-4d3e-8f90-123456789abc'),
+            ),
+        ],
+    )
+    def test_reads_scope_and_target(self, config, expected):
+        assert rrdb.db_target(config) == expected
+
+    @pytest.mark.parametrize(
+        ('config', 'message'),
+        [
+            ({'scope': 'tenant'}, 'scope must be one of org, team, user'),
+            ({'scope': 'org', 'target': 't-1'}, 'the org scope takes no target'),
+            ({'scope': 'team', 'target': 'team:other'}, 'not a valid team or user id'),
+            ({'scope': 'team', 'target': 'x' * 65}, 'not a valid team or user id'),
+            ({'scope': 'user', 'target': 42}, 'target must be a team or user id'),
+        ],
+    )
+    def test_rejects_bad_config(self, config, message):
+        with pytest.raises(ValueError, match=message):
+            rrdb.db_target(config)
+
+    def test_dsn_key(self):
+        assert rrdb.dsn_key('org') == 'org'
+        assert rrdb.dsn_key('team') == 'team'
+        assert rrdb.dsn_key('user', 'u-1') == 'user:u-1'
+
+    def test_public_endpoint_comes_from_the_source_providers(self):
+        assert rrdb.exposes_public_endpoint([{'provider': 'webhook'}, {'provider': 'rocketride_sql'}])
+        assert rrdb.exposes_public_endpoint([{'provider': 'discord'}])
+        assert not rrdb.exposes_public_endpoint([{'provider': 'tools'}, {'provider': 'rocketride_sql'}])
+        assert not rrdb.exposes_public_endpoint(None)
 
 
 class TestResolveRocketrideDsn:
-    """The full seam: injected env DSN first, else account singleton via async bridge."""
+    """Nodes only read what the task engine delivered; they never resolve."""
 
-    def _install_fake_account(self, monkeypatch, resolver):
-        monkeypatch.delenv(rrdb.DB_DSN_ENV, raising=False)
-        ai_pkg = types.ModuleType('ai')
-        ai_pkg.__path__ = []
-        account_mod = types.ModuleType('ai.account')
-        account_mod.account = types.SimpleNamespace(resolve_db_dsn=resolver)
-        monkeypatch.setitem(sys.modules, 'ai', ai_pkg)
-        monkeypatch.setitem(sys.modules, 'ai.account', account_mod)
+    @pytest.fixture(autouse=True)
+    def _clean_env(self, monkeypatch):
+        for name in (rrdb.DB_DSNS_ENV, 'ROCKETRIDE_DB_DSN', rrdb.DB_RESOLVE_ERROR_ENV):
+            monkeypatch.delenv(name, raising=False)
 
-    def test_injected_env_dsn_wins(self, monkeypatch):
-        """The task-engine-injected ROCKETRIDE_DB_DSN short-circuits everything."""
+    def _deliver(self, monkeypatch, dsns):
+        monkeypatch.setenv(rrdb.DB_DSNS_ENV, json.dumps(dsns))
 
-        async def fake(client_id):  # pragma: no cover — must not be reached
-            raise AssertionError('account must not be consulted when the env DSN is present')
+    def test_map_entry_for_each_scope(self, monkeypatch):
+        self._deliver(monkeypatch, {'org': 'postgresql://o', 'team': 'postgresql://t', 'user:u-2': 'postgresql://u2'})
+        assert rrdb.resolve_rocketride_dsn() == 'postgresql://o'
+        assert rrdb.resolve_rocketride_dsn('team') == 'postgresql://t'
+        assert rrdb.resolve_rocketride_dsn('user', 'u-2') == 'postgresql://u2'
 
-        self._install_fake_account(monkeypatch, fake)
-        monkeypatch.setenv(rrdb.DB_DSN_ENV, f'  {TEST_DSN}  ')
-        # No client id needed on the injected path either.
-        monkeypatch.delenv(rrdb.CLIENT_ID_ENV, raising=False)
-        assert rrdb.resolve_rocketride_dsn() == TEST_DSN
+    def test_missing_map_key_raises_and_never_falls_back(self, monkeypatch):
+        """A key the engine did not authorize must raise, even with an org DSN at hand."""
+        self._deliver(monkeypatch, {'org': 'postgresql://o'})
+        with pytest.raises(ValueError, match="was not given the team database 't-9'"):
+            rrdb.resolve_rocketride_dsn('team', 't-9')
+        with pytest.raises(ValueError, match="was not given the run's own user database"):
+            rrdb.resolve_rocketride_dsn('user')
+
+    def test_malformed_map_raises(self, monkeypatch):
+        monkeypatch.setenv(rrdb.DB_DSNS_ENV, '{not json')
+        with pytest.raises(ValueError, match='not valid JSON'):
+            rrdb.resolve_rocketride_dsn()
+
+    def test_a_lone_single_dsn_variable_is_not_a_delivery(self, monkeypatch):
+        """Only the map counts: a stray ROCKETRIDE_DB_DSN is never read."""
+        monkeypatch.setenv('ROCKETRIDE_DB_DSN', TEST_DSN)
+        with pytest.raises(rrdb.DsnNotDelivered):
+            rrdb.resolve_rocketride_dsn()
 
     def test_resolve_error_env_surfaces_broker_failure(self, monkeypatch):
         """A server-side resolution failure names the real cause, not sign-in."""
-
-        async def fake(client_id):  # pragma: no cover — must not be reached
-            raise AssertionError('account must not be consulted when a resolve error is present')
-
-        self._install_fake_account(monkeypatch, fake)
-        monkeypatch.delenv(rrdb.DB_DSN_ENV, raising=False)
         monkeypatch.setenv(rrdb.DB_RESOLVE_ERROR_ENV, 'DB broker request failed: HTTP 503')
-        with pytest.raises(ValueError, match='HTTP 503'):
+        with pytest.raises(
+            ValueError, match='cloud database is not available for this task: DB broker request failed: HTTP 503'
+        ):
             rrdb.resolve_rocketride_dsn()
 
-    def test_empty_env_dsn_falls_back_to_account(self, monkeypatch):
-        async def fake(client_id):
-            return TEST_DSN
+    def test_resolve_error_env_reports_missing_cloud_database(self, monkeypatch):
+        """An engine without a broker passes the reason down the same way (#2463)."""
+        monkeypatch.setenv(
+            rrdb.DB_RESOLVE_ERROR_ENV, 'this server has no RocketRide cloud database (no database broker is configured)'
+        )
+        with pytest.raises(ValueError) as excinfo:
+            rrdb.resolve_rocketride_dsn()
+        assert 'this server has no RocketRide cloud database' in str(excinfo.value)
+        assert not isinstance(excinfo.value, rrdb.DsnNotDelivered)
 
-        self._install_fake_account(monkeypatch, fake)
-        monkeypatch.setenv(rrdb.DB_DSN_ENV, '   ')
-        monkeypatch.setenv(rrdb.CLIENT_ID_ENV, 'tenant-42')
-        assert rrdb.resolve_rocketride_dsn() == TEST_DSN
+    def test_outside_a_task_nothing_is_resolved(self, monkeypatch):
+        """No DSN delivered (a save-time probe in the server process): raise
+        DsnNotDelivered and never call the account layer, which holds the
+        broker token and would mint any tenant's DSN with no authorization.
+        """
+        account_mod = types.ModuleType('ai.account')
 
-    def test_resolves_via_fake_account(self, monkeypatch):
-        seen = {}
+        async def poisoned(*args, **kwargs):  # pragma: no cover - must not be reached
+            raise AssertionError('nodes must never resolve a DSN through the account layer')
 
-        async def fake(client_id):
-            seen['client_id'] = client_id
-            return TEST_DSN
-
-        self._install_fake_account(monkeypatch, fake)
-        monkeypatch.setenv(rrdb.CLIENT_ID_ENV, 'tenant-42')
-        assert rrdb.resolve_rocketride_dsn() == TEST_DSN
-        assert seen['client_id'] == 'tenant-42'
-
-    def test_empty_dsn_raises(self, monkeypatch):
-        async def fake(client_id):
-            return ''
-
-        self._install_fake_account(monkeypatch, fake)
-        monkeypatch.setenv(rrdb.CLIENT_ID_ENV, 'tenant-42')
-        with pytest.raises(ValueError, match='empty DSN'):
+        account_mod.account = types.SimpleNamespace(resolve_db_dsn=poisoned)
+        monkeypatch.setitem(sys.modules, 'ai.account', account_mod)
+        monkeypatch.setenv('ROCKETRIDE_CLIENT_ID', 'tenant-42')
+        with pytest.raises(rrdb.DsnNotDelivered, match='connectivity is checked when it runs'):
             rrdb.resolve_rocketride_dsn()
 
-    def test_rejects_running_event_loop_before_creating_coroutine(self, monkeypatch):
-        """Reject running-loop callers before creating the resolver coroutine."""
-        created = []
-
-        def fake(client_id):
-            async def resolve():
-                return TEST_DSN
-
-            coro = resolve()
-            created.append(coro)
-            return coro
-
-        self._install_fake_account(monkeypatch, fake)
-        monkeypatch.setenv(rrdb.CLIENT_ID_ENV, 'tenant-42')
-
-        async def call_from_loop():
-            return rrdb.resolve_rocketride_dsn()
-
-        try:
-            with pytest.raises(RuntimeError, match='running event loop'):
-                asyncio.run(call_from_loop())
-            assert created == []
-        finally:
-            # Close any coroutine created if the regression returns.
-            for coro in created:
-                coro.close()
+    def test_bad_scope_is_refused_before_any_lookup(self, monkeypatch):
+        self._deliver(monkeypatch, {'org': 'postgresql://o'})
+        with pytest.raises(ValueError, match='scope must be one of'):
+            rrdb.resolve_rocketride_dsn('everyone')
 
 
 # ---------------------------------------------------------------------------
@@ -255,9 +274,9 @@ class TestAccountStub:
         monkeypatch.setitem(sys.modules, 'ai.account.oss', oss_mod)
         return base_mod.AccountBase, oss_mod.Account
 
-    def test_oss_stub_raises_cloud_signin_message(self, account_cls):
+    def test_oss_stub_raises_no_cloud_db_message(self, account_cls):
         _, account = account_cls
-        with pytest.raises(NotImplementedError, match='require signing into RocketRide cloud'):
+        with pytest.raises(NotImplementedError, match='no RocketRide cloud database is configured on this server'):
             asyncio.run(account().resolve_db_dsn('tenant-42'))
 
     def test_base_default_raises(self, account_cls):
@@ -314,20 +333,13 @@ def _sql_iglobal_cls(monkeypatch):
 
 
 class TestRocketrideSqlConnection:
-    def _with_fake_account(self, monkeypatch):
-        account_mod = types.ModuleType('ai.account')
-
-        async def fake(client_id):
-            return TEST_DSN
-
-        account_mod.account = types.SimpleNamespace(resolve_db_dsn=fake)
-        monkeypatch.setitem(sys.modules, 'ai.account', account_mod)
-        monkeypatch.setenv('ROCKETRIDE_CLIENT_ID', 'tenant-42')
-        monkeypatch.delenv('ROCKETRIDE_DB_DSN', raising=False)
+    def _deliver_org_dsn(self, monkeypatch):
+        """Deliver the org DSN the way the task engine does."""
+        monkeypatch.setenv('ROCKETRIDE_DB_DSNS', json.dumps({'org': TEST_DSN}))
 
     def test_connection_params_come_from_resolved_dsn(self, monkeypatch):
         cls, _ = _sql_iglobal_cls(monkeypatch)
-        self._with_fake_account(monkeypatch)
+        self._deliver_org_dsn(monkeypatch)
         glb = cls()
         params = glb._connection_params({'table': ' widgets '})
         assert params['host'] == 'localhost'
@@ -338,7 +350,7 @@ class TestRocketrideSqlConnection:
 
     def test_build_connection_url_uses_cached_dsn(self, monkeypatch):
         cls, _ = _sql_iglobal_cls(monkeypatch)
-        self._with_fake_account(monkeypatch)
+        self._deliver_org_dsn(monkeypatch)
         glb = cls()
         params = glb._connection_params({})
         url = glb._build_connection_url(params)
@@ -347,13 +359,95 @@ class TestRocketrideSqlConnection:
     def test_no_connection_fields_read_from_config(self, monkeypatch):
         """host/user/password in config must be ignored — the DSN wins."""
         cls, _ = _sql_iglobal_cls(monkeypatch)
-        self._with_fake_account(monkeypatch)
+        self._deliver_org_dsn(monkeypatch)
         glb = cls()
         params = glb._connection_params({'host': 'evil', 'user': 'evil', 'password': 'evil'})
         assert params['host'] == 'localhost'
         assert params['user'] == 'rruser'
         url = glb._build_connection_url(params)
         assert 'evil' not in url
+
+    def test_connection_params_read_the_nodes_scope(self, monkeypatch):
+        """A team-scoped node gets the team entry of the map, not the org's."""
+        cls, _ = _sql_iglobal_cls(monkeypatch)
+        team_dsn = 'postgresql://team_rw:pw@pooler:5432/t_team'
+        monkeypatch.setenv('ROCKETRIDE_DB_DSNS', json.dumps({'org': TEST_DSN, 'team': team_dsn}))
+        glb = cls()
+        params = glb._connection_params({'scope': 'team', 'table': 'widgets'})
+        assert params['database'] == 't_team'
+        assert glb._build_connection_url(params) == 'postgresql+psycopg2://team_rw:pw@pooler:5432/t_team'
+
+    def test_save_time_probe_outside_a_task_is_silent(self, monkeypatch):
+        """No DSN in the server process: static checks only, no warning (any
+        warning keeps the node config panel open), no connection attempt.
+        """
+        cls, rrdb_mod = _sql_iglobal_cls(monkeypatch)
+        monkeypatch.delenv('ROCKETRIDE_DB_DSNS', raising=False)
+        monkeypatch.delenv('ROCKETRIDE_DB_RESOLVE_ERROR', raising=False)
+        warnings = []
+        iglobal_mod = sys.modules['nodes.rocketride_sql.IGlobal']
+        monkeypatch.setattr(iglobal_mod, 'warning', warnings.append)
+        monkeypatch.setattr(iglobal_mod.DatabaseGlobalBase, 'validateConfig', lambda self: warnings.append('probed'))
+        glb = cls()
+        glb.glb = types.SimpleNamespace(logicalType='rocketride_sql', connConfig={'scope': 'team'})
+        glb.validateConfig()
+        assert warnings == []
+
+    def test_save_time_probe_reports_a_bad_scope(self, monkeypatch):
+        cls, _ = _sql_iglobal_cls(monkeypatch)
+        warnings = []
+        iglobal_mod = sys.modules['nodes.rocketride_sql.IGlobal']
+        monkeypatch.setattr(iglobal_mod, 'warning', warnings.append)
+        monkeypatch.setattr(iglobal_mod.Config, 'getNodeConfig', lambda provider, cfg: dict(cfg))
+        glb = cls()
+        glb.glb = types.SimpleNamespace(logicalType='rocketride_sql', connConfig={'scope': 'everyone'})
+        glb.validateConfig()
+        assert len(warnings) == 1 and 'scope must be one of org, team, user' in warnings[0]
+
+
+def _engine_pool_kwargs(monkeypatch, cls, logical_type, conn_config):
+    """Run ``beginGlobal`` with ``create_engine`` patched; return its kwargs.
+
+    Nothing connects: the engine, the transaction registry and both schema
+    reflections are stand-ins, so only the pool sizing reaches the assertion.
+    """
+    db_global = sys.modules['ai.common.database.db_global_base']
+    calls = []
+    monkeypatch.setattr(db_global, 'create_engine', lambda url, **kw: calls.append(kw) or types.SimpleNamespace())
+    tx_registry = types.ModuleType('ai.common.database.tx_registry')
+    tx_registry.TransactionRegistry = lambda *a, **kw: None
+    monkeypatch.setitem(sys.modules, 'ai.common.database.tx_registry', tx_registry)
+    monkeypatch.setattr(sys.modules['ai.common.config'].Config, 'getNodeConfig', lambda provider, cfg: dict(cfg))
+    monkeypatch.setattr(cls, '_getDatabaseSchema', lambda self: {})
+    monkeypatch.setattr(cls, '_getTableSchema', lambda self, table: {})
+    glb = cls()
+    glb.glb = types.SimpleNamespace(logicalType=logical_type, connConfig=conn_config)
+    glb.beginGlobal()
+    assert len(calls) == 1
+    return calls[0]
+
+
+class TestSqlEnginePoolSize:
+    """PgBouncer pools the cloud node's connections, so its engine stays small;
+    every other SQL node keeps the base's larger pool.
+    """
+
+    def test_rocketride_sql_keeps_a_two_plus_two_pool(self, monkeypatch):
+        cls, _ = _sql_iglobal_cls(monkeypatch)
+        monkeypatch.setenv('ROCKETRIDE_DB_DSNS', json.dumps({'org': TEST_DSN}))
+        kwargs = _engine_pool_kwargs(monkeypatch, cls, 'rocketride_sql', {'table': 'widgets'})
+        assert kwargs['pool_size'] == 2
+        assert kwargs['max_overflow'] == 2
+
+    @pytest.mark.parametrize('node', ['db_postgres', 'db_mysql'])
+    def test_other_sql_nodes_keep_the_default_pool(self, monkeypatch, node):
+        _sql_iglobal_cls(monkeypatch)
+        node_dir = _REPO / 'nodes' / 'src' / 'nodes' / node
+        cls = _load_from_path(f'nodes.{node}.IGlobal', node_dir / 'IGlobal.py').IGlobal
+        config = {'host': 'h', 'user': 'u', 'password': 'p', 'database': 'd', 'table': 'widgets'}
+        kwargs = _engine_pool_kwargs(monkeypatch, cls, node, config)
+        assert kwargs['pool_size'] == 10
+        assert kwargs['max_overflow'] == 20
 
 
 # ---------------------------------------------------------------------------
@@ -417,7 +511,7 @@ def mock_rv(monkeypatch):
         from ai.common.config import Config
 
         monkeypatch.setattr(Config, 'getNodeConfig', staticmethod(lambda provider, connConfig: dict(connConfig)))
-        monkeypatch.setenv('ROCKETRIDE_DB_DSN', TEST_DSN)
+        monkeypatch.setenv('ROCKETRIDE_DB_DSNS', json.dumps({'org': TEST_DSN}))
         monkeypatch.delenv('ROCKETRIDE_DB_RESOLVE_ERROR', raising=False)
         store_mod = importlib.import_module('nodes.rocketride_vector.rocketride_vector')
         driver = importlib.import_module('ai.common.store.pgvector.driver')
@@ -463,6 +557,40 @@ def _doc(object_id, chunk_id, embedding, content=None):
 
 
 class TestRocketrideVectorStore:
+    def test_store_connects_to_its_scopes_database(self, mock_rv, monkeypatch):
+        user_dsn = 'postgresql://u_rw:pw@pooler:5432/t_user_u1'
+        monkeypatch.setenv('ROCKETRIDE_DB_DSNS', json.dumps({'org': TEST_DSN, 'user:u-1': user_dsn}))
+        store = _make_store(mock_rv, {'collection': 'rr_vec', 'similarity': 'cosine', 'scope': 'user', 'target': 'u-1'})
+        assert store.database == 't_user_u1'
+
+    def test_store_refuses_a_scope_the_task_was_not_given(self, mock_rv):
+        with pytest.raises(ValueError, match="was not given the team database 't-9'"):
+            _make_store(mock_rv, {'collection': 'rr_vec', 'similarity': 'cosine', 'scope': 'team', 'target': 't-9'})
+
+    def test_save_time_probe_outside_a_task_is_silent(self, mock_rv, monkeypatch):
+        monkeypatch.delenv('ROCKETRIDE_DB_DSNS', raising=False)
+        iglobal_mod = sys.modules['nodes.rocketride_vector.IGlobal']
+        warnings = []
+        monkeypatch.setattr(iglobal_mod, 'warning', warnings.append)
+        glb = iglobal_mod.IGlobal()
+        glb.glb = types.SimpleNamespace(
+            logicalType='rocketride_vector', connConfig={'collection': 'rr_vec', 'scope': 'team'}
+        )
+        glb._probe_connection(glb.glb.connConfig)
+        assert warnings == [] and mock_rv.db.opened == []
+
+    def test_save_time_probe_still_checks_the_scope(self, mock_rv, monkeypatch):
+        monkeypatch.delenv('ROCKETRIDE_DB_DSNS', raising=False)
+        iglobal_mod = sys.modules['nodes.rocketride_vector.IGlobal']
+        warnings = []
+        monkeypatch.setattr(iglobal_mod, 'warning', warnings.append)
+        glb = iglobal_mod.IGlobal()
+        glb.glb = types.SimpleNamespace(
+            logicalType='rocketride_vector', connConfig={'collection': 'rr_vec', 'scope': 'org', 'target': 't-1'}
+        )
+        glb._probe_connection(glb.glb.connConfig)
+        assert len(warnings) == 1 and 'the org scope takes no target' in warnings[0]
+
     def test_connects_via_resolved_dsn(self, mock_rv):
         store = _make_store(mock_rv, {'collection': 'rr_vec', 'similarity': 'cosine'})
         # No client_id on the store: identity rides the task file (#1686);
@@ -797,8 +925,17 @@ class TestPgVectorSupportLevel:
         assert 'experimental' not in answer['caveats']
 
 
-class TestRocketrideVectorWriteCheck:
-    """The node's local write check (live twins: test_rocketride_db_full.py TestRocketrideVectorNode)."""
+class TestRocketrideVectorWriteGate:
+    """The node's tool writes, behind both gates (live twins: test_rocketride_db_full.py TestRocketrideVectorNode).
+
+    The outer gate is the node's expose_tools and allow_write switches (both off
+    by default); past it, every write runs the store write gate
+    (vx_write_gate.check_write) with the per-caller switches allow_writes (DAP)
+    and agent_writes (agents).
+    """
+
+    # The two outer switches on: what a pipeline that lets tools write sets.
+    _OPEN = {'expose_tools': True, 'allow_write': True}
 
     @staticmethod
     def _node(env, config):
@@ -823,8 +960,38 @@ class TestRocketrideVectorWriteCheck:
     def _rows(env):
         return sorted(r['objectid'] for r in env.db.table('rr_vec').rows.values())
 
-    def test_delete_without_a_call_context_is_refused(self, mock_rv):
+    def test_tools_are_hidden_and_refused_with_the_shipped_switches(self, mock_rv):
+        """Neither outer switch set: no tool is offered, and a direct call is refused before the store."""
+        from ai.common.tool_context import ToolCallContext, tool_call
+
         glb, inst = self._node(mock_rv, {'collection': 'rr_vec', 'similarity': 'cosine', 'allow_writes': True})
+        assert glb.expose_tools is False and glb.allow_write is False
+        assert inst._collect_tool_methods() == {}
+        ctx = ToolCallContext(origin='agent', source_type=None, targeted=True, caller={'auth': 'agent'})
+        with tool_call(ctx):
+            answer = inst.delete({'object_ids': ['doc']})
+        assert answer['success'] is False and 'expose_tools=true' in answer['error']
+        assert self._rows(mock_rv) == ['doc', 'schema']
+        glb.endGlobal()
+
+    def test_write_tools_are_hidden_and_refused_until_allow_write(self, mock_rv):
+        from ai.common.tool_context import ToolCallContext, tool_call
+
+        config = {'collection': 'rr_vec', 'similarity': 'cosine', 'expose_tools': True, 'allow_writes': True}
+        glb, inst = self._node(mock_rv, config)
+        offered = set(inst._collect_tool_methods())
+        assert {'search', 'objdir', 'get', 'stats', 'dialect', 'documents'} <= offered
+        assert offered.isdisjoint({'upsert', 'delete', 'remove_document'})
+        ctx = ToolCallContext(origin='agent', source_type=None, targeted=True, caller={'auth': 'agent'})
+        with tool_call(ctx):
+            answer = inst.delete({'object_ids': ['doc']})
+        assert answer['success'] is False and 'allow_write=true' in answer['error']
+        assert self._rows(mock_rv) == ['doc', 'schema']
+        glb.endGlobal()
+
+    def test_delete_without_a_call_context_is_refused(self, mock_rv):
+        config = {'collection': 'rr_vec', 'similarity': 'cosine', 'allow_writes': True, **self._OPEN}
+        glb, inst = self._node(mock_rv, config)
         answer = inst.delete({'object_ids': ['doc']})
         assert answer['success'] is False and answer['code'] == 'WRITES_UNKNOWN_CALLER'
         assert inst.delete({'object_ids': ['schema']})['code'] == 'RESERVED_ID'
@@ -838,7 +1005,7 @@ class TestRocketrideVectorWriteCheck:
     def test_switches_refuse_calls_with_a_context(self, mock_rv, origin, switches, code):
         from ai.common.tool_context import ToolCallContext, tool_call
 
-        glb, inst = self._node(mock_rv, {'collection': 'rr_vec', 'similarity': 'cosine', **switches})
+        glb, inst = self._node(mock_rv, {'collection': 'rr_vec', 'similarity': 'cosine', **self._OPEN, **switches})
         ctx = ToolCallContext(origin=origin, source_type='tools', targeted=True, caller={'auth': 'account'})
         upsert = {
             'documents': [{'content': 'x', 'object_id': 'new', 'embedding': [0, 1, 0, 0, 0], 'embedding_model': 'm'}]
@@ -849,22 +1016,22 @@ class TestRocketrideVectorWriteCheck:
         assert self._rows(mock_rv) == ['doc', 'schema']
         glb.endGlobal()
 
-    def test_agent_call_with_default_switches_reaches_the_store(self, mock_rv):
-        """The node's own check and the store write gate both read the bound context and let it through."""
+    def test_agent_call_with_allow_write_on_reaches_the_store(self, mock_rv):
+        """allow_write is the one switch an agent needs: the write gate reads the bound context and lets it through."""
         from ai.common.tool_context import ToolCallContext, tool_call
 
-        glb, inst = self._node(mock_rv, {'collection': 'rr_vec', 'similarity': 'cosine'})
+        glb, inst = self._node(mock_rv, {'collection': 'rr_vec', 'similarity': 'cosine', **self._OPEN})
         ctx = ToolCallContext(origin='agent', source_type=None, targeted=True, caller={'auth': 'agent'})
         with tool_call(ctx):
             assert inst.delete({'object_ids': ['doc']})['success'] is True
         assert self._rows(mock_rv) == ['schema']
         glb.endGlobal()
 
-    def test_dap_call_with_default_switches_is_refused_and_keeps_the_rows(self, mock_rv):
-        """A console (DAP) delete with the shipped switches answers WRITES_DISABLED and removes nothing."""
+    def test_dap_call_without_allow_writes_is_refused_and_keeps_the_rows(self, mock_rv):
+        """A console (DAP) delete past the outer gate, allow_writes off: WRITES_DISABLED, nothing removed."""
         from ai.common.tool_context import ToolCallContext, tool_call
 
-        glb, inst = self._node(mock_rv, {'collection': 'rr_vec', 'similarity': 'cosine'})
+        glb, inst = self._node(mock_rv, {'collection': 'rr_vec', 'similarity': 'cosine', **self._OPEN})
         ctx = ToolCallContext(
             origin='dap', source_type='tools', targeted=True, caller={'auth': 'account', 'userId': 'u-1'}
         )
@@ -874,11 +1041,12 @@ class TestRocketrideVectorWriteCheck:
         assert self._rows(mock_rv) == ['doc', 'schema']
         glb.endGlobal()
 
-    def test_dap_call_with_allow_writes_on_passes_both_checks(self, mock_rv):
-        """With rrvector.allow_writes on, the store gate (read from the node config) agrees with the node's check."""
+    def test_dap_call_with_allow_writes_on_passes_both_gates(self, mock_rv):
+        """With the outer switches and rrvector.allow_writes on, a Tools-source delete removes the document."""
         from ai.common.tool_context import ToolCallContext, tool_call
 
-        glb, inst = self._node(mock_rv, {'collection': 'rr_vec', 'similarity': 'cosine', 'allow_writes': True})
+        config = {'collection': 'rr_vec', 'similarity': 'cosine', 'allow_writes': True, **self._OPEN}
+        glb, inst = self._node(mock_rv, config)
         assert glb.allow_writes is True
         ctx = ToolCallContext(
             origin='dap', source_type='tools', targeted=True, caller={'auth': 'account', 'userId': 'u-1'}
@@ -897,9 +1065,9 @@ class TestRocketrideVectorWriteCheck:
 _GRAPH_NODE_DIR = _REPO / 'nodes' / 'src' / 'nodes' / 'rocketride_graph'
 _CLOUD_DB_NODE_DIRS = (_SQL_NODE_DIR, _VEC_NODE_DIR, _GRAPH_NODE_DIR)
 
-# How the docs used to describe the tenant: the signed-in user. The server
-# resolves the database by the task's organization (its user only where there
-# is no organization), so these phrases describe the wrong tenancy model.
+# How the docs used to describe the tenant: the signed-in user. The engine
+# authorizes the database the node's Database setting chooses against the
+# task's identity, so these phrases describe the wrong tenancy model.
 _STALE_TENANT_PHRASES = (
     'signed-in rocketride identity',
     'signed-in rocketride tenant',
@@ -920,7 +1088,7 @@ def _prose(path: Path) -> str:
 
 
 class TestTenancyWording:
-    """The cloud DB nodes describe the database as the organization's (AGE-T6)."""
+    """The cloud DB nodes describe the database as the one the node chooses (AGE-T6, then #2626)."""
 
     @pytest.mark.parametrize('node_dir', _CLOUD_DB_NODE_DIRS, ids=lambda p: p.name)
     def test_no_text_describes_the_signed_in_user_as_the_tenant(self, node_dir):
@@ -934,6 +1102,169 @@ class TestTenancyWording:
         assert stale == []
 
     @pytest.mark.parametrize('node_dir', _CLOUD_DB_NODE_DIRS, ids=lambda p: p.name)
-    def test_description_and_readme_name_the_organization(self, node_dir):
-        assert "the connection to your organization's database" in _prose(node_dir / 'services.json')
-        assert 'per organization' in _prose(node_dir / 'README.md')
+    def test_description_and_readme_name_the_chosen_database(self, node_dir):
+        assert 'the connection to the database you choose' in _prose(node_dir / 'services.json')
+        assert 'chosen under database' in _prose(node_dir / 'README.md')
+
+
+# ---------------------------------------------------------------------------
+# psycopg2 doubles for the rocketride_graph connection tests below
+# ---------------------------------------------------------------------------
+
+
+class _FakeCursor:
+    def __init__(self, executed, fetch_batches):
+        self._executed = executed
+        self._fetch_batches = fetch_batches
+
+    def execute(self, sql, params=None):
+        self._executed.append(sql)
+
+    def fetchone(self):
+        # Existence probes (_doesCollectionExist) read a single boolean.
+        return (True,)
+
+    def fetchall(self):
+        return self._fetch_batches.pop(0) if self._fetch_batches else []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class _FakeClient:
+    def __init__(self):
+        self.executed: list[str] = []
+        self.commits = 0
+        # Queue of row batches returned by successive fetchall() calls.
+        self.fetch_batches: list[list] = []
+
+    def cursor(self):
+        return _FakeCursor(self.executed, self.fetch_batches)
+
+    def commit(self):
+        self.commits += 1
+
+    def close(self):
+        pass
+
+
+# ---------------------------------------------------------------------------
+# rocketride_graph: scope-aware connection and the save-time probe
+# ---------------------------------------------------------------------------
+
+
+class _GraphCursor(_FakeCursor):
+    # Every read the node's connect path makes returns one row.
+    description = (('v',),)
+
+    def fetchone(self):
+        return ('1.5.0',)
+
+    def fetchall(self):
+        return [('1.5.0',)]
+
+
+class _GraphClient(_FakeClient):
+    # What the node's connection pool reads and calls on a connection.
+    closed = 0
+    autocommit = False
+
+    def cursor(self):
+        return _GraphCursor(self.executed, self.fetch_batches)
+
+    def rollback(self):
+        pass
+
+    def get_transaction_status(self):
+        return 0  # psycopg2.extensions.TRANSACTION_STATUS_IDLE
+
+
+def _graph_iglobal(monkeypatch):
+    """Load rocketride_graph/IGlobal with its graph base and driver stubbed."""
+    warnings: list[str] = []
+    connects: list[str] = []
+
+    rocketlib = types.ModuleType('rocketlib')
+    rocketlib.warning = warnings.append
+    # The node writes connection-failure detail at debug level only.
+    rocketlib.debug = lambda *a, **kw: None
+    monkeypatch.setitem(sys.modules, 'rocketlib', rocketlib)
+
+    psycopg2_mod = types.ModuleType('psycopg2')
+
+    def connect(dsn, **kw):
+        connects.append(dsn)
+        return _GraphClient()
+
+    psycopg2_mod.connect = connect
+    psycopg2_mod.sql = types.ModuleType('psycopg2.sql')
+    psycopg2_mod.errors = types.ModuleType('psycopg2.errors')
+    for name in ('QueryCanceled', 'ReadOnlySqlTransaction'):
+        setattr(psycopg2_mod.errors, name, type(name, (Exception,), {}))
+    psycopg2_mod.extensions = types.ModuleType('psycopg2.extensions')
+    psycopg2_mod.extensions.TRANSACTION_STATUS_IDLE = 0
+    monkeypatch.setitem(sys.modules, 'psycopg2', psycopg2_mod)
+    for name in ('sql', 'errors', 'extensions'):
+        monkeypatch.setitem(sys.modules, f'psycopg2.{name}', getattr(psycopg2_mod, name))
+
+    ai_pkg = types.ModuleType('ai')
+    ai_pkg.__path__ = []
+    common_pkg = types.ModuleType('ai.common')
+    common_pkg.__path__ = []
+    graph_pkg = types.ModuleType('ai.common.graph')
+    graph_pkg.__path__ = []
+    graph_pkg.GraphGlobalBase = type(
+        'GraphGlobalBase', (), {'_config_int': staticmethod(lambda cfg, key, default: default)}
+    )
+    age = types.ModuleType('ai.common.graph.age')
+    for name in ('FirewallConfig', 'TranslatedQuery'):
+        setattr(age, name, type(name, (), {}))
+    for name in ('AgeTranslationError', 'AgeFirewallRejected', 'AgeUnsupportedFeature'):
+        setattr(age, name, type(name, (Exception,), {}))
+    age.TranslateMode = types.SimpleNamespace(SAFE='safe')
+    for name in ('decode_agtype', 'decode_row', 'parse_agtype', 'translate'):
+        setattr(age, name, lambda *a, **kw: None)
+    adapters = types.ModuleType('ai.common.graph.adapters')
+    adapters.age_adapter = types.ModuleType('ai.common.graph.adapters.age_adapter')
+    for name, mod in (
+        ('ai', ai_pkg),
+        ('ai.common', common_pkg),
+        ('ai.common.graph', graph_pkg),
+        ('ai.common.graph.age', age),
+        ('ai.common.graph.adapters', adapters),
+    ):
+        monkeypatch.setitem(sys.modules, name, mod)
+    # The connection pool and the schema limits are plain Python: load the real ones.
+    for name in ('connection_pool', 'schema'):
+        module = _load_from_path(f'ai.common.graph.{name}', _AI_SRC / 'ai' / 'common' / 'graph' / f'{name}.py')
+        monkeypatch.setitem(sys.modules, f'ai.common.graph.{name}', module)
+
+    rrdb_mod = _load_from_path('ai.common.rocketride_db', _RRDB_PATH)
+    monkeypatch.setitem(sys.modules, 'ai.common.rocketride_db', rrdb_mod)
+    for name in ('ROCKETRIDE_DB_DSNS', 'ROCKETRIDE_DB_RESOLVE_ERROR'):
+        monkeypatch.delenv(name, raising=False)
+
+    iglobal = _load_from_path('nodes.rocketride_graph.IGlobal', _GRAPH_NODE_DIR / 'IGlobal.py')
+    return iglobal.IGlobal(), warnings, connects
+
+
+class TestRocketrideGraphConnection:
+    def test_open_driver_connects_to_its_scopes_database(self, monkeypatch):
+        glb, _, connects = _graph_iglobal(monkeypatch)
+        monkeypatch.setenv('ROCKETRIDE_DB_DSNS', json.dumps({'org': TEST_DSN, 'team:t-1': 'postgresql://t1'}))
+        glb._open_driver({'scope': 'team', 'target': 't-1'})
+        assert connects == ['postgresql://t1']
+
+    def test_save_time_probe_outside_a_task_is_silent(self, monkeypatch):
+        glb, warnings, connects = _graph_iglobal(monkeypatch)
+        glb._probe_connection({'scope': 'user'})
+        assert warnings == [] and connects == []
+
+    def test_save_time_probe_still_checks_the_scope(self, monkeypatch):
+        glb, warnings, connects = _graph_iglobal(monkeypatch)
+        glb._probe_connection({'scope': 'team', 'target': 'team:x'})
+        assert connects == []
+        assert len(warnings) == 1 and 'not a valid team or user id' in warnings[0]

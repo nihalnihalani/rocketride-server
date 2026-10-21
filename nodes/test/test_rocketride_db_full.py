@@ -27,9 +27,8 @@
 
 Runs the ``rocketride_sql`` and ``rocketride_vector`` nodes end-to-end against
 a local PostgreSQL container standing in for the cloud data-core, connected
-through the real seam (env ``ROCKETRIDE_CLIENT_ID`` + a fake, injectable
-``Account.resolve_db_dsn`` — exactly how tests are meant to swap the resolver;
-node code is identical regardless of which resolver is active).
+through the real seam (the DSN delivered in ``ROCKETRIDE_DB_DSNS``, as the
+task engine does).
 
 Requires a container on the live pin (PG16 + pgvector), e.g.::
 
@@ -39,7 +38,7 @@ Requires a container on the live pin (PG16 + pgvector), e.g.::
     docker exec rr-pg-phase1 psql -U rruser -d rrtenant -c 'CREATE EXTENSION IF NOT EXISTS vector;'
 
 The ``rocketride_vector`` cases run the node's real classes over the shared
-pgvector driver, with the DSN injected through ``ROCKETRIDE_DB_DSN`` (the
+pgvector driver, with the DSN delivered in ``ROCKETRIDE_DB_DSNS`` (the
 production delivery path), once directly and once through a transaction-mode
 pooler.
 
@@ -66,6 +65,8 @@ import urllib.parse
 import types
 import uuid
 
+from ._store_base_stubs import store_base_stubs
+
 from pathlib import Path
 
 import pytest
@@ -82,7 +83,6 @@ TEST_DSN = os.environ.get('RR_TEST_PG_DSN', 'postgresql://rruser:rrpass@localhos
 # Derived, not hardcoded: the suite must also run against a provisioned tenant
 # DSN (e.g. t_<slug>_<hash> through a pooler), not just the default container.
 TEST_DB_NAME = urllib.parse.urlparse(TEST_DSN).path.lstrip('/')
-TEST_CLIENT_ID = 'tenant-integration-test'
 
 # RR_REQUIRE_DB_TESTS (set by CI once its DB containers are healthy) turns
 # every skip in this module into a hard failure: a broken container or missing
@@ -195,6 +195,8 @@ def _build_rr_env(monkeypatch):
                 'maxChunkId',
             ):
                 setattr(self, name, kw.get(name))
+            # The drivers page with these since #2631; the stand-in must carry them too.
+            self.offset = kw.get('offset', 0)
             self.limit = kw.get('limit', 10)
 
     class _QuestionText(str):
@@ -236,7 +238,12 @@ def _build_rr_env(monkeypatch):
                 self._createCollection(len(documents[0].embedding))
             return True
 
+    # rocketride_vector's IGlobal / IInstance sit on the store base since #2587;
+    # these tests drive the driver Store directly, so only the names matter.
+    bases = store_base_stubs()
     store_mod.DocumentStoreBase = _StubDocumentStoreBase
+    store_mod.StoreGlobalBase = bases.StoreGlobalBase
+    store_mod.StoreInstanceBase = bases.StoreInstanceBase
 
     monkeypatch.setitem(sys.modules, 'ai', ai_pkg)
     monkeypatch.setitem(sys.modules, 'ai.common', common_pkg)
@@ -258,17 +265,8 @@ def _build_rr_env(monkeypatch):
     rrdb_mod = _load_from_path('ai.common.rocketride_db', _RRDB_PATH, register=False)
     monkeypatch.setitem(sys.modules, 'ai.common.rocketride_db', rrdb_mod)
 
-    # The injectable fake resolver: same seam a SaaS build fills in.
-    account_mod = types.ModuleType('ai.account')
-
-    async def fake_resolve_db_dsn(client_id):
-        assert client_id == TEST_CLIENT_ID
-        return TEST_DSN
-
-    account_mod.account = types.SimpleNamespace(resolve_db_dsn=fake_resolve_db_dsn)
-    monkeypatch.setitem(sys.modules, 'ai.account', account_mod)
-    monkeypatch.setenv('ROCKETRIDE_CLIENT_ID', TEST_CLIENT_ID)
-    monkeypatch.delenv('ROCKETRIDE_DB_DSN', raising=False)
+    # Deliver the DSN the way the task engine does: nodes never resolve one.
+    monkeypatch.setenv('ROCKETRIDE_DB_DSNS', json.dumps({'org': TEST_DSN}))
 
     return types.SimpleNamespace(schema=schema, warnings=warnings)
 
@@ -412,27 +410,6 @@ class TestRocketrideSqlE2E:
         finally:
             glb.endGlobal()
 
-    def test_begin_global_via_injected_env_dsn(self, rr_env, monkeypatch, sql_table):
-        """The production delivery path: the task engine resolves server-side and
-        injects ROCKETRIDE_DB_DSN; the node-side account is never consulted.
-        """
-        import types as _types
-
-        async def poisoned(client_id):  # pragma: no cover — must not be reached
-            raise AssertionError('account must not be consulted when ROCKETRIDE_DB_DSN is injected')
-
-        monkeypatch.setitem(
-            sys.modules, 'ai.account', _types.SimpleNamespace(account=_types.SimpleNamespace(resolve_db_dsn=poisoned))
-        )
-        monkeypatch.setenv('ROCKETRIDE_DB_DSN', TEST_DSN)
-        glb, inst = self._begin(monkeypatch, {'table': sql_table, 'allow_execute': True})
-        try:
-            assert glb.database == TEST_DB_NAME
-            rows = inst.execute({'sql': f'SELECT count(*) AS n FROM {sql_table}'})
-            assert rows['rows'][0]['n'] == 2
-        finally:
-            glb.endGlobal()
-
     def test_config_connection_fields_ignored(self, rr_env, monkeypatch, sql_table):
         """The defining property: config cannot redirect the connection."""
         glb, _ = self._begin(
@@ -529,7 +506,7 @@ def vec_dsn(request) -> str:
 
 @pytest.fixture()
 def rv(monkeypatch, vec_dsn):
-    """The real rocketride_vector node, its DSN injected the way the task engine injects it."""
+    """The real rocketride_vector node, its DSN delivered the way the task engine delivers it."""
     import depends as real_depends
 
     depends_mod = types.ModuleType('depends')
@@ -541,7 +518,7 @@ def rv(monkeypatch, vec_dsn):
     from ai.common.config import Config
 
     monkeypatch.setattr(Config, 'getNodeConfig', staticmethod(lambda provider, connConfig: dict(connConfig)))
-    monkeypatch.setenv('ROCKETRIDE_DB_DSN', vec_dsn)
+    monkeypatch.setenv('ROCKETRIDE_DB_DSNS', json.dumps({'org': vec_dsn}))
     monkeypatch.delenv('ROCKETRIDE_DB_RESOLVE_ERROR', raising=False)
     store_mod = importlib.import_module('nodes.rocketride_vector.rocketride_vector')
     iglobal_mod = importlib.import_module('nodes.rocketride_vector.IGlobal')
@@ -591,9 +568,14 @@ def _called_as(rv, ctx):
 
 
 def _begin_vector_node(rv, config):
-    """Run the node's real beginGlobal (open the store, register the transform key)."""
+    """Run the node's real beginGlobal (open the store, register the transform key).
+
+    The tool tests run past the outer gate: unless ``config`` sets them,
+    expose_tools and allow_write are on (both default off on the node).
+    """
     from rocketlib import OPEN_MODE
 
+    config = {'expose_tools': True, 'allow_write': True, **config}
     glb = rv.IGlobal()
     glb.IEndpoint = types.SimpleNamespace(
         endpoint=types.SimpleNamespace(openMode=OPEN_MODE.SOURCE, bag={}, parameters={})
@@ -774,7 +756,7 @@ class TestRocketrideVectorNode:
         assert issubclass(rv.Store, PgVectorStore)
 
     def test_services_declare_the_tool_and_the_write_switches(self):
-        from ai.common.store.vx_defaults import VECTOR_AGENT_WRITES_DEFAULT, VECTOR_ALLOW_WRITES_DEFAULT
+        from ai.common.store.vx_defaults import VECTOR_ALLOW_WRITES_DEFAULT
 
         text = (_VEC_NODE_DIR / 'services.json').read_text(encoding='utf-8')
         text = '\n'.join(line for line in text.splitlines() if not line.strip().startswith('//'))
@@ -782,11 +764,55 @@ class TestRocketrideVectorNode:
         assert services['classType'] == ['store', 'tool']
         assert services['capabilities'] == ['invoke']
         fields = services['fields']
+        # The outer gate (#2631): the tool surface and the write tools, both off by default.
+        assert fields['rrvector.expose_tools']['default'] is False
+        assert fields['rrvector.allow_write']['default'] is False
+        # The write gate's DAP switch; agents need only allow_write (no rrvector.agent_writes).
         assert fields['rrvector.allow_writes']['default'] is VECTOR_ALLOW_WRITES_DEFAULT
-        assert fields['rrvector.agent_writes']['default'] is VECTOR_AGENT_WRITES_DEFAULT
-        assert {'rrvector.allow_writes', 'rrvector.agent_writes'} <= set(fields['rrvector.cloud']['properties'])
-        # The default lives in vx_defaults only: no profile pins it.
+        assert 'rrvector.agent_writes' not in fields
+        properties = set(fields['rrvector.cloud']['properties'])
+        assert {'rrvector.expose_tools', 'rrvector.allow_write', 'rrvector.allow_writes'} <= properties
+        # The allow_writes default lives in vx_defaults only: no profile pins it.
         assert all('allow_writes' not in profile for profile in services['preconfig']['profiles'].values())
+
+    def test_tools_are_hidden_and_refused_with_the_shipped_switches(self, rv, table):
+        """With expose_tools and allow_write at their defaults (off), no tool is offered or runs."""
+        from ai.common.tool_context import ToolCallContext
+
+        rng = np.random.default_rng(40)
+        glb, inst = _begin_vector_node(
+            rv, {'collection': table, 'similarity': 'cosine', 'expose_tools': False, 'allow_write': False}
+        )
+        ctx = ToolCallContext(origin='agent', source_type=None, targeted=True, caller={'auth': 'agent'})
+        try:
+            self._seed(rv, glb, rng)
+            assert inst._collect_tool_methods() == {}
+            with _called_as(rv, ctx):
+                for answer in (inst.stats({}), inst.objdir({}), self._write(inst, rng, 'delete', 'doc')):
+                    assert answer['success'] is False and 'expose_tools=true' in answer['error'], answer
+            self._unchanged(rv, glb)
+        finally:
+            glb.endGlobal()
+
+    def test_write_tools_are_hidden_and_refused_until_allow_write(self, rv, table):
+        from ai.common.tool_context import ToolCallContext
+
+        rng = np.random.default_rng(39)
+        glb, inst = _begin_vector_node(
+            rv, {'collection': table, 'similarity': 'cosine', 'allow_write': False, 'allow_writes': True}
+        )
+        ctx = ToolCallContext(origin='agent', source_type=None, targeted=True, caller={'auth': 'agent'})
+        try:
+            self._seed(rv, glb, rng)
+            offered = set(inst._collect_tool_methods())
+            assert {'search', 'objdir', 'get', 'stats'} <= offered
+            assert offered.isdisjoint({'upsert', 'delete', 'remove_document'})
+            with _called_as(rv, ctx):
+                answer = self._write(inst, rng, 'delete', 'doc')
+            assert answer['success'] is False and 'allow_write=true' in answer['error'], answer
+            self._unchanged(rv, glb)
+        finally:
+            glb.endGlobal()
 
     def test_begin_global_opens_the_store_and_keys_on_the_tenant(self, rv, table):
         glb, inst = _begin_vector_node(rv, {'collection': table, 'similarity': 'cosine'})
@@ -909,7 +935,7 @@ class TestRocketrideVectorNode:
             glb.endGlobal()
 
     def test_agent_writes_with_a_call_context_reach_the_store(self, rv, table):
-        """With the default switches an agent's upsert and delete go through to the table."""
+        """With allow_write on and the write gate's default switches an agent's upsert and delete go through."""
         from ai.common.tool_context import ToolCallContext
 
         rng = np.random.default_rng(46)

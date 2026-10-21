@@ -47,7 +47,7 @@
 	// Optional:
 	//		Description of this driver
 	//
-	"description": ["A RocketRide-managed relational database. Stores structured table data ", "in your own provisioned RocketRide cloud database with zero setup — no host, ", "user, or password to enter; the server resolves the connection to your ", "organization's database automatically. Supports the same natural-language query, ", "schema reflection, and direct-execute surface as the generic PostgreSQL node."],
+	"description": ["A RocketRide-managed relational database. Stores structured table data ", "in your own provisioned RocketRide cloud database with zero setup — no host, ", "user, or password to enter; the engine delivers the connection to the ", "database you choose automatically. Supports the same natural-language query, ", "schema reflection, and direct-execute surface as the generic PostgreSQL node."],
 	//
 	// Optional:
 	//	  The icon is the icon to display in the UI for this node
@@ -61,8 +61,8 @@
 	//
 	"invoke": {
 		"llm": {
-			"description": "LLM to use to craft SQL queries from question",
-			"min": 1
+			"description": "LLM that writes SQL from a natural-language question; not needed for execute (raw SQL)",
+			"min": 0
 		}
 	},
 	//
@@ -124,9 +124,23 @@
 			"default": false,
 			"description": "Permit the execute, begin, commit, and rollback tool functions to run raw SQL without LLM translation or safety checks. Leave OFF unless a trusted application explicitly needs to issue SQL directly."
 		},
+		"rocketridesql.scope": {
+			"type": "string",
+			"title": "Database",
+			"default": "org",
+			"enum": [["org", "Organization"], ["team", "Team"], ["user", "Personal"]],
+			"description": "Organization (default): shared by everyone in the organization. Team: the run's team (your current dev team, or the team a deploy is billed to). Personal: your own, for runs you start yourself. Each is a separate database: switching doesn't move data, and a new one starts empty."
+		},
+		"rocketridesql.target": {
+			"hidden": true,
+			"type": "string",
+			"title": "Team or user",
+			"default": "",
+			"description": "Another team's or user's database (admins only). Leave empty to use your own team's or your own"
+		},
 		"rocketridesql.default": {
 			"object": "default",
-			"properties": ["rocketridesql.db_description", "rocketridesql.table", "rocketridesql.max_attempts", "rocketridesql.allow_execute"]
+			"properties": ["rocketridesql.db_description", "rocketridesql.table", "rocketridesql.max_attempts", "rocketridesql.allow_execute", "rocketridesql.scope", "rocketridesql.target"]
 		},
 		"rocketridesql.profile": {
 			"hidden": true,
@@ -150,7 +164,12 @@
 		{
 			"section": "Pipe",
 			"title": "RocketRide SQL",
-			"properties": ["rocketridesql.profile"]
+			"properties": ["rocketridesql.profile"],
+			"ui": {
+				"ui:options": {
+					"compactDescriptions": true
+				}
+			}
 		}
 	]
 }

@@ -24,26 +24,50 @@
 # ------------------------------------------------------------------------------
 # This class controls the data shared between all threads for the task.
 #
-# The store lifecycle (open the store, wire the tool-path embedder, register the
-# transform key) is StoreGlobalBase's, like every vector store node's; this
-# class supplies the RocketRide-specific pieces: there are no host/user/password
-# fields, because the DSN of the organization's database (the tenant; a user
-# only where there is no organization) comes from the account layer
-# (ai.common.rocketride_db).
+# Sits on the shared store base like store_postgres, differing only in how it
+# connects: there are no host/user/password fields; the task engine delivers
+# the authorized DSN for this node's scope / target (ai.common.rocketride_db).
+# The base supplies the lifecycle (open the store outside CONFIG mode, wire the
+# tool-path embedder, register the transform key) and, through
+# StoreInstanceBase, the agent and Vector Explorer tools.
+#
+# The table is in a managed RocketRide database, so the whole tool surface is
+# opt-in through the expose_tools setting (off by default), and the write tools
+# (upsert, delete, remove_document) also need the allow_write setting (off by
+# default). Past that outer gate, a write from a DAP caller (the Vector
+# Explorer's trash can) still needs allow_writes, and the write gate's caller
+# rules apply (vx_write_gate). The data lanes are always available.
 # ------------------------------------------------------------------------------
+import os
 import re
 from typing import Any, Dict
 
 from rocketlib import warning
+
+from ai.common.rocketride_db import DsnNotDelivered, db_target, resolve_rocketride_dsn
 from ai.common.store import StoreGlobalBase
-from ai.common.rocketride_db import resolve_rocketride_dsn
 
 # Valid unquoted PostgreSQL identifier: letter/underscore start, alphanumeric/underscore body, max 63 chars
 VALID_TABLE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]{0,62}$')
 
 
 class IGlobal(StoreGlobalBase):
-    serverName: str = 'rocketride_vector'
+    serverName: str = 'rrvector'
+
+    # Read by VectorStoreToolMixin when the engine lists or dispatches tools.
+    # The base resolves the rrvector.expose_tools setting at start; this class
+    # default keeps the tool surface off when nothing is configured, because
+    # objdir and get (and the Vector Explorer's documents and chunks) together
+    # return the whole table of the managed database to any caller of the
+    # pipeline's tool path.
+    expose_tools: bool = False
+
+    # Read by VectorStoreToolMixin before a write tool runs. The base resolves
+    # the rrvector.allow_write setting at start; this class default keeps
+    # writes off when nothing is configured. It is the one switch for agent
+    # writes on this node: there is no rrvector.agent_writes setting, so the
+    # write gate's agent switch keeps its default (on) behind this one.
+    allow_write: bool = False
 
     def _open_store(self, logical_type: str, conn_config: Dict[str, Any], bag: Dict[str, Any]):
         """Return the driver's Store, imported lazily so config mode never loads the driver."""
@@ -68,7 +92,9 @@ class IGlobal(StoreGlobalBase):
         Validate the RocketRide cloud vector store config with fast, read-only probes.
 
         - Enforce a safe unquoted identifier for the table (collection).
-        - Resolve the per-tenant DSN, connect with a short timeout, run SELECT 1.
+        - Check scope / target. Outside a task no DSN is delivered, so stop
+          there: connectivity is checked when the pipeline runs.
+        - Inside a task, connect with a short timeout, run SELECT 1.
         - Verify pgvector availability via ``SELECT NULL::vector``.
         - Surface raw provider errors without truncation.
         """
@@ -83,15 +109,16 @@ class IGlobal(StoreGlobalBase):
                 )
                 return
 
-            # No host/user/password fields — resolve the per-tenant DSN.
-            dsn = resolve_rocketride_dsn()
+            # No host/user/password fields: read the delivered DSN.
+            try:
+                dsn = resolve_rocketride_dsn(*db_target(config))
+            except DsnNotDelivered:
+                return
 
             # Load deps on demand: in CONFIG mode beginGlobal never imports
             # .rocketride_vector (where the node's other depends() lives), so
             # this is the only thing that installs the driver at save time —
             # same pattern as store_postgres and the other DB nodes.
-            import os
-
             from depends import depends  # type: ignore
 
             depends(os.path.dirname(os.path.realpath(__file__)) + '/requirements.txt')

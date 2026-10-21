@@ -36,12 +36,13 @@ inherit the engine's full environment, only an allowlist:
 
 - process basics: `PATH`, `HOME`, locale, TLS and proxy settings
 - interpreter and ML runtime settings (`PYTHON*`, `HF_*`, `CUDA_*`, and similar)
-- every `ROCKETRIDE_` variable except `ROCKETRIDE_DB_DSN` and
-  `ROCKETRIDE_DB_RESOLVE_ERROR` (and the former broker names below), which the
-  engine removes in any spelling. A task that uses a RocketRide database node
-  then gets its own resolved `ROCKETRIDE_DB_DSN`, however the pipeline spells
-  the node's provider (any case, or a `${ROCKETRIDE_*}` placeholder). Any other
-  `ROCKETRIDE_DB_*` name passes through like the rest.
+- every `ROCKETRIDE_` variable except `ROCKETRIDE_DB_DSNS`, `ROCKETRIDE_DB_DSN`
+  and `ROCKETRIDE_DB_RESOLVE_ERROR` (and the former broker names below), which
+  the engine removes in any spelling. A task that uses a RocketRide database
+  node then gets `ROCKETRIDE_DB_DSNS`, holding the DSN of each database the run
+  was approved for, however the pipeline spells the node's provider (any case,
+  or a `${ROCKETRIDE_*}` placeholder). Any other `ROCKETRIDE_DB_*` name passes
+  through like the rest.
 - what nodes and the task itself use directly: `RR_STORE_URL`,
   `RR_STORE_SECRET_KEY`, `RR_SIGNING_KEY`, `RR_BASE_URL`, `RR_CORS_ORIGINS`,
   `RR_OAUTH_BROKER_URL`, `RR_PROC_PRIVATE`, `MEDIA_TOOLKIT_FFMPEG`, `AWS_*`, and
@@ -61,8 +62,7 @@ environment or in its `.env` file, even next to the new names, and the
 open-source `set_env` command refuses them: rename them in the deployment
 configuration and secret mapping in the same change. A hosted engine without
 the broker settings logs a warning at startup, and its RocketRide database
-nodes report that the broker is not configured, both when their configuration
-is saved and when a task starts.
+nodes report the missing broker configuration when a task starts.
 
 The open-source `set_env` command replaces the engine's whole set of
 `ROCKETRIDE_` settings, in its environment and in its `.env` file, with the
@@ -103,16 +103,18 @@ by the engine's user. If the `.env` file cannot be read as UTF-8 or the new
 one cannot be written in full, the command fails and leaves the engine's
 environment and the `.env` file as they were.
 
-Each RocketRide database node connects to the database of the organization
-that runs the pipeline (of the user, where there is no organization). The
-engine resolves that connection when a task starts, from the task's own
-identity; nothing in the pipeline, a node's configuration or the task's
-environment selects it. On a hosted engine a task takes that connection from
-the engine alone: when the engine resolved none for it, its database nodes
-report that and never resolve one themselves. The connection check that runs
-when a node's configuration is saved resolves no database at all on a hosted
-engine, so the engine's own environment cannot select one either. The connection string the
-broker returns must require TLS: an explicit `sslmode`
+Each RocketRide database node connects to the database its Database setting
+chooses: the organization's (the default), the run's team's or the run's
+user's. When a task starts, the engine authorizes every database the
+pipeline's nodes choose against the task's own identity, resolves their
+connections and hands them to the task in `ROCKETRIDE_DB_DSNS`; nothing else in
+the pipeline, a node's configuration or the task's environment selects a
+tenant. A task takes its connections from the engine alone: a database the
+engine did not resolve for it is refused, and its database nodes never resolve
+one themselves. The connection check that runs when a node's configuration is
+saved resolves no database at all, so the engine's own environment cannot
+select one either. The connection string the broker returns must require TLS:
+an explicit `sslmode`
 of `require`, `verify-ca` or `verify-full` is used as issued, a missing one
 becomes `require`, and one that does not require TLS is refused unless every
 host it names (including libpq's `host` and `hostaddr` parameters) is on the

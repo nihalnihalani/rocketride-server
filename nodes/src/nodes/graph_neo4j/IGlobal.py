@@ -32,6 +32,7 @@ and LLM query loop from the base class.
 
 from __future__ import annotations
 
+import re
 import time
 
 from itertools import islice
@@ -42,7 +43,7 @@ from neo4j.exceptions import Neo4jError, ServiceUnavailable
 
 from rocketlib import error, warning
 
-from ai.common.graph import GraphGlobalBase, is_cypher_safe
+from ai.common.graph import GraphGlobalBase, is_cypher_safe, strip_cypher_literals
 from ai.common.graph.adapters import neo4j_adapter
 from ai.common.graph.cypher_safety import NEO4J_READ_PROCEDURES, CypherRefused, check_read_only_cypher
 from ai.common.graph.schema import SCHEMA_LABEL_LIMIT, SCHEMA_REL_TYPE_LIMIT, SCHEMA_SAMPLE_SIZE
@@ -61,11 +62,21 @@ READ_ONLY_PRIVILEGES = frozenset(
 DEFAULT_URI = 'neo4j://localhost:7687'
 DEFAULT_DATABASE = 'neo4j'
 
+# Statements Neo4j runs only in an auto-commit transaction: batched subqueries
+# (``CALL { ... } IN [n] [CONCURRENT] TRANSACTIONS``) and Neo4j 4's
+# ``USING PERIODIC COMMIT``.
+_AUTO_COMMIT_ONLY = re.compile(
+    r'\}\s*IN\s+(?:(?:\S+\s+)?CONCURRENT\s+)?TRANSACTIONS\b|\bUSING\s+PERIODIC\s+COMMIT\b',
+    re.IGNORECASE,
+)
+
 
 class IGlobal(GraphGlobalBase):
     """Neo4J-specific global connection state."""
 
     QUERY_TIMEOUT: float = 30.0  # Maximum seconds a Cypher query may run before being aborted.
+
+    supports_execute_params = True
 
     driver: Optional[neo4j.Driver] = None
 
@@ -177,29 +188,47 @@ class IGlobal(GraphGlobalBase):
             result = session.run(neo4j.Query(query, timeout=self.QUERY_TIMEOUT), params or {})
             return [_record_to_dict(record) for _, record in zip(range(cap), result)]
 
-    def _run_query_raw(self, query: str) -> Dict[str, Any]:
-        """Execute a raw statement with no safety gate (the EXECUTE path)."""
-        max_rows = self.max_execute_rows
-        with self.driver.session(database=self.database) as session:
-            result = session.run(neo4j.Query(query, timeout=self.QUERY_TIMEOUT))
-            rows = [_record_to_dict(record) for _, record in zip(range(max_rows + 1), result)]
-            if len(rows) > max_rows:
-                raise ValueError(f'EXECUTE query exceeded max_execute_rows={max_rows}')
+    def _run_query_raw(self, query: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Execute a raw statement with no safety gate (the EXECUTE path).
 
-            counters = result.consume().counters
-            # Count writes unconditionally: a Cypher write commonly also returns rows
-            # (CREATE (n) RETURN n), so a non-empty result set does not mean nothing
-            # changed. The counters are 0 for a pure read anyway.
-            affected = (
-                counters.nodes_created
-                + counters.nodes_deleted
-                + counters.relationships_created
-                + counters.relationships_deleted
-                + counters.properties_set
-                + counters.labels_added
-                + counters.labels_removed
-            )
-            return {'rows': rows, 'affected_rows': affected}
+        The statement runs in an explicit transaction that commits only after
+        the row cap is checked, so a result over ``max_execute_rows`` is rolled
+        back and a retry cannot duplicate the write. Batched statements run in
+        auto-commit, the only mode Neo4j allows for them; each batch commits on
+        its own, so the cap cannot undo them.
+
+        ``params`` binds ``$name`` values as Bolt parameters.
+        """
+        with self.driver.session(database=self.database) as session:
+            if _needs_auto_commit(query):
+                return self._read_execute_result(
+                    session.run(neo4j.Query(query, timeout=self.QUERY_TIMEOUT), params or {})
+                )
+            # Leaving the block commits; an exception inside it, the row cap's included, rolls back.
+            with session.begin_transaction(timeout=self.QUERY_TIMEOUT) as tx:
+                return self._read_execute_result(tx.run(query, params or {}))
+
+    def _read_execute_result(self, result: neo4j.Result) -> Dict[str, Any]:
+        """Collect an EXECUTE result as ``{'rows', 'affected_rows'}``; raise past ``max_execute_rows``."""
+        max_rows = self.max_execute_rows
+        rows = [_record_to_dict(record) for _, record in zip(range(max_rows + 1), result)]
+        if len(rows) > max_rows:
+            raise ValueError(f'EXECUTE query exceeded max_execute_rows={max_rows}')
+
+        counters = result.consume().counters
+        # Count writes unconditionally: a Cypher write commonly also returns rows
+        # (CREATE (n) RETURN n), so a non-empty result set does not mean nothing
+        # changed. The counters are 0 for a pure read anyway.
+        affected = (
+            counters.nodes_created
+            + counters.nodes_deleted
+            + counters.relationships_created
+            + counters.relationships_deleted
+            + counters.properties_set
+            + counters.labels_added
+            + counters.labels_removed
+        )
+        return {'rows': rows, 'affected_rows': affected}
 
     # ------------------------------------------------------------------
     # read_query / execute(shape='graph')
@@ -238,10 +267,13 @@ class IGlobal(GraphGlobalBase):
         ) as session:
             return session.execute_read(neo4j.unit_of_work(timeout=self.QUERY_TIMEOUT)(work))
 
-    def _raw_query_rows(self, cypher, fetch_limit, consume):
-        """execute(shape='graph'): run as written in one write transaction (never retried)."""
+    def _raw_query_rows(self, cypher, fetch_limit, consume, params=None):
+        """execute(shape='graph'): run as written in one write transaction (never retried).
+
+        ``params`` binds ``$name`` values as Bolt parameters, as in ``_run_query_raw``.
+        """
         with self.driver.session(database=self.database) as session:
-            result = session.run(neo4j.Query(cypher, timeout=self.QUERY_TIMEOUT))
+            result = session.run(neo4j.Query(cypher, timeout=self.QUERY_TIMEOUT), params or {})
             envelope = consume(list(result.keys()), (record.values() for record in islice(result, fetch_limit)))
             counters = result.consume().counters
             affected = (
@@ -375,6 +407,11 @@ class IGlobal(GraphGlobalBase):
 # ---------------------------------------------------------------------------
 # Module-level helpers
 # ---------------------------------------------------------------------------
+
+
+def _needs_auto_commit(query: str) -> bool:
+    """Return True for a statement Neo4j refuses to run inside an explicit transaction."""
+    return bool(_AUTO_COMMIT_ONLY.search(strip_cypher_literals(query)))
 
 
 def _quote(name: str) -> str:

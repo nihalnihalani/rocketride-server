@@ -1,8 +1,9 @@
 # rocketride_graph
 
 A RocketRide graph database node for natural-language Cypher queries against
-the Apache AGE graph in your organization's managed RocketRide database. Pick it
-over rocketride_sql when relationships and traversals are the data model.
+the Apache AGE graph in a managed RocketRide database: your organization's, your
+team's or your own (see Database). Pick it over rocketride_sql when
+relationships and traversals are the data model.
 
 ## What it does
 
@@ -38,7 +39,7 @@ node defines no configurable server-name prefix. Inputs are JSON objects.
 | refresh_schema | Re-reads the schema now and returns it like get_schema. |
 | get_query | Converts required natural-language question to read-only Cypher without executing it; limit is optional. |
 | read_query | Runs required `cypher` you wrote, read-only, with optional `params` and `limit`, and returns positional rows in the shared graph result shape. |
-| execute | Runs required raw Cypher query when direct execution is enabled. |
+| execute | Runs required raw Cypher query when direct execution is enabled; optional params binds `$name` values (for example `{"rows": [...]}` for `UNWIND $rows`), which need no escaping and do not count toward the 10,000-character query limit (params JSON is capped at 8 MiB). The statement may also be sent as sql, the key client.database.query uses; session_id and row_mode 'array' are refused, because graph nodes have no transactions and return row objects. If the result has more rows than the execute row limit, the call fails and nothing is saved; with shape "graph" the result is cut at that limit and marked truncated instead, and what the statement wrote stands. On AGE 1.5.0, `UNWIND $rows ... MERGE` creates duplicates when rows repeat a key, so remove repeated keys first. |
 | dialect | Returns {"dialect": "age"} plus the AGE version, database and graph names, capabilities, limits and read boundary. |
 
 get_data defaults to the shared read limit, then clamps the requested limit to
@@ -115,23 +116,33 @@ the label id inside each graph id. read_boundary is read_only_tx. The
 natural-language tools tell the model it is writing for Apache AGE 1.5.0 and
 list the constructs it cannot use.
 
+The translator also guards two AGE 1.5.0 gaps that would otherwise return wrong
+data without an error. An empty-list test such as `x IN []` is rewritten to
+`false`, its standard Cypher value. AGE applies SET, REMOVE and DELETE only to
+the first node or edge a MERGE creates in a statement, so after a MERGE these
+are rejected unless they change a variable bound before that MERGE, or the node
+of a single-node MERGE that starts the query. For a bulk upsert, run the MERGE,
+then the SET as a separate execute call, for example
+`UNWIND $rows AS row MATCH (n:Item {id: row.id}) SET n.name = row.name`.
+Properties written inside the MERGE pattern are stored, but MERGE matches on
+them: with different values it creates a second node or edge.
+
 ## Configuration
 
-The single built-in profile supplies the default graph name. RocketRide
-provisions one database per organization for its managed database nodes (per
-user only where there is no organization), and the RocketRide server resolves
-the connection to it from the pipeline's organization instead of a host, user,
-password, or database name you enter; nothing in the node configuration or the
-pipeline can point it at another database. Start with the defaults, then tune the
-graph context and read limits around the size and shape of the graph your LLM
-must query.
+The single built-in profile supplies the default graph name. The node uses the
+managed database chosen under Database (Organization by default); the RocketRide
+server authorizes it for the run and delivers its connection at task start. There
+is no host, user, password, DSN or database name to enter, and no such key in the
+node configuration can point it at another database. Start with the defaults,
+then tune the graph context and read limits around the size and shape of the
+graph your LLM must query.
 
 ### Graph name and graph description
 
-Graph name defaults to rocketride, the graph RocketRide creates when your
-organization's database is first provisioned, and must name an existing AGE
-graph; startup fails instead of creating a missing graph (the error says how
-to create one with `SELECT create_graph(...)`). Graph description is empty by
+Graph name defaults to rocketride, the graph every RocketRide database comes
+with (see Database), and must name an existing AGE graph; startup fails instead
+of creating a missing graph (the error says how to create one with
+`SELECT create_graph(...)`). Graph description is empty by
 default and becomes LLM context, so describe labels, relationship meaning, and
 domain vocabulary when those are not obvious from reflected schema. Change the
 graph name when the tenant database contains multiple AGE graphs; update the
@@ -141,7 +152,9 @@ description with it so generated Cypher targets the right model.
 
 The node retries failed Cypher validation up to five times by default. Raise
 Max validation attempts (at most 10) for a complex schema where the returned validation error
-is likely to let the LLM repair its query, or lower it to fail faster. Max read
+is likely to let the LLM repair its query, or lower it to fail faster. The
+runtime applies 1–10: a value above 10 saved by an earlier version of the form,
+or set in a pipeline file, still runs as 10. Max read
 rows defaults to 1,000 and is an owner-controlled cap for the questions lane,
 get_data and read_query (and so for Graph Explorer, whose "All" asks for this
 cap); increase it only when agents truly need larger result sets, since
@@ -163,13 +176,50 @@ safe read-only gate. They still use the AGE translator and its resource
 controls, and refuse schema-qualified function calls and `CALL`. Enable it
 only for trusted callers that require writes or raw Cypher.
 
+### Database
+
+Database picks which RocketRide cloud database the node uses. It defaults to
+Organization, so existing pipelines keep using the database they already had.
+
+- **Organization**: the database shared by everyone in the organization the
+  pipeline runs in. Data from before this choice existed lives here.
+- **Team**: the database of the run's team. A run from the builder uses your
+  current dev team and needs run rights (task.control) on it; a deployed
+  pipeline uses the team it is billed to.
+- **Personal**: your own database in this organization. It works only when you
+  are the person running the pipeline: builder runs, store apps you run, and
+  pipelines you deploy for yourself (@me). A pipeline deployed for a team has
+  no person behind it, so it fails at start with an error that says so.
+  Organization admins can reach members' personal databases, and that access
+  is logged.
+
+Each choice is a separate database. Switching does not move or copy data, and
+a database you have not used yet is created empty on the first run that needs
+it. Every database, new ones included, comes with a graph named rocketride, so the
+default Graph name works in each.
+
+A pipeline exposed through a public link (a chat, dropper, webhook, Discord or
+Telegram source) runs as you, so visitors' requests use your team or personal
+database, not their own.
+
+Access is checked when the run starts. If the run may not use the chosen
+database, it does not start, and the error says which database and why. A
+self-hosted engine supports only Organization; Team and Personal fail at start
+because they need RocketRide cloud. Access is approved for the whole run, not
+each node: every node in a run can reach every database the run was approved
+for.
+
 ## Limitations
 
 This node runs on the RocketRide engine host and does not support remote
-execution. The RocketRide server resolves the database connection for the
-pipeline's organization at task start, so it needs the cloud database broker
-configured. The tenant database must already have Apache AGE installed and
-contain the configured graph. Read paths are
+execution. The RocketRide server resolves the connection to the node's chosen
+database at task start; on a server without a RocketRide cloud
+database (for example, a local or self-hosted engine with no database broker) the
+task fails at start with a message that says so; use a connection-configured
+node such as graph_neo4j or graph_falkordb there. On RocketRide Cloud, missing
+broker configuration is a server configuration error: contact the server
+operator to restore it and retry. The tenant database must
+already have Apache AGE installed and contain the configured graph. Read paths are
 intentionally read-only; raw execution remains disabled until explicitly
 enabled.
 

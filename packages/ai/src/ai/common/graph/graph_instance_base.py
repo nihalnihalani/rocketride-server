@@ -302,19 +302,7 @@ class GraphInstanceBase(IInstanceBase, ABC):
         return {'query': query, 'valid': True}
 
     @tool_function(
-        input_schema={
-            'type': 'object',
-            'required': ['query'],
-            'properties': {
-                'query': {'type': 'string', 'description': 'Raw query to execute.'},
-                'shape': {
-                    'type': 'string',
-                    'enum': list(_EXECUTE_SHAPES),
-                    'description': 'Result shape: "legacy" (default, rows as objects) or "graph" (the read_query '
-                    'envelope plus affected_rows).',
-                },
-            },
-        },
+        input_schema=lambda self: self._execute_input_schema(),
         output_schema={
             'type': 'object',
             'properties': {
@@ -341,17 +329,44 @@ class GraphInstanceBase(IInstanceBase, ABC):
         ),
     )
     def execute(self, args):
-        """Execute a raw statement, bypassing translation and the read-only gate."""
+        """Execute a raw statement, bypassing translation and the read-only gate.
+
+        Args:
+            args (dict): ``query`` (str) — the raw statement; ``sql`` is accepted
+                in its place, which is the key ``client.database.query`` sends.
+                ``params`` (dict, optional) — values for ``$name`` placeholders.
+                ``shape`` (str, optional) — ``'legacy'`` (the default) or
+                ``'graph'`` for the read_query envelope.
+
+        Returns:
+            dict: ``{'rows': [...], 'affected_rows': int}``; with shape
+            ``'graph'``, the read_query envelope plus ``affected_rows``.
+
+        Raises:
+            ValueError: execute is disabled, the statement is missing,
+                ``params`` is not an object / not supported by this driver, or
+                the call carries a ``session_id`` / ``row_mode`` other than
+                ``'object'`` (graph nodes have neither).
+        """
         args = normalize_tool_input(args, tool_name='execute')
-        query = require_str(args, 'query', tool_name='execute')
+        # A disabled node reports that first, whatever the arguments are.
+        if not self.IGlobal.allow_execute:
+            raise ValueError('execute tool is disabled for this node (set allow_execute=true)')
+
+        key = 'sql' if 'query' not in args and 'sql' in args else 'query'
+        query = require_str(args, key, tool_name='execute')
         shape = args.get('shape', 'legacy')
         if shape is None:
             shape = 'legacy'
         if shape not in _EXECUTE_SHAPES:
             raise ValueError(f'execute: "shape" must be one of {", ".join(_EXECUTE_SHAPES)} (got {shape!r})')
-
-        if not self.IGlobal.allow_execute:
-            raise ValueError('execute tool is disabled for this node (set allow_execute=true)')
+        params = self._execute_params(args.get('params'))
+        # client.database.query also forwards these SQL-node options; refuse
+        # them rather than run outside the transaction or in another row shape.
+        if args.get('session_id'):
+            raise ValueError('execute: graph nodes have no transactions, so "session_id" is not supported')
+        if (args.get('row_mode') or 'object') != 'object':
+            raise ValueError('execute: graph nodes return row objects, so "row_mode" must be \'object\'')
 
         if shape == 'graph':
             # Never retried: a write may already have happened.
@@ -361,7 +376,10 @@ class GraphInstanceBase(IInstanceBase, ABC):
                 return self._graph_envelope(columns, rows, row_limit)
 
             try:
-                envelope, affected = self.IGlobal._raw_query_rows(query, row_limit + 1, consume)
+                if params:
+                    envelope, affected = self.IGlobal._raw_query_rows(query, row_limit + 1, consume, params=params)
+                else:
+                    envelope, affected = self.IGlobal._raw_query_rows(query, row_limit + 1, consume)
             except GraphToolError:
                 raise
             except NotImplementedError as e:
@@ -370,7 +388,10 @@ class GraphInstanceBase(IInstanceBase, ABC):
                 raise self._graph_error(e) from e
             return {**envelope, 'affected_rows': int(affected or 0)}
 
-        result = self.IGlobal._run_query_raw(query)
+        if params:
+            result = self.IGlobal._run_query_raw(query, params=params)
+        else:
+            result = self.IGlobal._run_query_raw(query)
         return {
             'rows': [self._sanitize_row(row) for row in result.get('rows', [])],
             'affected_rows': result.get('affected_rows', 0),
@@ -611,6 +632,58 @@ class GraphInstanceBase(IInstanceBase, ABC):
     # ------------------------------------------------------------------
     # Sanitization helpers
     # ------------------------------------------------------------------
+
+    def _execute_input_schema(self) -> Dict[str, Any]:
+        """Input schema of the execute tool for this driver.
+
+        Returns:
+            Dict[str, Any]: JSON schema; ``params`` is listed only when the
+            driver sets ``supports_execute_params``, so agents are not offered
+            an argument the node would refuse.
+        """
+        properties: Dict[str, Any] = {'query': {'type': 'string', 'description': 'Raw query to execute.'}}
+        if getattr(getattr(self, 'IGlobal', None), 'supports_execute_params', False):
+            properties['params'] = {
+                'type': 'object',
+                'description': (
+                    'Values for $name placeholders in the query, keyed by name '
+                    '(e.g. {"rows": [...]} for UNWIND $rows). Values are bound, not '
+                    'pasted into the query text, so they need no escaping and do not '
+                    'count toward the query length limit.'
+                ),
+            }
+        properties['shape'] = {
+            'type': 'string',
+            'enum': list(_EXECUTE_SHAPES),
+            'description': 'Result shape: "legacy" (default, rows as objects) or "graph" (the read_query '
+            'envelope plus affected_rows).',
+        }
+        return {'type': 'object', 'required': ['query'], 'properties': properties}
+
+    def _execute_params(self, raw: Any) -> Optional[Dict[str, Any]]:
+        """Validate the execute tool's ``params``; None when there are none.
+
+        Args:
+            raw (Any): The ``params`` value from the tool input.
+
+        Returns:
+            Optional[Dict[str, Any]]: The bound values, or None for a missing
+            or empty value (an empty list included — the SQL-shaped SDK call
+            may send one).
+
+        Raises:
+            ValueError: ``params`` is not an object, or the driver cannot bind them.
+        """
+        if raw is None or (isinstance(raw, (dict, list)) and not raw):
+            return None
+        if not isinstance(raw, dict):
+            raise ValueError(
+                'execute: "params" must be an object keyed by placeholder name, e.g. '
+                '{"rows": [...]} for $rows; positional lists are not supported for graph queries'
+            )
+        if not self.IGlobal.supports_execute_params:
+            raise ValueError(f'execute: "params" is not supported by the {self._db_display_name()} node')
+        return raw
 
     @staticmethod
     def _clamp_limit(raw: Any) -> int:

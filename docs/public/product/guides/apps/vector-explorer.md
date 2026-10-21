@@ -19,8 +19,8 @@ node is configured for, with that node's settings. If apps are new to you, read
 
 Vector Explorer is built for four stores, the ones with tests that run against
 a live server: [PostgreSQL with pgvector](/nodes/store_postgres),
-[RocketRide Vector](/nodes/rocketride_vector) (your organization's managed
-RocketRide database), [Qdrant](/nodes/store_qdrant) and
+[RocketRide Vector](/nodes/rocketride_vector) (a managed RocketRide database:
+your organization's, your team's or your own), [Qdrant](/nodes/store_qdrant) and
 [Chroma](/nodes/store_chroma). [Milvus](/nodes/store_milvus),
 [Weaviate](/nodes/store_weaviate), [Pinecone](/nodes/store_pinecone),
 [Astra DB](/nodes/store_astra) and [MongoDB Atlas](/nodes/store_atlas) are
@@ -92,8 +92,8 @@ written by an earlier release, and **Experimental** otherwise.
 - **Your store's connection details.** Type them into the store nodes' forms.
   The app never shows them, and store nodes never return them. A `.pipe` file
   is plain JSON and keeps what you type as written, so treat it like any file
-  that holds a password. `rocketride_vector` has none to type: it uses your
-  organization's managed RocketRide database.
+  that holds a password. `rocketride_vector` has none to type: it uses the
+  managed RocketRide database its Database setting chooses.
 - **A key for the chat's LLM.** The templates ship with the placeholder key
   `replace-with-your-key` and an empty `base_url` on the LLM node
   ([OpenAI-Compatible API](/nodes/llm_openai_api)). Replace the key, and set
@@ -111,13 +111,24 @@ written by an earlier release, and **Experimental** otherwise.
   `config.<profile>.allow_writes` to `true` on the store component in the
   `.pipe` (for example `"local": { …, "allow_writes": true }`), then restart the
   pipeline. Every store node's form also shows it, as **Allow document
-  management from tool calls**, next to **Allow writes from agents** (**Allow
-  agent writes** on RocketRide Vector). With it off, the trash buttons are
+  management from tool calls**, next to **Allow writes from agents** (on
+  RocketRide Vector, next to **Allow writes through tools**). With it off, the
+  trash buttons are
   disabled and say why. Adding
   documents is not governed by this switch: it goes through the Ingest source,
   and anyone with the data permission on the ingest task can add documents.
   Agents that use a store as a tool are unaffected; they have their own switch,
   `agent_writes`, which is on by default.
+- **RocketRide Vector needs its tools turned on.** The RocketRide Vector node
+  keeps its whole tool surface off until **Expose as tools** is on, and its
+  write tools until **Allow writes through tools** is also on; both are off by
+  default because the table is in a managed database. Vector Explorer reads a
+  RocketRide Vector store through those tools, so its template turns **Expose
+  as tools** on for both stores and **Allow writes through tools** on for
+  `store_1`. In a pipeline of your own, set `expose_tools` (and, to remove
+  documents, `allow_write` and `allow_writes`) under `config.cloud`. On this
+  node, **Allow writes through tools** is also the one switch for agent
+  writes.
 - **No Tools source? The card is read-only.** A pipeline with a vector store
   but no running Tools source, such as an ordinary RAG chat pipeline, is still
   listed, marked **Read-only** and reached through its Chat (or else Ingest)

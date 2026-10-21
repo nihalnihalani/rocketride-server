@@ -56,9 +56,13 @@ function makeTestAction() {
 		description: 'Testing shared',
 		run: async (ctx, task) => {
 			// Pass explicit paths: `scripts` arg breaks on Node 26, `*.test.mjs` glob breaks on Node 20.
-			const scriptTests = (await readdir(SCRIPTS_DIR)).filter((f) => f.endsWith('.test.mjs')).map((f) => path.join('scripts', f));
+			const scriptTests = (await readdir(SCRIPTS_DIR))
+				.filter((f) => f.endsWith('.test.mjs'))
+				.map((f) => path.join('scripts', f));
 			// Both extensions: pure-logic suites are .test.ts, component suites .test.tsx.
-			const componentTests = (await readdir(SRC_DIR, { recursive: true })).filter((f) => f.endsWith('.test.tsx') || f.endsWith('.test.ts')).map((f) => path.join('src', f));
+			const componentTests = (await readdir(SRC_DIR, { recursive: true }))
+				.filter((f) => f.endsWith('.test.tsx') || f.endsWith('.test.ts'))
+				.map((f) => path.join('src', f));
 			const testFiles = [...scriptTests, ...componentTests];
 
 			// Fail rather than pass silently. The suites are tracked source, so an
@@ -67,13 +71,19 @@ function makeTestAction() {
 			// returning cleanly would report the whole suite green while nothing
 			// at all had run.
 			if (testFiles.length === 0) {
-				throw new Error(`No shared test files found under ${SCRIPTS_DIR} or ${SRC_DIR} — the suites are tracked source and must be present`);
+				throw new Error(
+					`No shared test files found under ${SCRIPTS_DIR} or ${SRC_DIR} — ` +
+						'the suites are tracked source and must be present'
+				);
 			}
 
 			for (const dir of REQUIRED_TEST_DIRS) {
 				const prefix = dir + path.sep;
 				if (!testFiles.some((f) => f.startsWith(prefix))) {
-					throw new Error(`No test files found under ${path.join(APP_ROOT, dir)} — its suites are tracked source and must be present`);
+					throw new Error(
+						`No test files found under ${path.join(APP_ROOT, dir)} — ` +
+							'its suites are tracked source and must be present'
+					);
 				}
 			}
 
@@ -85,13 +95,27 @@ function makeTestAction() {
 			// replaces it (scripts/lib/appModule.js).
 			await execCommand('npx', ['tsc', '-p', 'tsconfig.test.json', '--noEmit'], { task, cwd: APP_ROOT });
 
-				// stub-css: no-op loader for stylesheet imports the shell barrel
-				// side-effect-pulls (Tabulator CSS) — node cannot execute CSS.
-				// stub-shell: runtime stand-in for the 'shell'/'rocketride'
-				// platform modules, which only exist inside a running shell.
-				// './' prefix required: a bare relative path in --require is
-				// resolved as a package name, not a file.
-				await execCommand('node', ['--require', './scripts/stub-css.cjs', '--require', './scripts/stub-shell.cjs', '--import', 'tsx', '--test', '--test-reporter=spec', ...testFiles], { task, cwd: APP_ROOT });
+			// stub-css: no-op loader for stylesheet imports the shell barrel
+			// side-effect-pulls (Tabulator CSS) — node cannot execute CSS.
+			// stub-shell: runtime stand-in for the 'shell'/'rocketride'
+			// platform modules, which only exist inside a running shell.
+			// './' prefix required: a bare relative path in --require is
+			// resolved as a package name, not a file.
+			await execCommand(
+				'node',
+				[
+					'--require',
+					'./scripts/stub-css.cjs',
+					'--require',
+					'./scripts/stub-shell.cjs',
+					'--import',
+					'tsx',
+					'--test',
+					'--test-reporter=spec',
+					...testFiles,
+				],
+				{ task, cwd: APP_ROOT }
+			);
 		},
 	};
 }

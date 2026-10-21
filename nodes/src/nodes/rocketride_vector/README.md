@@ -1,9 +1,9 @@
 # rocketride_vector
 
 A RocketRide vector store node that stores embedded document chunks and retrieves
-them by keyword or semantic similarity from your organization's managed
-RocketRide database. Pick it over the SQL and graph nodes for retrieval-augmented
-document search.
+them by keyword or semantic similarity from a managed RocketRide database: your
+organization's, your team's or your own (see Database). Pick it over the SQL and
+graph nodes for retrieval-augmented document search.
 
 ## What it does
 
@@ -12,9 +12,11 @@ A batch that carries a document's first chunk replaces every chunk stored for
 that document; a later batch of the same document adds its chunks, so a long
 document that the embedding node sends in several batches is stored whole.
 Questions can produce matching documents, answers, or enriched questions through
-the three configured question outputs. The node is also a tool: an agent can
-search the table and manage its documents, and the Vector Explorer app browses,
-maps and edits it through a Tools source.
+the three configured question outputs. The same store can be offered to an agent
+or app as tools once Expose as tools is on, and the Vector Explorer app browses,
+maps and edits it through a Tools source; the write tools also need Allow writes
+through tools. Both are off by default because the table lives in a managed
+database. There is no raw-SQL execution surface.
 
 It stores through the same pgvector driver as the PostgreSQL store
 (`store_postgres`); the two differ only in how they reach the database and in
@@ -31,34 +33,66 @@ their configuration.
 
 ## As a tool
 
-The tool-server name is `rocketride_vector`.
+An agent node in the same pipeline sees each function as
+`<node id>.<function>`, where the node id is this node's id in the pipeline
+(for example `rrvector_1.search`). An app calls `client.tool` with the bare
+function name and this node's id (`tool='search', node_id='rrvector_1'`); with
+no node id the call goes to the first node in the pipeline that owns a tool of
+that name. The functions are offered only while Expose as tools is on, which
+is off by default because the table lives in a managed database and `objdir`
+and `get` together return all of it. The write functions (`upsert`, `delete`,
+and the Vector Explorer's `remove_document`) are offered only while Allow
+writes through tools is also on, because they change that table. While a
+switch is off the affected functions are left out of the tool list: an agent's
+call fails with "not found in tool catalog", an app's `client.tool` call fails
+with the engine's "No handler found for tool" error, and a direct call returns
+a failure object naming the switch.
+`examples/rocketride-vector-agent.pipe` in the repository is a chat agent
+wired to this node's tools.
 
 | Function | Description |
 | --- | --- |
-| `search` | Searches the table for a non-empty `query`; accepts an optional `top_k` and a metadata `filter`, and returns matching content, metadata and scores. Needs an embedding provider bound to the node. |
-| `upsert` | Adds or replaces documents from a non-empty `documents` array; each needs `content` and an `object_id`. |
-| `delete` | Removes every chunk of the documents in a non-empty `object_ids` array. |
-| `objdir` | Lists the stored document paths, optionally under a `parent` path, with `offset` and `limit`. |
-| `get` | Returns the chunks of one `object_id` in chunk order, with `offset` and `limit`. |
+| `search` | Searches the store for a non-empty `query`; accepts optional `top_k` and a metadata `filter` (`objectId`, `nodeId`, `parent`) and returns matching content, metadata, and scores. Needs the node's Embedding setting (the embedding sub-block under Parameters) configured; without it the tool returns a failure object naming the node. |
+| `objdir` | Lists the stored document paths, optionally under a `parent` path, with `offset` and `limit`. Deleted documents and the collection's control record are not listed. |
+| `get` | Returns up to `limit` chunks of one document by `object_id`, sorted by chunk ID; use `offset` to retrieve subsequent pages. The reply carries `total` (the document's chunk count), `has_more`, and `truncated`. The tool pages the document itself, so `offset` behaves the same on every store; a document is read up to 10,000 chunks, and `truncated` is true when that ceiling was hit. |
 | `stats` | Reports the number of stored rows, the embedding model and the vector size. |
+| `upsert` | Adds or replaces a non-empty `documents` array; each needs `content` and an `object_id`. Offered only while writes are allowed. |
+| `delete` | Removes every chunk of the documents in a non-empty `object_ids` array. Offered only while writes are allowed. |
 
-`upsert` and `delete` change the table. When an agent in the pipeline calls
-them, Allow agent writes decides; when a Tools source calls them (an SDK script,
-or the Vector Explorer), Allow document management from tool calls decides, and
-it is off by default. A call the engine did not identify as coming from an
-agent or a Tools source is always refused. The collection's control record
-(object ID `schema`) can never be removed or overwritten through a tool.
+The Vector Explorer reads the store through the same tool surface (`dialect`,
+`documents`, `chunks`, `vectors`, `sample`, `project`, `neighbors` and the
+other functions of the vector tool contract), so it too needs Expose as tools.
+
+Past those two switches, every write still passes the store's write gate. An
+agent's `upsert` or `delete` goes through. A call from a Tools source (an SDK
+script, or the Vector Explorer) also needs Allow document management from tool
+calls, which is off by default, and must come from a Tools source of the
+pipeline, addressed to this node. A call the engine did not identify as coming
+from an agent or a Tools source is always refused. The collection's control
+record (object ID `schema`) can never be removed or overwritten through a tool.
+
+A refused call or an invalid input returns `{"success": false, "code": "...",
+"error": "..."}` (a call refused by one of the two switches above carries no
+`code`). `get` and `objdir` require integer pagination values, with `offset` at
+least 0 and `limit` at least 1; missing or null values use the defaults
+(offset 0, limit 100 for `get` and 1000 for `objdir`), and larger limits are
+capped at those values.
 
 ## Configuration
 
 The single cloud profile provides a table, cosine similarity, a score threshold,
-and HNSW index defaults. RocketRide provisions one database per organization for
-its managed database nodes (per user only where there is no organization), and
-the RocketRide server resolves the connection to it from the pipeline's
-organization instead of a host, user, password, or database name you enter;
-nothing in the node configuration or the pipeline can point it at another
-database. Bind an embedding module for semantic search; the embedding dimension
-is taken from the first stored document rather than from a configuration field.
+and HNSW index defaults. The node uses the managed database chosen under
+Database (Organization by default); the RocketRide server authorizes it for the
+run and delivers its connection at task start, instead of a host, user,
+password, or database name you enter, and no such key in the node
+configuration can point it at another database. On a server without a
+RocketRide cloud database (for example, a local or self-hosted engine with no
+database broker) the task fails at start with a message that says so; use
+PostgreSQL (pgvector), provider `postgres`, with your own connection settings
+there. On RocketRide Cloud, missing broker configuration is a server
+configuration error: contact the server operator to restore it and retry. Bind
+an embedding module for semantic search; the embedding dimension is taken from
+the first stored document rather than from a configuration field.
 
 ### Table
 
@@ -98,19 +132,75 @@ supported ranges (m 2–100 and ef_construction 4–1,000), and ef_construction 
 raised to at least twice m. These values do not rebuild an index that already
 exists.
 
-### Write switches
+### Tool Server Name
 
-Allow document management from tool calls (`allow_writes`) is off by default.
-Turn it on in the pipeline whose Tools source should be able to remove documents
-from the table, for example the pipeline the Vector Explorer manages. Even when
-it is on, a removal is accepted only from a Tools source of the pipeline,
-addressed to this node; calls from the pipeline's chat or ingest sources are
-refused. Because the table is shared by the organization's pipelines, removing a
-document removes it for all of them.
+The tool-server name defaults to `rrvector`. It labels this node in the
+messages the tool functions return (for example a refused write names
+`rrvector.delete`); agents and apps address the functions by the node's
+pipeline id, which already keeps several vector stores apart.
 
-Allow agent writes (`agent_writes`) is on by default and keeps an agent's
-`upsert` and `delete` calls working as before. Turn it off when the agents of
-this pipeline should only search.
+### Expose as tools
+
+Off by default. When off, the node offers no tool functions: an agent's call
+fails with "not found in tool catalog", an app's with the engine's "No handler
+found for tool" error, and a direct call returns a failure object. The
+documents and questions lanes are unaffected. Turn it on only for a pipeline
+whose agent or app is meant to read this table through tools. These reads are
+not restricted to the matches above the questions lane's score threshold;
+`objdir` still lists only one object ID per distinct parent path.
+
+### Allow writes through tools
+
+Off by default, and read only while Expose as tools is on. When off, `upsert`
+and `delete` are not offered: an agent's call fails with "not found in tool
+catalog", an app's with the engine's "No handler found for tool" error.
+`search`, `objdir`, `get`, and `stats` keep working, and the documents lane
+still writes. Turn it on only for a pipeline whose agent or app is meant to
+manage the documents in this table.
+
+### Allow document management from tool calls
+
+Off by default (`allow_writes`), and read only while Expose as tools and Allow
+writes through tools are on. Turn it on in the pipeline whose Tools source
+should be able to add and remove documents in the table, for example the
+pipeline the Vector Explorer manages. Even when it is on, a write is accepted
+only from a Tools source of the pipeline, addressed to this node; calls from
+the pipeline's chat or ingest sources are refused. Because the table is shared
+by every pipeline that names it in the same database, removing a document
+removes it for all of them. Agents need only Allow writes through tools.
+
+### Database
+
+Database picks which RocketRide cloud database the node uses. It defaults to
+Organization, so existing pipelines keep using the database they already had.
+
+- **Organization**: the database shared by everyone in the organization the
+  pipeline runs in. Data from before this choice existed lives here.
+- **Team**: the database of the run's team. A run from the builder uses your
+  current dev team and needs run rights (task.control) on it; a deployed
+  pipeline uses the team it is billed to.
+- **Personal**: your own database in this organization. It works only when you
+  are the person running the pipeline: builder runs, store apps you run, and
+  pipelines you deploy for yourself (@me). A pipeline deployed for a team has
+  no person behind it, so it fails at start with an error that says so.
+  Organization admins can reach members' personal databases, and that access
+  is logged.
+
+Each choice is a separate database. Switching does not move or copy data, and
+a database you have not used yet is created empty on the first run that needs
+it. Documents indexed into one database are not searchable from another; after
+switching, send your documents through again to index them into the new one.
+
+A pipeline exposed through a public link (a chat, dropper, webhook, Discord or
+Telegram source) runs as you, so visitors' requests use your team or personal
+database, not their own.
+
+Access is checked when the run starts. If the run may not use the chosen
+database, it does not start, and the error says which database and why. A
+self-hosted engine supports only Organization; Team and Personal fail at start
+because they need RocketRide cloud. Access is approved for the whole run, not
+each node: every node in a run can reach every database the run was approved
+for.
 
 ## Notes
 
@@ -152,15 +242,19 @@ pooler. Errors never name the database server, user or database.
 
 | Field | Type | Description | Default |
 |---|---|---|---|
-| `rrvector.agent_writes` | `boolean` | **Allow agent writes**<br/>Lets an agent in this pipeline call the upsert and delete tools. | `true` |
-| `rrvector.allow_writes` | `boolean` | **Allow document management from tool calls**<br/>Lets a Tools source of this pipeline remove documents through tool calls (the Vector Explorer's trash can, and the delete and upsert tools). Off by default. The table is shared by every pipeline of the organization that names it. | `false` |
+| `rrvector.allow_write` | `boolean` | **Allow writes through tools**<br/>Permit the upsert and delete tool functions to change this table in your RocketRide cloud database. Applies only while Expose as tools is on. Leave OFF unless a trusted application or agent needs to manage documents through tools; the documents lane and the read tools (search, objdir, get, stats) are unaffected. | `false` |
+| `rrvector.allow_writes` | `boolean` | **Allow document management from tool calls**<br/>Lets a Tools source of this pipeline add and remove documents through tool calls (the Vector Explorer's trash can, and the upsert, delete and remove_document tools). Off by default, and read only while Expose as tools and Allow writes through tools are on. The table is shared by every pipeline that names it in the same database. | `false` |
 | `rrvector.collection` | `string` | **Table**<br/>Name of the table to store vectors in your RocketRide cloud database. | `"rocketride"` |
+| `rrvector.expose_tools` | `boolean` | **Expose as tools**<br/>Offer this table to agents and apps as tool functions: search, objdir, get and stats, plus upsert and delete when writes through tools are allowed. Leave OFF unless a trusted application or agent in this pipeline is meant to read the table through tools; objdir and get together return the whole table, not only the matches the questions lane returns. The documents and questions lanes are unaffected. | `false` |
 | `rrvector.hnsw_ef_construction` | `integer` | **HNSW ef_construction**<br/>HNSW build-time candidate list size used when the index is first created. | `64` |
 | `rrvector.hnsw_m` | `integer` | **HNSW m**<br/>HNSW graph degree (max connections per layer) used when the index is first created. | `16` |
 | `rrvector.profile` | `string` | **RocketRide cloud database**<br/>Connect to... | `"cloud"` |
 | `rrvector.provider` | `string` |  | const: `"rocketride_vector"` |
+| `rrvector.scope` | `string` | **Database**<br/>Organization (default): shared by everyone in the organization. Team: the run's team (your current dev team, or the team a deploy is billed to). Personal: your own, for runs you start yourself. Each is a separate database: switching doesn't move data, and a new one starts empty. | `"org"` |
 | `rrvector.score` | `number` | **Score threshold**<br/>Minimum similarity score for a document to be returned by search. | `0.5` |
+| `rrvector.serverName` | `string` | **Tool Server Name**<br/>Label for this store in the messages its tool functions return (for example a refused write names rrvector.delete). Agents see the functions as <node id>.search, objdir, get, stats, and upsert / delete when writes through tools are allowed; apps call client.tool with the function name and the node id. | `"rrvector"` |
 | `rrvector.similarity` | `string` | **Similarity Metric**<br/>The similarity metric to use for vector search. Also selects the HNSW index operator class. | `"cosine"` |
+| `rrvector.target` | `string` | **Team or user**<br/>Another team's or user's database (admins only). Leave empty to use your own team's or your own | `""` |
 
 ## Dependencies
 

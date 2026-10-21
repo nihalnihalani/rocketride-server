@@ -23,7 +23,7 @@
 
 /**
  * Build tasks for @rocketride/nodes
- * 
+ *
  * Commands:
  *   build - Sync nodes to dist
  *   test  - Run node integration tests (starts test server automatically)
@@ -33,42 +33,66 @@ const path = require('path');
 const os = require('os');
 const fs = require('fs');
 const {
-    exists,
-    syncDir,
-    syncFile,
-    readDirSafe,
-    readJson,
-    formatSyncStats,
-    removeDir,
-    getSharedName,
-    getSymName,
-    PROJECT_ROOT, BUILD_ROOT, DIST_ROOT,
-    startServer,
-    stopServer,
-    execCommand,
-    runPytest,
-    splitPytestOpts,
-    withoutXdistArgs,
-    hasDistMode,
-    collectPytestReport,
-    parallel,
-    bracket,
-    parseServerAddress
+	syncDir,
+	syncFile,
+	formatSyncStats,
+	isDirectory,
+	removeDir,
+	PROJECT_ROOT,
+	BUILD_ROOT,
+	DIST_ROOT,
+	OVERLAY_ROOT,
+	startServer,
+	stopServer,
+	execCommand,
+	runPytest,
+	splitPytestOpts,
+	withoutXdistArgs,
+	hasDistMode,
+	collectPytestReport,
+	parallel,
+	bracket,
+	parseServerAddress,
+	isLinux,
+	loadPackageJson,
 } = require('../../scripts/lib');
+const { stageNodeLibrary, makeNodeModule } = require('./node-build');
 
 const PACKAGE_DIR = path.join(__dirname, '..');
-const SRC_DIR = path.join(PACKAGE_DIR, 'src', 'nodes');
+
+// Map of node name -> project or overlay src/nodes directory. Overlay node wins over project node.
+const SRC_NODE_DIRS = new Map(
+	[
+		path.join(PACKAGE_DIR, 'src', 'nodes'),
+		...(OVERLAY_ROOT ? [path.join(OVERLAY_ROOT, 'nodes', 'src', 'nodes')] : []),
+	]
+		.filter((srcDir) => fs.existsSync(srcDir))
+		.flatMap((srcDir) => fs.readdirSync(srcDir).map((name) => [name, srcDir]))
+);
 const TEST_DIR = path.join(PACKAGE_DIR, 'test');
 const DIST_DIR = path.join(DIST_ROOT, 'server', 'nodes');
 
-// Build inputs of the c++ and java nodes, not copied into dist
-const IGNORE = ['**/CMakeLists.txt', '**/src/**', '**/lib/**', '**/scripts/**', '**/target/**'];
+// Build inputs or runtime files - none of it belongs in dist.
+const IGNORE = ['**/CMakeLists.txt', '**/src/**', '**/lib/**', '**/scripts/**', '**/target/**', '**/__pycache__/**'];
 
 // Engine (built by server:build; execCommand resolves extension on Windows)
 const ENGINE = path.join(DIST_ROOT, 'server', 'engine');
 
-// Where cmake leaves the c++ node binaries
-const BUILD_NODES_DIR = path.join(BUILD_ROOT, 'nodes');
+// A builder module of a node's own, by the names the registry discovers
+const hasOwnModule = (nodeDir) =>
+	['tasks.js', 'tasks.cjs'].some((file) => fs.existsSync(path.join(nodeDir, 'scripts', file)));
+
+// A c++ node is one with a CMakeLists.txt and without a module of its own.
+const CPP_NODES = [...SRC_NODE_DIRS]
+	.filter(
+		([name, srcDir]) =>
+			fs.existsSync(path.join(srcDir, name, 'CMakeLists.txt')) && !hasOwnModule(path.join(srcDir, name))
+	)
+	.map(([name, srcDir]) => ({ name, srcDir }));
+
+const CPP_NODE_BUILDS = [...SRC_NODE_DIRS]
+	.filter(([name, srcDir]) => fs.existsSync(path.join(srcDir, name, 'CMakeLists.txt')))
+	.map(([name]) => `${name}:build`);
 
 // Live database suites. Each one drives a real driver against a real server and
 // stubs the engine surface itself, so it needs no test server; but it must run
@@ -80,28 +104,28 @@ const BUILD_NODES_DIR = path.join(BUILD_ROOT, 'nodes');
 // so does a suite in which nothing passed or a test that skipped without a
 // deliberate "NOT RUN:" reason.
 const DB_LIVE_SUITES = [
-    'test_rocketride_db_full.py',
-    'test_rocketride_graph_full.py',
-    'test_graph_age_full.py',
-    'test_graph_drivers_full.py',
-    'test_graph_neo4j_full.py',
-    'test_graph_falkordb_full.py',
-    // Regenerates graph-ui's wire fixtures (apps/graph-ui/tests/fixtures/v1) and compares.
-    'test_graph_wire_fixtures_full.py',
-    // Starts dist/server's engine itself and calls the shipped Graph Explorer
-    // templates' graph tools through the SDK: the one suite that is not stubbed.
-    'test_graph_toolpath_full.py',
-    // Vector Explorer: the shared pgvector driver behind store_postgres, and the
-    // Qdrant and Chroma drivers, on new and legacy-shaped collections
-    // (test_rocketride_db_full.py above covers rocketride_vector).
-    'test_store_postgres_full.py',
-    'test_store_qdrant_full.py',
-    'test_store_chroma_full.py',
-    // Starts dist/server's engine and calls the shipped Vector Explorer
-    // templates' store and embed tools through the SDK.
-    'test_vector_toolpath_full.py',
-    // Regenerates vector-ui's wire fixtures (apps/vector-ui/tests/fixtures/v1/live) and compares.
-    'test_vector_wire_fixtures_full.py',
+	'test_rocketride_db_full.py',
+	'test_rocketride_graph_full.py',
+	'test_graph_age_full.py',
+	'test_graph_drivers_full.py',
+	'test_graph_neo4j_full.py',
+	'test_graph_falkordb_full.py',
+	// Regenerates graph-ui's wire fixtures (apps/graph-ui/tests/fixtures/v1) and compares.
+	'test_graph_wire_fixtures_full.py',
+	// Starts dist/server's engine itself and calls the shipped Graph Explorer
+	// templates' graph tools through the SDK: the one suite that is not stubbed.
+	'test_graph_toolpath_full.py',
+	// Vector Explorer: the shared pgvector driver behind store_postgres, and the
+	// Qdrant and Chroma drivers, on new and legacy-shaped collections
+	// (test_rocketride_db_full.py above covers rocketride_vector).
+	'test_store_postgres_full.py',
+	'test_store_qdrant_full.py',
+	'test_store_chroma_full.py',
+	// Starts dist/server's engine and calls the shipped Vector Explorer
+	// templates' store and embed tools through the SDK.
+	'test_vector_toolpath_full.py',
+	// Regenerates vector-ui's wire fixtures (apps/vector-ui/tests/fixtures/v1/live) and compares.
+	'test_vector_wire_fixtures_full.py',
 ];
 
 // Pooler passes: the cloud reaches tenant databases through a transaction-mode
@@ -127,300 +151,266 @@ const DB_EXPECTED_SKIP_PREFIX = 'NOT RUN:';
  * ('0', 'false', 'no' and 'off' mean no), otherwise the action's default.
  */
 function dbTestsRequired(byDefault) {
-    const raw = String(process.env.RR_REQUIRE_DB_TESTS || '').trim().toLowerCase();
-    if (!raw) return !!byDefault;
-    return !['0', 'false', 'no', 'off'].includes(raw);
+	const raw = String(process.env.RR_REQUIRE_DB_TESTS || '')
+		.trim()
+		.toLowerCase();
+	if (!raw) return !!byDefault;
+	return !['0', 'false', 'no', 'off'].includes(raw);
 }
 
 // ============================================================================
 // Action Factories
 // ============================================================================
 
-function makeSyncNodesAction(options = {}) {
-    return {
-        run: async (ctx, task) => {
-            task.output = 'Scanning for changes...';
+function makeSyncNodesAction() {
+	return {
+		run: async (ctx, task) => {
+			task.output = 'Scanning for changes...';
 
-            const stats = {};
-            await syncDir(SRC_DIR, DIST_DIR, { mirror: false, package: true, ignore: IGNORE }, stats);
+			const stats = {};
 
-            if (options.overlayRoot) {
-                const overlaySrcDir = path.join(options.overlayRoot, 'nodes', 'src', 'nodes');
-                if (await exists(overlaySrcDir)) {
-                    await syncDir(overlaySrcDir, DIST_DIR, { mirror: false, package: true, ignore: IGNORE }, stats);
-                }
-            }
+			for (const [name, srcDir] of SRC_NODE_DIRS) {
+				const src = path.join(srcDir, name);
 
-            await syncNodeBinaries(stats);
+				if (await isDirectory(src)) await syncNode(name, src, stats);
+				else await syncFile(src, path.join(DIST_DIR, name), { package: true }, stats);
+			}
 
-            task.output = formatSyncStats(stats);
-        }
-    };
-}
-
-// A node folder builds exactly one library, which its services*.json name in
-// their "path". Several services may share it, so they are read as a group
-async function nodeLibrary(nodeDir) {
-    const srcDir = path.join(SRC_DIR, nodeDir);
-    const libs = new Set();
-
-    for (const file of await readDirSafe(srcDir)) {
-        if (!/^services.*\.json$/.test(file)) continue;
-
-        const services = await readJson(path.join(srcDir, file));
-        if (services.node !== 'cpp') continue;
-
-        if (typeof services.path !== 'string' || !services.path)
-            throw new Error(`${path.join(srcDir, file)}: `
-                            + 'a cpp service needs a library name in "path"');
-
-        libs.add(services.path);
-    }
-
-    if (libs.size > 1)
-        throw new Error(`The node ${nodeDir} names more than one library: `
-                        + [...libs].join(', '));
-
-    const [lib] = libs;
-    return lib ?? null;
-}
-
-async function syncNodeBinaries(stats) {
-    for (const nodeDir of await readDirSafe(BUILD_NODES_DIR)) {
-        const lib = await nodeLibrary(nodeDir);
-        if (!lib) continue;
-
-        for (const name of [getSharedName(lib), getSymName(lib)].filter(Boolean)) {
-            await syncFile(path.join(BUILD_NODES_DIR, nodeDir, name),
-                           path.join(DIST_DIR, nodeDir, name),
-                           { package: true }, stats);
-        }
-    }
+			task.output = formatSyncStats(stats);
+		},
+	};
 }
 
 function makeStartTestServerAction(options = {}) {
-    return {
-        run: async (ctx, task) => {
-            const taskserver = options.taskserver || ctx.options?.taskserver;
-            if (taskserver) {
-                const parsed = parseServerAddress(taskserver);
-                ctx.port = parsed.port;
-                task.output = `Using existing server at ${parsed.uri}`;
-                return { port: parsed.port, server: null, serverUri: parsed.uri };
-            }
+	return {
+		run: async (ctx, task) => {
+			const taskserver = options.taskserver || ctx.options?.taskserver;
+			if (taskserver) {
+				const parsed = parseServerAddress(taskserver);
+				ctx.port = parsed.port;
+				task.output = `Using existing server at ${parsed.uri}`;
+				return { port: parsed.port, server: null, serverUri: parsed.uri };
+			}
 
-            task.output = 'Starting server...';
-            let taskComplete = false;
+			task.output = 'Starting server...';
+			let taskComplete = false;
 
-            // Set ROCKETRIDE_MOCK to enable mock modules for testing
-            const mocksPath = path.join(PACKAGE_DIR, 'test', 'mocks');
+			// Set ROCKETRIDE_MOCK to enable mock modules for testing
+			const mocksPath = path.join(PACKAGE_DIR, 'test', 'mocks');
 
-            const result = await startServer({
-                script: 'ai/eaas.py',
-                trace: options.trace,
-                basePort: 40000,  // Use 40000 range for node tests
-                env: {
-                    ROCKETRIDE_MOCK: mocksPath
-                },
-                onOutput: (text) => {
-                    if (taskComplete) return;
-                    const lines = text.trim().split('\n');
-                    if (lines.length > 0) {
-                        task.output = lines[lines.length - 1];
-                    }
-                }
-            });
+			const result = await startServer({
+				script: 'ai/eaas.py',
+				trace: options.trace,
+				basePort: 40000, // Use 40000 range for node tests
+				env: {
+					ROCKETRIDE_MOCK: mocksPath,
+				},
+				onOutput: (text) => {
+					if (taskComplete) return;
+					const lines = text.trim().split('\n');
+					if (lines.length > 0) {
+						task.output = lines[lines.length - 1];
+					}
+				},
+			});
 
-            ctx.port = result.port;
-            task.output = `Server ready on port ${ctx.port} (mocks enabled)`;
-            taskComplete = true;
-            return { port: result.port, server: result.server };
-        }
-    };
+			ctx.port = result.port;
+			task.output = `Server ready on port ${ctx.port} (mocks enabled)`;
+			taskComplete = true;
+			return { port: result.port, server: result.server };
+		},
+	};
 }
 
 function makeStopTestServerAction() {
-    return {
-        run: async (ctx, task) => {
-            const bracket = ctx.brackets?.['node-test-server'];
-            if (bracket?.server) {
-                task.output = 'Stopping server...';
-                await stopServer({ server: bracket.server });
-                task.output = 'Server stopped';
-            } else {
-                task.output = 'No server to stop';
-            }
-        }
-    };
+	return {
+		run: async (ctx, task) => {
+			const bracket = ctx.brackets?.['node-test-server'];
+			if (bracket?.server) {
+				task.output = 'Stopping server...';
+				await stopServer({ server: bracket.server });
+				task.output = 'Server stopped';
+			} else {
+				task.output = 'No server to stop';
+			}
+		},
+	};
 }
 
 // Modes: 'run' (the tests), 'warmup' (download the models of the selected heavy
 // tests; options.warmup === 'plan' only lists them), 'list-skipped' (report the
 // selected tests that will be skipped). Only 'run' needs the test server.
 function makeRunPytestAction(options = {}) {
-    const mode = options.mode || 'run';
-    return {
-        run: async (ctx, task) => {
-            // Load .env for test configuration
-            require('dotenv').config({ path: path.join(PROJECT_ROOT, '.env') });
+	const mode = options.mode || 'run';
+	return {
+		run: async (ctx, task) => {
+			// Load .env for test configuration
+			require('dotenv').config({ path: path.join(PROJECT_ROOT, '.env') });
 
-            const testEnv = {
-                ...process.env,
-                ROCKETRIDE_MOCK: path.join(PACKAGE_DIR, 'test', 'mocks')
-            };
-            if (mode === 'run') {
-                const bracket = ctx.brackets?.['node-test-server'];
-                if (!bracket?.port) throw new Error('node-test-server bracket missing — server did not start');
-                testEnv.ROCKETRIDE_URI = bracket.serverUri || `http://localhost:${bracket.port}`;
-            } else if (options.taskserver) {
-                // The hardware gate needs to know the tests would run on another machine.
-                testEnv.ROCKETRIDE_URI = parseServerAddress(options.taskserver).uri;
-            }
+			const testEnv = {
+				...process.env,
+				ROCKETRIDE_MOCK: path.join(PACKAGE_DIR, 'test', 'mocks'),
+			};
+			if (mode === 'run') {
+				const bracket = ctx.brackets?.['node-test-server'];
+				if (!bracket?.port) throw new Error('node-test-server bracket missing — server did not start');
+				testEnv.ROCKETRIDE_URI = bracket.serverUri || `http://localhost:${bracket.port}`;
+			} else if (options.taskserver) {
+				// The hardware gate needs to know the tests would run on another machine.
+				testEnv.ROCKETRIDE_URI = parseServerAddress(options.taskserver).uri;
+			}
 
-            // Use absolute paths since cwd is dist/server
-            const extraArgs = ['-v', '--rootdir', PACKAGE_DIR];
+			// Use absolute paths since cwd is dist/server
+			const extraArgs = ['-v', '--rootdir', PACKAGE_DIR];
 
-            // Warmup only concerns the dynamic tests; collecting just those keeps it quick.
-            const testsDir = mode === 'warmup' ? path.join(TEST_DIR, 'test_dynamic_full.py') : TEST_DIR;
-            if (mode === 'warmup') {
-                extraArgs.unshift(path.join(TEST_DIR, 'test_dynamic.py'));
-            }
+			// Warmup only concerns the dynamic tests; collecting just those keeps it quick.
+			const testsDir = mode === 'warmup' ? path.join(TEST_DIR, 'test_dynamic_full.py') : TEST_DIR;
+			if (mode === 'warmup') {
+				extraArgs.unshift(path.join(TEST_DIR, 'test_dynamic.py'));
+			}
 
-            if (!options.test_full) {
-                extraArgs.push(
-                    '--ignore-glob', '**/test_*_full.py',
-                    '--ignore-glob', '**/test_*_full/**');
-            } else {
-                // The live database suites run in their own unmocked pass.
-                for (const suite of DB_LIVE_SUITES) {
-                    extraArgs.push('--ignore', path.join(TEST_DIR, suite));
-                }
-            }
+			if (!options.test_full) {
+				extraArgs.push('--ignore-glob', '**/test_*_full.py', '--ignore-glob', '**/test_*_full/**');
+			} else {
+				// The live database suites run in their own unmocked pass.
+				for (const suite of DB_LIVE_SUITES) {
+					extraArgs.push('--ignore', path.join(TEST_DIR, suite));
+				}
+			}
 
-            // Exclude skip_node tests by default (same as skip_nodes in pytest_generate_tests for dynamic tests)
-            const pytestTokens = splitPytestOpts(options.pytest);
-            const hasExplicitMarkers = !!options.markers
-                || pytestTokens.some(t => t === '-m' || (t.startsWith('-m') && !t.startsWith('--')));
-            if (!hasExplicitMarkers) {
-                extraArgs.push('-m', 'not skip_node');
-            }
+			// Exclude skip_node tests by default (same as skip_nodes in pytest_generate_tests for dynamic tests)
+			const pytestTokens = splitPytestOpts(options.pytest);
+			const hasExplicitMarkers =
+				!!options.markers ||
+				pytestTokens.some((t) => t === '-m' || (t.startsWith('-m') && !t.startsWith('--')));
+			if (!hasExplicitMarkers) {
+				extraArgs.push('-m', 'not skip_node');
+			}
 
-            // Additional pytest options from --pytest="-s -v"; the collect-only
-            // modes run in one process, so xdist options are dropped for them.
-            extraArgs.push(...(mode === 'run' ? pytestTokens : withoutXdistArgs(pytestTokens)));
+			// Additional pytest options from --pytest="-s -v"; the collect-only
+			// modes run in one process, so xdist options are dropped for them.
+			extraArgs.push(...(mode === 'run' ? pytestTokens : withoutXdistArgs(pytestTokens)));
 
-            // Allow filtering tests by marker or pattern
-            const markers = options.markers;
-            const pattern = options.pytestPattern;
-            if (markers) {
-                extraArgs.push('-m', markers);
-            }
-            if (pattern) {
-                extraArgs.push('-k', pattern);
-            }
+			// Allow filtering tests by marker or pattern
+			const markers = options.markers;
+			const pattern = options.pytestPattern;
+			if (markers) {
+				extraArgs.push('-m', markers);
+			}
+			if (pattern) {
+				extraArgs.push('-k', pattern);
+			}
 
-            if (mode === 'warmup') {
-                extraArgs.push(`--warmup-models=${options.warmup === 'plan' ? 'plan' : 'download'}`);
-            } else if (mode === 'list-skipped') {
-                extraArgs.push(`--list-skipped=${options.listSkipped}`);
-            } else {
-                // Parallel execution via pytest-xdist. Defaults to min(cpus, 8) when the
-                // flag is not set: empirically, cloud-LLM rate limits + node-subprocess
-                // fan-out make >8 workers counterproductive on this test shape. Explicit
-                // values (numeric or 'auto') pass through; 'off'/'0' disables xdist.
-                const parallelRaw = options.pytestParallel ?? String(Math.min(os.cpus().length, 8));
-                const parallelVal = String(parallelRaw).trim().toLowerCase();
-                if (parallelVal && parallelVal !== 'off' && parallelVal !== '0') {
-                    extraArgs.push('-n', parallelVal);
-                    // Honor @pytest.mark.xdist_group (set in conftest._params): heavy
-                    // tests (requiresHardware) share lanes, each lane on one worker, so
-                    // they don't OOM-crash workers. The marker is ignored under other
-                    // --dist modes, which conftest refuses when heavy tests are selected.
-                    // Skip if the caller already chose a distribution mode via --pytest.
-                    if (!hasDistMode(extraArgs)) {
-                        extraArgs.push('--dist', 'loadgroup');
-                    }
-                }
-            }
+			if (mode === 'warmup') {
+				extraArgs.push(`--warmup-models=${options.warmup === 'plan' ? 'plan' : 'download'}`);
+			} else if (mode === 'list-skipped') {
+				extraArgs.push(`--list-skipped=${options.listSkipped}`);
+			} else {
+				// Parallel execution via pytest-xdist. Defaults to min(cpus, 8) when the
+				// flag is not set: empirically, cloud-LLM rate limits + node-subprocess
+				// fan-out make >8 workers counterproductive on this test shape. Explicit
+				// values (numeric or 'auto') pass through; 'off'/'0' disables xdist.
+				const parallelRaw = options.pytestParallel ?? String(Math.min(os.cpus().length, 8));
+				const parallelVal = String(parallelRaw).trim().toLowerCase();
+				if (parallelVal && parallelVal !== 'off' && parallelVal !== '0') {
+					extraArgs.push('-n', parallelVal);
+					// Honor @pytest.mark.xdist_group (set in conftest._params): heavy
+					// tests (requiresHardware) share lanes, each lane on one worker, so
+					// they don't OOM-crash workers. The marker is ignored under other
+					// --dist modes, which conftest refuses when heavy tests are selected.
+					// Skip if the caller already chose a distribution mode via --pytest.
+					if (!hasDistMode(extraArgs)) {
+						extraArgs.push('--dist', 'loadgroup');
+					}
+				}
+			}
 
-            const pytest = (extra = []) => runPytest({
-                engine: ENGINE,
-                testsDir,
-                extraArgs: [...extraArgs, ...extra],
-                execOpts: { task, cwd: PACKAGE_DIR, env: testEnv },
-            });
+			const pytest = (extra = []) =>
+				runPytest({
+					engine: ENGINE,
+					testsDir,
+					extraArgs: [...extraArgs, ...extra],
+					execOpts: { task, cwd: PACKAGE_DIR, env: testEnv },
+				});
 
-            // Reports the user asked for are printed once the builder finishes.
-            if (mode === 'list-skipped' || (mode === 'warmup' && options.warmup === 'plan')) {
-                await collectPytestReport(ctx, (reportArg) => pytest([reportArg]));
-                return;
-            }
-            await pytest();
+			// Reports the user asked for are printed once the builder finishes.
+			if (mode === 'list-skipped' || (mode === 'warmup' && options.warmup === 'plan')) {
+				await collectPytestReport(ctx, (reportArg) => pytest([reportArg]));
+				return;
+			}
+			await pytest();
 
-            if (mode !== 'run') return;
+			if (mode !== 'run') return;
 
-            // The node README schema validator's own tests live at the repo
-            // root; they are part of the node contract, so they run here.
-            await runPytest({
-                engine: ENGINE,
-                testsDir: path.join(PROJECT_ROOT, 'tests', 'test_validate_node_readme.py'),
-                execOpts: { task, cwd: PROJECT_ROOT, env: testEnv },
-            });
-        }
-    };
+			// The node README schema validator's own tests live at the repo
+			// root; they are part of the node contract, so they run here.
+			await runPytest({
+				engine: ENGINE,
+				testsDir: path.join(PROJECT_ROOT, 'tests', 'test_validate_node_readme.py'),
+				execOpts: { task, cwd: PROJECT_ROOT, env: testEnv },
+			});
+		},
+	};
 }
 
 function makeDocsGenerateAction() {
-    return {
-        run: async (ctx, task) => {
-            await execCommand('node', [path.join(__dirname, 'gen-node-tables.mjs')], { task, cwd: PACKAGE_DIR });
-        }
-    };
+	return {
+		run: async (ctx, task) => {
+			await execCommand('node', [path.join(__dirname, 'gen-node-tables.mjs')], { task, cwd: PACKAGE_DIR });
+		},
+	};
 }
 
 function makeCredentialsGenerateAction() {
-    return {
-        run: async (ctx, task) => {
-            await execCommand('node', [path.join(__dirname, 'gen-credentials.mjs')], { task, cwd: PACKAGE_DIR });
-        }
-    };
+	return {
+		run: async (ctx, task) => {
+			await execCommand('node', [path.join(__dirname, 'gen-credentials.mjs')], { task, cwd: PACKAGE_DIR });
+		},
+	};
 }
 
 function makeCredentialsCheckAction() {
-    return {
-        run: async (ctx, task) => {
-            await execCommand('node', [path.join(__dirname, 'gen-credentials.mjs'), '--check'], { task, cwd: PACKAGE_DIR });
-        }
-    };
+	return {
+		run: async (ctx, task) => {
+			await execCommand('node', [path.join(__dirname, 'gen-credentials.mjs'), '--check'], {
+				task,
+				cwd: PACKAGE_DIR,
+			});
+		},
+	};
 }
 
 function makeRunContractTestsAction() {
-    return {
-        run: async (ctx, task) => {
-            await runPytest({
-                engine: ENGINE,
-                testsDir: path.join(TEST_DIR, 'test_contracts.py'),
-                extraArgs: ['-v', '--rootdir', PACKAGE_DIR],
-                execOpts: { task, cwd: PACKAGE_DIR },
-            });
-        }
-    };
+	return {
+		run: async (ctx, task) => {
+			await runPytest({
+				engine: ENGINE,
+				testsDir: path.join(TEST_DIR, 'test_contracts.py'),
+				extraArgs: ['-v', '--rootdir', PACKAGE_DIR],
+				execOpts: { task, cwd: PACKAGE_DIR },
+			});
+		},
+	};
 }
 
 // Installs nodes/test/requirements.txt: the test harness plus the node packages
 // the tests import directly, which the nodes themselves install only when a
 // pipeline first loads them. depends() applies the engine constraints.
 function makeInstallTestDepsAction() {
-    return {
-        run: async (ctx, task) => {
-            task.output = 'Installing node test dependencies...';
-            await execCommand(
-                ENGINE,
-                ['-c', 'import sys; from depends import depends; depends(sys.argv[1])', path.join(TEST_DIR, 'requirements.txt')],
-                { task, cwd: PACKAGE_DIR }
-            );
-        }
-    };
+	return {
+		run: async (ctx, task) => {
+			task.output = 'Installing node test dependencies...';
+			await execCommand(
+				ENGINE,
+				[
+					'-c',
+					'import sys; from depends import depends; depends(sys.argv[1])',
+					path.join(TEST_DIR, 'requirements.txt'),
+				],
+				{ task, cwd: PACKAGE_DIR }
+			);
+		},
+	};
 }
 
 // Runs DB_LIVE_SUITES in one process (they share database fixtures, so no
@@ -432,63 +422,67 @@ function makeInstallTestDepsAction() {
 // With RR_TEST_PGVECTOR_POOLER_DSN set, each of DB_PGVECTOR_POOLER_SUITES must
 // also pass at least one pooled case in the live pass.
 function makeRunDbPytestAction(options = {}) {
-    return {
-        run: async (ctx, task) => {
-            require('dotenv').config({ path: path.join(PROJECT_ROOT, '.env') });
-            const required = dbTestsRequired(options.requireDb);
-            const testEnv = { ...process.env };
-            delete testEnv.ROCKETRIDE_MOCK;
-            // The suites read the variable themselves (unreachable server -> fail, not skip).
-            if (required) testEnv.RR_REQUIRE_DB_TESTS = '1';
-            else delete testEnv.RR_REQUIRE_DB_TESTS;
+	return {
+		run: async (ctx, task) => {
+			require('dotenv').config({ path: path.join(PROJECT_ROOT, '.env') });
+			const required = dbTestsRequired(options.requireDb);
+			const testEnv = { ...process.env };
+			delete testEnv.ROCKETRIDE_MOCK;
+			// The suites read the variable themselves (unreachable server -> fail, not skip).
+			if (required) testEnv.RR_REQUIRE_DB_TESTS = '1';
+			else delete testEnv.RR_REQUIRE_DB_TESTS;
 
-            const reportDir = path.join(BUILD_ROOT, 'nodes-db-tests');
-            await fs.promises.mkdir(reportDir, { recursive: true });
-            const passes = [{ suites: DB_LIVE_SUITES, report: 'junit.xml', env: testEnv }];
-            const poolerDsn = String(process.env.RR_TEST_AGE_POOLER_DSN || '').trim();
-            if (poolerDsn) {
-                const directDsn = testEnv.RR_TEST_AGE_DSN || 'postgresql://rruser:rrpass@localhost:55433/rrtenant';
-                passes.push({
-                    suites: DB_POOLER_SUITES,
-                    report: 'junit-pooler.xml',
-                    env: { ...testEnv, RR_TEST_AGE_DSN: poolerDsn, RR_TEST_AGE_ADMIN_DSN: directDsn },
-                });
-            } else if (required) {
-                task.output = 'RR_TEST_AGE_POOLER_DSN is not set: the transaction-mode pooler pass is not run';
-            }
-            const pgvectorPooler = String(testEnv.RR_TEST_PGVECTOR_POOLER_DSN || '').trim();
-            if (!pgvectorPooler && required) {
-                const note = 'RR_TEST_PGVECTOR_POOLER_DSN is not set: the pgvector suites leave out their pooled cases';
-                task.output = task.output ? `${task.output}\n${note}` : note;
-            }
+			const reportDir = path.join(BUILD_ROOT, 'nodes-db-tests');
+			await fs.promises.mkdir(reportDir, { recursive: true });
+			const passes = [{ suites: DB_LIVE_SUITES, report: 'junit.xml', env: testEnv }];
+			const poolerDsn = String(process.env.RR_TEST_AGE_POOLER_DSN || '').trim();
+			if (poolerDsn) {
+				const directDsn = testEnv.RR_TEST_AGE_DSN || 'postgresql://rruser:rrpass@localhost:55433/rrtenant';
+				passes.push({
+					suites: DB_POOLER_SUITES,
+					report: 'junit-pooler.xml',
+					env: { ...testEnv, RR_TEST_AGE_DSN: poolerDsn, RR_TEST_AGE_ADMIN_DSN: directDsn },
+				});
+			} else if (required) {
+				task.output = 'RR_TEST_AGE_POOLER_DSN is not set: the transaction-mode pooler pass is not run';
+			}
+			const pgvectorPooler = String(testEnv.RR_TEST_PGVECTOR_POOLER_DSN || '').trim();
+			if (!pgvectorPooler && required) {
+				const note = 'RR_TEST_PGVECTOR_POOLER_DSN is not set: the pgvector suites leave out their pooled cases';
+				task.output = task.output ? `${task.output}\n${note}` : note;
+			}
 
-            const pytestTokens = splitPytestOpts(options.pytest);
-            for (const pass of passes) {
-                const suites = pass.suites.map((suite) => path.join(TEST_DIR, suite));
-                const report = path.join(reportDir, pass.report);
-                await fs.promises.rm(report, { force: true });
-                await runPytest({
-                    engine: ENGINE,
-                    testsDir: suites[0],
-                    extraArgs: [
-                        ...suites.slice(1),
-                        '-v', '-rs', '--rootdir', PACKAGE_DIR,
-                        '-p', 'no:xdist',
-                        `--junitxml=${report}`,
-                        ...withoutXdistArgs(pytestTokens),
-                    ],
-                    execOpts: { task, cwd: PACKAGE_DIR, env: pass.env },
-                });
-                if (required) {
-                    const xml = await fs.promises.readFile(report, 'utf8');
-                    checkRequiredDbResults(xml, pass.suites, pass.report);
-                    if (pass.suites === DB_LIVE_SUITES && pgvectorPooler) {
-                        checkPooledCases(xml, DB_PGVECTOR_POOLER_SUITES, pass.report);
-                    }
-                }
-            }
-        }
-    };
+			const pytestTokens = splitPytestOpts(options.pytest);
+			for (const pass of passes) {
+				const suites = pass.suites.map((suite) => path.join(TEST_DIR, suite));
+				const report = path.join(reportDir, pass.report);
+				await fs.promises.rm(report, { force: true });
+				await runPytest({
+					engine: ENGINE,
+					testsDir: suites[0],
+					extraArgs: [
+						...suites.slice(1),
+						'-v',
+						'-rs',
+						'--rootdir',
+						PACKAGE_DIR,
+						'-p',
+						'no:xdist',
+						`--junitxml=${report}`,
+						...withoutXdistArgs(pytestTokens),
+					],
+					execOpts: { task, cwd: PACKAGE_DIR, env: pass.env },
+				});
+				if (required) {
+					const xml = await fs.promises.readFile(report, 'utf8');
+					checkRequiredDbResults(xml, pass.suites, pass.report);
+					if (pass.suites === DB_LIVE_SUITES && pgvectorPooler) {
+						checkPooledCases(xml, DB_PGVECTOR_POOLER_SUITES, pass.report);
+					}
+				}
+			}
+		},
+	};
 }
 
 /**
@@ -496,19 +490,19 @@ function makeRunDbPytestAction(options = {}) {
  * report is a deliberate "NOT RUN:" one.
  */
 function checkRequiredDbResults(xml, suites, label = 'junit.xml') {
-    const counts = countJunitResults(xml);
-    const names = suites.map((suite) => path.basename(suite, '.py'));
-    const empty = names.filter((name) => !(counts[name]?.passed > 0));
-    if (empty.length > 0) {
-        throw new Error(`The live databases are required but no test passed in: ${empty.join(', ')} (${label})`);
-    }
-    const unexpected = names.flatMap((name) => counts[name].unexpectedSkips);
-    if (unexpected.length > 0) {
-        throw new Error(
-            `The live databases are required but ${unexpected.length} test(s) skipped without a ` +
-            `${DB_EXPECTED_SKIP_PREFIX} reason (${label}):\n  ${unexpected.join('\n  ')}`
-        );
-    }
+	const counts = countJunitResults(xml);
+	const names = suites.map((suite) => path.basename(suite, '.py'));
+	const empty = names.filter((name) => !(counts[name]?.passed > 0));
+	if (empty.length > 0) {
+		throw new Error(`The live databases are required but no test passed in: ${empty.join(', ')} (${label})`);
+	}
+	const unexpected = names.flatMap((name) => counts[name].unexpectedSkips);
+	if (unexpected.length > 0) {
+		throw new Error(
+			`The live databases are required but ${unexpected.length} test(s) skipped without a ` +
+				`${DB_EXPECTED_SKIP_PREFIX} reason (${label}):\n  ${unexpected.join('\n  ')}`
+		);
+	}
 }
 
 /**
@@ -516,96 +510,190 @@ function checkRequiredDbResults(xml, suites, label = 'junit.xml') {
  * carries "pooler" (the pgvector suites' cases through RR_TEST_PGVECTOR_POOLER_DSN).
  */
 function checkPooledCases(xml, suites, label = 'junit.xml') {
-    const names = suites.map((suite) => path.basename(suite, '.py'));
-    const counts = countJunitResults(xml);
-    const missing = names.filter((name) => !(counts[name]?.pooledPassed > 0));
-    if (missing.length > 0) {
-        throw new Error(
-            `RR_TEST_PGVECTOR_POOLER_DSN is set but no pooled case passed in: ${missing.join(', ')} (${label})`
-        );
-    }
+	const names = suites.map((suite) => path.basename(suite, '.py'));
+	const counts = countJunitResults(xml);
+	const missing = names.filter((name) => !(counts[name]?.pooledPassed > 0));
+	if (missing.length > 0) {
+		throw new Error(
+			`RR_TEST_PGVECTOR_POOLER_DSN is set but no pooled case passed in: ${missing.join(', ')} (${label})`
+		);
+	}
 }
 
 function unescapeXml(text) {
-    return text
-        .replace(/&quot;/g, '"')
-        .replace(/&apos;/g, "'")
-        .replace(/&lt;/g, '<')
-        .replace(/&gt;/g, '>')
-        .replace(/&#(\d+);/g, (_m, code) => String.fromCharCode(Number(code)))
-        .replace(/&amp;/g, '&');
+	return text
+		.replace(/&quot;/g, '"')
+		.replace(/&apos;/g, "'")
+		.replace(/&lt;/g, '<')
+		.replace(/&gt;/g, '>')
+		.replace(/&#(\d+);/g, (_m, code) => String.fromCharCode(Number(code)))
+		.replace(/&amp;/g, '&');
 }
 
 // Per-module passed/skipped/failed counts from a pytest JUnit report, with the
 // skips whose reason does not start with "NOT RUN:". Test cases are attributed
 // by the module name in their classname ("test_x" or "test_x.Class").
 function countJunitResults(xml) {
-    const counts = {};
-    const caseRe = /<testcase\b([^>]*?)(\/>|>([\s\S]*?)<\/testcase>)/g;
-    let match;
-    while ((match = caseRe.exec(xml)) !== null) {
-        const classname = (/classname="([^"]*)"/.exec(match[1]) || [])[1] || '';
-        const testName = unescapeXml((/\bname="([^"]*)"/.exec(match[1]) || [])[1] || '');
-        const module = classname.split('.').find((part) => part.startsWith('test_')) || classname;
-        const body = match[3] || '';
-        const entry = counts[module] || (counts[module] = { passed: 0, skipped: 0, failed: 0, pooledPassed: 0, unexpectedSkips: [] });
-        const skipped = /<skipped\b([^>]*)/.exec(body);
-        if (skipped) {
-            entry.skipped += 1;
-            const reason = unescapeXml((/message="([^"]*)"/.exec(skipped[1]) || [])[1] || '');
-            if (!reason.startsWith(DB_EXPECTED_SKIP_PREFIX)) entry.unexpectedSkips.push(`${module}::${testName}: ${reason}`);
-        } else if (/<(failure|error)\b/.test(body)) entry.failed += 1;
-        else {
-            entry.passed += 1;
-            if (/pooler/.test(testName)) entry.pooledPassed += 1;
-        }
-    }
-    return counts;
+	const counts = {};
+	const caseRe = /<testcase\b([^>]*?)(\/>|>([\s\S]*?)<\/testcase>)/g;
+	let match;
+	while ((match = caseRe.exec(xml)) !== null) {
+		const classname = (/classname="([^"]*)"/.exec(match[1]) || [])[1] || '';
+		const testName = unescapeXml((/\bname="([^"]*)"/.exec(match[1]) || [])[1] || '');
+		const module = classname.split('.').find((part) => part.startsWith('test_')) || classname;
+		const body = match[3] || '';
+		const entry =
+			counts[module] ||
+			(counts[module] = { passed: 0, skipped: 0, failed: 0, pooledPassed: 0, unexpectedSkips: [] });
+		const skipped = /<skipped\b([^>]*)/.exec(body);
+		if (skipped) {
+			entry.skipped += 1;
+			const reason = unescapeXml((/message="([^"]*)"/.exec(skipped[1]) || [])[1] || '');
+			if (!reason.startsWith(DB_EXPECTED_SKIP_PREFIX))
+				entry.unexpectedSkips.push(`${module}::${testName}: ${reason}`);
+		} else if (/<(failure|error)\b/.test(body)) entry.failed += 1;
+		else {
+			entry.passed += 1;
+			if (/pooler/.test(testName)) entry.pooledPassed += 1;
+		}
+	}
+	return counts;
 }
 
 function makeTestAction(options = {}) {
-    if (options.warmup && !['plan', 'off'].includes(options.warmup)) {
-        throw new Error(`--warmup=${options.warmup}: expected 'plan' or 'off'`);
-    }
-    const runName = options.test_full ? 'nodes:run-pytest-full' : 'nodes:run-pytest';
-    const steps = [
-        'server:build',
-        parallel([
-            'nodes:build',
-            'ai:build',
-            'client-python:build'
-        ], 'Build dependencies'),
-    ];
+	if (options.warmup && !['plan', 'off'].includes(options.warmup)) {
+		throw new Error(`--warmup=${options.warmup}: expected 'plan' or 'off'`);
+	}
+	const runName = options.test_full ? 'nodes:run-pytest-full' : 'nodes:run-pytest';
+	const steps = ['server:build', parallel(['nodes:build', 'ai:build', 'client-python:build'], 'Build dependencies')];
 
-    // Collect-only modes need no test server.
-    if (options.listSkipped) {
-        steps.push({ name: `${runName}:list-skipped`, action: makeRunPytestAction({ ...options, mode: 'list-skipped' }) });
-        return { description: 'Listing skipped node tests', steps };
-    }
-    if (options.test_full && options.warmup === 'plan') {
-        steps.push({ name: 'nodes:warmup-models', action: makeRunPytestAction({ ...options, mode: 'warmup' }) });
-        return { description: 'Planning node test model downloads', steps };
-    }
+	// Collect-only modes need no test server.
+	if (options.listSkipped) {
+		steps.push({
+			name: `${runName}:list-skipped`,
+			action: makeRunPytestAction({ ...options, mode: 'list-skipped' }),
+		});
+		return { description: 'Listing skipped node tests', steps };
+	}
+	if (options.test_full && options.warmup === 'plan') {
+		steps.push({ name: 'nodes:warmup-models', action: makeRunPytestAction({ ...options, mode: 'warmup' }) });
+		return { description: 'Planning node test model downloads', steps };
+	}
 
-    // The collect-only modes above report the environment as it is; test runs complete it.
-    steps.push({ name: 'nodes:install-test-deps', action: makeInstallTestDepsAction() });
+	// The collect-only modes above report the environment as it is; test runs complete it.
+	steps.push({ name: 'nodes:install-test-deps', action: makeInstallTestDepsAction() });
 
-    // Download the selected heavy tests' models before the server starts, so the
-    // downloads don't count against test timeouts. Pointless for a remote server.
-    if (options.test_full && options.warmup !== 'off' && !options.taskserver) {
-        steps.push({ name: 'nodes:warmup-models', action: makeRunPytestAction({ ...options, mode: 'warmup' }) });
-    }
-    steps.push(bracket({
-        name: 'node-test-server',
-        setup: makeStartTestServerAction(options),
-        teardown: makeStopTestServerAction(options),
-        steps: [{ name: runName, action: makeRunPytestAction(options) }]
-    }));
-    // Live database suites need no test server, only their databases.
-    if (!options.taskserver) {
-        steps.push({ name: 'nodes:run-pytest-db', action: makeRunDbPytestAction(options) });
-    }
-    return { description: 'Testing nodes', steps };
+	// Download the selected heavy tests' models before the server starts, so the
+	// downloads don't count against test timeouts. Pointless for a remote server.
+	if (options.test_full && options.warmup !== 'off' && !options.taskserver) {
+		steps.push({ name: 'nodes:warmup-models', action: makeRunPytestAction({ ...options, mode: 'warmup' }) });
+	}
+	steps.push(
+		bracket({
+			name: 'node-test-server',
+			setup: makeStartTestServerAction(options),
+			teardown: makeStopTestServerAction(options),
+			steps: [{ name: runName, action: makeRunPytestAction(options) }],
+		})
+	);
+	// Live database suites need no test server, only their databases.
+	if (!options.taskserver) {
+		steps.push({ name: 'nodes:run-pytest-db', action: makeRunDbPytestAction(options) });
+	}
+	return { description: 'Testing nodes', steps };
+}
+
+// Builds engine-base from dist/server, then the node image FROM it.
+function makeBuildImageAction(options = {}) {
+	return {
+		run: async (ctx, task) => {
+			const reason = await containerUnavailable();
+			if (reason) return skipLoudly('nodes:build-container', task, reason);
+
+			const { base, node } = await imageNames();
+			const dockerDir = path.join(PROJECT_ROOT, 'docker');
+			// The per-Dockerfile .dockerignore files need BuildKit
+			const env = { ...process.env, DOCKER_BUILDKIT: '1' };
+
+			task.output = `Building ${base}...`;
+			await execCommand(
+				'docker',
+				['build', '-f', path.join(dockerDir, 'Dockerfile.engine-base'), '-t', base, path.dirname(DIST_ROOT)],
+				{ task, env, verbose: options.verbose }
+			);
+
+			task.output = `Building ${node}...`;
+			await execCommand(
+				'docker',
+				[
+					'build',
+					'-f',
+					path.join(dockerDir, 'Dockerfile.node'),
+					'--build-arg',
+					`ENGINE_BASE=${base}`,
+					'-t',
+					node,
+					PROJECT_ROOT,
+				],
+				{ task, env, verbose: options.verbose }
+			);
+
+			task.output = `Built ${node}`;
+		},
+	};
+}
+
+// Stage 0 of the container tests: the node image as a run gets it, checked by
+// docker/test-node-image.sh (the release workflow runs the same script before
+// signing). The runtime itself (a pipeline through the container) comes with
+// its Launcher.
+function makeTestImageAction(options = {}) {
+	return {
+		run: async (ctx, task) => {
+			const reason = await containerUnavailable();
+			if (reason) return skipLoudly('nodes:test-container', task, reason);
+
+			const { node } = await imageNames();
+			task.output = `Checking ${node}...`;
+			await execCommand('sh', [path.join(PROJECT_ROOT, 'docker', 'test-node-image.sh'), node], {
+				task,
+				verbose: options.verbose,
+			});
+			task.output = `${node}: engine probe and offline installs passed`;
+		},
+	};
+}
+
+// ============================================================================
+// Utilities
+// ============================================================================
+
+async function syncNode(name, srcDir, stats) {
+	const distDir = path.join(DIST_DIR, name);
+
+	await syncDir(srcDir, distDir, { mirror: false, package: true, ignore: IGNORE }, stats);
+	await stageNodeLibrary(name, srcDir, stats);
+}
+
+async function containerUnavailable() {
+	if (!isLinux()) return 'Linux only; dist/server here is not a Linux engine. Pull a published engine-base instead';
+	try {
+		await execCommand('docker', ['info'], { stdio: 'ignore', silent: true });
+	} catch {
+		return 'no Docker daemon reachable';
+	}
+	return null;
+}
+
+function skipLoudly(taskName, task, reason) {
+	task.output = `Skipped: ${reason}`;
+	console.warn(`WARNING: ${taskName} skipped — ${reason}`);
+}
+
+// Both images carry the engine version: the task protocol is not versioned.
+async function imageNames() {
+	const { version } = await loadPackageJson();
+	return { base: `rocketride/engine-base:${version}`, node: `rocketride/node:${version}` };
 }
 
 // ============================================================================
@@ -613,55 +701,104 @@ function makeTestAction(options = {}) {
 // ============================================================================
 
 module.exports = {
-    name: 'nodes',
-    description: 'Pipeline Nodes',
+	name: 'nodes',
+	description: 'Pipeline Nodes',
 
-    actions: [
-        // Internal actions
-        { name: 'nodes:sync', action: makeSyncNodesAction },
-        { name: 'nodes:start-server', action: makeStartTestServerAction },
-        { name: 'nodes:stop-server', action: makeStopTestServerAction },
-        { name: 'nodes:run-contracts', action: makeRunContractTestsAction },
-        { name: 'nodes:docs-generate', action: makeDocsGenerateAction },
-        { name: 'nodes:credentials-generate', action: makeCredentialsGenerateAction },
-        { name: 'nodes:credentials-check', action: makeCredentialsCheckAction },
+	actions: [
+		// Internal actions
+		{ name: 'nodes:sync', action: makeSyncNodesAction },
+		{ name: 'nodes:start-server', action: makeStartTestServerAction },
+		{ name: 'nodes:stop-server', action: makeStopTestServerAction },
+		{ name: 'nodes:run-contracts', action: makeRunContractTestsAction },
+		{ name: 'nodes:docs-generate', action: makeDocsGenerateAction },
+		{ name: 'nodes:credentials-generate', action: makeCredentialsGenerateAction },
+		{ name: 'nodes:credentials-check', action: makeCredentialsCheckAction },
+		{
+			name: 'nodes:submodule-build',
+			action: () => ({
+				// Each node builds itself; the sync stages every node's sources
+				steps: [parallel(CPP_NODE_BUILDS, 'Build c++ nodes'), 'nodes:sync'],
+			}),
+		},
 
-        // Public actions (have descriptions)
-        { name: 'nodes:build', action: () => ({
-            description: 'Build nodes',
-            steps: ['server:build', 'nodes:sync', 'nodes:docs-generate', 'nodes:credentials-generate']
-        })},
-        { name: 'nodes:test', action: (options) => makeTestAction({ ...options, test_full: false }) },
-        { name: 'nodes:test-full', action: (options) => makeTestAction({ ...options, test_full: true }) },
-        // The live-database lane on its own: the databases are required unless
-        // RR_REQUIRE_DB_TESTS=0 (nodes:test keeps them optional by default).
-        { name: 'nodes:test-db', action: (options) => ({
-            description: 'Testing nodes (live databases)',
-            steps: [
-                'server:build',
-                parallel(['nodes:build', 'ai:build'], 'Build dependencies'),
-                { name: 'nodes:install-test-deps', action: makeInstallTestDepsAction() },
-                { name: 'nodes:run-pytest-db', action: makeRunDbPytestAction({ ...options, requireDb: true }) },
-            ]
-        })},
-        { name: 'nodes:test-contracts', action: () => ({
-            description: 'Testing nodes (contracts)',
-            steps: ['server:build', 'nodes:run-contracts']
-        })},
-        { name: 'nodes:clean', action: () => ({
-            description: 'Cleaning nodes',
-            run: async (ctx, task) => {
-                await removeDir(DIST_DIR);
-                task.output = 'Cleaned nodes';
-            }
-        })}
-    ]
+		// Public actions (have descriptions)
+		{
+			name: 'nodes:build',
+			action: () => ({
+				description: 'Build nodes',
+				steps: [
+					'server:build-core',
+					'nodes:submodule-build',
+					'nodes:docs-generate',
+					'nodes:credentials-generate',
+				],
+			}),
+		},
+		{
+			name: 'nodes:build-container',
+			action: (options) => ({
+				description: 'Build the node container image',
+				steps: ['nodes:build', { name: 'nodes:build-image', action: makeBuildImageAction(options) }],
+			}),
+		},
+		// Not part of nodes:test: it needs a daemon, and skips loudly without one
+		{
+			name: 'nodes:test-container',
+			action: (options) => ({
+				description: 'Test the node container image',
+				steps: ['nodes:build-container', { name: 'nodes:test-image', action: makeTestImageAction(options) }],
+			}),
+		},
+		{ name: 'nodes:test', action: (options) => makeTestAction({ ...options, test_full: false }) },
+		{ name: 'nodes:test-full', action: (options) => makeTestAction({ ...options, test_full: true }) },
+		// The live-database lane on its own: the databases are required unless
+		// RR_REQUIRE_DB_TESTS=0 (nodes:test keeps them optional by default).
+		{
+			name: 'nodes:test-db',
+			action: (options) => ({
+				description: 'Testing nodes (live databases)',
+				steps: [
+					'server:build',
+					parallel(['nodes:build', 'ai:build', 'client-python:build'], 'Build dependencies'),
+					{ name: 'nodes:install-test-deps', action: makeInstallTestDepsAction() },
+					{ name: 'nodes:run-pytest-db', action: makeRunDbPytestAction({ ...options, requireDb: true }) },
+				],
+			}),
+		},
+		{
+			name: 'nodes:test-contracts',
+			action: () => ({
+				description: 'Testing nodes (contracts)',
+				steps: ['server:build', 'nodes:run-contracts'],
+			}),
+		},
+		{
+			name: 'nodes:clean',
+			action: () => ({
+				description: 'Cleaning nodes',
+				run: async (ctx, task) => {
+					await removeDir(DIST_DIR);
+					task.output = 'Cleaned nodes';
+				},
+			}),
+		},
+	],
 };
 
+// C++ node actions
+module.exports = [module.exports, ...CPP_NODES.map(makeNodeModule)];
+
 // The live-database lane's pure helpers (nodes/test/test_db_lane_guard.py).
-module.exports.dbLane = { DB_LIVE_SUITES, DB_POOLER_SUITES, DB_PGVECTOR_POOLER_SUITES, dbTestsRequired, countJunitResults, checkRequiredDbResults, checkPooledCases };
+module.exports.dbLane = {
+	DB_LIVE_SUITES,
+	DB_POOLER_SUITES,
+	DB_PGVECTOR_POOLER_SUITES,
+	dbTestsRequired,
+	countJunitResults,
+	checkRequiredDbResults,
+	checkPooledCases,
+};
 
 // Export paths for external use
-module.exports.SRC_DIR = SRC_DIR;
 module.exports.DIST_DIR = DIST_DIR;
 module.exports.TEST_DIR = TEST_DIR;

@@ -67,7 +67,8 @@ returned as an error otherwise.
 
 `get_schema` accepts an optional `label`; an unknown label returns an `error`,
 otherwise the response includes `{database, labels, nodes, relationships}`.
-`execute` requires a non-empty raw `query` and returns `{rows, affected_rows}`;
+`execute` requires a non-empty raw `query`, accepts an optional object `params`
+whose values bind to `$name` placeholders, and returns `{rows, affected_rows}`;
 it raises an error while direct execution is disabled. With `shape: "graph"`
 it returns the `read_query` result shape plus `affected_rows` instead.
 
@@ -163,7 +164,9 @@ actual schema.
 
 **Max validation attempts** controls how many times a rejected generated query
 is repaired after Neo4j rejects it under `EXPLAIN`. The setting defaults to 5
-and accepts 1–10. Increase it only if valid requests routinely
+and accepts 1–10, the range the runtime applies: a value above 10 saved by an
+earlier version of this form, or set in a pipeline file, still runs as 10.
+Increase it only if valid requests routinely
 need additional repair attempts, since each retry calls the LLM and delays the
 answer. When all attempts fail, the node returns the database error rather than
 running the last rejected query.
@@ -175,9 +178,14 @@ agent and lane traffic: generated reads pass the Cypher safety gate and use a
 READ access-mode session. Turn it on only for a trusted caller that must issue
 raw Cypher through `execute` or `QuestionType.EXECUTE`, because that path skips
 both LLM translation and the read-only gate and can write to the database.
-Raw execution is still limited to 25,000 returned rows: in the default shape
-exceeding that limit raises an error, and with `shape: "graph"` the result is
-cut at 25,000 rows and reported as truncated (`truncated_by: "rows"`).
+Raw execution is still limited to 25,000 returned rows. In the default shape,
+exceeding that limit raises an error and rolls the statement back, so nothing
+is saved and a retry is safe; with `shape: "graph"` the result is cut at 25,000
+rows and reported as truncated (`truncated_by: "rows"`), and what the statement
+wrote stands. Batched statements are the exception: `CALL { ... } IN
+TRANSACTIONS` and, on Neo4j 4, `USING PERIODIC COMMIT`. Neo4j commits each
+batch as it runs, so a retry after the error can repeat writes; keep what these
+statements return under the limit.
 
 ## Authentication
 

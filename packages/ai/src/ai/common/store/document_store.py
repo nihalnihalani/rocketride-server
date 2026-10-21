@@ -1,5 +1,6 @@
 import functools
 import importlib
+import json
 import threading
 from abc import abstractmethod, ABC
 from typing import TYPE_CHECKING, List, Callable, Dict, Any, FrozenSet, Optional, Sequence, Tuple
@@ -1183,6 +1184,13 @@ def getStore(provider: str, connConfig: Dict[str, Any], bag: Dict[str, Any]) -> 
 
 _VECTORDB_TOOL_MAX_TOP_K = 100
 _VECTORDB_TOOL_DEFAULT_TOP_K = 10
+_VECTORDB_TOOL_MAX_OBJDIR_LIMIT = 1000
+_VECTORDB_TOOL_MAX_GET_LIMIT = 100
+# `get` pages a document itself: whether a driver's `get` honours `offset` varies
+# (Astra, Weaviate and Pinecone ignore it), so the tool fetches the document's
+# chunks once, orders them by chunkId here and slices. This is also the most
+# chunks one document can have and still be fully readable through the tool.
+_VECTORDB_TOOL_GET_FETCH_LIMIT = 10_000
 _VECTORDB_DEFAULT_SERVER_NAME = 'vectordb'
 _OBJDIR_MAX_LIMIT = 1000
 _OBJDIR_SCAN_MAX = 10000
@@ -1212,7 +1220,32 @@ class VectorStoreToolMixin(VectorExplorerExtTools, VectorExplorerTools):
     ``<serverName>.upsert`` and ``<serverName>.delete`` where ``serverName``
     comes from ``self.IGlobal.serverName`` (user-configurable via
     ``services.json``). This prevents tool-name collisions when a pipeline
-    contains more than one vectordb node.
+    contains more than one vectordb node. An agent node in the same pipeline
+    addresses them by the store node's pipeline id instead
+    (``<node id>.search``, see ``ai.common.agent``); there ``serverName``
+    only labels the tools' messages.
+
+    Two optional ``IGlobal`` switches gate the surface (``StoreGlobalBase``
+    resolves both from the node config). ``expose_tools`` decides whether the
+    node offers any tool at all: a node that does not define it exposes them,
+    a node whose store is shared or managed (``rocketride_vector`` reads and
+    writes the team's tenant database) defaults it to off, because ``objdir``
+    and ``get`` together return the whole table to any caller of the
+    pipeline's tool path. ``allow_write`` then decides whether the write tools
+    (``upsert``, ``delete`` and ``remove_document``) are among them. While a
+    switch is off the affected tools are left out of ``_collect_tool_methods``,
+    so the engine neither lists nor dispatches them (an invoke fails as a tool
+    the node has no handler for); :meth:`_vectordb_surface_refusal`, which the
+    shared tool envelope (``vectordb_tool``) runs before every tool, is a second
+    line of defence for direct calls and returns ``{"success": false, "error":
+    ...}``. The SQL nodes keep raw execution behind an ``allow_execute`` switch
+    in the same spirit (there, ``execute`` raises).
+
+    Those two switches are the outer gate: whether a tool exists for this node
+    at all. A write tool that exists still runs ``vx_write_gate.check_write``
+    first, the inner gate: who is calling (an agent, or a DAP caller through a
+    Tools source with an account or task key) and the node's per-caller switches
+    ``allow_writes`` (DAP calls) and ``agent_writes`` (agent calls).
     """
 
     # --- Configuration knobs (override via IGlobal) ------------------------
@@ -1261,6 +1294,83 @@ class VectorStoreToolMixin(VectorExplorerExtTools, VectorExplorerTools):
         name = name.strip().strip('.')
         return name or _VECTORDB_DEFAULT_SERVER_NAME
 
+    def _vectordb_allow_write(self) -> bool:
+        """Whether the ``upsert`` and ``delete`` tools may change the store.
+
+        Reads ``self.IGlobal.allow_write``. A node that does not define the
+        attribute allows writes, which keeps every existing store node as it
+        was; a node that sets it (from its configuration) decides per node.
+        A string value is parsed like a config switch, so ``'false'`` and
+        ``'0'`` are off rather than truthy.
+        """
+        from ai.common.utils import parse_bool
+
+        glb = getattr(self, 'IGlobal', None)
+        return parse_bool(getattr(glb, 'allow_write', True), default=True)
+
+    def _vectordb_write_refused(self, tool: str) -> Dict[str, Any]:
+        """The failure object a write tool returns when writes are off for this node."""
+        return {
+            'success': False,
+            'error': (
+                f'{self._vectordb_server_name()}.{tool} is disabled for this node: writes through tools are '
+                'off (set allow_write=true in the node configuration to enable)'
+            ),
+        }
+
+    def _vectordb_expose_tools(self) -> bool:
+        """Whether this node offers its tool functions at all.
+
+        Reads ``self.IGlobal.expose_tools``. A node that does not define the
+        attribute exposes its tools, which keeps every existing store node as
+        it was; a node that sets it (from its configuration) decides per node.
+        Parsed like ``allow_write``, so ``'false'`` and ``'0'`` are off.
+        """
+        from ai.common.utils import parse_bool
+
+        glb = getattr(self, 'IGlobal', None)
+        return parse_bool(getattr(glb, 'expose_tools', True), default=True)
+
+    def _vectordb_tools_refused(self, tool: str) -> Dict[str, Any]:
+        """The failure object any tool returns when the node does not expose its tools."""
+        return {
+            'success': False,
+            'error': (
+                f'{self._vectordb_server_name()}.{tool} is disabled for this node: tools are off '
+                '(set expose_tools=true in the node configuration to enable)'
+            ),
+        }
+
+    _VECTORDB_WRITE_TOOLS = frozenset(vx_write_gate.WRITE_TOOLS)
+
+    def _vectordb_surface_refusal(self, tool: str) -> Optional[Dict[str, Any]]:
+        """The outer gate for one call: None when this node offers ``tool``, else the failure object.
+
+        Run by the shared tool envelope (``vectordb_tool``) before the tool reads its
+        input, for every store tool: the tools switch first, then, for a write tool,
+        the write switch.
+        """
+        if not self._vectordb_expose_tools():
+            return self._vectordb_tools_refused(tool)
+        if tool in self._VECTORDB_WRITE_TOOLS and not self._vectordb_allow_write():
+            return self._vectordb_write_refused(tool)
+        return None
+
+    def _collect_tool_methods(self):
+        """Advertise no tools while the node does not expose them, and the write tools only when it allows writes.
+
+        The engine's ``tool.query`` discovery walks this; leaving a tool out
+        means an agent never sees a tool it cannot call (the pattern
+        ``tool_filesystem`` uses for its allow flags). A direct invocation is
+        still refused by the tools themselves.
+        """
+        if not self._vectordb_expose_tools():
+            return {}
+        methods = super()._collect_tool_methods()
+        if self._vectordb_allow_write():
+            return methods
+        return {name: method for name, method in methods.items() if name not in self._VECTORDB_WRITE_TOOLS}
+
     def _vectordb_compute_embedding(self, query_text: str) -> Optional[List[float]]:
         """Attempt to compute a query embedding for semantic search.
 
@@ -1290,10 +1400,6 @@ class VectorStoreToolMixin(VectorExplorerExtTools, VectorExplorerTools):
             return None
         return list(embedding)
 
-    # --- Tool descriptor / dispatch plumbing ------------------------------
-    #
-    # Override ``_collect_tool_methods`` so that our bare Python method
-    # names ``search``/``upsert``/``delete`` are exposed to the engine as
     # --- Tool methods ------------------------------------------------------
 
     @tool_function(
@@ -1821,11 +1927,13 @@ class VectorStoreToolMixin(VectorExplorerExtTools, VectorExplorerTools):
                 },
                 'offset': {
                     'type': 'integer',
+                    'minimum': 0,
                     'description': 'Number of results to skip (default 0).',
                 },
                 'limit': {
                     'type': 'integer',
-                    'description': 'Maximum number of results to return (default 1000).',
+                    'minimum': 1,
+                    'description': 'Maximum number of results to return (default and cap 1000).',
                 },
             },
         },
@@ -1846,7 +1954,8 @@ class VectorStoreToolMixin(VectorExplorerExtTools, VectorExplorerTools):
         """List unique document paths in this vector store.
 
         ``paths`` maps each path to an objectId as before; the control record is never
-        listed and ``limit`` is clamped to 1..1000. On a driver with a native document
+        listed. ``offset`` must be 0 or more and ``limit`` 1 or more (at most 1000 are
+        returned). On a driver with a native document
         listing (``listDocuments``), ``entries`` lists every document (path and objectId,
         equal paths not collapsed) and deleted documents are left out. On any other
         driver the answer is the driver's own ``getPaths`` page, as before: the default
@@ -1855,13 +1964,14 @@ class VectorStoreToolMixin(VectorExplorerExtTools, VectorExplorerTools):
         store = self._vectordb_store()
 
         parent = args.get('parent', None)
+        from ai.common.utils import optional_int
+
         try:
-            offset = int(args.get('offset', 0))
-            limit = int(args.get('limit', 1000))
-        except (TypeError, ValueError):
-            raise ToolRefusal('INVALID_INPUT', 'offset and limit must be valid integers') from None
-        offset = max(0, offset)
-        limit = max(1, min(limit, _OBJDIR_MAX_LIMIT))
+            offset = optional_int(args, 'offset', default=0, lo=0, tool_name='objdir')
+            limit = optional_int(args, 'limit', default=_OBJDIR_MAX_LIMIT, lo=1, tool_name='objdir')
+        except ValueError as exc:
+            raise ToolRefusal('INVALID_INPUT', str(exc)) from None
+        limit = min(limit, _OBJDIR_MAX_LIMIT)
 
         entries: Optional[List[Dict[str, str]]] = None
         if 'listDocuments' in store.capabilities():
@@ -1939,11 +2049,13 @@ class VectorStoreToolMixin(VectorExplorerExtTools, VectorExplorerTools):
                 },
                 'offset': {
                     'type': 'integer',
-                    'description': 'Number of chunks to skip (default 0).',
+                    'minimum': 0,
+                    'description': 'Number of chunks to skip (default 0); pages are ordered by chunk ID on every store.',
                 },
                 'limit': {
                     'type': 'integer',
-                    'description': 'Maximum number of chunks to return (default 100).',
+                    'minimum': 1,
+                    'description': 'Maximum number of chunks to return (default and cap 100).',
                 },
             },
         },
@@ -1961,22 +2073,33 @@ class VectorStoreToolMixin(VectorExplorerExtTools, VectorExplorerTools):
                         },
                     },
                 },
-                'total': {'type': 'integer'},
+                'total': {'type': 'integer', 'description': 'Chunks the document has (up to 10000).'},
+                'offset': {'type': 'integer'},
+                'has_more': {'type': 'boolean', 'description': 'Whether a page follows this one.'},
+                'truncated': {
+                    'type': 'boolean',
+                    'description': 'True when the document hit the 10000-chunk read ceiling: total and the last page may be incomplete.',
+                },
                 'success': {'type': 'boolean'},
             },
         },
-        description='Retrieve document chunks by objectId from the vector database.',
+        description=(
+            'Retrieve document chunks by objectId from the vector database, in pages of up to 100 '
+            "ordered by chunk ID; `total` is the document's chunk count and `has_more` says whether "
+            'another page follows. A document is read up to 10000 chunks; `truncated` is true when that '
+            'ceiling was hit.'
+        ),
     )
     @vectordb_tool
     def get(self, args):
-        """Retrieve document chunks by objectId, in chunk order (``has_more`` says whether more follow).
+        """Retrieve document chunks by objectId, in pages ordered by chunk ID.
 
-        ``offset`` is a chunk id, not a row count: the page starts at the first stored chunk
-        whose id is ``offset`` or more (the next page starts after the last ``chunkId``
-        returned). For a document whose chunk ids run 0, 1, 2, ... this is the row offset
-        it always was; with gaps in the ids, ``offset`` 0 still starts at the first stored
-        chunk. The descriptor text ("chunks to skip") is unchanged so agents see the same
-        catalog.
+        offset counts chunks after that sort, total is the document's chunk count
+        and has_more says whether another page follows. The driver is asked for the
+        whole document (up to _VECTORDB_TOOL_GET_FETCH_LIMIT chunks; truncated says
+        when that ceiling was hit) and the page is cut here, so offset means the same
+        on every backend. The Vector Explorer pages a document by chunk id through the
+        chunks tool instead.
         """
         store = self._vectordb_store()
 
@@ -1984,15 +2107,25 @@ class VectorStoreToolMixin(VectorExplorerExtTools, VectorExplorerTools):
         if not object_id:
             raise ToolRefusal('INVALID_INPUT', 'object_id is required')
 
-        try:
-            offset = int(args.get('offset', 0))
-            limit = int(args.get('limit', 100))
-        except (TypeError, ValueError):
-            raise ToolRefusal('INVALID_INPUT', 'offset and limit must be valid integers') from None
-        offset = max(0, offset)
-        limit = max(1, min(limit, VECTOR_TOOL_LIMITS['chunks_page']))
+        from ai.common.utils import optional_int
 
-        page = store.scrollChunks(object_id, after_chunk=offset - 1, limit=limit, deleted='active')
+        try:
+            offset = optional_int(args, 'offset', default=0, lo=0, tool_name='get')
+            limit = optional_int(args, 'limit', default=_VECTORDB_TOOL_MAX_GET_LIMIT, lo=1, tool_name='get')
+        except ValueError as exc:
+            raise ToolRefusal('INVALID_INPUT', str(exc)) from None
+
+        limit = min(limit, _VECTORDB_TOOL_MAX_GET_LIMIT)
+        # The driver is asked for the whole document (see _VECTORDB_TOOL_GET_FETCH_LIMIT);
+        # the page is cut here, so `offset` means the same on every backend.
+        doc_filter = DocFilter(
+            objectIds=[object_id],
+            offset=0,
+            limit=_VECTORDB_TOOL_GET_FETCH_LIMIT,
+            isDeleted=False,
+        )
+        docs = store.get(doc_filter)
+
         chunks = [
             {
                 'content': doc.page_content,
@@ -2007,13 +2140,32 @@ class VectorStoreToolMixin(VectorExplorerExtTools, VectorExplorerTools):
                 if hasattr(doc.metadata, '__dict__')
                 else {},
             }
-            for doc in page.docs
+            for doc in docs
         ]
 
-        # Sort by chunkId for deterministic pagination order
-        chunks.sort(key=lambda c: c.get('chunkId', 0))
+        # Deterministic page order on every store: by chunkId, then by content and
+        # metadata, so repeated chunk IDs returned in a different order on the next
+        # call cannot shift a page boundary and drop or repeat a chunk.
+        def _page_key(chunk):
+            return (
+                int(chunk.get('chunkId') or 0),
+                str(chunk.get('content') or ''),
+                json.dumps(chunk.get('metadata') or {}, sort_keys=True, default=str),
+            )
 
-        return {'success': True, 'chunks': chunks, 'total': len(chunks), 'has_more': page.has_more}
+        chunks.sort(key=_page_key)
+        total = len(chunks)
+        page = chunks[offset : offset + limit]
+
+        return {
+            'success': True,
+            'chunks': page,
+            'total': total,
+            'offset': offset,
+            'has_more': offset + limit < total,
+            # The read ceiling was reached: the document may have more than `total` chunks.
+            'truncated': len(docs) >= _VECTORDB_TOOL_GET_FETCH_LIMIT,
+        }
 
     @tool_function(
         input_schema={

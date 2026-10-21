@@ -37,7 +37,7 @@ drivers behind them.
 | Tool audience (`agent`, `dap`) | `@tool_function(audience=...)` in `packages/server/engine-lib/rocketlib-python/lib/rocketlib/filters.py` |
 | The `embed` tool on the embedding nodes | `packages/ai/src/ai/common/embed_tool.py`, used by `embedding_transformer` and `embedding_openai` |
 | Store nodes | `nodes/src/nodes/{store_postgres,rocketride_vector,store_qdrant,store_chroma,store_milvus,store_weaviate,store_pinecone,store_astra,store_atlas}/` |
-| The write switches as node fields | `vector.allow_writes` and `vector.agent_writes` in `nodes/src/nodes/core/services.common.vector.json`; `rrvector.*` on `rocketride_vector` |
+| The write switches as node fields | `vector.allow_writes` and `vector.agent_writes` in `nodes/src/nodes/core/services.common.vector.json`; on `rocketride_vector`, `rrvector.allow_writes` behind the outer switches `rrvector.expose_tools` and `rrvector.allow_write` (contract §6.0) |
 | Starting pipelines | `apps/vector-ui/templates/*.pipe` |
 | Wire fixtures and generators | `apps/vector-ui/tests/fixtures/` |
 | Live acceptance (engine, containers, stub LLM, browser lanes) | `scripts/acceptance/vector-explorer/` ([README](../../../scripts/acceptance/vector-explorer/README.md)) |
@@ -170,6 +170,11 @@ both lists to every suite the change lanes own in `lanes.json`.
 - **The gate** (contract §6.3) runs first in `remove_document`, `delete` and
   `upsert`, fails closed, and answers refusals as envelopes; the write tools
   stay listed. Agent pipelines keep writing with the defaults (`agent_writes`).
+  `rocketride_vector` is the exception (contract §6.0): its tools, and then its
+  write tools, exist only while `expose_tools` and `allow_write` are on (both
+  off by default), and `allow_write` is its one switch for agent writes. The
+  `rocketride_vector` template sets `expose_tools` on both stores and
+  `allow_write` on `store_1`.
 - **Ingest is not gated by the switch.** Files dropped on the Ingest source
   are written through the data lane; only the reserved objectId `schema` (the
   collection's control record) is refused there.
