@@ -111,10 +111,14 @@ connections and hands them to the task in `ROCKETRIDE_DB_DSNS`; nothing else in
 the pipeline, a node's configuration or the task's environment selects a
 tenant. A task takes its connections from the engine alone: a database the
 engine did not resolve for it is refused, and its database nodes never resolve
-one themselves. The connection check that runs when a node's configuration is
-saved resolves no database at all, so the engine's own environment cannot
-select one either. The connection string the broker returns must require TLS:
-an explicit `sslmode`
+one themselves. On a hosted engine, the connection check that runs when a
+node's configuration is saved (in the engine's own server process) resolves
+no database at all: it reads neither `ROCKETRIDE_DB_DSNS` nor
+`ROCKETRIDE_DB_RESOLVE_ERROR` from the engine's environment, so that
+environment cannot select a tenant either, and the check stops at the node's
+settings. An open-source engine has one tenant; there the check uses a map set
+in the engine's environment, if there is one. The connection string the broker
+returns must require TLS: an explicit `sslmode`
 of `require`, `verify-ca` or `verify-full` is used as issued, a missing one
 becomes `require`, and one that does not require TLS is refused unless every
 host it names (including libpq's `host` and `hostaddr` parameters) is on the

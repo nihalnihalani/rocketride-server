@@ -30,7 +30,9 @@ is none), and the server process, where a node's save-time ``validateConfig``
 probe runs. Neither kind ever resolves a database itself: no account call, no
 identity from the environment (``ROCKETRIDE_CLIENT_ID``), no single
 ``ROCKETRIDE_DB_DSN``, whichever account class is loaded and whatever flags
-the command line carries.
+the command line carries. A hosted engine's server process serves every
+tenant and its probe carries none, so it does not read the map, or a
+resolution error, from its own environment either.
 """
 
 from __future__ import annotations
@@ -118,6 +120,16 @@ _PROCESS_IDS = [
     'hosted-task-with-added-saas-flag',
 ]
 
+# The processes whose environment the task engine built (and the open-source
+# server, one tenant): the only ones that read a delivered map.
+_READERS = ('open-source-server', 'hosted-task', 'hosted-task-with-added-saas-flag')
+_READER_PROCESSES = [p for p, pid in zip(_PROCESSES, _PROCESS_IDS) if pid in _READERS]
+
+# A hosted engine's server process: the engine's own --saas flag or an account
+# with the saas capability, and no --hosted child flag.
+_HOSTED_SERVERS = [p for p, pid in zip(_PROCESSES, _PROCESS_IDS) if pid.startswith('hosted-server')]
+_HOSTED_SERVER_IDS = [pid for pid in _PROCESS_IDS if pid.startswith('hosted-server')]
+
 
 # ---------------------------------------------------------------------------
 # No process resolves a database itself
@@ -137,7 +149,7 @@ def test_nothing_delivered_resolves_nothing(server_env, account_cls, argv):
     assert 'some-tenant' not in str(caught.value)
 
 
-@pytest.mark.parametrize('account_cls,argv', _PROCESSES, ids=_PROCESS_IDS)
+@pytest.mark.parametrize('account_cls,argv', _READER_PROCESSES, ids=list(_READERS))
 def test_only_the_delivered_map_counts(server_env, account_cls, argv):
     """A delivered map is read for the node's key alone; nothing else in the environment is."""
     calls = _install(server_env, account_cls, argv)
@@ -149,6 +161,41 @@ def test_only_the_delivered_map_counts(server_env, account_cls, argv):
         rocketride_db.resolve_rocketride_dsn('team')
     assert calls == []
     assert SERVER_DSN not in str(caught.value) and delivered not in str(caught.value)
+
+
+@pytest.mark.parametrize('account_cls,argv', _HOSTED_SERVERS, ids=_HOSTED_SERVER_IDS)
+def test_hosted_server_never_uses_its_own_dsn_or_identity(server_env, account_cls, argv):
+    """A hosted server process with a map, a single DSN and a tenant in its own environment: nothing is taken."""
+    calls = _install(server_env, account_cls, argv)
+    server_env.setenv(rocketride_db.DB_DSNS_ENV, json.dumps({'org': SERVER_DSN, 'team:t-1': SERVER_DSN}))
+
+    for scope, target in (('org', ''), ('team', 't-1')):
+        with pytest.raises(rocketride_db.DsnNotDelivered) as caught:
+            rocketride_db.resolve_rocketride_dsn(scope, target)
+        assert SERVER_DSN not in str(caught.value)
+        assert 'some-tenant' not in str(caught.value)
+    assert calls == []
+
+
+@pytest.mark.parametrize('account_cls,argv', _HOSTED_SERVERS, ids=_HOSTED_SERVER_IDS)
+def test_hosted_server_ignores_a_resolve_error_in_its_own_environment(server_env, account_cls, argv):
+    """ROCKETRIDE_DB_RESOLVE_ERROR is the engine's message to a task, not server state."""
+    server_env.setenv(rocketride_db.DB_RESOLVE_ERROR_ENV, 'stale reason from somewhere')
+    calls = _install(server_env, account_cls, argv)
+
+    with pytest.raises(rocketride_db.DsnNotDelivered) as caught:
+        rocketride_db.resolve_rocketride_dsn()
+
+    assert 'stale reason' not in str(caught.value)
+    assert calls == []
+
+
+def test_hosted_server_still_checks_the_scope(server_env):
+    """The node's scope/target check runs first, so a save-time probe still reports a bad one."""
+    _install(server_env, _HostedAccount, ['engine', '--saas'])
+
+    with pytest.raises(ValueError, match='the org scope takes no target'):
+        rocketride_db.resolve_rocketride_dsn('org', 't-1')
 
 
 def test_the_engines_resolve_error_is_reported(server_env):

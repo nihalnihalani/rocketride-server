@@ -40,6 +40,7 @@ Stdlib only: nodes tests load this file in isolation.
 import json
 import os
 import re
+import sys
 import urllib.parse
 from collections.abc import Iterable, Mapping
 
@@ -54,6 +55,10 @@ DB_DSNS_ENV = 'ROCKETRIDE_DB_DSNS'
 # instead of a DSN, so the node can report the real cause rather than a
 # missing-identity error that nothing the user does can fix.
 DB_RESOLVE_ERROR_ENV = 'ROCKETRIDE_DB_RESOLVE_ERROR'
+
+# A hosted engine starts each task process with this flag
+# (task_engine.CONST_HOSTED_CHILD_FLAG); its own server process never has it.
+HOSTED_CHILD_FLAG = '--hosted'
 
 
 # The node providers that use a RocketRide cloud database.
@@ -143,11 +148,34 @@ def to_sqlalchemy_url(dsn: str) -> str:
     return dsn
 
 
+def _is_hosted_server() -> bool:
+    """True in the server process of a hosted (multi-tenant) engine.
+
+    Hosted means what it means to the task engine and to the startup broker
+    warning: the engine's own ``--saas`` launch flag, or an account with the
+    ``saas`` capability. A task process is never the server: a hosted engine
+    starts each one with ``--hosted`` (pipeline arguments can add flags, not
+    remove that one), and the task engine built its environment. The account
+    layer is consulted only when already loaded, as it always is in the server
+    process before any node runs, so this never imports it.
+    """
+    if HOSTED_CHILD_FLAG in sys.argv:
+        return False
+    if '--saas' in sys.argv:
+        return True
+    account = getattr(sys.modules.get('ai.account'), 'account', None)
+    return 'saas' in (getattr(account, 'capabilities', None) or ())
+
+
 def resolve_rocketride_dsn(scope: str = 'org', target: str = '') -> str:
     """Return the DSN the task engine delivered for ``(scope, target)``.
 
     Lookup order:
 
+    0. A hosted engine's server process (where a node's save-time probe
+       runs) resolves nothing: it serves every tenant and the probe carries
+       none, so it never takes a DSN, or the reason there is none, from its
+       own environment. Raises DsnNotDelivered, as outside any task.
     1. ``ROCKETRIDE_DB_DSNS``: the per-task map. A missing key raises; it
        never falls back to another database.
     2. ``ROCKETRIDE_DB_RESOLVE_ERROR``: server-side resolution failed, or the
@@ -165,6 +193,14 @@ def resolve_rocketride_dsn(scope: str = 'org', target: str = '') -> str:
     """
     scope, target = db_target({'scope': scope, 'target': target})
     key = dsn_key(scope, target)
+
+    # A hosted server process: nothing in its own environment is a delivery,
+    # whatever ROCKETRIDE_DB_DSNS or ROCKETRIDE_DB_RESOLVE_ERROR says there.
+    if _is_hosted_server():
+        raise DsnNotDelivered(
+            "a hosted engine's server process takes no RocketRide cloud database from its environment; "
+            'connectivity is checked when the pipeline runs'
+        )
 
     delivered = os.environ.get(DB_DSNS_ENV, '').strip()
     if delivered:
