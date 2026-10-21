@@ -882,7 +882,7 @@ class Store(DocumentStoreBase):
         if not objectIds:
             return
 
-        self._setDeleted(objectIds, True)
+        self._setIsDeleted(objectIds, True)
         return
 
     def markActive(self, objectIds: List[str]) -> None:
@@ -899,10 +899,10 @@ class Store(DocumentStoreBase):
         if not objectIds:
             return
 
-        self._setDeleted(objectIds, False)
+        self._setIsDeleted(objectIds, False)
         return
 
-    def _setDeleted(self, objectIds: List[str], value: bool) -> None:
+    def _setIsDeleted(self, objectIds: List[str], value: bool) -> None:
         """Set isDeleted on every record of ``objectIds`` (update takes ids and full metadata)."""
         for batch in self._idBatches(objectIds):
             results = self.collectionObj.get(where={'objectId': {'$in': batch}}, include=['metadatas'])
