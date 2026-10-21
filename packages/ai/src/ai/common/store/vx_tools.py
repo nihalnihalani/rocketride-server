@@ -63,7 +63,6 @@ from ..schema import Doc, DocFilter, QuestionText
 from . import vx_write_gate
 from .errors import StoreError, StoreUnsupported, ToolRefusal
 from .vx_defaults import (
-    VECTOR_AGENT_WRITES_DEFAULT,
     VECTOR_ALLOW_WRITES_DEFAULT,
     VECTOR_TOOL_DEFAULTS,
     VECTOR_TOOL_LIMITS,
@@ -1065,10 +1064,6 @@ class VectorExplorerTools:
         """Whether a DAP caller may write: ``allow_write`` and ``allow_writes`` both on."""
         return self._vx_outer_writes() and self._vx_switch('allow_writes', VECTOR_ALLOW_WRITES_DEFAULT)
 
-    def _vx_agent_writes(self) -> bool:
-        """Whether an agent may write: ``allow_write`` and ``agent_writes`` both on."""
-        return self._vx_outer_writes() and self._vx_switch('agent_writes', VECTOR_AGENT_WRITES_DEFAULT)
-
     @staticmethod
     def _vx_forget_counts(store: Any) -> None:
         _vx_state(store).forget_counts()
@@ -1319,7 +1314,6 @@ class VectorExplorerTools:
             'score': self._vx_score(store),
             'support': support,
             'allow_writes': self._vx_allow_writes(),
-            'agent_writes': self._vx_agent_writes(),
             'writes_scope': 'tools_source',
             'write_tools': list(WRITE_TOOLS),
             'capabilities': capabilities,
@@ -2464,7 +2458,6 @@ class VectorExplorerTools:
             'remove_document',
             object_ids=_gate_ids(args.get('object_ids')),
             allow_writes=self._vx_allow_writes(),
-            agent_writes=self._vx_agent_writes(),
         )
         ids = _strings_arg(args.get('object_ids'), 'object_ids', LIMITS['write_ids_max'])
         removed, not_found, rows = self._vx_remove(store, ids)

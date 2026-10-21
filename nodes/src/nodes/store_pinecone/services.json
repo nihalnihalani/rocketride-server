@@ -225,11 +225,11 @@
 		},
 		"pinecone.pod-based": {
 			"object": "pod-based",
-			"properties": ["vector.apikey", "vector.score", "pinecone.collection", "pinecone.serverName", "vector.allow_writes", "vector.agent_writes"]
+			"properties": ["vector.apikey", "vector.score", "pinecone.collection", "pinecone.serverName", "vector.allow_writes"]
 		},
 		"pinecone.serverless-dense": {
 			"object": "serverless-dense",
-			"properties": ["vector.apikey", "vector.score", "pinecone.collection", "pinecone.serverName", "vector.allow_writes", "vector.agent_writes"]
+			"properties": ["vector.apikey", "vector.score", "pinecone.collection", "pinecone.serverName", "vector.allow_writes"]
 		},
 		"pinecone.profile": {
 			"title": "Type of Pinecone Connection",

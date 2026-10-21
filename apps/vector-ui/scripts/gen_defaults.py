@@ -4,7 +4,7 @@
 # =============================================================================
 """Generate apps/vector-ui/tests/fixtures/defaults.json from the store nodes' vx_defaults.py.
 
-The write-switch defaults and the tool limits are defined once, in
+The write-switch default and the tool limits are defined once, in
 ``packages/ai/src/ai/common/store/vx_defaults.py``. The app's tests read them
 from the generated ``tests/fixtures/defaults.json``, so a changed default is one
 edit there plus a rerun of this script.
@@ -28,7 +28,6 @@ TARGET = APP_DIR / 'tests' / 'fixtures' / 'defaults.json'
 # The names exported to the fixture, in this order.
 NAMES = (
     'VECTOR_ALLOW_WRITES_DEFAULT',
-    'VECTOR_AGENT_WRITES_DEFAULT',
     'VECTOR_TOOL_LIMITS',
     'VECTOR_TOOL_DEFAULTS',
     'EMBED_TOOL_LIMITS',

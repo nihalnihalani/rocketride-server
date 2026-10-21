@@ -90,11 +90,6 @@
 		"code": "WRITES_BROADCAST",
 		"error": "The store refused this request: name the node the write is for."
 	},
-	"WRITES_AGENT": {
-		"success": false,
-		"code": "WRITES_AGENT",
-		"error": "Writes from agents are turned off on this store node (agent_writes)."
-	},
 	"WRITES_UNKNOWN_CALLER": {
 		"success": false,
 		"code": "WRITES_UNKNOWN_CALLER",

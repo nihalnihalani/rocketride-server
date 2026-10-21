@@ -33,12 +33,18 @@ test("the app knows exactly the codes the store nodes document (the errors fixtu
 	assert.deepEqual(Object.keys(fixture('errors')).sort(), [...TOOL_CODES].sort());
 });
 
+test('agents have no write switch of their own: allow_write, the outer gate, alone decides, so no code says agents are refused', () => {
+	assert.equal((TOOL_CODES as readonly string[]).includes('WRITES_AGENT'), false);
+	assert.equal(Object.prototype.hasOwnProperty.call(CODE_SENTENCES, 'WRITES_AGENT'), false);
+	assert.equal(codeSentence('WRITES_AGENT'), GENERIC_REFUSAL, 'a code no node sends reads as the generic refusal');
+});
+
 test('the write refusals say exactly which rule refused', () => {
 	assert.equal(codeSentence('WRITES_DISABLED'), 'Removing documents is turned off on this store node (allow_writes).');
 	assert.equal(codeSentence('WRITES_SOURCE'), 'Only a Tools source may remove documents.');
 	assert.equal(codeSentence('WRITES_UNKNOWN_CALLER'), 'The engine did not identify this request, so the store refused the write. Update the engine to a version that supports the Vector Explorer.');
 	assert.equal(codeSentence('RESERVED_ID'), "That record is the collection's control record and cannot be removed.");
-	for (const code of ['WRITES_PUBLIC', 'WRITES_BROADCAST', 'WRITES_AGENT', 'READS_PUBLIC', 'SOMETHING_NEW', undefined]) {
+	for (const code of ['WRITES_PUBLIC', 'WRITES_BROADCAST', 'READS_PUBLIC', 'SOMETHING_NEW', undefined]) {
 		assert.equal(codeSentence(code), GENERIC_REFUSAL, String(code));
 	}
 	assert.equal(GENERIC_REFUSAL, "The store refused this request; see the pipeline's run log.");

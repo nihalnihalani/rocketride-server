@@ -23,12 +23,13 @@
 # SOFTWARE.
 # =============================================================================
 
-"""Defaults of the vector store write switches and tool limits: the single source.
+"""Defaults of the vector store write switch and tool limits: the single source.
 
-The store nodes read the two switches when ``vector.allow_writes`` /
-``vector.agent_writes`` (``rrvector.allow_writes`` on rocketride_vector) are not
-set in the node configuration. The templates test and the live tool-path
-expectation table read the same values (the app reads them from
+The store nodes read the write switch when ``vector.allow_writes``
+(``rrvector.allow_writes`` on rocketride_vector) is not set in the node
+configuration. Agents have no switch here: the node's ``allow_write`` (the
+outer gate) alone decides whether they write. The templates test and the live
+tool-path expectation table read the same values (the app reads them from
 ``apps/vector-ui/tests/fixtures/defaults.json``, generated from this file by
 ``apps/vector-ui/scripts/gen_defaults.py``), so changing a default is one line
 here plus a regeneration.
@@ -39,9 +40,6 @@ This module must stay free of imports: the generator loads it by path.
 #: Whether DAP tool calls (``client.tool()`` from a Tools source) may remove or upsert documents.
 #: Off by default; turn it on per store node with ``allow_writes``.
 VECTOR_ALLOW_WRITES_DEFAULT = False
-
-#: Whether tool calls made by an agent inside the pipeline may write (today's behaviour).
-VECTOR_AGENT_WRITES_DEFAULT = True
 
 #: Node-enforced limits, reported verbatim in ``dialect.limits`` (contract section 4.1).
 #: Page sizes and counts are maxima; the ``*_default`` keys are the defaults.

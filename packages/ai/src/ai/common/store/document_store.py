@@ -1242,10 +1242,10 @@ class VectorStoreToolMixin(VectorExplorerExtTools, VectorExplorerTools):
     in the same spirit (there, ``execute`` raises).
 
     Those two switches are the outer gate: whether a tool exists for this node
-    at all. A write tool that exists still runs ``vx_write_gate.check_write``
-    first, the inner gate: who is calling (an agent, or a DAP caller through a
-    Tools source with an account or task key) and the node's per-caller switches
-    ``allow_writes`` (DAP calls) and ``agent_writes`` (agent calls).
+    at all, and so ``allow_write`` alone decides whether an agent may write. A
+    write tool that exists still runs ``vx_write_gate.check_write`` first, the
+    inner gate: who is calling (an agent, or a DAP caller through a Tools source
+    with an account or task key) and, for DAP calls, the node's ``allow_writes``.
     """
 
     # --- Configuration knobs (override via IGlobal) ------------------------
@@ -1768,7 +1768,6 @@ class VectorStoreToolMixin(VectorExplorerExtTools, VectorExplorerTools):
             'upsert',
             object_ids=[str(raw.get('object_id', '')).strip() for raw in candidates],
             allow_writes=self._vx_allow_writes(),
-            agent_writes=self._vx_agent_writes(),
             supplies_embedding=any(
                 raw.get('embedding') is not None or raw.get('embedding_model') for raw in candidates
             ),
@@ -1896,7 +1895,6 @@ class VectorStoreToolMixin(VectorExplorerExtTools, VectorExplorerTools):
             'delete',
             object_ids=clean_ids,
             allow_writes=self._vx_allow_writes(),
-            agent_writes=self._vx_agent_writes(),
         )
         if not isinstance(object_ids, list) or not object_ids:
             raise ToolRefusal('INVALID_INPUT', 'delete requires a non-empty "object_ids" array')

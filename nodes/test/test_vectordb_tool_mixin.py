@@ -746,7 +746,7 @@ def node(
     store: Any,
     *,
     allow_writes: Optional[bool] = None,
-    agent_writes: Optional[bool] = None,
+    allow_write: Optional[bool] = None,
     logical_type: str = 'postgres',
     node_id: str = 'store_1',
     embed_query: Optional[Callable] = None,
@@ -756,8 +756,8 @@ def node(
     glb = SimpleNamespace(store=store, glb=SimpleNamespace(logicalType=logical_type), serverName='vdb')
     if allow_writes is not None:
         glb.allow_writes = allow_writes
-    if agent_writes is not None:
-        glb.agent_writes = agent_writes
+    if allow_write is not None:
+        glb.allow_write = allow_write
     if embed_query is not None:
         glb.embed_query = embed_query
         glb.embed_model_name = embed_model_name
@@ -857,8 +857,11 @@ def test_dialect_capabilities_follow_the_driver():
 def test_dialect_reports_the_write_switches():
     store = clustered()
     assert node(store).dialect({})['allow_writes'] is False
-    answer = node(store, allow_writes=True, agent_writes=False).dialect({})
-    assert (answer['allow_writes'], answer['agent_writes']) == (True, False)
+    answer = node(store, allow_writes=True).dialect({})
+    assert answer['allow_writes'] is True
+    # allow_write (the outer gate) alone decides agent writes: the answer names no agent switch.
+    assert 'agent_writes' not in answer
+    assert node(store, allow_writes=True, allow_write=False).dialect({})['allow_writes'] is False
 
 
 def test_dialect_on_a_missing_collection_is_a_success_with_nulls():
@@ -2459,7 +2462,8 @@ def test_remove_document_reserved_id(context):
         (dap(source_type=None), {'allow_writes': True}, 'WRITES_SOURCE'),
         (dap(auth='public'), {'allow_writes': True}, 'WRITES_PUBLIC'),
         (dap(targeted=False), {'allow_writes': True}, 'WRITES_BROADCAST'),
-        (agent(), {'agent_writes': False}, 'WRITES_AGENT'),
+        # allow_write off: the outer gate refuses an agent (and anyone) before the write gate, without a code.
+        (agent(), {'allow_writes': True, 'allow_write': False}, None),
     ],
 )
 @pytest.mark.parametrize('tool', ['remove_document', 'delete'])
@@ -2468,7 +2472,7 @@ def test_refused_removals_leave_the_data_unchanged(context, ctx, switches, code,
     store = clustered(CountingStore, docs=2, chunks=2)
     before = {key: doc.model_dump() for key, doc in store.rows.items()}
     answer = getattr(node(store, **switches), tool)({'object_ids': ['doc00']})
-    assert (answer['success'], answer['code']) == (False, code)
+    assert (answer['success'], answer.get('code')) == (False, code)
     assert {key: doc.model_dump() for key, doc in store.rows.items()} == before
     assert not any(call[0] == 'remove' for call in store.calls)
 
@@ -2481,7 +2485,7 @@ def test_refused_removals_leave_the_data_unchanged(context, ctx, switches, code,
         (dap(source_type='dropper'), {'allow_writes': True}, 'WRITES_SOURCE'),
         (dap(auth='public'), {'allow_writes': True}, 'WRITES_PUBLIC'),
         (dap(targeted=False), {'allow_writes': True}, 'WRITES_BROADCAST'),
-        (agent(), {'agent_writes': False}, 'WRITES_AGENT'),
+        (agent(), {'allow_writes': True, 'allow_write': False}, None),
     ],
 )
 def test_refused_upserts_leave_the_data_unchanged(context, ctx, switches, code):
@@ -2490,7 +2494,7 @@ def test_refused_upserts_leave_the_data_unchanged(context, ctx, switches, code):
     before = set(store.rows)
     inst = node(store, embed_query=lambda text: [0.1] * 8, embed_model_name=MODEL, **switches)
     answer = inst.upsert({'documents': [{'content': 'new text', 'object_id': 'fresh'}]})
-    assert (answer['success'], answer['code']) == (False, code)
+    assert (answer['success'], answer.get('code')) == (False, code)
     assert set(store.rows) == before
 
 
@@ -2513,14 +2517,27 @@ _UNCHECKED_INPUT = {
         (None, {'allow_writes': True}, 'WRITES_UNKNOWN_CALLER'),
         (dap(), {}, 'WRITES_DISABLED'),
         (dap(auth='public'), {'allow_writes': True}, 'WRITES_PUBLIC'),
-        (agent(), {'agent_writes': False}, 'WRITES_AGENT'),
+        (agent(), {'allow_write': False}, None),
     ],
 )
 @pytest.mark.parametrize('tool,shape', sorted(_UNCHECKED_INPUT))
 def test_the_gate_answers_before_the_input_is_checked(context, ctx, switches, code, tool, shape):
     context(ctx)
     answer = getattr(node(clustered(CountingStore), **switches), tool)(_UNCHECKED_INPUT[(tool, shape)])
-    assert (answer['success'], answer['code']) == (False, code)
+    assert (answer['success'], answer.get('code')) == (False, code)
+
+
+@pytest.mark.parametrize('tool', ['remove_document', 'delete'])
+def test_an_agent_removal_needs_only_allow_write(context, tool):
+    # allow_writes (DAP calls) is off and a stray agent_writes is not read: allow_write alone decides.
+    context(agent())
+    store = clustered(CountingStore, docs=2, chunks=2)
+    inst = node(store, allow_writes=False, allow_write=True)
+    inst.IGlobal.agent_writes = False
+    answer = getattr(inst, tool)({'object_ids': ['doc00']})
+    assert answer['success'] is True, answer
+    assert not any(key[0] == 'doc00' for key in store.rows)
+    assert any(key[0] == 'doc01' for key in store.rows)
 
 
 @pytest.mark.parametrize(

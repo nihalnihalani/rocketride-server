@@ -364,7 +364,6 @@ TOOL_CODES: Tuple[str, ...] = (
     'WRITES_SOURCE',
     'WRITES_PUBLIC',
     'WRITES_BROADCAST',
-    'WRITES_AGENT',
     'WRITES_UNKNOWN_CALLER',
     'READS_PUBLIC',
 )

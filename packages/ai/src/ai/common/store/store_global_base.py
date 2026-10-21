@@ -46,7 +46,7 @@ from ai.common.transform import IGlobalTransform
 from ai.common.utils.config_utils import parse_bool
 
 from .document_store import DocumentStoreBase
-from .vx_defaults import VECTOR_AGENT_WRITES_DEFAULT, VECTOR_ALLOW_WRITES_DEFAULT
+from .vx_defaults import VECTOR_ALLOW_WRITES_DEFAULT
 
 
 class StoreGlobalBase(IGlobalTransform, ABC):
@@ -78,15 +78,14 @@ class StoreGlobalBase(IGlobalTransform, ABC):
     embed_query = None
     embed_model_name: Optional[str] = None
 
-    # Per-caller write switches of the vector store tools (remove_document,
-    # delete, upsert), read by vx_write_gate.check_write once the outer gate
-    # above (expose_tools, allow_write) lets a write tool run. Resolved in
-    # beginGlobal from the node config keys ``allow_writes`` and
-    # ``agent_writes``: ``allow_writes`` governs external tool calls (DAP),
-    # ``agent_writes`` calls made by an agent inside the pipeline. A driver
-    # may change either class default.
+    # The DAP write switch of the vector store tools (remove_document, delete,
+    # upsert), read by vx_write_gate.check_write once the outer gate above
+    # (expose_tools, allow_write) lets a write tool run. Resolved in
+    # beginGlobal from the node config key ``allow_writes``; it governs
+    # external tool calls (DAP) only. Agents have no switch of their own:
+    # allow_write alone decides whether they write. A driver may change the
+    # class default.
     allow_writes: bool = VECTOR_ALLOW_WRITES_DEFAULT
-    agent_writes: bool = VECTOR_AGENT_WRITES_DEFAULT
 
     # ------------------------------------------------------------------
     # Abstract interface — every store driver must implement these
@@ -158,8 +157,8 @@ class StoreGlobalBase(IGlobalTransform, ABC):
         # overrides both count, loose booleans ('false', '0', 'yes', 'off', ...) read
         # as such, and an absent or unrecognised value keeps the driver's class
         # default. expose_tools and allow_write are the outer gate (whether a tool
-        # exists for this node at all); allow_writes (DAP calls) and agent_writes
-        # (agent calls) are the write gate's per-caller switches (vx_write_gate).
+        # exists for this node at all, so allow_write alone decides agent writes);
+        # allow_writes is the write gate's switch for DAP calls (vx_write_gate).
         def _switch(name: str) -> bool:
             raw = cfg.get(name) if hasattr(cfg, 'get') else None
             return parse_bool(raw, default=getattr(type(self), name))
@@ -167,7 +166,6 @@ class StoreGlobalBase(IGlobalTransform, ABC):
         self.expose_tools = _switch('expose_tools')
         self.allow_write = _switch('allow_write')
         self.allow_writes = _switch('allow_writes')
-        self.agent_writes = _switch('agent_writes')
 
         # A key left as an unfilled ${ROCKETRIDE_...} fails here, before the driver sends it.
         self._check_credentials(cfg, connConfig)

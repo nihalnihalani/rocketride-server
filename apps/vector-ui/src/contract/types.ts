@@ -75,7 +75,6 @@ export const TOOL_CODES = [
 	'WRITES_SOURCE',
 	'WRITES_PUBLIC',
 	'WRITES_BROADCAST',
-	'WRITES_AGENT',
 	'WRITES_UNKNOWN_CALLER',
 	'READS_PUBLIC',
 ] as const;
@@ -293,8 +292,8 @@ export interface IDialectResult {
 	index: { type: string; params?: Record<string, unknown> } | null;
 	score: IScoreInfo;
 	support: SupportLevel;
+	/** Whether a DAP caller (this app) may write; agents have no switch of their own (the node's allow_write decides). */
 	allow_writes: boolean;
-	agent_writes: boolean;
 	/** v1: 'tools_source' (external writes are honoured only from a Tools source). */
 	writes_scope: string;
 	write_tools: string[];

@@ -8,6 +8,8 @@
 // =============================================================================
 
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
 import { test } from 'node:test';
 import { ExplorerToolError } from 'shared/explorer';
 import { DEFAULT_LIMITS, readChunksPage, readDialect, readDocumentsPage, readRemoveResult, readStats, unwrapEnvelope } from '../src/vector/results';
@@ -58,10 +60,21 @@ test('readDialect: the probe answer, or null for an old or foreign node; missing
 	assert.deepEqual(thin.capabilities, {});
 	assert.deepEqual(thin.caveats, []);
 	assert.equal(thin.allow_writes, false, 'an answer that does not say writes are on reads as off');
+	assert.equal('agent_writes' in pg, false, 'allow_write alone decides agent writes: the dialect has no agent switch');
+	assert.equal('agent_writes' in readDialect({ ...fixture('dialect_pgvector'), agent_writes: false })!, false, 'an agent_writes key a node sends is not read');
 	assert.equal(thin.health.collection_exists, false);
 	const missing = readDialect(fixture('dialect_collection_missing'));
 	assert.equal(missing?.health.collection_exists, false);
 	assert.equal(missing?.dimension, null);
+});
+
+test('no wire fixture names an agent write switch or its refusal', () => {
+	const root = path.resolve(__dirname, 'fixtures');
+	const walk = (dir: string): string[] => fs.readdirSync(dir, { withFileTypes: true }).flatMap((entry) => (entry.isDirectory() ? walk(path.join(dir, entry.name)) : [path.join(dir, entry.name)]));
+	const files = walk(root).filter((file) => file.endsWith('.json'));
+	assert.ok(files.some((file) => file.includes(`${path.sep}live${path.sep}`)) && files.some((file) => file.includes(`${path.sep}provisional${path.sep}`)), 'the premise: live and provisional fixtures are read');
+	const naming = files.filter((file) => /agent_writes|WRITES_AGENT|AGENT_WRITES/.test(fs.readFileSync(file, 'utf8')));
+	assert.deepEqual(naming.map((file) => path.relative(root, file)), []);
 });
 
 test('readStats: the extended figures, never the legacy count as documents or chunks', () => {

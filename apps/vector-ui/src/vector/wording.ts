@@ -42,7 +42,7 @@ import type { Caveat, ToolCode } from '../contract/types';
 export const GENERIC_REFUSAL = "The store refused this request; see the pipeline's run log.";
 
 /** The write refusals: the sentence is the whole message (the node's own text adds nothing). */
-const WRITE_CODES: ReadonlySet<string> = new Set(['WRITES_DISABLED', 'WRITES_SOURCE', 'WRITES_PUBLIC', 'WRITES_BROADCAST', 'WRITES_AGENT', 'WRITES_UNKNOWN_CALLER', 'RESERVED_ID']);
+const WRITE_CODES: ReadonlySet<string> = new Set(['WRITES_DISABLED', 'WRITES_SOURCE', 'WRITES_PUBLIC', 'WRITES_BROADCAST', 'WRITES_UNKNOWN_CALLER', 'RESERVED_ID']);
 
 /** One sentence per documented code. */
 export const CODE_SENTENCES: Readonly<Record<ToolCode, string>> = {
@@ -64,7 +64,6 @@ export const CODE_SENTENCES: Readonly<Record<ToolCode, string>> = {
 	WRITES_SOURCE: 'Only a Tools source may remove documents.',
 	WRITES_PUBLIC: GENERIC_REFUSAL,
 	WRITES_BROADCAST: GENERIC_REFUSAL,
-	WRITES_AGENT: GENERIC_REFUSAL,
 	WRITES_UNKNOWN_CALLER: 'The engine did not identify this request, so the store refused the write. Update the engine to a version that supports the Vector Explorer.',
 	// The app signs in with an account, never with a task's public key, so it does not meet this one.
 	READS_PUBLIC: GENERIC_REFUSAL,

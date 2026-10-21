@@ -22,3 +22,9 @@ up (see `scripts/acceptance/vector-explorer/README.md`):
 
 `nodes/test/test_vector_wire_fixtures_full.py` regenerates them and fails when a
 committed capture no longer matches the tools.
+
+One hand edit is pending a recapture: when the store nodes dropped the
+`agent_writes` switch (the node's `allow_write` alone decides agent writes),
+the `agent_writes` key was removed by hand from the eight `dialect.json` and
+`dialect.legacy.json` captures, and nothing else in them changed. The next
+regeneration against the live databases replaces them.
