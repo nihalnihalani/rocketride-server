@@ -137,6 +137,8 @@ def test_replacement_preserves_other_documents(store_env):
 def test_failed_batch_rolls_back_deletion_and_partial_inserts(store_env):
     import psycopg2
 
+    from ai.common.store.errors import StoreError
+
     store, raw, table = store_env
     # Seed directly so the baseline metadata bug cannot mask the delete-before-
     # insert bug. This also exercises the driver with collection checks disabled.
@@ -148,7 +150,9 @@ def test_failed_batch_rolls_back_deletion_and_partial_inserts(store_env):
     raw.commit()
     bad = _doc('b')
     bad.embedding = [float('nan'), 0.0, 0.0]
-    with pytest.raises(psycopg2.DataError, match='NaN'):
+    # The shared pgvector driver checks the vector before it is sent and raises StoreError
+    # ("NaN not allowed in vector"); develop's single-connection driver let psycopg2 raise.
+    with pytest.raises((psycopg2.DataError, StoreError), match='NaN'):
         store.addChunks([_doc(content='replacement'), bad], checkCollection=False)
     assert _rows(raw, table) == [('a', 0, 'original'), ('b', 0, 'original'), ('c', 0, 'untouched')]
     # A failed transaction must be rolled back so this same connection works.

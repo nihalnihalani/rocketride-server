@@ -171,6 +171,8 @@ def test_the_lane_lists_the_vector_suites_and_the_pgvector_pooled_cases():
     out = _lane({'required': []})
     for suite in (
         'test_rocketride_db_full.py',
+        'test_rocketride_vector_tools_full.py',
+        'test_vector_store_writes_full.py',
         'test_store_postgres_full.py',
         'test_store_qdrant_full.py',
         'test_store_chroma_full.py',
