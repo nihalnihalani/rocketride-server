@@ -103,6 +103,7 @@ import { createLatestQueue } from '../map/neighbours';
 import type { IClusterLabel, IOverlayEnd, IPlace } from '../map/overlay';
 import { centroidStar, chatQueryPlan, comparePlan, placeProjected, queryBlocker, querySims, raysFromSearch, resolveKeys, starFromProject, withSampleRetry } from '../map/queryProjection';
 import type { IStar } from '../map/queryProjection';
+import { polarityOf } from '../map/recommend';
 import { spawnLayoutWorker } from '../map/spawnWorker';
 import { MAP_STYLES } from '../map/styles';
 import { readPalette } from '../map/tokens';
@@ -1752,7 +1753,10 @@ export function MapView(props: MapViewProps): React.ReactElement {
 									onRemoveDocument={(objectId) => actions.requestRemove([objectId])}
 									treeNeighbours={edges === 'tree' && tree && selected !== null ? treeNeighbours(tree.edges, selected) : null}
 									onAddExample={onAddExample}
+									examplePolarity={selectedKey ? polarityOf(examples, selectedKey) : null}
 									onShowText={onShowText}
+									connectionKey={model.connectionKey}
+									query={query?.text ?? null}
 								/>
 							) : null}
 							{tab === 'neighbours' ? (
