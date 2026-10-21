@@ -31,7 +31,8 @@
 // the node's kNN graph; and the rows of the map's exports (points, clusters,
 // duplicate pairs), built only when an export is chosen. An export row holds
 // words and numbers only: paths, chunk numbers, scores, layout coordinates and
-// the short snippet the node already sent; never a vector.
+// the short snippet the node already sent; never a vector. The scope rule says
+// whether the console's scope is the one the points on screen were drawn with.
 // =============================================================================
 
 import { EXPORT_COLUMNS } from '../contract/types';
@@ -359,4 +360,78 @@ export function duplicateExportRows(sample: ISampleResult, hidden: ArrayLike<num
 				similarity: dp4(d.sim),
 			})),
 	};
+}
+
+// -----------------------------------------------------------------------------
+// The scope a sample was drawn with
+// -----------------------------------------------------------------------------
+
+/** The documents a sample is drawn from: one key for them, how many, and the console's words for them. */
+export interface IDrawnScope {
+	/** `count:id|id|...`, or '' for the whole collection. */
+	key: string;
+	/** Documents in the scope (0 for the whole collection). */
+	documents: number;
+	/** The console's words for the scope ('' for the whole collection). */
+	label: string;
+}
+
+/** The whole collection: no scope. */
+export const UNSCOPED: IDrawnScope = Object.freeze({ key: '', documents: 0, label: '' });
+
+/**
+ * The scope a draw sends, from the documents the console scoped the map to.
+ *
+ * @param objectIds - The documents, or null when the map is not scoped.
+ * @param label - The console's words for the scope.
+ * @returns The scope, or UNSCOPED for none.
+ */
+export function drawnScope(objectIds: readonly string[] | null, label: string): IDrawnScope {
+	return objectIds && objectIds.length > 0 ? { key: `${objectIds.length}:${objectIds.join('|')}`, documents: objectIds.length, label } : UNSCOPED;
+}
+
+/** A draw started over the sample on screen for a scope (by key), and whether the store refused it. */
+export interface IScopeAttempt {
+	key: string;
+	failed: boolean;
+}
+
+/** What the map knows of the sample on screen: the scope it was drawn with, and the last draw tried over it. */
+export interface ISampleScope {
+	drawn: IDrawnScope;
+	attempt: IScopeAttempt | null;
+}
+
+/**
+ * How the console's scope stands on the map: `none` (no scope, and the points
+ * shown are from the whole collection), `applied` (the points shown were drawn
+ * with it), `pending` (a draw with it is due or in flight) or `failed` (the
+ * store refused the draw; the points shown were drawn without it).
+ */
+export type MapScopeState = 'none' | 'applied' | 'pending' | 'failed';
+
+/**
+ * The state of the console's scope over the sample on screen.
+ *
+ * @param target - The key of the scope the console holds ('' for none).
+ * @param shown - What the map knows of the sample on screen.
+ * @returns The state.
+ */
+export function mapScopeState(target: string, shown: ISampleScope): MapScopeState {
+	if (shown.drawn.key === target) return target === '' ? 'none' : 'applied';
+	return shown.attempt !== null && shown.attempt.key === target && shown.attempt.failed ? 'failed' : 'pending';
+}
+
+/**
+ * Whether the map should draw the sample again for the console's scope: the
+ * points shown were drawn with another scope and no draw for this one was
+ * tried over them. A refused draw is not tried again by itself (a busy store
+ * would be asked in a loop); the legend offers it.
+ *
+ * @param target - The key of the scope the console holds ('' for none).
+ * @param shown - What the map knows of the sample on screen.
+ * @returns True when a draw is due.
+ */
+export function scopeDrawDue(target: string, shown: ISampleScope): boolean {
+	return shown.drawn.key !== target && (shown.attempt === null || shown.attempt.key !== target);
 }

@@ -34,10 +34,10 @@ import type { ConsoleActions, ConsoleModel, IDialectResult, IExportItem, IRecomm
 import { PointCanvas } from '../src/components/PointCanvas';
 import { clusterLabel, clusterRows, clusterView } from '../src/map/clusters';
 import { spanningTree } from '../src/map/graph';
-import { clusterExportRows, duplicateExportRows, pointExportRows } from '../src/map/model';
+import { UNSCOPED, clusterExportRows, drawnScope, duplicateExportRows, mapScopeState, pointExportRows, scopeDrawDue } from '../src/map/model';
 import { comparePlan } from '../src/map/queryProjection';
 import type { ILayoutClient, ILayoutSpec, LayoutOutcome } from '../src/map/workerClient';
-import { EDGES_LIGHT_NOTE, MAP_UNAVAILABLE, edgeLegend, listingNote, scopeNote } from '../src/map/wording';
+import { EDGES_LIGHT_NOTE, MAP_UNAVAILABLE, SCOPE_RETRY, edgeLegend, listingNote, scopeFailedNote, scopeLeftNote, scopeNote, scopePendingNote } from '../src/map/wording';
 import type { SideTab } from '../src/views/MapView';
 import { deepFreeze, loadSample, modelOf, pcaXY } from './support/map.samples';
 
@@ -345,17 +345,50 @@ test('edges: Tree draws the spanning tree (n-1 edges on a connected graph), Neig
 	assert.equal(attr(treeOut, 'data-edges-auto-degrade'), 'on');
 });
 
-test('a scope applied to the map is sent with the sample, the neighbours and recommend, and the legend says so', async () => {
-	const ids = clustered.docs.slice(0, 5).map((d) => d.objectId);
-	const scope: IScopeState = { filter: { path_prefix: 'C:/demo/field/' }, label: 'folder is under C:/demo/field/', objectIds: ids, overflow: null, applyTo: { documents: true, map: true, search: true, chat: true } };
-	const { calls, channels: counted } = counting({ recommend: () => JSON.parse(fs.readFileSync(path.join(FIX, 'recommend_ok.json'), 'utf8')) });
-	const out = render({ model: enrichedModel({ scope }), channels: counted, sample: modelOf(clustered), initialTable: true, initialTab: 'recommend' });
-	assert.match(out, /Scope: folder is under C:\/demo\/field\/ \(5 documents\); the sample is drawn from these only/);
-	assert.match(out, /data-scoped="5"/);
-	last<{ onSample(o: { n: number; mode: 'detailed'; seed: number }): void }>('MapToolbar').onSample({ n: 1000, mode: 'detailed', seed: 8 });
+// -----------------------------------------------------------------------------
+// The console's scope on the map: the legend and data-scoped state the scope
+// the points on screen were drawn with, never only the one the console holds.
+// -----------------------------------------------------------------------------
+
+/** Let the calls a captured handler started settle (the counting channel answers on the microtask queue). */
+const settle = (): Promise<void> => new Promise((resolve) => setImmediate(resolve));
+
+/** An attribute of the map's root. */
+const rootAttr = (out: string, name: string): string | null => attrOf(out, 'vector-map', name);
+
+/** A scope over the first `count` documents of the clusters fixture, applied to the map. */
+function scopeOver(count: number, folder = 'C:/demo/field/'): IScopeState {
+	const ids = clustered.docs.slice(0, count).map((d) => d.objectId);
+	return { filter: { path_prefix: folder }, label: `folder is under ${folder}`, objectIds: ids, overflow: null, applyTo: { documents: true, map: true, search: true, chat: true } };
+}
+
+/** A fresh answer object (the view keeps what it drew each answer with beside the answer itself). */
+const answerOf = (sampleId: string): ISampleResult => ({ ...clustered, sample_id: sampleId }) as ISampleResult;
+
+type ToolbarSample = { onSample(o: { n: number; mode: 'detailed'; seed: number }): void };
+
+test('a scope applied to the map is sent with the sample, the neighbours and recommend; the legend states it only once a sample drawn with it is shown', async () => {
+	const scope = scopeOver(5);
+	const ids = scope.objectIds!;
+	const { calls, channels: counted } = counting({ sample: () => answerOf('s-8-scoped'), recommend: () => JSON.parse(fs.readFileSync(path.join(FIX, 'recommend_ok.json'), 'utf8')) });
+	const selection = createSelectionStore(KEY);
+	// The sample on screen was drawn before the console scoped the map: the legend says it is being drawn again.
+	const before = render({ model: enrichedModel({ scope }), channels: counted, sample: modelOf(answerOf('s-7-unscoped')), selection, initialTable: true, initialTab: 'recommend' });
+	assert.doesNotMatch(before, /the sample is drawn from these only/, 'no sample was drawn with this scope');
+	assert.ok(before.includes(scopePendingNote(scope.label, 5)));
+	assert.equal(rootAttr(before, 'data-scoped'), '', 'the points shown were drawn from the whole collection');
+	assert.equal(rootAttr(before, 'data-scope-state'), 'pending');
+	assert.equal(last<{ scopeRetry?: unknown }>('Legend').scopeRetry ?? null, null, 'nothing to retry while the draw is due');
+	last<ToolbarSample>('MapToolbar').onSample({ n: 1000, mode: 'detailed', seed: 8 });
 	const sampled = calls.find((c) => c.tool === 'sample');
 	assert.deepEqual(sampled?.input.filter, { object_ids: ids });
 	assert.deepEqual(sampled?.input.cluster, { method: 'knn-components', labels: true }, 'clusters are asked of a node that offers them');
+	await settle();
+	assert.equal(selection.getState().sampleModel?.sampleId, 's-8-scoped', 'the scoped answer is the sample shown');
+	const out = render({ model: enrichedModel({ scope }), channels: counted, selection, initialTable: true, initialTab: 'recommend' });
+	assert.match(out, /Scope: folder is under C:\/demo\/field\/ \(5 documents\); the sample is drawn from these only/);
+	assert.equal(rootAttr(out, 'data-scoped'), '5');
+	assert.equal(rootAttr(out, 'data-scope-state'), 'applied');
 	last<{ onSelect(i: number): void }>('PointsTable').onSelect(3);
 	const neighbours = calls.find((c) => c.tool === 'neighbors');
 	assert.deepEqual(neighbours?.input.filter, { object_ids: ids });
@@ -370,6 +403,110 @@ test('a scope applied to the map is sent with the sample, the neighbours and rec
 	last<{ onSample(o: { n: number; mode: 'detailed'; seed: number }): void }>('MapToolbar').onSample({ n: 1000, mode: 'detailed', seed: 8 });
 	assert.equal(plain.calls[0]?.input.filter, undefined);
 	assert.equal(plain.calls[0]?.input.cluster, undefined);
+});
+
+test('a refused scoped draw is never captioned as scoped: the legend says the scope is not applied and offers the draw again, which sends the scope again', async () => {
+	const scope = scopeOver(2, 'C:/demo/x/');
+	let refuse = true;
+	const { calls, channels: counted } = counting({ sample: () => (refuse ? { success: false, code: 'BUSY', error: 'Another sample is being drawn.' } : answerOf('s-9-retried')) });
+	const selection = createSelectionStore(KEY);
+	render({ model: enrichedModel({ scope }), channels: counted, sample: modelOf(answerOf('s-7-unscoped')), selection });
+	last<ToolbarSample>('MapToolbar').onSample({ n: 1000, mode: 'detailed', seed: 7 });
+	await settle();
+	assert.equal(selection.getState().sampleModel?.sampleId, 's-7-unscoped', 'the store refused: the unscoped sample stays on screen');
+	const failed = render({ model: enrichedModel({ scope }), channels: counted, selection });
+	assert.doesNotMatch(failed, /the sample is drawn from these only/);
+	assert.ok(failed.includes(scopeFailedNote(scope.label, 2)), 'the legend says the scope is not applied');
+	assert.equal(rootAttr(failed, 'data-scoped'), '');
+	assert.equal(rootAttr(failed, 'data-scope-state'), 'failed');
+	assert.match(failed, new RegExp(`<button[^>]*data-scope-retry=""[^>]*>${SCOPE_RETRY}</button>`));
+	const legend = last<{ scopeRetry?: { label: string; onClick(): void } | null }>('Legend');
+	assert.equal(legend.scopeRetry?.label, SCOPE_RETRY);
+	// The store is free again: the legend's action draws the sample with the scope.
+	refuse = false;
+	legend.scopeRetry!.onClick();
+	await settle();
+	const draws = calls.filter((c) => c.tool === 'sample');
+	assert.equal(draws.length, 2);
+	assert.deepEqual(draws[1]?.input.filter, { object_ids: scope.objectIds });
+	assert.equal(selection.getState().sampleModel?.sampleId, 's-9-retried');
+	const applied = render({ model: enrichedModel({ scope }), channels: counted, selection });
+	assert.ok(applied.includes(scopeNote(scope.label, 2)));
+	assert.equal(rootAttr(applied, 'data-scoped'), '2');
+	assert.equal(rootAttr(applied, 'data-scope-state'), 'applied');
+	assert.doesNotMatch(applied, /data-scope-retry/);
+});
+
+test('an older draw refused after a newer one started does not mark the scope failed: the legend follows the newest draw', async () => {
+	const scope = scopeOver(4);
+	const answers: Array<(value: unknown) => void> = [];
+	const tools = { invoke: (tool: string) => (tool === 'sample' ? new Promise((resolve) => answers.push(resolve)) : new Promise<never>(() => undefined)) } as unknown as IRoleChannel;
+	const ordered: VectorChannels = { tools, chat: null, ingest: null };
+	const selection = createSelectionStore(KEY);
+	render({ model: enrichedModel({ scope }), channels: ordered, sample: modelOf(answerOf('s-7-shown')), selection });
+	const toolbar = last<ToolbarSample>('MapToolbar');
+	toolbar.onSample({ n: 1000, mode: 'detailed', seed: 8 });
+	toolbar.onSample({ n: 1000, mode: 'detailed', seed: 9 });
+	assert.equal(answers.length, 2, 'two draws in flight');
+	answers[0]!({ success: false, code: 'BUSY', error: 'Another sample is being drawn.' });
+	await settle();
+	const meanwhile = render({ model: enrichedModel({ scope }), channels: ordered, selection });
+	assert.equal(rootAttr(meanwhile, 'data-scope-state'), 'pending', 'the newer draw is still in flight');
+	assert.doesNotMatch(meanwhile, /data-scope-retry/);
+	answers[1]!(answerOf('s-9-newest'));
+	await settle();
+	const done = render({ model: enrichedModel({ scope }), channels: ordered, selection });
+	assert.equal(selection.getState().sampleModel?.sampleId, 's-9-newest');
+	assert.equal(rootAttr(done, 'data-scope-state'), 'applied');
+	assert.equal(rootAttr(done, 'data-scoped'), '4');
+});
+
+test('a sample drawn with a scope the console then cleared says its points are from that scope only until the whole collection is drawn', async () => {
+	const scope = scopeOver(3);
+	const selection = createSelectionStore(KEY);
+	const { channels: counted } = counting({ sample: () => answerOf('s-8-three') });
+	render({ model: enrichedModel({ scope }), channels: counted, sample: modelOf(answerOf('s-7-before')), selection });
+	last<ToolbarSample>('MapToolbar').onSample({ n: 1000, mode: 'detailed', seed: 8 });
+	await settle();
+	const cleared = render({ model: enrichedModel(), channels: counted, selection });
+	assert.equal(rootAttr(cleared, 'data-scoped'), '3', 'the points shown are still the scoped sample');
+	assert.equal(rootAttr(cleared, 'data-scope-state'), 'pending');
+	assert.ok(cleared.includes(scopeLeftNote(scope.label, 3, false)));
+	assert.doesNotMatch(cleared, /the sample is drawn from these only/);
+	// Back to the same scope: the sample on screen was drawn with it.
+	const again = render({ model: enrichedModel({ scope }), channels: counted, selection });
+	assert.equal(rootAttr(again, 'data-scope-state'), 'applied');
+});
+
+test('the scope rule: the map draws once per scope (never again while that draw is pending or after the store refused it) and captions only the scope it drew with', () => {
+	const a = '2:doc-a|doc-b';
+	const b = '1:doc-c';
+	const drawnA = { drawn: drawnScope(['doc-a', 'doc-b'], 'folder a'), attempt: null };
+	assert.equal(drawnA.drawn.key, a);
+	assert.deepEqual(drawnScope(null, 'x'), UNSCOPED);
+	assert.deepEqual(drawnScope([], 'x'), UNSCOPED);
+	const unscoped = { drawn: UNSCOPED, attempt: null };
+	// Nothing to do: drawn with the scope the console holds.
+	assert.equal(scopeDrawDue('', unscoped), false);
+	assert.equal(scopeDrawDue(a, drawnA), false);
+	assert.equal(mapScopeState('', unscoped), 'none');
+	assert.equal(mapScopeState(a, drawnA), 'applied');
+	// A new scope: a draw is due and the caption says it is pending until it lands.
+	assert.equal(scopeDrawDue(a, unscoped), true);
+	assert.equal(mapScopeState(a, unscoped), 'pending');
+	assert.equal(scopeDrawDue('', drawnA), true, 'a cleared scope draws the whole collection again');
+	// In flight: not again (the effect runs again on every busy change).
+	const inFlight = { drawn: UNSCOPED, attempt: { key: a, failed: false } };
+	assert.equal(scopeDrawDue(a, inFlight), false);
+	assert.equal(mapScopeState(a, inFlight), 'pending');
+	// Refused: not again by itself (a busy store would be asked in a loop); the legend offers the draw.
+	const refused = { drawn: UNSCOPED, attempt: { key: a, failed: true } };
+	assert.equal(scopeDrawDue(a, refused), false);
+	assert.equal(mapScopeState(a, refused), 'failed');
+	// Another scope meanwhile: due again, whatever happened to the last one.
+	assert.equal(scopeDrawDue(b, refused), true);
+	assert.equal(mapScopeState(b, refused), 'pending');
+	assert.equal(mapScopeState(b, inFlight), 'pending');
 });
 
 test('the toolbar\'s Export items: the sample, the selection, the points shown, the clusters, duplicates, outliers and the PNG; rows carry words and numbers, never a vector', () => {
@@ -603,6 +740,12 @@ test('the legend\'s lines: edges drawn, a truncated listing, a scope, an isolati
 	assert.equal(listingNote(clustered), null, 'a complete listing says nothing');
 	assert.equal(listingNote(loadSample('sample_demo_1000.json')), null, 'an older node says nothing');
 	assert.equal(scopeNote('folder is under C:/demo/handbooks/', 12), 'Scope: folder is under C:/demo/handbooks/ (12 documents); the sample is drawn from these only');
+	// The scope's other states: the draw is due or in flight, the store refused it, the console cleared it.
+	assert.equal(scopePendingNote('folder is under C:/demo/handbooks/', 12), 'Scope: folder is under C:/demo/handbooks/ (12 documents); the sample is being drawn again from these only (the points shown were drawn without this scope)');
+	assert.equal(scopeFailedNote('folder is under C:/demo/handbooks/', 1), 'Scope not applied (folder is under C:/demo/handbooks/, 1 document): the sample could not be drawn again from these; the points shown were drawn without this scope');
+	assert.equal(scopeLeftNote('folder is under C:/demo/handbooks/', 12, false), 'No scope on the map now: the sample is being drawn again from the whole collection (the points shown are still from the earlier scope: folder is under C:/demo/handbooks/, 12 documents)');
+	assert.equal(scopeLeftNote('folder is under C:/demo/handbooks/', 12, true), 'No scope on the map now, but the sample could not be drawn again: the points shown are still from the earlier scope (folder is under C:/demo/handbooks/, 12 documents)');
+	assert.equal(SCOPE_RETRY, 'Draw the sample again');
 	const out = render({ sample: modelOf(truncated) });
 	assert.match(out, /Sampled from the first 500 documents by path; the collection has more/);
 });

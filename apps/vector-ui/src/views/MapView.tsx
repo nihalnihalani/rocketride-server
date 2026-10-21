@@ -97,7 +97,8 @@ import { NO_EDGES, edgeStats, edgesOf, mergeEdges, spanningTree, topEdges, treeN
 import { tweenPositions } from '../map/interaction';
 import type { KeyAction } from '../map/interaction';
 import { combineMasks, expandByNeighbours, isolateMask, isolationLine, shownCount } from '../map/isolate';
-import { applyTransform, chunkPath, clusterExportRows, ditherRounded, documentOf, duplicateExportRows, hiddenMask, keyIndex, keyString, neighboursOf, normaliseLayout, pcaPositions, pointExportRows, pointKey } from '../map/model';
+import { UNSCOPED, applyTransform, chunkPath, clusterExportRows, ditherRounded, documentOf, drawnScope, duplicateExportRows, hiddenMask, keyIndex, keyString, mapScopeState, neighboursOf, normaliseLayout, pcaPositions, pointExportRows, pointKey, scopeDrawDue } from '../map/model';
+import type { ISampleScope, IScopeAttempt } from '../map/model';
 import { createLatestQueue } from '../map/neighbours';
 import type { IClusterLabel, IOverlayEnd, IPlace } from '../map/overlay';
 import { centroidStar, chatQueryPlan, comparePlan, placeProjected, queryBlocker, querySims, raysFromSearch, resolveKeys, starFromProject, withSampleRetry } from '../map/queryProjection';
@@ -108,7 +109,7 @@ import { readPalette } from '../map/tokens';
 import type { IMapPalette } from '../map/tokens';
 import { createLayoutClient } from '../map/workerClient';
 import type { ILayoutClient } from '../map/workerClient';
-import { BUSY, CENTROID_APPROX, CLUSTERS_UNSUPPORTED, EDGES_DEGRADED, EDGES_LIGHT_LIMIT, EDGES_LIGHT_NOTE, LAYOUT_CANCELLED, LAYOUT_NOT_BETTER, LIGHT_POSITIONS, MAP_UNAVAILABLE, QUERY_NEEDS_EMBED, QUERY_PLACED_APPROX, clusterAnnouncement, edgeLegend, listingNote, mapFailure, num, pointAnnouncement, sampleLabel, scopeNote } from '../map/wording';
+import { BUSY, CENTROID_APPROX, CLUSTERS_UNSUPPORTED, EDGES_DEGRADED, EDGES_LIGHT_LIMIT, EDGES_LIGHT_NOTE, LAYOUT_CANCELLED, LAYOUT_NOT_BETTER, LIGHT_POSITIONS, MAP_UNAVAILABLE, QUERY_NEEDS_EMBED, QUERY_PLACED_APPROX, clusterAnnouncement, edgeLegend, listingNote, mapFailure, num, pointAnnouncement, sampleLabel, SCOPE_RETRY, scopeLine } from '../map/wording';
 import { heatScores } from '../vector/heat';
 
 /** Props: the frozen ones plus where the Table toggle and the side panel start. */
@@ -153,6 +154,29 @@ const RECOMMEND_EXAMPLES_DEFAULT = 10;
 
 /** No directory rows (a map mounted without the console's source). */
 const NO_ROWS: readonly IDocumentItem[] = [];
+
+/**
+ * What the map knows of each sample answer: the scope it was drawn with, and
+ * the last draw tried over it while it was on screen. Kept beside the answer
+ * object, which the selection store holds across tab switches and remounts (the
+ * frozen sample model has no field for it), so the legend and data-scoped state
+ * only the scope the points on screen were drawn with. An answer the map did not
+ * draw itself counts as drawn from the whole collection.
+ */
+const SAMPLE_SCOPES = new WeakMap<ISampleResult, ISampleScope>();
+
+/** An answer the map has no record of. */
+const NOT_RECORDED: ISampleScope = Object.freeze({ drawn: UNSCOPED, attempt: null });
+
+/**
+ * What the map knows of a sample answer's scope.
+ *
+ * @param result - The answer on screen, if any.
+ * @returns Its drawn scope and the last draw tried over it.
+ */
+function scopeOfSample(result: ISampleResult | null | undefined): ISampleScope {
+	return (result ? SAMPLE_SCOPES.get(result) : undefined) ?? NOT_RECORDED;
+}
 const NO_ROWS_SOURCE: IDocumentRowsSource = { getRows: () => NO_ROWS, subscribe: () => () => undefined };
 
 /**
@@ -429,11 +453,14 @@ export function MapView(props: MapViewProps): React.ReactElement {
 	// The console's scope as the map applies it: its documents, when it applies to the map and fits the limit.
 	const scope = model.scope ?? null;
 	const scopeIds = scope && scope.applyTo.map && scope.overflow === null && scope.objectIds !== null && scope.objectIds.length > 0 && scope.objectIds.length <= limits.scope_keys_max ? scope.objectIds : null;
-	const scopeKey = scopeIds ? `${scopeIds.length}:${scopeIds.join('|')}` : '';
+	const scopeTarget = drawnScope(scopeIds, scope?.label ?? '');
 	const scopeRef = useRef<readonly string[] | null>(scopeIds);
 	scopeRef.current = scopeIds;
-	/** The scope a sample was drawn with ('' for none). */
-	const sampledScope = useRef<string>('');
+	const scopeTargetRef = useRef(scopeTarget);
+	scopeTargetRef.current = scopeTarget;
+	// The scope the points on screen were drawn with, and how the console's scope stands over them.
+	const shownScope = scopeOfSample(sampleModel?.result);
+	const scopeState = mapScopeState(scopeTarget.key, shownScope);
 	const docRows = useSyncExternalStore((props.documents ?? NO_ROWS_SOURCE).subscribe, (props.documents ?? NO_ROWS_SOURCE).getRows, (props.documents ?? NO_ROWS_SOURCE).getRows);
 	const docRowMap = useMemo(() => new Map(docRows.map((row) => [row.objectId, row])), [docRows]);
 	const connectionRef = useRef(model.connectionKey);
@@ -677,19 +704,34 @@ export function MapView(props: MapViewProps): React.ReactElement {
 				...(model.capabilities.clusters === true ? { cluster: { method: 'knn-components' as const, labels: true } } : {}),
 				...(scopeRef.current ? { filter: { object_ids: [...scopeRef.current] } } : {}),
 			};
-			const drawnScope = scopeRef.current ? `${scopeRef.current.length}:${scopeRef.current.join('|')}` : '';
+			// The scope this draw sends, noted over the sample on screen until the answer lands.
+			const target = scopeTargetRef.current;
+			const shown = selection.getState().sampleModel?.result ?? null;
+			const attempt: IScopeAttempt = { key: target.key, failed: false };
+			if (shown) SAMPLE_SCOPES.set(shown, { drawn: scopeOfSample(shown).drawn, attempt });
+			/** End this draw's note over the sample it started on, unless a newer draw has replaced it. */
+			const endAttempt = (next: IScopeAttempt | null): void => {
+				const now = scopeOfSample(shown);
+				if (shown && now.attempt === attempt) SAMPLE_SCOPES.set(shown, { drawn: now.drawn, attempt: next });
+			};
 			client.cancel();
 			setBusy(BUSY.sampling);
 			setError(null);
 			const answer = await callTool<ISampleResult>(channel, 'sample', input as Record<string, unknown>, { nodeId: storeNode, timeoutMs: limits.sample_budget_ms + 30_000 });
-			if (connectionRef.current !== key) return null;
-			setBusy(null);
+			if (connectionRef.current !== key) {
+				endAttempt(null);
+				return null;
+			}
 			if (!answer.ok) {
+				// Noted before the render this answer causes: the legend says the scope was not applied.
+				endAttempt({ key: target.key, failed: true });
+				setBusy(null);
 				if (!answer.stale) setError(mapFailure(answer.code, answer.message));
 				return null;
 			}
+			setBusy(null);
 			const result = answer.value;
-			sampledScope.current = drawnScope;
+			SAMPLE_SCOPES.set(result, { drawn: target, attempt: null });
 			resetView(opts.keepQuery === true);
 			selection.setSampleModel({ sampleId: result.sample_id, seed: opts.seed, mode: result.mode, receivedAt: Date.now(), result, pinned: [], removed: [] });
 			setFitToken((t) => t + 1);
@@ -707,15 +749,22 @@ export function MapView(props: MapViewProps): React.ReactElement {
 		void drawSample({ n: Math.min(limits.sample_default, limits.sample_max), mode: 'detailed', seed: DEFAULT_SEED });
 	}, [visible, canSample, channel, sampleModel, busy, model.connectionKey, limits, drawSample]);
 
-	// The console scoped the map to other documents: draw the sample again from those (a scope is a reason to sample).
+	// The console scoped the map to other documents: draw the sample again from those (a scope is a reason to
+	// sample). Once per scope over the sample on screen: drawSample notes the draw before its first await, so
+	// the run a busy change causes does not start a second one, and a refused draw waits for the legend's action.
 	useEffect(() => {
 		if (!visible || !sampleModel || busy !== null || channel === null) return;
-		if (sampledScope.current === scopeKey) return;
-		sampledScope.current = scopeKey;
+		if (!scopeDrawDue(scopeTarget.key, scopeOfSample(sampleModel.result))) return;
 		void drawSample({ n: sampleModel.result.n_requested, mode: sampleModel.mode, seed: sampleModel.seed });
 		// Runs again when a busy map frees up, so a scope changed meanwhile is not missed.
 		// eslint-disable-next-line react-hooks/exhaustive-deps
-	}, [scopeKey, visible, busy]);
+	}, [scopeTarget.key, visible, busy, sampleModel]);
+
+	/** The legend's action after a refused draw: the sample on screen drawn again, with the console's scope. */
+	const retryScope = useCallback((): void => {
+		const shown = selection.getState().sampleModel;
+		if (shown) void drawSample({ n: shown.result.n_requested, mode: shown.mode, seed: shown.seed });
+	}, [selection, drawSample]);
 
 	/** Draw the current sample again (same seed, pinned and highlighted keys kept): SAMPLE_EXPIRED. */
 	const resample = useCallback(async (extra: readonly VectorKey[] = []): Promise<string | null> => {
@@ -1512,7 +1561,7 @@ export function MapView(props: MapViewProps): React.ReactElement {
 		...(edges === 'neighbours' && lightCap ? [EDGES_LIGHT_NOTE] : []),
 		...(edges === 'neighbours' && edgesDegraded ? [EDGES_DEGRADED] : []),
 		...(listingLine ? [listingLine] : []),
-		...(scopeIds && scope ? [scopeNote(scope.label, scopeIds.length)] : []),
+		...(sample ? [scopeLine(scopeState, scopeTarget.key ? scopeTarget : null, shownScope.drawn.key ? shownScope.drawn : null)].filter((line): line is string => line !== null) : []),
 		...(isolation ? [isolationLine(isolation.shown, isolation.n)] : []),
 		...(queryB ? [`Hollow star: "${queryB.text}" (compared in Search)`] : []),
 	];
@@ -1548,7 +1597,8 @@ export function MapView(props: MapViewProps): React.ReactElement {
 			data-min-cluster-size={minClusterSize}
 			data-shown={sample ? shownPoints : ''}
 			data-isolated={isolation ? '1' : '0'}
-			data-scoped={scopeIds ? scopeIds.length : ''}
+			data-scoped={sample && shownScope.drawn.documents > 0 ? shownScope.drawn.documents : ''}
+			data-scope-state={sample ? scopeState : ''}
 		>
 			<MapToolbar
 				limits={model.capabilities.sample_light === false ? { ...limits, sample_max_light: limits.sample_max } : limits}
@@ -1671,7 +1721,7 @@ export function MapView(props: MapViewProps): React.ReactElement {
 								cameraOverride={cameraOverride}
 							/>
 						</div>
-						<Legend sample={sampleModel!} colourBy={colourBy} pointCap={pointCap} backend={backend} colouring={colouring} notes={legendNotes} />
+						<Legend sample={sampleModel!} colourBy={colourBy} pointCap={pointCap} backend={backend} colouring={colouring} notes={legendNotes} scopeRetry={scopeState === 'failed' && busy === null ? { label: SCOPE_RETRY, onClick: retryScope } : null} />
 					</div>
 					<aside style={MAP_STYLES.side} aria-label="Map details">
 						<div role="tablist" aria-label="Map details" style={MAP_STYLES.tabs}>

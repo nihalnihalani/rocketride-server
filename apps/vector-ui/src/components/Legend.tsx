@@ -30,7 +30,8 @@
 // 2D distances are approximate while ranks and scores are exact. Coloured by
 // cluster it lists the largest groups and says how many more the Clusters tab
 // lists; the view adds its lines (what a cluster is, the edges drawn, how the
-// sample's listing ended, an isolation) as notes.
+// sample's listing ended, the scope, an isolation) as notes, and the draw again
+// when the store refused to draw the sample for the console's scope.
 // =============================================================================
 
 import React from 'react';
@@ -49,6 +50,8 @@ export interface LegendProps extends Omit<ContractLegendProps, 'colourBy'> {
 	colouring?: IColouring | null;
 	/** Extra lines (query placement, layout notes). */
 	notes?: readonly string[];
+	/** Offered under the lines when the store refused to draw the sample for the console's scope. */
+	scopeRetry?: { label: string; onClick(): void } | null;
 }
 
 /**
@@ -101,6 +104,13 @@ export function Legend(props: LegendProps): React.ReactElement {
 					{line}
 				</p>
 			))}
+			{props.scopeRetry ? (
+				<p style={MAP_STYLES.note}>
+					<button type="button" style={MAP_STYLES.button} data-scope-retry="" onClick={props.scopeRetry.onClick}>
+						{props.scopeRetry.label}
+					</button>
+				</p>
+			) : null}
 		</section>
 	);
 }

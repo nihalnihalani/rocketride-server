@@ -30,6 +30,7 @@
 // =============================================================================
 
 import type { ISampleResult, SampleMode } from '../contract/types';
+import type { MapScopeState } from './model';
 
 /** en-US number. */
 export function num(value: number): string {
@@ -247,13 +248,74 @@ export function listingNote(sample: ISampleResult): string | null {
 	return "Sampled from part of the collection: the store's listing stopped early";
 }
 
+/** "12 documents" / "1 document". */
+function documentsOf(documents: number): string {
+	return `${num(documents)} ${documents === 1 ? 'document' : 'documents'}`;
+}
+
 /**
- * The legend's line for a scope applied to the map.
+ * The legend's line for a scope the points on screen were drawn with.
  *
  * @param label - The scope's words.
  * @param documents - Documents in scope.
  * @returns The line.
  */
 export function scopeNote(label: string, documents: number): string {
-	return `Scope: ${label} (${num(documents)} ${documents === 1 ? 'document' : 'documents'}); the sample is drawn from these only`;
+	return `Scope: ${label} (${documentsOf(documents)}); the sample is drawn from these only`;
+}
+
+/**
+ * The legend's line while the sample is drawn again for a scope (the points shown were drawn without it).
+ *
+ * @param label - The scope's words.
+ * @param documents - Documents in scope.
+ * @returns The line.
+ */
+export function scopePendingNote(label: string, documents: number): string {
+	return `Scope: ${label} (${documentsOf(documents)}); the sample is being drawn again from these only (the points shown were drawn without this scope)`;
+}
+
+/**
+ * The legend's line when the store refused to draw the sample for a scope.
+ *
+ * @param label - The scope's words.
+ * @param documents - Documents in scope.
+ * @returns The line.
+ */
+export function scopeFailedNote(label: string, documents: number): string {
+	return `Scope not applied (${label}, ${documentsOf(documents)}): the sample could not be drawn again from these; the points shown were drawn without this scope`;
+}
+
+/**
+ * The legend's line when the console no longer scopes the map but the points shown were drawn with a scope.
+ *
+ * @param label - The earlier scope's words.
+ * @param documents - Documents in the earlier scope.
+ * @param failed - The store refused to draw the whole collection again.
+ * @returns The line.
+ */
+export function scopeLeftNote(label: string, documents: number, failed: boolean): string {
+	if (failed) return `No scope on the map now, but the sample could not be drawn again: the points shown are still from the earlier scope (${label}, ${documentsOf(documents)})`;
+	return `No scope on the map now: the sample is being drawn again from the whole collection (the points shown are still from the earlier scope: ${label}, ${documentsOf(documents)})`;
+}
+
+/** The legend's action after the store refused a draw for the scope. */
+export const SCOPE_RETRY = 'Draw the sample again';
+
+/**
+ * The legend's scope line: only the scope the points on screen were drawn with
+ * is stated as applied; otherwise what is happening to the console's scope.
+ *
+ * @param state - How the console's scope stands over the sample on screen.
+ * @param target - The console's scope (null for none).
+ * @param drawn - The scope the points on screen were drawn with (null for the whole collection).
+ * @returns The line, or null when there is no scope either way.
+ */
+export function scopeLine(state: MapScopeState, target: { label: string; documents: number } | null, drawn: { label: string; documents: number } | null): string | null {
+	if (state === 'none') return null;
+	if (target) {
+		if (state === 'applied') return scopeNote(target.label, target.documents);
+		return state === 'failed' ? scopeFailedNote(target.label, target.documents) : scopePendingNote(target.label, target.documents);
+	}
+	return drawn ? scopeLeftNote(drawn.label, drawn.documents, state === 'failed') : null;
 }
