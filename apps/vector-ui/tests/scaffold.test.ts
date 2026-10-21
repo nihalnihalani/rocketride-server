@@ -15,6 +15,7 @@
 // =============================================================================
 
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { test } from 'node:test';
@@ -22,7 +23,8 @@ import { test } from 'node:test';
 const APP_ROOT = path.resolve(__dirname, '..');
 const REPO_ROOT = path.resolve(APP_ROOT, '..', '..');
 const pkg = JSON.parse(fs.readFileSync(path.join(APP_ROOT, 'package.json'), 'utf8'));
-const graphPkg = JSON.parse(fs.readFileSync(path.join(REPO_ROOT, 'apps', 'graph-ui', 'package.json'), 'utf8'));
+// sql-ui: the other Explorer app in this checkout, the family member the shared rules are read from.
+const sqlPkg = JSON.parse(fs.readFileSync(path.join(REPO_ROOT, 'apps', 'sql-ui', 'package.json'), 'utf8'));
 
 /** Strip CR so the comparison is line-ending independent (matches uiAudit). */
 function readLf(file: string): string {
@@ -48,7 +50,7 @@ test('manifest identity: id, name, publisher, description and the module federat
 	assert.equal(m.publisher, 'Aparavi Software AG');
 	assert.equal(m.description, 'Manage and visualise the documents in a vector store through pipeline store nodes');
 	assert.equal(m.id.replace(/[^a-zA-Z0-9_$]/g, '_'), 'rocketride_vector');
-	// A version 4 uuid of its own: not graph-ui's, not any other app's.
+	// A version 4 uuid of its own: not any other app's.
 	assert.match(m.projectId, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
 	for (const other of familyPackages()) assert.notEqual(other.pkg.appManifest?.projectId, m.projectId, `projectId is also ${other.name}'s`);
 });
@@ -99,7 +101,7 @@ test('manifest hygiene matches the family contract: license, scripts, the canoni
 	assert.equal(pkg.scripts.typecheck, 'tsc --noEmit');
 	assert.equal(pkg.scripts['typecheck:tests'], 'tsc -p tsconfig.test.json --noEmit');
 	assert.deepEqual(pkg.browserslist, ['chrome >= 81', 'edge >= 83', 'firefox >= 76', 'safari >= 13']);
-	assert.deepEqual(pkg.browserslist, graphPkg.browserslist, 'browserslist equals the family floor (never changed per app)');
+	assert.deepEqual(pkg.browserslist, sqlPkg.browserslist, 'browserslist equals the family floor (never changed per app)');
 });
 
 test('dependencies: exactly the Explorer set, no 3D or windowing library', () => {
@@ -168,8 +170,23 @@ test('tsconfig resolves shared/* to the shared library, and the test program add
 	assert.match(testConfig, /"node"/);
 });
 
-test("the platform stub the tests load is graph-ui's, unchanged", () => {
-	assert.equal(readLf(path.join(APP_ROOT, 'scripts', 'stub-shell.cjs')), readLf(path.join(REPO_ROOT, 'apps', 'graph-ui', 'scripts', 'stub-shell.cjs')));
+// The stub is graph-ui's (feat/graph-explorer), byte for byte. graph-ui is not in every checkout, so its bytes
+// are pinned here; sql-ui's stub is the same code under its own comments, and the code is held to it.
+const FAMILY_STUB_SHA256 = '5013f9a1cd313f860c6285026db5e6acbaac552a42270e5960c2228b1b536ddd';
+
+/** A script's code without its comments and blank lines. */
+function codeOf(text: string): string {
+	return text
+		.replace(/\/\*[\s\S]*?\*\//g, '')
+		.split('\n')
+		.filter((line) => line.trim() && !line.trim().startsWith('//'))
+		.join('\n');
+}
+
+test("the platform stub the tests load is the Explorer family's, unchanged", () => {
+	const stub = readLf(path.join(APP_ROOT, 'scripts', 'stub-shell.cjs'));
+	assert.equal(createHash('sha256').update(stub).digest('hex'), FAMILY_STUB_SHA256, "graph-ui's stub, byte for byte");
+	assert.equal(codeOf(stub), codeOf(readLf(path.join(REPO_ROOT, 'apps', 'sql-ui', 'scripts', 'stub-shell.cjs'))), "sql-ui's stub code");
 });
 
 // The app imports the shared Explorer library (`shared/*`, resolved through tsconfig paths). The App Builder and
@@ -293,5 +310,5 @@ test("the lockfile has an importer for apps/vector-ui with exactly the manifest'
 		const expected = Object.fromEntries(Object.entries(pkg[section] as Record<string, string>).map(([dep, range]) => [dep, overridden.has(dep) ? 'workspace:*' : range]));
 		assert.deepEqual(importer[section], expected, section);
 	}
-	assert.deepEqual(importerSpecifiers(lock, 'apps/graph-ui')?.dependencies?.shell, 'workspace:*', 'the premise: graph-ui reads the same way');
+	assert.deepEqual(importerSpecifiers(lock, 'apps/sql-ui')?.dependencies?.shell, 'workspace:*', 'the premise: sql-ui reads the same way');
 });
