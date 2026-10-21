@@ -587,12 +587,17 @@ def test_remove_counted_reports_the_rows_removed(adapter, store):
 # -----------------------------------------------------------------------------
 
 
-def test_semantic_search_applies_the_floor_not_the_threshold(adapter, store):
-    """Rows under the node threshold survive; rows under the floor do not, unless minScore is -inf."""
+def test_semantic_search_cuts_at_the_floor_or_the_drivers_threshold(adapter, store):
+    """Rows under the cut are dropped unless minScore is -inf.
+
+    The cut is the floor, so rows under the node threshold survive (the questions lane
+    applies it), except on Milvus, whose driver cut at the threshold on develop and still does.
+    """
     h.ingest(store, 'doc-a', '/docs/a.md', [0, 1, 2])
     adapter.set_scores(store, [0.9, 0.35, 0.1])
     kept = [doc.score for doc in store.searchSemantic(_question(), DocFilter(limit=10))]
-    expected = [s for s in (0.9, 0.35, 0.1) if s >= adapter.floor]
+    cut = store.threshold_search if adapter.threshold_in_driver else adapter.floor
+    expected = [s for s in (0.9, 0.35, 0.1) if s >= cut]
     assert kept == pytest.approx(expected, abs=1e-6)
     adapter.set_scores(store, [0.9, 0.35, 0.1])
     every = [doc.score for doc in store.searchSemantic(_question(), h.VxFilter(limit=10, minScore=-math.inf))]

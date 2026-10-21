@@ -69,6 +69,8 @@ def test_l2_scores_fall_with_distance(adapter, store):
     """L2 distance d scores 1 / (1 + d): the closest row scores highest."""
     h.ingest(store, 'doc-a', '/docs/a.md', [0, 1])
     store.similarity = 'L2'
+    # The driver cuts at the node threshold (develop's rule); lowered so both rows come back.
+    store.threshold_search = 0.0
     records = [r for r in adapter.records(store) if r['meta'].get('objectId') == 'doc-a']
 
     def search(collection_name, data, filter=None, limit=10, output_fields=None, **kwargs):

@@ -580,8 +580,10 @@ class Store(DocumentStoreBase):
         """
         Semantic search.
 
-        Hits below the score floor (``effectiveFloor``) are dropped; the node's score
-        threshold is applied by the caller, not here.
+        As on develop, hits below the node's score threshold (``threshold_search``)
+        are dropped here, so the agent ``search`` tool answers what the ``questions``
+        lane keeps. A caller that sets ``DocFilter.minScore`` (the Vector Explorer)
+        gets every hit down to it instead.
         """
         # If the collection does not exists, by definition there are
         # no search results to return
@@ -618,7 +620,9 @@ class Store(DocumentStoreBase):
             output_fields=['meta', 'content'],
         )
 
-        docs = self._convertToDocs(points[0], floor=self.effectiveFloor(docFilter))
+        min_score = getattr(docFilter, 'minScore', None)
+        cut = float(min_score) if min_score is not None else float(self.threshold_search)
+        docs = self._convertToDocs(points[0], floor=cut)
 
         # Return the results
         return docs

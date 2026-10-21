@@ -328,6 +328,8 @@ class Adapter:
     legacy_control_has_model: bool = True
     #: the client library the driver talks to (its errors may carry the server address)
     client_module: str = ''
+    #: whether searchSemantic cuts at the node threshold when minScore is unset (develop's Milvus), else at the floor
+    threshold_in_driver: bool = False
 
     def new_store(self) -> Any:  # pragma: no cover - interface
         raise NotImplementedError
@@ -477,6 +479,7 @@ class MilvusAdapter(Adapter):
     backend = 'milvus'
     services = 'store_milvus/services.json'
     floor = 0.2
+    threshold_in_driver = True
     offset_raises = True
     extras_stored = True
 
