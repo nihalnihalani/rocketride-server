@@ -578,7 +578,8 @@ least one pooled case; without it those cases skip with `NOT RUN:` and the task
 output says so. `scripts/acceptance/vector-explorer/validate_all.sh` always sets
 it, to the `vx-pgbouncer` container from that folder's README unless you point
 it elsewhere, so a local gate run includes the pooled cases. The servers and
-their environment variables (`RR_TEST_PG_DSN`, `RR_TEST_PGVECTOR_POOLER_DSN`,
+their environment variables (`RR_TEST_PG_DSN`, `RR_TEST_PGVECTOR_DSN` for the
+toolpath and wire-fixture suites, `RR_TEST_PGVECTOR_POOLER_DSN`,
 `RR_TEST_QDRANT_URL`, `RR_TEST_CHROMA_URL`, ...) are the ones
 `.github/workflows/_build.yaml` starts; run the same images locally to
 reproduce a CI failure (`scripts/acceptance/vector-explorer/containers/start.sh`
