@@ -83,6 +83,7 @@
 				"nodes/test/test_store_chroma_full.py",
 				"nodes/test/test_store_postgres_full.py",
 				"nodes/test/test_vector_documents_filter.py",
+				"nodes/test/test_vector_hook_names.py",
 				"packages/ai/src/ai/common/store/document_store.py",
 				"packages/ai/src/ai/common/store/pgvector/driver.py",
 				"packages/ai/src/ai/common/store/pgvector/sql.py",
@@ -91,7 +92,8 @@
 				"scripts/acceptance/vector-explorer/selftest/test_seed_legacy.py"
 			],
 			"new": [
-				"nodes/test/test_vector_documents_filter.py"
+				"nodes/test/test_vector_documents_filter.py",
+				"nodes/test/test_vector_hook_names.py"
 			]
 		},
 		{

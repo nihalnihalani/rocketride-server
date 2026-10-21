@@ -840,8 +840,8 @@ class TestPgVectorTransactions:
             if row['objectid'] == 'a':
                 row['isdeleted'] = None  # a row written by hand or by another client
         assert store.countChunks(DocFilter()) == 2
-        assert store.countDocuments(DocFilter()) == 1
-        listed = store.listDocuments(cursor=None, limit=5, object_ids=None, deleted='active', sort='path')
+        assert store.countDocumentsWhere(DocFilter()) == 1
+        listed = store.listDocumentPage(cursor=None, limit=5, object_ids=None, deleted='active', sort='path')
         assert [(r.objectId, r.chunks, r.deleted) for r in listed.items] == [('a', 2, False)]
         assert all(d.metadata.isDeleted is False for d in store.get(DocFilter(objectIds=['a'])))
 
@@ -851,7 +851,7 @@ class TestPgVectorTransactions:
             store.addChunks([_doc(f'd{i}', c, [1, 0, 0, 0, c]) for c in range(2)])
         cursor, seen, totals = None, [], []
         while True:
-            page = store.listDocuments(cursor=cursor, limit=2, object_ids=None, deleted='active', sort='path')
+            page = store.listDocumentPage(cursor=cursor, limit=2, object_ids=None, deleted='active', sort='path')
             seen += [r.objectId for r in page.items]
             totals.append(page.total)
             cursor = page.next_cursor
@@ -931,8 +931,8 @@ class TestRocketrideVectorWriteGate:
 
     The outer gate is the node's expose_tools and allow_write switches (both off
     by default); past it, every write runs the store write gate
-    (vx_write_gate.check_write) with the per-caller switches allow_writes (DAP)
-    and agent_writes (agents).
+    (vx_write_gate.check_write), whose one switch, allow_writes, governs DAP
+    callers. Agents have no switch of their own: allow_write alone decides theirs.
     """
 
     # The two outer switches on: what a pipeline that lets tools write sets.
@@ -999,22 +999,37 @@ class TestRocketrideVectorWriteGate:
         assert self._rows(mock_rv) == ['doc', 'schema']
         glb.endGlobal()
 
-    @pytest.mark.parametrize(
-        ('origin', 'switches', 'code'),
-        [('dap', {'allow_writes': False}, 'WRITES_DISABLED'), ('agent', {'agent_writes': False}, 'WRITES_AGENT')],
-    )
-    def test_switches_refuse_calls_with_a_context(self, mock_rv, origin, switches, code):
+    def test_allow_writes_off_refuses_dap_calls_with_a_context(self, mock_rv):
         from ai.common.tool_context import ToolCallContext, tool_call
 
-        glb, inst = self._node(mock_rv, {'collection': 'rr_vec', 'similarity': 'cosine', **self._OPEN, **switches})
-        ctx = ToolCallContext(origin=origin, source_type='tools', targeted=True, caller={'auth': 'account'})
+        config = {'collection': 'rr_vec', 'similarity': 'cosine', **self._OPEN, 'allow_writes': False}
+        glb, inst = self._node(mock_rv, config)
+        ctx = ToolCallContext(origin='dap', source_type='tools', targeted=True, caller={'auth': 'account'})
         upsert = {
             'documents': [{'content': 'x', 'object_id': 'new', 'embedding': [0, 1, 0, 0, 0], 'embedding_model': 'm'}]
         }
         with tool_call(ctx):
-            assert inst.delete({'object_ids': ['doc']})['code'] == code
-            assert inst.upsert(upsert)['code'] == code
+            assert inst.delete({'object_ids': ['doc']})['code'] == 'WRITES_DISABLED'
+            assert inst.upsert(upsert)['code'] == 'WRITES_DISABLED'
         assert self._rows(mock_rv) == ['doc', 'schema']
+        glb.endGlobal()
+
+    def test_an_agent_write_needs_only_allow_write(self, mock_rv):
+        """allow_writes off and a stray agent_writes off in the config: an agent's upsert and delete still go through."""
+        from ai.common.tool_context import ToolCallContext, tool_call
+
+        config = {'collection': 'rr_vec', 'similarity': 'cosine', **self._OPEN, 'allow_writes': False}
+        glb, inst = self._node(mock_rv, {**config, 'agent_writes': False})
+        assert not hasattr(glb, 'agent_writes'), 'the node reads no agent switch'
+        ctx = ToolCallContext(origin='agent', source_type=None, targeted=True, caller={'auth': 'agent'})
+        upsert = {
+            'documents': [{'content': 'x', 'object_id': 'new', 'embedding': [0, 1, 0, 0, 0], 'embedding_model': 'm'}]
+        }
+        with tool_call(ctx):
+            stored = inst.upsert(upsert)
+            removed = inst.delete({'object_ids': ['doc']})
+        assert stored['success'] is True and removed['success'] is True, (stored, removed)
+        assert self._rows(mock_rv) == ['new', 'schema']
         glb.endGlobal()
 
     def test_agent_call_with_allow_write_on_reaches_the_store(self, mock_rv):

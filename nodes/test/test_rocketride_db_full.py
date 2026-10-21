@@ -767,9 +767,9 @@ class TestRocketrideVectorNode:
         # The outer gate (#2631): the tool surface and the write tools, both off by default.
         assert fields['rrvector.expose_tools']['default'] is False
         assert fields['rrvector.allow_write']['default'] is False
-        # The write gate's DAP switch; agents need only allow_write (no rrvector.agent_writes).
+        # The write gate's DAP switch. Agents have no switch of their own: allow_write alone decides theirs.
         assert fields['rrvector.allow_writes']['default'] is VECTOR_ALLOW_WRITES_DEFAULT
-        assert 'rrvector.agent_writes' not in fields
+        assert not [name for name in fields if 'agent_writes' in name]
         properties = set(fields['rrvector.cloud']['properties'])
         assert {'rrvector.expose_tools', 'rrvector.allow_write', 'rrvector.allow_writes'} <= properties
         # The allow_writes default lives in vx_defaults only: no profile pins it.
@@ -908,7 +908,6 @@ class TestRocketrideVectorNode:
         ('origin', 'switches', 'object_id', 'code'),
         [
             ('dap', {'allow_writes': False}, 'doc', 'WRITES_DISABLED'),
-            ('agent', {'agent_writes': False}, 'doc', 'WRITES_AGENT'),
             ('agent', {}, 'schema', 'RESERVED_ID'),
             ('dap', {'allow_writes': True}, 'schema', 'RESERVED_ID'),
         ],
@@ -934,12 +933,18 @@ class TestRocketrideVectorNode:
         finally:
             glb.endGlobal()
 
-    def test_agent_writes_with_a_call_context_reach_the_store(self, rv, table):
-        """With allow_write on and the write gate's default switches an agent's upsert and delete go through."""
+    @pytest.mark.parametrize(
+        'switches',
+        [{}, {'allow_writes': False, 'agent_writes': False}],
+        ids=['defaults', 'dap-writes-off-and-a-stray-agent-switch'],
+    )
+    def test_an_agent_s_upsert_and_delete_with_a_call_context_reach_the_store(self, rv, table, switches):
+        """allow_write alone decides an agent's write: allow_writes and a stray agent_writes key are not read."""
         from ai.common.tool_context import ToolCallContext
 
         rng = np.random.default_rng(46)
-        glb, inst = _begin_vector_node(rv, {'collection': table, 'similarity': 'cosine'})
+        glb, inst = _begin_vector_node(rv, {'collection': table, 'similarity': 'cosine', **switches})
+        assert not hasattr(glb, 'agent_writes')
         ctx = ToolCallContext(origin='agent', source_type=None, targeted=True, caller={'auth': 'agent'})
         try:
             self._seed(rv, glb, rng)
