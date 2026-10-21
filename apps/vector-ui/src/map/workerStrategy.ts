@@ -37,9 +37,8 @@
 //     needed because Rspack's automatic public path reads `self.location`, which
 //     inside a blob worker is a `blob:` URL, so every later chunk would be
 //     fetched from the wrong place (the same finding as Graph Explorer's
-//     layout worker, apps/graph-ui/src/layout/workerStrategy.ts). This path
-//     exists only when the build is not a production build; it is never taken
-//     silently in production.
+//     layout worker). This path exists only when the build is not a
+//     production build; it is never taken silently in production.
 //
 // Nothing here touches the DOM, so the decision and the wrapper source are
 // tested in Node.
