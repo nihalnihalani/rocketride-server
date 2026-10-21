@@ -37,23 +37,33 @@
 // nothing because it ignored the filter). Whatever the store did not apply is
 // matched here over the loaded rows (`clientKeys`, `matches`), and the words
 // always say which ("(store)", "(store; the path text filtered here)",
-// "(filtered here; the store cannot filter by these)"). A count matched here
-// over a listing that stopped short (capped, stalled) is only of the rows
-// loaded, and the words say that too ("N of M loaded match", "at least").
+// "(filtered here; the store cannot filter by these)"). Until the store
+// answers for a scope (its first page on its way, or failed) nothing is said
+// about what it applies and nothing is counted: the scope is loading
+// (`'pending'`). A count matched here over a listing that stopped short
+// (capped, stalled) is only of the rows loaded, and the words say that too
+// ("N of M loaded match", "at least"). The directory's "Documents in scope"
+// export holds the scope's own loaded documents, whether or not the list is
+// filtered by it (`directoryExportItems`).
 // Without a condition the path box is not a scope and is never sent: it
 // filters what is loaded, as it always did. A saved filter keeps the
 // conditions only (`conditionsFilter`).
 //
 // THE SCOPE'S DOCUMENTS. `resolveScope` turns the listing into the objectIds
-// the scope covers once the listing settles; above `limits.scope_keys_max`
-// (2,000) it gives the count instead (`overflow`) and the map, search and chat
-// are not scoped (`scopeAvailability`), so no surface ever sends more than the
-// cap. Nothing here is kept outside memory.
+// the scope covers once the listing holds every document it lists; above
+// `limits.scope_keys_max` (2,000) it gives the count instead (`overflow`), so
+// no surface ever sends more than the cap. Until the ids are known (the
+// listing pages, its first page failed, or it stopped short of every
+// document) the map, search and chat are not scoped by it, and the Apply to
+// toggles are off with the sentence that says why (`scopeReadiness`,
+// `scopeAvailability`): a toggle never reads on while its surface is
+// unscoped. Nothing here is kept outside memory.
 // =============================================================================
 
-import type { Availability, FilterApplied, IDocumentItem, IDocumentsFilter, IScopeState, IStatsResult } from '../contract/types';
+import type { Availability, FilterApplied, IDocumentItem, IDocumentsFilter, IExportItem, IScopeState, IStatsResult } from '../contract/types';
 import { DOCUMENTS_FILTER_KEYS } from '../contract/types';
-import { filterItems, filterSummary } from './documents';
+import { DIRECTORY_LOAD_MORE } from './budgets';
+import { documentExportRows, filterItems, filterSummary } from './documents';
 import type { IPagerState } from './documents';
 import type { IStatsView } from './results';
 
@@ -343,11 +353,68 @@ export function sameFilter(a: IDocumentsFilter | null | undefined, b: IDocuments
 	return canon(a) === canon(b);
 }
 
-/** An ISO-8601 time the node accepts (a date, or a date and time with an optional zone). */
-const ISO_RE = /^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:?\d{2})?)?$/;
+/** An extension the node accepts in `file_types` (vx_types `_FILE_TYPE`): 1 to 16 lower-case letters and digits, no dot. */
+export const FILE_TYPE_RE = /^[a-z0-9]{1,16}$/;
 
-/** An extension without a dot: letters, digits, '_' and '-'. */
-const EXT_RE = /^[a-z0-9_-]{1,16}$/i;
+/** The node refuses more entries of `file_types` than this (vx_types `DOC_LIST_FILTER_TYPES_MAX`). */
+export const FILTER_TYPES_MAX = 32;
+
+/**
+ * Whether an extension can be sent in `file_types` as it is.
+ *
+ * @param ext - The extension, without the dot.
+ * @returns True when the node accepts it.
+ */
+export function isFilterExtension(ext: string): boolean {
+	return FILE_TYPE_RE.test(ext);
+}
+
+/**
+ * An ISO-8601 time as the node reads it (vx_types `_INSTANT`): a date,
+ * optionally a time ('T', 't' or a space; seconds and up to nine fraction
+ * digits optional) and, with a time, 'Z' or an offset '+HH:MM'.
+ */
+const INSTANT_RE = /^(\d{4})-(\d{2})-(\d{2})(?:[Tt ](\d{2}):(\d{2})(?::(\d{2})(?:\.\d{1,9})?)?([Zz]|[+-]\d{2}:\d{2})?)?$/;
+
+/** The first and last instants the node can turn into its UTC form (years 1 to 9999). */
+const FIRST_INSTANT_MS = Date.parse('0001-01-01T00:00:00Z');
+const LAST_INSTANT_MS = Date.parse('9999-12-31T23:59:59Z');
+
+/** Days in a month of the proleptic Gregorian calendar. */
+function daysIn(year: number, month: number): number {
+	const leap = (year % 4 === 0 && year % 100 !== 0) || year % 400 === 0;
+	return [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1] as number;
+}
+
+/**
+ * Read an ISO-8601 time the way the node does (no offset is UTC; the fraction
+ * is dropped), refusing what it refuses: a month 13, February 30, hour 24, an
+ * offset of 24 hours, and a time whose UTC form falls outside years 1 to 9999.
+ *
+ * @param text - The time.
+ * @returns Epoch ms, or null when the node would refuse it.
+ */
+export function instantMs(text: string): number | null {
+	const m = INSTANT_RE.exec(text.trim());
+	if (m === null) return null;
+	const [year, month, day] = [Number(m[1]), Number(m[2]), Number(m[3])];
+	const [hour, minute, second] = [Number(m[4] ?? 0), Number(m[5] ?? 0), Number(m[6] ?? 0)];
+	if (year < 1 || month < 1 || month > 12 || day < 1 || day > daysIn(year, month) || hour > 23 || minute > 59 || second > 59) return null;
+	let offset = 0;
+	const zone = m[7];
+	if (zone !== undefined && zone !== 'Z' && zone !== 'z') {
+		const hours = Number(zone.slice(1, 3));
+		const minutes = Number(zone.slice(4, 6));
+		if (hours > 23 || minutes > 59) return null;
+		offset = (zone[0] === '+' ? 1 : -1) * (hours * 60 + minutes) * 60_000;
+	}
+	// setUTCFullYear, not Date.UTC, which reads the years 0 to 99 as 1900 to 1999.
+	const at = new Date(0);
+	at.setUTCFullYear(year, month - 1, day);
+	at.setUTCHours(hour, minute, second, 0);
+	const ms = at.getTime() - offset;
+	return ms >= FIRST_INSTANT_MS && ms <= LAST_INSTANT_MS ? ms : null;
+}
 
 /**
  * Check a wire filter by the node's rules (contract section 4.4-A), so the app
@@ -369,12 +436,13 @@ export function validateFilter(value: unknown): string | null {
 	if (isSet('file_types')) {
 		const types = filter.file_types;
 		if (!Array.isArray(types) || types.length === 0) return "'file_types' must list at least one extension.";
-		for (const t of types) if (typeof t !== 'string' || !EXT_RE.test(t)) return `'${String(t)}' is not a file extension (letters and digits, without the dot).`;
+		if (types.length > FILTER_TYPES_MAX) return `'file_types' lists at most ${FILTER_TYPES_MAX} extensions.`;
+		for (const t of types) if (typeof t !== 'string' || !isFilterExtension(t.trim().toLowerCase())) return `'${String(t)}' is not a file extension (letters and digits, without the dot).`;
 	}
 	for (const key of ['ingested_after', 'ingested_before']) {
 		if (!isSet(key)) continue;
 		const text = filter[key];
-		if (typeof text !== 'string' || !ISO_RE.test(text) || !Number.isFinite(Date.parse(text))) return `'${key}' must be an ISO-8601 date or time.`;
+		if (typeof text !== 'string' || instantMs(text) === null) return `'${key}' must be an ISO-8601 date or time.`;
 	}
 	for (const key of ['min_chunks', 'max_chunks']) {
 		if (!isSet(key)) continue;
@@ -445,14 +513,15 @@ function keeps(item: IDocumentItem, filter: IDocumentsFilter, key: FilterKey): b
 		case 'file_types': {
 			const path = item.path.toLowerCase();
 			const name = path.slice(Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\')) + 1);
-			return (filter.file_types as string[]).some((t) => name.endsWith(`.${t.toLowerCase()}`));
+			return (filter.file_types as string[]).some((t) => name.endsWith(`.${t.trim().toLowerCase()}`));
 		}
 		case 'ingested_after':
 		case 'ingested_before': {
 			if (item.ingestedAt === null) return false;
 			const at = Date.parse(item.ingestedAt);
-			const bound = Date.parse(filter[key] as string);
-			if (!Number.isFinite(at) || !Number.isFinite(bound)) return false;
+			// The bound is read as the node reads it, so the rows matched here agree with the store.
+			const bound = instantMs(filter[key] as string);
+			if (!Number.isFinite(at) || bound === null) return false;
 			return key === 'ingested_after' ? at >= bound : at < bound;
 		}
 		case 'min_chunks':
@@ -554,8 +623,11 @@ export interface IScopeView {
 	current: boolean;
 	/** The listing is current and ended (complete, capped, stopped). */
 	settled: boolean;
-	/** How the store answered for this scope: 'here' when the listing did not ask it. */
-	applied: FilterApplied | 'here';
+	/**
+	 * How the store answered for this scope: 'here' when the listing did not ask it; 'pending' while the
+	 * listing asked and the store has not answered yet (its first page is on its way, or failed).
+	 */
+	applied: FilterApplied | 'here' | 'pending';
 	ignored: string[];
 	/** The store's total for the listing, when it gave one. */
 	total: number | null;
@@ -565,6 +637,11 @@ export interface IScopeView {
 	 * listing stopped short (capped, stalled, failed): then it is of the loaded rows.
 	 */
 	exact: boolean;
+	/**
+	 * The listing is current and holds every document it lists (it ended, or
+	 * loaded the store's total): its matches are every document the scope keeps.
+	 */
+	complete: boolean;
 }
 
 /**
@@ -580,20 +657,33 @@ export function scopeView(scope: Pick<IScopeState, 'filter'> & { applyTo?: Pick<
 	const asked = dir.filter !== null && sameFilter(dir.filter, wanted);
 	// While the list is filtered by the scope, the listing must be the one that asked for it; otherwise an unfiltered one.
 	const current = (scope.applyTo?.documents ?? true) && wanted !== null ? asked : dir.filter === null;
-	const applied: FilterApplied | 'here' = asked ? (dir.filterApplied ?? 'none') : 'here';
+	// Asked, and no page answered yet: nothing is known about what the store applies (never 'none').
+	const applied: IScopeView['applied'] = asked ? (dir.filterApplied ?? 'pending') : 'here';
 	const keys = clientKeys(scope.filter, asked ? dir.filterApplied : null, dir.filterIgnored);
 	const match = scopeObjectIds(dir.rows, scope.filter, cap, keys);
 	const storeCounts = applied === 'server' && keys.length === 0 && dir.total !== null;
 	const count = storeCounts ? Math.max(dir.total as number, match.count) : match.count;
-	const complete = dir.status === 'done' || (dir.total !== null && dir.rows.length >= dir.total);
-	return { count, chunks: match.chunks, ids: count > cap ? null : match.ids, loaded: dir.rows.length, current, settled: current && SETTLED.has(dir.status), applied, ignored: asked ? dir.filterIgnored : [], total: dir.total, exact: storeCounts || complete };
+	const complete = listingComplete(dir);
+	return { count, chunks: match.chunks, ids: count > cap ? null : match.ids, loaded: dir.rows.length, current, settled: current && SETTLED.has(dir.status), applied, ignored: asked ? dir.filterIgnored : [], total: dir.total, exact: storeCounts || complete, complete: current && complete };
+}
+
+/**
+ * Whether a listing holds every document it lists: it ended, or it loaded the store's total.
+ *
+ * @param dir - The listing.
+ * @returns True when nothing more is to come.
+ */
+function listingComplete(dir: IPagerState): boolean {
+	return dir.status === 'done' || (dir.total !== null && dir.rows.length >= dir.total);
 }
 
 /**
  * Resolve a scope's documents from the directory: its objectIds once the
- * listing for it settles (null while it loads, or while the list still shows
- * another listing), or, above the cap, the count as soon as it is known.
- * Returns the same object when nothing changed.
+ * listing for it holds every document it lists (null while it loads, while
+ * the list still shows another listing, and when the listing stopped short:
+ * capped, stalled, one page only or failed, since the rows loaded are then
+ * only part of the scope), or, above the cap, the count as soon as it is
+ * known. Returns the same object when nothing changed.
  *
  * @param scope - The scope.
  * @param dir - The directory's listing (filtered by the scope when its Documents toggle is on).
@@ -603,7 +693,9 @@ export function scopeView(scope: Pick<IScopeState, 'filter'> & { applyTo?: Pick<
 export function resolveScope(scope: IScopeState, dir: IPagerState, cap: number): IScopeState {
 	const view = scopeView(scope, dir, cap);
 	const overflow = view.current && view.count > cap ? view.count : null;
-	const objectIds = overflow === null && view.settled ? view.ids : null;
+	// Only a listing of every document names the scope's documents: a failed first page or a listing that stopped
+	// short leaves them unknown (scopeReadiness says which), so no empty or partial scope is claimed.
+	const objectIds = overflow === null && view.settled && view.applied !== 'pending' && view.complete ? view.ids : null;
 	const label = describeFilter(scope.filter);
 	const sameIds = scope.objectIds === objectIds || (scope.objectIds !== null && objectIds !== null && scope.objectIds.length === objectIds.length && scope.objectIds.every((id, i) => id === objectIds[i]));
 	if (sameIds && scope.overflow === overflow && scope.label === label) return scope;
@@ -646,14 +738,27 @@ export function scopeFromFilter(filter: IFilter, prev: IScopeState | null | unde
 }
 
 /**
- * A scope with the path box's new text (the same scope when it did not change).
+ * A scope with the path box's new text (the same scope when it did not
+ * change, or when the node would refuse the text: the ScopeBar says so).
  *
  * @param scope - The scope.
  * @param text - The path box, after its debounce.
  * @returns The scope.
  */
 export function withText(scope: IScopeState, text: string): IScopeState {
-	return scopeFromFilter(filterOf(scope, text), scope) ?? scope;
+	const next = scopeFromFilter(filterOf(scope, text), scope) ?? scope;
+	return checkScope(next) === null ? next : scope;
+}
+
+/**
+ * Why the node would refuse a new scope's conditions (a chart's bar, "Scope
+ * to this folder", the path box), so the console says it instead of sending it.
+ *
+ * @param scope - The new scope, or null for none.
+ * @returns null when it can be sent, else the sentence.
+ */
+export function checkScope(scope: Pick<IScopeState, 'filter'> | null): string | null {
+	return scope === null ? null : validateFilter(scope.filter);
 }
 
 /**
@@ -680,7 +785,15 @@ export interface IDirectoryView {
 	summary: string | null;
 	/** What the directory knows about the scope, or null without one. */
 	scope: IScopeView | null;
+	/**
+	 * The loaded documents the scope keeps, whatever its Documents toggle (on, they are the rows listed);
+	 * null without a scope, or while the store has not answered for it.
+	 */
+	scopeRows: IDocumentItem[] | null;
 }
+
+/** The status line while the store has not answered for a scope yet. */
+export const SCOPE_LOADING_TEXT = 'Loading the documents in scope…';
 
 /**
  * The directory's rows and status line. Without a scope the path box filters
@@ -698,17 +811,43 @@ export interface IDirectoryView {
 export function directoryView(dir: IPagerState, scope: IScopeState | null, text: string, cap: number): IDirectoryView {
 	if (scope === null) {
 		const rows = filterItems(dir.rows, text);
-		return { rows, summary: filterSummary(dir, text, rows.length), scope: null };
+		return { rows, summary: filterSummary(dir, text, rows.length), scope: null, scopeRows: null };
 	}
 	const view = scopeView(scope, dir, cap);
-	if (!scope.applyTo.documents) {
-		const rows = filterItems(dir.rows, text);
-		return { rows, summary: `Not applied to this list. Scope: ${scopeStatusText(view)}`, scope: view };
-	}
+	const listed = scope.applyTo.documents ? null : filterItems(dir.rows, text);
+	// The store has not answered for the scope: say it is loading (a failed first page: the footer says why, with Retry).
+	if (view.applied === 'pending') return { rows: listed ?? [], summary: dir.status === 'loading' ? SCOPE_LOADING_TEXT : null, scope: view, scopeRows: null };
 	const asked = view.applied !== 'here';
 	const keys = clientKeys(scope.filter, asked ? dir.filterApplied : null, dir.filterIgnored);
-	const rows = keys.length === 0 ? [...dir.rows] : dir.rows.filter((row) => matches(row, scope.filter, keys));
-	return { rows, summary: scopeStatusText(view), scope: view };
+	const scopeRows = keys.length === 0 ? [...dir.rows] : dir.rows.filter((row) => matches(row, scope.filter, keys));
+	if (listed !== null) return { rows: listed, summary: `Not applied to this list. Scope: ${scopeStatusText(view)}`, scope: view, scopeRows };
+	return { rows: scopeRows, summary: scopeStatusText(view), scope: view, scopeRows };
+}
+
+/**
+ * The directory's export items: the loaded documents, and with a scope the
+ * loaded documents it keeps (whatever its Documents toggle). The scope's
+ * label says "Loaded documents in scope" while its listing has not loaded
+ * every document, so the count never reads as the scope's whole size.
+ *
+ * @param dir - The listing.
+ * @param view - The directory's view of it ({@link directoryView}).
+ * @returns The items.
+ */
+export function directoryExportItems(dir: IPagerState, view: IDirectoryView): IExportItem[] {
+	const items: IExportItem[] = [{ id: 'directory-loaded', label: `Loaded documents (${dir.rows.length.toLocaleString('en-US')})`, kind: 'documents', disabled: dir.rows.length === 0 ? 'Nothing loaded yet' : null, rows: () => documentExportRows(dir.rows) }];
+	if (view.scope === null) return items;
+	const rows = view.scopeRows;
+	if (rows === null) {
+		items.push({ id: 'directory-scope', label: 'Documents in scope', kind: 'documents', disabled: 'The documents in scope have not loaded yet', rows: () => documentExportRows([]) });
+		return items;
+	}
+	// Every document the scope keeps is loaded: the listing asked for the scope (or for every document) and ended complete.
+	const complete = (view.scope.current || dir.filter === null) && (dir.status === 'done' || (dir.total !== null && dir.rows.length >= dir.total));
+	const label = `${complete ? 'Documents in scope' : 'Loaded documents in scope'} (${rows.length.toLocaleString('en-US')})`;
+	const disabled = rows.length > 0 ? null : complete ? 'No document matches the scope' : 'No loaded document matches the scope';
+	items.push({ id: 'directory-scope', label, kind: 'documents', disabled, rows: () => documentExportRows(rows) });
+	return items;
 }
 
 // =============================================================================
@@ -764,6 +903,8 @@ export function scopeStatusText(view: Pick<IScopeView, 'applied' | 'ignored' | '
 		}
 		case 'none':
 			return `${view.count.toLocaleString('en-US')} of ${view.loaded.toLocaleString('en-US')} loaded match (filtered here; the store cannot filter by these)`;
+		case 'pending':
+			return SCOPE_LOADING_TEXT;
 		default:
 			return `${view.count.toLocaleString('en-US')} of ${view.loaded.toLocaleString('en-US')} loaded match (filtered here)`;
 	}
@@ -774,27 +915,138 @@ export function scopeStatusText(view: Pick<IScopeView, 'applied' | 'ignored' | '
  *
  * @param count - Documents in scope.
  * @param cap - `limits.scope_keys_max`.
+ * @param atLeast - The count is of the loaded rows only (the listing has not loaded every document).
  * @returns The sentence.
  */
-export function tooLargeText(count: number, cap: number): string {
-	return `Scope too large for the map, search and chat (${count.toLocaleString('en-US')} documents; at most ${cap.toLocaleString('en-US')}). Narrow the folder.`;
+export function tooLargeText(count: number, cap: number, atLeast = false): string {
+	return `Scope too large for the map, search and chat (${atLeast ? 'at least ' : ''}${count.toLocaleString('en-US')} documents; at most ${cap.toLocaleString('en-US')}). Narrow the folder.`;
 }
 
-/** Why the map, search and chat are not scoped by a scope that keeps nothing. */
+/** Why the map, search and chat are not scoped by a scope that keeps nothing (said only once every document is loaded). */
 export const NO_MATCH_SCOPE = 'No document matches these conditions, so the map, search and chat are not scoped.';
 
+/** Why the map, search and chat are not scoped while the scope's listing is on its way. */
+export const SCOPE_WAITING_TEXT = "Waiting for the scope's documents; the map, search and chat are not scoped yet.";
+
+/** Why they are not scoped after the scope's first page failed. */
+export const SCOPE_FAILED_TEXT = "The scope's documents did not load; Retry the directory. The map, search and chat are not scoped.";
+
+/** How far a listing is, in words: '500 of 600 loaded', '500 loaded'. */
+function loadedWords(loaded: number, total: number | null): string {
+	return total !== null && total >= loaded ? `${loaded.toLocaleString('en-US')} of ${total.toLocaleString('en-US')} loaded` : `${loaded.toLocaleString('en-US')} loaded`;
+}
+
 /**
- * Whether each surface can be scoped (the Apply to toggles).
+ * Why the map, search and chat are not scoped yet while the scope's listing pages.
+ *
+ * @param loaded - Rows loaded so far.
+ * @param total - The store's total for the listing, when it said.
+ * @returns e.g. "Waiting for the scope's documents (500 of 600 loaded); ...".
+ */
+export function scopeWaitingText(loaded: number, total: number | null): string {
+	return loaded === 0 ? SCOPE_WAITING_TEXT : `Waiting for the scope's documents (${loadedWords(loaded, total)}); the map, search and chat are not scoped yet.`;
+}
+
+/** The end of every sentence for a listing that stopped short. */
+const NOT_ALL_KNOWN = "so the scope's documents are not all known: the map, search and chat are not scoped.";
+
+/** How far Load more goes: one click when the rest fits, else the pace. */
+function loadMoreWords(left: number | null): string {
+	const pace = `(${DIRECTORY_LOAD_MORE.toLocaleString('en-US')} at a time)`;
+	if (left === null) return `Load more to include them ${pace}.`;
+	return left <= DIRECTORY_LOAD_MORE ? `Load more to include the other ${left.toLocaleString('en-US')}.` : `Load more to include the other ${left.toLocaleString('en-US')} ${pace}.`;
+}
+
+/**
+ * Why the map, search and chat are not scoped by a listing that stopped short.
+ * A capped listing says how far Load more goes (the documents left when the
+ * store counted them, and how many a click lists), so on a large collection
+ * the instruction is one the user can weigh.
+ *
+ * @param status - How it stopped (capped, unsupported, stalled, error).
+ * @param loaded - Rows loaded.
+ * @param total - The store's total for the listing, when it said.
+ * @returns The sentence, with what would include the rest.
+ */
+export function scopePartialText(status: IPagerState['status'], loaded: number, total: number | null): string {
+	const n = loaded.toLocaleString('en-US');
+	switch (status) {
+		case 'capped':
+			return total !== null && total > loaded ? `Only ${n} of ${total.toLocaleString('en-US')} documents are loaded, ${NOT_ALL_KNOWN} ${loadMoreWords(total - loaded)}` : `Only ${n} documents are loaded and more may exist, ${NOT_ALL_KNOWN} ${loadMoreWords(null)}`;
+		case 'unsupported':
+			return `Only the first page of documents is listed (${n} loaded), ${NOT_ALL_KNOWN}`;
+		case 'stalled':
+			return `Loading stopped at ${n} documents, ${NOT_ALL_KNOWN}`;
+		case 'error':
+			return `Loading stopped at ${n} documents, ${NOT_ALL_KNOWN} Retry the directory to include them.`;
+		default:
+			return `Only ${n} documents are loaded, ${NOT_ALL_KNOWN}`;
+	}
+}
+
+/**
+ * Where a scope's documents are:
+ *   ready     its objectIds are known (at least one): the map, search and chat can be scoped;
+ *   overflow  more than the cap;
+ *   empty     every document is loaded and none matches;
+ *   waiting   its listing is on its way (or the list still shows another one);
+ *   failed    its first page failed (Retry);
+ *   partial   its listing stopped short of every document (capped, one page only, stalled, failed part-way).
+ */
+export type ScopePhase = 'ready' | 'overflow' | 'empty' | 'waiting' | 'failed' | 'partial';
+
+/** A scope's phase and why the map, search and chat are not scoped by it (null when ready). */
+export interface IScopeReadiness {
+	phase: ScopePhase;
+	reason: string | null;
+}
+
+/**
+ * Where a scope's documents are, resolved from the directory's listing when
+ * given (else from the scope as it was last resolved: its objectIds not known
+ * yet is 'waiting').
  *
  * @param scope - The scope.
  * @param cap - `limits.scope_keys_max`.
+ * @param dir - The directory's listing, when known.
+ * @returns The phase and the sentence.
+ */
+export function scopeReadiness(scope: IScopeState, cap: number, dir?: IPagerState | null): IScopeReadiness {
+	const resolved = dir ? resolveScope(scope, dir, cap) : scope;
+	const view = dir ? scopeView(resolved, dir, cap) : null;
+	if (resolved.overflow !== null) return { phase: 'overflow', reason: tooLargeText(resolved.overflow, cap, view !== null && !view.exact) };
+	if (resolved.objectIds !== null) return resolved.objectIds.length === 0 ? { phase: 'empty', reason: NO_MATCH_SCOPE } : { phase: 'ready', reason: null };
+	if (!dir || view === null || !view.current) return { phase: 'waiting', reason: SCOPE_WAITING_TEXT };
+	if (!view.settled) return { phase: 'waiting', reason: scopeWaitingText(view.loaded, dir.total) };
+	if (view.applied === 'pending') return { phase: 'failed', reason: SCOPE_FAILED_TEXT };
+	return { phase: 'partial', reason: scopePartialText(dir.status, view.loaded, dir.total) };
+}
+
+/**
+ * Whether each surface can be scoped (the Apply to toggles): Map, Search and
+ * Chat only once the scope's documents are known and fit the cap; otherwise
+ * they are off, disabled with the sentence, never shown on while unscoped.
+ *
+ * @param scope - The scope.
+ * @param cap - `limits.scope_keys_max`.
+ * @param dir - The directory's listing, when known (the sentence then says how far it is).
  * @returns Per surface: available, or disabled with the sentence.
  */
-export function scopeAvailability(scope: IScopeState, cap: number): Record<keyof IScopeState['applyTo'], Availability> {
-	let others: Availability = ON;
-	if (scope.overflow !== null) others = { enabled: false, reason: tooLargeText(scope.overflow, cap) };
-	else if (scope.objectIds !== null && scope.objectIds.length === 0) others = { enabled: false, reason: NO_MATCH_SCOPE };
+export function scopeAvailability(scope: IScopeState, cap: number, dir?: IPagerState | null): Record<keyof IScopeState['applyTo'], Availability> {
+	const readiness = scopeReadiness(scope, cap, dir);
+	const others: Availability = readiness.phase === 'ready' ? ON : { enabled: false, reason: readiness.reason };
 	return { documents: ON, map: others, search: others, chat: others };
+}
+
+/**
+ * The directory's empty text when no listed row matches the scope: of the
+ * loaded rows only while the listing has not loaded every document.
+ *
+ * @param view - What the directory knows about the scope.
+ * @returns e.g. 'No loaded document matches these conditions (5,000 of 12,000 loaded).'
+ */
+export function scopeNoMatchText(view: Pick<IScopeView, 'complete' | 'loaded' | 'total'>): string {
+	return view.complete ? 'No documents match these conditions.' : `No loaded document matches these conditions (${loadedWords(view.loaded, view.total)}).`;
 }
 
 /**
@@ -802,11 +1054,15 @@ export function scopeAvailability(scope: IScopeState, cap: number): Record<keyof
  * scope's own (`exact` false: matched over the rows loaded so far) is "at
  * least", in the rows loaded.
  *
- * @param view - The scope's count, its chunks (summed here), whether the listing settled, how many rows are loaded and whether the count is the scope's own (default true).
+ * Before the store answered for the scope (`applied` 'pending') nothing is
+ * counted: "Scope: loading…", or after a failed first page "not counted".
+ *
+ * @param view - The scope's count, its chunks (summed here), whether the listing settled, how many rows are loaded, whether the count is the scope's own (default true) and how the store answered.
  * @param stats - The last stats answer (its document count), or null.
  * @returns e.g. 'Scope: 12 of 42 documents · 318 chunks (counted here)'.
  */
-export function scopeStripText(view: Pick<IScopeView, 'count' | 'chunks' | 'settled' | 'loaded'> & { exact?: boolean }, stats: Pick<IStatsView, 'documents'> | Pick<IStatsResult, 'documents'> | null): string {
+export function scopeStripText(view: Pick<IScopeView, 'count' | 'chunks' | 'settled' | 'loaded'> & { exact?: boolean; applied?: IScopeView['applied'] }, stats: Pick<IStatsView, 'documents'> | Pick<IStatsResult, 'documents'> | null): string {
+	if (view.applied === 'pending') return view.settled ? 'Scope: not counted (the listing did not load)' : 'Scope: loading…';
 	const of = stats?.documents ?? null;
 	const exact = view.exact !== false;
 	const docs = `${exact ? '' : 'at least '}${of === null ? plural(view.count, 'document', 'documents') : `${view.count.toLocaleString('en-US')} of ${plural(of, 'document', 'documents')}`}`;

@@ -20,7 +20,7 @@ import { test } from 'node:test';
 import React from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import type { IRoleChannel } from 'shared/explorer';
-import type { ConsoleActions, ConsoleModel, IDialectResult, IDocumentItem, VectorChannels } from '../src/contract/types';
+import type { ConsoleActions, ConsoleModel, IDialectResult, IDocumentItem, IExportItem, IScopeState, VectorChannels } from '../src/contract/types';
 import { fixture } from './support/fixtures';
 
 // The shell's building blocks exist only inside a running shell: plain stand-ins that render their text.
@@ -49,15 +49,24 @@ moduleWithLoad._load = function (request: string, parent: unknown, isMain: boole
 	return originalLoad.call(this, request, parent, isMain);
 };
 
+// The directory's export items as the ExportMenu receives them: a stand-in that records its props.
+let exportItems: readonly IExportItem[] = [];
+function ExportMenuStandIn(props: { items: readonly IExportItem[] }): React.ReactElement {
+	exportItems = props.items;
+	return <span data-component="ExportMenu" />;
+}
+const exportMenuPath = require.resolve('../src/components/ExportMenu');
+require.cache[exportMenuPath] = { id: exportMenuPath, filename: exportMenuPath, loaded: true, exports: { __esModule: true, default: ExportMenuStandIn, ExportMenu: ExportMenuStandIn } } as never;
+
 const { createSelectionStore } = require('../src/contract/bridge') as typeof import('../src/contract/bridge');
 const { DocumentDirectory } = require('../src/components/DocumentDirectory') as typeof import('../src/components/DocumentDirectory');
-const { StatsStrip } = require('../src/components/StatsStrip') as typeof import('../src/components/StatsStrip');
+const { StatsAsOf, StatsStrip } = require('../src/components/StatsStrip') as typeof import('../src/components/StatsStrip');
 const { StatsCharts } = require('../src/components/StatsCharts') as typeof import('../src/components/StatsCharts');
 const { HealthPanel } = require('../src/components/HealthPanel') as typeof import('../src/components/HealthPanel');
 const { healthSummary } = require('../src/vector/health') as typeof import('../src/vector/health');
 const { readDialect } = require('../src/vector/results') as typeof import('../src/vector/results');
 const { DocumentView } = require('../src/views/DocumentView') as typeof import('../src/views/DocumentView');
-const { pagerApplyPage, pagerBegin, pagerInit } = require('../src/vector/documents') as typeof import('../src/vector/documents');
+const { pagerApplyPage, pagerBegin, pagerFail, pagerInit } = require('../src/vector/documents') as typeof import('../src/vector/documents');
 const { readDocumentsPage, readStats } = require('../src/vector/results') as typeof import('../src/vector/results');
 
 const dialect = fixture<IDialectResult>('dialect_pgvector');
@@ -97,6 +106,15 @@ test('the stats strip ends with a collapsed Charts disclosure holding the StatsC
 	assert.ok(mounted(html, 'StatsCharts') > html.indexOf('>Charts</summary>'));
 });
 
+test('the stats strip renders with 130,000 loaded rows (Load more, 25 times): the closed Charts disclosure bins them without a RangeError', () => {
+	const rows: IDocumentItem[] = Array.from({ length: 130_000 }, (_, i) => ({ objectId: `d${i}`, path: `C:/corp/f${i % 97}/d${i}.pdf`, chunks: 1 + (i % 40), has_first_chunk: true, tables: 0, deleted: false, nodeId: null, size: 1, modifyTime: null, ingestedAt: `2026-0${1 + (i % 9)}-15T00:00:00Z`, pointId: null }));
+	const stats = { view: readStats(fixture('stats_pgvector')), status: 'ready' as const, error: null, lastAt: 0, mode: 'full' as const };
+	const html = renderToStaticMarkup(<StatsStrip stats={stats} dialect={dialect} readOnly={false} documents={rows} />);
+	assert.doesNotMatch(html, /<details[^>]* open/, 'the disclosure is closed');
+	mounted(html, 'StatsCharts');
+	assert.match(html, /aria-label="Chunks per document, 130,000 documents in /, 'every loaded row is binned');
+});
+
 test('while a scope is active the stats strip says what it covers on a second line', () => {
 	const stats = { view: readStats(fixture('stats_pgvector')), status: 'ready' as const, error: null, lastAt: 0, mode: 'full' as const };
 	const html = renderToStaticMarkup(<StatsStrip stats={stats} dialect={dialect} readOnly={false} scopeLine="Scope: 12 of 42 documents · 318 chunks (counted here)" />);
@@ -132,6 +150,49 @@ test('the charts mark the bar the scope selected (pressed, outlined) and say wha
 	assert.match(loading, /<svg aria-hidden="true"/, 'skeleton bars');
 	assert.match(loading, /role="status"[^>]*>Loading documents…</);
 	assert.match(renderToStaticMarkup(<StatsCharts rows={[]} dialect={dialect} />), /No documents to chart yet\./);
+});
+
+/** Every element in a React tree (function components are not called). */
+function elementsOf(node: React.ReactNode, out: React.ReactElement[] = []): React.ReactElement[] {
+	if (Array.isArray(node)) for (const child of node) elementsOf(child, out);
+	else if (React.isValidElement(node)) {
+		out.push(node);
+		elementsOf((node.props as { children?: React.ReactNode }).children, out);
+	}
+	return out;
+}
+
+test("the strip's one-second clock re-renders only the 'counts as of' words, never the charts", () => {
+	const rows: IDocumentItem[] = readDocumentsPage(fixture('documents_page1')).items;
+	const stats = { view: readStats(fixture('stats_pgvector')), status: 'ready' as const, error: null, lastAt: 0, mode: 'full' as const };
+	const onScope = (): void => undefined;
+	const props = { stats, dialect, readOnly: false, documents: rows, onScope };
+	// The strip itself keeps no state (called outside React, a hook would throw): the clock lives in StatsAsOf.
+	const tree = (): React.ReactElement[] => elementsOf(StatsStrip(props));
+	const first = tree();
+	const clock = first.filter((e) => e.type === StatsAsOf);
+	assert.equal(clock.length, 1, 'one clock');
+	assert.equal((clock[0]?.props as { view: unknown }).view, stats.view);
+	// The charts are memoised on props the strip passes through unchanged, so a tick of the clock leaves them alone.
+	assert.equal((StatsCharts as unknown as { $$typeof: symbol }).$$typeof, Symbol.for('react.memo'));
+	const charts = (elements: React.ReactElement[]) => elements.find((e) => e.type === StatsCharts)?.props as Record<string, unknown>;
+	const a = charts(first);
+	const b = charts(tree());
+	assert.ok(a && b);
+	for (const key of new Set([...Object.keys(a), ...Object.keys(b)])) assert.ok(Object.is(a[key], b[key]), `${key} is the same between two renders`);
+	assert.match(renderToStaticMarkup(<StatsAsOf view={stats.view} stale={false} refreshing={false} />), /aria-live="off"/);
+});
+
+test('the ingest chart with one far-off ingest time: a few dozen bars, not ninety thousand', () => {
+	const rows: IDocumentItem[] = [...readDocumentsPage(fixture('documents_page1')).items, { ...(readDocumentsPage(fixture('documents_page1')).items[0] as IDocumentItem), objectId: 'sentinel', ingestedAt: '9999-12-31T23:59:59Z' }];
+	const started = performance.now();
+	const html = renderToStaticMarkup(<StatsCharts rows={rows} total={null} dialect={dialect} onScope={noop} />);
+	const took = performance.now() - started;
+	const ingest = html.slice(html.indexOf('data-chart="ingest"'));
+	assert.ok((ingest.match(/<rect /g) ?? []).length <= 62, `${(ingest.match(/<rect /g) ?? []).length} bars`);
+	assert.match(ingest, /<tr><td>after \d{4}-\d{2}-\d{2}<\/td><td>1<\/td><\/tr>/);
+	assert.ok(html.length < 100_000, `${html.length} characters`);
+	assert.ok(took < 200, `rendered in ${took.toFixed(1)} ms`);
 });
 
 test('the strip: a Size figure when the store reports it; no Charts disclosure for an empty collection', () => {
@@ -209,4 +270,38 @@ test('an oversize document stays in its folder with a muted "oversize" badge; it
 	assert.doesNotMatch(html, /Needs attention/);
 	assert.match(html, /<span style="[^"]*var\(--rr-border-input\)[^"]*" data-flag="">oversize<\/span>/);
 	assert.match(html, /title="C:\/corp\/handbooks\/manual\.pdf · [^"]*· oversize · objectId manual-1"/);
+});
+
+/** A scope over a filter, on every surface unless told otherwise, not resolved yet. */
+function scopeOf(filter: IScopeState['filter'], documents = true): IScopeState {
+	return { filter, label: '', objectIds: null, overflow: null, applyTo: { documents, map: true, search: true, chat: true } };
+}
+
+test("a scope's listing before the store answers: the status line says it is loading, never what the store cannot filter; a failed first page leaves the error and Retry to the footer", () => {
+	const filter = { path_prefix: 'C:/demo/greenhouse/', path_contains: 'orc' };
+	const directory = (pager: ReturnType<typeof pagerInit>): string => renderToStaticMarkup(<DocumentDirectory pager={pager} selectedId={null} writes={on} onSelect={noop} onRemove={noop} onLoadMore={noop} onRetry={noop} scope={scopeOf(filter)} onScope={noop} />);
+	const loading = pagerBegin(pagerInit(), filter);
+	const html = directory(loading);
+	assert.match(html, /role="status">Loading the documents in scope…<\/div>/);
+	assert.doesNotMatch(html, /cannot filter|0 of 0 loaded/);
+	const failed = directory(pagerFail(loading, { headline: 'The store did not answer in time.' }));
+	assert.doesNotMatch(failed, /role="status">[^<]*(match|cannot filter|Loading)/, 'no status line about the scope');
+	assert.match(failed, /<span>Loading stopped at 0 documents: The store did not answer in time\.<\/span><button[^>]*>Retry<\/button>/);
+});
+
+test("the directory's export with the Documents toggle off: 'Documents in scope' holds only the scope's documents, its count in the label", () => {
+	const pager = pagerApplyPage(pagerApplyPage(pagerBegin(pagerInit()), readDocumentsPage(fixture('documents_page1'))), readDocumentsPage(fixture('documents_page2_last')));
+	const prefix = 'C:/demo/greenhouse/';
+	const html = renderToStaticMarkup(<DocumentDirectory pager={pager} selectedId={null} writes={on} onSelect={noop} onRemove={noop} onLoadMore={noop} onRetry={noop} scope={scopeOf({ path_prefix: prefix }, false)} onScope={noop} />);
+	assert.match(html, /role="status">Not applied to this list\. Scope: 2 of 7 loaded match \(filtered here\)<\/div>/);
+	assert.equal(exportItems.find((i) => i.id === 'directory-loaded')?.label, 'Loaded documents (7)', 'the list on screen');
+	const scoped = exportItems.find((i) => i.id === 'directory-scope');
+	assert.ok(scoped);
+	const rows = scoped.rows?.().rows ?? [];
+	assert.equal(scoped.label, `Documents in scope (${rows.length})`);
+	assert.equal(rows.length, 2);
+	assert.ok(
+		rows.every((row) => String(row.path).startsWith(prefix)),
+		'every exported row is in the scope'
+	);
 });

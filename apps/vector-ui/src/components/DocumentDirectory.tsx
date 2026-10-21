@@ -40,9 +40,9 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { Button } from 'shell';
 import type { Availability, IDocumentItem, IDocumentsFilter, IExportItem, IScopeState, ISavedFilter } from '../contract/types';
 import type { IRemoveTarget } from '../vector/confirm';
-import { buildGroups, directoryHeading, documentExportRows, pagerFooter, pagerProgressText } from '../vector/documents';
+import { buildGroups, directoryHeading, pagerFooter, pagerProgressText } from '../vector/documents';
 import type { IDirectoryGroup, IDirectoryRow, IPagerState } from '../vector/documents';
-import { FILTER_DEBOUNCE_MS, directoryView, scopeWith, withText } from '../vector/filters';
+import { FILTER_DEBOUNCE_MS, checkScope, directoryExportItems, directoryView, scopeNoMatchText, scopeWith, withText } from '../vector/filters';
 import { medianChunks } from '../vector/health';
 import type { ConditionKind } from '../vector/filters';
 import { DEFAULT_LIMITS } from '../vector/results';
@@ -125,6 +125,9 @@ export function DocumentDirectory({ pager, selectedId, writes, onSelect, onRemov
 	const [filter, setFilter] = useState('');
 	const applied = useDebounced(filter, FILTER_DEBOUNCE_MS);
 	const [folderMenu, setFolderMenu] = useState<IFolderMenu | null>(null);
+	// Why "Scope to this folder" was not applied (the node would refuse the folder), until the scope changes.
+	const [folderError, setFolderError] = useState<string | null>(null);
+	useEffect(() => setFolderError(null), [scope]);
 	const [collapsed, setCollapsed] = useState<ReadonlySet<string>>(new Set());
 	const [checked, setChecked] = useState<ReadonlySet<string>>(new Set());
 	const [scrollTop, setScrollTop] = useState(0);
@@ -164,11 +167,8 @@ export function DocumentDirectory({ pager, selectedId, writes, onSelect, onRemov
 	const median = useMemo(() => (pager.status === 'loading' || pager.status === 'idle' ? null : medianChunks(pager.rows)), [pager.status, pager.rows]);
 	const groups = useMemo(() => buildGroups(matches, { medianChunks: median }), [matches, median]);
 	const folders = useMemo(() => [...new Set(groups.filter((g) => g.kind === 'folder').map((g) => g.label))], [groups]);
-	const exportItems = useMemo<IExportItem[]>(() => {
-		const items: IExportItem[] = [{ id: 'directory-loaded', label: `Loaded documents (${pager.rows.length.toLocaleString('en-US')})`, kind: 'documents', disabled: pager.rows.length === 0 ? 'Nothing loaded yet' : null, rows: () => documentExportRows(pager.rows) }];
-		if (scope !== null) items.push({ id: 'directory-scope', label: `Documents in scope (${matches.length.toLocaleString('en-US')})`, kind: 'documents', disabled: matches.length === 0 ? 'No document matches the scope' : null, rows: () => documentExportRows(matches) });
-		return items;
-	}, [pager.rows, scope, matches]);
+	// "Documents in scope" holds the scope's own documents even while its Documents toggle is off (vector/filters.ts).
+	const exportItems = useMemo<IExportItem[]>(() => directoryExportItems(pager, view), [pager, view]);
 	const lines = useMemo<Line[]>(() => {
 		const out: Line[] = [];
 		for (const group of groups) {
@@ -199,11 +199,13 @@ export function DocumentDirectory({ pager, selectedId, writes, onSelect, onRemov
 		setChecked(next);
 	};
 
+	// With the scope on the list, "no match" is of the loaded rows until every document is loaded.
+	const scoped = scope !== null && scope.applyTo.documents && view.scope !== null ? view.scope : null;
 	let empty: string | null = null;
-	if (pager.rows.length === 0 && pager.status === 'done' && !(scope !== null && scope.applyTo.documents)) empty = EMPTY.noDocuments;
+	if (pager.rows.length === 0 && pager.status === 'done' && scoped === null) empty = EMPTY.noDocuments;
 	else if (pager.rows.length === 0 && pager.status === 'error') empty = EMPTY.unreachable(pager.error?.headline ?? 'the store did not answer.');
-	else if (pager.rows.length > 0 && matches.length === 0) empty = scope !== null ? 'No documents match these conditions.' : EMPTY.noMatch(applied.trim());
-	else if (pager.rows.length === 0 && pager.status === 'done' && scope !== null && scope.applyTo.documents) empty = 'No documents match these conditions.';
+	else if (pager.rows.length > 0 && matches.length === 0) empty = scoped !== null ? scopeNoMatchText(scoped) : EMPTY.noMatch(applied.trim());
+	else if (pager.rows.length === 0 && pager.status === 'done' && scoped !== null) empty = scopeNoMatchText(scoped);
 
 	return (
 		<section aria-label="Documents" style={{ ...styles.panel, flex: 1 }}>
@@ -212,7 +214,12 @@ export function DocumentDirectory({ pager, selectedId, writes, onSelect, onRemov
 				<span style={{ ...styles.small, fontWeight: 400, textTransform: 'none', letterSpacing: 0, marginLeft: 'auto' }}>{pager.status === 'idle' ? '' : directoryHeading(pager)}</span>
 				<ExportMenu items={exportItems} collection={collection} />
 			</div>
-			<ScopeBar text={filter} scopeText={applied} onText={setFilter} scope={scope} onScope={onScope} cap={cap} available={available} folders={folders} saved={saved} onSave={onSave} onDeleteSaved={onDeleteSaved} />
+			<ScopeBar text={filter} scopeText={applied} onText={setFilter} scope={scope} onScope={onScope} cap={cap} available={available} folders={folders} saved={saved} onSave={onSave} onDeleteSaved={onDeleteSaved} listing={pager} />
+			{folderError !== null && (
+				<div role="alert" style={{ ...styles.small, padding: '0 12px 6px' }}>
+					{folderError}
+				</div>
+			)}
 			{(summary || progress) && (
 				<div style={{ ...styles.small, padding: '0 12px 6px' }} role="status">
 					{summary ?? progress}
@@ -293,7 +300,10 @@ export function DocumentDirectory({ pager, selectedId, writes, onSelect, onRemov
 						autoFocus
 						style={{ ...styles.small, textAlign: 'left', padding: '4px 10px', background: 'none', border: 'none', color: 'inherit', cursor: 'pointer' }}
 						onClick={() => {
-							onScope?.(scopeWith(scope, applied, { path_prefix: folderMenu.folder }));
+							const next = scopeWith(scope, applied, { path_prefix: folderMenu.folder });
+							const refused = checkScope(next);
+							setFolderError(refused);
+							if (refused === null) onScope?.(next);
 							setFolderMenu(null);
 						}}
 						onFocus={(event) => (event.currentTarget.style.outline = FOCUS_RING)}

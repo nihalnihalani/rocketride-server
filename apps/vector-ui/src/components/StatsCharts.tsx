@@ -189,7 +189,7 @@ function Chart({ chart, scope, onScope }: { chart: IChart; scope: IDocumentsFilt
  * @param props - {@link StatsChartsProps}.
  * @returns The section.
  */
-export function StatsCharts({ rows, total = null, sample = null, dialect = null, onScope, loading = false, scope = null }: StatsChartsProps): React.ReactElement {
+function StatsChartsView({ rows, total = null, sample = null, dialect = null, onScope, loading = false, scope = null }: StatsChartsProps): React.ReactElement {
 	// Re-binned only when what the charts read changes (a page, the sample), not on the strip's clock.
 	const charts = useMemo(() => collectionCharts({ rows, total, sample, dialect, loading }), [rows, total, sample, dialect, loading]);
 	if (rows.length === 0 && !loading && sample === null) {
@@ -209,5 +209,8 @@ export function StatsCharts({ rows, total = null, sample = null, dialect = null,
 		</section>
 	);
 }
+
+/** The charts, drawn again only when what they read changes (a page, the sample, the scope), never on the strip's clock. */
+export const StatsCharts = React.memo(StatsChartsView);
 
 export default StatsCharts;

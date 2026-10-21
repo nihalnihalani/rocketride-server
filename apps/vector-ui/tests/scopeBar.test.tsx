@@ -12,7 +12,9 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import React from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
-import type { IScopeState, ISavedFilter } from '../src/contract/types';
+import type { IDocumentItem, IScopeState, ISavedFilter } from '../src/contract/types';
+import type { IPagerState } from '../src/vector/documents';
+import type { IDocumentsPageView } from '../src/vector/results';
 import { fixture } from './support/fixtures';
 
 // The shell's building blocks exist only inside a running shell: plain stand-ins that render their text.
@@ -27,16 +29,30 @@ const shellStandIn = {
 };
 const moduleWithLoad = Module as unknown as { _load: (request: string, parent: unknown, isMain: boolean) => unknown };
 const originalLoad = moduleWithLoad._load;
+/** The SDK's Question as the chat builds it: its text and its filter. */
+class QuestionStandIn {
+	filter: Record<string, unknown> | undefined = undefined;
+	texts: string[] = [];
+	addQuestion(text: string): void {
+		this.texts.push(text);
+	}
+}
 moduleWithLoad._load = function (request: string, parent: unknown, isMain: boolean): unknown {
 	if (request === 'shell') return shellStandIn;
+	if (request === 'rocketride') return { Question: QuestionStandIn };
 	return originalLoad.call(this, request, parent, isMain);
 };
 
 const { ScopeBar, draftCondition } = require('../src/components/ScopeBar') as typeof import('../src/components/ScopeBar');
 const { DocumentDirectory } = require('../src/components/DocumentDirectory') as typeof import('../src/components/DocumentDirectory');
-const { pagerApplyPage, pagerBegin, pagerInit } = require('../src/vector/documents') as typeof import('../src/vector/documents');
-const { readDocumentsPage } = require('../src/vector/results') as typeof import('../src/vector/results');
-const { tooLargeText } = require('../src/vector/filters') as typeof import('../src/vector/filters');
+const { pagerApplyPage, pagerBegin, pagerFail, pagerInit } = require('../src/vector/documents') as typeof import('../src/vector/documents');
+const { readDocumentsPage, readStats } = require('../src/vector/results') as typeof import('../src/vector/results');
+const { FILTER_TEXT_MAX, SCOPE_FAILED_TEXT, listingFilter, resolveScope, scopeFromFilter, tooLargeText } = require('../src/vector/filters') as typeof import('../src/vector/filters');
+const { consoleScope } = require('../src/vector/consoleModel') as typeof import('../src/vector/consoleModel');
+const { createConsoleStore } = require('../src/vector/consoleStore') as typeof import('../src/vector/consoleStore');
+const { buildQuestion } = require('../src/chat/useVectorChat') as typeof import('../src/chat/useVectorChat');
+const { manualClock } = require('shared/explorer/connect/testing') as typeof import('shared/explorer/connect/testing');
+const { ExplorerToolError } = require('shared/explorer') as typeof import('shared/explorer');
 
 const noop = (): void => undefined;
 const on = { enabled: true, reason: null };
@@ -172,4 +188,147 @@ test('the directory with a scope: its status line says what the store applied', 
 	assert.match(html, /role="status"[^>]*>2 documents match \(store\)</);
 	assert.match(html, /aria-label="Remove condition: folder is under C:\/demo\/greenhouse\/"/);
 	assert.match(html, /aria-label="Folder C:\/demo\/greenhouse\/"/);
+});
+
+// =============================================================================
+// WHILE THE SCOPE'S DOCUMENTS ARE NOT ALL KNOWN
+// =============================================================================
+
+/** 600 documents in storage order, every third under C:/demo/handbooks/ (200 in scope). */
+function row(i: number): IDocumentItem {
+	return { objectId: `d${String(i).padStart(4, '0')}`, path: i % 3 === 0 ? `C:/demo/handbooks/doc_${i}.md` : `C:/demo/other/doc_${i}.md`, chunks: 4, has_first_chunk: true, tables: 0, deleted: false, nodeId: null, size: 10, modifyTime: null, ingestedAt: null, pointId: null };
+}
+
+/** A Qdrant-like page: the store filters nothing ('none'). */
+function clientPage(from: number, n: number, next: string | null, total: number | null = 600): IDocumentsPageView {
+	return readDocumentsPage({ success: true, items: Array.from({ length: n }, (_, k) => row(from + k)), next_cursor: next, total, counts_exact: true, distinct: true, sorted: false, caveats: ['documents_filter_client'], filter_applied: 'none', filter_ignored: ['path_prefix'] });
+}
+
+/** A sentence as a literal in a regular expression. */
+function literal(text: string): string {
+	return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/** The Chat toggle of a rendered bar: pressed, disabled and its title. */
+function chatToggle(html: string): { pressed: boolean; disabled: boolean; title: string | null } {
+	const tag = html.match(/<button[^>]*>Chat<\/button>/)?.[0] ?? '';
+	assert.ok(tag !== '', 'the Chat toggle is there');
+	return { pressed: /aria-pressed="true"/.test(tag), disabled: /disabled=""/.test(tag), title: tag.match(/title="([^"]*)"/)?.[1]?.replace(/&#x27;/g, "'") ?? null };
+}
+
+test('the toggles while the listing pages: Map, Search and Chat off and disabled with the sentence, which is shown', () => {
+	const filter = { path_prefix: 'C:/demo/handbooks/' };
+	const half = pagerApplyPage(pagerBegin(pagerInit(), filter), clientPage(0, 500, 'c1'));
+	const html = bar({ scope: scopeOf(filter), listing: half, cap: 2_000 }).replace(/&#x27;/g, "'");
+	const sentence = literal("Waiting for the scope's documents (500 of 600 loaded); the map, search and chat are not scoped yet.");
+	for (const label of ['Map', 'Search', 'Chat']) assert.match(html, new RegExp(`aria-pressed="false" disabled="" title="${sentence}"[^>]*>${label}</button>`), label);
+	assert.match(html, /aria-pressed="true"[^>]*>Documents<\/button>/);
+	assert.match(html, new RegExp(`role="status"[^>]*>${sentence}</div>`));
+	// Without the listing the bar cannot tell how far it is, but it never shows an unresolved scope as applied.
+	assert.deepEqual(chatToggle(bar({ scope: scopeOf(filter), cap: 2_000 })), { pressed: false, disabled: true, title: "Waiting for the scope's documents; the map, search and chat are not scoped yet." });
+});
+
+test("the directory over a listing that stopped short: the loaded rows' empty match is said to be of the loaded rows, and the toggles say why they are off", () => {
+	const legal = { path_prefix: 'C:/corp/legal/' };
+	let pager: IPagerState = pagerBegin(pagerInit(), legal);
+	for (let p = 0; p < 10; p += 1) pager = pagerApplyPage(pager, clientPage(p * 500, 500, `c${p + 1}`, 12_000));
+	assert.equal(pager.status, 'capped');
+	const html = renderToStaticMarkup(<DocumentDirectory pager={pager} selectedId={null} writes={on} onSelect={noop} onRemove={noop} onLoadMore={noop} onRetry={noop} scope={scopeOf(legal)} onScope={noop} cap={2_000} />);
+	assert.match(html, />No loaded document matches these conditions \(5,000 of 12,000 loaded\)\.</);
+	assert.doesNotMatch(html, /No documents? match(es)? these conditions/);
+	assert.deepEqual(chatToggle(html), { pressed: false, disabled: true, title: "Only 5,000 of 12,000 documents are loaded, so the scope's documents are not all known: the map, search and chat are not scoped. Load more to include the other 7,000 (5,000 at a time)." });
+	assert.match(html, />Load more</);
+});
+
+test('the path box under a scope: text the node would refuse is not sent, and the bar says so', () => {
+	const scope = scopeOf({ path_prefix: 'C:/demo/' }, { objectIds: ['a'] });
+	const long = 'x'.repeat(FILTER_TEXT_MAX + 1);
+	assert.match(bar({ scope, text: long, scopeText: long }), /role="alert"[^>]*>The path text is longer than 1,024 characters, so it is not sent with the scope\. Shorten it\.</);
+	assert.doesNotMatch(bar({ scope, text: 'x'.repeat(FILTER_TEXT_MAX), scopeText: 'x'.repeat(FILTER_TEXT_MAX) }), /role="alert"/);
+	assert.doesNotMatch(bar({ text: long, scopeText: long }), /role="alert"/, 'without a scope the box only filters the loaded rows');
+});
+
+test("the console's scope over a paging and a failed listing: no question goes out unscoped while the Chat toggle reads on", async () => {
+	const CAP = 2_000;
+	const folder = 'C:/demo/handbooks/';
+	const inScope = Array.from({ length: 600 }, (_, i) => row(i))
+		.filter((r) => r.path.startsWith(folder))
+		.map((r) => r.objectId)
+		.sort();
+	let release: () => void = noop;
+	let failFirst = false;
+	const clock = manualClock(Date.parse('2026-10-16T09:00:00Z'));
+	const store = createConsoleStore(
+		{
+			stats: async () => readStats(fixture('stats_pgvector')),
+			documents: async (cursor) => {
+				if (failFirst) throw new ExplorerToolError({ kind: 'timeout', tool: 'documents', message: 'Stopped waiting for documents after 40 s.' });
+				if (cursor === null) return clientPage(0, 500, 'c1');
+				await new Promise<void>((resolve) => (release = resolve));
+				return clientPage(500, 100, null);
+			},
+			chunks: async () => {
+				throw new Error('not asked');
+			},
+			remove: async () => {
+				throw new Error('not asked');
+			},
+			announce: noop,
+			clock,
+		},
+		{ pageSize: 500, chunkPage: 100, writeBatch: 100 }
+	);
+	// What the console does: the ScopeBar sets the scope, the listing asks for it, and the scope resolves from the listing.
+	let scope = scopeFromFilter({ conditions: [{ kind: 'folder', prefix: folder }], text: '' }, null);
+	assert.ok(scope);
+	const seen: Array<{ status: string; chatOn: boolean; sent: number | null; notice: string | null }> = [];
+	const observe = (): void => {
+		const dir = store.getState().directory;
+		scope = resolveScope(scope as IScopeState, dir, CAP);
+		const html = renderToStaticMarkup(<DocumentDirectory pager={dir} selectedId={null} writes={on} onSelect={noop} onRemove={noop} onLoadMore={noop} onRetry={noop} scope={scope} onScope={noop} cap={CAP} />);
+		const toggle = chatToggle(html);
+		const wiring = consoleScope(null, scope, dir, CAP);
+		const question = buildQuestion('What is the falcon intake?', wiring.chat) as unknown as QuestionStandIn;
+		const sent = (question.filter?.objectIds as string[] | undefined) ?? null;
+		if (toggle.pressed) assert.deepEqual([...(sent ?? [])].sort(), inScope, `${dir.status}: the toggle reads on, so the question is asked of the scope's documents`);
+		else {
+			assert.equal(sent, null);
+			assert.ok(toggle.disabled && toggle.title !== null, `${dir.status}: the toggle says why`);
+			assert.equal(wiring.chatNotice, `${toggle.title} A question asked now goes to every document.`, 'and the chat says so');
+		}
+		seen.push({ status: dir.status, chatOn: toggle.pressed, sent: sent?.length ?? null, notice: wiring.chatNotice });
+	};
+	const unsubscribe = store.subscribe(observe);
+	store.setFilter(listingFilter((scope as IScopeState).filter));
+	store.open();
+	await clock.settle();
+	observe();
+	const paging = seen[seen.length - 1];
+	assert.deepEqual(paging, { status: 'loading', chatOn: false, sent: null, notice: "Waiting for the scope's documents (500 of 600 loaded); the map, search and chat are not scoped yet. A question asked now goes to every document." });
+	release();
+	await clock.settle();
+	observe();
+	assert.deepEqual(seen[seen.length - 1], { status: 'done', chatOn: true, sent: 200, notice: null });
+	// A new listing whose first page fails: off and said until Retry lists it.
+	failFirst = true;
+	store.refresh();
+	await clock.settle();
+	observe();
+	const failed = seen[seen.length - 1];
+	assert.equal(failed?.status, 'error');
+	assert.equal(failed?.chatOn, false);
+	assert.equal(failed?.notice, `${SCOPE_FAILED_TEXT} A question asked now goes to every document.`);
+	failFirst = false;
+	store.retryDocuments();
+	await clock.settle();
+	release();
+	await clock.settle();
+	observe();
+	assert.deepEqual(seen[seen.length - 1], { status: 'done', chatOn: true, sent: 200, notice: null });
+	assert.ok(
+		seen.every((s) => s.chatOn === (s.sent !== null)),
+		'never on and unscoped, never scoped and off'
+	);
+	unsubscribe();
+	store.dispose();
 });

@@ -16,9 +16,10 @@ import { connectionCaches } from '../src/adapters/explorer';
 import { connectionEntry } from '../src/adapters/connections';
 import { makeConsoleActions } from '../src/adapters/consoleActions';
 import { QUICK_STATS_INTERVAL_MS } from '../src/vector/budgets';
-import { chatScopeFor } from '../src/vector/consoleModel';
+import { CHAT_UNSCOPED_TEXT, chatScopeFor, consoleScope, mapScopeFor } from '../src/vector/consoleModel';
 import { createConsoleStore } from '../src/vector/consoleStore';
-import { directoryView } from '../src/vector/filters';
+import { pagerApplyPage, pagerBegin, pagerFail, pagerFooter, pagerInit } from '../src/vector/documents';
+import { directoryView, scopeStripText } from '../src/vector/filters';
 import { DEFAULT_LIMITS } from '../src/vector/results';
 import type { IConsoleDeps } from '../src/vector/consoleStore';
 import { readChunksPage, readDocumentsPage, readRemoveResult, readStats } from '../src/vector/results';
@@ -583,6 +584,79 @@ test("the directory's status line says how much the store applied: server, parti
 	store.dispose();
 });
 
+test('typing in the path box on a store that applies it: between the listings the line says the scope is loading, never that the store cannot filter', async () => {
+	const { store, clock, filters } = scoped('documents_filter_server');
+	const greenhouse = { path_prefix: 'C:/demo/greenhouse/' };
+	let filter: IDocumentsFilter = greenhouse;
+	let text = '';
+	const scope = (): IScopeState => ({ filter, label: '', objectIds: null, overflow: null, applyTo: { documents: true, map: true, search: true, chat: true } });
+	const lines: Array<{ status: string | null; strip: string }> = [];
+	const unsubscribe = store.subscribe(() => {
+		const view = directoryView(store.getState().directory, scope(), text, 2_000);
+		lines.push({ status: view.summary, strip: view.scope ? scopeStripText(view.scope, { documents: 42 }) : '' });
+	});
+	store.setFilter(greenhouse);
+	store.open();
+	await clock.settle();
+	const before = lines.length;
+	// Two settled box texts: each lists again (the store applies path_contains).
+	for (const typed of ['orc', 'orchid']) {
+		text = typed;
+		filter = { ...greenhouse, path_contains: typed };
+		store.setFilter(filter);
+		await clock.settle();
+	}
+	unsubscribe();
+	assert.deepEqual(
+		filters.slice(-2),
+		[
+			{ ...greenhouse, path_contains: 'orc' },
+			{ ...greenhouse, path_contains: 'orchid' },
+		],
+		'each settled text asked the store'
+	);
+	const typing = lines.slice(before);
+	assert.ok(
+		typing.some((l) => l.status === 'Loading the documents in scope…' && l.strip === 'Scope: loading…'),
+		'between the listings: loading'
+	);
+	assert.deepEqual(
+		typing.filter((l) => /cannot filter|0 of 0|at least/.test(`${l.status} ${l.strip}`)),
+		[],
+		'nothing about what the store cannot filter, no count of nothing loaded'
+	);
+	assert.equal(typing[typing.length - 1]?.status, '2 documents match (store)');
+	store.dispose();
+});
+
+test("a scope's first page fails: no status line about the store (the footer's error and Retry speak), and Retry lists it", async () => {
+	let fail = true;
+	const greenhouse = { path_prefix: 'C:/demo/greenhouse/' };
+	const { store, clock } = harness({
+		documents: async (_cursor, _limit, filter) => {
+			if (filter && fail) throw new ExplorerToolError({ kind: 'timeout', tool: 'documents', message: 'Stopped waiting for documents after 40 s.' });
+			return readDocumentsPage(filter ? fixture('documents_filter_server') : fixture('documents_page1'));
+		},
+	});
+	const scope: IScopeState = { filter: greenhouse, label: '', objectIds: null, overflow: null, applyTo: { documents: true, map: true, search: true, chat: true } };
+	store.setFilter(greenhouse);
+	store.open();
+	await clock.settle();
+	const failed = store.getState().directory;
+	assert.equal(failed.status, 'error');
+	assert.equal(failed.pages, 0);
+	const view = directoryView(failed, scope, '', 2_000);
+	assert.equal(view.summary, null);
+	assert.equal(view.scope?.applied, 'pending');
+	assert.equal(scopeStripText(view.scope!, { documents: 42 }), 'Scope: not counted (the listing did not load)');
+	assert.equal(pagerFooter(failed)?.retry, true, 'the footer offers Retry');
+	fail = false;
+	store.retryDocuments();
+	await clock.settle();
+	assert.equal(directoryView(store.getState().directory, scope, '', 2_000).summary, '2 documents match (store)');
+	store.dispose();
+});
+
 test('askAbout never scopes the chat to more than scope_keys_max documents; it says why instead', () => {
 	const limits = { ...DEFAULT_LIMITS, scope_keys_max: 3 };
 	const entry = connectionEntry({ key: 'key-ask-cap', nodeId: 'store_1', roles: {}, provider: 'postgres', pipelineName: 'p' } as unknown as Parameters<typeof connectionEntry>[0], null, limits, manualClock());
@@ -607,4 +681,91 @@ test('the chat is scoped by "Ask about these" first, else by the scope while its
 	assert.equal(chatScopeFor(null, scope({ objectIds: ['a', 'b', 'c'] }), 2), null, 'never more than the cap');
 	assert.equal(chatScopeFor(['a', 'b', 'c'], null, 2), null, 'not even from "Ask about these"');
 	assert.equal(chatScopeFor(null, null, 2_000), null);
+});
+
+// =============================================================================
+// THE CONSOLE'S SCOPE: what the chat, search and the map are handed while its documents are (not yet) known
+// =============================================================================
+
+/** 600 documents in storage order, every third under C:/demo/handbooks/ (200 in scope). */
+function handbookRow(i: number): IDocumentItem {
+	return doc(`d${String(i).padStart(4, '0')}`, i % 3 === 0 ? `C:/demo/handbooks/doc_${i}.md` : `C:/demo/other/doc_${i}.md`);
+}
+
+/** A Qdrant-like page of that collection: the store filters nothing. */
+function clientPage(from: number, n: number, next: string | null, total: number | null = 600): IDocumentsPageView {
+	return readDocumentsPage({ success: true, items: Array.from({ length: n }, (_, k) => handbookRow(from + k)), next_cursor: next, total, counts_exact: true, distinct: true, sorted: false, caveats: ['documents_filter_client'], filter_applied: 'none', filter_ignored: ['path_prefix'] });
+}
+
+test('consoleScope: the chat is scoped only once the scope names its documents; until then it says the question goes to every document', () => {
+	const folder = { path_prefix: 'C:/demo/handbooks/' };
+	const fresh: IScopeState = { filter: folder, label: '', objectIds: null, overflow: null, applyTo: { documents: true, map: true, search: true, chat: true } };
+	const begun = pagerBegin(pagerInit(), folder);
+	const half = pagerApplyPage(begun, clientPage(0, 500, 'c1'));
+	const whole = pagerApplyPage(half, clientPage(500, 100, null));
+	const failed = pagerFail(begun, { headline: 'The store did not answer in time.' });
+	const capped = { ...pagerApplyPage(begun, clientPage(0, 500, 'c1', 12_000)), status: 'capped' as const };
+	const tail = ' A question asked now goes to every document.';
+	assert.equal(CHAT_UNSCOPED_TEXT, tail.trim());
+
+	// The listing pages: the scope is not applied yet; search waits for it (its ids are null), the map keeps what it drew.
+	const waiting = consoleScope(null, fresh, half, 2_000);
+	assert.equal(waiting.chat, null);
+	assert.equal(waiting.chatNotice, `Waiting for the scope's documents (500 of 600 loaded); the map, search and chat are not scoped yet.${tail}`);
+	assert.equal(waiting.waiting, true);
+	assert.equal(waiting.applied, waiting.scope, 'search is handed the scope itself: it waits for the documents');
+	assert.equal(waiting.applied?.objectIds, null);
+	// Every page in: scoped, and nothing to say.
+	const ready = consoleScope(null, fresh, whole, 2_000);
+	assert.equal(ready.chat?.length, 200);
+	assert.equal(ready.chatNotice, null);
+	assert.equal(ready.waiting, false);
+	assert.equal(ready.applied, ready.scope);
+	assert.equal(ready.readiness?.phase, 'ready');
+	// The first page failed, or the listing stopped short: nothing is scoped by it, and every surface is told so.
+	for (const [dir, words] of [
+		[failed, "The scope's documents did not load; Retry the directory. The map, search and chat are not scoped."],
+		[capped, "Only 500 of 12,000 documents are loaded, so the scope's documents are not all known: the map, search and chat are not scoped. Load more to include the other 11,500 (5,000 at a time)."],
+	] as const) {
+		const unknown = consoleScope(null, fresh, dir, 2_000);
+		assert.equal(unknown.chat, null);
+		assert.equal(unknown.chatNotice, `${words}${tail}`);
+		assert.equal(unknown.waiting, false);
+		assert.deepEqual(unknown.applied?.applyTo, { documents: true, map: false, search: false, chat: false }, 'the map and search are not scoped by it either');
+		assert.deepEqual(unknown.scope?.applyTo, fresh.applyTo, "the user's toggles are kept for when the documents are known");
+	}
+	// "Ask about these" first; the Chat toggle off says nothing; no scope, nothing.
+	assert.deepEqual(consoleScope(['x'], fresh, half, 2_000).chat, ['x']);
+	assert.equal(consoleScope(['x'], fresh, half, 2_000).chatNotice, null);
+	assert.equal(consoleScope(null, { ...fresh, applyTo: { ...fresh.applyTo, chat: false } }, half, 2_000).chatNotice, null);
+	assert.deepEqual(consoleScope(null, null, half, 2_000), { scope: null, readiness: null, chat: null, chatNotice: null, applied: null, waiting: false });
+	// Above the cap: the chat is not scoped, and says why.
+	const big = consoleScope(null, { ...fresh, filter: { path_prefix: 'C:/demo/' } }, pagerApplyPage(pagerBegin(pagerInit(), { path_prefix: 'C:/demo/' }), readDocumentsPage({ success: true, items: Array.from({ length: 500 }, (_, i) => doc(`b${i}`, `C:/demo/${i}.md`)), next_cursor: 'c1', total: 2_340, counts_exact: true, distinct: true, sorted: true, caveats: [], filter_applied: 'server', filter_ignored: [] })), 2_000);
+	assert.equal(big.chat, null);
+	assert.equal(big.chatNotice, `Scope too large for the map, search and chat (2,340 documents; at most 2,000). Narrow the folder.${tail}`);
+});
+
+test('mapScopeFor: while a new scope finds its documents the map keeps the scope it drew with, so it samples once, when they are known', () => {
+	const folder = { path_prefix: 'C:/demo/handbooks/' };
+	const fresh: IScopeState = { filter: folder, label: '', objectIds: null, overflow: null, applyTo: { documents: true, map: true, search: true, chat: true } };
+	const begun = pagerBegin(pagerInit(), folder);
+	const whole = pagerApplyPage(pagerApplyPage(begun, clientPage(0, 500, 'c1')), clientPage(500, 100, null));
+	const a = consoleScope(null, fresh, whole, 2_000);
+	let held = mapScopeFor(null, a);
+	assert.equal(held, a.applied, 'resolved: the map is scoped to it');
+	// A chart's bar narrows the scope: a new listing for it is on its way.
+	const narrowed = { ...fresh, filter: { ...folder, file_types: ['md'] } };
+	const b = consoleScope(null, narrowed, pagerBegin(pagerInit(), narrowed.filter), 2_000);
+	assert.equal(b.waiting, true);
+	held = mapScopeFor(held, b);
+	assert.equal(held, a.applied, 'the map keeps the documents it was drawn from: no sample of every document in between');
+	const bDone = consoleScope(null, narrowed, pagerApplyPage(pagerApplyPage(pagerBegin(pagerInit(), narrowed.filter), clientPage(0, 500, 'c1')), clientPage(500, 100, null)), 2_000);
+	held = mapScopeFor(held, bDone);
+	assert.equal(held, bDone.applied);
+	assert.equal(held?.objectIds?.length, 200);
+	// Known not to be knowable (the listing failed): the map is not scoped, as its toggle says.
+	const bFailed = consoleScope(null, narrowed, pagerFail(pagerBegin(pagerInit(), narrowed.filter), { headline: 'x' }), 2_000);
+	assert.equal(mapScopeFor(held, bFailed)?.applyTo.map, false);
+	// No scope: none.
+	assert.equal(mapScopeFor(held, consoleScope(null, null, whole, 2_000)), null);
 });

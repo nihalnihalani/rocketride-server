@@ -40,12 +40,17 @@
 // entry's value store, read by the map and search as ConsoleModel.scope);
 // this view hands its conditions and path box to the controller's listing
 // while its Documents toggle is on, resolves the documents it covers from the listing
-// (vector/filters.ts resolveScope: their objectIds once it settles, the count
-// above limits.scope_keys_max), scopes the chat to them while the Chat toggle
-// is on (never above the cap), and keeps the saved filters of the connection.
+// (vector/filters.ts resolveScope: their objectIds once it holds every
+// document, the count above limits.scope_keys_max), scopes the chat to them
+// while the Chat toggle is on (never above the cap), and keeps the saved
+// filters of the connection. A surface is scoped exactly when its toggle reads
+// on (vector/consoleModel.ts consoleScope): until the scope's documents are
+// known the chat asks every document and says so above it, search waits for
+// them, and the map keeps the scope it drew with (mapScopeFor), so it samples
+// once, when they are known.
 // =============================================================================
 
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { Availability, IDocumentsFilter, IScopeState } from '../contract/types';
 import { Banner, Button, ContentHeader, EmptyState, ToggleGroup, useShellConnection } from 'shell';
 import type { IExplorerEndpoint } from 'shared/explorer';
@@ -61,8 +66,8 @@ import IngestPanel from '../components/IngestPanel';
 import StatsStrip from '../components/StatsStrip';
 import { getDocs } from '../docs';
 import { documentUri } from '../vector/addresses';
-import { alsoReaches, chatScopeFor, writesDuringRemoval } from '../vector/consoleModel';
-import { CONDITION_KINDS, conditionAvailability, listingFilter, resolveScope, scopeStripText, scopeView, scopeWith } from '../vector/filters';
+import { alsoReaches, consoleScope, mapScopeFor, writesDuringRemoval } from '../vector/consoleModel';
+import { CONDITION_KINDS, checkScope, conditionAvailability, listingFilter, resolveScope, scopeStripText, scopeView, scopeWith } from '../vector/filters';
 import type { ConditionKind } from '../vector/filters';
 import { healthSummary, medianChunks } from '../vector/health';
 import { savedFiltersFor } from '../vector/savedFilters';
@@ -160,14 +165,31 @@ export const ConsoleView: React.FC<IConsoleViewProps> = ({ opened, active }) => 
 		for (const kind of CONDITION_KINDS) out[kind] = conditionAvailability(kind, { caveats, rows: state.directory.rows });
 		return out;
 	}, [caveatsKey, state.directory.rows]);
-	const scopeLine = scope !== null ? scopeStripText(scopeView(scope, state.directory, cap), state.stats.view) : null;
+	// What the chat, search and the map are handed: each scoped exactly when the ScopeBar shows its toggle on.
+	const wiring = useMemo(() => consoleScope(chatScope, scope, state.directory, cap), [chatScope, scope, state.directory, cap]);
+	const surfaceModel = useMemo(() => (wiring.applied === (model.scope ?? null) ? model : { ...model, scope: wiring.applied }), [model, wiring.applied]);
+	// The map keeps the scope it drew with while a new scope's documents are on their way (state from the last render).
+	const [mapScope, setMapScope] = useState<IScopeState | null>(null);
+	const nextMapScope = mapScopeFor(mapScope, wiring);
+	if (nextMapScope !== mapScope) setMapScope(nextMapScope);
+	const mapModel = useMemo(() => (nextMapScope === (model.scope ?? null) ? model : { ...model, scope: nextMapScope }), [model, nextMapScope]);
+	const scopeLine = wiring.scope !== null ? scopeStripText(scopeView(wiring.scope, state.directory, cap), state.stats.view) : null;
 	// The "N need attention" chip: the loaded documents' health; complete only for the whole, finished listing.
 	const health = useMemo(() => {
 		const settled = state.directory.status !== 'loading' && state.directory.status !== 'idle';
 		return healthSummary(state.directory.rows, { medianChunks: settled ? medianChunks(state.directory.rows) : null, complete: state.directory.status === 'done' && state.directory.filter === null });
 	}, [state.directory]);
 	// A chart's bar sets its kind of condition (a chunk range, a file type, a period) and keeps the others.
-	const scopeFromChart = (filter: IDocumentsFilter): void => entry.scope.set(scopeWith(scope, scope?.filter.path_contains ?? '', filter));
+	// Kept between renders so the memoised charts are not drawn again for nothing.
+	const scopeFromChart = useCallback(
+		(filter: IDocumentsFilter): void => {
+			const next = scopeWith(scope, scope?.filter.path_contains ?? '', filter);
+			const refused = checkScope(next);
+			if (refused !== null) announcer.announce(refused);
+			else entry.scope.set(next);
+		},
+		[scope, entry]
+	);
 
 	// Saved filters: per connection, in memory (the app's map, emptied on a change of identity).
 	const savedStore = useMemo(() => savedFiltersFor(savedFilters, entry.key), [entry.key]);
@@ -185,8 +207,8 @@ export const ConsoleView: React.FC<IConsoleViewProps> = ({ opened, active }) => 
 		setSaved(savedStore.list());
 	};
 
-	// The chat: "Ask about these" first, else the scope's documents while its Chat toggle is on.
-	const chatDocuments = chatScopeFor(chatScope, scope, cap);
+	// The chat: "Ask about these" first, else the scope's documents while its Chat toggle is on and they are known.
+	const chatDocuments = wiring.chat;
 	const clearChatScope = (): void => {
 		if (chatScope !== null) entry.chatScope.set(null);
 		else if (scope !== null) entry.scope.set({ ...scope, applyTo: { ...scope.applyTo, chat: false } });
@@ -259,12 +281,17 @@ export const ConsoleView: React.FC<IConsoleViewProps> = ({ opened, active }) => 
 						{model.ingest.enabled ? <IngestPanel model={model} channels={channels} actions={actions} alsoReaches={alsoReaches(endpoint, VECTOR_PROVIDERS)} /> : <EmptyState title="Add documents" description={model.ingest.reason ?? undefined} />}
 					</div>
 					<div style={{ flex: cols.stacked ? 'none' : `1 1 ${cols.chat}`, minHeight: cols.stacked ? 360 : 0, display: 'flex', flexDirection: 'column', overflow: 'auto' }} aria-label="Chat" role="region">
-						{model.chat.enabled ? <ChatPanel model={model} channels={channels} selection={entry.selection} actions={actions} scope={chatDocuments} onClearScope={clearChatScope} /> : <EmptyState title="Chat" description={model.chat.reason ?? undefined} />}
+						{model.chat.enabled && wiring.chatNotice !== null && (
+							<p role="status" data-chat-scope-notice="" style={{ ...styles.small, margin: '0 0 6px' }}>
+								{wiring.chatNotice}
+							</p>
+						)}
+						{model.chat.enabled ? <ChatPanel model={surfaceModel} channels={channels} selection={entry.selection} actions={actions} scope={chatDocuments} onClearScope={clearChatScope} /> : <EmptyState title="Chat" description={model.chat.reason ?? undefined} />}
 					</div>
 				</div>
 			</div>
 			<div style={{ flex: 1, minHeight: 0, display: tab === 'map' ? 'flex' : 'none', flexDirection: 'column', padding: 12 }}>
-				<MapView model={model} channels={channels} selection={entry.selection} actions={actions} visible={active && tab === 'map'} documents={entry.documents} />
+				<MapView model={mapModel} channels={channels} selection={entry.selection} actions={actions} visible={active && tab === 'map'} documents={entry.documents} />
 			</div>
 		</div>
 	);

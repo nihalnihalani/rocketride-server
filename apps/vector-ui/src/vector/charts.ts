@@ -28,14 +28,17 @@
 // their own: chunks per document (powers-of-two bins over the directory's
 // loaded rows), chunk length (from the map's sample, its pinned points left
 // out), documents by file type, and documents ingested over time (by day,
-// week or month by the span). Each says where its numbers come from and how
-// much of the collection that is ("5 of 42 documents loaded"), never an
-// estimate; a bar whose documents the store can be asked for carries the
-// scope a click applies (a chunk range, a file type, a period).
+// week, month, quarter or year by the span, never more than MAX_PERIOD_BINS
+// bars; times outside 2000 to a year from now are shown apart as "before" and
+// "after" bars). Each says where its numbers come from and how much of the
+// collection that is ("5 of 42 documents loaded"), never an estimate; a bar
+// whose documents the store can be asked for carries the scope a click
+// applies (a chunk range, a file type, a period).
 // =============================================================================
 
 import type { IDialectResult, IDocumentItem, IDocumentsFilter, ISampleModel } from '../contract/types';
 import { extensionOf } from './fileType';
+import { isFilterExtension } from './filters';
 
 // =============================================================================
 // BINS
@@ -90,6 +93,24 @@ export function binCounts(values: readonly number[], edges: readonly number[]): 
 	return counts;
 }
 
+/**
+ * The smallest and largest of some numbers, in one pass. Spreading the
+ * values into Math.min or Math.max passes each one as an argument, and past
+ * about 125,000 of them (Load more, 25 times) V8 throws RangeError.
+ *
+ * @param values - Numbers (at least one; NaN is skipped).
+ * @returns The smallest and the largest (Infinity and -Infinity for none).
+ */
+export function minMax(values: readonly number[]): { min: number; max: number } {
+	let min = Infinity;
+	let max = -Infinity;
+	for (const v of values) {
+		if (v < min) min = v;
+		if (v > max) max = v;
+	}
+	return { min, max };
+}
+
 /** A range in words: '1', '2–3'. */
 function rangeLabel(lo: number, hi: number): string {
 	return lo === hi ? lo.toLocaleString('en-US') : `${lo.toLocaleString('en-US')}–${hi.toLocaleString('en-US')}`;
@@ -104,7 +125,7 @@ function rangeLabel(lo: number, hi: number): string {
  */
 export function logBins(values: readonly number[]): IBin[] {
 	if (values.length === 0) return [];
-	const max = Math.max(...values);
+	const { max } = minMax(values);
 	const lows: number[] = values.some((v) => v < 1) ? [0] : [];
 	for (let lo = 1; lo <= Math.max(1, max); lo *= 2) lows.push(lo);
 	const counts = binCounts(values, lows);
@@ -136,7 +157,7 @@ function niceStep(max: number, target: number): number {
  */
 export function lengthBins(lengths: readonly number[]): IBin[] {
 	if (lengths.length === 0) return [];
-	const max = Math.max(...lengths);
+	const { max } = minMax(lengths);
 	const step = niceStep(max + 1, 10);
 	const lows: number[] = [];
 	for (let lo = 0; lo <= max; lo += step) lows.push(lo);
@@ -151,7 +172,8 @@ export function lengthBins(lengths: readonly number[]): IBin[] {
  *
  * @param rows - The loaded documents.
  * @param top - Bars at most (default 8).
- * @returns The bins; a type's bar scopes to it.
+ * @returns The bins; a type's bar scopes to it when the node accepts it as an extension (not '15 meeting' from
+ *   'Board 2026.10.15 meeting', 'db_old' or 'json-ld'; those bars are drawn, not clickable).
  */
 export function byFileType(rows: readonly IDocumentItem[], top = 8): IBin[] {
 	const NONE = '(no extension)';
@@ -161,7 +183,7 @@ export function byFileType(rows: readonly IDocumentItem[], top = 8): IBin[] {
 		counts.set(ext, (counts.get(ext) ?? 0) + 1);
 	}
 	const sorted = [...counts.entries()].sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
-	const bin = (ext: string, count: number, i: number): IBin => ({ key: `t${ext}`, label: ext, lo: i, hi: i, count, scope: ext === NONE ? null : { file_types: [ext] } });
+	const bin = (ext: string, count: number, i: number): IBin => ({ key: `t${ext}`, label: ext, lo: i, hi: i, count, scope: ext !== NONE && isFilterExtension(ext) ? { file_types: [ext] } : null });
 	if (sorted.length <= top) return sorted.map(([ext, count], i) => bin(ext, count, i));
 	const kept = sorted.slice(0, top - 1).map(([ext, count], i) => bin(ext, count, i));
 	const rest = sorted.slice(top - 1);
@@ -175,12 +197,25 @@ export function byFileType(rows: readonly IDocumentItem[], top = 8): IBin[] {
 
 const DAY_MS = 86_400_000;
 
-/** How the ingest chart groups time. */
-export type PeriodUnit = 'day' | 'week' | 'month';
+/** The ingest chart draws at most this many period bars (plus the "before" and "after" ones). */
+export const MAX_PERIOD_BINS = 60;
+
+/** Ingest times before this are shown apart (no vector store ingested anything earlier). */
+const INGEST_EARLIEST_MS = Date.UTC(2000, 0, 1);
+
+/** At most this many years of ingest times are binned, so even yearly bars stay under the cap. */
+const INGEST_YEARS_MAX = 50;
+
+/** How the ingest chart groups time, finest first. */
+export type PeriodUnit = 'day' | 'week' | 'month' | 'quarter' | 'year';
+
+const UNITS: readonly PeriodUnit[] = ['day', 'week', 'month', 'quarter', 'year'];
 
 /** The start of the UTC period holding a time. */
 function periodStart(ms: number, unit: PeriodUnit): number {
 	const d = new Date(ms);
+	if (unit === 'year') return Date.UTC(d.getUTCFullYear(), 0, 1);
+	if (unit === 'quarter') return Date.UTC(d.getUTCFullYear(), Math.floor(d.getUTCMonth() / 3) * 3, 1);
 	if (unit === 'month') return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 1);
 	const day = Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate());
 	if (unit === 'day') return day;
@@ -192,7 +227,15 @@ function periodNext(start: number, unit: PeriodUnit): number {
 	if (unit === 'day') return start + DAY_MS;
 	if (unit === 'week') return start + 7 * DAY_MS;
 	const d = new Date(start);
-	return Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 1);
+	if (unit === 'year') return Date.UTC(d.getUTCFullYear() + 1, 0, 1);
+	return Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + (unit === 'quarter' ? 3 : 1), 1);
+}
+
+/** How many periods of a unit run from `min` to `max` (counting stops past the cap). */
+function periodCount(min: number, max: number, unit: PeriodUnit): number {
+	let n = 0;
+	for (let s = periodStart(min, unit); s <= max && n <= MAX_PERIOD_BINS; s = periodNext(s, unit)) n += 1;
+	return n;
 }
 
 /** An ISO time without milliseconds. */
@@ -200,35 +243,81 @@ function iso(ms: number): string {
 	return new Date(ms).toISOString().replace('.000Z', 'Z');
 }
 
+/** A period's label: '2026-10-08', 'week of 2026-08-03', '2026-10', '2026 Q4', '2026'. */
+function periodLabel(start: number, unit: PeriodUnit): string {
+	const day = iso(start).slice(0, 10);
+	switch (unit) {
+		case 'day':
+			return day;
+		case 'week':
+			return `week of ${day}`;
+		case 'month':
+			return day.slice(0, 7);
+		case 'quarter':
+			return `${day.slice(0, 4)} Q${Math.floor(new Date(start).getUTCMonth() / 3) + 1}`;
+		case 'year':
+			return day.slice(0, 4);
+	}
+}
+
+/**
+ * The ingest times the chart bins: from 2000 (or, decades on, the last 50
+ * years) to a year after now, both as the first and last days kept.
+ *
+ * @param now - The console's clock (epoch ms).
+ * @returns `from` (inclusive) and `to` (exclusive, the midnight after the last day), epoch ms.
+ */
+export function ingestWindow(now: number): { from: number; to: number } {
+	const last = new Date(now + 365 * DAY_MS);
+	const to = Date.UTC(last.getUTCFullYear(), last.getUTCMonth(), last.getUTCDate() + 1);
+	return { from: Math.max(INGEST_EARLIEST_MS, Date.UTC(last.getUTCFullYear() - INGEST_YEARS_MAX + 1, 0, 1)), to };
+}
+
 /**
  * Documents ingested per day (span within 31 days), week (Monday, UTC; within
- * 26 weeks) or month, every period from the first to the last kept.
+ * 26 weeks), month, quarter or year: the finest of those that keeps at most
+ * MAX_PERIOD_BINS bars, every period from the first to the last kept. Times
+ * outside {@link ingestWindow} (a sentinel such as 9999-12-31 or 1970-01-01)
+ * are counted in a "before" and an "after" bar, which scope nothing.
  *
  * @param rows - The loaded documents.
- * @returns The unit, the bins (each scopes to its period) and how many rows had an ingest time.
+ * @param now - The console's clock (epoch ms).
+ * @returns The unit, the bins (each period scopes to itself), how many rows had an ingest time and how many of those are outside the window.
  */
-export function byIngestPeriod(rows: readonly IDocumentItem[]): { unit: PeriodUnit; bins: IBin[]; dated: number } {
+export function byIngestPeriod(rows: readonly IDocumentItem[], now: number = Date.now()): { unit: PeriodUnit; bins: IBin[]; dated: number; outside: number } {
+	const range = ingestWindow(now);
 	const times: number[] = [];
+	const before: number[] = [];
+	const after: number[] = [];
 	for (const row of rows) {
 		if (row.ingestedAt === null) continue;
 		const at = Date.parse(row.ingestedAt);
-		if (Number.isFinite(at)) times.push(at);
+		if (!Number.isFinite(at)) continue;
+		if (at < range.from) before.push(at);
+		else if (at >= range.to) after.push(at);
+		else times.push(at);
 	}
-	if (times.length === 0) return { unit: 'day', bins: [], dated: 0 };
-	const min = Math.min(...times);
-	const max = Math.max(...times);
-	const spanDays = (periodStart(max, 'day') - periodStart(min, 'day')) / DAY_MS;
-	const unit: PeriodUnit = spanDays <= 31 ? 'day' : spanDays <= 7 * 26 ? 'week' : 'month';
-	const starts: number[] = [];
-	for (let s = periodStart(min, unit); s <= max; s = periodNext(s, unit)) starts.push(s);
-	const counts = binCounts(times, starts);
-	const bins = starts.map((start, i) => {
-		const next = periodNext(start, unit);
-		const day = iso(start).slice(0, 10);
-		const label = unit === 'day' ? day : unit === 'week' ? `week of ${day}` : day.slice(0, 7);
-		return { key: `p${start}`, label, lo: start, hi: next - 1, count: counts[i] as number, scope: { ingested_after: iso(start), ingested_before: iso(next) } };
-	});
-	return { unit, bins, dated: times.length };
+	const dated = times.length + before.length + after.length;
+	const outside = before.length + after.length;
+	if (dated === 0) return { unit: 'day', bins: [], dated: 0, outside: 0 };
+	const bins: IBin[] = [];
+	if (before.length > 0) bins.push({ key: 'pbefore', label: `before ${iso(range.from).slice(0, 10)}`, lo: minMax(before).min, hi: range.from - 1, count: before.length, scope: null });
+	let unit: PeriodUnit = 'day';
+	if (times.length > 0) {
+		const { min, max } = minMax(times);
+		const spanDays = (periodStart(max, 'day') - periodStart(min, 'day')) / DAY_MS;
+		const finest = spanDays <= 31 ? 0 : spanDays <= 7 * 26 ? 1 : 2;
+		unit = UNITS.slice(finest).find((u) => periodCount(min, max, u) <= MAX_PERIOD_BINS) ?? 'year';
+		const starts: number[] = [];
+		for (let s = periodStart(min, unit); s <= max && starts.length < MAX_PERIOD_BINS; s = periodNext(s, unit)) starts.push(s);
+		const counts = binCounts(times, starts);
+		starts.forEach((start, i) => {
+			const next = periodNext(start, unit);
+			bins.push({ key: `p${start}`, label: periodLabel(start, unit), lo: start, hi: next - 1, count: counts[i] as number, scope: { ingested_after: iso(start), ingested_before: iso(next) } });
+		});
+	}
+	if (after.length > 0) bins.push({ key: 'pafter', label: `after ${iso(range.to - DAY_MS).slice(0, 10)}`, lo: range.to, hi: minMax(after).max, count: after.length, scope: null });
+	return { unit, bins, dated, outside };
 }
 
 // =============================================================================
@@ -264,6 +353,8 @@ export interface IChartsInput {
 	dialect: IDialectResult | null;
 	/** The directory is still loading pages. */
 	loading: boolean;
+	/** The console's clock (epoch ms) for the ingest chart's window; default now. */
+	now?: number;
 }
 
 /** A number with its noun. */
@@ -333,7 +424,7 @@ export function chunksPerDocument(rows: readonly IDocumentItem[], total: number 
  * @returns Chunks per document, chunk length, documents by file type, ingested over time.
  */
 export function collectionCharts(input: IChartsInput): IChart[] {
-	const { rows, total, sample, dialect, loading } = input;
+	const { rows, total, sample, dialect, loading, now = Date.now() } = input;
 	const skeleton = loading && rows.length === 0;
 
 	const chunks = { ...chunksPerDocument(rows, total), loading };
@@ -361,17 +452,19 @@ export function collectionCharts(input: IChartsInput): IChart[] {
 	const types: IChart = { id: 'types', title: 'Documents by file type', unit: 'documents', bins: typeBins, caption: coverage(rows.length, total), summary: summaryOf('Documents by file type', typeBins, 'documents'), disabled: null, loading, median: null };
 
 	const caveats = new Set(dialect?.caveats ?? []);
-	const periods = byIngestPeriod(rows);
+	const periods = byIngestPeriod(rows, now);
 	let ingestDisabled: string | null = null;
 	if (caveats.has('extras_not_stored')) ingestDisabled = 'This store does not keep ingest times';
 	else if (rows.length > 0 && periods.dated === 0) ingestDisabled = 'No ingest times on the loaded documents';
 	const undated = rows.length - periods.dated;
+	const range = ingestWindow(now);
+	const apart = periods.outside > 0 ? ` · ${plural(periods.outside, 'ingest time', 'ingest times')} outside ${iso(range.from).slice(0, 10)} to ${iso(range.to - DAY_MS).slice(0, 10)}, shown apart` : '';
 	const ingest: IChart = {
 		id: 'ingest',
 		title: 'Ingested over time',
 		unit: 'documents',
 		bins: periods.bins,
-		caption: `by ${periods.unit} · ${coverage(rows.length, total)}${undated > 0 && periods.dated > 0 ? ` · ${undated.toLocaleString('en-US')} without an ingest time` : ''}`,
+		caption: `${periods.dated > periods.outside ? `by ${periods.unit} · ` : ''}${coverage(rows.length, total)}${undated > 0 && periods.dated > 0 ? ` · ${undated.toLocaleString('en-US')} without an ingest time` : ''}${apart}`,
 		summary: summaryOf(`Documents ingested by ${periods.unit}`, periods.bins, 'documents'),
 		disabled: ingestDisabled,
 		loading,
