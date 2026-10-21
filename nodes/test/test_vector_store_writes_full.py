@@ -150,8 +150,9 @@ def test_failed_batch_rolls_back_deletion_and_partial_inserts(store_env):
     raw.commit()
     bad = _doc('b')
     bad.embedding = [float('nan'), 0.0, 0.0]
-    # The shared pgvector driver checks the vector before it is sent and raises StoreError
-    # ("NaN not allowed in vector"); develop's single-connection driver let psycopg2 raise.
+    # pgvector rejects the NaN on the server ("NaN not allowed in vector"). The shared
+    # driver's pool.run_write maps that psycopg2 error to StoreError, keeping the server's
+    # text; develop's single-connection driver let the psycopg2.DataError through.
     with pytest.raises((psycopg2.DataError, StoreError), match='NaN'):
         store.addChunks([_doc(content='replacement'), bad], checkCollection=False)
     assert _rows(raw, table) == [('a', 0, 'original'), ('b', 0, 'original'), ('c', 0, 'untouched')]

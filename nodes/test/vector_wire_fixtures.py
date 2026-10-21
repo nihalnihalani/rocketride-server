@@ -48,6 +48,7 @@ import json
 import math
 import os
 import sys
+import uuid
 
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -377,11 +378,37 @@ def _captures_for(
     # Last, and on an id nothing was uploaded under: writes that must be refused.
     nobody = disposable_id(tp)
     put('remove_document', 'writes_source', side.tool('remove_document', {'object_ids': [nobody]}, source='chat_1'))
-    put('remove_document', 'writes_disabled', side.tool('remove_document', {'object_ids': [nobody]}, node='store_2'))
+    put('remove_document', 'writes_disabled', _writes_disabled_answer(tp, side, nobody))
     put('remove_document', 'reserved_id', side.tool('remove_document', {'object_ids': ['schema']}))
     if problems:
         raise CaptureMismatch('; '.join(problems))
     return out
+
+
+def _writes_disabled_answer(tp, side, nobody: str) -> Any:
+    """The WRITES_DISABLED refusal: a Tools-source removal on a store whose allow_writes is off.
+
+    Every template's store_2 answers it, except rocketride_vector's. There store_2 keeps
+    allow_write off, which hides its write tools (the engine finds no handler), because
+    allow_write is the one barrier against agent writes on that node. For it the refusal
+    is taken from the generator's own copy of the pipeline: store_1 with allow_write on,
+    allow_writes off and no agent wired, run as a side of its own and stopped afterwards.
+    """
+    if side.template != 'rocketride_vector':
+        return side.tool('remove_document', {'object_ids': [nobody]}, node='store_2')
+    pipe = json.loads(json.dumps(side.pipe))
+    pipe['project_id'] = str(uuid.uuid4())
+    pipe['name'] = f'{pipe.get("name", "vx-wire")} (writes off)'
+    for comp in pipe['components']:
+        if comp['id'] == 'store_1':
+            profile = comp['config']['profile']
+            comp['config'][profile] = {**comp['config'][profile], 'allow_write': True, 'allow_writes': False}
+    assert not any(str(comp.get('provider', '')).startswith('agent') for comp in pipe['components'])
+    variant = tp._Side(side.engine, side.template, f'{side.kind}-writes-off', side.collection, pipe, ('tools_1',))
+    try:
+        return variant.tool('remove_document', {'object_ids': [nobody]})
+    finally:
+        variant.stop()
 
 
 def _backend_captures(

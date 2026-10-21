@@ -1155,6 +1155,9 @@ def test_dialect_describes_the_store(side, deployment):
     assert health['collection_exists'] is True and health['control_record'] is True
     s2 = side.ok('dialect', node='store_2')
     assert s2['allow_writes'] is False, 'store_2 must report writes off'
+    if deployment.provider == 'rocketride_vector':
+        # store_2 has allow_write off: its write tools are hidden, so no caller writes there.
+        assert s2['agent_writes'] is False, 'store_2 hides its write tools from agents too'
 
 
 def test_stats_full_and_quick(side, deployment):
@@ -1652,12 +1655,23 @@ def _write_cases() -> List[Tuple[str, str, str, str, Callable[[str], Dict[str, A
     ]
 
 
+#: What the engine raises when a call names a node that offers no such tool
+#: (``data_conn``: ``No handler found for tool "<tool>" on node "<node>"``).
+_NO_HANDLER = 'No handler found for tool "{tool}" on node "{node}"'
+
+
 @pytest.mark.parametrize('case', _write_cases(), ids=lambda c: c[0])
 def test_writes_are_refused_with_the_data_unchanged(side, deployment, tmp_path, case):
     label, source, node, tool, make_input, expected = case
     _name, oid = _own_document(side, re.sub(r'\W+', '-', label), tmp_path)
     before = deployment.service.counts(side.collection)
-    assert side.refused(tool, make_input(oid), source=source, node=node) == expected, label
+    if deployment.provider == 'rocketride_vector' and node == 'store_2':
+        # rocketride_vector's store_2 keeps allow_write off (the one barrier against agent
+        # writes on that node), so its write tools are hidden: the engine finds no handler.
+        with pytest.raises(Exception, match=re.escape(_NO_HANDLER.format(tool=tool, node=node))):
+            side.tool(tool, make_input(oid), source=source, node=node)
+    else:
+        assert side.refused(tool, make_input(oid), source=source, node=node) == expected, label
     assert deployment.service.counts(side.collection) == before
     side.ok('remove_document', {'object_ids': [oid]})
 
@@ -1666,8 +1680,11 @@ def test_a_broadcast_write_is_refused(side, deployment, tmp_path):
     _name, oid = _own_document(side, 'broadcast', tmp_path)
     before = deployment.service.counts(side.collection)
     # A broadcast reaches the first node that has the tool; which store that is decides the code.
+    # rocketride_vector's store_2 has no write tools (allow_write off), so there the broadcast
+    # always lands on store_1, whose allow_writes is on, whichever store answers dialect first.
     first = side.ok('dialect', node='')
-    expected = 'WRITES_BROADCAST' if first['allow_writes'] else 'WRITES_DISABLED'
+    writes = first['allow_writes'] or deployment.provider == 'rocketride_vector'
+    expected = 'WRITES_BROADCAST' if writes else 'WRITES_DISABLED'
     assert side.refused('remove_document', {'object_ids': [oid]}, node='') == expected
     assert deployment.service.counts(side.collection) == before
     side.ok('remove_document', {'object_ids': [oid]})
