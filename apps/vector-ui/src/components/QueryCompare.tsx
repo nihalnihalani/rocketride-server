@@ -38,7 +38,7 @@ import React from 'react';
 import type { CSSProperties } from 'react';
 import { commonStyles } from 'shell';
 import type { IScoreInfo } from '../contract/types';
-import { compareRuns, compareSentence, sideOf } from '../vector/compare';
+import { compareRuns, compareSentence, rowKey, sideOf } from '../vector/compare';
 import type { CompareSide, CompareSummary } from '../vector/compare';
 import { STATUS_WORDS, fromChatLine, runCaption, scoreTitle } from '../vector/searchWorkbench';
 import type { Classification, WorkbenchRow, WorkbenchRun } from '../vector/searchWorkbench';
@@ -134,11 +134,11 @@ function Column({ letter, side, summary, score, onOpen, scopeOn }: SideProps): R
 						</tr>
 					</thead>
 					<tbody>
-						{view.rows.map((row) => {
+						{view.rows.map((row, index) => {
 							const where = sideOf(summary, row.key, letter);
 							const path = row.path || row.objectId;
 							return (
-								<tr key={`${row.objectId}#${row.chunkId}`} data-status={row.status} data-side={where} style={row.status === 'used' || row.status === 'keyword' ? undefined : S.muted}>
+								<tr key={rowKey(row.key, index)} data-status={row.status} data-side={where} style={row.status === 'used' || row.status === 'keyword' ? undefined : S.muted}>
 									<td style={S.td}>{row.rank}</td>
 									<td style={S.td} title={row.preview}>
 										<button type="button" style={S.link} aria-label={`Open ${path} at chunk ${row.chunkId}`} onClick={() => onOpen(row)}>

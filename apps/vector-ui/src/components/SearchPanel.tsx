@@ -56,7 +56,7 @@ import { Banner, commonStyles } from 'shell';
 import type { SearchPanelProps as ContractSearchPanelProps, IScoreInfo } from '../contract/types';
 import { callTool, toolChannelFor } from '../chat/toolCalls';
 import { showCompareOnMap } from '../adapters/consoleActions';
-import { compareRuns, compareSentence } from '../vector/compare';
+import { compareRuns, compareSentence, rowKey } from '../vector/compare';
 import { CALL_TIMEOUT_MS, DEFAULT_TOP_K, KEYWORD_FALLBACK_SENTENCE, MODEL_MISMATCH_SENTENCE, MODE_HINTS, NODE_SETTING_FIELD, NODE_SETTING_NOTE, NODE_SETTING_RANGE, STATUS_WORDS, classifyAt, defaultMode, fromChatLine, initialThreshold, keywordCaption, modeOptions, noResultsSentence, nodeSettingText, onGrid, prefillRun, rateLimitSentence, runCaption, runWorkbench, scoreTitle, searchExportItems, searchScope, secondsLeft, showSearchOnMap, sliderRange, sliderValueText, thresholdSentence, topKChoices, topKOptions } from '../vector/searchWorkbench';
 import type { ChatPrefill, Classification, ModeOption, SearchMode, SliderRange, WorkbenchDeps, WorkbenchOutcome, WorkbenchRow, WorkbenchRun } from '../vector/searchWorkbench';
 import { ExportMenu } from './ExportMenu';
@@ -233,11 +233,11 @@ export function SearchResults({ run, view, score, range, onThreshold, onCopySett
 							</tr>
 						</thead>
 						<tbody>
-							{view.rows.map((row) => {
+							{view.rows.map((row, index) => {
 								const path = row.path || row.objectId;
 								const from = fusedFrom(row);
 								return (
-									<tr key={`${row.objectId}#${row.chunkId}`} data-status={row.status} data-key={`${row.objectId}#${row.chunkId}`} style={row.status === 'used' || row.status === 'keyword' ? undefined : S.muted}>
+									<tr key={rowKey(row.key, index)} data-status={row.status} data-key={`${row.objectId}#${row.chunkId}`} style={row.status === 'used' || row.status === 'keyword' ? undefined : S.muted}>
 										<td style={S.td}>{row.rank}</td>
 										<td style={S.td}>
 											<span>{`${path} #${row.chunkId}${row.cited ? ' · cited' : ''}`}</span>

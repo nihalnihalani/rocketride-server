@@ -27,7 +27,9 @@
 // Server-rendered smoke tests (there is no DOM harness): each panel renders
 // its available and unavailable states with the right sentences, accessible
 // names and controls. The shell's components are replaced by plain stand-ins
-// that render their text, loaded before the panels are.
+// that render their text, loaded before the panels are, and the panels' JSX
+// runtime records sibling elements keyed alike (React only warns about those
+// in the browser).
 // =============================================================================
 
 import { test as nodeTest } from 'node:test';
@@ -37,11 +39,13 @@ import path from 'node:path';
 import Module from 'node:module';
 import React from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
-import type { IExplorerEndpoint, IRoleChannel } from 'shared/explorer';
+import type { IExplorerEndpoint, IProbeResult, IRoleChannel } from 'shared/explorer';
+import { fakeWorld, manualClock, projectRows, vectorComponents } from 'shared/explorer/connect/testing';
 import type { ConsoleActions, ConsoleModel, IChatSource, IDialectResult, IScopeState, ISearchResult, VectorChannels, VectorKey } from '../src/contract/types';
 import { createSelectionStore } from '../src/contract/bridge';
 import type { UploadRow } from '../src/vector/uploads';
 import { QUERY_NEEDS_EMBED } from '../src/map/wording';
+import { classifyRetrieval } from '../src/vector/retrieval';
 import { classifyAt, runWorkbench, sliderRange } from '../src/vector/searchWorkbench';
 import type { ChatPrefill, WorkbenchDeps, WorkbenchRun } from '../src/vector/searchWorkbench';
 
@@ -63,22 +67,74 @@ function test(name: string, fn: () => void | Promise<void>): void {
 const h = React.createElement;
 const shellStandIn = {
 	commonStyles: new Proxy({}, { get: () => ({}) }),
-	EmptyState: ({ title, description }: { title: string; description?: string }) => h('div', { 'data-empty-state': '' }, h('strong', null, title), description ? h('p', null, description) : null),
+	EmptyState: ({ title, description, action }: { title: string; description?: string; action?: React.ReactNode }) => h('div', { 'data-empty-state': '' }, h('strong', null, title), description ? h('p', null, description) : null, action ?? null),
 	Banner: ({ variant, children }: { variant: string; children: React.ReactNode }) => h('div', { 'data-banner': variant }, children),
 	ConfirmDialog: (props: { title: string; message: React.ReactNode; confirmLabel?: string; cancelLabel?: string }) => h('div', { role: 'dialog', 'aria-label': props.title }, props.message, h('button', null, props.cancelLabel ?? 'Cancel'), h('button', null, props.confirmLabel ?? 'Save')),
 	useShellEvent: () => undefined,
 };
+// ── Sibling keys (the panels' JSX runtime, installed with the stand-ins) ─────
+//
+// In the browser React warns "Encountered two children with the same key" when
+// one children array holds two elements keyed alike, and may then drop or
+// repeat rows. renderToStaticMarkup never reconciles, so it never says so: the
+// panels' JSX runtime is wrapped to record such pairs as they render here.
+
+/** The JSX runtime's two factories. */
+type JsxFactory = (type: unknown, props: { children?: unknown } | null, key?: unknown) => unknown;
+const jsxRuntime = require('react/jsx-runtime') as { jsx: JsxFactory; jsxs: JsxFactory };
+/** Sibling elements rendered with a key already used in their array, as "<parent>: <key>". */
+const keyClashes: string[] = [];
+/** Elements the panels created through the wrapped runtime (proves the check ran). */
+let checkedElements = 0;
+
+/**
+ * Record the keys used twice in one children array, as React's reconciler
+ * would warn about them (each nested array is its own set of siblings).
+ *
+ * @param parent - The element type the children belong to.
+ * @param children - Its children.
+ */
+function recordKeyClashes(parent: unknown, children: unknown): void {
+	if (!Array.isArray(children)) return;
+	const seen = new Set<string>();
+	for (const child of children) {
+		if (Array.isArray(child)) {
+			recordKeyClashes(parent, child);
+		} else if (React.isValidElement(child) && child.key !== null) {
+			const key = String(child.key);
+			if (seen.has(key)) keyClashes.push(`${typeof parent === 'function' ? parent.name : String(parent)}: ${key}`);
+			seen.add(key);
+		}
+	}
+}
+
+/**
+ * A JSX factory that checks the children's keys before creating the element.
+ *
+ * @param factory - The runtime's factory.
+ * @returns The checked factory.
+ */
+function checked(factory: JsxFactory): JsxFactory {
+	return (type, props, key) => {
+		checkedElements += 1;
+		recordKeyClashes(type, props?.children);
+		return factory(type, props, key);
+	};
+}
+const checkedJsxRuntime = { ...jsxRuntime, jsx: checked(jsxRuntime.jsx), jsxs: checked(jsxRuntime.jsxs) };
+
 const moduleWithLoad = Module as unknown as { _load: (request: string, parent: unknown, isMain: boolean) => unknown };
 const originalLoad = moduleWithLoad._load;
 moduleWithLoad._load = function (request: string, parent: unknown, isMain: boolean): unknown {
 	if (request === 'shell') return shellStandIn;
+	if (request === 'react/jsx-runtime') return checkedJsxRuntime;
 	return originalLoad.call(this, request, parent, isMain);
 };
 
 const { IngestPanel, NO_INGEST_SENTENCE } = require('../src/components/IngestPanel') as typeof import('../src/components/IngestPanel');
 const { ChatPanel, NO_CHAT_SENTENCE } = require('../src/components/ChatPanel') as typeof import('../src/components/ChatPanel');
 const { SourcesPanel } = require('../src/components/SourcesPanel') as typeof import('../src/components/SourcesPanel');
-const { RetrievalDebugger } = require('../src/components/RetrievalDebugger') as typeof import('../src/components/RetrievalDebugger');
+const { RetrievalDebugger, RetrievalTable } = require('../src/components/RetrievalDebugger') as typeof import('../src/components/RetrievalDebugger');
 const { ScoreHistogram } = require('../src/components/ScoreHistogram') as typeof import('../src/components/ScoreHistogram');
 const { SearchPanel, SearchResults, SHOWING_SEARCH } = require('../src/components/SearchPanel') as typeof import('../src/components/SearchPanel');
 const { QueryCompare } = require('../src/components/QueryCompare') as typeof import('../src/components/QueryCompare');
@@ -88,6 +144,8 @@ const { ReplaceConfirmDialog } = require('../src/ingest/ReplaceConfirmDialog') a
 const { chatSessionFor, forgetChatAndIngest } = require('../src/chat/registry') as typeof import('../src/chat/registry');
 const { parseChatResult } = require('../src/vector/chatResult') as typeof import('../src/vector/chatResult');
 const { replaceQuestion } = require('../src/vector/uploads') as typeof import('../src/vector/uploads');
+const { buildConsoleModel } = require('../src/vector/consoleModel') as typeof import('../src/vector/consoleModel');
+const { makeVectorEndpointStore } = require('../src/adapters/explorer') as typeof import('../src/adapters/explorer');
 
 // ── Fixtures ────────────────────────────────────────────────────────────────
 
@@ -294,6 +352,115 @@ test('ChatPanel: without a Chat source it says so and offers no composer', () =>
 	forgetChatAndIngest();
 });
 
+// ── Without a Chat source: Search needs no LLM ──────────────────────────────
+//
+// The console mounts this panel on every open connection, so a pipeline with
+// a Tools source and an embedding node but no running Chat source still
+// reaches Search: the header's toggle, the SearchPanel behind it, and an
+// action in the chat body's empty state that shows it.
+
+/** The console model of a connection whose Chat source is not running (as consoleModel builds it). */
+function noChatModel(overrides: Partial<ConsoleModel> = {}): ConsoleModel {
+	return model({ chat: { enabled: false, reason: NO_CHAT_SENTENCE }, nodes: { store: 'store_1', embed: 'embed_1', llm: null, llmName: null }, ...overrides });
+}
+
+/** The channels of that connection: no chat channel. */
+const noChatChannels: VectorChannels = { ...channels, chat: null };
+
+/**
+ * The radio inputs of the SearchPanel's mode choice, by value.
+ *
+ * @param html - The rendered markup.
+ * @returns Each mode and whether its radio is disabled.
+ */
+function modeRadios(html: string): Record<string, boolean> {
+	const radios: Record<string, boolean> = {};
+	for (const [tag] of html.matchAll(/<input type="radio"[^>]*\/>/g)) {
+		const value = /value="([a-z]+)"/.exec(tag)?.[1];
+		if (value !== undefined) radios[value] = tag.includes('disabled=""');
+	}
+	return radios;
+}
+
+/**
+ * The chat body's empty state.
+ *
+ * @param html - The rendered markup.
+ * @returns Its markup, or '' when there is none.
+ */
+function chatEmptyState(html: string): string {
+	const body = html.slice(html.indexOf('data-surface="chat"'));
+	const at = body.indexOf('<div data-empty-state="">');
+	if (at < 0) return '';
+	return body.slice(at, body.indexOf('</div>', at) + '</div>'.length);
+}
+
+test('ChatPanel: without a Chat source the Search toggle, the SearchPanel and a "Search without the LLM" action stay', () => {
+	forgetChatAndIngest();
+	const html = render(h(ChatPanel, { model: noChatModel(), channels: noChatChannels, selection: createSelectionStore('render-1'), actions, scope: null, onClearScope: () => undefined }));
+	assert.match(html, /<button[^>]*aria-pressed="false"[^>]*>Search<\/button>/, 'the header toggle does not depend on the chat');
+	const at = html.search(/<[a-z]+[^>]*data-component="SearchPanel"/);
+	assert.ok(at >= 0, 'the SearchPanel is mounted');
+	assert.match(html.slice(0, at), /<div hidden=""[^>]*>$/, 'hidden until Search is on');
+	assert.doesNotMatch(html, /Answers by/, 'no LLM to name');
+	assert.doesNotMatch(html, /<textarea/, 'no composer');
+	const empty = chatEmptyState(html);
+	assert.match(empty, /<strong>Chat is not available<\/strong>/);
+	assert.ok(empty.includes(NO_CHAT_SENTENCE));
+	assert.match(empty, /<button type="button"[^>]*>Search without the LLM<\/button>/, 'the empty state offers Search');
+	forgetChatAndIngest();
+});
+
+test('ChatPanel: without a Chat source, Search on shows the SearchPanel with every mode the store can run', () => {
+	forgetChatAndIngest();
+	const html = render(h(ChatPanel, { model: noChatModel(), channels: noChatChannels, selection: createSelectionStore('render-1'), actions, scope: null, onClearScope: () => undefined, initialSearch: true }));
+	assert.match(html, /<button[^>]*aria-pressed="true"[^>]*>Search<\/button>/);
+	const at = html.search(/<[a-z]+[^>]*data-component="SearchPanel"/);
+	assert.ok(at >= 0);
+	assert.doesNotMatch(html.slice(html.lastIndexOf('<div', at - 1), at), /hidden=""/, 'the SearchPanel is shown');
+	assert.deepEqual(modeRadios(html), { semantic: false, keyword: false, hybrid: false, auto: false }, 'no mode needs the chat');
+	assert.match(html, /<div data-surface="chat" style="display:none">/, 'the empty chat body is hidden behind Search');
+	forgetChatAndIngest();
+});
+
+test('ChatPanel: without a Chat source and with no search the store can run, the empty state offers no Search action', () => {
+	forgetChatAndIngest();
+	const nothing = noChatModel({ embed: { enabled: false, reason: QUERY_NEEDS_EMBED }, nodes: { store: 'store_1', embed: null, llm: null, llmName: null }, capabilities: { ...dialect.capabilities, search_keyword: false } });
+	const html = render(h(ChatPanel, { model: nothing, channels: noChatChannels, selection: createSelectionStore('render-1'), actions, scope: null, onClearScope: () => undefined }));
+	const empty = chatEmptyState(html);
+	assert.match(empty, /Chat is not available/);
+	assert.doesNotMatch(empty, /<button/, 'nothing to offer');
+	assert.match(html, /<button[^>]*aria-pressed="false"[^>]*>Search<\/button>/, 'the toggle stays; the SearchPanel says why nothing runs');
+	forgetChatAndIngest();
+});
+
+test("ChatPanel: on the console's own model of a connection with a Tools source and no Chat source, Search runs every mode", async () => {
+	forgetChatAndIngest();
+	const qdrant = fixture<IDialectResult>('dialect_qdrant.json');
+	const world = fakeWorld(projectRows(['ingest_1', 'tools_1'], vectorComponents('qdrant')), (call) => (call.tool === 'dialect' ? qdrant : {}));
+	const clock = manualClock();
+	const store = makeVectorEndpointStore({ clock, debounceMs: 0 });
+	const refreshing = store.refresh(world.client);
+	await clock.advance(0);
+	await refreshing;
+	await clock.settle();
+	const { endpoints, probes } = store.getState();
+	assert.equal(endpoints.length, 1, 'the store is one card');
+	const endpoint: IExplorerEndpoint = endpoints[0];
+	const probe: IProbeResult | undefined = probes[endpoint.key];
+	const built = buildConsoleModel(endpoint, probe, null);
+	assert.equal(built.chat.enabled, false, 'no Chat source: the chat is off');
+	assert.equal(built.embed.enabled, true, 'the Tools source reaches the embedding node');
+	const key = built.connectionKey;
+	const off = render(h(ChatPanel, { model: built, channels: noChatChannels, selection: createSelectionStore(key), actions, scope: null, onClearScope: () => undefined }));
+	assert.match(off, /<button[^>]*aria-pressed="false"[^>]*>Search<\/button>/);
+	assert.match(off, /data-component="SearchPanel"/);
+	assert.match(chatEmptyState(off), /Search without the LLM/);
+	const on = render(h(ChatPanel, { model: built, channels: noChatChannels, selection: createSelectionStore(key), actions, scope: null, onClearScope: () => undefined, initialSearch: true }));
+	assert.deepEqual(modeRadios(on), { semantic: false, keyword: false, hybrid: false, auto: false });
+	forgetChatAndIngest();
+});
+
 test('SourcesPanel: chunk text is text, not markup; scores carry their formula', () => {
 	const sources: IChatSource[] = parseChatResult({ documents: [{ page_content: '<script>alert(1)</script> water', score: 0.5757, metadata: { objectId: 'o1', chunkId: 2, parent: 'a/b.md' } }] }).sources;
 	const html = render(h(SourcesPanel, { sources, score: dialect.score, onOpen: () => undefined, onShowOnMap: () => undefined }));
@@ -490,6 +657,23 @@ test("SearchResults: the slider over the store's range, its count beside the nod
 	assert.match(html, /below the floor \(the store drops it\)/);
 });
 
+test('SearchResults: without a Chat source every "ask about this" is off and says why; open and map stay', async () => {
+	const run = await finishedRun('water', 'semantic', [twentyRows()]);
+	const html = render(h(SearchResults, { run, view: classifyAt(run.rows, 0.3, dialect.score), score: dialect.score, range: sliderRange(dialect.score), ...resultHandlers, canAsk: false, askReason: NO_CHAT_SENTENCE }));
+	const asks = [...html.matchAll(/<button[^>]*aria-label="Ask about [^"]*"[^>]*>/g)].map(([tag]) => tag);
+	assert.equal(asks.length, 20);
+	for (const tag of asks) {
+		assert.ok(tag.includes('disabled=""'), tag);
+		assert.ok(tag.includes(`title="${NO_CHAT_SENTENCE}"`), tag);
+	}
+	const others = [...html.matchAll(/<button[^>]*aria-label="(?:Open|Show chunk) [^"]*"[^>]*>/g)].map(([tag]) => tag);
+	assert.equal(others.length, 40, 'open and map on every row');
+	assert.ok(
+		others.every((tag) => !tag.includes('disabled=""')),
+		'open and map do not need the chat'
+	);
+});
+
 test('SearchResults: keyword rows have no slider; hybrid says it was fused here; the cited mark; warnings', async () => {
 	const keyword = await finishedRun('KX4471', 'keyword', [fixture<ISearchResult>('search_keyword_fallback_warning.json')]);
 	const kw = render(h(SearchResults, { run: keyword, view: classifyAt(keyword.rows, 0.3, dialect.score), score: dialect.score, range: sliderRange(dialect.score), ...resultHandlers }));
@@ -538,6 +722,81 @@ test('QueryCompare: the column of the brought question says "From the chat" and 
 	assert.match(column('A'), /From the chat: the chunk its answer cited is marked “cited”\./);
 	assert.match(column('A'), /#67<\/button> · cited/);
 	assert.doesNotMatch(column('B'), /From the chat|· cited/);
+});
+
+/**
+ * Render an element and collect the sibling elements it keyed alike.
+ *
+ * @param element - The element.
+ * @returns The markup and the clashes.
+ */
+function renderCheckingKeys(element: React.ReactElement): { html: string; clashes: string[] } {
+	keyClashes.length = 0;
+	const before = checkedElements;
+	const html = render(element);
+	assert.ok(checkedElements > before, 'the panel rendered through the checked JSX runtime');
+	return { html, clashes: [...keyClashes] };
+}
+
+/**
+ * The result rows of some markup (the header rows carry no status).
+ *
+ * @param html - The markup.
+ * @returns How many.
+ */
+function resultRows(html: string): number {
+	return (html.match(/<tr[^>]*data-status="/g) ?? []).length;
+}
+
+test('SearchResults, QueryCompare and the "Why these?" table: an answer that repeats a chunk, or carries no chunk ids, lists every row and keys no two alike', async () => {
+	const vector = fixture<ISearchResult>('search_vector.json');
+	const [first, second] = vector.results;
+	const repeated: ISearchResult = { ...vector, total: 3, results: [first, { ...first, rank: 2, score: first.score - 0.01 }, { ...second, rank: 3 }] };
+	// Without objectId and chunkId every row reads as the same chunk ("#-1").
+	const bare: ISearchResult = {
+		success: true,
+		mode_used: 'semantic',
+		warnings: [],
+		total: 2,
+		results: [
+			{ content: 'one', score: 0.5, metadata: {} },
+			{ content: 'two', score: 0.45, metadata: {} },
+		],
+	};
+	const clashes: Record<string, string[]> = {};
+	for (const [name, answer] of [
+		['repeated chunk', repeated],
+		['no chunk ids', bare],
+	] as const) {
+		const run = await finishedRun('water', 'semantic', [answer]);
+		const view = classifyAt(run.rows, 0.3, dialect.score);
+		const results = renderCheckingKeys(h(SearchResults, { run, view, score: dialect.score, range: sliderRange(dialect.score), ...resultHandlers }));
+		clashes[`SearchResults, ${name}`] = results.clashes;
+		assert.equal(resultRows(results.html), answer.results.length, `SearchResults, ${name}: every row`);
+		const compare = renderCheckingKeys(h(QueryCompare, { a: { run, view }, b: { run, view }, score: dialect.score, onShowBoth: () => undefined, onOpen: () => undefined }));
+		clashes[`QueryCompare, ${name}`] = compare.clashes;
+		assert.equal(resultRows(compare.html), 2 * answer.results.length, `QueryCompare, ${name}: every row of A and of B`);
+		const table = renderCheckingKeys(h(RetrievalTable, { view: classifyRetrieval(answer, dialect.score, []) }));
+		clashes[`"Why these?", ${name}`] = table.clashes;
+		assert.equal(resultRows(table.html), answer.results.length, `"Why these?", ${name}: every row`);
+		if (answer === repeated) {
+			// The acceptance scripts read the chunk from data-key; it stays the chunk's own.
+			assert.equal((results.html.match(new RegExp(`data-key="${first.metadata.objectId}#${first.metadata.chunkId}"`, 'g')) ?? []).length, 2);
+		}
+	}
+	assert.deepEqual(clashes, {
+		'SearchResults, repeated chunk': [],
+		'QueryCompare, repeated chunk': [],
+		'"Why these?", repeated chunk': [],
+		'SearchResults, no chunk ids': [],
+		'QueryCompare, no chunk ids': [],
+		'"Why these?", no chunk ids': [],
+	});
+	// The chat's sources are read once per chunk (parseChatResult), so their keys cannot repeat.
+	const doc = { page_content: 'water', score: 0.5, metadata: { objectId: 'o1', chunkId: 2, parent: 'a/b.md' } };
+	const sources = parseChatResult({ documents: [doc, doc, { ...doc, metadata: { ...doc.metadata, chunkId: 3 } }] }).sources;
+	assert.equal(sources.length, 2);
+	assert.deepEqual(renderCheckingKeys(h(SourcesPanel, { sources, score: dialect.score, onOpen: () => undefined, onShowOnMap: () => undefined })).clashes, []);
 });
 
 test('RetrievalDebugger: says when it searches only the documents the question was asked about', () => {

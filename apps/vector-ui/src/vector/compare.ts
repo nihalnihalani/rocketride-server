@@ -73,6 +73,21 @@ export function keyId(key: VectorKey): string {
 }
 
 /**
+ * The React key of a result row: its position, then its chunk. The chunk
+ * alone is not unique: a store may answer the same chunk twice, and rows
+ * without chunk ids all read as `#-1`. A run's rows are replaced together
+ * and keep their order while the threshold moves, so the position is stable
+ * for as long as the run is shown.
+ *
+ * @param key - The row's chunk.
+ * @param index - The row's position in its table.
+ * @returns `index:objectId#chunkId`.
+ */
+export function rowKey(key: VectorKey, index: number): string {
+	return `${index}:${keyId(key)}`;
+}
+
+/**
  * The distinct chunk ids of a run, in order.
  *
  * @param rows - The run's rows.
