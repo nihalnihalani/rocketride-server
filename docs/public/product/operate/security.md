@@ -81,8 +81,10 @@ whole request, changing nothing, when:
 - `env` is not an object of names to values (`null`, for example);
 - it would set `ROCKETRIDE_APIKEY` to an empty or blank value (a new non-empty
   key is accepted, which rotates it);
-- a name is one of the broker settings or their former names, in any case or
-  with surrounding whitespace (refused, not ignored);
+- a name is one of the broker settings or their former names, or one of the
+  names the engine delivers a task's databases in (`ROCKETRIDE_DB_DSNS`,
+  `ROCKETRIDE_DB_DSN`, `ROCKETRIDE_DB_RESOLVE_ERROR`), in any case or with
+  surrounding whitespace (refused, not ignored);
 - a `ROCKETRIDE_` name has nothing after the prefix, or anything other than
   ASCII letters, digits and underscores;
 - a value given for a `ROCKETRIDE_` name is not a string, has a control

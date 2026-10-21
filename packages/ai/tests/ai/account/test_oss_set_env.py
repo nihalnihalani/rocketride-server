@@ -175,6 +175,29 @@ def test_the_broker_settings_are_refused_however_they_are_spelled(engine_dir, na
 
 
 @pytest.mark.parametrize(
+    'name',
+    [
+        'ROCKETRIDE_DB_DSNS',
+        'rocketride_db_dsns',
+        ' ROCKETRIDE_DB_DSN',
+        'ROCKETRIDE_Db_Dsn',
+        'ROCKETRIDE_DB_RESOLVE_ERROR',
+        'ROCKETRIDE_DB_RESOLVE_ERROR\t',
+    ],
+)
+def test_the_task_database_delivery_names_are_refused_however_they_are_spelled(engine_dir, name):
+    """Only the task engine sets these, per task: one written into the engine's environment
+    or .env file would read as a delivery wherever that environment is used.
+    """
+    from ai.account.oss import _SET_ENV_RESERVED
+
+    assert name.strip().upper() in _SET_ENV_RESERVED
+    message = _assert_refused(engine_dir, {'ROCKETRIDE_GX_KEEP': 'kept', name: SECRET})
+    assert repr(name) in message
+    assert 'task engine' in message
+
+
+@pytest.mark.parametrize(
     'value',
     [f'${{RR_DB_BROKER_TOKEN}}{SECRET}', f'{SECRET}-${{RR_DB_BROKER_URL:-x}}', f'${{ROCKETRIDE_GX_KEEP}}{SECRET}'],
 )

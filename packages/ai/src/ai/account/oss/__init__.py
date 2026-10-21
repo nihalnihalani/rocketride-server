@@ -66,7 +66,15 @@ from ..base import DB_BROKER_TOKEN_ENV, DB_BROKER_URL_ENV, LEGACY_DB_BROKER_ENV,
 _SET_ENV_NAME = re.compile(r'ROCKETRIDE_[A-Za-z0-9_]+')
 
 # The DB broker settings (operator-only) and their former names, upper-cased.
-_SET_ENV_RESERVED = frozenset({DB_BROKER_URL_ENV, DB_BROKER_TOKEN_ENV, *LEGACY_DB_BROKER_ENV})
+_SET_ENV_BROKER = frozenset({DB_BROKER_URL_ENV, DB_BROKER_TOKEN_ENV, *LEGACY_DB_BROKER_ENV})
+
+# What the task engine hands each task its RocketRide cloud databases in (the
+# DSN map, the former single DSN, and the reason there is none), upper-cased.
+# Only the engine sets them, per task; a value in the engine's own
+# environment is never a delivery.
+_SET_ENV_DB_DELIVERY = frozenset({'ROCKETRIDE_DB_DSNS', 'ROCKETRIDE_DB_DSN', 'ROCKETRIDE_DB_RESOLVE_ERROR'})
+
+_SET_ENV_RESERVED = _SET_ENV_BROKER | _SET_ENV_DB_DELIVERY
 
 
 def _env_file_value(name: str, value: Any) -> str:
@@ -118,7 +126,8 @@ def _checked_set_env(raw: Any) -> Dict[str, str]:
 
     Names without the ROCKETRIDE_ prefix are dropped, as before, except the DB
     broker settings and their former names: those are refused in any
-    spelling (case, surrounding whitespace). A ROCKETRIDE_ name must be one
+    spelling (case, surrounding whitespace), and so are the names the task
+    engine delivers a task's databases in (``_SET_ENV_DB_DELIVERY``). A ROCKETRIDE_ name must be one
     token and every value must fit on its line (see :func:`_env_file_value`).
 
     Raises:
@@ -127,12 +136,19 @@ def _checked_set_env(raw: Any) -> Dict[str, str]:
     if not isinstance(raw, dict):
         raise ValueError('set_env: env must be an object of names to string values')
 
-    reserved = sorted(repr(k) for k in raw if isinstance(k, str) and k.strip().upper() in _SET_ENV_RESERVED)
+    reserved = sorted(repr(k) for k in raw if isinstance(k, str) and k.strip().upper() in _SET_ENV_BROKER)
     if reserved:
         raise ValueError(
             f'{", ".join(reserved)}: DB broker setting name(s), refused. The DB broker settings are '
             'RR_DB_BROKER_URL and RR_DB_BROKER_TOKEN, set by the server operator; the former '
             'ROCKETRIDE_DB_BROKER_* names are refused everywhere.'
+        )
+    delivery = sorted(repr(k) for k in raw if isinstance(k, str) and k.strip().upper() in _SET_ENV_DB_DELIVERY)
+    if delivery:
+        raise ValueError(
+            f'{", ".join(delivery)}: refused. The task engine sets ROCKETRIDE_DB_DSNS, ROCKETRIDE_DB_DSN '
+            'and ROCKETRIDE_DB_RESOLVE_ERROR for each task it starts, from the databases it authorized; '
+            'they are never set in the engine environment.'
         )
 
     env = {k: v for k, v in raw.items() if isinstance(k, str) and k.startswith('ROCKETRIDE_')}
