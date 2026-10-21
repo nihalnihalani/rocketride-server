@@ -28,8 +28,11 @@
 // as a review queue: a similarity slider (0.90 to 0.995, applied in the
 // browser over the sample's own pairs, so moving it sends nothing), a keep
 // policy (oldest ingest, shortest path, most chunks, or by hand), one
-// fieldset per group with a Keep radio per document and the pairs that make
-// it, and Show group, Mark reviewed, Remove the others and Remove all queued.
+// fieldset per group with a Keep radio per document (the first 20 and the
+// kept one; the rest counted, with how many of them are queued) and the
+// pairs that make it, and Show group, Mark reviewed, Remove the others and
+// Remove all queued. What the sample shows about each group is worked out
+// once per view and documents, never on every render.
 // A group inside one document is listed apart with Open only.
 //
 // Removing is the console's: the queued objectIds go to the host's batched
@@ -42,11 +45,11 @@
 import React, { useCallback, useMemo, useReducer, useState, useSyncExternalStore } from 'react';
 import type { Availability, DuplicatesPanelProps as ContractDuplicatesPanelProps, IDocumentItem, IDocumentRowsSource, ISampleModel } from '../contract/types';
 import { reviewedDocuments } from '../adapters/connections';
-import { GROUPS_SHOWN_MAX, KEEP_POLICIES, PAIRS_SHOWN_MAX, THRESHOLD_MAX, THRESHOLD_MIN, THRESHOLD_STEP, copyVerdict, dedupeView, docInfo, isReviewed, keepOf, markReviewed, policyChooses, queueInit, queueReducer, queued, reviewedOf, unmarkReviewed } from '../map/dedupe';
-import type { CopyVerdict, IDedupeView, IDocInfo, IDocumentGroup, IQueueState, IQueued, KeepPolicy, ReviewedCache } from '../map/dedupe';
+import { DOCS_SHOWN_MAX, GROUPS_SHOWN_MAX, KEEP_POLICIES, PAIRS_SHOWN_MAX, THRESHOLD_MAX, THRESHOLD_MIN, THRESHOLD_STEP, copyVerdict, dedupeView, docInfo, isReviewed, keepOf, markReviewed, policyChooses, queueInit, queueReducer, queued, reviewedOf, unmarkReviewed } from '../map/dedupe';
+import type { ContainmentVerdict, CopyVerdict, IDedupeView, IDocInfo, IDocumentGroup, IQueueState, IQueued, KeepPolicy, ReviewedCache } from '../map/dedupe';
 import { formatSize } from '../vector/fileType';
 import { MAP_STYLES } from '../map/styles';
-import { CHOOSE_KEEP_FIRST, KEPT_ELSEWHERE, NOT_WHOLE_COPIES_NOTE, NO_BULK_REMOVE, POLICY_LEAVES_GROUP, SHARED_PASSAGES_NOTE, POLICY_LABELS, POLICY_UNAVAILABLE, REPEATED_HEADING, REPEATED_NOTE, TOO_FEW_SAMPLED_NOTE, duplicatesKnnCaveat, duplicatesNone, duplicatesSampleCaveat, groupLegend, groupsCappedLine, morePairsLine, num, plural, queuedLine, removeAllLabel, removeOthersLabel, removedLine, reviewedGroupsHeading, sharedLine, simText, thresholdValueText } from '../map/reviewWording';
+import { BY_HAND_NOT_SHOWN, BY_HAND_OWN_TEXT, CHOOSE_KEEP_FIRST, HELD_NOT_SHOWN, HELD_OWN_TEXT, KEPT_ELSEWHERE, NOTHING_SHOWN_HELD, NOT_WHOLE_COPIES_NOTE, NO_BULK_REMOVE, PARTLY_MATCHED_NOTE, POLICY_LEAVES_GROUP, SHARED_PASSAGES_NOTE, POLICY_LABELS, POLICY_UNAVAILABLE, REPEATED_HEADING, REPEATED_NOTE, TOO_FEW_SAMPLED_NOTE, UNEVEN_SAMPLE_NOTE, UNSIZED_NOTE, duplicatesKnnCaveat, duplicatesNone, duplicatesSampleCaveat, groupLegend, groupsCappedLine, moreDocumentsLine, morePairsLine, num, plural, queuedLine, removeAllLabel, removeOthersLabel, removedLine, reviewedGroupsHeading, sharedLine, simText, thresholdValueText } from '../map/reviewWording';
 
 /** Props: the frozen ones, plus the queue's starting choices and the reviewed cache. */
 export interface DuplicatesPanelProps extends ContractDuplicatesPanelProps {
@@ -69,6 +72,8 @@ export interface DuplicatesBodyProps {
 	done: string | null;
 	/** Whether the host can remove several documents in one confirmed batch. */
 	bulk: boolean;
+	/** What the sample shows about each group, by group key (worked out once per view and documents; else per group as drawn). */
+	verdicts?: ReadonlyMap<string, CopyVerdict>;
 	onThreshold(value: number): void;
 	onPolicy(policy: KeepPolicy): void;
 	onKeep(group: string, objectId: string): void;
@@ -82,8 +87,23 @@ export interface DuplicatesBodyProps {
 const NOT_COPIES_NOTES: Readonly<Record<Exclude<CopyVerdict, 'copies'>, string>> = {
 	passages: SHARED_PASSAGES_NOTE,
 	mixed: NOT_WHOLE_COPIES_NOTE,
+	partial: PARTLY_MATCHED_NOTE,
 	sparse: TOO_FEW_SAMPLED_NOTE,
+	unsized: UNSIZED_NOTE,
+	uneven: UNEVEN_SAMPLE_NOTE,
 };
+
+/**
+ * The words under a document the keep does not queue, or queues only by hand.
+ *
+ * @param verdict - What the sample shows about the kept document holding it.
+ * @param byHand - True when a hand-picked keep queues it anyway.
+ * @returns The phrase.
+ */
+function heldWords(verdict: ContainmentVerdict, byHand: boolean): string {
+	if (verdict === 'out') return byHand ? BY_HAND_OWN_TEXT : HELD_OWN_TEXT;
+	return byHand ? BY_HAND_NOT_SHOWN : HELD_NOT_SHOWN;
+}
 
 /** The last path segment. */
 function base(path: string): string {
@@ -131,6 +151,23 @@ function docLine(doc: IDocInfo | undefined, shared: number): string {
 }
 
 /**
+ * Why a document that is not kept is or is not queued, after the doc line.
+ *
+ * @param objectId - The document.
+ * @param conflicts - Documents another group keeps.
+ * @param held - The group's documents a policy leaves in place, and why.
+ * @param unshown - The group's documents queued by hand that the sample does not show held, and why.
+ * @returns The phrase with its separator, or ''.
+ */
+function docState(objectId: string, conflicts: ReadonlySet<string>, held: ReadonlyMap<string, ContainmentVerdict> | undefined, unshown: ReadonlyMap<string, ContainmentVerdict> | undefined): string {
+	const notHeld = held?.get(objectId);
+	if (notHeld !== undefined) return ` · ${heldWords(notHeld, false)}`;
+	if (conflicts.has(objectId)) return ` · ${KEPT_ELSEWHERE}`;
+	const byHand = unshown?.get(objectId);
+	return byHand !== undefined ? ` · ${heldWords(byHand, true)}` : '';
+}
+
+/**
  * The pairs of a group as list rows.
  *
  * @param props - The body's props.
@@ -156,31 +193,61 @@ function pairList(props: DuplicatesBodyProps, group: IDocumentGroup): React.Reac
 }
 
 /**
+ * The documents listed under a group: the first DOCS_SHOWN_MAX, the kept one
+ * always among them.
+ *
+ * @param group - The group.
+ * @param keep - Its kept document, or null.
+ * @returns The listed objectIds, in the group's order.
+ */
+function listedDocuments(group: IDocumentGroup, keep: string | null): readonly string[] {
+	if (group.objectIds.length <= DOCS_SHOWN_MAX) return group.objectIds;
+	const first = group.objectIds.slice(0, DOCS_SHOWN_MAX);
+	if (keep === null || first.includes(keep)) return first;
+	return [...group.objectIds.slice(0, DOCS_SHOWN_MAX - 1), keep];
+}
+
+/**
  * One group across documents.
  *
  * @param props - The body's props.
  * @param group - The group.
  * @param reviewed - Whether it was marked reviewed.
+ * @param conflicts - Documents another group keeps.
  * @returns Its fieldset.
  */
-function groupFieldset(props: DuplicatesBodyProps, group: IDocumentGroup, reviewed: boolean): React.ReactElement {
+function groupFieldset(props: DuplicatesBodyProps, group: IDocumentGroup, reviewed: boolean, conflicts: ReadonlySet<string>): React.ReactElement {
 	const keep = keepOf(group, props.state, props.info);
 	const mine = props.queue.byGroup.get(group.key) ?? [];
-	const conflicts = new Set(props.queue.conflicts);
+	const queuedHere = new Set(mine);
 	const writesOff = !props.writes.enabled;
 	const reason = props.writes.reason ?? undefined;
 	const cannotBulk = mine.length > 1 && !props.bulk;
-	const removeWhy = writesOff ? reason : keep === null ? CHOOSE_KEEP_FIRST : cannotBulk ? NO_BULK_REMOVE : undefined;
-	// Not copies: a policy leaves the group alone, and the panel says why.
-	const verdict = copyVerdict(group, props.info);
+	const removeWhy = writesOff ? reason : keep === null ? CHOOSE_KEEP_FIRST : cannotBulk ? NO_BULK_REMOVE : mine.length === 0 ? NOTHING_SHOWN_HELD : undefined;
+	// Not copies: a policy queues only the documents the sample shows the kept one holds, and the panel says why.
+	const verdict = props.verdicts?.get(group.key) ?? copyVerdict(group, props.info);
+	const held = props.queue.held.get(group.key);
+	const unshown = props.queue.unshown.get(group.key);
+	const listed = listedDocuments(group, keep);
+	const left = group.objectIds.length - listed.length;
+	let leftQueued = 0;
+	let leftUnshown = 0;
+	if (left > 0 && !reviewed) {
+		const shown = new Set(listed);
+		for (const id of group.objectIds) {
+			if (shown.has(id) || !queuedHere.has(id)) continue;
+			leftQueued += 1;
+			if (unshown?.has(id)) leftUnshown += 1;
+		}
+	}
 	return (
 		<fieldset key={group.key} data-group={group.id} style={{ border: '1px solid var(--rr-border)', borderRadius: 6, margin: '8px 0', padding: '6px 8px', opacity: reviewed ? 0.8 : 1 }}>
 			<legend style={MAP_STYLES.label}>{groupLegend(group.id, group.objectIds.length, group.simMin, group.simMax)}</legend>
-			{group.objectIds.map((objectId) => {
+			{listed.map((objectId) => {
 				const doc = props.info.get(objectId);
 				const path = doc?.path || objectId;
 				const isKept = keep === objectId;
-				const isQueued = !reviewed && mine.includes(objectId);
+				const isQueued = !reviewed && queuedHere.has(objectId);
 				return (
 					<div key={objectId} style={{ padding: '3px 0' }}>
 						<label style={{ ...MAP_STYLES.small, display: 'flex', gap: 6, alignItems: 'baseline' }}>
@@ -191,11 +258,12 @@ function groupFieldset(props: DuplicatesBodyProps, group: IDocumentGroup, review
 						</label>
 						<div style={{ ...MAP_STYLES.small, marginLeft: 22 }}>
 							{docLine(doc, group.shared[objectId] ?? 0)}
-							{!isKept && keep !== null && !reviewed && conflicts.has(objectId) ? ` · ${KEPT_ELSEWHERE}` : ''}
+							{!isKept && keep !== null && !reviewed ? docState(objectId, conflicts, held, unshown) : ''}
 						</div>
 					</div>
 				);
 			})}
+			{left > 0 ? <p style={MAP_STYLES.note}>{moreDocumentsLine(left, leftQueued, leftUnshown)}</p> : null}
 			{pairList(props, group)}
 			{verdict === 'copies' ? null : (
 				<p style={MAP_STYLES.note}>
@@ -267,6 +335,7 @@ export function DuplicatesBody(props: DuplicatesBodyProps): React.ReactElement {
 	const total = queue.objectIds.length;
 	const bulkBlocked = total > 1 && !props.bulk;
 	const policies = KEEP_POLICIES.map((p) => ({ p, ok: p === 'manual' || p === 'shortest-path' || policyChooses(view.groups, p, props.info) }));
+	const conflicts = new Set(queue.conflicts);
 	return (
 		<section aria-label="Near-duplicate review" data-component="DuplicatesPanel" data-threshold={state.threshold} data-queued={total}>
 			<div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
@@ -277,6 +346,8 @@ export function DuplicatesBody(props: DuplicatesBodyProps): React.ReactElement {
 				<p style={MAP_STYLES.note}>{duplicatesKnnCaveat(result.knn.k)}</p>
 				<p style={MAP_STYLES.note}>{duplicatesSampleCaveat(result.n)}</p>
 			</div>
+			{/* Outside the groups: a removal that resolves the last group still says what it did. */}
+			{props.done ? <p style={MAP_STYLES.note}>{props.done}</p> : null}
 			{view.groups.length === 0 && view.repeated.length === 0 ? (
 				<p style={MAP_STYLES.note}>{duplicatesNone(state.threshold)}</p>
 			) : (
@@ -297,11 +368,10 @@ export function DuplicatesBody(props: DuplicatesBodyProps): React.ReactElement {
 						</button>
 					</div>
 					<p style={MAP_STYLES.note} role="status">
-						{queuedLine(total)}
+						{queuedLine(total, state.policy !== 'manual' && view.groups.some((g) => keepOf(g, state, props.info) !== null))}
 					</p>
-					{props.done ? <p style={MAP_STYLES.note}>{props.done}</p> : null}
 					{!writes.enabled && writes.reason ? <p style={MAP_STYLES.note}>{writes.reason}</p> : null}
-					{shown.map((g) => groupFieldset(props, g, false))}
+					{shown.map((g) => groupFieldset(props, g, false, conflicts))}
 					{open.length > shown.length ? <p style={MAP_STYLES.note}>{groupsCappedLine(shown.length, open.length)}</p> : null}
 					{view.repeated.length > 0 ? (
 						<section aria-label={REPEATED_HEADING} data-repeated="">
@@ -313,7 +383,7 @@ export function DuplicatesBody(props: DuplicatesBodyProps): React.ReactElement {
 					{done.length > 0 ? (
 						<section aria-label="Reviewed groups">
 							<h4 style={{ ...MAP_STYLES.heading, fontSize: 12, marginTop: 10 }}>{reviewedGroupsHeading(done.length)}</h4>
-							{done.slice(0, GROUPS_SHOWN_MAX).map((g) => groupFieldset(props, g, true))}
+							{done.slice(0, GROUPS_SHOWN_MAX).map((g) => groupFieldset(props, g, true, conflicts))}
 						</section>
 					) : null}
 				</>
@@ -353,6 +423,8 @@ function DuplicatesQueue(props: DuplicatesPanelProps): React.ReactElement {
 	const view = useMemo(() => dedupeView(result, state.threshold, removed), [result, state.threshold, removed]);
 	const info = useMemo(() => docInfo(result, rows), [result, rows]);
 	const queue = useMemo(() => queued(view.groups, state, info, reviewed), [view, state, info, reviewed]);
+	// What the sample shows about each group: once per view and documents, not on every render.
+	const verdicts = useMemo(() => new Map(view.groups.map((g) => [g.key, copyVerdict(g, info)] as const)), [view, info]);
 
 	const onReview = useCallback(
 		(group: IDocumentGroup, value: boolean): void => {
@@ -387,10 +459,10 @@ function DuplicatesQueue(props: DuplicatesPanelProps): React.ReactElement {
 	let done: string | null = null;
 	if (requested.length > 0 && removedNow.length > 0) {
 		const counts = removedNow.map((id) => info.get(id)?.chunks ?? null);
-		done = removedLine(removedNow.length, requested.length, counts.every((c) => c !== null) ? counts.reduce<number>((sum, c) => sum + (c ?? 0), 0) : null);
+		done = removedLine(removedNow.length, counts.every((c) => c !== null) ? counts.reduce<number>((sum, c) => sum + (c ?? 0), 0) : null);
 	}
 
-	return <DuplicatesBody sample={props.sample} writes={props.writes} view={view} info={info} state={state} reviewed={reviewed} queue={queue} done={done} bulk={props.onRemoveDocuments !== undefined} onThreshold={(value) => dispatch({ type: 'threshold', value })} onPolicy={(value) => dispatch({ type: 'policy', value })} onKeep={(group, objectId) => dispatch({ type: 'keep', group, objectId })} onShow={(points) => props.onSelect(points)} onReview={onReview} onRemove={onRemove} onOpenDocument={props.onOpenDocument} />;
+	return <DuplicatesBody sample={props.sample} writes={props.writes} view={view} info={info} state={state} reviewed={reviewed} queue={queue} done={done} bulk={props.onRemoveDocuments !== undefined} verdicts={verdicts} onThreshold={(value) => dispatch({ type: 'threshold', value })} onPolicy={(value) => dispatch({ type: 'policy', value })} onKeep={(group, objectId) => dispatch({ type: 'keep', group, objectId })} onShow={(points) => props.onSelect(points)} onReview={onReview} onRemove={onRemove} onOpenDocument={props.onOpenDocument} />;
 }
 
 /**

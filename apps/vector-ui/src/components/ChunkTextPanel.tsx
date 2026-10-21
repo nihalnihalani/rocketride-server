@@ -32,9 +32,12 @@
 //
 // The text comes from `chunks {object_id, after_chunk: id - 1, limit: 1}`,
 // as the map's light mode already asks it, and is fetched ONCE per key: the
-// texts are kept per sample in a small bounded cache that the registry
-// empties on a change of identity ('chunk text'), so a second look, or two
-// asks in flight together, cost no second call.
+// texts are kept per connection and sample in a small bounded cache that the
+// registry empties on a change of identity ('chunk text'), so a second look,
+// or two asks in flight together, cost no second call. The connection is
+// part of the scope because the node derives a sample id from the seed and
+// the keys alone: one corpus in two stores, sampled with the same seed, has
+// one sample id on both.
 // =============================================================================
 
 import React, { useEffect, useRef, useState } from 'react';
@@ -98,7 +101,19 @@ export async function fetchChunkText(channel: Pick<IRoleChannel, 'invoke'>, stor
 	return text ? { ok: true, value: text } : { ok: false, code: 'NOT_FOUND', message: chunkMissing(key[1]) };
 }
 
-/** A bounded cache of chunk texts per sample; a failure is never kept. */
+/**
+ * The cache scope of a sample's texts: its connection and its sample id, so
+ * two stores holding one corpus never share a text.
+ *
+ * @param connectionKey - The connection, or none (the sample alone scopes the texts).
+ * @param sampleId - The sample.
+ * @returns The scope.
+ */
+export function chunkTextScope(connectionKey: string | null | undefined, sampleId: string): string {
+	return JSON.stringify([connectionKey ?? '', sampleId]);
+}
+
+/** A bounded cache of chunk texts per scope (chunkTextScope); a failure is never kept. */
 export interface IChunkTextCache {
 	/** The text of a key, asking `fetch` only when it is neither kept nor on its way. */
 	load(scope: string, key: VectorKey, fetch: LoadChunkText): Promise<ToolOutcome<IChunkText>>;
@@ -154,7 +169,7 @@ export function createChunkTextCache(max = 64): IChunkTextCache {
 	};
 }
 
-/** The inspector's chunk texts (per sample, bounded), emptied on a change of identity. */
+/** The inspector's chunk texts (per connection and sample, bounded), emptied on a change of identity. */
 export const chunkTexts = createChunkTextCache();
 
 connectionCaches.register('chunk text', () => chunkTexts.clear());
@@ -251,7 +266,9 @@ export function ChunkTextPanel(props: ChunkTextPanelProps): React.ReactElement {
 
 /** Props of the inspector's text section. */
 export interface ChunkTextSectionProps {
-	/** The sample the point belongs to (the cache's scope). */
+	/** The connection the sample was drawn from (with the sample id, the cache's scope). */
+	connectionKey?: string;
+	/** The sample the point belongs to. */
 	sampleId: string;
 	/** The selected chunk. */
 	chunkKey: VectorKey;
@@ -269,6 +286,8 @@ export interface ChunkTextSectionProps {
 	initialOpen?: boolean;
 	/** Words for another chunk of the same document. */
 	labelOf?(key: VectorKey): string;
+	/** The document's stored chunk count, when known: Next chunk stops at its last chunk. */
+	chunks?: number | null;
 }
 
 /** What the section shows for its current chunk. */
@@ -282,10 +301,11 @@ type Loaded = { text: IChunkText | null; error: string | null };
  * @returns The button and, when open, the panel.
  */
 export function ChunkTextSection(props: ChunkTextSectionProps): React.ReactElement | null {
-	const { loadText, sampleId } = props;
+	const { loadText } = props;
+	const scope = chunkTextScope(props.connectionKey, props.sampleId);
 	const [open, setOpen] = useState(props.initialOpen === true);
 	const [key, setKey] = useState<VectorKey>(props.chunkKey);
-	const [loaded, setLoaded] = useState<Loaded>(() => ({ text: loadText ? (chunkTexts.peek(sampleId, props.chunkKey) ?? null) : null, error: null }));
+	const [loaded, setLoaded] = useState<Loaded>(() => ({ text: loadText ? (chunkTexts.peek(scope, props.chunkKey) ?? null) : null, error: null }));
 	const asked = useRef('');
 	const selected = `${props.chunkKey[0]}#${props.chunkKey[1]}`;
 
@@ -302,20 +322,20 @@ export function ChunkTextSection(props: ChunkTextSectionProps): React.ReactEleme
 		props.onShowText?.(key);
 		if (!loadText) return;
 		// Whatever was asked before is no longer wanted, even when this key is already kept.
-		asked.current = `${sampleId}|${current}`;
-		const hit = chunkTexts.peek(sampleId, key);
+		asked.current = `${scope}|${current}`;
+		const hit = chunkTexts.peek(scope, key);
 		if (hit) {
 			setLoaded({ text: hit, error: null });
 			return;
 		}
 		setLoaded({ text: null, error: null });
 		const mine = asked.current;
-		void chunkTexts.load(sampleId, key, loadText).then((outcome) => {
+		void chunkTexts.load(scope, key, loadText).then((outcome) => {
 			if (asked.current !== mine) return;
 			setLoaded(outcome.ok ? { text: outcome.value, error: null } : { text: null, error: outcome.code === 'NOT_FOUND' ? chunkMissing(key[1]) : outcome.message });
 		});
 		// eslint-disable-next-line react-hooks/exhaustive-deps
-	}, [open, current, sampleId]);
+	}, [open, current, scope]);
 
 	const onSelected = current === selected;
 	const text: IChunkText | null = loadText ? loaded.text : onSelected && props.hostText ? clampText(props.hostText) : null;
@@ -325,7 +345,7 @@ export function ChunkTextSection(props: ChunkTextSectionProps): React.ReactEleme
 			<button type="button" style={{ ...MAP_STYLES.button, marginTop: 4 }} aria-expanded={open} onClick={() => setOpen((v) => !v)}>
 				{open ? 'Hide full text' : 'Show full text'}
 			</button>
-			{open ? <ChunkTextPanel chunkKey={key} label={label} text={text?.text ?? null} truncated={text?.truncated ?? false} query={props.query} error={loadText ? loaded.error : null} onPrevious={loadText ? () => setKey([key[0], Math.max(0, key[1] - 1)]) : undefined} onNext={loadText ? () => setKey([key[0], key[1] + 1]) : undefined} onClose={() => setOpen(false)} /> : null}
+			{open ? <ChunkTextPanel chunkKey={key} label={label} text={text?.text ?? null} truncated={text?.truncated ?? false} query={props.query} error={loadText ? loaded.error : null} onPrevious={loadText ? () => setKey([key[0], Math.max(0, key[1] - 1)]) : undefined} onNext={loadText ? () => setKey([key[0], key[1] + 1]) : undefined} hasNext={typeof props.chunks === 'number' ? key[1] < props.chunks - 1 : undefined} onClose={() => setOpen(false)} /> : null}
 		</div>
 	);
 }

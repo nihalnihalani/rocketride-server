@@ -395,3 +395,37 @@ test('the canvas heatmap paints every cell: the surface first, then the ramp at 
 	assert.ok(at(0, 2).alpha > at(0, 4).alpha, '0.9 is darker than 0.85');
 	assert.equal(ctx.globalAlpha, 1, 'the context is left opaque');
 });
+
+test('a cell the node could not compute (null for a non-finite value) is shown as a dash, left out of the order, the range and the shade, and exported empty', () => {
+	const answer = fixture<ISimilarityMatrixResult>('similarity_matrix_ok');
+	const holes = answer.matrix.map((row) => [...row]) as Array<Array<number | null>>;
+	(holes[0] as Array<number | null>)[2] = null;
+	(holes[2] as Array<number | null>)[0] = null;
+	const range = matrixRange(holes);
+	assert.ok(Number.isFinite(range.min) && Number.isFinite(range.max), 'the range is the computed cells');
+	const order = chainOrder(holes);
+	assert.deepEqual([...order].sort(), [0, 1, 2], 'still a permutation');
+	const state: MatrixState = { kind: 'ok', keys: answer.keys, matrix: holes, metric: answer.metric, source: answer.source, notFound: [] };
+	for (const showTable of [false, true]) {
+		const out = renderToStaticMarkup(body({ state, showTable, selected: [0, 2] }));
+		assert.match(out, /: –"/, 'its title and label read a dash');
+		assert.match(out, /Selected: [^<]* · similarity –/);
+	}
+	const big = bigState(30);
+	(big.matrix[3] as Array<number | null>)[7] = null;
+	assert.doesNotThrow(() => renderToStaticMarkup(body({ state: big, labelOf: bigLabel, selected: [3, 7] })), 'the canvas heatmap renders');
+	const rects: Array<{ alpha: number; style: string }> = [];
+	const ctx = {
+		fillStyle: '' as string,
+		globalAlpha: 1,
+		clearRect: noop,
+		fillRect(): void {
+			rects.push({ alpha: this.globalAlpha, style: String(this.fillStyle) });
+		},
+	};
+	paintHeatmap(ctx, holes, range, 3, 1, { surface: '#ffffff', ramp: '#4263eb' });
+	assert.equal(rects.filter((r) => r.style === '#4263eb').length, 7, 'no ramp over the two missing cells');
+	const exported = matrixRows(answer.keys, holes, label);
+	const firstName = exported.columns[3 + 2] as string;
+	assert.equal(exported.rows[0]?.[firstName], null, 'exported as an empty cell');
+});

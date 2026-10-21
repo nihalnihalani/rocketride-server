@@ -21,8 +21,8 @@ import React from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import type { IRoleChannel } from 'shared/explorer';
 import { connectionCaches } from '../src/adapters/explorer';
-import { ChunkTextPanel, ChunkTextSection, chunkTextInput, chunkTexts, createChunkTextCache, fetchChunkText, readChunkText } from '../src/components/ChunkTextPanel';
-import type { IChunkText } from '../src/components/ChunkTextPanel';
+import { ChunkTextPanel, ChunkTextSection, chunkTextInput, chunkTextScope, chunkTexts, createChunkTextCache, fetchChunkText, readChunkText } from '../src/components/ChunkTextPanel';
+import type { ChunkTextSectionProps, IChunkText } from '../src/components/ChunkTextPanel';
 import { PointInspector } from '../src/components/PointInspector';
 import type { ExamplePolarity, IChunksResult, ToolOutcome, VectorKey } from '../src/contract/types';
 import { CHUNK_TEXT_MAX } from '../src/vector/highlight';
@@ -95,6 +95,29 @@ test('a failed fetch is not kept, so asking again retries; the cache holds a bou
 	await cache.load('s', ['o', 3], fetchText);
 	assert.equal(cache.peek('s', ['o', 1]), undefined, 'the oldest text is dropped beyond the bound');
 	assert.ok(cache.peek('s', ['o', 3]));
+});
+
+test('the cache is scoped by connection as well as sample: the same corpus and seed on two stores never share a text', async () => {
+	// The node's sample id comes from the seed and the keys, so one corpus
+	// ingested into two stores and sampled with the same seed has one id.
+	const sampleId = 's-7-c6774b86';
+	const cache = createChunkTextCache(8);
+	const calls: string[] = [];
+	const from =
+		(store: string) =>
+		async (key: VectorKey): Promise<ToolOutcome<IChunkText>> => {
+			calls.push(store);
+			return ok(`${store} text of #${key[1]}`);
+		};
+	const a = await cache.load(chunkTextScope('conn-pgvector', sampleId), KEY, from('pgvector'));
+	const b = await cache.load(chunkTextScope('conn-qdrant', sampleId), KEY, from('qdrant'));
+	assert.deepEqual(a, ok('pgvector text of #3'));
+	assert.deepEqual(b, ok('qdrant text of #3'), "the second connection gets its own store's text, never the first one's");
+	assert.deepEqual(calls, ['pgvector', 'qdrant'], 'one call per connection');
+	await cache.load(chunkTextScope('conn-qdrant', sampleId), KEY, from('qdrant'));
+	assert.equal(calls.length, 2, 'each connection asks once');
+	assert.notEqual(chunkTextScope('a', 'b|c'), chunkTextScope('a|b', 'c'), 'no two connection and sample pairs share a scope');
+	assert.notEqual(chunkTextScope(undefined, sampleId), chunkTextScope('conn-qdrant', sampleId), 'without a connection the scope is the sample alone');
 });
 
 test("the inspector's text cache is registered and emptied on a change of identity", async () => {
@@ -180,7 +203,7 @@ test('the inspector offers Show full text only when the map can fetch it; the pa
 
 test('opened, the section shows the cached text of the selected chunk with the query marked, and steps through chunks', async () => {
 	const key = [sample.result.docs[sample.result.points.doc[0] as number]!.objectId, sample.result.points.chunk[0] as number] as VectorKey;
-	await chunkTexts.load(sample.sampleId, key, async () => ok('The spring feeds the water tank.'));
+	await chunkTexts.load(chunkTextScope(undefined, sample.sampleId), key, async () => ok('The spring feeds the water tank.'));
 	const out = html(<ChunkTextSection sampleId={sample.sampleId} chunkKey={key} label="first #0" query="water" loadText={async () => ok('unused')} initialOpen />);
 	assert.match(out, /aria-expanded="true"[^>]*>Hide full text</);
 	assert.match(out, /<mark[^>]*>water<\/mark>/);
@@ -189,6 +212,26 @@ test('opened, the section shows the cached text of the selected chunk with the q
 	const hosted = html(<ChunkTextSection sampleId="s" chunkKey={key} label="first #0" query={null} hostText="Text the map fetched." onShowText={noop} initialOpen />);
 	assert.match(hosted, /Text the map fetched\./);
 	assert.doesNotMatch(hosted, /Previous chunk/, 'stepping needs the loader');
+});
+
+test('the section reads the cache under its connection, and the inspector hands it the connection', async () => {
+	const key = [sample.result.docs[sample.result.points.doc[1] as number]!.objectId, sample.result.points.chunk[1] as number] as VectorKey;
+	await chunkTexts.load(chunkTextScope('conn-a', sample.sampleId), key, async () => ok('Text as connection A stores it.'));
+	const loader = async (): Promise<ToolOutcome<IChunkText>> => ok('unused');
+	const onA = html(<ChunkTextSection connectionKey="conn-a" sampleId={sample.sampleId} chunkKey={key} label="a #1" query={null} loadText={loader} initialOpen />);
+	assert.match(onA, /Text as connection A stores it\./);
+	const onB = html(<ChunkTextSection connectionKey="conn-b" sampleId={sample.sampleId} chunkKey={key} label="a #1" query={null} loadText={loader} initialOpen />);
+	assert.doesNotMatch(onB, /connection A/, "another connection with the same sample id never shows the first one's text");
+	assert.match(onB, /Loading the chunk&#x27;s text…/, 'it asks its own store');
+	const sectionOf = (connectionKey: string | undefined): React.ReactElement<ChunkTextSectionProps> => {
+		const found = elements(PointInspector({ ...base, index: 1, loadText: loader, connectionKey })).find((el) => el.type === ChunkTextSection);
+		assert.ok(found, 'the text section');
+		return found as React.ReactElement<ChunkTextSectionProps>;
+	};
+	assert.equal(sectionOf('conn-b').props.connectionKey, 'conn-b');
+	assert.equal(sectionOf('conn-b').key, chunkTextScope('conn-b', sample.sampleId), 'a fresh section per connection and sample');
+	assert.notEqual(sectionOf('conn-a').key, sectionOf('conn-b').key);
+	assert.equal(sectionOf(undefined).props.connectionKey, undefined, 'a host without a connection: the sample alone scopes the cache');
 });
 
 test("Add as example (+) and (−) hand the point's key to Recommend; its side is tagged", () => {
@@ -231,4 +274,25 @@ test("with Tree edges drawn the inspector lists the point's tree neighbours, eac
 	assert.deepEqual(selected, [[sample.result.docs[sample.result.points.doc[5] as number]!.objectId, sample.result.points.chunk[5] as number]]);
 	assert.doesNotMatch(html(<PointInspector {...base} index={0} treeNeighbours={null} />), /Tree neighbours/);
 	assert.doesNotMatch(html(<PointInspector {...base} index={0} treeNeighbours={[]} />), /Tree neighbours/);
+});
+
+test("on the last chunk of a document Next chunk is disabled: the inspector hands the section the document's chunk count", async () => {
+	const r = sample.result;
+	let index = -1;
+	for (let i = 0; i < r.n && index < 0; i += 1) {
+		const doc = r.docs[r.points.doc[i] as number]!;
+		if (doc.chunks !== null && r.points.chunk[i] === doc.chunks - 1 && doc.chunks > 1) index = i;
+	}
+	assert.ok(index >= 0, 'a last chunk is in the sample');
+	const doc = r.docs[r.points.doc[index] as number]!;
+	const key: VectorKey = [doc.objectId, r.points.chunk[index] as number];
+	await chunkTexts.load(chunkTextScope(undefined, sample.sampleId), key, async () => ok('last words'));
+	const last = html(<ChunkTextSection sampleId={sample.sampleId} chunkKey={key} label={`${doc.path} #${key[1]}`} query={null} chunks={doc.chunks} loadText={async () => ok('x')} initialOpen />);
+	assert.match(last, /<button[^>]*disabled=""[^>]*>Next chunk<\/button>/);
+	const before: VectorKey = [doc.objectId, key[1] - 1];
+	await chunkTexts.load(chunkTextScope(undefined, sample.sampleId), before, async () => ok('earlier words'));
+	assert.doesNotMatch(html(<ChunkTextSection sampleId={sample.sampleId} chunkKey={before} label="x" query={null} chunks={doc.chunks} loadText={async () => ok('x')} initialOpen />), /<button[^>]*disabled=""[^>]*>Next chunk<\/button>/, 'before the last, Next is enabled');
+	assert.doesNotMatch(html(<ChunkTextSection sampleId={sample.sampleId} chunkKey={key} label="x" query={null} loadText={async () => ok('x')} initialOpen />), /<button[^>]*disabled=""[^>]*>Next chunk<\/button>/, 'an unknown count leaves Next enabled');
+	const inspector = html(<PointInspector {...base} index={index} loadText={async () => ok('x')} />);
+	assert.match(inspector, /Show full text/);
 });

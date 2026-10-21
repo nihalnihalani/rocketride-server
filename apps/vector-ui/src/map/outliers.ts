@@ -35,8 +35,11 @@
 //
 // Each outlier says why it is one: its density against the sample's median
 // and its nearest neighbour in the sample (the most similar of its kNN row).
-// Reviewed documents are the connection's 'reviewed documents' cache, the
-// same one the duplicates queue marks (map/dedupe.ts helpers).
+// A reviewed outlier is one chunk: it is kept in the registry's reviewed
+// cache under the connection's own outliers scope (outliersScope), apart from
+// the documents the duplicates queue marks, so marking a duplicates group
+// reviewed marks none of its outliers and marking one outlier marks only it.
+// The registry clears both on a change of identity.
 // =============================================================================
 
 import type { ISampleResult } from '../contract/types';
@@ -138,8 +141,28 @@ export interface IOutlierRow {
 	chunk: number;
 	density: number;
 	why: string;
-	/** Its document was marked reviewed. */
+	/** This chunk was marked reviewed as an outlier. */
 	reviewed: boolean;
+}
+
+/**
+ * The reviewed cache's entry for a connection's outliers (apart from its reviewed documents).
+ *
+ * @param connectionKey - The connection.
+ * @returns The scope.
+ */
+export function outliersScope(connectionKey: string): string {
+	return `${connectionKey}\u0000outliers`;
+}
+
+/**
+ * An outlier's id in that entry: its chunk.
+ *
+ * @param row - The outlier (its document and chunk).
+ * @returns The id.
+ */
+export function outlierKey(row: Pick<IOutlierRow, 'objectId' | 'chunk'>): string {
+	return `${row.objectId}\u0000${row.chunk}`;
 }
 
 /**
@@ -148,7 +171,7 @@ export interface IOutlierRow {
  * @param sample - The `sample` answer.
  * @param pct - The percentile.
  * @param removed - objectIds removed since the sample was drawn.
- * @param reviewed - The connection's reviewed documents.
+ * @param reviewed - The connection's reviewed outliers (outlierKey ids under outliersScope).
  * @returns The rows, sparsest first.
  */
 export function outlierRows(sample: ISampleResult, pct: number, removed: readonly string[] = [], reviewed: ReadonlySet<string> = new Set()): IOutlierRow[] {
@@ -169,6 +192,7 @@ export function outlierRows(sample: ISampleResult, pct: number, removed: readonl
 		}
 		const density = sample.density[index] ?? 0;
 		const objectId = doc?.objectId ?? '';
-		return { index, objectId, path: doc?.path ?? '?', chunk: sample.points.chunk[index] as number, density, why: whyText({ density, median, nearest }), reviewed: reviewed.has(objectId) };
+		const chunk = sample.points.chunk[index] as number;
+		return { index, objectId, path: doc?.path ?? '?', chunk, density, why: whyText({ density, median, nearest }), reviewed: reviewed.has(outlierKey({ objectId, chunk })) };
 	});
 }

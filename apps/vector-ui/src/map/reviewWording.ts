@@ -140,10 +140,12 @@ export function thresholdValueText(threshold: number): string {
  * How many documents are queued.
  *
  * @param n - Queued documents.
+ * @param policyChose - True when a keep policy chose in the groups (nothing it keeps holds another document, as far as the sample shows).
  * @returns E.g. "3 documents queued".
  */
-export function queuedLine(n: number): string {
-	return n === 0 ? 'No document queued. Choose which document to keep in each group.' : `${plural(n, 'document')} queued`;
+export function queuedLine(n: number, policyChose = false): string {
+	if (n > 0) return `${plural(n, 'document')} queued`;
+	return policyChose ? 'No document queued: this sample does not show that a kept document holds another one. Choose a keep by hand to queue one anyway.' : 'No document queued. Choose which document to keep in each group.';
 }
 
 /**
@@ -170,31 +172,55 @@ export function removeOthersLabel(n: number): string {
 /** A group has no kept document yet. */
 export const CHOOSE_KEEP_FIRST = 'Choose the document to keep first';
 
-/** Every document of a group has text of its own beside the shared passages. */
-export const SHARED_PASSAGES_NOTE = 'Shared passages only: each of these documents also has text the others do not. Removing a document removes all of it.';
+/** Every document of a group holds text the others do not, as the sample shows. */
+export const SHARED_PASSAGES_NOTE = 'Shared passages only: this sample shows that each of these documents holds text the others do not. Removing a document removes all of it.';
 
-/** Some document of a group is not a copy of the others. */
-export const NOT_WHOLE_COPIES_NOTE = 'Not every document here is a copy of the others: removing one removes text the others do not have.';
+/** Some document of a group holds text the others do not, as the sample shows. */
+export const NOT_WHOLE_COPIES_NOTE = 'Not every document here is a copy of the others: this sample shows that at least one holds text the others do not.';
 
-/** The sample holds too few chunks of a group's documents to tell copies from shared text. */
+/** The sample holds too few chunks of a document of the group to tell copies from shared text. */
 export const TOO_FEW_SAMPLED_NOTE = 'This sample holds too few chunks of these documents to tell copies from shared text.';
 
-/** A policy does not choose in a group that is not copies. */
-export const POLICY_LEAVES_GROUP = 'A keep policy leaves this group alone; pick the document to keep by hand to queue the others.';
+/** The sample holds enough of a group's documents but cannot tell yet whether they are whole copies. */
+export const PARTLY_MATCHED_NOTE = 'This sample cannot tell yet whether these documents are whole copies of each other: it holds part of each, and part of a document may be text the others do not have.';
+
+/** The store did not report the chunk counts the verdict needs. */
+export const UNSIZED_NOTE = 'The store did not report how many chunks these documents have, so this sample cannot tell copies from shared text.';
+
+/** The sample was not drawn evenly within documents (strategy 'first', or a refill). */
+export const UNEVEN_SAMPLE_NOTE = 'This sample was not drawn evenly within these documents, so it can only compare the chunks it holds, and those do not tell.';
+
+/** A policy queues a document only where the sample shows the kept one holds it. */
+export const POLICY_LEAVES_GROUP = 'A keep policy queues a document only when this sample shows that the kept one holds it.';
+
+/** Under a document a policy leaves in place: the sample shows it holds text the kept one does not. */
+export const HELD_OWN_TEXT = 'holds text the kept document does not, so not queued';
+
+/** Under a document a policy leaves in place: the sample does not show the kept one holds it. */
+export const HELD_NOT_SHOWN = 'this sample does not show that the kept document holds it, so not queued';
+
+/** Under a document queued by a hand-picked keep: the sample shows it holds text the kept one does not. */
+export const BY_HAND_OWN_TEXT = 'queued by your choice; this sample shows it holds text the kept document does not';
+
+/** Under a document queued by a hand-picked keep: the sample does not show the kept one holds it. */
+export const BY_HAND_NOT_SHOWN = 'queued by your choice; this sample does not show that the kept document holds it';
+
+/** A group's Remove button when its keep holds no other document, as far as the sample shows. */
+export const NOTHING_SHOWN_HELD = 'This sample does not show that the kept document holds the others.';
 
 /**
- * After the console removed queued documents.
+ * After the console removed queued documents. The chunk count is the
+ * document list's (the node's own count of what it removed does not reach
+ * the panel), and nothing is said about documents not removed: a cancelled
+ * dialog and a batch that stopped at an error look the same from here.
  *
  * @param removed - Documents now gone.
- * @param asked - Documents asked for.
- * @param chunks - Their chunks as the store reported them per document, or null when one is unknown.
- * @returns E.g. "Removed 3 documents (41 chunks)".
+ * @param chunks - Their chunks as the document list counts them, or null when one is unknown.
+ * @returns E.g. "Removed 3 documents (41 chunks as listed)".
  */
-export function removedLine(removed: number, asked: number, chunks: number | null): string {
-	const counted = chunks === null ? '' : ` (${plural(chunks, 'chunk')})`;
-	if (removed >= asked) return `Removed ${plural(removed, 'document')}${counted}`;
-	const left = asked - removed;
-	return `Removed ${num(removed)} of ${plural(asked, 'document')}${counted}; ${num(left)} ${left === 1 ? 'is' : 'are'} still stored.`;
+export function removedLine(removed: number, chunks: number | null): string {
+	const counted = chunks === null ? '' : ` (${plural(chunks, 'chunk')} as listed)`;
+	return `Removed ${plural(removed, 'document')}${counted}`;
 }
 
 /**
@@ -252,6 +278,20 @@ export function groupsCappedLine(shown: number, total: number): string {
  */
 export function morePairsLine(n: number): string {
 	return `and ${plural(n, 'more pair')}`;
+}
+
+/**
+ * Documents of a group not listed under it.
+ *
+ * @param n - Documents left out.
+ * @param queuedAmong - Of those, the queued ones.
+ * @param unshownAmong - Of the queued ones, those queued by a hand-picked keep the sample does not show to hold them.
+ * @returns E.g. "and 980 more documents, none of them queued. Show group selects the whole group on the map."
+ */
+export function moreDocumentsLine(n: number, queuedAmong: number, unshownAmong = 0): string {
+	const which = queuedAmong <= 0 ? (n === 1 ? 'not queued' : 'none of them queued') : queuedAmong >= n ? (n === 1 ? 'queued' : `all ${num(n)} of them queued`) : `${num(queuedAmong)} of them queued`;
+	const unshown = unshownAmong > 0 ? `, ${num(unshownAmong)} by your choice although this sample does not show that the kept document holds ${unshownAmong === 1 ? 'it' : 'them'}` : '';
+	return `and ${plural(n, 'more document')}, ${which}${unshown}. Show group selects the whole group on the map.`;
 }
 
 /**
