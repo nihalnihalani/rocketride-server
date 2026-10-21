@@ -124,8 +124,9 @@ written by an earlier release, and **Experimental** otherwise.
   write tools until **Allow writes through tools** is also on; both are off by
   default because the table is in a managed database. Vector Explorer reads a
   RocketRide Vector store through those tools, so its template turns **Expose
-  as tools** on for both stores and **Allow writes through tools** on for
-  `store_1`. In a pipeline of your own, set `expose_tools` (and, to remove
+  as tools** and **Allow writes through tools** on for both stores; the chat's
+  `store_2` still refuses removals, because its **Allow document management
+  from tool calls** is off. In a pipeline of your own, set `expose_tools` (and, to remove
   documents, `allow_write` and `allow_writes`) under `config.cloud`. On this
   node, **Allow writes through tools** is also the one switch for agent
   writes.

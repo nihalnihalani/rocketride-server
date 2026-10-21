@@ -173,8 +173,9 @@ both lists to every suite the change lanes own in `lanes.json`.
   `rocketride_vector` is the exception (contract §6.0): its tools, and then its
   write tools, exist only while `expose_tools` and `allow_write` are on (both
   off by default), and `allow_write` is its one switch for agent writes. The
-  `rocketride_vector` template sets `expose_tools` on both stores and
-  `allow_write` on `store_1`.
+  `rocketride_vector` template sets `expose_tools` and `allow_write` on both
+  stores, so `store_2`'s write tools exist and refuse with `WRITES_DISABLED`
+  (its `allow_writes` is off) as on every other provider.
 - **Ingest is not gated by the switch.** Files dropped on the Ingest source
   are written through the data lane; only the reserved objectId `schema` (the
   collection's control record) is refused there.

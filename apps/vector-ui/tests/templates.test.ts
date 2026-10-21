@@ -229,16 +229,16 @@ test('allow_writes: true on store_1 only, read where the node reads it (config[c
 	}
 });
 
-test('rocketride_vector: both stores expose their tools, and only store_1 allows writes through tools', () => {
-	// The node's outer gate (#2631): expose_tools and allow_write are off by default, so a
-	// template the explorer opens sets them itself. The chat's store_2 is read-only.
+test('rocketride_vector: both stores open the outer gate; only store_1 lets a Tools source write', () => {
+	// The node's outer gate (#2631): expose_tools and allow_write are off by default, so the
+	// template sets them itself. On store_2 (the chat's) they are on only so its write tools
+	// exist and refuse a write with WRITES_DISABLED, as every other provider's store_2 does;
+	// allow_writes keeps it read-only, and a public key reads neither store (READS_PUBLIC).
 	const { components } = read('rocketride_vector');
 	const store1 = settings(byId(components, 'store_1'));
 	const store2 = settings(byId(components, 'store_2'));
-	assert.equal(store1.expose_tools, true);
-	assert.equal(store1.allow_write, true);
-	assert.equal(store2.expose_tools, true);
-	assert.equal(store2.allow_write, false);
+	assert.deepEqual([store1.expose_tools, store1.allow_write, store1.allow_writes], [true, true, true]);
+	assert.deepEqual([store2.expose_tools, store2.allow_write, store2.allow_writes], [true, true, false]);
 });
 
 /** The repository root (driver sources are read from it). */

@@ -229,7 +229,7 @@
           "hnsw_m": 16,
           "hnsw_ef_construction": 64,
           "expose_tools": true,
-          "allow_write": false,
+          "allow_write": true,
           "allow_writes": false
         },
         "parameters": {}

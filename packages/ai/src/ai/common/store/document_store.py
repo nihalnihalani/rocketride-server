@@ -1238,7 +1238,8 @@ class VectorStoreToolMixin(VectorExplorerExtTools, VectorExplorerTools):
     the node has no handler for); :meth:`_vectordb_surface_refusal`, which the
     shared tool envelope (``vectordb_tool``) runs before every tool, is a second
     line of defence for direct calls and returns ``{"success": false, "error":
-    ...}``. The SQL nodes keep raw execution behind an ``allow_execute`` switch
+    ...}``. The same check refuses every read tool to a DAP caller signed in with
+    a task's public key (``vx_write_gate.check_read``, ``READS_PUBLIC``). The SQL nodes keep raw execution behind an ``allow_execute`` switch
     in the same spirit (there, ``execute`` raises).
 
     Those two switches are the outer gate: whether a tool exists for this node
@@ -1344,16 +1345,28 @@ class VectorStoreToolMixin(VectorExplorerExtTools, VectorExplorerTools):
     _VECTORDB_WRITE_TOOLS = frozenset(vx_write_gate.WRITE_TOOLS)
 
     def _vectordb_surface_refusal(self, tool: str) -> Optional[Dict[str, Any]]:
-        """The outer gate for one call: None when this node offers ``tool``, else the failure object.
+        """The outer gate for one call: None when this node offers ``tool`` to this caller, else the failure object.
 
         Run by the shared tool envelope (``vectordb_tool``) before the tool reads its
         input, for every store tool: the tools switch first, then, for a write tool,
-        the write switch.
+        the write switch (the tool then runs ``vx_write_gate.check_write`` itself).
+        Every other tool reads, so it runs ``vx_write_gate.check_read`` here: a DAP
+        call from a connection signed in with a task's public key is refused with
+        ``READS_PUBLIC`` before anything is read. The agent tools (``search``,
+        ``objdir``, ``get``, ``stats``) get the same rule as the Vector Explorer's
+        read tools, so a public key cannot list and read the table through them.
+        Agents and account or task callers read as before.
         """
         if not self._vectordb_expose_tools():
             return self._vectordb_tools_refused(tool)
-        if tool in self._VECTORDB_WRITE_TOOLS and not self._vectordb_allow_write():
-            return self._vectordb_write_refused(tool)
+        if tool in self._VECTORDB_WRITE_TOOLS:
+            if not self._vectordb_allow_write():
+                return self._vectordb_write_refused(tool)
+            return None
+        try:
+            vx_write_gate.check_read()
+        except ToolRefusal as refusal:
+            return refusal.envelope()
         return None
 
     def _collect_tool_methods(self):

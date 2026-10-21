@@ -574,6 +574,48 @@ def test_reads_answer_every_caller_but_a_public_task_key(ctx):
     assert [row['objectId'] for row in answer['items']] == ['a']
 
 
+#: The tools agents are offered that read: develop's legacy tool surface (#2631).
+_AGENT_READ_TOOLS = (
+    ('objdir', {}),
+    ('get', {'object_id': 'secret-doc'}),
+    ('search', {'query': 'secret'}),
+    ('stats', {}),
+)
+
+
+def _exposed_node(store):
+    """rocketride_vector as its Vector Explorer template ships it: tools exposed, tool writes off."""
+    node = _tool_node(store)
+    node.IGlobal.expose_tools = True
+    node.IGlobal.allow_write = False
+    return node
+
+
+@pytest.mark.parametrize('tool, args', _AGENT_READ_TOOLS, ids=[t for t, _ in _AGENT_READ_TOOLS])
+def test_a_public_task_key_cannot_read_the_table_through_the_agent_tools(tool, args):
+    """Together, objdir and get list and read every document, so a public key is refused there too."""
+    store = MemoryStore().seed(corpus({'secret-doc': [0, 1], 'other': [0]}))
+    node = _exposed_node(store)
+    seen = len(store.calls)
+    answer = _dispatch(node, tool, args, dap(auth='public', source_type='chat'))
+    assert answer == {'success': False, 'code': 'READS_PUBLIC', 'error': 'The store refused this request.'}
+    assert len(store.calls) == seen, 'nothing was read'
+
+
+@pytest.mark.parametrize(
+    'ctx',
+    [dap(), dap(auth='task'), dap(source_type='chat'), agent(), None],
+    ids=['account', 'task', 'chat-source', 'agent', 'no-context'],
+)
+def test_the_agent_read_tools_answer_every_other_caller(ctx):
+    store = MemoryStore().seed(corpus({'secret-doc': [0, 1], 'other': [0]}))
+    node = _exposed_node(store)
+    listing = _dispatch(node, 'objdir', {}, ctx)
+    got = _dispatch(node, 'get', {'object_id': 'secret-doc'}, ctx)
+    assert listing['success'] is True and got['success'] is True, (listing, got)
+    assert got['total'] == 2
+
+
 def test_the_read_check_is_the_gate_module_s_and_reads_the_engine_context():
     with tool_context.tool_call(dap(auth='public')):
         with pytest.raises(ToolRefusal) as refused:
