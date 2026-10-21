@@ -10,10 +10,11 @@ The mock ``qdrant_client`` (``nodes/test/mocks/qdrant_client``) answers
 Qdrant 1.17 server does (checked against one): examples may be point ids or raw
 vectors and are never returned; ``average_vector`` searches with
 ``avg_positive + avg_positive - avg_negative`` (``avg_positive`` without
-negatives) over unit-length examples on a Cosine collection and refuses an empty
-positive side; ``best_score`` scores every candidate by its best positive and
-best negative similarity through Qdrant's sigmoid step and accepts negatives
-alone; ``sum_scores`` sums them.
+negatives), counting a stored point at unit length on a Cosine collection and a
+raw example vector as given, and refuses an empty positive side; ``best_score``
+scores every candidate by its best positive and best negative similarity (the
+negated squared distance on Euclid) through Qdrant's sigmoid step and accepts
+negatives alone; ``sum_scores`` sums them.
 
 The driver's ``recommendNative`` hook resolves explorer keys to point ids (the
 deterministic ids and the random ids of older rows alike), keeps to the active
@@ -160,6 +161,39 @@ def test_sum_scores_adds_positive_and_subtracts_negative_similarities():
         ((_cos(v, vectors[1]) - _cos(v, vectors[2]), i) for i, v in vectors.items() if i not in (1, 2)), reverse=True
     )
     assert [p.id for p in points] == [i for _s, i in expected]
+
+
+def test_average_vector_takes_a_raw_example_vector_as_given_on_a_cosine_collection():
+    client, vectors = _server()
+    raw = vectors[7] * 5.0  # far from unit length
+    assert abs(np.linalg.norm(raw) - 1.0) > 1.0
+    points = _recommend(client, positive=[raw.tolist(), 1], negative=[3], strategy='average_vector', limit=100)
+    avg_p = np.mean([raw, _unit(vectors[1])], axis=0)
+    query = avg_p + avg_p - _unit(vectors[3])
+    expected = sorted(((_cos(query, v), i) for i, v in vectors.items() if i not in (1, 3)), reverse=True)
+    assert [p.id for p in points] == [i for _s, i in expected], (
+        'stored points count at unit length, raw vectors as given'
+    )
+    assert [p.score for p in points] == pytest.approx([s for s, _i in expected])
+
+
+def test_best_score_on_euclid_measures_by_the_negated_squared_distance():
+    client, vectors = _server(distance='Euclid')
+    points = _recommend(client, positive=[1, 2], negative=[3], strategy='best_score', limit=100)
+
+    def sim(a, b):
+        return -float(np.sum((np.asarray(a) - np.asarray(b)) ** 2))
+
+    expected = []
+    for i, v in vectors.items():
+        if i in (1, 2, 3):
+            continue
+        best_p = max(sim(v, vectors[j]) for j in (1, 2))
+        best_n = sim(v, vectors[3])
+        expected.append((_sigmoid(best_p) if best_p > best_n else -_sigmoid(best_n), i))
+    expected.sort(reverse=True)
+    assert [p.id for p in points] == [i for _s, i in expected]
+    assert [p.score for p in points] == pytest.approx([s for s, _i in expected])
 
 
 def test_examples_may_be_raw_vectors_and_are_never_returned():
@@ -346,6 +380,28 @@ def test_recommend_native_drops_unknown_examples_and_keeps_the_rest():
         positive=[('ghost', 0), ('doc-1', 0)], negative=[('ghost', 1)], strategy='best_score', limit=100
     )
     assert len(docs) == 19 and ('doc-1', 0) not in _keys(docs)
+
+
+def test_recommend_native_never_turns_positives_that_resolve_to_nothing_into_a_negatives_only_query():
+    store = make_store(drv, collection='vx_rec')
+    _corpus(store)
+    store.getVectors([('doc-1', 0)])  # the driver remembers the point id
+    store.removeCounted(['doc-1'])
+    before = Client.calls.get('query_points', 0)
+    for positive in ([('ghost', 0)], [('doc-1', 0)], [('schema', 0)], [('ghost', 0), ('doc-1', 0), ('schema', 0)]):
+        docs = store.recommendNative(positive=positive, negative=[('doc-2', 1)], strategy='best_score', limit=5)
+        assert docs == [], positive
+    assert Client.calls.get('query_points', 0) == before, 'positives were asked for, none is stored'
+    with_vector = store.recommendNative(
+        positive=[('ghost', 0)],
+        negative=[('doc-2', 1)],
+        vector=_vector_of(store, ('doc-3', 2)).tolist(),
+        strategy='best_score',
+        limit=3,
+    )
+    assert _keys(with_vector)[0] == ('doc-3', 2), 'the query vector is a positive example of its own'
+    alone = store.recommendNative(positive=[], negative=[('doc-2', 1)], strategy='best_score', limit=5)
+    assert len(alone) == 5 and all(d.score < 0 for d in alone), 'negatives alone, as asked, are still answered'
 
 
 def test_recommend_native_on_a_missing_collection_is_empty():

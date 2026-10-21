@@ -1680,7 +1680,10 @@ class Store(DocumentStoreBase):
         ``-sigmoid(s)`` of the best negative similarity (a value in [-1, 1]).
 
         Returns [] when the collection is missing or no example resolves (for
-        ``average_vector``: no positive one). Raises ValueError for any other strategy.
+        ``average_vector``: no positive one), and when positive keys were given, none
+        of them resolves and there is no ``vector``: "like A, unlike B" with A gone is
+        never answered as "unlike B" (only an empty ``positive`` asks for negatives
+        alone). Raises ValueError for any other strategy.
         """
         if strategy not in self.RECOMMEND_STRATEGIES:
             raise ValueError(f'unknown recommendation strategy {strategy!r}')
@@ -1694,6 +1697,8 @@ class Store(DocumentStoreBase):
         pids = self._storedPointIds(list(dict.fromkeys(pos + neg)))
         positives: List[Any] = [pids[key] for key in pos if key in pids]
         negatives: List[Any] = [pids[key] for key in neg if key in pids]
+        if positive and not positives and vector is None:
+            return []
         if vector is not None:
             positives.append([float(v) for v in vector])
         if not positives and (strategy == 'average_vector' or not negatives):
