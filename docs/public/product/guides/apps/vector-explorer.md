@@ -111,14 +111,15 @@ written by an earlier release, and **Experimental** otherwise.
   `config.<profile>.allow_writes` to `true` on the store component in the
   `.pipe` (for example `"local": { …, "allow_writes": true }`), then restart the
   pipeline. Every store node's form also shows it, as **Allow document
-  management from tool calls**, next to **Allow writes from agents** (on
-  RocketRide Vector, next to **Allow writes through tools**). With it off, the
+  management from tool calls** (on RocketRide Vector, next to **Allow writes
+  through tools**). With it off, the
   trash buttons are
   disabled and say why. Adding
   documents is not governed by this switch: it goes through the Ingest source,
   and anyone with the data permission on the ingest task can add documents.
-  Agents that use a store as a tool are unaffected; they have their own switch,
-  `agent_writes`, which is on by default.
+  Agents that use a store as a tool are unaffected: an agent writes whenever
+  the store's write tools exist (on RocketRide Vector, only while **Allow
+  writes through tools** is on).
 - **RocketRide Vector needs its tools turned on.** The RocketRide Vector node
   keeps its whole tool surface off until **Expose as tools** is on, and its
   write tools until **Allow writes through tools** is also on; both are off by
