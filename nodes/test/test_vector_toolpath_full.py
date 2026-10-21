@@ -276,6 +276,17 @@ def seeded_fingerprint(
     }
 
 
+# The loopback host is spelled more than one way: an answer that names a fixture server under
+# another spelling than the configured one still leaks it.
+_LOOPBACK = ('localhost', '127.0.0.1', '::1')
+
+
+def _addresses(host: str, port: Optional[int]) -> List[str]:
+    """``host:port`` as an answer could spell it: every loopback spelling when ``host`` is a loopback one."""
+    hosts = _LOOPBACK if host in _LOOPBACK else (host,)
+    return [f'[{h}]:{port}' if ':' in h else f'{h}:{port}' for h in hosts]
+
+
 class _PgVector:
     """postgres.pipe (direct settings) and rocketride_vector.pipe (DSN from the broker stand-in)."""
 
@@ -292,12 +303,12 @@ class _PgVector:
         self.where = f'{self.host}:{self.port}'
 
     def secrets(self) -> List[str]:
-        out = ['postgresql://', 'postgres://', self.where, self.database, self.user]
+        out = ['postgresql://', 'postgres://', *_addresses(self.host, self.port), self.database, self.user]
         if self.password:
             out.append(self.password)
         if self.pooler_dsn:
             pooler = urlparse(self.pooler_dsn)
-            out += [f'{pooler.hostname}:{pooler.port}', pooler.password or '']
+            out += [*_addresses(pooler.hostname or '127.0.0.1', pooler.port), pooler.password or '']
         return [s for s in out if s]
 
     def _connect(self):
@@ -445,7 +456,8 @@ class _Qdrant:
         self.where = f'{self.host}:{self.port}'
 
     def secrets(self) -> List[str]:
-        return [self.where, f'http://{self.where}']
+        addresses = _addresses(self.host, self.port)
+        return addresses + [f'http://{address}' for address in addresses]
 
     def client(self):
         from qdrant_client import QdrantClient
@@ -558,7 +570,8 @@ class _Chroma:
         self.where = f'{self.host}:{self.port}'
 
     def secrets(self) -> List[str]:
-        return [self.where, f'http://{self.where}']
+        addresses = _addresses(self.host, self.port)
+        return addresses + [f'http://{address}' for address in addresses]
 
     def client(self):
         import chromadb
@@ -2001,14 +2014,29 @@ def test_the_pgvector_secrets_include_the_database_user():
     assert service.user and service.user in service.secrets()
 
 
+def test_the_pgvector_secrets_name_the_loopback_host_in_every_spelling(monkeypatch):
+    monkeypatch.setenv('RR_TEST_PGVECTOR_DSN', 'postgresql://u:p@localhost:55432/db')
+    monkeypatch.setenv('RR_TEST_PGVECTOR_POOLER_DSN', 'postgresql://u:p@127.0.0.1:56434/db')
+    secrets_ = _PgVector('postgres').secrets()
+    for address in ('localhost:55432', '127.0.0.1:55432', '[::1]:55432', 'localhost:56434', '127.0.0.1:56434'):
+        assert address in secrets_, address
+    # The configured spelling is localhost; an answer that names the server another way still leaks it.
+    assert _secret_findings({'success': False, 'error': 'could not connect to 127.0.0.1:55432'}, secrets_)
+    monkeypatch.setenv('RR_TEST_PGVECTOR_DSN', 'postgresql://u:p@db.internal:5432/db')
+    monkeypatch.delenv('RR_TEST_PGVECTOR_POOLER_DSN')
+    hosts = [s for s in _PgVector('postgres').secrets() if s.endswith(':5432')]
+    assert hosts == ['db.internal:5432'], 'another host is banned as spelled, and only it'
+
+
 def test_the_end_of_run_scan_reads_every_template_including_the_stock_rag_shape():
     # The stock-RAG shape records its answers under its own name, which no deployment's own scan reads.
-    leaked = ('stock_rag', 'stock', 'stats', {'success': True, 'where': '127.0.0.1:55432', 'ok': 1})
+    configured = _PgVector('postgres').where  # RR_TEST_PGVECTOR_DSN's host and port, as spelled there
+    leaked = ('stock_rag', 'stock', 'stats', {'success': True, 'where': configured, 'ok': 1})
     clean = ('qdrant', 'new', 'stats', {'success': True, 'documents': 3})
     banned = _run_banned(
         SimpleNamespace(token='broker-t', url='http://127.0.0.1:1/provision'), SimpleNamespace(apikey='engine-key')
     )
-    assert {'127.0.0.1:55432', 'broker-t', 'engine-key'} <= set(banned)
+    assert {configured, 'broker-t', 'engine-key'} <= set(banned)
     findings = _run_findings([clean, leaked], banned)
     assert len(findings) == 1 and findings[0].startswith('stock_rag/stock stats'), findings
 
