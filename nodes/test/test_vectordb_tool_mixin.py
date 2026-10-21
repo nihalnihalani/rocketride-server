@@ -2783,18 +2783,46 @@ def test_objdir_excludes_the_control_record_and_deleted_documents():
     assert 'schema' not in answer['paths'].values()
 
 
-def test_objdir_filters_by_parent_prefix_and_pages():
+def test_objdir_filters_by_an_exact_parent_and_pages():
+    # parent is an exact path, as develop's drivers and #2704's listing read it: never a prefix.
     store = ExactListingStore().seed(
-        [make_doc(f'd{i}', 0, path=f'/docs/{i}.md') for i in range(5)] + [make_doc('x', 0, path='/x.md')]
+        [make_doc(f'd{i}', 0, path='/docs/same.md') for i in range(5)]
+        + [make_doc('longer', 0, path='/docs/same.md.bak'), make_doc('below', 0, path='/docs/sub/x.md')]
     )
-    answer = node(store).objdir({'parent': '/docs/', 'offset': 1, 'limit': 2})
+    inst = node(store)
+    answer = inst.objdir({'parent': '/docs/same.md', 'offset': 1, 'limit': 2})
     assert [e['objectId'] for e in answer['entries']] == ['d1', 'd2']
+    assert answer['truncated'] is False
+    everything = inst.objdir({'parent': '/docs/same.md'})['entries']
+    assert sorted(e['objectId'] for e in everything) == ['d0', 'd1', 'd2', 'd3', 'd4']
+    assert inst.objdir({'parent': '/docs/'})['entries'] == []
+    assert inst.objdir({'parent': '/docs/sub/x.md'})['paths'] == {'/docs/sub/x.md': 'below'}
+
+
+def test_objdir_refuses_a_parent_that_is_not_a_string():
+    answer = node(ExactListingStore().seed(corpus({'a': [0]}))).objdir({'parent': 5})
+    assert (answer['success'], answer['code']) == (False, 'INVALID_INPUT')
 
 
 def test_objdir_pages_a_native_listing_past_one_page():
     store = ExactListingStore().seed(corpus({f'd{i:04d}': [0] for i in range(1200)}))
     answer = node(store).objdir({})
     assert len(answer['entries']) == 1000 and len({e['objectId'] for e in answer['entries']}) == 1000
+    assert answer['truncated'] is False and 'warning' not in answer
+    rest = node(store).objdir({'offset': 1000})
+    assert len(rest['entries']) == 200 and rest['truncated'] is False
+
+
+def test_objdir_says_when_its_scan_cap_cut_the_page_short(monkeypatch):
+    monkeypatch.setattr(_store_module, '_OBJDIR_SCAN_MAX', 600)
+    store = ExactListingStore().seed(
+        corpus({f'd{i:04d}': [0] for i in range(1200)}) + [make_doc('late', 0, path='Z:/late.md')]
+    )
+    # Listed by path, 'Z:/late.md' comes after the 1,200 'C:/demo/...' documents: past the cap.
+    answer = node(store).objdir({'parent': 'Z:/late.md'})
+    assert answer['success'] is True and answer['entries'] == []
+    assert answer['truncated'] is True
+    assert '600' in answer['warning'] and 'incomplete' in answer['warning']
 
 
 class _PathsSpy(MemoryStore):
@@ -2810,6 +2838,7 @@ def test_objdir_without_a_native_listing_keeps_the_drivers_get_paths():
     answer = node(store).objdir({'parent': '/docs/', 'offset': 0, 'limit': 50})
     assert [call for call in store.calls if call[0] == 'getPaths'] == [('getPaths', '/docs/', 0, 50)]
     assert not [call for call in store.calls if call[0] == 'get']
+    assert answer['truncated'] is False
     assert sorted(e['objectId'] for e in answer['entries']) == ['a', 'b']
     assert 'schema' not in answer['paths'].values()
 
@@ -2871,6 +2900,8 @@ def test_objdir_stops_paging_a_listing_that_brings_nothing_new(store_cls):
     expected = [] if store_cls is _EmptyPageListing else ['a', 'b']
     assert sorted(entry['objectId'] for entry in answer['entries']) == expected
     assert len(_backend_calls(store, 'listDocumentPage')) <= 3
+    # The store kept handing out cursors, so the list may go on: the answer says so.
+    assert answer['truncated'] is True and 'incomplete' in answer['warning']
 
 
 def test_objdir_stops_when_the_listing_reports_it_cannot_page():
@@ -2885,6 +2916,7 @@ def test_objdir_stops_when_the_listing_reports_it_cannot_page():
     answer = node(store).objdir({})
     assert [entry['objectId'] for entry in answer['entries']] == ['p1']
     assert len(_backend_calls(store, 'listDocumentPage')) == 1
+    assert answer['truncated'] is True and 'incomplete' in answer['warning']
 
 
 def test_objdir_stops_at_its_time_budget(monkeypatch):
@@ -2904,6 +2936,8 @@ def test_objdir_stops_at_its_time_budget(monkeypatch):
     answer = node(store).objdir({})
     assert answer['success'] is True and len(answer['entries']) == 2
     assert len(_backend_calls(store, 'listDocumentPage')) == 2
+    assert answer['truncated'] is True
+    assert 'time budget' in answer['warning'] and 'incomplete' in answer['warning']
 
 
 @pytest.mark.parametrize('store_cls', [_EmptyPageListing, _RepeatingListing])

@@ -1195,6 +1195,13 @@ _VECTORDB_DEFAULT_SERVER_NAME = 'vectordb'
 _OBJDIR_MAX_LIMIT = 1000
 _OBJDIR_SCAN_MAX = 10000
 
+#: What ``objdir`` answers in ``warning`` when its listing stopped before the page was full.
+_OBJDIR_STOPPED = {
+    'cap': 'objdir read its limit of {rows} rows before the page was full: the list is incomplete.',
+    'budget': 'objdir ran out of its time budget before the page was full: the list is incomplete.',
+    'stale': 'The store stopped handing out new documents before the page was full: the list may be incomplete.',
+}
+
 
 #: The normaliser every store tool's input goes through (kept under its historical name).
 _normalize_vectordb_tool_input = normalize_tool_input
@@ -1952,16 +1959,23 @@ class VectorStoreToolMixin(VectorExplorerExtTools, VectorExplorerTools):
         """List unique document paths in this vector store.
 
         ``paths`` maps each path to an objectId as before; the control record is never
-        listed. ``offset`` must be 0 or more and ``limit`` 1 or more (at most 1000 are
-        returned). On a driver with a native document
+        listed. ``parent``, when given, is an exact path (as develop's drivers read it),
+        never a prefix. ``offset`` must be 0 or more and ``limit`` 1 or more (at most
+        1000 are returned). On a driver with a native document
         listing (``listDocumentPage``), ``entries`` lists every document (path and objectId,
         equal paths not collapsed) and deleted documents are left out. On any other
         driver the answer is the driver's own ``getPaths`` page, as before: the default
         listing pages by offset, which several backends ignore or read as a point id.
+
+        ``truncated`` is True when the listing stopped before the page was full and before
+        the store ran out of documents (the scan cap, the time budget, or a store that
+        stopped paging); ``warning`` then says why, because the list is incomplete.
         """
         store = self._vectordb_store()
 
         parent = args.get('parent', None)
+        if parent is not None and not isinstance(parent, str):
+            raise ToolRefusal('INVALID_INPUT', 'objdir: parent must be a string')
         from ai.common.utils import optional_int
 
         try:
@@ -1972,11 +1986,12 @@ class VectorStoreToolMixin(VectorExplorerExtTools, VectorExplorerTools):
         limit = min(limit, _OBJDIR_MAX_LIMIT)
 
         entries: Optional[List[Dict[str, str]]] = None
+        stopped: Optional[str] = None
         if 'listDocumentPage' in store.capabilities():
             try:
-                entries = self._vectordb_objdir_listing(store, parent, offset, limit)
+                entries, stopped = self._vectordb_objdir_listing(store, parent, offset, limit)
             except StoreUnsupported:
-                entries = None
+                entries, stopped = None, None
         if entries is None:
             legacy = store.getPaths(parent=parent, offset=offset, limit=limit) or {}
             entries = [
@@ -1988,22 +2003,31 @@ class VectorStoreToolMixin(VectorExplorerExtTools, VectorExplorerTools):
         paths: Dict[str, str] = {}
         for entry in entries:
             paths.setdefault(entry['path'], entry['objectId'])
-        return {'success': True, 'paths': paths, 'entries': entries}
+        answer: Dict[str, Any] = {'success': True, 'paths': paths, 'entries': entries, 'truncated': stopped is not None}
+        if stopped is not None:
+            answer['warning'] = _OBJDIR_STOPPED[stopped].format(rows=_OBJDIR_SCAN_MAX)
+            warning(f'vectordb tool: objdir on {self._vectordb_server_name()}: {answer["warning"]}')
+        return answer
 
     @staticmethod
     def _vectordb_objdir_listing(
-        store: 'DocumentStoreBase', parent: Any, offset: int, limit: int
-    ) -> List[Dict[str, str]]:
-        """``objdir`` entries from a native ``listDocumentPage``: active documents under ``parent``, paged.
+        store: 'DocumentStoreBase', parent: Optional[str], offset: int, limit: int
+    ) -> Tuple[List[Dict[str, str]], Optional[str]]:
+        """``objdir`` entries from a native ``listDocumentPage``: active documents at ``parent``, paged.
 
         Each document is listed once. Paging ends after ``_OBJDIR_SCAN_MAX`` rows or as
         :class:`ListingGuard` decides (empty or repeated pages, a listing that cannot
         page, the time budget), so a driver whose cursor never ends cannot hang the tool.
+
+        Returns the entries and why the listing stopped short of a full page while the
+        store may hold more (a key of ``_OBJDIR_STOPPED``), or None when the page is full
+        or the listing ended.
         """
         entries: List[Dict[str, str]] = []
         seen: set = set()
         skipped = 0
         scanned = 0
+        stopped: Optional[str] = None
         page_size = VECTOR_TOOL_LIMITS['documents_page']
         guard = ListingGuard(_OBJDIR_SCAN_MAX, page_size, VECTOR_TOOL_LIMITS['sample_budget_ms'] / 1000.0)
         cursor: Optional[str] = None
@@ -2023,7 +2047,7 @@ class VectorStoreToolMixin(VectorExplorerExtTools, VectorExplorerTools):
                 new_documents += 1
                 if row.deleted:
                     continue
-                if isinstance(parent, str) and parent and not row.path.startswith(parent):
+                if parent is not None and row.path != parent:
                     continue
                 if skipped < offset:
                     skipped += 1
@@ -2032,9 +2056,11 @@ class VectorStoreToolMixin(VectorExplorerExtTools, VectorExplorerTools):
                     entries.append({'path': row.path, 'objectId': row.objectId})
             scanned += len(page.items)
             if guard.stop(page, new_documents) or scanned >= _OBJDIR_SCAN_MAX:
+                if guard.reason != 'complete' and len(entries) < limit:
+                    stopped = guard.reason if guard.reason in ('budget', 'stale') else 'cap'
                 break
             cursor = page.next_cursor
-        return entries
+        return entries, stopped
 
     @tool_function(
         input_schema={

@@ -315,7 +315,7 @@ A missing collection answers the same envelope with nulls and `health.collection
 
 **`upsert`** (legacy descriptor unchanged, gated) — unchanged input/output; an external caller supplying `embedding`/`embedding_model` → `INVALID_INPUT`; `object_id == 'schema'` → `RESERVED_ID`. Into an existing collection built with another embedding model it answers `MODEL_MISMATCH`, with another dimension `DIMENSION_MISMATCH`, before anything is written. For all three write tools the gate (§6.3) runs before the input is checked, so a refused caller sending too many ids or a malformed list gets the gate's code, not `INVALID_INPUT`.
 
-**`get`, `objdir`** (legacy descriptors unchanged; fixed) — `get` guards `int()`, clamps `limit`, pages in chunk order, adds `has_more`; `objdir` keeps `paths`, adds `entries`, excludes `schema` and deleted rows, clamps `limit`.
+**`get`, `objdir`** (legacy descriptors unchanged; fixed) — `get` guards `int()`, clamps `limit`, pages in chunk order, adds `has_more`; `objdir` keeps `paths`, adds `entries`, excludes `schema` and deleted rows, clamps `limit`, reads `parent` as an exact path (as develop's drivers do; a non-string `parent` is `INVALID_INPUT`), and answers `truncated` (with a `warning` when true) when its listing stopped at the 10,000-row scan cap, the `sample_budget_ms` time budget or a store that stopped paging before the page was full.
 
 ### 4.3 `embed` on the embedding nodes (new mixin `packages/ai/src/ai/common/embed_tool.py`)
 
