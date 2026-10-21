@@ -23,7 +23,6 @@ import json
 import os
 
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
@@ -146,14 +145,51 @@ def test_an_answer_with_another_outcome_than_expected_is_reported():
     assert gen.outcome_problem(None, gen.OK)
 
 
-class _FakeSide:
-    """Answers every call as the tools should, except the outcomes overridden by (tool, input key)."""
+TEMPLATES = Path(__file__).resolve().parents[2] / 'apps' / 'vector-ui' / 'templates'
 
-    def __init__(self, wrong=None):
+
+def _template(name):
+    """A shipped template's pipeline, as the toolpath suite starts it."""
+    raw = json.loads((TEMPLATES / f'{name}.pipe').read_text(encoding='utf-8'))
+    return raw.get('pipeline', raw)
+
+
+class _FakeSide:
+    """A running copy of a template as test_vector_toolpath_full._Side holds it.
+
+    It has what the real side has (engine, template, kind, collection, pipe and
+    the sources it was started for) and answers every call as the tools should
+    for its pipe's switches, except the outcomes overridden by (tool, source,
+    node). A store whose allow_write is off has no write tools, so the engine
+    finds no handler; allow_writes off refuses a Tools-source write with
+    WRITES_DISABLED; any other source gets WRITES_SOURCE.
+    """
+
+    def __init__(
+        self,
+        wrong=None,
+        *,
+        engine='engine',
+        template='qdrant',
+        kind='new',
+        collection='vx_wire',
+        pipe=None,
+        sources=('tools_1', 'chat_1', 'ingest_1'),
+    ):
+        self.engine, self.template, self.kind, self.collection = engine, template, kind, collection
+        self.pipe = pipe if pipe is not None else _template(template)
+        self.sources = tuple(sources)
         self.calls = []
         self.wrong = wrong or {}
+        self.stopped = False
+
+    def settings(self, node):
+        comp = next(c for c in self.pipe['components'] if c['id'] == node)
+        return comp['config'][comp['config']['profile']]
 
     def tool(self, name, inp=None, *, source='tools_1', node='store_1'):
+        if source not in self.sources:
+            raise KeyError(f'{source} was not started for this side')
         inp = inp or {}
         self.calls.append((name, inp, source, node))
         key = (name, source, node)
@@ -164,18 +200,43 @@ class _FakeSide:
         if name == 'search' and len(inp.get('vector') or []) == 10:
             return {'success': False, 'code': 'DIMENSION_MISMATCH', 'error': 'dimension'}
         if name == 'remove_document':
+            settings = self.settings(node)
+            if not settings.get('allow_write', True):
+                return {'success': False, 'error': f'no handler for {name} on {node}'}
             if inp.get('object_ids') == ['schema']:
                 return {'success': False, 'code': 'RESERVED_ID', 'error': 'control record'}
+            if not settings.get('allow_writes', False):
+                return {'success': False, 'code': 'WRITES_DISABLED', 'error': 'switch'}
             if source != 'tools_1':
                 return {'success': False, 'code': 'WRITES_SOURCE', 'error': 'source'}
-            if node != 'store_1':
-                return {'success': False, 'code': 'WRITES_DISABLED', 'error': 'switch'}
         if name == 'sample':
             return {'success': True, 'sample_id': 's-7-0000aaaa', 'n': 12, 'of': {'chunks': 12, 'documents': 8}}
         return {'success': True}
 
+    def stop(self):
+        self.stopped = True
 
-_TP = SimpleNamespace(object_id=lambda name: f'oid:{name}')
+
+class _FakeToolpath:
+    """What the generator uses of test_vector_toolpath_full: object ids, and _Side to start a copy."""
+
+    def __init__(self, wrong=None):
+        self.started = []
+        self.wrong = wrong
+
+    @staticmethod
+    def object_id(name):
+        return f'oid:{name}'
+
+    def _Side(self, eng, template, kind, collection, pipe, sources):
+        side = _FakeSide(
+            self.wrong, engine=eng, template=template, kind=kind, collection=collection, pipe=pipe, sources=sources
+        )
+        self.started.append(side)
+        return side
+
+
+_TP = _FakeToolpath()
 
 
 def test_every_capture_states_its_expected_outcome_and_writes_go_last():
@@ -221,6 +282,48 @@ def test_every_required_capture_is_generated_for_both_sides():
             i for i, c in enumerate(side.calls) if c[0] == 'remove_document' and c[1] == {'object_ids': ['second']}
         ]
         assert removal == [len(side.calls) - 1], side.calls[-3:]
+
+
+def test_writes_disabled_is_store_2s_refusal_except_on_rocketride_vector():
+    disabled = gen.file_name('qdrant', 'remove_document', 'writes_disabled')
+    tp, side = _FakeToolpath(), _FakeSide(template='qdrant')
+    out = gen._captures_for(tp, side, 'new', 'qdrant', 'multi', [0.1] * 384, [0.2] * 384)
+    assert out[disabled]['code'] == 'WRITES_DISABLED'
+    assert ('remove_document', {'object_ids': [gen.disposable_id(tp)]}, 'tools_1', 'store_2') in side.calls
+    assert tp.started == []
+
+    # rocketride_vector's store_2 keeps allow_write off, so it has no write tools to refuse with:
+    # the refusal comes from a copy of the side's pipeline, store_1 with allow_writes off.
+    disabled = gen.file_name('rocketride_vector', 'remove_document', 'writes_disabled.legacy')
+    tp, side = _FakeToolpath(), _FakeSide(template='rocketride_vector', kind='legacy', collection='vx_legacy')
+    assert side.settings('store_2')['allow_write'] is False
+    pipe_before = json.dumps(side.pipe, sort_keys=True)
+    out = gen._captures_for(tp, side, 'legacy', 'rocketride_vector', 'multi', [0.1] * 384, [0.2] * 384)
+    assert not [c for c in side.calls if c[0] == 'remove_document' and c[3] == 'store_2']
+    (copy,) = tp.started
+    assert (copy.engine, copy.template, copy.kind, copy.collection) == (
+        side.engine,
+        'rocketride_vector',
+        'legacy-writes-off',
+        'vx_legacy',
+    )
+    assert copy.sources == ('tools_1',)
+    assert copy.settings('store_1') == {**side.settings('store_1'), 'allow_write': True, 'allow_writes': False}
+    assert copy.pipe['project_id'] != side.pipe.get('project_id') and copy.pipe['name'].endswith('(writes off)')
+    assert json.dumps(side.pipe, sort_keys=True) == pipe_before, "the side's own pipeline is not changed"
+    assert copy.calls == [('remove_document', {'object_ids': [gen.disposable_id(tp)]}, 'tools_1', 'store_1')]
+    assert copy.stopped
+    assert out[disabled]['code'] == 'WRITES_DISABLED'
+
+
+def test_a_writes_off_copy_that_removes_fails_generation_and_is_still_stopped():
+    tp = _FakeToolpath(wrong={('remove_document', 'tools_1', 'store_1'): {'success': True, 'removed': {'chunks': 0}}})
+    with pytest.raises(gen.CaptureMismatch, match='remove_document.writes_disabled'):
+        gen._captures_for(
+            tp, _FakeSide(template='rocketride_vector'), 'new', 'rocketride_vector', 'multi', [0.1] * 384, [0.2] * 384
+        )
+    (copy,) = tp.started
+    assert copy.stopped
 
 
 def test_a_live_suite_does_not_run_under_mocks(monkeypatch):
