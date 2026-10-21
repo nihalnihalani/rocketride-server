@@ -1015,7 +1015,7 @@ def test_stats_counts_orphans_and_deleted_chunks():
 
 def test_stats_without_document_counts_falls_back_to_first_chunks():
     class FirstChunksOnly(CountingStore):
-        def countDocuments(self, docFilter):
+        def countDocumentsWhere(self, docFilter):
             return None
 
     answer = node(FirstChunksOnly().seed(corpus({'a': [0, 1], 'b': [0]}))).stats({})
@@ -1038,9 +1038,9 @@ def test_stats_quick_returns_cached_figures_with_their_time(monkeypatch):
     inst = node(store)
     full = inst.stats({'mode': 'full'})
     clock[0] += 45
-    calls_before = len([c for c in store.calls if c[0] in ('countChunks', 'countDocuments')])
+    calls_before = len([c for c in store.calls if c[0] in ('countChunks', 'countDocumentsWhere')])
     quick = inst.stats({'mode': 'quick'})
-    calls_after = len([c for c in store.calls if c[0] in ('countChunks', 'countDocuments')])
+    calls_after = len([c for c in store.calls if c[0] in ('countChunks', 'countDocumentsWhere')])
     assert calls_after == calls_before
     assert quick['documents'] == full['documents'] == 2 and quick['count'] == full['count']
     assert quick['counts_as_of'] == full['computed_at'] and quick['computed_at'] != full['computed_at']
@@ -1109,9 +1109,9 @@ def _quick_after(monkeypatch, age_s: float):
     inst = node(store)
     full = inst.stats({'mode': 'full'})
     clock[0] += age_s
-    counted = len([c for c in store.calls if c[0] in ('countChunks', 'countDocuments')])
+    counted = len([c for c in store.calls if c[0] in ('countChunks', 'countDocumentsWhere')])
     quick = inst.stats({'mode': 'quick'})
-    recounted = len([c for c in store.calls if c[0] in ('countChunks', 'countDocuments')]) > counted
+    recounted = len([c for c in store.calls if c[0] in ('countChunks', 'countDocumentsWhere')]) > counted
     return full, quick, recounted
 
 
@@ -1192,7 +1192,7 @@ class _HealthRow(DocumentRow):
 
 def _with_health(store: Any, health: Dict[str, tuple]) -> Any:
     """Make ``store`` list the documents named in ``health`` as rows carrying those two fields."""
-    list_documents = store.listDocuments
+    list_documents = store.listDocumentPage
 
     def listing(**kw: Any) -> DocPage:
         page = list_documents(**kw)
@@ -1208,7 +1208,7 @@ def _with_health(store: Any, health: Dict[str, tuple]) -> Any:
         ]
         return dataclasses.replace(page, items=rows)
 
-    store.listDocuments = listing
+    store.listDocumentPage = listing
     return store
 
 
@@ -1265,7 +1265,7 @@ def test_documents_clamps_the_limit_with_a_warning():
     store = clustered(docs=2, chunks=1)
     answer = node(store).documents({'limit': 10_000})
     assert answer['warnings'] == ['limit_clamped']
-    assert [c for c in store.calls if c[0] == 'listDocuments'][-1][2] == 500
+    assert [c for c in store.calls if c[0] == 'listDocumentPage'][-1][2] == 500
 
 
 @pytest.mark.parametrize(
@@ -1305,8 +1305,8 @@ def test_documents_never_lists_the_control_record():
 
 def test_documents_unsupported_listing_is_unsupported():
     class NoListing(MemoryStore):
-        def listDocuments(self, **kw):
-            raise StoreUnsupported('listDocuments is not supported by this store')
+        def listDocumentPage(self, **kw):
+            raise StoreUnsupported('listDocumentPage is not supported by this store')
 
     answer = node(NoListing().seed(corpus({'a': [0]}))).documents({})
     assert (answer['success'], answer['code']) == (False, 'UNSUPPORTED')
@@ -1626,7 +1626,7 @@ def test_sample_refuses_a_cluster_request_it_cannot_serve(cluster, words):
     answer = node(store).sample({'n': 10, 'cluster': cluster})
     assert (answer['success'], answer['code']) == (False, 'INVALID_INPUT')
     assert words in answer['error']
-    assert not any(call[0] in ('getVectors', 'listDocuments') for call in store.calls), 'refused before the store'
+    assert not any(call[0] in ('getVectors', 'listDocumentPage') for call in store.calls), 'refused before the store'
 
 
 @pytest.mark.parametrize('cluster', [{'method': 'knn-components'}, {'labels': True}, {'method': None, 'labels': None}])
@@ -1780,7 +1780,7 @@ class _GridStore(ExactListingStore):
         self.seed([make_doc('seed', 0, dim=dim)])  # creates the collection and its control record
         del self.rows[('seed', 0)]
 
-    def listDocuments(self, *, cursor, limit, object_ids, deleted, sort) -> DocPage:
+    def listDocumentPage(self, *, cursor, limit, object_ids, deleted, sort) -> DocPage:
         docs, chunks = self.grid
         rows = [
             DocumentRow(
@@ -2826,9 +2826,9 @@ def test_objdir_refuses_a_limit_below_one():
 class _EmptyPageListing(VectorMemoryStore):
     """A native listing that filters every page to nothing but still hands out a cursor."""
 
-    def listDocuments(self, *, cursor, limit, object_ids, deleted, sort):
-        self.calls.append(('listDocuments', cursor, limit))
-        pages = len(_backend_calls(self, 'listDocuments'))
+    def listDocumentPage(self, *, cursor, limit, object_ids, deleted, sort):
+        self.calls.append(('listDocumentPage', cursor, limit))
+        pages = len(_backend_calls(self, 'listDocumentPage'))
         if pages > 200:
             raise RuntimeError(f'asked for {pages} pages: the listing loop does not end')
         return DocPage([], f'c{pages}', None, False, True, True, [])
@@ -2837,9 +2837,9 @@ class _EmptyPageListing(VectorMemoryStore):
 class _RepeatingListing(VectorMemoryStore):
     """A native listing that ignores its cursor: every page is the first one, with a fresh cursor."""
 
-    def listDocuments(self, *, cursor, limit, object_ids, deleted, sort):
-        self.calls.append(('listDocuments', cursor, limit))
-        pages = len(_backend_calls(self, 'listDocuments'))
+    def listDocumentPage(self, *, cursor, limit, object_ids, deleted, sort):
+        self.calls.append(('listDocumentPage', cursor, limit))
+        pages = len(_backend_calls(self, 'listDocumentPage'))
         if pages > 200:
             raise RuntimeError(f'asked for {pages} pages: the listing loop does not end')
         firsts = [doc for key, doc in self.rows.items() if key[1] == 0 and key[0] != 'schema']
@@ -2853,30 +2853,30 @@ def test_objdir_stops_paging_a_listing_that_brings_nothing_new(store_cls):
     assert answer['success'] is True
     expected = [] if store_cls is _EmptyPageListing else ['a', 'b']
     assert sorted(entry['objectId'] for entry in answer['entries']) == expected
-    assert len(_backend_calls(store, 'listDocuments')) <= 3
+    assert len(_backend_calls(store, 'listDocumentPage')) <= 3
 
 
 def test_objdir_stops_when_the_listing_reports_it_cannot_page():
     class Unpageable(VectorMemoryStore):
-        def listDocuments(self, *, cursor, limit, object_ids, deleted, sort):
-            self.calls.append(('listDocuments', cursor, limit))
-            page = len(_backend_calls(self, 'listDocuments'))
+        def listDocumentPage(self, *, cursor, limit, object_ids, deleted, sort):
+            self.calls.append(('listDocumentPage', cursor, limit))
+            page = len(_backend_calls(self, 'listDocumentPage'))
             row = _store_module.documentRow(make_doc(f'p{page}', 0))
             return DocPage([row], f'c{page}', None, False, True, True, ['documents_paging_unsupported'])
 
     store = Unpageable().seed(corpus({'a': [0]}))
     answer = node(store).objdir({})
     assert [entry['objectId'] for entry in answer['entries']] == ['p1']
-    assert len(_backend_calls(store, 'listDocuments')) == 1
+    assert len(_backend_calls(store, 'listDocumentPage')) == 1
 
 
 def test_objdir_stops_at_its_time_budget(monkeypatch):
     clock = [100.0]
 
     class Slow(VectorMemoryStore):
-        def listDocuments(self, *, cursor, limit, object_ids, deleted, sort):
-            self.calls.append(('listDocuments', cursor, limit))
-            page = len(_backend_calls(self, 'listDocuments'))
+        def listDocumentPage(self, *, cursor, limit, object_ids, deleted, sort):
+            self.calls.append(('listDocumentPage', cursor, limit))
+            page = len(_backend_calls(self, 'listDocumentPage'))
             clock[0] += 31.0
             return DocPage(
                 [_store_module.documentRow(make_doc(f'p{page}', 0))], f'c{page}', None, False, True, True, []
@@ -2886,7 +2886,7 @@ def test_objdir_stops_at_its_time_budget(monkeypatch):
     store = Slow().seed(corpus({'a': [0]}))
     answer = node(store).objdir({})
     assert answer['success'] is True and len(answer['entries']) == 2
-    assert len(_backend_calls(store, 'listDocuments')) == 2
+    assert len(_backend_calls(store, 'listDocumentPage')) == 2
 
 
 @pytest.mark.parametrize('store_cls', [_EmptyPageListing, _RepeatingListing])
@@ -2894,7 +2894,7 @@ def test_sample_stops_paging_a_listing_that_brings_nothing_new(store_cls):
     store = store_cls().seed(corpus({'a': [0, 1], 'b': [0, 1]}, dim=8))
     answer = node(store).sample({'n': 10})
     assert answer['success'] is True and answer['n'] == 4
-    assert len(_backend_calls(store, 'listDocuments')) <= 3
+    assert len(_backend_calls(store, 'listDocumentPage')) <= 3
 
 
 # ---------------------------------------------------------------------------

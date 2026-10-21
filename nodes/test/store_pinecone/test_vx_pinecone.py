@@ -133,7 +133,7 @@ def test_a_pod_index_cannot_sample_or_list(adapter):
     h.ingest(store, 'doc-a', '/docs/a.md', [0, 1])
     with pytest.raises(StoreUnsupported):
         store.sampleChunks(n=2, seed=1, strategy='random', docFilter=h.VxFilter(deleted='active'), include_keys=[])
-    page = store.listDocuments(cursor=None, limit=10, object_ids=None, deleted='active', sort='path')
+    page = store.listDocumentPage(cursor=None, limit=10, object_ids=None, deleted='active', sort='path')
     assert [row.objectId for row in page.items] == ['doc-a']
     assert page.next_cursor is None
 

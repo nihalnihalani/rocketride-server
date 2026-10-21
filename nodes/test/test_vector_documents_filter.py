@@ -187,7 +187,7 @@ def _list_all(store, flt: Optional[DocListFilter], *, limit: int = 3, deleted: s
     """Every page of a listing: (objectIds in order, the pages)."""
     pages, cursor = [], None
     while True:
-        page = store.listDocuments(
+        page = store.listDocumentPage(
             cursor=cursor, limit=limit, object_ids=None, deleted=deleted, sort='path', filter=flt
         )
         pages.append(page)
@@ -205,7 +205,7 @@ def _f(**kw: Any) -> DocListFilter:
 def test_pgvector_declares_the_filter_and_takes_it_in_its_hook(pg):
     cls = pg.driver.PgVectorStore
     assert 'documents_filter' in cls.VX_DRIVER_CAPABILITIES
-    params = inspect.signature(cls.listDocuments).parameters
+    params = inspect.signature(cls.listDocumentPage).parameters
     assert params['filter'].kind is inspect.Parameter.KEYWORD_ONLY and params['filter'].default is None
     assert 'documents_filter' in pg.open().capabilities()
 
@@ -286,7 +286,7 @@ def test_pgvector_filtered_pages_follow_one_another_and_carry_the_filtered_total
 def test_pgvector_rows_of_a_filtered_listing_keep_their_counts_and_metadata(pg):
     store = pg.open()
     _seed(store)
-    page = store.listDocuments(
+    page = store.listDocumentPage(
         cursor=None, limit=10, object_ids=None, deleted='active', sort='path', filter=_f(has_tables=True)
     )
     (row,) = page.items
@@ -308,7 +308,7 @@ def test_pgvector_filter_and_object_ids_and_deleted_mode_combine(pg):
     assert _list_all(store, flt)[0] == ['orphan', 'osprey']
     assert _list_all(store, flt, deleted='deleted')[0] == ['falcon']
     assert _list_all(store, flt, deleted='all')[0] == ['falcon', 'orphan', 'osprey']
-    page = store.listDocuments(
+    page = store.listDocumentPage(
         cursor=None, limit=10, object_ids=['osprey', 'notes', 'schema'], deleted='active', sort='path', filter=flt
     )
     assert [r.objectId for r in page.items] == ['osprey'] and page.total == 1
@@ -356,8 +356,8 @@ def test_pgvector_cursor_is_bound_to_its_filter(pg):
 
     store = pg.open()
     _seed(store)
-    plain = store.listDocuments(cursor=None, limit=2, object_ids=None, deleted='active', sort='path')
-    filtered = store.listDocuments(
+    plain = store.listDocumentPage(cursor=None, limit=2, object_ids=None, deleted='active', sort='path')
+    filtered = store.listDocumentPage(
         cursor=None, limit=2, object_ids=None, deleted='active', sort='path', filter=_f(file_types=['md'])
     )
     assert plain.next_cursor and filtered.next_cursor
@@ -367,10 +367,10 @@ def test_pgvector_cursor_is_bound_to_its_filter(pg):
         (filtered.next_cursor, _f(file_types=['pdf'])),
     ):
         with pytest.raises(ToolRefusal) as err:
-            store.listDocuments(cursor=cursor, limit=2, object_ids=None, deleted='active', sort='path', filter=flt)
+            store.listDocumentPage(cursor=cursor, limit=2, object_ids=None, deleted='active', sort='path', filter=flt)
         assert err.value.code == 'INVALID_INPUT'
     # The cursor goes on with the same filter, normalised the same way.
-    again = store.listDocuments(
+    again = store.listDocumentPage(
         cursor=filtered.next_cursor,
         limit=2,
         object_ids=None,
@@ -436,7 +436,7 @@ def test_pgvector_without_the_meta_column_leaves_the_ingest_keys_to_the_app(pg):
     listed, pages = _list_all(store, flt, limit=2)
     assert listed == _expected(flt, dates=False) == ['falcon', 'orphan', 'osprey']
     assert all(page.filter_ignored == ('ingested_after', 'ingested_before') for page in pages)
-    only_dates = store.listDocuments(
+    only_dates = store.listDocumentPage(
         cursor=None, limit=50, object_ids=None, deleted='active', sort='path', filter=_f(ingested_after='2026-10-01')
     )
     assert only_dates.filter_ignored == ('ingested_after',) and only_dates.total == len(LIBRARY)
@@ -529,7 +529,7 @@ def test_pgvector_a_document_whose_rows_left_the_mode_between_the_two_statements
         return list_documents(columns, where)
 
     monkeypatch.setattr(store._sql, 'list_documents', soft_delete_then_aggregate)
-    page = store.listDocuments(cursor=None, limit=10, object_ids=None, deleted='active', sort='path')
+    page = store.listDocumentPage(cursor=None, limit=10, object_ids=None, deleted='active', sort='path')
     assert [r.objectId for r in page.items] == ['gappy', 'whole']
 
 

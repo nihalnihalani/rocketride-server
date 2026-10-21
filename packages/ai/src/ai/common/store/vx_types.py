@@ -26,7 +26,7 @@
 """Value types of the vector store explorer hooks (frozen interface).
 
 These are what the optional ``DocumentStoreBase`` hooks return (``describe``,
-``listDocuments``, ``scrollChunks``, ``knnGraph``) and the string vocabularies the
+``listDocumentPage``, ``scrollChunks``, ``knnGraph``) and the string vocabularies the
 tools answer with (codes, capabilities, caveats). The tools turn them into JSON;
 nothing here is sent over the wire as-is.
 
@@ -97,7 +97,7 @@ class StoreInfo:
 
 @dataclass(frozen=True)
 class DocumentRow:
-    """One document (one objectId) in a ``listDocuments`` page."""
+    """One document (one objectId) in a ``listDocumentPage`` page."""
 
     objectId: str
     path: str
@@ -117,7 +117,7 @@ class DocumentRow:
 
 @dataclass(frozen=True)
 class DocPage:
-    """One page of ``listDocuments``."""
+    """One page of ``listDocumentPage``."""
 
     items: List[DocumentRow]
     #: Opaque cursor for the next page; None when the listing ended.

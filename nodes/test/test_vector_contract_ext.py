@@ -16,7 +16,7 @@ is implemented, so the app and the drivers can build against it:
 * ``parse_doc_list_filter``: the ``documents`` filter, normalised, and every input
   it refuses with a sentence;
 * the ``documents`` tool reads that filter (a refused one is ``INVALID_INPUT`` and
-  never reaches the store), hands it to ``listDocuments(..., filter=...)`` only when
+  never reaches the store), hands it to ``listDocumentPage(..., filter=...)`` only when
   the driver declares ``documents_filter`` (so the first contract's closed hook
   signatures keep working), and answers ``filter_applied`` / ``filter_ignored``
   from the page's ``DocPage.filter_ignored``: ``'server'``, ``'partial'`` (caveat
@@ -232,7 +232,7 @@ def _library():
 class _ListingFilterStore(ExactListingStore):
     """A driver that is handed the documents filter: it applies the path keys and skips the others.
 
-    ``received`` records the ``filter`` of every ``listDocuments`` call (None when the tool
+    ``received`` records the ``filter`` of every ``listDocumentPage`` call (None when the tool
     left the keyword out); ``also_skipped`` names keys the driver reports though it was not given them.
     """
 
@@ -244,9 +244,9 @@ class _ListingFilterStore(ExactListingStore):
         self.received: List[Optional[DocListFilter]] = []
         self.also_skipped = tuple(also_skipped)
 
-    def listDocuments(self, *, cursor, limit, object_ids, deleted, sort, filter=None) -> DocPage:
+    def listDocumentPage(self, *, cursor, limit, object_ids, deleted, sort, filter=None) -> DocPage:
         self.received.append(filter)
-        page = super().listDocuments(cursor=cursor, limit=limit, object_ids=object_ids, deleted=deleted, sort=sort)
+        page = super().listDocumentPage(cursor=cursor, limit=limit, object_ids=object_ids, deleted=deleted, sort=sort)
         if filter is None:
             return page
 
@@ -267,7 +267,7 @@ def _paths(answer) -> List[str]:
 
 
 def test_list_documents_takes_the_filter_by_keyword_with_none_by_default():
-    parameter = inspect.signature(DocumentStoreBase.listDocuments).parameters['filter']
+    parameter = inspect.signature(DocumentStoreBase.listDocumentPage).parameters['filter']
     assert parameter.kind is inspect.Parameter.KEYWORD_ONLY and parameter.default is None
 
 
@@ -277,8 +277,8 @@ def test_a_page_names_no_ignored_filter_key_unless_its_hook_says_so():
 
 def test_the_base_hook_applies_no_filter_key_and_names_every_given_one():
     store = MemoryStore().seed(_library())
-    plain = store.listDocuments(cursor=None, limit=10, object_ids=None, deleted='active', sort='path')
-    page = store.listDocuments(
+    plain = store.listDocumentPage(cursor=None, limit=10, object_ids=None, deleted='active', sort='path')
+    page = store.listDocumentPage(
         cursor=None,
         limit=10,
         object_ids=None,
@@ -318,7 +318,7 @@ def test_a_store_that_cannot_filter_answers_none_and_leaves_every_key_to_the_app
 
 
 def test_a_driver_with_the_first_contracts_closed_hook_is_never_handed_the_filter():
-    # ExactListingStore overrides listDocuments(*, cursor, limit, object_ids, deleted, sort) as every
+    # ExactListingStore overrides listDocumentPage(*, cursor, limit, object_ids, deleted, sort) as every
     # driver did before section 4.4; handing it filter= would raise TypeError (a STORE_ERROR).
     store = ExactListingStore().seed(_library())
     answer = node(store).documents({'filter': {'path_prefix': 'C:/other/'}})
@@ -385,7 +385,7 @@ def test_a_refused_filter_is_invalid_input_and_never_reaches_the_store(value, se
     answer = node(store).documents({'filter': value})
     assert answer['success'] is False and answer['code'] == 'INVALID_INPUT'
     assert sentence in answer['error']
-    assert store.received == [] and not [call for call in store.calls if call[0] == 'listDocuments']
+    assert store.received == [] and not [call for call in store.calls if call[0] == 'listDocumentPage']
 
 
 _REPO = Path(__file__).resolve().parents[2]
@@ -412,7 +412,7 @@ def _declares_documents_filter(cls: ast.ClassDef) -> bool:
         ("class D:\n    VX_DRIVER_CAPABILITIES: FrozenSet[str] = frozenset({'documents_filter', 'knn_native'})", True),
         ("class D:\n    VX_DRIVER_CAPABILITIES = Base.VX_DRIVER_CAPABILITIES | {'documents_filter'}", True),
         ("class D:\n    VX_DRIVER_CAPABILITIES = frozenset({'documents_sorted'})\n    x = 'documents_filter'", False),
-        ('class D:\n    def listDocuments(self, *, cursor, limit, object_ids, deleted, sort): ...', False),
+        ('class D:\n    def listDocumentPage(self, *, cursor, limit, object_ids, deleted, sort): ...', False),
     ],
 )
 def test_the_guard_below_reads_a_declaration_of_the_filter(source, declared):
@@ -430,7 +430,7 @@ def test_a_driver_that_declares_the_filter_takes_it_in_its_own_list_documents():
         for cls in ast.walk(ast.parse(path.read_text(encoding='utf-8'))):
             if not isinstance(cls, ast.ClassDef):
                 continue
-            hook = next((n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == 'listDocuments'), None)
+            hook = next((n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == 'listDocumentPage'), None)
             if hook is None:
                 continue
             takes = 'filter' in {arg.arg for arg in hook.args.kwonlyargs}

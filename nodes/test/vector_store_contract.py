@@ -258,17 +258,17 @@ def assert_no_connection_details(value: Any) -> None:
 
 
 def list_all(store, *, limit: int = 3, deleted: str = 'active', object_ids: Optional[Sequence[str]] = None):
-    """Every page of listDocuments: (items, pages)."""
+    """Every page of listDocumentPage: (items, pages)."""
     items, pages, cursor = [], [], None
     for _ in range(10000):
-        page = store.listDocuments(cursor=cursor, limit=limit, object_ids=object_ids, deleted=deleted, sort='path')
+        page = store.listDocumentPage(cursor=cursor, limit=limit, object_ids=object_ids, deleted=deleted, sort='path')
         assert_no_connection_details(page)
         pages.append(page)
         items.extend(page.items)
         cursor = page.next_cursor
         if cursor is None:
             return items, pages
-    raise AssertionError('listDocuments did not end')
+    raise AssertionError('listDocumentPage did not end')
 
 
 def check_listing(store, expect: Expect, *, limit: int = 3) -> None:

@@ -6,8 +6,8 @@
 """The Vector Explorer hooks of the Qdrant driver, against the mock client.
 
 Each hook is called the way the explorer tools call it (contract section 2.2):
-``describe``, ``scoreInfo``, ``countChunks``, ``countDocuments``,
-``listDocuments`` (chunk-0 scroll + facet counts + orphan sweep),
+``describe``, ``scoreInfo``, ``countChunks``, ``countDocumentsWhere``,
+``listDocumentPage`` (chunk-0 scroll + facet counts + orphan sweep),
 ``scrollChunks``, ``sampleChunks``, ``getVectors`` (deterministic-id fast path
 with the filter fallback), ``knnGraph`` (Qdrant's ``search_matrix_offsets``)
 and ``removeCounted``. The same assertions run against a live Qdrant in
@@ -96,13 +96,13 @@ def _delete_point(store, pid):
 def _all_pages(store, limit=2, object_ids=None, deleted='active'):
     items, cursor, pages = [], None, []
     for _ in range(50):
-        page = store.listDocuments(cursor=cursor, limit=limit, object_ids=object_ids, deleted=deleted, sort='path')
+        page = store.listDocumentPage(cursor=cursor, limit=limit, object_ids=object_ids, deleted=deleted, sort='path')
         pages.append(page)
         items.extend(page.items)
         cursor = page.next_cursor
         if cursor is None:
             return items, pages
-    raise AssertionError('listDocuments never ended')
+    raise AssertionError('listDocumentPage never ended')
 
 
 # --- capabilities, describe, scoreInfo ------------------------------------------------
@@ -145,8 +145,8 @@ def test_describe_a_missing_collection_never_raises():
     assert info.control_record is None
     assert info.dimension is None and info.model is None
     assert store.countChunks(vx_filter()) == 0
-    assert store.countDocuments(vx_filter()) == 0
-    page = store.listDocuments(cursor=None, limit=10, object_ids=None, deleted='active', sort='path')
+    assert store.countDocumentsWhere(vx_filter()) == 0
+    page = store.listDocumentPage(cursor=None, limit=10, object_ids=None, deleted='active', sort='path')
     assert page.items == [] and page.next_cursor is None and page.total == 0
 
 
@@ -186,7 +186,7 @@ def test_count_documents_counts_distinct_ids_including_orphans():
     store = make_store(drv)
     _corpus(store, docs=3, chunks=3)
     _delete_point(store, drv.point_id_for('doc-1', 0))
-    assert store.countDocuments(vx_filter()) == 3
+    assert store.countDocumentsWhere(vx_filter()) == 3
     assert store.countChunks(vx_filter(chunkIds=[0])) == 2
 
 
@@ -194,11 +194,11 @@ def test_count_documents_answers_none_above_the_cap(monkeypatch):
     store = make_store(drv)
     _corpus(store, docs=5, chunks=1)
     monkeypatch.setattr(drv.Store, 'COUNT_DOCUMENTS_CAP', 3)
-    assert store.countDocuments(vx_filter()) is None
+    assert store.countDocumentsWhere(vx_filter()) is None
 
 
 def test_stats_above_the_document_cap_counts_first_chunks(monkeypatch):
-    # countDocuments is overridden (so dialect says count_documents) yet answers None
+    # countDocumentsWhere is overridden (so dialect says count_documents) yet answers None
     # above COUNT_DOCUMENTS_CAP: stats must fall back on that None, not on the capability.
     from ai.common.store import VectorStoreToolMixin
 
@@ -213,7 +213,7 @@ def test_stats_above_the_document_cap_counts_first_chunks(monkeypatch):
     assert 'documents_by_first_chunk' in answer['caveats']
 
 
-# --- listDocuments --------------------------------------------------------------------
+# --- listDocumentPage --------------------------------------------------------------------
 
 
 def test_list_documents_pages_every_document_once_with_counts():
@@ -300,7 +300,7 @@ def test_list_documents_finds_low_count_orphans_in_a_large_collection():
     assert sorted(i.objectId for i in items if not i.has_first_chunk) == ['orphan-0', 'orphan-1']
     assert {p.total for p in pages} == {1202}
     assert all(p.caveats == ['documents_unsorted'] for p in pages)
-    assert store.countDocuments(vx_filter()) == 1202
+    assert store.countDocumentsWhere(vx_filter()) == 1202
 
 
 def test_list_documents_flags_a_capped_count_and_lists_no_false_orphan(monkeypatch):
@@ -314,7 +314,7 @@ def test_list_documents_flags_a_capped_count_and_lists_no_false_orphan(monkeypat
     assert all(p.total is None for p in pages)
     orphans = {i.objectId for i in items if not i.has_first_chunk}
     assert orphans <= {'doc-3'}  # capped may miss an orphan, never invent one
-    assert store.countDocuments(vx_filter()) is None
+    assert store.countDocumentsWhere(vx_filter()) is None
 
 
 def _capped_orphan_corpus(store):
@@ -395,12 +395,12 @@ def test_list_documents_computes_the_total_once_per_listing(monkeypatch):
         return facet(*args, **kwargs)
 
     monkeypatch.setattr(store.client, 'facet', spy)
-    first = store.listDocuments(cursor=None, limit=2, object_ids=None, deleted='active', sort='path')
+    first = store.listDocumentPage(cursor=None, limit=2, object_ids=None, deleted='active', sort='path')
     assert first.total == 7
     assert max(limits) > 7  # the first page counts every document once
 
     limits.clear()
-    second = store.listDocuments(cursor=first.next_cursor, limit=2, object_ids=None, deleted='active', sort='path')
+    second = store.listDocumentPage(cursor=first.next_cursor, limit=2, object_ids=None, deleted='active', sort='path')
     assert second.total == 7
     assert limits and max(limits) <= 3  # later pages facet over their own objectIds only
 
@@ -426,12 +426,12 @@ def _pages_with_facets(store, monkeypatch, limit=2, cursor=None):
     pages = []
     for _ in range(50):
         calls.clear()
-        page = store.listDocuments(cursor=cursor, limit=limit, object_ids=None, deleted='active', sort='path')
+        page = store.listDocumentPage(cursor=cursor, limit=limit, object_ids=None, deleted='active', sort='path')
         pages.append((page, list(calls)))
         cursor = page.next_cursor
         if cursor is None:
             return pages
-    raise AssertionError('listDocuments never ended')
+    raise AssertionError('listDocumentPage never ended')
 
 
 def test_list_documents_builds_the_orphan_list_once_per_listing(monkeypatch):
@@ -454,17 +454,19 @@ def test_list_documents_rebuilds_the_orphan_list_for_a_cursor_it_does_not_rememb
     # Another instance (or an expired list) answers the same page from a fresh sweep.
     store = make_store(drv)
     _orphan_corpus(store)
-    first = store.listDocuments(cursor=None, limit=2, object_ids=None, deleted='active', sort='path')
-    second = store.listDocuments(cursor=first.next_cursor, limit=2, object_ids=None, deleted='active', sort='path')
-    expected = store.listDocuments(cursor=second.next_cursor, limit=2, object_ids=None, deleted='active', sort='path')
+    first = store.listDocumentPage(cursor=None, limit=2, object_ids=None, deleted='active', sort='path')
+    second = store.listDocumentPage(cursor=first.next_cursor, limit=2, object_ids=None, deleted='active', sort='path')
+    expected = store.listDocumentPage(
+        cursor=second.next_cursor, limit=2, object_ids=None, deleted='active', sort='path'
+    )
 
     other = make_store(drv)
-    page = other.listDocuments(cursor=second.next_cursor, limit=2, object_ids=None, deleted='active', sort='path')
+    page = other.listDocumentPage(cursor=second.next_cursor, limit=2, object_ids=None, deleted='active', sort='path')
     assert [i.objectId for i in page.items] == [i.objectId for i in expected.items]
     assert page.total == expected.total == 8
 
     monkeypatch.setattr(drv.Store, 'ORPHAN_LIST_TTL_S', -1)  # every remembered list has expired
-    page = store.listDocuments(cursor=second.next_cursor, limit=2, object_ids=None, deleted='active', sort='path')
+    page = store.listDocumentPage(cursor=second.next_cursor, limit=2, object_ids=None, deleted='active', sort='path')
     assert [i.objectId for i in page.items] == [i.objectId for i in expected.items]
 
 
@@ -475,7 +477,7 @@ def test_documents_are_counted_without_an_object_id_index():
     _delete_point(store, drv.point_id_for('doc-2', 0))
     Client._collections[store.collection]['payload_schema'].pop('meta.objectId')
 
-    assert store.countDocuments(vx_filter()) == 4
+    assert store.countDocumentsWhere(vx_filter()) == 4
     items, pages = _all_pages(store, limit=3)
     rows = {i.objectId: i for i in items}
     assert set(rows) == {'doc-0', 'doc-1', 'doc-2', 'doc-3'}
@@ -508,7 +510,7 @@ def test_list_documents_refuses_a_cursor_it_did_not_issue(cursor):
     _corpus(store)
     Client.calls.clear()
     with pytest.raises(ToolRefusal) as err:
-        store.listDocuments(cursor=cursor, limit=5, object_ids=None, deleted='active', sort='path')
+        store.listDocumentPage(cursor=cursor, limit=5, object_ids=None, deleted='active', sort='path')
     assert err.value.code == 'INVALID_INPUT'
     assert Client.calls.get('scroll', 0) == 0  # refused before anything reaches the server
 
@@ -517,7 +519,7 @@ def test_list_documents_accepts_a_well_formed_point_id_it_did_not_see():
     # Qdrant starts a scroll at the first id at or after the offset: a valid id is a position, not an error.
     store = make_store(drv)
     _corpus(store, docs=3, chunks=1)
-    page = store.listDocuments(
+    page = store.listDocumentPage(
         cursor=_cursor({'ph': 'c', 'p': '00000000-0000-0000-0000-000000000000'}),
         limit=10,
         object_ids=None,

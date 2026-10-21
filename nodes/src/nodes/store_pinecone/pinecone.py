@@ -986,8 +986,8 @@ class Store(DocumentStoreBase):
             'threshold': self.threshold_search,
         }
 
-    @_backend_errors('listDocuments')
-    def listDocuments(
+    @_backend_errors('listDocumentPage')
+    def listDocumentPage(
         self,
         *,
         cursor: Optional[str],

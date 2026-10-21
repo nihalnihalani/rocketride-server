@@ -56,8 +56,8 @@ class _PagedListing(ExactListingStore):
 
     page_rows = 300
 
-    def listDocuments(self, *, cursor, limit, object_ids, deleted, sort) -> DocPage:
-        return super().listDocuments(
+    def listDocumentPage(self, *, cursor, limit, object_ids, deleted, sort) -> DocPage:
+        return super().listDocumentPage(
             cursor=cursor, limit=min(limit, self.page_rows), object_ids=object_ids, deleted=deleted, sort=sort
         )
 
@@ -65,9 +65,9 @@ class _PagedListing(ExactListingStore):
 class _EndlessListing(VectorMemoryStore):
     """Every page brings one new document (never stored) and a cursor: only the page budget ends it."""
 
-    def listDocuments(self, *, cursor, limit, object_ids, deleted, sort):
-        self.calls.append(('listDocuments', cursor, limit))
-        page = len(_backend_calls(self, 'listDocuments'))
+    def listDocumentPage(self, *, cursor, limit, object_ids, deleted, sort):
+        self.calls.append(('listDocumentPage', cursor, limit))
+        page = len(_backend_calls(self, 'listDocumentPage'))
         if page > 200:
             raise RuntimeError(f'asked for {page} pages: the listing loop does not end')
         row = _store_module.documentRow(make_doc(f'ghost{page:03d}', 0))
@@ -77,8 +77,8 @@ class _EndlessListing(VectorMemoryStore):
 class _UnpageableListing(VectorMemoryStore):
     """A store that lists one page and says it cannot page further (as the base listing does on a repeat)."""
 
-    def listDocuments(self, *, cursor, limit, object_ids, deleted, sort):
-        self.calls.append(('listDocuments', cursor, limit))
+    def listDocumentPage(self, *, cursor, limit, object_ids, deleted, sort):
+        self.calls.append(('listDocumentPage', cursor, limit))
         firsts = [doc for key, doc in self.rows.items() if key[1] == 0 and key[0] != 'schema'][:2]
         rows = [_store_module.documentRow(doc) for doc in firsts]
         return DocPage(rows, None, None, False, True, True, ['documents_paging_unsupported'])
@@ -118,7 +118,7 @@ def test_pages_without_a_new_document_are_stale(store_cls):
     assert listing['reason'] == 'stale' and listing['truncated'] is True
     assert listing['documents'] == (0 if store_cls is _EmptyPageListing else 2)
     assert 'listing_truncated' in answer['caveats']
-    assert len(_backend_calls(store, 'listDocuments')) <= 3
+    assert len(_backend_calls(store, 'listDocumentPage')) <= 3
 
 
 def test_a_store_that_cannot_page_is_a_stale_listing():
@@ -133,7 +133,7 @@ def test_a_listing_that_never_ends_stops_at_its_page_budget():
     pages = 1 + vx_tools.LISTING_SLACK_PAGES
     assert _listing(answer) == {'documents': pages, 'truncated': True, 'reason': 'pages'}
     # The listing's pages, plus the one page that looks up the paths of documents it never listed.
-    assert len(_backend_calls(store, 'listDocuments')) == pages + 1
+    assert len(_backend_calls(store, 'listDocumentPage')) == pages + 1
     assert answer['n'] == 3, 'the refill still draws what the store holds'
 
 
@@ -145,9 +145,9 @@ def test_a_slow_listing_stops_at_its_share_of_the_time_budget(monkeypatch):
     class Slow(_PagedListing):
         page_rows = 2
 
-        def listDocuments(self, **kw):
+        def listDocumentPage(self, **kw):
             clock[0] += page_s
-            return super().listDocuments(**kw)
+            return super().listDocumentPage(**kw)
 
     monkeypatch.setattr(vx_tools, '_monotonic', lambda: clock[0])
     store = Slow().seed(_single_chunk_docs(7))
@@ -172,7 +172,7 @@ def test_a_scope_of_twelve_hundred_documents_is_listed_whole_over_four_pages():
     scope: List[str] = [f'd{i:04d}' for i in range(1200)]
     answer = node(store).sample({'n': 2000, 'seed': 5, 'filter': {'object_ids': scope}})
     assert _listing(answer) == {'documents': 1200, 'truncated': False, 'reason': 'complete'}
-    assert len(_backend_calls(store, 'listDocuments')) == 4
+    assert len(_backend_calls(store, 'listDocumentPage')) == 4
     # Every scoped document has its chunk 0 in the stratified pick: no refill, no bias.
     assert {doc['objectId'] for doc in answer['docs']} == set(scope)
     assert (answer['n'], answer['biased'], answer['strategy_used']) == (1200, False, 'stratified')
@@ -221,7 +221,7 @@ def test_a_scoped_native_sample_counts_the_scope():
 
 def test_a_native_sampler_that_cannot_count_reports_the_documents_it_drew():
     class Uncounted(NativeStratifiedStore):
-        def countDocuments(self, docFilter):
+        def countDocumentsWhere(self, docFilter):
             return None
 
     store = Uncounted().seed(corpus({'a': [0, 1], 'b': [0], 'c': [0, 1, 2]}, dim=8))

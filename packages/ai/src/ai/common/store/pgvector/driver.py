@@ -125,7 +125,7 @@ class PgVectorStore(DocumentStoreBase):
     #: table, directly and through a transaction-mode pooler.
     VX_SUPPORT = 'supported'
 
-    #: ``documents_filter``: ``listDocuments`` applies the documents filter in the statement that pages the keys.
+    #: ``documents_filter``: ``listDocumentPage`` applies the documents filter in the statement that pages the keys.
     VX_DRIVER_CAPABILITIES: FrozenSet[str] = frozenset(
         {'sample_stratified_native', 'documents_distinct', 'documents_sorted', 'search_keyword', 'documents_filter'}
     )
@@ -789,7 +789,7 @@ class PgVectorStore(DocumentStoreBase):
 
         return self._read(work, 0)
 
-    def countDocuments(self, docFilter: DocFilter) -> Optional[int]:
+    def countDocumentsWhere(self, docFilter: DocFilter) -> Optional[int]:
         """Distinct objectIds matching ``docFilter`` (the control record never counts)."""
         statement = self._sql.count_documents(self._where(docFilter))
 
@@ -799,7 +799,7 @@ class PgVectorStore(DocumentStoreBase):
 
         return self._read(work, 0)
 
-    def listDocuments(
+    def listDocumentPage(
         self,
         *,
         cursor: Optional[str],

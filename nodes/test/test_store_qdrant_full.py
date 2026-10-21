@@ -255,7 +255,7 @@ def test_counts(collection):
     store, expect = collection
     assert store.countChunks(_vx_filter()) == expect.chunks
     assert store.countChunks(_vx_filter(chunkIds=[0])) == len(expect.documents) - len(expect.orphans)
-    assert store.countDocuments(_vx_filter()) == len(expect.documents)
+    assert store.countDocumentsWhere(_vx_filter()) == len(expect.documents)
     assert store.count_documents() >= expect.chunks + 1
 
 
@@ -377,10 +377,10 @@ def test_a_cursor_with_a_malformed_point_id_is_refused(new_store):
 
     for point in ('zzz', -1):
         with pytest.raises(ToolRefusal) as err:
-            store.listDocuments(cursor=cursor(point), limit=5, object_ids=None, deleted='active', sort='path')
+            store.listDocumentPage(cursor=cursor(point), limit=5, object_ids=None, deleted='active', sort='path')
         assert err.value.code == 'INVALID_INPUT'
     # A well-formed id is a position: Qdrant starts at the first point at or after it.
-    page = store.listDocuments(
+    page = store.listDocumentPage(
         cursor=cursor('00000000-0000-0000-0000-000000000000'), limit=50, object_ids=None, deleted='active', sort='path'
     )
     assert {i.objectId for i in page.items} == set(expect.documents)
@@ -439,7 +439,7 @@ def test_soft_delete_keeps_the_payload(new_store):
 
 def test_scale_counts(scale_store):
     total = contract.SCALE_DOCS + len(contract.SCALE_ORPHANS)
-    assert scale_store.countDocuments(_vx_filter()) == total
+    assert scale_store.countDocumentsWhere(_vx_filter()) == total
     assert scale_store.countChunks(_vx_filter(chunkIds=[0])) == contract.SCALE_DOCS
     assert scale_store.countChunks(_vx_filter()) == 2 * contract.SCALE_DOCS + len(contract.SCALE_ORPHANS)
 
@@ -463,7 +463,7 @@ def test_scale_orphan_pages_reuse_the_listing_sweep(scale_store, monkeypatch):
     pages, cursor = [], None
     for _ in range(10):
         calls.clear()
-        page = scale_store.listDocuments(cursor=cursor, limit=1, object_ids=scope, deleted='active', sort='path')
+        page = scale_store.listDocumentPage(cursor=cursor, limit=1, object_ids=scope, deleted='active', sort='path')
         pages.append((page, list(calls)))
         cursor = page.next_cursor
         if cursor is None:
@@ -564,7 +564,7 @@ def test_capped_listing_has_no_slow_page_and_never_facets_over_the_counted_ids(c
     seen, orphans, slowest, cursor = [], [], 0.0, None
     for _ in range(documents // 500 + 5):
         started = time.monotonic()
-        page = store.listDocuments(cursor=cursor, limit=500, object_ids=None, deleted='active', sort='path')
+        page = store.listDocumentPage(cursor=cursor, limit=500, object_ids=None, deleted='active', sort='path')
         slowest = max(slowest, time.monotonic() - started)
         assert 'document_count_capped' in page.caveats and page.total is None
         seen += [i.objectId for i in page.items]
@@ -600,4 +600,4 @@ def test_a_missing_collection_answers_without_raising():
     info = store.describe()
     assert info.collection_exists is False and info.control_record is None
     assert store.countChunks(_vx_filter()) == 0
-    assert store.listDocuments(cursor=None, limit=5, object_ids=None, deleted='active', sort='path').items == []
+    assert store.listDocumentPage(cursor=None, limit=5, object_ids=None, deleted='active', sort='path').items == []

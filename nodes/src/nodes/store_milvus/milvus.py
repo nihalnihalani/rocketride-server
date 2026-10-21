@@ -1076,8 +1076,8 @@ class Store(DocumentStoreBase):
         conditions.append(f"meta['objectId'] != '{CONTROL_OBJECT_ID}'")
         return self._countWhere(conditions)
 
-    @_backend_errors('listDocuments')
-    def listDocuments(
+    @_backend_errors('listDocumentPage')
+    def listDocumentPage(
         self,
         *,
         cursor: Optional[str],

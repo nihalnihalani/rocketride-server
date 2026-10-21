@@ -5,7 +5,7 @@
 
 """The optional explorer hooks on ``DocumentStoreBase`` and their shared defaults.
 
-Every vector store driver inherits ``describe``, ``listDocuments``,
+Every vector store driver inherits ``describe``, ``listDocumentPage``,
 ``scrollChunks``, ``knnGraph`` and ``removeCounted`` from the base class and may
 override them natively. These tests drive the defaults through an in-memory
 driver that implements only the abstract API, so they hold for a driver that
@@ -197,8 +197,8 @@ class CountingStore(MemoryStore):
         self.calls.append(('countChunks', docFilter))
         return len(self._live(docFilter))
 
-    def countDocuments(self, docFilter: DocFilter) -> Optional[int]:
-        self.calls.append(('countDocuments', docFilter))
+    def countDocumentsWhere(self, docFilter: DocFilter) -> Optional[int]:
+        self.calls.append(('countDocumentsWhere', docFilter))
         return len({d.metadata.objectId for d in self._live(docFilter)})
 
 
@@ -232,8 +232,8 @@ class ExactListingStore(VectorMemoryStore):
 
     VX_DRIVER_CAPABILITIES = frozenset({'search_keyword', 'documents_distinct', 'documents_sorted'})
 
-    def listDocuments(self, *, cursor, limit, object_ids, deleted, sort) -> DocPage:
-        self.calls.append(('listDocuments', cursor, limit))
+    def listDocumentPage(self, *, cursor, limit, object_ids, deleted, sort) -> DocPage:
+        self.calls.append(('listDocumentPage', cursor, limit))
         groups: Dict[str, List[Doc]] = {}
         for doc in self.rows.values():
             md = doc.metadata
@@ -390,7 +390,7 @@ def test_capabilities_of_a_driver_that_overrides_nothing_is_empty():
 
 def test_capabilities_lists_overridden_hooks_and_driver_constants():
     caps = NativeStratifiedStore().capabilities()
-    assert {'countChunks', 'countDocuments', 'getVectors', 'sampleChunks', 'listDocuments'} <= caps
+    assert {'countChunks', 'countDocumentsWhere', 'getVectors', 'sampleChunks', 'listDocumentPage'} <= caps
     assert {'sample_stratified_native', 'documents_distinct', 'documents_sorted'} <= caps
     assert 'describe' not in caps and 'knnGraph' not in caps
 
@@ -427,7 +427,7 @@ def test_resolve_deleted(flt, expected):
 def test_count_hooks_default_to_none():
     store = seeded()
     assert store.countChunks(DocFilter()) is None
-    assert store.countDocuments(DocFilter()) is None
+    assert store.countDocumentsWhere(DocFilter()) is None
 
 
 def test_get_vectors_and_sample_chunks_default_to_unsupported():
@@ -503,7 +503,7 @@ def test_default_cursor_state_refuses_a_forged_cursor(state):
 def test_list_documents_default_refuses_a_forged_cursor(state):
     store = MemoryStore().seed(corpus({'a': [0], 'b': [0]}))
     with pytest.raises(ToolRefusal) as caught:
-        store.listDocuments(cursor=ds.encodeCursor(state), limit=2, object_ids=None, deleted='active', sort='path')
+        store.listDocumentPage(cursor=ds.encodeCursor(state), limit=2, object_ids=None, deleted='active', sort='path')
     assert caught.value.code == 'INVALID_INPUT'
     assert not [call for call in store.calls if call[0] == 'get']
 
@@ -595,13 +595,13 @@ def test_no_model_compared_yet_is_unknown():
 
 
 # ---------------------------------------------------------------------------
-# listDocuments default
+# listDocumentPage default
 # ---------------------------------------------------------------------------
 
 
 def test_list_documents_default_lists_first_chunks_sorted_within_the_page():
     store = seeded()
-    page = store.listDocuments(cursor=None, limit=10, object_ids=None, deleted='active', sort='path')
+    page = store.listDocumentPage(cursor=None, limit=10, object_ids=None, deleted='active', sort='path')
     assert [row.objectId for row in page.items] == ['a', 'b', 'c']
     assert (page.distinct, page.sorted, page.counts_exact, page.total) == (False, False, False, None)
     assert all(row.chunks is None and row.has_first_chunk for row in page.items)
@@ -610,14 +610,14 @@ def test_list_documents_default_lists_first_chunks_sorted_within_the_page():
 
 def test_list_documents_default_never_lists_the_control_record():
     store = seeded()
-    page = store.listDocuments(cursor=None, limit=10, object_ids=None, deleted='all', sort='path')
+    page = store.listDocumentPage(cursor=None, limit=10, object_ids=None, deleted='all', sort='path')
     assert 'schema' not in [row.objectId for row in page.items]
 
 
 def test_list_documents_default_rows_carry_path_node_and_extras():
     store = MemoryStore()
     store.seed([make_doc('x', 0, path='C:/demo/x.pdf', size=7419, ingestedAt='2026-10-08T18:20:11Z')])
-    row = store.listDocuments(cursor=None, limit=5, object_ids=None, deleted='active', sort='path').items[0]
+    row = store.listDocumentPage(cursor=None, limit=5, object_ids=None, deleted='active', sort='path').items[0]
     assert isinstance(row, DocumentRow)
     assert (row.path, row.nodeId, row.size, row.ingestedAt, row.modifyTime) == (
         'C:/demo/x.pdf',
@@ -631,19 +631,19 @@ def test_list_documents_default_rows_carry_path_node_and_extras():
 
 def test_list_documents_default_pages_with_an_opaque_cursor():
     store = seeded(spec={f'd{i:02d}': [0] for i in range(5)})
-    first = store.listDocuments(cursor=None, limit=2, object_ids=None, deleted='active', sort='path')
+    first = store.listDocumentPage(cursor=None, limit=2, object_ids=None, deleted='active', sort='path')
     assert [r.objectId for r in first.items] == ['d00', 'd01'] and first.next_cursor
-    second = store.listDocuments(cursor=first.next_cursor, limit=2, object_ids=None, deleted='active', sort='path')
+    second = store.listDocumentPage(cursor=first.next_cursor, limit=2, object_ids=None, deleted='active', sort='path')
     assert [r.objectId for r in second.items] == ['d02', 'd03'] and second.next_cursor
-    third = store.listDocuments(cursor=second.next_cursor, limit=2, object_ids=None, deleted='active', sort='path')
+    third = store.listDocumentPage(cursor=second.next_cursor, limit=2, object_ids=None, deleted='active', sort='path')
     assert [r.objectId for r in third.items] == ['d04'] and third.next_cursor is None
 
 
 def test_list_documents_default_on_an_offset_ignoring_backend_ends_with_a_caveat():
     store = seeded(spec={f'd{i:02d}': [0] for i in range(5)}, ignore_offset=True)
-    first = store.listDocuments(cursor=None, limit=2, object_ids=None, deleted='active', sort='path')
+    first = store.listDocumentPage(cursor=None, limit=2, object_ids=None, deleted='active', sort='path')
     assert first.next_cursor
-    second = store.listDocuments(cursor=first.next_cursor, limit=2, object_ids=None, deleted='active', sort='path')
+    second = store.listDocumentPage(cursor=first.next_cursor, limit=2, object_ids=None, deleted='active', sort='path')
     assert second.items == []
     assert second.next_cursor is None
     assert second.caveats == ['documents_paging_unsupported']
@@ -651,16 +651,16 @@ def test_list_documents_default_on_an_offset_ignoring_backend_ends_with_a_caveat
 
 def test_list_documents_default_filters_by_object_ids():
     store = seeded()
-    page = store.listDocuments(cursor=None, limit=10, object_ids=['c', 'a'], deleted='active', sort='path')
+    page = store.listDocumentPage(cursor=None, limit=10, object_ids=['c', 'a'], deleted='active', sort='path')
     assert [r.objectId for r in page.items] == ['a', 'c']
 
 
 def test_list_documents_default_honours_deleted():
     store = seeded()
     store.markDeleted(['b'])
-    active = store.listDocuments(cursor=None, limit=10, object_ids=None, deleted='active', sort='path')
-    deleted = store.listDocuments(cursor=None, limit=10, object_ids=None, deleted='deleted', sort='path')
-    everything = store.listDocuments(cursor=None, limit=10, object_ids=None, deleted='all', sort='path')
+    active = store.listDocumentPage(cursor=None, limit=10, object_ids=None, deleted='active', sort='path')
+    deleted = store.listDocumentPage(cursor=None, limit=10, object_ids=None, deleted='deleted', sort='path')
+    everything = store.listDocumentPage(cursor=None, limit=10, object_ids=None, deleted='all', sort='path')
     assert [r.objectId for r in active.items] == ['a', 'c']
     assert [r.objectId for r in deleted.items] == ['b'] and deleted.items[0].deleted is True
     assert [r.objectId for r in everything.items] == ['a', 'b', 'c']
@@ -670,7 +670,7 @@ def test_list_documents_default_honours_deleted():
 def test_list_documents_and_scroll_chunks_default_read_active_rows_whatever_the_legacy_flag_selects(store_cls):
     store = seeded(store_cls)
     store.markDeleted(['b'])
-    page = store.listDocuments(cursor=None, limit=10, object_ids=None, deleted='active', sort='path')
+    page = store.listDocumentPage(cursor=None, limit=10, object_ids=None, deleted='active', sort='path')
     assert [r.objectId for r in page.items] == ['a', 'c']
     chunks = store.scrollChunks('a', after_chunk=-1, limit=10, deleted='active')
     assert [d.metadata.chunkId for d in chunks.docs] == [0, 1]
@@ -679,7 +679,7 @@ def test_list_documents_and_scroll_chunks_default_read_active_rows_whatever_the_
 
 def test_list_documents_default_asks_for_one_extra_row_to_detect_more():
     store = seeded()
-    store.listDocuments(cursor=None, limit=2, object_ids=None, deleted='active', sort='path')
+    store.listDocumentPage(cursor=None, limit=2, object_ids=None, deleted='active', sort='path')
     flt = [c for c in store.calls if c[0] == 'get'][-1][1]
     assert flt.limit == 3 and flt.chunkIds == [0] and flt.deleted == 'active' and flt.isDeleted is False
 

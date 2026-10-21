@@ -413,7 +413,7 @@ class TestConnections:
         q.embedding = _unit(rng)
         store.searchSemantic(q, s.DocFilter(limit=3))
         store.countChunks(_filter())
-        store.listDocuments(cursor=None, limit=10, object_ids=None, deleted='active', sort='path')
+        store.listDocumentPage(cursor=None, limit=10, object_ids=None, deleted='active', sort='path')
         store.count_documents()
         store.get(s.DocFilter(objectIds=['doc'], limit=10))
         assert store._db.pool_size >= 1  # the pool kept a connection open
@@ -446,7 +446,7 @@ class TestConnections:
                     elif kind == 1:
                         store.countChunks(_filter())
                     elif kind == 2:
-                        store.listDocuments(cursor=None, limit=50, object_ids=None, deleted='active', sort='path')
+                        store.listDocumentPage(cursor=None, limit=50, object_ids=None, deleted='active', sort='path')
                     elif kind == 3:
                         store.get(s.DocFilter(objectIds=['seed-03'], limit=10))
                     else:
@@ -476,7 +476,7 @@ class TestConnections:
         assert not any(t.is_alive() for t in threads), 'a worker hung'
         assert errors == []
         assert counts['reads'] > 20 and counts['writes'] > 0
-        assert store.countDocuments(_filter()) == 10 + counts['writes']
+        assert store.countDocumentsWhere(_filter()) == 10 + counts['writes']
         assert store._db.pool_size <= 4
         assert _idle_in_transaction(admin, table) == 0
 
@@ -706,7 +706,7 @@ class TestReads:
         assert store.get(s.DocFilter(limit=3)) == []
         assert store.getPaths() == {}
         assert store.countChunks(_filter()) == 0
-        assert store.listDocuments(cursor=None, limit=10, object_ids=None, deleted='active', sort='path').items == []
+        assert store.listDocumentPage(cursor=None, limit=10, object_ids=None, deleted='active', sort='path').items == []
         info = store.describe()
         assert info.collection_exists is False and info.control_record is None
 
@@ -737,8 +737,8 @@ class TestHooks:
         for hook in (
             'describe',
             'countChunks',
-            'countDocuments',
-            'listDocuments',
+            'countDocumentsWhere',
+            'listDocumentPage',
             'scrollChunks',
             'sampleChunks',
             'getVectors',
@@ -767,17 +767,17 @@ class TestHooks:
         assert store.countChunks(_filter(deleted='all')) == 5
         assert store.countChunks(_filter(isDeleted=True)) == 5
         assert store.countChunks(_filter(chunkIds=[0], deleted='all')) == 2
-        assert store.countDocuments(_filter()) == 1
-        assert store.countDocuments(_filter(deleted='all')) == 2
+        assert store.countDocumentsWhere(_filter()) == 1
+        assert store.countDocumentsWhere(_filter(deleted='all')) == 2
         store.markActive(['b'])
-        assert store.countDocuments(_filter()) == 2
+        assert store.countDocumentsWhere(_filter()) == 2
 
     def test_list_documents_pages_by_path_with_counts_and_extras(self, dsn, table, stores):
         rng = np.random.default_rng(42)
         store = _open(dsn, table, stores)
         for i, name in enumerate(['delta', 'alpha', 'charlie', 'bravo', 'echo']):
             _ingest(store, rng, name, i + 1, size=100 + i, ingestedAt='2026-10-08T18:20:11Z')
-        first = store.listDocuments(cursor=None, limit=2, object_ids=None, deleted='active', sort='path')
+        first = store.listDocumentPage(cursor=None, limit=2, object_ids=None, deleted='active', sort='path')
         assert [r.objectId for r in first.items] == ['alpha', 'bravo']
         assert (first.total, first.counts_exact, first.distinct, first.sorted) == (5, True, True, True)
         assert first.next_cursor
@@ -791,11 +791,15 @@ class TestHooks:
         )
         assert (alpha.size, alpha.ingestedAt, alpha.nodeId) == (101, '2026-10-08T18:20:11Z', 'chunk_1')
         assert alpha.pointId
-        second = store.listDocuments(cursor=first.next_cursor, limit=2, object_ids=None, deleted='active', sort='path')
+        second = store.listDocumentPage(
+            cursor=first.next_cursor, limit=2, object_ids=None, deleted='active', sort='path'
+        )
         assert [r.objectId for r in second.items] == ['charlie', 'delta']
-        third = store.listDocuments(cursor=second.next_cursor, limit=2, object_ids=None, deleted='active', sort='path')
+        third = store.listDocumentPage(
+            cursor=second.next_cursor, limit=2, object_ids=None, deleted='active', sort='path'
+        )
         assert [r.objectId for r in third.items] == ['echo'] and third.next_cursor is None
-        only = store.listDocuments(cursor=None, limit=10, object_ids=['echo', 'schema'], deleted='all', sort='path')
+        only = store.listDocumentPage(cursor=None, limit=10, object_ids=['echo', 'schema'], deleted='all', sort='path')
         assert [r.objectId for r in only.items] == ['echo'] and only.total == 1
 
     def test_list_documents_counts_once_and_aggregates_only_the_page(self, dsn, table, stores, monkeypatch):
@@ -821,7 +825,7 @@ class TestHooks:
         monkeypatch.setattr(store._sql, 'list_documents', spy_list)
         pages, cursor = [], None
         while True:
-            page = store.listDocuments(cursor=cursor, limit=3, object_ids=None, deleted='active', sort='path')
+            page = store.listDocumentPage(cursor=cursor, limit=3, object_ids=None, deleted='active', sort='path')
             pages.append(page)
             cursor = page.next_cursor
             if cursor is None:
@@ -843,7 +847,7 @@ class TestHooks:
         store = _open(dsn, table, stores)
         _ingest(store, rng, 'a', 1)
         with pytest.raises(ToolRefusal) as err:
-            store.listDocuments(cursor='not-a-cursor', limit=2, object_ids=None, deleted='active', sort='path')
+            store.listDocumentPage(cursor='not-a-cursor', limit=2, object_ids=None, deleted='active', sort='path')
         assert err.value.code == 'INVALID_INPUT'
 
     def test_scroll_chunks_pages_without_embeddings(self, dsn, table, stores):
@@ -1009,7 +1013,7 @@ def _listed(store, flt, *, limit: int = 3, deleted: str = 'active'):
     """Every page of a listing: (objectIds in the store's order, the pages)."""
     pages, cursor = [], None
     while True:
-        page = store.listDocuments(
+        page = store.listDocumentPage(
             cursor=cursor, limit=limit, object_ids=None, deleted=deleted, sort='path', filter=flt
         )
         pages.append(page)
@@ -1072,13 +1076,15 @@ class TestDocumentsFilter:
         store = _open(dsn, table, stores)
         _ingest_library(store, rng)
         md = _doc_filter(file_types=['md'])
-        plain = store.listDocuments(cursor=None, limit=2, object_ids=None, deleted='active', sort='path')
-        first = store.listDocuments(cursor=None, limit=2, object_ids=None, deleted='active', sort='path', filter=md)
+        plain = store.listDocumentPage(cursor=None, limit=2, object_ids=None, deleted='active', sort='path')
+        first = store.listDocumentPage(cursor=None, limit=2, object_ids=None, deleted='active', sort='path', filter=md)
         for cursor, flt in ((plain.next_cursor, md), (first.next_cursor, None)):
             with pytest.raises(ToolRefusal) as err:
-                store.listDocuments(cursor=cursor, limit=2, object_ids=None, deleted='active', sort='path', filter=flt)
+                store.listDocumentPage(
+                    cursor=cursor, limit=2, object_ids=None, deleted='active', sort='path', filter=flt
+                )
             assert err.value.code == 'INVALID_INPUT'
-        rest = store.listDocuments(
+        rest = store.listDocumentPage(
             cursor=first.next_cursor, limit=50, object_ids=None, deleted='active', sort='path', filter=md
         )
         assert {r.objectId for r in first.items + rest.items} == _selected(md) and rest.total == 5
@@ -1191,7 +1197,7 @@ class TestLegacy:
         rng = np.random.default_rng(50)
         _legacy_synthetic(admin, table, rng)
         store = _open(dsn, table, stores)
-        page = store.listDocuments(cursor=None, limit=10, object_ids=None, deleted='active', sort='path')
+        page = store.listDocumentPage(cursor=None, limit=10, object_ids=None, deleted='active', sort='path')
         rows = {r.objectId: r for r in page.items}
         assert set(rows) == {'whole', 'orphan'}
         assert rows['orphan'].has_first_chunk is False and rows['orphan'].chunks == 6
@@ -1216,11 +1222,13 @@ class TestLegacy:
         store = _open(dsn, table, stores)
         s = _schema()
 
-        listed = store.listDocuments(cursor=None, limit=10, object_ids=None, deleted='active', sort='path')
+        listed = store.listDocumentPage(cursor=None, limit=10, object_ids=None, deleted='active', sort='path')
         rows = {r.objectId: r for r in listed.items}
         assert set(rows) == {'whole', 'orphan', 'nullflags'} and listed.total == 3
         assert (rows['nullflags'].chunks, rows['nullflags'].deleted) == (3, False)
-        assert store.listDocuments(cursor=None, limit=10, object_ids=None, deleted='deleted', sort='path').items == []
+        assert (
+            store.listDocumentPage(cursor=None, limit=10, object_ids=None, deleted='deleted', sort='path').items == []
+        )
         got = store.get(s.DocFilter(objectIds=['nullflags'], limit=10))
         assert [d.metadata.chunkId for d in got] == [0, 1, 2]
         assert all(d.metadata.isDeleted is False for d in got)
@@ -1230,7 +1238,7 @@ class TestLegacy:
         assert 'C:/legacy/nullflags.md' in store.getPaths()
         active, deleted, every = (store.countChunks(_filter(deleted=m)) for m in ('active', 'deleted', 'all'))
         assert (active, deleted, every) == (12, 0, 12)
-        assert store.countDocuments(_filter()) == 3
+        assert store.countDocumentsWhere(_filter()) == 3
 
         store.markDeleted(['nullflags'])
         assert store.countChunks(_filter(deleted='deleted')) == 3
@@ -1298,7 +1306,7 @@ class TestLegacy:
         rows = []
         cursor = None
         while True:
-            page = store.listDocuments(cursor=cursor, limit=200, object_ids=None, deleted='active', sort='path')
+            page = store.listDocumentPage(cursor=cursor, limit=200, object_ids=None, deleted='active', sort='path')
             rows.extend(page.items)
             cursor = page.next_cursor
             if cursor is None:
@@ -1352,7 +1360,7 @@ class TestLegacy:
             store = _open(dsn, table, stores)
             assert store.describe().meta_column is False
             flt = _doc_filter(ingested_after='2026-10-01', path_contains='ORPHAN')
-            page = store.listDocuments(
+            page = store.listDocumentPage(
                 cursor=None, limit=10, object_ids=None, deleted='active', sort='path', filter=flt
             )
             assert [r.objectId for r in page.items] == ['orphan'] and page.total == 1

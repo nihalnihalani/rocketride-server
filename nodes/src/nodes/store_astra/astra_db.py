@@ -928,8 +928,8 @@ class Store(DocumentStoreBase):
             return 0
         return self._countWhere(self._notControl(self._convertFilter(docFilter)))
 
-    @_backend_errors('listDocuments')
-    def listDocuments(
+    @_backend_errors('listDocumentPage')
+    def listDocumentPage(
         self,
         *,
         cursor: Optional[str],

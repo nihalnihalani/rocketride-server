@@ -265,8 +265,8 @@ class DocumentStoreBase(ABC):
         'describe',
         'scoreInfo',
         'countChunks',
-        'countDocuments',
-        'listDocuments',
+        'countDocumentsWhere',
+        'listDocumentPage',
         'scrollChunks',
         'sampleChunks',
         'getVectors',
@@ -458,7 +458,7 @@ class DocumentStoreBase(ABC):
         """
         return None
 
-    def countDocuments(self, docFilter: DocFilter) -> Optional[int]:
+    def countDocumentsWhere(self, docFilter: DocFilter) -> Optional[int]:
         """
         Count the distinct objectIds matching ``docFilter`` (control record excluded).
 
@@ -468,7 +468,7 @@ class DocumentStoreBase(ABC):
         """
         return None
 
-    def listDocuments(
+    def listDocumentPage(
         self,
         *,
         cursor: Optional[str],
@@ -1956,7 +1956,7 @@ class VectorStoreToolMixin(VectorExplorerExtTools, VectorExplorerTools):
         ``paths`` maps each path to an objectId as before; the control record is never
         listed. ``offset`` must be 0 or more and ``limit`` 1 or more (at most 1000 are
         returned). On a driver with a native document
-        listing (``listDocuments``), ``entries`` lists every document (path and objectId,
+        listing (``listDocumentPage``), ``entries`` lists every document (path and objectId,
         equal paths not collapsed) and deleted documents are left out. On any other
         driver the answer is the driver's own ``getPaths`` page, as before: the default
         listing pages by offset, which several backends ignore or read as a point id.
@@ -1974,7 +1974,7 @@ class VectorStoreToolMixin(VectorExplorerExtTools, VectorExplorerTools):
         limit = min(limit, _OBJDIR_MAX_LIMIT)
 
         entries: Optional[List[Dict[str, str]]] = None
-        if 'listDocuments' in store.capabilities():
+        if 'listDocumentPage' in store.capabilities():
             try:
                 entries = self._vectordb_objdir_listing(store, parent, offset, limit)
             except StoreUnsupported:
@@ -1996,7 +1996,7 @@ class VectorStoreToolMixin(VectorExplorerExtTools, VectorExplorerTools):
     def _vectordb_objdir_listing(
         store: 'DocumentStoreBase', parent: Any, offset: int, limit: int
     ) -> List[Dict[str, str]]:
-        """``objdir`` entries from a native ``listDocuments``: active documents under ``parent``, paged.
+        """``objdir`` entries from a native ``listDocumentPage``: active documents under ``parent``, paged.
 
         Each document is listed once. Paging ends after ``_OBJDIR_SCAN_MAX`` rows or as
         :class:`ListingGuard` decides (empty or repeated pages, a listing that cannot
@@ -2010,7 +2010,7 @@ class VectorStoreToolMixin(VectorExplorerExtTools, VectorExplorerTools):
         guard = ListingGuard(_OBJDIR_SCAN_MAX, page_size, VECTOR_TOOL_LIMITS['sample_budget_ms'] / 1000.0)
         cursor: Optional[str] = None
         while len(entries) < limit:
-            page = store.listDocuments(
+            page = store.listDocumentPage(
                 cursor=cursor,
                 limit=page_size,
                 object_ids=None,

@@ -6,10 +6,10 @@
 """The Vector Explorer hooks of the Chroma driver, against the mock client.
 
 Each hook is called the way the explorer tools call it (contract section 2.2):
-``describe``, ``scoreInfo``, ``countChunks``, ``listDocuments`` (chunk-0 pages
+``describe``, ``scoreInfo``, ``countChunks``, ``listDocumentPage`` (chunk-0 pages
 by offset + per-page counts + a sweep for documents without chunk 0),
 ``scrollChunks``, ``sampleChunks``, ``getVectors`` and ``removeCounted``.
-``countDocuments`` and ``knnGraph`` keep the shared defaults. The same
+``countDocumentsWhere`` and ``knnGraph`` keep the shared defaults. The same
 assertions run against a live Chroma in ``nodes/test/test_store_chroma_full.py``.
 """
 
@@ -90,13 +90,13 @@ def _delete_row(store, rid):
 def _all_pages(store, limit=2, object_ids=None, deleted='active'):
     items, cursor, pages = [], None, []
     for _ in range(50):
-        page = store.listDocuments(cursor=cursor, limit=limit, object_ids=object_ids, deleted=deleted, sort='path')
+        page = store.listDocumentPage(cursor=cursor, limit=limit, object_ids=object_ids, deleted=deleted, sort='path')
         pages.append(page)
         items.extend(page.items)
         cursor = page.next_cursor
         if cursor is None:
             return items, pages
-    raise AssertionError('listDocuments never ended')
+    raise AssertionError('listDocumentPage never ended')
 
 
 # --- capabilities, describe, scoreInfo ------------------------------------------------
@@ -109,14 +109,14 @@ def test_capabilities():
         'describe',
         'scoreInfo',
         'countChunks',
-        'listDocuments',
+        'listDocumentPage',
         'scrollChunks',
         'sampleChunks',
         'getVectors',
         'removeCounted',
     ):
         assert hook in caps, hook
-    assert 'countDocuments' not in caps and 'knnGraph' not in caps
+    assert 'countDocumentsWhere' not in caps and 'knnGraph' not in caps
     assert {'documents_distinct', 'search_keyword'} <= caps
     assert 'knn_native' not in caps and 'sample_stratified_native' not in caps
     assert set(DocumentStoreBase.VX_HOOKS) >= caps - store.VX_DRIVER_CAPABILITIES
@@ -151,7 +151,7 @@ def test_describe_a_missing_collection_never_raises():
     info = store.describe()
     assert info.collection_exists is False and info.control_record is None
     assert store.countChunks(vx_filter()) == 0
-    page = store.listDocuments(cursor=None, limit=5, object_ids=None, deleted='active', sort='path')
+    page = store.listDocumentPage(cursor=None, limit=5, object_ids=None, deleted='active', sort='path')
     assert page.items == [] and page.next_cursor is None
 
 
@@ -196,7 +196,7 @@ def test_empty_id_lists_answer_nothing_without_asking_the_server():
     store = make_store(drv)
     _corpus(store, docs=2, chunks=2)
     for object_ids in (['schema'], []):
-        page = store.listDocuments(cursor=None, limit=5, object_ids=object_ids, deleted='all', sort='path')
+        page = store.listDocumentPage(cursor=None, limit=5, object_ids=object_ids, deleted='all', sort='path')
         assert page.items == [] and page.next_cursor is None and page.total == 0
     query = QuestionText(text='doc')
     query.embedding = [1.0, 0, 0, 0, 0, 0]
@@ -223,7 +223,7 @@ def test_count_chunks_excludes_the_control_record_and_follows_the_filter():
     assert store.countChunks(vx_filter(deleted='deleted')) == 4
     assert store.countChunks(vx_filter(chunkIds=[0])) == 2
     assert store.countChunks(vx_filter(objectIds=['schema'], deleted='all')) == 0
-    assert store.countDocuments(vx_filter()) is None
+    assert store.countDocumentsWhere(vx_filter()) is None
 
 
 def test_count_chunks_pages_through_large_sets(monkeypatch):
@@ -233,7 +233,7 @@ def test_count_chunks_pages_through_large_sets(monkeypatch):
     assert store.countChunks(vx_filter()) == 15
 
 
-# --- listDocuments --------------------------------------------------------------------
+# --- listDocumentPage --------------------------------------------------------------------
 
 
 def test_list_documents_pages_every_document_once_with_counts():
@@ -334,7 +334,7 @@ def test_list_documents_refuses_a_forged_cursor(cursor):
     store = make_store(drv)
     _corpus(store)
     with pytest.raises(ToolRefusal) as err:
-        store.listDocuments(cursor=cursor, limit=5, object_ids=None, deleted='active', sort='path')
+        store.listDocumentPage(cursor=cursor, limit=5, object_ids=None, deleted='active', sort='path')
     assert err.value.code == 'INVALID_INPUT'
 
 
