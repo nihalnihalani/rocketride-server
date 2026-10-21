@@ -13,7 +13,10 @@ commit added or changed (``day0``); and every file the enrichment backlog names
 * every owned path exists, or is marked new;
 * no path has two owners (a folder glob of one lane never covers another lane's path);
 * every backlog path and every day-0 path has exactly one owner;
-* the checker itself reports each kind of mistake (it is run on broken copies).
+* the checker itself reports each kind of mistake (it is run on broken copies);
+* every vector-ui suite a lane owns is one ``vector-ui:test`` requires (``apps/vector-ui/scripts/tasks.js``):
+  always, or once the module it tests is in the checkout, so a suite dropped at a merge
+  fails the run instead of passing vacuously.
 
 At each gate the per-lane diff is checked from the command line, which lists every
 changed path outside the lane's list and exits 1 when there is one:
@@ -32,6 +35,7 @@ Run the tests: python3 -m unittest discover -s scripts/acceptance/vector-explore
 
 import copy
 import json
+import re
 import subprocess
 import sys
 import unittest
@@ -41,6 +45,9 @@ from typing import Any, Callable, Dict, Iterable, List, Optional
 HERE = Path(__file__).resolve().parent
 LANES_JSON = HERE.parent / 'lanes.json'
 REPO = HERE.parents[3]
+TASKS_JS = REPO / 'apps' / 'vector-ui' / 'scripts' / 'tasks.js'
+#: A vector-ui suite as lanes.json names it.
+SUITE = re.compile(r'^apps/vector-ui/tests/([^/]+\.test\.tsx?)$')
 
 #: The lanes of the wave, in order.
 LANE_IDS = ['E0', 'E1', 'E2', 'E3', 'E4', 'E5', 'E6', 'E7', 'E8', 'E9', 'E10']
@@ -188,6 +195,56 @@ def changed(base: str, tip: str, root: Path = REPO) -> List[str]:
     return [line for line in result.stdout.splitlines() if line]
 
 
+def tasks_suites(text: str) -> Optional[Dict[str, Any]]:
+    """What vector-ui's tasks.js requires: {'always': [suites], 'feature': {suite: module it tests}}, None when unreadable.
+
+    ``ALWAYS_REQUIRED_TESTS`` is a list of suite names; ``FEATURE_TESTS`` an object of
+    ``'suite': 'src/...'`` pairs (a suite required once its module is in the checkout).
+    """
+    always = re.search(r'const ALWAYS_REQUIRED_TESTS = \[(.*?)\];', text, re.S)
+    feature = re.search(r'const FEATURE_TESTS = \{(.*?)\};', text, re.S)
+    if not always or not feature:
+        return None
+    strip = lambda body: re.sub(r'//[^\n]*', '', body)  # noqa: E731 - comment lines name no suite
+    return {
+        'always': re.findall(r"'([^']+)'", strip(always.group(1))),
+        'feature': dict(re.findall(r"'([^']+)'\s*:\s*'([^']+)'", strip(feature.group(1)))),
+    }
+
+
+def suite_problems(
+    doc: Dict[str, Any], suites: Optional[Dict[str, Any]], exists: Callable[[str], bool] = present
+) -> List[str]:
+    """Why vector-ui:test would not hold every lane's suites (empty when it does).
+
+    Every ``apps/vector-ui/tests/*.test.ts(x)`` a lane owns must be required: in
+    ALWAYS_REQUIRED_TESTS, or in FEATURE_TESTS paired with a module some lane owns (the suite
+    is then required once that module is in the checkout). A suite in both lists, a pair whose
+    module no lane owns, and (on this checkout) a module present without its suite are problems.
+    """
+    if suites is None:
+        return ['apps/vector-ui/scripts/tasks.js has no ALWAYS_REQUIRED_TESTS list or FEATURE_TESTS pairs']
+    out: List[str] = []
+    always, feature = suites['always'], suites['feature']
+    owned: Dict[str, List[str]] = {}
+    for lane in doc['lanes']:
+        for path in lane['owns']:
+            match = SUITE.match(path)
+            if match:
+                owned.setdefault(match.group(1), []).append(lane['lane'])
+    for suite, lanes in sorted(owned.items()):
+        if suite not in always and suite not in feature:
+            out.append(f'{suite} ({", ".join(lanes)}) is not required by vector-ui:test')
+    for suite in sorted(set(always) & set(feature)):
+        out.append(f'{suite} is both always required and paired with {feature[suite]}')
+    for suite, module in sorted(feature.items()):
+        if not owners(doc, f'apps/vector-ui/{module}'):
+            out.append(f'{suite} is paired with apps/vector-ui/{module}, which no lane owns')
+        elif exists(f'apps/vector-ui/{module}') and not exists(f'apps/vector-ui/tests/{suite}'):
+            out.append(f'apps/vector-ui/{module} is in the checkout but its suite {suite} is not')
+    return out
+
+
 class LanesFileTests(unittest.TestCase):
     """lanes.json as committed."""
 
@@ -223,6 +280,16 @@ class LanesFileTests(unittest.TestCase):
         ):
             self.assertEqual(owners(self.doc, path), ['E10'], path)
             self.assertIn(path, self.doc['day0'])
+
+    def test_vector_ui_test_requires_every_suite_a_lane_owns(self):
+        suites = tasks_suites(TASKS_JS.read_text(encoding='utf-8'))
+        self.assertIsNotNone(suites, 'tasks.js lists ALWAYS_REQUIRED_TESTS and FEATURE_TESTS')
+        self.assertEqual(suite_problems(self.doc, suites), [])
+        new_suites = sorted(
+            {SUITE.match(p).group(1) for lane in self.doc['lanes'] for p in lane['new'] if SUITE.match(p)}
+        )
+        self.assertEqual(len(new_suites), 20, 'the enrichment adds twenty suites')
+        self.assertEqual(sorted(suites['feature']), new_suites, 'each new suite is required once its module is in')
 
 
 class Day0AndOrderTests(unittest.TestCase):
@@ -339,6 +406,55 @@ class CheckerTests(unittest.TestCase):
         self.assertEqual(outside(doc, 'E1', []), [])
         with self.assertRaises(ValueError):
             outside(doc, 'E11', changed_paths)
+
+    def test_the_suite_checker_reports_each_kind_of_mistake(self):
+        doc = self.sound()
+        doc['lanes'][1]['owns'] += [
+            'apps/vector-ui/tests/a.test.ts',
+            'apps/vector-ui/tests/b.test.tsx',
+            'apps/vector-ui/src/b.ts',
+        ]
+        sound = {'always': ['a.test.ts'], 'feature': {'b.test.tsx': 'src/b.ts'}}
+        self.assertEqual(suite_problems(doc, sound, exists=lambda path: True), [])
+        self.assertEqual(
+            suite_problems(doc, sound, exists=lambda path: False), [], 'nothing of the feature in the checkout yet'
+        )
+        cases = {
+            'not required': (
+                {'always': [], 'feature': {'b.test.tsx': 'src/b.ts'}},
+                lambda path: True,
+                'a.test.ts (E1) is not required',
+            ),
+            'both lists': (
+                {'always': ['a.test.ts', 'b.test.tsx'], 'feature': {'b.test.tsx': 'src/b.ts'}},
+                lambda path: True,
+                'both always required and paired',
+            ),
+            'unowned module': (
+                {'always': ['a.test.ts'], 'feature': {'b.test.tsx': 'src/c.ts'}},
+                lambda path: True,
+                'which no lane owns',
+            ),
+            'module without its suite': (
+                sound,
+                lambda path: not path.endswith('b.test.tsx'),
+                'is in the checkout but its suite b.test.tsx is not',
+            ),
+            'no lists': (None, lambda path: True, 'has no ALWAYS_REQUIRED_TESTS'),
+        }
+        for what, (suites, exists, words) in cases.items():
+            found = suite_problems(doc, suites, exists=exists)
+            self.assertTrue(any(words in line for line in found), f'{what}: {found}')
+
+    def test_the_suite_lists_are_read_from_tasks_js_without_its_comments(self):
+        text = (
+            "const ALWAYS_REQUIRED_TESTS = [\n\t// a comment 'x.test.ts'\n\t'a.test.ts',\n\t'b.test.tsx',\n];\n"
+            "const FEATURE_TESTS = {\n\t// 'y.test.ts': 'src/y.ts'\n\t'c.test.ts': 'src/vector/c.ts',\n};\n"
+        )
+        self.assertEqual(
+            tasks_suites(text), {'always': ['a.test.ts', 'b.test.tsx'], 'feature': {'c.test.ts': 'src/vector/c.ts'}}
+        )
+        self.assertIsNone(tasks_suites('const REQUIRED_TESTS = [];'))
 
     def test_a_folder_glob_covers_its_folder_only(self):
         self.assertTrue(covers('a/b/**', 'a/b/c'))

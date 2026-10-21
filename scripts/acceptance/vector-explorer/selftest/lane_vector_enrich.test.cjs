@@ -169,7 +169,7 @@ const lane = require('../browser/lane_vector_enrich.cjs');
 const E = require('../env.cjs');
 
 // GE3's enrichment steps (ENRICHED_SPEC 4.1), each of which the lane must run on every backend.
-const GE3 = [/clusters \(P0-1\)/, /Minimum size 2/, /Ask about these/, /edges \(P0-3\)/, /colour by ingest date \(P1-3\)/, /isolate \(P1-4\)/, /text \(P1-6\)/, /recommend \(P1-1\)/, /Best score/, /matrix \(P1-2\)/, /export \(P0-6\)/, /map PNG/, /views \(P1-5\)/, /duplicates queue \(P0-4\)/, /outliers \(P1-8\)/, /charts \(P0-7\)/, /scope \(P0-2\)/, /Keyword finds KX4471/, /threshold slider/, /Compare/, /55 %/, /duplicates removal/, /outlier removal/, /ingest summary \(P1-9\)/, /restore/, /sign-out/, /privacy \(B4\)/];
+const GE3 = [/clusters \(P0-1\)/, /Minimum size 2/, /Ask about these/, /edges \(P0-3\)/, /colour by ingest date \(P1-3\)/, /isolate \(P1-4\)/, /text \(P1-6\)/, /recommend \(P1-1\)/, /Best score/, /matrix \(P1-2\)/, /export \(P0-6\)/, /map PNG/, /views \(P1-5\)/, /duplicates queue \(P0-4\)/, /outliers \(P1-8\)/, /charts \(P0-7\)/, /scope \(P0-2\)/, /clearing the scope/, /Keyword finds KX4471/, /threshold slider/, /Compare/, /55 %/, /duplicates removal/, /outlier removal/, /ingest summary \(P1-9\)/, /restore/, /sign-out/, /privacy \(B4\)/];
 // Steps that belong to some backends only.
 const ONLY = { qdrant: [/scope of 600/, /listing \(the scope card\)/], chroma: [/scope of 600/, /listing \(the scope card\)/], postgres: [/health \(P1-7\)/] };
 
@@ -225,6 +225,235 @@ test('lane_vector_enrich: run by vector-ui:e2e-live it covers the named backends
 test('the lane writes lane_vector_enrich.json into its output folder (the file vector-ui:e2e-live reads)', () => {
 	const source = fs.readFileSync(path.join(ACC, 'browser', 'lane_vector_enrich.cjs'), 'utf8');
 	assert.ok(source.includes("path.join(out, 'lane_vector_enrich.json')"));
+});
+
+test('vector-ui:e2e-live runs the enrichment lane when it is named, with the backends, and leaves it out of the default and of all', async () => {
+	// It removes and puts back demo documents, so a run opts in by name.
+	const tasks = require(path.join(ACC, '..', '..', '..', 'apps', 'vector-ui', 'scripts', 'tasks.js'));
+	const ENV = { ENGINE_URL: 'http://127.0.0.1:5650/' };
+	assert.deepStrictEqual(tasks.e2e.planE2e({ ...ENV, VECTOR_UI_E2E_LANES: 'enrich' }).lanes, [{ name: 'enrich', script: 'lane_vector_enrich.cjs' }]);
+	assert.deepStrictEqual(
+		tasks.e2e.planE2e({ ...ENV, VECTOR_UI_E2E_LANES: 'vector,enrich' }).lanes.map((l) => l.name),
+		['vector', 'enrich']
+	);
+	assert.deepStrictEqual(
+		tasks.e2e.planE2e(ENV).lanes.map((l) => l.name),
+		['vector', 'perf']
+	);
+	assert.deepStrictEqual(
+		tasks.e2e.planE2e({ ...ENV, VECTOR_UI_E2E_LANES: 'all' }).lanes.map((l) => l.name),
+		['vector', 'perf']
+	);
+	assert.throws(() => tasks.e2e.planE2e({ ...ENV, VECTOR_UI_E2E_LANES: 'graph' }), /Unknown lane "graph".*vector, perf, all, enrich/);
+	assert.ok(fs.existsSync(path.join(tasks.e2e.ACCEPTANCE_BROWSER_DIR, tasks.e2e.OPT_IN_LANES.enrich)));
+	const outDir = fs.mkdtempSync(path.join(os.tmpdir(), 'vx-enrich-e2e-'));
+	try {
+		const plan = tasks.e2e.planE2e({ ...ENV, OUT_DIR: outDir, VECTOR_UI_E2E_LANES: 'vector,enrich', VECTOR_UI_E2E_BACKENDS: 'qdrant,chroma' });
+		const calls = [];
+		const exec = async (args) => {
+			calls.push(args);
+			const [script, , out] = args;
+			fs.mkdirSync(out, { recursive: true });
+			const name = `${path.basename(script, '.cjs')}.json`;
+			fs.writeFileSync(path.join(out, name), JSON.stringify([{ browser: 'chrome', backend: 'qdrant', name: 'clusters', status: path.basename(script) === 'lane_vector_enrich.cjs' ? 'FAIL' : 'PASS' }]));
+			if (path.basename(script) === 'lane_vector_enrich.cjs') throw new Error('Command failed (exit 1)');
+			return undefined;
+		};
+		await assert.rejects(tasks.e2e.runLanes(plan, { exec }), (error) => {
+			assert.match(error.message, /^1 of 2 lane runs failed/m);
+			assert.match(error.message, /lane_vector_enrich\.cjs \(chrome\): 1 failed row in lane_vector_enrich\.json:\n {2}qdrant: clusters$/m);
+			return true;
+		});
+		assert.deepStrictEqual(
+			calls.map((args) => [path.basename(args[0]), ...args.slice(4)]),
+			[
+				['lane_vector.cjs', 'qdrant,chroma'],
+				['lane_vector_enrich.cjs', 'qdrant,chroma'],
+			]
+		);
+	} finally {
+		fs.rmSync(outDir, { recursive: true, force: true });
+	}
+});
+
+// ---------------------------------------------------------------------------
+// Fail-closed: a planned step the lane never recorded fails, in the lane and in vector-ui:e2e-live
+// ---------------------------------------------------------------------------
+
+/** A map reading as the lane takes it (mapReading in the lane): settled on the demo collection's 308-point unscoped sample unless `extra` says otherwise. */
+const mapReading = (extra = {}) => ({ state: 'ready', busy: '', pending: [], sample: { index: 40, n: 308, scoped: false, success: true }, shown: 308, queryA: 'none', queryB: 'none', legend: 'Showing 308 of 308 chunks (random sample)', ...extra });
+/** The Compare step's second question. */
+const QUESTION_B = 'How is the station powered in winter?';
+
+/** Rows of a backend that ran every planned step and passed it. */
+const passingRows = (key) => lane.stepsFor(key).map((s) => ({ fixture: key, name: lane.STEP_TITLES[s], status: 'PASS' }));
+
+test('every planned step has its own title, and the lane runs each step by its title', () => {
+	const keys = [...new Set(lane.BACKENDS.flatMap((key) => lane.stepsFor(key)))];
+	assert.deepStrictEqual(
+		keys.filter((k) => typeof lane.STEP_TITLES[k] !== 'string'),
+		[],
+		'planned steps without a title'
+	);
+	assert.deepStrictEqual(Object.keys(lane.STEP_TITLES).sort(), [...keys].sort(), 'titles of steps no backend plans');
+	const titles = Object.values(lane.STEP_TITLES);
+	assert.strictEqual(new Set(titles).size, titles.length, 'two steps share a title');
+	// main names each step through the table, so the steps it never reached are found by title.
+	const source = fs.readFileSync(path.join(ACC, 'browser', 'lane_vector_enrich.cjs'), 'utf8');
+	const calls = [...source.matchAll(/await step\(page, ([^,]+),/g)].map((m) => m[1]);
+	assert.ok(calls.length >= keys.length, `${calls.length} step calls for ${keys.length} planned steps`);
+	assert.deepStrictEqual(
+		calls.filter((c) => !/^STEP_TITLES\[(['"]).+\1\]$/.test(c)),
+		[],
+		'step calls not named through STEP_TITLES'
+	);
+	assert.deepStrictEqual([...new Set(calls.map((c) => c.slice(13, -2)))].sort(), [...keys].sort(), 'the steps main runs are the planned ones');
+});
+
+test('unrecordedRows: each planned step the lane never recorded is a FAIL row, and a thrown error its own lane row', () => {
+	const planned = lane.stepsFor('qdrant');
+	const all = passingRows('qdrant');
+	assert.deepStrictEqual(lane.unrecordedRows('qdrant', planned, all, null), []);
+	// Sign-in threw: nothing recorded.
+	const none = lane.unrecordedRows('qdrant', planned, [], new Error('locator.waitFor: Timeout 20000ms exceeded'));
+	assert.strictEqual(none.length, planned.length + 1);
+	assert.ok(
+		none.every((r) => r.status === 'FAIL' && r.fixture === 'qdrant'),
+		JSON.stringify(none.slice(0, 2))
+	);
+	assert.deepStrictEqual(
+		none.filter((r) => r.name !== 'lane').map((r) => r.name),
+		planned.map((s) => lane.STEP_TITLES[s])
+	);
+	assert.match(none.find((r) => r.name === 'lane').detail, /Timeout 20000ms/);
+	assert.match(none[0].detail, /not run/);
+	// Stopped after five steps, no error: the rest fail, and no lane row.
+	const part = lane.unrecordedRows('qdrant', planned, all.slice(0, 5), null);
+	assert.deepStrictEqual(
+		part.map((r) => r.name),
+		planned.slice(5).map((s) => lane.STEP_TITLES[s])
+	);
+	// A row recorded under another name does not stand in for a planned step.
+	assert.strictEqual(lane.unrecordedRows('qdrant', planned, [...all.slice(1), { fixture: 'qdrant', name: 'clusters', status: 'PASS' }], null).length, 1);
+});
+
+test('e2eBackendRows: a backend fails when its child wrote no result, fewer rows than it planned, or exited non-zero', () => {
+	const fails = (rows) => rows.filter((r) => r.status !== 'PASS');
+	assert.deepStrictEqual(fails(lane.e2eBackendRows('postgres', 0, passingRows('postgres'))), []);
+	const empty = fails(lane.e2eBackendRows('qdrant', 1, []));
+	assert.strictEqual(empty.length, lane.stepsFor('qdrant').length + 1, 'an empty result');
+	assert.match(empty.find((r) => r.name === 'lane').detail, new RegExp(`exited 1 having recorded 0 of its ${lane.stepsFor('qdrant').length} planned steps`));
+	assert.strictEqual(fails(lane.e2eBackendRows('qdrant', 1, null)).length, lane.stepsFor('qdrant').length + 1, 'no result');
+	const short = fails(lane.e2eBackendRows('chroma', 0, passingRows('chroma').slice(0, -3)));
+	assert.strictEqual(short.length, 4, 'three planned steps missing, and how the lane ended');
+	assert.match(short[3].detail, new RegExp(`exited 0 having recorded ${lane.stepsFor('chroma').length - 3} of its ${lane.stepsFor('chroma').length}`));
+	// The child's own lane row (it threw, and said so) is not repeated.
+	const own = [...lane.unrecordedRows('postgres', lane.stepsFor('postgres'), [], new Error('boom'))];
+	assert.strictEqual(fails(lane.e2eBackendRows('postgres', 1, own)).length, own.length);
+	const exited = fails(lane.e2eBackendRows('chroma', 1, passingRows('chroma')));
+	assert.deepStrictEqual(
+		exited.map((r) => r.name),
+		['lane'],
+		'every row passed but the child exited 1'
+	);
+	assert.match(exited[0].detail, /exited 1/);
+	assert.strictEqual(fails(lane.e2eBackendRows('chroma', null, passingRows('chroma'))).length, 1, 'killed by a signal');
+	// A failed step already carries the non-zero exit: no extra lane row.
+	const one = passingRows('chroma');
+	one[2] = { ...one[2], status: 'FAIL' };
+	assert.strictEqual(fails(lane.e2eBackendRows('chroma', 1, one)).length, 1);
+});
+
+test('runForE2e: a backend whose child wrote [] fails the run, with a FAIL row for each of its planned steps', () => {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'vx-enrich-e2e-'));
+	try {
+		const fixtures = ['qdrant', 'postgres', 'chroma', 'rocketride_vector'];
+		/** A stand-in child: writes `written(key)` into the backend's folder and exits `status(key)`. */
+		const spawn = (written, status) => (_exe, argv) => {
+			const [sub, key] = argv.slice(-2);
+			fs.mkdirSync(sub, { recursive: true });
+			const rows = written(key);
+			if (rows !== undefined) fs.writeFileSync(path.join(sub, 'lane_vector_enrich.json'), JSON.stringify(rows));
+			return { status: status(key) };
+		};
+		const run = (written, status) => {
+			const log = console.log;
+			console.log = () => {};
+			try {
+				const code = lane.runForE2e({ base: 'http://127.0.0.1:9', out: dir, browser: 'chrome', fixtures }, spawn(written, status));
+				return { code, rows: JSON.parse(fs.readFileSync(path.join(dir, 'lane_vector_enrich.json'), 'utf8')) };
+			} finally {
+				console.log = log;
+			}
+		};
+		const sound = run(passingRows, () => 0);
+		assert.strictEqual(sound.code, 0);
+		assert.deepStrictEqual([...new Set(sound.rows.map((r) => r.backend))], fixtures);
+		// qdrant's sign-in timed out (its child wrote [] and exited 1); the other three passed.
+		const empty = run(
+			(key) => (key === 'qdrant' ? [] : passingRows(key)),
+			(key) => (key === 'qdrant' ? 1 : 0)
+		);
+		assert.strictEqual(empty.code, 1);
+		const qdrant = empty.rows.filter((r) => r.backend === 'qdrant');
+		assert.strictEqual(qdrant.length, lane.stepsFor('qdrant').length + 1);
+		assert.ok(qdrant.every((r) => r.status === 'FAIL' && r.browser === 'chrome'));
+		// A child that wrote nothing at all, and one that stopped part way.
+		assert.strictEqual(
+			run(
+				(key) => (key === 'chroma' ? undefined : passingRows(key)),
+				() => 0
+			).code,
+			1
+		);
+		assert.strictEqual(
+			run(
+				(key) => (key === 'postgres' ? passingRows(key).slice(0, 4) : passingRows(key)),
+				() => 0
+			).code,
+			1
+		);
+		assert.strictEqual(run(passingRows, (key) => (key === 'rocketride_vector' ? 1 : 0)).code, 1);
+	} finally {
+		fs.rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test('lane_vector_enrich: a run whose sign-in throws records every planned step as FAIL, and the error', () => {
+	// A stand-in Playwright whose page.goto rejects (the engine is not there): main throws before its first step.
+	const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vx-enrich-throw-'));
+	try {
+		const pw = path.join(tmp, 'pw', 'node_modules', 'playwright');
+		fs.mkdirSync(pw, { recursive: true });
+		fs.writeFileSync(
+			path.join(pw, 'index.js'),
+			`'use strict';
+const handler = {
+	get(_t, prop) {
+		if (prop === 'then') return undefined;
+		if (prop === 'goto') return async () => { throw new Error('page.goto: net::ERR_CONNECTION_REFUSED'); };
+		if (prop === 'on') return () => undefined;
+		return fake;
+	},
+	apply() { return fake; },
+};
+const fake = new Proxy(function () {}, handler);
+module.exports = { chromium: fake };
+`
+		);
+		const out = path.join(tmp, 'out');
+		const res = spawnSync(process.execPath, [path.join(ACC, 'browser', 'lane_vector_enrich.cjs'), 'http://127.0.0.1:9', out, 'chroma'], { encoding: 'utf8', timeout: 60000, env: { ...process.env, PLAYWRIGHT_DIR: path.join(tmp, 'pw'), CLIENT_TS_DIR: path.join(tmp, 'no-client') } });
+		assert.notStrictEqual(res.status, 0);
+		const rows = JSON.parse(fs.readFileSync(path.join(out, 'lane_vector_enrich.json'), 'utf8'));
+		assert.deepStrictEqual(
+			rows.filter((r) => r.name !== 'lane').map((r) => r.name),
+			lane.stepsFor('chroma').map((s) => lane.STEP_TITLES[s])
+		);
+		assert.ok(rows.every((r) => r.status === 'FAIL'));
+		assert.match(rows.find((r) => r.name === 'lane').detail, /ERR_CONNECTION_REFUSED/);
+	} finally {
+		fs.rmSync(tmp, { recursive: true, force: true });
+	}
 });
 
 test("the lane's planted facts and its own cards are the generator's", () => {
@@ -347,6 +576,50 @@ test("edgesVerdict: the tree is n minus the components, neighbours at most 5n, h
 	for (const [what, change] of Object.entries({ 'tree count': { tree: 19 }, 'no neighbour edges': { neighbours5: 0 }, 'too many': { neighbours5: 101 }, 'no hover': { hovered: null }, 'no selection': { selected: null }, 'expand count': { expanded: 5 }, 'no graph': { sample: sampleOf({ knn: undefined }) } })) assert.notStrictEqual(lane.edgesVerdict({ ...sound, ...change }), true, what);
 	// A point with no neighbour (noise) cannot be expanded.
 	assert.notStrictEqual(lane.edgesVerdict({ ...sound, selected: 18, expanded: 0 }), true);
+	assert.notStrictEqual(lane.edgesVerdict({ ...sound, hovered: 0 }), true, 'the hover drew no more with the edges on than off');
+});
+
+test('matrixCluster: the largest group of at most the matrix cap that holds two chunks of one document', () => {
+	const sample = sampleOf();
+	// Group 0 is the manual (6 points, one document): it fits and has same-document pairs.
+	assert.deepStrictEqual(lane.matrixCluster(sample), { cluster: 0, size: 6 });
+	assert.strictEqual(lane.MATRIX_MAX, 100);
+	// Over the cap the next group that fits is taken; with every group one point per document none is.
+	assert.deepStrictEqual(lane.matrixCluster(sample, 5, 5), { cluster: 1, size: 5 });
+	const spread = sampleOf({ points: { ...sampleOf().points, doc: DOC_OF.map((_, i) => i % 7) } });
+	assert.strictEqual(lane.matrixCluster(spread), null, 'every group holds one chunk per document');
+	assert.strictEqual(lane.matrixCluster(sampleOf({ clusters: undefined })), null);
+});
+
+test('csvTable reads past the byte-order mark the app writes first', () => {
+	assert.deepStrictEqual(lane.csvTable('\uFEFFobjectId,chunkId\r\na,1\r\n').header, ['objectId', 'chunkId']);
+	assert.strictEqual(lane.csvTable('\uFEFFobjectId,chunkId\r\na,1\r\n').rows.length, 1);
+});
+
+test("thresholdPositions and thresholdVerdict: positions from the answer's scores, every row passing at the first and fewer at the second", () => {
+	// Scores all above 0.6 (no row fails at 0.60): low stays 0.30, high goes above the median.
+	assert.deepStrictEqual(lane.thresholdPositions([0.71, 0.66, 0.68, 0.74, 0.69]), { low: 0.3, high: 0.7 });
+	// A row under 0.30: low drops to its floor so every row passes there.
+	assert.deepStrictEqual(lane.thresholdPositions([0.25, 0.4, 0.5]), { low: 0.25, high: 0.41 });
+	// One score: high is above it.
+	assert.deepStrictEqual(lane.thresholdPositions([0.55]), { low: 0.3, high: 0.56 });
+	assert.strictEqual(lane.thresholdPositions([]), null);
+	assert.strictEqual(lane.thresholdPositions([null, 'x']), null);
+	const at = { low: 0.3, high: 0.7 };
+	const low = 'At 0.30: 5 of 5 would pass (the store node has no threshold set)';
+	const high = 'At 0.70: 2 of 5 would pass (the store node has no threshold set)';
+	assert.strictEqual(lane.thresholdVerdict({ low, high, copied: 'threshold_search: 0.70', at }), true);
+	assert.notStrictEqual(lane.thresholdVerdict({ low, high: 'At 0.70: 5 of 5 would pass', copied: 'threshold_search: 0.70', at }), true, 'no fewer at high');
+	assert.notStrictEqual(lane.thresholdVerdict({ low, high, copied: 'threshold_search: 0.60', at }), true, 'another value copied');
+	assert.notStrictEqual(lane.thresholdVerdict({ low, high: high.replace('0.70', '0.60'), copied: 'threshold_search: 0.70', at }), true, 'the slider did not move there');
+});
+
+test('hoverEdgePixels: what the hover adds over its edges is the overlay difference with the edges on less the one with them off', () => {
+	// The ring alone adds 60 pixels; with the edges on the hover also draws its thicker edges (140 pixels).
+	assert.strictEqual(lane.hoverEdgePixels({ withEdges: { away: 10, over: 210 }, without: { away: 10, over: 70 } }), 140);
+	// The ring and nothing else: the edges were not thickened.
+	assert.strictEqual(lane.hoverEdgePixels({ withEdges: { away: 10, over: 70 }, without: { away: 10, over: 70 } }), 0);
+	for (const broken of [null, {}, { withEdges: { away: 1, over: 2 } }, { withEdges: { away: 1, over: null }, without: { away: 1, over: 2 } }]) assert.strictEqual(lane.hoverEdgePixels(broken), null, JSON.stringify(broken));
 });
 
 test('rampVerdict: the dated ramp names the first and last ingest day of the sampled documents', () => {
@@ -360,9 +633,57 @@ test('rampVerdict: the dated ramp names the first and last ingest day of the sam
 });
 
 test('isolateVerdict: shown points follow the selection, the table, Expand and Show all', () => {
-	const sound = { n: 1000, selection: 40, isolated: { shown: 40, flag: '1' }, tableRows: 40, expanded: 95, all: { shown: 1000, flag: '0' } };
+	// What Isolate and Show all framed: the camera once the points stopped, and the one Fit gives then.
+	const framing = { isolate: { camera: '2d:0.1,-0.2,412.5', fitted: '2d:0.1,-0.2,412.5' }, showAll: { camera: '2d:0,0,198', fitted: '2d:0,0,198' } };
+	const sound = { n: 1000, selection: 40, isolated: { shown: 40, flag: '1' }, tableRows: 40, expanded: 95, all: { shown: 1000, flag: '0' }, framing };
 	assert.strictEqual(lane.isolateVerdict(sound), true);
-	for (const [what, change] of Object.entries({ 'nothing selected': { selection: 0 }, 'everything selected': { selection: 1000 }, 'not isolated': { isolated: { shown: 1000, flag: '0' } }, 'table rows': { tableRows: 1000 }, 'expand did nothing': { expanded: 40 }, 'show all short': { all: { shown: 999, flag: '0' } }, 'still isolated': { all: { shown: 1000, flag: '1' } } })) assert.notStrictEqual(lane.isolateVerdict({ ...sound, ...change }), true, what);
+	const broken = {
+		'nothing selected': { selection: 0 },
+		'everything selected': { selection: 1000 },
+		'not isolated': { isolated: { shown: 1000, flag: '0' } },
+		'table rows': { tableRows: 1000 },
+		'expand did nothing': { expanded: 40 },
+		'show all short': { all: { shown: 999, flag: '0' } },
+		'still isolated': { all: { shown: 1000, flag: '1' } },
+		// The app fitted the camera to where the points were before they moved: Fit then moves it.
+		'Isolate framed the points before they moved': { framing: { ...framing, isolate: { camera: '2d:-0.6,0.3,1650', fitted: '2d:0.1,-0.2,412.5' } } },
+		'Show all framed the points before they moved': { framing: { ...framing, showAll: { camera: '2d:1.9,-0.8,61.2', fitted: '2d:0,0,198' } } },
+		'no camera read': { framing: { ...framing, isolate: { camera: '', fitted: '' } } },
+		'framing not read': { framing: undefined },
+	};
+	for (const [what, change] of Object.entries(broken)) assert.notStrictEqual(lane.isolateVerdict({ ...sound, ...change }), true, what);
+	assert.match(lane.isolateVerdict({ ...sound, ...broken['Isolate framed the points before they moved'] }), /after Isolate .*Fit then moves it/);
+});
+
+test('fitVerdict: the camera a Fit gave is the one a second Fit gives (the points had stopped moving)', () => {
+	assert.strictEqual(lane.fitVerdict({ camera: '2d:0,0,412.5', refit: '2d:0,0,412.5' }), true);
+	assert.match(lane.fitVerdict({ camera: '2d:0.1,0,98.2', refit: '2d:0,0,412.5' }), /second Fit/);
+	assert.match(lane.fitVerdict({ camera: '', refit: '' }), /no camera/);
+	assert.match(lane.fitVerdict({ camera: null, refit: null }), /no camera/);
+	assert.match(lane.fitVerdict(null), /no camera/);
+});
+
+test('lassoShareVerdict: a lasso over part of the fitted map takes some of the points drawn, one over all of it every one', () => {
+	assert.strictEqual(lane.lassoShareVerdict({ share: 0.5, selected: 150, shown: 308 }), true);
+	// The whole sample in the left half: the map is not spread across the canvas (drawn small at its left).
+	assert.match(lane.lassoShareVerdict({ share: 0.5, selected: 308, shown: 308 }), /every one of the 308/);
+	assert.match(lane.lassoShareVerdict({ share: 0.5, selected: 0, shown: 308 }), /no point/);
+	assert.match(lane.lassoShareVerdict({ share: 0.5, selected: null, shown: 308 }), /no point/);
+	assert.strictEqual(lane.lassoShareVerdict({ share: 1, selected: 79, shown: 79 }), true);
+	// The whole canvas over one group shown alone took a patch of it: the camera did not show the whole group.
+	assert.match(lane.lassoShareVerdict({ share: 1, selected: 14, shown: 79 }), /14 of the 79/);
+	assert.notStrictEqual(lane.lassoShareVerdict({ share: 0.5, selected: 10, shown: null }), true);
+	assert.notStrictEqual(lane.lassoShareVerdict({ share: 1, selected: 0, shown: 0 }), true);
+});
+
+test('matrixLassoVerdict: the lasso over a group shown alone selects exactly the group', () => {
+	const group = { cluster: 0, size: 79 };
+	assert.strictEqual(lane.matrixLassoVerdict({ group, shown: 79, selected: 79 }), true);
+	assert.match(lane.matrixLassoVerdict({ group, shown: 79, selected: 14 }), /selects 14 of the 79/);
+	assert.match(lane.matrixLassoVerdict({ group, shown: 308, selected: 308 }), /shows 308 points \(79 in the group\)/);
+	assert.notStrictEqual(lane.matrixLassoVerdict({ group, shown: 79, selected: null }), true);
+	assert.notStrictEqual(lane.matrixLassoVerdict({ group, shown: null, selected: 79 }), true);
+	assert.notStrictEqual(lane.matrixLassoVerdict({ group: { cluster: 2, size: 1 }, shown: 1, selected: 1 }), true, 'a matrix needs two points');
 });
 
 test("chunkTextVerdict: 'water' is marked and the full text was fetched once for the key", () => {
@@ -457,23 +778,78 @@ test('matrixVerdict: the selected keys, no indices, a symmetric unit-diagonal ma
 	for (const [what, change] of Object.entries(broken)) assert.notStrictEqual(lane.matrixVerdict({ ...sound, ...change }), true, what);
 });
 
-test("selectionCsvVerdict and exportNameVerdict: one row per selected point of the sample, no vector or secret, the app's file name", () => {
+test("selectionCsvVerdict and exportNameVerdict: the rows are the Selection tab's points (its copied keys, its documents), no vector or secret, the app's file name", () => {
 	const sample = sampleOf();
 	const sampleKeys = Array.from({ length: 20 }, (_, i) => lane.keyOf(sample, i));
 	const header = 'objectId,chunkId,path,chunk_index,length,density,cluster,cluster_label,query_similarity,is_duplicate,is_outlier,x,y,z,snippet';
 	const row = (i) => `${sampleKeys[i][0]},${sampleKeys[i][1]},${lane.pathOf(sample, i)},${i},800,0.61,0,procedure · pump,,false,false,0.12,-0.5,,"a ""quoted"", snippet"`;
-	const csv = [header, row(0), row(1), row(2)].join('\r\n') + '\r\n';
+	const csvOf = (idx) => [header, ...idx.map(row)].join('\r\n') + '\r\n';
+	const range = (count) => Array.from({ length: count }, (_, i) => i);
 	const secrets = { 'the API key': 'local-acceptance-key' };
-	assert.strictEqual(lane.selectionCsvVerdict({ csv, selection: 3, sampleKeys, dim: 8, secrets }), true);
-	assert.match(lane.selectionCsvVerdict({ csv, selection: 4, sampleKeys, dim: 8, secrets }), /3 rows for 4/);
-	assert.match(lane.selectionCsvVerdict({ csv: [header, row(0), row(0)].join('\r\n'), selection: 2, sampleKeys, dim: 8, secrets }), /twice/);
-	assert.match(lane.selectionCsvVerdict({ csv: [header, row(0).replace('o-manual', 'o-gone')].join('\r\n'), selection: 1, sampleKeys, dim: 8, secrets }), /not points of the sample/);
-	assert.match(lane.selectionCsvVerdict({ csv: csv.replace('procedure · pump', 'local-acceptance-key'), selection: 3, sampleKeys, dim: 8, secrets }), /API key/);
-	assert.match(lane.selectionCsvVerdict({ csv: csv.replace('"a ""quoted"", snippet"', '"[0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8]"'), selection: 3, sampleKeys, dim: 8, secrets }), /float/);
-	assert.match(lane.selectionCsvVerdict({ csv: 'path\r\nx\r\n', selection: 1, sampleKeys, dim: 8, secrets }), /objectId column/);
+	/** The verdict on `csv` when the canvas counted, and the Selection tab holds, the points `chosen` (Copy keys gave their keys). */
+	const verdict = (csv, chosen, extra = {}) => lane.selectionCsvVerdict({ csv, selection: chosen.length, sampleKeys, dim: 8, secrets, selectedKeys: chosen.map((i) => sampleKeys[i]), tab: { points: chosen.length, documents: new Set(chosen.map((i) => sampleKeys[i][0])).size }, ...extra });
+	const csv = csvOf([0, 1, 2]);
+	assert.strictEqual(verdict(csv, [0, 1, 2]), true);
+	// The Selection tab's keys in another order are the same points.
+	assert.strictEqual(verdict(csv, [0, 1, 2], { selectedKeys: [sampleKeys[2], sampleKeys[0], sampleKeys[1]] }), true);
+	assert.match(verdict(csv, [0, 1, 2, 3]), /3 rows for 4/);
+	assert.match(verdict([header, row(0), row(0)].join('\r\n'), [0, 1]), /twice/);
+	assert.match(verdict([header, row(0).replace('o-manual', 'o-gone')].join('\r\n'), [0]), /not points of the sample/);
+	assert.match(verdict(csv.replace('procedure · pump', 'local-acceptance-key'), [0, 1, 2]), /API key/);
+	assert.match(verdict(csv.replace('"a ""quoted"", snippet"', '"[0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8]"'), [0, 1, 2]), /float/);
+	assert.match(lane.selectionCsvVerdict({ csv: 'path\r\nx\r\n', selection: 1, sampleKeys, dim: 8, secrets, selectedKeys: [sampleKeys[0]], tab: { points: 1, documents: 1 } }), /objectId column/);
+	// A lasso that took the whole sample (or nothing): its CSV cannot be told from the sample's.
+	assert.strictEqual(verdict(csvOf(range(19)), range(19)), true);
+	assert.match(verdict(csvOf(range(20)), range(20)), /every point of the sample/);
+	assert.match(verdict(csvOf([]), []), /no point/);
+	// The selection count says some, the CSV holds the whole sample.
+	assert.match(verdict(csvOf(range(20)), range(19)), /20 rows for 19/);
+	// Rows of the right number, each a point of the sample, but not the points selected: the
+	// manual's first three chunks are selected, the CSV holds the orchid notes' three (one
+	// document each, so the documents count cannot tell them apart), or two of the three and one other.
+	assert.match(verdict(csvOf([6, 7, 8]), [0, 1, 2]), /not the Selection tab's points: 3 rows not selected \(o-orchid#6\), 3 selected points missing \(o-manual#0\)/);
+	assert.match(verdict(csvOf([0, 1, 6]), [0, 1, 2]), /not the Selection tab's points: 1 rows? not selected/);
+	// The keys Copy keys gave: read, as many as the canvas counted, each once.
+	assert.match(verdict(csv, [0, 1, 2], { selectedKeys: null }), /Copy keys/);
+	assert.match(verdict(csv, [0, 1, 2], { selectedKeys: [sampleKeys[0], sampleKeys[1]] }), /Copy keys gave 2 keys for 3 selected points/);
+	assert.match(verdict(csv, [0, 1, 2], { selectedKeys: [sampleKeys[0], sampleKeys[1], sampleKeys[1]] }), /Copy keys gave a key twice/);
+	// The tab's line: as many points as the canvas counted, from as many documents as the rows come from.
+	assert.match(verdict(csv, [0, 1, 2], { tab: null }), /Selection tab's line/);
+	assert.match(verdict(csv, [0, 1, 2], { tab: { points: 4, documents: 1 } }), /the Selection tab says 4 points selected, the canvas 3/);
+	assert.match(verdict(csv, [0, 1, 2], { tab: { points: 3, documents: 2 } }), /the Selection tab says 2 documents, the CSV's rows come from 1/);
 	assert.strictEqual(lane.exportNameVerdict('vector-explorer_vx_demo_docs_selection_20261015-2310.csv', 'vx_demo_docs', 'selection', 'csv'), true);
 	assert.notStrictEqual(lane.exportNameVerdict('export.csv', 'vx_demo_docs', 'selection', 'csv'), true);
 	assert.notStrictEqual(lane.exportNameVerdict('vector-explorer_other_selection_20261015-2310.csv', 'vx_demo_docs', 'selection', 'csv'), true);
+});
+
+test("selectionCsvVerdict over the live Qdrant sample: a lasso over the left half, a CSV of the right half's points is refused", () => {
+	const sample = JSON.parse(fs.readFileSync(path.join(ACC, '..', '..', '..', 'apps', 'vector-ui', 'tests', 'fixtures', 'v1', 'live', 'qdrant', 'sample.json'), 'utf8'));
+	const n = sample.n;
+	const sampleKeys = Array.from({ length: n }, (_, i) => lane.keyOf(sample, i));
+	const byX = Array.from({ length: n }, (_, i) => i).sort((a, b) => sample.points.x[a] - sample.points.x[b]);
+	const k = Math.floor(n / 2);
+	const left = byX.slice(0, k);
+	const right = byX.slice(n - k);
+	assert.ok(k > 0 && left.every((i) => !right.includes(i)), 'the halves share no point');
+	const header = 'objectId,chunkId,path,chunk_index,x,y,snippet';
+	const csvOf = (idx) => [header, ...idx.map((i) => [...sampleKeys[i], lane.pathOf(sample, i), sampleKeys[i][1], sample.points.x[i], sample.points.y[i], 'text'].join(','))].join('\n');
+	const docs = new Set(left.map((i) => sampleKeys[i][0])).size;
+	const args = (csv) => ({ csv, selection: k, sampleKeys, dim: sample.dimension, secrets: {}, selectedKeys: left.map((i) => sampleKeys[i]), tab: { points: k, documents: docs } });
+	assert.strictEqual(lane.selectionCsvVerdict(args(csvOf(left))), true);
+	assert.match(lane.selectionCsvVerdict(args(csvOf(right))), new RegExp(`not the Selection tab's points: ${k} rows not selected`));
+});
+
+test("selectionLine and copiedKeys: the Selection tab's line and the keys Copy keys puts on the clipboard", () => {
+	assert.deepStrictEqual(lane.selectionLine('Selected points 1,234 points selected from 56 documents. Ask about these only'), { points: 1234, documents: 56 });
+	assert.deepStrictEqual(lane.selectionLine('3 points selected from 1 documents.'), { points: 3, documents: 1 });
+	assert.strictEqual(lane.selectionLine('Turn on the lasso (L) and draw around points to select them.'), null);
+	assert.strictEqual(lane.selectionLine(null), null);
+	assert.deepStrictEqual(lane.copiedKeys('[["o-a",0],["o-b",3]]'), [
+		['o-a', 0],
+		['o-b', 3],
+	]);
+	assert.deepStrictEqual(lane.copiedKeys('[]'), []);
+	for (const text of ['', 'threshold_search: 0.79', '[1,2]', '[["o-a"]]', '[["o-a",0,1]]', '[[0,0]]', '{"keys":[]}', null]) assert.strictEqual(lane.copiedKeys(text), null, String(text));
 });
 
 /** A PNG of w x h RGBA pixels from a pixel function (filter 0 rows), as a canvas writes it. */
@@ -567,22 +943,106 @@ test('viewsVerdict: listed after a switch, re-sampled with the seed, at most 200
 	for (const [what, change] of Object.entries(broken)) assert.notStrictEqual(lane.viewsVerdict({ listedAfterSwitch: true, saved, apply, line, ...change }), true, what);
 });
 
-test('dedupeVerdict: two groups for the two planted pairs, the shortest path kept, the slider with no sample request', () => {
+/**
+ * A sample for the duplicates queue: the two planted pairs (0.99, 0.985), the osprey handbook next to
+ * the falcon one at 0.93 (a kNN edge), two chunks of the manual at 0.95 (repeated text inside one
+ * document, never a group across documents) and a dissimilar edge.
+ */
+const DEDUPE_DOCS = ['handbooks/falcon_handbook.md', 'handbooks/falcon_handbook_rev2.md', 'field/kestrel_field_guide.md', 'archive/kestrel_field_guide_copy.md', 'handbooks/osprey_station_handbook.md', 'manuals/long_manual.md'].map((rel, i) => ({ i, objectId: `o-${i}`, path: D + rel }));
+function dedupeSample(osprey = 0.93) {
+	// kNN rows (offsets_row/cols/sims): 0 -> 4 (osprey), 1 -> 2 (dissimilar), 5 -> 6 (the manual's own chunks).
+	const knn = { k: 1, offsets_row: [0, 1, 2, 2, 2, 2, 3, 3], cols: [4, 2, 6], sims: [osprey, 0.5, 0.95] };
+	return {
+		success: true,
+		n: 7,
+		docs: DEDUPE_DOCS,
+		points: { doc: [0, 1, 2, 3, 4, 5, 5], chunk: [0, 0, 0, 0, 0, 0, 1] },
+		knn,
+		duplicates: [
+			{ a: 0, b: 1, sim: 0.99 },
+			{ a: 2, b: 3, sim: 0.985 },
+		],
+	};
+}
+const [FALCON, REV2, KESTREL, COPY, OSPREY] = DEDUPE_DOCS.map((d) => d.path);
+
+test("dedupeGroupsAt and regroupThreshold: the queue's groups across documents from the sample's pairs; the first slider position below that changes them", () => {
+	const sample = dedupeSample();
+	const sorted = (groups) => groups.map((g) => [...g].sort()).sort((a, b) => a.join('\n').localeCompare(b.join('\n')));
+	assert.deepStrictEqual(
+		sorted(lane.dedupeGroupsAt(sample, 0.97)),
+		sorted([
+			[FALCON, REV2],
+			[KESTREL, COPY],
+		])
+	);
+	// The manual's own chunks pair at 0.95: repeated text, not a group across documents.
+	assert.deepStrictEqual(
+		sorted(lane.dedupeGroupsAt(sample, 0.95)),
+		sorted([
+			[FALCON, REV2],
+			[KESTREL, COPY],
+		])
+	);
+	assert.deepStrictEqual(
+		sorted(lane.dedupeGroupsAt(sample, 0.93)),
+		sorted([
+			[FALCON, OSPREY, REV2],
+			[KESTREL, COPY],
+		])
+	);
+	const slider = { min: 0.9, step: 0.005 };
+	assert.strictEqual(lane.regroupThreshold(sample, 0.97, slider), 0.93);
+	// Nothing between the slider's minimum and the start changes the groups: no position to move to.
+	assert.strictEqual(lane.regroupThreshold(dedupeSample(0.6), 0.97, slider), null);
+	assert.strictEqual(lane.regroupThreshold(dedupeSample(0.93), 0.92, slider), null, 'only positions below the start count');
+	// Positions are on the slider's grid (0.965, 0.96, ...), never a float sum.
+	assert.strictEqual(lane.regroupThreshold(dedupeSample(0.966), 0.97, slider), 0.965);
+});
+
+test('dedupeVerdict: two groups for the two planted pairs, the shortest path kept, the slider re-grouping with no sample request', () => {
 	const groups = [
-		[`${D}handbooks/falcon_handbook.md`, `${D}handbooks/falcon_handbook_rev2.md`],
-		[`${D}field/kestrel_field_guide.md`, `${D}archive/kestrel_field_guide_copy.md`],
+		[FALCON, REV2],
+		[KESTREL, COPY],
 	];
-	const keptPaths = [`${D}handbooks/falcon_handbook.md`, `${D}field/kestrel_field_guide.md`];
-	const sound = { groups, keptPaths, samplesSent: 0, thresholdAfter: '0.92' };
+	const keptPaths = [FALCON, KESTREL];
+	const queuedPaths = [REV2, COPY];
+	const regrouped = [
+		[FALCON, REV2, OSPREY],
+		[KESTREL, COPY],
+	];
+	const sound = { groups, keptPaths, queuedPaths, queuedCount: 2, samplesSent: 0, from: 0.97, to: 0.93, thresholdAfter: '0.93', groupsAfter: regrouped, expectedBefore: groups, expectedAfter: regrouped };
 	assert.strictEqual(lane.dedupeVerdict(sound), true);
+	// Order inside and across groups does not matter.
+	assert.strictEqual(
+		lane.dedupeVerdict({
+			...sound,
+			groupsAfter: [
+				[COPY, KESTREL],
+				[OSPREY, FALCON, REV2],
+			],
+		}),
+		true
+	);
 	const broken = {
 		'a pair split': { groups: [[groups[0][0]], [groups[0][1]], groups[1]] },
 		'one group': { groups: [[...groups[0], ...groups[1]]] },
 		'rev2 kept': { keptPaths: [groups[0][1], groups[1][0]] },
+		'nothing queued': { queuedPaths: [], queuedCount: 0 },
+		'one pair not queued': { queuedPaths: [groups[0][1]], queuedCount: 1 },
+		'a kept document queued': { queuedPaths: [groups[0][0], groups[0][1], groups[1][1]], queuedCount: 3 },
+		'the count disagrees with the marks': { queuedCount: 3 },
 		'slider not moved': { thresholdAfter: '0.97' },
 		're-sampled': { samplesSent: 1 },
+		// The slider's label moved and the groups stayed: the panel did not re-group.
+		'groups unchanged after the slider': { groupsAfter: groups },
+		'groups not read after the slider': { groupsAfter: undefined },
+		"groups after the slider are not the sample's there": { groupsAfter: [[FALCON, REV2, KESTREL, COPY]] },
+		"the start's groups are not the sample's": { expectedBefore: regrouped },
+		'no slider position re-groups the sample': { to: null, thresholdAfter: null, groupsAfter: null, expectedAfter: null },
 	};
 	for (const [what, change] of Object.entries(broken)) assert.notStrictEqual(lane.dedupeVerdict({ ...sound, ...change }), true, what);
+	assert.match(lane.dedupeVerdict({ ...sound, groupsAfter: groups }), /did not change/);
 });
 
 test('removalVerdict: exactly the expected documents, batches of at most 100, the stats dropped by them', () => {
@@ -686,14 +1146,114 @@ test('keywordVerdict, thresholdVerdict, compareVerdict, layoutVerdict: the searc
 	const a = r(['a', 'b', 'c', 'd']);
 	const b = r(['c', 'd', 'e', 'f']);
 	const summary = 'A and B share 2 of 4 results (Jaccard 0.33); 2 documents only in A, 2 only in B';
-	assert.strictEqual(lane.compareVerdict({ a, b, summary, starA: 'placed', starB: 'placed' }), true);
-	assert.notStrictEqual(lane.compareVerdict({ a, b, summary: summary.replace('share 2', 'share 3'), starA: 'placed', starB: 'placed' }), true);
-	assert.notStrictEqual(lane.compareVerdict({ a, b, summary: summary.replace('0.33', '0.50'), starA: 'placed', starB: 'placed' }), true);
-	assert.notStrictEqual(lane.compareVerdict({ a, b, summary, starA: 'placed', starB: 'none' }), true);
-	assert.notStrictEqual(lane.compareVerdict({ a, b: r([]), summary, starA: 'placed', starB: 'placed' }), true);
+	// The map before Show A and B (settled on the unscoped sample) and after it (settled again, both stars).
+	const map = { before: mapReading(), after: mapReading({ queryA: 'placed', queryB: 'placed', legend: `Showing 308 of 308 chunks (random sample) Hollow star: "${QUESTION_B}" (compared in Search)` }), n: 308, questionB: QUESTION_B };
+	const sound = { a, b, summary, starA: 'placed', starB: 'placed', ...map };
+	assert.strictEqual(lane.compareVerdict(sound), true);
+	assert.notStrictEqual(lane.compareVerdict({ ...sound, summary: summary.replace('share 2', 'share 3') }), true);
+	assert.notStrictEqual(lane.compareVerdict({ ...sound, summary: summary.replace('0.33', '0.50') }), true);
+	assert.notStrictEqual(lane.compareVerdict({ ...sound, starB: 'none' }), true);
+	assert.notStrictEqual(lane.compareVerdict({ ...sound, b: r([]) }), true);
 	assert.strictEqual(lane.layoutVerdict({ before: 0.55, after: 0.551 }), true);
 	assert.notStrictEqual(lane.layoutVerdict({ before: 0.55, after: 1 }), true);
 	assert.notStrictEqual(lane.layoutVerdict({ before: null, after: 0.55 }), true);
+});
+
+test("mapBusy: only the map's own busy line counts, not the toolbar's other status lines", () => {
+	assert.strictEqual(lane.mapBusy([]), '');
+	assert.strictEqual(lane.mapBusy(['Saved vector-explorer_vx_demo_docs_map_20261016-2146.png.']), '', "the Export menu's status");
+	assert.strictEqual(lane.mapBusy(['Sampling…']), 'Sampling…');
+	assert.strictEqual(lane.mapBusy(['Saved x.png.', 'Laying out… 40%']), 'Laying out… 40%');
+	for (const t of ['Embedding…', 'Placing the query…']) assert.strictEqual(lane.mapBusy([t]), t);
+	assert.strictEqual(lane.mapBusy(null), '');
+});
+
+test("mapCalls: the sample and the calls in flight are those of the map in front (its connection's token), not another connection's", () => {
+	let seq = 0;
+	const frames = [];
+	/** A tool request on `token`, answered with `result` unless it is undefined. */
+	const call = (token, tool, input, result) => {
+		seq += 1;
+		frames.push({ dir: 'sent', msg: { type: 'request', seq, command: 'rrext_process', arguments: { subcommand: 'tool', tool, nodeId: 'store_1', input, token } } });
+		if (result !== undefined) frames.push({ dir: 'received', msg: { type: 'response', request_seq: seq, body: { result } } });
+	};
+	call('demo', 'sample', { n: 1000 }, { success: true, n: 308 });
+	const demoAt = frames.length - 2;
+	call('card', 'sample', { n: 1000 }, { success: true, n: 600 });
+	const capture = { frames, sockets: 1 };
+	assert.deepStrictEqual(lane.mapCalls(capture, 0, 'demo'), { sample: { index: demoAt, n: 308, scoped: false, success: true, code: null }, pending: [] });
+	assert.strictEqual(lane.mapCalls(capture, 0, 'card').sample.n, 600);
+	// Another map's call in flight does not hold this one up; this map's own does.
+	call('card', 'project', { sample_id: 's' }, undefined);
+	assert.deepStrictEqual(lane.mapCalls(capture, 0, 'demo').pending, []);
+	call('demo', 'search', { top_k: 10 }, undefined);
+	assert.deepStrictEqual(lane.mapCalls(capture, 0, 'demo').pending, ['search']);
+	assert.deepStrictEqual(lane.mapCalls(capture, frames.length, 'demo').pending, [], 'only the calls sent since the mark');
+	// A sample request still unanswered is in flight however old, and is the map's last sample.
+	call('demo', 'sample', { n: 1000, filter: { object_ids: ['o-1'] } }, undefined);
+	const late = lane.mapCalls(capture, frames.length, 'demo');
+	assert.deepStrictEqual(late.pending, ['sample']);
+	assert.strictEqual(late.sample, null);
+	// A refused sample is its last one, refused.
+	frames.push({ dir: 'received', msg: { type: 'response', request_seq: seq, body: { result: { success: false, code: 'BUSY' } } } });
+	assert.deepStrictEqual(lane.mapCalls(capture, 0, 'demo').sample, { index: frames.length - 2, n: null, scoped: true, success: false, code: 'BUSY' });
+	// No token: nothing is this map's.
+	assert.deepStrictEqual(lane.mapCalls(capture, 0, null), { sample: null, pending: [] });
+});
+
+test('mapSettledVerdict: the map is settled when its last sample request is answered and drawn whole, it is not busy, and none of its calls is in flight', () => {
+	assert.strictEqual(lane.mapSettledVerdict(mapReading(), {}), true);
+	assert.strictEqual(lane.mapSettledVerdict(mapReading(), { scoped: false, n: 308, after: 39, sampleIndex: 40 }), true);
+	const scoped = mapReading({ sample: { index: 40, n: 31, scoped: true, success: true }, shown: 31, legend: 'Showing 31 of 31 chunks (random sample)' });
+	assert.strictEqual(lane.mapSettledVerdict(scoped, { scoped: true }), true);
+	for (const [why, reading, expect] of [
+		['no reading', null, {}],
+		['no sample drawn yet', mapReading({ state: 'sampling' }), {}],
+		['the toolbar says it is sampling', mapReading({ busy: 'Sampling…' }), {}],
+		['a sample request unanswered', mapReading({ pending: ['sample'] }), {}],
+		["star B's project unanswered", mapReading({ pending: ['project'] }), {}],
+		['no sample request at all', mapReading({ sample: null }), {}],
+		['the last sample was refused', mapReading({ sample: { index: 40, n: null, scoped: false, success: false, code: 'BUSY' } }), {}],
+		['an older sample still drawn', mapReading({ shown: 31 }), {}],
+		['the legend names another sample', mapReading({ legend: 'Showing 31 of 31 chunks (random sample)' }), {}],
+		['no sample line in the legend', mapReading({ legend: 'Map legend' }), {}],
+		['still the scoped sample', scoped, { scoped: false }],
+		['not the unscoped sample of the demo collection', mapReading(), { n: 500 }],
+		['no unscoped size to compare with', mapReading(), { n: null }],
+		['drawn before the Clear', mapReading(), { after: 40 }],
+		['another sample than the one held before', mapReading(), { sampleIndex: 12 }],
+		['no sample to hold the stars on', mapReading(), { sampleIndex: null }],
+	])
+		assert.notStrictEqual(lane.mapSettledVerdict(reading, expect), true, why);
+	// The stars: both placed, and the legend naming star B's question.
+	const stars = { stars: { b: QUESTION_B } };
+	const placed = mapReading({ queryA: 'placed', queryB: 'placed', legend: `Showing 308 of 308 chunks (random sample) Hollow star: "${QUESTION_B}" (compared in Search)` });
+	assert.strictEqual(lane.mapSettledVerdict(placed, stars), true);
+	assert.notStrictEqual(lane.mapSettledVerdict({ ...placed, queryB: 'none' }, stars), true);
+	assert.notStrictEqual(lane.mapSettledVerdict({ ...placed, queryA: 'failed' }, stars), true);
+	assert.notStrictEqual(lane.mapSettledVerdict({ ...placed, legend: 'Showing 308 of 308 chunks (random sample)' }, stars), true);
+});
+
+test('compareVerdict: the stars count only on a map settled before Show A and B and settled again after it, on the same sample', () => {
+	const r = (ids) => ({ results: ids.map((id) => ({ metadata: { objectId: id, chunkId: 0 } })) });
+	const placed = mapReading({ queryA: 'placed', queryB: 'placed', legend: `Showing 308 of 308 chunks (random sample) Hollow star: "${QUESTION_B}" (compared in Search)` });
+	const sound = { a: r(['a', 'b', 'c', 'd']), b: r(['c', 'd', 'e', 'f']), summary: 'A and B share 2 of 4 results (Jaccard 0.33)', starA: 'placed', starB: 'placed', before: mapReading(), after: placed, n: 308, questionB: QUESTION_B };
+	assert.strictEqual(lane.compareVerdict(sound), true);
+	// Show A and B was clicked while the map still held the cleared scope's 31-chunk sample.
+	assert.notStrictEqual(lane.compareVerdict({ ...sound, before: mapReading({ sample: { index: 40, n: 31, scoped: true, success: true }, shown: 31, legend: 'Showing 31 of 31 chunks (random sample)' }) }), true);
+	// ...or while it was drawing another one.
+	assert.notStrictEqual(lane.compareVerdict({ ...sound, before: mapReading({ pending: ['sample'] }) }), true);
+	assert.notStrictEqual(lane.compareVerdict({ ...sound, before: null }), true);
+	// Both stars read placed once, but the second, settled reading has star B gone (a new sample dropped it).
+	assert.notStrictEqual(lane.compareVerdict({ ...sound, after: { ...placed, queryB: 'none' } }), true);
+	assert.notStrictEqual(lane.compareVerdict({ ...sound, after: { ...placed, pending: ['search'] } }), true);
+	// The stars sit on another sample than the one the map held before the click.
+	assert.notStrictEqual(lane.compareVerdict({ ...sound, after: { ...placed, sample: { ...placed.sample, index: 77 } } }), true);
+	assert.notStrictEqual(lane.compareVerdict({ ...sound, after: null }), true);
+	// The legend does not name star B.
+	assert.notStrictEqual(lane.compareVerdict({ ...sound, after: { ...placed, legend: 'Showing 308 of 308 chunks (random sample)' } }), true);
+	// The first reading's stars still count.
+	assert.notStrictEqual(lane.compareVerdict({ ...sound, starB: 'none' }), true);
 });
 
 test('ingestVerdict and healthVerdict: the drop summary and the pin; the legacy listing flagged', () => {
@@ -727,42 +1287,132 @@ test('ingestVerdict and healthVerdict: the drop summary and the pin; the legacy 
 // ---------------------------------------------------------------------------
 // What the lane looks for exists in the app's source (once the owning lane's code is on this branch)
 // ---------------------------------------------------------------------------
+//
+// The app's source is apps/vector-ui/src of this checkout, or VX_APP_SRC (e.g. the merged app of
+// vx/integration, checked from a lane branch whose own copy still holds the day-0 placeholders).
+// Comment lines are left out before matching: a marker or a label must be in the code.
 
-const SRC = path.join(ACC, '..', '..', '..', 'apps', 'vector-ui', 'src');
-const src = (file) => (fs.existsSync(path.join(SRC, file)) ? fs.readFileSync(path.join(SRC, file), 'utf8') : null);
-/** The NEEDS reason while `file` is still the day-0 placeholder (or lacks the owning lane's marker), else false. */
+const SRC = process.env.VX_APP_SRC || path.join(ACC, '..', '..', '..', 'apps', 'vector-ui', 'src');
+/** A source file's code without its comment lines (// lines, the lines of block comments). */
+function codeOf(text) {
+	const out = [];
+	let block = false;
+	for (const line of String(text).split('\n')) {
+		const t = line.trim();
+		if (block) {
+			if (t.includes('*/')) block = false;
+			continue;
+		}
+		if (t.startsWith('/*')) {
+			block = !t.includes('*/');
+			continue;
+		}
+		if (t.startsWith('//')) continue;
+		out.push(line);
+	}
+	return out.join('\n');
+}
+/** The code of an app source file, or null when the file is absent. */
+const src = (file) => (fs.existsSync(path.join(SRC, file)) ? codeOf(fs.readFileSync(path.join(SRC, file), 'utf8')) : null);
+/** The NEEDS reason while `file` is absent or still the day-0 placeholder (or its code lacks the owning lane's marker), else false. */
 const needs = (lanes, file, marker) => {
 	const text = src(file);
 	const built = text !== null && (marker ? text.includes(marker) : !text.includes('data-placeholder'));
-	return built ? false : `NEEDS:${lanes} merged — integration gate GE2 (${file} is not built on this branch)`;
+	return built ? false : `NEEDS:${lanes} merged — integration gate GE2 (${file} is not built in ${SRC}; VX_APP_SRC checks another tree)`;
 };
+
+test('the source checks read code, not comments', () => {
+	const text = ['// Drop of 3 files', '/*', ' * aria-label="Hidden"', ' */', '/** One line: Hidden too */', 'const a = <b aria-label="Shown">Drop of {n}</b>; // trailing words stay', '\t// Indented comment'].join('\n');
+	const code = codeOf(text);
+	assert.ok(!code.includes('Hidden'), code);
+	assert.ok(!code.includes('Indented comment'));
+	assert.ok(!code.includes('Drop of 3 files'));
+	assert.ok(code.includes('aria-label="Shown"') && code.includes('Drop of {n}'));
+});
+
+const UI = lane.UI;
+/** A data hook's attribute text from its selector ('[data-x="y"]' -> 'data-x="y"'); anything else as written. */
+const hook = (sel) => (typeof sel === 'string' && sel.startsWith('[') && sel.endsWith(']') ? sel.slice(1, -1) : String(sel));
+/**
+ * The names and hooks the lane's UI table finds the enrichment's controls by, and the source file
+ * that must carry each (as an aria-label, or as the data hook itself): [owner, file, marker, patterns].
+ */
+const UI_SOURCES = [
+	['E5', 'components/MapToolbar.tsx', 'aria-label="Edges per point"', [`aria-label="${UI.map.edges}"`, `aria-label="${UI.map.edgesPerPoint}"`, `aria-label="${UI.map.colourBy}"`]],
+	['E5', 'views/MapView.tsx', 'Copy keys', [`aria-label="${UI.map.selectionSection}"`]],
+	['E5', 'components/ClustersPanel.tsx', null, [`aria-label="${UI.map.minClusterSize}"`, `aria-label="${UI.map.clustersList}"`]],
+	['E6', 'components/DuplicatesPanel.tsx', 'Near-duplicate review', [`aria-label="${UI.dedupe.section}"`, `aria-label="${UI.dedupe.threshold}"`, `aria-label="${UI.dedupe.policy}"`]],
+	['E6', 'components/OutliersPanel.tsx', 'data-component="OutliersPanel"', [hook(UI.outliers.section), `aria-label="${UI.outliers.percentile}"`]],
+	['E6', 'components/PointInspector.tsx', 'Add as example', [`aria-label="${UI.inspector.addPositive}"`, `aria-label="${UI.inspector.addNegative}"`]],
+	['E6', 'components/RecommendPanel.tsx', null, [hook(UI.recommend.panel), `aria-label="${UI.recommend.strategy}"`]],
+	['E6', 'components/ChunkTextPanel.tsx', null, [hook(UI.text.panel)]],
+	['E6', 'components/SimilarityMatrix.tsx', null, [hook(UI.matrix.panel)]],
+	['E7', 'components/SearchPanel.tsx', null, [hook(UI.search.panel), `aria-label="${UI.search.box}"`, `aria-label="${UI.search.boxB}"`, `aria-label="${UI.search.threshold}"`]],
+	['E8', 'components/SavedViewsMenu.tsx', null, [hook(UI.views.menu), `aria-label="${UI.views.name}"`, hook(UI.views.save)]],
+	['E8', 'components/ExportMenu.tsx', null, [hook(UI.export.menu), 'data-export-item={item.id}', 'data-export-format={format}']],
+	['E4', 'components/ScopeBar.tsx', null, [`aria-label="${UI.scope.prefix}"`, `aria-label="${UI.scope.saveName}"`]],
+	['E9', 'components/UploadList.tsx', 'data-component="IngestSummary"', [hook(UI.ingest.root)]],
+];
+for (const [owner, file, marker, patterns] of UI_SOURCES) {
+	test(`the lane's UI names for ${file} are the app's`, { skip: needs(owner, file, marker) }, () => {
+		const text = src(file);
+		assert.deepStrictEqual(
+			patterns.filter((p) => !text.includes(p)),
+			[],
+			`${file} lacks these`
+		);
+	});
+}
+
+/** The wording and hooks the lane's steps read beyond the UI names: [owner, file, marker, patterns]. */
 const SOURCES = [
-	['E5', 'views/MapView.tsx', 'data-edge-mode', ['data-colour-by', 'data-edge-count', 'data-edges-hovered', 'data-min-cluster-size', 'data-shown', 'data-isolated', 'data-query-b-state']],
-	['E5', 'components/MapToolbar.tsx', 'aria-label="Edges per point"', ['aria-label="Edges"', 'aria-label="Edges per point"', 'aria-label="Colour by"', 'Expand selected']],
-	['E5', 'components/ClustersPanel.tsx', null, ['aria-label="Minimum size"', 'aria-label="Clusters by size"', 'Ask about the documents of cluster ${', 'in no group']],
+	['E5', 'views/MapView.tsx', 'data-edge-mode', ['data-colour-by', 'data-edge-count', 'data-min-cluster-size', 'data-shown', 'data-isolated', 'data-query-state', 'data-query-b-state']],
+	// The Selection tab's line and its Copy keys (the keys as JSON on the clipboard), which the export step compares the CSV with.
+	['E5', 'views/MapView.tsx', 'Copy keys', ['{num(keys.length)} points selected from {num(docs.length)} documents.', 'Copy keys', 'onCopy={(keys) => {', 'const text = JSON.stringify(keys);', 'navigator.clipboard.writeText(text)']],
+	['E5', 'components/PointCanvas.tsx', 'data-layer="edges"', ['className="vector-map-canvas"', 'data-layer="edges"', 'data-map-tooltip', 'el.dataset.camera = cameraSignature(camera)', 'el.dataset.drawCount']],
+	['E5', 'map/overlay.ts', 'hoverEdges', ['extras.hoverEdges', 'ctx.lineWidth = 2']],
+	['E5', 'components/MapToolbar.tsx', 'aria-label="Edges per point"', ['Expand selected', "{ id: 'tree', label: 'Tree' }", "{ id: 'neighbours', label: 'Neighbours' }"]],
+	['E5', 'components/ClustersPanel.tsx', null, ['Ask about the documents of cluster ${', 'in no group', 'data-cluster="noise"']],
 	['E5', 'map/colours.ts', "'ingest-date'", ["label: 'Cluster'", "label: 'Ingest date'", 'oldest (${', 'newest (${']],
 	['E5', 'components/Legend.tsx', 'Colour ramp from', ['Colour ramp from ${']],
 	['E5', 'map/wording.ts', 'listingNote', ['Sampled from the first ${num(listing.documents)} documents by path; the collection has more']],
-	['E6', 'components/DuplicatesPanel.tsx', 'Near-duplicate review', ['aria-label="Near-duplicate review"', 'aria-label="Near-duplicate similarity threshold"', 'aria-label="Which document each group keeps"', 'data-threshold', 'fieldset', 'Show group']],
-	['E6', 'map/reviewWording.ts', 'removeAllLabel', ['Remove all queued (${', "'shortest-path'", 'Keep shortest path']],
-	['E6', 'components/OutliersPanel.tsx', 'data-component="OutliersPanel"', ['Remove document', '<select', 'sample median']],
-	['E6', 'components/PointInspector.tsx', 'Add as example', ['Add as example (+)', 'Add as example (−)', 'Show full text']],
-	['E6', 'components/RecommendPanel.tsx', null, ['aria-label="Strategy"', 'Best score', 'Run']],
+	// A settled map (mapSettledVerdict): the root's state, the toolbar's busy line and its wording, the legend's sample line and star B.
+	['E5', 'views/MapView.tsx', 'data-edge-mode', ["data-map-state={sample ? 'ready'", 'Hollow star: "${queryB.text}" (compared in Search)']],
+	['E5', 'components/MapToolbar.tsx', 'aria-label="Edges per point"', ['<span role="status" style={MAP_STYLES.small}>', '{props.busy}']],
+	['E5', 'map/wording.ts', 'listingNote', ["sampling: 'Sampling…'", "layout: 'Laying out…'", "embedding: 'Embedding…'", "projecting: 'Placing the query…'", "neighbours: 'Finding neighbours…'", 'Showing ${num(sample.n)} of ${num(of)} chunks']],
+	['E6', 'components/DuplicatesPanel.tsx', 'Near-duplicate review', ['data-threshold', 'data-group={group.id}', 'type="radio"', 'aria-label={`Keep ${path}`}', 'Show group', 'min={THRESHOLD_MIN}', 'step={THRESHOLD_STEP}']],
+	['E6', 'map/reviewWording.ts', 'removeAllLabel', ['Remove all queued (${', "'shortest-path'"]],
+	['E6', 'components/OutliersPanel.tsx', 'data-component="OutliersPanel"', ['Remove document', '<select', 'aria-label="Outliers"']],
+	['E6', 'map/outliers.ts', 'whyText', ['vs sample median ${']],
+	['E6', 'components/ChunkTextPanel.tsx', null, ["'Show full text'", "'Hide full text'", '<mark']],
+	['E6', 'components/RecommendPanel.tsx', null, ['Best score (ranked by the store)', 'onClick={() => props.onRun()}']],
 	['E6', 'components/SimilarityMatrix.tsx', null, ['Export CSV']],
-	['E6', 'components/ChunkTextPanel.tsx', null, ['<mark']],
-	['E7', 'components/ChatPanel.tsx', 'Search without the LLM', ['Search without the LLM', 'aria-pressed']],
-	['E7', 'components/SearchPanel.tsx', null, ['aria-label="Search the collection"', 'aria-label="Compare with"', 'aria-label="Search mode"', 'aria-label="Threshold"', 'Copy as node setting', 'Compare']],
-	['E8', 'components/ExportMenu.tsx', null, ['data-export-item', 'data-export-format', 'role="menuitem"']],
-	['E8', 'components/SavedViewsMenu.tsx', null, ['Save current view', 'aria-label="Name of the view"', 'Apply view ${', 'selected points restored']],
-	['E9', 'components/UploadList.tsx', 'Drop of', ['data-component="IngestSummary"', 'Show new chunks on the map', 'new chunks placed']],
-	['E4', 'components/ScopeBar.tsx', null, ['Add condition', 'aria-label="Folder the paths start with"', 'aria-label="Name of the saved filter"', 'Apply saved filter ${', 'Remove condition: ${', 'Save…', 'Clear']],
+	['E7', 'components/ChatPanel.tsx', 'Search without the LLM', ['title="Search without the LLM"', 'aria-pressed']],
+	['E7', 'components/SearchPanel.tsx', null, ['type="radio"', 'Copy as node setting', "'Run A and B'", 'Compare']],
+	['E7', 'vector/searchWorkbench.ts', 'MODE_LABELS', ["semantic: 'Semantic', keyword: 'Keyword'", 'would pass', 'threshold_search: ${']],
+	['E7', 'vector/compare.ts', 'A and B share', ['A and B share ${']],
+	['E7', 'components/QueryCompare.tsx', null, ['on the map`']],
+	['E8', 'components/ExportMenu.tsx', null, ['role="menuitem"', 'aria-haspopup="menu"']],
+	['E8', 'components/SavedViewsMenu.tsx', null, ['Apply view ${', 'Save the current view']],
+	['E8', 'vector/savedViews.ts', 'restoreSentence', ['selected points restored', 'drawn hollow']],
+	['E8', 'vector/export.ts', 'vector-explorer_', ['vector-explorer_${safeCollection(collection)}_${kind}_${fileStamp(at)}.${ext}']],
+	['E9', 'components/UploadList.tsx', 'SHOW_NEW_LABEL', ['{SHOW_NEW_LABEL}']],
+	['E9', 'vector/uploads.ts', 'placedSentence', ["SHOW_NEW_LABEL = 'Show new chunks on the map'", 'Drop of ${', 'new chunks placed:']],
+	['E4', 'components/ScopeBar.tsx', null, ['Add condition', 'Apply saved filter ${', 'Remove condition: ${', 'Save…', 'Clear']],
+	['E4', 'vector/filters.ts', 'scopeStatusText', ["folder: 'Folder is under'", "'documents match'", 'loaded match (filtered here']],
 	['E4', 'components/StatsCharts.tsx', null, ['data-chart={chart.id}', 'aria-label={words}']],
+	['E4', 'components/StatsStrip.tsx', 'StatsCharts', ['>Charts</summary>']],
 	['E4', 'components/DocumentRow.tsx', 'data-flag', ['data-object-id={item.objectId}', 'data-flag']],
+	['E4', 'vector/health.ts', 'no_first_chunk', ["label: 'no first chunk'", "'deleted chunk'"]],
 ];
 for (const [owner, file, marker, patterns] of SOURCES) {
 	test(`the lane's selectors for ${file} exist in the app's source`, { skip: needs(owner, file, marker) }, () => {
 		const text = src(file);
-		for (const p of patterns) assert.ok(text.includes(p), `${file} has no ${JSON.stringify(p)}`);
+		assert.deepStrictEqual(
+			patterns.filter((p) => !text.includes(p)),
+			[],
+			`${file} lacks these`
+		);
 	});
 }
 
@@ -819,4 +1469,63 @@ test('perf lane: each edge mode is its own gate at 2,000 detailed points and 4x,
 	assert.match(at1[0].name, /^GATE 2,000 detailed points at 4x/);
 	// Each edge row carries its own privacy row, named with its mode.
 	assert.ok(at1.some((g) => /^privacy \(B4\).*edges:tree at 4x/.test(g.name)));
+});
+
+test("perf lane: the edges a mode must draw are computed from the sample's kNN graph as the map computes them", () => {
+	const perf = require('../browser/lane_vector_perf.cjs');
+	// Two triangles {0,1,2} and {3,4,5}: each point's two neighbours are its triangle's other points, strongest first.
+	const knn = { offsets_row: [0, 2, 4, 6, 8, 10, 12], cols: [1, 2, 0, 2, 0, 1, 4, 5, 3, 5, 3, 4], sims: [0.9, 0.8, 0.9, 0.7, 0.8, 0.7, 0.9, 0.8, 0.9, 0.7, 0.8, 0.7] };
+	assert.strictEqual(perf.expectedEdges(knn, 6, 'none'), 0);
+	assert.strictEqual(perf.expectedEdges(knn, 6, 'tree'), 4, 'six points in two pieces: a forest of 6 - 2 edges');
+	assert.strictEqual(perf.expectedEdges(knn, 6, 'neighbours:1'), 4, "each point's strongest neighbour, each pair once: 0-1, 0-2, 3-4, 3-5");
+	assert.strictEqual(perf.expectedEdges(knn, 6, 'neighbours:2'), 6);
+	assert.strictEqual(perf.expectedEdges(knn, 6, 'neighbours:5'), 6, 'no more than the graph holds');
+	// A point listed as its own neighbour is skipped without taking a place; ties go to the lower index.
+	const self = { offsets_row: [0, 2, 3, 4], cols: [0, 2, 0, 1], sims: [1, 0.5, 0.5, 0.5] };
+	// Rows: 0 -> [0 (itself), 2], 1 -> [0], 2 -> [1]; strongest neighbours 0-2, 1-0, 2-1: three pairs.
+	assert.strictEqual(perf.expectedEdges(self, 3, 'neighbours:1'), 3, '0 skips itself and takes 2');
+	assert.strictEqual(perf.expectedEdges({ offsets_row: [0, 1, 2], cols: [1, 0], sims: [0.5, 0.5] }, 2, 'tree'), 1);
+	assert.strictEqual(perf.expectedEdges({ offsets_row: [0, 0, 0, 0], cols: [], sims: [] }, 3, 'tree'), 0, 'three isolated points: no tree edge');
+	assert.strictEqual(perf.expectedEdges(undefined, 6, 'tree'), null, 'no kNN graph: nothing to compute');
+	assert.strictEqual(perf.expectedEdges({ offsets_row: [0, 1], cols: [1], sims: [0.5] }, 6, 'neighbours:3'), null, 'a graph shorter than the sample');
+});
+
+test('perf lane: an edge row that drew fewer (or other) edges than its mode gives fails, with or without the computed count', () => {
+	const perf = require('../browser/lane_vector_perf.cjs');
+	const frames = (count, ms) => Array.from({ length: count }, () => ms);
+	const base = { n: 2000, mode: 'detailed', cpuThrottle: 4, renderer: 'webgl', panFrameMs: perf.summarise(frames(80, 18)), panWork: { draws: 74, cameraBefore: '2d:0,0,40', cameraAfter: '2d:3,1,40' }, privacy: { frames: 120, dimension: 384, embedAnswers: 0, vectorRequests: 0, violations: [] } };
+	const expected = { tree: 1994, 'neighbours:3': 4120, 'neighbours:5': 6630 };
+	const row = (mode, extra = {}) => ({ ...base, edges: `edges:${mode}`, edgesAutoDegrade: false, edgesDegraded: false, edgesDrawn: expected[mode], edgesExpected: expected[mode], ...(mode.startsWith('neighbours') ? { edgesPerPoint: Number(mode.split(':')[1]) } : {}), ...extra });
+	for (const mode of Object.keys(expected)) {
+		assert.strictEqual(perf.edgeRowProblem(row(mode), mode), null, `${mode} drew what its sample gives`);
+		assert.notStrictEqual(perf.edgeRowProblem(row(mode, { edgesDrawn: 1 }), mode), null, `${mode} drew 1 edge`);
+		assert.notStrictEqual(perf.edgeRowProblem(row(mode, { edgesDrawn: expected[mode] - 1 }), mode), null, `${mode} drew one edge fewer than its sample gives`);
+		assert.notStrictEqual(perf.edgeRowProblem(row(mode, { edgesDrawn: expected[mode] + 1 }), mode), null, `${mode} drew one edge more than its sample gives`);
+		assert.match(String(perf.edgeRowProblem(row(mode, { edgesExpected: null }), mode)), /could not be computed/, `${mode}: the lane could not compute the count`);
+		// A row with no computed count (a hand-made row) is still held to the least its mode can draw.
+		const bare = row(mode, { edgesExpected: undefined, edgesDrawn: 1 });
+		assert.notStrictEqual(perf.edgeRowProblem(bare, mode), null, `${mode}: 1 edge without a computed count`);
+		assert.strictEqual(perf.edgeRowProblem(row(mode, { edgesExpected: undefined }), mode), null, `${mode}: a plausible count without a computed one`);
+	}
+	assert.strictEqual(perf.edgeFloor('tree', 2000), 1000, 'every point has a neighbour, so at most n/2 pieces');
+	assert.strictEqual(perf.edgeFloor('neighbours:5', 2000), 5000, 'm distinct partners per point, each pair counted at most twice');
+	// The gate of the DA counterexample: one edge drawn and the per-point count echoing the control.
+	const all = [{ ...base, edgeModes: perf.EDGE_MODES, edgesAutoDegrade: false }, row('none', { edgesDrawn: 0, edgesExpected: 0 }), row('tree', { edgesDrawn: 1 }), row('neighbours:3', { edgesDrawn: 1 }), row('neighbours:5', { edgesDrawn: 1 })];
+	for (const mode of ['tree', 'neighbours:3', 'neighbours:5']) assert.strictEqual(perf.evaluateGates(all).find((g) => g.name.startsWith(`GATE edges:${mode} `)).status, 'FAIL', mode);
+});
+
+test('perf lane: a run whose page cannot turn the slow-frame switch off says so once, and its edge rows are not measured', () => {
+	const perf = require('../browser/lane_vector_perf.cjs');
+	const frames = (count, ms) => Array.from({ length: count }, () => ms);
+	const points = { n: 2000, mode: 'detailed', cpuThrottle: 4, renderer: 'webgl', panFrameMs: perf.summarise(frames(80, 18)), panWork: { draws: 74, cameraBefore: 'a', cameraAfter: 'b' }, privacy: { frames: 1, dimension: 384, embedAnswers: 0, vectorRequests: 0, violations: [] }, edgeModes: perf.EDGE_MODES };
+	const switchGate = (rows) => perf.evaluateGates(rows).filter((g) => /slow-frame switch/.test(g.name) && !g.name.startsWith('GATE edges:'));
+	const on = switchGate([{ ...points, edgesAutoDegrade: true }]);
+	assert.strictEqual(on.length, 1, 'one row names the cause');
+	assert.strictEqual(on[0].status, 'FAIL');
+	assert.match(on[0].detail, /cannot turn/);
+	assert.strictEqual(switchGate([{ ...points, edgesAutoDegrade: false }])[0].status, 'PASS');
+	assert.strictEqual(switchGate([{ ...points, edgesAutoDegrade: undefined }])[0].status, 'FAIL', 'unrecorded');
+	assert.deepStrictEqual(switchGate([{ ...points, edgeModes: undefined }]), [], 'a run without edge rows has no switch row');
+	assert.strictEqual(perf.switchProblem({ edgesAutoDegrade: true }), perf.SWITCH_ON);
+	assert.strictEqual(perf.switchProblem({ edgesAutoDegrade: false }), null);
 });

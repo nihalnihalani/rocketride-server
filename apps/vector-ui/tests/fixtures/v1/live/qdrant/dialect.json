@@ -58,9 +58,9 @@
     "remove": true,
     "remove_count": true,
     "soft_delete": false,
-    "clusters": false,
+    "clusters": true,
     "documents_filter": false,
-    "recommend_best_score": false,
+    "recommend_best_score": true,
     "projection": [
       "pca"
     ]
@@ -94,5 +94,7 @@
   },
   "caveats": [
     "brute_force_search"
-  ]
+  ],
+  "size_bytes": null,
+  "keyword_match": "token"
 }

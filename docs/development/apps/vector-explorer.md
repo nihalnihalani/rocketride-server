@@ -147,6 +147,14 @@ Builder tasks (see the [builder reference](../builder/reference.md)):
 ./builder vector-ui:e2e-live  # browser lanes against ENGINE_URL; opt-in, not part of test or CI
 ```
 
+`vector-ui:test` runs every suite under `apps/vector-ui/tests` and fails when a
+suite it requires is missing: every one of `ALWAYS_REQUIRED_TESTS` in
+`apps/vector-ui/scripts/tasks.js`, and each suite of `FEATURE_TESTS` once the
+module it is paired with is in the checkout (the enrichment's suites, so a merge
+that brings a feature without its suite fails instead of passing with the suite
+never run). `scripts/acceptance/vector-explorer/selftest/test_lanes.py` holds
+both lists to every suite the change lanes own in `lanes.json`.
+
 ## The write switch
 
 - **One source for the defaults.** `VECTOR_ALLOW_WRITES_DEFAULT` (false) and
@@ -255,6 +263,19 @@ takes its own block of free task ports (from `RR_TEST_TOOLPATH_BASE_PORT`,
 default 44000), so runs from two checkouts at once do not reach each other's
 tasks, and `RR_TEST_TOOLPATH_ENGINE_PORT` fixes the engine's own port.
 
+With `RR_TEST_VECTOR_LEGACY=seeded` the tool-path suite runs its legacy pass on
+the shared `vx_legacy_docs` that `seed_legacy.sh` writes. It adds and removes
+only documents of its own there, and checks that: it fingerprints the seeded
+collection when a backend's deployment starts (each seeded document's rows,
+deleted ones included, and on pgvector the soft-deleted rows) and fails after
+that backend's live tests if the fingerprint changed, so a write that touched
+the seed is caught by the run that made it rather than by the next
+`seed_legacy.sh --verify-only`. Its counts are of active rows, and the pgvector
+seed's one soft-deleted row is expected in `stats.deleted_chunks` and in the
+legacy `stats.count`. A seed written before the corpus planted its keyword
+token skips the keyword case on the legacy side with a `NOT RUN:` reason (the
+stored text has no such word); `seed_legacy.sh --recreate` seeds it again.
+
 Without `RR_REQUIRE_DB_TESTS` a suite whose server is unreachable skips with a
 `NOT RUN:` reason, so a run can pass without touching a database; read the skip
 summary that `-rs` prints. A run by name also leaves out the checks
@@ -303,7 +324,65 @@ cd dist/server
 
 The lane removes demo documents (the duplicates queue, an outlier) and uploads
 three files of its own, then uploads the removed documents again under their own
-names and removes its own, so the corpus is as it was.
+names and removes its own, so the corpus is as it was. Because it writes to the
+stores, `vector-ui:e2e-live` runs it only when `VECTOR_UI_E2E_LANES` names it
+(`enrich`; the default run and `all` leave it out), once per backend of
+`VECTOR_UI_E2E_BACKENDS`.
+
+A run accounts for every step it plans (`stepsFor`, each named through
+`STEP_TITLES`): a step it never reached, because sign-in timed out or the
+browser did not start, records FAIL with the error, and so does the run in a
+`lane` row. Run by `vector-ui:e2e-live`, a backend whose child exited non-zero,
+wrote no result, or recorded fewer rows than it planned fails, so a backend
+cannot drop out of a run that reports every step passing.
+
+The steps that read the map after something has made it sample again read it
+settled, from the app's own signals and never from a quiet period: the map root
+holds a sample (`data-map-state="ready"`), the toolbar shows none of the map's
+busy wording (Sampling…, Embedding…, Placing the query…; the Export menu's
+status beside it does not count), the last `sample` request of the map's own
+connection (each open connection has a map of its own; its requests carry
+that connection's Tools task token) is answered and is what the map draws
+whole (`data-shown` and the legend's "Showing N of …" are its n), and none of
+the map's `embed`, `project`, `search` or `neighbors` calls is unanswered. After
+the scope step's last Clear, the map, shown again, must settle on a sample
+asked for after the Clear, unscoped and as large as the clusters step's.
+Compare first settles the map on that unscoped sample, then clicks Show A and
+B; once both stars are placed it reads the map again when it has settled: both
+stars still placed, the legend naming star B's question, on the same sample.
+The restore step removes on the page the uploads the store holds, then removes
+through the store whatever the page left behind (an upload it could not remove
+still fails the step), so a failed run does not leave the next one a changed
+corpus.
+
+The lane finds the enrichment's controls by the names and data hooks the app
+gives them (its `UI` table). The self-test checks each of them, and the wording
+the steps read, against the code of the app's source files (comment lines left
+out), skipping a file with a `NEEDS:` reason while it is still a placeholder;
+`VX_APP_SRC=<tree>/apps/vector-ui/src` points that check at another tree, for
+example the merged app from a lane branch whose own copy still holds the
+placeholders.
+
+A lasso is only as good as the camera under it. Isolate, Show all and Show only
+cluster move the points (the shown ones fill the layout, over a short tween), so
+the lane fits the map once no frame has been drawn for 700 ms and fits it again:
+the camera (`data-camera` on the map canvas) must not move on the second Fit. A
+lasso over part of the canvas must then take some of the points drawn but not
+all of them, and one over the whole canvas every one, so the matrix step's lasso
+over a cluster shown alone selects exactly that cluster, and the export step's
+selection is some of the sample, never the whole of it. Before it exports, the
+export step reads the Selection tab: its line ("N points selected from M
+documents") and the keys its Copy keys puts on the clipboard, emptied first so
+an earlier copy is not read. The CSV's rows must be exactly those keys, as many
+as the canvas counted, from M documents; any other points of the sample of the
+same number fail the step. The isolate step also
+reads the camera the app framed by itself after Isolate and after Show all, once
+the points stop: a Fit then must leave it where it is. The duplicates step
+computes the queue's groups from the sample the page holds (the node's pairs and
+the kNN edges at or above the threshold, groups across documents only), moves
+the slider to the first position below its start at which they change, reads
+the panel's groups again, and requires the sample's groups there, with no
+`sample` frame.
 
 The perf lane (`lane_vector_perf.cjs`) measures the map's edges per mode
 (`EDGE_MODES`: none, tree, neighbours:3, neighbours:5) on its 2,000-point
@@ -312,8 +391,15 @@ detailed sample, at 1x and 4x CPU throttling. Before the shell loads it sets
 edge however slow its frames; each row records what the map root reports
 (`data-edges-auto-degrade`, `data-edges-degraded`, `data-edge-count`), and each
 mode at 4x is its own gate (p95 frame interval ≤ 33 ms), failing when it was
-measured with the switch on. `gen_perf.py --check` says whether the perf
-fixture's sample can carry every edge row.
+measured with the switch on. Each edge row also records the edges its mode must
+draw over the page's own sample (`edgesExpected`, computed from the sample
+answer in the page's frames as `map/graph.ts` computes them: the tree is n minus
+the kNN graph's pieces, Neighbours m each point's m strongest pairs, kept once)
+and fails unless the map drew exactly that, so a slow mode cannot pass by
+drawing fewer edges. The points row of the edge sample records the switch too:
+a page that cannot turn it off gets one row saying so, and its edge rows are not
+measured. `gen_perf.py --check` says whether the perf fixture's sample can
+carry every edge row.
 
 `scripts/acceptance/vector-explorer/lanes.json` lists which change lane owns
 which file in a multi-lane build of the app, the commit the lanes branch from
@@ -326,7 +412,7 @@ commit.
 | Folder | What | How it is made |
 | --- | --- | --- |
 | `apps/vector-ui/tests/fixtures/provisional/` | One hand-written answer per tool and case, including the error envelopes | By hand, from the contract |
-| `apps/vector-ui/tests/fixtures/v1/live/<backend>/` | Answers captured from the live drivers, on a new and a legacy collection, scrubbed of volatile values; with the additive tools on the branch also `documents.filter`, `sample.clusters`, `search.keyword`, `recommend`, `recommend.best_score`, `similarity_matrix` and `dialect.enriched` | `nodes/test/vector_wire_fixtures.py`; `test_vector_wire_fixtures_full.py` regenerates and compares |
+| `apps/vector-ui/tests/fixtures/v1/live/<backend>/` | Answers captured from the live drivers, on a new and a legacy collection, scrubbed of volatile values; with the additive tools on the branch also `documents.filter`, `sample.clusters`, `search.keyword`, `recommend`, `recommend.best_score` (Qdrant; `recommend.unsupported` where the store refuses it, since a refusal capture is named by its code), `similarity_matrix` and `dialect.enriched` | `nodes/test/vector_wire_fixtures.py`; `test_vector_wire_fixtures_full.py` regenerates and compares |
 | `sample_*.json` among the provisional fixtures | Seeded synthetic `sample` answers for the map's tests | `apps/vector-ui/tests/fixtures/gen_sample.ts` (`--check` verifies them) |
 | `defaults.json` | The write defaults and tool limits | `apps/vector-ui/scripts/gen_defaults.py` (`--check`) |
 | `chunking.json` | The chunker settings every template carries | The chunking calibration run |
