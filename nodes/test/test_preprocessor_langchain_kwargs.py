@@ -47,13 +47,20 @@ def _real_text_splitters():
     exactly as it found it, so the other tests still see their stand-ins whatever
     order the tests run in.
 
+    A package that is a stand-in (or missing) is set aside with its whole tree:
+    real submodules an earlier test imported can sit under a stand-in parent, and
+    a submodule already in sys.modules is returned without importing its parent,
+    so the real package would never be loaded.
+
     Skips only when the package is not installed in this Python; an installed
     package that fails to import is a failure, not a skip.
     """
     saved = _langchain_entries()
-    for name, mod in saved.items():
-        if _is_stand_in(mod):
-            del sys.modules[name]
+    for root in _LANGCHAIN_ROOTS:
+        whole_tree = _is_stand_in(saved.get(root)) or root not in saved
+        for name, mod in saved.items():
+            if name.split('.', 1)[0] == root and (whole_tree or _is_stand_in(mod)):
+                del sys.modules[name]
     try:
         if importlib.util.find_spec('langchain_text_splitters') is None:
             pytest.skip('NOT RUN: langchain_text_splitters is not installed in this Python (run with the engine)')
@@ -99,4 +106,32 @@ def test_the_import_gets_past_a_langchain_core_stand_in_and_puts_it_back(monkeyp
 
     assert sys.modules['langchain_core'] is core
     assert sys.modules['langchain_core.messages'] is messages
+    assert 'langchain_text_splitters' not in sys.modules
+
+
+def test_the_import_gets_past_a_stand_in_over_real_submodules_and_puts_both_back(monkeypatch):
+    # What the mocked pass can leave behind: real langchain_core submodules, imported by an
+    # earlier test (llm_bedrock/test_token_count.py does), under a bare langchain_core stand-in
+    # that a stub-installing module put over the package. A submodule already in sys.modules is
+    # returned without importing its parent, so the real package must not be reached through them.
+    with _real_text_splitters():
+        real = {name: mod for name, mod in sys.modules.items() if name.startswith('langchain_core.')}
+    assert real, 'importing the splitters loads langchain_core submodules'
+    core = types.ModuleType('langchain_core')
+    monkeypatch.setitem(sys.modules, 'langchain_core', core)
+    for name, mod in real.items():
+        monkeypatch.setitem(sys.modules, name, mod)
+    monkeypatch.delitem(sys.modules, 'langchain_text_splitters', raising=False)
+
+    with _real_text_splitters() as module:
+        assert getattr(module, '__file__', None) is not None
+        package = sys.modules['langchain_core']
+        assert getattr(package, '__path__', None), 'the real langchain_core is loaded inside'
+        loaded = [name for name in real if name in sys.modules and name.count('.') == 1]
+        assert loaded and all(getattr(package, name.split('.')[1]) is sys.modules[name] for name in loaded), (
+            'the package and its submodules come from one import'
+        )
+
+    assert sys.modules['langchain_core'] is core
+    assert all(sys.modules[name] is mod for name, mod in real.items())
     assert 'langchain_text_splitters' not in sys.modules
