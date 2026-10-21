@@ -79,9 +79,9 @@ def store_env(monkeypatch, request):
         yield store, raw, table
     finally:
         try:
-            if store is not None and store.client is not None:
-                store.client.close()
-                store.client = None
+            if store is not None:
+                # The shared pgvector driver owns a connection pool; close() releases it.
+                store.close()
         finally:
             try:
                 raw.rollback()

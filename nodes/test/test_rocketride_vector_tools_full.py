@@ -167,12 +167,16 @@ def tools_env(monkeypatch):
                 allow_write=allow_write,
             )
 
-    yield _Tools, raw_conn
+    # The calls run as an agent's: past the node's two switches every write also
+    # runs the store write gate, which needs the engine's call context.
+    from ai.common.tool_context import ToolCallContext, tool_call
+
+    with tool_call(ToolCallContext(origin='agent', source_type=None, targeted=True, caller={'auth': 'agent'})):
+        yield _Tools, raw_conn
 
     for store in stores:
-        if store.client is not None:
-            store.client.close()
-            store.client = None
+        # The shared pgvector driver owns a connection pool; close() releases it.
+        store.close()
     with raw_conn.cursor() as cur:
         cur.execute(f'DROP TABLE IF EXISTS {TABLE}')
         raw_conn.commit()
@@ -248,7 +252,8 @@ def test_tools_round_trip_on_the_real_store(tools_env):
     assert found['results'][0]['score'] > 0.99
 
     # delete: gone from the count and the listing
-    assert tools.delete({'object_ids': ['obj-c']}) == {'success': True, 'deleted_count': 1}
+    deleted = tools.delete({'object_ids': ['obj-c']})
+    assert (deleted['success'], deleted['deleted_count']) == (True, 1)
     assert tools.stats({})['count'] == 3
     assert '/c' not in tools.objdir({})['paths']
 
@@ -411,15 +416,16 @@ def test_the_shipped_profile_resolves_through_the_real_node(tools_env, monkeypat
         glb, inst = make({'collection': TABLE, 'expose_tools': True})
         assert glb.expose_tools is True and glb.allow_write is False
         if real_collector:
-            assert set(inst._collect_tool_methods()) == {'search', 'objdir', 'get', 'stats'}
+            reads = set(inst._collect_tool_methods())
+            assert {'search', 'objdir', 'get', 'stats', 'dialect', 'documents'} <= reads
+            assert reads.isdisjoint({'upsert', 'delete', 'remove_document'})
 
         glb, inst = make({'collection': TABLE, 'expose_tools': True, 'allow_write': True})
         assert glb.expose_tools is True and glb.allow_write is True
         if real_collector:
-            assert set(inst._collect_tool_methods()) == {'search', 'objdir', 'get', 'stats', 'upsert', 'delete'}
+            assert set(inst._collect_tool_methods()) == reads | {'upsert', 'delete', 'remove_document'}
     finally:
         for glb in opened:
             store = getattr(glb, 'store', None)
-            if store is not None and getattr(store, 'client', None) is not None:
-                store.client.close()
-                store.client = None
+            if store is not None:
+                store.close()
