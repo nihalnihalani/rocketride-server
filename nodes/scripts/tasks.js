@@ -97,12 +97,12 @@ const CPP_NODE_BUILDS = [...SRC_NODE_DIRS]
 // Live database suites. Each one drives a real driver against a real server and
 // stubs the engine surface itself, so it needs no test server; but it must run
 // WITHOUT ROCKETRIDE_MOCK, because nodes/test/mocks shadows psycopg2,
-// qdrant_client and chromadb engine-wide. The mocked pass therefore ignores
-// these files and a separate pass runs them. Each suite skips when its server
-// is unreachable, unless the databases are required (nodes:test-db by default;
-// nodes:test with RR_REQUIRE_DB_TESTS, as CI runs it): then an unreachable
-// server fails, and so does a suite in which nothing passed or a test that
-// skipped without a deliberate "NOT RUN:" reason.
+// qdrant_client and chromadb engine-wide. The mocked pass therefore leaves
+// these files out by path (mockedPassIgnores) and a separate pass runs them.
+// Each suite skips when its server is unreachable, unless the databases are
+// required (nodes:test-db by default; nodes:test with RR_REQUIRE_DB_TESTS, as
+// CI runs it): then an unreachable server fails, and so does a suite in which
+// nothing passed or a test that skipped without a deliberate "NOT RUN:" reason.
 const DB_LIVE_SUITES = [
 	'test_rocketride_db_full.py',
 	// rocketride_vector's agent tools and the vector-store writes, on pgvector.
@@ -135,6 +135,21 @@ const DB_PGVECTOR_POOLER_SUITES = ['test_rocketride_db_full.py', 'test_store_pos
 // RR_TEST_PGVECTOR_POOLER_DSN is not set); any other skip under a required run
 // fails it.
 const DB_EXPECTED_SKIP_PREFIX = 'NOT RUN:';
+
+/**
+ * The collection ignores of the mocked pass. Without test_full every
+ * test_*_full.py is left out by glob; in both modes the live database suites
+ * are also left out by absolute path. pytest makes an --ignore-glob pattern
+ * absolute against its working directory before matching, so the glob holds
+ * only when pytest runs from nodes/ (as this module starts it) or a directory
+ * that contains it; from dist/server, say, it matches nothing, serially or
+ * under xdist. A path holds wherever pytest runs.
+ */
+function mockedPassIgnores(testFull) {
+	const args = testFull ? [] : ['--ignore-glob', '**/test_*_full.py', '--ignore-glob', '**/test_*_full/**'];
+	for (const suite of DB_LIVE_SUITES) args.push('--ignore', path.join(TEST_DIR, suite));
+	return args;
+}
 
 /**
  * Whether the live databases are required: RR_REQUIRE_DB_TESTS when set
@@ -250,7 +265,7 @@ function makeRunPytestAction(options = {}) {
 				testEnv.ROCKETRIDE_URI = parseServerAddress(options.taskserver).uri;
 			}
 
-			// Use absolute paths since cwd is dist/server
+			// Absolute paths: the engine is dist/server's, pytest runs from nodes/ (PACKAGE_DIR)
 			const extraArgs = ['-v', '--rootdir', PACKAGE_DIR];
 
 			// Warmup only concerns the dynamic tests; collecting just those keeps it quick.
@@ -259,14 +274,8 @@ function makeRunPytestAction(options = {}) {
 				extraArgs.unshift(path.join(TEST_DIR, 'test_dynamic.py'));
 			}
 
-			if (!options.test_full) {
-				extraArgs.push('--ignore-glob', '**/test_*_full.py', '--ignore-glob', '**/test_*_full/**');
-			} else {
-				// The live database suites run in their own unmocked pass.
-				for (const suite of DB_LIVE_SUITES) {
-					extraArgs.push('--ignore', path.join(TEST_DIR, suite));
-				}
-			}
+			// The live database suites run in their own unmocked pass (makeRunDbPytestAction).
+			extraArgs.push(...mockedPassIgnores(options.test_full));
 
 			// Exclude skip_node tests by default (same as skip_nodes in pytest_generate_tests for dynamic tests)
 			const pytestTokens = splitPytestOpts(options.pytest);
@@ -770,6 +779,7 @@ module.exports = [module.exports, ...CPP_NODES.map(makeNodeModule)];
 module.exports.dbLane = {
 	DB_LIVE_SUITES,
 	DB_PGVECTOR_POOLER_SUITES,
+	mockedPassIgnores,
 	dbTestsRequired,
 	countJunitResults,
 	checkRequiredDbResults,

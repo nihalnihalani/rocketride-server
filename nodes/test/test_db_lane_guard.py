@@ -50,6 +50,10 @@ if (input.required !== undefined) {
     out.suites = lane.DB_LIVE_SUITES;
     out.pgvectorPoolerSuites = lane.DB_PGVECTOR_POOLER_SUITES;
 }
+if (input.ignores !== undefined) {
+    out.ignores = { mocked: lane.mockedPassIgnores(false), full: lane.mockedPassIgnores(true) };
+    out.testDir = require('path').join(require('path').dirname(process.argv[1]), '..', 'test');
+}
 if (input.pooled !== undefined) {
     try {
         lane.checkPooledCases(input.pooled, input.suites);
@@ -186,3 +190,21 @@ def test_pgvector_suites_must_pass_a_pooled_case_when_the_pooler_is_set():
     )
     error = _lane({'pooled': direct_only, 'suites': suites})['pooledError']
     assert error is not None and 'test_store_postgres_full' in error and 'test_rocketride_db_full' not in error
+
+
+def test_the_mocked_pass_leaves_the_live_suites_out_by_path_wherever_pytest_runs():
+    # pytest makes an --ignore-glob pattern absolute against its working directory, so the
+    # glob holds only from nodes/ or above; an --ignore path holds from anywhere.
+    out = _lane({'ignores': True, 'required': []})
+    test_dir = Path(out['testDir']).resolve()
+    by_path = [str(test_dir / suite) for suite in out['suites']]
+
+    def ignored(args):
+        return [str(Path(args[i + 1]).resolve()) for i, a in enumerate(args) if a == '--ignore']
+
+    mocked, full = out['ignores']['mocked'], out['ignores']['full']
+    assert ignored(mocked) == by_path, 'nodes:test leaves every live suite out by absolute path'
+    assert ignored(full) == by_path, 'so does nodes:test-full'
+    assert all(Path(p).is_absolute() for p in ignored(mocked) + ignored(full))
+    assert mocked[:4] == ['--ignore-glob', '**/test_*_full.py', '--ignore-glob', '**/test_*_full/**']
+    assert '--ignore-glob' not in full, 'nodes:test-full collects the other _full suites'
