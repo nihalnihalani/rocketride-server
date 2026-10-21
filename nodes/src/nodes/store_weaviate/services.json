@@ -235,11 +235,11 @@
 		},
 		"weaviate.cloud": {
 			"object": "cloud",
-			"properties": ["vector.cloud.host", "vector.apikey", "vector.score", "vector.collection", "weaviate.serverName", "vector.allow_writes", "vector.agent_writes"]
+			"properties": ["vector.cloud.host", "vector.apikey", "vector.score", "vector.collection", "weaviate.serverName", "vector.allow_writes"]
 		},
 		"weaviate.local": {
 			"object": "local",
-			"properties": ["vector.local.host", "vector.local.port", "vector.local.grpc_port", "vector.score", "vector.collection", "weaviate.serverName", "vector.allow_writes", "vector.agent_writes"]
+			"properties": ["vector.local.host", "vector.local.port", "vector.local.grpc_port", "vector.score", "vector.collection", "weaviate.serverName", "vector.allow_writes"]
 		},
 		"weaviate.profile": {
 			"title": "Type of Weaviate host",

@@ -1,7 +1,6 @@
 {
 	"_generated": "by apps/vector-ui/scripts/gen_defaults.py from packages/ai/src/ai/common/store/vx_defaults.py; do not edit",
 	"VECTOR_ALLOW_WRITES_DEFAULT": false,
-	"VECTOR_AGENT_WRITES_DEFAULT": true,
 	"VECTOR_TOOL_LIMITS": {
 		"documents_page": 500,
 		"chunks_page": 200,

@@ -28,15 +28,20 @@
 ``remove_document``, ``delete`` and ``upsert`` call :func:`check_write` first,
 before they check their input or touch the store. The gate reads who is calling only from the context the
 engine attached to the call (``ai.common.tool_context.current_tool_call()``);
-nothing in the tool input is ever read as context. It checks, in order:
+nothing in the tool input is ever read as context.
+
+It is the inner gate. The outer one is the node's ``expose_tools`` / ``allow_write``
+pair (``VectorStoreToolMixin``, #2631): with ``allow_write`` off the write tools do
+not exist for anyone, so a call never reaches this gate. ``allow_write`` alone
+decides whether an agent may write, as on develop; the gate has no switch of its
+own for agents. It checks, in order:
 
 ====================================================  ========================
 Condition                                             Result
 ====================================================  ========================
 any objectId is ``'schema'`` (the control record)     ``RESERVED_ID``
 no context (or one the gate cannot read)              ``WRITES_UNKNOWN_CALLER``
-an agent call and ``agent_writes`` on                 allowed
-an agent call and ``agent_writes`` off                ``WRITES_AGENT``
+an agent call                                         allowed
 a DAP call and ``allow_writes`` off                   ``WRITES_DISABLED``
 a DAP call from a source other than Tools             ``WRITES_SOURCE``
 a DAP caller that is not an account or a task key     ``WRITES_PUBLIC``
@@ -168,7 +173,6 @@ def check_write(
     *,
     object_ids: Sequence[str],
     allow_writes: bool,
-    agent_writes: bool,
     supplies_embedding: bool = False,
     context: Any = _UNSET,
 ) -> GateDecision:
@@ -176,8 +180,7 @@ def check_write(
 
     :param tool: ``'remove_document'``, ``'delete'`` or ``'upsert'``.
     :param object_ids: Every objectId the call would write or remove.
-    :param allow_writes: The node's ``allow_writes`` switch (DAP calls).
-    :param agent_writes: The node's ``agent_writes`` switch (agent calls).
+    :param allow_writes: The node's ``allow_writes`` switch (DAP calls); agents do not read it.
     :param supplies_embedding: True when an ``upsert`` carries caller-supplied embeddings.
     :param context: The call context; read from the engine when left out.
     :raises ToolRefusal: With the code of the first row of the gate that refuses.
@@ -191,9 +194,8 @@ def check_write(
             'WRITES_UNKNOWN_CALLER', 'The engine did not identify this request, so the store refused the write.'
         )
 
+    # An agent reaches this gate only through a write tool the outer gate (allow_write) let it see.
     if ctx.origin == 'agent':
-        if not agent_writes:
-            raise ToolRefusal('WRITES_AGENT', 'Writes from agents are turned off on this store node (agent_writes).')
         return GateDecision(origin='agent', caller={'auth': 'agent', 'userId': None, 'teamId': None})
 
     if not allow_writes:

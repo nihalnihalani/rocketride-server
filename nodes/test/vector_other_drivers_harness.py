@@ -6,7 +6,7 @@
 """Harness for the mocked explorer-hook suites of the experimental vector stores.
 
 Milvus, Weaviate, Pinecone, Astra DB and MongoDB Atlas have no local server in
-this repository, so their explorer hooks (``describe``, ``listDocuments``,
+this repository, so their explorer hooks (``describe``, ``listDocumentPage``,
 ``scrollChunks``, ``getVectors``, ...) are tested against in-memory clients:
 
 * Milvus, Weaviate, Pinecone and Astra use the client mocks under
@@ -314,7 +314,7 @@ class Adapter:
     counts: bool = True
     #: whether the listing has exact per-document chunk counts
     listing_counts: bool = True
-    #: whether listDocuments is sorted by path natively
+    #: whether listDocumentPage is sorted by path natively
     listing_sorted: bool = False
     #: strategy_used for sampleChunks('random')
     random_strategy: str = 'first'
@@ -328,6 +328,8 @@ class Adapter:
     legacy_control_has_model: bool = True
     #: the client library the driver talks to (its errors may carry the server address)
     client_module: str = ''
+    #: whether searchSemantic cuts at the node threshold when minScore is unset (develop's Milvus), else at the floor
+    threshold_in_driver: bool = False
 
     def new_store(self) -> Any:  # pragma: no cover - interface
         raise NotImplementedError
@@ -386,7 +388,7 @@ def collect_listing(
     pages: List[Any] = []
     cursor = None
     for _ in range(max_pages):
-        page = store.listDocuments(
+        page = store.listDocumentPage(
             cursor=cursor, limit=limit, object_ids=kwargs.get('object_ids'), deleted=deleted, sort='path'
         )
         pages.append(page)
@@ -477,6 +479,7 @@ class MilvusAdapter(Adapter):
     backend = 'milvus'
     services = 'store_milvus/services.json'
     floor = 0.2
+    threshold_in_driver = True
     offset_raises = True
     extras_stored = True
 

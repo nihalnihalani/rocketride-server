@@ -963,15 +963,15 @@ class Store(DocumentStoreBase):
         )
         return int(rows[0]['n']) if rows else 0
 
-    @_backend_errors('countDocuments')
-    def countDocuments(self, docFilter: DocFilter) -> Optional[int]:
+    @_backend_errors('countDocumentsWhere')
+    def countDocumentsWhere(self, docFilter: DocFilter) -> Optional[int]:
         """Distinct objectIds matching ``docFilter`` ($group), control record excluded."""
         if not self._doesCollectionExist():
             return 0
         return self._countGroups(self._notControl(self._convertFilter(docFilter)))
 
-    @_backend_errors('listDocuments')
-    def listDocuments(
+    @_backend_errors('listDocumentPage')
+    def listDocumentPage(
         self,
         *,
         cursor: Optional[str],

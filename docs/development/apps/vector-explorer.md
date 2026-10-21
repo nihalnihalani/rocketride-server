@@ -37,7 +37,7 @@ drivers behind them.
 | Tool audience (`agent`, `dap`) | `@tool_function(audience=...)` in `packages/server/engine-lib/rocketlib-python/lib/rocketlib/filters.py` |
 | The `embed` tool on the embedding nodes | `packages/ai/src/ai/common/embed_tool.py`, used by `embedding_transformer` and `embedding_openai` |
 | Store nodes | `nodes/src/nodes/{store_postgres,rocketride_vector,store_qdrant,store_chroma,store_milvus,store_weaviate,store_pinecone,store_astra,store_atlas}/` |
-| The write switches as node fields | `vector.allow_writes` and `vector.agent_writes` in `nodes/src/nodes/core/services.common.vector.json`; on `rocketride_vector`, `rrvector.allow_writes` behind the outer switches `rrvector.expose_tools` and `rrvector.allow_write` (contract §6.0) |
+| The write switches as node fields | `vector.allow_writes` in `nodes/src/nodes/core/services.common.vector.json`; on `rocketride_vector`, `rrvector.allow_writes` behind the outer switches `rrvector.expose_tools` and `rrvector.allow_write` (contract §6.0). Agents have no switch of their own: `allow_write` alone decides their writes |
 | Starting pipelines | `apps/vector-ui/templates/*.pipe` |
 | Wire fixtures and generators | `apps/vector-ui/tests/fixtures/` |
 | Live acceptance (engine, containers, stub LLM, browser lanes) | `scripts/acceptance/vector-explorer/` ([README](../../../scripts/acceptance/vector-explorer/README.md)) |
@@ -157,9 +157,9 @@ both lists to every suite the change lanes own in `lanes.json`.
 
 ## The write switch
 
-- **One source for the defaults.** `VECTOR_ALLOW_WRITES_DEFAULT` (false) and
-  `VECTOR_AGENT_WRITES_DEFAULT` (true) live in `vx_defaults.py`.
-  `apps/vector-ui/scripts/gen_defaults.py` exports them, with the tool limits,
+- **One source for the default.** `VECTOR_ALLOW_WRITES_DEFAULT` (false) lives
+  in `vx_defaults.py`.
+  `apps/vector-ui/scripts/gen_defaults.py` exports it, with the tool limits,
   to `apps/vector-ui/tests/fixtures/defaults.json`, and `--check` fails when
   the JSON is stale. The node, the app's templates test and the tool-path
   suite's expectation table all read that value, so changing a default is one
@@ -169,10 +169,12 @@ both lists to every suite the change lanes own in `lanes.json`.
   `store_1`, `false` on `store_2`.
 - **The gate** (contract §6.3) runs first in `remove_document`, `delete` and
   `upsert`, fails closed, and answers refusals as envelopes; the write tools
-  stay listed. Agent pipelines keep writing with the defaults (`agent_writes`).
+  stay listed. An agent's write is decided by the outer switch `allow_write`
+  alone, as on develop (#2631); the gate has no agent switch, so agent
+  pipelines keep writing as before.
   `rocketride_vector` is the exception (contract §6.0): its tools, and then its
   write tools, exist only while `expose_tools` and `allow_write` are on (both
-  off by default), and `allow_write` is its one switch for agent writes. The
+  off by default), so its agents write only where `allow_write` is on. The
   `rocketride_vector` template sets `expose_tools` on both stores and
   `allow_write` on `store_1` only: `store_2` hides its write tools entirely, so
   neither agents nor DAP callers can write there (a write to it fails as an

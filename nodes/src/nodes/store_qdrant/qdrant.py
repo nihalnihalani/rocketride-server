@@ -224,7 +224,7 @@ class Store(DocumentStoreBase):
     # (nodes/test/test_store_qdrant_full.py) runs on a new and a legacy collection.
     VX_SUPPORT = 'supported'
 
-    # Most distinct objectIds counted exactly (countDocuments, the listing's total and
+    # Most distinct objectIds counted exactly (countDocumentsWhere, the listing's total and
     # its sweep for documents without chunk 0); above it the count is unknown (None)
     # and the listing carries the caveat 'document_count_capped'.
     COUNT_DOCUMENTS_CAP = 10000
@@ -1142,7 +1142,7 @@ class Store(DocumentStoreBase):
         flt.must_not = list(flt.must_not or []) + [self._notControl()]
         return int(self.client.count(collection_name=self.collection, count_filter=flt, exact=True).count)
 
-    def countDocuments(self, docFilter: DocFilter) -> Optional[int]:
+    def countDocumentsWhere(self, docFilter: DocFilter) -> Optional[int]:
         """
         Distinct objectIds matching ``docFilter``, counted by an exact facet.
 
@@ -1314,7 +1314,7 @@ class Store(DocumentStoreBase):
                 lists.popitem(last=False)
         return token
 
-    def listDocuments(self, *, cursor, limit, object_ids, deleted, sort):
+    def listDocumentPage(self, *, cursor, limit, object_ids, deleted, sort):
         """
         One page of documents: chunk-0 rows in storage order, then documents without chunk 0.
 

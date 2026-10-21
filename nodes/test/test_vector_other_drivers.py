@@ -75,7 +75,7 @@ def test_support_stays_experimental(adapter):
 def test_capabilities_name_the_native_hooks(adapter, store):
     """The driver overrides the hooks it answers natively and leaves knnGraph to the node."""
     caps = store.capabilities()
-    for hook in ('describe', 'scoreInfo', 'listDocuments', 'scrollChunks', 'getVectors', 'sampleChunks'):
+    for hook in ('describe', 'scoreInfo', 'listDocumentPage', 'scrollChunks', 'getVectors', 'sampleChunks'):
         assert hook in caps, hook
     assert 'knn_native' not in caps
     assert ('sample_stratified_native' in caps) == adapter.stratified_native
@@ -206,7 +206,7 @@ def test_count_chunks_on_a_missing_collection_is_zero(adapter, store):
 
 
 # -----------------------------------------------------------------------------
-# listDocuments
+# listDocumentPage
 # -----------------------------------------------------------------------------
 
 
@@ -250,11 +250,11 @@ def test_listing_costs_the_same_backend_calls_whatever_the_page_size(adapter, st
     """A page of 12 documents costs no more backend calls than a page of 3 (no count per document)."""
     for i in range(12):
         h.ingest(store, f'doc-{i:02d}', f'/docs/{i:02d}.md', [0, 1, 2])
-    store.listDocuments(cursor=None, limit=1, object_ids=None, deleted='active', sort='path')  # fills driver caches
+    store.listDocumentPage(cursor=None, limit=1, object_ids=None, deleted='active', sort='path')  # fills driver caches
     counter = adapter.count_calls(store)
-    small = store.listDocuments(cursor=None, limit=3, object_ids=None, deleted='active', sort='path')
+    small = store.listDocumentPage(cursor=None, limit=3, object_ids=None, deleted='active', sort='path')
     small_calls, counter['calls'] = counter['calls'], 0
-    large = store.listDocuments(cursor=None, limit=12, object_ids=None, deleted='active', sort='path')
+    large = store.listDocumentPage(cursor=None, limit=12, object_ids=None, deleted='active', sort='path')
     assert len(small.items) == 3 and len(large.items) == 12
     assert counter['calls'] == small_calls, (small_calls, counter['calls'])
     assert small_calls <= 5, small_calls
@@ -283,7 +283,7 @@ def test_listing_honours_the_deleted_modes(adapter, store):
 
 #: Every hook read that takes a deleted mode, asked for one outside active / deleted / all
 UNKNOWN_DELETED_MODE = {
-    'listDocuments': lambda store: store.listDocuments(
+    'listDocumentPage': lambda store: store.listDocumentPage(
         cursor=None, limit=5, object_ids=None, deleted='bogus', sort='path'
     ),
     'scrollChunks': lambda store: store.scrollChunks('doc-a', after_chunk=-1, limit=5, deleted='bogus'),
@@ -291,7 +291,7 @@ UNKNOWN_DELETED_MODE = {
         n=3, seed=1, strategy='random', docFilter=h.VxFilter(deleted='bogus'), include_keys=[]
     ),
     'countChunks': lambda store: store.countChunks(h.VxFilter(deleted='bogus')),
-    'countDocuments': lambda store: store.countDocuments(h.VxFilter(deleted='bogus')),
+    'countDocumentsWhere': lambda store: store.countDocumentsWhere(h.VxFilter(deleted='bogus')),
 }
 
 
@@ -331,10 +331,10 @@ def test_listing_on_a_backend_that_ignores_offsets_ends_with_a_caveat(adapter, s
     """A repeated page ends the listing instead of looping (documents_paging_unsupported)."""
     _ingest_five(store)
     adapter.ignore_offsets(store)
-    first = store.listDocuments(cursor=None, limit=2, object_ids=None, deleted='active', sort='path')
+    first = store.listDocumentPage(cursor=None, limit=2, object_ids=None, deleted='active', sort='path')
     assert len(first.items) == 2
     assert first.next_cursor is not None
-    second = store.listDocuments(cursor=first.next_cursor, limit=2, object_ids=None, deleted='active', sort='path')
+    second = store.listDocumentPage(cursor=first.next_cursor, limit=2, object_ids=None, deleted='active', sort='path')
     assert second.items == []
     assert second.next_cursor is None
     assert 'documents_paging_unsupported' in second.caveats
@@ -344,7 +344,7 @@ def test_listing_refuses_a_cursor_it_did_not_issue(adapter, store):
     """A malformed cursor is INVALID_INPUT, not a crash."""
     h.ingest(store, 'doc-a', '/docs/a.md', [0])
     with pytest.raises(ToolRefusal) as excinfo:
-        store.listDocuments(cursor='%%not-a-cursor%%', limit=2, object_ids=None, deleted='active', sort='path')
+        store.listDocumentPage(cursor='%%not-a-cursor%%', limit=2, object_ids=None, deleted='active', sort='path')
     assert excinfo.value.code == 'INVALID_INPUT'
 
 
@@ -373,7 +373,7 @@ def test_listing_refuses_a_forged_position(adapter, store, value):
     if adapter.name == 'pinecone' and isinstance(value, str):
         value = 7  # Pinecone's position is the backend's token: a string is its own shape
     with pytest.raises(ToolRefusal) as excinfo:
-        store.listDocuments(
+        store.listDocumentPage(
             cursor=_cursor(CURSOR_SHAPES[adapter.name](value)), limit=2, object_ids=None, deleted='active', sort='path'
         )
     assert excinfo.value.code == 'INVALID_INPUT'
@@ -392,7 +392,7 @@ def test_listing_with_a_page_token_the_backend_rejects(adapter, store):
     if adapter.name not in BACKEND_TOKENS:
         # Offset cursors: the driver itself refuses a position it never issues
         with pytest.raises(ToolRefusal):
-            store.listDocuments(
+            store.listDocumentPage(
                 cursor=_cursor(CURSOR_SHAPES[adapter.name]('garbage')),
                 limit=2,
                 object_ids=None,
@@ -402,7 +402,7 @@ def test_listing_with_a_page_token_the_backend_rejects(adapter, store):
         return
     cursor, rejection = BACKEND_TOKENS[adapter.name]
     with pytest.raises(StoreError) as excinfo:
-        store.listDocuments(cursor=_cursor(cursor), limit=2, object_ids=None, deleted='active', sort='path')
+        store.listDocumentPage(cursor=_cursor(cursor), limit=2, object_ids=None, deleted='active', sort='path')
     assert rejection in str(excinfo.value)
 
 
@@ -410,14 +410,14 @@ def test_listing_an_empty_id_list_is_empty(adapter, store):
     """object_ids=[] asks for no document: an empty last page, not the whole collection."""
     h.ingest(store, 'doc-a', '/docs/a.md', [0])
     h.ingest(store, 'doc-b', '/docs/b.md', [0])
-    page = store.listDocuments(cursor=None, limit=5, object_ids=[], deleted='active', sort='path')
+    page = store.listDocumentPage(cursor=None, limit=5, object_ids=[], deleted='active', sort='path')
     assert page.items == []
     assert page.next_cursor is None
 
 
 def test_listing_a_missing_collection_is_empty(adapter, store):
     """No collection: an empty last page."""
-    page = store.listDocuments(cursor=None, limit=5, object_ids=None, deleted='active', sort='path')
+    page = store.listDocumentPage(cursor=None, limit=5, object_ids=None, deleted='active', sort='path')
     assert page.items == []
     assert page.next_cursor is None
 
@@ -587,12 +587,17 @@ def test_remove_counted_reports_the_rows_removed(adapter, store):
 # -----------------------------------------------------------------------------
 
 
-def test_semantic_search_applies_the_floor_not_the_threshold(adapter, store):
-    """Rows under the node threshold survive; rows under the floor do not, unless minScore is -inf."""
+def test_semantic_search_cuts_at_the_floor_or_the_drivers_threshold(adapter, store):
+    """Rows under the cut are dropped unless minScore is -inf.
+
+    The cut is the floor, so rows under the node threshold survive (the questions lane
+    applies it), except on Milvus, whose driver cut at the threshold on develop and still does.
+    """
     h.ingest(store, 'doc-a', '/docs/a.md', [0, 1, 2])
     adapter.set_scores(store, [0.9, 0.35, 0.1])
     kept = [doc.score for doc in store.searchSemantic(_question(), DocFilter(limit=10))]
-    expected = [s for s in (0.9, 0.35, 0.1) if s >= adapter.floor]
+    cut = store.threshold_search if adapter.threshold_in_driver else adapter.floor
+    expected = [s for s in (0.9, 0.35, 0.1) if s >= cut]
     assert kept == pytest.approx(expected, abs=1e-6)
     adapter.set_scores(store, [0.9, 0.35, 0.1])
     every = [doc.score for doc in store.searchSemantic(_question(), h.VxFilter(limit=10, minScore=-math.inf))]
@@ -647,8 +652,8 @@ def test_services_json_cases_replay_on_the_mock(adapter, store):
 TOOL_CALLS = {
     'describe': lambda store: store.describe(),
     'countChunks': lambda store: store.countChunks(DocFilter()),
-    'countDocuments': lambda store: store.countDocuments(DocFilter()),
-    'listDocuments': lambda store: store.listDocuments(
+    'countDocumentsWhere': lambda store: store.countDocumentsWhere(DocFilter()),
+    'listDocumentPage': lambda store: store.listDocumentPage(
         cursor=None, limit=5, object_ids=None, deleted='active', sort='path'
     ),
     'scrollChunks': lambda store: store.scrollChunks('doc-a', after_chunk=-1, limit=5, deleted='active'),
@@ -677,10 +682,10 @@ TOOL_CALLS = {
 #: answering) before it reaches the backend fails here instead of passing unchecked.
 ANSWERS_WITHOUT_BACKEND = {
     ('pinecone', 'searchKeyword'): 'refuses',  # no keyword search on Pinecone: StoreUnsupported
-    ('milvus', 'countDocuments'): 'inherits',  # base default None: no distinct count
-    ('astra_db', 'countDocuments'): 'inherits',
+    ('milvus', 'countDocumentsWhere'): 'inherits',  # base default None: no distinct count
+    ('astra_db', 'countDocumentsWhere'): 'inherits',
     ('pinecone', 'countChunks'): 'inherits',  # Pinecone cannot count
-    ('pinecone', 'countDocuments'): 'inherits',
+    ('pinecone', 'countDocumentsWhere'): 'inherits',
     ('pinecone', 'removeCounted'): 'inherits',
     ('astra_db', 'doesCollectionExist'): 'reads_missing',  # Astra reads a failed check as a missing collection
 }

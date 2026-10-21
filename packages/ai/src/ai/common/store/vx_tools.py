@@ -63,7 +63,6 @@ from ..schema import Doc, DocFilter, QuestionText
 from . import vx_write_gate
 from .errors import StoreError, StoreUnsupported, ToolRefusal
 from .vx_defaults import (
-    VECTOR_AGENT_WRITES_DEFAULT,
     VECTOR_ALLOW_WRITES_DEFAULT,
     VECTOR_TOOL_DEFAULTS,
     VECTOR_TOOL_LIMITS,
@@ -98,7 +97,7 @@ MAX_ANSWER_BYTES = 8 * 1024 * 1024
 #: The tools that change data (gated by ``vx_write_gate``).
 WRITE_TOOLS = ('remove_document', 'delete', 'upsert')
 
-#: Most rows ``objdir`` scans through ``listDocuments`` to fill one answer.
+#: Most rows ``objdir`` scans through ``listDocumentPage`` to fill one answer.
 OBJDIR_SCAN_MAX = 10000
 
 #: Documents the sampler lists to build its key space (a scope of more documents is listed whole,
@@ -199,12 +198,12 @@ INVALID_CURSOR_TEXT = 'cursor must be the next_cursor of a previous page.'
 
 
 def invalidCursor() -> ToolRefusal:
-    """The refusal (``INVALID_INPUT``) a ``listDocuments`` hook raises for a cursor it did not issue."""
+    """The refusal (``INVALID_INPUT``) a ``listDocumentPage`` hook raises for a cursor it did not issue."""
     return ToolRefusal('INVALID_INPUT', INVALID_CURSOR_TEXT)
 
 
 def defaultCursorState(cursor: Optional[str]) -> Tuple[int, Optional[str]]:
-    """Return ``(offset, first key)`` of a cursor issued by the default ``listDocuments``.
+    """Return ``(offset, first key)`` of a cursor issued by the default ``listDocumentPage``.
 
     ``(0, None)`` for no cursor. A cursor that does not decode, lacks the offset
     ``o``, carries an offset that is not an integer in ``0..CURSOR_OFFSET_MAX``, or a
@@ -884,7 +883,7 @@ def _vx_state(store: Any) -> _VxState:
 
 
 class ListingGuard:
-    """Ends a cursor loop over ``listDocuments`` that would not end on its own.
+    """Ends a cursor loop over ``listDocumentPage`` that would not end on its own.
 
     Paging stops when the page has no cursor, when the driver reports
     ``documents_paging_unsupported``, after :data:`LISTING_STALE_PAGES` pages in a row
@@ -1065,10 +1064,6 @@ class VectorExplorerTools:
         """Whether a DAP caller may write: ``allow_write`` and ``allow_writes`` both on."""
         return self._vx_outer_writes() and self._vx_switch('allow_writes', VECTOR_ALLOW_WRITES_DEFAULT)
 
-    def _vx_agent_writes(self) -> bool:
-        """Whether an agent may write: ``allow_write`` and ``agent_writes`` both on."""
-        return self._vx_outer_writes() and self._vx_switch('agent_writes', VECTOR_AGENT_WRITES_DEFAULT)
-
     @staticmethod
     def _vx_forget_counts(store: Any) -> None:
         _vx_state(store).forget_counts()
@@ -1137,7 +1132,7 @@ class VectorExplorerTools:
         return {
             'describe': True,
             'count': True,
-            'count_documents': has('countDocuments'),
+            'count_documents': has('countDocumentsWhere'),
             'documents': True,
             'documents_distinct': has('documents_distinct'),
             'documents_sorted': has('documents_sorted'),
@@ -1319,7 +1314,6 @@ class VectorExplorerTools:
             'score': self._vx_score(store),
             'support': support,
             'allow_writes': self._vx_allow_writes(),
-            'agent_writes': self._vx_agent_writes(),
             'writes_scope': 'tools_source',
             'write_tools': list(WRITE_TOOLS),
             'capabilities': capabilities,
@@ -1343,7 +1337,7 @@ class VectorExplorerTools:
     def _vx_compute_counts(self, store: Any) -> Dict[str, Any]:
         """The filtered figures of ``stats`` (control record excluded); None where the store cannot count."""
         caveats: List[str] = []
-        documents = self._vx_count(store.countDocuments, deletedFilter('active'))
+        documents = self._vx_count(store.countDocumentsWhere, deletedFilter('active'))
         first = self._vx_count(store.countChunks, deletedFilter('active', chunkIds=[0]))
         without_first: Optional[int] = None
         if documents is None and first is not None:
@@ -1506,7 +1500,7 @@ class VectorExplorerTools:
         # the closed keyword-only signature of the first contract and are filtered by the app.
         hand_over = doc_filter is not None and 'documents_filter' in store.capabilities()
         hook_args: Dict[str, Any] = {'filter': doc_filter} if hand_over else {}
-        page = store.listDocuments(
+        page = store.listDocumentPage(
             cursor=cursor, limit=limit, object_ids=object_ids, deleted=deleted, sort=sort, **hook_args
         )
         items = [
@@ -1710,7 +1704,7 @@ class VectorExplorerTools:
         guard = ListingGuard(limit, page_size, max(0.0, listing_deadline - _monotonic()))
         reason = 'complete'
         while True:
-            page = store.listDocuments(
+            page = store.listDocumentPage(
                 cursor=cursor,
                 limit=page_size,
                 object_ids=object_ids,
@@ -2027,7 +2021,7 @@ class VectorExplorerTools:
 
             if doc_order and any(oid not in listing for oid in doc_order):
                 try:
-                    page = store.listDocuments(
+                    page = store.listDocumentPage(
                         cursor=None,
                         limit=min(len(doc_order), LIMITS['documents_page']),
                         object_ids=doc_order[: LIMITS['documents_page']],
@@ -2117,7 +2111,7 @@ class VectorExplorerTools:
         of_filter = {'objectIds': object_ids} if object_ids else {}
         of = {
             'chunks': self._vx_count(store.countChunks, deletedFilter(deleted, **of_filter)),
-            'documents': self._vx_count(store.countDocuments, deletedFilter(deleted, **of_filter)),
+            'documents': self._vx_count(store.countDocumentsWhere, deletedFilter(deleted, **of_filter)),
         }
         if listed is None:
             # A native sampler drew from the whole scope without listing it: its key space is
@@ -2464,7 +2458,6 @@ class VectorExplorerTools:
             'remove_document',
             object_ids=_gate_ids(args.get('object_ids')),
             allow_writes=self._vx_allow_writes(),
-            agent_writes=self._vx_agent_writes(),
         )
         ids = _strings_arg(args.get('object_ids'), 'object_ids', LIMITS['write_ids_max'])
         removed, not_found, rows = self._vx_remove(store, ids)

@@ -69,6 +69,8 @@ def test_l2_scores_fall_with_distance(adapter, store):
     """L2 distance d scores 1 / (1 + d): the closest row scores highest."""
     h.ingest(store, 'doc-a', '/docs/a.md', [0, 1])
     store.similarity = 'L2'
+    # The driver cuts at the node threshold (develop's rule); lowered so both rows come back.
+    store.threshold_search = 0.0
     records = [r for r in adapter.records(store) if r['meta'].get('objectId') == 'doc-a']
 
     def search(collection_name, data, filter=None, limit=10, output_fields=None, **kwargs):
@@ -121,9 +123,9 @@ def test_listing_counts_are_unknown_when_a_page_has_more_chunks_than_one_query(a
     monkeypatch.setattr(adapter.module, 'MAX_QUERY_WINDOW', 5)
     for i in range(3):
         h.ingest(store, f'doc-{i}', f'/docs/{i}.md', [0, 1, 2])
-    page = store.listDocuments(cursor=None, limit=2, object_ids=None, deleted='active', sort='path')
+    page = store.listDocumentPage(cursor=None, limit=2, object_ids=None, deleted='active', sort='path')
     assert len(page.items) == 2
     assert page.counts_exact is False
     assert [row.chunks for row in page.items] == [None, None]
-    small = store.listDocuments(cursor=None, limit=1, object_ids=None, deleted='active', sort='path')
+    small = store.listDocumentPage(cursor=None, limit=1, object_ids=None, deleted='active', sort='path')
     assert small.counts_exact is True and small.items[0].chunks == 3

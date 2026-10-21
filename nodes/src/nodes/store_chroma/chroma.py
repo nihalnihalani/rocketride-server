@@ -134,7 +134,7 @@ def _check_server_version(version: str) -> None:
 
 class Store(DocumentStoreBase):
     # Explorer capabilities beyond the hooks this class overrides (vx_types.CAPABILITY_KEYS).
-    # documents_filter: listDocuments applies the filter's has_first_chunk (and names the other keys).
+    # documents_filter: listDocumentPage applies the filter's has_first_chunk (and names the other keys).
     VX_DRIVER_CAPABILITIES = frozenset({'documents_distinct', 'search_keyword', 'documents_filter'})
 
     # dialect.keyword_match: searchKeyword is where_document {'$contains': text}, which matches text fragments.
@@ -1235,7 +1235,7 @@ class Store(DocumentStoreBase):
         ]
         return orphans, len(per_object), capped
 
-    def listDocuments(self, *, cursor, limit, object_ids, deleted, sort, filter=None):
+    def listDocumentPage(self, *, cursor, limit, object_ids, deleted, sort, filter=None):
         """
         One page of documents: chunk-0 records by offset, then documents without chunk 0.
 

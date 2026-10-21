@@ -171,7 +171,6 @@ export function readDialect(info: Record<string, unknown> | null | undefined): I
 		},
 		support: info.support === 'supported' ? 'supported' : 'experimental',
 		allow_writes: info.allow_writes === true,
-		agent_writes: info.agent_writes === true,
 		writes_scope: str(info.writes_scope) ?? 'tools_source',
 		write_tools: strings(info.write_tools),
 		capabilities,

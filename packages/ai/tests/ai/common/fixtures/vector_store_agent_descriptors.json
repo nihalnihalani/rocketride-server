@@ -30,11 +30,12 @@
   }
  },
  {
-  "description": "Demo corpus Retrieve document chunks by objectId from the vector database.",
+  "description": "Demo corpus Retrieve document chunks by objectId from the vector database, in pages of up to 100 ordered by chunk ID; `total` is the document's chunk count and `has_more` says whether another page follows. A document is read up to 10000 chunks; `truncated` is true when that ceiling was hit.",
   "inputSchema": {
    "properties": {
     "limit": {
-     "description": "Maximum number of chunks to return (default 100).",
+     "description": "Maximum number of chunks to return (default and cap 100).",
+     "minimum": 1,
      "type": "integer"
     },
     "object_id": {
@@ -42,7 +43,8 @@
      "type": "string"
     },
     "offset": {
-     "description": "Number of chunks to skip (default 0).",
+     "description": "Number of chunks to skip (default 0); pages are ordered by chunk ID on every store.",
+     "minimum": 0,
      "type": "integer"
     }
    },
@@ -71,11 +73,23 @@
      },
      "type": "array"
     },
+    "has_more": {
+     "description": "Whether a page follows this one.",
+     "type": "boolean"
+    },
+    "offset": {
+     "type": "integer"
+    },
     "success": {
      "type": "boolean"
     },
     "total": {
+     "description": "Chunks the document has (up to 10000).",
      "type": "integer"
+    },
+    "truncated": {
+     "description": "True when the document hit the 10000-chunk read ceiling: total and the last page may be incomplete.",
+     "type": "boolean"
     }
    },
    "type": "object"
@@ -86,11 +100,13 @@
   "inputSchema": {
    "properties": {
     "limit": {
-     "description": "Maximum number of results to return (default 1000).",
+     "description": "Maximum number of results to return (default and cap 1000).",
+     "minimum": 1,
      "type": "integer"
     },
     "offset": {
      "description": "Number of results to skip (default 0).",
+     "minimum": 0,
      "type": "integer"
     },
     "parent": {

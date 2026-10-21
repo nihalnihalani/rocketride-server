@@ -65,8 +65,7 @@ class IGlobal(StoreGlobalBase):
     # Read by VectorStoreToolMixin before a write tool runs. The base resolves
     # the rrvector.allow_write setting at start; this class default keeps
     # writes off when nothing is configured. It is the one switch for agent
-    # writes on this node: there is no rrvector.agent_writes setting, so the
-    # write gate's agent switch keeps its default (on) behind this one.
+    # writes, as on every store node: the write gate has no agent switch.
     allow_write: bool = False
 
     def _open_store(self, logical_type: str, conn_config: Dict[str, Any], bag: Dict[str, Any]):

@@ -229,11 +229,11 @@
 		},
 		"milvus.cloud": {
 			"object": "cloud",
-			"properties": ["vector.cloud.host", "vector.cloud.port", "vector.apikey", "vector.score", "vector.collection", "milvus.serverName", "vector.allow_writes", "vector.agent_writes"]
+			"properties": ["vector.cloud.host", "vector.cloud.port", "vector.apikey", "vector.score", "vector.collection", "milvus.serverName", "vector.allow_writes"]
 		},
 		"milvus.local": {
 			"object": "local",
-			"properties": ["vector.local.host", "vector.local.port", "vector.score", "vector.collection", "milvus.serverName", "vector.allow_writes", "vector.agent_writes"]
+			"properties": ["vector.local.host", "vector.local.port", "vector.score", "vector.collection", "milvus.serverName", "vector.allow_writes"]
 		},
 		"milvus.profile": {
 			"title": "Type of Milvus host",

@@ -66,7 +66,7 @@ MAX_QUERY_RESULTS = 10000
 # Objects read per page when updating a document's chunks
 UPDATE_PAGE = 1000
 
-# Largest number of documents countDocuments groups before it gives up (None)
+# Largest number of documents countDocumentsWhere groups before it gives up (None)
 MAX_GROUPS = 10000
 
 # Weaviate distance -> the explorer's metric vocabulary (None: no vector-space equivalent)
@@ -1076,16 +1076,16 @@ class Store(DocumentStoreBase):
             return 0
         return self._count(_all(self._convertFilter(docFilter), self._notControl()))
 
-    @_backend_errors('countDocuments')
-    def countDocuments(self, docFilter: DocFilter) -> Optional[int]:
+    @_backend_errors('countDocumentsWhere')
+    def countDocumentsWhere(self, docFilter: DocFilter) -> Optional[int]:
         """Distinct objectIds matching ``docFilter`` (group by objectId); None above the group cap."""
         if not self._doesCollectionExist():
             return 0
         groups = self._countByObject(_all(self._convertFilter(docFilter), self._notControl()), MAX_GROUPS)
         return len(groups) if len(groups) < MAX_GROUPS else None
 
-    @_backend_errors('listDocuments')
-    def listDocuments(
+    @_backend_errors('listDocumentPage')
+    def listDocumentPage(
         self,
         *,
         cursor: Optional[str],
@@ -1097,7 +1097,7 @@ class Store(DocumentStoreBase):
         """
         One page of documents: chunk-0 objects by offset, with per-document counts grouped by objectId.
 
-        A document whose chunk 0 is missing is not listed (``countDocuments`` still counts it);
+        A document whose chunk 0 is missing is not listed (``countDocumentsWhere`` still counts it);
         rows arrive in storage order.
         """
         offset, previous_first = _decode_cursor(cursor)

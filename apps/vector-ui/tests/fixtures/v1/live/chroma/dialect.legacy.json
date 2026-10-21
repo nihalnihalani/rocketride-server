@@ -33,7 +33,6 @@
   },
   "support": "supported",
   "allow_writes": true,
-  "agent_writes": true,
   "writes_scope": "tools_source",
   "write_tools": [
     "remove_document",

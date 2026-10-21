@@ -98,8 +98,8 @@ def test_keyword_search_matches_the_question_text(store):
 def test_count_documents_groups_by_object(adapter, store):
     """Documents are counted natively (group by objectId), a document without chunk 0 included."""
     adapter.seed_legacy(store)
-    assert store.countDocuments(h.VxFilter(deleted='active')) == 3
-    assert 'countDocuments' in store.capabilities()
+    assert store.countDocumentsWhere(h.VxFilter(deleted='active')) == 3
+    assert 'countDocumentsWhere' in store.capabilities()
 
 
 def test_describe_reports_the_index_and_version(store):

@@ -1138,7 +1138,8 @@ def test_dialect_describes_the_store(side, deployment):
     assert d['collection'] == side.collection
     assert (d['metric'], d['model'], d['dimension']) == ('cosine', EMBEDDING_MODEL, DIMENSION)
     assert d['support'] in vx_types.SUPPORT_LEVELS
-    assert d['allow_writes'] is True and d['agent_writes'] is vx_defaults.VECTOR_AGENT_WRITES_DEFAULT
+    # allow_write (the outer gate) alone decides agent writes: the answer names no agent switch.
+    assert d['allow_writes'] is True and 'agent_writes' not in d
     assert d['writes_scope'] == 'tools_source'
     assert set(d['write_tools']) == {'remove_document', 'delete', 'upsert'}
     # embed_node is the one capability the app fills in (CONTRACT section 4.1); the node reports the rest.
@@ -1155,9 +1156,7 @@ def test_dialect_describes_the_store(side, deployment):
     assert health['collection_exists'] is True and health['control_record'] is True
     s2 = side.ok('dialect', node='store_2')
     assert s2['allow_writes'] is False, 'store_2 must report writes off'
-    if deployment.provider == 'rocketride_vector':
-        # store_2 has allow_write off: its write tools are hidden, so no caller writes there.
-        assert s2['agent_writes'] is False, 'store_2 hides its write tools from agents too'
+    assert 'agent_writes' not in s2
 
 
 def test_stats_full_and_quick(side, deployment):

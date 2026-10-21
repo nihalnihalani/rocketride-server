@@ -99,9 +99,8 @@ addressed to this node; calls from the pipeline's chat or ingest sources are
 refused. Documents the pipeline's own lanes write are not affected by this
 switch.
 
-Allow writes from agents (`agent_writes`) is on by default and keeps an
-agent's `upsert` and `delete` calls working as before. Turn it off when the
-agents of this pipeline should only search.
+The switch does not apply to an agent in this pipeline: its `upsert` and
+`delete` calls work as they always have.
 
 ## Authentication
 

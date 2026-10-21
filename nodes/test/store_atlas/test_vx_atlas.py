@@ -109,7 +109,7 @@ def test_listing_counts_chunks_and_tables_per_document(store):
     """The aggregated listing carries exact chunk and table counts, sorted by path."""
     h.ingest(store, 'doc-b', '/docs/b.md', [0, 1, 2])
     h.ingest(store, 'doc-a', '/docs/a.md', [0, 1], is_table=True)
-    page = store.listDocuments(cursor=None, limit=10, object_ids=None, deleted='active', sort='path')
+    page = store.listDocumentPage(cursor=None, limit=10, object_ids=None, deleted='active', sort='path')
     assert [(r.objectId, r.chunks, r.tables) for r in page.items] == [('doc-a', 2, 2), ('doc-b', 3, 0)]
     assert page.total == 2 and page.distinct is True and page.counts_exact is True
 
@@ -117,7 +117,7 @@ def test_listing_counts_chunks_and_tables_per_document(store):
 def test_count_documents_groups_by_object(adapter, store):
     """Documents are counted natively, a document without chunk 0 included."""
     adapter.seed_legacy(store)
-    assert store.countDocuments(h.VxFilter(deleted='active')) == 3
+    assert store.countDocumentsWhere(h.VxFilter(deleted='active')) == 3
 
 
 def test_get_paths_skip_the_control_record(store):

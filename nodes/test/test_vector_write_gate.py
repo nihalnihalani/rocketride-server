@@ -10,9 +10,13 @@ first. It reads only the call context the engine attached to the call
 (``ai.common.tool_context.current_tool_call()``), never anything in the tool
 input, and refuses in a fixed order:
 
-    schema id -> no context -> agent (agent_writes) -> DAP with allow_writes off
+    schema id -> no context -> agent (allowed) -> DAP with allow_writes off
     -> source other than tools -> caller other than account/task
     -> call not naming the node -> caller-supplied embedding on upsert
+
+An agent's write is decided by the outer gate alone: ``allow_write`` (#2631)
+hides the write tools from agents and DAP callers alike, and there is no
+separate switch for agents, as on develop.
 
 The engine binds the context: the dispatcher (``IInstanceBase._dispatch_tool``)
 runs each tool inside the context stamped on its invoke param. Without a
@@ -23,6 +27,7 @@ section sends write tools through the real dispatcher with and without a stamp.
 from __future__ import annotations
 
 import importlib.util
+import inspect
 import json
 import re
 import sys
@@ -35,11 +40,12 @@ from rocketlib import IInstanceBase, OPEN_MODE
 from rocketlib.types import IInvokeTool
 
 from ai.common import tool_context
-from ai.common.store import StoreGlobalBase, StoreInstanceBase, vx_write_gate
+from ai.common.store import StoreGlobalBase, StoreInstanceBase, vx_defaults, vx_write_gate
 from ai.common.store import store_global_base as sgb
 from ai.common.store.document_store import VectorStoreToolMixin, deletedFilter
 from ai.common.store.errors import ToolRefusal
-from ai.common.store.vx_defaults import VECTOR_AGENT_WRITES_DEFAULT, VECTOR_ALLOW_WRITES_DEFAULT
+from ai.common.store.vx_defaults import VECTOR_ALLOW_WRITES_DEFAULT
+from ai.common.store.vx_types import TOOL_CODES
 from ai.common.tool_context import ToolCallContext
 
 from .test_vector_hooks import CountingStore, MemoryStore, corpus, make_doc
@@ -75,12 +81,11 @@ def agent() -> ToolCallContext:
     return ToolCallContext(origin='agent', source_type=None, targeted=True, caller={'auth': 'agent'})
 
 
-def _check(ctx, *, tool='remove_document', ids=('doc-1',), allow=True, agent_writes=True, embedding=False):
+def _check(ctx, *, tool='remove_document', ids=('doc-1',), allow=True, embedding=False):
     return vx_write_gate.check_write(
         tool,
         object_ids=list(ids),
         allow_writes=allow,
-        agent_writes=agent_writes,
         supplies_embedding=embedding,
         context=ctx,
     )
@@ -114,13 +119,16 @@ def test_no_context_is_an_unknown_caller(tool):
 
 
 @pytest.mark.parametrize('tool', _WRITE_TOOLS)
-def test_agent_with_agent_writes_is_allowed(tool):
-    assert _code(agent(), tool=tool, allow=False) == 'ALLOWED'
+@pytest.mark.parametrize('allow', [False, True])
+def test_an_agent_write_passes_the_inner_gate_whatever_allow_writes_says(tool, allow):
+    # allow_writes governs DAP calls only; whether an agent may write is allow_write's (the outer gate).
+    assert _code(agent(), tool=tool, allow=allow) == 'ALLOWED'
 
 
-@pytest.mark.parametrize('tool', _WRITE_TOOLS)
-def test_agent_with_agent_writes_off_is_refused(tool):
-    assert _code(agent(), tool=tool, agent_writes=False) == 'WRITES_AGENT'
+def test_the_gate_has_no_agent_switch():
+    assert 'agent_writes' not in inspect.signature(vx_write_gate.check_write).parameters
+    assert 'WRITES_AGENT' not in TOOL_CODES
+    assert not hasattr(vx_defaults, 'VECTOR_AGENT_WRITES_DEFAULT')
 
 
 @pytest.mark.parametrize('tool', _WRITE_TOOLS)
@@ -173,14 +181,12 @@ def test_rows_are_checked_in_order():
 def test_default_switches_decide_a_dap_call_from_the_console():
     """The expectation the templates and the live tool-path table share."""
     expected = 'ALLOWED' if VECTOR_ALLOW_WRITES_DEFAULT else 'WRITES_DISABLED'
-    assert _code(dap(), allow=VECTOR_ALLOW_WRITES_DEFAULT, agent_writes=VECTOR_AGENT_WRITES_DEFAULT) == expected
-    agent_expected = 'ALLOWED' if VECTOR_AGENT_WRITES_DEFAULT else 'WRITES_AGENT'
-    assert _code(agent(), allow=VECTOR_ALLOW_WRITES_DEFAULT, agent_writes=VECTOR_AGENT_WRITES_DEFAULT) == agent_expected
+    assert _code(dap(), allow=VECTOR_ALLOW_WRITES_DEFAULT) == expected
+    assert _code(agent(), allow=VECTOR_ALLOW_WRITES_DEFAULT) == 'ALLOWED'
 
 
-def test_the_shipped_defaults_are_writes_off_and_agent_writes_on():
+def test_the_shipped_default_is_writes_off():
     assert VECTOR_ALLOW_WRITES_DEFAULT is False
-    assert VECTOR_AGENT_WRITES_DEFAULT is True
 
 
 # ---------------------------------------------------------------------------
@@ -209,22 +215,20 @@ def test_a_context_the_gate_cannot_read_is_an_unknown_caller(ctx):
 
 def test_the_gate_reads_the_engine_context_when_none_is_passed(monkeypatch):
     monkeypatch.setattr(vx_write_gate, '_current_tool_call', lambda: dap())
-    decision = vx_write_gate.check_write('remove_document', object_ids=['a'], allow_writes=True, agent_writes=True)
+    decision = vx_write_gate.check_write('remove_document', object_ids=['a'], allow_writes=True)
     assert decision.origin == 'dap'
 
 
 def test_without_engine_wiring_every_write_is_refused():
     """A call that reaches the gate with no context is refused whatever the switches say."""
     with pytest.raises(ToolRefusal) as refusal:
-        vx_write_gate.check_write(
-            'remove_document', object_ids=['a'], allow_writes=True, agent_writes=True, context=None
-        )
+        vx_write_gate.check_write('remove_document', object_ids=['a'], allow_writes=True, context=None)
     assert refusal.value.code == 'WRITES_UNKNOWN_CALLER'
 
 
 def test_the_gate_reads_the_engine_reader_at_call_time(monkeypatch):
     monkeypatch.setattr(tool_context, 'current_tool_call', lambda: agent())
-    decision = vx_write_gate.check_write('delete', object_ids=['a'], allow_writes=False, agent_writes=True)
+    decision = vx_write_gate.check_write('delete', object_ids=['a'], allow_writes=False)
     assert decision.origin == 'agent'
 
 
@@ -246,7 +250,7 @@ def test_an_engine_without_tool_context_refuses_every_write(monkeypatch):
     spec.loader.exec_module(module)
     assert module._current_tool_call is None
     with pytest.raises(ToolRefusal) as refusal:
-        module.check_write('delete', object_ids=['a'], allow_writes=True, agent_writes=True)
+        module.check_write('delete', object_ids=['a'], allow_writes=True)
     assert refusal.value.code == 'WRITES_UNKNOWN_CALLER'
 
 
@@ -267,7 +271,6 @@ def test_refusal_messages_name_no_internal_detail():
         (dap(source_type='chat'), {}),
         (dap(auth='public'), {}),
         (dap(targeted=False), {}),
-        (agent(), {'agent_writes': False}),
     ]:
         with pytest.raises(ToolRefusal) as refusal:
             _check(ctx, **kw)
@@ -288,7 +291,7 @@ def test_refusal_messages_match_the_console_wording():
 
 
 # ---------------------------------------------------------------------------
-# Node switches: allow_writes / agent_writes
+# Node switches: allow_writes (DAP calls); agents have none of their own
 # ---------------------------------------------------------------------------
 
 
@@ -322,7 +325,7 @@ def _begin(monkeypatch, node_config: Dict[str, Any]) -> _Global:
 def test_switches_default_to_the_shared_constants(monkeypatch):
     glb = _begin(monkeypatch, {})
     assert glb.allow_writes is VECTOR_ALLOW_WRITES_DEFAULT
-    assert glb.agent_writes is VECTOR_AGENT_WRITES_DEFAULT
+    assert not hasattr(glb, 'agent_writes')
 
 
 @pytest.mark.parametrize(
@@ -332,19 +335,20 @@ def test_allow_writes_is_read_loosely_from_the_node_config(monkeypatch, raw, exp
     assert _begin(monkeypatch, {'allow_writes': raw}).allow_writes is expected
 
 
-def test_agent_writes_can_be_turned_off(monkeypatch):
-    assert _begin(monkeypatch, {'agent_writes': 'false'}).agent_writes is False
+def test_an_agent_writes_key_in_the_node_config_is_not_read(monkeypatch):
+    glb = _begin(monkeypatch, {'agent_writes': 'false'})
+    assert not hasattr(glb, 'agent_writes')
+    assert (glb.allow_write, glb.allow_writes) == (True, VECTOR_ALLOW_WRITES_DEFAULT)
 
 
 def test_unreadable_switch_values_fall_back_to_the_defaults(monkeypatch):
-    glb = _begin(monkeypatch, {'allow_writes': 'maybe', 'agent_writes': None})
+    glb = _begin(monkeypatch, {'allow_writes': 'maybe'})
     assert glb.allow_writes is VECTOR_ALLOW_WRITES_DEFAULT
-    assert glb.agent_writes is VECTOR_AGENT_WRITES_DEFAULT
 
 
 def test_switch_class_defaults_are_the_constants():
     assert StoreGlobalBase.allow_writes is VECTOR_ALLOW_WRITES_DEFAULT
-    assert StoreGlobalBase.agent_writes is VECTOR_AGENT_WRITES_DEFAULT
+    assert not hasattr(StoreGlobalBase, 'agent_writes')
 
 
 def _load_jsonc(path: Path) -> dict:
@@ -356,14 +360,13 @@ def test_the_form_fields_default_to_the_same_constants():
     fields = _load_jsonc(_COMMON_VECTOR_JSON)['fields']
     assert fields['vector.allow_writes']['type'] == 'boolean'
     assert fields['vector.allow_writes']['default'] is VECTOR_ALLOW_WRITES_DEFAULT
-    assert fields['vector.agent_writes']['type'] == 'boolean'
-    assert fields['vector.agent_writes']['default'] is VECTOR_AGENT_WRITES_DEFAULT
     assert fields['vector.allow_writes']['title'] == 'Allow document management from tool calls'
+    assert not [name for name in fields if 'agent_writes' in name]
 
 
 _NODES_DIR = _ROOT / 'nodes' / 'src' / 'nodes'
 
-#: The vector store nodes whose tools run the gate on ``vector.allow_writes`` / ``vector.agent_writes``
+#: The vector store nodes whose tools run the gate on ``vector.allow_writes``
 #: (rocketride_vector has its own ``rrvector.*`` pair; Elasticsearch and OpenSearch have no explorer tools).
 _VECTOR_STORE_NODES = (
     'store_postgres',
@@ -429,16 +432,22 @@ def test_the_listed_store_nodes_are_every_vector_store_with_tools():
 
 
 @pytest.mark.parametrize('node', _VECTOR_STORE_NODES)
-def test_every_vector_store_form_shows_both_write_switches(node):
+def test_every_vector_store_form_shows_the_write_switch(node):
     services = _load_services(_NODES_DIR / node / 'services.json')
     lists = _settings_lists(services)
     assert lists, f'{node}: no form list names the collection'
     for props in lists:
         assert 'vector.allow_writes' in props, (node, props)
-        assert 'vector.agent_writes' in props, (node, props)
     # The defaults live in vx_defaults only: no profile pins them.
     for name, profile in services.get('preconfig', {}).get('profiles', {}).items():
         assert 'allow_writes' not in profile and 'agent_writes' not in profile, (node, name)
+
+
+@pytest.mark.parametrize('node', _VECTOR_STORE_NODES + ('rocketride_vector', 'core'))
+def test_no_store_node_has_an_agent_write_switch(node):
+    # allow_write (the outer gate) alone decides agent writes, as on develop.
+    for path in sorted((_NODES_DIR / node).glob('services*.json')):
+        assert 'agent_writes' not in path.read_text(encoding='utf-8'), path.name
 
 
 # ---------------------------------------------------------------------------
@@ -485,7 +494,7 @@ def test_create_collection_still_writes_the_control_record_on_an_empty_driver():
 
 def test_tool_call_context_manager_reaches_the_gate():
     with tool_context.tool_call(dap()):
-        decision = vx_write_gate.check_write('remove_document', object_ids=['a'], allow_writes=True, agent_writes=True)
+        decision = vx_write_gate.check_write('remove_document', object_ids=['a'], allow_writes=True)
     assert decision.origin == 'dap'
 
 
@@ -493,14 +502,15 @@ class _ToolNode(VectorStoreToolMixin, IInstanceBase):
     pass
 
 
-def _tool_node(store, *, allow_writes: Optional[bool] = None, agent_writes: Optional[bool] = None) -> _ToolNode:
+def _tool_node(store, *, allow_writes: Optional[bool] = None, allow_write: Optional[bool] = None) -> _ToolNode:
     inst = object.__new__(_ToolNode)
     inst.IGlobal = SimpleNamespace(
         store=store,
         glb=SimpleNamespace(logicalType='postgres'),
         allow_writes=allow_writes,
-        agent_writes=agent_writes,
     )
+    if allow_write is not None:
+        inst.IGlobal.allow_write = allow_write
     inst.instance = SimpleNamespace(pipeType={'id': 'store_1'})
     return inst
 
@@ -593,3 +603,25 @@ def test_the_default_switches_refuse_a_dap_write_and_let_an_agent_write():
     allowed = _dispatch(node, 'delete', {'object_ids': ['b']}, agent())
     assert allowed['success'] is True, allowed
     assert not any(key[0] == 'b' for key in store.rows)
+
+
+def test_an_agent_writes_whenever_allow_write_is_on():
+    """allow_write alone decides an agent's write: allow_writes is off, and a stray agent_writes is not read."""
+    store = MemoryStore().seed(corpus({'a': [0], 'b': [0]}))
+    node = _tool_node(store, allow_writes=False, allow_write=True)
+    node.IGlobal.agent_writes = False
+    answer = _dispatch(node, 'delete', {'object_ids': ['a']}, agent())
+    assert answer['success'] is True, answer
+    assert not any(key[0] == 'a' for key in store.rows)
+    assert ('b', 0) in store.rows
+
+
+@pytest.mark.parametrize('tool', _WRITE_TOOLS)
+def test_with_allow_write_off_an_agent_has_no_write_tool(tool):
+    store = MemoryStore().seed(corpus({'a': [0]}))
+    node = _tool_node(store, allow_writes=True, allow_write=False)
+    assert tool not in node._collect_tool_methods()
+    with tool_context.tool_call(agent()):
+        answer = getattr(node, tool)({'object_ids': ['a'], 'documents': [{'content': 'x', 'object_id': 'a'}]})
+    assert answer['success'] is False and 'allow_write=true' in answer['error'], answer
+    assert ('a', 0) in store.rows

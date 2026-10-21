@@ -69,7 +69,7 @@ The collection is the destination for stored chunks. The save-time probe accepts
 
 The runtime accepts `L2`, `IP`, `COSINE`, `JACCARD`, `HAMMING`, or `BM25` as the similarity setting, defaulting to `COSINE`; another value stops initialization. It builds the vector index using this metric, so select the metric that matches the embeddings already in the collection before writing its first data. Changing it later does not rebuild an existing index.
 
-The retrieval score defaults to `0.5` and filters converted result scores on the `questions` lane. For cosine results the driver converts the returned similarity to `(similarity + 1) / 2`; for `L2`, `JACCARD` and `HAMMING` distances it uses `1 / (1 + distance)`, so the closest result scores highest; for `IP` and `BM25` it applies a sigmoid conversion. The driver itself drops only results under a fixed floor of `0.2`; the agent `search` function therefore returns results between the floor and the retrieval score that the `questions` lane would filter out. Raise the score when retrieved context is noisy or unrelated; lower it when the expected source material is absent. The tradeoff is recall versus the amount of weak context passed downstream, and a threshold can only be meaningful with the same metric used to create the collection.
+The retrieval score defaults to `0.5` and filters converted result scores. For cosine results the driver converts the returned similarity to `(similarity + 1) / 2`; for `L2`, `JACCARD` and `HAMMING` distances it uses `1 / (1 + distance)`, so the closest result scores highest; for `IP` and `BM25` it applies a sigmoid conversion. The driver itself drops results under the retrieval score, so the agent `search` function returns the same results the `questions` lane keeps; only a caller that sets its own lower bound (the Vector Explorer) sees weaker results. Raise the score when retrieved context is noisy or unrelated; lower it when the expected source material is absent. The tradeoff is recall versus the amount of weak context passed downstream, and a threshold can only be meaningful with the same metric used to create the collection.
 
 ### Write batch size and timeout
 
@@ -96,9 +96,8 @@ addressed to this node; calls from the pipeline's chat or ingest sources are
 refused. Documents the pipeline's own lanes write are not affected by this
 switch.
 
-Allow writes from agents (`agent_writes`) is on by default and keeps an
-agent's `upsert` and `delete` calls working as before. Turn it off when the
-agents of this pipeline should only search.
+The switch does not apply to an agent in this pipeline: its `upsert` and
+`delete` calls work as they always have.
 
 ## Authentication
 

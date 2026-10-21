@@ -243,7 +243,7 @@ def test_counts(collection):
     store, expect = collection
     assert store.countChunks(_vx_filter()) == expect.chunks
     assert store.countChunks(_vx_filter(chunkIds=[0])) == len(expect.documents) - len(expect.orphans)
-    assert store.countDocuments(_vx_filter()) is None  # no distinct count on Chroma: the tools count first chunks
+    assert store.countDocumentsWhere(_vx_filter()) is None  # no distinct count on Chroma: the tools count first chunks
     spy = _GetSpy(store.collectionObj)
     store.collectionObj.get = spy
     try:
@@ -332,7 +332,7 @@ def test_documents_tool_lists_the_orphan_unsorted(collection):
 def _filtered(store, flt, *, limit: int = 3, deleted: str = 'active'):
     items, pages, cursor = [], [], None
     for _ in range(10000):
-        page = store.listDocuments(
+        page = store.listDocumentPage(
             cursor=cursor, limit=limit, object_ids=None, deleted=deleted, sort='path', filter=flt
         )
         contract.assert_no_connection_details(page)
@@ -341,7 +341,7 @@ def _filtered(store, flt, *, limit: int = 3, deleted: str = 'active'):
         cursor = page.next_cursor
         if cursor is None:
             return items, pages
-    raise AssertionError('listDocuments did not end')
+    raise AssertionError('listDocumentPage did not end')
 
 
 def test_chroma_declares_the_documents_filter():
@@ -350,7 +350,7 @@ def test_chroma_declares_the_documents_filter():
     assert 'documents_filter' in drv.Store.VX_DRIVER_CAPABILITIES
     import inspect
 
-    parameter = inspect.signature(drv.Store.listDocuments).parameters['filter']
+    parameter = inspect.signature(drv.Store.listDocumentPage).parameters['filter']
     assert parameter.kind is inspect.Parameter.KEYWORD_ONLY and parameter.default is None
 
 
@@ -401,17 +401,17 @@ def test_a_documents_cursor_is_bound_to_its_first_chunk_filter(collection):
     store, expect = collection
     if len(expect.documents) - len(expect.orphans) < 2:
         pytest.skip('the collection has fewer than two documents with a first chunk')
-    first = store.listDocuments(
+    first = store.listDocumentPage(
         cursor=None, limit=1, object_ids=None, deleted='active', sort='path', filter=DocListFilter(has_first_chunk=True)
     )
-    plain = store.listDocuments(cursor=None, limit=1, object_ids=None, deleted='active', sort='path')
+    plain = store.listDocumentPage(cursor=None, limit=1, object_ids=None, deleted='active', sort='path')
     for cursor, flt in (
         (first.next_cursor, None),
         (first.next_cursor, DocListFilter(has_first_chunk=False)),
         (plain.next_cursor, DocListFilter(has_first_chunk=True)),
     ):
         with pytest.raises(ToolRefusal) as err:
-            store.listDocuments(cursor=cursor, limit=1, object_ids=None, deleted='active', sort='path', filter=flt)
+            store.listDocumentPage(cursor=cursor, limit=1, object_ids=None, deleted='active', sort='path', filter=flt)
         assert err.value.code == 'INVALID_INPUT'
 
 
@@ -499,7 +499,7 @@ def test_empty_id_lists_select_nothing(new_store):
     # The server refuses `$in: []`; the driver answers an empty result instead.
     store, _ = new_store
     for object_ids in (['schema'], []):
-        page = store.listDocuments(cursor=None, limit=5, object_ids=object_ids, deleted='all', sort='path')
+        page = store.listDocumentPage(cursor=None, limit=5, object_ids=object_ids, deleted='all', sort='path')
         assert page.items == [] and page.total == 0 and page.next_cursor is None
     assert store.countChunks(_vx_filter(objectIds=[])) == 0
     assert store.countChunks(_vx_filter(chunkIds=[])) == 0
@@ -563,4 +563,4 @@ def test_a_missing_collection_answers_without_raising():
     info = store.describe()
     assert info.collection_exists is False and info.control_record is None
     assert store.countChunks(_vx_filter()) == 0
-    assert store.listDocuments(cursor=None, limit=5, object_ids=None, deleted='active', sort='path').items == []
+    assert store.listDocumentPage(cursor=None, limit=5, object_ids=None, deleted='active', sort='path').items == []
