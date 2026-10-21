@@ -74,7 +74,10 @@ test('no wire fixture names an agent write switch or its refusal', () => {
 	const files = walk(root).filter((file) => file.endsWith('.json'));
 	assert.ok(files.some((file) => file.includes(`${path.sep}live${path.sep}`)) && files.some((file) => file.includes(`${path.sep}provisional${path.sep}`)), 'the premise: live and provisional fixtures are read');
 	const naming = files.filter((file) => /agent_writes|WRITES_AGENT|AGENT_WRITES/.test(fs.readFileSync(file, 'utf8')));
-	assert.deepEqual(naming.map((file) => path.relative(root, file)), []);
+	assert.deepEqual(
+		naming.map((file) => path.relative(root, file)),
+		[]
+	);
 });
 
 test('readStats: the extended figures, never the legacy count as documents or chunks', () => {
