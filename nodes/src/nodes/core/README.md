@@ -319,6 +319,8 @@ The internal Word indexer, ZIP Creation, and null endpoint are protocol-bearing 
 
 | Field | Type | Description | Default |
 |---|---|---|---|
+| `vector.agent_writes` | `boolean` | **Allow writes from agents**<br/>Let an agent in this pipeline add and remove documents through this node's tools. | `true` |
+| `vector.allow_writes` | `boolean` | **Allow document management from tool calls**<br/>Let tool calls from a Tools source (for example the Vector Explorer) remove and add documents in this collection. Calls from other sources, from callers that are not signed in, and calls that do not name this node are refused either way. | `false` |
 | `vector.apikey` | `string` | **API key**<br/>Enter your API key |  |
 | `vector.cloud.host` | `string` | **Host**<br/>Enter the server IP address e.g. Localhost |  |
 | `vector.cloud.port` | `number` | **Port**<br/>Enter the port number |  |
