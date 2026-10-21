@@ -43,8 +43,10 @@ from rocketlib import OPEN_MODE, warning
 
 from ai.common.config import Config, check_credential_resolved
 from ai.common.transform import IGlobalTransform
+from ai.common.utils.config_utils import parse_bool
 
 from .document_store import DocumentStoreBase
+from .vx_defaults import VECTOR_AGENT_WRITES_DEFAULT, VECTOR_ALLOW_WRITES_DEFAULT
 
 
 class StoreGlobalBase(IGlobalTransform, ABC):
@@ -75,6 +77,16 @@ class StoreGlobalBase(IGlobalTransform, ABC):
     # beginGlobal only when an embedding sub-block is configured.
     embed_query = None
     embed_model_name: Optional[str] = None
+
+    # Per-caller write switches of the vector store tools (remove_document,
+    # delete, upsert), read by vx_write_gate.check_write once the outer gate
+    # above (expose_tools, allow_write) lets a write tool run. Resolved in
+    # beginGlobal from the node config keys ``allow_writes`` and
+    # ``agent_writes``: ``allow_writes`` governs external tool calls (DAP),
+    # ``agent_writes`` calls made by an agent inside the pipeline. A driver
+    # may change either class default.
+    allow_writes: bool = VECTOR_ALLOW_WRITES_DEFAULT
+    agent_writes: bool = VECTOR_AGENT_WRITES_DEFAULT
 
     # ------------------------------------------------------------------
     # Abstract interface — every store driver must implement these
@@ -142,17 +154,20 @@ class StoreGlobalBase(IGlobalTransform, ABC):
         if isinstance(resolved_name, str) and resolved_name.strip():
             self.serverName = resolved_name.strip()
 
-        # Same source for the two tool switches: profile defaults and user
-        # overrides both count, strings such as 'false' / '0' stay off, and an
-        # absent or unrecognised value falls back to the driver's class default.
-        # Imported here: ai.common.utils pulls requests and tenacity at import
-        # time, which every store node would otherwise load.
-        from ai.common.utils import parse_bool
+        # The tool switches, from the same merged config: profile defaults and user
+        # overrides both count, loose booleans ('false', '0', 'yes', 'off', ...) read
+        # as such, and an absent or unrecognised value keeps the driver's class
+        # default. expose_tools and allow_write are the outer gate (whether a tool
+        # exists for this node at all); allow_writes (DAP calls) and agent_writes
+        # (agent calls) are the write gate's per-caller switches (vx_write_gate).
+        def _switch(name: str) -> bool:
+            raw = cfg.get(name) if hasattr(cfg, 'get') else None
+            return parse_bool(raw, default=getattr(type(self), name))
 
-        raw_expose_tools = cfg.get('expose_tools') if hasattr(cfg, 'get') else None
-        self.expose_tools = parse_bool(raw_expose_tools, default=type(self).expose_tools)
-        raw_allow_write = cfg.get('allow_write') if hasattr(cfg, 'get') else None
-        self.allow_write = parse_bool(raw_allow_write, default=type(self).allow_write)
+        self.expose_tools = _switch('expose_tools')
+        self.allow_write = _switch('allow_write')
+        self.allow_writes = _switch('allow_writes')
+        self.agent_writes = _switch('agent_writes')
 
         # A key left as an unfilled ${ROCKETRIDE_...} fails here, before the driver sends it.
         self._check_credentials(cfg, connConfig)
