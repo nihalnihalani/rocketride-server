@@ -1158,7 +1158,7 @@ def test_dialect_describes_the_store(side, deployment):
     # embed_node is the one capability the app fills in (CONTRACT section 4.1); the node reports the rest.
     assert set(vx_types.CAPABILITY_KEYS) - {'embed_node'} <= set(d['capabilities'])
     assert 'embed_node' not in d['capabilities']
-    assert d['capabilities']['search_vector'] is True and d['capabilities']['soft_delete'] is False
+    assert d['capabilities']['search_vector'] is True and d['capabilities']['soft_delete'] is True
     assert d['capabilities']['knn_native'] is (deployment.provider == 'qdrant')
     # statement_timeout_ms is pgvector's own (CONTRACT section 4.1); the other backends report null.
     limits = dict(vx_defaults.VECTOR_TOOL_LIMITS)
