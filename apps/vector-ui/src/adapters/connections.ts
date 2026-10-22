@@ -25,7 +25,7 @@
 // =============================================================================
 //
 // What one open connection keeps while its console and document tabs come
-// and go: the console controller (stats, directory, chunks, removal), the
+// and go: the console controller (stats, directory, trash, chunks, writes), the
 // shared selection (vector/bridge), the console's tab (Console or Map), the
 // chat's scope ("Ask about these only"), the directory's scope (conditions
 // shared with the map, search and chat) and its loaded rows as a source for
@@ -52,7 +52,7 @@ import { CHUNKS_PAGE } from '../vector/budgets';
 import { createConsoleStore } from '../vector/consoleStore';
 import type { IConsoleClock, IConsoleStore } from '../vector/consoleStore';
 import { DEFAULT_LIMITS } from '../vector/results';
-import { deleteBatch, fetchChunks, fetchDocumentsPage, fetchStats } from './actions';
+import { deleteBatch, fetchChunks, fetchDocumentsPage, fetchStats, restoreBatch, trashBatch } from './actions';
 import { announcer, connectionCaches, vectorEndpoints } from './explorer';
 
 /** A tiny external store of one value (useSyncExternalStore-compatible). */
@@ -109,6 +109,8 @@ export interface IConnectionEntry {
 	scope: IValueStore<IScopeState | null>;
 	/** The directory's loaded rows, for the map (MapViewProps.documents). */
 	documents: IDocumentRowsSource;
+	/** How many writes the console ran on this store; a change asks the map to draw its sample again (MapViewProps.writes). */
+	writes: IValueStore<number>;
 	/** True once the console asked for its first stats and page. */
 	opened: boolean;
 }
@@ -129,7 +131,7 @@ const entries = new Map<string, IConnectionEntry>();
  * @param clock - The clock (tests pass a manual one).
  * @returns The controller.
  */
-function makeController(entry: Pick<IConnectionEntry, 'ctx' | 'selection'>, clock: IConsoleClock): IConsoleStore {
+function makeController(entry: Pick<IConnectionEntry, 'ctx' | 'selection' | 'writes'>, clock: IConsoleClock): IConsoleStore {
 	const { ctx } = entry;
 	const session = (tool: string) => {
 		if (ctx.client === null) throw new ExplorerToolError({ kind: 'unavailable', tool, message: 'Not connected to the server. Reconnect, then refresh.' });
@@ -138,9 +140,11 @@ function makeController(entry: Pick<IConnectionEntry, 'ctx' | 'selection'>, cloc
 	return createConsoleStore(
 		{
 			stats: (mode) => fetchStats(session('stats'), ctx.endpoint.nodeId, mode),
-			documents: (cursor, limit, filter) => fetchDocumentsPage(session('list_documents'), ctx.endpoint.nodeId, { cursor, limit }, {}, filter),
+			documents: (cursor, limit, filter, deleted) => fetchDocumentsPage(session('list_documents'), ctx.endpoint.nodeId, { cursor, limit }, {}, filter, deleted),
 			chunks: (objectId, afterChunk, limit) => fetchChunks(session('chunks'), ctx.endpoint.nodeId, { objectId, afterChunk, limit }),
-			remove: (ids) => deleteBatch(session('delete'), ctx.endpoint.nodeId, ids),
+			trash: (ids) => trashBatch(session('soft_delete'), ctx.endpoint.nodeId, ids),
+			restore: (ids) => restoreBatch(session('restore'), ctx.endpoint.nodeId, ids),
+			remove: (ids, opts) => deleteBatch(session('delete'), ctx.endpoint.nodeId, ids, opts),
 			announce: (text) => announcer.announce(text),
 			onRemoved: (ids) => {
 				for (const id of ids) entry.selection.forgetDocument(id);
@@ -148,6 +152,7 @@ function makeController(entry: Pick<IConnectionEntry, 'ctx' | 'selection'>, cloc
 			reprobe: () => {
 				if (ctx.client !== null) void vectorEndpoints.probe(ctx.client, ctx.endpoint.key);
 			},
+			onWritten: () => entry.writes.set(entry.writes.get() + 1),
 			clock,
 		},
 		{
@@ -187,6 +192,7 @@ export function connectionEntry(endpoint: IExplorerEndpoint, client: IExplorerCl
 			chatScope: createValueStore<readonly string[] | null>(null),
 			scope: createValueStore<IScopeState | null>(null),
 			documents: undefined as unknown as IDocumentRowsSource,
+			writes: createValueStore(0),
 			opened: false,
 		};
 		made.controller = makeController(made, clock);

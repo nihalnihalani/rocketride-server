@@ -98,7 +98,7 @@ test('PointInspector: a hint with nothing selected; the chunk, its neighbours an
 	assert.match(out, /12 nearest in the collection/);
 	assert.match(out, /Open document/);
 	assert.match(out, /Find similar/);
-	assert.match(out, /<button[^>]*disabled=""[^>]*>Remove document<\/button>/);
+	assert.match(out, /<button[^>]*disabled=""[^>]*>Move to trash<\/button>/);
 	assert.ok(out.includes(writesOff.reason), 'the reason is shown as text, not only as a tooltip');
 });
 
@@ -152,7 +152,7 @@ test('MapToolbar: sizes capped by the node\'s limits, t-SNE disabled above 1,000
 	assert.match(busy, />Cancel<\/button>/);
 });
 
-test('Selection tab: "Remove these documents" hands the console EVERY selected document (it confirms and batches), never a silent first 100', () => {
+test('Selection tab: "Move these documents to the trash" hands the console EVERY selected document (it confirms and batches), never a silent first 100', () => {
 	// 260 points over 250 documents: more than write_ids_max (100).
 	const keys: VectorKey[] = Array.from({ length: 260 }, (_, i) => [`doc-${i % 250}`, Math.floor(i / 250)] as VectorKey);
 	const asked: Array<readonly string[]> = [];
@@ -160,13 +160,13 @@ test('Selection tab: "Remove these documents" hands the console EVERY selected d
 	assert.equal(limits.write_ids_max, 100);
 	const tree = SelectionTab(props);
 	assert.match(html(tree), /260 points selected from 250 documents\./);
-	button(tree, 'Remove these documents').props.onClick();
+	button(tree, 'Move these documents to the trash').props.onClick();
 	assert.equal(asked[0]?.length, 250, 'the console is asked about all 250 documents the tab names');
 	assert.deepEqual([...(asked[0] ?? [])].sort(), Array.from({ length: 250 }, (_, i) => `doc-${i}`).sort());
 	button(tree, 'Ask about these only').props.onClick();
 	assert.equal(asked[1]?.length, 250);
 	const off = SelectionTab({ ...props, writes: { enabled: false, reason: 'Removing documents is turned off on this store node (allow_writes).' } });
-	assert.equal(button(off, 'Remove these documents').props.disabled, true);
+	assert.equal(button(off, 'Move these documents to the trash').props.disabled, true);
 	assert.match(html(off), /turned off on this store node/);
 	assert.match(html(SelectionTab({ ...props, keys: [] })), /Turn on the lasso \(L\)/);
 });

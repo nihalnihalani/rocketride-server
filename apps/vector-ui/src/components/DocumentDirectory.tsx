@@ -32,20 +32,28 @@
 // the console's scope, which the listing asks the store for together with
 // the path box, and the status line words honestly (vector/filters.ts
 // directoryView). Right-clicking a folder offers "Scope to
-// this folder". Rows can be checked to remove several at once; removing
-// always goes through the console's confirmation.
+// this folder". Rows can be checked to move several to the trash at once.
+//
+// THE TRASH. With a host that has it, the title holds a Documents / Trash
+// switch; "Trash (N)" is the store's count (stats.deleted_documents), never the
+// loaded rows. The Trash view lists the console's trash listing: each row
+// restores (at once) or deletes permanently (confirmed and typed by the
+// console), checked rows do the same together, and Empty trash asks the
+// console to empty the whole trash. Writes always go through the console.
 // =============================================================================
 
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { Button } from 'shell';
 import type { Availability, IDocumentItem, IDocumentsFilter, IExportItem, IScopeState, ISavedFilter } from '../contract/types';
 import type { IRemoveTarget } from '../vector/confirm';
+import type { DirectoryView } from '../vector/consoleStore';
 import { buildGroups, directoryHeading, pagerFooter, pagerProgressText } from '../vector/documents';
 import type { IDirectoryGroup, IDirectoryRow, IPagerState } from '../vector/documents';
 import { FILTER_DEBOUNCE_MS, checkScope, directoryExportItems, directoryView, scopeNoMatchText, scopeWith, withText } from '../vector/filters';
 import { medianChunks } from '../vector/health';
 import type { ConditionKind } from '../vector/filters';
 import { DEFAULT_LIMITS } from '../vector/results';
+import { formatCount } from '../vector/stats';
 import { EMPTY } from '../vector/wording';
 import { ChevronIcon } from '../icons';
 import { FOCUS_RING, styles } from '../styles';
@@ -65,6 +73,7 @@ export interface IDocumentDirectoryProps {
 	selectedId: string | null;
 	writes: Availability;
 	onSelect(item: IDocumentItem): void;
+	/** Move to trash (the console confirms; nothing to type). */
 	onRemove(targets: IRemoveTarget[]): void;
 	onLoadMore(): void;
 	onRetry(): void;
@@ -82,6 +91,15 @@ export interface IDocumentDirectoryProps {
 	saved?: readonly ISavedFilter[];
 	onSave?(name: string, filter: IDocumentsFilter): string | null;
 	onDeleteSaved?(id: string): void;
+	/** Which listing `pager` is; with `onView` the title switches between them. */
+	view?: DirectoryView;
+	onView?(view: DirectoryView): void;
+	/** Documents in the trash as the store counts them (stats.deleted_documents), or null where it cannot count. */
+	trashCount?: number | null;
+	/** The Trash view's writes: restore at once, delete permanently (confirmed), empty the whole trash (confirmed). */
+	onRestore?(targets: IRemoveTarget[]): void;
+	onDelete?(targets: IRemoveTarget[]): void;
+	onEmptyTrash?(): void;
 }
 
 /** The value, once it has not changed for `ms`. */
@@ -121,7 +139,11 @@ export function targetOf(item: IDocumentItem): IRemoveTarget {
  * @param props - {@link IDocumentDirectoryProps}.
  * @returns The panel element.
  */
-export function DocumentDirectory({ pager, selectedId, writes, onSelect, onRemove, onLoadMore, onRetry, collection = null, scope = null, onScope, cap = DEFAULT_LIMITS.scope_keys_max, available, saved, onSave, onDeleteSaved }: IDocumentDirectoryProps): React.ReactElement {
+export function DocumentDirectory({ pager, selectedId, writes, onSelect, onRemove, onLoadMore, onRetry, collection = null, scope: activeScope = null, onScope: onActiveScope, cap = DEFAULT_LIMITS.scope_keys_max, available, saved, onSave, onDeleteSaved, view: shownView = 'active', onView, trashCount = null, onRestore, onDelete, onEmptyTrash }: IDocumentDirectoryProps): React.ReactElement {
+	// The scope belongs to the stored documents: the trash is listed whole, its path box filtering what is loaded.
+	const inTrash = shownView === 'trash';
+	const scope = inTrash ? null : activeScope;
+	const onScope = inTrash ? undefined : onActiveScope;
 	const [filter, setFilter] = useState('');
 	const applied = useDebounced(filter, FILTER_DEBOUNCE_MS);
 	const [folderMenu, setFolderMenu] = useState<IFolderMenu | null>(null);
@@ -165,7 +187,7 @@ export function DocumentDirectory({ pager, selectedId, writes, onSelect, onRemov
 	const matches = view.rows;
 	// "Oversize" compares with the median of the loaded documents, once the listing settled (no row moves while pages arrive).
 	const median = useMemo(() => (pager.status === 'loading' || pager.status === 'idle' ? null : medianChunks(pager.rows)), [pager.status, pager.rows]);
-	const groups = useMemo(() => buildGroups(matches, { medianChunks: median }), [matches, median]);
+	const groups = useMemo(() => buildGroups(matches, { medianChunks: median, trash: inTrash }), [matches, median, inTrash]);
 	const folders = useMemo(() => [...new Set(groups.filter((g) => g.kind === 'folder').map((g) => g.label))], [groups]);
 	// "Documents in scope" holds the scope's own documents even while its Documents toggle is off (vector/filters.ts).
 	const exportItems = useMemo<IExportItem[]>(() => directoryExportItems(pager, view), [pager, view]);
@@ -202,7 +224,7 @@ export function DocumentDirectory({ pager, selectedId, writes, onSelect, onRemov
 	// With the scope on the list, "no match" is of the loaded rows until every document is loaded.
 	const scoped = scope !== null && scope.applyTo.documents && view.scope !== null ? view.scope : null;
 	let empty: string | null = null;
-	if (pager.rows.length === 0 && pager.status === 'done' && scoped === null) empty = EMPTY.noDocuments;
+	if (pager.rows.length === 0 && pager.status === 'done' && scoped === null) empty = inTrash ? EMPTY.trash : EMPTY.noDocuments;
 	else if (pager.rows.length === 0 && pager.status === 'error') empty = EMPTY.unreachable(pager.error?.headline ?? 'the store did not answer.');
 	else if (pager.rows.length > 0 && matches.length === 0) empty = scoped !== null ? scopeNoMatchText(scoped) : EMPTY.noMatch(applied.trim());
 	else if (pager.rows.length === 0 && pager.status === 'done' && scoped !== null) empty = scopeNoMatchText(scoped);
@@ -210,7 +232,17 @@ export function DocumentDirectory({ pager, selectedId, writes, onSelect, onRemov
 	return (
 		<section aria-label="Documents" style={{ ...styles.panel, flex: 1 }}>
 			<div style={styles.panelTitle}>
-				<span>Documents</span>
+				{onView ? (
+					<span role="group" aria-label="Documents or trash" style={{ display: 'inline-flex', gap: 4 }}>
+						{(['active', 'trash'] as const).map((which) => (
+							<button key={which} type="button" aria-pressed={shownView === which} onClick={() => onView(which)} style={{ background: 'none', border: 'none', borderBottom: shownView === which ? '2px solid currentColor' : '2px solid transparent', padding: '0 2px', color: 'inherit', font: 'inherit', fontWeight: 'inherit', textTransform: 'inherit', letterSpacing: 'inherit', cursor: 'pointer' }} onFocus={(event) => (event.currentTarget.style.outline = FOCUS_RING)} onBlur={(event) => (event.currentTarget.style.outline = 'none')}>
+								{which === 'active' ? 'Documents' : trashCount === null ? 'Trash' : `Trash (${formatCount(trashCount)})`}
+							</button>
+						))}
+					</span>
+				) : (
+					<span>Documents</span>
+				)}
 				<span style={{ ...styles.small, fontWeight: 400, textTransform: 'none', letterSpacing: 0, marginLeft: 'auto' }}>{pager.status === 'idle' ? '' : directoryHeading(pager)}</span>
 				<ExportMenu items={exportItems} collection={collection} />
 			</div>
@@ -225,12 +257,30 @@ export function DocumentDirectory({ pager, selectedId, writes, onSelect, onRemov
 					{summary ?? progress}
 				</div>
 			)}
+			{inTrash && onEmptyTrash && (
+				<div style={{ display: 'flex', gap: 8, alignItems: 'center', padding: '0 12px 8px' }}>
+					<Button small variant="danger" disabled={!writes.enabled || (pager.rows.length === 0 && (trashCount ?? 0) === 0)} title={writes.reason ?? undefined} onClick={onEmptyTrash}>
+						Empty trash
+					</Button>
+				</div>
+			)}
 			{checkedItems.length > 0 && (
 				<div style={{ display: 'flex', gap: 8, alignItems: 'center', padding: '0 12px 8px' }}>
 					<span style={styles.small}>{`${checkedItems.length} selected`}</span>
-					<Button small variant="danger" disabled={!writes.enabled} title={writes.reason ?? undefined} onClick={() => onRemove(checkedItems.map(targetOf))}>
-						Remove selected
-					</Button>
+					{inTrash ? (
+						<>
+							<Button small variant="secondary" disabled={!writes.enabled} title={writes.reason ?? undefined} onClick={() => onRestore?.(checkedItems.map(targetOf))}>
+								Restore selected
+							</Button>
+							<Button small variant="danger" disabled={!writes.enabled} title={writes.reason ?? undefined} onClick={() => onDelete?.(checkedItems.map(targetOf))}>
+								Delete selected permanently
+							</Button>
+						</>
+					) : (
+						<Button small variant="secondary" disabled={!writes.enabled} title={writes.reason ?? undefined} onClick={() => onRemove(checkedItems.map(targetOf))}>
+							Move selected to the trash
+						</Button>
+					)}
 					<Button small variant="ghost" onClick={() => setChecked(new Set())}>
 						Clear
 					</Button>
@@ -275,7 +325,7 @@ export function DocumentDirectory({ pager, selectedId, writes, onSelect, onRemov
 							const item = line.row.item;
 							return (
 								<div key={item.objectId} role="none" style={{ position: 'absolute', top, left: 0, right: 0 }}>
-									<DocumentRow row={line.row} selected={item.objectId === selectedId} checked={checked.has(item.objectId)} writes={writes} onSelect={() => onSelect(item)} onToggleCheck={() => toggleCheck(item.objectId)} onRemove={() => onRemove([targetOf(item)])} />
+									<DocumentRow row={line.row} selected={item.objectId === selectedId} checked={checked.has(item.objectId)} writes={writes} onSelect={() => onSelect(item)} onToggleCheck={() => toggleCheck(item.objectId)} onRemove={() => onRemove([targetOf(item)])} mode={inTrash ? 'trash' : 'active'} onRestore={() => onRestore?.([targetOf(item)])} onDelete={() => onDelete?.([targetOf(item)])} />
 								</div>
 							);
 						})}

@@ -1075,7 +1075,7 @@ export interface ConsoleModel {
 	limits: IVectorLimits;
 	/** Capabilities from the dialect, else all false. */
 	capabilities: IVectorCapabilities;
-	/** Remove controls (trash, multi-remove). */
+	/** Write controls (Move to trash, Restore, Delete permanently, Empty trash). */
 	writes: Availability;
 	/** Drop zone / Add files. */
 	ingest: Availability;
@@ -1195,7 +1195,7 @@ export interface ConsoleActions {
 	openDocument(objectId: string, chunkId?: number): void;
 	/** Switch to the Map tab and highlight these keys. */
 	showOnMap(keys: readonly VectorKey[], source: HighlightSource): void;
-	/** Ask to remove documents: the console confirms (Cancel focused) and runs the gated write. */
+	/** Ask to move documents to the trash: the console confirms (Cancel focused, nothing to type) and runs the gated soft_delete. */
 	requestRemove(objectIds: readonly string[]): void;
 	/** "Ask about these only": scope the next chat question to these documents. */
 	askAbout(objectIds: readonly string[]): void;
@@ -1389,7 +1389,7 @@ export interface DuplicatesPanelProps {
 	connectionKey?: string;
 	/** The console's directory rows (paths, chunk counts, ingest times, sizes for the keep policies). */
 	documents?: IDocumentRowsSource | null;
-	/** Remove several documents at once: the console confirms with the typed count and sends batches. */
+	/** Move several documents to the trash at once: the console confirms (nothing to type) and sends batches. */
 	onRemoveDocuments?(objectIds: readonly string[]): void;
 	onOpenDocument?(objectId: string, chunkId: number): void;
 }

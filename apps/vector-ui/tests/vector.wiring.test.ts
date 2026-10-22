@@ -111,7 +111,7 @@ test('the Map is a tab of the console: both stay mounted, the map is told when i
 	const view = code('views/ConsoleView.tsx');
 	assert.match(view, /display: tab === 'console' \? 'flex' : 'none'/);
 	assert.match(view, /display: tab === 'map' \? 'flex' : 'none'/);
-	assert.match(view, /<MapView model=\{mapModel\} channels=\{channels\} selection=\{entry\.selection\} actions=\{actions\} visible=\{active && tab === 'map'\} documents=\{entry\.documents\} \/>/);
+	assert.match(view, /<MapView model=\{mapModel\} channels=\{channels\} selection=\{entry\.selection\} actions=\{actions\} visible=\{active && tab === 'map'\} documents=\{entry\.documents\} writes=\{entry\.writes\} \/>/);
 	assert.match(view, /const nextMapScope = mapScopeFor\(mapScope, wiring\);\s*if \(nextMapScope !== mapScope\) setMapScope\(nextMapScope\);/, 'the map keeps the scope it drew with while a new one finds its documents');
 	assert.match(view, /const mapModel = useMemo\(\(\) => \(nextMapScope === \(model\.scope \?\? null\) \? model : \{ \.\.\.model, scope: nextMapScope \}\), \[model, nextMapScope\]\)/);
 	assert.match(view, /\{ id: 'console', label: 'Console' \},\s*\{ id: 'map', label: 'Map' \}/);
@@ -163,7 +163,7 @@ test("a document's health: the tab compares with the console's loaded documents 
 	assert.match(view, /onProbe=\{\(\) => void countDeleted\(\)\}/, 'the two one-row chunks calls run only on the click');
 	assert.match(view, /model\.capabilities\.soft_delete === true/, 'offered only where the store soft-deletes');
 	assert.doesNotMatch(view, /Without first chunk/);
-	assert.match(code('components/DocumentDirectory.tsx'), /buildGroups\(matches, \{ medianChunks: median \}\)/);
+	assert.match(code('components/DocumentDirectory.tsx'), /buildGroups\(matches, \{ medianChunks: median, trash: inTrash \}\)/);
 	assert.match(code('views/ConsoleView.tsx'), /healthSummary\(state\.directory\.rows, \{ medianChunks: settled \? medianChunks\(state\.directory\.rows\) : null, complete: state\.directory\.status === 'done' && state\.directory\.filter === null \}\)/);
 });
 
@@ -183,13 +183,37 @@ test("every removal is confirmed by the app-level host, with Cancel focused by t
 	}
 });
 
-test('the trash buttons say what they remove, and are disabled with the reason', () => {
+test('the trash buttons say what they do, and are disabled with the reason', () => {
 	for (const file of ['components/DocumentRow.tsx', 'views/DocumentView.tsx']) {
 		const source = code(file);
-		assert.match(source, /aria-label=\{`Remove \$\{\w+\} from the database`\}/, file);
+		assert.match(source, /aria-label=\{`Move \$\{\w+\} to the trash`\}/, file);
 		assert.match(source, /disabled=\{!(model\.)?writes\.enabled\}/, file);
 		assert.match(source, /writes\.reason/, file);
 	}
+	const row = code('components/DocumentRow.tsx');
+	assert.match(row, /aria-label=\{`Restore \$\{\w+\}`\}/, 'a trashed row restores');
+	assert.match(row, /aria-label=\{`Delete \$\{\w+\} permanently`\}/, 'and deletes permanently');
+});
+
+test('the Trash view: the console hands the directory its view, the store count and the trash actions; the host confirms each write with its own dialog', () => {
+	const view = code('views/ConsoleView.tsx');
+	assert.match(view, /pager=\{state\.view === 'trash' \? state\.trash : state\.directory\}/);
+	assert.match(view, /view=\{state\.view\} onView=\{\(next\) => entry\.controller\.setView\(next\)\}/);
+	assert.match(view, /trashCount=\{state\.stats\.view\?\.deletedDocuments \?\? null\}/, 'the badge is the store count, never the loaded rows');
+	assert.match(view, /onRestore=\{\(targets\) => void entry\.controller\.restore\(targets\)\}/);
+	assert.match(view, /onDelete=\{\(targets\) => entry\.controller\.requestDelete\(targets\)\}/);
+	assert.match(view, /onEmptyTrash=\{\(\) => void entry\.controller\.requestEmptyTrash\(\)\}/);
+	const host = code('components/RemoveDialogHost.tsx');
+	for (const fn of ['trashConfirmation(', 'multiTrashConfirmation(', 'removeConfirmation(', 'multiRemoveConfirmation(', 'emptyTrashConfirmation(']) assert.ok(host.includes(fn), fn);
+	const connections = code('adapters/connections.ts');
+	assert.match(connections, /trash: \(ids\) => trashBatch\(session\('soft_delete'\)/);
+	assert.match(connections, /restore: \(ids\) => restoreBatch\(session\('restore'\)/);
+	assert.match(connections, /remove: \(ids, opts\) => deleteBatch\(session\('delete'\), ctx\.endpoint\.nodeId, ids, opts\)/);
+	assert.match(connections, /onWritten: \(\) => entry\.writes\.set\(entry\.writes\.get\(\) \+ 1\)/, "every write that ran bumps the connection's write count");
+	assert.match(view, /<MapView [^>]*writes=\{entry\.writes\}/, 'which the map reads');
+	const map = code('views/MapView.tsx');
+	assert.match(map, /useSyncExternalStore\(\(props\.writes \?\? NO_WRITES\)\.subscribe/, 'the map subscribes to the write count');
+	assert.match(map, /drawnWrites\.current !== writes/, 'and draws its sample again when a write changed the store');
 });
 
 test("no lane file reads a token or a component's configuration, or stops events for the shell", () => {

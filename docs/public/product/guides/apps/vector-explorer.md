@@ -6,8 +6,9 @@ title: Vector Explorer
 
 Vector Explorer is the app for managing the documents in a vector store your
 pipelines already use. Its main screen is a console: how many documents and
-chunks the store holds, a directory of every document with a button to remove
-it, a drop zone that adds files, and a chat that answers from those documents.
+chunks the store holds, a directory of every document with a button to move it
+to the trash (and the trash, to restore or delete for good), a drop zone that
+adds files, and a chat that answers from those documents.
 A second tab, the map, shows how close the chunks are to each other and to a
 question you type.
 
@@ -49,7 +50,7 @@ written by an earlier release, and **Experimental** otherwise.
     against the store, and answered by an LLM, which also returns the chunks it
     was given.
   - **Tools** ([Tools](/nodes/webhook/tools)): the app's own requests (counts,
-    the directory, removal, the map).
+    the directory, the trash, the map).
 
   The pipeline has two store nodes on the same collection. `store_1` is the one
   Vector Explorer manages; `store_2` answers the chat. Give both the same
@@ -103,8 +104,8 @@ written by an earlier release, and **Experimental** otherwise.
   "**LLM error** — ValueError: Invalid API key." (offline, it names the failed
   connection instead). That is the expected state of a template whose key has
   not been replaced, not a fault in the app. Everything else (counts, the
-  directory, adding and removing documents, the map) works without an LLM.
-- **Removing documents needs the write switch.** Every vector store node that
+  directory, adding documents, the trash, the map) works without an LLM.
+- **The trash needs the write switch.** Every vector store node that
   Vector Explorer lists reads an `allow_writes` setting, off by default. The
   Vector Explorer templates turn it on for `store_1` and leave it off for
   `store_2`. To turn it on in a pipeline of your own, set
@@ -113,7 +114,7 @@ written by an earlier release, and **Experimental** otherwise.
   pipeline. Every store node's form also shows it, as **Allow document
   management from tool calls** (on RocketRide Vector, next to **Allow writes
   through tools**). With it off, the
-  trash buttons are
+  trash buttons (and Restore, Delete permanently and Empty trash) are
   disabled and say why. Adding
   documents is not governed by this switch: it goes through the Ingest source,
   and anyone with the data permission on the ingest task can add documents.
@@ -193,7 +194,8 @@ Below 900 pixels wide the panels stack.
 
 Documents, chunks, deleted chunks, average chunks per document, the embedding
 model and dimension, the metric and the index type. They are counted when the
-console opens, after every removal or completed upload, and on **Refresh**.
+console opens, after every write (moving to or out of the trash, deleting) or
+completed upload, and on **Refresh**.
 While the console is visible a lighter check runs at most every 15 seconds and
 the strip says "counts as of N s ago". Numbers the node did not return are
 shown as "—" with a tooltip, never estimated: Pinecone, for example, cannot
@@ -342,26 +344,44 @@ documents only in A, 2 only in B"; with the map open, both are drawn as stars (A
 ★, B ☆). **Why these?** under a chat answer gains **Open in Search**, which
 opens this view with the answer's question and its cited chunks marked.
 
-## Removing documents
+## The trash and removing documents
 
-Each document has a trash button ("Remove `<path>` from the database"). It is
-enabled only when the store node allows it, the connection has a Tools source,
-and the card is not read-only; otherwise it is disabled and says why.
+Each document has a trash button ("Move `<path>` to the trash"). It is enabled
+only when the store node allows writes (and can move documents to the trash),
+the connection has a Tools source, and the card is not read-only; otherwise it
+is disabled and says why.
 
-The confirmation shows the path, the short id, the chunk count and the store,
-collection and backend: "Removes this document and its N chunks from
-`<collection>`. This cannot be undone; add the file again to restore it."
-**Cancel** has the focus, and Enter never confirms. Removing several documents
-at once (select them, or lasso them on the map) asks you to type the count,
-removes them in batches, and stops at the first error, saying what was removed.
-On `rocketride_vector` you type the table name, because the table is shared by
-every pipeline in the organization that names it.
+**Move to trash** asks first, with nothing to type: the confirmation shows the
+path, the short id, the chunk count and the store, collection and backend:
+"Moves this document and its N chunks to the trash of `<collection>`. Search,
+chat and the map leave it out until it is restored from the Trash." **Cancel**
+has the focus, and Enter never confirms. Several documents (select them, or
+lasso them on the map) move together, in batches; the first error stops the
+rest, and the app says what already moved.
 
-After a removal the counts and the directory refresh and the app announces
-"Removed `<path>` (N chunks)", with the number of chunks the store actually
-removed, or just "Removed `<path>`" when the store cannot count the rows it
-removed (Pinecone). If the request times out: "The request may still complete
-on the server. Refresh to check." Writes are never retried.
+The directory's title switches between **Documents** and **Trash (N)**, where
+N is the number of documents with chunks in the trash as the store counts it.
+The Trash lists those documents. On each one, **Restore** brings it back at
+once, and **Delete permanently** asks first: "Deletes this document and its N
+chunks from `<collection>`. This cannot be undone; add the file again to
+restore it." Checked rows restore or delete together; deleting several asks you
+to type their count. **Empty trash** lists the whole trash, asks you to type
+the number of documents in it, and deletes them permanently. A document that
+still has chunks outside the trash (a later upload added some after it was
+moved there) is kept and reported: "Emptied the trash: deleted 12 documents
+permanently (140 chunks). 1 was kept: it still has chunks outside the trash."
+On `rocketride_vector` the permanent deletes ask for the table name instead,
+because the table is shared by every pipeline in the organization that names
+it. A document in the trash cannot be read until it is restored: "This
+document is in the trash. Restore it to read it."
+
+After any of these the counts, both lists, the store's details (model,
+dimension, index) and the map refresh, and the app says what happened, for
+example "Moved `<path>` to the trash (N chunks)" or "Deleted `<path>`
+permanently (N chunks)", with the number of chunks the store actually reported
+(none when it cannot count them, as on Pinecone). If the request times out:
+"The request may still complete on the server. Refresh to check." Writes are
+never retried.
 
 When the store refuses, the app says why:
 
@@ -402,16 +422,16 @@ with the reason, when the store node cannot sample; the console is unaffected.
   reason.
 - **Point.** Hover shows the document and snippet. Click lists the 12 nearest
   chunks in the whole collection with their similarity; neighbours outside the
-  sample are drawn hollow. **Open document**, **Find similar** and **Remove
-  document** act on it.
+  sample are drawn hollow. **Open document**, **Find similar** and **Move to
+  trash** act on it.
 - **Answers.** The sources of a chat answer light up on the map; sources
   outside the sample are added to it. The answer's question becomes the star:
   it is embedded by the pipeline's embedding node and placed like a query, with
   rays to its true top results. When that node cannot be reached from the
   Tools source, the star is the score-weighted centre of the sources instead,
   and the legend marks it approximate.
-- **Lasso** (`L`): select an area, then **Ask about these only**, **Remove
-  these documents**, **Isolate** or **Copy keys**. The **Selection** tab also
+- **Lasso** (`L`): select an area, then **Ask about these only**, **Move
+  these documents to the trash**, **Isolate** or **Copy keys**. The **Selection** tab also
   shows a **similarity matrix** of 2 to 100 selected points: a heatmap (values
   in the cells up to 20 × 20), ordered so that close points sit together, with a
   table alternative, **Export CSV** and **Show pair**. The store computes it from
@@ -443,15 +463,16 @@ with the reason, when the store node cannot sample; the console is unaffected.
   with its similarity range, a **Keep** choice per document and a policy (keep
   oldest ingest, shortest path, most chunks, or choose by hand). The similarity
   slider (0.90 to 0.995) regroups at once, from each point's 15 nearest
-  neighbours in the sample. **Show group**, **Mark reviewed**, **Remove the
-  others** and **Remove all queued (N documents)** follow; removal is confirmed
-  by typing the count. Repeated text inside one document is listed apart, with
+  neighbours in the sample. **Show group**, **Mark reviewed**, **Move the
+  others to the trash** and **Move all queued to the trash (N documents)**
+  follow, through the console's confirmation; the Trash restores them. Repeated
+  text inside one document is listed apart, with
   **Open** only.
 - **Outliers.** Unusually isolated chunks are ringed, and the **Outliers** tab
   lists the lowest-density share of the sample (1, 2 or 5 %, chosen without
   asking the store again), each with why ("density 0.12 vs sample median 0.61;
   nearest neighbour 0.31 in `<path>`"), **Mark reviewed**, **Show neighbours**
-  and **Remove document**.
+  and **Move to trash**.
 - **Recommend.** From a point's panel, **Add as example (+)** or **(−)**; the
   **Recommend** tab finds the chunks most like the positives and least like the
   negatives in the whole collection (**Average vector** everywhere; **Best
@@ -598,11 +619,11 @@ Explorer.
 
 ## Limits
 
-- **Removal cannot be undone.** There is no trash to restore from; add the file
-  again.
+- **Deleting permanently cannot be undone.** A document moved to the trash can be
+  restored; one deleted permanently (or by Empty trash) can only be added again.
 - **No cancel on the server.** A question, an upload or a sample already
   running on the server cannot be cancelled from the app; it only stops
-  waiting. A removal that timed out may still complete. (A layout runs in your
+  waiting. A write that timed out may still complete. (A layout runs in your
   browser and has **Cancel**.)
 - **Elasticsearch and OpenSearch** store nodes are not supported and are not
   listed.
@@ -618,7 +639,7 @@ Explorer.
   app before it sends anything; a file over a limit is excluded, not ingested.
   These are the only upload limits: the engine does not apply the templates'
   parser size setting in this release.
-- **Read-only cards** cannot add or remove documents.
+- **Read-only cards** cannot add documents or change the trash.
 - **Answers need a model.** Chat needs a working LLM (a key, or a local
   OpenAI-compatible server); everything else does not.
 - **The map's analysis covers its sample.** Clusters, duplicates, outliers and
@@ -643,7 +664,7 @@ across pgvector, RocketRide Vector, Qdrant and Chroma, it gives you:
   ranks first, and two questions compared side by side;
 - the collection's clusters named by their own words;
 - the neighbour graph and its spanning tree drawn over the sample;
-- near-duplicate groups removed in one confirmed batch, with the rows reported;
+- near-duplicate groups moved to the trash in one confirmed batch, with the rows reported, and a trash to restore them from;
 - a folder, file-type or date scope that applies to the documents, the map, the
   search and the chat;
 - charts of chunks per document, chunk length, file types and ingest time;

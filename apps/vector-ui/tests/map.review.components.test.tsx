@@ -118,7 +118,7 @@ test('the queue: one fieldset per group with its documents, Keep radios labelled
 	assert.match(out, /Pairs among each point&#x27;s 15 nearest neighbours in this sample/);
 	assert.match(out, /Within this sample of 1,000 chunks; draw a larger or light sample to cover more\./);
 	assert.match(out, /role="status"[^>]*>No document queued/);
-	assert.match(out, /<button[^>]*disabled=""[^>]*>Remove all queued \(0 documents\)<\/button>/);
+	assert.match(out, /<button[^>]*disabled=""[^>]*>Move all queued to the trash \(0 documents\)<\/button>/);
 	assert.match(out, /Keep oldest ingest/);
 	assert.match(out, /Keep shortest path/);
 	assert.match(out, /Keep most chunks/);
@@ -128,7 +128,7 @@ test('the queue: one fieldset per group with its documents, Keep radios labelled
 test('a policy fills every group: the kept document is checked, the others are tagged queued, and the count is spoken', () => {
 	const out = html(<DuplicatesPanel sample={SMALL} writes={on} documents={rowsSource} onSelect={noop} onRemoveDocument={noop} onRemoveDocuments={noop} initial={{ policy: 'shortest-path' }} />);
 	assert.match(out, /role="status"[^>]*>2 documents queued/);
-	assert.match(out, /<button[^>]*>Remove all queued \(2 documents\)<\/button>/);
+	assert.match(out, /<button[^>]*>Move all queued to the trash \(2 documents\)<\/button>/);
 	assert.match(out, /checked=""[^>]*aria-label="Keep C:\/demo\/handbooks\/falcon_handbook\.md"|aria-label="Keep C:\/demo\/handbooks\/falcon_handbook\.md"[^>]*checked=""/);
 	assert.equal((out.match(/>queued</g) ?? []).length, 2);
 	assert.match(out, /2 chunks · ingested 2026-10-02 · 4 KB · 2 of 2 sampled chunks match/);
@@ -140,8 +140,8 @@ test('writes off: Keep radios and every Remove disabled, and the reason shown as
 	const out = html(<DuplicatesPanel sample={SMALL} writes={off} onSelect={noop} onRemoveDocument={noop} onRemoveDocuments={noop} initial={{ policy: 'shortest-path' }} />);
 	assert.equal((out.match(/type="radio"/g) ?? []).length, 4);
 	assert.equal((out.match(/type="radio"[^>]*disabled=""|disabled=""[^>]*type="radio"/g) ?? []).length, 4);
-	assert.match(out, /<button[^>]*disabled=""[^>]*>Remove all queued \(2 documents\)<\/button>/);
-	assert.match(out, /<button[^>]*disabled=""[^>]*>Remove the other<\/button>/);
+	assert.match(out, /<button[^>]*disabled=""[^>]*>Move all queued to the trash \(2 documents\)<\/button>/);
+	assert.match(out, /<button[^>]*disabled=""[^>]*>Move the other to the trash<\/button>/);
 	assert.ok(out.includes(off.reason as string));
 });
 
@@ -159,7 +159,7 @@ test('a group inside one document offers Show and Open, never a Remove or a Keep
 	assert.ok(repeated, 'the repeated-text section');
 	const inside = elements(repeated);
 	assert.ok(inside.some((el) => el.type === 'button' && textOf(el) === 'Open'));
-	assert.ok(!inside.some((el) => el.type === 'button' && /Remove/.test(textOf(el))));
+	assert.ok(!inside.some((el) => el.type === 'button' && /Remove|trash/.test(textOf(el))));
 	assert.ok(!inside.some((el) => el.type === 'input'));
 });
 
@@ -174,8 +174,8 @@ test("buttons hand the host what they say: Show the group's points, Mark reviewe
 	const tree = DuplicatesBody({ sample: modelOf(sample), writes: on, view, info, state, reviewed: new Set(), queue: queued(view.groups, state, info, new Set()), done: null, bulk: true, onThreshold: noop, onPolicy: noop, onKeep: noop, onShow: (points) => shown.push([...points]), onReview: (group, value) => reviewed.push([[...group.objectIds], value]), onRemove: (ids) => removed.push([...ids]) });
 	button(tree, 'Show group').props.onClick();
 	button(tree, 'Mark reviewed').props.onClick();
-	button(tree, 'Remove the other').props.onClick();
-	button(tree, 'Remove all queued').props.onClick();
+	button(tree, 'Move the other to the trash').props.onClick();
+	button(tree, 'Move all queued to the trash').props.onClick();
 	assert.deepEqual(shown, [[0, 1, 2, 3]]);
 	assert.deepEqual(reviewed, [[['oa', 'ob'], true]]);
 	assert.deepEqual(removed, [['ob'], ['ob', 'od']]);
@@ -187,12 +187,12 @@ test('reviewed groups leave the queue and can be reviewed again; the done line c
 	const view = dedupeView(sample, 0.97);
 	const state = queueReducer(queueInit(), { type: 'policy', value: 'shortest-path' });
 	const done = new Set(['oa', 'ob']);
-	const tree = DuplicatesBody({ sample: modelOf(sample), writes: on, view, info, state, reviewed: done, queue: queued(view.groups, state, info, done), done: 'Removed 1 document (5 chunks)', bulk: true, onThreshold: noop, onPolicy: noop, onKeep: noop, onShow: noop, onReview: noop, onRemove: noop });
+	const tree = DuplicatesBody({ sample: modelOf(sample), writes: on, view, info, state, reviewed: done, queue: queued(view.groups, state, info, done), done: 'Moved 1 document to the trash (5 chunks)', bulk: true, onThreshold: noop, onPolicy: noop, onKeep: noop, onShow: noop, onReview: noop, onRemove: noop });
 	const out = renderToStaticMarkup(tree);
 	assert.match(out, /Reviewed \(1 group\)/);
 	assert.match(out, /Review again/);
 	assert.match(out, /1 document queued/);
-	assert.match(out, /Removed 1 document \(5 chunks\)/);
+	assert.match(out, /Moved 1 document to the trash \(5 chunks\)/);
 });
 
 test('requestRemoval: one document through the single dialog when that is all the host has, several only through the batched one', () => {
@@ -210,7 +210,7 @@ test('requestRemoval: one document through the single dialog when that is all th
 
 test('without the batched remove, the bulk button is disabled with its reason', () => {
 	const out = html(<DuplicatesPanel sample={SMALL} writes={on} onSelect={noop} onRemoveDocument={noop} initial={{ policy: 'shortest-path' }} />);
-	assert.match(out, /<button[^>]*disabled=""[^>]*title="This view cannot remove several documents at once\."[^>]*>Remove all queued \(2 documents\)<\/button>/);
+	assert.match(out, /<button[^>]*disabled=""[^>]*title="This view cannot move several documents to the trash at once\."[^>]*>Move all queued to the trash \(2 documents\)<\/button>/);
 });
 
 test("the sample model's removed documents leave the groups", () => {
@@ -223,12 +223,12 @@ test("the sample model's removed documents leave the groups", () => {
 test('after the console removed queued documents the panel says how many, with the chunks as the document list counts them', () => {
 	const sample: ISampleModel = { ...SMALL, removed: ['ob'] };
 	const out = html(<DuplicatesPanel sample={sample} writes={on} documents={rowsSource} onSelect={noop} onRemoveDocument={noop} onRemoveDocuments={noop} initial={{ requested: ['ob', 'od'] }} />);
-	assert.match(out, /Removed 1 document \(2 chunks as listed\)/);
+	assert.match(out, /Moved 1 document to the trash \(2 chunks as listed\)/);
 	assert.doesNotMatch(out, /still stored/, 'a cancelled dialog and a stopped batch look the same from here: nothing is said about the rest');
 	const all: ISampleModel = { ...SMALL, removed: ['ob', 'od'] };
-	assert.match(html(<DuplicatesPanel sample={all} writes={on} documents={rowsSource} onSelect={noop} onRemoveDocument={noop} onRemoveDocuments={noop} initial={{ requested: ['ob', 'od'] }} />), /Removed 2 documents \(3 chunks as listed\)/);
+	assert.match(html(<DuplicatesPanel sample={all} writes={on} documents={rowsSource} onSelect={noop} onRemoveDocument={noop} onRemoveDocuments={noop} initial={{ requested: ['ob', 'od'] }} />), /Moved 2 documents to the trash \(3 chunks as listed\)/);
 	const unknown: ISampleModel = { ...modelOf({ ...small(), docs: small().docs.map((d) => ({ ...d, chunks: null })) }), removed: ['ob'] };
-	assert.match(html(<DuplicatesPanel sample={unknown} writes={on} onSelect={noop} onRemoveDocument={noop} onRemoveDocuments={noop} initial={{ requested: ['ob', 'od'] }} />), /Removed 1 document</, 'no count when the list does not have one');
+	assert.match(html(<DuplicatesPanel sample={unknown} writes={on} onSelect={noop} onRemoveDocument={noop} onRemoveDocuments={noop} initial={{ requested: ['ob', 'od'] }} />), /Moved 1 document to the trash</, 'no count when the list does not have one');
 });
 
 test('a removal that resolves the last group still says what was removed, beside the sentence that no pair is left', () => {
@@ -246,8 +246,8 @@ test('a removal that resolves the last group still says what was removed, beside
 	const sample: ISampleModel = { ...modelOf({ ...only, knn }), removed: ['ob'] };
 	const out = html(<DuplicatesPanel sample={sample} writes={on} documents={rowsSource} onSelect={noop} onRemoveDocument={noop} onRemoveDocuments={noop} initial={{ policy: 'shortest-path', requested: ['ob'] }} />);
 	assert.match(out, /No near-duplicate pairs at similarity 0\.97 or above in this sample\./, 'the only group is resolved');
-	assert.match(out, /Removed 1 document \(2 chunks as listed\)/, 'and the panel says what the removal did');
-	assert.doesNotMatch(html(<DuplicatesPanel sample={modelOf({ ...only, knn })} writes={on} onSelect={noop} onRemoveDocument={noop} />), /Removed/, 'nothing removed, nothing said');
+	assert.match(out, /Moved 1 document to the trash \(2 chunks as listed\)/, 'and the panel says what the removal did');
+	assert.doesNotMatch(html(<DuplicatesPanel sample={modelOf({ ...only, knn })} writes={on} onSelect={noop} onRemoveDocument={noop} />), /Moved \d+ documents? to the trash|Removed/, 'nothing moved, nothing said');
 });
 
 test('the reviewed documents of a connection come from its cache, so the queue keeps them across tab switches', () => {
@@ -270,9 +270,9 @@ test('groups of shared passages say so; a policy keeps one document in each and 
 	assert.equal((policy.match(/checked=""/g) ?? []).length, 3, 'the policy keeps one document per group');
 	assert.equal((policy.match(/>queued</g) ?? []).length, 0);
 	assert.ok((policy.match(/holds text the kept document does not, so not queued/g) ?? []).length >= 4, 'the documents it leaves say they hold text of their own');
-	assert.match(policy, /<button[^>]*disabled=""[^>]*title="This sample does not show that the kept document holds the others\."[^>]*>Remove the others<\/button>/);
+	assert.match(policy, /<button[^>]*disabled=""[^>]*title="This sample does not show that the kept document holds the others\."[^>]*>Move the others to the trash<\/button>/);
 	assert.doesNotMatch(html(<DuplicatesPanel sample={SMALL} writes={on} onSelect={noop} onRemoveDocument={noop} />), /Shared passages only/, 'a copy shares most of its chunks');
-	assert.match(out, /<button[^>]*disabled=""[^>]*title="Choose the document to keep first"[^>]*>Remove the others<\/button>/);
+	assert.match(out, /<button[^>]*disabled=""[^>]*title="Choose the document to keep first"[^>]*>Move the others to the trash<\/button>/);
 });
 
 test('two long files sampled once each through the shared paragraph: the panel says it cannot tell, and a policy queues nothing', () => {
@@ -296,7 +296,7 @@ test('two long files sampled once each through the shared paragraph: the panel s
 	assert.match(out, /This sample holds too few chunks of these documents to tell copies from shared text\. A keep policy queues a document only when this sample shows that the kept one holds it\./);
 	assert.doesNotMatch(out, /Shared passages only|Not every document here is a copy/);
 	assert.match(out, /role="status"[^>]*>No document queued/);
-	assert.match(out, /<button[^>]*disabled=""[^>]*>Remove all queued \(0 documents\)<\/button>/);
+	assert.match(out, /<button[^>]*disabled=""[^>]*>Move all queued to the trash \(0 documents\)<\/button>/);
 	assert.match(out, /this sample does not show that the kept document holds it, so not queued/, 'the document the policy leaves says why');
 });
 
@@ -397,7 +397,7 @@ test("a group's kept document is listed even when it is not among the first 20, 
 	assert.ok(unshown > 0 && unshown < 20, `${unshown} of the 20 left out are not shown held`);
 	assert.match(out, new RegExp(`and 20 more documents, all 20 of them queued, ${unshown} by your choice although this sample does not show that the kept document holds them\\. Show group selects the whole group on the map\\.`));
 	assert.match(out, /role="status"[^>]*>39 documents queued/);
-	assert.match(out, />Remove the others \(39\)</);
+	assert.match(out, />Move the others to the trash \(39\)</);
 });
 
 // =============================================================================
@@ -414,8 +414,8 @@ test('the outlier review: a percentile select, one row per outlier with why, and
 	assert.match(out, /density 0\.24 vs sample median 0\.68; nearest neighbour 0\.\d\d in /);
 	assert.equal((out.match(/>Show neighbours</g) ?? []).length, 10);
 	assert.equal((out.match(/>Mark reviewed</g) ?? []).length, 10);
-	assert.equal((out.match(/<button[^>]*>Remove document<\/button>/g) ?? []).length, 10);
-	assert.doesNotMatch(out, /<button[^>]*disabled=""[^>]*>Remove document<\/button>/);
+	assert.equal((out.match(/<button[^>]*>Move to trash<\/button>/g) ?? []).length, 10);
+	assert.doesNotMatch(out, /<button[^>]*disabled=""[^>]*>Move to trash<\/button>/);
 });
 
 test('a larger percentile lists more rows from the same sample', () => {
@@ -425,10 +425,10 @@ test('a larger percentile lists more rows from the same sample', () => {
 
 test('Remove document is disabled with the reason when writes are off, and absent without a remove handler', () => {
 	const out = html(<OutliersPanel sample={demo} onSelect={noop} onRemoveDocument={noop} writes={off} />);
-	assert.equal((out.match(/<button[^>]*disabled=""[^>]*>Remove document<\/button>/g) ?? []).length, 10);
+	assert.equal((out.match(/<button[^>]*disabled=""[^>]*>Move to trash<\/button>/g) ?? []).length, 10);
 	assert.ok(out.includes(off.reason as string));
-	assert.equal((html(<OutliersPanel sample={demo} onSelect={noop} onRemoveDocument={noop} />).match(/<button[^>]*disabled=""[^>]*>Remove document<\/button>/g) ?? []).length, 10, 'no writes given: closed');
-	assert.doesNotMatch(html(<OutliersPanel sample={demo} onSelect={noop} />), /Remove document|Show neighbours/);
+	assert.equal((html(<OutliersPanel sample={demo} onSelect={noop} onRemoveDocument={noop} />).match(/<button[^>]*disabled=""[^>]*>Move to trash<\/button>/g) ?? []).length, 10, 'no writes given: closed');
+	assert.doesNotMatch(html(<OutliersPanel sample={demo} onSelect={noop} />), /Move to trash|Show neighbours/);
 });
 
 test('the outlier buttons hand the host the point or its document', () => {
@@ -441,7 +441,7 @@ test('the outlier buttons hand the host the point or its document', () => {
 	button(tree, 'C:/demo/finance/ocr_scan_junk.txt').props.onClick();
 	button(tree, 'Show neighbours').props.onClick();
 	button(tree, 'Mark reviewed').props.onClick();
-	button(tree, 'Remove document').props.onClick();
+	button(tree, 'Move to trash').props.onClick();
 	assert.deepEqual(picked, [262]);
 	assert.deepEqual(neighbours, [262]);
 	assert.deepEqual(reviewed, [[outlierKey(rows[0]!), true]], 'Mark reviewed marks the chunk');
@@ -651,7 +651,7 @@ test('a revision that added chapters: keeping the original queues nothing and th
 	};
 	const out = html(<DuplicatesPanel sample={modelOf(revision)} writes={on} onSelect={noop} onRemoveDocument={noop} onRemoveDocuments={noop} initial={{ policy: 'shortest-path' }} />);
 	assert.match(out, /role="status"[^>]*>No document queued/);
-	assert.match(out, /<button[^>]*disabled=""[^>]*>Remove all queued \(0 documents\)<\/button>/);
+	assert.match(out, /<button[^>]*disabled=""[^>]*>Move all queued to the trash \(0 documents\)<\/button>/);
 	assert.match(out, /8 chunks · 4 of 8 sampled chunks match · holds text the kept document does not, so not queued/);
 	assert.match(out, /Not every document here is a copy of the others/);
 	const most = html(<DuplicatesPanel sample={modelOf(revision)} writes={on} onSelect={noop} onRemoveDocument={noop} onRemoveDocuments={noop} initial={{ policy: 'most-chunks' }} />);
@@ -711,7 +711,7 @@ test('a kept handbook that prints a section three times: no policy queues the do
 		const out = html(<DuplicatesPanel sample={modelOf(sample)} writes={on} documents={documents} onSelect={noop} onRemoveDocument={noop} onRemoveDocuments={noop} initial={{ policy }} />);
 		assert.match(out, /aria-label="Keep C:\/hb\/handbook\.md" checked=""/, `${policy} keeps the handbook`);
 		assert.match(out, /role="status"[^>]*>No document queued/, `${policy}: nothing queued`);
-		assert.match(out, /<button[^>]*disabled=""[^>]*>Remove all queued \(0 documents\)<\/button>/, `${policy}: the bulk remove is disabled`);
+		assert.match(out, /<button[^>]*disabled=""[^>]*>Move all queued to the trash \(0 documents\)<\/button>/, `${policy}: the bulk remove is disabled`);
 		assert.match(out, /300 chunks · ingested 2026-03-01 · \d+ of 143 sampled chunks match · this sample does not show that the kept document holds it, so not queued/, `${policy}: the document says why it is left`);
 		assert.match(out, /This sample cannot tell yet whether these documents are whole copies of each other/, `${policy}: the group is not called copies`);
 	}

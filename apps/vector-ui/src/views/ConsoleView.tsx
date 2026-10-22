@@ -26,7 +26,8 @@
 //
 // The default document of every connection. Across the top, the database
 // summary (StatsStrip); on the left, every document by its path with its
-// trash button and, under it, the selected document's chunks; on the right,
+// trash button (and, one switch away, the Trash: Restore, Delete permanently,
+// Empty trash) and, under it, the selected document's chunks; on the right,
 // adding documents above the chat. The Map is a second tab of the same
 // document: both stay mounted (the map gets `visible` so its canvas sleeps
 // while hidden), and every map action lands back here through the console's
@@ -34,7 +35,7 @@
 //
 // The console's calls and their pacing live in its controller
 // (vector/consoleStore.ts); this view renders the controller's snapshot and
-// forwards clicks. Removal is confirmed by the app-level dialog host.
+// forwards clicks. Writes are confirmed by the app-level dialog host.
 //
 // THE SCOPE. The directory's ScopeBar sets the connection's scope (the
 // entry's value store, read by the map and search as ConsoleModel.scope);
@@ -268,12 +269,12 @@ export const ConsoleView: React.FC<IConsoleViewProps> = ({ opened, active }) => 
 			<StatsStrip stats={state.stats} dialect={dialect} readOnly={model.readOnly} documents={state.directory.rows} scopeLine={scopeLine} sample={selection.connectionKey === entry.key ? selection.sampleModel : null} loading={state.directory.status === 'loading'} scopeFilter={scope?.filter ?? null} onScope={scopeFromChart} health={health} />
 			{(state.removal.status === 'running' || state.removal.message) && (
 				<div role="status" style={{ ...styles.small, padding: '6px 24px' }}>
-					{state.removal.status === 'running' ? BUSY.removing : state.removal.message}
+					{state.removal.status === 'running' ? (state.removal.message ?? BUSY.removing) : state.removal.message}
 				</div>
 			)}
 			<div ref={body} style={{ flex: 1, minHeight: 0, display: tab === 'console' ? 'flex' : 'none', flexDirection: cols.stacked ? 'column' : 'row', gap: 12, padding: 12, overflow: cols.stacked ? 'auto' : 'hidden' }}>
 				<div style={{ flex: cols.stacked ? 'none' : `0 0 ${cols.left}`, height: cols.stacked ? 520 : undefined, display: 'flex', flexDirection: 'column', minWidth: 0, minHeight: 0 }}>
-					<DocumentDirectory pager={state.directory} selectedId={selectedId} writes={writesDuringRemoval(model.writes, state.removal.status)} onSelect={(item) => entry.selection.selectDocument({ objectId: item.objectId, path: item.path })} onRemove={(targets) => entry.controller.requestRemove(targets)} onLoadMore={() => entry.controller.loadMoreDocuments()} onRetry={() => entry.controller.retryDocuments()} collection={model.collection} scope={scope} onScope={setScope} cap={cap} available={available} saved={saved} onSave={saveFilter} onDeleteSaved={deleteFilter} />
+					<DocumentDirectory pager={state.view === 'trash' ? state.trash : state.directory} selectedId={selectedId} writes={writesDuringRemoval(model.writes, state.removal.status)} onSelect={(item) => entry.selection.selectDocument({ objectId: item.objectId, path: item.path })} onRemove={(targets) => entry.controller.requestRemove(targets)} onLoadMore={() => entry.controller.loadMoreDocuments()} onRetry={() => entry.controller.retryDocuments()} collection={model.collection} scope={scope} onScope={setScope} cap={cap} available={available} saved={saved} onSave={saveFilter} onDeleteSaved={deleteFilter} view={state.view} onView={(next) => entry.controller.setView(next)} trashCount={state.stats.view?.deletedDocuments ?? null} onRestore={(targets) => void entry.controller.restore(targets)} onDelete={(targets) => entry.controller.requestDelete(targets)} onEmptyTrash={() => void entry.controller.requestEmptyTrash()} />
 					<ChunkList chunks={state.chunks} path={selection.document?.path ?? null} onMore={() => entry.controller.loadMoreChunks()} onOpen={(chunkId) => actions.openDocument(state.chunks.objectId ?? '', chunkId)} onMap={(key) => actions.showOnMap([key], 'document')} />
 				</div>
 				<div style={{ flex: cols.stacked ? 'none' : `1 1 ${cols.right}`, display: 'flex', flexDirection: 'column', gap: 12, minWidth: 0, minHeight: 0 }}>
@@ -291,7 +292,7 @@ export const ConsoleView: React.FC<IConsoleViewProps> = ({ opened, active }) => 
 				</div>
 			</div>
 			<div style={{ flex: 1, minHeight: 0, display: tab === 'map' ? 'flex' : 'none', flexDirection: 'column', padding: 12 }}>
-				<MapView model={mapModel} channels={channels} selection={entry.selection} actions={actions} visible={active && tab === 'map'} documents={entry.documents} />
+				<MapView model={mapModel} channels={channels} selection={entry.selection} actions={actions} visible={active && tab === 'map'} documents={entry.documents} writes={entry.writes} />
 			</div>
 		</div>
 	);

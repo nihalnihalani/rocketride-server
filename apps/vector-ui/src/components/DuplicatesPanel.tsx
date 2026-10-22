@@ -30,15 +30,16 @@
 // policy (oldest ingest, shortest path, most chunks, or by hand), one
 // fieldset per group with a Keep radio per document (the first 20 and the
 // kept one; the rest counted, with how many of them are queued) and the
-// pairs that make it, and Show group, Mark reviewed, Remove the others and
-// Remove all queued. What the sample shows about each group is worked out
+// pairs that make it, and Show group, Mark reviewed, Move the others to the
+// trash and Move all queued to the trash. What the sample shows about each group is worked out
 // once per view and documents, never on every render.
 // A group inside one document is listed apart with Open only.
 //
-// Removing is the console's: the queued objectIds go to the host's batched
-// remove, which confirms with the typed count and sends `delete`
-// at most `write_ids_max` at a time, stopping at the first error. Without
-// writes the radios and every Remove are disabled with the reason as text.
+// Moving to the trash is the console's: the queued objectIds go to the host's
+// batched move, which confirms (nothing to type: the Trash restores them) and
+// sends `soft_delete` at most `write_ids_max` at a time, stopping at the first
+// error. Without writes the radios and every button that moves documents are
+// disabled with the reason as text.
 // The reviewed documents are the connection's 'reviewed documents' cache.
 // =============================================================================
 

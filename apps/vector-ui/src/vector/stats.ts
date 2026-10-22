@@ -167,7 +167,7 @@ export function statsChips(input: { dialect: IDialectResult | null; stats: IStat
 		chips.push(dialect.support === 'supported' ? { key: 'support', label: 'Supported', tone: 'success', tooltip: 'Run against a live server on new and legacy collections in this build.' } : { key: 'support', label: 'Experimental', tone: 'warning', tooltip: CAVEAT_SENTENCES.experimental });
 	}
 	if (readOnly) chips.push({ key: 'writes', label: 'Read-only', tone: 'muted', tooltip: `${EMPTY.readOnly}.` });
-	else if (dialect) chips.push(dialect.allow_writes ? { key: 'writes', label: 'Writes on', tone: 'info', tooltip: 'Documents can be removed from this console (allow_writes is on for this store node).' } : { key: 'writes', label: 'Writes off', tone: 'muted', tooltip: CODE_SENTENCES.WRITES_DISABLED });
+	else if (dialect) chips.push(dialect.allow_writes ? { key: 'writes', label: 'Writes on', tone: 'info', tooltip: 'Documents can be moved to the trash, restored and deleted from this console (allow_writes is on for this store node).' } : { key: 'writes', label: 'Writes off', tone: 'muted', tooltip: CODE_SENTENCES.WRITES_DISABLED });
 
 	const caveats = [...new Set([...(dialect?.caveats ?? []), ...(stats?.caveats ?? [])])];
 	if (dialect?.health.model_mismatch === true && !caveats.includes('model_mismatch')) caveats.push('model_mismatch');

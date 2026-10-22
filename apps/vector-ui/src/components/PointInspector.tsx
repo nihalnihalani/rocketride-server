@@ -27,7 +27,7 @@
 // What the selected point is (path, chunk of N, length, text), how similar it
 // is to the active query (and the pipeline's own score when known), its 12
 // nearest chunks in the whole collection, and the actions that land back in the
-// console: Open document, Find similar, Remove document (gated; when it is not
+// console: Open document, Find similar, Move to trash (gated; when it is not
 // available the reason is shown as text). Beside them:
 //
 //   - Add as example (+) / (−): the point becomes a Recommend example;
@@ -116,7 +116,7 @@ export function PointInspector(props: PointInspectorProps): React.ReactElement {
 					Find similar
 				</button>
 				<button type="button" style={MAP_STYLES.button} disabled={!props.writes.enabled || removed} onClick={() => props.onRemoveDocument(objectId)}>
-					Remove document
+					Move to trash
 				</button>
 			</div>
 			{props.onAddExample ? (

@@ -29,7 +29,7 @@
 // browser from the sample's density, so changing it sends nothing; 1 % is
 // the node's own list. Each row says why (density against the sample's
 // median, nearest neighbour in the sample) and offers Show neighbours, Mark
-// reviewed and Remove document (the console confirms; without writes the
+// reviewed and Move to trash (the console confirms; without writes the
 // button is disabled with the reason as text). A reviewed outlier is its
 // chunk, kept in the registry's reviewed cache under the connection's
 // outliers scope, apart from the documents the duplicates queue marks.
@@ -117,7 +117,7 @@ export function OutliersBody(props: OutliersBodyProps): React.ReactElement {
 							</button>
 							{props.canRemove ? (
 								<button type="button" style={MAP_STYLES.button} disabled={!writes.enabled} title={writes.enabled ? undefined : (writes.reason ?? undefined)} onClick={() => props.onRemove(row.objectId)}>
-									Remove document
+									Move to trash
 								</button>
 							) : null}
 						</div>

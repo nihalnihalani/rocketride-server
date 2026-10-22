@@ -57,7 +57,11 @@ drivers behind them.
 2. **Probe.** One `dialect` call per store node, on the anchor role's token. It
    answers the provider, backend, collection, metric, model, dimension, score
    definition, support level, write switches, capabilities, limits, health and
-   caveats, and never a host, DSN, credential or database name.
+   caveats, and never a host, DSN, credential or database name. The console
+   asks it again (`vectorEndpoints.probe`) when an upload completes and after
+   every write, so a store found empty shows its model, dimension and index
+   once documents exist; until then the drawer reads them from the last
+   `stats` answer, and the strip's "Empty collection" follows fresh stats.
 3. **Tool calls.** `store.channel(client, endpoint, role)` returns a channel
    bound to one role's token; `invoke(tool, input, { nodeId })` sends a DAP
    `tool` request that always names the node. The engine checks the data
@@ -134,7 +138,18 @@ Rules the tests pin:
   threshold, the outlier share, edges and isolation are computed from the
   sample the browser holds (`sample.knn`, `sample.density`,
   `sample.duplicates`, `clusters.labels`); `sample` is called again only for
-  another size, mode, seed, scope, or an expired sample.
+  another size, mode, seed, scope, an expired sample, or after a write (below).
+- **Writes.** The directory has a Documents / Trash switch; **Trash (N)** is
+  `stats.deleted_documents`. Move to trash (`soft_delete`) and Restore
+  (`restore`) can be undone, so nothing is typed for them (Restore asks
+  nothing at all); Delete permanently (`delete`) and Empty trash (`delete` with
+  `deleted_only: true` over the whole `list_documents {deleted: 'deleted'}`
+  listing, reporting `kept_live`) keep the typed confirmations. Every write is
+  sent once per batch of `write_ids_max`, never retried, and confirmed by the
+  console's controller only (`vector/consoleStore.ts`, `vector/confirm.ts`).
+  After any write that ran the console asks `stats` in full, lists both
+  listings again, probes the dialect again and bumps the connection's write
+  count, which makes the map draw its sample again.
 - **Exports carry no vector.** `vector/export.ts` imports nothing that calls a
   tool; its rows are words and numbers, snippets at most `snippet_chars`.
 
@@ -167,8 +182,8 @@ both lists to every suite the change lanes own in `lanes.json`.
 - **Where it lives in a pipe.** `config[config.profile].allow_writes` on the
   store component (contract §6.1). The templates set it explicitly: `true` on
   `store_1`, `false` on `store_2`.
-- **The gate** (contract §6.3) runs first in `remove_document`, `delete` and
-  `upsert`, fails closed, and answers refusals as envelopes; the write tools
+- **The gate** (contract §6.3) runs first in `delete`, `soft_delete`,
+  `restore` and `upsert`, fails closed, and answers refusals as envelopes; the write tools
   stay listed. An agent's write is decided by the outer switch `allow_write`
   alone, as on develop (#2631); the gate has no agent switch, so agent
   pipelines keep writing as before.

@@ -158,11 +158,14 @@ export function sortDocuments(items: readonly IDocumentItem[]): IDocumentItem[] 
  * "oversize" (which needs the median, passed once the listing settled) is a
  * badge in the document's own folder, so no row moves when it comes or goes.
  *
+ * In the Trash view (`trash`) every document has chunks in the trash: that is why it is listed there, so its
+ * deleted chunks are neither a badge nor a reason to need attention.
+ *
  * @param rows - The documents, in display order.
- * @param health - The median chunks per loaded document (null while unknown).
+ * @param health - The median chunks per loaded document (null while unknown); `trash` for the Trash view.
  * @returns The groups.
  */
-export function buildGroups(rows: readonly IDocumentItem[], health: { medianChunks: number | null } = { medianChunks: null }): IDirectoryGroup[] {
+export function buildGroups(rows: readonly IDocumentItem[], health: { medianChunks: number | null; trash?: boolean } = { medianChunks: null }): IDirectoryGroup[] {
 	const pathCounts = new Map<string, number>();
 	for (const item of rows) pathCounts.set(item.path, (pathCounts.get(item.path) ?? 0) + 1);
 	const folders = new Map<string, IDirectoryGroup>();
@@ -170,9 +173,9 @@ export function buildGroups(rows: readonly IDocumentItem[], health: { medianChun
 	const attention: IDirectoryGroup = { key: 'attention', label: '', kind: 'attention', rows: [] };
 	for (const item of rows) {
 		const place = placeOf(item);
-		const itemHealth = documentHealth(item, { medianChunks: health.medianChunks });
-		const flags = itemHealth.flags.map((f) => f.label);
-		const row: IDirectoryRow = { item, name: place.name, duplicate: (pathCounts.get(item.path) ?? 0) > 1, shortId: item.objectId.slice(0, 8), flags, attention: needsAttention(itemHealth) };
+		const all = documentHealth(item, { medianChunks: health.medianChunks }).flags;
+		const shown = health.trash ? all.filter((f) => f.kind !== 'deleted_chunks') : all;
+		const row: IDirectoryRow = { item, name: place.name, duplicate: (pathCounts.get(item.path) ?? 0) > 1, shortId: item.objectId.slice(0, 8), flags: shown.map((f) => f.label), attention: needsAttention({ flags: shown }) };
 		if (row.attention) attention.rows.push({ ...row, name: item.path || '(no path)' });
 		else if (place.kind === 'uploaded') uploaded.rows.push(row);
 		else {

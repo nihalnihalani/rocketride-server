@@ -152,28 +152,28 @@ export function queuedLine(n: number, policyChose = false): string {
  * The bulk button.
  *
  * @param n - Queued documents.
- * @returns E.g. "Remove all queued (3 documents)".
+ * @returns E.g. "Move all queued to the trash (3 documents)".
  */
 export function removeAllLabel(n: number): string {
-	return `Remove all queued (${plural(n, 'document')})`;
+	return `Move all queued to the trash (${plural(n, 'document')})`;
 }
 
 /**
  * A group's own remove button.
  *
  * @param n - The group's queued documents.
- * @returns E.g. "Remove the others (2)".
+ * @returns E.g. "Move the others to the trash (2)".
  */
 export function removeOthersLabel(n: number): string {
-	if (n === 0) return 'Remove the others';
-	return n === 1 ? 'Remove the other' : `Remove the others (${num(n)})`;
+	if (n === 0) return 'Move the others to the trash';
+	return n === 1 ? 'Move the other to the trash' : `Move the others to the trash (${num(n)})`;
 }
 
 /** A group has no kept document yet. */
 export const CHOOSE_KEEP_FIRST = 'Choose the document to keep first';
 
 /** Every document of a group holds text the others do not, as the sample shows. */
-export const SHARED_PASSAGES_NOTE = 'Shared passages only: this sample shows that each of these documents holds text the others do not. Removing a document removes all of it.';
+export const SHARED_PASSAGES_NOTE = 'Shared passages only: this sample shows that each of these documents holds text the others do not. Moving a document to the trash moves all of it.';
 
 /** Some document of a group holds text the others do not, as the sample shows. */
 export const NOT_WHOLE_COPIES_NOTE = 'Not every document here is a copy of the others: this sample shows that at least one holds text the others do not.';
@@ -205,22 +205,22 @@ export const BY_HAND_OWN_TEXT = 'queued by your choice; this sample shows it hol
 /** Under a document queued by a hand-picked keep: the sample does not show the kept one holds it. */
 export const BY_HAND_NOT_SHOWN = 'queued by your choice; this sample does not show that the kept document holds it';
 
-/** A group's Remove button when its keep holds no other document, as far as the sample shows. */
+/** A group's Move to trash button when its keep holds no other document, as far as the sample shows. */
 export const NOTHING_SHOWN_HELD = 'This sample does not show that the kept document holds the others.';
 
 /**
- * After the console removed queued documents. The chunk count is the
- * document list's (the node's own count of what it removed does not reach
- * the panel), and nothing is said about documents not removed: a cancelled
+ * After the console moved queued documents to the trash. The chunk count is
+ * the document list's (the node's own count of what it moved does not reach
+ * the panel), and nothing is said about documents not moved: a cancelled
  * dialog and a batch that stopped at an error look the same from here.
  *
- * @param removed - Documents now gone.
+ * @param removed - Documents now in the trash.
  * @param chunks - Their chunks as the document list counts them, or null when one is unknown.
- * @returns E.g. "Removed 3 documents (41 chunks as listed)".
+ * @returns E.g. "Moved 3 documents to the trash (41 chunks as listed)".
  */
 export function removedLine(removed: number, chunks: number | null): string {
 	const counted = chunks === null ? '' : ` (${plural(chunks, 'chunk')} as listed)`;
-	return `Removed ${plural(removed, 'document')}${counted}`;
+	return `Moved ${plural(removed, 'document')} to the trash${counted}`;
 }
 
 /**
@@ -257,7 +257,7 @@ export const REPEATED_HEADING = 'Repeated text inside one document';
 export const REPEATED_NOTE = 'The same text more than once inside one document. Open the document to look; nothing is removed from here.';
 
 /** Several documents need the console's multi-remove dialog, which this view was not given. */
-export const NO_BULK_REMOVE = 'This view cannot remove several documents at once.';
+export const NO_BULK_REMOVE = 'This view cannot move several documents to the trash at once.';
 
 /**
  * Only the largest groups are drawn.

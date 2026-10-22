@@ -28,10 +28,12 @@
 // attention"; a muted 'oversize' in a folder; two at most, then "+N"), chunk count ("—" when the store
 // cannot count), a tables badge, a tooltip with size, type, ingest time, the
 // health flags and the short objectId, a multi-select
-// checkbox and the trash button. The trash button is disabled with the reason
-// whenever removing is not available; it never sends anything itself: it asks
-// the console, which confirms first. Only the name selects the row, so no
-// control inside it has to stop an event from reaching another.
+// checkbox and the trash button (Move to trash). In the Trash view the row has
+// Restore and Delete permanently instead. Every button is disabled with the
+// reason whenever writing is not available; none sends anything itself: each
+// asks the console, which confirms first where the write is permanent. Only
+// the name selects the row, so no control inside it has to stop an event from
+// reaching another.
 // =============================================================================
 
 import React from 'react';
@@ -51,7 +53,12 @@ export interface IDocumentRowProps {
 	writes: Availability;
 	onSelect(): void;
 	onToggleCheck(): void;
+	/** Move to trash (the Documents view). */
 	onRemove(): void;
+	/** The Trash view: the row restores and deletes permanently instead. */
+	mode?: 'active' | 'trash';
+	onRestore?(): void;
+	onDelete?(): void;
 }
 
 /**
@@ -76,9 +83,14 @@ export function rowTooltip(row: IDirectoryRow): string {
  * @param props - {@link IDocumentRowProps}.
  * @returns The row element.
  */
-export function DocumentRow({ row, selected, checked, writes, onSelect, onToggleCheck, onRemove }: IDocumentRowProps): React.ReactElement {
+export function DocumentRow({ row, selected, checked, writes, onSelect, onToggleCheck, onRemove, mode = 'active', onRestore, onDelete }: IDocumentRowProps): React.ReactElement {
 	const { item } = row;
 	const label = item.path || item.objectId;
+	const ring = {
+		onFocus: (event: React.FocusEvent<HTMLButtonElement>) => (event.currentTarget.style.outline = FOCUS_RING),
+		onBlur: (event: React.FocusEvent<HTMLButtonElement>) => (event.currentTarget.style.outline = 'none'),
+	};
+	const gated = { opacity: writes.enabled ? 1 : 0.55, cursor: writes.enabled ? 'pointer' : 'not-allowed' };
 	// A defect is a warning; a badge on a row that stays in its folder (oversize) is a note.
 	const badgeEdge = row.attention ? TONE_EDGE.warning : TONE_EDGE.muted;
 	return (
@@ -98,21 +110,53 @@ export function DocumentRow({ row, selected, checked, writes, onSelect, onToggle
 			<span style={{ ...styles.small, minWidth: 28, textAlign: 'right' }} aria-label={item.chunks === null ? 'chunk count unknown' : `${item.chunks} chunks`}>
 				{item.chunks === null ? '—' : formatCount(item.chunks)}
 			</span>
-			<button
-				type="button"
-				style={{ ...styles.iconButton, opacity: writes.enabled ? 1 : 0.55, cursor: writes.enabled ? 'pointer' : 'not-allowed' }}
-				aria-label={`Remove ${label} from the database`}
-				title={writes.enabled ? `Remove ${label} from the database` : (writes.reason ?? undefined)}
-				aria-disabled={!writes.enabled}
-				disabled={!writes.enabled}
-				onClick={() => {
-					if (writes.enabled) onRemove();
-				}}
-				onFocus={(event) => (event.currentTarget.style.outline = FOCUS_RING)}
-				onBlur={(event) => (event.currentTarget.style.outline = 'none')}
-			>
-				<BxTrash />
-			</button>
+			{mode === 'trash' ? (
+				<>
+					<button
+						type="button"
+						style={{ ...styles.small, ...gated, background: 'none', border: '1px solid var(--rr-border-input)', borderRadius: 4, padding: '0 6px', color: 'inherit' }}
+						aria-label={`Restore ${label}`}
+						title={writes.enabled ? `Restore ${label}` : (writes.reason ?? undefined)}
+						aria-disabled={!writes.enabled}
+						disabled={!writes.enabled}
+						onClick={() => {
+							if (writes.enabled) onRestore?.();
+						}}
+						{...ring}
+					>
+						Restore
+					</button>
+					<button
+						type="button"
+						style={{ ...styles.iconButton, ...gated }}
+						aria-label={`Delete ${label} permanently`}
+						title={writes.enabled ? `Delete ${label} permanently` : (writes.reason ?? undefined)}
+						aria-disabled={!writes.enabled}
+						disabled={!writes.enabled}
+						onClick={() => {
+							if (writes.enabled) onDelete?.();
+						}}
+						{...ring}
+					>
+						<BxTrash />
+					</button>
+				</>
+			) : (
+				<button
+					type="button"
+					style={{ ...styles.iconButton, ...gated }}
+					aria-label={`Move ${label} to the trash`}
+					title={writes.enabled ? `Move ${label} to the trash` : (writes.reason ?? undefined)}
+					aria-disabled={!writes.enabled}
+					disabled={!writes.enabled}
+					onClick={() => {
+						if (writes.enabled) onRemove();
+					}}
+					{...ring}
+				>
+					<BxTrash />
+				</button>
+			)}
 		</div>
 	);
 }

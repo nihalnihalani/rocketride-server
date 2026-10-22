@@ -113,8 +113,16 @@ import type { ILayoutClient } from '../map/workerClient';
 import { BUSY, CENTROID_APPROX, CLUSTERS_UNSUPPORTED, EDGES_DEGRADED, EDGES_LIGHT_LIMIT, EDGES_LIGHT_NOTE, LAYOUT_CANCELLED, LAYOUT_NOT_BETTER, LIGHT_POSITIONS, MAP_UNAVAILABLE, QUERY_NEEDS_EMBED, QUERY_PLACED_APPROX, clusterAnnouncement, edgeLegend, listingNote, mapFailure, num, pointAnnouncement, sampleLabel, SCOPE_RETRY, scopeLine } from '../map/wording';
 import { heatScores } from '../vector/heat';
 
-/** Props: the frozen ones plus where the Table toggle and the side panel start. */
+/** How many writes the console ran on the store (the connection's write count). */
+export interface IWriteCountSource {
+	get(): number;
+	subscribe(listener: () => void): () => void;
+}
+
+/** Props: the frozen ones plus where the Table toggle and the side panel start, and the console's write count. */
 export interface MapViewProps extends ContractMapViewProps {
+	/** A change means a write (to the trash, out of it, deleted) changed what a sample holds: the shown sample is drawn again. */
+	writes?: IWriteCountSource | null;
 	/** Open with the Table alternative shown (only the toggle's starting state; off when not given). */
 	initialTable?: boolean;
 	/** The side panel's first tab (only its starting state; 'point' when not given). */
@@ -179,6 +187,9 @@ function scopeOfSample(result: ISampleResult | null | undefined): ISampleScope {
 	return (result ? SAMPLE_SCOPES.get(result) : undefined) ?? NOT_RECORDED;
 }
 const NO_ROWS_SOURCE: IDocumentRowsSource = { getRows: () => NO_ROWS, subscribe: () => () => undefined };
+
+/** No console around the map: no write ever happens. */
+const NO_WRITES: IWriteCountSource = { get: () => 0, subscribe: () => () => undefined };
 
 /**
  * A colouring as a saved view keeps it. The saved view's field is the
@@ -304,7 +315,7 @@ export interface SelectionTabProps {
 	writes: Availability;
 	/** "Ask about these only": the documents of the selection. */
 	onAskAbout(objectIds: readonly string[]): void;
-	/** "Remove these documents": EVERY document of the selection; the console confirms and batches the writes (APP_SPEC §6). */
+	/** "Move these documents to the trash": EVERY document of the selection; the console confirms and batches the writes (APP_SPEC §6). */
 	onRemove(objectIds: readonly string[]): void;
 	onCopy(keys: readonly VectorKey[]): void;
 	/** Show only the selected points on the map; absent: no such button. */
@@ -337,7 +348,7 @@ export function SelectionTab(props: SelectionTabProps): React.ReactElement {
 					Ask about these only
 				</button>
 				<button type="button" style={MAP_STYLES.button} disabled={!writes.enabled} onClick={() => props.onRemove(docs)}>
-					Remove these documents
+					Move these documents to the trash
 				</button>
 				<button type="button" style={MAP_STYLES.button} onClick={() => props.onCopy(keys)}>
 					Copy keys
@@ -463,6 +474,11 @@ export function MapView(props: MapViewProps): React.ReactElement {
 	const shownScope = scopeOfSample(sampleModel?.result);
 	const scopeState = mapScopeState(scopeTarget.key, shownScope);
 	const docRows = useSyncExternalStore((props.documents ?? NO_ROWS_SOURCE).subscribe, (props.documents ?? NO_ROWS_SOURCE).getRows, (props.documents ?? NO_ROWS_SOURCE).getRows);
+	// The console's write count, and the count the sample on screen was drawn at (each draw notes it).
+	const writes = useSyncExternalStore((props.writes ?? NO_WRITES).subscribe, (props.writes ?? NO_WRITES).get, (props.writes ?? NO_WRITES).get);
+	const writesRef = useRef(writes);
+	writesRef.current = writes;
+	const drawnWrites = useRef(writes);
 	const docRowMap = useMemo(() => new Map(docRows.map((row) => [row.objectId, row])), [docRows]);
 	const connectionRef = useRef(model.connectionKey);
 	connectionRef.current = model.connectionKey;
@@ -716,6 +732,7 @@ export function MapView(props: MapViewProps): React.ReactElement {
 				if (shown && now.attempt === attempt) SAMPLE_SCOPES.set(shown, { drawn: now.drawn, attempt: next });
 			};
 			client.cancel();
+			drawnWrites.current = writesRef.current;
 			setBusy(BUSY.sampling);
 			setError(null);
 			const answer = await callTool<ISampleResult>(channel, 'sample', input as Record<string, unknown>, { nodeId: storeNode, timeoutMs: limits.sample_budget_ms + 30_000 });
@@ -760,6 +777,16 @@ export function MapView(props: MapViewProps): React.ReactElement {
 		// Runs again when a busy map frees up, so a scope changed meanwhile is not missed.
 		// eslint-disable-next-line react-hooks/exhaustive-deps
 	}, [scopeTarget.key, visible, busy, sampleModel]);
+
+	// A write on the store since the sample on screen was drawn (a move to the trash, a restore, a delete): draw it
+	// again with its size, mode and seed, once the map is shown, so trashed points leave it and restored ones return.
+	useEffect(() => {
+		if (drawnWrites.current !== writes && visible && sampleModel && busy === null && channel !== null) {
+			void drawSample({ n: sampleModel.result.n_requested, mode: sampleModel.mode, seed: sampleModel.seed });
+		}
+		// drawSample notes the count before its first await, so the run its busy change causes does not draw again.
+		// eslint-disable-next-line react-hooks/exhaustive-deps
+	}, [writes, visible, busy, sampleModel]);
 
 	/** The legend's action after a refused draw: the sample on screen drawn again, with the console's scope. */
 	const retryScope = useCallback((): void => {

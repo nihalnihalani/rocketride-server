@@ -270,6 +270,12 @@ test("the console's scope over a paging and a failed listing: no question goes o
 			chunks: async () => {
 				throw new Error('not asked');
 			},
+			trash: async () => {
+				throw new Error('not asked');
+			},
+			restore: async () => {
+				throw new Error('not asked');
+			},
 			remove: async () => {
 				throw new Error('not asked');
 			},

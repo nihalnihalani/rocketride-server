@@ -305,3 +305,30 @@ test("the directory's export with the Documents toggle off: 'Documents in scope'
 		'every exported row is in the scope'
 	);
 });
+
+test('the directory: Documents and Trash (n); a document moves to the trash, a trashed one restores or deletes permanently, and the trash empties', () => {
+	const off = { enabled: false, reason: 'Removing documents is turned off on this store node (allow_writes).' };
+	const active = pagerApplyPage(pagerBegin(pagerInit()), readDocumentsPage(fixture('list_documents_page1')));
+	const listed = readDocumentsPage(fixture('list_documents_page1'));
+	const trash = pagerApplyPage(pagerBegin(pagerInit()), { ...listed, items: listed.items.map((item) => ({ ...item, deleted: true })) });
+	const first = listed.items[0]!.path;
+	const html = renderToStaticMarkup(<DocumentDirectory pager={active} selectedId={null} writes={on} onSelect={noop} onRemove={noop} onLoadMore={noop} onRetry={noop} view="active" onView={noop} trashCount={3} onRestore={noop} onDelete={noop} onEmptyTrash={noop} />);
+	assert.match(html, /<button[^>]*aria-pressed="true"[^>]*>Documents<\/button>/);
+	assert.match(html, /<button[^>]*aria-pressed="false"[^>]*>Trash \(3\)<\/button>/, 'the Trash badge is the store count');
+	assert.ok(html.includes(`aria-label="Move ${first} to the trash"`), 'a document moves to the trash');
+	assert.doesNotMatch(html, /Delete permanently|Empty trash|aria-label="Restore /, 'nothing permanent in the Documents view');
+	const bin = renderToStaticMarkup(<DocumentDirectory pager={trash} selectedId={null} writes={on} onSelect={noop} onRemove={noop} onLoadMore={noop} onRetry={noop} view="trash" onView={noop} trashCount={null} onRestore={noop} onDelete={noop} onEmptyTrash={noop} />);
+	assert.match(bin, /<button[^>]*aria-pressed="true"[^>]*>Trash<\/button>/, 'no count where the store cannot count');
+	assert.ok(bin.includes(`aria-label="Restore ${first}"`));
+	assert.ok(bin.includes(`aria-label="Delete ${first} permanently"`));
+	assert.doesNotMatch(bin, /to the trash"/, 'a trashed document is not moved again');
+	assert.match(bin, /<button[^>]*>Empty trash<\/button>/);
+	const empty = renderToStaticMarkup(<DocumentDirectory pager={pagerApplyPage(pagerBegin(pagerInit()), { ...listed, items: [], nextCursor: null, total: 0 })} selectedId={null} writes={on} onSelect={noop} onRemove={noop} onLoadMore={noop} onRetry={noop} view="trash" onView={noop} trashCount={0} onRestore={noop} onDelete={noop} onEmptyTrash={noop} />);
+	assert.match(empty, /The trash is empty\./);
+	assert.match(empty, /<button[^>]*disabled=""[^>]*>Empty trash<\/button>/, 'nothing to empty');
+	const readOnly = renderToStaticMarkup(<DocumentDirectory pager={trash} selectedId={null} writes={off} onSelect={noop} onRemove={noop} onLoadMore={noop} onRetry={noop} view="trash" onView={noop} trashCount={7} onRestore={noop} onDelete={noop} onEmptyTrash={noop} />);
+	assert.match(readOnly, /<button[^>]*disabled=""[^>]*>Empty trash<\/button>/);
+	assert.match(readOnly, new RegExp(`aria-label="Restore ${first.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&')}"[^>]*disabled=""|disabled=""[^>]*aria-label="Restore ${first.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&')}"`), 'writes off: Restore is disabled with the reason');
+	const plain = renderToStaticMarkup(<DocumentDirectory pager={active} selectedId={null} writes={on} onSelect={noop} onRemove={noop} onLoadMore={noop} onRetry={noop} />);
+	assert.doesNotMatch(plain, />Trash/, 'a host without the trash shows no switch');
+});

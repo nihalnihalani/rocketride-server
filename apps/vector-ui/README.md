@@ -2,7 +2,8 @@
 
 Vector Explorer is the console for a vector store your pipelines already
 write to: see how many documents and chunks it holds, list every document by
-its path, remove a document, drop new files in to add them, ask questions over
+its path, move a document to the trash (and restore it, or delete it for good),
+drop new files in to add them, ask questions over
 what is stored, and map the chunks to see which ones sit close together. It is
 not a database client of its own. Every call travels through a store node
 inside one of your running pipelines, so it reaches exactly the collection that
@@ -53,10 +54,11 @@ answer the Vector Explorer tools.
   placeholder `replace-with-your-key`; replace it with your key, and set
   `base_url` only for an OpenAI-compatible server other than OpenAI. Until
   then the chat cannot answer; everything else works.
-- **Removing documents is a node setting.** Each store node has **Allow
-  document management from tool calls** (`allow_writes`). It is off unless the
-  pipeline turns it on; the templates turn it on for `store_1` only. With it
-  off, the trash buttons are disabled and say why.
+- **The trash is a node setting.** Each store node has **Allow document
+  management from tool calls** (`allow_writes`). It is off unless the pipeline
+  turns it on; the templates turn it on for `store_1` only. With it off, the
+  trash buttons (and Restore, Delete permanently and Empty trash) are disabled
+  and say why.
 
 ## Connections
 
@@ -98,10 +100,11 @@ Opening a connection opens its console, the main screen.
 - **Statistics** across the top: documents, chunks, deleted chunks, average
   chunks per document, the embedding model and dimension, the metric and the
   index. The figures come from the node's `stats` tool: a full count when the
-  console opens, after a removal or a completed upload and on **Refresh**, and
-  a quick refresh at most every 15 seconds while the console is visible, which
-  says "counts as of 12 s ago". A figure the store cannot count shows "—" with
-  a tooltip saying so (Pinecone counts nothing per document). Chips name what
+  console opens, after a write (to or from the trash, a delete) or a completed
+  upload and on **Refresh**, and a quick refresh at most every 15 seconds while
+  the console is visible, which says "counts as of 12 s ago". A figure the store
+  cannot count shows "—" with a tooltip saying so (Pinecone counts nothing per
+  document). Chips name what
   qualifies the figures: **Experimental**, **Brute-force search**, **Writes
   on/off**, **Read-only**, **N without first chunk** and caveats such as
   "Scores are the backend's raw values, not 0–1."
@@ -134,13 +137,22 @@ Opening a connection opens its console, the main screen.
   document, chunk length (from the map's sample), documents by file type and
   ingest time; clicking a bar scopes the documents to it. A **Size** figure
   appears where the store reports one.
-- **Remove**: the trash button of a row removes that document and all its
-  chunks, after a confirmation whose **Cancel** has the focus. The answer says
-  how many chunks were removed, and the statistics and the list refresh. Select
-  several rows to remove them together: you type the count to confirm, they go
-  in batches of at most 100, and the first error stops the run and says what
-  already ran. On `rocketride_vector` you type the table name instead, because
-  the table is shared by every pipeline of your organization that names it.
+- **Move to trash**: the trash button of a row moves that document and all its
+  chunks to the trash, after a confirmation whose **Cancel** has the focus;
+  nothing is typed, because the Trash can restore it. The answer says how many
+  chunks moved, and the statistics, the list, the store's details and the map
+  refresh. Select several rows to move them together: they go in batches of at
+  most 100, and the first error stops the run and says what already ran.
+- **Trash**: the directory's title switches between **Documents** and **Trash
+  (N)**, N being the store's count of documents with chunks in the trash. There
+  each document has **Restore** (at once) and **Delete permanently** (confirmed;
+  several are confirmed by typing their count), and **Empty trash** deletes the
+  whole trash permanently after you type how many documents it holds. A
+  document that still has chunks outside the trash is kept, and the answer says
+  so. On `rocketride_vector` the permanent deletes ask for the table name
+  instead, because the table is shared by every pipeline of your organization
+  that names it. A document in the trash says "This document is in the trash.
+  Restore it to read it." until it is restored.
 - **Add documents** at the top right: drop files or folders, or use **Add
   files** / **Add folder**. Each upload shows its progress and then "N chunks
   added".
@@ -188,10 +200,11 @@ says otherwise.
   the rest back.
 - **Duplicates** is a review queue: near-duplicate chunks grouped by document,
   a similarity slider, a keep policy (oldest ingest, shortest path, most chunks
-  or by hand), and **Remove all queued**, confirmed by typing the count.
+  or by hand), and **Move all queued to the trash**, through the console's
+  confirmation.
 - **Outliers** lists the sparsest points with why ("density 0.12 vs sample
   median 0.61"), the share to show (1, 2 or 5 %), **Mark reviewed** and
-  **Remove document**.
+  **Move to trash**.
 - **Recommend** finds chunks like the positive examples and unlike the
   negative ones (add them from a point's panel; best score where the store
   offers it, Qdrant).
@@ -254,7 +267,8 @@ threshold slider that shows what the node's setting would keep; a text question
 placed on the map with rays to the chunks the store really ranks first, and two
 questions compared side by side; the collection's clusters named by their own
 words; the neighbour graph and its spanning tree drawn over the sample;
-near-duplicate groups removed in one confirmed batch with the rows reported; a
+near-duplicate groups moved to the trash in one confirmed batch with the rows
+reported, and a trash to restore them from; a
 folder, file-type or date scope that applies to the documents, the map, the
 search and the chat; charts of chunks per document, chunk length, file types
 and ingest time; and CSV, JSON and PNG exports of what you see. The map draws at
@@ -266,10 +280,11 @@ store node's graph, and the legend says which one computed it.
 
 ## Limits
 
-- **Read-only cards cannot add or remove documents.** Start the pipeline's
-  Tools source to manage it.
-- **Removing is per document, and cannot be undone.** Add the file again to
-  restore it.
+- **Read-only cards cannot add documents or change the trash.** Start the
+  pipeline's Tools source to manage it.
+- **Deleting permanently cannot be undone.** A document moved to the trash can
+  be restored; one deleted permanently (or by Empty trash) can only be added
+  again.
 - **Counts are what the store returns.** A store that cannot count shows "—";
   the app never estimates a count.
 - **No cancel.** A request the app stops waiting for may still finish on the

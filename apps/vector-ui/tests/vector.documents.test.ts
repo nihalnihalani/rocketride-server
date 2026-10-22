@@ -279,3 +279,23 @@ test("the directory's export: the documents columns, each row the directory's ow
 	assert.doesNotMatch(JSON.stringify(out), /secret|embedding/);
 	assert.equal(documentExportRows([doc('a', 'a.md')]).rows[0]?.deleted_chunks, null, 'not reported: empty, not 0');
 });
+
+test('the Trash view groups its documents by folder: their deleted chunks are why they are listed, not a defect', () => {
+	const trashed = (objectId: string, path: string): IDocumentItem => ({ objectId, path, chunks: 3, has_first_chunk: true, tables: 0, deleted: true, nodeId: null, size: null, modifyTime: null, ingestedAt: null, pointId: null, deleted_chunks: 3 });
+	const rows = [trashed('a', 'C:/demo/field/gull.md'), trashed('b', 'C:/demo/field/heron.md'), { ...trashed('c', 'C:/demo/notes.md'), has_first_chunk: false }];
+	const active = buildGroups(rows);
+	assert.ok(
+		active.some((g) => g.kind === 'attention' && g.rows.length === 3),
+		'in the Documents view, deleted chunks need attention'
+	);
+	const bin = buildGroups(rows, { medianChunks: null, trash: true });
+	assert.deepEqual(
+		bin.map((g) => [g.kind, g.rows.map((r) => r.item.objectId)]),
+		[
+			['folder', ['a', 'b']],
+			['attention', ['c']],
+		],
+		'only a real defect (no first chunk) still needs attention'
+	);
+	assert.deepEqual(bin[0]!.rows[0]!.flags, [], 'and no row carries the deleted-chunks badge');
+});

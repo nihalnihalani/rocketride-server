@@ -213,7 +213,7 @@ export function DocumentView({ model, channels, selection, actions, objectId, pa
 						<Button variant="ghost" disabled={keys.length === 0} onClick={() => actions.showOnMap(keys, 'document')}>
 							Show chunk path on map
 						</Button>
-						<button type="button" style={{ ...styles.iconButton, opacity: model.writes.enabled ? 1 : 0.55, cursor: model.writes.enabled ? 'pointer' : 'not-allowed' }} aria-label={`Remove ${shownPath} from the database`} title={model.writes.enabled ? `Remove ${shownPath} from the database` : (model.writes.reason ?? undefined)} disabled={!model.writes.enabled} onClick={() => actions.requestRemove([objectId])} onFocus={(event) => (event.currentTarget.style.outline = FOCUS_RING)} onBlur={(event) => (event.currentTarget.style.outline = 'none')}>
+						<button type="button" style={{ ...styles.iconButton, opacity: model.writes.enabled ? 1 : 0.55, cursor: model.writes.enabled ? 'pointer' : 'not-allowed' }} aria-label={`Move ${shownPath} to the trash`} title={model.writes.enabled ? `Move ${shownPath} to the trash` : (model.writes.reason ?? undefined)} disabled={!model.writes.enabled} onClick={() => actions.requestRemove([objectId])} onFocus={(event) => (event.currentTarget.style.outline = FOCUS_RING)} onBlur={(event) => (event.currentTarget.style.outline = 'none')}>
 							<BxTrash />
 						</button>
 					</>

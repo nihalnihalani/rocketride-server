@@ -39,6 +39,9 @@ export const CHUNKS_PAGE = 100;
 /** The multi-remove dialog lists at most this many paths. */
 export const MULTI_REMOVE_LIST_MAX = 20;
 
+/** Pages of the trash listing Empty trash reads before it confirms (100,000 documents at the default page of 500). */
+export const EMPTY_TRASH_MAX_PAGES = 200;
+
 /** Files per drop, bytes per file and per drop, enforced before sending (the parser also refuses a file over 50 MB). */
 export const UPLOAD_MAX_FILES = 20;
 export const UPLOAD_MAX_FILE_BYTES = 50 * 1024 * 1024;

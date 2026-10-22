@@ -29,8 +29,9 @@
 // ask the console (ConsoleActions). Each action carries whether it is
 // available and, when it is not, the sentence the disabled control shows:
 //
-//   writes  the trash buttons: `dialect.allow_writes`, `capabilities.remove`,
-//           not read-only, and the connection's calls ride on a Tools source.
+//   writes  the trash buttons: `dialect.allow_writes`, `capabilities.remove`
+//           and `capabilities.soft_delete` (the trash), not read-only, and the
+//           connection's calls ride on a Tools source.
 //   ingest  the drop zone: an Ingest source is running, not read-only.
 //   chat    the chat: a Chat source is running.
 //   embed   text queries: an embedding node the anchor source reaches.
@@ -114,11 +115,11 @@ export function toolsSourceIsTools(endpoint: IExplorerEndpoint): boolean {
 }
 
 /**
- * What the console's remove controls get: the model's `writes`, disabled while a removal runs.
+ * What the console's write controls get: the model's `writes`, disabled while a write runs.
  *
  * @param writes - The model's writes.
- * @param removal - The controller's removal status.
- * @returns The availability the trash buttons and "Remove selected" use.
+ * @param removal - The controller's write status.
+ * @returns The availability the trash, restore and delete buttons use.
  */
 export function writesDuringRemoval(writes: Availability, removal: 'idle' | 'running' | 'done' | 'error'): Availability {
 	return removal === 'running' && writes.enabled ? off(BUSY.removing) : writes;
@@ -221,6 +222,7 @@ export function buildConsoleModel(endpoint: IExplorerEndpoint, probe: IProbeResu
 	else if (dialect === null) writes = off('The store node has not answered yet.');
 	else if (!dialect.allow_writes) writes = off(CODE_SENTENCES.WRITES_DISABLED);
 	else if (dialect.capabilities.remove !== true) writes = off("This store node cannot remove documents. Update the pipeline's store node to a version that supports Vector Explorer.");
+	else if (dialect.capabilities.soft_delete !== true) writes = off("This store node cannot move documents to the trash. Update the pipeline's store node to a version that supports Vector Explorer.");
 	else writes = ON;
 
 	let ingest: Availability;

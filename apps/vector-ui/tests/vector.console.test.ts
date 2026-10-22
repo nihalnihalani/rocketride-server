@@ -22,7 +22,7 @@ import { pagerApplyPage, pagerBegin, pagerFail, pagerFooter, pagerInit } from '.
 import { directoryView, scopeStripText } from '../src/vector/filters';
 import { DEFAULT_LIMITS } from '../src/vector/results';
 import type { IConsoleDeps } from '../src/vector/consoleStore';
-import { readChunksPage, readDocumentsPage, readDeleteResult, readStats } from '../src/vector/results';
+import { readChunksPage, readDocumentsPage, readDeleteResult, readStats, readTrashResult } from '../src/vector/results';
 import type { IDocumentsPageView } from '../src/vector/results';
 import { BUSY, CANCELLED_TEXT, CODE_SENTENCES } from '../src/vector/wording';
 import { fixture } from './support/fixtures';
@@ -37,18 +37,28 @@ function doc(objectId: string, path: string): IDocumentItem {
 	return { objectId, path, chunks: 2, has_first_chunk: true, tables: 0, deleted: false, nodeId: null, size: null, modifyTime: null, ingestedAt: null, pointId: null };
 }
 
+/** The trash listing's one page: two documents with chunks in the trash. */
+function trashPage(): Record<string, unknown> {
+	return { ...fixture('list_documents_page2_last'), items: [doc('gull', 'C:/demo/field/gull.md'), doc('heron', 'C:/demo/field/heron.md')].map((d) => ({ ...d, deleted: true })), next_cursor: null, total: 2 };
+}
+
 /** A controller over scripted tools and a manual clock. */
 function harness(over: Partial<IConsoleDeps> = {}) {
 	const clock = manualClock(Date.parse('2026-10-08T18:31:00Z'));
 	const calls: ICall[] = [];
 	const announced: string[] = [];
 	const removedIds: string[][] = [];
+	let written = 0;
 	const deps: IConsoleDeps = {
 		stats: async (mode) => {
 			calls.push({ tool: 'stats', args: [mode] });
 			return readStats(mode === 'quick' ? fixture('stats_quick') : fixture('stats_pgvector'));
 		},
-		documents: async (cursor, limit) => {
+		documents: async (cursor, limit, _filter, deleted) => {
+			if (deleted === 'deleted') {
+				calls.push({ tool: 'trash listing', args: [cursor, limit] });
+				return readDocumentsPage(trashPage());
+			}
 			calls.push({ tool: 'documents', args: [cursor, limit] });
 			return readDocumentsPage(cursor ? fixture('list_documents_page2_last') : fixture('list_documents_page1'));
 		},
@@ -56,17 +66,26 @@ function harness(over: Partial<IConsoleDeps> = {}) {
 			calls.push({ tool: 'chunks', args: [objectId, after, limit] });
 			return readChunksPage(fixture('chunks_page'));
 		},
-		remove: async (ids) => {
-			calls.push({ tool: 'delete', args: [ids] });
+		trash: async (ids) => {
+			calls.push({ tool: 'soft_delete', args: [ids] });
+			return readTrashResult({ ...fixture('soft_delete_ok'), object_ids: ids, matched_chunks: 12 * ids.length });
+		},
+		restore: async (ids) => {
+			calls.push({ tool: 'restore', args: [ids] });
+			return readTrashResult({ ...fixture('restore_ok'), object_ids: ids, matched_chunks: 12 * ids.length });
+		},
+		remove: async (ids, opts) => {
+			calls.push({ tool: 'delete', args: opts?.deletedOnly ? [ids, 'deleted_only'] : [ids] });
 			return readDeleteResult({ ...fixture('delete_ok'), removed_chunks: 12 * ids.length }, ids);
 		},
 		announce: (text) => announced.push(text),
 		onRemoved: (ids) => removedIds.push([...ids]),
+		onWritten: () => void (written += 1),
 		clock,
 		...over,
 	};
 	const store = createConsoleStore(deps, { pageSize: 500, chunkPage: 100, writeBatch: 100 });
-	return { store, clock, calls, announced, removedIds, tools: () => calls.map((c) => c.tool) };
+	return { store, clock, calls, announced, removedIds, written: () => written, tools: () => calls.map((c) => c.tool) };
 }
 
 test('opening the console: a full stats call and the directory loading every page in the background', async () => {
@@ -306,55 +325,59 @@ test('selecting a document lists its chunks, 100 per page, and "more" continues 
 	store.dispose();
 });
 
-test('remove: asking opens the confirmation and sends nothing; Cancel sends nothing and says so', async () => {
+const KESTREL = { objectId: 'kestrel', path: 'C:/demo/field/kestrel_field_guide.md', chunks: 12 };
+
+test('move to trash: asking opens a confirmation to type nothing into and sends nothing; Cancel sends nothing and says so', async () => {
 	const { store, clock, tools, announced } = harness();
 	store.setWritesEnabled(true);
 	store.open();
 	await clock.settle();
-	store.requestRemove([{ objectId: 'kestrel', path: 'C:/demo/field/kestrel_field_guide.md', chunks: 12 }]);
-	assert.equal(store.getState().confirm?.targets.length, 1);
-	assert.ok(!tools().includes('delete'), 'nothing is sent before Confirm');
+	store.requestRemove([KESTREL]);
+	assert.deepEqual([store.getState().confirm?.action, store.getState().confirm?.targets.length], ['trash', 1]);
+	assert.ok(!tools().includes('soft_delete'), 'nothing is sent before Confirm');
 	store.cancelRemove();
 	await clock.settle();
 	assert.equal(store.getState().confirm, null);
-	assert.ok(!tools().includes('delete'), 'Cancel sends nothing');
+	assert.ok(!tools().includes('soft_delete'), 'Cancel sends nothing');
 	assert.deepEqual(announced, [CANCELLED_TEXT]);
 	assert.equal(store.getState().removal.message, CANCELLED_TEXT);
 	store.dispose();
 });
 
-test('remove: Confirm sends the batch once, announces the rows removed, refreshes stats in full and the directory, and forgets the document', async () => {
-	const { store, clock, calls, announced, removedIds } = harness();
+test('move to trash: Confirm sends soft_delete once, then refreshes the stats in full, the directory, the dialect and the map, and forgets the document', async () => {
+	let probes = 0;
+	const { store, clock, calls, announced, removedIds, written } = harness({ reprobe: () => void (probes += 1) });
 	store.setWritesEnabled(true);
 	store.open();
 	await clock.settle();
 	store.selectDocument('kestrel');
 	await clock.settle();
 	calls.length = 0;
-	store.requestRemove([{ objectId: 'kestrel', path: 'C:/demo/field/kestrel_field_guide.md', chunks: 12 }]);
+	store.requestRemove([KESTREL]);
 	await store.confirmRemove();
 	await clock.settle();
 	assert.deepEqual(calls.map((c) => [c.tool, ...c.args]).slice(0, 2), [
-		['delete', ['kestrel']],
+		['soft_delete', ['kestrel']],
 		['stats', 'full'],
 	]);
 	assert.ok(
 		calls.some((c) => c.tool === 'documents' && c.args[0] === null),
 		'the directory starts over'
 	);
-	assert.deepEqual(announced, ['Removed C:/demo/field/kestrel_field_guide.md (12 chunks)']);
-	assert.deepEqual(removedIds, [['kestrel']]);
-	assert.equal(store.getState().chunks.objectId, null, "the removed document's chunk list closes");
-	assert.equal(store.getState().confirm, null);
+	assert.ok(!calls.some((c) => c.tool === 'delete'), 'nothing is deleted permanently');
+	assert.deepEqual(announced, ['Moved C:/demo/field/kestrel_field_guide.md to the trash (12 chunks)']);
+	assert.deepEqual(removedIds, [['kestrel']], 'the selection and the map forget it');
+	assert.equal(store.getState().chunks.objectId, null, "the trashed document's chunk list closes");
+	assert.deepEqual([probes, written()], [1, 1], 'the dialect is probed again and the map draws its sample again');
 	store.dispose();
 });
 
-test('remove: refused by the node, the sentence names the rule; with writes off nothing is ever sent', async () => {
+test('move to trash: refused by the node, the sentence names the rule; with writes off nothing is ever sent', async () => {
 	let sent = 0;
-	const { store, clock, announced } = harness({
-		remove: async () => {
+	const { store, clock, announced, written } = harness({
+		trash: async () => {
 			sent += 1;
-			throw new ExplorerToolError({ kind: 'store', tool: 'delete', message: 'Only a Tools source may remove documents.', code: 'WRITES_SOURCE' });
+			throw new ExplorerToolError({ kind: 'store', tool: 'soft_delete', message: 'Only a Tools source may remove documents.', code: 'WRITES_SOURCE' });
 		},
 	});
 	store.setWritesEnabled(true);
@@ -364,25 +387,29 @@ test('remove: refused by the node, the sentence names the rule; with writes off 
 	await store.confirmRemove();
 	assert.deepEqual(announced, [CODE_SENTENCES.WRITES_SOURCE]);
 	assert.equal(store.getState().removal.status, 'error');
+	assert.equal(written(), 0, 'a refused first batch changed nothing: the map keeps its sample');
 	store.setWritesEnabled(false);
 	store.requestRemove([{ objectId: 'k', path: 'k.md', chunks: 1 }]);
+	store.requestDelete([{ objectId: 'k', path: 'k.md', chunks: 1 }]);
+	await store.restore([{ objectId: 'k', path: 'k.md', chunks: 1 }]);
+	await store.requestEmptyTrash();
 	assert.equal(store.getState().confirm, null, 'no confirmation opens while writes are off');
 	await store.confirmRemove();
 	assert.equal(sent, 1, 'only the first, refused, call');
 	store.dispose();
 });
 
-test('remove: while a removal runs no second confirmation opens and nothing more is sent', async () => {
+test('one write at a time: while one runs no confirmation opens, no restore is sent, and the screen reader hears why', async () => {
 	let release: (() => void) | null = null;
 	let inFlight = 0;
 	let maxInFlight = 0;
-	const { store, clock, announced } = harness({
-		remove: async (ids) => {
+	const { store, clock, announced, tools } = harness({
+		trash: async (ids) => {
 			inFlight += 1;
 			maxInFlight = Math.max(maxInFlight, inFlight);
 			await new Promise<void>((resolve) => (release = resolve));
 			inFlight -= 1;
-			return readDeleteResult({ ...fixture('delete_ok'), removed_chunks: 2 * ids.length }, ids);
+			return readTrashResult({ ...fixture('soft_delete_ok'), object_ids: ids, matched_chunks: 2 * ids.length });
 		},
 	});
 	store.setWritesEnabled(true);
@@ -393,40 +420,190 @@ test('remove: while a removal runs no second confirmation opens and nothing more
 	await clock.settle();
 	assert.equal(store.getState().removal.status, 'running');
 	store.requestRemove([{ objectId: 'b', path: 'b.md', chunks: 2 }]);
-	assert.equal(store.getState().confirm, null, 'no second confirmation opens while a removal runs');
-	assert.deepEqual(announced, [BUSY.removing], 'and the screen reader hears why');
+	store.requestDelete([{ objectId: 'b', path: 'b.md', chunks: 2 }]);
+	await store.restore([{ objectId: 'b', path: 'b.md', chunks: 2 }]);
+	assert.equal(store.getState().confirm, null, 'no second confirmation opens while a write runs');
+	assert.ok(!tools().includes('restore'), 'and no restore is sent');
+	assert.deepEqual(announced, [BUSY.removing, BUSY.removing, BUSY.removing]);
 	await store.confirmRemove();
 	await clock.settle();
-	assert.equal(maxInFlight, 1, 'one removal at a time');
+	assert.equal(maxInFlight, 1, 'one write at a time');
 	release!();
 	await first;
 	await clock.settle();
 	assert.equal(store.getState().removal.status, 'done');
 	store.requestRemove([{ objectId: 'b', path: 'b.md', chunks: 2 }]);
-	assert.equal(store.getState().confirm?.targets[0].objectId, 'b', 'once it ended, removing is offered again');
+	assert.equal(store.getState().confirm?.targets[0].objectId, 'b', 'once it ended, writing is offered again');
 	store.dispose();
 });
 
-test('several documents go in batches of write_ids_max and stop at the first error', async () => {
+test('several documents go to the trash in batches of write_ids_max and stop at the first error', async () => {
 	const sent: string[][] = [];
 	const { store, clock, announced } = harness({
-		remove: async (ids) => {
+		trash: async (ids) => {
 			sent.push([...ids]);
-			if (sent.length === 2) throw new ExplorerToolError({ kind: 'store', tool: 'delete', message: 'x', code: 'WRITES_DISABLED' });
-			return readDeleteResult({ success: true, deleted_count: ids.length, not_found: [], kept_live: [], removed_chunks: ids.length }, ids);
+			if (sent.length === 2) throw new ExplorerToolError({ kind: 'store', tool: 'soft_delete', message: 'x', code: 'WRITES_DISABLED' });
+			return readTrashResult({ success: true, object_ids: ids, not_found: [], matched_chunks: ids.length });
 		},
 	});
 	store.setWritesEnabled(true);
 	const targets = Array.from({ length: 250 }, (_, i) => ({ objectId: `id-${i}`, path: `f${i}.md`, chunks: 1 }));
 	store.requestRemove(targets);
-	assert.equal(store.getState().confirm?.kind, 'multi');
+	assert.deepEqual([store.getState().confirm?.action, store.getState().confirm?.kind], ['trash', 'multi']);
 	await store.confirmRemove();
 	await clock.settle();
 	assert.deepEqual(
 		sent.map((b) => b.length),
 		[100, 100]
 	);
-	assert.equal(announced[0], `Removed 100 documents (100 chunks). Stopped after 1 of 3 batches: ${CODE_SENTENCES.WRITES_DISABLED}`);
+	assert.equal(announced[0], `Moved 100 documents to the trash (100 chunks). Stopped after 1 of 3 batches: ${CODE_SENTENCES.WRITES_DISABLED}`);
+	store.dispose();
+});
+
+test('the Trash view lists list_documents with deleted "deleted" once it is shown; Refresh and a write list it again', async () => {
+	const { store, clock, calls, tools } = harness();
+	store.setWritesEnabled(true);
+	store.open();
+	await clock.settle();
+	assert.ok(!tools().includes('trash listing'), 'the trash is not listed before it is shown');
+	assert.equal(store.getState().view, 'active');
+	store.setView('trash');
+	await clock.settle();
+	assert.equal(store.getState().view, 'trash');
+	assert.deepEqual(
+		store.getState().trash.rows.map((r) => r.objectId),
+		['gull', 'heron']
+	);
+	assert.equal(store.getState().directory.rows.length, 7, 'the active listing is kept as it was');
+	calls.length = 0;
+	store.refresh();
+	await clock.settle();
+	assert.deepEqual(
+		calls.filter((c) => c.tool === 'trash listing').map((c) => c.args[0]),
+		[null],
+		'Refresh lists the trash again from the start'
+	);
+	calls.length = 0;
+	store.requestRemove([KESTREL]);
+	await store.confirmRemove();
+	await clock.settle();
+	assert.ok(tools().includes('trash listing'), 'a document moved to the trash appears there');
+	store.setView('active');
+	assert.equal(store.getState().view, 'active');
+	store.dispose();
+});
+
+test('restore runs at once (it can be undone), refreshes everything a write does, and forgets nothing', async () => {
+	let probes = 0;
+	const { store, clock, calls, announced, removedIds, written } = harness({ reprobe: () => void (probes += 1) });
+	store.setWritesEnabled(true);
+	store.open();
+	store.setView('trash');
+	await clock.settle();
+	calls.length = 0;
+	await store.restore([{ objectId: 'gull', path: 'C:/demo/field/gull.md', chunks: 2 }]);
+	await clock.settle();
+	assert.equal(store.getState().confirm, null, 'no confirmation');
+	assert.deepEqual(calls.map((c) => [c.tool, ...c.args]).slice(0, 2), [
+		['restore', ['gull']],
+		['stats', 'full'],
+	]);
+	assert.ok(calls.some((c) => c.tool === 'documents' && c.args[0] === null) && calls.some((c) => c.tool === 'trash listing' && c.args[0] === null), 'both listings start over');
+	assert.deepEqual(announced, ['Restored C:/demo/field/gull.md (12 chunks)']);
+	assert.deepEqual(removedIds, [], 'a restored document is stored: nothing forgets it');
+	assert.deepEqual([probes, written()], [1, 1]);
+	store.dispose();
+});
+
+test('delete permanently: a confirmation first, then one delete without deleted_only; the document is forgotten', async () => {
+	const { store, clock, calls, announced, removedIds } = harness();
+	store.setWritesEnabled(true);
+	store.open();
+	store.setView('trash');
+	await clock.settle();
+	calls.length = 0;
+	store.requestDelete([{ objectId: 'gull', path: 'C:/demo/field/gull.md', chunks: 2 }]);
+	assert.deepEqual([store.getState().confirm?.action, store.getState().confirm?.kind], ['delete', 'single']);
+	assert.ok(!calls.some((c) => c.tool === 'delete'), 'nothing is sent before Confirm');
+	await store.confirmRemove();
+	await clock.settle();
+	assert.deepEqual(
+		calls.filter((c) => c.tool === 'delete').map((c) => c.args),
+		[[['gull']]]
+	);
+	assert.deepEqual(announced, ['Deleted C:/demo/field/gull.md permanently (12 chunks)']);
+	assert.deepEqual(removedIds, [['gull']]);
+	store.dispose();
+});
+
+test('empty trash: every page of the trash is listed first, then a confirmation; Confirm deletes with deleted_only and reports the documents kept live', async () => {
+	const pages: Array<string | null> = [];
+	const trash = (n: number) => Array.from({ length: n }, (_, i) => ({ ...doc(`t-${i}`, `C:/demo/trash/t${i}.md`), deleted: true }));
+	const sent: Array<[string[], boolean]> = [];
+	const { store, clock, announced, removedIds, written } = harness({
+		documents: async (cursor, _limit, _filter, deleted) => {
+			if (deleted !== 'deleted') return readDocumentsPage(fixture('list_documents_page2_last'));
+			pages.push(cursor);
+			const first = cursor === null;
+			return readDocumentsPage({ ...fixture('list_documents_page2_last'), items: first ? trash(150).slice(0, 100) : trash(150).slice(100), next_cursor: first ? 'page-2' : null, total: 150 });
+		},
+		remove: async (ids, opts) => {
+			sent.push([[...ids], opts?.deletedOnly === true]);
+			// t-7 still has a live chunk: a later ingest added one after it was moved to the trash.
+			const kept = ids.filter((id) => id === 't-7');
+			return readDeleteResult({ success: true, deleted_count: ids.length, not_found: [], kept_live: kept, removed_chunks: 2 * (ids.length - kept.length) }, ids);
+		},
+	});
+	store.setWritesEnabled(true);
+	store.open();
+	await clock.settle();
+	await store.requestEmptyTrash();
+	assert.deepEqual(pages, [null, 'page-2'], 'the whole trash, page after page');
+	const pending = store.getState().confirm;
+	assert.deepEqual([pending?.action, pending?.kind, pending?.targets.length], ['empty', 'multi', 150]);
+	assert.equal(sent.length, 0, 'nothing is deleted before Confirm');
+	await store.confirmRemove();
+	await clock.settle();
+	assert.deepEqual(
+		sent.map(([ids, only]) => [ids.length, only]),
+		[
+			[100, true],
+			[50, true],
+		],
+		'batches of write_ids_max, every one with deleted_only'
+	);
+	assert.equal(announced.at(-1), 'Emptied the trash: deleted 149 documents permanently (298 chunks). 1 was kept: it still has chunks outside the trash.');
+	assert.ok(!removedIds.flat().includes('t-7'), 'a kept document is not forgotten');
+	assert.equal(removedIds.flat().length, 149);
+	assert.equal(written(), 1);
+	store.dispose();
+});
+
+test('empty trash with nothing in it says so and opens nothing', async () => {
+	const { store, clock, announced } = harness({
+		documents: async () => readDocumentsPage({ ...fixture('list_documents_page2_last'), items: [], next_cursor: null, total: 0 }),
+	});
+	store.setWritesEnabled(true);
+	store.open();
+	await clock.settle();
+	await store.requestEmptyTrash();
+	assert.equal(store.getState().confirm, null);
+	assert.deepEqual(announced, ['The trash is empty.']);
+	store.dispose();
+});
+
+test("a document in the trash: its chunk list says IN_TRASH's sentence", async () => {
+	const { store, clock } = harness({
+		chunks: async () => {
+			throw new ExplorerToolError({ kind: 'store', tool: 'chunks', message: "chunks: the document 'gull' is in the trash; restore it to read it", code: 'IN_TRASH' });
+		},
+	});
+	store.open();
+	store.selectDocument('gull');
+	await clock.settle();
+	assert.equal(store.getState().chunks.status, 'error');
+	assert.equal(store.getState().chunks.error?.headline, 'This document is in the trash. Restore it to read it.');
+	assert.equal(CODE_SENTENCES.IN_TRASH, 'This document is in the trash. Restore it to read it.');
 	store.dispose();
 });
 

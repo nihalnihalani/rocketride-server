@@ -207,6 +207,9 @@ test('the console model: nodes, limits, capabilities and why each action is or i
 	const noRemove = buildConsoleModel(f.endpoint, { ...f.probe!, info: { ...fixture('dialect_pgvector'), capabilities: { ...fixture('dialect_pgvector').capabilities, remove: false } } }, null);
 	assert.equal(noRemove.writes.enabled, false);
 	assert.match(noRemove.writes.reason ?? '', /cannot remove documents/);
+	// The trash needs the driver to mark chunks deleted (dialect.capabilities.soft_delete): without it nothing can move there.
+	const noTrash = buildConsoleModel(f.endpoint, { ...f.probe!, info: { ...fixture('dialect_pgvector'), capabilities: { ...fixture('dialect_pgvector').capabilities, soft_delete: false } } }, null);
+	assert.deepEqual(noTrash.writes, { enabled: false, reason: "This store node cannot move documents to the trash. Update the pipeline's store node to a version that supports Vector Explorer." });
 	const unprobed = buildConsoleModel(f.endpoint, undefined, null);
 	assert.equal(unprobed.writes.enabled, false, 'nothing is enabled before the node answered');
 	// The tools role filled by a source that is not a Tools source (a webhook named tools_1): the node would refuse.

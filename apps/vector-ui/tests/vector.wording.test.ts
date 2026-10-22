@@ -11,7 +11,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { ExplorerToolError } from 'shared/explorer';
 import { CAVEATS, TOOL_CODES } from '../src/contract/types';
-import { BUSY, CANCELLED_TEXT, CAVEAT_SENTENCES, CODE_SENTENCES, GENERIC_REFUSAL, WRITE_TIMEOUT_TEXT, caveatSentence, codeSentence, failureText } from '../src/vector/wording';
+import { BUSY, CANCELLED_TEXT, CAVEAT_SENTENCES, CODE_SENTENCES, EMPTY, GENERIC_REFUSAL, WRITE_TIMEOUT_TEXT, caveatSentence, codeSentence, failureText } from '../src/vector/wording';
 import { fixture } from './support/fixtures';
 
 test('every documented code has a sentence, and every documented caveat has one', () => {
@@ -105,6 +105,7 @@ test('no running task, an old node and a restarting pipeline each say what to do
 });
 
 test('busy labels and the cancel sentence', () => {
-	assert.deepEqual(BUSY, { refreshing: 'Refreshing…', sampling: 'Sampling…', embedding: 'Embedding…', removing: 'Removing…', uploading: 'Uploading…', layingOut: 'Laying out…', loadingDocuments: 'Loading documents…' });
+	assert.deepEqual(BUSY, { refreshing: 'Refreshing…', sampling: 'Sampling…', embedding: 'Embedding…', removing: 'Removing…', restoring: 'Restoring…', listingTrash: 'Listing the trash…', uploading: 'Uploading…', layingOut: 'Laying out…', loadingDocuments: 'Loading documents…' });
 	assert.equal(CANCELLED_TEXT, 'Cancelled. Nothing was sent.');
+	assert.equal(EMPTY.trash, 'The trash is empty.');
 });

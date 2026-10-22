@@ -21,15 +21,16 @@
 // SOFTWARE.
 
 // =============================================================================
-// VECTOR-UI — REMOVE CONFIRMATION (one document; Cancel focused)
+// VECTOR-UI — ONE-DOCUMENT CONFIRMATION (Move to trash, Delete permanently; Cancel focused)
 // =============================================================================
 //
-// The shell's ConfirmDialog, destructive, with the focus moved to Cancel from
-// this component's OWN mount effect (the shape of the shared
-// PatternConfirmDialog): React runs a parent's effects after its children's,
-// so this runs after the dialog focused its confirm button, and a stray Enter
-// cancels instead of removing. On rocketride_vector the table name must be
-// typed before Remove is enabled.
+// The shell's ConfirmDialog (destructive for Delete permanently, not for Move
+// to trash, which can be undone), with the focus moved to Cancel from this
+// component's OWN mount effect (the shape of the shared PatternConfirmDialog):
+// React runs a parent's effects after its children's, so this runs after the
+// dialog focused its confirm button, and a stray Enter cancels instead of
+// writing. Deleting permanently on rocketride_vector needs the table name
+// typed before its button is enabled.
 // =============================================================================
 
 import React, { useEffect, useRef, useState } from 'react';
@@ -62,7 +63,7 @@ export function RemoveConfirmDialog({ content, onConfirm, onCancel }: IRemoveCon
 	return (
 		<ConfirmDialog
 			title={content.title}
-			destructive
+			destructive={content.destructive}
 			cancelLabel={content.cancelLabel}
 			confirmLabel={content.confirmLabel}
 			confirmDisabled={!ready}

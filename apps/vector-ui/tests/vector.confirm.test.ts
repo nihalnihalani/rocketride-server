@@ -7,10 +7,13 @@
 // CONFIRM AND REMOVE: what the dialogs say, typed confirmations, batches that stop at the first error
 // =============================================================================
 //
-// The map's duplicates queue removes through the same path: its queued
-// documents reach the console's multi-remove dialog whole (typed count, the
-// paths listed), and the confirmed removal sends them in batches of the
-// node's write_ids_max, nothing before Confirm and nothing after Cancel.
+// Three writes are confirmed here: Move to trash (nothing to type: it can be
+// undone from the Trash), Delete permanently and Empty trash (both typed as
+// before: the count of several documents, or a shared table's name). The
+// map's duplicates queue moves to the trash through the same path: its queued
+// documents reach the console's dialog whole (the paths listed), and the
+// confirmed write sends them in batches of the node's write_ids_max, nothing
+// before Confirm and nothing after Cancel.
 // =============================================================================
 
 import assert from 'node:assert/strict';
@@ -23,10 +26,10 @@ import { dedupeView, docInfo, queueInit, queueReducer, queued } from '../src/map
 import { MULTI_REMOVE_LIST_MAX } from '../src/vector/budgets';
 import { createConsoleStore } from '../src/vector/consoleStore';
 import type { IConsoleDeps } from '../src/vector/consoleStore';
-import { readChunksPage, readDocumentsPage, readDeleteResult, readStats } from '../src/vector/results';
+import { readChunksPage, readDocumentsPage, readDeleteResult, readStats, readTrashResult } from '../src/vector/results';
 import { loadSample } from './support/map.samples';
 import { fixture } from './support/fixtures';
-import { REMOVE_CANCEL_LABEL, batches, confirmReady, multiRemoveConfirmation, removalSummary, removeConfirmation, runRemoval } from '../src/vector/confirm';
+import { REMOVE_CANCEL_LABEL, batches, confirmReady, emptyTrashConfirmation, multiRemoveConfirmation, multiTrashConfirmation, removalSummary, removeConfirmation, runRemoval, trashConfirmation } from '../src/vector/confirm';
 import type { IRemoveContext } from '../src/vector/confirm';
 import type { IRemoveView } from '../src/vector/results';
 import { CODE_SENTENCES } from '../src/vector/wording';
@@ -35,25 +38,48 @@ const PG: IRemoveContext = { storeName: 'PostgreSQL (pgvector)', collection: 'vx
 const RRV: IRemoveContext = { storeName: 'RocketRide Vector', collection: 'vector_explorer_docs', backend: 'pgvector', provider: 'rocketride_vector' };
 const KESTREL = { objectId: 'kestrel-guide-object-id', path: 'C:/demo/field/kestrel_field_guide.md', chunks: 12 };
 
-test('the single-document dialog: path, short objectId, chunk count, where, and what cannot be undone', () => {
+test('move to trash: the same lines, nothing to type, and where it can be restored from', () => {
+	const c = trashConfirmation(KESTREL, PG);
+	assert.equal(c.title, 'Move this document to the trash?');
+	assert.deepEqual(
+		c.lines.map((l) => l.label),
+		['Path', 'objectId', 'Chunks', 'Store']
+	);
+	assert.equal(c.sentence, 'Moves this document and its 12 chunks to the trash of vx_demo_docs. Search, chat and the map leave it out until it is restored from the Trash.');
+	assert.equal(c.confirmLabel, 'Move to trash');
+	assert.equal(c.typed, null, 'nothing to type: it can be undone');
+	assert.equal(c.destructive, false);
+	const shared = trashConfirmation(KESTREL, RRV);
+	assert.equal(shared.typed, null, 'not on a shared table either');
+	assert.ok(shared.extra.includes("Shared table: every pipeline in this organization that names table 'vector_explorer_docs' reads and writes these rows."), 'the shared table is still said');
+	const several = multiTrashConfirmation(
+		Array.from({ length: 23 }, (_, i) => ({ objectId: `id-${i}`, path: `C:/demo/f${i}.md`, chunks: 2 })),
+		PG
+	);
+	assert.deepEqual([several.title, several.confirmLabel, several.typed, several.more, several.destructive], ['Move 23 documents to the trash?', 'Move 23 documents to the trash', null, 3, false]);
+	assert.equal(several.sentence, 'Moves these 23 documents and their 46 chunks to the trash of vx_demo_docs, in batches of at most 100; the first error stops the rest. Restore them from the Trash.');
+});
+
+test('delete permanently, one document: path, short objectId, chunk count, where, and what cannot be undone', () => {
 	const c = removeConfirmation(KESTREL, PG);
-	assert.equal(c.title, 'Remove this document?');
+	assert.equal(c.title, 'Delete this document permanently?');
 	assert.deepEqual(c.lines, [
 		{ label: 'Path', value: 'C:/demo/field/kestrel_field_guide.md' },
 		{ label: 'objectId', value: 'kestrel-…' },
 		{ label: 'Chunks', value: '12' },
 		{ label: 'Store', value: 'PostgreSQL (pgvector) · vx_demo_docs · pgvector' },
 	]);
-	assert.equal(c.sentence, 'Removes this document and its 12 chunks from vx_demo_docs. This cannot be undone; add the file again to restore it.');
-	assert.equal(c.confirmLabel, 'Remove document');
+	assert.equal(c.sentence, 'Deletes this document and its 12 chunks from vx_demo_docs. This cannot be undone; add the file again to restore it.');
+	assert.equal(c.confirmLabel, 'Delete permanently');
+	assert.equal(c.destructive, true);
 	assert.equal(c.cancelLabel, REMOVE_CANCEL_LABEL);
 	assert.equal(REMOVE_CANCEL_LABEL, 'Cancel');
 	assert.equal(c.typed, null, 'a store of its own needs no typed confirmation');
-	assert.equal(removeConfirmation({ ...KESTREL, chunks: null }, PG).sentence, 'Removes this document and all its chunks from vx_demo_docs. This cannot be undone; add the file again to restore it.', 'no invented count');
+	assert.equal(removeConfirmation({ ...KESTREL, chunks: null }, PG).sentence, 'Deletes this document and all its chunks from vx_demo_docs. This cannot be undone; add the file again to restore it.', 'no invented count');
 	assert.equal(removeConfirmation({ ...KESTREL, chunks: 1 }, PG).sentence.includes('its 1 chunk from'), true);
 });
 
-test('rocketride_vector: type the table name, and say the table is shared by the organization', () => {
+test('rocketride_vector: deleting permanently types the table name, and says the table is shared by the organization', () => {
 	const c = removeConfirmation(KESTREL, RRV);
 	assert.deepEqual(c.typed, { expected: 'vector_explorer_docs', prompt: "Type the table name 'vector_explorer_docs' to confirm." });
 	assert.ok(c.extra.includes("Shared table: every pipeline in this organization that names table 'vector_explorer_docs' reads and writes these rows."));
@@ -63,18 +89,28 @@ test('rocketride_vector: type the table name, and say the table is shared by the
 	assert.equal(confirmReady(null, ''), true);
 });
 
-test('the multi-remove dialog: type the count, at most 20 paths listed, the rest counted', () => {
+test('delete permanently, several documents: type the count, at most 20 paths listed, the rest counted', () => {
 	const targets = Array.from({ length: 23 }, (_, i) => ({ objectId: `id-${i}`, path: `C:/demo/f${i}.md`, chunks: 2 }));
 	const c = multiRemoveConfirmation(targets, PG);
-	assert.equal(c.title, 'Remove 23 documents?');
+	assert.equal(c.title, 'Delete 23 documents permanently?');
 	assert.equal(c.listed.length, MULTI_REMOVE_LIST_MAX);
 	assert.equal(c.more, 3);
 	assert.deepEqual(c.typed, { expected: '23', prompt: 'Type 23 to confirm.' });
-	assert.equal(c.confirmLabel, 'Remove 23 documents');
-	assert.equal(c.sentence, 'Removes these 23 documents and their 46 chunks from vx_demo_docs, in batches of at most 100; the first error stops the rest. This cannot be undone.');
+	assert.equal(c.confirmLabel, 'Delete 23 documents permanently');
+	assert.equal(c.sentence, 'Deletes these 23 documents and their 46 chunks from vx_demo_docs, in batches of at most 100; the first error stops the rest. This cannot be undone.');
 	const shared = multiRemoveConfirmation(targets.slice(0, 2), RRV);
 	assert.equal(shared.typed?.expected, 'vector_explorer_docs', 'on a shared table the table name is typed, not the count');
 	assert.equal(multiRemoveConfirmation([...targets.slice(0, 1), { objectId: 'x', path: 'x', chunks: null }], PG).sentence.includes('and all their chunks'), true);
+});
+
+test('empty trash: the documents in the trash listed, the count typed (a shared table its name), and what is kept', () => {
+	const targets = Array.from({ length: 23 }, (_, i) => ({ objectId: `id-${i}`, path: `C:/demo/f${i}.md`, chunks: 2 }));
+	const c = emptyTrashConfirmation(targets, PG);
+	assert.deepEqual([c.title, c.confirmLabel, c.listed.length, c.more, c.destructive], ['Empty the trash?', 'Empty trash', MULTI_REMOVE_LIST_MAX, 3, true]);
+	assert.deepEqual(c.typed, { expected: '23', prompt: 'Type 23 to confirm.' });
+	assert.equal(c.sentence, 'Deletes the 23 documents in the trash of vx_demo_docs permanently, in batches of at most 100; a document that still has chunks outside the trash is kept. This cannot be undone.');
+	assert.equal(emptyTrashConfirmation(targets.slice(0, 1), PG).typed?.expected, '1', 'even one document is typed');
+	assert.equal(emptyTrashConfirmation(targets, RRV).typed?.expected, 'vector_explorer_docs');
 });
 
 test("batches of at most 100 (the node's write_ids_max)", () => {
@@ -131,28 +167,38 @@ test('runRemoval stops at the first error and says what already ran; a count the
 	assert.equal(outcome.batchesRun, 1);
 	assert.equal(outcome.removedChunks, null);
 	assert.deepEqual(outcome.error, { headline: CODE_SENTENCES.WRITES_DISABLED });
-	assert.equal(removalSummary(outcome, [{ objectId: 'a', path: 'a.md' }]), `Removed 2 documents. Stopped after 1 of 2 batches: ${CODE_SENTENCES.WRITES_DISABLED}`);
+	assert.equal(removalSummary(outcome, [{ objectId: 'a', path: 'a.md' }], 'delete'), `Deleted 2 documents permanently. Stopped after 1 of 2 batches: ${CODE_SENTENCES.WRITES_DISABLED}`);
 });
 
-test('the announcement after a removal names the document and the rows removed', () => {
-	const one = { removed: [{ objectId: 'k', chunks: 12 }], notFound: [], removedChunks: 12, batchesRun: 1, batchesTotal: 1, error: null };
-	assert.equal(removalSummary(one, [{ objectId: 'k', path: 'C:/demo/field/kestrel_field_guide.md' }]), 'Removed C:/demo/field/kestrel_field_guide.md (12 chunks)');
-	const gone = { removed: [], notFound: ['k'], removedChunks: 0, batchesRun: 1, batchesTotal: 1, error: null };
-	assert.equal(removalSummary(gone, [{ objectId: 'k', path: 'x.md' }]), 'x.md was not stored any more; nothing was removed');
+test('the announcement after a write names the document and the rows it moved or deleted', () => {
+	const kestrel = [{ objectId: 'k', path: 'C:/demo/field/kestrel_field_guide.md' }];
+	const one = { removed: [{ objectId: 'k', chunks: 12 }], notFound: [], keptLive: [], removedChunks: 12, batchesRun: 1, batchesTotal: 1, error: null };
+	assert.equal(removalSummary(one, kestrel, 'delete'), 'Deleted C:/demo/field/kestrel_field_guide.md permanently (12 chunks)');
+	assert.equal(removalSummary(one, kestrel, 'trash'), 'Moved C:/demo/field/kestrel_field_guide.md to the trash (12 chunks)');
+	assert.equal(removalSummary(one, kestrel, 'restore'), 'Restored C:/demo/field/kestrel_field_guide.md (12 chunks)');
+	const gone = { removed: [], notFound: ['k'], keptLive: [], removedChunks: 0, batchesRun: 1, batchesTotal: 1, error: null };
+	assert.equal(removalSummary(gone, [{ objectId: 'k', path: 'x.md' }], 'delete'), 'x.md was not stored any more; nothing was deleted');
+	assert.equal(removalSummary(gone, [{ objectId: 'k', path: 'x.md' }], 'trash'), 'x.md was not stored any more; nothing was moved to the trash');
 	const many = {
 		removed: [
 			{ objectId: 'a', chunks: 1 },
 			{ objectId: 'b', chunks: 2 },
 		],
 		notFound: ['c'],
+		keptLive: [],
 		removedChunks: 3,
 		batchesRun: 1,
 		batchesTotal: 1,
 		error: null,
 	};
-	assert.equal(removalSummary(many, []), 'Removed 2 documents (3 chunks). 1 was not stored any more.');
-	const timeout = { removed: [], notFound: [], removedChunks: null, batchesRun: 0, batchesTotal: 1, error: { headline: 'The request may still complete on the server. Refresh to check.' } };
-	assert.equal(removalSummary(timeout, [{ objectId: 'k', path: 'x.md' }]), 'The request may still complete on the server. Refresh to check.');
+	assert.equal(removalSummary(many, [], 'delete'), 'Deleted 2 documents permanently (3 chunks). 1 was not stored any more.');
+	assert.equal(removalSummary(many, [], 'restore'), 'Restored 2 documents (3 chunks). 1 was not stored any more.');
+	const emptied = { ...many, notFound: [], keptLive: ['p', 'q'] };
+	assert.equal(removalSummary(emptied, [], 'empty'), 'Emptied the trash: deleted 2 documents permanently (3 chunks). 2 were kept: they still have chunks outside the trash.');
+	assert.equal(removalSummary({ ...emptied, keptLive: [] }, [{ objectId: 'a', path: 'a.md' }], 'empty'), 'Emptied the trash: deleted 2 documents permanently (3 chunks).', 'Empty trash always counts, even for one document');
+	const timeout = { removed: [], notFound: [], keptLive: [], removedChunks: null, batchesRun: 0, batchesTotal: 1, error: { headline: 'The request may still complete on the server. Refresh to check.' } };
+	assert.equal(removalSummary(timeout, [{ objectId: 'k', path: 'x.md' }], 'trash'), 'The request may still complete on the server. Refresh to check.');
+	assert.equal(removalSummary({ ...timeout, error: null }, [], 'empty'), 'Nothing was deleted.');
 });
 
 // =============================================================================
@@ -169,7 +215,7 @@ function demoQueue(): { ids: string[]; rows: IDocumentItem[] } {
 	return { ids: queued(view.groups, state, docInfo(sample, rows), new Set()).objectIds, rows };
 }
 
-/** A console controller whose removals are recorded batch by batch. */
+/** A console controller whose moves to the trash are recorded batch by batch. */
 function consoleWith(rows: IDocumentItem[], writeBatch: number) {
 	const sent: string[][] = [];
 	const clock = manualClock(Date.parse('2026-10-15T09:00:00Z'));
@@ -177,9 +223,14 @@ function consoleWith(rows: IDocumentItem[], writeBatch: number) {
 		stats: async () => readStats(fixture('stats_pgvector')),
 		documents: async () => readDocumentsPage({ ...fixture('list_documents_page2_last'), items: rows }),
 		chunks: async () => readChunksPage(fixture('chunks_page')),
-		remove: async (ids) => {
+		trash: async (ids) => {
 			sent.push([...ids]);
-			return readDeleteResult({ ...fixture('delete_ok'), removed_chunks: 3 * ids.length }, ids);
+			return readTrashResult({ ...fixture('soft_delete_ok'), object_ids: ids, matched_chunks: 3 * ids.length });
+		},
+		restore: async () => assert.fail('the queue never restores'),
+		remove: async (ids) => {
+			assert.fail(`the queue never deletes permanently (${ids.length})`);
+			return readDeleteResult(fixture('delete_ok'), ids);
 		},
 		announce: () => undefined,
 		clock,
@@ -189,7 +240,7 @@ function consoleWith(rows: IDocumentItem[], writeBatch: number) {
 	return { store, sent };
 }
 
-test('the queued duplicates reach the multi-remove dialog whole: typed count, their paths, nothing sent before Confirm', () => {
+test('the queued duplicates reach the move-to-trash dialog whole: their paths, nothing to type, nothing sent before Confirm', () => {
 	const { ids, rows } = demoQueue();
 	assert.equal(ids.length, 5, 'the four-document group queues three, each pair one');
 	const { store, sent } = consoleWith(rows, 100);
@@ -199,14 +250,14 @@ test('the queued duplicates reach the multi-remove dialog whole: typed count, th
 	assert.deepEqual(asked, [ids], 'the whole queue, never cut to write_ids_max');
 	store.requestRemove(asked[0]!.map((objectId) => ({ objectId, path: byId.get(objectId)!.path, chunks: byId.get(objectId)!.chunks })));
 	const pending = store.getState().confirm;
-	assert.equal(pending?.kind, 'multi');
+	assert.deepEqual([pending?.action, pending?.kind], ['trash', 'multi']);
 	assert.deepEqual(
 		pending?.targets.map((t) => t.objectId),
 		ids
 	);
-	const dialog = multiRemoveConfirmation(pending!.targets, PG);
-	assert.equal(dialog.title, 'Remove 5 documents?');
-	assert.deepEqual(dialog.typed, { expected: '5', prompt: 'Type 5 to confirm.' });
+	const dialog = multiTrashConfirmation(pending!.targets, PG);
+	assert.equal(dialog.title, 'Move 5 documents to the trash?');
+	assert.equal(dialog.typed, null);
 	assert.deepEqual(
 		dialog.listed,
 		ids.map((id) => byId.get(id)!.path)
@@ -217,7 +268,7 @@ test('the queued duplicates reach the multi-remove dialog whole: typed count, th
 	store.dispose();
 });
 
-test("confirming the queue sends it in batches of the node's write_ids_max, every queued document once", async () => {
+test("confirming the queue moves it to the trash in batches of the node's write_ids_max, every queued document once", async () => {
 	const { ids, rows } = demoQueue();
 	const { store, sent } = consoleWith(rows, 2);
 	store.requestRemove(ids.map((objectId) => ({ objectId, path: objectId, chunks: null })));

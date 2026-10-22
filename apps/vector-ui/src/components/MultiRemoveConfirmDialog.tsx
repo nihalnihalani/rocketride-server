@@ -21,14 +21,15 @@
 // SOFTWARE.
 
 // =============================================================================
-// VECTOR-UI — MULTI-REMOVE CONFIRMATION (several documents; type the count)
+// VECTOR-UI — SEVERAL-DOCUMENT CONFIRMATION (Move to trash, Delete permanently, Empty trash)
 // =============================================================================
 //
-// Lists up to 20 paths and counts the rest; Remove stays disabled until the
-// count (or, on rocketride_vector, the table name) is typed. Cancel has the
-// focus, moved there by this component's own mount effect (see
-// RemoveConfirmDialog). The removal runs in batches of at most 100 and stops
-// at the first error.
+// Lists up to 20 paths and counts the rest. Deleting permanently and emptying
+// the trash stay disabled until the count (or, on rocketride_vector, the table
+// name) is typed; moving to the trash types nothing, since it can be undone.
+// Cancel has the focus, moved there by this component's own mount effect (see
+// RemoveConfirmDialog). The write runs in batches of at most 100 and stops at
+// the first error.
 // =============================================================================
 
 import React, { useEffect, useRef, useState } from 'react';
@@ -62,13 +63,13 @@ export function MultiRemoveConfirmDialog({ content, onConfirm, onCancel }: IMult
 	return (
 		<ConfirmDialog
 			title={content.title}
-			destructive
+			destructive={content.destructive}
 			cancelLabel={content.cancelLabel}
 			confirmLabel={content.confirmLabel}
 			confirmDisabled={!ready}
 			message={
 				<div ref={anchor}>
-					<ul aria-label="Documents to remove" style={{ margin: '8px 0', paddingLeft: 20, maxHeight: 180, overflowY: 'auto' }}>
+					<ul aria-label={content.listLabel} style={{ margin: '8px 0', paddingLeft: 20, maxHeight: 180, overflowY: 'auto' }}>
 						{content.listed.map((path, i) => (
 							<li key={`${i}:${path}`} style={{ overflowWrap: 'anywhere' }}>
 								{path}
@@ -82,10 +83,12 @@ export function MultiRemoveConfirmDialog({ content, onConfirm, onCancel }: IMult
 							{sentence}
 						</p>
 					))}
-					<label style={{ display: 'flex', flexDirection: 'column', gap: 4, marginTop: 8 }}>
-						<span>{content.typed.prompt}</span>
-						<input type="text" value={typed} onChange={(event) => setTyped(event.target.value)} style={styles.input} autoComplete="off" spellCheck={false} />
-					</label>
+					{content.typed && (
+						<label style={{ display: 'flex', flexDirection: 'column', gap: 4, marginTop: 8 }}>
+							<span>{content.typed.prompt}</span>
+							<input type="text" value={typed} onChange={(event) => setTyped(event.target.value)} style={styles.input} autoComplete="off" spellCheck={false} />
+						</label>
+					)}
 				</div>
 			}
 			onConfirm={() => {
