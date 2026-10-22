@@ -232,3 +232,20 @@ test('the console model without an ingest or chat source, or without an embeddin
 	assert.deepEqual(buildConsoleModel(bare.endpoint, bare.probe, null).embed, { enabled: false, reason: EMPTY.noEmbed });
 	assert.equal(row().pipeline?.components?.[0].provider, 'db_postgres', 'the premise: the default fake row is a SQL node');
 });
+
+test('the drawer of a store found empty reads model, dimension and index from fresh stats; a dialect that has them wins', async () => {
+	const [f] = await discover(world(projectRows(['ingest_1', 'chat_1', 'tools_1'], vectorComponents('postgres')), fixture('dialect_collection_missing')));
+	const value = (drawer: ReturnType<typeof drawerView>, label: string) => drawer.rows.find((r) => r.label === label)?.value;
+	const before = drawerView(f.endpoint, f.probe);
+	assert.deepEqual(['Model', 'Dimension', 'Index'].map((label) => value(before, label)), ['—', '—', '—'], 'nothing known yet');
+	const fresh = readStats({ ...fixture('stats_pgvector'), index: { type: 'hnsw', params: { m: 16 } } });
+	const after = drawerView(f.endpoint, f.probe, fresh);
+	assert.equal(value(after, 'Model'), 'sentence-transformers/all-MiniLM-L6-v2');
+	assert.equal(value(after, 'Dimension'), '384');
+	assert.equal(value(after, 'Index'), 'hnsw (m 16)');
+	const [g] = await discover(world(projectRows(['ingest_1', 'chat_1', 'tools_1'], vectorComponents('postgres')), fixture('dialect_pgvector')));
+	const probed = drawerView(g.endpoint, g.probe, readStats({ ...fixture('stats_pgvector'), model: 'other/model', dimension: 768 }));
+	assert.equal(value(probed, 'Model'), 'sentence-transformers/all-MiniLM-L6-v2');
+	assert.equal(value(probed, 'Dimension'), '384');
+	assert.equal(value(probed, 'Index'), 'hnsw (m 16, ef_construction 64)');
+});

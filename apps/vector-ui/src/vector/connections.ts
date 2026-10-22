@@ -43,6 +43,7 @@ import type { IExplorerEndpoint, IProbeResult } from 'shared/explorer';
 import type { IDialectResult } from '../contract/types';
 import { sharedTableSentence } from './confirm';
 import { readDialect } from './results';
+import type { IStatsView } from './results';
 import { EXPERIMENTAL_BADGE, providerTitle, supportOf } from './support';
 import { CAVEAT_SENTENCES, EMPTY, caveatSentence } from './wording';
 
@@ -234,11 +235,15 @@ function componentName(endpoint: IExplorerEndpoint, prefix: string): string | nu
  * dimension, index, the embedding and LLM node names, the write switch, support,
  * and the notes (caveats, the shared table, who can add documents, grouping).
  *
+ * Model, dimension and index come from the dialect, else from the console's last stats answer: a store
+ * found empty has none of them in its dialect until it is probed again.
+ *
  * @param endpoint - The endpoint (token-free).
  * @param probe - Its probe, when one exists.
+ * @param stats - The connection's last stats answer, when its console has one.
  * @returns The view.
  */
-export function drawerView(endpoint: IExplorerEndpoint, probe: IProbeResult | undefined): IDrawerView {
+export function drawerView(endpoint: IExplorerEndpoint, probe: IProbeResult | undefined, stats: IStatsView | null = null): IDrawerView {
 	const dialect = probe?.ok ? readDialect(probe.info) : null;
 	const rows: IDetailRow[] = [];
 	for (const role of ROLE_ORDER) {
@@ -252,10 +257,13 @@ export function drawerView(endpoint: IExplorerEndpoint, probe: IProbeResult | un
 		rows.push({ label: 'Backend', value: [dialect.backend, dialect.backend_version].filter(Boolean).join(' ') });
 		rows.push({ label: 'Collection', value: dialect.collection ?? '—' });
 		rows.push({ label: 'Metric', value: dialect.metric ?? '—' });
-		rows.push({ label: 'Model', value: dialect.model ?? '—' });
-		rows.push({ label: 'Dimension', value: dialect.dimension === null ? '—' : String(dialect.dimension) });
-		const params = dialect.index?.params ? Object.entries(dialect.index.params).map(([k, v]) => `${k} ${String(v)}`) : [];
-		rows.push({ label: 'Index', value: dialect.index ? `${dialect.index.type}${params.length ? ` (${params.join(', ')})` : ''}` : '—' });
+		const model = dialect.model ?? stats?.model ?? null;
+		const dimension = dialect.dimension ?? stats?.dimension ?? null;
+		const index = dialect.index ?? stats?.index ?? null;
+		rows.push({ label: 'Model', value: model ?? '—' });
+		rows.push({ label: 'Dimension', value: dimension === null ? '—' : String(dimension) });
+		const params = index?.params ? Object.entries(index.params).map(([k, v]) => `${k} ${String(v)}`) : [];
+		rows.push({ label: 'Index', value: index ? `${index.type}${params.length ? ` (${params.join(', ')})` : ''}` : '—' });
 	}
 	rows.push({ label: 'Embedding node', value: componentName(endpoint, 'embedding_') ?? '—' });
 	rows.push({ label: 'LLM node', value: componentName(endpoint, 'llm_') ?? '—' });

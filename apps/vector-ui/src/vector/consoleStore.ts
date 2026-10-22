@@ -28,7 +28,8 @@
 // pacing, so the React view only renders its snapshot and forwards clicks:
 //
 //   STATS      `stats({mode:'full'})` on open, after a removal, after a
-//              completed upload and on Refresh; `stats({mode:'quick'})` at
+//              completed upload and on Refresh (after an upload or a write
+//              the store's dialect is probed again too, deps.reprobe); `stats({mode:'quick'})` at
 //              most every 15 s while the console is visible. A failure keeps
 //              the last figures (the strip greys them) and says why; with no
 //              figures yet, the full call is asked again every 15 s.
@@ -89,6 +90,11 @@ export interface IConsoleDeps {
 	announce(text: string): void;
 	/** Documents that are no longer stored (the selection and the map forget them). */
 	onRemoved?(objectIds: readonly string[]): void;
+	/**
+	 * Probe the store again (its `dialect`): after an upload completes and after a write, so what was read at
+	 * discovery (an empty collection, no model or index yet) does not stay on screen. Fire and forget.
+	 */
+	reprobe?(): void;
 	clock: IConsoleClock;
 }
 
@@ -342,6 +348,7 @@ export function createConsoleStore(deps: IConsoleDeps, opts: IConsoleOptions): I
 		documentsChanged(): void {
 			planStats('upload');
 			startDirectory();
+			deps.reprobe?.();
 		},
 		loadMoreDocuments(): void {
 			set({ directory: pagerLoadMore(state.directory) });
@@ -417,6 +424,7 @@ export function createConsoleStore(deps: IConsoleDeps, opts: IConsoleOptions): I
 			if (outcome.batchesRun > 0) {
 				planStats('write');
 				startDirectory();
+				deps.reprobe?.();
 			}
 		},
 		dispose(): void {

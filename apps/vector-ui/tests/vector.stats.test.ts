@@ -137,3 +137,13 @@ test('a Size figure joins the strip when the dialect reports the bytes the colle
 		false
 	);
 });
+
+test('Empty collection: fresh stats win over the dialect read when the store was found empty', () => {
+	const labels = (chips: ReturnType<typeof statsChips>) => chips.map((c) => c.label);
+	const foundEmpty = readDialect(fixture('dialect_collection_missing'));
+	// After an upload the store holds documents: the strip must not say "Documents 42" beside "Empty collection".
+	assert.ok(!labels(statsChips({ dialect: foundEmpty, stats: readStats(fixture('stats_pgvector')), readOnly: false })).includes('Empty collection'));
+	// Before the first stats answer the dialect decides; fresh stats that say the collection is missing win as well.
+	assert.ok(labels(statsChips({ dialect: foundEmpty, stats: null, readOnly: false })).includes('Empty collection'));
+	assert.ok(labels(statsChips({ dialect: readDialect(fixture('dialect_pgvector')), stats: readStats(fixture('stats_collection_missing_legacy')), readOnly: false })).includes('Empty collection'));
+});

@@ -12,7 +12,7 @@ import { test } from 'node:test';
 import { ExplorerToolError } from 'shared/explorer';
 import { manualClock } from 'shared/explorer/connect/testing';
 import type { IDocumentItem, IDocumentsFilter, IScopeState } from '../src/contract/types';
-import { connectionCaches } from '../src/adapters/explorer';
+import { connectionCaches, vectorEndpoints } from '../src/adapters/explorer';
 import { connectionEntry } from '../src/adapters/connections';
 import { makeConsoleActions } from '../src/adapters/consoleActions';
 import { QUICK_STATS_INTERVAL_MS } from '../src/vector/budgets';
@@ -768,4 +768,44 @@ test('mapScopeFor: while a new scope finds its documents the map keeps the scope
 	assert.equal(mapScopeFor(held, bFailed)?.applyTo.map, false);
 	// No scope: none.
 	assert.equal(mapScopeFor(held, consoleScope(null, null, whole, 2_000)), null);
+});
+
+test('the store is probed again (its dialect) after an upload completes and after a write', async () => {
+	let probes = 0;
+	const { store, clock } = harness({ reprobe: () => void (probes += 1) });
+	store.setWritesEnabled(true);
+	store.open();
+	await clock.settle();
+	assert.equal(probes, 0, 'opening reads the dialect discovery already holds');
+	store.documentsChanged();
+	await clock.settle();
+	assert.equal(probes, 1, 'after an upload');
+	store.requestRemove([{ objectId: 'kestrel', path: 'C:/demo/field/kestrel_field_guide.md', chunks: 12 }]);
+	await store.confirmRemove();
+	await clock.settle();
+	assert.equal(probes, 2, 'after a write');
+	store.cancelRemove();
+	store.refresh();
+	await clock.settle();
+	assert.equal(probes, 2, 'Refresh and Cancel send no probe of their own');
+	store.dispose();
+});
+
+test("a connection's controller probes its endpoint again through the endpoint store", async () => {
+	const asked: Array<[unknown, string]> = [];
+	const real = vectorEndpoints.probe;
+	vectorEndpoints.probe = async (client, key) => {
+		asked.push([client, key]);
+		return null;
+	};
+	try {
+		const client = {} as never;
+		const entry = connectionEntry({ key: 'probe-wiring', nodeId: 'store_1', provider: 'qdrant', roles: {}, components: [] } as never, client);
+		entry.controller.documentsChanged();
+		assert.deepEqual(asked, [[client, 'probe-wiring']]);
+		entry.controller.dispose();
+	} finally {
+		vectorEndpoints.probe = real;
+		connectionCaches.clearAll();
+	}
 });

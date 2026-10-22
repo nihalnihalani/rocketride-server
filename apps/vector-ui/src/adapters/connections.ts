@@ -145,6 +145,9 @@ function makeController(entry: Pick<IConnectionEntry, 'ctx' | 'selection'>, cloc
 			onRemoved: (ids) => {
 				for (const id of ids) entry.selection.forgetDocument(id);
 			},
+			reprobe: () => {
+				if (ctx.client !== null) void vectorEndpoints.probe(ctx.client, ctx.endpoint.key);
+			},
 			clock,
 		},
 		{

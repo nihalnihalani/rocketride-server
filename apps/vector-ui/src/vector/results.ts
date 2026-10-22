@@ -208,6 +208,8 @@ export interface IStatsView {
 	avgPerDocument: number | null;
 	dimension: number | null;
 	metric: string | null;
+	/** The index, when the answer carries one (the drawer falls back to it while the dialect has none). */
+	index: { type: string; params?: Record<string, unknown> } | null;
 	computedAt: string | null;
 	countsAsOf: string | null;
 	caveats: string[];
@@ -237,6 +239,7 @@ export function readStats(value: Record<string, unknown>): IStatsView {
 		avgPerDocument: count(value.avg_chunks_per_document),
 		dimension: count(value.dimension) || vectorSize || null,
 		metric: str(value.metric),
+		index: isPlainObject(value.index) && typeof value.index.type === 'string' ? { type: value.index.type, ...(isPlainObject(value.index.params) ? { params: value.index.params } : {}) } : null,
 		computedAt: str(value.computed_at),
 		countsAsOf: str(value.counts_as_of),
 		caveats: strings(value.caveats),

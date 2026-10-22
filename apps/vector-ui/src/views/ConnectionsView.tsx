@@ -29,9 +29,10 @@
 // console. Nothing here holds or shows a credential or a node's configuration.
 // =============================================================================
 
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useState, useSyncExternalStore } from 'react';
 import { Banner, Button, ConnectionCard, ContentHeader, DetailPanel, EmptyState, Section, StatusBadge, useShellConnection } from 'shell';
 import type { IExplorerEndpoint, IProbeResult } from 'shared/explorer';
+import { existingEntry } from '../adapters/connections';
 import { vectorEndpoints } from '../adapters/explorer';
 import { useVectorEndpoints } from '../adapters/react';
 import ConnectionDrawerDetails from '../components/ConnectionDrawerDetails';
@@ -158,6 +159,9 @@ export const ConnectionsView: React.FC = () => {
 	);
 };
 
+/** A subscription that never fires (no console opened for the connection yet). */
+const NO_SUBSCRIBE = (): (() => void) => () => undefined;
+
 /** Props of the drawer. */
 interface IConnectionDrawerProps {
 	endpoint: IExplorerEndpoint | null;
@@ -177,6 +181,13 @@ const ConnectionDrawer: React.FC<IConnectionDrawerProps> = ({ endpoint, probe, o
 	const [testing, setTesting] = useState(false);
 	// Keyed on the card it shows, so a result never carries over to another connection.
 	const [tested, setTested] = useState<ITestResult | null>(null);
+	// The connection's last stats, once its console has them: they fill what the dialect read at discovery lacks.
+	const entry = endpoint ? existingEntry(endpoint.key) : undefined;
+	const stats = useSyncExternalStore(
+		entry?.controller.subscribe ?? NO_SUBSCRIBE,
+		() => entry?.controller.getState().stats.view ?? null,
+		() => null
+	);
 	if (!endpoint) return null;
 	const view = vectorCardView(endpoint, probe);
 	const test = async (): Promise<void> => {
@@ -219,7 +230,7 @@ const ConnectionDrawer: React.FC<IConnectionDrawerProps> = ({ endpoint, probe, o
 					</div>
 				)}
 			</Section>
-			<ConnectionDrawerDetails drawer={drawerView(endpoint, probe)} />
+			<ConnectionDrawerDetails drawer={drawerView(endpoint, probe, stats)} />
 		</DetailPanel>
 	);
 };
