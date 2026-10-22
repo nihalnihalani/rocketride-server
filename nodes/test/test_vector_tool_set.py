@@ -247,7 +247,8 @@ def test_delete_answers_kept_live_and_removes_trashed_documents_only_when_asked(
     answer = inst.delete({'object_ids': ['doc00', 'doc01', 'ghost'], 'deleted_only': True})
     assert answer['success'] is True, answer
     assert (answer['kept_live'], answer['not_found'], answer['removed_chunks']) == (['doc01'], ['ghost'], 2)
-    assert answer['audit']['action'] == 'vector.delete' and answer['audit']['object_ids'] == ['doc00', 'ghost']
+    assert answer['audit']['action'] == 'vector.delete'
+    assert answer['audit']['object_ids'] == ['doc00', 'doc01', 'ghost'], 'the audit names every id the call named'
     keys = set(_rows(store))
     assert not any(key[0] == 'doc00' for key in keys)
     assert {('doc01', 0), ('doc01', 1), ('doc01', 2)} <= keys, 'a partly trashed document is left whole'

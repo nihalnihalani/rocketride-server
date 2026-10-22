@@ -1960,14 +1960,16 @@ class VectorStoreToolMixin(VectorExplorerExtTools, VectorExplorerTools):
         rows: Optional[int] = 0
         if targets:
             _removed, not_found, rows = self._vx_remove(store, targets)
-        self._vx_log_write('vector.delete', targets, rows, decision.origin)
+        # The audit names every id the call named, as without deleted_only (kept_live and
+        # not_found say which of them were left alone); rows is what went.
+        self._vx_log_write('vector.delete', unique_ids, rows, decision.origin)
         return {
             'success': True,
             'deleted_count': len(clean_ids),
             'removed_chunks': rows,
             'not_found': not_found,
             'kept_live': kept_live,
-            'audit': self._vx_audit('vector.delete', store, targets, rows, decision),
+            'audit': self._vx_audit('vector.delete', store, unique_ids, rows, decision),
         }
 
     # --- The trash and the document listing (#2704's names, the explorer's shapes) --------------
