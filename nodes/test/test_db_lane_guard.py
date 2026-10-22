@@ -200,11 +200,13 @@ def test_the_mocked_pass_leaves_the_live_suites_out_by_path_wherever_pytest_runs
     by_path = [str(test_dir / suite) for suite in out['suites']]
 
     def ignored(args):
-        return [str(Path(args[i + 1]).resolve()) for i, a in enumerate(args) if a == '--ignore']
+        paths = [args[i + 1] for i, a in enumerate(args) if a == '--ignore']
+        # Checked before resolving: a relative --ignore would hold only from one directory.
+        assert all(Path(p).is_absolute() for p in paths), paths
+        return [str(Path(p).resolve()) for p in paths]
 
     mocked, full = out['ignores']['mocked'], out['ignores']['full']
     assert ignored(mocked) == by_path, 'nodes:test leaves every live suite out by absolute path'
     assert ignored(full) == by_path, 'so does nodes:test-full'
-    assert all(Path(p).is_absolute() for p in ignored(mocked) + ignored(full))
     assert mocked[:4] == ['--ignore-glob', '**/test_*_full.py', '--ignore-glob', '**/test_*_full/**']
     assert '--ignore-glob' not in full, 'nodes:test-full collects the other _full suites'
